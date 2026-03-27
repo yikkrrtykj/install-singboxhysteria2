@@ -309,7 +309,7 @@ show_client_configuration() {
   show_notice "clash-meta配置参数"
 cat << EOF
 
-port: 7890
+port: 7897
 allow-lan: true
 mode: rule
 log-level: info
