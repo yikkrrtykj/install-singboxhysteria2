@@ -860,7 +860,7 @@ process_warp(){
             read -p "请输入对应数字（0-5）: " warp_input
         case $warp_input in
           1)
-            jq '.route.final = "direct"' /root/sbox/sbconfig_server.json > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
+            jq '.route.rules = [ .route.rules[] | del(.outbound) ]' /root/sbox/sbconfig_server.json > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
             sed -i "s/WARP_OPTION=.*/WARP_OPTION=0/" /root/sbox/config
             reload_singbox
           ;;
@@ -870,7 +870,9 @@ process_warp(){
             if [ "$current_mode1" == "ss-out" ]; then
                 target_outbound="ss-out"
             fi
-            jq --arg target "$target_outbound" '.route.final = $target' /root/sbox/sbconfig_server.json > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
+            jq --arg target "$target_outbound" '
+                .route.rules += [{"outbound": $target}]
+            ' /root/sbox/sbconfig_server.json > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
             sed -i "s/WARP_OPTION=.*/WARP_OPTION=1/" /root/sbox/config
             reload_singbox
           else
@@ -1267,19 +1269,19 @@ enable_warp(){
               },
               (if $target_outbound == "direct" then
                 {
-                  "rule_set": ["geosite-openai","geosite-netflix","geosite-google","geosite-youtube"],
+                  "rule_set": ["geosite-openai","geosite-netflix"],
                   "outbound": "direct",
                   "override_address": $ipaddress,
                   "override_port": ($tport | tonumber)
                 }
               elif $target_outbound == "wireguard-out" then
                 {
-                  "rule_set": ["geosite-openai","geosite-netflix","geosite-google","geosite-youtube"],
+                  "rule_set": ["geosite-openai","geosite-netflix"],
                   "outbound": "wireguard-out"
                 }
               else
                 {
-                  "rule_set": ["geosite-openai","geosite-netflix","geosite-google","geosite-youtube"],
+                  "rule_set": ["geosite-openai","geosite-netflix"],
                   "outbound": "ss-out"
                 }
               end),
@@ -1315,20 +1317,6 @@ enable_warp(){
                 "format": "binary",
                 "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/netflix.srs",
                 "download_detour": "direct"
-              },
-              {
-                "tag": "geosite-google",
-                "type": "remote",
-                "format": "binary",
-                "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/google.srs",
-                "download_detour": "direct"
-              },
-              {
-                "tag": "geosite-youtube",
-                "type": "remote",
-                "format": "binary",
-                "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/youtube.srs",
-                "download_detour": "direct"
               }
           ] | .endpoints = [
             (
@@ -1352,20 +1340,26 @@ enable_warp(){
                 ]
               } | if $strategy != "" then .domain_resolver = {"server":"dns-local", "strategy":$strategy} else . end
             )
-          ] | .outbounds += (
-            if $target_outbound == "ss-out" then
-              [
-                {
-                  "type": "shadowsocks",
-                  "tag": "ss-out",
-                  "server": $ssipaddress,
-                  "server_port": ($sstport | tonumber),
-                  "method": "2022-blake3-aes-128-gcm",
-                  "password": $sspwd
-                } | if $strategy != "" then .domain_resolver = {"server":"dns-local", "strategy":$strategy} else . end
-              ]
-            else [] end
-          )' "/root/sbox/sbconfig_server.json" > "/root/sbox/sbconfig_server.temp" && mv "/root/sbox/sbconfig_server.temp" "/root/sbox/sbconfig_server.json"
+          ] | .outbounds += [
+            (
+              {
+                "type": "direct",
+                "tag": "doko-out",
+                "override_address": $ipaddress,
+                "override_port": ($tport | tonumber)
+              } | if $strategy != "" then .domain_resolver = {"server":"dns-local", "strategy":$strategy} else . end
+            ),
+            (
+              {
+                "type": "shadowsocks",
+                "tag": "ss-out",
+                "server": $ssipaddress,
+                "server_port": ($sstport | tonumber),
+                "method": "2022-blake3-aes-128-gcm",
+                "password": $sspwd
+              } | if $strategy != "" then .domain_resolver = {"server":"dns-local", "strategy":$strategy} else . end
+            )
+          ]' "/root/sbox/sbconfig_server.json" > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp "/root/sbox/sbconfig_server.json"
 
       sed -i "s/WARP_ENABLE=FALSE/WARP_ENABLE=TRUE/" /root/sbox/config
       sed -i "s/WARP_OPTION=.*/WARP_OPTION=0/" /root/sbox/config
@@ -1373,7 +1367,7 @@ enable_warp(){
 }
 
 disable_warp(){
-    jq '.route.rules = [{"action": "sniff"}, {"network": "udp", "port": 443, "action": "reject"}] | .route.final = "direct" | del(.route.rule_set) | del(.outbounds[] | select(.tag == "ss-out")) | del(.endpoints)' "/root/sbox/sbconfig_server.json" > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
+    jq '.route.rules = [{"action": "sniff"}, {"network": "udp", "port": 443, "action": "reject"}] | del(.route.rule_set) | del(.outbounds[] | select(.tag == "wireguard-out" or .tag == "doko-out" or .tag == "ss-out"))' "/root/sbox/sbconfig_server.json" > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp "/root/sbox/sbconfig_server.json"
     sed -i "s/WARP_ENABLE=TRUE/WARP_ENABLE=FALSE/" /root/sbox/config
     reload_singbox
 }
@@ -1424,12 +1418,17 @@ process_doko() {
                           "listen": "::",
                           "listen_port": ($fport | tonumber)
                       }
+                  ] | .outbounds += [
+                      {
+                          "type": "direct",
+                          "tag": ($tag + "-out"),
+                          "override_address": $ipaddress,
+                          "override_port": ($tport | tonumber)
+                      }
                   ] | .route.rules += [
                       {
                           "inbound": $tag,
-                          "outbound": "direct",
-                          "override_address": $ipaddress,
-                          "override_port": ($tport | tonumber)
+                          "outbound": ($tag + "-out")
                       }
                   ]' "/root/sbox/sbconfig_server.json" > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp "/root/sbox/sbconfig_server.json"
               echo "已添加任意门规则配置 ($tag)"
@@ -1438,7 +1437,7 @@ process_doko() {
           2)
               echo "请输入要删除的任意门规则标签 (例如：direct-in1): "
               read delete_tag
-              jq 'del(.inbounds[] | select(.tag == $delete_tag)) | .route.rules = (.route.rules | map(select(.inbound != $delete_tag)))' --arg delete_tag "$delete_tag" "/root/sbox/sbconfig_server.json" > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp "/root/sbox/sbconfig_server.json"
+              jq 'del(.inbounds[] | select(.tag == $delete_tag)) | del(.outbounds[] | select(.tag == ($delete_tag + "-out"))) | .route.rules = (.route.rules | map(select(.inbound != $delete_tag)))' --arg delete_tag "$delete_tag" "/root/sbox/sbconfig_server.json" > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp "/root/sbox/sbconfig_server.json"
               echo "已删除任意门规则 ($delete_tag)"
               reload_singbox
               ;;
@@ -1462,7 +1461,7 @@ process_dokoko() {
         echo "已存在的监听为: $existing_ip : $existing_port "
         read -p "是否删除已存在的配置？ (y/n): " delete_option
         if [ "$delete_option" = "y" ]; then
-            jq --arg tag "$tag" 'del(.inbounds[] | select(.tag == $tag)) | .route.rules = (.route.rules | map(select(.inbound != $tag)))' "$config_file" > "${config_file}.temp" && mv "${config_file}.temp" "$config_file"
+            jq --arg tag "$tag" 'del(.inbounds[] | select(.tag == $tag)) | del(.outbounds[] | select(.tag == ($tag + "-out"))) | .route.rules = (.route.rules | map(select(.inbound != $tag)))' "$config_file" > "${config_file}.temp" && mv "${config_file}.temp" "$config_file"
             echo "已删除配置"
             systemctl restart sing-box
         else
@@ -1494,11 +1493,16 @@ process_dokoko() {
                     "listen": $fip,
                     "listen_port": ($fport | tonumber)
                 }
+            ] | .outbounds += [
+                {
+                    "type": "direct",
+                    "tag": "direct-in-out",
+                    "override_port": 443
+                }
             ] | .route.rules += [
                 {
                     "inbound": "direct-in",
-                    "outbound": "direct",
-                    "override_port": 443
+                    "outbound": "direct-in-out"
                 }
             ]' "$config_file" > "${config_file}.temp" && mv "${config_file}.temp" "$config_file"
         echo "已添加任意门解锁机配置"
@@ -1691,7 +1695,7 @@ disable_hy2hopping(){
 }
 
 #--------------------------------
-print_with_delay "Reality Hysteria2 二合一脚本 by 绵阿羊" 0.03
+print_with_delay "Reality Hysteria2 二合一脚本" 0.03
 echo ""
 echo ""
 install_pkgs
@@ -1861,7 +1865,6 @@ cat > /root/sbox/sbconfig_server.json << EOF
     ]
   },
   "route": {
-    "final": "direct",
     "rules": [
       {
         "action": "sniff"
