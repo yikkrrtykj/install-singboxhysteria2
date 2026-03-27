@@ -386,7 +386,7 @@ proxy-groups:
 
 
 rules:
-    - AND,((NETWORK,udp),(DEST-PORT,443)),REJECT
+    - AND,((NETWORK,udp),(DST-PORT,443)),REJECT
     - GEOIP,LAN,DIRECT
     - GEOIP,CN,DIRECT
     - MATCH,节点选择
