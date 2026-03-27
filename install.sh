@@ -1239,7 +1239,7 @@ enable_warp(){
                 "action": "reject"
               },
               {
-                "rule_set": ["geosite-openai","geosite-netflix"],
+                "rule_set": ["geosite-openai","geosite-netflix","geosite-google"],
                 "outbound": $warp_out
               },
               {
@@ -1262,6 +1262,13 @@ enable_warp(){
                 "type": "remote",
                 "format": "binary",
                 "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/netflix.srs",
+                "download_detour": "direct"
+              },
+              {
+                "tag": "geosite-google",
+                "type": "remote",
+                "format": "binary",
+                "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/google.srs",
                 "download_detour": "direct"
               }
             ]
