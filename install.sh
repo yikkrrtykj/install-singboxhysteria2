@@ -1230,8 +1230,7 @@ enable_warp(){
             "final": "direct",
             "rules": [
               {
-                "action": "sniff",
-                "sniff_override_destination": true
+                "action": "sniff"
               },
               {
                 "rule_set": ["geosite-openai","geosite-netflix"],
@@ -1322,7 +1321,7 @@ enable_warp(){
 }
 
 disable_warp(){
-    jq '.route = {"rules": [{"action": "sniff", "sniff_override_destination": true}]} | del(.outbounds[] | select(.tag == "warp-IPv4-out" or .tag == "warp-IPv6-out" or .tag == "doko" or .tag == "ss-out" or .tag == "warp-IPv4-prefer-out" or .tag == "warp-IPv6-prefer-out" or .tag == "wireguard-out"))' "/root/sbox/sbconfig_server.json" > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp "/root/sbox/sbconfig_server.json"
+    jq '.route = {"rules": [{"action": "sniff"}]} | del(.outbounds[] | select(.tag == "warp-IPv4-out" or .tag == "warp-IPv6-out" or .tag == "doko" or .tag == "ss-out" or .tag == "warp-IPv4-prefer-out" or .tag == "warp-IPv6-prefer-out" or .tag == "wireguard-out"))' "/root/sbox/sbconfig_server.json" > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp "/root/sbox/sbconfig_server.json"
     sed -i "s/WARP_ENABLE=TRUE/WARP_ENABLE=FALSE/" /root/sbox/config
     reload_singbox
 }
@@ -1795,8 +1794,7 @@ cat > /root/sbox/sbconfig_server.json << EOF
   "route": {
     "rules": [
       {
-        "action": "sniff",
-        "sniff_override_destination": true
+        "action": "sniff"
       }
     ]
   },
