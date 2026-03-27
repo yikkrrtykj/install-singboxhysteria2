@@ -923,6 +923,7 @@ process_warp(){
                       read -p "请输入落地机vps ip: " ipaddress
                       read -p "请输入落地机vps 端口: " tport
                       tport=${tport:-443}
+                      ipaddress=$ssipaddress
                       warp_out="doko"
                       sed -i "s/WARP_MODE=.*/WARP_MODE=4/" /root/sbox/config
                       break
@@ -1166,12 +1167,10 @@ enable_warp(){
               break
               ;;
           0)
-              # Exit the loop if option 0 is selected
               echo "退出"
               exit 0
               ;;
           *)
-              # Handle invalid input
               echo "无效的输入，请重新输入"
               ;;
       esac
@@ -1235,12 +1234,10 @@ enable_warp(){
               break
               ;;
           0)
-              # Exit the loop if option 0 is selected
               echo "退出"
               exit 0
               ;;
           *)
-              # Handle invalid input
               echo "无效的输入，请重新输入"
               ;;
       esac
@@ -1430,14 +1427,14 @@ process_doko() {
                           "inbound": $tag,
                           "outbound": ($tag + "-out")
                       }
-                  ]' "/root/sbox/sbconfig_server.json" > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp "/root/sbox/sbconfig_server.json"
+                  ]' "/root/sbox/sbconfig_server.json" > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
               echo "已添加任意门规则配置 ($tag)"
               reload_singbox
               ;;
           2)
               echo "请输入要删除的任意门规则标签 (例如：direct-in1): "
               read delete_tag
-              jq 'del(.inbounds[] | select(.tag == $delete_tag)) | del(.outbounds[] | select(.tag == ($delete_tag + "-out"))) | .route.rules = (.route.rules | map(select(.inbound != $delete_tag)))' --arg delete_tag "$delete_tag" "/root/sbox/sbconfig_server.json" > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp "/root/sbox/sbconfig_server.json"
+              jq 'del(.inbounds[] | select(.tag == $delete_tag)) | del(.outbounds[] | select(.tag == ($delete_tag + "-out"))) | .route.rules = (.route.rules | map(select(.inbound != $delete_tag)))' --arg delete_tag "$delete_tag" "/root/sbox/sbconfig_server.json" > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
               echo "已删除任意门规则 ($delete_tag)"
               reload_singbox
               ;;
