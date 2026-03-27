@@ -1631,7 +1631,7 @@ disable_hy2hopping(){
 }
 
 #--------------------------------
-print_with_delay "Reality Hysteria2 二合一脚本 by 绵阿羊" 0.03
+print_with_delay "Reality Hysteria2 二合一脚本" 0.03
 echo ""
 echo ""
 install_pkgs
