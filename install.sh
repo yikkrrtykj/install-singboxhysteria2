@@ -145,7 +145,7 @@ install_singbox(){
     echo "最新版本为: $latest_version"
     package_name="sing-box-${latest_version}-linux-${arch}"
     url="https://github.com/SagerNet/sing-box/releases/download/${latest_version_tag}/${package_name}.tar.gz"
-    curl -L#o "/root/${package_name}.tar.gz" "https://ghp.ci/$url"
+    curl -4 -L#o "/root/${package_name}.tar.gz" "$url"
     tar -xzf "/root/${package_name}.tar.gz" -C /root
     mv "/root/${package_name}/sing-box" /root/sbox
     rm -r "/root/${package_name}.tar.gz" "/root/${package_name}"
