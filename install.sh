@@ -860,13 +860,25 @@ process_warp(){
             read -p "请输入对应数字（0-5）: " warp_input
         case $warp_input in
           1)
-            jq '.route.final = "direct"' /root/sbox/sbconfig_server.json > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
+            jq '.route.rules[-1].outbound = "direct" | .route.rules[-1].domain_strategy = "ipv4_only"' /root/sbox/sbconfig_server.json > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
             sed -i "s/WARP_OPTION=.*/WARP_OPTION=0/" /root/sbox/config
             reload_singbox
           ;;
           2)
           if [ "$current_mode1" != "doko" ]; then
-            jq --arg current_mode1 "$current_mode1" '.route.final = $current_mode1' /root/sbox/sbconfig_server.json > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
+            target_outbound="wireguard-out"
+            domain_strategy=""
+            case $current_mode1 in
+                "warp-IPv6-prefer-out") domain_strategy="prefer_ipv6" ;;
+                "warp-IPv4-prefer-out") domain_strategy="prefer_ipv4" ;;
+                "warp-IPv6-out") domain_strategy="ipv6_only" ;;
+                "warp-IPv4-out") domain_strategy="ipv4_only" ;;
+                "ss-out") target_outbound="ss-out" ;;
+            esac
+            jq --arg target "$target_outbound" --arg strategy "$domain_strategy" '
+              .route.rules[-1].outbound = $target |
+              (if $strategy != "" then .route.rules[-1].domain_strategy = $strategy else del(.route.rules[-1].domain_strategy) end)
+            ' /root/sbox/sbconfig_server.json > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
             sed -i "s/WARP_OPTION=.*/WARP_OPTION=1/" /root/sbox/config
             reload_singbox
           else
@@ -931,31 +943,38 @@ process_warp(){
                       break
                       ;;
                   0)
-                      # Exit the loop if option 0 is selected
                       echo "退出warp"
                       exit 0
                       ;;
                   *)
-                      # Handle invalid input
                       echo "无效的输入，请重新输入"
                       ;;
               esac
           done
             
-            jq --arg warp_out "$warp_out" --arg ipaddress "${ipaddress:-1.0.0.1}" --arg tport "${tport:-53}" '
-              .route.rules |= map(
-                if has("rule_set") or has("domain_keyword") then
-                  if $warp_out == "doko" then
-                    .outbound = "direct" | .override_address = $ipaddress | .override_port = ($tport | tonumber)
-                  else
-                    .outbound = $warp_out | del(.override_address) | del(.override_port)
-                  end
-                else . end
-              )
+            target_outbound="wireguard-out"
+            domain_strategy=""
+            case $warp_out in
+                "warp-IPv6-prefer-out") domain_strategy="prefer_ipv6" ;;
+                "warp-IPv4-prefer-out") domain_strategy="prefer_ipv4" ;;
+                "warp-IPv6-out") domain_strategy="ipv6_only" ;;
+                "warp-IPv4-out") domain_strategy="ipv4_only" ;;
+                "doko") target_outbound="direct" ;;
+                "ss-out") target_outbound="ss-out" ;;
+            esac
+
+            jq --arg target "$target_outbound" --arg strategy "$domain_strategy" '
+              .route.rules[2].outbound = $target |
+              (if $strategy != "" then .route.rules[2].domain_strategy = $strategy else del(.route.rules[2].domain_strategy) end) |
+              .route.rules[3].outbound = $target |
+              (if $strategy != "" then .route.rules[3].domain_strategy = $strategy else del(.route.rules[3].domain_strategy) end)
             ' /root/sbox/sbconfig_server.json > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
             
-            if [ "$warp_option" -ne 0 ] && [ "$warp_out" != "doko" ]; then
-              jq --arg warp_out "$warp_out" '.route.final = $warp_out' /root/sbox/sbconfig_server.json > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
+            if [ "$warp_option" -ne 0 ] && [ "$target_outbound" != "direct" ]; then
+              jq --arg target "$target_outbound" --arg strategy "$domain_strategy" '
+                .route.rules[-1].outbound = $target |
+                (if $strategy != "" then .route.rules[-1].domain_strategy = $strategy else del(.route.rules[-1].domain_strategy) end)
+              ' /root/sbox/sbconfig_server.json > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
             fi
             reload_singbox
             ;;
@@ -1087,12 +1106,10 @@ process_warp(){
                     ;;
 
                 0)
-                    # Exit the loop if option 0 is selected
                     echo "退出"
                     exit 0
                     ;;
                 *)
-                    # Handle invalid input
                     echo "无效的输入"
                     ;;
             esac
@@ -1143,12 +1160,10 @@ enable_warp(){
               break
               ;;
           0)
-              # Exit the loop if option 0 is selected
               echo "退出"
               exit 0
               ;;
           *)
-              # Handle invalid input
               echo "无效的输入，请重新输入"
               ;;
       esac
@@ -1212,12 +1227,10 @@ enable_warp(){
               break
               ;;
           0)
-              # Exit the loop if option 0 is selected
               echo "退出"
               exit 0
               ;;
           *)
-              # Handle invalid input
               echo "无效的输入，请重新输入"
               ;;
       esac
