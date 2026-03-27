@@ -867,13 +867,9 @@ process_warp(){
           2)
           if [ "$current_mode1" != "doko" ]; then
             target_outbound="wireguard-out"
-            case $current_mode1 in
-                "warp-IPv6-prefer-out") target_outbound="warp-IPv6-prefer-out" ;;
-                "warp-IPv4-prefer-out") target_outbound="warp-IPv4-prefer-out" ;;
-                "warp-IPv6-out") target_outbound="warp-IPv6-out" ;;
-                "warp-IPv4-out") target_outbound="warp-IPv4-out" ;;
-                "ss-out") target_outbound="ss-out" ;;
-            esac
+            if [ "$current_mode1" == "ss-out" ]; then
+                target_outbound="ss-out"
+            fi
             jq --arg target "$target_outbound" '.route.final = $target' /root/sbox/sbconfig_server.json > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
             sed -i "s/WARP_OPTION=.*/WARP_OPTION=1/" /root/sbox/config
             reload_singbox
@@ -949,16 +945,22 @@ process_warp(){
           done
             
             target_outbound="wireguard-out"
+            domain_strategy=""
             case $warp_out in
-                "warp-IPv6-prefer-out") target_outbound="warp-IPv6-prefer-out" ;;
-                "warp-IPv4-prefer-out") target_outbound="warp-IPv4-prefer-out" ;;
-                "warp-IPv6-out") target_outbound="warp-IPv6-out" ;;
-                "warp-IPv4-out") target_outbound="warp-IPv4-out" ;;
-                "doko") target_outbound="doko-out" ;;
+                "warp-IPv6-prefer-out") domain_strategy="prefer_ipv6" ;;
+                "warp-IPv4-prefer-out") domain_strategy="prefer_ipv4" ;;
+                "warp-IPv6-out") domain_strategy="ipv6_only" ;;
+                "warp-IPv4-out") domain_strategy="ipv4_only" ;;
+                "doko") target_outbound="direct" ;;
                 "ss-out") target_outbound="ss-out" ;;
             esac
 
-            jq --arg target "$target_outbound" '
+            jq --arg target "$target_outbound" --arg strategy "$domain_strategy" '
+              .outbounds |= map(
+                if .tag == "wireguard-out" or .tag == "direct" then
+                  if $strategy != "" then .domain_resolver = {"server":"dns-local", "strategy":$strategy} else del(.domain_resolver) end
+                else . end
+              ) |
               .route.rules |= map(
                 if has("rule_set") or has("domain_keyword") then
                   .outbound = $target
@@ -966,7 +968,7 @@ process_warp(){
               )
             ' /root/sbox/sbconfig_server.json > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
             
-            if [ "$warp_option" -ne 0 ] && [ "$target_outbound" != "doko-out" ]; then
+            if [ "$warp_option" -ne 0 ] && [ "$target_outbound" != "direct" ]; then
               jq --arg target "$target_outbound" '.route.final = $target' /root/sbox/sbconfig_server.json > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
             fi
             reload_singbox
@@ -1002,7 +1004,7 @@ process_warp(){
                             url="https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/$new_keyword.srs"
                             formatted_keyword="geosite-$new_keyword"
                             # 检查是否存在相同的 geosite 关键字
-                            if jq --arg formatted_keyword "$formatted_keyword" '.route.rules[2].rule_set | any(. == $formatted_keyword)' /root/sbox/sbconfig_server.json | grep -q "true"; then
+                            if jq --arg formatted_keyword "$formatted_keyword" '.route.rules[] | select(has("rule_set")) | .rule_set | any(. == $formatted_keyword)' /root/sbox/sbconfig_server.json | grep -q "true"; then
                               echo "geosite已存在，不添加重复项: $formatted_keyword"
                             else
                               http_status=$(curl -s -o /dev/null -w "%{http_code}" "$url")
@@ -1017,7 +1019,7 @@ process_warp(){
                                     "download_detour": "direct"
                                   }'
 
-                                jq --arg formatted_keyword "$formatted_keyword" '.route.rules[2].rule_set += [$formatted_keyword]' /root/sbox/sbconfig_server.json > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
+                                jq --arg formatted_keyword "$formatted_keyword" '(.route.rules[] | select(has("rule_set")) | .rule_set) += [$formatted_keyword]' /root/sbox/sbconfig_server.json > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
                                 jq --argjson new_rule "$new_rule" '.route.rule_set += [$new_rule]' /root/sbox/sbconfig_server.json > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
 
                                 echo "geosite已添加: $new_rule"
@@ -1030,8 +1032,8 @@ process_warp(){
                             #delete domain keywords
                             read -p "请输入要删除的域名关键字（若要删除geosite-openai，输入openai） " keyword_to_delete
                             formatted_keyword="geosite-$keyword_to_delete"
-                            if jq --arg formatted_keyword "$formatted_keyword" '.route.rules[2].rule_set | any(. == $formatted_keyword)' /root/sbox/sbconfig_server.json | grep -q "true"; then
-                              jq --arg formatted_keyword "$formatted_keyword" '.route.rules[2].rule_set -= [$formatted_keyword]' /root/sbox/sbconfig_server.json > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
+                            if jq --arg formatted_keyword "$formatted_keyword" '.route.rules[] | select(has("rule_set")) | .rule_set | any(. == $formatted_keyword)' /root/sbox/sbconfig_server.json | grep -q "true"; then
+                              jq --arg formatted_keyword "$formatted_keyword" '(.route.rules[] | select(has("rule_set")) | .rule_set) -= [$formatted_keyword]' /root/sbox/sbconfig_server.json > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
                               #卸载ruleset
                               jq --arg formatted_keyword "$formatted_keyword" 'del(.route.rule_set[] | select(.tag == $formatted_keyword))' /root/sbox/sbconfig_server.json > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
                               echo "域名关键字已删除: $formatted_keyword"
@@ -1068,18 +1070,18 @@ process_warp(){
                           1)
                             #add domain keywords
                             read -p "请输入要添加的域名关键字: " new_keyword
-                            if jq --arg new_keyword "$new_keyword" '.route.rules[3].domain_keyword | any(. == $new_keyword)' /root/sbox/sbconfig_server.json | grep -q "true"; then
+                            if jq --arg new_keyword "$new_keyword" '.route.rules[] | select(has("domain_keyword")) | .domain_keyword | any(. == $new_keyword)' /root/sbox/sbconfig_server.json | grep -q "true"; then
                               echo "域名关键字已存在，不添加重复项: $new_keyword"
                             else
-                              jq --arg new_keyword "$new_keyword" '.route.rules[3].domain_keyword += [$new_keyword]' /root/sbox/sbconfig_server.json > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
+                              jq --arg new_keyword "$new_keyword" '(.route.rules[] | select(has("domain_keyword")) | .domain_keyword) += [$new_keyword]' /root/sbox/sbconfig_server.json > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
                               echo "域名关键字已添加: $new_keyword"
                             fi
                             ;;
                           2)
                             #delete domain keywords
                             read -p "请输入要删除的域名关键字: " keyword_to_delete
-                            if jq --arg keyword_to_delete "$keyword_to_delete" '.route.rules[3].domain_keyword | any(. == $keyword_to_delete)' /root/sbox/sbconfig_server.json | grep -q "true"; then
-                              jq --arg keyword_to_delete "$keyword_to_delete" '.route.rules[3].domain_keyword -= [$keyword_to_delete]' /root/sbox/sbconfig_server.json > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
+                            if jq --arg keyword_to_delete "$keyword_to_delete" '.route.rules[] | select(has("domain_keyword")) | .domain_keyword | any(. == $keyword_to_delete)' /root/sbox/sbconfig_server.json | grep -q "true"; then
+                              jq --arg keyword_to_delete "$keyword_to_delete" '(.route.rules[] | select(has("domain_keyword")) | .domain_keyword) -= [$keyword_to_delete]' /root/sbox/sbconfig_server.json > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
                               echo "域名关键字已删除: $keyword_to_delete"
                             else
                               echo "域名关键字不存在，不执行删除操作: $keyword_to_delete"
@@ -1099,10 +1101,12 @@ process_warp(){
                     ;;
 
                 0)
+                    # Exit the loop if option 0 is selected
                     echo "退出"
                     exit 0
                     ;;
                 *)
+                    # Handle invalid input
                     echo "无效的输入"
                     ;;
             esac
@@ -1153,10 +1157,12 @@ enable_warp(){
               break
               ;;
           0)
+              # Exit the loop if option 0 is selected
               echo "退出"
               exit 0
               ;;
           *)
+              # Handle invalid input
               echo "无效的输入，请重新输入"
               ;;
       esac
@@ -1220,27 +1226,38 @@ enable_warp(){
               break
               ;;
           0)
+              # Exit the loop if option 0 is selected
               echo "退出"
               exit 0
               ;;
           *)
+              # Handle invalid input
               echo "无效的输入，请重新输入"
               ;;
       esac
   done
   
       target_outbound="wireguard-out"
+      domain_strategy=""
       case $warp_out in
-          "warp-IPv6-prefer-out") target_outbound="warp-IPv6-prefer-out" ;;
-          "warp-IPv4-prefer-out") target_outbound="warp-IPv4-prefer-out" ;;
-          "warp-IPv6-out") target_outbound="warp-IPv6-out" ;;
-          "warp-IPv4-out") target_outbound="warp-IPv4-out" ;;
-          "doko") target_outbound="doko-out" ;;
+          "warp-IPv6-prefer-out") domain_strategy="prefer_ipv6" ;;
+          "warp-IPv4-prefer-out") domain_strategy="prefer_ipv4" ;;
+          "warp-IPv6-out") domain_strategy="ipv6_only" ;;
+          "warp-IPv4-out") domain_strategy="ipv4_only" ;;
+          "doko") target_outbound="direct" ;;
           "ss-out") target_outbound="ss-out" ;;
       esac
 
-      jq --arg private_key "$private_key" --arg v6 "$v6" --arg reserved "$reserved" --arg target_outbound "$target_outbound" --arg ipaddress "$ipaddress" --arg tport "$tport" --arg ssipaddress "$ssipaddress" --arg sstport "$sstport" --arg sspwd "$sspwd" '
-          .route.rules += [
+      jq --arg private_key "$private_key" --arg v6 "$v6" --arg reserved "$reserved" --arg target_outbound "$target_outbound" --arg strategy "$domain_strategy" --arg ipaddress "$ipaddress" --arg tport "$tport" --arg ssipaddress "$ssipaddress" --arg sstport "$sstport" --arg sspwd "$sspwd" '
+          .route.rules = [
+              {
+                "action": "sniff"
+              },
+              {
+                "network": "udp",
+                "port": 443,
+                "action": "reject"
+              },
               {
                 "rule_set": ["geosite-openai","geosite-netflix","geosite-google","geosite-youtube"],
                 "outbound": $target_outbound
@@ -1278,78 +1295,45 @@ enable_warp(){
                 "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/youtube.srs",
                 "download_detour": "direct"
               }
-          ] | .endpoints = [
-            {
-              "type": "wireguard",
-              "tag": "wireguard-out",
-              "system": false,
-              "address": [
-                "172.16.0.2/32",
-                ($v6 + "/128")
-              ],
-              "private_key": $private_key,
-              "mtu": 1280,
-              "peers": [
-                {
-                  "address": "162.159.192.1",
-                  "port": 2408,
-                  "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
-                  "allowed_ips": ["0.0.0.0/0", "::/0"],
-                  "reserved": $reserved
-                }
-              ]
-            }
           ] | .outbounds += [
-            {
-              "type": "direct",
-              "tag": "warp-IPv4-out",
-              "domain_resolver": {
-                "server": "dns-local",
-                "strategy": "ipv4_only"
-              },
-              "detour": "wireguard-out"
-            },
-            {
-              "type": "direct",
-              "tag": "warp-IPv6-out",
-              "domain_resolver": {
-                "server": "dns-local",
-                "strategy": "ipv6_only"
-              },
-              "detour": "wireguard-out"
-            },
-            {
-              "type": "direct",
-              "tag": "warp-IPv6-prefer-out",
-              "domain_resolver": {
-                "server": "dns-local",
-                "strategy": "prefer_ipv6"
-              },
-              "detour": "wireguard-out"
-            },
-            {
-              "type": "direct",
-              "tag": "warp-IPv4-prefer-out",
-              "domain_resolver": {
-                "server": "dns-local",
-                "strategy": "prefer_ipv4"
-              },
-              "detour": "wireguard-out"
-            },
-            {
-              "type": "direct",
-              "tag": "doko-out",
-              "override_address": $ipaddress,
-              "override_port": ($tport | tonumber)
-            },
-            {
-              "type": "shadowsocks",
-              "tag": "ss-out",
-              "server": $ssipaddress,
-              "server_port": ($sstport | tonumber),
-              "method": "2022-blake3-aes-128-gcm",
-              "password": $sspwd
-            }
+            (
+              {
+                "type": "wireguard",
+                "tag": "wireguard-out",
+                "local_address": [
+                  "172.16.0.2/32",
+                  ($v6 + "/128")
+                ],
+                "private_key": $private_key,
+                "mtu": 1280,
+                "peers": [
+                  {
+                    "server": "162.159.192.1",
+                    "server_port": 2408,
+                    "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+                    "reserved": $reserved
+                  }
+                ]
+              } | if $strategy != "" then .domain_resolver = {"server":"dns-local", "strategy":$strategy} else . end
+            ),
+            (
+              {
+                "type": "direct",
+                "tag": "doko-out",
+                "override_address": $ipaddress,
+                "override_port": ($tport | tonumber)
+              } | if $strategy != "" then .domain_resolver = {"server":"dns-local", "strategy":$strategy} else . end
+            ),
+            (
+              {
+                "type": "shadowsocks",
+                "tag": "ss-out",
+                "server": $ssipaddress,
+                "server_port": ($sstport | tonumber),
+                "method": "2022-blake3-aes-128-gcm",
+                "password": $sspwd
+              } | if $strategy != "" then .domain_resolver = {"server":"dns-local", "strategy":$strategy} else . end
+            )
           ]' "/root/sbox/sbconfig_server.json" > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp "/root/sbox/sbconfig_server.json"
 
       sed -i "s/WARP_ENABLE=FALSE/WARP_ENABLE=TRUE/" /root/sbox/config
@@ -1358,7 +1342,7 @@ enable_warp(){
 }
 
 disable_warp(){
-    jq '.route.rules = [{"action": "sniff"}, {"network": "udp", "port": 443, "action": "reject"}] | del(.route.rule_set) | del(.outbounds[] | select(.tag | startswith("warp-") or .tag == "doko-out" or .tag == "ss-out")) | del(.endpoints)' "/root/sbox/sbconfig_server.json" > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp "/root/sbox/sbconfig_server.json"
+    jq '.route.rules = [{"action": "sniff"}, {"network": "udp", "port": 443, "action": "reject"}] | del(.route.rule_set) | del(.outbounds[] | select(.tag == "wireguard-out" or .tag == "doko-out" or .tag == "ss-out"))' "/root/sbox/sbconfig_server.json" > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp "/root/sbox/sbconfig_server.json"
     sed -i "s/WARP_ENABLE=TRUE/WARP_ENABLE=FALSE/" /root/sbox/config
     reload_singbox
 }
@@ -1851,7 +1835,8 @@ cat > /root/sbox/sbconfig_server.json << EOF
     "servers": [
       {
         "tag": "dns-local",
-        "type": "local"
+        "address": "local",
+        "detour": "direct"
       }
     ]
   },
@@ -1921,6 +1906,10 @@ cat > /root/sbox/sbconfig_server.json << EOF
                 "server": "dns-local",
                 "strategy": "ipv4_only"
             }
+        },
+        {
+            "type": "block",
+            "tag": "block"
         }
     ]
 }
