@@ -94,7 +94,7 @@ install_pkgs() {
 install_shortcut() {
   cat > /root/sbox/mianyang.sh << EOF
 #!/usr/bin/env bash
-bash <(curl -fsSL https://github.com/vveg26/sing-box-reality-hysteria2/raw/main/install.sh) \$1
+bash <(curl -fsSL https://raw.githubusercontent.com/yikkrrtykj/install-singboxhysteria2/main/install.sh) \$1
 EOF
   chmod +x /root/sbox/mianyang.sh
   ln -sf /root/sbox/mianyang.sh /usr/bin/mianyang
@@ -1242,17 +1242,16 @@ enable_warp(){
   done
   
       target_outbound="wireguard-out"
-      domain_strategy=""
       case $warp_out in
-          "warp-IPv6-prefer-out") domain_strategy="prefer_ipv6" ;;
-          "warp-IPv4-prefer-out") domain_strategy="prefer_ipv4" ;;
-          "warp-IPv6-out") domain_strategy="ipv6_only" ;;
-          "warp-IPv4-out") domain_strategy="ipv4_only" ;;
-          "doko") target_outbound="direct" ;;
+          "warp-IPv6-prefer-out") target_outbound="warp-IPv6-prefer-out" ;;
+          "warp-IPv4-prefer-out") target_outbound="warp-IPv4-prefer-out" ;;
+          "warp-IPv6-out") target_outbound="warp-IPv6-out" ;;
+          "warp-IPv4-out") target_outbound="warp-IPv4-out" ;;
+          "doko") target_outbound="doko-out" ;;
           "ss-out") target_outbound="ss-out" ;;
       esac
 
-      jq --arg private_key "$private_key" --arg v6 "$v6" --arg reserved "$reserved" --arg target_outbound "$target_outbound" --arg strategy "$domain_strategy" --arg ipaddress "$ipaddress" --arg tport "$tport" --arg ssipaddress "$ssipaddress" --arg sstport "$sstport" --arg sspwd "$sspwd" '
+      jq --arg private_key "$private_key" --arg v6 "$v6" --arg reserved "$reserved" --arg target_outbound "$target_outbound" --arg ipaddress "$ipaddress" --arg tport "$tport" --arg ssipaddress "$ssipaddress" --arg sstport "$sstport" --arg sspwd "$sspwd" '
           .route.rules = [
               {
                 "action": "sniff"
@@ -1315,11 +1314,10 @@ enable_warp(){
                     "server": "162.159.192.1",
                     "server_port": 2408,
                     "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
-                    "allowed_ips": ["0.0.0.0/0", "::/0"],
                     "reserved": $reserved
                   }
                 ]
-              } | if $strategy != "" then .domain_resolver = {"server":"dns-local", "strategy":$strategy} else . end
+              }
             ),
             (
               {
@@ -1327,7 +1325,7 @@ enable_warp(){
                 "tag": "doko-out",
                 "override_address": $ipaddress,
                 "override_port": ($tport | tonumber)
-              } | if $strategy != "" then .domain_resolver = {"server":"dns-local", "strategy":$strategy} else . end
+              }
             ),
             (
               {
@@ -1337,7 +1335,7 @@ enable_warp(){
                 "server_port": ($sstport | tonumber),
                 "method": "2022-blake3-aes-128-gcm",
                 "password": $sspwd
-              } | if $strategy != "" then .domain_resolver = {"server":"dns-local", "strategy":$strategy} else . end
+              }
             )
           ]' "/root/sbox/sbconfig_server.json" > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp "/root/sbox/sbconfig_server.json"
 
@@ -1840,7 +1838,7 @@ cat > /root/sbox/sbconfig_server.json << EOF
     "servers": [
       {
         "tag": "dns-local",
-        "address": "local"
+        "type": "local"
       }
     ]
   },
