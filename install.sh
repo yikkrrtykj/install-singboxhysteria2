@@ -860,25 +860,21 @@ process_warp(){
             read -p "请输入对应数字（0-5）: " warp_input
         case $warp_input in
           1)
-            jq '.route.rules[-1].outbound = "direct" | .route.rules[-1].domain_strategy = "ipv4_only"' /root/sbox/sbconfig_server.json > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
+            jq '.route.final = "direct"' /root/sbox/sbconfig_server.json > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
             sed -i "s/WARP_OPTION=.*/WARP_OPTION=0/" /root/sbox/config
             reload_singbox
           ;;
           2)
           if [ "$current_mode1" != "doko" ]; then
             target_outbound="wireguard-out"
-            domain_strategy=""
             case $current_mode1 in
-                "warp-IPv6-prefer-out") domain_strategy="prefer_ipv6" ;;
-                "warp-IPv4-prefer-out") domain_strategy="prefer_ipv4" ;;
-                "warp-IPv6-out") domain_strategy="ipv6_only" ;;
-                "warp-IPv4-out") domain_strategy="ipv4_only" ;;
+                "warp-IPv6-prefer-out") target_outbound="warp-IPv6-prefer-out" ;;
+                "warp-IPv4-prefer-out") target_outbound="warp-IPv4-prefer-out" ;;
+                "warp-IPv6-out") target_outbound="warp-IPv6-out" ;;
+                "warp-IPv4-out") target_outbound="warp-IPv4-out" ;;
                 "ss-out") target_outbound="ss-out" ;;
             esac
-            jq --arg target "$target_outbound" --arg strategy "$domain_strategy" '
-              .route.rules[-1].outbound = $target |
-              (if $strategy != "" then .route.rules[-1].domain_strategy = $strategy else del(.route.rules[-1].domain_strategy) end)
-            ' /root/sbox/sbconfig_server.json > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
+            jq --arg target "$target_outbound" '.route.final = $target' /root/sbox/sbconfig_server.json > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
             sed -i "s/WARP_OPTION=.*/WARP_OPTION=1/" /root/sbox/config
             reload_singbox
           else
@@ -953,28 +949,25 @@ process_warp(){
           done
             
             target_outbound="wireguard-out"
-            domain_strategy=""
             case $warp_out in
-                "warp-IPv6-prefer-out") domain_strategy="prefer_ipv6" ;;
-                "warp-IPv4-prefer-out") domain_strategy="prefer_ipv4" ;;
-                "warp-IPv6-out") domain_strategy="ipv6_only" ;;
-                "warp-IPv4-out") domain_strategy="ipv4_only" ;;
-                "doko") target_outbound="direct" ;;
+                "warp-IPv6-prefer-out") target_outbound="warp-IPv6-prefer-out" ;;
+                "warp-IPv4-prefer-out") target_outbound="warp-IPv4-prefer-out" ;;
+                "warp-IPv6-out") target_outbound="warp-IPv6-out" ;;
+                "warp-IPv4-out") target_outbound="warp-IPv4-out" ;;
+                "doko") target_outbound="doko-out" ;;
                 "ss-out") target_outbound="ss-out" ;;
             esac
 
-            jq --arg target "$target_outbound" --arg strategy "$domain_strategy" '
-              .route.rules[2].outbound = $target |
-              (if $strategy != "" then .route.rules[2].domain_strategy = $strategy else del(.route.rules[2].domain_strategy) end) |
-              .route.rules[3].outbound = $target |
-              (if $strategy != "" then .route.rules[3].domain_strategy = $strategy else del(.route.rules[3].domain_strategy) end)
+            jq --arg target "$target_outbound" '
+              .route.rules |= map(
+                if has("rule_set") or has("domain_keyword") then
+                  .outbound = $target
+                else . end
+              )
             ' /root/sbox/sbconfig_server.json > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
             
-            if [ "$warp_option" -ne 0 ] && [ "$target_outbound" != "direct" ]; then
-              jq --arg target "$target_outbound" --arg strategy "$domain_strategy" '
-                .route.rules[-1].outbound = $target |
-                (if $strategy != "" then .route.rules[-1].domain_strategy = $strategy else del(.route.rules[-1].domain_strategy) end)
-              ' /root/sbox/sbconfig_server.json > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
+            if [ "$warp_option" -ne 0 ] && [ "$target_outbound" != "doko-out" ]; then
+              jq --arg target "$target_outbound" '.route.final = $target' /root/sbox/sbconfig_server.json > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
             fi
             reload_singbox
             ;;
@@ -1237,65 +1230,26 @@ enable_warp(){
   done
   
       target_outbound="wireguard-out"
-      domain_strategy=""
       case $warp_out in
-          "warp-IPv6-prefer-out") domain_strategy="prefer_ipv6" ;;
-          "warp-IPv4-prefer-out") domain_strategy="prefer_ipv4" ;;
-          "warp-IPv6-out") domain_strategy="ipv6_only" ;;
-          "warp-IPv4-out") domain_strategy="ipv4_only" ;;
-          "doko") target_outbound="direct" ;;
+          "warp-IPv6-prefer-out") target_outbound="warp-IPv6-prefer-out" ;;
+          "warp-IPv4-prefer-out") target_outbound="warp-IPv4-prefer-out" ;;
+          "warp-IPv6-out") target_outbound="warp-IPv6-out" ;;
+          "warp-IPv4-out") target_outbound="warp-IPv4-out" ;;
+          "doko") target_outbound="doko-out" ;;
           "ss-out") target_outbound="ss-out" ;;
       esac
 
-      jq --arg private_key "$private_key" --arg v6 "$v6" --arg reserved "$reserved" --arg target_outbound "$target_outbound" --arg strategy "$domain_strategy" --arg ipaddress "$ipaddress" --arg tport "$tport" --arg ssipaddress "$ssipaddress" --arg sstport "$sstport" --arg sspwd "$sspwd" '
-          .route = {
-            "rules": [
+      jq --arg private_key "$private_key" --arg v6 "$v6" --arg reserved "$reserved" --arg target_outbound "$target_outbound" --arg ipaddress "$ipaddress" --arg tport "$tport" --arg ssipaddress "$ssipaddress" --arg sstport "$sstport" --arg sspwd "$sspwd" '
+          .route.rules += [
               {
-                "action": "sniff"
+                "rule_set": ["geosite-openai","geosite-netflix","geosite-google","geosite-youtube"],
+                "outbound": $target_outbound
               },
               {
-                "network": "udp",
-                "port": 443,
-                "action": "reject"
-              },
-              (if $target_outbound == "direct" then
-                {
-                  "rule_set": ["geosite-openai","geosite-netflix","geosite-google","geosite-youtube"],
-                  "outbound": "direct",
-                  "override_address": $ipaddress,
-                  "override_port": ($tport | tonumber)
-                }
-              elif $target_outbound == "wireguard-out" then
-                {
-                  "rule_set": ["geosite-openai","geosite-netflix","geosite-google","geosite-youtube"],
-                  "outbound": "wireguard-out"
-                }
-              else
-                {
-                  "rule_set": ["geosite-openai","geosite-netflix","geosite-google","geosite-youtube"],
-                  "outbound": "ss-out"
-                }
-              end),
-              (if $target_outbound == "direct" then
-                {
-                  "domain_keyword": ["ipaddress"],
-                  "outbound": "direct",
-                  "override_address": $ipaddress,
-                  "override_port": ($tport | tonumber)
-                }
-              elif $target_outbound == "wireguard-out" then
-                {
-                  "domain_keyword": ["ipaddress"],
-                  "outbound": "wireguard-out"
-                }
-              else
-                {
-                  "domain_keyword": ["ipaddress"],
-                  "outbound": "ss-out"
-                }
-              end)
-            ],
-            "rule_set": [
+                "domain_keyword": ["ipaddress"],
+                "outbound": $target_outbound
+              }
+          ] | .route.rule_set = [
               { 
                 "tag": "geosite-openai",
                 "type": "remote",
@@ -1324,21 +1278,69 @@ enable_warp(){
                 "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/youtube.srs",
                 "download_detour": "direct"
               }
-            ]
-          } | .outbounds += [
+          ] | .endpoints = [
             {
               "type": "wireguard",
               "tag": "wireguard-out",
-              "server": "162.159.192.1",
-              "server_port": 2408,
-              "local_address": [
+              "system": false,
+              "address": [
                 "172.16.0.2/32",
                 ($v6 + "/128")
               ],
               "private_key": $private_key,
-              "reserved": $reserved,
-              "peer_public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
-              "mtu": 1280
+              "mtu": 1280,
+              "peers": [
+                {
+                  "address": "162.159.192.1",
+                  "port": 2408,
+                  "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+                  "allowed_ips": ["0.0.0.0/0", "::/0"],
+                  "reserved": $reserved
+                }
+              ]
+            }
+          ] | .outbounds += [
+            {
+              "type": "direct",
+              "tag": "warp-IPv4-out",
+              "domain_resolver": {
+                "server": "dns-local",
+                "strategy": "ipv4_only"
+              },
+              "detour": "wireguard-out"
+            },
+            {
+              "type": "direct",
+              "tag": "warp-IPv6-out",
+              "domain_resolver": {
+                "server": "dns-local",
+                "strategy": "ipv6_only"
+              },
+              "detour": "wireguard-out"
+            },
+            {
+              "type": "direct",
+              "tag": "warp-IPv6-prefer-out",
+              "domain_resolver": {
+                "server": "dns-local",
+                "strategy": "prefer_ipv6"
+              },
+              "detour": "wireguard-out"
+            },
+            {
+              "type": "direct",
+              "tag": "warp-IPv4-prefer-out",
+              "domain_resolver": {
+                "server": "dns-local",
+                "strategy": "prefer_ipv4"
+              },
+              "detour": "wireguard-out"
+            },
+            {
+              "type": "direct",
+              "tag": "doko-out",
+              "override_address": $ipaddress,
+              "override_port": ($tport | tonumber)
             },
             {
               "type": "shadowsocks",
@@ -1356,7 +1358,7 @@ enable_warp(){
 }
 
 disable_warp(){
-    jq '.route = {"rules": [{"action": "sniff"}, {"network": "udp", "port": 443, "action": "reject"}]} | del(.outbounds[] | select(.tag == "wireguard-out" or .tag == "ss-out" or .tag == "warp-IPv4-out" or .tag == "warp-IPv6-out" or .tag == "warp-IPv4-prefer-out" or .tag == "warp-IPv6-prefer-out")) | del(.endpoints)' "/root/sbox/sbconfig_server.json" > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp "/root/sbox/sbconfig_server.json"
+    jq '.route.rules = [{"action": "sniff"}, {"network": "udp", "port": 443, "action": "reject"}] | del(.route.rule_set) | del(.outbounds[] | select(.tag | startswith("warp-") or .tag == "doko-out" or .tag == "ss-out")) | del(.endpoints)' "/root/sbox/sbconfig_server.json" > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp "/root/sbox/sbconfig_server.json"
     sed -i "s/WARP_ENABLE=TRUE/WARP_ENABLE=FALSE/" /root/sbox/config
     reload_singbox
 }
@@ -1407,21 +1409,26 @@ process_doko() {
                           "listen": "::",
                           "listen_port": ($fport | tonumber)
                       }
-                  ] | .route.rules = [
+                  ] | .outbounds += [
                       {
-                          "inbound": $tag,
-                          "outbound": "direct",
+                          "type": "direct",
+                          "tag": ($tag + "-out"),
                           "override_address": $ipaddress,
                           "override_port": ($tport | tonumber)
                       }
-                  ] + .route.rules' "/root/sbox/sbconfig_server.json" > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp "/root/sbox/sbconfig_server.json"
+                  ] | .route.rules += [
+                      {
+                          "inbound": $tag,
+                          "outbound": ($tag + "-out")
+                      }
+                  ]' "/root/sbox/sbconfig_server.json" > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp "/root/sbox/sbconfig_server.json"
               echo "已添加任意门规则配置 ($tag)"
               reload_singbox
               ;;
           2)
               echo "请输入要删除的任意门规则标签 (例如：direct-in1): "
               read delete_tag
-              jq 'del(.inbounds[] | select(.tag == $delete_tag)) | .route.rules = (.route.rules | map(select(.inbound != $delete_tag)))' --arg delete_tag "$delete_tag" "/root/sbox/sbconfig_server.json" > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp "/root/sbox/sbconfig_server.json"
+              jq 'del(.inbounds[] | select(.tag == $delete_tag)) | del(.outbounds[] | select(.tag == ($delete_tag + "-out"))) | .route.rules = (.route.rules | map(select(.inbound != $delete_tag)))' --arg delete_tag "$delete_tag" "/root/sbox/sbconfig_server.json" > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp "/root/sbox/sbconfig_server.json"
               echo "已删除任意门规则 ($delete_tag)"
               reload_singbox
               ;;
@@ -1445,7 +1452,7 @@ process_dokoko() {
         echo "已存在的监听为: $existing_ip : $existing_port "
         read -p "是否删除已存在的配置？ (y/n): " delete_option
         if [ "$delete_option" = "y" ]; then
-            jq --arg tag "$tag" '.inbounds = (.inbounds | map(select(.tag != $tag))) | .route.rules = (.route.rules | map(select(.inbound != $tag)))' "$config_file" > "${config_file}.temp" && mv "${config_file}.temp" "$config_file"
+            jq --arg tag "$tag" 'del(.inbounds[] | select(.tag == $tag)) | del(.outbounds[] | select(.tag == ($tag + "-out"))) | .route.rules = (.route.rules | map(select(.inbound != $tag)))' "$config_file" > "${config_file}.temp" && mv "${config_file}.temp" "$config_file"
             echo "已删除配置"
             systemctl restart sing-box
         else
@@ -1477,13 +1484,18 @@ process_dokoko() {
                     "listen": $fip,
                     "listen_port": ($fport | tonumber)
                 }
-            ] | .route.rules = [
+            ] | .outbounds += [
                 {
-                    "inbound": "direct-in",
-                    "outbound": "direct",
+                    "type": "direct",
+                    "tag": "direct-in-out",
                     "override_port": 443
                 }
-            ] + .route.rules' "$config_file" > "${config_file}.temp" && mv "${config_file}.temp" "$config_file"
+            ] | .route.rules += [
+                {
+                    "inbound": "direct-in",
+                    "outbound": "direct-in-out"
+                }
+            ]' "$config_file" > "${config_file}.temp" && mv "${config_file}.temp" "$config_file"
         echo "已添加任意门解锁机配置"
         reload_singbox
     fi
