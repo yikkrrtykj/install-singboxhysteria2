@@ -1262,43 +1262,15 @@ enable_warp(){
                 "port": 443,
                 "action": "reject"
               },
-              (if $target_outbound == "direct" then
-                {
-                  "rule_set": ["geosite-openai","geosite-netflix","geosite-google","geosite-youtube"],
-                  "outbound": "direct",
-                  "override_address": $ipaddress,
-                  "override_port": ($tport | tonumber)
-                }
-              elif $target_outbound == "wireguard-out" then
-                {
-                  "rule_set": ["geosite-openai","geosite-netflix","geosite-google","geosite-youtube"],
-                  "outbound": "wireguard-out"
-                }
-              else
-                {
-                  "rule_set": ["geosite-openai","geosite-netflix","geosite-google","geosite-youtube"],
-                  "outbound": "ss-out"
-                }
-              end),
-              (if $target_outbound == "direct" then
-                {
-                  "domain_keyword": ["ipaddress"],
-                  "outbound": "direct",
-                  "override_address": $ipaddress,
-                  "override_port": ($tport | tonumber)
-                }
-              elif $target_outbound == "wireguard-out" then
-                {
-                  "domain_keyword": ["ipaddress"],
-                  "outbound": "wireguard-out"
-                }
-              else
-                {
-                  "domain_keyword": ["ipaddress"],
-                  "outbound": "ss-out"
-                }
-              end)
-            ] | .route.rule_set = [
+              {
+                "rule_set": ["geosite-openai","geosite-netflix","geosite-google","geosite-youtube"],
+                "outbound": $target_outbound
+              },
+              {
+                "domain_keyword": ["ipaddress"],
+                "outbound": $target_outbound
+              }
+          ] | .route.rule_set = [
               { 
                 "tag": "geosite-openai",
                 "type": "remote",
@@ -1327,7 +1299,7 @@ enable_warp(){
                 "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/youtube.srs",
                 "download_detour": "direct"
               }
-            ] | .outbounds += [
+          ] | .outbounds += [
             (
               {
                 "type": "wireguard",
@@ -1343,6 +1315,7 @@ enable_warp(){
                     "server": "162.159.192.1",
                     "server_port": 2408,
                     "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+                    "allowed_ips": ["0.0.0.0/0", "::/0"],
                     "reserved": $reserved
                   }
                 ]
@@ -1374,7 +1347,7 @@ enable_warp(){
 }
 
 disable_warp(){
-    jq '.route = {"rules": [{"action": "sniff"}, {"network": "udp", "port": 443, "action": "reject"}]} | del(.outbounds[] | select(.tag == "wireguard-out" or .tag == "doko-out" or .tag == "ss-out"))' "/root/sbox/sbconfig_server.json" > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp "/root/sbox/sbconfig_server.json"
+    jq '.route.rules = [{"action": "sniff"}, {"network": "udp", "port": 443, "action": "reject"}] | del(.route.rule_set) | del(.outbounds[] | select(.tag == "wireguard-out" or .tag == "doko-out" or .tag == "ss-out"))' "/root/sbox/sbconfig_server.json" > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp "/root/sbox/sbconfig_server.json"
     sed -i "s/WARP_ENABLE=TRUE/WARP_ENABLE=FALSE/" /root/sbox/config
     reload_singbox
 }
@@ -1867,7 +1840,7 @@ cat > /root/sbox/sbconfig_server.json << EOF
     "servers": [
       {
         "tag": "dns-local",
-        "type": "local"
+        "address": "local"
       }
     ]
   },
