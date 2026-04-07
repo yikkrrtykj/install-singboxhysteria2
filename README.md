@@ -9,6 +9,7 @@ cat /root/sbox/sbconfig_server.json | grep listen_port
 ```
 ---------------------
 如无法访问google
+
 1、拉取并运行 WARP 部署脚本13
 ```
 wget -N https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh && bash menu.sh
