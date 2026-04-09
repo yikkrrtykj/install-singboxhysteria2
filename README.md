@@ -2,6 +2,10 @@
 ```
 bash <(curl -fsSL https://raw.githubusercontent.com/yikkrrtykj/install-singboxhysteria2/main/install.sh)
 ```
+网络质量体检脚本
+```
+bash <(curl -Ls https://Check.Place) -N
+```
 ----------------------
 读取底层配置文件端口
 ```
