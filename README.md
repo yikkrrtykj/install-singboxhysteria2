@@ -4,7 +4,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/yikkrrtykj/install-singboxhy
 ```
 网络质量体检脚本
 ```
-bash <(curl -Ls https://Check.Place) -N
+bash <(curl -Ls https://Check.Place) -I
 ```
 ----------------------
 读取底层配置文件端口
