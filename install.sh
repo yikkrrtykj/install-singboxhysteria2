@@ -43,11 +43,8 @@ show_status(){
         cpu_usage=$(ps -p $singbox_pid -o %cpu | tail -n 1)
         memory_usage_mb=$(( $(ps -p "$singbox_pid" -o rss | tail -n 1) / 1024 ))
 
-        p_latest_version_tag=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases" | jq -r '[.[] | select(.prerelease==true)][0].tag_name' 2>/dev/null)
         latest_version_tag=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases" | jq -r '[.[] | select(.prerelease==false)][0].tag_name' 2>/dev/null)
-
         latest_version=${latest_version_tag#v}  # Remove 'v' prefix from version number
-        p_latest_version=${p_latest_version_tag#v}  # Remove 'v' prefix from version number
 
         iswarp=$(grep '^WARP_ENABLE=' /root/sbox/config | cut -d'=' -f2)
         hyhop=$(grep '^HY_HOPPING=' /root/sbox/config | cut -d'=' -f2)
@@ -57,9 +54,8 @@ show_status(){
         info "状态: 运行中"
         info "CPU 占用: $cpu_usage%"
         info "内存 占用: ${memory_usage_mb}MB"
-        info "singbox测试版最新版本: $p_latest_version"
         info "singbox正式版最新版本: $latest_version"
-        info "singbox当前版本(输入4管理切换): $(/root/sbox/sing-box version 2>/dev/null | awk '/version/{print $NF}')"
+		info "singbox当前版本: $(/root/sbox/sing-box version 2>/dev/null | awk '/version/{print $NF}')"
         info "warp流媒体解锁(输入6管理): $(if [ "$iswarp" == "TRUE" ]; then echo "开启"; else echo "关闭"; fi)"
         info "hy2端口跳跃(输入7管理): $(if [ "$hyhop" == "TRUE" ]; then echo "开启"; else echo "关闭"; fi)"
         hint "========================="
