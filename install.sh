@@ -298,7 +298,7 @@ proxies:
     server: $server_ip
     port: $hy_port
     password: $hy_password
-	up: "100 Mbps"
+    up: "100 Mbps"
     down: "100 Mbps"
     sni: $hy_server_name
     skip-cert-verify: true
