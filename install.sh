@@ -115,23 +115,11 @@ reload_singbox() {
 
 
 install_singbox(){
-		echo "请选择需要安装的SING-BOX版本:"
-		echo "1. 正式版"
-		echo "2. 测试版"
-		read -p "输入你的选项 (1-2, 默认: 1): " version_choice
-		version_choice=${version_choice:-1}
-		# Set the tag based on user choice
-		if [ "$version_choice" -eq 2 ]; then
-			echo "Installing Alpha version..."
-			latest_version_tag=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases" | jq -r '[.[] | select(.prerelease==true)][0].tag_name' 2>/dev/null)
-		else
-			echo "Installing Stable version..."
-			latest_version_tag=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases" | jq -r '[.[] | select(.prerelease==false)][0].tag_name' 2>/dev/null)
-		fi
+	echo "Installing latest stable version..."
+	latest_version_tag=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases" | jq -r '[.[] | select(.prerelease==false)][0].tag_name' 2>/dev/null)
     if [ -z "$latest_version_tag" ] || [ "$latest_version_tag" == "null" ]; then
             latest_version_tag="v1.13.4"
     fi
-		# No need to fetch the latest version tag again, it's already set based on user choice
 		latest_version=${latest_version_tag#v}  # Remove 'v' prefix from version number
 		echo "Latest version: $latest_version"
 		# Detect server architecture
@@ -151,60 +139,6 @@ install_singbox(){
     rm -r "/root/${package_name}.tar.gz" "/root/${package_name}"
     chown root:root /root/sbox/sing-box
     chmod +x /root/sbox/sing-box
-}
-
-change_singbox(){
-			echo "切换SING-BOX版本..."
-			echo ""
-			# Extract the current version
-			current_version_tag=$(/root/sbox/sing-box version | grep 'sing-box version' | awk '{print $3}')
-
-			# Fetch the latest stable and alpha version tags
-			latest_stable_version=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases" | jq -r '[.[] | select(.prerelease==false)][0].tag_name' 2>/dev/null)
-			latest_alpha_version=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases" | jq -r '[.[] | select(.prerelease==true)][0].tag_name' 2>/dev/null)
-
-			# Determine current version type (stable or alpha)
-      if [[ $current_version_tag == *"-alpha"* || $current_version_tag == *"-rc"* || $current_version_tag == *"-beta"* ]]; then
-				echo "当前为测试版，准备切换为最新正式版..."
-				echo ""
-				new_version_tag=$latest_stable_version
-			else
-				echo "当前为正式版，准备切换为最新测试版..."
-				echo ""
-				new_version_tag=$latest_alpha_version
-			fi
-
-			# Stop the service before updating
-			systemctl stop sing-box
-
-			# Download and replace the binary
-			arch=$(uname -m)
-			case $arch in
-				x86_64) arch="amd64" ;;
-				aarch64) arch="arm64" ;;
-				armv7l) arch="armv7" ;;
-			esac
-
-			package_name="sing-box-${new_version_tag#v}-linux-${arch}"
-			url="https://github.com/SagerNet/sing-box/releases/download/${new_version_tag}/${package_name}.tar.gz"
-
-			curl -sLo "/root/${package_name}.tar.gz" "$url"
-			tar -xzf "/root/${package_name}.tar.gz" -C /root
-			mv "/root/${package_name}/sing-box" /root/sbox/sing-box
-
-			# Cleanup the package
-			rm -r "/root/${package_name}.tar.gz" "/root/${package_name}"
-
-			# Set the permissions
-			chown root:root /root/sbox/sing-box
-			chmod +x /root/sbox/sing-box
-
-			# Restart the service with the new binary
-			systemctl daemon-reload
-			systemctl start sing-box
-
-			echo "Version switched and service restarted with the new binary."
-			echo ""
 }
 
 generate_port() {
@@ -337,6 +271,16 @@ dns:
     ipcidr:
       - 240.0.0.0/4
 
+tun:
+  enable: true
+  stack: system
+  device: Meta
+  mtu: 1420
+  auto-route: true
+  auto-detect-interface: true
+  dns-hijack:
+    - any:53
+	  
 proxies:        
   - name: Reality
     type: vless
@@ -358,6 +302,8 @@ proxies:
     server: $server_ip
     port: $hy_port
     password: $hy_password
+	up: "100 Mbps"
+    down: "100 Mbps"
     sni: $hy_server_name
     skip-cert-verify: true
     alpn:
@@ -383,7 +329,6 @@ proxy-groups:
 
 
 rules:
-    - AND,((NETWORK,udp),(DST-PORT,443)),REJECT
     - GEOIP,LAN,DIRECT
     - GEOIP,CN,DIRECT
     - MATCH,节点选择
@@ -1568,10 +1513,9 @@ process_singbox() {
     info "3. 查看sing-box状态"
     info "4. 查看sing-box实时日志"
     info "5. 查看sing-box服务端配置"
-    info "6. 切换SINGBOX内核版本"
     info "0. 退出"
     echo ""
-    read -p "请输入对应数字（0-6）: " user_input
+    read -p "请输入对应数字（0-5）: " user_input
     echo ""
     case "$user_input" in
         1)
@@ -1603,16 +1547,12 @@ process_singbox() {
             cat /root/sbox/sbconfig_server.json
             break
             ;;
-        6)
-            change_singbox
-            break
-            ;;
         0)
           echo "退出"
           break
           ;;
         *)
-            echo "请输入正确选项: 0-6"
+            echo "请输入正确选项: 0-5"
             ;;
     esac
   done
