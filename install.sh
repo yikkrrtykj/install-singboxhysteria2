@@ -248,7 +248,7 @@ global-client-fingerprint: chrome
 ipv6: true
 dns:
   enable: true
-  listen: :53
+  listen: "0.0.0.0:53"
   ipv6: true
   enhanced-mode: fake-ip
   fake-ip-range: 198.18.0.1/16
@@ -275,7 +275,7 @@ tun:
   auto-route: true
   auto-detect-interface: true
   dns-hijack:
-    - any:53
+    - "any:53"
 	  
 proxies:        
   - name: Reality
