@@ -930,13 +930,8 @@ process_warp(){
             esac
 
             jq --arg target "$target_outbound" --arg strategy "$domain_strategy" --arg ipaddress "$ipaddress" --arg tport "$tport" '
-              .endpoints |= map(
-                if .tag == "wireguard-out" then
-                  if $strategy != "" then .domain_resolver = {"server":"dns-local", "strategy":$strategy} else del(.domain_resolver) end
-                else . end
-              ) |
               .outbounds |= map(
-                if .tag == "direct" or .tag == "ss-out" then
+                if .tag == "wireguard-out" or .tag == "direct" or .tag == "ss-out" then
                   if $strategy != "" then .domain_resolver = {"server":"dns-local", "strategy":$strategy} else del(.domain_resolver) end
                 else . end
               ) |
@@ -1292,29 +1287,23 @@ enable_warp(){
                 "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/netflix.srs",
                 "download_detour": "direct"
               }
-          ] | .endpoints = [
+          ] | .outbounds += [
             (
               {
                 "type": "wireguard",
                 "tag": "wireguard-out",
-                "address": [
+                "server": "162.159.192.1",
+                "server_port": 2408,
+                "local_address": [
                   "172.16.0.2/32",
                   ($v6 + "/128")
                 ],
                 "private_key": $private_key,
-                "mtu": 1280,
-                "peers": [
-                  {
-                    "address": "162.159.192.1",
-                    "port": 2408,
-                    "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
-                    "allowed_ips": ["0.0.0.0/0", "::/0"],
-                    "reserved": $reserved
-                  }
-                ]
+                "peer_public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+                "reserved": [$reserved],
+                "mtu": 1280
               } | if $strategy != "" then .domain_resolver = {"server":"dns-local", "strategy":$strategy} else . end
-            )
-          ] | .outbounds += [
+            ),
             (
               {
                 "type": "shadowsocks",
@@ -1335,8 +1324,7 @@ enable_warp(){
 disable_warp(){
     jq '.route.rules = [{"action": "sniff"}, {"network": "udp", "port": 443, "action": "reject"}] |
         del(.route.rule_set) |
-        .endpoints = ((.endpoints // []) | map(select(.tag != "wireguard-out"))) |
-        .outbounds = ((.outbounds // []) | map(select(.tag != "doko-out" and .tag != "ss-out")))' "/root/sbox/sbconfig_server.json" > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp "/root/sbox/sbconfig_server.json"
+        .outbounds = ((.outbounds // []) | map(select(.tag != "wireguard-out" and .tag != "ss-out")))' "/root/sbox/sbconfig_server.json" > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp "/root/sbox/sbconfig_server.json"
     sed -i "s/WARP_ENABLE=TRUE/WARP_ENABLE=FALSE/" /root/sbox/config
     reload_singbox
 }
