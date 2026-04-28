@@ -12,6 +12,28 @@ error() { warning "$*" && exit 1; }
 info() { echo -e "${green}$*${reset}"; }
 hint() { echo -e "${yellow}$*${reset}"; }
 
+SING_BOX_MIN_VERSION="1.13.0"
+SING_BOX_FALLBACK_VERSION_TAG="v1.13.8"
+
+version_at_least() {
+    local version="${1#v}"
+    local minimum="${2#v}"
+    local v_major v_minor v_patch m_major m_minor m_patch
+
+    IFS='.' read -r v_major v_minor v_patch _ <<< "$version"
+    IFS='.' read -r m_major m_minor m_patch _ <<< "$minimum"
+    v_major=${v_major:-0}; v_minor=${v_minor:-0}; v_patch=${v_patch:-0}
+    m_major=${m_major:-0}; m_minor=${m_minor:-0}; m_patch=${m_patch:-0}
+    v_patch=${v_patch%%[^0-9]*}
+    m_patch=${m_patch%%[^0-9]*}
+
+    if ((10#$v_major > 10#$m_major)); then return 0; fi
+    if ((10#$v_major < 10#$m_major)); then return 1; fi
+    if ((10#$v_minor > 10#$m_minor)); then return 0; fi
+    if ((10#$v_minor < 10#$m_minor)); then return 1; fi
+    ((10#${v_patch:-0} >= 10#${m_patch:-0}))
+}
+
 show_notice() {
     local message="$1"
     local terminal_width=$(tput cols)
@@ -111,12 +133,17 @@ reload_singbox() {
 
 
 install_singbox(){
-	echo "Installing latest stable version..."
-	latest_version_tag=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases" | jq -r '[.[] | select(.prerelease==false)][0].tag_name' 2>/dev/null)
+	echo "Installing sing-box ${SING_BOX_MIN_VERSION}+ stable version..."
+	latest_version_tag=$(curl -fsSL "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | jq -r '.tag_name // empty' 2>/dev/null)
     if [ -z "$latest_version_tag" ] || [ "$latest_version_tag" == "null" ]; then
-            latest_version_tag="v1.13.4"
+            latest_version_tag="$SING_BOX_FALLBACK_VERSION_TAG"
     fi
 		latest_version=${latest_version_tag#v}  # Remove 'v' prefix from version number
+    if ! version_at_least "$latest_version" "$SING_BOX_MIN_VERSION"; then
+            hint "GitHub 返回的版本 $latest_version 低于 ${SING_BOX_MIN_VERSION}，改用 ${SING_BOX_FALLBACK_VERSION_TAG#v}"
+            latest_version_tag="$SING_BOX_FALLBACK_VERSION_TAG"
+            latest_version=${latest_version_tag#v}
+    fi
 		echo "Latest version: $latest_version"
 		# Detect server architecture
 		arch=$(uname -m)
@@ -332,7 +359,7 @@ rules:
 EOF
   echo ""
   echo ""
-  show_notice "sing-box客户端配置1.8.0及以上"
+  show_notice "sing-box客户端配置1.13.0及以上"
 cat << EOF
 {
   "log": {
@@ -357,18 +384,18 @@ cat << EOF
     "servers": [
       {
         "tag": "proxyDns",
-        "type": "remote",
+        "type": "udp",
         "server": "8.8.8.8",
         "detour": "proxy"
       },
       {
         "tag": "localDns",
-        "type": "remote",
+        "type": "udp",
         "server": "223.5.5.5",
         "detour": "direct"
       },
       {
-        "tag": "remote",
+        "tag": "fakeip",
         "type": "fakeip",
         "inet4_range": "198.18.0.0/15",
         "inet6_range": "fc00::/18"
@@ -388,24 +415,23 @@ cat << EOF
         "action": "reject"
       },
       {
-        "outbound": "any",
-        "server": "localDns",
-        "disable_cache": true
-      },
-      {
         "rule_set": "geosite-cn",
+        "action": "route",
         "server": "localDns"
       },
       {
         "clash_mode": "direct",
+        "action": "route",
         "server": "localDns"
       },
       {
         "clash_mode": "global",
+        "action": "route",
         "server": "proxyDns"
       },
       {
         "rule_set": "geosite-geolocation-!cn",
+        "action": "route",
         "server": "proxyDns"
       },
       {
@@ -413,10 +439,11 @@ cat << EOF
           "A",
           "AAAA"
         ],
-        "server": "remote"
+        "action": "route",
+        "server": "fakeip"
       }
     ],
-    "independent_cache": true
+    "final": "proxyDns"
   },
   "inbounds": [
     {
@@ -494,7 +521,10 @@ cat << EOF
         },
     {
       "tag": "direct",
-      "type": "direct"
+      "type": "direct",
+      "domain_resolver": {
+        "server": "localDns"
+      }
     },
     {
       "tag": "auto",
@@ -537,6 +567,7 @@ cat << EOF
   ],
   "route": {
     "auto_detect_interface": true,
+    "default_domain_resolver": "localDns",
     "final": "proxy",
     "rules": [
       {
@@ -864,7 +895,6 @@ process_warp(){
                       read -p "请输入落地机vps ip: " ipaddress
                       read -p "请输入落地机vps 端口: " tport
                       tport=${tport:-443}
-                      ipaddress=$ssipaddress
                       warp_out="doko"
                       sed -i "s/WARP_MODE=.*/WARP_MODE=4/" /root/sbox/config
                       break
@@ -899,7 +929,7 @@ process_warp(){
                 "ss-out") target_outbound="ss-out" ;;
             esac
 
-            jq --arg target "$target_outbound" --arg strategy "$domain_strategy" '
+            jq --arg target "$target_outbound" --arg strategy "$domain_strategy" --arg ipaddress "$ipaddress" --arg tport "$tport" '
               .endpoints |= map(
                 if .tag == "wireguard-out" then
                   if $strategy != "" then .domain_resolver = {"server":"dns-local", "strategy":$strategy} else del(.domain_resolver) end
@@ -912,7 +942,13 @@ process_warp(){
               ) |
               .route.rules |= map(
                 if has("rule_set") or has("domain_keyword") then
-                  .outbound = $target
+                  .outbound = $target |
+                  if $target == "direct" then
+                    .override_address = $ipaddress |
+                    .override_port = ($tport | tonumber)
+                  else
+                    del(.override_address) | del(.override_port)
+                  end
                 else . end
               )
             ' /root/sbox/sbconfig_server.json > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
@@ -927,7 +963,7 @@ process_warp(){
           3)
             info "请选择："
             echo ""
-            info "1. 手动添加geosite分流（适配singbox1.8.0)"
+            info "1. 手动添加geosite分流（适配singbox1.13.0及以上)"
             info "2. 手动添加域名关键字匹配分流"
             info "0. 退出"
             echo ""
@@ -1281,14 +1317,6 @@ enable_warp(){
           ] | .outbounds += [
             (
               {
-                "type": "direct",
-                "tag": "doko-out",
-                "override_address": $ipaddress,
-                "override_port": ($tport | tonumber)
-              } | if $strategy != "" then .domain_resolver = {"server":"dns-local", "strategy":$strategy} else . end
-            ),
-            (
-              {
                 "type": "shadowsocks",
                 "tag": "ss-out",
                 "server": $ssipaddress,
@@ -1305,7 +1333,10 @@ enable_warp(){
 }
 
 disable_warp(){
-    jq '.route.rules = [{"action": "sniff"}, {"network": "udp", "port": 443, "action": "reject"}] | del(.route.rule_set) | del(.outbounds[] | select(.tag == "wireguard-out" or .tag == "doko-out" or .tag == "ss-out"))' "/root/sbox/sbconfig_server.json" > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp "/root/sbox/sbconfig_server.json"
+    jq '.route.rules = [{"action": "sniff"}, {"network": "udp", "port": 443, "action": "reject"}] |
+        del(.route.rule_set) |
+        .endpoints = ((.endpoints // []) | map(select(.tag != "wireguard-out"))) |
+        .outbounds = ((.outbounds // []) | map(select(.tag != "doko-out" and .tag != "ss-out")))' "/root/sbox/sbconfig_server.json" > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp "/root/sbox/sbconfig_server.json"
     sed -i "s/WARP_ENABLE=TRUE/WARP_ENABLE=FALSE/" /root/sbox/config
     reload_singbox
 }
@@ -1329,7 +1360,7 @@ generate_random_number() {
 process_doko() {
   while :; do
       echo "已配置的任意门转发规则如下:"
-      jq '.route.rules[] | select(.inbound | startswith("direct-in")) | "\(.inbound): 转发至ip \(.override_address), 转发至端口 \(.override_port)"' /root/sbox/sbconfig_server.json
+      jq '.inbounds[] | select((.tag // "") | startswith("direct-in")) | "\(.tag): 转发至ip \(.override_address // "未设置"), 转发至端口 \(.override_port // "未设置")"' /root/sbox/sbconfig_server.json
       echo ""
       echo "选择操作:"
       echo "1. 添加规则"
@@ -1354,19 +1385,14 @@ process_doko() {
                           "type": "direct",
                           "tag": $tag,
                           "listen": "::",
-                          "listen_port": ($fport | tonumber)
-                      }
-                  ] | .outbounds += [
-                      {
-                          "type": "direct",
-                          "tag": ($tag + "-out"),
                           "override_address": $ipaddress,
-                          "override_port": ($tport | tonumber)
+                          "override_port": ($tport | tonumber),
+                          "listen_port": ($fport | tonumber)
                       }
                   ] | .route.rules += [
                       {
                           "inbound": $tag,
-                          "outbound": ($tag + "-out")
+                          "outbound": "direct"
                       }
                   ]' "/root/sbox/sbconfig_server.json" > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
               echo "已添加任意门规则配置 ($tag)"
@@ -1429,18 +1455,13 @@ process_dokoko() {
                     "type": "direct",
                     "tag": "direct-in",
                     "listen": $fip,
-                    "listen_port": ($fport | tonumber)
-                }
-            ] | .outbounds += [
-                {
-                    "type": "direct",
-                    "tag": "direct-in-out",
+                    "listen_port": ($fport | tonumber),
                     "override_port": 443
                 }
             ] | .route.rules += [
                 {
                     "inbound": "direct-in",
-                    "outbound": "direct-in-out"
+                    "outbound": "direct"
                 }
             ]' "$config_file" > "${config_file}.temp" && mv "${config_file}.temp" "$config_file"
         echo "已添加任意门解锁机配置"
