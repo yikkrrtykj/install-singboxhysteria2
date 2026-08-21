@@ -13,7 +13,7 @@ info() { echo -e "${green}$*${reset}"; }
 hint() { echo -e "${yellow}$*${reset}"; }
 
 SING_BOX_MIN_VERSION="1.13.0"
-SING_BOX_FALLBACK_VERSION_TAG="v1.13.8"
+SING_BOX_FALLBACK_VERSION_TAG="v1.13.19"
 
 version_at_least() {
     local version="${1#v}"
@@ -59,11 +59,12 @@ print_with_delay() {
 
 
 show_status(){
-    singbox_pid=$(pgrep sing-box)
-    singbox_status=$(systemctl is-active sing-box)
-    if [ "$singbox_status" == "active" ]; then
-        cpu_usage=$(ps -p $singbox_pid -o %cpu | tail -n 1)
-        memory_usage_mb=$(( $(ps -p "$singbox_pid" -o rss | tail -n 1) / 1024 ))
+    singbox_pid=$(pgrep -o -x sing-box 2>/dev/null || true)
+    singbox_status=$(systemctl is-active sing-box 2>/dev/null || true)
+    if [ -n "$singbox_pid" ]; then
+        cpu_usage=$(ps -p "$singbox_pid" -o %cpu= | xargs)
+        memory_usage_kb=$(ps -p "$singbox_pid" -o rss= | xargs)
+        memory_usage_mb=$(( ${memory_usage_kb:-0} / 1024 ))
 
         latest_version_tag=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases" | jq -r '[.[] | select(.prerelease==false)][0].tag_name' 2>/dev/null)
         latest_version=${latest_version_tag#v}  # Remove 'v' prefix from version number
@@ -74,6 +75,11 @@ show_status(){
         warning "SING-BOX服务状态信息:"
         hint "========================="
         info "状态: 运行中"
+        if [ "$singbox_status" == "active" ]; then
+            info "启动方式: systemd (sing-box.service)"
+        else
+            warning "启动方式: 手工进程（sing-box.service 当前未激活）"
+        fi
         info "CPU 占用: $cpu_usage%"
         info "内存 占用: ${memory_usage_mb}MB"
         info "singbox正式版最新版本: $latest_version"
@@ -120,11 +126,30 @@ EOF
 
 reload_singbox() {
     if /root/sbox/sing-box check -c /root/sbox/sbconfig_server.json; then
-        echo "检查配置文件成功，开始重启服务..."
-        if systemctl reload sing-box; then
-            echo "服务重启成功."
+        echo "检查配置文件成功，开始重新加载服务..."
+        if systemctl is-active --quiet sing-box; then
+            if systemctl reload sing-box; then
+                echo "systemd 服务重新加载成功."
+            else
+                error "systemd 服务重新加载失败，请检查日志"
+            fi
+        elif pgrep -x sing-box >/dev/null 2>&1; then
+            singbox_pid=$(pgrep -o -x sing-box)
+            if kill -HUP "$singbox_pid"; then
+                echo "手工启动的 sing-box 进程已重新加载配置."
+            else
+                error "无法重新加载手工启动的 sing-box 进程"
+            fi
         else
-            error "服务重启失败，请检查错误日志"
+            error "未找到正在运行的 sing-box 进程"
+        fi
+
+        if systemctl is-active --quiet sing-box-hy2-hopping.service; then
+            if systemctl reload sing-box-hy2-hopping.service; then
+                info "Hysteria2 端口跳跃规则已同步刷新."
+            else
+                error "Hysteria2 端口跳跃规则刷新失败"
+            fi
         fi
     else
         error "配置文件检查错误，请检查配置文件"
@@ -156,12 +181,42 @@ install_singbox(){
     echo "最新版本为: $latest_version"
     package_name="sing-box-${latest_version}-linux-${arch}"
     url="https://github.com/SagerNet/sing-box/releases/download/${latest_version_tag}/${package_name}.tar.gz"
-    curl -4 -L#o "/root/${package_name}.tar.gz" "$url"
-    tar -xzf "/root/${package_name}.tar.gz" -C /root
-    mv "/root/${package_name}/sing-box" /root/sbox
-    rm -r "/root/${package_name}.tar.gz" "/root/${package_name}"
-    chown root:root /root/sbox/sing-box
-    chmod +x /root/sbox/sing-box
+    archive_path="/root/${package_name}.tar.gz"
+    candidate_path="/root/sbox/sing-box.new"
+    curl -4 -fL --progress-bar -o "$archive_path" "$url" || error "下载 sing-box 失败"
+    tar -tzf "$archive_path" >/dev/null 2>&1 || error "下载包校验失败"
+    tar -xzf "$archive_path" -C /root || error "解压 sing-box 失败"
+    install -m 0755 -o root -g root "/root/${package_name}/sing-box" "$candidate_path" || error "准备新版 sing-box 失败"
+    rm -rf "$archive_path" "/root/${package_name}"
+
+    if [ -f /root/sbox/sbconfig_server.json ]; then
+        "$candidate_path" check -c /root/sbox/sbconfig_server.json || {
+            rm -f "$candidate_path"
+            error "新版 sing-box 无法通过现有配置检查，已保留当前版本"
+        }
+    fi
+
+    if [ -x /root/sbox/sing-box ]; then
+        backup_path="/root/sbox/sing-box.backup-$(date +%Y%m%d-%H%M%S)"
+        cp -a /root/sbox/sing-box "$backup_path" || error "备份当前 sing-box 失败"
+        info "旧版 sing-box 已备份到: $backup_path"
+    fi
+    mv -f "$candidate_path" /root/sbox/sing-box || error "替换 sing-box 失败"
+}
+
+restart_singbox() {
+    if systemctl is-active --quiet sing-box; then
+        systemctl restart sing-box
+        return $?
+    fi
+
+    if pgrep -x sing-box >/dev/null 2>&1; then
+        warning "检测到 sing-box 正由手工进程运行，拒绝启动第二个 systemd 实例。"
+        warning "请先安排维护窗口，将现有进程平滑迁移到 sing-box.service。"
+        return 2
+    fi
+
+    systemctl start sing-box
 }
 
 generate_port() {
@@ -170,7 +225,7 @@ generate_port() {
         port=$((RANDOM % 10001 + 10000))
         read -p "请为 ${protocol} 输入监听端口(默认为随机生成): " user_input
         port=${user_input:-$port}
-        ss -tuln | grep -q ":$port\b" || { echo "$port"; return $port; }
+        ss -tuln | grep -q ":$port\b" || { echo "$port"; return 0; }
         echo "端口 $port 被占用，请输入其他端口"
     done
 }
@@ -225,17 +280,25 @@ show_client_configuration() {
   hy_server_name=$(grep -o "HY_SERVER_NAME='[^']*'" /root/sbox/config | awk -F"'" '{print $2}')
   hy_password=$(jq -r '.inbounds[] | select(.tag == "hy2-in") | .users[0].password' /root/sbox/sbconfig_server.json)
   ishopping=$(grep '^HY_HOPPING=' /root/sbox/config | cut -d'=' -f2)
-  if [ "$ishopping" = "FALSE" ]; then
+  hy_hopping_start=$(grep '^HY_HOPPING_START=' /root/sbox/config | cut -d'=' -f2)
+  hy_hopping_end=$(grep '^HY_HOPPING_END=' /root/sbox/config | cut -d'=' -f2)
+  hy_server_port_json="            \"server_port\": $hy_port,"
+  hy_clash_port_yaml="    port: $hy_port"
+  formatted_range=""
+  if [ "$ishopping" = "TRUE" ] &&
+     [[ "$hy_hopping_start" =~ ^[0-9]+$ ]] &&
+     [[ "$hy_hopping_end" =~ ^[0-9]+$ ]]; then
+      formatted_range="${hy_hopping_start}-${hy_hopping_end}"
+      hy_server_port_json="            \"server_ports\": [\"${hy_hopping_start}:${hy_hopping_end}\"],"
+      hy_clash_port_yaml="    port: $hy_port
+    ports: ${formatted_range}
+    hop-interval: 30"
+      hy2_link="hysteria2://$hy_password@$server_ip:$hy_port?insecure=1&sni=$hy_server_name&mport=${hy_port},${formatted_range}#SING-BOX-HYSTERIA2"
+  elif [ "$ishopping" = "TRUE" ]; then
+      warning "端口跳跃已标记为开启，但配置中没有有效端口范围，将显示固定端口配置。"
       hy2_link="hysteria2://$hy_password@$server_ip:$hy_port?insecure=1&sni=$hy_server_name#SING-BOX-HYSTERIA2"
   else
-      hopping_range=$(iptables -t nat -L -n -v | grep "udp" | grep -oP 'dpts:\K\d+:\d+' || ip6tables -t nat -L -n -v | grep "udp" | grep -oP 'dpts:\K\d+:\d+')
-      if [ -z "$hopping_range" ]; then
-          warning "端口跳跃已开启却未找到端口范围。"
-          hy2_link="hysteria2://$hy_password@$server_ip:$hy_port?insecure=1&sni=$hy_server_name#SING-BOX-HYSTERIA2"
-      else
-          formatted_range=$(echo "$hopping_range" | sed 's/:/-/')
-          hy2_link="hysteria2://$hy_password@$server_ip:$hy_port?insecure=1&sni=$hy_server_name&mport=${hy_port},${formatted_range}#SING-BOX-HYSTERIA2"
-      fi
+      hy2_link="hysteria2://$hy_password@$server_ip:$hy_port?insecure=1&sni=$hy_server_name#SING-BOX-HYSTERIA2"
   fi
   echo ""
   echo "" 
@@ -253,10 +316,10 @@ show_client_configuration() {
   echo "------------------------------------"
   echo "服务器ip: $server_ip"
   echo "端口号: $hy_port"
-  if [ "$ishopping" = "FALSE" ]; then
-    echo "端口跳跃未开启"
-  else
+  if [ "$ishopping" = "TRUE" ] && [ -n "$formatted_range" ]; then
     echo "跳跃端口为${formatted_range}"
+  else
+    echo "端口跳跃未开启"
   fi
   echo "密码password: $hy_password"
   echo "域名SNI: $hy_server_name"
@@ -323,10 +386,10 @@ proxies:
   - name: Hysteria2
     type: hysteria2
     server: $server_ip
-    port: $hy_port
+${hy_clash_port_yaml}
     password: $hy_password
-    up: "100 Mbps"
-    down: "100 Mbps"
+    up: "300 Mbps"
+    down: "300 Mbps"
     sni: $hy_server_name
     skip-cert-verify: true
     alpn:
@@ -505,10 +568,10 @@ cat << EOF
     {
             "type": "hysteria2",
             "server": "$server_ip",
-            "server_port": $hy_port,
+${hy_server_port_json}
             "tag": "sing-box-hysteria2",
-            "up_mbps": 100,
-            "down_mbps": 100,
+            "up_mbps": 300,
+            "down_mbps": 300,
             "password": "$hy_password",
             "tls": {
                 "enabled": true,
@@ -689,9 +752,82 @@ EOF
 
 }
 
+NETWORK_SYSCTL_FILE="/etc/sysctl.d/99-sing-box-network.conf"
+UDP_BUFFER_MIN_BYTES=16777216
+
+read_sysctl_number() {
+    sysctl -n "$1" 2>/dev/null | tr -cd '0-9'
+}
+
+larger_number() {
+    local first="${1:-0}"
+    local second="${2:-0}"
+    if (( first > second )); then
+        echo "$first"
+    else
+        echo "$second"
+    fi
+}
+
+write_network_sysctl() {
+    local request_bbr="${1:-FALSE}"
+    local current_rmem current_wmem target_rmem target_wmem current_cc temp_file
+
+    current_rmem=$(read_sysctl_number net.core.rmem_max)
+    current_wmem=$(read_sysctl_number net.core.wmem_max)
+    target_rmem=$(larger_number "${current_rmem:-0}" "$UDP_BUFFER_MIN_BYTES")
+    target_wmem=$(larger_number "${current_wmem:-0}" "$UDP_BUFFER_MIN_BYTES")
+    current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)
+    if [ "$current_cc" = "bbr" ]; then
+        request_bbr="TRUE"
+    fi
+
+    mkdir -p /etc/sysctl.d
+    temp_file=$(mktemp) || error "无法创建网络优化临时文件"
+    {
+        echo "# Managed by install-singboxhysteria2"
+        echo "# Keep UDP socket buffer limits at least 16 MiB for Hysteria2/QUIC."
+        echo "net.core.rmem_max = $target_rmem"
+        echo "net.core.wmem_max = $target_wmem"
+        if [ "$request_bbr" = "TRUE" ]; then
+            echo "# TCP tuning for Reality and proxied TCP traffic."
+            echo "net.core.default_qdisc = fq"
+            echo "net.ipv4.tcp_congestion_control = bbr"
+        fi
+    } > "$temp_file"
+
+    install -m 0644 "$temp_file" "$NETWORK_SYSCTL_FILE" || {
+        rm -f "$temp_file"
+        error "写入网络优化配置失败"
+    }
+    rm -f "$temp_file"
+    sysctl -p "$NETWORK_SYSCTL_FILE" || error "应用网络优化配置失败"
+
+    info "Hysteria2 UDP 接收缓冲上限: $(sysctl -n net.core.rmem_max)"
+    info "Hysteria2 UDP 发送缓冲上限: $(sysctl -n net.core.wmem_max)"
+}
+
+configure_udp_buffers() {
+    write_network_sysctl "FALSE"
+}
+
 enable_bbr() {
-    bash <(curl -L -s https://raw.githubusercontent.com/teddysun/across/master/bbr.sh)
-    echo ""
+    local available_cc
+
+    if command -v modprobe >/dev/null 2>&1; then
+        modprobe tcp_bbr >/dev/null 2>&1 || true
+    fi
+    available_cc=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+
+    if grep -qw bbr <<< "$available_cc"; then
+        write_network_sysctl "TRUE"
+        info "TCP BBR 已启用: $(sysctl -n net.ipv4.tcp_congestion_control)"
+        info "默认队列算法: $(sysctl -n net.core.default_qdisc)"
+    else
+        warning "当前内核不支持 TCP BBR；不会下载第三方脚本或自动更换内核。"
+        configure_udp_buffers
+        return 1
+    fi
 }
 
 modify_singbox() {
@@ -748,8 +884,40 @@ modify_singbox() {
     reload_singbox
 }
 
+backup_current_installation() {
+    local backup_dir backup_name unit_path
+
+    backup_name="sbox-backup-$(date +%Y%m%d-%H%M%S)"
+    backup_dir="/root/${backup_name}"
+    install -d -m 0700 "$backup_dir" || return 1
+    cp -a /root/sbox "$backup_dir/" || return 1
+    unit_path="$(systemctl show sing-box -p FragmentPath --value 2>/dev/null || true)"
+    if [ -n "$unit_path" ] && [ -e "$unit_path" ]; then
+        cp -a "$unit_path" "$backup_dir/sing-box.service.source"
+        printf '%s\n' "$unit_path" > "$backup_dir/sing-box.service.source-path.txt"
+    elif [ -e /etc/systemd/system/sing-box.service ]; then
+        cp -a /etc/systemd/system/sing-box.service "$backup_dir/sing-box.service.source"
+    fi
+    if [ -e /usr/bin/mianyang ] || [ -L /usr/bin/mianyang ]; then
+        cp -a --no-dereference /usr/bin/mianyang "$backup_dir/usr-bin-mianyang"
+    fi
+    systemctl cat sing-box > "$backup_dir/sing-box.unit.txt" 2>&1 || true
+    systemctl show sing-box -p LoadState -p ActiveState -p FragmentPath -p MainPID > "$backup_dir/sing-box.state.txt" 2>&1 || true
+    ps -ef | grep '[s]ing-box' > "$backup_dir/sing-box.process.txt" 2>&1 || true
+    sysctl net.core.rmem_max net.core.wmem_max net.core.default_qdisc net.ipv4.tcp_congestion_control > "$backup_dir/network-sysctl.txt" 2>&1 || true
+    iptables-save > "$backup_dir/iptables.rules" 2>/dev/null || true
+    ip6tables-save > "$backup_dir/ip6tables.rules" 2>/dev/null || true
+    tar -C /root -czf "/root/${backup_name}.tar.gz" "$backup_name" || return 1
+    chmod 0600 "/root/${backup_name}.tar.gz"
+    sha256sum "/root/${backup_name}.tar.gz" > "/root/${backup_name}.tar.gz.sha256"
+    info "完整备份已创建: /root/${backup_name}.tar.gz"
+}
+
 uninstall_singbox() {
     warning "开始卸载..."
+    if pgrep -x sing-box >/dev/null 2>&1 && ! systemctl is-active --quiet sing-box; then
+        error "sing-box 当前由手工进程运行。为防止删除运行中的配置，已拒绝卸载。"
+    fi
     disable_hy2hopping
     systemctl disable --now sing-box > /dev/null 2>&1
     rm -f /etc/systemd/system/sing-box.service
@@ -1335,7 +1503,16 @@ update_singbox(){
     # 检查配置
     if /root/sbox/sing-box check -c /root/sbox/sbconfig_server.json; then
       echo "检查配置文件成功，重启服务..."
-      systemctl restart sing-box
+      if restart_singbox; then
+          info "sing-box 已使用新版二进制启动"
+      else
+          restart_result=$?
+          if [ "$restart_result" -eq 2 ]; then
+              warning "新版二进制已安装并保留旧版备份，但手工运行的旧进程尚未重启。"
+          else
+              error "sing-box 重启失败，请使用备份二进制恢复"
+          fi
+      fi
     else
       error "启动失败，请检查配置文件"
     fi
@@ -1415,7 +1592,7 @@ process_dokoko() {
         if [ "$delete_option" = "y" ]; then
             jq --arg tag "$tag" 'del(.inbounds[] | select(.tag == $tag)) | del(.outbounds[] | select(.tag == ($tag + "-out"))) | .route.rules = (.route.rules | map(select(.inbound != $tag)))' "$config_file" > "${config_file}.temp" && mv "${config_file}.temp" "$config_file"
             echo "已删除配置"
-            systemctl restart sing-box
+            reload_singbox
         else
             echo "未删除配置"
         fi
@@ -1527,10 +1704,9 @@ process_singbox() {
             warning "重启sing-box..."
             # 检查配置
             if /root/sbox/sing-box check -c /root/sbox/sbconfig_server.json; then
-                info "检查配置文件，启动服务..."
-                systemctl restart sing-box
+              info "检查配置文件，启动服务..."
+              restart_singbox || warning "sing-box 未重启，请查看上方提示"
             fi
-            info "重启完成"
             break
             ;;
         2)
@@ -1596,8 +1772,8 @@ process_hy2hopping(){
                   ;;
                 3)
                   # 查看NAT规则
-                  iptables -t nat -L -n -v | grep "udp"
-                  ip6tables -t nat -L -n -v | grep "udp"
+                  iptables -t nat -L PREROUTING -n -v --line-numbers 2>/dev/null | grep "$HY_HOPPING_COMMENT"
+                  ip6tables -t nat -L PREROUTING -n -v --line-numbers 2>/dev/null | grep "$HY_HOPPING_COMMENT"
                   break
                   ;;
                 0)
@@ -1612,39 +1788,216 @@ process_hy2hopping(){
         done
 }
 # 开启hysteria2端口跳跃
+HY_HOPPING_COMMENT="sing-box-hy2-hopping"
+HY_HOPPING_HELPER="/root/sbox/hy2-hopping.sh"
+HY_HOPPING_SERVICE="/etc/systemd/system/sing-box-hy2-hopping.service"
+
+set_config_value() {
+    local key="$1"
+    local value="$2"
+    local config_file="/root/sbox/config"
+
+    if grep -q "^${key}=" "$config_file" 2>/dev/null; then
+        sed -i "s/^${key}=.*/${key}=${value}/" "$config_file"
+    else
+        printf '%s=%s\n' "$key" "$value" >> "$config_file"
+    fi
+}
+
+remove_hy2_hopping_rules() {
+    local firewall rule_number
+
+    for firewall in iptables ip6tables; do
+        command -v "$firewall" >/dev/null 2>&1 || continue
+        while :; do
+            rule_number=$("$firewall" -t nat -L PREROUTING -n -v --line-numbers 2>/dev/null |
+                awk -v marker="$HY_HOPPING_COMMENT" 'index($0, marker) {print $1; exit}')
+            [ -n "$rule_number" ] || break
+            "$firewall" -t nat -D PREROUTING "$rule_number" >/dev/null 2>&1 || break
+        done
+    done
+}
+
+install_hy2_hopping_helper() {
+    cat > "$HY_HOPPING_HELPER" <<'EOF'
+#!/usr/bin/env bash
+set -u
+
+CONFIG_FILE="/root/sbox/config"
+SERVER_CONFIG="/root/sbox/sbconfig_server.json"
+RULE_COMMENT="sing-box-hy2-hopping"
+
+remove_rules() {
+    local firewall rule_number
+    for firewall in iptables ip6tables; do
+        command -v "$firewall" >/dev/null 2>&1 || continue
+        while :; do
+            rule_number=$("$firewall" -t nat -L PREROUTING -n -v --line-numbers 2>/dev/null |
+                awk -v marker="$RULE_COMMENT" 'index($0, marker) {print $1; exit}')
+            [ -n "$rule_number" ] || break
+            "$firewall" -t nat -D PREROUTING "$rule_number" >/dev/null 2>&1 || break
+        done
+    done
+}
+
+apply_rules() {
+    local hy_port applied firewall hy_hopping hy_hopping_start hy_hopping_end
+    [ -f "$CONFIG_FILE" ] || { echo "Missing $CONFIG_FILE" >&2; return 1; }
+    hy_hopping=$(sed -n 's/^HY_HOPPING=//p' "$CONFIG_FILE" | tail -n 1 | tr -d "'\"")
+    hy_hopping_start=$(sed -n 's/^HY_HOPPING_START=//p' "$CONFIG_FILE" | tail -n 1 | tr -d "'\"")
+    hy_hopping_end=$(sed -n 's/^HY_HOPPING_END=//p' "$CONFIG_FILE" | tail -n 1 | tr -d "'\"")
+    [ "$hy_hopping" = "TRUE" ] || { remove_rules; return 0; }
+    [[ "$hy_hopping_start" =~ ^[0-9]+$ ]] || { echo "Invalid HY_HOPPING_START" >&2; return 1; }
+    [[ "$hy_hopping_end" =~ ^[0-9]+$ ]] || { echo "Invalid HY_HOPPING_END" >&2; return 1; }
+    (( hy_hopping_start >= 1 && hy_hopping_end <= 65535 && hy_hopping_start <= hy_hopping_end )) || {
+        echo "Invalid Hysteria2 hopping range" >&2
+        return 1
+    }
+
+    hy_port=$(jq -r '.inbounds[] | select(.tag == "hy2-in") | .listen_port' "$SERVER_CONFIG")
+    [[ "$hy_port" =~ ^[0-9]+$ ]] || { echo "Invalid Hysteria2 listen port" >&2; return 1; }
+
+    remove_rules
+    applied=0
+    for firewall in iptables ip6tables; do
+        command -v "$firewall" >/dev/null 2>&1 || continue
+        if "$firewall" -t nat -A PREROUTING -p udp \
+            --dport "${hy_hopping_start}:${hy_hopping_end}" \
+            -m comment --comment "$RULE_COMMENT" \
+            -j REDIRECT --to-ports "$hy_port"; then
+            applied=1
+        fi
+    done
+    (( applied == 1 )) || { echo "Failed to apply Hysteria2 hopping rules" >&2; return 1; }
+}
+
+case "${1:-apply}" in
+    apply) apply_rules ;;
+    remove) remove_rules ;;
+    *) echo "Usage: $0 {apply|remove}" >&2; exit 2 ;;
+esac
+EOF
+    chmod 0755 "$HY_HOPPING_HELPER"
+
+    cat > "$HY_HOPPING_SERVICE" <<'EOF'
+[Unit]
+Description=Persistent Hysteria2 port hopping rules for sing-box
+After=network-online.target sing-box.service
+Wants=network-online.target
+PartOf=sing-box.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/root/sbox/hy2-hopping.sh apply
+ExecReload=/root/sbox/hy2-hopping.sh apply
+ExecStop=/root/sbox/hy2-hopping.sh remove
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+}
+
 enable_hy2hopping(){
     hint "开启端口跳跃..."
     warning "注意: 端口跳跃范围不要覆盖已经占用的端口，否则会错误！"
-    hy_current_port=$(jq -r '.inbounds[] | select(.tag == "hy2-in") | .listen_port' /root/sbox/sbconfig_server.json)
-    read -p "输入UDP端口范围的起始值(默认50000): " -r start_port
-    start_port=${start_port:-50000}
-    read -p "输入UDP端口范围的结束值(默认51000): " -r end_port
-    end_port=${end_port:-51000}
-    iptables -t nat -A PREROUTING -i eth0 -p udp --dport $start_port:$end_port -j DNAT --to-destination :$hy_current_port
-    ip6tables -t nat -A PREROUTING -i eth0 -p udp --dport $start_port:$end_port -j DNAT --to-destination :$hy_current_port
+    while :; do
+        read -p "输入UDP端口范围的起始值(默认50000): " -r start_port
+        start_port=${start_port:-50000}
+        read -p "输入UDP端口范围的结束值(默认51000): " -r end_port
+        end_port=${end_port:-51000}
+        if [[ "$start_port" =~ ^[0-9]+$ ]] && [[ "$end_port" =~ ^[0-9]+$ ]] &&
+           (( start_port >= 1 && end_port <= 65535 && start_port <= end_port )); then
+            break
+        fi
+        warning "端口范围无效，必须满足 1 <= 起始端口 <= 结束端口 <= 65535。"
+    done
 
-    sed -i "s/HY_HOPPING=FALSE/HY_HOPPING=TRUE/" /root/sbox/config
+    set_config_value HY_HOPPING_START "$start_port"
+    set_config_value HY_HOPPING_END "$end_port"
+    set_config_value HY_HOPPING TRUE
+    install_hy2_hopping_helper
+
+    if systemctl enable --now sing-box-hy2-hopping.service; then
+        info "端口跳跃已开启并设置为重启后自动恢复: ${start_port}-${end_port}"
+        warning "请同时确认云防火墙和本机防火墙已放行该 UDP 端口范围。"
+    else
+        systemctl disable --now sing-box-hy2-hopping.service >/dev/null 2>&1 || true
+        set_config_value HY_HOPPING FALSE
+        remove_hy2_hopping_rules
+        rm -f "$HY_HOPPING_SERVICE" "$HY_HOPPING_HELPER"
+        systemctl daemon-reload
+        error "端口跳跃规则应用失败，已回退为关闭状态"
+    fi
 }
 
 disable_hy2hopping(){
   echo "正在关闭端口跳跃..."
-  iptables -t nat -F PREROUTING >/dev/null 2>&1
-  ip6tables -t nat -F PREROUTING >/dev/null 2>&1
-  sed -i "s/HY_HOPPING=TRUE/HY_HOPPING=FALSE/" /root/sbox/config
-  #TOREMOVE compatible with legacy users
-  sed -i "s/HY_HOPPING='TRUE'/HY_HOPPING=FALSE/" /root/sbox/config
+  if [ -f "$HY_HOPPING_SERVICE" ]; then
+      systemctl disable --now sing-box-hy2-hopping.service >/dev/null 2>&1 || true
+  fi
+  remove_hy2_hopping_rules
+  set_config_value HY_HOPPING FALSE
+  set_config_value HY_HOPPING_START ""
+  set_config_value HY_HOPPING_END ""
+  rm -f "$HY_HOPPING_SERVICE" "$HY_HOPPING_HELPER"
+  systemctl daemon-reload
   echo "关闭完成"
 }
 
 #--------------------------------
+INSTALLATION_MARKERS=(
+    /root/sbox/sbconfig_server.json
+    /root/sbox/config
+    /root/sbox/mianyang.sh
+    /usr/bin/mianyang
+    /root/sbox/sing-box
+    /etc/systemd/system/sing-box.service
+    /lib/systemd/system/sing-box.service
+    /usr/lib/systemd/system/sing-box.service
+)
+
+has_any_installation_marker() {
+    local marker
+    for marker in "${INSTALLATION_MARKERS[@]}"; do
+        if [ -e "$marker" ] || [ -L "$marker" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+show_installation_markers() {
+    local marker
+    for marker in "${INSTALLATION_MARKERS[@]}"; do
+        if [ -e "$marker" ] || [ -L "$marker" ]; then
+            info "存在: $marker"
+        else
+            warning "缺失: $marker"
+        fi
+    done
+}
+
 print_with_delay "Reality Hysteria2 二合一脚本" 0.03
 echo ""
 echo ""
-install_pkgs
-# Check if reality.json, sing-box, and sing-box.service already exist
-if [ -f "/root/sbox/sbconfig_server.json" ] && [ -f "/root/sbox/config" ] && [ -f "/root/sbox/mianyang.sh" ] && [ -f "/usr/bin/mianyang" ] && [ -f "/root/sbox/sing-box" ] && [ -f "/etc/systemd/system/sing-box.service" ]; then
+
+# Any existing marker blocks the automatic fresh-install path. This prevents a
+# missing shortcut or service file from causing silent key/config regeneration.
+if has_any_installation_marker; then
+    if [ ! -f /root/sbox/sbconfig_server.json ] ||
+       [ ! -f /root/sbox/config ] ||
+       [ ! -x /root/sbox/sing-box ]; then
+        warning "检测到不完整或非标准的现有安装。为防止覆盖 Reality/Hysteria2 配置，脚本已停止。"
+        show_installation_markers
+        error "请先备份并修复缺失文件，不会自动执行全新安装"
+    fi
+
+    install_pkgs
     echo ""
     warning "sing-box-reality-hysteria2已安装"
+    show_installation_markers
     show_status
     echo ""
     hint "=======常规配置========="
@@ -1654,7 +2007,7 @@ if [ -f "/root/sbox/sbconfig_server.json" ] && [ -f "/root/sbox/config" ] && [ -
     info "2. 修改配置"
     info "3. 显示客户端配置"
     info "4. sing-box基础操作"
-    info "5. 一键开启bbr"
+    info "5. 启用本地 BBR + 优化 Hysteria2 UDP 缓冲"
     info "6. 流媒体解锁"
     info "7. hysteria2端口跳跃"
     info "8. 本机添加任意门中转规则（本机做中转机）"
@@ -1671,6 +2024,13 @@ if [ -f "/root/sbox/sbconfig_server.json" ] && [ -f "/root/sbox/config" ] && [ -
 
     case $choice in
       1)
+          warning "重新安装会生成新的 Reality 密钥、UUID、端口和 Hysteria2 密码。"
+          read -r -p "如已确认，请输入 REINSTALL 继续: " reinstall_confirm
+          if [ "$reinstall_confirm" != "REINSTALL" ]; then
+              warning "输入不匹配，已取消重新安装"
+              exit 0
+          fi
+          backup_current_installation || error "重新安装前备份失败，已停止"
           uninstall_singbox
         ;;
       2)
@@ -1688,7 +2048,6 @@ if [ -f "/root/sbox/sbconfig_server.json" ] && [ -f "/root/sbox/config" ] && [ -
           ;;
       5)
           enable_bbr
-          mianyang
           exit 0
           ;;
       6)
@@ -1722,6 +2081,7 @@ if [ -f "/root/sbox/sbconfig_server.json" ] && [ -f "/root/sbox/config" ] && [ -
 	esac
 	fi
 
+install_pkgs
 mkdir -p "/root/sbox/"
 
 install_singbox
@@ -1782,6 +2142,8 @@ PUBLIC_KEY='$public_key'
 # Hysteria2
 HY_SERVER_NAME='$hy_server_name'
 HY_HOPPING=FALSE
+HY_HOPPING_START=
+HY_HOPPING_END=
 # Warp
 WARP_ENABLE=FALSE
 # 1 2 3 4
@@ -1849,6 +2211,8 @@ cat > /root/sbox/sbconfig_server.json << EOF
         "tag": "hy2-in",
         "listen": "::",
         "listen_port": $hy_port,
+        "up_mbps": 1000,
+        "down_mbps": 1000,
         "users": [
             {
                 "password": "$hy_password"
@@ -1877,6 +2241,8 @@ cat > /root/sbox/sbconfig_server.json << EOF
 }
 EOF
 
+configure_udp_buffers
+
 cat > /etc/systemd/system/sing-box.service <<EOF
 [Unit]
 After=network.target nss-lookup.target
@@ -1899,7 +2265,6 @@ if /root/sbox/sing-box check -c /root/sbox/sbconfig_server.json; then
     systemctl daemon-reload
     systemctl enable sing-box > /dev/null 2>&1
     systemctl start sing-box
-    systemctl restart sing-box
     install_shortcut
     show_client_configuration
     warning "输入mianyang,即可打开菜单"

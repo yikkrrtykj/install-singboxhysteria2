@@ -2,6 +2,11 @@
 ```
 bash <(curl -fsSL https://raw.githubusercontent.com/yikkrrtykj/install-singboxhysteria2/main/install.sh)
 ```
+
+建议在全新 Linux 服务器的 root 会话中执行。安装时根据提示设置 Reality 和 Hysteria2 端口，并在云防火墙中放行 Reality 的 TCP 端口及 Hysteria2 的 UDP 端口。
+
+新安装默认参数：Hysteria2 服务端上下行上限均为 1000 Mbps；生成的客户端上下行参数均为 300 Mbps。服务端的 1000 Mbps 是每个客户端的最大带宽配置，实际速度仍取决于服务器线路、客户端线路、CPU 和网络状况。
+
 网络质量体检脚本
 ```
 bash <(curl -Ls https://Check.Place) -I
@@ -72,7 +77,10 @@ curl -x socks5h://127.0.0.1:40000 -I https://www.google.com
   },
 ```
 5、服务重启与状态确认
+
+先检查配置，再通过脚本菜单执行重启；菜单会识别 systemd 服务和手工启动进程，避免同时启动两个 sing-box 实例。
 ```
 /root/sbox/sing-box check -c /root/sbox/sbconfig_server.json
-systemctl restart sing-box
+mianyang
 ```
+进入菜单后选择“sing-box基础操作”→“重启sing-box”。如果提示当前是手工进程，请先安排维护窗口迁移到 `sing-box.service`，不要直接运行 `systemctl restart sing-box`。
