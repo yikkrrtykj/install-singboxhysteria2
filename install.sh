@@ -2135,7 +2135,6 @@ if has_any_installation_marker; then
     install_pkgs
     echo ""
     info "sing-box-reality-hysteria2 已安装"
-    show_installation_markers
     show_status
     echo ""
     hint "=======常规配置========="
