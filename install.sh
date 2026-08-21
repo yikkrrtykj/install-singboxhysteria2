@@ -67,18 +67,23 @@ show_status(){
         memory_usage_mb=$(( ${memory_usage_kb:-0} / 1024 ))
 
         latest_version_tag=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases" | jq -r '[.[] | select(.prerelease==false)][0].tag_name' 2>/dev/null)
-        latest_version=${latest_version_tag#v}  # Remove 'v' prefix from version number
+        if [ -n "$latest_version_tag" ] && [ "$latest_version_tag" != "null" ]; then
+            latest_version=${latest_version_tag#v}
+        else
+            latest_version="查询失败"
+        fi
 
         iswarp=$(grep '^WARP_ENABLE=' /root/sbox/config | cut -d'=' -f2)
         hyhop=$(grep '^HY_HOPPING=' /root/sbox/config | cut -d'=' -f2)
 
-        warning "SING-BOX服务状态信息:"
+        info "SING-BOX服务状态信息:"
         hint "========================="
         info "状态: 运行中"
         if [ "$singbox_status" == "active" ]; then
             info "启动方式: systemd (sing-box.service)"
         else
-            warning "启动方式: 手工进程（sing-box.service 当前未激活）"
+            hint "启动方式: 手工进程（当前可用，但未由 systemd 管理）"
+            hint "处理方法: 选择 4 → 6，将手工进程迁移到 systemd"
         fi
         info "CPU 占用: $cpu_usage%"
         info "内存 占用: ${memory_usage_mb}MB"
@@ -764,6 +769,27 @@ EOF
   cat "$client_config_path"
   echo ""
   info "sing-box 客户端配置已保存到: $client_config_path"
+
+  if command -v base64 >/dev/null 2>&1; then
+    mihomo_config_base64=$(base64 "$mihomo_config_path" | tr -d '\r\n')
+    echo ""
+    echo ""
+    show_notice "Linux Mihomo 网关：复制以下命令到客户端"
+    info "命令 1：把本次节点配置写入 Linux 客户端"
+    printf "umask 077 && printf '%%s' '%s' | base64 -d > /tmp/mihomo_client.yaml && chmod 600 /tmp/mihomo_client.yaml\n" "$mihomo_config_base64"
+    echo ""
+    info "命令 2：下载 Linux 网关安装器"
+    echo "curl -fsSL -o /tmp/install-linux-gateway.sh https://raw.githubusercontent.com/yikkrrtykj/install-singboxhysteria2/main/install-linux-gateway.sh && chmod 700 /tmp/install-linux-gateway.sh"
+    echo ""
+    info "命令 3：安装 Mihomo、启用 TUN 网关并开放局域网 9090 UI"
+    # Keep command substitution literal so it runs on the Linux client.
+    # shellcheck disable=SC2016
+    echo 'if [ "$(id -u)" -eq 0 ]; then bash /tmp/install-linux-gateway.sh --config /tmp/mihomo_client.yaml --ui-lan --yes; else sudo bash /tmp/install-linux-gateway.sh --config /tmp/mihomo_client.yaml --ui-lan --yes; fi'
+    echo ""
+    hint "安装完成后查看 UI 密钥: cat /etc/mihomo/ui-secret"
+  else
+    warning "未找到 base64，无法生成 Linux 客户端的一键复制命令。"
+  fi
 
 }
 
@@ -1699,6 +1725,71 @@ process_ssko() {
     fi
 }
 
+migrate_singbox_to_systemd() {
+    local manual_pid process_count confirm_input
+
+    if systemctl is-active --quiet sing-box; then
+        info "sing-box 已由 systemd 管理，无需迁移。"
+        return 0
+    fi
+
+    process_count=$(pgrep -x sing-box 2>/dev/null | wc -l)
+    if [ "$process_count" -eq 0 ]; then
+        warning "没有检测到 sing-box 进程，请使用菜单中的重启功能启动服务。"
+        return 1
+    fi
+    if [ "$process_count" -ne 1 ]; then
+        warning "检测到 ${process_count} 个 sing-box 进程，拒绝自动迁移，请先人工检查。"
+        pgrep -a -x sing-box
+        return 1
+    fi
+    if [ ! -f /etc/systemd/system/sing-box.service ]; then
+        warning "缺少 /etc/systemd/system/sing-box.service，无法迁移。"
+        return 1
+    fi
+    /root/sbox/sing-box check -c /root/sbox/sbconfig_server.json || return 1
+
+    manual_pid=$(pgrep -o -x sing-box)
+    warning "迁移会短暂重启 sing-box，当前手工进程 PID: $manual_pid"
+    read -r -p "输入 MIGRATE 确认迁移到 systemd: " confirm_input
+    if [ "$confirm_input" != "MIGRATE" ]; then
+        hint "已取消迁移。"
+        return 0
+    fi
+
+    systemctl daemon-reload
+    systemctl enable sing-box >/dev/null 2>&1 || return 1
+    kill -TERM "$manual_pid" || return 1
+    for _ in {1..10}; do
+        if ! kill -0 "$manual_pid" 2>/dev/null; then
+            break
+        fi
+        sleep 1
+    done
+    if kill -0 "$manual_pid" 2>/dev/null; then
+        warning "手工进程未在 10 秒内退出；未强制结束，迁移已取消。"
+        return 1
+    fi
+
+    if systemctl start sing-box && systemctl is-active --quiet sing-box; then
+        info "迁移完成：sing-box 已由 systemd 管理。"
+        systemctl status sing-box --no-pager
+        return 0
+    fi
+
+    warning "systemd 启动失败，正在恢复手工运行方式。"
+    systemctl stop sing-box >/dev/null 2>&1 || true
+    nohup /root/sbox/sing-box run -c /root/sbox/sbconfig_server.json \
+        >/root/sbox/sing-box-manual.log 2>&1 &
+    sleep 2
+    if pgrep -x sing-box >/dev/null 2>&1; then
+        warning "已恢复手工进程，请检查: /root/sbox/sing-box-manual.log"
+    else
+        warning "手工进程恢复失败，请立即检查配置和日志。"
+    fi
+    return 1
+}
+
 process_singbox() {
   while :; do
     echo ""
@@ -1710,9 +1801,10 @@ process_singbox() {
     info "3. 查看sing-box状态"
     info "4. 查看sing-box实时日志"
     info "5. 查看sing-box服务端配置"
+    info "6. 将手工进程迁移到 systemd"
     info "0. 退出"
     echo ""
-    read -p "请输入对应数字（0-5）: " user_input
+    read -r -p "请输入对应数字（0-6）: " user_input
     echo ""
     case "$user_input" in
         1)
@@ -1743,12 +1835,16 @@ process_singbox() {
             cat /root/sbox/sbconfig_server.json
             break
             ;;
+        6)
+            migrate_singbox_to_systemd
+            break
+            ;;
         0)
           echo "退出"
           break
           ;;
         *)
-            echo "请输入正确选项: 0-5"
+            echo "请输入正确选项: 0-6"
             ;;
     esac
   done
@@ -1984,14 +2080,41 @@ has_any_installation_marker() {
 }
 
 show_installation_markers() {
-    local marker
-    for marker in "${INSTALLATION_MARKERS[@]}"; do
+    local marker service_unit=""
+    for marker in \
+        /root/sbox/sbconfig_server.json \
+        /root/sbox/config \
+        /root/sbox/sing-box; do
         if [ -e "$marker" ] || [ -L "$marker" ]; then
             info "存在: $marker"
         else
             warning "缺失: $marker"
         fi
     done
+
+    if [ -x /root/sbox/mianyang.sh ] && { [ -e /usr/bin/mianyang ] || [ -L /usr/bin/mianyang ]; }; then
+        info "管理命令: /usr/bin/mianyang"
+    else
+        warning "管理命令不完整: /usr/bin/mianyang"
+    fi
+
+    service_unit=$(systemctl show sing-box -p FragmentPath --value 2>/dev/null || true)
+    if [ -z "$service_unit" ] || [ ! -e "$service_unit" ]; then
+        for marker in \
+            /etc/systemd/system/sing-box.service \
+            /lib/systemd/system/sing-box.service \
+            /usr/lib/systemd/system/sing-box.service; do
+            if [ -e "$marker" ]; then
+                service_unit="$marker"
+                break
+            fi
+        done
+    fi
+    if [ -n "$service_unit" ] && [ -e "$service_unit" ]; then
+        info "systemd 服务文件: $service_unit"
+    else
+        warning "未找到 sing-box.service"
+    fi
 }
 
 print_with_delay "Reality Hysteria2 二合一脚本" 0.03
@@ -2011,16 +2134,16 @@ if has_any_installation_marker; then
 
     install_pkgs
     echo ""
-    warning "sing-box-reality-hysteria2已安装"
+    info "sing-box-reality-hysteria2 已安装"
     show_installation_markers
     show_status
     echo ""
     hint "=======常规配置========="
-    warning "请选择选项:"
+    hint "请选择选项:"
     echo ""
     info "1. 重新安装"
     info "2. 修改配置"
-    info "3. 显示客户端配置"
+    info "3. 显示客户端配置和 Linux 安装命令"
     info "4. sing-box基础操作"
     info "5. 启用本地 BBR + 优化 Hysteria2 UDP 缓冲"
     info "6. 流媒体解锁"
@@ -2035,7 +2158,7 @@ if has_any_installation_marker; then
     echo ""
     hint "========================="
     echo ""
-    read -p "请输入对应数字 (0-10): " choice
+    read -r -p "请输入对应数字 (0-10): " choice
 
     case $choice in
       1)
