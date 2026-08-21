@@ -2211,6 +2211,8 @@ cat > /root/sbox/sbconfig_server.json << EOF
         "tag": "hy2-in",
         "listen": "::",
         "listen_port": $hy_port,
+        "up_mbps": 1000,
+        "down_mbps": 1000,
         "users": [
             {
                 "password": "$hy_password"

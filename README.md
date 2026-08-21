@@ -2,6 +2,11 @@
 ```
 bash <(curl -fsSL https://raw.githubusercontent.com/yikkrrtykj/install-singboxhysteria2/main/install.sh)
 ```
+
+建议在全新 Linux 服务器的 root 会话中执行。安装时根据提示设置 Reality 和 Hysteria2 端口，并在云防火墙中放行 Reality 的 TCP 端口及 Hysteria2 的 UDP 端口。
+
+新安装默认参数：Hysteria2 服务端上下行上限均为 1000 Mbps；生成的客户端上下行参数均为 300 Mbps。服务端的 1000 Mbps 是每个客户端的最大带宽配置，实际速度仍取决于服务器线路、客户端线路、CPU 和网络状况。
+
 网络质量体检脚本
 ```
 bash <(curl -Ls https://Check.Place) -I
