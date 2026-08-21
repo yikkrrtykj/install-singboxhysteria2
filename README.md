@@ -6,7 +6,7 @@
 bash <(curl -fsSL https://raw.githubusercontent.com/yikkrrtykj/install-singboxhysteria2/main/install.sh)
 ```
 
-作用：安装 Reality + Hysteria2 服务端、systemd 服务和 `mianyang` 管理命令。
+作用：安装 Reality + Hysteria2 服务端、systemd 服务和 `mianyang` 管理命令。全新安装会自动启用并启动 `sing-box.service`，不使用手工进程。
 
 默认带宽参数：
 
@@ -26,7 +26,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/yikkrrtykj/install-singboxhy
 mianyang
 ```
 
-作用：修改服务端配置、显示客户端配置、重启或更新 sing-box、启用 BBR、管理端口跳跃。
+作用：修改服务端配置、显示客户端配置、重启或更新 sing-box、启用 BBR、管理端口跳跃和中转规则。
 
 选择 `3. 显示客户端配置和 Linux 安装命令` 后会显示：
 
@@ -49,7 +49,13 @@ mianyang
 mianyang
 ```
 
-作用：选择 `4. sing-box基础操作`，再选择 `1. 重启sing-box`；脚本会先检查配置，并阻止手工进程与 systemd 双开。
+作用：进入 `4. sing-box基础操作`。子菜单功能：
+
+1. 检查现有配置，成功后重启 systemd 服务；
+2. 下载最新正式版内核，先用现有配置验证，并备份旧内核；
+3. 查看 `sing-box.service` 是否正在运行；
+4. 持续查看实时日志，按 `Ctrl+C` 退出；
+5. 查看完整服务端配置，输出包含 UUID、密码和私钥，不要公开。
 
 ```bash
 systemctl status sing-box --no-pager
@@ -83,15 +89,13 @@ systemctl restart sing-box
 
 作用：直接重启 systemd 管理的 sing-box。
 
-## 4. 把手工进程迁移到 systemd
+## 4. 网络优化
 
 ```bash
 mianyang
 ```
 
-作用：选择 `4. sing-box基础操作`，再选择 `6. 将手工进程迁移到 systemd`。
-
-迁移前会检查配置并要求输入 `MIGRATE`，迁移失败时会尝试恢复手工运行方式。
+作用：选择菜单 5，启用内核支持的 BBR 和 `fq`，并把 Hysteria2/QUIC UDP 收发缓冲上限提高到至少 16 MiB。配置保存在 `/etc/sysctl.d/99-sing-box-network.conf`，不依赖第三方优化脚本，也不需要更新客户端配置。
 
 ## 5. Windows 客户端
 
