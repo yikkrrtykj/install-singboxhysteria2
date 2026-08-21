@@ -263,7 +263,7 @@ show_client_configuration() {
   echo ""
   info "二维码如下"
   echo ""
-  qrencode -t UTF8 $reality_link
+  qrencode -t UTF8 "$reality_link"
   echo ""
   info "客户端通用参数如下"
   echo "------------------------------------"
@@ -310,7 +310,7 @@ show_client_configuration() {
   echo ""
   info "二维码如下"
   echo ""
-  qrencode -t UTF8 $hy2_link  
+  qrencode -t UTF8 "$hy2_link"
   echo ""
   info "客户端通用参数如下"
   echo "------------------------------------"
@@ -326,16 +326,19 @@ show_client_configuration() {
   echo "跳过证书验证（允许不安全）: True"
   echo "------------------------------------"
 
-  show_notice "clash-meta配置参数"
-cat << EOF
-
-port: 7897
+  show_notice "Mihomo/Clash Meta客户端配置参数"
+  mihomo_config_path="/root/sbox/mihomo_client.yaml"
+cat > "$mihomo_config_path" << EOF || error "保存 Mihomo 客户端配置失败"
+mixed-port: 7897
 allow-lan: true
+bind-address: "*"
 mode: rule
 log-level: info
 unified-delay: true
-global-client-fingerprint: chrome
 ipv6: true
+profile:
+  store-selected: true
+  store-fake-ip: true
 dns:
   enable: true
   listen: "0.0.0.0:53"
@@ -359,15 +362,17 @@ dns:
 
 tun:
   enable: true
-  stack: system
-  device: Meta
+  stack: mixed
+  device: Mihomo
   mtu: 1420
   auto-route: true
+  auto-redirect: true
   auto-detect-interface: true
   dns-hijack:
-    - "any:53"
-	  
-proxies:        
+    - any:53
+    - tcp://any:53
+
+proxies:
   - name: Reality
     type: vless
     server: $server_ip
@@ -399,9 +404,9 @@ proxy-groups:
   - name: 节点选择
     type: select
     proxies:
-      - 自动选择
       - Reality
       - Hysteria2
+      - 自动选择
       - DIRECT
 
   - name: 自动选择
@@ -415,15 +420,20 @@ proxy-groups:
 
 
 rules:
-    - GEOIP,LAN,DIRECT
-    - GEOIP,CN,DIRECT
-    - MATCH,节点选择
+  - GEOIP,LAN,DIRECT
+  - GEOIP,CN,DIRECT
+  - MATCH,节点选择
 
 EOF
+  chmod 0600 "$mihomo_config_path" || error "设置 Mihomo 客户端配置权限失败"
+  cat "$mihomo_config_path"
+  echo ""
+  info "Mihomo 客户端配置已保存到: $mihomo_config_path"
   echo ""
   echo ""
   show_notice "sing-box客户端配置1.13.0及以上"
-cat << EOF
+  client_config_path="/root/sbox/sbconfig_client.json"
+cat > "$client_config_path" << EOF || error "保存 sing-box 客户端配置失败"
 {
   "log": {
     "level": "debug",
@@ -749,6 +759,11 @@ ${hy_server_port_json}
   }
 }
 EOF
+
+  chmod 0600 "$client_config_path" || error "设置 sing-box 客户端配置权限失败"
+  cat "$client_config_path"
+  echo ""
+  info "sing-box 客户端配置已保存到: $client_config_path"
 
 }
 
