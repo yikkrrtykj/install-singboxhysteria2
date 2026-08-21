@@ -73,7 +73,6 @@ show_status(){
             latest_version="查询失败"
         fi
 
-        iswarp=$(grep '^WARP_ENABLE=' /root/sbox/config | cut -d'=' -f2)
         hyhop=$(grep '^HY_HOPPING=' /root/sbox/config | cut -d'=' -f2)
 
         info "SING-BOX服务状态信息:"
@@ -82,15 +81,13 @@ show_status(){
         if [ "$singbox_status" == "active" ]; then
             info "启动方式: systemd (sing-box.service)"
         else
-            hint "启动方式: 手工进程（当前可用，但未由 systemd 管理）"
-            hint "处理方法: 选择 4 → 6，将手工进程迁移到 systemd"
+            warning "启动方式: 手工进程（旧安装，未由 systemd 管理）"
         fi
         info "CPU 占用: $cpu_usage%"
         info "内存 占用: ${memory_usage_mb}MB"
         info "singbox正式版最新版本: $latest_version"
 		info "singbox当前版本: $(/root/sbox/sing-box version 2>/dev/null | awk '/version/{print $NF}')"
-        info "warp流媒体解锁(输入6管理): $(if [ "$iswarp" == "TRUE" ]; then echo "开启"; else echo "关闭"; fi)"
-        info "hy2端口跳跃(输入7管理): $(if [ "$hyhop" == "TRUE" ]; then echo "开启"; else echo "关闭"; fi)"
+        info "hy2端口跳跃(输入6管理): $(if [ "$hyhop" == "TRUE" ]; then echo "开启"; else echo "关闭"; fi)"
         hint "========================="
     else
         warning "SING-BOX 未运行！"
@@ -968,576 +965,6 @@ uninstall_singbox() {
     warning "卸载完成"
 }
 
-process_warp(){
-    while :; do
-        iswarp=$(grep '^WARP_ENABLE=' /root/sbox/config | cut -d'=' -f2)
-        if [ "$iswarp" = "FALSE" ]; then
-          warning "分流解锁功能未开启，是否开启（一路回车默认为: warp v6解锁openai和奈飞）"
-          read -p "是否开启? (y/n 默认为y): " confirm
-          confirm=${confirm:-"y"}
-          if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-            enable_warp
-          else
-            break
-          fi
-        else
-            warp_option=$(awk -F= '/^WARP_OPTION/{gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}' /root/sbox/config)
-            case $warp_option in
-                0)
-                    current_option="手动分流(使用geosite和domain分流)"
-                    ;;
-                1)
-                    current_option="全局分流(接管所有流量)"
-                    ;;
-                *)
-                    current_option="unknow!"
-                    ;;
-            esac
-            warp_mode=$(awk -F= '/^WARP_MODE/{gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}' /root/sbox/config)
-            case $warp_mode in
-                0)
-                    current_mode="Ipv6优先"
-                    current_mode1="warp-IPv6-prefer-out"
-                    ;;
-                1)
-                    current_mode="Ipv4优先"
-                    current_mode1="warp-IPv4-prefer-out"
-                    ;;
-                2)
-                    current_mode="Ipv6仅允许"
-                    current_mode1="warp-IPv6-out"
-                    ;;
-                3)
-                    current_mode="Ipv4仅允许"
-                    current_mode1="warp-IPv4-out"
-                    ;;
-                4)
-                    current_mode="任意门解锁"
-                    current_mode1="doko"
-                    ;;
-                5)
-                    current_mode="ss解锁"
-                    current_mode1="ss-out"
-                    ;;
-                *)
-                    current_option="unknow!"
-                    ;;
-            esac
-            echo ""
-            warning "warp分流已经开启"
-            echo ""
-            hint "当前模式为: $current_mode"
-            hint "当前状态为: $current_option"
-            echo ""
-            info "请选择选项："
-            echo ""
-            info "1. 切换为手动分流(geosite和domain分流)"
-            info "2. 切换为全局分流(接管所有流量)" 
-            info "3. 设置手动分流规则(geosite和domain分流)"  
-            info "4. 切换为分流策略"
-            info "5. 删除解锁"
-            info "0. 退出"
-            echo ""
-            read -p "请输入对应数字（0-5）: " warp_input
-        case $warp_input in
-          1)
-            jq '.route.rules = [ .route.rules[] | del(.outbound) ]' /root/sbox/sbconfig_server.json > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
-            sed -i "s/WARP_OPTION=.*/WARP_OPTION=0/" /root/sbox/config
-            reload_singbox
-          ;;
-          2)
-          if [ "$current_mode1" != "doko" ]; then
-            target_outbound="wireguard-out"
-            if [ "$current_mode1" == "ss-out" ]; then
-                target_outbound="ss-out"
-            fi
-            jq --arg target "$target_outbound" '
-                .route.rules += [{"outbound": $target}]
-            ' /root/sbox/sbconfig_server.json > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
-            sed -i "s/WARP_OPTION=.*/WARP_OPTION=1/" /root/sbox/config
-            reload_singbox
-          else
-            warning "任意门解锁无法使用全局接管，请使用ss解锁策略"
-          fi
-            ;;
-          4)
-          while :; do
-              warning "请选择需要切换的分流策略"
-              echo ""
-              hint "当前状态为: $current_option"
-              echo ""
-              info "请选择切换的选项："
-              echo ""
-              info "1. Ipv6优先(默认)"
-              info "2. Ipv4优先"
-              info "3. 仅允许Ipv6"
-              info "4. 仅允许Ipv4"
-              info "5. 任意门链式解锁"
-              info "6. ss链式解锁"
-              info "0. 退出"
-              echo ""
-
-              read -p "请输入对应数字（0-5）: " user_input
-              user_input=${user_input:-1}
-              case $user_input in
-                  1)
-                      warp_out="warp-IPv6-prefer-out"
-                      sed -i "s/WARP_MODE=.*/WARP_MODE=0/" /root/sbox/config
-                      break
-                      ;;
-                  2)
-                      warp_out="warp-IPv4-prefer-out"
-                      sed -i "s/WARP_MODE=.*/WARP_MODE=1/" /root/sbox/config
-                      break
-                      ;;
-                  3)
-                      warp_out="warp-IPv6-out"
-                      sed -i "s/WARP_MODE=.*/WARP_MODE=2/" /root/sbox/config
-                      break
-                      ;;
-                  4)
-                      warp_out="warp-IPv4-out"
-                      sed -i "s/WARP_MODE=.*/WARP_MODE=3/" /root/sbox/config
-                      break
-                      ;;
-                  5)
-                      read -p "请输入落地机vps ip: " ipaddress
-                      read -p "请输入落地机vps 端口: " tport
-                      tport=${tport:-443}
-                      warp_out="doko"
-                      sed -i "s/WARP_MODE=.*/WARP_MODE=4/" /root/sbox/config
-                      break
-                      ;;
-                  6)
-                      read -p "请输入落地机vps ip: " ssipaddress
-                      read -p "请输入落地机vps 端口: " sstport
-                      read -p "请输入落地机vps ss密码: " sspwd
-                      jq --arg new_address "$ssipaddress" --arg sspwd "$sspwd" --argjson new_port "$sstport" '.outbounds |= map(if .tag == "ss-out" then .server = $new_address | .password = $sspwd | .server_port = ($new_port | tonumber) else . end)' /root/sbox/sbconfig_server.json > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
-                      warp_out="ss-out"
-                      sed -i "s/WARP_MODE=.*/WARP_MODE=5/" /root/sbox/config
-                      break
-                      ;;
-                  0)
-                      echo "退出warp"
-                      exit 0
-                      ;;
-                  *)
-                      echo "无效的输入，请重新输入"
-                      ;;
-              esac
-          done
-            
-            target_outbound="wireguard-out"
-            domain_strategy=""
-            case $warp_out in
-                "warp-IPv6-prefer-out") domain_strategy="prefer_ipv6" ;;
-                "warp-IPv4-prefer-out") domain_strategy="prefer_ipv4" ;;
-                "warp-IPv6-out") domain_strategy="ipv6_only" ;;
-                "warp-IPv4-out") domain_strategy="ipv4_only" ;;
-                "doko") target_outbound="direct" ;;
-                "ss-out") target_outbound="ss-out" ;;
-            esac
-
-            jq --arg target "$target_outbound" --arg strategy "$domain_strategy" --arg ipaddress "$ipaddress" --arg tport "$tport" '
-              .outbounds |= map(
-                if .tag == "wireguard-out" or .tag == "direct" or .tag == "ss-out" then
-                  if $strategy != "" then .domain_resolver = {"server":"dns-local", "strategy":$strategy} else del(.domain_resolver) end
-                else . end
-              ) |
-              .route.rules |= map(
-                if has("rule_set") or has("domain_keyword") then
-                  .outbound = $target |
-                  if $target == "direct" then
-                    .override_address = $ipaddress |
-                    .override_port = ($tport | tonumber)
-                  else
-                    del(.override_address) | del(.override_port)
-                  end
-                else . end
-              )
-            ' /root/sbox/sbconfig_server.json > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
-            
-            if [ "$warp_option" -ne 0 ] && [ "$target_outbound" != "direct" ]; then
-              jq --arg target "$target_outbound" '
-                .route.final = $target
-              ' /root/sbox/sbconfig_server.json > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
-            fi
-            reload_singbox
-            ;;
-          3)
-            info "请选择："
-            echo ""
-            info "1. 手动添加geosite分流（适配singbox1.13.0及以上)"
-            info "2. 手动添加域名关键字匹配分流"
-            info "0. 退出"
-            echo ""
-
-            read -p "请输入对应数字（0-2）: " user_input
-            case $user_input in
-                1)
-                    while :; do
-                      echo ""
-                      warning "geosite分流为: "
-                      #域名关键字为
-                      jq '.route.rules[] | select(.rule_set) | .rule_set' /root/sbox/sbconfig_server.json
-                      info "请选择操作："
-                      echo "1. 添加geosite"
-                      echo "2. 删除geosite"
-                      echo "0. 退出"
-                      echo ""
-
-                      read -p "请输入对应数字（0-2）: " user_input
-
-                      case $user_input in
-                          1)
-                            #add domain
-                            read -p "请输入要添加的域名关键字（若要添加geosite-openai，输入openai）: " new_keyword
-                            url="https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/$new_keyword.srs"
-                            formatted_keyword="geosite-$new_keyword"
-                            # 检查是否存在相同的 geosite 关键字
-                            if jq --arg formatted_keyword "$formatted_keyword" '.route.rules[] | select(has("rule_set")) | .rule_set | any(. == $formatted_keyword)' /root/sbox/sbconfig_server.json | grep -q "true"; then
-                              echo "geosite已存在，不添加重复项: $formatted_keyword"
-                            else
-                              http_status=$(curl -s -o /dev/null -w "%{http_code}" "$url")
-
-                              if [ "$http_status" -eq 200 ]; then
-                                # 如果不存在，则添加
-                                  new_rule='{
-                                    "tag": "'"$formatted_keyword"'",
-                                    "type": "remote",
-                                    "format": "binary",
-                                    "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/'"$new_keyword"'.srs",
-                                    "download_detour": "direct"
-                                  }'
-
-                                jq --arg formatted_keyword "$formatted_keyword" '(.route.rules[] | select(has("rule_set")) | .rule_set) += [$formatted_keyword]' /root/sbox/sbconfig_server.json > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
-                                jq --argjson new_rule "$new_rule" '.route.rule_set += [$new_rule]' /root/sbox/sbconfig_server.json > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
-
-                                echo "geosite已添加: $new_rule"
-                              else
-                                echo "geosite srs文件不存在，请重新输入..."
-                              fi
-                            fi
-                            ;;
-                          2)
-                            #delete domain keywords
-                            read -p "请输入要删除的域名关键字（若要删除geosite-openai，输入openai） " keyword_to_delete
-                            formatted_keyword="geosite-$keyword_to_delete"
-                            if jq --arg formatted_keyword "$formatted_keyword" '.route.rules[] | select(has("rule_set")) | .rule_set | any(. == $formatted_keyword)' /root/sbox/sbconfig_server.json | grep -q "true"; then
-                              jq --arg formatted_keyword "$formatted_keyword" '(.route.rules[] | select(has("rule_set")) | .rule_set) -= [$formatted_keyword]' /root/sbox/sbconfig_server.json > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
-                              #卸载ruleset
-                              jq --arg formatted_keyword "$formatted_keyword" 'del(.route.rule_set[] | select(.tag == $formatted_keyword))' /root/sbox/sbconfig_server.json > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
-                              echo "域名关键字已删除: $formatted_keyword"
-                            else
-                              echo "域名关键字不存在，不执行删除操作: $formatted_keyword"
-                            fi
-                              ;;
-                          0)
-                              echo "退出"
-                              break
-                              ;;
-                          *)
-                              echo "无效的输入，请重新输入"
-                              ;;
-                      esac
-                  done
-                    break
-                    ;;
-                2)
-                    while :; do
-                      echo ""
-                      warning "域名关键字为: "
-                      #域名关键字为
-                      jq '.route.rules[] | select(.domain_keyword) | .domain_keyword' /root/sbox/sbconfig_server.json
-                      info "请选择操作："
-                      echo "1. 添加域名关键字"
-                      echo "2. 删除域名关键字"
-                      echo "0. 退出"
-                      echo ""
-
-                      read -p "请输入对应数字（0-2）: " user_input
-
-                      case $user_input in
-                          1)
-                            #add domain keywords
-                            read -p "请输入要添加的域名关键字: " new_keyword
-                            if jq --arg new_keyword "$new_keyword" '.route.rules[] | select(has("domain_keyword")) | .domain_keyword | any(. == $new_keyword)' /root/sbox/sbconfig_server.json | grep -q "true"; then
-                              echo "域名关键字已存在，不添加重复项: $new_keyword"
-                            else
-                              jq --arg new_keyword "$new_keyword" '(.route.rules[] | select(has("domain_keyword")) | .domain_keyword) += [$new_keyword]' /root/sbox/sbconfig_server.json > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
-                              echo "域名关键字已添加: $new_keyword"
-                            fi
-                            ;;
-                          2)
-                            #delete domain keywords
-                            read -p "请输入要删除的域名关键字: " keyword_to_delete
-                            if jq --arg keyword_to_delete "$keyword_to_delete" '.route.rules[] | select(has("domain_keyword")) | .domain_keyword | any(. == $keyword_to_delete)' /root/sbox/sbconfig_server.json | grep -q "true"; then
-                              jq --arg keyword_to_delete "$keyword_to_delete" '(.route.rules[] | select(has("domain_keyword")) | .domain_keyword) -= [$keyword_to_delete]' /root/sbox/sbconfig_server.json > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
-                              echo "域名关键字已删除: $keyword_to_delete"
-                            else
-                              echo "域名关键字不存在，不执行删除操作: $keyword_to_delete"
-                            fi
-                              ;;
-                          0)
-                              echo "退出"
-                              break
-                              ;;
-                          *)
-                              echo "无效的输入，请重新输入"
-                              ;;
-                      esac
-                  done
-
-                    break
-                    ;;
-
-                0)
-                    # Exit the loop if option 0 is selected
-                    echo "退出"
-                    exit 0
-                    ;;
-                *)
-                    # Handle invalid input
-                    echo "无效的输入"
-                    ;;
-            esac
-            reload_singbox
-            break
-            ;;
-          5)
-              disable_warp
-              break
-            ;;
-          *)
-              echo "退出"
-              break
-              ;;
-        esac
-
-
-        fi
-        echo "配置文件更新成功"
-    done
-}
-enable_warp(){
-    #默认提供的warp节点
-  while :; do
-      warning "请选择是否需要注册warp"
-      echo ""
-      info "请选择选项："
-      echo ""
-      info "1. 使用绵羊提供的warp节点(默认)"
-      info "2. 使用手动刷的warp节点"
-      info "0. 退出"
-      echo ""
-      read -p "请输入对应数字（0-2）: " user_input
-      user_input=${user_input:-1}
-      case $user_input in
-          1)
-              v6="2606:4700:110:87ad:b400:91:eadb:887f"
-              private_key="wIC19yRRSJkhVJcE09Qo9bE3P3PIwS3yyqyUnjwNO34="
-              reserved="XiBe"
-              break
-              ;;
-          2)
-              warning "开始注册warp..."
-              output=$(bash -c "$(curl -L warp-reg.vercel.app)")
-              v6=$(echo "$output" | grep -oP '"v6": "\K[^"]+' | awk 'NR==2')
-              private_key=$(echo "$output" | grep -oP '"private_key": "\K[^"]+')
-              reserved=$(echo "$output" | grep -oP '"reserved_str": "\K[^"]+')
-              break
-              ;;
-          0)
-              echo "退出"
-              exit 0
-              ;;
-          *)
-              echo "无效的输入，请重新输入"
-              ;;
-      esac
-  done
-      ipaddress="1.0.0.1"
-      tport=53
-      ssipaddress="1.0.0.1"
-      sstport=53
-      sspwd="8JCsPssfgS8tiRwiMlhARg=="
-  while :; do
-      warning "请选择需要设置的策略（默认为warp-v6优先）"
-      echo ""
-      info "请选择选项："
-      echo ""
-      info "1. Ipv6优先(默认)"
-      info "2. Ipv4优先"
-      info "3. 仅允许Ipv6"
-      info "4. 仅允许Ipv4"
-      info "5. 任意门链式解锁"
-      info "6. ss链式解锁"
-      info "0. 退出"
-      echo ""
-      read -p "请输入对应数字（0-6）: " user_input
-      user_input=${user_input:-1}
-      case $user_input in
-          1)
-              warp_out="warp-IPv6-prefer-out"
-              sed -i "s/WARP_MODE=.*/WARP_MODE=0/" /root/sbox/config
-              break
-              ;;
-          2)
-              warp_out="warp-IPv4-prefer-out"
-              sed -i "s/WARP_MODE=.*/WARP_MODE=1/" /root/sbox/config
-              break
-              ;;
-          3)
-              warp_out="warp-IPv6-out"
-              sed -i "s/WARP_MODE=.*/WARP_MODE=2/" /root/sbox/config
-              break
-              ;;
-          4)
-              warp_out="warp-IPv4-out"
-              sed -i "s/WARP_MODE=.*/WARP_MODE=3/" /root/sbox/config
-              break
-              ;;
-          5)
-              read -p "请输入落地机vps ip: " ssipaddress
-              read -p "请输入落地机vps 端口: " sstport
-              tport=${sstport:-443}
-              ipaddress=$ssipaddress
-              warp_out="doko"
-              sed -i "s/WARP_MODE=.*/WARP_MODE=4/" /root/sbox/config
-              break
-              ;;
-          6)
-              read -p "请输入落地机vps ip: " ssipaddress
-              read -p "请输入落地机vps 端口: " sstport
-              read -p "请输入落地机vps ss密码: " sspwd
-              warp_out="ss-out"
-              sed -i "s/WARP_MODE=.*/WARP_MODE=5/" /root/sbox/config
-              break
-              ;;
-          0)
-              echo "退出"
-              exit 0
-              ;;
-          *)
-              echo "无效的输入，请重新输入"
-              ;;
-      esac
-  done
-  
-      target_outbound="wireguard-out"
-      domain_strategy=""
-      case $warp_out in
-          "warp-IPv6-prefer-out") domain_strategy="prefer_ipv6" ;;
-          "warp-IPv4-prefer-out") domain_strategy="prefer_ipv4" ;;
-          "warp-IPv6-out") domain_strategy="ipv6_only" ;;
-          "warp-IPv4-out") domain_strategy="ipv4_only" ;;
-          "doko") target_outbound="direct" ;;
-          "ss-out") target_outbound="ss-out" ;;
-      esac
-
-      jq --arg private_key "$private_key" --arg v6 "$v6" --arg reserved "$reserved" --arg target_outbound "$target_outbound" --arg strategy "$domain_strategy" --arg ipaddress "$ipaddress" --arg tport "$tport" --arg ssipaddress "$ssipaddress" --arg sstport "$sstport" --arg sspwd "$sspwd" '
-          .route.rules = [
-              {
-                "action": "sniff"
-              },
-              {
-                "network": "udp",
-                "port": 443,
-                "action": "reject"
-              },
-              (if $target_outbound == "direct" then
-                {
-                  "rule_set": ["geosite-openai","geosite-netflix"],
-                  "outbound": "direct",
-                  "override_address": $ipaddress,
-                  "override_port": ($tport | tonumber)
-                }
-              elif $target_outbound == "wireguard-out" then
-                {
-                  "rule_set": ["geosite-openai","geosite-netflix"],
-                  "outbound": "wireguard-out"
-                }
-              else
-                {
-                  "rule_set": ["geosite-openai","geosite-netflix"],
-                  "outbound": "ss-out"
-                }
-              end),
-              (if $target_outbound == "direct" then
-                {
-                  "domain_keyword": ["ipaddress"],
-                  "outbound": "direct",
-                  "override_address": $ipaddress,
-                  "override_port": ($tport | tonumber)
-                }
-              elif $target_outbound == "wireguard-out" then
-                {
-                  "domain_keyword": ["ipaddress"],
-                  "outbound": "wireguard-out"
-                }
-              else
-                {
-                  "domain_keyword": ["ipaddress"],
-                  "outbound": "ss-out"
-                }
-              end)
-          ] | .route.rule_set = [
-              { 
-                "tag": "geosite-openai",
-                "type": "remote",
-                "format": "binary",
-                "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/openai.srs",
-                "download_detour": "direct"
-              },
-              {
-                "tag": "geosite-netflix",
-                "type": "remote",
-                "format": "binary",
-                "url": "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/netflix.srs",
-                "download_detour": "direct"
-              }
-          ] | .outbounds += [
-            (
-              {
-                "type": "wireguard",
-                "tag": "wireguard-out",
-                "server": "162.159.192.1",
-                "server_port": 2408,
-                "local_address": [
-                  "172.16.0.2/32",
-                  ($v6 + "/128")
-                ],
-                "private_key": $private_key,
-                "peer_public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
-                "reserved": [$reserved],
-                "mtu": 1280
-              } | if $strategy != "" then .domain_resolver = {"server":"dns-local", "strategy":$strategy} else . end
-            ),
-            (
-              {
-                "type": "shadowsocks",
-                "tag": "ss-out",
-                "server": $ssipaddress,
-                "server_port": ($sstport | tonumber),
-                "method": "2022-blake3-aes-128-gcm",
-                "password": $sspwd
-              } | if $strategy != "" then .domain_resolver = {"server":"dns-local", "strategy":$strategy} else . end
-            )
-          ]' "/root/sbox/sbconfig_server.json" > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp "/root/sbox/sbconfig_server.json"
-
-      sed -i "s/WARP_ENABLE=FALSE/WARP_ENABLE=TRUE/" /root/sbox/config
-      sed -i "s/WARP_OPTION=.*/WARP_OPTION=0/" /root/sbox/config
-      reload_singbox
-}
-
-disable_warp(){
-    jq '.route.rules = [{"action": "sniff"}, {"network": "udp", "port": 443, "action": "reject"}] |
-        del(.route.rule_set) |
-        .outbounds = ((.outbounds // []) | map(select(.tag != "wireguard-out" and .tag != "ss-out")))' "/root/sbox/sbconfig_server.json" > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp "/root/sbox/sbconfig_server.json"
-    sed -i "s/WARP_ENABLE=TRUE/WARP_ENABLE=FALSE/" /root/sbox/config
-    reload_singbox
-}
-
 update_singbox(){
     info "更新singbox..."
     install_singbox
@@ -1725,86 +1152,20 @@ process_ssko() {
     fi
 }
 
-migrate_singbox_to_systemd() {
-    local manual_pid process_count confirm_input
-
-    if systemctl is-active --quiet sing-box; then
-        info "sing-box 已由 systemd 管理，无需迁移。"
-        return 0
-    fi
-
-    process_count=$(pgrep -x sing-box 2>/dev/null | wc -l)
-    if [ "$process_count" -eq 0 ]; then
-        warning "没有检测到 sing-box 进程，请使用菜单中的重启功能启动服务。"
-        return 1
-    fi
-    if [ "$process_count" -ne 1 ]; then
-        warning "检测到 ${process_count} 个 sing-box 进程，拒绝自动迁移，请先人工检查。"
-        pgrep -a -x sing-box
-        return 1
-    fi
-    if [ ! -f /etc/systemd/system/sing-box.service ]; then
-        warning "缺少 /etc/systemd/system/sing-box.service，无法迁移。"
-        return 1
-    fi
-    /root/sbox/sing-box check -c /root/sbox/sbconfig_server.json || return 1
-
-    manual_pid=$(pgrep -o -x sing-box)
-    warning "迁移会短暂重启 sing-box，当前手工进程 PID: $manual_pid"
-    read -r -p "输入 MIGRATE 确认迁移到 systemd: " confirm_input
-    if [ "$confirm_input" != "MIGRATE" ]; then
-        hint "已取消迁移。"
-        return 0
-    fi
-
-    systemctl daemon-reload
-    systemctl enable sing-box >/dev/null 2>&1 || return 1
-    kill -TERM "$manual_pid" || return 1
-    for _ in {1..10}; do
-        if ! kill -0 "$manual_pid" 2>/dev/null; then
-            break
-        fi
-        sleep 1
-    done
-    if kill -0 "$manual_pid" 2>/dev/null; then
-        warning "手工进程未在 10 秒内退出；未强制结束，迁移已取消。"
-        return 1
-    fi
-
-    if systemctl start sing-box && systemctl is-active --quiet sing-box; then
-        info "迁移完成：sing-box 已由 systemd 管理。"
-        systemctl status sing-box --no-pager
-        return 0
-    fi
-
-    warning "systemd 启动失败，正在恢复手工运行方式。"
-    systemctl stop sing-box >/dev/null 2>&1 || true
-    nohup /root/sbox/sing-box run -c /root/sbox/sbconfig_server.json \
-        >/root/sbox/sing-box-manual.log 2>&1 &
-    sleep 2
-    if pgrep -x sing-box >/dev/null 2>&1; then
-        warning "已恢复手工进程，请检查: /root/sbox/sing-box-manual.log"
-    else
-        warning "手工进程恢复失败，请立即检查配置和日志。"
-    fi
-    return 1
-}
-
 process_singbox() {
   while :; do
     echo ""
     echo ""
     info "请选择选项："
     echo ""
-    info "1. 重启sing-box"
-    info "2. 更新sing-box内核"
-    info "3. 查看sing-box状态"
-    info "4. 查看sing-box实时日志"
-    info "5. 查看sing-box服务端配置"
-    info "6. 将手工进程迁移到 systemd"
+    info "1. 检查配置并重启 sing-box"
+    info "2. 安全更新 sing-box 内核"
+    info "3. 查看 systemd 服务状态"
+    info "4. 查看实时日志（Ctrl+C 退出）"
+    info "5. 查看服务端配置（包含密钥）"
     info "0. 退出"
     echo ""
-    read -r -p "请输入对应数字（0-6）: " user_input
+    read -r -p "请输入对应数字（0-5）: " user_input
     echo ""
     case "$user_input" in
         1)
@@ -1821,8 +1182,8 @@ process_singbox() {
             break
             ;;
         3)
-            warning "singbox基本信息如下(ctrl+c退出)"
-            systemctl status sing-box
+            info "sing-box systemd 状态如下："
+            systemctl status sing-box --no-pager
             break
             ;;
         4)
@@ -1831,12 +1192,8 @@ process_singbox() {
             break
             ;;
         5)
-            echo "singbox服务端如下："
+            warning "以下服务端配置包含 UUID、密码和私钥，请勿公开："
             cat /root/sbox/sbconfig_server.json
-            break
-            ;;
-        6)
-            migrate_singbox_to_systemd
             break
             ;;
         0)
@@ -1844,7 +1201,7 @@ process_singbox() {
           break
           ;;
         *)
-            echo "请输入正确选项: 0-6"
+            echo "请输入正确选项: 0-5"
             ;;
     esac
   done
@@ -2145,19 +1502,18 @@ if has_any_installation_marker; then
     info "3. 显示客户端配置和 Linux 安装命令"
     info "4. sing-box基础操作"
     info "5. 启用本地 BBR + 优化 Hysteria2 UDP 缓冲"
-    info "6. 流媒体解锁"
-    info "7. hysteria2端口跳跃"
-    info "8. 本机添加任意门中转规则（本机做中转机）"
+    info "6. Hysteria2 端口跳跃"
+    info "7. 本机添加任意门中转规则（本机做中转机）"
     info "0. 卸载"
     echo ""
     hint "=======落地机解锁配置======"
     echo ""
-    info "9.  落地机任意门解锁（本机做解锁机）"
-    info "10. 落地机ss解锁（本机做解锁机）"
+    info "8. 落地机任意门解锁（本机做解锁机）"
+    info "9. 落地机 SS 解锁（本机做解锁机）"
     echo ""
     hint "========================="
     echo ""
-    read -r -p "请输入对应数字 (0-10): " choice
+    read -r -p "请输入对应数字 (0-9): " choice
 
     case $choice in
       1)
@@ -2188,22 +1544,18 @@ if has_any_installation_marker; then
           exit 0
           ;;
       6)
-          process_warp
-          exit 0
-          ;;
-      7)
           process_hy2hopping
           exit 0
           ;;
-      8) 
+      7)
           process_doko
           exit 0
           ;;
-      9) 
+      8)
           process_dokoko
           exit 0
           ;;
-      10) 
+      9)
           process_ssko
           exit 0
           ;;
@@ -2281,12 +1633,6 @@ HY_SERVER_NAME='$hy_server_name'
 HY_HOPPING=FALSE
 HY_HOPPING_START=
 HY_HOPPING_END=
-# Warp
-WARP_ENABLE=FALSE
-# 1 2 3 4
-WARP_MODE=1
-# 0 局部分流 1 全局分流
-WARP_OPTION=0
 EOF
 
 #generate singbox server config
