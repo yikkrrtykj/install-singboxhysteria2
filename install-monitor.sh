@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-RAW="https://raw.githubusercontent.com/yikkrrtykj/install-singboxhysteria2/main"
+RAW="${SBOX_REPO_RAW_BASE:-https://raw.githubusercontent.com/yikkrrtykj/install-singboxhysteria2/main}"
 DIR=/root/sbox/monitor
 SCRIPT=$DIR/proxy-monitor.py
 TOKEN=/root/sbox/monitor-token
@@ -82,19 +82,19 @@ AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
 WantedBy=multi-user.target
 EOF
 
-cat >"$HELPER" <<'EOF'
+cat >"$HELPER" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-PORT="${SBOX_MONITOR_PORT:-9191}"
-IP=$(sed -n "s/^SERVER_IP=['\"]\{0,1\}\([^'\"]*\)['\"]\{0,1\}$/\1/p" /root/sbox/config 2>/dev/null | tail -n1)
-IP=${IP:-SERVER_IP}
-TOKEN=$(cat /root/sbox/monitor-token 2>/dev/null || true)
-case "${1:-url}" in
-  url) echo "http://${IP}:${PORT}/${TOKEN}/" ;;
+PORT="\${SBOX_MONITOR_PORT:-9191}"
+IP=\$(sed -n "s/^SERVER_IP=['\\\"]\\{0,1\\}\\([^'\\\"]*\\)['\\\"]\\{0,1\\}$/\\1/p" /root/sbox/config 2>/dev/null | tail -n1)
+IP=\${IP:-SERVER_IP}
+TOKEN=\$(cat /root/sbox/monitor-token 2>/dev/null || true)
+case "\${1:-url}" in
+  url) echo "http://\${IP}:\${PORT}/\${TOKEN}/" ;;
   status) systemctl status sbox-monitor --no-pager ;;
   logs) journalctl -u sbox-monitor -n 100 --no-pager ;;
   restart) systemctl restart sbox-monitor ;;
-  update) bash <(curl -fsSL https://raw.githubusercontent.com/yikkrrtykj/install-singboxhysteria2/main/install-monitor.sh) ;;
+  update) SBOX_REPO_RAW_BASE="$RAW" bash <(curl -fsSL "$RAW/install-monitor.sh") ;;
   *) echo "Usage: sbox-monitor {url|status|logs|restart|update}" >&2; exit 2 ;;
 esac
 EOF
