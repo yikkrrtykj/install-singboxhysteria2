@@ -2,7 +2,8 @@
 # Thin wrapper: preserve the original installer as install-core.sh, then ensure
 # the independent read-only proxy monitor is installed after a successful run.
 set -uo pipefail
-RAW_BASE="https://raw.githubusercontent.com/yikkrrtykj/install-singboxhysteria2/main"
+RAW_BASE="${SBOX_REPO_RAW_BASE:-https://raw.githubusercontent.com/yikkrrtykj/install-singboxhysteria2/main}"
+export SBOX_REPO_RAW_BASE="$RAW_BASE"
 CORE_URL="$RAW_BASE/install-core.sh"
 MONITOR_URL="$RAW_BASE/install-monitor.sh"
 MONITOR_SERVICE="/etc/systemd/system/sbox-monitor.service"
