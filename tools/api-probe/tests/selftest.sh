@@ -274,6 +274,69 @@ else
   fail "transfer pid lifecycle: $(printf '%s' "$out" | grep -E 'XFER_FAIL|Error|error' | head -n2 | tr '\n' ' ')"
 fi
 
+section "regression #7: runtime local-init order in evidence.sh (set -u)"
+# Under `set -u`, referencing a variable inside the same `local` statement that
+# declares it explodes at runtime ("prefix: unbound variable" was hit by the
+# first real VPS run). This test actually EXECUTES run_direction_test /
+# run_attribution_test with the network-facing pieces mocked out, and asserts
+# the curl evidence stems are assembled exactly as expected.
+cat > "$TMP/reg/init_test.sh" <<'INITTEST'
+set -uo pipefail
+: "${LIB_DIR:?LIB_DIR must be set}"
+EVROOT="$1"
+fail_with() { echo "INIT_FAIL: $1"; exit "$2"; }
+
+export PROBE_ROOT="$EVROOT/probe-root"
+mkdir -p "$PROBE_ROOT"
+. "$LIB_DIR/common.sh"
+. "$LIB_DIR/evidence.sh"
+
+# Mock the network/collection side; the direction-test functions themselves run
+# for real, including every `local` initialisation.
+record_stem() { printf '%s\n' "$4" >> "$EVROOT/stems.txt"; }
+api_snapshot() { :; }
+sample_transfer() { printf '0\n'; }
+await_xfer() { :; }
+start_download() { record_stem "$@"; XFER_LAST="mock"; }
+start_upload()   { record_stem "$@"; XFER_LAST="mock"; }
+
+out="$(run_direction_test reality dl 18081 1024 1024 2>&1)" \
+  || fail_with "run_direction_test reality dl crashed: $out" 1
+out="$(run_direction_test reality ul 18081 1024 1024 2>&1)" \
+  || fail_with "run_direction_test reality ul crashed: $out" 2
+out="$(run_direction_test hy2 dl 18082 1024 1024 2>&1)" \
+  || fail_with "run_direction_test hy2 dl crashed: $out" 3
+out="$(run_direction_test hy2 ul 18082 1024 1024 2>&1)" \
+  || fail_with "run_direction_test hy2 ul crashed: $out" 4
+case "$out" in *"unbound variable"*) fail_with "unbound variable leaked: $out" 5 ;; esac
+
+grep -qx "$PROBE_ROOT/evidence/reality-dl-curl" "$EVROOT/stems.txt" \
+  || fail_with "reality dl stem wrong: $(cat "$EVROOT/stems.txt" | tr '\n' ' ')" 6
+grep -qx "$PROBE_ROOT/evidence/reality-ul-curl" "$EVROOT/stems.txt" \
+  || fail_with "reality ul stem wrong" 7
+grep -qx "$PROBE_ROOT/evidence/hy2-dl-curl" "$EVROOT/stems.txt" \
+  || fail_with "hy2 dl stem wrong" 8
+grep -qx "$PROBE_ROOT/evidence/hy2-ul-curl" "$EVROOT/stems.txt" \
+  || fail_with "hy2 ul stem wrong" 9
+
+: > "$EVROOT/stems.txt"
+out="$(run_attribution_test reality 18081 18083 2>&1)" \
+  || fail_with "run_attribution_test crashed: $out" 10
+case "$out" in *"unbound variable"*) fail_with "unbound variable in attribution: $out" 11 ;; esac
+grep -qx "$PROBE_ROOT/evidence/reality-ab-a-curl" "$EVROOT/stems.txt" \
+  || fail_with "reality ab-a stem wrong" 12
+grep -qx "$PROBE_ROOT/evidence/reality-ab-b-curl" "$EVROOT/stems.txt" \
+  || fail_with "reality ab-b stem wrong" 13
+
+echo "INIT_OK"
+exit 0
+INITTEST
+if out="$(LIB_DIR="$LIB_DIR" bash "$TMP/reg/init_test.sh" "$TMP/reg/init-ev" 2>&1)"; then
+  pass "runtime init order: direction/attribution run under set -u with correct stems (INIT_OK)"
+else
+  fail "runtime init order: $(printf '%s' "$out" | grep -E 'INIT_FAIL|Error|error' | head -n2 | tr '\n' ' ')"
+fi
+
 section "regression #4: sink honours ?bytes= and enforces the cap"
 SINK_PORT_TEST=$(( 18000 + (RANDOM % 2000) ))
 "$PY" "$LIB_DIR/sink.py" --port "$SINK_PORT_TEST" --bytes 1048576 >"$TMP/sink.log" 2>&1 &

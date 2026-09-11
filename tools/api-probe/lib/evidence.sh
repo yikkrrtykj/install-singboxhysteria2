@@ -266,7 +266,12 @@ sample_transfer() {
 
 run_direction_test() {
   local proto=$1 kind=$2 socks=$3 bytes=$4 rate=$5
-  local prefix="$proto-$kind" stem="$EVID_DIR/$prefix-curl" pid
+  # Never reference a variable inside the same `local` statement that declares it:
+  # all words of the statement are expanded before any assignment happens, so
+  # $prefix would still be unbound under `set -u`.
+  local prefix stem pid samples
+  prefix="${proto}-${kind}"
+  stem="${EVID_DIR}/${prefix}-curl"
   log "== $proto $kind: 已知 ${bytes}B 单向传输（连接存活期间周期采样）=="
   api_snapshot "$prefix-pre"
   case "$kind" in
@@ -286,10 +291,13 @@ run_direction_test() {
 
 run_attribution_test() {
   local proto=$1 socks_a=$2 socks_b=$3
-  local half=$(( PAYLOAD_BYTES / 2 ))
-  local half_rate=$(( TRANSFER_RATE / 2 ))
-  local prefix="$proto-ab" pid pid2 samples
-  local stem_a="$EVID_DIR/$proto-ab-a-curl" stem_b="$EVID_DIR/$proto-ab-b-curl"
+  # Same rule as run_direction_test: declare first, assign on separate lines.
+  local half half_rate prefix stem_a stem_b pid pid2 samples
+  half=$(( PAYLOAD_BYTES / 2 ))
+  half_rate=$(( TRANSFER_RATE / 2 ))
+  prefix="${proto}-ab"
+  stem_a="${EVID_DIR}/${prefix}-a-curl"
+  stem_b="${EVID_DIR}/${prefix}-b-curl"
   log "== $proto: 归因测试（$USER_A / $USER_B 并发，各 ${half}B）=="
   api_snapshot "$prefix-pre"
   start_download "$socks_a" "$half" "$half_rate" "$stem_a"
