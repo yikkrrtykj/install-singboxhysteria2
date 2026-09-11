@@ -166,11 +166,23 @@ XFER_PIDS=()
 XFER_LAST=""
 
 kill_transfers() {
+  # Only iterates PIDs still belonging to active transfers: every pid removed by
+  # remove_xfer_pid (already waited/reaped) can never be signalled again, so a
+  # recycled PID cannot be mistaken for ours by the EXIT trap.
   local p
   for p in ${XFER_PIDS[@]+"${XFER_PIDS[@]}"}; do
     [ -n "$p" ] && kill -TERM "$p" 2>/dev/null || true
   done
   XFER_PIDS=()
+}
+
+remove_xfer_pid() { # remove_xfer_pid <pid> -- drop a waited/reaped pid from the active set
+  local pid=$1 i
+  local remaining=()
+  for i in ${XFER_PIDS[@]+"${XFER_PIDS[@]}"}; do
+    [ "$i" = "$pid" ] || remaining+=("$i")
+  done
+  XFER_PIDS=("${remaining[@]}")
 }
 
 proto_tag() {
@@ -300,7 +312,9 @@ run_protocol_tests() {
 }
 
 await_xfer() { # await_xfer <pid> <what> <stem>
-  # Reaps the curl process and persists its exit code as the third evidence file.
+  # Reaps the curl process, persists its exit code as the third evidence file and
+  # immediately drops the pid from XFER_PIDS, so the EXIT trap can never signal a
+  # pid that has already been reaped (possibly recycled by the OS in the meantime).
   # If the script dies before this runs, the .rc file is simply absent and the
   # analyzer treats the transfer as unevidenced (never as a success).
   local pid=$1 what=$2 stem=$3 rc=0
@@ -311,6 +325,7 @@ await_xfer() { # await_xfer <pid> <what> <stem>
     warn "$what 未正常结束（curl exit $rc，证据: $stem.err / $stem.rc）"
   fi
   printf '%s\n' "$rc" > "$stem.rc"
+  remove_xfer_pid "$pid"
   return 0
 }
 

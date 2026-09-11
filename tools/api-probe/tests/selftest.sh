@@ -205,6 +205,75 @@ analyze_strict "$TMP/ev-short"
 direction_blocked "$TMP/ev-short" "90% of requested bytes"
 expect_grep "$TMP/ev-short/SUMMARY.txt" '明显小于请求' "short-transfer reason is stated"
 
+# 100% is the accepted case (covered by the ev-ok baseline above), so anything
+# beyond the window must fail symmetrically in the other direction too
+cp -r "$TMP/ev-ok" "$TMP/ev-over"
+"$PY" - "$TMP/ev-over/reality-dl-curl.json" <<'PY'
+import json
+import sys
+data = json.load(open(sys.argv[1]))
+data["bytes_downloaded"] = int(data["requested_bytes"] * 1.1)
+json.dump(data, open(sys.argv[1], "w"))
+PY
+analyze_strict "$TMP/ev-over"
+direction_blocked "$TMP/ev-over" "110% of requested bytes"
+expect_grep "$TMP/ev-over/SUMMARY.txt" '明显大于请求' "over-transfer reason is stated"
+
+section "regression #6: reaped transfer pids are removed from XFER_PIDS"
+# kill_transfers runs from the EXIT trap and signals every pid left in XFER_PIDS.
+# A pid already waited/reaped by await_xfer must have been dropped from that array,
+# otherwise a recycled pid could be signalled by mistake.
+mkdir -p "$TMP/reg"
+cat > "$TMP/reg/xfer_test.sh" <<'XFERTEST'
+set -uo pipefail
+: "${LIB_DIR:?LIB_DIR must be set}"
+EVROOT="$1"   # NOT EVID_DIR: sourcing lib/*.sh resets EVID_DIR to $PROBE_ROOT/evidence
+mkdir -p "$EVROOT"
+fail_with() { echo "XFER_FAIL: $1"; exit "$2"; }
+. "$LIB_DIR/common.sh"
+. "$LIB_DIR/evidence.sh"
+
+# helper semantics: drops the matching pid, preserves order, ignores unknown pids
+XFER_PIDS=(111 222 333)
+remove_xfer_pid 222 || fail_with "remove_xfer_pid returned non-zero" 1
+[ "${#XFER_PIDS[@]}" -eq 2 ] || fail_with "remove_xfer_pid did not drop the pid" 2
+[ "${XFER_PIDS[0]}" = "111" ] && [ "${XFER_PIDS[1]}" = "333" ] \
+  || fail_with "remove_xfer_pid corrupted the remaining pids" 3
+remove_xfer_pid 999
+[ "${#XFER_PIDS[@]}" -eq 2 ] || fail_with "removing an unknown pid changed the array" 4
+
+# a real background job, waited/reaped by await_xfer, must vanish from XFER_PIDS
+stem="$EVROOT/fake-dl-curl"
+{ sleep 0.2; } &
+pid=$!
+XFER_PIDS+=( "$pid" )
+await_xfer "$pid" "fake transfer" "$stem" || fail_with "await_xfer returned failure" 5
+case " ${XFER_PIDS[*]} " in *" $pid "*) fail_with "reaped pid still in XFER_PIDS" 6 ;; esac
+[ -s "$stem.rc" ] || fail_with "rc evidence missing after await_xfer" 7
+[ "$(cat "$stem.rc")" = "0" ] || fail_with "rc should be 0 for a clean wait" 8
+
+# kill_transfers with nothing active must be a no-op (nothing left to signal)
+kill_transfers
+[ "${#XFER_PIDS[@]}" -eq 0 ] || fail_with "XFER_PIDS not empty after kill_transfers" 9
+
+# while an active transfer is still running, kill_transfers DOES signal it
+{ sleep 30; } &
+pid2=$!
+XFER_PIDS+=( "$pid2" )
+kill_transfers
+wait "$pid2" 2>/dev/null
+rc2=$?
+[ "$rc2" -ne 0 ] || fail_with "kill_transfers did not signal an active transfer" 10
+
+echo "XFER_OK"
+exit 0
+XFERTEST
+if out="$(LIB_DIR="$LIB_DIR" bash "$TMP/reg/xfer_test.sh" "$TMP/reg/xfer-ev" 2>&1)"; then
+  pass "transfer pid lifecycle: reaped pids removed, active pids signalled (XFER_OK)"
+else
+  fail "transfer pid lifecycle: $(printf '%s' "$out" | grep -E 'XFER_FAIL|Error|error' | head -n2 | tr '\n' ' ')"
+fi
+
 section "regression #4: sink honours ?bytes= and enforces the cap"
 SINK_PORT_TEST=$(( 18000 + (RANDOM % 2000) ))
 "$PY" "$LIB_DIR/sink.py" --port "$SINK_PORT_TEST" --bytes 1048576 >"$TMP/sink.log" 2>&1 &

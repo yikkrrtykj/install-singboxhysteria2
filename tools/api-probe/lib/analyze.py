@@ -34,9 +34,10 @@ SYNTHETIC_BANNER = "SYNTHETIC FIXTURE OUTPUT - NOT RUNTIME DATA (validates deriv
 FIXTURE_MARKER = "_fixture"
 TOLERANCE = 0.85
 BIDIRECTIONAL_NOISE = 0.20
-# A direction verdict requires curl to have actually moved at least this share of
-# the requested bytes; anything at or below 90% must never produce VERIFIED.
+# A direction verdict requires the actually-transferred bytes to fall within this
+# window of the requested bytes: <= 90% or >= 110% must never produce VERIFIED.
 CURL_SIZE_FLOOR = 0.98
+CURL_SIZE_CEILING = 1.02
 
 STATUS_ORDER = ["FAILED", "NO", "INCONCLUSIVE", "PARTIAL", "VERIFIED", NOT_TESTED]
 
@@ -167,10 +168,17 @@ class CurlTransfer:
         elif self.requested is None:
             self.reasons.append("curl 未报告 requested_bytes，无法核对实际传输量")
         elif self.actual < self.requested * CURL_SIZE_FLOOR:
-            self.reasons.append("实际传输 %.0fB 明显小于请求 %.0fB（仅 %.1f%%，要求 >= %.0f%%）"
+            self.reasons.append("实际传输 %.0fB 明显小于请求 %.0fB（仅 %.1f%%，"
+                                "允许误差 %.0f%%–%.0f%%）"
                                 % (self.actual, self.requested,
                                    100.0 * self.actual / self.requested,
-                                   100.0 * CURL_SIZE_FLOOR))
+                                   100.0 * CURL_SIZE_FLOOR, 100.0 * CURL_SIZE_CEILING))
+        elif self.actual > self.requested * CURL_SIZE_CEILING:
+            self.reasons.append("实际传输 %.0fB 明显大于请求 %.0fB（%.1f%%，"
+                                "允许误差 %.0f%%–%.0f%%）"
+                                % (self.actual, self.requested,
+                                   100.0 * self.actual / self.requested,
+                                   100.0 * CURL_SIZE_FLOOR, 100.0 * CURL_SIZE_CEILING))
 
     @property
     def ok(self):

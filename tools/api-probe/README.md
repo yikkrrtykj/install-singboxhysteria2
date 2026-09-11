@@ -116,7 +116,7 @@ bash phase-a-probe.sh cleanup
 2. 传输进行中按 `SAMPLE_INTERVAL`（默认 1 秒）持续采样 `-s01/-s02/...`；
 3. 传输进程结束后，**只要该 inbound 仍有连接可见就继续短采样**（0.25 秒间隔，最多 8 次），因此最后一个"连接仍存活"的采样带着接近最终值的计数器；
 4. 每个计数器取这些采样中的**峰值**，与 `-pre` 相减得到增量；
-5. **基准**取自 curl 的真实 `size_download` / `size_upload`（写在 `*-curl.json` 里），而不是假设"4 秒传了多少"。**严格证据模式**：每次传输必须同时持有三类证据文件（`*-curl.json` / `*-curl.err` / `*-curl.rc`），且 curl exit code = 0、HTTP 200、实测字节与 `requested_bytes` 在允许误差内（实测低于请求的 98% 即拒绝），方向判定才允许给出 `VERIFIED` / `PARTIAL`；任一条件不满足时输出 `INCONCLUSIVE` / `NOT TESTED`，**绝不回退到 `meta.payload_bytes`**——该值只作为"期望测试大小"显示。
+5. **基准**取自 curl 的真实 `size_download` / `size_upload`（写在 `*-curl.json` 里），而不是假设"4 秒传了多少"。**严格证据模式**：每次传输必须同时持有三类证据文件（`*-curl.json` / `*-curl.err` / `*-curl.rc`），且 curl exit code = 0、HTTP 200、实测字节与 `requested_bytes` 在允许误差内（`0.98 ≤ 实测/请求 ≤ 1.02`，低于 98% 或超过 102% 均拒绝），方向判定才允许给出 `VERIFIED` / `PARTIAL`；任一条件不满足时输出 `INCONCLUSIVE` / `NOT TESTED`，**绝不回退到 `meta.payload_bytes`**——该值只作为"期望测试大小"显示。
 
 传输结束后另有 `-closed` 快照，**仅用于连接关闭行为**，不参与任何字节计算。
 
@@ -221,7 +221,7 @@ bash tests/selftest.sh
 包含：`bash -n`、`python3 -m py_compile`、**guardrail lint**（断言脚本里不存在 `pkill`/`killall`、`systemctl <verb> ... sing-box`、
 `iptables`/`nft`/`ufw`、`rm -rf .../root/sbox`、`sed -i`、写生产路径）、`shellcheck -S warning`（若环境有 shellcheck），
 分析器在“空证据 / 合成证据 / 反向命名”三种输入下的行为，以及上面列出的四类回归测试。
-当前共 59 项检查（本机无 shellcheck 时为 58 项 + 1 skip）。
+当前共 63 项检查（本机无 shellcheck 时为 62 项 + 1 skip）。
 
 ---
 
