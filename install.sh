@@ -744,13 +744,13 @@ with_client_lock() {
 get_reality_client_names() { # [config] -> one name per line ("" = unnamed user)
     jq -r --arg tag "$REALITY_INBOUND_TAG" \
         '.inbounds[] | select(.tag == $tag) | .users[]? | (.name // "")' \
-        "${1:-$SB_SERVER_CONFIG}" 2>/dev/null
+        "${1:-$SB_SERVER_CONFIG}" 2>/dev/null | tr -d '\r'
 }
 
 get_hy2_client_names() { # [config] -> one name per line ("" = unnamed user)
     jq -r --arg tag "$HY2_INBOUND_TAG" \
         '.inbounds[] | select(.tag == $tag) | .users[]? | (.name // "")' \
-        "${1:-$SB_SERVER_CONFIG}" 2>/dev/null
+        "${1:-$SB_SERVER_CONFIG}" 2>/dev/null | tr -d '\r'
 }
 
 # Structural consistency of a (candidate or live) server config. Compares name
@@ -815,12 +815,13 @@ audit_client_consistency() { # audit_client_consistency [config] -> table + rc
 }
 
 # Reload the running instance; succeeds trivially when nothing is running
-# (e.g. config-only change with the service stopped).
+# (e.g. config-only change with the service stopped). Propagates failure so
+# commit_server_config can roll back.
 reload_running_singbox() {
     if systemctl is-active --quiet sing-box 2>/dev/null; then
-        systemctl reload sing-box
+        systemctl reload sing-box || return 1
     elif pgrep -x sing-box >/dev/null 2>&1; then
-        kill -HUP "$(pgrep -o -x sing-box)"
+        kill -HUP "$(pgrep -o -x sing-box)" || return 1
     fi
     return 0
 }
@@ -1184,6 +1185,9 @@ generate_client_configuration() { # generate_client_configuration <name>
     fi
     uuid="$(printf '%s\n' "$creds" | sed -n '1p')"
     password="$(printf '%s\n' "$creds" | sed -n '2p')"
+    # write_mihomo_template reads these exact names from the caller scope
+    reality_uuid="$uuid"
+    hy_password="$password"
 
     server_ip=$(grep -o "SERVER_IP='[^']*'" "$SB_STATE_FILE" 2>/dev/null | awk -F"'" '{print $2}')
     public_key=$(grep -o "PUBLIC_KEY='[^']*'" "$SB_STATE_FILE" 2>/dev/null | awk -F"'" '{print $2}')
