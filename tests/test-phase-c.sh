@@ -260,8 +260,10 @@ add_client "vmix-03" > "$TMP/c9.add" 2>&1
 assert_rc 1 $? "add refused while inconsistent"
 after_add="$(sha256sum "$SB_SANDBOX_CONFIG" | awk '{print $1}')"
 if [ "$before_add" = "$after_add" ]; then pass "add refused did not touch config"; else fail "add refused mutated config"; fi
-echo n | delete_client "vmix-01" > "$TMP/c9.del" 2>&1
+echo y | delete_client "vmix-01" > "$TMP/c9.del" 2>&1
 if grep -q '禁止破坏性操作' "$TMP/c9.del"; then pass "delete refused while inconsistent"; else fail "delete not blocked while inconsistent"; fi
+after_del="$(sha256sum "$SB_SANDBOX_CONFIG" | awk '{print $1}')"
+if [ "$before_add" = "$after_del" ]; then pass "delete refused did not touch config"; else fail "delete refused mutated config"; fi
 
 section "regression C10: failed sing-box check leaves the live config untouched"
 write_old_config; write_state_file

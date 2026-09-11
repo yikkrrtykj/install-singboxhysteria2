@@ -833,13 +833,16 @@ reload_health_ok() {
     pgrep -x sing-box >/dev/null 2>&1
 }
 
-# The ONLY path that mutates sbconfig_server.json:
+# Internal transaction commit. The CALLER must already hold the client config
+# lock (see with_client_lock): the whole read -> audit -> candidate -> commit
+# sequence has to run under one exclusive lock or two concurrent managers could
+# lose each other's update. This function never acquires the lock itself.
 #   candidate -> structural audit -> sing-box check -> backup -> atomic mv
 #   -> reload -> health check; on any failure after the mv the previous config
 #   is restored and reloaded, so the disk state is never left half-migrated.
 commit_server_config() { # commit_server_config <candidate> <description>
     local candidate="$1" description="${2:-server config update}"
-    local backup_path was_running problems rc
+    local backup_path was_running problems
     [ -f "$candidate" ] || { warning "candidate 不存在: $candidate"; return 1; }
 
     problems="$(candidate_problems "$candidate")"
@@ -866,7 +869,8 @@ commit_server_config() { # commit_server_config <candidate> <description>
         was_running=no
     fi
 
-    backup_path="${SB_SERVER_CONFIG}.bak.$(date +%Y%m%d-%H%M%S)"
+    # .$$ keeps two same-second transactions from colliding on the backup name.
+    backup_path="${SB_SERVER_CONFIG}.bak.$(date +%Y%m%d-%H%M%S).$$"
     cp -a "$SB_SERVER_CONFIG" "$backup_path" || {
         warning "备份正式配置失败（$description），正式配置未修改"
         rm -f "$candidate"
@@ -887,11 +891,12 @@ commit_server_config() { # commit_server_config <candidate> <description>
         fi
         warning "reload 后健康检查失败（$description），自动回滚..."
         cp -a "$backup_path" "$SB_SERVER_CONFIG"
-        reload_running_singbox
-        if reload_health_ok; then
+        # The rollback reload's exit code matters: a failed reload command with a
+        # still-alive process must NOT be reported as a successful recovery.
+        if reload_running_singbox && reload_health_ok; then
             warning "已回滚并重新加载上一份配置: $backup_path"
         else
-            warning "已回滚配置文件，但服务未能恢复，请立即人工检查！备份: $backup_path"
+            warning "已回滚配置文件，但服务未能确认恢复，请立即人工检查！备份: $backup_path"
         fi
         return 1
     fi
@@ -899,6 +904,10 @@ commit_server_config() { # commit_server_config <candidate> <description>
     info "配置已提交（当前无运行中的 sing-box 进程，跳过 reload）: $description"
     info "上一份配置备份: $backup_path"
     return 0
+}
+
+new_candidate_path() { # new_candidate_path -> unique candidate file next to the live config
+    mktemp "${SB_SERVER_CONFIG}.candidate.XXXXXX" 2>/dev/null
 }
 client_name_exists() { # client_name_exists <name> [config] -> rc 0 if present in either inbound
     local name="$1" cfg="${2:-$SB_SERVER_CONFIG}"
@@ -910,7 +919,13 @@ client_name_exists() { # client_name_exists <name> [config] -> rc 0 if present i
 #   {"uuid": "AAAA", ...}  ->  {"name": "legacy", "uuid": "AAAA", ...}
 # Only fills in the missing name; never touches uuid/password/flow.
 # Idempotent: running it again on an already-migrated config is a no-op.
+# The ENTIRE decision + candidate generation runs under the config lock, so a
+# migration can never interleave with a concurrent add/delete.
 migrate_legacy_clients() {
+    with_client_lock _migrate_legacy_clients_locked
+}
+
+_migrate_legacy_clients_locked() {
     local cfg="$SB_SERVER_CONFIG" candidate r_unnamed h_unnamed
     [ -f "$cfg" ] || { warning "服务端配置不存在: $cfg"; return 1; }
     if ! jq empty "$cfg" >/dev/null 2>&1; then
@@ -937,7 +952,7 @@ migrate_legacy_clients() {
         return 1
     fi
 
-    candidate="${cfg}.candidate.$$"
+    candidate="$(new_candidate_path)" || { warning "创建 candidate 失败"; return 1; }
     jq --arg legacy "$RESERVED_CLIENT_NAME" '
       (.inbounds[] | select(.tag == "vless-in") | .users) |=
         map(if has("name") then . else . + {"name": $legacy} end) |
@@ -945,10 +960,17 @@ migrate_legacy_clients() {
         map(if has("name") then . else . + {"name": $legacy} end)
     ' "$cfg" > "$candidate" || { warning "生成迁移 candidate 失败"; rm -f "$candidate"; return 1; }
 
-    with_client_lock commit_server_config "$candidate" "migrate unnamed user to legacy"
+    commit_server_config "$candidate" "migrate unnamed user to legacy"
 }
 
 add_client() { # add_client <name> -> adds to BOTH inbounds atomically
+    with_client_lock _add_client_locked "$1"
+}
+
+# Runs under the config lock: every judgement below re-reads the LIVE config,
+# so a transaction that lost the lock race starts from the winner's state
+# instead of overwriting it with a stale snapshot (no lost update).
+_add_client_locked() {
     local name="$1" candidate uuid password
     if ! validate_client_name "$name"; then
         warning "客户端名称非法: '$name'（允许: 字母/数字开头，仅字母数字._-，长度 1-32）"
@@ -959,6 +981,10 @@ add_client() { # add_client <name> -> adds to BOTH inbounds atomically
         return 1
     fi
     [ -f "$SB_SERVER_CONFIG" ] || { warning "服务端配置不存在: $SB_SERVER_CONFIG"; return 1; }
+    if ! jq empty "$SB_SERVER_CONFIG" >/dev/null 2>&1; then
+        warning "服务端配置不是合法 JSON: $SB_SERVER_CONFIG"
+        return 1
+    fi
     if ! audit_client_consistency "$SB_SERVER_CONFIG" >/dev/null; then
         warning "当前 Reality/HY2 用户集合不一致，先修复后再添加客户端（运行一致性检查）"
         audit_client_consistency "$SB_SERVER_CONFIG"
@@ -978,7 +1004,7 @@ add_client() { # add_client <name> -> adds to BOTH inbounds atomically
         return 1
     fi
 
-    candidate="${SB_SERVER_CONFIG}.candidate.$$"
+    candidate="$(new_candidate_path)" || { warning "创建 candidate 失败"; return 1; }
     jq --arg name "$name" --arg uuid "$uuid" --arg password "$password" '
       (.inbounds[] | select(.tag == "vless-in") | .users) += [
         {"name": $name, "uuid": $uuid, "flow": "xtls-rprx-vision"}
@@ -991,23 +1017,24 @@ add_client() { # add_client <name> -> adds to BOTH inbounds atomically
     }
 
     # Single transaction: Reality + HY2 appear together or not at all.
-    with_client_lock commit_server_config "$candidate" "add client $name" || return 1
-    info "客户端 '$name' 已同时添加到 Reality 与 HY2（UUID/password 已生成）"
+    if commit_server_config "$candidate" "add client $name"; then
+        info "客户端 '$name' 已同时添加到 Reality 与 HY2（UUID/password 已生成）"
+        return 0
+    fi
+    return 1
 }
 
 delete_client() { # delete_client <name> -> removes from BOTH inbounds atomically
-    local name="$1" candidate r_found h_found confirm
+    # Confirmation happens outside the lock (it is interactive UI), but every
+    # safety judgement is re-made against the LIVE config inside the lock, so a
+    # config changed between "y" and the transaction cannot be deleted blindly.
+    local name="$1" r_found h_found confirm
     if [ "$name" = "$RESERVED_CLIENT_NAME" ]; then
         warning "'$RESERVED_CLIENT_NAME' 是保留名称，本版本禁止删除（legacy retirement 属于后续功能）"
         return 1
     fi
     [ -n "$name" ] || { warning "客户端名称不能为空"; return 1; }
     [ -f "$SB_SERVER_CONFIG" ] || { warning "服务端配置不存在: $SB_SERVER_CONFIG"; return 1; }
-    if ! audit_client_consistency "$SB_SERVER_CONFIG" >/dev/null; then
-        warning "当前 Reality/HY2 用户集合不一致，禁止破坏性操作（先运行一致性检查并修复）"
-        audit_client_consistency "$SB_SERVER_CONFIG"
-        return 1
-    fi
 
     r_found="MISSING"; h_found="MISSING"
     grep -qxF "$name" <(get_reality_client_names "$SB_SERVER_CONFIG") && r_found="FOUND"
@@ -1015,17 +1042,29 @@ delete_client() { # delete_client <name> -> removes from BOTH inbounds atomicall
     info "准备删除客户端: $name"
     info "Reality: $r_found"
     info "HY2:     $h_found"
-    if [ "$r_found" != "FOUND" ] || [ "$h_found" != "FOUND" ]; then
-        warning "客户端 '$name' 未在两个协议中同时存在，拒绝删除（请先修复一致性）"
-        return 1
-    fi
     read -r -p "确认删除 '$name'？此操作会同时移除 Reality 与 HY2 凭据 (y/n): " confirm
     if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
         info "已取消删除 '$name'"
         return 1
     fi
 
-    candidate="${SB_SERVER_CONFIG}.candidate.$$"
+    with_client_lock _delete_client_locked "$name"
+}
+
+_delete_client_locked() {
+    local name="$1" candidate
+    if ! audit_client_consistency "$SB_SERVER_CONFIG" >/dev/null; then
+        warning "当前 Reality/HY2 用户集合不一致，禁止破坏性操作（先运行一致性检查并修复）"
+        audit_client_consistency "$SB_SERVER_CONFIG"
+        return 1
+    fi
+    if ! grep -qxF "$name" <(get_reality_client_names "$SB_SERVER_CONFIG") ||
+       ! grep -qxF "$name" <(get_hy2_client_names "$SB_SERVER_CONFIG"); then
+        warning "客户端 '$name' 未在两个协议中同时存在（锁内复核），拒绝删除（请先修复一致性）"
+        return 1
+    fi
+
+    candidate="$(new_candidate_path)" || { warning "创建 candidate 失败"; return 1; }
     jq --arg name "$name" '
       (.inbounds[] | select(.tag == "vless-in") | .users) |=
         map(select(.name != $name)) |
@@ -1035,10 +1074,10 @@ delete_client() { # delete_client <name> -> removes from BOTH inbounds atomicall
         warning "生成 delete candidate 失败"; rm -f "$candidate"; return 1
     }
 
-    with_client_lock commit_server_config "$candidate" "delete client $name" || {
+    if ! commit_server_config "$candidate" "delete client $name"; then
         warning "服务端修改失败，客户端配置目录 $SB_CLIENTS_DIR/$name 保持不变"
         return 1
-    }
+    fi
     # Only after the server-side commit succeeded may the derived files go.
     if [ -d "$SB_CLIENTS_DIR/$name" ]; then
         rm -rf "$SB_CLIENTS_DIR/$name"
