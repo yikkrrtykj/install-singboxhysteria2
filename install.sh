@@ -330,103 +330,8 @@ show_client_configuration() {
 
   show_notice "Mihomo/Clash Meta客户端配置参数"
   mihomo_config_path="/root/sbox/mihomo_client.yaml"
-cat > "$mihomo_config_path" << EOF || error "保存 Mihomo 客户端配置失败"
-mixed-port: 7897
-allow-lan: true
-bind-address: "*"
-mode: rule
-log-level: info
-unified-delay: true
-ipv6: true
-profile:
-  store-selected: true
-  store-fake-ip: true
-dns:
-  enable: true
-  listen: "0.0.0.0:53"
-  ipv6: true
-  enhanced-mode: fake-ip
-  fake-ip-range: 198.18.0.1/16
-  default-nameserver: 
-    - 223.5.5.5
-    - 8.8.8.8
-  nameserver:
-    - https://dns.alidns.com/dns-query
-    - https://doh.pub/dns-query
-  fallback:
-    - https://1.0.0.1/dns-query
-    - tls://dns.google
-  fallback-filter:
-    geoip: true
-    geoip-code: CN
-    ipcidr:
-      - 240.0.0.0/4
-
-tun:
-  enable: true
-  stack: mixed
-  device: Mihomo
-  mtu: 1420
-  auto-route: true
-  auto-redirect: true
-  auto-detect-interface: true
-  dns-hijack:
-    - any:53
-    - tcp://any:53
-
-proxies:
-  - name: Reality
-    type: vless
-    server: $server_ip
-    port: $reality_port
-    uuid: $reality_uuid
-    network: tcp
-    udp: true
-    tls: true
-    flow: xtls-rprx-vision
-    servername: $reality_server_name
-    client-fingerprint: chrome
-    reality-opts:
-      public-key: $public_key
-      short-id: $short_id
-
-  - name: Hysteria2
-    type: hysteria2
-    server: $server_ip
-${hy_clash_port_yaml}
-    password: $hy_password
-    up: "300 Mbps"
-    down: "300 Mbps"
-    sni: $hy_server_name
-    skip-cert-verify: true
-    alpn:
-      - h3
-
-proxy-groups:
-  - name: 节点选择
-    type: select
-    proxies:
-      - Reality
-      - Hysteria2
-      - 自动选择
-      - DIRECT
-
-  - name: 自动选择
-    type: url-test
-    proxies:
-      - Reality
-      - Hysteria2
-    url: "http://www.gstatic.com/generate_204"
-    interval: 300
-    tolerance: 50
-
-
-rules:
-  - GEOIP,LAN,DIRECT
-  - GEOIP,CN,DIRECT
-  - MATCH,节点选择
-
-EOF
+  # 共享账号（users[0]）的展示路径；多客户端请用"客户端管理 -> 生成客户端配置"
+  write_mihomo_template "$mihomo_config_path" || error "保存 Mihomo 客户端配置失败"
   chmod 0600 "$mihomo_config_path" || error "设置 Mihomo 客户端配置权限失败"
   cat "$mihomo_config_path"
   echo ""
@@ -1139,6 +1044,188 @@ delete_client() { # delete_client <name> -> removes from BOTH inbounds atomicall
         info "已删除派生客户端配置目录: $SB_CLIENTS_DIR/$name"
     fi
     info "客户端 '$name' 已从 Reality 与 HY2 同时删除"
+}
+get_client_credentials() { # get_client_credentials <name> [config] -> "uuid\npassword"
+    local name="$1" cfg="${2:-$SB_SERVER_CONFIG}" uuid password
+    uuid="$(jq -r --arg name "$name" --arg tag "$REALITY_INBOUND_TAG" '
+        .inbounds[] | select(.tag == $tag) | .users[]? | select(.name == $name) | .uuid // ""
+    ' "$cfg" 2>/dev/null)"
+    password="$(jq -r --arg name "$name" --arg tag "$HY2_INBOUND_TAG" '
+        .inbounds[] | select(.tag == $tag) | .users[]? | select(.name == $name) | .password // ""
+    ' "$cfg" 2>/dev/null)"
+    [ -n "$uuid" ] && [ -n "$password" ] || return 1
+    printf '%s\n%s\n' "$uuid" "$password"
+}
+
+# Writes the Mihomo/Clash Meta client YAML using caller-scope variables:
+#   $server_ip $reality_port $reality_uuid $reality_server_name $public_key
+#   $short_id $hy_clash_port_yaml $hy_password $hy_server_name
+# Only the credentials differ between clients; everything else is shared.
+write_mihomo_template() { # write_mihomo_template <outfile>
+    local outfile="$1"
+    cat > "$outfile" << EOF || return 1
+mixed-port: 7897
+allow-lan: true
+bind-address: "*"
+mode: rule
+log-level: info
+unified-delay: true
+ipv6: true
+profile:
+  store-selected: true
+  store-fake-ip: true
+dns:
+  enable: true
+  listen: "0.0.0.0:53"
+  ipv6: true
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  default-nameserver:
+    - 223.5.5.5
+    - 8.8.8.8
+  nameserver:
+    - https://dns.alidns.com/dns-query
+    - https://doh.pub/dns-query
+  fallback:
+    - https://1.0.0.1/dns-query
+    - tls://dns.google
+  fallback-filter:
+    geoip: true
+    geoip-code: CN
+    ipcidr:
+      - 240.0.0.0/4
+
+tun:
+  enable: true
+  stack: mixed
+  device: Mihomo
+  mtu: 1420
+  auto-route: true
+  auto-redirect: true
+  auto-detect-interface: true
+  dns-hijack:
+    - any:53
+    - tcp://any:53
+
+proxies:
+  - name: Reality
+    type: vless
+    server: $server_ip
+    port: $reality_port
+    uuid: $reality_uuid
+    network: tcp
+    udp: true
+    tls: true
+    flow: xtls-rprx-vision
+    servername: $reality_server_name
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: $public_key
+      short-id: $short_id
+
+  - name: Hysteria2
+    type: hysteria2
+    server: $server_ip
+${hy_clash_port_yaml}
+    password: $hy_password
+    up: "300 Mbps"
+    down: "300 Mbps"
+    sni: $hy_server_name
+    skip-cert-verify: true
+    alpn:
+      - h3
+
+proxy-groups:
+  - name: 节点选择
+    type: select
+    proxies:
+      - Reality
+      - Hysteria2
+      - 自动选择
+      - DIRECT
+
+  - name: 自动选择
+    type: url-test
+    proxies:
+      - Reality
+      - Hysteria2
+    url: "http://www.gstatic.com/generate_204"
+    interval: 300
+    tolerance: 50
+
+
+rules:
+  - GEOIP,LAN,DIRECT
+  - GEOIP,CN,DIRECT
+  - MATCH,节点选择
+
+EOF
+    return 0
+}
+
+# Per-client derived configuration: /root/sbox/clients/<name>/mihomo.yaml
+# (directory 0700, file 0600). The YAML is DERIVED output only -- the server
+# config remains the single source of truth and the YAML can be regenerated.
+generate_client_configuration() { # generate_client_configuration <name>
+    local name="$1" cfg="$SB_SERVER_CONFIG" uuid password creds
+    local out_dir out_file
+    if ! validate_client_name "$name"; then
+        warning "客户端名称非法: '$name'"
+        return 1
+    fi
+    [ -f "$cfg" ] || { warning "服务端配置不存在: $cfg"; return 1; }
+    if ! audit_client_consistency "$cfg" >/dev/null; then
+        warning "客户端集合不一致，拒绝生成配置（先运行一致性检查）"
+        return 1
+    fi
+    if ! creds="$(get_client_credentials "$name" "$cfg")"; then
+        warning "客户端 '$name' 在 Reality/HY2 中不完整，无法生成配置"
+        return 1
+    fi
+    uuid="$(printf '%s\n' "$creds" | sed -n '1p')"
+    password="$(printf '%s\n' "$creds" | sed -n '2p')"
+
+    server_ip=$(grep -o "SERVER_IP='[^']*'" "$SB_STATE_FILE" 2>/dev/null | awk -F"'" '{print $2}')
+    public_key=$(grep -o "PUBLIC_KEY='[^']*'" "$SB_STATE_FILE" 2>/dev/null | awk -F"'" '{print $2}')
+    reality_port=$(jq -r --arg tag "$REALITY_INBOUND_TAG" '.inbounds[] | select(.tag == $tag) | .listen_port' "$cfg")
+    reality_server_name=$(jq -r --arg tag "$REALITY_INBOUND_TAG" '.inbounds[] | select(.tag == $tag) | .tls.server_name' "$cfg")
+    short_id=$(jq -r --arg tag "$REALITY_INBOUND_TAG" '.inbounds[] | select(.tag == $tag) | .tls.reality.short_id[0]' "$cfg")
+    hy_port=$(jq -r --arg tag "$HY2_INBOUND_TAG" '.inbounds[] | select(.tag == $tag) | .listen_port' "$cfg")
+    hy_server_name=$(grep -o "HY_SERVER_NAME='[^']*'" "$SB_STATE_FILE" 2>/dev/null | awk -F"'" '{print $2}')
+    ishopping=$(grep '^HY_HOPPING=' "$SB_STATE_FILE" 2>/dev/null | cut -d'=' -f2)
+    hy_hopping_start=$(grep '^HY_HOPPING_START=' "$SB_STATE_FILE" 2>/dev/null | cut -d'=' -f2)
+    hy_hopping_end=$(grep '^HY_HOPPING_END=' "$SB_STATE_FILE" 2>/dev/null | cut -d'=' -f2)
+    hy_clash_port_yaml="    port: $hy_port"
+    formatted_range=""
+    if [ "$ishopping" = "TRUE" ] &&
+       [[ "$hy_hopping_start" =~ ^[0-9]+$ ]] &&
+       [[ "$hy_hopping_end" =~ ^[0-9]+$ ]]; then
+        formatted_range="${hy_hopping_start}-${hy_hopping_end}"
+        hy_clash_port_yaml="    port: $hy_port
+    ports: ${formatted_range}
+    hop-interval: 30"
+    fi
+
+    out_dir="$SB_CLIENTS_DIR/$name"
+    if ! mkdir -p "$out_dir"; then
+        warning "创建客户端目录失败: $out_dir"
+        return 1
+    fi
+    chmod 0700 "$out_dir"
+    out_file="$out_dir/mihomo.yaml"
+    if ! write_mihomo_template "$out_file"; then
+        warning "写入客户端配置失败: $out_file"
+        return 1
+    fi
+    chmod 0600 "$out_file"
+
+    info "客户端 '$name' 的 Mihomo 配置已生成: $out_file（使用 '$name' 自己的 UUID/password）"
+    info "Reality 链接: vless://$uuid@$server_ip:$reality_port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$reality_server_name&fp=chrome&pbk=$public_key&sid=$short_id&type=tcp&headerType=none#REALITY-$name"
+    if [ -n "$formatted_range" ]; then
+        info "HY2 链接: hysteria2://$password@$server_ip:$hy_port?insecure=1&sni=$hy_server_name&mport=${hy_port},${formatted_range}#HY2-$name"
+    else
+        info "HY2 链接: hysteria2://$password@$server_ip:$hy_port?insecure=1&sni=$hy_server_name#HY2-$name"
+    fi
 }
 # <<< phase-c client-management <<< ============================================
 
