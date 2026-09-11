@@ -99,6 +99,8 @@ start_sink() {
   fi
   truncate -s "$PAYLOAD_BYTES" "$PAYLOAD_FILE" 2>/dev/null \
     || head -c "$PAYLOAD_BYTES" /dev/zero > "$PAYLOAD_FILE"
+  truncate -s "$(( PAYLOAD_BYTES / 2 ))" "$PAYLOAD_HALF_FILE" 2>/dev/null \
+    || head -c "$(( PAYLOAD_BYTES / 2 ))" /dev/zero > "$PAYLOAD_HALF_FILE"
   start_detached sink "$PROBE_ROOT/sink.log" python3 "$PROBE_ROOT/sink.py" --port "$SINK_PORT" --bytes "$PAYLOAD_BYTES" >/dev/null
   PROBE_PIDS+=(sink)
   ensure_detached_pid sink "$PROBE_ROOT/sink.py" || warn "无法确认 sink 的存活 pid"
@@ -137,7 +139,8 @@ api_snapshot() {
   local label=$1 out
   mkdir -p "$EVID_DIR"
   api_capture_version
-  for out in connections traffic memory; do
+  api_snapshot_conn "$label"
+  for out in traffic memory; do
     if ! api_curl "/$out" > "$EVID_DIR/$label.$out.json" 2>"$EVID_DIR/$label.$out.err"; then
       printf '{"_probe_api_error": "request to /%s failed"}\n' "$out" > "$EVID_DIR/$label.$out.json"
     fi
@@ -147,7 +150,16 @@ api_snapshot() {
         > "$EVID_DIR/$label.keys.txt" 2>/dev/null; then
     : > "$EVID_DIR/$label.keys.txt"
   fi
-  log "snapshot $label: $(python3 "$LIB_DIR/analyze.py" count "$EVID_DIR/$label.connections.json" 2>/dev/null || echo '?') 条连接"
+}
+
+# Cheap variant used by the in-transfer sampling loop: /connections only.
+api_snapshot_conn() {
+  local label=$1
+  mkdir -p "$EVID_DIR"
+  if ! api_curl /connections > "$EVID_DIR/$label.connections.json" 2>/dev/null; then
+    printf '{"_probe_api_error": "request to /connections failed"}\n' > "$EVID_DIR/$label.connections.json"
+  fi
+  log "sample $label: $(python3 "$LIB_DIR/analyze.py" count "$EVID_DIR/$label.connections.json" 2>/dev/null || echo '?') 条连接"
 }
 
 XFER_PIDS=()
@@ -161,29 +173,124 @@ kill_transfers() {
   XFER_PIDS=()
 }
 
-sink_url() { printf 'http://127.0.0.1:%s/blob' "$SINK_PORT"; }
+proto_tag() {
+  case "$1" in
+    reality) printf '%s' "$REALITY_TAG" ;;
+    hy2) printf '%s' "$HY2_TAG" ;;
+    *) printf '' ;;
+  esac
+}
+
+sink_url() {
+  local bytes="${1:-$PAYLOAD_BYTES}"
+  printf 'http://127.0.0.1:%s/blob?bytes=%s' "$SINK_PORT" "$bytes"
+}
+
+payload_file_for() {
+  local bytes=$1
+  if [ "$bytes" = "$PAYLOAD_BYTES" ]; then printf '%s' "$PAYLOAD_FILE"; return 0; fi
+  if [ "$bytes" = "$(( PAYLOAD_BYTES / 2 ))" ] && [ -s "$PAYLOAD_HALF_FILE" ]; then
+    printf '%s' "$PAYLOAD_HALF_FILE"; return 0
+  fi
+  local tmp="$PROBE_ROOT/payload-$bytes.bin"
+  if [ ! -s "$tmp" ]; then
+    truncate -s "$bytes" "$tmp" 2>/dev/null || head -c "$bytes" /dev/zero > "$tmp" \
+      || { warn "无法生成 $bytes 字节负载"; return 1; }
+  fi
+  printf '%s' "$tmp"
+}
 
 # The pid is published through XFER_LAST rather than stdout: a command substitution
 # would run in a subshell, so XFER_PIDS would not be updated and the EXIT trap could
 # leave curl processes behind.
 start_download() {
   local socks=$1 bytes=$2 rate=$3 outfile=$4
-  curl -sS -o /dev/null -w '{"mode":"download","bytes_downloaded":%{size_download},"speed_bps":%{speed_download},"http_code":%{http_code}}\n' \
+  curl -sS -o /dev/null -w '{"mode":"download","requested_bytes":'"$bytes"',"bytes_downloaded":%{size_download},"speed_bps":%{speed_download},"http_code":%{http_code}}\n' \
     --limit-rate "$rate" --max-time "$TRANSFER_MAX_TIME" \
-    -x "socks5h://127.0.0.1:$socks" "$(sink_url)" > "$outfile" 2>&1 &
+    -x "socks5h://127.0.0.1:$socks" "$(sink_url "$bytes")" > "$outfile" 2>&1 &
   XFER_LAST=$!
   XFER_PIDS+=("$XFER_LAST")
 }
 
 start_upload() {
-  local socks=$1 rate=$2 outfile=$3
-  curl -sS -o /dev/null -w '{"mode":"upload","bytes_uploaded":%{size_upload},"speed_bps":%{speed_download},"http_code":%{http_code}}\n' \
+  local socks=$1 bytes=$2 rate=$3 outfile=$4
+  local payload
+  payload="$(payload_file_for "$bytes")" || { XFER_LAST=""; return 1; }
+  curl -sS -o /dev/null -w '{"mode":"upload","requested_bytes":'"$bytes"',"bytes_uploaded":%{size_upload},"speed_bps":%{speed_download},"http_code":%{http_code}}\n' \
     --limit-rate "$rate" --max-time "$TRANSFER_MAX_TIME" \
     -H 'Content-Type: application/octet-stream' \
-    --data-binary "@$PAYLOAD_FILE" \
-    -x "socks5h://127.0.0.1:$socks" "$(sink_url)" > "$outfile" 2>&1 &
+    --data-binary "@$payload" \
+    -x "socks5h://127.0.0.1:$socks" "$(sink_url "$bytes")" > "$outfile" 2>&1 &
   XFER_LAST=$!
   XFER_PIDS+=("$XFER_LAST")
+}
+
+# Sample the API while the transfer runs, then keep sampling only while this
+# inbound's connections are still visible. The last sample taken while the
+# connection is alive carries its final counters, so direction math never depends
+# on a post-transfer snapshot.
+sample_transfer() {
+  local prefix=$1 pid=$2 tag=$3 i=0 label tail=0
+  while kill -0 "$pid" 2>/dev/null; do
+    i=$((i + 1))
+    api_snapshot_conn "$(printf '%s-s%02d' "$prefix" "$i")"
+    sleep "$SAMPLE_INTERVAL"
+  done
+  while [ "$tail" -lt "$SAMPLE_TAIL_MAX" ]; do
+    i=$((i + 1))
+    label="$(printf '%s-s%02d' "$prefix" "$i")"
+    api_snapshot_conn "$label"
+    grep -qF -- "$tag" "$EVID_DIR/$label.connections.json" 2>/dev/null || break
+    tail=$((tail + 1))
+    sleep "$SAMPLE_TAIL_INTERVAL"
+  done
+  printf '%s\n' "$i"
+}
+
+run_direction_test() {
+  local proto=$1 kind=$2 socks=$3 bytes=$4 rate=$5
+  local prefix="$proto-$kind" outfile="$EVID_DIR/$proto-$kind-curl.txt" pid
+  log "== $proto $kind: 已知 ${bytes}B 单向传输（连接存活期间周期采样）=="
+  api_snapshot "$prefix-pre"
+  case "$kind" in
+    dl) start_download "$socks" "$bytes" "$rate" "$outfile" ;;
+    ul) start_upload   "$socks" "$bytes" "$rate" "$outfile" ;;
+    *)  die "未知传输类型: $kind" ;;
+  esac
+  pid=$XFER_LAST
+  if [ -z "$pid" ]; then warn "$proto $kind 未能启动传输"; return 1; fi
+  local samples
+  samples="$(sample_transfer "$prefix" "$pid" "$(proto_tag "$proto")")"
+  await_xfer "$pid" "$proto $kind"
+  # Only for the connection-close behaviour check, never for byte math.
+  api_snapshot "$prefix-closed"
+  log "$proto $kind 采样数: $samples"
+}
+
+run_attribution_test() {
+  local proto=$1 socks_a=$2 socks_b=$3
+  local half=$(( PAYLOAD_BYTES / 2 ))
+  local half_rate=$(( TRANSFER_RATE / 2 ))
+  local prefix="$proto-ab" pid pid2 samples
+  log "== $proto: 归因测试（$USER_A / $USER_B 并发，各 ${half}B）=="
+  api_snapshot "$prefix-pre"
+  start_download "$socks_a" "$half" "$half_rate" "$EVID_DIR/$proto-ab-a-curl.txt"
+  pid=$XFER_LAST
+  start_download "$socks_b" "$half" "$half_rate" "$EVID_DIR/$proto-ab-b-curl.txt"
+  pid2=$XFER_LAST
+  if [ -z "$pid" ] || [ -z "$pid2" ]; then warn "$proto 归因传输未能启动"; return 1; fi
+  samples="$(sample_transfer "$prefix" "$pid" "$(proto_tag "$proto")")"
+  await_xfer "$pid"  "$proto 归因 $USER_A"
+  await_xfer "$pid2" "$proto 归因 $USER_B"
+  api_snapshot "$prefix-closed"
+  log "$proto 归因采样数: $samples"
+}
+
+run_protocol_tests() {
+  local proto=$1 socks_a=$2 socks_b=$3
+  run_direction_test "$proto" dl "$socks_a" "$PAYLOAD_BYTES" "$TRANSFER_RATE"
+  run_direction_test "$proto" ul "$socks_a" "$PAYLOAD_BYTES" "$TRANSFER_RATE"
+  run_attribution_test "$proto" "$socks_a" "$socks_b"
 }
 
 await_xfer() {
@@ -196,47 +303,6 @@ await_xfer() {
 }
 
 # --------------------------------------------------------------- test matrix ---
-
-run_protocol_tests() {
-  local proto=$1 socks_a=$2 socks_b=$3
-  local half=$(( PAYLOAD_BYTES / 2 ))
-  local half_rate=$(( TRANSFER_RATE / 2 ))
-  local pid pid2
-
-  log "== $proto: 方向测试（客户端下载 ${PAYLOAD_BYTES}B，单向，已知大小）=="
-  api_snapshot "$proto-dl-pre"
-  start_download "$socks_a" "$PAYLOAD_BYTES" "$TRANSFER_RATE" "$EVID_DIR/$proto-dl-curl.txt"
-  pid=$XFER_LAST
-  sleep "$TRANSFER_MID_DELAY"
-  api_snapshot "$proto-dl-mid"
-  await_xfer "$pid" "$proto 下载"
-  api_snapshot "$proto-dl-post"
-
-  log "== $proto: 方向测试（客户端上传 ${PAYLOAD_BYTES}B，单向，已知大小）=="
-  api_snapshot "$proto-ul-pre"
-  start_upload "$socks_a" "$TRANSFER_RATE" "$EVID_DIR/$proto-ul-curl.txt"
-  pid=$XFER_LAST
-  sleep "$TRANSFER_MID_DELAY"
-  api_snapshot "$proto-ul-mid"
-  await_xfer "$pid" "$proto 上传"
-  api_snapshot "$proto-ul-post"
-
-  log "== $proto: 归因测试（$USER_A 与 $USER_B 并发，各 ${half}B）=="
-  api_snapshot "$proto-ab-pre"
-  start_download "$socks_a" "$half" "$half_rate" "$EVID_DIR/$proto-ab-a-curl.txt"
-  pid=$XFER_LAST
-  start_download "$socks_b" "$half" "$half_rate" "$EVID_DIR/$proto-ab-b-curl.txt"
-  pid2=$XFER_LAST
-  sleep "$TRANSFER_MID_DELAY"
-  api_snapshot "$proto-ab-mid"
-  await_xfer "$pid"  "$proto 归因 $USER_A"
-  await_xfer "$pid2" "$proto 归因 $USER_B"
-  api_snapshot "$proto-ab-post"
-
-  log "== $proto: 连接关闭行为 =="
-  sleep 2
-  api_snapshot "$proto-final"
-}
 
 run_local_matrix() {
   mkdir -p "$EVID_DIR"

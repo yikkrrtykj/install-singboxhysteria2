@@ -42,7 +42,9 @@ Phase A - sing-box official API feasibility probe (manual diagnostic tool)
 
   prepare   生成 probe 密钥/用户/证书/配置并执行 sing-box check，不启动任何进程
   run       以独立进程启动 probe（顺带启动一次性客户端与 sink），跑本机测试矩阵，
-            采集 evidence 并分析，默认结束后停止 probe 自己的进程
+            采集 evidence 并分析，默认结束后停止 probe 自己的进程。
+            启动前会校验 manifest：参数与 prepare 时不一致就重新生成配置并重新 check，
+            因此 prepare(local) 之后的 run --expose 一定会用 expose 配置
   collect   对正在运行的 probe 再取一次快照（例如外部客户端测完之后）
   status    显示 probe 状态
   cleanup   只停止 probe 自己的进程并删除 PROBE_ROOT
@@ -121,11 +123,13 @@ EOF
 cmd_run() {
   require_root
   require_probe_root_sane
+  require_prereqs
+  require_prod_bin
   stop_extra_procs
-  if [ ! -s "$PROBE_CONFIG" ]; then
-    log "未检测到已生成的 probe 配置，先执行 prepare（只写入 $PROBE_ROOT）"
-    prepare_all
-  fi
+  require_probe_ports_free
+  # Never start a config that was generated for different flags: prepare without
+  # --expose followed by run --expose must not reuse the loopback-only config.
+  ensure_config_current
   trap 'kill_transfers' EXIT
   start_probe
   run_local_matrix

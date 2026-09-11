@@ -39,6 +39,36 @@ require_no_production_port_collision() {
   fi
 }
 
+keys_file_complete() {
+  [ -s "$KEYS_FILE" ] || return 1
+  python3 - "$KEYS_FILE" <<'PY' >/dev/null 2>&1
+import json
+import sys
+
+REQUIRED = (
+    "reality_private_key",
+    "reality_public_key",
+    "reality_uuid_a",
+    "reality_uuid_b",
+    "reality_short_id",
+    "hy2_password_a",
+    "hy2_password_b",
+    "cert_cn",
+)
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        data = json.load(handle)
+except Exception:
+    raise SystemExit(1)
+if not isinstance(data, dict):
+    raise SystemExit(1)
+for key in REQUIRED:
+    if not isinstance(data.get(key), str) or not data[key].strip():
+        raise SystemExit(1)
+raise SystemExit(0)
+PY
+}
+
 gen_material() {
   mkdir -p "$CERTS_DIR"
   chmod 0700 "$PROBE_ROOT" "$CERTS_DIR"
@@ -48,23 +78,32 @@ gen_material() {
     chmod 0600 "$SECRET_FILE"
   fi
 
-  if [ ! -s "$KEYS_FILE" ]; then
-    local kp priv pub uuid sid pw_a pw_b cn KEYS_TMP
+  if ! keys_file_complete; then
+    if [ -s "$KEYS_FILE" ]; then
+      mv -f "$KEYS_FILE" "$KEYS_FILE.replaced-$(date +%Y%m%d-%H%M%S)"
+      warn "已有 probe 密钥材料不完整或缺少双 UUID（旧格式），已另存备份并重新生成"
+    fi
+    local kp priv pub uuid_a uuid_b sid pw_a pw_b cn KEYS_TMP
     kp="$("$PROD_BIN" generate reality-keypair)"
     priv="$(printf '%s\n' "$kp" | awk -F': *' '/PrivateKey/{print $2}')"
     pub="$(printf '%s\n' "$kp" | awk -F': *' '/PublicKey/{print $2}')"
-    uuid="$("$PROD_BIN" generate uuid)"
+    # One UUID per probe user: a shared UUID cannot prove inbound-user attribution
+    # and a duplicate UUID may be rejected outright.
+    uuid_a="$("$PROD_BIN" generate uuid)"
+    uuid_b="$("$PROD_BIN" generate uuid)"
     sid="$("$PROD_BIN" generate rand --hex 8)"
     pw_a="$(rand_hex 16)"
     pw_b="$(rand_hex 16)"
     cn="probe-${RANDOM}.invalid"
+    [ -n "$uuid_a" ] && [ -n "$uuid_b" ] || die "生成 probe UUID 失败"
+    [ "$uuid_a" != "$uuid_b" ] || die "两个 probe 用户拿到相同 UUID，拒绝继续"
     KEYS_TMP=$(mktemp)
-    printf '{\n  "reality_private_key": "%s",\n  "reality_public_key": "%s",\n  "reality_uuid": "%s",\n  "reality_short_id": "%s",\n  "hy2_password_a": "%s",\n  "hy2_password_b": "%s",\n  "cert_cn": "%s"\n}\n' \
-      "$priv" "$pub" "$uuid" "$sid" "$pw_a" "$pw_b" "$cn" > "$KEYS_TMP"
+    printf '{\n  "reality_private_key": "%s",\n  "reality_public_key": "%s",\n  "reality_uuid_a": "%s",\n  "reality_uuid_b": "%s",\n  "reality_short_id": "%s",\n  "hy2_password_a": "%s",\n  "hy2_password_b": "%s",\n  "cert_cn": "%s"\n}\n' \
+      "$priv" "$pub" "$uuid_a" "$uuid_b" "$sid" "$pw_a" "$pw_b" "$cn" > "$KEYS_TMP"
     [ -s "$KEYS_TMP" ] || die "生成 probe 密钥材料失败"
     install -m 0600 "$KEYS_TMP" "$KEYS_FILE"
     rm -f "$KEYS_TMP"
-    ok "已生成独立 probe 密钥材料 ($KEYS_FILE)"
+    ok "已生成独立 probe 密钥材料（probe-a / probe-b 各自独立 UUID）($KEYS_FILE)"
   else
     log "复用已有 probe 密钥材料 ($KEYS_FILE)"
   fi
@@ -83,14 +122,17 @@ gen_material() {
 }
 
 write_probe_config() {
-  local listen priv uuid sid pw_a pw_b
+  local listen priv uuid_a uuid_b sid pw_a pw_b
   listen="$(probe_listen_addr)"
   priv="$(getkey reality_private_key)"
-  uuid="$(getkey reality_uuid)"
+  uuid_a="$(getkey reality_uuid_a)"
+  uuid_b="$(getkey reality_uuid_b)"
   sid="$(getkey reality_short_id)"
   pw_a="$(getkey hy2_password_a)"
   pw_b="$(getkey hy2_password_b)"
   [ -n "$priv" ] && [ -n "$pw_a" ] || die "probe 密钥材料不完整，请先删除 $KEYS_FILE 重新生成"
+  [ -n "$uuid_a" ] && [ -n "$uuid_b" ] && [ "$uuid_a" != "$uuid_b" ] \
+    || die "probe Reality 两个用户需要两个不同的 UUID，请删除 $KEYS_FILE 重新生成"
 
   cat > "$PROBE_CONFIG" <<EOF
 {
@@ -108,8 +150,8 @@ write_probe_config() {
       "listen": "$listen",
       "listen_port": $REALITY_PORT,
       "users": [
-        { "name": "$USER_A", "uuid": "$uuid", "flow": "xtls-rprx-vision" },
-        { "name": "$USER_B", "uuid": "$uuid", "flow": "xtls-rprx-vision" }
+        { "name": "$USER_A", "uuid": "$uuid_a", "flow": "xtls-rprx-vision" },
+        { "name": "$USER_B", "uuid": "$uuid_b", "flow": "xtls-rprx-vision" }
       ],
       "tls": {
         "enabled": true,
@@ -162,9 +204,12 @@ EOF
 # One client config per (probe user x protocol) so each curl run maps to exactly
 # one credential with no routing ambiguity.
 write_one_client() {
-  local name=$1 socks=$2 proto=$3 user=$4 server=$5 outfile="$PROBE_ROOT/$1.json"
-  local pub uuid sid pw
-  pub="$(getkey reality_public_key)"; uuid="$(getkey reality_uuid)"; sid="$(getkey reality_short_id)"
+  local name=$1 socks=$2 proto=$3 user=$4 server=$5
+  local outfile="$PROBE_ROOT/$name.json"
+  local pub sid pw uuid
+  pub="$(getkey reality_public_key)"; sid="$(getkey reality_short_id)"
+  # Each client must carry the credential of its own probe user.
+  if [ "$user" = "$USER_A" ]; then uuid="$(getkey reality_uuid_a)"; else uuid="$(getkey reality_uuid_b)"; fi
   if [ "$proto" = "reality" ]; then
     cat > "$outfile" <<EOF
 {
@@ -271,6 +316,67 @@ check_all_configs() {
   ok "全部 probe 配置通过 sing-box check"
 }
 
+probe_manifest_file() { printf '%s/manifest.json' "$PROBE_ROOT"; }
+
+# The manifest records the parameters the generated configs were built from, so a
+# later run with different flags (e.g. --expose, another port, another public IP)
+# cannot silently reuse a stale config.
+write_probe_manifest() {
+  python3 "$LIB_DIR/analyze.py" write-manifest --out "$(probe_manifest_file)" \
+    --probe-root "$PROBE_ROOT" --expose "$EXPOSE" \
+    --reality-port "$REALITY_PORT" --hy2-port "$HY2_PORT" --clash-port "$CLASH_PORT" \
+    --sink-port "$SINK_PORT" --public-ip "${PUBLIC_IP:-}" \
+    --payload-bytes "$PAYLOAD_BYTES" --transfer-rate "$TRANSFER_RATE" \
+    --probe-config "$PROBE_CONFIG"
+}
+
+config_is_current() {
+  local out
+  if out="$(python3 "$LIB_DIR/analyze.py" check-manifest --manifest "$(probe_manifest_file)" \
+      --probe-root "$PROBE_ROOT" --expose "$EXPOSE" \
+      --reality-port "$REALITY_PORT" --hy2-port "$HY2_PORT" --clash-port "$CLASH_PORT" \
+      --sink-port "$SINK_PORT" --public-ip "${PUBLIC_IP:-}" \
+      --payload-bytes "$PAYLOAD_BYTES" --transfer-rate "$TRANSFER_RATE" \
+      --probe-config "$PROBE_CONFIG" 2>&1)"; then
+    return 0
+  fi
+  warn "probe 配置与本次参数不一致 -> $out"
+  return 1
+}
+
+generate_all_configs() {
+  gen_material
+  write_probe_config
+  write_client_configs
+  if [ "${EXPOSE:-0}" = "1" ]; then
+    write_external_client_configs
+  fi
+  write_probe_manifest || warn "写入 manifest 失败；run 将退化为每次重新生成配置"
+}
+
+# Called by run before starting anything: never start a config that was generated
+# for different flags.
+ensure_config_current() {
+  if [ -s "$PROBE_CONFIG" ] && config_is_current; then
+    log "probe 配置与本次参数一致（manifest + 配置 hash 均匹配）"
+    return 0
+  fi
+  log "生成 probe 配置（仅写入 $PROBE_ROOT）"
+  generate_all_configs
+  check_all_configs || die "配置检查未通过，禁止启动"
+}
+
+require_probe_ports_free() {
+  require_free_port "$REALITY_PORT" "Reality"
+  require_free_port "$HY2_PORT" "HY2"
+  require_free_port "$CLASH_PORT" "Clash API"
+  require_free_port "$SINK_PORT" "本机 sink"
+  require_free_port "$SOCKS_AR" "socks a/reality"
+  require_free_port "$SOCKS_AH" "socks a/hy2"
+  require_free_port "$SOCKS_BR" "socks b/reality"
+  require_free_port "$SOCKS_BH" "socks b/hy2"
+}
+
 prepare_all() {
   log "== prepare: 只写入 $PROBE_ROOT，不触碰生产 =="
   require_root
@@ -283,26 +389,13 @@ prepare_all() {
     warn "读取版本输出异常，请人工确认: $v"
   fi
 
-  require_free_port "$REALITY_PORT" "Reality"
-  require_free_port "$HY2_PORT" "HY2"
-  require_free_port "$CLASH_PORT" "Clash API"
-  require_free_port "$SINK_PORT" "本机 sink"
-  require_free_port "$SOCKS_AR" "socks a/reality"
-  require_free_port "$SOCKS_AH" "socks a/hy2"
-  require_free_port "$SOCKS_BR" "socks b/reality"
-  require_free_port "$SOCKS_BH" "socks b/hy2"
-
+  require_probe_ports_free
   require_no_production_port_collision
 
   mkdir -p "$PROBE_ROOT" "$RUN_DIR" "$EVID_DIR"
   chmod 0700 "$PROBE_ROOT"
 
-  gen_material
-  write_probe_config
-  write_client_configs
-  if [ "${EXPOSE:-0}" = "1" ]; then
-    write_external_client_configs
-  fi
+  generate_all_configs
   check_all_configs || die "配置检查未通过，未启动任何进程"
   ok "prepare 完成（未启动任何进程）"
 }

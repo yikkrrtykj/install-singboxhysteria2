@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
-# Static checks and analyzer self-test for the Phase A probe tool.
+# Static checks, analyzer self-test and regression tests for the Phase A probe tool.
 #
-# Nothing here touches /root/sbox-probe, /root/sbox or sing-box itself: the
-# analyzer is exercised against generated synthetic fixtures in a temp dir, and
-# the guardrail lint below asserts the shipped scripts contain no destructive
-# pattern. Runtime verdicts are deliberately NOT produced here.
+# Nothing here touches /root/sbox-probe or sing-box itself: the analyzer runs against
+# generated synthetic fixtures, config generation runs against a mock sing-box
+# binary, and the sink is exercised over loopback. Runtime verdicts are deliberately
+# NOT produced here.
 set -uo pipefail
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 TOOL_DIR="$(cd -- "$HERE/.." && pwd)"
-ANALYZE="$TOOL_DIR/lib/analyze.py"
+LIB_DIR="$TOOL_DIR/lib"
+ANALYZE="$LIB_DIR/analyze.py"
 GEN="$HERE/fixtures/make-synthetic.py"
 PY="${PYTHON:-python3}"
 
@@ -19,20 +20,28 @@ SKIP=0
 TMP="$(mktemp -d)"
 export PYTHONPYCACHEPREFIX="$TMP/pycache"
 cleanup_tmp() {
+  [ -n "${SINK_PID:-}" ] && kill "$SINK_PID" 2>/dev/null
   rm -rf -- "$TMP"
   find "$TOOL_DIR" -name '__pycache__' -type d -prune -exec rm -rf -- {} + 2>/dev/null || true
 }
 trap cleanup_tmp EXIT
 
-pass() { PASS=$((PASS + 1)); printf '  %sPASS%s %s\n' "${C_GREEN:-}" "${C_OFF:-}" "$*"; }
-fail() { FAIL=$((FAIL + 1)); printf '  %sFAIL%s %s\n' "${C_RED:-}" "${C_OFF:-}" "$*"; }
-skip() { SKIP=$((SKIP + 1)); printf '  %sSKIP%s %s\n' "${C_YELLOW:-}" "${C_OFF:-}" "$*"; }
+pass() { PASS=$((PASS + 1)); printf '  PASS %s\n' "$*"; }
+fail() { FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "$*"; }
+skip() { SKIP=$((SKIP + 1)); printf '  SKIP %s\n' "$*"; }
 section() { printf '\n== %s ==\n' "$*"; }
 expect_grep() { # expect_grep <file> <ere> <label>
-  if grep -qE "$2" "$1"; then pass "$3"; else fail "$3 (no match: $2 in $(basename "$1"))"; fi
+  if grep -qE "$2" "$1" 2>/dev/null; then pass "$3"; else fail "$3 (no match: $2 in $(basename "$1"))"; fi
 }
 expect_no_grep() {
-  if grep -qE "$2" "$1"; then fail "$3 (unexpected match: $2)"; else pass "$3"; fi
+  if grep -qE "$2" "$1" 2>/dev/null; then fail "$3 (unexpected match: $2)"; else pass "$3"; fi
+}
+analyze_fixture() { # analyze_fixture <dir> <variant> <extra args...>
+  local dir=$1 variant=$2
+  shift 2
+  "$PY" "$GEN" --out "$dir" --variant "$variant" >/dev/null
+  "$PY" "$ANALYZE" analyze --evidence-dir "$dir" --fixture-mode \
+    --md-out "$dir/report.md" --json-out "$dir/analysis.json" "$@" >"$dir/stdout.txt" 2>&1
 }
 
 section "shell syntax"
@@ -74,7 +83,7 @@ if command -v shellcheck >/dev/null 2>&1; then
     else fail "shellcheck $(basename "$f"): $(head -n3 "$TMP/sc.out" | tr '\n' ' ')"; fi
   done < <(find "$TOOL_DIR" -name '*.sh' -type f | sort)
 else
-  skip "shellcheck 未安装（本轮以 bash -n + guardrail lint 替代）"
+  skip "shellcheck 未安装（以 bash -n + guardrail lint 替代）"
 fi
 
 section "analyzer: empty evidence dir must say NOT TESTED"
@@ -91,9 +100,7 @@ expect_grep "$TMP/ev-nomode/SUMMARY.txt" 'NOT TESTED / WAITING FOR RUNTIME DATA'
 expect_no_grep "$TMP/ev-nomode/SUMMARY.txt" 'YES - ' "fixtures without flag -> no verdict from synthetic data"
 
 section "analyzer: derivation math on synthetic fixtures (--fixture-mode)"
-"$PY" "$GEN" --out "$TMP/ev-ok" --variant consistent >/dev/null
-"$PY" "$ANALYZE" analyze --evidence-dir "$TMP/ev-ok" --fixture-mode \
-  --md-out "$TMP/ev-ok/report.md" --json-out "$TMP/ev-ok/analysis.json" >"$TMP/ok.txt" 2>&1
+analyze_fixture "$TMP/ev-ok" consistent
 expect_grep "$TMP/ev-ok/SUMMARY.txt" '^reality\.user_field +VERIFIED +YES' "reality user field -> YES when field carries the names"
 expect_grep "$TMP/ev-ok/SUMMARY.txt" '^hy2\.user_field +NO +NO -' "hy2 user field -> NO when no field carries the names"
 expect_grep "$TMP/ev-ok/SUMMARY.txt" '^reality\.source_ip +VERIFIED' "reality source ip -> VERIFIED with a public address"
@@ -104,13 +111,179 @@ expect_grep "$TMP/ev-ok/report.md" '字段命名与客户端视角一致' "consi
 expect_grep "$TMP/ev-ok/report.md" '语义=客户端下行' "download test -> counter mapped to client downstream"
 expect_grep "$TMP/ev-ok/report.md" '语义=客户端上行' "upload test -> counter mapped to client upstream"
 expect_grep "$TMP/ev-ok/report.md" 'SYNTHETIC FIXTURE OUTPUT' "fixture mode -> report is banner-marked synthetic"
+expect_grep "$TMP/ev-ok/report.md" 'curl bytes_downloaded' "direction basis comes from curl-reported bytes"
 
 section "analyzer: inverted counter naming must be detected, not hard-coded"
-"$PY" "$GEN" --out "$TMP/ev-inv" --variant inverted >/dev/null
-"$PY" "$ANALYZE" analyze --evidence-dir "$TMP/ev-inv" --fixture-mode \
-  --md-out "$TMP/ev-inv/report.md" >"$TMP/inv.txt" 2>&1
+analyze_fixture "$TMP/ev-inv" inverted
 expect_grep "$TMP/ev-inv/report.md" '字段命名与客户端视角相反' "inverted variant -> naming flagged as opposite"
 expect_grep "$TMP/ev-inv/report.md" '语义=客户端下行' "inverted variant -> direction still derived from traffic"
+
+section "regression #2: direction must NOT be computed from the post-transfer snapshot"
+# The fixture's -closed snapshots carry zeroed counters and no connections, so any
+# implementation that still used them would fail this verdict.
+expect_grep "$TMP/ev-ok/SUMMARY.txt" '^reality\.direction +VERIFIED' "direction VERIFIED although closed snapshot is zeroed"
+cp -r "$TMP/ev-ok" "$TMP/ev-nosamples"
+rm -f "$TMP"/ev-nosamples/*-s[0-9][0-9].connections.json
+"$PY" "$ANALYZE" analyze --evidence-dir "$TMP/ev-nosamples" --fixture-mode >"$TMP/nosamples.txt" 2>&1
+expect_grep "$TMP/ev-nosamples/SUMMARY.txt" '^reality\.direction +NOT TESTED' "without in-transfer samples -> NOT TESTED (no fallback to closed)"
+expect_grep "$TMP/ev-nosamples/SUMMARY.txt" '缺少客户端下载期间的活动采样' "missing-sample reason is stated"
+
+section "regression #4: transfer size must match the requested bytes"
+expect_grep "$TMP/ev-ok/SUMMARY.txt" '^payload\.matches_request +VERIFIED' "curl-reported bytes match requested (half for probe-a/probe-b)"
+expect_grep "$TMP/ev-ok/report.md" 'ab-a 请求 33554432' "attribution payload is half, not full"
+cp -r "$TMP/ev-ok" "$TMP/ev-badpayload"
+"$PY" - "$TMP/ev-badpayload/reality-dl-curl.txt" <<'PY'
+import json
+import sys
+json.dump({"mode": "download", "requested_bytes": 67108864, "bytes_downloaded": 4096,
+           "speed_bps": 1, "http_code": 200}, open(sys.argv[1], "w"))
+PY
+"$PY" "$ANALYZE" analyze --evidence-dir "$TMP/ev-badpayload" --fixture-mode >"$TMP/badpayload.txt" 2>&1
+expect_grep "$TMP/ev-badpayload/SUMMARY.txt" '^payload\.matches_request +NO' "size mismatch -> NO"
+
+section "regression #4: sink honours ?bytes= and enforces the cap"
+SINK_PORT_TEST=$(( 18000 + (RANDOM % 2000) ))
+"$PY" "$LIB_DIR/sink.py" --port "$SINK_PORT_TEST" --bytes 1048576 >"$TMP/sink.log" 2>&1 &
+SINK_PID=$!
+sink_ready=0
+for _ in $(seq 1 20); do
+  if curl -s -o /dev/null "http://127.0.0.1:$SINK_PORT_TEST/blob?bytes=1"; then sink_ready=1; break; fi
+  sleep 0.3
+done
+if [ "$sink_ready" -eq 1 ]; then
+  got="$(curl -s -o /dev/null -w '%{size_download}' "http://127.0.0.1:$SINK_PORT_TEST/blob?bytes=524288")"
+  if [ "$got" = "524288" ]; then pass "GET ?bytes=524288 served exactly 524288 bytes"; else fail "GET ?bytes=524288 served $got bytes"; fi
+  code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$SINK_PORT_TEST/blob?bytes=99999999")"
+  if [ "$code" = "400" ]; then pass "GET above cap -> HTTP 400"; else fail "GET above cap -> HTTP $code"; fi
+  truncate -s 262144 "$TMP/up.bin" 2>/dev/null || head -c 262144 /dev/zero > "$TMP/up.bin"
+  sent="$(curl -s -o /dev/null -w '%{size_upload}' --data-binary "@$TMP/up.bin" "http://127.0.0.1:$SINK_PORT_TEST/blob")"
+  if [ "$sent" = "262144" ]; then pass "POST drained exactly the uploaded 262144 bytes"; else fail "POST drained $sent bytes"; fi
+else
+  fail "sink did not start on 127.0.0.1:$SINK_PORT_TEST ($(head -n2 "$TMP/sink.log" | tr '\n' ' '))"
+fi
+kill "$SINK_PID" 2>/dev/null
+SINK_PID=""
+
+section "regression #1 + #3: probe config generation and stale-config regeneration"
+MOCK="$TMP/mock-sing-box"
+cat > "$MOCK" <<'MOCK'
+#!/usr/bin/env bash
+# Mock sing-box: only what the probe generator needs. check validates JSON.
+set -uo pipefail
+cmd="${1:-}"; shift || true
+hex() { od -An -tx1 -N"$1" /dev/urandom | tr -d ' \n'; }
+case "$cmd" in
+  version) printf 'sing-box version 9.9.9-mock\n' ;;
+  generate)
+    case "${1:-}" in
+      reality-keypair) printf 'PrivateKey: %s\nPublicKey: %s\n' "$(hex 32)" "$(hex 32)" ;;
+      uuid) printf '%s-%s-%s-%s-%s\n' "$(hex 4)" "$(hex 2)" "$(hex 2)" "$(hex 2)" "$(hex 6)" ;;
+      rand) printf '%s\n' "$(hex 4)" ;;
+      *) exit 2 ;;
+    esac ;;
+  check)
+    file=""
+    while [ $# -gt 0 ]; do case "$1" in -c) file="$2"; shift 2 ;; *) shift ;; esac; done
+    [ -n "$file" ] && [ -f "$file" ] || exit 1
+    python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$file" ;;
+  run) sleep 3600 ;;
+  *) exit 2 ;;
+esac
+MOCK
+chmod +x "$MOCK"
+
+mkdir -p "$TMP/reg/sbox-probe/certs" "$TMP/reg/sbox-probe/run" "$TMP/reg/sbox-probe/evidence"
+# Non-empty placeholders so the test does not depend on openssl; the mock check only
+# validates JSON, so the certificate content is irrelevant here.
+printf 'dummy-cert' > "$TMP/reg/sbox-probe/certs/cert.pem"
+printf 'dummy-key' > "$TMP/reg/sbox-probe/certs/private.key"
+printf '{"inbounds":[{"type":"vless","tag":"vless-in","listen_port":13579},{"type":"hysteria2","tag":"hy2-in","listen_port":24680}]}\n' > "$TMP/reg/prod.json"
+printf "SERVER_IP='203.0.113.7'\nHY_HOPPING=FALSE\nHY_HOPPING_START=\nHY_HOPPING_END=\n" > "$TMP/reg/state"
+
+cat > "$TMP/reg/probe_regress.sh" <<'REGRESS'
+set -uo pipefail
+. "$LIB_DIR/common.sh"
+. "$LIB_DIR/probe-config.sh"
+. "$LIB_DIR/evidence.sh"
+
+fail_with() { echo "REGRESS_FAIL: $1"; exit "$2"; }
+
+EXPOSE=0
+PUBLIC_IP=203.0.113.9
+export EXPOSE PUBLIC_IP
+
+generate_all_configs || fail_with "generate_all_configs (local)" 20
+check_all_configs || fail_with "check_all_configs (local)" 21
+grep -q '"listen": "127.0.0.1"' "$PROBE_CONFIG" || fail_with "local config must bind 127.0.0.1" 22
+
+# --- regression #1: two distinct Reality UUIDs -------------------------------
+UUID_A="$(python3 "$LIB_DIR/analyze.py" getkey "$KEYS_FILE" reality_uuid_a)"
+UUID_B="$(python3 "$LIB_DIR/analyze.py" getkey "$KEYS_FILE" reality_uuid_b)"
+[ -n "$UUID_A" ] && [ -n "$UUID_B" ] || fail_with "keys.json must carry two UUIDs" 30
+[ "$UUID_A" != "$UUID_B" ] || fail_with "probe-a and probe-b must not share a UUID" 31
+grep -q "\"name\": \"$USER_A\", \"uuid\": \"$UUID_A\"" "$PROBE_CONFIG" || fail_with "probe-a must use UUID-A in probe.json" 32
+grep -q "\"name\": \"$USER_B\", \"uuid\": \"$UUID_B\"" "$PROBE_CONFIG" || fail_with "probe-b must use UUID-B in probe.json" 33
+CLIENT_A_UUID="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["outbounds"][0]["uuid"])' "$PROBE_ROOT/client-a-reality.json")"
+CLIENT_B_UUID="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["outbounds"][0]["uuid"])' "$PROBE_ROOT/client-b-reality.json")"
+[ "$CLIENT_A_UUID" = "$UUID_A" ] || fail_with "client-a-reality must carry UUID-A" 34
+[ "$CLIENT_B_UUID" = "$UUID_B" ] || fail_with "client-b-reality must carry UUID-B" 35
+[ "$CLIENT_A_UUID" != "$CLIENT_B_UUID" ] || fail_with "the two Reality clients must not share a UUID" 36
+
+# --- regression #3: prepare(local) then --expose must not reuse the stale config
+config_is_current || fail_with "freshly generated config must be current" 40
+EXPOSE=1
+export EXPOSE
+ensure_config_current || fail_with "ensure_config_current" 41
+grep -q '"listen": "::"' "$PROBE_CONFIG" || fail_with "run --expose must regenerate a listen :: config" 42
+[ -s "$PROBE_ROOT/client-a-reality-external.json" ] || fail_with "external client configs must be written" 43
+python3 "$LIB_DIR/analyze.py" check-manifest --manifest "$(probe_manifest_file)" \
+  --probe-root "$PROBE_ROOT" --expose 0 --reality-port "$REALITY_PORT" --hy2-port "$HY2_PORT" \
+  --clash-port "$CLASH_PORT" --sink-port "$SINK_PORT" --public-ip "$PUBLIC_IP" \
+  --payload-bytes "$PAYLOAD_BYTES" --transfer-rate "$TRANSFER_RATE" \
+  --probe-config "$PROBE_CONFIG" >/dev/null 2>&1 \
+  && fail_with "check-manifest must report stale for different flags" 44
+
+# idempotence: a second ensure must not touch the config
+BEFORE="$(sha256sum "$PROBE_CONFIG" | awk '{print $1}')"
+ensure_config_current || fail_with "ensure_config_current (second)" 45
+AFTER="$(sha256sum "$PROBE_CONFIG" | awk '{print $1}')"
+[ "$BEFORE" = "$AFTER" ] || fail_with "matching config must not be regenerated" 46
+
+# editing the config by hand must invalidate the manifest
+printf '\n' >> "$PROBE_CONFIG"
+ensure_config_current || fail_with "ensure_config_current (after edit)" 47
+grep -q '"listen": "::"' "$PROBE_CONFIG" || fail_with "edited config must be regenerated with current flags" 48
+
+echo "REGRESS_OK"
+exit 0
+REGRESS
+
+if out="$(LIB_DIR="$LIB_DIR" PROBE_ROOT="$TMP/reg/sbox-probe" PROD_BIN="$MOCK" \
+          PROD_CONFIG="$TMP/reg/prod.json" PROD_STATE="$TMP/reg/state" \
+          REALITY_PORT=18443 HY2_PORT=18444 CLASH_PORT=19090 \
+          SINK_PORT=18080 SOCKS_AR=18081 SOCKS_AH=18082 SOCKS_BR=18083 SOCKS_BH=18084 \
+          PAYLOAD_BYTES=67108864 TRANSFER_RATE=4194304 \
+          bash "$TMP/reg/probe_regress.sh" 2>&1)"; then
+  pass "probe config generation + manifest regression script (REGRESS_OK)"
+else
+  fail "probe regression script: $(printf '%s' "$out" | grep -E 'REGRESS_FAIL|Error|error' | head -n2 | tr '\n' ' ')"
+fi
+if grep -q '"name": "probe-a"' "$TMP/reg/sbox-probe/probe.json" 2>/dev/null; then
+  ua="$(python3 "$ANALYZE" getkey "$TMP/reg/sbox-probe/keys.json" reality_uuid_a 2>/dev/null)"
+  ub="$(python3 "$ANALYZE" getkey "$TMP/reg/sbox-probe/keys.json" reality_uuid_b 2>/dev/null)"
+  if [ -n "$ua" ] && [ -n "$ub" ] && [ "$ua" != "$ub" ]; then
+    pass "two Reality users carry different UUIDs ($ua != $ub)"
+  else
+    fail "Reality UUIDs: a='$ua' b='$ub'"
+  fi
+  if grep -q '"listen": "::"' "$TMP/reg/sbox-probe/probe.json"; then
+    pass "final config was regenerated for expose mode (listen ::)"
+  else
+    fail "final config still not in expose mode"
+  fi
+else
+  fail "probe.json was not generated by the regression script"
+fi
 
 printf '\n== summary ==\n'
 printf '  pass=%d fail=%d skip=%d\n' "$PASS" "$FAIL" "$SKIP"

@@ -7,7 +7,10 @@ This is not runtime data and is not a claim about real sing-box behaviour:
   such files unless --fixture-mode is passed;
 * the Hysteria2 connections deliberately carry **no** user field so the negative
   ("NO") path can be exercised. That says nothing about what the real API
-  returns -- only a run against a real server can answer that.
+  returns -- only a run against a real server can answer that;
+* the ``-closed`` snapshots deliberately report zeroed counters with no
+  connections, so a regression that starts using them for byte math would show up
+  as a failing direction verdict instead of silently passing.
 
 Usage:
     make-synthetic.py --out DIR [--variant consistent|inverted]
@@ -23,8 +26,8 @@ import os
 
 MARK = "SYNTHETIC - NOT RUNTIME DATA (tests/fixtures/make-synthetic.py)"
 N = 67108864
-EIGHTH = N // 8
-SIXTEENTH = N // 16
+QUARTER = N // 4
+HALF = N // 2
 PUBLIC_SOURCE_IP = "203.0.113.9"
 
 
@@ -72,6 +75,12 @@ def main():
                    {"_fixture": MARK, "uploadTotal": upload_total,
                     "downloadTotal": download_total, "connections": connections})
 
+    def curl(label, mode, requested):
+        key = "bytes_downloaded" if mode == "download" else "bytes_uploaded"
+        write_json(os.path.join(out, "%s-curl.txt" % label),
+                   {"_fixture": MARK, "mode": mode, "requested_bytes": requested,
+                    key: requested, "speed_bps": 4194304, "http_code": 200})
+
     for proto in ("reality", "hy2"):
         user = None if proto == "hy2" else "probe-a"
         tag = "r" if proto == "reality" else "h"
@@ -81,29 +90,40 @@ def main():
         def grow(counter, amount):
             return (amount if counter == "upload" else 0, amount if counter == "download" else 0)
 
-        # known-size, single-direction tests
+        # --- single-direction download test ---------------------------------
         snap("%s-dl-pre" % proto, [], 0, 0)
-        up, down = grow(dl_grow, EIGHTH)
-        snap("%s-dl-mid" % proto, [connection("%s-dl" % tag, proto, user, up, down)], up, down)
-        up, down = grow(dl_grow, N)
-        snap("%s-dl-post" % proto, [], up, down)
+        for step, amount in enumerate((QUARTER, HALF, N), start=1):
+            pos_up, pos_down = grow(dl_grow, amount)
+            snap("%s-dl-s%02d" % (proto, step),
+                 [connection("%s-dl" % tag, proto, user, pos_up, pos_down)], pos_up, pos_down)
+        # No connections left and zeroed counters: must never be used for byte math.
+        snap("%s-dl-closed" % proto, [], 0, 0)
+        curl("%s-dl" % proto, "download", N)
 
-        snap("%s-ul-pre" % proto, [], up, down)
-        base_up, base_down = up, down
-        dup, ddown = grow(ul_grow, EIGHTH)
-        snap("%s-ul-mid" % proto, [connection("%s-ul" % tag, proto, user, dup, ddown)],
-             base_up + dup, base_down + ddown)
-        dup, ddown = grow(ul_grow, N)
-        snap("%s-ul-post" % proto, [], base_up + dup, base_down + ddown)
+        # --- single-direction upload test -----------------------------------
+        base_up, base_down = grow(dl_grow, N)
+        snap("%s-ul-pre" % proto, [], base_up, base_down)
+        for step, amount in enumerate((QUARTER, HALF, N), start=1):
+            up, down = grow(ul_grow, amount)
+            snap("%s-ul-s%02d" % (proto, step),
+                 [connection("%s-ul" % tag, proto, user, up, down)],
+                 base_up + up, base_down + down)
+        snap("%s-ul-closed" % proto, [], 0, 0)
+        curl("%s-ul" % proto, "upload", N)
 
-        # concurrent two-user attribution test
-        base_up, base_down = base_up + dup, base_down + ddown
+        # --- concurrent two-user attribution test (half payload each) -------
+        up, down = grow(ul_grow, N)
+        base_up, base_down = base_up + up, base_down + down
         snap("%s-ab-pre" % proto, [], base_up, base_down)
-        conns = [connection("%s-ab-a" % tag, proto, "probe-a" if proto == "reality" else None, 0, SIXTEENTH),
-                 connection("%s-ab-b" % tag, proto, "probe-b" if proto == "reality" else None, 0, SIXTEENTH)]
-        snap("%s-ab-mid" % proto, conns, base_up, base_down + EIGHTH)
-        snap("%s-ab-post" % proto, [], base_up, base_down + EIGHTH)
-        snap("%s-final" % proto, [], base_up, base_down + EIGHTH)
+        for step, amount in enumerate((QUARTER, HALF), start=1):
+            conns = [
+                connection("%s-ab-a" % tag, proto, "probe-a" if proto == "reality" else None, 0, amount),
+                connection("%s-ab-b" % tag, proto, "probe-b" if proto == "reality" else None, 0, amount),
+            ]
+            snap("%s-ab-s%02d" % (proto, step), conns, base_up, base_down + amount * 2)
+        snap("%s-ab-closed" % proto, [], base_up, base_down + HALF * 2)
+        curl("%s-ab-a" % proto, "download", HALF)
+        curl("%s-ab-b" % proto, "download", HALF)
 
     # An extra snapshot, as produced by `collect` after external clients ran, so the
     # analyzer's non-loopback source-IP path gets exercised for Reality only.
@@ -111,10 +131,10 @@ def main():
                                          source_ip=PUBLIC_SOURCE_IP)], 0, 1024)
 
     snap("version-prep", [], 0, 0)
-    write_json(os.path.join(out, "00-api-version.json"),
-               {"_fixture": MARK, "version": "1.14.0-synthetic", "meta": True})
     write_json(os.path.join(out, "version-prep.traffic.json"), {"_fixture": MARK, "up": 1234, "down": 5678})
     write_json(os.path.join(out, "version-prep.memory.json"), {"_fixture": MARK, "inuse": 1, "oslimit": 2})
+    write_json(os.path.join(out, "00-api-version.json"),
+               {"_fixture": MARK, "version": "1.14.0-synthetic", "meta": True})
     write_json(os.path.join(out, "meta.json"), {
         "collected_at": "2026-09-11T00:00:00+00:00",
         "production_version": "1.14.0-synthetic",

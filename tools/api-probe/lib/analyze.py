@@ -175,12 +175,21 @@ class Row:
         }
 
 
-def counter_deltas(before, after):
-    cb, ca = before.counters(), after.counters()
-    out = {}
-    for key in set(cb) | set(ca):
-        out[key] = ca.get(key, 0.0) - cb.get(key, 0.0)
-    return out
+def max_counter_deltas(before, samples):
+    """Delta of the largest value each counter reached across the samples.
+
+    Cumulative counters end at their maximum, and per-connection counters are only
+    visible while the connection lives -- taking the maximum over the samples taken
+    during (and just after) the transfer covers both without depending on a
+    post-transfer snapshot.
+    """
+    base = before.counters()
+    peak = {}
+    for snap in samples:
+        for key, value in snap.counters().items():
+            if value > peak.get(key, float("-inf")):
+                peak[key] = value
+    return {key: value - base.get(key, 0.0) for key, value in peak.items()}
 
 
 def largest_growth(delta_map):
@@ -188,6 +197,31 @@ def largest_growth(delta_map):
     if not positives:
         return None, 0.0
     return max(positives, key=lambda kv: kv[1])
+
+
+def counter_name(key):
+    """Drop the origin prefix so root.x and conn_sum.x can be compared."""
+    return key.split(".", 1)[1] if "." in key else key
+
+
+def counter_family(key):
+    """Normalise a counter name to its direction family.
+
+    The same measurement can be reported as ``downloadTotal`` at the response root
+    and as ``download`` per connection, so both have to collapse to one family --
+    otherwise the reverse-direction noise check would flag a single-direction
+    transfer as bidirectional.
+    """
+    name = counter_name(key).lower()
+    for suffix in ("total", "sum"):
+        if name.endswith(suffix) and len(name) > len(suffix):
+            name = name[: -len(suffix)]
+    return name
+
+
+def family_keys(keys, key):
+    family = counter_family(key)
+    return {k for k in keys if counter_family(k) == family}
 
 
 def magnitude_match(delta_map, expected, exclude=()):
@@ -226,13 +260,6 @@ def discover_key(snapshots, predicate):
     return hits
 
 
-def sample_connections(snap, limit=3):
-    out = []
-    for conn in snap.connections[:limit]:
-        out.append(conn_flat(conn))
-    return out
-
-
 class Analyzer:
     def __init__(self, args):
         self.args = args
@@ -249,8 +276,8 @@ class Analyzer:
         self.fixture_mode = args.fixture_mode
         labels = ["version-prep"]
         for proto in ("reality", "hy2"):
-            for suffix in ("dl-pre", "dl-mid", "dl-post", "ul-pre", "ul-mid", "ul-post",
-                           "ab-pre", "ab-mid", "ab-post", "final"):
+            for suffix in ("dl-pre", "dl-closed", "ul-pre", "ul-closed",
+                           "ab-pre", "ab-closed"):
                 labels.append("%s-%s" % (proto, suffix))
         labels.append("final-idle")
         self.snaps = {label + ".connections": Snapshot(self.edir, label, self.fixture_mode) for label in labels}
@@ -288,6 +315,26 @@ class Analyzer:
 
     def all_snapshots(self):
         return list(self.snaps.values()) + list(self.extras)
+
+    def samples(self, proto, kind):
+        """In-transfer samples of one test, e.g. samples('reality', 'dl')."""
+        rx = re.compile(r"^%s-%s-s\d+$" % (re.escape(proto), re.escape(kind)))
+        return sorted((s for s in self.all_snapshots() if rx.match(s.label) and s.usable),
+                      key=lambda s: s.label)
+
+    def last_active(self, proto, kind):
+        pool = [s for s in self.samples(proto, kind) if s.connections]
+        return pool[-1] if pool else None
+
+    def curl_bytes(self, label):
+        """Bytes curl reports having transferred, from the -w JSON it wrote."""
+        raw, error = load_json(os.path.join(self.edir, "%s-curl.txt" % label))
+        if not isinstance(raw, dict):
+            return None, error or "unreadable"
+        for key in ("bytes_downloaded", "bytes_uploaded"):
+            if isinstance(raw.get(key), (int, float)) and raw[key] > 0:
+                return float(raw[key]), key
+        return None, "no byte count reported"
 
     def any_fixture(self):
         return [s.label for s in self.snaps.values() if s.fixture]
@@ -365,25 +412,32 @@ class Analyzer:
 
     def protocol_rows(self, proto):
         tag = self.proto_tags.get(proto, "")
-        dl_pre, dl_mid, dl_post = (self.snap("%s-%s" % (proto, x)) for x in ("dl-pre", "dl-mid", "dl-post"))
-        ul_pre, ul_post = (self.snap("%s-%s" % (proto, x)) for x in ("ul-pre", "ul-post"))
-        ab_mid = self.snap("%s-ab-mid" % proto)
-        final = self.snap("%s-final" % proto)
+        dl_pre = self.snap("%s-dl-pre" % proto)
+        ab_pre = self.snap("%s-ab-pre" % proto)
+        ul_pre = self.snap("%s-ul-pre" % proto)
+        dl_closed = self.snap("%s-dl-closed" % proto)
+        dl_samples = self.samples(proto, "dl")
+        ul_samples = self.samples(proto, "ul")
+        ab_samples = self.samples(proto, "ab")
+        active_samples = [s for s in dl_samples + ul_samples + ab_samples if s.connections]
 
-        active = [s for s in (dl_mid, ab_mid, dl_post, final) + tuple(self.extras) if s.usable and s.connections]
-        tag_hits = discover_key(active, lambda v: tag_matches(v, tag))
+        # Active-transfer samples come first: user / inbound / source-IP evidence has
+        # to come from a moment when this inbound actually had connections.
+        ordered = active_samples + [dl_pre, ab_pre] + list(self.extras)
+        tag_hits = discover_key(ordered, lambda v: tag_matches(v, tag))
         tag_key = sorted(tag_hits)[0] if tag_hits else None
-        evidence_files = ["%s.connections.json" % s.label for s in (dl_mid, ab_mid, dl_post)]
+        dl_peak = max(dl_samples, key=lambda s: len(s.connections), default=dl_pre)
+        ab_peak = max(ab_samples, key=lambda s: len(s.connections), default=ab_pre)
 
         # --- source IP ---------------------------------------------------------
         # Extra snapshots (e.g. collected after external clients ran) are folded in
         # here: that is the only way a public source address can ever be observed.
-        ip_pool = self.filtered_view([dl_mid, ab_mid] + self.extras, tag_key, tag)
+        ip_pool = self.filtered_view([dl_peak, ab_peak] + list(self.extras), tag_key, tag)
         ip_hits = discover_key(ip_pool, ip_like)
         source_keys = [k for k in ip_hits if "source" in k.lower() or k.lower().startswith("src")]
         if not ip_pool:
             self.rows.append(Row("%s.source_ip" % proto, NOT_TESTED,
-                                 "无活动连接快照: %s" % dl_mid.why_unusable()))
+                                 "无活动连接快照: %s" % dl_peak.why_unusable()))
         elif not ip_hits:
             self.rows.append(Row("%s.source_ip" % proto, "NO",
                                  "NO - 未在任何 connection 字段中发现 IP 形态取值；已检查字段: %s"
@@ -405,24 +459,24 @@ class Analyzer:
                                      self.evidence_names(ip_pool)))
 
         # --- inbound -----------------------------------------------------------
-        if not self.runtime_present(active):
+        if not self.runtime_present(ordered):
             self.rows.append(Row("%s.inbound" % proto, NOT_TESTED, "无活动连接快照"))
         elif tag_key:
-            vals = sorted({conn_flat(c).get(tag_key) for c in dl_mid.by_tag(tag_key, tag)})
+            values = sorted({str(conn_flat(c).get(tag_key)) for s in active_samples + [dl_peak, ab_peak]
+                             for c in s.by_tag(tag_key, tag)})
             self.rows.append(Row("%s.inbound" % proto, "VERIFIED",
-                                 "字段 %s 取值 %s（期望 tag %s）" % (tag_key, ",".join(str(v) for v in vals), tag),
-                                 evidence_files))
+                                 "字段 %s 取值 %s（期望 tag %s）"
+                                 % (tag_key, ",".join(values), tag),
+                                 self.evidence_names(active_samples or [dl_peak])))
         else:
             self.rows.append(Row("%s.inbound" % proto, "NO",
                                  "NO - 未找到取值等于 %s 的字段；无法从 API 区分该 inbound" % tag,
-                                 evidence_files))
+                                 self.evidence_names(active_samples or [dl_peak])))
 
         # --- user attribution --------------------------------------------------
-        conns_for_proto = dl_mid.by_tag(tag_key, tag) if tag_key else list(dl_mid.connections)
-        ab_conns = ab_mid.by_tag(tag_key, tag) if tag_key else list(ab_mid.connections)
-        # Only connections of this inbound may be inspected, otherwise the other
-        # inbound's snapshots would supply a field name that this one does not have.
-        user_pool = self.filtered_view([ab_mid, dl_mid] + self.extras, tag_key, tag)
+        conns_for_proto = dl_peak.by_tag(tag_key, tag) if tag_key else list(dl_peak.connections)
+        ab_conns = ab_peak.by_tag(tag_key, tag) if tag_key else list(ab_peak.connections)
+        user_pool = self.filtered_view([ab_peak, dl_peak] + active_samples + list(self.extras), tag_key, tag)
         user_hits = discover_key(user_pool, lambda v: isinstance(v, str) and v in self.users)
         if not self.runtime_present(user_pool):
             self.rows.append(Row("%s.user_field" % proto, NOT_TESTED,
@@ -440,43 +494,68 @@ class Analyzer:
             self.rows.append(Row("%s.user_field" % proto, status,
                                  "%s - 字段名 %s，观测取值 %s；并发归因快照命中 %s"
                                  % (label, key, ",".join(values), ",".join(sorted(ab_users)) or "(none)"),
-                                 ["%s.connections.json" % s.label for s in (ab_mid, dl_mid)]))
+                                 self.evidence_names([ab_peak, dl_peak])))
         else:
             candidate_keys = sorted({k for s in user_pool if s.usable for k in s.flat_union()})
             self.rows.append(Row("%s.user_field" % proto, "NO",
                                  "NO - 全字段扫描未发现任何字段的取值等于 %s；已检查 %d 个字段，"
                                  "该 inbound 观测到 %d 条连接"
                                  % ("/".join(sorted(self.users)), len(candidate_keys), len(conns_for_proto)),
-                                 ["%s.connections.json" % s.label for s in (ab_mid, dl_mid)]))
+                                 self.evidence_names([ab_peak, dl_peak])))
 
         # --- direction ---------------------------------------------------------
-        if not (dl_pre.usable and dl_post.usable and ul_pre.usable and ul_post.usable):
-            missing = [s.label for s in (dl_pre, dl_post, ul_pre, ul_post) if not s.usable]
+        # Byte math uses only samples taken while the transfer ran (plus the brief
+        # tail while its connections were still visible). The post-transfer snapshot
+        # is deliberately excluded: the API may drop the connection and with it the
+        # per-connection counters, which would turn a real measurement into noise.
+        if not dl_pre.usable or not dl_samples:
             self.rows.append(Row("%s.direction" % proto, NOT_TESTED,
-                                 "缺少方向测试前后快照: %s" % ", ".join(missing),
-                                 ["%s.connections.json" % s.label for s in (dl_pre, dl_post)]))
+                                 "缺少客户端下载期间的活动采样（pre=%s, samples=%d）"
+                                 % (dl_pre.why_unusable(), len(dl_samples))))
+        elif not ul_pre.usable or not ul_samples:
+            self.rows.append(Row("%s.direction" % proto, NOT_TESTED,
+                                 "缺少客户端上传期间的活动采样（pre=%s, samples=%d）"
+                                 % (ul_pre.why_unusable(), len(ul_samples))))
         else:
-            dl_delta = counter_deltas(dl_pre, dl_post)
-            ul_delta = counter_deltas(ul_pre, ul_post)
-            recv_key, recv_val, recv_ok = magnitude_match(dl_delta, self.payload)
-            send_key, send_val, send_ok = magnitude_match(ul_delta, self.payload)
-            _, recv_second = largest_growth({k: v for k, v in dl_delta.items() if k != recv_key})
-            extra = {"download_test_deltas": dl_delta, "upload_test_deltas": ul_delta}
+            dl_delta = max_counter_deltas(dl_pre, dl_samples)
+            ul_delta = max_counter_deltas(ul_pre, ul_samples)
+            exp_dl, src_dl = self.curl_bytes("%s-dl" % proto)
+            exp_ul, src_ul = self.curl_bytes("%s-ul" % proto)
+            if exp_dl is None:
+                exp_dl, src_dl = float(self.payload), "fallback meta.payload_bytes (%s)" % src_dl
+            else:
+                src_dl = "curl %s" % src_dl
+            if exp_ul is None:
+                exp_ul, src_ul = float(self.payload), "fallback meta.payload_bytes (%s)" % src_ul
+            else:
+                src_ul = "curl %s" % src_ul
+            recv_key, recv_val, recv_ok = magnitude_match(dl_delta, exp_dl)
+            send_key, send_val, send_ok = magnitude_match(ul_delta, exp_ul)
+            # Reverse-direction noise = the counter family that the upload test
+            # identified as client->server grew during the client-download test.
+            reverse_seen = max((dl_delta.get(k, 0.0) for k in family_keys(dl_delta, send_key)),
+                               default=0.0)
+            extra = {"download_test_deltas": dl_delta, "upload_test_deltas": ul_delta,
+                     "download_samples": len(dl_samples), "upload_samples": len(ul_samples),
+                     "expected_download_bytes": exp_dl, "expected_upload_bytes": exp_ul,
+                     "expected_basis": {"download": src_dl, "upload": src_ul}}
             if not recv_ok or not send_ok:
                 self.rows.append(Row("%s.direction" % proto, "INCONCLUSIVE",
-                                     "INCONCLUSIVE - 未找到与已知流量 %dB 匹配的计数器增量；"
-                                     "下载测试最大增长 %s=%s，上传测试最大增长 %s=%s"
-                                     % (self.payload, recv_key, recv_val, send_key, send_val),
-                                     ["%s-dl-*.connections.json" % proto, "%s-ul-*.connections.json" % proto],
+                                     "INCONCLUSIVE - 未找到与实测流量匹配的计数器增量；"
+                                     "下载 %.0fB 期间最大增长 %s=%s，上传 %.0fB 期间最大增长 %s=%s"
+                                     % (exp_dl, recv_key, recv_val, exp_ul, send_key, send_val),
+                                     self.evidence_names(dl_samples + ul_samples),
                                      extra))
             elif recv_key == send_key:
                 self.rows.append(Row("%s.direction" % proto, "INCONCLUSIVE",
                                      "INCONCLUSIVE - 同一個计数器 %s 在两个方向都增长，无法归因方向" % recv_key,
-                                     [], extra))
+                                     self.evidence_names(dl_samples + ul_samples), extra))
             else:
                 lines = [
-                    "客户端下载 %dB 期间: %s 增长 %.0f -> 语义=客户端下行(服务器->客户端)" % (self.payload, recv_key, recv_val),
-                    "客户端上传 %dB 期间: %s 增长 %.0f -> 语义=客户端上行(客户端->服务器)" % (self.payload, send_key, send_val),
+                    "客户端下载 %.0fB（基准=%s，%d 个活动采样）期间 %s 峰值增长 %.0f"
+                    " -> 语义=客户端下行(服务器->客户端)" % (exp_dl, src_dl, len(dl_samples), recv_key, recv_val),
+                    "客户端上传 %.0fB（基准=%s，%d 个活动采样）期间 %s 峰值增长 %.0f"
+                    " -> 语义=客户端上行(客户端->服务器)" % (exp_ul, src_ul, len(ul_samples), send_key, send_val),
                 ]
                 perspective = name_perspective(recv_key)
                 if perspective == "downish":
@@ -489,52 +568,91 @@ class Analyzer:
                 else:
                     lines.append("字段命名无法判断视角（%s），方向语义以上面的实测增量结论为准" % recv_key)
                     status = "PARTIAL"
-                noise = recv_second if recv_second else 0.0
-                if noise >= self.payload * BIDIRECTIONAL_NOISE:
-                    lines.append("注意: 反向计数器同时增长 %.0f，测试可能不是单向的" % noise)
+                if reverse_seen >= exp_dl * BIDIRECTIONAL_NOISE:
+                    lines.append("注意: 反向计数器 %s 族同时增长 %.0f，测试可能不是单向的"
+                                 % (counter_family(send_key), reverse_seen))
                     status = "PARTIAL"
                 self.rows.append(Row("%s.direction" % proto, status, " | ".join(lines),
-                                     ["%s-dl-pre.connections.json" % proto, "%s-dl-post.connections.json" % proto,
-                                      "%s-ul-pre.connections.json" % proto, "%s-ul-post.connections.json" % proto],
+                                     self.evidence_names([dl_pre] + dl_samples + [ul_pre] + ul_samples),
                                      extra))
 
         # --- connection granularity -------------------------------------------
-        if not self.runtime_present([dl_mid, ab_mid]):
+        if not self.runtime_present(dl_samples + ab_samples):
             self.rows.append(Row("%s.connection_granularity" % proto, NOT_TESTED,
-                                 "无活动连接快照"))
+                                 "无活动连接采样（dl=%d, ab=%d）" % (len(dl_samples), len(ab_samples))))
         else:
-            single = len(dl_mid.by_tag(tag_key, tag))
-            pair = len(ab_mid.by_tag(tag_key, tag))
+            single = max((len(s.by_tag(tag_key, tag)) for s in dl_samples), default=0)
+            pair = max((len(s.by_tag(tag_key, tag)) for s in ab_samples), default=0)
             status = "VERIFIED" if (single == 1 and pair == 2) else "PARTIAL"
             self.rows.append(Row("%s.connection_granularity" % proto, status,
-                                 "单流快照 %d 条连接（期望 1）；双用户并发快照 %d 条（期望 2）"
+                                 "单流峰值 %d 条连接（期望 1）；双用户并发峰值 %d 条（期望 2）"
                                  % (single, pair),
-                                 ["%s-dl-mid.connections.json" % proto, "%s-ab-mid.connections.json" % proto]))
+                                 self.evidence_names([dl_peak, ab_peak])))
 
         # --- connection close behaviour ---------------------------------------
-        mid_ids = [c.get("id") for c in dl_mid.connections if isinstance(c.get("id"), str)]
-        post_ids = {c.get("id") for c in dl_post.connections if isinstance(c.get("id"), str)}
-        if not dl_mid.usable or not dl_post.usable:
+        # The only row allowed to look at the post-transfer snapshot.
+        last_active = self.last_active(proto, "dl")
+        if last_active is None or not dl_closed.usable:
             self.rows.append(Row("%s.connection_close" % proto, NOT_TESTED,
-                                 "缺少 mid/post 快照: %s" % dl_mid.why_unusable()))
-        elif not mid_ids:
-            self.rows.append(Row("%s.connection_close" % proto, "PARTIAL",
-                                 "未发现连接 id 字段，无法判断关闭后是否从列表消失；"
-                                 "post 快照连接数=%d" % len(dl_post.connections)))
+                                 "缺少最后一个活动采样或 closed 快照（closed=%s）" % dl_closed.why_unusable()))
         else:
-            lingering = [i for i in mid_ids if i in post_ids]
-            if lingering:
+            active_ids = [c.get("id") for c in last_active.connections if isinstance(c.get("id"), str)]
+            closed_ids = {c.get("id") for c in dl_closed.connections if isinstance(c.get("id"), str)}
+            if not active_ids:
                 self.rows.append(Row("%s.connection_close" % proto, "PARTIAL",
-                                     "传输结束后 %d/%d 条连接仍在列表中" % (len(lingering), len(mid_ids))))
+                                     "未发现连接 id 字段，无法判断关闭后是否从列表消失；"
+                                     "closed 快照连接数=%d" % len(dl_closed.connections)))
             else:
-                self.rows.append(Row("%s.connection_close" % proto, "VERIFIED",
-                                     "传输结束后 %d 条连接均已从列表消失；post 快照剩余连接 %d 条"
-                                     % (len(mid_ids), len(dl_post.connections))))
+                lingering = [i for i in active_ids if i in closed_ids]
+                if lingering:
+                    self.rows.append(Row("%s.connection_close" % proto, "PARTIAL",
+                                         "传输结束后 %d/%d 条连接仍在列表中"
+                                         % (len(lingering), len(active_ids)),
+                                         self.evidence_names([last_active, dl_closed])))
+                else:
+                    self.rows.append(Row("%s.connection_close" % proto, "VERIFIED",
+                                         "传输结束后 %d 条连接均已从列表消失；closed 快照剩余连接 %d 条"
+                                         % (len(active_ids), len(dl_closed.connections)),
+                                         self.evidence_names([last_active, dl_closed])))
 
     # ---------------------------------------------------------------- render ---
 
+    def payload_rows(self):
+        """Prove every transfer moved exactly the number of bytes that was asked for.
+
+        This is what makes the half-payload attribution test meaningful: probe-a and
+        probe-b must each have moved half, and the direction tests the full size.
+        """
+        checks = []
+        for proto in ("reality", "hy2"):
+            for label, expected in (("%s-dl" % proto, self.payload),
+                                    ("%s-ul" % proto, self.payload),
+                                    ("%s-ab-a" % proto, self.payload // 2),
+                                    ("%s-ab-b" % proto, self.payload // 2)):
+                actual, source = self.curl_bytes(label)
+                checks.append((label, expected, actual, source))
+        present = [c for c in checks if c[2] is not None]
+        if not present:
+            self.rows.append(Row("payload.matches_request", NOT_TESTED,
+                                 "没有 curl 实测字节数（未运行传输，或 curl 输出不可解析）"))
+            return
+        detail = "; ".join("%s 请求 %d 实测 %.0f" % (l, e, a) for l, e, a, _ in present)
+        bad = [c for c in present if not (c[1] * 0.99 <= c[2] <= c[1] * 1.01)]
+        if bad:
+            self.rows.append(Row("payload.matches_request", "NO",
+                                 "NO - 实际传输字节与请求不一致: %s"
+                                 % "; ".join("%s 请求 %d 实测 %.0f" % (l, e, a) for l, e, a, _ in bad)))
+        elif len(present) < len(checks):
+            self.rows.append(Row("payload.matches_request", "PARTIAL",
+                                 "部分传输缺少 curl 实测（%d/%d）: %s"
+                                 % (len(present), len(checks), detail)))
+        else:
+            self.rows.append(Row("payload.matches_request", "VERIFIED",
+                                 "全部传输实际字节与请求一致（含 probe-a/probe-b 各 half）: %s" % detail))
+
     def run(self):
         self.global_rows()
+        self.payload_rows()
         for proto in ("reality", "hy2"):
             self.protocol_rows(proto)
         self.production_untouched_row()
@@ -685,6 +803,75 @@ def _int(value, default=0):
         return default
 
 
+def _sha256(path):
+    try:
+        import hashlib
+        with open(path, "rb") as handle:
+            return hashlib.sha256(handle.read()).hexdigest()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _manifest_values(args):
+    return {
+        "probe_root": args.probe_root,
+        "expose": str(_int(args.expose)),
+        "reality_port": str(_int(args.reality_port)),
+        "hy2_port": str(_int(args.hy2_port)),
+        "clash_port": str(_int(args.clash_port)),
+        "sink_port": str(_int(args.sink_port)),
+        "public_ip": args.public_ip,
+        "payload_bytes": str(_int(args.payload_bytes)),
+        "transfer_rate": str(_int(args.transfer_rate)),
+    }
+
+
+def add_manifest_args(parser):
+    parser.add_argument("--out")
+    parser.add_argument("--manifest")
+    parser.add_argument("--probe-root", default="")
+    parser.add_argument("--expose", default="0")
+    parser.add_argument("--reality-port", default="")
+    parser.add_argument("--hy2-port", default="")
+    parser.add_argument("--clash-port", default="")
+    parser.add_argument("--sink-port", default="")
+    parser.add_argument("--public-ip", default="")
+    parser.add_argument("--payload-bytes", default="")
+    parser.add_argument("--transfer-rate", default="")
+    parser.add_argument("--probe-config", default="")
+
+
+def cmd_write_manifest(args):
+    """Record the parameters the generated probe config was built from."""
+    data = _manifest_values(args)
+    data["written_at"] = _now()
+    data["probe_config"] = args.probe_config
+    data["probe_config_sha256"] = _sha256(args.probe_config) if args.probe_config else ""
+    with open(args.out, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, ensure_ascii=False, indent=2)
+    return 0
+
+
+def cmd_check_manifest(args):
+    """Exit 0 when the stored parameters still match, 1 with the diffs otherwise."""
+    data, error = load_json(args.manifest)
+    if error or not isinstance(data, dict):
+        print("manifest unreadable: %s" % (error or "not an object"))
+        return 1
+    current = _manifest_values(args)
+    diffs = ["%s(%s->%s)" % (key, data.get(key), value)
+             for key, value in current.items() if str(data.get(key)) != value]
+    if not args.probe_config or not os.path.isfile(args.probe_config):
+        diffs.append("probe_config(missing)")
+    elif data.get("probe_config_sha256") != _sha256(args.probe_config):
+        diffs.append("probe_config(sha256 changed)")
+    if diffs:
+        print("stale: " + ", ".join(diffs))
+        return 1
+    print("current")
+    return 0
+
+
 def cmd_write_meta(args):
     """Write the expectation file the analyzer reads, so it is always valid JSON."""
     data = {
@@ -776,6 +963,12 @@ def main(argv=None):
     p_meta.add_argument("--payload-bytes", default="67108864")
     p_meta.add_argument("--transfer-rate", default="4194304")
 
+    p_wm = sub.add_parser("write-manifest", help="record the parameters used to generate the probe config")
+    add_manifest_args(p_wm)
+
+    p_cm = sub.add_parser("check-manifest", help="report whether the stored parameters still match")
+    add_manifest_args(p_cm)
+
     p_an = sub.add_parser("analyze", help="derive the feasibility verdicts from captured evidence")
     p_an.add_argument("--evidence-dir", required=True)
     p_an.add_argument("--json-out")
@@ -796,6 +989,10 @@ def main(argv=None):
         return cmd_prod_ports(args.path)
     if args.cmd == "write-meta":
         return cmd_write_meta(args)
+    if args.cmd == "write-manifest":
+        return cmd_write_manifest(args)
+    if args.cmd == "check-manifest":
+        return cmd_check_manifest(args)
     return cmd_analyze(args)
 
 

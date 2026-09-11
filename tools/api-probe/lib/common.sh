@@ -6,6 +6,10 @@
 #   * the tool only ever writes inside PROBE_ROOT;
 #   * a process is killable only if its /proc cmdline references PROBE_ROOT and
 #     it is not the MainPID of the production sing-box unit.
+#
+# Several values below are read by lib/probe-config.sh and lib/evidence.sh, which
+# are always sourced next to this file; shellcheck only sees one file at a time.
+# shellcheck disable=SC2034
 
 PROBE_ROOT="${PROBE_ROOT:-/root/sbox-probe}"
 PROD_DIR="${PROD_DIR:-/root/sbox}"
@@ -14,6 +18,7 @@ PROD_SERVICE="${PROD_SERVICE:-sing-box}"
 PROD_CONFIG="${PROD_CONFIG:-$PROD_DIR/sbconfig_server.json}"
 PROD_STATE="${PROD_STATE:-$PROD_DIR/config}"
 
+# shellcheck disable=SC2034
 RUN_DIR="$PROBE_ROOT/run"
 EVID_DIR="$PROBE_ROOT/evidence"
 CERTS_DIR="$PROBE_ROOT/certs"
@@ -22,6 +27,7 @@ KEYS_FILE="$PROBE_ROOT/keys.json"
 PROBE_CONFIG="$PROBE_ROOT/probe.json"
 PROBE_LOG="$PROBE_ROOT/probe.log"
 PAYLOAD_FILE="$PROBE_ROOT/payload.bin"
+PAYLOAD_HALF_FILE="$PROBE_ROOT/payload-half.bin"
 
 REALITY_PORT="${REALITY_PORT:-18443}"
 HY2_PORT="${HY2_PORT:-18444}"
@@ -40,9 +46,14 @@ USER_B="probe-b"
 EXPOSE="${EXPOSE:-0}"
 PUBLIC_IP="${PUBLIC_IP:-}"
 PAYLOAD_BYTES="${PAYLOAD_BYTES:-67108864}"
-TRANSFER_RATE="${TRANSFER_RATE:-4m}"
-TRANSFER_MID_DELAY="${TRANSFER_MID_DELAY:-4}"
+TRANSFER_RATE="${TRANSFER_RATE:-4194304}"
 TRANSFER_MAX_TIME="${TRANSFER_MAX_TIME:-300}"
+# A connection may disappear the moment the last byte is proxied, so the counters
+# are sampled while the transfer runs (and briefly while its connections are still
+# visible) instead of relying on a post-transfer snapshot.
+SAMPLE_INTERVAL="${SAMPLE_INTERVAL:-1}"
+SAMPLE_TAIL_INTERVAL="${SAMPLE_TAIL_INTERVAL:-0.25}"
+SAMPLE_TAIL_MAX="${SAMPLE_TAIL_MAX:-8}"
 
 if [ -t 1 ]; then
   C_RED=$'\033[31m'; C_YEL=$'\033[33m'; C_GRN=$'\033[32m'; C_CYN=$'\033[36m'; C_RST=$'\033[0m'
@@ -196,8 +207,8 @@ find_probe_pid_by_cmdline() {
 }
 
 ensure_detached_pid() {
-  local name=$1 needle=$2 pid i
-  for i in 1 2 3 4 5 6; do
+  local name=$1 needle=$2 pid
+  for _ in 1 2 3 4 5 6; do
     pid="$(read_pid "$name")"
     if pid_is_probe "$pid"; then return 0; fi
     sleep 0.5
