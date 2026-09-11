@@ -440,6 +440,103 @@ CHILD
     if ! ls "$CONC"/sbconfig_server.json.candidate.* >/dev/null 2>&1; then pass "no candidate left behind after concurrent adds"; else fail "candidate residue after concurrent adds"; fi
 fi
 
+section "restore main sandbox after C17's dedicated sandbox"
+export SB_SERVER_CONFIG="$SB_SANDBOX_CONFIG"
+export SB_STATE_FILE="$SB_SANDBOX_STATE"
+export SB_CLIENTS_DIR="$SB_SANDBOX_CLIENTS"
+export SB_SING_BOX_BIN="$TMP/mock-sing-box"
+export SB_LOCK_FILE="$SANDBOX/config.lock"
+
+section "regression C18: missing inbounds entirely must FAIL audit"
+printf '{}\n' > "$SB_SANDBOX_CONFIG"
+if audit_client_consistency > "$TMP/c18.audit" 2>&1; then fail "audit passes on {}"; else pass "audit FAILS on {}"; fi
+assert_grep '缺少 inbounds 字段' "$TMP/c18.audit" "missing inbounds reason stated"
+assert_no_grep '一致性检查通过' "$TMP/c18.audit" "must not report a passing audit"
+before_add="$(sha256sum "$SB_SANDBOX_CONFIG" | awk '{print $1}')"
+add_client "ghost" > "$TMP/c18.add" 2>&1
+assert_rc 1 $? "add_client blocked on {}"
+after_add="$(sha256sum "$SB_SANDBOX_CONFIG" | awk '{print $1}')"
+if [ "$before_add" = "$after_add" ]; then pass "live config SHA unchanged on {}"; else fail "config mutated on {}"; fi
+
+section "regression C19: inbounds=null must FAIL audit"
+printf '{"inbounds": null}\n' > "$SB_SANDBOX_CONFIG"
+if audit_client_consistency > "$TMP/c19.audit" 2>&1; then fail "audit passes with inbounds=null"; else pass "audit FAILS with inbounds=null"; fi
+assert_grep '缺少 inbounds 字段' "$TMP/c19.audit" "null inbounds reported as missing"
+add_client "ghost-null" > "$TMP/c19.add" 2>&1
+assert_rc 1 $? "add_client blocked with inbounds=null"
+
+section "regression C20: non-array inbounds must FAIL audit"
+printf '{"inbounds": {}}\n' > "$SB_SANDBOX_CONFIG"
+if audit_client_consistency > "$TMP/c20.audit" 2>&1; then fail "audit passes with inbounds={}]"; else pass "audit FAILS with inbounds={}"; fi
+assert_grep 'inbounds 不是数组' "$TMP/c20.audit" "non-array inbounds reason stated"
+
+section "regression C21: jq runtime failure inside audit must fail closed"
+write_old_config; write_state_file
+migrate_legacy_clients >/dev/null 2>&1
+before_add="$(sha256sum "$SB_SANDBOX_CONFIG" | awk '{print $1}')"
+# Wrap jq: fail ONLY the identity-check program (exit 5) while letting the
+# structural program and everything else through -- proving the caller checks
+# candidate_problems' exit code, not just its stdout.
+jq() {
+    if [ "${MOCK_JQ_FAIL_IDENTITY:-0}" = "1" ] &&
+       [ "${1:-}" = "-r" ] &&
+       [[ "${2:-}" == *"name 集合不一致"* ]]; then
+        return 5
+    fi
+    command jq "$@"
+}
+MOCK_JQ_FAIL_IDENTITY=1 audit_client_consistency > "$TMP/c21.audit" 2>&1
+assert_rc 1 $? "audit fail-closed when identity jq errors"
+assert_grep '结构审计执行失败' "$TMP/c21.audit" "audit error reason stated"
+assert_no_grep '一致性检查通过' "$TMP/c21.audit" "empty stdout must not mean OK"
+MOCK_JQ_FAIL_IDENTITY=1 add_client "jq-broken" > "$TMP/c21.add" 2>&1
+assert_rc 1 $? "add_client fail-closed when identity jq errors"
+candidate="$SB_SANDBOX_CONFIG.c21-candidate"
+cp "$SB_SANDBOX_CONFIG" "$candidate"
+MOCK_JQ_FAIL_IDENTITY=1 commit_server_config "$candidate" "c21" > "$TMP/c21.commit" 2>&1
+assert_rc 1 $? "commit_server_config fail-closed when identity jq errors"
+assert_grep '结构审计执行失败' "$TMP/c21.commit" "commit error reason stated"
+if [ ! -e "$candidate" ]; then pass "candidate cleaned up after audit failure"; else fail "candidate left behind"; fi
+after_add="$(sha256sum "$SB_SANDBOX_CONFIG" | awk '{print $1}')"
+if [ "$before_add" = "$after_add" ]; then pass "live config untouched by failed-audit transaction"; else fail "live config mutated during audit failure"; fi
+unset -f jq
+unset MOCK_JQ_FAIL_IDENTITY
+
+section "regression C22: migration on bad structure must FAIL"
+printf '{}\n' > "$SB_SANDBOX_CONFIG"
+before_add="$(sha256sum "$SB_SANDBOX_CONFIG" | awk '{print $1}')"
+migrate_legacy_clients > "$TMP/c22.out" 2>&1
+assert_rc 1 $? "migrate_legacy_clients fails on {}"
+assert_no_grep '无需迁移' "$TMP/c22.out" "must not treat {} as nothing-to-migrate"
+assert_grep '缺少 inbounds 字段' "$TMP/c22.out" "structure precheck reason stated"
+after_add="$(sha256sum "$SB_SANDBOX_CONFIG" | awk '{print $1}')"
+if [ "$before_add" = "$after_add" ]; then pass "config unchanged by failed migration"; else fail "config mutated by failed migration"; fi
+
+section "regression C23: locked delete helper itself refuses legacy"
+write_old_config; write_state_file
+migrate_legacy_clients >/dev/null 2>&1
+with_client_lock _delete_client_locked "legacy" > "$TMP/c23.out" 2>&1
+assert_rc 1 $? "_delete_client_locked legacy refused"
+assert_grep '保留名称' "$TMP/c23.out" "invariant reason stated"
+assert_grep 'OLD-REALITY-UUID' "$SB_SANDBOX_CONFIG" "legacy untouched after direct locked call"
+
+section "regression C24: same-second transactions get unique backups"
+write_old_config; write_state_file
+migrate_legacy_clients >/dev/null 2>&1
+bak_before="$(ls -1 "$SB_SANDBOX_CONFIG".bak.* 2>/dev/null | wc -l)"
+# two transactions back-to-back: same second, same shell pid
+add_client "bak-a" >/dev/null 2>&1
+assert_rc 0 $? "bak-a added"
+add_client "bak-b" >/dev/null 2>&1
+assert_rc 0 $? "bak-b added"
+bak_after="$(ls -1 "$SB_SANDBOX_CONFIG".bak.* 2>/dev/null | wc -l)"
+assert_rc 2 "$((bak_after - bak_before))" "two same-second transactions produced two distinct backups"
+broken=0
+for b in "$SB_SANDBOX_CONFIG".bak.*; do
+    [ -s "$b" ] || { fail "backup file empty: $b"; broken=1; }
+done
+[ "$broken" -eq 0 ] && pass "all backup files exist and are non-empty"
+
 printf '\n== summary ==\n'
 printf '  pass=%d fail=%d\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
