@@ -1227,6 +1227,58 @@ generate_client_configuration() { # generate_client_configuration <name>
         info "HY2 链接: hysteria2://$password@$server_ip:$hy_port?insecure=1&sni=$hy_server_name#HY2-$name"
     fi
 }
+list_clients() { # 查看客户端（只读，不作为破坏性操作的门槛）
+    audit_client_consistency "$SB_SERVER_CONFIG"
+}
+
+add_client_interactive() {
+    local name
+    read -r -p "请输入客户端名称 (例如 vmix-01，字母/数字开头，仅字母数字._-，最长32): " name
+    add_client "$name"
+}
+
+generate_client_configuration_interactive() {
+    local name
+    audit_client_consistency "$SB_SERVER_CONFIG" || return 1
+    read -r -p "请输入要生成配置的客户端名称: " name
+    generate_client_configuration "$name"
+}
+
+delete_client_interactive() {
+    local name
+    read -r -p "请输入要删除的客户端名称: " name
+    delete_client "$name"
+}
+
+client_management_menu() {
+    while :; do
+        echo ""
+        show_notice "客户端管理"
+        info "1. 查看客户端"
+        info "2. 添加客户端"
+        info "3. 生成客户端配置"
+        info "4. 删除客户端"
+        info "5. 迁移旧客户端为 legacy"
+        info "6. 检查客户端一致性"
+        info "0. 返回"
+        echo ""
+        read -r -p "请输入对应数字（0-6）: " cm_choice
+        echo ""
+        case "$cm_choice" in
+            1) list_clients ;;
+            2) add_client_interactive ;;
+            3) generate_client_configuration_interactive ;;
+            4) delete_client_interactive ;;
+            5)
+                warning "迁移只会为没有 name 的旧用户补上 name=legacy，绝不更换 UUID/password。"
+                migrate_legacy_clients
+                ;;
+            6) audit_client_consistency "$SB_SERVER_CONFIG" ;;
+            0) break ;;
+            *) warning "无效的选项，请重新选择" ;;
+        esac
+    done
+}
 # <<< phase-c client-management <<< ============================================
 
 NETWORK_SYSCTL_FILE="/etc/sysctl.d/99-sing-box-network.conf"
@@ -1949,10 +2001,11 @@ if has_any_installation_marker; then
     echo ""
     info "8. 落地机任意门解锁（本机做解锁机）"
     info "9. 落地机 SS 解锁（本机做解锁机）"
+    info "10. 客户端管理（多设备身份 / legacy 迁移 / 一致性检查）"
     echo ""
     hint "========================="
     echo ""
-    read -r -p "请输入对应数字 (0-9): " choice
+    read -r -p "请输入对应数字 (0-10): " choice
 
     case $choice in
       1)
@@ -1996,6 +2049,10 @@ if has_any_installation_marker; then
           ;;
       9)
           process_ssko
+          exit 0
+          ;;
+      10)
+          client_management_menu
           exit 0
           ;;
       0)
