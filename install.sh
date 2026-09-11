@@ -753,12 +753,19 @@ get_hy2_client_names() { # [config] -> one name per line ("" = unnamed user)
         "${1:-$SB_SERVER_CONFIG}" 2>/dev/null | tr -d '\r'
 }
 
-# Structural consistency of a (candidate or live) server config. Compares name
-# SETS between the two inbounds -- equal counts alone can hide a mismatch --
-# plus emptiness, duplicates and per-protocol credential sanity.
+# Structural consistency of a (candidate or live) server config. The two
+# protocol inbounds must exist EXACTLY ONCE (a missing or duplicated tag must
+# fail loudly, never silently audit the first match against an empty set) and
+# their users field must be a real array. Compares name SETS between the two
+# inbounds -- equal counts alone can hide a mismatch -- plus emptiness,
+# duplicates and per-protocol credential sanity.
 candidate_problems() { # candidate_problems <config> -> prints problem lines (empty = OK)
     jq -r '
-      def usr(tag): ([.inbounds[] | select(.tag == tag) | (.users // [])] | first // []);
+      def inbound(tag): ([.inbounds[] | select(.tag == tag)]);
+      def usr(tag): (inbound(tag)[0] // {}) |
+        (if ((.users // null) | type) == "array" then .users else [] end);
+      inbound("vless-in") as $ri |
+      inbound("hy2-in") as $hi |
       usr("vless-in") as $ru |
       usr("hy2-in") as $hu |
       ([ $ru[] | .name // "" ]) as $rn |
@@ -767,6 +774,20 @@ candidate_problems() { # candidate_problems <config> -> prints problem lines (em
       ([ $hu[] | .password // "" ]) as $hp |
       ([ $ru[] | .flow // "" ]) as $rf |
       ([]
+        + (if ($ri | length) == 0 then ["缺少 vless-in 入站"] else [] end)
+        + (if ($ri | length) > 1 then ["vless-in 入站数量不是 1（实际 \($ri | length) 个）"] else [] end)
+        + (if ($hi | length) == 0 then ["缺少 hy2-in 入站"] else [] end)
+        + (if ($hi | length) > 1 then ["hy2-in 入站数量不是 1（实际 \($hi | length) 个）"] else [] end)
+        + (if ($ri | length) == 1 then
+             (if ($ri[0] | has("users") | not) then ["vless-in 缺少 users 字段"]
+              elif (($ri[0].users) | type) != "array" then ["vless-in 的 users 不是数组"]
+              else [] end)
+           else [] end)
+        + (if ($hi | length) == 1 then
+             (if ($hi[0] | has("users") | not) then ["hy2-in 缺少 users 字段"]
+              elif (($hi[0].users) | type) != "array" then ["hy2-in 的 users 不是数组"]
+              else [] end)
+           else [] end)
         + (if ($rn | index("")) != null then ["vless-in 存在没有 name 的用户"] else [] end)
         + (if ($hn | index("")) != null then ["hy2-in 存在没有 name 的用户"] else [] end)
         + (if ($rn | sort) == ($hn | sort) then [] else ["Reality 与 HY2 的 name 集合不一致"] end)

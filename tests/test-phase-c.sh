@@ -291,6 +291,155 @@ assert_rc 0 "$(get_reality_client_names | grep -cx 'vmix-rb')" "no vmix-rb in re
 assert_rc 0 "$(get_hy2_client_names | grep -cx 'vmix-rb')" "no vmix-rb in hy2 after rollback"
 SYSTEMCTL_MODE="ok"
 
+section "regression C12: missing vless-in must FAIL and block add"
+write_old_config; write_state_file
+jq '.inbounds = [.inbounds[] | select(.tag != "vless-in")]' "$SB_SANDBOX_CONFIG" \
+    > "$SB_SANDBOX_CONFIG.tmp" && mv "$SB_SANDBOX_CONFIG.tmp" "$SB_SANDBOX_CONFIG"
+if audit_client_consistency > "$TMP/c12.audit" 2>&1; then fail "audit passes without vless-in"; else pass "audit FAILS when vless-in missing"; fi
+assert_grep '缺少 vless-in' "$TMP/c12.audit" "missing vless-in reason stated"
+before_add="$(sha256sum "$SB_SANDBOX_CONFIG" | awk '{print $1}')"
+add_client "no-reality" > "$TMP/c12.add" 2>&1
+assert_rc 1 $? "add_client blocked without vless-in"
+after_add="$(sha256sum "$SB_SANDBOX_CONFIG" | awk '{print $1}')"
+if [ "$before_add" = "$after_add" ]; then pass "config unchanged when vless-in missing"; else fail "config mutated without vless-in"; fi
+
+section "regression C13: duplicated vless-in must FAIL"
+write_old_config; write_state_file
+jq '.inbounds += [.inbounds[] | select(.tag == "vless-in")]' "$SB_SANDBOX_CONFIG" \
+    > "$SB_SANDBOX_CONFIG.tmp" && mv "$SB_SANDBOX_CONFIG.tmp" "$SB_SANDBOX_CONFIG"
+if audit_client_consistency > "$TMP/c13.audit" 2>&1; then fail "audit passes with duplicated vless-in"; else pass "audit FAILS with duplicated vless-in"; fi
+assert_grep 'vless-in 入站数量不是 1' "$TMP/c13.audit" "duplicate vless-in reason stated"
+before_add="$(sha256sum "$SB_SANDBOX_CONFIG" | awk '{print $1}')"
+add_client "dup-reality" > "$TMP/c13.add" 2>&1
+assert_rc 1 $? "add_client blocked with duplicated vless-in"
+after_add="$(sha256sum "$SB_SANDBOX_CONFIG" | awk '{print $1}')"
+if [ "$before_add" = "$after_add" ]; then pass "config unchanged with duplicated vless-in"; else fail "config mutated with duplicated vless-in"; fi
+
+section "regression C14: missing hy2-in must FAIL (symmetric)"
+write_old_config; write_state_file
+jq '.inbounds = [.inbounds[] | select(.tag != "hy2-in")]' "$SB_SANDBOX_CONFIG" \
+    > "$SB_SANDBOX_CONFIG.tmp" && mv "$SB_SANDBOX_CONFIG.tmp" "$SB_SANDBOX_CONFIG"
+if audit_client_consistency > "$TMP/c14.audit" 2>&1; then fail "audit passes without hy2-in"; else pass "audit FAILS when hy2-in missing"; fi
+assert_grep '缺少 hy2-in' "$TMP/c14.audit" "missing hy2-in reason stated"
+add_client "no-hy2" > "$TMP/c14.add" 2>&1
+assert_rc 1 $? "add_client blocked without hy2-in"
+
+section "regression C15: duplicated hy2-in must FAIL (symmetric)"
+write_old_config; write_state_file
+jq '.inbounds += [.inbounds[] | select(.tag == "hy2-in")]' "$SB_SANDBOX_CONFIG" \
+    > "$SB_SANDBOX_CONFIG.tmp" && mv "$SB_SANDBOX_CONFIG.tmp" "$SB_SANDBOX_CONFIG"
+if audit_client_consistency > "$TMP/c15.audit" 2>&1; then fail "audit passes with duplicated hy2-in"; else pass "audit FAILS with duplicated hy2-in"; fi
+assert_grep 'hy2-in 入站数量不是 1' "$TMP/c15.audit" "duplicate hy2-in reason stated"
+
+section "regression C12b: non-array users must FAIL"
+write_old_config; write_state_file
+jq '(.inbounds[] | select(.tag == "vless-in") | .users) = {"name": "oops"}' "$SB_SANDBOX_CONFIG" \
+    > "$SB_SANDBOX_CONFIG.tmp" && mv "$SB_SANDBOX_CONFIG.tmp" "$SB_SANDBOX_CONFIG"
+if audit_client_consistency > "$TMP/c12b.audit" 2>&1; then fail "audit passes with non-array users"; else pass "audit FAILS with non-array users"; fi
+assert_grep 'users 不是数组' "$TMP/c12b.audit" "non-array users reason stated"
+
+section "regression C16: rollback reload failure must NOT be reported as recovered"
+write_old_config; write_state_file
+migrate_legacy_clients >/dev/null 2>&1
+before_add="$(sha256sum "$SB_SANDBOX_CONFIG" | awk '{print $1}')"
+# First reload fails AND the rollback reload fails too, while pgrep/systemctl
+# keep reporting the process alive: recovery must not be claimed.
+SYSTEMCTL_MODE="reload_fail" add_client "vmix-c16" > "$TMP/c16.out" 2>&1
+assert_rc 1 $? "add_client fails when first and rollback reload both fail"
+assert_no_grep '已回滚并重新加载上一份配置' "$TMP/c16.out" "must NOT claim successful rollback reload"
+assert_grep '未能确认恢复' "$TMP/c16.out" "manual-intervention message stated"
+after_add="$(sha256sum "$SB_SANDBOX_CONFIG" | awk '{print $1}')"
+if [ "$before_add" = "$after_add" ]; then pass "live config restored to backup content"; else fail "live config differs from backup after rollback"; fi
+SYSTEMCTL_MODE="ok"
+
+section "regression C17: concurrent add must not lose updates"
+if ! command -v flock >/dev/null 2>&1; then
+    printf '  SKIP concurrency test: flock unavailable\n'
+else
+    CONC="$TMP/conc"
+    mkdir -p "$CONC"
+    # Point the harness at a FRESH sandbox shared by both concurrent children.
+    export SB_SERVER_CONFIG="$CONC/sbconfig_server.json"
+    export SB_STATE_FILE="$CONC/config"
+    export SB_CLIENTS_DIR="$CONC/clients"
+    export SB_SING_BOX_BIN="$TMP/mock-sing-box"
+    export SB_LOCK_FILE="$CONC/config.lock"
+    SB_SANDBOX_CONFIG="$SB_SERVER_CONFIG"
+    write_old_config; write_state_file
+    migrate_legacy_clients >/dev/null 2>&1
+    # Slow mock sing-box: widens the read-modify-write window so an unlocked
+    # implementation would deterministically lose one update.
+    cat > "$TMP/mock-sing-box-slow" <<MOCK
+#!/usr/bin/env bash
+set -u
+COUNT_FILE="$CONC/cred-count"
+case "\${1:-}" in
+  check)
+    file=""
+    while [ \$# -gt 0 ]; do case "\$1" in -c) file="\$2"; shift 2 ;; *) shift ;; esac; done
+    jq empty "\$file" >/dev/null 2>&1 || exit 1
+    exit 0 ;;
+  generate)
+    sleep 0.5
+    n="\$(cat "\$COUNT_FILE" 2>/dev/null || echo 0)"; n=\$((n + 1)); printf '%s\n' "\$n" > "\$COUNT_FILE"
+    case "\${2:-}" in
+      uuid) printf 'cccccccc-cccc-cccc-cccc-%012d\n' "\$n" ;;
+      rand) printf 'dddd%028x\n' "\$n" ;;
+      *) exit 2 ;;
+    esac ;;
+  *) exit 2 ;;
+esac
+MOCK
+    chmod +x "$TMP/mock-sing-box-slow"
+    cat > "$CONC/child.sh" <<'CHILD'
+set -u
+NAME="$1"; CFG="$2"; GO="$3"; MOCK_SB="$4"; PHASEC="$5"
+export SB_SERVER_CONFIG="$CFG/sbconfig_server.json"
+export SB_STATE_FILE="$CFG/config"
+export SB_CLIENTS_DIR="$CFG/clients"
+export SB_SING_BOX_BIN="$MOCK_SB"
+export SB_LOCK_FILE="$CFG/config.lock"
+info() { :; }; warning() { :; }; hint() { :; }; error() { :; }
+. "$PHASEC"
+systemctl() { case "$1" in is-active) return 0 ;; reload) return 0 ;; esac; return 0; }
+pgrep() { return 0; }
+# barrier: start together, then race for the same lock
+while [ ! -f "$GO" ]; do sleep 0.05; done
+add_client "$NAME"
+exit $?
+CHILD
+    : > "$CONC/stage"
+    bash "$CONC/child.sh" client-a "$CONC" "$CONC/go" "$TMP/mock-sing-box-slow" "$TMP/phasec.sh" \
+        > "$CONC/a.log" 2>&1 &
+    cpid1=$!
+    bash "$CONC/child.sh" client-b "$CONC" "$CONC/go" "$TMP/mock-sing-box-slow" "$TMP/phasec.sh" \
+        > "$CONC/b.log" 2>&1 &
+    cpid2=$!
+    # wait until both children are through sourcing and are parked at the barrier
+    for _ in $(seq 1 50); do
+        [ -d "/proc/$cpid1" ] && [ -d "/proc/$cpid2" ] || break
+        sleep 0.1
+    done
+    sleep 1
+    : > "$CONC/go"
+    wait "$cpid1"; rc_a=$?
+    wait "$cpid2"; rc_b=$?
+    if [ "$rc_a" -ne 0 ]; then fail "concurrent add client-a (rc=$rc_a): $(cat "$CONC/a.log" | head -n3 | tr '\n' ' ')"; else pass "concurrent add client-a"; fi
+    if [ "$rc_b" -ne 0 ]; then fail "concurrent add client-b (rc=$rc_b): $(cat "$CONC/b.log" | head -n3 | tr '\n' ' ')"; else pass "concurrent add client-b"; fi
+    export SB_SERVER_CONFIG="$CONC/sbconfig_server.json"
+    export SB_STATE_FILE="$CONC/config"
+    export SB_CLIENTS_DIR="$CONC/clients"
+    export SB_SING_BOX_BIN="$TMP/mock-sing-box"
+    export SB_LOCK_FILE="$CONC/config.lock"
+    assert_rc 1 "$(get_reality_client_names | grep -cx 'client-a')" "client-a present in reality"
+    assert_rc 1 "$(get_hy2_client_names | grep -cx 'client-a')" "client-a present in hy2"
+    assert_rc 1 "$(get_reality_client_names | grep -cx 'client-b')" "client-b present in reality"
+    assert_rc 1 "$(get_hy2_client_names | grep -cx 'client-b')" "client-b present in hy2"
+    assert_rc 1 "$(get_reality_client_names | grep -cx 'legacy')" "legacy preserved in reality"
+    if audit_client_consistency > "$TMP/c17.audit" 2>&1; then pass "final name sets consistent after concurrent adds"; else fail "final name sets inconsistent: $(cat "$TMP/c17.audit" | tr '\n' ' ')"; fi
+    if ! ls "$CONC"/sbconfig_server.json.candidate.* >/dev/null 2>&1; then pass "no candidate left behind after concurrent adds"; else fail "candidate residue after concurrent adds"; fi
+fi
+
 printf '\n== summary ==\n'
 printf '  pass=%d fail=%d\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
