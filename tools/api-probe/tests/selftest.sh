@@ -91,7 +91,9 @@ mkdir -p "$TMP/ev-empty"
 "$PY" "$ANALYZE" analyze --evidence-dir "$TMP/ev-empty" >"$TMP/empty.txt" 2>&1
 expect_grep "$TMP/ev-empty/SUMMARY.txt" 'NOT TESTED / WAITING FOR RUNTIME DATA' "empty dir -> NOT TESTED marker"
 expect_no_grep "$TMP/ev-empty/SUMMARY.txt" 'YES - ' "empty dir -> no invented YES"
-expect_no_grep "$TMP/ev-empty/SUMMARY.txt" 'VERIFIED' "empty dir -> no invented VERIFIED"
+# match the STATUS column, not the word anywhere (the notes section may mention
+# verdict names in prose, e.g. the source-IP enhancement TODO)
+expect_no_grep "$TMP/ev-empty/SUMMARY.txt" '[[:space:]]VERIFIED[[:space:]]' "empty dir -> no VERIFIED status"
 
 section "analyzer: synthetic fixtures are ignored without --fixture-mode"
 "$PY" "$GEN" --out "$TMP/ev-nomode" >/dev/null
@@ -132,7 +134,7 @@ section "regression #4: transfer size must match the requested bytes"
 expect_grep "$TMP/ev-ok/SUMMARY.txt" '^payload\.matches_request +VERIFIED' "curl-reported bytes match requested (half for probe-a/probe-b)"
 expect_grep "$TMP/ev-ok/report.md" 'ab-a 请求 33554432' "attribution payload is half, not full"
 cp -r "$TMP/ev-ok" "$TMP/ev-badpayload"
-"$PY" - "$TMP/ev-badpayload/reality-dl-curl.txt" <<'PY'
+"$PY" - "$TMP/ev-badpayload/reality-dl-curl.json" <<'PY'
 import json
 import sys
 json.dump({"mode": "download", "requested_bytes": 67108864, "bytes_downloaded": 4096,
@@ -140,6 +142,68 @@ json.dump({"mode": "download", "requested_bytes": 67108864, "bytes_downloaded": 
 PY
 "$PY" "$ANALYZE" analyze --evidence-dir "$TMP/ev-badpayload" --fixture-mode >"$TMP/badpayload.txt" 2>&1
 expect_grep "$TMP/ev-badpayload/SUMMARY.txt" '^payload\.matches_request +NO' "size mismatch -> NO"
+
+section "regression #5 (HIGH): strict curl evidence gate for direction verdicts"
+# Direction may only be VERIFIED/PARTIAL when the transfer is backed by complete
+# curl evidence: exit code 0, HTTP 200, actually-moved bytes ~= requested_bytes,
+# plus in-transfer connection sampling. No fallback to meta.payload_bytes allowed.
+direction_blocked() { # direction_blocked <dir> <label>
+  expect_grep "$1/SUMMARY.txt" '^reality\.direction +(INCONCLUSIVE|NOT TESTED)' "$2 -> INCONCLUSIVE/NOT TESTED"
+  expect_no_grep "$1/SUMMARY.txt" '^reality\.direction +(VERIFIED|PARTIAL)' "$2 -> never VERIFIED/PARTIAL"
+}
+analyze_strict() { # analyze_strict <dir>
+  "$PY" "$ANALYZE" analyze --evidence-dir "$1" --fixture-mode >"$TMP/$(basename "$1").out.txt" 2>&1
+}
+
+# baseline: full successful transfer -> direction may be VERIFIED
+expect_grep "$TMP/ev-ok/SUMMARY.txt" '^reality\.direction +VERIFIED' "full successful curl transfer -> direction VERIFIED"
+
+# curl rc != 0
+cp -r "$TMP/ev-ok" "$TMP/ev-rc"
+printf '28\n' > "$TMP/ev-rc/reality-dl-curl.rc"
+analyze_strict "$TMP/ev-rc"
+direction_blocked "$TMP/ev-rc" "curl exit 28 (timeout)"
+expect_grep "$TMP/ev-rc/SUMMARY.txt" 'curl exit code=28' "rc failure reason is stated"
+expect_grep "$TMP/ev-rc/SUMMARY.txt" '不回退到 meta.payload_bytes' "no-fallback to meta.payload_bytes is stated"
+
+# HTTP 500
+cp -r "$TMP/ev-ok" "$TMP/ev-http500"
+"$PY" - "$TMP/ev-http500/reality-dl-curl.json" <<'PY'
+import json
+import sys
+data = json.load(open(sys.argv[1]))
+data["http_code"] = 500
+json.dump(data, open(sys.argv[1], "w"))
+PY
+analyze_strict "$TMP/ev-http500"
+direction_blocked "$TMP/ev-http500" "HTTP 500"
+expect_grep "$TMP/ev-http500/SUMMARY.txt" 'HTTP code=500' "HTTP failure reason is stated"
+
+# corrupt curl JSON (stderr garbage instead of JSON)
+cp -r "$TMP/ev-ok" "$TMP/ev-corrupt"
+printf 'curl: (56) Recv failure: Connection was reset\n' > "$TMP/ev-corrupt/reality-dl-curl.json"
+analyze_strict "$TMP/ev-corrupt"
+direction_blocked "$TMP/ev-corrupt" "corrupt curl JSON"
+expect_grep "$TMP/ev-corrupt/SUMMARY.txt" 'curl JSON 不可解析' "corrupt JSON reason is stated"
+
+# missing curl JSON
+cp -r "$TMP/ev-ok" "$TMP/ev-missing"
+rm -f "$TMP/ev-missing/reality-dl-curl.json"
+analyze_strict "$TMP/ev-missing"
+direction_blocked "$TMP/ev-missing" "missing curl JSON"
+
+# short transfer: only 90% of the requested bytes actually moved
+cp -r "$TMP/ev-ok" "$TMP/ev-short"
+"$PY" - "$TMP/ev-short/reality-dl-curl.json" <<'PY'
+import json
+import sys
+data = json.load(open(sys.argv[1]))
+data["bytes_downloaded"] = int(data["requested_bytes"] * 0.9)
+json.dump(data, open(sys.argv[1], "w"))
+PY
+analyze_strict "$TMP/ev-short"
+direction_blocked "$TMP/ev-short" "90% of requested bytes"
+expect_grep "$TMP/ev-short/SUMMARY.txt" '明显小于请求' "short-transfer reason is stated"
 
 section "regression #4: sink honours ?bytes= and enforces the cap"
 SINK_PORT_TEST=$(( 18000 + (RANDOM % 2000) ))

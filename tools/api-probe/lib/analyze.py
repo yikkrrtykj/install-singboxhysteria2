@@ -8,6 +8,11 @@ Everything here is derived mechanically from captured API responses:
   to a human meaning;
 * the user/attribution field is discovered by looking for a key whose value
   equals one of the configured probe user names;
+* direction verdicts follow a strict-evidence policy: each transfer must be
+  backed by its own curl evidence files (<label>-curl.json / .err / .rc) with
+  exit code 0, HTTP 200 and actually-moved bytes within tolerance of the
+  request. There is NO fallback to meta.payload_bytes -- that value is the
+  requested test size and may only be displayed, never used as evidence;
 * when no runtime snapshot is available every item reports
   "NOT TESTED / WAITING FOR RUNTIME DATA" instead of a verdict.
 
@@ -29,6 +34,9 @@ SYNTHETIC_BANNER = "SYNTHETIC FIXTURE OUTPUT - NOT RUNTIME DATA (validates deriv
 FIXTURE_MARKER = "_fixture"
 TOLERANCE = 0.85
 BIDIRECTIONAL_NOISE = 0.20
+# A direction verdict requires curl to have actually moved at least this share of
+# the requested bytes; anything at or below 90% must never produce VERIFIED.
+CURL_SIZE_FLOOR = 0.98
 
 STATUS_ORDER = ["FAILED", "NO", "INCONCLUSIVE", "PARTIAL", "VERIFIED", NOT_TESTED]
 
@@ -44,6 +52,16 @@ def load_json(path):
     except FileNotFoundError:
         return None, "missing"
     except Exception as exc:  # any unreadable snapshot is simply "no data"
+        return None, "unreadable: %s" % exc
+
+
+def read_text(path):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read(), None
+    except FileNotFoundError:
+        return None, "missing"
+    except Exception as exc:  # noqa: BLE001
         return None, "unreadable: %s" % exc
 
 
@@ -82,6 +100,97 @@ def conn_flat(conn):
         else:
             flat[key] = value
     return flat
+
+
+class CurlTransfer:
+    """Strict, machine-checked evidence for one curl transfer.
+
+    Three files must back a transfer before any verdict may use its bytes:
+
+    * ``<label>-curl.json`` -- the machine-readable ``curl -w`` result carrying
+      ``requested_bytes`` / ``bytes_downloaded`` / ``bytes_uploaded`` / ``http_code``;
+    * ``<label>-curl.err`` -- curl's stderr, kept separate so it can never corrupt
+      the JSON;
+    * ``<label>-curl.rc``  -- curl's exit code.
+
+    A transfer is ``ok`` only when exit code == 0, HTTP code == 200 and the
+    actually-transferred bytes are within tolerance of the requested bytes.
+    ``meta.payload_bytes`` is NEVER a fallback here: it only states what size the
+    test *asked* for and may at most be displayed as the expected size.
+    """
+
+    def __init__(self, label, edir, fixture_mode=False):
+        self.label = label
+        self.json_path = os.path.join(edir, "%s-curl.json" % label)
+        self.err_path = os.path.join(edir, "%s-curl.err" % label)
+        self.rc_path = os.path.join(edir, "%s-curl.rc" % label)
+        self.exit_code = None
+        self.http_code = None
+        self.requested = None
+        self.actual = None
+        self.byte_field = None
+        self.reasons = []
+        self._load(fixture_mode)
+
+    def _load(self, fixture_mode):
+        rc_text, rc_error = read_text(self.rc_path)
+        rc_stripped = rc_text.strip() if rc_text is not None else ""
+        if rc_error is None and rc_stripped.isdigit():
+            self.exit_code = int(rc_stripped)
+            if self.exit_code != 0:
+                self.reasons.append("curl exit code=%d (要求 0)" % self.exit_code)
+        else:
+            self.reasons.append("curl exit code 证据缺失或不可读 (%s-curl.rc %s)"
+                                % (self.label, rc_error or "not an integer"))
+        raw, error = load_json(self.json_path)
+        if error is not None or not isinstance(raw, dict):
+            self.reasons.append("curl JSON 不可解析 (%s-curl.json: %s)"
+                                % (self.label, error or "not an object"))
+            return
+        if is_fixture(raw) and not fixture_mode:
+            self.reasons.append("合成 curl fixture 已忽略（未开启 --fixture-mode）")
+            return
+        http = raw.get("http_code")
+        self.http_code = float(http) if numeric(http) else None
+        if self.http_code != 200:
+            self.reasons.append("HTTP code=%s (要求 200)" % http)
+        req = raw.get("requested_bytes")
+        self.requested = float(req) if numeric(req) and req > 0 else None
+        for key in ("bytes_downloaded", "bytes_uploaded"):
+            value = raw.get(key)
+            if numeric(value) and value > 0:
+                self.actual = float(value)
+                self.byte_field = key
+                break
+        if self.actual is None:
+            self.reasons.append("curl 未报告实际传输字节 (size_download/size_upload)")
+        elif self.requested is None:
+            self.reasons.append("curl 未报告 requested_bytes，无法核对实际传输量")
+        elif self.actual < self.requested * CURL_SIZE_FLOOR:
+            self.reasons.append("实际传输 %.0fB 明显小于请求 %.0fB（仅 %.1f%%，要求 >= %.0f%%）"
+                                % (self.actual, self.requested,
+                                   100.0 * self.actual / self.requested,
+                                   100.0 * CURL_SIZE_FLOOR))
+
+    @property
+    def ok(self):
+        return not self.reasons
+
+    def files(self):
+        return sorted(os.path.basename(p) for p in (self.json_path, self.err_path, self.rc_path))
+
+    def as_dict(self):
+        return {
+            "label": self.label,
+            "ok": self.ok,
+            "exit_code": self.exit_code,
+            "http_code": self.http_code,
+            "requested_bytes": self.requested,
+            "actual_bytes": self.actual,
+            "byte_field": self.byte_field,
+            "reasons": list(self.reasons),
+            "files": self.files(),
+        }
 
 
 class Snapshot:
@@ -291,6 +400,7 @@ class Analyzer:
             pass
         self.rows = []
         self.notes = []
+        self._curl_cache = {}
 
     def snap(self, label):
         return self.snaps[label + ".connections"]
@@ -326,15 +436,11 @@ class Analyzer:
         pool = [s for s in self.samples(proto, kind) if s.connections]
         return pool[-1] if pool else None
 
-    def curl_bytes(self, label):
-        """Bytes curl reports having transferred, from the -w JSON it wrote."""
-        raw, error = load_json(os.path.join(self.edir, "%s-curl.txt" % label))
-        if not isinstance(raw, dict):
-            return None, error or "unreadable"
-        for key in ("bytes_downloaded", "bytes_uploaded"):
-            if isinstance(raw.get(key), (int, float)) and raw[key] > 0:
-                return float(raw[key]), key
-        return None, "no byte count reported"
+    def curl_transfer(self, label):
+        """Strict evidence for one transfer, read once and cached."""
+        if label not in self._curl_cache:
+            self._curl_cache[label] = CurlTransfer(label, self.edir, self.fixture_mode)
+        return self._curl_cache[label]
 
     def any_fixture(self):
         return [s.label for s in self.snaps.values() if s.fixture]
@@ -504,10 +610,11 @@ class Analyzer:
                                  self.evidence_names([ab_peak, dl_peak])))
 
         # --- direction ---------------------------------------------------------
-        # Byte math uses only samples taken while the transfer ran (plus the brief
-        # tail while its connections were still visible). The post-transfer snapshot
-        # is deliberately excluded: the API may drop the connection and with it the
-        # per-connection counters, which would turn a real measurement into noise.
+        # Strict-evidence mode. A VERIFIED/PARTIAL verdict is only allowed when BOTH
+        # transfers are backed by complete curl evidence (exit code 0, HTTP 200 and
+        # actually-moved bytes within tolerance of the request) AND in-transfer
+        # connection sampling exists. meta.payload_bytes is display-only here: it is
+        # the requested test size and NEVER substitutes for measured bytes.
         if not dl_pre.usable or not dl_samples:
             self.rows.append(Row("%s.direction" % proto, NOT_TESTED,
                                  "缺少客户端下载期间的活动采样（pre=%s, samples=%d）"
@@ -517,64 +624,76 @@ class Analyzer:
                                  "缺少客户端上传期间的活动采样（pre=%s, samples=%d）"
                                  % (ul_pre.why_unusable(), len(ul_samples))))
         else:
-            dl_delta = max_counter_deltas(dl_pre, dl_samples)
-            ul_delta = max_counter_deltas(ul_pre, ul_samples)
-            exp_dl, src_dl = self.curl_bytes("%s-dl" % proto)
-            exp_ul, src_ul = self.curl_bytes("%s-ul" % proto)
-            if exp_dl is None:
-                exp_dl, src_dl = float(self.payload), "fallback meta.payload_bytes (%s)" % src_dl
+            dl_evi = self.curl_transfer("%s-dl" % proto)
+            ul_evi = self.curl_transfer("%s-ul" % proto)
+            curl_extra = {"meta_payload_bytes_display": self.payload,
+                          "meta_payload_bytes_role": "期望测试大小（仅显示），不作为传输证据",
+                          "download_curl": dl_evi.as_dict(),
+                          "upload_curl": ul_evi.as_dict()}
+            if not dl_evi.ok or not ul_evi.ok:
+                self.rows.append(Row(
+                    "%s.direction" % proto, "INCONCLUSIVE",
+                    "INCONCLUSIVE - download: %s；upload: %s"
+                    "（不回退到 meta.payload_bytes；严格证据条件: curl exit code=0、"
+                    "HTTP 200、实测字节≈requested_bytes 三者缺一不可）"
+                    % ("；".join(dl_evi.reasons) or "证据完整",
+                       "；".join(ul_evi.reasons) or "证据完整"),
+                    dl_evi.files() + ul_evi.files()
+                    + self.evidence_names(dl_samples + ul_samples),
+                    curl_extra))
             else:
-                src_dl = "curl %s" % src_dl
-            if exp_ul is None:
-                exp_ul, src_ul = float(self.payload), "fallback meta.payload_bytes (%s)" % src_ul
-            else:
-                src_ul = "curl %s" % src_ul
-            recv_key, recv_val, recv_ok = magnitude_match(dl_delta, exp_dl)
-            send_key, send_val, send_ok = magnitude_match(ul_delta, exp_ul)
-            # Reverse-direction noise = the counter family that the upload test
-            # identified as client->server grew during the client-download test.
-            reverse_seen = max((dl_delta.get(k, 0.0) for k in family_keys(dl_delta, send_key)),
-                               default=0.0)
-            extra = {"download_test_deltas": dl_delta, "upload_test_deltas": ul_delta,
-                     "download_samples": len(dl_samples), "upload_samples": len(ul_samples),
-                     "expected_download_bytes": exp_dl, "expected_upload_bytes": exp_ul,
-                     "expected_basis": {"download": src_dl, "upload": src_ul}}
-            if not recv_ok or not send_ok:
-                self.rows.append(Row("%s.direction" % proto, "INCONCLUSIVE",
-                                     "INCONCLUSIVE - 未找到与实测流量匹配的计数器增量；"
-                                     "下载 %.0fB 期间最大增长 %s=%s，上传 %.0fB 期间最大增长 %s=%s"
-                                     % (exp_dl, recv_key, recv_val, exp_ul, send_key, send_val),
-                                     self.evidence_names(dl_samples + ul_samples),
-                                     extra))
-            elif recv_key == send_key:
-                self.rows.append(Row("%s.direction" % proto, "INCONCLUSIVE",
-                                     "INCONCLUSIVE - 同一個计数器 %s 在两个方向都增长，无法归因方向" % recv_key,
-                                     self.evidence_names(dl_samples + ul_samples), extra))
-            else:
-                lines = [
-                    "客户端下载 %.0fB（基准=%s，%d 个活动采样）期间 %s 峰值增长 %.0f"
-                    " -> 语义=客户端下行(服务器->客户端)" % (exp_dl, src_dl, len(dl_samples), recv_key, recv_val),
-                    "客户端上传 %.0fB（基准=%s，%d 个活动采样）期间 %s 峰值增长 %.0f"
-                    " -> 语义=客户端上行(客户端->服务器)" % (exp_ul, src_ul, len(ul_samples), send_key, send_val),
-                ]
-                perspective = name_perspective(recv_key)
-                if perspective == "downish":
-                    lines.append("字段命名与客户端视角一致: 下行计数器名为 %s" % recv_key)
-                    status = "VERIFIED"
-                elif perspective == "upish":
-                    lines.append("字段命名与客户端视角相反: 下行计数器名为 %s（upload/sent 类）"
-                                 "-> 渲染时必须对调" % recv_key)
-                    status = "VERIFIED"
+                dl_delta = max_counter_deltas(dl_pre, dl_samples)
+                ul_delta = max_counter_deltas(ul_pre, ul_samples)
+                exp_dl, src_dl = dl_evi.actual, "curl %s" % dl_evi.byte_field
+                exp_ul, src_ul = ul_evi.actual, "curl %s" % ul_evi.byte_field
+                recv_key, recv_val, recv_ok = magnitude_match(dl_delta, exp_dl)
+                send_key, send_val, send_ok = magnitude_match(ul_delta, exp_ul)
+                # Reverse-direction noise = the counter family that the upload test
+                # identified as client->server grew during the client-download test.
+                reverse_seen = max((dl_delta.get(k, 0.0) for k in family_keys(dl_delta, send_key)),
+                                   default=0.0)
+                extra = dict(curl_extra)
+                extra.update({"download_test_deltas": dl_delta, "upload_test_deltas": ul_delta,
+                              "download_samples": len(dl_samples), "upload_samples": len(ul_samples),
+                              "expected_download_bytes": exp_dl, "expected_upload_bytes": exp_ul,
+                              "expected_basis": {"download": src_dl, "upload": src_ul}})
+                if not recv_ok or not send_ok:
+                    self.rows.append(Row("%s.direction" % proto, "INCONCLUSIVE",
+                                         "INCONCLUSIVE - 未找到与实测流量匹配的计数器增量；"
+                                         "下载 %.0fB 期间最大增长 %s=%s，上传 %.0fB 期间最大增长 %s=%s"
+                                         % (exp_dl, recv_key, recv_val, exp_ul, send_key, send_val),
+                                         self.evidence_names(dl_samples + ul_samples),
+                                         extra))
+                elif recv_key == send_key:
+                    self.rows.append(Row("%s.direction" % proto, "INCONCLUSIVE",
+                                         "INCONCLUSIVE - 同一個计数器 %s 在两个方向都增长，无法归因方向" % recv_key,
+                                         self.evidence_names(dl_samples + ul_samples), extra))
                 else:
-                    lines.append("字段命名无法判断视角（%s），方向语义以上面的实测增量结论为准" % recv_key)
-                    status = "PARTIAL"
-                if reverse_seen >= exp_dl * BIDIRECTIONAL_NOISE:
-                    lines.append("注意: 反向计数器 %s 族同时增长 %.0f，测试可能不是单向的"
-                                 % (counter_family(send_key), reverse_seen))
-                    status = "PARTIAL"
-                self.rows.append(Row("%s.direction" % proto, status, " | ".join(lines),
-                                     self.evidence_names([dl_pre] + dl_samples + [ul_pre] + ul_samples),
-                                     extra))
+                    lines = [
+                        "客户端下载 %.0fB（基准=%s，%d 个活动采样）期间 %s 峰值增长 %.0f"
+                        " -> 语义=客户端下行(服务器->客户端)" % (exp_dl, src_dl, len(dl_samples), recv_key, recv_val),
+                        "客户端上传 %.0fB（基准=%s，%d 个活动采样）期间 %s 峰值增长 %.0f"
+                        " -> 语义=客户端上行(客户端->服务器)" % (exp_ul, src_ul, len(ul_samples), send_key, send_val),
+                    ]
+                    perspective = name_perspective(recv_key)
+                    if perspective == "downish":
+                        lines.append("字段命名与客户端视角一致: 下行计数器名为 %s" % recv_key)
+                        status = "VERIFIED"
+                    elif perspective == "upish":
+                        lines.append("字段命名与客户端视角相反: 下行计数器名为 %s（upload/sent 类）"
+                                     "-> 渲染时必须对调" % recv_key)
+                        status = "VERIFIED"
+                    else:
+                        lines.append("字段命名无法判断视角（%s），方向语义以上面的实测增量结论为准" % recv_key)
+                        status = "PARTIAL"
+                    if reverse_seen >= exp_dl * BIDIRECTIONAL_NOISE:
+                        lines.append("注意: 反向计数器 %s 族同时增长 %.0f，测试可能不是单向的"
+                                     % (counter_family(send_key), reverse_seen))
+                        status = "PARTIAL"
+                    self.rows.append(Row("%s.direction" % proto, status, " | ".join(lines),
+                                         dl_evi.files() + ul_evi.files()
+                                         + self.evidence_names([dl_pre] + dl_samples + [ul_pre] + ul_samples),
+                                         extra))
 
         # --- connection granularity -------------------------------------------
         if not self.runtime_present(dl_samples + ab_samples):
@@ -622,6 +741,8 @@ class Analyzer:
 
         This is what makes the half-payload attribution test meaningful: probe-a and
         probe-b must each have moved half, and the direction tests the full size.
+        Only complete strict curl evidence counts (rc=0, HTTP 200, bytes parsed);
+        a transfer with failed evidence is reported, never silently accepted.
         """
         checks = []
         for proto in ("reality", "hy2"):
@@ -629,26 +750,30 @@ class Analyzer:
                                     ("%s-ul" % proto, self.payload),
                                     ("%s-ab-a" % proto, self.payload // 2),
                                     ("%s-ab-b" % proto, self.payload // 2)):
-                actual, source = self.curl_bytes(label)
-                checks.append((label, expected, actual, source))
-        present = [c for c in checks if c[2] is not None]
+                checks.append((label, expected, self.curl_transfer(label)))
+        present = [c for c in checks if c[2].actual is not None]
         if not present:
             self.rows.append(Row("payload.matches_request", NOT_TESTED,
-                                 "没有 curl 实测字节数（未运行传输，或 curl 输出不可解析）"))
+                                 "没有 curl 实测字节数（未运行传输，或 curl 证据不可用）"))
             return
-        detail = "; ".join("%s 请求 %d 实测 %.0f" % (l, e, a) for l, e, a, _ in present)
-        bad = [c for c in present if not (c[1] * 0.99 <= c[2] <= c[1] * 1.01)]
+        bad = [c for c in present
+               if not c[2].ok or not (c[1] * 0.99 <= c[2].actual <= c[1] * 1.01)]
         if bad:
             self.rows.append(Row("payload.matches_request", "NO",
-                                 "NO - 实际传输字节与请求不一致: %s"
-                                 % "; ".join("%s 请求 %d 实测 %.0f" % (l, e, a) for l, e, a, _ in bad)))
+                                 "NO - 实际传输字节与请求不一致或 curl 证据不完整: %s"
+                                 % "; ".join("%s: %s" % (l, "；".join(e.reasons) or
+                                                        "请求 %d 实测 %.0f" % (exp, e.actual))
+                                             for l, exp, e in bad)))
         elif len(present) < len(checks):
             self.rows.append(Row("payload.matches_request", "PARTIAL",
-                                 "部分传输缺少 curl 实测（%d/%d）: %s"
-                                 % (len(present), len(checks), detail)))
+                                 "部分传输缺少 curl 实测（%d/%d）"
+                                 % (len(present), len(checks))))
         else:
             self.rows.append(Row("payload.matches_request", "VERIFIED",
-                                 "全部传输实际字节与请求一致（含 probe-a/probe-b 各 half）: %s" % detail))
+                                 "全部传输 curl 证据完整（exit code=0、HTTP 200）且实际字节与请求一致"
+                                 "（含 probe-a/probe-b 各 half）: %s"
+                                 % "; ".join("%s 请求 %d 实测 %.0f" % (l, exp, e.actual)
+                                             for l, exp, e in present)))
 
     def run(self):
         self.global_rows()
@@ -665,6 +790,9 @@ class Analyzer:
             "本工具是开发/诊断工具，不属于 Monitor v2，不会被安装器自动安装到用户服务器。",
             "结论仅对本次采集时的 sing-box 版本与配置有效，版本见 api.version 与 00-production-before.txt。",
             "source IP 与 user 归因的最终判定需要外部客户端（不同公网出口 / 同一 NAT 后两个具名用户）。",
+            "TODO(enhancement, 不阻塞本机 Phase A): 外部测试时支持 expected source IP 参数，"
+            "并对 API 观测到的 sourceIP 做机械精确比对（API sourceIP == expected IP 才判 VERIFIED）；"
+            "当前 source_ip 行只区分回环/非回环，公网源 IP 的精确一致性验证留待外部测试阶段实现。",
         ]
 
     def summary_text(self):

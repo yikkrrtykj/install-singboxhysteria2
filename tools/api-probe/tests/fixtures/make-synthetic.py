@@ -77,9 +77,15 @@ def main():
 
     def curl(label, mode, requested):
         key = "bytes_downloaded" if mode == "download" else "bytes_uploaded"
-        write_json(os.path.join(out, "%s-curl.txt" % label),
+        write_json(os.path.join(out, "%s-curl.json" % label),
                    {"_fixture": MARK, "mode": mode, "requested_bytes": requested,
                     key: requested, "speed_bps": 4194304, "http_code": 200})
+        # Same three-file evidence contract as the runtime collector:
+        # machine-readable JSON + stderr + exit code, all persistent.
+        with open(os.path.join(out, "%s-curl.err" % label), "w", encoding="utf-8") as handle:
+            handle.write("")
+        with open(os.path.join(out, "%s-curl.rc" % label), "w", encoding="utf-8") as handle:
+            handle.write("0\n")
 
     for proto in ("reality", "hy2"):
         user = None if proto == "hy2" else "probe-a"

@@ -203,24 +203,29 @@ payload_file_for() {
 # The pid is published through XFER_LAST rather than stdout: a command substitution
 # would run in a subshell, so XFER_PIDS would not be updated and the EXIT trap could
 # leave curl processes behind.
+#
+# Every transfer persists THREE separate evidence files under $stem:
+#   $stem.json  machine-readable curl -w result (bytes actually moved, http_code)
+#   $stem.err   curl stderr (kept apart so it can never corrupt the JSON)
+#   $stem.rc    curl exit code, written by await_xfer once the process is reaped
 start_download() {
-  local socks=$1 bytes=$2 rate=$3 outfile=$4
+  local socks=$1 bytes=$2 rate=$3 stem=$4
   curl -sS -o /dev/null -w '{"mode":"download","requested_bytes":'"$bytes"',"bytes_downloaded":%{size_download},"speed_bps":%{speed_download},"http_code":%{http_code}}\n' \
     --limit-rate "$rate" --max-time "$TRANSFER_MAX_TIME" \
-    -x "socks5h://127.0.0.1:$socks" "$(sink_url "$bytes")" > "$outfile" 2>&1 &
+    -x "socks5h://127.0.0.1:$socks" "$(sink_url "$bytes")" > "$stem.json" 2> "$stem.err" &
   XFER_LAST=$!
   XFER_PIDS+=("$XFER_LAST")
 }
 
 start_upload() {
-  local socks=$1 bytes=$2 rate=$3 outfile=$4
+  local socks=$1 bytes=$2 rate=$3 stem=$4
   local payload
   payload="$(payload_file_for "$bytes")" || { XFER_LAST=""; return 1; }
   curl -sS -o /dev/null -w '{"mode":"upload","requested_bytes":'"$bytes"',"bytes_uploaded":%{size_upload},"speed_bps":%{speed_download},"http_code":%{http_code}}\n' \
     --limit-rate "$rate" --max-time "$TRANSFER_MAX_TIME" \
     -H 'Content-Type: application/octet-stream' \
     --data-binary "@$payload" \
-    -x "socks5h://127.0.0.1:$socks" "$(sink_url "$bytes")" > "$outfile" 2>&1 &
+    -x "socks5h://127.0.0.1:$socks" "$(sink_url "$bytes")" > "$stem.json" 2> "$stem.err" &
   XFER_LAST=$!
   XFER_PIDS+=("$XFER_LAST")
 }
@@ -249,19 +254,19 @@ sample_transfer() {
 
 run_direction_test() {
   local proto=$1 kind=$2 socks=$3 bytes=$4 rate=$5
-  local prefix="$proto-$kind" outfile="$EVID_DIR/$proto-$kind-curl.txt" pid
+  local prefix="$proto-$kind" stem="$EVID_DIR/$prefix-curl" pid
   log "== $proto $kind: 已知 ${bytes}B 单向传输（连接存活期间周期采样）=="
   api_snapshot "$prefix-pre"
   case "$kind" in
-    dl) start_download "$socks" "$bytes" "$rate" "$outfile" ;;
-    ul) start_upload   "$socks" "$bytes" "$rate" "$outfile" ;;
+    dl) start_download "$socks" "$bytes" "$rate" "$stem" ;;
+    ul) start_upload   "$socks" "$bytes" "$rate" "$stem" ;;
     *)  die "未知传输类型: $kind" ;;
   esac
   pid=$XFER_LAST
   if [ -z "$pid" ]; then warn "$proto $kind 未能启动传输"; return 1; fi
   local samples
   samples="$(sample_transfer "$prefix" "$pid" "$(proto_tag "$proto")")"
-  await_xfer "$pid" "$proto $kind"
+  await_xfer "$pid" "$proto $kind" "$stem"
   # Only for the connection-close behaviour check, never for byte math.
   api_snapshot "$prefix-closed"
   log "$proto $kind 采样数: $samples"
@@ -272,16 +277,17 @@ run_attribution_test() {
   local half=$(( PAYLOAD_BYTES / 2 ))
   local half_rate=$(( TRANSFER_RATE / 2 ))
   local prefix="$proto-ab" pid pid2 samples
+  local stem_a="$EVID_DIR/$proto-ab-a-curl" stem_b="$EVID_DIR/$proto-ab-b-curl"
   log "== $proto: 归因测试（$USER_A / $USER_B 并发，各 ${half}B）=="
   api_snapshot "$prefix-pre"
-  start_download "$socks_a" "$half" "$half_rate" "$EVID_DIR/$proto-ab-a-curl.txt"
+  start_download "$socks_a" "$half" "$half_rate" "$stem_a"
   pid=$XFER_LAST
-  start_download "$socks_b" "$half" "$half_rate" "$EVID_DIR/$proto-ab-b-curl.txt"
+  start_download "$socks_b" "$half" "$half_rate" "$stem_b"
   pid2=$XFER_LAST
   if [ -z "$pid" ] || [ -z "$pid2" ]; then warn "$proto 归因传输未能启动"; return 1; fi
   samples="$(sample_transfer "$prefix" "$pid" "$(proto_tag "$proto")")"
-  await_xfer "$pid"  "$proto 归因 $USER_A"
-  await_xfer "$pid2" "$proto 归因 $USER_B"
+  await_xfer "$pid"  "$proto 归因 $USER_A" "$stem_a"
+  await_xfer "$pid2" "$proto 归因 $USER_B" "$stem_b"
   api_snapshot "$prefix-closed"
   log "$proto 归因采样数: $samples"
 }
@@ -293,13 +299,19 @@ run_protocol_tests() {
   run_attribution_test "$proto" "$socks_a" "$socks_b"
 }
 
-await_xfer() {
-  local pid=$1 what=$2
+await_xfer() { # await_xfer <pid> <what> <stem>
+  # Reaps the curl process and persists its exit code as the third evidence file.
+  # If the script dies before this runs, the .rc file is simply absent and the
+  # analyzer treats the transfer as unevidenced (never as a success).
+  local pid=$1 what=$2 stem=$3 rc=0
   if wait "$pid"; then
     ok "$what 完成"
   else
-    warn "$what 未正常结束（详见 evidence 中的 curl 输出）"
+    rc=$?
+    warn "$what 未正常结束（curl exit $rc，证据: $stem.err / $stem.rc）"
   fi
+  printf '%s\n' "$rc" > "$stem.rc"
+  return 0
 }
 
 # --------------------------------------------------------------- test matrix ---

@@ -116,7 +116,7 @@ bash phase-a-probe.sh cleanup
 2. 传输进行中按 `SAMPLE_INTERVAL`（默认 1 秒）持续采样 `-s01/-s02/...`；
 3. 传输进程结束后，**只要该 inbound 仍有连接可见就继续短采样**（0.25 秒间隔，最多 8 次），因此最后一个"连接仍存活"的采样带着接近最终值的计数器；
 4. 每个计数器取这些采样中的**峰值**，与 `-pre` 相减得到增量；
-5. **基准**取自 curl 的真实 `size_download` / `size_upload`（写在 `*-curl.txt` 里），而不是假设"4 秒传了多少"；缺失时才回退到 `meta.payload_bytes` 并在结论里注明。
+5. **基准**取自 curl 的真实 `size_download` / `size_upload`（写在 `*-curl.json` 里），而不是假设"4 秒传了多少"。**严格证据模式**：每次传输必须同时持有三类证据文件（`*-curl.json` / `*-curl.err` / `*-curl.rc`），且 curl exit code = 0、HTTP 200、实测字节与 `requested_bytes` 在允许误差内（实测低于请求的 98% 即拒绝），方向判定才允许给出 `VERIFIED` / `PARTIAL`；任一条件不满足时输出 `INCONCLUSIVE` / `NOT TESTED`，**绝不回退到 `meta.payload_bytes`**——该值只作为"期望测试大小"显示。
 
 传输结束后另有 `-closed` 快照，**仅用于连接关闭行为**，不参与任何字节计算。
 
@@ -138,10 +138,11 @@ bash phase-a-probe.sh cleanup
 ├── <proto>-dl-pre.connections.json              方向测试（下载）开始前
 ├── <proto>-dl-s01.connections.json ...          传输期间的活动采样（增量基线由此取峰值）
 ├── <proto>-dl-closed.connections.json           传输结束后（只用于连接关闭行为）
-├── <proto>-dl-curl.txt                           curl 实测 requested/actual 字节数
-├── <proto>-ul-*                                 上传方向测试（同上）
+├── <proto>-dl-curl.json                          curl -w 机器可读结果（requested/actual 字节数、http_code）
+├── <proto>-dl-curl.err / -dl-curl.rc             同一传输的 stderr 与 exit code（严格证据模式三件套）
+├── <proto>-ul-*                                 上传方向测试（同上，同样三件套）
 ├── <proto>-ab-pre / -s01.. / -closed            双用户并发归因测试
-├── <proto>-ab-a-curl.txt / -ab-b-curl.txt        两个用户各自的实测字节数（各 half）
+├── <proto>-ab-a-curl.* / -ab-b-curl.*           两个用户各自的 curl 证据三件套（各 half）
 ├── <label>.traffic.json / <label>.memory.json   /traffic、/memory 原始响应
 ├── <label>.keys.txt              该快照的 root / connection / 嵌套 keys 全量枚举
 ├── 90-production-after.txt       生产基线（复采样，用于证明未被改动）
@@ -163,7 +164,7 @@ bash phase-a-probe.sh cleanup
 - **upload / download 方向**：用**已知大小的单向流量**实测，基准是 curl 实测字节数。哪个计数器的**活跃期峰值增量**≈该字节数，它就是"朝客户端方向"的计数器；再据此给出
   `语义=客户端下行(服务器->客户端)` / `语义=客户端上行(客户端->服务器)`，并判断**字段命名与客户端视角一致还是相反**（相反时提示渲染必须对调）。
   两个方向如果命中同一个计数器，直接判 `INCONCLUSIVE`；如果上传测试识别出的计数器族在下载测试期间也明显增长，则提示"可能不是单向"。
-- **payload 一致性**：`payload.matches_request` 逐条比对 curl 实测字节数与请求字节数（含 `probe-a`/`probe-b` 各 half）。
+- **payload 一致性**：`payload.matches_request` 逐条比对 curl 实测字节数与请求字节数（含 `probe-a`/`probe-b` 各 half）；任一传输的 curl 证据不完整（rc 非 0 / HTTP 非 200 / JSON 不可解析）也会被判 `NO` 并列出原因，不会静默放行。
 - **inbound**：找一个取值等于该 inbound tag 的字段，同时兼容 `tag` 与 `type/tag` 两种形状。
 - **source IP**：找 IP 形态的取值，优先 `source` 前缀的键；只有回环地址时判 `PARTIAL` 并明确写出“公网源 IP 未验证”。
 - **连接粒度 / 关闭行为**：按 tag 过滤后统计活动采样里的连接数峰值；关闭行为用"最后一个活动采样"与 `-closed` 快照对比连接 id。
@@ -177,7 +178,8 @@ bash phase-a-probe.sh cleanup
 1. 两个 Reality 用户 UUID 必须不同（用 mock sing-box 真实跑一遍配置生成并比对 probe.json 与两个客户端配置）；
 2. 方向计算不得回退到 `-closed` 快照（fixture 的 `-closed` 计数器被故意清零：一旦回退就会判失败）；
 3. `prepare`(local) → `run --expose` 必须重新生成配置（manifest 不一致 + 配置被手工修改两种情况）；
-4. sink 必须按 `?bytes=` 精确传输、超上限返回 400，且 curl 实测字节数必须与请求一致（含 half）。
+4. sink 必须按 `?bytes=` 精确传输、超上限返回 400，且 curl 实测字节数必须与请求一致（含 half）；
+5. **方向判定的严格 curl 证据门槛**：完整成功传输 → `direction` 可以 `VERIFIED`；curl rc 非 0、HTTP 500、curl JSON 损坏/缺失、实际只传了请求量的 90% 或更少 → `direction` 必须是 `INCONCLUSIVE` / `NOT TESTED`，禁止任何回退。
 
 合成数据带 `_fixture` 标记，分析器在未加 `--fixture-mode` 时**一律忽略**它们。
 
@@ -206,6 +208,8 @@ bash phase-a-probe.sh cleanup
 
 测完在服务器上执行 `collect --label <场景名>`，再 `cleanup`。注意 `--expose` 期间这两个端口对外可达，测完请关闭安全组/防火墙放行。
 
+**TODO（enhancement，不阻塞本机 Phase A）**：外部测试时支持 `--expected-source-ip` 参数，由分析器对 API 观测到的 `sourceIP` 做**机械精确比对**（`API sourceIP == expected IP` 才判 `VERIFIED`）；当前 `source_ip` 行只区分回环/非回环，公网源 IP 的精确一致性验证留待外部测试阶段实现。
+
 ---
 
 ## 自检
@@ -217,7 +221,7 @@ bash tests/selftest.sh
 包含：`bash -n`、`python3 -m py_compile`、**guardrail lint**（断言脚本里不存在 `pkill`/`killall`、`systemctl <verb> ... sing-box`、
 `iptables`/`nft`/`ufw`、`rm -rf .../root/sbox`、`sed -i`、写生产路径）、`shellcheck -S warning`（若环境有 shellcheck），
 分析器在“空证据 / 合成证据 / 反向命名”三种输入下的行为，以及上面列出的四类回归测试。
-当前共 47 项检查（本机无 shellcheck 时为 42 项 + 1 skip）。
+当前共 59 项检查（本机无 shellcheck 时为 58 项 + 1 skip）。
 
 ---
 
@@ -241,6 +245,6 @@ bash tests/selftest.sh
 | `sing-box check` 失败 | 看 `evidence/05-probe-check.txt`；检查目标版本是否接受探针配置里的字段（如 `up_mbps`/`down_mbps`） |
 | Clash API 20 秒未就绪 | 看 `/root/sbox-probe/probe.log`；确认端口未被占用、secret 文件存在 |
 | 端口被占用 | 用 `--reality-port/--hy2-port/--clash-port/--sink-port` 换端口，或先 `cleanup` 残留探针 |
-| 连接数为 0 | 确认客户端 socks 已监听、sink 已启动；看 `*-curl.txt` 里的 `http_code` |
+| 连接数为 0 | 确认客户端 socks 已监听、sink 已启动；看 `*-curl.json` 里的 `http_code`、`*-curl.rc` 里的 exit code |
 | 报告里大量 `NOT TESTED` | 说明没有取到运行时数据（快照缺失/API 请求失败），按上面的条目排查后重跑 |
 | `status` 显示 `stale/foreign pid` | pidfile 与真实进程不一致（通常进程已退出），`cleanup` 会清理 pidfile |
