@@ -994,6 +994,152 @@ commit_server_config() { # commit_server_config <candidate> <description>
     info "上一份配置备份: $backup_path"
     return 0
 }
+client_name_exists() { # client_name_exists <name> [config] -> rc 0 if present in either inbound
+    local name="$1" cfg="${2:-$SB_SERVER_CONFIG}"
+    grep -qxF "$name" <(get_reality_client_names "$cfg") ||
+        grep -qxF "$name" <(get_hy2_client_names "$cfg")
+}
+
+# One-shot, key-preserving migration of the pre-Phase-C shared account:
+#   {"uuid": "AAAA", ...}  ->  {"name": "legacy", "uuid": "AAAA", ...}
+# Only fills in the missing name; never touches uuid/password/flow.
+# Idempotent: running it again on an already-migrated config is a no-op.
+migrate_legacy_clients() {
+    local cfg="$SB_SERVER_CONFIG" candidate r_unnamed h_unnamed
+    [ -f "$cfg" ] || { warning "服务端配置不存在: $cfg"; return 1; }
+    if ! jq empty "$cfg" >/dev/null 2>&1; then
+        warning "服务端配置不是合法 JSON: $cfg"
+        return 1
+    fi
+    r_unnamed="$(get_reality_client_names "$cfg" | grep -c '^$' || true)"
+    h_unnamed="$(get_hy2_client_names "$cfg" | grep -c '^$' || true)"
+    if [ "$r_unnamed" -eq 0 ] && [ "$h_unnamed" -eq 0 ]; then
+        info "所有用户都已具备 name，无需迁移"
+        return 0
+    fi
+    if [ "$r_unnamed" != "$h_unnamed" ]; then
+        warning "Reality 有 $r_unnamed 个无名用户，HY2 有 $h_unnamed 个，无法安全迁移；请先运行一致性检查"
+        return 1
+    fi
+    if [ "$r_unnamed" -gt 1 ]; then
+        warning "存在多个无名用户，无法确定哪一个是 legacy，已拒绝迁移"
+        return 1
+    fi
+    if grep -qxF "$RESERVED_CLIENT_NAME" <(get_reality_client_names "$cfg") ||
+       grep -qxF "$RESERVED_CLIENT_NAME" <(get_hy2_client_names "$cfg"); then
+        warning "配置中已存在名为 $RESERVED_CLIENT_NAME 的用户，拒绝迁移以避免覆盖"
+        return 1
+    fi
+
+    candidate="${cfg}.candidate.$$"
+    jq --arg legacy "$RESERVED_CLIENT_NAME" '
+      (.inbounds[] | select(.tag == "vless-in") | .users) |=
+        map(if has("name") then . else . + {"name": $legacy} end) |
+      (.inbounds[] | select(.tag == "hy2-in") | .users) |=
+        map(if has("name") then . else . + {"name": $legacy} end)
+    ' "$cfg" > "$candidate" || { warning "生成迁移 candidate 失败"; rm -f "$candidate"; return 1; }
+
+    with_client_lock commit_server_config "$candidate" "migrate unnamed user to legacy"
+}
+
+add_client() { # add_client <name> -> adds to BOTH inbounds atomically
+    local name="$1" candidate uuid password
+    if ! validate_client_name "$name"; then
+        warning "客户端名称非法: '$name'（允许: 字母/数字开头，仅字母数字._-，长度 1-32）"
+        return 1
+    fi
+    if [ "$name" = "$RESERVED_CLIENT_NAME" ]; then
+        warning "'$RESERVED_CLIENT_NAME' 是保留名称，不能通过添加客户端创建"
+        return 1
+    fi
+    [ -f "$SB_SERVER_CONFIG" ] || { warning "服务端配置不存在: $SB_SERVER_CONFIG"; return 1; }
+    if ! audit_client_consistency "$SB_SERVER_CONFIG" >/dev/null; then
+        warning "当前 Reality/HY2 用户集合不一致，先修复后再添加客户端（运行一致性检查）"
+        audit_client_consistency "$SB_SERVER_CONFIG"
+        return 1
+    fi
+    if client_name_exists "$name" "$SB_SERVER_CONFIG"; then
+        warning "客户端 '$name' 已存在（Reality 或 HY2），拒绝重复添加"
+        return 1
+    fi
+
+    if ! uuid="$("$SB_SING_BOX_BIN" generate uuid)" || [ -z "$uuid" ]; then
+        warning "生成 Reality UUID 失败"
+        return 1
+    fi
+    if ! password="$("$SB_SING_BOX_BIN" generate rand --hex 16)" || [ -z "$password" ]; then
+        warning "生成 Hysteria2 password 失败"
+        return 1
+    fi
+
+    candidate="${SB_SERVER_CONFIG}.candidate.$$"
+    jq --arg name "$name" --arg uuid "$uuid" --arg password "$password" '
+      (.inbounds[] | select(.tag == "vless-in") | .users) += [
+        {"name": $name, "uuid": $uuid, "flow": "xtls-rprx-vision"}
+      ] |
+      (.inbounds[] | select(.tag == "hy2-in") | .users) += [
+        {"name": $name, "password": $password}
+      ]
+    ' "$SB_SERVER_CONFIG" > "$candidate" || {
+        warning "生成 add candidate 失败"; rm -f "$candidate"; return 1
+    }
+
+    # Single transaction: Reality + HY2 appear together or not at all.
+    with_client_lock commit_server_config "$candidate" "add client $name" || return 1
+    info "客户端 '$name' 已同时添加到 Reality 与 HY2（UUID/password 已生成）"
+}
+
+delete_client() { # delete_client <name> -> removes from BOTH inbounds atomically
+    local name="$1" candidate r_found h_found confirm
+    if [ "$name" = "$RESERVED_CLIENT_NAME" ]; then
+        warning "'$RESERVED_CLIENT_NAME' 是保留名称，本版本禁止删除（legacy retirement 属于后续功能）"
+        return 1
+    fi
+    [ -n "$name" ] || { warning "客户端名称不能为空"; return 1; }
+    [ -f "$SB_SERVER_CONFIG" ] || { warning "服务端配置不存在: $SB_SERVER_CONFIG"; return 1; }
+    if ! audit_client_consistency "$SB_SERVER_CONFIG" >/dev/null; then
+        warning "当前 Reality/HY2 用户集合不一致，禁止破坏性操作（先运行一致性检查并修复）"
+        audit_client_consistency "$SB_SERVER_CONFIG"
+        return 1
+    fi
+
+    r_found="MISSING"; h_found="MISSING"
+    grep -qxF "$name" <(get_reality_client_names "$SB_SERVER_CONFIG") && r_found="FOUND"
+    grep -qxF "$name" <(get_hy2_client_names "$SB_SERVER_CONFIG") && h_found="FOUND"
+    info "准备删除客户端: $name"
+    info "Reality: $r_found"
+    info "HY2:     $h_found"
+    if [ "$r_found" != "FOUND" ] || [ "$h_found" != "FOUND" ]; then
+        warning "客户端 '$name' 未在两个协议中同时存在，拒绝删除（请先修复一致性）"
+        return 1
+    fi
+    read -r -p "确认删除 '$name'？此操作会同时移除 Reality 与 HY2 凭据 (y/n): " confirm
+    if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+        info "已取消删除 '$name'"
+        return 1
+    fi
+
+    candidate="${SB_SERVER_CONFIG}.candidate.$$"
+    jq --arg name "$name" '
+      (.inbounds[] | select(.tag == "vless-in") | .users) |=
+        map(select(.name != $name)) |
+      (.inbounds[] | select(.tag == "hy2-in") | .users) |=
+        map(select(.name != $name))
+    ' "$SB_SERVER_CONFIG" > "$candidate" || {
+        warning "生成 delete candidate 失败"; rm -f "$candidate"; return 1
+    }
+
+    with_client_lock commit_server_config "$candidate" "delete client $name" || {
+        warning "服务端修改失败，客户端配置目录 $SB_CLIENTS_DIR/$name 保持不变"
+        return 1
+    }
+    # Only after the server-side commit succeeded may the derived files go.
+    if [ -d "$SB_CLIENTS_DIR/$name" ]; then
+        rm -rf "$SB_CLIENTS_DIR/$name"
+        info "已删除派生客户端配置目录: $SB_CLIENTS_DIR/$name"
+    fi
+    info "客户端 '$name' 已从 Reality 与 HY2 同时删除"
+}
 # <<< phase-c client-management <<< ============================================
 
 NETWORK_SYSCTL_FILE="/etc/sysctl.d/99-sing-box-network.conf"
