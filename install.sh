@@ -790,6 +790,212 @@ EOF
 
 }
 
+# >>> phase-c client-management >>> ============================================
+# Phase C: multi-client identity management.
+#
+# Single source of truth remains /root/sbox/sbconfig_server.json (no clients.json).
+# Every logical client is ONE name present in BOTH inbounds:
+#   vless-in.users[] -> {"name": ..., "uuid": ..., "flow": "xtls-rprx-vision"}
+#   hy2-in.users[]   -> {"name": ..., "password": ...}
+# Hard rule: Reality name == HY2 name == device_id.
+# The name "legacy" is RESERVED: it labels the pre-Phase-C shared account,
+# is never created through "add client" and never deleted by this version.
+# Everything under /root/sbox/clients/ is DERIVED output; it can always be
+# regenerated from the server config.
+SB_SERVER_CONFIG="${SB_SERVER_CONFIG:-/root/sbox/sbconfig_server.json}"
+SB_STATE_FILE="${SB_STATE_FILE:-/root/sbox/config}"
+SB_CLIENTS_DIR="${SB_CLIENTS_DIR:-/root/sbox/clients}"
+SB_SING_BOX_BIN="${SB_SING_BOX_BIN:-/root/sbox/sing-box}"
+SB_LOCK_FILE="${SB_LOCK_FILE:-/root/sbox/config.lock}"
+RESERVED_CLIENT_NAME="legacy"
+CLIENT_NAME_PATTERN='^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$'
+REALITY_INBOUND_TAG="vless-in"
+HY2_INBOUND_TAG="hy2-in"
+REALITY_FLOW="xtls-rprx-vision"
+
+validate_client_name() { # validate_client_name <name> -> rc 0 if allowed
+    local name="$1"
+    [ -n "$name" ] || return 1
+    [[ "$name" =~ $CLIENT_NAME_PATTERN ]] || return 1
+    return 0
+}
+
+# Runs "$@" while holding the exclusive config lock (fd 9), so two management
+# operations can never mutate sbconfig_server.json concurrently.
+with_client_lock() {
+    if command -v flock >/dev/null 2>&1; then
+        if mkdir -p "$(dirname "$SB_LOCK_FILE")" 2>/dev/null &&
+           exec 9>>"$SB_LOCK_FILE" 2>/dev/null && flock 9 2>/dev/null; then
+            "$@"
+            local rc=$?
+            exec 9>&- 2>/dev/null
+            return $rc
+        fi
+        warning "无法获取配置锁 ($SB_LOCK_FILE)，单机低并发场景下继续执行"
+    fi
+    "$@"
+}
+
+get_reality_client_names() { # [config] -> one name per line ("" = unnamed user)
+    jq -r --arg tag "$REALITY_INBOUND_TAG" \
+        '.inbounds[] | select(.tag == $tag) | .users[]? | (.name // "")' \
+        "${1:-$SB_SERVER_CONFIG}" 2>/dev/null
+}
+
+get_hy2_client_names() { # [config] -> one name per line ("" = unnamed user)
+    jq -r --arg tag "$HY2_INBOUND_TAG" \
+        '.inbounds[] | select(.tag == $tag) | .users[]? | (.name // "")' \
+        "${1:-$SB_SERVER_CONFIG}" 2>/dev/null
+}
+
+# Structural consistency of a (candidate or live) server config. Compares name
+# SETS between the two inbounds -- equal counts alone can hide a mismatch --
+# plus emptiness, duplicates and per-protocol credential sanity.
+candidate_problems() { # candidate_problems <config> -> prints problem lines (empty = OK)
+    jq -r '
+      def usr(tag): ([.inbounds[] | select(.tag == tag) | (.users // [])] | first // []);
+      usr("vless-in") as $ru |
+      usr("hy2-in") as $hu |
+      ([ $ru[] | .name // "" ]) as $rn |
+      ([ $hu[] | .name // "" ]) as $hn |
+      ([ $ru[] | .uuid // "" ]) as $rid |
+      ([ $hu[] | .password // "" ]) as $hp |
+      ([ $ru[] | .flow // "" ]) as $rf |
+      ([]
+        + (if ($rn | index("")) != null then ["vless-in 存在没有 name 的用户"] else [] end)
+        + (if ($hn | index("")) != null then ["hy2-in 存在没有 name 的用户"] else [] end)
+        + (if ($rn | sort) == ($hn | sort) then [] else ["Reality 与 HY2 的 name 集合不一致"] end)
+        + (if ($rn | length) == ($rn | unique | length) then [] else ["vless-in 存在重复 name"] end)
+        + (if ($hn | length) == ($hn | unique | length) then [] else ["hy2-in 存在重复 name"] end)
+        + (if ($rid | index("")) != null then ["vless-in 存在没有 uuid 的用户"] else [] end)
+        + (if ($hp | index("")) != null then ["hy2-in 存在没有 password 的用户"] else [] end)
+        + (if ($rid | length) == ($rid | unique | length) then [] else ["vless-in 存在重复 uuid"] end)
+        + (if ($hp | length) == ($hp | unique | length) then [] else ["hy2-in 存在重复 password"] end)
+        + (if ($rf | all(. == "xtls-rprx-vision")) then [] else ["vless-in 存在 flow 不等于 xtls-rprx-vision 的用户"] end)
+      )[]
+    ' "$1" 2>/dev/null
+}
+
+audit_client_consistency() { # audit_client_consistency [config] -> table + rc
+    local cfg="${1:-$SB_SERVER_CONFIG}" problems rn hn union name r h p
+    if [ ! -f "$cfg" ]; then
+        warning "服务端配置不存在: $cfg"
+        return 1
+    fi
+    if ! jq empty "$cfg" >/dev/null 2>&1; then
+        warning "服务端配置不是合法 JSON: $cfg"
+        return 1
+    fi
+    problems="$(candidate_problems "$cfg")"
+    rn="$(get_reality_client_names "$cfg")"
+    hn="$(get_hy2_client_names "$cfg")"
+    printf '%-16s %-12s %s\n' "NAME" "REALITY" "HY2"
+    union="$(printf '%s\n%s\n' "$rn" "$hn" | sed '/^$/d' | sort -u)"
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        r="MISSING"; h="MISSING"
+        grep -qxF "$name" <<<"$rn" && r="OK"
+        grep -qxF "$name" <<<"$hn" && h="OK"
+        printf '%-16s %-12s %s\n' "$name" "$r" "$h"
+    done <<< "$union"
+    if [ -n "$problems" ]; then
+        warning "客户端一致性检查发现问题:"
+        while IFS= read -r p; do
+            [ -n "$p" ] && warning "  - $p"
+        done <<< "$problems"
+        return 1
+    fi
+    info "客户端一致性检查通过（Reality 与 HY2 的 name 集合完全一致）"
+    return 0
+}
+
+# Reload the running instance; succeeds trivially when nothing is running
+# (e.g. config-only change with the service stopped).
+reload_running_singbox() {
+    if systemctl is-active --quiet sing-box 2>/dev/null; then
+        systemctl reload sing-box
+    elif pgrep -x sing-box >/dev/null 2>&1; then
+        kill -HUP "$(pgrep -o -x sing-box)"
+    fi
+    return 0
+}
+
+# After a reload the previously running instance must still be alive.
+reload_health_ok() {
+    sleep 1
+    if systemctl is-active --quiet sing-box 2>/dev/null; then return 0; fi
+    pgrep -x sing-box >/dev/null 2>&1
+}
+
+# The ONLY path that mutates sbconfig_server.json:
+#   candidate -> structural audit -> sing-box check -> backup -> atomic mv
+#   -> reload -> health check; on any failure after the mv the previous config
+#   is restored and reloaded, so the disk state is never left half-migrated.
+commit_server_config() { # commit_server_config <candidate> <description>
+    local candidate="$1" description="${2:-server config update}"
+    local backup_path was_running problems rc
+    [ -f "$candidate" ] || { warning "candidate 不存在: $candidate"; return 1; }
+
+    problems="$(candidate_problems "$candidate")"
+    if [ -n "$problems" ]; then
+        warning "candidate 结构一致性检查失败（$description），正式配置未修改:"
+        while IFS= read -r p; do
+            [ -n "$p" ] && warning "  - $p"
+        done <<< "$problems"
+        rm -f "$candidate"
+        return 1
+    fi
+
+    if ! "$SB_SING_BOX_BIN" check -c "$candidate" >/dev/null 2>&1; then
+        warning "sing-box check 未通过（$description），正式配置未修改"
+        rm -f "$candidate"
+        return 1
+    fi
+
+    if systemctl is-active --quiet sing-box 2>/dev/null; then
+        was_running=systemd
+    elif pgrep -x sing-box >/dev/null 2>&1; then
+        was_running=manual
+    else
+        was_running=no
+    fi
+
+    backup_path="${SB_SERVER_CONFIG}.bak.$(date +%Y%m%d-%H%M%S)"
+    cp -a "$SB_SERVER_CONFIG" "$backup_path" || {
+        warning "备份正式配置失败（$description），正式配置未修改"
+        rm -f "$candidate"
+        return 1
+    }
+
+    if ! mv -f "$candidate" "$SB_SERVER_CONFIG"; then
+        warning "原子替换失败（$description），已保留备份: $backup_path"
+        rm -f "$candidate"
+        return 1
+    fi
+
+    if [ "$was_running" != "no" ]; then
+        if reload_running_singbox && reload_health_ok; then
+            info "配置已提交并重载成功: $description"
+            info "上一份配置备份: $backup_path"
+            return 0
+        fi
+        warning "reload 后健康检查失败（$description），自动回滚..."
+        cp -a "$backup_path" "$SB_SERVER_CONFIG"
+        reload_running_singbox
+        if reload_health_ok; then
+            warning "已回滚并重新加载上一份配置: $backup_path"
+        else
+            warning "已回滚配置文件，但服务未能恢复，请立即人工检查！备份: $backup_path"
+        fi
+        return 1
+    fi
+
+    info "配置已提交（当前无运行中的 sing-box 进程，跳过 reload）: $description"
+    info "上一份配置备份: $backup_path"
+    return 0
+}
+# <<< phase-c client-management <<< ============================================
+
 NETWORK_SYSCTL_FILE="/etc/sysctl.d/99-sing-box-network.conf"
 UDP_BUFFER_MIN_BYTES=16777216
 
@@ -1671,6 +1877,7 @@ cat > /root/sbox/sbconfig_server.json << EOF
       "listen_port": $reality_port,
       "users": [
         {
+          "name": "legacy",
           "uuid": "$reality_uuid",
           "flow": "xtls-rprx-vision"
         }
@@ -1698,6 +1905,7 @@ cat > /root/sbox/sbconfig_server.json << EOF
         "down_mbps": 1000,
         "users": [
             {
+                "name": "legacy",
                 "password": "$hy_password"
             }
         ],
