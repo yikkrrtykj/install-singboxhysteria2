@@ -264,6 +264,9 @@ assert_grep ' upgrade$' "$FIX_RELEASES/releases.history" "upgrade recorded in hi
 # ---------------------------------------------------------------------------
 section "T04 failed upgrade (invalid staged code) leaves production untouched"
 LIVE_BEFORE_T04="$(readlink "$FIX_APP_LINK")"
+# Staging (and therefore validation) only runs when the version differs;
+# a broken candidate must ship as a new version to be exercised.
+printf '0.2.1\n' > "$FIX_SRC/VERSION"
 printf 'def broken(:\n' > "$FIX_SRC/collector.py"
 OUT4="$TMP/out-t04.log"
 run_install "$OUT4"
