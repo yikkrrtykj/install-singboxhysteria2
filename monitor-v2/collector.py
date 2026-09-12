@@ -65,6 +65,11 @@ DEFAULT_INTERVAL = 2.0
 DEFAULT_CLOSED_TTL = 600.0  # keep finalized ids ~10 minutes
 RECENT_SOURCES_MAX = 10
 RECENT_CONNECTIONS_MAX = 20
+# Per-connection rows exposed in the top-level snapshot "connections" list
+# (read-only view consumed by the Phase E2 dashboard). Active lifecycles are
+# always included; the RECENT half is capped so a busy server cannot bloat
+# every 1-second snapshot push.
+CONNECTIONS_RECENT_MAX = 200
 SECRET_ENV = "BOX_API_SECRET"
 
 STATUS_ACTIVE = "ACTIVE"
@@ -120,6 +125,36 @@ def _new_connection(fields, now):
         "uplink_total": float(fields.get("uplink_total", 0)),
         "downlink_total": float(fields.get("downlink_total", 0)),
         "last_seen": now,
+    }
+
+
+def _iso_or_none(timestamp):
+    value = _to_seconds(timestamp)
+    return _iso(value) if value else None
+
+
+def _connection_row(conn, state):
+    """One flat per-connection row for the snapshot "connections" list.
+
+    Pure projection of an internal lifecycle: no recomputation, no second
+    accumulator -- USER / INBOUND / ID / totals / state all come from the
+    tracker's own lifecycle records.
+    """
+    return {
+        "id": conn["id"],
+        "user": conn["user"],
+        "inbound": conn["inbound"],
+        "inbound_type": conn.get("inbound_type", ""),
+        "network": conn.get("network", ""),
+        "source": conn.get("source", ""),
+        "destination": conn.get("destination", ""),
+        "created_at": _iso_or_none(conn.get("created_at")),
+        "closed_at": _iso_or_none(conn.get("closed_at")),
+        "uplink_rate": round(conn.get("uplink_rate", 0.0), 3),
+        "downlink_rate": round(conn.get("downlink_rate", 0.0), 3),
+        "uplink_total": round(conn.get("uplink_total", 0.0), 3),
+        "downlink_total": round(conn.get("downlink_total", 0.0), 3),
+        "state": state,
     }
 
 
@@ -547,6 +582,18 @@ class Tracker:
                 ],
             }
 
+        # Flat per-connection view for the Connections page: every ACTIVE
+        # lifecycle plus the most recent RECENT rows (capped). Rows are pure
+        # projections of the lifecycles above -- the dashboard never re-derives
+        # traffic from them.
+        connection_rows = [_connection_row(conn, STATUS_ACTIVE)
+                           for conn in self.active.values()]
+        for conn in sorted(self.closed.values(),
+                           key=lambda c: c["closed_at"],
+                           reverse=True)[:CONNECTIONS_RECENT_MAX]:
+            connection_rows.append(_connection_row(conn, STATUS_RECENT))
+        connection_rows.sort(key=lambda row: row["created_at"] or "", reverse=True)
+
         return {
             "batch_count": self.batch_count,
             "skipped_events": self.skipped_events,
@@ -555,6 +602,7 @@ class Tracker:
             "abandoned_on_reset": self.abandoned_on_reset,
             "active_connections": len(self.active),
             "recently_closed": len(self.closed),
+            "connections": connection_rows,
             "devices": devices,
         }
 
