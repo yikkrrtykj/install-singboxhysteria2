@@ -1,0 +1,11 @@
+{
+  "reset": false,
+  "events": [
+    {
+      "type": "UPDATE",
+      "id": "r1",
+      "uplink_delta": 300,
+      "downlink_delta": 700
+    }
+  ]
+}

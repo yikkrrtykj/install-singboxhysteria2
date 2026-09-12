@@ -1,0 +1,54 @@
+{
+  "reset": true,
+  "events": [
+    {
+      "type": "NEW",
+      "id": "r1",
+      "connection": {
+        "id": "r1",
+        "user": "vmix-01",
+        "inbound": "vless-in",
+        "inbound_type": "vless",
+        "network": "tcp",
+        "source": "203.0.113.9:51000",
+        "destination": "example.com:443",
+        "created_at": 1757000000000,
+        "uplink_total": 1000,
+        "downlink_total": 2000
+      }
+    },
+    {
+      "type": "NEW",
+      "id": "h1",
+      "connection": {
+        "id": "h1",
+        "user": "vmix-01",
+        "inbound": "hy2-in",
+        "inbound_type": "hysteria2",
+        "network": "udp",
+        "source": "203.0.113.9:51001",
+        "destination": "example.com:443",
+        "created_at": 1757000001000,
+        "uplink_total": 5,
+        "downlink_total": 10
+      }
+    },
+    {
+      "type": "NEW",
+      "id": "c9",
+      "connection": {
+        "id": "c9",
+        "user": "legacy",
+        "inbound": "hy2-in",
+        "inbound_type": "hysteria2",
+        "network": "udp",
+        "source": "203.0.113.7:51002",
+        "destination": "example.com:443",
+        "created_at": 1756999000000,
+        "closed_at": 1000,
+        "uplink_total": 500,
+        "downlink_total": 700
+      }
+    }
+  ]
+}

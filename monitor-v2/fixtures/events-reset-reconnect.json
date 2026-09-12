@@ -1,0 +1,21 @@
+{
+  "reset": true,
+  "events": [
+    {
+      "type": "NEW",
+      "id": "r1",
+      "connection": {
+        "id": "r1",
+        "user": "vmix-01",
+        "inbound": "vless-in",
+        "inbound_type": "vless",
+        "network": "tcp",
+        "source": "203.0.113.9:51000",
+        "destination": "example.com:443",
+        "created_at": 1757000000000,
+        "uplink_total": 3000,
+        "downlink_total": 4000
+      }
+    }
+  ]
+}
