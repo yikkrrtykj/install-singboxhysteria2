@@ -697,20 +697,37 @@ validate_client_name() { # validate_client_name <name> -> rc 0 if allowed
     return 0
 }
 
+# Seconds to wait for the exclusive config lock before aborting. Web/E3 helpers
+# MUST run with a finite timeout; the CLI default stays generous.
+SB_LOCK_TIMEOUT="${SB_LOCK_TIMEOUT:-15}"
+
 # Runs "$@" while holding the exclusive config lock (fd 9), so two management
 # operations can never mutate sbconfig_server.json concurrently.
+# FAIL-CLOSED: a missing flock binary, an unopenable lock file, an acquire
+# error or a timeout each abort WITHOUT ever running "$@" -- no candidate, no
+# backup, no config mutation and no reload is attempted unlocked.
 with_client_lock() {
-    if command -v flock >/dev/null 2>&1; then
-        if mkdir -p "$(dirname "$SB_LOCK_FILE")" 2>/dev/null &&
-           exec 9>>"$SB_LOCK_FILE" 2>/dev/null && flock 9 2>/dev/null; then
-            "$@"
-            local rc=$?
-            exec 9>&- 2>/dev/null
-            return $rc
-        fi
-        warning "无法获取配置锁 ($SB_LOCK_FILE)，单机低并发场景下继续执行"
+    if ! command -v flock >/dev/null 2>&1; then
+        warning "flock 不可用，无法安全地序列化配置修改，操作已中止（fail-closed）"
+        return 1
+    fi
+    if ! mkdir -p "$(dirname "$SB_LOCK_FILE")" 2>/dev/null; then
+        warning "无法创建锁目录 $(dirname "$SB_LOCK_FILE")，操作已中止（fail-closed）"
+        return 1
+    fi
+    if ! exec 9>>"$SB_LOCK_FILE" 2>/dev/null; then
+        warning "无法打开配置锁文件 $SB_LOCK_FILE，操作已中止（fail-closed）"
+        return 1
+    fi
+    if ! flock -w "$SB_LOCK_TIMEOUT" 9 2>/dev/null; then
+        warning "配置锁 $SB_LOCK_FILE 获取失败或超时（${SB_LOCK_TIMEOUT}s），操作已中止（fail-closed）"
+        exec 9>&- 2>/dev/null
+        return 1
     fi
     "$@"
+    local rc=$?
+    exec 9>&- 2>/dev/null
+    return $rc
 }
 
 get_reality_client_names() { # [config] -> one name per line ("" = unnamed user)
