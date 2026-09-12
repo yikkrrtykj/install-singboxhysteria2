@@ -22,7 +22,7 @@ PASS=0
 FAIL=0
 # The gate at the bottom of this file fails unless exactly this many
 # assertions ran AND passed, so unreachable sections can never fake success.
-EXPECTED_PASS=101
+EXPECTED_PASS=158
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
@@ -609,6 +609,248 @@ assert_eq "$(snap_field "$snap" 'snap["stale"]')" "False" "idle silence does NOT
 assert_eq "$(snap_field "$snap" 'snap["last_error"]')" "None" "idle silence records no error"
 assert_eq "$(snap_field "$snap" 'snap["devices"]["legacy"]["protocols"]["vless-in"]["uplink_total"]')" "42.0" "reset batch decoded through the idle window"
 assert_eq "$(snap_field "$snap" 'snap["batch_count"]')" "1" "idle heartbeats do not count as stream batches"
+
+# ---------------------------------------------------------------------------
+# G: integration canary gate (tests/monitor-v2-integration-e1.sh)
+#
+# The VPS canary must never fake a green run: INCONCLUSIVE is its own exit
+# code (2), EXPECT_USER / REQUIRE_CLOSED / EXPECT_INBOUND are hard gates, and
+# ALL evidence is a baseline -> final delta -- the service.api reset replay
+# makes bare recently_closed>0 and cumulative totals worthless. The verdict
+# logic lives in monitor-v2/lifecycle_gate.py so it is verified here with
+# synthetic snapshots instead of waiting for a VPS.
+
+GATE="$ROOT/monitor-v2/lifecycle_gate.py"
+INTEG="$ROOT/tests/monitor-v2-integration-e1.sh"
+
+section "G1: integration gate -- static contract"
+if bash -n "$INTEG" 2>"$TMP/bashn.err"; then
+    pass "integration script parses (bash -n)"
+else
+    fail "bash -n integration: $(cat "$TMP/bashn.err")"
+fi
+INTEG_SRC="$(cat "$INTEG")"
+GATE_SRC="$(cat "$GATE")"
+assert_contains "EXIT_PASS=0" "$INTEG_SRC" "integration declares EXIT_PASS=0"
+assert_contains "EXIT_FAIL=1" "$INTEG_SRC" "integration declares EXIT_FAIL=1"
+assert_contains "EXIT_INCONCLUSIVE=2" "$INTEG_SRC" "integration declares EXIT_INCONCLUSIVE=2"
+assert_contains "REQUIRE_CLOSED" "$INTEG_SRC" "integration wires REQUIRE_CLOSED"
+assert_contains "EXPECT_USER" "$INTEG_SRC" "integration wires EXPECT_USER"
+assert_contains "EXPECT_INBOUND" "$INTEG_SRC" "integration wires EXPECT_INBOUND"
+assert_contains "configuration error" "$INTEG_SRC" "invalid gate config is a configuration error"
+assert_contains "baseline.json" "$INTEG_SRC" "integration captures a pre-window baseline"
+assert_contains "lifecycle_gate.py" "$INTEG_SRC" "integration delegates verdicts to the gate evaluator"
+assert_contains "no CLOSED/finalize evidence observed" "$INTEG_SRC" "integration carries the CLOSED fail reason"
+assert_contains "recent_connections" "$GATE_SRC" "gate uses recent_connections ids (closed-id delta)"
+assert_contains "uplink_total" "$GATE_SRC" "gate compares uplink totals (traffic delta)"
+assert_contains "downlink_total" "$GATE_SRC" "gate compares downlink totals (traffic delta)"
+assert_contains "EXIT_INCONCLUSIVE = 2" "$GATE_SRC" "gate evaluator declares the three-state contract"
+assert_contains "expected USER was not observed" "$GATE_SRC" "gate hard-fails on a missing EXPECT_USER"
+if "$PY" -m py_compile "$GATE" 2>>"$TMP/py.err"; then
+    pass "py_compile lifecycle_gate.py"
+else
+    fail "py_compile lifecycle_gate.py: $(cat "$TMP/py.err")"
+fi
+
+section "G2: gate evaluator -- synthetic baseline/final verdicts (cases A-K)"
+snap="$(PYTHONPATH="$ROOT/monitor-v2" "$PY" -c '
+import json
+from lifecycle_gate import (ConfigurationError, evaluate,
+                            parse_expect_inbound, parse_require_closed)
+
+def device(up, down, protos=("vless-in",), recent=(), active=0):
+    status = "ACTIVE" if active else ("RECENT ACTIVITY" if recent else "IDLE")
+    return {
+        "status": status,
+        "protocols": {p: {"uplink_total": float(up), "downlink_total": float(down)}
+                      for p in protos},
+        "active_connections": active,
+        "uplink_total": float(up), "downlink_total": float(down),
+        "recent_sources": ["203.0.113.9:51000"] if recent else [],
+        "recent_connections": [
+            {"id": cid, "inbound": "vless-in", "source": "203.0.113.9:51000",
+             "uplink_total": 0.0, "downlink_total": 0.0} for cid in recent],
+    }
+
+def snap(devices=(), stale=False):
+    return {
+        "stale": stale, "last_error": None, "batch_count": 1,
+        "active_connections": sum(d[1]["active_connections"] for d in devices),
+        "recently_closed": sum(len(d[1]["recent_connections"]) for d in devices),
+        "devices": {name: dev for name, dev in devices},
+    }
+
+out = {}
+empty = snap()
+legacy_base = snap([("legacy", device(100, 50, recent=("old1",)))])
+
+# case A: no traffic at all, no EXPECT_USER -> INCONCLUSIVE (exit 2)
+r = evaluate(empty, snap(), "", "", False)
+out["A_verdict"] = r["verdict"]; out["A_exit"] = r["exit"]
+
+# case A2: devices present but pure historical replay -> INCONCLUSIVE
+r = evaluate(legacy_base, snap([("legacy", device(100, 50, recent=("old1",)))]),
+             "", "", False)
+out["A2_verdict"] = r["verdict"]
+
+# case B: EXPECT_USER=legacy, devices empty -> FAIL (never INCONCLUSIVE)
+r = evaluate(empty, snap(), "legacy", "", False)
+out["B_verdict"] = r["verdict"]; out["B_reason"] = r["reason"]
+
+# case B2: EXPECT_USER set, other devices seen, legacy missing -> FAIL
+r = evaluate(empty, snap([("vmix-01", device(10, 5))]), "legacy", "", False)
+out["B2_verdict"] = r["verdict"]
+
+# case C: legacy gains traffic, REQUIRE_CLOSED=0 -> PASS (exit 0)
+r = evaluate(legacy_base,
+             snap([("legacy", device(250, 80, recent=("old1",), active=1))]),
+             "legacy", "", False)
+out["C_verdict"] = r["verdict"]; out["C_exit"] = r["exit"]
+
+# case C2: only downlink moves -> the traffic delta still counts
+r = evaluate(snap([("legacy", device(100, 50))]),
+             snap([("legacy", device(100, 55, active=1))]), "legacy", "", False)
+out["C2_verdict"] = r["verdict"]
+
+# case D: traffic moved but REQUIRE_CLOSED=1 and no new closed id -> FAIL
+r = evaluate(legacy_base,
+             snap([("legacy", device(250, 80, recent=("old1",), active=1))]),
+             "legacy", "", True)
+out["D_verdict"] = r["verdict"]; out["D_reason"] = r["reason"]
+
+# case D2: closed ids replayed unchanged never satisfy REQUIRE_CLOSED
+r = evaluate(snap([("legacy", device(100, 50, recent=("old1", "old2")))]),
+             snap([("legacy", device(250, 80, recent=("old1", "old2")))]),
+             "legacy", "", True)
+out["D2_verdict"] = r["verdict"]; out["D2_reason"] = r["reason"]
+
+# case E: traffic + a NEW closed id -> PASS with REQUIRE_CLOSED=1 (exit 0)
+r = evaluate(legacy_base,
+             snap([("legacy", device(250, 80, recent=("old1", "new9")))]),
+             "legacy", "", True)
+out["E_verdict"] = r["verdict"]; out["E_exit"] = r["exit"]
+
+# case E2: new closed id but zero traffic delta -> the traffic gate still fails
+r = evaluate(legacy_base,
+             snap([("legacy", device(100, 50, recent=("old1", "new9")))]),
+             "legacy", "", True)
+out["E2_verdict"] = r["verdict"]
+
+# case F: EXPECT_INBOUND gate -- missing tag FAILs, present tag passes
+r = evaluate(snap([("legacy", device(100, 50))]),
+             snap([("legacy", device(250, 80, active=1))]),
+             "legacy", "hy2-in", False)
+out["F_verdict"] = r["verdict"]
+r = evaluate(snap([("legacy", device(100, 50))]),
+             snap([("legacy", device(250, 80, protos=("vless-in", "hy2-in"), active=1))]),
+             "legacy", "hy2-in", False)
+out["F2_verdict"] = r["verdict"]
+
+# case G: an unexpected inbound tag fails the vless-in/hy2-in allowlist
+r = evaluate(snap([("legacy", device(100, 50, protos=("vless-in", "socks-in")))]),
+             snap([("legacy", device(250, 80, protos=("vless-in", "socks-in"), active=1))]),
+             "legacy", "", False)
+out["G_verdict"] = r["verdict"]
+
+# case H: stale final snapshot -> FAIL even with a traffic delta
+r = evaluate(snap([("legacy", device(100, 50))]),
+             snap([("legacy", device(250, 80))], stale=True),
+             "legacy", "", False)
+out["H_verdict"] = r["verdict"]
+
+# case I: stale baseline -> FAIL before anything else
+r = evaluate(snap(stale=True), snap([("legacy", device(250, 80))]),
+             "legacy", "", False)
+out["I_verdict"] = r["verdict"]
+
+# case J: gate configuration errors
+try:
+    parse_require_closed("2"); out["J_verdict"] = "NO-ERROR"
+except ConfigurationError:
+    out["J_verdict"] = "ConfigurationError"
+try:
+    parse_require_closed(2); out["J2_verdict"] = "NO-ERROR"
+except ConfigurationError:
+    out["J2_verdict"] = "ConfigurationError"
+try:
+    parse_expect_inbound("trojan-in"); out["J3_verdict"] = "NO-ERROR"
+except ConfigurationError:
+    out["J3_verdict"] = "ConfigurationError"
+out["J4_verdict"] = str(parse_require_closed("1") is True
+                        and parse_require_closed("0") is False)
+
+# case K: without EXPECT_USER, real in-window activity is judged, not skipped
+r = evaluate(empty, snap([("legacy", device(0, 5, recent=("new1",)))]),
+             "", "", False)
+out["K_verdict"] = r["verdict"]; out["K_exit"] = r["exit"]
+
+# case K2: a new closed id with zero traffic still fails the traffic gate
+r = evaluate(empty, snap([("legacy", device(0, 0, recent=("new1",)))]),
+             "", "", False)
+out["K2_verdict"] = r["verdict"]
+
+print(json.dumps(out))
+')"
+assert_eq "$(snap_field "$snap" 'snap["A_verdict"]')" "INCONCLUSIVE" "case A: no traffic, no EXPECT_USER -> INCONCLUSIVE"
+assert_eq "$(snap_field "$snap" 'snap["A_exit"]')" "2" "case A exits 2 (INCONCLUSIVE is never PASS)"
+assert_eq "$(snap_field "$snap" 'snap["A2_verdict"]')" "INCONCLUSIVE" "case A2: replay-only devices, zero delta -> INCONCLUSIVE"
+assert_eq "$(snap_field "$snap" 'snap["B_verdict"]')" "FAIL" "case B: EXPECT_USER + empty devices -> FAIL (never INCONCLUSIVE)"
+assert_eq "$(snap_field "$snap" 'snap["B_reason"]')" "EXPECT_USER legacy not observed" "case B reason names the missing USER"
+assert_eq "$(snap_field "$snap" 'snap["B2_verdict"]')" "FAIL" "case B2: EXPECT_USER missing among other devices -> FAIL"
+assert_eq "$(snap_field "$snap" 'snap["C_verdict"]')" "PASS" "case C: new traffic, REQUIRE_CLOSED=0 -> PASS"
+assert_eq "$(snap_field "$snap" 'snap["C_exit"]')" "0" "case C exits 0"
+assert_eq "$(snap_field "$snap" 'snap["C2_verdict"]')" "PASS" "case C2: downlink-only movement counts as traffic delta"
+assert_eq "$(snap_field "$snap" 'snap["D_verdict"]')" "FAIL" "case D: REQUIRE_CLOSED=1 without a new closed id -> FAIL"
+assert_contains "no CLOSED/finalize evidence observed" "$snap" "case D reason is the CLOSED evidence failure"
+assert_eq "$(snap_field "$snap" 'snap["D2_verdict"]')" "FAIL" "case D2: replayed closed ids alone never satisfy REQUIRE_CLOSED"
+assert_contains "no CLOSED/finalize evidence observed" "$snap" "case D2 reason is the CLOSED evidence failure"
+assert_eq "$(snap_field "$snap" 'snap["E_verdict"]')" "PASS" "case E: traffic + new closed id -> PASS"
+assert_eq "$(snap_field "$snap" 'snap["E_exit"]')" "0" "case E exits 0"
+assert_eq "$(snap_field "$snap" 'snap["E2_verdict"]')" "FAIL" "case E2: new closed id without traffic still fails the traffic gate"
+assert_eq "$(snap_field "$snap" 'snap["F_verdict"]')" "FAIL" "case F: EXPECT_INBOUND=hy2-in not observed -> FAIL"
+assert_eq "$(snap_field "$snap" 'snap["F2_verdict"]')" "PASS" "case F2: EXPECT_INBOUND=hy2-in observed -> PASS"
+assert_eq "$(snap_field "$snap" 'snap["G_verdict"]')" "FAIL" "case G: unexpected inbound tag fails the allowlist"
+assert_eq "$(snap_field "$snap" 'snap["H_verdict"]')" "FAIL" "case H: stale final -> FAIL even with traffic"
+assert_eq "$(snap_field "$snap" 'snap["I_verdict"]')" "FAIL" "case I: stale baseline -> FAIL"
+assert_eq "$(snap_field "$snap" 'snap["J_verdict"]')" "ConfigurationError" "case J: REQUIRE_CLOSED=2 is a configuration error"
+assert_eq "$(snap_field "$snap" 'snap["J2_verdict"]')" "ConfigurationError" "case J2: REQUIRE_CLOSED=2 (int) is a configuration error"
+assert_eq "$(snap_field "$snap" 'snap["J3_verdict"]')" "ConfigurationError" "case J3: EXPECT_INBOUND=trojan-in is a configuration error"
+assert_eq "$(snap_field "$snap" 'snap["J4_verdict"]')" "True" "case J4: REQUIRE_CLOSED 1/0 parse to True/False"
+assert_eq "$(snap_field "$snap" 'snap["K_verdict"]')" "PASS" "case K: no EXPECT_USER, real in-window activity -> PASS"
+assert_eq "$(snap_field "$snap" 'snap["K_exit"]')" "0" "case K exits 0"
+assert_eq "$(snap_field "$snap" 'snap["K2_verdict"]')" "FAIL" "case K2: zero-traffic window (id only) still fails the traffic gate"
+
+section "G3: integration script -- configuration gate runs before SKIP"
+integ_out="$(REQUIRE_CLOSED=2 bash "$INTEG" 2>&1)"
+integ_rc=$?
+assert_eq "$integ_rc" "1" "REQUIRE_CLOSED=2 -> configuration error exits 1"
+assert_contains "configuration error" "$integ_out" "REQUIRE_CLOSED=2 reported as a configuration error"
+assert_not_contains "SKIP" "$integ_out" "gate config validated BEFORE the environment SKIP"
+integ_out="$(EXPECT_INBOUND=trojan-in bash "$INTEG" 2>&1)"
+integ_rc=$?
+assert_eq "$integ_rc" "1" "EXPECT_INBOUND=trojan-in -> configuration error exits 1"
+assert_contains "configuration error" "$integ_out" "EXPECT_INBOUND=trojan-in reported as a configuration error"
+integ_out="$(SING_BOX_BIN=/nonexistent-sing-box REQUIRE_CLOSED=1 EXPECT_USER=legacy bash "$INTEG" 2>&1)"
+integ_rc=$?
+assert_eq "$integ_rc" "0" "valid gate config still SKIPs cleanly off-VPS (exit 0)"
+assert_contains "SKIP" "$integ_out" "off-VPS run with valid config reports SKIP"
+
+section "G4: gate evaluator CLI -- file inputs and exit codes"
+printf '%s' '{"stale": false, "recently_closed": 1, "active_connections": 0, "devices": {"legacy": {"status": "RECENT ACTIVITY", "uplink_total": 100, "downlink_total": 50, "protocols": {"vless-in": {}}, "active_connections": 0, "recent_connections": [{"id": "old1", "inbound": "vless-in", "source": "203.0.113.9:51000", "uplink_total": 0.0, "downlink_total": 0.0}]}}}' > "$TMP/gate-base.json"
+printf '%s' '{"stale": false, "recently_closed": 1, "active_connections": 1, "devices": {"legacy": {"status": "ACTIVE", "uplink_total": 250, "downlink_total": 80, "protocols": {"vless-in": {}}, "active_connections": 1, "recent_connections": [{"id": "old1", "inbound": "vless-in", "source": "203.0.113.9:51000", "uplink_total": 0.0, "downlink_total": 0.0}]}}}' > "$TMP/gate-final.json"
+"$PY" "$GATE" --baseline "$TMP/gate-base.json" --final "$TMP/gate-final.json" \
+    --expect-user legacy --require-closed 0 >"$TMP/gate-cli.txt" 2>&1
+assert_eq "$?" "0" "CLI: traffic delta without REQUIRE_CLOSED exits 0"
+assert_contains "traffic delta observed" "$(cat "$TMP/gate-cli.txt")" "CLI: check lines are replayed by the integration script"
+"$PY" "$GATE" --baseline "$TMP/gate-base.json" --final "$TMP/gate-final.json" \
+    --expect-user legacy --require-closed 1 >"$TMP/gate-cli2.txt" 2>&1
+assert_eq "$?" "1" "CLI: REQUIRE_CLOSED=1 without new closed ids exits 1"
+"$PY" "$GATE" --baseline "$TMP/gate-base.json" --final "$TMP/gate-base.json" \
+    --require-closed 0 >"$TMP/gate-cli3.txt" 2>&1
+assert_eq "$?" "2" "CLI: nothing observed in-window exits 2 (INCONCLUSIVE)"
+"$PY" "$GATE" --baseline "$TMP/gate-base.json" --final "$TMP/gate-final.json" \
+    --require-closed 2 >/dev/null 2>&1
+assert_eq "$?" "1" "CLI: REQUIRE_CLOSED=2 is a configuration error (exit 1)"
 
 printf '\n== summary ==\n'
 printf '  pass=%d fail=%d (expected pass=%d)\n' "$PASS" "$FAIL" "$EXPECTED_PASS"
