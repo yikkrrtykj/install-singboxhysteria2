@@ -7,10 +7,15 @@ password. Requirements implemented here:
   over a random 16-byte salt, verified with ``hmac.compare_digest``;
 * session tokens are ``secrets.token_urlsafe(32)`` (256-bit) and live in
   memory ONLY: restarting the web process logs browsers out instead of
-  persisting bearer tokens on disk;
-* the session cookie is ``Secure; HttpOnly; SameSite=Strict`` (8h default
-  lifetime; browsers treat localhost as trustworthy so Secure cookies work
-  on the loopback canary too, and remote mode is TLS-only anyway);
+  persisting bearer tokens on disk. Each session also carries its own
+  CSRF token (exposed to the page via ``/api/v1/session``; every
+  authenticated mutation must present it);
+* the session cookie is always ``HttpOnly; SameSite=Strict`` with an 8h
+  default lifetime. The ``Secure`` flag is MODE-SCOPED: mandatory on
+  remote listeners and any TLS listener; deliberately omitted on a
+  loopback HTTP listener, where browsers differ in whether they accept
+  Secure cookies over plain http://localhost and nothing crosses a
+  network anyway;
 * failed logins are rate limited per source IP: 5 failures inside 15
   minutes lock the address out for 15 minutes.
 

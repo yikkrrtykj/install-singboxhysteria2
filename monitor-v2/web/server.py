@@ -167,6 +167,18 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         path = normalize_path(self.path)
         remote = self.client_address[0]
 
+        # POST body framing is validated BEFORE every other gate: the
+        # recovery exemption, the whitelist and the session checks all
+        # run after we know the declared body is sane and bounded. No
+        # early-return path can be reached with a malformed
+        # Content-Length, an unbounded body or chunked framing.
+        if method == "POST":
+            error = self._body_header_error()
+            if error is not None:
+                self.close_connection = True  # framing untrusted: no reuse
+                self._send_json(error[0], {"error": error[1]})
+                return
+
         # Phase E4 exemption hook: the recovery flow is the single whitelist
         # exception (added by web/recovery.py wiring; empty in this commit).
         if self._recovery_route(method, path, remote):
@@ -248,11 +260,7 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         return None
 
     def _route_post(self, path, remote):
-        error = self._body_header_error()
-        if error is not None:
-            self.close_connection = True  # body length untrusted: no reuse
-            self._send_json(error[0], {"error": error[1]})
-            return
+        # Body framing was already validated in _route() before every gate.
         if self._cross_origin():
             self._send_json(403, {"error": "cross-origin request rejected"})
             return
@@ -648,9 +656,19 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"retry: 3000\n\n")
         self.wfile.flush()
+        # The session was valid at connection time; it must stay valid for
+        # the whole stream. Revalidate the ORIGINAL token before every
+        # push: TTL expiry, logout or a password change (which revokes
+        # other sessions) each stop an open stream within one publish
+        # tick (~1s). No special auth-expired event: the browser's
+        # EventSource reconnects, the new request hits 401, the UI shows
+        # the login view.
+        token = self._session_token()
         try:
             for _version, payload in self.app.broker.subscribe(
                     after_version=version):
+                if self.app.session_from_token(token) is None:
+                    break  # session expired or revoked mid-stream
                 chunk = ("event: snapshot\ndata: %s\n\n" % payload).encode(
                     "utf-8")
                 self.wfile.write(chunk)
