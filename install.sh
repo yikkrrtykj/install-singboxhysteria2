@@ -160,18 +160,12 @@ reload_singbox() {
 
 
 install_singbox(){
-	echo "Installing sing-box ${SING_BOX_MIN_VERSION}+ stable version..."
-	latest_version_tag=$(curl -fsSL "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | jq -r '.tag_name // empty' 2>/dev/null)
-    if [ -z "$latest_version_tag" ] || [ "$latest_version_tag" == "null" ]; then
-            latest_version_tag="$SING_BOX_FALLBACK_VERSION_TAG"
-    fi
-		latest_version=${latest_version_tag#v}  # Remove 'v' prefix from version number
-    if ! version_at_least "$latest_version" "$SING_BOX_MIN_VERSION"; then
-            hint "GitHub 返回的版本 $latest_version 低于 ${SING_BOX_MIN_VERSION}，改用 ${SING_BOX_FALLBACK_VERSION_TAG#v}"
-            latest_version_tag="$SING_BOX_FALLBACK_VERSION_TAG"
-            latest_version=${latest_version_tag#v}
-    fi
-		echo "Latest version: $latest_version"
+	echo "Installing sing-box 1.14.x stable version..."
+	# Phase D: fresh installs are pinned to the newest STABLE 1.14.x release.
+	# 1.13.x / 1.15.x / prereleases are rejected by the selector itself.
+	latest_version_tag="$(select_1_14_stable_tag)" || error "无法确定 sing-box 1.14.x stable 版本"
+	latest_version=${latest_version_tag#v}
+	echo "Selected 1.14.x stable version: $latest_version"
 		# Detect server architecture
 		arch=$(uname -m)
 		echo "本机架构为: $arch"
@@ -1405,6 +1399,432 @@ client_management_menu() {
 }
 # <<< phase-c client-management <<< ============================================
 
+# >>> phase-d singbox-1.14-api >>> =============================================
+# Phase D: safe production upgrade 1.13.x -> 1.14.x stable with a localhost-only
+# sing-box service.api inbound (data source for the future Monitor v2).
+# Scope: no Monitor UI/daemon, no database, no conntrack/ss collection.
+SB_API_TAG="monitor-api"
+SB_API_LISTEN="127.0.0.1"
+SB_API_PORT="9091"
+SB_TARGET_LINE="1.14"
+SB_RELEASES_URL="https://api.github.com/repos/SagerNet/sing-box/releases?per_page=100"
+
+# Selects the newest STABLE 1.14.x release tag from GitHub. Fail-closed:
+# prereleases, 1.13.x and 1.15.x are never accepted, and "latest" cannot drift
+# the target across major/minor lines. Prints e.g. "v1.14.7".
+select_1_14_stable_tag() {
+    local releases tag
+    releases="$(curl -fsSL "$SB_RELEASES_URL" 2>/dev/null)" || {
+        warning "无法获取 sing-box releases 列表"
+        return 1
+    }
+    tag="$(printf '%s' "$releases" | jq -r '
+        [ .[] | select(.prerelease == false)
+              | .tag_name
+              | select(test("^v1\\.14\\.[0-9]+$")) ]
+        | sort_by(sub("^v"; "") | split(".") | map(tonumber))
+        | last // empty
+    ' 2>/dev/null)"
+    if [ -z "$tag" ] || [ "$tag" = "null" ]; then
+        warning "GitHub releases 中没有可用的 stable v1.14.x（拒绝 1.13.x / 1.15.x / prerelease）"
+        return 1
+    fi
+    printf '%s\n' "$tag"
+}
+
+# Audit of the api-inbound state in a config. Empty output = either no api
+# inbound (can be injected) or exactly one fully-compliant one. Anything else
+# is a problem: duplicate monitor-api tag, wrong type, non-loopback listen,
+# wrong port, or a malformed services field. Exit code also fail-closed.
+api_injection_problems() { # api_injection_problems <config>
+    jq -r '
+      ([.inbounds[]? | select(.type == "api")]) as $ai |
+      ([.inbounds[]? | select(.tag == "monitor-api")]) as $ti |
+      ($ai[0] // {}) as $a |
+      ([]
+        + (if ($ai | length) > 1 then ["存在多个 type=api 的 inbound"] else [] end)
+        + (if ($ti | length) > 1 then ["存在重复的 monitor-api tag"] else [] end)
+        + (if ($ti | length) == 1 and (($ti[0].type // "") != "api")
+           then ["tag 为 monitor-api 的 inbound type 不是 api（实际 \($ti[0].type // "缺失")）"] else [] end)
+        + (if ($ai | length) == 1 then
+             ([]
+               + (if (($a.tag // "") != "monitor-api") then ["api inbound 的 tag 必须是 monitor-api（实际 \($a.tag // "缺失")）"] else [] end)
+               + (if (($a.listen // "") != "127.0.0.1") then ["api inbound 必须只监听 127.0.0.1（实际 \($a.listen // "缺失")）"] else [] end)
+               + (if (($a.listen_port // null) != 9091) then ["api inbound 端口必须是 9091（实际 \($a.listen_port // "缺失")）"] else [] end)
+               + (if ($a.services != null and ($a.services | type) != "array")
+                 then ["api inbound 的 services 不是数组"] else [] end)
+               + (if ($a.services != null and ($a.services | type) == "array")
+                    and (($a.services | all(type == "string")) | not)
+                 then ["api inbound 的 services 必须是字符串数组"] else [] end)
+             )
+           else [] end)
+      )[]
+    ' "$1" 2>/dev/null
+}
+
+# True when the config already carries exactly one compliant api inbound.
+has_compliant_api_inbound() { # has_compliant_api_inbound <config>
+    local count problems
+    problems="$(api_injection_problems "$1")" || return 1
+    [ -z "$problems" ] || return 1
+    count="$(jq -r '[.inbounds[]? | select(.type == "api")] | length' "$1" 2>/dev/null)" || return 1
+    [ "$count" = "1" ]
+}
+
+# Appends the required localhost-only service.api inbound (idempotence is the
+# caller's job: only call when has_compliant_api_inbound is false and
+# api_injection_problems is empty).
+inject_api_inbound() { # inject_api_inbound <in-config> <out-config>
+    jq --arg tag "$SB_API_TAG" --arg listen "$SB_API_LISTEN" --argjson port "$SB_API_PORT" '
+      .inbounds += [
+        {"type": "api", "tag": $tag, "listen": $listen, "listen_port": $port}
+      ]
+    ' "$1" > "$2"
+}
+
+api_port_occupied() { # any current listener on the API port (v4 or v6)
+    ss -H -lntu 2>/dev/null | grep -qE "[:.]${SB_API_PORT}[[:space:]]"
+}
+
+# Downloads and verifies a candidate binary for <tag>, placing it at
+# <candidate_path> (which MUST live on the same filesystem as the live binary
+# so the later replacement is an atomic rename).
+acquire_candidate_binary() { # acquire_candidate_binary <tag> <version> <candidate_path>
+    local tag="$1" ver="$2" candidate="$3"
+    local arch package archive extract_dir
+    arch="$(uname -m)"
+    case "$arch" in
+        x86_64) arch="amd64" ;;
+        aarch64) arch="arm64" ;;
+        armv7l) arch="armv7" ;;
+    esac
+    package="sing-box-${ver}-linux-${arch}"
+    archive="$(mktemp "${SB_SING_BOX_BIN}.archive.XXXXXX")" || return 1
+    extract_dir="$(mktemp -d "${SB_SING_BOX_BIN}.extract.XXXXXX")" || {
+        rm -f "$archive"
+        return 1
+    }
+    if ! curl -4 -fL --progress-bar -o "$archive" \
+            "https://github.com/SagerNet/sing-box/releases/download/${tag}/${package}.tar.gz"; then
+        warning "下载 sing-box ${tag} 失败"
+        rm -rf "$archive" "$extract_dir"
+        return 1
+    fi
+    if ! tar -tzf "$archive" >/dev/null 2>&1; then
+        warning "下载包校验失败（非有效 tar.gz）"
+        rm -rf "$archive" "$extract_dir"
+        return 1
+    fi
+    if ! tar -xzf "$archive" -C "$extract_dir"; then
+        warning "解压 sing-box 失败"
+        rm -rf "$archive" "$extract_dir"
+        return 1
+    fi
+    if [ ! -f "$extract_dir/$package/sing-box" ]; then
+        warning "下载包内缺少 sing-box 二进制"
+        rm -rf "$archive" "$extract_dir"
+        return 1
+    fi
+    if ! install -m 0755 "$extract_dir/$package/sing-box" "$candidate"; then
+        warning "准备 candidate 二进制失败"
+        rm -rf "$archive" "$extract_dir"
+        return 1
+    fi
+    rm -rf "$archive" "$extract_dir"
+    return 0
+}
+
+verify_candidate_binary() { # verify_candidate_binary <candidate> <version>
+    local out
+    if ! out="$("$1" version 2>/dev/null)"; then
+        warning "candidate 二进制无法执行 version"
+        return 1
+    fi
+    if ! printf '%s' "$out" | grep -q "version $2"; then
+        warning "candidate 二进制版本不是 $2（$(printf '%s' "$out" | head -n 1)）"
+        return 1
+    fi
+    return 0
+}
+
+# Post-restart runtime verification. Expected version, service state, MainPID,
+# Reality TCP / HY2 UDP listeners, the loopback-only API listener (never
+# 0.0.0.0/[::]) and a live `sing-box api connection list` call.
+phase_d_health_ok() { # phase_d_health_ok <expected_version> [require_api=yes|no]
+    local expected="$1" require_api="${2:-yes}"
+    local main_pid reality_port hy_port out
+    if ! systemctl is-active --quiet sing-box 2>/dev/null; then
+        warning "健康检查失败: sing-box 服务未 active"
+        return 1
+    fi
+    main_pid="$(systemctl show sing-box -p MainPID --value 2>/dev/null)"
+    case "$main_pid" in
+        ''|*[!0-9]*) warning "健康检查失败: MainPID 无效（${main_pid:-空}）"; return 1 ;;
+    esac
+    [ "$main_pid" -gt 0 ] || { warning "健康检查失败: MainPID 无效（$main_pid）"; return 1; }
+    if ! out="$("$SB_SING_BOX_BIN" version 2>/dev/null)"; then
+        warning "健康检查失败: 当前二进制无法执行 version"
+        return 1
+    fi
+    if ! printf '%s' "$out" | grep -q "version $expected"; then
+        warning "健康检查失败: 当前二进制不是 $expected（$(printf '%s' "$out" | head -n 1)）"
+        return 1
+    fi
+    reality_port="$(jq -r --arg tag "$REALITY_INBOUND_TAG" \
+        '.inbounds[] | select(.tag == $tag) | .listen_port' "$SB_SERVER_CONFIG" 2>/dev/null)"
+    hy_port="$(jq -r --arg tag "$HY2_INBOUND_TAG" \
+        '.inbounds[] | select(.tag == $tag) | .listen_port' "$SB_SERVER_CONFIG" 2>/dev/null)"
+    if ! ss -H -lnt 2>/dev/null | grep -qE "[:.]${reality_port}[[:space:]]"; then
+        warning "健康检查失败: Reality TCP 监听缺失（$reality_port）"
+        return 1
+    fi
+    if ! ss -H -lnu 2>/dev/null | grep -qE "[:.]${hy_port}[[:space:]]"; then
+        warning "健康检查失败: HY2 UDP 监听缺失（$hy_port）"
+        return 1
+    fi
+    if [ "$require_api" = "yes" ]; then
+        if ! ss -H -lnt 2>/dev/null | grep -qE "127\.0\.0\.1:${SB_API_PORT}[[:space:]]"; then
+            warning "健康检查失败: API 127.0.0.1:${SB_API_PORT} 未监听"
+            return 1
+        fi
+        if ss -H -lnt 2>/dev/null | grep -qE "(0\.0\.0\.0|\[::\]):${SB_API_PORT}[[:space:]]"; then
+            warning "健康检查失败: API 监听越界（检测到 0.0.0.0/[::]:${SB_API_PORT}）"
+            return 1
+        fi
+        if ! "$SB_SING_BOX_BIN" api --url "http://127.0.0.1:${SB_API_PORT}" connection list >/dev/null 2>&1; then
+            warning "健康检查失败: sing-box api connection list 不可用"
+            return 1
+        fi
+    fi
+    return 0
+}
+
+hy2_hopping_enabled() {
+    [ "$(grep '^HY_HOPPING=' "$SB_STATE_FILE" 2>/dev/null | cut -d'=' -f2)" = "TRUE" ]
+}
+
+# Hopping rules must be restored after BOTH a successful upgrade and a rollback.
+ensure_hy2_hopping_after_restart() {
+    hy2_hopping_enabled || return 0
+    local service="${SB_HOPPING_SERVICE:-${HY_HOPPING_SERVICE:-/etc/systemd/system/sing-box-hy2-hopping.service}}"
+    if [ ! -f "$service" ]; then
+        warning "HY_HOPPING=TRUE 但缺少 $service；端口跳跃规则未刷新，请人工确认"
+        return 1
+    fi
+    if ! systemctl reload sing-box-hy2-hopping.service 2>/dev/null; then
+        warning "Hysteria2 端口跳跃规则刷新失败（sing-box-hy2-hopping.service）"
+        return 1
+    fi
+    return 0
+}
+
+# Double rollback: restores the old binary AND the old config, restarts, and
+# re-verifies. A failing rollback restart is reported as needing manual
+# intervention -- never as a successful recovery.
+_rollback_upgrade() { # _rollback_upgrade <backup_bin> <backup_cfg> <old_version>
+    local backup_bin="$1" backup_cfg="$2" old_version="$3"
+    local require_api="no"
+    warning "升级失败，执行双回滚（binary + config）..."
+    if ! cp -a "$backup_bin" "$SB_SING_BOX_BIN" || ! cp -a "$backup_cfg" "$SB_SERVER_CONFIG"; then
+        warning "回滚文件恢复失败，请立即人工介入！备份: $backup_bin / $backup_cfg"
+        return 1
+    fi
+    if ! systemctl restart sing-box 2>/dev/null; then
+        warning "回滚后 restart sing-box 失败，请立即人工介入！备份: $backup_bin / $backup_cfg"
+        return 1
+    fi
+    if has_compliant_api_inbound "$SB_SERVER_CONFIG"; then
+        require_api="yes"
+    fi
+    if ! phase_d_health_ok "$old_version" "$require_api"; then
+        warning "回滚后健康检查失败，请立即人工介入！备份: $backup_bin / $backup_cfg"
+        return 1
+    fi
+    if ! ensure_hy2_hopping_after_restart; then
+        warning "回滚后端口跳跃规则未能确认恢复，请人工检查"
+        return 1
+    fi
+    warning "已回滚到升级前状态（binary $old_version + config），服务健康"
+    return 0
+}
+
+upgrade_singbox_1_14() {
+    # A manual (non-systemd) sing-box process must block the upgrade BEFORE any
+    # binary/config change: Phase D only operates on a systemd-managed instance.
+    if pgrep -x sing-box >/dev/null 2>&1 && ! systemctl is-active --quiet sing-box 2>/dev/null; then
+        warning "检测到 sing-box 正由手工进程运行（非 systemd 管理），Phase D 拒绝修改 binary/config"
+        warning "请先安排维护窗口，将现有进程迁移到 sing-box.service 后再执行升级"
+        return 1
+    fi
+    with_client_lock _upgrade_singbox_1_14_locked
+}
+
+# The whole transaction runs under the SAME /root/sbox/config.lock as Phase C:
+# read -> audit -> candidate -> check -> backup -> replace -> restart -> health.
+_upgrade_singbox_1_14_locked() {
+    local problems api_problems tag ver old_version
+    local candidate_bin backup_bin backup_cfg candidate_cfg
+    [ -f "$SB_SERVER_CONFIG" ] || { warning "服务端配置不存在: $SB_SERVER_CONFIG"; return 1; }
+    if ! jq empty "$SB_SERVER_CONFIG" >/dev/null 2>&1; then
+        warning "服务端配置不是合法 JSON: $SB_SERVER_CONFIG"
+        return 1
+    fi
+
+    # Phase C precondition: the multi-client identity model must already be in
+    # place. Phase D NEVER auto-migrates an unnamed shared account.
+    if ! problems="$(candidate_problems "$SB_SERVER_CONFIG")"; then
+        warning "客户端结构审计执行失败: $SB_SERVER_CONFIG"
+        return 1
+    fi
+    if [ -n "$problems" ]; then
+        if grep -q '没有 name' <<<"$problems"; then
+            warning "检测到旧的无名共享账号（Phase C legacy migration 尚未执行），Phase D 不自动迁移"
+            warning "请先运行: mianyang → 10 客户端管理 → 5 迁移旧客户端为 legacy，然后再升级"
+        else
+            warning "客户端身份审计未通过（先在客户端管理中修复一致性）:"
+            while IFS= read -r p; do
+                [ -n "$p" ] && warning "  - $p"
+            done <<< "$problems"
+        fi
+        return 1
+    fi
+
+    # Existing API state must be either absent or fully compliant; anything
+    # else is fail-closed and never auto-overwritten.
+    if ! api_problems="$(api_injection_problems "$SB_SERVER_CONFIG")"; then
+        warning "API 配置审计执行失败: $SB_SERVER_CONFIG"
+        return 1
+    fi
+    if [ -n "$api_problems" ]; then
+        warning "现有 API 配置不合规（拒绝自动覆盖）:"
+        while IFS= read -r p; do
+            [ -n "$p" ] && warning "  - $p"
+        done <<< "$api_problems"
+        return 1
+    fi
+
+    if api_port_occupied; then
+        warning "${SB_API_LISTEN}:${SB_API_PORT} 已被占用，拒绝升级"
+        return 1
+    fi
+
+    tag="$(select_1_14_stable_tag)" || return 1
+    ver="${tag#v}"
+    old_version="$("$SB_SING_BOX_BIN" version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)"
+    [ -n "$old_version" ] || { warning "无法读取当前 sing-box 版本"; return 1; }
+
+    candidate_bin="$(mktemp "${SB_SING_BOX_BIN}.new.XXXXXX")" || {
+        warning "创建 candidate 二进制失败"
+        return 1
+    }
+    if ! acquire_candidate_binary "$tag" "$ver" "$candidate_bin"; then
+        rm -f "$candidate_bin"
+        return 1
+    fi
+    if ! verify_candidate_binary "$candidate_bin" "$ver"; then
+        rm -f "$candidate_bin"
+        return 1
+    fi
+
+    candidate_cfg="$(mktemp "${SB_SERVER_CONFIG}.candidate.XXXXXX")" || {
+        rm -f "$candidate_bin"
+        return 1
+    }
+    if has_compliant_api_inbound "$SB_SERVER_CONFIG"; then
+        cp -a "$SB_SERVER_CONFIG" "$candidate_cfg"
+    elif ! inject_api_inbound "$SB_SERVER_CONFIG" "$candidate_cfg"; then
+        warning "生成 candidate config 失败"
+        rm -f "$candidate_bin" "$candidate_cfg"
+        return 1
+    fi
+
+    if ! problems="$(candidate_problems "$candidate_cfg")"; then
+        warning "candidate 结构审计执行失败"
+        rm -f "$candidate_bin" "$candidate_cfg"
+        return 1
+    fi
+    if [ -n "$problems" ]; then
+        warning "candidate 身份审计未通过:"
+        while IFS= read -r p; do
+            [ -n "$p" ] && warning "  - $p"
+        done <<< "$problems"
+        rm -f "$candidate_bin" "$candidate_cfg"
+        return 1
+    fi
+    if ! api_problems="$(api_injection_problems "$candidate_cfg")"; then
+        warning "candidate API 审计执行失败"
+        rm -f "$candidate_bin" "$candidate_cfg"
+        return 1
+    fi
+    if [ -n "$api_problems" ] || ! has_compliant_api_inbound "$candidate_cfg"; then
+        warning "candidate API 配置验证失败:"
+        while IFS= read -r p; do
+            [ -n "$p" ] && warning "  - $p"
+        done <<< "$api_problems"
+        rm -f "$candidate_bin" "$candidate_cfg"
+        return 1
+    fi
+
+    if ! "$candidate_bin" check -c "$candidate_cfg" >/dev/null 2>&1; then
+        warning "candidate binary check 未通过，正式环境未修改"
+        rm -f "$candidate_bin" "$candidate_cfg"
+        return 1
+    fi
+
+    backup_bin="$(mktemp "${SB_SING_BOX_BIN}.bak.$(date +%Y%m%d-%H%M%S).XXXXXX")" || {
+        rm -f "$candidate_bin" "$candidate_cfg"
+        return 1
+    }
+    backup_cfg="$(mktemp "${SB_SERVER_CONFIG}.bak.$(date +%Y%m%d-%H%M%S).XXXXXX")" || {
+        rm -f "$candidate_bin" "$candidate_cfg" "$backup_bin"
+        return 1
+    }
+    if ! cp -a "$SB_SING_BOX_BIN" "$backup_bin"; then
+        warning "备份当前 binary 失败，正式环境未修改"
+        rm -f "$candidate_bin" "$candidate_cfg" "$backup_bin" "$backup_cfg"
+        return 1
+    fi
+    if ! cp -a "$SB_SERVER_CONFIG" "$backup_cfg"; then
+        warning "备份当前配置失败，正式环境未修改"
+        rm -f "$candidate_bin" "$candidate_cfg" "$backup_bin" "$backup_cfg"
+        return 1
+    fi
+
+    if ! mv -f "$candidate_bin" "$SB_SING_BOX_BIN"; then
+        warning "原子替换 binary 失败，正式环境未修改"
+        rm -f "$candidate_bin" "$candidate_cfg" "$backup_bin" "$backup_cfg"
+        return 1
+    fi
+    if ! mv -f "$candidate_cfg" "$SB_SERVER_CONFIG"; then
+        warning "原子替换 config 失败，恢复 config 后停止"
+        cp -a "$backup_cfg" "$SB_SERVER_CONFIG"
+        rm -f "$candidate_bin" "$candidate_cfg" "$backup_bin" "$backup_cfg"
+        return 1
+    fi
+
+    if ! systemctl restart sing-box 2>/dev/null; then
+        _rollback_upgrade "$backup_bin" "$backup_cfg" "$old_version"
+        rm -f "$backup_bin" "$backup_cfg"
+        return 1
+    fi
+    if ! phase_d_health_ok "$ver" "yes"; then
+        _rollback_upgrade "$backup_bin" "$backup_cfg" "$old_version"
+        rm -f "$backup_bin" "$backup_cfg"
+        return 1
+    fi
+    if ! ensure_hy2_hopping_after_restart; then
+        _rollback_upgrade "$backup_bin" "$backup_cfg" "$old_version"
+        rm -f "$backup_bin" "$backup_cfg"
+        return 1
+    fi
+
+    info "升级完成: sing-box $ver（binary + config 已替换并验证健康）"
+    info "本机 service.api 已启用: http://${SB_API_LISTEN}:${SB_API_PORT}（仅回环监听）"
+    info "升级前备份: binary=$backup_bin config=$backup_cfg"
+    return 0
+}
+# <<< phase-d singbox-1.14-api <<< ============================================
+
 NETWORK_SYSCTL_FILE="/etc/sysctl.d/99-sing-box-network.conf"
 UDP_BUFFER_MIN_BYTES=16777216
 
@@ -1581,24 +2001,16 @@ uninstall_singbox() {
 }
 
 update_singbox(){
-    info "更新singbox..."
-    install_singbox
-    # 检查配置
-    if /root/sbox/sing-box check -c /root/sbox/sbconfig_server.json; then
-      echo "检查配置文件成功，重启服务..."
-      if restart_singbox; then
-          info "sing-box 已使用新版二进制启动"
-      else
-          restart_result=$?
-          if [ "$restart_result" -eq 2 ]; then
-              warning "新版二进制已安装并保留旧版备份，但手工运行的旧进程尚未重启。"
-          else
-              error "sing-box 重启失败，请使用备份二进制恢复"
-          fi
-      fi
-    else
-      error "启动失败，请检查配置文件"
+    # Phase D: production upgrades go through the full transaction
+    # (identity audit -> candidate binary+config -> check -> backup ->
+    # atomic replace -> restart -> health / double rollback). The old
+    # half-transaction (replace binary, then hope the restart works) is gone.
+    info "升级 sing-box（Phase D 事务: 1.14.x stable + 本机 service.api）..."
+    if ! upgrade_singbox_1_14; then
+        warning "升级未完成；正式环境保持可用状态（详见上方原因/回滚信息）"
+        return 1
     fi
+    return 0
 }
 
 generate_random_number() {
@@ -1774,7 +2186,7 @@ process_singbox() {
     info "请选择选项："
     echo ""
     info "1. 检查配置并重启 sing-box"
-    info "2. 安全更新 sing-box 内核"
+    info "2. 升级 sing-box 内核（Phase D: 1.14.x + 本机 service.api）"
     info "3. 查看 systemd 服务状态"
     info "4. 查看实时日志（Ctrl+C 退出）"
     info "5. 查看服务端配置（包含密钥）"
@@ -2331,6 +2743,12 @@ cat > /root/sbox/sbconfig_server.json << EOF
             "certificate_path": "/root/sbox/self-cert/cert.pem",
             "key_path": "/root/sbox/self-cert/private.key"
         }
+    },
+    {
+        "type": "api",
+        "tag": "monitor-api",
+        "listen": "127.0.0.1",
+        "listen_port": 9091
     }
   ],
     "outbounds": [
