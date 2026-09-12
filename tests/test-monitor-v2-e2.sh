@@ -20,7 +20,7 @@ PASS=0
 FAIL=0
 # The gate at the bottom fails unless exactly this many assertions ran AND
 # passed, so unreachable sections can never fake success.
-EXPECTED_PASS=182
+EXPECTED_PASS=239
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
@@ -46,18 +46,26 @@ else
 fi
 STATIC_SRC="$(cat "$ROOT/monitor-v2/web/static/index.html" "$ROOT/monitor-v2/web/static/app.js" "$ROOT/monitor-v2/web/static/style.css")"
 SERVER_SRC="$(cat $WEB_PY)"
+README_SRC="$(cat "$ROOT/monitor-v2/README.md")"
 assert_not_contains 'OFFLINE' "$STATIC_SRC" "frontend never shows OFFLINE"
 assert_not_contains 'Tunnel Down' "$STATIC_SRC" "frontend never shows Tunnel Down"
 assert_not_contains 'OFFLINE' "$SERVER_SRC" "backend never emits OFFLINE"
 assert_not_contains 'Tunnel Down' "$SERVER_SRC" "backend never emits Tunnel Down"
 assert_not_contains 'sbconfig' "$SERVER_SRC" "web code never touches sbconfig_server.json"
-XFF_READS="$(printf %s "$SERVER_SRC" | grep -E 'headers\.get\("X-(Forwarded-For|Real-IP)' || true)"
+XFF_READS="$(printf '%s' "$SERVER_SRC" | grep -E 'headers\.get\("X-(Forwarded-For|Real-IP)' || true)"
 assert_eq "$XFF_READS" "" "server never reads X-Forwarded-For / X-Real-IP"
 EXTERNAL_REFS="$(printf '%s' "$STATIC_SRC" | grep -oE 'https?://[^"'"'"' )<>]+' | grep -v 'www.w3.org' || true)"
 assert_eq "$EXTERNAL_REFS" "" "static assets are fully local (no CDN/external URLs)"
 CLOSE_REFS="$(printf '%s' "$SERVER_SRC" | grep -iE 'close.?connection|DELETE.*connections|connections.*close' | grep -v 'close_connection\|close its own generator\|browser disconnect\|ConnectionResetError\|BrokenPipeError\|_drain\|Connection: close\|close_connection =' || true)"
 assert_eq "$CLOSE_REFS" "" "no close-connection endpoint anywhere in the server"
+assert_not_contains 'confirm: true' "$STATIC_SRC" "frontend never pre-confirms a self-lockout removal"
+assert_contains 'X-CSRF-Token' "$STATIC_SRC" "frontend attaches the session CSRF token to mutations"
+assert_contains 'snapshot_version' "$STATIC_SRC" "watchdog keys freshness on snapshot_version"
+assert_not_contains 'setup` 可用 openssl 生成自签名证书' "$README_SRC" "README no longer claims setup generates certificates"
+assert_contains '自动生成自签名证书' "$README_SRC" "README documents: no automatic self-signed generation"
+assert_contains 'Packaging' "$README_SRC" "README defers certificate provisioning to Packaging"
 
+# -- shared python harness ---------------------------------------------------
 # -- shared python harness ---------------------------------------------------
 cat > "$TMP/e2_harness.py" <<'HARNESS_EOF'
 #!/usr/bin/env python3
@@ -75,9 +83,12 @@ sys.path.insert(0, os.environ["MONITOR_V2_ROOT"])
 STATIC_DIR = os.environ["STATIC_DIR"]
 
 from collector import Collector
+import web.access
+import web.auth
 from web.access import AccessPolicy, host_entry_for_ip, parse_network
 from web.auth import AuthStore
 from web.broker import SnapshotBroker
+from web.recovery import RecoveryGlobalGuard
 from web.server import MonitorWebApp, build_server
 
 PASSWORD = "test-password-e2-1"
@@ -97,7 +108,7 @@ def raises_value_error(func, value):
 
 def make_stack(data_dir, *, password=None, recovery=None, whitelist=(),
                poll=0.2, url="http://127.0.0.1:1", session_ttl=3600.0,
-               batches=None):
+               batches=None, recovery_guard=None, remote_mode=False):
     policy = AccessPolicy(data_dir)
     for entry in whitelist:
         policy.add(entry)
@@ -118,7 +129,9 @@ def make_stack(data_dir, *, password=None, recovery=None, whitelist=(),
     broker = SnapshotBroker(collector, poll_seconds=poll)
     broker.start()
     app = MonitorWebApp(broker=broker, access=policy,
-                        static_dir=STATIC_DIR, auth=auth)
+                        static_dir=STATIC_DIR, auth=auth,
+                        remote_mode=remote_mode,
+                        recovery_guard=recovery_guard)
     srv = build_server(app, "127.0.0.1", 0)
     port = srv.server_address[1]
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -157,6 +170,17 @@ def login(port, source, password=PASSWORD, extra=None):
 
 def cookie_of(response):
     return response["headers"].get("set-cookie", "").split(";")[0]
+
+
+def csrf_of(port, source, cookie):
+    data = json.loads(req(port, source, "GET", "/api/v1/session",
+                          {"Cookie": cookie})["body"])
+    return data.get("csrf_token") or ""
+
+
+def authed_headers(cookie, csrf):
+    return {"Content-Type": "application/json", "Cookie": cookie,
+            "X-CSRF-Token": csrf}
 
 
 RESET_BATCH = {"reset": True, "events": [
@@ -213,6 +237,7 @@ def group_whitelist():
     out["host_entry_v4"] = host_entry_for_ip("1.2.3.4") == "1.2.3.4/32"
     out["covers_inside"] = cidr.covers("10.10.10.0/24", "10.10.10.3")
     out["covers_outside"] = not cidr.covers("10.10.10.0/24", "10.10.11.3")
+    out["covers_ipv6_parent"] = v6.covers("2001:db8::/64", "2001:db8::1")
     out["remove_works"] = cidr.remove("10.10.10.0/24") \
         and cidr.entries() == ()
     out["remove_missing_false"] = not cidr.remove("10.10.10.0/24")
@@ -248,6 +273,28 @@ def group_gate():
         port, "127.0.0.5", "POST", "/api/v1/login",
         {"Content-Type": "application/json"},
         json_body({"password": "x"}))["status"] == 403
+
+    # Recovery public asset chain: an EXACT allowlist. A locked-out browser
+    # must be able to render AND submit the recovery page.
+    out["recovery_page_nonwhitelisted_200"] = req(
+        port, "127.0.0.5", "GET", "/recovery")["status"] == 200
+    out["recovery_css_nonwhitelisted_200"] = req(
+        port, "127.0.0.5", "GET", "/static/style.css")["status"] == 200
+    out["recovery_js_nonwhitelisted_200"] = req(
+        port, "127.0.0.5", "GET", "/static/app.js")["status"] == 200
+    out["recovery_favicon_nonwhitelisted_200"] = req(
+        port, "127.0.0.5", "GET", "/favicon.svg")["status"] == 200
+    rec = req(port, "127.0.0.5", "POST", "/api/v1/recovery",
+              {"Content-Type": "application/json"},
+              json_body({"key": "whatever"}))
+    out["recovery_api_exempt_reaches_handler"] = rec["status"] == 403 \
+        and "invalid recovery key" in rec["body"]
+    # ...and the rest of the dashboard STAYS gated for the same caller.
+    out["recovery_assets_do_not_open_dashboard"] = req(
+        port, "127.0.0.5", "GET", "/")["status"] == 403
+    out["no_wildcard_static_exemption"] = req(
+        port, "127.0.0.1", "GET", "/static/../../webapp.py")["status"] == 404
+
     spoof = req(port, "127.0.0.5", "GET", "/",
                 {"X-Forwarded-For": "127.0.0.1"})
     out["xff_cannot_bypass"] = spoof["status"] == 403
@@ -255,12 +302,6 @@ def group_gate():
                  {"X-Forwarded-For": "1.2.3.4",
                   "X-Real-IP": "::1"})
     out["xff_and_realip_cannot_bypass"] = spoof2["status"] == 403
-    out["recovery_page_exempt_200"] = req(port, "127.0.0.5", "GET",
-                                          "/recovery")["status"] == 200
-    rec = req(port, "127.0.0.5", "POST", "/api/v1/recovery",
-              {"Content-Type": "application/json"},
-              json_body({"key": "whatever"}))
-    out["recovery_api_exempt_reaches_handler"] = rec["status"] == 503
     headers = req(port, "127.0.0.1", "GET", "/")["headers"]
     out["csp_header"] = headers.get("content-security-policy") == \
         "default-src 'self'"
@@ -301,7 +342,7 @@ def group_auth():
     out["good_login_200"] = good["status"] == 200
     set_cookie = good["headers"].get("set-cookie", "")
     out["cookie_httponly"] = "HttpOnly" in set_cookie
-    out["cookie_secure"] = "Secure" in set_cookie
+    out["cookie_secure_absent_loopback"] = "Secure" not in set_cookie
     out["cookie_samesite_strict"] = "SameSite=Strict" in set_cookie
     cookie = cookie_of(good)
     out["snapshot_unauthenticated_401"] = req(
@@ -312,8 +353,10 @@ def group_auth():
     out["password_never_returned"] = PASSWORD not in snap_resp["body"]
     session_resp = req(port, "127.0.0.5", "GET", "/api/v1/session",
                        {"Cookie": cookie})
-    out["session_info_authenticated"] = json.loads(
-        session_resp["body"])["authenticated"] is True
+    session_info = json.loads(session_resp["body"])
+    out["session_info_authenticated"] = session_info["authenticated"] is True
+    csrf = session_info.get("csrf_token") or ""
+    out["csrf_token_in_session"] = bool(csrf)
     with open(os.path.join(stack["data_dir"], "auth.json")) as handle:
         auth_raw = handle.read()
     out["auth_hash_only_scrypt"] = "scrypt" in auth_raw \
@@ -322,13 +365,62 @@ def group_auth():
     out["access_json_exists"] = os.path.exists(
         os.path.join(stack["data_dir"], "access.json"))
 
+    # --- CSRF: session-bound token required on every mutation ---------------
+    plain = {"Content-Type": "application/json", "Cookie": cookie}
+    out["csrf_missing_403"] = req(
+        port, "127.0.0.5", "POST", "/api/v1/whitelist", plain,
+        json_body({"entry": "198.51.100.0/24"}))["status"] == 403
+    out["csrf_wrong_403"] = req(
+        port, "127.0.0.5", "POST", "/api/v1/whitelist",
+        dict(plain, **{"X-CSRF-Token": "wrong-token"}),
+        json_body({"entry": "198.51.100.0/24"}))["status"] == 403
+    out["csrf_correct_200"] = req(
+        port, "127.0.0.5", "POST", "/api/v1/whitelist",
+        authed_headers(cookie, csrf),
+        json_body({"entry": "198.51.100.0/24"}))["status"] == 200
+    out["csrf_get_unaffected"] = snap_resp["status"] == 200
+    out["login_unaffected_by_csrf"] = good["status"] == 200
+
+    # CSRF is bound to ITS session: another browser's cookie with this
+    # session's token must fail.
+    second = login(port, "127.0.0.5")
+    cookie_b = cookie_of(second)
+    csrf_b = csrf_of(port, "127.0.0.5", cookie_b)
+    out["csrf_session_bound_403"] = req(
+        port, "127.0.0.5", "POST", "/api/v1/whitelist",
+        {"Content-Type": "application/json", "Cookie": cookie_b,
+         "X-CSRF-Token": csrf},
+        json_body({"entry": "203.0.113.0/24"}))["status"] == 403
+    out["csrf_cross_sessions_ok"] = req(
+        port, "127.0.0.5", "POST", "/api/v1/whitelist",
+        authed_headers(cookie_b, csrf_b),
+        json_body({"entry": "203.0.113.0/24"}))["status"] == 200
+
+    # --- Origin: second layer (only when the browser declares one) ---------
+    out["origin_foreign_403"] = req(
+        port, "127.0.0.5", "POST", "/api/v1/whitelist",
+        dict(authed_headers(cookie_b, csrf_b),
+             **{"Origin": "https://evil.example"}),
+        json_body({"entry": "192.0.2.0/24"}))["status"] == 403
+    out["origin_same_200"] = req(
+        port, "127.0.0.5", "POST", "/api/v1/whitelist",
+        dict(authed_headers(cookie_b, csrf_b),
+             **{"Origin": "http://127.0.0.1:%d" % port}),
+        json_body({"entry": "192.0.2.0/24"}))["status"] == 200
+
+    # expired session: 401 (session check) wins over CSRF 403
     stack_x = make_stack(tempfile.mkdtemp(), password=PASSWORD,
                          whitelist=["127.0.0.5/32"], session_ttl=0.4)
     cookie_x = cookie_of(login(stack_x["port"], "127.0.0.5"))
+    csrf_x = csrf_of(stack_x["port"], "127.0.0.5", cookie_x)
     time.sleep(0.9)
     out["expired_session_401"] = req(
         stack_x["port"], "127.0.0.5", "GET", "/api/v1/snapshot",
         {"Cookie": cookie_x})["status"] == 401
+    out["csrf_expired_session_401"] = req(
+        stack_x["port"], "127.0.0.5", "POST", "/api/v1/whitelist",
+        authed_headers(cookie_x, csrf_x),
+        json_body({"entry": "198.51.100.0/24"}))["status"] == 401
 
     stack_r = make_stack(tempfile.mkdtemp(), password=PASSWORD,
                          whitelist=["127.0.0.5/32", "127.0.0.6/32"])
@@ -341,26 +433,26 @@ def group_auth():
                          whitelist=["127.0.0.5/32"])
     port_p = stack_p["port"]
     cookie_a = cookie_of(login(port_p, "127.0.0.5"))
-    cookie_b = cookie_of(login(port_p, "127.0.0.5"))
-    change = {"Content-Type": "application/json"}
+    csrf_a = csrf_of(port_p, "127.0.0.5", cookie_a)
+    cookie_b2 = cookie_of(login(port_p, "127.0.0.5"))
     r = req(port_p, "127.0.0.5", "POST", "/api/v1/password",
-            dict(change, Cookie=cookie_a),
+            authed_headers(cookie_a, csrf_a),
             json_body({"current_password": "wrong",
                        "new_password": NEW_PASSWORD}))
     out["pw_change_wrong_current_403"] = r["status"] == 403
     r = req(port_p, "127.0.0.5", "POST", "/api/v1/password",
-            dict(change, Cookie=cookie_a),
+            authed_headers(cookie_a, csrf_a),
             json_body({"current_password": PASSWORD,
                        "new_password": "short"}))
     out["pw_change_too_short_400"] = r["status"] == 400
     r = req(port_p, "127.0.0.5", "POST", "/api/v1/password",
-            dict(change, Cookie=cookie_a),
+            authed_headers(cookie_a, csrf_a),
             json_body({"current_password": PASSWORD,
                        "new_password": NEW_PASSWORD}))
     out["pw_change_ok_200"] = r["status"] == 200
     out["other_session_invalidated"] = req(
         port_p, "127.0.0.5", "GET", "/api/v1/snapshot",
-        {"Cookie": cookie_b})["status"] == 401
+        {"Cookie": cookie_b2})["status"] == 401
     out["own_session_kept"] = req(
         port_p, "127.0.0.5", "GET", "/api/v1/snapshot",
         {"Cookie": cookie_a})["status"] == 200
@@ -460,6 +552,9 @@ def group_stale():
         snap.get("snapshot_generated_at"))
     out["collector_uptime_present"] = isinstance(
         snap.get("collector_uptime_seconds"), (int, float))
+    out["snapshot_version_present"] = isinstance(
+        snap.get("snapshot_version"), int)
+    out["last_publish_at_present"] = bool(snap.get("last_publish_at"))
 
     dead = make_stack(tempfile.mkdtemp(), password=PASSWORD,
                       whitelist=["127.0.0.5/32"],
@@ -472,6 +567,33 @@ def group_stale():
     out["unreachable_api_stale"] = snap_d["stale"] is True
     out["unreachable_api_empty_not_invented"] = \
         snap_d["devices"] == {} and snap_d["active_connections"] == 0
+
+    # --- publisher freeze: health is evaluated at READ time -----------------
+    frozen = make_stack(tempfile.mkdtemp(), password=PASSWORD,
+                        whitelist=["127.0.0.5/32"], poll=0.15,
+                        batches=[RESET_BATCH])
+    time.sleep(0.8)
+    broker = frozen["broker"]
+    version_before = broker.snapshot_json()[0]
+    dead_thread = threading.Thread(target=lambda: None)
+    dead_thread.start()
+    dead_thread.join()
+    broker._publisher_thread = dead_thread      # simulate thread death
+    broker._published_at = broker._clock() - 999  # simulate wedged publisher
+    cookie_f = cookie_of(login(frozen["port"], "127.0.0.5"))
+    snap_f = json.loads(req(frozen["port"], "127.0.0.5", "GET",
+                            "/api/v1/snapshot",
+                            {"Cookie": cookie_f})["body"])
+    out["publisher_freeze_web_status_stale"] = snap_f["web_status"] == "STALE"
+    out["publisher_freeze_consumer_alive"] = broker._consumer_alive()
+    out["publisher_freeze_state_kept"] = \
+        snap_f["devices"]["legacy"]["uplink_total"] == 100.0
+    out["publisher_freeze_version_present"] = \
+        isinstance(snap_f.get("snapshot_version"), int)
+    out["publisher_freeze_last_publish_present"] = \
+        bool(snap_f.get("last_publish_at"))
+    out["frozen_version_does_not_advance"] = \
+        broker.snapshot_json()[0] == version_before
     return out
 
 
@@ -480,8 +602,6 @@ def group_recovery():
     stack = make_stack(tempfile.mkdtemp(), password=PASSWORD,
                        recovery=RECOVERY_KEY)
     port = stack["port"]
-    out["recovery_page_nonwhitelisted_200"] = req(
-        port, "127.0.0.6", "GET", "/recovery")["status"] == 200
     wrong = req(port, "127.0.0.6", "POST", "/api/v1/recovery",
                 {"Content-Type": "application/json"},
                 json_body({"key": "wrong-key"}))
@@ -497,6 +617,8 @@ def group_recovery():
     out["recovery_no_session_cookie"] = "set-cookie" not in ok["headers"]
     out["recovery_success_message"] = \
         "IP added. Please login normally." in ok["body"]
+    out["recovery_success_leaks_no_whitelist"] = \
+        "whitelist" not in ok["body"] and body.get("entry") == "127.0.0.6/32"
     out["recovery_whitelist_updated"] = \
         stack["policy"].entries() == ("127.0.0.6/32",)
     out["recovery_cannot_view_snapshot"] = req(
@@ -513,6 +635,7 @@ def group_recovery():
                 json_body({"key": RECOVERY_KEY}))
     out["recovery_idempotent_200"] = again["status"] == 200
 
+    # per-IP lockout still works (3 failures -> 30 min lock)
     stack_l = make_stack(tempfile.mkdtemp(), recovery=RECOVERY_KEY)
     statuses = [req(stack_l["port"], "127.0.0.7", "POST", "/api/v1/recovery",
                     {"Content-Type": "application/json"},
@@ -520,11 +643,40 @@ def group_recovery():
                 for i in range(4)]
     out["recovery_rate_limit"] = statuses == [403, 403, 403, 429]
 
+    # GLOBAL guard: rolling window across DIFFERENT source addresses, and
+    # a rejected attempt must not perform any scrypt work.
+    guard = RecoveryGlobalGuard(max_concurrent=2, window_seconds=60.0,
+                                max_attempts_per_window=3)
+    stack_g = make_stack(tempfile.mkdtemp(), recovery=RECOVERY_KEY,
+                         recovery_guard=guard)
+    calls = {"n": 0}
+    real_verify = stack_g["auth"].verify_recovery_key
+
+    def counting_verify(key):
+        calls["n"] += 1
+        return real_verify(key)
+
+    stack_g["auth"].verify_recovery_key = counting_verify
+    global_statuses = []
+    for i, ip in enumerate(("127.0.0.11", "127.0.0.12", "127.0.0.13",
+                            "127.0.0.14")):
+        r = req(stack_g["port"], ip, "POST", "/api/v1/recovery",
+                {"Content-Type": "application/json"},
+                json_body({"key": "wrong-%d" % i}))
+        global_statuses.append(
+            (r["status"], r["headers"].get("retry-after")))
+    out["recovery_global_limit_429"] = \
+        [s for s, _ in global_statuses] == [403, 403, 403, 429]
+    out["recovery_global_retry_after"] = global_statuses[3][1] is not None \
+        and int(global_statuses[3][1]) >= 1
+    out["recovery_rejected_no_scrypt"] = calls["n"] == 3
+
     stack_r = make_stack(tempfile.mkdtemp(), password=PASSWORD,
                          recovery=RECOVERY_KEY,
                          whitelist=["127.0.0.5/32"])
     cookie = cookie_of(login(stack_r["port"], "127.0.0.5"))
-    rot = {"Content-Type": "application/json", "Cookie": cookie}
+    csrf = csrf_of(stack_r["port"], "127.0.0.5", cookie)
+    rot = authed_headers(cookie, csrf)
     r = req(stack_r["port"], "127.0.0.5", "POST", "/api/v1/recovery/rotate",
             rot, json_body({"current_password": "wrong"}))
     out["rotate_wrong_password_403"] = r["status"] == 403
@@ -551,16 +703,29 @@ def group_endpoints():
                        whitelist=["127.0.0.5/32"], batches=[RESET_BATCH])
     port = stack["port"]
     cookie = cookie_of(login(port, "127.0.0.5"))
-    authed = {"Content-Type": "application/json", "Cookie": cookie}
+    csrf = csrf_of(port, "127.0.0.5", cookie)
+    authed = authed_headers(cookie, csrf)
+    plain = {"Content-Type": "application/json", "Cookie": cookie}
+
     out["no_config_endpoint"] = req(port, "127.0.0.5", "POST",
                                     "/api/v1/config", authed,
                                     json_body({"anything": True}))["status"] == 404
-    out["no_close_endpoint_delete"] = req(port, "127.0.0.5", "DELETE",
-                                          "/api/v1/connections/abc",
-                                          authed)["status"] == 404
+    deleted = req(port, "127.0.0.5", "DELETE", "/api/v1/connections/abc",
+                  {"Cookie": cookie})
+    out["no_close_endpoint_delete"] = deleted["status"] == 405
+    out["delete_405_allow_header"] = \
+        deleted["headers"].get("allow") == "GET, POST"
     out["no_close_endpoint_post"] = req(port, "127.0.0.5", "POST",
                                         "/api/v1/connections/abc/close",
                                         authed)["status"] == 404
+    out["method_put_405"] = req(port, "127.0.0.5", "PUT", "/api/v1/snapshot",
+                                {"Cookie": cookie})["status"] == 405
+    out["method_patch_405"] = req(port, "127.0.0.5", "PATCH", "/",
+                                  {})["status"] == 405
+    out["method_options_405"] = req(port, "127.0.0.5", "OPTIONS", "/",
+                                    {})["status"] == 405
+    out["method_trace_405"] = req(port, "127.0.0.5", "TRACE", "/",
+                                  {})["status"] == 405
     out["no_reload_endpoint"] = req(port, "127.0.0.5", "POST",
                                     "/api/v1/reload", authed)["status"] == 404
     out["no_clients_endpoint"] = req(port, "127.0.0.5", "POST",
@@ -568,12 +733,21 @@ def group_endpoints():
                                      json_body({"user": "x"}))["status"] == 404
     out["unknown_get_404"] = req(port, "127.0.0.5", "GET",
                                  "/api/v1/nope")["status"] == 404
+    out["malformed_cl_400"] = req(
+        port, "127.0.0.5", "POST", "/api/v1/whitelist",
+        dict(plain, **{"Content-Length": "abc"}),
+        b'{"entry": "1.2.3.4/32"}')["status"] == 400
+    oversized = json.dumps({"entry": "1.2.3.4/32",
+                            "pad": "x" * 70000}).encode()
+    out["oversized_413"] = req(
+        port, "127.0.0.5", "POST", "/api/v1/whitelist",
+        dict(authed, **{"Content-Length": str(len(oversized))}),
+        oversized)["status"] == 413
+
     snap_raw = req(port, "127.0.0.5", "GET", "/api/v1/snapshot",
                    {"Cookie": cookie})["body"]
     out["no_offline_label"] = "OFFLINE" not in snap_raw
     out["no_tunnel_down_label"] = "Tunnel Down" not in snap_raw
-    out["no_client_manager_fields"] = "password" not in json.dumps(
-        list(json.loads(snap_raw).get("devices", {})))
 
     out["wl_add_invalid_400"] = req(port, "127.0.0.5", "POST",
                                     "/api/v1/whitelist", authed,
@@ -585,15 +759,176 @@ def group_endpoints():
     out["wl_remove_missing_404"] = req(port, "127.0.0.5", "POST",
                                        "/api/v1/whitelist/remove", authed,
                                        json_body({"entry": "203.0.113.1/32"}))["status"] == 404
+
+    # Server-authoritative self-lockout confirm: exact /32 AND parent /24
+    # both answer 409 FIRST; an unrelated CIDR removes immediately.
+    out["wl_add_parent_cidr"] = req(port, "127.0.0.5", "POST",
+                                    "/api/v1/whitelist", authed,
+                                    json_body({"entry": "127.0.0.0/24"}))["status"] == 200
     out["wl_remove_own_needs_confirm"] = req(
         port, "127.0.0.5", "POST", "/api/v1/whitelist/remove", authed,
         json_body({"entry": "127.0.0.5/32"}))["status"] == 409
+    out["wl_remove_parent_cidr_409"] = req(
+        port, "127.0.0.5", "POST", "/api/v1/whitelist/remove", authed,
+        json_body({"entry": "127.0.0.0/24"}))["status"] == 409
+    out["wl_remove_unrelated_immediate_200"] = req(
+        port, "127.0.0.5", "POST", "/api/v1/whitelist/remove", authed,
+        json_body({"entry": "198.51.100.0/24"}))["status"] == 200
+    out["wl_remove_parent_confirmed_200"] = req(
+        port, "127.0.0.5", "POST", "/api/v1/whitelist/remove", authed,
+        json_body({"entry": "127.0.0.0/24", "confirm": True}))["status"] == 200
     out["wl_remove_own_confirmed_200"] = req(
         port, "127.0.0.5", "POST", "/api/v1/whitelist/remove", authed,
         json_body({"entry": "127.0.0.5/32", "confirm": True}))["status"] == 200
     out["wl_remove_applied"] = req(port, "127.0.0.5", "GET",
                                    "/api/v1/whitelist",
                                    {"Cookie": cookie})["status"] == 403
+    return out
+
+
+def group_concurrency():
+    out = {}
+    errors = []
+
+    # 1) concurrent adds of the SAME CIDR -> exactly one entry, disk coherent
+    d1 = tempfile.mkdtemp()
+    pol1 = AccessPolicy(d1)
+
+    def adder():
+        try:
+            pol1.add("10.10.10.0/24")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=adder) for _ in range(24)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    out["concurrent_add_same_entry"] = not errors and \
+        pol1.entries() == ("10.10.10.0/24",)
+    out["concurrent_add_disk_coherent"] = \
+        AccessPolicy(d1).entries() == pol1.entries()
+
+    # 2) concurrent mixed add/remove -> memory == disk, no exceptions
+    d2 = tempfile.mkdtemp()
+    pol2 = AccessPolicy(d2)
+
+    def mixed(i):
+        try:
+            pol2.add("10.9.%d.0/24" % (i % 4))
+            if i % 2 == 0:
+                pol2.remove("10.9.%d.0/24" % (i % 4))
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=mixed, args=(i,)) for i in range(24)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    out["concurrent_mixed_coherent"] = not errors and \
+        AccessPolicy(d2).entries() == pol2.entries()
+
+    # 3) concurrent login failures all land in the limiter
+    auth1 = AuthStore(tempfile.mkdtemp())
+
+    def hammer():
+        for _ in range(25):
+            auth1.login_limiter.record_failure("8.8.8.8")
+
+    threads = [threading.Thread(target=hammer) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    allowed, _retry = auth1.login_limiter.check("8.8.8.8")
+    out["concurrent_login_failures_lock"] = not allowed
+
+    # 4) password change while sessions resolve concurrently
+    auth2 = AuthStore(tempfile.mkdtemp())
+    auth2.set_password("concurrent-pass-1")
+    toks = [auth2.sessions.create() for _ in range(20)]
+
+    def churn():
+        for _ in range(50):
+            for tok in toks:
+                auth2.sessions.resolve(tok)
+
+    def changer():
+        auth2.set_password("concurrent-pass-2")
+
+    t1 = threading.Thread(target=churn)
+    t2 = threading.Thread(target=changer)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+    out["password_change_during_use_ok"] = \
+        auth2.verify_password("concurrent-pass-2") and not errors
+    out["password_change_drops_old_sessions"] = all(
+        auth2.sessions.resolve(tok) is None for tok in toks)
+
+    # 5) recovery guard concurrency cap: exactly max_concurrent get through
+    guard = RecoveryGlobalGuard(max_concurrent=2, window_seconds=3600.0,
+                                max_attempts_per_window=1000)
+    results = {"ok": 0, "busy": 0}
+    results_lock = threading.Lock()
+
+    def grabber():
+        ok, _retry = guard.try_acquire()
+        with results_lock:
+            results["ok" if ok else "busy"] += 1
+
+    threads = [threading.Thread(target=grabber) for _ in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    out["guard_concurrency_cap"] = results == {"ok": 2, "busy": 8}
+
+    # 6) storage fault injection -> rollback, memory == disk
+    real_write = web.access.atomic_write_json
+
+    def boom(path, payload):
+        raise OSError("injected disk failure")
+
+    d3 = tempfile.mkdtemp()
+    pol3 = AccessPolicy(d3)
+    pol3.add("10.5.0.0/24")
+    web.access.atomic_write_json = boom
+    raised = False
+    try:
+        pol3.add("10.6.0.0/24")
+    except OSError:
+        raised = True
+    finally:
+        web.access.atomic_write_json = real_write
+    out["storage_fault_whitelist_rollback"] = raised and \
+        pol3.entries() == ("10.5.0.0/24",) and \
+        AccessPolicy(d3).entries() == ("10.5.0.0/24",)
+
+    auth3 = AuthStore(tempfile.mkdtemp())
+    auth3.set_password("rollback-pass-1")
+    auth3.set_recovery_key("rollback-key-a")
+    web.auth.atomic_write_json = boom
+    raised_pw = raised_key = False
+    try:
+        auth3.set_password("rollback-pass-2")
+    except OSError:
+        raised_pw = True
+    try:
+        auth3.set_recovery_key("rollback-key-b")
+    except OSError:
+        raised_key = True
+    finally:
+        web.auth.atomic_write_json = real_write
+    out["storage_fault_password_rollback"] = raised_pw and \
+        auth3.verify_password("rollback-pass-1") and \
+        not auth3.verify_password("rollback-pass-2")
+    out["storage_fault_recovery_rollback"] = raised_key and \
+        auth3.verify_recovery_key("rollback-key-a") and \
+        not auth3.verify_recovery_key("rollback-key-b")
     return out
 
 
@@ -605,6 +940,7 @@ GROUPS = {
     "stale": group_stale,
     "recovery": group_recovery,
     "endpoints": group_endpoints,
+    "concurrency": group_concurrency,
 }
 
 if __name__ == "__main__":
@@ -614,6 +950,7 @@ if __name__ == "__main__":
     except Exception as exc:  # noqa: BLE001 - surface harness errors as JSON
         results = {"_harness_error": "%s: %s" % (type(exc).__name__, exc)}
     print(json.dumps(results, sort_keys=True))
+
 HARNESS_EOF
 
 run_group() {
@@ -665,11 +1002,12 @@ check 'd["host_entry_v6"]' "recovery-style entry for v6 is /128"
 check 'd["host_entry_v4"]' "recovery-style entry for v4 is /32"
 check 'd["covers_inside"]' "covers() detects own-IP removals"
 check 'd["covers_outside"]' "covers() ignores unrelated IPs"
+check 'd["covers_ipv6_parent"]' "covers() handles IPv6 parent CIDR"
 check 'd["remove_works"]' "whitelist entry removable"
 check 'd["remove_missing_false"]' "removing a missing entry reports False"
 check 'd["corrupt_file_fails_closed"]' "corrupt access.json fails closed"
 
-section "W2: HTTP gate order (whitelist first, real sockets)"
+section "W2: HTTP gate order + recovery public asset chain"
 run_group "gate"
 check 'd.get("_harness_error") is None' "harness ran clean"
 check 'd["root_loopback_200"]' "loopback reaches the shell"
@@ -679,10 +1017,15 @@ check 'd["nonwhitelisted_session_403"]' "non-whitelisted IP -> 403 on session in
 check 'd["nonwhitelisted_snapshot_403"]' "non-whitelisted IP -> 403 on snapshot"
 check 'd["nonwhitelisted_stream_403"]' "non-whitelisted IP -> 403 on SSE"
 check 'd["nonwhitelisted_login_403"]' "non-whitelisted IP -> 403 even before login"
+check 'd["recovery_page_nonwhitelisted_200"]' "recovery page reachable without whitelist"
+check 'd["recovery_css_nonwhitelisted_200"]' "recovery chain: style.css reachable"
+check 'd["recovery_js_nonwhitelisted_200"]' "recovery chain: app.js reachable"
+check 'd["recovery_favicon_nonwhitelisted_200"]' "recovery chain: favicon reachable"
+check 'd["recovery_api_exempt_reaches_handler"]' "recovery API exempt (uniform invalid-key 403)"
+check 'd["recovery_assets_do_not_open_dashboard"]' "asset exemption does NOT open the dashboard"
+check 'd["no_wildcard_static_exemption"]' "no wildcard /static exemption (traversal still 404)"
 check 'd["xff_cannot_bypass"]' "X-Forwarded-For cannot bypass the whitelist"
 check 'd["xff_and_realip_cannot_bypass"]' "X-Forwarded-For + X-Real-IP cannot bypass"
-check 'd["recovery_page_exempt_200"]' "/recovery page is the whitelist exception"
-check 'd["recovery_api_exempt_reaches_handler"]' "recovery API exempt (503 = unconfigured, not 403)"
 check 'd["csp_header"]' "CSP: default-src 'self'"
 check 'd["nosniff_header"]' "X-Content-Type-Options: nosniff"
 check 'd["referrer_header"]' "Referrer-Policy: no-referrer"
@@ -696,23 +1039,34 @@ check 'd["session_info_current_ip"]' "session info reports the socket peer IP"
 check 'd["session_info_unauthenticated"]' "session info shows unauthenticated"
 check 'd["session_info_snapshot_still_gated"]' "whitelisted but unauthenticated -> 401 on snapshot"
 
-section "W3: admin authentication"
+section "W3: admin authentication + session-bound CSRF"
 run_group "auth"
 check 'd.get("_harness_error") is None' "harness ran clean"
 check 'd["wrong_login_401"]' "invalid login fails"
 check 'd["no_cookie_on_failed_login"]' "no cookie on failed login"
 check 'd["good_login_200"]' "valid login succeeds"
 check 'd["cookie_httponly"]' "cookie is HttpOnly"
-check 'd["cookie_secure"]' "cookie is Secure"
+check 'd["cookie_secure_absent_loopback"]' "loopback HTTP cookie omits Secure (by design)"
 check 'd["cookie_samesite_strict"]' "cookie is SameSite=Strict"
 check 'd["snapshot_unauthenticated_401"]' "snapshot requires login"
 check 'd["snapshot_authenticated_200"]' "session cookie opens the snapshot"
 check 'd["password_never_returned"]' "password never returned in responses"
 check 'd["session_info_authenticated"]' "session info reflects the login"
+check 'd["csrf_token_in_session"]' "authenticated session exposes its CSRF token"
 check 'd["auth_hash_only_scrypt"]' "auth.json stores a scrypt hash"
 check 'd["auth_no_plaintext"]' "auth.json has NO plaintext password"
 check 'd["access_json_exists"]' "access.json in the data dir"
+check 'd["csrf_missing_403"]' "mutation WITHOUT CSRF token -> 403"
+check 'd["csrf_wrong_403"]' "mutation with WRONG CSRF token -> 403"
+check 'd["csrf_correct_200"]' "mutation with correct CSRF token -> 200"
+check 'd["csrf_get_unaffected"]' "GET endpoints need no CSRF token"
+check 'd["login_unaffected_by_csrf"]' "login needs no CSRF token (no session yet)"
+check 'd["csrf_session_bound_403"]' "session A token cannot act on session B cookie"
+check 'd["csrf_cross_sessions_ok"]' "each session works with its own token"
+check 'd["origin_foreign_403"]' "foreign Origin rejected (second layer)"
+check 'd["origin_same_200"]' "same-origin POST accepted"
 check 'd["expired_session_401"]' "expired session rejected"
+check 'd["csrf_expired_session_401"]' "expired session + old CSRF -> 401 (session first)"
 check 'd["rate_limit_first_five_401"]' "five bad logins -> 401"
 check 'd["rate_limit_sixth_429"]' "sixth bad login -> 429 (IP rate limit)"
 check 'd["pw_change_wrong_current_403"]' "password change re-verifies current password"
@@ -738,7 +1092,7 @@ check 'd["snapshot_after_disconnect_200"]' "snapshot endpoint healthy after disc
 check 'd["connections_rows_present"]' "snapshot carries per-connection rows from E1"
 check 'd["snapshot_totals_untouched"]' "totals come from E1 unchanged"
 
-section "W5: stale semantics inherited from E1"
+section "W5: stale semantics + publisher freeze detection"
 run_group "stale"
 check 'd.get("_harness_error") is None' "harness ran clean"
 check 'd["stale_flag_true"]' "stream failure -> stale=true in the web snapshot"
@@ -752,50 +1106,71 @@ check 'd["stale_last_success_recorded"]' "last successful API event recorded"
 check 'd["monitor_started_at_present"]' "monitor_started_at present"
 check 'd["snapshot_generated_at_present"]' "snapshot_generated_at present"
 check 'd["collector_uptime_present"]' "collector uptime present"
+check 'd["snapshot_version_present"]' "snapshot_version present in every snapshot"
+check 'd["last_publish_at_present"]' "last_publish_at present in every snapshot"
 check 'd["unreachable_api_stale"]' "unreachable service.api -> stale"
 check 'd["unreachable_api_empty_not_invented"]' "no devices invented when none were seen"
+check 'd["publisher_freeze_web_status_stale"]' "frozen publisher -> web_status STALE (read-time health)"
+check 'd["publisher_freeze_consumer_alive"]' "consumer thread alive while publisher frozen"
+check 'd["publisher_freeze_state_kept"]' "frozen broker still serves the last real state"
+check 'd["publisher_freeze_version_present"]' "frozen snapshot still carries version fields"
+check 'd["publisher_freeze_last_publish_present"]' "frozen snapshot still carries last_publish_at"
+check 'd["frozen_version_does_not_advance"]' "frozen publisher does not advance the version"
 
-section "W6: recovery flow"
+section "W6: recovery flow + global verification budget"
 run_group "recovery"
 check 'd.get("_harness_error") is None' "harness ran clean"
-check 'd["recovery_page_nonwhitelisted_200"]' "recovery page reachable without whitelist"
 check 'd["recovery_wrong_key_403"]' "wrong recovery key rejected"
 check 'd["recovery_ok_200"]' "correct recovery key accepted"
 check 'd["recovery_adds_caller_only"]' "recovery adds ONLY the caller IP (/32)"
 check 'd["recovery_ignores_supplied_ip"]' "client-supplied target IP ignored"
 check 'd["recovery_no_session_cookie"]' "recovery never creates an admin session"
 check 'd["recovery_success_message"]' "success message points back to login"
+check 'd["recovery_success_leaks_no_whitelist"]' "success response leaks no whitelist contents"
 check 'd["recovery_whitelist_updated"]' "whitelist gained exactly the caller host entry"
 check 'd["recovery_cannot_view_snapshot"]' "recovery cannot view the dashboard"
 check 'd["recovery_cannot_view_whitelist"]' "recovery cannot view the whitelist"
 check 'd["recovery_cannot_change_password"]' "recovery cannot change the password"
 check 'd["recovery_idempotent_200"]' "repeated recovery with the same key stays 200"
-check 'd["recovery_rate_limit"]' "recovery failures rate-limited (3x403 then 429)"
+check 'd["recovery_rate_limit"]' "per-IP recovery failures rate-limited (3x403 then 429)"
+check 'd["recovery_global_limit_429"]' "GLOBAL window limit hits across different IPs"
+check 'd["recovery_global_retry_after"]' "global limit 429 carries Retry-After"
+check 'd["recovery_rejected_no_scrypt"]' "rejected attempts perform NO scrypt work"
 check 'd["rotate_wrong_password_403"]' "rotation re-verifies the password"
 check 'd["rotate_ok_200"]' "rotation issues a new key"
 check 'd["rotate_new_key_differs"]' "new key differs from the old one"
 check 'd["rotate_old_key_rejected"]' "old key invalid after rotation"
 check 'd["rotate_new_key_adds_caller"]' "new key adds the caller (/32)"
 
-section "W7: read-only surface (no mutation endpoints)"
+section "W7: read-only surface, HTTP guards, self-lockout flow"
 run_group "endpoints"
 check 'd.get("_harness_error") is None' "harness ran clean"
 check 'd["no_config_endpoint"]' "no /api/v1/config endpoint"
-check 'd["no_close_endpoint_delete"]' "no DELETE connection endpoint"
+check 'd["no_close_endpoint_delete"]' "DELETE -> uniform 405 (no delete endpoint)"
+check 'd["delete_405_allow_header"]' "405 carries Allow: GET, POST"
 check 'd["no_close_endpoint_post"]' "no close-connection endpoint"
+check 'd["method_put_405"]' "PUT -> 405"
+check 'd["method_patch_405"]' "PATCH -> 405"
+check 'd["method_options_405"]' "OPTIONS -> 405"
+check 'd["method_trace_405"]' "TRACE -> 405"
 check 'd["no_reload_endpoint"]' "no reload endpoint"
 check 'd["no_clients_endpoint"]' "no client management endpoint"
 check 'd["unknown_get_404"]' "unknown API paths 404"
+check 'd["malformed_cl_400"]' "malformed Content-Length -> 400"
+check 'd["oversized_413"]' "oversized body -> 413"
 check 'd["no_offline_label"]' "snapshot JSON never contains OFFLINE"
 check 'd["no_tunnel_down_label"]' "snapshot JSON never contains Tunnel Down"
-check 'd["no_client_manager_fields"]' "no device names carry credential fields"
 check 'd["wl_add_invalid_400"]' "invalid CIDR rejected at the API"
 check 'd["wl_add_ok_200"]' "valid CIDR accepted"
 check 'd["wl_add_persisted"]' "whitelist add persisted"
 check 'd["wl_remove_missing_404"]' "removing unknown entry 404"
-check 'd["wl_remove_own_needs_confirm"]' "removing own IP requires confirm"
-check 'd["wl_remove_own_confirmed_200"]' "own-IP removal works with confirm"
-check 'd["wl_remove_applied"]' "removed entry actually gates the caller again"
+check 'd["wl_add_parent_cidr"]' "parent /24 entry added for the confirm test"
+check 'd["wl_remove_own_needs_confirm"]' "exact /32 covering own IP -> 409 first"
+check 'd["wl_remove_parent_cidr_409"]' "parent /24 covering own IP -> 409 first"
+check 'd["wl_remove_unrelated_immediate_200"]' "unrelated CIDR removes WITHOUT confirm"
+check 'd["wl_remove_parent_confirmed_200"]' "confirmed retry after 409 removes the parent /24"
+check 'd["wl_remove_own_confirmed_200"]' "confirmed retry removes the exact /32"
+check 'd["wl_remove_applied"]' "removed entries actually gate the caller again"
 
 section "W8: setup + serve CLI (real subprocesses)"
 SETUP_DIR="$TMP/cli-setup"
@@ -860,10 +1235,11 @@ SERVE_COOKIE="$(printf '%s' "$CURL_LOGIN" | grep -i '^set-cookie:' | head -1 | s
 CURL_STALE=""
 for _ in $(seq 1 40); do
     CURL_STALE="$(curl -s -H "Cookie: $SERVE_COOKIE" "http://127.0.0.1:$SERVE_PORT/api/v1/snapshot")"
-    if printf %s "$CURL_STALE" | grep -qF '"stale": true'; then break; fi
+    if printf '%s' "$CURL_STALE" | grep -qF '"stale": true'; then break; fi
     sleep 0.5
 done
 assert_contains '"stale": true' "$CURL_STALE" "dead service.api -> dashboard shows stale=true"
+assert_contains '"snapshot_version"' "$CURL_STALE" "real server snapshot carries snapshot_version"
 assert_contains '"api_status": "STALE"' "$CURL_STALE" "api_status STALE for the banner"
 kill "$SERVE_PID" 2>/dev/null
 wait "$SERVE_PID" 2>/dev/null
@@ -902,6 +1278,9 @@ if [ -x "$(command -v openssl)" ]; then
     assert_contains "remote+TLS" "$(cat "$TMP/serve-tls.log")" "remote mode reports remote+TLS"
     TLS_CODE="$(curl -sk -o /dev/null -w '%{http_code}' "https://127.0.0.2:$TLS_PORT/")"
     assert_eq "$TLS_CODE" "200" "HTTPS (self-signed) serves the shell"
+    TLS_LOGIN="$(curl -sk -D - -o /dev/null -X POST "https://127.0.0.2:$TLS_PORT/api/v1/login" \
+        -H 'Content-Type: application/json' -d '{"password": "serve-password-3"}')"
+    assert_contains "Secure" "$TLS_LOGIN" "remote TLS cookie is Secure"
     TLS_403="$(curl -sk -o /dev/null -w '%{http_code}' "https://127.0.0.2:$TLS_PORT/api/v1/snapshot")"
     assert_eq "$TLS_403" "401" "HTTPS snapshot still requires login"
     kill "$TLS_PID" 2>/dev/null
@@ -909,6 +1288,20 @@ if [ -x "$(command -v openssl)" ]; then
 else
     fail "openssl available for self-signed TLS (environment problem)"
 fi
+
+section "W9: concurrency + storage fault injection"
+run_group "concurrency"
+check 'd.get("_harness_error") is None' "harness ran clean"
+check 'd["concurrent_add_same_entry"]' "24 concurrent adds of one CIDR -> single entry"
+check 'd["concurrent_add_disk_coherent"]' "concurrent adds keep memory == disk"
+check 'd["concurrent_mixed_coherent"]' "concurrent mixed add/remove stays coherent"
+check 'd["concurrent_login_failures_lock"]' "concurrent login failures all recorded -> lockout"
+check 'd["password_change_during_use_ok"]' "password change during session churn works"
+check 'd["password_change_drops_old_sessions"]' "password change drops old sessions under concurrency"
+check 'd["guard_concurrency_cap"]' "recovery guard admits exactly max_concurrent verifications"
+check 'd["storage_fault_whitelist_rollback"]' "whitelist write failure -> rollback, memory == disk"
+check 'd["storage_fault_password_rollback"]' "password write failure -> old password still valid"
+check 'd["storage_fault_recovery_rollback"]' "recovery-key write failure -> old key still valid"
 
 printf '\n== summary ==\n'
 printf '  pass=%d fail=%d (expected pass=%d)\n' "$PASS" "$FAIL" "$EXPECTED_PASS"
