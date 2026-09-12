@@ -501,14 +501,16 @@ if [ "$IS_LINUX" = "1" ]; then
     rm -f "$PERMBOX/config"
     harden_sensitive_permissions
     assert_rc 0 $? "missing sensitive file is skipped, not an error"
-    # chmod failure is fail-closed
+    # chmod failure is fail-closed: re-point the state file at a path the
+    # chmod override refuses, so the helper's own loop hits the failure
+    SB_STATE_FILE="$PERMBOX/BLOCKED-state"
+    touch "$PERMBOX/BLOCKED-state"
     chmod() { if [[ "${2:-}" == *BLOCKED* ]]; then return 1; fi; command chmod "$@"; }
-    mv "$PERMBOX/config" "$PERMBOX/BLOCKED-state" 2>/dev/null
-    touch "$PERMBOX/config"
     harden_sensitive_permissions > "$TMP/s9.out" 2>&1
     assert_rc 1 $? "chmod failure fails closed"
     assert_grep '拒绝继续' "$TMP/s9.out" "chmod failure reason stated"
     unset -f chmod
+    rm -f "$PERMBOX/BLOCKED-state"
 else
     harden_sensitive_permissions
     assert_rc 0 $? "harden_sensitive_permissions succeeds (Windows rc path)"
