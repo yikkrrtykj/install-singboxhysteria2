@@ -1117,6 +1117,14 @@ delete_client() { # delete_client <name> -> removes from BOTH inbounds atomicall
 
 _delete_client_locked() {
     local name="$1" candidate
+    # The destructive helper revalidates EVERYTHING itself and never trusts the
+    # outer delete_client(): order is name syntax -> reserved -> consistency
+    # audit -> existence -> mutation. Any rejection leaves the live config and
+    # the filesystem untouched.
+    if ! validate_client_name "$name"; then
+        warning "客户端名称非法: '$name'（locked helper 二次防护，允许: 字母/数字开头，仅字母数字._-，长度 1-32）"
+        return 1
+    fi
     # Invariant enforced again INSIDE the destructive helper: even a future
     # caller that bypasses delete_client must never be able to remove legacy.
     if [ "$name" = "$RESERVED_CLIENT_NAME" ]; then
@@ -1149,8 +1157,10 @@ _delete_client_locked() {
         return 1
     fi
     # Only after the server-side commit succeeded may the derived files go.
+    # The name was revalidated above; "--" only stops option parsing, it is
+    # never a substitute for validation.
     if [ -d "$SB_CLIENTS_DIR/$name" ]; then
-        rm -rf "$SB_CLIENTS_DIR/$name"
+        rm -rf -- "${SB_CLIENTS_DIR:?}/$name"
         info "已删除派生客户端配置目录: $SB_CLIENTS_DIR/$name"
     fi
     info "客户端 '$name' 已从 Reality 与 HY2 同时删除"
