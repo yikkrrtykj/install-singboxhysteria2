@@ -34,9 +34,9 @@ if command -v shellcheck >/dev/null 2>&1; then
 else
     printf '  SKIP shellcheck 未安装\n'
 fi
-assert_grep '"type": "api"' "$INSTALL_SH" "fresh install writes the service.api inbound"
-assert_grep '"listen": "127.0.0.1"' "$INSTALL_SH" "fresh api inbound is loopback-only"
-assert_grep '"listen_port": 9091' "$INSTALL_SH" "fresh api inbound port is 9091"
+assert_grep '"type": "api"' "$INSTALL_SH" "fresh install writes the monitor-api service"
+assert_grep '"listen": "127.0.0.1"' "$INSTALL_SH" "fresh monitor-api service is loopback-only"
+assert_grep '"listen_port": 9091' "$INSTALL_SH" "fresh monitor-api service port is 9091"
 assert_grep '"name": "legacy"' "$INSTALL_SH" "fresh install default user stays name=legacy"
 assert_no_grep 'releases/latest' "$INSTALL_SH" "no /latest auto-crossing (1.14 selector only)"
 
@@ -219,7 +219,7 @@ printf '0\n' > "$MOCK_COUNT_FILE"
 . "$TMP/blocks.sh"
 
 # ------------------------------------------------------------------ helpers --
-write_migrated_config() { # Phase C 已完成形态：legacy + vmix-01，均具名，无 api inbound
+write_migrated_config() { # Phase C 已完成形态：legacy + vmix-01，均具名，无 monitor-api service
     cat > "$SB_SERVER_CONFIG" <<'EOF'
 {
   "inbounds": [
@@ -438,12 +438,12 @@ export RESTART_FAIL_MODE="none"
 
 section "D13: successful upgrade preserves every user credential; idempotent"
 setup_upgrade_sandbox
-users_before="$(jq -Sc '[.inbounds[] | select(.type != "api") | .users] | sort' "$SB_SERVER_CONFIG")"
+users_before="$(jq -Sc '[.inbounds[] | .users] | sort' "$SB_SERVER_CONFIG")"
 upgrade_singbox_1_14 > "$TMP/d13.out" 2>&1
 assert_rc 0 $? "upgrade succeeds"
 assert_rc 1 "$(printf '%s' "$("$SB_SING_BOX_BIN" version)" | grep -c '1.14.7')" "live binary is now 1.14.7"
 assert_rc 1 "$(jq -r '[.services[]? | select(.tag == "monitor-api")] | length' "$SB_SERVER_CONFIG" | tr -d '\r')" "exactly one monitor-api service after upgrade"
-users_after="$(jq -Sc '[.inbounds[] | select(.type != "api") | .users] | sort' "$SB_SERVER_CONFIG" | tr -d '\r')"
+users_after="$(jq -Sc '[.inbounds[] | .users] | sort' "$SB_SERVER_CONFIG" | tr -d '\r')"
 if [ "$users_before" = "$users_after" ]; then pass "all user credentials preserved verbatim"; else fail "users changed by upgrade"; fi
 assert_grep 'OLD-REALITY-UUID' "$SB_SERVER_CONFIG" "legacy reality uuid kept"
 assert_grep 'VMIX-HY2-PASSWORD' "$SB_SERVER_CONFIG" "vmix-01 hy2 password kept"

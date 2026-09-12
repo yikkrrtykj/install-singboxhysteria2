@@ -12,28 +12,6 @@ error() { warning "$*" && exit 1; }
 info() { echo -e "${green}$*${reset}"; }
 hint() { echo -e "${yellow}$*${reset}"; }
 
-SING_BOX_MIN_VERSION="1.13.0"
-SING_BOX_FALLBACK_VERSION_TAG="v1.13.19"
-
-version_at_least() {
-    local version="${1#v}"
-    local minimum="${2#v}"
-    local v_major v_minor v_patch m_major m_minor m_patch
-
-    IFS='.' read -r v_major v_minor v_patch _ <<< "$version"
-    IFS='.' read -r m_major m_minor m_patch _ <<< "$minimum"
-    v_major=${v_major:-0}; v_minor=${v_minor:-0}; v_patch=${v_patch:-0}
-    m_major=${m_major:-0}; m_minor=${m_minor:-0}; m_patch=${m_patch:-0}
-    v_patch=${v_patch%%[^0-9]*}
-    m_patch=${m_patch%%[^0-9]*}
-
-    if ((10#$v_major > 10#$m_major)); then return 0; fi
-    if ((10#$v_major < 10#$m_major)); then return 1; fi
-    if ((10#$v_minor > 10#$m_minor)); then return 0; fi
-    if ((10#$v_minor < 10#$m_minor)); then return 1; fi
-    ((10#${v_patch:-0} >= 10#${m_patch:-0}))
-}
-
 show_notice() {
     local message="$1"
     local terminal_width=$(tput cols)
@@ -1400,13 +1378,9 @@ client_management_menu() {
 # <<< phase-c client-management <<< ============================================
 
 # >>> phase-d singbox-1.14-api >>> =============================================
-# Phase D: safe production upgrade 1.13.x -> 1.14.x stable with a localhost-only
-# sing-box service.api (top-level "services" entry, data source for the future
-# Monitor v2). Scope: no Monitor UI/daemon, no database, no conntrack/ss.
-#
-# The primitive layer below was contributed on this branch as lib/phase-d.sh and
-# is folded into install.sh here because the installer is distributed as ONE
-# self-contained file (install-shortcut downloads only install.sh).
+# Phase D: safe production upgrade to 1.14.x stable with a localhost-only
+# service.api (top-level "services" entry); the installer is a single
+# self-contained file, so all Phase D primitives live here.
 PHASE_D_TARGET_MAJOR="${PHASE_D_TARGET_MAJOR:-1}"
 PHASE_D_TARGET_MINOR="${PHASE_D_TARGET_MINOR:-14}"
 PHASE_D_MIN_VERSION="${PHASE_D_MIN_VERSION:-1.14.0}"

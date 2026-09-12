@@ -52,10 +52,12 @@ mianyang
 作用：进入 `4. sing-box基础操作`。子菜单功能：
 
 1. 检查现有配置，成功后重启 systemd 服务；
-2. 下载最新正式版内核，先用现有配置验证，并备份旧内核；
+2. 安全升级到最新 stable 1.14.x：升级前执行身份/API/配置审计；binary + config 成对备份；重启后验证 Reality、HY2、localhost service.api；失败自动双回滚；
 3. 查看 `sing-box.service` 是否正在运行；
 4. 持续查看实时日志，按 `Ctrl+C` 退出；
 5. 查看完整服务端配置，输出包含 UUID、密码和私钥，不要公开。
+
+`service.api` 仅监听 `127.0.0.1:9091`，不向公网开放。
 
 ```bash
 systemctl status sing-box --no-pager
