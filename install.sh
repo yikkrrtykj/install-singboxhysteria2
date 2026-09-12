@@ -1424,7 +1424,7 @@ select_1_14_stable_tag() {
               | select(test("^v1\\.14\\.[0-9]+$")) ]
         | sort_by(sub("^v"; "") | split(".") | map(tonumber))
         | last // empty
-    ' 2>/dev/null)"
+    ' 2>/dev/null | tr -d '\r')"
     if [ -z "$tag" ] || [ "$tag" = "null" ]; then
         warning "GitHub releases 中没有可用的 stable v1.14.x（拒绝 1.13.x / 1.15.x / prerelease）"
         return 1
@@ -1467,7 +1467,7 @@ has_compliant_api_inbound() { # has_compliant_api_inbound <config>
     local count problems
     problems="$(api_injection_problems "$1")" || return 1
     [ -z "$problems" ] || return 1
-    count="$(jq -r '[.inbounds[]? | select(.type == "api")] | length' "$1" 2>/dev/null)" || return 1
+    count="$(jq -r '[.inbounds[]? | select(.type == "api")] | length' "$1" 2>/dev/null | tr -d '\r')" || return 1
     [ "$count" = "1" ]
 }
 
@@ -1703,8 +1703,8 @@ _upgrade_singbox_1_14_locked() {
         return 1
     fi
 
-    if api_port_occupied; then
-        warning "${SB_API_LISTEN}:${SB_API_PORT} 已被占用，拒绝升级"
+    if ! has_compliant_api_inbound "$SB_SERVER_CONFIG" && api_port_occupied; then
+        warning "${SB_API_LISTEN}:${SB_API_PORT} 已被占用，拒绝升级（即将新增 API 监听）"
         return 1
     fi
 
