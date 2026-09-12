@@ -604,6 +604,7 @@ fi
 
 section "R3-1b forward daemon-reload failure -> transaction rollback"
 if [ "$SYMLINKS_OK" = 1 ]; then
+    echo "# r3-1b-drift" >> "$FIX_UNIT"   # unit must CHANGE so the reload fires
     UNIT_R3B="$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)"
     LINK_R3B="$(readlink "$FIX_APP_LINK")"
     printf '0.6.0\n' > "$FIX_SRC/VERSION"
@@ -622,6 +623,7 @@ fi
 
 section "R3-1c forward wait-active failure -> transaction rollback"
 if [ "$SYMLINKS_OK" = 1 ]; then
+    rm -f "$MOCK_FAIL_DAEMON_RELOAD_COUNT"   # no leftover fault flags
     UNIT_R3C="$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)"
     LINK_R3C="$(readlink "$FIX_APP_LINK")"
     printf '0.7.0\n' > "$FIX_SRC/VERSION"
