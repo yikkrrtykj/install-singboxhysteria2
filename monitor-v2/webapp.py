@@ -239,9 +239,10 @@ def cmd_serve(args):
         _remote_gate_password(problems, data_dir)   # authentication wiring
         _remote_gate_recovery(problems, data_dir)   # recovery wiring
         if problems:
-            print("refusing to start remote listener:", file=sys.stderr)
+            print("refusing to start remote listener:", file=sys.stderr,
+              flush=True)
             for problem in problems:
-                print("  - %s" % problem, file=sys.stderr)
+                print("  - %s" % problem, file=sys.stderr, flush=True)
             return 2
 
     collector = Collector(url=args.url, interval=args.interval,
@@ -261,7 +262,7 @@ def cmd_serve(args):
     scheme = "https" if tls_context is not None else "http"
     print("monitor web (%s) listening on %s:%d [%s]" %
           (MONITOR_WEB_VERSION, args.listen, args.port,
-           "remote+TLS" if remote_mode else "loopback"))
+           "remote+TLS" if remote_mode else "loopback"), flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
