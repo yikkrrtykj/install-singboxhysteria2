@@ -371,22 +371,24 @@
       .catch(function (error) { wlMessage(error.message, true); });
   }
 
-  function removeEntry(entry) {
-    var ownIp = state.whitelist && state.whitelist.current_ip;
-    var isOwn = ownIp && entryContains(entry, ownIp);
-    if (isOwn &&
-        !window.confirm("Removing this IP will lock this browser out.\n" +
-                        "Recovery key will be required. Continue?")) {
-      return;
-    }
-    api("/api/v1/whitelist/remove",
-        { method: "POST", body: { entry: entry, confirm: true } })
+  function removeEntry(entry, confirmed) {
+    // Server-authoritative two-phase flow: the FIRST request never carries
+    // confirm -- the server decides whether the entry covers the caller's
+    // source address and answers 409 if so. Only after the user confirms
+    // the lock-out warning is the confirmed retry sent.
+    var body = { entry: entry };
+    if (confirmed) { body.confirm = true; }
+    api("/api/v1/whitelist/remove", { method: "POST", body: body })
       .then(function () { wlMessage("Removed " + entry, false); loadAccess(); })
-      .catch(function (error) { wlMessage(error.message, true); });
-  }
-
-  function entryContains(entry, ip) {
-    return entry === ip || entry.indexOf(ip + "/") === 0;
+      .catch(function (error) {
+        if (error.status === 409 && !confirmed &&
+            window.confirm("Removing this entry will lock this browser out.\n" +
+                           "Recovery key will be required. Continue?")) {
+          removeEntry(entry, true);
+          return;
+        }
+        wlMessage(error.message, true);
+      });
   }
 
   /* ---------- settings: password + recovery ---------- */
