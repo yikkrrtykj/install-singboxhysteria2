@@ -279,6 +279,19 @@ HY_HOPPING_START=
 HY_HOPPING_END=
 EOF
 }
+# Listener fixtures for the mocked `ss`: BEFORE a restart only the two protocol
+# listeners exist (no API yet); AFTER a successful restart the loopback API
+# listener appears. Every stateful section must (re)initialise these itself --
+# never rely on the previous test having restored them (D17 deliberately leaves
+# a polluted SS_TCP behind to prove the 9091 conflict path).
+reset_listener_fixtures() {
+    export SS_TCP="LISTEN 0 128 0.0.0.0:18443 0.0.0.0:*"
+    export SS_UDP="UNCONN 0 0 0.0.0.0:18444 0.0.0.0:*"
+    export SS_TCP_AFTER="LISTEN 0 128 0.0.0.0:18443 0.0.0.0:*
+LISTEN 0 128 127.0.0.1:9091 0.0.0.0:*"
+    export SS_UDP_AFTER="UNCONN 0 0 0.0.0.0:18444 0.0.0.0:*"
+}
+
 setup_upgrade_sandbox() {
     write_state FALSE
     write_migrated_config
@@ -286,13 +299,7 @@ setup_upgrade_sandbox() {
     chmod +x "$SB_SING_BOX_BIN"
     # each scenario starts from a clean pre-upgrade state: no old backups
     rm -f "$SANDBOX"/sing-box.bak.* "$SANDBOX"/sbconfig_server.json.bak.*
-    # BEFORE the upgrade: only the two protocol listeners exist (no API yet).
-    export SS_TCP="LISTEN 0 128 0.0.0.0:18443 0.0.0.0:*"
-    export SS_UDP="UNCONN 0 0 0.0.0.0:18444 0.0.0.0:*"
-    # AFTER a successful restart: the loopback API listener appears.
-    export SS_TCP_AFTER="LISTEN 0 128 0.0.0.0:18443 0.0.0.0:*
-LISTEN 0 128 127.0.0.1:9091 0.0.0.0:*"
-    export SS_UDP_AFTER="UNCONN 0 0 0.0.0.0:18444 0.0.0.0:*"
+    reset_listener_fixtures
     export GITHUB_FIXTURE="$TMP/gh-main.json"
     : > "$SYSTEMCTL_LOG"
     printf '0\n' > "$RESTART_COUNT_FILE"
@@ -477,26 +484,45 @@ upgrade_singbox_1_14 > "$TMP/d17.out" 2>&1
 assert_rc 1 $? "upgrade refused when 9091 occupied"
 assert_grep '已被占用' "$TMP/d17.out" "port conflict reason stated"
 if [ "$cfg_sha" = "$(sha "$SB_SERVER_CONFIG")" ] && [ "$bin_sha" = "$(sha "$SB_SING_BOX_BIN")" ]; then pass "live untouched (D17)"; else fail "live mutated (D17)"; fi
-export SS_TCP="LISTEN 0 128 0.0.0.0:18443 0.0.0.0:*
-LISTEN 0 128 127.0.0.1:9091 0.0.0.0:*"
+# NOTE: D17 intentionally leaves SS_TCP polluted (9091 occupied). D16 and every
+# later section re-initialise their own fixtures and must not rely on a manual
+# restore here.
 
 section "D16: Phase C add and Phase D upgrade share one flock (no lost update)"
+# D16 is fully order-independent: D17 deliberately leaves a polluted SS_TCP
+# (9091 "occupied") behind, so this section re-initialises every fixture and
+# mode itself instead of trusting the previous test's cleanup.
+CONC="$TMP/conc"
+mkdir -p "$CONC"
+export SB_SERVER_CONFIG="$CONC/sbconfig_server.json"
+export SB_STATE_FILE="$CONC/config"
+export SB_CLIENTS_DIR="$CONC/clients"
+export SB_SING_BOX_BIN="$CONC/sing-box"
+export SB_LOCK_FILE="$CONC/config.lock"
+export SB_HOPPING_SERVICE="$CONC/hy2-hopping.service"
+SB_SANDBOX_CONFIG="$SB_SERVER_CONFIG"
+write_state FALSE
+write_migrated_config
+cp "$TMP/mock-old-sb" "$SB_SING_BOX_BIN"
+chmod +x "$SB_SING_BOX_BIN"
+reset_listener_fixtures
+export GITHUB_FIXTURE="$TMP/gh-main.json"
+export SYSTEMCTL_MODE="ok"
+export PGREP_MODE="found"
+export RESTART_FAIL_MODE="none"
+: > "$SYSTEMCTL_LOG"
+printf '0\n' > "$RESTART_COUNT_FILE"
+rm -f "$TMP/new-check-fail" "$TMP/new-api-fail"
+export SB_NEW_CHECK_FAIL="$TMP/new-check-fail"
+export SB_NEW_API_FAIL="$TMP/new-api-fail"
+export MOCK_COUNT_FILE="$CONC/cred-count"
+printf '0\n' > "$MOCK_COUNT_FILE"
+# fail fast, BEFORE forking, if the fixtures are ever polluted again
+assert_no_grep '127\.0\.0\.1:9091' <(printf '%s\n' "$SS_TCP") "D16 pre-upgrade fixture has no API listener"
+assert_grep '127\.0\.0\.1:9091' <(printf '%s\n' "$SS_TCP_AFTER") "D16 post-upgrade fixture has loopback API"
 if ! command -v flock >/dev/null 2>&1; then
     printf '  SKIP concurrency test: flock unavailable\n'
 else
-    CONC="$TMP/conc"
-    mkdir -p "$CONC"
-    export SB_SERVER_CONFIG="$CONC/sbconfig_server.json"
-    export SB_STATE_FILE="$CONC/config"
-    export SB_CLIENTS_DIR="$CONC/clients"
-    export SB_SING_BOX_BIN="$CONC/sing-box"
-    export SB_LOCK_FILE="$CONC/config.lock"
-    export SB_HOPPING_SERVICE="$CONC/hy2-hopping.service"
-    SB_SANDBOX_CONFIG="$SB_SERVER_CONFIG"
-    write_state FALSE
-    write_migrated_config
-    cp "$TMP/mock-old-sb" "$SB_SING_BOX_BIN"
-    chmod +x "$SB_SING_BOX_BIN"
     cat > "$CONC/child.sh" <<'CHILD'
 set -u
 ROLE="$1"; CFG="$2"; GO="$3"; PHASEC="$4"
@@ -537,14 +563,14 @@ CHILD
     assert_rc 1 "$(jq -r '[.services[]? | select(.tag == "monitor-api")] | length' "$SB_SERVER_CONFIG" | tr -d '\r')" "api service present exactly once"
     assert_rc 1 "$(printf '%s' "$("$SB_SING_BOX_BIN" version)" | grep -c '1.14.7')" "binary upgraded to 1.14.7"
     if audit_client_consistency > "$TMP/d16.audit" 2>&1; then pass "final identity audit consistent"; else fail "final audit inconsistent: $(cat "$TMP/d16.audit" | tr '\n' ' ')"; fi
-    # restore the main sandbox for any later sections
-    export SB_SERVER_CONFIG="$SANDBOX/sbconfig_server.json"
-    export SB_STATE_FILE="$SANDBOX/config"
-    export SB_CLIENTS_DIR="$SANDBOX/clients"
-    export SB_SING_BOX_BIN="$SANDBOX/sing-box"
-    export SB_LOCK_FILE="$SANDBOX/config.lock"
-    export SB_HOPPING_SERVICE="$SANDBOX/sing-box-hy2-hopping.service"
 fi
+# restore the main sandbox env (D18/D19 re-initialise everything themselves)
+export SB_SERVER_CONFIG="$SANDBOX/sbconfig_server.json"
+export SB_STATE_FILE="$SANDBOX/config"
+export SB_CLIENTS_DIR="$SANDBOX/clients"
+export SB_SING_BOX_BIN="$SANDBOX/sing-box"
+export SB_LOCK_FILE="$SANDBOX/config.lock"
+export SB_HOPPING_SERVICE="$SANDBOX/sing-box-hy2-hopping.service"
 
 section "D18: config mv failure -> double recovery of binary AND config"
 setup_upgrade_sandbox
