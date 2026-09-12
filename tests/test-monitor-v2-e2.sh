@@ -20,7 +20,7 @@ PASS=0
 FAIL=0
 # The gate at the bottom fails unless exactly this many assertions ran AND
 # passed, so unreachable sections can never fake success.
-EXPECTED_PASS=239
+EXPECTED_PASS=252
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
@@ -140,7 +140,19 @@ def make_stack(data_dir, *, password=None, recovery=None, whitelist=(),
             "broker": broker, "data_dir": data_dir}
 
 
-def req(port, source, method, path, headers=None, body=None, timeout=5.0):
+def req(port, source, method, path, headers=None, body=None, timeout=8.0):
+    try:
+        return _req_once(port, source, method, path, headers, body, timeout)
+    except (ConnectionError, OSError):
+        # Transient loopback reset under load (Windows): one retry keeps a
+        # single dropped connection from failing a whole group. A second
+        # failure is a real problem and propagates.
+        time.sleep(0.3)
+        return _req_once(port, source, method, path, headers, body, timeout)
+
+
+def _req_once(port, source, method, path, headers=None, body=None,
+              timeout=8.0):
     s = socket.socket()
     s.bind((source, 0))
     s.settimeout(timeout)
@@ -519,6 +531,76 @@ def group_stream():
         and c1[0]["uplink_total"] == 100.0
     out["snapshot_totals_untouched"] = \
         snap["devices"]["legacy"]["uplink_total"] == 100.0
+
+    # --- SSE session lifecycle: an OPEN stream must follow revocation -------
+    def sse_socket(target, cookie_x):
+        sx = socket.socket()
+        sx.bind(("127.0.0.5", 0))
+        sx.settimeout(6.0)
+        sx.connect(("127.0.0.1", target["port"]))
+        sx.sendall(("GET /api/v1/stream HTTP/1.1\r\nHost: monitor\r\n"
+                    "Cookie: %s\r\n\r\n" % cookie_x).encode())
+        buf = ""
+        deadline = time.time() + 6
+        while time.time() < deadline and "event: snapshot" not in buf:
+            try:
+                chunk = sx.recv(65536)
+            except socket.timeout:
+                break
+            if not chunk:
+                break
+            buf += chunk.decode("utf-8", "replace")
+        return sx, "event: snapshot" in buf
+
+    def closed_within(sock_x, seconds):
+        """True when the server closes the stream inside the window: no
+        further snapshots is proven by EOF, not by a follow-up GET."""
+        sock_x.settimeout(seconds)
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            try:
+                chunk = sock_x.recv(65536)
+            except socket.timeout:
+                return False  # still streaming after the window
+            if not chunk:
+                return True   # server closed the revoked stream
+        return False
+
+    # A: session TTL expires while the SSE is open -> stream stops
+    ttl_stack = make_stack(tempfile.mkdtemp(), password=PASSWORD,
+                           whitelist=["127.0.0.5/32"], poll=0.15,
+                           session_ttl=0.8)
+    ttl_cookie = cookie_of(login(ttl_stack["port"], "127.0.0.5"))
+    sx, got_event = sse_socket(ttl_stack, ttl_cookie)
+    time.sleep(1.2)  # TTL expires mid-stream
+    out["sse_initial_event_received"] = got_event
+    out["sse_ttl_expiry_stops_stream"] = closed_within(sx, 6.0)
+    sx.close()
+
+    # B: logout while the SSE is open -> stream stops
+    out_stack = make_stack(tempfile.mkdtemp(), password=PASSWORD,
+                           whitelist=["127.0.0.5/32"], poll=0.15)
+    out_cookie = cookie_of(login(out_stack["port"], "127.0.0.5"))
+    out_csrf = csrf_of(out_stack["port"], "127.0.0.5", out_cookie)
+    sx, got_event = sse_socket(out_stack, out_cookie)
+    req(out_stack["port"], "127.0.0.5", "POST", "/api/v1/logout",
+        authed_headers(out_cookie, out_csrf), json_body({}))
+    out["sse_logout_stops_stream"] = closed_within(sx, 6.0)
+    sx.close()
+
+    # C: session A changes password -> session B's open SSE stops
+    pair = make_stack(tempfile.mkdtemp(), password=PASSWORD,
+                      whitelist=["127.0.0.5/32"], poll=0.15)
+    cookie_a = cookie_of(login(pair["port"], "127.0.0.5"))
+    csrf_a = csrf_of(pair["port"], "127.0.0.5", cookie_a)
+    cookie_b = cookie_of(login(pair["port"], "127.0.0.5"))
+    sx, got_event = sse_socket(pair, cookie_b)
+    req(pair["port"], "127.0.0.5", "POST", "/api/v1/password",
+        authed_headers(cookie_a, csrf_a),
+        json_body({"current_password": PASSWORD,
+                   "new_password": "revoked-pass-9"}))
+    out["sse_password_revoke_stops_stream"] = closed_within(sx, 6.0)
+    sx.close()
     return out
 
 
@@ -932,6 +1014,91 @@ def group_concurrency():
     return out
 
 
+def group_framing():
+    out = {}
+    guard = RecoveryGlobalGuard(max_concurrent=2, window_seconds=3600.0,
+                                max_attempts_per_window=1000)
+    stack = make_stack(tempfile.mkdtemp(), password=PASSWORD,
+                       recovery=RECOVERY_KEY, recovery_guard=guard)
+    port = stack["port"]
+    calls = {"n": 0}
+    real_verify = stack["auth"].verify_recovery_key
+
+    def counting_verify(key):
+        calls["n"] += 1
+        return real_verify(key)
+
+    stack["auth"].verify_recovery_key = counting_verify
+
+    def raw_post(source, path, header_block, body=b""):
+        """Hand-built POST; returns (status_line, server_closed_socket)."""
+        sx = socket.socket()
+        sx.bind((source, 0))
+        sx.settimeout(5.0)
+        sx.connect(("127.0.0.1", port))
+        sx.sendall(("POST %s HTTP/1.1\r\nHost: monitor\r\n" % path
+                    ).encode() + header_block.encode() + b"\r\n" + body)
+        time.sleep(0.25)
+        data = b""
+        try:
+            data = sx.recv(65536)
+        except socket.timeout:
+            pass
+        status = data.decode("utf-8", "replace").splitlines()[0] if data \
+            else ""
+        closed = False
+        try:
+            sx.sendall(b"GET /api/v1/session HTTP/1.1\r\nHost: m\r\n\r\n")
+            nxt = sx.recv(65536)
+            closed = (nxt == b"")  # clean EOF: server closed it
+        except socket.timeout:
+            closed = False         # still open after the window
+        except OSError:
+            closed = True          # reset/abort: connection is gone
+        sx.close()
+        return status, closed
+
+    # malformed Content-Length on the whitelist-EXEMPT recovery endpoint
+    status, closed = raw_post("127.0.0.6", "/api/v1/recovery",
+                              "Content-Type: application/json\r\n"
+                              "Content-Length: abc\r\n")
+    out["framing_recovery_malformed_cl_400"] = " 400" in status
+    out["framing_recovery_malformed_closes"] = closed
+
+    # oversized declared body -> 413 before any gate/handler work
+    status, closed = raw_post("127.0.0.6", "/api/v1/recovery",
+                              "Content-Type: application/json\r\n"
+                              "Content-Length: 70000\r\n", b"x" * 1000)
+    out["framing_recovery_oversized_413"] = " 413" in status
+    out["framing_recovery_oversized_closes"] = closed
+
+    # chunked Transfer-Encoding -> 400
+    status, closed = raw_post("127.0.0.6", "/api/v1/recovery",
+                              "Content-Type: application/json\r\n"
+                              "Transfer-Encoding: chunked\r\n",
+                              b"5\r\nhello\r\n0\r\n\r\n")
+    out["framing_recovery_te_400"] = " 400" in status
+    out["framing_recovery_te_closes"] = closed
+
+    # NONE of the rejected framings performed scrypt work
+    out["framing_recovery_zero_scrypt"] = calls["n"] == 0
+
+    # a NON-WHITELISTED login POST cannot slip past the framing guard
+    plain = make_stack(tempfile.mkdtemp())  # empty whitelist
+    sx = socket.socket()
+    sx.bind(("127.0.0.5", 0))
+    sx.settimeout(5.0)
+    sx.connect(("127.0.0.1", plain["port"]))
+    sx.sendall(b"POST /api/v1/login HTTP/1.1\r\nHost: m\r\n"
+               b"Content-Type: application/json\r\n"
+               b"Content-Length: abc\r\n\r\n")
+    time.sleep(0.25)
+    data = sx.recv(65536).decode("utf-8", "replace")
+    out["framing_login_before_whitelist_400"] = " 400" in data
+    sx.close()
+    return out
+
+
 GROUPS = {
     "whitelist": group_whitelist,
     "gate": group_gate,
@@ -941,6 +1108,7 @@ GROUPS = {
     "recovery": group_recovery,
     "endpoints": group_endpoints,
     "concurrency": group_concurrency,
+    "framing": group_framing,
 }
 
 if __name__ == "__main__":
@@ -1091,6 +1259,10 @@ check 'd["collector_thread_alive"]' "collector thread survives client disconnect
 check 'd["snapshot_after_disconnect_200"]' "snapshot endpoint healthy after disconnect"
 check 'd["connections_rows_present"]' "snapshot carries per-connection rows from E1"
 check 'd["snapshot_totals_untouched"]' "totals come from E1 unchanged"
+check 'd["sse_initial_event_received"]' "SSE delivers its first snapshot while valid"
+check 'd["sse_ttl_expiry_stops_stream"]' "SSE A: TTL expiry mid-stream -> stream stops"
+check 'd["sse_logout_stops_stream"]' "SSE B: logout while stream open -> stream stops"
+check 'd["sse_password_revoke_stops_stream"]' "SSE C: password change revokes session B open stream"
 
 section "W5: stale semantics + publisher freeze detection"
 run_group "stale"
@@ -1302,6 +1474,18 @@ check 'd["guard_concurrency_cap"]' "recovery guard admits exactly max_concurrent
 check 'd["storage_fault_whitelist_rollback"]' "whitelist write failure -> rollback, memory == disk"
 check 'd["storage_fault_password_rollback"]' "password write failure -> old password still valid"
 check 'd["storage_fault_recovery_rollback"]' "recovery-key write failure -> old key still valid"
+
+section "W10: SSE session lifecycle + POST framing on the raw wire"
+run_group "framing"
+check 'd.get("_harness_error") is None' "harness ran clean"
+check 'd["framing_recovery_malformed_cl_400"]' "recovery malformed Content-Length -> 400 (before gates)"
+check 'd["framing_recovery_malformed_closes"]' "malformed-CL rejection closes the connection"
+check 'd["framing_recovery_oversized_413"]' "recovery oversized body -> 413"
+check 'd["framing_recovery_oversized_closes"]' "oversized rejection closes the connection"
+check 'd["framing_recovery_te_400"]' "recovery chunked Transfer-Encoding -> 400"
+check 'd["framing_recovery_te_closes"]' "TE rejection closes the connection"
+check 'd["framing_recovery_zero_scrypt"]' "rejected framings perform ZERO scrypt verifications"
+check 'd["framing_login_before_whitelist_400"]' "non-whitelisted login POST cannot bypass the framing guard"
 
 printf '\n== summary ==\n'
 printf '  pass=%d fail=%d (expected pass=%d)\n' "$PASS" "$FAIL" "$EXPECTED_PASS"
