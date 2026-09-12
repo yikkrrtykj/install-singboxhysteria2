@@ -168,12 +168,19 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         self._send_json(404, {"error": "not found"})
 
     def _recovery_route(self, method, path, remote):
-        """The recovery flow is the SINGLE whitelist exception: GET /recovery
-        serves the shell, POST /api/v1/recovery validates the key and adds
-        the CALLER's own address (/32 or /128) to the whitelist. Nothing
-        else is reachable here and no session is ever created."""
-        if method == "GET" and path == "/recovery":
-            self._serve_static(STATIC_ROUTES["/"])
+        """The recovery flow is the SINGLE whitelist exception.
+
+        It is an EXACT allowlist (never a wildcard): the recovery shell plus
+        the minimal asset set that shell needs to render and submit, and the
+        recovery API itself. These static files are the public app shell --
+        they contain no snapshot data, no whitelist content, no session and
+        no credentials. Everything else stays behind the whitelist gate:
+        GET / and /api/v1/* still answer 403 to a locked-out caller.
+        """
+        if method == "GET" and path in (
+                "/recovery", "/static/style.css", "/static/app.js",
+                "/favicon.svg"):
+            self._serve_static(STATIC_ROUTES.get(path, "index.html"))
             return True
         if method == "POST" and path == "/api/v1/recovery":
             self._handle_recovery(remote)
@@ -374,7 +381,9 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         """
         auth = self.app.auth
         if auth is None or not auth.recovery_configured():
-            self._send_json(503, {"error": "recovery is not configured"})
+            # Uniform generic refusal: never reveal whether recovery is
+            # configured, and never distinguish hash states on failure.
+            self._send_json(403, {"error": "invalid recovery key"})
             return
         body = self._json_body()
         key = body.get("key") if isinstance(body, dict) else None
