@@ -111,11 +111,28 @@ printf 'systemctl %s\n' "\$*" >> "\$MOCK_CALL_LOG"
 op="\$1"; shift
 case "\$op" in
   is-active)
-    if [ -f "\$MOCK_FAIL_IS_ACTIVE_COUNT" ]; then
-      n="\$(cat "\$MOCK_FAIL_IS_ACTIVE_COUNT" 2>/dev/null || echo 0)"
-      if [ "\$n" -gt 0 ] 2>/dev/null; then
-        echo "\$((n - 1))" > "\$MOCK_FAIL_IS_ACTIVE_COUNT"
-        exit 1
+    # SKIP file: first K calls behave normally (e.g. the transaction
+    # capture must observe the REAL state); COUNT file: next N calls fail.
+    if [ -f "\$MOCK_FAIL_IS_ACTIVE_SKIP" ]; then
+      m="\$(cat "\$MOCK_FAIL_IS_ACTIVE_SKIP" 2>/dev/null || echo 0)"
+      if [ "\$m" -gt 0 ] 2>/dev/null; then
+        echo "\$((m - 1))" > "\$MOCK_FAIL_IS_ACTIVE_SKIP"
+      else
+      if [ -f "\$MOCK_FAIL_IS_ACTIVE_COUNT" ]; then
+        n="\$(cat "\$MOCK_FAIL_IS_ACTIVE_COUNT" 2>/dev/null || echo 0)"
+        if [ "\$n" -gt 0 ] 2>/dev/null; then
+          echo "\$((n - 1))" > "\$MOCK_FAIL_IS_ACTIVE_COUNT"
+          exit 1
+        fi
+      fi
+      fi
+    else
+      if [ -f "\$MOCK_FAIL_IS_ACTIVE_COUNT" ]; then
+        n="\$(cat "\$MOCK_FAIL_IS_ACTIVE_COUNT" 2>/dev/null || echo 0)"
+        if [ "\$n" -gt 0 ] 2>/dev/null; then
+          echo "\$((n - 1))" > "\$MOCK_FAIL_IS_ACTIVE_COUNT"
+          exit 1
+        fi
       fi
     fi
     [ "\$(cat "\$MOCK_SYS_STATE" 2>/dev/null || echo inactive)" = "active" ] && exit 0 || exit 1 ;;
@@ -206,6 +223,7 @@ export SBMON_STATE_DIR="$FIX_STATE/state"
 export MOCK_CALL_LOG MOCK_SYS_STATE MOCK_ENABLED_STATE
 export MOCK_FAIL_DAEMON_RELOAD_COUNT="$TMP/mock-fail-daemon-reload-count"
 export MOCK_FAIL_IS_ACTIVE_COUNT="$TMP/mock-fail-is-active-count"
+export MOCK_FAIL_IS_ACTIVE_SKIP="$TMP/mock-fail-is-active-skip"
 export MOCK_FAIL_RESTART_ONCE="$TMP/mock-fail-restart-once"
 export SBMON_LOCK_FILE="$TMP/deploy.lock"
 # P4: real flock where available (Linux CI gate); no-op shim elsewhere so the
@@ -623,7 +641,9 @@ fi
 
 section "R3-1c forward wait-active failure -> transaction rollback"
 if [ "$SYMLINKS_OK" = 1 ]; then
-    rm -f "$MOCK_FAIL_DAEMON_RELOAD_COUNT"   # no leftover fault flags
+    rm -f "$MOCK_FAIL_DAEMON_RELOAD_COUNT" "$MOCK_FAIL_IS_ACTIVE_COUNT" "$MOCK_FAIL_IS_ACTIVE_SKIP"   # no leftover fault flags
+    echo 1 > "$MOCK_FAIL_IS_ACTIVE_SKIP"   # capture observes the real active state
+    echo 6 > "$MOCK_FAIL_IS_ACTIVE_COUNT"  # all 6 gate polls fail (timeout 6)
     UNIT_R3C="$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)"
     LINK_R3C="$(readlink "$FIX_APP_LINK")"
     printf '0.7.0\n' > "$FIX_SRC/VERSION"
