@@ -1,2 +1,5 @@
 *.sh text eol=lf
 *.md text eol=lf
+monitor-v2/deploy/app-bin/* text eol=lf
+monitor-v2/deploy/*.in text eol=lf
+monitor-v2/VERSION text eol=lf
