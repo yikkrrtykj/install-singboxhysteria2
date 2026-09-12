@@ -60,6 +60,13 @@ import json
 # The complete, closed set of keys an enrichment object may ever carry.
 # Deliberately NOT included: any server identity field (no device name, no
 # service.api identity), connection ids, rules, provider details, secrets.
+#
+# Freshness vocabulary (stateless single-poll semantics, v1):
+#   checked_at  = when THIS poll completed (always set, success or failure)
+#   updated_at  = when valid enrichment data was last obtained (null on a
+#                 failed poll -- a failure is never backdated into freshness)
+#   stale       = true whenever updated_at is null or older than max_age;
+#                 an unreachable API can therefore never look fresh
 ENRICHMENT_KEYS = (
     "reachable",
     "version",
@@ -70,6 +77,7 @@ ENRICHMENT_KEYS = (
     "active_connections",
     "traffic_up_bps",
     "traffic_down_bps",
+    "checked_at",
     "updated_at",
     "stale",
     "error",
@@ -82,7 +90,11 @@ DEFAULT_MAX_AGE = 30.0  # seconds after updated_at before a stored sample is sta
 
 
 def new_enrichment():
-    """An empty enrichment object: nothing observed, nothing reachable."""
+    """An empty enrichment object: nothing observed, nothing reachable.
+
+    ``stale`` starts True: with no updated_at there is no valid data yet, and
+    unknown age must never pass as fresh.
+    """
     return {
         "reachable": False,
         "version": None,
@@ -93,28 +105,36 @@ def new_enrichment():
         "active_connections": None,
         "traffic_up_bps": None,
         "traffic_down_bps": None,
+        "checked_at": None,
         "updated_at": None,
-        "stale": False,
+        "stale": True,
         "error": None,
     }
 
 
-def finish_enrichment(snapshot, updated_at_iso, error=None):
-    """Seal a snapshot: whitelist only, attach updated_at and the joined error.
+def finish_enrichment(snapshot, checked_at_iso, updated_at_iso, error=None):
+    """Seal a snapshot: whitelist only, attach the freshness pair and error.
 
     This is the single exit point for enrichment objects. It rebuilds the dict
     from ENRICHMENT_KEYS, so anything an intermediate step squirreled away that
     is not part of the contract (identity fields, raw payloads, credentials)
     is structurally dropped, not merely hidden.
+
+    Stateless semantics (v1): ``updated_at`` is non-null ONLY when the poll
+    obtained valid data (reachable /version success); ``stale`` is therefore
+    True for every failed poll -- "unreachable but fresh" is impossible.
+    A future stateful wrapper can keep the older ``updated_at`` and recompute
+    ``stale`` via :func:`apply_freshness`; it must never invent a success.
     """
     out = new_enrichment()
     for key in ENRICHMENT_KEYS:
-        if key in ("reachable", "updated_at", "error", "stale"):
+        if key in ("reachable", "checked_at", "updated_at", "error", "stale"):
             continue
         out[key] = snapshot.get(key)
     out["reachable"] = bool(snapshot.get("reachable"))
-    out["updated_at"] = updated_at_iso
-    out["stale"] = False
+    out["checked_at"] = checked_at_iso
+    out["updated_at"] = updated_at_iso if updated_at_iso else None
+    out["stale"] = updated_at_iso is None
     out["error"] = error
     return out
 
@@ -198,18 +218,29 @@ def parse_proxies(payload, group):
 
 
 def parse_connections(payload):
-    """GET /connections -> number of locally active connections (0 when idle).
+    """GET /connections -> locally active connection count, or None.
 
-    Verified quirk: the official snapshot marshals the connections slice
-    without omitempty, so an idle core returns {"connections": null}; some
-    builds/paths may omit the key entirely. Both normalize to 0 -- an empty
-    snapshot is data, not an error.
+    Semantics matter here -- schema drift must never disguise itself as idle:
+
+    * ``"connections": null``   -> 0   (verified official idle shape: the nil
+      slice marshals without omitempty; an idle core really says null)
+    * ``"connections": []``     -> 0   (explicitly no connections)
+    * key missing               -> None (contract drift / unknown shape)
+    * wrong type (str/int/...)  -> None (contract drift / unknown shape)
+    * non-dict payload          -> None (payload itself unusable)
+
+    0 = confirmed empty; None = "we do not know". Callers must never render
+    None as 0.
     """
     if not isinstance(payload, dict):
         return None
-    connections = payload.get("connections")
-    if not isinstance(connections, list):
+    if "connections" not in payload:
+        return None
+    connections = payload["connections"]
+    if connections is None:
         return 0
+    if not isinstance(connections, list):
+        return None
     return len(connections)
 
 

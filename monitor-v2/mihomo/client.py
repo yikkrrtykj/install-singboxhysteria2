@@ -102,27 +102,39 @@ def parse_controller_url(url):
 
     Returns (host, port, scheme). The Mihomo external-controller is a
     client-local service; anything non-loopback is refused before a single
-    byte (and never a secret) leaves the machine.
+    byte (and never a secret) leaves the machine. Also refused: embedded
+    credentials, non-root paths, query strings and fragments.
+
+    Error messages deliberately never echo the full URL: a URL can carry
+    user:pass credentials, and configuration errors end up in logs/stderr.
+    Only non-secret components (scheme, host, path, port) are named.
     """
     parts = urllib.parse.urlsplit(url)
     if parts.scheme not in ("http", "https"):
         raise ConfigurationError(
             "mihomo controller URL scheme must be http(s), got %r" % parts.scheme)
-    if parts.query or parts.fragment:
+    if parts.username is not None or parts.password is not None \
+            or "@" in (parts.netloc or ""):
         raise ConfigurationError(
-            "mihomo controller URL must not carry a query string or fragment")
+            "mihomo controller URL must not embed credentials (user:pass form)")
     host = (parts.hostname or "").lower()
     if host not in LOOPBACK_HOSTS:
         raise ConfigurationError(
             "mihomo controller URL must target the loopback interface "
             "(127.0.0.1 / localhost / ::1), got host %r. The external-"
             "controller is a client-local service and must never be exposed "
-            "to a network." % url)
+            "to a network." % host)
     port = parts.port
     if port is None:
         port = 443 if parts.scheme == "https" else 9090
     if not 0 < port < 65536:
         raise ConfigurationError("invalid mihomo controller port: %r" % (parts.port,))
+    if parts.path not in ("", "/"):
+        raise ConfigurationError(
+            "mihomo controller URL path must be empty or '/', got %r" % parts.path)
+    if parts.query or parts.fragment:
+        raise ConfigurationError(
+            "mihomo controller URL must not carry a query string or fragment")
     return host, port, parts.scheme
 
 
@@ -139,8 +151,11 @@ def redact(text, secrets):
 class HttpTransport:
     """Minimal stdlib REST transport: one short-lived connection per request.
 
-    Holds the secret and emits it ONLY as an Authorization header on the
-    request line's headers -- never in the path (no query string, ever).
+    READ-ONLY BY CONSTRUCTION: the only request surface is ``get(path)`` --
+    there is no ``method`` parameter anywhere on this class, so no mutation
+    verb (PUT/POST/PATCH/DELETE) can be issued, not even by accident. The
+    secret is emitted ONLY as an Authorization header on the request line's
+    headers -- never in the path (no query string, ever).
     """
 
     def __init__(self, host, port, scheme="http", secret=None, timeout=DEFAULT_TIMEOUT):
@@ -164,12 +179,12 @@ class HttpTransport:
             headers["Authorization"] = "Bearer %s" % self.secret
         return headers
 
-    def request(self, method, path):
-        """One GET-style request -> (status, body bytes). Raises TransportError."""
+    def get(self, path):
+        """One GET request -> (status, body bytes). Raises TransportError."""
         try:
             conn = self._connection()
             try:
-                conn.request(method, path, headers=self._headers())
+                conn.request("GET", path, headers=self._headers())
                 response = conn.getresponse()
                 body = response.read()
                 return response.status, body
@@ -179,14 +194,27 @@ class HttpTransport:
             raise TransportError("%s: %s" % (type(exc).__name__, exc)) from exc
 
     def read_stream_sample(self, path, sample_deadline):
-        """Read ONE JSON line from a streaming endpoint (e.g. the traffic
-        stream), then abandon the connection (the upstream server-side handler
-        exits on the next failed write). Bounded by ``sample_deadline`` seconds.
+        """Read ONE JSON line from an INDEFINITE streaming endpoint.
 
-        The socket timeout is applied BEFORE getresponse(): for a will-close
-        response http.client detaches the socket while reading, so it can no
-        longer be retuned per iteration. Between reads the deadline is
-        re-checked, so a stalling stream still cannot exceed the budget.
+        The Mihomo /traffic handler streams one flushed ``JSON + newline`` per
+        second and KEEPS THE CONNECTION OPEN -- it is never closed for the
+        client. This reader therefore returns the moment the FIRST complete
+        newline-terminated line has arrived; it never waits for the connection
+        to close, never waits for a full read buffer, never consumes a second
+        line, and is bounded by the ABSOLUTE deadline ``sample_deadline``.
+
+        Mechanics (newline framing over bounded reads):
+        * the socket timeout is applied BEFORE ``getresponse()`` -- for a
+          will-close response http.client detaches the socket during read, so
+          it cannot be retuned afterwards;
+        * each iteration performs ONE bounded ``read1()`` (a single recv --
+          unlike ``read(n)``, which would block for ``n`` bytes on a healthy
+          stream and stall exactly the way the first line must not);
+        * between reads the ABSOLUTE deadline is re-checked, and on a
+          keep-alive response (the real mihomo case) the socket timeout is
+          re-tuned to the remaining budget;
+        * worst-case overshoot is one bounded read (<= sample_deadline) on a
+          will-close stream, and ≈ deadline on keep-alive streams.
         """
         deadline = time.monotonic() + max(sample_deadline, MIN_TIMEOUT)
         try:
@@ -198,17 +226,24 @@ class HttpTransport:
                 response = conn.getresponse()
                 if response.status != 200:
                     raise ApiError(response.status, response.read())
-                chunks = bytearray()
-                while b"\n" not in chunks:
-                    if time.monotonic() >= deadline:
+                buffer_ = bytearray()
+                while True:
+                    newline = buffer_.find(b"\n")
+                    if newline != -1:
+                        return bytes(buffer_[:newline])
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
                         raise TransportError("stream sample timed out after %.1fs"
                                              % sample_deadline)
-                    chunk = response.read(4096)
+                    if conn.sock is not None:
+                        try:
+                            conn.sock.settimeout(remaining)
+                        except OSError:
+                            pass  # will-close response: pre-set timeout still bounds recv
+                    chunk = response.read1(4096)
                     if not chunk:
                         raise TransportError("stream ended before a full sample")
-                    chunks.extend(chunk)
-                line, _, _ = bytes(chunks).partition(b"\n")
-                return line
+                    buffer_.extend(chunk)
             finally:
                 conn.close()
         except (OSError, http.client.HTTPException) as exc:
@@ -247,7 +282,7 @@ class MihomoClient:
     def _get_json(self, path, errors):
         """Fetch + decode one JSON endpoint. Returns the payload or None."""
         try:
-            status, body = self.transport.request("GET", path)
+            status, body = self.transport.get(path)
         except TransportError as exc:
             errors.append("%s transport failed: %s" % (path, redact(str(exc), self._secrets())))
             return None
@@ -283,7 +318,14 @@ class MihomoClient:
     # -- main entry -----------------------------------------------------------
 
     def collect(self):
-        """Poll the local API once and return a sealed enrichment object."""
+        """Poll the local API once and return a sealed enrichment object.
+
+        Freshness semantics (stateless v1): ``checked_at`` is stamped on every
+        poll; ``updated_at`` is stamped ONLY when the poll obtained valid data
+        (reachable /version success). A failed poll therefore seals as
+        ``stale=true`` with ``updated_at=null`` -- an unreachable API can
+        never look fresh, and the failure is never backdated.
+        """
         errors = []
         snap = new_enrichment()
 
@@ -291,7 +333,7 @@ class MihomoClient:
         #    (one refused/timeout request, bounded by the clamped timeout).
         status, body = None, b""
         try:
-            status, body = self.transport.request("GET", "/version")
+            status, body = self.transport.get("/version")
         except TransportError as exc:
             errors.append("version probe failed: %s" % redact(str(exc), self._secrets()))
         except Exception as exc:  # noqa: BLE001 -- never propagate
@@ -312,11 +354,17 @@ class MihomoClient:
                           % (status, (": %s" % body[:MAX_ERROR_BODY].decode("utf-8", "replace")
                                       .replace("\n", " ")) if body else ""))
         errors = [redact(e, self._secrets()) for e in errors]
+        checked_at = self._iso()
         if version is None:
-            return finish_enrichment(snap, self._iso(), error="; ".join(errors) or None)
+            # failed poll: no valid data was obtained, so updated_at stays
+            # null and the sample is sealed stale -- never "unreachable but
+            # fresh", and no older success may be invented here (stateless).
+            return finish_enrichment(snap, checked_at, None,
+                                     error="; ".join(errors) or None)
 
         snap["reachable"] = True
         snap["version"] = version
+        updated_at = checked_at  # valid enrichment data obtained on THIS poll
 
         # 2..4) optional enrichment endpoints, each isolated
         configs = self._get_json("/configs", errors)
@@ -343,19 +391,57 @@ class MihomoClient:
             snap["traffic_up_bps"] = traffic["up"]
             snap["traffic_down_bps"] = traffic["down"]
 
-        return finish_enrichment(snap, self._iso(), error="; ".join(errors) or None)
+        return finish_enrichment(snap, checked_at, updated_at,
+                                 error="; ".join(errors) or None)
 
     def _iso(self):
         return datetime.datetime.fromtimestamp(
             float(self.clock()), datetime.timezone.utc).isoformat()
 
 
+class SecretFileError(Exception):
+    """The --secret-file violates the permission contract (never a secret)."""
+
+
+def check_secret_mode(st_mode, path):
+    """Enforce the secret-file permission contract on one stat result.
+
+    POSIX contract: the file must be a REGULAR file and carry NO group/other
+    permission bits -- 0400 and 0600 pass, 0644 / 0664 / 0666 and anything
+    more open are rejected. Fail-closed: the content is read only AFTER this
+    passes, so a rejected file's content can never reach an error message.
+
+    Windows note (documented in README): POSIX mode bits are not enforced by
+    the filesystem there; E4 v1 relies on filesystem ACLs and does not fully
+    validate on Windows (os.name == "nt").
+    """
+    import stat as stat_module
+    if not stat_module.S_ISREG(st_mode):
+        raise SecretFileError("secret file must be a regular file: %s" % path)
+    if st_mode & 0o077:
+        raise SecretFileError(
+            "secret file permissions too open (%s), want 0600 or stricter: %s"
+            % (oct(st_mode & 0o777), path))
+
+
 def resolve_secret(secret_file):
-    """MIHOMO_API_SECRET environment wins; otherwise read --secret-file (0600)."""
+    """MIHOMO_API_SECRET environment wins; otherwise read --secret-file.
+
+    The file is permission-checked (0600/0400, regular file) BEFORE its
+    content is read, and error messages contain only the path and permission
+    bits -- never the secret content.
+    """
     env_secret = os.environ.get(SECRET_ENV, "")
     if env_secret:
         return env_secret
     if secret_file:
+        try:
+            st = os.stat(secret_file)
+        except FileNotFoundError:
+            raise SecretFileError("secret file not found: %s" % secret_file) from None
+        except OSError as exc:
+            raise SecretFileError("secret file not readable: %s" % secret_file) from exc
+        check_secret_mode(st.st_mode, secret_file)
         with open(secret_file, encoding="utf-8") as handle:
             return handle.read().strip()
     return ""
@@ -375,7 +461,9 @@ def build_arg_parser():
                         help="per-request timeout in seconds, clamped to 1-3 "
                              "(default: %(default)s)")
     parser.add_argument("--secret-file", default=None,
-                        help="file holding the controller secret (mode 0600); "
+                        help="file holding the controller secret; POSIX: "
+                             "regular file, mode 0600/0400 enforced (Windows "
+                             "relies on filesystem ACLs); "
                              "%s takes precedence" % SECRET_ENV)
     parser.add_argument("--pretty", action="store_true", help="indent JSON output")
     return parser
@@ -387,7 +475,7 @@ def main(argv=None):
         client = MihomoClient(url=args.url, group=args.group,
                               secret=resolve_secret(args.secret_file),
                               timeout=args.timeout)
-    except ConfigurationError as exc:
+    except (ConfigurationError, SecretFileError) as exc:
         print("fatal configuration error: %s" % exc, file=sys.stderr)
         return 2
     enrichment = client.collect()
