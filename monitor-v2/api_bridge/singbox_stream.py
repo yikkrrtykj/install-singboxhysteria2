@@ -39,13 +39,15 @@ class SingboxEventStream:
     uplink_total / downlink_total / uplink_delta / downlink_delta).
     """
 
-    def __init__(self, url, interval_seconds=2.0, secret=None, timeout=5.0):
+    def __init__(self, url, interval_seconds=2.0, secret=None,
+                 connect_timeout=5.0, idle_timeout=30.0):
         # parse_api_url is fail-closed: anything non-loopback is refused here.
         self.host, self.port = parse_api_url(url)
         self.url = url
         self.interval_seconds = interval_seconds
         self.secret = secret
-        self.timeout = timeout
+        self.connect_timeout = connect_timeout
+        self.idle_timeout = idle_timeout
         self.interval_ns = int(round(interval_seconds * 1_000_000_000)) or 1
         self._stream = None
 
@@ -53,7 +55,8 @@ class SingboxEventStream:
         request = encode_subscribe_connections_request(self.interval_ns)
         self._stream = GrpcWebStream(
             self.host, self.port, SERVICE_PATH, request,
-            timeout=self.timeout, secret=self.secret,
+            timeout=self.connect_timeout, secret=self.secret,
+            idle_timeout=self.idle_timeout,
             scheme="https" if self.url.startswith("https") else "http")
         self._stream.connect()
         return self._stream.batches()

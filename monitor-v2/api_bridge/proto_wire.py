@@ -206,6 +206,14 @@ def encode_subscribe_connections_request(interval_ns):
     return encode_varint_field(1, int(interval_ns))
 
 
+def decode_subscribe_connections_request(raw):
+    """Decode a SubscribeConnectionsRequest (used by tests / diagnostics)."""
+    if not isinstance(raw, (bytes, bytearray)):
+        raise ProtoDecodeError("request payload must be bytes")
+    fields = decode_message(bytes(raw), {1: ("interval", "varint")})
+    return {"interval": int(fields.get("interval", 0))}
+
+
 def decode_connection(raw):
     if not isinstance(raw, (bytes, bytearray)):
         return None
