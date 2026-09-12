@@ -16,11 +16,22 @@ Threading model
 * tracker access is serialized through a lock. The lock is installed as a
   proxy wrapper AROUND the tracker object -- ``collector.py`` itself stays
   unmodified and the E1 regression suite is unaffected.
-* publisher thread: builds ONE decorated snapshot per poll tick (~1s),
-  serializes it once and bumps a version under a condition variable.
+* publisher thread: builds ONE decorated snapshot per poll tick (~1s) and
+  bumps a version under a condition variable.
 * SSE subscribers wait on the condition variable and always receive the
   latest JSON. A browser that disconnects only ends its own generator --
   the collector never notices.
+
+Freeze detection
+----------------
+
+A dead publisher is invisible at publish time: the LAST published
+snapshot would keep whatever health marker it carried forever. Health is
+therefore computed at READ time from three independent facts -- consumer
+thread alive, publisher thread alive, and ``last_publish_at`` not older
+than the health threshold (``max(5s, 5x poll)``). Any failure degrades
+``web_status`` to STALE, which is what the dashboard chips, banners and
+watchdog key on.
 """
 
 from __future__ import annotations
@@ -61,17 +72,20 @@ class _LockedTracker:
 
 
 class SnapshotBroker:
-    """Owns the collector thread and the latest serialized snapshot."""
+    """Owns the collector thread and the latest published snapshot."""
 
-    def __init__(self, collector, poll_seconds=1.0, clock=time.time):
+    def __init__(self, collector, poll_seconds=1.0, clock=time.time,
+                 health_threshold=None):
         self._collector = collector
         self._poll = poll_seconds
         self._clock = clock
+        self._health_threshold = health_threshold if health_threshold is not None \
+            else max(5.0, poll_seconds * 5.0)
         self._lock = threading.Lock()       # tracker access
         self._cond = threading.Condition()  # snapshot publication
         self._version = 0
-        self._snapshot = None               # decorated dict (publisher only writes)
-        self._snapshot_json = None          # canonical JSON string
+        self._published = None        # base snapshot dict (no health fields)
+        self._published_at = None     # clock() of the last publish
         self._stop = threading.Event()
         self._consumer_thread = None
         self._publisher_thread = None
@@ -107,42 +121,76 @@ class SnapshotBroker:
         while not self._stop.is_set():
             snapshot = self._collector.snapshot()
             self._decorate(snapshot)
-            payload = json.dumps(snapshot, sort_keys=True)
+            published_at = self._clock()
             with self._cond:
-                self._snapshot = snapshot
-                self._snapshot_json = payload
+                self._published = snapshot
+                self._published_at = published_at
                 self._version += 1
                 self._cond.notify_all()
             self._stop.wait(self._poll)
 
     def _decorate(self, snapshot):
-        """Add web-level fields WITHOUT touching any E1 traffic field."""
+        """Add web-level fields WITHOUT touching any E1 traffic field.
+
+        Deliberately NO web_status here: health is computed at read time so
+        a frozen publisher cannot leave a stale HEALTHY marker behind.
+        """
         snapshot["monitor_started_at"] = self.started_iso
         snapshot["snapshot_generated_at"] = snapshot.get("generated_at")
         stale = bool(snapshot.get("stale"))
         snapshot["api_status"] = "STALE" if stale else "CONNECTED"
-        alive = bool(self._consumer_thread is not None
-                     and self._consumer_thread.is_alive())
-        snapshot["web_status"] = "HEALTHY" if alive else "STALE"
         snapshot["collector_uptime_seconds"] = round(
             self._clock() - self.started_at, 3)
+
+    # -- health (evaluated at READ time) --------------------------------------
+
+    def _publisher_alive(self):
+        return self._publisher_thread is not None \
+            and self._publisher_thread.is_alive()
+
+    def _consumer_alive(self):
+        return self._consumer_thread is not None \
+            and self._consumer_thread.is_alive()
+
+    def _healthy(self):
+        if not (self._consumer_alive() and self._publisher_alive()):
+            return False
+        published_at = self._published_at
+        if published_at is None:
+            return False
+        return (self._clock() - published_at) <= self._health_threshold
+
+    def _view(self):
+        """Copy of the published snapshot with read-time health fields."""
+        with self._cond:
+            base = self._published
+            version = self._version
+            published_at = self._published_at
+        if base is None:
+            return None, version, None
+        view = dict(base)
+        view["web_status"] = "HEALTHY" if self._healthy() else "STALE"
+        view["snapshot_version"] = version
+        view["last_publish_at"] = _iso(published_at) \
+            if published_at else None
+        return view, version, json.dumps(view, sort_keys=True)
 
     # -- readers -------------------------------------------------------------
 
     def snapshot(self):
-        with self._cond:
-            return self._snapshot
+        view, _version, _payload = self._view()
+        return view
 
     def snapshot_json(self):
-        with self._cond:
-            return self._version, self._snapshot_json
+        _view, version, payload = self._view()
+        return version, payload
 
     def wait_for_snapshot(self, timeout=10.0):
         with self._cond:
-            if self._snapshot_json is None:
+            if self._published is None:
                 self._cond.wait_for(
-                    lambda: self._snapshot_json is not None, timeout=timeout)
-            return self._snapshot_json is not None
+                    lambda: self._published is not None, timeout=timeout)
+            return self._published is not None
 
     def subscribe(self, after_version=0):
         """Yield ``(version, json)`` per published snapshot.
@@ -160,6 +208,7 @@ class SnapshotBroker:
                         timeout=SUBSCRIBER_IDLE_WAIT)
                 if self._version <= version:
                     continue
-                version = self._version
-                payload = self._snapshot_json
+            view, version, payload = self._view()
+            if payload is None:
+                continue
             yield version, payload

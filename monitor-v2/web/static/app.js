@@ -18,7 +18,8 @@
     view: "overview",
     es: null,
     esGeneration: 0,
-    lastSnapshotAt: 0
+    lastSnapshotAt: 0,
+    lastVersion: 0
   };
 
   function $(id) { return document.getElementById(id); }
@@ -152,6 +153,10 @@
     var snap = state.snapshot;
     if (!snap) return;
 
+    if (snap.snapshot_version && snap.snapshot_version > state.lastVersion) {
+      state.lastVersion = snap.snapshot_version;
+    }
+
     setChip($("chip-monitor"), "Monitor",
             snap.web_status || "—",
             snap.web_status === "HEALTHY" ? "ok" : "bad");
@@ -159,8 +164,17 @@
             snap.api_status || "—",
             snap.api_status === "CONNECTED" ? "ok" : "bad");
 
+    // Two distinct degradation modes, one banner slot:
+    //   stale  -- the E1 stream to service.api is broken (last state kept);
+    //   frozen -- the web backend itself stopped publishing new snapshots.
+    var banner = $("stale-text");
     if (snap.stale) {
-      $("stale-time").textContent = fmtTime(snap.last_success_at);
+      banner.textContent = "Data stale — Last successful API event: " +
+        fmtTime(snap.last_success_at);
+      show($("stale-banner"));
+    } else if (snap.web_status !== "HEALTHY") {
+      banner.textContent = "Monitor data frozen — last publish: " +
+        fmtTime(snap.last_publish_at);
       show($("stale-banner"));
     } else {
       hide($("stale-banner"));
@@ -534,11 +548,16 @@
   function startWatchdog() {
     setInterval(function () {
       if (!state.session || !state.session.authenticated) return;
-      // Fallback poll if the SSE stream is not delivering.
+      // Fallback poll if the SSE stream is not delivering. Freshness only
+      // advances when the snapshot VERSION truly moves: a frozen publisher
+      // answering HTTP 200 with the same payload must never keep the
+      // watchdog healthy by itself.
       if (Date.now() - state.lastSnapshotAt > 10000) {
         api("/api/v1/snapshot").then(function (snap) {
+          if ((snap.snapshot_version || 0) > state.lastVersion) {
+            state.lastSnapshotAt = Date.now();
+          }
           state.snapshot = snap;
-          state.lastSnapshotAt = Date.now();
           render();
         }).catch(function () { /* ignored; stream may recover */ });
       }
