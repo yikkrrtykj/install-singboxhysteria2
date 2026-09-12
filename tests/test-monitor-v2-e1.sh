@@ -20,6 +20,9 @@ export BRIDGE="$ROOT/monitor-v2/api_bridge"
 
 PASS=0
 FAIL=0
+# The gate at the bottom of this file fails unless exactly this many
+# assertions ran AND passed, so unreachable sections can never fake success.
+EXPECTED_PASS=101
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
@@ -283,7 +286,8 @@ print(json.dumps({"snap": s, "raw": json.dumps(s)}))
 assert_eq "$(snap_field "$snap" 'snap["snap"]["devices"]["vmix-01"]["status"]')" "IDLE" "known device with nothing recent -> IDLE"
 assert_not_contains 'OFFLINE' "$snap" "never emits OFFLINE"
 assert_not_contains 'Tunnel Down' "$snap" "never emits Tunnel Down"
-assert_eq "$(snap_field "$snap" 'snap["snap"]["devices"]["vmix-01"]["uplink_total"]')" "1000.0" "banked totals survive with zero connections"
+assert_eq "$(snap_field "$snap" 'snap["snap"]["devices"]["vmix-01"]["uplink_total"]')" "1005.0" "abandoned lower bound keeps device totals from dropping (r1 closed 1000 + h1 abandoned 5)"
+assert_eq "$(snap_field "$snap" 'snap["snap"]["devices"]["vmix-01"]["protocols"]["vless-in"]["uplink_total"]')" "1000.0" "closed vless-in totals stay banked exactly"
 
 section "E1-14: closed TTL expires -> recent row gone, banked totals remain"
 snap="$(tracker_seq '
@@ -345,10 +349,21 @@ def events_message(events, reset):
 reset_batch = events_message([event_new("r1", "legacy", "vless-in", 1000, 2000)], True)
 update_batch = events_message([event_update("r1", 300, 700)], False)
 
+checks = {}
+
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
-        self.rfile.read(length)
+        body = self.rfile.read(length)
+        # Validate the gRPC-Web REQUEST envelope: 0x00 flags + 4-byte BE length
+        # + protobuf. Without the envelope the real service.api rejects the call.
+        checks["content_type"] = self.headers.get("Content-Type")
+        checks["flags"] = body[0] if body else None
+        checks["declared"] = int.from_bytes(body[1:5], "big") if len(body) >= 5 else -1
+        checks["actual"] = len(body) - 5 if len(body) >= 5 else -1
+        if len(body) >= 5 and body[0] == 0 and checks["declared"] == checks["actual"]:
+            from proto_wire import decode_subscribe_connections_request
+            checks["interval"] = decode_subscribe_connections_request(body[5:]).get("interval")
         self.send_response(200)
         self.send_header("Content-Type", "application/grpc-web+proto")
         self.send_header("Transfer-Encoding", "chunked")
@@ -372,9 +387,10 @@ threading.Thread(target=server.serve_forever, daemon=True).start()
 from collector import Collector
 from api_bridge.singbox_stream import SingboxEventStream
 c = Collector(url="http://127.0.0.1:%d" % port, interval=1.0)
-c.stream_factory = lambda: SingboxEventStream("http://127.0.0.1:%d" % port, interval_seconds=1.0, timeout=2.0)
+c.stream_factory = lambda: SingboxEventStream("http://127.0.0.1:%d" % port, interval_seconds=1.0, connect_timeout=2.0, idle_timeout=5.0)
 c.consume(max_batches=2)
 snap = c.snapshot()
+snap["_request_checks"] = checks
 server.shutdown()
 print(json.dumps(snap))
 ')"
@@ -382,16 +398,9 @@ assert_eq "$(snap_field "$snap" 'snap["devices"]["legacy"]["protocols"]["vless-i
 assert_eq "$(snap_field "$snap" 'snap["devices"]["legacy"]["protocols"]["vless-in"]["downlink_total"]')" "2700.0" "wire path downlink"
 assert_eq "$(snap_field "$snap" 'snap["batch_count"]')" "2" "both batches decoded from the wire"
 assert_eq "$(snap_field "$snap" 'snap["stale"]')" "False" "wire path healthy"
-
-printf '\n== summary ==\n'
-printf '  pass=%d fail=%d\n' "$PASS" "$FAIL"
-[ "$FAIL" -eq 0 ] || exit 1
-exit 0
-
-printf '\n== summary ==\n'
-printf '  pass=%d fail=%d\n' "$PASS" "$FAIL"
-[ "$FAIL" -eq 0 ] || exit 1
-exit 0
+assert_eq "$(snap_field "$snap" 'snap["_request_checks"]["flags"] == 0 and snap["_request_checks"]["declared"] == snap["_request_checks"]["actual"]')" "True" "request carries a valid gRPC-Web frame (0x00 + BE length)"
+assert_eq "$(snap_field "$snap" 'snap["_request_checks"]["content_type"]')" "application/grpc-web+proto" "request content-type is grpc-web+proto"
+assert_eq "$(snap_field "$snap" 'snap["_request_checks"].get("interval")')" "1000000000" "request interval is nanoseconds (1.0s -> 1e9)"
 
 section "E1-15/16: loopback URL accepted, non-loopback rejected (fail-closed)"
 snap="$(tracker_seq '
@@ -445,7 +454,7 @@ t = Tracker()
 t.apply_batch({"reset": False, "events": [
   {"type": "NEW", "id": "w1", "connection": {"id": "w1", "user": "legacy", "inbound": "vless-in", "uplink_total": 100, "downlink_total": 9000}},
   {"type": "NEW", "id": "w2", "connection": {"id": "w2", "user": "legacy", "inbound": "hy2-in", "uplink_total": 300, "downlink_total": 7000}},
-]}, 1000)
+]}, 1700000000)
 print(json.dumps(t.snapshot(1000)))
 ')"
 assert_eq "$(snap_field "$snap" 'snap["devices"]["legacy"]["uplink_total"]')" "400.0" "device uplink aggregates only uplink"
@@ -453,3 +462,159 @@ assert_eq "$(snap_field "$snap" 'snap["devices"]["legacy"]["downlink_total"]')" 
 assert_eq "$(snap_field "$snap" 'snap["devices"]["legacy"]["protocols"]["vless-in"]["uplink_total"]')" "100.0" "protocol vless-in uplink"
 assert_eq "$(snap_field "$snap" 'snap["devices"]["legacy"]["protocols"]["hy2-in"]["downlink_total"]')" "7000.0" "protocol hy2-in downlink"
 assert_eq "$(snap_field "$snap" 'snap["devices"]["legacy"]["uplink_rate"]')" "0.0" "no invented rates without UPDATE events"
+
+section "E1-19: CLOSED uses authoritative final Connection totals"
+snap="$(tracker_seq '
+import json
+from collector import Tracker
+t = Tracker()
+t.apply_batch({"reset": False, "events": [
+  {"type": "NEW", "id": "c1", "connection": {"id": "c1", "user": "legacy", "inbound": "vless-in", "uplink_total": 1000, "downlink_total": 2000}}
+]}, 1000)
+t.apply_batch({"reset": False, "events": [
+  {"type": "UPDATE", "id": "c1", "uplink_delta": 300, "downlink_delta": 700}
+]}, 1700000002)
+t.apply_batch({"reset": False, "events": [
+  {"type": "CLOSED", "id": "c1", "closed_at": 1700000003000,
+   "connection": {"id": "c1", "user": "legacy", "inbound": "vless-in", "uplink_total": 5000, "downlink_total": 9000}}
+]}, 1700000003)
+s_main = t.snapshot(1700000003)
+t.apply_batch({"reset": False, "events": [
+  {"type": "NEW", "id": "c2", "connection": {"id": "c2", "user": "legacy", "inbound": "hy2-in", "uplink_total": 1000, "downlink_total": 2000}}
+]}, 1700000004)
+t.apply_batch({"reset": False, "events": [
+  {"type": "CLOSED", "id": "c2", "closed_at": 1700000005000,
+   "connection": {"id": "c2", "user": "someone-else", "inbound": "hy2-in", "uplink_total": 999999, "downlink_total": 999999}}
+]}, 1700000005)
+s_drift = t.snapshot(1700000005)
+print(json.dumps({"main": s_main, "drift": s_drift}))
+')"
+assert_eq "$(snap_field "$snap" 'snap["main"]["devices"]["legacy"]["protocols"]["vless-in"]["uplink_total"]')" "5000.0" "tail traffic after last UPDATE is kept (authoritative 5000, not 1300)"
+assert_eq "$(snap_field "$snap" 'snap["main"]["devices"]["legacy"]["protocols"]["vless-in"]["downlink_total"]')" "9000.0" "authoritative downlink at CLOSED"
+assert_eq "$(snap_field "$snap" 'snap["main"]["recently_closed"]')" "1" "closed row visible (closed_at in ms was normalized)"
+assert_eq "$(snap_field "$snap" 'snap["drift"]["identity_conflicts"]')" "1" "drifting CLOSED connection counted as conflict"
+assert_eq "$(snap_field "$snap" 'snap["drift"]["devices"]["legacy"]["protocols"]["hy2-in"]["uplink_total"]')" "1000.0" "drifting totals ignored: tracked totals banked, no migration"
+
+section "E1-20: reset replay of a banked closed id never double-banks"
+snap="$(tracker_seq '
+import json
+from collector import Tracker
+t = Tracker(closed_ttl=600)
+t.apply_batch({"reset": False, "events": [
+  {"type": "NEW", "id": "q1", "connection": {"id": "q1", "user": "legacy", "inbound": "vless-in", "uplink_total": 1000, "downlink_total": 2000}}
+]}, 1700000000)
+t.apply_batch({"reset": False, "events": [
+  {"type": "CLOSED", "id": "q1", "closed_at": 1700000003000}
+]}, 1700000003)
+s_before = t.snapshot(1700020000)   # display TTL long expired
+# server replays recent closed connections (~1000) in every reset
+t.apply_batch({"reset": True, "events": [
+  {"type": "NEW", "id": "q1", "connection": {"id": "q1", "user": "legacy", "inbound": "vless-in", "closed_at": 1700000003000, "uplink_total": 1000, "downlink_total": 2000}}
+]}, 1700020001)
+# and a stray duplicate CLOSED event for the same long-gone id
+t.apply_batch({"reset": False, "events": [
+  {"type": "CLOSED", "id": "q1", "closed_at": 1700000003000}
+]}, 1700020002)
+s_after = t.snapshot(1700020002)
+print(json.dumps({"before": s_before, "after": s_after}))
+')"
+assert_eq "$(snap_field "$snap" 'snap["before"]["devices"]["legacy"]["protocols"]["vless-in"]["uplink_total"]')" "1000.0" "baseline banked once"
+assert_eq "$(snap_field "$snap" 'snap["after"]["devices"]["legacy"]["protocols"]["vless-in"]["uplink_total"]')" "1000.0" "replay after TTL does NOT bank twice (guard is independent of display cache)"
+assert_eq "$(snap_field "$snap" 'snap["after"]["duplicate_events"]')" "2" "both replay deliveries counted as duplicates"
+assert_eq "$(snap_field "$snap" 'snap["after"]["recently_closed"]')" "0" "old closed_at never resurfaces as recent"
+
+section "E1-21: RECENT ACTIVITY is judged by real closed_at, not last_seen"
+snap="$(tracker_seq '
+import json
+from collector import Tracker
+NOW = 1700000000
+t = Tracker(closed_ttl=600)
+t.apply_batch({"reset": True, "events": [
+  {"type": "NEW", "id": "old1", "connection": {"id": "old1", "user": "legacy", "inbound": "vless-in", "closed_at": (NOW - 3600) * 1000, "uplink_total": 111, "downlink_total": 222}},
+  {"type": "NEW", "id": "fresh1", "connection": {"id": "fresh1", "user": "legacy", "inbound": "hy2-in", "closed_at": (NOW - 10) * 1000, "uplink_total": 333, "downlink_total": 444}},
+  {"type": "NEW", "id": "old2", "connection": {"id": "old2", "user": "vmix-09", "inbound": "vless-in", "closed_at": (NOW - 3600) * 1000, "uplink_total": 777, "downlink_total": 888}}
+]}, NOW)
+print(json.dumps(t.snapshot(NOW)))
+')"
+assert_eq "$(snap_field "$snap" 'snap["recently_closed"]')" "1" "only the truly recent closed row stays in display"
+assert_eq "$(snap_field "$snap" 'snap["devices"]["legacy"]["status"]')" "RECENT ACTIVITY" "device with a fresh closed row is RECENT ACTIVITY"
+assert_eq "$(snap_field "$snap" 'snap["devices"]["vmix-09"]["status"]')" "IDLE" "hour-old closed row does NOT fake RECENT ACTIVITY"
+assert_eq "$(snap_field "$snap" 'snap["devices"]["vmix-09"]["protocols"]["vless-in"]["uplink_total"]')" "777.0" "its totals remain banked regardless"
+assert_eq "$(snap_field "$snap" 'snap["devices"]["legacy"]["uplink_total"]')" "444.0" "legacy keeps both rows banked (111+333)"
+
+section "E1-22: abandoned lifecycles bank a lower bound and never double count"
+snap="$(tracker_seq '
+import json
+from collector import Tracker
+t = Tracker()
+t.apply_batch({"reset": True, "events": [
+  {"type": "NEW", "id": "r1", "connection": {"id": "r1", "user": "vmix-01", "inbound": "vless-in", "uplink_total": 1000, "downlink_total": 2000}}
+]}, 1700000000)
+t.apply_batch({"reset": True, "events": []}, 1700000001)   # r1 missing: abandoned
+s_abandoned = t.snapshot(1700000001)
+t.apply_batch({"reset": True, "events": [
+  {"type": "NEW", "id": "r1", "connection": {"id": "r1", "user": "vmix-01", "inbound": "vless-in", "uplink_total": 5000, "downlink_total": 9000}}
+]}, 1700000002)                                            # same lifecycle comes back
+s_revived = t.snapshot(1700000002)
+t.apply_batch({"reset": False, "events": [
+  {"type": "CLOSED", "id": "r1", "closed_at": 1700000003000}
+]}, 1700000003)
+s_closed = t.snapshot(1700000003)
+print(json.dumps({"abandoned": s_abandoned, "revived": s_revived, "closed": s_closed}))
+')"
+assert_eq "$(snap_field "$snap" 'snap["abandoned"]["devices"]["vmix-01"]["protocols"]["vless-in"]["uplink_total"]')" "1000.0" "abandon keeps last-known totals as lower bound (never drops to 0)"
+assert_eq "$(snap_field "$snap" 'snap["abandoned"]["abandoned_on_reset"]')" "1" "abandonment counted"
+assert_eq "$(snap_field "$snap" 'snap["revived"]["devices"]["vmix-01"]["protocols"]["vless-in"]["uplink_total"]')" "5000.0" "revived lifecycle adopts authoritative totals without adding the lower bound"
+assert_eq "$(snap_field "$snap" 'snap["closed"]["devices"]["vmix-01"]["protocols"]["vless-in"]["uplink_total"]')" "5000.0" "final close banks exactly once"
+
+section "T11: idle-but-healthy stream is silence, not staleness"
+snap="$(tracker_seq '
+import json, os, sys, threading, time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+sys.path.insert(0, os.environ["BRIDGE"])
+import proto_wire as pw
+conn = pw.encode_length_delimited(1, b"i1") + pw.encode_length_delimited(2, b"vless-in") + pw.encode_length_delimited(3, b"vless") + pw.encode_length_delimited(10, b"legacy") + pw.encode_varint_field(16, 42) + pw.encode_varint_field(17, 84)
+evt = pw.encode_varint_field(1, 0) + pw.encode_length_delimited(2, b"i1") + pw.encode_length_delimited(3, conn)
+batch = pw.encode_length_delimited(1, evt) + pw.encode_varint_field(2, 1)
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        self.send_response(200)
+        self.send_header("Content-Type", "application/grpc-web+proto")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        frame = b"\x00" + len(batch).to_bytes(4, "big") + batch
+        self.wfile.write(("%x\r\n" % len(frame)).encode() + frame + b"\r\n")
+        self.wfile.flush()
+        time.sleep(2.5)   # long silence: healthy idle, no keepalive batches
+        trailer = b"grpc-status: 0\r\n"
+        frame = b"\x80" + len(trailer).to_bytes(4, "big") + trailer
+        self.wfile.write(("%x\r\n" % len(frame)).encode() + frame + b"\r\n")
+        self.wfile.flush()
+    def log_message(self, *args):
+        pass
+server = HTTPServer(("127.0.0.1", 0), Handler)
+port = server.server_address[1]
+threading.Thread(target=server.serve_forever, daemon=True).start()
+from collector import Collector
+from api_bridge.singbox_stream import SingboxEventStream
+c = Collector(url="http://127.0.0.1:%d" % port, interval=0.5)
+c.stream_factory = lambda: SingboxEventStream("http://127.0.0.1:%d" % port, interval_seconds=0.5, connect_timeout=2.0, idle_timeout=0.5)
+c.consume(duration=1.5)
+snap = c.snapshot()
+print(json.dumps(snap))
+')"
+assert_eq "$(snap_field "$snap" 'snap["stale"]')" "False" "idle silence does NOT mark stale"
+assert_eq "$(snap_field "$snap" 'snap["last_error"]')" "None" "idle silence records no error"
+assert_eq "$(snap_field "$snap" 'snap["devices"]["legacy"]["protocols"]["vless-in"]["uplink_total"]')" "42.0" "reset batch decoded through the idle window"
+assert_eq "$(snap_field "$snap" 'snap["batch_count"]')" "1" "idle heartbeats do not count as stream batches"
+
+printf '\n== summary ==\n'
+printf '  pass=%d fail=%d (expected pass=%d)\n' "$PASS" "$FAIL" "$EXPECTED_PASS"
+if [ "$FAIL" -ne 0 ] || [ "$PASS" -ne "$EXPECTED_PASS" ]; then
+    printf '  RESULT: FAILED (failures, or a section did not run)\n'
+    exit 1
+fi
+printf '  RESULT: ALL GREEN\n'
+exit 0
