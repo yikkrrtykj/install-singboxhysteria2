@@ -26,6 +26,7 @@ from __future__ import annotations
 import datetime
 import ipaddress
 import os
+import threading
 
 from web.storage import atomic_write_json, ensure_private_dir, read_json
 
@@ -58,11 +59,20 @@ def _atomic_write_json(path, payload):
 
 
 class AccessPolicy:
-    """The persisted IP whitelist (access.json) + source-IP decision."""
+    """The persisted IP whitelist (access.json) + source-IP decision.
+
+    Thread-safe: request threads may add/remove entries concurrently with
+    gate checks, so every read of the entry list takes the lock. Mutations
+    are STORAGE-FIRST: the candidate list is written atomically BEFORE the
+    in-memory list is replaced, so a failed write can never produce a
+    200 response with disk left stale (the exception propagates and the
+    server answers 500 with memory == disk).
+    """
 
     def __init__(self, data_dir):
         self.data_dir = data_dir
         self.path = os.path.join(data_dir, "access.json")
+        self._lock = threading.RLock()
         self._entries = []
         self.updated_at = None
         self.load()
@@ -70,26 +80,28 @@ class AccessPolicy:
     # -- persistence ---------------------------------------------------------
 
     def load(self):
-        self._entries = []
-        self.updated_at = None
-        data = read_json(self.path)
-        if not isinstance(data, dict):
-            return
-        entries = data.get("whitelist")
-        if not isinstance(entries, list):
-            return
-        for entry in entries:
-            try:
-                self._entries.append(parse_network(entry))
-            except ValueError:
-                continue  # never let a corrupt entry open the gate
-        self.updated_at = data.get("updated_at")
+        with self._lock:
+            self._entries = []
+            self.updated_at = None
+            data = read_json(self.path)
+            if not isinstance(data, dict):
+                return
+            entries = data.get("whitelist")
+            if not isinstance(entries, list):
+                return
+            for entry in entries:
+                try:
+                    self._entries.append(parse_network(entry))
+                except ValueError:
+                    continue  # never let a corrupt entry open the gate
+            self.updated_at = data.get("updated_at")
 
-    def save(self):
+    def _commit(self, entries):
+        """Atomically persist the candidate list; raises on failure."""
         ensure_private_dir(self.data_dir)
         atomic_write_json(self.path, {
             "version": ACCESS_VERSION,
-            "whitelist": self._entries,
+            "whitelist": entries,
             "updated_at": datetime.datetime.now(
                 datetime.timezone.utc).isoformat(),
         })
@@ -97,33 +109,39 @@ class AccessPolicy:
     # -- entries -------------------------------------------------------------
 
     def entries(self):
-        return tuple(self._entries)
+        with self._lock:
+            return tuple(self._entries)
 
     def contains(self, entry):
         try:
             canonical = parse_network(entry)
         except ValueError:
             return False
-        return canonical in self._entries
+        with self._lock:
+            return canonical in self._entries
 
     def add(self, entry):
         canonical = parse_network(entry)
-        if canonical not in self._entries:
-            self._entries.append(canonical)
-            self._entries.sort()
-            self.save()
-        return canonical
+        with self._lock:
+            if canonical in self._entries:
+                return canonical
+            candidate = sorted(self._entries + [canonical])
+            self._commit(candidate)  # storage first; raises -> no change
+            self._entries = candidate
+            return canonical
 
     def remove(self, entry):
         try:
             canonical = parse_network(entry)
         except ValueError:
             return False
-        if canonical not in self._entries:
-            return False
-        self._entries.remove(canonical)
-        self.save()
-        return True
+        with self._lock:
+            if canonical not in self._entries:
+                return False
+            candidate = [e for e in self._entries if e != canonical]
+            self._commit(candidate)  # storage first; raises -> no change
+            self._entries = candidate
+            return True
 
     def covers(self, entry, remote_ip):
         """True when the entry network contains the given source address."""
@@ -143,7 +161,9 @@ class AccessPolicy:
             return False
         if any(str(addr) in LOOPBACK_ALLOW for addr in candidates):
             return True
-        for entry in self._entries:
+        with self._lock:
+            entries = list(self._entries)
+        for entry in entries:
             network = ipaddress.ip_network(entry)
             for addr in candidates:
                 if addr.version == network.version and addr in network:

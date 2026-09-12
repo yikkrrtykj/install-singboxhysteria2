@@ -24,6 +24,7 @@ import base64
 import hashlib
 import hmac
 import secrets
+import threading
 import time
 
 from web.storage import atomic_write_json, ensure_private_dir, read_json
@@ -84,7 +85,11 @@ def validate_password(password):
 
 
 class LoginRateLimiter:
-    """Per-IP sliding-window lockout for failed logins (in memory)."""
+    """Per-IP sliding-window lockout for failed logins (in memory).
+
+    Thread-safe: ThreadingHTTPServer may process several logins at once,
+    and the failure window / lockout tables must not race.
+    """
 
     def __init__(self, max_failures=LOGIN_MAX_FAILURES,
                  window_seconds=LOGIN_WINDOW_SECONDS,
@@ -93,70 +98,90 @@ class LoginRateLimiter:
         self.window_seconds = window_seconds
         self.lockout_seconds = lockout_seconds
         self._clock = clock
+        self._mutex = threading.Lock()
         self._failures = {}     # ip -> [timestamps]
         self._locked_until = {}  # ip -> timestamp
 
     def check(self, ip):
         """(allowed, retry_after_seconds) for a login attempt from ip."""
         now = self._clock()
-        until = self._locked_until.get(ip)
-        if until is not None:
-            if now < until:
-                return False, int(round(until - now))
-            del self._locked_until[ip]
-            self._failures.pop(ip, None)
-        return True, 0
+        with self._mutex:
+            until = self._locked_until.get(ip)
+            if until is not None:
+                if now < until:
+                    return False, int(round(until - now))
+                del self._locked_until[ip]
+                self._failures.pop(ip, None)
+            return True, 0
 
     def record_failure(self, ip):
         now = self._clock()
-        window_start = now - self.window_seconds
-        recent = [t for t in self._failures.get(ip, []) if t > window_start]
-        recent.append(now)
-        self._failures[ip] = recent
-        if len(recent) >= self.max_failures:
-            self._locked_until[ip] = now + self.lockout_seconds
+        with self._mutex:
+            window_start = now - self.window_seconds
+            recent = [t for t in self._failures.get(ip, []) if t > window_start]
+            recent.append(now)
+            self._failures[ip] = recent
+            if len(recent) >= self.max_failures:
+                self._locked_until[ip] = now + self.lockout_seconds
 
     def record_success(self, ip):
-        self._failures.pop(ip, None)
-        self._locked_until.pop(ip, None)
+        with self._mutex:
+            self._failures.pop(ip, None)
+            self._locked_until.pop(ip, None)
 
 
 class SessionStore:
-    """In-memory bearer sessions; nothing token-shaped is ever persisted."""
+    """In-memory bearer sessions; nothing token-shaped is ever persisted.
+
+    Thread-safe: concurrent logins/logouts/expiries come from different
+    request threads; the sessions dict is guarded by a mutex (no reliance
+    on GIL atomicity for multi-step operations).
+    """
 
     def __init__(self, ttl=DEFAULT_SESSION_TTL, clock=time.time):
         self.ttl = ttl
         self._clock = clock
-        self._sessions = {}  # token -> {"created": ts, "expires": ts}
+        self._mutex = threading.Lock()
+        self._sessions = {}  # token -> {"created", "expires", "csrf_token"}
 
     def create(self):
         now = self._clock()
         token = secrets.token_urlsafe(32)
         record = {"created": now, "expires": now + self.ttl,
                   "csrf_token": secrets.token_urlsafe(32)}
-        self._sessions[token] = record
+        with self._mutex:
+            self._sessions[token] = record
         return token
 
     def resolve(self, token):
-        record = self._sessions.get(token)
-        if record is None:
-            return None
-        if self._clock() >= record["expires"]:
-            del self._sessions[token]
-            return None
-        return record
+        with self._mutex:
+            record = self._sessions.get(token)
+            if record is None:
+                return None
+            if self._clock() >= record["expires"]:
+                del self._sessions[token]
+                return None
+            return record
 
     def drop(self, token):
-        self._sessions.pop(token, None)
+        with self._mutex:
+            self._sessions.pop(token, None)
 
     def drop_all(self, except_token=None):
-        for token in list(self._sessions):
-            if token != except_token:
-                del self._sessions[token]
+        with self._mutex:
+            for token in list(self._sessions):
+                if token != except_token:
+                    del self._sessions[token]
 
 
 class AuthStore:
-    """auth.json persistence (hashes only) + in-memory session/rate state."""
+    """auth.json persistence (hashes only) + in-memory session/rate state.
+
+    Thread-safe and storage-first: mutations build the candidate payload,
+    write it atomically, and only then publish the in-memory state under a
+    mutex. A failed write therefore leaves memory and disk coherent (and
+    the HTTP layer turns the exception into a 500 -- never a success).
+    """
 
     def __init__(self, data_dir, session_ttl=DEFAULT_SESSION_TTL,
                  clock=time.time):
@@ -164,6 +189,7 @@ class AuthStore:
         self.path = "%s/auth.json" % data_dir
         self.sessions = SessionStore(ttl=session_ttl, clock=clock)
         self.login_limiter = LoginRateLimiter(clock=clock)
+        self._mutex = threading.RLock()
         self._password = None
         self._recovery = None
         self.load()
@@ -171,53 +197,78 @@ class AuthStore:
     # -- persistence ---------------------------------------------------------
 
     def load(self):
-        data = read_json(self.path)
-        if not isinstance(data, dict):
-            return
-        password = data.get("password")
-        if isinstance(password, dict) and password.get("hash"):
-            self._password = password
-        recovery = data.get("recovery")
-        if isinstance(recovery, dict) and recovery.get("hash"):
-            self._recovery = recovery
+        with self._mutex:
+            data = read_json(self.path)
+            if not isinstance(data, dict):
+                return
+            password = data.get("password")
+            if isinstance(password, dict) and password.get("hash"):
+                self._password = password
+            recovery = data.get("recovery")
+            if isinstance(recovery, dict) and recovery.get("hash"):
+                self._recovery = recovery
+
+    def _payload(self, password_record=None, recovery_record=None):
+        payload = {"version": AUTH_VERSION}
+        password = password_record if password_record is not None \
+            else self._password
+        if password is not None:
+            payload["password"] = password
+        recovery = recovery_record if recovery_record is not None \
+            else self._recovery
+        if recovery is not None:
+            payload["recovery"] = recovery
+        return payload
 
     def save(self):
-        ensure_private_dir(self.data_dir)
-        payload = {"version": AUTH_VERSION}
-        if self._password is not None:
-            payload["password"] = self._password
-        if self._recovery is not None:
-            payload["recovery"] = self._recovery
-        atomic_write_json(self.path, payload)
+        with self._mutex:
+            ensure_private_dir(self.data_dir)
+            atomic_write_json(self.path, self._payload())
 
     # -- password ------------------------------------------------------------
 
     def password_configured(self):
-        return self._password is not None
+        with self._mutex:
+            return self._password is not None
 
     def verify_password(self, password):
-        if self._password is None:
+        with self._mutex:
+            record = self._password
+        if record is None:
             return False
-        return verify_secret(password, self._password)
+        return verify_secret(password, record)
 
     def set_password(self, password, keep_session=None):
         validate_password(password)
-        self._password = hash_secret(password)
-        self.save()
-        # A new password invalidates every OTHER session (admin may be
-        # locking out a compromised browser); the caller stays logged in.
-        self.sessions.drop_all(except_token=keep_session)
+        record = hash_secret(password)
+        with self._mutex:
+            # storage first: a failed write raises BEFORE any in-memory
+            # state changes, so HTTP callers can never observe a 200 with
+            # disk left stale.
+            ensure_private_dir(self.data_dir)
+            atomic_write_json(self.path, self._payload(password_record=record))
+            self._password = record
+            # A new password invalidates every OTHER session (admin may be
+            # locking out a compromised browser); the caller stays logged in.
+            self.sessions.drop_all(except_token=keep_session)
 
     # -- recovery record (hash only; the flow lives in web/recovery.py) ------
 
     def recovery_configured(self):
-        return self._recovery is not None
+        with self._mutex:
+            return self._recovery is not None
 
     def set_recovery_key(self, key):
-        self._recovery = hash_secret(key)
-        self.save()
+        record = hash_secret(key)
+        with self._mutex:
+            ensure_private_dir(self.data_dir)
+            atomic_write_json(self.path,
+                              self._payload(recovery_record=record))
+            self._recovery = record
 
     def verify_recovery_key(self, key):
-        if self._recovery is None:
+        with self._mutex:
+            record = self._recovery
+        if record is None:
             return False
-        return verify_secret(key, self._recovery)
+        return verify_secret(key, record)
