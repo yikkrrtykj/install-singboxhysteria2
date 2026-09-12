@@ -390,6 +390,7 @@ UNIT_DRIFT_HASH="$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)"
 LINK_BEFORE_T15="$(readlink "$FIX_APP_LINK")"
 printf '0.4.0\n' > "$FIX_SRC/VERSION"
 : > "$MOCK_FAIL_RESTART_ONCE"
+RESTARTS_B15=$(grep -c 'systemctl restart singbox-monitor' "$MOCK_CALL_LOG" || true)
 OUT15="$TMP/out-t15.log"
 run_install "$OUT15"
 RC15=$?
@@ -398,12 +399,12 @@ assert_eq "$LINK_BEFORE_T15" "$(readlink "$FIX_APP_LINK")" "release restored to 
 assert_eq "$UNIT_DRIFT_HASH" "$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)" "unit restored to pre-transaction content (P3)"
 assert_grep '事务前状态已恢复' "$OUT15" "rollback completion reported"
 RESTORE_CALLS=$(grep -c 'systemctl restart singbox-monitor' "$MOCK_CALL_LOG")
-if [ "$RESTORE_CALLS" -ge 2 ]; then
-    pass "failed restart followed by restoration restart (P3)"
+if [ "$((RESTORE_CALLS - RESTARTS_B15))" -eq 2 ]; then
+    pass "exactly 2 restarts in this transaction (failed + restoration)"
 else
-    fail "expected >=2 monitor restarts (failed + restore), got $RESTORE_CALLS"
+    fail "expected exactly 2 monitor restarts in T15, got $((RESTORE_CALLS - RESTARTS_B15))"
 fi
-if sbmon_service_active; then pass "old service active after transaction rollback"; else fail "service not active after rollback"; fi
+assert_eq "active" "$(cat "$MOCK_SYS_STATE")" "old service active after transaction rollback"
 assert_no_grep 'sing-box' "$MOCK_CALL_LOG" "rollback never touches sing-box"
 assert_no_grep ' 0\.4\.0 ' "$FIX_RELEASES/releases.history" "failed upgrade candidate (0.4.0) absent from history (F1)"
 
@@ -493,7 +494,7 @@ assert_eq "disabled" "$(cat "$MOCK_ENABLED_STATE")" "service disabled after fres
 section "T17 deployment lock serialization (P4, flock-gated)"
 if command -v flock >/dev/null 2>&1; then
     LINK_B=$(readlink "$FIX_APP_LINK" 2>/dev/null || true); UNIT_B=$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)
-    flock "$SBMON_LOCK_FILE" -c 'sleep 5' & LOCK_HOLDER=$!
+    flock "$SBMON_LOCK_FILE" -c 'sleep 9' & LOCK_HOLDER=$!
     sleep 0.4
     ( SBMON_LOCK_TIMEOUT=2 "$INSTALL_MONITOR" install ) > "$TMP/out-t17i.log" 2>&1
     assert_rc 1 $? "install aborts fail-closed while lock held"
