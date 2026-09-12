@@ -22,9 +22,19 @@ Official stream contract (verified against the v1.14.0 source,
   closed ones;
 * UPDATE carries only id + uplinkDelta + downlinkDelta (no Connection object);
   UPDATE(0,0) means "traffic stopped";
-* CLOSED carries id + closedAt and finalizes exactly once;
+* CLOSED carries id + closedAt (normally WITH the final Connection whose
+  authoritative totals include traffic after the last UPDATE ticker) and
+  finalizes exactly once;
 * neither the server nor this collector relies on ids disappearing from a
-  later poll.
+  later poll;
+* the server replays ~1000 recently-closed connections in every reset, so an
+  LRU banked-id guard (independent of the 10-minute display cache) makes sure
+  a replayed lifecycle is never banked twice;
+* active ids missing from a reset are ABANDONED (never "closed"): their last
+  known totals are banked as a lower bound so cumulative totals never go
+  backwards, and the bound is un-banked if the id comes back;
+* an idle-but-healthy stream can stay silent for a long time (the server
+  skips empty ticker batches): idle reads are heartbeats, not staleness.
 
 Traffic model: ``uplink`` / ``downlink`` are the OFFICIAL API direction names
 and are kept separate everywhere (connection, protocol, device). They are NOT
@@ -116,16 +126,27 @@ def _new_connection(fields, now):
 class Tracker:
     """In-memory event-driven lifecycle accumulator (no database)."""
 
-    def __init__(self, closed_ttl=DEFAULT_CLOSED_TTL, interval=DEFAULT_INTERVAL):
+    def __init__(self, closed_ttl=DEFAULT_CLOSED_TTL, interval=DEFAULT_INTERVAL,
+                 banked_id_cap=4096):
         self.closed_ttl = closed_ttl
         self.interval = interval
         self.active = {}    # id -> connection dict
-        self.closed = {}    # id -> connection dict (+ closed_at), recent only
+        # Display-only cache: recent closed connections for RECENT ACTIVITY.
+        # Pruned by the REAL closed_at (not by last_seen), because a reset
+        # replay may deliver a connection that closed long ago.
+        self.closed = {}
         self.finalized = {}  # (user, inbound) -> {"uplink": x, "downlink": y}
+        # Replay/accounting guard, INDEPENDENT of the display cache above.
+        # The server keeps ~1000 recently-closed connections for replay in the
+        # next reset; our display TTL (10 min) must never decide whether a
+        # replayed id gets banked again. LRU id -> accounting record
+        # {user, inbound, uplink, downlink, state: closed|abandoned}.
+        self.banked_id_cap = banked_id_cap
+        self._banked_ids = {}
         self.devices = set()  # every device name ever observed
         self.batch_count = 0
         self.skipped_events = 0      # malformed / unknown-id events (fail-safe)
-        self.duplicate_events = 0    # CLOSED for an already-finalized id
+        self.duplicate_events = 0    # CLOSED / replayed rows for a banked id
         self.identity_conflicts = 0  # id tried to change user/inbound (HIGH guard)
         self.abandoned_on_reset = 0  # active ids dropped by reset without CLOSED
 
@@ -138,6 +159,24 @@ class Tracker:
         slot = self.finalized.setdefault(key, {"uplink": 0.0, "downlink": 0.0})
         slot["uplink"] = max(0.0, slot["uplink"] - uplink)
         slot["downlink"] = max(0.0, slot["downlink"] - downlink)
+
+    def _record_banked(self, cid, user, inbound, uplink, downlink, state):
+        """LRU-register a banked lifecycle (closed or abandoned) for replay guard."""
+        if cid in self._banked_ids:
+            del self._banked_ids[cid]
+        self._banked_ids[cid] = {"user": user, "inbound": inbound,
+                                 "uplink": uplink, "downlink": downlink,
+                                 "state": state}
+        while len(self._banked_ids) > self.banked_id_cap:
+            self._banked_ids.pop(next(iter(self._banked_ids)))
+
+    def _drop_banked(self, cid):
+        """Remove and return a banked lifecycle record (unbank it first)."""
+        return self._banked_ids.pop(cid, None)
+
+    def _unbank_record(self, record):
+        self._unbank((record["user"], record["inbound"]),
+                     record["uplink"], record["downlink"])
 
     def _identity_conflict(self, conn, fields, now):
         """HIGH guard: an id keeps its (user, inbound) identity forever.
@@ -164,6 +203,9 @@ class Tracker:
         key = (conn["user"], conn["inbound"])
         # bank exactly once, at finalize time
         self._bank(key, conn["uplink_total"], conn["downlink_total"])
+        self._record_banked(conn["id"], conn["user"], conn["inbound"],
+                            conn["uplink_total"], conn["downlink_total"],
+                            state="closed")
         self.closed[conn["id"]] = conn
 
     # -- batch / event application ----------------------------------------------
@@ -172,9 +214,12 @@ class Tracker:
         if not isinstance(batch, dict):
             self.skipped_events += 1
             return
-        self.batch_count += 1
         events = batch.get("events") or []
-        if batch.get("reset"):
+        is_reset = bool(batch.get("reset"))
+        if not events and not is_reset:
+            return  # heartbeat from an idle-but-healthy stream: nothing to apply
+        self.batch_count += 1
+        if is_reset:
             self._apply_reset(events, now)
             return
         for event in events:
@@ -187,9 +232,13 @@ class Tracker:
         events for all currently ACTIVE connections plus NEW events (with
         closedAt) for recently CLOSED ones. Active lifecycles present in the
         batch are refreshed with the authoritative totals (same lifecycle, no
-        double counting). Active ids NOT present in the batch are dropped
-        WITHOUT banking -- the server never confirmed them closed, so banking
-        would be guessing.
+        double counting). Active ids NOT present in the batch are treated as
+        ABANDONED / INCOMPLETE: they are not closed (we never got CLOSED and
+        refuse to invent a closed_at), they never show as RECENT ACTIVITY, but
+        their LAST KNOWN totals are banked as a lower bound so device totals
+        can never go backwards across a stream reset. Should the same id show
+        up again later (as active or as a replayed closed row), the lower
+        bound is un-banked first, so nothing is ever double counted.
         """
         seen = set()
         for event in events:
@@ -210,8 +259,13 @@ class Tracker:
             else:
                 self._upsert_active(cid, fields, now)
         for cid in [c for c in list(self.active) if c not in seen]:
-            self.active.pop(cid)
+            conn = self.active.pop(cid)
             self.abandoned_on_reset += 1
+            key = (conn["user"], conn["inbound"])
+            self._bank(key, conn["uplink_total"], conn["downlink_total"])
+            self._record_banked(conn["id"], conn["user"], conn["inbound"],
+                                conn["uplink_total"], conn["downlink_total"],
+                                state="abandoned")
 
     def _upsert_active(self, cid, fields, now):
         existing = self.active.get(cid)
@@ -225,14 +279,17 @@ class Tracker:
                                              float(fields.get("downlink_total", 0)))
             existing["last_seen"] = now
             return
-        closed_conn = self.closed.pop(cid, None)
-        if closed_conn is not None and \
-                (closed_conn["user"], closed_conn["inbound"]) != (fields.get("user"),
-                                                                  fields.get("inbound")):
+        display = self.closed.get(cid)
+        banked = self._banked_ids.get(cid)
+        identity_source = display or banked
+        if identity_source is not None and \
+                (identity_source["user"], identity_source["inbound"]) != (fields.get("user"),
+                                                                          fields.get("inbound")):
             # reactivation with a different identity is a conflict too
-            self.closed[cid] = closed_conn
             self.identity_conflicts += 1
             return
+        self.closed.pop(cid, None)
+        carried = self._drop_banked(cid)
         conn = _new_connection({"id": cid, "user": fields["user"],
                                 "inbound": fields["inbound"],
                                 "inbound_type": fields.get("inbound_type", ""),
@@ -242,22 +299,53 @@ class Tracker:
                                 "created_at": fields.get("created_at"),
                                 "uplink_total": fields.get("uplink_total", 0),
                                 "downlink_total": fields.get("downlink_total", 0)}, now)
-        if closed_conn is not None:
-            # reactivation: continue the same lifecycle, un-bank its totals
-            key = (closed_conn["user"], closed_conn["inbound"])
-            self._unbank(key, closed_conn["uplink_total"], closed_conn["downlink_total"])
-            conn["uplink_total"] = max(closed_conn["uplink_total"], conn["uplink_total"])
-            conn["downlink_total"] = max(closed_conn["downlink_total"], conn["downlink_total"])
-            conn["created_at"] = closed_conn["created_at"] or conn["created_at"]
+        if carried is not None:
+            # the same lifecycle continues (was closed OR abandoned before):
+            # un-bank its recorded totals and carry them forward as a floor
+            self._unbank_record(carried)
+            conn["uplink_total"] = max(carried["uplink"], conn["uplink_total"])
+            conn["downlink_total"] = max(carried["downlink"], conn["downlink_total"])
+        if display is not None:
+            conn["created_at"] = display["created_at"] or conn["created_at"]
         self.active[cid] = conn
         self.devices.add(conn["user"])
 
     def _record_closed_row(self, cid, fields, now, closed_at):
-        """A closed connection announced as NEW (reset batches / initial state)."""
+        """A closed connection announced as NEW (reset batches / server replay).
+
+        The server replays ~1000 recently-closed connections in every reset,
+        so this path must consult the INDEPENDENT banked-id guard (not the
+        10-minute display cache): a replay of an already-banked lifecycle is
+        never banked again, no matter how old it is. An ABANDONED lifecycle
+        that later receives its true final values has its lower-bound bank
+        replaced by the authoritative ones.
+        """
         user, inbound = _row_identity(fields)
         self.devices.add(user)
+        banked = self._banked_ids.get(cid)
+        if banked is not None:
+            if (banked["user"], banked["inbound"]) != (user, inbound):
+                self.identity_conflicts += 1  # never move traffic across devices
+                return
+            self.duplicate_events += 1  # exact id already banked once
+            if banked["state"] == "abandoned":
+                # replace the lower bound with the true final values
+                self._drop_banked(cid)
+                self._unbank_record(banked)
+                original = _new_connection(
+                    {"id": cid, "user": user, "inbound": inbound,
+                     "inbound_type": fields.get("inbound_type", ""),
+                     "network": fields.get("network", ""),
+                     "source": fields.get("source", ""),
+                     "destination": fields.get("destination", ""),
+                     "created_at": fields.get("created_at"),
+                     "uplink_total": fields.get("uplink_total", 0),
+                     "downlink_total": fields.get("downlink_total", 0)}, now)
+                original["closed_at"] = closed_at or now
+                self._finalize(original, now, closed_at=original["closed_at"])
+            return
         if cid in self.closed:
-            self.duplicate_events += 1  # already banked once
+            self.duplicate_events += 1  # display cache also says: seen before
             return
         if cid in self.active:
             # the active lifecycle received its authoritative closure
@@ -332,10 +420,50 @@ class Tracker:
         if etype == "CLOSED":
             conn = self.active.pop(cid, None)
             if conn is not None:
-                self._finalize(conn, now, closed_at=event.get("closed_at"))
+                # 1.14 CLOSED events normally carry the final Connection, whose
+                # uplinkTotal/downlinkTotal include everything transferred
+                # after the last UPDATE ticker. Identity guard first, then
+                # refresh the authoritative totals, then finalize -- otherwise
+                # the tail of the traffic (e.g. the last 50 KB) is lost.
+                if fields and self._identity_conflict(conn, fields, now):
+                    if "uplink_total" in fields:
+                        conn["uplink_total"] = max(conn["uplink_total"],
+                                                   float(fields.get("uplink_total", 0)))
+                    if "downlink_total" in fields:
+                        conn["downlink_total"] = max(conn["downlink_total"],
+                                                     float(fields.get("downlink_total", 0)))
+                closed_at = event.get("closed_at") or fields.get("closed_at")
+                self._finalize(conn, now, closed_at=closed_at)
+                return
+            banked = self._banked_ids.get(cid)
+            if banked is not None:
+                if banked["state"] == "closed":
+                    self.duplicate_events += 1  # finalize exactly once
+                    return
+                # closure of an ABANDONED lifecycle: replace the lower-bound
+                # bank with the true final values when the event carries them
+                if not fields:
+                    return  # nothing better than the lower bound is available
+                if (banked["user"], banked["inbound"]) != _row_identity(fields):
+                    self.identity_conflicts += 1
+                    return
+                self._drop_banked(cid)
+                self._unbank_record(banked)
+                final = _new_connection(
+                    {"id": cid, "user": banked["user"], "inbound": banked["inbound"],
+                     "inbound_type": fields.get("inbound_type", ""),
+                     "network": fields.get("network", ""),
+                     "source": fields.get("source", ""),
+                     "destination": fields.get("destination", ""),
+                     "created_at": fields.get("created_at"),
+                     "uplink_total": fields.get("uplink_total", 0),
+                     "downlink_total": fields.get("downlink_total", 0)}, now)
+                final["closed_at"] = _to_seconds(event.get("closed_at")) \
+                    or _to_seconds(fields.get("closed_at")) or now
+                self._finalize(final, now, closed_at=final["closed_at"])
                 return
             if cid in self.closed:
-                self.duplicate_events += 1  # finalize exactly once
+                self.duplicate_events += 1  # display cache says: seen before
                 return
             self.skipped_events += 1  # unknown id: no invented traffic
             return
@@ -343,10 +471,12 @@ class Tracker:
         self.skipped_events += 1  # unknown event type
 
     def snapshot(self, now):
-        # prune the recent-closed cache by TTL; banked totals are unaffected
-        # (they live in self.finalized and never decrease)
+        # Prune the recent-closed DISPLAY cache by the real closed_at, never by
+        # last_seen: a reset replay may deliver a connection that closed long
+        # ago, and it must not resurface as RECENT ACTIVITY. Banked totals are
+        # unaffected (they live in self.finalized / the banked-id guard).
         expired = [cid for cid, c in self.closed.items()
-                   if now - c["last_seen"] > self.closed_ttl]
+                   if now - _to_seconds(c["closed_at"]) > self.closed_ttl]
         for cid in expired:
             del self.closed[cid]
         per_device_active = {}
@@ -477,11 +607,16 @@ class Collector:
                 for batch in self.stream_factory():
                     now = self.clock()
                     self.tracker.apply_batch(batch, now)
-                    applied += 1
-                    self.stale = False
-                    self.consecutive_failures = 0
-                    self.last_success_at = now
-                    self.last_error = None
+                    # Heartbeat batches (empty, from an idle-but-healthy
+                    # stream) keep the loop alive without counting as data:
+                    # the official server sends NOTHING while there is no
+                    # traffic, so idle silence must never look like staleness.
+                    if batch.get("events") or batch.get("reset"):
+                        applied += 1
+                        self.stale = False
+                        self.consecutive_failures = 0
+                        self.last_success_at = now
+                        self.last_error = None
                     if max_batches is not None and applied >= max_batches:
                         return applied
                     if deadline is not None and self.clock() >= deadline:
@@ -536,8 +671,11 @@ def build_arg_parser():
                              "%s takes precedence" % SECRET_ENV)
     parser.add_argument("--closed-ttl", type=float, default=DEFAULT_CLOSED_TTL,
                         help="how long finalized ids stay in the recent cache")
-    parser.add_argument("--timeout", type=float, default=5.0,
-                        help="per-read stream timeout in seconds")
+    parser.add_argument("--connect-timeout", type=float, default=5.0,
+                        help="connect / response-header timeout in seconds")
+    parser.add_argument("--idle-timeout", type=float, default=30.0,
+                        help="read silence allowance; an idle-but-healthy "
+                             "stream is NOT an error (default: %(default)s)")
     parser.add_argument("--once", action="store_true",
                         help="consume the first (reset) batch, print JSON, exit")
     parser.add_argument("--duration", type=float, default=None,
@@ -553,7 +691,9 @@ def main(argv=None):
 
     def factory():
         return SingboxEventStream(args.url, interval_seconds=args.interval,
-                                  secret=secret, timeout=args.timeout)
+                                  secret=secret,
+                                  connect_timeout=args.connect_timeout,
+                                  idle_timeout=args.idle_timeout)
 
     try:
         collector = Collector(url=args.url, interval=args.interval,
