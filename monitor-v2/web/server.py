@@ -33,6 +33,7 @@ from web.recovery import (RECOVERY_SUCCESS_MESSAGE, RecoveryGlobalGuard,
 MONITOR_WEB_VERSION = "0.1.0-e2"
 SESSION_COOKIE = "monitor_session"
 MAX_BODY_BYTES = 65536
+SUPPORTED_METHODS = "GET, POST"
 
 CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -127,11 +128,26 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         self._dispatch("POST")
 
+    # The dashboard implements exactly GET and POST. Everything else --
+    # including methods a future phase might want (E3 DELETE) -- is
+    # uniformly rejected NOW instead of drifting into accidental surface.
     def do_PUT(self):
-        self._dispatch("PUT")
+        self._method_not_allowed()
 
-    def do_DELETE(self):
-        self._dispatch("DELETE")
+    do_PATCH = do_DELETE = do_OPTIONS = do_TRACE = do_CONNECT = do_PUT
+
+    def _method_not_allowed(self):
+        # Uniform surface: 405 + Allow, and never reuse a connection whose
+        # method semantics (or body framing) we did not interpret.
+        self.close_connection = True
+        body = json.dumps({"error": "method not allowed"}).encode("utf-8")
+        self.send_response(405)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Allow", SUPPORTED_METHODS)
+        self.send_header("Content-Length", str(len(body)))
+        self._common_headers()
+        self.end_headers()
+        self.wfile.write(body)
 
     def _dispatch(self, method):
         try:
@@ -208,7 +224,35 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             return
         self._send_json(404, {"error": "not found"})
 
+    def _body_header_error(self):
+        """(status, message) when request body headers are unacceptable.
+
+        A malformed Content-Length is a 400, never a silent 0; an oversized
+        body is a 413; chunked bodies are unsupported. In all three cases
+        the connection is closed afterwards -- the body length is not
+        trusted for skipping.
+        """
+        if self.headers.get("Transfer-Encoding"):
+            return 400, "Transfer-Encoding is not supported"
+        raw = self.headers.get("Content-Length")
+        if raw is None:
+            return None
+        try:
+            length = int(raw)
+        except (TypeError, ValueError):
+            return 400, "malformed Content-Length"
+        if length < 0:
+            return 400, "malformed Content-Length"
+        if length > MAX_BODY_BYTES:
+            return 413, "request body too large"
+        return None
+
     def _route_post(self, path, remote):
+        error = self._body_header_error()
+        if error is not None:
+            self.close_connection = True  # body length untrusted: no reuse
+            self._send_json(error[0], {"error": error[1]})
+            return
         if self._cross_origin():
             self._send_json(403, {"error": "cross-origin request rejected"})
             return
@@ -400,11 +444,26 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             return
         auth.login_limiter.record_success(remote)
         token = auth.sessions.create()
-        cookie = ("%s=%s; Path=/; Max-Age=%d; HttpOnly; Secure; "
-                  "SameSite=Strict" % (SESSION_COOKIE, token,
-                                       int(auth.sessions.ttl)))
         self._send_json(200, {"status": "ok"},
-                        extra_headers=[("Set-Cookie", cookie)])
+                        extra_headers=[("Set-Cookie",
+                                        self._session_cookie(
+                                            token, int(auth.sessions.ttl)))])
+
+    def _session_cookie(self, value, max_age):
+        """Session cookie header with the mode-appropriate Secure flag.
+
+        Remote mode (and any TLS listener) is HTTPS-only, so Secure is
+        mandatory there. On a loopback HTTP listener Secure is deliberately
+        omitted: browsers differ in whether they accept Secure cookies over
+        plain http://localhost, the loopback canary must work in all of
+        them, and a loopback-only listener never touches a network.
+        """
+        parts = ["%s=%s" % (SESSION_COOKIE, value), "Path=/",
+                 "Max-Age=%d" % max_age, "HttpOnly", "SameSite=Strict"]
+        if self.app.remote_mode or \
+                getattr(self.server, "scheme", "http") == "https":
+            parts.append("Secure")
+        return "; ".join(parts)
 
     # -- recovery flow -----------------------------------------------------------
 
@@ -488,10 +547,9 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         token = self._session_token()
         if self.app.auth is not None and token:
             self.app.auth.sessions.drop(token)
-        cookie = ("%s=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict"
-                  % SESSION_COOKIE)
         self._send_json(200, {"status": "ok"},
-                        extra_headers=[("Set-Cookie", cookie)])
+                        extra_headers=[("Set-Cookie",
+                                        self._session_cookie("", 0))])
 
     def _handle_password(self, session, remote):
         """POST /api/v1/password {current_password, new_password}."""
