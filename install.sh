@@ -1401,89 +1401,196 @@ client_management_menu() {
 
 # >>> phase-d singbox-1.14-api >>> =============================================
 # Phase D: safe production upgrade 1.13.x -> 1.14.x stable with a localhost-only
-# sing-box service.api inbound (data source for the future Monitor v2).
-# Scope: no Monitor UI/daemon, no database, no conntrack/ss collection.
-SB_API_TAG="monitor-api"
-SB_API_LISTEN="127.0.0.1"
-SB_API_PORT="9091"
-SB_TARGET_LINE="1.14"
+# sing-box service.api (top-level "services" entry, data source for the future
+# Monitor v2). Scope: no Monitor UI/daemon, no database, no conntrack/ss.
+#
+# The primitive layer below was contributed on this branch as lib/phase-d.sh and
+# is folded into install.sh here because the installer is distributed as ONE
+# self-contained file (install-shortcut downloads only install.sh).
+PHASE_D_TARGET_MAJOR="${PHASE_D_TARGET_MAJOR:-1}"
+PHASE_D_TARGET_MINOR="${PHASE_D_TARGET_MINOR:-14}"
+PHASE_D_MIN_VERSION="${PHASE_D_MIN_VERSION:-1.14.0}"
+PHASE_D_API_TAG="${PHASE_D_API_TAG:-monitor-api}"
+PHASE_D_API_LISTEN="${PHASE_D_API_LISTEN:-127.0.0.1}"
+PHASE_D_API_PORT="${PHASE_D_API_PORT:-9091}"
 SB_RELEASES_URL="https://api.github.com/repos/SagerNet/sing-box/releases?per_page=100"
 
 # Selects the newest STABLE 1.14.x release tag from GitHub. Fail-closed:
-# prereleases, 1.13.x and 1.15.x are never accepted, and "latest" cannot drift
-# the target across major/minor lines. Prints e.g. "v1.14.7".
+# drafts/prereleases, 1.13.x and 1.15.x are never accepted, and "latest" can
+# never drift the target across major/minor lines. Prints e.g. "v1.14.7".
 select_1_14_stable_tag() {
-    local releases tag
+    local releases
     releases="$(curl -fsSL "$SB_RELEASES_URL" 2>/dev/null)" || {
         warning "无法获取 sing-box releases 列表"
         return 1
     }
-    tag="$(printf '%s' "$releases" | jq -r '
-        [ .[] | select(.prerelease == false)
-              | .tag_name
-              | select(test("^v1\\.14\\.[0-9]+$")) ]
-        | sort_by(sub("^v"; "") | split(".") | map(tonumber))
-        | last // empty
-    ' 2>/dev/null | tr -d '\r')"
-    if [ -z "$tag" ] || [ "$tag" = "null" ]; then
+    local tag
+    tag="$(printf '%s' "$releases" | phase_d_select_release_from_json 2>/dev/null | tr -d '\r')" || {
         warning "GitHub releases 中没有可用的 stable v1.14.x（拒绝 1.13.x / 1.15.x / prerelease）"
         return 1
-    fi
+    }
+    [ -n "$tag" ] || {
+        warning "GitHub releases 中没有可用的 stable v1.14.x（拒绝 1.13.x / 1.15.x / prerelease）"
+        return 1
+    }
     printf '%s\n' "$tag"
 }
 
-# Audit of the api-inbound state in a config. Empty output = either no api
-# inbound (can be injected) or exactly one fully-compliant one. Anything else
-# is a problem: duplicate monitor-api tag, wrong type, non-loopback listen,
-# wrong port, or a malformed services field. Exit code also fail-closed.
-api_injection_problems() { # api_injection_problems <config>
-    jq -r '
-      ([.inbounds[]? | select(.type == "api")]) as $ai |
-      ([.inbounds[]? | select(.tag == "monitor-api")]) as $ti |
-      ($ai[0] // {}) as $a |
-      ([]
-        + (if ($ai | length) > 1 then ["存在多个 type=api 的 inbound"] else [] end)
-        + (if ($ti | length) > 1 then ["存在重复的 monitor-api tag"] else [] end)
-        + (if ($ti | length) == 1 and (($ti[0].type // "") != "api")
-           then ["tag 为 monitor-api 的 inbound type 不是 api（实际 \($ti[0].type // "缺失")）"] else [] end)
-        + (if ($ai | length) == 1 then
-             ([]
-               + (if (($a.tag // "") != "monitor-api") then ["api inbound 的 tag 必须是 monitor-api（实际 \($a.tag // "缺失")）"] else [] end)
-               + (if (($a.listen // "") != "127.0.0.1") then ["api inbound 必须只监听 127.0.0.1（实际 \($a.listen // "缺失")）"] else [] end)
-               + (if (($a.listen_port // null) != 9091) then ["api inbound 端口必须是 9091（实际 \($a.listen_port // "缺失")）"] else [] end)
-               + (if ($a.services != null and ($a.services | type) != "array")
-                 then ["api inbound 的 services 不是数组"] else [] end)
-               + (if ($a.services != null and ($a.services | type) == "array")
-                    and (($a.services | all(type == "string")) | not)
-                 then ["api inbound 的 services 必须是字符串数组"] else [] end)
-             )
-           else [] end)
-      )[]
-    ' "$1" 2>/dev/null
+phase_d_version_in_target_series() { # <version-or-tag>
+    local version="${1#v}"
+    [[ "$version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || return 1
+    [ "${BASH_REMATCH[1]}" = "$PHASE_D_TARGET_MAJOR" ] || return 1
+    [ "${BASH_REMATCH[2]}" = "$PHASE_D_TARGET_MINOR" ] || return 1
+    return 0
 }
 
-# True when the config already carries exactly one compliant api inbound.
-has_compliant_api_inbound() { # has_compliant_api_inbound <config>
-    local count problems
-    problems="$(api_injection_problems "$1")" || return 1
-    [ -z "$problems" ] || return 1
-    count="$(jq -r '[.inbounds[]? | select(.type == "api")] | length' "$1" 2>/dev/null | tr -d '\r')" || return 1
-    [ "$count" = "1" ]
+phase_d_version_at_least_min() { # <version-or-tag>
+    local version="${1#v}" minimum="${PHASE_D_MIN_VERSION#v}"
+    local v_major v_minor v_patch m_major m_minor m_patch
+    [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    [[ "$minimum" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    IFS='.' read -r v_major v_minor v_patch <<< "$version"
+    IFS='.' read -r m_major m_minor m_patch <<< "$minimum"
+    (( 10#$v_major > 10#$m_major )) && return 0
+    (( 10#$v_major < 10#$m_major )) && return 1
+    (( 10#$v_minor > 10#$m_minor )) && return 0
+    (( 10#$v_minor < 10#$m_minor )) && return 1
+    (( 10#$v_patch >= 10#$m_patch ))
 }
 
-# Appends the required localhost-only service.api inbound (idempotence is the
-# caller's job: only call when has_compliant_api_inbound is false and
-# api_injection_problems is empty).
-inject_api_inbound() { # inject_api_inbound <in-config> <out-config>
-    jq --arg tag "$SB_API_TAG" --arg listen "$SB_API_LISTEN" --argjson port "$SB_API_PORT" '
-      .inbounds += [
-        {"type": "api", "tag": $tag, "listen": $listen, "listen_port": $port}
-      ]
-    ' "$1" > "$2"
+phase_d_release_tag_is_allowed() { # <tag>
+    local tag="$1"
+    [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    phase_d_version_in_target_series "$tag" || return 1
+    phase_d_version_at_least_min "$tag"
+}
+
+# Pure release selector: reads the GitHub releases JSON array on stdin and
+# prints the newest stable v1.14.x tag.
+phase_d_select_release_from_json() {
+    local selected
+    selected="$(jq -er \
+        --argjson major "$PHASE_D_TARGET_MAJOR" \
+        --argjson minor "$PHASE_D_TARGET_MINOR" '
+          [ .[]
+            | select((.draft // false) == false)
+            | select((.prerelease // false) == false)
+            | .tag_name as $tag
+            | select($tag | type == "string")
+            | ($tag | capture("^v(?<major>[0-9]+)\\.(?<minor>[0-9]+)\\.(?<patch>[0-9]+)$")?) as $v
+            | select($v != null)
+            | select(($v.major | tonumber) == $major and ($v.minor | tonumber) == $minor)
+            | {
+                tag: $tag,
+                major: ($v.major | tonumber),
+                minor: ($v.minor | tonumber),
+                patch: ($v.patch | tonumber)
+              }
+          ]
+          | sort_by([.major, .minor, .patch])
+          | last
+          | .tag
+        ' 2>/dev/null)" || return 1
+    phase_d_release_tag_is_allowed "$selected" || return 1
+    printf '%s\n' "$selected"
+}
+
+# Structural audit of the top-level services state: services (if present) must
+# be an array; the monitor-api service must appear at most once with exactly
+# the compliant type/listen/port. Empty output = injectable or already exact.
+# Exit code also fail-closed.
+phase_d_config_structure_problems() { # <config>
+    local cfg="$1"
+    jq -r \
+      --arg tag "$PHASE_D_API_TAG" \
+      --arg listen "$PHASE_D_API_LISTEN" \
+      --argjson port "$PHASE_D_API_PORT" '
+      if type != "object" then
+        ["配置根节点不是 object"]
+      elif (has("services") and ((.services | type) != "array")) then
+        ["services 存在但不是数组"]
+      else
+        ((.services // []) | map(select(.tag == $tag))) as $m |
+        ([ ]
+          + (if ($m | length) > 1 then ["monitor-api service 数量大于 1"] else [] end)
+          + (if ($m | length) == 1 and ($m[0].type // "") != "api"
+             then ["monitor-api type 不是 api"] else [] end)
+          + (if ($m | length) == 1 and ($m[0].listen // "") != $listen
+             then ["monitor-api listen 不是 127.0.0.1"] else [] end)
+          + (if ($m | length) == 1 and ($m[0].listen_port // -1) != $port
+             then ["monitor-api listen_port 不是 9091"] else [] end)
+        )
+      end
+      | .[]
+    ' "$cfg" 2>/dev/null
+}
+
+# True when the config already carries exactly one compliant monitor-api
+# service entry (loopback-only, fixed port).
+phase_d_api_service_exact() { # <config>
+    local cfg="$1"
+    jq -e \
+      --arg tag "$PHASE_D_API_TAG" \
+      --arg listen "$PHASE_D_API_LISTEN" \
+      --argjson port "$PHASE_D_API_PORT" '
+        [(.services // [])[] | select(.tag == $tag)] as $m |
+        ($m | length) == 1 and
+        $m[0].type == "api" and
+        $m[0].listen == $listen and
+        $m[0].listen_port == $port
+      ' "$cfg" >/dev/null 2>&1
+}
+
+# Idempotent injection of the localhost-only service.api entry. Fails closed
+# when the input config fails the structural audit; re-audits the output.
+phase_d_inject_api_service() { # <input> <output>
+    local input="$1" output="$2" problems rc count tmp
+    problems="$(phase_d_config_structure_problems "$input")"; rc=$?
+    if [ "$rc" -ne 0 ]; then
+        warning "Phase D API 结构审计执行失败"
+        return 1
+    fi
+    if [ -n "$problems" ]; then
+        printf '%s\n' "$problems" >&2
+        return 1
+    fi
+
+    count="$(jq -er --arg tag "$PHASE_D_API_TAG" '[(.services // [])[] | select(.tag == $tag)] | length' "$input" 2>/dev/null | tr -d '\r')" || return 1
+    if [ "$count" -eq 1 ]; then
+        # Existing exact service passed the structural audit; preserve config.
+        cp -a -- "$input" "$output" || return 1
+        return 0
+    fi
+
+    tmp="${output}.tmp.$$"
+    rm -f -- "$tmp"
+    if ! jq \
+      --arg tag "$PHASE_D_API_TAG" \
+      --arg listen "$PHASE_D_API_LISTEN" \
+      --argjson port "$PHASE_D_API_PORT" '
+        .services = ((.services // []) + [{
+          "type": "api",
+          "tag": $tag,
+          "listen": $listen,
+          "listen_port": $port
+        }])
+      ' "$input" > "$tmp"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    mv -f -- "$tmp" "$output" || { rm -f -- "$tmp"; return 1; }
+
+    problems="$(phase_d_config_structure_problems "$output")"; rc=$?
+    if [ "$rc" -ne 0 ] || [ -n "$problems" ]; then
+        rm -f -- "$output"
+        [ -n "$problems" ] && printf '%s\n' "$problems" >&2
+        return 1
+    fi
+    return 0
 }
 
 api_port_occupied() { # any current listener on the API port (v4 or v6)
-    ss -H -lntu 2>/dev/null | grep -qE "[:.]${SB_API_PORT}[[:space:]]"
+    ss -H -lntu 2>/dev/null | grep -qE "[:.]${PHASE_D_API_PORT}[[:space:]]"
 }
 
 # Downloads and verifies a candidate binary for <tag>, placing it at
@@ -1583,15 +1690,15 @@ phase_d_health_ok() { # phase_d_health_ok <expected_version> [require_api=yes|no
         return 1
     fi
     if [ "$require_api" = "yes" ]; then
-        if ! ss -H -lnt 2>/dev/null | grep -qE "127\.0\.0\.1:${SB_API_PORT}[[:space:]]"; then
-            warning "健康检查失败: API 127.0.0.1:${SB_API_PORT} 未监听"
+        if ! ss -H -lnt 2>/dev/null | grep -qE "127\.0\.0\.1:${PHASE_D_API_PORT}[[:space:]]"; then
+            warning "健康检查失败: API 127.0.0.1:${PHASE_D_API_PORT} 未监听"
             return 1
         fi
-        if ss -H -lnt 2>/dev/null | grep -qE "(0\.0\.0\.0|\[::\]):${SB_API_PORT}[[:space:]]"; then
-            warning "健康检查失败: API 监听越界（检测到 0.0.0.0/[::]:${SB_API_PORT}）"
+        if ss -H -lnt 2>/dev/null | grep -qE "(0\.0\.0\.0|\[::\]):${PHASE_D_API_PORT}[[:space:]]"; then
+            warning "健康检查失败: API 监听越界（检测到 0.0.0.0/[::]:${PHASE_D_API_PORT}）"
             return 1
         fi
-        if ! "$SB_SING_BOX_BIN" api --url "http://127.0.0.1:${SB_API_PORT}" connection list >/dev/null 2>&1; then
+        if ! "$SB_SING_BOX_BIN" api --url "http://127.0.0.1:${PHASE_D_API_PORT}" connection list >/dev/null 2>&1; then
             warning "健康检查失败: sing-box api connection list 不可用"
             return 1
         fi
@@ -1633,7 +1740,7 @@ _rollback_upgrade() { # _rollback_upgrade <backup_bin> <backup_cfg> <old_version
         warning "回滚后 restart sing-box 失败，请立即人工介入！备份: $backup_bin / $backup_cfg"
         return 1
     fi
-    if has_compliant_api_inbound "$SB_SERVER_CONFIG"; then
+    if phase_d_api_service_exact "$SB_SERVER_CONFIG"; then
         require_api="yes"
     fi
     if ! phase_d_health_ok "$old_version" "$require_api"; then
@@ -1691,7 +1798,7 @@ _upgrade_singbox_1_14_locked() {
 
     # Existing API state must be either absent or fully compliant; anything
     # else is fail-closed and never auto-overwritten.
-    if ! api_problems="$(api_injection_problems "$SB_SERVER_CONFIG")"; then
+    if ! api_problems="$(phase_d_config_structure_problems "$SB_SERVER_CONFIG")"; then
         warning "API 配置审计执行失败: $SB_SERVER_CONFIG"
         return 1
     fi
@@ -1703,8 +1810,8 @@ _upgrade_singbox_1_14_locked() {
         return 1
     fi
 
-    if ! has_compliant_api_inbound "$SB_SERVER_CONFIG" && api_port_occupied; then
-        warning "${SB_API_LISTEN}:${SB_API_PORT} 已被占用，拒绝升级（即将新增 API 监听）"
+    if ! phase_d_api_service_exact "$SB_SERVER_CONFIG" && api_port_occupied; then
+        warning "127.0.0.1:${PHASE_D_API_PORT} 已被占用，拒绝升级（即将新增 API 监听）"
         return 1
     fi
 
@@ -1730,9 +1837,9 @@ _upgrade_singbox_1_14_locked() {
         rm -f "$candidate_bin"
         return 1
     }
-    if has_compliant_api_inbound "$SB_SERVER_CONFIG"; then
+    if phase_d_api_service_exact "$SB_SERVER_CONFIG"; then
         cp -a "$SB_SERVER_CONFIG" "$candidate_cfg"
-    elif ! inject_api_inbound "$SB_SERVER_CONFIG" "$candidate_cfg"; then
+    elif ! phase_d_inject_api_service "$SB_SERVER_CONFIG" "$candidate_cfg"; then
         warning "生成 candidate config 失败"
         rm -f "$candidate_bin" "$candidate_cfg"
         return 1
@@ -1751,12 +1858,12 @@ _upgrade_singbox_1_14_locked() {
         rm -f "$candidate_bin" "$candidate_cfg"
         return 1
     fi
-    if ! api_problems="$(api_injection_problems "$candidate_cfg")"; then
+    if ! api_problems="$(phase_d_config_structure_problems "$candidate_cfg")"; then
         warning "candidate API 审计执行失败"
         rm -f "$candidate_bin" "$candidate_cfg"
         return 1
     fi
-    if [ -n "$api_problems" ] || ! has_compliant_api_inbound "$candidate_cfg"; then
+    if [ -n "$api_problems" ] || ! phase_d_api_service_exact "$candidate_cfg"; then
         warning "candidate API 配置验证失败:"
         while IFS= read -r p; do
             [ -n "$p" ] && warning "  - $p"
@@ -1819,7 +1926,7 @@ _upgrade_singbox_1_14_locked() {
     fi
 
     info "升级完成: sing-box $ver（binary + config 已替换并验证健康）"
-    info "本机 service.api 已启用: http://${SB_API_LISTEN}:${SB_API_PORT}（仅回环监听）"
+    info "本机 service.api 已启用: http://${PHASE_D_API_LISTEN}:${PHASE_D_API_PORT}（仅回环监听）"
     info "升级前备份: binary=$backup_bin config=$backup_cfg"
     return 0
 }
@@ -2743,12 +2850,14 @@ cat > /root/sbox/sbconfig_server.json << EOF
             "certificate_path": "/root/sbox/self-cert/cert.pem",
             "key_path": "/root/sbox/self-cert/private.key"
         }
-    },
+    }
+  ],
+  "services": [
     {
-        "type": "api",
-        "tag": "monitor-api",
-        "listen": "127.0.0.1",
-        "listen_port": 9091
+      "type": "api",
+      "tag": "monitor-api",
+      "listen": "127.0.0.1",
+      "listen_port": 9091
     }
   ],
     "outbounds": [
