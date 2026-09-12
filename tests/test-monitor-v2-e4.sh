@@ -29,7 +29,7 @@ PASS=0
 FAIL=0
 # The gate at the bottom of this file fails unless exactly this many
 # assertions ran AND passed, so unreachable sections can never fake success.
-EXPECTED_PASS=144
+EXPECTED_PASS=161
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
@@ -206,6 +206,60 @@ from client import main
 rc = main(['--url', 'http://alice:s3cr3t-pw@localhost:9090'])
 " 2>&1 1>/dev/null)"
 assert_not_contains "s3cr3t-pw" "$out" "CLI stderr never echoes URL credentials"
+out="$(mihomo_py "
+from client import parse_controller_url, ConfigurationError
+try:
+    parse_controller_url('http://localhost:notaport')
+    print('ACCEPTED')
+except ConfigurationError:
+    print('REFUSED')
+")"
+assert_eq "$out" "REFUSED" "non-numeric port refused as configuration error"
+out="$(mihomo_py "
+from client import parse_controller_url, ConfigurationError
+try:
+    parse_controller_url('http://localhost:70000')
+    print('ACCEPTED')
+except ConfigurationError:
+    print('REFUSED')
+")"
+assert_eq "$out" "REFUSED" "out-of-range port refused as configuration error"
+out="$(mihomo_py "
+from client import parse_controller_url, ConfigurationError
+try:
+    parse_controller_url('http://[::1:9090')
+    print('ACCEPTED')
+except ConfigurationError:
+    print('REFUSED')
+")"
+assert_eq "$out" "REFUSED" "malformed IPv6 URL refused as configuration error"
+out="$(mihomo_py "
+from client import parse_controller_url, ConfigurationError
+try:
+    parse_controller_url('http://')
+    print('ACCEPTED')
+except ConfigurationError:
+    print('REFUSED')
+")"
+assert_eq "$out" "REFUSED" "empty hostname refused"
+out="$(mihomo_py "
+from client import parse_controller_url, ConfigurationError
+try:
+    parse_controller_url('http://localhost:9090/token-9f8a7b6e')
+    print('ACCEPTED')
+except ConfigurationError as e:
+    print('REFUSED' if '9f8a7b6e' not in str(e) else 'ECHOED')
+")"
+assert_eq "$out" "REFUSED" "non-root path refused WITHOUT echoing the user path"
+out="$(mihomo_py "
+import sys
+from client import main
+rc = main(['--url', 'http://localhost:notaport'])
+print('rc=%s' % rc, file=sys.stderr)
+" 2>&1 1>/dev/null)"
+assert_contains "fatal configuration error" "$out" "malformed URL exits via the fatal-config path"
+assert_not_contains "Traceback" "$out" "malformed URL never produces a traceback"
+assert_contains "rc=2" "$out" "malformed URL exits 2"
 
 section "E4-02: reachable API -- full happy path from fixtures"
 out="$(mihomo_py "$PY_PREAMBLE
@@ -509,38 +563,48 @@ print(json.dumps({"env": r_env, "file": r_file}))
 assert_eq "$(field "$out" 'obj["env"]')" "env-secret-wins" "MIHOMO_API_SECRET env wins over file"
 assert_eq "$(field "$out" 'obj["file"]')" "file-secret" "secret file read when env unset"
 
-section "E4-13: --secret-file permission contract (0600/0400, fail-closed)"
+section "E4-13: --secret-file contract (all: regular file; POSIX: 0600/0400 bits)"
 out="$(mihomo_py '
 import json
 from client import check_secret_mode, SecretFileError
-def verdict(mode):
+def verdict(mode, platform):
     try:
-        check_secret_mode(mode, "secret.file"); return "accepted"
+        check_secret_mode(mode, "secret.file", platform=platform); return "accepted"
     except SecretFileError:
         return "rejected"
 print(json.dumps({
-    "0600": verdict(0o100600),
-    "0400": verdict(0o100400),
-    "0644": verdict(0o100644),
-    "0664": verdict(0o100664),
-    "0666": verdict(0o100666),
-    "dir": verdict(0o040755),
+    "0600": verdict(0o100600, "posix"),
+    "0400": verdict(0o100400, "posix"),
+    "0000": verdict(0o100000, "posix"),
+    "0200": verdict(0o100200, "posix"),
+    "0644": verdict(0o100644, "posix"),
+    "0664": verdict(0o100664, "posix"),
+    "0666": verdict(0o100666, "posix"),
+    "dir": verdict(0o040755, "posix"),
+    "win0644": verdict(0o100644, "windows"),
+    "win0666": verdict(0o100666, "windows"),
+    "windir": verdict(0o040755, "windows"),
 }))
 ')"
-assert_eq "$(field "$out" 'obj["0600"]')" "accepted" "0600 accepted"
-assert_eq "$(field "$out" 'obj["0400"]')" "accepted" "0400 accepted"
-assert_eq "$(field "$out" 'obj["0644"]')" "rejected" "0644 rejected"
-assert_eq "$(field "$out" 'obj["0664"]')" "rejected" "0664 rejected"
-assert_eq "$(field "$out" 'obj["0666"]')" "rejected" "0666 rejected"
-assert_eq "$(field "$out" 'obj["dir"]')" "rejected" "non-regular file (directory bits) rejected"
+assert_eq "$(field "$out" 'obj["0600"]')" "accepted" "POSIX 0600 accepted"
+assert_eq "$(field "$out" 'obj["0400"]')" "accepted" "POSIX 0400 accepted"
+assert_eq "$(field "$out" 'obj["0000"]')" "rejected" "POSIX 0000 rejected (must be owner-readable)"
+assert_eq "$(field "$out" 'obj["0200"]')" "rejected" "POSIX 0200 rejected (must be owner-readable)"
+assert_eq "$(field "$out" 'obj["0644"]')" "rejected" "POSIX 0644 rejected"
+assert_eq "$(field "$out" 'obj["0664"]')" "rejected" "POSIX 0664 rejected"
+assert_eq "$(field "$out" 'obj["0666"]')" "rejected" "POSIX 0666 rejected"
+assert_eq "$(field "$out" 'obj["dir"]')" "rejected" "non-regular file rejected on POSIX"
+assert_eq "$(field "$out" 'obj["win0644"]')" "accepted" "Windows: 0644 accepted (no POSIX-bit rejection; ACL territory)"
+assert_eq "$(field "$out" 'obj["win0666"]')" "accepted" "Windows: 0666 accepted (documented ACL limitation)"
+assert_eq "$(field "$out" 'obj["windir"]')" "rejected" "Windows: regular-file requirement still enforced"
 out="$(mihomo_py '
 import json, os, sys, tempfile
 sys.path.insert(0, os.environ["MIHOMO_DIR"])
-from client import resolve_secret, SecretFileError
+import client as m
 try:
-    resolve_secret(os.path.join(tempfile.gettempdir(), "definitely-missing-e4.secret"))
+    m.resolve_secret(os.path.join(tempfile.gettempdir(), "definitely-missing-e4.secret"))
     print(json.dumps({"missing": "ACCEPTED"}))
-except SecretFileError as e:
+except m.SecretFileError as e:
     print(json.dumps({"missing": "rejected", "leak": "s3cr3t" in str(e)}))
 ')"
 assert_eq "$(field "$out" 'obj["missing"]')" "rejected" "missing secret file rejected"
@@ -563,27 +627,53 @@ import json, os, sys, tempfile
 sys.path.insert(0, os.environ["MIHOMO_DIR"])
 import client as m
 fd, f = tempfile.mkstemp(suffix=".secret"); os.write(fd, b"s3cr3t-CONTENT"); os.close(fd)
-real_stat = m.os.stat
-def fake_stat(path, *a, **k):
+real_fstat, real_win = m.os.fstat, m._WINDOWS
+m._WINDOWS = False   # exercise the POSIX fd path deterministically on any OS
+def fake_fstat(fd2):
     return os.stat_result((mode, 1, 0, 0, 0, 0, 13, 0, 0, 0))
 try:
     mode = 0o100644
-    m.os.stat = fake_stat
+    m.os.fstat = fake_fstat
     try:
         m.resolve_secret(f)
         weak = "ACCEPTED"
     except m.SecretFileError as e:
         weak = "rejected" if "s3cr3t-CONTENT" not in str(e) else "LEAKED-CONTENT"
     mode = 0o100600
-    m.os.stat = fake_stat
     strong = m.resolve_secret(f)
 finally:
-    m.os.stat = real_stat
+    m.os.fstat = real_fstat
+    m._WINDOWS = real_win
     os.unlink(f)
 print(json.dumps({"weak": weak, "strong": strong}))
 ')"
-assert_eq "$(field "$out" 'obj["weak"]')" "rejected" "0644 file rejected; its CONTENT never reaches the error"
-assert_eq "$(field "$out" 'obj["strong"]')" "s3cr3t-CONTENT" "0600 file with the same content is read"
+assert_eq "$(field "$out" 'obj["weak"]')" "rejected" "POSIX 0644 fd rejected; its CONTENT never reaches the error"
+assert_eq "$(field "$out" 'obj["strong"]')" "s3cr3t-CONTENT" "POSIX 0600 fd with the same content is read"
+out="$(mihomo_py '
+import json, os, sys, tempfile
+sys.path.insert(0, os.environ["MIHOMO_DIR"])
+import client as m
+fd, f = tempfile.mkstemp(suffix=".secret"); os.write(fd, b"s3cr3t-CONTENT"); os.close(fd)
+real_open, real_win = m.os.open, m._WINDOWS
+m._WINDOWS = False
+def refusing_open(path, flags, *a, **k):
+    raise PermissionError(13, "permission denied")
+m.os.open = refusing_open
+try:
+    try:
+        m.resolve_secret(f)
+        verdict = "ACCEPTED"
+    except m.SecretFileError as e:
+        verdict = "wrapped" if ("Traceback" not in str(e) and "s3cr3t-CONTENT" not in str(e)) else "BAD"
+    except Exception as e:
+        verdict = "UNWRAPPED:%s" % type(e).__name__
+finally:
+    m.os.open = real_open
+    m._WINDOWS = real_win
+    os.unlink(f)
+print(json.dumps({"open_failure": verdict}))
+')"
+assert_eq "$(field "$out" 'obj["open_failure"]')" "wrapped" "open() failure wrapped as SecretFileError (never a raw OSError/traceback)"
 
 section "E4-14: transport is GET-only BY CONSTRUCTION"
 out="$(mihomo_py '
@@ -827,6 +917,51 @@ from model import is_identity_safe
 print(json.dumps({"extra": is_identity_safe({"reachable": True, "user": "vmix-01"})}))
 ')"
 assert_eq "$(field "$out" 'obj["extra"]')" "False" "an object carrying an identity key fails the identity-safe check"
+
+section "E4-17: checked_at stamps TRUE completion time (advancing clock)"
+out="$(mihomo_py '
+import json, os, datetime
+from client import MihomoClient
+from model import parse_updated_at
+
+state = {"t": 100.0}
+def clock():
+    return state["t"]
+
+class SlowEndpoints:
+    """Each endpoint consumes 1s of the shared clock, like real requests."""
+    def __init__(self, routes): self.routes = routes
+    def get(self, path):
+        state["t"] += 1.0
+        status, body = self.routes[path]
+        return status, body
+    def read_stream_sample(self, path, deadline):
+        state["t"] += 1.0
+        return self.routes[path][1]
+
+def iso(t):
+    return datetime.datetime.fromtimestamp(t, datetime.timezone.utc).isoformat()
+
+endpoints = {
+    "/version": (200, open(os.path.join(os.environ["MIHOMO_FIX"], "version-ok.json"), "rb").read()),
+    "/configs": (200, open(os.path.join(os.environ["MIHOMO_FIX"], "configs-rule.json"), "rb").read()),
+    "/proxies": (200, open(os.path.join(os.environ["MIHOMO_FIX"], "proxies-ok.json"), "rb").read()),
+    "/connections": (200, open(os.path.join(os.environ["MIHOMO_FIX"], "connections-active.json"), "rb").read()),
+    "/traffic": (200, open(os.path.join(os.environ["MIHOMO_FIX"], "traffic-sample.json"), "rb").read()),
+}
+c = MihomoClient(url="http://127.0.0.1:9090", group="PROXY",
+                 transport=SlowEndpoints(endpoints), clock=clock)
+e = c.collect()
+print(json.dumps({
+    "checked_at": e["checked_at"],
+    "updated_at": e["updated_at"],
+    "completion": iso(105.0),
+    "version_time": iso(101.0),
+}))
+')"
+assert_eq "$(field "$out" 'obj["checked_at"]')" "$(field "$out" 'obj["completion"]')" "checked_at == final collect completion (t=105), not /version time"
+assert_eq "$(field "$out" 'obj["updated_at"]')" "$(field "$out" 'obj["completion"]')" "updated_at == final successful poll completion (t=105)"
+assert_not_contains "$(field "$out" 'obj["version_time"]')" "$(field "$out" 'obj["checked_at"]')" "checked_at is NOT the /version moment (t=101)"
 
 printf '\n== summary ==\n'
 printf '  pass=%d fail=%d (expected pass=%d)\n' "$PASS" "$FAIL" "$EXPECTED_PASS"
