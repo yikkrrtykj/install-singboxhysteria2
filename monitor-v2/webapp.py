@@ -33,6 +33,7 @@ if HERE not in sys.path:
 
 from collector import Collector, resolve_secret  # noqa: E402
 from web.access import LOOPBACK_ALLOW, AccessPolicy, host_entry_for_ip  # noqa: E402
+from web.auth import AuthStore, validate_password  # noqa: E402
 from web.broker import SnapshotBroker  # noqa: E402
 from web.server import (MONITOR_WEB_VERSION, MonitorWebApp,  # noqa: E402
                         build_server)
@@ -76,6 +77,11 @@ def build_arg_parser():
                             % DEFAULT_DATA_DIR)
     setup.add_argument("--assume-yes", action="store_true",
                        help="accept defaults non-interactively (automation)")
+    setup.add_argument("--password", default=None,
+                       help="admin password (AUTOMATION ONLY -- the value "
+                            "lands in shell history; prefer the prompt)")
+    setup.add_argument("--session-ttl", type=float, default=8 * 3600.0,
+                       help="admin session lifetime in seconds")
 
     serve = sub.add_parser(
         "serve", help="run the collector, broker and web listener")
@@ -105,6 +111,37 @@ def build_arg_parser():
     serve.add_argument("--session-ttl", type=float, default=8 * 3600.0,
                        help="admin session lifetime in seconds")
     return parser
+
+
+def _configure_password(auth, args):
+    """Set the admin password (scrypt hash only, never printed/echoed)."""
+    if auth.password_configured():
+        print("Admin password already configured "
+              "(change it on the Settings page).")
+        return
+    password = args.password
+    if password is not None:
+        try:
+            validate_password(password)
+        except ValueError as exc:
+            print("error: %s" % exc, file=sys.stderr)
+            raise SystemExit(2)
+    else:
+        import getpass
+        while True:
+            password = getpass.getpass("Admin password (min 8 chars): ")
+            try:
+                validate_password(password)
+            except ValueError as exc:
+                print("  %s" % exc)
+                continue
+            repeat = getpass.getpass("Repeat admin password: ")
+            if password != repeat:
+                print("  passwords do not match, try again")
+                continue
+            break
+    auth.set_password(password)
+    print("Admin password configured (scrypt hash in auth.json).")
 
 
 def cmd_setup(args):
@@ -137,9 +174,12 @@ def cmd_setup(args):
         print("No SSH client IP detected ($SSH_CONNECTION unset); "
               "whitelist stays empty.")
 
+    _configure_password(AuthStore(data_dir, session_ttl=args.session_ttl),
+                        args)
+    # recovery key configuration lands with the recovery module
+
     print("Access data: %s" % access.path)
-    print("Next: configure authentication with `webapp.py setup` "
-          "(admin password + recovery key), then `webapp.py serve`.")
+    print("Next: `webapp.py serve` (loopback: 127.0.0.1:%d)" % DEFAULT_PORT)
     return 0
 
 
@@ -181,9 +221,13 @@ def cmd_serve(args):
     broker = SnapshotBroker(collector, poll_seconds=args.poll)
     broker.start()
 
+    auth = AuthStore(data_dir, session_ttl=args.session_ttl)
+    if not auth.password_configured():
+        auth = None  # closed dashboard: every API stays "login required"
+
     app = MonitorWebApp(broker=broker, access=access,
                         static_dir=os.path.join(HERE, "web", "static"),
-                        remote_mode=remote_mode)
+                        auth=auth, remote_mode=remote_mode)
     server = build_server(app, args.listen, args.port, tls_context)
     scheme = "https" if tls_context is not None else "http"
     print("monitor web (%s) listening on %s:%d [%s]" %
@@ -200,11 +244,15 @@ def cmd_serve(args):
 
 
 def _remote_gate_password(problems, data_dir):
-    return  # authentication wiring lands with the auth module
+    if not AuthStore(data_dir).password_configured():
+        problems.append("the admin password is not configured (webapp.py "
+                        "setup)")
 
 
 def _remote_gate_recovery(problems, data_dir):
-    return  # recovery wiring lands with the recovery module
+    if not AuthStore(data_dir).recovery_configured():
+        problems.append("the recovery key is not configured (webapp.py "
+                        "setup)")
 
 
 def main(argv=None):

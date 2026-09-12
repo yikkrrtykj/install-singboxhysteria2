@@ -179,9 +179,27 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/v1/stream":
             self._require_session(self._handle_stream)
             return
+        if path == "/api/v1/whitelist":
+            self._require_session(self._handle_whitelist_get, remote)
+            return
         self._send_json(404, {"error": "not found"})
 
     def _route_post(self, path, remote):
+        if path == "/api/v1/login":
+            self._handle_login(remote)
+            return
+        if path == "/api/v1/logout":
+            self._require_session(self._handle_logout)
+            return
+        if path == "/api/v1/password":
+            self._require_session(self._handle_password, remote)
+            return
+        if path == "/api/v1/whitelist":
+            self._require_session(self._handle_whitelist_add, remote)
+            return
+        if path == "/api/v1/whitelist/remove":
+            self._require_session(self._handle_whitelist_remove, remote)
+            return
         self._send_json(404, {"error": "not found"})
 
     # -- gates -----------------------------------------------------------------
@@ -198,6 +216,46 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         morsel = cookie.get(SESSION_COOKIE)
         return morsel.value if morsel else None
 
+    def _body_length(self):
+        try:
+            return int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return 0
+
+    def _drain_body(self):
+        """Consume any unread request body so it is never mistaken for a
+        pipelined request (an early 403/401 must not leave bytes behind)."""
+        if self.command not in ("POST", "PUT", "DELETE"):
+            return
+        if self.headers.get("Transfer-Encoding"):
+            self.close_connection = True  # chunked bodies are not supported
+            return
+        length = self._body_length()
+        remaining = length - getattr(self, "_consumed", 0)
+        if remaining <= 0:
+            return
+        if remaining > MAX_BODY_BYTES:
+            self.close_connection = True  # refuse to buffer absurd bodies
+            return
+        try:
+            self.rfile.read(remaining)
+        except OSError:
+            self.close_connection = True
+        self._consumed = length
+
+    def _json_body(self):
+        """Read a bounded JSON object body; None on anything malformed."""
+        length = self._body_length()
+        if length <= 0 or length > MAX_BODY_BYTES:
+            return None
+        try:
+            data = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return None
+        finally:
+            self._consumed = length
+        return data if isinstance(data, dict) else None
+
     def _require_session(self, handler, *args):
         session = self.app.session_from_token(self._session_token())
         if session is None:
@@ -213,6 +271,7 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
 
     def _send_json(self, status, payload, extra_headers=None):
+        self._drain_body()
         body = json.dumps(payload, sort_keys=True).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -252,7 +311,119 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             "version": self.app.version,
         })
 
+    def _handle_login(self, remote):
+        """POST /api/v1/login {password} -> session cookie.
+
+        Rate limited per source IP; the password itself is never logged and
+        never echoed back anywhere.
+        """
+        auth = self.app.auth
+        if auth is None or not auth.password_configured():
+            self._send_json(503, {"error": "authentication not configured"})
+            return
+        body = self._json_body()
+        password = body.get("password") if isinstance(body, dict) else None
+        if not isinstance(password, str):
+            self._send_json(400, {"error": "password required"})
+            return
+        allowed, retry_after = auth.login_limiter.check(remote)
+        if not allowed:
+            self._send_json(
+                429,
+                {"error": "too many failed attempts; try again later",
+                 "retry_after": retry_after},
+                extra_headers=[("Retry-After", str(retry_after))])
+            return
+        if not auth.verify_password(password):
+            auth.login_limiter.record_failure(remote)
+            self._send_json(401, {"error": "invalid password"})
+            return
+        auth.login_limiter.record_success(remote)
+        token = auth.sessions.create()
+        cookie = ("%s=%s; Path=/; Max-Age=%d; HttpOnly; Secure; "
+                  "SameSite=Strict" % (SESSION_COOKIE, token,
+                                       int(auth.sessions.ttl)))
+        self._send_json(200, {"status": "ok"},
+                        extra_headers=[("Set-Cookie", cookie)])
+
     # -- session-gated endpoints -------------------------------------------------
+
+    def _handle_logout(self, session):
+        token = self._session_token()
+        if self.app.auth is not None and token:
+            self.app.auth.sessions.drop(token)
+        cookie = ("%s=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict"
+                  % SESSION_COOKIE)
+        self._send_json(200, {"status": "ok"},
+                        extra_headers=[("Set-Cookie", cookie)])
+
+    def _handle_password(self, session, remote):
+        """POST /api/v1/password {current_password, new_password}."""
+        auth = self.app.auth
+        body = self._json_body()
+        if not isinstance(body, dict):
+            self._send_json(400, {"error": "invalid request body"})
+            return
+        current = body.get("current_password")
+        new = body.get("new_password")
+        if not isinstance(current, str) or not isinstance(new, str):
+            self._send_json(400, {"error": "current_password and "
+                                           "new_password required"})
+            return
+        allowed, retry_after = auth.login_limiter.check(remote)
+        if not allowed:
+            self._send_json(429, {"error": "try again later"})
+            return
+        if not auth.verify_password(current):
+            auth.login_limiter.record_failure(remote)
+            self._send_json(403, {"error": "current password is wrong"})
+            return
+        auth.login_limiter.record_success(remote)
+        try:
+            auth.set_password(new, keep_session=self._session_token())
+        except ValueError as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        self._send_json(200, {"status": "ok"})
+
+    def _handle_whitelist_get(self, session, remote):
+        self._send_json(200, {
+            "whitelist": list(self.app.access.entries()),
+            "current_ip": remote,
+        })
+
+    def _handle_whitelist_add(self, session, remote):
+        body = self._json_body()
+        entry = body.get("entry") if isinstance(body, dict) else None
+        if not isinstance(entry, str):
+            self._send_json(400, {"error": "entry required"})
+            return
+        try:
+            canonical = self.app.access.add(entry)
+        except ValueError:
+            self._send_json(400, {"error": "invalid IP or CIDR entry"})
+            return
+        self._send_json(200, {"status": "ok", "entry": canonical,
+                              "whitelist": list(self.app.access.entries())})
+
+    def _handle_whitelist_remove(self, session, remote):
+        body = self._json_body()
+        entry = body.get("entry") if isinstance(body, dict) else None
+        if not isinstance(entry, str):
+            self._send_json(400, {"error": "entry required"})
+            return
+        if self.app.access.covers(entry, remote) and body.get("confirm") is not True:
+            self._send_json(
+                409,
+                {"error": "confirm required: removing your current IP will "
+                          "lock this browser out; the recovery key will be "
+                          "required"})
+            return
+        if not self.app.access.remove(entry):
+            self._send_json(404, {"error": "entry not found"})
+            return
+        self._send_json(200, {"status": "ok",
+                              "whitelist": list(self.app.access.entries())})
 
     def _handle_snapshot(self, session):
         version, payload = self.app.broker.snapshot_json()

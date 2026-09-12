@@ -25,9 +25,9 @@ from __future__ import annotations
 
 import datetime
 import ipaddress
-import json
 import os
-import tempfile
+
+from web.storage import atomic_write_json, ensure_private_dir, read_json
 
 LOOPBACK_ALLOW = frozenset({"127.0.0.1", "::1"})
 
@@ -54,35 +54,7 @@ def host_entry_for_ip(address):
 
 
 def _atomic_write_json(path, payload):
-    directory = os.path.dirname(path) or "."
-    handle = tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=directory,
-                                         prefix=".access-", suffix=".tmp",
-                                         delete=False)
-    try:
-        json.dump(payload, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-        handle.close()
-        os.replace(handle.name, path)
-    except BaseException:
-        handle.close()
-        try:
-            os.unlink(handle.name)
-        except OSError:
-            pass
-        raise
-    _restrict_permissions(path)
-
-
-def _restrict_permissions(path):
-    # POSIX: keep secrets root-only. Non-POSIX hosts (Windows dev) ignore.
-    if os.name != "posix":
-        return
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
+    atomic_write_json(path, payload)
 
 
 class AccessPolicy:
@@ -100,13 +72,9 @@ class AccessPolicy:
     def load(self):
         self._entries = []
         self.updated_at = None
-        try:
-            with open(self.path, encoding="utf-8") as handle:
-                data = json.load(handle)
-        except FileNotFoundError:
+        data = read_json(self.path)
+        if not isinstance(data, dict):
             return
-        except (OSError, ValueError):
-            return  # unreadable/corrupt file == empty whitelist (fail-closed)
         entries = data.get("whitelist")
         if not isinstance(entries, list):
             return
@@ -118,13 +86,8 @@ class AccessPolicy:
         self.updated_at = data.get("updated_at")
 
     def save(self):
-        os.makedirs(self.data_dir, exist_ok=True)
-        if os.name == "posix":
-            try:
-                os.chmod(self.data_dir, 0o700)
-            except OSError:
-                pass
-        _atomic_write_json(self.path, {
+        ensure_private_dir(self.data_dir)
+        atomic_write_json(self.path, {
             "version": ACCESS_VERSION,
             "whitelist": self._entries,
             "updated_at": datetime.datetime.now(
@@ -161,6 +124,15 @@ class AccessPolicy:
         self._entries.remove(canonical)
         self.save()
         return True
+
+    def covers(self, entry, remote_ip):
+        """True when the entry network contains the given source address."""
+        try:
+            network = ipaddress.ip_network(parse_network(entry))
+        except ValueError:
+            return False
+        return any(addr.version == network.version and addr in network
+                   for addr in self._address_candidates(remote_ip))
 
     # -- decision ------------------------------------------------------------
 
