@@ -222,3 +222,33 @@ bash tests/monitor-v2-integration-e1.sh
 - Web dashboard（Phase E2）；
 - Reality-only RTT/retrans 增强（ss，可选）；
 - expected source IP 机械比对（外部测试阶段）。
+
+## Phase E4 -- Mihomo client API enrichment（OPTIONAL，read-only）
+
+E4 在**客户端本地** Mihomo external-controller 上做可选 enrichment，
+是显示层的补充，绝不是身份数据源：
+
+```text
+Server truth（不可替代）:  Device = service.api USER / Protocol = INBOUND / Lifecycle = connection ID
+Mihomo API（仅补充展示）:  version / mode / selected proxy / delay /
+                           local connections / local traffic rate
+```
+
+铁律（由代码结构强制，详见 `monitor-v2/mihomo/README.md`）：
+
+* enrichment 输出对象走固定 key 白名单，结构上不可能携带任何身份字段；
+  节点显示名（`vmix-01-HY2`、`香港-01`……）原样透传为 `selected_proxy`，
+  仅用于展示，绝不参与身份判定/映射/重命名；
+* controller URL 只允许 loopback（fail-closed）；Mihomo API 是客户端本地
+  服务，绝不公网暴露，服务器侧读取应走显式 agent/隧道设计；
+* secret 只经 `Authorization: Bearer` 头传递：不进日志、不进输出对象、
+  不进 URL query、错误文本统一 redact；超时钳制在 1-3 秒；
+* `reachable=false`（unreachable / disabled / wrong secret / offline）只是
+  一个观测结果，服务端 Monitor 完全不受影响，设备状态绝不因此改变；
+* freshness 双域独立：enrichment 有自己的 `updated_at/stale/error`，与
+  E1 流的 stale 完全分离；
+* 只读：不选节点、不切模式、不 reload、不重启、不关连接、不触发
+  delay 主动探测（只读缓存 history）。
+
+文件：`monitor-v2/mihomo/{client.py,model.py,fixtures/}`；
+测试：`tests/test-monitor-v2-e4.sh`（E1 回归必须保持 188/188）。
