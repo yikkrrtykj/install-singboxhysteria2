@@ -160,17 +160,23 @@ stale       = true whenever updated_at is null, or older than max_age
   placed in a URL query string; redacted from every stored error message
   (including secrets that show up inside transport exceptions or HTTP error
   bodies).
-* **Secret-file permission contract**: on POSIX the file MUST be a regular
-  file with NO group/other permission bits -- `0600` / `0400` pass, `0644` /
-  `0664` / `0666` are rejected BEFORE the content is read (so a rejected
-  file's content can never reach an error message). On Windows POSIX mode
-  bits are not enforced by the filesystem; E4 v1 relies on filesystem ACLs
-  there and does not fully validate.
-* **Short timeouts**: every request timeout is clamped to 1-3 seconds
-  (default 2.0) and `collect()` never raises, so one stuck client API can
-  never stall the Monitor loop. The `/traffic` sample reader is bounded by
-  an absolute deadline and returns on the first complete newline-framed
-  JSON line.
+* **Secret-file permission contract**: on ALL platforms the file MUST be a
+  regular file. On POSIX it must additionally be owner-readable with NO
+  group/other permission bits -- `0600` / `0400` pass; `0000`, `0200`,
+  `0644` / `0664` / `0666` are rejected BEFORE the content is read (so a
+  rejected file's content can never reach an error message); symlinks are
+  rejected (`O_NOFOLLOW` + fd/fstat, so the checked object is the read
+  object). On Windows the POSIX permission-bit rejection is NOT applied --
+  mode bits carry no access semantics on NTFS; E4 v1 relies on filesystem
+  ACLs there (documented limitation). Any open/read failure becomes a
+  redacted `SecretFileError` -- never a traceback, never secret content.
+* **Per-request timeouts**: every INDIVIDUAL API request is bounded to 1-3
+  seconds (default 2.0) and `collect()` never raises. A full poll runs
+  several requests sequentially and may therefore take multiple request
+  budgets -- the whole-poll deadline (and concurrency) is deliberately NOT
+  invented here; that is a separate design once E4 is actually integrated
+  into an agent. The `/traffic` sample reader is bounded by an absolute
+  deadline and returns on the first complete newline-framed JSON line.
 * **No public exposure**: nothing in this phase listens on any port.
 
 ## Files

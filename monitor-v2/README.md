@@ -243,9 +243,12 @@ Mihomo API（仅补充展示）:  version / mode / selected proxy / delay /
   服务，绝不公网暴露，服务器侧读取应走显式 agent/隧道设计；
 * secret 只经 `Authorization: Bearer` 头传递：不进日志、不进输出对象、
   不进 URL query、错误文本统一 redact（含传输异常/HTTP 错误体内出现的
-  secret）；超时钳制在 1-3 秒；`--secret-file` 在 POSIX 上强制校验
-  （regular file + 无 group/other 权限位，0600/0400 可用，0644+ 拒绝，
-  校验先于读取内容）；Windows 依赖文件系统 ACL，v1 不做完整校验；
+  secret）；每个 API 请求超时钳制在 1-3 秒（整个 poll 顺序请求可能占用
+  多个请求预算；whole-poll deadline 留待真正集成 agent 时单独设计）；
+  `--secret-file` 全平台要求 regular file；POSIX 强制 owner-readable 且
+  无 group/other 权限位（0600/0400 可用，0000/0200/0644+ 拒绝，校验先于
+  读取内容，O_NOFOLLOW 拒绝 symlink）；Windows 不做 POSIX 位拒绝，依赖
+  文件系统 ACL（v1 文档化限制）；
 * transport 只有 `get(path)` 一个入口——不存在 method 参数，PUT/POST/
   PATCH/DELETE 在结构上无法发出；URL 拒绝 userinfo/非根 path/query/
   fragment，且错误信息绝不回显完整 URL；
