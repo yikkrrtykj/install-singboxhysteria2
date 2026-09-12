@@ -101,8 +101,10 @@ fi
 # Mock systemctl: records every invocation; simulates unit state transitions.
 MOCK_CALL_LOG="$TMP/systemctl-calls.log"
 MOCK_SYS_STATE="$TMP/unit-state"
+MOCK_ENABLED_STATE="$TMP/unit-enabled"
 : > "$MOCK_CALL_LOG"
 echo inactive > "$MOCK_SYS_STATE"
+echo disabled > "$MOCK_ENABLED_STATE"
 cat > "$TMP/bin/systemctl-mock" <<MOCK
 #!/usr/bin/env bash
 printf 'systemctl %s\n' "\$*" >> "\$MOCK_CALL_LOG"
@@ -110,15 +112,24 @@ op="\$1"; shift
 case "\$op" in
   is-active)
     [ "\$(cat "\$MOCK_SYS_STATE" 2>/dev/null || echo inactive)" = "active" ] && exit 0 || exit 1 ;;
+  is-enabled)
+    [ "\$(cat "\$MOCK_ENABLED_STATE" 2>/dev/null || echo disabled)" = "enabled" ] && exit 0 || exit 1 ;;
   daemon-reload)
     exit 0 ;;
   enable)
-    for a in "\$@"; do
-      if [ "\$a" = "--now" ] && [ -n "\${MOCK_FAIL_START:-}" ]; then
-        echo "mock: start failed" >&2; exit 1
-      fi
-    done
-    echo active > "\$MOCK_SYS_STATE"; exit 0 ;;
+    # real semantics: `enable` succeeds even when the subsequent start of
+    # `enable --now` fails (unit enabled, service inactive).
+    now=0
+    for a in "\$@"; do [ "\$a" = "--now" ] && now=1; done
+    if [ "\$now" = 1 ] && [ -n "\${MOCK_FAIL_START:-}" ]; then
+      echo enabled > "\$MOCK_ENABLED_STATE"
+      echo "mock: start failed" >&2; exit 1
+    fi
+    echo enabled > "\$MOCK_ENABLED_STATE"
+    if [ "\$now" = 1 ]; then echo active > "\$MOCK_SYS_STATE"; fi
+    exit 0 ;;
+  stop)
+    echo inactive > "\$MOCK_SYS_STATE"; exit 0 ;;
   restart)
     if [ -n "\${MOCK_FAIL_START:-}" ]; then echo "mock: restart failed" >&2; exit 1; fi
     if [ -f "\$MOCK_FAIL_RESTART_ONCE" ]; then
@@ -127,7 +138,11 @@ case "\$op" in
     fi
     echo active > "\$MOCK_SYS_STATE"; exit 0 ;;
   disable)
-    echo inactive > "\$MOCK_SYS_STATE"; exit 0 ;;
+    now=0
+    for a in "\$@"; do [ "\$a" = "--now" ] && now=1; done
+    echo disabled > "\$MOCK_ENABLED_STATE"
+    if [ "\$now" = 1 ]; then echo inactive > "\$MOCK_SYS_STATE"; fi
+    exit 0 ;;
   *)
     exit 0 ;;
 esac
@@ -143,7 +158,15 @@ run_uninstall_quiet() {
     ( "$INSTALL_MONITOR" uninstall --purge-state --purge-config --purge-backups ) >/dev/null 2>&1 || true
 }
 
-export SBMON_FIXTURE=1
+# F3: when the harness runs as root (Linux CI second pass), user/group
+# management and file metadata run FOR REAL (SBMON_FIXTURE=0): real
+# useradd/groupadd, real chown/chgrp, real uid/gid assertions. Non-root
+# runs use the fixture identity shim.
+if [ "$(id -u)" = "0" ]; then
+    export SBMON_FIXTURE=0
+else
+    export SBMON_FIXTURE=1
+fi
 export SBMON_SYSTEMCTL="$TMP/bin/systemctl-mock"
 export SBMON_PYTHON3="$PY3"
 export SBMON_APP_LINK="$FIX_APP_LINK"
@@ -157,7 +180,7 @@ export SBMON_VERSION_FILE="$FIX_SRC/VERSION"
 export SBMON_API_SECRET_SOURCE="$FIX_PROXY/monitor-api.secret"
 export SBMON_HEALTH_TIMEOUT=6
 export SBMON_STATE_DIR="$FIX_STATE/state"
-export MOCK_CALL_LOG MOCK_SYS_STATE
+export MOCK_CALL_LOG MOCK_SYS_STATE MOCK_ENABLED_STATE
 export MOCK_FAIL_RESTART_ONCE="$TMP/mock-fail-restart-once"
 export SBMON_LOCK_FILE="$TMP/deploy.lock"
 # P4: real flock where available (Linux CI gate); no-op shim elsewhere so the
@@ -258,6 +281,15 @@ assert_grep '"service_active":true' "$OUT1" "health reports service_active=true 
 [ -f "$FIX_CONF_DIR/api.secret" ] && pass "derived api.secret delivered (P6)" || fail "derived api.secret missing"
 if [ "$MODES_OK" = 1 ]; then assert_dir_mode "$FIX_CONF_DIR/api.secret" 640 "api.secret mode 0640 root:group (P6)"; else printf '  SKIP api.secret mode (chmod unreliable)\n'; fi
 assert_eq "$(cat "$FIX_PROXY/monitor-api.secret")" "$(cat "$FIX_CONF_DIR/api.secret")" "api.secret content mirrors S0 anchor"
+if [ "$SBMON_FIXTURE" = "0" ]; then
+    SBOXWEB_GID="$(getent group sboxweb | cut -d: -f3)"
+    assert_eq "0" "$(stat -c '%u' "$FIX_CONF_DIR/monitor.conf")" "monitor.conf owner root (real metadata, F3)"
+    assert_eq "$SBOXWEB_GID" "$(stat -c '%g' "$FIX_CONF_DIR/monitor.conf")" "monitor.conf group sboxweb (real metadata, F3)"
+    assert_eq "0" "$(stat -c '%u' "$FIX_CONF_DIR/api.secret")" "api.secret owner root (real metadata, F3)"
+    assert_eq "$SBOXWEB_GID" "$(stat -c '%g' "$FIX_CONF_DIR/api.secret")" "api.secret group sboxweb (real metadata, F3)"
+else
+    printf '  SKIP real uid/gid assertions (non-root fixture pass; root CI pass covers them)\n'
+fi
 SECRET_HASH_1="$(sha256sum "$FIX_CONF_DIR/api.secret" | cut -d' ' -f1)"
 SECRET_MTIME_1="$(stat -c '%Y' "$FIX_CONF_DIR/api.secret")"
 
@@ -298,7 +330,7 @@ if [ -n "$(find "$FIX_RELEASES" -maxdepth 1 -type d -name '0.1.0-*' -print -quit
 else
     fail "previous release tree was removed"
 fi
-assert_grep ' upgrade$' "$FIX_RELEASES/releases.history" "upgrade recorded in history"
+assert_grep ' upgrade$' "$FIX_RELEASES/releases.history" "successful upgrade recorded in history (F1)"
 
 # ---------------------------------------------------------------------------
 section "T04 failed upgrade (invalid staged code) leaves production untouched"
@@ -316,6 +348,7 @@ if find "$FIX_RELEASES" -maxdepth 1 -name '.staging-*' 2>/dev/null | grep -q .; 
 else
     pass "staging leftovers removed"
 fi
+assert_no_grep ' 0\.2\.1 ' "$FIX_RELEASES/releases.history" "failed candidate never enters history (F1)"
 cp "$REPO_ROOT/monitor-v2/collector.py" "$FIX_SRC/collector.py"
 printf '0.3.0\n' > "$FIX_SRC/VERSION"
 
@@ -328,6 +361,7 @@ else
     fail "rollback exits 0"
 fi
 assert_eq '0.1.0' "$(cat "$FIX_APP_LINK/VERSION")" "rolled back to previous release 0.1.0"
+assert_grep ' rollback$' "$FIX_RELEASES/releases.history" "successful rollback recorded in history (F1)"
 assert_grep 'systemctl restart singbox-monitor' "$MOCK_CALL_LOG" "rollback restarts monitor only"
 assert_no_grep 'sing-box' "$MOCK_CALL_LOG" "rollback never touches sing-box"
 
@@ -343,6 +377,165 @@ else
 '
 fi
 
+if [ "$SYMLINKS_OK" != 1 ]; then
+    printf '  SKIP T15/T16/F1/F2a/F2b 原子事务流（此平台无符号链接；完整套件在 Linux 运行）\n'
+else
+# ---------------------------------------------------------------------------
+section "T15 transactional unit rollback (release + unit + service state)"
+# Simulate admin drift on the unit so the upgrade transaction actually
+# rewrites it; the one-shot restart failure trips the health gate and the
+# transaction must restore release, unit AND service state.
+echo "# admin-drift" >> "$FIX_UNIT"
+UNIT_DRIFT_HASH="$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)"
+LINK_BEFORE_T15="$(readlink "$FIX_APP_LINK")"
+printf '0.4.0\n' > "$FIX_SRC/VERSION"
+: > "$MOCK_FAIL_RESTART_ONCE"
+OUT15="$TMP/out-t15.log"
+run_install "$OUT15"
+RC15=$?
+assert_rc 1 "$RC15" "upgrade gate failure exits nonzero"
+assert_eq "$LINK_BEFORE_T15" "$(readlink "$FIX_APP_LINK")" "release restored to pre-transaction target"
+assert_eq "$UNIT_DRIFT_HASH" "$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)" "unit restored to pre-transaction content (P3)"
+assert_grep '事务前状态已恢复' "$OUT15" "rollback completion reported"
+RESTORE_CALLS=$(grep -c 'systemctl restart singbox-monitor' "$MOCK_CALL_LOG")
+if [ "$RESTORE_CALLS" -ge 2 ]; then
+    pass "failed restart followed by restoration restart (P3)"
+else
+    fail "expected >=2 monitor restarts (failed + restore), got $RESTORE_CALLS"
+fi
+if sbmon_service_active; then pass "old service active after transaction rollback"; else fail "service not active after rollback"; fi
+assert_no_grep 'sing-box' "$MOCK_CALL_LOG" "rollback never touches sing-box"
+assert_no_grep ' 0\.4\.0 ' "$FIX_RELEASES/releases.history" "failed upgrade candidate (0.4.0) absent from history (F1)"
+
+# ---------------------------------------------------------------------------
+section "T16 rollback restore failure -> CRITICAL, never claims success"
+printf '0.5.0\n' > "$FIX_SRC/VERSION"
+OUT16="$TMP/out-t16.log"
+MOCK_FAIL_START=1 run_install "$OUT16"
+RC16=$?
+unset MOCK_FAIL_START
+assert_rc 2 "$RC16" "restore failure exits 2 (CRITICAL)"
+assert_grep 'CRITICAL' "$OUT16" "CRITICAL reported"
+assert_no_grep '事务前状态已恢复' "$OUT16" "must NOT claim rollback complete (P3)"
+assert_no_grep ' 0\.5\.0 ' "$FIX_RELEASES/releases.history" "CRITICAL-failed candidate (0.5.0) absent from history (F1)"
+# clean state for later sections
+printf '0.3.0\n' > "$FIX_SRC/VERSION"
+
+# ---------------------------------------------------------------------------
+section "F1 history hygiene: rollback never selects a failed candidate"
+# manual rollback after the failed 0.4.0/0.5.0 attempts: the only successful
+# releases in history are 0.1.0 / 0.2.0 / 0.3.0 -- the target must come from
+# those, never from the failed candidates.
+OUT_F1="$TMP/out-f1.log"
+if ( "$INSTALL_MONITOR" rollback ) > "$OUT_F1" 2>&1; then
+    pass "rollback exits 0"
+else
+    fail "rollback exits 0"
+fi
+assert_eq '0.1.0' "$(cat "$FIX_APP_LINK/VERSION")" "rollback target is a historically successful release (not 0.4.0/0.5.0)"
+printf '0.4.0\n' > "$FIX_SRC/VERSION"
+OUT_F1B="$TMP/out-f1b.log"
+run_install "$OUT_F1B"
+assert_rc 0 $? "successful 0.4.0 deploy"
+F1_COUNT=$(grep -c ' 0\.4\.0 upgrade$' "$FIX_RELEASES/releases.history" || true)
+assert_eq "1" "$F1_COUNT" "successful 0.4.0 appears exactly once in history (F1)"
+
+# ---------------------------------------------------------------------------
+section "F2a existing inactive+disabled install: failed deploy fully restored"
+echo inactive > "$MOCK_SYS_STATE"
+echo disabled > "$MOCK_ENABLED_STATE"
+UNIT_F2A="$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)"
+printf '0.5.0\n' > "$FIX_SRC/VERSION"
+OUT_F2A="$TMP/out-f2a.log"
+MOCK_FAIL_START=1 run_install "$OUT_F2A"
+RC_F2A=$?
+unset MOCK_FAIL_START
+assert_rc 1 "$RC_F2A" "inactive existing install: failed deploy exits nonzero"
+assert_eq '0.4.0' "$(cat "$FIX_APP_LINK/VERSION")" "release restored (F2)"
+assert_eq "$UNIT_F2A" "$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)" "unit restored (F2)"
+assert_eq "inactive" "$(cat "$MOCK_SYS_STATE")" "service inactive restored (F2)"
+assert_eq "disabled" "$(cat "$MOCK_ENABLED_STATE")" "service disabled restored (F2)"
+assert_no_grep ' 0\.5\.0 ' "$FIX_RELEASES/releases.history" "failed 0.5.0 absent from history (F1/F2)"
+assert_grep '事务前状态已恢复' "$OUT_F2A" "rollback completion reported (F2)"
+
+section "F2b existing inactive+enabled install: failed deploy fully restored"
+echo inactive > "$MOCK_SYS_STATE"
+echo enabled > "$MOCK_ENABLED_STATE"
+UNIT_F2B="$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)"
+printf '0.6.0\n' > "$FIX_SRC/VERSION"
+OUT_F2B="$TMP/out-f2b.log"
+MOCK_FAIL_START=1 run_install "$OUT_F2B"
+RC_F2B=$?
+unset MOCK_FAIL_START
+assert_rc 1 "$RC_F2B" "inactive+enabled existing install: failed deploy exits nonzero"
+assert_eq '0.4.0' "$(cat "$FIX_APP_LINK/VERSION")" "release restored (F2b)"
+assert_eq "$UNIT_F2B" "$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)" "unit restored (F2b)"
+assert_eq "inactive" "$(cat "$MOCK_SYS_STATE")" "service inactive restored (F2b)"
+assert_eq "enabled" "$(cat "$MOCK_ENABLED_STATE")" "service ENABLED state restored (F2b)"
+assert_no_grep ' 0\.6\.0 ' "$FIX_RELEASES/releases.history" "failed 0.6.0 absent from history (F1/F2)"
+printf '0.4.0\n' > "$FIX_SRC/VERSION"
+fi  # end SYMLINKS_OK block (T15/T16/F1/F2a/F2b)
+
+section "F2c fresh-install failure: cleanup, never active/enabled"
+run_uninstall_quiet
+MOCK_FAIL_START=1 run_install "$TMP/out-f2c.log"
+RC_F2C=$?
+unset MOCK_FAIL_START
+assert_rc 1 "$RC_F2C" "fresh install with failed start exits nonzero"
+if [ ! -L "$FIX_APP_LINK" ] && [ ! -e "$FIX_APP_LINK" ]; then pass "no live symlink left behind (F2c)"; else fail "live symlink still present after fresh failure"; fi
+if [ ! -e "$FIX_UNIT" ]; then pass "new unit removed after fresh failure (F2c)"; else fail "unit still present after fresh failure"; fi
+[ -d "$FIX_RELEASES" ] && pass "immutable release tree retained for diagnosis (F2c)" || fail "release tree removed"
+if [ ! -e "$FIX_RELEASES/releases.history" ]; then pass "no history entry for failed fresh install (F1)"; else fail "history written for failed fresh install"; fi
+assert_eq "inactive" "$(cat "$MOCK_SYS_STATE")" "service inactive after fresh failure (F2c)"
+assert_eq "disabled" "$(cat "$MOCK_ENABLED_STATE")" "service disabled after fresh failure (F2c)"
+
+# ---------------------------------------------------------------------------
+section "T17 deployment lock serialization (P4, flock-gated)"
+if command -v flock >/dev/null 2>&1; then
+    LINK_B=$(readlink "$FIX_APP_LINK" 2>/dev/null || true); UNIT_B=$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)
+    flock "$SBMON_LOCK_FILE" -c 'sleep 5' & LOCK_HOLDER=$!
+    sleep 0.4
+    ( SBMON_LOCK_TIMEOUT=2 "$INSTALL_MONITOR" install ) > "$TMP/out-t17i.log" 2>&1
+    assert_rc 1 $? "install aborts fail-closed while lock held"
+    ( SBMON_LOCK_TIMEOUT=2 "$INSTALL_MONITOR" rollback ) > "$TMP/out-t17r.log" 2>&1
+    assert_rc 1 $? "rollback aborts fail-closed while lock held"
+    ( SBMON_LOCK_TIMEOUT=2 "$INSTALL_MONITOR" uninstall ) > "$TMP/out-t17u.log" 2>&1
+    assert_rc 1 $? "uninstall aborts fail-closed while lock held"
+    assert_eq "$LINK_B" "$(readlink "$FIX_APP_LINK" 2>/dev/null || true)" "app link unchanged during lock contention"
+    assert_eq "$UNIT_B" "$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)" "unit unchanged during lock contention"
+    wait "$LOCK_HOLDER" 2>/dev/null || true
+    run_install "$TMP/out-t17ok.log"
+    assert_rc 0 $? "install proceeds after lock released"
+    assert_grep 'deployment lock acquired' "$TMP/out-t17ok.log" "lock acquisition logged"
+else
+    printf '  SKIP T17 (flock 不可用；Linux CI 为最终 gate)\n'
+fi
+
+# ---------------------------------------------------------------------------
+section "F4 upgrade precondition inside the deployment lock"
+# Simulate: upgrade blocks on the lock; while the lock is held another
+# (out-of-band) deploy removes the current release; the lock is released.
+# The upgrade must then re-check INSIDE the lock and fail -- never
+# degrade into a fresh install.
+if command -v flock >/dev/null 2>&1; then
+    UNIT_F4="$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)"
+    flock "$SBMON_LOCK_FILE" -c "sleep 2; rm -rf '$SBMON_RELEASES_DIR' '$SBMON_APP_LINK'" & F4_HOLDER=$!
+    sleep 0.4
+    OUT_F4="$TMP/out-f4.log"
+    ( SBMON_LOCK_TIMEOUT=15 "$INSTALL_MONITOR" upgrade ) > "$OUT_F4" 2>&1
+    RC_F4=$?
+    assert_rc 1 "$RC_F4" "upgrade fails after concurrent removal (precondition re-checked under lock)"
+    assert_grep '升级前置检查' "$OUT_F4" "locked precondition error message (F4)"
+    if [ ! -L "$SBMON_APP_LINK" ] && [ ! -e "$SBMON_APP_LINK" ]; then pass "no fresh release created (F4)"; else fail "upgrade degraded into fresh install"; fi
+    if [ ! -d "$SBMON_RELEASES_DIR" ]; then pass "no releases dir recreated (F4)"; else fail "releases dir recreated"; fi
+    assert_eq "$UNIT_F4" "$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)" "unit untouched by failed upgrade (F4)"
+    if [ ! -e "$SBMON_RELEASES_DIR/releases.history" ]; then pass "no history entry (F4)"; else fail "history entry written by failed upgrade"; fi
+    wait "$F4_HOLDER" 2>/dev/null || true
+else
+    printf '  SKIP F4 (flock 不可用；Linux CI 为最终 gate)\n'
+fi
+
+# ---------------------------------------------------------------------------
 section "T06 monitor-only uninstall (default: state/config/backups preserved)"
 OUT6="$TMP/out-t06.log"
 if ( "$INSTALL_MONITOR" uninstall ) > "$OUT6" 2>&1; then
@@ -373,7 +566,9 @@ echo inactive > "$MOCK_SYS_STATE"
 OUT7="$TMP/out-t07.log"
 MOCK_FAIL_START=1 run_install "$OUT7"
 assert_rc 1 $? "install reports failure when service start fails"
-[ -e "$FIX_UNIT" ] && pass "unit kept for diagnosis after failed start" || fail "unit removed on failed start"
+if [ ! -e "$FIX_UNIT" ]; then pass "new unit removed after failed start (F2c contract)"; else fail "unit kept after failed fresh start"; fi
+if [ ! -L "$FIX_APP_LINK" ] && [ ! -e "$FIX_APP_LINK" ]; then pass "no live symlink after failed start (F2c)"; else fail "live symlink kept after failed start"; fi
+[ -d "$FIX_RELEASES" ] && pass "release tree retained for diagnosis" || fail "release tree removed"
 assert_grep 'journalctl -u singbox-monitor' "$OUT7" "failure message points at journal"
 unset MOCK_FAIL_START
 
@@ -558,6 +753,43 @@ assert_grep '预检失败' "$OUT10" "error message explains precheck"
 
 # ---------------------------------------------------------------------------
 if [ "$SYMLINKS_OK" = 1 ]; then
+# ---------------------------------------------------------------------------
+section "F3a chgrp failure -> install fails closed, no half-config"
+# Real chgrp semantics: as non-root, chgrp to a group we do not belong to
+# fails with EPERM. Probe first (platforms where chgrp is a no-op skip).
+CHGRP_REAL=0
+if [ "$(id -u)" != "0" ]; then
+    printf x > "$TMP/chgrp-probe"
+    if ! chgrp daemon "$TMP/chgrp-probe" 2>/dev/null; then CHGRP_REAL=1; fi
+fi
+if [ "$CHGRP_REAL" = 1 ]; then
+    run_uninstall_quiet
+    rm -rf "$FIX_STATE" "$FIX_CONF_DIR"
+    OUT_F3A="$TMP/out-f3a.log"
+    ( SBMON_REAL_CHGRP=1 SBMON_GROUP=daemon "$INSTALL_MONITOR" install ) > "$OUT_F3A" 2>&1
+    assert_rc 1 $? "chgrp failure -> install fails closed (F3)"
+    assert_grep '组设置失败' "$OUT_F3A" "fail-closed ownership message (F3)"
+    if [ ! -e "$FIX_CONF_DIR/monitor.conf" ]; then pass "no half-config accepted (F3)"; else fail "half-written monitor.conf left behind"; fi
+    if [ ! -L "$SBMON_APP_LINK" ] && [ ! -e "$SBMON_APP_LINK" ]; then pass "no release activated (F3)"; else fail "release activated despite ownership failure"; fi
+    if [ ! -e "$FIX_RELEASES/releases.history" ]; then pass "no history entry (F3)"; else fail "history written despite ownership failure"; fi
+else
+    printf '  SKIP F3a (需要非 root + 真实 chgrp 语义；Linux CI 为最终 gate)\n'
+fi
+
+section "F3b wrong-group metadata repaired (root real-metadata pass)"
+if [ "$(id -u)" = "0" ]; then
+    chgrp root "$FIX_CONF_DIR/monitor.conf" "$FIX_CONF_DIR/api.secret"
+    OUT_F3B="$TMP/out-f3b.log"
+    run_install "$OUT_F3B"
+    assert_rc 0 $? "metadata drift repair succeeds as root (F3)"
+    SBOXWEB_GID="$(getent group sboxweb | cut -d: -f3)"
+    assert_eq "$SBOXWEB_GID" "$(stat -c '%g' "$FIX_CONF_DIR/monitor.conf")" "monitor.conf group repaired to sboxweb (F3)"
+    assert_eq "$SBOXWEB_GID" "$(stat -c '%g' "$FIX_CONF_DIR/api.secret")" "api.secret group repaired to sboxweb (F3)"
+else
+    printf '  SKIP F3b (root real-metadata pass on Linux CI covers this)\n'
+fi
+
+# ---------------------------------------------------------------------------
 section "T11 bad permissions repaired without content change"
 run_install "$TMP/out-t11setup.log" >/dev/null 2>&1
 C11_BEFORE="$(sha256sum "$FIX_CONF_DIR/monitor.conf" | cut -d' ' -f1)"

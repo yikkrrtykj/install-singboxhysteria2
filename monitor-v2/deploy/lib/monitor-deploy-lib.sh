@@ -101,8 +101,13 @@ sbmon_acquire_deploy_lock() {
 # ---------------------------------------------------------------------------
 # P3: atomic file primitives (same-filesystem temp + rename)
 # ---------------------------------------------------------------------------
-sbmon_atomic_write() { # sbmon_atomic_write <path> <mode>  (content on stdin)
-    local target="$1" mode="$2"
+sbmon_atomic_write() { # sbmon_atomic_write <path> <mode> [group]  (content on stdin)
+    # F3: ownership is a functional requirement, decided EXPLICITLY by the
+    # caller -- never implicitly by this helper. When <group> is given, the
+    # chgrp MUST succeed BEFORE the rename (a replaced-but-unreadable file
+    # must never exist). The fixture without SBMON_REAL_CHGRP=1 delegates
+    # metadata semantics to the root Linux CI gate.
+    local target="$1" mode="$2" group="${3:-}"
     local dir
     dir="$(dirname -- "$target")"
     local tmp
@@ -110,11 +115,45 @@ sbmon_atomic_write() { # sbmon_atomic_write <path> <mode>  (content on stdin)
         || sbmon_die "临时文件创建失败: $dir"
     cat > "$tmp" || { rm -f -- "$tmp"; sbmon_die "临时文件写入失败: $tmp"; }
     chmod "$mode" "$tmp"
-    if [ "$SBMON_FIXTURE" != "1" ]; then
-        chgrp "$SBMON_GROUP" "$tmp" 2>/dev/null || true
+    if [ -n "$group" ] && { [ "$SBMON_FIXTURE" != "1" ] || [ "${SBMON_REAL_CHGRP:-0}" = "1" ]; }; then
+        chgrp "$group" "$tmp" \
+            || { rm -f -- "$tmp"; sbmon_die "组设置失败（$group）：fail-closed，目标文件未被替换"; }
     fi
     sync -f "$tmp" 2>/dev/null || true   # best-effort fsync where the platform supports it
     mv -f -- "$tmp" "$target" || { rm -f -- "$tmp"; sbmon_die "原子替换失败: $target"; }
+}
+
+# F3: verify (and repair) the runtime metadata contract of a file the
+# sboxweb service user MUST be able to read: regular file, exact mode,
+# owner root, group <SBMON_GROUP>. Metadata drift is repaired; repair
+# failure aborts. Never warn-and-continue. (Fixture runs without
+# SBMON_REAL_CHGRP=1 delegate these checks to the root Linux CI gate.)
+sbmon_verify_runtime_meta() { # sbmon_verify_runtime_meta <path> <mode>
+    local path="$1" want_mode="$2"
+    [ -f "$path" ] || sbmon_die "runtime 文件不是普通文件: $path（fail-closed）"
+    local mode
+    mode="$(stat -c '%a' "$path")"
+    if [ "$mode" != "$want_mode" ]; then
+        chmod "$want_mode" "$path" || sbmon_die "权限修复失败（$path -> $want_mode）：fail-closed"
+    fi
+    if [ "$SBMON_FIXTURE" = "1" ] && [ "${SBMON_REAL_CHGRP:-0}" != "1" ]; then
+        return 0
+    fi
+    local want_gid cur_gid cur_uid
+    want_gid="$(getent group "$SBMON_GROUP" | cut -d: -f3)"
+    [ -n "$want_gid" ] || sbmon_die "组 $SBMON_GROUP 不存在：runtime 文件组契约无法满足（fail-closed）"
+    cur_uid="$(stat -c '%u' "$path")"
+    cur_gid="$(stat -c '%g' "$path")"
+    if [ "$cur_uid" != "0" ]; then
+        chown root "$path" || sbmon_die "owner 修复失败（$path -> root）：fail-closed"
+    fi
+    if [ "$cur_gid" != "$want_gid" ]; then
+        chgrp "$SBMON_GROUP" "$path" || sbmon_die "组修复失败（$path -> $SBMON_GROUP）：fail-closed"
+    fi
+    # post-repair verification: contract must actually hold
+    [ "$(stat -c '%u' "$path")" = "0" ] || sbmon_die "owner 仍非 root（$path）：fail-closed"
+    [ "$(stat -c '%g' "$path")" = "$want_gid" ] || sbmon_die "组仍非 $SBMON_GROUP（$path）：fail-closed"
+    [ "$(stat -c '%a' "$path")" = "$want_mode" ] || sbmon_die "权限仍非 $want_mode（$path）：fail-closed"
 }
 
 # ---------------------------------------------------------------------------
@@ -239,7 +278,7 @@ sbmon_write_default_conf() {
         return 0
     fi
     sbmon_info "写入默认 monitor.conf（仅首次，原子写入）"
-    sbmon_atomic_write "$conf" 0640 <<EOF
+    sbmon_atomic_write "$conf" 0640 "$SBMON_GROUP" <<EOF
 # sing-box Monitor v2 configuration (KEY=VALUE, parsed strictly; no shell eval)
 # Written once by install-monitor.sh; upgrades and repairs NEVER overwrite it.
 
@@ -280,15 +319,9 @@ sbmon_repair_conf_perms() {
     local conf
     conf="$(sbmon_conf_file)"
     [ -e "$conf" ] || return 0
-    local mode
-    mode="$(stat -c '%a' "$conf")"
-    if [ "$mode" != "640" ]; then
-        sbmon_warn "monitor.conf 权限为 $mode，修复为 0640（内容未改动）"
-        chmod 0640 "$conf"
-    fi
-    if [ "$SBMON_FIXTURE" != "1" ]; then
-        chgrp "$SBMON_GROUP" "$conf"
-    fi
+    # F3: monitor.conf is runtime-read by the service user -> ownership and
+    # mode are functional requirements; repair is fail-closed.
+    sbmon_verify_runtime_meta "$conf" 0640
 }
 
 # ---------------------------------------------------------------------------
@@ -320,31 +353,18 @@ sbmon_sync_api_secret() {
         sbmon_die "S0 anchor 不是可读的普通文件（$source）：fail-closed，未做任何变更"
     fi
     if [ -f "$dest" ] && cmp -s -- "$source" "$dest"; then
+        # F3: content-identical still requires the FULL metadata contract:
+        # regular file + 0640 + owner root + group sboxweb. Drift is
+        # repaired; repair failure aborts the install (the monitor would
+        # otherwise be unreadable at runtime while health shows green).
+        sbmon_verify_runtime_meta "$dest" 0640
         sbmon_info "api.secret 内容一致，不重写（无 mtime churn）"
     else
         local ddir
         ddir="$(dirname -- "$dest")"
         [ -d "$ddir" ] || sbmon_die "secret 目标目录不存在: $ddir"
-        local tmp
-        tmp="$(mktemp "$ddir/.api.secret.XXXXXX")" || sbmon_die "secret 临时文件创建失败"
-        cat -- "$source" > "$tmp" || { rm -f -- "$tmp"; sbmon_die "secret 临时写入失败：安装中止"; }
-        chmod 0640 "$tmp"
-        if [ "$SBMON_FIXTURE" != "1" ]; then
-            chgrp "$SBMON_GROUP" "$tmp" || { rm -f -- "$tmp"; sbmon_die "secret 组设置失败：安装中止"; }
-        fi
-        sync -f "$tmp" 2>/dev/null || true
-        mv -f -- "$tmp" "$dest" || { rm -f -- "$tmp"; sbmon_die "api.secret 原子替换失败：安装中止"; }
-        sbmon_info "api.secret 已同步（derived copy, 0640）"
-    fi
-    # Converge perms on the derived copy even when content was identical.
-    local mode
-    mode="$(stat -c '%a' "$dest")"
-    if [ "$mode" != "640" ]; then
-        chmod 0640 "$dest"
-        sbmon_info "api.secret 权限修复为 0640"
-    fi
-    if [ "$SBMON_FIXTURE" != "1" ]; then
-        chgrp "$SBMON_GROUP" "$dest" 2>/dev/null || true
+        sbmon_atomic_write "$dest" 0640 "$SBMON_GROUP" < "$source"
+        sbmon_info "api.secret 已同步（derived copy, root:$SBMON_GROUP 0640）"
     fi
 }
 
@@ -461,7 +481,7 @@ sbmon_install_unit() {
     fi
     # P3: atomic unit install (same-filesystem temp -> rename); readers of
     # the unit never observe a half-written file.
-    sbmon_atomic_write "$SBMON_UNIT_FILE" 0644 <<< "$rendered"
+    sbmon_atomic_write "$SBMON_UNIT_FILE" 0644 <<< "$rendered"   # root:root, no group chgrp
     # shellcheck disable=SC2034  # consumed by the caller (install-monitor.sh)
     SBMON_UNIT_CHANGED=1
     sbmon_systemctl daemon-reload
@@ -473,6 +493,11 @@ sbmon_systemctl() {
 
 sbmon_service_restart() { sbmon_systemctl restart "$SBMON_SERVICE_NAME"; }
 sbmon_service_enable_now() { sbmon_systemctl enable --now "$SBMON_SERVICE_NAME"; }
+sbmon_service_enable() { sbmon_systemctl enable "$SBMON_SERVICE_NAME"; }
+sbmon_service_stop() { sbmon_systemctl stop "$SBMON_SERVICE_NAME"; }
+sbmon_service_enabled() { # rc 0 = enabled (explicit fact, never inferred)
+    sbmon_systemctl is-enabled "$SBMON_SERVICE_NAME" >/dev/null 2>&1
+}
 sbmon_service_stop_disable() {
     sbmon_systemctl disable --now "$SBMON_SERVICE_NAME" >/dev/null 2>&1 || true
 }

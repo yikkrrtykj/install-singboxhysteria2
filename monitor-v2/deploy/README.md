@@ -192,6 +192,15 @@ sudoers、exact-token 读权直接复用，不需要迁移 service identity。
 **永不发生**（任何路径）：覆盖 `monitor.conf`、重置 auth/access/state、触碰防火墙、
 触碰 `/root/sbox`（含 proxy 凭据/密码/recovery key/whitelist）、重启 sing-box。
 
+**round 2 F2 — fresh install 失败的清理契约**：首次部署没有旧状态可回滚；candidate
+启动失败时：删除 live 符号链接、删除新建 unit、daemon-reload、恢复 disabled + inactive；
+**保留不可变的 release 树**供排错。绝不留下 active release 或 enabled 的坏服务。
+
+**round 2 F1 — history 是 commit record**：`releases.history` 只在服务门通过（部署成功）
+后写入；失败候选、已回滚候选、部分部署候选**绝不进入**成功 release history，因此
+`rollback` 的目标选择永远不可能选中失败候选。如需失败审计，将来单独建
+failed-attempt log，不污染回滚目标集。
+
 `uninstall`（任务 9，默认保留）：
 
 ```text
@@ -251,20 +260,25 @@ generated YAML —— 一个都不许出现）的实现方式：
 ## 7. 升级 / 回滚模型（任务 7）
 
 ```text
-【事务状态捕获】old_release_id + 旧 unit 内容（同文件系统临时备份）+ old_service_active
+【事务状态捕获】old_release_id + 旧 unit 内容（同文件系统临时备份）
+                 + old_service_active + old_service_enabled（`systemctl is-enabled` 显式记录，绝不推断）
   → stage（releases/.staging-*，py_compile + bash -n 预验证；失败删 staging，生产树零影响）
   → unit 原子写入（同文件系统 temp → chmod → rename；读者永远看不到半个 unit）
   → activate（mv -T 符号链接原子切换；旧树即备份，保留最近 SBMON_KEEP_RELEASES=3 个）
   → systemctl restart singbox-monitor      ← 唯一被重启的服务；sing-box 无感
   → 门：等待 service_active（默认 20s）
 
-失败（review round 1 P3：release 与 unit 作为同一个 deployment transaction 回滚）：
+失败（review round 1 P3 + round 2 F2：release + unit + 服务状态作为同一个
+deployment transaction 回滚，**无论事务前服务是 active 还是 inactive**）：
   → 恢复旧 release（flip 回 old_id）
   → 恢复旧 unit（原子写回事务前内容；unit 原本不存在则删除新 unit）
-  → daemon-reload → restart 旧 monitor → 验证 active
+  → daemon-reload
+  → 恢复 enabled 状态（old_enabled=1 → enable；否则 disable）
+  → 恢复 active 状态（old_active=1 → restart + 验证 active；否则 stop + 验证 inactive）
   → 任一步失败 → CRITICAL + exit 2，绝不声称 "rollback complete"
 
-rollback 命令 = 人工版同一动作（可指定 release id）
+rollback 命令 = 人工版同一动作（可指定 release id）；**成功激活并确认 service active 之后**
+才追加 `action=rollback` 历史（round 2 F1：rollback 自身失败不得写成功历史）。
 ```
 
 Monitor 升级**默认不得重启 sing-box** —— deploy 代码根本没有 sing-box 操作面；测试记录全部
@@ -333,6 +347,10 @@ Deferred（integration 对话接）：E2 `app/web/serve` 与 `web_http` 探针�
   `health`/`status`/`history` 只读、不加独占锁。
 - 契约（fail-closed，绝不 warn-and-continue）：`flock` 缺失、锁文件打开失败、
   `flock -w` 超时（默认 15s，`SBMON_LOCK_TIMEOUT`）、获取失败 → 在**任何 mutation 之前**中止。
+- **round 2 F4**：统一 dispatcher `sbmon_with_deploy_lock <locked-fn>` —— install/upgrade/
+  rollback/uninstall 都是"acquire lock → precondition 读 → decision → mutation"同锁完成，
+  无嵌套 flock。upgrade 的"已安装"前置检查在**锁内**复核：并发 uninstall 先完成时，
+  upgrade 拿到锁后必须失败，**绝不退化为 fresh install**。
 
 ### 11.2 S0 service.api secret → 非 root Monitor bridge（P6）
 
@@ -345,6 +363,12 @@ Deferred（integration 对话接）：E2 `app/web/serve` 与 `web_http` 探针�
 - fail-closed：conf 声明了 `SBMON_API_SECRET_FILE` 而 anchor 缺失/不可读/类型错误 → 安装中止；
   monitor-service 启动时对配置的 secret 文件做存在/可读/普通文件三查，任一不满足 → 拒绝启动，
   **绝不静默降级为无 auth 连接**。pre-S0 逃生口：conf 中注释掉该行并删除派生文件。
+- **round 2 F3 — ownership 是功能要求**：`monitor.conf` 与 `api.secret` 的
+  `root:sboxweb 0640` 由调用方显式指定（atomic helper 不隐式决定 ownership）；
+  chgrp 必须在 rename **之前**成功（绝不会出现"已替换线上文件但 sboxweb 读不了"）；
+  内容一致时仍校验 regular file/mode/owner root/group sboxweb，metadata 漂移原子修复、
+  修复失败 abort，绝无 warning-and-continue。Linux CI 以 **root 第二遍**跑真实
+  useradd/groupadd/chown/chgrp 并断言 stat uid==0 / gid==sboxweb / mode==0640。
 - 静态隔离测试对 anchor 路径做**唯一一次**精确豁免（deploy 代码中该字符串恰好出现一次）。
 
 ### 11.3 service.api URL contract（P7）
@@ -354,3 +378,19 @@ Deferred（integration 对话接）：E2 `app/web/serve` 与 `web_http` 探针�
   path 仅允许 "" 或 "/"、无 query、无 fragment。
 - `monitor-service` 启动时校验（不满足 → 拒绝启动）；health 同时报告 `api_url_valid`。
   不满足契约时绝不发起连接。
+
+---
+
+## 12. Review round 2 决议摘要
+
+1. **F1**：`releases.history` = 成功部署的 commit record（服务门通过后写入）；失败候选、
+   已回滚候选不进入 history，rollback 目标永远选不到失败候选。rollback 自身成功后才写
+   `action=rollback`。
+2. **F2**：事务捕获并恢复完整服务状态（active + enabled 显式记录、显式恢复）；existing
+   install 无论事务前 active/inactive/enabled/disabled，candidate 失败都完整回滚；
+   fresh install 失败走清理契约（§5）。
+3. **F3**：runtime 文件（monitor.conf、api.secret）的 root:sboxweb 0640 是功能契约；
+   chgrp 在 rename 前 fail-closed；metadata 漂移修复失败即 abort；CI 以 root 第二遍
+   验证真实 uid/gid/mode。
+4. **F4**：所有 mutating 命令统一 `sbmon_with_deploy_lock` dispatcher；upgrade 的
+   已安装前置检查在锁内复核，绝不退化为 fresh install。

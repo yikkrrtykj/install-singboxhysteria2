@@ -61,10 +61,23 @@ parse_flags() { # parse_flags <cmd> "$@"
 }
 
 # ---------------------------------------------------------------------------
-# P3: deployment transaction -- release + unit are rolled back TOGETHER.
+# F4: unified dispatcher -- every mutating command runs
+# "acquire lock -> precondition -> decision -> mutation" under ONE lock.
+# Precondition reads happen INSIDE the lock (no TOCTOU between
+# "upgrade checks installed" and a concurrent uninstall).
 # ---------------------------------------------------------------------------
-sbmon_txn_rollback() { # <old_id> <old_unit_backup|''> <old_unit_existed> <old_active>
-    local old_id="$1" old_unit_backup="$2" old_unit_existed="$3" old_active="$4"
+sbmon_with_deploy_lock() { # sbmon_with_deploy_lock <locked-fn> [args...]
+    local fn="$1"; shift
+    sbmon_acquire_deploy_lock
+    "$fn" "$@"
+}
+
+# ---------------------------------------------------------------------------
+# P3/F2: deployment transaction -- release + unit + service state
+# (active AND enabled) are rolled back TOGETHER.
+# ---------------------------------------------------------------------------
+sbmon_txn_rollback() { # <old_id> <old_unit_backup|''> <old_unit_existed> <old_active> <old_enabled>
+    local old_id="$1" old_unit_backup="$2" old_unit_existed="$3" old_active="$4" old_enabled="$5"
     sbmon_warn "部署门未通过：开始恢复事务前状态（release + unit + 服务）"
 
     if [ -n "$old_id" ]; then
@@ -88,6 +101,18 @@ sbmon_txn_rollback() { # <old_id> <old_unit_backup|''> <old_unit_existed> <old_a
         sbmon_critical "回滚后 daemon-reload 失败；systemd 状态可能不一致，需要人工处理"
     fi
 
+    # F2: restore the recorded enabled state explicitly (never inferred).
+    if [ "$old_enabled" = 1 ]; then
+        if ! sbmon_service_enable; then
+            sbmon_critical "回滚后 enable 恢复失败（事务前 enabled）；需要人工处理"
+        fi
+    else
+        if ! sbmon_systemctl disable "$SBMON_SERVICE_NAME"; then
+            sbmon_critical "回滚后 disable 恢复失败（事务前 disabled）；需要人工处理"
+        fi
+    fi
+
+    # F2: restore the recorded active state explicitly.
     if [ "$old_active" = 1 ]; then
         if ! sbmon_service_restart; then
             sbmon_critical "回滚后服务重启失败（旧 release/unit 已恢复但服务未运行）；需要人工处理"
@@ -96,16 +121,47 @@ sbmon_txn_rollback() { # <old_id> <old_unit_backup|''> <old_unit_existed> <old_a
             sbmon_critical "回滚后服务未恢复 active；旧 release/unit 已就位，需要人工检查 journalctl -u $SBMON_SERVICE_NAME"
         fi
     else
-        sbmon_service_stop_disable
+        sbmon_service_stop
         if sbmon_service_active; then
             sbmon_critical "回滚后服务仍处于运行状态（事务前为 inactive）；需要人工处理"
         fi
     fi
 
-    sbmon_warn "事务前状态已恢复（release=${old_id:-<none>} unit=$([ "$old_unit_existed" = 1 ] && printf restored || printf removed) service_active=$old_active）"
+    sbmon_warn "事务前状态已恢复（release=${old_id:-<none>} unit=$([ "$old_unit_existed" = 1 ] && printf restored || printf removed) service_active=$old_active service_enabled=$old_enabled）"
 }
 
-cmd_install() {
+# F2: fresh-install failure has NO pre-state to restore. Contract (README §5):
+# remove the live symlink and the newly created unit (never leave an active
+# release or an enabled broken service), keep the immutable release tree for
+# diagnosis, end disabled + inactive.
+sbmon_fresh_failure_cleanup() {
+    sbmon_warn "首次部署启动失败：清理激活链接与 unit（release 树保留以便排查）"
+    rm -rf -- "$SBMON_APP_LINK"   # symlink itself; never descends into the release tree
+    rm -f -- "$SBMON_UNIT_FILE"
+    sbmon_systemctl daemon-reload || true
+    sbmon_service_stop || true
+    if ! sbmon_systemctl disable "$SBMON_SERVICE_NAME"; then
+        sbmon_critical "首次部署失败清理：disable 失败，可能残留 enabled 状态"
+    fi
+    if sbmon_service_active; then
+        sbmon_critical "首次部署失败清理：服务仍处于运行状态"
+    fi
+    sbmon_warn "已恢复到未安装状态（disabled + inactive）；排查请查看 journalctl -u $SBMON_SERVICE_NAME"
+}
+
+cmd_install() { # F4: lock -> precondition -> decision -> mutation, all in one lock
+    parse_flags install "$@"
+    sbmon_with_deploy_lock _cmd_install_locked install "$@"
+}
+
+cmd_upgrade() { # F4: precondition is checked INSIDE the deploy lock and can
+    #            never degrade into a fresh install.
+    parse_flags upgrade "$@"
+    sbmon_with_deploy_lock _cmd_install_locked upgrade "$@"
+}
+
+_cmd_install_locked() { # <install|upgrade> [flags...]
+    local MODE="$1"; shift
     parse_flags install "$@"
 
     # --- precheck: fail closed BEFORE touching the filesystem ---
@@ -114,10 +170,14 @@ cmd_install() {
     [ -f "$DEPLOY_DIR/singbox-monitor.service.in" ] || sbmon_die "缺少 unit 模板"
     [ -d "$SBMON_REPO_MONITOR_DIR" ] || sbmon_die "缺少 monitor-v2 源目录: $SBMON_REPO_MONITOR_DIR"
 
-    # P4: serialize ALL mutations. Every step below (user/dirs/conf/secret/
-    # stage/unit/flip/restart/rollback/prune/history) runs under this lock;
-    # a busy/unavailable lock aborts before any mutation (fail-closed).
-    sbmon_acquire_deploy_lock
+    # F4: precondition re-check under the lock. A concurrent uninstall may
+    # have completed between the CLI call and this point -- upgrade must
+    # fail here, never fall through to a fresh install.
+    local current_id_pre
+    current_id_pre="$(sbmon_current_release_id)"
+    if [ "$MODE" = "upgrade" ] && [ -z "$current_id_pre" ]; then
+        sbmon_die "升级前置检查（锁内）：当前未安装 Monitor；绝不退化为全新安装"
+    fi
 
     local repo_version current_version current_id
     repo_version="$(sbmon_repo_version)"
@@ -156,9 +216,11 @@ cmd_install() {
         action="repair"
     fi
 
-    # --- transaction state (P3): captured before anything is mutated ---
+    # --- transaction state (P3/F2): captured before anything is mutated ---
     local was_active=0
     if sbmon_service_active; then was_active=1; fi
+    local old_enabled=0
+    if sbmon_service_enabled; then old_enabled=1; fi
     local old_unit_existed=0
     local old_unit_backup=""
     if [ -e "$SBMON_UNIT_FILE" ]; then
@@ -169,8 +231,10 @@ cmd_install() {
 
     local new_id=""
     if [ "$action" = "fresh" ] || [ "$action" = "upgrade" ] || [ "$action" = "repair" ] || [ "$action" = "downgrade" ]; then
+        # F1: history is a COMMIT record, not an intent record. The entry is
+        # written ONLY after the service gate passes; failed/rolled-back
+        # candidates never become rollback targets.
         new_id="$(sbmon_stage_release "$repo_version")"
-        sbmon_record_history "$new_id" "$repo_version" "$action"
         sbmon_activate_release "$new_id"
     fi
 
@@ -194,10 +258,10 @@ cmd_install() {
             else
                 sbmon_warn "服务未在 ${SBMON_HEALTH_TIMEOUT}s 内激活"
                 if [ "$old_unit_existed" = 1 ] || [ -n "$current_id" ]; then
-                    sbmon_txn_rollback "$current_id" "$old_unit_backup" "$old_unit_existed" 1
+                    sbmon_txn_rollback "$current_id" "$old_unit_backup" "$old_unit_existed" 1 "$old_enabled"
                 else
                     rm -f -- "$old_unit_backup" 2>/dev/null || true
-                    sbmon_warn "无事务前状态可回滚（首次部署），unit 保留以便排查"
+                    sbmon_fresh_failure_cleanup
                 fi
                 return 1
             fi
@@ -205,17 +269,31 @@ cmd_install() {
     else
         sbmon_info "启用并启动 singbox-monitor"
         if ! sbmon_service_enable_now; then
-            sbmon_warn "服务启动失败：unit 已保留以便排查（journalctl -u $SBMON_SERVICE_NAME）"
+            sbmon_warn "candidate 启动失败"
+            if [ "$old_unit_existed" = 1 ] || [ -n "$current_id" ]; then
+                sbmon_txn_rollback "$current_id" "$old_unit_backup" "$old_unit_existed" 0 "$old_enabled"
+            else
+                rm -f -- "$old_unit_backup" 2>/dev/null || true
+                sbmon_fresh_failure_cleanup
+            fi
             return 1
         fi
         if ! sbmon_wait_service_active; then
-            sbmon_warn "服务未在 ${SBMON_HEALTH_TIMEOUT}s 内激活，请检查 journalctl -u $SBMON_SERVICE_NAME"
+            sbmon_warn "服务未在 ${SBMON_HEALTH_TIMEOUT}s 内激活"
+            if [ "$old_unit_existed" = 1 ] || [ -n "$current_id" ]; then
+                sbmon_txn_rollback "$current_id" "$old_unit_backup" "$old_unit_existed" 0 "$old_enabled"
+            else
+                rm -f -- "$old_unit_backup" 2>/dev/null || true
+                sbmon_fresh_failure_cleanup
+            fi
             return 1
         fi
         sbmon_info "服务已激活"
     fi
 
+    # F1: gate PASSED -> the candidate is now a committed deployment.
     if [ "$release_changed" = 1 ]; then
+        sbmon_record_history "$new_id" "$repo_version" "$action"
         sbmon_prune_releases
     fi
     rm -f -- "$old_unit_backup" 2>/dev/null || true
@@ -224,15 +302,12 @@ cmd_install() {
     sbmon_info "install 完成（action=$action version=$repo_version）"
 }
 
-cmd_upgrade() {
-    if [ -z "$(sbmon_current_release_id)" ]; then
-        sbmon_die "尚未安装 Monitor；请先运行 install"
-    fi
-    cmd_install "$@"
+cmd_rollback() { # rollback [release-id]
+    # F4: lock -> precondition -> mutation, single acquisition, no nesting.
+    sbmon_with_deploy_lock _cmd_rollback_locked "$@"
 }
 
-cmd_rollback() { # rollback [release-id]
-    sbmon_acquire_deploy_lock   # P4: rollback mutates release/unit/service
+_cmd_rollback_locked() { # [release-id]   (F4: runs under the deploy lock)
     local target="${1:-}"
     [ -L "$SBMON_APP_LINK" ] || sbmon_die "当前没有已激活的 release"
     local current
@@ -244,9 +319,11 @@ cmd_rollback() { # rollback [release-id]
     [ -d "$SBMON_RELEASES_DIR/$target" ] || sbmon_die "release 不存在: $target"
     sbmon_info "回滚: $current -> $target"
     sbmon_activate_release "$target"
-    sbmon_record_history "$target" "$(tr -d ' \t\r\n' < "$SBMON_RELEASES_DIR/$target/VERSION")" "rollback"
     sbmon_service_restart
     if sbmon_wait_service_active; then
+        # F1: history is a commit record -- a rollback that itself failed
+        # must NOT append a successful history entry.
+        sbmon_record_history "$target" "$(tr -d ' \t\r\n' < "$SBMON_RELEASES_DIR/$target/VERSION")" "rollback"
         sbmon_info "回滚完成，服务已激活"
         sbmon_report_health
     else
@@ -296,7 +373,10 @@ sbmon_report_health() {
 
 cmd_uninstall() {
     parse_flags uninstall "$@"
-    sbmon_acquire_deploy_lock   # P4: uninstall mutates unit/releases/state
+    sbmon_with_deploy_lock _cmd_uninstall_locked
+}
+
+_cmd_uninstall_locked() { # F4: runs under the deploy lock
     sbmon_info "卸载 Monitor（仅 Monitor；不触碰 sing-box / 代理凭据 / 配置）"
     sbmon_service_stop_disable
     if [ -e "$SBMON_UNIT_FILE" ]; then
