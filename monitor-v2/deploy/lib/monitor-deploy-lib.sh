@@ -1,4 +1,5 @@
 # monitor-deploy-lib.sh -- Monitor v2 deployment primitives (skeleton, E2/E3-aware).
+# shellcheck shell=bash
 #
 # Design contract (see monitor-v2/deploy/README.md):
 #   * Idempotent converge: install/upgrade/repair/uninstall can be re-run; an
@@ -231,7 +232,8 @@ sbmon_repair_conf_perms() {
 # ---------------------------------------------------------------------------
 sbmon_stage_release() { # sbmon_stage_release <version> -> prints release id on stdout (logs -> stderr)
     local version="$1"
-    local id="${version}-$(date +%Y%m%d%H%M%S)"
+    local id
+    id="${version}-$(date +%Y%m%d%H%M%S)"
     while [ -e "$SBMON_RELEASES_DIR/$id" ]; do
         id="${id}-x$RANDOM"
     done
@@ -303,10 +305,11 @@ sbmon_prune_releases() {
     local keep="$SBMON_KEEP_RELEASES"
     (( total > keep )) || return 0
     # ids are glob-ordered (timestamp suffix => chronological)
-    local i
+    local i victim
     for (( i = 0; i < total - keep; i++ )); do
         sbmon_info "清理旧 release: ${ids[$i]}"
-        rm -rf -- "$SBMON_RELEASES_DIR/${ids[$i]}"
+        victim="$SBMON_RELEASES_DIR/${ids[$i]}"
+        rm -rf -- "${victim:?}"   # :? guard: never expand empty -> /
     done
 }
 
@@ -337,6 +340,7 @@ sbmon_install_unit() {
     fi
     printf '%s\n' "$rendered" > "$SBMON_UNIT_FILE"
     chmod 0644 "$SBMON_UNIT_FILE"
+    # shellcheck disable=SC2034  # consumed by the caller (install-monitor.sh)
     SBMON_UNIT_CHANGED=1
     sbmon_systemctl daemon-reload
 }

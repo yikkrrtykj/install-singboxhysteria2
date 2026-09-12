@@ -1,4 +1,5 @@
 # monitor-env.sh -- shared helpers for the deployed monitor shims.
+# shellcheck shell=bash
 # Sourced by monitor-service and monitor-health inside the release tree.
 # Kept dependency-free and journal-safe: never prints conf values or secrets.
 
@@ -14,6 +15,7 @@ monitor_env_load() { # monitor_env_load <conf-file>
         key="${line%%=*}"
         value="${line#*=}"
         [ "$key" != "$line" ] || continue
+        # shellcheck disable=SC2034  # SBMON_ENV_* are consumed by sourcing shims
         case "$key" in
             SBMON_WEB_BIND) SBMON_ENV_WEB_BIND="$value" ;;
             SBMON_API_URL) SBMON_ENV_API_URL="$value" ;;
