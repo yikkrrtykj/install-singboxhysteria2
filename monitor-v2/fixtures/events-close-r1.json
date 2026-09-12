@@ -1,0 +1,10 @@
+{
+  "reset": false,
+  "events": [
+    {
+      "type": "CLOSED",
+      "id": "r1",
+      "closed_at": 123456
+    }
+  ]
+}

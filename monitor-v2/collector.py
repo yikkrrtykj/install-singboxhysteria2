@@ -1,33 +1,41 @@
 #!/usr/bin/env python3
-"""Monitor v2 E1 collector -- API-first, identity-first.
+"""Monitor v2 E1 collector -- API-first, identity-first, event-driven.
 
 Identity model (confirmed by the 1.14.0 production canary):
 
     Device      = API USER      (e.g. "vmix-01")
-    Protocol    = API INBOUND   (e.g. "vless-in" / "hy2-in")
-    Lifecycle   = API ID        (connection row id)
+    Protocol    = API INBOUND TAG (e.g. "vless-in" / "hy2-in"; inbound_type is
+                  stored separately and is NOT part of the identity)
+    Lifecycle   = API connection ID (immutable identity for its whole life)
     Source IP   = metadata, display only -- NEVER an identity key
 
-The collector polls the sing-box service.api (127.0.0.1:9091 only), keeps an
-in-memory lifecycle accumulator and emits debug JSON. No database, no public
-HTTP UI, no conntrack, no ss -- those are later phases.
+The collector consumes the OFFICIAL service.api event stream
+(``daemon.StartedService/SubscribeConnections`` over gRPC-Web on the loopback
+listener -- see monitor-v2/api_bridge/) and maintains an in-memory lifecycle
+accumulator. No database, no public UI, no conntrack, no ss.
 
-Connection lifecycle state machine:
+Official stream contract (verified against the v1.14.0 source,
+``daemon/started_service.go`` -- do NOT guess):
 
-    first seen id            -> active
-    same id on next poll     -> update rate/total (monotonic)
-    id disappears            -> finalize: bank its last total into the device/
-                                protocol cumulative counter, move the row to the
-                                recent-closed cache (kept ~10 min)
-    id comes back            -> reactivate the same lifecycle (never double count)
+* the FIRST message of a subscription carries ``reset=true`` with NEW events
+  for ALL active connections plus NEW events (with ``closedAt``) for recently
+  closed ones;
+* UPDATE carries only id + uplinkDelta + downlinkDelta (no Connection object);
+  UPDATE(0,0) means "traffic stopped";
+* CLOSED carries id + closedAt and finalizes exactly once;
+* neither the server nor this collector relies on ids disappearing from a
+  later poll.
 
-Device/protocol cumulative totals therefore never decrease when rows disappear,
-and totals are never counted twice (banked once at finalize, un-banked on
-reactivation).
+Traffic model: ``uplink`` / ``downlink`` are the OFFICIAL API direction names
+and are kept separate everywhere (connection, protocol, device). They are NOT
+relabelled upload/download -- the client-perspective mapping is a later,
+explicit step. Authoritative totals rule:
 
-Status semantics: the API exposes logical routed connections, not transport
-heartbeats. The only honest statuses are ACTIVE / RECENT ACTIVITY / IDLE.
-There is deliberately no ONLINE / OFFLINE / "Tunnel Down".
+* NEW carries authoritative uplinkTotal/downlinkTotal (lifecycle start);
+* UPDATE without a Connection object ADDS the deltas;
+* UPDATE WITH a Connection object REPLACES the totals (authoritative);
+* CLOSED banks the final lifecycle totals exactly once into the device/protocol
+  cumulative counters: totals never decrease, never double count.
 """
 
 from __future__ import annotations
@@ -35,161 +43,312 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import os
 import sys
 import time
-import urllib.error
-import urllib.request
-from collections import OrderedDict
+
+from api_bridge.singbox_stream import (ConfigurationError, SingboxEventStream,
+                                       parse_api_url)
 
 DEFAULT_URL = "http://127.0.0.1:9091"
-DEFAULT_CONNECTIONS_PATH = "/connections"
-DEFAULT_TIMEOUT = 3.0
-DEFAULT_INTERVAL = 3.0
+DEFAULT_INTERVAL = 2.0
 DEFAULT_CLOSED_TTL = 600.0  # keep finalized ids ~10 minutes
 RECENT_SOURCES_MAX = 10
 RECENT_CONNECTIONS_MAX = 20
+SECRET_ENV = "BOX_API_SECRET"
 
 STATUS_ACTIVE = "ACTIVE"
 STATUS_RECENT = "RECENT ACTIVITY"
 STATUS_IDLE = "IDLE"
 
 
-def _num(value, default=0.0):
-    """Tolerant numeric parse: int/float pass through, numeric strings ok."""
-    if isinstance(value, bool):
-        return default
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
-        try:
-            return float(value)
-        except ValueError:
-            return default
-    return default
+def _iso(timestamp):
+    if timestamp is None:
+        return None
+    return datetime.datetime.fromtimestamp(timestamp, datetime.timezone.utc).isoformat()
 
 
-def _str(value):
-    return value if isinstance(value, str) else ""
+def _to_seconds(timestamp):
+    """Normalize proto epoch timestamps to seconds.
 
-
-def normalize_row(row):
-    """Extract the identity/traffic fields from one API row.
-
-    Returns None for anything that cannot be safely attributed (fail-safe:
-    a malformed row is skipped, never allowed to pollute the aggregate state).
+    The official proto carries createdAt/closedAt as UnixMilli; the collector
+    clock runs in seconds. Epoch milliseconds are ~1.7e12, seconds ~1.7e9, so
+    the threshold is unambiguous for any plausible clock.
     """
-    if not isinstance(row, dict):
-        return None
-    cid = row.get("id")
-    user = row.get("user")
-    inbound = row.get("inbound")
-    if not isinstance(cid, str) or not cid:
-        return None
-    if not isinstance(user, str) or not user:
-        return None
-    if not isinstance(inbound, str) or not inbound:
-        return None
+    if not timestamp:
+        return 0
+    value = float(timestamp)
+    return value / 1000.0 if value > 1e11 else value
+
+
+def redact(text, secrets):
+    if not text:
+        return text
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, "[redacted]")
+    return text
+
+
+def _row_identity(fields):
+    return fields.get("user"), fields.get("inbound")
+
+
+def _new_connection(fields, now):
     return {
-        "id": cid,
-        "user": user,
-        "inbound": inbound,
-        "network": _str(row.get("network")),
-        "source": _str(row.get("source")),
-        "destination": _str(row.get("destination")),
-        "created": _str(row.get("created")),
-        "rate": max(0.0, _num(row.get("rate"))),
-        "total": max(0.0, _num(row.get("total"))),
+        "id": fields["id"],
+        "user": fields["user"],
+        "inbound": fields["inbound"],
+        "inbound_type": fields.get("inbound_type", ""),
+        "network": fields.get("network", ""),
+        "source": fields.get("source", ""),
+        "destination": fields.get("destination", ""),
+        "created_at": _to_seconds(fields.get("created_at")) or now,
+        "closed_at": 0,
+        "uplink_rate": 0.0,
+        "downlink_rate": 0.0,
+        "uplink_total": float(fields.get("uplink_total", 0)),
+        "downlink_total": float(fields.get("downlink_total", 0)),
+        "last_seen": now,
     }
 
 
-def fetch_connections(url, connections_path=DEFAULT_CONNECTIONS_PATH,
-                      timeout=DEFAULT_TIMEOUT, secret=None):
-    """API adapter: GET {url}{connections_path}, return the raw rows list."""
-    request = urllib.request.Request(url.rstrip("/") + connections_path)
-    if secret:
-        request.add_header("Authorization", "Bearer " + secret)
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        data = json.loads(response.read().decode("utf-8"))
-    if isinstance(data, dict):
-        rows = data.get("connections")
-    elif isinstance(data, list):
-        rows = data
-    else:
-        rows = []
-    return rows if isinstance(rows, list) else []
-
-
 class Tracker:
-    """In-memory lifecycle accumulator (first version: no database)."""
+    """In-memory event-driven lifecycle accumulator (no database)."""
 
-    def __init__(self, closed_ttl=DEFAULT_CLOSED_TTL):
+    def __init__(self, closed_ttl=DEFAULT_CLOSED_TTL, interval=DEFAULT_INTERVAL):
         self.closed_ttl = closed_ttl
-        self.active = {}            # id -> connection dict (+ last_seen)
-        self.closed = OrderedDict() # id -> connection dict (+ closed_at), oldest first
-        self.finalized = {}         # (user, inbound) -> banked cumulative total
-        self.devices = set()        # every device name ever observed
-        self.poll_count = 0
-        self.skipped_rows = 0
-        self.duplicate_rows = 0
+        self.interval = interval
+        self.active = {}    # id -> connection dict
+        self.closed = {}    # id -> connection dict (+ closed_at), recent only
+        self.finalized = {}  # (user, inbound) -> {"uplink": x, "downlink": y}
+        self.devices = set()  # every device name ever observed
+        self.batch_count = 0
+        self.skipped_events = 0      # malformed / unknown-id events (fail-safe)
+        self.duplicate_events = 0    # CLOSED for an already-finalized id
+        self.identity_conflicts = 0  # id tried to change user/inbound (HIGH guard)
+        self.abandoned_on_reset = 0  # active ids dropped by reset without CLOSED
 
-    def poll(self, rows, now):
-        """Feed one API poll (rows list) at timestamp `now`."""
-        rows = rows if isinstance(rows, list) else []
-        self.poll_count += 1
+    def _bank(self, key, uplink, downlink):
+        slot = self.finalized.setdefault(key, {"uplink": 0.0, "downlink": 0.0})
+        slot["uplink"] += uplink
+        slot["downlink"] += downlink
+
+    def _unbank(self, key, uplink, downlink):
+        slot = self.finalized.setdefault(key, {"uplink": 0.0, "downlink": 0.0})
+        slot["uplink"] = max(0.0, slot["uplink"] - uplink)
+        slot["downlink"] = max(0.0, slot["downlink"] - downlink)
+
+    def _identity_conflict(self, conn, fields, now):
+        """HIGH guard: an id keeps its (user, inbound) identity forever.
+
+        A conflicting event never moves accumulated traffic to another device,
+        never overwrites the lifecycle identity and is counted. Returns True
+        when the event may proceed (identity matches or carries none).
+        """
+        incoming = _row_identity(fields)
+        if None in incoming or not all(incoming):
+            return True  # event carries no identity fields to compare
+        current = (conn["user"], conn["inbound"])
+        if incoming == current:
+            return True
+        self.identity_conflicts += 1
+        conn["last_seen"] = now
+        return False
+
+    def _finalize(self, conn, now, closed_at=None):
+        conn["closed_at"] = _to_seconds(closed_at) or conn["closed_at"] or now
+        conn["last_seen"] = now
+        conn["uplink_rate"] = 0.0
+        conn["downlink_rate"] = 0.0
+        key = (conn["user"], conn["inbound"])
+        # bank exactly once, at finalize time
+        self._bank(key, conn["uplink_total"], conn["downlink_total"])
+        self.closed[conn["id"]] = conn
+
+    # -- batch / event application ----------------------------------------------
+
+    def apply_batch(self, batch, now):
+        if not isinstance(batch, dict):
+            self.skipped_events += 1
+            return
+        self.batch_count += 1
+        events = batch.get("events") or []
+        if batch.get("reset"):
+            self._apply_reset(events, now)
+            return
+        for event in events:
+            self._apply_event(event, now)
+
+    def _apply_reset(self, events, now):
+        """reset=true: rebuild the snapshot from the official batch.
+
+        Per the official server implementation the reset batch contains NEW
+        events for all currently ACTIVE connections plus NEW events (with
+        closedAt) for recently CLOSED ones. Active lifecycles present in the
+        batch are refreshed with the authoritative totals (same lifecycle, no
+        double counting). Active ids NOT present in the batch are dropped
+        WITHOUT banking -- the server never confirmed them closed, so banking
+        would be guessing.
+        """
         seen = set()
-        normalized = []
-        for row in rows:
-            item = normalize_row(row)
-            if item is None:
-                self.skipped_rows += 1
+        for event in events:
+            if not isinstance(event, dict):
+                self.skipped_events += 1
                 continue
-            if item["id"] in seen:
-                self.duplicate_rows += 1  # same id twice in one poll: keep first
+            fields = event.get("connection")
+            fields = fields if isinstance(fields, dict) else {}
+            cid = event.get("id") or fields.get("id")
+            user, inbound = _row_identity(fields)
+            if not cid or not user or not inbound:
+                self.skipped_events += 1
                 continue
-            seen.add(item["id"])
-            normalized.append(item)
-
-        for item in normalized:
-            cid = item["id"]
-            existing = self.active.get(cid)
-            if existing is not None:
-                # same lifecycle: totals are monotonic
-                item["total"] = max(existing["total"], item["total"])
-                item["created"] = existing["created"] or item["created"]
+            seen.add(cid)
+            closed_at = _to_seconds(fields.get("closed_at"))
+            if closed_at:
+                self._record_closed_row(cid, fields, now, closed_at)
             else:
-                closed_conn = self.closed.pop(cid, None)
-                if closed_conn is not None:
-                    # reactivation of a recently finalized id: continue the same
-                    # lifecycle and un-bank its total (no double counting)
-                    key = (closed_conn["user"], closed_conn["inbound"])
-                    self.finalized[key] = max(
-                        0.0, self.finalized.get(key, 0.0) - closed_conn["total"])
-                    item["total"] = max(closed_conn["total"], item["total"])
-                    item["created"] = closed_conn["created"] or item["created"]
-            item["last_seen"] = now
-            self.active[cid] = item
-            self.devices.add(item["user"])
+                self._upsert_active(cid, fields, now)
+        for cid in [c for c in list(self.active) if c not in seen]:
+            self.active.pop(cid)
+            self.abandoned_on_reset += 1
 
-        # finalize ids that disappeared from this poll
-        for cid in list(self.active.keys()):
-            if cid in seen:
-                continue
+    def _upsert_active(self, cid, fields, now):
+        existing = self.active.get(cid)
+        if existing is not None:
+            if not self._identity_conflict(existing, fields, now):
+                return
+            # authoritative totals: same lifecycle, values replaced not added
+            existing["uplink_total"] = max(existing["uplink_total"],
+                                           float(fields.get("uplink_total", 0)))
+            existing["downlink_total"] = max(existing["downlink_total"],
+                                             float(fields.get("downlink_total", 0)))
+            existing["last_seen"] = now
+            return
+        closed_conn = self.closed.pop(cid, None)
+        if closed_conn is not None and \
+                (closed_conn["user"], closed_conn["inbound"]) != (fields.get("user"),
+                                                                  fields.get("inbound")):
+            # reactivation with a different identity is a conflict too
+            self.closed[cid] = closed_conn
+            self.identity_conflicts += 1
+            return
+        conn = _new_connection({"id": cid, "user": fields["user"],
+                                "inbound": fields["inbound"],
+                                "inbound_type": fields.get("inbound_type", ""),
+                                "network": fields.get("network", ""),
+                                "source": fields.get("source", ""),
+                                "destination": fields.get("destination", ""),
+                                "created_at": fields.get("created_at"),
+                                "uplink_total": fields.get("uplink_total", 0),
+                                "downlink_total": fields.get("downlink_total", 0)}, now)
+        if closed_conn is not None:
+            # reactivation: continue the same lifecycle, un-bank its totals
+            key = (closed_conn["user"], closed_conn["inbound"])
+            self._unbank(key, closed_conn["uplink_total"], closed_conn["downlink_total"])
+            conn["uplink_total"] = max(closed_conn["uplink_total"], conn["uplink_total"])
+            conn["downlink_total"] = max(closed_conn["downlink_total"], conn["downlink_total"])
+            conn["created_at"] = closed_conn["created_at"] or conn["created_at"]
+        self.active[cid] = conn
+        self.devices.add(conn["user"])
+
+    def _record_closed_row(self, cid, fields, now, closed_at):
+        """A closed connection announced as NEW (reset batches / initial state)."""
+        user, inbound = _row_identity(fields)
+        self.devices.add(user)
+        if cid in self.closed:
+            self.duplicate_events += 1  # already banked once
+            return
+        if cid in self.active:
+            # the active lifecycle received its authoritative closure
             conn = self.active.pop(cid)
-            conn["closed_at"] = now
-            key = (conn["user"], conn["inbound"])
-            # bank the final total once: device totals keep it after the row is
-            # gone, and the closed cache below is display-only
-            self.finalized[key] = self.finalized.get(key, 0.0) + conn["total"]
-            self.closed[cid] = conn
+            conn["uplink_total"] = max(conn["uplink_total"],
+                                       float(fields.get("uplink_total", 0)))
+            conn["downlink_total"] = max(conn["downlink_total"],
+                                         float(fields.get("downlink_total", 0)))
+            self._finalize(conn, now, closed_at=closed_at)
+            return
+        conn = _new_connection({"id": cid, "user": user, "inbound": inbound,
+                                "inbound_type": fields.get("inbound_type", ""),
+                                "network": fields.get("network", ""),
+                                "source": fields.get("source", ""),
+                                "destination": fields.get("destination", ""),
+                                "created_at": fields.get("created_at"),
+                                "uplink_total": fields.get("uplink_total", 0),
+                                "downlink_total": fields.get("downlink_total", 0)}, now)
+        conn["closed_at"] = closed_at or now
+        self._finalize(conn, now, closed_at=conn["closed_at"])
 
-        # prune the recent-closed cache (totals stay banked, nothing drops)
-        expired = [cid for cid, c in self.closed.items()
-                   if now - c["closed_at"] > self.closed_ttl]
-        for cid in expired:
-            del self.closed[cid]
+    def _apply_event(self, event, now):
+        if not isinstance(event, dict):
+            self.skipped_events += 1
+            return
+        etype = event.get("type")
+        cid = event.get("id")
+        fields = event.get("connection") if isinstance(event.get("connection"), dict) else {}
+
+        if etype == "NEW":
+            closed_at = _to_seconds(fields.get("closed_at"))
+            if closed_at:
+                self._record_closed_row(cid or "", fields, now, closed_at)
+                return
+            if not cid:
+                self.skipped_events += 1
+                return
+            user, inbound = _row_identity(fields)
+            if not user or not inbound:
+                self.skipped_events += 1
+                return
+            self._upsert_active(cid, fields, now)
+            return
+
+        if etype == "UPDATE":
+            conn = self.active.get(cid)
+            if conn is None:
+                # UPDATE for an unknown id: fail-safe, never a phantom device
+                self.skipped_events += 1
+                return
+            if fields and not self._identity_conflict(conn, fields, now):
+                return  # identity drift: traffic must not migrate
+            elapsed = max(now - conn["last_seen"], 1e-6)
+            uplink_delta = float(event.get("uplink_delta", 0))
+            downlink_delta = float(event.get("downlink_delta", 0))
+            if "uplink_total" in fields or "downlink_total" in fields:
+                # authoritative totals inside the UPDATE: replace, never add
+                if "uplink_total" in fields:
+                    conn["uplink_total"] = max(conn["uplink_total"],
+                                               float(fields.get("uplink_total", 0)))
+                if "downlink_total" in fields:
+                    conn["downlink_total"] = max(conn["downlink_total"],
+                                                 float(fields.get("downlink_total", 0)))
+            else:
+                conn["uplink_total"] += uplink_delta
+                conn["downlink_total"] += downlink_delta
+            conn["uplink_rate"] = uplink_delta / elapsed
+            conn["downlink_rate"] = downlink_delta / elapsed
+            conn["last_seen"] = now
+            return
+
+        if etype == "CLOSED":
+            conn = self.active.pop(cid, None)
+            if conn is not None:
+                self._finalize(conn, now, closed_at=event.get("closed_at"))
+                return
+            if cid in self.closed:
+                self.duplicate_events += 1  # finalize exactly once
+                return
+            self.skipped_events += 1  # unknown id: no invented traffic
+            return
+
+        self.skipped_events += 1  # unknown event type
 
     def snapshot(self, now):
-        """Aggregate the current state into the debug JSON model."""
+        # prune the recent-closed cache by TTL; banked totals are unaffected
+        # (they live in self.finalized and never decrease)
+        expired = [cid for cid, c in self.closed.items()
+                   if now - c["last_seen"] > self.closed_ttl]
+        for cid in expired:
+            del self.closed[cid]
         per_device_active = {}
         per_device_closed = {}
         for conn in self.active.values():
@@ -208,14 +367,22 @@ class Tracker:
             protocols = {}
             for inbound in proto_names:
                 proto_active = [c for c in active if c["inbound"] == inbound]
-                banked = self.finalized.get((name, inbound), 0.0)
+                banked = self.finalized.get((name, inbound),
+                                            {"uplink": 0.0, "downlink": 0.0})
                 protocols[inbound] = {
+                    "device_name": name,
+                    "inbound": inbound,
                     "active_connections": len(proto_active),
-                    "rate": round(sum(c["rate"] for c in proto_active), 3),
-                    "total": round(sum(c["total"] for c in proto_active) + banked, 3),
+                    "uplink_rate": round(sum((c["uplink_rate"] for c in proto_active), 0.0), 3),
+                    "downlink_rate": round(sum((c["downlink_rate"] for c in proto_active), 0.0), 3),
+                    "uplink_total": round(sum((c["uplink_total"] for c in proto_active), 0.0)
+                                          + banked["uplink"], 3),
+                    "downlink_total": round(sum((c["downlink_total"] for c in proto_active), 0.0)
+                                            + banked["downlink"], 3),
                 }
-            device_total = sum(c["total"] for c in active) + sum(
-                self.finalized.get((name, inbound), 0.0) for inbound in proto_names)
+            banked_all = [self.finalized.get((name, inbound),
+                                             {"uplink": 0.0, "downlink": 0.0})
+                          for inbound in proto_names]
             last_seen_list = [c["last_seen"] for c in active + closed]
             if active:
                 status = STATUS_ACTIVE
@@ -226,106 +393,185 @@ class Tracker:
             recent_conns = sorted(closed, key=lambda c: c["closed_at"],
                                   reverse=True)[:RECENT_CONNECTIONS_MAX]
             devices[name] = {
+                "name": name,
                 "status": status,
                 "protocols": protocols,
                 "active_connections": len(active),
+                "uplink_rate": round(sum((c["uplink_rate"] for c in active), 0.0), 3),
+                "downlink_rate": round(sum((c["downlink_rate"] for c in active), 0.0), 3),
+                "uplink_total": round(sum((c["uplink_total"] for c in active), 0.0)
+                                      + sum((b["uplink"] for b in banked_all), 0.0), 3),
+                "downlink_total": round(sum((c["downlink_total"] for c in active), 0.0)
+                                        + sum((b["downlink"] for b in banked_all), 0.0), 3),
                 "recent_sources": sorted(
                     {c["source"] for c in active + closed if c["source"]}
                 )[:RECENT_SOURCES_MAX],
-                "rate": round(sum(c["rate"] for c in active), 3),
-                "total": round(device_total, 3),
-                "last_activity": max(last_seen_list) if last_seen_list else None,
+                "last_activity": _iso(max(last_seen_list)) if last_seen_list else None,
                 "recent_connections": [
                     {"id": c["id"], "inbound": c["inbound"], "source": c["source"],
-                     "destination": c["destination"], "total": round(c["total"], 3),
-                     "closed_at": c["closed_at"]}
+                     "destination": c["destination"],
+                     "uplink_total": round(c["uplink_total"], 3),
+                     "downlink_total": round(c["downlink_total"], 3),
+                     "closed_at": _iso(c["closed_at"])}
                     for c in recent_conns
                 ],
             }
 
         return {
-            "poll_count": self.poll_count,
-            "skipped_rows": self.skipped_rows,
-            "duplicate_rows": self.duplicate_rows,
+            "batch_count": self.batch_count,
+            "skipped_events": self.skipped_events,
+            "duplicate_events": self.duplicate_events,
+            "identity_conflicts": self.identity_conflicts,
+            "abandoned_on_reset": self.abandoned_on_reset,
             "active_connections": len(self.active),
             "recently_closed": len(self.closed),
             "devices": devices,
         }
 
-
 class Collector:
-    """API adapter + tracker: poll_once() never raises and marks staleness."""
+    """Stream consumer + tracker: consume() never raises and marks staleness.
 
-    def __init__(self, url=DEFAULT_URL, connections_path=DEFAULT_CONNECTIONS_PATH,
-                 timeout=DEFAULT_TIMEOUT, secret=None, closed_ttl=DEFAULT_CLOSED_TTL):
+    Stream failures (connection refused, timeout, EOF, decode error, bad gRPC
+    status) keep the last known state, never finalize anything, never zero any
+    counter, and set ``stale=True`` until a subsequent batch succeeds.
+    """
+
+    def __init__(self, url=DEFAULT_URL, interval=DEFAULT_INTERVAL, secret=None,
+                 closed_ttl=DEFAULT_CLOSED_TTL, stream_factory=None,
+                 clock=time.time):
+        # parse_api_url is fail-closed: non-loopback targets are a fatal
+        # configuration error (credentials must never leave the machine).
         self.url = url
-        self.connections_path = connections_path
-        self.timeout = timeout
+        self.host, self.port = parse_api_url(url)
+        self.interval = interval
         self.secret = secret
-        self.tracker = Tracker(closed_ttl=closed_ttl)
+        self.clock = clock
+        self.tracker = Tracker(closed_ttl=closed_ttl, interval=interval)
+        self.stream_factory = stream_factory or (
+            lambda: SingboxEventStream(url, interval_seconds=interval,
+                                       secret=secret))
         self.stale = False
         self.last_error = None
+        self.last_success_at = None
+        self.consecutive_failures = 0
 
-    def poll_once(self, now=None):
-        now = time.time() if now is None else now
-        try:
-            rows = fetch_connections(self.url, self.connections_path,
-                                     self.timeout, self.secret)
-            self.tracker.poll(rows, now)
-            self.stale = False
-            self.last_error = None
-        except Exception as exc:  # noqa: BLE001 -- any API failure keeps state
-            self.stale = True
-            self.last_error = str(exc)
-        return self.snapshot(now)
+    def _secrets(self):
+        secrets = [self.secret, os.environ.get(SECRET_ENV, "")]
+        return [s for s in secrets if s]
 
-    def snapshot(self, now):
+    def consume(self, duration=None, max_batches=None):
+        """Consume the event stream. Exactly one of duration/max_batches is set.
+
+        Reconnects with capped backoff on stream failure until the duration (or
+        the batch budget) is exhausted. Never raises.
+        """
+        if (duration is None) == (max_batches is None):
+            raise ValueError("consume() needs exactly one of duration/max_batches")
+        start = self.clock()
+        deadline = start + duration if duration is not None else None
+        applied = 0
+        backoff = 0.2
+        secrets = self._secrets()
+        while True:
+            try:
+                for batch in self.stream_factory():
+                    now = self.clock()
+                    self.tracker.apply_batch(batch, now)
+                    applied += 1
+                    self.stale = False
+                    self.consecutive_failures = 0
+                    self.last_success_at = now
+                    self.last_error = None
+                    if max_batches is not None and applied >= max_batches:
+                        return applied
+                    if deadline is not None and self.clock() >= deadline:
+                        return applied
+                raise RuntimeError("event stream ended by the server")
+            except Exception as exc:  # noqa: BLE001 -- stale semantics
+                self.stale = True
+                self.consecutive_failures += 1
+                self.last_error = redact("%s: %s" % (type(exc).__name__, exc),
+                                         secrets)
+                if max_batches is not None and applied >= max_batches:
+                    return applied
+                if deadline is not None:
+                    if self.clock() >= deadline:
+                        return applied
+                    time.sleep(min(backoff, max(0.0, deadline - self.clock())))
+                    backoff = min(backoff * 2, 2.0)
+                else:
+                    return applied  # batch-budget mode: one failure ends it
+
+    def snapshot(self):
+        now = self.clock()
         snap = self.tracker.snapshot(now)
         snap["stale"] = self.stale
-        snap["last_error"] = self.last_error
-        snap["generated_at"] = datetime.datetime.fromtimestamp(
-            now, datetime.timezone.utc).isoformat()
+        snap["last_error"] = redact(self.last_error, self._secrets())
+        snap["last_success_at"] = _iso(self.last_success_at)
+        snap["generated_at"] = _iso(now)
         return snap
 
 
-def main(argv=None):
+def resolve_secret(secret_file):
+    """BOX_API_SECRET environment wins; otherwise read --secret-file (0600)."""
+    env_secret = os.environ.get(SECRET_ENV, "")
+    if env_secret:
+        return env_secret
+    if secret_file:
+        with open(secret_file, encoding="utf-8") as handle:
+            return handle.read().strip()
+    return ""
+
+
+def build_arg_parser():
     parser = argparse.ArgumentParser(
-        description="Monitor v2 E1 collector (API-first, identity = API USER)")
+        description="Monitor v2 E1 collector "
+                    "(API-first, identity = API USER, loopback-only service.api)")
     parser.add_argument("--url", default=DEFAULT_URL,
-                        help="service.api base URL (default: %(default)s, loopback only)")
-    parser.add_argument("--connections-path", default=DEFAULT_CONNECTIONS_PATH,
-                        help="API path (default: %(default)s)")
+                        help="service.api URL; MUST be loopback (default: %(default)s)")
+    parser.add_argument("--interval", type=float, default=DEFAULT_INTERVAL,
+                        help="stream UPDATE pacing in seconds (default: %(default)s)")
     parser.add_argument("--secret-file", default=None,
-                        help="optional file containing the API bearer token")
-    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
+                        help="file holding the API bearer token (mode 0600); "
+                             "%s takes precedence" % SECRET_ENV)
     parser.add_argument("--closed-ttl", type=float, default=DEFAULT_CLOSED_TTL,
                         help="how long finalized ids stay in the recent cache")
+    parser.add_argument("--timeout", type=float, default=5.0,
+                        help="per-read stream timeout in seconds")
     parser.add_argument("--once", action="store_true",
-                        help="poll once, print the JSON state, exit")
-    parser.add_argument("--loop", action="store_true",
-                        help="poll continuously and print one JSON state per poll")
-    parser.add_argument("--interval", type=float, default=DEFAULT_INTERVAL,
-                        help="loop polling interval in seconds (default: %(default)s)")
-    parser.add_argument("--pretty", action="store_true", help="indent the JSON output")
-    args = parser.parse_args(argv)
+                        help="consume the first (reset) batch, print JSON, exit")
+    parser.add_argument("--duration", type=float, default=None,
+                        help="consume the stream for this many seconds, then "
+                             "print the JSON state and exit")
+    parser.add_argument("--pretty", action="store_true", help="indent JSON output")
+    return parser
 
-    secret = None
-    if args.secret_file:
-        with open(args.secret_file, encoding="utf-8") as handle:
-            secret = handle.read().strip()
 
-    collector = Collector(url=args.url, connections_path=args.connections_path,
-                          timeout=args.timeout, secret=secret,
-                          closed_ttl=args.closed_ttl)
-    if args.loop:
-        try:
-            while True:
-                print(json.dumps(collector.poll_once(), sort_keys=True), flush=True)
-                time.sleep(args.interval)
-        except KeyboardInterrupt:
-            return 0
-    snap = collector.poll_once()
-    print(json.dumps(snap, indent=2 if args.pretty else None, sort_keys=True))
+def main(argv=None):
+    args = build_arg_parser().parse_args(argv)
+    secret = resolve_secret(args.secret_file)
+
+    def factory():
+        return SingboxEventStream(args.url, interval_seconds=args.interval,
+                                  secret=secret, timeout=args.timeout)
+
+    try:
+        collector = Collector(url=args.url, interval=args.interval,
+                              secret=secret, closed_ttl=args.closed_ttl,
+                              stream_factory=factory)
+    except ConfigurationError as exc:
+        print("fatal configuration error: %s" % exc, file=sys.stderr)
+        return 2
+
+    if args.once:
+        collector.consume(max_batches=1)
+    elif args.duration is not None:
+        collector.consume(duration=args.duration)
+    else:
+        print("nothing to do: pass --once or --duration SECONDS", file=sys.stderr)
+        return 2
+    print(json.dumps(collector.snapshot(), indent=2 if args.pretty else None,
+                     sort_keys=True))
     return 0
 
 

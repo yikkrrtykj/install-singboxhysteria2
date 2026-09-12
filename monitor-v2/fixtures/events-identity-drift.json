@@ -1,0 +1,19 @@
+{
+  "reset": false,
+  "events": [
+    {
+      "type": "UPDATE",
+      "id": "r1",
+      "uplink_delta": 1,
+      "downlink_delta": 1,
+      "connection": {
+        "id": "r1",
+        "user": "vmix-02",
+        "inbound": "hy2-in",
+        "inbound_type": "hysteria2",
+        "uplink_total": 999999,
+        "downlink_total": 999999
+      }
+    }
+  ]
+}
