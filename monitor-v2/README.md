@@ -14,9 +14,13 @@ daemon.StartedService/SubscribeConnections   （server-streaming）
 ```
 
 适配器实现在 `monitor-v2/api_bridge/`：纯 Python 标准库的**最小 gRPC-Web 客户端**
-（`application/grpc-web+proto`，标准 length-prefixed 帧），protobuf 字段号逐条对照
+（`application/grpc-web+proto`，原生 socket + select 读流），protobuf 字段号逐条对照
 官方 `daemon/started_service.proto`（tag v1.14.0），未 vendor 任何 Go module，
 未解析人类可读表格，未使用任何 Clash REST 端点（旧 Clash `/connections` 与本实现无关）。
+
+**请求方向同样使用 length-prefixed 帧**：`0x00 + 4 字节大端长度 + protobuf`
+（官方 web_bridge 只改 Content-Type 后原样转发 body，不会替客户端补 envelope）；
+响应方向是 `0x00` 数据帧流 + 结尾 `0x80` trailer 帧（grpc-status）。
 
 ## 官方事件语义（已对照 v1.14.0 源码 daemon/started_service.go 确认，非猜测）
 
@@ -38,13 +42,20 @@ ConnectionEvents { events[]; reset }
 ```text
 reset=true   -> 用该批次重建快照：批内活跃 id 沿用同一 lifecycle 并刷新权威 totals；
                 批内 closedAt 行直接入库（bank 一次）；
-                批外旧活跃 id 丢弃但不 bank（服务端未确认 CLOSED，不猜测）
+                批外旧活跃 id 记为 ABANDONED：不假装 CLOSED、不显示 RECENT，
+                但把最后已知 totals 作为 lower bound 入账（累计永不倒退）；
+                该 id 后重新出现时先撤销 lower bound 再继续
 NEW          -> 活跃 lifecycle 建立/刷新（totals 权威值，非累加）
 UPDATE       -> 无 Connection 对象：totals += delta；
                 有 Connection 对象：totals = 权威值（替换，绝不双算）
-CLOSED       -> 精确 finalize 一次：最终 totals 一次性 bank 进 device/protocol，
-                行进入 recent 缓存；重复 CLOSED 只计数不重复 bank
-流失败        -> stale=true，保留 last state，不生成 CLOSED、不清零任何计数
+CLOSED       -> 正常携带最终 Connection（含最后一个 ticker 之后传播的流量）：
+                先做 identity guard，再用其权威 totals 刷新，然后精确 finalize 一次
+防重账守卫    -> 服务端在每次 reset 里重放最近约 1000 条 closed 连接；
+                独立的 LRU banked-id 守卫（4096 条，先于展示缓存判定）
+                保证同一 id 永远只 bank 一次，与 10 分钟展示 TTL 完全解耦
+流失败        -> stale=true，保留 last state，不生成 CLOSED、不清零任何计数；
+                连接/响应头有超时上限，但流 body 可以长期静默（官方空闲时
+                不发送任何批次）——静默产生心跳批次，绝不误判 stale 或重连
 ```
 
 ## 身份模型（不可变）
@@ -134,17 +145,25 @@ python3 monitor-v2/collector.py --secret-file /root/sbox/api.secret --duration 3
 ## 生命周期状态语义（诚实版）
 
 只输出 `ACTIVE` / `RECENT ACTIVITY` / `IDLE`。**没有** `ONLINE / OFFLINE / Tunnel Down`。
+`RECENT ACTIVITY` 按**真实 closed_at** 判定（不是收到事件的时间）：reset 重放的很久以前
+关闭的连接不会重新伪装成近期活动。
 HY2 多个逻辑连接共享同一 QUIC source endpoint 属正常现象，按独立 ID 分别计数，不合并。
 
 ## 测试
 
 ```bash
-# E1 回归（62 断言：E1-01..E1-18 + 官方事件 fixture + T10 真实 gRPC-Web wire 环回）
+# E1 回归（101 断言：E1-01..E1-22 + 官方事件 fixture + T10 请求/响应双向真帧验证 +
+# T11 空闲流心跳）。脚本末尾只有唯一 exit，并用 EXPECTED_PASS 门槛强制
+# “跑满 101 且全过”才算成功。
 bash tests/test-monitor-v2-e1.sh
 
 # Linux 集成（仅当 /root/sbox/sing-box 与 127.0.0.1:9091 存在时执行，否则 SKIP）
 bash tests/monitor-v2-integration-e1.sh
 ```
+
+集成脚本 phase 2 会在真实客户端流量下检查 USER / INBOUND / lifecycle /
+uplink+downlink 变化 / 关闭证据；无流量时报 INCONCLUSIVE 而不是 PASS；
+可设 `EXPECT_USER=legacy` 断言指定用户；`SOURCE_PRESENT` 只输出布尔值。
 
 测试 fixture 位于 `monitor-v2/fixtures/events-*.json`，字段与官方 proto 对应
 （NEW/UPDATE/CLOSED、reset、uplinkDelta/downlinkDelta、uplinkTotal/downlinkTotal）。
