@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# monitor-service -- runtime entrypoint of singbox-monitor.service (skeleton).
+#
+# Modes (monitor.conf SBMON_MODE):
+#   collector-loop  REAL, E1-only: run the E1 collector in cycles, atomically
+#                   writing each snapshot to <state>/snapshot.json. No web, no
+#                   listening socket. This is the honest default until E2 lands.
+#   web             DEFERRED E2 HOOK: requires app/web/serve entry deployed by
+#                   the E2 integration conversation. Fail-closed otherwise.
+#
+# Journal hygiene: collector stdout (snapshot JSON, contains client metadata)
+# is redirected to the 0700 state dir, never to journald. Only lifecycle
+# messages from this shim reach the journal.
+set -Eeuo pipefail
+
+CONF="${1:-/etc/singbox-monitor/monitor.conf}"
+SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/monitor-env.sh
+source "$SELF_DIR/../lib/monitor-env.sh"
+
+APP_DIR="$(cd -- "$SELF_DIR/.." && pwd)"
+
+SBMON_ENV_MODE=""
+SBMON_ENV_API_URL=""
+SBMON_ENV_API_SECRET_FILE=""
+SBMON_ENV_CYCLE_SECONDS=""
+monitor_env_load "$CONF" || { echo "monitor-service: cannot read conf" >&2; exit 1; }
+
+MODE="${SBMON_ENV_MODE:-collector-loop}"
+API_URL="${SBMON_ENV_API_URL:-http://127.0.0.1:9091}"
+CYCLE_SECONDS="${SBMON_ENV_CYCLE_SECONDS:-300}"
+# systemd sets WorkingDirectory=@SBMON_STATE_ROOT@; the snapshot lives at
+# <state-root>/state/snapshot.json. SBMON_STATE_DIR overrides for tests.
+STATE_DIR="${SBMON_STATE_DIR:-$PWD/state}"
+COLLECTOR="$APP_DIR/app/collector/collector.py"
+
+log() { echo "monitor-service: $*"; }
+
+child_pid=""
+terminate() {
+    if [ -n "$child_pid" ]; then
+        kill "$child_pid" 2>/dev/null || true
+    fi
+    exit 0
+}
+trap terminate TERM INT
+
+run_collector_loop() {
+    local pybin="${SBMON_PYTHON3:-python3}"
+    [ -f "$COLLECTOR" ] || { log "collector.py missing in $APP_DIR"; exit 1; }
+    command -v "$pybin" >/dev/null 2>&1 || { log "python3 not found"; exit 1; }
+    mkdir -p "$STATE_DIR"
+
+    local secret_args=()
+    if [ -n "${SBMON_ENV_API_SECRET_FILE:-}" ] && [ -f "$SBMON_ENV_API_SECRET_FILE" ]; then
+        secret_args=(--secret-file "$SBMON_ENV_API_SECRET_FILE")
+    fi
+
+    log "mode=collector-loop cycle=${CYCLE_SECONDS}s target=<loopback service.api>"
+    local first=1
+    while :; do
+        local tmp="$STATE_DIR/.snapshot.json.tmp"
+        local -a mode_args=(--duration "$CYCLE_SECONDS")
+        # First snapshot immediately (--once consumes the authoritative reset
+        # batch and exits) so health sees a fresh snapshot seconds after start.
+        if [ "$first" = 1 ]; then
+            mode_args=(--once)
+            first=0
+        fi
+        # stdout -> temp file; only on clean exit it becomes the new snapshot.
+        # stderr stays on journald: the collector redacts secrets by contract.
+        local rc=0
+        "$pybin" "$COLLECTOR" --url "$API_URL" "${mode_args[@]}" \
+            "${secret_args[@]+"${secret_args[@]}"}" > "$tmp" &
+        child_pid=$!
+        wait "$child_pid" || rc=$?
+        child_pid=""
+        if [ "$rc" = 0 ]; then
+            mv -f -- "$tmp" "$STATE_DIR/snapshot.json"
+        else
+            rm -f -- "$tmp"
+        fi
+        # Stream ended or API unreachable: brief pause, then reconnect. The
+        # first message of every new subscription is a full authoritative
+        # reset, so state rebuilds without external persistence.
+        sleep 5 &
+        child_pid=$!
+        wait "$child_pid" || true
+        child_pid=""
+    done
+}
+
+run_web() {
+    # E2 hook: the web app ships its own entry at app/web/serve (name NOT
+    # finalized by the E2 conversation yet). Until then this mode refuses to
+    # run so the unit state honestly shows "not implemented" instead of
+    # silently doing nothing.
+    if [ -x "$APP_DIR/app/web/serve" ]; then
+        exec "$APP_DIR/app/web/serve" "$CONF"
+    fi
+    log "mode=web requested but no app/web/serve entry deployed (E2 pending)"
+    exit 21
+}
+
+case "$MODE" in
+    collector-loop) run_collector_loop ;;
+    web)            run_web ;;
+    *) log "unknown SBMON_MODE: $MODE"; exit 1 ;;
+esac

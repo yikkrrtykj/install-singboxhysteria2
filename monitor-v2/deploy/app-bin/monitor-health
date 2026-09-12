@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# monitor-health -- health probe for singbox-monitor (skeleton).
+#
+# Reports SEPARATE signals (never one merged health=true):
+#   service_active  -- systemd unit is active (web/collector process alive)
+#   api_reachable   -- sing-box service.api TCP endpoint answers (loopback)
+#   snapshot        -- collector snapshot present + fresh (stale state guard)
+#   web_http        -- E2 dashboard HTTP endpoint; not-applicable until E2 ships
+#
+# Exit codes: 0 healthy | 1 unhealthy (service down) | 2 degraded
+# (service up but api unreachable and/or snapshot stale/missing).
+# Output is a single JSON line; no conf values, no snapshot data, no secrets.
+set -Eeuo pipefail
+
+CONF="${1:-/etc/singbox-monitor/monitor.conf}"
+QUIET=0
+[ "${2:-}" = "--quiet" ] && QUIET=1
+
+SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/monitor-env.sh
+source "$SELF_DIR/../lib/monitor-env.sh"
+
+SBMON_SYSTEMCTL="${SBMON_SYSTEMCTL:-systemctl}"
+SBMON_SERVICE_NAME="${SBMON_SERVICE_NAME:-singbox-monitor}"
+
+SBMON_ENV_MODE=""
+SBMON_ENV_API_URL=""
+SBMON_ENV_CYCLE_SECONDS=""
+monitor_env_load "$CONF" || { echo '{"error":"conf unreadable"}'; exit 1; }
+
+MODE="${SBMON_ENV_MODE:-collector-loop}"
+API_URL="${SBMON_ENV_API_URL:-http://127.0.0.1:9091}"
+CYCLE_SECONDS="${SBMON_ENV_CYCLE_SECONDS:-300}"
+STATE_DIR="${SBMON_STATE_DIR:-$PWD/state}"
+
+service_active=false
+if "$SBMON_SYSTEMCTL" is-active --quiet "$SBMON_SERVICE_NAME" 2>/dev/null; then
+    service_active=true
+fi
+
+api_reachable=false
+if monitor_env_split_url "$API_URL" \
+   && monitor_env_tcp_probe "$REPLY_HOST" "$REPLY_PORT" 2; then
+    api_reachable=true
+fi
+
+snapshot_present=false
+snapshot_stale=true
+snapshot_age=-1
+SNAP="$STATE_DIR/snapshot.json"
+if [ -f "$SNAP" ]; then
+    snapshot_present=true
+    now="$(monitor_env_now)"
+    mtime="$(monitor_env_mtime "$SNAP")"
+    snapshot_age=$(( now - mtime ))
+    # Two full collection cycles without a new snapshot == stale.
+    max_age=$(( CYCLE_SECONDS * 2 + 30 ))
+    if (( snapshot_age >= 0 && snapshot_age <= max_age )); then
+        snapshot_stale=false
+    fi
+fi
+
+web_http="not-applicable"
+if [ "$MODE" = "web" ]; then
+    # E2 hook: integration conversation extends this branch with an HTTP
+    # probe of SBMON_WEB_BIND (e.g. GET /healthz). Until that exists the
+    # field reports "unimplemented" and does not block degraded/healthy.
+    web_http="unimplemented"
+fi
+
+overall="healthy"
+if [ "$service_active" != true ]; then
+    overall="unhealthy"
+elif [ "$api_reachable" != true ] || [ "$snapshot_stale" = true ]; then
+    overall="degraded"
+fi
+
+json=$(printf '{"service_active":%s,"api_reachable":%s,"snapshot":{"present":%s,"age_seconds":%s,"stale":%s},"web_http":"%s","mode":"%s","overall":"%s"}' \
+    "$service_active" "$api_reachable" "$snapshot_present" "$snapshot_age" "$snapshot_stale" \
+    "$web_http" "$MODE" "$overall")
+
+if [ "$QUIET" = 1 ]; then
+    printf '%s\n' "$json"
+else
+    printf '%s\n' "$json"
+fi
+
+case "$overall" in
+    healthy)   exit 0 ;;
+    degraded)  exit 2 ;;
+    unhealthy) exit 1 ;;
+esac
