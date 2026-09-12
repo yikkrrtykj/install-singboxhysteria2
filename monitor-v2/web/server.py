@@ -27,8 +27,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
 from web.access import host_entry_for_ip
-from web.recovery import (RECOVERY_SUCCESS_MESSAGE, RecoveryRateLimiter,
-                          generate_key)
+from web.recovery import (RECOVERY_SUCCESS_MESSAGE, RecoveryGlobalGuard,
+                          RecoveryRateLimiter, generate_key)
 
 MONITOR_WEB_VERSION = "0.1.0-e2"
 SESSION_COOKIE = "monitor_session"
@@ -67,7 +67,8 @@ class MonitorWebApp:
     """Wiring shared by all requests: broker + access policy + auth."""
 
     def __init__(self, broker, access, static_dir, auth=None,
-                 remote_mode=False, version=MONITOR_WEB_VERSION):
+                 remote_mode=False, version=MONITOR_WEB_VERSION,
+                 recovery_guard=None):
         self.broker = broker
         self.access = access
         self.auth = auth
@@ -75,6 +76,7 @@ class MonitorWebApp:
         self.remote_mode = remote_mode
         self.version = version
         self.recovery_limiter = RecoveryRateLimiter()
+        self.recovery_guard = recovery_guard or RecoveryGlobalGuard()
         self._static_cache = {}
 
     def static_file(self, name):
@@ -432,15 +434,29 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
                                "again later", "retry_after": retry_after},
                 extra_headers=[("Retry-After", str(retry_after))])
             return
-        if not auth.verify_recovery_key(key):
-            limiter.record_failure(remote)
-            self._send_json(403, {"error": "invalid recovery key"})
+        # Global budget (all source addresses): rolling-window attempt cap
+        # plus scrypt concurrency cap. A rejected caller consumes NO scrypt
+        # work -- the guard is checked before any verification happens.
+        acquired, guard_retry = self.app.recovery_guard.try_acquire()
+        if not acquired:
+            self._send_json(
+                429, {"error": "recovery verification is busy; try again "
+                               "later", "retry_after": guard_retry},
+                extra_headers=[("Retry-After", str(guard_retry))])
             return
-        limiter.record_success(remote)
-        entry = host_entry_for_ip(remote)
-        self.app.access.add(entry)
-        self._send_json(200, {"status": "ok", "ip": remote, "entry": entry,
-                              "message": RECOVERY_SUCCESS_MESSAGE})
+        try:
+            if not auth.verify_recovery_key(key):
+                limiter.record_failure(remote)
+                self._send_json(403, {"error": "invalid recovery key"})
+                return
+            limiter.record_success(remote)
+            entry = host_entry_for_ip(remote)
+            self.app.access.add(entry)
+            self._send_json(
+                200, {"status": "ok", "ip": remote, "entry": entry,
+                      "message": RECOVERY_SUCCESS_MESSAGE})
+        finally:
+            self.app.recovery_guard.release()
 
     def _handle_recovery_rotate(self, session):
         """POST /api/v1/recovery/rotate {current_password} -> new key once."""
