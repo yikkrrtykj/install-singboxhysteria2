@@ -130,10 +130,13 @@ sbmon_atomic_write() { # sbmon_atomic_write <path> <mode> [group]  (content on s
 # SBMON_REAL_CHGRP=1 delegate these checks to the root Linux CI gate.)
 sbmon_verify_runtime_meta() { # sbmon_verify_runtime_meta <path> <mode>
     local path="$1" want_mode="$2"
+    # compare modes numerically in octal ("640" == "0640")
+    sbmon_norm8() { printf '%o
+' "$(( 8#$1 ))"; }
     [ -f "$path" ] || sbmon_die "runtime 文件不是普通文件: $path（fail-closed）"
     local mode
     mode="$(stat -c '%a' "$path")"
-    if [ "$mode" != "$want_mode" ]; then
+    if [ "$(sbmon_norm8 "$mode")" != "$(sbmon_norm8 "$want_mode")" ]; then
         chmod "$want_mode" "$path" || sbmon_die "权限修复失败（$path -> $want_mode）：fail-closed"
     fi
     if [ "$SBMON_FIXTURE" = "1" ] && [ "${SBMON_REAL_CHGRP:-0}" != "1" ]; then
@@ -153,7 +156,7 @@ sbmon_verify_runtime_meta() { # sbmon_verify_runtime_meta <path> <mode>
     # post-repair verification: contract must actually hold
     [ "$(stat -c '%u' "$path")" = "0" ] || sbmon_die "owner 仍非 root（$path）：fail-closed"
     [ "$(stat -c '%g' "$path")" = "$want_gid" ] || sbmon_die "组仍非 $SBMON_GROUP（$path）：fail-closed"
-    [ "$(stat -c '%a' "$path")" = "$want_mode" ] || sbmon_die "权限仍非 $want_mode（$path）：fail-closed"
+    [ "$(sbmon_norm8 "$(stat -c '%a' "$path")")" = "$(sbmon_norm8 "$want_mode")" ]         || sbmon_die "权限仍非 $want_mode（$path）：fail-closed"
 }
 
 # ---------------------------------------------------------------------------
