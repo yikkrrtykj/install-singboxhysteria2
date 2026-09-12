@@ -1,0 +1,57 @@
+{
+  "downloadTotal": 47233412,
+  "uploadTotal": 8123456,
+  "connections": [
+    {
+      "id": "6f9619ff-8b86-d011-b42d-00c04fc964ff",
+      "metadata": {
+        "network": "tcp",
+        "type": "Hysteria2",
+        "sourceIP": "127.0.0.1",
+        "destinationIP": "203.0.113.10",
+        "sourcePort": "51001",
+        "destinationPort": "8443",
+        "host": "example.com"
+      },
+      "upload": 12000,
+      "download": 340000,
+      "start": "2026-09-12T10:00:05.123+08:00",
+      "chains": ["PROXY", "vmix-01-HY2"],
+      "rule": "DomainSuffix",
+      "rulePayload": "example.com"
+    },
+    {
+      "id": "a8098c1a-f86e-11da-bd1a-00112444be1e",
+      "metadata": {
+        "network": "udp",
+        "type": "Hysteria2",
+        "sourceIP": "127.0.0.1",
+        "sourcePort": "51002",
+        "destinationPort": "443"
+      },
+      "upload": 900,
+      "download": 52000,
+      "start": "2026-09-12T10:01:00.000+08:00",
+      "chains": ["PROXY", "vmix-01-HY2"],
+      "rule": "GeoIP",
+      "rulePayload": "CN"
+    },
+    {
+      "id": "b0e3f2b2-2b1c-4a5f-9e01-3f1e2d3c4b5a",
+      "metadata": {
+        "network": "tcp",
+        "type": "Shadowsocks",
+        "sourceIP": "127.0.0.1",
+        "sourcePort": "51003",
+        "destinationPort": "443"
+      },
+      "upload": 5000,
+      "download": 910000,
+      "start": "2026-09-12T10:02:12.500+08:00",
+      "chains": ["PROXY", "香港-01"],
+      "rule": "Match",
+      "rulePayload": ""
+    }
+  ],
+  "memory": 26214400
+}
