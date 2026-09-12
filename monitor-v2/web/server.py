@@ -18,6 +18,7 @@ frontend is served from local static assets only (CSP ``default-src
 
 from __future__ import annotations
 
+import hmac
 import json
 import sys
 import traceback
@@ -206,23 +207,28 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         self._send_json(404, {"error": "not found"})
 
     def _route_post(self, path, remote):
+        if self._cross_origin():
+            self._send_json(403, {"error": "cross-origin request rejected"})
+            return
         if path == "/api/v1/login":
             self._handle_login(remote)
             return
         if path == "/api/v1/logout":
-            self._require_session(self._handle_logout)
+            self._require_session(self._handle_logout, csrf=True)
             return
         if path == "/api/v1/password":
-            self._require_session(self._handle_password, remote)
+            self._require_session(self._handle_password, remote, csrf=True)
             return
         if path == "/api/v1/whitelist":
-            self._require_session(self._handle_whitelist_add, remote)
+            self._require_session(self._handle_whitelist_add, remote,
+                                  csrf=True)
             return
         if path == "/api/v1/whitelist/remove":
-            self._require_session(self._handle_whitelist_remove, remote)
+            self._require_session(self._handle_whitelist_remove, remote,
+                                  csrf=True)
             return
         if path == "/api/v1/recovery/rotate":
-            self._require_session(self._handle_recovery_rotate)
+            self._require_session(self._handle_recovery_rotate, csrf=True)
             return
         self._send_json(404, {"error": "not found"})
 
@@ -280,12 +286,35 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             self._consumed = length
         return data if isinstance(data, dict) else None
 
-    def _require_session(self, handler, *args):
+    def _require_session(self, handler, *args, csrf=False):
+        """Resolve the session; for mutations also enforce the session-bound
+        CSRF token (primary defence) and the same-origin check (second
+        layer). The session cookie stays HttpOnly; the CSRF token is the
+        only one of the pair the browser scripting context may hold."""
         session = self.app.session_from_token(self._session_token())
         if session is None:
             self._send_json(401, {"error": "login required"})
             return
+        if csrf:
+            supplied = self.headers.get("X-CSRF-Token")
+            expected = session.get("csrf_token", "")
+            if not isinstance(supplied, str) or \
+                    not hmac.compare_digest(supplied, expected):
+                self._send_json(403,
+                                {"error": "missing or invalid CSRF token"})
+                return
         handler(session, *args)
+
+    def _cross_origin(self):
+        """True when the browser declared a foreign Origin (second CSRF
+        layer). Tools that send no Origin are NOT affected here -- they
+        still face the CSRF-token contract above."""
+        origin = self.headers.get("Origin")
+        if not origin:
+            return False
+        host = self.headers.get("Host", "")
+        scheme = getattr(self.server, "scheme", "http")
+        return origin.rstrip("/") != ("%s://%s" % (scheme, host)).rstrip("/")
 
     # -- responses ---------------------------------------------------------------
 
@@ -324,7 +353,7 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
 
     def _handle_session_info(self, remote):
         session = self.app.session_from_token(self._session_token())
-        self._send_json(200, {
+        payload = {
             "authenticated": session is not None,
             "current_ip": remote,
             "whitelist_allowed": True,  # the request already passed the gate
@@ -333,7 +362,12 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             "recovery_configured": self.app.recovery_configured(),
             "remote_mode": self.app.remote_mode,
             "version": self.app.version,
-        })
+        }
+        if session is not None:
+            # The CSRF half of the session: safe to expose to the page's own
+            # scripting context, unlike the HttpOnly session cookie.
+            payload["csrf_token"] = session.get("csrf_token")
+        self._send_json(200, payload)
 
     def _handle_login(self, remote):
         """POST /api/v1/login {password} -> session cookie.
@@ -549,6 +583,7 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
 def build_server(app, host, port, tls_context=None):
     server = MonitorHTTPServer((host, port), MonitorRequestHandler)
     server.app = app
+    server.scheme = "https" if tls_context is not None else "http"
     if tls_context is not None:
         server.socket = tls_context.wrap_socket(server.socket, server_side=True)
     return server

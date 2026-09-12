@@ -132,7 +132,9 @@ class SessionStore:
     def create(self):
         now = self._clock()
         token = secrets.token_urlsafe(32)
-        self._sessions[token] = {"created": now, "expires": now + self.ttl}
+        record = {"created": now, "expires": now + self.ttl,
+                  "csrf_token": secrets.token_urlsafe(32)}
+        self._sessions[token] = record
         return token
 
     def resolve(self, token):

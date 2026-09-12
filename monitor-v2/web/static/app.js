@@ -92,6 +92,10 @@
 
   /* ---------- API ---------- */
 
+  // Login and recovery bootstrap run BEFORE a session (and therefore a CSRF
+  // token) exists; every other mutation carries the session-bound token.
+  var CSRF_EXEMPT_PATHS = /^\/api\/v1\/(login|recovery)$/;
+
   function api(path, options) {
     options = options || {};
     var init = {
@@ -102,6 +106,10 @@
     if (options.body !== undefined) {
       init.headers["Content-Type"] = "application/json";
       init.body = JSON.stringify(options.body);
+      if (!CSRF_EXEMPT_PATHS.test(path) && state.session &&
+          state.session.csrf_token) {
+        init.headers["X-CSRF-Token"] = state.session.csrf_token;
+      }
     }
     return fetch(path, init).then(function (response) {
       return response.json().catch(function () { return {}; }).then(function (data) {
