@@ -330,103 +330,8 @@ show_client_configuration() {
 
   show_notice "Mihomo/Clash Meta客户端配置参数"
   mihomo_config_path="/root/sbox/mihomo_client.yaml"
-cat > "$mihomo_config_path" << EOF || error "保存 Mihomo 客户端配置失败"
-mixed-port: 7897
-allow-lan: true
-bind-address: "*"
-mode: rule
-log-level: info
-unified-delay: true
-ipv6: true
-profile:
-  store-selected: true
-  store-fake-ip: true
-dns:
-  enable: true
-  listen: "0.0.0.0:53"
-  ipv6: true
-  enhanced-mode: fake-ip
-  fake-ip-range: 198.18.0.1/16
-  default-nameserver: 
-    - 223.5.5.5
-    - 8.8.8.8
-  nameserver:
-    - https://dns.alidns.com/dns-query
-    - https://doh.pub/dns-query
-  fallback:
-    - https://1.0.0.1/dns-query
-    - tls://dns.google
-  fallback-filter:
-    geoip: true
-    geoip-code: CN
-    ipcidr:
-      - 240.0.0.0/4
-
-tun:
-  enable: true
-  stack: mixed
-  device: Mihomo
-  mtu: 1420
-  auto-route: true
-  auto-redirect: true
-  auto-detect-interface: true
-  dns-hijack:
-    - any:53
-    - tcp://any:53
-
-proxies:
-  - name: Reality
-    type: vless
-    server: $server_ip
-    port: $reality_port
-    uuid: $reality_uuid
-    network: tcp
-    udp: true
-    tls: true
-    flow: xtls-rprx-vision
-    servername: $reality_server_name
-    client-fingerprint: chrome
-    reality-opts:
-      public-key: $public_key
-      short-id: $short_id
-
-  - name: Hysteria2
-    type: hysteria2
-    server: $server_ip
-${hy_clash_port_yaml}
-    password: $hy_password
-    up: "300 Mbps"
-    down: "300 Mbps"
-    sni: $hy_server_name
-    skip-cert-verify: true
-    alpn:
-      - h3
-
-proxy-groups:
-  - name: 节点选择
-    type: select
-    proxies:
-      - Reality
-      - Hysteria2
-      - 自动选择
-      - DIRECT
-
-  - name: 自动选择
-    type: url-test
-    proxies:
-      - Reality
-      - Hysteria2
-    url: "http://www.gstatic.com/generate_204"
-    interval: 300
-    tolerance: 50
-
-
-rules:
-  - GEOIP,LAN,DIRECT
-  - GEOIP,CN,DIRECT
-  - MATCH,节点选择
-
-EOF
+  # 共享账号（users[0]）的展示路径；多客户端请用"客户端管理 -> 生成客户端配置"
+  write_mihomo_template "$mihomo_config_path" || error "保存 Mihomo 客户端配置失败"
   chmod 0600 "$mihomo_config_path" || error "设置 Mihomo 客户端配置权限失败"
   cat "$mihomo_config_path"
   echo ""
@@ -789,6 +694,716 @@ EOF
   fi
 
 }
+
+# >>> phase-c client-management >>> ============================================
+# Phase C: multi-client identity management.
+#
+# Single source of truth remains /root/sbox/sbconfig_server.json (no clients.json).
+# Every logical client is ONE name present in BOTH inbounds:
+#   vless-in.users[] -> {"name": ..., "uuid": ..., "flow": "xtls-rprx-vision"}
+#   hy2-in.users[]   -> {"name": ..., "password": ...}
+# Hard rule: Reality name == HY2 name == device_id.
+# The name "legacy" is RESERVED: it labels the pre-Phase-C shared account,
+# is never created through "add client" and never deleted by this version.
+# Everything under /root/sbox/clients/ is DERIVED output; it can always be
+# regenerated from the server config.
+SB_SERVER_CONFIG="${SB_SERVER_CONFIG:-/root/sbox/sbconfig_server.json}"
+SB_STATE_FILE="${SB_STATE_FILE:-/root/sbox/config}"
+SB_CLIENTS_DIR="${SB_CLIENTS_DIR:-/root/sbox/clients}"
+SB_SING_BOX_BIN="${SB_SING_BOX_BIN:-/root/sbox/sing-box}"
+SB_LOCK_FILE="${SB_LOCK_FILE:-/root/sbox/config.lock}"
+RESERVED_CLIENT_NAME="legacy"
+CLIENT_NAME_PATTERN='^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$'
+REALITY_INBOUND_TAG="vless-in"
+HY2_INBOUND_TAG="hy2-in"
+REALITY_FLOW="xtls-rprx-vision"
+
+validate_client_name() { # validate_client_name <name> -> rc 0 if allowed
+    local name="$1"
+    [ -n "$name" ] || return 1
+    [[ "$name" =~ $CLIENT_NAME_PATTERN ]] || return 1
+    return 0
+}
+
+# Runs "$@" while holding the exclusive config lock (fd 9), so two management
+# operations can never mutate sbconfig_server.json concurrently.
+with_client_lock() {
+    if command -v flock >/dev/null 2>&1; then
+        if mkdir -p "$(dirname "$SB_LOCK_FILE")" 2>/dev/null &&
+           exec 9>>"$SB_LOCK_FILE" 2>/dev/null && flock 9 2>/dev/null; then
+            "$@"
+            local rc=$?
+            exec 9>&- 2>/dev/null
+            return $rc
+        fi
+        warning "无法获取配置锁 ($SB_LOCK_FILE)，单机低并发场景下继续执行"
+    fi
+    "$@"
+}
+
+get_reality_client_names() { # [config] -> one name per line ("" = unnamed user)
+    jq -r --arg tag "$REALITY_INBOUND_TAG" \
+        '.inbounds[] | select(.tag == $tag) | .users[]? | (.name // "")' \
+        "${1:-$SB_SERVER_CONFIG}" 2>/dev/null | tr -d '\r'
+}
+
+get_hy2_client_names() { # [config] -> one name per line ("" = unnamed user)
+    jq -r --arg tag "$HY2_INBOUND_TAG" \
+        '.inbounds[] | select(.tag == $tag) | .users[]? | (.name // "")' \
+        "${1:-$SB_SERVER_CONFIG}" 2>/dev/null | tr -d '\r'
+}
+
+# Structural precheck only: root must be an object, .inbounds must exist and be
+# an array, vless-in/hy2-in must each appear EXACTLY once, and their users
+# field must exist and be an array. Deliberately separate from the identity
+# audit: legacy migration must accept users WITHOUT names, so it runs only
+# this check before counting unnamed users. The jq exit code propagates to the
+# function: any runtime error means FAIL, never "no problems".
+client_structure_problems() { # client_structure_problems <config> -> prints problem lines
+    jq -r '
+      if (type != "object") then ["配置根节点不是 object"]
+      elif ((.inbounds // null) | type) != "array" then
+        (if (.inbounds // null) == null then ["缺少 inbounds 字段"] else ["inbounds 不是数组"] end)
+      else
+        (
+          ([.inbounds[] | select(.tag == "vless-in")]) as $ri |
+          ([.inbounds[] | select(.tag == "hy2-in")]) as $hi |
+          ([]
+            + (if ($ri | length) == 0 then ["缺少 vless-in 入站"] else [] end)
+            + (if ($ri | length) > 1 then ["vless-in 入站数量不是 1（实际 \($ri | length) 个）"] else [] end)
+            + (if ($hi | length) == 0 then ["缺少 hy2-in 入站"] else [] end)
+            + (if ($hi | length) > 1 then ["hy2-in 入站数量不是 1（实际 \($hi | length) 个）"] else [] end)
+            + (if ($ri | length) == 1 then
+                 (if ($ri[0] | has("users") | not) then ["vless-in 缺少 users 字段"]
+                  elif (($ri[0].users) | type) != "array" then ["vless-in 的 users 不是数组"]
+                  else [] end)
+               else [] end)
+            + (if ($hi | length) == 1 then
+                 (if ($hi[0] | has("users") | not) then ["hy2-in 缺少 users 字段"]
+                  elif (($hi[0].users) | type) != "array" then ["hy2-in 的 users 不是数组"]
+                  else [] end)
+               else [] end)
+          )
+        )
+      end | .[]
+    ' "$1" 2>/dev/null
+}
+
+# Full identity audit: structure first, then the per-user rules. FAIL-CLOSED:
+# a jq/runtime error inside either stage is an audit FAILURE, never "no
+# problems found" -- callers must check this function's exit code, not just
+# its stdout.
+candidate_problems() { # candidate_problems <config> -> prints problem lines (empty = OK)
+    local structural
+    structural="$(client_structure_problems "$1")" || return $?
+    if [ -n "$structural" ]; then
+        printf '%s\n' "$structural"
+        return 0
+    fi
+    jq -r '
+      ([.inbounds[] | select(.tag == "vless-in")][0].users) as $ru |
+      ([.inbounds[] | select(.tag == "hy2-in")][0].users) as $hu |
+      ([ $ru[] | .name // "" ]) as $rn |
+      ([ $hu[] | .name // "" ]) as $hn |
+      ([ $ru[] | .uuid // "" ]) as $rid |
+      ([ $hu[] | .password // "" ]) as $hp |
+      ([ $ru[] | .flow // "" ]) as $rf |
+      ([]
+        + (if ($rn | index("")) != null then ["vless-in 存在没有 name 的用户"] else [] end)
+        + (if ($hn | index("")) != null then ["hy2-in 存在没有 name 的用户"] else [] end)
+        + (if ($rn | sort) == ($hn | sort) then [] else ["Reality 与 HY2 的 name 集合不一致"] end)
+        + (if ($rn | length) == ($rn | unique | length) then [] else ["vless-in 存在重复 name"] end)
+        + (if ($hn | length) == ($hn | unique | length) then [] else ["hy2-in 存在重复 name"] end)
+        + (if ($rid | index("")) != null then ["vless-in 存在没有 uuid 的用户"] else [] end)
+        + (if ($hp | index("")) != null then ["hy2-in 存在没有 password 的用户"] else [] end)
+        + (if ($rid | length) == ($rid | unique | length) then [] else ["vless-in 存在重复 uuid"] end)
+        + (if ($hp | length) == ($hp | unique | length) then [] else ["hy2-in 存在重复 password"] end)
+        + (if ($rf | all(. == "xtls-rprx-vision")) then [] else ["vless-in 存在 flow 不等于 xtls-rprx-vision 的用户"] end)
+      )[]
+    ' "$1" 2>/dev/null
+}
+
+audit_client_consistency() { # audit_client_consistency [config] -> table + rc
+    local cfg="${1:-$SB_SERVER_CONFIG}" problems rn hn union name r h p
+    if [ ! -f "$cfg" ]; then
+        warning "服务端配置不存在: $cfg"
+        return 1
+    fi
+    if ! jq empty "$cfg" >/dev/null 2>&1; then
+        warning "服务端配置不是合法 JSON: $cfg"
+        return 1
+    fi
+    # FAIL-CLOSED: a jq/runtime error inside the audit is an audit failure,
+    # never equivalent to "no problems found".
+    if ! problems="$(candidate_problems "$cfg")"; then
+        warning "客户端结构审计执行失败: $cfg"
+        return 1
+    fi
+    rn="$(get_reality_client_names "$cfg")"
+    hn="$(get_hy2_client_names "$cfg")"
+    printf '%-16s %-12s %s\n' "NAME" "REALITY" "HY2"
+    union="$(printf '%s\n%s\n' "$rn" "$hn" | sed '/^$/d' | sort -u)"
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        r="MISSING"; h="MISSING"
+        grep -qxF "$name" <<<"$rn" && r="OK"
+        grep -qxF "$name" <<<"$hn" && h="OK"
+        printf '%-16s %-12s %s\n' "$name" "$r" "$h"
+    done <<< "$union"
+    if [ -n "$problems" ]; then
+        warning "客户端一致性检查发现问题:"
+        while IFS= read -r p; do
+            [ -n "$p" ] && warning "  - $p"
+        done <<< "$problems"
+        return 1
+    fi
+    info "客户端一致性检查通过（Reality 与 HY2 的 name 集合完全一致）"
+    return 0
+}
+
+# Reload the running instance; succeeds trivially when nothing is running
+# (e.g. config-only change with the service stopped). Propagates failure so
+# commit_server_config can roll back.
+reload_running_singbox() {
+    if systemctl is-active --quiet sing-box 2>/dev/null; then
+        systemctl reload sing-box || return 1
+    elif pgrep -x sing-box >/dev/null 2>&1; then
+        kill -HUP "$(pgrep -o -x sing-box)" || return 1
+    fi
+    return 0
+}
+
+# After a reload the previously running instance must still be alive.
+reload_health_ok() {
+    sleep 1
+    if systemctl is-active --quiet sing-box 2>/dev/null; then return 0; fi
+    pgrep -x sing-box >/dev/null 2>&1
+}
+
+# Internal transaction commit. The CALLER must already hold the client config
+# lock (see with_client_lock): the whole read -> audit -> candidate -> commit
+# sequence has to run under one exclusive lock or two concurrent managers could
+# lose each other's update. This function never acquires the lock itself.
+#   candidate -> structural audit -> sing-box check -> backup -> atomic mv
+#   -> reload -> health check; on any failure after the mv the previous config
+#   is restored and reloaded, so the disk state is never left half-migrated.
+commit_server_config() { # commit_server_config <candidate> <description>
+    local candidate="$1" description="${2:-server config update}"
+    local backup_path was_running problems
+    [ -f "$candidate" ] || { warning "candidate 不存在: $candidate"; return 1; }
+
+    # FAIL-CLOSED: a jq/runtime error while auditing the candidate must abort
+    # the transaction, never be treated as "candidate is fine".
+    if ! problems="$(candidate_problems "$candidate")"; then
+        warning "candidate 结构审计执行失败（$description），正式配置未修改"
+        rm -f "$candidate"
+        return 1
+    fi
+    if [ -n "$problems" ]; then
+        warning "candidate 结构一致性检查失败（$description），正式配置未修改:"
+        while IFS= read -r p; do
+            [ -n "$p" ] && warning "  - $p"
+        done <<< "$problems"
+        rm -f "$candidate"
+        return 1
+    fi
+
+    if ! "$SB_SING_BOX_BIN" check -c "$candidate" >/dev/null 2>&1; then
+        warning "sing-box check 未通过（$description），正式配置未修改"
+        rm -f "$candidate"
+        return 1
+    fi
+
+    if systemctl is-active --quiet sing-box 2>/dev/null; then
+        was_running=systemd
+    elif pgrep -x sing-box >/dev/null 2>&1; then
+        was_running=manual
+    else
+        was_running=no
+    fi
+
+    # Unique per transaction, even twice in the same second of one process.
+    backup_path="$(new_backup_path)" || {
+        warning "创建备份文件失败（$description），正式配置未修改"
+        rm -f "$candidate"
+        return 1
+    }
+    cp -a "$SB_SERVER_CONFIG" "$backup_path" || {
+        warning "备份正式配置失败（$description），正式配置未修改"
+        rm -f "$candidate"
+        return 1
+    }
+
+    if ! mv -f "$candidate" "$SB_SERVER_CONFIG"; then
+        warning "原子替换失败（$description），已保留备份: $backup_path"
+        rm -f "$candidate"
+        return 1
+    fi
+
+    if [ "$was_running" != "no" ]; then
+        if reload_running_singbox && reload_health_ok; then
+            info "配置已提交并重载成功: $description"
+            info "上一份配置备份: $backup_path"
+            return 0
+        fi
+        warning "reload 后健康检查失败（$description），自动回滚..."
+        cp -a "$backup_path" "$SB_SERVER_CONFIG"
+        # The rollback reload's exit code matters: a failed reload command with a
+        # still-alive process must NOT be reported as a successful recovery.
+        if reload_running_singbox && reload_health_ok; then
+            warning "已回滚并重新加载上一份配置: $backup_path"
+        else
+            warning "已回滚配置文件，但服务未能确认恢复，请立即人工检查！备份: $backup_path"
+        fi
+        return 1
+    fi
+
+    info "配置已提交（当前无运行中的 sing-box 进程，跳过 reload）: $description"
+    info "上一份配置备份: $backup_path"
+    return 0
+}
+
+new_candidate_path() { # new_candidate_path -> unique candidate file next to the live config
+    mktemp "${SB_SERVER_CONFIG}.candidate.XXXXXX" 2>/dev/null
+}
+
+new_backup_path() { # new_backup_path -> unique backup file next to the live config
+    mktemp "${SB_SERVER_CONFIG}.bak.$(date +%Y%m%d-%H%M%S).XXXXXX" 2>/dev/null
+}
+client_name_exists() { # client_name_exists <name> [config] -> rc 0 if present in either inbound
+    local name="$1" cfg="${2:-$SB_SERVER_CONFIG}"
+    grep -qxF "$name" <(get_reality_client_names "$cfg") ||
+        grep -qxF "$name" <(get_hy2_client_names "$cfg")
+}
+
+# One-shot, key-preserving migration of the pre-Phase-C shared account:
+#   {"uuid": "AAAA", ...}  ->  {"name": "legacy", "uuid": "AAAA", ...}
+# Only fills in the missing name; never touches uuid/password/flow.
+# Idempotent: running it again on an already-migrated config is a no-op.
+# The ENTIRE decision + candidate generation runs under the config lock, so a
+# migration can never interleave with a concurrent add/delete.
+migrate_legacy_clients() {
+    with_client_lock _migrate_legacy_clients_locked
+}
+
+_migrate_legacy_clients_locked() {
+    local cfg="$SB_SERVER_CONFIG" candidate r_unnamed h_unnamed structural
+    [ -f "$cfg" ] || { warning "服务端配置不存在: $cfg"; return 1; }
+    if ! jq empty "$cfg" >/dev/null 2>&1; then
+        warning "服务端配置不是合法 JSON: $cfg"
+        return 1
+    fi
+    # Structure precheck (identity audit would wrongly reject nameless users,
+    # which is exactly what migration must accept). For {} this must FAIL,
+    # never fall through to "all users already named".
+    if ! structural="$(client_structure_problems "$cfg")"; then
+        warning "客户端结构审计执行失败: $cfg"
+        return 1
+    fi
+    if [ -n "$structural" ]; then
+        warning "配置结构不满足迁移前提:"
+        while IFS= read -r p; do
+            [ -n "$p" ] && warning "  - $p"
+        done <<< "$structural"
+        return 1
+    fi
+    r_unnamed="$(get_reality_client_names "$cfg" | grep -c '^$' || true)"
+    h_unnamed="$(get_hy2_client_names "$cfg" | grep -c '^$' || true)"
+    if [ "$r_unnamed" -eq 0 ] && [ "$h_unnamed" -eq 0 ]; then
+        info "所有用户都已具备 name，无需迁移"
+        return 0
+    fi
+    if [ "$r_unnamed" != "$h_unnamed" ]; then
+        warning "Reality 有 $r_unnamed 个无名用户，HY2 有 $h_unnamed 个，无法安全迁移；请先运行一致性检查"
+        return 1
+    fi
+    if [ "$r_unnamed" -gt 1 ]; then
+        warning "存在多个无名用户，无法确定哪一个是 legacy，已拒绝迁移"
+        return 1
+    fi
+    if grep -qxF "$RESERVED_CLIENT_NAME" <(get_reality_client_names "$cfg") ||
+       grep -qxF "$RESERVED_CLIENT_NAME" <(get_hy2_client_names "$cfg"); then
+        warning "配置中已存在名为 $RESERVED_CLIENT_NAME 的用户，拒绝迁移以避免覆盖"
+        return 1
+    fi
+
+    candidate="$(new_candidate_path)" || { warning "创建 candidate 失败"; return 1; }
+    jq --arg legacy "$RESERVED_CLIENT_NAME" '
+      (.inbounds[] | select(.tag == "vless-in") | .users) |=
+        map(if has("name") then . else . + {"name": $legacy} end) |
+      (.inbounds[] | select(.tag == "hy2-in") | .users) |=
+        map(if has("name") then . else . + {"name": $legacy} end)
+    ' "$cfg" > "$candidate" || { warning "生成迁移 candidate 失败"; rm -f "$candidate"; return 1; }
+
+    commit_server_config "$candidate" "migrate unnamed user to legacy"
+}
+
+add_client() { # add_client <name> -> adds to BOTH inbounds atomically
+    with_client_lock _add_client_locked "$1"
+}
+
+# Runs under the config lock: every judgement below re-reads the LIVE config,
+# so a transaction that lost the lock race starts from the winner's state
+# instead of overwriting it with a stale snapshot (no lost update).
+_add_client_locked() {
+    local name="$1" candidate uuid password
+    if ! validate_client_name "$name"; then
+        warning "客户端名称非法: '$name'（允许: 字母/数字开头，仅字母数字._-，长度 1-32）"
+        return 1
+    fi
+    if [ "$name" = "$RESERVED_CLIENT_NAME" ]; then
+        warning "'$RESERVED_CLIENT_NAME' 是保留名称，不能通过添加客户端创建"
+        return 1
+    fi
+    [ -f "$SB_SERVER_CONFIG" ] || { warning "服务端配置不存在: $SB_SERVER_CONFIG"; return 1; }
+    if ! jq empty "$SB_SERVER_CONFIG" >/dev/null 2>&1; then
+        warning "服务端配置不是合法 JSON: $SB_SERVER_CONFIG"
+        return 1
+    fi
+    if ! audit_client_consistency "$SB_SERVER_CONFIG" >/dev/null; then
+        warning "当前 Reality/HY2 用户集合不一致，先修复后再添加客户端（运行一致性检查）"
+        audit_client_consistency "$SB_SERVER_CONFIG"
+        return 1
+    fi
+    if client_name_exists "$name" "$SB_SERVER_CONFIG"; then
+        warning "客户端 '$name' 已存在（Reality 或 HY2），拒绝重复添加"
+        return 1
+    fi
+
+    if ! uuid="$("$SB_SING_BOX_BIN" generate uuid)" || [ -z "$uuid" ]; then
+        warning "生成 Reality UUID 失败"
+        return 1
+    fi
+    if ! password="$("$SB_SING_BOX_BIN" generate rand --hex 16)" || [ -z "$password" ]; then
+        warning "生成 Hysteria2 password 失败"
+        return 1
+    fi
+
+    candidate="$(new_candidate_path)" || { warning "创建 candidate 失败"; return 1; }
+    jq --arg name "$name" --arg uuid "$uuid" --arg password "$password" '
+      (.inbounds[] | select(.tag == "vless-in") | .users) += [
+        {"name": $name, "uuid": $uuid, "flow": "xtls-rprx-vision"}
+      ] |
+      (.inbounds[] | select(.tag == "hy2-in") | .users) += [
+        {"name": $name, "password": $password}
+      ]
+    ' "$SB_SERVER_CONFIG" > "$candidate" || {
+        warning "生成 add candidate 失败"; rm -f "$candidate"; return 1
+    }
+
+    # Single transaction: Reality + HY2 appear together or not at all.
+    if commit_server_config "$candidate" "add client $name"; then
+        info "客户端 '$name' 已同时添加到 Reality 与 HY2（UUID/password 已生成）"
+        return 0
+    fi
+    return 1
+}
+
+delete_client() { # delete_client <name> -> removes from BOTH inbounds atomically
+    # Confirmation happens outside the lock (it is interactive UI), but every
+    # safety judgement is re-made against the LIVE config inside the lock, so a
+    # config changed between "y" and the transaction cannot be deleted blindly.
+    local name="$1" r_found h_found confirm
+    if [ "$name" = "$RESERVED_CLIENT_NAME" ]; then
+        warning "'$RESERVED_CLIENT_NAME' 是保留名称，本版本禁止删除（legacy retirement 属于后续功能）"
+        return 1
+    fi
+    [ -n "$name" ] || { warning "客户端名称不能为空"; return 1; }
+    [ -f "$SB_SERVER_CONFIG" ] || { warning "服务端配置不存在: $SB_SERVER_CONFIG"; return 1; }
+
+    r_found="MISSING"; h_found="MISSING"
+    grep -qxF "$name" <(get_reality_client_names "$SB_SERVER_CONFIG") && r_found="FOUND"
+    grep -qxF "$name" <(get_hy2_client_names "$SB_SERVER_CONFIG") && h_found="FOUND"
+    info "准备删除客户端: $name"
+    info "Reality: $r_found"
+    info "HY2:     $h_found"
+    read -r -p "确认删除 '$name'？此操作会同时移除 Reality 与 HY2 凭据 (y/n): " confirm
+    if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+        info "已取消删除 '$name'"
+        return 1
+    fi
+
+    with_client_lock _delete_client_locked "$name"
+}
+
+_delete_client_locked() {
+    local name="$1" candidate
+    # Invariant enforced again INSIDE the destructive helper: even a future
+    # caller that bypasses delete_client must never be able to remove legacy.
+    if [ "$name" = "$RESERVED_CLIENT_NAME" ]; then
+        warning "'$RESERVED_CLIENT_NAME' 是保留名称，本版本禁止删除（locked helper 二次防护）"
+        return 1
+    fi
+    if ! audit_client_consistency "$SB_SERVER_CONFIG" >/dev/null; then
+        warning "当前 Reality/HY2 用户集合不一致，禁止破坏性操作（先运行一致性检查并修复）"
+        audit_client_consistency "$SB_SERVER_CONFIG"
+        return 1
+    fi
+    if ! grep -qxF "$name" <(get_reality_client_names "$SB_SERVER_CONFIG") ||
+       ! grep -qxF "$name" <(get_hy2_client_names "$SB_SERVER_CONFIG"); then
+        warning "客户端 '$name' 未在两个协议中同时存在（锁内复核），拒绝删除（请先修复一致性）"
+        return 1
+    fi
+
+    candidate="$(new_candidate_path)" || { warning "创建 candidate 失败"; return 1; }
+    jq --arg name "$name" '
+      (.inbounds[] | select(.tag == "vless-in") | .users) |=
+        map(select(.name != $name)) |
+      (.inbounds[] | select(.tag == "hy2-in") | .users) |=
+        map(select(.name != $name))
+    ' "$SB_SERVER_CONFIG" > "$candidate" || {
+        warning "生成 delete candidate 失败"; rm -f "$candidate"; return 1
+    }
+
+    if ! commit_server_config "$candidate" "delete client $name"; then
+        warning "服务端修改失败，客户端配置目录 $SB_CLIENTS_DIR/$name 保持不变"
+        return 1
+    fi
+    # Only after the server-side commit succeeded may the derived files go.
+    if [ -d "$SB_CLIENTS_DIR/$name" ]; then
+        rm -rf "$SB_CLIENTS_DIR/$name"
+        info "已删除派生客户端配置目录: $SB_CLIENTS_DIR/$name"
+    fi
+    info "客户端 '$name' 已从 Reality 与 HY2 同时删除"
+}
+get_client_credentials() { # get_client_credentials <name> [config] -> "uuid\npassword"
+    local name="$1" cfg="${2:-$SB_SERVER_CONFIG}" uuid password
+    uuid="$(jq -r --arg name "$name" --arg tag "$REALITY_INBOUND_TAG" '
+        .inbounds[] | select(.tag == $tag) | .users[]? | select(.name == $name) | .uuid // ""
+    ' "$cfg" 2>/dev/null)"
+    password="$(jq -r --arg name "$name" --arg tag "$HY2_INBOUND_TAG" '
+        .inbounds[] | select(.tag == $tag) | .users[]? | select(.name == $name) | .password // ""
+    ' "$cfg" 2>/dev/null)"
+    [ -n "$uuid" ] && [ -n "$password" ] || return 1
+    printf '%s\n%s\n' "$uuid" "$password"
+}
+
+# Writes the Mihomo/Clash Meta client YAML using caller-scope variables:
+#   $server_ip $reality_port $reality_uuid $reality_server_name $public_key
+#   $short_id $hy_clash_port_yaml $hy_password $hy_server_name
+# Only the credentials differ between clients; everything else is shared.
+write_mihomo_template() { # write_mihomo_template <outfile>
+    local outfile="$1"
+    cat > "$outfile" << EOF || return 1
+mixed-port: 7897
+allow-lan: true
+bind-address: "*"
+mode: rule
+log-level: info
+unified-delay: true
+ipv6: true
+profile:
+  store-selected: true
+  store-fake-ip: true
+dns:
+  enable: true
+  listen: "0.0.0.0:53"
+  ipv6: true
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  default-nameserver:
+    - 223.5.5.5
+    - 8.8.8.8
+  nameserver:
+    - https://dns.alidns.com/dns-query
+    - https://doh.pub/dns-query
+  fallback:
+    - https://1.0.0.1/dns-query
+    - tls://dns.google
+  fallback-filter:
+    geoip: true
+    geoip-code: CN
+    ipcidr:
+      - 240.0.0.0/4
+
+tun:
+  enable: true
+  stack: mixed
+  device: Mihomo
+  mtu: 1420
+  auto-route: true
+  auto-redirect: true
+  auto-detect-interface: true
+  dns-hijack:
+    - any:53
+    - tcp://any:53
+
+proxies:
+  - name: Reality
+    type: vless
+    server: $server_ip
+    port: $reality_port
+    uuid: $reality_uuid
+    network: tcp
+    udp: true
+    tls: true
+    flow: xtls-rprx-vision
+    servername: $reality_server_name
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: $public_key
+      short-id: $short_id
+
+  - name: Hysteria2
+    type: hysteria2
+    server: $server_ip
+${hy_clash_port_yaml}
+    password: $hy_password
+    up: "300 Mbps"
+    down: "300 Mbps"
+    sni: $hy_server_name
+    skip-cert-verify: true
+    alpn:
+      - h3
+
+proxy-groups:
+  - name: 节点选择
+    type: select
+    proxies:
+      - Reality
+      - Hysteria2
+      - 自动选择
+      - DIRECT
+
+  - name: 自动选择
+    type: url-test
+    proxies:
+      - Reality
+      - Hysteria2
+    url: "http://www.gstatic.com/generate_204"
+    interval: 300
+    tolerance: 50
+
+
+rules:
+  - GEOIP,LAN,DIRECT
+  - GEOIP,CN,DIRECT
+  - MATCH,节点选择
+
+EOF
+    return 0
+}
+
+# Per-client derived configuration: /root/sbox/clients/<name>/mihomo.yaml
+# (directory 0700, file 0600). The YAML is DERIVED output only -- the server
+# config remains the single source of truth and the YAML can be regenerated.
+generate_client_configuration() { # generate_client_configuration <name>
+    local name="$1" cfg="$SB_SERVER_CONFIG" uuid password creds
+    local out_dir out_file
+    if ! validate_client_name "$name"; then
+        warning "客户端名称非法: '$name'"
+        return 1
+    fi
+    [ -f "$cfg" ] || { warning "服务端配置不存在: $cfg"; return 1; }
+    if ! audit_client_consistency "$cfg" >/dev/null; then
+        warning "客户端集合不一致，拒绝生成配置（先运行一致性检查）"
+        return 1
+    fi
+    if ! creds="$(get_client_credentials "$name" "$cfg")"; then
+        warning "客户端 '$name' 在 Reality/HY2 中不完整，无法生成配置"
+        return 1
+    fi
+    uuid="$(printf '%s\n' "$creds" | sed -n '1p')"
+    password="$(printf '%s\n' "$creds" | sed -n '2p')"
+    # write_mihomo_template reads these exact names from the caller scope
+    reality_uuid="$uuid"
+    hy_password="$password"
+
+    server_ip=$(grep -o "SERVER_IP='[^']*'" "$SB_STATE_FILE" 2>/dev/null | awk -F"'" '{print $2}')
+    public_key=$(grep -o "PUBLIC_KEY='[^']*'" "$SB_STATE_FILE" 2>/dev/null | awk -F"'" '{print $2}')
+    reality_port=$(jq -r --arg tag "$REALITY_INBOUND_TAG" '.inbounds[] | select(.tag == $tag) | .listen_port' "$cfg")
+    reality_server_name=$(jq -r --arg tag "$REALITY_INBOUND_TAG" '.inbounds[] | select(.tag == $tag) | .tls.server_name' "$cfg")
+    short_id=$(jq -r --arg tag "$REALITY_INBOUND_TAG" '.inbounds[] | select(.tag == $tag) | .tls.reality.short_id[0]' "$cfg")
+    hy_port=$(jq -r --arg tag "$HY2_INBOUND_TAG" '.inbounds[] | select(.tag == $tag) | .listen_port' "$cfg")
+    hy_server_name=$(grep -o "HY_SERVER_NAME='[^']*'" "$SB_STATE_FILE" 2>/dev/null | awk -F"'" '{print $2}')
+    ishopping=$(grep '^HY_HOPPING=' "$SB_STATE_FILE" 2>/dev/null | cut -d'=' -f2)
+    hy_hopping_start=$(grep '^HY_HOPPING_START=' "$SB_STATE_FILE" 2>/dev/null | cut -d'=' -f2)
+    hy_hopping_end=$(grep '^HY_HOPPING_END=' "$SB_STATE_FILE" 2>/dev/null | cut -d'=' -f2)
+    hy_clash_port_yaml="    port: $hy_port"
+    formatted_range=""
+    if [ "$ishopping" = "TRUE" ] &&
+       [[ "$hy_hopping_start" =~ ^[0-9]+$ ]] &&
+       [[ "$hy_hopping_end" =~ ^[0-9]+$ ]]; then
+        formatted_range="${hy_hopping_start}-${hy_hopping_end}"
+        hy_clash_port_yaml="    port: $hy_port
+    ports: ${formatted_range}
+    hop-interval: 30"
+    fi
+
+    out_dir="$SB_CLIENTS_DIR/$name"
+    if ! mkdir -p "$out_dir"; then
+        warning "创建客户端目录失败: $out_dir"
+        return 1
+    fi
+    chmod 0700 "$out_dir"
+    out_file="$out_dir/mihomo.yaml"
+    if ! write_mihomo_template "$out_file"; then
+        warning "写入客户端配置失败: $out_file"
+        return 1
+    fi
+    chmod 0600 "$out_file"
+
+    info "客户端 '$name' 的 Mihomo 配置已生成: $out_file（使用 '$name' 自己的 UUID/password）"
+    info "Reality 链接: vless://$uuid@$server_ip:$reality_port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$reality_server_name&fp=chrome&pbk=$public_key&sid=$short_id&type=tcp&headerType=none#REALITY-$name"
+    if [ -n "$formatted_range" ]; then
+        info "HY2 链接: hysteria2://$password@$server_ip:$hy_port?insecure=1&sni=$hy_server_name&mport=${hy_port},${formatted_range}#HY2-$name"
+    else
+        info "HY2 链接: hysteria2://$password@$server_ip:$hy_port?insecure=1&sni=$hy_server_name#HY2-$name"
+    fi
+}
+list_clients() { # 查看客户端（只读，不作为破坏性操作的门槛）
+    audit_client_consistency "$SB_SERVER_CONFIG"
+}
+
+add_client_interactive() {
+    local name
+    read -r -p "请输入客户端名称 (例如 vmix-01，字母/数字开头，仅字母数字._-，最长32): " name
+    add_client "$name"
+}
+
+generate_client_configuration_interactive() {
+    local name
+    audit_client_consistency "$SB_SERVER_CONFIG" || return 1
+    read -r -p "请输入要生成配置的客户端名称: " name
+    generate_client_configuration "$name"
+}
+
+delete_client_interactive() {
+    local name
+    read -r -p "请输入要删除的客户端名称: " name
+    delete_client "$name"
+}
+
+client_management_menu() {
+    while :; do
+        echo ""
+        show_notice "客户端管理"
+        info "1. 查看客户端"
+        info "2. 添加客户端"
+        info "3. 生成客户端配置"
+        info "4. 删除客户端"
+        info "5. 迁移旧客户端为 legacy"
+        info "6. 检查客户端一致性"
+        info "0. 返回"
+        echo ""
+        read -r -p "请输入对应数字（0-6）: " cm_choice
+        echo ""
+        case "$cm_choice" in
+            1) list_clients ;;
+            2) add_client_interactive ;;
+            3) generate_client_configuration_interactive ;;
+            4) delete_client_interactive ;;
+            5)
+                warning "迁移只会为没有 name 的旧用户补上 name=legacy，绝不更换 UUID/password。"
+                migrate_legacy_clients
+                ;;
+            6) audit_client_consistency "$SB_SERVER_CONFIG" ;;
+            0) break ;;
+            *) warning "无效的选项，请重新选择" ;;
+        esac
+    done
+}
+# <<< phase-c client-management <<< ============================================
 
 NETWORK_SYSCTL_FILE="/etc/sysctl.d/99-sing-box-network.conf"
 UDP_BUFFER_MIN_BYTES=16777216
@@ -1510,10 +2125,11 @@ if has_any_installation_marker; then
     echo ""
     info "8. 落地机任意门解锁（本机做解锁机）"
     info "9. 落地机 SS 解锁（本机做解锁机）"
+    info "10. 客户端管理（多设备身份 / legacy 迁移 / 一致性检查）"
     echo ""
     hint "========================="
     echo ""
-    read -r -p "请输入对应数字 (0-9): " choice
+    read -r -p "请输入对应数字 (0-10): " choice
 
     case $choice in
       1)
@@ -1557,6 +2173,10 @@ if has_any_installation_marker; then
           ;;
       9)
           process_ssko
+          exit 0
+          ;;
+      10)
+          client_management_menu
           exit 0
           ;;
       0)
@@ -1671,6 +2291,7 @@ cat > /root/sbox/sbconfig_server.json << EOF
       "listen_port": $reality_port,
       "users": [
         {
+          "name": "legacy",
           "uuid": "$reality_uuid",
           "flow": "xtls-rprx-vision"
         }
@@ -1698,6 +2319,7 @@ cat > /root/sbox/sbconfig_server.json << EOF
         "down_mbps": 1000,
         "users": [
             {
+                "name": "legacy",
                 "password": "$hy_password"
             }
         ],
