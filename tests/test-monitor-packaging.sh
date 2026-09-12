@@ -111,10 +111,24 @@ printf 'systemctl %s\n' "\$*" >> "\$MOCK_CALL_LOG"
 op="\$1"; shift
 case "\$op" in
   is-active)
+    if [ -f "\$MOCK_FAIL_IS_ACTIVE_COUNT" ]; then
+      n="\$(cat "\$MOCK_FAIL_IS_ACTIVE_COUNT" 2>/dev/null || echo 0)"
+      if [ "\$n" -gt 0 ] 2>/dev/null; then
+        echo "\$((n - 1))" > "\$MOCK_FAIL_IS_ACTIVE_COUNT"
+        exit 1
+      fi
+    fi
     [ "\$(cat "\$MOCK_SYS_STATE" 2>/dev/null || echo inactive)" = "active" ] && exit 0 || exit 1 ;;
   is-enabled)
     [ "\$(cat "\$MOCK_ENABLED_STATE" 2>/dev/null || echo disabled)" = "enabled" ] && exit 0 || exit 1 ;;
   daemon-reload)
+    if [ -f "\$MOCK_FAIL_DAEMON_RELOAD_COUNT" ]; then
+      n="\$(cat "\$MOCK_FAIL_DAEMON_RELOAD_COUNT" 2>/dev/null || echo 0)"
+      if [ "\$n" -gt 0 ] 2>/dev/null; then
+        echo "\$((n - 1))" > "\$MOCK_FAIL_DAEMON_RELOAD_COUNT"
+        echo "mock: daemon-reload failed" >&2; exit 1
+      fi
+    fi
     exit 0 ;;
   enable)
     # real semantics: plain enable succeeds even when the subsequent start
@@ -154,9 +168,11 @@ run_install() { # run_install <outdir> [args...]
     local rc=0
     ( "$INSTALL_MONITOR" install "$@" ) > "$out" 2>&1 || rc=$?
     if [ "$rc" != 0 ]; then
-        printf '--- install output (rc=%s) ---\n' "$rc" >&2
+        printf '%s
+' "--- install output (rc=$rc) ---" >&2
         cat -- "$out" >&2
-        printf '--- end install output ---\n' >&2
+        printf '%s
+' "--- end install output ---" >&2
     fi
     return "$rc"
 }
@@ -188,6 +204,8 @@ export SBMON_API_SECRET_SOURCE="$FIX_PROXY/monitor-api.secret"
 export SBMON_HEALTH_TIMEOUT=6
 export SBMON_STATE_DIR="$FIX_STATE/state"
 export MOCK_CALL_LOG MOCK_SYS_STATE MOCK_ENABLED_STATE
+export MOCK_FAIL_DAEMON_RELOAD_COUNT="$TMP/mock-fail-daemon-reload-count"
+export MOCK_FAIL_IS_ACTIVE_COUNT="$TMP/mock-fail-is-active-count"
 export MOCK_FAIL_RESTART_ONCE="$TMP/mock-fail-restart-once"
 export SBMON_LOCK_FILE="$TMP/deploy.lock"
 # P4: real flock where available (Linux CI gate); no-op shim elsewhere so the
@@ -497,6 +515,19 @@ if [ ! -e "$FIX_RELEASES/releases.history" ]; then pass "no history entry for fa
 assert_eq "inactive" "$(cat "$MOCK_SYS_STATE")" "service inactive after fresh failure (F2c)"
 assert_eq "disabled" "$(cat "$MOCK_ENABLED_STATE")" "service disabled after fresh failure (F2c)"
 
+section "R3-3 fresh cleanup daemon-reload failure -> CRITICAL exit 2"
+run_uninstall_quiet
+# fresh failure path: apply's daemon-reload fails (count 1), then the
+# cleanup's own daemon-reload fails too (count 2) -> CRITICAL, never a
+# false "restored to uninstalled state" claim.
+echo 2 > "$MOCK_FAIL_DAEMON_RELOAD_COUNT"
+MOCK_FAIL_START=1 run_install "$TMP/out-r33.log"
+RC_R33=$?
+unset MOCK_FAIL_START
+assert_rc 2 "$RC_R33" "fresh cleanup daemon-reload failure exits 2 (R3-3)"
+assert_grep 'CRITICAL' "$TMP/out-r33.log" "CRITICAL reported (R3-3)"
+assert_no_grep '已恢复到未安装状态' "$TMP/out-r33.log" "no false restored-to-uninstalled claim (R3-3)"
+
 # ---------------------------------------------------------------------------
 section "T17 deployment lock serialization (P4, flock-gated)"
 if command -v flock >/dev/null 2>&1; then
@@ -544,6 +575,102 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+section "R3-1a forward unit atomic-write failure -> transaction rollback"
+if [ "$SYMLINKS_OK" = 1 ]; then
+    OUT_R3A="$TMP/out-r3a.log"
+    run_install "$OUT_R3A"          # fresh 0.4.0
+    assert_rc 0 $? "baseline install for R3 tests"
+    LINK_R3="$(readlink "$FIX_APP_LINK")"
+    UNIT_R3="$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)"
+    HIST_R3="$(cat "$FIX_RELEASES/releases.history")"
+    printf '0.5.0\n' > "$FIX_SRC/VERSION"
+    # REAL atomic-write failure: mktemp under a nonexistent directory (ENOENT).
+    OUT_R3B="$TMP/out-r3b.log"
+    ( SBMON_UNIT_FILE="$FIX_UNIT_DIR/missing-dir/singbox-monitor.service" "$INSTALL_MONITOR" install ) > "$OUT_R3B" 2>&1
+    assert_rc 1 $? "unit atomic-write failure -> install exits nonzero"
+    assert_eq "$LINK_R3" "$(readlink "$FIX_APP_LINK")" "release restored after forward unit-write failure (R3-1)"
+    assert_eq "$UNIT_R3" "$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)" "unit unchanged after forward unit-write failure (R3-1)"
+    assert_eq "$HIST_R3" "$(cat "$FIX_RELEASES/releases.history")" "history unchanged by forward unit-write failure (R3-5)"
+    assert_grep '事务前状态已恢复' "$OUT_R3B" "transaction rollback ran (R3-1)"
+    assert_grep 'unit 原子写入失败' "$OUT_R3B" "unit write failure reported (R3-1)"
+
+    # a successful upgrade so the later rollback tests have a target
+    OUT_R3C="$TMP/out-r3c.log"
+    run_install "$OUT_R3C"
+    assert_rc 0 $? "successful 0.5.0 upgrade"
+else
+    printf '  SKIP R3-1a/c 原子事务流（此平台无符号链接）\n'
+fi
+
+section "R3-1b forward daemon-reload failure -> transaction rollback"
+if [ "$SYMLINKS_OK" = 1 ]; then
+    UNIT_R3B="$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)"
+    LINK_R3B="$(readlink "$FIX_APP_LINK")"
+    printf '0.6.0\n' > "$FIX_SRC/VERSION"
+    echo 1 > "$MOCK_FAIL_DAEMON_RELOAD_COUNT"
+    OUT_R3D="$TMP/out-r3d.log"
+    run_install "$OUT_R3D"
+    assert_rc 1 $? "daemon-reload failure -> install exits nonzero"
+    assert_eq "$LINK_R3B" "$(readlink "$FIX_APP_LINK")" "release restored after daemon-reload failure (R3-1)"
+    assert_eq "$UNIT_R3B" "$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)" "unit restored after daemon-reload failure (R3-1)"
+    assert_no_grep ' 0\.6\.0 ' "$FIX_RELEASES/releases.history" "failed 0.6.0 absent from history (R3-5)"
+    assert_grep '事务前状态已恢复' "$OUT_R3D" "transaction rollback ran (R3-1)"
+    assert_eq "active" "$(cat "$MOCK_SYS_STATE")" "service active after rollback (R3-1b)"
+else
+    printf '  SKIP R3-1b 原子事务流（此平台无符号链接）\n'
+fi
+
+section "R3-1c forward wait-active failure -> transaction rollback"
+if [ "$SYMLINKS_OK" = 1 ]; then
+    UNIT_R3C="$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)"
+    LINK_R3C="$(readlink "$FIX_APP_LINK")"
+    printf '0.7.0\n' > "$FIX_SRC/VERSION"
+    # is-active fails for the next 7 calls: all 6 polls inside the 6s gate
+    # deadline fail, the rollback's own wait then succeeds on a fresh poll.
+    echo 7 > "$MOCK_FAIL_IS_ACTIVE_COUNT"
+    OUT_R3E="$TMP/out-r3e.log"
+    run_install "$OUT_R3E"
+    assert_rc 1 $? "wait-active failure -> install exits nonzero"
+    assert_eq "$LINK_R3C" "$(readlink "$FIX_APP_LINK")" "release restored after wait-active failure (R3-1)"
+    assert_eq "$UNIT_R3C" "$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)" "unit restored after wait-active failure (R3-1)"
+    assert_no_grep ' 0\.7\.0 ' "$FIX_RELEASES/releases.history" "failed 0.7.0 absent from history (R3-5)"
+    assert_grep '事务前状态已恢复' "$OUT_R3E" "transaction rollback ran (R3-1)"
+    assert_eq "active" "$(cat "$MOCK_SYS_STATE")" "service active after rollback (R3-1c)"
+    printf '0.5.0\n' > "$FIX_SRC/VERSION"
+else
+    printf '  SKIP R3-1c 原子事务流（此平台无符号链接）\n'
+fi
+
+section "R3-2a manual rollback failure restores original release"
+if [ "$SYMLINKS_OK" = 1 ]; then
+    UNIT_R3D="$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)"
+    ROLLBACKS_B=$(grep -c ' rollback$' "$FIX_RELEASES/releases.history" || true)
+    : > "$MOCK_FAIL_RESTART_ONCE"
+    OUT_R3F="$TMP/out-r3f.log"
+    ( "$INSTALL_MONITOR" rollback ) > "$OUT_R3F" 2>&1
+    RC_R3F=$?
+    assert_rc 1 "$RC_R3F" "failed rollback exits nonzero"
+    assert_eq '0.5.0' "$(cat "$FIX_APP_LINK/VERSION")" "original release restored after failed rollback (R3-2)"
+    assert_eq "active" "$(cat "$MOCK_SYS_STATE")" "service active on original release (R3-2)"
+    assert_eq "$UNIT_R3D" "$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)" "unit untouched by rollback apply/restore (R3-2)"
+    ROLLBACKS_A=$(grep -c ' rollback$' "$FIX_RELEASES/releases.history" || true)
+    assert_eq "$ROLLBACKS_B" "$ROLLBACKS_A" "failed rollback writes no history (R3-2/R3-5)"
+    assert_grep '已恢复到原 release' "$OUT_R3F" "restore-original reported (R3-2)"
+
+    section "R3-2b rollback restore failure -> CRITICAL exit 2"
+    OUT_R3G="$TMP/out-r3g.log"
+    RC_R3G=0
+    ( export MOCK_FAIL_START=1; "$INSTALL_MONITOR" rollback ) > "$OUT_R3G" 2>&1 || RC_R3G=$?
+    unset MOCK_FAIL_START
+    assert_rc 2 "$RC_R3G" "rollback restore failure exits 2 (R3-2)"
+    assert_grep 'CRITICAL' "$OUT_R3G" "CRITICAL reported (R3-2)"
+    assert_no_grep '回滚完成' "$OUT_R3G" "no false rollback-complete claim (R3-2)"
+    ROLLBACKS_C=$(grep -c ' rollback$' "$FIX_RELEASES/releases.history" || true)
+    assert_eq "$ROLLBACKS_B" "$ROLLBACKS_C" "CRITICAL rollback writes no history (R3-2/R3-5)"
+else
+    printf '  SKIP R3-2 手动回滚事务（此平台无符号链接）\n'
+fi
+
 section "T06 monitor-only uninstall (default: state/config/backups preserved)"
 OUT6="$TMP/out-t06.log"
 if ( "$INSTALL_MONITOR" uninstall ) > "$OUT6" 2>&1; then
@@ -796,6 +923,47 @@ if [ "$(id -u)" = "0" ]; then
 else
     printf '  SKIP F3b (root real-metadata pass on Linux CI covers this)\n'
 fi
+
+section "R3-4a api.secret directory target -> fail-closed"
+run_uninstall_quiet
+rm -rf "$FIX_STATE" "$FIX_CONF_DIR"
+mkdir -p "$FIX_CONF_DIR/api.secret"   # target is a DIRECTORY
+OUT_R34A="$TMP/out-r34a.log"
+run_install "$OUT_R34A"
+assert_rc 1 $? "api.secret directory target -> install fails closed (R3-4)"
+[ -d "$FIX_CONF_DIR/api.secret" ] && pass "directory target unchanged (R3-4)" || fail "directory target replaced"
+NESTED=$(find "$FIX_CONF_DIR/api.secret" -name '.api.secret.*' 2>/dev/null | wc -l)
+assert_eq "0" "$NESTED" "no temp artifact nested inside the directory (R3-4)"
+if [ ! -L "$SBMON_APP_LINK" ] && [ ! -e "$SBMON_APP_LINK" ]; then pass "no release activated (R3-4a)"; else fail "release activated despite wrong-type target"; fi
+
+section "R3-4b api.secret symlink target -> fail-closed"
+if [ "$SYMLINKS_OK" = 1 ]; then
+    rm -rf "$FIX_CONF_DIR"
+    mkdir -p "$FIX_CONF_DIR"
+    ln -s "$FIX_PROXY/monitor-api.secret" "$FIX_CONF_DIR/api.secret"
+    OUT_R34B="$TMP/out-r34b.log"
+    run_install "$OUT_R34B"
+    assert_rc 1 $? "api.secret symlink target -> install fails closed (R3-4)"
+    [ -L "$FIX_CONF_DIR/api.secret" ] && pass "symlink target unchanged (R3-4)" || fail "symlink target replaced/followed"
+    assert_eq "$(cat "$FIX_PROXY/monitor-api.secret")" "$(cat "$FIX_CONF_DIR/api.secret")" "symlink target content untouched (R3-4)"
+else
+    printf '  SKIP R3-4b（此平台无符号链接）\n'
+fi
+
+section "R3-4c monitor.conf symlink -> fail-closed"
+if [ "$SYMLINKS_OK" = 1 ]; then
+    rm -rf "$FIX_CONF_DIR"
+    mkdir -p "$FIX_CONF_DIR"
+    ln -s "$FIX_PROXY/monitor-api.secret" "$FIX_CONF_DIR/monitor.conf"
+    OUT_R34C="$TMP/out-r34c.log"
+    run_install "$OUT_R34C"
+    assert_rc 1 $? "monitor.conf symlink -> install fails closed (R3-4)"
+    [ -L "$FIX_CONF_DIR/monitor.conf" ] && pass "monitor.conf symlink unchanged (R3-4)" || fail "monitor.conf symlink replaced"
+    assert_eq "$(cat "$FIX_PROXY/monitor-api.secret")" "$(cat "$FIX_CONF_DIR/monitor.conf")" "monitor.conf symlink target untouched (R3-4)"
+else
+    printf '  SKIP R3-4c（此平台无符号链接）\n'
+fi
+run_uninstall_quiet
 
 # ---------------------------------------------------------------------------
 section "T11 bad permissions repaired without content change"

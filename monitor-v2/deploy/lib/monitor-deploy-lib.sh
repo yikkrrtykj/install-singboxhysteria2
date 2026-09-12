@@ -108,19 +108,35 @@ sbmon_atomic_write() { # sbmon_atomic_write <path> <mode> [group]  (content on s
     # must never exist). The fixture without SBMON_REAL_CHGRP=1 delegates
     # metadata semantics to the root Linux CI gate.
     local target="$1" mode="$2" group="${3:-}"
+    # R3-7: inside a deployment transaction this helper must RETURN nonzero
+    # (never exit) so the transaction owner can roll back. Callers that are
+    # NOT in a live transaction turn the rc into sbmon_die themselves.
     local dir
-    dir="$(dirname -- "$target")"
+    dir="$(dirname -- "$target")" || return 1
     local tmp
-    tmp="$(mktemp "$dir/.sbmon-write.XXXXXX")" \
-        || sbmon_die "临时文件创建失败: $dir"
-    cat > "$tmp" || { rm -f -- "$tmp"; sbmon_die "临时文件写入失败: $tmp"; }
-    chmod "$mode" "$tmp"
+    tmp="$(mktemp "$dir/.sbmon-write.XXXXXX")" || return 1
+    if ! cat > "$tmp"; then rm -f -- "$tmp"; return 1; fi
+    if ! chmod "$mode" "$tmp"; then rm -f -- "$tmp"; return 1; fi
     if [ -n "$group" ] && { [ "$SBMON_FIXTURE" != "1" ] || [ "${SBMON_REAL_CHGRP:-0}" = "1" ]; }; then
-        chgrp "$group" "$tmp" \
-            || { rm -f -- "$tmp"; sbmon_die "组设置失败（$group）：fail-closed，目标文件未被替换"; }
+        if ! chgrp "$group" "$tmp"; then
+            rm -f -- "$tmp"
+            sbmon_warn "组设置失败（$group）：目标文件未被替换"
+            return 1
+        fi
     fi
     sync -f "$tmp" 2>/dev/null || true   # best-effort fsync where the platform supports it
-    mv -f -- "$tmp" "$target" || { rm -f -- "$tmp"; sbmon_die "原子替换失败: $target"; }
+    if ! mv -f -- "$tmp" "$target"; then rm -f -- "$tmp"; return 1; fi
+    return 0
+}
+
+# R3-4: a runtime file target must be absent or a REGULAR file (never a
+# directory / symlink / fifo / ...). -f follows symlinks, so -L is excluded
+# explicitly; no symlink target is ever followed or replaced.
+sbmon_require_regular_or_absent() { # sbmon_require_regular_or_absent <path> <label>
+    local path="$1" label="$2"
+    if [ -L "$path" ] || { [ -e "$path" ] && [ ! -f "$path" ]; }; then
+        sbmon_die "$label 目标已存在且不是普通文件（symlink/directory/其他）：fail-closed，未做任何变更"
+    fi
 }
 
 # F3: verify (and repair) the runtime metadata contract of a file the
@@ -276,12 +292,15 @@ sbmon_conf_get() { # sbmon_conf_get <KEY> -> value or empty (never logged)
 sbmon_write_default_conf() {
     local conf
     conf="$(sbmon_conf_file)"
-    if [ -e "$conf" ]; then
+    if [ -e "$conf" ] || [ -L "$conf" ]; then
+        # R3-4: existing non-regular / symlink conf is fail-closed, never
+        # chmod/chgrp'd through a symlink or replaced.
+        sbmon_require_regular_or_absent "$conf" "monitor.conf"
         sbmon_info "monitor.conf 已存在，保留不动: $conf"
         return 0
     fi
     sbmon_info "写入默认 monitor.conf（仅首次，原子写入）"
-    sbmon_atomic_write "$conf" 0640 "$SBMON_GROUP" <<EOF
+    sbmon_atomic_write "$conf" 0640 "$SBMON_GROUP" <<EOF || sbmon_die "monitor.conf 原子写入失败"
 # sing-box Monitor v2 configuration (KEY=VALUE, parsed strictly; no shell eval)
 # Written once by install-monitor.sh; upgrades and repairs NEVER overwrite it.
 
@@ -321,7 +340,9 @@ EOF
 sbmon_repair_conf_perms() {
     local conf
     conf="$(sbmon_conf_file)"
-    [ -e "$conf" ] || return 0
+    [ -e "$conf" ] || [ -L "$conf" ] || return 0
+    # R3-4: never repair through a symlink/non-regular target.
+    sbmon_require_regular_or_absent "$conf" "monitor.conf"
     # F3: monitor.conf is runtime-read by the service user -> ownership and
     # mode are functional requirements; repair is fail-closed.
     sbmon_verify_runtime_meta "$conf" 0640
@@ -355,6 +376,9 @@ sbmon_sync_api_secret() {
     if [ ! -f "$source" ] || [ ! -r "$source" ]; then
         sbmon_die "S0 anchor 不是可读的普通文件（$source）：fail-closed，未做任何变更"
     fi
+    # R3-4: dest must be absent or a regular file; never follow/replace a
+    # symlink and never mv INTO a directory target.
+    sbmon_require_regular_or_absent "$dest" "api.secret"
     if [ -f "$dest" ] && cmp -s -- "$source" "$dest"; then
         # F3: content-identical still requires the FULL metadata contract:
         # regular file + 0640 + owner root + group sboxweb. Drift is
@@ -366,7 +390,8 @@ sbmon_sync_api_secret() {
         local ddir
         ddir="$(dirname -- "$dest")"
         [ -d "$ddir" ] || sbmon_die "secret 目标目录不存在: $ddir"
-        sbmon_atomic_write "$dest" 0640 "$SBMON_GROUP" < "$source"
+        sbmon_atomic_write "$dest" 0640 "$SBMON_GROUP" < "$source" \
+            || sbmon_die "api.secret 原子写入失败：安装中止"
         sbmon_info "api.secret 已同步（derived copy, root:$SBMON_GROUP 0640）"
     fi
 }
@@ -418,14 +443,17 @@ sbmon_stage_release() { # sbmon_stage_release <version> -> prints release id on 
     printf '%s\n' "$id"
 }
 
-sbmon_activate_release() { # sbmon_activate_release <id> -- atomic symlink flip
+sbmon_activate_release() { # sbmon_activate_release <id> -- atomic symlink flip; rc 0/1 (R3-7)
     local id="$1"
-    [ -d "$SBMON_RELEASES_DIR/$id" ] || sbmon_die "release 不存在: $id"
+    [ -d "$SBMON_RELEASES_DIR/$id" ] || { sbmon_warn "release 不存在: $id"; return 1; }
     local tmp_link="$SBMON_RELEASES_DIR/.switch-tmp"
-    rm -f -- "$tmp_link"
-    ln -s "$SBMON_RELEASES_DIR/$id" "$tmp_link"
+    rm -f -- "$tmp_link" || return 1
+    ln -s "$SBMON_RELEASES_DIR/$id" "$tmp_link" || return 1
     # mv -T performs rename(2): readers see either the old or the new link.
-    mv -T -- "$tmp_link" "$SBMON_APP_LINK"
+    if ! mv -T -- "$tmp_link" "$SBMON_APP_LINK"; then
+        rm -f -- "$tmp_link" 2>/dev/null || true
+        return 1
+    fi
     sbmon_info "已激活 release: $id"
 }
 
@@ -471,23 +499,26 @@ sbmon_render_unit() {
 
 SBMON_UNIT_CHANGED=0
 
-sbmon_install_unit() {
+sbmon_install_unit() { # rc 0 ok / 1 failed (R3-7: never exits inside a transaction)
     local rendered
-    rendered="$(sbmon_render_unit)"
+    rendered="$(sbmon_render_unit)" || return 1
     if [ -e "$SBMON_UNIT_FILE" ]; then
-        if [ "$(cat "$SBMON_UNIT_FILE")" = "$rendered" ]; then
+        if [ "$(cat "$SBMON_UNIT_FILE" 2>/dev/null)" = "$rendered" ]; then
             sbmon_info "systemd unit 无变化"
             return 0
         fi
-        cp -a -- "$SBMON_UNIT_FILE" "$SBMON_UNIT_FILE.bak.$(date +%Y%m%d%H%M%S)"
+        cp -a -- "$SBMON_UNIT_FILE" "$SBMON_UNIT_FILE.bak.$(date +%Y%m%d%H%M%S)" || return 1
         sbmon_warn "systemd unit 已存在且内容变化，已备份旧 unit 后覆盖"
     fi
     # P3: atomic unit install (same-filesystem temp -> rename); readers of
     # the unit never observe a half-written file.
-    sbmon_atomic_write "$SBMON_UNIT_FILE" 0644 <<< "$rendered"   # root:root, no group chgrp
+    if ! sbmon_atomic_write "$SBMON_UNIT_FILE" 0644 <<< "$rendered"; then
+        sbmon_warn "unit 原子写入失败"
+        return 1
+    fi   # root:root, no group chgrp
     # shellcheck disable=SC2034  # consumed by the caller (install-monitor.sh)
     SBMON_UNIT_CHANGED=1
-    sbmon_systemctl daemon-reload
+    sbmon_systemctl daemon-reload || return 1
 }
 
 sbmon_systemctl() {

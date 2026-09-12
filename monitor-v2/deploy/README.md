@@ -279,6 +279,14 @@ deployment transaction 回滚，**无论事务前服务是 active 还是 inactiv
 
 rollback 命令 = 人工版同一动作（可指定 release id）；**成功激活并确认 service active 之后**
 才追加 `action=rollback` 历史（round 2 F1：rollback 自身失败不得写成功历史）。
+
+**Round 3 — 最终事务边界**：任何在 live release 激活之后的失败 —— 包括 unit 原子写入、
+daemon-reload、服务 start/restart、active 门 —— 都进入同一条回滚路径（forward-apply 内的
+helper 只 return nonzero，绝不 exit 穿透事务边界）。Manual rollback 本身也是事务：
+target 激活/健康失败时恢复原 release（含 enabled/active 状态），恢复亦失败 → CRITICAL exit 2；
+失败的 rollback 不写任何 history。fresh 失败清理同样不吞错：任一步失败 → CRITICAL exit 2，
+只有全部恢复成功才声明 "restored to uninstalled state"。runtime 文件目标（monitor.conf、
+api.secret）若已存在且不是普通文件（directory/symlink/...）→ fail-closed，绝不跟随或替换。
 ```
 
 Monitor 升级**默认不得重启 sing-box** —— deploy 代码根本没有 sing-box 操作面；测试记录全部

@@ -130,21 +130,35 @@ sbmon_txn_rollback() { # <old_id> <old_unit_backup|''> <old_unit_existed> <old_a
     sbmon_warn "事务前状态已恢复（release=${old_id:-<none>} unit=$([ "$old_unit_existed" = 1 ] && printf restored || printf removed) service_active=$old_active service_enabled=$old_enabled）"
 }
 
-# F2: fresh-install failure has NO pre-state to restore. Contract (README §5):
-# remove the live symlink and the newly created unit (never leave an active
-# release or an enabled broken service), keep the immutable release tree for
-# diagnosis, end disabled + inactive.
+# F2/R3-3: fresh-install failure has NO pre-state to restore. Contract
+# (README §5): remove the live symlink and the newly created unit (never
+# leave an active release or an enabled broken service), keep the immutable
+# release tree for diagnosis, end disabled + inactive. R3-3: NO step is
+# allowed to swallow errors -- only when every restore step succeeded may
+# the function claim "restored to uninstalled state"; any failure is
+# CRITICAL exit 2.
 sbmon_fresh_failure_cleanup() {
     sbmon_warn "首次部署启动失败：清理激活链接与 unit（release 树保留以便排查）"
-    rm -rf -- "$SBMON_APP_LINK"   # symlink itself; never descends into the release tree
-    rm -f -- "$SBMON_UNIT_FILE"
-    sbmon_systemctl daemon-reload || true
-    sbmon_service_stop || true
+    if ! sbmon_service_stop; then
+        sbmon_critical "首次部署失败清理：stop 失败"
+    fi
     if ! sbmon_systemctl disable "$SBMON_SERVICE_NAME"; then
         sbmon_critical "首次部署失败清理：disable 失败，可能残留 enabled 状态"
     fi
+    if ! rm -rf -- "$SBMON_APP_LINK"; then   # symlink itself; never descends into the release tree
+        sbmon_critical "首次部署失败清理：live 链接删除失败"
+    fi
+    if ! rm -f -- "$SBMON_UNIT_FILE"; then
+        sbmon_critical "首次部署失败清理：unit 删除失败"
+    fi
+    if ! sbmon_systemctl daemon-reload; then
+        sbmon_critical "首次部署失败清理：daemon-reload 失败；systemd 状态可能不一致"
+    fi
     if sbmon_service_active; then
         sbmon_critical "首次部署失败清理：服务仍处于运行状态"
+    fi
+    if sbmon_service_enabled; then
+        sbmon_critical "首次部署失败清理：服务仍处于 enabled 状态"
     fi
     sbmon_warn "已恢复到未安装状态（disabled + inactive）；排查请查看 journalctl -u $SBMON_SERVICE_NAME"
 }
@@ -158,6 +172,47 @@ cmd_upgrade() { # F4: precondition is checked INSIDE the deploy lock and can
     #            never degrade into a fresh install.
     parse_flags upgrade "$@"
     sbmon_with_deploy_lock _cmd_install_locked upgrade "$@"
+}
+
+# R3-1: forward apply. Every step that touches live deployment state
+# returns nonzero on failure -- nothing in here may exit (R3-7); the caller
+# (transaction handler in _cmd_install_locked) owns rollback.
+sbmon_apply_candidate() { # <new_id-or-empty> <was_active> <no_start>
+    local new_id="$1" was_active="$2" no_start="$3"
+    if [ -n "$new_id" ]; then
+        sbmon_activate_release "$new_id" || { sbmon_warn "release 激活失败"; return 1; }
+    fi
+    # Unit converge runs on EVERY path (incl. noop): template changes must
+    # apply even when the app version is unchanged. Atomic write (P3).
+    SBMON_UNIT_CHANGED=0
+    sbmon_install_unit || { sbmon_warn "unit 应用失败"; return 1; }
+    [ "$no_start" = 1 ] && { sbmon_info "--no-start：跳过服务启动（仅部署文件）"; return 0; }
+    if [ "$was_active" = 1 ]; then
+        if [ -n "$new_id" ] || [ "$SBMON_UNIT_CHANGED" = 1 ]; then
+            sbmon_info "重启监控服务（仅 singbox-monitor，不触碰 sing-box）"
+            if ! sbmon_service_restart; then
+                sbmon_warn "服务重启失败"
+                return 1
+            fi
+            if ! sbmon_wait_service_active; then
+                sbmon_warn "服务未在 ${SBMON_HEALTH_TIMEOUT}s 内激活"
+                return 1
+            fi
+            sbmon_info "服务已激活"
+        fi
+    else
+        sbmon_info "启用并启动 singbox-monitor"
+        if ! sbmon_service_enable_now; then
+            sbmon_warn "candidate 启动失败"
+            return 1
+        fi
+        if ! sbmon_wait_service_active; then
+            sbmon_warn "服务未在 ${SBMON_HEALTH_TIMEOUT}s 内激活"
+            return 1
+        fi
+        sbmon_info "服务已激活"
+    fi
+    return 0
 }
 
 _cmd_install_locked() { # <install|upgrade> [flags...]
@@ -233,62 +288,29 @@ _cmd_install_locked() { # <install|upgrade> [flags...]
     if [ "$action" = "fresh" ] || [ "$action" = "upgrade" ] || [ "$action" = "repair" ] || [ "$action" = "downgrade" ]; then
         # F1: history is a COMMIT record, not an intent record. The entry is
         # written ONLY after the service gate passes; failed/rolled-back
-        # candidates never become rollback targets.
+        # candidates never become rollback targets. Staging mutates nothing
+        # live, so its failure may still die (precondition-class).
         new_id="$(sbmon_stage_release "$repo_version")"
-        sbmon_activate_release "$new_id"
     fi
 
-    # Unit converge runs on EVERY path (incl. noop): template changes must
-    # apply even when the app version is unchanged. Atomic write (P3).
-    SBMON_UNIT_CHANGED=0
-    sbmon_install_unit
+    # R3-1: EVERY forward-apply step after pre-state capture -- release
+    # activation, unit atomic write, daemon-reload, restart/enable, and the
+    # active gate -- runs inside sbmon_apply_candidate, which only RETURNS
+    # nonzero (never exits). Any failure enters the same rollback path here.
+    if ! sbmon_apply_candidate "$new_id" "$was_active" "$OPT_NO_START"; then
+        sbmon_warn "candidate 部署失败，进入事务回滚"
+        if [ "$old_unit_existed" = 1 ] || [ -n "$current_id" ]; then
+            sbmon_txn_rollback "$current_id" "$old_unit_backup" "$old_unit_existed" "$was_active" "$old_enabled"
+        else
+            rm -f -- "$old_unit_backup" 2>/dev/null || true
+            sbmon_fresh_failure_cleanup
+        fi
+        return 1
+    fi
 
     local release_changed=0
     if [ -n "$new_id" ]; then
         release_changed=1
-    fi
-
-    if [ "$OPT_NO_START" = 1 ]; then
-        sbmon_info "--no-start：跳过服务启动（仅部署文件）"
-    elif [ "$was_active" = 1 ]; then
-        if [ "$release_changed" = 1 ] || [ "$SBMON_UNIT_CHANGED" = 1 ]; then
-            sbmon_info "重启监控服务（仅 singbox-monitor，不触碰 sing-box）"
-            if sbmon_service_restart && sbmon_wait_service_active; then
-                sbmon_info "服务已激活"
-            else
-                sbmon_warn "服务未在 ${SBMON_HEALTH_TIMEOUT}s 内激活"
-                if [ "$old_unit_existed" = 1 ] || [ -n "$current_id" ]; then
-                    sbmon_txn_rollback "$current_id" "$old_unit_backup" "$old_unit_existed" 1 "$old_enabled"
-                else
-                    rm -f -- "$old_unit_backup" 2>/dev/null || true
-                    sbmon_fresh_failure_cleanup
-                fi
-                return 1
-            fi
-        fi
-    else
-        sbmon_info "启用并启动 singbox-monitor"
-        if ! sbmon_service_enable_now; then
-            sbmon_warn "candidate 启动失败"
-            if [ "$old_unit_existed" = 1 ] || [ -n "$current_id" ]; then
-                sbmon_txn_rollback "$current_id" "$old_unit_backup" "$old_unit_existed" 0 "$old_enabled"
-            else
-                rm -f -- "$old_unit_backup" 2>/dev/null || true
-                sbmon_fresh_failure_cleanup
-            fi
-            return 1
-        fi
-        if ! sbmon_wait_service_active; then
-            sbmon_warn "服务未在 ${SBMON_HEALTH_TIMEOUT}s 内激活"
-            if [ "$old_unit_existed" = 1 ] || [ -n "$current_id" ]; then
-                sbmon_txn_rollback "$current_id" "$old_unit_backup" "$old_unit_existed" 0 "$old_enabled"
-            else
-                rm -f -- "$old_unit_backup" 2>/dev/null || true
-                sbmon_fresh_failure_cleanup
-            fi
-            return 1
-        fi
-        sbmon_info "服务已激活"
     fi
 
     # F1: gate PASSED -> the candidate is now a committed deployment.
@@ -307,6 +329,77 @@ cmd_rollback() { # rollback [release-id]
     sbmon_with_deploy_lock _cmd_rollback_locked "$@"
 }
 
+# R3-2: apply a rollback target and bring the service to the required
+# state; returns nonzero on ANY failure (never exits, R3-7). The caller
+# owns restoring the original release.
+sbmon_apply_rollback_target() { # <target-id> <orig_active> <orig_enabled>
+    local target="$1" orig_active="$2" orig_enabled="$3"
+    sbmon_activate_release "$target" || { sbmon_warn "rollback: target 激活失败"; return 1; }
+    if [ "$orig_active" = 1 ]; then
+        if ! sbmon_service_restart; then
+            sbmon_warn "rollback: 服务重启失败"
+            return 1
+        fi
+        if ! sbmon_wait_service_active; then
+            sbmon_warn "rollback: 服务未在 ${SBMON_HEALTH_TIMEOUT}s 内激活"
+            return 1
+        fi
+    else
+        # product contract: rollback keeps the ORIGINAL active state; an
+        # inactive service stays inactive on the target release.
+        if ! sbmon_service_stop; then
+            sbmon_warn "rollback: 服务停止失败"
+            return 1
+        fi
+        if sbmon_service_active; then
+            sbmon_warn "rollback: 服务未停止"
+            return 1
+        fi
+    fi
+    # enabled state is untouched by activate/restart/stop; verify it still
+    # matches the captured original (defensive, fail-closed).
+    local now_enabled=0
+    if sbmon_service_enabled; then now_enabled=1; fi
+    if [ "$now_enabled" != "$orig_enabled" ]; then
+        sbmon_warn "rollback: enabled 状态漂移（want=$orig_enabled got=$now_enabled）"
+        return 1
+    fi
+    return 0
+}
+
+# R3-2: restore the original release after a failed rollback target apply.
+# Failure here is irrecoverable -> CRITICAL.
+sbmon_restore_original_after_rollback() { # <orig_id> <orig_active> <orig_enabled>
+    local orig_id="$1" orig_active="$2" orig_enabled="$3"
+    if ! sbmon_activate_release "$orig_id"; then
+        sbmon_critical "rollback 恢复失败：原 release 激活异常（$orig_id）；需要人工处理"
+    fi
+    if [ "$orig_enabled" = 1 ]; then
+        if ! sbmon_service_enable; then
+            sbmon_critical "rollback 恢复失败：enable 恢复失败；需要人工处理"
+        fi
+    else
+        if ! sbmon_systemctl disable "$SBMON_SERVICE_NAME"; then
+            sbmon_critical "rollback 恢复失败：disable 恢复失败；需要人工处理"
+        fi
+    fi
+    if [ "$orig_active" = 1 ]; then
+        if ! sbmon_service_restart; then
+            sbmon_critical "rollback 恢复失败：原 release 重启失败；需要人工处理"
+        fi
+        if ! sbmon_wait_service_active; then
+            sbmon_critical "rollback 恢复失败：原 release 未恢复 active；需要人工检查 journalctl -u $SBMON_SERVICE_NAME"
+        fi
+    else
+        if ! sbmon_service_stop; then
+            sbmon_critical "rollback 恢复失败：服务停止失败；需要人工处理"
+        fi
+        if sbmon_service_active; then
+            sbmon_critical "rollback 恢复失败：服务仍处于运行状态（事务前 inactive）"
+        fi
+    fi
+}
+
 _cmd_rollback_locked() { # [release-id]   (F4: runs under the deploy lock)
     local target="${1:-}"
     [ -L "$SBMON_APP_LINK" ] || sbmon_die "当前没有已激活的 release"
@@ -317,19 +410,27 @@ _cmd_rollback_locked() { # [release-id]   (F4: runs under the deploy lock)
         [ -n "$target" ] || sbmon_die "history 中没有可回滚的 release"
     fi
     [ -d "$SBMON_RELEASES_DIR/$target" ] || sbmon_die "release 不存在: $target"
+
+    # R3-2: capture the full pre-state BEFORE touching anything.
+    local orig_active=0 orig_enabled=0
+    if sbmon_service_active; then orig_active=1; fi
+    if sbmon_service_enabled; then orig_enabled=1; fi
+
     sbmon_info "回滚: $current -> $target"
-    sbmon_activate_release "$target"
-    sbmon_service_restart
-    if sbmon_wait_service_active; then
-        # F1: history is a commit record -- a rollback that itself failed
-        # must NOT append a successful history entry.
-        sbmon_record_history "$target" "$(tr -d ' \t\r\n' < "$SBMON_RELEASES_DIR/$target/VERSION")" "rollback"
-        sbmon_info "回滚完成，服务已激活"
-        sbmon_report_health
-    else
-        sbmon_warn "回滚后服务未激活，请检查 journalctl -u $SBMON_SERVICE_NAME"
+    if ! sbmon_apply_rollback_target "$target" "$orig_active" "$orig_enabled"; then
+        sbmon_warn "rollback target 未能健康应用：恢复原 release $current"
+        if sbmon_restore_original_after_rollback "$current" "$orig_active" "$orig_enabled"; then
+            sbmon_warn "已恢复到原 release（rollback 未完成）；未写入任何 history"
+        else
+            sbmon_critical "rollback 恢复亦失败（见上方 CRITICAL）"
+        fi
         return 1
     fi
+    # F1: history is a commit record -- recorded only after the rollback
+    # target is activated AND the service state is verified.
+    sbmon_record_history "$target" "$(tr -d ' \t\r\n' < "$SBMON_RELEASES_DIR/$target/VERSION")" "rollback"
+    sbmon_info "回滚完成"
+    sbmon_report_health
 }
 
 cmd_history() {
