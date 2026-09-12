@@ -104,13 +104,15 @@
       credentials: "same-origin",
       headers: {}
     };
+    var isMutation = init.method !== "GET";
+    if (isMutation && !CSRF_EXEMPT_PATHS.test(path) && state.session &&
+        state.session.csrf_token) {
+      // Attach to EVERY mutation, including body-less ones (logout).
+      init.headers["X-CSRF-Token"] = state.session.csrf_token;
+    }
     if (options.body !== undefined) {
       init.headers["Content-Type"] = "application/json";
       init.body = JSON.stringify(options.body);
-      if (!CSRF_EXEMPT_PATHS.test(path) && state.session &&
-          state.session.csrf_token) {
-        init.headers["X-CSRF-Token"] = state.session.csrf_token;
-      }
     }
     return fetch(path, init).then(function (response) {
       return response.json().catch(function () { return {}; }).then(function (data) {

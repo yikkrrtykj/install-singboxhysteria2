@@ -300,7 +300,14 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
 
     def _drain_body(self):
         """Consume any unread request body so it is never mistaken for a
-        pipelined request (an early 403/401 must not leave bytes behind)."""
+        pipelined request (an early 403/401 must not leave bytes behind).
+
+        A request whose body had to be DRAINED rather than parsed also
+        loses its keep-alive: we never reuse a connection after bytes we
+        did not explicitly interpret. This deterministically rules out
+        request-smuggling through leftover body fragments -- a locked-out
+        caller's connection is worth nothing, the next request simply
+        opens a new one."""
         if self.command not in ("POST", "PUT", "DELETE"):
             return
         if self.headers.get("Transfer-Encoding"):
@@ -310,13 +317,13 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         remaining = length - getattr(self, "_consumed", 0)
         if remaining <= 0:
             return
+        self.close_connection = True  # drained, not parsed: no reuse
         if remaining > MAX_BODY_BYTES:
-            self.close_connection = True  # refuse to buffer absurd bodies
-            return
+            return  # absurd body: close without buffering it
         try:
             self.rfile.read(remaining)
         except OSError:
-            self.close_connection = True
+            pass
         self._consumed = length
 
     def _json_body(self):
