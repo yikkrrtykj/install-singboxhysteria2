@@ -25,6 +25,10 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
+from web.access import host_entry_for_ip
+from web.recovery import (RECOVERY_SUCCESS_MESSAGE, RecoveryRateLimiter,
+                          generate_key)
+
 MONITOR_WEB_VERSION = "0.1.0-e2"
 SESSION_COOKIE = "monitor_session"
 MAX_BODY_BYTES = 65536
@@ -69,6 +73,7 @@ class MonitorWebApp:
         self.static_dir = static_dir
         self.remote_mode = remote_mode
         self.version = version
+        self.recovery_limiter = RecoveryRateLimiter()
         self._static_cache = {}
 
     def static_file(self, name):
@@ -84,8 +89,7 @@ class MonitorWebApp:
         return cached
 
     def recovery_configured(self):
-        # Replaced by the recovery module wiring (Phase E4 access flow).
-        return False
+        return self.auth is not None and self.auth.recovery_configured()
 
     def session_from_token(self, token):
         if not self.auth or not token:
@@ -164,7 +168,17 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         self._send_json(404, {"error": "not found"})
 
     def _recovery_route(self, method, path, remote):
-        return False  # replaced by the recovery module wiring
+        """The recovery flow is the SINGLE whitelist exception: GET /recovery
+        serves the shell, POST /api/v1/recovery validates the key and adds
+        the CALLER's own address (/32 or /128) to the whitelist. Nothing
+        else is reachable here and no session is ever created."""
+        if method == "GET" and path == "/recovery":
+            self._serve_static(STATIC_ROUTES["/"])
+            return True
+        if method == "POST" and path == "/api/v1/recovery":
+            self._handle_recovery(remote)
+            return True
+        return False
 
     def _route_get(self, path, remote):
         if path in STATIC_ROUTES:
@@ -199,6 +213,9 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/v1/whitelist/remove":
             self._require_session(self._handle_whitelist_remove, remote)
+            return
+        if path == "/api/v1/recovery/rotate":
+            self._require_session(self._handle_recovery_rotate)
             return
         self._send_json(404, {"error": "not found"})
 
@@ -345,6 +362,66 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
                                        int(auth.sessions.ttl)))
         self._send_json(200, {"status": "ok"},
                         extra_headers=[("Set-Cookie", cookie)])
+
+    # -- recovery flow -----------------------------------------------------------
+
+    def _handle_recovery(self, remote):
+        """POST /api/v1/recovery {key} -> add the CALLER's IP, nothing more.
+
+        No session is created; the dashboard and the whitelist stay
+        invisible; the target of the whitelist add is always the real
+        socket peer address, never a client-supplied value.
+        """
+        auth = self.app.auth
+        if auth is None or not auth.recovery_configured():
+            self._send_json(503, {"error": "recovery is not configured"})
+            return
+        body = self._json_body()
+        key = body.get("key") if isinstance(body, dict) else None
+        if not isinstance(key, str) or not key:
+            self._send_json(400, {"error": "recovery key required"})
+            return
+        limiter = self.app.recovery_limiter
+        allowed, retry_after = limiter.check(remote)
+        if not allowed:
+            self._send_json(
+                429, {"error": "too many failed recovery attempts; try "
+                               "again later", "retry_after": retry_after},
+                extra_headers=[("Retry-After", str(retry_after))])
+            return
+        if not auth.verify_recovery_key(key):
+            limiter.record_failure(remote)
+            self._send_json(403, {"error": "invalid recovery key"})
+            return
+        limiter.record_success(remote)
+        entry = host_entry_for_ip(remote)
+        self.app.access.add(entry)
+        self._send_json(200, {"status": "ok", "ip": remote, "entry": entry,
+                              "message": RECOVERY_SUCCESS_MESSAGE})
+
+    def _handle_recovery_rotate(self, session):
+        """POST /api/v1/recovery/rotate {current_password} -> new key once."""
+        auth = self.app.auth
+        body = self._json_body()
+        current = body.get("current_password") \
+            if isinstance(body, dict) else None
+        if not isinstance(current, str):
+            self._send_json(400, {"error": "current_password required"})
+            return
+        remote = self.client_address[0]
+        allowed, retry_after = auth.login_limiter.check(remote)
+        if not allowed:
+            self._send_json(429, {"error": "try again later"})
+            return
+        if not auth.verify_password(current):
+            auth.login_limiter.record_failure(remote)
+            self._send_json(403, {"error": "current password is wrong"})
+            return
+        auth.login_limiter.record_success(remote)
+        key = generate_key()
+        auth.set_recovery_key(key)
+        # shown exactly once, in this response; only a hash is stored
+        self._send_json(200, {"status": "ok", "recovery_key": key})
 
     # -- session-gated endpoints -------------------------------------------------
 

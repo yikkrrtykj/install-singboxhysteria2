@@ -35,6 +35,7 @@ from collector import Collector, resolve_secret  # noqa: E402
 from web.access import LOOPBACK_ALLOW, AccessPolicy, host_entry_for_ip  # noqa: E402
 from web.auth import AuthStore, validate_password  # noqa: E402
 from web.broker import SnapshotBroker  # noqa: E402
+from web.recovery import generate_key  # noqa: E402
 from web.server import (MONITOR_WEB_VERSION, MonitorWebApp,  # noqa: E402
                         build_server)
 
@@ -82,6 +83,10 @@ def build_arg_parser():
                             "lands in shell history; prefer the prompt)")
     setup.add_argument("--session-ttl", type=float, default=8 * 3600.0,
                        help="admin session lifetime in seconds")
+    setup.add_argument("--recovery-out", default=None,
+                       help="AUTOMATION ONLY: also write the generated "
+                            "recovery key to this file (0600) instead of "
+                            "relying on the one-time on-screen display")
 
     serve = sub.add_parser(
         "serve", help="run the collector, broker and web listener")
@@ -144,6 +149,30 @@ def _configure_password(auth, args):
     print("Admin password configured (scrypt hash in auth.json).")
 
 
+def _configure_recovery_key(data_dir, args):
+    """Generate the one-time recovery key (>=128-bit) and store its hash."""
+    auth = AuthStore(data_dir)
+    if auth.recovery_configured():
+        print("Recovery key already configured "
+              "(regenerate it on the Settings page).")
+        return
+    key = generate_key()
+    auth.set_recovery_key(key)
+    print()
+    print("==========================================================")
+    print("Recovery key (shown ONCE -- store it somewhere safe NOW):")
+    print()
+    print("    %s" % key)
+    print()
+    print("It can only add the calling IP back to the whitelist.")
+    print("==========================================================")
+    if args.recovery_out:
+        from web.storage import atomic_write_json
+        atomic_write_json(args.recovery_out + ".json",
+                          {"recovery_key": key})
+        print("(automation: key also written to %s.json)" % args.recovery_out)
+
+
 def cmd_setup(args):
     """Interactive first-time setup. Never prints the password back."""
     data_dir = args.data_dir or default_data_dir()
@@ -176,7 +205,7 @@ def cmd_setup(args):
 
     _configure_password(AuthStore(data_dir, session_ttl=args.session_ttl),
                         args)
-    # recovery key configuration lands with the recovery module
+    _configure_recovery_key(data_dir, args)
 
     print("Access data: %s" % access.path)
     print("Next: `webapp.py serve` (loopback: 127.0.0.1:%d)" % DEFAULT_PORT)
