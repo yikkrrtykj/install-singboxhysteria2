@@ -117,8 +117,8 @@ case "\$op" in
   daemon-reload)
     exit 0 ;;
   enable)
-    # real semantics: `enable` succeeds even when the subsequent start of
-    # `enable --now` fails (unit enabled, service inactive).
+    # real semantics: plain enable succeeds even when the subsequent start
+    # of enable --now fails (unit enabled, service inactive).
     now=0
     for a in "\$@"; do [ "\$a" = "--now" ] && now=1; done
     if [ "\$now" = 1 ] && [ -n "\${MOCK_FAIL_START:-}" ]; then
@@ -151,7 +151,14 @@ chmod +x "$TMP/bin/systemctl-mock"
 
 run_install() { # run_install <outdir> [args...]
     local out="$1"; shift
-    ( "$INSTALL_MONITOR" install "$@" ) > "$out" 2>&1
+    local rc=0
+    ( "$INSTALL_MONITOR" install "$@" ) > "$out" 2>&1 || rc=$?
+    if [ "$rc" != 0 ]; then
+        printf '--- install output (rc=%s) ---\n' "$rc" >&2
+        cat -- "$out" >&2
+        printf '--- end install output ---\n' >&2
+    fi
+    return "$rc"
 }
 
 run_uninstall_quiet() {
