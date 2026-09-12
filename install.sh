@@ -1903,25 +1903,50 @@ _upgrade_singbox_1_14_locked() {
         return 1
     fi
     if ! mv -f "$candidate_cfg" "$SB_SERVER_CONFIG"; then
-        warning "原子替换 config 失败，恢复 config 后停止"
-        cp -a "$backup_cfg" "$SB_SERVER_CONFIG"
-        rm -f "$candidate_bin" "$candidate_cfg" "$backup_bin" "$backup_cfg"
+        # The binary at the live path is ALREADY the new one: this is a mixed
+        # state (new binary + old config). Restore BOTH -- config first, then
+        # binary -- then restart immediately and verify, so that no future
+        # restart ever runs the mixed pair. Backups are KEPT until the
+        # recovered state is proven healthy.
+        warning "原子替换 config 失败，执行双恢复（config → binary）..."
+        if ! cp -a "$backup_cfg" "$SB_SERVER_CONFIG"; then
+            warning "恢复 config 失败，请立即人工介入！备份: $backup_bin / $backup_cfg"
+            return 1
+        fi
+        if ! cp -a "$backup_bin" "$SB_SING_BOX_BIN"; then
+            warning "恢复 binary 失败，请立即人工介入！备份: $backup_bin / $backup_cfg"
+            return 1
+        fi
+        rm -f "$candidate_bin" "$candidate_cfg"
+        if ! systemctl restart sing-box 2>/dev/null; then
+            warning "双恢复后 restart sing-box 失败，请立即人工介入！备份: $backup_bin / $backup_cfg"
+            return 1
+        fi
+        local require_api="no"
+        if phase_d_api_service_exact "$SB_SERVER_CONFIG"; then require_api="yes"; fi
+        if ! phase_d_health_ok "$old_version" "$require_api"; then
+            warning "双恢复后健康检查失败，请立即人工介入！备份: $backup_bin / $backup_cfg"
+            return 1
+        fi
+        if ! ensure_hy2_hopping_after_restart; then
+            warning "双恢复后端口跳跃规则未能确认恢复，请人工检查"
+            return 1
+        fi
+        warning "已恢复到升级前状态（binary $old_version + config），服务健康"
+        info "升级前备份已保留: binary=$backup_bin config=$backup_cfg"
         return 1
     fi
 
     if ! systemctl restart sing-box 2>/dev/null; then
         _rollback_upgrade "$backup_bin" "$backup_cfg" "$old_version"
-        rm -f "$backup_bin" "$backup_cfg"
         return 1
     fi
     if ! phase_d_health_ok "$ver" "yes"; then
         _rollback_upgrade "$backup_bin" "$backup_cfg" "$old_version"
-        rm -f "$backup_bin" "$backup_cfg"
         return 1
     fi
     if ! ensure_hy2_hopping_after_restart; then
         _rollback_upgrade "$backup_bin" "$backup_cfg" "$old_version"
-        rm -f "$backup_bin" "$backup_cfg"
         return 1
     fi
 

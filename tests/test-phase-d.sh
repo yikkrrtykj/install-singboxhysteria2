@@ -121,6 +121,19 @@ curl() {
     fi
     return 0
 }
+# Simulate a failure of the CONFIG atomic replacement while the binary has
+# already been replaced (the mixed-state scenario from the review). The mv
+# target is always the LAST argument.
+mv() {
+    if [ "${MV_FAIL_CONFIG:-0}" = "1" ]; then
+        local last
+        eval "last=\"\${$#}\""
+        if [ "$last" = "${SB_SERVER_CONFIG:-}" ]; then
+            return 1
+        fi
+    fi
+    command mv "$@"
+}
 MOCKS
 
 # ------------------------------------------------------------- mock binaries --
@@ -271,6 +284,8 @@ setup_upgrade_sandbox() {
     write_migrated_config
     cp "$TMP/mock-old-sb" "$SB_SING_BOX_BIN"
     chmod +x "$SB_SING_BOX_BIN"
+    # each scenario starts from a clean pre-upgrade state: no old backups
+    rm -f "$SANDBOX"/sing-box.bak.* "$SANDBOX"/sbconfig_server.json.bak.*
     # BEFORE the upgrade: only the two protocol listeners exist (no API yet).
     export SS_TCP="LISTEN 0 128 0.0.0.0:18443 0.0.0.0:*"
     export SS_UDP="UNCONN 0 0 0.0.0.0:18444 0.0.0.0:*"
@@ -391,7 +406,7 @@ export RESTART_FAIL_MODE="first"
 upgrade_singbox_1_14 > "$TMP/d10.out" 2>&1
 assert_rc 1 $? "upgrade fails when restart fails"
 assert_rc 1 "$(printf '%s' "$("$SB_SING_BOX_BIN" version)" | grep -c '1.13.13')" "old binary restored"
-assert_rc 0 "$(jq -r '[.inbounds[] | select(.type == "api")] | length' "$SB_SERVER_CONFIG")" "old config restored (no api inbound)"
+assert_rc 0 "$(jq -r '[.services[]? | select(.tag == "monitor-api")] | length' "$SB_SERVER_CONFIG" | tr -d '\r')" "old config restored (no api service)"
 assert_grep '已回滚到升级前状态' "$TMP/d10.out" "successful rollback reported"
 
 section "D11: API health failure -> double rollback"
@@ -402,7 +417,7 @@ upgrade_singbox_1_14 > "$TMP/d11.out" 2>&1
 assert_rc 1 $? "upgrade fails when API listener missing"
 assert_grep 'API 127.0.0.1:9091 未监听' "$TMP/d11.out" "api health reason stated"
 assert_rc 1 "$(printf '%s' "$("$SB_SING_BOX_BIN" version)" | grep -c '1.13.13')" "old binary restored (D11)"
-assert_rc 0 "$(jq -r '[.inbounds[] | select(.type == "api")] | length' "$SB_SERVER_CONFIG")" "old config restored (D11)"
+assert_rc 0 "$(jq -r '[.services[]? | select(.tag == "monitor-api")] | length' "$SB_SERVER_CONFIG" | tr -d '\r')" "old config restored (D11)"
 assert_grep '已回滚到升级前状态' "$TMP/d11.out" "successful rollback reported (D11)"
 
 section "D12: rollback restart failure is reported as manual intervention"
@@ -491,6 +506,9 @@ export SB_CLIENTS_DIR="$CFG/clients"
 export SB_SING_BOX_BIN="$CFG/sing-box"
 export SB_LOCK_FILE="$CFG/config.lock"
 export SB_HOPPING_SERVICE="$CFG/hy2-hopping.service"
+# per-child restart counter and log: the two children must not share state
+export SYSTEMCTL_LOG="$CFG/systemctl-$ROLE.log"; : > "$SYSTEMCTL_LOG"
+export RESTART_COUNT_FILE="$CFG/restart-count-$ROLE"; printf '0\n' > "$RESTART_COUNT_FILE"
 info() { :; }; warning() { :; }; hint() { :; }; error() { :; }
 . "$CFG/mocks.sh"
 . "$PHASEC"
@@ -517,7 +535,7 @@ CHILD
     assert_rc 1 "$(get_reality_client_names | grep -cx 'client-x')" "client-x survived in reality"
     assert_rc 1 "$(get_hy2_client_names | grep -cx 'client-x')" "client-x survived in hy2"
     assert_rc 1 "$(jq -r '[.services[]? | select(.tag == "monitor-api")] | length' "$SB_SERVER_CONFIG" | tr -d '\r')" "api service present exactly once"
-    assert_rc 0 "$(printf '%s' "$("$SB_SING_BOX_BIN" version)" | grep -c '1.14.7')" "binary upgraded to 1.14.7"
+    assert_rc 1 "$(printf '%s' "$("$SB_SING_BOX_BIN" version)" | grep -c '1.14.7')" "binary upgraded to 1.14.7"
     if audit_client_consistency > "$TMP/d16.audit" 2>&1; then pass "final identity audit consistent"; else fail "final audit inconsistent: $(cat "$TMP/d16.audit" | tr '\n' ' ')"; fi
     # restore the main sandbox for any later sections
     export SB_SERVER_CONFIG="$SANDBOX/sbconfig_server.json"
@@ -527,6 +545,41 @@ CHILD
     export SB_LOCK_FILE="$SANDBOX/config.lock"
     export SB_HOPPING_SERVICE="$SANDBOX/sing-box-hy2-hopping.service"
 fi
+
+section "D18: config mv failure -> double recovery of binary AND config"
+setup_upgrade_sandbox
+cfg_sha="$(sha "$SB_SERVER_CONFIG")"; bin_sha="$(sha "$SB_SING_BOX_BIN")"
+# binary mv succeeds, then the config mv fails -> mixed state must be fully
+# recovered (config first, then binary), restarted and re-verified
+export MV_FAIL_CONFIG=1
+upgrade_singbox_1_14 > "$TMP/d18.out" 2>&1
+assert_rc 1 $? "upgrade fails when config mv fails"
+assert_grep '执行双恢复' "$TMP/d18.out" "double-recovery stated"
+assert_grep '已恢复到升级前状态' "$TMP/d18.out" "recovery verified"
+assert_rc 1 "$(printf '%s' "$("$SB_SING_BOX_BIN" version)" | grep -c '1.13.13')" "old binary restored (no new+old mix)"
+assert_rc 0 "$(jq -r '[.services[]? | select(.tag == "monitor-api")] | length' "$SB_SERVER_CONFIG" | tr -d '\r')" "old config restored (D18)"
+if [ "$cfg_sha" = "$(sha "$SB_SERVER_CONFIG")" ] && [ "$bin_sha" = "$(sha "$SB_SING_BOX_BIN")" ]; then pass "live pair byte-identical to pre-upgrade (D18)"; else fail "live pair differs (D18)"; fi
+assert_grep 'restart sing-box' "$SYSTEMCTL_LOG" "recovery restart actually ran"
+bak_bin="$(ls -1 "$SANDBOX"/sing-box.bak.* 2>/dev/null | wc -l)"
+bak_cfg="$(ls -1 "$SANDBOX"/sbconfig_server.json.bak.* 2>/dev/null | wc -l)"
+assert_rc 1 "$bak_bin" "binary backup kept after recovery"
+assert_rc 1 "$bak_cfg" "config backup kept after recovery"
+export MV_FAIL_CONFIG=0
+
+section "D19: rollback failure must KEEP backups for manual recovery"
+setup_upgrade_sandbox
+export RESTART_FAIL_MODE="all"
+upgrade_singbox_1_14 > "$TMP/d19.out" 2>&1
+assert_rc 1 $? "upgrade fails when every restart fails"
+assert_grep '请立即人工介入' "$TMP/d19.out" "manual intervention stated"
+bak_bin="$(ls -1 "$SANDBOX"/sing-box.bak.* 2>/dev/null | wc -l)"
+bak_cfg="$(ls -1 "$SANDBOX"/sbconfig_server.json.bak.* 2>/dev/null | wc -l)"
+if [ "$bak_bin" -ge 1 ] && [ "$bak_cfg" -ge 1 ]; then pass "backups still present after failed rollback (manual recovery possible)"; else fail "backups were deleted after failed rollback (bin=$bak_bin cfg=$bak_cfg)"; fi
+broken=0
+for b in "$SANDBOX"/*.bak.*; do [ -s "$b" ] || { fail "empty backup: $b"; broken=1; }; done
+[ "$broken" -eq 0 ] && pass "all kept backups are non-empty"
+assert_rc 1 "$(printf '%s' "$("$SB_SING_BOX_BIN" version)" | grep -c '1.13.13')" "old binary file restored even though restart failed"
+export RESTART_FAIL_MODE="none"
 
 printf '\n== summary ==\n'
 printf '  pass=%d fail=%d\n' "$PASS" "$FAIL"
