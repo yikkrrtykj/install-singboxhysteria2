@@ -242,11 +242,23 @@ Mihomo API（仅补充展示）:  version / mode / selected proxy / delay /
 * controller URL 只允许 loopback（fail-closed）；Mihomo API 是客户端本地
   服务，绝不公网暴露，服务器侧读取应走显式 agent/隧道设计；
 * secret 只经 `Authorization: Bearer` 头传递：不进日志、不进输出对象、
-  不进 URL query、错误文本统一 redact；超时钳制在 1-3 秒；
+  不进 URL query、错误文本统一 redact（含传输异常/HTTP 错误体内出现的
+  secret）；超时钳制在 1-3 秒；`--secret-file` 在 POSIX 上强制校验
+  （regular file + 无 group/other 权限位，0600/0400 可用，0644+ 拒绝，
+  校验先于读取内容）；Windows 依赖文件系统 ACL，v1 不做完整校验；
+* transport 只有 `get(path)` 一个入口——不存在 method 参数，PUT/POST/
+  PATCH/DELETE 在结构上无法发出；URL 拒绝 userinfo/非根 path/query/
+  fragment，且错误信息绝不回显完整 URL；
 * `reachable=false`（unreachable / disabled / wrong secret / offline）只是
   一个观测结果，服务端 Monitor 完全不受影响，设备状态绝不因此改变；
-* freshness 双域独立：enrichment 有自己的 `updated_at/stale/error`，与
+* freshness 双域独立：enrichment 有自己的 `checked_at`（本次轮询完成时间）
+  / `updated_at`（最近一次成功取得有效数据的时间，失败轮询为 null 且
+  stale=true，绝不出现 unreachable-but-fresh）/ `error`，与
   E1 流的 stale 完全分离；
+* `/connections` 语义：`null`/`[]` -> 0（确认空闲），key 缺失或类型错误
+  -> None（schema 漂移/未知，绝不伪装成 idle）；
+* `/traffic` 是真实无限流：newline 分帧 + 绝对 deadline 的首行读取器，
+  读到第一条完整 JSON 立即返回，不等连接关闭、不读第二条；
 * 只读：不选节点、不切模式、不 reload、不重启、不关连接、不触发
   delay 主动探测（只读缓存 history）。
 

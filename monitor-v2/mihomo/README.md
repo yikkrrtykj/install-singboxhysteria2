@@ -53,16 +53,17 @@ official web UI (MetaCubeX/metacubexd). Classification per field:
 | node delay | selected node's `history[-1].delay` (`{"time", "delay"}`) | **optional** | exists only after some earlier delay test; `delay == 0` means the last probe FAILED (not a latency); the adapter NEVER triggers a test |
 | per-test-URL histories | `extra: {testUrl: {alive, history}}` | **version-dependent** | newer builds only; unused in v1 |
 | active connections | `GET /connections` -> `{"downloadTotal","uploadTotal","connections": [...] , "memory"}` | **stable** | snapshot form (plain GET); per-connection counters are `upload`/`download` while the totals are `uploadTotal`/`downloadTotal` (mirrored names -- easy to swap) |
-| idle connections | same endpoint, `"connections": null` (nil slice, no omitempty) or key absent | **stable quirk** | normalized to `0` -- empty is data, not an error |
+| idle / unknown connections | same endpoint: `"connections": null` (official idle shape), `[]`, key absent, or wrong type | **stable quirk** | `null` and `[]` -> `0` (confirmed empty); key MISSING or wrong type -> `null` (schema drift / unknown -- never rendered as idle) |
 | core memory | `memory` in the snapshot / `GET /memory` stream | **optional, version-dependent** | mihomo-specific; not needed for enrichment v1 |
-| instantaneous traffic rate | `GET /traffic` -> infinite chunked stream, one `{"up","down","upTotal","downTotal"}` JSON per second, first sample ~1 s after connect | **optional, streaming** | the adapter reads ONE sample then abandons the connection; only the instantaneous `up`/`down` pair is kept |
+| instantaneous traffic rate | `GET /traffic` -> INDEFINITE stream, one flushed `JSON + \n` per second, connection stays OPEN, first sample ~1 s after connect | **optional, streaming** | newline-framed first-sample reader: returns the moment the first complete line arrives (bounded `read1` calls + absolute deadline), never waits for the connection to close or a full read buffer; only the instantaneous `up`/`down` pair is kept |
 | local traffic totals | `upTotal`/`downTotal` in the same stream | **unsuitable** | client-local since core start; redundant with (and inferior to) the server's authoritative counters |
 | rules | `GET /rules` | **unsuitable for v1** | large payload, no enrichment value yet |
 | logs / memory streams / DNS debug | `GET /logs`, `GET /memory`, `GET /dns/query` | **unsuitable for v1** | streams / debug tools |
 | proxy providers | `GET /providers/proxies` | **optional, version-dependent** | only present when providers are configured |
 
-FORBIDDEN control-plane operations (read-only mandate -- the adapter only
-ever issues `GET`):
+FORBIDDEN control-plane operations (read-only mandate -- the transport
+exposes `get(path)` ONLY; there is no `method` parameter anywhere, so a
+mutation verb cannot even be expressed):
 
 * selecting a proxy (`PUT /proxies/{group}`), closing connections
   (`DELETE /connections[/{id}]`), mode/config change or reload
@@ -90,6 +91,7 @@ on a Unix socket / Windows named pipe (`external-controller-unix` /
   "active_connections": 11,
   "traffic_up_bps": 1234,
   "traffic_down_bps": 5678,
+  "checked_at": "2026-09-12T10:00:00+00:00",
   "updated_at": "2026-09-12T10:00:00+00:00",
   "stale": false,
   "error": null
@@ -104,13 +106,32 @@ on a Unix socket / Windows named pipe (`external-controller-unix` /
   problem.
 * Optional endpoints fail in isolation: a broken `/configs` nulls only
   `mode`, and the object stays `reachable: true`.
+* `active_connections` is an int ONLY when the snapshot shape was understood;
+  schema drift (missing key, wrong type) yields `null` -- "unknown", which
+  must never be rendered as 0/idle.
 
 ## Freshness / stale / error semantics (independent domains)
 
-* every collect() stamps its own `updated_at`;
+Vocabulary (stateless single-poll semantics, v1):
+
+```text
+checked_at  = when THIS poll completed (always set, success or failure)
+updated_at  = when valid enrichment data was last obtained (null on a
+              failed poll -- a failure is never backdated into freshness)
+reachable   = whether the LAST /version probe succeeded
+stale       = true whenever updated_at is null, or older than max_age
+```
+
+* every collect() stamps `checked_at`; a SUCCESSFUL poll also stamps
+  `updated_at` (same instant) and seals `stale: false`;
+* a FAILED poll (unreachable / 401 / timeout / malformed `/version`) seals
+  `updated_at: null`, `stale: true` -- "unreachable but fresh" is impossible,
+  and a stateless poll never invents an older success;
 * `model.apply_freshness(enrichment, now, max_age)` marks a STORED sample
   stale after `max_age` seconds (default 30); an object without a usable
-  `updated_at` is stale by definition;
+  `updated_at` is stale by definition. A future stateful wrapper keeps the
+  last successful `updated_at` and recomputes `stale` -- it must never
+  fabricate `updated_at` for a failed poll;
 * client enrichment staleness and server Monitor staleness are completely
   separate: `Mihomo down` while the E1 stream is healthy means
   `enrichment.stale = true` alongside a healthy server snapshot -- and the
@@ -121,19 +142,35 @@ on a Unix socket / Windows named pipe (`external-controller-unix` /
 
 * **Loopback only, fail-closed**: `parse_controller_url` accepts
   `127.0.0.1` / `localhost` / `::1` (default port 9090) and refuses
-  everything else before a single byte is sent. The Mihomo API is a
-  client-local service; `browser -> Internet -> Mihomo API` and
-  `external-controller: 0.0.0.0:9090` are explicitly rejected designs. If a
-  server ever needs this data, that is an explicit agent / outbound
-  connection / secure tunnel design -- not a widened bind address.
+  everything else before a single byte is sent -- including embedded
+  credentials (`user:pass@`), non-root paths, query strings and fragments.
+  Error messages never echo the full URL (a URL can carry credentials);
+  only non-secret components (scheme / host / path / port) are named.
+  The Mihomo API is a client-local service; `browser -> Internet -> Mihomo
+  API` and `external-controller: 0.0.0.0:9090` are explicitly rejected
+  designs. If a server ever needs this data, that is an explicit agent /
+  outbound connection / secure tunnel design -- not a widened bind address.
+* **Read-only transport by construction**: `HttpTransport.get(path)` is the
+  only request surface -- no `method` parameter exists, so PUT/POST/PATCH/
+  DELETE cannot be issued even by accident (guarded by static and runtime
+  regression tests).
 * **Secret handling**: resolved from the `MIHOMO_API_SECRET` environment
-  variable or `--secret-file` (create it mode 0600); sent ONLY in the
-  `Authorization: Bearer` header; never logged, never serialized into the
-  output object, never placed in a URL query string; redacted from every
-  stored error message.
+  variable or `--secret-file`; sent ONLY in the `Authorization: Bearer`
+  header; never logged, never serialized into the output object, never
+  placed in a URL query string; redacted from every stored error message
+  (including secrets that show up inside transport exceptions or HTTP error
+  bodies).
+* **Secret-file permission contract**: on POSIX the file MUST be a regular
+  file with NO group/other permission bits -- `0600` / `0400` pass, `0644` /
+  `0664` / `0666` are rejected BEFORE the content is read (so a rejected
+  file's content can never reach an error message). On Windows POSIX mode
+  bits are not enforced by the filesystem; E4 v1 relies on filesystem ACLs
+  there and does not fully validate.
 * **Short timeouts**: every request timeout is clamped to 1-3 seconds
   (default 2.0) and `collect()` never raises, so one stuck client API can
-  never stall the Monitor loop.
+  never stall the Monitor loop. The `/traffic` sample reader is bounded by
+  an absolute deadline and returns on the first complete newline-framed
+  JSON line.
 * **No public exposure**: nothing in this phase listens on any port.
 
 ## Files
