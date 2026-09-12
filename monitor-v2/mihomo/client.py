@@ -30,8 +30,9 @@ SECURITY MODEL (hard):
       API is deliberately not implemented);
     * errors are redacted through the same mechanism as the server adapter
       before they are stored;
-    * every request has a SHORT timeout, clamped to 1-3 seconds, so one slow
-      client API can never stall the Monitor loop; collect() never raises.
+    * every INDIVIDUAL request is bounded to 1-3 seconds; one full poll may
+      take multiple request budgets (a global poll deadline is a later,
+      explicit design). collect() never raises.
 
 CONTROL PLANE FORBIDDEN (read-only mandate): selecting proxies (PUT), mode
 changes or config reloads (PATCH/PUT on /configs), closing connections
@@ -47,6 +48,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import errno
 import http.client
 import json
 import os
@@ -64,7 +66,7 @@ DEFAULT_URL = "http://127.0.0.1:9090"
 DEFAULT_GROUP = None          # no guessing: the caller names the group to watch
 DEFAULT_TIMEOUT = 2.0
 MIN_TIMEOUT = 1.0
-MAX_TIMEOUT = 3.0             # a stuck client API must never stall the Monitor
+MAX_TIMEOUT = 3.0             # per-request bound; a poll may span several
 SECRET_ENV = "MIHOMO_API_SECRET"
 MAX_ERROR_BODY = 120          # bytes of a non-200 body kept for diagnostics
 
@@ -105,37 +107,45 @@ def parse_controller_url(url):
     byte (and never a secret) leaves the machine. Also refused: embedded
     credentials, non-root paths, query strings and fragments.
 
-    Error messages deliberately never echo the full URL: a URL can carry
-    user:pass credentials, and configuration errors end up in logs/stderr.
-    Only non-secret components (scheme, host, path, port) are named.
+    ANY malformed URL (bad port literal, out-of-range port, broken IPv6
+    brackets, ...) becomes a ConfigurationError -- never a ValueError/trace,
+    so the CLI always exits via "fatal configuration error" with rc=2.
+
+    Error messages deliberately never echo the full URL or user-supplied URL
+    fragments (path included): a URL can carry user:pass-like content, and
+    configuration errors end up in logs/stderr. Only vetted components
+    (scheme, host, port) are named.
     """
-    parts = urllib.parse.urlsplit(url)
-    if parts.scheme not in ("http", "https"):
+    try:
+        parts = urllib.parse.urlsplit(url)
+        if parts.scheme not in ("http", "https"):
+            raise ConfigurationError(
+                "mihomo controller URL scheme must be http(s), got %r" % parts.scheme)
+        if parts.username is not None or parts.password is not None \
+                or "@" in (parts.netloc or ""):
+            raise ConfigurationError(
+                "mihomo controller URL must not embed credentials (user:pass form)")
+        host = (parts.hostname or "").lower()
+        if host not in LOOPBACK_HOSTS:
+            raise ConfigurationError(
+                "mihomo controller URL must target the loopback interface "
+                "(127.0.0.1 / localhost / ::1), got host %r. The external-"
+                "controller is a client-local service and must never be exposed "
+                "to a network." % host)
+        port = parts.port  # raises ValueError for non-numeric / out-of-range
+        if port is None:
+            port = 443 if parts.scheme == "https" else 9090
+        if not 0 < port < 65536:
+            raise ConfigurationError("invalid mihomo controller port")
+        if parts.path not in ("", "/"):
+            raise ConfigurationError("mihomo controller URL must use the root path")
+        if parts.query or parts.fragment:
+            raise ConfigurationError(
+                "mihomo controller URL must not carry a query string or fragment")
+        return host, port, parts.scheme
+    except ValueError:
         raise ConfigurationError(
-            "mihomo controller URL scheme must be http(s), got %r" % parts.scheme)
-    if parts.username is not None or parts.password is not None \
-            or "@" in (parts.netloc or ""):
-        raise ConfigurationError(
-            "mihomo controller URL must not embed credentials (user:pass form)")
-    host = (parts.hostname or "").lower()
-    if host not in LOOPBACK_HOSTS:
-        raise ConfigurationError(
-            "mihomo controller URL must target the loopback interface "
-            "(127.0.0.1 / localhost / ::1), got host %r. The external-"
-            "controller is a client-local service and must never be exposed "
-            "to a network." % host)
-    port = parts.port
-    if port is None:
-        port = 443 if parts.scheme == "https" else 9090
-    if not 0 < port < 65536:
-        raise ConfigurationError("invalid mihomo controller port: %r" % (parts.port,))
-    if parts.path not in ("", "/"):
-        raise ConfigurationError(
-            "mihomo controller URL path must be empty or '/', got %r" % parts.path)
-    if parts.query or parts.fragment:
-        raise ConfigurationError(
-            "mihomo controller URL must not carry a query string or fragment")
-    return host, port, parts.scheme
+            "malformed mihomo controller URL (bad host or port)") from None
 
 
 def redact(text, secrets):
@@ -354,17 +364,16 @@ class MihomoClient:
                           % (status, (": %s" % body[:MAX_ERROR_BODY].decode("utf-8", "replace")
                                       .replace("\n", " ")) if body else ""))
         errors = [redact(e, self._secrets()) for e in errors]
-        checked_at = self._iso()
         if version is None:
             # failed poll: no valid data was obtained, so updated_at stays
             # null and the sample is sealed stale -- never "unreachable but
             # fresh", and no older success may be invented here (stateless).
-            return finish_enrichment(snap, checked_at, None,
+            # checked_at stamps when THIS (failed) poll finished.
+            return finish_enrichment(snap, self._iso(), None,
                                      error="; ".join(errors) or None)
 
         snap["reachable"] = True
         snap["version"] = version
-        updated_at = checked_at  # valid enrichment data obtained on THIS poll
 
         # 2..4) optional enrichment endpoints, each isolated
         configs = self._get_json("/configs", errors)
@@ -391,7 +400,11 @@ class MihomoClient:
             snap["traffic_up_bps"] = traffic["up"]
             snap["traffic_down_bps"] = traffic["down"]
 
-        return finish_enrichment(snap, checked_at, updated_at,
+        # checked_at/updated_at stamp the moment the WHOLE poll completed --
+        # AFTER the optional endpoints, per the documented semantics, never
+        # the moment /version answered.
+        finished_at = self._iso()
+        return finish_enrichment(snap, finished_at, finished_at,
                                  error="; ".join(errors) or None)
 
     def _iso(self):
@@ -403,47 +416,99 @@ class SecretFileError(Exception):
     """The --secret-file violates the permission contract (never a secret)."""
 
 
-def check_secret_mode(st_mode, path):
+# Branch point for the secret-file contract; module attribute so tests can
+# exercise both code paths deterministically on any OS.
+_WINDOWS = os.name == "nt"
+
+
+def check_secret_mode(st_mode, path, platform=None):
     """Enforce the secret-file permission contract on one stat result.
 
-    POSIX contract: the file must be a REGULAR file and carry NO group/other
-    permission bits -- 0400 and 0600 pass, 0644 / 0664 / 0666 and anything
-    more open are rejected. Fail-closed: the content is read only AFTER this
-    passes, so a rejected file's content can never reach an error message.
+    ALL platforms: the file must be a REGULAR file.
 
-    Windows note (documented in README): POSIX mode bits are not enforced by
-    the filesystem there; E4 v1 relies on filesystem ACLs and does not fully
-    validate on Windows (os.name == "nt").
+    POSIX: it must additionally be owner-readable (0400 / 0600 pass; 0000 and
+    0200 are rejected) and carry NO group/other permission bits (0644 / 0664 /
+    0666 and anything more open are rejected).
+
+    Windows: POSIX permission-bit rejection is NOT applied -- the NTFS mode
+    bits carry no access semantics there; E4 v1 relies on filesystem ACLs and
+    documents that limitation (see README).
     """
     import stat as stat_module
+    if platform is None:
+        platform = "windows" if _WINDOWS else "posix"
     if not stat_module.S_ISREG(st_mode):
         raise SecretFileError("secret file must be a regular file: %s" % path)
+    if platform == "windows":
+        return  # ACL territory; POSIX bits are meaningless on NTFS
+    if not st_mode & 0o400:
+        raise SecretFileError("secret file must be owner-readable: %s" % path)
     if st_mode & 0o077:
         raise SecretFileError(
             "secret file permissions too open (%s), want 0600 or stricter: %s"
             % (oct(st_mode & 0o777), path))
 
 
+def _read_secret_file(path):
+    """Read the secret file AFTER validating its permissions. POSIX uses an
+    O_NOFOLLOW descriptor + fstat so the checked object is the read object
+    (symlink best-effort rejection, no stat/open race). Any open/read failure
+    becomes SecretFileError -- never a traceback, never secret content.
+    """
+    if os.path.islink(path):
+        raise SecretFileError("secret file must not be a symlink: %s" % path)
+    if _WINDOWS:
+        try:
+            st = os.stat(path)
+        except FileNotFoundError:
+            raise SecretFileError("secret file not found: %s" % path) from None
+        except OSError:
+            raise SecretFileError("secret file not readable: %s" % path) from None
+        check_secret_mode(st.st_mode, path, platform="windows")
+        try:
+            with open(path, encoding="utf-8") as handle:
+                return handle.read().strip()
+        except OSError:
+            raise SecretFileError("secret file not readable: %s" % path) from None
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        raise SecretFileError("secret file not found: %s" % path) from None
+    except OSError as exc:
+        if getattr(exc, "errno", None) == errno.ELOOP:
+            raise SecretFileError(
+                "secret file must not be a symlink: %s" % path) from exc
+        raise SecretFileError("secret file not readable: %s" % path) from exc
+    fd_owned = True  # os.open handed it to us; fdopen takes over on success
+    try:
+        st = os.fstat(fd)
+        check_secret_mode(st.st_mode, path, platform="posix")
+        handle = os.fdopen(fd, "r", encoding="utf-8")
+        fd_owned = False  # the handle owns the fd now
+        try:
+            return handle.read().strip()
+        except OSError:
+            raise SecretFileError("secret file not readable: %s" % path) from None
+        finally:
+            handle.close()
+    finally:
+        if fd_owned:
+            os.close(fd)
+
+
 def resolve_secret(secret_file):
     """MIHOMO_API_SECRET environment wins; otherwise read --secret-file.
 
-    The file is permission-checked (0600/0400, regular file) BEFORE its
-    content is read, and error messages contain only the path and permission
-    bits -- never the secret content.
+    The file is permission-checked BEFORE its content is read, and error
+    messages contain only the path and permission bits -- never the secret
+    content, never a traceback.
     """
     env_secret = os.environ.get(SECRET_ENV, "")
     if env_secret:
         return env_secret
     if secret_file:
-        try:
-            st = os.stat(secret_file)
-        except FileNotFoundError:
-            raise SecretFileError("secret file not found: %s" % secret_file) from None
-        except OSError as exc:
-            raise SecretFileError("secret file not readable: %s" % secret_file) from exc
-        check_secret_mode(st.st_mode, secret_file)
-        with open(secret_file, encoding="utf-8") as handle:
-            return handle.read().strip()
+        return _read_secret_file(secret_file)
     return ""
 
 
