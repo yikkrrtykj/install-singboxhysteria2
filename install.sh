@@ -1497,6 +1497,22 @@ sync_api_secret_file() { # -> rc 0 when the derived file matches the live config
     write_api_secret_file "$secret"
 }
 
+# Existing-install bootstrap (S0), called BEFORE the interactive menu. A
+# failing permission hardening -- or a derived secret file that cannot be
+# brought back in sync with the config, which is the secret's authoritative
+# source -- must ABORT the installer here (error exits): the menu is never
+# entered and no management mutation can run against an unsafe or
+# desynced-credential state. Installations whose config carries no valid
+# monitor-api secret yet (Phase D migration not done) stay unaffected: sync
+# treats that as nothing-to-do.
+repair_existing_install_security_baseline() {
+    harden_sensitive_permissions ||
+        { error "敏感文件权限加固失败，请先人工检查磁盘/权限后再运行"; return 1; }
+    sync_api_secret_file ||
+        { error "monitor-api.secret 派生文件修复失败，请先人工检查磁盘/目录/权限后再运行"; return 1; }
+    return 0
+}
+
 # Idempotent permission repair for sensitive files. Existing files are forced
 # to 0600 (clients dir 0700, public cert 0644); missing files are skipped
 # without error; ANY chmod failure is fail-closed and callers must abort the
@@ -2854,13 +2870,12 @@ if has_any_installation_marker; then
     fi
 
     install_pkgs
-    # S0: idempotent permission repair on every existing install, BEFORE the
-    # interactive menu runs. A failing chmod aborts here -- never continue
-    # operating on world-readable credentials.
-    harden_sensitive_permissions || error "敏感文件权限加固失败，请先人工修复权限后再运行"
-    # S0: config wins over the derived collector file; repair drift instead of
-    # letting the collector authenticate with a stale secret.
-    sync_api_secret_file || warning "monitor-api.secret 派生文件修复失败，本机 collector 认证可能受影响"
+    # S0: fail-closed bootstrap repair on every existing install, BEFORE the
+    # interactive menu runs. A failing chmod or an unrepairable derived secret
+    # file aborts here (see repair_existing_install_security_baseline) -- the
+    # menu is never entered, so no management mutation can continue on an
+    # unsafe or desynced-credential state.
+    repair_existing_install_security_baseline
     echo ""
     info "sing-box-reality-hysteria2 已安装"
     show_status

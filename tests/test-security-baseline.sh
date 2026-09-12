@@ -9,8 +9,12 @@
 #   - service.api secret: generation, migration, rerun stability,
 #     exact-checker rejection of secret-less monitor-api, derived 0600 file,
 #     config-is-authoritative repair, no secret leakage into audit output
-#   - credential preservation gate: everything except .services byte-identical
-#     across the API-auth migration (Reality/HY2 users, keys, ports, cert paths)
+#   - credential preservation gate: the canonicalized config EXCLUDING
+#     .services is identical across the API-auth migration (Reality/HY2
+#     users, keys, ports, cert paths -- semantic preservation, not raw
+#     byte-for-byte JSON identity)
+#   - existing-install baseline repair: fail-closed on an unrepairable
+#     derived secret file, no-op for healthy and pre-Phase-D installs
 #
 # Like the phase-c/d suites, the tests really EXECUTE the shell functions: the
 # phase-c + s0 + phase-d blocks are extracted from install.sh and sourced with
@@ -53,7 +57,7 @@ assert_grep 'openssl rand -hex 32' "$INSTALL_SH" "API secret comes from a CSPRNG
 assert_no_grep '^umask 077' "$INSTALL_SH" "no global umask change (scoped hardening only)"
 assert_grep 'write_api_secret_file "\$monitor_api_secret" \|\| error' "$INSTALL_SH" "fresh install writes the derived secret file fail-closed"
 assert_grep 'harden_sensitive_permissions \|\| error' "$INSTALL_SH" "fresh install hardens permissions fail-closed"
-assert_grep 'harden_sensitive_permissions \|\| error "敏感文件权限加固失败，请先人工修复权限' "$INSTALL_SH" "existing-install menu repairs permissions fail-closed"
+assert_grep '^repair_existing_install_security_baseline\(\)' "$INSTALL_SH" "fail-closed existing-install baseline repair helper exists"
 assert_no_grep '单机低并发场景下继续执行' "$INSTALL_SH" "unlocked fallback is gone"
 assert_grep 'flock -w "\$SB_LOCK_TIMEOUT" 9' "$INSTALL_SH" "lock acquisition uses a finite timeout"
 assert_grep '操作已中止（fail-closed）' "$INSTALL_SH" "lock failure aborts the operation"
@@ -71,6 +75,16 @@ else
 fi
 backup_chmod="$(grep -c 'chmod 0600 "\$backup_path" 2>/dev/null\|chmod 0600 "\$backup_cfg" 2>/dev/null' "$INSTALL_SH")"
 assert_rc 2 "$backup_chmod" "both backup paths enforce 0600 explicitly"
+assert_no_grep '派生文件修复失败，本机 collector 认证可能受影响' "$INSTALL_SH" "fail-open sync warning is gone"
+repair_body="$(awk '/^repair_existing_install_security_baseline\(\) \{/,/^\}/' "$INSTALL_SH")"
+assert_grep 'harden_sensitive_permissions \|\|' <(printf '%s\n' "$repair_body") "permission repair failure aborts via error()"
+assert_grep 'sync_api_secret_file \|\|' <(printf '%s\n' "$repair_body") "derived-file repair failure aborts via error()"
+assert_no_grep 'warning' <(printf '%s\n' "$repair_body") "repair helper never warns-and-continues"
+if grep -qE '^[[:space:]]*repair_existing_install_security_baseline$' "$INSTALL_SH"; then
+    pass "existing-install menu path calls the fail-closed baseline repair"
+else
+    fail "existing-install menu path calls the fail-closed baseline repair"
+fi
 
 section "extract blocks and prepare sandbox"
 awk '/# >>> phase-c client-management >>>/,/# <<< phase-d singbox-1.14-api <<</' \
@@ -339,9 +353,9 @@ sec3="$(config_secret)"
 if [[ "$sec3" =~ ^[0-9a-f]{64}$ ]]; then pass "migrated secret is 64 hex chars"; else fail "migrated secret malformed: '$sec3'"; fi
 fp_after="$(jq -S 'del(.services)' "$SB_SERVER_CONFIG")"
 if [ "$fp_before" = "$fp_after" ]; then
-    pass "credential gate: config minus .services is byte-identical (users/ports/keys/cert paths)"
+    pass "credential gate: canonicalized config excluding .services is identical (names/uuids/passwords/keys/ports/cert paths)"
 else
-    fail "credential gate: non-service config bytes changed by the migration"
+    fail "credential gate: non-service config content changed by the migration"
 fi
 assert_grep 'OLD-REALITY-UUID' "$SB_SERVER_CONFIG" "reality uuid preserved"
 assert_grep 'VMIX-HY2-PASSWORD' "$SB_SERVER_CONFIG" "hy2 password preserved"
@@ -428,7 +442,7 @@ hold_lock() {
 release_lock() {
     [ -n "$holder_pid" ] && kill "$holder_pid" 2>/dev/null
     wait "$holder_pid" 2>/dev/null
-    rm -rf -- "$SB_LOCK_FILE.mocklock" "$SB_LOCK_FILE.held"
+    rm -rf -- "$SB_LOCK_FILE".mocklock.* "$SB_LOCK_FILE.held"
     holder_pid=""
 }
 hold_lock && {
@@ -556,6 +570,65 @@ assert_rc 0 $? "upgrade for leak scan succeeds"
 leak="$(jq -r '[(.services // [])[] | select(.tag == "monitor-api")][0].secret' "$SB_SERVER_CONFIG")"
 assert_no_grep "$leak" "$TMP/s11.out" "API secret absent from all upgrade output"
 assert_no_grep 'OLD-KEY|OLD-HY2-PASSWORD|OLD-REALITY-UUID' "$TMP/s11.out" "user credentials absent from upgrade output"
+
+section "S12: existing-install baseline repair is fail-closed"
+# error() must be observable: record the invocation instead of the harness
+# default. In the real installer error() exits, so ERROR_CALLED=1 + rc!=0
+# means the interactive menu is never reached.
+ERROR_CALLED=0
+error() { printf '  [err ] %s\n' "$*"; ERROR_CALLED=1; return 1; }
+GOOD="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+# S12a: healthy install -> repair succeeds, nothing rewritten, no warnings
+setup_upgrade_sandbox
+add_api_service_with_secret "$GOOD"
+printf '%s\n' "$GOOD" > "$SB_API_SECRET_FILE"
+repair_existing_install_security_baseline > "$TMP/s12a.out" 2>&1
+assert_rc 0 $? "healthy repair succeeds"
+assert_no_grep '不一致|缺失' "$TMP/s12a.out" "no drift/missing warning on the healthy path"
+assert_no_grep "$GOOD" "$TMP/s12a.out" "no secret in repair output"
+if [ "$(config_secret)" = "$GOOD" ]; then pass "config secret untouched (no rotation)"; else fail "config secret changed by repair"; fi
+if [ "$(tr -d '\r\n' < "$SB_API_SECRET_FILE")" = "$GOOD" ]; then pass "derived file untouched on the healthy path"; else fail "derived file rewritten on the healthy path"; fi
+
+# S12b: stale derived file -> repaired from the config, config unchanged
+printf 'stale-secret\n' > "$SB_API_SECRET_FILE"
+repair_existing_install_security_baseline > "$TMP/s12b.out" 2>&1
+assert_rc 0 $? "stale derived file repaired successfully"
+assert_grep '不一致' "$TMP/s12b.out" "drift repair announced"
+assert_no_grep "$GOOD" "$TMP/s12b.out" "drift warning carries no secret"
+if [ "$(tr -d '\r\n' < "$SB_API_SECRET_FILE")" = "$GOOD" ]; then pass "derived file restored from config"; else fail "derived file not restored"; fi
+if [ "$(config_secret)" = "$GOOD" ]; then pass "config unchanged by repair"; else fail "config mutated by repair"; fi
+
+# S12c: forced write failure -> installer aborts, menu NOT entered
+printf 'stale-secret\n' > "$SB_API_SECRET_FILE"
+fp_before="$(jq -S 'del(.services)' "$SB_SERVER_CONFIG")"
+write_api_secret_file() { return 1; }
+ERROR_CALLED=0
+repair_existing_install_security_baseline > "$TMP/s12c.out" 2>&1
+assert_rc 1 $? "repair aborts when the derived file cannot be written"
+if [ "$ERROR_CALLED" = "1" ]; then pass "error() invoked (real installer exits: menu NOT entered)"; else fail "no abort signal on repair failure"; fi
+assert_grep '修复失败' "$TMP/s12c.out" "abort reason stated"
+assert_no_grep "$GOOD" "$TMP/s12c.out" "abort output prints no secret"
+unset -f write_api_secret_file
+if [ "$(config_secret)" = "$GOOD" ]; then pass "config secret unchanged by the failed repair"; else fail "config secret changed by the failed repair"; fi
+if [ "$(jq -S 'del(.services)' "$SB_SERVER_CONFIG")" = "$fp_before" ]; then
+    pass "Reality/HY2 credentials unchanged by the failed repair"
+else
+    fail "Reality/HY2 credentials changed by the failed repair"
+fi
+
+# S12d: pre-Phase-D config (no valid secret) must NOT lock the menu
+setup_upgrade_sandbox
+write_migrated_config
+rm -f "$SB_API_SECRET_FILE"
+ERROR_CALLED=0
+repair_existing_install_security_baseline > "$TMP/s12d.out" 2>&1
+assert_rc 0 $? "no-secret config: repair is a no-op (menu stays reachable)"
+assert_no_grep '修复失败' "$TMP/s12d.out" "no failure reported without a configured secret"
+
+# restore the harness-default error() behaviour
+ERROR_CALLED=0
+error() { printf '  [err ] %s\n' "$*"; }
 
 printf '\n== summary ==\n'
 printf '  pass=%d fail=%d\n' "$PASS" "$FAIL"
