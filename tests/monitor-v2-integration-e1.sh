@@ -28,13 +28,25 @@
 #   EXPECT_USER     hard gate: this API USER must appear in devices, else
 #                   FAIL. An empty devices dict with a named USER is a FAIL,
 #                   never an INCONCLUSIVE -- the operator named the USER.
-#   EXPECT_INBOUND  optional hard gate: vless-in (Reality) / hy2-in (HY2)
-#                   must be observed, else FAIL. Lets Reality and HY2 run as
+#   EXPECT_INBOUND  optional hard gate: vless-in (Reality) / hy2-in (HY2).
+#                   NOT just a presence check: it binds EVERY piece of
+#                   evidence -- the traffic delta AND the closed-id delta --
+#                   to that USER + INBOUND scope (traffic reads only
+#                   devices[USER]["protocols"][INBOUND], closures only
+#                   recent_connections rows carried by that inbound), so a
+#                   sibling protocol's historical totals or closures can
+#                   never make the canary pass. Lets Reality and HY2 run as
 #                   separate production canaries.
 #   REQUIRE_CLOSED  1 = a NEW CLOSED/finalize beyond baseline is REQUIRED,
 #                       else FAIL: no CLOSED/finalize evidence observed.
 #                   0 = closed evidence stays informational; the connection
 #                       may still be active at window end.
+#
+# STRICT CANARY: setting ANY gate (EXPECT_USER / EXPECT_INBOUND /
+# REQUIRE_CLOSED=1) makes a missing sing-box binary or an unreachable
+# service.api a FAIL (exit 1) -- a production canary must never answer a
+# broken environment with SKIP (exit 0). Only the gate-free observational
+# run SKIPs off-VPS.
 set -uo pipefail
 
 EXIT_PASS=0
@@ -50,6 +62,13 @@ LIFECYCLE_WINDOW="${LIFECYCLE_WINDOW:-20}"
 EXPECT_USER="${EXPECT_USER:-}"
 EXPECT_INBOUND="${EXPECT_INBOUND:-}"
 REQUIRE_CLOSED="${REQUIRE_CLOSED:-0}"
+
+fail_out() {
+    printf '\nRESULT: FAIL\n'
+    printf '  reason: %s\n' "$*"
+    printf '  exit=1\n'
+    exit "$EXIT_FAIL"
+}
 
 # Configuration is validated BEFORE anything else -- even before the SKIP
 # checks -- so a mistyped gate variable can never look like a green run.
@@ -68,19 +87,36 @@ case "$EXPECT_INBOUND" in
         ;;
 esac
 
+# Strict canary: any gate turns a broken environment into a FAIL, never a
+# SKIP -- "SKIP exit 0" must never masquerade as a canary result.
+STRICT_CANARY=0
+if [ -n "$EXPECT_USER" ] || [ -n "$EXPECT_INBOUND" ] || [ "$REQUIRE_CLOSED" = "1" ]; then
+    STRICT_CANARY=1
+fi
+
 if [ ! -x "$SING_BOX_BIN" ]; then
+    if [ "$STRICT_CANARY" = "1" ]; then
+        fail_out "strict canary requires $SING_BOX_BIN (binary not found; run on the VPS)"
+    fi
     echo "SKIP: $SING_BOX_BIN not present (integration test must run on the server)"
     exit "$EXIT_PASS"
 fi
-if ! "$PY" -c 'import socket,sys
+# The probe follows --url / API_URL (same endpoint the collectors will use).
+if ! "$PY" -c 'import socket, sys, urllib.parse
+u = urllib.parse.urlsplit(sys.argv[1])
+host = u.hostname or "127.0.0.1"
+port = u.port or 9091
 s = socket.socket(); s.settimeout(2)
 try:
-    s.connect(("127.0.0.1", 9091))
+    s.connect((host, int(port)))
 except OSError:
     sys.exit(1)
 finally:
-    s.close()' 2>/dev/null; then
-    echo "SKIP: service.api not reachable on 127.0.0.1:9091 (is sing-box running with service.api enabled?)"
+    s.close()' "$API_URL" 2>/dev/null; then
+    if [ "$STRICT_CANARY" = "1" ]; then
+        fail_out "strict canary requires service.api at $API_URL (unreachable; is sing-box running?)"
+    fi
+    echo "SKIP: service.api not reachable at $API_URL (is sing-box running with service.api enabled?)"
     exit "$EXIT_PASS"
 fi
 
@@ -89,12 +125,6 @@ trap 'rm -rf -- "$TMP"' EXIT
 FAIL=0
 TAB="$(printf '\t')"
 check() { if [ "$1" = "OK" ]; then printf '  PASS %s\n' "$2"; else FAIL=$((FAIL + 1)); printf '  FAIL %s (%s)\n' "$2" "$1"; fi; }
-fail_out() {
-    printf '\nRESULT: FAIL\n'
-    printf '  reason: %s\n' "$*"
-    printf '  exit=1\n'
-    exit "$EXIT_FAIL"
-}
 
 echo "== phase 1: structural (6s) =="
 "$PY" "$ROOT/monitor-v2/collector.py" --url "$API_URL" --duration 6 --pretty \
@@ -127,21 +157,15 @@ fi
 
 echo ""
 echo "== phase 2: lifecycle (${LIFECYCLE_WINDOW}s) =="
-if [ -n "$EXPECT_USER" ]; then
-    echo "  expecting USER=$EXPECT_USER (drive a client connection now)"
-else
-    echo "  no EXPECT_USER set; observing whatever client traffic occurs"
-fi
-if [ -n "$EXPECT_INBOUND" ]; then
-    echo "  expecting INBOUND=$EXPECT_INBOUND"
-fi
 if [ "$REQUIRE_CLOSED" = "1" ]; then
     echo "  REQUIRE_CLOSED=1: a NEW CLOSED/finalize beyond baseline is required"
 fi
 
-# Baseline BEFORE the window: the reset replay makes bare recently_closed>0
-# and cumulative totals worthless as evidence -- the gate only accepts
-# baseline -> final deltas (traffic and recent-closed IDs).
+# Baseline BEFORE any traffic prompt: the reset replay makes bare
+# recently_closed>0 and cumulative totals worthless as evidence, and an
+# early "drive a client now" hint would leak in-window traffic into the
+# baseline (baseline == final hides the very delta the gate needs).
+echo "  Capturing baseline. DO NOT start client traffic yet."
 "$PY" "$ROOT/monitor-v2/collector.py" --url "$API_URL" --once --pretty \
     >"$TMP/baseline.json" 2>"$TMP/base.err.txt"
 brc=$?
@@ -154,6 +178,22 @@ b = json.load(open(sys.argv[1]))
 print("  baseline: devices=%d recently_closed=%d (historical replay included)"
       % (len(b.get("devices") or {}), b.get("recently_closed") or 0))' \
     "$TMP/baseline.json"
+
+echo "  BASELINE CAPTURED"
+echo "  Start client traffic NOW:"
+if [ -n "$EXPECT_USER" ]; then
+    echo "    USER=$EXPECT_USER"
+else
+    echo "    USER=any (no EXPECT_USER gate)"
+fi
+if [ -n "$EXPECT_INBOUND" ]; then
+    echo "    INBOUND=$EXPECT_INBOUND"
+fi
+echo "    1. connect the real production node"
+echo "    2. generate a small amount of traffic"
+echo "    3. stop/close the connection before the window ends"
+echo "  Starting observation window in 2 seconds..."
+sleep 2
 
 "$PY" "$ROOT/monitor-v2/collector.py" --url "$API_URL" --duration "$LIFECYCLE_WINDOW" --pretty \
     >"$TMP/life.json" 2>"$TMP/life.err.txt"

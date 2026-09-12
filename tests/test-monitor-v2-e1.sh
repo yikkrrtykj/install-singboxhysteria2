@@ -22,7 +22,7 @@ PASS=0
 FAIL=0
 # The gate at the bottom of this file fails unless exactly this many
 # assertions ran AND passed, so unreachable sections can never fake success.
-EXPECTED_PASS=158
+EXPECTED_PASS=188
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
@@ -662,8 +662,9 @@ def device(up, down, protos=("vless-in",), recent=(), active=0):
     status = "ACTIVE" if active else ("RECENT ACTIVITY" if recent else "IDLE")
     return {
         "status": status,
-        "protocols": {p: {"uplink_total": float(up), "downlink_total": float(down)}
-                      for p in protos},
+        "protocols": {p: {"active_connections": active,
+                          "uplink_total": float(up),
+                          "downlink_total": float(down)} for p in protos},
         "active_connections": active,
         "uplink_total": float(up), "downlink_total": float(down),
         "recent_sources": ["203.0.113.9:51000"] if recent else [],
@@ -832,8 +833,8 @@ assert_eq "$integ_rc" "1" "EXPECT_INBOUND=trojan-in -> configuration error exits
 assert_contains "configuration error" "$integ_out" "EXPECT_INBOUND=trojan-in reported as a configuration error"
 integ_out="$(SING_BOX_BIN=/nonexistent-sing-box REQUIRE_CLOSED=1 EXPECT_USER=legacy bash "$INTEG" 2>&1)"
 integ_rc=$?
-assert_eq "$integ_rc" "0" "valid gate config still SKIPs cleanly off-VPS (exit 0)"
-assert_contains "SKIP" "$integ_out" "off-VPS run with valid config reports SKIP"
+assert_eq "$integ_rc" "1" "gates set + missing binary -> strict canary FAIL (never SKIP)"
+assert_contains "strict canary" "$integ_out" "strict gate run reports the strict canary failure"
 
 section "G4: gate evaluator CLI -- file inputs and exit codes"
 printf '%s' '{"stale": false, "recently_closed": 1, "active_connections": 0, "devices": {"legacy": {"status": "RECENT ACTIVITY", "uplink_total": 100, "downlink_total": 50, "protocols": {"vless-in": {}}, "active_connections": 0, "recent_connections": [{"id": "old1", "inbound": "vless-in", "source": "203.0.113.9:51000", "uplink_total": 0.0, "downlink_total": 0.0}]}}}' > "$TMP/gate-base.json"
@@ -851,6 +852,138 @@ assert_eq "$?" "2" "CLI: nothing observed in-window exits 2 (INCONCLUSIVE)"
 "$PY" "$GATE" --baseline "$TMP/gate-base.json" --final "$TMP/gate-final.json" \
     --require-closed 2 >/dev/null 2>&1
 assert_eq "$?" "1" "CLI: REQUIRE_CLOSED=2 is a configuration error (exit 1)"
+
+section "G5: inbound-scoped evidence -- USER + INBOUND (cases L1-L4 + combo)"
+snap="$(PYTHONPATH="$ROOT/monitor-v2" "$PY" -c '
+import json
+from lifecycle_gate import evaluate, scope_recent_ids, scope_totals
+
+def duo(vless_up, vless_down, hy2_up, hy2_down,
+        vless_recent=(), hy2_recent=(), vless_active=0, hy2_active=0):
+    def proto(up, down, active):
+        return {"active_connections": active,
+                "uplink_total": float(up), "downlink_total": float(down)}
+    recents = ([{"id": cid, "inbound": "vless-in", "source": "203.0.113.9:51000",
+                 "uplink_total": 0.0, "downlink_total": 0.0}
+                for cid in vless_recent]
+               + [{"id": cid, "inbound": "hy2-in", "source": "203.0.113.9:51001",
+                   "uplink_total": 0.0, "downlink_total": 0.0}
+                  for cid in hy2_recent])
+    status = "ACTIVE" if (vless_active or hy2_active) else \
+        ("RECENT ACTIVITY" if recents else "IDLE")
+    return {
+        "status": status,
+        "protocols": {"vless-in": proto(vless_up, vless_down, vless_active),
+                      "hy2-in": proto(hy2_up, hy2_down, hy2_active)},
+        "active_connections": vless_active + hy2_active,
+        "uplink_total": float(vless_up + hy2_up),
+        "downlink_total": float(vless_down + hy2_down),
+        "recent_sources": ["203.0.113.9:51000", "203.0.113.9:51001"] if recents else [],
+        "recent_connections": recents,
+    }
+
+def snap(devices=(), stale=False):
+    return {
+        "stale": stale, "last_error": None, "batch_count": 1,
+        "active_connections": sum(d[1]["active_connections"] for d in devices),
+        "recently_closed": sum(len(d[1]["recent_connections"]) for d in devices),
+        "devices": {name: dev for name, dev in devices},
+    }
+
+out = {}
+base = snap([("legacy", duo(100, 50, 200, 60))])
+
+# scope helper contract itself (the user asked these signatures explicitly)
+out["S_totals_hy2"] = str(scope_totals(base, "legacy", "hy2-in"))
+out["S_totals_user"] = str(scope_totals(base, "legacy", ""))
+hy2_final = snap([("legacy", duo(100, 50, 260, 66, vless_recent=("v1",), hy2_recent=("h9",)))])
+out["S_ids_hy2"] = json.dumps(sorted(scope_recent_ids(hy2_final, "legacy", "hy2-in")))
+out["S_ids_all"] = json.dumps(sorted(scope_recent_ids(hy2_final, "legacy", "")))
+
+# L1: EXPECT_INBOUND=hy2-in but only vless-in grew traffic -> FAIL
+final = snap([("legacy", duo(1100, 50, 200, 60, vless_recent=("v1",)))])
+r = evaluate(base, final, "legacy", "hy2-in", True)
+out["L1_verdict"] = r["verdict"]; out["L1_reason"] = r["reason"]
+
+# L2: only a vless-in CLOSED, no traffic anywhere -> FAIL
+final = snap([("legacy", duo(100, 50, 200, 60, vless_recent=("v1",)))])
+r = evaluate(base, final, "legacy", "hy2-in", True)
+out["L2_verdict"] = r["verdict"]; out["L2_reason"] = r["reason"]
+
+# L2b: hy2 traffic grows, but the ONLY new closed id is vless-in -> FAIL
+# (a sibling-protocol closure must never satisfy the hy2 REQUIRE_CLOSED gate)
+final = snap([("legacy", duo(100, 50, 260, 66, vless_recent=("v1",)))])
+r = evaluate(base, final, "legacy", "hy2-in", True)
+out["L2b_verdict"] = r["verdict"]; out["L2b_reason"] = r["reason"]
+out["L2b_closed_fail"] = any(
+    status == "FAIL" and text.startswith("no CLOSED/finalize evidence observed")
+    for status, text in r["lines"])
+
+# L3: hy2-in traffic delta + hy2-in new CLOSED -> PASS
+final = snap([("legacy", duo(100, 50, 260, 66, hy2_recent=("h9",)))])
+r = evaluate(base, final, "legacy", "hy2-in", True)
+out["L3_verdict"] = r["verdict"]; out["L3_exit"] = r["exit"]
+
+# L4: vless-in traffic delta + vless-in new CLOSED -> PASS
+final = snap([("legacy", duo(1100, 55, 200, 60, vless_recent=("v1",)))])
+r = evaluate(base, final, "legacy", "vless-in", True)
+out["L4_verdict"] = r["verdict"]; out["L4_exit"] = r["exit"]
+
+# combo: same USER owns both protocols; vless-in did +1000 bytes and closed
+# id v1 while hy2-in did NOTHING in the window
+combo = snap([("legacy", duo(1100, 50, 200, 60, vless_recent=("v1",)))])
+r = evaluate(base, combo, "legacy", "hy2-in", True)
+out["C_hy2_verdict"] = r["verdict"]; out["C_hy2_reason"] = r["reason"]
+r = evaluate(base, combo, "legacy", "vless-in", True)
+out["C_vless_verdict"] = r["verdict"]; out["C_vless_exit"] = r["exit"]
+
+print(json.dumps(out))
+')"
+assert_eq "$(snap_field "$snap" 'snap["S_totals_hy2"]')" "(200.0, 60.0)" "scope_totals(hy2-in) reads ONLY the hy2-in protocol totals"
+assert_eq "$(snap_field "$snap" 'snap["S_totals_user"]')" "(300.0, 110.0)" "scope_totals without inbound keeps the USER aggregate"
+assert_eq "$(snap_field "$snap" 'snap["S_ids_hy2"]')" '["h9"]' "scope_recent_ids(hy2-in) drops the vless-in closure"
+assert_eq "$(snap_field "$snap" 'snap["S_ids_all"]')" '["h9", "v1"]' "scope_recent_ids without inbound keeps both closures"
+assert_eq "$(snap_field "$snap" 'snap["L1_verdict"]')" "FAIL" "L1: EXPECT_INBOUND=hy2-in with only vless-in traffic -> FAIL"
+assert_contains "no traffic delta beyond baseline" "$snap" "L1 fails the hy2-scoped traffic gate"
+assert_contains "uplink 200->200" "$snap" "L1 delta numbers are hy2-in scoped (vless growth invisible)"
+assert_eq "$(snap_field "$snap" 'snap["L2_verdict"]')" "FAIL" "L2: only a vless-in CLOSED, no traffic -> FAIL"
+assert_contains "no traffic delta beyond baseline" "$snap" "L2 fails the hy2-scoped traffic gate"
+assert_eq "$(snap_field "$snap" 'snap["L2b_verdict"]')" "FAIL" "L2b: hy2 traffic but only a vless-in CLOSED -> FAIL"
+assert_contains "no lifecycle evidence observed" "$snap" "L2b hy2 scope shows no lifecycle of its own"
+assert_eq "$(snap_field "$snap" 'snap["L2b_closed_fail"]')" "True" "L2b: vless-in closure cannot satisfy the hy2 REQUIRE_CLOSED gate"
+assert_eq "$(snap_field "$snap" 'snap["L3_verdict"]')" "PASS" "L3: hy2-in traffic + hy2-in CLOSED -> PASS"
+assert_eq "$(snap_field "$snap" 'snap["L3_exit"]')" "0" "L3 exits 0"
+assert_eq "$(snap_field "$snap" 'snap["L4_verdict"]')" "PASS" "L4: vless-in traffic + vless-in CLOSED -> PASS"
+assert_eq "$(snap_field "$snap" 'snap["L4_exit"]')" "0" "L4 exits 0"
+assert_eq "$(snap_field "$snap" 'snap["C_hy2_verdict"]')" "FAIL" "combo: vless-in growth cannot make the hy2-in canary pass"
+assert_contains "uplink 200->200" "$snap" "combo reason shows hy2-in scoped zero delta"
+assert_eq "$(snap_field "$snap" 'snap["C_vless_verdict"]')" "PASS" "combo: same evidence passes the vless-in canary"
+assert_eq "$(snap_field "$snap" 'snap["C_vless_exit"]')" "0" "combo vless-in exits 0"
+
+section "G6: strict canary environment gating (L5-L8) -- no SKIP for gated runs"
+printf '#!/usr/bin/env true\n' > "$TMP/dummy-sing-box"
+chmod +x "$TMP/dummy-sing-box"
+DEAD_URL="http://127.0.0.1:1"
+integ_out="$(SING_BOX_BIN=/nonexistent-sing-box bash "$INTEG" 2>&1)"
+integ_rc=$?
+assert_eq "$integ_rc" "0" "L5: no gates + no sing-box -> SKIP exit 0"
+assert_contains "SKIP" "$integ_out" "L5 reports SKIP"
+integ_out="$(SING_BOX_BIN=/nonexistent-sing-box EXPECT_USER=legacy bash "$INTEG" 2>&1)"
+integ_rc=$?
+assert_eq "$integ_rc" "1" "L6: EXPECT_USER + no sing-box -> FAIL exit 1"
+assert_contains "strict canary" "$integ_out" "L6 reports the strict canary failure"
+integ_out="$(SING_BOX_BIN=/nonexistent-sing-box EXPECT_INBOUND=hy2-in bash "$INTEG" 2>&1)"
+integ_rc=$?
+assert_eq "$integ_rc" "1" "L7: EXPECT_INBOUND + no sing-box -> FAIL exit 1"
+assert_contains "strict canary" "$integ_out" "L7 reports the strict canary failure"
+integ_out="$(SING_BOX_BIN="$TMP/dummy-sing-box" REQUIRE_CLOSED=1 API_URL="$DEAD_URL" bash "$INTEG" 2>&1)"
+integ_rc=$?
+assert_eq "$integ_rc" "1" "L8: REQUIRE_CLOSED=1 + API unreachable -> FAIL exit 1"
+assert_contains "strict canary" "$integ_out" "L8 reports the strict canary failure"
+integ_out="$(SING_BOX_BIN="$TMP/dummy-sing-box" API_URL="$DEAD_URL" bash "$INTEG" 2>&1)"
+integ_rc=$?
+assert_eq "$integ_rc" "0" "no gates + dummy binary + API unreachable -> SKIP exit 0"
+assert_contains "SKIP" "$integ_out" "observational run still SKIPs on a dead API"
 
 printf '\n== summary ==\n'
 printf '  pass=%d fail=%d (expected pass=%d)\n' "$PASS" "$FAIL" "$EXPECTED_PASS"

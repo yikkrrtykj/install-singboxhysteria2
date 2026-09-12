@@ -152,17 +152,20 @@ HY2 多个逻辑连接共享同一 QUIC source endpoint 属正常现象，按独
 ## 测试
 
 ```bash
-# E1 回归（158 断言：E1-01..E1-22 + 官方事件 fixture + T10 请求/响应双向真帧验证 +
-# T11 空闲流心跳 + G1..G4 集成 canary 门槛）。脚本末尾只有唯一 exit，并用
-# EXPECTED_PASS 门槛强制“跑满 158 且全过”才算成功。
+# E1 回归（188 断言：E1-01..E1-22 + 官方事件 fixture + T10 请求/响应双向真帧验证 +
+# T11 空闲流心跳 + G1..G6 集成 canary 门槛：合成判定 A-K、USER+INBOUND 作用域
+# L1-L4/combo、strict 环境门槛 L5-L8）。脚本末尾只有唯一 exit，并用
+# EXPECTED_PASS 门槛强制“跑满 188 且全过”才算成功。
 bash tests/test-monitor-v2-e1.sh
 
-# Linux 集成（仅当 /root/sbox/sing-box 与 127.0.0.1:9091 存在时执行，否则 SKIP）
+# Linux 集成（无门槛的观察运行在非 VPS 环境 SKIP=0）
 # 三态退出码：PASS=0 / FAIL=1 / INCONCLUSIVE=2（非法配置也是 FAIL=1）。
 bash tests/monitor-v2-integration-e1.sh
 ```
 
-集成脚本 phase 2 先抓一次 `--once` baseline，再开 LIFECYCLE_WINDOW 窗口，
+集成脚本 phase 2 先抓一次 `--once` baseline（提示 DO NOT start client
+traffic yet），成功后提示 Start client traffic NOW 并倒计时 2 秒才开窗 --
+避免操作者提前产生的流量混进 baseline（baseline == final 会掩盖 delta）。
 判定交给 `monitor-v2/lifecycle_gate.py`（纯逻辑，可用合成快照本地回归）。
 service.api 初始 reset 会重放 ~1000 条历史关闭连接、累计总量从不清零，所以
 裸的 `recently_closed > 0` / `uplink_total > 0` 不构成任何证据；门槛只认
@@ -174,20 +177,39 @@ ID delta（本窗口新 CLOSED/finalize）。`active_connections > 0` 永远不�
 
 - `EXPECT_USER=legacy`：硬门槛，devices 里必须出现该 USER，否则 FAIL
   （devices 为空 + 指定了 USER 同样是 FAIL，绝不降级为 INCONCLUSIVE）；
-- `EXPECT_INBOUND=vless-in|hy2-in`：可选硬门槛，Reality / HY2 分开跑 canary；
+- `EXPECT_INBOUND=vless-in|hy2-in`：硬门槛，**不只是检查协议存在**：它把
+  traffic delta 与 CLOSED delta 全部限定到 USER + INBOUND（只读
+  `protocols[inbound]` 的 totals、只认该 inbound 的 recent-closed ID），
+  同一 USER 的兄弟协议（如 vless-in）的增长或关闭永远帮 hy2-in canary
+  过不了关；
 - `REQUIRE_CLOSED=1`：必须出现 baseline 之外的新关闭 ID，否则
   FAIL: no CLOSED/finalize evidence observed。
 
-没有 EXPECT_USER 且窗口内完全没有真实客户端生命周期时报 `INCONCLUSIVE`
-（exit 2），永远不算 PASS；`SOURCE_PRESENT` 只输出布尔值。
+strict canary：只要设置了任一门槛（EXPECT_USER / EXPECT_INBOUND /
+REQUIRE_CLOSED=1），sing-box binary 缺失或 service.api 不可达 = FAIL
+（exit 1），绝不 SKIP；只有无门槛的观察运行才允许在非 VPS 环境 SKIP
+（exit 0）。
+
+没有设置任何门槛且窗口内完全没有真实客户端生命周期时报 `INCONCLUSIVE`
+（exit 2），永远不算 PASS；`SOURCE_PRESENT` 只输出布尔值，不参与
+identity / traffic 记账 / CLOSED 匹配。
 
 生产 canary 推荐（Reality / HY2 各跑一次，两次都 PASS 才算 E1 canary 通过）：
 
 ```bash
-EXPECT_USER=legacy REQUIRE_CLOSED=1 EXPECT_INBOUND=vless-in LIFECYCLE_WINDOW=30 \
-    bash tests/monitor-v2-integration-e1.sh   # Reality
-EXPECT_USER=legacy REQUIRE_CLOSED=1 EXPECT_INBOUND=hy2-in  LIFECYCLE_WINDOW=30 \
-    bash tests/monitor-v2-integration-e1.sh   # HY2
+# Reality
+EXPECT_USER=legacy \
+EXPECT_INBOUND=vless-in \
+REQUIRE_CLOSED=1 \
+LIFECYCLE_WINDOW=30 \
+bash tests/monitor-v2-integration-e1.sh
+
+# HY2
+EXPECT_USER=legacy \
+EXPECT_INBOUND=hy2-in \
+REQUIRE_CLOSED=1 \
+LIFECYCLE_WINDOW=30 \
+bash tests/monitor-v2-integration-e1.sh
 ```
 
 测试 fixture 位于 `monitor-v2/fixtures/events-*.json`，字段与官方 proto 对应

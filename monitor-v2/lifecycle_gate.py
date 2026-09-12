@@ -19,7 +19,13 @@ test window. Every gate here is therefore a baseline -> final DELTA:
                     else FAIL. An empty devices dict with a named USER is a
                     FAIL, never INCONCLUSIVE: the operator named the USER;
 * EXPECT_INBOUND  : optional hard gate -- vless-in (Reality) / hy2-in (HY2)
-                    must be observed for the gate scope, else FAIL;
+                    must be observed for the gate scope, else FAIL. It is
+                    NOT just a presence check: it binds BOTH deltas above to
+                    the USER + INBOUND scope (traffic reads ONLY
+                    ``devices[USER]["protocols"][INBOUND]``, closures only
+                    ``recent_connections`` rows carried by that inbound), so
+                    a sibling protocol's growth or closures can never make
+                    the canary pass;
 * REQUIRE_CLOSED  : 0/1 only, anything else is a configuration error;
 * stale           : baseline AND final must both be non-stale.
 
@@ -27,12 +33,14 @@ Verdicts mirror the integration script's three-state contract:
 
     PASS          exit 0   every gate green
     FAIL          exit 1   a hard gate failed (or a configuration error)
-    INCONCLUSIVE  exit 2   phase 1 healthy but NO real client lifecycle was
-                          observed in this window (never counted as PASS)
+    INCONCLUSIVE  exit 2   the fully observational run (NO gate set) saw no
+                          real client lifecycle in this window (never
+                          counted as PASS)
 
-INCONCLUSIVE is reserved for the no-EXPECT_USER run: no devices at all, or
-devices that are pure historical replay (no traffic delta AND no new closed
-ids). With EXPECT_USER set the verdict is always PASS or FAIL.
+INCONCLUSIVE is reserved for gate-free runs: no devices at all, or devices
+that are pure historical replay (no traffic delta AND no new closed ids).
+Any strict gate (EXPECT_USER / EXPECT_INBOUND / REQUIRE_CLOSED=1) asserts
+evidence and must FAIL, never downgrade to INCONCLUSIVE.
 
 The unit suite (tests/test-monitor-v2-e1.sh) drives evaluate() directly with
 synthetic baseline/final snapshots, so the gate logic is verified locally
@@ -83,12 +91,7 @@ def _fmt(value):
     return text or "0"
 
 
-def _totals(entry):
-    return (float((entry or {}).get("uplink_total") or 0),
-            float((entry or {}).get("downlink_total") or 0))
-
-
-def _scope_entries(snap, expect_user):
+def _scoped_devices(snap, expect_user):
     """Device entries for the gate scope: one named USER or every device."""
     devices = snap.get("devices") or {}
     if expect_user:
@@ -97,31 +100,61 @@ def _scope_entries(snap, expect_user):
     return list(devices.values())
 
 
-def scope_totals(snap, expect_user):
-    """(uplink, downlink) summed over the gate scope."""
+def scope_totals(snap, expect_user, expect_inbound=""):
+    """(uplink, downlink) over the gate scope.
+
+    With expect_inbound the gate reads ONLY devices[..]["protocols"][inbound]:
+    a USER's sibling protocol must never make the traffic delta pass. Without
+    it, device-level totals (USER scope / all-device scope) are used, exactly
+    like before the inbound scoping existed.
+    """
     up = down = 0.0
-    for entry in _scope_entries(snap, expect_user):
-        u, d = _totals(entry)
-        up += u
-        down += d
+    for dev in _scoped_devices(snap, expect_user):
+        if expect_inbound:
+            proto = (dev.get("protocols") or {}).get(expect_inbound) or {}
+            up += float(proto.get("uplink_total") or 0)
+            down += float(proto.get("downlink_total") or 0)
+        else:
+            up += float(dev.get("uplink_total") or 0)
+            down += float(dev.get("downlink_total") or 0)
     return (up, down)
 
 
-def scope_recent_ids(snap, expect_user):
-    """Recent-CLOSED connection IDs for the gate scope (display cache only)."""
+def scope_recent_ids(snap, expect_user, expect_inbound=""):
+    """Recent-CLOSED connection IDs for the gate scope (display cache only).
+
+    With expect_inbound only closures CARRIED by that inbound count: a
+    vless-in CLOSED must never satisfy a hy2-in REQUIRE_CLOSED gate.
+    """
     ids = set()
-    for entry in _scope_entries(snap, expect_user):
-        for conn in entry.get("recent_connections") or []:
+    for dev in _scoped_devices(snap, expect_user):
+        for conn in dev.get("recent_connections") or []:
             cid = conn.get("id")
-            if cid:
-                ids.add(str(cid))
+            if not cid:
+                continue
+            if expect_inbound and conn.get("inbound") != expect_inbound:
+                continue
+            ids.add(str(cid))
     return ids
 
 
+def _scope_active(snap, expect_user, expect_inbound=""):
+    """True when the gate scope currently holds a live connection."""
+    for dev in _scoped_devices(snap, expect_user):
+        if expect_inbound:
+            proto = (dev.get("protocols") or {}).get(expect_inbound) or {}
+            if (proto.get("active_connections") or 0) > 0:
+                return True
+        elif (dev.get("active_connections") or 0) > 0:
+            return True
+    return False
+
+
 def _scope_protocols(snap, expect_user):
+    """ALL inbound tags seen for the gate scope (allowlist check only)."""
     protos = set()
-    for entry in _scope_entries(snap, expect_user):
-        protos |= set((entry.get("protocols") or {}).keys())
+    for dev in _scoped_devices(snap, expect_user):
+        protos |= set((dev.get("protocols") or {}).keys())
     return protos
 
 
@@ -155,16 +188,17 @@ def evaluate(baseline, final, expect_user="", expect_inbound="",
                        "baseline snapshot is stale")
 
     devices = final.get("devices") or {}
-    b_up, b_down = scope_totals(baseline, expect_user)
-    f_up, f_down = scope_totals(final, expect_user)
+    b_up, b_down = scope_totals(baseline, expect_user, expect_inbound)
+    f_up, f_down = scope_totals(final, expect_user, expect_inbound)
     traffic_delta = f_up > b_up or f_down > b_down
-    new_closed_ids = scope_recent_ids(final, expect_user) \
-        - scope_recent_ids(baseline, expect_user)
+    new_closed_ids = scope_recent_ids(final, expect_user, expect_inbound) \
+        - scope_recent_ids(baseline, expect_user, expect_inbound)
 
-    # INCONCLUSIVE escape (only WITHOUT EXPECT_USER): nothing observable
-    # happened in this window. Devices seen with zero delta are historical
-    # reset replay, not a real client lifecycle.
-    if not expect_user:
+    # INCONCLUSIVE escape: ONLY the fully observational run (no gate set)
+    # may report "nothing observed" as INCONCLUSIVE. A strict canary
+    # (EXPECT_USER / EXPECT_INBOUND / REQUIRE_CLOSED) asserts evidence and
+    # must FAIL, never downgrade to INCONCLUSIVE.
+    if not expect_user and not expect_inbound and not require_closed:
         if not devices and (final.get("recently_closed") or 0) == 0:
             info("INCONCLUSIVE: no client traffic observed in this window; "
                  "drive a Reality/HY2 connection (stable client) and re-run")
@@ -186,8 +220,11 @@ def evaluate(baseline, final, expect_user="", expect_inbound="",
                 % (expect_user, ", ".join(sorted(devices)) or "none"))
             return _finish(lines, VERDICT_FAIL, EXIT_FAIL,
                            "EXPECT_USER %s not observed" % expect_user)
-    else:
+    elif devices:
         ok("device observed: %s" % ", ".join(sorted(devices)))
+    else:
+        bad("no device observed in this window (strict gates cannot be "
+            "verified without any device)")
 
     # INBOUND gates: the requested production path, then the allowlist.
     if expect_inbound:
@@ -214,21 +251,27 @@ def evaluate(baseline, final, expect_user="", expect_inbound="",
             "%s->%s)" % (_fmt(b_up), _fmt(f_up), _fmt(b_down), _fmt(f_down)))
 
     # Source presence is metadata only -- reported as a boolean, never raw.
-    source_present = any(
-        conn.get("source")
-        for entry in _scope_entries(final, expect_user)
-        for conn in entry.get("recent_connections") or []) or any(
-        entry.get("recent_sources")
-        for entry in _scope_entries(final, expect_user))
+    # With expect_inbound only that inbound's closures are inspected; source
+    # never participates in identity, accounting or CLOSED matching.
+    scoped_conns = [
+        conn
+        for dev in _scoped_devices(final, expect_user)
+        for conn in dev.get("recent_connections") or []
+        if not expect_inbound or conn.get("inbound") == expect_inbound]
+    source_present = any(conn.get("source") for conn in scoped_conns) or (
+        not expect_inbound and any(
+            dev.get("recent_sources")
+            for dev in _scoped_devices(final, expect_user)))
     info("SOURCE_PRESENT=%s (raw source is never printed)"
          % ("true" if source_present else "false"))
 
-    # Lifecycle evidence: a new closed id, a live connection or a device the
-    # window left ACTIVE / RECENT ACTIVITY. Never a CLOSED verdict by itself.
-    lifecycle = bool(new_closed_ids) or any(
-        (entry.get("active_connections") or 0) > 0
-        or entry.get("status") in ("ACTIVE", "RECENT ACTIVITY")
-        for entry in _scope_entries(final, expect_user))
+    # Lifecycle evidence: a new closed id or a live connection inside the
+    # gate scope. Never a CLOSED verdict by itself.
+    lifecycle = bool(new_closed_ids) \
+        or _scope_active(final, expect_user, expect_inbound) \
+        or (not expect_inbound and any(
+            dev.get("status") in ("ACTIVE", "RECENT ACTIVITY")
+            for dev in _scoped_devices(final, expect_user)))
     if lifecycle:
         ok("new lifecycle observed")
     else:
