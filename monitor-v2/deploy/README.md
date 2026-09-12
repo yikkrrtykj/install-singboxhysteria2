@@ -95,6 +95,9 @@ spool `/var/lib/sbox-cm/spool/`、helper `/usr/local/lib/sbox-cm/sbox-cm` + 单�
 1. **`/root/sbox` 之外是硬约束**：`uninstall_singbox` 会 `rm -rf /root/sbox`。Monitor 放进去等于把
    自己的生死交给了代理卸载流程；反向亦然（Monitor-only uninstall 绝不允许碰 `sbconfig_server.json`）。
    两棵树完全分离，靠"互不引用"保证（测试静态断言 deploy 代码中不出现这两个字符串）。
+   **唯一例外（review round 1 P6）**：S0 secret bridge 只读 S0 anchor
+   `/root/sbox/monitor-api.secret`（root:root 0600，永不 chmod/chgrp/改写它）——
+   测试对该路径做了精确豁免，并断言 deploy 代码中该引用恰好出现一次。
 2. **release 树 + 符号链接**（对任务书 `/opt/singbox-monitor/app` 平铺的偏离）：任务 7 要求
    "stage → 备份旧版 → **原子**切换"。平铺目录的切换至少要两次 rename，中间窗口是断的；
    `mv -T` 一个符号链接是单次 rename(2)，读侧要么旧要么新。旧 release 目录保留在
@@ -110,12 +113,17 @@ spool `/var/lib/sbox-cm/spool/`、helper `/usr/local/lib/sbox-cm/sbox-cm` + 单�
 6. **VERSION 放在 release 树内**：`upgrade` 判定、`status`、health 都读激活树里的 VERSION，
    单一事实源。
 
-## 2. 用户模型（非 root，任务 4）
+## 2. 用户模型（非 root；round 1 P5 定案 = sboxweb）
 
 ```text
-系统组  singbox-monitor  (system, nologin)
-系统用户 singbox-monitor (system, gid=组, home=/var/lib/singbox-monitor, shell=/usr/sbin/nologin)
+系统组  sboxweb          (system, nologin)
+系统用户 sboxweb         (system, gid=组, home=/var/lib/singbox-monitor, shell=/usr/sbin/nologin)
 ```
+
+**P5 定案**：runtime 身份直接采用 E3 rev4 已 approved 的非特权用户 `sboxweb`；产品名 /
+service 名（singbox-monitor.service）/ 路径（/opt、/var/lib、/etc 下的 singbox-monitor*）
+保持不变——用户名与产品名不需要相同。这样 E3 落地时 spool（root:sboxweb 0710）、
+sudoers、exact-token 读权直接复用，不需要迁移 service identity。
 
 - Monitor 今天需要的能力全集：**connect 127.0.0.1:9091 + bind 127.0.0.1:9191（>1024，非特权）+
   读 /etc/singbox-monitor + 写 /var/lib/singbox-monitor**。零 capability → unit 里
@@ -127,10 +135,8 @@ spool `/var/lib/sbox-cm/spool/`、helper `/usr/local/lib/sbox-cm/sbox-cm` + 单�
   （E3 设计 rev4 的单条 sudoers + verb allowlist + 账本模型）。本骨架把它留成边界：
   Web 用户（见下方命名对齐）将来加入 helper 的 sudoers 目标，helper 独占 config.lock 写权。
   **绝不能**是 "整个 web server 跑 root"。
-- **命名对齐风险（诚实记录）**：任务书提议 `singbox-monitor`；E3 设计 rev4 假设 Web 用户叫
-  `sboxweb`。骨架用**单一常量 `SBMON_USER`**（默认 `singbox-monitor`）实现，一处改名即可切换。
-  E3 integration 对话必须二选一：改 E3 文档的用户名，或部署时 `SBMON_USER=sboxweb`。
-  spool 权限模型（`root:<web组> 0710` + 文件 0640）与用户名无关，直接兼容。
+- 实现上仍是单一常量 `SBMON_USER`/`SBMON_GROUP`（默认 sboxweb），测试断言
+  `User=sboxweb` / `Group=sboxweb`。
 
 ## 3. systemd 模型（任务 5）
 
@@ -141,6 +147,10 @@ spool `/var/lib/sbox-cm/spool/`、helper `/usr/local/lib/sbox-cm/sbox-cm` + 单�
   也不会阻止 monitor 启动 —— collector 把不可达流当 stale、持续重连（E1 语义），这正是任务 12
   要的"两个健康信号分开"的运行时基础。
 - `Restart=on-failure` + `RestartSec=5s`；`TimeoutStopSec=15s`（collector 周期内可被 TERM 打断）。
+- `UMask=0077`（round 1 P8）：snapshot/temp/runtime 文件默认私有。
+- `ExecStart=.../monitor-service <conf> <state-root>/state`（round 1 P1）：**state root 是显式
+  contract**，unit、CLI（install-monitor.sh health/status）都显式传值；`WorkingDirectory` 只是
+  便利，不是正确性/安全性事实源。
 - 加固逐项（每项都对应真实需求，不是堆砌）：
   - `NoNewPrivileges`：永远不得提权（E3 桥是独立 sudo 路径，不是 web 进程自己提权）；
   - `ProtectHome=true`：/root、/home 不可见 —— 物理上读不到 `/root/sbox`，误配置也无效；
@@ -210,32 +220,51 @@ generated YAML —— 一个都不许出现）的实现方式：
    不进 argv/日志/异常/JSON；
 4. deploy/shim 自身的输出只含路径与状态词。测试用假秘密值全量扫描 stdout/stderr/unit 文件验证。
 
-**健康 = 三个分离信号，绝不合并成一个 health=true**（`bin/monitor-health` 输出单行 JSON）：
+**健康 = 分离信号，绝不合并成一个 health=true**（`bin/monitor-health <conf> <state-dir>`
+输出单行 JSON；state-dir 是显式参数，round 1 P1：管理员在任意 cwd 下跑
+`install-monitor.sh health/status` 都读同一个 snapshot，绝不从 `$PWD` 推断）：
 
 ```json
-{"service_active": true|false,          ← web/collector 进程存活（systemd）
- "api_reachable":  true|false,          ← sing-box service.api TCP 可达（loopback）
- "snapshot": {"present": bool, "age_seconds": N, "stale": bool},   ← 陈旧状态守卫
- "web_http": "not-applicable"|"unimplemented"|"ok",                ← E2 钩子
+{"service_active": true|false,     ← web/collector 进程存活（systemd）
+ "api_url_valid": true|false,      ← SBMON_API_URL 满足 loopback http contract（round 1 P7）
+ "api_reachable":  true|false,     ← sing-box service.api TCP 可达（loopback）
+ "snapshot": {"present": bool, "age_seconds": N,
+              "wellformed": bool,
+              "collector_stale": bool,   ← round 1 P2：E1 snapshot JSON 顶层 stale 字段
+              "age_stale": bool,         ← 文件 mtime 超过 2×CYCLE+30s
+              "stale": bool},            ← final = malformed ∨ collector_stale ∨ age_stale
+ "web_http": "not-applicable"|"unimplemented"|"ok",   ← E2 钩子
  "mode": "collector-loop", "overall": "healthy|degraded|unhealthy"}
 ```
 
+- **P2 语义陈旧**：E1 contract 是"流/API/auth 失败 → 保留 last state → stale=true，
+  collector 仍正常输出 snapshot"——所以**文件 mtime 新鲜 ≠ collector 健康**。
+  final stale 必须组合：malformed JSON（按 stale=true + degraded 处理）∨ E1 JSON 顶层
+  `stale==true` ∨ age 超限。**TCP 9091 reachable + snapshot stale=true → 绝不 overall=healthy**
+  （必测）。snapshot 内容（devices/ids/last_error）绝不进日志或输出。
 - `overall` 只是汇总词，字段永远单独可读；
-- exit：0 healthy / 1 unhealthy（服务死）/ 2 degraded（活着但 api 不可达或 snapshot 陈旧）；
+- exit：0 healthy / 1 unhealthy（服务死）/ 2 degraded（活着但 api 不可达/URL 非法/snapshot 陈旧）；
 - api 不可达在"sing-box 没起来"时是**正确状态**（degraded，不是 crash）——monitor 的职责就是
-  把它显示出来；陈旧判定 = `2×CYCLE_SECONDS+30s` 无新 snapshot；
+  把它显示出来；
 - `web_http` 在 collector-loop 模式 `not-applicable`；E2 落地后由 integration 对话补 HTTP 探针。
 
 ## 7. 升级 / 回滚模型（任务 7）
 
 ```text
-download/copy (stage 到 releases/.staging-*)
-  → validate（py_compile + bash -n + VERSION 可读；失败删 staging，生产树零影响）
+【事务状态捕获】old_release_id + 旧 unit 内容（同文件系统临时备份）+ old_service_active
+  → stage（releases/.staging-*，py_compile + bash -n 预验证；失败删 staging，生产树零影响）
+  → unit 原子写入（同文件系统 temp → chmod → rename；读者永远看不到半个 unit）
   → activate（mv -T 符号链接原子切换；旧树即备份，保留最近 SBMON_KEEP_RELEASES=3 个）
   → systemctl restart singbox-monitor      ← 唯一被重启的服务；sing-box 无感
-  → 等待 service_active（默认 20s）
-  → 失败 → 自动 flip 回旧 release + 重启 → 明确告警
-  → rollback 命令 = 人工版同一动作（可指定 release id）
+  → 门：等待 service_active（默认 20s）
+
+失败（review round 1 P3：release 与 unit 作为同一个 deployment transaction 回滚）：
+  → 恢复旧 release（flip 回 old_id）
+  → 恢复旧 unit（原子写回事务前内容；unit 原本不存在则删除新 unit）
+  → daemon-reload → restart 旧 monitor → 验证 active
+  → 任一步失败 → CRITICAL + exit 2，绝不声称 "rollback complete"
+
+rollback 命令 = 人工版同一动作（可指定 release id）
 ```
 
 Monitor 升级**默认不得重启 sing-box** —— deploy 代码根本没有 sing-box 操作面；测试记录全部
@@ -269,6 +298,11 @@ E2/E3/本分支三线并行，避免对共享文件制造冲突；接线与菜�
 | 坏权限修复 | T11（0640 修复、内容哈希不变） |
 | B/C. 已有 Phase C/D/E1 server | T12（fixture 代理树哈希全程不变 + systemctl 全程无 sing-box 操作） |
 | Web 端口契约（任务 10） | T13（127.0.0.1:9191、永不 0.0.0.0） |
+| round 1 P3 事务回滚 | T15（升级门失败 → release+unit+服务一起恢复）；T16（恢复也失败 → CRITICAL rc=2，绝不声称回滚完成） |
+| round 1 P4 部署锁 | T17（持锁期间 install/rollback/uninstall 全部 fail-closed；link/unit/history 不变；放锁后可继续） |
+| round 1 P1 state path | T08b（从 `/`、`$TMP`、随机 cwd 跑 health → 读同一 snapshot） |
+| round 1 P2 语义 stale | T08（fresh+stale:true→degraded；old+stale:false→degraded；malformed→degraded；missing→degraded；**api reachable + stale=true 绝不 healthy**） |
+| round 1 P6/P7 service fail-closed | T08c（missing/wrong-type secret → 立即退出；非 loopback/带 path 的 URL → 立即退出；IPv6 `[::1]` 合法接受；secret 值零输出） |
 
 真机 canary（A/B 场景在真实 VPS 上的冒烟）属于部署验收，不在本 PR 内执行；
 production 保持 UNCHANGED。
@@ -286,3 +320,37 @@ production 保持 UNCHANGED。
 Deferred（integration 对话接）：E2 `app/web/serve` 与 `web_http` 探针；E3 helper/sudoers 与
 `SBMON_USER` 命名对齐（§2）；install.sh 菜单接线；api.secret 供给策略（S0）；full-stack uninstall
 菜单组合。
+
+---
+
+## 11. Review round 1 设计补遗
+
+### 11.1 部署串行锁（P4）
+
+- 位置：`/run/lock/singbox-monitor-deploy.lock`（`SBMON_LOCK_FILE` 可覆盖，fixture 用临时根）。
+- 覆盖范围：**所有 mutating 命令**（install/upgrade/rollback/uninstall）的整个事务——
+  user/dir/conf/secret/stage/unit/flip/restart/rollback/prune/history 全部在同一把锁内；
+  `health`/`status`/`history` 只读、不加独占锁。
+- 契约（fail-closed，绝不 warn-and-continue）：`flock` 缺失、锁文件打开失败、
+  `flock -w` 超时（默认 15s，`SBMON_LOCK_TIMEOUT`）、获取失败 → 在**任何 mutation 之前**中止。
+
+### 11.2 S0 service.api secret → 非 root Monitor bridge（P6）
+
+- 不变量：单一事实源仍是 sing-box 配置里的 `service.api.secret`；S0 的 root-side anchor
+  `/root/sbox/monitor-api.secret`（root:root 0600）**永不**被 chmod/chgrp/改写；
+  绝不为读它而放宽 `ProtectHome`。
+- 投递：`sbmon_sync_api_secret`（install 内、部署锁内、任何 release 变更之前调用）派生
+  `/etc/singbox-monitor/api.secret`（root:sboxweb 0640，temp + 原子 rename）。
+  内容一致 → 不重写、无 mtime churn；内容漂移 → 原子修复；写失败 → 安装中止（零变更）。
+- fail-closed：conf 声明了 `SBMON_API_SECRET_FILE` 而 anchor 缺失/不可读/类型错误 → 安装中止；
+  monitor-service 启动时对配置的 secret 文件做存在/可读/普通文件三查，任一不满足 → 拒绝启动，
+  **绝不静默降级为无 auth 连接**。pre-S0 逃生口：conf 中注释掉该行并删除派生文件。
+- 静态隔离测试对 anchor 路径做**唯一一次**精确豁免（deploy 代码中该字符串恰好出现一次）。
+
+### 11.3 service.api URL contract（P7）
+
+- 用 Python `urllib.parse` 校验（shell 不再手搓 URL 解析，IPv6 `[::1]` 正确处理）：
+  scheme=http、host ∈ {127.0.0.1, localhost, ::1}、合法数值端口、无 userinfo、
+  path 仅允许 "" 或 "/"、无 query、无 fragment。
+- `monitor-service` 启动时校验（不满足 → 拒绝启动）；health 同时报告 `api_url_valid`。
+  不满足契约时绝不发起连接。

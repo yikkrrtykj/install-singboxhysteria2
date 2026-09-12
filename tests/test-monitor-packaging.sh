@@ -75,6 +75,8 @@ cat > "$FIX_PROXY_CONF" <<'EOF'
 {"inbounds": [{"type": "vless", "tag": "vless-in", "users": [{"name": "legacy", "uuid": "PROXY-UUID-SHOULD-SURVIVE"}]}]}
 EOF
 printf "SERVER_IP='203.0.113.1'\n" > "$FIX_PROXY_STATE"
+# P6: fixture S0 anchor (the real default lives at /root/sbox/monitor-api.secret)
+printf 'fixture-api-secret-VALUE-must-not-leak\n' > "$FIX_PROXY/monitor-api.secret"
 PROXY_CONF_HASH_BEFORE="$(sha256sum "$FIX_PROXY_CONF" | cut -d' ' -f1)"
 PROXY_STATE_HASH_BEFORE="$(sha256sum "$FIX_PROXY_STATE" | cut -d' ' -f1)"
 
@@ -119,6 +121,10 @@ case "\$op" in
     echo active > "\$MOCK_SYS_STATE"; exit 0 ;;
   restart)
     if [ -n "\${MOCK_FAIL_START:-}" ]; then echo "mock: restart failed" >&2; exit 1; fi
+    if [ -f "\$MOCK_FAIL_RESTART_ONCE" ]; then
+      rm -f "\$MOCK_FAIL_RESTART_ONCE"
+      echo "mock: one-shot restart failure" >&2; exit 1
+    fi
     echo active > "\$MOCK_SYS_STATE"; exit 0 ;;
   disable)
     echo inactive > "\$MOCK_SYS_STATE"; exit 0 ;;
@@ -148,9 +154,21 @@ export SBMON_UNIT_FILE="$FIX_UNIT"
 export SBMON_BACKUP_ROOT="$FIX_BACKUPS"
 export SBMON_REPO_MONITOR_DIR="$FIX_SRC"
 export SBMON_VERSION_FILE="$FIX_SRC/VERSION"
+export SBMON_API_SECRET_SOURCE="$FIX_PROXY/monitor-api.secret"
 export SBMON_HEALTH_TIMEOUT=6
 export SBMON_STATE_DIR="$FIX_STATE/state"
 export MOCK_CALL_LOG MOCK_SYS_STATE
+export MOCK_FAIL_RESTART_ONCE="$TMP/mock-fail-restart-once"
+export SBMON_LOCK_FILE="$TMP/deploy.lock"
+# P4: real flock where available (Linux CI gate); no-op shim elsewhere so the
+# rest of the suite still runs on platforms without flock.
+if command -v flock >/dev/null 2>&1; then
+    export SBMON_FLOCK=flock
+else
+    printf '#!/usr/bin/env bash'"""\n"""'exit 0\n' > "$TMP/bin/flock-mock"
+    chmod +x "$TMP/bin/flock-mock"
+    export SBMON_FLOCK="$TMP/bin/flock-mock"
+fi
 export PATH="$TMP/bin:$PATH"
 
 # Mutable source copy so tests can bump VERSION without touching the repo.
@@ -178,11 +196,21 @@ fi
 # Hard isolation between deploy track and proxy tree + firewall tooling.
 # Comments are stripped first: the guarantee is about executable code.
 strip_comments() { sed -e 's/#.*$//' "$@"; }
-DEPLOY_CODE=$(strip_comments "$DEPLOY_DIR"/lib/*.sh "$DEPLOY_DIR"/app-bin/* "$DEPLOY_DIR"/install-monitor.sh "$DEPLOY_DIR"/singbox-monitor.service.in)
+# P6: the S0 anchor path (/root/sbox/monitor-api.secret) is the ONE sanctioned
+# reference into the proxy tree (read-only secret source); mask it before the
+# isolation scan so the guarantee stays "nothing else touches /root/sbox".
+DEPLOY_CODE=$(strip_comments "$DEPLOY_DIR"/lib/*.sh "$DEPLOY_DIR"/app-bin/* "$DEPLOY_DIR"/install-monitor.sh "$DEPLOY_DIR"/singbox-monitor.service.in \
+    | sed "s|/root/sbox/monitor-api\.secret|<SBMON_S0_ANCHOR>|g")
 if printf '%s' "$DEPLOY_CODE" | grep -qE 'sbconfig_server\.json|/root/sbox|sbox-backup'; then
-    fail "deploy code must never reference the proxy tree"
+    fail "deploy code must never reference the proxy tree (beyond the S0 anchor)"
 else
-    pass "deploy code has zero references to /root/sbox / sbconfig_server.json / production backups"
+    pass "deploy code has zero references to /root/sbox / sbconfig_server.json / production backups (S0 anchor exempted)"
+fi
+ANCHOR_COUNT=$(printf '%s\n' "$DEPLOY_CODE" | grep -c '<SBMON_S0_ANCHOR>' || true)
+if [ "$ANCHOR_COUNT" = "1" ]; then
+    pass "S0 anchor referenced exactly once (default assignment in deploy lib)"
+else
+    fail "S0 anchor referenced $ANCHOR_COUNT times (want exactly 1)"
 fi
 if printf '%s' "$DEPLOY_CODE" | grep -qE '(^|[^a-z])(ufw|iptables|ip6tables|firewall-cmd|firewalld)([^a-z]|$)'; then
     fail "deploy code must never touch firewall tooling"
@@ -215,7 +243,11 @@ assert_dir_mode "$FIX_CONF_DIR/monitor.conf" 640 "monitor.conf mode 0640"
 assert_grep 'After=network-online\.target sing-box\.service' "$FIX_UNIT" "unit orders after network-online + sing-box"
 assert_grep '^Wants=network-online\.target' "$FIX_UNIT" "unit wants network-online"
 assert_no_grep '^Requires=' "$FIX_UNIT" "unit has NO Requires= on sing-box (boot must not fail)"
-assert_grep '^User=singbox-monitor$' "$FIX_UNIT" "unit runs as dedicated non-root user"
+assert_grep '^User=sboxweb$' "$FIX_UNIT" "unit runs as E3-approved non-root user sboxweb (P5)"
+assert_grep '^Group=sboxweb$' "$FIX_UNIT" "unit group sboxweb (P5)"
+assert_grep '^UMask=0077$' "$FIX_UNIT" "unit UMask=0077 (P8)"
+assert_grep 'monitor-service .*monitor\.conf.*state' "$FIX_UNIT" "unit passes conf + state dir explicitly (P1)"
+assert_grep 'SBMON_API_SECRET_FILE=' "$FIX_CONF_DIR/monitor.conf" "default conf declares derived secret file (P6)"
 assert_grep 'NoNewPrivileges=true' "$FIX_UNIT" "unit NoNewPrivileges"
 assert_grep 'ProtectHome=true' "$FIX_UNIT" "unit ProtectHome (cannot read /root/sbox)"
 assert_grep 'ProtectSystem=full' "$FIX_UNIT" "unit ProtectSystem"
@@ -223,6 +255,11 @@ assert_grep 'Restart=on-failure' "$FIX_UNIT" "unit Restart=on-failure"
 assert_grep 'CapabilityBoundingSet=$' "$FIX_UNIT" "unit drops all capabilities"
 assert_grep 'systemctl enable --now singbox-monitor' "$MOCK_CALL_LOG" "enable --now recorded"
 assert_grep '"service_active":true' "$OUT1" "health reports service_active=true after install"
+[ -f "$FIX_CONF_DIR/api.secret" ] && pass "derived api.secret delivered (P6)" || fail "derived api.secret missing"
+if [ "$MODES_OK" = 1 ]; then assert_dir_mode "$FIX_CONF_DIR/api.secret" 640 "api.secret mode 0640 root:group (P6)"; else printf '  SKIP api.secret mode (chmod unreliable)\n'; fi
+assert_eq "$(cat "$FIX_PROXY/monitor-api.secret")" "$(cat "$FIX_CONF_DIR/api.secret")" "api.secret content mirrors S0 anchor"
+SECRET_HASH_1="$(sha256sum "$FIX_CONF_DIR/api.secret" | cut -d' ' -f1)"
+SECRET_MTIME_1="$(stat -c '%Y' "$FIX_CONF_DIR/api.secret")"
 
 # ---------------------------------------------------------------------------
 if [ "$SYMLINKS_OK" = 1 ]; then
@@ -242,6 +279,8 @@ assert_grep 'auth-marker-must-survive' "$FIX_STATE/auth/probe" "auth state untou
 assert_eq "$RELEASES_COUNT_1" "$(find "$FIX_RELEASES" -maxdepth 1 -type d ! -path "$FIX_RELEASES" | wc -l)" "no extra release staged"
 CALLS_MUT_2="$(grep -cE ' (restart|enable|disable|daemon-reload) ' "$MOCK_CALL_LOG" || true)"
 assert_eq "$CALLS_MUT_1" "$CALLS_MUT_2" "no state-changing systemctl calls on noop (no restart)"
+assert_eq "$SECRET_HASH_1" "$(sha256sum "$FIX_CONF_DIR/api.secret" | cut -d' ' -f1)" "api.secret content stable (P6)"
+assert_eq "$SECRET_MTIME_1" "$(stat -c '%Y' "$FIX_CONF_DIR/api.secret")" "api.secret not rewritten when content identical (no mtime churn, P6)"
 
 # ---------------------------------------------------------------------------
 section "T03 upgrade (monitor only; sing-box untouched)"
@@ -354,7 +393,7 @@ SBMON_MODE=collector-loop
 SBMON_CYCLE_SECONDS=300
 EOF
 mkdir -p "$FIX_STATE/state"
-printf '{"devices": {}}\n' > "$FIX_STATE/state/snapshot.json"   # fresh snapshot
+SNAP="$FIX_STATE/state/snapshot.json"
 LISTENER_PID=""
 if [ "$HAVE_PY3" = 1 ]; then
     python3 - <<'PY' &
@@ -363,7 +402,7 @@ s = socket.socket()
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(("127.0.0.1", 19091))
 s.listen(8)
-s.settimeout(25)
+s.settimeout(30)
 try:
     while True:
         c, _ = s.accept()
@@ -374,23 +413,115 @@ PY
     LISTENER_PID=$!
 fi
 sleep 0.7
-H_JSON="$("$HEALTH_BIN" "$HC")"; H_RC=$?
-assert_rc 0 "$H_RC" "healthy: service up + api reachable + fresh snapshot"
+h_probe() { "$HEALTH_BIN" "$HC" "$FIX_STATE/state"; }
+
+# case 1: fresh file + collector fresh + api reachable -> healthy
+printf '{"stale": false, "devices": {}}\n' > "$SNAP"
+H_JSON="$(h_probe)"; H_RC=$?
+assert_rc 0 "$H_RC" "healthy: service up + api reachable + fresh fresh-collector snapshot"
 assert_grep '"service_active":true' <(printf '%s' "$H_JSON") "health json service_active=true"
 assert_grep '"api_reachable":true' <(printf '%s' "$H_JSON") "health json api_reachable=true"
+assert_grep '"collector_stale":false' <(printf '%s' "$H_JSON") "health json collector_stale=false"
 assert_grep '"stale":false' <(printf '%s' "$H_JSON") "health json snapshot not stale"
-[ -n "$LISTENER_PID" ] && kill "$LISTENER_PID" 2>/dev/null
-H_JSON="$("$HEALTH_BIN" "$HC")"; H_RC=$?
-assert_rc 2 "$H_RC" "degraded (rc 2): api unreachable while service alive"
-assert_grep '"service_active":true' <(printf '%s' "$H_JSON") "degraded still shows service_active=true"
-assert_grep '"api_reachable":false' <(printf '%s' "$H_JSON") "degraded shows api_reachable=false"
-touch -d '2 hours ago' "$FIX_STATE/state/snapshot.json"
-H_JSON="$("$HEALTH_BIN" "$HC")"; H_RC=$?
-assert_grep '"stale":true' <(printf '%s' "$H_JSON") "old snapshot flagged stale"
+
+# case 2 (P2, review special case): api reachable + collector stale=true
+#   -> fresh file does NOT mean healthy; MUST NOT overall=healthy
+printf '{"stale": true, "devices": {}}\n' > "$SNAP"
+H_JSON="$(h_probe)"; H_RC=$?
+assert_rc 2 "$H_RC" "degraded (rc 2): collector semantic stale while api reachable"
+assert_grep '"api_reachable":true' <(printf '%s' "$H_JSON") "api still reachable in stale case"
+assert_grep '"collector_stale":true' <(printf '%s' "$H_JSON") "collector_stale=true from E1 snapshot JSON"
+assert_grep '"age_stale":false' <(printf '%s' "$H_JSON") "age_stale=false (file is fresh)"
+assert_grep '"stale":true' <(printf '%s' "$H_JSON") "final stale=true"
+assert_grep '"overall":"degraded"' <(printf '%s' "$H_JSON") "overall degraded (never healthy with stale snapshot)"
+
+# case 3: old file + collector fresh -> age-stale -> degraded
+printf '{"stale": false, "devices": {}}\n' > "$SNAP"
+touch -d '2 hours ago' "$SNAP"
+H_JSON="$(h_probe)"; H_RC=$?
+assert_rc 2 "$H_RC" "degraded (rc 2): age-stale snapshot"
+assert_grep '"collector_stale":false' <(printf '%s' "$H_JSON") "collector fresh in age-stale case"
+assert_grep '"age_stale":true' <(printf '%s' "$H_JSON") "age_stale=true"
+
+# case 4: malformed JSON -> stale=true + degraded (contents never logged)
+printf 'not-json-{{{' > "$SNAP"
+H_JSON="$(h_probe)"; H_RC=$?
+assert_rc 2 "$H_RC" "degraded (rc 2): malformed snapshot"
+assert_grep '"stale":true' <(printf '%s' "$H_JSON") "malformed snapshot treated as stale"
+assert_no_grep 'not-json' "$TMP/out-redaction-probe.log" "malformed snapshot contents never emitted (P2: never log snapshot data)"
+
+# case 5: missing file -> degraded
+rm -f "$SNAP"
+H_JSON="$(h_probe)"; H_RC=$?
+assert_rc 2 "$H_RC" "degraded (rc 2): snapshot missing"
+assert_grep '"present":false' <(printf '%s' "$H_JSON") "snapshot present=false"
+assert_grep '"stale":true' <(printf '%s' "$H_JSON") "missing snapshot = stale"
+
+# case 6: invalid API URL (P7) -> api_url_valid=false, degraded
+printf '{"stale": false, "devices": {}}\n' > "$SNAP"
+HC_BAD="$TMP/health-bad.conf"
+cat > "$HC_BAD" <<EOF
+SBMON_API_URL=http://0.0.0.0:9091
+SBMON_MODE=collector-loop
+SBMON_CYCLE_SECONDS=300
+EOF
+H_JSON="$("$HEALTH_BIN" "$HC_BAD" "$FIX_STATE/state")"; H_RC=$?
+assert_rc 2 "$H_RC" "degraded (rc 2): invalid API URL"
+assert_grep '"api_url_valid":false' <(printf '%s' "$H_JSON") "api_url_valid=false for non-loopback URL"
+
+# case 7: service down -> unhealthy
 echo inactive > "$MOCK_SYS_STATE"
-H_JSON="$("$HEALTH_BIN" "$HC")"; H_RC=$?
+H_JSON="$(h_probe)"; H_RC=$?
 assert_rc 1 "$H_RC" "unhealthy (rc 1): service down"
 assert_grep '"service_active":false' <(printf '%s' "$H_JSON") "unhealthy shows service_active=false"
+[ -n "$LISTENER_PID" ] && kill "$LISTENER_PID" 2>/dev/null
+
+# ---------------------------------------------------------------------------
+section "T08b health explicit state path (P1)"
+printf '{"stale": false, "devices": {}}\n' > "$FIX_STATE/state/snapshot.json"
+echo active > "$MOCK_SYS_STATE"
+norm() { printf '%s' "$1" | sed 's/"age_seconds":[0-9]*/"age_seconds":X/'; }
+OUT_A="$( ( cd / && "$INSTALL_MONITOR" health ) 2>&1 || true)"
+OUT_B="$( ( cd "$TMP" && "$INSTALL_MONITOR" health ) 2>&1 || true)"
+OUT_C="$( ( mkdir -p "$TMP/random-cwd" && cd "$TMP/random-cwd" && "$INSTALL_MONITOR" health ) 2>&1 || true)"
+assert_eq "$(norm "$OUT_A")" "$(norm "$OUT_B")" "health identical from / and TMP (explicit state contract, P1)"
+assert_eq "$(norm "$OUT_B")" "$(norm "$OUT_C")" "health identical from random cwd (explicit state contract, P1)"
+assert_grep '"snapshot":' <(printf '%s' "$OUT_A") "health reads the real state root regardless of cwd"
+
+# ---------------------------------------------------------------------------
+section "T08c service fail-closed: secret file + API URL contract (P6/P7)"
+SVC="$FIX_APP_LINK/bin/monitor-service"
+SCRATCH_STATE="$(mktemp -d)"
+write_svc_conf() { # <file> <api-url-line> <secret-line>
+    { printf 'SBMON_MODE=collector-loop\n'; printf '%s\n' "$2"; printf '%s\n' "$3"; } > "$1"
+}
+GOOD_URL="SBMON_API_URL=http://127.0.0.1:19091"
+GOOD_SECRET="SBMON_API_SECRET_FILE=$FIX_CONF_DIR/api.secret"
+
+write_svc_conf "$TMP/svc-missing-secret.conf" "$GOOD_URL" "SBMON_API_SECRET_FILE=$SCRATCH_STATE/nope.secret"
+timeout 8 "$SVC" "$TMP/svc-missing-secret.conf" "$SCRATCH_STATE" > "$TMP/svc1.log" 2>&1
+assert_rc 1 $? "configured-but-missing secret -> immediate fail-closed exit"
+assert_grep 'fail-closed' "$TMP/svc1.log" "fail-closed message present"
+assert_no_grep 'mode=collector-loop' "$TMP/svc1.log" "service never enters collector loop without secret"
+
+write_svc_conf "$TMP/svc-dir-secret.conf" "$GOOD_URL" "SBMON_API_SECRET_FILE=$SCRATCH_STATE"
+timeout 8 "$SVC" "$TMP/svc-dir-secret.conf" "$SCRATCH_STATE" > "$TMP/svc2.log" 2>&1
+assert_rc 1 $? "wrong-type (directory) secret -> immediate fail-closed exit"
+
+write_svc_conf "$TMP/svc-bad-url.conf" "SBMON_API_URL=http://0.0.0.0:9091" ""
+timeout 8 "$SVC" "$TMP/svc-bad-url.conf" "$SCRATCH_STATE" > "$TMP/svc3.log" 2>&1
+assert_rc 1 $? "invalid (non-loopback) API URL -> immediate fail-closed exit (P7)"
+
+write_svc_conf "$TMP/svc-bad-ipv6.conf" "SBMON_API_URL=http://[::1]:19091/x?y=1" ""
+timeout 8 "$SVC" "$TMP/svc-bad-ipv6.conf" "$SCRATCH_STATE" > "$TMP/svc4.log" 2>&1
+assert_rc 1 $? "URL with path/query -> immediate fail-closed exit (P7)"
+
+write_svc_conf "$TMP/svc-ok.conf" "SBMON_API_URL=http://[::1]:19091" "$GOOD_SECRET"
+timeout 3 "$SVC" "$TMP/svc-ok.conf" "$SCRATCH_STATE" > "$TMP/svc5.log" 2>&1 || true
+assert_grep 'mode=collector-loop' "$TMP/svc5.log" "valid IPv6 loopback URL + present secret -> service starts (P7 IPv6 parse)"
+assert_no_grep 'fixture-api-secret' "$TMP/svc5.log" "secret value never printed"
+
+rm -rf "$SCRATCH_STATE"
 
 # ---------------------------------------------------------------------------
 section "T09 journal redaction (secrets never reach service output)"

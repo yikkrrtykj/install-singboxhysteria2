@@ -23,7 +23,12 @@ set -Eeuo pipefail
 # ---------------------------------------------------------------------------
 # Overridable configuration (production defaults)
 # ---------------------------------------------------------------------------
-SBMON_USER="${SBMON_USER:-singbox-monitor}"
+# Runtime identity follows the E3 rev4 approved user model: the unprivileged
+# web/service user is `sboxweb`. Product/service/paths keep the
+# singbox-monitor name; the user name does not have to match either. This
+# lets E3 land without re-migrating the service identity (spool
+# root:sboxweb 0710, sudoers, exact-token reads all key off this user).
+SBMON_USER="${SBMON_USER:-sboxweb}"
 SBMON_GROUP="${SBMON_GROUP:-$SBMON_USER}"
 
 SBMON_APP_LINK="${SBMON_APP_LINK:-/opt/singbox-monitor}"                 # symlink -> current release
@@ -38,6 +43,20 @@ SBMON_WEB_BIND_DEFAULT="${SBMON_WEB_BIND_DEFAULT:-127.0.0.1:9191}"
 SBMON_API_URL_DEFAULT="${SBMON_API_URL_DEFAULT:-http://127.0.0.1:9091}"   # matches PHASE_D_API_* in install.sh
 SBMON_KEEP_RELEASES="${SBMON_KEEP_RELEASES:-3}"
 SBMON_HEALTH_TIMEOUT="${SBMON_HEALTH_TIMEOUT:-20}"
+
+# P4: serialization of ALL mutating deployment commands. Fail-closed: a
+# missing flock binary, an unopenable lock file, or a timeout aborts the
+# command before any mutation -- never warn-and-continue.
+SBMON_LOCK_FILE="${SBMON_LOCK_FILE:-/run/lock/singbox-monitor-deploy.lock}"
+SBMON_LOCK_TIMEOUT="${SBMON_LOCK_TIMEOUT:-15}"
+SBMON_FLOCK="${SBMON_FLOCK:-flock}"
+
+# P6: S0 anchor. The service.api secret's single source of truth stays the
+# sing-box config / the root-side S0 anchor file (root:root 0600). Packaging
+# only delivers a least-privilege DERIVED copy to the non-root monitor; this
+# is the one sanctioned reference into the proxy tree and nothing else may
+# read from it.
+SBMON_API_SECRET_SOURCE="${SBMON_API_SECRET_SOURCE:-/root/sbox/monitor-api.secret}"
 
 # Tooling (overridable for fixtures/mocks)
 SBMON_SYSTEMCTL="${SBMON_SYSTEMCTL:-systemctl}"
@@ -60,6 +79,43 @@ SBMON_HISTORY_FILE="${SBMON_HISTORY_FILE:-$SBMON_RELEASES_DIR/releases.history}"
 sbmon_info() { printf '[sbmon] %s\n' "$*"; }
 sbmon_warn() { printf '[sbmon] WARNING: %s\n' "$*" >&2; }
 sbmon_die() { printf '[sbmon] ERROR: %s\n' "$*" >&2; exit 1; }
+# P3: rollback itself failed. The deployment must NOT claim success or
+# "rollback complete"; loud non-zero exit for operator attention.
+sbmon_critical() { printf '[sbmon] CRITICAL: %s\n' "$*" >&2; exit 2; }
+
+# ---------------------------------------------------------------------------
+# P4: deployment serialization lock (mutating commands only)
+# ---------------------------------------------------------------------------
+sbmon_acquire_deploy_lock() {
+    command -v "$SBMON_FLOCK" >/dev/null 2>&1 \
+        || sbmon_die "缺少 flock（部署锁 fail-closed，拒绝在无锁状态下变更）"
+    mkdir -p -- "$(dirname -- "$SBMON_LOCK_FILE")" 2>/dev/null || true
+    exec 9>>"$SBMON_LOCK_FILE" \
+        || sbmon_die "部署锁文件无法打开: fail-closed（$SBMON_LOCK_FILE）"
+    if ! "$SBMON_FLOCK" -w "$SBMON_LOCK_TIMEOUT" 9; then
+        sbmon_die "部署锁获取失败（超时 ${SBMON_LOCK_TIMEOUT}s 或被拒绝）；另一部署操作可能正在进行，已放弃变更"
+    fi
+    sbmon_info "deployment lock acquired: $SBMON_LOCK_FILE"
+}
+
+# ---------------------------------------------------------------------------
+# P3: atomic file primitives (same-filesystem temp + rename)
+# ---------------------------------------------------------------------------
+sbmon_atomic_write() { # sbmon_atomic_write <path> <mode>  (content on stdin)
+    local target="$1" mode="$2"
+    local dir
+    dir="$(dirname -- "$target")"
+    local tmp
+    tmp="$(mktemp "$dir/.sbmon-write.XXXXXX")" \
+        || sbmon_die "临时文件创建失败: $dir"
+    cat > "$tmp" || { rm -f -- "$tmp"; sbmon_die "临时文件写入失败: $tmp"; }
+    chmod "$mode" "$tmp"
+    if [ "$SBMON_FIXTURE" != "1" ]; then
+        chgrp "$SBMON_GROUP" "$tmp" 2>/dev/null || true
+    fi
+    sync -f "$tmp" 2>/dev/null || true   # best-effort fsync where the platform supports it
+    mv -f -- "$tmp" "$target" || { rm -f -- "$tmp"; sbmon_die "原子替换失败: $target"; }
+}
 
 # ---------------------------------------------------------------------------
 # Version helpers
@@ -165,9 +221,15 @@ sbmon_create_layout() {
 }
 
 # ---------------------------------------------------------------------------
-# monitor.conf -- written ONCE (fresh install); never overwritten.
+# monitor.conf -- written ONCE (fresh install, atomically); never overwritten.
 # ---------------------------------------------------------------------------
 sbmon_conf_file() { printf '%s/monitor.conf\n' "$SBMON_CONF_DIR"; }
+
+sbmon_conf_get() { # sbmon_conf_get <KEY> -> value or empty (never logged)
+    local key="$1" line
+    line="$(grep -E "^${key}=" "$(sbmon_conf_file)" 2>/dev/null | tail -n 1)" || return 0
+    printf '%s\n' "${line#*=}"
+}
 
 sbmon_write_default_conf() {
     local conf
@@ -176,8 +238,8 @@ sbmon_write_default_conf() {
         sbmon_info "monitor.conf 已存在，保留不动: $conf"
         return 0
     fi
-    sbmon_info "写入默认 monitor.conf（仅首次）"
-    cat > "$conf" <<EOF
+    sbmon_info "写入默认 monitor.conf（仅首次，原子写入）"
+    sbmon_atomic_write "$conf" 0640 <<EOF
 # sing-box Monitor v2 configuration (KEY=VALUE, parsed strictly; no shell eval)
 # Written once by install-monitor.sh; upgrades and repairs NEVER overwrite it.
 
@@ -187,11 +249,17 @@ sbmon_write_default_conf() {
 SBMON_WEB_BIND=$SBMON_WEB_BIND_DEFAULT
 
 # sing-box service.api endpoint (Phase D pins 127.0.0.1:9091; do not expose).
+# Validated against the loopback http contract at service start and health.
 SBMON_API_URL=$SBMON_API_URL_DEFAULT
 
-# Optional Authorization bearer secret for service.api (S0 owns provisioning).
-# Installer never creates this file; if present it is permission-checked.
-# SBMON_API_SECRET_FILE=$SBMON_CONF_DIR/api.secret
+# P6 S0 bridge: DERIVED copy of the service.api secret, delivered by
+# install-monitor.sh from the root-side S0 anchor (root:root 0600) to
+# root:sboxweb 0640. The anchor stays the only source of truth; this file is
+# a least-privilege delivery copy. The monitor service FAILS CLOSED when this
+# file is configured but missing/unreadable/wrong-type -- it never silently
+# downgrades to an unauthenticated connection. Pre-S0 escape hatch: comment
+# this line out AND remove the derived file to run without API auth.
+SBMON_API_SECRET_FILE=$SBMON_CONF_DIR/api.secret
 
 # Runtime mode: collector-loop (E1-only snapshot engine; honest skeleton).
 # E2 integration switches this to "web" once app/serve entry exists.
@@ -200,10 +268,6 @@ SBMON_MODE=collector-loop
 # Collector stream window per snapshot cycle (seconds).
 SBMON_CYCLE_SECONDS=300
 EOF
-    chmod 0640 "$conf"
-    if [ "$SBMON_FIXTURE" != "1" ]; then
-        chgrp "$SBMON_GROUP" "$conf"
-    fi
 }
 
 # Strict KEY=VALUE parsing for the deployed shims lives in
@@ -224,6 +288,63 @@ sbmon_repair_conf_perms() {
     fi
     if [ "$SBMON_FIXTURE" != "1" ]; then
         chgrp "$SBMON_GROUP" "$conf"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# P6: S0 service.api secret -> non-root monitor bridge.
+#
+# Design (README §"S0 secret bridge"):
+#   * single source of truth: sing-box service.api secret / S0 root-side
+#     anchor (root:root 0600). NEVER chmod/chgrp the anchor; NEVER weaken
+#     ProtectHome to read it directly at runtime.
+#   * packaging delivers a DERIVED copy at the conf-declared path with
+#     root:<SBMON_GROUP> 0640 via temp+atomic rename.
+#   * source missing while the conf expects a secret file -> fail closed
+#     (the monitor must never silently degrade to unauthenticated).
+#   * content-identical -> no rewrite, no mtime churn.
+#   * write failure -> installer aborts. Contents are never printed.
+# ---------------------------------------------------------------------------
+sbmon_sync_api_secret() {
+    local dest
+    dest="$(sbmon_conf_get SBMON_API_SECRET_FILE)"
+    if [ -z "$dest" ]; then
+        sbmon_info "monitor.conf 未配置 SBMON_API_SECRET_FILE：跳过 secret bridge（无 API auth 模式）"
+        return 0
+    fi
+    local source="$SBMON_API_SECRET_SOURCE"
+    if [ ! -e "$source" ]; then
+        sbmon_die "S0 anchor 缺失（$source 不存在）而 conf 要求 secret（$dest）：fail-closed，未做任何变更"
+    fi
+    if [ ! -f "$source" ] || [ ! -r "$source" ]; then
+        sbmon_die "S0 anchor 不是可读的普通文件（$source）：fail-closed，未做任何变更"
+    fi
+    if [ -f "$dest" ] && cmp -s -- "$source" "$dest"; then
+        sbmon_info "api.secret 内容一致，不重写（无 mtime churn）"
+    else
+        local ddir
+        ddir="$(dirname -- "$dest")"
+        [ -d "$ddir" ] || sbmon_die "secret 目标目录不存在: $ddir"
+        local tmp
+        tmp="$(mktemp "$ddir/.api.secret.XXXXXX")" || sbmon_die "secret 临时文件创建失败"
+        cat -- "$source" > "$tmp" || { rm -f -- "$tmp"; sbmon_die "secret 临时写入失败：安装中止"; }
+        chmod 0640 "$tmp"
+        if [ "$SBMON_FIXTURE" != "1" ]; then
+            chgrp "$SBMON_GROUP" "$tmp" || { rm -f -- "$tmp"; sbmon_die "secret 组设置失败：安装中止"; }
+        fi
+        sync -f "$tmp" 2>/dev/null || true
+        mv -f -- "$tmp" "$dest" || { rm -f -- "$tmp"; sbmon_die "api.secret 原子替换失败：安装中止"; }
+        sbmon_info "api.secret 已同步（derived copy, 0640）"
+    fi
+    # Converge perms on the derived copy even when content was identical.
+    local mode
+    mode="$(stat -c '%a' "$dest")"
+    if [ "$mode" != "640" ]; then
+        chmod 0640 "$dest"
+        sbmon_info "api.secret 权限修复为 0640"
+    fi
+    if [ "$SBMON_FIXTURE" != "1" ]; then
+        chgrp "$SBMON_GROUP" "$dest" 2>/dev/null || true
     fi
 }
 
@@ -338,8 +459,9 @@ sbmon_install_unit() {
         cp -a -- "$SBMON_UNIT_FILE" "$SBMON_UNIT_FILE.bak.$(date +%Y%m%d%H%M%S)"
         sbmon_warn "systemd unit 已存在且内容变化，已备份旧 unit 后覆盖"
     fi
-    printf '%s\n' "$rendered" > "$SBMON_UNIT_FILE"
-    chmod 0644 "$SBMON_UNIT_FILE"
+    # P3: atomic unit install (same-filesystem temp -> rename); readers of
+    # the unit never observe a half-written file.
+    sbmon_atomic_write "$SBMON_UNIT_FILE" 0644 <<< "$rendered"
     # shellcheck disable=SC2034  # consumed by the caller (install-monitor.sh)
     SBMON_UNIT_CHANGED=1
     sbmon_systemctl daemon-reload
@@ -364,9 +486,9 @@ sbmon_health_json() {
     local probe
     probe="$(sbmon_health_cmd)"
     [ -x "$probe" ] || { printf '{"error":"probe missing"}'; return 1; }
-    # Always pass the conf explicitly: the probe's default is the production
-    # path, which is wrong under a fixture root.
-    "$probe" "$(sbmon_conf_file)" 2>/dev/null || true   # degraded(2)/unhealthy(1) still print JSON
+    # P1: the state root is an explicit contract -- the probe must never
+    # infer it from the caller's working directory.
+    "$probe" "$(sbmon_conf_file)" "$SBMON_STATE_ROOT/state" 2>/dev/null || true   # degraded(2)/unhealthy(1) still print JSON
 }
 
 sbmon_service_active() {

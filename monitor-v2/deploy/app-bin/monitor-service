@@ -1,24 +1,40 @@
 #!/usr/bin/env bash
 # monitor-service -- runtime entrypoint of singbox-monitor.service (skeleton).
 #
+# Usage: monitor-service <conf> <state-dir>
+#   <conf>       monitor.conf path (required; unit passes it explicitly)
+#   <state-dir>  snapshot/state directory (required; unit passes
+#                @SBMON_STATE_ROOT@/state explicitly -- P1: the state root is
+#                an explicit contract, never inferred from $PWD or WorkingDirectory)
+#
 # Modes (monitor.conf SBMON_MODE):
 #   collector-loop  REAL, E1-only: run the E1 collector in cycles, atomically
-#                   writing each snapshot to <state>/snapshot.json. No web, no
-#                   listening socket. This is the honest default until E2 lands.
-#   web             DEFERRED E2 HOOK: requires app/web/serve entry deployed by
-#                   the E2 integration conversation. Fail-closed otherwise.
+#                   writing each snapshot to <state-dir>/snapshot.json. No
+#                   web, no listening socket. Honest default until E2 lands.
+#   web             DEFERRED E2 HOOK: requires app/web/serve deployed by the
+#                   E2 integration conversation. Fail-closed otherwise.
+#
+# Startup contracts (all fail-closed, checked BEFORE the loop starts):
+#   * SBMON_API_URL must satisfy the loopback http contract (P7);
+#   * if SBMON_API_SECRET_FILE is configured, the file must exist, be
+#     readable and be a regular file (P6) -- never a silent downgrade to an
+#     unauthenticated connection.
 #
 # Journal hygiene: collector stdout (snapshot JSON, contains client metadata)
-# is redirected to the 0700 state dir, never to journald. Only lifecycle
-# messages from this shim reach the journal.
+# is redirected to the state dir, never to journald. Only lifecycle messages
+# from this shim reach the journal.
 set -Eeuo pipefail
 
-CONF="${1:-/etc/singbox-monitor/monitor.conf}"
+CONF="${1:-}"
+STATE_DIR="${2:-${SBMON_STATE_DIR:-}}"
 SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/monitor-env.sh
 source "$SELF_DIR/../lib/monitor-env.sh"
 
 APP_DIR="$(cd -- "$SELF_DIR/.." && pwd)"
+
+[ -n "$CONF" ] || { echo "monitor-service: conf path required" >&2; exit 1; }
+[ -n "$STATE_DIR" ] || { echo "monitor-service: state dir required (explicit contract, no \$PWD inference)" >&2; exit 1; }
 
 SBMON_ENV_MODE=""
 SBMON_ENV_API_URL=""
@@ -29,12 +45,29 @@ monitor_env_load "$CONF" || { echo "monitor-service: cannot read conf" >&2; exit
 MODE="${SBMON_ENV_MODE:-collector-loop}"
 API_URL="${SBMON_ENV_API_URL:-http://127.0.0.1:9091}"
 CYCLE_SECONDS="${SBMON_ENV_CYCLE_SECONDS:-300}"
-# systemd sets WorkingDirectory=@SBMON_STATE_ROOT@; the snapshot lives at
-# <state-root>/state/snapshot.json. SBMON_STATE_DIR overrides for tests.
-STATE_DIR="${SBMON_STATE_DIR:-$PWD/state}"
 COLLECTOR="$APP_DIR/app/collector/collector.py"
 
 log() { echo "monitor-service: $*"; }
+
+# --- P7: validate the API URL before doing anything else ---
+if ! monitor_env_validate_api_url "$API_URL"; then
+    log "SBMON_API_URL violates the loopback http contract (scheme=http, host=loopback, valid numeric port, no userinfo/path/query/fragment); refusing to start"
+    exit 1
+fi
+
+# --- P6: configured secret file is a hard requirement, never optional ---
+secret_args=()
+if [ -n "${SBMON_ENV_API_SECRET_FILE:-}" ]; then
+    if [ ! -e "$SBMON_ENV_API_SECRET_FILE" ]; then
+        log "SBMON_API_SECRET_FILE is configured but missing: fail-closed (no silent unauthenticated downgrade)"
+        exit 1
+    fi
+    if [ ! -f "$SBMON_ENV_API_SECRET_FILE" ] || [ ! -r "$SBMON_ENV_API_SECRET_FILE" ]; then
+        log "SBMON_API_SECRET_FILE is configured but not a readable regular file: fail-closed"
+        exit 1
+    fi
+    secret_args=(--secret-file "$SBMON_ENV_API_SECRET_FILE")
+fi
 
 child_pid=""
 terminate() {
@@ -50,11 +83,6 @@ run_collector_loop() {
     [ -f "$COLLECTOR" ] || { log "collector.py missing in $APP_DIR"; exit 1; }
     command -v "$pybin" >/dev/null 2>&1 || { log "python3 not found"; exit 1; }
     mkdir -p "$STATE_DIR"
-
-    local secret_args=()
-    if [ -n "${SBMON_ENV_API_SECRET_FILE:-}" ] && [ -f "$SBMON_ENV_API_SECRET_FILE" ]; then
-        secret_args=(--secret-file "$SBMON_ENV_API_SECRET_FILE")
-    fi
 
     log "mode=collector-loop cycle=${CYCLE_SECONDS}s target=<loopback service.api>"
     local first=1
@@ -96,7 +124,7 @@ run_web() {
     # run so the unit state honestly shows "not implemented" instead of
     # silently doing nothing.
     if [ -x "$APP_DIR/app/web/serve" ]; then
-        exec "$APP_DIR/app/web/serve" "$CONF"
+        exec "$APP_DIR/app/web/serve" "$CONF" "$STATE_DIR"
     fi
     log "mode=web requested but no app/web/serve entry deployed (E2 pending)"
     exit 21

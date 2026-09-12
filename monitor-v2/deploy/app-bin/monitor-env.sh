@@ -26,18 +26,65 @@ monitor_env_load() { # monitor_env_load <conf-file>
     done < "$conf"
 }
 
-# Split http://host:port into REPLY_HOST / REPLY_PORT (loopback-only guard).
+# P7: production API URL contract, validated via the Python runtime
+# (urllib.parse) -- the shell never hand-parses URLs.
+#   scheme  = http exactly (service.api is h2c http on loopback)
+#   host    = 127.0.0.1 | localhost | ::1  (loopback-only, E1 fail-closed)
+#   port    = numeric, valid range
+#   no userinfo, no query, no fragment, no path beyond "/"
+monitor_env_validate_api_url() { # monitor_env_validate_api_url <url> -> rc 0 valid
+    local pybin="${SBMON_PYTHON3:-python3}"
+    command -v "$pybin" >/dev/null 2>&1 || return 1
+    "$pybin" - "$1" <<'PY'
+import sys
+from urllib.parse import urlsplit
+try:
+    u = urlsplit(sys.argv[1])
+    port = u.port  # may raise ValueError on invalid/overflowing port
+    ok = (
+        u.scheme == "http"
+        and u.hostname in ("127.0.0.1", "localhost", "::1")
+        and isinstance(port, int) and 0 < port < 65536
+        and u.username is None and u.password is None
+        and u.path in ("", "/")
+        and u.query == "" and u.fragment == ""
+    )
+except ValueError:
+    ok = False
+sys.exit(0 if ok else 1)
+PY
+}
+
+# Split a VALIDATED loopback URL into REPLY_HOST / REPLY_PORT for the TCP
+# probe. Invalid URLs and non-loopback hosts fail closed (E1 contract).
 monitor_env_split_url() { # monitor_env_split_url <url>
-    local url="$1" rest
-    rest="${url#*://}"
-    [ "$rest" != "$url" ] || return 1
-    REPLY_HOST="${rest%%[:/]*}"
-    REPLY_PORT="${rest#*:}"
-    REPLY_PORT="${REPLY_PORT%%[/]*}"
-    case "$REPLY_HOST" in
-        127.0.0.1|localhost|::1) return 0 ;;
-        *) return 1 ;;   # fail-closed: service.api must stay loopback (E1 contract)
-    esac
+    local pybin="${SBMON_PYTHON3:-python3}"
+    command -v "$pybin" >/dev/null 2>&1 || return 1
+    local out
+    out="$("$pybin" - "$1" <<'PY'
+import sys
+from urllib.parse import urlsplit
+try:
+    u = urlsplit(sys.argv[1])
+    port = u.port
+    ok = (
+        u.scheme == "http"
+        and u.hostname in ("127.0.0.1", "localhost", "::1")
+        and isinstance(port, int) and 0 < port < 65536
+        and u.username is None and u.password is None
+        and u.path in ("", "/")
+        and u.query == "" and u.fragment == ""
+    )
+    if not ok:
+        sys.exit(1)
+    print(u.hostname, port)
+except ValueError:
+    sys.exit(1)
+PY
+)" || return 1
+    REPLY_HOST="${out%% *}"
+    REPLY_PORT="${out##* }"
+    [ -n "$REPLY_HOST" ] && [ -n "$REPLY_PORT" ]
 }
 
 # TCP connect probe (no curl dependency, no output).
