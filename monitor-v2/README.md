@@ -262,12 +262,20 @@ socket 对端地址 → IP 白名单 → admin session → 路由
   反代场景需要另行显式设计 trusted proxy，本版不支持。
 - admin 认证：scrypt（N=16384/r=8/p=1 + 随机盐，`hmac.compare_digest` 比较），
   `auth.json` 只存 hash；session token 为 `secrets.token_urlsafe(32)`，
-  仅存内存（重启即失效，不落盘）；cookie `Secure; HttpOnly; SameSite=Strict`，
-  默认 8h；登录失败按源 IP 限速（15 分钟内 5 次失败 → 锁 15 分钟）。
+  仅存内存（重启即失效，不落盘）；每个 session 另带独立的 CSRF token
+  （`/api/v1/session` 登录后返回，登录后所有 mutation 必须携带
+  `X-CSRF-Token`，`hmac.compare_digest` 比较；若浏览器声明 Origin 还须同源）。
+  cookie `HttpOnly; SameSite=Strict`，默认 8h；`Secure` 按模式强制：
+  remote 监听与任何 TLS 监听**必须**带 Secure，loopback HTTP 监听刻意不带
+  （各浏览器对 http://localhost 上的 Secure cookie 行为不一，loopback
+  不经过网络，兼容性优先且边界明确）。登录失败按源 IP 限速
+  （15 分钟内 5 次失败 → 锁 15 分钟）。
 - Recovery：≥128-bit 随机 key（token_urlsafe(24) ≈ 192-bit），明文只显示一次，
   服务器只存 hash。它**只能**把调用方的真实对端地址以 `/32`（或 `/128`）
   加回白名单：不能看 dashboard/白名单、不能指定任意 IP、不能删条目、
-  不能改密码、**不建立 admin session**。失败限速更严（3 次失败 → 锁 30 分钟）。
+  不能改密码、**不建立 admin session**。失败限速更严（3 次失败 → 锁 30 分钟）；
+  另有**全进程**预算：每分钟最多 20 次验证尝试、最多 2 个并发 scrypt 验证，
+  被拒请求在 scrypt 之前就被 429（带 Retry-After），限速器全部线程安全。
   成功响应只有 "IP added. Please login normally."。
 - 日志只记请求行（方法/路径/状态/对端 IP），密码、session token、
   recovery key、sing-box credentials 永不出现在日志。
@@ -277,10 +285,16 @@ socket 对端地址 → IP 白名单 → admin session → 路由
 默认 `127.0.0.1:9191`。只有用户明确 `--listen 0.0.0.0`（或其他非 loopback
 地址）才启用 remote management，且必须**同时**满足：TLS 证书/私钥、admin
 password、recovery key、非空白名单——任何一项缺失都 **拒绝启动**（exit 2），
-绝不降级为 warning。TLS 支持 `--tls-cert/--tls-key` 提供的证书；
-`setup` 可用 openssl 生成自签名证书（私钥 0600）。响应统一带
+绝不降级为 warning。
+
+**TLS 范围（明确）**：E2 只接受用户自行提供的 `--tls-cert / --tls-key`。
+E2 **不**自动申请证书、**不**自动生成自签名证书、不做 Let's Encrypt——
+自动证书生成/发放属于后续 Packaging 阶段的职责。响应统一带
 `Content-Security-Policy: default-src 'self'`、`X-Content-Type-Options:
-nosniff`、`Referrer-Policy: no-referrer`、`X-Frame-Options: DENY`。
+nosniff`、`Referrer-Policy: no-referrer`、`X-Frame-Options: DENY`；
+HTTP 表面固定为 GET/POST（其余方法一律 405 + `Allow: GET, POST`），
+请求体上限 64 KiB（malformed Content-Length → 400，超限 → 413，
+chunked → 400 并断连）。
 
 ### 数据存放（与 sing-box 配置严格分离）
 
