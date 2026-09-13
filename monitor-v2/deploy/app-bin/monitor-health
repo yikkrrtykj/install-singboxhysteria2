@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# monitor-health -- health probe for singbox-monitor (skeleton).
+#
+# Usage: monitor-health [conf] [state-dir] [--quiet]
+#   conf       default /etc/singbox-monitor/monitor.conf
+#   state-dir  REQUIRED in production (P1): callers pass it explicitly
+#              (install-monitor.sh health/status and the systemd unit pass
+#              <state-root>/state). Never inferred from $PWD.
+#
+# Reports SEPARATE signals (never one merged health=true):
+#   service_active  -- systemd unit is active (web/collector process alive)
+#   api_reachable   -- sing-box service.api TCP endpoint answers (loopback)
+#   api_url_valid   -- SBMON_API_URL satisfies the loopback http contract (P7)
+#   snapshot        -- present / age_seconds / collector_stale (P2: E1 JSON
+#                      top-level "stale" flag) / age_stale / stale
+#   web_http        -- E2 dashboard HTTP endpoint; not-applicable until E2 ships
+#
+# P2 stale semantics (E1 contract: stream/API/auth failure keeps the last
+# state and stamps stale=true in the snapshot JSON, so a FRESH FILE is not
+# proof of a healthy collector):
+#   final stale = malformed JSON OR collector_stale (JSON stale==true) OR age_stale
+#   malformed JSON is reported as stale=true + degraded, contents never logged.
+#
+# Exit codes: 0 healthy | 1 unhealthy (service down) | 2 degraded
+# (service up but api unreachable, url invalid, and/or snapshot stale).
+# Output is a single JSON line; no snapshot contents, no secrets.
+set -Eeuo pipefail
+
+CONF="${1:-/etc/singbox-monitor/monitor.conf}"
+STATE_DIR="${2:-${SBMON_STATE_DIR:-}}"
+
+SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/monitor-env.sh
+source "$SELF_DIR/../lib/monitor-env.sh"
+
+SBMON_SYSTEMCTL="${SBMON_SYSTEMCTL:-systemctl}"
+SBMON_SERVICE_NAME="${SBMON_SERVICE_NAME:-singbox-monitor}"
+
+if [ -z "$STATE_DIR" ]; then
+    printf '{"error":"state dir not specified (explicit contract; pass <state-root>/state)"}\n'
+    exit 1
+fi
+
+SBMON_ENV_MODE=""
+SBMON_ENV_API_URL=""
+SBMON_ENV_CYCLE_SECONDS=""
+monitor_env_load "$CONF" || { echo '{"error":"conf unreadable"}'; exit 1; }
+
+MODE="${SBMON_ENV_MODE:-collector-loop}"
+API_URL="${SBMON_ENV_API_URL:-http://127.0.0.1:9091}"
+CYCLE_SECONDS="${SBMON_ENV_CYCLE_SECONDS:-300}"
+
+service_active=false
+if "$SBMON_SYSTEMCTL" is-active --quiet "$SBMON_SERVICE_NAME" 2>/dev/null; then
+    service_active=true
+fi
+
+api_url_valid=false
+api_reachable=false
+if monitor_env_validate_api_url "$API_URL"; then
+    api_url_valid=true
+    if monitor_env_split_url "$API_URL" \
+       && monitor_env_tcp_probe "$REPLY_HOST" "$REPLY_PORT" 2; then
+        api_reachable=true
+    fi
+fi
+
+snapshot_present=false
+snapshot_stale=true
+snapshot_age=-1
+age_stale=true
+collector_stale=true
+snapshot_wellformed=false
+SNAP="$STATE_DIR/snapshot.json"
+if [ -f "$SNAP" ]; then
+    snapshot_present=true
+    now="$(monitor_env_now)"
+    mtime="$(monitor_env_mtime "$SNAP")"
+    snapshot_age=$(( now - mtime ))
+    # Two full collection cycles without a new snapshot == age-stale.
+    max_age=$(( CYCLE_SECONDS * 2 + 30 ))
+    if (( snapshot_age >= 0 && snapshot_age <= max_age )); then
+        age_stale=false
+    fi
+    # P2: semantic staleness from the E1 snapshot itself. The python helper
+    # prints ONLY one token (wellformed / stale / fresh); snapshot contents
+    # (devices, ids, errors) are never read into or emitted by this probe.
+    pybin="${SBMON_PYTHON3:-python3}"
+    if command -v "$pybin" >/dev/null 2>&1; then
+        verdict="$("$pybin" - "$SNAP" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as f:
+        d = json.load(f)
+    if not isinstance(d, dict):
+        print("malformed")
+    elif d.get("stale") is True:
+        print("stale")
+    else:
+        print("fresh")
+except Exception:
+    print("malformed")
+PY
+)" || verdict="malformed"
+        case "$verdict" in
+            fresh)     snapshot_wellformed=true; collector_stale=false ;;
+            stale)     snapshot_wellformed=true; collector_stale=true ;;
+            malformed) snapshot_wellformed=false; collector_stale=true ;;
+        esac
+    fi
+fi
+
+snapshot_stale=true
+if [ "$snapshot_present" = true ] && [ "$age_stale" = false ] \
+   && [ "$collector_stale" = false ]; then
+    snapshot_stale=false
+fi
+
+web_http="not-applicable"
+if [ "$MODE" = "web" ]; then
+    # E2 hook: integration conversation extends this branch with an HTTP
+    # probe of SBMON_WEB_BIND (e.g. GET /healthz). Until that exists the
+    # field reports "unimplemented" and does not block degraded/healthy.
+    web_http="unimplemented"
+fi
+
+overall="healthy"
+if [ "$service_active" != true ]; then
+    overall="unhealthy"
+elif [ "$api_reachable" != true ] || [ "$api_url_valid" != true ] \
+     || [ "$snapshot_stale" = true ]; then
+    overall="degraded"
+fi
+
+json=$(printf '{"service_active":%s,"api_url_valid":%s,"api_reachable":%s,"snapshot":{"present":%s,"age_seconds":%s,"wellformed":%s,"collector_stale":%s,"age_stale":%s,"stale":%s},"web_http":"%s","mode":"%s","overall":"%s"}' \
+    "$service_active" "$api_url_valid" "$api_reachable" "$snapshot_present" "$snapshot_age" \
+    "$snapshot_wellformed" "$collector_stale" "$age_stale" "$snapshot_stale" "$web_http" "$MODE" "$overall")
+
+printf '%s\n' "$json"
+
+case "$overall" in
+    healthy)   exit 0 ;;
+    degraded)  exit 2 ;;
+    unhealthy) exit 1 ;;
+esac

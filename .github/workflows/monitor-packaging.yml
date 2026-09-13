@@ -1,0 +1,21 @@
+name: monitor-packaging
+
+on:
+  push:
+    branches: [feature/monitor-packaging]
+  pull_request:
+
+jobs:
+  packaging-tests:
+    # The atomic release-switch tests (T02-T05, T15/T16, F1/F2, T17/F4) need
+    # real symlink rename(2) semantics, so the full suite runs on Linux.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Monitor v2 packaging test suite (fixture identity)
+        run: bash tests/test-monitor-packaging.sh
+      # F3: a second root pass runs user/group management and file metadata
+      # FOR REAL (useradd/groupadd/chown/chgrp) and asserts the
+      # root:sboxweb 0640 ownership contract plus wrong-group repair.
+      - name: Run Monitor v2 packaging test suite (root, real metadata)
+        run: sudo --preserve-env=HOME bash tests/test-monitor-packaging.sh

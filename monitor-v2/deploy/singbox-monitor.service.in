@@ -1,0 +1,46 @@
+[Unit]
+Description=sing-box Monitor v2 (collector + local web dashboard)
+# Ordering only: if sing-box fails to start, the monitor MUST NOT fail the
+# boot or be blocked -- After= without Requires= still starts this unit, and
+# the collector treats an unreachable stream as stale and keeps retrying.
+After=network-online.target sing-box.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@SBMON_USER@
+Group=@SBMON_GROUP@
+# P1: the state root is passed explicitly to the entrypoint; WorkingDirectory
+# is a convenience only, never the source of truth for the state path.
+ExecStart=@SBMON_APP_DIR@/bin/monitor-service @SBMON_CONF@ @SBMON_STATE_ROOT@/state
+WorkingDirectory=@SBMON_STATE_ROOT@
+# P8: private-by-default runtime files (snapshots, temp copies).
+UMask=0077
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=15s
+
+# --- hardening: each line maps to a real need of the monitor ---
+# Collector needs: connect 127.0.0.1:9091, bind 127.0.0.1:9191 (>1024),
+# read /etc/singbox-monitor, write /var/lib/singbox-monitor. Nothing else.
+# The S0 secret is delivered as a derived root:sboxweb 0640 copy under /etc
+# by the installer (P6); these options are NOT weakened for it.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=full
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target
