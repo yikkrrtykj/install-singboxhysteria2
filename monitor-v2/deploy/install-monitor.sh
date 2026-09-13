@@ -505,7 +505,7 @@ _cmd_web_setup_locked() {
         SSH_CONNECTION="$ssh_conn" "$SBMON_PYTHON3" "$webapp" setup \
             --data-dir "$SBMON_STATE_ROOT" || rc=$?
     else
-        command -v "${SBMON_SUDO:-sudo}" >/dev/null 2>&1 \
+        command -v "$SBMON_SUDO" >/dev/null 2>&1 \
             || sbmon_die "web-setup: 缺少 sudo，无法以 $SBMON_USER 运行 setup：fail-closed"
         # -n: non-interactive sudo (fail instead of prompting for a root
         # password mid-setup). Only SSH_CONNECTION is forwarded.

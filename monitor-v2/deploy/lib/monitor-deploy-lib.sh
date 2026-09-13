@@ -61,6 +61,7 @@ SBMON_API_SECRET_SOURCE="${SBMON_API_SECRET_SOURCE:-/root/sbox/monitor-api.secre
 # Tooling (overridable for fixtures/mocks)
 SBMON_SYSTEMCTL="${SBMON_SYSTEMCTL:-systemctl}"
 SBMON_PYTHON3="${SBMON_PYTHON3:-python3}"
+SBMON_SUDO="${SBMON_SUDO:-sudo}"   # web-setup drops to the service identity
 SBMON_FIXTURE="${SBMON_FIXTURE:-0}"   # 1 = skip user/group/chown (non-root test runs)
 
 # Repo-side sources, resolved relative to this file:
