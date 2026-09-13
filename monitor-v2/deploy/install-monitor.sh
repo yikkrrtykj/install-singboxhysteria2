@@ -93,9 +93,13 @@ sbmon_txn_rollback() { # <old_id> <old_unit_backup|''> <old_unit_existed> <old_a
             sbmon_critical "unit 恢复失败（备份缺失或写入失败）；需要人工处理"
         fi
     else
-        rm -f -- "$SBMON_UNIT_FILE"
+        # R4-1: removal of the candidate unit is a restoration step -- a
+        # failure must be CRITICAL, never a silent set -e exit.
+        if ! rm -f -- "$SBMON_UNIT_FILE"; then
+            sbmon_critical "unit 删除失败（candidate unit 无法移除）；需要人工处理"
+        fi
     fi
-    rm -f -- "$old_unit_backup" 2>/dev/null || true
+    rm -f -- "$old_unit_backup" 2>/dev/null || true   # temp bookkeeping, not a state restore step
 
     if ! sbmon_systemctl daemon-reload; then
         sbmon_critical "回滚后 daemon-reload 失败；systemd 状态可能不一致，需要人工处理"
@@ -479,13 +483,40 @@ cmd_uninstall() {
 
 _cmd_uninstall_locked() { # F4: runs under the deploy lock
     sbmon_info "卸载 Monitor（仅 Monitor；不触碰 sing-box / 代理凭据 / 配置）"
-    sbmon_service_stop_disable
-    if [ -e "$SBMON_UNIT_FILE" ]; then
-        rm -f -- "$SBMON_UNIT_FILE"
-        sbmon_systemctl daemon-reload
+    # R4-2: idempotency comes from CHECKING state, never from swallowing
+    # errors. Already-absent states are fine; a FAILED stop/disable aborts
+    # BEFORE any destructive deletion.
+    if sbmon_service_active; then
+        if ! sbmon_service_stop_strict; then
+            sbmon_die "服务停止失败：拒绝在 Monitor 运行时删除部署文件"
+        fi
     fi
-    rm -rf -- "$SBMON_APP_LINK"   # symlink itself; never descends into the release tree
-    rm -rf -- "$SBMON_RELEASES_DIR"
+    if sbmon_service_enabled; then
+        if ! sbmon_service_disable_strict; then
+            sbmon_die "服务 disable 失败：拒绝在 enabled 状态下删除部署文件"
+        fi
+    fi
+    # Final proof BEFORE deleting anything.
+    if sbmon_service_active; then
+        sbmon_critical "卸载前校验失败：服务仍处于运行状态"
+    fi
+    if sbmon_service_enabled; then
+        sbmon_critical "卸载前校验失败：服务仍处于 enabled 状态"
+    fi
+    if [ -e "$SBMON_UNIT_FILE" ]; then
+        if ! rm -f -- "$SBMON_UNIT_FILE"; then
+            sbmon_critical "unit 删除失败（卸载已开始，处于部分删除状态）；需要人工处理"
+        fi
+        if ! sbmon_systemctl daemon-reload; then
+            sbmon_critical "卸载后 daemon-reload 失败（unit 已删除，处于部分卸载状态）；需要人工处理"
+        fi
+    fi
+    if ! rm -rf -- "$SBMON_APP_LINK"; then   # symlink itself; never descends into the release tree
+        sbmon_critical "app 链接删除失败（部分卸载状态）；需要人工处理"
+    fi
+    if ! rm -rf -- "$SBMON_RELEASES_DIR"; then
+        sbmon_critical "release 树删除失败（部分卸载状态）；需要人工处理"
+    fi
     if [ "$OPT_PURGE_STATE" = 1 ]; then
         sbmon_info "--purge-state: 删除 $SBMON_STATE_ROOT（auth/access/state）"
         rm -rf -- "$SBMON_STATE_ROOT"

@@ -463,24 +463,44 @@ sbmon_record_history() { # sbmon_record_history <id> <version> <action>
 }
 
 sbmon_prune_releases() {
-    # Keep the newest SBMON_KEEP_RELEASES releases; never remove the live one.
+    # R4-3: retention order is DEPLOYMENT CHRONOLOGY, never version lexical
+    # order (0.10.0 sorts before 0.9.0 lexicographically). Primary source =
+    # releases.history commit order (F1); release dirs left over from failed
+    # candidates (never committed) are appended oldest-mtime-first. The live
+    # release is always protected. history itself is never rewritten: pruned
+    # releases keep their commit records.
     local live
     live="$(sbmon_current_release_id)"
-    local -a ids=()
-    local d
-    for d in "$SBMON_RELEASES_DIR"/*; do
-        [ -d "$d" ] || continue
-        [ "$(basename -- "$d")" = "$live" ] && continue
-        ids+=("$(basename -- "$d")")
-    done
-    local total="${#ids[@]}"
+    local -a ordered=()
+    local seen=" "
+    local id d
+    if [ -r "$SBMON_HISTORY_FILE" ]; then
+        while read -r _ id _; do
+            [ -n "$id" ] || continue
+            case "$seen" in *" $id "*) continue ;; esac
+            [ -d "$SBMON_RELEASES_DIR/$id" ] || continue   # pruned earlier: history entry stays
+            seen="$seen$id "
+            ordered+=("$id")
+        done < "$SBMON_HISTORY_FILE"
+    fi
+    # Non-history dirs (failed-candidate leftovers): oldest mtime first.
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        id="$d"
+        case "$seen" in *" $id "*) continue ;; esac
+        [ -d "$SBMON_RELEASES_DIR/$id" ] || continue
+        seen="$seen$id "
+        ordered+=("$id")
+    done < <(find "$SBMON_RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %f\n' 2>/dev/null | sort -n | cut -d' ' -f2-)
+    local total="${#ordered[@]}"
     local keep="$SBMON_KEEP_RELEASES"
     (( total > keep )) || return 0
-    # ids are glob-ordered (timestamp suffix => chronological)
     local i victim
     for (( i = 0; i < total - keep; i++ )); do
-        sbmon_info "清理旧 release: ${ids[$i]}"
-        victim="$SBMON_RELEASES_DIR/${ids[$i]}"
+        id="${ordered[$i]}"
+        [ "$id" = "$live" ] && continue
+        sbmon_info "清理旧 release: $id"
+        victim="$SBMON_RELEASES_DIR/$id"
         rm -rf -- "${victim:?}"   # :? guard: never expand empty -> /
     done
 }
@@ -532,8 +552,14 @@ sbmon_service_stop() { sbmon_systemctl stop "$SBMON_SERVICE_NAME"; }
 sbmon_service_enabled() { # rc 0 = enabled (explicit fact, never inferred)
     sbmon_systemctl is-enabled "$SBMON_SERVICE_NAME" >/dev/null 2>&1
 }
-sbmon_service_stop_disable() {
-    sbmon_systemctl disable --now "$SBMON_SERVICE_NAME" >/dev/null 2>&1 || true
+# R4-2: the old stop_disable helper swallowed errors (|| true) and was a
+# trap for future callers. Idempotency must come from CHECKING state first,
+# never from ignoring failures. Uninstall uses the strict sequence inline.
+sbmon_service_stop_strict() {
+    sbmon_systemctl stop "$SBMON_SERVICE_NAME"
+}
+sbmon_service_disable_strict() {
+    sbmon_systemctl disable "$SBMON_SERVICE_NAME"
 }
 
 # ---------------------------------------------------------------------------

@@ -79,13 +79,13 @@ spool `/var/lib/sbox-cm/spool/`、helper `/usr/local/lib/sbox-cm/sbox-cm` + 单�
     bin/monitor-service                  ← 运行入口 shim（见 §4）
     bin/monitor-health                   ← 健康探测（见 §6）
     lib/monitor-env.sh
-/var/lib/singbox-monitor/                ← singbox-monitor:singbox-monitor 0750
+/var/lib/singbox-monitor/                ← sboxweb:sboxweb 0750（runtime state）
   state/                                 0700  collector snapshot.json、运行状态
   auth/                                  0700  E2 管理认证（admin 口令哈希、recovery key）
   access/                                0700  访问日志（E2）
 /etc/singbox-monitor/                    root:root 0755
-  monitor.conf                           root:singbox-monitor 0640（服务用户只读）
-  api.secret                             （可选）root:singbox-monitor 0640，安装器永不创建
+  monitor.conf                           root:sboxweb 0640（服务用户只读）
+  api.secret                             root:sboxweb 0640（由 install 从 S0 anchor 派生）
 /etc/systemd/system/singbox-monitor.service
 /var/backups/singbox-monitor/            root 0700（手工备份位；release 保留本身即回滚备份）
 ```
@@ -335,13 +335,14 @@ production 保持 UNCHANGED。
 
 ## 10. 已实现 / 明确 deferred
 
-已实现：目录布局 helper、系统用户 helper、unit 模板、release staging/原子切换/清理、
+已实现：目录布局 helper、系统用户 helper（sboxweb）、unit 模板、release staging/原子切换/清理、
 版本比较、幂等 install/upgrade/repair/uninstall/rollback/health/status、collector-loop 运行形态、
-分离式健康探测、临时根测试装置（T01–T14）。
+分离式健康探测、S0 secret 派生桥（§11.2）、部署锁与完整事务回滚（§7/§11/§12）、
+临时根测试装置（T01–T17 + F/R3/R4 系列）。
 
-Deferred（integration 对话接）：E2 `app/web/serve` 与 `web_http` 探针；E3 helper/sudoers 与
-`SBMON_USER` 命名对齐（§2）；install.sh 菜单接线；api.secret 供给策略（S0）；full-stack uninstall
-菜单组合。
+Deferred（integration 对话接）：E2 `app/web/serve` 与 `web_http` 探针；E3 privileged helper/sudoers；
+install.sh 菜单接线；full-stack uninstall 菜单组合；真机 VPS canary；legacy config mutation lock
+integration（modify_singbox/process_doko 等的 config.lock 问题）。
 
 ---
 

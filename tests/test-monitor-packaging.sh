@@ -160,6 +160,9 @@ case "\$op" in
     if [ "\$now" = 1 ]; then echo active > "\$MOCK_SYS_STATE"; fi
     exit 0 ;;
   stop)
+    if [ -f "\$MOCK_FAIL_STOP" ]; then
+      echo "mock: stop failed" >&2; exit 1
+    fi
     echo inactive > "\$MOCK_SYS_STATE"; exit 0 ;;
   restart)
     if [ -n "\${MOCK_FAIL_START:-}" ]; then echo "mock: restart failed" >&2; exit 1; fi
@@ -169,6 +172,9 @@ case "\$op" in
     fi
     echo active > "\$MOCK_SYS_STATE"; exit 0 ;;
   disable)
+    if [ -f "\$MOCK_FAIL_DISABLE" ]; then
+      echo "mock: disable failed" >&2; exit 1
+    fi
     now=0
     for a in "\$@"; do [ "\$a" = "--now" ] && now=1; done
     echo disabled > "\$MOCK_ENABLED_STATE"
@@ -224,6 +230,8 @@ export MOCK_CALL_LOG MOCK_SYS_STATE MOCK_ENABLED_STATE
 export MOCK_FAIL_DAEMON_RELOAD_COUNT="$TMP/mock-fail-daemon-reload-count"
 export MOCK_FAIL_IS_ACTIVE_COUNT="$TMP/mock-fail-is-active-count"
 export MOCK_FAIL_IS_ACTIVE_SKIP="$TMP/mock-fail-is-active-skip"
+export MOCK_FAIL_STOP="$TMP/mock-fail-stop"
+export MOCK_FAIL_DISABLE="$TMP/mock-fail-disable"
 export MOCK_FAIL_RESTART_ONCE="$TMP/mock-fail-restart-once"
 export SBMON_LOCK_FILE="$TMP/deploy.lock"
 # P4: real flock where available (Linux CI gate); no-op shim elsewhere so the
@@ -693,6 +701,182 @@ else
     printf '  SKIP R3-2 手动回滚事务（此平台无符号链接）\n'
 fi
 
+section "R4-1a rollback unit-removal failure -> CRITICAL exit 2"
+if [ "$SYMLINKS_OK" = 1 ]; then
+    # PATH-level rm injection: refuses exactly one path, delegates everything
+    # else to the real rm binary.
+    REAL_RM="$(command -v rm)"
+    cat > "$TMP/bin/rm" <<MOCK
+#!/usr/bin/env bash
+for a in "\$@"; do
+  if [ -n "\$SBMON_RM_FAIL_PATH" ] && [ "\$a" = "\$SBMON_RM_FAIL_PATH" ]; then
+    echo "mock: rm refused \$a" >&2; exit 1
+  fi
+done
+exec "$REAL_RM" "\$@"
+MOCK
+    chmod +x "$TMP/bin/rm"
+    rm -f -- "$FIX_UNIT"            # old unit absent at capture (old_unit_existed=0)
+    LINK_R4A="$(readlink "$FIX_APP_LINK")"
+    HIST_R4A="$(cat "$FIX_RELEASES/releases.history")"
+    printf '0.6.0\n' > "$FIX_SRC/VERSION"
+    echo 1 > "$MOCK_FAIL_IS_ACTIVE_SKIP"
+    echo 6 > "$MOCK_FAIL_IS_ACTIVE_COUNT"
+    OUT_R4A="$TMP/out-r4a.log"
+    ( export SBMON_RM_FAIL_PATH="$FIX_UNIT"; "$INSTALL_MONITOR" install ) > "$OUT_R4A" 2>&1
+    RC_R4A=$?
+    unset SBMON_RM_FAIL_PATH
+    rm -f "$MOCK_FAIL_IS_ACTIVE_SKIP" "$MOCK_FAIL_IS_ACTIVE_COUNT"
+    assert_rc 2 "$RC_R4A" "rollback unit-removal failure exits 2 (R4-1)"
+    assert_grep 'CRITICAL' "$OUT_R4A" "CRITICAL reported (R4-1)"
+    assert_no_grep '事务前状态已恢复' "$OUT_R4A" "no false restore-complete claim (R4-1)"
+    assert_no_grep ' 0\.6\.0 ' "$FIX_RELEASES/releases.history" "failed 0.6.0 absent from history (R3-5)"
+    if [ -e "$FIX_UNIT" ]; then pass "candidate unit still present (rm was refused, R4-1)"; else fail "candidate unit vanished despite rm failure"; fi
+    assert_eq "$LINK_R4A" "$(readlink "$FIX_APP_LINK")" "release restored before the failing step (R4-1)"
+    assert_eq "$HIST_R4A" "$(cat "$FIX_RELEASES/releases.history")" "history unchanged (R3-5)"
+else
+    printf '  SKIP R4-1a 原子事务流（此平台无符号链接）\n'
+fi
+
+section "R4-1b rollback stop failure -> CRITICAL exit 2"
+if [ "$SYMLINKS_OK" = 1 ]; then
+    echo inactive > "$MOCK_SYS_STATE"   # old_active=0
+    printf '0.6.0\n' > "$FIX_SRC/VERSION"
+    : > "$MOCK_FAIL_STOP"
+    : > "$MOCK_FAIL_START"
+    OUT_R4B="$TMP/out-r4b.log"
+    run_install "$OUT_R4B"
+    RC_R4B=$?
+    unset MOCK_FAIL_START
+    rm -f "$MOCK_FAIL_STOP"
+    assert_rc 2 "$RC_R4B" "rollback stop failure exits 2 (R4-1)"
+    assert_grep 'CRITICAL' "$OUT_R4B" "CRITICAL reported (R4-1b)"
+    assert_no_grep '事务前状态已恢复' "$OUT_R4B" "no false restore-complete claim (R4-1b)"
+    assert_no_grep ' 0\.6\.0 ' "$FIX_RELEASES/releases.history" "failed 0.6.0 absent from history (R3-5)"
+else
+    printf '  SKIP R4-1b 原子事务流（此平台无符号链接）\n'
+fi
+
+section "R4-3 prune ordering is deployment chronology, not version lexical order"
+if [ "$SYMLINKS_OK" != 1 ]; then
+    printf '  SKIP R4-3（此平台无符号链接；完整套件在 Linux 运行）\n'
+fi
+if [ "$SYMLINKS_OK" = 1 ]; then
+run_uninstall_quiet
+printf '0.9.0\n' > "$FIX_SRC/VERSION"
+run_install "$TMP/out-r43a.log"
+assert_rc 0 $? "deploy 0.9.0"
+printf '0.10.0\n' > "$FIX_SRC/VERSION"
+run_install "$TMP/out-r43b.log"
+assert_rc 0 $? "deploy 0.10.0"
+printf '0.2.0\n' > "$FIX_SRC/VERSION"
+( SBMON_KEEP_RELEASES=2 "$INSTALL_MONITOR" install --allow-downgrade ) > "$TMP/out-r43c.log" 2>&1
+assert_rc 0 $? "deploy 0.2.0 --allow-downgrade (prune keeps 2 by deployment age)"
+if ls -d "$FIX_RELEASES/0.9.0-"* >/dev/null 2>&1; then
+    fail "0.9.0 retained -- lexicographic order leaked into prune"
+else
+    pass "oldest DEPLOYED release (0.9.0) pruned first (chronology)"
+fi
+if ls -d "$FIX_RELEASES/0.10.0-"* >/dev/null 2>&1; then
+    pass "0.10.0 retained (lexicographically smallest, deployment-newer)"
+else
+    fail "0.10.0 was pruned by version lexical order (R4-3)"
+fi
+
+section "R4-3 default rollback skips pruned history entries"
+OUT_R43D="$TMP/out-r43d.log"
+if ( "$INSTALL_MONITOR" rollback ) > "$OUT_R43D" 2>&1; then
+    pass "default rollback exits 0"
+else
+    fail "default rollback exits 0"
+fi
+assert_eq '0.10.0' "$(cat "$FIX_APP_LINK/VERSION")" "default rollback selects 0.10.0, skipping the pruned 0.9.0 (R4-3)"
+
+section "R4-3 no retained rollback target -> clean fail"
+rm -rf "$FIX_RELEASES"/0.10.0-* 2>/dev/null
+HIST_R43="$(cat "$FIX_RELEASES/releases.history")"
+VER_R43="$(cat "$FIX_APP_LINK/VERSION")"
+OUT_R43E="$TMP/out-r43e.log"
+if ( "$INSTALL_MONITOR" rollback ) > "$OUT_R43E" 2>&1; then
+    fail "rollback with no retained target must fail"
+    RC_R43E=0
+else
+    RC_R43E=$?
+    pass "rollback with no retained target fails (rc=$RC_R43E)"
+fi
+assert_grep '没有仍保留的可回滚' "$OUT_R43E" "clean fail message (R4-3)"
+assert_eq "$VER_R43" "$(cat "$FIX_APP_LINK/VERSION")" "current unchanged after clean fail (R4-3)"
+assert_eq "$HIST_R43" "$(cat "$FIX_RELEASES/releases.history")" "no new history entry after clean fail (R4-3)"
+fi  # end SYMLINKS_OK block (R4-3)
+
+section "R4-2 uninstall idempotent when already inactive+disabled"
+run_uninstall_quiet
+OUT_R42A="$TMP/out-r42a.log"
+if ( "$INSTALL_MONITOR" uninstall ) > "$OUT_R42A" 2>&1; then
+    pass "uninstall on already-absent deployment is idempotent (R4-2)"
+else
+    fail "uninstall on already-absent deployment must succeed"
+fi
+assert_grep '卸载完成' "$OUT_R42A" "idempotent uninstall still completes (R4-2)"
+
+section "R4-2 uninstall stop failure -> fail-closed, deployment retained"
+printf '0.5.0\n' > "$FIX_SRC/VERSION"
+run_install "$TMP/out-r42setup.log"
+assert_rc 0 $? "baseline install for R4-2 tests"
+: > "$MOCK_FAIL_STOP"
+OUT_R42B="$TMP/out-r42b.log"
+if ( "$INSTALL_MONITOR" uninstall ) > "$OUT_R42B" 2>&1; then
+    fail "uninstall with failing stop must fail"
+else
+    pass "uninstall with failing stop aborts (R4-2)"
+fi
+rm -f "$MOCK_FAIL_STOP"
+assert_grep '拒绝在 Monitor 运行时删除部署文件' "$OUT_R42B" "stop failure aborts before deletion (R4-2)"
+if [ -e "$FIX_UNIT" ]; then pass "unit retained after stop failure (R4-2)"; else fail "unit deleted despite stop failure"; fi
+if [ -e "$FIX_APP_LINK" ]; then pass "app link retained after stop failure (R4-2)"; else fail "app link deleted despite stop failure"; fi
+[ -d "$FIX_RELEASES" ] && pass "release trees retained after stop failure (R4-2)" || fail "releases deleted despite stop failure"
+
+section "R4-2 uninstall disable failure -> fail-closed, deployment retained"
+echo enabled > "$MOCK_ENABLED_STATE"   # enabled, but the disable call will fail
+: > "$MOCK_FAIL_DISABLE"
+OUT_R42C="$TMP/out-r42c.log"
+if ( "$INSTALL_MONITOR" uninstall ) > "$OUT_R42C" 2>&1; then
+    fail "uninstall with failing disable must fail"
+else
+    pass "uninstall with failing disable aborts (R4-2)"
+fi
+rm -f "$MOCK_FAIL_DISABLE"
+assert_grep '拒绝在 enabled 状态下删除部署文件' "$OUT_R42C" "disable failure aborts before deletion (R4-2)"
+if [ -e "$FIX_UNIT" ]; then pass "unit retained after disable failure (R4-2)"; else fail "unit deleted despite disable failure"; fi
+if [ -e "$FIX_APP_LINK" ]; then pass "app link retained after disable failure (R4-2)"; else fail "app link deleted despite disable failure"; fi
+
+section "R4-2 uninstall post-delete daemon-reload failure -> CRITICAL"
+echo 1 > "$MOCK_FAIL_DAEMON_RELOAD_COUNT"
+OUT_R42D="$TMP/out-r42d.log"
+if ( "$INSTALL_MONITOR" uninstall ) > "$OUT_R42D" 2>&1; then
+    fail "uninstall with failing post-delete daemon-reload must not claim success"
+    RC_R42D=0
+else
+    RC_R42D=$?
+    pass "uninstall reports failure when post-delete daemon-reload fails (rc=$RC_R42D)"
+fi
+assert_grep 'CRITICAL' "$OUT_R42D" "CRITICAL for partial destructive state (R4-2)"
+assert_no_grep '卸载完成' "$OUT_R42D" "no false uninstall-complete claim (R4-2)"
+
+section "R4-2 uninstall success leaves service stopped and disabled"
+run_uninstall_quiet   # R4-2d's CRITICAL left a partial deployment behind
+run_install "$TMP/out-r42e.log"
+assert_rc 0 $? "baseline install for final uninstall check"
+OUT_R42F="$TMP/out-r42f.log"
+if ( "$INSTALL_MONITOR" uninstall ) > "$OUT_R42F" 2>&1; then
+    pass "normal uninstall succeeds (R4-2)"
+else
+    fail "normal uninstall succeeds (R4-2)"
+fi
+assert_eq "inactive" "$(cat "$MOCK_SYS_STATE")" "final state inactive (R4-2)"
+assert_eq "disabled" "$(cat "$MOCK_ENABLED_STATE")" "final state disabled (R4-2)"
+assert_grep '卸载完成' "$OUT_R42F" "success message after verified stop/disable (R4-2)"
+
 section "T06 monitor-only uninstall (default: state/config/backups preserved)"
 OUT6="$TMP/out-t06.log"
 if ( "$INSTALL_MONITOR" uninstall ) > "$OUT6" 2>&1; then
@@ -700,7 +884,8 @@ if ( "$INSTALL_MONITOR" uninstall ) > "$OUT6" 2>&1; then
 else
     fail "uninstall exits 0"
 fi
-assert_grep 'systemctl disable --now singbox-monitor' "$MOCK_CALL_LOG" "disable --now recorded"
+assert_grep 'systemctl stop singbox-monitor' "$MOCK_CALL_LOG" "strict stop recorded (R4-2)"
+assert_grep 'systemctl disable singbox-monitor' "$MOCK_CALL_LOG" "strict disable recorded (R4-2)"
 [ ! -e "$FIX_UNIT" ] && pass "unit file removed" || fail "unit file still present"
 [ ! -L "$FIX_APP_LINK" ] && pass "app link removed" || fail "app link still present"
 [ ! -d "$FIX_RELEASES" ] && pass "release trees removed" || fail "release trees still present"
