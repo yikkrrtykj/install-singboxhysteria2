@@ -902,9 +902,12 @@ if [ "$SYMLINKS_OK" = 1 ]; then
     A_ID="$(find "$FIX_RELEASES" -maxdepth 1 -type d -name '1.0.0-*' -printf '%f\n' | head -n 1)"
     ( "$INSTALL_MONITOR" rollback "$A_ID" ) > "$TMP/out-r413c.log" 2>&1
     assert_rc 0 $? "rollback to A (live = oldest tree)"
-    printf '1.2.0\n' > "$FIX_SRC/VERSION"
-    ( SBMON_KEEP_RELEASES=2 "$INSTALL_MONITOR" install ) > "$TMP/out-r413d.log" 2>&1
-    assert_rc 0 $? "deploy 1.2.0 (total 3 > KEEP=2, oldest is LIVE)"
+    # An install-prune always runs with the freshly activated (newest) tree
+    # as live, so the live-oldest edge is exercised by invoking the REAL
+    # sbmon_prune_releases (sourced from the deploy lib with the same
+    # fixture environment) with KEEP=2 while A is live.
+    ( SBMON_KEEP_RELEASES=2 source "$REPO_ROOT/monitor-v2/deploy/lib/monitor-deploy-lib.sh"; sbmon_prune_releases ) > "$TMP/out-r413d.log" 2>&1
+    assert_rc 0 $? "prune with live=oldest succeeds (R4.1-3)"
     ls -d "$FIX_RELEASES/1.0.0-"* >/dev/null 2>&1 && pass "live A retained despite being oldest (R4.1-3)" || fail "live A was pruned"
     if ls -d "$FIX_RELEASES/1.1.0-"* >/dev/null 2>&1; then
         fail "B retained -- live-skip broke the retention count (R4.1-3)"
