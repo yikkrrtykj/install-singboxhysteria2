@@ -1,8 +1,8 @@
 # Monitor v2 Integration — Round 0 Record
 
-Status: **DRAFT — awaiting Round 0 review.** This document records verified
+Status: **DRAFT — awaiting Round 0.1 review.** This document records verified
 code facts of the integration tree only. No runtime wiring, no VPS run, no
-production change happened in Round 0.
+production change happened in Round 0 / Round 0.1.
 
 ## Inputs (verified before any merge)
 
@@ -37,26 +37,39 @@ files merged byte-identical to their branch heads (verified by
 
 ## Regression results
 
-Test environment note: these gates were executed on a Windows Git Bash host
-(no WSL, no systemd, no `/root/sbox`). `test-phase-c.sh`,
-`test-phase-d.sh` and `test-security-baseline.sh` depend on POSIX runtime
-semantics that this host cannot provide; the identical failure sets reproduce
-on the **frozen, already-reviewed branch worktrees** (control runs), so the
-counts below are environment baselines, not integration regressions. The
-monitor-v2 gates (E1/E2/E4/Packaging) are self-contained and fully green.
+**Authoritative gate: GitHub Actions Ubuntu (`ubuntu-latest`), run on this
+branch.** Local Windows Git Bash numbers are a development baseline only:
+Windows cannot represent the flock / systemd / POSIX-metadata semantics these
+suites assert, so its Phase C/D/S0 failures are an environment artifact. The
+frozen-branch control comparison there showed zero local integration
+regression (kept as a development record, not a verdict).
 
-| Gate | Integration tree | Frozen-branch control | Verdict |
-|---|---|---|---|
-| Phase C | pass=71 fail=47 | S0 control: pass=71 fail=47 | match — 0 regression |
-| Phase D | pass=55 fail=49 | S0 control: pass=55 fail=49 | match — 0 regression |
-| S0 baseline | pass=85 fail=31 | S0 control: pass=85 fail=31 | match — 0 regression |
-| E1 | **pass=188 fail=0** | 188/0 on every track | GREEN |
-| E2 | **pass=252 fail=0** | E2 control: 252/0 | GREEN |
-| E4 | **pass=161 fail=0** | E4 control: 161/0 | GREEN |
-| Packaging | **129 passed 0 failed** | Packaging control: 129/0 | GREEN |
+Linux CI (PR #16 checks, head `3131c73`):
 
-`bash -n install.sh`: PASS. shellcheck: PASS (see PR checks; no new findings
-introduced by integration).
+| Gate | Linux CI result |
+|---|---|
+| Phase C | **121/121 PASS** |
+| Phase D | **105/105 PASS** |
+| S0 baseline | **133/133 PASS** |
+| Packaging fixture | **307/307 PASS** |
+| Packaging root metadata | **309/309 PASS** |
+| E1 | **188/188 PASS** (self-contained; green locally on Windows too) |
+| E2 | **252/252 PASS** (self-contained; green locally on Windows too) |
+| E4 | **161/161 PASS** (self-contained; green locally on Windows too) |
+
+Round 0.1 adds E1/E2/E4 as mandatory steps of the `shell-tests` workflow (no
+`continue-on-error`), so every future push of this PR re-proves them on
+Linux alongside Phase C/D/S0.
+
+Local Windows development baseline (supplementary, non-authoritative):
+Phase C pass=72 fail=47, Phase D pass=56 fail=49, S0 pass=86 fail=31 —
+failure sets byte-identical to frozen-branch control runs (only random
+tmpdir names differ); E1 188/0, E2 252/0, E4 161/0, Packaging 130/0 all
+green locally as well.
+
+`bash -n install.sh`: PASS. `shellcheck -S warning` (install.sh, gateway,
+all deploy scripts): PASS; also asserted inside the suites and re-run on
+Linux CI.
 
 S0 spot checks confirmed in code: `/root/sbox/config.lock` fail-closed;
 `service.api` listen `127.0.0.1:9091` with nonempty secret
@@ -90,8 +103,40 @@ E2 webapp.py serve --secret-file ...
 
 Rules held: config = runtime truth, both secret files = derived copies
 (enforced in `install.sh` and `monitor-deploy-lib.sh` drift repair);
-E2 never reads `/root/sbox` (it only receives `--secret-file`);
-no auth fallback exists in E2 auth code.
+E2 never reads `/root/sbox` (it only receives `--secret-file`).
+
+Secret-resolution truth (code, not aspiration): `resolve_secret()`
+(`monitor-v2/collector.py:698`) resolves in precedence order
+`BOX_API_SECRET` env → `--secret-file` → `""`. It returns the empty string
+— it does not fatal — when both are absent. Therefore:
+
+- **At code level**, the E1/E2 collector supports unauthenticated API
+  operation, for compatibility with a secret-less `service.api`.
+- **The integrated production runtime DOES NOT permit that mode.**
+  Packaging owns the fail-closed deployment gate: a configured
+  `api.secret` must exist, be a regular file, and be readable, and
+  **integrated web mode MUST NOT invoke `webapp.py serve` without an
+  explicit `--secret-file`** (Round 1 hard invariant).
+- **`BOX_API_SECRET` must not be injected via the systemd environment.**
+  File-based delivery is the production contract: the secret never enters
+  the unit file, never appears as a literal in process arguments, and
+  never reaches the journal — only the secret *file path* is passed.
+  Full chain:
+
+```
+sbconfig_server.json  service.api.secret
+        ↓
+/root/sbox/monitor-api.secret
+        ↓
+/etc/singbox-monitor/api.secret
+        ↓
+Packaging preflight verifies (regular file, readable, group-readable)
+        ↓
+ExecStart / monitor-service passes:
+    --secret-file /etc/singbox-monitor/api.secret
+        ↓
+E2 webapp.py serve
+```
 
 ### I0-2 — E2 entrypoint vs Packaging placeholder  ⚠ ROUND 1
 

@@ -25,6 +25,9 @@ jobs:
           bash -n tests/test-phase-d.sh
           bash -n tests/test-security-baseline.sh
           bash -n tests/canary-api-auth.sh
+          bash -n tests/test-monitor-v2-e1.sh
+          bash -n tests/test-monitor-v2-e2.sh
+          bash -n tests/test-monitor-v2-e4.sh
 
       - name: Phase C regression suite
         run: bash tests/test-phase-c.sh
@@ -34,3 +37,15 @@ jobs:
 
       - name: S0 security-baseline regression suite (incl. Linux-only mode assertions)
         run: bash tests/test-security-baseline.sh
+
+      - name: E1 collector regression suite
+        run: bash tests/test-monitor-v2-e1.sh
+
+      - name: E2 web dashboard regression suite
+        run: bash tests/test-monitor-v2-e2.sh
+
+      - name: E4 Mihomo enrichment regression suite
+        run: bash tests/test-monitor-v2-e4.sh
+
+      - name: Integration regression complete (all prior steps green)
+        run: echo 'Phase C + Phase D + S0 + E1 + E2 + E4: all green on Linux'
