@@ -275,7 +275,7 @@ cannot mutate E1 server truth (fixed enrichment-key whitelist,
 `model.ENRICHMENT_KEYS`; GET-only transport). Final client delivery/packaging
 is a later integration decision — define the actual consumer first.
 
-### I0-7 — Pre-E3 config mutation blocker  🛑 BLOCKER BEFORE E3 ENABLEMENT
+### I0-7 — Pre-E3 config mutation blocker  ✅ CLOSED (Integration Round 2)
 
 Verified: `modify_singbox` (`install.sh:2259`), `process_doko` (2373),
 `process_dokoko` (2430), `process_ssko` (2485) all read and write
@@ -289,7 +289,16 @@ Before E3 (Web Client Manager) enablement, choose:
   `/root/sbox/config.lock`; or
 - B: disable these legacy mutation flows while web management is active.
 
-Round 0 changes nothing here; status is BLOCKER BEFORE E3 ENABLEMENT.
+Round 0/1 changed nothing here; status was BLOCKER BEFORE E3 ENABLEMENT.
+
+**Round 2 (CLOSED via option A):** the reviewed Legacy Hardening track
+(`e3713f2` + `a52ab88`, cherry-picked in Round 2) migrated every legacy
+runtime config/state writer — `modify_singbox`, `process_doko`,
+`process_dokoko`, `process_ssko`, the HY2 hopping state writers — into the
+SAME fail-closed `/root/sbox/config.lock` used by Phase C / Phase D, and
+added the L3 atomic dual-file rollback primitive. The lost-update window
+that made E3 unsafe is gone; I0-7 is CLOSED. See
+`docs/legacy-config-transaction-hardening.md` (L1–L5).
 
 ---
 
@@ -382,6 +391,56 @@ removed or weakened.
   Packaging. Reverse proxy / firewall: untouched.
 - E3: design only (`beb915a9`), not merged, not implemented.
 - E4: still repo-only (not staged, not deployed); unchanged boundary.
-- **I0-7 remains a hard PRE-E3 BLOCKER** (legacy `modify_singbox` /
-  `process_doko` / `process_dokoko` / `process_ssko` still bypass
-  `/root/sbox/config.lock`). Not addressed in Round 1 by design.
+- **I0-7 remained a hard PRE-E3 BLOCKER** in Round 1 (legacy `modify_singbox` /
+  `process_doko` / `process_dokoko` / `process_ssko` still bypassed
+  `/root/sbox/config.lock`). Not addressed in Round 1 by design — **CLOSED in
+  Round 2**, see below.
+
+---
+
+## Round 2 — Legacy Hardening integration (this document's current state)
+
+Round 2 cherry-picked the two reviewed, frozen Legacy Hardening commits onto
+the Round 1.1 integration head. No merge, no rebase, no squash; PR #17 is NOT
+merged. Legacy PR #16 (#16 body aside) and all Round 1.1 Packaging/Web
+artifacts are byte/semantically untouched.
+
+- Base: `f948dc8eacfd894593e87b47bee45dfc99883519` (frozen Round 1.1 head).
+- Integrated (in order): `e3713f2366f66b92fb5b5098d4f490d05b9c2646`
+  ("security: serialize legacy sing-box config mutations"),
+  `a52ab8837909f6947db0c19472f4908efbf4f1c0`
+  ("fix(security): make legacy dual-file rollback atomic").
+- Conflicts: none.
+
+### State of the world after Round 2
+
+1. **Legacy runtime config/state writers are now serialized.** Every durable
+   sing-box management mutation — Phase C client management, Phase D upgrade,
+   `modify_singbox`, `process_doko`, `process_dokoko`, `process_ssko` and the
+   HY2 hopping state writers — runs under the SAME fail-closed
+   `/root/sbox/config.lock` (unique-temp discipline, no shared fixed temp
+   files; `restore_file_atomically` for atomic dual-file rollback).
+2. **I0-7 (old lost-update blocker) is CLOSED.** The legacy writers can no
+   longer bypass the lock, so concurrent Phase C / legacy / future-helper
+   mutations can no longer lose each other's update.
+3. **The L5 marker is only a provisional E3 activation interface.** The
+   `SB_MANAGEMENT_ACTIVE_MARKER` / `require_management_inactive` guard
+   (`docs/legacy-config-transaction-hardening.md`, L5) is the hook where
+   future E3 will publish/remove a management-active signal before
+   destructive legacy operations. No production code creates the marker
+   today; it is NOT an E3 implementation and does NOT by itself make E3
+   safe.
+4. **Concurrent E3 enablement is STILL BLOCKED**, pending the E3 rev5
+   activation / privileged-helper design (how E3 runs mutations as a
+   privileged helper under this same lock, and how the marker is published
+   and ratified). Serialization of existing writers is necessary, not
+   sufficient, for E3.
+
+### Round 2 non-goals (status)
+
+- VPS canary: **NOT RUN**.
+- Production: **UNCHANGED**. Public 9191: **CLOSED**.
+- E3: **NOT STARTED** (design only, `beb915a9`, not merged; concurrent
+  enablement blocked per item 4 above).
+- E4: still repo-only (not staged, not deployed); unchanged boundary.
+- PR #17: unchanged / draft / NOT merged.

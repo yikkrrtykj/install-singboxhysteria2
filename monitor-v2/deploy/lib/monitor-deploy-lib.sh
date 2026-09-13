@@ -249,16 +249,6 @@ sbmon_ensure_user() {
         --shell /usr/sbin/nologin "$SBMON_USER"
 }
 
-sbmon_chown() { # sbmon_chown <path> [mode]
-    local path="$1" mode="${2:-}"
-    if [ "$SBMON_FIXTURE" != "1" ]; then
-        chown -R "$SBMON_USER:$SBMON_GROUP" "$path"
-    fi
-    if [ -n "$mode" ]; then
-        chmod "$mode" "$path"
-    fi
-}
-
 # ---------------------------------------------------------------------------
 # R1.1-A: SERVICE-OWNED STATE TREE -- root privilege boundary.
 #

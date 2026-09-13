@@ -27,9 +27,11 @@
 #   * SBMON_WEB_BIND must parse as a loopback bind (IPv4/IPv6/localhost);
 #     0.0.0.0, LAN/public/malformed forms refuse to start (R1-4).
 #
-# Journal hygiene: webapp.py / collector stdout (may contain client
-# metadata) is redirected by the unit to the state dir, never to journald.
-# Only lifecycle messages from this shim reach the journal.
+# Journal hygiene: the unit configures NO stdout redirection; in
+# collector-loop mode THIS SHIM redirects collector stdout (which may
+# contain client metadata) to the state dir, never to journald; in web
+# mode snapshots are written to files by the SnapshotBroker and webapp
+# stdout only carries lifecycle messages.
 set -Eeuo pipefail
 
 CONF="${1:-}"

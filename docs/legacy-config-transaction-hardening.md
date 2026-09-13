@@ -1,11 +1,16 @@
 # Legacy Config Transaction Hardening (L1–L5)
 
-Status: **implemented — draft, not integrated.**
+Status: **implemented — integrated (Integration Round 2, cherry-picked).**
 
 - Base: `cd307abb4963a71134fcf5cac8cc0da5746d89ac`
-- Branch: `feature/legacy-config-transaction-hardening` (independent parallel branch)
-- Not merged with `feature/monitor-v2-integration` (Round 1.1)
+- Branch of origin: `feature/legacy-config-transaction-hardening`
+- Integrated into `feature/monitor-v2-integration` in Round 2 on top of the
+  frozen Round 1.1 head `f948dc8eacfd894593e87b47bee45dfc99883519`
+  (cherry-pick only; PR #17 NOT merged)
 - **E3: NOT IMPLEMENTED.** VPS: NOT RUN. Production: UNCHANGED.
+  The L5 marker is a provisional activation interface only; concurrent E3
+  enablement is STILL BLOCKED pending the E3 rev5 activation /
+  privileged-helper design.
 
 This closes the `I0-7` PRE-E3 blocker (option **A** from
 `docs/monitor-v2-integration.md`): every runtime durable sing-box management
