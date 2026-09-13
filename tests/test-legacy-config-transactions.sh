@@ -32,6 +32,11 @@ assert_rc() { if [ "$1" = "$2" ]; then pass "$3"; else fail "$3 (expected rc=$1,
 assert_grep() { if grep -qE "$1" "$2" 2>/dev/null; then pass "$3"; else fail "$3 (no match: $1)"; fi; }
 assert_no_grep() { if grep -qE "$1" "$2" 2>/dev/null; then fail "$3 (unexpected match: $1)"; else pass "$3"; fi; }
 sha() { sha256sum "$1" 2>/dev/null | awk '{print $1}'; }
+IS_LINUX=1
+case "$(uname -s)" in
+    MINGW*|MSYS*) IS_LINUX=0 ;;
+esac
+mode_of() { stat -c %a "$1" 2>/dev/null; }
 
 # --------------------------------------------------------------- static checks --
 section "static checks"
@@ -56,6 +61,11 @@ assert_grep 'with_client_lock _process_dokoko_add_locked' "$INSTALL_SH" "dokoko 
 assert_grep 'with_client_lock _process_ssko_add_locked' "$INSTALL_SH" "ssko add takes the global lock"
 assert_grep 'with_client_lock _enable_hy2hopping_locked' "$INSTALL_SH" "enable hy2 hopping takes the global lock"
 assert_grep 'with_client_lock _disable_hy2hopping_locked' "$INSTALL_SH" "disable hy2 hopping takes the global lock"
+assert_grep 'restore_file_atomically' "$INSTALL_SH" "atomic restore primitive exists"
+assert_grep 'cmp -s "\$backup" "\$live"' "$INSTALL_SH" "restore verifies the committed file byte-for-byte"
+assert_grep '\.restore\.XXXXXX' "$INSTALL_SH" "restore uses a unique same-directory temp path"
+assert_no_grep 'cp -a "\$json_bak" "\$cfg"' "$INSTALL_SH" "no direct cp restore onto the live JSON path"
+assert_no_grep 'cp -a "\$state_bak" "\$state"' "$INSTALL_SH" "no direct cp restore onto the live state path"
 # L5 guard wiring + ordering (guard BEFORE backup/uninstall in the reinstall branch).
 assert_grep 'SB_MANAGEMENT_ACTIVE_MARKER' "$INSTALL_SH" "L5 management-active marker interface exists"
 assert_grep 'require_management_inactive "重新安装"' "$INSTALL_SH" "reinstall branch checks the L5 guard"
@@ -480,6 +490,39 @@ assert_rc "$before_state" "$(sha "$SB_STATE_FILE")" "state unchanged after secon
 assert_grep '回滚服务端配置' "$TMP/t10.out" "JSON rollback reported"
 unset -f mv
 
+section "T10b: rollback restore itself fails -> manual intervention, no false success"
+reset_sandbox
+before_uuid="$(jq -c '[.inbounds[] | select(.tag=="vless-in") | .users[] | .uuid]' "$SB_SERVER_CONFIG")"
+before_pwd="$(jq -c '[.inbounds[] | select(.tag=="hy2-in") | .users[] | .password]' "$SB_SERVER_CONFIG")"
+before_key="$(jq -r '.inbounds[] | select(.tag=="vless-in") | .tls.reality.private_key' "$SB_SERVER_CONFIG")"
+before_secret="$(jq -r '.services[] | select(.tag=="monitor-api") | .secret' "$SB_SERVER_CONFIG")"
+# real fault injection: the state-candidate replace is forced to fail (entering the
+# second-artifact path) AND every restore atomic mv (unique *.restore.* temp) fails.
+mv() {
+    local a last
+    eval "last=\"\${$#}\""
+    if [ "${MV_FAIL_STATE:-0}" = "1" ] && [ "$last" = "$SB_STATE_FILE" ]; then return 1; fi
+    if [ "${MV_FAIL_RESTORE:-0}" = "1" ]; then
+        for a in "$@"; do case "$a" in *.restore.*) return 1 ;; esac; done
+    fi
+    command mv "$@"
+}
+MV_FAIL_STATE=1 MV_FAIL_RESTORE=1 with_client_lock _modify_singbox_locked 18500 18501 "example.org" "cert-new.pem" "key-new.pem" "new.example.org" >"$TMP/t10b.out" 2>&1
+assert_rc 1 $? "transaction fails and the restore failure is not swallowed"
+assert_grep '人工介入' "$TMP/t10b.out" "manual intervention required"
+assert_grep '备份保留' "$TMP/t10b.out" "backup retention stated"
+assert_no_grep '已回滚并重新加载上一份配置与状态' "$TMP/t10b.out" "must NOT claim a successful rollback"
+assert_no_grep '已恢复并校验上一份配置与状态' "$TMP/t10b.out" "must NOT claim a successful restore"
+assert_no_grep '恢复成功' "$TMP/t10b.out" "must NOT claim recovery success"
+assert_rc 1 "$(ls -1 "$SB_SERVER_CONFIG".bak.* 2>/dev/null | wc -l)" "JSON hardened backup retained after failed restore"
+assert_rc 1 "$(ls -1 "$SB_STATE_FILE".bak.* 2>/dev/null | wc -l)" "state hardened backup retained after failed restore"
+if ! ls "$SB_SERVER_CONFIG".restore.* "$SB_STATE_FILE".restore.* >/dev/null 2>&1; then pass "no restore temp residue after failed restore"; else fail "restore temp residue after failed restore"; fi
+assert_rc "$before_uuid" "$(jq -c '[.inbounds[] | select(.tag=="vless-in") | .users[] | .uuid]' "$SB_SERVER_CONFIG")" "Reality UUIDs unchanged by failed rollback"
+assert_rc "$before_pwd" "$(jq -c '[.inbounds[] | select(.tag=="hy2-in") | .users[] | .password]' "$SB_SERVER_CONFIG")" "HY2 passwords unchanged by failed rollback"
+assert_rc "$before_key" "$(jq -r '.inbounds[] | select(.tag=="vless-in") | .tls.reality.private_key' "$SB_SERVER_CONFIG")" "Reality private key unchanged by failed rollback"
+assert_rc "$before_secret" "$(jq -r '.services[] | select(.tag=="monitor-api") | .secret' "$SB_SERVER_CONFIG")" "service.api.secret unchanged by failed rollback"
+unset -f mv
+
 section "T11: reload failure -> both files restored"
 reset_sandbox
 before_json="$(sha "$SB_SERVER_CONFIG")"
@@ -490,6 +533,39 @@ assert_rc 1 $? "transaction fails when the first reload fails"
 assert_rc "$before_json" "$(sha "$SB_SERVER_CONFIG")" "JSON restored after reload failure"
 assert_rc "$before_state" "$(sha "$SB_STATE_FILE")" "state restored after reload failure"
 assert_grep '已回滚并重新加载上一份配置与状态' "$TMP/t11.out" "successful rollback reload reported"
+if [ "$IS_LINUX" = "1" ]; then
+    assert_rc 600 "$(mode_of "$SB_SERVER_CONFIG")" "restored live JSON mode is 0600"
+    assert_rc 600 "$(mode_of "$SB_STATE_FILE")" "restored live state mode is 0600"
+else
+    printf '  SKIP permission-mode assertions on Windows sandbox\n'
+fi
+if ! ls "$SB_SERVER_CONFIG".restore.* "$SB_STATE_FILE".restore.* >/dev/null 2>&1; then pass "no atomic-restore temp residue after success"; else fail "restore temp residue after success"; fi
+SYSTEMCTL_MODE="ok"
+
+section "T11b: rollback restore failure after reload failure -> manual intervention"
+reset_sandbox
+before_state="$(sha "$SB_STATE_FILE")"
+# real fault injection: only the JSON restore's atomic mv (an arg is the unique
+# *.restore.* temp, destination == live JSON) fails; the state restore succeeds.
+mv() {
+    local a last
+    eval "last=\"\${$#}\""
+    if [ "${MV_FAIL_RESTORE_JSON:-0}" = "1" ] && [ "$last" = "$SB_SERVER_CONFIG" ]; then
+        for a in "$@"; do case "$a" in *.restore.*) return 1 ;; esac; done
+    fi
+    command mv "$@"
+}
+SYSTEMCTL_MODE="reload_fail" MV_FAIL_RESTORE_JSON=1 with_client_lock _modify_singbox_locked 18500 18501 "example.org" "cert-new.pem" "key-new.pem" "new.example.org" >"$TMP/t11b.out" 2>&1
+assert_rc 1 $? "transaction fails when rollback restore fails after reload failure"
+assert_grep '人工介入' "$TMP/t11b.out" "manual intervention required after reload + restore failure"
+assert_grep '备份保留' "$TMP/t11b.out" "backup retention stated"
+assert_no_grep '已回滚并重新加载上一份配置与状态' "$TMP/t11b.out" "must NOT claim a successful rollback"
+assert_no_grep '已恢复并校验上一份配置与状态' "$TMP/t11b.out" "must NOT claim a successful restore"
+assert_no_grep '恢复成功' "$TMP/t11b.out" "must NOT claim recovery success"
+assert_rc 1 "$(ls -1 "$SB_SERVER_CONFIG".bak.* 2>/dev/null | wc -l)" "JSON hardened backup retained after reload + restore failure"
+assert_rc 1 "$(ls -1 "$SB_STATE_FILE".bak.* 2>/dev/null | wc -l)" "state hardened backup retained after reload + restore failure"
+assert_rc "$before_state" "$(sha "$SB_STATE_FILE")" "the unfailing state restore still wrote back the previous state"
+unset -f mv
 SYSTEMCTL_MODE="ok"
 
 section "T12: rollback reload failure clearly reported"
@@ -595,6 +671,40 @@ if [ ! -e "$TMP/destructive-hit" ]; then pass "no destructive step reached befor
 unset -f disable_hy2hopping systemctl
 rm -f "$SB_MANAGEMENT_ACTIVE_MARKER"
 management_is_active; assert_rc 1 $? "management_is_active false again after removing the marker"
+
+section "T19: restore_file_atomically primitive"
+reset_sandbox
+printf 'ORIGINAL-LIVE\n' > "$SB_SERVER_CONFIG"
+printf 'BACKUP-CONTENT\n' > "$TMP/prim.bak"
+chmod 0600 "$TMP/prim.bak" 2>/dev/null
+restore_file_atomically "$TMP/prim.bak" "$SB_SERVER_CONFIG" >"$TMP/t19.out" 2>&1
+assert_rc 0 $? "restore_file_atomically succeeds on a regular backup"
+assert_rc "$(sha "$TMP/prim.bak")" "$(sha "$SB_SERVER_CONFIG")" "restored live is byte-identical to the backup"
+if [ -f "$TMP/prim.bak" ]; then pass "original hardened backup preserved"; else fail "backup was deleted by restore"; fi
+if ! ls "$SB_SERVER_CONFIG".restore.* >/dev/null 2>&1; then pass "no restore temp residue after success"; else fail "restore temp residue after success"; fi
+if [ "$IS_LINUX" = "1" ]; then
+    assert_rc 600 "$(mode_of "$SB_SERVER_CONFIG")" "restored live mode is 0600"
+else
+    printf '  SKIP permission-mode assertion on Windows sandbox\n'
+fi
+restore_file_atomically "$TMP/does-not-exist" "$SB_SERVER_CONFIG" >"$TMP/t19b.out" 2>&1
+assert_rc 1 $? "restore fails closed when the backup is missing"
+assert_grep '拒绝恢复' "$TMP/t19b.out" "irregular/missing backup reason stated"
+# a non-regular backup (a directory) must be rejected fail-closed, portably
+restore_file_atomically "$TMP" "$SB_SERVER_CONFIG" >"$TMP/t19d.out" 2>&1
+assert_rc 1 $? "restore refuses a non-regular (directory) backup"
+assert_grep '拒绝恢复' "$TMP/t19d.out" "non-regular backup reason stated"
+ln -sf "$TMP/prim.bak" "$TMP/prim.symlink" 2>/dev/null
+if [ "$IS_LINUX" = "1" ]; then
+    restore_file_atomically "$TMP/prim.symlink" "$SB_SERVER_CONFIG" >"$TMP/t19c.out" 2>&1
+    assert_rc 1 $? "restore refuses a symlink backup"
+else
+    printf '  SKIP symlink-backup assertion on Windows sandbox (MSYS may copy instead of link)\n'
+fi
+printf 'second-payload\nline2\n' > "$TMP/prim2.bak"
+restore_file_atomically "$TMP/prim2.bak" "$SB_SERVER_CONFIG" >/dev/null 2>&1
+assert_rc 0 $? "second restore succeeds"
+assert_rc "$(sha "$TMP/prim2.bak")" "$(sha "$SB_SERVER_CONFIG")" "second restore byte-identical"
 
 # ---------------------------------------------------------------------- summary --
 printf '\n== summary ==\n'
