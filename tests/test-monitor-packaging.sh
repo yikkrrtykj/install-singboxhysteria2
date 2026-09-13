@@ -1543,36 +1543,68 @@ run_uninstall_quiet
 rm -rf "$FIX_STATE" "$FIX_CONF_DIR"
 run_install "$TMP/out-t19setup.log" >/dev/null 2>&1
 assert_rc 0 $? "install before web-setup exits 0"
-# The reviewed E2 setup is interactive; pre-seed a configured AuthStore so the
-# whitelist/password/recovery prompts are already satisfied and the packaging
-# path runs end to end non-interactively. This exercises the real command.
-mkdir -p "$FIX_STATE"
-printf '{"whitelist": ["198.51.100.9/32"]}\n' > "$FIX_STATE/access.json"
-printf '{"password": {"salt": "x", "hash": "y"}, "recovery": {"salt": "x", "hash": "y"}}\n' > "$FIX_STATE/auth.json"
-chmod 0600 "$FIX_STATE/auth.json" "$FIX_STATE/access.json"
-SETUP_OUT="$TMP/out-t19.log"
-SETUP_RC=0
-SSH_CONNECTION='203.0.113.77 55222 198.51.100.5 22' "$INSTALL_MONITOR" web-setup < /dev/null > "$SETUP_OUT" 2>&1 || SETUP_RC=$?
-if [ "$SETUP_RC" = 0 ]; then
-    pass "web-setup runs the reviewed E2 setup path to completion"
-else
-    printf '  NOTE web-setup exited rc=%s in the fixture (interactive prompts)\n' "$SETUP_RC"
-    pass "web-setup path exercised (nonzero without a full interactive AuthStore)"
-fi
-assert_no_grep 'sing-box' "$MOCK_CALL_LOG" "web-setup never touches sing-box"
-if [ ! -e "$FIX_STATE/auth" ]; then
-    pass "web-setup writes flat files (no legacy auth/ dir created)"
-else
-    fail "web-setup created a legacy auth/ directory"
-fi
-assert_no_grep 'Traceback' "$SETUP_OUT" "no unhandled python traceback in web-setup output"
-if [ "$SBMON_FIXTURE" = "0" ]; then
-    assert_eq "sboxweb" "$(stat -c '%U' "$FIX_STATE/auth.json" 2>/dev/null || echo '?')" "auth.json owned by sboxweb after web-setup (real metadata)"
-else
-    printf '  SKIP real-owner assertion (non-root fixture pass; root CI covers it)\n'
-fi
 "$INSTALL_MONITOR" web-setup </dev/null > "$TMP/t19reg.log" 2>&1 || true
 assert_no_grep '未知命令' "$TMP/t19reg.log" "web-setup is a registered command"
+
+if [ "$SYMLINKS_OK" = 1 ]; then
+    # The reviewed E2 setup is interactive. Seed a COMPLETE, service-user
+    # readable AuthStore so the whitelist/password/recovery prompts are
+    # already satisfied and the packaging path runs end to end against the
+    # real command (no stub).
+    mkdir -p "$FIX_STATE"
+    printf '{"version": 1, "password": {"hash": "seed"}, "recovery": {"hash": "seed"}}\n' > "$FIX_STATE/auth.json"
+    printf '{"whitelist": ["198.51.100.9/32"]}\n' > "$FIX_STATE/access.json"
+    chmod 0700 "$FIX_STATE"
+    chmod 0600 "$FIX_STATE/auth.json" "$FIX_STATE/access.json"
+    if [ "$SBMON_FIXTURE" = "0" ]; then
+        # Production path: setup runs AS the service user, so the seeded store
+        # must be readable by that identity (mirrors a real /var/lib install),
+        # and the fixture tree must be traversable like /opt.
+        chmod 0755 "$TMP" "$FIX_RELEASES"
+        chown "$SBMON_USER:$SBMON_GROUP" "$FIX_STATE" "$FIX_STATE/auth.json" "$FIX_STATE/access.json"
+    fi
+    CALLS_BEFORE_SU="$(wc -l < "$MOCK_CALL_LOG")"
+    SETUP_OUT="$TMP/out-t19.log"
+    SETUP_RC=0
+    SSH_CONNECTION='203.0.113.77 55222 198.51.100.5 22' "$INSTALL_MONITOR" web-setup < /dev/null > "$SETUP_OUT" 2>&1 || SETUP_RC=$?
+    assert_grep 'deployment lock acquired' "$SETUP_OUT" "web-setup runs under the deployment lock"
+    assert_rc 0 "$SETUP_RC" "web-setup runs the reviewed E2 setup to completion as the service identity"
+    assert_grep 'singbox-monitor' "$SETUP_OUT" "web-setup reports the monitor-only restart"
+    tail -n +"$((CALLS_BEFORE_SU + 1))" "$MOCK_CALL_LOG" > "$TMP/t19-calls.log"
+    assert_grep 'restart singbox-monitor' "$TMP/t19-calls.log" "web-setup restarted ONLY singbox-monitor (was active)"
+    assert_no_grep 'sing-box' "$MOCK_CALL_LOG" "web-setup never touches sing-box (whole run)"
+    if [ ! -e "$FIX_STATE/auth" ]; then
+        pass "web-setup writes flat files (no legacy auth/ dir created)"
+    else
+        fail "web-setup created a legacy auth/ directory"
+    fi
+    assert_no_grep 'Traceback' "$SETUP_OUT" "no unhandled python traceback in web-setup output"
+    if grep -q '203.0.113.77' "$FIX_STATE/access.json"; then
+        fail "web-setup auto-added the SSH source to the whitelist"
+    else
+        pass "web-setup never auto-adds a whitelist entry"
+    fi
+    assert_grep '198.51.100.9/32' "$FIX_STATE/access.json" "pre-existing whitelist entry untouched"
+    if [ "$SBMON_FIXTURE" = "0" ]; then
+        assert_eq "sboxweb" "$(stat -c '%U' "$FIX_STATE/auth.json")" "auth.json owned by sboxweb after web-setup (real metadata)"
+        assert_eq "sboxweb" "$(stat -c '%U' "$FIX_STATE/access.json")" "access.json owned by sboxweb after web-setup"
+        assert_eq "700" "$(stat -c '%a' "$FIX_STATE")" "data root private 0700 after web-setup"
+    else
+        printf '  SKIP real-owner assertion (non-root fixture pass; root CI covers it)\n'
+    fi
+else
+    printf '  SKIP T19 success path (此平台无符号链接 -> 无已激活 release)\n'
+    OUT_T19NC="$TMP/out-t19nc.log"
+    "$INSTALL_MONITOR" web-setup </dev/null > "$OUT_T19NC" 2>&1 || true
+    assert_grep 'deployment lock acquired' "$OUT_T19NC" "web-setup takes the deployment lock even when it must refuse"
+    assert_grep '没有已激活的 release' "$OUT_T19NC" "web-setup fails closed without an activated release"
+    if [ ! -e "$FIX_STATE/auth" ]; then
+        pass "refused web-setup created no legacy auth/ dir"
+    else
+        fail "refused web-setup created a legacy auth/ directory"
+    fi
+    assert_no_grep 'sing-box' "$MOCK_CALL_LOG" "refused web-setup never touches sing-box"
+fi
 
 section "T12 production isolation (dynamic): proxy tree hash unchanged end-to-end"
 assert_eq "$PROXY_CONF_HASH_BEFORE" "$(sha256sum "$FIX_PROXY_CONF" | cut -d' ' -f1)" "fixture sbconfig_server.json hash unchanged"
