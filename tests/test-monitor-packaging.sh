@@ -204,6 +204,19 @@ run_uninstall_quiet() {
     ( "$INSTALL_MONITOR" uninstall --purge-state --purge-config --purge-backups ) >/dev/null 2>&1 || true
 }
 
+# R1.1-A: fixtures that pre-create <data-root>/state must mirror the production
+# reality -- the state tree is SERVICE-USER owned. In the root real-metadata
+# pass the harness runs as root, so a bare `mkdir -p` would leave a root-owned
+# state/ that the installer must (by the privilege boundary) refuse to
+# converge. Only the HARNESS sets up fixture ownership this way; the installer
+# itself never chowns a service-owned child.
+ensure_fixture_state_dir() {
+    mkdir -p "$FIX_STATE/state"
+    if [ "$SBMON_FIXTURE" = "0" ]; then
+        chown "${SBMON_USER:-sboxweb}:${SBMON_GROUP:-sboxweb}" "$FIX_STATE/state"
+    fi
+}
+
 # F3: when the harness runs as root (Linux CI second pass), user/group
 # management and file metadata run FOR REAL (SBMON_FIXTURE=0): real
 # useradd/groupadd, real chown/chgrp, real uid/gid assertions. Non-root
@@ -1039,7 +1052,8 @@ assert_grep '卸载完成' "$OUT_R42F" "success message after verified stop/disa
 section "T06 monitor-only uninstall (default: state/config/backups preserved)"
 # Seed legacy dirs + flat access files: earlier sections purge the state
 # root, and uninstall must PRESERVE whatever is there.
-mkdir -p "$FIX_STATE/auth" "$FIX_STATE/access" "$FIX_STATE/state"
+mkdir -p "$FIX_STATE/auth" "$FIX_STATE/access"
+ensure_fixture_state_dir
 printf 'legacy-auth\n' > "$FIX_STATE/auth/probe"
 printf '{"legacy": true}\n' > "$FIX_STATE/auth.json"
 printf '{"whitelist": []}\n' > "$FIX_STATE/access.json"
@@ -1096,7 +1110,7 @@ SBMON_API_URL=http://127.0.0.1:19091
 SBMON_MODE=collector-loop
 SBMON_CYCLE_SECONDS=300
 EOF
-mkdir -p "$FIX_STATE/state"
+ensure_fixture_state_dir
 SNAP="$FIX_STATE/state/snapshot.json"
 LISTENER_PID=""
 if [ "$HAVE_PY3" = 1 ]; then
@@ -1309,7 +1323,7 @@ SBMON_API_SECRET_FILE=$FIX_CONF_DIR/api.secret
 SBMON_MODE=web
 SBMON_WEB_POLL_SECONDS=1
 EOF
-mkdir -p "$FIX_STATE/state"
+ensure_fixture_state_dir
 HEALTH_FILE="$FIX_STATE/state/health.json"
 WEB_LIVE_PID=""
 API_LIVE_PID=""
@@ -1478,7 +1492,7 @@ SBMON_API_URL=http://127.0.0.1:19091
 SBMON_MODE=web
 SBMON_WEB_POLL_SECONDS=1
 EOF
-mkdir -p "$FIX_STATE/state"
+ensure_fixture_state_dir
 C_HEALTH="$FIX_STATE/state/health.json"
 set_c_stub() { # <status> <content_type> <body-string>
     python3 - "$C_SPEC" "$1" "$2" "$3" <<'PY'
@@ -1618,6 +1632,7 @@ SBMON_MODE=web
 SBMON_WEB_POLL_SECONDS=0
 EOF
 echo active > "$MOCK_SYS_STATE"
+ensure_fixture_state_dir
 printf '{"schema_version":1,"snapshot_version":1,"published_at":"2030-01-01T00:00:00+00:00","collector_stale":false,"consumer_alive":true}\n' > "$FIX_STATE/state/health.json"
 H_JSON="$("$HWB" "$D_HCONF" "$FIX_STATE")"; H_RC=$?
 assert_rc 2 "$H_RC" "health: poll=0 cannot look fresh -> degraded (R1.1-D)"
@@ -1627,7 +1642,8 @@ section "T09 journal redaction (secrets never reach service output)"
 run_uninstall_quiet
 FAKE_SECRET='S3cr3t-T0ken-abc123'
 FAKE_UUID='550e8400-e29b-41d4-a716-446655440000'
-mkdir -p "$FIX_CONF_DIR" "$FIX_STATE/state"
+mkdir -p "$FIX_CONF_DIR"
+ensure_fixture_state_dir
 printf '%s\n' "$FAKE_SECRET" > "$FIX_CONF_DIR/api.secret"
 cat > "$FIX_STATE/state/snapshot.json" <<EOF
 {"devices": {"client-a": {"active_connections": 1, "identity": "$FAKE_UUID"}}}
@@ -1790,6 +1806,23 @@ run_install "$OUT_R11A3"
 assert_rc 0 $? "state/ normal directory -> install succeeds (R1.1-A)"
 assert_dir_mode "$FIX_STATE" 700 "data root converges to 0700 (R1.1-A)"
 assert_dir_mode "$FIX_STATE/state" 700 "state/ converges to 0700 (R1.1-A)"
+
+# A4 (root real-metadata pass): an existing state/ owned by ROOT cannot be
+# converged AS the service user -- install must fail closed with a manual-fix
+# hint BEFORE any release/history mutation. The installer never "rescues" it
+# with a root chown of a service-owned child.
+if [ "$SBMON_FIXTURE" = "0" ]; then
+    run_uninstall_quiet
+    rm -rf "$FIX_STATE" "$FIX_RELEASES"
+    mkdir -p "$FIX_STATE/state"
+    chown root:root "$FIX_STATE/state"
+    OUT_R11A4="$TMP/out-r11a4.log"
+    run_install "$OUT_R11A4"
+    assert_rc 1 $? "root-owned state/ -> install fails closed (R1.1-A)"
+    assert_grep '不属于服务用户' "$OUT_R11A4" "root-owned state/ manual-fix hint (R1.1-A)"
+    if [ ! -L "$SBMON_APP_LINK" ] && [ ! -e "$SBMON_APP_LINK" ]; then pass "no release activated on root-owned state/ (R1.1-A)"; else fail "release activated despite root-owned state/ (R1.1-A)"; fi
+    if [ ! -e "$FIX_RELEASES/releases.history" ]; then pass "no history written on root-owned state/ (R1.1-A)"; else fail "history mutated despite root-owned state/ (R1.1-A)"; fi
+fi
 run_uninstall_quiet
 
 # ---------------------------------------------------------------------------

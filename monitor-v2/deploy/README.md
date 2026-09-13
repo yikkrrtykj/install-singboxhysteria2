@@ -493,7 +493,8 @@ integration（modify_singbox/process_doko 等的 config.lock 问题）。
   fail-closed），收敛为 `sboxweb:sboxweb 0700`；`state/` 由
   `sbmon_ensure_state_tree_as_service_user` **以 sboxweb 身份**创建/收敛；root 绝不对 service-owned
   child pathname 做 chown/chmod（`check→chown/chmod` 的 TOCTOU + symlink-follow 不能提权）；
-  不递归 chown/chmod；auth/access 迁移安全。
+  **已存在但不属于 sboxweb 的 `state/`（例如 root 手工创建）→ fail-closed 并给人工 chown/删除
+  提示，绝不自动"救回"**；不递归 chown/chmod；auth/access 迁移安全。
 - **B 移除 web-setup 的 root privileged mutation**：删除 setup 成功后对 data root / auth.json /
   access.json 的 root chown/chmod；改为非破坏性后置校验 `sbmon_verify_service_owned_tree`
   （漂移→fail-closed + 人工修复提示，绝不自动救回 root 属主数据）；失败信息诚实（可能部分持久化）

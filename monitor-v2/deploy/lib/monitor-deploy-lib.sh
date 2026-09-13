@@ -314,6 +314,19 @@ sbmon_ensure_state_tree_as_service_user() {
     else
         command -v "$SBMON_SUDO" >/dev/null 2>&1 \
             || sbmon_die "缺少 sudo，无法以 $SBMON_USER 收敛 state/：fail-closed"
+        # Non-mutating precheck: an existing state/ the service user does NOT
+        # own (e.g. hand-created as root after a purge) can never be converged
+        # AS the service user. Fail closed with a manual-fix hint -- root never
+        # chowns a service-owned child (that check->chown race is exactly what
+        # this boundary exists to prevent).
+        if [ -d "$state" ]; then
+            local want_uid state_uid
+            want_uid="$(id -u "$SBMON_USER" 2>/dev/null)" || want_uid=""
+            state_uid="$(stat -c '%u' "$state" 2>/dev/null)" || state_uid=""
+            if [ -z "$want_uid" ] || [ -z "$state_uid" ] || [ "$state_uid" != "$want_uid" ]; then
+                sbmon_die "state/ 已存在但不属于服务用户 $SBMON_USER（uid=${state_uid:-?}，期望 ${want_uid:-?}）：请人工执行 chown $SBMON_USER:$SBMON_GROUP '$state' 或删除该目录后重试；安装器绝不以 root 修改 service-owned 子项：fail-closed"
+            fi
+        fi
         # env -i: an explicit, minimal environment -- never the caller's.
         "$SBMON_SUDO" -n -u "$SBMON_USER" -- env -i \
             HOME="$SBMON_STATE_ROOT" \
