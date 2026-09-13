@@ -275,7 +275,7 @@ strip_comments() { sed -e 's/#.*$//' "$@"; }
 # isolation scan so the guarantee stays "nothing else touches /root/sbox".
 DEPLOY_CODE=$(strip_comments "$DEPLOY_DIR"/lib/*.sh "$DEPLOY_DIR"/app-bin/* "$DEPLOY_DIR"/install-monitor.sh "$DEPLOY_DIR"/singbox-monitor.service.in \
     | sed "s|/root/sbox/monitor-api\.secret|<SBMON_S0_ANCHOR>|g")
-if printf '%s' "$DEPLOY_CODE" | grep -qE 'sbconfig_server\.json|/root/sbox|sbox-backup'; then
+if [ "$(printf '%s' "$DEPLOY_CODE" | grep -cE 'sbconfig_server\.json|/root/sbox|sbox-backup')" -gt 0 ]; then
     fail "deploy code must never reference the proxy tree (beyond the S0 anchor)"
 else
     pass "deploy code has zero references to /root/sbox / sbconfig_server.json / production backups (S0 anchor exempted)"
@@ -286,7 +286,7 @@ if [ "$ANCHOR_COUNT" = "1" ]; then
 else
     fail "S0 anchor referenced $ANCHOR_COUNT times (want exactly 1)"
 fi
-if printf '%s' "$DEPLOY_CODE" | grep -qE '(^|[^a-z])(ufw|iptables|ip6tables|firewall-cmd|firewalld)([^a-z]|$)'; then
+if [ "$(printf '%s' "$DEPLOY_CODE" | grep -cE '(^|[^a-z])(ufw|iptables|ip6tables|firewall-cmd|firewalld)([^a-z]|$)')" -gt 0 ]; then
     fail "deploy code must never touch firewall tooling"
 else
     pass "deploy code never invokes firewall tooling"
