@@ -414,8 +414,22 @@ _cmd_rollback_locked() { # [release-id]   (F4: runs under the deploy lock)
     local current
     current="$(sbmon_current_release_id)"
     if [ -z "$target" ]; then
-        target="$(awk -v cur="$current" '$2 != cur { print $2 }' "$SBMON_HISTORY_FILE" 2>/dev/null | tail -n 1)"
-        [ -n "$target" ] || sbmon_die "history 中没有可回滚的 release"
+        # R4-3: default target = NEWEST history entry that (a) is not the
+        # current release and (b) still has a release directory. History is
+        # a durable commit record -- pruned releases keep their entries and
+        # are skipped here, never rewritten.
+        target=""
+        if [ -r "$SBMON_HISTORY_FILE" ]; then
+            local hid
+            while read -r _ hid _; do
+                [ -n "$hid" ] || continue
+                [ "$hid" = "$current" ] && continue
+                [ -d "$SBMON_RELEASES_DIR/$hid" ] || continue
+                target="$hid"
+                break
+            done < <(tac "$SBMON_HISTORY_FILE")
+        fi
+        [ -n "$target" ] || sbmon_die "history 中没有仍保留的可回滚 release（全部已被 retention 清理）"
     fi
     [ -d "$SBMON_RELEASES_DIR/$target" ] || sbmon_die "release 不存在: $target"
 
