@@ -1,0 +1,36 @@
+name: shell-tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  bash-suites:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq shellcheck
+          flock --version || sudo apt-get install -y util-linux
+
+      - name: bash -n (all shell sources)
+        run: |
+          bash -n install.sh
+          bash -n install-linux-gateway.sh
+          bash -n tests/test-phase-c.sh
+          bash -n tests/test-phase-d.sh
+          bash -n tests/test-security-baseline.sh
+          bash -n tests/canary-api-auth.sh
+
+      - name: Phase C regression suite
+        run: bash tests/test-phase-c.sh
+
+      - name: Phase D regression suite
+        run: bash tests/test-phase-d.sh
+
+      - name: S0 security-baseline regression suite (incl. Linux-only mode assertions)
+        run: bash tests/test-security-baseline.sh

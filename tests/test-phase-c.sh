@@ -55,6 +55,9 @@ export SB_STATE_FILE="$SB_SANDBOX_STATE"
 export SB_CLIENTS_DIR="$SB_SANDBOX_CLIENTS"
 export SB_SING_BOX_BIN="$TMP/mock-sing-box"
 export SB_LOCK_FILE="$SANDBOX/config.lock"
+# flock(1) shim: no-op where util-linux flock exists (Linux/CI), enables the
+# fail-closed lock and concurrency tests on platforms without it (e.g. MSYS2).
+. "$HERE/lib/mock-flock.sh"
 
 mkdir -p "$SANDBOX" "$TMP/bin"
 # Mock sing-box: check validates JSON (fails when the fail-flag file exists);

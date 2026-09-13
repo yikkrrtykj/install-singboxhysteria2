@@ -91,6 +91,37 @@ systemctl restart sing-box
 
 作用：直接重启 systemd 管理的 sing-box。
 
+## 3.1 安全基线（S0）
+
+本分支对凭据与 API 边界做了基线加固：
+
+**敏感文件权限**：安装器对以下文件显式执行 `chmod 0600`（不再依赖系统默认 umask）：
+
+- `/root/sbox/sbconfig_server.json`（服务端配置，凭据事实来源）
+- `/root/sbox/config`（状态文件）
+- `/root/sbox/self-cert/private.key`（自签私钥；`cert.pem` 保持 0644）
+- `/root/sbox/monitor-api.secret`（见下）
+- 所有 `sbconfig_server.json.bak.*` 备份、客户端 `clients/<名称>/`（目录 0700，`mihomo.yaml` 0600）
+
+老服务器重跑安装器菜单时会先做一次幂等的权限修复；任何 `chmod` 失败都会终止安装（fail-closed）。
+
+**monitor-api 认证 secret**：本机 `service.api`（127.0.0.1:9091）强制 Bearer 认证：
+
+- `sbconfig_server.json` 中 `monitor-api` 的 `secret` 是唯一事实来源；
+- `/root/sbox/monitor-api.secret` 是给本机 collector 使用的受控派生文件（root:root，0600）；
+- 两者不一致时以配置为准重新生成派生文件（有 warning，但不打印 secret）；
+- 已配置的非空 secret 在重跑/升级时永不轮换；老服务器升级到 1.14 时自动补齐 secret（candidate → check → 备份 → 原子替换 → reload → 健康检查，失败自动回滚）。
+
+**认证金丝雀**（升级后建议手动执行一次）：
+
+```bash
+bash tests/canary-api-auth.sh --with-collector
+```
+
+验证：无凭据/错误凭据必须被拒绝（Unauthenticated），正确凭据可调用，collector 可用 `monitor-api.secret` 建立 SubscribeConnections 流。
+
+**配置锁 fail-closed**：所有配置修改（添加/删除客户端、Phase D 升级）都经过 `/root/sbox/config.lock`；flock 缺失、锁文件打不开或等待超时（默认 15s，可用 `SB_LOCK_TIMEOUT` 调整）都会直接中止，绝不无锁修改配置。删除客户端在锁内也会重新校验名称合法性（`../x`、`a/b` 等一律拒绝）。
+
 ## 4. 网络优化
 
 ```bash

@@ -55,6 +55,12 @@ export SB_CLIENTS_DIR="$SANDBOX/clients"
 export SB_SING_BOX_BIN="$SANDBOX/sing-box"
 export SB_LOCK_FILE="$SANDBOX/config.lock"
 export SB_HOPPING_SERVICE="$SANDBOX/sing-box-hy2-hopping.service"
+export SB_API_SECRET_FILE="$SANDBOX/monitor-api.secret"
+export SB_SELF_CERT_KEY="$SANDBOX/self-cert/private.key"
+export SB_SELF_CERT_CERT="$SANDBOX/self-cert/cert.pem"
+# flock(1) shim: no-op where util-linux flock exists (Linux/CI), enables the
+# fail-closed lock tests on platforms without it (e.g. MSYS2).
+. "$HERE/lib/mock-flock.sh"
 
 info() { printf '  [info] %s\n' "$*"; }
 warning() { printf '  [warn] %s\n' "$*"; }
@@ -171,6 +177,22 @@ case "${1:-}" in
     exit 0 ;;
   api)
     [ -f "${SB_NEW_API_FAIL:-/nonexistent}" ] && exit 1
+    # Emulate service.api auth enforcement: when the live config carries a
+    # monitor-api secret, only a call presenting exactly that secret succeeds.
+    want_secret="$(jq -r --arg tag "monitor-api" '
+      ([(.services // [])[] | select(.tag == $tag)][0].secret // "")
+    ' "${SB_SERVER_CONFIG:?}" 2>/dev/null || printf '')"
+    got_secret=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --secret) got_secret="${2:-}"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    if [ -n "$want_secret" ] && [ "$got_secret" != "$want_secret" ]; then
+      printf 'rpc error: Unauthenticated\n' >&2
+      exit 1
+    fi
     exit 0 ;;
   generate)
     n="$(cat "${MOCK_COUNT_FILE:?}" 2>/dev/null || echo 0)"; n=$((n + 1)); printf '%s\n' "$n" > "${MOCK_COUNT_FILE:?}"
@@ -532,6 +554,9 @@ export SB_CLIENTS_DIR="$CFG/clients"
 export SB_SING_BOX_BIN="$CFG/sing-box"
 export SB_LOCK_FILE="$CFG/config.lock"
 export SB_HOPPING_SERVICE="$CFG/hy2-hopping.service"
+export SB_API_SECRET_FILE="$CFG/monitor-api.secret"
+export SB_SELF_CERT_KEY="$CFG/self-cert/private.key"
+export SB_SELF_CERT_CERT="$CFG/self-cert/cert.pem"
 # per-child restart counter and log: the two children must not share state
 export SYSTEMCTL_LOG="$CFG/systemctl-$ROLE.log"; : > "$SYSTEMCTL_LOG"
 export RESTART_COUNT_FILE="$CFG/restart-count-$ROLE"; printf '0\n' > "$RESTART_COUNT_FILE"
@@ -571,6 +596,9 @@ export SB_CLIENTS_DIR="$SANDBOX/clients"
 export SB_SING_BOX_BIN="$SANDBOX/sing-box"
 export SB_LOCK_FILE="$SANDBOX/config.lock"
 export SB_HOPPING_SERVICE="$SANDBOX/sing-box-hy2-hopping.service"
+export SB_API_SECRET_FILE="$SANDBOX/monitor-api.secret"
+export SB_SELF_CERT_KEY="$SANDBOX/self-cert/private.key"
+export SB_SELF_CERT_CERT="$SANDBOX/self-cert/cert.pem"
 
 section "D18: config mv failure -> double recovery of binary AND config"
 setup_upgrade_sandbox

@@ -14,10 +14,14 @@ hint() { echo -e "${yellow}$*${reset}"; }
 
 show_notice() {
     local message="$1"
-    local terminal_width=$(tput cols)
-    local line=$(printf "%*s" "$terminal_width" | tr ' ' '*')
+    local terminal_width
+    terminal_width=$(tput cols)
+    local line
+    line=$(printf '%*s' "$terminal_width" '' | tr ' ' '*')
     local padding=$(( (terminal_width - ${#message}) / 2 ))
-    local padded_message="$(printf "%*s%s" $padding '' "$message")"
+    [ "$padding" -lt 0 ] && padding=0
+    local padded_message
+    padded_message="$(printf '%*s' "$padding" '')${message}"
     warning "${bold}${line}${reset}"
     echo ""
     warning "${bold}${padded_message}${reset}"
@@ -688,7 +692,6 @@ RESERVED_CLIENT_NAME="legacy"
 CLIENT_NAME_PATTERN='^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$'
 REALITY_INBOUND_TAG="vless-in"
 HY2_INBOUND_TAG="hy2-in"
-REALITY_FLOW="xtls-rprx-vision"
 
 validate_client_name() { # validate_client_name <name> -> rc 0 if allowed
     local name="$1"
@@ -697,20 +700,37 @@ validate_client_name() { # validate_client_name <name> -> rc 0 if allowed
     return 0
 }
 
+# Seconds to wait for the exclusive config lock before aborting. Web/E3 helpers
+# MUST run with a finite timeout; the CLI default stays generous.
+SB_LOCK_TIMEOUT="${SB_LOCK_TIMEOUT:-15}"
+
 # Runs "$@" while holding the exclusive config lock (fd 9), so two management
 # operations can never mutate sbconfig_server.json concurrently.
+# FAIL-CLOSED: a missing flock binary, an unopenable lock file, an acquire
+# error or a timeout each abort WITHOUT ever running "$@" -- no candidate, no
+# backup, no config mutation and no reload is attempted unlocked.
 with_client_lock() {
-    if command -v flock >/dev/null 2>&1; then
-        if mkdir -p "$(dirname "$SB_LOCK_FILE")" 2>/dev/null &&
-           exec 9>>"$SB_LOCK_FILE" 2>/dev/null && flock 9 2>/dev/null; then
-            "$@"
-            local rc=$?
-            exec 9>&- 2>/dev/null
-            return $rc
-        fi
-        warning "无法获取配置锁 ($SB_LOCK_FILE)，单机低并发场景下继续执行"
+    if ! command -v flock >/dev/null 2>&1; then
+        warning "flock 不可用，无法安全地序列化配置修改，操作已中止（fail-closed）"
+        return 1
+    fi
+    if ! mkdir -p "$(dirname "$SB_LOCK_FILE")" 2>/dev/null; then
+        warning "无法创建锁目录 $(dirname "$SB_LOCK_FILE")，操作已中止（fail-closed）"
+        return 1
+    fi
+    if ! exec 9>>"$SB_LOCK_FILE" 2>/dev/null; then
+        warning "无法打开配置锁文件 $SB_LOCK_FILE，操作已中止（fail-closed）"
+        return 1
+    fi
+    if ! flock -w "$SB_LOCK_TIMEOUT" 9 2>/dev/null; then
+        warning "配置锁 $SB_LOCK_FILE 获取失败或超时（${SB_LOCK_TIMEOUT}s），操作已中止（fail-closed）"
+        exec 9>&- 2>/dev/null
+        return 1
     fi
     "$@"
+    local rc=$?
+    exec 9>&- 2>/dev/null
+    return $rc
 }
 
 get_reality_client_names() { # [config] -> one name per line ("" = unnamed user)
@@ -905,6 +925,14 @@ commit_server_config() { # commit_server_config <candidate> <description>
         rm -f "$candidate"
         return 1
     }
+    # cp -a preserves the SOURCE mode: on servers upgraded from older installs
+    # the live config may still be world-readable. A backup must never inherit
+    # that, so the mode is enforced explicitly instead of assumed.
+    if ! chmod 0600 "$backup_path" 2>/dev/null; then
+        warning "备份文件权限收紧为 0600 失败（$description），正式配置未修改"
+        rm -f "$backup_path" "$candidate"
+        return 1
+    fi
 
     if ! mv -f "$candidate" "$SB_SERVER_CONFIG"; then
         warning "原子替换失败（$description），已保留备份: $backup_path"
@@ -1100,6 +1128,14 @@ delete_client() { # delete_client <name> -> removes from BOTH inbounds atomicall
 
 _delete_client_locked() {
     local name="$1" candidate
+    # The destructive helper revalidates EVERYTHING itself and never trusts the
+    # outer delete_client(): order is name syntax -> reserved -> consistency
+    # audit -> existence -> mutation. Any rejection leaves the live config and
+    # the filesystem untouched.
+    if ! validate_client_name "$name"; then
+        warning "客户端名称非法: '$name'（locked helper 二次防护，允许: 字母/数字开头，仅字母数字._-，长度 1-32）"
+        return 1
+    fi
     # Invariant enforced again INSIDE the destructive helper: even a future
     # caller that bypasses delete_client must never be able to remove legacy.
     if [ "$name" = "$RESERVED_CLIENT_NAME" ]; then
@@ -1132,8 +1168,10 @@ _delete_client_locked() {
         return 1
     fi
     # Only after the server-side commit succeeded may the derived files go.
+    # The name was revalidated above; "--" only stops option parsing, it is
+    # never a substitute for validation.
     if [ -d "$SB_CLIENTS_DIR/$name" ]; then
-        rm -rf "$SB_CLIENTS_DIR/$name"
+        rm -rf -- "${SB_CLIENTS_DIR:?}/$name"
         info "已删除派生客户端配置目录: $SB_CLIENTS_DIR/$name"
     fi
     info "客户端 '$name' 已从 Reality 与 HY2 同时删除"
@@ -1377,6 +1415,148 @@ client_management_menu() {
 }
 # <<< phase-c client-management <<< ============================================
 
+# >>> s0 credential-boundary hardening >>> =====================================
+# S0 baseline hardening for the files this installer owns.
+#
+# Secret truth model: sbconfig_server.json is the single runtime source of
+# truth for the monitor-api service secret. /root/sbox/monitor-api.secret is a
+# DERIVED, convenience copy for the local collector (root:root, 0600). When
+# the two disagree, the CONFIG wins and the derived file is regenerated --
+# never the reverse, and a configured secret is never rotated on rerun. The
+# secret is transport authentication for service.api only; the identity model
+# (Device = service.api USER, Protocol = INBOUND, Lifecycle = connection id)
+# is unchanged.
+SB_API_SECRET_FILE="${SB_API_SECRET_FILE:-/root/sbox/monitor-api.secret}"
+SB_SELF_CERT_KEY="${SB_SELF_CERT_KEY:-/root/sbox/self-cert/private.key}"
+SB_SELF_CERT_CERT="${SB_SELF_CERT_CERT:-/root/sbox/self-cert/cert.pem}"
+
+# 256-bit secret from a CSPRNG. Never derived from timestamps, client
+# credentials, recovery keys or admin passwords; callers fail closed when no
+# CSPRNG is available. Prints ONLY the secret (callers must not echo it).
+generate_api_secret() {
+    local secret=""
+    if command -v openssl >/dev/null 2>&1; then
+        secret="$(openssl rand -hex 32 2>/dev/null | tr -d '\r\n')"
+    fi
+    if [ -z "$secret" ] && [ -r /dev/urandom ]; then
+        secret="$(od -An -N32 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
+    fi
+    [ ${#secret} -eq 64 ] || return 1
+    [[ "$secret" =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf '%s\n' "$secret"
+}
+
+# The config's monitor-api secret; "" when the entry is absent or its secret
+# is not a non-empty string. Never prints anything but the value itself.
+read_api_secret_from_config() { # [config]
+    jq -r --arg tag "$PHASE_D_API_TAG" '
+      ([(.services // [])[] | select(.tag == $tag)][0].secret // "") as $s |
+      if (($s | type) == "string") and (($s | length) > 0) then $s else "" end
+    ' "${1:-$SB_SERVER_CONFIG}" 2>/dev/null | tr -d '\r'
+}
+
+# Atomically writes the derived collector secret file (root:root, 0600).
+write_api_secret_file() { # <secret>
+    local secret="$1" tmp
+    [ -n "$secret" ] || return 1
+    tmp="$(mktemp "${SB_API_SECRET_FILE}.tmp.XXXXXX")" || return 1
+    if ! (umask 077 && printf '%s\n' "$secret" > "$tmp"); then
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! chmod 0600 "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        return 1
+    fi
+    # The installer always runs as root on the server; only skip the chown in
+    # non-root sandboxes (tests), never silently on the real host.
+    if [ "$(id -u)" = "0" ] && ! chown root:root "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! mv -f "$tmp" "$SB_API_SECRET_FILE" 2>/dev/null; then
+        rm -f "$tmp"
+        return 1
+    fi
+    return 0
+}
+
+# Config is authoritative: (re)generate the derived file when it is missing or
+# disagrees with the live config. Warnings never contain the secret itself.
+sync_api_secret_file() { # -> rc 0 when the derived file matches the live config
+    local secret current
+    secret="$(read_api_secret_from_config "$SB_SERVER_CONFIG")"
+    [ -n "$secret" ] || return 0   # no usable API secret in config: nothing to sync
+    if [ -f "$SB_API_SECRET_FILE" ]; then
+        current="$(tr -d '\r\n' < "$SB_API_SECRET_FILE" 2>/dev/null)"
+        [ "$current" = "$secret" ] && return 0
+        warning "monitor-api.secret 派生文件与服务端配置不一致，已按配置重新生成（以配置为准）"
+    else
+        warning "monitor-api.secret 派生文件缺失，已按服务端配置重新生成"
+    fi
+    write_api_secret_file "$secret"
+}
+
+# Existing-install bootstrap (S0), called BEFORE the interactive menu. A
+# failing permission hardening -- or a derived secret file that cannot be
+# brought back in sync with the config, which is the secret's authoritative
+# source -- must ABORT the installer here (error exits): the menu is never
+# entered and no management mutation can run against an unsafe or
+# desynced-credential state. Installations whose config carries no valid
+# monitor-api secret yet (Phase D migration not done) stay unaffected: sync
+# treats that as nothing-to-do.
+repair_existing_install_security_baseline() {
+    harden_sensitive_permissions ||
+        { error "敏感文件权限加固失败，请先人工检查磁盘/权限后再运行"; return 1; }
+    sync_api_secret_file ||
+        { error "monitor-api.secret 派生文件修复失败，请先人工检查磁盘/目录/权限后再运行"; return 1; }
+    return 0
+}
+
+# Idempotent permission repair for sensitive files. Existing files are forced
+# to 0600 (clients dir 0700, public cert 0644); missing files are skipped
+# without error; ANY chmod failure is fail-closed and callers must abort the
+# install. Never prints file contents.
+harden_sensitive_permissions() {
+    local target sub
+    for target in \
+        "$SB_SERVER_CONFIG" \
+        "$SB_STATE_FILE" \
+        "$SB_API_SECRET_FILE" \
+        "$SB_SELF_CERT_KEY" \
+        /root/sbox/mihomo_client.yaml \
+        /root/sbox/sbconfig_client.json; do
+        [ -f "$target" ] || continue
+        if ! chmod 0600 "$target" 2>/dev/null; then
+            warning "无法将敏感文件权限收紧为 0600: $target（拒绝继续，请人工检查）"
+            return 1
+        fi
+    done
+    if [ -f "$SB_SELF_CERT_CERT" ] && ! chmod 0644 "$SB_SELF_CERT_CERT" 2>/dev/null; then
+        warning "无法设置公钥证书权限为 0644: $SB_SELF_CERT_CERT"
+        return 1
+    fi
+    if [ -d "$SB_CLIENTS_DIR" ]; then
+        if ! chmod 0700 "$SB_CLIENTS_DIR" 2>/dev/null; then
+            warning "无法将客户端目录权限收紧为 0700: $SB_CLIENTS_DIR（拒绝继续）"
+            return 1
+        fi
+        for sub in "$SB_CLIENTS_DIR"/*; do
+            [ -d "$sub" ] || continue
+            if ! chmod 0700 "$sub" 2>/dev/null; then
+                warning "无法将客户端目录权限收紧为 0700: $sub（拒绝继续）"
+                return 1
+            fi
+            if [ -f "$sub/mihomo.yaml" ] && ! chmod 0600 "$sub/mihomo.yaml" 2>/dev/null; then
+                warning "无法将客户端配置权限收紧为 0600: $sub/mihomo.yaml（拒绝继续）"
+                return 1
+            fi
+        done
+    fi
+    return 0
+}
+# <<< s0 credential-boundary hardening <<< =====================================
+
 # >>> phase-d singbox-1.14-api >>> =============================================
 # Phase D: safe production upgrade to 1.14.x stable with a localhost-only
 # service.api (top-level "services" entry); the installer is a single
@@ -1500,7 +1680,7 @@ phase_d_config_structure_problems() { # <config>
 }
 
 # True when the config already carries exactly one compliant monitor-api
-# service entry (loopback-only, fixed port).
+# service entry (loopback-only, fixed port) WITH a non-empty string secret.
 phase_d_api_service_exact() { # <config>
     local cfg="$1"
     jq -e \
@@ -1511,14 +1691,26 @@ phase_d_api_service_exact() { # <config>
         ($m | length) == 1 and
         $m[0].type == "api" and
         $m[0].listen == $listen and
-        $m[0].listen_port == $port
+        $m[0].listen_port == $port and
+        ($m[0].secret | type) == "string" and
+        ($m[0].secret | length) > 0
       ' "$cfg" >/dev/null 2>&1
 }
 
-# Idempotent injection of the localhost-only service.api entry. Fails closed
-# when the input config fails the structural audit; re-audits the output.
-phase_d_inject_api_service() { # <input> <output>
+# Idempotent injection of the localhost-only service.api entry WITH its
+# authentication secret:
+#   - no monitor-api entry           -> append a full entry (incl. secret)
+#   - entry without a usable secret  -> fill in the secret, touch nothing else
+#   - already exact (incl. secret)   -> preserve the config byte-for-byte
+#                                      (a rerun NEVER rotates the secret)
+# When the structural audit passes and the entry exists but is not exact, the
+# only possible gap IS the missing secret (type/listen/port/count are already
+# enforced by the structural audit). An explicit secret argument is honoured;
+# otherwise one is generated. Fails closed on any audit error; re-audits the
+# output including the secret.
+phase_d_inject_api_service() { # <input> <output> [secret]
     local input="$1" output="$2" problems rc count tmp
+    local secret="${3:-}"
     problems="$(phase_d_config_structure_problems "$input")"; rc=$?
     if [ "$rc" -ne 0 ]; then
         warning "Phase D API 结构审计执行失败"
@@ -1531,33 +1723,59 @@ phase_d_inject_api_service() { # <input> <output>
 
     count="$(jq -er --arg tag "$PHASE_D_API_TAG" '[(.services // [])[] | select(.tag == $tag)] | length' "$input" 2>/dev/null | tr -d '\r')" || return 1
     if [ "$count" -eq 1 ]; then
-        # Existing exact service passed the structural audit; preserve config.
-        cp -a -- "$input" "$output" || return 1
-        return 0
-    fi
-
-    tmp="${output}.tmp.$$"
-    rm -f -- "$tmp"
-    if ! jq \
-      --arg tag "$PHASE_D_API_TAG" \
-      --arg listen "$PHASE_D_API_LISTEN" \
-      --argjson port "$PHASE_D_API_PORT" '
-        .services = ((.services // []) + [{
-          "type": "api",
-          "tag": $tag,
-          "listen": $listen,
-          "listen_port": $port
-        }])
-      ' "$input" > "$tmp"; then
+        if phase_d_api_service_exact "$input"; then
+            # Existing exact service passed both audits; preserve config.
+            cp -a -- "$input" "$output" || return 1
+            return 0
+        fi
+        if [ -z "$secret" ] && ! secret="$(generate_api_secret)"; then
+            warning "生成 monitor-api secret 失败"
+            return 1
+        fi
+        tmp="${output}.tmp.$$"
         rm -f -- "$tmp"
-        return 1
+        if ! jq --arg tag "$PHASE_D_API_TAG" --arg secret "$secret" \
+          '(.services[] | select(.tag == $tag) | .secret) = $secret' \
+          "$input" > "$tmp"; then
+            rm -f -- "$tmp"
+            return 1
+        fi
+        mv -f -- "$tmp" "$output" || { rm -f -- "$tmp"; return 1; }
+    else
+        if [ -z "$secret" ] && ! secret="$(generate_api_secret)"; then
+            warning "生成 monitor-api secret 失败"
+            return 1
+        fi
+        tmp="${output}.tmp.$$"
+        rm -f -- "$tmp"
+        if ! jq \
+          --arg tag "$PHASE_D_API_TAG" \
+          --arg listen "$PHASE_D_API_LISTEN" \
+          --argjson port "$PHASE_D_API_PORT" \
+          --arg secret "$secret" '
+            .services = ((.services // []) + [{
+              "type": "api",
+              "tag": $tag,
+              "listen": $listen,
+              "listen_port": $port,
+              "secret": $secret
+            }])
+          ' "$input" > "$tmp"; then
+            rm -f -- "$tmp"
+            return 1
+        fi
+        mv -f -- "$tmp" "$output" || { rm -f -- "$tmp"; return 1; }
     fi
-    mv -f -- "$tmp" "$output" || { rm -f -- "$tmp"; return 1; }
 
     problems="$(phase_d_config_structure_problems "$output")"; rc=$?
     if [ "$rc" -ne 0 ] || [ -n "$problems" ]; then
         rm -f -- "$output"
         [ -n "$problems" ] && printf '%s\n' "$problems" >&2
+        return 1
+    fi
+    if ! phase_d_api_service_exact "$output"; then
+        rm -f -- "$output"
+        warning "注入后 monitor-api 仍不合规（secret 校验失败）"
         return 1
     fi
     return 0
@@ -1633,7 +1851,7 @@ verify_candidate_binary() { # verify_candidate_binary <candidate> <version>
 # 0.0.0.0/[::]) and a live `sing-box api connection list` call.
 phase_d_health_ok() { # phase_d_health_ok <expected_version> [require_api=yes|no]
     local expected="$1" require_api="${2:-yes}"
-    local main_pid reality_port hy_port out
+    local main_pid reality_port hy_port out api_secret
     if ! systemctl is-active --quiet sing-box 2>/dev/null; then
         warning "健康检查失败: sing-box 服务未 active"
         return 1
@@ -1672,9 +1890,24 @@ phase_d_health_ok() { # phase_d_health_ok <expected_version> [require_api=yes|no
             warning "健康检查失败: API 监听越界（检测到 0.0.0.0/[::]:${PHASE_D_API_PORT}）"
             return 1
         fi
-        if ! "$SB_SING_BOX_BIN" api --url "http://127.0.0.1:${PHASE_D_API_PORT}" connection list >/dev/null 2>&1; then
-            warning "健康检查失败: sing-box api connection list 不可用"
-            return 1
+        # The secret's source of truth is the (already committed) live config.
+        api_secret="$(read_api_secret_from_config "$SB_SERVER_CONFIG")"
+        if [ -n "$api_secret" ]; then
+            if ! "$SB_SING_BOX_BIN" api --url "http://127.0.0.1:${PHASE_D_API_PORT}" --secret "$api_secret" connection list >/dev/null 2>&1; then
+                warning "健康检查失败: sing-box api connection list 不可用"
+                return 1
+            fi
+            # Negative canary: with a secret configured, an UNauthenticated call
+            # MUST be rejected; success would mean auth is not enforced.
+            if "$SB_SING_BOX_BIN" api --url "http://127.0.0.1:${PHASE_D_API_PORT}" connection list >/dev/null 2>&1; then
+                warning "健康检查失败: service.api 未强制认证（无凭据调用竟然成功）"
+                return 1
+            fi
+        else
+            if ! "$SB_SING_BOX_BIN" api --url "http://127.0.0.1:${PHASE_D_API_PORT}" connection list >/dev/null 2>&1; then
+                warning "健康检查失败: sing-box api connection list 不可用"
+                return 1
+            fi
         fi
     fi
     return 0
@@ -1870,6 +2103,13 @@ _upgrade_singbox_1_14_locked() {
         rm -f "$candidate_bin" "$candidate_cfg" "$backup_bin" "$backup_cfg"
         return 1
     fi
+    # cp -a preserves the source mode; an old 0644 live config must never
+    # produce a world-readable backup.
+    if ! chmod 0600 "$backup_cfg" 2>/dev/null; then
+        warning "备份文件权限收紧为 0600 失败，正式环境未修改"
+        rm -f "$candidate_bin" "$candidate_cfg" "$backup_bin" "$backup_cfg"
+        return 1
+    fi
 
     if ! mv -f "$candidate_bin" "$SB_SING_BOX_BIN"; then
         warning "原子替换 binary 失败，正式环境未修改"
@@ -1927,6 +2167,13 @@ _upgrade_singbox_1_14_locked() {
     info "升级完成: sing-box $ver（binary + config 已替换并验证健康）"
     info "本机 service.api 已启用: http://${PHASE_D_API_LISTEN}:${PHASE_D_API_PORT}（仅回环监听）"
     info "升级前备份: binary=$backup_bin config=$backup_cfg"
+    # S0: the committed config is the API secret's source of truth. Refresh the
+    # derived collector file so the local collector never authenticates with a
+    # missing/stale copy (a configured secret is never rotated here).
+    if ! sync_api_secret_file; then
+        warning "monitor-api.secret 派生文件刷新失败（binary/config 已提交且健康）；本机 collector 将无法认证，请手动检查权限"
+        return 1
+    fi
     return 0
 }
 # <<< phase-d singbox-1.14-api <<< ============================================
@@ -2623,6 +2870,12 @@ if has_any_installation_marker; then
     fi
 
     install_pkgs
+    # S0: fail-closed bootstrap repair on every existing install, BEFORE the
+    # interactive menu runs. A failing chmod or an unrepairable derived secret
+    # file aborts here (see repair_existing_install_security_baseline) -- the
+    # menu is never entered, so no management mutation can continue on an
+    # unsafe or desynced-credential state.
+    repair_existing_install_security_baseline
     echo ""
     info "sing-box-reality-hysteria2 已安装"
     show_status
@@ -2757,6 +3010,12 @@ mkdir -p /root/sbox/self-cert/ && openssl ecparam -genkey -name prime256v1 -out 
 info "自签证书生成完成,保存于/root/sbox/self-cert/"
 echo ""
 echo ""
+
+# S0: service.api transport authentication secret. Generated once at install
+# time from a CSPRNG (256 bit); sbconfig_server.json stays its single source
+# of truth and /root/sbox/monitor-api.secret is the derived copy for the local
+# collector. Never reused from client credentials or admin passwords.
+monitor_api_secret="$(generate_api_secret)" || error "无法生成 monitor-api secret（需要可用的 CSPRNG）"
 #get ip
 server_ip=$(curl -s4m8 ip.sb -k) || server_ip=$(curl -s6m8 ip.sb -k)
 
@@ -2856,7 +3115,8 @@ cat > /root/sbox/sbconfig_server.json << EOF
       "type": "api",
       "tag": "monitor-api",
       "listen": "127.0.0.1",
-      "listen_port": 9091
+      "listen_port": 9091,
+      "secret": "$monitor_api_secret"
     }
   ],
     "outbounds": [
@@ -2871,6 +3131,12 @@ cat > /root/sbox/sbconfig_server.json << EOF
     ]
 }
 EOF
+
+# S0: derived collector secret file, then explicit permission hardening for
+# every credential-bearing file this installer just created. Missing optional
+# files are skipped; any chmod failure aborts the install (fail-closed).
+write_api_secret_file "$monitor_api_secret" || error "无法写入 monitor-api.secret（root:root 0600）"
+harden_sensitive_permissions || error "敏感文件权限加固失败，安装已停止"
 
 configure_udp_buffers
 
