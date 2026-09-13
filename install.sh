@@ -2303,6 +2303,50 @@ new_state_backup_path() { # new_state_backup_path -> unique backup next to the l
     mktemp "${SB_STATE_FILE}.bak.$(date +%Y%m%d-%H%M%S).XXXXXX" 2>/dev/null
 }
 
+# Atomically restores <live> from a hardened <backup>, keeping the original
+# backup intact. FAIL-CLOSED at every step: a missing/symlink/non-regular backup,
+# or a failed unique-temp creation, copy, chmod, atomic replace or verification
+# each return non-zero -- and a failure is NEVER reported as a successful restore.
+# The caller must hold with_client_lock. The live pathname is never `cp`'d onto
+# directly (a partial copy would corrupt the durable pair) and `sed -i` is never
+# used: the exact backup bytes are staged in a UNIQUE temp file in the SAME
+# directory and atomically renamed into place, then verified byte-for-byte.
+restore_file_atomically() { # <backup> <live>
+    local backup="$1" live="$2" tmp=""
+    if [ -z "$backup" ] || [ -z "$live" ]; then
+        warning "restore_file_atomically: 参数不能为空"
+        return 1
+    fi
+    if [ -L "$backup" ] || [ ! -f "$backup" ]; then
+        warning "备份不是普通文件（缺失或符号链接），拒绝恢复: $backup"
+        return 1
+    fi
+    if ! tmp="$(mktemp "${live}.restore.XXXXXX" 2>/dev/null)"; then
+        warning "创建恢复临时文件失败（需与目标同目录）: ${live}.restore.XXXXXX"
+        return 1
+    fi
+    if ! cp -a "$backup" "$tmp" 2>/dev/null; then
+        warning "写入恢复临时文件失败: $tmp"
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! chmod 0600 "$tmp" 2>/dev/null; then
+        warning "恢复临时文件权限收紧为 0600 失败: $tmp"
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! mv -f "$tmp" "$live" 2>/dev/null; then
+        warning "恢复文件原子替换失败: $live"
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! cmp -s "$backup" "$live" 2>/dev/null; then
+        warning "恢复校验失败：$live 与备份 $backup 内容不一致"
+        return 1
+    fi
+    return 0
+}
+
 # rc 0 when $1 is a usable TCP/UDP port number (1-65535, digits only).
 valid_port() {
     case "$1" in
@@ -2444,7 +2488,7 @@ _modify_singbox_locked() { # <reality_port> <hy_port> <server_name> <hy_cert> <h
     local reality_port="$1" hy_port="$2" server_name="$3" hy_cert="$4" hy_key="$5" hy_domain="$6"
     local cfg="$SB_SERVER_CONFIG" state="$SB_STATE_FILE"
     local json_cand="" state_cand="" json_bak="" state_bak=""
-    local problems="" was_running="" p=""
+    local problems="" was_running="" p="" rj=0 rs=0
 
     # 1. re-read the LIVE artifacts (never a pre-lock snapshot).
     [ -f "$cfg" ] || { warning "服务端配置不存在: $cfg"; return 1; }
@@ -2575,18 +2619,28 @@ _modify_singbox_locked() { # <reality_port> <hy_port> <server_name> <hy_cert> <h
         return 1
     fi
     if ! mv -f "$state_cand" "$state"; then
-        warning "状态文件原子替换失败，回滚服务端配置..."
-        cp -a "$json_bak" "$cfg"
-        if [ "$was_running" != "no" ]; then
-            if reload_running_singbox && reload_health_ok; then
-                warning "已回滚服务端配置；状态文件未修改: $json_bak"
-            else
-                warning "已回滚服务端配置，但服务未能确认恢复，请立即人工检查！备份: $json_bak / $state_bak"
-            fi
-        else
-            warning "已回滚服务端配置；状态文件未修改（当前无运行中的 sing-box）: $json_bak"
-        fi
+        # The state rename failed, so the old state is normally still in place;
+        # nevertheless restore+verify BOTH artifacts atomically so the durable
+        # pair is provably restored and never left split (new JSON + old state).
         rm -f "$state_cand"
+        warning "状态文件原子替换失败，回滚服务端配置与状态并校验..."
+        rj=0; rs=0
+        restore_file_atomically "$json_bak" "$cfg" || rj=1
+        restore_file_atomically "$state_bak" "$state" || rs=1
+        if [ "$rj" -ne 0 ] || [ "$rs" -ne 0 ]; then
+            warning "回滚恢复失败，需人工介入！两份持久化文件可能不一致，请勿继续操作。"
+            warning "备份保留（请勿删除）: $json_bak / $state_bak"
+            return 1
+        fi
+        if [ "$was_running" = "no" ]; then
+            warning "已恢复并校验上一份配置与状态（当前无运行中的 sing-box，无需 reload）: $json_bak / $state_bak"
+            return 1
+        fi
+        if reload_running_singbox && reload_health_ok; then
+            warning "已回滚并重新加载上一份配置与状态: $json_bak / $state_bak"
+        else
+            warning "已恢复并校验上一份配置与状态，但服务未能确认恢复，请立即人工检查！备份: $json_bak / $state_bak"
+        fi
         return 1
     fi
 
@@ -2602,16 +2656,21 @@ _modify_singbox_locked() { # <reality_port> <hy_port> <server_name> <hy_cert> <h
         return 0
     fi
 
-    # 11./12. reload/health failed -> restore BOTH and verify recovery.
+    # 11./12. reload/health failed -> atomically restore+verify BOTH artifacts,
+    # then reload the previous configuration.
     warning "reload 后健康检查失败，回滚配置与状态..."
-    if ! cp -a "$json_bak" "$cfg" || ! cp -a "$state_bak" "$state"; then
-        warning "回滚文件恢复失败，请立即人工介入！备份: $json_bak / $state_bak"
+    rj=0; rs=0
+    restore_file_atomically "$json_bak" "$cfg" || rj=1
+    restore_file_atomically "$state_bak" "$state" || rs=1
+    if [ "$rj" -ne 0 ] || [ "$rs" -ne 0 ]; then
+        warning "回滚恢复失败，需人工介入！两份持久化文件可能不一致，请勿继续操作。"
+        warning "备份保留（请勿删除）: $json_bak / $state_bak"
         return 1
     fi
     if reload_running_singbox && reload_health_ok; then
         warning "已回滚并重新加载上一份配置与状态: $json_bak / $state_bak"
     else
-        warning "已回滚配置与状态，但服务未能确认恢复，请立即人工检查！备份: $json_bak / $state_bak"
+        warning "已恢复磁盘上的配置与状态，但服务未能确认恢复，请立即人工检查！备份: $json_bak / $state_bak"
     fi
     return 1
 }

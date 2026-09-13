@@ -75,6 +75,41 @@ reported as needing manual intervention, never as success. Only the requested
 values are mutated — Reality UUIDs, HY2 passwords, the Reality private key and
 `service.api.secret` are never rotated.
 
+### L3 rollback hardening (atomic restore)
+
+Rollback no longer copies a backup directly onto the live pathname (a partial
+`cp` could leave a half-written durable artifact). One narrowly scoped
+primitive implements the approved model:
+
+```
+restore_file_atomically <backup> <live>
+  backup -> unique <live>.restore.XXXXXX (SAME directory)
+         -> exact backup bytes
+         -> chmod 0600
+         -> atomic mv into <live>
+         -> byte-for-byte verification (cmp -s)
+```
+
+It fails closed (non-zero) on a missing / symlink / non-regular backup, or a
+failed unique-temp creation, copy, chmod, atomic replace or verification; it
+cleans its temporary file on failure and NEVER deletes the original hardened
+backup. No shared fixed restore filename is used, and `sed -i` is never used.
+
+Both rollback paths now restore **and verify BOTH** durable artifacts:
+
+- **second-artifact replace failure** (JSON replaced, state rename failed):
+  restore+verify JSON, restore+verify state. If either restore fails →
+  `MANUAL INTERVENTION`, both backup paths printed, no success claim.
+- **reload/health failure after commit**: restore+verify JSON, restore+verify
+  state, then reload + health. If either restore fails → `MANUAL INTERVENTION`,
+  no recovery claim. If the restores succeed but the rollback reload/health
+  fails → disk is restored but runtime recovery is explicitly NOT confirmed.
+
+The phrases 已回滚 / 已恢复 / 恢复成功 are emitted only after the corresponding
+restore, byte-for-byte verification and (where applicable) reload+health have
+all succeeded, so a failed restore can never flow into a rollback-success
+message.
+
 ## L4 — state writers
 
 `set_config_value` (live → unique candidate → atomic `mv`),
@@ -122,4 +157,9 @@ rollback, absence of fixed temp filenames, dual-file success, forced
 second-artifact failure, reload failure, rollback-reload failure reporting, the
 HY2-state vs modify_singbox lost-update race, lock unavailable/timeout,
 no-interactive-wait-under-lock, credential preservation, and the L5
-management-active guard. Linux CI uses the real `flock(1)`.
+management-active guard). L3 rollback hardening adds: the atomic restore
+primitive (success + missing/non-regular/symlink fail-closed), forced restore
+failure in the second-artifact path (T10b) and after a reload failure (T11b)
+(manual intervention, no false success, backups retained, no temp residue, no
+credential change), and successful-rollback verification (byte-identical,
+mode 0600 on Linux, no residue). Linux CI uses the real `flock(1)`.
