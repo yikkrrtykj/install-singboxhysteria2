@@ -48,4 +48,4 @@ jobs:
         run: bash tests/test-monitor-v2-e4.sh
 
       - name: Integration regression complete (all prior steps green)
-        run: echo 'Phase C + Phase D + S0 + E1 + E2 + E4: all green on Linux'
+        run: "echo 'Phase C + Phase D + S0 + E1 + E2 + E4: all green on Linux'"
