@@ -1561,7 +1561,7 @@ if [ "$SYMLINKS_OK" = 1 ]; then
         # must be readable by that identity (mirrors a real /var/lib install),
         # and the fixture tree must be traversable like /opt.
         chmod 0755 "$TMP" "$FIX_RELEASES"
-        chown "$SBMON_USER:$SBMON_GROUP" "$FIX_STATE" "$FIX_STATE/auth.json" "$FIX_STATE/access.json"
+        chown "${SBMON_USER:-sboxweb}:${SBMON_GROUP:-sboxweb}" "$FIX_STATE" "$FIX_STATE/auth.json" "$FIX_STATE/access.json"
     fi
     CALLS_BEFORE_SU="$(wc -l < "$MOCK_CALL_LOG")"
     SETUP_OUT="$TMP/out-t19.log"
