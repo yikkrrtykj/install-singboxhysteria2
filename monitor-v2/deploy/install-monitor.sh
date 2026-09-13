@@ -125,7 +125,11 @@ sbmon_txn_rollback() { # <old_id> <old_unit_backup|''> <old_unit_existed> <old_a
             sbmon_critical "回滚后服务未恢复 active；旧 release/unit 已就位，需要人工检查 journalctl -u $SBMON_SERVICE_NAME"
         fi
     else
-        sbmon_service_stop
+        # R4-1: stop is a restoration step -- failure is CRITICAL, never a
+        # silent set -e exit.
+        if ! sbmon_service_stop; then
+            sbmon_critical "回滚后服务停止失败（事务前为 inactive）；需要人工处理"
+        fi
         if sbmon_service_active; then
             sbmon_critical "回滚后服务仍处于运行状态（事务前为 inactive）；需要人工处理"
         fi

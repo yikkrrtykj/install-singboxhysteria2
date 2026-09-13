@@ -793,7 +793,9 @@ fi
 assert_eq '0.10.0' "$(cat "$FIX_APP_LINK/VERSION")" "default rollback selects 0.10.0, skipping the pruned 0.9.0 (R4-3)"
 
 section "R4-3 no retained rollback target -> clean fail"
-rm -rf "$FIX_RELEASES"/0.10.0-* 2>/dev/null
+# remove every NON-current release tree (the live 0.10.0 stays; removing the
+# live tree would not exercise the pruned-target scan)
+rm -rf "$FIX_RELEASES"/0.2.0-* "$FIX_RELEASES"/0.9.0-* 2>/dev/null
 HIST_R43="$(cat "$FIX_RELEASES/releases.history")"
 VER_R43="$(cat "$FIX_APP_LINK/VERSION")"
 OUT_R43E="$TMP/out-r43e.log"
@@ -805,7 +807,8 @@ else
     pass "rollback with no retained target fails (rc=$RC_R43E)"
 fi
 assert_grep '没有仍保留的可回滚' "$OUT_R43E" "clean fail message (R4-3)"
-assert_eq "$VER_R43" "$(cat "$FIX_APP_LINK/VERSION")" "current unchanged after clean fail (R4-3)"
+assert_eq "$VER_R43" "$(cat "$FIX_APP_LINK/VERSION")" "current (0.10.0) unchanged after clean fail (R4-3)"
+assert_eq '0.10.0' "$(cat "$FIX_APP_LINK/VERSION")" "live release still 0.10.0 after clean fail (R4-3)"
 assert_eq "$HIST_R43" "$(cat "$FIX_RELEASES/releases.history")" "no new history entry after clean fail (R4-3)"
 fi  # end SYMLINKS_OK block (R4-3)
 
