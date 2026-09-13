@@ -44,7 +44,9 @@ suites assert, so its Phase C/D/S0 failures are an environment artifact. The
 frozen-branch control comparison there showed zero local integration
 regression (kept as a development record, not a verdict).
 
-Linux CI (PR #16 checks, head `3131c73`):
+Linux CI (PR #16 checks): first confirmed at head `3131c73`; re-confirmed at
+`768ed50` after Round 0.1 added E1/E2/E4 as mandatory `shell-tests` steps
+(counts identical):
 
 | Gate | Linux CI result |
 |---|---|
