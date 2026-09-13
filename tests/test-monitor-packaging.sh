@@ -899,6 +899,11 @@ if [ "$SYMLINKS_OK" = 1 ]; then
     ( SBMON_KEEP_RELEASES=2 "$INSTALL_MONITOR" install ) > "$TMP/out-r413b.log" 2>&1
     assert_rc 0 $? "deploy 1.1.0 (B)"
     touch -d '3 hours ago' "$FIX_RELEASES"/1.1.0-* 2>/dev/null
+    printf '1.2.0
+' > "$FIX_SRC/VERSION"
+    run_install "$TMP/out-r413c2.log"   # KEEP=3 (default): no prune yet, 3 trees
+    assert_rc 0 $? "deploy 1.2.0 (C)"
+    touch -d '2 hours ago' "$FIX_RELEASES"/1.2.0-* 2>/dev/null
     A_ID="$(find "$FIX_RELEASES" -maxdepth 1 -type d -name '1.0.0-*' -printf '%f\n' | head -n 1)"
     ( "$INSTALL_MONITOR" rollback "$A_ID" ) > "$TMP/out-r413c.log" 2>&1
     assert_rc 0 $? "rollback to A (live = oldest tree)"
