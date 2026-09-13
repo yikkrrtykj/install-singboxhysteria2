@@ -346,3 +346,49 @@ bash tests/test-monitor-v2-e1.sh
 - Reality-only RTT/retrans 增强（ss，可选）；
 - expected source IP 机械比对（外部测试阶段）；
 - 可信反代（trusted proxy）场景下的白名单来源设计。
+
+## Phase E4 -- Mihomo client API enrichment（OPTIONAL，read-only）
+
+E4 在**客户端本地** Mihomo external-controller 上做可选 enrichment，
+是显示层的补充，绝不是身份数据源：
+
+```text
+Server truth（不可替代）:  Device = service.api USER / Protocol = INBOUND / Lifecycle = connection ID
+Mihomo API（仅补充展示）:  version / mode / selected proxy / delay /
+                           local connections / local traffic rate
+```
+
+铁律（由代码结构强制，详见 `monitor-v2/mihomo/README.md`）：
+
+* enrichment 输出对象走固定 key 白名单，结构上不可能携带任何身份字段；
+  节点显示名（`vmix-01-HY2`、`香港-01`……）原样透传为 `selected_proxy`，
+  仅用于展示，绝不参与身份判定/映射/重命名；
+* controller URL 只允许 loopback（fail-closed）；Mihomo API 是客户端本地
+  服务，绝不公网暴露，服务器侧读取应走显式 agent/隧道设计；
+* secret 只经 `Authorization: Bearer` 头传递：不进日志、不进输出对象、
+  不进 URL query、错误文本统一 redact（含传输异常/HTTP 错误体内出现的
+  secret）；每个 API 请求超时钳制在 1-3 秒（整个 poll 顺序请求可能占用
+  多个请求预算；whole-poll deadline 留待真正集成 agent 时单独设计）；
+  `--secret-file` 全平台要求 regular file；POSIX 强制 owner-readable 且
+  无 group/other 权限位（0600/0400 可用，0000/0200/0644+ 拒绝，校验先于
+  读取内容，O_NOFOLLOW 拒绝 symlink）；Windows 不做 POSIX 位拒绝，依赖
+  文件系统 ACL（v1 文档化限制）；
+* transport 只有 `get(path)` 一个入口——不存在 method 参数，PUT/POST/
+  PATCH/DELETE 在结构上无法发出；URL 拒绝 userinfo/非根 path/query/
+  fragment，且错误信息绝不回显完整 URL；
+* `reachable=false`（unreachable / disabled / wrong secret / offline）只是
+  一个观测结果，服务端 Monitor 完全不受影响，设备状态绝不因此改变；
+* freshness 双域独立：enrichment 有自己的 `checked_at`（本次轮询完成时间）
+  / `updated_at`（最近一次成功取得有效数据的时间，失败轮询为 null 且
+  stale=true，绝不出现 unreachable-but-fresh）/ `error`，与
+  E1 流的 stale 完全分离；
+* `/connections` 语义：`null`/`[]` -> 0（确认空闲），key 缺失或类型错误
+  -> None（schema 漂移/未知，绝不伪装成 idle）；
+* `/traffic` 是真实无限流：newline 分帧 + 绝对 deadline 的首行读取器，
+  读到第一条完整 JSON 立即返回，不等连接关闭、不读第二条；
+* 只读：不选节点、不切模式、不 reload、不重启、不关连接、不触发
+  delay 主动探测（只读缓存 history）。
+
+文件：`monitor-v2/mihomo/{client.py,model.py,fixtures/}`；
+测试：`tests/test-monitor-v2-e4.sh`（E1 回归必须保持 188/188）。
+

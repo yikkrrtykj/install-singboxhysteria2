@@ -1,0 +1,8 @@
+{
+  "log-level": "warning",
+  "allow-lan": false,
+  "ipv6": true,
+  "tun": {
+    "enable": true
+  }
+}
