@@ -264,7 +264,7 @@ generated YAML —— 一个都不许出现）的实现方式：
                  + old_service_active + old_service_enabled（`systemctl is-enabled` 显式记录，绝不推断）
   → stage（releases/.staging-*，py_compile + bash -n 预验证；失败删 staging，生产树零影响）
   → unit 原子写入（同文件系统 temp → chmod → rename；读者永远看不到半个 unit）
-  → activate（mv -T 符号链接原子切换；旧树即备份，保留最近 SBMON_KEEP_RELEASES=3 个）
+  → activate（mv -T 符号链接原子切换；旧树即备份，retention 按 release-tree creation age 保留最近 SBMON_KEEP_RELEASES=3 个，见 §13）
   → systemctl restart singbox-monitor      ← 唯一被重启的服务；sing-box 无感
   → 门：等待 service_active（默认 20s）
 
@@ -403,3 +403,18 @@ integration（modify_singbox/process_doko 等的 config.lock 问题）。
    验证真实 uid/gid/mode。
 4. **F4**：所有 mutating 命令统一 `sbmon_with_deploy_lock` dispatcher；upgrade 的
    已安装前置检查在锁内复核，绝不退化为 fresh install。
+
+---
+
+## 13. Review round 4.1 — retention contract（最终）
+
+- **retention = actual release-tree creation chronology**（目录 mtime，旧 → 新），与
+  `releases.history` 完全解耦：history 只承担审计记录 + rollback 目标选择两个职责，
+  不再参与物理树的生命周期排序。
+- **rollback activation does not mutate release-tree age**：rollback 只翻转符号链接，
+  从不重建/触碰 immutable tree —— 被回滚到的 release 仍按其创建年龄参与 retention。
+- **failed candidate 按真实年龄参与 prune**（非 history 树不再是"最新"）。
+- **live 永不被 prune**（无论多老）；prune 循环跳过 live 后继续寻找次旧 victim，
+  直到满足 KEEP 或只剩 live —— 不会因 skip live 而超量保留。
+- history 语义不变（R3-5/F1）：durable successful commit record，prune 永不重写；
+  default rollback newest→oldest、skip current、skip 目录已不存在的条目。

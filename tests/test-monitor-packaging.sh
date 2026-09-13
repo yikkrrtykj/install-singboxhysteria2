@@ -766,9 +766,11 @@ run_uninstall_quiet
 printf '0.9.0\n' > "$FIX_SRC/VERSION"
 run_install "$TMP/out-r43a.log"
 assert_rc 0 $? "deploy 0.9.0"
+touch -d '3 hours ago' "$FIX_RELEASES"/0.9.0-* 2>/dev/null   # distinct creation ages
 printf '0.10.0\n' > "$FIX_SRC/VERSION"
 run_install "$TMP/out-r43b.log"
 assert_rc 0 $? "deploy 0.10.0"
+touch -d '2 hours ago' "$FIX_RELEASES"/0.10.0-* 2>/dev/null   # distinct creation ages
 printf '0.2.0\n' > "$FIX_SRC/VERSION"
 ( SBMON_KEEP_RELEASES=2 "$INSTALL_MONITOR" install --allow-downgrade ) > "$TMP/out-r43c.log" 2>&1
 assert_rc 0 $? "deploy 0.2.0 --allow-downgrade (prune keeps 2 by deployment age)"
@@ -811,6 +813,110 @@ assert_eq "$VER_R43" "$(cat "$FIX_APP_LINK/VERSION")" "current (0.10.0) unchange
 assert_eq '0.10.0' "$(cat "$FIX_APP_LINK/VERSION")" "live release still 0.10.0 after clean fail (R4-3)"
 assert_eq "$HIST_R43" "$(cat "$FIX_RELEASES/releases.history")" "no new history entry after clean fail (R4-3)"
 fi  # end SYMLINKS_OK block (R4-3)
+
+section "R4.1-1 repeated history release id does not distort creation-age prune"
+if [ "$SYMLINKS_OK" = 1 ]; then
+    run_uninstall_quiet
+    printf '1.0.0\n' > "$FIX_SRC/VERSION"
+    run_install "$TMP/out-r411a.log"
+    assert_rc 0 $? "deploy 1.0.0 (A)"
+    printf '1.1.0\n' > "$FIX_SRC/VERSION"
+    run_install "$TMP/out-r411b.log"
+    assert_rc 0 $? "deploy 1.1.0 (B)"
+    printf '1.2.0\n' > "$FIX_SRC/VERSION"
+    run_install "$TMP/out-r411c.log"
+    assert_rc 0 $? "deploy 1.2.0 (C)"
+    touch -d '4 hours ago' "$FIX_RELEASES"/1.0.0-* 2>/dev/null
+    touch -d '3 hours ago' "$FIX_RELEASES"/1.1.0-* 2>/dev/null
+    touch -d '2 hours ago' "$FIX_RELEASES"/1.2.0-* 2>/dev/null
+    A_ID="$(find "$FIX_RELEASES" -maxdepth 1 -type d -name '1.0.0-*' -printf '%f\n' | head -n 1)"
+    ( "$INSTALL_MONITOR" rollback "$A_ID" ) > "$TMP/out-r411d.log" 2>&1
+    assert_rc 0 $? "rollback back to A (1.0.0)"
+    printf '1.3.0\n' > "$FIX_SRC/VERSION"
+    run_install "$TMP/out-r411e.log"
+    assert_rc 0 $? "deploy 1.3.0 (D; total 4 trees > KEEP=3)"
+    # creation-age contract: A is the OLDEST tree even though the latest
+    # history entry references it via rollback -> A is pruned, B/C/D retained.
+    if ls -d "$FIX_RELEASES/1.0.0-"* >/dev/null 2>&1; then
+        fail "A (oldest creation) should have been pruned"
+    else
+        pass "A pruned by creation age despite latest history reference (R4.1-1)"
+    fi
+    ls -d "$FIX_RELEASES/1.1.0-"* >/dev/null 2>&1 && pass "B retained" || fail "B pruned unexpectedly"
+    ls -d "$FIX_RELEASES/1.2.0-"* >/dev/null 2>&1 && pass "C retained" || fail "C pruned unexpectedly"
+    ls -d "$FIX_RELEASES/1.3.0-"* >/dev/null 2>&1 && pass "D retained" || fail "D pruned unexpectedly"
+    assert_grep ' 1\.0\.0 fresh$' "$FIX_RELEASES/releases.history" "A install entry still in history (R4.1-5)"
+    assert_grep ' 1\.0\.0 rollback$' "$FIX_RELEASES/releases.history" "A rollback entry still in history (R4.1-5)"
+    # default rollback must skip the pruned A entry by directory existence
+    OUT_R411F="$TMP/out-r411f.log"
+    if ( "$INSTALL_MONITOR" rollback ) > "$OUT_R411F" 2>&1; then
+        pass "default rollback after A-prune exits 0"
+    else
+        fail "default rollback after A-prune exits 0"
+    fi
+    assert_eq '1.2.0' "$(cat "$FIX_APP_LINK/VERSION")" "default rollback selects C, skipping the pruned A entry (R4.1-1)"
+else
+    printf '  SKIP R4.1-1 原子事务流（此平台无符号链接）\n'
+fi
+
+section "R4.1-2 old failed candidate pruned by real age, not appended as newest"
+if [ "$SYMLINKS_OK" = 1 ]; then
+    run_uninstall_quiet
+    mkdir -p "$FIX_RELEASES/0.0.9-1000010101"   # fake FAILED-candidate tree
+    touch -d '6 hours ago' "$FIX_RELEASES/0.0.9-1000010101"
+    printf '1.0.0\n' > "$FIX_SRC/VERSION"
+    run_install "$TMP/out-r412a.log"
+    assert_rc 0 $? "deploy 1.0.0"
+    touch -d '3 hours ago' "$FIX_RELEASES"/1.0.0-* 2>/dev/null
+    printf '1.1.0\n' > "$FIX_SRC/VERSION"
+    run_install "$TMP/out-r412b.log"
+    assert_rc 0 $? "deploy 1.1.0"
+    touch -d '2 hours ago' "$FIX_RELEASES"/1.1.0-* 2>/dev/null
+    printf '1.2.0\n' > "$FIX_SRC/VERSION"
+    run_install "$TMP/out-r412c.log"
+    assert_rc 0 $? "deploy 1.2.0 (total 4 > KEEP=3; oldest is the failed candidate)"
+    if ls -d "$FIX_RELEASES/0.0.9-"* >/dev/null 2>&1; then
+        fail "old failed candidate retained -- non-history trees treated as newest (R4.1-4)"
+    else
+        pass "old failed candidate pruned by real age (R4.1-4)"
+    fi
+    ls -d "$FIX_RELEASES/1.0.0-"* >/dev/null 2>&1 && pass "1.0.0 retained" || fail "1.0.0 pruned unexpectedly"
+    ls -d "$FIX_RELEASES/1.1.0-"* >/dev/null 2>&1 && pass "1.1.0 retained" || fail "1.1.0 pruned unexpectedly"
+    ls -d "$FIX_RELEASES/1.2.0-"* >/dev/null 2>&1 && pass "1.2.0 retained" || fail "1.2.0 pruned unexpectedly"
+    assert_no_grep ' 0\.0\.9 ' "$FIX_RELEASES/releases.history" "failed candidate never enters history (R4.1-5)"
+else
+    printf '  SKIP R4.1-2 原子事务流（此平台无符号链接）\n'
+fi
+
+section "R4.1-3 live-oldest protection: prune continues past live until count met"
+if [ "$SYMLINKS_OK" = 1 ]; then
+    run_uninstall_quiet
+    printf '1.0.0\n' > "$FIX_SRC/VERSION"
+    ( SBMON_KEEP_RELEASES=2 "$INSTALL_MONITOR" install ) > "$TMP/out-r413a.log" 2>&1
+    assert_rc 0 $? "deploy 1.0.0 (A)"
+    touch -d '4 hours ago' "$FIX_RELEASES"/1.0.0-* 2>/dev/null
+    printf '1.1.0\n' > "$FIX_SRC/VERSION"
+    ( SBMON_KEEP_RELEASES=2 "$INSTALL_MONITOR" install ) > "$TMP/out-r413b.log" 2>&1
+    assert_rc 0 $? "deploy 1.1.0 (B)"
+    touch -d '3 hours ago' "$FIX_RELEASES"/1.1.0-* 2>/dev/null
+    A_ID="$(find "$FIX_RELEASES" -maxdepth 1 -type d -name '1.0.0-*' -printf '%f\n' | head -n 1)"
+    ( "$INSTALL_MONITOR" rollback "$A_ID" ) > "$TMP/out-r413c.log" 2>&1
+    assert_rc 0 $? "rollback to A (live = oldest tree)"
+    printf '1.2.0\n' > "$FIX_SRC/VERSION"
+    ( SBMON_KEEP_RELEASES=2 "$INSTALL_MONITOR" install ) > "$TMP/out-r413d.log" 2>&1
+    assert_rc 0 $? "deploy 1.2.0 (total 3 > KEEP=2, oldest is LIVE)"
+    ls -d "$FIX_RELEASES/1.0.0-"* >/dev/null 2>&1 && pass "live A retained despite being oldest (R4.1-3)" || fail "live A was pruned"
+    if ls -d "$FIX_RELEASES/1.1.0-"* >/dev/null 2>&1; then
+        fail "B retained -- live-skip broke the retention count (R4.1-3)"
+    else
+        pass "B pruned (loop continued past live, R4.1-3)"
+    fi
+    ls -d "$FIX_RELEASES/1.2.0-"* >/dev/null 2>&1 && pass "C retained (newest)" || fail "C pruned unexpectedly"
+    DIRCOUNT=$(find "$FIX_RELEASES" -mindepth 1 -maxdepth 1 -type d ! -name '.staging-*' | wc -l)
+    assert_eq "2" "$DIRCOUNT" "final retained count == KEEP (live-skip did not over-retain, R4.1-3)"
+else
+    printf '  SKIP R4.1-3 原子事务流（此平台无符号链接）\n'
+fi
 
 section "R4-2 uninstall idempotent when already inactive+disabled"
 run_uninstall_quiet

@@ -463,45 +463,44 @@ sbmon_record_history() { # sbmon_record_history <id> <version> <action>
 }
 
 sbmon_prune_releases() {
-    # R4-3: retention order is DEPLOYMENT CHRONOLOGY, never version lexical
-    # order (0.10.0 sorts before 0.9.0 lexicographically). Primary source =
-    # releases.history commit order (F1); release dirs left over from failed
-    # candidates (never committed) are appended oldest-mtime-first. The live
-    # release is always protected. history itself is never rewritten: pruned
-    # releases keep their commit records.
+    # R4.1: retention = ACTUAL RELEASE-DIRECTORY AGE (creation chronology),
+    # fully decoupled from releases.history. History is the audit record and
+    # the rollback-target source ONLY -- it must not also rank physical
+    # trees: first-seen order misrepresents rolled-back releases (A install,
+    # B, C, A rollback, D => A is the OLDEST tree, not a recent one) and
+    # failed-candidate trees (never committed) would otherwise sort last.
+    # A directory's mtime is the single age fact shared by successful
+    # releases and failed candidates. Rollback activation does NOT mutate
+    # release-tree age (immutable artifact -- rollback only flips the
+    # symlink, it never re-creates the tree).
+    #
+    # Live protection (R4.1-3): the live release is never pruned regardless
+    # of age; the loop keeps searching for the next-oldest eligible victim
+    # until the retention count is met or only the live release remains (a
+    # naive "skip live in the first N" would retain KEEP+1 trees).
+    #
+    # history is never rewritten here: pruned releases keep their commit
+    # records; default rollback skips history entries whose directory is gone.
     local live
     live="$(sbmon_current_release_id)"
     local -a ordered=()
-    local seen=" "
-    local id d
-    if [ -r "$SBMON_HISTORY_FILE" ]; then
-        while read -r _ id _; do
-            [ -n "$id" ] || continue
-            case "$seen" in *" $id "*) continue ;; esac
-            [ -d "$SBMON_RELEASES_DIR/$id" ] || continue   # pruned earlier: history entry stays
-            seen="$seen$id "
-            ordered+=("$id")
-        done < "$SBMON_HISTORY_FILE"
-    fi
-    # Non-history dirs (failed-candidate leftovers): oldest mtime first.
+    local d
+    # -type d excludes .switch-tmp (a symlink) and releases.history (a file);
+    # .staging-* intermediates are not retention candidates.
     while IFS= read -r d; do
         [ -n "$d" ] || continue
-        id="$d"
-        case "$seen" in *" $id "*) continue ;; esac
-        [ -d "$SBMON_RELEASES_DIR/$id" ] || continue
-        seen="$seen$id "
-        ordered+=("$id")
+        case "$d" in .staging-*) continue ;; esac
+        ordered+=("$d")
     done < <(find "$SBMON_RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %f\n' 2>/dev/null | sort -n | cut -d' ' -f2-)
     local total="${#ordered[@]}"
     local keep="$SBMON_KEEP_RELEASES"
-    (( total > keep )) || return 0
-    local i victim
-    for (( i = 0; i < total - keep; i++ )); do
-        id="${ordered[$i]}"
+    local i id
+    for (( i = 0; i < total && total > keep; i++ )); do
+        id="${ordered[$i]}"   # oldest -> newest
         [ "$id" = "$live" ] && continue
         sbmon_info "清理旧 release: $id"
-        victim="$SBMON_RELEASES_DIR/$id"
-        rm -rf -- "${victim:?}"   # :? guard: never expand empty -> /
+        rm -rf -- "${SBMON_RELEASES_DIR:?}/$id"   # :? guard: never expand empty -> /
+        total=$(( total - 1 ))
     done
 }
 
