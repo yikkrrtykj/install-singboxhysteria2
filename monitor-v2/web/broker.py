@@ -38,6 +38,8 @@ from __future__ import annotations
 
 import datetime
 import json
+import os
+import tempfile
 import threading
 import time
 
@@ -46,6 +48,16 @@ import time
 CONSUME_SLICE_SECONDS = 300.0
 
 SUBSCRIBER_IDLE_WAIT = 15.0
+
+# Packaging health-export contract (integration Round 1): a MINIMAL record
+# with EXACTLY these keys -- never any client/runtime payload (devices,
+# connections, user, source, destination, errors, credentials). The external
+# probe reads only these facts.
+HEALTH_FILE_SCHEMA_VERSION = 1
+HEALTH_FILE_KEYS = frozenset({
+    "schema_version", "snapshot_version", "published_at",
+    "collector_stale", "consumer_alive",
+})
 
 
 def _iso(timestamp):
@@ -75,12 +87,15 @@ class SnapshotBroker:
     """Owns the collector thread and the latest published snapshot."""
 
     def __init__(self, collector, poll_seconds=1.0, clock=time.time,
-                 health_threshold=None):
+                 health_threshold=None, health_file=None):
         self._collector = collector
         self._poll = poll_seconds
         self._clock = clock
         self._health_threshold = health_threshold if health_threshold is not None \
             else max(5.0, poll_seconds * 5.0)
+        # Packaging health export (optional; standalone E2 passes None and
+        # behaves exactly as before this parameter existed).
+        self._health_file = health_file
         self._lock = threading.Lock()       # tracker access
         self._cond = threading.Condition()  # snapshot publication
         self._version = 0
@@ -126,8 +141,51 @@ class SnapshotBroker:
                 self._published = snapshot
                 self._published_at = published_at
                 self._version += 1
+                version = self._version
                 self._cond.notify_all()
+            self._export_health_file(snapshot, version)
             self._stop.wait(self._poll)
+
+    def _export_health_file(self, snapshot, version):
+        """Atomically export the MINIMAL packaging health record.
+
+        Auxiliary by contract: a failed export NEVER kills the serving
+        dashboard (the external probe observes the file going missing or
+        stale) and never leaves a partial JSON file (same-directory temp +
+        fsync + os.replace; a failed replace keeps the previous complete
+        file). The payload is the fixed whitelist -- no client/runtime
+        metadata -- and is never logged.
+        """
+        if not self._health_file:
+            return
+        payload = {
+            "schema_version": HEALTH_FILE_SCHEMA_VERSION,
+            "snapshot_version": int(version),
+            "published_at": _iso(self._clock()),
+            "collector_stale": bool(snapshot.get("stale")),
+            "consumer_alive": self._consumer_alive(),
+        }
+        try:
+            directory = os.path.dirname(self._health_file) or "."
+            fd, tmp = tempfile.mkstemp(dir=directory, prefix=".health-",
+                                       suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump(payload, handle, sort_keys=True)
+                    handle.write("\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.chmod(tmp, 0o600)
+                os.replace(tmp, self._health_file)
+                tmp = None
+            finally:
+                if tmp is not None:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+        except OSError:
+            return
 
     def _decorate(self, snapshot):
         """Add web-level fields WITHOUT touching any E1 traffic field.

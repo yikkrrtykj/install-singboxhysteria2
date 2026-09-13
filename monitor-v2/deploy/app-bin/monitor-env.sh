@@ -22,6 +22,7 @@ monitor_env_load() { # monitor_env_load <conf-file>
             SBMON_API_SECRET_FILE) SBMON_ENV_API_SECRET_FILE="$value" ;;
             SBMON_MODE) SBMON_ENV_MODE="$value" ;;
             SBMON_CYCLE_SECONDS) SBMON_ENV_CYCLE_SECONDS="$value" ;;
+            SBMON_WEB_POLL_SECONDS) SBMON_ENV_WEB_POLL_SECONDS="$value" ;;
         esac
     done < "$conf"
 }
@@ -85,6 +86,55 @@ PY
     REPLY_HOST="${out%% *}"
     REPLY_PORT="${out##* }"
     [ -n "$REPLY_HOST" ] && [ -n "$REPLY_PORT" ]
+}
+
+# R1: production WEB BIND contract, validated via the Python runtime
+# (ipaddress) -- the shell never hand-splits host:port (IPv6 brackets and
+# "::1:9191"-style ambiguity are unparseable in Bash).
+#   accepted   127.0.0.1:9191 | localhost:9191 | [::1]:9191 | [::1]:port
+#   rejected   0.0.0.0, private LAN / public addresses, malformed or
+#              overflowing port, userinfo, path/query/fragment, wildcard
+# On success prints "<host> <port>" (host normalized: brackets stripped).
+monitor_env_split_web_bind() { # monitor_env_split_web_bind <bind> -> "host port"
+    local pybin="${SBMON_PYTHON3:-python3}"
+    command -v "$pybin" >/dev/null 2>&1 || return 1
+    local out
+    out="$("$pybin" - "$1" <<'PY'
+import ipaddress, sys
+raw = sys.argv[1]
+try:
+    if any(ch in raw for ch in "/?#@") or any(ch.isspace() for ch in raw):
+        raise ValueError("userinfo/path/query/fragment/space")
+    if raw.startswith("["):
+        inner, sep, rest = raw[1:].partition("]")
+        if not sep or not rest.startswith(":"):
+            raise ValueError("bracketed IPv6 without :port")
+        host, port_s = inner, rest[1:]
+    else:
+        host, sep, port_s = raw.rpartition(":")
+        if not sep or not host:
+            raise ValueError("missing host or :port")
+    if not port_s.isdigit():
+        raise ValueError("port must be decimal digits")
+    port = int(port_s)
+    if not 0 < port < 65536:
+        raise ValueError("port out of range")
+    if host != "localhost":
+        addr = ipaddress.ip_address(host)  # rejects hostnames/brackets
+        if addr.is_unspecified or not addr.is_loopback:
+            raise ValueError("not loopback")
+except ValueError:
+    sys.exit(1)
+print(host, port)
+PY
+)" || return 1
+    REPLY_BIND_HOST="${out%% *}"
+    REPLY_BIND_PORT="${out##* }"
+    [ -n "$REPLY_BIND_HOST" ] && [ -n "$REPLY_BIND_PORT" ]
+}
+
+monitor_env_validate_web_bind() { # rc 0 = valid loopback bind
+    monitor_env_split_web_bind "$1" >/dev/null
 }
 
 # TCP connect probe (no curl dependency, no output).

@@ -113,6 +113,12 @@ def build_arg_parser():
                        help="TLS private key (required for remote listen)")
     serve.add_argument("--poll", type=float, default=1.0,
                        help="dashboard snapshot cadence in seconds")
+    serve.add_argument("--health-file", default=None,
+                       help="OPTIONAL packaging health export: a minimal "
+                            "key-whitelisted JSON record written atomically "
+                            "per publication tick (no client/runtime "
+                            "payload). Standalone E2 omits it and behaves "
+                            "exactly as without this flag.")
     serve.add_argument("--session-ttl", type=float, default=8 * 3600.0,
                        help="admin session lifetime in seconds")
     return parser
@@ -248,7 +254,8 @@ def cmd_serve(args):
     collector = Collector(url=args.url, interval=args.interval,
                           secret=resolve_secret(args.secret_file),
                           closed_ttl=args.closed_ttl)
-    broker = SnapshotBroker(collector, poll_seconds=args.poll)
+    broker = SnapshotBroker(collector, poll_seconds=args.poll,
+                            health_file=args.health_file)
     broker.start()
 
     auth = AuthStore(data_dir, session_ttl=args.session_ttl)

@@ -266,10 +266,19 @@ sbmon_create_layout() {
     # App side: root-owned, service user only reads.
     mkdir -p "$SBMON_RELEASES_DIR"
     chmod 0755 "$SBMON_RELEASES_DIR"
-    # State side: service-user-owned, no group/other access.
-    mkdir -p "$SBMON_STATE_ROOT/state" "$SBMON_STATE_ROOT/auth" "$SBMON_STATE_ROOT/access"
-    sbmon_chown "$SBMON_STATE_ROOT" 0750
-    chmod 0700 "$SBMON_STATE_ROOT/state" "$SBMON_STATE_ROOT/auth" "$SBMON_STATE_ROOT/access"
+    # State side (R1): /var/lib/singbox-monitor is the E2 DATA ROOT, owned by
+    # the service user and private (0700). auth.json / access.json live flat
+    # in the data root (E2 contract); state/ holds runtime files (health
+    # export, collector-loop snapshot). Fresh installs create ONLY state/ --
+    # the legacy auth/ and access/ DIRECTORIES are no longer created; if an
+    # old install has them they are preserved untouched (never deleted,
+    # never repurposed). Only the root and state/ dir metadata converge;
+    # legacy directory contents are never chown'ed/chmod'ed en masse.
+    mkdir -p "$SBMON_STATE_ROOT/state"
+    if [ "$SBMON_FIXTURE" != "1" ]; then
+        chown "$SBMON_USER:$SBMON_GROUP" "$SBMON_STATE_ROOT" "$SBMON_STATE_ROOT/state"
+    fi
+    chmod 0700 "$SBMON_STATE_ROOT" "$SBMON_STATE_ROOT/state"
     # Config side: root-owned, group-readable (service user reads, never writes).
     mkdir -p "$SBMON_CONF_DIR"
     chmod 0755 "$SBMON_CONF_DIR"
@@ -322,11 +331,16 @@ SBMON_API_URL=$SBMON_API_URL_DEFAULT
 # this line out AND remove the derived file to run without API auth.
 SBMON_API_SECRET_FILE=$SBMON_CONF_DIR/api.secret
 
-# Runtime mode: collector-loop (E1-only snapshot engine; honest skeleton).
-# E2 integration switches this to "web" once app/serve entry exists.
-SBMON_MODE=collector-loop
+# Runtime mode (R1): the INTEGRATED default is "web" -- one E1 Collector,
+# one SnapshotBroker, one loopback dashboard, one health export. The
+# collector-loop skeleton stays available as an explicit compatibility mode.
+SBMON_MODE=web
 
-# Collector stream window per snapshot cycle (seconds).
+# Web dashboard snapshot cadence (seconds). Drives the SnapshotBroker poll
+# and the health-record freshness window.
+SBMON_WEB_POLL_SECONDS=1
+
+# Collector-loop compatibility: stream window per snapshot cycle (seconds).
 SBMON_CYCLE_SECONDS=300
 EOF
 }
@@ -410,15 +424,23 @@ sbmon_stage_release() { # sbmon_stage_release <version> -> prints release id on 
 
     sbmon_info "staging release: $id" >&2
     rm -rf -- "$staged"
-    mkdir -p "$staged/app" "$staged/bin" "$staged/lib"
+    mkdir -p "$staged/app/monitor-v2" "$staged/bin" "$staged/lib"
 
-    # Code: E1 collector + api_bridge (the only components that exist today).
+    # R1: ONE coherent server runtime tree -- app/monitor-v2/ holds the E1
+    # collector (with api_bridge) AND the E2 web runtime (webapp.py + web/).
+    # There is exactly ONE collector.py in the release; no second, separate
+    # collector runtime tree exists. monitor-v2/mihomo (E4) is deliberately
+    # NOT staged: it stays a repo-only/optional client component.
     [ -f "$SBMON_REPO_MONITOR_DIR/collector.py" ] || sbmon_die "缺少 collector.py: $SBMON_REPO_MONITOR_DIR"
     [ -d "$SBMON_REPO_MONITOR_DIR/api_bridge" ] || sbmon_die "缺少 api_bridge/: $SBMON_REPO_MONITOR_DIR"
-    mkdir -p "$staged/app/collector"
-    cp -- "$SBMON_REPO_MONITOR_DIR/collector.py" "$staged/app/collector/"
-    cp -R -- "$SBMON_REPO_MONITOR_DIR/api_bridge" "$staged/app/collector/api_bridge"
-    rm -rf -- "$staged/app/collector/api_bridge/__pycache__"
+    [ -f "$SBMON_REPO_MONITOR_DIR/webapp.py" ] || sbmon_die "缺少 webapp.py: $SBMON_REPO_MONITOR_DIR"
+    [ -d "$SBMON_REPO_MONITOR_DIR/web" ] || sbmon_die "缺少 web/: $SBMON_REPO_MONITOR_DIR"
+    cp -- "$SBMON_REPO_MONITOR_DIR/collector.py" "$staged/app/monitor-v2/"
+    cp -- "$SBMON_REPO_MONITOR_DIR/webapp.py" "$staged/app/monitor-v2/"
+    cp -R -- "$SBMON_REPO_MONITOR_DIR/api_bridge" "$staged/app/monitor-v2/api_bridge"
+    rm -rf -- "$staged/app/monitor-v2/api_bridge/__pycache__"
+    cp -R -- "$SBMON_REPO_MONITOR_DIR/web" "$staged/app/monitor-v2/web"
+    rm -rf -- "$staged/app/monitor-v2/web/__pycache__"
 
     # Shims + shared env lib from deploy templates.
     cp -- "$DEPLOY_DIR/app-bin/monitor-service" "$staged/bin/monitor-service"
@@ -427,10 +449,15 @@ sbmon_stage_release() { # sbmon_stage_release <version> -> prints release id on 
 
     printf '%s\n' "$version" > "$staged/VERSION"
 
-    # Validate BEFORE it can become live: python syntax + shell syntax.
+    # Validate BEFORE it can become live: python syntax for the WHOLE staged
+    # runtime (collector, api_bridge, webapp, web/*.py) + shell syntax for
+    # the shims. JS syntax is a CI/development gate -- Node.js is never a
+    # production installer dependency.
     "$SBMON_PYTHON3" -m py_compile \
-        "$staged/app/collector/collector.py" \
-        "$staged/app/collector/api_bridge/"*.py >/dev/null 2>&1 \
+        "$staged/app/monitor-v2/collector.py" \
+        "$staged/app/monitor-v2/webapp.py" \
+        "$staged/app/monitor-v2/api_bridge/"*.py \
+        "$staged/app/monitor-v2/web/"*.py >/dev/null 2>&1 \
         || { rm -rf -- "$staged"; sbmon_die "staged python 代码校验失败，放弃发布"; }
     bash -n "$staged/bin/monitor-service" "$staged/bin/monitor-health" "$staged/lib/monitor-env.sh" \
         || { rm -rf -- "$staged"; sbmon_die "staged shell 脚本校验失败，放弃发布"; }
@@ -570,9 +597,9 @@ sbmon_health_json() {
     local probe
     probe="$(sbmon_health_cmd)"
     [ -x "$probe" ] || { printf '{"error":"probe missing"}'; return 1; }
-    # P1: the state root is an explicit contract -- the probe must never
+    # P1: the data root is an explicit contract -- the probe must never
     # infer it from the caller's working directory.
-    "$probe" "$(sbmon_conf_file)" "$SBMON_STATE_ROOT/state" 2>/dev/null || true   # degraded(2)/unhealthy(1) still print JSON
+    "$probe" "$(sbmon_conf_file)" "$SBMON_STATE_ROOT" 2>/dev/null || true   # degraded(2)/unhealthy(1) still print JSON
 }
 
 sbmon_service_active() {

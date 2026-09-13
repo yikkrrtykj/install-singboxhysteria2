@@ -10,9 +10,9 @@ Wants=network-online.target
 Type=simple
 User=@SBMON_USER@
 Group=@SBMON_GROUP@
-# P1: the state root is passed explicitly to the entrypoint; WorkingDirectory
+# P1: the data root is passed explicitly to the entrypoint; WorkingDirectory
 # is a convenience only, never the source of truth for the state path.
-ExecStart=@SBMON_APP_DIR@/bin/monitor-service @SBMON_CONF@ @SBMON_STATE_ROOT@/state
+ExecStart=@SBMON_APP_DIR@/bin/monitor-service @SBMON_CONF@ @SBMON_STATE_ROOT@
 WorkingDirectory=@SBMON_STATE_ROOT@
 # P8: private-by-default runtime files (snapshots, temp copies).
 UMask=0077

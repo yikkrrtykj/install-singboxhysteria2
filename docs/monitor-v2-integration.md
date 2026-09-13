@@ -1,8 +1,10 @@
 # Monitor v2 Integration — Round 0 Record
 
-Status: **DRAFT — awaiting Round 0.1 review.** This document records verified
-code facts of the integration tree only. No runtime wiring, no VPS run, no
-production change happened in Round 0 / Round 0.1.
+Status: **DRAFT — Round 1 runtime wiring implemented, awaiting review.**
+This document records verified code facts of the integration tree. Round 0 /
+0.1 assembled the four frozen tracks and closed Linux CI; Round 1 wired the
+reviewed E2 web runtime into the reviewed Packaging runtime (I0-2/I0-3/I0-4
+and the secret runtime contract). No VPS run, no production change, no E3.
 
 ## Inputs (verified before any merge)
 
@@ -140,62 +142,103 @@ ExecStart / monitor-service passes:
 E2 webapp.py serve
 ```
 
-### I0-2 — E2 entrypoint vs Packaging placeholder  ⚠ ROUND 1
+### I0-2 — E2 entrypoint vs Packaging placeholder  ✅ RESOLVED (R1-1/R1-3)
 
-Packaging's `monitor-service` (line 122-129) execs `$APP_DIR/app/web/serve`
-when present, else exits 21 with "no app/web/serve entry deployed (E2
-pending)". The real E2 entrypoint is `monitor-v2/webapp.py serve`
-(subcommands `setup` / `serve`; `serve` runs ONE E1 `Collector` →
-`SnapshotBroker` → HTTP/SSE, `webapp.py:248`).
-
-Round 1 MUST wire `monitor-service`'s web mode to the real entrypoint
-(`exec python3 webapp.py serve ...`). No fake `app/web/serve` server logic
-may be created; a release-tree wrapper that only execs the real webapp is
-acceptable. Round 0 deliberately leaves `web` fail-closed (exit 21).
-
-### I0-3 — E2 persistence layout vs Packaging layout  ⚠ ROUND 1
-
-Verified mismatch:
-
-- E2: `<data-dir>/auth.json`, `<data-dir>/access.json`
-  (`webapp.py:11`, `auth.py:194`, `access.py:74`), default data-dir
-  `/var/lib/singbox-monitor` (`webapp.py:42`), and
-  `ensure_private_dir(data_dir)` tightens the data-dir itself to 0700
-  (`storage.py:16`).
-- Packaging: `mkdir -p $SBMON_STATE_ROOT/{state,auth,access}`
-  (`monitor-deploy-lib.sh:270`).
-
-Round 1 must pick ONE truth. Recommendation (migration-safe convergence):
-adopt E2's flat model —
+The fake `app/web/serve` hook is **gone**. `monitor-service`'s `web` mode now
+execs the real, already-reviewed entrypoint inside the immutable release:
 
 ```
-/var/lib/singbox-monitor/   sboxweb:sboxweb 0700
-  auth.json                 0600
-  access.json               0600
+exec env -u BOX_API_SECRET python3 <release>/app/monitor-v2/webapp.py serve \
+    --listen <validated loopback host>  --port <validated port>  \
+    --url "$SBMON_API_URL"  --secret-file "$SBMON_API_SECRET_FILE"  \
+    --data-dir "$DATA_ROOT"  --health-file "$DATA_ROOT/state/health.json"  \
+    --poll "$SBMON_WEB_POLL_SECONDS"
+```
+
+There is exactly ONE `Collector`, ONE `SnapshotBroker` and ONE service.api
+stream consumer in the runtime. No second collector exists for health or
+packaging. The staged release layout (R1-1) is one coherent tree:
+
+```
+app/monitor-v2/{collector.py, webapp.py, api_bridge/, web/{*.py, static/*}}
+bin/{monitor-service, monitor-health}
+lib/monitor-env.sh
+```
+
+`collector.py` exists exactly once (no duplicate independently-maintained
+runtime tree); `collector-loop` compatibility mode points at the same file.
+Staged Python validation now compiles `collector.py`, `api_bridge/*.py`,
+`webapp.py` and `web/*.py`. Node.js is never a production installer
+dependency (JS syntax stays a CI/development gate). `monitor-v2/mihomo` (E4)
+is NOT staged.
+
+### I0-3 — E2 persistence layout vs Packaging layout  ✅ RESOLVED (R1-2)
+
+E2's model is now the single truth:
+
+```
+/var/lib/singbox-monitor/   sboxweb:sboxweb 0700   (E2 DATA ROOT)
+  auth.json                 0600   admin hash + recovery hash
+  access.json               0600   IP/CIDR whitelist
   state/                    0700
+    health.json                    broker health export (minimal, R1-6)
+    snapshot.json                  collector-loop compatibility only
 ```
 
-Packaging stops creating new `auth/` / `access/` dirs; existing empty dirs on
-old installs are left in place (not a destructive cleanup). Round 0: record
-only, no code change.
+Fresh installs create the data root and `state/` only — the legacy `auth/`
+and `access/` **directories are no longer created**. Migration safety: a
+pre-existing `auth/` or `access/` directory is preserved untouched (its
+contents are never deleted, chown'ed, chmod'ed or repurposed), and
+`auth.json` / `access.json` are never overwritten by
+install/upgrade/repair/rollback (asserted byte-identical in the suite).
 
-### I0-4 — Web health vs snapshot-file health  ⚠ ROUND 1
+The deployed shim contract changed from `monitor-service <conf> <state-dir>`
+to `monitor-service <conf> <data-root>`, and the systemd unit now passes
+`/var/lib/singbox-monitor` explicitly (`ExecStart=... monitor-service <conf>
+@SBMON_STATE_ROOT@`). `monitor-health` takes the same `<conf> <data-root>`
+contract. No cwd/path inference anywhere.
 
-- Packaging `monitor-health` reports `service_active` / `api` /
-  `snapshot` (file age + staleness) from the collector-loop's
-  `state/snapshot.json`; README documents `web_http` as
-  `not-applicable` in collector-loop mode.
-- E2 keeps everything in memory: one `Collector` thread →
-  `SnapshotBroker` publishes a decorated snapshot per poll tick;
-  **no snapshot file** (`broker.py:75-132`).
+### I0-4 — Web health vs snapshot-file health  ✅ RESOLVED via option (A) (R1-6/R1-7)
 
-Round 1 must keep exactly ONE collector and bridge health via either
-(A) a minimal private health state file written by the E2 broker, or
-(B) a dedicated loopback internal health surface. Choice pending a fresh
-review of broker/server code at wiring time. Forbidden: a second E1
-collector for health; feeding authenticated `/api/v1/snapshot` from a
-systemd probe with a stored admin session/token. The health path must not
-depend on browser admin credentials.
+Chosen: **(A) a minimal private health state file written by the E2 broker.**
+No second collector, no loopback-only internal surface, no stored admin
+credential anywhere in the health path.
+
+`SnapshotBroker` gained an OPTIONAL `health_file` parameter (default `None`;
+standalone E2 without `--health-file` behaves exactly as before). On every
+successful publisher tick it atomically rewrites a minimal record with
+EXACTLY these keys:
+
+```json
+{"schema_version": 1, "snapshot_version": <int>,
+ "published_at": "<UTC ISO>", "collector_stale": <bool>,
+ "consumer_alive": <bool>}
+```
+
+Implementation contract: same-directory temp file + `fsync` +
+`os.replace` (mode 0600); a failed write never leaves a partial JSON file
+and **never kills the serving dashboard** (the external probe then observes
+the file going missing/stale). The record carries no client/runtime payload
+(no devices, connections, user, source, destination, `last_error`,
+credentials or bearer material) and is never logged. This is asserted in the
+E2 suite including a forced-failure case.
+
+`monitor-health` in web mode reads ONLY this file (never `auth.json` /
+`access.json`) and adds an **unauthenticated loopback** liveness probe:
+
+```
+GET /api/v1/session      (no password, no cookie, no CSRF token,
+                          no recovery key, no service.api bearer)
+```
+
+Any answer below 500 proves the dashboard is alive (a closed dashboard
+answers 401/403). Signals reported: `service_active`, `api_url_valid`,
+`api_reachable`, `broker_health{present,wellformed,age_seconds,age_stale,
+collector_stale,consumer_alive,stale}`, `web_http`, `mode`, `overall`.
+Exit: 0 healthy / 1 unhealthy (service inactive) / 2 degraded (bad API URL,
+API unreachable, health missing/malformed/too old, `collector_stale`,
+`consumer_alive=false`, or web endpoint unavailable). `collector-loop`
+mode retains the original `snapshot` behavior unchanged.
 
 ### I0-5 — Web exposure boundary
 
@@ -206,8 +249,9 @@ mutation, no reverse proxy. Future canary via SSH tunnel / local curl only.
 
 ### I0-6 — E4 placement
 
-Fact: `sbmon_stage_release` (`monitor-deploy-lib.sh:408-431`) stages ONLY
-`collector.py` + `api_bridge/` (plus deploy shims). E4's
+Fact: `sbmon_stage_release` now stages the E1 collector **and** the E2 web
+runtime (`app/monitor-v2/{collector.py, webapp.py, api_bridge/, web/}`,
+asserted by the packaging suite) — but it still copies no E4 code. E4's
 `monitor-v2/mihomo/` is repo-only / optional client component; it is NOT in
 the server release, and must NOT be mechanically added in Round 1. E4 is
 client-side, optional, loopback-only, read-only enrichment; it is not server
@@ -252,12 +296,65 @@ Round 0 changes nothing here; status is BLOCKER BEFORE E3 ENABLEMENT.
 | No credential rotation | PASS — Reality UUID / HY2 password / Reality private key / ports / cert paths untouched: `install.sh` byte-identical to S0 head; no other track touches them |
 | No new database | PASS (E2 persistence is auth.json/access.json only) |
 
-## Round 0 non-goals (status)
+## Round 1 — runtime wiring (implemented)
 
-- VPS canary: **NOT RUN** — Round 1 must first resolve I0-2/I0-3/I0-4 and the
-  final systemd `ExecStart`; a VPS run before that has no value.
-- Production: **UNCHANGED**. Public 9191: **CLOSED**.
+Contracts closed: **I0-2** (real `webapp.py serve` entrypoint, no fake
+`app/web/serve`), **I0-3** (E2 flat persistence model is the single truth;
+data-root/`state/` only on fresh installs, legacy dirs preserved), **I0-4**
+(one collector + minimal broker health export + unauthenticated loopback
+liveness probe), and the **secret runtime contract** below.
+
+### R1-5 secret contract (production)
+
+`resolve_secret()` (`monitor-v2/collector.py:698`) is deliberately
+**unchanged**: `BOX_API_SECRET` → `--secret-file` → `""`, no fatal. That is
+the standalone E1/E2 API contract. Packaging owns the fail-closed
+deployment gate instead:
+
+- web mode REQUIRES `SBMON_API_SECRET_FILE` configured, and the file must be
+  **present, a regular file (symlink rejected), readable and non-empty**;
+- before exec, `BOX_API_SECRET` is **unset** (`exec env -u BOX_API_SECRET`)
+  so the environment can never override or rescue the file contract;
+- the secret value never enters argv, the environment, the unit file, stdout
+  /stderr or the journal — only the secret **file path** is passed:
+
+```
+config service.api.secret
+  -> /root/sbox/monitor-api.secret    root:root 0600
+  -> /etc/singbox-monitor/api.secret  root:sboxweb 0640
+  -> Packaging preflight (regular, readable, non-empty)
+  -> ExecStart / monitor-service:  --secret-file /etc/singbox-monitor/api.secret
+  -> E2 webapp.py serve
+```
+
+`ProtectHome` is not weakened and E2 never reads `/root/sbox`.
+
+### R1-4 bind contract
+
+`monitor-env.sh` validates the web bind with Python `ipaddress` (never Bash
+colon-splitting). Accepted: `127.0.0.1:9191`, `localhost:9191`, `[::1]:9191`.
+Rejected: `0.0.0.0`, private LAN and public addresses, malformed/overflowing
+ports, userinfo, path/query/fragment, wildcard (`::`) and missing host/port.
+Packaging does not use E2 remote/TLS mode.
+
+### R1-8 web-setup
+
+`install-monitor.sh web-setup` runs the reviewed `webapp.py setup
+--data-dir /var/lib/singbox-monitor` **as the service identity** (under the
+deployment lock, only `SSH_CONNECTION` forwarded), so `auth.json` /
+`access.json` are never root-owned. It never auto-adds a whitelist entry,
+never accepts/generates a plaintext password non-interactively, never logs
+the password or recovery key, and if the service was active it restarts
+**only** `singbox-monitor` afterwards (never sing-box). It is never run
+automatically by unattended install.
+
+### Round 1 non-goals (status)
+
+- VPS canary: **NOT RUN**.
+- Production: **UNCHANGED**. Public 9191: **CLOSED**. TLS: not used by
+  Packaging. Reverse proxy / firewall: untouched.
 - E3: design only (`beb915a9`), not merged, not implemented.
-- Round 1 blockers: I0-2 entrypoint wiring, I0-3 persistence convergence,
-  I0-4 health bridge (one-collector rule), final `ExecStart`; I0-7 stays a
-  hard blocker in front of E3 enablement.
+- E4: still repo-only (not staged, not deployed); unchanged boundary.
+- **I0-7 remains a hard PRE-E3 BLOCKER** (legacy `modify_singbox` /
+  `process_doko` / `process_dokoko` / `process_ssko` still bypass
+  `/root/sbox/config.lock`). Not addressed in Round 1 by design.

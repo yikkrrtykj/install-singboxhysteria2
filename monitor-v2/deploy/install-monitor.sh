@@ -36,6 +36,9 @@ commands:
   install [--repair] [--allow-downgrade] [--no-start]   收敛到仓库 VERSION（幂等）
   upgrade                                               等价 install（未安装则拒绝）
   rollback [release-id]                                 回滚 release（只重启 monitor）
+  web-setup                                             以 sboxweb 身份运行已评审的
+                                                        webapp.py setup（交互式；
+                                                        白名单/口令/恢复键）
   history                                               release 历史
   health                                                输出分离式健康 JSON
   status                                                版本 + 目录 + 服务状态
@@ -463,13 +466,97 @@ cmd_history() {
     fi
 }
 
+# ---------------------------------------------------------------------------
+# R1-8: web-setup -- run the already-reviewed E2 `webapp.py setup` AS THE
+# SERVICE IDENTITY so auth.json / access.json are never root-owned.
+#   * under the deployment lock (F4);
+#   * the ONLY env value forwarded is SSH_CONNECTION (the E2 setup uses it
+#     to OFFER the current SSH source /32|/128 -- it never auto-adds one
+#     without the interactive confirmation);
+#   * fully interactive: the password prompt and the one-time recovery-key
+#     display stay on the terminal; no plaintext password is accepted or
+#     echoed non-interactively; neither password nor recovery key is ever
+#     written to the journal (this shim adds no logging of them);
+#   * on success, ownership/metadata of the data root and the flat
+#     auth.json / access.json converge to the service user;
+#   * if the monitor service WAS active, restart ONLY singbox-monitor so a
+#     process started with auth=None reloads the fresh AuthStore;
+#     sing-box is never touched;
+#   * never run automatically as part of unattended install.
+# ---------------------------------------------------------------------------
+cmd_web_setup() {
+    sbmon_with_deploy_lock _cmd_web_setup_locked
+}
+
+_cmd_web_setup_locked() {
+    local release_id webapp
+    release_id="$(sbmon_current_release_id)"
+    [ -n "$release_id" ] || sbmon_die "web-setup: 当前没有已激活的 release（先 install）"
+    webapp="$SBMON_RELEASES_DIR/$release_id/app/monitor-v2/webapp.py"
+    [ -f "$webapp" ] || sbmon_die "web-setup: 当前 release 缺少 webapp.py（release 布局异常）：fail-closed"
+
+    local ssh_conn="${SSH_CONNECTION:-}"
+    local was_active=0
+    if sbmon_service_active; then was_active=1; fi
+
+    local rc=0
+    if [ "$SBMON_FIXTURE" = "1" ]; then
+        # Fixture/non-root test runs execute directly (same reviewed code).
+        SSH_CONNECTION="$ssh_conn" "$SBMON_PYTHON3" "$webapp" setup \
+            --data-dir "$SBMON_STATE_ROOT" || rc=$?
+    else
+        command -v "${SBMON_SUDO:-sudo}" >/dev/null 2>&1 \
+            || sbmon_die "web-setup: 缺少 sudo，无法以 $SBMON_USER 运行 setup：fail-closed"
+        # -n: non-interactive sudo (fail instead of prompting for a root
+        # password mid-setup). Only SSH_CONNECTION is forwarded.
+        "$SBMON_SUDO" -n -u "$SBMON_USER" -- env \
+            SSH_CONNECTION="$ssh_conn" "$SBMON_PYTHON3" "$webapp" setup \
+            --data-dir "$SBMON_STATE_ROOT" || rc=$?
+    fi
+    if [ "$rc" != 0 ]; then
+        sbmon_warn "web setup 失败（rc=$rc）；既有 auth/access 数据保持不变"
+        return "$rc"
+    fi
+
+    # Metadata convergence (root pass only): the data root and the flat
+    # access files must be service-user-owned and private. Legacy auth/ and
+    # access/ DIRECTORIES (old installs) are never touched here.
+    if [ "$SBMON_FIXTURE" != "1" ]; then
+        chown "$SBMON_USER:$SBMON_GROUP" "$SBMON_STATE_ROOT"
+        chmod 0700 "$SBMON_STATE_ROOT"
+        local f
+        for f in auth.json access.json; do
+            if [ -f "$SBMON_STATE_ROOT/$f" ] && [ ! -L "$SBMON_STATE_ROOT/$f" ]; then
+                chown "$SBMON_USER:$SBMON_GROUP" "$SBMON_STATE_ROOT/$f"
+                chmod 0600 "$SBMON_STATE_ROOT/$f"
+            fi
+        done
+    fi
+    sbmon_info "web setup 完成（auth.json / access.json 位于 $SBMON_STATE_ROOT，属主 $SBMON_USER）"
+
+    if [ "$was_active" = 1 ]; then
+        sbmon_info "重启 singbox-monitor 以加载新创建的 AuthStore（仅 Monitor，不触碰 sing-box）"
+        if ! sbmon_service_restart; then
+            sbmon_warn "web setup 后服务重启失败"
+            return 1
+        fi
+        if ! sbmon_wait_service_active; then
+            sbmon_warn "web setup 后服务未恢复 active"
+            return 1
+        fi
+    else
+        sbmon_info "服务此前未运行：不启动（web-setup 不改变服务状态）"
+    fi
+    return 0
+}
+
 cmd_health() {
     local probe
     probe="$(sbmon_health_cmd)"
     [ -x "$probe" ] || sbmon_die "health probe 不存在（未安装？）: $probe"
-    # P1: explicit conf + state-root contract; the probe never infers the
+    # P1: explicit conf + data-root contract; the probe never infers the
     # state path from the caller's working directory.
-    exec "$probe" "$(sbmon_conf_file)" "$SBMON_STATE_ROOT/state" "$@"
+    exec "$probe" "$(sbmon_conf_file)" "$SBMON_STATE_ROOT" "$@"
 }
 
 cmd_status() {
@@ -563,6 +650,7 @@ main() {
         install)   cmd_install "$@" ;;
         upgrade)   cmd_upgrade "$@" ;;
         rollback)  cmd_rollback "$@" ;;
+        web-setup) cmd_web_setup "$@" ;;
         history)   cmd_history ;;
         health)    cmd_health "$@" ;;
         status)    cmd_status ;;

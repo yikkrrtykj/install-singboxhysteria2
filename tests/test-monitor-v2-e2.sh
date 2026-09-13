@@ -20,7 +20,7 @@ PASS=0
 FAIL=0
 # The gate at the bottom fails unless exactly this many assertions ran AND
 # passed, so unreachable sections can never fake success.
-EXPECTED_PASS=252
+EXPECTED_PASS=272
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
@@ -87,7 +87,8 @@ import web.access
 import web.auth
 from web.access import AccessPolicy, host_entry_for_ip, parse_network
 from web.auth import AuthStore
-from web.broker import SnapshotBroker
+from web.broker import (HEALTH_FILE_KEYS, HEALTH_FILE_SCHEMA_VERSION,
+                        SnapshotBroker)
 from web.recovery import RecoveryGlobalGuard
 from web.server import MonitorWebApp, build_server
 
@@ -108,7 +109,8 @@ def raises_value_error(func, value):
 
 def make_stack(data_dir, *, password=None, recovery=None, whitelist=(),
                poll=0.2, url="http://127.0.0.1:1", session_ttl=3600.0,
-               batches=None, recovery_guard=None, remote_mode=False):
+               batches=None, recovery_guard=None, remote_mode=False,
+               health_file=None):
     policy = AccessPolicy(data_dir)
     for entry in whitelist:
         policy.add(entry)
@@ -126,7 +128,8 @@ def make_stack(data_dir, *, password=None, recovery=None, whitelist=(),
         raise RuntimeError("stream EOF")
 
     collector = Collector(url=url, stream_factory=factory)
-    broker = SnapshotBroker(collector, poll_seconds=poll)
+    broker = SnapshotBroker(collector, poll_seconds=poll,
+                            health_file=health_file)
     broker.start()
     app = MonitorWebApp(broker=broker, access=policy,
                         static_dir=STATIC_DIR, auth=auth,
@@ -1099,6 +1102,103 @@ def group_framing():
     return out
 
 
+def group_health():
+    """R1-6: SnapshotBroker health-file export (optional, minimal, atomic).
+
+    The file carries EXACTLY the whitelisted keys -- no devices, no
+    connections, no identity, no credential material -- and its failure mode
+    never takes the dashboard down.
+    """
+    out = {}
+    data_dir = tempfile.mkdtemp()
+    health_path = os.path.join(data_dir, "state", "health.json")
+    os.makedirs(os.path.dirname(health_path), exist_ok=True)
+
+    stack = make_stack(data_dir, password=PASSWORD,
+                       whitelist=["127.0.0.5/32"], poll=0.15,
+                       batches=[RESET_BATCH], health_file=health_path)
+    port = stack["port"]
+    time.sleep(1.0)  # let several publication ticks land
+
+    out["health_file_created"] = os.path.isfile(health_path)
+    if out["health_file_created"]:
+        with open(health_path, encoding="utf-8") as handle:
+            record = json.load(handle)
+        out["health_keys_exact"] = set(record.keys()) == set(HEALTH_FILE_KEYS)
+        out["health_schema_version"] = (
+            record.get("schema_version") == HEALTH_FILE_SCHEMA_VERSION)
+        v1 = record.get("snapshot_version")
+        out["health_version_int"] = isinstance(v1, int) and not isinstance(v1, bool)
+        out["health_published_at_iso"] = isinstance(record.get("published_at"), str)
+        out["health_flags_bool"] = (
+            isinstance(record.get("collector_stale"), bool)
+            and isinstance(record.get("consumer_alive"), bool))
+        out["health_consumer_alive_true"] = record.get("consumer_alive") is True
+        # no client/runtime payload anywhere in the serialized record
+        blob = json.dumps(record, sort_keys=True)
+        forbidden = ("device", "connections", "source", "destination",
+                     "last_error", "user", "uuid", "password", "secret",
+                     "token", PASSWORD)
+        out["health_no_client_payload"] = not any(
+            token.lower() in blob.lower() for token in forbidden)
+
+        # version advances with publication
+        time.sleep(0.6)
+        with open(health_path, encoding="utf-8") as handle:
+            record2 = json.load(handle)
+        v2 = record2.get("snapshot_version")
+        out["health_version_advances"] = (
+            isinstance(v2, int) and isinstance(v1, int) and v2 > v1)
+
+        # standalone behaviour unchanged: no health file path -> no file
+        other = tempfile.mkdtemp()
+        plain = make_stack(other, password=PASSWORD, whitelist=["127.0.0.5/32"],
+                           poll=0.15, batches=[RESET_BATCH])
+        time.sleep(0.6)
+        out["standalone_no_health_file"] = not os.path.exists(
+            os.path.join(other, "state", "health.json"))
+        out["standalone_broker_has_none"] = plain["broker"]._health_file is None
+
+        # a failing health export must not kill the dashboard, and must not
+        # truncate/corrupt the previous complete file.
+        before = json.loads(req(port, "127.0.0.5", "GET", "/api/v1/snapshot",
+                                {"Cookie": cookie_of(login(port, "127.0.0.5"))})["body"])
+        stack["broker"]._health_file = os.path.join(data_dir, "missing-dir", "health.json")
+        time.sleep(0.6)
+        after = req(port, "127.0.0.5", "GET", "/api/v1/snapshot",
+                    {"Cookie": cookie_of(login(port, "127.0.0.5"))})
+        out["health_failure_dashboard_alive"] = after["status"] == 200
+        out["health_failure_no_partial_file"] = not os.path.exists(
+            os.path.join(data_dir, "missing-dir", "health.json"))
+        stack["broker"]._health_file = health_path
+        time.sleep(0.6)
+        with open(health_path, encoding="utf-8") as handle:
+            record3 = json.load(handle)   # still valid JSON after recovery
+        out["health_recovers_after_failure"] = record3.get("schema_version") == 1
+        out["health_prev_file_intact"] = before.get("snapshot_version") is not None
+        stack["broker"].stop()
+        plain["broker"].stop()
+    return out
+
+
+def group_health_stale_file():
+    """collector_stale=true must be reflected in the export."""
+    out = {}
+    data_dir = tempfile.mkdtemp()
+    health_path = os.path.join(data_dir, "state", "health.json")
+    os.makedirs(os.path.dirname(health_path), exist_ok=True)
+    stack = make_stack(data_dir, password=PASSWORD, whitelist=["127.0.0.5/32"],
+                       poll=0.15, batches=[RESET_BATCH], health_file=health_path)
+    time.sleep(1.2)   # reset batch consumed, then the stream dies -> stale
+    with open(health_path, encoding="utf-8") as handle:
+        record = json.load(handle)
+    out["stale_exported"] = record.get("collector_stale") is True
+    out["stale_consumer_still_alive"] = record.get("consumer_alive") is True
+    out["stale_keys_exact"] = set(record.keys()) == set(HEALTH_FILE_KEYS)
+    stack["broker"].stop()
+    return out
+
+
 GROUPS = {
     "whitelist": group_whitelist,
     "gate": group_gate,
@@ -1109,6 +1209,8 @@ GROUPS = {
     "endpoints": group_endpoints,
     "concurrency": group_concurrency,
     "framing": group_framing,
+    "health": group_health,
+    "health_stale": group_health_stale_file,
 }
 
 if __name__ == "__main__":
@@ -1486,6 +1588,32 @@ check 'd["framing_recovery_te_400"]' "recovery chunked Transfer-Encoding -> 400"
 check 'd["framing_recovery_te_closes"]' "TE rejection closes the connection"
 check 'd["framing_recovery_zero_scrypt"]' "rejected framings perform ZERO scrypt verifications"
 check 'd["framing_login_before_whitelist_400"]' "non-whitelisted login POST cannot bypass the framing guard"
+
+section "W11: broker health export (R1-6 packaging contract)"
+run_group "health"
+check 'd.get("_harness_error") is None' "health harness ran clean"
+check 'd["health_file_created"]' "broker writes the health file when --health-file is set"
+check 'd["health_keys_exact"]' "health file has EXACTLY the whitelisted keys"
+check 'd["health_schema_version"]' "health file carries schema_version=1"
+check 'd["health_version_int"]' "snapshot_version is an int"
+check 'd["health_published_at_iso"]' "published_at is an ISO timestamp string"
+check 'd["health_flags_bool"]' "collector_stale/consumer_alive are booleans"
+check 'd["health_consumer_alive_true"]' "consumer_alive=true while the collector thread lives"
+check 'd["health_no_client_payload"]' "health file carries NO client/runtime payload (no device/user/uuid/secret)"
+check 'd["health_version_advances"]' "snapshot_version advances with publication"
+check 'd["standalone_no_health_file"]' "standalone E2 (no --health-file) writes NO health file"
+check 'd["standalone_broker_has_none"]' "standalone broker has health_file=None (unchanged behavior)"
+check 'd["health_failure_dashboard_alive"]' "failed health export never kills the serving dashboard"
+check 'd["health_failure_no_partial_file"]' "failed health export leaves no partial JSON file"
+check 'd["health_prev_file_intact"]' "previous complete health file survives a failed export"
+check 'd["health_recovers_after_failure"]' "health export recovers after the failure is repaired"
+
+section "W12: health export reflects collector staleness (R1-6)"
+run_group "health_stale"
+check 'd.get("_harness_error") is None' "stale health harness ran clean"
+check 'd["stale_exported"]' "collector_stale=true is exported when the stream dies"
+check 'd["stale_consumer_still_alive"]' "consumer thread stays alive while stale (E1 retry semantics)"
+check 'd["stale_keys_exact"]' "stale health record keeps the exact key whitelist"
 
 printf '\n== summary ==\n'
 printf '  pass=%d fail=%d (expected pass=%d)\n' "$PASS" "$FAIL" "$EXPECTED_PASS"

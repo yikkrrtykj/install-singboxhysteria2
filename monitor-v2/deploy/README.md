@@ -1,6 +1,7 @@
 # Monitor v2 — Packaging / Installer / Deployment Track（skeleton）
 
-状态：**deployment skeleton（Draft PR）**。E2（Web Dashboard）/ E3（特权 helper）在并行对话开发，
+状态：**runtime 已接线（Integration Round 1，Draft PR）**。E2 Web Dashboard 已由本部署骨架
+真实启动（`SBMON_MODE=web` 默认）；E3（特权 helper）在并行对话开发，
 本分支**不实现、不伪造**它们的任何路径；只提供可运行的部署骨架、幂等 helper、测试与设计文档，
 最终由 integration 对话接上。
 
@@ -74,15 +75,20 @@ spool `/var/lib/sbox-cm/spool/`、helper `/usr/local/lib/sbox-cm/sbox-cm` + 单�
 /opt/singbox-monitor-releases/
   <version>-<timestamp>/                  ← 不可变 release 树（root:root 0755/0644）
     VERSION
-    app/collector/{collector.py, api_bridge/}   ← 今天唯一存在的组件（E1）
-    app/web/serve                        ← E2 集成对话交付；骨架里不存在、不伪造
+    app/monitor-v2/                      ← 唯一的服务端运行时树（R1）
+      collector.py                       ← E1 collector（唯一一份，无第二个 runtime 树）
+      api_bridge/
+      webapp.py                          ← E2 真实入口（setup / serve）
+      web/{*.py, static/*}               ← E2 后端 + 静态资源
     bin/monitor-service                  ← 运行入口 shim（见 §4）
     bin/monitor-health                   ← 健康探测（见 §6）
     lib/monitor-env.sh
-/var/lib/singbox-monitor/                ← sboxweb:sboxweb 0750（runtime state）
-  state/                                 0700  collector snapshot.json、运行状态
-  auth/                                  0700  E2 管理认证（admin 口令哈希、recovery key）
-  access/                                0700  访问日志（E2）
+/var/lib/singbox-monitor/                ← sboxweb:sboxweb 0700（E2 DATA ROOT, R1）
+  auth.json                             0600  E2 管理认证（admin 口令哈希、recovery key）
+  access.json                           0600  E2 白名单（IP/CIDR）
+  state/                                0700  运行时文件
+    health.json                               broker 健康导出（最小白名单字段，R1-6）
+    snapshot.json                             collector-loop 兼容模式的快照
 /etc/singbox-monitor/                    root:root 0755
   monitor.conf                           root:sboxweb 0640（服务用户只读）
   api.secret                             root:sboxweb 0640（由 install 从 S0 anchor 派生）
@@ -108,8 +114,12 @@ spool `/var/lib/sbox-cm/spool/`、helper `/usr/local/lib/sbox-cm/sbox-cm` + 单�
 4. **`/etc/singbox-monitor/monitor.conf` 0640 root:group**：任务 4 要求 Monitor "只 read 自己配置、
    不 write"。组可读、他人不可读、服务用户不可写 —— E2/E3 的配置变更必须走 root/特权桥，不是
    Web 进程自己改文件。
-5. **`/var/lib` 三子目录 0700**：auth/access/state 是 E2 的隐私面（口令哈希、recovery key、访问日志），
-   只 owner 可进。骨架现在就按这个权限创建，E2 落地时不需要再动权限模型。
+5. **data root 0700 + 扁平文件（R1-3 收敛）**：E2 的事实模型是 `<data-root>/auth.json` /
+   `<data-root>/access.json` 两个扁平文件（`ensure_private_dir` 把 data root 收紧到 0700），
+   `state/` 放运行时文件。旧安装上遗留的 `auth/`、`access/` 目录**按原样保留、绝不删除或改用途**
+   （migration-safe convergence，不是 destructive cleanup）；新安装不再创建它们。
+   auth.json / access.json 从不由 install/upgrade/repair/rollback 覆盖。
+   它们仍是 E2 的隐私面（口令哈希、recovery key、白名单），只 owner 可进。
 6. **VERSION 放在 release 树内**：`upgrade` 判定、`status`、health 都读激活树里的 VERSION，
    单一事实源。
 
@@ -148,7 +158,7 @@ sudoers、exact-token 读权直接复用，不需要迁移 service identity。
   要的"两个健康信号分开"的运行时基础。
 - `Restart=on-failure` + `RestartSec=5s`；`TimeoutStopSec=15s`（collector 周期内可被 TERM 打断）。
 - `UMask=0077`（round 1 P8）：snapshot/temp/runtime 文件默认私有。
-- `ExecStart=.../monitor-service <conf> <state-root>/state`（round 1 P1）：**state root 是显式
+- `ExecStart=.../monitor-service <conf> <data-root>`（R1-2）：**data root 是显式
   contract**，unit、CLI（install-monitor.sh health/status）都显式传值；`WorkingDirectory` 只是
   便利，不是正确性/安全性事实源。
 - 加固逐项（每项都对应真实需求，不是堆砌）：
@@ -169,12 +179,22 @@ sudoers、exact-token 读权直接复用，不需要迁移 service identity。
 
 `bin/monitor-service`（bash，严格模式，conf 解析无 eval/source）：
 
-- `SBMON_MODE=collector-loop`（默认，**真实可用**）：循环跑 E1 collector——首拍 `--once`
+- `SBMON_MODE=web`（**默认，真实可用**，R1-3）：exec 真实入口
+  `app/monitor-v2/webapp.py serve`——**一个** E1 Collector → **一个** SnapshotBroker →
+  loopback web 监听 + `state/health.json` 健康导出。整个运行时只有一个 collector、
+  一个 service.api 流消费者；不存在为 health 或 packaging 另起的第二个 collector。
+  web 模式 fail-closed 前置条件：`SBMON_API_SECRET_FILE` 必须已配置且是**存在、普通文件
+  （非 symlink）、可读、非空**；exec 前 `unset BOX_API_SECRET`（secret 只经文件传递，
+  绝不进 unit 文件/argv/journal）；`SBMON_WEB_BIND` 必须是 loopback 形式（IPv4/IPv6/localhost），
+  `0.0.0.0`、LAN/公网地址、畸形端口一律拒绝启动。
+- `SBMON_MODE=collector-loop`（**兼容模式**，显式启用）：循环跑 E1 collector——首拍 `--once`
   （秒级拿到 reset 权威快照），此后每拍 `--duration $SBMON_CYCLE_SECONDS`；stdout 原子写
   （tmp + mv）到 `state/snapshot.json`。流失败 → 暂停 5s 重连；每次新订阅的第一条消息就是全量
   权威 reset，无需外部持久化即可重建。这不是伪造 E2，是 E1 唯一诚实的服务化形态。
-- `SBMON_MODE=web`：**E2 钩子**。仅当 `app/web/serve` 存在且可执行时 exec 它；否则 exit 21
-  fail-closed —— unit 状态诚实地显示"未实现"，而不是静默空转。入口名由 E2 对话最终定名。
+- Web 管理入口（首次配置）：`install-monitor.sh web-setup`——以 `sboxweb` 身份运行已评审的
+  `webapp.py setup`（交互式口令 + 恢复键），使 auth.json/access.json 不会意外变成 root 属主。
+  它绝不自动加入白名单、绝不以明文口令非交互运行、绝不记录口令/恢复键；若服务此前 active，
+  成功 setup 后**只重启 singbox-monitor**（不触碰 sing-box）。无人值守安装不会自动跑它。
 - web 进程存活性（systemd active）与 service.api 连通性从第一天就是两个信号（§6）。
 
 ## 5. 安装语义（任务 6：fresh / upgrade / repair / uninstall 严格区分）
@@ -205,7 +225,8 @@ failed-attempt log，不污染回滚目标集。
 
 ```text
 uninstall                    → 停止+disable、删 unit、删 /opt 链接与 release 树
-  默认保留: /var/lib/singbox-monitor（auth/access/state）、/etc/singbox-monitor、/var/backups
+  默认保留: /var/lib/singbox-monitor（auth.json/access.json/state，以及旧安装遗留的 auth//access/ 目录）、
+  /etc/singbox-monitor、/var/backups
   --purge-state             → 追加删除 /var/lib/singbox-monitor
   --purge-config            → 追加删除 /etc/singbox-monitor
   --purge-backups           → 追加删除 /var/backups/singbox-monitor
@@ -215,7 +236,7 @@ uninstall                    → 停止+disable、删 unit、删 /opt 链接与 
   （deploy 代码里不存在这些路径，测试静态断言）。
 - **full proxy stack uninstall = 现有 `uninstall_singbox` + `uninstall --purge-state --purge-config`**
   的组合（文档定义；install.sh 菜单接线留给 integration 对话，见 §8）。
-- 任务 9 的"默认保留 auth/access state？"：本骨架默认**保留**（可 `--purge-state`），
+- 任务 9 的"默认保留 auth/access/state？"：默认**保留**（可 `--purge-state`），
   PR review 时如需反转只改默认值 + 测试。
 
 ## 6. 日志红线与健康模型（任务 11 / 12）
@@ -242,8 +263,11 @@ generated YAML —— 一个都不许出现）的实现方式：
               "collector_stale": bool,   ← round 1 P2：E1 snapshot JSON 顶层 stale 字段
               "age_stale": bool,         ← 文件 mtime 超过 2×CYCLE+30s
               "stale": bool},            ← final = malformed ∨ collector_stale ∨ age_stale
- "web_http": "not-applicable"|"unimplemented"|"ok",   ← E2 钩子
- "mode": "collector-loop", "overall": "healthy|degraded|unhealthy"}
+ "broker_health": {             ← web 模式：只读 <data-root>/state/health.json（最小记录）
+   "present": bool, "wellformed": bool, "age_seconds": int, "age_stale": bool,
+   "collector_stale": bool, "consumer_alive": bool, "stale": bool},
+ "web_http": "ok"|"unavailable"|"not-applicable",   ← web 模式的未认证 loopback 活跃度探针
+ "mode": "web", "overall": "healthy|degraded|unhealthy"}
 ```
 
 - **P2 语义陈旧**：E1 contract 是"流/API/auth 失败 → 保留 last state → stale=true，
@@ -255,7 +279,11 @@ generated YAML —— 一个都不许出现）的实现方式：
 - exit：0 healthy / 1 unhealthy（服务死）/ 2 degraded（活着但 api 不可达/URL 非法/snapshot 陈旧）；
 - api 不可达在"sing-box 没起来"时是**正确状态**（degraded，不是 crash）——monitor 的职责就是
   把它显示出来；
-- `web_http` 在 collector-loop 模式 `not-applicable`；E2 落地后由 integration 对话补 HTTP 探针。
+- `web_http` 在 collector-loop 模式 `not-applicable`；web 模式对 loopback 执行
+  **未认证** `GET /api/v1/session`（无 admin 口令、无 session cookie、无 CSRF token、
+  无 recovery key、无 service.api bearer），任何 <500 的应答即证明 dashboard 存活。
+- web 模式**不读** snapshot.json，只读最小健康记录；`auth.json`/`access.json` 内容
+  永不被探针读取或输出。
 
 ## 7. 升级 / 回滚模型（任务 7）
 
@@ -297,9 +325,9 @@ systemctl 调用并断言无 `sing-box` 字样。若某次升级明确涉及 sin
 
 顶层菜单未来新增（例如 `11. Monitor / Web Dashboard`）→ 调用
 `monitor-v2/deploy/install-monitor.sh`（离线本机路径，不走 curl）。**本分支不改 install.sh**：
-E2/E3/本分支三线并行，避免对共享文件制造冲突；接线与菜单文案由 integration 对话一次完成。
+E2/E3/本分支三线并行，避免对共享文件制造冲突；接线由 Integration Round 1 完成。
 "install → sing-box 1.14 → service.api loopback → Monitor collector → Web service → systemd units"
-的完整链路在 E2 落地前，由 collector-loop 模式提供除 Web 外的全部环节。
+的完整链路现已由 web 模式提供（collector-loop 保留为显式兼容模式）。
 
 ## 9. 迁移/测试矩阵（任务 8；`tests/test-monitor-packaging.sh`）
 
@@ -336,11 +364,12 @@ production 保持 UNCHANGED。
 ## 10. 已实现 / 明确 deferred
 
 已实现：目录布局 helper、系统用户 helper（sboxweb）、unit 模板、release staging/原子切换/清理、
-版本比较、幂等 install/upgrade/repair/uninstall/rollback/health/status、collector-loop 运行形态、
+版本比较、幂等 install/upgrade/repair/uninstall/rollback/health/status、web + collector-loop 运行形态、
+web-setup、
 分离式健康探测、S0 secret 派生桥（§11.2）、部署锁与完整事务回滚（§7/§11/§12）、
 临时根测试装置（T01–T17 + F/R3/R4 系列）。
 
-Deferred（integration 对话接）：E2 `app/web/serve` 与 `web_http` 探针；E3 privileged helper/sudoers；
+Deferred：E3 privileged helper/sudoers；
 install.sh 菜单接线；full-stack uninstall 菜单组合；真机 VPS canary；legacy config mutation lock
 integration（modify_singbox/process_doko 等的 config.lock 问题）。
 
