@@ -260,26 +260,161 @@ sbmon_chown() { # sbmon_chown <path> [mode]
 }
 
 # ---------------------------------------------------------------------------
+# R1.1-A: SERVICE-OWNED STATE TREE -- root privilege boundary.
+#
+# /var/lib/singbox-monitor is the E2 DATA ROOT. Its parent (/var/lib) is
+# root-controlled, so root may safely create it and converge its metadata.
+# EVERYTHING BELOW it (state/, auth.json, access.json, ...) lives inside a
+# directory the sboxweb service user OWNS: it can replace child entries at
+# will, so a root pathname chown/chmod of a child would be a symlink-follow /
+# TOCTOU privilege-escalation primitive (`check -> chown/chmod` is still
+# racy, so `[ ! -L path ]` alone is NOT a fix). Therefore:
+#   * root only creates/confirms the TOP-LEVEL data root (a REAL directory,
+#     never a symlink / non-directory) and converges its owner/mode;
+#   * state/ is created and mode-converged AS THE SERVICE USER, never by root.
+# A symlink race after our checks cannot escalate: the mutation itself runs
+# with sboxweb privileges, so it can only ever affect sboxweb-owned data.
+#   * No recursive chown/chmod of the data root is EVER performed.
+# auth.json / access.json / legacy auth//access/ directories are never
+# rewritten or metadata-mutated here (migration-safe).
+# ---------------------------------------------------------------------------
+sbmon_ensure_state_tree_as_service_user() {
+    local root="$SBMON_STATE_ROOT"
+    local state="$SBMON_STATE_ROOT/state"
+
+    # --- top-level data root: root-owned boundary; real directory only ---
+    if [ -L "$root" ]; then
+        sbmon_die "数据根 $root 是符号链接：fail-closed，未做任何变更"
+    fi
+    if [ -e "$root" ] && [ ! -d "$root" ]; then
+        sbmon_die "数据根 $root 已存在但不是目录：fail-closed，未做任何变更"
+    fi
+    mkdir -p -- "$root" || sbmon_die "无法创建数据根 $root：fail-closed"
+    if [ -L "$root" ] || [ ! -d "$root" ]; then
+        sbmon_die "数据根 $root 不是真实目录：fail-closed，未做任何变更"
+    fi
+    if [ "$SBMON_FIXTURE" != "1" ]; then
+        chown "$SBMON_USER:$SBMON_GROUP" "$root" \
+            || sbmon_die "数据根属主设置失败（$root -> $SBMON_USER:$SBMON_GROUP）：fail-closed"
+    fi
+    chmod 0700 "$root" || sbmon_die "数据根权限设置失败（$root -> 0700）：fail-closed"
+
+    # --- state/: created + mode-converged AS THE SERVICE USER ---
+    # Explicit refusal of a symlink / non-directory BEFORE any mutation.
+    if [ -L "$state" ]; then
+        sbmon_die "state/ 是符号链接（$state）：fail-closed，未做任何变更"
+    fi
+    if [ -e "$state" ] && [ ! -d "$state" ]; then
+        sbmon_die "state/ 已存在但不是目录（$state）：fail-closed，未做任何变更"
+    fi
+
+    if [ "$SBMON_FIXTURE" = "1" ]; then
+        mkdir -p -- "$state" || sbmon_die "无法创建 state/（$state）：fail-closed"
+        chmod 0700 -- "$state" || sbmon_die "state/ 权限设置失败（$state）：fail-closed"
+    else
+        command -v "$SBMON_SUDO" >/dev/null 2>&1 \
+            || sbmon_die "缺少 sudo，无法以 $SBMON_USER 收敛 state/：fail-closed"
+        # env -i: an explicit, minimal environment -- never the caller's.
+        "$SBMON_SUDO" -n -u "$SBMON_USER" -- env -i \
+            HOME="$SBMON_STATE_ROOT" \
+            PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+            sh -c '
+                set -e
+                state="$1"
+                [ ! -L "$state" ] || exit 3
+                { [ ! -e "$state" ] || [ -d "$state" ]; } || exit 4
+                mkdir -p -- "$state"
+                chmod 0700 -- "$state"
+            ' sh "$state" \
+            || sbmon_die "以 $SBMON_USER 身份收敛 state/ 失败（$state）：fail-closed"
+    fi
+    # Post-check (non-mutating): the converged path must be a real directory.
+    if [ -L "$state" ] || [ ! -d "$state" ]; then
+        sbmon_die "state/ 不是真实目录（$state）：fail-closed"
+    fi
+}
+
+# R1.1-B: NON-DESTRUCTIVE postcondition for files the E2 setup/storage owns.
+# The installer must never root-chown/chmod a pathname inside the service-user
+# data root; it only VERIFIES the contract and, on drift, fails closed with a
+# manual-fix hint. Ownership checks are skipped under the fixture identity
+# shim (SBMON_FIXTURE=1); mode/regular-file checks still run.
+sbmon_verify_service_owned_child_file() { # <path> <mode> <label> -> rc 0 ok
+    local path="$1" want_mode="$2" label="$3"
+    if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+        return 0   # absent is tolerated; E2 decides whether to create it
+    fi
+    if [ -L "$path" ] || [ ! -f "$path" ]; then
+        sbmon_warn "$label 不是普通文件（symlink/目录/其他）：请人工检查 $path（未做任何变更）"
+        return 1
+    fi
+    local mode
+    mode="$(stat -c '%a' "$path" 2>/dev/null)" || return 1
+    if [ "$(( 8#${mode:-0} ))" != "$(( 8#$want_mode ))" ]; then
+        sbmon_warn "$label 权限为 ${mode:-?}（期望 $want_mode）：请人工修复（未做任何变更）"
+        return 1
+    fi
+    if [ "$SBMON_FIXTURE" = "1" ]; then
+        return 0
+    fi
+    local wuid wgid cuid cgid
+    wuid="$(id -u "$SBMON_USER" 2>/dev/null)" || { sbmon_warn "$label: 无法解析服务用户 $SBMON_USER"; return 1; }
+    wgid="$(getent group "$SBMON_GROUP" | cut -d: -f3)"
+    [ -n "$wgid" ] || { sbmon_warn "$label: 组 $SBMON_GROUP 不存在"; return 1; }
+    cuid="$(stat -c '%u' "$path")"
+    cgid="$(stat -c '%g' "$path")"
+    if [ "$cuid" != "$wuid" ] || [ "$cgid" != "$wgid" ]; then
+        sbmon_warn "$label 属主非 $SBMON_USER:$SBMON_GROUP（uid=$cuid gid=$cgid）：请人工修复（未做任何变更）"
+        return 1
+    fi
+    return 0
+}
+
+sbmon_verify_service_owned_tree() { # non-mutating postcondition; rc 0 ok
+    local root="$SBMON_STATE_ROOT"
+    if [ -L "$root" ] || [ ! -d "$root" ]; then
+        sbmon_warn "数据根 $root 不是真实目录：请人工检查（未做任何变更）"
+        return 1
+    fi
+    local mode
+    mode="$(stat -c '%a' "$root" 2>/dev/null || echo '')"
+    if [ "$(( 8#${mode:-0} ))" != "$(( 8#700 ))" ]; then
+        sbmon_warn "数据根 $root 权限为 ${mode:-?}（期望 700）：请人工修复（未做任何变更）"
+        return 1
+    fi
+    if [ "$SBMON_FIXTURE" != "1" ]; then
+        local wuid wgid cuid cgid
+        wuid="$(id -u "$SBMON_USER" 2>/dev/null)" || { sbmon_warn "无法解析服务用户 $SBMON_USER：fail-closed"; return 1; }
+        wgid="$(getent group "$SBMON_GROUP" | cut -d: -f3)"
+        [ -n "$wgid" ] || { sbmon_warn "组 $SBMON_GROUP 不存在：fail-closed"; return 1; }
+        cuid="$(stat -c '%u' "$root")"
+        cgid="$(stat -c '%g' "$root")"
+        if [ "$cuid" != "$wuid" ] || [ "$cgid" != "$wgid" ]; then
+            sbmon_warn "数据根 $root 属主非 $SBMON_USER:$SBMON_GROUP：请人工修复（未做任何变更）"
+            return 1
+        fi
+    fi
+    sbmon_verify_service_owned_child_file "$root/auth.json" 0600 "auth.json" || return 1
+    sbmon_verify_service_owned_child_file "$root/access.json" 0600 "access.json" || return 1
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # Directory layout (created fresh; NEVER emptied by upgrade/repair)
 # ---------------------------------------------------------------------------
 sbmon_create_layout() {
     sbmon_info "创建目录布局（不清理既有内容）"
+    # State side (R1 / R1.1-A): the data root + state/ tree is created through
+    # the service-owned boundary helper -- root converges only the top-level
+    # data root, state/ is created AS the service user, and no child pathname
+    # inside the service-owned root is ever root-chown'ed/chmod'ed. Fresh
+    # installs create ONLY state/ -- the legacy auth/ and access/ DIRECTORIES
+    # are no longer created; if an old install has them they are preserved
+    # untouched (never deleted, never repurposed).
+    sbmon_ensure_state_tree_as_service_user
     # App side: root-owned, service user only reads.
     mkdir -p "$SBMON_RELEASES_DIR"
     chmod 0755 "$SBMON_RELEASES_DIR"
-    # State side (R1): /var/lib/singbox-monitor is the E2 DATA ROOT, owned by
-    # the service user and private (0700). auth.json / access.json live flat
-    # in the data root (E2 contract); state/ holds runtime files (health
-    # export, collector-loop snapshot). Fresh installs create ONLY state/ --
-    # the legacy auth/ and access/ DIRECTORIES are no longer created; if an
-    # old install has them they are preserved untouched (never deleted,
-    # never repurposed). Only the root and state/ dir metadata converge;
-    # legacy directory contents are never chown'ed/chmod'ed en masse.
-    mkdir -p "$SBMON_STATE_ROOT/state"
-    if [ "$SBMON_FIXTURE" != "1" ]; then
-        chown "$SBMON_USER:$SBMON_GROUP" "$SBMON_STATE_ROOT" "$SBMON_STATE_ROOT/state"
-    fi
-    chmod 0700 "$SBMON_STATE_ROOT" "$SBMON_STATE_ROOT/state"
     # Config side: root-owned, group-readable (service user reads, never writes).
     mkdir -p "$SBMON_CONF_DIR"
     chmod 0755 "$SBMON_CONF_DIR"

@@ -210,6 +210,10 @@ run_uninstall_quiet() {
 # runs use the fixture identity shim.
 if [ "$(id -u)" = "0" ]; then
     export SBMON_FIXTURE=0
+    # R1.1: several production paths now execute AS the service user (state/
+    # convergence and web-setup). Like /var/lib and /opt in a real install,
+    # the fixture tree must be traversable by that identity.
+    chmod 0755 "$TMP" "$FIX"
 else
     export SBMON_FIXTURE=1
 fi
@@ -1325,13 +1329,25 @@ except OSError:
 PY1
 API_LIVE_PID=$!
 python3 - <<'PY2' &
-import http.server
+import http.server, json
 class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(401)
-        self.send_header("Content-Length", "2")
+        # R1.1-C: mirror the REAL E2 /api/v1/session shape (200 + JSON) so the
+        # "web_http ok" assertion proves an identity check, not just "<500".
+        body = json.dumps({
+            "authenticated": False,
+            "current_ip": "127.0.0.1",
+            "whitelist_allowed": True,
+            "password_configured": False,
+            "recovery_configured": False,
+            "remote_mode": False,
+            "version": "e2-session-stub",
+        }).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(b"{}")
+        self.wfile.write(body)
     def log_message(self, *a):
         pass
 srv = http.server.HTTPServer(("127.0.0.1", 19193), H)
@@ -1408,6 +1424,204 @@ assert_grep '"service_active":false' <(printf '%s' "$H_JSON") "web unhealthy rep
 echo active > "$MOCK_SYS_STATE"
 rm -f "$HEALTH_FILE"
 [ -n "$API_LIVE_PID" ] && kill "$API_LIVE_PID" 2>/dev/null
+
+# ---------------------------------------------------------------------------
+section "T20 web health identity check (R1.1-C)"
+# The probe must verify this really is the E2 dashboard -- HTTP 200 AND a JSON
+# object with the minimal stable session shape -- not merely "any <500 answer".
+# A controllable loopback stub re-reads a spec file per request so status/body
+# can be flipped between probes.
+C_SPEC="$TMP/c-stub-spec.json"
+C_PORT=19197
+cat > "$TMP/c-stub.py" <<'PY'
+import http.server, json, sys
+spec_path, port = sys.argv[1], int(sys.argv[2])
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        try:
+            with open(spec_path, encoding="utf-8") as fh:
+                spec = json.load(fh)
+        except Exception:
+            spec = {"status": 500, "body": ""}
+        body = str(spec.get("body", "")).encode("utf-8")
+        self.send_response(int(spec.get("status", 500)))
+        ctype = spec.get("content_type")
+        if ctype:
+            self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a):
+        pass
+srv = http.server.HTTPServer(("127.0.0.1", port), H)
+srv.serve_forever()
+PY
+python3 "$TMP/c-stub.py" "$C_SPEC" "$C_PORT" &
+C_STUB_PID=$!
+python3 - <<'PYAPI' &
+import socket
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", 19091)); s.listen(8); s.settimeout(120)
+try:
+    while True:
+        c, _ = s.accept(); c.close()
+except OSError:
+    pass
+PYAPI
+C_API_PID=$!
+sleep 0.8
+
+C_CONF="$TMP/health-c.conf"
+cat > "$C_CONF" <<EOF
+SBMON_WEB_BIND=127.0.0.1:$C_PORT
+SBMON_API_URL=http://127.0.0.1:19091
+SBMON_MODE=web
+SBMON_WEB_POLL_SECONDS=1
+EOF
+mkdir -p "$FIX_STATE/state"
+C_HEALTH="$FIX_STATE/state/health.json"
+set_c_stub() { # <status> <content_type> <body-string>
+    python3 - "$C_SPEC" "$1" "$2" "$3" <<'PY'
+import json, sys
+with open(sys.argv[1], "w", encoding="utf-8") as fh:
+    json.dump({"status": int(sys.argv[2]),
+               "content_type": sys.argv[3],
+               "body": sys.argv[4]}, fh)
+PY
+}
+write_c_health() {
+    printf '{"schema_version":1,"snapshot_version":1,"published_at":"2030-01-01T00:00:00+00:00","collector_stale":false,"consumer_alive":true}\n' > "$C_HEALTH"
+}
+c_probe() { write_c_health; "$HWB" "$C_CONF" "$FIX_STATE"; }
+echo active > "$MOCK_SYS_STATE"
+
+C_JSON='{"authenticated": false, "whitelist_allowed": true, "version": "e2-test"}'
+set_c_stub 200 application/json "$C_JSON"
+H_JSON="$(c_probe)"; H_RC=$?
+assert_rc 0 "$H_RC" "200 + valid E2 session JSON -> healthy (R1.1-C)"
+assert_grep '"web_http":"ok"' <(printf '%s' "$H_JSON") "web_http ok for the real session shape (R1.1-C)"
+
+for c_status in 404 401 403 500; do
+    set_c_stub "$c_status" application/json "$C_JSON"
+    H_JSON="$(c_probe)"; H_RC=$?
+    assert_rc 2 "$H_RC" "HTTP $c_status from the web port -> degraded (R1.1-C)"
+    assert_grep '"web_http":"unavailable"' <(printf '%s' "$H_JSON") "web_http unavailable for HTTP $c_status (R1.1-C)"
+done
+
+set_c_stub 200 text/html '<html><body>definitely not the dashboard</body></html>'
+H_JSON="$(c_probe)"; H_RC=$?
+assert_rc 2 "$H_RC" "200 + non-JSON body -> degraded (R1.1-C)"
+assert_grep '"web_http":"unavailable"' <(printf '%s' "$H_JSON") "web_http unavailable for a foreign 200 body (R1.1-C)"
+
+set_c_stub 200 application/json '{"foo": 1, "bar": true}'
+H_JSON="$(c_probe)"; H_RC=$?
+assert_rc 2 "$H_RC" "200 + wrong JSON shape -> degraded (R1.1-C)"
+
+# body privacy: an ignored field is never echoed into probe output
+C_SENTINEL='probe-body-sentinel-9f3a'
+set_c_stub 200 application/json "{\"authenticated\": false, \"whitelist_allowed\": true, \"version\": \"e2-test\", \"current_ip\": \"$C_SENTINEL\"}"
+H_JSON="$(c_probe)"; H_RC=$?
+assert_rc 0 "$H_RC" "extra session fields tolerated (stable shape check) (R1.1-C)"
+assert_no_grep "$C_SENTINEL" <(printf '%s' "$H_JSON") "session body contents never appear in probe output (R1.1-C)"
+
+kill "$C_STUB_PID" 2>/dev/null
+C_STUB_PID=""
+sleep 0.4
+H_JSON="$(c_probe)"; H_RC=$?
+assert_rc 2 "$H_RC" "no listener on the web port -> degraded (R1.1-C)"
+
+# real E2 server end to end (the strongest identity proof)
+C_REAL_PORT=19198
+C_REAL_DATA="$TMP/c-real-data"
+mkdir -p "$C_REAL_DATA"
+python3 "$FIX_APP_LINK/app/monitor-v2/webapp.py" serve \
+    --listen 127.0.0.1 --port "$C_REAL_PORT" \
+    --url http://127.0.0.1:19091 \
+    --secret-file "$FIX_CONF_DIR/api.secret" \
+    --data-dir "$C_REAL_DATA" --poll 0.5 > "$TMP/c-real-web.log" 2>&1 &
+C_REAL_PID=$!
+C_REAL_CONF="$TMP/health-c-real.conf"
+cat > "$C_REAL_CONF" <<EOF
+SBMON_WEB_BIND=127.0.0.1:$C_REAL_PORT
+SBMON_API_URL=http://127.0.0.1:19091
+SBMON_MODE=web
+SBMON_WEB_POLL_SECONDS=1
+EOF
+C_REAL_UP=0
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    if python3 -c "import socket,sys; s=socket.socket(); s.settimeout(0.3); sys.exit(0 if s.connect_ex(('127.0.0.1', $C_REAL_PORT)) == 0 else 1)" 2>/dev/null; then
+        C_REAL_UP=1; break
+    fi
+    sleep 0.5
+done
+if [ "$C_REAL_UP" = 1 ]; then
+    write_c_health
+    H_JSON="$("$HWB" "$C_REAL_CONF" "$FIX_STATE")"; H_RC=$?
+    assert_rc 0 "$H_RC" "real E2 session endpoint (200 + valid JSON) -> healthy (R1.1-C)"
+    assert_grep '"web_http":"ok"' <(printf '%s' "$H_JSON") "web_http ok against the real E2 server (R1.1-C)"
+else
+    fail "real E2 web server did not come up for the identity probe (R1.1-C)"
+fi
+kill "$C_REAL_PID" 2>/dev/null
+rm -rf "$C_REAL_DATA"
+[ -n "$C_API_PID" ] && kill "$C_API_PID" 2>/dev/null
+
+# ---------------------------------------------------------------------------
+section "T21 SBMON_WEB_POLL_SECONDS strict finite>0 contract (R1.1-D)"
+D_ENV="$FIX_APP_LINK/lib/monitor-env.sh"
+for d_good in 1 1.0 0.5 2.25; do
+    if ( . "$D_ENV"; monitor_env_validate_poll_seconds "$d_good" ); then
+        pass "helper accepts poll=$d_good (R1.1-D)"
+    else
+        fail "helper rejects poll=$d_good (R1.1-D)"
+    fi
+done
+for d_bad in 0 0.0 -1 NaN nan inf Infinity . 1..2 abc ''; do
+    if ( . "$D_ENV"; monitor_env_validate_poll_seconds "$d_bad" ); then
+        fail "helper accepts invalid poll='$d_bad' (R1.1-D)"
+    else
+        pass "helper rejects poll='$d_bad' (R1.1-D)"
+    fi
+done
+assert_eq "20" "$( ( . "$D_ENV"; monitor_env_poll_max_age 1 ) )" "max_age(1)=20 (R1.1-D)"
+assert_eq "18" "$( ( . "$D_ENV"; monitor_env_poll_max_age 0.5 ) )" "max_age(0.5)=ceil(17.5)=18 (no truncation) (R1.1-D)"
+assert_eq "27" "$( ( . "$D_ENV"; monitor_env_poll_max_age 2.25 ) )" "max_age(2.25)=ceil(26.25)=27 (R1.1-D)"
+assert_rc 1 "$( ( . "$D_ENV"; monitor_env_poll_max_age 0 ) >/dev/null 2>&1; echo $? )" "max_age(0) fails closed (R1.1-D)"
+
+D_SCRATCH="$(mktemp -d)"
+d_write_conf() { # <file> <poll>
+    { printf 'SBMON_MODE=web\n';
+      printf 'SBMON_API_URL=http://127.0.0.1:19091\n';
+      printf 'SBMON_WEB_BIND=127.0.0.1:19199\n';
+      printf 'SBMON_API_SECRET_FILE=%s\n' "$FIX_CONF_DIR/api.secret";
+      printf 'SBMON_WEB_POLL_SECONDS=%s\n' "$2"; } > "$1"
+}
+for d_good in 1 1.0 0.5 2.25; do
+    d_write_conf "$TMP/d-good.conf" "$d_good"
+    timeout 3 "$WEB_SVC" "$TMP/d-good.conf" "$D_SCRATCH" > "$TMP/d-good.log" 2>&1 || true
+    assert_grep 'mode=web' "$TMP/d-good.log" "service accepts poll=$d_good and reaches web exec (R1.1-D)"
+done
+for d_bad in 0 0.0 -1 NaN nan inf Infinity . 1..2 abc ''; do
+    d_write_conf "$TMP/d-bad.conf" "$d_bad"
+    timeout 5 "$WEB_SVC" "$TMP/d-bad.conf" "$D_SCRATCH" > "$TMP/d-bad.log" 2>&1
+    assert_rc 1 $? "service rejects poll='$d_bad' fail-closed (R1.1-D)"
+    assert_no_grep 'mode=web' "$TMP/d-bad.log" "rejected poll='$d_bad' never execs webapp (no busy-loop path) (R1.1-D)"
+done
+rm -rf "$D_SCRATCH"
+
+# health applies the SAME contract: an invalid poll cannot look fresh
+D_HCONF="$TMP/d-health-badpoll.conf"
+cat > "$D_HCONF" <<EOF
+SBMON_WEB_BIND=127.0.0.1:19199
+SBMON_API_URL=http://127.0.0.1:19091
+SBMON_MODE=web
+SBMON_WEB_POLL_SECONDS=0
+EOF
+echo active > "$MOCK_SYS_STATE"
+printf '{"schema_version":1,"snapshot_version":1,"published_at":"2030-01-01T00:00:00+00:00","collector_stale":false,"consumer_alive":true}\n' > "$FIX_STATE/state/health.json"
+H_JSON="$("$HWB" "$D_HCONF" "$FIX_STATE")"; H_RC=$?
+assert_rc 2 "$H_RC" "health: poll=0 cannot look fresh -> degraded (R1.1-D)"
+assert_grep '"age_stale":true' <(printf '%s' "$H_JSON") "health poll=0 -> age_stale=true (same rule as service) (R1.1-D)"
 
 section "T09 journal redaction (secrets never reach service output)"
 run_uninstall_quiet
@@ -1521,6 +1735,64 @@ fi
 run_uninstall_quiet
 
 # ---------------------------------------------------------------------------
+section "R1.1-A service-owned state tree privilege boundary"
+# Root must never path-chown/chmod a child inside the sboxweb-owned data root:
+# a service-user-controlled state/ entry could be swapped for a symlink and a
+# privileged metadata mutation would follow it. Fail-closed BEFORE any release
+# or history mutation; existing auth/access bytes always preserved.
+run_uninstall_quiet
+rm -rf "$FIX_STATE" "$FIX_RELEASES"
+mkdir -p "$FIX_STATE"
+printf '{"legacy": true}\n' > "$FIX_STATE/auth.json"
+printf '{"whitelist": ["198.51.100.9/32"]}\n' > "$FIX_STATE/access.json"
+STATE_AUTH_HASH="$(sha256sum "$FIX_STATE/auth.json" | cut -d' ' -f1)"
+STATE_ACCESS_HASH="$(sha256sum "$FIX_STATE/access.json" | cut -d' ' -f1)"
+
+# A1: wrong-type (regular file) state/ -> fail closed, entry untouched
+printf 'not-a-directory\n' > "$FIX_STATE/state"
+OUT_R11A1="$TMP/out-r11a1.log"
+run_install "$OUT_R11A1"
+assert_rc 1 $? "state/ wrong type (regular file) -> install fails closed (R1.1-A)"
+assert_eq "not-a-directory" "$(cat "$FIX_STATE/state")" "wrong-type state/ entry unchanged (R1.1-A)"
+rm -f "$FIX_STATE/state"
+
+if [ "$SYMLINKS_OK" = 1 ]; then
+    # A2: state/ replaced with a symlink to a sentinel -> root must not follow
+    # it. Sentinel uid:gid:mode and content stay byte-for-byte identical.
+    SENTINEL="$TMP/state-sentinel"
+    rm -rf "$SENTINEL"
+    mkdir -p "$SENTINEL"
+    printf 'sentinel-must-survive\n' > "$SENTINEL/marker"
+    chmod 0705 "$SENTINEL"
+    SENT_META_BEFORE="$(stat -c '%u:%g:%a' "$SENTINEL")"
+    SENT_MARK_BEFORE="$(sha256sum "$SENTINEL/marker" | cut -d' ' -f1)"
+    ln -s "$SENTINEL" "$FIX_STATE/state"
+    OUT_R11A2="$TMP/out-r11a2.log"
+    run_install "$OUT_R11A2"
+    assert_rc 1 $? "state/ symlink -> install fails closed (R1.1-A)"
+    assert_grep 'state/' "$OUT_R11A2" "fail-closed message names state/ (R1.1-A)"
+    assert_eq "$SENT_META_BEFORE" "$(stat -c '%u:%g:%a' "$SENTINEL")" "symlink-target sentinel uid:gid:mode untouched (R1.1-A)"
+    assert_eq "$SENT_MARK_BEFORE" "$(sha256sum "$SENTINEL/marker" | cut -d' ' -f1)" "symlink-target sentinel content untouched (R1.1-A)"
+    [ -L "$FIX_STATE/state" ] && pass "state/ symlink left in place (never replaced/followed) (R1.1-A)" || fail "state/ symlink replaced (R1.1-A)"
+    if [ ! -L "$SBMON_APP_LINK" ] && [ ! -e "$SBMON_APP_LINK" ]; then pass "no release activated on state/ failure (R1.1-A)"; else fail "release activated despite state/ failure (R1.1-A)"; fi
+    if [ ! -e "$FIX_RELEASES/releases.history" ]; then pass "no history written on state/ failure (R1.1-A)"; else fail "history mutated despite state/ failure (R1.1-A)"; fi
+    rm -f "$FIX_STATE/state"
+else
+    printf '  SKIP R1.1-A symlink sentinel case（此平台无符号链接）\n'
+fi
+
+assert_eq "$STATE_AUTH_HASH" "$(sha256sum "$FIX_STATE/auth.json" | cut -d' ' -f1)" "existing auth.json bytes unchanged (R1.1-A)"
+assert_eq "$STATE_ACCESS_HASH" "$(sha256sum "$FIX_STATE/access.json" | cut -d' ' -f1)" "existing access.json bytes unchanged (R1.1-A)"
+
+# A3: a normal state/ dir converges and the install succeeds.
+OUT_R11A3="$TMP/out-r11a3.log"
+run_install "$OUT_R11A3"
+assert_rc 0 $? "state/ normal directory -> install succeeds (R1.1-A)"
+assert_dir_mode "$FIX_STATE" 700 "data root converges to 0700 (R1.1-A)"
+assert_dir_mode "$FIX_STATE/state" 700 "state/ converges to 0700 (R1.1-A)"
+run_uninstall_quiet
+
+# ---------------------------------------------------------------------------
 section "T11 bad permissions repaired without content change"
 run_install "$TMP/out-t11setup.log" >/dev/null 2>&1
 C11_BEFORE="$(sha256sum "$FIX_CONF_DIR/monitor.conf" | cut -d' ' -f1)"
@@ -1596,9 +1868,102 @@ if [ "$SYMLINKS_OK" = 1 ]; then
         assert_eq "sboxweb" "$(stat -c '%U' "$FIX_STATE/auth.json")" "auth.json owned by sboxweb after web-setup (real metadata)"
         assert_eq "sboxweb" "$(stat -c '%U' "$FIX_STATE/access.json")" "access.json owned by sboxweb after web-setup"
         assert_eq "700" "$(stat -c '%a' "$FIX_STATE")" "data root private 0700 after web-setup"
+        # R1.1-B: full owner:group + mode contract, guaranteed by E2 itself.
+        assert_eq "sboxweb" "$(stat -c '%G' "$FIX_STATE/auth.json")" "auth.json group sboxweb (R1.1-B)"
+        assert_eq "600" "$(stat -c '%a' "$FIX_STATE/auth.json")" "auth.json mode 0600 (R1.1-B)"
+        assert_eq "sboxweb" "$(stat -c '%G' "$FIX_STATE/access.json")" "access.json group sboxweb (R1.1-B)"
+        assert_eq "600" "$(stat -c '%a' "$FIX_STATE/access.json")" "access.json mode 0600 (R1.1-B)"
     else
         printf '  SKIP real-owner assertion (non-root fixture pass; root CI covers it)\n'
     fi
+
+    # R1.1-B: the installer must contain NO root chown/chmod inside web-setup
+    # and must never accept credentials via argv (comments stripped first).
+    WS_FN="$(sed -n '/^_cmd_web_setup_locked()/,/^}/p' "$INSTALL_MONITOR")"
+    WS_CODE="$(printf '%s' "$WS_FN" | strip_comments)"
+    if printf '%s' "$WS_CODE" | grep -qE '(^|[^[:alnum:]_])(chown|chmod)([^[:alnum:]_]|$)'; then
+        fail "web-setup still performs a root chown/chmod (R1.1-B)"
+    else
+        pass "web-setup performs no root chown/chmod on service-owned children (R1.1-B)"
+    fi
+    if printf '%s' "$WS_CODE" | grep -qE -- '--password|--recovery-out'; then
+        fail "web-setup accepts password/recovery via argv (R1.1-E)"
+    else
+        pass "web-setup never passes password/recovery key via argv (R1.1-E)"
+    fi
+
+    # R1.1-B: a symlink attack on a service-owned child must never mutate a
+    # root-owned sentinel, and a verify failure must not restart the monitor.
+    if [ "$SBMON_FIXTURE" = "0" ]; then
+        SENT="$TMP/access-sentinel"
+        printf 'root-sentinel-body\n' > "$SENT"
+        chmod 0600 "$SENT"
+        chown root:root "$SENT"
+        SENT_META_BEFORE2="$(stat -c '%u:%g:%a' "$SENT")"
+        SENT_HASH_BEFORE2="$(sha256sum "$SENT" | cut -d' ' -f1)"
+        rm -f "$FIX_STATE/access.json"
+        ln -s "$SENT" "$FIX_STATE/access.json"
+        CALLS_BEFORE_SYM="$(wc -l < "$MOCK_CALL_LOG")"
+        OUT_T19SYM="$TMP/out-t19-symlink.log"
+        "$INSTALL_MONITOR" web-setup </dev/null > "$OUT_T19SYM" 2>&1 || true
+        assert_eq "$SENT_META_BEFORE2" "$(stat -c '%u:%g:%a' "$SENT")" "root-owned sentinel metadata unchanged (R1.1-B)"
+        assert_eq "$SENT_HASH_BEFORE2" "$(sha256sum "$SENT" | cut -d' ' -f1)" "root-owned sentinel content unchanged (R1.1-B)"
+        tail -n +"$((CALLS_BEFORE_SYM + 1))" "$MOCK_CALL_LOG" > "$TMP/t19-sym-calls.log"
+        assert_no_grep 'restart' "$TMP/t19-sym-calls.log" "verify-failed web-setup does not restart the monitor (R1.1-B)"
+        rm -f "$FIX_STATE/access.json"
+        printf '{"whitelist": ["198.51.100.9/32"]}\n' > "$FIX_STATE/access.json"
+        chown "${SBMON_USER:-sboxweb}:${SBMON_GROUP:-sboxweb}" "$FIX_STATE/access.json"
+        chmod 0600 "$FIX_STATE/access.json"
+    fi
+
+    # R1.1-B: an explicit setup failure must propagate the rc, be honest about
+    # possible partial writes, and never restart the monitor.
+    FAILPY="$TMP/fail-python.sh"
+    printf '#!/usr/bin/env bash\nexit 7\n' > "$FAILPY"
+    chmod 0755 "$FAILPY"
+    CALLS_BEFORE_FAIL="$(wc -l < "$MOCK_CALL_LOG")"
+    FAIL_OUT="$TMP/out-t19-fail.log"
+    FAIL_RC=0
+    SBMON_PYTHON3="$FAILPY" "$INSTALL_MONITOR" web-setup </dev/null > "$FAIL_OUT" 2>&1 || FAIL_RC=$?
+    assert_rc 7 "$FAIL_RC" "web-setup propagates the setup failure rc (R1.1-B)"
+    assert_grep '可能已完成部分持久化写入' "$FAIL_OUT" "setup failure is honest about possible partial writes (R1.1-B)"
+    assert_no_grep '保持不变' "$FAIL_OUT" "setup failure no longer claims byte-identical data (R1.1-B)"
+    tail -n +"$((CALLS_BEFORE_FAIL + 1))" "$MOCK_CALL_LOG" > "$TMP/t19-fail-calls.log"
+    assert_no_grep 'restart' "$TMP/t19-fail-calls.log" "failed web-setup does not restart the monitor (R1.1-B)"
+
+    # R1.1-E: setup must run under an EXPLICIT CLEAN environment. A thin
+    # python wrapper (resolved as the interpreter) records the child env.
+    PROBE_DIR="$TMP/env-probe"
+    mkdir -p "$PROBE_DIR"
+    chmod 0777 "$PROBE_DIR"
+    ENV_DUMP="$PROBE_DIR/dump"
+    ENV_PY="$PROBE_DIR/pywrap"
+    cat > "$ENV_PY" <<WRAP
+#!/usr/bin/env bash
+{
+  printf 'HOME=%s\n' "\${HOME:-}"
+  printf 'PATH=%s\n' "\${PATH:-}"
+  printf 'SSH_CONNECTION=%s\n' "\${SSH_CONNECTION:-}"
+  [ -z "\${BOX_API_SECRET:-}" ] || printf 'LEAK_BOX_API_SECRET=1\n'
+  [ -z "\${RANDOM_TEST_ENV:-}" ] || printf 'LEAK_RANDOM_TEST_ENV=1\n'
+} > "$ENV_DUMP"
+exec "$PY3" "\$@"
+WRAP
+    chmod 0755 "$ENV_PY"
+    rm -f "$ENV_DUMP"
+    ENV_OUT="$TMP/out-t19-env.log"
+    ENV_RC=0
+    BOX_API_SECRET='sentinel-box-secret' RANDOM_TEST_ENV='sentinel-random-env' \
+    SBMON_PYTHON3="$ENV_PY" SSH_CONNECTION='203.0.113.9 55222 198.51.100.5 22' \
+        "$INSTALL_MONITOR" web-setup </dev/null > "$ENV_OUT" 2>&1 || ENV_RC=$?
+    assert_rc 0 "$ENV_RC" "clean-env web-setup completes (R1.1-E)"
+    if [ -s "$ENV_DUMP" ]; then pass "env probe observed the setup child (R1.1-E)"; else fail "env probe did not run (R1.1-E)"; fi
+    ENV_DUMP_TEXT="$(cat "$ENV_DUMP" 2>/dev/null || true)"
+    assert_grep "^HOME=$FIX_STATE$" <(printf '%s' "$ENV_DUMP_TEXT") "setup HOME == data root (R1.1-E)"
+    assert_grep '^PATH=/usr/sbin:/usr/bin:/sbin:/bin$' <(printf '%s' "$ENV_DUMP_TEXT") "setup PATH == explicitly approved path (R1.1-E)"
+    assert_grep '^SSH_CONNECTION=203\.0\.113\.9' <(printf '%s' "$ENV_DUMP_TEXT") "SSH_CONNECTION forwarded to setup (R1.1-E)"
+    assert_no_grep 'LEAK_BOX_API_SECRET' <(printf '%s' "$ENV_DUMP_TEXT") "BOX_API_SECRET not visible to setup (R1.1-E)"
+    assert_no_grep 'LEAK_RANDOM_TEST_ENV' <(printf '%s' "$ENV_DUMP_TEXT") "arbitrary caller env not visible to setup (R1.1-E)"
 else
     printf '  SKIP T19 success path (此平台无符号链接 -> 无已激活 release)\n'
     OUT_T19NC="$TMP/out-t19nc.log"

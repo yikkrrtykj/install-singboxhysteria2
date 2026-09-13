@@ -137,6 +137,50 @@ monitor_env_validate_web_bind() { # rc 0 = valid loopback bind
     monitor_env_split_web_bind "$1" >/dev/null
 }
 
+# R1.1-D: strict SBMON_WEB_POLL_SECONDS contract -- the value must be a NUMERIC,
+# FINITE float strictly greater than 0. Bash character checks accept "0"/"0.0"
+# (which would make the SnapshotBroker publisher wait(0) spin in a tight loop),
+# so the parse/reject decision is delegated to the Python float parser.
+# Accepted: 1, 1.0, 0.5, 2.25   Rejected: 0, 0.0, -1, NaN, nan, inf, Infinity,
+# ".", 1..2, abc, empty. monitor-service AND monitor-health call THIS function
+# so the service and the probe can never disagree on what is legal.
+monitor_env_validate_poll_seconds() { # monitor_env_validate_poll_seconds <value> -> rc 0 valid
+    local pybin="${SBMON_PYTHON3:-python3}"
+    command -v "$pybin" >/dev/null 2>&1 || return 1
+    "$pybin" - "$1" <<'PY'
+import math, sys
+try:
+    value = float(sys.argv[1])
+except (TypeError, ValueError):
+    sys.exit(1)
+sys.exit(0 if math.isfinite(value) and value > 0 else 1)
+PY
+}
+
+# R1.1-D: derive the broker health freshness window from a VALIDATED poll
+# value using ceil(5 * poll_seconds + 15). The old ${WEB_POLL%%.*} integer
+# truncation silently mis-handled fractional values (0.5 -> 0). Prints the
+# integer threshold on stdout; rc 1 for any invalid value so the caller can
+# fail closed instead of silently substituting a different rule.
+monitor_env_poll_max_age() { # monitor_env_poll_max_age <value> -> prints ceil(5*v+15)
+    local pybin="${SBMON_PYTHON3:-python3}"
+    command -v "$pybin" >/dev/null 2>&1 || return 1
+    local out
+    out="$("$pybin" - "$1" <<'PY'
+import math, sys
+try:
+    value = float(sys.argv[1])
+except (TypeError, ValueError):
+    sys.exit(1)
+if not (math.isfinite(value) and value > 0):
+    sys.exit(1)
+print(math.ceil(5.0 * value + 15.0))
+PY
+)" || return 1
+    [ -n "$out" ] || return 1
+    printf '%s\n' "$out"
+}
+
 # TCP connect probe (no curl dependency, no output).
 monitor_env_tcp_probe() { # monitor_env_tcp_probe <host> <port> [timeout]
     local host="$1" port="$2" timeout="${3:-2}"

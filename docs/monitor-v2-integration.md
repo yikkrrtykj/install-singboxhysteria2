@@ -1,10 +1,14 @@
 # Monitor v2 Integration — Round 0 Record
 
-Status: **DRAFT — Round 1 runtime wiring implemented, awaiting review.**
+Status: **DRAFT — Round 1 runtime wiring + Round 1.1 hardening implemented, awaiting review.**
 This document records verified code facts of the integration tree. Round 0 /
 0.1 assembled the four frozen tracks and closed Linux CI; Round 1 wired the
 reviewed E2 web runtime into the reviewed Packaging runtime (I0-2/I0-3/I0-4
-and the secret runtime contract). No VPS run, no production change, no E3.
+and the secret runtime contract); Round 1.1 added five fail-closed
+integration-hardening fixes (service-owned state tree boundary, no root
+mutation of `auth.json`/`access.json`, web health identity check, strict poll
+contract, clean `web-setup` environment). No VPS run, no production change,
+no E3.
 
 ## Inputs (verified before any merge)
 
@@ -227,15 +231,21 @@ credentials or bearer material) and is never logged. This is asserted in the
 E2 suite including a forced-failure case.
 
 `monitor-health` in web mode reads ONLY this file (never `auth.json` /
-`access.json`) and adds an **unauthenticated loopback** liveness probe:
+`access.json`) and adds an **unauthenticated loopback identity probe**:
 
 ```
 GET /api/v1/session      (no password, no cookie, no CSRF token,
                           no recovery key, no service.api bearer)
 ```
 
-Any answer below 500 proves the dashboard is alive (a closed dashboard
-answers 401/403). Signals reported: `service_active`, `api_url_valid`,
+Round 1.1 hardened this from "any answer below 500 proves the dashboard is
+alive" to a real **identity** check: the probe requires **HTTP 200** AND a
+decodable **JSON object** carrying the minimal stable E2 session shape
+(`authenticated` bool, `whitelist_allowed` bool, `version` non-empty string;
+optional `password_configured`/`recovery_configured`/`remote_mode` bools). An
+unrelated program on the port (404/401/403/500, or a foreign 200 body) is no
+longer mistaken for the dashboard, and the response body is never emitted.
+Signals reported: `service_active`, `api_url_valid`,
 `api_reachable`, `broker_health{present,wellformed,age_seconds,age_stale,
 collector_stale,consumer_alive,stale}`, `web_http`, `mode`, `overall`.
 Exit: 0 healthy / 1 unhealthy (service inactive) / 2 degraded (bad API URL,
@@ -344,12 +354,26 @@ Packaging does not use E2 remote/TLS mode.
 
 `install-monitor.sh web-setup` runs the reviewed `webapp.py setup
 --data-dir /var/lib/singbox-monitor` **as the service identity** (under the
-deployment lock, only `SSH_CONNECTION` forwarded), so `auth.json` /
-`access.json` are never root-owned. It never auto-adds a whitelist entry,
-never accepts/generates a plaintext password non-interactively, never logs
-the password or recovery key, and if the service was active it restarts
-**only** `singbox-monitor` afterwards (never sing-box). It is never run
-automatically by unattended install.
+deployment lock), so `auth.json` / `access.json` are never root-owned. It
+never auto-adds a whitelist entry, never accepts/generates a plaintext
+password non-interactively, never logs the password or recovery key, and if
+the service was active it restarts **only** `singbox-monitor` afterwards
+(never sing-box). It is never run automatically by unattended install.
+Round 1.1 tightened the environment and postcondition (see below).
+
+### Round 1.1 — integration hardening (implemented)
+
+Round 1.1 is a small integration-hardening round (no new architecture): five
+fail-closed fixes with additive regressions. No existing assertion was
+removed or weakened.
+
+| # | Fix | Contract |
+|---|---|---|
+| **A** | Service-owned state tree privilege boundary | Root creates/confirms only the **top-level** data root (a real directory, never a symlink/non-directory) and converges it to `sboxweb:sboxweb 0700`. `state/` is created and mode-converged **as the service user** (`sbmon_ensure_state_tree_as_service_user`), never by root. A `state/` symlink or wrong-type entry fails closed, and a symlink race after the check cannot escalate because the mutation itself runs with `sboxweb` privileges. No recursive chown/chmod of the data root. `auth.json`/`access.json`/legacy `auth//access/` stay migration-safe. |
+| **B** | No root mutation of `auth.json`/`access.json` | The post-`web-setup` root `chown`/`chmod` of the data root and flat access files was **removed**. The installer only runs a **non-destructive** postcondition (`sbmon_verify_service_owned_tree`); drift fails closed with a manual-fix hint (never auto-rescued). A setup failure reports honestly that partial persistence may have happened and never restarts the monitor. |
+| **C** | Web health identity check | `monitor-health` web mode requires **HTTP 200 + a JSON object** with the minimal E2 session shape (`authenticated`/`whitelist_allowed` bool, `version` non-empty string); 404/401/403/500 or a foreign 200 body is **degraded**. No credential, no login dependency, body never emitted. |
+| **D** | Strict poll contract | `SBMON_WEB_POLL_SECONDS` must be a **finite float > 0** (Python `float` parse in `monitor-env.sh`), shared by `monitor-service` (fail-closed before `exec webapp`) and `monitor-health`. `0`/`0.0`/negative/`NaN`/`inf`/`Infinity`/`.`/`1..2`/garbage/empty are rejected; absent defaults to `1`. Freshness uses `ceil(5 * poll + 15)` (no `${VAR%%.*}` truncation). |
+| **E** | Clean setup environment | Production `web-setup` resolves the python binary as root (`command -v`) and runs the reviewed setup under an **explicit clean env** (`env -i`): only `HOME` (data root), a fixed approved `PATH` and `SSH_CONNECTION` are forwarded. `BOX_API_SECRET`, tokens/cookies and any arbitrary caller env are never inherited; password/recovery key never enter argv, env or logs. |
 
 ### Round 1 non-goals (status)
 

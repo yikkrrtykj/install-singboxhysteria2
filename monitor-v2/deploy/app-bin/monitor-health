@@ -21,10 +21,15 @@
 #       exported by the ONE SnapshotBroker inside the web runtime (R1-6).
 #       present / wellformed / age_seconds / age_stale / collector_stale /
 #       consumer_alive / stale. auth.json / access.json are NEVER read.
-#   web_http        -- unauthenticated liveness GET /api/v1/session on the
-#                      loopback web bind (web mode only). No admin password,
-#                      no session cookie, no CSRF token, no recovery key, no
-#                      service.api bearer secret.
+#   web_http        -- unauthenticated IDENTITY probe: GET /api/v1/session on
+#                      the loopback web bind (web mode only), requiring HTTP
+#                      200 + a JSON object carrying the minimal stable E2
+#                      session shape (authenticated/whitelist_allowed bool,
+#                      version non-empty string). An unrelated service on the
+#                      port (404/401/403/500 or 200 with a foreign body) is
+#                      NOT treated as the dashboard. No admin password, no
+#                      session cookie, no CSRF token, no recovery key, no
+#                      service.api bearer secret; the body is never emitted.
 #
 # P2 stale semantics: a FRESH FILE is not proof of a healthy collector.
 #   collector-loop: stale = malformed OR collector_stale OR age_stale
@@ -57,14 +62,15 @@ SBMON_ENV_MODE=""
 SBMON_ENV_API_URL=""
 SBMON_ENV_CYCLE_SECONDS=""
 SBMON_ENV_WEB_BIND=""
-SBMON_ENV_WEB_POLL_SECONDS=""
+# SBMON_ENV_WEB_POLL_SECONDS is left UNSET so an absent key (default 1) can be
+# distinguished from a present-but-empty value (R1.1-D: rejected, same rule as
+# monitor-service).
 monitor_env_load "$CONF" || { echo '{"error":"conf unreadable"}'; exit 1; }
 
 MODE="${SBMON_ENV_MODE:-web}"
 API_URL="${SBMON_ENV_API_URL:-http://127.0.0.1:9091}"
 CYCLE_SECONDS="${SBMON_ENV_CYCLE_SECONDS:-300}"
-WEB_POLL="${SBMON_ENV_WEB_POLL_SECONDS:-1}"
-case "$WEB_POLL" in ''|*[!0-9.]*) WEB_POLL=1 ;; esac
+WEB_POLL="${SBMON_ENV_WEB_POLL_SECONDS-1}"
 
 service_active=false
 if "$SBMON_SYSTEMCTL" is-active --quiet "$SBMON_SERVICE_NAME" 2>/dev/null; then
@@ -104,7 +110,13 @@ if [ "$MODE" = "web" ]; then
     # helper prints ONLY whitelisted tokens (present/wellformed verdict,
     # version int, two 0/1 flags) -- health-file values are never echoed.
     HEALTH_FILE="$STATE_DIR/health.json"
-    max_age=$(( 5 * ${WEB_POLL%%.*} + 15 ))
+    # R1.1-D: freshness window from the SAME strict poll contract the service
+    # enforces (ceil(5*poll+15), Python float). An invalid poll yields an
+    # unusable window (max_age=-1) so the record can never look fresh -- the
+    # probe never substitutes a different rule than the service.
+    if ! max_age="$(monitor_env_poll_max_age "$WEB_POLL")"; then
+        max_age=-1
+    fi
     if [ -f "$HEALTH_FILE" ]; then
         broker_present=true
         now="$(monitor_env_now)"
@@ -149,22 +161,42 @@ PY
         broker_stale=false
     fi
 
-    # R1-7: unauthenticated loopback liveness probe (GET /api/v1/session).
+    # R1-7 / R1.1-C: unauthenticated loopback IDENTITY probe. Getting a
+    # response is NOT proof this is the E2 dashboard: an unrelated program on
+    # the port could answer 404/401/403 -- or even 200 with some other body.
+    # We therefore require HTTP 200 AND a decodable JSON object carrying the
+    # minimal stable E2 session shape:
+    #   authenticated bool, whitelist_allowed bool, version non-empty string
+    # (optionally password_configured / recovery_configured / remote_mode as
+    # bools). No admin password, cookie, CSRF token, recovery key or
+    # service.api bearer is ever used, no response body is ever emitted.
     web_http="unavailable"
     if monitor_env_split_web_bind "${SBMON_ENV_WEB_BIND:-127.0.0.1:9191}" \
        && command -v "$pybin" >/dev/null 2>&1; then
         if "$pybin" - "$REPLY_BIND_HOST" "$REPLY_BIND_PORT" <<'PY' >/dev/null 2>&1; then
-import http.client, sys
+import http.client, json, sys
 host, port = sys.argv[1], int(sys.argv[2])
 try:
     conn = http.client.HTTPConnection(host, port, timeout=3)
-    # Deliberately UNAUTHENTICATED: no password, no cookie, no CSRF token,
-    # no recovery key, no service.api bearer. Any non-5xx answer proves the
-    # dashboard is alive (a closed dashboard answers 401/403).
     conn.request("GET", "/api/v1/session")
     resp = conn.getresponse()
-    resp.read()
-    sys.exit(0 if resp.status < 500 else 1)
+    raw = resp.read()
+    if resp.status != 200:
+        sys.exit(1)
+    payload = json.loads(raw.decode("utf-8"))
+    if not isinstance(payload, dict):
+        sys.exit(1)
+    if not isinstance(payload.get("authenticated"), bool):
+        sys.exit(1)
+    if not isinstance(payload.get("whitelist_allowed"), bool):
+        sys.exit(1)
+    version = payload.get("version")
+    if not isinstance(version, str) or not version:
+        sys.exit(1)
+    for key in ("password_configured", "recovery_configured", "remote_mode"):
+        if key in payload and not isinstance(payload[key], bool):
+            sys.exit(1)
+    sys.exit(0)
 except Exception:
     sys.exit(1)
 PY

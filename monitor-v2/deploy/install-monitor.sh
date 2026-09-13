@@ -467,18 +467,24 @@ cmd_history() {
 }
 
 # ---------------------------------------------------------------------------
-# R1-8: web-setup -- run the already-reviewed E2 `webapp.py setup` AS THE
-# SERVICE IDENTITY so auth.json / access.json are never root-owned.
+# R1-8 / R1.1-B,E: web-setup -- run the already-reviewed E2 `webapp.py setup`
+# AS THE SERVICE IDENTITY so auth.json / access.json are never root-owned.
 #   * under the deployment lock (F4);
-#   * the ONLY env value forwarded is SSH_CONNECTION (the E2 setup uses it
-#     to OFFER the current SSH source /32|/128 -- it never auto-adds one
-#     without the interactive confirmation);
+#   * E: the setup runs in an EXPLICIT CLEAN environment (`env -i`): only
+#     HOME (the data root), a fixed approved PATH and SSH_CONNECTION are
+#     forwarded. The caller's environment is NOT inherited (no BOX_API_SECRET,
+#     no token/cookie, no arbitrary env); the python binary is resolved by
+#     root first (`command -v`) and passed as an absolute path;
+#   * SSH_CONNECTION is the only data value forwarded (E2 uses it to OFFER the
+#     current SSH source /32|/128 -- it never auto-adds without confirmation);
 #   * fully interactive: the password prompt and the one-time recovery-key
 #     display stay on the terminal; no plaintext password is accepted or
 #     echoed non-interactively; neither password nor recovery key is ever
-#     written to the journal (this shim adds no logging of them);
-#   * on success, ownership/metadata of the data root and the flat
-#     auth.json / access.json converge to the service user;
+#     written to the argv, the environment, the journal or the installer log;
+#   * B: after setup, NO root-side chown/chmod of auth.json / access.json (or
+#     any service-owned child). The installer only runs a NON-DESTRUCTIVE
+#     postcondition check; a mismatch fails closed with a manual-fix hint --
+#     it never "rescues" root-owned data automatically;
 #   * if the monitor service WAS active, restart ONLY singbox-monitor so a
 #     process started with auth=None reloads the fresh AuthStore;
 #     sing-box is never touched;
@@ -499,38 +505,48 @@ _cmd_web_setup_locked() {
     local was_active=0
     if sbmon_service_active; then was_active=1; fi
 
+    # E: build the explicit clean environment ONCE (never inherit the caller).
+    local -a setup_env=(env -i \
+        HOME="$SBMON_STATE_ROOT" \
+        PATH=/usr/sbin:/usr/bin:/sbin:/bin)
+    if [ -n "$ssh_conn" ]; then
+        setup_env+=("SSH_CONNECTION=$ssh_conn")
+    fi
+
     local rc=0
     if [ "$SBMON_FIXTURE" = "1" ]; then
-        # Fixture/non-root test runs execute directly (same reviewed code).
-        SSH_CONNECTION="$ssh_conn" "$SBMON_PYTHON3" "$webapp" setup \
+        # Fixture/non-root test runs execute directly (same reviewed code),
+        # still under the same clean environment contract.
+        "${setup_env[@]}" "$SBMON_PYTHON3" "$webapp" setup \
             --data-dir "$SBMON_STATE_ROOT" || rc=$?
     else
         command -v "$SBMON_SUDO" >/dev/null 2>&1 \
             || sbmon_die "web-setup: 缺少 sudo，无法以 $SBMON_USER 运行 setup：fail-closed"
+        # E: resolve the interpreter as root, then exec it by absolute path
+        # inside the clean env (the fixed PATH does not have to contain it).
+        local pybin
+        pybin="$(command -v "$SBMON_PYTHON3")" \
+            || sbmon_die "web-setup: 找不到 python3（$SBMON_PYTHON3）：fail-closed"
         # -n: non-interactive sudo (fail instead of prompting for a root
-        # password mid-setup). Only SSH_CONNECTION is forwarded.
-        "$SBMON_SUDO" -n -u "$SBMON_USER" -- env \
-            SSH_CONNECTION="$ssh_conn" "$SBMON_PYTHON3" "$webapp" setup \
+        # password mid-setup). stdin/stdout/stderr/TTY stay attached.
+        "$SBMON_SUDO" -n -u "$SBMON_USER" -- "${setup_env[@]}" \
+            "$pybin" "$webapp" setup \
             --data-dir "$SBMON_STATE_ROOT" || rc=$?
     fi
     if [ "$rc" != 0 ]; then
-        sbmon_warn "web setup 失败（rc=$rc）；既有 auth/access 数据保持不变"
+        # B: honest failure message. E2 setup performs several persistence
+        # steps; a later-step failure does NOT prove earlier steps wrote
+        # nothing, so we never claim the data is byte-identical/unchanged.
+        sbmon_warn "web setup 失败（rc=$rc）；setup 可能已完成部分持久化写入，请检查 $SBMON_STATE_ROOT/auth.json 与 access.json 后重试；Monitor 未因本次失败自动重启。"
         return "$rc"
     fi
 
-    # Metadata convergence (root pass only): the data root and the flat
-    # access files must be service-user-owned and private. Legacy auth/ and
-    # access/ DIRECTORIES (old installs) are never touched here.
-    if [ "$SBMON_FIXTURE" != "1" ]; then
-        chown "$SBMON_USER:$SBMON_GROUP" "$SBMON_STATE_ROOT"
-        chmod 0700 "$SBMON_STATE_ROOT"
-        local f
-        for f in auth.json access.json; do
-            if [ -f "$SBMON_STATE_ROOT/$f" ] && [ ! -L "$SBMON_STATE_ROOT/$f" ]; then
-                chown "$SBMON_USER:$SBMON_GROUP" "$SBMON_STATE_ROOT/$f"
-                chmod 0600 "$SBMON_STATE_ROOT/$f"
-            fi
-        done
+    # B: NO root-side privileged mutation of service-owned children. Ownership
+    # and mode of the data root / auth.json / access.json are guaranteed by
+    # E2 storage/setup itself; here we only VERIFY (never chown/chmod).
+    if ! sbmon_verify_service_owned_tree; then
+        sbmon_warn "web setup 后置校验失败：未重启 Monitor；请按上方提示人工修复数据根/auth.json/access.json 权限后重试"
+        return 1
     fi
     sbmon_info "web setup 完成（auth.json / access.json 位于 $SBMON_STATE_ROOT，属主 $SBMON_USER）"
 

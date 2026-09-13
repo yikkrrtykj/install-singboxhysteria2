@@ -120,6 +120,14 @@ spool `/var/lib/sbox-cm/spool/`、helper `/usr/local/lib/sbox-cm/sbox-cm` + 单�
    （migration-safe convergence，不是 destructive cleanup）；新安装不再创建它们。
    auth.json / access.json 从不由 install/upgrade/repair/rollback 覆盖。
    它们仍是 E2 的隐私面（口令哈希、recovery key、白名单），只 owner 可进。
+   **R1.1-A 权限边界**：`/var/lib/singbox-monitor` 的父目录 `/var/lib` 由 root 控制，所以 root
+   只安全地创建/确认**顶层 data root**（必须是真实目录，symlink / 非目录一律 fail-closed）并把它
+   收敛为 `sboxweb:sboxweb 0700`。其下一切（`state/`、auth.json …）都在 **sboxweb 拥有的目录**里，
+   sboxweb 可以随时替换其中的 child entry，因此 root **绝不对这些 child pathname 做
+   chown/chmod**（`check -> chmod/chown` 的 TOCTOU + symlink-follow 会被升级为提权原语，
+   仅加 `[ ! -L path ]` 不能修复）。`state/` 的创建与 mode 收敛改为 `sbmon_ensure_state_tree_as_service_user`
+   **以 sboxweb 身份**执行；即便 check 与 mutation 之间存在 race，mutation 本身也只在 sboxweb
+   权限下运行，无法形成 root 提权。不做整个 data root 的递归 chown/chmod。
 6. **VERSION 放在 release 树内**：`upgrade` 判定、`status`、health 都读激活树里的 VERSION，
    单一事实源。
 
@@ -186,7 +194,10 @@ sudoers、exact-token 读权直接复用，不需要迁移 service identity。
   web 模式 fail-closed 前置条件：`SBMON_API_SECRET_FILE` 必须已配置且是**存在、普通文件
   （非 symlink）、可读、非空**；exec 前 `unset BOX_API_SECRET`（secret 只经文件传递，
   绝不进 unit 文件/argv/journal）；`SBMON_WEB_BIND` 必须是 loopback 形式（IPv4/IPv6/localhost），
-  `0.0.0.0`、LAN/公网地址、畸形端口一律拒绝启动。
+  `0.0.0.0`、LAN/公网地址、畸形端口一律拒绝启动。**R1.1-D**：`SBMON_WEB_POLL_SECONDS` 必须是
+  **有限浮点且 > 0**（`monitor-env.sh` 用 Python `float` 解析，而非 Bash 字符检查）；`0`/`0.0`/
+  负数/`NaN`/`inf`/`Infinity`/`.`/`1..2`/乱码都 fail-closed，**在 exec webapp 之前**退出
+  （`0` 会让 SnapshotBroker publisher 的 `wait(0)` 变成 tight loop）；缺省（键不存在）为 `1`。
 - `SBMON_MODE=collector-loop`（**兼容模式**，显式启用）：循环跑 E1 collector——首拍 `--once`
   （秒级拿到 reset 权威快照），此后每拍 `--duration $SBMON_CYCLE_SECONDS`；stdout 原子写
   （tmp + mv）到 `state/snapshot.json`。流失败 → 暂停 5s 重连；每次新订阅的第一条消息就是全量
@@ -195,6 +206,17 @@ sudoers、exact-token 读权直接复用，不需要迁移 service identity。
   `webapp.py setup`（交互式口令 + 恢复键），使 auth.json/access.json 不会意外变成 root 属主。
   它绝不自动加入白名单、绝不以明文口令非交互运行、绝不记录口令/恢复键；若服务此前 active，
   成功 setup 后**只重启 singbox-monitor**（不触碰 sing-box）。无人值守安装不会自动跑它。
+  - **R1.1-E 干净环境**：production 下先以 root `command -v` 解析 python 绝对路径，再通过
+    `env -i HOME=<data-root> PATH=/usr/sbin:/usr/bin:/sbin:/bin SSH_CONNECTION=... <pybin> …`
+    运行（`sudo -n -u sboxweb`）。**只有** HOME/PATH/SSH_CONNECTION 被转发；`BOX_API_SECRET`、
+    token/cookie、任意调用者环境一概不继承；口令/恢复键绝不进 argv / env / journal / 安装日志；
+    stdin/stdout/stderr/TTY 保持（setup 是交互式的）。
+  - **R1.1-B 无 root 改动**：setup 成功后**删除**了原先对 data root 及 auth.json/access.json 的
+    root `chown`/`chmod`。属主/权限由 E2 storage/setup 自己保证（data root `sboxweb:sboxweb 0700`，
+    auth.json/access.json `sboxweb:sboxweb 0600`）；安装器只做**非破坏性**后置校验
+    （`sbmon_verify_service_owned_tree`），一旦漂移即 fail-closed 并给人工修复提示，**绝不自动
+    "救回"** root 属主的数据。setup 失败信息也改为诚实表述（可能已完成部分持久化写入），且
+    **不会**因此重启 Monitor。
 - web 进程存活性（systemd active）与 service.api 连通性从第一天就是两个信号（§6）。
 
 ## 5. 安装语义（任务 6：fresh / upgrade / repair / uninstall 严格区分）
@@ -266,7 +288,7 @@ generated YAML —— 一个都不许出现）的实现方式：
  "broker_health": {             ← web 模式：只读 <data-root>/state/health.json（最小记录）
    "present": bool, "wellformed": bool, "age_seconds": int, "age_stale": bool,
    "collector_stale": bool, "consumer_alive": bool, "stale": bool},
- "web_http": "ok"|"unavailable"|"not-applicable",   ← web 模式的未认证 loopback 活跃度探针
+ "web_http": "ok"|"unavailable"|"not-applicable",   ← web 模式的未认证 loopback 身份探针（R1.1-C）
  "mode": "web", "overall": "healthy|degraded|unhealthy"}
 ```
 
@@ -280,8 +302,14 @@ generated YAML —— 一个都不许出现）的实现方式：
 - api 不可达在"sing-box 没起来"时是**正确状态**（degraded，不是 crash）——monitor 的职责就是
   把它显示出来；
 - `web_http` 在 collector-loop 模式 `not-applicable`；web 模式对 loopback 执行
-  **未认证** `GET /api/v1/session`（无 admin 口令、无 session cookie、无 CSRF token、
-  无 recovery key、无 service.api bearer），任何 <500 的应答即证明 dashboard 存活。
+  **未认证身份探针** `GET /api/v1/session`（无 admin 口令、无 session cookie、无 CSRF token、
+  无 recovery key、无 service.api bearer）。**R1.1-C**：探针要求 **HTTP 200** 且 body 是合法
+  **JSON object** 并满足最小稳定 shape（`authenticated` / `whitelist_allowed` 为 bool，
+  `version` 为非空 string；可选 `password_configured`/`recovery_configured`/`remote_mode` 为 bool）。
+  404/401/403/500、或 200 但 body 非 JSON / shape 不符（例如 9191 上跑着别的程序）一律记为
+  **degraded**；body 内容永不出现在探针输出里。
+- **R1.1-D**：broker 健康新鲜度窗口由 `ceil(5 * SBMON_WEB_POLL_SECONDS + 15)` 计算（Python），
+  不再用 `${WEB_POLL%%.*}` 的整数截断；非法 poll 不会让记录"看起来新鲜"（age_stale=true）。
 - web 模式**不读** snapshot.json，只读最小健康记录；`auth.json`/`access.json` 内容
   永不被探针读取或输出。
 
@@ -353,6 +381,13 @@ E2/E3/本分支三线并行，避免对共享文件制造冲突；接线由 Inte
 | round 1 P1 state path | T08b（从 `/`、`$TMP`、随机 cwd 跑 health → 读同一 snapshot） |
 | round 1 P2 语义 stale | T08（fresh+stale:true→degraded；old+stale:false→degraded；malformed→degraded；missing→degraded；**api reachable + stale=true 绝不 healthy**） |
 | round 1 P6/P7 service fail-closed | T08c（missing/wrong-type secret → 立即退出；非 loopback/带 path 的 URL → 立即退出；IPv6 `[::1]` 合法接受；secret 值零输出） |
+| round 1 web 健康 | T18（broker_health + web_http；未认证 `/api/v1/session`） |
+| round 1 web-setup | T19（以 sboxweb 身份跑真实 `webapp.py setup`；只重启 monitor；不自动加白名单） |
+| **round 1.1-A 权限边界** | R1.1-A（`state/` 正常 → PASS；`state/` 为 symlink → fail-closed 且 **sentinel 的 uid:gid:mode/内容完全不变**；`state/` 非目录 → fail-closed；失败发生在 release/history 变更之前；既有 auth.json/access.json 字节不变） |
+| **round 1.1-B 无 root 改动** | T19（web-setup 函数内无 root `chown`/`chmod`；root-owned symlink sentinel 元数据不变；setup 失败信息诚实、且不重启 Monitor；成功时 auth.json/access.json 为 sboxweb:group 0600） |
+| **round 1.1-C 身份校验** | T20（真实 E2 session 200+JSON → healthy；404/401/403/500、200 非 JSON、shape 不符、无监听 → degraded；body 内容不出现在输出） |
+| **round 1.1-D poll 契约** | T21（`1/1.0/0.5/2.25` 接受；`0/0.0/-1/NaN/inf/Infinity/./1..2/abc/空` 拒绝且不 exec；service 与 health 同一规则；`ceil(5*v+15)`） |
+| **round 1.1-E 干净环境** | T19（注入 `BOX_API_SECRET`/任意 env 对 setup 不可见；`SSH_CONNECTION` 可见；`HOME`==data root；`PATH`==批准路径） |
 
 真机 canary（A/B 场景在真实 VPS 上的冒烟）属于部署验收，不在本 PR 内执行；
 production 保持 UNCHANGED。
@@ -367,7 +402,7 @@ production 保持 UNCHANGED。
 版本比较、幂等 install/upgrade/repair/uninstall/rollback/health/status、web + collector-loop 运行形态、
 web-setup、
 分离式健康探测、S0 secret 派生桥（§11.2）、部署锁与完整事务回滚（§7/§11/§12）、
-临时根测试装置（T01–T17 + F/R3/R4 系列）。
+临时根测试装置（T01–T21 + F/R3/R4 系列 + R1.1-A/B/C/D/E）。
 
 Deferred：E3 privileged helper/sudoers；
 install.sh 菜单接线；full-stack uninstall 菜单组合；真机 VPS canary；legacy config mutation lock
@@ -447,3 +482,26 @@ integration（modify_singbox/process_doko 等的 config.lock 问题）。
   直到满足 KEEP 或只剩 live —— 不会因 skip live 而超量保留。
 - history 语义不变（R3-5/F1）：durable successful commit record，prune 永不重写；
   default rollback newest→oldest、skip current、skip 目录已不存在的条目。
+
+---
+
+## 14. Integration Round 1.1 — integration hardening（本轮）
+
+小范围 integration hardening，5 个 fail-closed 修复；**不新增断言删除/弱化，全部 additive**。
+
+- **A 服务自有 state tree 权限边界**：root 只负责顶层 data root（必须真实目录，symlink/非目录
+  fail-closed），收敛为 `sboxweb:sboxweb 0700`；`state/` 由
+  `sbmon_ensure_state_tree_as_service_user` **以 sboxweb 身份**创建/收敛；root 绝不对 service-owned
+  child pathname 做 chown/chmod（`check→chown/chmod` 的 TOCTOU + symlink-follow 不能提权）；
+  不递归 chown/chmod；auth/access 迁移安全。
+- **B 移除 web-setup 的 root privileged mutation**：删除 setup 成功后对 data root / auth.json /
+  access.json 的 root chown/chmod；改为非破坏性后置校验 `sbmon_verify_service_owned_tree`
+  （漂移→fail-closed + 人工修复提示，绝不自动救回 root 属主数据）；失败信息诚实（可能部分持久化）
+  且不重启 Monitor；成功时只重启 `singbox-monitor`；sing-box 永不被触碰。
+- **C web 健康身份校验**：`web_http` 要求 200 + 合法 JSON object + 最小 session shape
+  （`authenticated`/`whitelist_allowed` bool、`version` 非空 string）；无关程序/畸形应答 → degraded；
+  body 不输出；不增加登录凭据依赖。
+- **D poll 严格契约**：`SBMON_WEB_POLL_SECONDS` 必须是有限浮点 > 0（Python float，service 与 health
+  同一函数）；非法值在 `exec` 前 fail-closed；缺省=1；健康新鲜度 `ceil(5*poll+15)`。
+- **E web-setup 干净环境**：`env -i` + 仅 HOME/PATH/SSH_CONNECTION；root 先 `command -v` 解析
+  python 绝对路径；不继承调用者环境；口令/恢复键不进 argv/env/journal；stdin/stdout/stderr/TTY 保留。

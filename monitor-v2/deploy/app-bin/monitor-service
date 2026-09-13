@@ -51,7 +51,9 @@ SBMON_ENV_API_URL=""
 SBMON_ENV_API_SECRET_FILE=""
 SBMON_ENV_CYCLE_SECONDS=""
 SBMON_ENV_WEB_BIND=""
-SBMON_ENV_WEB_POLL_SECONDS=""
+# SBMON_ENV_WEB_POLL_SECONDS is intentionally left UNSET before the load so an
+# absent key (default 1) can be told apart from a present-but-empty value
+# (R1.1-D: empty and every malformed form are rejected, never defaulted).
 monitor_env_load "$CONF" || { echo "monitor-service: cannot read conf" >&2; exit 1; }
 
 MODE="${SBMON_ENV_MODE:-web}"
@@ -163,8 +165,15 @@ run_web() {
         log "SBMON_WEB_BIND='$bind' is not an accepted loopback bind (accepts 127.0.0.1:p | localhost:p | [::1]:p); wildcard/LAN/public/malformed forms refuse to start"
         exit 1
     fi
-    local poll="${SBMON_ENV_WEB_POLL_SECONDS:-1}"
-    case "$poll" in ''|*[!0-9.]*) log "SBMON_WEB_POLL_SECONDS must be a positive number"; exit 1 ;; esac
+    # R1.1-D: strict FINITE > 0 contract (Python float parse) before exec; a
+    # 0/0.0 poll would make the SnapshotBroker publisher wait(0) spin. An
+    # absent key defaults to 1; a present-but-empty/invalid value is rejected.
+    # Never echo the raw value (it is not a secret, but the message is generic).
+    local poll="${SBMON_ENV_WEB_POLL_SECONDS-1}"
+    if ! monitor_env_validate_poll_seconds "$poll"; then
+        log "SBMON_WEB_POLL_SECONDS must be a finite number greater than 0; refusing to start (fail-closed)"
+        exit 1
+    fi
 
     mkdir -p "$STATE_DIR"
     # R1-5: file-based delivery only -- the secret must never enter the
