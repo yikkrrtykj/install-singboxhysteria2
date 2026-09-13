@@ -906,7 +906,7 @@ if [ "$SYMLINKS_OK" = 1 ]; then
     # as live, so the live-oldest edge is exercised by invoking the REAL
     # sbmon_prune_releases (sourced from the deploy lib with the same
     # fixture environment) with KEEP=2 while A is live.
-    ( SBMON_KEEP_RELEASES=2 source "$REPO_ROOT/monitor-v2/deploy/lib/monitor-deploy-lib.sh"; sbmon_prune_releases ) > "$TMP/out-r413d.log" 2>&1
+    ( SBMON_KEEP_RELEASES=2 source "$REPO_ROOT/monitor-v2/deploy/lib/monitor-deploy-lib.sh"; sbmon_prune_releases ) > "$TMP/out-r413d.log" 2>&1         || { RC_R413D=$?; echo "--- prune invocation output (rc=$RC_R413D) ---" >&2; cat "$TMP/out-r413d.log" >&2; echo "--- end ---" >&2; false; }
     assert_rc 0 $? "prune with live=oldest succeeds (R4.1-3)"
     ls -d "$FIX_RELEASES/1.0.0-"* >/dev/null 2>&1 && pass "live A retained despite being oldest (R4.1-3)" || fail "live A was pruned"
     if ls -d "$FIX_RELEASES/1.1.0-"* >/dev/null 2>&1; then
