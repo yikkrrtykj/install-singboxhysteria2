@@ -1568,6 +1568,13 @@ if [ "$SYMLINKS_OK" = 1 ]; then
     SETUP_RC=0
     SSH_CONNECTION='203.0.113.77 55222 198.51.100.5 22' "$INSTALL_MONITOR" web-setup < /dev/null > "$SETUP_OUT" 2>&1 || SETUP_RC=$?
     assert_grep 'deployment lock acquired' "$SETUP_OUT" "web-setup runs under the deployment lock"
+    if [ "$SETUP_RC" != 0 ]; then
+        # Diagnostic only: token-looking strings are masked so no secret or
+        # recovery key can reach the CI log.
+        printf '  --- web-setup output (masked) ---\n'
+        sed -E 's/[A-Za-z0-9_-]{24,}/<redacted>/g' "$SETUP_OUT" 2>/dev/null | head -25
+        printf '  --- end web-setup output ---\n'
+    fi
     assert_rc 0 "$SETUP_RC" "web-setup runs the reviewed E2 setup to completion as the service identity"
     assert_grep 'singbox-monitor' "$SETUP_OUT" "web-setup reports the monitor-only restart"
     tail -n +"$((CALLS_BEFORE_SU + 1))" "$MOCK_CALL_LOG" > "$TMP/t19-calls.log"
