@@ -46,20 +46,23 @@ suites assert, so its Phase C/D/S0 failures are an environment artifact. The
 frozen-branch control comparison there showed zero local integration
 regression (kept as a development record, not a verdict).
 
-Linux CI (PR #16 checks): first confirmed at head `3131c73`; re-confirmed at
-`768ed50` after Round 0.1 added E1/E2/E4 as mandatory `shell-tests` steps
-(counts identical):
+Linux CI (PR #16 checks) — **Round 1 head, all green**:
 
-| Gate | Linux CI result |
-|---|---|
-| Phase C | **121/121 PASS** |
-| Phase D | **105/105 PASS** |
-| S0 baseline | **133/133 PASS** |
-| Packaging fixture | **307/307 PASS** |
-| Packaging root metadata | **309/309 PASS** |
-| E1 | **188/188 PASS** (self-contained; green locally on Windows too) |
-| E2 | **252/252 PASS** (self-contained; green locally on Windows too) |
-| E4 | **161/161 PASS** (self-contained; green locally on Windows too) |
+| Gate | Linux CI result | vs Round 0.1 |
+|---|---|---|
+| Phase C | **121/121 PASS** | unchanged |
+| Phase D | **105/105 PASS** | unchanged |
+| S0 baseline | **133/133 PASS** | unchanged |
+| E1 | **188/188 PASS** | unchanged |
+| E2 | **272/272 PASS** | +20 new R1 assertions (health export) |
+| E4 | **161/161 PASS** | unchanged |
+| Packaging fixture | **381/381 PASS** | +74 new R1 assertions |
+| Packaging root metadata | **385/385 PASS** | +76 new R1 assertions |
+
+No existing assertion was removed or weakened; every change is additive. The
+E2 suite's `EXPECTED_PASS` moved 252 → 272 and the packaging suite grew with
+the Round 1 coverage in R1-9 (staging, persistence, web runtime, secret
+matrix, bind contract, health probe, web-setup).
 
 Round 0.1 adds E1/E2/E4 as mandatory steps of the `shell-tests` workflow (no
 `continue-on-error`), so every future push of this PR re-proves them on
