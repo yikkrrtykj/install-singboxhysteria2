@@ -28,6 +28,7 @@ jobs:
           bash -n tests/test-monitor-v2-e1.sh
           bash -n tests/test-monitor-v2-e2.sh
           bash -n tests/test-monitor-v2-e4.sh
+          bash -n tests/test-legacy-config-transactions.sh
 
       - name: Phase C regression suite
         run: bash tests/test-phase-c.sh
@@ -37,6 +38,9 @@ jobs:
 
       - name: S0 security-baseline regression suite (incl. Linux-only mode assertions)
         run: bash tests/test-security-baseline.sh
+
+      - name: Legacy config transaction hardening regression suite (real flock on Linux)
+        run: bash tests/test-legacy-config-transactions.sh
 
       - name: E1 collector regression suite
         run: bash tests/test-monitor-v2-e1.sh
