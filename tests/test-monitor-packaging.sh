@@ -374,6 +374,7 @@ if [ "$SYMLINKS_OK" = 1 ]; then
 section "T02 idempotent second install"
 CONF_HASH_1="$(sha256sum "$FIX_CONF_DIR/monitor.conf" | cut -d' ' -f1)"
 CONF_MTIME_1="$(stat -c '%Y' "$FIX_CONF_DIR/monitor.conf")"
+mkdir -p "$FIX_STATE/auth" "$FIX_STATE/access"
 echo 'auth-marker-must-survive' > "$FIX_STATE/auth/probe"
 echo 'access-marker-must-survive' > "$FIX_STATE/access/probe"
 printf '{"legacy": true}\n' > "$FIX_STATE/auth.json"
