@@ -743,7 +743,7 @@ if [ "$SYMLINKS_OK" = 1 ]; then
     echo inactive > "$MOCK_SYS_STATE"   # old_active=0
     printf '0.6.0\n' > "$FIX_SRC/VERSION"
     : > "$MOCK_FAIL_STOP"
-    : > "$MOCK_FAIL_START"
+    export MOCK_FAIL_START=1   # mock reads non-emptiness only
     OUT_R4B="$TMP/out-r4b.log"
     run_install "$OUT_R4B"
     RC_R4B=$?
