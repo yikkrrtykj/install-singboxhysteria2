@@ -91,16 +91,32 @@ jobs:
               -e 's|@SBMON_STATE_ROOT@|/var/lib/singbox-monitor|g' \
               monitor-v2/deploy/singbox-monitor.service.in > "$UNIT"
           systemd-analyze verify "$UNIT" 2>&1 | tee "$RUNNER_TEMP/unit-verify.log"
-          # Never silently ignore an unsupported security-critical directive:
+          # HARD GATE #1 (all baselines): the unit must parse cleanly AND the
+          # verify process itself must exit 0. `set -o pipefail` above makes
+          # the pipeline propagate systemd-analyze's rc through tee, so a
+          # verify failure is a step failure -- never soft-passed. Never
+          # silently ignore an unsupported security-critical directive --
           # systemd reports ignored/unknown keys as warnings in verify output.
           if grep -Eqi 'unknown key|unsupported|not supported|failed to parse' "$RUNNER_TEMP/unit-verify.log"; then
             echo "::error::systemd on ${{ matrix.os }} rejected or ignored a directive in the production unit"
             exit 1
           fi
-          # Hardening exposure level is informational (scored); the run still
-          # proves every hardening directive parses on this baseline.
-          systemd-analyze security --offline=yes "$UNIT" | tee "$RUNNER_TEMP/unit-security.log" \
-            || echo "note: offline security analysis not available on this systemd"
+          # HARD GATE #2 (capability-detected): systemd-analyze security
+          # --offline=yes is enforced wherever this systemd supports it: its
+          # rc is propagated by pipefail, so a nonzero rc fails the step. On a
+          # baseline whose systemd lacks offline analysis, `verify` above
+          # remains the hard gate and `security` is explicitly documented as
+          # INFORMATIONAL-only there (documented in monitor-v2/deploy/README.md
+          # §"兼容性预检与环境诊断") -- it is never silently soft-passed.
+          # The capability probe goes through a FILE (not `cmd | grep -q`):
+          # under pipefail, grep -q can exit early and SIGPIPE the producer,
+          # which would turn the probe itself into a spurious hard failure.
+          if systemd-analyze security --help >"$RUNNER_TEMP/security-help.log" 2>&1 \
+             && grep -q -- '--offline' "$RUNNER_TEMP/security-help.log"; then
+            systemd-analyze security --offline=yes "$UNIT" | tee "$RUNNER_TEMP/unit-security.log"
+          else
+            echo "systemd-analyze security --offline is NOT supported on this baseline (systemd $(systemd --version | head -n1 | awk '{print $2, $3}')); 'verify' is the enforced hard gate here and the security analysis is informational-only on this runner (documented contract)."
+          fi
 
       - name: Integration regression complete (all prior steps green)
         run: "echo 'Phase C + Phase D + S0 + Legacy + E1 + E2 + E4 + Packaging + existing-api-auth migration + journal-time compat: all green on ${{ matrix.os }}'"

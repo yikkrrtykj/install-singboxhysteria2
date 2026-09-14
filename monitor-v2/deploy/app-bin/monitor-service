@@ -50,8 +50,10 @@ STATE_DIR="$DATA_ROOT/state"
 
 # Compatibility preflight (capability detection, never distro-version
 # branching): fail closed BEFORE any state is touched when a required
-# runtime command is missing (see monitor-env.sh for the required set).
-if ! monitor_env_require_commands; then
+# runtime command is missing. The service set is MINIMAL (python3 only --
+# see monitor-env.sh for the per-command rationale); the full compatibility
+# preflight lives in the deployment path.
+if ! monitor_env_require_commands service; then
     exit 1
 fi
 monitor_env_record_environment   # diagnostics (stderr/journal), no secrets

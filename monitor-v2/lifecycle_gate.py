@@ -55,6 +55,18 @@ Grace semantics (enforced here):
 * grace can NEVER rescue a primary-window failure of any other gate
   (traffic / USER / INBOUND / lifecycle): those go straight to FAIL.
 
+Sticky scoped CLOSED evidence: the final/grace snapshot is NOT judged from
+``recent_connections`` alone -- that is a bounded 20-row display cache, so a
+busy device closing >20 newer connections can evict the wanted closure AFTER
+it was observed. The gate therefore reads the UNION of recent_connections and
+the collector's evidence-grade ``closed_ids`` projection (every closed
+lifecycle within the collector's TTL bank, which outlives the whole grace
+interval), always under the ORIGINAL baseline subtraction and the USER×
+INBOUND scope. Display-cache eviction after observation can therefore never
+cause a false FAIL (and the baseline subtraction keeps replayed ids dead, so
+it can never cause a false PASS either). The dashboard cache itself is NOT
+enlarged as the fix.
+
 When the gate is called WITHOUT ``grace_final`` and reports
 ``grace_eligible`` (also printed as a GRACE_ELIGIBLE line by the CLI), the
 caller MAY enter the grace window; it is never mandatory.

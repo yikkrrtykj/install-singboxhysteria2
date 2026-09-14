@@ -3,6 +3,6 @@ __pycache__/
 *.pyc
 
 # Local scratch / debug files
-.dbg-restore.sh
+.dbg-*.sh
 sc.zip
 sc-bin/

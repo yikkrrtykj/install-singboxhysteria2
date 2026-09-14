@@ -201,25 +201,62 @@ monitor_env_now() { date +%s; }
 monitor_env_mtime() { stat -c '%Y' "$1" 2>/dev/null || echo 0; }
 
 # ---------------------------------------------------------------------------
-# Compatibility preflight (capability detection -- never distro-version
+# Runtime dependency preflight (capability detection -- never distro-version
 # branching; supported baselines: Ubuntu 22.04 / 24.04 / 26.04 LTS).
 # The runtime entrypoints FAIL CLOSED on any missing required command with a
 # single clear diagnostic -- no degraded mode, no silent downgrade.
-# SBMON_REQUIRED_COMMANDS may override the default set for fixtures/tests;
-# setting it (even to empty) replaces the default entirely.
+#
+# Dependency sets are SPLIT by consumer (documented per command):
+#   service : python3 -- executes webapp.py / collector.py; the whole E1/E2
+#             runtime is stdlib Python. (mkdir/mv/sleep are coreutils and
+#             always present; they are not named dependencies.)
+#   health  : python3 -- JSON verdict helpers + the loopback identity probe;
+#             systemctl -- the service_active signal;
+#             stat -- mtime-based freshness windows (monitor_env_mtime).
+# journalctl / jq / ss / flock / sha256sum / mktemp are DEPLOYMENT/canary-side
+# tooling: they are required by the full compatibility preflight in
+# monitor-deploy-lib.sh, never by the runtime shims.
+#
+# SBMON_REQUIRED_COMMANDS may override a set ONLY behind the explicit
+# test-only gate SBMON_TEST_ALLOW_REQUIRED_COMMANDS_OVERRIDE=1 (production
+# invocations refuse the bypass: fail-closed).
 # ---------------------------------------------------------------------------
-monitor_env_require_commands() { # monitor_env_require_commands -> rc 0 all present
+monitor_env_required_command_set() { # monitor_env_required_command_set <service|health>
+    case "$1" in
+        service) printf '%s\n' python3 ;;
+        health)  printf '%s\n' python3 systemctl stat ;;
+        *) return 1 ;;
+    esac
+}
+
+monitor_env_require_commands() { # monitor_env_require_commands <service|health> -> rc 0 all present
+    local set_name="${1:-service}"
+    local list
+    list="$(monitor_env_required_command_set "$set_name")" || {
+        printf 'monitor: unknown preflight dependency set: %s\n' "$set_name" >&2
+        return 1
+    }
+    if [ "${SBMON_REQUIRED_COMMANDS+x}" = x ]; then
+        if [ "${SBMON_TEST_ALLOW_REQUIRED_COMMANDS_OVERRIDE:-0}" != "1" ]; then
+            printf 'monitor: SBMON_REQUIRED_COMMANDS override refused outside fixture/test mode (production preflight uses the required %s set)\n' "$set_name" >&2
+            return 1
+        fi
+        # shellcheck disable=SC2086  # intentional word split of the gated override list
+        list="${SBMON_REQUIRED_COMMANDS}"
+    fi
     local missing="" cmd
     local pybin="${SBMON_PYTHON3:-python3}"
-    # The python wrapper actually used by the shims is checked first.
-    case "$pybin" in
-        */*) [ -x "$pybin" ] || missing=" $pybin" ;;
-        *)   command -v "$pybin" >/dev/null 2>&1 || missing=" $pybin" ;;
-    esac
-    local default_set="systemctl journalctl jq ss stat sha256sum mktemp flock"
-    local list="${SBMON_REQUIRED_COMMANDS-$default_set}"
     for cmd in $list; do
-        command -v "$cmd" >/dev/null 2>&1 || missing="$missing $cmd"
+        case "$cmd" in
+            python3)
+                # the wrapper actually used by the shims is checked as itself
+                case "$pybin" in
+                    */*) [ -x "$pybin" ] || missing=" $pybin" ;;
+                    *)   command -v "$pybin" >/dev/null 2>&1 || missing=" $pybin" ;;
+                esac
+                ;;
+            *) command -v "$cmd" >/dev/null 2>&1 || missing="$missing $cmd" ;;
+        esac
     done
     if [ -n "$missing" ]; then
         printf 'monitor: missing required runtime command(s):%s -- fail-closed, refusing to continue (install the packages providing them)\n' "$missing" >&2

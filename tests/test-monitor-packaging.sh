@@ -269,6 +269,9 @@ export PATH="$TMP/bin:$PATH"
 # synthetic missing tool, so coverage is not lost.
 if [ "$(uname -s 2>/dev/null)" != "Linux" ]; then
     export SBMON_REQUIRED_COMMANDS="stat sha256sum mktemp"
+    # The override is only ever honored behind the explicit test-only gate
+    # (production invocations refuse the bypass -- see T00).
+    export SBMON_TEST_ALLOW_REQUIRED_COMMANDS_OVERRIDE=1
 fi
 
 # Mutable source copy so tests can bump VERSION without touching the repo.
@@ -350,6 +353,7 @@ section "T00 compatibility preflight: missing required command -> fail closed"
 # preflight rejects the environment.
 (
     export SBMON_REQUIRED_COMMANDS="sbmon-synthetic-missing-tool"
+    export SBMON_TEST_ALLOW_REQUIRED_COMMANDS_OVERRIDE=1
     "$INSTALL_MONITOR" install
 ) > "$TMP/out-t00-preflight.log" 2>&1
 assert_rc 1 $? "install aborts (rc 1) when a required command is missing"
@@ -364,10 +368,24 @@ else
 fi
 (
     export SBMON_REQUIRED_COMMANDS="sbmon-synthetic-missing-tool"
+    export SBMON_TEST_ALLOW_REQUIRED_COMMANDS_OVERRIDE=1
     "$INSTALL_MONITOR" rollback
 ) > "$TMP/out-t00-rollback.log" 2>&1
 assert_rc 1 $? "rollback aborts (rc 1) when a required command is missing"
 assert_grep '缺少必需依赖命令' "$TMP/out-t00-rollback.log" "rollback preflight names the missing dependency"
+
+# Production invocations can NEVER bypass the preflight via
+# SBMON_REQUIRED_COMMANDS: without the explicit test-only gate the override
+# is refused (fail-closed), even though every command in this environment
+# actually exists.
+(
+    export SBMON_REQUIRED_COMMANDS="stat sha256sum mktemp"
+    unset SBMON_TEST_ALLOW_REQUIRED_COMMANDS_OVERRIDE
+    "$INSTALL_MONITOR" install
+) > "$TMP/out-t00-bypass.log" 2>&1
+assert_rc 1 $? "production install rejects the SBMON_REQUIRED_COMMANDS bypass"
+assert_grep '绕过必需命令预检' "$TMP/out-t00-bypass.log" "bypass refusal diagnostic is explicit"
+assert_no_grep 'install 完成' "$TMP/out-t00-bypass.log" "no install happens under a refused bypass"
 
 # ---------------------------------------------------------------------------
 section "T01 fresh install"
@@ -1288,6 +1306,18 @@ timeout 3 "$SVC" "$TMP/svc-ok.conf" "$SCRATCH_STATE" > "$TMP/svc5.log" 2>&1 || t
 assert_grep 'mode=collector-loop' "$TMP/svc5.log" "valid IPv6 loopback URL + present secret -> service starts (P7 IPv6 parse)"
 assert_no_grep 'fixture-api-secret' "$TMP/svc5.log" "secret value never printed"
 
+# Production invocation of the runtime shim can NEVER bypass the preflight
+# via SBMON_REQUIRED_COMMANDS: without the explicit test-only gate the
+# override is refused even though every listed command actually exists.
+printf 'SBMON_MODE=collector-loop\n' > "$TMP/svc-bypass.conf"
+(
+    export SBMON_REQUIRED_COMMANDS="stat sha256sum mktemp"
+    unset SBMON_TEST_ALLOW_REQUIRED_COMMANDS_OVERRIDE
+    "$SVC" "$TMP/svc-bypass.conf" "$SCRATCH_STATE"
+) > "$TMP/out-t00-bypass-shim.log" 2>&1
+assert_rc 1 $? "runtime shim rejects the bypass in a production invocation"
+assert_grep 'override refused outside fixture/test mode' "$TMP/out-t00-bypass-shim.log" "shim bypass refusal named"
+
 rm -rf "$SCRATCH_STATE"
 
 # ---------------------------------------------------------------------------
@@ -1935,9 +1965,15 @@ if [ "$SYMLINKS_OK" = 1 ]; then
     # Loopback-only access hint (operator UX hardening; additive, no security
     # model change): printed on SUCCESS output only, never the server IP.
     assert_grep '127.0.0.1:9191' "$SETUP_OUT" "web-setup prints the loopback listen hint"
-    assert_grep 'ssh -L 19191:127.0.0.1:9191' "$SETUP_OUT" "web-setup prints the SSH port-forward hint"
+    # T19 access-hint contract (only this contract is asserted about IPs):
+    #   * the E2 setup itself MAY print the DETECTED SSH CLIENT source IP
+    #     (203.0.113.77 in this fixture) -- that is reviewed E2 behaviour;
+    #   * the installer hint must require the explicit root@<server> form;
+    #   * the SERVER-side SSH IP (198.51.100.5 = SSH_CONNECTION field 3) must
+    #     never be printed or inferred anywhere in the output.
+    assert_grep 'ssh -L 19191:127\.0\.0\.1:9191 root@<server>' "$SETUP_OUT" "web-setup access hint requires root@<server>"
     assert_grep 'http://127.0.0.1:19191' "$SETUP_OUT" "web-setup prints the dashboard URL hint"
-    assert_no_grep '203.0.113.77' "$SETUP_OUT" "web-setup never prints/infers the SSH source public IP"
+    assert_no_grep '198\.51\.100\.5' "$SETUP_OUT" "web-setup never prints/infers the server-side SSH IP"
     assert_no_grep 'sshd_config' "$SETUP_OUT" "web-setup never suggests changing sshd_config"
     tail -n +"$((CALLS_BEFORE_SU + 1))" "$MOCK_CALL_LOG" > "$TMP/t19-calls.log"
     assert_grep 'restart singbox-monitor' "$TMP/t19-calls.log" "web-setup restarted ONLY singbox-monitor (was active)"

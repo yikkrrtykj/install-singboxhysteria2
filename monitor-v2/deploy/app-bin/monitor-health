@@ -60,8 +60,9 @@ STATE_DIR="$DATA_ROOT/state"
 
 # Compatibility preflight (capability detection, never distro-version
 # branching): fail closed on missing runtime commands; stdout stays a single
-# JSON line, the detailed diagnostic goes to stderr.
-if ! monitor_env_require_commands; then
+# JSON line, the detailed diagnostic goes to stderr. The health set is the
+# probe's actual dependencies (python3 / systemctl / stat).
+if ! monitor_env_require_commands health; then
     printf '{"error":"missing required runtime commands (see stderr)"}\n'
     exit 1
 fi

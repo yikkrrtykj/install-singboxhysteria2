@@ -203,6 +203,12 @@ ID delta（本窗口新 CLOSED/finalize）。`active_connections > 0` 永远不�
   展示缓存 eviction 不再造成假 FAIL。方向性保证：cap 只丢**最旧**行，
   加上 baseline 差集防重放，eviction 只可能造成假 FAIL，**绝不可能**造成
   假 PASS。
+  **残余风险（显式声明）**：若同一设备在 TTL 窗口（≤600s）内出现
+  **>512 条更新**的关闭，最旧的 `closed_ids` 行会被丢弃，目标 id 的证据
+  可能随之丢失 → false FAIL。这需要单设备约 >2 次/秒的**持续**关闭速率
+  贯穿整个 grace 窗口，超出 canary 场景（单客户端生命周期验证）两个数量级；
+  且失败方向安全（绝不产生假 PASS）。保留 cap 是为了给快照 JSON 体量一个
+  有界上界。
 
 strict canary：只要设置了任一门槛（EXPECT_USER / EXPECT_INBOUND /
 REQUIRE_CLOSED=1），sing-box binary 缺失或 service.api 不可达 = FAIL
@@ -255,10 +261,15 @@ E4 / Packaging / existing-api-auth migration / journal-time 兼容套件全部�
   的可移植子集；**任何安全关键指令都不会被静默忽略**——CI 在三个基线上跑
   `systemd-analyze verify` 并把 "unknown/unsupported directive" 视为失败。
 - **缺失能力 fail-closed**：预检发现必需命令缺失即带清晰诊断立即失败，
-  绝不降级运行。必需运行时命令集合：`python3`、`systemctl`、`journalctl`、
-  `jq`、`ss`、`flock`、`stat`、`sha256sum`、`mktemp`（部署侧见
-  `sbmon_preflight_commands`，运行时侧见 `monitor_env_require_commands`；
-  `SBMON_REQUIRED_COMMANDS` 可供 fixture/test 覆写）。
+  绝不降级运行。命令集按消费者拆分并逐命令记录用途：
+  部署变更路径（install/upgrade/rollback/uninstall）要求全集
+  `python3` `systemctl` `journalctl` `jq` `ss` `flock` `stat` `sha256sum`
+  `mktemp`（`sbmon_preflight_commands`）；运行时 shim 只要求实际依赖
+  （monitor-service = `python3`；monitor-health = `python3` `systemctl`
+  `stat`，见 `monitor_env_require_commands`）。
+  `SBMON_REQUIRED_COMMANDS` 覆写仅限显式测试门
+  （fixture / `SBMON_TEST_ALLOW_REQUIRED_COMMANDS_OVERRIDE=1`）之后生效；
+  生产调用携带该覆写会被拒绝（fail-closed），预检不可被绕过。
 - **service.api 契约全版本一致**：loopback-only URL 契约（`127.0.0.1` /
   `localhost` / `::1`）与鉴权要求（web 模式强制 `SBMON_API_SECRET_FILE`）
   在三个基线上逐字节相同，无任何版本例外。

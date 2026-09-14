@@ -39,7 +39,11 @@ assert_rc() { # assert_rc <expected-nonzero:0/1> <rc> <label>
 # the 2026-09-14T15:51:50Z instant (September = EDT, -0400).
 tz_instant_ok() { # tz_instant_ok <zone> <expected-offset>
     local z
-    z="$(TZ="$1" date -u -d '2026-09-14 15:51:50 UTC' +%z 2>/dev/null || true)"
+    # NO -u here: `date -u` would display in UTC and +%z would always be
+    # +0000, making every named-zone probe fail (SKIP on Linux CI). Without
+    # -u, TZ drives the display offset and the probe really checks that the
+    # zone resolves on this platform.
+    z="$(TZ="$1" date -d '2026-09-14 15:51:50 UTC' +%z 2>/dev/null || true)"
     [ "$z" = "$2" ]
 }
 

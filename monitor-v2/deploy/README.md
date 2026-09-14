@@ -26,8 +26,10 @@
   `python3 --version`、`systemd --version` 首行、`uname -r`；存在 `ssh` 时
   记录 `ssh -V`。绝不记录 conf 值 / secret / 快照内容。
 - **systemd unit 可移植子集**：unit 硬化指令取三个基线 systemd 都支持的
-  子集；CI 在三基线运行 `systemd-analyze verify` + `security --offline=yes`，
-  任何 "unknown/unsupported directive" 判失败（安全关键指令绝不静默忽略）。
+  子集。CI 分两级：`systemd-analyze verify` 是**全部基线的硬门**（任何
+  "unknown/unsupported directive" 判失败，安全关键指令绝不静默忽略）；
+  `systemd-analyze security --offline=yes` 按能力检测——支持的基线上**硬性
+  执行**，不支持的基线上明确标注为 informational-only（绝不静默软通过）。
 - **journal 时间兼容（B6 实机发现）**：Ubuntu 22.04 `journalctl --since`
   拒绝 raw RFC3339（`...T...Z`）；内部时间戳保持 RFC3339/UTC，传给
   journalctl 前经 `tests/lib/journal-time.sh` 规范化为本地

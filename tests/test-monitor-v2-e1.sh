@@ -22,7 +22,7 @@ PASS=0
 FAIL=0
 # The gate at the bottom of this file fails unless exactly this many
 # assertions ran AND passed, so unreachable sections can never fake success.
-EXPECTED_PASS=226
+EXPECTED_PASS=232
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
@@ -877,7 +877,8 @@ import json
 from lifecycle_gate import evaluate, scope_recent_ids, scope_totals
 
 def duo(vless_up, vless_down, hy2_up, hy2_down,
-        vless_recent=(), hy2_recent=(), vless_active=0, hy2_active=0):
+        vless_recent=(), hy2_recent=(), vless_active=0, hy2_active=0,
+        vless_closed_ids=(), hy2_closed_ids=()):
     def proto(up, down, active):
         return {"active_connections": active,
                 "uplink_total": float(up), "downlink_total": float(down)}
@@ -887,6 +888,13 @@ def duo(vless_up, vless_down, hy2_up, hy2_down,
                + [{"id": cid, "inbound": "hy2-in", "source": "203.0.113.9:51001",
                    "uplink_total": 0.0, "downlink_total": 0.0}
                   for cid in hy2_recent])
+    # Evidence-grade closed-id projection (what the collector emits as
+    # ``closed_ids``): NOT the 20-row display cache -- rows here survive
+    # display eviction within the collector TTL bank.
+    evidence = ([{"id": cid, "inbound": "vless-in", "closed_at": "2026-09-14T15:51:50Z"}
+                 for cid in vless_closed_ids]
+                + [{"id": cid, "inbound": "hy2-in", "closed_at": "2026-09-14T15:51:50Z"}
+                   for cid in hy2_closed_ids])
     status = "ACTIVE" if (vless_active or hy2_active) else \
         ("RECENT ACTIVITY" if recents else "IDLE")
     return {
@@ -898,6 +906,7 @@ def duo(vless_up, vless_down, hy2_up, hy2_down,
         "downlink_total": float(vless_down + hy2_down),
         "recent_sources": ["203.0.113.9:51000", "203.0.113.9:51001"] if recents else [],
         "recent_connections": recents,
+        "closed_ids": evidence,
     }
 
 def snap(devices=(), stale=False):
@@ -1009,7 +1018,8 @@ import json
 from lifecycle_gate import evaluate
 
 def duo(vless_up, vless_down, hy2_up, hy2_down,
-        vless_recent=(), hy2_recent=(), vless_active=0, hy2_active=0):
+        vless_recent=(), hy2_recent=(), vless_active=0, hy2_active=0,
+        vless_closed_ids=(), hy2_closed_ids=()):
     def proto(up, down, active):
         return {"active_connections": active,
                 "uplink_total": float(up), "downlink_total": float(down)}
@@ -1019,6 +1029,13 @@ def duo(vless_up, vless_down, hy2_up, hy2_down,
                + [{"id": cid, "inbound": "hy2-in", "source": "203.0.113.9:51001",
                    "uplink_total": 0.0, "downlink_total": 0.0}
                   for cid in hy2_recent])
+    # Evidence-grade closed-id projection (what the collector emits as
+    # ``closed_ids``): NOT the 20-row display cache -- rows here survive
+    # display eviction within the collector TTL bank.
+    evidence = ([{"id": cid, "inbound": "vless-in", "closed_at": "2026-09-14T15:51:50Z"}
+                 for cid in vless_closed_ids]
+                + [{"id": cid, "inbound": "hy2-in", "closed_at": "2026-09-14T15:51:50Z"}
+                   for cid in hy2_closed_ids])
     status = "ACTIVE" if (vless_active or hy2_active) else \
         ("RECENT ACTIVITY" if recents else "IDLE")
     return {
@@ -1030,6 +1047,7 @@ def duo(vless_up, vless_down, hy2_up, hy2_down,
         "downlink_total": float(vless_down + hy2_down),
         "recent_sources": ["203.0.113.9:51000", "203.0.113.9:51001"] if recents else [],
         "recent_connections": recents,
+        "closed_ids": evidence,
     }
 
 def snap(devices=(), stale=False, identity_conflicts=0):
@@ -1105,6 +1123,36 @@ r = evaluate(base_replay, primary_replay, "legacy", "hy2-in", True,
              grace_final=grace_replay)
 out["GR9_verdict"] = r["verdict"]
 
+# GR10 (sticky evidence, the review regression): the wanted HY2 CLOSED "h9"
+# IS observed during the grace window, then EVICTED from the 20-row
+# recent_connections display cache by >20 newer closures. The grace verdict
+# must still PASS via the closed_ids evidence projection (scoped, ORIGINAL
+# baseline subtraction) -- cache eviction can never cause a false FAIL, and
+# the dashboard cache stays 20 rows (the fix is NOT a bigger cache).
+newer = tuple("v-new-%02d" % i for i in range(21))   # 21 newer sibling closures
+grace_evicted = snap([("legacy", duo(100, 50, 260, 66,
+                                     vless_recent=newer,        # h9 evicted
+                                     hy2_closed_ids=("h9",)))])
+r = evaluate(base, primary, "legacy", "hy2-in", True, grace_final=grace_evicted)
+out["GR10_verdict"] = r["verdict"]; out["GR10_exit"] = r["exit"]
+
+# GR11: same eviction shape in the PRIMARY window -> straight PASS, grace
+# never even entered (the evidence projection is sticky for the whole
+# interval, not just for grace snapshots).
+final_evicted = snap([("legacy", duo(100, 50, 260, 66,
+                                     vless_recent=newer,
+                                     hy2_closed_ids=("h9",)))])
+r = evaluate(base, final_evicted, "legacy", "hy2-in", True)
+out["GR11_verdict"] = r["verdict"]; out["GR11_exit"] = r["exit"]
+
+# GR12: the evidence projection is SCOPED -- an id carried by the sibling
+# inbound in closed_ids can never satisfy the hy2-in gate (same rule as the
+# display cache).
+grace_wrong_scope = snap([("legacy", duo(100, 50, 260, 66,
+                                         vless_closed_ids=("v9",)))])
+r = evaluate(base, primary, "legacy", "hy2-in", True, grace_final=grace_wrong_scope)
+out["GR12_verdict"] = r["verdict"]
+
 # Eligibility flags (evaluate WITHOUT grace_final):
 # the sole-CLOSED-failure shape is eligible...
 r = evaluate(base, primary, "legacy", "hy2-in", True)
@@ -1134,11 +1182,18 @@ assert_contains "no traffic delta beyond baseline" "$snap" "GR7 keeps the primar
 assert_eq "$(snap_field "$snap" 'snap["GR8_verdict"]')" "PASS" "GR8: primary PASS stays PASS with a grace snapshot present"
 assert_eq "$(snap_field "$snap" 'snap["GR8_exit"]')" "0" "GR8 exits 0"
 assert_eq "$(snap_field "$snap" 'snap["GR9_verdict"]')" "FAIL" "GR9: baseline replayed ids stay dead evidence in grace"
+assert_eq "$(snap_field "$snap" 'snap["GR10_verdict"]')" "PASS" "GR10: HY2 CLOSED evicted from the 20-row display cache by >20 newer closures -> grace still PASS (sticky closed_ids evidence)"
+assert_eq "$(snap_field "$snap" 'snap["GR10_exit"]')" "0" "GR10 exits 0"
+assert_eq "$(snap_field "$snap" 'snap["GR11_verdict"]')" "PASS" "GR11: eviction shape in the primary window -> straight PASS (evidence sticky across the whole interval)"
+assert_eq "$(snap_field "$snap" 'snap["GR11_exit"]')" "0" "GR11 exits 0"
+assert_eq "$(snap_field "$snap" 'snap["GR12_verdict"]')" "FAIL" "GR12: closed_ids evidence projection is USER-INBOUND scoped (sibling-inbound id can never satisfy the gate)"
 assert_eq "$(snap_field "$snap" 'snap["E_D_eligible"]')" "True" "eligibility: sole-CLOSED-failure primary is grace eligible"
 assert_eq "$(snap_field "$snap" 'snap["E_traffic_eligible"]')" "False" "eligibility: traffic failure is NOT grace eligible"
 assert_eq "$(snap_field "$snap" 'snap["E_sibling_eligible"]')" "False" "eligibility: sibling-only closure (CLOSED+lifecycle fail) is NOT eligible"
 
 section "G8: closed-id evidence projection -- 20-entry display-cache eviction guard"
+# The eviction fix is the evidence projection, NOT a bigger display cache.
+assert_contains "RECENT_CONNECTIONS_MAX = 20" "$(cat "$ROOT/monitor-v2/collector.py")" "dashboard display cache stays 20 rows (eviction fix = closed_ids evidence projection, never a bigger cache)"
 snap="$(tracker_seq '
 import json
 from collector import Tracker
