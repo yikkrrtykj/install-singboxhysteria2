@@ -1577,7 +1577,7 @@ harden_sensitive_permissions() {
 # >>> existing-api-auth narrow migration >>> ===================================
 # Narrow S0 migration for OLD servers that already run sing-box 1.14.x with a
 # structurally compliant localhost-only service.api (tag monitor-api,
-# 127.0.0.1:9091) but WITHOUT authentication (secret absent or empty).
+# 127.0.0.1:9091) but WITHOUT authentication (the secret KEY is absent).
 #
 # Why this exists: the Phase D upgrade path injects the secret, but it is a
 # BINARY upgrade transaction (download/replace sing-box, restart). An old
@@ -1610,14 +1610,14 @@ harden_sensitive_permissions() {
 # Read-only classification of the live service.api authentication state:
 #   exact            exactly one compliant monitor-api WITH a non-empty string
 #                    secret
-#   needed           exactly one compliant monitor-api whose secret is MISSING
-#                    in the approved narrow-migration shape: key absent, null,
-#                    or an empty string -- the ONLY auto-migratable shape
-#   malformed-secret exactly one compliant monitor-api but the secret exists
-#                    with a NON-string type (number/bool/object/array):
-#                    narrow migration MUST refuse (overwriting an unknown
-#                    secret value/type is never a narrow change) -- the
-#                    normal Phase D repair/upgrade path is required
+#   needed           exactly one compliant monitor-api whose secret KEY IS
+#                    ABSENT -- nothing to overwrite; the ONLY auto-migratable
+#                    shape
+#   malformed-secret exactly one compliant monitor-api but the secret KEY
+#                    EXISTS with an unusable value ("", null, number/bool/
+#                    object/array): narrow migration MUST refuse (overwriting
+#                    an unknown secret value/type is never a narrow change)
+#                    -- the normal Phase D repair/upgrade path is required
 #   absent           no monitor-api entry at all (narrow migration must NOT
 #                    reinvent it -- that is the Phase D path)
 #   structural       monitor-api count/type/listen/port violate the contract
