@@ -1,6 +1,6 @@
 # Monitor v2 — Phase E3 Design rev5: Privileged Mutation Architecture（AF_UNIX RPC 特权变更架构）
 
-状态：**设计稿 rev5（已吸收独立 review 修正 #1–#8 及 PR #18 独立 source review follow-up 修正 F-1..F-3；全部代码事实重新锚定于冻结基线 `3ee9a162`；待 final design approval；本轮零实现）**
+状态：**设计稿 rev5（已吸收独立 review 修正 #1–#8 及 PR #18 独立 source review follow-up 修正 F-1..F-3；全部代码事实重新锚定于冻结基线 `3ee9a162`；G5 FINAL DESIGN APPROVED；本轮零实现）**
 
 基线锚点：
 
@@ -732,7 +732,7 @@ INV-15 step-up 与 session 绑定，五类事件（§5.2）立即吊销
 | **G2** | uninstall/破坏性路径锁下重构 + 锚点不灭（M-1'..M-3'、L-ANCHOR-1..4、no-nesting locked 变体） | 待实现（实现工作的一部分） |
 | **G3** | E2 step-up 端点 + §5.2 吊销语义定案（关闭 U-2 web 侧） | 待定案 |
 | **G4** | 既有 `singbox-monitor.service`（Round 2 起即 `User=sboxweb`）的 E3 原地扩展与 unit 硬化方案定案（sboxweb 用户与服务化**已是基线事实**，不新建 `sboxweb.service`；F-1） | 待定案 |
-| **G5** | 本设计（rev5）final design approval | 待批准 |
+| **G5** | 本设计（rev5）final design approval | **PASS / APPROVED** |
 | **G6** | 测试脚手架：sbox-cm test wrapper（沙箱 `SB_*` 注入）+ journal/账本 fixture + 帧协议 fuzz（截断帧/超长帧/慢客户端） | 待定义 |
 
 G1/G2/G3/G4 是**实现里程碑**（由 M0/M0.5 交付并各自带测试闸门），不是"动第一行代码"的前置；**唯一的前置是 G5（本设计获批）**。而 **ENABLE E3 MANAGEMENT** 则要求 G1–G6 全部完成（§14）。

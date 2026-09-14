@@ -375,7 +375,7 @@ ss -ntp 'dport = :9091' | grep -c "pid=$MPID," | tee -a "$ART/p2-singleton.txt" 
 - **PASS**：两计数均为 1。**FAIL**：计数 ≠ 1（且不在 P3 明示窗口）→ 停止；处置仅限 `systemctl restart singbox-monitor`，禁止按名/宽泛 kill。
 - **artifacts**：`$ART/p2-singleton.txt`。
 
-### P2-7 journal 泄漏门禁（rev2.2：内存态 Python 精确已知敏感值扫描器，private-key 三层检测）
+### P2-7 journal 泄漏门禁（rev2.3：内存态 Python 精确已知敏感值扫描器，private-key 三层检测；退出码经 PIPESTATUS[0] 捕获）
 
 原理：Python（标准库，root 身份，短命进程）在**内存中**收集已知敏感值字面量——live 配置（`/root/sbox/sbconfig_server.json`）中所有 `uuid`（Reality 凭据值）/ `password`（HY2 password）/ `private_key`（Reality）/ `secret`（service.api secret）字符串值，以及根锚点文件 `/root/sbox/monitor-api.secret`，对 `$T0` 以来两个单元的 journal 区间做**完整文本子串计数**，输出**固定四类别聚合计数**。
 
