@@ -2116,5 +2116,34 @@ assert_no_grep '0\.0\.0\.0' "$FIX_CONF_DIR/monitor.conf" "conf never binds 0.0.0
 assert_no_grep '0\.0\.0\.0' "$FIX_UNIT" "unit never references 0.0.0.0"
 assert_grep '127\.0\.0\.1:9191' "$FIX_CONF_DIR/monitor.conf" "web dashboard stays on 127.0.0.1:9191"
 
+# ---------------------------------------------------------------------------
+section "T14 CI systemd verify gate contract (fail-closed rc)"
+# Static contract for the systemd validation step in
+# .github/workflows/tests.yml:
+#   1. verify's rc is CAPTURED and judged (never ignored);
+#   2. a nonzero verify rc with UNCLASSIFIED diagnostics fails the step;
+#   3. a nonzero verify rc with EMPTY diagnostics fails the step;
+#   4. only a mechanical UNRELATED-runner-noise allowlist may excuse a
+#      nonzero rc, and the allowlist classification never touches
+#      singbox-monitor.service lines;
+#   5. the old note-only escape hatch (nonzero rc + "no target-unit match"
+#      => success) must stay gone forever.
+WF="$REPO_ROOT/.github/workflows/tests.yml"
+assert_rc 0 "$([ -f "$WF" ] && echo 0 || echo 1)" "workflow file exists"
+assert_grep 'systemd-analyze verify "\$UNIT" 2>&1 \| tee "\$RUNNER_TEMP/unit-verify\.log" \|\| vrc=\$\?' \
+    "$WF" "verify rc is captured through tee (rc-aware)"
+assert_grep 'UNCLASSIFIED diagnostics \(fail-closed' "$WF" \
+    "nonzero verify rc + unclassified diagnostics => hard failure"
+assert_grep 'EMPTY diagnostics \(fail-closed hard gate\)' "$WF" \
+    "nonzero verify rc + empty diagnostics => hard failure"
+assert_grep 'UNRELATED_NOISE_RE=' "$WF" \
+    "unrelated runner noise is excused only via a mechanical allowlist"
+assert_grep "grep -v 'singbox-monitor\\\\.service'" "$WF" \
+    "allowlist classification never touches target-unit lines"
+assert_grep 'rejected or ignored a directive in the production unit' "$WF" \
+    "target-unit directive errors remain a hard failure"
+assert_no_grep 'the hard gate holds for the production unit' "$WF" \
+    "old note-only escape hatch (nonzero rc + no target-unit match => success) is gone"
+
 printf '\n== RESULT: %d passed, %d failed ==\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
