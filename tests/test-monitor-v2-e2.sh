@@ -654,8 +654,17 @@ def group_stale():
         snap_d["devices"] == {} and snap_d["active_connections"] == 0
 
     # --- publisher freeze: health is evaluated at READ time -----------------
+    # The freeze is simulated by swapping the _publisher_thread attribute
+    # (read-time health must flag the wedged publisher); the REAL publisher
+    # thread stays alive and keeps ticking every `poll` seconds. The
+    # "version does not advance" assertion spans a scrypt login + HTTP
+    # roundtrip, so the tick period must be far larger than that window --
+    # poll=0.15 made the check a coin flip on slow runners (22.04 CI).
+    # poll=5.0 keeps every frozen assertion valid (STALE still comes from
+    # the dead publisher thread + the wedged _published_at) while making
+    # the version window deterministic.
     frozen = make_stack(tempfile.mkdtemp(), password=PASSWORD,
-                        whitelist=["127.0.0.5/32"], poll=0.15,
+                        whitelist=["127.0.0.5/32"], poll=5.0,
                         batches=[RESET_BATCH])
     time.sleep(0.8)
     broker = frozen["broker"]
