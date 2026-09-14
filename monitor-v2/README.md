@@ -154,10 +154,11 @@ HY2 多个逻辑连接共享同一 QUIC source endpoint 属正常现象，按独
 ## 测试
 
 ```bash
-# E1 回归（213 断言：E1-01..E1-22 + 官方事件 fixture + T10 请求/响应双向真帧验证 +
-# T11 空闲流心跳 + G1..G7 集成 canary 门槛：合成判定 A-K、USER+INBOUND 作用域
-# L1-L4/combo、strict 环境门槛 L5-L8、CLOSE_GRACE_WINDOW 语义 GR1-GR9）。
-# 脚本末尾只有唯一 exit，并用 EXPECTED_PASS 门槛强制“跑满 213 且全过”才算成功。
+# E1 回归（226 断言：E1-01..E1-22 + 官方事件 fixture + T10 请求/响应双向真帧验证 +
+# T11 空闲流心跳 + G1..G8 集成 canary 门槛：合成判定 A-K、USER+INBOUND 作用域
+# L1-L4/combo、strict 环境门槛 L5-L8、CLOSE_GRACE_WINDOW 语义 GR1-GR9、
+# closed_ids 证据投影与 20-entry 展示缓存 eviction 守卫 G8）。
+# 脚本末尾只有唯一 exit，并用 EXPECTED_PASS 门槛强制“跑满 226 且全过”才算成功。
 bash tests/test-monitor-v2-e1.sh
 
 # Linux 集成（无门槛的观察运行在非 VPS 环境 SKIP=0）
@@ -194,6 +195,14 @@ ID delta（本窗口新 CLOSED/finalize）。`active_connections > 0` 永远不�
   补窗内出现 baseline 之外的新 recent-closed `Connection.id` → PASS，
   超时 → FAIL。grace **绝不**"救活" primary window 的 traffic/USER/INBOUND
   失败（那些直接 FAIL，不进补窗）。
+- **CLOSED 证据通道与 20-entry 展示缓存 eviction**：`recent_connections` 只是
+  RECENT 展示缓存（每设备最新 20 条）；繁忙设备在 240s grace 内关闭 >20 条
+  更新连接时可能把目标 id 挤出该缓存。因此快照含 additive 的每设备
+  `closed_ids`（≤512、newest-first、行只含 `id`/`inbound`/`closed_at`，
+  TTL 内全部 finalize id），gate 的 closed-id delta 读两者的**并集**——
+  展示缓存 eviction 不再造成假 FAIL。方向性保证：cap 只丢**最旧**行，
+  加上 baseline 差集防重放，eviction 只可能造成假 FAIL，**绝不可能**造成
+  假 PASS。
 
 strict canary：只要设置了任一门槛（EXPECT_USER / EXPECT_INBOUND /
 REQUIRE_CLOSED=1），sing-box binary 缺失或 service.api 不可达 = FAIL

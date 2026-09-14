@@ -65,6 +65,14 @@ DEFAULT_INTERVAL = 2.0
 DEFAULT_CLOSED_TTL = 600.0  # keep finalized ids ~10 minutes
 RECENT_SOURCES_MAX = 10
 RECENT_CONNECTIONS_MAX = 20
+# Evidence-grade closed-id projection (per device, newest-first). Unlike the
+# 20-row RECENT display cache above, this exists so the integration gate's
+# closed-id delta cannot be defeated by display-cache eviction (a busy device
+# closing >20 newer connections inside the 240s CLOSE_GRACE_WINDOW). The cap
+# only ever drops the OLDEST rows: losing evidence can cause a false FAIL on
+# an absurdly busy device, never a false PASS (baseline subtraction blocks
+# reset replay).
+CLOSED_IDS_EVIDENCE_MAX = 512
 # Per-connection rows exposed in the top-level snapshot "connections" list
 # (read-only view consumed by the Phase E2 dashboard). Active lifecycles are
 # always included; the RECENT half is capped so a busy server cannot bloat
@@ -555,8 +563,9 @@ class Tracker:
                 status = STATUS_RECENT
             else:
                 status = STATUS_IDLE
-            recent_conns = sorted(closed, key=lambda c: c["closed_at"],
-                                  reverse=True)[:RECENT_CONNECTIONS_MAX]
+            closed_newest_first = sorted(closed, key=lambda c: c["closed_at"],
+                                         reverse=True)
+            recent_conns = closed_newest_first[:RECENT_CONNECTIONS_MAX]
             devices[name] = {
                 "name": name,
                 "status": status,
@@ -579,6 +588,17 @@ class Tracker:
                      "downlink_total": round(c["downlink_total"], 3),
                      "closed_at": _iso(c["closed_at"])}
                     for c in recent_conns
+                ],
+                # Additive, gate-oriented evidence channel (NOT a display
+                # surface): every closed lifecycle still held within the TTL,
+                # newest-first, minimal rows. Immune to the 20-row RECENT
+                # display-cache eviction that could otherwise hide an
+                # in-window CLOSED from the integration gate during a long
+                # CLOSE_GRACE_WINDOW (see CLOSED_IDS_EVIDENCE_MAX above).
+                "closed_ids": [
+                    {"id": c["id"], "inbound": c["inbound"],
+                     "closed_at": _iso(c["closed_at"])}
+                    for c in closed_newest_first[:CLOSED_IDS_EVIDENCE_MAX]
                 ],
             }
 

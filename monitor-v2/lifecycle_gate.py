@@ -147,20 +147,34 @@ def scope_totals(snap, expect_user, expect_inbound=""):
 
 
 def scope_recent_ids(snap, expect_user, expect_inbound=""):
-    """Recent-CLOSED connection IDs for the gate scope (display cache only).
+    """Closed-connection IDs for the gate scope (baseline-delta evidence).
+
+    Reads the union of:
+    * ``recent_connections`` -- the 20-row RECENT display cache (all older
+      snapshots keep working exactly as before); and
+    * ``closed_ids`` -- the collector's evidence-grade projection that covers
+      every closed lifecycle within the TTL, so a busy device evicting rows
+      from the display cache during a long CLOSE_GRACE_WINDOW can never hide
+      an in-window CLOSED (eviction can only cause a false FAIL, never a
+      false PASS: the baseline subtraction blocks reset replay).
 
     With expect_inbound only closures CARRIED by that inbound count: a
     vless-in CLOSED must never satisfy a hy2-in REQUIRE_CLOSED gate.
     """
     ids = set()
     for dev in _scoped_devices(snap, expect_user):
-        for conn in dev.get("recent_connections") or []:
-            cid = conn.get("id")
-            if not cid:
-                continue
-            if expect_inbound and conn.get("inbound") != expect_inbound:
-                continue
-            ids.add(str(cid))
+        for source in (dev.get("recent_connections") or [],
+                       dev.get("closed_ids") or []):
+            for conn in source:
+                if isinstance(conn, dict):
+                    cid, inbound = conn.get("id"), conn.get("inbound")
+                else:
+                    cid, inbound = conn, None  # bare id: no scoping info
+                if not cid:
+                    continue
+                if expect_inbound and inbound != expect_inbound:
+                    continue
+                ids.add(str(cid))
     return ids
 
 
