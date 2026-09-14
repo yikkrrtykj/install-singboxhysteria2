@@ -97,14 +97,6 @@ jobs:
           printf '#!/bin/sh\nexit 0\n' | sudo tee /opt/singbox-monitor/bin/monitor-service >/dev/null
           sudo chmod 0755 /opt/singbox-monitor/bin/monitor-service
           vrc=0
-          # systemd-analyze verify resolves the ExecStart binary and fails
-          # (nonzero) when it does not exist. Stage a minimal stub at the
-          # exact production path on the disposable runner -- the real
-          # binary is installed by the deployer, not by CI. This keeps the
-          # gate genuinely hard (a broken ExecStart still fails) without
-          # making CI structurally unable to pass.
-          sudo mkdir -p /opt/singbox-monitor/bin
-          sudo install -m 0755 /dev/null /opt/singbox-monitor/bin/monitor-service
           systemd-analyze verify "$UNIT" 2>&1 | tee "$RUNNER_TEMP/unit-verify.log" || vrc=$?
           # HARD GATE (all baselines): judge ONLY singbox-monitor.service
           # lines. verify scans the unit's dependency graph, so UNRELATED
