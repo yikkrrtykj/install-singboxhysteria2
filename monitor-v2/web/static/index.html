@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sing-box Monitor</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div id="app" class="app hidden">
+
+  <aside class="sidebar">
+    <div class="brand">
+      <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M12 2 4 5.5v5.2c0 5 3.4 9.6 8 10.8 4.6-1.2 8-5.8 8-10.8V5.5L12 2zm0 2.2 6 2.7v3.8c0 4.1-2.6 7.8-6 8.9-3.4-1.1-6-4.8-6-8.9V6.9l6-2.7z"/><path fill="currentColor" d="M11 7h2v5.2l3.3 1.9-1 1.7L11 13.4V7z"/></svg>
+      <span>sing-box Monitor</span>
+    </div>
+    <nav id="nav" class="nav" aria-label="Main">
+      <button class="nav-item active" data-view="overview" type="button">
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M3 3h8v10H3V3zm2 2v6h4V5H5zM13 3h8v6h-8V3zm2 2v2h4V5h-4zM3 15h8v6H3v-6zm2 2v2h4v-2H5zm8-2h8v6h-8v-6zm2 2v2h4v-2h-4zM13 11h8v2h-8v-2z"/></svg>
+        <span>Overview</span>
+      </button>
+      <button class="nav-item" data-view="devices" type="button">
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M4 4h16v6H4V4zm2 2v2h12V6H6zM4 10h16v10H4V10zm2 2v6h5v-6H6zm7 0v2h5v-2h-5zm0 4v2h5v-2h-5z"/></svg>
+        <span>Devices</span>
+      </button>
+      <button class="nav-item" data-view="connections" type="button">
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M8.7 5.7 5.7 8.7a4 4 0 0 0 5.7 5.7l1.4-1.5-1.4-1.4-1.4 1.4a2 2 0 1 1-2.9-2.8l3-3a2 2 0 0 1 2.9 0l1.4-1.4a4 4 0 0 0-5.7 0zm6.6 12.6 3-3a4 4 0 0 0-5.7-5.7l-1.4 1.5 1.4 1.4 1.4-1.4a2 2 0 1 1 2.9 2.8l-3 3a2 2 0 0 1-2.9 0l-1.4 1.4a4 4 0 0 0 5.7 0z"/></svg>
+        <span>Connections</span>
+      </button>
+      <button class="nav-item" data-view="settings" type="button">
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="m9.3 2 .5 2.1c-.5.2-1 .5-1.5.8l-2-1.2-2.1 2.1L5.4 8c-.3.4-.6.9-.8 1.5L2.5 10v3l2.1.5c.2.5.5 1 .8 1.5l-1.2 2 2.1 2.1 2-1.2c.5.3 1 .6 1.5.8l.5 2.1h3l.5-2.1c.5-.2 1-.5 1.5-.8l2 1.2 2.1-2.1-1.2-2c.3-.5.6-1 .8-1.5l2.1-.5v-3l-2.1-.5c-.2-.5-.5-1-.8-1.5l1.2-2-2.1-2.1-2 1.2c-.5-.3-1-.6-1.5-.8L14.7 2h-3zm1.5 6a4 4 0 1 1 0 8 4 4 0 0 1 0-8z"/></svg>
+        <span>Settings</span>
+      </button>
+    </nav>
+    <div class="sidebar-foot">
+      <button id="logout-btn" class="btn ghost full" type="button">Log out</button>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <h1 id="view-title">Overview</h1>
+      <div class="chips">
+        <span class="chip" id="chip-monitor" data-state="unknown">Monitor · —</span>
+        <span class="chip" id="chip-api" data-state="unknown">sing-box API · —</span>
+      </div>
+    </header>
+
+    <div id="stale-banner" class="stale-banner hidden" role="alert">
+      <span aria-hidden="true">⚠</span>
+      <span id="stale-text"></span>
+    </div>
+
+    <!-- Overview -->
+    <section id="view-overview" class="view">
+      <div class="status-row card">
+        <div class="kv"><span class="k">Collector uptime</span><span class="v" id="st-uptime">—</span></div>
+        <div class="kv"><span class="k">Last event</span><span class="v" id="st-last-event">—</span></div>
+        <div class="kv"><span class="k">Snapshot generated</span><span class="v" id="st-generated">—</span></div>
+      </div>
+      <div class="cards">
+        <div class="card stat"><div class="stat-label">Devices</div><div class="stat-value" id="st-devices">—</div></div>
+        <div class="card stat"><div class="stat-label">Active connections</div><div class="stat-value" id="st-active">—</div></div>
+        <div class="card stat"><div class="stat-label">Uplink rate</div><div class="stat-value" id="st-up-rate">—</div></div>
+        <div class="card stat"><div class="stat-label">Downlink rate</div><div class="stat-value" id="st-down-rate">—</div></div>
+        <div class="card stat"><div class="stat-label">Session uplink total</div><div class="stat-value" id="st-up-total">—</div><div class="stat-note">Since monitor start</div></div>
+        <div class="card stat"><div class="stat-label">Session downlink total</div><div class="stat-value" id="st-down-total">—</div><div class="stat-note">Since monitor start</div></div>
+      </div>
+    </section>
+
+    <!-- Devices -->
+    <section id="view-devices" class="view hidden">
+      <div id="devices-grid" class="devices-grid"></div>
+    </section>
+
+    <!-- Connections -->
+    <section id="view-connections" class="view hidden">
+      <div class="table-toolbar">
+        <div class="seg" id="conn-filter" role="group" aria-label="Filter connections">
+          <button class="seg-item active" data-filter="all" type="button">All</button>
+          <button class="seg-item" data-filter="ACTIVE" type="button">Active</button>
+          <button class="seg-item" data-filter="RECENT" type="button">Recent</button>
+        </div>
+        <span class="muted" id="conn-count"></span>
+      </div>
+      <div class="card table-card">
+        <table class="table" id="conn-table">
+          <thead>
+            <tr>
+              <th>Device</th><th>Protocol</th><th>ID</th><th>Network</th>
+              <th>Destination</th><th class="num">↑ rate</th><th class="num">↓ rate</th>
+              <th class="num">↑ total</th><th class="num">↓ total</th>
+              <th>Created</th><th>State</th>
+            </tr>
+          </thead>
+          <tbody id="conn-tbody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Settings -->
+    <section id="view-settings" class="view hidden">
+      <div class="card">
+        <h2>Access Control</h2>
+        <div class="kv"><span class="k">Your current IP</span><span class="v"><span id="wl-current">—</span> <span class="badge ok" id="wl-current-status">✓ Allowed</span></span></div>
+        <h3>Allowed IP/CIDR</h3>
+        <ul id="wl-list" class="wl-list"></ul>
+        <div class="row">
+          <input id="wl-add-input" type="text" placeholder="1.2.3.4/32 · 10.10.10.0/24 · 2001:db8::1/128" autocomplete="off" spellcheck="false">
+          <button id="wl-add-btn" class="btn" type="button">+ Add IP/CIDR</button>
+          <button id="wl-add-current" class="btn ghost" type="button">Add current IP</button>
+        </div>
+        <p id="wl-msg" class="form-msg hidden"></p>
+      </div>
+
+      <div class="card">
+        <h2>Admin password</h2>
+        <form id="pw-form" class="form">
+          <label>Current password<input id="pw-current" type="password" autocomplete="current-password"></label>
+          <label>New password<input id="pw-new" type="password" autocomplete="new-password" minlength="8"></label>
+          <label>Repeat new password<input id="pw-repeat" type="password" autocomplete="new-password" minlength="8"></label>
+          <div class="row"><button class="btn" type="submit">Change password</button></div>
+          <p id="pw-msg" class="form-msg hidden"></p>
+        </form>
+      </div>
+
+      <div class="card">
+        <h2>Recovery</h2>
+        <p class="muted">The recovery key can add the IP you are calling from back to the whitelist when you are locked out. It is shown only once when (re)generated; the server stores a hash only.</p>
+        <div class="kv"><span class="k">Recovery key</span><span class="v" id="rec-status">—</span></div>
+        <div class="row"><button id="rec-rotate-btn" class="btn" type="button">Regenerate recovery key</button></div>
+        <p id="rec-result" class="key-result hidden"></p>
+      </div>
+
+      <div class="card">
+        <h2>Monitor information</h2>
+        <div class="kv"><span class="k">Version</span><span class="v" id="mi-version">—</span></div>
+        <div class="kv"><span class="k">Monitor started</span><span class="v" id="mi-started">—</span></div>
+        <div class="kv"><span class="k">Collector uptime</span><span class="v" id="mi-uptime">—</span></div>
+        <div class="kv"><span class="k">Batches processed</span><span class="v" id="mi-batches">—</span></div>
+        <div class="kv"><span class="k">Skipped events</span><span class="v" id="mi-skipped">—</span></div>
+        <div class="kv"><span class="k">Identity conflicts</span><span class="v" id="mi-conflicts">—</span></div>
+        <div class="kv"><span class="k">Abandoned on reset</span><span class="v" id="mi-abandoned">—</span></div>
+        <div class="kv"><span class="k">Last stream error</span><span class="v" id="mi-error">—</span></div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<!-- Login -->
+<div id="login-overlay" class="overlay hidden">
+  <form id="login-form" class="panel">
+    <div class="brand center">
+      <svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true"><path fill="currentColor" d="M12 2 4 5.5v5.2c0 5 3.4 9.6 8 10.8 4.6-1.2 8-5.8 8-10.8V5.5L12 2z"/></svg>
+      <span>sing-box Monitor</span>
+    </div>
+    <label>Admin password<input id="login-password" type="password" autocomplete="current-password" autofocus></label>
+    <button class="btn full" type="submit">Log in</button>
+    <p id="login-error" class="form-msg error hidden" role="alert"></p>
+  </form>
+</div>
+
+<!-- Recovery (path /recovery) -->
+<div id="recovery-view" class="overlay hidden">
+  <form id="recovery-form" class="panel">
+    <div class="brand center">
+      <svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true"><path fill="currentColor" d="M12 2 4 5.5v5.2c0 5 3.4 9.6 8 10.8 4.6-1.2 8-5.8 8-10.8V5.5L12 2z"/></svg>
+      <span>Monitor recovery</span>
+    </div>
+    <p class="muted">Locked out? Enter your recovery key. The server will add the IP you are calling from (host /32 or /128) back to the whitelist.</p>
+    <label>Recovery key<input id="recovery-key" type="password" autocomplete="off" spellcheck="false"></label>
+    <button class="btn full" type="submit">Unlock this IP</button>
+    <p id="recovery-msg" class="form-msg hidden" role="alert"></p>
+    <a class="muted center-link" href="/">Back to login</a>
+  </form>
+</div>
+
+<div id="toast" class="toast hidden" role="status"></div>
+
+<template id="device-card-template">
+  <article class="card device-card">
+    <header class="device-head">
+      <h2 class="device-name"></h2>
+      <span class="badge device-status"></span>
+    </header>
+    <div class="device-protocols"></div>
+    <footer class="device-foot">
+      <span class="muted">Last activity <span class="device-last"></span></span>
+    </footer>
+  </article>
+</template>
+
+<template id="protocol-row-template">
+  <div class="proto-row">
+    <div class="proto-name"><span class="proto-label"></span><span class="proto-tag muted"></span></div>
+    <div class="proto-stats">
+      <span class="proto-rate up">↑ <span class="pr-up"></span></span>
+      <span class="proto-rate down">↓ <span class="pr-down"></span></span>
+      <span class="proto-total up">↑ <span class="pt-up"></span></span>
+      <span class="proto-total down">↓ <span class="pt-down"></span></span>
+      <span class="proto-conns"><span class="pc-count"></span> active</span>
+    </div>
+  </div>
+</template>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

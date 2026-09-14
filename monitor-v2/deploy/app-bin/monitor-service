@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+# monitor-service -- runtime entrypoint of singbox-monitor.service.
+#
+# Usage: monitor-service <conf> <data-root>
+#   <conf>       monitor.conf path (required; unit passes it explicitly)
+#   <data-root>  E2 data root (required; unit passes @SBMON_STATE_ROOT@ --
+#                P1: an explicit contract, never inferred from $PWD or
+#                WorkingDirectory). auth.json / access.json live flat in the
+#                data root; state/ holds runtime files (health export,
+#                collector-loop snapshot).
+#
+# Modes (monitor.conf SBMON_MODE):
+#   web             INTEGRATED DEFAULT: exec the real E2 runtime
+#                   app/monitor-v2/webapp.py serve -- ONE E1 Collector fed
+#                   into ONE SnapshotBroker behind the loopback web listener.
+#                   There is no second collector anywhere in this runtime.
+#   collector-loop  COMPATIBILITY mode: run the E1 collector in cycles,
+#                   atomically writing each snapshot to
+#                   <data-root>/state/snapshot.json. No web listener.
+#
+# Startup contracts (all fail-closed, checked BEFORE the runtime starts):
+#   * SBMON_API_URL must satisfy the loopback http contract (P7);
+#   * web mode REQUIRES SBMON_API_SECRET_FILE: present, regular (never a
+#     symlink), readable, non-empty (R1-5). BOX_API_SECRET is UNSET before
+#     exec: Packaging is file-based only, the secret never travels through
+#     the environment, argv, unit file or the journal;
+#   * SBMON_WEB_BIND must parse as a loopback bind (IPv4/IPv6/localhost);
+#     0.0.0.0, LAN/public/malformed forms refuse to start (R1-4).
+#
+# Journal hygiene: the unit configures NO stdout redirection; in
+# collector-loop mode THIS SHIM redirects collector stdout (which may
+# contain client metadata) to the state dir, never to journald; in web
+# mode snapshots are written to files by the SnapshotBroker and webapp
+# stdout only carries lifecycle messages.
+set -Eeuo pipefail
+
+CONF="${1:-}"
+DATA_ROOT="${2:-${SBMON_STATE_DIR:-}}"
+SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/monitor-env.sh
+source "$SELF_DIR/../lib/monitor-env.sh"
+
+APP_DIR="$(cd -- "$SELF_DIR/.." && pwd)"
+WEBAPP="$APP_DIR/app/monitor-v2/webapp.py"
+COLLECTOR="$APP_DIR/app/monitor-v2/collector.py"
+
+[ -n "$CONF" ] || { echo "monitor-service: conf path required" >&2; exit 1; }
+[ -n "$DATA_ROOT" ] || { echo "monitor-service: data root required (explicit contract, no \$PWD inference)" >&2; exit 1; }
+STATE_DIR="$DATA_ROOT/state"
+
+SBMON_ENV_MODE=""
+SBMON_ENV_API_URL=""
+SBMON_ENV_API_SECRET_FILE=""
+SBMON_ENV_CYCLE_SECONDS=""
+SBMON_ENV_WEB_BIND=""
+# SBMON_ENV_WEB_POLL_SECONDS is intentionally left UNSET before the load so an
+# absent key (default 1) can be told apart from a present-but-empty value
+# (R1.1-D: empty and every malformed form are rejected, never defaulted).
+monitor_env_load "$CONF" || { echo "monitor-service: cannot read conf" >&2; exit 1; }
+
+MODE="${SBMON_ENV_MODE:-web}"
+API_URL="${SBMON_ENV_API_URL:-http://127.0.0.1:9091}"
+CYCLE_SECONDS="${SBMON_ENV_CYCLE_SECONDS:-300}"
+
+log() { echo "monitor-service: $*"; }
+
+# --- P7: validate the API URL before doing anything else ---
+if ! monitor_env_validate_api_url "$API_URL"; then
+    log "SBMON_API_URL violates the loopback http contract (scheme=http, host=loopback, valid numeric port, no userinfo/path/query/fragment); refusing to start"
+    exit 1
+fi
+
+# --- R1-5: secret contract. collector-loop keeps the historical optional
+# behavior; web mode is file-based and fail-closed (always configured,
+# always a real regular file, never empty, BOX_API_SECRET unset). ---
+secret_file_regular_readable_nonempty() { # <path> -> rc 0 usable
+    local f="$1"
+    [ ! -L "$f" ] || return 1
+    [ -f "$f" ] || return 1
+    [ -r "$f" ] || return 1
+    [ -s "$f" ] || return 1
+}
+
+if [ "$MODE" = "web" ]; then
+    if [ -z "${SBMON_ENV_API_SECRET_FILE:-}" ]; then
+        log "web mode requires SBMON_API_SECRET_FILE in monitor.conf: fail-closed (Packaging never runs unauthenticated)"
+        exit 1
+    fi
+    if ! secret_file_regular_readable_nonempty "$SBMON_ENV_API_SECRET_FILE"; then
+        log "SBMON_API_SECRET_FILE is configured but not a readable regular non-empty file (missing/symlink/directory/empty): fail-closed"
+        exit 1
+    fi
+    secret_args=(--secret-file "$SBMON_ENV_API_SECRET_FILE")
+else
+    secret_args=()
+    if [ -n "${SBMON_ENV_API_SECRET_FILE:-}" ]; then
+        if [ ! -e "$SBMON_ENV_API_SECRET_FILE" ]; then
+            log "SBMON_API_SECRET_FILE is configured but missing: fail-closed (no silent unauthenticated downgrade)"
+            exit 1
+        fi
+        if [ ! -f "$SBMON_ENV_API_SECRET_FILE" ] || [ ! -r "$SBMON_ENV_API_SECRET_FILE" ]; then
+            log "SBMON_API_SECRET_FILE is configured but not a readable regular file: fail-closed"
+            exit 1
+        fi
+        secret_args=(--secret-file "$SBMON_ENV_API_SECRET_FILE")
+    fi
+fi
+
+child_pid=""
+terminate() {
+    if [ -n "$child_pid" ]; then
+        kill "$child_pid" 2>/dev/null || true
+    fi
+    exit 0
+}
+trap terminate TERM INT
+
+run_collector_loop() {
+    local pybin="${SBMON_PYTHON3:-python3}"
+    [ -f "$COLLECTOR" ] || { log "collector.py missing in $APP_DIR"; exit 1; }
+    command -v "$pybin" >/dev/null 2>&1 || { log "python3 not found"; exit 1; }
+    mkdir -p "$STATE_DIR"
+
+    log "mode=collector-loop cycle=${CYCLE_SECONDS}s target=<loopback service.api>"
+    local first=1
+    while :; do
+        local tmp="$STATE_DIR/.snapshot.json.tmp"
+        local -a mode_args=(--duration "$CYCLE_SECONDS")
+        # First snapshot immediately (--once consumes the authoritative reset
+        # batch and exits) so health sees a fresh snapshot seconds after start.
+        if [ "$first" = 1 ]; then
+            mode_args=(--once)
+            first=0
+        fi
+        # stdout -> temp file; only on clean exit it becomes the new snapshot.
+        # stderr stays on journald: the collector redacts secrets by contract.
+        local rc=0
+        "$pybin" "$COLLECTOR" --url "$API_URL" "${mode_args[@]}" \
+            "${secret_args[@]+"${secret_args[@]}"}" > "$tmp" &
+        child_pid=$!
+        wait "$child_pid" || rc=$?
+        child_pid=""
+        if [ "$rc" = 0 ]; then
+            mv -f -- "$tmp" "$STATE_DIR/snapshot.json"
+        else
+            rm -f -- "$tmp"
+        fi
+        # Stream ended or API unreachable: brief pause, then reconnect. The
+        # first message of every new subscription is a full authoritative
+        # reset, so state rebuilds without external persistence.
+        sleep 5 &
+        child_pid=$!
+        wait "$child_pid" || true
+        child_pid=""
+    done
+}
+
+run_web() {
+    local pybin="${SBMON_PYTHON3:-python3}"
+    [ -f "$WEBAPP" ] || { log "webapp.py missing in $APP_DIR (release layout corrupted)"; exit 1; }
+    [ -f "$COLLECTOR" ] || { log "collector.py missing in $APP_DIR (release layout corrupted)"; exit 1; }
+    command -v "$pybin" >/dev/null 2>&1 || { log "python3 not found"; exit 1; }
+
+    # R1-4: loopback-only bind, parsed by Python (never hand-split).
+    local bind="${SBMON_ENV_WEB_BIND:-127.0.0.1:9191}"
+    if ! monitor_env_split_web_bind "$bind"; then
+        log "SBMON_WEB_BIND='$bind' is not an accepted loopback bind (accepts 127.0.0.1:p | localhost:p | [::1]:p); wildcard/LAN/public/malformed forms refuse to start"
+        exit 1
+    fi
+    # R1.1-D: strict FINITE > 0 contract (Python float parse) before exec; a
+    # 0/0.0 poll would make the SnapshotBroker publisher wait(0) spin. An
+    # absent key defaults to 1; a present-but-empty/invalid value is rejected.
+    # Never echo the raw value (it is not a secret, but the message is generic).
+    local poll="${SBMON_ENV_WEB_POLL_SECONDS-1}"
+    if ! monitor_env_validate_poll_seconds "$poll"; then
+        log "SBMON_WEB_POLL_SECONDS must be a finite number greater than 0; refusing to start (fail-closed)"
+        exit 1
+    fi
+
+    mkdir -p "$STATE_DIR"
+    # R1-5: file-based delivery only -- the secret must never enter the
+    # environment (unit file, journal, /proc/<pid>/environ). The exec below
+    # drops BOX_API_SECRET before webapp.py ever starts.
+    log "mode=web bind=<loopback> poll=${poll}s target=<loopback service.api>"
+    exec env -u BOX_API_SECRET "$pybin" "$WEBAPP" serve \
+        --listen "$REPLY_BIND_HOST" \
+        --port "$REPLY_BIND_PORT" \
+        --url "$API_URL" \
+        --secret-file "$SBMON_ENV_API_SECRET_FILE" \
+        --data-dir "$DATA_ROOT" \
+        --health-file "$STATE_DIR/health.json" \
+        --poll "$poll"
+}
+
+case "$MODE" in
+    collector-loop) run_collector_loop ;;
+    web)            run_web ;;
+    *) log "unknown SBMON_MODE: $MODE"; exit 1 ;;
+esac

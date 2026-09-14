@@ -1,0 +1,55 @@
+name: shell-tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  bash-suites:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq shellcheck
+          flock --version || sudo apt-get install -y util-linux
+
+      - name: bash -n (all shell sources)
+        run: |
+          bash -n install.sh
+          bash -n install-linux-gateway.sh
+          bash -n tests/test-phase-c.sh
+          bash -n tests/test-phase-d.sh
+          bash -n tests/test-security-baseline.sh
+          bash -n tests/canary-api-auth.sh
+          bash -n tests/test-monitor-v2-e1.sh
+          bash -n tests/test-monitor-v2-e2.sh
+          bash -n tests/test-monitor-v2-e4.sh
+          bash -n tests/test-legacy-config-transactions.sh
+
+      - name: Phase C regression suite
+        run: bash tests/test-phase-c.sh
+
+      - name: Phase D regression suite
+        run: bash tests/test-phase-d.sh
+
+      - name: S0 security-baseline regression suite (incl. Linux-only mode assertions)
+        run: bash tests/test-security-baseline.sh
+
+      - name: Legacy config transaction hardening regression suite (real flock on Linux)
+        run: bash tests/test-legacy-config-transactions.sh
+
+      - name: E1 collector regression suite
+        run: bash tests/test-monitor-v2-e1.sh
+
+      - name: E2 web dashboard regression suite
+        run: bash tests/test-monitor-v2-e2.sh
+
+      - name: E4 Mihomo enrichment regression suite
+        run: bash tests/test-monitor-v2-e4.sh
+
+      - name: Integration regression complete (all prior steps green)
+        run: "echo 'Phase C + Phase D + S0 + E1 + E2 + E4: all green on Linux'"

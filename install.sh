@@ -14,10 +14,14 @@ hint() { echo -e "${yellow}$*${reset}"; }
 
 show_notice() {
     local message="$1"
-    local terminal_width=$(tput cols)
-    local line=$(printf "%*s" "$terminal_width" | tr ' ' '*')
+    local terminal_width
+    terminal_width=$(tput cols)
+    local line
+    line=$(printf '%*s' "$terminal_width" '' | tr ' ' '*')
     local padding=$(( (terminal_width - ${#message}) / 2 ))
-    local padded_message="$(printf "%*s%s" $padding '' "$message")"
+    [ "$padding" -lt 0 ] && padding=0
+    local padded_message
+    padded_message="$(printf '%*s' "$padding" '')${message}"
     warning "${bold}${line}${reset}"
     echo ""
     warning "${bold}${padded_message}${reset}"
@@ -688,7 +692,6 @@ RESERVED_CLIENT_NAME="legacy"
 CLIENT_NAME_PATTERN='^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$'
 REALITY_INBOUND_TAG="vless-in"
 HY2_INBOUND_TAG="hy2-in"
-REALITY_FLOW="xtls-rprx-vision"
 
 validate_client_name() { # validate_client_name <name> -> rc 0 if allowed
     local name="$1"
@@ -697,20 +700,54 @@ validate_client_name() { # validate_client_name <name> -> rc 0 if allowed
     return 0
 }
 
+# Seconds to wait for the exclusive config lock before aborting. Web/E3 helpers
+# MUST run with a finite timeout; the CLI default stays generous.
+SB_LOCK_TIMEOUT="${SB_LOCK_TIMEOUT:-15}"
+
 # Runs "$@" while holding the exclusive config lock (fd 9), so two management
-# operations can never mutate sbconfig_server.json concurrently.
+# operations can never mutate the durable sing-box state concurrently.
+#
+# NOTE ON THE NAME: despite the historical "client" name, this is the GLOBAL
+# management lock for EVERY durable sing-box config/state mutation, not just
+# Phase C client management. The SAME /root/sbox/config.lock serializes:
+#   - Phase C client management (add/delete/migrate)          [this block]
+#   - Phase D 1.14.x upgrade (binary + config)                [phase-d block]
+#   - legacy ports/SNI (modify_singbox), direct-in (doko/dokoko),
+#     SS (ssko) and HY2-hopping state writers                 [legacy block]
+# and the future E3 helper. The name is kept because a rename would touch every
+# caller/test for no functional gain; treat it as "the config/state lock".
+#
+# DISCIPLINE: callers must NOT nest with_client_lock. A public entry point
+# gathers interactive input WITHOUT the lock, then calls
+# `with_client_lock _xxx_locked ...`; the `_xxx_locked` helper re-reads LIVE
+# state, revalidates, mutates, and never re-acquires the lock. Never hold this
+# lock while waiting for interactive user input.
+#
+# FAIL-CLOSED: a missing flock binary, an unopenable lock file, an acquire
+# error or a timeout each abort WITHOUT ever running "$@" -- no candidate, no
+# backup, no config mutation and no reload is attempted unlocked.
 with_client_lock() {
-    if command -v flock >/dev/null 2>&1; then
-        if mkdir -p "$(dirname "$SB_LOCK_FILE")" 2>/dev/null &&
-           exec 9>>"$SB_LOCK_FILE" 2>/dev/null && flock 9 2>/dev/null; then
-            "$@"
-            local rc=$?
-            exec 9>&- 2>/dev/null
-            return $rc
-        fi
-        warning "无法获取配置锁 ($SB_LOCK_FILE)，单机低并发场景下继续执行"
+    if ! command -v flock >/dev/null 2>&1; then
+        warning "flock 不可用，无法安全地序列化配置修改，操作已中止（fail-closed）"
+        return 1
+    fi
+    if ! mkdir -p "$(dirname "$SB_LOCK_FILE")" 2>/dev/null; then
+        warning "无法创建锁目录 $(dirname "$SB_LOCK_FILE")，操作已中止（fail-closed）"
+        return 1
+    fi
+    if ! exec 9>>"$SB_LOCK_FILE" 2>/dev/null; then
+        warning "无法打开配置锁文件 $SB_LOCK_FILE，操作已中止（fail-closed）"
+        return 1
+    fi
+    if ! flock -w "$SB_LOCK_TIMEOUT" 9 2>/dev/null; then
+        warning "配置锁 $SB_LOCK_FILE 获取失败或超时（${SB_LOCK_TIMEOUT}s），操作已中止（fail-closed）"
+        exec 9>&- 2>/dev/null
+        return 1
     fi
     "$@"
+    local rc=$?
+    exec 9>&- 2>/dev/null
+    return $rc
 }
 
 get_reality_client_names() { # [config] -> one name per line ("" = unnamed user)
@@ -905,6 +942,14 @@ commit_server_config() { # commit_server_config <candidate> <description>
         rm -f "$candidate"
         return 1
     }
+    # cp -a preserves the SOURCE mode: on servers upgraded from older installs
+    # the live config may still be world-readable. A backup must never inherit
+    # that, so the mode is enforced explicitly instead of assumed.
+    if ! chmod 0600 "$backup_path" 2>/dev/null; then
+        warning "备份文件权限收紧为 0600 失败（$description），正式配置未修改"
+        rm -f "$backup_path" "$candidate"
+        return 1
+    fi
 
     if ! mv -f "$candidate" "$SB_SERVER_CONFIG"; then
         warning "原子替换失败（$description），已保留备份: $backup_path"
@@ -1100,6 +1145,14 @@ delete_client() { # delete_client <name> -> removes from BOTH inbounds atomicall
 
 _delete_client_locked() {
     local name="$1" candidate
+    # The destructive helper revalidates EVERYTHING itself and never trusts the
+    # outer delete_client(): order is name syntax -> reserved -> consistency
+    # audit -> existence -> mutation. Any rejection leaves the live config and
+    # the filesystem untouched.
+    if ! validate_client_name "$name"; then
+        warning "客户端名称非法: '$name'（locked helper 二次防护，允许: 字母/数字开头，仅字母数字._-，长度 1-32）"
+        return 1
+    fi
     # Invariant enforced again INSIDE the destructive helper: even a future
     # caller that bypasses delete_client must never be able to remove legacy.
     if [ "$name" = "$RESERVED_CLIENT_NAME" ]; then
@@ -1132,8 +1185,10 @@ _delete_client_locked() {
         return 1
     fi
     # Only after the server-side commit succeeded may the derived files go.
+    # The name was revalidated above; "--" only stops option parsing, it is
+    # never a substitute for validation.
     if [ -d "$SB_CLIENTS_DIR/$name" ]; then
-        rm -rf "$SB_CLIENTS_DIR/$name"
+        rm -rf -- "${SB_CLIENTS_DIR:?}/$name"
         info "已删除派生客户端配置目录: $SB_CLIENTS_DIR/$name"
     fi
     info "客户端 '$name' 已从 Reality 与 HY2 同时删除"
@@ -1377,6 +1432,148 @@ client_management_menu() {
 }
 # <<< phase-c client-management <<< ============================================
 
+# >>> s0 credential-boundary hardening >>> =====================================
+# S0 baseline hardening for the files this installer owns.
+#
+# Secret truth model: sbconfig_server.json is the single runtime source of
+# truth for the monitor-api service secret. /root/sbox/monitor-api.secret is a
+# DERIVED, convenience copy for the local collector (root:root, 0600). When
+# the two disagree, the CONFIG wins and the derived file is regenerated --
+# never the reverse, and a configured secret is never rotated on rerun. The
+# secret is transport authentication for service.api only; the identity model
+# (Device = service.api USER, Protocol = INBOUND, Lifecycle = connection id)
+# is unchanged.
+SB_API_SECRET_FILE="${SB_API_SECRET_FILE:-/root/sbox/monitor-api.secret}"
+SB_SELF_CERT_KEY="${SB_SELF_CERT_KEY:-/root/sbox/self-cert/private.key}"
+SB_SELF_CERT_CERT="${SB_SELF_CERT_CERT:-/root/sbox/self-cert/cert.pem}"
+
+# 256-bit secret from a CSPRNG. Never derived from timestamps, client
+# credentials, recovery keys or admin passwords; callers fail closed when no
+# CSPRNG is available. Prints ONLY the secret (callers must not echo it).
+generate_api_secret() {
+    local secret=""
+    if command -v openssl >/dev/null 2>&1; then
+        secret="$(openssl rand -hex 32 2>/dev/null | tr -d '\r\n')"
+    fi
+    if [ -z "$secret" ] && [ -r /dev/urandom ]; then
+        secret="$(od -An -N32 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
+    fi
+    [ ${#secret} -eq 64 ] || return 1
+    [[ "$secret" =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf '%s\n' "$secret"
+}
+
+# The config's monitor-api secret; "" when the entry is absent or its secret
+# is not a non-empty string. Never prints anything but the value itself.
+read_api_secret_from_config() { # [config]
+    jq -r --arg tag "$PHASE_D_API_TAG" '
+      ([(.services // [])[] | select(.tag == $tag)][0].secret // "") as $s |
+      if (($s | type) == "string") and (($s | length) > 0) then $s else "" end
+    ' "${1:-$SB_SERVER_CONFIG}" 2>/dev/null | tr -d '\r'
+}
+
+# Atomically writes the derived collector secret file (root:root, 0600).
+write_api_secret_file() { # <secret>
+    local secret="$1" tmp
+    [ -n "$secret" ] || return 1
+    tmp="$(mktemp "${SB_API_SECRET_FILE}.tmp.XXXXXX")" || return 1
+    if ! (umask 077 && printf '%s\n' "$secret" > "$tmp"); then
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! chmod 0600 "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        return 1
+    fi
+    # The installer always runs as root on the server; only skip the chown in
+    # non-root sandboxes (tests), never silently on the real host.
+    if [ "$(id -u)" = "0" ] && ! chown root:root "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! mv -f "$tmp" "$SB_API_SECRET_FILE" 2>/dev/null; then
+        rm -f "$tmp"
+        return 1
+    fi
+    return 0
+}
+
+# Config is authoritative: (re)generate the derived file when it is missing or
+# disagrees with the live config. Warnings never contain the secret itself.
+sync_api_secret_file() { # -> rc 0 when the derived file matches the live config
+    local secret current
+    secret="$(read_api_secret_from_config "$SB_SERVER_CONFIG")"
+    [ -n "$secret" ] || return 0   # no usable API secret in config: nothing to sync
+    if [ -f "$SB_API_SECRET_FILE" ]; then
+        current="$(tr -d '\r\n' < "$SB_API_SECRET_FILE" 2>/dev/null)"
+        [ "$current" = "$secret" ] && return 0
+        warning "monitor-api.secret 派生文件与服务端配置不一致，已按配置重新生成（以配置为准）"
+    else
+        warning "monitor-api.secret 派生文件缺失，已按服务端配置重新生成"
+    fi
+    write_api_secret_file "$secret"
+}
+
+# Existing-install bootstrap (S0), called BEFORE the interactive menu. A
+# failing permission hardening -- or a derived secret file that cannot be
+# brought back in sync with the config, which is the secret's authoritative
+# source -- must ABORT the installer here (error exits): the menu is never
+# entered and no management mutation can run against an unsafe or
+# desynced-credential state. Installations whose config carries no valid
+# monitor-api secret yet (Phase D migration not done) stay unaffected: sync
+# treats that as nothing-to-do.
+repair_existing_install_security_baseline() {
+    harden_sensitive_permissions ||
+        { error "敏感文件权限加固失败，请先人工检查磁盘/权限后再运行"; return 1; }
+    sync_api_secret_file ||
+        { error "monitor-api.secret 派生文件修复失败，请先人工检查磁盘/目录/权限后再运行"; return 1; }
+    return 0
+}
+
+# Idempotent permission repair for sensitive files. Existing files are forced
+# to 0600 (clients dir 0700, public cert 0644); missing files are skipped
+# without error; ANY chmod failure is fail-closed and callers must abort the
+# install. Never prints file contents.
+harden_sensitive_permissions() {
+    local target sub
+    for target in \
+        "$SB_SERVER_CONFIG" \
+        "$SB_STATE_FILE" \
+        "$SB_API_SECRET_FILE" \
+        "$SB_SELF_CERT_KEY" \
+        /root/sbox/mihomo_client.yaml \
+        /root/sbox/sbconfig_client.json; do
+        [ -f "$target" ] || continue
+        if ! chmod 0600 "$target" 2>/dev/null; then
+            warning "无法将敏感文件权限收紧为 0600: $target（拒绝继续，请人工检查）"
+            return 1
+        fi
+    done
+    if [ -f "$SB_SELF_CERT_CERT" ] && ! chmod 0644 "$SB_SELF_CERT_CERT" 2>/dev/null; then
+        warning "无法设置公钥证书权限为 0644: $SB_SELF_CERT_CERT"
+        return 1
+    fi
+    if [ -d "$SB_CLIENTS_DIR" ]; then
+        if ! chmod 0700 "$SB_CLIENTS_DIR" 2>/dev/null; then
+            warning "无法将客户端目录权限收紧为 0700: $SB_CLIENTS_DIR（拒绝继续）"
+            return 1
+        fi
+        for sub in "$SB_CLIENTS_DIR"/*; do
+            [ -d "$sub" ] || continue
+            if ! chmod 0700 "$sub" 2>/dev/null; then
+                warning "无法将客户端目录权限收紧为 0700: $sub（拒绝继续）"
+                return 1
+            fi
+            if [ -f "$sub/mihomo.yaml" ] && ! chmod 0600 "$sub/mihomo.yaml" 2>/dev/null; then
+                warning "无法将客户端配置权限收紧为 0600: $sub/mihomo.yaml（拒绝继续）"
+                return 1
+            fi
+        done
+    fi
+    return 0
+}
+# <<< s0 credential-boundary hardening <<< =====================================
+
 # >>> phase-d singbox-1.14-api >>> =============================================
 # Phase D: safe production upgrade to 1.14.x stable with a localhost-only
 # service.api (top-level "services" entry); the installer is a single
@@ -1500,7 +1697,7 @@ phase_d_config_structure_problems() { # <config>
 }
 
 # True when the config already carries exactly one compliant monitor-api
-# service entry (loopback-only, fixed port).
+# service entry (loopback-only, fixed port) WITH a non-empty string secret.
 phase_d_api_service_exact() { # <config>
     local cfg="$1"
     jq -e \
@@ -1511,14 +1708,26 @@ phase_d_api_service_exact() { # <config>
         ($m | length) == 1 and
         $m[0].type == "api" and
         $m[0].listen == $listen and
-        $m[0].listen_port == $port
+        $m[0].listen_port == $port and
+        ($m[0].secret | type) == "string" and
+        ($m[0].secret | length) > 0
       ' "$cfg" >/dev/null 2>&1
 }
 
-# Idempotent injection of the localhost-only service.api entry. Fails closed
-# when the input config fails the structural audit; re-audits the output.
-phase_d_inject_api_service() { # <input> <output>
+# Idempotent injection of the localhost-only service.api entry WITH its
+# authentication secret:
+#   - no monitor-api entry           -> append a full entry (incl. secret)
+#   - entry without a usable secret  -> fill in the secret, touch nothing else
+#   - already exact (incl. secret)   -> preserve the config byte-for-byte
+#                                      (a rerun NEVER rotates the secret)
+# When the structural audit passes and the entry exists but is not exact, the
+# only possible gap IS the missing secret (type/listen/port/count are already
+# enforced by the structural audit). An explicit secret argument is honoured;
+# otherwise one is generated. Fails closed on any audit error; re-audits the
+# output including the secret.
+phase_d_inject_api_service() { # <input> <output> [secret]
     local input="$1" output="$2" problems rc count tmp
+    local secret="${3:-}"
     problems="$(phase_d_config_structure_problems "$input")"; rc=$?
     if [ "$rc" -ne 0 ]; then
         warning "Phase D API 结构审计执行失败"
@@ -1531,33 +1740,59 @@ phase_d_inject_api_service() { # <input> <output>
 
     count="$(jq -er --arg tag "$PHASE_D_API_TAG" '[(.services // [])[] | select(.tag == $tag)] | length' "$input" 2>/dev/null | tr -d '\r')" || return 1
     if [ "$count" -eq 1 ]; then
-        # Existing exact service passed the structural audit; preserve config.
-        cp -a -- "$input" "$output" || return 1
-        return 0
-    fi
-
-    tmp="${output}.tmp.$$"
-    rm -f -- "$tmp"
-    if ! jq \
-      --arg tag "$PHASE_D_API_TAG" \
-      --arg listen "$PHASE_D_API_LISTEN" \
-      --argjson port "$PHASE_D_API_PORT" '
-        .services = ((.services // []) + [{
-          "type": "api",
-          "tag": $tag,
-          "listen": $listen,
-          "listen_port": $port
-        }])
-      ' "$input" > "$tmp"; then
+        if phase_d_api_service_exact "$input"; then
+            # Existing exact service passed both audits; preserve config.
+            cp -a -- "$input" "$output" || return 1
+            return 0
+        fi
+        if [ -z "$secret" ] && ! secret="$(generate_api_secret)"; then
+            warning "生成 monitor-api secret 失败"
+            return 1
+        fi
+        tmp="${output}.tmp.$$"
         rm -f -- "$tmp"
-        return 1
+        if ! jq --arg tag "$PHASE_D_API_TAG" --arg secret "$secret" \
+          '(.services[] | select(.tag == $tag) | .secret) = $secret' \
+          "$input" > "$tmp"; then
+            rm -f -- "$tmp"
+            return 1
+        fi
+        mv -f -- "$tmp" "$output" || { rm -f -- "$tmp"; return 1; }
+    else
+        if [ -z "$secret" ] && ! secret="$(generate_api_secret)"; then
+            warning "生成 monitor-api secret 失败"
+            return 1
+        fi
+        tmp="${output}.tmp.$$"
+        rm -f -- "$tmp"
+        if ! jq \
+          --arg tag "$PHASE_D_API_TAG" \
+          --arg listen "$PHASE_D_API_LISTEN" \
+          --argjson port "$PHASE_D_API_PORT" \
+          --arg secret "$secret" '
+            .services = ((.services // []) + [{
+              "type": "api",
+              "tag": $tag,
+              "listen": $listen,
+              "listen_port": $port,
+              "secret": $secret
+            }])
+          ' "$input" > "$tmp"; then
+            rm -f -- "$tmp"
+            return 1
+        fi
+        mv -f -- "$tmp" "$output" || { rm -f -- "$tmp"; return 1; }
     fi
-    mv -f -- "$tmp" "$output" || { rm -f -- "$tmp"; return 1; }
 
     problems="$(phase_d_config_structure_problems "$output")"; rc=$?
     if [ "$rc" -ne 0 ] || [ -n "$problems" ]; then
         rm -f -- "$output"
         [ -n "$problems" ] && printf '%s\n' "$problems" >&2
+        return 1
+    fi
+    if ! phase_d_api_service_exact "$output"; then
+        rm -f -- "$output"
+        warning "注入后 monitor-api 仍不合规（secret 校验失败）"
         return 1
     fi
     return 0
@@ -1633,7 +1868,7 @@ verify_candidate_binary() { # verify_candidate_binary <candidate> <version>
 # 0.0.0.0/[::]) and a live `sing-box api connection list` call.
 phase_d_health_ok() { # phase_d_health_ok <expected_version> [require_api=yes|no]
     local expected="$1" require_api="${2:-yes}"
-    local main_pid reality_port hy_port out
+    local main_pid reality_port hy_port out api_secret
     if ! systemctl is-active --quiet sing-box 2>/dev/null; then
         warning "健康检查失败: sing-box 服务未 active"
         return 1
@@ -1672,9 +1907,24 @@ phase_d_health_ok() { # phase_d_health_ok <expected_version> [require_api=yes|no
             warning "健康检查失败: API 监听越界（检测到 0.0.0.0/[::]:${PHASE_D_API_PORT}）"
             return 1
         fi
-        if ! "$SB_SING_BOX_BIN" api --url "http://127.0.0.1:${PHASE_D_API_PORT}" connection list >/dev/null 2>&1; then
-            warning "健康检查失败: sing-box api connection list 不可用"
-            return 1
+        # The secret's source of truth is the (already committed) live config.
+        api_secret="$(read_api_secret_from_config "$SB_SERVER_CONFIG")"
+        if [ -n "$api_secret" ]; then
+            if ! "$SB_SING_BOX_BIN" api --url "http://127.0.0.1:${PHASE_D_API_PORT}" --secret "$api_secret" connection list >/dev/null 2>&1; then
+                warning "健康检查失败: sing-box api connection list 不可用"
+                return 1
+            fi
+            # Negative canary: with a secret configured, an UNauthenticated call
+            # MUST be rejected; success would mean auth is not enforced.
+            if "$SB_SING_BOX_BIN" api --url "http://127.0.0.1:${PHASE_D_API_PORT}" connection list >/dev/null 2>&1; then
+                warning "健康检查失败: service.api 未强制认证（无凭据调用竟然成功）"
+                return 1
+            fi
+        else
+            if ! "$SB_SING_BOX_BIN" api --url "http://127.0.0.1:${PHASE_D_API_PORT}" connection list >/dev/null 2>&1; then
+                warning "健康检查失败: sing-box api connection list 不可用"
+                return 1
+            fi
         fi
     fi
     return 0
@@ -1870,6 +2120,13 @@ _upgrade_singbox_1_14_locked() {
         rm -f "$candidate_bin" "$candidate_cfg" "$backup_bin" "$backup_cfg"
         return 1
     fi
+    # cp -a preserves the source mode; an old 0644 live config must never
+    # produce a world-readable backup.
+    if ! chmod 0600 "$backup_cfg" 2>/dev/null; then
+        warning "备份文件权限收紧为 0600 失败，正式环境未修改"
+        rm -f "$candidate_bin" "$candidate_cfg" "$backup_bin" "$backup_cfg"
+        return 1
+    fi
 
     if ! mv -f "$candidate_bin" "$SB_SING_BOX_BIN"; then
         warning "原子替换 binary 失败，正式环境未修改"
@@ -1927,6 +2184,13 @@ _upgrade_singbox_1_14_locked() {
     info "升级完成: sing-box $ver（binary + config 已替换并验证健康）"
     info "本机 service.api 已启用: http://${PHASE_D_API_LISTEN}:${PHASE_D_API_PORT}（仅回环监听）"
     info "升级前备份: binary=$backup_bin config=$backup_cfg"
+    # S0: the committed config is the API secret's source of truth. Refresh the
+    # derived collector file so the local collector never authenticates with a
+    # missing/stale copy (a configured secret is never rotated here).
+    if ! sync_api_secret_file; then
+        warning "monitor-api.secret 派生文件刷新失败（binary/config 已提交且健康）；本机 collector 将无法认证，请手动检查权限"
+        return 1
+    fi
     return 0
 }
 # <<< phase-d singbox-1.14-api <<< ============================================
@@ -2009,14 +2273,174 @@ enable_bbr() {
     fi
 }
 
+# >>> legacy-config-transaction-hardening >>> ==================================
+# L1..L5: serialize EVERY durable sing-box management mutation under the SAME
+# /root/sbox/config.lock used by Phase C / Phase D (see the with_client_lock
+# note above). The legacy CLI flows below used to write sbconfig_server.json and
+# /root/sbox/config directly, bypassing the lock and using shared fixed temp
+# files. They now follow the same discipline:
+#
+#   public_function()  -> gather interactive input WITHOUT the lock
+#                      -> with_client_lock _public_function_locked <values>
+#
+#   _..._locked()      -> re-read LIVE state, revalidate, mutate, commit
+#                      -> never re-acquire the lock, never block on user input
+#
+# All JSON writers go through commit_server_config, so they inherit candidate
+# audit + sing-box check + 0600 backup + atomic replace + reload + health +
+# rollback. modify_singbox additionally owns /root/sbox/config, so it performs a
+# dedicated TWO-FILE transaction (see _modify_singbox_locked).
+# ==============================================================================
+
+# Unique candidate/backup paths next to the DURABLE STATE file (/root/sbox/config).
+# Same mktemp discipline as new_candidate_path/new_backup_path: never a shared
+# fixed temp name, so two transactions can never collide on one path.
+new_state_candidate_path() { # new_state_candidate_path -> unique candidate next to the live state
+    mktemp "${SB_STATE_FILE}.candidate.XXXXXX" 2>/dev/null
+}
+
+new_state_backup_path() { # new_state_backup_path -> unique backup next to the live state
+    mktemp "${SB_STATE_FILE}.bak.$(date +%Y%m%d-%H%M%S).XXXXXX" 2>/dev/null
+}
+
+# Atomically restores <live> from a hardened <backup>, keeping the original
+# backup intact. FAIL-CLOSED at every step: a missing/symlink/non-regular backup,
+# or a failed unique-temp creation, copy, chmod, atomic replace or verification
+# each return non-zero -- and a failure is NEVER reported as a successful restore.
+# The caller must hold with_client_lock. The live pathname is never `cp`'d onto
+# directly (a partial copy would corrupt the durable pair) and `sed -i` is never
+# used: the exact backup bytes are staged in a UNIQUE temp file in the SAME
+# directory and atomically renamed into place, then verified byte-for-byte.
+restore_file_atomically() { # <backup> <live>
+    local backup="$1" live="$2" tmp=""
+    if [ -z "$backup" ] || [ -z "$live" ]; then
+        warning "restore_file_atomically: 参数不能为空"
+        return 1
+    fi
+    if [ -L "$backup" ] || [ ! -f "$backup" ]; then
+        warning "备份不是普通文件（缺失或符号链接），拒绝恢复: $backup"
+        return 1
+    fi
+    if ! tmp="$(mktemp "${live}.restore.XXXXXX" 2>/dev/null)"; then
+        warning "创建恢复临时文件失败（需与目标同目录）: ${live}.restore.XXXXXX"
+        return 1
+    fi
+    if ! cp -a "$backup" "$tmp" 2>/dev/null; then
+        warning "写入恢复临时文件失败: $tmp"
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! chmod 0600 "$tmp" 2>/dev/null; then
+        warning "恢复临时文件权限收紧为 0600 失败: $tmp"
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! mv -f "$tmp" "$live" 2>/dev/null; then
+        warning "恢复文件原子替换失败: $live"
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! cmp -s "$backup" "$live" 2>/dev/null; then
+        warning "恢复校验失败：$live 与备份 $backup 内容不一致"
+        return 1
+    fi
+    return 0
+}
+
+# rc 0 when $1 is a usable TCP/UDP port number (1-65535, digits only).
+valid_port() {
+    case "$1" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+
+# rc 0 when an inbound with this exact tag exists in <config>.
+inbound_tag_exists() { # <tag> [config]
+    jq -e --arg tag "$1" '[.inbounds[] | select(.tag == $tag)] | length > 0' \
+        "${2:-$SB_SERVER_CONFIG}" >/dev/null 2>&1
+}
+
+# Structural precheck for the legacy JSON writers (direct-in / ss-in). The Phase C
+# identity audit only knows vless-in/hy2-in, so these flows need their own
+# fail-closed structural gate BEFORE building a candidate:
+#   root object, .inbounds array, and (for the direct-in flows) .route.rules array.
+# FAIL-CLOSED: a jq runtime error propagates as a non-zero exit code and must be
+# treated as a failure by callers, never as "no problems".
+legacy_json_structure_problems() { # <config> [require_route_rules yes|no]
+    local cfg="$1" need_rules="${2:-no}"
+    jq -r --arg need "$need_rules" '
+      if (type != "object") then ["配置根节点不是 object"]
+      elif ((.inbounds // null) | type) != "array" then
+        (if (.inbounds // null) == null then ["缺少 inbounds 字段"] else ["inbounds 不是数组"] end)
+      elif ($need == "yes") and has("route") and ((.route | type) != "object") then
+        ["route 不是 object"]
+      elif ($need == "yes") and (((.route // {}) | .rules // null) == null) then
+        ["缺少 route.rules 字段"]
+      elif ($need == "yes") and ((((.route // {}) | .rules) | type) != "array") then
+        ["route.rules 不是数组"]
+      else [] end | .[]
+    ' "$cfg" 2>/dev/null
+}
+
+# live state -> candidate -> atomic replace, used by the HY2 state writers.
+# The caller MUST already hold with_client_lock. Rewrites the single line whose
+# key matches (appending when absent), leaving every other byte untouched.
+set_state_key() { # set_state_key <live> <candidate> <key> <replacement-line>
+    local live="$1" candidate="$2" key="$3" line="$4"
+    awk -v key="$key" -v line="$line" '
+        BEGIN { done = 0 }
+        index($0, key "=") == 1 { print line; done = 1; next }
+        { print }
+        END { if (!done) print line }
+    ' "$live" > "$candidate" 2>/dev/null
+}
+
+# ---------------------------------------------------------------- L5 guard --
+# Narrowly scoped guard for the future E3 (Web Client Manager) enablement.
+#
+# E3 IS NOT IMPLEMENTED on this branch, so NO production code creates this
+# signal and current installations keep the exact legacy behaviour (the marker
+# path simply does not exist). This is the ACTIVATION HOOK that future E3 must
+# own: while web/E3 management is active it must publish the marker (and remove
+# it when management is disabled / maintenance mode is entered), so the
+# destructive CLI uninstall/reinstall refuses BEFORE touching disk instead of
+# racing a live manager. The concrete signal is deliberately a single
+# root-owned file (the simplest durable signal); it is subordinate to the final
+# E3/Integration decision and MUST be ratified there. SB_MANAGEMENT_ACTIVE_MARKER
+# is overridable so tests can simulate the active state without inventing an
+# irreversible production contract.
+SB_MANAGEMENT_ACTIVE_MARKER="${SB_MANAGEMENT_ACTIVE_MARKER:-/root/sbox/web-management.active}"
+
+management_is_active() { # rc 0 when web/E3 management is marked active
+    [ -e "$SB_MANAGEMENT_ACTIVE_MARKER" ]
+}
+
+require_management_inactive() { # <operation-label> -> rc 0 when safe to proceed
+    local op="${1:-该操作}"
+    if ! management_is_active; then
+        return 0
+    fi
+    warning "检测到 Web 管理已启用（$SB_MANAGEMENT_ACTIVE_MARKER）。"
+    warning "为避免与 Web/E3 管理并发破坏 /root/sbox 配置，已拒绝 '$op'。"
+    warning "请先关闭 Web 管理或进入维护模式，再执行 '$op'。"
+    return 1
+}
+
+# -------------------------------------------------- L3 modify_singbox (2 files) --
+# Interactive input is gathered BEFORE the lock (prompts, port picking and the
+# TLS/HTTP2 probe are all user/network blocking). The dual-file transaction runs
+# under with_client_lock.
 modify_singbox() {
+    local reality_current_port reality_port reality_current_server_name reality_server_name input_server_name
+    local hy_current_port hy_port hy_current_cert hy_current_key hy_current_domain hy_domain hy_cert hy_key
     echo ""
     warning "开始修改VISION_REALITY 端口号和域名"
     echo ""
-    reality_current_port=$(jq -r '.inbounds[] | select(.tag == "vless-in") | .listen_port' /root/sbox/sbconfig_server.json)
+    reality_current_port=$(jq -r '.inbounds[] | select(.tag == "vless-in") | .listen_port' "$SB_SERVER_CONFIG")
     reality_port=$(modify_port "$reality_current_port" "VISION_REALITY")
     info "生成的端口号为: $reality_port"
-    reality_current_server_name=$(jq -r '.inbounds[] | select(.tag == "vless-in") | .tls.server_name' /root/sbox/sbconfig_server.json)
+    reality_current_server_name=$(jq -r '.inbounds[] | select(.tag == "vless-in") | .tls.server_name' "$SB_SERVER_CONFIG")
     reality_server_name="$reality_current_server_name"
     while :; do
         read -p "请输入需要偷取证书的网站，必须支持 TLS 1.3 and HTTP/2 (默认: $reality_server_name): " input_server_name
@@ -2031,37 +2455,226 @@ modify_singbox() {
     echo ""
     warning "开始修改hysteria2端口号"
     echo ""
-    hy_current_port=$(jq -r '.inbounds[] | select(.tag == "hy2-in") | .listen_port' /root/sbox/sbconfig_server.json)
+    hy_current_port=$(jq -r '.inbounds[] | select(.tag == "hy2-in") | .listen_port' "$SB_SERVER_CONFIG")
     hy_port=$(modify_port "$hy_current_port" "HYSTERIA2")
     info "生成的端口号为: $hy_port"
     info "修改hysteria2应用证书路径"
-    hy_current_cert=$(jq -r '.inbounds[] | select(.tag == "hy2-in") | .tls.certificate_path' /root/sbox/sbconfig_server.json)
-    hy_current_key=$(jq -r '.inbounds[] | select(.tag == "hy2-in") | .tls.key_path' /root/sbox/sbconfig_server.json)
-    hy_current_domain=$(grep -o "HY_SERVER_NAME='[^']*'" /root/sbox/config | awk -F"'" '{print $2}')
+    hy_current_cert=$(jq -r '.inbounds[] | select(.tag == "hy2-in") | .tls.certificate_path' "$SB_SERVER_CONFIG")
+    hy_current_key=$(jq -r '.inbounds[] | select(.tag == "hy2-in") | .tls.key_path' "$SB_SERVER_CONFIG")
+    hy_current_domain=$(grep -o "HY_SERVER_NAME='[^']*'" "$SB_STATE_FILE" | awk -F"'" '{print $2}')
     read -p "请输入证书域名 (默认: $hy_current_domain): " hy_domain
     hy_domain=${hy_domain:-$hy_current_domain}
     read -p "请输入证书cert路径 (默认: $hy_current_cert): " hy_cert
     hy_cert=${hy_cert:-$hy_current_cert}
     read -p "请输入证书key路径 (默认: $hy_current_key): " hy_key
     hy_key=${hy_key:-$hy_current_key}
-    jq --arg reality_port "$reality_port" \
-    --arg hy_port "$hy_port" \
-    --arg reality_server_name "$reality_server_name" \
-    --arg hy_cert "$hy_cert" \
-    --arg hy_key "$hy_key" \
-    '
-    (.inbounds[] | select(.tag == "vless-in") | .listen_port) |= ($reality_port | tonumber) |
-    (.inbounds[] | select(.tag == "hy2-in") | .listen_port) |= ($hy_port | tonumber) |
-    (.inbounds[] | select(.tag == "vless-in") | .tls.server_name) |= $reality_server_name |
-    (.inbounds[] | select(.tag == "vless-in") | .tls.reality.handshake.server) |= $reality_server_name |
-    (.inbounds[] | select(.tag == "hy2-in") | .tls.certificate_path) |= $hy_cert |
-    (.inbounds[] | select(.tag == "hy2-in") | .tls.key_path) |= $hy_key
-    ' /root/sbox/sbconfig_server.json > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
-    
-    sed -i "s/HY_SERVER_NAME='.*'/HY_SERVER_NAME='$hy_domain'/" /root/sbox/config
 
-    reload_singbox
+    # No lock is held here; the transaction re-reads and revalidates LIVE state.
+    with_client_lock _modify_singbox_locked \
+        "$reality_port" "$hy_port" "$reality_server_name" "$hy_cert" "$hy_key" "$hy_domain"
 }
+
+# Two-file transaction: /root/sbox/sbconfig_server.json AND /root/sbox/config
+# must change together. `commit_server_config` + `sed -i` is deliberately NOT
+# used: that would still allow a split durable state (new JSON + old state).
+# Order: re-read LIVE -> revalidate -> build BOTH unique candidates -> validate
+# JSON -> sing-box check -> hardened 0600 backups of BOTH -> atomically replace
+# BOTH -> reload -> health. Any failure after either live replacement restores
+# BOTH artifacts, reloads the old configuration and verifies recovery; a success
+# never leaves new JSON + old state (or old JSON + new state).
+# Only the explicitly requested values are mutated: Reality UUIDs, HY2 passwords,
+# the Reality private key and service.api.secret are never rotated here.
+_modify_singbox_locked() { # <reality_port> <hy_port> <server_name> <hy_cert> <hy_key> <hy_domain>
+    local reality_port="$1" hy_port="$2" server_name="$3" hy_cert="$4" hy_key="$5" hy_domain="$6"
+    local cfg="$SB_SERVER_CONFIG" state="$SB_STATE_FILE"
+    local json_cand="" state_cand="" json_bak="" state_bak=""
+    local problems="" was_running="" p="" rj=0 rs=0
+
+    # 1. re-read the LIVE artifacts (never a pre-lock snapshot).
+    [ -f "$cfg" ] || { warning "服务端配置不存在: $cfg"; return 1; }
+    [ -f "$state" ] || { warning "状态文件不存在: $state"; return 1; }
+    if ! jq empty "$cfg" >/dev/null 2>&1; then
+        warning "服务端配置不是合法 JSON: $cfg"
+        return 1
+    fi
+
+    # 2. revalidate every assumption against the LIVE config.
+    if ! problems="$(candidate_problems "$cfg")"; then
+        warning "服务端配置结构审计执行失败，修改已中止"
+        return 1
+    fi
+    if [ -n "$problems" ]; then
+        warning "服务端配置结构不满足修改前提:"
+        while IFS= read -r p; do
+            [ -n "$p" ] && warning "  - $p"
+        done <<< "$problems"
+        return 1
+    fi
+    if ! valid_port "$reality_port"; then
+        warning "Reality 端口非法: '$reality_port'"
+        return 1
+    fi
+    if ! valid_port "$hy_port"; then
+        warning "HY2 端口非法: '$hy_port'"
+        return 1
+    fi
+    [ -n "$server_name" ] || { warning "Reality server_name 不能为空"; return 1; }
+    [ -n "$hy_cert" ] || { warning "HY2 证书 cert 路径不能为空"; return 1; }
+    [ -n "$hy_key" ] || { warning "HY2 证书 key 路径不能为空"; return 1; }
+    # The domain is written into a single-quoted state line; reject anything that
+    # would break that line rather than emitting a corrupt durable state.
+    case "$hy_domain" in
+        ''|*"'"*|*'\'*)
+            warning "证书域名非法（不得为空/引号/反斜杠）: '$hy_domain'"
+            return 1
+            ;;
+    esac
+    case "$hy_domain" in
+        *[[:space:]]*)
+            warning "证书域名不得包含空白: '$hy_domain'"
+            return 1
+            ;;
+    esac
+
+    # 3./4. build BOTH unique candidates from the LIVE files (no shared temp file).
+    json_cand="$(new_candidate_path)" || { warning "创建 JSON candidate 失败"; return 1; }
+    if ! jq --arg reality_port "$reality_port" \
+        --arg hy_port "$hy_port" \
+        --arg reality_server_name "$server_name" \
+        --arg hy_cert "$hy_cert" \
+        --arg hy_key "$hy_key" \
+        '
+        (.inbounds[] | select(.tag == "vless-in") | .listen_port) |= ($reality_port | tonumber) |
+        (.inbounds[] | select(.tag == "hy2-in") | .listen_port) |= ($hy_port | tonumber) |
+        (.inbounds[] | select(.tag == "vless-in") | .tls.server_name) |= $reality_server_name |
+        (.inbounds[] | select(.tag == "vless-in") | .tls.reality.handshake.server) |= $reality_server_name |
+        (.inbounds[] | select(.tag == "hy2-in") | .tls.certificate_path) |= $hy_cert |
+        (.inbounds[] | select(.tag == "hy2-in") | .tls.key_path) |= $hy_key
+        ' "$cfg" > "$json_cand"; then
+        warning "生成 JSON candidate 失败"
+        rm -f "$json_cand"
+        return 1
+    fi
+    state_cand="$(new_state_candidate_path)" || { warning "创建状态 candidate 失败"; rm -f "$json_cand"; return 1; }
+    if ! set_state_key "$state" "$state_cand" "HY_SERVER_NAME" "HY_SERVER_NAME='${hy_domain}'"; then
+        warning "生成状态 candidate 失败"
+        rm -f "$json_cand" "$state_cand"
+        return 1
+    fi
+
+    # 5. validate the candidate JSON (syntax + identity audit) BEFORE any replace.
+    if ! jq empty "$json_cand" >/dev/null 2>&1; then
+        warning "candidate JSON 不是合法 JSON，修改已中止"
+        rm -f "$json_cand" "$state_cand"
+        return 1
+    fi
+    if ! problems="$(candidate_problems "$json_cand")"; then
+        warning "candidate 结构审计执行失败，修改已中止"
+        rm -f "$json_cand" "$state_cand"
+        return 1
+    fi
+    if [ -n "$problems" ]; then
+        warning "candidate 结构一致性检查失败，正式配置与状态均未修改:"
+        while IFS= read -r p; do
+            [ -n "$p" ] && warning "  - $p"
+        done <<< "$problems"
+        rm -f "$json_cand" "$state_cand"
+        return 1
+    fi
+
+    # 6. sing-box check on the candidate (never on the live file).
+    if ! "$SB_SING_BOX_BIN" check -c "$json_cand" >/dev/null 2>&1; then
+        warning "sing-box check 未通过，正式配置与状态均未修改"
+        rm -f "$json_cand" "$state_cand"
+        return 1
+    fi
+
+    if systemctl is-active --quiet sing-box 2>/dev/null; then
+        was_running=systemd
+    elif pgrep -x sing-box >/dev/null 2>&1; then
+        was_running=manual
+    else
+        was_running=no
+    fi
+
+    # 7. hardened backups of BOTH live files (0600, never inherit world-readable).
+    json_bak="$(new_backup_path)" || { warning "创建 JSON 备份路径失败"; rm -f "$json_cand" "$state_cand"; return 1; }
+    state_bak="$(new_state_backup_path)" || { warning "创建状态备份路径失败"; rm -f "$json_cand" "$state_cand"; return 1; }
+    if ! cp -a "$cfg" "$json_bak" || ! chmod 0600 "$json_bak" 2>/dev/null; then
+        warning "备份服务端配置失败"
+        rm -f "$json_cand" "$state_cand" "$json_bak"
+        return 1
+    fi
+    if ! cp -a "$state" "$state_bak" || ! chmod 0600 "$state_bak" 2>/dev/null; then
+        warning "备份状态文件失败"
+        rm -f "$json_cand" "$state_cand" "$json_bak" "$state_bak"
+        return 1
+    fi
+
+    # 8. atomically replace BOTH durable artifacts. A failure after the first
+    # replace restores both from the hardened backups: the pair is never split.
+    if ! mv -f "$json_cand" "$cfg"; then
+        warning "JSON 原子替换失败，持久化状态未修改"
+        rm -f "$json_cand" "$state_cand"
+        return 1
+    fi
+    if ! mv -f "$state_cand" "$state"; then
+        # The state rename failed, so the old state is normally still in place;
+        # nevertheless restore+verify BOTH artifacts atomically so the durable
+        # pair is provably restored and never left split (new JSON + old state).
+        rm -f "$state_cand"
+        warning "状态文件原子替换失败，回滚服务端配置与状态并校验..."
+        rj=0; rs=0
+        restore_file_atomically "$json_bak" "$cfg" || rj=1
+        restore_file_atomically "$state_bak" "$state" || rs=1
+        if [ "$rj" -ne 0 ] || [ "$rs" -ne 0 ]; then
+            warning "回滚恢复失败，需人工介入！两份持久化文件可能不一致，请勿继续操作。"
+            warning "备份保留（请勿删除）: $json_bak / $state_bak"
+            return 1
+        fi
+        if [ "$was_running" = "no" ]; then
+            warning "已恢复并校验上一份配置与状态（当前无运行中的 sing-box，无需 reload）: $json_bak / $state_bak"
+            return 1
+        fi
+        if reload_running_singbox && reload_health_ok; then
+            warning "已回滚并重新加载上一份配置与状态: $json_bak / $state_bak"
+        else
+            warning "已恢复并校验上一份配置与状态，但服务未能确认恢复，请立即人工检查！备份: $json_bak / $state_bak"
+        fi
+        return 1
+    fi
+
+    # 9./10. reload + health.
+    if [ "$was_running" = "no" ]; then
+        info "配置与状态已同时提交（当前无运行中的 sing-box，跳过 reload）"
+        info "上一份备份: $json_bak / $state_bak"
+        return 0
+    fi
+    if reload_running_singbox && reload_health_ok; then
+        info "配置与状态已同时提交并重载成功"
+        info "上一份备份: $json_bak / $state_bak"
+        return 0
+    fi
+
+    # 11./12. reload/health failed -> atomically restore+verify BOTH artifacts,
+    # then reload the previous configuration.
+    warning "reload 后健康检查失败，回滚配置与状态..."
+    rj=0; rs=0
+    restore_file_atomically "$json_bak" "$cfg" || rj=1
+    restore_file_atomically "$state_bak" "$state" || rs=1
+    if [ "$rj" -ne 0 ] || [ "$rs" -ne 0 ]; then
+        warning "回滚恢复失败，需人工介入！两份持久化文件可能不一致，请勿继续操作。"
+        warning "备份保留（请勿删除）: $json_bak / $state_bak"
+        return 1
+    fi
+    if reload_running_singbox && reload_health_ok; then
+        warning "已回滚并重新加载上一份配置与状态: $json_bak / $state_bak"
+    else
+        warning "已恢复磁盘上的配置与状态，但服务未能确认恢复，请立即人工检查！备份: $json_bak / $state_bak"
+    fi
+    return 1
+}
+
 
 backup_current_installation() {
     local backup_dir backup_name unit_path
@@ -2093,6 +2706,12 @@ backup_current_installation() {
 }
 
 uninstall_singbox() {
+    # L5: refuse BEFORE any destructive mutation when web/E3 management is active.
+    # E3 is not implemented, so this only triggers when a future E3 publishes the
+    # marker; default installations behave exactly as before.
+    if ! require_management_inactive "卸载"; then
+        return 1
+    fi
     warning "开始卸载..."
     if pgrep -x sing-box >/dev/null 2>&1 && ! systemctl is-active --quiet sing-box; then
         error "sing-box 当前由手工进程运行。为防止删除运行中的配置，已拒绝卸载。"
@@ -2104,6 +2723,7 @@ uninstall_singbox() {
     rm -f /usr/bin/mianyang /root/sbox/self-cert/private.key /root/sbox/self-cert/cert.pem /root/sbox/config
     rm -rf /root/sbox/self-cert/ /root/sbox/
     warning "卸载完成"
+    return 0
 }
 
 update_singbox(){
@@ -2124,76 +2744,177 @@ generate_random_number() {
     echo $((10000000 + RANDOM % 90000000))
 }
 process_doko() {
-  while :; do
-      echo "已配置的任意门转发规则如下:"
-      jq '.inbounds[] | select((.tag // "") | startswith("direct-in")) | "\(.tag): 转发至ip \(.override_address // "未设置"), 转发至端口 \(.override_port // "未设置")"' /root/sbox/sbconfig_server.json
-      echo ""
-      echo "选择操作:"
-      echo "1. 添加规则"
-      echo "2. 删除规则"
-      echo "0. 退出"
-      read -p "请输入选择的操作数字（0-2）: " choice
-      case $choice in
-          1)
-              fport=$(generate_port "本机任意门入站")
-              echo "本机端口为: $fport"
-              read -p "请输入转发至的vps ip: " ipaddress
-              read -p "请输入转发至的vps端口: " tport
-
-              # Generate an 8-digit random number as tag_suffix
-              tag_suffix=$(generate_random_number)
-
-              tag="direct-in${tag_suffix}"
-
-              jq --arg ipaddress "$ipaddress" --arg fport "$fport" --arg tport "$tport" --arg tag "$tag" '
-                  .inbounds += [
-                      {
-                          "type": "direct",
-                          "tag": $tag,
-                          "listen": "::",
-                          "override_address": $ipaddress,
-                          "override_port": ($tport | tonumber),
-                          "listen_port": ($fport | tonumber)
-                      }
-                  ] | .route.rules += [
-                      {
-                          "inbound": $tag,
-                          "outbound": "direct"
-                      }
-                  ]' "/root/sbox/sbconfig_server.json" > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
-              echo "已添加任意门规则配置 ($tag)"
-              reload_singbox
-              ;;
-          2)
-              echo "请输入要删除的任意门规则标签 (例如：direct-in1): "
-              read delete_tag
-              jq 'del(.inbounds[] | select(.tag == $delete_tag)) | del(.outbounds[] | select(.tag == ($delete_tag + "-out"))) | .route.rules = (.route.rules | map(select(.inbound != $delete_tag)))' --arg delete_tag "$delete_tag" "/root/sbox/sbconfig_server.json" > /root/sbox/sbconfig_server.temp && mv /root/sbox/sbconfig_server.temp /root/sbox/sbconfig_server.json
-              echo "已删除任意门规则 ($delete_tag)"
-              reload_singbox
-              ;;
-          0)
-              echo "退出"
-              ;;
-          *)
-              echo "无效的选择"
-              ;;
-      esac
+    local choice fport ipaddress tport delete_tag
+    while :; do
+        echo "已配置的任意门转发规则如下:"
+        jq '.inbounds[] | select((.tag // "") | startswith("direct-in")) | "\(.tag): 转发至ip \(.override_address // "未设置"), 转发至端口 \(.override_port // "未设置")"' "$SB_SERVER_CONFIG"
+        echo ""
+        echo "选择操作:"
+        echo "1. 添加规则"
+        echo "2. 删除规则"
+        echo "0. 退出"
+        read -p "请输入选择的操作数字（0-2）: " choice
+        case $choice in
+            1)
+                # Interactive input is gathered WITHOUT holding the config lock.
+                fport=$(generate_port "本机任意门入站")
+                echo "本机端口为: $fport"
+                read -p "请输入转发至的vps ip: " ipaddress
+                read -p "请输入转发至的vps端口: " tport
+                with_client_lock _process_doko_add_locked "$fport" "$ipaddress" "$tport" ||
+                    warning "添加任意门规则失败，配置未修改"
+                ;;
+            2)
+                echo "请输入要删除的任意门规则标签 (例如：direct-in1): "
+                read -r delete_tag
+                with_client_lock _process_doko_delete_locked "$delete_tag" ||
+                    warning "删除任意门规则失败，配置未修改"
+                ;;
+            0)
+                echo "退出"
+                break
+                ;;
+            *)
+                echo "无效的选择"
+                ;;
+        esac
     done
+}
+
+# Locked helper: re-reads LIVE config, revalidates, generates a UNIQUE tag, builds
+# a unique candidate and commits. Never re-acquires the lock and never reads input.
+_process_doko_add_locked() { # <fport> <ipaddress> <tport>
+    local fport="$1" ipaddress="$2" tport="$3"
+    local cfg="$SB_SERVER_CONFIG" candidate="" tag="" suffix="" problems="" attempt=0 p=""
+    if ! valid_port "$fport"; then
+        warning "本机端口非法: '$fport'"
+        return 1
+    fi
+    if ! valid_port "$tport"; then
+        warning "转发端口非法: '$tport'"
+        return 1
+    fi
+    [ -n "$ipaddress" ] || { warning "转发目标 IP 不能为空"; return 1; }
+    [ -f "$cfg" ] || { warning "服务端配置不存在: $cfg"; return 1; }
+    if ! jq empty "$cfg" >/dev/null 2>&1; then
+        warning "服务端配置不是合法 JSON: $cfg"
+        return 1
+    fi
+    if ! problems="$(legacy_json_structure_problems "$cfg" yes)"; then
+        warning "服务端配置结构审计执行失败，已中止"
+        return 1
+    fi
+    if [ -n "$problems" ]; then
+        warning "服务端配置结构不满足添加前提:"
+        while IFS= read -r p; do
+            [ -n "$p" ] && warning "  - $p"
+        done <<< "$problems"
+        return 1
+    fi
+
+    # Generate/REVALIDATE a unique direct-in tag while the lock is held.
+    while :; do
+        attempt=$((attempt + 1))
+        if [ "$attempt" -gt 100 ]; then
+            warning "无法生成唯一的任意门标签，已中止"
+            return 1
+        fi
+        suffix="$(generate_random_number)"
+        tag="direct-in${suffix}"
+        if ! inbound_tag_exists "$tag" "$cfg"; then
+            break
+        fi
+    done
+
+    candidate="$(new_candidate_path)" || { warning "创建 candidate 失败"; return 1; }
+    if ! jq --arg ipaddress "$ipaddress" --arg fport "$fport" --arg tport "$tport" --arg tag "$tag" '
+        .inbounds += [
+            {
+                "type": "direct",
+                "tag": $tag,
+                "listen": "::",
+                "override_address": $ipaddress,
+                "override_port": ($tport | tonumber),
+                "listen_port": ($fport | tonumber)
+            }
+        ] | .route.rules += [
+            {
+                "inbound": $tag,
+                "outbound": "direct"
+            }
+        ]' "$cfg" > "$candidate"; then
+        warning "生成 direct-in candidate 失败"
+        rm -f "$candidate"
+        return 1
+    fi
+    if ! commit_server_config "$candidate" "add direct-in $tag"; then
+        warning "任意门规则写入失败（commit 未成功），配置未修改"
+        return 1
+    fi
+    info "已添加任意门规则配置 ($tag)"
+    return 0
+}
+
+# Locked helper: delete path. Re-checks the target exists WHILE LOCKED (a tag can
+# disappear between the menu display and the transaction).
+_process_doko_delete_locked() { # <tag>
+    local tag="$1"
+    local cfg="$SB_SERVER_CONFIG" candidate="" problems="" p=""
+    [ -n "$tag" ] || { warning "标签不能为空"; return 1; }
+    [ -f "$cfg" ] || { warning "服务端配置不存在: $cfg"; return 1; }
+    if ! jq empty "$cfg" >/dev/null 2>&1; then
+        warning "服务端配置不是合法 JSON: $cfg"
+        return 1
+    fi
+    if ! problems="$(legacy_json_structure_problems "$cfg" yes)"; then
+        warning "服务端配置结构审计执行失败，已中止"
+        return 1
+    fi
+    if [ -n "$problems" ]; then
+        warning "服务端配置结构不满足删除前提:"
+        while IFS= read -r p; do
+            [ -n "$p" ] && warning "  - $p"
+        done <<< "$problems"
+        return 1
+    fi
+    if ! inbound_tag_exists "$tag" "$cfg"; then
+        warning "任意门规则标签 '$tag' 不存在（锁内复核），拒绝删除"
+        return 1
+    fi
+    candidate="$(new_candidate_path)" || { warning "创建 candidate 失败"; return 1; }
+    if ! jq --arg tag "$tag" '
+        del(.inbounds[] | select(.tag == $tag)) |
+        del(.outbounds[] | select(.tag == ($tag + "-out"))) |
+        .route.rules = (.route.rules | map(select(.inbound != $tag)))
+    ' "$cfg" > "$candidate"; then
+        warning "生成 direct-in delete candidate 失败"
+        rm -f "$candidate"
+        return 1
+    fi
+    if ! commit_server_config "$candidate" "delete direct-in $tag"; then
+        warning "任意门规则删除失败（commit 未成功），配置未修改"
+        return 1
+    fi
+    info "已删除任意门规则 ($tag)"
+    return 0
 }
 process_dokoko() {
     warning "任意门落地机设置，目前只支持解锁使用443端口的网站"
-    config_file="/root/sbox/sbconfig_server.json"
-    tag="direct-in"
-    existing_port=$(jq -r --arg tag "$tag" '.inbounds[] | select(.tag == $tag) | .listen_port' "$config_file")
-    existing_ip=$(jq -r --arg tag "$tag" '.inbounds[] | select(.tag == $tag) | .listen' "$config_file")
+    local cfg="$SB_SERVER_CONFIG" tag="direct-in"
+    local existing_port existing_ip delete_option fport fip ip_regex
+    existing_port=$(jq -r --arg tag "$tag" '.inbounds[] | select(.tag == $tag) | .listen_port' "$cfg")
+    existing_ip=$(jq -r --arg tag "$tag" '.inbounds[] | select(.tag == $tag) | .listen' "$cfg")
 
     if [ -n "$existing_port" ] && [ "$existing_port" != "null" ]; then
         echo "已存在的监听为: $existing_ip : $existing_port "
         read -p "是否删除已存在的配置？ (y/n): " delete_option
         if [ "$delete_option" = "y" ]; then
-            jq --arg tag "$tag" 'del(.inbounds[] | select(.tag == $tag)) | del(.outbounds[] | select(.tag == ($tag + "-out"))) | .route.rules = (.route.rules | map(select(.inbound != $tag)))' "$config_file" > "${config_file}.temp" && mv "${config_file}.temp" "$config_file"
-            echo "已删除配置"
-            reload_singbox
+            # The delete decision is revalidated inside the lock.
+            if with_client_lock _process_dokoko_delete_locked "$tag"; then
+                echo "已删除配置"
+            else
+                warning "删除配置失败，配置未修改"
+            fi
         else
             echo "未删除配置"
         fi
@@ -2207,41 +2928,132 @@ process_dokoko() {
             fi
         done
         while true; do
-          read -p "请输入被解锁机vps ip: " fip
-          ip_regex="^([0-9]{1,3}\.){3}[0-9]{1,3}$"
-          if [[ $fip =~ $ip_regex ]]; then
-              break
-          else
-              warning "输入的IP地址格式不合法"
-          fi
+            read -p "请输入被解锁机vps ip: " fip
+            ip_regex="^([0-9]{1,3}\.){3}[0-9]{1,3}$"
+            if [[ $fip =~ $ip_regex ]]; then
+                break
+            else
+                warning "输入的IP地址格式不合法"
+            fi
         done
-        jq --arg fport "$fport" --arg fip "$fip" '
-            .inbounds += [
-                {   
-                    "type": "direct",
-                    "tag": "direct-in",
-                    "listen": $fip,
-                    "listen_port": ($fport | tonumber),
-                    "override_port": 443
-                }
-            ] | .route.rules += [
-                {
-                    "inbound": "direct-in",
-                    "outbound": "direct"
-                }
-            ]' "$config_file" > "${config_file}.temp" && mv "${config_file}.temp" "$config_file"
-        echo "已添加任意门解锁机配置"
-        reload_singbox
+        # The "no existing direct-in" decision is revalidated inside the lock so
+        # concurrent adds can never produce duplicate direct-in tags.
+        if with_client_lock _process_dokoko_add_locked "$fport" "$fip"; then
+            echo "已添加任意门解锁机配置"
+        else
+            warning "添加解锁机配置失败，配置未修改"
+        fi
     fi
+}
+
+_process_dokoko_add_locked() { # <fport> <fip>
+    local fport="$1" fip="$2"
+    local cfg="$SB_SERVER_CONFIG" candidate="" problems="" p=""
+    if ! valid_port "$fport"; then
+        warning "监听端口非法: '$fport'"
+        return 1
+    fi
+    if [[ ! "$fip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        warning "被解锁机 IP 非法: '$fip'"
+        return 1
+    fi
+    [ -f "$cfg" ] || { warning "服务端配置不存在: $cfg"; return 1; }
+    if ! jq empty "$cfg" >/dev/null 2>&1; then
+        warning "服务端配置不是合法 JSON: $cfg"
+        return 1
+    fi
+    if ! problems="$(legacy_json_structure_problems "$cfg" yes)"; then
+        warning "服务端配置结构审计执行失败，已中止"
+        return 1
+    fi
+    if [ -n "$problems" ]; then
+        warning "服务端配置结构不满足添加前提:"
+        while IFS= read -r p; do
+            [ -n "$p" ] && warning "  - $p"
+        done <<< "$problems"
+        return 1
+    fi
+    # Revalidate the "no existing direct-in" decision under the lock: a concurrent
+    # add that won the race must make this one fail instead of duplicating the tag.
+    if inbound_tag_exists "direct-in" "$cfg"; then
+        warning "direct-in 已存在（锁内复核，可能已被并发操作创建），拒绝重复添加"
+        return 1
+    fi
+    candidate="$(new_candidate_path)" || { warning "创建 candidate 失败"; return 1; }
+    if ! jq --arg fport "$fport" --arg fip "$fip" '
+        .inbounds += [
+            {
+                "type": "direct",
+                "tag": "direct-in",
+                "listen": $fip,
+                "listen_port": ($fport | tonumber),
+                "override_port": 443
+            }
+        ] | .route.rules += [
+            {
+                "inbound": "direct-in",
+                "outbound": "direct"
+            }
+        ]' "$cfg" > "$candidate"; then
+        warning "生成 direct-in candidate 失败"
+        rm -f "$candidate"
+        return 1
+    fi
+    if ! commit_server_config "$candidate" "add direct-in"; then
+        warning "解锁机配置写入失败（commit 未成功），配置未修改"
+        return 1
+    fi
+    return 0
+}
+
+_process_dokoko_delete_locked() { # <tag>
+    local tag="$1"
+    local cfg="$SB_SERVER_CONFIG" candidate="" problems="" p=""
+    [ -n "$tag" ] || { warning "标签不能为空"; return 1; }
+    [ -f "$cfg" ] || { warning "服务端配置不存在: $cfg"; return 1; }
+    if ! jq empty "$cfg" >/dev/null 2>&1; then
+        warning "服务端配置不是合法 JSON: $cfg"
+        return 1
+    fi
+    if ! problems="$(legacy_json_structure_problems "$cfg" yes)"; then
+        warning "服务端配置结构审计执行失败，已中止"
+        return 1
+    fi
+    if [ -n "$problems" ]; then
+        warning "服务端配置结构不满足删除前提:"
+        while IFS= read -r p; do
+            [ -n "$p" ] && warning "  - $p"
+        done <<< "$problems"
+        return 1
+    fi
+    if ! inbound_tag_exists "$tag" "$cfg"; then
+        warning "direct-in 不存在（锁内复核），拒绝删除"
+        return 1
+    fi
+    candidate="$(new_candidate_path)" || { warning "创建 candidate 失败"; return 1; }
+    if ! jq --arg tag "$tag" '
+        del(.inbounds[] | select(.tag == $tag)) |
+        del(.outbounds[] | select(.tag == ($tag + "-out"))) |
+        .route.rules = (.route.rules | map(select(.inbound != $tag)))
+    ' "$cfg" > "$candidate"; then
+        warning "生成 delete candidate 失败"
+        rm -f "$candidate"
+        return 1
+    fi
+    if ! commit_server_config "$candidate" "delete direct-in"; then
+        warning "解锁机配置删除失败（commit 未成功），配置未修改"
+        return 1
+    fi
+    return 0
 }
 
 process_ssko() {
     warning "开始SS落地机设置"
-    config_file="/root/sbox/sbconfig_server.json"
-    tag="ss-in"
-    existing_port=$(jq -r --arg tag "$tag" '.inbounds[] | select(.tag == $tag) | .listen_port' "$config_file")
-    existing_pwd=$(jq -r --arg tag "$tag" '.inbounds[] | select(.tag == $tag) | .password' "$config_file")
-    server_ip=$(grep -o "SERVER_IP='[^']*'" /root/sbox/config | awk -F"'" '{print $2}')
+    local cfg="$SB_SERVER_CONFIG" tag="ss-in"
+    local existing_port existing_pwd server_ip delete_option fport
+    existing_port=$(jq -r --arg tag "$tag" '.inbounds[] | select(.tag == $tag) | .listen_port' "$cfg")
+    existing_pwd=$(jq -r --arg tag "$tag" '.inbounds[] | select(.tag == $tag) | .password' "$cfg")
+    server_ip=$(grep -o "SERVER_IP='[^']*'" "$SB_STATE_FILE" | awk -F"'" '{print $2}')
 
     if [ -n "$existing_port" ] && [ "$existing_port" != "null" ]; then
         info "已存在ss入站配置,监听端口号为: $existing_port"
@@ -2250,9 +3062,11 @@ process_ssko() {
         echo ""
         read -p "是否删除已存在的配置？ (y/n): " delete_option
         if [ "$delete_option" = "y" ]; then
-            jq --arg tag "$tag" '.inbounds = (.inbounds | map(select(.tag != $tag)))' "$config_file" > "${config_file}.temp" && mv "${config_file}.temp" "$config_file"
-            echo "已删除配置"
-            reload_singbox
+            if with_client_lock _process_ssko_delete_locked "$tag"; then
+                echo "已删除配置"
+            else
+                warning "删除配置失败，配置未修改"
+            fi
         else
             echo "未删除配置"
         fi
@@ -2265,24 +3079,112 @@ process_ssko() {
                 warning "端口必须为非空数字，请重新输入."
             fi
         done
-        sspwd=$(/root/sbox/sing-box generate rand 16 --base64)
-        info "监听端口号为: $fport"
-        info "ss密码为：$sspwd"
-        info "本机ip为: $server_ip"
-        jq --arg sspwd "$sspwd" --arg fport "$fport" '
-            .inbounds += [
-                {   
-                    "type": "shadowsocks",
-                    "tag": "ss-in",
-                    "listen": "::",
-                    "listen_port": ($fport | tonumber),
-                    "method": "2022-blake3-aes-128-gcm",
-                    "password": $sspwd
-                }
-            ]' "$config_file" > "${config_file}.temp" && mv "${config_file}.temp" "$config_file"
-        echo "已添加ss解锁机配置"
-        reload_singbox
+        # Password generation is part of candidate planning: it happens INSIDE the
+        # lock and never blocks on user input.
+        if with_client_lock _process_ssko_add_locked "$fport"; then
+            echo "已添加ss解锁机配置"
+        else
+            warning "添加ss解锁机配置失败，配置未修改"
+        fi
     fi
+}
+
+_process_ssko_add_locked() { # <fport>
+    local fport="$1"
+    local cfg="$SB_SERVER_CONFIG" candidate="" problems="" sspwd="" server_ip="" p=""
+    if ! valid_port "$fport"; then
+        warning "监听端口非法: '$fport'"
+        return 1
+    fi
+    [ -f "$cfg" ] || { warning "服务端配置不存在: $cfg"; return 1; }
+    if ! jq empty "$cfg" >/dev/null 2>&1; then
+        warning "服务端配置不是合法 JSON: $cfg"
+        return 1
+    fi
+    if ! problems="$(legacy_json_structure_problems "$cfg" no)"; then
+        warning "服务端配置结构审计执行失败，已中止"
+        return 1
+    fi
+    if [ -n "$problems" ]; then
+        warning "服务端配置结构不满足添加前提:"
+        while IFS= read -r p; do
+            [ -n "$p" ] && warning "  - $p"
+        done <<< "$problems"
+        return 1
+    fi
+    # Revalidate ss-in non-existence while locked (no duplicate ss-in).
+    if inbound_tag_exists "ss-in" "$cfg"; then
+        warning "ss-in 已存在（锁内复核，可能已被并发操作创建），拒绝重复添加"
+        return 1
+    fi
+    if ! sspwd="$("$SB_SING_BOX_BIN" generate rand 16 --base64)" || [ -z "$sspwd" ]; then
+        warning "生成 SS 密码失败"
+        return 1
+    fi
+    candidate="$(new_candidate_path)" || { warning "创建 candidate 失败"; return 1; }
+    if ! jq --arg sspwd "$sspwd" --arg fport "$fport" '
+        .inbounds += [
+            {
+                "type": "shadowsocks",
+                "tag": "ss-in",
+                "listen": "::",
+                "listen_port": ($fport | tonumber),
+                "method": "2022-blake3-aes-128-gcm",
+                "password": $sspwd
+            }
+        ]' "$cfg" > "$candidate"; then
+        warning "生成 ss-in candidate 失败"
+        rm -f "$candidate"
+        return 1
+    fi
+    if ! commit_server_config "$candidate" "add ss-in"; then
+        warning "SS 落地机配置写入失败（commit 未成功），配置未修改"
+        return 1
+    fi
+    server_ip="$(grep -o "SERVER_IP='[^']*'" "$SB_STATE_FILE" | awk -F"'" '{print $2}')"
+    info "监听端口号为: $fport"
+    info "ss密码为：$sspwd"
+    info "本机ip为: $server_ip"
+    return 0
+}
+
+_process_ssko_delete_locked() { # <tag>
+    local tag="$1"
+    local cfg="$SB_SERVER_CONFIG" candidate="" problems="" p=""
+    [ -n "$tag" ] || { warning "标签不能为空"; return 1; }
+    [ -f "$cfg" ] || { warning "服务端配置不存在: $cfg"; return 1; }
+    if ! jq empty "$cfg" >/dev/null 2>&1; then
+        warning "服务端配置不是合法 JSON: $cfg"
+        return 1
+    fi
+    if ! problems="$(legacy_json_structure_problems "$cfg" no)"; then
+        warning "服务端配置结构审计执行失败，已中止"
+        return 1
+    fi
+    if [ -n "$problems" ]; then
+        warning "服务端配置结构不满足删除前提:"
+        while IFS= read -r p; do
+            [ -n "$p" ] && warning "  - $p"
+        done <<< "$problems"
+        return 1
+    fi
+    if ! inbound_tag_exists "$tag" "$cfg"; then
+        warning "ss-in 不存在（锁内复核），拒绝删除"
+        return 1
+    fi
+    candidate="$(new_candidate_path)" || { warning "创建 candidate 失败"; return 1; }
+    if ! jq --arg tag "$tag" '
+        .inbounds = (.inbounds | map(select(.tag != $tag)))
+    ' "$cfg" > "$candidate"; then
+        warning "生成 delete candidate 失败"
+        rm -f "$candidate"
+        return 1
+    fi
+    if ! commit_server_config "$candidate" "delete ss-in"; then
+        warning "SS 落地机配置删除失败（commit 未成功），配置未修改"
+        return 1
+    fi
+    return 0
 }
 
 process_singbox() {
@@ -2390,19 +3292,37 @@ process_hy2hopping(){
 }
 # 开启hysteria2端口跳跃
 HY_HOPPING_COMMENT="sing-box-hy2-hopping"
-HY_HOPPING_HELPER="/root/sbox/hy2-hopping.sh"
-HY_HOPPING_SERVICE="/etc/systemd/system/sing-box-hy2-hopping.service"
+HY_HOPPING_HELPER="${SB_HOPPING_HELPER:-/root/sbox/hy2-hopping.sh}"
+HY_HOPPING_SERVICE="${SB_HOPPING_SERVICE:-/etc/systemd/system/sing-box-hy2-hopping.service}"
 
-set_config_value() {
+# NOTE: the caller MUST already hold the global config/state lock
+# (with_client_lock). This rewrites the durable /root/sbox/config atomically
+# (live -> unique candidate -> mv) instead of `sed -i` on the live file, so a
+# concurrent modify_singbox can never observe or produce a torn state file.
+set_config_value() { # set_config_value <key> <value>
     local key="$1"
     local value="$2"
-    local config_file="/root/sbox/config"
-
-    if grep -q "^${key}=" "$config_file" 2>/dev/null; then
-        sed -i "s/^${key}=.*/${key}=${value}/" "$config_file"
-    else
-        printf '%s=%s\n' "$key" "$value" >> "$config_file"
+    local config_file="$SB_STATE_FILE"
+    local candidate=""
+    case "$key" in
+        ''|*[!A-Za-z0-9_]*) warning "非法状态键: '$key'"; return 1 ;;
+    esac
+    case "$value" in
+        *$'\n'*|*$'\r'*) warning "状态值不得包含换行: '$key'"; return 1 ;;
+    esac
+    [ -f "$config_file" ] || { warning "状态文件不存在: $config_file"; return 1; }
+    candidate="$(new_state_candidate_path)" || { warning "创建状态 candidate 失败"; return 1; }
+    if ! set_state_key "$config_file" "$candidate" "$key" "${key}=${value}"; then
+        warning "生成状态 candidate 失败"
+        rm -f "$candidate"
+        return 1
     fi
+    if ! mv -f "$candidate" "$config_file"; then
+        warning "状态文件原子替换失败"
+        rm -f "$candidate"
+        return 1
+    fi
+    return 0
 }
 
 remove_hy2_hopping_rules() {
@@ -2500,7 +3420,10 @@ EOF
     systemctl daemon-reload
 }
 
+# Interactive port-range input happens here (OUTSIDE the lock); the durable state
+# mutation runs in _enable_hy2hopping_locked under the global lock.
 enable_hy2hopping(){
+    local start_port end_port
     hint "开启端口跳跃..."
     warning "注意: 端口跳跃范围不要覆盖已经占用的端口，否则会错误！"
     while :; do
@@ -2514,38 +3437,60 @@ enable_hy2hopping(){
         fi
         warning "端口范围无效，必须满足 1 <= 起始端口 <= 结束端口 <= 65535。"
     done
+    with_client_lock _enable_hy2hopping_locked "$start_port" "$end_port"
+}
 
-    set_config_value HY_HOPPING_START "$start_port"
-    set_config_value HY_HOPPING_END "$end_port"
-    set_config_value HY_HOPPING TRUE
+# L4: the durable /root/sbox/config mutation is serialized under the SAME global
+# lock as modify_singbox, so the two can never lose each other's update.
+# NONBLOCKING weakness (documented, NOT fixed here): the state write, the systemd
+# helper unit and the firewall rules are three separate effects -- the config lock
+# serializes only the state mutation and does not make the trio atomic. A crash
+# between the state write and `systemctl enable` is handled by the existing
+# rollback below (state reset to FALSE). This can never corrupt E3-managed JSON.
+_enable_hy2hopping_locked() { # <start_port> <end_port>
+    local start_port="$1" end_port="$2"
+    set_config_value HY_HOPPING_START "$start_port" || { warning "写入 HY_HOPPING_START 失败"; return 1; }
+    set_config_value HY_HOPPING_END "$end_port" || { warning "写入 HY_HOPPING_END 失败"; return 1; }
+    set_config_value HY_HOPPING TRUE || { warning "写入 HY_HOPPING 失败"; return 1; }
     install_hy2_hopping_helper
 
     if systemctl enable --now sing-box-hy2-hopping.service; then
         info "端口跳跃已开启并设置为重启后自动恢复: ${start_port}-${end_port}"
         warning "请同时确认云防火墙和本机防火墙已放行该 UDP 端口范围。"
-    else
-        systemctl disable --now sing-box-hy2-hopping.service >/dev/null 2>&1 || true
-        set_config_value HY_HOPPING FALSE
-        remove_hy2_hopping_rules
-        rm -f "$HY_HOPPING_SERVICE" "$HY_HOPPING_HELPER"
-        systemctl daemon-reload
-        error "端口跳跃规则应用失败，已回退为关闭状态"
+        return 0
     fi
+    systemctl disable --now sing-box-hy2-hopping.service >/dev/null 2>&1 || true
+    set_config_value HY_HOPPING FALSE
+    remove_hy2_hopping_rules
+    rm -f "$HY_HOPPING_SERVICE" "$HY_HOPPING_HELPER"
+    systemctl daemon-reload
+    error "端口跳跃规则应用失败，已回退为关闭状态"
+    return 1
 }
 
+# L4: serialize the durable state mutation; the menu/interactive work stays
+# outside the lock. The systemd/firewall teardown is intentionally NOT claimed to
+# be atomic with the state write (see the L4 note on _enable_hy2hopping_locked).
 disable_hy2hopping(){
-  echo "正在关闭端口跳跃..."
-  if [ -f "$HY_HOPPING_SERVICE" ]; then
-      systemctl disable --now sing-box-hy2-hopping.service >/dev/null 2>&1 || true
-  fi
-  remove_hy2_hopping_rules
-  set_config_value HY_HOPPING FALSE
-  set_config_value HY_HOPPING_START ""
-  set_config_value HY_HOPPING_END ""
-  rm -f "$HY_HOPPING_SERVICE" "$HY_HOPPING_HELPER"
-  systemctl daemon-reload
-  echo "关闭完成"
+    with_client_lock _disable_hy2hopping_locked
 }
+
+_disable_hy2hopping_locked() {
+    echo "正在关闭端口跳跃..."
+    if [ -f "$HY_HOPPING_SERVICE" ]; then
+        systemctl disable --now sing-box-hy2-hopping.service >/dev/null 2>&1 || true
+    fi
+    remove_hy2_hopping_rules
+    set_config_value HY_HOPPING FALSE || { warning "写入 HY_HOPPING 失败"; return 1; }
+    set_config_value HY_HOPPING_START "" || { warning "写入 HY_HOPPING_START 失败"; return 1; }
+    set_config_value HY_HOPPING_END "" || { warning "写入 HY_HOPPING_END 失败"; return 1; }
+    rm -f "$HY_HOPPING_SERVICE" "$HY_HOPPING_HELPER"
+    systemctl daemon-reload
+    echo "关闭完成"
+    return 0
+}
+
+# <<< legacy-config-transaction-hardening <<< ==================================
 
 #--------------------------------
 INSTALLATION_MARKERS=(
@@ -2623,6 +3568,12 @@ if has_any_installation_marker; then
     fi
 
     install_pkgs
+    # S0: fail-closed bootstrap repair on every existing install, BEFORE the
+    # interactive menu runs. A failing chmod or an unrepairable derived secret
+    # file aborts here (see repair_existing_install_security_baseline) -- the
+    # menu is never entered, so no management mutation can continue on an
+    # unsafe or desynced-credential state.
+    repair_existing_install_security_baseline
     echo ""
     info "sing-box-reality-hysteria2 已安装"
     show_status
@@ -2651,6 +3602,11 @@ if has_any_installation_marker; then
 
     case $choice in
       1)
+          # L5: refuse BEFORE any destructive mutation when web/E3 management is
+          # active (the guard runs before the backup and before uninstall).
+          if ! require_management_inactive "重新安装"; then
+              exit 1
+          fi
           warning "重新安装会生成新的 Reality 密钥、UUID、端口和 Hysteria2 密码。"
           read -r -p "如已确认，请输入 REINSTALL 继续: " reinstall_confirm
           if [ "$reinstall_confirm" != "REINSTALL" ]; then
@@ -2658,7 +3614,9 @@ if has_any_installation_marker; then
               exit 0
           fi
           backup_current_installation || error "重新安装前备份失败，已停止"
-          uninstall_singbox
+          if ! uninstall_singbox; then
+              exit 1
+          fi
         ;;
       2)
           modify_singbox
@@ -2698,7 +3656,9 @@ if has_any_installation_marker; then
           exit 0
           ;;
       0)
-          uninstall_singbox
+          if ! uninstall_singbox; then
+              exit 1
+          fi
 	        exit 0
           ;;
       *)
@@ -2757,6 +3717,12 @@ mkdir -p /root/sbox/self-cert/ && openssl ecparam -genkey -name prime256v1 -out 
 info "自签证书生成完成,保存于/root/sbox/self-cert/"
 echo ""
 echo ""
+
+# S0: service.api transport authentication secret. Generated once at install
+# time from a CSPRNG (256 bit); sbconfig_server.json stays its single source
+# of truth and /root/sbox/monitor-api.secret is the derived copy for the local
+# collector. Never reused from client credentials or admin passwords.
+monitor_api_secret="$(generate_api_secret)" || error "无法生成 monitor-api secret（需要可用的 CSPRNG）"
 #get ip
 server_ip=$(curl -s4m8 ip.sb -k) || server_ip=$(curl -s6m8 ip.sb -k)
 
@@ -2856,7 +3822,8 @@ cat > /root/sbox/sbconfig_server.json << EOF
       "type": "api",
       "tag": "monitor-api",
       "listen": "127.0.0.1",
-      "listen_port": 9091
+      "listen_port": 9091,
+      "secret": "$monitor_api_secret"
     }
   ],
     "outbounds": [
@@ -2871,6 +3838,12 @@ cat > /root/sbox/sbconfig_server.json << EOF
     ]
 }
 EOF
+
+# S0: derived collector secret file, then explicit permission hardening for
+# every credential-bearing file this installer just created. Missing optional
+# files are skipped; any chmod failure aborts the install (fail-closed).
+write_api_secret_file "$monitor_api_secret" || error "无法写入 monitor-api.secret（root:root 0600）"
+harden_sensitive_permissions || error "敏感文件权限加固失败，安装已停止"
 
 configure_udp_buffers
 

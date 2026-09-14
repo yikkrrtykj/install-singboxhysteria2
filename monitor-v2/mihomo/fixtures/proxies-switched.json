@@ -1,0 +1,31 @@
+{
+  "proxies": {
+    "PROXY": {
+      "type": "Selector",
+      "now": "香港-01",
+      "all": ["vmix-01-HY2", "vmix-01-Reality", "香港-01", "DIRECT"],
+      "history": [],
+      "alive": true,
+      "udp": true
+    },
+    "vmix-01-HY2": {
+      "type": "Hysteria2",
+      "history": [
+        {"time": "2026-09-12T09:58:00.123+08:00", "delay": 91},
+        {"time": "2026-09-12T10:00:00.456+08:00", "delay": 82}
+      ],
+      "alive": true,
+      "udp": true
+    },
+    "香港-01": {
+      "type": "Shadowsocks",
+      "history": [],
+      "alive": true,
+      "udp": true
+    },
+    "DIRECT": {
+      "type": "Direct",
+      "history": []
+    }
+  }
+}

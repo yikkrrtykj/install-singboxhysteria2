@@ -1,8 +1,10 @@
-# Monitor v2 -- Phase E1 collector（API-first, event-driven）
+# Monitor v2 -- E1 collector（API-first, event-driven）+ E2 read-only Web Dashboard
 
-E1 只交付数据层：通过 sing-box 1.14 `service.api` 的**官方 gRPC 事件流**读取逻辑连接，
-按 **Device = API USER** 聚合，输出调试 JSON。**没有** Web UI、数据库、conntrack/ss、
-Prometheus，也没有任何对外监听。
+E1 交付数据层：通过 sing-box 1.14 `service.api` 的**官方 gRPC 事件流**读取逻辑连接，
+按 **Device = API USER** 聚合，输出调试 JSON。E2 在其上交付**只读** Web Dashboard
+（静态前端 + Python 标准库 HTTP/SSE 后端，详见下文 Phase E2 一节）。
+数据层始终：**没有**数据库、conntrack/ss、Prometheus；collector 本身无对外监听，
+监听来自 E2 的 web 进程且默认仅 loopback。
 
 ## 数据源：真实的 service.api（不是 Clash REST）
 
@@ -215,10 +217,178 @@ bash tests/monitor-v2-integration-e1.sh
 测试 fixture 位于 `monitor-v2/fixtures/events-*.json`，字段与官方 proto 对应
 （NEW/UPDATE/CLOSED、reset、uplinkDelta/downlinkDelta、uplinkTotal/downlinkTotal）。
 
+## Phase E2 -- 只读 Web Dashboard（本次新增）
+
+E2 在 E1 数据层之上交付一个**只读** dashboard：静态前端（vanilla JS/CSS/SVG，
+零依赖、零 CDN、断公网可用）+ Python 标准库 HTTP/SSE 后端。**不**创建/删除
+客户端、不修改 UUID/password、不触碰 `sbconfig_server.json`、不 reload/restart
+sing-box、不引入数据库/conntrack/Prometheus（这些是 E3+ 的事）。
+
+```text
+sing-box service.api (127.0.0.1:9091)
+        │  SubscribeConnections（gRPC-Web，E1 官方事件流）
+        ▼
+E1 Collector ── 单进程单实例，长期存活（lifecycle/banked/replay-guard 状态
+        │        全在内存；绝不按请求重启）
+        ▼
+Snapshot Broker（monitor-v2/web/broker.py）
+  - collector 线程：consume() 分片循环，永不 raise，stale 语义原样继承
+  - publisher 线程：~1s 构建一次装饰后的 snapshot，序列化一次，版本号递增
+        │
+        ├── GET /api/v1/snapshot   （一次性全量 JSON）
+        └── GET /api/v1/stream     （SSE，~1s 推送；浏览器断开不影响 collector）
+                ▼
+        Web Dashboard（浏览器永远不直接访问 9091）
+```
+
+snapshot = E1 原始字段原样透传（`devices` / `connections` / 计数器 /
+`stale` / `last_error` / `last_success_at` / `generated_at`），仅**追加**
+web 层字段：`web_status`、`api_status`、`monitor_started_at`、
+`snapshot_generated_at`、`collector_uptime_seconds`。E1 的
+`Tracker.snapshot()` 新增顶层 `connections` 逐连接行（ACTIVE + 有上限的
+RECENT，纯投影、无二次记账），供 Connections 表使用；188 项 E1 断言不受影响。
+
+### 请求门顺序（每个普通请求）
+
+```text
+socket 对端地址 → IP 白名单 → admin session → 路由
+```
+
+- 白名单默认 **空**；仅 `127.0.0.1` / `::1` 隐式放行（本机管理 /
+  SSH 隧道 / localhost canary）。支持 IPv4/IPv6 主机与 CIDR
+  （`1.2.3.4/32`、`10.10.10.0/24`、`2001:db8::1/128`），`ipaddress` 解析，
+  非法条目直接拒绝。唯一例外：`/recovery`（GET 页面 + POST API）。
+- **只信 socket 对端地址**：`X-Forwarded-For` / `X-Real-IP` 永远不读；
+  反代场景需要另行显式设计 trusted proxy，本版不支持。
+- admin 认证：scrypt（N=16384/r=8/p=1 + 随机盐，`hmac.compare_digest` 比较），
+  `auth.json` 只存 hash；session token 为 `secrets.token_urlsafe(32)`，
+  仅存内存（重启即失效，不落盘）；每个 session 另带独立的 CSRF token
+  （`/api/v1/session` 登录后返回，登录后所有 mutation 必须携带
+  `X-CSRF-Token`，`hmac.compare_digest` 比较；若浏览器声明 Origin 还须同源）。
+  cookie `HttpOnly; SameSite=Strict`，默认 8h；`Secure` 按模式强制：
+  remote 监听与任何 TLS 监听**必须**带 Secure，loopback HTTP 监听刻意不带
+  （各浏览器对 http://localhost 上的 Secure cookie 行为不一，loopback
+  不经过网络，兼容性优先且边界明确）。登录失败按源 IP 限速
+  （15 分钟内 5 次失败 → 锁 15 分钟）。
+- Recovery：≥128-bit 随机 key（token_urlsafe(24) ≈ 192-bit），明文只显示一次，
+  服务器只存 hash。它**只能**把调用方的真实对端地址以 `/32`（或 `/128`）
+  加回白名单：不能看 dashboard/白名单、不能指定任意 IP、不能删条目、
+  不能改密码、**不建立 admin session**。失败限速更严（3 次失败 → 锁 30 分钟）；
+  另有**全进程**预算：每分钟最多 20 次验证尝试、最多 2 个并发 scrypt 验证，
+  被拒请求在 scrypt 之前就被 429（带 Retry-After），限速器全部线程安全。
+  成功响应只有 "IP added. Please login normally."。
+- 日志只记请求行（方法/路径/状态/对端 IP），密码、session token、
+  recovery key、sing-box credentials 永不出现在日志。
+
+### 端口与远端模式
+
+默认 `127.0.0.1:9191`。只有用户明确 `--listen 0.0.0.0`（或其他非 loopback
+地址）才启用 remote management，且必须**同时**满足：TLS 证书/私钥、admin
+password、recovery key、非空白名单——任何一项缺失都 **拒绝启动**（exit 2），
+绝不降级为 warning。
+
+**TLS 范围（明确）**：E2 只接受用户自行提供的 `--tls-cert / --tls-key`。
+E2 **不**自动申请证书、**不**自动生成自签名证书、不做 Let's Encrypt——
+自动证书生成/发放属于后续 Packaging 阶段的职责。响应统一带
+`Content-Security-Policy: default-src 'self'`、`X-Content-Type-Options:
+nosniff`、`Referrer-Policy: no-referrer`、`X-Frame-Options: DENY`；
+HTTP 表面固定为 GET/POST（其余方法一律 405 + `Allow: GET, POST`），
+请求体上限 64 KiB（malformed Content-Length → 400，超限 → 413，
+chunked → 400 并断连）。
+
+### 数据存放（与 sing-box 配置严格分离）
+
+```text
+/var/lib/singbox-monitor/     （POSIX：目录 0700，文件 0600；可用
+├── access.json                  SINGBOX_MONITOR_DATA_DIR 覆盖）
+│     （白名单；与 Phase C credentials 无任何关系）
+└── auth.json （scrypt hash；不含明文密码/recovery key/session token）
+```
+
+改白名单/密码/recovery 不 restart、不 reload sing-box，不影响 Reality/HY2
+与已生成的 YAML。Stale 语义由 web 原样继承：stale=true 时保留最后快照、
+页面横幅显示 "⚠ Data stale + Last successful API event 时间"，不清零、
+不伪装 CLOSED、不显示 ONLINE/OFFLINE/Tunnel Down（设备状态只有
+`ACTIVE` / `RECENT ACTIVITY` / `IDLE`）。
+
+### 用法
+
+```bash
+# 首次配置（检测 $SSH_CONNECTION 提示加白；配置 admin 密码与一次性 recovery key）
+sudo python3 monitor-v2/webapp.py setup
+
+# 本地/隧道模式（默认 loopback:9191；无需 TLS）
+sudo python3 monitor-v2/webapp.py serve --url http://127.0.0.1:9091
+
+# 远端模式（四项缺一即拒启）
+sudo python3 monitor-v2/webapp.py serve --listen 0.0.0.0 \
+    --tls-cert /var/lib/singbox-monitor/tls/monitor.crt \
+    --tls-key  /var/lib/singbox-monitor/tls/monitor.key
+```
+
+### E2 测试
+
+```bash
+# E2 回归（182 断言：白名单模型、HTTP 门序、认证/session/限速、SSE 生命周期、
+# stale 继承、recovery 语义、只读端点面、setup/serve CLI、远端 TLS 启停；
+# 单一 EXPECTED_PASS 出口，与 E1 同风格）
+bash tests/test-monitor-v2-e2.sh
+
+# E1 回归必须继续 188/188
+bash tests/test-monitor-v2-e1.sh
+```
+
 ## 已知未实现（后续阶段）
 
 - 用户视角 upload/download 方向映射（需按 API 视角说明，E1 不虚构）；
-- 数据库 / 历史曲线；
-- Web dashboard（Phase E2）；
+- 数据库 / 历史曲线（totals 为 "Since monitor start"，非 all-time）；
+- Client Manager（Phase E3，明确不在本阶段）；
 - Reality-only RTT/retrans 增强（ss，可选）；
-- expected source IP 机械比对（外部测试阶段）。
+- expected source IP 机械比对（外部测试阶段）；
+- 可信反代（trusted proxy）场景下的白名单来源设计。
+
+## Phase E4 -- Mihomo client API enrichment（OPTIONAL，read-only）
+
+E4 在**客户端本地** Mihomo external-controller 上做可选 enrichment，
+是显示层的补充，绝不是身份数据源：
+
+```text
+Server truth（不可替代）:  Device = service.api USER / Protocol = INBOUND / Lifecycle = connection ID
+Mihomo API（仅补充展示）:  version / mode / selected proxy / delay /
+                           local connections / local traffic rate
+```
+
+铁律（由代码结构强制，详见 `monitor-v2/mihomo/README.md`）：
+
+* enrichment 输出对象走固定 key 白名单，结构上不可能携带任何身份字段；
+  节点显示名（`vmix-01-HY2`、`香港-01`……）原样透传为 `selected_proxy`，
+  仅用于展示，绝不参与身份判定/映射/重命名；
+* controller URL 只允许 loopback（fail-closed）；Mihomo API 是客户端本地
+  服务，绝不公网暴露，服务器侧读取应走显式 agent/隧道设计；
+* secret 只经 `Authorization: Bearer` 头传递：不进日志、不进输出对象、
+  不进 URL query、错误文本统一 redact（含传输异常/HTTP 错误体内出现的
+  secret）；每个 API 请求超时钳制在 1-3 秒（整个 poll 顺序请求可能占用
+  多个请求预算；whole-poll deadline 留待真正集成 agent 时单独设计）；
+  `--secret-file` 全平台要求 regular file；POSIX 强制 owner-readable 且
+  无 group/other 权限位（0600/0400 可用，0000/0200/0644+ 拒绝，校验先于
+  读取内容，O_NOFOLLOW 拒绝 symlink）；Windows 不做 POSIX 位拒绝，依赖
+  文件系统 ACL（v1 文档化限制）；
+* transport 只有 `get(path)` 一个入口——不存在 method 参数，PUT/POST/
+  PATCH/DELETE 在结构上无法发出；URL 拒绝 userinfo/非根 path/query/
+  fragment，且错误信息绝不回显完整 URL；
+* `reachable=false`（unreachable / disabled / wrong secret / offline）只是
+  一个观测结果，服务端 Monitor 完全不受影响，设备状态绝不因此改变；
+* freshness 双域独立：enrichment 有自己的 `checked_at`（本次轮询完成时间）
+  / `updated_at`（最近一次成功取得有效数据的时间，失败轮询为 null 且
+  stale=true，绝不出现 unreachable-but-fresh）/ `error`，与
+  E1 流的 stale 完全分离；
+* `/connections` 语义：`null`/`[]` -> 0（确认空闲），key 缺失或类型错误
+  -> None（schema 漂移/未知，绝不伪装成 idle）；
+* `/traffic` 是真实无限流：newline 分帧 + 绝对 deadline 的首行读取器，
+  读到第一条完整 JSON 立即返回，不等连接关闭、不读第二条；
+* 只读：不选节点、不切模式、不 reload、不重启、不关连接、不触发
+  delay 主动探测（只读缓存 history）。
+
+文件：`monitor-v2/mihomo/{client.py,model.py,fixtures/}`；
+测试：`tests/test-monitor-v2-e4.sh`（E1 回归必须保持 188/188）。
+

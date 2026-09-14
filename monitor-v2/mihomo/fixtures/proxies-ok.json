@@ -1,0 +1,70 @@
+{
+  "proxies": {
+    "PROXY": {
+      "type": "Selector",
+      "now": "vmix-01-HY2",
+      "all": ["vmix-01-HY2", "vmix-01-Reality", "香港-01", "DIRECT"],
+      "history": [],
+      "alive": true,
+      "udp": true,
+      "xudp": false,
+      "tfo": false
+    },
+    "BACKUP": {
+      "type": "URLTest",
+      "now": "vmix-01-Reality",
+      "all": ["vmix-01-Reality", "vmix-01-HY2"],
+      "history": [],
+      "alive": true,
+      "udp": true
+    },
+    "vmix-01-HY2": {
+      "type": "Hysteria2",
+      "server": "203.0.113.10",
+      "port": 8443,
+      "history": [
+        {"time": "2026-09-12T09:58:00.123+08:00", "delay": 91},
+        {"time": "2026-09-12T10:00:00.456+08:00", "delay": 82}
+      ],
+      "alive": true,
+      "udp": true,
+      "xudp": false,
+      "tfo": false
+    },
+    "vmix-01-Reality": {
+      "type": "Vless",
+      "server": "203.0.113.10",
+      "port": 443,
+      "history": [
+        {"time": "2026-09-12T10:00:01.000+08:00", "delay": 0}
+      ],
+      "alive": false,
+      "udp": true,
+      "xudp": false,
+      "tfo": false
+    },
+    "香港-01": {
+      "type": "Shadowsocks",
+      "server": "198.51.100.7",
+      "port": 8388,
+      "history": [],
+      "alive": true,
+      "udp": true
+    },
+    "GLOBAL": {
+      "type": "Selector",
+      "now": "DIRECT",
+      "all": ["PROXY", "vmix-01-HY2", "vmix-01-Reality", "香港-01", "DIRECT"],
+      "history": [],
+      "alive": true
+    },
+    "DIRECT": {
+      "type": "Direct",
+      "history": []
+    },
+    "REJECT": {
+      "type": "Reject",
+      "history": []
+    }
+  }
+}
