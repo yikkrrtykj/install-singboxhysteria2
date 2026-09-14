@@ -1,6 +1,6 @@
 # Monitor v2 — Phase E3 Design rev5: Privileged Mutation Architecture（AF_UNIX RPC 特权变更架构）
 
-状态：**设计稿 rev5（已吸收独立 review 修正 #1–#8；全部代码事实重新锚定于冻结基线 `3ee9a162`；待 final design approval；本轮零实现）**
+状态：**设计稿 rev5（已吸收独立 review 修正 #1–#8 及 PR #18 独立 source review follow-up 修正 F-1..F-3；全部代码事实重新锚定于冻结基线 `3ee9a162`；待 final design approval；本轮零实现）**
 
 基线锚点：
 
@@ -9,8 +9,8 @@
 | 仓库 | `yikkrrtykj/install-singboxhysteria2` |
 | 设计基线 commit（唯一代码事实来源） | `3ee9a162a3fb53d9fddc95cb6eba95b3bcc5702e`（Round 2 head，I0-7 CLOSED） |
 | 行号口径 | 本文所有 `install.sh:N` 均为 **`git grep -n` 于 `3ee9a162…` 该 commit** 的结果；本地旧工作树行号一律作废 |
-| 上游设计 | `docs/monitor-v2-e3-design.md`（rev4，§编号沿用其语义） |
-| Round 2 报告 | `round2-final-report.md`（L5 = provisional activation marker，E3 被阻塞） |
+| 上游设计 | rev4 设计稿（`docs/monitor-v2-e3-design.md`）——**不在基线 `3ee9a162` 树内**，仅历史沿革参考；rev5 实现所依赖的全部规范性 rev4 契约已折入本文附录 A–E（rev5 自包含，rev4 不作为活跃设计合入） |
+| Round 2 集成记录 | `docs/monitor-v2-integration.md`（基线树内权威 Integration 记录；L5 = provisional activation marker，E3 被阻塞） |
 | 模式 | DESIGN / READ-ONLY。不连 VPS、不碰生产、不合并 PR #16/#17、不暴露 9191、不动 TLS/防火墙/凭据 |
 
 ---
@@ -26,8 +26,8 @@ rev5 不推翻 rev4 的事务语义，只**更换特权通道并收敛初始操�
 | R5-3 | rev4 账本/审计放 `/root/sbox/web/`；基线 marker 默认 `/root/sbox/web-management.active`（`install.sh:2413`） | 特权运行时状态整体迁往 **`/var/lib/sbox-cm/`（root 0700）**；`SB_MANAGEMENT_ACTIVE_MARKER` 常量名保留、生产默认路径迁出 `/root/sbox`（§4.1–4.2） | 基线 `uninstall_singbox` 仍 `rm -rf /root/sbox/`：放在里面的标记与锁都会被它自己销毁 |
 | R5-4 | L5 marker 仅是 provisional（基线 `install.sh:2413/2416/2419`，锁外检查） | **正式化**：路径迁移 + 检查移入锁内 + 锁下生命周期 + 锚点不灭契约（§4.3–4.5） | 消除 activation TOCTOU 与锁 inode 替换漏洞 |
 | R5-5 | helper 事务依赖调用方在位 | **断连不可中止事务**（§8-R10） | 守护进程模型下"web 重启于 mutation 途中"是一等失败场景 |
-| R5-6 | 失败矩阵 F1–F22 | F1–F22 语义保留并被 RPC 错误码表吸收；新增 R1–R12 竞态矩阵（§8） | 同一套 `commit_server_config`，错误语义同源 |
-| R5-7 | rev4 §4.7 锁契约 L1–L6 | **原样继承**；L5 扩展：management.* 也持锁；新增 L7"锁路径名永不 unlink"（§3.2） | 单一互斥点 + 永久锚点 |
+| R5-6 | 失败矩阵 F1–F22 | F1–F22 语义保留并被 RPC 错误码表吸收（全文折入**附录 D**）；新增 R1–R12 竞态矩阵（§8） | 同一套 `commit_server_config`，错误语义同源 |
+| R5-7 | 锁契约 L1–L6（原 rev4 §4.7，全文折入**附录 A**） | **原样继承**；L5 扩展：management.* 也持锁；新增 L7"锁路径名永不 unlink"（§3.2） | 单一互斥点 + 永久锚点 |
 | R5-8（review #1） | rev5 首版误判锁 fail-open（引用了本地旧工作树） | **撤销 B-1**。基线 `with_client_lock`（`install.sh:729-745`）在锁目录创建失败（734-735）、锁文件打开失败（738-739）、flock 错误/超时（743-744）三条路径上全部 fail-closed 中止。**Round 2 全局锁前置 = ALREADY PASS** | 事实修正；E3-0 对锁只做 verify + preserve |
 | R5-9（review #2） | 首版仅"uninstall 先取锁" | **锁生命周期问题显式解决**：config.lock = 永久控制面锚点；uninstall 保留 `/root/sbox/` 目录与 config.lock 本体；仅在锁内移除运行时/配置/凭据物；任何事务内永不 unlink 锁路径名（§4.4） | unlink 被锁路径名后，他人可重建同名新 inode 并获得**另一把** flock ⇒ 绕过互斥；仅取锁不够 |
 | R5-10（review #3） | 首版默认 `commit_server_config` 回滚语义照搬 | **M0 硬化共享事务**：基线回滚在 `install.sh:967` 执行未校验的直接 `cp -a "$backup_path" "$SB_SERVER_CONFIG"`；M0 以已评审的 `restore_file_atomically`（`install.sh:2314`：同目录唯一临时文件 + chmod 0600 + 原子 mv + cmp 逐字节校验）替换之；共享库输出结构化事务结果；CLI 兼容包装继续暴露历史 0/1 行为。**不复制提交引擎**（§3.1） | 通用单文件事务的回滚不允许未校验直接覆盖 live 路径名 |
@@ -37,7 +37,15 @@ rev5 不推翻 rev4 的事务语义，只**更换特权通道并收敛初始操�
 | R5-14（review #7） | step-up 仅有过期语义 | step-up 绑定当前 session，并在 logout / 改密 / recovery 重置或轮换 / session 过期 / web 重启时**立即吊销**；activate/deactivate/add/delete 均要求近期 step-up；helper 永不收到密码、恢复密钥、session cookie、CSRF token（§5） | 撤销是 step-up 的安全闭环 |
 | R5-15（review #8） | 首版 verdict 把未实现代码当开始实现的前置 | 三层 readiness 术语（§14）：BEGIN = 批准即可；ENABLE = 实现 + 全部门禁；DEPLOY = 显式 canary 批准 | 门禁只拦它该拦的阶段 |
 
-rev4 中**逐字保留、不在本文复述**的部分：§6.9 幂等账本（intent/outcome + fsync + generation/supersede + 调和矩阵）、§6.9.1 Idempotency-Key schema、§4.7 L1–L6、失败矩阵 F1–F22、危险操作 UX（§7）、日志脱敏（§8.3）。
+**PR #18 独立 source review follow-up 修正（仅文档，零实现）**：
+
+| # | 修正 |
+| --- | --- |
+| F-1 | 服务化基线事实修正：Round 2 起既有的 `singbox-monitor.service` 已以 `User=sboxweb` 运行（基线 `monitor-v2/deploy/` unit 实证）。rev5 **不**设计/供给新的 `sboxweb.service`；E2 = 既有 `singbox-monitor.service` 原地扩展（§1.1/§1.2/§9.2 G4/§10 M0.5/§13 B-4 已相应改写）。 |
+| F-2 | rev5 自包含：基线 `3ee9a162` 树内**不含** rev4 设计稿与 Round 2 报告；全部被实现阶段引用的规范性 rev4 契约折入本文附录 A–E；Round 2 引用改为基线树内的 `docs/monitor-v2-integration.md`。 |
+| F-3 | step-up API 名修正：既有 E2 auth API 为 `auth.verify_password()`（非 `verify_secret`），§5.1 已更正。 |
+
+rev4 中被 rev5 实现阶段引用的全部规范性契约（幂等账本与调和、Idempotency-Key schema、锁契约 L1–L6、失败矩阵 F1–F22、凭据卫生/审计/UX 等全部 MUST/SHALL 规则）已**折入本文附录 A–E**——rev5 自包含，不依赖基线树中不存在的文件；rev4 文档仅作历史沿革参考，**不**作为活跃设计合入。文中 `E3-Txx` 为 rev4 历史测试矩阵的既有编号，其规范效力以附录重述的契约为准，具体测试由 G6 脚手架重建。
 
 ---
 
@@ -53,7 +61,9 @@ rev4 中**逐字保留、不在本文复述**的部分：§6.9 幂等账本（in
                 │ HTTP（127.0.0.1 / 既有 TLS 反代不变；9191 不新增暴露）
 ┌───────────────▼─────────────────────────────────────────────────────┐
 │ 边界 A：E2 web 服务（sboxweb，非特权）                                  │
-│   · 运行用户 sboxweb（systemd unit `sboxweb.service`，M0.5 供给）      │
+│   · 运行用户 sboxweb：既有 singbox-monitor.service 已以 User=sboxweb   │
+│     运行（Round 2 基线事实）；E3 在该既有 unit 上原地扩展，            │
+│     不新建 sboxweb.service（review follow-up F-1）                     │
 │   · 对 /root/sbox 零文件权限；对 /var/lib/sbox-cm 零文件权限            │
 │   · 认证 / CSRF / 限流 / step-up（§5）/ access log 脱敏（E2 提供）      │
 │   · E3 变更 = 仅"把白名单 op 的 JSON 发给本地 socket"，                │
@@ -86,7 +96,7 @@ rev4 中**逐字保留、不在本文复述**的部分：§6.9 幂等账本（in
 
 | 组件 | 运行身份 | 文件权限 | 网络能力 | 说明 |
 | --- | --- | --- | --- | --- |
-| E2 web（sboxweb.service） | `sboxweb:sboxweb`（系统用户，nologin） | 仅自身 data-dir（auth/whitelist） | 仅监听既有 loopback 面；**无** `/root/sbox`、`/var/lib/sbox-cm` 任何权限 | 被攻破时的上限 = 触发 §7 六个 op（residual risk §9） |
+| E2 web（既有 `singbox-monitor.service`，User=sboxweb） | `sboxweb:sboxweb`（系统用户，nologin；Round 2 起既有事实，不新建 unit） | 仅自身 data-dir（auth/whitelist） | 仅监听既有 loopback 面；**无** `/root/sbox`、`/var/lib/sbox-cm` 任何权限 | 被攻破时的上限 = 触发 §7 六个 op（residual risk §9） |
 | sbox-cm helper | `root` | 读写 `/root/sbox/**`、`/var/lib/sbox-cm/**` | **只**持有 AF_UNIX socket；零 TCP/UDP bind | 单点特权；全部行为在 §7 allowlist + 锁契约内 |
 | CLI（mianyang / install.sh） | root（交互） | 同现状 | — | Phase C/D 全部写入器已在锁内（基线实证，§0 R5-8）；破坏性路径锁下重构见 §4.4 |
 
@@ -161,7 +171,7 @@ CapabilityBoundingSet=CAP_KILL CAP_DAC_OVERRIDE
   "actor": { "session_fp": "a1f3…",            // 会话指纹（sha256 前 16 hex，仅审计）
              "stepup_fp": "9d2e…" },           // step-up 事件指纹（仅审计，§5.4）
   "name": "vmix-01",                           // client.add/delete 必填，Phase C 正则
-  "idempotency_key": "6f0e…" }                 // client.add / client.delete 必填（rev4 §6.9.1）
+  "idempotency_key": "6f0e…" }                 // client.add / client.delete 必填（schema 见附录 C）
 
 // 请求（management / inventory 类）
 { "v": "e3-rpc/1", "request_id": "…", "op": "management.status" }
@@ -176,7 +186,7 @@ schema 规则（parse 阶段强制，先于一切文件访问）：
 * `v != "e3-rpc/1"` → `E_SCHEMA`；`request_id` 缺失/非法形状 → `E_SCHEMA`。
 * **协议绝不接受：任何命令、argv、文件路径、配置名、shell 片段、凭据值、
   密码、恢复密钥、session cookie、CSRF token**。op → 行为的映射是 helper 内的固定 switch，不是数据。
-* 请求 payload ≤ 64 KiB；`name` ≤ 32 字符且匹配 `^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$`，`legacy` 保留名（rev4 §6.5 双层防御同样成立：web 中间件 + helper 内二次硬校验）。
+* 请求 payload ≤ 64 KiB；`name` ≤ 32 字符且匹配 `^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$`，`legacy` 保留名（附录 E-7 双层防御同样成立：web 中间件 + helper 内二次硬校验）。
 
 ### 2.3 操作 → 行为映射（helper 内固定表）
 
@@ -186,8 +196,8 @@ schema 规则（parse 阶段强制，先于一切文件访问）：
 | `client.list` | 锁内读 live 配置 → 最小净化清单（§6.5） | 是（短持有，防撕裂读） | **否**（激活前 UI 也要能显示） | 天然幂等只读 |
 | `management.activate` | 锁内校验前置 → 写标记 → 审计（§4.3） | 是 | —（自身即激活动作；要求近期 step-up） | 已 active → `no_op:true` |
 | `management.deactivate` | 锁内删标记 → 审计 | 是 | —（退出动作必须始终可达） | 已 inactive → `no_op:true` |
-| `client.add` | rev4 §4.3 流程原样（账本先于 live precondition） | 是 | 是 | Idempotency-Key 账本 |
-| `client.delete` | rev4 §4.4 流程原样 | 是 | 是 | 同上 |
+| `client.add` | §3.1 执行序列（账本先于 live precondition，附录 B） | 是 | 是 | Idempotency-Key 账本 |
+| `client.delete` | §3.1 执行序列（delete 收尾顺序，附录 B） | 是 | 是 | 同上 |
 
 锁等待策略：mutation 类 `flock -w 15`（L2，超时 → `E_LOCK`，零写入）；`client.list` 同样 15 s（清单正确性优先于时延）；status 不取锁、不等待。
 
@@ -204,8 +214,8 @@ schema 规则（parse 阶段强制，先于一切文件访问）：
 
 * helper 维护最近 512 条 `{request_id → 响应摘要}` 环形缓存（内存，重启即失）；
   10 分钟内同 `request_id` 的重复请求 → 返回缓存响应（传输层重放屏蔽）。
-* **权威幂等语义只在账本**（`idempotency_key`，rev4 §6.9）；request_id 缓存只是降噪，
-  不承担正确性。缓存 miss + 同 key 重试 → 走账本 replay，结果逐字段一致（rev4 E3-T52）。
+* **权威幂等语义只在账本**（`idempotency_key`，附录 B）；request_id 缓存只是降噪，
+  不承担正确性。缓存 miss + 同 key 重试 → 走账本 replay，结果逐字段一致（附录 B.10；E3-T52）。
 
 ### 2.6 错误模型（稳定码 + retriable + stage）
 
@@ -230,7 +240,7 @@ schema 规则（parse 阶段强制，先于一切文件访问）：
 | `E_NOT_FOUND` | 404 | false | delete 目标不存在（账本调和后仍不满足重跑条件） |
 | `E_CONFIG_INCONSISTENT` | 409 | false | live JSON 非法/一致性审计失败/双 inbound 不齐 |
 | `E_IDEMPOTENCY_CONFLICT` | 409 | false | 同 key 异 payload / in_flight 异 payload |
-| `E_RECONCILE_CONFLICT` | 409 | false | in_flight 期间 live 被外部改动（rev4 §6.9.4） |
+| `E_RECONCILE_CONFLICT` | 409 | false | in_flight 期间 live 被外部改动（附录 B.9 调和矩阵） |
 | `E_LEDGER_UNAVAILABLE` | 503 | true | intent append/fsync 失败 ⇒ 零变更（F13/F14） |
 | `E_STATE_UNCERTAIN` | 503 | true | outcome 落账失败但 commit 已成功（F15，禁回滚健康配置） |
 | `E_CANDIDATE_REJECTED` | 500 | false | candidate 审计 / `sing-box check` 失败（未触盘，F4） |
@@ -241,7 +251,7 @@ schema 规则（parse 阶段强制，先于一切文件访问）：
 | `E_TIMEOUT` | 504 | true | op deadline 到期（仅未进入 mutation 时可发生） |
 | `E_INTERNAL` | 500 | false | 其余内部错误（审计 CRITICAL） |
 
-stage 枚举沿用 rev4 §4.2：`parse | peer | lock | ledger_intent | revalidate | candidate | check | backup | replace | reload | health | rollback | rollback_manual | outcome | marker | audit`。
+stage 枚举（rev4 §4.2 沿革；失败点语义见附录 D）：`parse | peer | lock | ledger_intent | revalidate | candidate | check | backup | replace | reload | health | rollback | rollback_manual | outcome | marker | audit`。
 
 ---
 
@@ -249,16 +259,16 @@ stage 枚举沿用 rev4 §4.2：`parse | peer | lock | ledger_intent | revalidat
 
 ### 3.1 client.add / client.delete 在 helper 内的执行序列
 
-**硬性不变量：一条通道、一把锁、一套事务、零旁路（rev4 §4.1 原文继承）。**
+**硬性不变量：一条通道、一把锁、一套事务、零旁路（附录 E-1；rev4 §4.1 原文继承）。**
 
 ```text
 0  parse/schema      v/request_id/op/actor/name/Idempotency-Key 校验（无文件访问）
 1  lock              with_client_lock —— 同一把 /root/sbox/config.lock，fail-closed
                      （基线 install.sh:729-745 已实证，ALREADY PASS，E3-0 仅 verify+preserve）
 2  reread live       【锁内】重新读取 /root/sbox/sbconfig_server.json —— 绝不使用
-                     web 传入或锁外缓存的任何状态快照（rev4 §6.7 请求内重读原则）
+                     web 传入或锁外缓存的任何状态快照（附录 E-2 请求内重读原则）
 3  revalidate        JSON 合法性 → 结构审计（fail-closed）→ 存在性/一致性复核 →
-                     helper 自算语义 digest → 账本查询/调和（先于一切 live precondition，A-19）
+                     helper 自算语义 digest → 账本查询/调和（先于一切 live precondition，附录 B.7 / A-19）
 4  durable intent    append → flush → fsync（文件+目录，§3.2）；失败 ⇒ E_LEDGER_UNAVAILABLE，零变更
 5  candidate         同目录 mktemp 唯一临时文件（new_candidate_path，install.sh:983）
 6  structural audit  candidate_problems fail-closed（commit_server_config，install.sh:899 内）
@@ -355,7 +365,7 @@ T-4  不得出现第二份 commit 引擎或第二份 restore 实现
 ```text
 SB_MANAGEMENT_ACTIVE_MARKER 生产默认路径 := /var/lib/sbox-cm/management.active
 （常量名、env 可覆盖性保留——测试沙箱契约不变；但生产 helper 内嵌路径常量、
-  拒绝 SB_* 环境注入，与 rev4 D3 同源：覆盖能力只属于测试 wrapper 与 root CLI）
+  拒绝 SB_* 环境注入，与附录 E-12 同源：覆盖能力只属于测试 wrapper 与 root CLI）
 
 内容（JSON，root 0644，root:root）：
 { "v": 1, "state": "active",
@@ -384,9 +394,9 @@ SB_MANAGEMENT_ACTIVE_MARKER 生产默认路径 := /var/lib/sbox-cm/management.ac
 ```text
 /var/lib/sbox-cm/                    root:root 0700
   management.active                  root:root 0644   激活标记（§4.1）
-  ledger/cm-ledger.jsonl             root:root 0600   幂等账本（rev4 §6.9；fsync 文件+目录）
+  ledger/cm-ledger.jsonl             root:root 0600   幂等账本（附录 B；fsync 文件+目录）
   journal/<request_id>.json          root:root 0600   tx journal（§3.2；fsync 文件+目录）
-  audit/cm.jsonl                     root:root 0600   特权审计（rev4 §8.4）
+  audit/cm.jsonl                     root:root 0600   特权审计（附录 E-11）
   （spool/ 与 export 一起推迟，§7.2）
 ```
 
@@ -456,7 +466,7 @@ L-ANCHOR-4  测试断言：uninstall 后 config.lock 存在且以 sboxweb 模拟
   2764+2770 process_doko / 2913+2941 process_dokoko / 3065+3084 process_ssko
   3440 enable_hy2hopping / 3475 disable_hy2hopping
   外加：tests/test-phase-c.sh、tests/test-phase-d.sh 的 SB_LOCK_FILE 重定向契约、
-  rev4 §4.7 L1 文本、共享库抽取、E3 helper、CI 双套件
+  附录 A L1 文本（原 rev4 §4.7）、共享库抽取、E3 helper、CI 双套件
 ```
 
 迁移必须是一个原子的"全部切换 + 全套回归"提交，无灰度价值、引入一次性全局风险；
@@ -497,17 +507,18 @@ M-4'  陈旧标记（人为绕过 deactivate 强删配置后重装）：
 ### 5.1 模型
 
 ```text
-· 普通 admin session（memory-only，rev4 §8.1 既有事实）= 只读级：
+· 普通 admin session（memory-only，附录 E-5 既有事实）= 只读级：
     GET clients（经 client.list）/ status / 流量视图 —— 全部放行。
 · mutation 级（client.add/delete、management.activate/deactivate）：
     要求 session 内存在未过期的 step-up 授权，否则 401 reauth_required。
 · step-up 获取：POST /api/v1/step-up { password }（新增端点，E2 范畴）
-    → scrypt 常量时间校验（复用 auth.verify_secret）→ 复用 LoginRateLimiter（同一限速器，
+    → scrypt 常量时间校验（复用既有 auth.verify_password()——review follow-up F-3 修正，
+      非 verify_secret）→ 复用 LoginRateLimiter（同一限速器，
       失败计数共享，防止把 step-up 端点当第二暴力破解面）
     → 成功 ⇒ session 内存态置 step_up = { expires_at = now + 300s }（U-7 默认）
 · UI 收到 401 reauth_required ⇒ 弹密码框 → 成功后自动重放原请求
   （confirm / Idempotency-Key 不变；helper 自算 digest 对同一语义请求一致，
-   账本 replay 不受影响 —— rev4 §8.2 原文继承）
+   账本 replay 不受影响 —— 附录 E-6 原文继承）
 ```
 
 ### 5.2 吊销语义（review #7）
@@ -536,7 +547,7 @@ S-3  step-up 状态是 web 进程内存态：web 重启 ⇒ 全部 step-up 失�
      mutation 重试会先收到 401（安全默认，代价 = 重新输一次密码）。
 S-4  journald 约束：helper 经 systemd 输出仅限 code/stage/name/request_id/
      digest 前缀；rev4 E3-T29/T55 的全链路卫生扫描对 journald fixture 同样生效。
-S-5  client.add 的新凭据由 helper 在锁内生成（rev4 §4.3 步骤 5），仅以
+S-5  client.add 的新凭据由 helper 在锁内生成（§3.1 步骤 5 / 附录 B.5），仅以
      planned_cred_digest 进入账本；值本身留在 live 配置与（未来的）export 通道内。
 ```
 
@@ -545,7 +556,7 @@ S-5  client.add 的新凭据由 helper 在锁内生成（rev4 §4.3 步骤 5）�
 | 场景 | 行为 |
 | --- | --- |
 | step-up 过期/被吊销后发起 mutation | 401 reauth_required（web 层拦截，helper 根本收不到） |
-| 窗口内同 Idempotency-Key 重试 | 账本 replay 原结果（rev4 E3-T13/T30/T52）；web 层仍要求窗口有效且未被吊销（replay 也是一次"授权读取变更结果"） |
+| 窗口内同 Idempotency-Key 重试 | 账本 replay 原结果（附录 B；E3-T13/T30/T52）；web 层仍要求窗口有效且未被吊销（replay 也是一次"授权读取变更结果"） |
 | 同 request_id 重放 | §2.5 传输层缓存返回缓存响应 |
 | 窗口内第 N 个不同 mutation | 允许（窗口模型，rev4 U-7 备选为单次令牌） |
 
@@ -620,8 +631,8 @@ S-5  client.add 的新凭据由 helper 在锁内生成（rev4 §4.3 步骤 5）�
 ```
 
 ```text
-· 真值源 = 锁内 live 配置（防撕裂读，rev4 §6.8）；registry 仅 advisory（rev4 D4），
-  缺失 ⇒ source:"untracked"，绝不推断 "cli"（rev4 E3-T19）
+· 真值源 = 锁内 live 配置（防撕裂读，附录 E-3）；registry 仅 advisory（附录 E-16），
+  缺失 ⇒ source:"untracked"，绝不推断 "cli"（附录 E-8；E3-T19）
 · 净化规则：仅 name / protocols / reserved / mutable / source 五字段；
   **零 UUID、零 password、零私钥、零 YAML、零分享 URI**（S-1/S-2 延伸；
   审计与卫生扫描把 client.list 响应纳入零命中断言）
@@ -648,10 +659,10 @@ S-5  client.add 的新凭据由 helper 在锁内生成（rev4 §4.3 步骤 5）�
 
 | 被推迟 | 理由 |
 | --- | --- |
-| `client.rotate` | 依赖 rev4 §4.5 双协议共同旋转 + rotation 失效 UX；不阻塞 v1 主线 |
-| `client.export` / `consume_export` / spool | rev4 §4.6 是自成一体的子系统（0710 spool、token、消费、清扫）；推迟它把 rev5 阻塞面收敛到"特权通道 + 激活生命周期"本身 |
+| `client.rotate` | 依赖双协议共同旋转（附录 E-17 A-2）+ rotation 失效 UX；不阻塞 v1 主线 |
+| `client.export` / `consume_export` / spool | export 子系统（一次性 token、0710 spool、特权消费、清扫——见附录 E-17 中标注"推迟"的决策项）是自成一体的子系统；推迟它把 rev5 阻塞面收敛到"特权通道 + 激活生命周期"本身 |
 | `client.get`（单客户端详情） | `client.list` 已覆盖 v1 需求 |
-| 任何 legacy 写路径（doko/dokoko/ssko/HY2 hopping/upgrade）经 web | 明确**永不**进入 RPC 白名单：CLI 运维域，混入只会扩大攻击面（rev4 A-1 精神延伸） |
+| 任何 legacy 写路径（doko/dokoko/ssko/HY2 hopping/upgrade）经 web | 明确**永不**进入 RPC 白名单：CLI 运维域，混入只会扩大攻击面（附录 E-7 legacy 保护精神延伸） |
 
 ### 7.3 功能缺口（如实声明）
 
@@ -661,12 +672,12 @@ UI 明示 `credential_delivery:"cli"`；备选：把 `client.export` 提前纳�
 
 ---
 
-## 8. 失败 / 竞态分析（R1–R12；失败点矩阵 F1–F22 沿用 rev4 §6.4）
+## 8. 失败 / 竞态分析（R1–R12；失败点矩阵 F1–F22 全文见附录 D）
 
 | # | 竞态/失败 | 序列 | 保护机制 | 结果 |
 | --- | --- | --- | --- | --- |
 | R1 | **E3 add vs legacy add** | web `client.add` 与 CLI `add_client`（基线 `install.sh:1059`）并发 | 同一把 config.lock 全序化（fail-closed 已实证）；后到者锁内 reread + revalidate，`client_name_exists` 双向复核 | 败者 `E_DUPLICATE_NAME`（409）或 `E_LOCK`（423）；零 lost update |
-| R2 | **E3 delete vs legacy modify** | web delete 与 CLI `modify_singbox`（2473）/`process_doko`（2764）并发 | 同锁串行；helper 锁内重取 `old_cred_digest` 复核；账本调和矩阵（rev4 §6.9.4） | 期间 live 被改 ⇒ `E_RECONCILE_CONFLICT`（409），绝不误删 replacement（rev4 E3-T48） |
+| R2 | **E3 delete vs legacy modify** | web delete 与 CLI `modify_singbox`（2473）/`process_doko`（2764）并发 | 同锁串行；helper 锁内重取 `old_cred_digest` 复核；账本调和矩阵（附录 B.9） | 期间 live 被改 ⇒ `E_RECONCILE_CONFLICT`（409），绝不误删 replacement（E3-T48） |
 | R3 | **E3 activate vs uninstall** | activate 等锁时 uninstall 到来 | M-1'：uninstall 在 `with_client_lock` 临界区内查标记（基线 2712 的锁外检查移入锁内）⇒ 两者严格全序 | 全序二选一：uninstall 先完成 ⇒ activate 因配置缺失拒绝；activate 先完成 ⇒ uninstall 见标记拒绝。无窗口 |
 | R4 | **uninstall vs activate**（现状不对称的单列镜像） | 基线 marker 检查在锁外（2712/3607） | M-1' 落地前该 TOCTOU 真实存在 ⇒ PRE-IMPLEMENTATION gate G2 | G2 未绿前 `management.activate` 不允许上线（闸门先于被闸者存在） |
 | R5 | **helper crash 而持锁** | helper 进程死亡时持有 flock | flock 随 fd 由内核释放（无死锁残留）；tx journal 留有 phase（文件 fsync ≥ 模型 A） | web 收连接断开 ⇒ `E_STATE_UNCERTAIN`（503）语义 + 提示同 key 重试；helper 重启 → 锁下调和（R6/R12） |
@@ -720,7 +731,7 @@ INV-15 step-up 与 session 绑定，五类事件（§5.2）立即吊销
 | **G1** | 共享事务库抽取 + 通用事务硬化（§3.1.1 T-1..T-4：restore_file_atomically 进回滚、结构化结果、CLI 0/1 兼容包装）+ Phase C/D 回归全绿 | 待实现（实现工作的一部分） |
 | **G2** | uninstall/破坏性路径锁下重构 + 锚点不灭（M-1'..M-3'、L-ANCHOR-1..4、no-nesting locked 变体） | 待实现（实现工作的一部分） |
 | **G3** | E2 step-up 端点 + §5.2 吊销语义定案（关闭 U-2 web 侧） | 待定案 |
-| **G4** | sboxweb systemd 化 + 系统用户供给方案定案 | 待定案 |
+| **G4** | 既有 `singbox-monitor.service`（Round 2 起即 `User=sboxweb`）的 E3 原地扩展与 unit 硬化方案定案（sboxweb 用户与服务化**已是基线事实**，不新建 `sboxweb.service`；F-1） | 待定案 |
 | **G5** | 本设计（rev5）final design approval | 待批准 |
 | **G6** | 测试脚手架：sbox-cm test wrapper（沙箱 `SB_*` 注入）+ journal/账本 fixture + 帧协议 fuzz（截断帧/超长帧/慢客户端） | 待定义 |
 
@@ -733,11 +744,11 @@ G1/G2/G3/G4 是**实现里程碑**（由 M0/M0.5 交付并各自带测试闸门�
 | 阶段 | 交付物 | 测试闸门 | 回滚方式 |
 | --- | --- | --- | --- |
 | **M0 共享库 + 事务硬化**（= G1 + G2） | `lib/client-management.sh` 抽取（字节级）；回滚改 restore_file_atomically（T-1）；结构化事务结果 + CLI 0/1 包装（T-2）；uninstall 锁下重构 + 锚点不灭（M-1'/L-ANCHOR）；marker 生产路径迁 /var/lib/sbox-cm（常量名/env 覆盖保留） | Phase C/D 回归全绿；`bash -n` + shellcheck；新锁生命周期测试（R12 inode 断言、卸载后锚点存活、no-nesting 静态断言） | 逐 commit revert；纯 CLI 侧，无生产影响 |
-| **M0.5 供给**（= G3/G4） | sboxweb 用户 + `sboxweb.service`；step-up 端点 + 吊销语义 | E2 回归 + step-up/吊销测试（五类事件各一条断言） | unit 停用即回手动运行；端点独立可关 |
-| **M1 helper** | `sbox-cm` 守护进程 + unit；socket/PEERCRED；长度前缀帧 + 三级 deadline；6 op dispatch；账本 + tx journal（文件+目录 fsync）；启动锁下调和；degraded 语义 | E3 套件（rev4 T 系裁剪 + R1–R12 断言）；帧 fuzz（G6）；sandbox 全绿 | `systemctl stop --now sbox-cm` ⇒ 变更面全关（默认态即安全态） |
+| **M0.5 供给**（= G3/G4） | 既有 `singbox-monitor.service` 原地扩展（sboxweb 用户与服务化已是 Round 2 基线事实，**不新建** `sboxweb.service`；F-1）；step-up 端点 + 吊销语义 | E2 回归 + step-up/吊销测试（五类事件各一条断言） | unit 扩展旗标回退即回原形态；端点独立可关 |
+| **M1 helper** | `sbox-cm` 守护进程 + unit；socket/PEERCRED；长度前缀帧 + 三级 deadline；6 op dispatch；账本 + tx journal（文件+目录 fsync）；启动锁下调和；degraded 语义 | E3 套件（rev4 T 系沿革裁剪——规范以附录 A–E 为准 + R1–R12 断言）；帧 fuzz（G6）；sandbox 全绿 | `systemctl stop --now sbox-cm` ⇒ 变更面全关（默认态即安全态） |
 | **M2 web 适配** | 错误映射、step-up 挂钩、status UI、client.list UI、add/delete 流程 + type-to-confirm + Idempotency-Key | API 契约测试（mock helper）+ S0 安全套件扩展 | web 侧熔断 ⇒ 界面回只读 |
-| **M3 激活上线**（= ENABLE 门禁在此收口） | runbook：status → activate → list → add/delete 验证 → deactivate；active_stale 处置 | **G1–G6 全绿 + rev4 §12 适用测试全绿** 方可激活 | deactivate 即关 |
-| **M4 硬化** | 失败注入（F1–F22 × R1–R12）、并发 canary、全通道卫生 grep（+journald +client.list 响应）、审计 schema 校验、双图复核刷新 | §9.1 全部 INV 有对应断言且绿 | — |
+| **M3 激活上线**（= ENABLE 门禁在此收口） | runbook：status → activate → list → add/delete 验证 → deactivate；active_stale 处置 | **G1–G6 全绿 + 附录 A–E 对应断言（G6 重建的 E3 套件）全绿** 方可激活 | deactivate 即关 |
+| **M4 硬化** | 失败注入（附录 D F1–F22 × R1–R12）、并发 canary、全通道卫生 grep（+journald +client.list 响应）、审计 schema 校验、双图复核刷新 | §9.1 全部 INV 有对应断言且绿 | — |
 
 依赖链：M0 → M0.5 → M1 → M2 → M3 → M4；M1 不得先于 M0（R1/R3/R4/R12 的保护来自 M0）。
 
@@ -875,9 +886,9 @@ client.delete          = { name:string, idempotency_key:string(16..128) } // dea
 | B-1 | 共享事务库不存在；且 `commit_server_config` 回滚含未校验直接 `cp -a`（install.sh:967），需按 T-1 硬化 | 基线 grep 实证；phase-c 块内嵌 | G1 / M0 |
 | B-2 | `uninstall_singbox`（2708）`rm -rf /root/sbox/` 会删除锁与标记本体；marker 检查（2712/3607）在锁外 | 基线 grep 实证 | G2 / M0 |
 | B-3 | E2 无 step-up 端点、无吊销语义 | 本分支 web 路由表实证 | G3 / M0.5 |
-| B-4 | E2 未服务化（无 sboxweb 用户/unit） | 本分支 grep 实证 | G4 / M0.5 |
+| B-4 | ~~E2 未服务化（无 sboxweb 用户/unit）~~ **基线事实修正（F-1）**：Round 2 起既有 `singbox-monitor.service` 已以 `User=sboxweb` 服务化运行；剩余工作 = 该既有 unit 的 E3 原地扩展与硬化定案（不新建 `sboxweb.service`） | 基线 `monitor-v2/deploy/` unit 实证 | G4 / M0.5 |
 | B-5 | sbox-cm.service 硬化旗标未实测（D-Bus/sandbox 交互） | §1.4 注 | M1 验收 |
-| B-6 | rev4 的 E3-T/legacy 测试套件不在本分支（CI 计数出自 round2 报告） | 本分支 tests/ 实际清单 | G6（脚手架重建） |
+| B-6 | rev4 的 E3-T/legacy 测试套件不在本分支（CI 计数出自 `docs/monitor-v2-integration.md` 记录） | 本分支 tests/ 实际清单 | G6（脚手架重建；断言集以附录 A–E 契约为准） |
 
 ---
 
@@ -903,5 +914,168 @@ client.delete          = { name:string, idempotency_key:string(16..128) } // dea
 * [x] 实施阶段（§10 M0–M4）
 * [x] 显式阻塞项（§13 B-1..B-6；B-1 旧项撤销并留痕）
 * [x] 最终判定（§14 三层 readiness）
+* [x] PR #18 独立 source review follow-up 修正（F-1 服务化基线事实 / F-2 自包含 / F-3 verify_password）
+* [x] 附录 A–E（锁契约 L1–L6、幂等账本与调和契约、Idempotency-Key schema、失败语义 F1–F22、其他规范性继承契约）——rev5 自包含
 * [x] 全部代码事实对基线 `3ee9a162` 重新锚定（`git grep -n` 行号，§0/§3/§4/§8/§13）
 * [x] **本轮零实现、零运行时改动、未连接 VPS、未触碰 PR #16/#17 / 9191 / TLS / 凭据 —— STOP after revised rev5 design**
+
+---
+
+## 附录 A — 锁契约 L1–L6（折入自 rev4 §4.7；rev5 §2.3/§4.4 扩展生效）
+
+> 基线 `3ee9a162` 树内不含 rev4 文档（F-2），故将其锁契约全文折入；编号 L1–L6 不变。
+> rev5 新增 L7"锁路径名永不 unlink"（§4.4 L-ANCHOR-1..4、INV-13）；L5 的管理面扩展见 §2.3/R5-7。
+
+```text
+L1  全局唯一互斥点：/root/sbox/config.lock 的排他 flock；所有 mutation path
+    （install.sh CLI 菜单 + helper 全部 mutation op）都必须经它。
+L2  fail-closed：flock 命令缺失 / 锁文件打开失败 / flock 获取失败 / 等待超时
+    （helper -w 15s）→ 一律错误退出（CLI 非零 rc；helper E_LOCK → HTTP 423），
+    在 candidate 创建、备份、任何写入之前中止。锁失败必须不修改 config（字节不变）。
+    （基线 install.sh:729-745 已实证 fail-closed；E3-0 仅 verify + preserve，§0 R5-8。）
+L3  修复点在共享库：with_client_lock 的语义对 CLI 与 Web 同时成立——二者共用同一
+    函数，不存在"只修 Web"的选项。
+L4  commit_server_config 维持现状：自身不加锁，由调用方持锁（该前提由 L2/L3 在
+    所有调用点上强制成立）。
+L5  锁作用域（rev5 修订）：helper 侧 client.add / client.delete /
+    management.activate / management.deactivate / client.list（短持有，防撕裂读）
+    持锁；management.status 不持锁（不读 live 配置，无撕裂面）。CLI 交互式只读
+    显示维持无锁现状——display-only，无写风险。
+L6  Web 层不得自行实现第二把锁/队列来"补"全局保证；进程内并发原语仅用于请求
+    背压，不充当全局锁。
+```
+
+## 附录 B — 幂等账本与调和契约（折入自 rev4 §6.9；rev5 实现的规范性输入）
+
+**B.1 digest 所有权**：Web 不提供 digest。helper 自己 parse → schema 校验 → 语义 canonicalize（`{op,name,protocols}` / `{op,name}`）→ `digest = sha256(canonical-json)`；账本匹配只认 helper 自算值；RPC 请求携带的任何 digest 字段必须被拒绝且无法影响账本（E3-T42）。
+
+**B.2 强制范围**：`client.add` / `client.delete` 必填 Idempotency-Key（schema 见附录 C）；缺失 → 拒绝（web 中间件 + helper 双层强制）。理由：delete 成功但响应丢失后外部重建同名时，无幂等的 retry 会删除第二代同名客户端（不可接受）；add 响应丢失后同 key 重试应 replay 原始结果，而非误导性 duplicate 冲突。
+
+**B.3 存储**：`/var/lib/sbox-cm/ledger/cm-ledger.jsonl`（rev5 §4.2；root 0600；append-only；GC/compaction 由 helper 锁内做；TTL 24h）。
+
+**B.4 intent 记录**：`{key, op, name, digest(helper 自算), state:"in_flight", generation, planned_cred_digest(仅 add) / old_cred_digest(delete), ts, request_id}`（rotate 推迟；其 `planned_new_cred_digest` 字段随该 op 未来纳入时生效）。
+
+**B.5 generation / supersede（核心不变量）**：同一 key 可有多条 intent generation，单调递增；**最新 durable in_flight 记录 = 当前有效 plan**。调和重跑必须先追加 superseding 记录（generation+1，含新 planned digest）并 fsync，之后才允许 mutation。不变量：**mutation 使用的 planned credentials 必有一个已 fsync 的 ledger digest 与之对应**——账本描述的 plan 与 candidate 实际使用的凭据永远一致；否则二次 crash 后调和会拿错 plan。
+
+**B.6 写入次序与 durability**：
+
+```text
+intent  = append → flush → fsync（文件；掉电级承诺加 fsync 父目录，§3.2 模型 B）
+          ⇒ durable 之后才允许任何 config mutation；
+          失败 ⇒ E_LEDGER_UNAVAILABLE，零变更（F13/F14）
+outcome = 最终非敏感 result append → flush → fsync ⇒ durable 之后 helper 才允许
+          返回成功；失败且 commit 已成功 ⇒ 不回滚健康配置 ⇒
+          E_STATE_UNCERTAIN + "retry with the SAME Idempotency-Key"（F15）
+摘要白名单：planned_cred_digest / old_cred_digest 均为 sha256(凭据拼接)，
+          单向不可逆，仅存 root-only 账本；不入审计/响应
+```
+
+**B.7 统一 mutation 顺序（add / delete 一致；账本先于一切 live precondition）**：
+
+```text
+0  parse / schema / name 正则 / reserved 名 / key schema（不读文件、不取锁）
+1  acquire config.lock（fail-closed，附录 A L2）
+2  helper 语义 canonicalize → 自算 request digest
+3  lookup ledger by Idempotency-Key【同一把锁内，先于一切 live precondition】
+4  live precondition：consistency / exists / duplicate / reserved / 双 inbound
+5  create durable intent（append + fsync；调和重跑路径 = supersede intent）
+6  mutation（candidate → commit_server_config）
+7  derived/cleanup → 8 registry（advisory）→ 9 durable outcome → 10 audit → unlock
+
+delete 收尾顺序：commit → 派生目录清理 → registry 清理 → 最终非敏感 result →
+durable outcome → audit → unlock；派生清理失败走 advisory
+（deleted:true, derived_cleanup:false + warnings），outcome 如实记录最终对外结果。
+账本查询先于 duplicate/not_found 的理由：create 失联重试时 live 已存在该 name，
+正确行为是账本 done ⇒ replay 原始结果，而非 409。
+```
+
+**B.8 请求匹配规则（helper 锁内）**：
+
+| 账本状态 | digest 匹配 | 行为 |
+| --- | --- | --- |
+| 无记录 | — | 进入 live precondition → durable intent → 事务 → 派生 → outcome |
+| done | 匹配 | **replay**：原样返回落账 result（+ `replayed:true`），零第二次事务 |
+| done | 不匹配 | `E_IDEMPOTENCY_CONFLICT`（409） |
+| in_flight | 不匹配 | `E_IDEMPOTENCY_CONFLICT`（409） |
+| in_flight | 匹配 | 调和矩阵（B.9） |
+
+**B.9 调和矩阵（按 planned/old digest 精确判定）**：`current_cred_digest = sha256(该 name 当前 uuid + "\n" + 当前 password)`，锁内现算。
+
+| intent | live 状态（锁内核对） | 结论 |
+| --- | --- | --- |
+| create(add) | name 不存在 | 上次未生效 → **重跑**：新 planned 凭据 → superseding intent（generation+1）→ fsync → mutation |
+| create(add) | 存在 ∧ current == planned_cred_digest | 本请求已生效 → 补完派生工作 → done（replay） |
+| create(add) | 存在 ∧ current != planned_cred_digest | **E_RECONCILE_CONFLICT**：同名对象是别的 actor 建的，禁止覆盖、禁止判成功 |
+| delete | name 不存在 | 期望状态已达成 → 补完 derived/registry 清理 → done（replay） |
+| delete | 存在 ∧ current == old_cred_digest | 未生效 → **重跑 delete**（先 supersede intent → fsync → mutation） |
+| delete | 存在 ∧ current != old_cred_digest | **E_RECONCILE_CONFLICT**：同名已被 rotate/recreate，**绝对不得删除当前对象** |
+
+（rotate 行随该 op 推迟；未来纳入时按同构扩展：`current == planned_new → replay` / `current == old → 重跑` / 其他 → conflict。）
+
+crash 窗口收敛：commit 前 crash ⇒ in_flight + live 未变 ⇒ 调和重跑；commit 后 outcome 前 crash ⇒ in_flight + live 已变 ⇒ 调和判"已生效" ⇒ 补 derived + outcome。两个窗口都被矩阵闭合。
+
+**B.10 其他**：replay 与首次最终结果逐字段一致（含 warnings / derived_cleanup）；同 key 指纹（sha256 前 8 位）进审计；Web 重启不丢账本（磁盘文件 + fsync），Web 必须原样透传重试请求中的同一 key。
+
+## 附录 C — Idempotency-Key schema（折入自 rev4 §6.9.1 / A-26）
+
+```text
+格式：opaque ASCII token；长度 16–128 字符；字符集 [A-Za-z0-9._:-]
+禁止：newline、控制字符、whitespace、Unicode、path 分隔符（/ \）、超长/过短
+校验：Web 中间件早拒 + helper E_SCHEMA 双层二次验证（schema 属 parse 阶段，
+      先于锁与账本）
+日志/审计：只记 sha256(key) 前 8 位（key_fp），永不记 full key；
+      账本本身（root-only 0600）存 full key 以供查找
+推荐生成：浏览器 crypto.randomUUID() 或等价随机 token
+（RPC schema 侧对应约束见本文 §2.2：idempotency_key: string(16..128)。）
+```
+
+## 附录 D — 失败语义 F1–F22（折入自 rev4 §6.4；rev5 §2.6 错误码映射）
+
+| # | 失败点 | 磁盘状态 | 服务状态 | rev5 错误码（§2.6） | 后续 |
+| --- | --- | --- | --- | --- | --- |
+| F1 | name/形状/reserved（parse 阶段） | 不变 | 不变 | E_SCHEMA / E_RESERVED_NAME（400/403） | 无 |
+| F2 | 锁不可用/获取失败/超时（fail-closed） | **不变（字节级）** | 不变 | E_LOCK（423，retriable） | 稍后重试；无 candidate/备份残留 |
+| F3 | live 配置 JSON 非法 / 一致性审计失败 | 不变 | 不变 | E_CONFIG_INCONSISTENT（409） | 先跑 CLI 一致性检查 |
+| F4 | candidate 生成/审计失败 / `sing-box check` 失败 | 不变（candidate 被删） | 不变 | E_CANDIDATE_REJECTED（500） | 附审计问题行；系统完好 |
+| F5 | 备份失败 / 原子 mv 失败 | live 不变；备份保留 | 不变 | E_COMMIT_FAILED（500，retriable） | 系统完好，可重试 |
+| F6 | reload 失败 | **已自动回滚**（M0 后经 `restore_file_atomically`，T-1） | 已恢复 | E_ROLLED_BACK（503，retriable） | 可安全重试 |
+| F7 | 健康检查失败 | 同 F6 回滚 | 已恢复 | E_ROLLED_BACK（503，retriable） | 可安全重试 |
+| F8 | 回滚后再 reload/健康仍失败 | 回滚文件已就位 | **未确认恢复** | E_MANUAL_INTERVENTION（500）+ degraded | **禁止盲目重试**，人工恢复；审计 CRITICAL |
+| F9 | 提交成功后 canonical yaml_gen 失败 | 服务端已生效 | 正常 | ok + warnings（advisory） | `yaml_available:false` + warnings；不影响正确性 |
+| F10 | 提交成功后 registry 失败 | 服务端已生效 | 正常 | ok（advisory） | 元数据 null、source=untracked；无影响 |
+| F11 | （export 推迟）live 渲染/spool 写入失败 | 无部分文件 | 正常 | （export 子系统不在 rev5 v1 操作面） | 未来纳入时随其设计定稿 |
+| F12 | flock 二进制缺失 | **不变** | 不变 | E_LOCK（423） | CLI 菜单 mutation 同样拒绝（附录 A L3） |
+| F13 | 账本 intent append 失败 | **零变更（mutation 未开始）** | 不变 | E_LEDGER_UNAVAILABLE（503，retriable） | 同 key 重试安全 |
+| F14 | 账本 intent fsync 失败 | **零变更** | 不变 | E_LEDGER_UNAVAILABLE（503，retriable） | 同 key 重试安全 |
+| F15 | 账本 outcome append/fsync 失败（commit 已成功） | 已提交（健康） | 正常 | E_STATE_UNCERTAIN（503，retriable） | **不回滚健康配置**；同 key 重试 → 调和补账 |
+| F16 | 调和冲突：in_flight 期间 live 被外部改动 | 不变（拒绝动作） | 不变 | E_RECONCILE_CONFLICT（409） | 人工刷新确认后再操作 |
+| F17 | （export 推迟）download token used/expired/unknown | — | 正常 | （不在 rev5 v1 操作面；统一 404 语义随 export 定稿） | — |
+| F18 | （export 推迟）Web restart 后 outstanding token | — | 正常 | （同上；session memory-only ⇒ 失效） | — |
+| F19 | helper 收到非空 argv / 非法 op / 缺 key | 不变 | 不变 | E_SCHEMA / E_OP_UNKNOWN（400） | 修复调用方；防御性告警 |
+| F20 | production helper 检测 `SB_*` 环境注入 | 不变 | 不变 | E_INTERNAL（500，审计 CRITICAL） | 排查注入源 |
+| F21 | delete 派生目录清理失败 | 服务端已提交；`clients/<name>/` 残留 | 正常 | ok + warnings（advisory） | `deleted:true, derived_cleanup:false`；人工/下次清理可后补 |
+| F22 | （export 推迟）stream 后 consume 失败 | orphan 暂存 | 正常 | （不在 rev5 v1 操作面） | — |
+
+语义注（继承 rev4 R1–R5）：F4–F8 复用 `commit_server_config` 既有语义，E3 只做错误码映射；rev5 M0 按 T-1 硬化回滚原语。add 的 F6/F7 = "客户端从未存在"；delete 的 F6/F7 = "客户端仍完整存在，派生目录保持"。F2/F12 是 fail-closed 的直接推论——锁失败的失败模式是"什么都不做"。F13/F14 与 F15 是账本 durability 的两半：intent 失败 ⇒ 什么都没发生（重试安全）；outcome 失败 ⇒ 变更已生效（禁止回滚健康配置，必须同 key 补账）。
+
+## 附录 E — 其他规范性继承契约（MUST/SHALL 规则，折入自 rev4）
+
+| # | 契约 |
+| --- | --- |
+| E-1 | **事务唯一性（一条通道、一把锁、一套事务、零旁路）**：服务端配置的全部合法写路径 = `with_client_lock` + `commit_server_config`；E3 不新增任何并行事务实现；helper 直写 `sbconfig_server.json` 即 INV-4 违例。 |
+| E-2 | **请求内重读原则**：一切判定（存在性、一致性、reserved、cred digest）都在锁内对 live 配置重新做出，绝不基于陈旧快照写入。 |
+| E-3 | **读取一致性/撕裂读**：`mv` 原子替换保证单文件完整性，但跨 inbound 的两次读可能横跨一次提交 → `client.list` 等读操作在锁内执行（rev5 §2.3：短持有）。 |
+| E-4 | Web 层无第二把锁/队列（= 附录 A L6）。 |
+| E-5 | **E2 会话 memory-only（基线事实）**：web 重启 ⇒ 全部 admin session 失效；step-up 为 web 进程内存态（§5.2）。 |
+| E-6 | **step-up 重放语义**：401 reauth_required → UI 弹密码 → 成功后自动重放原请求（confirm/Idempotency-Key 不变；helper 自算 digest 对同一语义请求一致，账本 replay 不受影响）；helper 不参与 step-up。 |
+| E-7 | **legacy 保护（A-1）**：`legacy` = 保留名，Web list-only（GET 可见 `reserved:true, mutable:false`；add 名为 legacy / delete 一律拒绝）；双层防御 = web 中间件 + helper 内二次硬校验；任何 legacy 写路径（doko/dokoko/ssko/HY2 hopping/upgrade）永不进入 RPC 白名单。 |
+| E-8 | **source 溯源（A-16）**：`source:"web"` 仅限正向证据（registry 存在该 name 的 web 写入记录）；否则 `"untracked"`；绝不推断 `"cli"`。 |
+| E-9 | **凭据卫生禁令**：UUID/password/私钥/YAML/分享 URI/full token 不出现在 argv、env、journald、两份审计、错误 detail、client.list 响应、任何日志（唯一历史例外 = 推迟的 export 私有 IPC，随该子系统定稿）；允许出现的唯一派生值 = 单向摘要与指纹（sha256 不可逆）。 |
+| E-10 | **认证态与 YAML/服务端配置隔离**：改 admin password / whitelist / recovery key 只写 E2 认证存储，不触碰 `SB_*`、不获取 config.lock、不产生任何 YAML/服务端配置变化；反向亦然。 |
+| E-11 | **审计 schema 与禁记清单**：特权审计 JSONL（`/var/lib/sbox-cm/audit/cm.jsonl`，0600）每条含 ts/request_id/actor(指纹)/op/name/outcome/stage/backup/idempotency_key_fp 等；禁记：UUID、password、private key、YAML 内容、完整配置、分享 URI、token 全文（仅指纹）、cred digest 明文（账本专属）。`outcome ∈ ok|rejected|rolled_back|manual_intervention|replayed|uncertain`。每个 RPC 尝试（无论成败）恰一条记录；非法帧/超时连接同样入审计（connection_rejected / timeout）。 |
+| E-12 | **helper 环境自加固（A-18/D3）**：argv 恒空（非空即拒绝）、主动 unset/拒绝 `SB_*` 环境注入、固定 PATH/绝对路径、生产路径常量内嵌；测试经 test-only wrapper（非生产通道）注入沙箱；production helper 必须拒绝同样的注入。 |
+| E-13 | **命名契约**：`name` ≤ 32 字符且匹配 `^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$`；`legacy` 保留名；双层校验（web + helper）。 |
+| E-14 | **危险操作 UX（M2 硬性要求）**：mutation 前后果明示 + type-to-confirm（逐字回显 name）+ 近期 step-up；`E_RECONCILE_CONFLICT` 时 UI 明示"服务器状态已变化，请刷新核对后再操作"，绝不静默重试。 |
+| E-15 | **并发与背压**：helper 串行处理（§2.1）；web 适配层进程内并发原语仅作背压（等待上限 30s），不充当全局锁；并发 add 同名（各自 key）→ 恰好 1 成功、其余 E_DUPLICATE_NAME（或同 key replay）。 |
+| E-16 | **registry 顾问性（D4）**：created_at/rotated_at/credential_version/source 为 advisory 元数据，绝不参与凭据正确性判定；缺失/损坏 ⇒ 相关字段 null，功能不受影响。 |
+| E-17 | **已定案决策索引（rev4 A-1…A-26 摘要；规范效力以本文各节 + 附录 A–E 重述为准）**：A-1 legacy list-only（E-7）/ A-2 rotate 双协议共同旋转（推迟）/ A-3 token 两步下载（推迟）/ A-4 单 narrow helper / A-5 共享事务库（§3.1）/ A-6 锁 fail-closed（附录 A）/ A-7 幂等账本特权侧持久化（附录 B）/ A-8 spool 权限模型（推迟）/ A-9 统一 404（推迟）/ A-10 web 重启使未决导出失效（推迟）/ A-11 digest 所有权 = helper（B.1）/ A-12 mutation 强制 key（B.2）/ A-13 调和矩阵精确判定（B.9）/ A-14 账本 durability（B.6）/ A-15 export 真值 = live（推迟）/ A-16 source 溯源（E-8）/ A-17 token 日志脱敏（推迟）/ A-18 helper 环境自加固（E-12）/ A-19 账本查询先于 live precondition（B.7）/ A-20 调和重跑先 supersede（B.5）/ A-21 delete 收尾顺序（B.7）/ A-22 full token 唯一位置 = export 私有 IPC（推迟）/ A-23 consume 失败 deny-set 语义（推迟）/ A-24 consume_export 免锁（推迟；rev5 操作面无此 op）/ A-25 S0 依赖（已被基线 `3ee9a162` 达成，§0 R5-8）/ A-26 key schema（附录 C）。标注"推迟"的决策项属 export/rotate 子系统，不在 rev5 v1 实现面内；未来纳入时须随完整设计一并 review。 |

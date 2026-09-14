@@ -1,4 +1,4 @@
-# Monitor v2 — VPS Canary Final Runbook (Round 2, rev2.2)
+# Monitor v2 — VPS Canary Final Runbook (Round 2, rev2.3)
 
 状态：**DESIGN / DOCUMENTATION ONLY — 未执行**。
 本文档是 Round 2 的最终 localhost-only VPS canary runbook，供**未来获得明确批准后**的 canary 执行使用。
@@ -23,6 +23,14 @@
 
 10. Reality private-key 检测升级为**三层字面量**：(1) 完整非空 `private_key` 值；(2) 完整值的 **JSON 转义表示**（覆盖日志中 `\n` 转义渲染）；(3) **逐行 key material**（按行 split → strip → 过滤空行 → 过滤 `-----BEGIN…-----` / `-----END…-----` 等 formatting-only 行，保留真实密钥材料行——覆盖逐行拆分/归一化渲染）。其余类别（service.api secret、Reality UUID、HY2 password）保持精确全值扫描不变；输出固定为四类别聚合计数（`service_api_secret_matches` / `reality_uuid_matches` / `hy2_password_matches` / `reality_private_key_matches`）；**任一类别 >0 ⇒ FAIL/STOP**；**任一预期类别收集不到敏感材料 ⇒ fail-closed**（绝不静默通过）。扫描器保持：标准库、短命、内存态、零 secret 落盘、argv 零 secret、无 xtrace、journal 限 canary 区间；空字符串永不成为扫描模式。
 
+**rev2.3 变更（PR #18 独立 source review follow-up 修正，仅文档，零代码/零执行）**：
+
+11. P0-8 service.api JSON 形状修正为冻结基线事实：`.services[]` 条目 `tag=="monitor-api"` / `type=="api"` / `listen=="127.0.0.1"` / `listen_port==9091` / 非空 `secret`；废除错误的 `.listen == "127.0.0.1:9091"` 选择器（B3 相应改写：service.api 形状已确认，仅凭据字段键名仍属扫描器按键收集范畴）。
+12. 管线退出码纪律前置：canary 会话自 §1 起全局 `set -o pipefail`；install/upgrade、monitor health、journal 扫描器、E1 strict canary、rollback 等门禁管道一律显式捕获生产者退出码（`${PIPESTATUS[0]}`），tee 永远不可能把 FAIL 掩成 PASS。
+13. P3-0 collector 路径修正：`webapp.py` 与 `collector.py` 部署在同一目录（release 树 `app/monitor-v2/`）；同目录引用 `$WEBAPP_DIR/collector.py`（等价替代 = 冻结 checkout 的 `/root/canary-src/monitor-v2/collector.py`）；废除 `$WEBAPP_DIR/../collector.py`。
+14. cmdline artifact 拆分：基线 `p0-singbox-cmdline.txt` 仅含 cmdline 输出；ps/lstart 进程元数据单独落 `p0-singbox-process.txt`（信息性）；P4 做同类逐字节比较。
+15. 备份集合比较输入格式统一：P0/P4 集合不变量一律用"仅 basename、已排序"的同构文件比较；大小/时间戳元数据移入独立信息性 artifact（`p0-backups-info.txt`）。
+
 ---
 
 ## 0. 固定锚点与硬性禁令
@@ -37,7 +45,7 @@
 | sing-box 配置（唯一事实源） | `/root/sbox/sbconfig_server.json`（root 0600，canary 全程只读） |
 | sing-box 状态文件 | `/root/sbox/config`（只读） |
 | 配置锁 | `/root/sbox/config.lock`（canary 不触碰） |
-| service.api | 仅 `127.0.0.1:9091`，gRPC-Web `daemon.StartedService/SubscribeConnections`，非空 secret |
+| service.api | `.services[]` 条目：`tag=="monitor-api"`、`type=="api"`、`listen=="127.0.0.1"`、`listen_port==9091`、非空 `secret`；仅监听 `127.0.0.1:9091`，gRPC-Web `daemon.StartedService/SubscribeConnections` |
 | secret 派生链 | `sbconfig_server.json → /root/sbox/monitor-api.secret（root:root 0600）→ /etc/singbox-monitor/api.secret（root:sboxweb 0640）`，后者 fail-closed 派生 |
 | monitor 部署 | `monitor-v2/deploy/install-monitor.sh` + `lib/monitor-deploy-lib.sh`；release 树 `/opt/singbox-monitor-releases`，symlink `/opt/singbox-monitor`，conf `/etc/singbox-monitor/monitor.conf`，state `/var/lib/singbox-monitor`（sboxweb 0700），备份 `/var/backups/singbox-monitor` |
 | monitor 服务 | `singbox-monitor.service`，`User=sboxweb`（非 root），默认 `SBMON_WEB_BIND=127.0.0.1:9191`、`SBMON_API_URL=http://127.0.0.1:9091`、`SBMON_MODE=web` |
@@ -61,7 +69,7 @@
 | --- | --- | --- |
 | B1 | 本地开发工作区 `feature/proxy-monitor-web` 当前 head 为 `b52b42c…`，**不等于**冻结基线 `3ee9a16`，且本地不存在 `monitor-v2/deploy/`（该目录只在远端 head 3ee9a16 上）。本 runbook 的部署章节依据远端 head 3ee9a16 的真实文件（`install-monitor.sh`、`lib/monitor-deploy-lib.sh`、`app-bin/monitor-service`、`app-bin/monitor-health`）撰写 | **流程性前置**：canary 必须在 VPS 上用干净 clone 检出 `$FROZEN` 执行（§P0-1），绝不以本机工作区为源 |
 | B2 | VPS 当前实况未知：`singbox-monitor` 是否已装、`VERSION` 值、python3 版本均未知 | 由 §P0 门禁解析；fresh（`install --no-start`）vs 已有部署（`upgrade`）分支由 P0-6 结果决定，不是 blocker |
-| B3 | `sbconfig_server.json` 中 `service.api` 块与凭据字段（uuid/password/private_key）的确切 JSON 形状未在本仓库逐字段确认 | P0-8 与 P2-7 的 jq 选择器基于常见形状（`.uuid` / `.password` / `.private_key` / `.listen`）；若形状不同，**只允许改选择器形状，绝不打印敏感值**。非阻塞 |
+| B3 | ~~`service.api` 块确切 JSON 形状未确认~~（rev2.3 修正）：冻结基线事实 = `.services[]` 条目 `tag=="monitor-api"` / `type=="api"` / `listen=="127.0.0.1"` / `listen_port==9091` / 非空 `secret`。凭据字段（uuid/password/private_key）由 P2-7 扫描器**按键名遍历**收集 | P0-8 选择器已按上述基线形状固定；若 VPS 实机凭据键名与扫描器按键集合不同，**只允许调整收集键名集合，绝不打印敏感值**。非阻塞 |
 | B4 | E1 canary 流量验证会在窗口内产生**第二个短暂的 service.api consumer**（集成脚本自带的 collector 进程）。与稳态"one Collector / one consumer"约束冲突 | **设计内受控例外**：仅允许在 §P3 明示窗口内发生，窗口前后必须复跑单例断言（§P2-6）。非阻塞，但必须执行复检 |
 | B5（rev2 记录，rev2.1 更新方案） | `tests/monitor-v2-integration-e1.sh` 不传 `--secret-file`，strict canary 在有鉴权的生产 service.api 上无法直接运行 | 由 §P3-1 受控手动例外解决（**逐命令临时环境赋值窗口**，值不进父 shell）；不改冻结代码。等价备选方案见 §P3-1 备注 |
 
@@ -84,11 +92,14 @@ P6  Final report（PASS/FAIL 模板填写）
 VPS 上一次性建立 artifacts 目录并全程复用：
 
 ```bash
+set -o pipefail   # rev2.3：会话全局启用——任一管线中生产者非零退出都使整条管线非零
 export FROZEN=3ee9a162a3fb53d9fddc95cb6eba95b3bcc5702e
 export ART=/root/canary-artifacts-$(date -u +%Y%m%dT%H%M%SZ)
 mkdir -m 0700 -p "$ART"
 export T0=$(date -u +%Y-%m-%dT%H:%M:%SZ)   # canary 窗口起点（所有 --since 使用）
 ```
+
+**管线退出码纪律（rev2.3，自 P0 起生效）**：所有门禁管道（install/upgrade、monitor health、journal 扫描器、E1 strict canary、rollback）一律显式捕获**生产者退出码**（`${PIPESTATUS[0]}`）并以其判定；`tee` 的退出码永远不作为判定依据——任何生产者 FAIL 都不可能被 `tee` 掩成 PASS。
 
 ---
 
@@ -113,8 +124,8 @@ git status --porcelain             # 必须为空（工作区干净）
 ```bash
 SBPID=$(systemctl show -p MainPID --value sing-box)
 [ -n "$SBPID" ] && [ "$SBPID" != "0" ] || { echo 'FAIL: sing-box MainPID 无效'; exit 1; }
-tr '\0' ' ' < /proc/$SBPID/cmdline | tee "$ART/p0-singbox-cmdline.txt"
-ps -o pid=,user=,group=,lstart= -p "$SBPID" | tee -a "$ART/p0-singbox-cmdline.txt"
+tr '\0' ' ' < /proc/$SBPID/cmdline | tee "$ART/p0-singbox-cmdline.txt"          # 基线 artifact 仅含 cmdline（P4 同类逐字节比较）
+ps -o pid=,user=,group=,lstart= -p "$SBPID" | tee "$ART/p0-singbox-process.txt"  # 进程元数据独立留档（信息性；不参与 P4 cmdline 比较）
 # 生命周期不变量基线（rev2：PID 不变不足以证明无 in-process reload，需采集集合）
 systemctl show sing-box -p MainPID -p NRestarts -p ExecMainStartTimestampMonotonic -p ActiveState -p SubState \
   | tee "$ART/p0-singbox-lifecycle.txt"
@@ -122,7 +133,7 @@ systemctl show sing-box -p MainPID -p NRestarts -p ExecMainStartTimestampMonoton
 
 - **PASS**：`MainPID` 有效；cmdline 可执行文件为 `/root/sbox/sing-box` 且包含 `-c /root/sbox/sbconfig_server.json`；属主 `root`；lifecycle 基线已记录。
 - **FAIL**：cmdline 与上述不符（手工进程、路径漂移）→ 停止（先人工恢复 systemd 托管形态，超出本 canary 范围）。
-- **artifacts**：`$ART/p0-singbox-cmdline.txt`、`$ART/p0-singbox-lifecycle.txt`。
+- **artifacts**：`$ART/p0-singbox-cmdline.txt`、`$ART/p0-singbox-process.txt`、`$ART/p0-singbox-lifecycle.txt`。
 
 ### P0-3 既有服务状态（决定 P1 分支与 P5 条件）
 
@@ -179,12 +190,13 @@ fi | tee "$ART/p0-monitor-status.txt"
 ### P0-7 生产备份文件仍在
 
 ```bash
-find /root/sbox -maxdepth 1 -name '*.bak.*' -printf '%f %s bytes %TY-%Tm-%Td\n' | sort | tee "$ART/p0-backups-before.txt"
+find /root/sbox -maxdepth 1 -name '*.bak.*' -printf '%f\n' | sort | tee "$ART/p0-backups-before.txt"   # 集合不变量输入：仅 basename、已排序（与 P4 同构）
+find /root/sbox -maxdepth 1 -name '*.bak.*' -printf '%f %s bytes %TY-%Tm-%Td\n' | sort | tee "$ART/p0-backups-info.txt"   # 信息性元数据（不参与集合比较）
 [ -s "$ART/p0-backups-before.txt" ] || echo 'NOTE: /root/sbox 下无 .bak.*（合法，仅记录）'
 ```
 
-- **PASS**：清单已记录（P4 要求 canary 后该集合**只增不减**）。
-- **artifacts**：`$ART/p0-backups-before.txt`。
+- **PASS**：清单已记录（P4 与 `p4-backups-after.txt` 以同构"仅 basename、已排序"格式做集合比较，要求该集合**只增不减**）。
+- **artifacts**：`$ART/p0-backups-before.txt`、`$ART/p0-backups-info.txt`。
 
 ### P0-8 service.api 与 monitor secret 锚点（不打印任何敏感值）
 
@@ -193,10 +205,15 @@ find /root/sbox -maxdepth 1 -name '*.bak.*' -printf '%f %s bytes %TY-%Tm-%Td\n' 
 stat -c '%U %G %a %s' /root/sbox/monitor-api.secret | tee "$ART/p0-anchors.txt"
 [ -s /root/sbox/monitor-api.secret ] || { echo 'FAIL: 根锚点空/缺失'; exit 1; }
 
-# (b) sbconfig_server.json：恰有一个监听 127.0.0.1:9091 的 service/api 块且 secret 非空（布尔输出）
-jq -e '[.. | objects | select(.listen? == "127.0.0.1:9091")] | length == 1' \
+# (b) sbconfig_server.json：恰有一个 monitor-api service 条目（127.0.0.1:9091）且 secret 非空（布尔输出）
+#     冻结基线形状（rev2.3）：.services[] 条目 tag=="monitor-api" / type=="api" /
+#     listen=="127.0.0.1" / listen_port==9091 / secret 非空
+jq -e '[.services[]? | select(.tag? == "monitor-api" and .type? == "api"
+        and .listen? == "127.0.0.1" and .listen_port? == 9091)] | length == 1' \
    /root/sbox/sbconfig_server.json | tee -a "$ART/p0-anchors.txt"
-jq -e '[.. | objects | select(.listen? == "127.0.0.1:9091" and ((.secret? // "") | length > 0))] | length == 1' \
+jq -e '[.services[]? | select(.tag? == "monitor-api" and .type? == "api"
+        and .listen? == "127.0.0.1" and .listen_port? == 9091
+        and ((.secret? // "") | length > 0))] | length == 1' \
    /root/sbox/sbconfig_server.json | tee -a "$ART/p0-anchors.txt"
 
 # (c) 派生 secret（若 monitor 已装）与根锚点字节一致（比较哈希，不比较内容）
@@ -210,8 +227,8 @@ else
 fi | tee -a "$ART/p0-anchors.txt"
 ```
 
-- **PASS**：根锚点 `root:root 0600` 非空；两条 jq 均为 `true`；派生 secret（若存在）哈希一致或元数据 `root:sboxweb 0640`。
-- **FAIL**：锚点缺失/非 0600、service.api secret 空、9091 块多于一个 → 停止（S0 基线不成立，先修环境，非本 canary 范围）。
+- **PASS**：根锚点 `root:root 0600` 非空；两条 jq 均为 `true`（恰一个 `monitor-api` service 条目且 secret 非空）；派生 secret（若存在）哈希一致或元数据 `root:sboxweb 0640`。
+- **FAIL**：锚点缺失/非 0600、service.api secret 空、`monitor-api` 条目缺失或多于一个 → 停止（S0 基线不成立，先修环境，非本 canary 范围）。
 - **artifacts**：`$ART/p0-anchors.txt`。
 
 ---
@@ -227,6 +244,9 @@ if [ -L /opt/singbox-monitor ] && [ -d /opt/singbox-monitor-releases ] && ls /op
 else
   bash monitor-v2/deploy/install-monitor.sh install --no-start   # fresh 首装 → 暂存部署，不启动
 fi | tee "$ART/p1-install.log"
+RC_INSTALL=${PIPESTATUS[0]}    # rev2.3：生产者退出码（pipefail 已全局启用；绝不采信 tee 的 rc）
+[ "$RC_INSTALL" -eq 0 ] || { echo "FAIL: install/upgrade rc=$RC_INSTALL"; exit 1; }
+printf 'install/upgrade rc=%s\n' "$RC_INSTALL" | tee -a "$ART/p1-install.log"
 ```
 
 ### P1-2 fresh 路径：启动前离线验证（`--no-start` 爆炸半径收紧）
@@ -270,7 +290,7 @@ systemctl is-enabled singbox-monitor   # 期望 disabled / 非 enabled —— en
 #   systemctl enable singbox-monitor（fresh 首装路径）
 ```
 
-- **PASS 条件**：install/upgrade 退出码 0；release 激活；fresh 路径下 `--no-start` 离线验证全过、显式 start 后 active 且 **非 enabled**；upgrade 路径下服务健康。
+- **PASS 条件**：install/upgrade 生产者退出码 `RC_INSTALL=0`（`${PIPESTATUS[0]}`，非 tee 的）；release 激活；fresh 路径下 `--no-start` 离线验证全过、显式 start 后 active 且 **非 enabled**；upgrade 路径下服务健康。
 - **FAIL 条件**：脚本 CRITICAL（exit 2）、回滚后未恢复、或 fresh 路径验证任一不符（含 9191 提前监听、sing-box 哈希/PID 在 start 前变化）。
 - **STOP 动作**：停止 canary，`status` + `history` 取证交人工；**绝不**手工修补 `/opt`、`/etc/systemd`。
 - **artifacts**：`$ART/p1-install.log`、`$ART/p1-releases.txt`、`$ART/p1-status.txt`、`$ART/p1-health.json`、`$ART/p1-history.txt`。
@@ -335,11 +355,13 @@ curl -fsS http://127.0.0.1:9191/api/v1/session | jq -r '.current_ip // "absent"'
 
 ```bash
 bash /root/canary-src/monitor-v2/deploy/install-monitor.sh health | tee "$ART/p2-health.json"
+RC_HEALTH=${PIPESTATUS[0]}    # rev2.3：生产者退出码（0=healthy / 2=degraded / 1=unhealthy）；tee 不得掩码
+printf 'health rc=%s\n' "$RC_HEALTH" | tee -a "$ART/p2-health.json"
 ```
 
-判定（`monitor-health` 语义，web 模式）：`overall == "healthy"`（退出码 0）；`api_reachable` 且 `api_url_valid`；`broker_health`：`present/wellformed/consumer_alive == true`、`age_stale/collector_stale/stale == false`（窗口 `ceil(5×poll+15)` 秒）；`web_http == "ok"`。
+判定（`monitor-health` 语义，web 模式）：`overall == "healthy"`（生产者退出码 `RC_HEALTH=0`）；`api_reachable` 且 `api_url_valid`；`broker_health`：`present/wellformed/consumer_alive == true`、`age_stale/collector_stale/stale == false`（窗口 `ceil(5×poll+15)` 秒）；`web_http == "ok"`。
 
-- **FAIL**：`degraded`（exit 2）→ 停 P3，`journalctl -u singbox-monitor -n 100 --no-pager` 取证；`unhealthy`（exit 1）→ 停止。
+- **FAIL**：`degraded`（`RC_HEALTH=2`）→ 停 P3，`journalctl -u singbox-monitor -n 100 --no-pager` 取证；`unhealthy`（`RC_HEALTH=1`）→ 停止。
 - **artifacts**：`$ART/p2-health.json`、`$ART/p2-journal-tail.txt`。
 
 ### P2-6 One Collector / One SnapshotBroker / One service.api consumer
@@ -446,7 +468,7 @@ for unit in UNITS:
 
 sys.exit(1 if fail else 0)
 PYEOF
-SCAN_RC=$?
+SCAN_RC=${PIPESTATUS[0]}   # rev2.3：生产者（python 扫描器）退出码，而非 tee 的
 printf 'scanner rc=%s\n' "$SCAN_RC" | tee -a "$ART/p2-journal-scan.txt"
 ```
 
@@ -467,7 +489,9 @@ rev2 取消的两个**无效不变量**（不得再作为门禁）："设备键�
 
 ```bash
 WEBAPP_DIR=$(tr '\0' '\n' < /proc/$MPID/cmdline | grep -m1 'webapp\.py' | xargs dirname)
-python3 "$WEBAPP_DIR/../collector.py" --url http://127.0.0.1:9091 \
+# rev2.3：webapp.py 与 collector.py 部署在同一目录（release 树 app/monitor-v2/）——同目录引用；
+#          等价替代 = 冻结 checkout 的 /root/canary-src/monitor-v2/collector.py
+python3 "$WEBAPP_DIR/collector.py" --url http://127.0.0.1:9091 \
   --secret-file /etc/singbox-monitor/api.secret --once --pretty > "$ART/p3-collector-once.json"
 jq -e '.stale == false and (.identity_conflicts // 0) == 0' "$ART/p3-collector-once.json" >/dev/null \
   || { echo 'FAIL: 探针 stale 或 identity_conflicts>0'; exit 1; }
@@ -497,7 +521,7 @@ EXPECT_INBOUND='vless-in' \
 REQUIRE_CLOSED=1 \
 LIFECYCLE_WINDOW=30 \
 bash tests/monitor-v2-integration-e1.sh 2>&1 | tee "$ART/p3-reality.log"
-RC_REALITY=$?
+RC_REALITY=${PIPESTATUS[0]}   # rev2.3：显式捕获生产者退出码（pipefail 之外的第二层明确性）
 printf 'reality canary rc=%s\n' "$RC_REALITY" | tee -a "$ART/p3-reality.log"
 
 # —— HY2 窗口：同样逐命令赋值，退出码独立捕获 ——
@@ -507,14 +531,14 @@ EXPECT_INBOUND='hy2-in' \
 REQUIRE_CLOSED=1 \
 LIFECYCLE_WINDOW=30 \
 bash tests/monitor-v2-integration-e1.sh 2>&1 | tee "$ART/p3-hy2.log"
-RC_HY2=$?
+RC_HY2=${PIPESTATUS[0]}      # rev2.3：显式捕获生产者退出码（pipefail 之外的第二层明确性）
 printf 'hy2 canary rc=%s\n' "$RC_HY2" | tee -a "$ART/p3-hy2.log"
 
 # —— 父 shell 无残留确认（rev2.1：取代 rev2 的 export + unset 方案）——
 [ -z "${BOX_API_SECRET:-}" ] && echo 'BOX_API_SECRET: not present in parent shell'
 ```
 
-**窗口纪律**：`<device>` 为现网真实逻辑设备名（如 `legacy`，与 P0-8 确认一致；名字不同只改环境变量值，不改脚本）；两窗口内存在瞬时第二个 service.api consumer（B4 受控例外）；**读取 secret 前必须 `[ -o xtrace ]` 确认 OFF**（xtrace 展开会把 `BOX_API_SECRET=…` 赋值行打上终端/journal）；**绝不 `set -x` / `echo "$BOX_API_SECRET"` / 把值写进任何文件、unit、history**；值经 `VAR=val cmd` 前缀赋值只进入该次子进程的 environment，**不出现在 argv**（`ps` 默认不可见）、**不进入父 shell**（无需 unset——根本没有赋值发生）；两个退出码 `RC_REALITY` / `RC_HY2` 独立捕获、独立记录（`pipefail` 保证 tee 不掩码脚本 rc）。
+**窗口纪律**：`<device>` 为现网真实逻辑设备名（如 `legacy`，与 P0-8 确认一致；名字不同只改环境变量值，不改脚本）；两窗口内存在瞬时第二个 service.api consumer（B4 受控例外）；**读取 secret 前必须 `[ -o xtrace ]` 确认 OFF**（xtrace 展开会把 `BOX_API_SECRET=…` 赋值行打上终端/journal）；**绝不 `set -x` / `echo "$BOX_API_SECRET"` / 把值写进任何文件、unit、history**；值经 `VAR=val cmd` 前缀赋值只进入该次子进程的 environment，**不出现在 argv**（`ps` 默认不可见）、**不进入父 shell**（无需 unset——根本没有赋值发生）；两个退出码 `RC_REALITY` / `RC_HY2` 独立捕获、独立记录（`pipefail` + `${PIPESTATUS[0]}` 双保险，tee 不可能掩码脚本 rc）。
 
 **等价备选（若操作员偏好显式子壳）**：不改冻结代码的等价安全法是包装子壳——`bash -c 'set +x; exec env BOX_API_SECRET="$(cat /etc/singbox-monitor/api.secret)" bash tests/monitor-v2-integration-e1.sh'`（`export`/`env` 赋值被限制在该子壳进程内，交互父 shell 同样零残留），窗口纪律与上述完全一致。`--secret-file` 路线需要改测试脚本（传参透传），**明确不采用**（不改冻结 runtime/test 代码）。
 
@@ -546,7 +570,7 @@ systemctl show sing-box -p MainPID -p NRestarts -p ExecMainStartTimestampMonoton
   > "$ART/p4-singbox-lifecycle.txt"
 diff "$ART/p0-singbox-lifecycle.txt" "$ART/p4-singbox-lifecycle.txt" \
   && echo 'LIFECYCLE INVARIANTS: UNCHANGED' || echo 'FAIL: LIFECYCLE INVARIANT CHANGED'
-tr '\0' ' ' < /proc/$SBPID/cmdline | diff - "$ART/p0-singbox-cmdline.txt" && echo 'CMDLINE: IDENTICAL'
+tr '\0' ' ' < /proc/$SBPID/cmdline | diff - "$ART/p0-singbox-cmdline.txt" && echo 'CMDLINE: IDENTICAL'   # rev2.3：基线 artifact 仅含 cmdline，同类逐字节比较
 
 # (3) sing-box journal：窗口内无任何生命周期操作痕迹
 journalctl -u sing-box --since "$T0" --no-pager \
@@ -560,8 +584,8 @@ ss -lntup > "$ART/p4-listeners.txt"; diff "$ART/p0-listeners.txt" "$ART/p4-liste
 grep -E '0\.0\.0\.0:9191|\[::\]:9191' "$ART/p4-listeners.txt" && echo 'FAIL: 9191 NOT LOOPBACK-ONLY' || echo '9191: LOOPBACK-ONLY'
 
 # (6) 生产备份集合只增不减
-find /root/sbox -maxdepth 1 -name '*.bak.*' -printf '%f\n' | sort > "$ART/p4-backups-after.txt"
-comm -23 "$ART/p0-backups-before.txt" <(awk '{print $1}' "$ART/p4-backups-after.txt" | sort) | grep . \
+find /root/sbox -maxdepth 1 -name '*.bak.*' -printf '%f\n' | sort > "$ART/p4-backups-after.txt"   # rev2.3：与 p0-backups-before.txt 同构（仅 basename、已排序）
+comm -23 "$ART/p0-backups-before.txt" "$ART/p4-backups-after.txt" | grep . \
   && echo 'FAIL: 生产备份文件减少' || echo 'BACKUPS: SUPERSET-OR-EQUAL'
 ```
 
@@ -585,6 +609,8 @@ comm -23 "$ART/p0-backups-before.txt" <(awk '{print $1}' "$ART/p4-backups-after.
 cd /root/canary-src
 bash monitor-v2/deploy/install-monitor.sh history | tee "$ART/p5-history-before.txt"
 bash monitor-v2/deploy/install-monitor.sh rollback | tee "$ART/p5-rollback.log"   # 或 rollback <release-id>
+RC_ROLLBACK=${PIPESTATUS[0]}    # rev2.3：生产者退出码；tee 不得掩码
+printf 'rollback rc=%s\n' "$RC_ROLLBACK" | tee -a "$ART/p5-rollback.log"
 bash monitor-v2/deploy/install-monitor.sh status  | tee "$ART/p5-status-after.txt"
 bash monitor-v2/deploy/install-monitor.sh health  | tee "$ART/p5-health-after.json"
 ```
@@ -605,7 +631,7 @@ diff "$ART/p0-hash-before.txt" <(sha256sum /root/sbox/sbconfig_server.json /root
 
 - **PASS 条件（REQUIRED）**：release 回到目标旧版；health == healthy；单例复位；sing-box 不变量集合与哈希不变。
 - **NOT APPLICABLE 路径**：report 中记录 `rollback drill: NOT APPLICABLE (fresh install, no previous successful release; transactional rollback covered by Linux CI)`，无需任何命令。
-- **FAIL 条件（REQUIRED）**：CRITICAL 退出 / health degraded / sing-box 不变量变化。
+- **FAIL 条件（REQUIRED）**：CRITICAL 退出（`RC_ROLLBACK != 0`）/ health degraded / sing-box 不变量变化。
 - **STOP 动作**：保留 `$ART/p5-*`；monitor 侧仅限再次 `rollback` 或 `install --repair`；**绝不**以"顺手重启 sing-box"排障。
 - **artifacts**：`$ART/p5-*`（NOT APPLICABLE 时仅在 report 记录判定依据）。
 
@@ -613,20 +639,20 @@ diff "$ART/p0-hash-before.txt" <(sha256sum /root/sbox/sbconfig_server.json /root
 
 ---
 
-## 8. Exact PASS/FAIL matrix（rev2.2）
+## 8. Exact PASS/FAIL matrix（rev2.3）
 
 | Phase | 检查项 | PASS 条件 | FAIL 条件 | STOP 动作 | 必留 artifacts |
 | --- | --- | --- | --- | --- | --- |
 | P0-1 | checkout==`$FROZEN` 且干净 | SHA 逐字符相等 + `status --porcelain` 空 | SHA 不符/脏工作区 | 人工核对，禁止继续 | `p0-checkout.txt` |
-| P0-2 | sing-box 进程身份 + 生命周期基线 | MainPID 有效；cmdline == `/root/sbox/sing-box … -c sbconfig_server.json`；NRestarts/monotonic 基线已录 | cmdline 漂移/手工进程 | 停止，先恢复 systemd 托管形态 | `p0-singbox-cmdline.txt` `p0-singbox-lifecycle.txt` |
+| P0-2 | sing-box 进程身份 + 生命周期基线 | MainPID 有效；cmdline == `/root/sbox/sing-box … -c sbconfig_server.json`；NRestarts/monotonic 基线已录 | cmdline 漂移/手工进程 | 停止，先恢复 systemd 托管形态 | `p0-singbox-cmdline.txt` `p0-singbox-process.txt` `p0-singbox-lifecycle.txt` |
 | P0-3 | 服务状态 + 分支判定 | sing-box active+enabled；fresh/upgrade 分支与 P5 条件（REQUIRED/NA）已定 | sing-box 非 active | 停止 | `p0-service-state.txt` |
 | P0-4 | 监听器基线 | 9091 仅回环；无非回环 9191 | 9091 非回环 / 9191 非回环占用 | 停止（安全前提不成立） | `p0-listeners.txt` |
 | P0-5 | 哈希基线 | 两文件哈希已记录 | 文件缺失 | 停止 | `p0-hash-before.txt` |
 | P0-6 | monitor 现状 | status 可读 | 脚本缺失/布局不完整 | 停止，回 P0-1 | `p0-monitor-status.txt` |
 | P0-7 | 生产备份在位 | 清单已记录 | —（记录型） | — | `p0-backups-before.txt` |
-| P0-8 | secret 锚点 | 根锚点 root:root 0600 非空；9091 块唯一且 secret 非空；派生一致 | 锚点缺失/0600 违例/secret 空/块重复 | 停止（S0 基线不成立） | `p0-anchors.txt` |
-| P1（fresh） | `install --no-start` + 离线验证 + 显式 start | 退出码 0；release 树/symlink/unit/monitor.conf/派生 secret 就位；**9191 尚未监听**；sing-box 哈希/PID 在 start 前不变；start 后 active 且**非 enabled** | 任一离线验证不符；提前监听；enable 发生 | 停止取证，禁止手工修补 | `p1-install.log` `p1-releases.txt` |
-| P1（已有部署） | upgrade | 退出码 0；release 激活；health 可执行 | CRITICAL / 回滚后未恢复 | 停止，`status`+`history` 取证 | `p1-install.log` `p1-status.txt` `p1-health.json` `p1-history.txt` |
+| P0-8 | secret 锚点 | 根锚点 root:root 0600 非空；`monitor-api` service 条目唯一且 secret 非空；派生一致 | 锚点缺失/0600 违例/secret 空/`monitor-api` 条目缺失或重复 | 停止（S0 基线不成立） | `p0-anchors.txt` |
+| P1（fresh） | `install --no-start` + 离线验证 + 显式 start | `RC_INSTALL=0`（PIPESTATUS[0]）；release 树/symlink/unit/monitor.conf/派生 secret 就位；**9191 尚未监听**；sing-box 哈希/PID 在 start 前不变；start 后 active 且**非 enabled** | 任一离线验证不符；提前监听；enable 发生 | 停止取证，禁止手工修补 | `p1-install.log` `p1-releases.txt` |
+| P1（已有部署） | upgrade | `RC_INSTALL=0`（PIPESTATUS[0]）；release 激活；health 可执行 | CRITICAL / 回滚后未恢复 | 停止，`status`+`history` 取证 | `p1-install.log` `p1-status.txt` `p1-health.json` `p1-history.txt` |
 | P2-1 | 服务身份 sboxweb | 属主 sboxweb；cmdline=webapp serve 回环 + `--secret-file`（无 secret 值） | 身份/绑定/argv 违例 | 停止，journal 取证 | `p2-monitor-cmdline.txt` |
 | P2-2/3 | 9091/9191 回环 | 9091=sing-box、9191=monitor 且均 127.0.0.1 | 任一非回环 | 停止 | `p2-listener-*.txt` |
 | P2-4 | `/api/v1/session`（R1.1 最小形状） | 200；authenticated/whitelist_allowed 为 bool、version 非空；可选字段存在时类型正确；**额外字段不 FAIL** | 强制字段缺失/类型错；非 200/404/401/500 | 停止 | `p2-session-check.txt` |
@@ -634,16 +660,16 @@ diff "$ART/p0-hash-before.txt" <(sha256sum /root/sbox/sbconfig_server.json /root
 | P2-6 | 三单例 | webapp==1；9091 ESTAB 属主 $MPID==1 | 计数≠1（非 P3 窗口） | 仅允许 `systemctl restart singbox-monitor` | `p2-singleton.txt` |
 | P2-7 | journal 泄漏（内存态精确值硬门禁，private-key 三层检测） | 双单元四类别计数全 0（`service_api_secret_matches/reality_uuid_matches/hy2_password_matches/reality_private_key_matches`）且 scanner rc=0；private_key = 全值 + JSON 转义 + 逐行 key material 三层覆盖；空模式不可能产生；缺料 fail-closed；**零 secret 落盘** | 任一类别计数>0 / 预期材料缺失 / scanner 非零 | FAIL + STOP；journal 封存（0600）人工分析 | `p2-journal-scan.txt`（仅四类别计数与 rc） |
 | P3-0 | 快照结构健全性 | stale=false；identity_conflicts=0；行含 id/user/inbound | stale / identity_conflicts>0 | 停止，快照取证 | `p3-collector-once.json` `p3-structure.txt` |
-| P3-1/2 | strict 双 canary（逐命令临时环境窗口） | `RC_REALITY=0` 且 `RC_HY2=0`（独立捕获，pipefail）；读取 secret 前 xtrace 确认 OFF；窗口纪律无违规；父 shell 无 `BOX_API_SECRET` 残留 | FAIL(1)/INCONCLUSIVE(2)/xtrace ON/纪律违规/父 shell 残留 | 停止，保留 p3 日志；处置仅限 restart monitor | `p3-reality.log` `p3-hy2.log` |
+| P3-1/2 | strict 双 canary（逐命令临时环境窗口） | `RC_REALITY=0` 且 `RC_HY2=0`（独立捕获，pipefail + PIPESTATUS[0]）；读取 secret 前 xtrace 确认 OFF；窗口纪律无违规；父 shell 无 `BOX_API_SECRET` 残留 | FAIL(1)/INCONCLUSIVE(2)/xtrace ON/纪律违规/父 shell 残留 | 停止，保留 p3 日志；处置仅限 restart monitor | `p3-reality.log` `p3-hy2.log` |
 | P3-收尾 | 窗口后单例复位 | §P2-6 复检 1/1 | 不复位 | 停止 | `p2-singleton.txt`（复检） |
 | P4 | 隔离证明（不变量集合） | 哈希一致；MainPID/NRestarts/monotonic/cmdline/journal-lifecycle/监听 diff/备份超集全过；措辞 = "no evidence of restart/reload; all lifecycle/config invariants unchanged" | 任一不变量变化（breach） | 立即停止封存；不自行修复 sing-box | `p4-*` |
-| P5 | 回滚 drill（条件性） | REQUIRED：旧 release 恢复 + healthy + 单例复位 + sing-box 不变量不变。NOT APPLICABLE：fresh 且无既往 release（如实记录，不制造 release） | CRITICAL / degraded / sing-box 变化 | 保留 `p5-*`；monitor 侧仅限再次 rollback / `install --repair` | `p5-*` / report 记录 |
+| P5 | 回滚 drill（条件性） | REQUIRED：旧 release 恢复 + healthy + 单例复位 + sing-box 不变量不变。NOT APPLICABLE：fresh 且无既往 release（如实记录，不制造 release） | `RC_ROLLBACK≠0` / degraded / sing-box 变化 | 保留 `p5-*`；monitor 侧仅限再次 rollback / `install --repair` | `p5-*` / report 记录 |
 
 全局规则：**INCONCLUSIVE ≠ PASS**；任一阶段 FAIL 不得跳入下一阶段；重试仅对 P1（脚本事务性重试）合法。
 
 ---
 
-## 9. Risk table（rev2.2）
+## 9. Risk table（rev2.3）
 
 | # | 风险 | 概率 | 影响 | 缓解 | 残留 |
 | --- | --- | --- | --- | --- | --- |
@@ -659,15 +685,17 @@ diff "$ART/p0-hash-before.txt" <(sha256sum /root/sbox/sbconfig_server.json /root
 | R10 | VPS 实况与假设不符（B2/B3） | 中 | 门禁 FAIL（提前停止） | P0 全量预检 FAIL-fast | 无（设计即停） |
 | R11（rev2.1） | canary 子进程环境内含 secret（逐命令临时赋值） | 确定（设计内、有界、单命令生命周期） | 子进程存续期间环境含 secret | 值仅经 `BOX_API_SECRET=… cmd` 逐命令赋值进入该次子进程（冻结代码官方鉴权通道）；**绝不进入父 shell**；读取前强制 xtrace OFF；不 echo、不进 argv、不持久化；Reality/HY2 退出码独立捕获（pipefail）；与生产 service 文件传递 + `env -u` 契约严格区分 | 子进程存续期间的环境内存驻留（秒级、单管理员 SSH 会话内，可接受） |
 | R12（rev2.2） | 扫描器进程内存中驻留敏感值 | 确定（P2-7 期间） | 内存态敏感值集合 | 敏感值仅存在于 Python 扫描器进程内存（标准库、root、短命），进程退出即消失；**零落盘临时文件**（grep -F -f 模式文件方案已废除）；只输出四类别聚合计数，绝不打印值/命中行/子串；预期类别缺料时 fail-closed | 无磁盘残留；仅进程内存（秒级） |
+| R13（rev2.3） | tee 掩码生产者退出码导致 FAIL 误判为 PASS | 低 | 门禁误判（假 PASS，直接威胁判定可信度） | 会话全局 `set -o pipefail` + 全部门禁管道（install/upgrade、health、journal 扫描器、E1 canary、rollback）显式 `${PIPESTATUS[0]}` 捕获 | 无 |
 
 ---
 
-## 10. 为最终获批 canary 提议的命令清单（rev2.2 汇总）
+## 10. 为最终获批 canary 提议的命令清单（rev2.3 汇总）
 
 > 以下为**将来获批后**的执行序列；今日不执行（READ-ONLY 文档交付）。判定一律以 §8 矩阵为准。
 
 ```bash
 # —— 会话准备 ——
+set -o pipefail   # rev2.3：全局启用；门禁管道另显式捕获 PIPESTATUS[0]
 export FROZEN=3ee9a162a3fb53d9fddc95cb6eba95b3bcc5702e
 export ART=/root/canary-artifacts-$(date -u +%Y%m%dT%H%M%SZ); mkdir -m 0700 -p "$ART"
 export T0=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -681,10 +709,10 @@ systemctl show sing-box -p MainPID -p NRestarts -p ExecMainStartTimestampMonoton
 systemctl is-active sing-box; systemctl is-enabled sing-box
 ss -lntup > "$ART/p0-listeners.txt"
 sha256sum /root/sbox/sbconfig_server.json /root/sbox/config | tee "$ART/p0-hash-before.txt"
-find /root/sbox -maxdepth 1 -name '*.bak.*' -printf '%f %s %TY-%Tm-%Td\n' | sort | tee "$ART/p0-backups-before.txt"
+find /root/sbox -maxdepth 1 -name '*.bak.*' -printf '%f\n' | sort | tee "$ART/p0-backups-before.txt"; find /root/sbox -maxdepth 1 -name '*.bak.*' -printf '%f %s %TY-%Tm-%Td\n' | sort | tee "$ART/p0-backups-info.txt"
 stat -c '%U %G %a %s' /root/sbox/monitor-api.secret
-jq -e '[.. | objects | select(.listen? == "127.0.0.1:9091")] | length == 1' /root/sbox/sbconfig_server.json
-jq -e '[.. | objects | select(.listen? == "127.0.0.1:9091" and ((.secret? // "") | length > 0))] | length == 1' /root/sbox/sbconfig_server.json
+jq -e '[.services[]? | select(.tag? == "monitor-api" and .type? == "api" and .listen? == "127.0.0.1" and .listen_port? == 9091)] | length == 1' /root/sbox/sbconfig_server.json
+jq -e '[.services[]? | select(.tag? == "monitor-api" and .type? == "api" and .listen? == "127.0.0.1" and .listen_port? == 9091 and ((.secret? // "") | length > 0))] | length == 1' /root/sbox/sbconfig_server.json
 
 # —— P1：分支（fresh vs 已有部署）——
 if [ -L /opt/singbox-monitor ] && [ -d /opt/singbox-monitor-releases ]; then
@@ -713,16 +741,16 @@ ss -ntp 'dport = :9091' | grep -c "pid=$MPID,"  # 期望 1
 
 # —— P3 identity validation（逐命令临时环境鉴权窗口）——
 WEBAPP_DIR=$(tr '\0' '\n' < /proc/$MPID/cmdline | grep -m1 'webapp\.py' | xargs dirname)
-python3 "$WEBAPP_DIR/../collector.py" --url http://127.0.0.1:9091 --secret-file /etc/singbox-monitor/api.secret --once --pretty > "$ART/p3-collector-once.json"
+python3 "$WEBAPP_DIR/collector.py" --url http://127.0.0.1:9091 --secret-file /etc/singbox-monitor/api.secret --once --pretty > "$ART/p3-collector-once.json"   # rev2.3：同目录（app/monitor-v2/）；备选 /root/canary-src/monitor-v2/collector.py
 jq -e '.stale == false and (.identity_conflicts // 0) == 0' "$ART/p3-collector-once.json"
 
 [ -o xtrace ] && { echo 'FAIL: xtrace must be OFF'; exit 1; }
 set +x; set -o pipefail
 BOX_API_SECRET="$(cat /etc/singbox-monitor/api.secret)" EXPECT_USER='<device>' EXPECT_INBOUND='vless-in' REQUIRE_CLOSED=1 LIFECYCLE_WINDOW=30 \
-  bash tests/monitor-v2-integration-e1.sh 2>&1 | tee "$ART/p3-reality.log"; RC_REALITY=$?
+  bash tests/monitor-v2-integration-e1.sh 2>&1 | tee "$ART/p3-reality.log"; RC_REALITY=${PIPESTATUS[0]}
 printf 'reality rc=%s\n' "$RC_REALITY" | tee -a "$ART/p3-reality.log"
 BOX_API_SECRET="$(cat /etc/singbox-monitor/api.secret)" EXPECT_USER='<device>' EXPECT_INBOUND='hy2-in' REQUIRE_CLOSED=1 LIFECYCLE_WINDOW=30 \
-  bash tests/monitor-v2-integration-e1.sh 2>&1 | tee "$ART/p3-hy2.log"; RC_HY2=$?
+  bash tests/monitor-v2-integration-e1.sh 2>&1 | tee "$ART/p3-hy2.log"; RC_HY2=${PIPESTATUS[0]}
 printf 'hy2 rc=%s\n' "$RC_HY2" | tee -a "$ART/p3-hy2.log"
 [ -z "${BOX_API_SECRET:-}" ] && echo 'BOX_API_SECRET: not present in parent shell'
 # 窗口后复检单例（P2-6 两条）
@@ -748,7 +776,7 @@ bash monitor-v2/deploy/install-monitor.sh status; bash monitor-v2/deploy/install
 ## 11. Final PASS/FAIL report template（P6，canary 执行后填写）
 
 ```markdown
-# Monitor v2 VPS Canary — Final Report (Round 2, rev2.2)
+# Monitor v2 VPS Canary — Final Report (Round 2, rev2.3)
 
 - date (UTC): <YYYY-MM-DDTHH:MM:SSZ>
 - frozen head verified: 3ee9a162a3fb53d9fddc95cb6eba95b3bcc5702e  [PASS/FAIL]
@@ -784,10 +812,10 @@ bash monitor-v2/deploy/install-monitor.sh status; bash monitor-v2/deploy/install
 
 ---
 
-## 12. 交付核对（rev2.2）
+## 12. 交付核对（rev2.3）
 
-- [x] 最终 runbook（P0–P6，rev2 → rev2.1 → rev2.2 修订：R1.1 session 契约、逐命令临时环境鉴权窗口、身份门禁重构、fresh 爆炸半径收紧、条件性回滚 drill、不变量集合证据措辞、内存态精确敏感值泄漏扫描器、**private-key 三层检测 + 四类别固定计数 + 缺料 fail-closed**）
-- [x] 风险表（R1–R12）
+- [x] 最终 runbook（P0–P6，rev2 → rev2.1 → rev2.2 → rev2.3 修订：R1.1 session 契约、逐命令临时环境鉴权窗口、身份门禁重构、fresh 爆炸半径收紧、条件性回滚 drill、不变量集合证据措辞、内存态精确敏感值泄漏扫描器、**private-key 三层检测 + 四类别固定计数 + 缺料 fail-closed**；rev2.3 = PR #18 独立 review follow-up：service.api 基线形状、全局 pipefail + PIPESTATUS 纪律、collector 同目录路径、cmdline artifact 拆分、备份集合同构比较）
+- [x] 风险表（R1–R13）
 - [x] 精确 PASS/FAIL 矩阵（§8，逐项含 STOP 动作与 artifacts）
 - [x] 获批 canary 的命令清单（§10）
 - [x] 发现的事项（B1–B5，均定性为流程性前置/受控例外/记录项，无阻断性技术 blocker）
@@ -798,7 +826,7 @@ bash monitor-v2/deploy/install-monitor.sh status; bash monitor-v2/deploy/install
 ---
 
 **Monitor v2 VPS Canary Runbook**
-revision: **rev2.2**
+revision: **rev2.3**
 
 private-key full-value scan: PASS
 private-key linewise-material scan: PASS
