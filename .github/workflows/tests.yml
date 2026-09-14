@@ -7,7 +7,15 @@ on:
 
 jobs:
   bash-suites:
-    runs-on: ubuntu-latest
+    # Compatibility matrix: the three supported Ubuntu LTS baselines. Every
+    # suite below runs against each baseline's DEFAULT python3 and systemd
+    # (capability detection is exercised by the code under test; the matrix
+    # proves the defaults really work).
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04, ubuntu-26.04]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -16,6 +24,13 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y jq shellcheck
           flock --version || sudo apt-get install -y util-linux
+
+      - name: Environment diagnostics (no secrets)
+        run: |
+          . /etc/os-release && printf 'os=%s %s\n' "$ID" "$VERSION_ID"
+          python3 --version
+          systemd --version | head -n1
+          uname -r
 
       - name: bash -n (all shell sources)
         run: |
@@ -29,6 +44,14 @@ jobs:
           bash -n tests/test-monitor-v2-e2.sh
           bash -n tests/test-monitor-v2-e4.sh
           bash -n tests/test-legacy-config-transactions.sh
+          bash -n tests/test-existing-api-auth-migration.sh
+          bash -n tests/test-journal-time-compat.sh
+          bash -n tests/lib/journal-time.sh
+          bash -n tests/lib/mock-flock.sh
+          bash -n tests/test-monitor-packaging.sh
+
+      - name: "Journal time compatibility regression suite (B6 finding: raw RFC3339 rejected by Ubuntu 22.04 journalctl)"
+        run: bash tests/test-journal-time-compat.sh
 
       - name: Phase C regression suite
         run: bash tests/test-phase-c.sh
@@ -42,6 +65,9 @@ jobs:
       - name: Legacy config transaction hardening regression suite (real flock on Linux)
         run: bash tests/test-legacy-config-transactions.sh
 
+      - name: Existing service.api auth migration regression suite (narrow S0 migration)
+        run: bash tests/test-existing-api-auth-migration.sh
+
       - name: E1 collector regression suite
         run: bash tests/test-monitor-v2-e1.sh
 
@@ -51,5 +77,30 @@ jobs:
       - name: E4 Mihomo enrichment regression suite
         run: bash tests/test-monitor-v2-e4.sh
 
+      - name: Packaging/deployment regression suite (incl. runtime command preflight fail-closed)
+        run: bash tests/test-monitor-packaging.sh
+
+      - name: systemd unit + hardening directive validation (portable supported subset)
+        run: |
+          set -o pipefail
+          UNIT="$RUNNER_TEMP/singbox-monitor.service"
+          sed -e 's|@SBMON_USER@|sboxweb|g' \
+              -e 's|@SBMON_GROUP@|sboxweb|g' \
+              -e 's|@SBMON_APP_DIR@|/opt/singbox-monitor|g' \
+              -e 's|@SBMON_CONF@|/etc/singbox-monitor/monitor.conf|g' \
+              -e 's|@SBMON_STATE_ROOT@|/var/lib/singbox-monitor|g' \
+              monitor-v2/deploy/singbox-monitor.service.in > "$UNIT"
+          systemd-analyze verify "$UNIT" 2>&1 | tee "$RUNNER_TEMP/unit-verify.log"
+          # Never silently ignore an unsupported security-critical directive:
+          # systemd reports ignored/unknown keys as warnings in verify output.
+          if grep -Eqi 'unknown key|unsupported|not supported|failed to parse' "$RUNNER_TEMP/unit-verify.log"; then
+            echo "::error::systemd on ${{ matrix.os }} rejected or ignored a directive in the production unit"
+            exit 1
+          fi
+          # Hardening exposure level is informational (scored); the run still
+          # proves every hardening directive parses on this baseline.
+          systemd-analyze security --offline=yes "$UNIT" | tee "$RUNNER_TEMP/unit-security.log" \
+            || echo "note: offline security analysis not available on this systemd"
+
       - name: Integration regression complete (all prior steps green)
-        run: "echo 'Phase C + Phase D + S0 + E1 + E2 + E4: all green on Linux'"
+        run: "echo 'Phase C + Phase D + S0 + Legacy + E1 + E2 + E4 + Packaging + existing-api-auth migration + journal-time compat: all green on ${{ matrix.os }}'"

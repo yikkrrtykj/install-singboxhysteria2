@@ -85,6 +85,60 @@ sbmon_die() { printf '[sbmon] ERROR: %s\n' "$*" >&2; exit 1; }
 sbmon_critical() { printf '[sbmon] CRITICAL: %s\n' "$*" >&2; exit 2; }
 
 # ---------------------------------------------------------------------------
+# Compatibility preflight (capability detection -- never /etc/os-release
+# version branching; supported baselines: Ubuntu 22.04 / 24.04 / 26.04 LTS).
+# Every mutating command fails CLOSED on a missing required dependency,
+# BEFORE any filesystem/service mutation, with a single clear diagnostic.
+# SBMON_REQUIRED_COMMANDS may override the extra-command set for fixtures;
+# setting it (even to empty) replaces the default entirely. The configured
+# wrappers (SBMON_PYTHON3 / SBMON_SYSTEMCTL / SBMON_FLOCK) are always checked
+# as themselves, since those are the exact binaries the deployment executes.
+# ---------------------------------------------------------------------------
+sbmon_required_command_list() {
+    printf '%s\n' "$SBMON_PYTHON3" "$SBMON_SYSTEMCTL" "$SBMON_FLOCK"
+    if [ "${SBMON_REQUIRED_COMMANDS+x}" = x ]; then
+        # shellcheck disable=SC2086  # intentional word split of the override list
+        printf '%s\n' ${SBMON_REQUIRED_COMMANDS}
+    else
+        printf '%s\n' journalctl jq ss stat sha256sum mktemp
+    fi
+}
+
+sbmon_preflight_commands() {
+    local missing="" cmd
+    while IFS= read -r cmd; do
+        [ -n "$cmd" ] || continue
+        case "$cmd" in
+            */*) [ -x "$cmd" ] || missing="$missing $cmd" ;;
+            *)   command -v "$cmd" >/dev/null 2>&1 || missing="$missing $cmd" ;;
+        esac
+    done < <(sbmon_required_command_list)
+    if [ -n "$missing" ]; then
+        sbmon_die "缺少必需依赖命令:${missing}（preflight fail-closed，未做任何更改；请安装提供这些命令的软件包）"
+    fi
+}
+
+# Environment diagnostics for deploy/canary records -- NO secrets, no conf
+# values, no paths that could carry sensitive material.
+sbmon_record_environment() {
+    if [ -r /etc/os-release ]; then
+        local os_id os_ver
+        os_id="$(sed -n 's/^ID=//p' /etc/os-release | head -n1 | tr -d '"' || true)"
+        os_ver="$(sed -n 's/^VERSION_ID=//p' /etc/os-release | head -n1 | tr -d '"' || true)"
+        sbmon_info "environment os=${os_id:-unknown} ${os_ver:-unknown}"
+    else
+        sbmon_info "environment os-release unreadable"
+    fi
+    "$SBMON_PYTHON3" --version 2>&1 | sed 's/^/[sbmon] environment /' || true
+    "$SBMON_SYSTEMCTL" --version 2>/dev/null | head -n1 | sed 's/^/[sbmon] environment /' || true
+    if command -v ssh >/dev/null 2>&1; then
+        ssh -V 2>&1 | sed 's/^/[sbmon] environment /' || true
+    fi
+    sbmon_info "environment kernel=$(uname -r)"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # P4: deployment serialization lock (mutating commands only)
 # ---------------------------------------------------------------------------
 sbmon_acquire_deploy_lock() {

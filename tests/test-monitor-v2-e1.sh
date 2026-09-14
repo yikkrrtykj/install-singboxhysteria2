@@ -22,7 +22,7 @@ PASS=0
 FAIL=0
 # The gate at the bottom of this file fails unless exactly this many
 # assertions ran AND passed, so unreachable sections can never fake success.
-EXPECTED_PASS=188
+EXPECTED_PASS=213
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
@@ -641,6 +641,8 @@ assert_contains "configuration error" "$INTEG_SRC" "invalid gate config is a con
 assert_contains "baseline.json" "$INTEG_SRC" "integration captures a pre-window baseline"
 assert_contains "lifecycle_gate.py" "$INTEG_SRC" "integration delegates verdicts to the gate evaluator"
 assert_contains "no CLOSED/finalize evidence observed" "$INTEG_SRC" "integration carries the CLOSED fail reason"
+assert_contains "CLOSE_GRACE_WINDOW" "$INTEG_SRC" "integration wires CLOSE_GRACE_WINDOW"
+assert_contains "grace_final" "$GATE_SRC" "gate evaluator implements the grace snapshot contract"
 assert_contains "recent_connections" "$GATE_SRC" "gate uses recent_connections ids (closed-id delta)"
 assert_contains "uplink_total" "$GATE_SRC" "gate compares uplink totals (traffic delta)"
 assert_contains "downlink_total" "$GATE_SRC" "gate compares downlink totals (traffic delta)"
@@ -852,6 +854,22 @@ assert_eq "$?" "2" "CLI: nothing observed in-window exits 2 (INCONCLUSIVE)"
 "$PY" "$GATE" --baseline "$TMP/gate-base.json" --final "$TMP/gate-final.json" \
     --require-closed 2 >/dev/null 2>&1
 assert_eq "$?" "1" "CLI: REQUIRE_CLOSED=2 is a configuration error (exit 1)"
+# G4-grace: CLI grace inputs. gate-final is the "eligible" primary shape
+# (traffic delta + active, no new closed id).
+printf '%s' '{"stale": false, "identity_conflicts": 0, "recently_closed": 2, "active_connections": 0, "devices": {"legacy": {"status": "RECENT ACTIVITY", "uplink_total": 250, "downlink_total": 80, "protocols": {"vless-in": {}}, "active_connections": 0, "recent_connections": [{"id": "old1", "inbound": "vless-in", "source": "203.0.113.9:51000", "uplink_total": 0.0, "downlink_total": 0.0}, {"id": "new9", "inbound": "vless-in", "source": "203.0.113.9:51000", "uplink_total": 0.0, "downlink_total": 0.0}]}}}' > "$TMP/gate-grace-pass.json"
+"$PY" "$GATE" --baseline "$TMP/gate-base.json" --final "$TMP/gate-final.json" \
+    --grace-final "$TMP/gate-grace-pass.json" \
+    --expect-user legacy --require-closed 1 >"$TMP/gate-cli4.txt" 2>&1
+assert_eq "$?" "0" "CLI: grace window with a new closed id resolves the sole CLOSED failure (exit 0)"
+"$PY" "$GATE" --baseline "$TMP/gate-base.json" --final "$TMP/gate-final.json" \
+    --grace-final "$TMP/gate-final.json" \
+    --expect-user legacy --require-closed 1 >"$TMP/gate-cli5.txt" 2>&1
+assert_eq "$?" "1" "CLI: grace window timeout without a new closed id exits 1"
+"$PY" "$GATE" --baseline "$TMP/gate-base.json" --final "$TMP/gate-final.json" \
+    --expect-user legacy --require-closed 1 >"$TMP/gate-cli6.txt" 2>&1
+assert_eq "$?" "1" "CLI: primary-only run still exits 1"
+assert_contains "GRACE_ELIGIBLE" "$(cat "$TMP/gate-cli6.txt")" "CLI: grace-eligible primary failure is marked GRACE_ELIGIBLE"
+assert_not_contains "GRACE_ELIGIBLE" "$(cat "$TMP/gate-cli5.txt")" "CLI: grace-verdict output never re-marks GRACE_ELIGIBLE"
 
 section "G5: inbound-scoped evidence -- USER + INBOUND (cases L1-L4 + combo)"
 snap="$(PYTHONPATH="$ROOT/monitor-v2" "$PY" -c '
@@ -984,6 +1002,141 @@ integ_out="$(SING_BOX_BIN="$TMP/dummy-sing-box" API_URL="$DEAD_URL" bash "$INTEG
 integ_rc=$?
 assert_eq "$integ_rc" "0" "no gates + dummy binary + API unreachable -> SKIP exit 0"
 assert_contains "SKIP" "$integ_out" "observational run still SKIPs on a dead API"
+
+section "G7: CLOSE_GRACE_WINDOW semantics -- sole-missing-item contract"
+snap="$(PYTHONPATH="$ROOT/monitor-v2" "$PY" -c '
+import json
+from lifecycle_gate import evaluate
+
+def duo(vless_up, vless_down, hy2_up, hy2_down,
+        vless_recent=(), hy2_recent=(), vless_active=0, hy2_active=0):
+    def proto(up, down, active):
+        return {"active_connections": active,
+                "uplink_total": float(up), "downlink_total": float(down)}
+    recents = ([{"id": cid, "inbound": "vless-in", "source": "203.0.113.9:51000",
+                 "uplink_total": 0.0, "downlink_total": 0.0}
+                for cid in vless_recent]
+               + [{"id": cid, "inbound": "hy2-in", "source": "203.0.113.9:51001",
+                   "uplink_total": 0.0, "downlink_total": 0.0}
+                  for cid in hy2_recent])
+    status = "ACTIVE" if (vless_active or hy2_active) else \
+        ("RECENT ACTIVITY" if recents else "IDLE")
+    return {
+        "status": status,
+        "protocols": {"vless-in": proto(vless_up, vless_down, vless_active),
+                      "hy2-in": proto(hy2_up, hy2_down, hy2_active)},
+        "active_connections": vless_active + hy2_active,
+        "uplink_total": float(vless_up + hy2_up),
+        "downlink_total": float(vless_down + hy2_down),
+        "recent_sources": ["203.0.113.9:51000", "203.0.113.9:51001"] if recents else [],
+        "recent_connections": recents,
+    }
+
+def snap(devices=(), stale=False, identity_conflicts=0):
+    return {
+        "stale": stale, "last_error": None, "batch_count": 1,
+        "identity_conflicts": identity_conflicts,
+        "active_connections": sum(d[1]["active_connections"] for d in devices),
+        "recently_closed": sum(len(d[1]["recent_connections"]) for d in devices),
+        "devices": {name: dev for name, dev in devices},
+    }
+
+out = {}
+base = snap([("legacy", duo(100, 50, 200, 60))])
+# Primary window shape: hy2 traffic delta + hy2 still ACTIVE, no new closed
+# id -> the CLOSED gate is the SOLE failure (grace eligible).
+primary = snap([("legacy", duo(100, 50, 260, 66, hy2_active=1))])
+
+# GR1: grace snapshot carries a NEW hy2-in closed id -> PASS (exit 0)
+grace_pass = snap([("legacy", duo(100, 50, 260, 66, hy2_recent=("h9",)))])
+r = evaluate(base, primary, "legacy", "hy2-in", True, grace_final=grace_pass)
+out["GR1_verdict"] = r["verdict"]; out["GR1_exit"] = r["exit"]
+
+# GR2: grace timeout without a new id -> FAIL
+grace_idle = snap([("legacy", duo(100, 50, 260, 66, hy2_active=1))])
+r = evaluate(base, primary, "legacy", "hy2-in", True, grace_final=grace_idle)
+out["GR2_verdict"] = r["verdict"]; out["GR2_reason"] = r["reason"]
+
+# GR3: stale grace snapshot -> FAIL even though a new id appeared
+r = evaluate(base, primary, "legacy", "hy2-in", True,
+             grace_final=snap([("legacy", duo(100, 50, 260, 66, hy2_recent=("h9",)))],
+                              stale=True))
+out["GR3_verdict"] = r["verdict"]; out["GR3_reason"] = r["reason"]
+
+# GR4: a sibling-protocol (vless-in) closure can NOT satisfy the hy2 grace gate
+grace_sibling = snap([("legacy", duo(100, 50, 260, 66, vless_recent=("v1",)))])
+r = evaluate(base, primary, "legacy", "hy2-in", True, grace_final=grace_sibling)
+out["GR4_verdict"] = r["verdict"]
+
+# GR5: an active connection (or sibling closure + active) is NEVER a
+# substitute for a CLOSED/finalize inside the grace window
+grace_active = snap([("legacy", duo(100, 50, 260, 66,
+                                    vless_recent=("v1",), vless_active=1,
+                                    hy2_active=1))])
+r = evaluate(base, primary, "legacy", "hy2-in", True, grace_final=grace_active)
+out["GR5_verdict"] = r["verdict"]
+
+# GR6: identity gate failure during grace -> FAIL even with a new id
+grace_identity = snap([("legacy", duo(100, 50, 260, 66, hy2_recent=("h9",)))],
+                      identity_conflicts=7)
+r = evaluate(base, primary, "legacy", "hy2-in", True, grace_final=grace_identity)
+out["GR6_verdict"] = r["verdict"]; out["GR6_reason"] = r["reason"]
+
+# GR7: grace can NOT rescue a primary-window traffic failure: the primary
+# window lacks a traffic delta AND a closure -> grace is never entered.
+primary_no_traffic = snap([("legacy", duo(100, 50, 200, 60, hy2_active=1))])
+r = evaluate(base, primary_no_traffic, "legacy", "hy2-in", True,
+             grace_final=grace_pass)
+out["GR7_verdict"] = r["verdict"]; out["GR7_reason"] = r["reason"]
+
+# GR8: a primary PASS stays a PASS; the grace snapshot is never re-judged
+primary_pass = snap([("legacy", duo(100, 50, 260, 66, hy2_recent=("h9",)))])
+r = evaluate(base, primary_pass, "legacy", "hy2-in", True,
+             grace_final=grace_idle)
+out["GR8_verdict"] = r["verdict"]; out["GR8_exit"] = r["exit"]
+
+# GR9: baseline replayed ids stay dead evidence inside the grace window:
+# only h1 was ever seen, so nothing new -> timeout FAIL
+base_replay = snap([("legacy", duo(100, 50, 200, 60, hy2_recent=("h1",)))])
+primary_replay = snap([("legacy", duo(100, 50, 260, 66,
+                                      hy2_recent=("h1",), hy2_active=1))])
+grace_replay = snap([("legacy", duo(100, 50, 260, 66, hy2_recent=("h1",)))])
+r = evaluate(base_replay, primary_replay, "legacy", "hy2-in", True,
+             grace_final=grace_replay)
+out["GR9_verdict"] = r["verdict"]
+
+# Eligibility flags (evaluate WITHOUT grace_final):
+# the sole-CLOSED-failure shape is eligible...
+r = evaluate(base, primary, "legacy", "hy2-in", True)
+out["E_D_eligible"] = str(r.get("grace_eligible"))
+# ...a traffic failure (2 FAIL lines) is NOT...
+r = evaluate(base, primary_no_traffic, "legacy", "hy2-in", True)
+out["E_traffic_eligible"] = str(r.get("grace_eligible"))
+# ...and a sibling-only closure (CLOSED + lifecycle both fail) is NOT.
+primary_sibling_only = snap([("legacy", duo(100, 50, 260, 66, vless_recent=("v1",)))])
+r = evaluate(base, primary_sibling_only, "legacy", "hy2-in", True)
+out["E_sibling_eligible"] = str(r.get("grace_eligible"))
+
+print(json.dumps(out))
+')"
+assert_eq "$(snap_field "$snap" 'snap["GR1_verdict"]')" "PASS" "GR1: grace window with a new scoped closed id -> PASS"
+assert_eq "$(snap_field "$snap" 'snap["GR1_exit"]')" "0" "GR1 exits 0"
+assert_eq "$(snap_field "$snap" 'snap["GR2_verdict"]')" "FAIL" "GR2: grace timeout without a new closed id -> FAIL"
+assert_contains "CLOSE_GRACE window timed out" "$snap" "GR2 reason names the grace timeout"
+assert_eq "$(snap_field "$snap" 'snap["GR3_verdict"]')" "FAIL" "GR3: stale grace snapshot -> FAIL even with a new id"
+assert_contains "grace window snapshot is stale" "$snap" "GR3 reason names the stale grace snapshot"
+assert_eq "$(snap_field "$snap" 'snap["GR4_verdict"]')" "FAIL" "GR4: sibling-protocol closure cannot satisfy the grace gate"
+assert_eq "$(snap_field "$snap" 'snap["GR5_verdict"]')" "FAIL" "GR5: active connection can never substitute a CLOSED in grace"
+assert_eq "$(snap_field "$snap" 'snap["GR6_verdict"]')" "FAIL" "GR6: identity gate failure during grace -> FAIL"
+assert_contains "identity gate failure during grace window" "$snap" "GR6 reason names the identity failure"
+assert_eq "$(snap_field "$snap" 'snap["GR7_verdict"]')" "FAIL" "GR7: grace never rescues a primary-window traffic failure"
+assert_contains "no traffic delta beyond baseline" "$snap" "GR7 keeps the primary traffic failure as the reason"
+assert_eq "$(snap_field "$snap" 'snap["GR8_verdict"]')" "PASS" "GR8: primary PASS stays PASS with a grace snapshot present"
+assert_eq "$(snap_field "$snap" 'snap["GR8_exit"]')" "0" "GR8 exits 0"
+assert_eq "$(snap_field "$snap" 'snap["GR9_verdict"]')" "FAIL" "GR9: baseline replayed ids stay dead evidence in grace"
+assert_eq "$(snap_field "$snap" 'snap["E_D_eligible"]')" "True" "eligibility: sole-CLOSED-failure primary is grace eligible"
+assert_eq "$(snap_field "$snap" 'snap["E_traffic_eligible"]')" "False" "eligibility: traffic failure is NOT grace eligible"
+assert_eq "$(snap_field "$snap" 'snap["E_sibling_eligible"]')" "False" "eligibility: sibling-only closure (CLOSED+lifecycle fail) is NOT eligible"
 
 printf '\n== summary ==\n'
 printf '  pass=%d fail=%d (expected pass=%d)\n' "$PASS" "$FAIL" "$EXPECTED_PASS"

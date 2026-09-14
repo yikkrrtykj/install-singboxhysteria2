@@ -58,6 +58,15 @@ if [ -z "$DATA_ROOT" ]; then
 fi
 STATE_DIR="$DATA_ROOT/state"
 
+# Compatibility preflight (capability detection, never distro-version
+# branching): fail closed on missing runtime commands; stdout stays a single
+# JSON line, the detailed diagnostic goes to stderr.
+if ! monitor_env_require_commands; then
+    printf '{"error":"missing required runtime commands (see stderr)"}\n'
+    exit 1
+fi
+monitor_env_record_environment >&2   # diagnostics only, no secrets
+
 SBMON_ENV_MODE=""
 SBMON_ENV_API_URL=""
 SBMON_ENV_CYCLE_SECONDS=""

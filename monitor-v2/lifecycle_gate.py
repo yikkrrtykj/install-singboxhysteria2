@@ -37,6 +37,28 @@ Verdicts mirror the integration script's three-state contract:
                           real client lifecycle in this window (never
                           counted as PASS)
 
+CLOSE_GRACE_WINDOW (REQUIRE_CLOSED=1 only): when the primary window fails
+with the CLOSED gate as the ONLY failure (all other gates green -- USER,
+INBOUND, traffic delta, lifecycle, stale), the integration script may run an
+additional grace window and feed the resulting snapshot as ``grace_final``.
+Grace semantics (enforced here):
+
+* the ORIGINAL baseline stays authoritative -- no recapture, same
+  USER/INBOUND scope;
+* a sibling protocol's closure can never satisfy the gate (scoping is
+  unchanged);
+* an active connection is NEVER a substitute for a CLOSED/finalize;
+* the snapshot must be non-stale and identity-conflict-free for the whole
+  grace window, else FAIL;
+* a new recent-closed id beyond the original baseline inside the window ->
+  PASS; timeout without one -> FAIL;
+* grace can NEVER rescue a primary-window failure of any other gate
+  (traffic / USER / INBOUND / lifecycle): those go straight to FAIL.
+
+When the gate is called WITHOUT ``grace_final`` and reports
+``grace_eligible`` (also printed as a GRACE_ELIGIBLE line by the CLI), the
+caller MAY enter the grace window; it is never mandatory.
+
 INCONCLUSIVE is reserved for gate-free runs: no devices at all, or devices
 that are pure historical replay (no traffic delta AND no new closed ids).
 Any strict gate (EXPECT_USER / EXPECT_INBOUND / REQUIRE_CLOSED=1) asserts
@@ -62,6 +84,10 @@ EXIT_INCONCLUSIVE = 2
 VERDICT_PASS = "PASS"
 VERDICT_FAIL = "FAIL"
 VERDICT_INCONCLUSIVE = "INCONCLUSIVE"
+
+# The REQUIRE_CLOSED gate failure line starts with this prefix. It is the
+# ONLY failure the CLOSE_GRACE window is allowed to resolve.
+CLOSED_FAIL_REASON = "no CLOSED/finalize evidence observed"
 
 
 class ConfigurationError(ValueError):
@@ -158,14 +184,19 @@ def _scope_protocols(snap, expect_user):
     return protos
 
 
-def _finish(lines, verdict, exit_code, reason):
+def _finish(lines, verdict, exit_code, reason, grace_eligible=False):
     return {"verdict": verdict, "exit": exit_code, "reason": reason,
-            "lines": lines}
+            "lines": lines, "grace_eligible": grace_eligible}
 
 
 def evaluate(baseline, final, expect_user="", expect_inbound="",
-             require_closed=False):
-    """Pure gate logic over two collector snapshots. Never raises for data."""
+             require_closed=False, grace_final=None):
+    """Pure gate logic over two collector snapshots. Never raises for data.
+
+    ``grace_final`` (optional) is the CLOSE_GRACE_WINDOW snapshot, evaluated
+    ONLY when the primary window's sole failure is the CLOSED gate; see the
+    module docstring for the exact grace contract.
+    """
     lines = []
 
     def ok(text):
@@ -191,8 +222,9 @@ def evaluate(baseline, final, expect_user="", expect_inbound="",
     b_up, b_down = scope_totals(baseline, expect_user, expect_inbound)
     f_up, f_down = scope_totals(final, expect_user, expect_inbound)
     traffic_delta = f_up > b_up or f_down > b_down
+    baseline_ids = scope_recent_ids(baseline, expect_user, expect_inbound)
     new_closed_ids = scope_recent_ids(final, expect_user, expect_inbound) \
-        - scope_recent_ids(baseline, expect_user, expect_inbound)
+        - baseline_ids
 
     # INCONCLUSIVE escape: ONLY the fully observational run (no gate set)
     # may report "nothing observed" as INCONCLUSIVE. A strict canary
@@ -284,8 +316,8 @@ def evaluate(baseline, final, expect_user="", expect_inbound="",
             ok("new CLOSED/finalize observed (%d new id(s) beyond baseline)"
                % len(new_closed_ids))
         else:
-            bad("no CLOSED/finalize evidence observed (no new recent-closed "
-                "ids beyond baseline)")
+            bad("%s (no new recent-closed ids beyond baseline)"
+                % CLOSED_FAIL_REASON)
     elif new_closed_ids:
         info("new CLOSED/finalize observed (%d new id(s) beyond baseline)"
              % len(new_closed_ids))
@@ -300,9 +332,69 @@ def evaluate(baseline, final, expect_user="", expect_inbound="",
             % (final.get("last_error") or "unknown"))
 
     failed = [text for status, text in lines if status == "FAIL"]
-    if failed:
+    closed_failed = any(
+        status == "FAIL" and text.startswith(CLOSED_FAIL_REASON)
+        for status, text in lines)
+    # Grace eligibility: REQUIRE_CLOSED set, verdict FAIL, and the CLOSED
+    # gate is the ONLY failure. Anything else (traffic / USER / INBOUND /
+    # lifecycle / allowlist) goes straight to FAIL -- grace never rescues.
+    eligible = bool(require_closed and failed and closed_failed
+                    and len(failed) == 1 and grace_final is None)
+
+    if grace_final is None:
+        if failed:
+            return _finish(lines, VERDICT_FAIL, EXIT_FAIL, failed[0],
+                           grace_eligible=eligible)
+        return _finish(lines, VERDICT_PASS, EXIT_PASS, "")
+
+    # ---- CLOSE_GRACE_WINDOW evaluation ----
+    if not failed:
+        info("CLOSE_GRACE window not needed (primary window already PASS)")
+        return _finish(lines, VERDICT_PASS, EXIT_PASS, "")
+    if len(failed) > 1 or not closed_failed:
+        info("CLOSE_GRACE window NOT entered: the primary window has "
+             "failure(s) other than the CLOSED gate; grace never rescues "
+             "traffic/USER/INBOUND/lifecycle failures")
         return _finish(lines, VERDICT_FAIL, EXIT_FAIL, failed[0])
-    return _finish(lines, VERDICT_PASS, EXIT_PASS, "")
+
+    # The CLOSED gate is the sole primary failure. The grace snapshot must
+    # itself be healthy for its whole duration: stale or identity conflicts
+    # during grace are a FAIL, never a pass-through.
+    if grace_final.get("stale") is not False:
+        bad("grace window snapshot is stale; closure evidence is not "
+            "trustworthy (CLOSE_GRACE)")
+        return _finish(lines, VERDICT_FAIL, EXIT_FAIL,
+                       "grace window snapshot is stale")
+    if (grace_final.get("identity_conflicts") or 0) != 0:
+        bad("identity gate failure during the grace window "
+            "(identity_conflicts=%s)" % grace_final.get("identity_conflicts"))
+        return _finish(lines, VERDICT_FAIL, EXIT_FAIL,
+                       "identity gate failure during grace window")
+
+    # Same ORIGINAL baseline, same USER/INBOUND scope: a sibling protocol's
+    # closure or an active connection can never satisfy the gate here.
+    grace_ids = scope_recent_ids(grace_final, expect_user, expect_inbound) \
+        - baseline_ids
+    for idx, (status, text) in enumerate(lines):
+        if status == "FAIL" and text.startswith(CLOSED_FAIL_REASON):
+            if grace_ids:
+                lines[idx] = (
+                    "PASS",
+                    "new CLOSED/finalize observed during the CLOSE_GRACE "
+                    "window (%d new id(s) beyond the ORIGINAL baseline)"
+                    % len(grace_ids))
+            else:
+                lines[idx] = (
+                    "FAIL",
+                    "CLOSE_GRACE window timed out without a new "
+                    "CLOSED/finalize (no new recent-closed ids beyond the "
+                    "ORIGINAL baseline)")
+            break
+    if grace_ids:
+        return _finish(lines, VERDICT_PASS, EXIT_PASS, "")
+    return _finish(lines, VERDICT_FAIL, EXIT_FAIL,
+                   "CLOSE_GRACE window timed out without a new "
+                   "CLOSED/finalize")
 
 
 def main(argv=None):
@@ -319,6 +411,10 @@ def main(argv=None):
                         help="hard gate: this inbound tag must be observed")
     parser.add_argument("--require-closed", default="0",
                         help="1 = a NEW CLOSED beyond baseline is required")
+    parser.add_argument("--grace-final", default="",
+                        help="optional CLOSE_GRACE_WINDOW snapshot; judged "
+                             "only when the CLOSED gate is the sole primary "
+                             "failure")
     args = parser.parse_args(argv)
 
     try:
@@ -328,6 +424,10 @@ def main(argv=None):
             baseline = json.load(handle)
         with open(args.final, encoding="utf-8") as handle:
             final = json.load(handle)
+        grace_final = None
+        if args.grace_final:
+            with open(args.grace_final, encoding="utf-8") as handle:
+                grace_final = json.load(handle)
     except ConfigurationError as exc:
         print("FAIL\tconfiguration error: %s" % exc)
         print("RESULT\t%s" % VERDICT_FAIL)
@@ -339,9 +439,12 @@ def main(argv=None):
 
     outcome = evaluate(baseline, final, expect_user=args.expect_user,
                        expect_inbound=expect_inbound,
-                       require_closed=require_closed)
+                       require_closed=require_closed,
+                       grace_final=grace_final)
     for status, text in outcome["lines"]:
         print("%s\t%s" % (status, text))
+    if outcome.get("grace_eligible"):
+        print("GRACE_ELIGIBLE\t1")
     print("RESULT\t%s" % outcome["verdict"])
     if outcome["reason"]:
         print("REASON\t%s" % outcome["reason"])

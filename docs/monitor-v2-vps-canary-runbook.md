@@ -72,6 +72,7 @@
 | B3 | ~~`service.api` 块确切 JSON 形状未确认~~（rev2.3 修正）：冻结基线事实 = `.services[]` 条目 `tag=="monitor-api"` / `type=="api"` / `listen=="127.0.0.1"` / `listen_port==9091` / 非空 `secret`。凭据字段（uuid/password/private_key）由 P2-7 扫描器**按键名遍历**收集 | P0-8 选择器已按上述基线形状固定；若 VPS 实机凭据键名与扫描器按键集合不同，**只允许调整收集键名集合，绝不打印敏感值**。非阻塞 |
 | B4 | E1 canary 流量验证会在窗口内产生**第二个短暂的 service.api consumer**（集成脚本自带的 collector 进程）。与稳态"one Collector / one consumer"约束冲突 | **设计内受控例外**：仅允许在 §P3 明示窗口内发生，窗口前后必须复跑单例断言（§P2-6）。非阻塞，但必须执行复检 |
 | B5（rev2 记录，rev2.1 更新方案） | `tests/monitor-v2-integration-e1.sh` 不传 `--secret-file`，strict canary 在有鉴权的生产 service.api 上无法直接运行 | 由 §P3-1 受控手动例外解决（**逐命令临时环境赋值窗口**，值不进父 shell）；不改冻结代码。等价备选方案见 §P3-1 备注 |
+| B6（VPS canary 兼容性实机发现，2026-09-14，Ubuntu 22.04） | Ubuntu 22.04 的 `journalctl --since` **拒绝 raw RFC3339 时间戳**（实测输入 `2026-09-14T15:51:50Z`） | 已修复并固化：内部 canary 时间戳保持 RFC3339/UTC；`--since` 前一律经 `journal_time_normalize_jctl`（Python datetime，规范副本 `tests/lib/journal-time.sh`，回归测试 `tests/test-journal-time-compat.sh`）规范化为本地 "YYYY-MM-DD HH:MM:SS"。规范副本见 §1 会话准备 |
 
 除此之外**未发现任何阻断 canary 的技术 blocker**：Round 2 权威 CI 全绿、I0-7 CLOSED、Packaging 与 proxy 树静态隔离、`sbconfig_server.json` 零引用（S0 锚点除外）。
 
@@ -96,8 +97,40 @@ set -o pipefail   # rev2.3：会话全局启用——任一管线中生产者非
 export FROZEN=3ee9a162a3fb53d9fddc95cb6eba95b3bcc5702e
 export ART=/root/canary-artifacts-$(date -u +%Y%m%dT%H%M%SZ)
 mkdir -m 0700 -p "$ART"
-export T0=$(date -u +%Y-%m-%dT%H:%M:%SZ)   # canary 窗口起点（所有 --since 使用）
+export T0=$(date -u +%Y-%m-%dT%H:%M:%SZ)   # canary 窗口起点（内部时间戳，恒为 RFC3339/UTC）
+
+# —— journalctl 时间兼容（B6 发现，2026-09-14 Ubuntu 22.04 实机）——
+# 事实：Ubuntu 22.04 的 journalctl 拒绝 raw RFC3339（`2026-09-14T15:51:50Z`）。
+# 规则：T0 保持 RFC3339/UTC 作为内部时间戳；任何 journalctl --since 之前必须用
+# Python datetime 规范化为本地 "YYYY-MM-DD HH:MM:SS"；**绝不**把 raw "...T...Z"
+# 直接传给 journalctl。规范化实现以 tests/lib/journal-time.sh（回归测试
+# tests/test-journal-time-compat.sh 覆盖）为规范副本；P0-1 checkout 后也可直接
+# `source tests/lib/journal-time.sh` 获得同一实现。
+journal_time_normalize_jctl() {
+  python3 - "$1" <<'PYEOF'
+import sys
+from datetime import datetime, timezone
+raw = (sys.argv[1] if len(sys.argv) > 1 else "").strip()
+if not raw:
+    print("journal-time: empty timestamp", file=sys.stderr); sys.exit(1)
+if "T" not in raw and "Z" not in raw:   # 已规范化形态：幂等透传（严格校验）
+    try: datetime.strptime(raw, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        print(f"journal-time: not a valid timestamp: {raw!r}", file=sys.stderr); sys.exit(1)
+    print(raw); sys.exit(0)
+iso = raw[:-1] + "+00:00" if raw[-1] in ("Z", "z") else raw
+try: dt = datetime.fromisoformat(iso)
+except ValueError:
+    print(f"journal-time: not a valid RFC3339 timestamp: {raw!r}", file=sys.stderr); sys.exit(1)
+if dt.tzinfo is None:
+    dt = dt.replace(tzinfo=timezone.utc)   # 无显式偏移按 canary 约定视为 UTC
+print(dt.astimezone().strftime("%Y-%m-%d %H:%M:%S"))
+PYEOF
+}
+export J0="$(journal_time_normalize_jctl "$T0")"   # 所有 journalctl --since 只用 $J0
 ```
+
+> **时间戳纪律**：内部记账（T0、artifacts 命名、报告）一律 RFC3339/UTC；`journalctl --since` 一律使用 `$J0`（本地 "YYYY-MM-DD HH:MM:SS"）。输入非法时规范化函数 fail-closed（非零退出），绝不静默给出错误时间窗。
 
 **管线退出码纪律（rev2.3，自 P0 起生效）**：所有门禁管道（install/upgrade、monitor health、journal 扫描器、E1 strict canary、rollback）一律显式捕获**生产者退出码**（`${PIPESTATUS[0]}`）并以其判定；`tee` 的退出码永远不作为判定依据——任何生产者 FAIL 都不可能被 `tee` 掩成 PASS。
 
@@ -393,6 +426,23 @@ python3 - "$T0" <<'PYEOF' | tee "$ART/p2-journal-scan.txt"
 import json, subprocess, sys
 
 T0 = sys.argv[1]
+
+# B6 时间兼容：journalctl --since 绝不接收 raw RFC3339（"...T...Z"）。
+# 输入非法时 fail-closed（绝不用错误时间窗静默扫描）。
+from datetime import datetime, timezone
+
+def normalize_journal_since(ts):
+    text = ts.strip()
+    if "T" not in text and "Z" not in text:
+        datetime.strptime(text, "%Y-%m-%d %H:%M:%S")   # 已规范化形态：严格校验后透传
+        return text
+    iso = text[:-1] + "+00:00" if text[-1] in ("Z", "z") else text
+    dt = datetime.fromisoformat(iso)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+J0 = normalize_journal_since(T0)
 CFG = "/root/sbox/sbconfig_server.json"
 SECRET_FILE = "/root/sbox/monitor-api.secret"
 UNITS = ("singbox-monitor", "sing-box")
@@ -454,7 +504,7 @@ fail = False
 for unit in UNITS:
     try:
         text = subprocess.run(
-            ["journalctl", "-u", unit, "--since", T0, "--no-pager", "-o", "cat"],
+            ["journalctl", "-u", unit, "--since", J0, "--no-pager", "-o", "cat"],
             capture_output=True, text=True, check=True).stdout
     except subprocess.CalledProcessError as e:
         print(f"{unit}: journalctl failed rc={e.returncode}")
@@ -475,8 +525,8 @@ printf 'scanner rc=%s\n' "$SCAN_RC" | tee -a "$ART/p2-journal-scan.txt"
 计数语义说明：完整值命中与其组成行命中在"原样出现"场景下会**重复计数**——对本门禁（判定条件 = 任一类别 >0）这是**保守方向**（宁可多报），不构成误判风险。
 
 - **PASS**：两单元四个类别计数全部为 0（`service_api_secret_matches=0 reality_uuid_matches=0 hy2_password_matches=0 reality_private_key_matches=0`）且 `scanner rc=0`。
-- **FAIL / STOP**：任一类别计数 > 0、任一预期类别收集不到敏感材料（fail-closed）、或 scanner 非零退出 → 停止 canary，journal 全量封存（`journalctl -u <u> --since "$T0" > $ART/journal-<u>.log`，0600）人工分析。
-- **卫生（不变）**：标准库 Python、短命、内存态（敏感值仅存在于扫描器进程内存，进程退出即消失）、**零 secret 落盘临时文件**、argv 零 secret 值、无 xtrace、journal 限当前 canary 区间（`--since "$T0"`）；空字符串永不成为扫描模式。
+- **FAIL / STOP**：任一类别计数 > 0、任一预期类别收集不到敏感材料（fail-closed）、或 scanner 非零退出 → 停止 canary，journal 全量封存（`journalctl -u <u> --since "$J0" > $ART/journal-<u>.log`，0600；B6：`--since` 只用规范化后的 `$J0`，绝不传 raw `$T0`）人工分析。
+- **卫生（不变）**：标准库 Python、短命、内存态（敏感值仅存在于扫描器进程内存，进程退出即消失）、**零 secret 落盘临时文件**、argv 零 secret 值、无 xtrace、journal 限当前 canary 区间（`--since "$J0"`，由 fail-closed 的规范化从 RFC3339/UTC 的 T0 派生）；空字符串永不成为扫描模式。
 - **artifacts**：`$ART/p2-journal-scan.txt`（只有四类别计数与 rc；绝不打印 secret 值 / private-key 材料 / 命中行 / 命中子串）。
 
 ---
@@ -573,7 +623,7 @@ diff "$ART/p0-singbox-lifecycle.txt" "$ART/p4-singbox-lifecycle.txt" \
 tr '\0' ' ' < /proc/$SBPID/cmdline | diff - "$ART/p0-singbox-cmdline.txt" && echo 'CMDLINE: IDENTICAL'   # rev2.3：基线 artifact 仅含 cmdline，同类逐字节比较
 
 # (3) sing-box journal：窗口内无任何生命周期操作痕迹
-journalctl -u sing-box --since "$T0" --no-pager \
+journalctl -u sing-box --since "$J0" --no-pager \
   | grep -Ei 'starting sing-box|shutting down|signal|restart|reload|config file|restarted' \
   | tee "$ART/p4-singbox-journal-lifecycle.txt"      # 期望空文件
 
@@ -698,12 +748,34 @@ diff "$ART/p0-hash-before.txt" <(sha256sum /root/sbox/sbconfig_server.json /root
 set -o pipefail   # rev2.3：全局启用；门禁管道另显式捕获 PIPESTATUS[0]
 export FROZEN=3ee9a162a3fb53d9fddc95cb6eba95b3bcc5702e
 export ART=/root/canary-artifacts-$(date -u +%Y%m%dT%H%M%SZ); mkdir -m 0700 -p "$ART"
-export T0=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+export T0=$(date -u +%Y-%m-%dT%H:%M:%SZ)   # 内部时间戳恒为 RFC3339/UTC；journalctl --since 只用 $J0（见 §1 B6 规则）
+journal_time_normalize_jctl() { python3 - "$1" <<'PYEOF'
+import sys
+from datetime import datetime, timezone
+raw = (sys.argv[1] if len(sys.argv) > 1 else "").strip()
+if not raw:
+    print("journal-time: empty timestamp", file=sys.stderr); sys.exit(1)
+if "T" not in raw and "Z" not in raw:
+    try: datetime.strptime(raw, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        print(f"journal-time: not a valid timestamp: {raw!r}", file=sys.stderr); sys.exit(1)
+    print(raw); sys.exit(0)
+iso = raw[:-1] + "+00:00" if raw[-1] in ("Z", "z") else raw
+try: dt = datetime.fromisoformat(iso)
+except ValueError:
+    print(f"journal-time: not a valid RFC3339 timestamp: {raw!r}", file=sys.stderr); sys.exit(1)
+if dt.tzinfo is None:
+    dt = dt.replace(tzinfo=timezone.utc)
+print(dt.astimezone().strftime("%Y-%m-%d %H:%M:%S"))
+PYEOF
+}
+export J0="$(journal_time_normalize_jctl "$T0")"
 
 # —— P0 preflight ——
 git clone https://github.com/yikkrrtykj/install-singboxhysteria2 /root/canary-src
 cd /root/canary-src && git checkout --detach "$FROZEN"
 git rev-parse HEAD; git status --porcelain
+# （checkout 后可 `source tests/lib/journal-time.sh` 获得与回归测试一致的规范实现）
 SBPID=$(systemctl show -p MainPID --value sing-box); tr '\0' ' ' < /proc/$SBPID/cmdline
 systemctl show sing-box -p MainPID -p NRestarts -p ExecMainStartTimestampMonotonic -p ActiveState -p SubState
 systemctl is-active sing-box; systemctl is-enabled sing-box
@@ -758,7 +830,7 @@ printf 'hy2 rc=%s\n' "$RC_HY2" | tee -a "$ART/p3-hy2.log"
 # —— P4 isolation（不变量集合）——
 sha256sum /root/sbox/sbconfig_server.json /root/sbox/config | diff - "$ART/p0-hash-before.txt"
 systemctl show sing-box -p MainPID -p NRestarts -p ExecMainStartTimestampMonotonic -p ActiveState -p SubState | diff - "$ART/p0-singbox-lifecycle.txt"
-journalctl -u sing-box --since "$T0" --no-pager | grep -Ei 'starting|shutting|restart|reload'   # 期望空
+journalctl -u sing-box --since "$J0" --no-pager | grep -Ei 'starting|shutting|restart|reload'   # 期望空（B6：--since 只用 $J0）
 ss -lntup | diff - "$ART/p0-listeners.txt" || true   # 期望仅 +127.0.0.1:9191
 grep -E '0\.0\.0\.0:9191|\[::\]:9191' <(ss -lntp)    # 期望空
 

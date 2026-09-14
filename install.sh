@@ -1574,6 +1574,387 @@ harden_sensitive_permissions() {
 }
 # <<< s0 credential-boundary hardening <<< =====================================
 
+# >>> existing-api-auth narrow migration >>> ===================================
+# Narrow S0 migration for OLD servers that already run sing-box 1.14.x with a
+# structurally compliant localhost-only service.api (tag monitor-api,
+# 127.0.0.1:9091) but WITHOUT authentication (secret absent or empty).
+#
+# Why this exists: the Phase D upgrade path injects the secret, but it is a
+# BINARY upgrade transaction (download/replace sing-box, restart). An old
+# server that already runs a compliant 1.14.x service.api must be able to add
+# authentication WITHOUT touching the binary, the version, or any credential.
+#
+# Scope of the only allowed semantic change:
+#   .services[] entry where tag == "monitor-api" gains "secret": "<256-bit hex>"
+# Everything else (Reality UUIDs, HY2 passwords, Reality private key, short_id,
+# SNI, ports, certificates, /root/sbox/config state, binary, firewall, MTU,
+# port hopping, other services/inbounds/outbounds/routes) is preserved and
+# mechanically proven identical before commit. No credential rotation, ever.
+#
+# Discipline (same as Phase C/D):
+#   - interactive confirmation is gathered OUTSIDE /root/sbox/config.lock;
+#   - the locked helper re-reads LIVE state, revalidates, and is idempotent:
+#     if another process already added a valid secret it treats that as
+#     success, converges the derived anchor, and NEVER rotates the secret;
+#   - every mutation runs under the SAME with_client_lock as every other
+#     durable state change, fail-closed (no lock -> zero mutation);
+#   - pre-commit failure -> zero live mutation; post-commit failure ->
+#     atomic config restore (restore_file_atomically) + anchor restore +
+#     restart + re-verify; an unconfirmable restore is reported as
+#     MANUAL INTERVENTION REQUIRED and never as success.
+# The config remains the secret's single source of truth; the derived
+# /root/sbox/monitor-api.secret stays a root:root 0600 convenience copy.
+# This migration is NOT a sing-box binary upgrade and never replaces it.
+# ==============================================================================
+
+# Read-only classification of the live service.api authentication state:
+#   exact       exactly one compliant monitor-api WITH a non-empty secret
+#   needed      exactly one compliant monitor-api, secret missing/empty
+#   absent      no monitor-api entry at all (narrow migration must NOT
+#               reinvent it -- that is the Phase D path)
+#   structural  monitor-api count/type/listen/port violate the contract
+#   unreadable  config missing or invalid JSON
+#   audit-error jq/audit failure (fail-closed: never "no problems")
+existing_api_auth_classify() { # existing_api_auth_classify <config>
+    local cfg="$1" problems count
+    [ -f "$cfg" ] || { printf 'unreadable\n'; return 0; }
+    if ! jq empty "$cfg" >/dev/null 2>&1; then
+        printf 'unreadable\n'; return 0
+    fi
+    if ! problems="$(phase_d_config_structure_problems "$cfg")"; then
+        printf 'audit-error\n'; return 0
+    fi
+    if [ -n "$problems" ]; then
+        printf 'structural\n'; return 0
+    fi
+    count="$(jq -er --arg tag "$PHASE_D_API_TAG" \
+        '[(.services // [])[] | select(.tag == $tag)] | length' \
+        "$cfg" 2>/dev/null | tr -d '\r')" || { printf 'audit-error\n'; return 0; }
+    if [ "$count" -eq 0 ]; then
+        printf 'absent\n'; return 0
+    fi
+    if phase_d_api_service_exact "$cfg"; then
+        printf 'exact\n'
+    else
+        printf 'needed\n'
+    fi
+    return 0
+}
+
+# Narrow migration entry point, called on EXISTING installs before the menu.
+# Fresh installs never reach this function and are unaffected.
+#   exact      -> no prompt, no restart, never rotate; converge the derived
+#                 anchor from the authoritative config if it is missing/stale
+#   needed     -> explicit [y/N] confirmation OUTSIDE the lock (default NO);
+#                 declined -> ZERO changes, no restart, warn that Monitor v2
+#                 requires this migration before deployment
+#   absent /
+#   structural -> refuse: report that the normal Phase D repair/upgrade path
+#                 is required; zero changes, no prompt
+#   unreadable /
+#   audit-error -> warn and skip; zero changes
+maybe_migrate_existing_api_auth() {
+    local state answer
+    state="$(existing_api_auth_classify "$SB_SERVER_CONFIG")"
+    case "$state" in
+        exact)
+            # Already authenticated: converge the derived anchor, never rotate.
+            sync_api_secret_file || \
+                { error "monitor-api.secret 派生文件修复失败，请先人工检查磁盘/目录/权限后再运行"; return 1; }
+            return 0
+            ;;
+        needed)
+            : ;;
+        absent|structural)
+            warning "现有 service.api 结构不符合窄迁移条件（monitor-api 缺失或 type/listen/port/数量不合规），已跳过"
+            warning "该环境需要正常的 Phase D 修复/升级路径，本次未做任何修改"
+            return 0
+            ;;
+        *)
+            warning "无法读取或审计服务端配置，已跳过 service.api 认证窄迁移（未做任何修改）"
+            return 0
+            ;;
+    esac
+
+    echo ""
+    warning "检测到旧版 service.api 已启用但尚未配置认证。"
+    info "是否执行安全迁移，为 localhost service.api 增加认证？"
+    info "该操作不会修改 Reality/HY2 凭据、端口或 sing-box 版本，"
+    info "但会受控重启 sing-box 一次。"
+    # Interactive input is gathered OUTSIDE /root/sbox/config.lock (never hold
+    # the lock while waiting for the operator).
+    read -r -p "[y/N]: " answer
+    case "$answer" in
+        y|Y|yes|YES|Yes) ;;
+        *)
+            warning "已取消：未做任何修改，未重启 sing-box。"
+            warning "注意: Monitor v2 部署前必须先完成该认证迁移。"
+            return 0
+            ;;
+    esac
+    with_client_lock _migrate_existing_api_auth_locked
+}
+
+# Rollback for the narrow migration: atomically restore the pre-migration
+# config from the hardened backup, restore/remove the derived anchor, restart
+# sing-box to reload the old config and re-verify. ANY failure is reported as
+# needing manual intervention -- never as a successful recovery. Backups are
+# always preserved. Caller holds with_client_lock.
+_rollback_existing_api_auth() { # <backup_cfg> <anchor_had> <anchor_bak> <old_version>
+    local backup_cfg="$1" anchor_had="$2" anchor_bak="$3" old_version="$4"
+    warning "迁移提交后失败，执行回滚（config + anchor）..."
+    if ! restore_file_atomically "$backup_cfg" "$SB_SERVER_CONFIG"; then
+        warning "回滚 config 恢复失败，请立即人工介入！备份: $backup_cfg"
+        return 1
+    fi
+    if [ "$anchor_had" = "1" ]; then
+        if ! restore_file_atomically "$anchor_bak" "$SB_API_SECRET_FILE"; then
+            warning "回滚 monitor-api.secret 恢复失败，请立即人工介入！备份: $anchor_bak"
+            return 1
+        fi
+    else
+        rm -f "$SB_API_SECRET_FILE" 2>/dev/null
+    fi
+    if ! systemctl restart sing-box 2>/dev/null; then
+        warning "回滚后 restart sing-box 失败，请立即人工介入！备份: $backup_cfg"
+        return 1
+    fi
+    # The restored config has no usable monitor-api secret; the runtime must
+    # come back with the old (pre-auth) API behaviour and all proxy listeners.
+    if ! phase_d_health_ok "$old_version" "yes"; then
+        warning "回滚后健康检查失败，请立即人工介入！备份: $backup_cfg"
+        return 1
+    fi
+    if ! ensure_hy2_hopping_after_restart; then
+        warning "回滚后端口跳跃规则未能确认恢复，请人工检查"
+        return 1
+    fi
+    warning "已回滚到迁移前状态（config + anchor），服务健康"
+    return 0
+}
+
+# The whole transaction runs under the SAME /root/sbox/config.lock: re-read ->
+# revalidate -> candidate -> mechanical proof -> check -> backup -> commit ->
+# anchor -> one controlled restart -> health. Re-reads LIVE state under the
+# lock so a concurrent first migration wins and a second invocation becomes an
+# idempotent no-op (same secret, no rotation, no restart).
+_migrate_existing_api_auth_locked() {
+    local problems count secret cand_secret old_version
+    local candidate_cfg backup_cfg anchor_bak=""
+    local anchor_had=0
+    [ -f "$SB_SERVER_CONFIG" ] || { warning "服务端配置不存在: $SB_SERVER_CONFIG"; return 1; }
+    if ! jq empty "$SB_SERVER_CONFIG" >/dev/null 2>&1; then
+        warning "服务端配置不是合法 JSON: $SB_SERVER_CONFIG"
+        return 1
+    fi
+
+    # Same identity gate as Phase D: the multi-client model must be intact.
+    if ! problems="$(candidate_problems "$SB_SERVER_CONFIG")"; then
+        warning "客户端结构审计执行失败: $SB_SERVER_CONFIG"
+        return 1
+    fi
+    if [ -n "$problems" ]; then
+        warning "客户端身份审计未通过，窄迁移拒绝执行:"
+        while IFS= read -r p; do
+            [ -n "$p" ] && warning "  - $p"
+        done <<< "$problems"
+        return 1
+    fi
+
+    # Revalidate under the lock: the live state may have changed since the
+    # operator was asked (or since a concurrent invocation migrated already).
+    if ! problems="$(phase_d_config_structure_problems "$SB_SERVER_CONFIG")"; then
+        warning "API 配置审计执行失败: $SB_SERVER_CONFIG"
+        return 1
+    fi
+    if [ -n "$problems" ]; then
+        warning "现有 API 配置不合规（拒绝窄迁移），该环境需要 Phase D 修复/升级路径:"
+        while IFS= read -r p; do
+            [ -n "$p" ] && warning "  - $p"
+        done <<< "$problems"
+        return 1
+    fi
+    count="$(jq -er --arg tag "$PHASE_D_API_TAG" \
+        '[(.services // [])[] | select(.tag == $tag)] | length' \
+        "$SB_SERVER_CONFIG" 2>/dev/null | tr -d '\r')" || {
+        warning "无法读取 monitor-api service 数量"
+        return 1
+    }
+    [ "$count" -eq 1 ] || { warning "monitor-api service 数量不是 1，窄迁移拒绝执行"; return 1; }
+
+    if phase_d_api_service_exact "$SB_SERVER_CONFIG"; then
+        # Idempotent: a concurrent invocation already added a valid secret.
+        # Converge the anchor from the config, NEVER rotate, NO restart.
+        if ! sync_api_secret_file; then
+            warning "monitor-api.secret 派生文件修复失败，请人工检查磁盘/目录/权限"
+            return 1
+        fi
+        info "service.api 已配置认证（无需迁移），未修改任何内容"
+        return 0
+    fi
+
+    # Capture the pre-migration anchor state for rollback (the anchor is a
+    # DERIVED file; if it did not exist, rollback removes any new one).
+    if [ -f "$SB_API_SECRET_FILE" ]; then
+        anchor_had=1
+        anchor_bak="$(mktemp "${SB_API_SECRET_FILE}.bak.XXXXXX")" || {
+            warning "创建 anchor 备份失败，正式环境未修改"
+            return 1
+        }
+        if ! cp -a "$SB_API_SECRET_FILE" "$anchor_bak" || ! chmod 0600 "$anchor_bak" 2>/dev/null; then
+            warning "备份当前 anchor 失败，正式环境未修改"
+            rm -f "$anchor_bak"
+            return 1
+        fi
+    fi
+
+    if ! secret="$(generate_api_secret)"; then
+        warning "生成 monitor-api secret 失败，正式环境未修改"
+        [ -n "$anchor_bak" ] && rm -f "$anchor_bak"
+        return 1
+    fi
+
+    candidate_cfg="$(mktemp "${SB_SERVER_CONFIG}.candidate.XXXXXX")" || {
+        warning "创建 candidate config 失败，正式环境未修改"
+        [ -n "$anchor_bak" ] && rm -f "$anchor_bak"
+        return 1
+    }
+    # count==1 and not exact: the structural audit already proved the ONLY gap
+    # is the missing secret, so this fills in .secret and touches nothing else.
+    if ! phase_d_inject_api_service "$SB_SERVER_CONFIG" "$candidate_cfg" "$secret"; then
+        warning "生成 candidate config 失败，正式环境未修改"
+        rm -f "$candidate_cfg"
+        [ -n "$anchor_bak" ] && rm -f "$anchor_bak"
+        return 1
+    fi
+
+    # ---- mechanical proof (all six must hold before commit) ----
+    # 1. canonicalized config excluding .services is identical
+    # 2. all services other than monitor-api are identical
+    # 3. monitor-api excluding .secret is identical
+    if [ "$(jq -Sc 'del(.services)' "$SB_SERVER_CONFIG" 2>/dev/null)" != \
+         "$(jq -Sc 'del(.services)' "$candidate_cfg" 2>/dev/null)" ] ||
+       [ "$(jq -Sc --arg tag "$PHASE_D_API_TAG" \
+            '[.services[]? | select(.tag != $tag)]' "$SB_SERVER_CONFIG" 2>/dev/null)" != \
+         "$(jq -Sc --arg tag "$PHASE_D_API_TAG" \
+            '[.services[]? | select(.tag != $tag)]' "$candidate_cfg" 2>/dev/null)" ] ||
+       [ "$(jq -Sc --arg tag "$PHASE_D_API_TAG" \
+            '[.services[]? | select(.tag == $tag) | del(.secret)]' "$SB_SERVER_CONFIG" 2>/dev/null)" != \
+         "$(jq -Sc --arg tag "$PHASE_D_API_TAG" \
+            '[.services[]? | select(.tag == $tag) | del(.secret)]' "$candidate_cfg" 2>/dev/null)" ]; then
+        warning "candidate 校验失败: 窄迁移只允许新增 monitor-api secret，正式环境未修改"
+        rm -f "$candidate_cfg"
+        [ -n "$anchor_bak" ] && rm -f "$anchor_bak"
+        return 1
+    fi
+    # 4. exactly one monitor-api exists
+    count="$(jq -er --arg tag "$PHASE_D_API_TAG" \
+        '[(.services // [])[] | select(.tag == $tag)] | length' \
+        "$candidate_cfg" 2>/dev/null | tr -d '\r')" || count=0
+    if [ "$count" -ne 1 ]; then
+        warning "candidate 校验失败: monitor-api 数量不是 1，正式环境未修改"
+        rm -f "$candidate_cfg"
+        [ -n "$anchor_bak" ] && rm -f "$anchor_bak"
+        return 1
+    fi
+    # 5. the committed secret is exactly the generated non-empty value
+    cand_secret="$(jq -r --arg tag "$PHASE_D_API_TAG" \
+        '[(.services // [])[] | select(.tag == $tag)][0].secret // ""' \
+        "$candidate_cfg" 2>/dev/null | tr -d '\r')"
+    if [ "$cand_secret" != "$secret" ] || [[ ! "$cand_secret" =~ ^[0-9a-f]{64}$ ]]; then
+        warning "candidate 校验失败: secret 不是本次生成的有效值，正式环境未修改"
+        rm -f "$candidate_cfg"
+        [ -n "$anchor_bak" ] && rm -f "$anchor_bak"
+        return 1
+    fi
+    # 6. candidate passes the identity audit and the real sing-box check
+    if ! problems="$(candidate_problems "$candidate_cfg")" || [ -n "$problems" ]; then
+        warning "candidate 身份审计未通过，正式环境未修改"
+        rm -f "$candidate_cfg"
+        [ -n "$anchor_bak" ] && rm -f "$anchor_bak"
+        return 1
+    fi
+    if ! phase_d_api_service_exact "$candidate_cfg"; then
+        warning "candidate API 配置验证失败，正式环境未修改"
+        rm -f "$candidate_cfg"
+        [ -n "$anchor_bak" ] && rm -f "$anchor_bak"
+        return 1
+    fi
+    if ! "$SB_SING_BOX_BIN" check -c "$candidate_cfg" >/dev/null 2>&1; then
+        warning "candidate sing-box check 未通过，正式环境未修改"
+        rm -f "$candidate_cfg"
+        [ -n "$anchor_bak" ] && rm -f "$anchor_bak"
+        return 1
+    fi
+
+    # Unique same-directory backup, retained, mode 0600.
+    backup_cfg="$(mktemp "${SB_SERVER_CONFIG}.bak.$(date +%Y%m%d-%H%M%S).XXXXXX")" || {
+        warning "创建配置备份失败，正式环境未修改"
+        rm -f "$candidate_cfg"
+        [ -n "$anchor_bak" ] && rm -f "$anchor_bak"
+        return 1
+    }
+    if ! cp -a "$SB_SERVER_CONFIG" "$backup_cfg"; then
+        warning "备份当前配置失败，正式环境未修改"
+        rm -f "$candidate_cfg" "$backup_cfg"
+        [ -n "$anchor_bak" ] && rm -f "$anchor_bak"
+        return 1
+    fi
+    # cp -a preserves the source mode; an old 0644 live config must never
+    # produce a world-readable backup.
+    if ! chmod 0600 "$backup_cfg" 2>/dev/null; then
+        warning "备份文件权限收紧为 0600 失败，正式环境未修改"
+        rm -f "$candidate_cfg" "$backup_cfg"
+        [ -n "$anchor_bak" ] && rm -f "$anchor_bak"
+        return 1
+    fi
+
+    old_version="$("$SB_SING_BOX_BIN" version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)"
+    [ -n "$old_version" ] || old_version="unknown"
+
+    # Atomic live config replace (binary is NEVER touched). The backup is
+    # KEPT even when the replace itself fails (never destroys a recovery copy).
+    chmod 0600 "$candidate_cfg" 2>/dev/null || true
+    if ! mv -f "$candidate_cfg" "$SB_SERVER_CONFIG"; then
+        warning "原子替换 config 失败，正式环境未修改"
+        rm -f "$candidate_cfg"
+        [ -n "$anchor_bak" ] && rm -f "$anchor_bak"
+        return 1
+    fi
+
+    # Derived anchor next (runtime is untouched so far; a failure here needs a
+    # config restore but NO restart -- sing-box still runs the old config).
+    if ! write_api_secret_file "$secret"; then
+        if ! restore_file_atomically "$backup_cfg" "$SB_SERVER_CONFIG"; then
+            warning "anchor 写入失败且 config 回滚失败，请立即人工介入！备份: $backup_cfg"
+            return 1
+        fi
+        warning "monitor-api.secret 派生文件写入失败，已回滚 config（未重启，sing-box 仍运行旧配置）"
+        return 1
+    fi
+
+    # Exactly ONE controlled restart to activate the new secret.
+    if ! systemctl restart sing-box 2>/dev/null; then
+        _rollback_existing_api_auth "$backup_cfg" "$anchor_had" "$anchor_bak" "$old_version"
+        return 1
+    fi
+    if ! phase_d_health_ok "$old_version" "yes"; then
+        _rollback_existing_api_auth "$backup_cfg" "$anchor_had" "$anchor_bak" "$old_version"
+        return 1
+    fi
+    if ! ensure_hy2_hopping_after_restart; then
+        _rollback_existing_api_auth "$backup_cfg" "$anchor_had" "$anchor_bak" "$old_version"
+        return 1
+    fi
+
+    [ -n "$anchor_bak" ] && rm -f "$anchor_bak"
+    info "service.api 认证迁移完成: localhost monitor-api 已启用认证（受控重启一次，binary 未变更）"
+    info "monitor-api.secret 派生文件: $SB_API_SECRET_FILE（root:root 0600，以服务端配置为唯一权威来源）"
+    info "迁移前备份已保留: $backup_cfg"
+    return 0
+}
+# <<< existing-api-auth narrow migration <<< ===================================
+
 # >>> phase-d singbox-1.14-api >>> =============================================
 # Phase D: safe production upgrade to 1.14.x stable with a localhost-only
 # service.api (top-level "services" entry); the installer is a single
@@ -3574,6 +3955,11 @@ if has_any_installation_marker; then
     # menu is never entered, so no management mutation can continue on an
     # unsafe or desynced-credential state.
     repair_existing_install_security_baseline
+    # Narrow service.api auth migration for old servers: exact-with-secret and
+    # structurally-compliant-but-secret-less states are handled here, BEFORE
+    # the menu. A declined or not-applicable migration NEVER aborts the
+    # installer; a failing permission/anchor repair above still does.
+    maybe_migrate_existing_api_auth || true
     echo ""
     info "sing-box-reality-hysteria2 已安装"
     show_status

@@ -1,0 +1,8 @@
+# Local tool artifacts (never part of the repo)
+__pycache__/
+*.pyc
+
+# Local scratch / debug files
+.dbg-restore.sh
+sc.zip
+sc-bin/

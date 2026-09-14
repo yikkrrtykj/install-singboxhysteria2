@@ -199,3 +199,53 @@ PY
 
 monitor_env_now() { date +%s; }
 monitor_env_mtime() { stat -c '%Y' "$1" 2>/dev/null || echo 0; }
+
+# ---------------------------------------------------------------------------
+# Compatibility preflight (capability detection -- never distro-version
+# branching; supported baselines: Ubuntu 22.04 / 24.04 / 26.04 LTS).
+# The runtime entrypoints FAIL CLOSED on any missing required command with a
+# single clear diagnostic -- no degraded mode, no silent downgrade.
+# SBMON_REQUIRED_COMMANDS may override the default set for fixtures/tests;
+# setting it (even to empty) replaces the default entirely.
+# ---------------------------------------------------------------------------
+monitor_env_require_commands() { # monitor_env_require_commands -> rc 0 all present
+    local missing="" cmd
+    local pybin="${SBMON_PYTHON3:-python3}"
+    # The python wrapper actually used by the shims is checked first.
+    case "$pybin" in
+        */*) [ -x "$pybin" ] || missing=" $pybin" ;;
+        *)   command -v "$pybin" >/dev/null 2>&1 || missing=" $pybin" ;;
+    esac
+    local default_set="systemctl journalctl jq ss stat sha256sum mktemp flock"
+    local list="${SBMON_REQUIRED_COMMANDS-$default_set}"
+    for cmd in $list; do
+        command -v "$cmd" >/dev/null 2>&1 || missing="$missing $cmd"
+    done
+    if [ -n "$missing" ]; then
+        printf 'monitor: missing required runtime command(s):%s -- fail-closed, refusing to continue (install the packages providing them)\n' "$missing" >&2
+        return 1
+    fi
+    return 0
+}
+
+# Environment diagnostics for deploy/canary records -- NO secrets, stderr
+# only (stdout stays a single JSON line for monitor-health). os-release
+# ID+VERSION_ID, python/systemd versions, kernel release; ssh version only
+# when an ssh binary exists ("when relevant").
+monitor_env_record_environment() {
+    if [ -r /etc/os-release ]; then
+        local os_id os_ver
+        os_id="$(sed -n 's/^ID=//p' /etc/os-release | head -n1 | tr -d '"')"
+        os_ver="$(sed -n 's/^VERSION_ID=//p' /etc/os-release | head -n1 | tr -d '"')"
+        printf 'monitor: environment os=%s %s\n' "${os_id:-unknown}" "${os_ver:-unknown}"
+    else
+        printf 'monitor: environment os-release unreadable\n'
+    fi
+    local pybin="${SBMON_PYTHON3:-python3}"
+    "$pybin" --version 2>&1 | sed 's/^/monitor: environment /' || true
+    "${SBMON_SYSTEMCTL:-systemctl}" --version 2>/dev/null | head -n1 | sed 's/^/monitor: environment /' || true
+    if command -v ssh >/dev/null 2>&1; then
+        ssh -V 2>&1 | sed 's/^/monitor: environment /' || true
+    fi
+    printf 'monitor: environment kernel=%s\n' "$(uname -r)"
+}

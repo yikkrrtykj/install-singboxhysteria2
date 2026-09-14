@@ -48,6 +48,14 @@ COLLECTOR="$APP_DIR/app/monitor-v2/collector.py"
 [ -n "$DATA_ROOT" ] || { echo "monitor-service: data root required (explicit contract, no \$PWD inference)" >&2; exit 1; }
 STATE_DIR="$DATA_ROOT/state"
 
+# Compatibility preflight (capability detection, never distro-version
+# branching): fail closed BEFORE any state is touched when a required
+# runtime command is missing (see monitor-env.sh for the required set).
+if ! monitor_env_require_commands; then
+    exit 1
+fi
+monitor_env_record_environment   # diagnostics (stderr/journal), no secrets
+
 SBMON_ENV_MODE=""
 SBMON_ENV_API_URL=""
 SBMON_ENV_API_SECRET_FILE=""
