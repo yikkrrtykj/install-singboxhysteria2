@@ -63,7 +63,11 @@ assert_grep 'restore_file_atomically "\$backup_cfg" "\$SB_SERVER_CONFIG"' "$INST
 assert_grep 'generate_api_secret' "$INSTALL_SH" "secret comes from the existing CSPRNG contract"
 assert_grep '"secret": "\$monitor_api_secret"' "$INSTALL_SH" "fresh install path still embeds a generated API secret (X18)"
 assert_grep 'openssl rand -hex 32' "$INSTALL_SH" "fresh install CSPRNG unchanged (X18)"
-assert_rc 1 "$(grep -c 'maybe_migrate_existing_api_auth || true' "$INSTALL_SH")" "migration entry point wired exactly once (existing-install path only, X18)"
+assert_grep 'malformed-secret' "$INSTALL_SH" "malformed secret shape is a distinct refused classification (narrow migration never overwrites unknown credential types)"
+assert_grep 'rm -f -- "\$SB_API_SECRET_FILE"' "$INSTALL_SH" "no-anchor rollback uses a checked rm -f --"
+assert_grep '无法删除迁移新建的 monitor-api.secret' "$INSTALL_SH" "anchor removal failure escalates to MANUAL INTERVENTION (never a claimed successful rollback)"
+assert_rc 0 "$(grep -c 'maybe_migrate_existing_api_auth || true' "$INSTALL_SH")" "no swallow-failure wiring: '|| true' is banned (failures MUST abort the existing-install flow)"
+assert_rc 1 "$(grep -cE '^[[:space:]]*maybe_migrate_existing_api_auth$' "$INSTALL_SH")" "migration entry point wired exactly once, bare (existing-install path only, X18)"
 # The fresh-install flow must never call the migration wrapper.
 if awk '/^monitor_api_secret=/{fresh=1} fresh && /maybe_migrate_existing_api_auth/{bad=1} END{exit bad?1:0}' "$INSTALL_SH"; then
     pass "fresh-install block never calls the migration wrapper (X18)"
@@ -214,6 +218,18 @@ chmod +x "$TMP/mock-sb"
 
 . "$TMP/mocks.sh"
 . "$TMP/blocks.sh"
+
+# Targeted failure injection: RM_FAIL_ANCHOR=1 makes deleting the migration's
+# own anchor fail (used by X12c). Everything else falls through to real rm.
+rm() {
+    if [ "${RM_FAIL_ANCHOR:-0}" = "1" ] && [ "$#" -gt 0 ]; then
+        local a
+        for a in "$@"; do
+            [ -n "${SB_API_SECRET_FILE:-}" ] && [ "$a" = "$SB_API_SECRET_FILE" ] && return 1
+        done
+    fi
+    command rm "$@"
+}
 
 # ------------------------------------------------------------------ helpers --
 # Existing-install shape: Phase C identity model intact, Reality/HY2 creds, a
@@ -484,6 +500,49 @@ if [ "$cfg_sha" = "$(sha "$SB_SERVER_CONFIG")" ]; then pass "zero mutation (X7b)
 assert_grep 'Phase D 修复/升级路径' "$OUTDIR/x7b.out" "Phase D path reported (X7b)"
 assert_no_grep '检测到旧版 service.api' "$OUTDIR/x7b.out" "no prompt for absent api"
 
+section "X7c: secret-shape contract (finalized): ONLY the absent secret key auto-migrates"
+# The explicitly approved narrow-migration shape is a MISSING secret: the
+# "secret" KEY ABSENT on the monitor-api entry -- nothing to overwrite. A
+# PRESENT key with an unusable value ("", null, number, boolean, object,
+# array) is MALFORMED: it is never treated as missing and never overwritten;
+# the narrow migration refuses and points to Phase D. The lock re-check
+# enforces the same rule against a concurrent shape change between prompt
+# and lock.
+
+# X7c-0: secret KEY absent -> promptable, approved migration works
+reset_sandbox
+write_existing_config
+jq 'del(.services[0].secret)' "$SB_SERVER_CONFIG" > "$SB_SERVER_CONFIG.t" && mv -f "$SB_SERVER_CONFIG.t" "$SB_SERVER_CONFIG"
+cfg_sha="$(sha "$SB_SERVER_CONFIG")"
+maybe_migrate_existing_api_auth < "$(answer_file y)" > "$OUTDIR/x7c0.out" 2>&1
+assert_rc 0 $? "absent secret key migrates when approved"
+migrated="$(jq -r --arg tag monitor-api '[(.services // [])[] | select(.tag == $tag)][0].secret // ""' "$SB_SERVER_CONFIG" | tr -d '\r')"
+if [[ "$migrated" =~ ^[0-9a-f]{64}$ ]]; then pass "absent secret key replaced by a valid generated secret"; else fail "absent secret key not migrated: '$migrated'"; fi
+assert_rc 1 "$(grep -c 'restart sing-box' "$SYSTEMCTL_LOG")" "exactly one controlled restart (X7c-0)"
+register_secret
+
+# X7c-1..6: PRESENT but malformed secret values ("", null, number, boolean,
+# object, array) -> refuse, zero mutation, no prompt, no anchor, no restart,
+# Phase D reported. Malformed is NEVER classified as missing/overwritten.
+for shape in '""' 'null' '12345' 'true' '{"boss":1}' '["a","b"]'; do
+    reset_sandbox
+    write_existing_config
+    jq --argjson v "$shape" '.services[0].secret = $v' "$SB_SERVER_CONFIG" > "$SB_SERVER_CONFIG.t" \
+        && mv -f "$SB_SERVER_CONFIG.t" "$SB_SERVER_CONFIG"
+    cfg_sha="$(sha "$SB_SERVER_CONFIG")"; bin_sha="$(sha "$SB_SING_BOX_BIN")"
+    maybe_migrate_existing_api_auth < "$(answer_file y)" > "$OUTDIR/x7c-shape.out" 2>&1
+    assert_rc 0 $? "malformed secret ($shape) is a refusal, not an error"
+    assert_no_grep '检测到旧版 service.api' "$OUTDIR/x7c-shape.out" "no prompt for malformed secret ($shape)"
+    assert_grep 'Phase D 修复/升级路径' "$OUTDIR/x7c-shape.out" "Phase D path reported for malformed secret ($shape)"
+    if [ "$cfg_sha" = "$(sha "$SB_SERVER_CONFIG")" ] && [ "$bin_sha" = "$(sha "$SB_SING_BOX_BIN")" ]; then
+        pass "zero mutation for malformed secret ($shape)"
+    else
+        fail "mutated on malformed secret ($shape)"
+    fi
+    assert_rc 0 "$([ -f "$SB_API_SECRET_FILE" ] && echo 1 || echo 0)" "no anchor created for malformed secret ($shape)"
+    assert_rc 0 "$(grep -c 'restart sing-box' "$SYSTEMCTL_LOG")" "zero restart for malformed secret ($shape)"
+done
+
 section "X8: candidate sing-box check failure -> no live mutation"
 reset_sandbox
 write_existing_config
@@ -564,6 +623,24 @@ export RESTART_FAIL_MODE=none
 assert_grep '请立即人工介入' "$OUTDIR/x12b.out" "manual intervention stated"
 assert_no_grep '已回滚到迁移前状态' "$OUTDIR/x12b.out" "must NOT claim successful recovery"
 assert_rc 1 "$(ls -1 "$SANDBOX"/sbconfig_server.json.bak.* 2>/dev/null | wc -l)" "backups kept for manual recovery"
+
+section "X12c: no-anchor pre-state + anchor removal failure -> MANUAL INTERVENTION"
+# The pre-state had NO anchor; rollback must remove the derived file created
+# by the migration with a checked rm. A failed removal is escalated (nonzero,
+# MANUAL INTERVENTION) and NEVER reported as a successful rollback.
+reset_sandbox
+write_existing_config
+cfg_sha="$(sha "$SB_SERVER_CONFIG")"
+export RESTART_FAIL_MODE=all
+export RM_FAIL_ANCHOR=1
+maybe_migrate_existing_api_auth < "$(answer_file y)" > "$OUTDIR/x12c.out" 2>&1
+assert_rc 1 $? "migration fails when anchor removal fails"
+assert_rc 1 "$([ -e "$SB_API_SECRET_FILE" ] || [ -L "$SB_API_SECRET_FILE" ] && echo 1 || echo 0)" "anchor NOT removed (removal refused)"
+assert_grep '无法删除迁移新建的 monitor-api.secret' "$OUTDIR/x12c.out" "removal failure escalated to MANUAL INTERVENTION"
+assert_no_grep '已回滚到迁移前状态' "$OUTDIR/x12c.out" "never claims successful rollback"
+if [ "$cfg_sha" = "$(sha "$SB_SERVER_CONFIG")" ]; then pass "config still restored (anchor failure does not block the config rollback)"; else fail "config not restored (X12c)"; fi
+unset RM_FAIL_ANCHOR
+export RESTART_FAIL_MODE=none
 
 section "X13: post-restart auth health failure -> rollback verified"
 reset_sandbox

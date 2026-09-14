@@ -1608,15 +1608,23 @@ harden_sensitive_permissions() {
 # ==============================================================================
 
 # Read-only classification of the live service.api authentication state:
-#   exact       exactly one compliant monitor-api WITH a non-empty secret
-#   needed      exactly one compliant monitor-api, secret missing/empty
-#   absent      no monitor-api entry at all (narrow migration must NOT
-#               reinvent it -- that is the Phase D path)
-#   structural  monitor-api count/type/listen/port violate the contract
-#   unreadable  config missing or invalid JSON
-#   audit-error jq/audit failure (fail-closed: never "no problems")
+#   exact            exactly one compliant monitor-api WITH a non-empty string
+#                    secret
+#   needed           exactly one compliant monitor-api whose secret is MISSING
+#                    in the approved narrow-migration shape: key absent, null,
+#                    or an empty string -- the ONLY auto-migratable shape
+#   malformed-secret exactly one compliant monitor-api but the secret exists
+#                    with a NON-string type (number/bool/object/array):
+#                    narrow migration MUST refuse (overwriting an unknown
+#                    secret value/type is never a narrow change) -- the
+#                    normal Phase D repair/upgrade path is required
+#   absent           no monitor-api entry at all (narrow migration must NOT
+#                    reinvent it -- that is the Phase D path)
+#   structural       monitor-api count/type/listen/port violate the contract
+#   unreadable       config missing or invalid JSON
+#   audit-error      jq/audit failure (fail-closed: never "no problems")
 existing_api_auth_classify() { # existing_api_auth_classify <config>
-    local cfg="$1" problems count
+    local cfg="$1" problems count secret_type
     [ -f "$cfg" ] || { printf 'unreadable\n'; return 0; }
     if ! jq empty "$cfg" >/dev/null 2>&1; then
         printf 'unreadable\n'; return 0
@@ -1635,9 +1643,28 @@ existing_api_auth_classify() { # existing_api_auth_classify <config>
     fi
     if phase_d_api_service_exact "$cfg"; then
         printf 'exact\n'
-    else
-        printf 'needed\n'
+        return 0
     fi
+    # Not exact: classify the secret VALUE SHAPE. "Missing" means the secret
+    # KEY IS ABSENT -- nothing to overwrite. A PRESENT key with an unusable
+    # value ("", null, number, boolean, object, array) is malformed-secret:
+    # it is NEVER treated as missing and never overwritten by the narrow
+    # migration (the normal Phase D path owns it).
+    secret_state="$(jq -r --arg tag "$PHASE_D_API_TAG" '
+        ([(.services // [])[] | select(.tag == $tag)][0]) as $svc |
+        if ($svc | type) != "object" then "absent-service"
+        elif ($svc | has("secret") | not) then "absent"
+        elif ($svc.secret | type) == "string" then
+            (if ($svc.secret | length) == 0 then "empty-string" else "nonempty-string" end)
+        else ($svc.secret | type)
+        end' "$cfg" 2>/dev/null | tr -d '\r')" || { printf 'audit-error\n'; return 0; }
+    case "$secret_state" in
+        absent) printf 'needed\n' ;;                  # key absent = genuinely missing
+        empty-string)  printf 'malformed-secret\n' ;; # present "" -> refuse
+        null)          printf 'malformed-secret\n' ;; # present null -> refuse
+        nonempty-string) printf 'malformed-secret\n' ;; # unreachable edge (exact covers it) -> fail-closed
+        *)             printf 'malformed-secret\n' ;; # number/boolean/object/array -> refuse
+    esac
     return 0
 }
 
@@ -1645,9 +1672,16 @@ existing_api_auth_classify() { # existing_api_auth_classify <config>
 # Fresh installs never reach this function and are unaffected.
 #   exact      -> no prompt, no restart, never rotate; converge the derived
 #                 anchor from the authoritative config if it is missing/stale
-#   needed     -> explicit [y/N] confirmation OUTSIDE the lock (default NO);
-#                 declined -> ZERO changes, no restart, warn that Monitor v2
-#                 requires this migration before deployment
+#   needed     -> the secret KEY is ABSENT: explicit [y/N] confirmation
+#                 OUTSIDE the lock (default NO); declined -> ZERO changes,
+#                 no restart, warn that Monitor v2 requires this migration
+#                 before deployment
+#   malformed-
+#   secret     -> refuse: the secret KEY EXISTS but its value is unusable
+#                 ("", null, number, boolean, object, array). Malformed
+#                 values are NEVER treated as missing and never overwritten
+#                 -- that is not a narrow change. Zero changes, no prompt,
+#                 the Phase D repair/upgrade path is required
 #   absent /
 #   structural -> refuse: report that the normal Phase D repair/upgrade path
 #                 is required; zero changes, no prompt
@@ -1665,6 +1699,11 @@ maybe_migrate_existing_api_auth() {
             ;;
         needed)
             : ;;
+        malformed-secret)
+            warning "monitor-api 已配置 secret 但其类型/值形态不符合约定（非字符串或畸形值），窄迁移拒绝覆盖未知凭据"
+            warning "该环境需要正常的 Phase D 修复/升级路径，本次未做任何修改"
+            return 0
+            ;;
         absent|structural)
             warning "现有 service.api 结构不符合窄迁移条件（monitor-api 缺失或 type/listen/port/数量不合规），已跳过"
             warning "该环境需要正常的 Phase D 修复/升级路径，本次未做任何修改"
@@ -1713,7 +1752,18 @@ _rollback_existing_api_auth() { # <backup_cfg> <anchor_had> <anchor_bak> <old_ve
             return 1
         fi
     else
-        rm -f "$SB_API_SECRET_FILE" 2>/dev/null
+        # The pre-state had NO anchor: the derived file created by this
+        # migration must be removed. The rm return status is checked AND the
+        # actual absence is verified afterwards -- a failed removal is
+        # MANUAL INTERVENTION (nonzero), never a claimed successful rollback.
+        if ! rm -f -- "$SB_API_SECRET_FILE" 2>/dev/null; then
+            warning "回滚时无法删除迁移新建的 monitor-api.secret 派生文件（rm 返回非零: $SB_API_SECRET_FILE），请立即人工介入！备份: $backup_cfg"
+            return 1
+        fi
+        if [ -e "$SB_API_SECRET_FILE" ] || [ -L "$SB_API_SECRET_FILE" ]; then
+            warning "回滚时无法删除迁移新建的 monitor-api.secret 派生文件（$SB_API_SECRET_FILE），请立即人工介入！备份: $backup_cfg"
+            return 1
+        fi
     fi
     if ! systemctl restart sing-box 2>/dev/null; then
         warning "回滚后 restart sing-box 失败，请立即人工介入！备份: $backup_cfg"
@@ -1739,7 +1789,7 @@ _rollback_existing_api_auth() { # <backup_cfg> <anchor_had> <anchor_bak> <old_ve
 # lock so a concurrent first migration wins and a second invocation becomes an
 # idempotent no-op (same secret, no rotation, no restart).
 _migrate_existing_api_auth_locked() {
-    local problems count secret cand_secret old_version
+    local problems count secret cand_secret old_version secret_type
     local candidate_cfg backup_cfg anchor_bak=""
     local anchor_had=0
     [ -f "$SB_SERVER_CONFIG" ] || { warning "服务端配置不存在: $SB_SERVER_CONFIG"; return 1; }
@@ -1792,6 +1842,30 @@ _migrate_existing_api_auth_locked() {
         info "service.api 已配置认证（无需迁移），未修改任何内容"
         return 0
     fi
+
+    # Secret-shape re-check UNDER THE LOCK: only the explicitly approved
+    # "missing secret" shape -- the secret KEY ABSENT -- may be auto-migrated.
+    # A secret key that EXISTS with an unusable value ("", null, number,
+    # boolean, object, array) is malformed: it is never treated as missing
+    # and never overwritten. A concurrent change that made the secret
+    # malformed between the prompt and this lock is refused here --
+    # overwriting unknown credential material is never a narrow change.
+    secret_type="$(jq -r --arg tag "$PHASE_D_API_TAG" '
+        ([(.services // [])[] | select(.tag == $tag)][0]) as $svc |
+        if ($svc | type) != "object" then "absent-service"
+        elif ($svc | has("secret") | not) then "absent"
+        else ($svc.secret | type)
+        end' "$SB_SERVER_CONFIG" 2>/dev/null | tr -d '\r')" || {
+        warning "无法读取 monitor-api secret 类型（锁内复核失败）"
+        return 1
+    }
+    case "$secret_type" in
+        absent) : ;;
+        *)
+            warning "monitor-api secret 键存在但值形态不符合约定（$secret_type），窄迁移拒绝覆盖未知凭据；该环境需要 Phase D 修复/升级路径"
+            return 1
+            ;;
+    esac
 
     # Capture the pre-migration anchor state for rollback (the anchor is a
     # DERIVED file; if it did not exist, rollback removes any new one).
@@ -3957,9 +4031,11 @@ if has_any_installation_marker; then
     repair_existing_install_security_baseline
     # Narrow service.api auth migration for old servers: exact-with-secret and
     # structurally-compliant-but-secret-less states are handled here, BEFORE
-    # the menu. A declined or not-applicable migration NEVER aborts the
-    # installer; a failing permission/anchor repair above still does.
-    maybe_migrate_existing_api_auth || true
+    # the menu. Declined and not-applicable paths return 0 and NEVER abort the
+    # installer; any approved-migration / rollback / anchor / health failure
+    # returns nonzero and aborts the existing-install flow right here -- the
+    # menu is never entered on a failed migration (fail-closed).
+    maybe_migrate_existing_api_auth
     echo ""
     info "sing-box-reality-hysteria2 已安装"
     show_status

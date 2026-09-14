@@ -73,8 +73,21 @@ if [ -n "$v_line" ] && [ -n "$r_line" ] && [ "$v_line" -lt "$r_line" ]; then
 else
     fail "locked delete validates name syntax BEFORE the reserved check (v=$v_line r=$r_line)"
 fi
-backup_chmod="$(grep -c 'chmod 0600 "\$backup_path" 2>/dev/null\|chmod 0600 "\$backup_cfg" 2>/dev/null' "$INSTALL_SH")"
-assert_rc 2 "$backup_chmod" "both backup paths enforce 0600 explicitly"
+# Backup-mode hardening is asserted SCOPE-AWARE: the two ORIGINAL backup paths
+# keep their own per-function assertions, and the narrow-migration backup gets
+# a SEPARATE assertion (the global count would silently drift whenever another
+# transaction with its own backup is added).
+commit_body="$(awk '/^commit_server_config\(\) \{/,/^\}/' "$INSTALL_SH")"
+commit_chmod="$(printf '%s\n' "$commit_body" | grep -c 'chmod 0600 "\$backup_path" 2>/dev/null')"
+assert_rc 1 "$commit_chmod" "phase-c commit backup enforces 0600 explicitly (scope-aware)"
+upgrade_body="$(awk '/^_upgrade_singbox_1_14_locked\(\) \{/,/^\}/' "$INSTALL_SH")"
+upgrade_chmod="$(printf '%s\n' "$upgrade_body" | grep -c 'chmod 0600 "\$backup_cfg" 2>/dev/null')"
+assert_rc 1 "$upgrade_chmod" "phase-d upgrade backup enforces 0600 explicitly (scope-aware)"
+migration_body="$(awk '/^_migrate_existing_api_auth_locked\(\) \{/,/^\}/' "$INSTALL_SH")"
+migration_chmod="$(printf '%s\n' "$migration_body" | grep -c 'chmod 0600 "\$backup_cfg" 2>/dev/null')"
+assert_rc 1 "$migration_chmod" "narrow-migration config backup enforces 0600 explicitly (separate assertion)"
+anchor_bak_chmod="$(printf '%s\n' "$migration_body" | grep -c 'chmod 0600 "\$anchor_bak"')"
+assert_rc 1 "$anchor_bak_chmod" "narrow-migration anchor backup enforces 0600 explicitly"
 assert_no_grep '派生文件修复失败，本机 collector 认证可能受影响' "$INSTALL_SH" "fail-open sync warning is gone"
 repair_body="$(awk '/^repair_existing_install_security_baseline\(\) \{/,/^\}/' "$INSTALL_SH")"
 assert_grep 'harden_sensitive_permissions \|\|' <(printf '%s\n' "$repair_body") "permission repair failure aborts via error()"
