@@ -2300,8 +2300,9 @@ _rollback_upgrade() { # _rollback_upgrade <backup_bin> <backup_cfg> <old_version
     local backup_bin="$1" backup_cfg="$2" old_version="$3"
     local require_api="no"
     warning "升级失败，执行双回滚（binary + config）..."
-    if ! cp -a "$backup_bin" "$SB_SING_BOX_BIN" || ! cp -a "$backup_cfg" "$SB_SERVER_CONFIG"; then
-        warning "回滚文件恢复失败，请立即人工介入！备份: $backup_bin / $backup_cfg"
+    if ! restore_file_atomically "$backup_cfg" "$SB_SERVER_CONFIG" 0600 ||
+       ! restore_file_atomically "$backup_bin" "$SB_SING_BOX_BIN" 0755; then
+        warning "回滚文件原子恢复失败，请立即人工介入！备份: $backup_bin / $backup_cfg"
         return 1
     fi
     if ! systemctl restart sing-box 2>/dev/null; then
@@ -2484,11 +2485,11 @@ _upgrade_singbox_1_14_locked() {
         # restart ever runs the mixed pair. Backups are KEPT until the
         # recovered state is proven healthy.
         warning "原子替换 config 失败，执行双恢复（config → binary）..."
-        if ! cp -a "$backup_cfg" "$SB_SERVER_CONFIG"; then
+        if ! restore_file_atomically "$backup_cfg" "$SB_SERVER_CONFIG" 0600; then
             warning "恢复 config 失败，请立即人工介入！备份: $backup_bin / $backup_cfg"
             return 1
         fi
-        if ! cp -a "$backup_bin" "$SB_SING_BOX_BIN"; then
+        if ! restore_file_atomically "$backup_bin" "$SB_SING_BOX_BIN" 0755; then
             warning "恢复 binary 失败，请立即人工介入！备份: $backup_bin / $backup_cfg"
             return 1
         fi
