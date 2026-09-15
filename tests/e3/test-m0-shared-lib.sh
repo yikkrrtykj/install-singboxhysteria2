@@ -55,7 +55,10 @@ systemctl(){
       ;;
     reload)
       RELOAD_COUNT=$((RELOAD_COUNT+1))
-      if [ "$SYSTEMCTL_MODE" = fail-once ] && [ "$RELOAD_COUNT" -eq 1 ]; then return 1; fi
+      case "$SYSTEMCTL_MODE" in
+        fail-once) [ "$RELOAD_COUNT" -eq 1 ] && return 1 ;;
+        fail-all) return 1 ;;
+      esac
       return 0
       ;;
   esac
@@ -77,8 +80,18 @@ make_candidate(){
   printf '%s\n' "$c"
 }
 
+printf '\n== restore primitive preserves requested binary mode ==\n'
+printf '#!/bin/sh\nexit 0\n' > "$TMP/bin.bak"
+chmod 0755 "$TMP/bin.bak"
+printf 'broken\n' > "$TMP/bin.live"
+restore_file_atomically "$TMP/bin.bak" "$TMP/bin.live" 0755 >/dev/null 2>&1
+assert_rc 0 $? '0755 atomic restore succeeds'
+assert_rc "$(sha256sum "$TMP/bin.bak" | awk '{print $1}')" "$(sha256sum "$TMP/bin.live" | awk '{print $1}')" 'binary restore is byte-identical'
+assert_rc 755 "$(stat -c %a "$TMP/bin.live")" 'binary restore mode remains executable'
+
 printf '\n== success without running service ==\n'
 write_live
+SYSTEMCTL_MODE=stopped
 cand="$(make_candidate new)"
 commit_server_config "$cand" 'test-success' >/dev/null 2>&1
 assert_rc 0 $? 'commit succeeds while service is stopped'
@@ -113,6 +126,26 @@ printf '%s\n' "$res" | jq -e '
   .health_verified == true and
   (.backup_path | type == "string" and length > 0)
 ' >/dev/null && pass 'structured rollback result is complete' || fail 'structured rollback result mismatch'
+
+printf '\n== rollback runtime cannot be confirmed ==\n'
+write_live
+before="$(sha256sum "$SB_SERVER_CONFIG" | awk '{print $1}')"
+SYSTEMCTL_MODE=fail-all
+RELOAD_COUNT=0
+cand="$(make_candidate manual)"
+commit_server_config "$cand" 'test-manual' >/dev/null 2>&1
+assert_rc 1 $? 'manual-intervention path keeps CLI rc=1'
+after="$(sha256sum "$SB_SERVER_CONFIG" | awk '{print $1}')"
+assert_rc "$before" "$after" 'manual-intervention path still restores disk bytes'
+res="$(cm_transaction_result_json)"
+printf '%s\n' "$res" | jq -e '
+  .phase == "rollback_manual" and
+  .changed == false and
+  .reload_performed == true and
+  .rollback_attempted == true and
+  .rollback_ok == false and
+  .health_verified == false
+' >/dev/null && pass 'manual-intervention structured result does not claim rollback success' || fail 'manual-intervention structured result falsely claims success'
 
 printf '\nPASS=%d FAIL=%d\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
