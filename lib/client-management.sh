@@ -94,13 +94,20 @@ reload_health_ok() {
 
 # --------------------------------------------------------------- atomic restore --
 # Caller holds with_client_lock. Exact backup bytes are copied to a unique temp
-# in the target directory, hardened to 0600, atomically renamed, then verified.
-restore_file_atomically() { # <backup> <live>
-    local backup="$1" live="$2" tmp=""
+# in the target directory, hardened to the requested mode, atomically renamed,
+# then verified byte-for-byte. Config/state callers omit <mode> and get 0600;
+# the Phase-D binary rollback passes 0755. This is the ONE restore primitive for
+# both generic config transactions and the Phase-D paired transaction.
+restore_file_atomically() { # <backup> <live> [mode=0600]
+    local backup="$1" live="$2" mode="${3:-0600}" tmp=""
     if [ -z "$backup" ] || [ -z "$live" ]; then
         warning "restore_file_atomically: 参数不能为空"
         return 1
     fi
+    case "$mode" in
+        0600|0644|0755) : ;;
+        *) warning "restore_file_atomically: 非法目标权限 $mode"; return 1 ;;
+    esac
     if [ -L "$backup" ] || [ ! -f "$backup" ]; then
         warning "备份不是普通文件（缺失或符号链接），拒绝恢复: $backup"
         return 1
@@ -114,8 +121,8 @@ restore_file_atomically() { # <backup> <live>
         rm -f "$tmp"
         return 1
     fi
-    if ! chmod 0600 "$tmp" 2>/dev/null; then
-        warning "恢复临时文件权限收紧为 0600 失败: $tmp"
+    if ! chmod "$mode" "$tmp" 2>/dev/null; then
+        warning "恢复临时文件权限设置为 $mode 失败: $tmp"
         rm -f "$tmp"
         return 1
     fi
@@ -225,7 +232,7 @@ commit_server_config() { # <candidate> <description>
         warning "reload 后健康检查失败（$description），自动回滚..."
         CM_TX_PHASE="rollback"
         CM_TX_ROLLBACK_ATTEMPTED=true
-        if ! restore_file_atomically "$backup_path" "$SB_SERVER_CONFIG"; then
+        if ! restore_file_atomically "$backup_path" "$SB_SERVER_CONFIG" 0600; then
             CM_TX_PHASE="rollback_manual"
             CM_TX_ROLLBACK_OK=false
             warning "回滚恢复失败，请立即人工介入！备份: $backup_path"
@@ -234,13 +241,14 @@ commit_server_config() { # <candidate> <description>
         CM_TX_ROLLBACK_OK=true
         CM_TX_CHANGED=false
 
-        # The rollback reload is a second reload attempt; the boolean records
-        # that reload occurred at least once during the transaction.
         if reload_running_singbox && reload_health_ok; then
             CM_TX_HEALTH_VERIFIED=true
             warning "已回滚并重新加载上一份配置: $backup_path"
         else
+            # Disk bytes are restored, but rollback is not operationally
+            # complete until the previous runtime is confirmed healthy.
             CM_TX_PHASE="rollback_manual"
+            CM_TX_ROLLBACK_OK=false
             warning "已回滚配置文件，但服务未能确认恢复，请立即人工检查！备份: $backup_path"
         fi
         return 1
