@@ -154,10 +154,11 @@ HY2 多个逻辑连接共享同一 QUIC source endpoint 属正常现象，按独
 ## 测试
 
 ```bash
-# E1 回归（188 断言：E1-01..E1-22 + 官方事件 fixture + T10 请求/响应双向真帧验证 +
-# T11 空闲流心跳 + G1..G6 集成 canary 门槛：合成判定 A-K、USER+INBOUND 作用域
-# L1-L4/combo、strict 环境门槛 L5-L8）。脚本末尾只有唯一 exit，并用
-# EXPECTED_PASS 门槛强制“跑满 188 且全过”才算成功。
+# E1 回归（226 断言：E1-01..E1-22 + 官方事件 fixture + T10 请求/响应双向真帧验证 +
+# T11 空闲流心跳 + G1..G8 集成 canary 门槛：合成判定 A-K、USER+INBOUND 作用域
+# L1-L4/combo、strict 环境门槛 L5-L8、CLOSE_GRACE_WINDOW 语义 GR1-GR9、
+# closed_ids 证据投影与 20-entry 展示缓存 eviction 守卫 G8）。
+# 脚本末尾只有唯一 exit，并用 EXPECTED_PASS 门槛强制“跑满 226 且全过”才算成功。
 bash tests/test-monitor-v2-e1.sh
 
 # Linux 集成（无门槛的观察运行在非 VPS 环境 SKIP=0）
@@ -186,6 +187,28 @@ ID delta（本窗口新 CLOSED/finalize）。`active_connections > 0` 永远不�
   过不了关；
 - `REQUIRE_CLOSED=1`：必须出现 baseline 之外的新关闭 ID，否则
   FAIL: no CLOSED/finalize evidence observed。
+- `CLOSE_GRACE_WINDOW`（默认 240 秒）：**仅当** REQUIRE_CLOSED=1 且 primary
+  window 的唯一缺项是 CLOSED/finalize 门禁（USER/INBOUND/traffic delta/
+  lifecycle/stale 全部已过）时，进入补窗：**原始 baseline 保持权威**（不重拍）、
+  USER/INBOUND 作用域不变、兄弟协议的 closure 与 active 连接**永不**替代
+  CLOSED、grace 期间任何 stale / collector 失败 / identity 冲突一律 FAIL；
+  补窗内出现 baseline 之外的新 recent-closed `Connection.id` → PASS，
+  超时 → FAIL。grace **绝不**"救活" primary window 的 traffic/USER/INBOUND
+  失败（那些直接 FAIL，不进补窗）。
+- **CLOSED 证据通道与 20-entry 展示缓存 eviction**：`recent_connections` 只是
+  RECENT 展示缓存（每设备最新 20 条）；繁忙设备在 240s grace 内关闭 >20 条
+  更新连接时可能把目标 id 挤出该缓存。因此快照含 additive 的每设备
+  `closed_ids`（≤512、newest-first、行只含 `id`/`inbound`/`closed_at`，
+  TTL 内全部 finalize id），gate 的 closed-id delta 读两者的**并集**——
+  展示缓存 eviction 不再造成假 FAIL。方向性保证：cap 只丢**最旧**行，
+  加上 baseline 差集防重放，eviction 只可能造成假 FAIL，**绝不可能**造成
+  假 PASS。
+  **残余风险（显式声明）**：若同一设备在 TTL 窗口（≤600s）内出现
+  **>512 条更新**的关闭，最旧的 `closed_ids` 行会被丢弃，目标 id 的证据
+  可能随之丢失 → false FAIL。这需要单设备约 >2 次/秒的**持续**关闭速率
+  贯穿整个 grace 窗口，超出 canary 场景（单客户端生命周期验证）两个数量级；
+  且失败方向安全（绝不产生假 PASS）。保留 cap 是为了给快照 JSON 体量一个
+  有界上界。
 
 strict canary：只要设置了任一门槛（EXPECT_USER / EXPECT_INBOUND /
 REQUIRE_CLOSED=1），sing-box binary 缺失或 service.api 不可达 = FAIL
@@ -216,6 +239,54 @@ bash tests/monitor-v2-integration-e1.sh
 
 测试 fixture 位于 `monitor-v2/fixtures/events-*.json`，字段与官方 proto 对应
 （NEW/UPDATE/CLOSED、reset、uplinkDelta/downlinkDelta、uplinkTotal/downlinkTotal）。
+
+## 平台支持矩阵与兼容性策略
+
+支持矩阵（经 CI 三版本矩阵实测：Phase C / Phase D / S0 / Legacy / E1 / E2 /
+E4 / Packaging / existing-api-auth migration / journal-time 兼容套件全部通过）：
+
+| 平台 | 状态 |
+| --- | --- |
+| Ubuntu 22.04 LTS | supported / tested |
+| Ubuntu 24.04 LTS | supported / tested |
+| Ubuntu 26.04 LTS | supported / tested |
+| 其他 Ubuntu 版本 / 其他发行版 | not yet guaranteed |
+
+兼容性策略（对 monitor-v2 全部代码路径生效）：
+
+- **能力检测优先**：运行时差异一律按能力/特性检测分支（如 `command -v` 预检、
+  systemd 指令验证），**不**以 `/etc/os-release` 版本号做主分支。
+- **绝不削弱安全**：不为迁就某个更新/更旧的发行版而削弱加固（unit 硬化指令、
+  loopback 契约、鉴权要求）。systemd 指令随版本有差异时，优先采用三者都支持
+  的可移植子集；**任何安全关键指令都不会被静默忽略**——CI 在三个基线上跑
+  `systemd-analyze verify` 并把 "unknown/unsupported directive" 视为失败。
+- **缺失能力 fail-closed**：预检发现必需命令缺失即带清晰诊断立即失败，
+  绝不降级运行。命令集按消费者拆分并逐命令记录用途：
+  部署变更路径（install/upgrade/rollback/uninstall）要求全集
+  `python3` `systemctl` `journalctl` `jq` `ss` `flock` `stat` `sha256sum`
+  `mktemp`（`sbmon_preflight_commands`）；运行时 shim 只要求实际依赖
+  （monitor-service = `python3`；monitor-health = `python3` `systemctl`
+  `stat`，见 `monitor_env_require_commands`）。
+  `SBMON_REQUIRED_COMMANDS` 覆写仅限显式测试门
+  （fixture / `SBMON_TEST_ALLOW_REQUIRED_COMMANDS_OVERRIDE=1`）之后生效；
+  生产调用携带该覆写会被拒绝（fail-closed），预检不可被绕过。
+- **service.api 契约全版本一致**：loopback-only URL 契约（`127.0.0.1` /
+  `localhost` / `::1`）与鉴权要求（web 模式强制 `SBMON_API_SECRET_FILE`）
+  在三个基线上逐字节相同，无任何版本例外。
+- **Python 兼容**：以最老支持基线（Ubuntu 22.04 默认 **Python 3.10**）为下限；
+  不依赖 3.11+ 语法/stdlib 行为（例如 `datetime.fromisoformat` 不接受 `Z`
+  后缀——journal 时间规范化显式转换，见下）。CI 矩阵在三个基线的默认
+  解释器上运行全部测试。
+- **journal 时间兼容（真实 VPS canary 发现 B6，2026-09-14，Ubuntu 22.04）**：
+  Ubuntu 22.04 的 `journalctl --since` **拒绝 raw RFC3339 时间戳**
+  （实测 `2026-09-14T15:51:50Z`）。因此：内部 canary 时间戳恒为 RFC3339/UTC；
+  任何 `journalctl --since` 之前必须经 `journal_time_normalize_jctl`
+  （`tests/lib/journal-time.sh`，Python datetime，fail-closed）规范化为本地
+  `"YYYY-MM-DD HH:MM:SS"`；**绝不**把 raw `...T...Z` 直接传给 journalctl。
+  回归测试：`tests/test-journal-time-compat.sh`。
+- **环境诊断无泄密**：部署与运行时预检记录 `/etc/os-release` 的 `ID` +
+  `VERSION_ID`、`python3 --version`、`systemd --version` 首行、`uname -r`，
+  存在 `ssh` 时记录 `ssh -V`；绝不打印 conf 值/secret/快照内容。
 
 ## Phase E2 -- 只读 Web Dashboard（本次新增）
 
@@ -295,6 +366,50 @@ nosniff`、`Referrer-Policy: no-referrer`、`X-Frame-Options: DENY`；
 HTTP 表面固定为 GET/POST（其余方法一律 405 + `Allow: GET, POST`），
 请求体上限 64 KiB（malformed Content-Length → 400，超限 → 413，
 chunked → 400 并断连）。
+
+### 访问 loopback-only dashboard（SSH 端口转发）
+
+默认监听 `127.0.0.1:9191`，**不**对公网开放。推荐的访问方式是 SSH 本地端口转发
+（Windows / Linux / macOS 通用）：
+
+```bash
+ssh -L 19191:127.0.0.1:9191 root@SERVER_IP
+```
+
+保持该 SSH 会话打开，然后在浏览器访问：
+
+```text
+http://127.0.0.1:19191
+```
+
+可选的纯隧道形式（`-N`，不打开远程 shell）：
+
+```bash
+ssh -N -L 19191:127.0.0.1:9191 root@SERVER_IP
+```
+
+**注意**：部分 SSH 服务器/服务商环境会终止 `-N` 的纯转发（无 shell）会话。
+此时请改用上面的普通 shell 形式，或给纯隧道形式加上 keepalive：
+
+```bash
+ssh -N \
+  -o ServerAliveInterval=10 \
+  -o ServerAliveCountMax=6 \
+  -o ExitOnForwardFailure=yes \
+  -L 19191:127.0.0.1:9191 \
+  root@SERVER_IP
+```
+
+不要把修改 `sshd_config` 当作常规解法（保持服务器 SSH 配置原样）。
+
+### 白名单行为（为什么隧道访问无需加白）
+
+- `127.0.0.1` 与 `::1` 是**隐式放行**的（白名单默认为空即可本机/隧道访问）；
+- 因此 SSH 端口转发访问**不需要**把你的公网 SSH 来源 IP 加入 Monitor 白名单：
+  经隧道进来的浏览器连接，在 Monitor 看到的 socket 对端地址就是 loopback；
+- 如果在 web-setup 期间回答了 "n"，且从未写入过任何白名单条目，
+  `access.json` 可能**不存在**——这是合法状态，不是错误；
+- 浏览器连接经由 SSH 隧道到达 Monitor 时，表现为 loopback 来源。
 
 ### 数据存放（与 sing-box 配置严格分离）
 

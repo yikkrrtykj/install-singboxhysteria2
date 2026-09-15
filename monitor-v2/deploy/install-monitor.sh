@@ -231,8 +231,8 @@ _cmd_install_locked() { # <install|upgrade> [flags...]
     parse_flags install "$@"
 
     # --- precheck: fail closed BEFORE touching the filesystem ---
-    command -v "$SBMON_PYTHON3" >/dev/null 2>&1         || sbmon_die "缺少依赖 python3（预检失败，未做任何更改）"
-    command -v "$SBMON_SYSTEMCTL" >/dev/null 2>&1         || sbmon_die "缺少依赖 systemctl（预检失败，未做任何更改）"
+    sbmon_preflight_commands   # capability detection (python3/systemctl/journalctl/jq/ss/flock/stat/sha256sum/mktemp)
+    sbmon_record_environment   # diagnostics only (no secrets)
     [ -f "$DEPLOY_DIR/singbox-monitor.service.in" ] || sbmon_die "缺少 unit 模板"
     [ -d "$SBMON_REPO_MONITOR_DIR" ] || sbmon_die "缺少 monitor-v2 源目录: $SBMON_REPO_MONITOR_DIR"
 
@@ -412,6 +412,7 @@ sbmon_restore_original_after_rollback() { # <orig_id> <orig_active> <orig_enable
 }
 
 _cmd_rollback_locked() { # [release-id]   (F4: runs under the deploy lock)
+    sbmon_preflight_commands   # fail closed BEFORE any mutation
     local target="${1:-}"
     [ -L "$SBMON_APP_LINK" ] || sbmon_die "当前没有已激活的 release"
     local current
@@ -494,6 +495,29 @@ cmd_web_setup() {
     sbmon_with_deploy_lock _cmd_web_setup_locked
 }
 
+# Non-sensitive post-setup access hint (operator UX only). By contract this
+# NEVER prints or infers the server public IP, NEVER prints secrets, NEVER
+# auto-adds whitelist entries and NEVER touches firewall/sshd configuration.
+sbmon_print_web_access_hint() {
+    cat <<'EOF'
+
+Dashboard listens on loopback only:
+  127.0.0.1:9191
+
+From your workstation:
+  ssh -L 19191:127.0.0.1:9191 root@<server>
+
+Then open:
+  http://127.0.0.1:19191
+
+Note: 127.0.0.1 and ::1 are implicitly allowed, so SSH port-forward access
+does NOT require adding your public SSH source IP to the Monitor whitelist
+(the tunneled browser connection appears to Monitor as loopback). If you
+answered "n" during setup and no whitelist entry was ever written,
+access.json may not exist -- that is not an error.
+EOF
+}
+
 _cmd_web_setup_locked() {
     local release_id webapp
     release_id="$(sbmon_current_release_id)"
@@ -549,6 +573,7 @@ _cmd_web_setup_locked() {
         return 1
     fi
     sbmon_info "web setup 完成（auth.json / access.json 位于 $SBMON_STATE_ROOT，属主 $SBMON_USER）"
+    sbmon_print_web_access_hint
 
     if [ "$was_active" = 1 ]; then
         sbmon_info "重启 singbox-monitor 以加载新创建的 AuthStore（仅 Monitor，不触碰 sing-box）"
@@ -603,6 +628,7 @@ cmd_uninstall() {
 }
 
 _cmd_uninstall_locked() { # F4: runs under the deploy lock
+    sbmon_preflight_commands   # fail closed BEFORE any mutation
     sbmon_info "卸载 Monitor（仅 Monitor；不触碰 sing-box / 代理凭据 / 配置）"
     # R4-2: idempotency comes from CHECKING state, never from swallowing
     # errors. Already-absent states are fine; a FAILED stop/disable aborts

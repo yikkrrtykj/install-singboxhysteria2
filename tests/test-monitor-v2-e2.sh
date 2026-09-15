@@ -654,11 +654,48 @@ def group_stale():
         snap_d["devices"] == {} and snap_d["active_connections"] == 0
 
     # --- publisher freeze: health is evaluated at READ time -----------------
+    # The freeze is simulated by swapping the _publisher_thread attribute
+    # (read-time health must flag the wedged publisher). Swapping ALONE does
+    # NOT stop the REAL publisher thread: it keeps ticking every `poll`
+    # seconds and advancing the version, which made the "version does not
+    # advance" assertion a coin flip on slow runners (22.04 CI: the scrypt
+    # login + HTTP roundtrip occasionally outlasted a 0.15s poll).
+    #
+    # Deterministic freeze (TEST-ONLY; production broker.py is untouched):
+    #   1. wait on the broker's OWN synchronization primitive
+    #      (wait_for_snapshot) for the first publication -- never an
+    #      arbitrary sleep;
+    #   2. wait (bounded, content-based) until a PUBLISHED snapshot actually
+    #      carries the consumed RESET_BATCH. Note a plain long poll (e.g.
+    #      60s) would NOT be deterministic here: the publisher publishes
+    #      immediately at loop start, so the freeze could land BEFORE the
+    #      batch ever reached a publication and break the state-kept
+    #      assertion;
+    #   3. poison collector.snapshot() -- the PUBLISH loop is its ONLY
+    #      caller (the consumer thread uses consume()) -- so the real
+    #      publisher dies on its next tick, and JOIN it. After the join
+    #      NOTHING can advance the version while the consumer stays alive,
+    #      regardless of the poll interval or runner speed.
     frozen = make_stack(tempfile.mkdtemp(), password=PASSWORD,
                         whitelist=["127.0.0.5/32"], poll=0.15,
                         batches=[RESET_BATCH])
-    time.sleep(0.8)
     broker = frozen["broker"]
+    if not broker.wait_for_snapshot(timeout=15.0):
+        raise AssertionError("publisher never produced the first snapshot")
+    batch_deadline = time.time() + 30.0
+    while broker.snapshot().get("devices", {}).get("legacy", {}) \
+            .get("uplink_total") != 100.0:
+        if time.time() >= batch_deadline:
+            raise AssertionError(
+                "reset batch never reached a published snapshot")
+        time.sleep(0.05)
+    real_publisher = broker._publisher_thread
+    def _frozen_snapshot():
+        raise RuntimeError("publisher frozen by test")
+    broker._collector.snapshot = _frozen_snapshot
+    real_publisher.join(timeout=15)
+    if real_publisher.is_alive():
+        raise AssertionError("real publisher thread did not exit after freeze")
     version_before = broker.snapshot_json()[0]
     dead_thread = threading.Thread(target=lambda: None)
     dead_thread.start()

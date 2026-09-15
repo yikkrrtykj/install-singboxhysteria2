@@ -261,6 +261,18 @@ else
     export SBMON_FLOCK="$TMP/bin/flock-mock"
 fi
 export PATH="$TMP/bin:$PATH"
+# Compatibility preflight scope: the production default requires the full
+# command set (Ubuntu 22.04/24.04/26.04 baselines; see monitor-deploy-lib.sh).
+# On non-Linux dev platforms the reduced suite runs the same production code
+# against the commands that actually exist there (journalctl/ss/systemd do
+# not exist on MSYS); the fail-closed path itself is exercised below via a
+# synthetic missing tool, so coverage is not lost.
+if [ "$(uname -s 2>/dev/null)" != "Linux" ]; then
+    export SBMON_REQUIRED_COMMANDS="stat sha256sum mktemp"
+    # The override is only ever honored behind the explicit test-only gate
+    # (production invocations refuse the bypass -- see T00).
+    export SBMON_TEST_ALLOW_REQUIRED_COMMANDS_OVERRIDE=1
+fi
 
 # Mutable source copy so tests can bump VERSION without touching the repo.
 mkdir -p "$FIX_SRC"
@@ -320,6 +332,60 @@ if [ "$(printf '%s' "$DEPLOY_CODE" | grep -c 'app/web/serve')" -eq 0 ]; then
 else
     fail "deploy code still references the fake app/web/serve hook"
 fi
+
+# Compatibility preflight wiring (static): runtime shims and deploy lib must
+# call the capability-based preflight; the shims must expose the environment
+# diagnostics recorder (no secrets).
+assert_grep 'monitor_env_require_commands' "$DEPLOY_DIR/app-bin/monitor-service" "monitor-service runs the command preflight"
+assert_grep 'monitor_env_require_commands' "$DEPLOY_DIR/app-bin/monitor-health" "monitor-health runs the command preflight"
+assert_grep 'monitor_env_record_environment' "$DEPLOY_DIR/app-bin/monitor-service" "monitor-service records environment diagnostics"
+assert_grep 'sbmon_preflight_commands' "$DEPLOY_DIR/install-monitor.sh" "install path runs the preflight"
+if [ "$(grep -c 'sbmon_preflight_commands' "$DEPLOY_DIR/install-monitor.sh")" -ge 3 ]; then
+    pass "install/rollback/uninstall paths all run the preflight (>=3 call sites)"
+else
+    fail "preflight not wired into all mutating command paths (want >=3 call sites)"
+fi
+assert_grep 'journal_time_normalize' "$REPO_ROOT/tests/lib/journal-time.sh" "journal-time normalizer present (B6 regression)"
+
+# ---------------------------------------------------------------------------
+section "T00 compatibility preflight: missing required command -> fail closed"
+# Runs BEFORE the first real install: nothing may be created when the
+# preflight rejects the environment.
+(
+    export SBMON_REQUIRED_COMMANDS="sbmon-synthetic-missing-tool"
+    export SBMON_TEST_ALLOW_REQUIRED_COMMANDS_OVERRIDE=1
+    "$INSTALL_MONITOR" install
+) > "$TMP/out-t00-preflight.log" 2>&1
+assert_rc 1 $? "install aborts (rc 1) when a required command is missing"
+assert_grep '缺少必需依赖命令' "$TMP/out-t00-preflight.log" "preflight names the missing dependency clearly"
+assert_grep 'sbmon-synthetic-missing-tool' "$TMP/out-t00-preflight.log" "preflight names the exact missing tool"
+assert_no_grep 'install 完成' "$TMP/out-t00-preflight.log" "no success message after preflight failure"
+[ ! -e "$FIX_UNIT" ] && pass "no unit file written before preflight passes" || fail "unit file written despite preflight failure"
+if [ ! -d "$FIX_RELEASES" ] || [ -z "$(ls -A "$FIX_RELEASES" 2>/dev/null)" ]; then
+    pass "no release staged before preflight passes"
+else
+    fail "release staged despite preflight failure"
+fi
+(
+    export SBMON_REQUIRED_COMMANDS="sbmon-synthetic-missing-tool"
+    export SBMON_TEST_ALLOW_REQUIRED_COMMANDS_OVERRIDE=1
+    "$INSTALL_MONITOR" rollback
+) > "$TMP/out-t00-rollback.log" 2>&1
+assert_rc 1 $? "rollback aborts (rc 1) when a required command is missing"
+assert_grep '缺少必需依赖命令' "$TMP/out-t00-rollback.log" "rollback preflight names the missing dependency"
+
+# Production invocations can NEVER bypass the preflight via
+# SBMON_REQUIRED_COMMANDS: without the explicit test-only gate the override
+# is refused (fail-closed), even though every command in this environment
+# actually exists.
+(
+    export SBMON_REQUIRED_COMMANDS="stat sha256sum mktemp"
+    unset SBMON_TEST_ALLOW_REQUIRED_COMMANDS_OVERRIDE
+    "$INSTALL_MONITOR" install
+) > "$TMP/out-t00-bypass.log" 2>&1
+assert_rc 1 $? "production install rejects the SBMON_REQUIRED_COMMANDS bypass"
+assert_grep '绕过必需命令预检' "$TMP/out-t00-bypass.log" "bypass refusal diagnostic is explicit"
+assert_no_grep 'install 完成' "$TMP/out-t00-bypass.log" "no install happens under a refused bypass"
 
 # ---------------------------------------------------------------------------
 section "T01 fresh install"
@@ -1240,6 +1306,18 @@ timeout 3 "$SVC" "$TMP/svc-ok.conf" "$SCRATCH_STATE" > "$TMP/svc5.log" 2>&1 || t
 assert_grep 'mode=collector-loop' "$TMP/svc5.log" "valid IPv6 loopback URL + present secret -> service starts (P7 IPv6 parse)"
 assert_no_grep 'fixture-api-secret' "$TMP/svc5.log" "secret value never printed"
 
+# Production invocation of the runtime shim can NEVER bypass the preflight
+# via SBMON_REQUIRED_COMMANDS: without the explicit test-only gate the
+# override is refused even though every listed command actually exists.
+printf 'SBMON_MODE=collector-loop\n' > "$TMP/svc-bypass.conf"
+(
+    export SBMON_REQUIRED_COMMANDS="stat sha256sum mktemp"
+    unset SBMON_TEST_ALLOW_REQUIRED_COMMANDS_OVERRIDE
+    "$SVC" "$TMP/svc-bypass.conf" "$SCRATCH_STATE"
+) > "$TMP/out-t00-bypass-shim.log" 2>&1
+assert_rc 1 $? "runtime shim rejects the bypass in a production invocation"
+assert_grep 'override refused outside fixture/test mode' "$TMP/out-t00-bypass-shim.log" "shim bypass refusal named"
+
 rm -rf "$SCRATCH_STATE"
 
 # ---------------------------------------------------------------------------
@@ -1669,7 +1747,8 @@ OUT10="$TMP/out-t10.log"
 ( SBMON_PYTHON3=/nonexistent-sbmon-python3 "$INSTALL_MONITOR" install ) > "$OUT10" 2>&1
 assert_rc 1 $? "missing python3 -> install fails"
 [ ! -d "$FIX_STATE" ] && pass "no state dirs created on failed precheck" || fail "state dirs created despite failed precheck"
-assert_grep '预检失败' "$OUT10" "error message explains precheck"
+assert_grep '缺少必需依赖命令' "$OUT10" "error message explains precheck (names the missing dependency)"
+assert_grep 'fail-closed' "$OUT10" "precheck is fail-closed"
 
 # ---------------------------------------------------------------------------
 if [ "$SYMLINKS_OK" = 1 ]; then
@@ -1882,6 +1961,20 @@ if [ "$SYMLINKS_OK" = 1 ]; then
     fi
     assert_rc 0 "$SETUP_RC" "web-setup runs the reviewed E2 setup to completion as the service identity"
     assert_grep 'singbox-monitor' "$SETUP_OUT" "web-setup reports the monitor-only restart"
+
+    # Loopback-only access hint (operator UX hardening; additive, no security
+    # model change): printed on SUCCESS output only, never the server IP.
+    assert_grep '127.0.0.1:9191' "$SETUP_OUT" "web-setup prints the loopback listen hint"
+    # T19 access-hint contract (only this contract is asserted about IPs):
+    #   * the E2 setup itself MAY print the DETECTED SSH CLIENT source IP
+    #     (203.0.113.77 in this fixture) -- that is reviewed E2 behaviour;
+    #   * the installer hint must require the explicit root@<server> form;
+    #   * the SERVER-side SSH IP (198.51.100.5 = SSH_CONNECTION field 3) must
+    #     never be printed or inferred anywhere in the output.
+    assert_grep 'ssh -L 19191:127\.0\.0\.1:9191 root@<server>' "$SETUP_OUT" "web-setup access hint requires root@<server>"
+    assert_grep 'http://127.0.0.1:19191' "$SETUP_OUT" "web-setup prints the dashboard URL hint"
+    assert_no_grep '198\.51\.100\.5' "$SETUP_OUT" "web-setup never prints/infers the server-side SSH IP"
+    assert_no_grep 'sshd_config' "$SETUP_OUT" "web-setup never suggests changing sshd_config"
     tail -n +"$((CALLS_BEFORE_SU + 1))" "$MOCK_CALL_LOG" > "$TMP/t19-calls.log"
     assert_grep 'restart singbox-monitor' "$TMP/t19-calls.log" "web-setup restarted ONLY singbox-monitor (was active)"
     assert_no_grep 'sing-box' "$MOCK_CALL_LOG" "web-setup never touches sing-box (whole run)"
@@ -2022,6 +2115,35 @@ run_install "$TMP/out-t13setup.log" >/dev/null 2>&1   # ensure conf/unit exist a
 assert_no_grep '0\.0\.0\.0' "$FIX_CONF_DIR/monitor.conf" "conf never binds 0.0.0.0"
 assert_no_grep '0\.0\.0\.0' "$FIX_UNIT" "unit never references 0.0.0.0"
 assert_grep '127\.0\.0\.1:9191' "$FIX_CONF_DIR/monitor.conf" "web dashboard stays on 127.0.0.1:9191"
+
+# ---------------------------------------------------------------------------
+section "T14 CI systemd verify gate contract (fail-closed rc)"
+# Static contract for the systemd validation step in
+# .github/workflows/tests.yml:
+#   1. verify's rc is CAPTURED and judged (never ignored);
+#   2. a nonzero verify rc with UNCLASSIFIED diagnostics fails the step;
+#   3. a nonzero verify rc with EMPTY diagnostics fails the step;
+#   4. only a mechanical UNRELATED-runner-noise allowlist may excuse a
+#      nonzero rc, and the allowlist classification never touches
+#      singbox-monitor.service lines;
+#   5. the old note-only escape hatch (nonzero rc + "no target-unit match"
+#      => success) must stay gone forever.
+WF="$REPO_ROOT/.github/workflows/tests.yml"
+assert_rc 0 "$([ -f "$WF" ] && echo 0 || echo 1)" "workflow file exists"
+assert_grep 'systemd-analyze verify "\$UNIT" 2>&1 \| tee "\$RUNNER_TEMP/unit-verify\.log" \|\| vrc=\$\?' \
+    "$WF" "verify rc is captured through tee (rc-aware)"
+assert_grep 'UNCLASSIFIED diagnostics \(fail-closed' "$WF" \
+    "nonzero verify rc + unclassified diagnostics => hard failure"
+assert_grep 'EMPTY diagnostics \(fail-closed hard gate\)' "$WF" \
+    "nonzero verify rc + empty diagnostics => hard failure"
+assert_grep 'UNRELATED_NOISE_RE=' "$WF" \
+    "unrelated runner noise is excused only via a mechanical allowlist"
+assert_grep "grep -v 'singbox-monitor\\\\.service'" "$WF" \
+    "allowlist classification never touches target-unit lines"
+assert_grep 'rejected or ignored a directive in the production unit' "$WF" \
+    "target-unit directive errors remain a hard failure"
+assert_no_grep 'the hard gate holds for the production unit' "$WF" \
+    "old note-only escape hatch (nonzero rc + no target-unit match => success) is gone"
 
 printf '\n== RESULT: %d passed, %d failed ==\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

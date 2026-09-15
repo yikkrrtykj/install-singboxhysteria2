@@ -85,6 +85,82 @@ sbmon_die() { printf '[sbmon] ERROR: %s\n' "$*" >&2; exit 1; }
 sbmon_critical() { printf '[sbmon] CRITICAL: %s\n' "$*" >&2; exit 2; }
 
 # ---------------------------------------------------------------------------
+# Compatibility preflight (capability detection -- never /etc/os-release
+# version branching; supported baselines: Ubuntu 22.04 / 24.04 / 26.04 LTS).
+# Every mutating command fails CLOSED on a missing required dependency,
+# BEFORE any filesystem/service mutation, with a single clear diagnostic.
+# Required set (deployment/canary tooling actually used by this library and
+# its callers): python3 systemctl journalctl jq ss flock stat sha256sum
+# mktemp -- the runtime shims use their own MINIMAL sets (monitor-env.sh).
+# SBMON_REQUIRED_COMMANDS may override the extra-command set ONLY behind the
+# explicit test-only gate SBMON_TEST_ALLOW_REQUIRED_COMMANDS_OVERRIDE=1
+# (SBMON_FIXTURE deliberately does NOT unlock it: non-root production hosts
+# must not bypass the preflight either). A production invocation that sets
+# the override WITHOUT the gate is refused (fail-closed), so the preflight
+# can never be bypassed. The configured wrappers
+# (SBMON_PYTHON3 / SBMON_SYSTEMCTL / SBMON_FLOCK) are always checked as
+# themselves, since those are the exact binaries the deployment executes.
+# ---------------------------------------------------------------------------
+sbmon_required_command_list() { # -> prints the list; rc 1 = override refused (message on stderr)
+    printf '%s\n' "$SBMON_PYTHON3" "$SBMON_SYSTEMCTL" "$SBMON_FLOCK"
+    if [ "${SBMON_REQUIRED_COMMANDS+x}" = x ]; then
+        # The gate MUST be judged in the caller's context (a die/exit inside
+        # the process substitution would only kill the subshell and silently
+        # skip the preflight -- exactly the bypass this check prevents).
+        # ONLY the explicit test-only gate unlocks the override; SBMON_FIXTURE
+        # deliberately does NOT (non-root production/dev hosts must not be
+        # able to bypass the preflight either).
+        if [ "${SBMON_TEST_ALLOW_REQUIRED_COMMANDS_OVERRIDE:-0}" != "1" ]; then
+            printf '[sbmon] SBMON_REQUIRED_COMMANDS 覆写被拒绝（仅限显式测试门 SBMON_TEST_ALLOW_REQUIRED_COMMANDS_OVERRIDE=1；生产预检使用必需命令全集）\n' >&2
+            return 1
+        fi
+        # shellcheck disable=SC2086  # intentional word split of the gated override list
+        printf '%s\n' ${SBMON_REQUIRED_COMMANDS}
+    else
+        printf '%s\n' journalctl jq ss stat sha256sum mktemp
+    fi
+}
+
+sbmon_preflight_commands() {
+    local missing="" cmd list_text
+    # Capture in the PARENT context: an rc 1 here is a refused production
+    # bypass attempt, never an empty list.
+    if ! list_text="$(sbmon_required_command_list)"; then
+        sbmon_die "命令预检配置被拒绝（生产环境不得以 SBMON_REQUIRED_COMMANDS 绕过必需命令预检）：fail-closed，未做任何更改"
+    fi
+    while IFS= read -r cmd; do
+        [ -n "$cmd" ] || continue
+        case "$cmd" in
+            */*) [ -x "$cmd" ] || missing="$missing $cmd" ;;
+            *)   command -v "$cmd" >/dev/null 2>&1 || missing="$missing $cmd" ;;
+        esac
+    done <<< "$list_text"
+    if [ -n "$missing" ]; then
+        sbmon_die "缺少必需依赖命令:${missing}（preflight fail-closed，未做任何更改；请安装提供这些命令的软件包）"
+    fi
+}
+
+# Environment diagnostics for deploy/canary records -- NO secrets, no conf
+# values, no paths that could carry sensitive material.
+sbmon_record_environment() {
+    if [ -r /etc/os-release ]; then
+        local os_id os_ver
+        os_id="$(sed -n 's/^ID=//p' /etc/os-release | head -n1 | tr -d '"' || true)"
+        os_ver="$(sed -n 's/^VERSION_ID=//p' /etc/os-release | head -n1 | tr -d '"' || true)"
+        sbmon_info "environment os=${os_id:-unknown} ${os_ver:-unknown}"
+    else
+        sbmon_info "environment os-release unreadable"
+    fi
+    "$SBMON_PYTHON3" --version 2>&1 | sed 's/^/[sbmon] environment /' || true
+    "$SBMON_SYSTEMCTL" --version 2>/dev/null | head -n1 | sed 's/^/[sbmon] environment /' || true
+    if command -v ssh >/dev/null 2>&1; then
+        ssh -V 2>&1 | sed 's/^/[sbmon] environment /' || true
+    fi
+    sbmon_info "environment kernel=$(uname -r)"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # P4: deployment serialization lock (mutating commands only)
 # ---------------------------------------------------------------------------
 sbmon_acquire_deploy_lock() {

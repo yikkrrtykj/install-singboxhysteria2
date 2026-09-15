@@ -22,7 +22,7 @@ PASS=0
 FAIL=0
 # The gate at the bottom of this file fails unless exactly this many
 # assertions ran AND passed, so unreachable sections can never fake success.
-EXPECTED_PASS=188
+EXPECTED_PASS=232
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
@@ -641,6 +641,8 @@ assert_contains "configuration error" "$INTEG_SRC" "invalid gate config is a con
 assert_contains "baseline.json" "$INTEG_SRC" "integration captures a pre-window baseline"
 assert_contains "lifecycle_gate.py" "$INTEG_SRC" "integration delegates verdicts to the gate evaluator"
 assert_contains "no CLOSED/finalize evidence observed" "$INTEG_SRC" "integration carries the CLOSED fail reason"
+assert_contains "CLOSE_GRACE_WINDOW" "$INTEG_SRC" "integration wires CLOSE_GRACE_WINDOW"
+assert_contains "grace_final" "$GATE_SRC" "gate evaluator implements the grace snapshot contract"
 assert_contains "recent_connections" "$GATE_SRC" "gate uses recent_connections ids (closed-id delta)"
 assert_contains "uplink_total" "$GATE_SRC" "gate compares uplink totals (traffic delta)"
 assert_contains "downlink_total" "$GATE_SRC" "gate compares downlink totals (traffic delta)"
@@ -852,6 +854,22 @@ assert_eq "$?" "2" "CLI: nothing observed in-window exits 2 (INCONCLUSIVE)"
 "$PY" "$GATE" --baseline "$TMP/gate-base.json" --final "$TMP/gate-final.json" \
     --require-closed 2 >/dev/null 2>&1
 assert_eq "$?" "1" "CLI: REQUIRE_CLOSED=2 is a configuration error (exit 1)"
+# G4-grace: CLI grace inputs. gate-final is the "eligible" primary shape
+# (traffic delta + active, no new closed id).
+printf '%s' '{"stale": false, "identity_conflicts": 0, "recently_closed": 2, "active_connections": 0, "devices": {"legacy": {"status": "RECENT ACTIVITY", "uplink_total": 250, "downlink_total": 80, "protocols": {"vless-in": {}}, "active_connections": 0, "recent_connections": [{"id": "old1", "inbound": "vless-in", "source": "203.0.113.9:51000", "uplink_total": 0.0, "downlink_total": 0.0}, {"id": "new9", "inbound": "vless-in", "source": "203.0.113.9:51000", "uplink_total": 0.0, "downlink_total": 0.0}]}}}' > "$TMP/gate-grace-pass.json"
+"$PY" "$GATE" --baseline "$TMP/gate-base.json" --final "$TMP/gate-final.json" \
+    --grace-final "$TMP/gate-grace-pass.json" \
+    --expect-user legacy --require-closed 1 >"$TMP/gate-cli4.txt" 2>&1
+assert_eq "$?" "0" "CLI: grace window with a new closed id resolves the sole CLOSED failure (exit 0)"
+"$PY" "$GATE" --baseline "$TMP/gate-base.json" --final "$TMP/gate-final.json" \
+    --grace-final "$TMP/gate-final.json" \
+    --expect-user legacy --require-closed 1 >"$TMP/gate-cli5.txt" 2>&1
+assert_eq "$?" "1" "CLI: grace window timeout without a new closed id exits 1"
+"$PY" "$GATE" --baseline "$TMP/gate-base.json" --final "$TMP/gate-final.json" \
+    --expect-user legacy --require-closed 1 >"$TMP/gate-cli6.txt" 2>&1
+assert_eq "$?" "1" "CLI: primary-only run still exits 1"
+assert_contains "GRACE_ELIGIBLE" "$(cat "$TMP/gate-cli6.txt")" "CLI: grace-eligible primary failure is marked GRACE_ELIGIBLE"
+assert_not_contains "GRACE_ELIGIBLE" "$(cat "$TMP/gate-cli5.txt")" "CLI: grace-verdict output never re-marks GRACE_ELIGIBLE"
 
 section "G5: inbound-scoped evidence -- USER + INBOUND (cases L1-L4 + combo)"
 snap="$(PYTHONPATH="$ROOT/monitor-v2" "$PY" -c '
@@ -859,7 +877,8 @@ import json
 from lifecycle_gate import evaluate, scope_recent_ids, scope_totals
 
 def duo(vless_up, vless_down, hy2_up, hy2_down,
-        vless_recent=(), hy2_recent=(), vless_active=0, hy2_active=0):
+        vless_recent=(), hy2_recent=(), vless_active=0, hy2_active=0,
+        vless_closed_ids=(), hy2_closed_ids=()):
     def proto(up, down, active):
         return {"active_connections": active,
                 "uplink_total": float(up), "downlink_total": float(down)}
@@ -869,6 +888,13 @@ def duo(vless_up, vless_down, hy2_up, hy2_down,
                + [{"id": cid, "inbound": "hy2-in", "source": "203.0.113.9:51001",
                    "uplink_total": 0.0, "downlink_total": 0.0}
                   for cid in hy2_recent])
+    # Evidence-grade closed-id projection (what the collector emits as
+    # ``closed_ids``): NOT the 20-row display cache -- rows here survive
+    # display eviction within the collector TTL bank.
+    evidence = ([{"id": cid, "inbound": "vless-in", "closed_at": "2026-09-14T15:51:50Z"}
+                 for cid in vless_closed_ids]
+                + [{"id": cid, "inbound": "hy2-in", "closed_at": "2026-09-14T15:51:50Z"}
+                   for cid in hy2_closed_ids])
     status = "ACTIVE" if (vless_active or hy2_active) else \
         ("RECENT ACTIVITY" if recents else "IDLE")
     return {
@@ -880,6 +906,7 @@ def duo(vless_up, vless_down, hy2_up, hy2_down,
         "downlink_total": float(vless_down + hy2_down),
         "recent_sources": ["203.0.113.9:51000", "203.0.113.9:51001"] if recents else [],
         "recent_connections": recents,
+        "closed_ids": evidence,
     }
 
 def snap(devices=(), stale=False):
@@ -984,6 +1011,295 @@ integ_out="$(SING_BOX_BIN="$TMP/dummy-sing-box" API_URL="$DEAD_URL" bash "$INTEG
 integ_rc=$?
 assert_eq "$integ_rc" "0" "no gates + dummy binary + API unreachable -> SKIP exit 0"
 assert_contains "SKIP" "$integ_out" "observational run still SKIPs on a dead API"
+
+section "G7: CLOSE_GRACE_WINDOW semantics -- sole-missing-item contract"
+snap="$(PYTHONPATH="$ROOT/monitor-v2" "$PY" -c '
+import json
+from lifecycle_gate import evaluate
+
+def duo(vless_up, vless_down, hy2_up, hy2_down,
+        vless_recent=(), hy2_recent=(), vless_active=0, hy2_active=0,
+        vless_closed_ids=(), hy2_closed_ids=()):
+    def proto(up, down, active):
+        return {"active_connections": active,
+                "uplink_total": float(up), "downlink_total": float(down)}
+    recents = ([{"id": cid, "inbound": "vless-in", "source": "203.0.113.9:51000",
+                 "uplink_total": 0.0, "downlink_total": 0.0}
+                for cid in vless_recent]
+               + [{"id": cid, "inbound": "hy2-in", "source": "203.0.113.9:51001",
+                   "uplink_total": 0.0, "downlink_total": 0.0}
+                  for cid in hy2_recent])
+    # Evidence-grade closed-id projection (what the collector emits as
+    # ``closed_ids``): NOT the 20-row display cache -- rows here survive
+    # display eviction within the collector TTL bank.
+    evidence = ([{"id": cid, "inbound": "vless-in", "closed_at": "2026-09-14T15:51:50Z"}
+                 for cid in vless_closed_ids]
+                + [{"id": cid, "inbound": "hy2-in", "closed_at": "2026-09-14T15:51:50Z"}
+                   for cid in hy2_closed_ids])
+    status = "ACTIVE" if (vless_active or hy2_active) else \
+        ("RECENT ACTIVITY" if recents else "IDLE")
+    return {
+        "status": status,
+        "protocols": {"vless-in": proto(vless_up, vless_down, vless_active),
+                      "hy2-in": proto(hy2_up, hy2_down, hy2_active)},
+        "active_connections": vless_active + hy2_active,
+        "uplink_total": float(vless_up + hy2_up),
+        "downlink_total": float(vless_down + hy2_down),
+        "recent_sources": ["203.0.113.9:51000", "203.0.113.9:51001"] if recents else [],
+        "recent_connections": recents,
+        "closed_ids": evidence,
+    }
+
+def snap(devices=(), stale=False, identity_conflicts=0):
+    return {
+        "stale": stale, "last_error": None, "batch_count": 1,
+        "identity_conflicts": identity_conflicts,
+        "active_connections": sum(d[1]["active_connections"] for d in devices),
+        "recently_closed": sum(len(d[1]["recent_connections"]) for d in devices),
+        "devices": {name: dev for name, dev in devices},
+    }
+
+out = {}
+base = snap([("legacy", duo(100, 50, 200, 60))])
+# Primary window shape: hy2 traffic delta + hy2 still ACTIVE, no new closed
+# id -> the CLOSED gate is the SOLE failure (grace eligible).
+primary = snap([("legacy", duo(100, 50, 260, 66, hy2_active=1))])
+
+# GR1: grace snapshot carries a NEW hy2-in closed id -> PASS (exit 0)
+grace_pass = snap([("legacy", duo(100, 50, 260, 66, hy2_recent=("h9",)))])
+r = evaluate(base, primary, "legacy", "hy2-in", True, grace_final=grace_pass)
+out["GR1_verdict"] = r["verdict"]; out["GR1_exit"] = r["exit"]
+
+# GR2: grace timeout without a new id -> FAIL
+grace_idle = snap([("legacy", duo(100, 50, 260, 66, hy2_active=1))])
+r = evaluate(base, primary, "legacy", "hy2-in", True, grace_final=grace_idle)
+out["GR2_verdict"] = r["verdict"]; out["GR2_reason"] = r["reason"]
+
+# GR3: stale grace snapshot -> FAIL even though a new id appeared
+r = evaluate(base, primary, "legacy", "hy2-in", True,
+             grace_final=snap([("legacy", duo(100, 50, 260, 66, hy2_recent=("h9",)))],
+                              stale=True))
+out["GR3_verdict"] = r["verdict"]; out["GR3_reason"] = r["reason"]
+
+# GR4: a sibling-protocol (vless-in) closure can NOT satisfy the hy2 grace gate
+grace_sibling = snap([("legacy", duo(100, 50, 260, 66, vless_recent=("v1",)))])
+r = evaluate(base, primary, "legacy", "hy2-in", True, grace_final=grace_sibling)
+out["GR4_verdict"] = r["verdict"]
+
+# GR5: an active connection (or sibling closure + active) is NEVER a
+# substitute for a CLOSED/finalize inside the grace window
+grace_active = snap([("legacy", duo(100, 50, 260, 66,
+                                    vless_recent=("v1",), vless_active=1,
+                                    hy2_active=1))])
+r = evaluate(base, primary, "legacy", "hy2-in", True, grace_final=grace_active)
+out["GR5_verdict"] = r["verdict"]
+
+# GR6: identity gate failure during grace -> FAIL even with a new id
+grace_identity = snap([("legacy", duo(100, 50, 260, 66, hy2_recent=("h9",)))],
+                      identity_conflicts=7)
+r = evaluate(base, primary, "legacy", "hy2-in", True, grace_final=grace_identity)
+out["GR6_verdict"] = r["verdict"]; out["GR6_reason"] = r["reason"]
+
+# GR7: grace can NOT rescue a primary-window traffic failure: the primary
+# window lacks a traffic delta AND a closure -> grace is never entered.
+primary_no_traffic = snap([("legacy", duo(100, 50, 200, 60, hy2_active=1))])
+r = evaluate(base, primary_no_traffic, "legacy", "hy2-in", True,
+             grace_final=grace_pass)
+out["GR7_verdict"] = r["verdict"]; out["GR7_reason"] = r["reason"]
+
+# GR8: a primary PASS stays a PASS; the grace snapshot is never re-judged
+primary_pass = snap([("legacy", duo(100, 50, 260, 66, hy2_recent=("h9",)))])
+r = evaluate(base, primary_pass, "legacy", "hy2-in", True,
+             grace_final=grace_idle)
+out["GR8_verdict"] = r["verdict"]; out["GR8_exit"] = r["exit"]
+
+# GR9: baseline replayed ids stay dead evidence inside the grace window:
+# only h1 was ever seen, so nothing new -> timeout FAIL
+base_replay = snap([("legacy", duo(100, 50, 200, 60, hy2_recent=("h1",)))])
+primary_replay = snap([("legacy", duo(100, 50, 260, 66,
+                                      hy2_recent=("h1",), hy2_active=1))])
+grace_replay = snap([("legacy", duo(100, 50, 260, 66, hy2_recent=("h1",)))])
+r = evaluate(base_replay, primary_replay, "legacy", "hy2-in", True,
+             grace_final=grace_replay)
+out["GR9_verdict"] = r["verdict"]
+
+# GR10 (sticky evidence, the review regression): the wanted HY2 CLOSED "h9"
+# IS observed during the grace window, then EVICTED from the 20-row
+# recent_connections display cache by >20 newer closures. The grace verdict
+# must still PASS via the closed_ids evidence projection (scoped, ORIGINAL
+# baseline subtraction) -- cache eviction can never cause a false FAIL, and
+# the dashboard cache stays 20 rows (the fix is NOT a bigger cache).
+newer = tuple("v-new-%02d" % i for i in range(21))   # 21 newer sibling closures
+grace_evicted = snap([("legacy", duo(100, 50, 260, 66,
+                                     vless_recent=newer,        # h9 evicted
+                                     hy2_closed_ids=("h9",)))])
+r = evaluate(base, primary, "legacy", "hy2-in", True, grace_final=grace_evicted)
+out["GR10_verdict"] = r["verdict"]; out["GR10_exit"] = r["exit"]
+
+# GR11: same eviction shape in the PRIMARY window -> straight PASS, grace
+# never even entered (the evidence projection is sticky for the whole
+# interval, not just for grace snapshots).
+final_evicted = snap([("legacy", duo(100, 50, 260, 66,
+                                     vless_recent=newer,
+                                     hy2_closed_ids=("h9",)))])
+r = evaluate(base, final_evicted, "legacy", "hy2-in", True)
+out["GR11_verdict"] = r["verdict"]; out["GR11_exit"] = r["exit"]
+
+# GR12: the evidence projection is SCOPED -- an id carried by the sibling
+# inbound in closed_ids can never satisfy the hy2-in gate (same rule as the
+# display cache).
+grace_wrong_scope = snap([("legacy", duo(100, 50, 260, 66,
+                                         vless_closed_ids=("v9",)))])
+r = evaluate(base, primary, "legacy", "hy2-in", True, grace_final=grace_wrong_scope)
+out["GR12_verdict"] = r["verdict"]
+
+# Eligibility flags (evaluate WITHOUT grace_final):
+# the sole-CLOSED-failure shape is eligible...
+r = evaluate(base, primary, "legacy", "hy2-in", True)
+out["E_D_eligible"] = str(r.get("grace_eligible"))
+# ...a traffic failure (2 FAIL lines) is NOT...
+r = evaluate(base, primary_no_traffic, "legacy", "hy2-in", True)
+out["E_traffic_eligible"] = str(r.get("grace_eligible"))
+# ...and a sibling-only closure (CLOSED + lifecycle both fail) is NOT.
+primary_sibling_only = snap([("legacy", duo(100, 50, 260, 66, vless_recent=("v1",)))])
+r = evaluate(base, primary_sibling_only, "legacy", "hy2-in", True)
+out["E_sibling_eligible"] = str(r.get("grace_eligible"))
+
+print(json.dumps(out))
+')"
+assert_eq "$(snap_field "$snap" 'snap["GR1_verdict"]')" "PASS" "GR1: grace window with a new scoped closed id -> PASS"
+assert_eq "$(snap_field "$snap" 'snap["GR1_exit"]')" "0" "GR1 exits 0"
+assert_eq "$(snap_field "$snap" 'snap["GR2_verdict"]')" "FAIL" "GR2: grace timeout without a new closed id -> FAIL"
+assert_contains "CLOSE_GRACE window timed out" "$snap" "GR2 reason names the grace timeout"
+assert_eq "$(snap_field "$snap" 'snap["GR3_verdict"]')" "FAIL" "GR3: stale grace snapshot -> FAIL even with a new id"
+assert_contains "grace window snapshot is stale" "$snap" "GR3 reason names the stale grace snapshot"
+assert_eq "$(snap_field "$snap" 'snap["GR4_verdict"]')" "FAIL" "GR4: sibling-protocol closure cannot satisfy the grace gate"
+assert_eq "$(snap_field "$snap" 'snap["GR5_verdict"]')" "FAIL" "GR5: active connection can never substitute a CLOSED in grace"
+assert_eq "$(snap_field "$snap" 'snap["GR6_verdict"]')" "FAIL" "GR6: identity gate failure during grace -> FAIL"
+assert_contains "identity gate failure during grace window" "$snap" "GR6 reason names the identity failure"
+assert_eq "$(snap_field "$snap" 'snap["GR7_verdict"]')" "FAIL" "GR7: grace never rescues a primary-window traffic failure"
+assert_contains "no traffic delta beyond baseline" "$snap" "GR7 keeps the primary traffic failure as the reason"
+assert_eq "$(snap_field "$snap" 'snap["GR8_verdict"]')" "PASS" "GR8: primary PASS stays PASS with a grace snapshot present"
+assert_eq "$(snap_field "$snap" 'snap["GR8_exit"]')" "0" "GR8 exits 0"
+assert_eq "$(snap_field "$snap" 'snap["GR9_verdict"]')" "FAIL" "GR9: baseline replayed ids stay dead evidence in grace"
+assert_eq "$(snap_field "$snap" 'snap["GR10_verdict"]')" "PASS" "GR10: HY2 CLOSED evicted from the 20-row display cache by >20 newer closures -> grace still PASS (sticky closed_ids evidence)"
+assert_eq "$(snap_field "$snap" 'snap["GR10_exit"]')" "0" "GR10 exits 0"
+assert_eq "$(snap_field "$snap" 'snap["GR11_verdict"]')" "PASS" "GR11: eviction shape in the primary window -> straight PASS (evidence sticky across the whole interval)"
+assert_eq "$(snap_field "$snap" 'snap["GR11_exit"]')" "0" "GR11 exits 0"
+assert_eq "$(snap_field "$snap" 'snap["GR12_verdict"]')" "FAIL" "GR12: closed_ids evidence projection is USER-INBOUND scoped (sibling-inbound id can never satisfy the gate)"
+assert_eq "$(snap_field "$snap" 'snap["E_D_eligible"]')" "True" "eligibility: sole-CLOSED-failure primary is grace eligible"
+assert_eq "$(snap_field "$snap" 'snap["E_traffic_eligible"]')" "False" "eligibility: traffic failure is NOT grace eligible"
+assert_eq "$(snap_field "$snap" 'snap["E_sibling_eligible"]')" "False" "eligibility: sibling-only closure (CLOSED+lifecycle fail) is NOT eligible"
+
+section "G8: closed-id evidence projection -- 20-entry display-cache eviction guard"
+# The eviction fix is the evidence projection, NOT a bigger display cache.
+assert_contains "RECENT_CONNECTIONS_MAX = 20" "$(cat "$ROOT/monitor-v2/collector.py")" "dashboard display cache stays 20 rows (eviction fix = closed_ids evidence projection, never a bigger cache)"
+snap="$(tracker_seq '
+import json
+from collector import Tracker
+t = Tracker()
+# 25 hy2-in closures of ONE device: the 20-row RECENT display cache must
+# evict the 5 oldest, while the evidence projection keeps all of them.
+events = []
+for i in range(25):
+    events.append({"type": "NEW", "id": "t%02d" % i,
+                   "connection": {"id": "t%02d" % i, "user": "legacy",
+                                  "inbound": "hy2-in",
+                                  "source": "203.0.113.9:51001",
+                                  "uplink_total": 1, "downlink_total": 1}})
+t.apply_batch({"reset": False, "events": events}, 1000)
+events = []
+for i in range(25):
+    events.append({"type": "CLOSED", "id": "t%02d" % i, "closed_at": 1001 + i})
+t.apply_batch({"reset": False, "events": events}, 1030)
+s = t.snapshot(1030)
+recent_ids = [c["id"] for c in s["devices"]["legacy"]["recent_connections"]]
+evidence_ids = [c["id"] for c in s["devices"]["legacy"]["closed_ids"]]
+print(json.dumps({"recent_ids": recent_ids, "evidence_ids": evidence_ids}))
+')"
+assert_eq "$(snap_field "$snap" 'len(snap["recent_ids"])')" "20" "display cache caps at 20 rows (oldest evicted)"
+assert_eq "$(snap_field "$snap" 'len(snap["evidence_ids"])')" "25" "closed_ids evidence projection keeps ALL closed ids within TTL"
+assert_contains "t00" "$(snap_field "$snap" 'json.dumps(snap["evidence_ids"])')" "display-evicted oldest id stays in the evidence projection"
+assert_not_contains "t00" "$(snap_field "$snap" 'json.dumps(snap["recent_ids"])')" "oldest id is indeed evicted from the display cache"
+
+snap="$(tracker_seq '
+import json
+from collector import Tracker
+t = Tracker()
+events = []
+for i in range(515):
+    events.append({"type": "NEW", "id": "x%03d" % i,
+                   "connection": {"id": "x%03d" % i, "user": "legacy",
+                                  "inbound": "hy2-in",
+                                  "source": "203.0.113.9:51001",
+                                  "uplink_total": 1, "downlink_total": 1}})
+t.apply_batch({"reset": False, "events": events}, 1000)
+events = []
+for i in range(515):
+    events.append({"type": "CLOSED", "id": "x%03d" % i, "closed_at": 1001 + i})
+t.apply_batch({"reset": False, "events": events}, 1516)
+s = t.snapshot(1520)
+ev = s["devices"]["legacy"]["closed_ids"]
+print(json.dumps({"n": len(ev),
+                  "has_newest": any(c["id"] == "x514" for c in ev),
+                  "has_oldest": any(c["id"] == "x000" for c in ev),
+                  "rows_minimal": all(set(c) == {"id", "inbound", "closed_at"}
+                                      for c in ev)}))
+')"
+assert_eq "$(snap_field "$snap" 'snap["n"]')" "512" "evidence projection caps at CLOSED_IDS_EVIDENCE_MAX=512"
+assert_eq "$(snap_field "$snap" 'snap["has_newest"]')" "True" "cap drops only the OLDEST rows (newest kept)"
+assert_eq "$(snap_field "$snap" 'snap["has_oldest"]')" "False" "cap drops the oldest rows, never a false-PASS direction"
+assert_eq "$(snap_field "$snap" 'snap["rows_minimal"]')" "True" "evidence rows carry only id/inbound/closed_at (minimal surface)"
+
+# Gate side: the CLOSED evidence survives display-cache eviction.
+snap="$(PYTHONPATH="$ROOT/monitor-v2" "$PY" -c '
+import json
+from lifecycle_gate import evaluate, scope_recent_ids
+
+base = {"stale": False, "last_error": None, "batch_count": 1,
+        "active_connections": 0, "recently_closed": 0, "devices": {}}
+# The target closure t00 was evicted from recent_connections (25 newer
+# closures) but is still present in closed_ids -> the gate must see it.
+final = {"stale": False, "last_error": None, "batch_count": 9,
+         "identity_conflicts": 0,
+         "active_connections": 0, "recently_closed": 25,
+         "devices": {"legacy": {
+             "status": "RECENT ACTIVITY",
+             "protocols": {"hy2-in": {"active_connections": 0,
+                                      "uplink_total": 260.0,
+                                      "downlink_total": 66.0}},
+             "active_connections": 0,
+             "uplink_total": 260.0, "downlink_total": 66.0,
+             "recent_sources": [],
+             "recent_connections": [
+                 {"id": "t%02d" % i, "inbound": "hy2-in",
+                  "source": "x", "uplink_total": 0.0,
+                  "downlink_total": 0.0} for i in range(5, 25)],
+             "closed_ids": [
+                 {"id": "t%02d" % i, "inbound": "hy2-in",
+                  "closed_at": "2026-01-01T00:00:00Z"} for i in range(25)],
+         }}}
+out = {}
+ids = scope_recent_ids(final, "legacy", "hy2-in")
+out["has_evicted"] = str("t00" in ids)
+r = evaluate(base, final, "legacy", "hy2-in", True)
+out["verdict"] = r["verdict"]; out["exit"] = r["exit"]
+
+# A sibling-inbound row inside closed_ids must still never satisfy the gate:
+# strip every hy2-in evidence row first so the ONLY closure offered is vless.
+sib = json.loads(json.dumps(final))
+sib["devices"]["legacy"]["recent_connections"] = []
+sib["devices"]["legacy"]["closed_ids"] = [{"id": "v1", "inbound": "vless-in",
+                                           "closed_at": "2026-01-01T00:00:00Z"}]
+r = evaluate(base, sib, "legacy", "hy2-in", True)
+out["sibling_verdict"] = r["verdict"]
+print(json.dumps(out))
+')"
+assert_eq "$(snap_field "$snap" 'snap["has_evicted"]')" "True" "scope_recent_ids unions closed_ids: evicted display id is still evidence"
+assert_eq "$(snap_field "$snap" 'snap["verdict"]')" "PASS" "REQUIRE_CLOSED passes even when the target id left the 20-row display cache"
+assert_eq "$(snap_field "$snap" 'snap["exit"]')" "0" "eviction-guarded verdict exits 0"
+assert_eq "$(snap_field "$snap" 'snap["sibling_verdict"]')" "FAIL" "closed_ids union keeps inbound scoping: sibling row never satisfies the gate"
+assert_contains "closed_ids" "$GATE_SRC" "gate reads the closed_ids evidence projection"
 
 printf '\n== summary ==\n'
 printf '  pass=%d fail=%d (expected pass=%d)\n' "$PASS" "$FAIL" "$EXPECTED_PASS"

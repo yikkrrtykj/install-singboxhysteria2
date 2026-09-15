@@ -39,8 +39,23 @@
 #                   separate production canaries.
 #   REQUIRE_CLOSED  1 = a NEW CLOSED/finalize beyond baseline is REQUIRED,
 #                       else FAIL: no CLOSED/finalize evidence observed.
-#                   0 = closed evidence stays informational; the connection
-#                       may still be active at window end.
+#                       0 = closed evidence stays informational; the connection
+#                           may still be active at window end.
+#   CLOSE_GRACE_WINDOW  seconds (default 240). Only entered when
+#                       REQUIRE_CLOSED=1 AND every primary-window gate passed
+#                       EXCEPT the CLOSED/finalize gate (the sole missing
+#                       item). Grace semantics: the ORIGINAL baseline stays
+#                       authoritative (no recapture), the USER/INBOUND scope
+#                       is unchanged, an active connection and a sibling-
+#                       protocol closure never substitute a CLOSED, and the
+#                       grace snapshot must stay non-stale and identity-
+#                       conflict-free for the whole window. A new recent-
+#                       closed Connection.id beyond the original baseline
+#                       inside the window -> PASS; timeout without one ->
+#                       FAIL. Grace NEVER rescues a primary-window failure
+#                       of any other gate (traffic / USER / INBOUND /
+#                       lifecycle); any collector failure or stale snapshot
+#                       during grace is a FAIL.
 #
 # STRICT CANARY: setting ANY gate (EXPECT_USER / EXPECT_INBOUND /
 # REQUIRE_CLOSED=1) makes a missing sing-box binary or an unreachable
@@ -62,6 +77,7 @@ LIFECYCLE_WINDOW="${LIFECYCLE_WINDOW:-20}"
 EXPECT_USER="${EXPECT_USER:-}"
 EXPECT_INBOUND="${EXPECT_INBOUND:-}"
 REQUIRE_CLOSED="${REQUIRE_CLOSED:-0}"
+CLOSE_GRACE_WINDOW="${CLOSE_GRACE_WINDOW:-240}"
 
 fail_out() {
     printf '\nRESULT: FAIL\n'
@@ -76,6 +92,12 @@ case "$REQUIRE_CLOSED" in
     0|1) : ;;
     *)
         echo "configuration error: REQUIRE_CLOSED must be 0 or 1 (got '$REQUIRE_CLOSED')"
+        exit "$EXIT_FAIL"
+        ;;
+esac
+case "$CLOSE_GRACE_WINDOW" in
+    ''|*[!0-9]*|0)
+        echo "configuration error: CLOSE_GRACE_WINDOW must be a positive integer of seconds (got '$CLOSE_GRACE_WINDOW')"
         exit "$EXIT_FAIL"
         ;;
 esac
@@ -159,6 +181,8 @@ echo ""
 echo "== phase 2: lifecycle (${LIFECYCLE_WINDOW}s) =="
 if [ "$REQUIRE_CLOSED" = "1" ]; then
     echo "  REQUIRE_CLOSED=1: a NEW CLOSED/finalize beyond baseline is required"
+    echo "  (if everything else passes, a CLOSE_GRACE_WINDOW of"
+    echo "   ${CLOSE_GRACE_WINDOW}s is granted for the connection to close)"
 fi
 
 # Baseline BEFORE any traffic prompt: the reset replay makes bare
@@ -209,8 +233,51 @@ fi
     --final "$TMP/life.json" \
     --expect-user "$EXPECT_USER" \
     --expect-inbound "$EXPECT_INBOUND" \
-    --require-closed "$REQUIRE_CLOSED" >"$TMP/gate.txt"
+    --require-closed "$REQUIRE_CLOSED" >"$TMP/gate.primary.txt"
 grc=$?
+
+if [ "$grc" = "$EXIT_FAIL" ] \
+    && grep -q '^GRACE_ELIGIBLE' "$TMP/gate.primary.txt"; then
+    # The CLOSED/finalize gate is the SOLE primary failure -- every other
+    # gate (USER / INBOUND / traffic delta / lifecycle / stale) already
+    # passed. Enter the CLOSE_GRACE_WINDOW: the ORIGINAL baseline stays
+    # authoritative, the scope is unchanged, and only a NEW recent-closed
+    # id beyond that baseline inside this window can resolve the gate.
+    echo ""
+    echo "== phase 2b: CLOSE_GRACE_WINDOW (${CLOSE_GRACE_WINDOW}s) =="
+    echo "  Primary window: every gate passed EXCEPT CLOSED/finalize"
+    echo "  (the only missing item). Original baseline stays authoritative;"
+    echo "  USER/INBOUND scope unchanged; an active connection or a"
+    echo "  sibling-protocol closure can NOT satisfy the gate."
+    echo "  Close the client connection now (if still running)..."
+    "$PY" "$ROOT/monitor-v2/collector.py" --url "$API_URL" \
+        --duration "$CLOSE_GRACE_WINDOW" --pretty \
+        >"$TMP/grace.json" 2>"$TMP/grace.err.txt"
+    grcrc=$?
+    if [ "$grcrc" -ne 0 ]; then
+        sed 's/^/    stderr: /' "$TMP/grace.err.txt"
+        fail_out "grace window collector failed (rc=$grcrc)"
+    fi
+    "$PY" "$ROOT/monitor-v2/lifecycle_gate.py" \
+        --baseline "$TMP/baseline.json" \
+        --final "$TMP/life.json" \
+        --grace-final "$TMP/grace.json" \
+        --expect-user "$EXPECT_USER" \
+        --expect-inbound "$EXPECT_INBOUND" \
+        --require-closed "$REQUIRE_CLOSED" >"$TMP/gate.txt"
+    grc=$?
+    # Show the primary-window lines as diagnostics only; FAIL accounting
+    # is driven exclusively by the FINAL gate verdict below.
+    echo "  --- primary window gate lines (CLOSED was the only failure) ---"
+    while IFS="$TAB" read -r status name; do
+        case "$status" in
+            PASS|FAIL|INFO) printf '  primary %s: %s\n' "$status" "$name" ;;
+        esac
+    done < "$TMP/gate.primary.txt"
+    echo "  --- CLOSE_GRACE verdict ---"
+else
+    cp -- "$TMP/gate.primary.txt" "$TMP/gate.txt"
+fi
 
 while IFS="$TAB" read -r status name; do
     case "$status" in

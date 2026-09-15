@@ -9,6 +9,32 @@
 - 分支：`feature/monitor-packaging`
 - 本文所有结论以 main 实际代码为准（逐项注明出处），不是凭记忆。
 
+## 兼容性预检与环境诊断（三 Ubuntu LTS 基线）
+
+支持基线：Ubuntu 22.04 / 24.04 / 26.04 LTS（support matrix 见
+`monitor-v2/README.md` §"平台支持矩阵与兼容性策略"）。规则：
+
+- **能力检测，不做发行版版本分支**：install / upgrade / rollback / uninstall
+  在任何变更前运行 `sbmon_preflight_commands`（deploy lib）——必需命令
+  `python3` / `systemctl` / `journalctl` / `jq` / `ss` / `flock` / `stat` /
+  `sha256sum` / `mktemp`（可经 `SBMON_REQUIRED_COMMANDS` 覆写；配置的包装器
+  `SBMON_PYTHON3` / `SBMON_SYSTEMCTL` / `SBMON_FLOCK` 按自身检查）。缺失
+  依赖 = 带清晰诊断 fail-closed，未做任何更改。运行时入口
+  （`monitor-service` / `monitor-health`）经 `monitor_env_require_commands`
+  执行同一 fail-closed 预检。
+- **环境诊断无泄密**：install 路径记录 `/etc/os-release`（ID + VERSION_ID）、
+  `python3 --version`、`systemd --version` 首行、`uname -r`；存在 `ssh` 时
+  记录 `ssh -V`。绝不记录 conf 值 / secret / 快照内容。
+- **systemd unit 可移植子集**：unit 硬化指令取三个基线 systemd 都支持的
+  子集。CI 分两级：`systemd-analyze verify` 是**全部基线的硬门**（任何
+  "unknown/unsupported directive" 判失败，安全关键指令绝不静默忽略）；
+  `systemd-analyze security --offline=yes` 按能力检测——支持的基线上**硬性
+  执行**，不支持的基线上明确标注为 informational-only（绝不静默软通过）。
+- **journal 时间兼容（B6 实机发现）**：Ubuntu 22.04 `journalctl --since`
+  拒绝 raw RFC3339（`...T...Z`）；内部时间戳保持 RFC3339/UTC，传给
+  journalctl 前经 `tests/lib/journal-time.sh` 规范化为本地
+  `"YYYY-MM-DD HH:MM:SS"`。
+
 ---
 
 ## 0. 当前 installer 审计（main @ 3c61204 实测）
@@ -217,6 +243,40 @@ sudoers、exact-token 读权直接复用，不需要迁移 service identity。
     （`sbmon_verify_service_owned_tree`），一旦漂移即 fail-closed 并给人工修复提示，**绝不自动
     "救回"** root 属主的数据。setup 失败信息也改为诚实表述（可能已完成部分持久化写入），且
     **不会**因此重启 Monitor。
+
+### 访问 loopback-only dashboard（SSH 端口转发）
+
+web 默认只监听 `127.0.0.1:9191`，**不**对公网开放。从工作站访问的推荐方式
+（Windows / Linux / macOS 通用）是 SSH 本地端口转发：
+
+```bash
+ssh -L 19191:127.0.0.1:9191 root@SERVER_IP
+```
+
+保持该 SSH 会话打开，然后在浏览器访问 `http://127.0.0.1:19191`。
+
+可选的纯隧道形式（`-N`）：`ssh -N -L 19191:127.0.0.1:9191 root@SERVER_IP`。
+注意部分 SSH 服务器/服务商环境会终止 `-N` 的纯转发（无 shell）会话；此时改用
+上面的普通 shell 形式，或加 keepalive：
+
+```bash
+ssh -N \
+  -o ServerAliveInterval=10 \
+  -o ServerAliveCountMax=6 \
+  -o ExitOnForwardFailure=yes \
+  -L 19191:127.0.0.1:9191 \
+  root@SERVER_IP
+```
+
+不要把修改 `sshd_config` 当作常规解法（保持服务器 SSH 配置原样）。
+
+**白名单行为**：`127.0.0.1` / `::1` 隐式放行，因此 SSH 端口转发访问**不需要**
+把公网 SSH 来源 IP 加入白名单——隧道连接在 Monitor 看到的对端地址就是 loopback。
+在 web-setup 期间回答 "n" 且从未写入过白名单条目时，`access.json` 可能不存在，
+这是合法状态，不是错误。web-setup 成功后打印的非敏感访问提示遵守同一契约：
+不打印/推断服务器公网 IP、不打印秘密、不自动加白名单、不暴露 9191、
+不修改防火墙或 sshd 配置。
+
 - web 进程存活性（systemd active）与 service.api 连通性从第一天就是两个信号（§6）。
 
 ## 5. 安装语义（任务 6：fresh / upgrade / repair / uninstall 严格区分）
