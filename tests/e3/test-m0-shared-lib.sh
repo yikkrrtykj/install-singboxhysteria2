@@ -15,6 +15,14 @@ assert_rc(){ [ "$1" = "$2" ] && pass "$3" || fail "$3 (expected=$1 got=$2)"; }
 
 printf '===== E3 M0 SHARED LIB =====\n'
 
+EXPECTED_LIB_SHA="$(sed -n 's/^SB_CLIENT_MANAGEMENT_SHA256="\([0-9a-f]\{64\}\)"$/\1/p' "$INSTALL")"
+ACTUAL_LIB_SHA="$(sha256sum "$LIB" | awk '{print $1}')"
+assert_rc "$EXPECTED_LIB_SHA" "$ACTUAL_LIB_SHA" 'installer digest pin equals shared library SHA256'
+cp "$LIB" "$TMP/tampered-lib.sh"
+printf '\n# tampered\n' >> "$TMP/tampered-lib.sh"
+TAMPERED_SHA="$(sha256sum "$TMP/tampered-lib.sh" | awk '{print $1}')"
+if [ "$TAMPERED_SHA" != "$EXPECTED_LIB_SHA" ]; then pass 'one-byte/content drift changes shared-lib digest'; else fail 'tampered lib unexpectedly matches pinned digest'; fi
+
 bash -n "$LIB" && pass 'bash -n shared lib' || fail 'bash -n shared lib'
 if command -v shellcheck >/dev/null 2>&1; then
   shellcheck -S warning "$LIB" >/dev/null 2>&1 && pass 'shellcheck shared lib' || fail 'shellcheck shared lib'

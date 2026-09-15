@@ -707,6 +707,26 @@ validate_client_name() { # validate_client_name <name> -> rc 0 if allowed
 # lib/client-management.sh. Local repository execution sources the sibling file;
 # the historical curl/process-substitution entry point fetches the same path from
 # the selected repository ref. Tests/helpers may inject SB_CLIENT_MANAGEMENT_LIB.
+SB_CLIENT_MANAGEMENT_SHA256="55dc0d0a895a2f5d1d155517bc34039ef7d13e5adc81e06c81c1feb7e73dea58"
+
+verify_client_management_library() { # <path>
+    local lib="$1" got=""
+    if ! command -v sha256sum >/dev/null 2>&1; then
+        warning "sha256sum 不可用，无法验证共享事务库，已拒绝加载（fail-closed）"
+        return 1
+    fi
+    if [ ! -f "$lib" ]; then
+        warning "共享事务库不存在: $lib"
+        return 1
+    fi
+    got="$(sha256sum "$lib" 2>/dev/null | awk '{print $1}')" || return 1
+    if [ "$got" != "$SB_CLIENT_MANAGEMENT_SHA256" ]; then
+        warning "共享事务库完整性校验失败，已拒绝加载（fail-closed）"
+        return 1
+    fi
+    return 0
+}
+
 load_client_management_library() {
     local lib="${SB_CLIENT_MANAGEMENT_LIB:-}" source_dir="" tmp="" fn
 
@@ -717,14 +737,7 @@ load_client_management_library() {
         fi
     fi
 
-    if [ -n "$lib" ]; then
-        if [ ! -f "$lib" ]; then
-            warning "共享事务库不存在: $lib"
-            return 1
-        fi
-        # shellcheck source=/dev/null
-        . "$lib" || return 1
-    else
+    if [ -z "$lib" ]; then
         local ref="${SB_CLIENT_MANAGEMENT_REF:-main}"
         tmp="$(mktemp 2>/dev/null)" || {
             warning "无法创建共享事务库临时文件"
@@ -737,10 +750,22 @@ load_client_management_library() {
             rm -f "$tmp"
             return 1
         fi
-        # shellcheck source=/dev/null
-        . "$tmp" || { rm -f "$tmp"; return 1; }
-        rm -f "$tmp"
+        lib="$tmp"
     fi
+
+    # IMPORTANT: verify BEFORE sourcing. This binds install.sh to the exact
+    # reviewed shared transaction implementation. A future main/lib change
+    # makes an older installer fail closed instead of silently importing newer
+    # privileged transaction code. SB_CLIENT_MANAGEMENT_REF changes location,
+    # never the expected content digest.
+    if ! verify_client_management_library "$lib"; then
+        [ -n "$tmp" ] && rm -f "$tmp"
+        return 1
+    fi
+
+    # shellcheck source=/dev/null
+    . "$lib" || { [ -n "$tmp" ] && rm -f "$tmp"; return 1; }
+    [ -n "$tmp" ] && rm -f "$tmp"
 
     for fn in with_client_lock reload_running_singbox reload_health_ok \
               restore_file_atomically new_candidate_path new_backup_path \

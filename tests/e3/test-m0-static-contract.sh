@@ -30,6 +30,18 @@ has_install 'lib/client-management.sh' &&
   ok 'install.sh loads canonical transaction library' ||
   bad 'install.sh does not load canonical transaction library'
 
+EXPECTED_LIB_SHA="$(sed -n 's/^SB_CLIENT_MANAGEMENT_SHA256="\([0-9a-f]\{64\}\)"$/\1/p' "$INSTALL")"
+ACTUAL_LIB_SHA="$(sha256sum "$LIB" | awk '{print $1}')"
+if [ "$EXPECTED_LIB_SHA" = "$ACTUAL_LIB_SHA" ] && [ "$EXPECTED_LIB_SHA" = "55dc0d0a895a2f5d1d155517bc34039ef7d13e5adc81e06c81c1feb7e73dea58" ]; then
+  ok 'install.sh digest pin matches canonical shared library bytes'
+else
+  bad 'install.sh digest pin does not match canonical shared library'
+fi
+has_install 'verify_client_management_library "$lib"' &&
+has_install '. "$lib"' &&
+  ok 'loader verifies selected library before source' ||
+  bad 'loader digest verification/source contract missing'
+
 has_lib 'command -v flock' && has_lib 'exec 9>>"$SB_LOCK_FILE"' && has_lib 'flock -w "$SB_LOCK_TIMEOUT" 9' &&
   ok 'shared with_client_lock is fail-closed' ||
   bad 'shared with_client_lock fail-closed primitives missing'
