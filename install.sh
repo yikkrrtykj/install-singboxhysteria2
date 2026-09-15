@@ -688,6 +688,9 @@ SB_STATE_FILE="${SB_STATE_FILE:-/root/sbox/config}"
 SB_CLIENTS_DIR="${SB_CLIENTS_DIR:-/root/sbox/clients}"
 SB_SING_BOX_BIN="${SB_SING_BOX_BIN:-/root/sbox/sing-box}"
 SB_LOCK_FILE="${SB_LOCK_FILE:-/root/sbox/config.lock}"
+SB_ROOT_DIR="${SB_ROOT_DIR:-$(dirname "$SB_SERVER_CONFIG")}"
+SB_SHORTCUT="${SB_SHORTCUT:-/usr/bin/mianyang}"
+SB_SYSTEMD_UNIT="${SB_SYSTEMD_UNIT:-/etc/systemd/system/sing-box.service}"
 RESERVED_CLIENT_NAME="legacy"
 CLIENT_NAME_PATTERN='^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$'
 REALITY_INBOUND_TAG="vless-in"
@@ -889,6 +892,51 @@ reload_health_ok() {
     pgrep -x sing-box >/dev/null 2>&1
 }
 
+# Atomically restores <live> from a hardened <backup>, keeping the original
+# backup intact. FAIL-CLOSED at every step: a missing/symlink/non-regular backup,
+# or a failed unique-temp creation, copy, chmod, atomic replace or verification
+# each return non-zero -- and a failure is NEVER reported as a successful restore.
+# The caller must hold with_client_lock. The live pathname is never `cp`'d onto
+# directly (a partial copy would corrupt the durable pair) and `sed -i` is never
+# used: the exact backup bytes are staged in a UNIQUE temp file in the SAME
+# directory and atomically renamed into place, then verified byte-for-byte.
+restore_file_atomically() { # <backup> <live>
+    local backup="$1" live="$2" tmp=""
+    if [ -z "$backup" ] || [ -z "$live" ]; then
+        warning "restore_file_atomically: 参数不能为空"
+        return 1
+    fi
+    if [ -L "$backup" ] || [ ! -f "$backup" ]; then
+        warning "备份不是普通文件（缺失或符号链接），拒绝恢复: $backup"
+        return 1
+    fi
+    if ! tmp="$(mktemp "${live}.restore.XXXXXX" 2>/dev/null)"; then
+        warning "创建恢复临时文件失败（需与目标同目录）: ${live}.restore.XXXXXX"
+        return 1
+    fi
+    if ! cp -a "$backup" "$tmp" 2>/dev/null; then
+        warning "写入恢复临时文件失败: $tmp"
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! chmod 0600 "$tmp" 2>/dev/null; then
+        warning "恢复临时文件权限收紧为 0600 失败: $tmp"
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! mv -f "$tmp" "$live" 2>/dev/null; then
+        warning "恢复文件原子替换失败: $live"
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! cmp -s "$backup" "$live" 2>/dev/null; then
+        warning "恢复校验失败：$live 与备份 $backup 内容不一致"
+        return 1
+    fi
+    return 0
+}
+
+
 # Internal transaction commit. The CALLER must already hold the client config
 # lock (see with_client_lock): the whole read -> audit -> candidate -> commit
 # sequence has to run under one exclusive lock or two concurrent managers could
@@ -964,7 +1012,10 @@ commit_server_config() { # commit_server_config <candidate> <description>
             return 0
         fi
         warning "reload 后健康检查失败（$description），自动回滚..."
-        cp -a "$backup_path" "$SB_SERVER_CONFIG"
+        if ! restore_file_atomically "$backup_path" "$SB_SERVER_CONFIG"; then
+            warning "回滚恢复失败，请立即人工介入！备份: $backup_path"
+            return 1
+        fi
         # The rollback reload's exit code matters: a failed reload command with a
         # still-alive process must NOT be reported as a successful recovery.
         if reload_running_singbox && reload_health_ok; then
@@ -2758,50 +2809,6 @@ new_state_backup_path() { # new_state_backup_path -> unique backup next to the l
     mktemp "${SB_STATE_FILE}.bak.$(date +%Y%m%d-%H%M%S).XXXXXX" 2>/dev/null
 }
 
-# Atomically restores <live> from a hardened <backup>, keeping the original
-# backup intact. FAIL-CLOSED at every step: a missing/symlink/non-regular backup,
-# or a failed unique-temp creation, copy, chmod, atomic replace or verification
-# each return non-zero -- and a failure is NEVER reported as a successful restore.
-# The caller must hold with_client_lock. The live pathname is never `cp`'d onto
-# directly (a partial copy would corrupt the durable pair) and `sed -i` is never
-# used: the exact backup bytes are staged in a UNIQUE temp file in the SAME
-# directory and atomically renamed into place, then verified byte-for-byte.
-restore_file_atomically() { # <backup> <live>
-    local backup="$1" live="$2" tmp=""
-    if [ -z "$backup" ] || [ -z "$live" ]; then
-        warning "restore_file_atomically: 参数不能为空"
-        return 1
-    fi
-    if [ -L "$backup" ] || [ ! -f "$backup" ]; then
-        warning "备份不是普通文件（缺失或符号链接），拒绝恢复: $backup"
-        return 1
-    fi
-    if ! tmp="$(mktemp "${live}.restore.XXXXXX" 2>/dev/null)"; then
-        warning "创建恢复临时文件失败（需与目标同目录）: ${live}.restore.XXXXXX"
-        return 1
-    fi
-    if ! cp -a "$backup" "$tmp" 2>/dev/null; then
-        warning "写入恢复临时文件失败: $tmp"
-        rm -f "$tmp"
-        return 1
-    fi
-    if ! chmod 0600 "$tmp" 2>/dev/null; then
-        warning "恢复临时文件权限收紧为 0600 失败: $tmp"
-        rm -f "$tmp"
-        return 1
-    fi
-    if ! mv -f "$tmp" "$live" 2>/dev/null; then
-        warning "恢复文件原子替换失败: $live"
-        rm -f "$tmp"
-        return 1
-    fi
-    if ! cmp -s "$backup" "$live" 2>/dev/null; then
-        warning "恢复校验失败：$live 与备份 $backup 内容不一致"
-        return 1
-    fi
-    return 0
-}
-
 # rc 0 when $1 is a usable TCP/UDP port number (1-65535, digits only).
 valid_port() {
     case "$1" in
@@ -2865,7 +2872,7 @@ set_state_key() { # set_state_key <live> <candidate> <key> <replacement-line>
 # E3/Integration decision and MUST be ratified there. SB_MANAGEMENT_ACTIVE_MARKER
 # is overridable so tests can simulate the active state without inventing an
 # irreversible production contract.
-SB_MANAGEMENT_ACTIVE_MARKER="${SB_MANAGEMENT_ACTIVE_MARKER:-/root/sbox/web-management.active}"
+SB_MANAGEMENT_ACTIVE_MARKER="${SB_MANAGEMENT_ACTIVE_MARKER:-/var/lib/sbox-cm/management.active}"
 
 management_is_active() { # rc 0 when web/E3 management is marked active
     [ -e "$SB_MANAGEMENT_ACTIVE_MARKER" ]
@@ -3160,24 +3167,63 @@ backup_current_installation() {
     info "完整备份已创建: /root/${backup_name}.tar.gz"
 }
 
+# M0/G2 L-ANCHOR: uninstall is a destructive management transaction. The public
+# entry point acquires the SAME global config.lock and delegates to a no-nesting
+# helper. The lock pathname itself is a permanent control-plane anchor and is
+# never unlinked, even by uninstall.
 uninstall_singbox() {
-    # L5: refuse BEFORE any destructive mutation when web/E3 management is active.
-    # E3 is not implemented, so this only triggers when a future E3 publishes the
-    # marker; default installations behave exactly as before.
+    with_client_lock _uninstall_singbox_locked
+}
+
+_uninstall_singbox_locked() {
+    # The activation gate MUST be evaluated while holding config.lock. This
+    # closes the activate-vs-uninstall TOCTOU: either activation wins and this
+    # refuses, or uninstall wins and activation later sees the missing config.
     if ! require_management_inactive "卸载"; then
         return 1
     fi
+
     warning "开始卸载..."
     if pgrep -x sing-box >/dev/null 2>&1 && ! systemctl is-active --quiet sing-box; then
         error "sing-box 当前由手工进程运行。为防止删除运行中的配置，已拒绝卸载。"
     fi
-    disable_hy2hopping
-    systemctl disable --now sing-box > /dev/null 2>&1
-    rm -f /etc/systemd/system/sing-box.service
-    rm -f /root/sbox/sbconfig_server.json /root/sbox/sing-box /root/sbox/mianyang.sh
-    rm -f /usr/bin/mianyang /root/sbox/self-cert/private.key /root/sbox/self-cert/cert.pem /root/sbox/config
-    rm -rf /root/sbox/self-cert/ /root/sbox/
-    warning "卸载完成"
+
+    # Already inside with_client_lock: call the locked hopping helper directly
+    # so uninstall never nests a second flock acquisition.
+    if [ -f "$SB_STATE_FILE" ]; then
+        _disable_hy2hopping_locked || {
+            warning "关闭 Hysteria2 端口跳跃失败，卸载已中止（控制面锚点保留）"
+            return 1
+        }
+    else
+        systemctl disable --now sing-box-hy2-hopping.service >/dev/null 2>&1 || true
+        remove_hy2_hopping_rules
+        rm -f "$HY_HOPPING_SERVICE" "$HY_HOPPING_HELPER"
+    fi
+
+    systemctl disable --now sing-box >/dev/null 2>&1 || true
+    rm -f -- "$SB_SYSTEMD_UNIT"
+
+    # Remove installation-owned runtime/config/credential artifacts, but DO NOT
+    # rm -rf SB_ROOT_DIR. In particular, SB_LOCK_FILE must retain the same path
+    # and inode for the lifetime of this critical section and afterwards.
+    rm -f --         "$SB_SERVER_CONFIG"         "$SB_SING_BOX_BIN"         "$SB_ROOT_DIR/mianyang.sh"         "$SB_SHORTCUT"         "$SB_SELF_CERT_KEY"         "$SB_SELF_CERT_CERT"         "$SB_STATE_FILE"         "$SB_API_SECRET_FILE"
+
+    rm -rf -- "$SB_CLIENTS_DIR" "$(dirname "$SB_SELF_CERT_KEY")"
+
+    # Generated transaction residue/backups are installation-owned too. These
+    # globs deliberately target only known durable artifacts; config.lock is not
+    # matched and is never unlinked.
+    rm -f --         "$SB_SERVER_CONFIG".candidate.*         "$SB_SERVER_CONFIG".restore.*         "$SB_SERVER_CONFIG".bak.*         "$SB_STATE_FILE".candidate.*         "$SB_STATE_FILE".restore.*         "$SB_STATE_FILE".bak.* 2>/dev/null || true
+
+    systemctl daemon-reload >/dev/null 2>&1 || true
+
+    if [ ! -e "$SB_LOCK_FILE" ]; then
+        warning "控制面锚点异常消失: $SB_LOCK_FILE；需人工介入"
+        return 1
+    fi
+
+    warning "卸载完成（控制面锚点已保留: $SB_LOCK_FILE）"
     return 0
 }
 
