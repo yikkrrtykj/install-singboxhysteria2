@@ -73,18 +73,15 @@ t = replace_once(t, needle, add, "Phase D static restore assertions")
 
 # The mv fault injector must fail ONLY the first candidate->live config rename.
 # Atomic rollback itself also uses mv and must be allowed to prove recovery.
-old_mv = '''mv() {
-    if [ "${MV_FAIL_CONFIG:-0}" = "1" ]; then
-        local last
-        eval "last=\"\${$#}\""
-        if [ "$last" = "${SB_SERVER_CONFIG:-}" ]; then
-            return 1
-        fi
-    fi
-    command mv "$@"
-}
-'''
-new_mv = '''mv() {
+mv_start_marker = '# Simulate a failure of the CONFIG atomic replacement while the binary has\n'
+mv_start = t.find(mv_start_marker)
+mv_end = t.find('MOCKS\n', mv_start)
+if mv_start < 0 or mv_end < 0:
+    raise SystemExit("one-shot config mv fault: marker block not found")
+new_mv_block = r'''# Simulate a failure of the CONFIG atomic replacement while the binary has
+# already been replaced (the mixed-state scenario from the review). The fault
+# fires ONCE: the later atomic rollback rename must be allowed to succeed.
+mv() {
     if [ "${MV_FAIL_CONFIG:-0}" = "1" ]; then
         local last marker="${MV_FAIL_CONFIG_MARKER:-}"
         eval "last=\"\${$#}\""
@@ -96,7 +93,7 @@ new_mv = '''mv() {
     command mv "$@"
 }
 '''
-t = replace_once(t, old_mv, new_mv, "one-shot config mv fault")
+t = t[:mv_start] + new_mv_block + t[mv_end:]
 
 # Every scenario resets the one-shot mv failure marker.
 needle = '    export PGREP_MODE="found"\n    rm -f "$TMP/new-check-fail" "$TMP/new-api-fail"\n'
