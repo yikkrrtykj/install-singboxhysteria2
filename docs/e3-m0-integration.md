@@ -9,7 +9,7 @@ Status: **M0 implementation complete in repository; not deployed; E3 management 
 | Repository | `yikkrrtykj/install-singboxhysteria2` |
 | PR | `#20` — `e3: M0 transaction hardening and control-plane anchor` |
 | Base | `main@00684d6b3538fe755ef9a155ac6b783ffda64104` |
-| M0 reviewed code head before this record | `c3af65d9910b0b5a0a4252a4676845e6aac51a94` |
+| Final M0 code head before this record | `e19509eb91e35fdae46f04362498372f771861aa` |
 | Design | `docs/e3-rev5-privileged-mutation-design.md` |
 | Production | **UNTOUCHED by E3 M0** |
 | E3 management | **NOT ENABLED** |
@@ -54,14 +54,17 @@ The M0 implementation was exercised repeatedly during development; the final har
 - `bash -n lib/client-management.sh`
 - `tests/e3/test-m0-static-contract.sh`
 - `tests/e3/test-m0-shared-lib.sh`
+- `tests/test-security-baseline.sh`
 - `tests/test-legacy-config-transactions.sh`
 - `tests/test-phase-c.sh`
 - `tests/test-phase-d.sh`
 - `tests/test-existing-api-auth-migration.sh`
 
-The final digest-binding run completed every listed step successfully, including all legacy / Phase C / Phase D / existing-api-auth regressions. Phase D rollback tests additionally verify restored config mode `0600` and binary mode `0755`.
+The digest-binding and Phase-D atomic-restore runs completed the M0 / legacy / Phase C / Phase D / existing-api-auth regressions successfully. Phase D rollback tests additionally verify restored config mode `0600` and binary mode `0755`.
 
-This document commit intentionally triggers the repository's normal PR workflows again so `shell-tests` and `monitor-packaging` are evaluated on a user-authored final M0 head rather than relying on an Actions-bot follow-up commit.
+The first normal multi-Ubuntu PR matrix after the shared-library extraction found three **static test-location assertions** in `test-security-baseline.sh` that still grepped `install.sh` for functions intentionally moved to `lib/client-management.sh`. The same run's dynamic S0 lock-failure and backup-mode tests passed. The static assertions were then updated to inspect the canonical library; the full S0 security-baseline suite and the M0/legacy/Phase C/Phase D/existing-api-auth regression bundle passed before commit `e19509eb91e35fdae46f04362498372f771861aa`.
+
+This final record commit intentionally triggers the repository's normal PR workflows once more so `shell-tests` and `monitor-packaging` are evaluated on a user-authored final M0 head rather than relying on an Actions-bot follow-up commit.
 
 ## Explicit non-goals / not started
 
