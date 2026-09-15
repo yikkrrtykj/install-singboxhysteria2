@@ -1,0 +1,58 @@
+name: e3-m0-extract-lib-once
+
+on:
+  push:
+    branches:
+      - feature/e3-m0-transaction-hardening
+    paths:
+      - tools/e3-m0-extract-lib.py
+      - .github/workflows/e3-m0-extract-lib-once.yml
+
+permissions:
+  contents: write
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          ref: feature/e3-m0-transaction-hardening
+          fetch-depth: 0
+
+      - name: Extract canonical transaction library
+        run: python3 tools/e3-m0-extract-lib.py
+
+      - name: Syntax and static contracts
+        run: |
+          set -euo pipefail
+          bash -n install.sh
+          bash -n lib/client-management.sh
+          bash tests/e3/test-m0-static-contract.sh
+          bash tests/e3/test-m0-shared-lib.sh
+
+      - name: Legacy transaction regression
+        run: bash tests/test-legacy-config-transactions.sh
+
+      - name: Phase C regression
+        run: bash tests/test-phase-c.sh
+
+      - name: Phase D regression
+        run: bash tests/test-phase-d.sh
+
+      - name: Existing API auth regression
+        run: bash tests/test-existing-api-auth-migration.sh
+
+      - name: Commit extraction and remove one-shot machinery
+        env:
+          BRANCH: feature/e3-m0-transaction-hardening
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git rm -f tools/e3-m0-extract-lib.py .github/workflows/e3-m0-extract-lib-once.yml
+          git add install.sh lib/client-management.sh tests/
+          git diff --cached --check
+          git commit -m "e3: extract canonical shared transaction library"
+          git push origin HEAD:"$BRANCH"
