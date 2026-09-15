@@ -3,79 +3,80 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 INSTALL="$ROOT/install.sh"
+LIB="$ROOT/lib/client-management.sh"
 
 pass=0
 fail=0
 
-ok() {
-  printf '[PASS] %s\n' "$*"
-  pass=$((pass + 1))
-}
+ok()  { printf '[PASS] %s\n' "$*"; pass=$((pass + 1)); }
+bad() { printf '[FAIL] %s\n' "$*"; fail=$((fail + 1)); }
 
-bad() {
-  printf '[FAIL] %s\n' "$*"
-  fail=$((fail + 1))
-}
-
-contains() {
-  grep -Fq -- "$1" "$INSTALL"
-}
-
-not_contains() {
-  ! grep -Fq -- "$1" "$INSTALL"
-}
+has_install() { grep -Fq -- "$1" "$INSTALL"; }
+no_install()  { ! grep -Fq -- "$1" "$INSTALL"; }
+has_lib()     { grep -Fq -- "$1" "$LIB"; }
+no_lib()      { ! grep -Fq -- "$1" "$LIB"; }
 
 printf '===== E3 M0 STATIC CONTRACT =====\n'
-printf 'install=%s\n\n' "$INSTALL"
+printf 'install=%s\nlib=%s\n\n' "$INSTALL" "$LIB"
 
-# G1 existing global lock contract: preserve the already-reviewed fail-closed
-# semantics; E3 M0 must not regress or replace this lock with a second one.
-contains 'SB_LOCK_FILE="${SB_LOCK_FILE:-/root/sbox/config.lock}"' &&
+[ -f "$LIB" ] && ok 'canonical client-management library exists' || bad 'client-management library missing'
+
+# One canonical lock path remains in install.sh; implementation lives only in lib.
+has_install 'SB_LOCK_FILE="${SB_LOCK_FILE:-/root/sbox/config.lock}"' &&
   ok 'single canonical config.lock path remains' ||
   bad 'canonical config.lock declaration missing'
 
-contains 'command -v flock' && contains 'exec 9>>"$SB_LOCK_FILE"' && contains 'flock -w "$SB_LOCK_TIMEOUT" 9' &&
-  ok 'with_client_lock still fails closed around flock acquisition' ||
-  bad 'with_client_lock fail-closed primitives missing'
+has_install 'lib/client-management.sh' &&
+  ok 'install.sh loads canonical transaction library' ||
+  bad 'install.sh does not load canonical transaction library'
 
-# G1 / T-1: every single-file config rollback must use the hardened atomic
-# restore primitive, never cp directly onto the live pathname.
-contains 'restore_file_atomically()' && contains 'cmp -s "$backup" "$live"' &&
-  ok 'restore_file_atomically primitive exists and verifies bytes' ||
-  bad 'restore_file_atomically primitive incomplete'
+has_lib 'command -v flock' && has_lib 'exec 9>>"$SB_LOCK_FILE"' && has_lib 'flock -w "$SB_LOCK_TIMEOUT" 9' &&
+  ok 'shared with_client_lock is fail-closed' ||
+  bad 'shared with_client_lock fail-closed primitives missing'
 
-if not_contains 'cp -a "$backup_path" "$SB_SERVER_CONFIG"'; then
-  ok 'commit_server_config has no direct cp rollback onto live config'
+# No second copy of the shared primitives is permitted in install.sh.
+for fn in with_client_lock reload_running_singbox reload_health_ok restore_file_atomically \
+          new_candidate_path new_backup_path commit_server_config; do
+  lib_count="$(grep -cE "^${fn}\\(\\)" "$LIB" || true)"
+  install_count="$(grep -cE "^${fn}\\(\\)" "$INSTALL" || true)"
+  if [ "$lib_count" = "1" ] && [ "$install_count" = "0" ]; then
+    ok "$fn has exactly one source definition (shared lib)"
+  else
+    bad "$fn definition count lib=$lib_count install=$install_count"
+  fi
+done
+
+# T-1/T-2: hardened restore + structured non-sensitive transaction result.
+has_lib 'cmp -s "$backup" "$live"' &&
+  ok 'shared restore verifies bytes after atomic replace' ||
+  bad 'shared restore byte verification missing'
+
+if no_lib 'cp -a "$backup_path" "$SB_SERVER_CONFIG"' && no_install 'cp -a "$backup_path" "$SB_SERVER_CONFIG"'; then
+  ok 'generic rollback never directly cp-s backup onto live config'
 else
-  bad 'commit_server_config still directly cp-s backup onto live config (T-1 blocker)'
+  bad 'direct generic rollback copy still exists'
 fi
 
-# G2 / R5 formalized management marker. Environment override remains for test
-# injection, but the production default must no longer live under /root/sbox.
-if contains 'SB_MANAGEMENT_ACTIVE_MARKER="${SB_MANAGEMENT_ACTIVE_MARKER:-/var/lib/sbox-cm/management.active}"'; then
-  ok 'management marker production default is /var/lib/sbox-cm/management.active'
-else
-  bad 'management marker still uses the provisional /root/sbox path'
-fi
+has_lib 'cm_transaction_result_json()' && \
+has_lib 'rollback_attempted:' && \
+has_lib 'health_verified:' && \
+has_lib 'backup_path:' &&
+  ok 'shared transaction exposes structured result fields' ||
+  bad 'structured transaction result contract incomplete'
 
-# G2 / L-ANCHOR: uninstall must never remove the lock pathname or the whole
-# /root/sbox directory. The public entry point must acquire the same global
-# lock and delegate to a no-nesting locked helper.
-if contains 'uninstall_singbox()' && contains 'with_client_lock _uninstall_singbox_locked'; then
-  ok 'uninstall enters the global lock through a locked helper'
-else
-  bad 'uninstall is not yet routed through _uninstall_singbox_locked'
-fi
+# G2 marker + permanent control-plane anchor.
+has_install 'SB_MANAGEMENT_ACTIVE_MARKER="${SB_MANAGEMENT_ACTIVE_MARKER:-/var/lib/sbox-cm/management.active}"' &&
+  ok 'management marker production default is /var/lib/sbox-cm/management.active' ||
+  bad 'management marker production path is wrong'
 
-if not_contains 'rm -rf /root/sbox/self-cert/ /root/sbox/'; then
-  ok 'uninstall no longer rm -rf-s the /root/sbox control-plane anchor'
-else
-  bad 'uninstall still deletes /root/sbox and therefore config.lock path'
-fi
+has_install 'with_client_lock _uninstall_singbox_locked' &&
+  ok 'uninstall enters the global lock through locked helper' ||
+  bad 'uninstall is not routed through _uninstall_singbox_locked'
 
-# The locked helper must perform the activation gate under the lock. This is a
-# static shape assertion; dynamic inode/lifecycle behavior belongs in the M0
-# sandbox regression added with the implementation.
+no_install 'rm -rf /root/sbox/self-cert/ /root/sbox/' &&
+  ok 'uninstall never removes the config.lock parent directory' ||
+  bad 'uninstall still removes /root/sbox control-plane anchor'
+
 if grep -Eq '^_uninstall_singbox_locked\(\)' "$INSTALL" &&
    awk '
      /^_uninstall_singbox_locked\(\)/ {infn=1}
@@ -83,16 +84,14 @@ if grep -Eq '^_uninstall_singbox_locked\(\)' "$INSTALL" &&
      infn && /^}/ {exit found ? 0 : 1}
      END {if (!infn || !found) exit 1}
    ' "$INSTALL"; then
-  ok 'management inactive check is inside _uninstall_singbox_locked'
+  ok 'management inactive check is inside locked uninstall critical section'
 else
-  bad 'management inactive check is not yet inside locked uninstall critical section'
+  bad 'management inactive check is outside locked uninstall critical section'
 fi
 
 printf '\nPASS=%d FAIL=%d\n' "$pass" "$fail"
-
 if (( fail != 0 )); then
   printf 'E3_M0_STATIC_CONTRACT=FAIL\n'
   exit 1
 fi
-
 printf 'E3_M0_STATIC_CONTRACT=PASS\n'
