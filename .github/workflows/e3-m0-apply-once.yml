@@ -6,6 +6,7 @@ on:
       - feature/e3-m0-transaction-hardening
     paths:
       - tools/e3-m0-apply.py
+      - tools/e3-m0-fix-phasec.py
       - .github/workflows/e3-m0-apply-once.yml
 
 permissions:
@@ -22,7 +23,9 @@ jobs:
           fetch-depth: 0
 
       - name: Apply M0 patch
-        run: python3 tools/e3-m0-apply.py
+        run: |
+          python3 tools/e3-m0-apply.py
+          python3 tools/e3-m0-fix-phasec.py
 
       - name: Syntax gate
         run: bash -n install.sh
@@ -49,7 +52,7 @@ jobs:
           set -euo pipefail
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git rm -f tools/e3-m0-apply.py .github/workflows/e3-m0-apply-once.yml
+          git rm -f tools/e3-m0-apply.py tools/e3-m0-fix-phasec.py .github/workflows/e3-m0-apply-once.yml
           git add install.sh tests/test-legacy-config-transactions.sh tests/e3/test-m0-static-contract.sh
           git diff --cached --check
           git commit -m "e3: harden rollback and preserve control-plane lock anchor"
