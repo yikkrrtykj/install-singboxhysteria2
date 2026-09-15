@@ -453,11 +453,215 @@ bash tests/test-monitor-v2-e2.sh
 bash tests/test-monitor-v2-e1.sh
 ```
 
+## Phase M0.5 — Step-up 认证（G3）+ Monitor 权限边界定案（G4）
+
+M0.5 **不修改 sing-box，也不实现 sbox-cm**。它只交付 rev5 依赖链
+（M0 → M0.5 → M1 → M2 → M3 → M4）里两个前置：Web mutation 的二次认证，
+以及既有 `singbox-monitor.service` 的权限边界定型。
+
+### G3：Step-up（`POST /api/v1/step-up`）
+
+普通 admin session 保持只读级：login 之后 Dashboard / traffic / status /
+`client.list`（未来）全部放行，**不在页面加载时索要第二次密码**。
+
+只有特权 mutation 要求 step-up。请求门顺序固定为
+**session → session-bound CSRF → step-up**：
+
+```text
+POST /api/v1/step-up   {"password": "..."}
+  200 {"status": "ok", "expires_in": 300}
+  401 {"error": "invalid_credentials"}     密码错误
+  429 {"error": "rate_limited"}            触发限速（带 Retry-After）
+
+mutation 缺少 step-up
+  401 {"error": "reauth_required"}         Web UI 只认这一个码 → 弹密码框 → 重放原请求
+```
+
+**step-up 端点自身**同样要求已登录 session **和** 该 session 的 CSRF token
+（当然不能要求"已有 step-up"，那是循环依赖），内部顺序固定为：
+
+```text
+session → CSRF → rate-limit → verify_password → grant_step_up
+```
+
+CSRF 必须早于任何密码工作与计数器变更，这不是装饰：跨站请求虽然猜不到密码，
+却可以故意提交错误密码烧掉**共享**的 `LoginRateLimiter` 预算，把真正的管理员
+锁在门外（CSRF lockout DoS）。因此被 CSRF 拒绝的请求**不做 scrypt 工作、
+不消耗任何限速预算**。
+
+* 窗口 300 秒，记录**只在 Web 进程内存**：`session.step_up_expires`，
+  不写数据库、不写磁盘、不写任何 `SB_*` 状态。
+* 密码验证复用既有 `auth.verify_password()`；失败计数复用**同一个**
+  `LoginRateLimiter`（按 socket 对端地址），Step-up 因此不是第二个无限
+  暴力破解入口——两边共享锁定预算（`tests/test-monitor-v2-m05.sh` M3 双向断言）。
+
+**五类吊销（立即生效，不等 300 秒）**：
+
+| 事件 | 处理 |
+| --- | --- |
+| `POST /api/v1/logout` | session 删除 ⇒ step-up 一起消失 |
+| 管理员改密（`POST /api/v1/password`） | **所有** step-up 清空；调用方保留普通登录 session，**其他 session 一律删除**（保持 main 既有语义，绝不为"全量清 step-up"而放宽成所有 session 继续有效） |
+| Recovery reset / rotate | `set_recovery_key` ⇒ **所有** step-up 清空（含调用方自己的）；session **不登出**（与改密区分：只降权、不踢人） |
+| session TTL 到期 | session 消亡 ⇒ step-up 消亡 |
+| Web 进程重启 | memory-only ⇒ session 与 step-up 全部失效 |
+
+**吊销的并发语义（与 M1 的"durable intent 后事务不可取消"对齐）**：
+
+* gate 是**逐请求**求值的。logout / 改密 / recovery reset-rotate 之后，
+  所有**尚未通过 mutation authorization gate** 的请求**立即**失去 step-up
+  （不是等 300 秒）；
+* **已经通过 gate** 的请求不被重新判定，也不会因为随后发生的 logout/改密
+  被**半途中止**；
+* M0.5 不做任何 dispatch，所以当前不存在"半途事务"这一状态；这条规则现在就
+  写死，是因为 M1 继承它：一旦 durable ledger intent 落盘，sbox-cm 侧必须
+  把变更驱动到终态，与 Web session 之后做什么无关。
+
+**授权边界（M0.5 交付的是"门"，不是"动作"）**：rev5 §7 的四个特权 op
+已作为路由登记，走完整鉴权链：
+
+```text
+POST /api/v1/management/activate     → management.activate
+POST /api/v1/management/deactivate   → management.deactivate
+POST /api/v1/clients/add             → client.add
+POST /api/v1/clients/delete          → client.delete
+```
+
+通过 step-up 之后返回**固定 501 合同**：
+
+```json
+{ "error": "not_implemented", "op": "client.add", "milestone": "M0.5" }
+```
+
+501 在这里只表示**一件事**：授权链已全部通过，只缺后端。因此它**永远**不会
+早于门禁返回——没有 step-up 时仍然先给 `401 reauth_required`。特权执行面
+（sbox-cm / AF_UNIX RPC / 共享 config.lock / 提交引擎）属于 M1/M2。
+**本里程碑不读 `/root/sbox`、不写 marker、不 reload、不调用未来 helper，
+也不返回任何 success 形态的结果**。M1/M2 只是把这个 handler 的 body 换成
+RPC adapter，认证边界一行都不用重新设计。
+
+### `monitor_running` / `management_active`（正交状态）
+
+`GET /api/v1/session` 同时返回两个 **正交** 布尔：
+
+```json
+{"monitor_running": true, "management_active": false, "step_up_active": false}
+```
+
+* `monitor_running` = E1 collector 线程 + web publisher 线程都存活
+  （service.api 不可达的 `stale=true` 仍算 running，这是 E1 合同）；
+* `management_active` = 特权变更面是否已激活。**生产默认必须始终 false**；
+  M0.5 恒为 false 且 fail-closed：标记位于 root-only 的 sbox-cm 运行时目录，
+  sboxweb 对它**零文件系统权限**，唯一未来读通道是 sbox-cm RPC——
+  任何不可判定的情况一律返回 false（绝不宣称变更面已打开）。
+* 当前实现是一个**阶段性 provider，不是未来的真值源**。M1 之后它**必须**被
+  替换为：
+
+  ```text
+  Web  →  management.status RPC  →  sbox-cm
+  ```
+
+  Web **永远禁止**自己 `stat()/open()` 激活标记（代码里连标记文件名都不允许
+  出现，由静态断言 + 权限边界断言共同保证）。
+
+"监控在线 ≠ 允许 Web 修改 sing-box"：两者互不影响，代码与测试都按
+正交建模（冻结 publisher 只让 `monitor_running` 降级，`management_active`
+与只读快照不受影响）。
+
+### G4：`singbox-monitor.service` 权限边界硬化
+
+**不新建 `sboxweb.service`**：Round 2 起既有 unit 就是 `User=sboxweb`，
+本轮只是原地收紧（`monitor-v2/deploy/singbox-monitor.service.in`）：
+
+```text
+ProtectSystem=strict        （原 full：现在整个层级只读）
+ReadWritePaths=@SBMON_STATE_ROOT@   （唯一可写例外 = 自己的 data root）
+ProtectHome=yes             （/root、/home 不可见）
+再加：NoNewPrivileges / PrivateTmp / ProtectKernelTunables /
+      ProtectKernelModules / ProtectKernelLogs / ProtectControlGroups /
+      RestrictSUIDSGID / RestrictRealtime / LockPersonality /
+      SystemCallArchitectures=native
+CapabilityBoundingSet=       AmbientCapabilities=        （零 capability）
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+```
+
+最后一项**刻意**不收敛为 AF_UNIX-only：monitor 既是 loopback 客户端
+（127.0.0.1:9091）又是 loopback 监听者（127.0.0.1:9191），未来还要 connect
+`/run/sbox-cm/sbox-cm.sock`。只有 sbox-cm 才能做到纯 AF_UNIX——两个 unit 的
+address-family 合同**分开**，不互相借用。
+
+**核心安全边界（INV-1 在 Web 侧的落地）**：sboxweb 对 `/root/sbox/**` 与
+root-only 的 sbox-cm 运行时目录**直接文件访问 = 0**。未来即使增加 Client
+Manager，也**禁止** `open/jq/mv/chmod/systemctl reload/kill -HUP` 这类旁路，
+变更只能走：
+
+```text
+Web  →  AF_UNIX  →  sbox-cm  →  shared transaction engine
+```
+
+该边界由三层证据共同保证，**不以静态断言为唯一证明**：
+
+1. 静态断言：web 代码零路径引用（含标记文件名）；unit 只开一个 `ReadWritePaths`，
+   且不含两个特权树；
+2. 内核不变量（实际文件系统检查）：`/root` 必须 root:root owner-only，
+   `/root/sbox` 与 sbox-cm 运行时目录必须 absent 或 root:root owner-only
+   （M1 创建 `/var/lib/sbox-cm` 后必须复验 root:root 0700）；
+3. 主动探测：以**非 root 身份实际尝试**读取 `/root`、`/root/sbox`、
+   sbox-cm 运行时目录，必须 `denied`/`absent`（环境无法提供外部身份时打印
+   显式 SKIP，绝不静默算过）。
+
+### M0.5 测试
+
+```bash
+# M0.5 回归（套件 TOTAL=137：T1-T12 行为断言 + 五类吊销 + 吊销并发语义 +
+# step-up 端点自身的 session/CSRF 门与 CSRF lockout DoS 防护 +
+# 共享限速双向 + 正交状态模型 + unit 硬化逐项 + 权限边界静态断言 +
+# POSIX 内核不变量与实际读探测 6 项）
+bash tests/test-monitor-v2-m05.sh
+
+# 既有回归必须继续全绿
+bash tests/test-monitor-v2-e1.sh      # E1 collector
+bash tests/test-monitor-v2-e2.sh      # E2 web（272/272）
+bash tests/test-monitor-packaging.sh  # packaging（unit 断言已随硬化更新）
+```
+
+**计数口径**（硬门，杜绝"断言悄悄变少却仍然成功"）：套件大小是**平台无关**的
+`TOTAL=137`，每条断言必须落在 PASS / FAIL / SKIP 之一，`PASS + FAIL + SKIP`
+必须恰好等于 `TOTAL`，否则判 FAIL。标准 GitHub Ubuntu runner（非 root，外部
+身份可得）的期望输出：
+
+```text
+PASS=137
+FAIL=0
+SKIP=0
+TOTAL=137
+M05_RESULT=PASS
+```
+
+环境确实无法提供外部身份时，该节打印并计数 SKIP（例如 `134/0/3/137`），
+**绝不**通过下调期望值来凑通过；CI 上同一组数字还会写进 GitHub Actions
+step summary。
+
+验收门槛：`G3_STEP_UP` / `G3_REVOCATION` / `G4_SERVICE_BOUNDARY` /
+`G4_SYSTEMD_HARDENING` / `E1_REGRESSION` / `E2_REGRESSION` 全 PASS
+⇒ **M0.5 = COMPLETE**，方可开始 M1（sbox-cm root helper）。
+
+M0.5 的锁定合同（design review 后）汇总：step-up 端点需 session + CSRF 且
+CSRF 先于限速/校验；mutation 缺 step-up 一律 `401 reauth_required`；授权通过后
+只给固定 `501 not_implemented`；吊销逐请求生效、已过 gate 的请求不半途中止；
+改密保持"调用方 session 保留 / 其他 session 删除"并额外吊销全部 step-up；
+recovery rotate 只降权不踢人；`management_active` 是阶段性 provider，M1 必须
+换成 `management.status` RPC，Web 永不 stat 标记；unit 硬化使用
+`ProtectSystem=strict` + 单一 `ReadWritePaths`；权限边界必须同时有静态断言、
+内核不变量与实际读探测三重证据。
+
 ## 已知未实现（后续阶段）
 
 - 用户视角 upload/download 方向映射（需按 API 视角说明，E1 不虚构）；
 - 数据库 / 历史曲线（totals 为 "Since monitor start"，非 all-time）；
 - Client Manager（Phase E3，明确不在本阶段）；
+- **mutation 真执行**：`client.add/delete`、`management.activate/deactivate`
+  的 sbox-cm 特权后端（AF_UNIX RPC + 共享 config.lock + 提交引擎）属 M1/M2；
+  M0.5 只交付已评审的授权门（step-up）与 501 边界，`management_active` 恒 false；
 - Reality-only RTT/retrans 增强（ss，可选）；
 - expected source IP 机械比对（外部测试阶段）；
 - 可信反代（trusted proxy）场景下的白名单来源设计。

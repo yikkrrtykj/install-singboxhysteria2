@@ -42,6 +42,7 @@ jobs:
           bash -n tests/canary-api-auth.sh
           bash -n tests/test-monitor-v2-e1.sh
           bash -n tests/test-monitor-v2-e2.sh
+          bash -n tests/test-monitor-v2-m05.sh
           bash -n tests/test-monitor-v2-e4.sh
           bash -n tests/test-legacy-config-transactions.sh
           bash -n tests/test-existing-api-auth-migration.sh
@@ -73,6 +74,9 @@ jobs:
 
       - name: E2 web dashboard regression suite
         run: bash tests/test-monitor-v2-e2.sh
+
+      - name: M0.5 step-up auth + monitor privilege boundary regression suite
+        run: bash tests/test-monitor-v2-m05.sh
 
       - name: E4 Mihomo enrichment regression suite
         run: bash tests/test-monitor-v2-e4.sh
@@ -163,4 +167,4 @@ jobs:
           fi
 
       - name: Integration regression complete (all prior steps green)
-        run: "echo 'Phase C + Phase D + S0 + Legacy + E1 + E2 + E4 + Packaging + existing-api-auth migration + journal-time compat: all green on ${{ matrix.os }}'"
+        run: "echo 'Phase C + Phase D + S0 + Legacy + E1 + E2 + M0.5 + E4 + Packaging + existing-api-auth migration + journal-time compat: all green on ${{ matrix.os }}'"

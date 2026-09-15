@@ -119,10 +119,90 @@
         if (!response.ok) {
           var error = new Error(data.error || ("HTTP " + response.status));
           error.status = response.status;
+          error.code = data.error;   // stable machine code, e.g. reauth_required
           throw error;
         }
         return data;
       });
+    });
+  }
+
+  /* ---------- step-up (re-authentication) ----------
+   *
+   * Privileged mutations answer 401 {"error":"reauth_required"} when this
+   * session has no live step-up window. ONLY that response opens the password
+   * panel: the page never asks for a second password on load. After a
+   * successful POST /api/v1/step-up the ORIGINAL request is replayed
+   * unchanged (same body, same CSRF token).
+   */
+
+  var stepUpPending = null;
+
+  function promptStepUp() {
+    if (stepUpPending) return stepUpPending;   // one panel at a time
+    stepUpPending = new Promise(function (resolve, reject) {
+      var overlay = $("stepup-overlay");
+      var input = $("stepup-password");
+      var errorEl = $("stepup-error");
+      var form = $("stepup-form");
+      var cancel = $("stepup-cancel");
+
+      function close() {
+        hide(overlay);
+        input.value = "";
+        hide(errorEl);
+        form.removeEventListener("submit", onSubmit);
+        cancel.removeEventListener("click", onCancel);
+        stepUpPending = null;
+      }
+      function fail(message) {
+        errorEl.textContent = message;
+        show(errorEl);
+        input.focus();
+      }
+      function onSubmit(event) {
+        event.preventDefault();
+        var password = input.value;
+        if (!password) { fail("Password required."); return; }
+        api("/api/v1/step-up", { method: "POST", body: { password: password } })
+          .then(function () {
+            close();
+            loadSession().catch(function () { /* status refresh is best effort */ });
+            resolve();
+          })
+          .catch(function (error) {
+            if (error.status === 429) {
+              fail("Too many failed attempts — try again later.");
+            } else if (error.status === 401) {
+              fail("Incorrect password.");
+            } else {
+              fail(error.message);
+            }
+          });
+      }
+      function onCancel(event) {
+        event.preventDefault();
+        close();
+        reject(new Error("step-up cancelled"));
+      }
+
+      show(overlay);
+      errorEl.className = "form-msg error hidden";
+      errorEl.textContent = "";
+      input.value = "";
+      form.addEventListener("submit", onSubmit);
+      cancel.addEventListener("click", onCancel);
+      input.focus();
+    });
+    return stepUpPending;
+  }
+
+  function apiWithStepUp(path, options) {
+    return api(path, options).catch(function (error) {
+      if (error.status === 401 && error.code === "reauth_required") {
+        return promptStepUp().then(function () { return api(path, options); });
+      }
+      throw error;
     });
   }
 
@@ -198,6 +278,7 @@
     renderConnections(snap.connections || []);
     renderMonitorInfo(snap);
     renderWhitelistFromSession();
+    renderManagement();
   }
 
   function totalRate(snap, field) {
@@ -329,6 +410,56 @@
     $("mi-error").textContent = snap.last_error ? String(snap.last_error) : "none";
   }
 
+  /* ---------- management plane status (orthogonal booleans) ---------- */
+
+  function setBadge(el, label, cls) {
+    el.textContent = label;
+    el.className = "badge " + cls;
+  }
+
+  function renderManagement() {
+    var session = state.session;
+    if (!session) return;
+    var running = session.monitor_running === true;
+    var armed = session.management_active === true;
+    var authorized = session.step_up_active === true;
+    // Running the monitor says NOTHING about the mutation plane: the safe
+    // production default is running=true with management inactive.
+    setBadge($("mg-monitor"), running ? "running" : "not running",
+             running ? "ok" : "recent");
+    setBadge($("mg-manage"), armed ? "active" : "inactive (default)",
+             armed ? "recent" : "idle");
+    setBadge($("mg-stepup"), authorized ? "authorized" : "not authorized",
+             authorized ? "ok" : "idle");
+  }
+
+  function mgMessage(text, isError) {
+    var el = $("mg-msg");
+    el.textContent = text;
+    el.className = "form-msg " + (isError ? "error" : "ok");
+    show(el);
+  }
+
+  function managementMutation(path, onSuccessMessage) {
+    // The privileged backend is not part of this milestone, so a successful
+    // authorization ends in an explicit 501. What matters here is the gate:
+    // 401 reauth_required opens the password panel and replays the request.
+    apiWithStepUp(path, { method: "POST", body: {} })
+      .then(function () {
+        mgMessage(onSuccessMessage, false);
+        loadSession();
+      })
+      .catch(function (error) {
+        if (error.status === 501) {
+          mgMessage("Authorized. The privileged backend is not part of this " +
+                    "build yet.", false);
+          loadSession();
+          return;
+        }
+        mgMessage(error.message, true);
+      });
+  }
+
   /* ---------- settings: access control ---------- */
 
   function loadAccess() {
@@ -458,6 +589,7 @@
       $("rec-status").textContent =
         data.recovery_configured ? "configured ✓" : "not configured";
       renderWhitelistFromSession();
+      renderManagement();
       return data;
     });
   }
@@ -602,6 +734,14 @@
     $("recovery-form").addEventListener("submit", submitRecovery);
     $("pw-form").addEventListener("submit", changePassword);
     $("rec-rotate-btn").addEventListener("click", rotateRecovery);
+    $("mg-activate").addEventListener("click", function () {
+      managementMutation("/api/v1/management/activate",
+                         "Management activation was authorized.");
+    });
+    $("mg-deactivate").addEventListener("click", function () {
+      managementMutation("/api/v1/management/deactivate",
+                         "Management deactivation was authorized.");
+    });
     $("wl-add-btn").addEventListener("click", function () {
       var value = $("wl-add-input").value.trim();
       if (value) addEntry(value);
