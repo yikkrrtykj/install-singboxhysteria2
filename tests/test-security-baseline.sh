@@ -25,6 +25,7 @@ set -uo pipefail
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_SH="$HERE/../install.sh"
+CLIENT_LIB="$HERE/../lib/client-management.sh"
 
 PASS=0
 FAIL=0
@@ -59,8 +60,8 @@ assert_grep 'write_api_secret_file "\$monitor_api_secret" \|\| error' "$INSTALL_
 assert_grep 'harden_sensitive_permissions \|\| error' "$INSTALL_SH" "fresh install hardens permissions fail-closed"
 assert_grep '^repair_existing_install_security_baseline\(\)' "$INSTALL_SH" "fail-closed existing-install baseline repair helper exists"
 assert_no_grep '单机低并发场景下继续执行' "$INSTALL_SH" "unlocked fallback is gone"
-assert_grep 'flock -w "\$SB_LOCK_TIMEOUT" 9' "$INSTALL_SH" "lock acquisition uses a finite timeout"
-assert_grep '操作已中止（fail-closed）' "$INSTALL_SH" "lock failure aborts the operation"
+assert_grep 'flock -w "\$SB_LOCK_TIMEOUT" 9' "$CLIENT_LIB" "lock acquisition uses a finite timeout (shared lib)"
+assert_grep '操作已中止（fail-closed）' "$CLIENT_LIB" "lock failure aborts the operation (shared lib)"
 assert_grep 'rm -rf -- "\$\{SB_CLIENTS_DIR:\?\}/\$name"' "$INSTALL_SH" "destructive rm uses -- and a non-empty guard"
 assert_grep 'chown root:root' "$INSTALL_SH" "derived secret file is forced root:root"
 assert_grep '\-\-secret "\$api_secret"' "$INSTALL_SH" "health check authenticates the API call"
@@ -77,7 +78,7 @@ fi
 # keep their own per-function assertions, and the narrow-migration backup gets
 # a SEPARATE assertion (the global count would silently drift whenever another
 # transaction with its own backup is added).
-commit_body="$(awk '/^commit_server_config\(\) \{/,/^\}/' "$INSTALL_SH")"
+commit_body="$(awk '/^commit_server_config\(\) \{/,/^\}/' "$CLIENT_LIB")"
 commit_chmod="$(printf '%s\n' "$commit_body" | grep -c 'chmod 0600 "\$backup_path" 2>/dev/null')"
 assert_rc 1 "$commit_chmod" "phase-c commit backup enforces 0600 explicitly (scope-aware)"
 upgrade_body="$(awk '/^_upgrade_singbox_1_14_locked\(\) \{/,/^\}/' "$INSTALL_SH")"
