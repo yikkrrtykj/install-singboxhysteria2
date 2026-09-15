@@ -10,6 +10,11 @@ password. Requirements implemented here:
   persisting bearer tokens on disk. Each session also carries its own
   CSRF token (exposed to the page via ``/api/v1/session``; every
   authenticated mutation must present it);
+* a session may additionally hold a **step-up** (M0.5 / rev5 G3): a
+  300-second re-authentication window that privileged mutations require.
+  It too is memory-only and bound to its session -- logout, password
+  change, recovery-key rotation, session expiry and web restart each make
+  it vanish (``revoke_all_step_ups`` / session drop), never a disk write;
 * the session cookie is always ``HttpOnly; SameSite=Strict`` with an 8h
   default lifetime. The ``Secure`` flag is MODE-SCOPED: mandatory on
   remote listeners and any TLS listener; deliberately omitted on a
@@ -36,6 +41,11 @@ from web.storage import atomic_write_json, ensure_private_dir, read_json
 
 DEFAULT_SESSION_TTL = 8 * 3600.0
 MIN_PASSWORD_LENGTH = 8
+
+# Step-up (re-authentication) window for privileged mutations. Deliberately a
+# process constant, not a per-session value: the 300s figure is a contract
+# (rev5 §5.1 U-7), not a tunable.
+DEFAULT_STEP_UP_TTL = 300.0
 
 SCRYPT_N = 1 << 14
 SCRYPT_R = 8
@@ -141,10 +151,20 @@ class SessionStore:
     Thread-safe: concurrent logins/logouts/expiries come from different
     request threads; the sessions dict is guarded by a mutex (no reliance
     on GIL atomicity for multi-step operations).
+
+    Each session record is::
+
+        {"created", "expires", "csrf_token", "step_up_expires"}
+
+    where ``step_up_expires`` is ``None`` (never re-authenticated) or an
+    absolute clock value. The step-up is a property of one session: dropping
+    the session drops it, and it is never persisted anywhere.
     """
 
-    def __init__(self, ttl=DEFAULT_SESSION_TTL, clock=time.time):
+    def __init__(self, ttl=DEFAULT_SESSION_TTL, clock=time.time,
+                 step_up_ttl=DEFAULT_STEP_UP_TTL):
         self.ttl = ttl
+        self.step_up_ttl = step_up_ttl
         self._clock = clock
         self._mutex = threading.Lock()
         self._sessions = {}  # token -> {"created", "expires", "csrf_token"}
@@ -153,7 +173,8 @@ class SessionStore:
         now = self._clock()
         token = secrets.token_urlsafe(32)
         record = {"created": now, "expires": now + self.ttl,
-                  "csrf_token": secrets.token_urlsafe(32)}
+                  "csrf_token": secrets.token_urlsafe(32),
+                  "step_up_expires": None}
         with self._mutex:
             self._sessions[token] = record
         return token
@@ -178,6 +199,40 @@ class SessionStore:
                 if token != except_token:
                     del self._sessions[token]
 
+    # -- step-up (re-authentication) -----------------------------------------
+
+    def grant_step_up(self, token, ttl=None):
+        """Open a step-up window on ``token``; returns its expiry or None.
+
+        None means the session does not exist (or already expired), so no
+        window could be opened -- the caller must answer 401, never pretend
+        a grant happened.
+        """
+        ttl = self.step_up_ttl if ttl is None else ttl
+        now = self._clock()
+        with self._mutex:
+            record = self._sessions.get(token)
+            if record is None or now >= record["expires"]:
+                return None
+            record["step_up_expires"] = now + ttl
+            return record["step_up_expires"]
+
+    def step_up_active(self, token):
+        """True while a valid, unexpired step-up window exists on the session."""
+        now = self._clock()
+        with self._mutex:
+            record = self._sessions.get(token)
+            if record is None or now >= record["expires"]:
+                return False
+            expires = record.get("step_up_expires")
+            return expires is not None and now < expires
+
+    def revoke_all_step_ups(self):
+        """Drop EVERY step-up (the sessions themselves survive)."""
+        with self._mutex:
+            for record in self._sessions.values():
+                record["step_up_expires"] = None
+
 
 class AuthStore:
     """auth.json persistence (hashes only) + in-memory session/rate state.
@@ -189,10 +244,11 @@ class AuthStore:
     """
 
     def __init__(self, data_dir, session_ttl=DEFAULT_SESSION_TTL,
-                 clock=time.time):
+                 clock=time.time, step_up_ttl=DEFAULT_STEP_UP_TTL):
         self.data_dir = data_dir
         self.path = "%s/auth.json" % data_dir
-        self.sessions = SessionStore(ttl=session_ttl, clock=clock)
+        self.sessions = SessionStore(ttl=session_ttl, clock=clock,
+                                     step_up_ttl=step_up_ttl)
         self.login_limiter = LoginRateLimiter(clock=clock)
         self._mutex = threading.RLock()
         self._password = None
@@ -256,6 +312,12 @@ class AuthStore:
             # A new password invalidates every OTHER session (admin may be
             # locking out a compromised browser); the caller stays logged in.
             self.sessions.drop_all(except_token=keep_session)
+            # ...but EVERY step-up dies, including the caller's own: the
+            # credential the step-up was based on no longer exists, so the
+            # mutation privilege is revoked immediately rather than after
+            # the 300s window. The caller keeps a normal read-only session
+            # and must re-authenticate before the next mutation.
+            self.sessions.revoke_all_step_ups()
 
     # -- recovery record (hash only; the flow lives in web/recovery.py) ------
 
@@ -270,6 +332,11 @@ class AuthStore:
             atomic_write_json(self.path,
                               self._payload(recovery_record=record))
             self._recovery = record
+            # Rotating (or first configuring) the recovery key changes the
+            # authentication root, so every outstanding step-up is revoked:
+            # the same rule as a password change, applied to the recovery
+            # credential. Sessions stay logged in.
+            self.sessions.revoke_all_step_ups()
 
     def verify_recovery_key(self, key):
         with self._mutex:

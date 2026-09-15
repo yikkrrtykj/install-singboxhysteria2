@@ -9,11 +9,18 @@ Every request passes through the same gate, in this exact order:
     3. the route itself
 
 Only the socket peer address is trusted; ``X-Forwarded-For`` / ``X-Real-IP``
-are never read. The server is strictly read-only: there is no endpoint that
-mutates sing-box state, creates/deletes clients, touches credentials or
-reloads anything. All responses carry strict security headers and the
-frontend is served from local static assets only (CSP ``default-src
-'self'``, no CDN, no external fonts).
+are never read. The server is strictly read-only with respect to sing-box:
+there is no endpoint that mutates sing-box state, creates/deletes clients,
+touches credentials or reloads anything. All responses carry strict security
+headers and the frontend is served from local static assets only (CSP
+``default-src 'self'``, no CDN, no external fonts).
+
+M0.5 adds the **step-up authorization boundary** (rev5 §5, G3): four
+privileged mutation routes exist so the gate can be exercised, but the
+privileged backend itself is a later milestone (M1/M2). Each of them is
+therefore terminated with an explicit 501 AFTER the full authorization
+chain (session -> CSRF -> step-up) has been satisfied. No marker, no config,
+no sing-box state is ever touched by this module.
 """
 
 from __future__ import annotations
@@ -30,10 +37,23 @@ from web.access import host_entry_for_ip
 from web.recovery import (RECOVERY_SUCCESS_MESSAGE, RecoveryGlobalGuard,
                           RecoveryRateLimiter, generate_key)
 
-MONITOR_WEB_VERSION = "0.1.0-e2"
+MONITOR_WEB_VERSION = "0.1.0-m0.5"
 SESSION_COOKIE = "monitor_session"
 MAX_BODY_BYTES = 65536
 SUPPORTED_METHODS = "GET, POST"
+
+# The four privileged mutation routes of rev5 §7, represented here ONLY as
+# authorization boundaries (M0.5). They resolve the session, enforce CSRF and
+# require a live step-up; the privileged execution path (sbox-cm over
+# AF_UNIX) does not exist yet and must never be faked. Until M1/M2 lands they
+# answer a deterministic 501 with the operation name, which is what lets the
+# step-up gate be tested end to end without performing any mutation.
+MUTATION_ROUTES = {
+    "/api/v1/management/activate": "management.activate",
+    "/api/v1/management/deactivate": "management.deactivate",
+    "/api/v1/clients/add": "client.add",
+    "/api/v1/clients/delete": "client.delete",
+}
 
 CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -69,7 +89,7 @@ class MonitorWebApp:
 
     def __init__(self, broker, access, static_dir, auth=None,
                  remote_mode=False, version=MONITOR_WEB_VERSION,
-                 recovery_guard=None):
+                 recovery_guard=None, management_active=None):
         self.broker = broker
         self.access = access
         self.auth = auth
@@ -78,6 +98,15 @@ class MonitorWebApp:
         self.version = version
         self.recovery_limiter = RecoveryRateLimiter()
         self.recovery_guard = recovery_guard or RecoveryGlobalGuard()
+        # ``management_active`` is an ORTHOGONAL boolean to ``monitor_running``
+        # (rev5 §4.5): the monitor being up says nothing about whether the
+        # privileged mutation plane is armed. In M0.5 it is ALWAYS false, and
+        # deliberately so: the activation marker lives in the sbox-cm runtime
+        # directory under /var/lib, owned root-only, which this process has
+        # ZERO filesystem access to. The only future read channel is the
+        # sbox-cm RPC. The provider hook exists so the state model is testable
+        # and forward-compatible; it can never be satisfied by reading a file.
+        self._management_active = management_active
         self._static_cache = {}
 
     def static_file(self, name):
@@ -99,6 +128,44 @@ class MonitorWebApp:
         if not self.auth or not token:
             return None
         return self.auth.sessions.resolve(token)
+
+    def step_up_active(self, token):
+        """Is a live step-up window attached to this session right now?"""
+        if not self.auth or not token:
+            return False
+        return self.auth.sessions.step_up_active(token)
+
+    def monitor_running(self):
+        """``monitor_running``: the E1 collector + E2 web are both alive."""
+        run = getattr(self.broker, "running", None)
+        return bool(run()) if callable(run) else False
+
+    def management_active(self):
+        """``management_active``: the privileged mutation plane is armed.
+
+        M0.5 PHASE-SCOPED PROVIDER -- NOT the future source of truth.
+        The only legitimate future source is:
+
+            Web -> management.status RPC -> sbox-cm
+
+        (M1). This provider exists so the orthogonal status model is testable
+        today; it must be REPLACED by that RPC adapter in M1 and NEVER be
+        reimplemented as a filesystem read. The web process is permanently
+        forbidden from stat()/open()/read() of the activation marker (it lives
+        in the root-only sbox-cm runtime tree, which sboxweb cannot reach);
+        a "shortcut" here would both break INV-1 silently and produce a status
+        that is a fabrication rather than an observation.
+
+        Fail-closed: anything undeterminable answers False. Default (M0.5) is
+        False, which is also the required production resting state.
+        """
+        provider = self._management_active
+        if provider is None:
+            return False
+        try:
+            return bool(provider())
+        except Exception:  # noqa: BLE001 - unknown state is NOT "active"
+            return False
 
 
 class MonitorHTTPServer(ThreadingHTTPServer):
@@ -284,6 +351,13 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/v1/recovery/rotate":
             self._require_session(self._handle_recovery_rotate, csrf=True)
             return
+        if path == "/api/v1/step-up":
+            self._require_session(self._handle_step_up, csrf=True)
+            return
+        op = MUTATION_ROUTES.get(path)
+        if op is not None:
+            self._require_step_up(self._handle_mutation_boundary, op)
+            return
         self._send_json(404, {"error": "not found"})
 
     # -- gates -----------------------------------------------------------------
@@ -366,6 +440,47 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
                 return
         handler(session, *args)
 
+    def _require_step_up(self, handler, *args):
+        """Gate for privileged mutations (M0.5 / rev5 §5).
+
+        Chain, in order: session -> session-bound CSRF token -> live step-up.
+        A missing/expired step-up is a 401 ``reauth_required``, which is the
+        ONLY signal the web UI acts on (it pops the password box and replays
+        the identical request). The step-up credential itself never leaves
+        this process: the backend would only ever receive an actor
+        fingerprint, never the password.
+
+        REVOCATION CONCURRENCY SEMANTICS (contract, aligned with M1's
+        "a transaction is uncancellable once its durable intent is written"):
+
+        * the check above is evaluated PER REQUEST, at the moment the request
+          reaches the gate. Logout / password change / recovery reset-rotate
+          therefore strip the step-up from every request that has NOT yet
+          passed the gate -- immediately, not after the 300s window;
+        * a request that has ALREADY passed the gate is not reconsidered. Its
+          step-up was valid when authorization happened, and it must not be
+          aborted mid-flight by a revocation that lands afterwards;
+        * M0.5 performs no dispatch, so no half-finished transaction can exist
+          here at all. The rule is stated now because M1 inherits it: once a
+          durable ledger intent exists, the sbox-cm side drives the mutation
+          to a terminal state regardless of what the web session does.
+        """
+        token = self._session_token()
+        session = self.app.session_from_token(token)
+        if session is None:
+            self._send_json(401, {"error": "login required"})
+            return
+        supplied = self.headers.get("X-CSRF-Token")
+        expected = session.get("csrf_token", "")
+        if not isinstance(supplied, str) or \
+                not hmac.compare_digest(supplied, expected):
+            self._send_json(403, {"error": "missing or invalid CSRF token"})
+            return
+        if not self.app.step_up_active(token):
+            self._send_json(401, {"error": "reauth_required"})
+            return
+        handler(session, *args)
+
     def _cross_origin(self):
         """True when the browser declared a foreign Origin (second CSRF
         layer). Tools that send no Origin are NOT affected here -- they
@@ -423,6 +538,16 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             "recovery_configured": self.app.recovery_configured(),
             "remote_mode": self.app.remote_mode,
             "version": self.app.version,
+            # M0.5 orthogonal status model (rev5 §4.5). These two are
+            # independent on purpose: a running monitor with the mutation
+            # plane DISARMED is the normal, safe production default.
+            "monitor_running": self.app.monitor_running(),
+            "management_active": self.app.management_active(),
+            # The step-up state of THIS session, so the page can show whether
+            # a re-authentication is still live. It is an opaque boolean --
+            # no password, no token, no expiry value is disclosed.
+            "step_up_active": session is not None
+            and self.app.step_up_active(self._session_token()),
         }
         if session is not None:
             # The CSRF half of the session: safe to expose to the page's own
@@ -479,6 +604,62 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
                 getattr(self.server, "scheme", "http") == "https":
             parts.append("Secure")
         return "; ".join(parts)
+
+    def _handle_step_up(self, session):
+        """POST /api/v1/step-up {password} -> open a 300s mutation window.
+
+        Gate order for THIS endpoint, enforced by the caller plus this body:
+        session -> CSRF -> rate-limit -> verify_password -> grant_step_up.
+
+        It requires a logged-in session AND that session's CSRF token, but of
+        course not an existing step-up (that would be circular). The CSRF
+        requirement is not cosmetic: without it, a cross-site request could
+        not guess the password, but it COULD submit deliberate wrong ones and
+        burn the shared login-rate-limiter budget, locking the real admin out
+        (a CSRF-triggered lockout DoS). CSRF is therefore checked BEFORE any
+        password work or counter mutation -- a rejected cross-origin attempt
+        consumes no rate-limit budget and performs no scrypt work.
+
+        The password is verified with the SAME ``AuthStore.verify_password``
+        used by login, and failures are counted by the SAME
+        ``LoginRateLimiter`` keyed on the socket peer address. Step-up is
+        therefore not a second, unlimited password-guessing surface: the
+        lockout budget is shared, so neither endpoint can be used to brute
+        force the other's limiter away.
+        """
+        auth = self.app.auth
+        if auth is None:
+            self._send_json(401, {"error": "login required"})
+            return
+        body = self._json_body()
+        password = body.get("password") if isinstance(body, dict) else None
+        if not isinstance(password, str):
+            self._send_json(400, {"error": "password required"})
+            return
+        remote = self.client_address[0]
+        allowed, retry_after = auth.login_limiter.check(remote)
+        if not allowed:
+            self._send_json(
+                429,
+                {"error": "rate_limited", "retry_after": retry_after},
+                extra_headers=[("Retry-After", str(retry_after))])
+            return
+        if not auth.verify_password(password):
+            auth.login_limiter.record_failure(remote)
+            self._send_json(401, {"error": "invalid_credentials"})
+            return
+        auth.login_limiter.record_success(remote)
+        token = self._session_token()
+        # The window length comes from the session store (production default
+        # 300s, rev5 §5.1); the same value is reported back so the page and
+        # the test harness never have to assume it.
+        ttl = auth.sessions.step_up_ttl
+        if auth.sessions.grant_step_up(token, ttl) is None:
+            # The session vanished between the gate and the grant: never
+            # claim a window was opened.
+            self._send_json(401, {"error": "login required"})
+            return
+        self._send_json(200, {"status": "ok", "expires_in": ttl})
 
     # -- recovery flow -----------------------------------------------------------
 
@@ -561,10 +742,36 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
     def _handle_logout(self, session):
         token = self._session_token()
         if self.app.auth is not None and token:
+            # Dropping the session also drops its step-up: revocation on
+            # logout is immediate, not "whenever the 300s window lapses".
             self.app.auth.sessions.drop(token)
         self._send_json(200, {"status": "ok"},
                         extra_headers=[("Set-Cookie",
                                         self._session_cookie("", 0))])
+
+    def _handle_mutation_boundary(self, session, op):
+        """Authorization boundary for the four privileged mutation ops.
+
+        M0.5 delivers the gate, not the mutation. A request that reaches this
+        handler has already passed session + CSRF + step-up; the privileged
+        execution path (sbox-cm over AF_UNIX, with the shared config.lock and
+        commit engine) is M1/M2 work.
+
+        The terminal answer is a FIXED 501 contract:
+
+            {"error": "not_implemented", "op": "<op>", "milestone": "M0.5"}
+
+        501 means exactly one thing here: authorization was fully satisfied
+        and only the backend is missing. It is therefore never returned
+        before the gates -- a missing/expired step-up still answers
+        401 reauth_required first. No code path in this handler (or below it)
+        reads the proxy tree, writes the activation marker, reloads anything,
+        calls a future helper, or returns anything success-shaped. M1/M2
+        replaces the body of this handler with the RPC adapter and changes
+        nothing about the authentication boundary above it.
+        """
+        self._send_json(501, {"error": "not_implemented",
+                              "op": op, "milestone": "M0.5"})
 
     def _handle_password(self, session, remote):
         """POST /api/v1/password {current_password, new_password}."""

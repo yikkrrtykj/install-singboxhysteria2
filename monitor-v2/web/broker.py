@@ -218,6 +218,18 @@ class SnapshotBroker:
             return False
         return (self._clock() - published_at) <= self._health_threshold
 
+    def running(self):
+        """Is the MONITOR itself up (both broker threads alive)?
+
+        This is the ``monitor_running`` half of the M0.5 orthogonal status
+        model. It answers NOTHING about the management plane: a perfectly
+        running monitor is the default state with management mutations
+        disabled (``management_active=false``). An unreachable service.api
+        (stale=true) still counts as "running" -- the collector deliberately
+        keeps retrying, which is the E1 contract.
+        """
+        return self._consumer_alive() and self._publisher_alive()
+
     def _view(self):
         """Copy of the published snapshot with read-time health fields."""
         with self._cond:

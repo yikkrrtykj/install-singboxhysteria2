@@ -134,6 +134,19 @@
       </div>
 
       <div class="card">
+        <h2>Management plane</h2>
+        <p class="muted">Two independent states. The monitor can be fully online while the privileged mutation plane stays closed — that is the normal, safe default.</p>
+        <div class="kv"><span class="k">Monitor (dashboard + collector)</span><span class="v"><span class="badge" id="mg-monitor" data-state="unknown">—</span></span></div>
+        <div class="kv"><span class="k">Management mutations</span><span class="v"><span class="badge" id="mg-manage" data-state="unknown">—</span></span></div>
+        <div class="kv"><span class="k">Re-authentication (this session)</span><span class="v"><span class="badge" id="mg-stepup" data-state="unknown">—</span></span></div>
+        <div class="row">
+          <button id="mg-activate" class="btn" type="button">Activate management</button>
+          <button id="mg-deactivate" class="btn ghost" type="button">Deactivate management</button>
+        </div>
+        <p id="mg-msg" class="form-msg hidden" role="status"></p>
+      </div>
+
+      <div class="card">
         <h2>Monitor information</h2>
         <div class="kv"><span class="k">Version</span><span class="v" id="mi-version">—</span></div>
         <div class="kv"><span class="k">Monitor started</span><span class="v" id="mi-started">—</span></div>
@@ -162,6 +175,22 @@
 </div>
 
 <!-- Recovery (path /recovery) -->
+<!-- Step-up: only ever shown in response to a 401 reauth_required. The page
+     never asks for a second password on load. -->
+<div id="stepup-overlay" class="overlay hidden">
+  <form id="stepup-form" class="panel">
+    <div class="brand center">
+      <svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true"><path fill="currentColor" d="M12 2 4 5.5v5.2c0 5 3.4 9.6 8 10.8 4.6-1.2 8-5.8 8-10.8V5.5L12 2z"/><path fill="currentColor" d="M11 7h2v5.2l3.3 1.9-1 1.7L11 13.4V7z"/></svg>
+      <span>Confirm password</span>
+    </div>
+    <p class="muted">This change requires a fresh re-authentication. Your password is verified once and authorizes changes for the next few minutes.</p>
+    <label>Admin password<input id="stepup-password" type="password" autocomplete="current-password"></label>
+    <button class="btn full" type="submit">Authorize</button>
+    <button id="stepup-cancel" class="btn ghost full" type="button">Cancel</button>
+    <p id="stepup-error" class="form-msg error hidden" role="alert"></p>
+  </form>
+</div>
+
 <div id="recovery-view" class="overlay hidden">
   <form id="recovery-form" class="panel">
     <div class="brand center">

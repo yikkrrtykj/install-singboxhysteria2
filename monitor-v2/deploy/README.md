@@ -197,15 +197,21 @@ sudoers、exact-token 读权直接复用，不需要迁移 service identity。
   便利，不是正确性/安全性事实源。
 - 加固逐项（每项都对应真实需求，不是堆砌）：
   - `NoNewPrivileges`：永远不得提权（E3 桥是独立 sudo 路径，不是 web 进程自己提权）；
-  - `ProtectHome=true`：/root、/home 不可见 —— 物理上读不到 `/root/sbox`，误配置也无效；
-  - `ProtectSystem=full`：/usr、/boot、/etc 只读 —— 配置文件按设计就是只读的；/var 仍可写（状态）；
+  - `ProtectHome=yes`：/root、/home 不可见 —— 物理上读不到 `/root/sbox`，误配置也无效；
+  - `ProtectSystem=strict`（M0.5 G4，原 `full`）：整个层级只读（/dev、/proc、/sys 除外），
+    唯一可写例外由 `ReadWritePaths=@SBMON_STATE_ROOT@` 精确给出 = monitor 自己的 data root；
+    `/root/sbox` 与 root-only 的 sbox-cm 运行时目录既不可写也不可读；
   - `PrivateTmp`、`PrivateDevices`：monitor 不需要 /tmp 共享与任何设备；
   - `ProtectKernelTunables/Modules/Logs`、`ProtectControlGroups`：观察者不需要内核接口；
-  - `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`：只做 TCP loopback（AF_UNIX 留给 libc/NSS）；
+  - `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`：**刻意不收敛为 AF_UNIX-only** ——
+    monitor 既 connect 127.0.0.1:9091 又 bind 127.0.0.1:9191（AF_INET/AF_INET6），
+    未来还要 connect `/run/sbox-cm/sbox-cm.sock`（AF_UNIX）；只有 sbox-cm 才能做到纯 AF_UNIX，
+    两个 unit 的 address-family 合同分开；
   - `CapabilityBoundingSet=`（空）、`AmbientCapabilities=`：零 capability；
   - `RestrictSUIDSGID`、`RestrictRealtime`、`LockPersonality`、`SystemCallArchitectures=native`：常规面收窄。
   - **没有** `MemoryDenyWriteExecute`（CPython 不需要，但不为骨架引入不必要的兼容风险）；
-    **没有** `ReadWritePaths=`（ProtectSystem=full 不锁 /var，无需例外）。
+  - **唯一** `ReadWritePaths=` 例外 = `@SBMON_STATE_ROOT@`（M0.5 G4；`ProtectSystem=strict`
+    下这是 monitor 唯一的写面，绝不额外打开 `/root/sbox` 或 sbox-cm 运行时目录）。
 - 日志：stdout 的生命周期消息进 journal；**collector 的 snapshot JSON（含客户端元数据）重定向到
   0700 状态目录，绝不进 journal**（任务 11，见 §6）。
 
