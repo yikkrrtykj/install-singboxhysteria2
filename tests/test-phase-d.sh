@@ -39,6 +39,9 @@ assert_grep '"listen": "127.0.0.1"' "$INSTALL_SH" "fresh monitor-api service is 
 assert_grep '"listen_port": 9091' "$INSTALL_SH" "fresh monitor-api service port is 9091"
 assert_grep '"name": "legacy"' "$INSTALL_SH" "fresh install default user stays name=legacy"
 assert_no_grep 'releases/latest' "$INSTALL_SH" "no /latest auto-crossing (1.14 selector only)"
+assert_no_grep 'cp -a "\$backup_cfg" "\$SB_SERVER_CONFIG"' "$INSTALL_SH" "Phase D config rollback uses atomic restore"
+assert_no_grep 'cp -a "\$backup_bin" "\$SB_SING_BOX_BIN"' "$INSTALL_SH" "Phase D binary rollback uses atomic restore"
+assert_grep 'restore_file_atomically "\$backup_bin" "\$SB_SING_BOX_BIN" 0755' "$INSTALL_SH" "Phase D binary restore preserves executable mode"
 
 section "extract phase-c + phase-d blocks and prepare sandbox"
 awk '/# >>> phase-c client-management >>>/,/# <<< phase-d singbox-1.14-api <<</' \
@@ -54,6 +57,7 @@ export SB_STATE_FILE="$SANDBOX/config"
 export SB_CLIENTS_DIR="$SANDBOX/clients"
 export SB_SING_BOX_BIN="$SANDBOX/sing-box"
 export SB_LOCK_FILE="$SANDBOX/config.lock"
+export SB_CLIENT_MANAGEMENT_LIB="$HERE/../lib/client-management.sh"
 export SB_HOPPING_SERVICE="$SANDBOX/sing-box-hy2-hopping.service"
 export SB_API_SECRET_FILE="$SANDBOX/monitor-api.secret"
 export SB_SELF_CERT_KEY="$SANDBOX/self-cert/private.key"
@@ -128,13 +132,14 @@ curl() {
     return 0
 }
 # Simulate a failure of the CONFIG atomic replacement while the binary has
-# already been replaced (the mixed-state scenario from the review). The mv
-# target is always the LAST argument.
+# already been replaced (the mixed-state scenario from the review). The fault
+# fires ONCE: the later atomic rollback rename must be allowed to succeed.
 mv() {
     if [ "${MV_FAIL_CONFIG:-0}" = "1" ]; then
-        local last
+        local last marker="${MV_FAIL_CONFIG_MARKER:-}"
         eval "last=\"\${$#}\""
-        if [ "$last" = "${SB_SERVER_CONFIG:-}" ]; then
+        if [ "$last" = "${SB_SERVER_CONFIG:-}" ] && [ -n "$marker" ] && [ ! -e "$marker" ]; then
+            : > "$marker"
             return 1
         fi
     fi
@@ -328,6 +333,8 @@ setup_upgrade_sandbox() {
     export RESTART_FAIL_MODE="none"
     export SYSTEMCTL_MODE="ok"
     export PGREP_MODE="found"
+    export MV_FAIL_CONFIG_MARKER="$TMP/mv-fail-config-once"
+    rm -f "$MV_FAIL_CONFIG_MARKER"
     rm -f "$TMP/new-check-fail" "$TMP/new-api-fail"
     : > "$MOCK_COUNT_FILE"
     export SB_NEW_CHECK_FAIL="$TMP/new-check-fail"
@@ -437,6 +444,8 @@ assert_rc 1 $? "upgrade fails when restart fails"
 assert_rc 1 "$(printf '%s' "$("$SB_SING_BOX_BIN" version)" | grep -c '1.13.13')" "old binary restored"
 assert_rc 0 "$(jq -r '[.services[]? | select(.tag == "monitor-api")] | length' "$SB_SERVER_CONFIG" | tr -d '\r')" "old config restored (no api service)"
 assert_grep '已回滚到升级前状态' "$TMP/d10.out" "successful rollback reported"
+assert_rc 755 "$(stat -c %a "$SB_SING_BOX_BIN")" "rollback binary mode remains 0755"
+assert_rc 600 "$(stat -c %a "$SB_SERVER_CONFIG")" "rollback config mode is hardened 0600"
 
 section "D11: API health failure -> double rollback"
 setup_upgrade_sandbox
@@ -614,6 +623,8 @@ assert_rc 1 "$(printf '%s' "$("$SB_SING_BOX_BIN" version)" | grep -c '1.13.13')"
 assert_rc 0 "$(jq -r '[.services[]? | select(.tag == "monitor-api")] | length' "$SB_SERVER_CONFIG" | tr -d '\r')" "old config restored (D18)"
 if [ "$cfg_sha" = "$(sha "$SB_SERVER_CONFIG")" ] && [ "$bin_sha" = "$(sha "$SB_SING_BOX_BIN")" ]; then pass "live pair byte-identical to pre-upgrade (D18)"; else fail "live pair differs (D18)"; fi
 assert_grep 'restart sing-box' "$SYSTEMCTL_LOG" "recovery restart actually ran"
+assert_rc 755 "$(stat -c %a "$SB_SING_BOX_BIN")" "D18 recovered binary mode remains 0755"
+assert_rc 600 "$(stat -c %a "$SB_SERVER_CONFIG")" "D18 recovered config mode is 0600"
 bak_bin="$(ls -1 "$SANDBOX"/sing-box.bak.* 2>/dev/null | wc -l)"
 bak_cfg="$(ls -1 "$SANDBOX"/sbconfig_server.json.bak.* 2>/dev/null | wc -l)"
 assert_rc 1 "$bak_bin" "binary backup kept after recovery"

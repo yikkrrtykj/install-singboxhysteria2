@@ -688,6 +688,9 @@ SB_STATE_FILE="${SB_STATE_FILE:-/root/sbox/config}"
 SB_CLIENTS_DIR="${SB_CLIENTS_DIR:-/root/sbox/clients}"
 SB_SING_BOX_BIN="${SB_SING_BOX_BIN:-/root/sbox/sing-box}"
 SB_LOCK_FILE="${SB_LOCK_FILE:-/root/sbox/config.lock}"
+SB_ROOT_DIR="${SB_ROOT_DIR:-$(dirname "$SB_SERVER_CONFIG")}"
+SB_SHORTCUT="${SB_SHORTCUT:-/usr/bin/mianyang}"
+SB_SYSTEMD_UNIT="${SB_SYSTEMD_UNIT:-/etc/systemd/system/sing-box.service}"
 RESERVED_CLIENT_NAME="legacy"
 CLIENT_NAME_PATTERN='^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$'
 REALITY_INBOUND_TAG="vless-in"
@@ -700,55 +703,82 @@ validate_client_name() { # validate_client_name <name> -> rc 0 if allowed
     return 0
 }
 
-# Seconds to wait for the exclusive config lock before aborting. Web/E3 helpers
-# MUST run with a finite timeout; the CLI default stays generous.
-SB_LOCK_TIMEOUT="${SB_LOCK_TIMEOUT:-15}"
+# M0/G1: the lock/commit/rollback primitives have a single canonical source in
+# lib/client-management.sh. Local repository execution sources the sibling file;
+# the historical curl/process-substitution entry point fetches the same path from
+# the selected repository ref. Tests/helpers may inject SB_CLIENT_MANAGEMENT_LIB.
+SB_CLIENT_MANAGEMENT_SHA256="55dc0d0a895a2f5d1d155517bc34039ef7d13e5adc81e06c81c1feb7e73dea58"
 
-# Runs "$@" while holding the exclusive config lock (fd 9), so two management
-# operations can never mutate the durable sing-box state concurrently.
-#
-# NOTE ON THE NAME: despite the historical "client" name, this is the GLOBAL
-# management lock for EVERY durable sing-box config/state mutation, not just
-# Phase C client management. The SAME /root/sbox/config.lock serializes:
-#   - Phase C client management (add/delete/migrate)          [this block]
-#   - Phase D 1.14.x upgrade (binary + config)                [phase-d block]
-#   - legacy ports/SNI (modify_singbox), direct-in (doko/dokoko),
-#     SS (ssko) and HY2-hopping state writers                 [legacy block]
-# and the future E3 helper. The name is kept because a rename would touch every
-# caller/test for no functional gain; treat it as "the config/state lock".
-#
-# DISCIPLINE: callers must NOT nest with_client_lock. A public entry point
-# gathers interactive input WITHOUT the lock, then calls
-# `with_client_lock _xxx_locked ...`; the `_xxx_locked` helper re-reads LIVE
-# state, revalidates, mutates, and never re-acquires the lock. Never hold this
-# lock while waiting for interactive user input.
-#
-# FAIL-CLOSED: a missing flock binary, an unopenable lock file, an acquire
-# error or a timeout each abort WITHOUT ever running "$@" -- no candidate, no
-# backup, no config mutation and no reload is attempted unlocked.
-with_client_lock() {
-    if ! command -v flock >/dev/null 2>&1; then
-        warning "flock 不可用，无法安全地序列化配置修改，操作已中止（fail-closed）"
+verify_client_management_library() { # <path>
+    local lib="$1" got=""
+    if ! command -v sha256sum >/dev/null 2>&1; then
+        warning "sha256sum 不可用，无法验证共享事务库，已拒绝加载（fail-closed）"
         return 1
     fi
-    if ! mkdir -p "$(dirname "$SB_LOCK_FILE")" 2>/dev/null; then
-        warning "无法创建锁目录 $(dirname "$SB_LOCK_FILE")，操作已中止（fail-closed）"
+    if [ ! -f "$lib" ]; then
+        warning "共享事务库不存在: $lib"
         return 1
     fi
-    if ! exec 9>>"$SB_LOCK_FILE" 2>/dev/null; then
-        warning "无法打开配置锁文件 $SB_LOCK_FILE，操作已中止（fail-closed）"
+    got="$(sha256sum "$lib" 2>/dev/null | awk '{print $1}')" || return 1
+    if [ "$got" != "$SB_CLIENT_MANAGEMENT_SHA256" ]; then
+        warning "共享事务库完整性校验失败，已拒绝加载（fail-closed）"
         return 1
     fi
-    if ! flock -w "$SB_LOCK_TIMEOUT" 9 2>/dev/null; then
-        warning "配置锁 $SB_LOCK_FILE 获取失败或超时（${SB_LOCK_TIMEOUT}s），操作已中止（fail-closed）"
-        exec 9>&- 2>/dev/null
-        return 1
-    fi
-    "$@"
-    local rc=$?
-    exec 9>&- 2>/dev/null
-    return $rc
+    return 0
 }
+
+load_client_management_library() {
+    local lib="${SB_CLIENT_MANAGEMENT_LIB:-}" source_dir="" tmp="" fn
+
+    if [ -z "$lib" ] && [ -n "${BASH_SOURCE[0]:-}" ]; then
+        source_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
+        if [ -n "$source_dir" ] && [ -f "$source_dir/lib/client-management.sh" ]; then
+            lib="$source_dir/lib/client-management.sh"
+        fi
+    fi
+
+    if [ -z "$lib" ]; then
+        local ref="${SB_CLIENT_MANAGEMENT_REF:-main}"
+        tmp="$(mktemp 2>/dev/null)" || {
+            warning "无法创建共享事务库临时文件"
+            return 1
+        }
+        if ! curl -fsSL \
+            "https://raw.githubusercontent.com/yikkrrtykj/install-singboxhysteria2/${ref}/lib/client-management.sh" \
+            -o "$tmp"; then
+            warning "无法获取共享事务库 lib/client-management.sh (ref=$ref)"
+            rm -f "$tmp"
+            return 1
+        fi
+        lib="$tmp"
+    fi
+
+    # IMPORTANT: verify BEFORE sourcing. This binds install.sh to the exact
+    # reviewed shared transaction implementation. A future main/lib change
+    # makes an older installer fail closed instead of silently importing newer
+    # privileged transaction code. SB_CLIENT_MANAGEMENT_REF changes location,
+    # never the expected content digest.
+    if ! verify_client_management_library "$lib"; then
+        [ -n "$tmp" ] && rm -f "$tmp"
+        return 1
+    fi
+
+    # shellcheck source=/dev/null
+    . "$lib" || { [ -n "$tmp" ] && rm -f "$tmp"; return 1; }
+    [ -n "$tmp" ] && rm -f "$tmp"
+
+    for fn in with_client_lock reload_running_singbox reload_health_ok \
+              restore_file_atomically new_candidate_path new_backup_path \
+              commit_server_config cm_transaction_result_json; do
+        if ! declare -F "$fn" >/dev/null 2>&1; then
+            warning "共享事务库缺少函数: $fn"
+            return 1
+        fi
+    done
+    return 0
+}
+
+load_client_management_library || error "共享事务库加载失败，拒绝进入管理路径"
 
 get_reality_client_names() { # [config] -> one name per line ("" = unnamed user)
     jq -r --arg tag "$REALITY_INBOUND_TAG" \
@@ -870,123 +900,7 @@ audit_client_consistency() { # audit_client_consistency [config] -> table + rc
     return 0
 }
 
-# Reload the running instance; succeeds trivially when nothing is running
-# (e.g. config-only change with the service stopped). Propagates failure so
-# commit_server_config can roll back.
-reload_running_singbox() {
-    if systemctl is-active --quiet sing-box 2>/dev/null; then
-        systemctl reload sing-box || return 1
-    elif pgrep -x sing-box >/dev/null 2>&1; then
-        kill -HUP "$(pgrep -o -x sing-box)" || return 1
-    fi
-    return 0
-}
-
-# After a reload the previously running instance must still be alive.
-reload_health_ok() {
-    sleep 1
-    if systemctl is-active --quiet sing-box 2>/dev/null; then return 0; fi
-    pgrep -x sing-box >/dev/null 2>&1
-}
-
-# Internal transaction commit. The CALLER must already hold the client config
-# lock (see with_client_lock): the whole read -> audit -> candidate -> commit
-# sequence has to run under one exclusive lock or two concurrent managers could
-# lose each other's update. This function never acquires the lock itself.
-#   candidate -> structural audit -> sing-box check -> backup -> atomic mv
-#   -> reload -> health check; on any failure after the mv the previous config
-#   is restored and reloaded, so the disk state is never left half-migrated.
-commit_server_config() { # commit_server_config <candidate> <description>
-    local candidate="$1" description="${2:-server config update}"
-    local backup_path was_running problems
-    [ -f "$candidate" ] || { warning "candidate 不存在: $candidate"; return 1; }
-
-    # FAIL-CLOSED: a jq/runtime error while auditing the candidate must abort
-    # the transaction, never be treated as "candidate is fine".
-    if ! problems="$(candidate_problems "$candidate")"; then
-        warning "candidate 结构审计执行失败（$description），正式配置未修改"
-        rm -f "$candidate"
-        return 1
-    fi
-    if [ -n "$problems" ]; then
-        warning "candidate 结构一致性检查失败（$description），正式配置未修改:"
-        while IFS= read -r p; do
-            [ -n "$p" ] && warning "  - $p"
-        done <<< "$problems"
-        rm -f "$candidate"
-        return 1
-    fi
-
-    if ! "$SB_SING_BOX_BIN" check -c "$candidate" >/dev/null 2>&1; then
-        warning "sing-box check 未通过（$description），正式配置未修改"
-        rm -f "$candidate"
-        return 1
-    fi
-
-    if systemctl is-active --quiet sing-box 2>/dev/null; then
-        was_running=systemd
-    elif pgrep -x sing-box >/dev/null 2>&1; then
-        was_running=manual
-    else
-        was_running=no
-    fi
-
-    # Unique per transaction, even twice in the same second of one process.
-    backup_path="$(new_backup_path)" || {
-        warning "创建备份文件失败（$description），正式配置未修改"
-        rm -f "$candidate"
-        return 1
-    }
-    cp -a "$SB_SERVER_CONFIG" "$backup_path" || {
-        warning "备份正式配置失败（$description），正式配置未修改"
-        rm -f "$candidate"
-        return 1
-    }
-    # cp -a preserves the SOURCE mode: on servers upgraded from older installs
-    # the live config may still be world-readable. A backup must never inherit
-    # that, so the mode is enforced explicitly instead of assumed.
-    if ! chmod 0600 "$backup_path" 2>/dev/null; then
-        warning "备份文件权限收紧为 0600 失败（$description），正式配置未修改"
-        rm -f "$backup_path" "$candidate"
-        return 1
-    fi
-
-    if ! mv -f "$candidate" "$SB_SERVER_CONFIG"; then
-        warning "原子替换失败（$description），已保留备份: $backup_path"
-        rm -f "$candidate"
-        return 1
-    fi
-
-    if [ "$was_running" != "no" ]; then
-        if reload_running_singbox && reload_health_ok; then
-            info "配置已提交并重载成功: $description"
-            info "上一份配置备份: $backup_path"
-            return 0
-        fi
-        warning "reload 后健康检查失败（$description），自动回滚..."
-        cp -a "$backup_path" "$SB_SERVER_CONFIG"
-        # The rollback reload's exit code matters: a failed reload command with a
-        # still-alive process must NOT be reported as a successful recovery.
-        if reload_running_singbox && reload_health_ok; then
-            warning "已回滚并重新加载上一份配置: $backup_path"
-        else
-            warning "已回滚配置文件，但服务未能确认恢复，请立即人工检查！备份: $backup_path"
-        fi
-        return 1
-    fi
-
-    info "配置已提交（当前无运行中的 sing-box 进程，跳过 reload）: $description"
-    info "上一份配置备份: $backup_path"
-    return 0
-}
-
-new_candidate_path() { # new_candidate_path -> unique candidate file next to the live config
-    mktemp "${SB_SERVER_CONFIG}.candidate.XXXXXX" 2>/dev/null
-}
-
-new_backup_path() { # new_backup_path -> unique backup file next to the live config
-    mktemp "${SB_SERVER_CONFIG}.bak.$(date +%Y%m%d-%H%M%S).XXXXXX" 2>/dev/null
-}
+# Shared transaction primitives are loaded above from lib/client-management.sh.
 client_name_exists() { # client_name_exists <name> [config] -> rc 0 if present in either inbound
     local name="$1" cfg="${2:-$SB_SERVER_CONFIG}"
     grep -qxF "$name" <(get_reality_client_names "$cfg") ||
@@ -2411,8 +2325,9 @@ _rollback_upgrade() { # _rollback_upgrade <backup_bin> <backup_cfg> <old_version
     local backup_bin="$1" backup_cfg="$2" old_version="$3"
     local require_api="no"
     warning "升级失败，执行双回滚（binary + config）..."
-    if ! cp -a "$backup_bin" "$SB_SING_BOX_BIN" || ! cp -a "$backup_cfg" "$SB_SERVER_CONFIG"; then
-        warning "回滚文件恢复失败，请立即人工介入！备份: $backup_bin / $backup_cfg"
+    if ! restore_file_atomically "$backup_cfg" "$SB_SERVER_CONFIG" 0600 ||
+       ! restore_file_atomically "$backup_bin" "$SB_SING_BOX_BIN" 0755; then
+        warning "回滚文件原子恢复失败，请立即人工介入！备份: $backup_bin / $backup_cfg"
         return 1
     fi
     if ! systemctl restart sing-box 2>/dev/null; then
@@ -2595,11 +2510,11 @@ _upgrade_singbox_1_14_locked() {
         # restart ever runs the mixed pair. Backups are KEPT until the
         # recovered state is proven healthy.
         warning "原子替换 config 失败，执行双恢复（config → binary）..."
-        if ! cp -a "$backup_cfg" "$SB_SERVER_CONFIG"; then
+        if ! restore_file_atomically "$backup_cfg" "$SB_SERVER_CONFIG" 0600; then
             warning "恢复 config 失败，请立即人工介入！备份: $backup_bin / $backup_cfg"
             return 1
         fi
-        if ! cp -a "$backup_bin" "$SB_SING_BOX_BIN"; then
+        if ! restore_file_atomically "$backup_bin" "$SB_SING_BOX_BIN" 0755; then
             warning "恢复 binary 失败，请立即人工介入！备份: $backup_bin / $backup_cfg"
             return 1
         fi
@@ -2758,50 +2673,6 @@ new_state_backup_path() { # new_state_backup_path -> unique backup next to the l
     mktemp "${SB_STATE_FILE}.bak.$(date +%Y%m%d-%H%M%S).XXXXXX" 2>/dev/null
 }
 
-# Atomically restores <live> from a hardened <backup>, keeping the original
-# backup intact. FAIL-CLOSED at every step: a missing/symlink/non-regular backup,
-# or a failed unique-temp creation, copy, chmod, atomic replace or verification
-# each return non-zero -- and a failure is NEVER reported as a successful restore.
-# The caller must hold with_client_lock. The live pathname is never `cp`'d onto
-# directly (a partial copy would corrupt the durable pair) and `sed -i` is never
-# used: the exact backup bytes are staged in a UNIQUE temp file in the SAME
-# directory and atomically renamed into place, then verified byte-for-byte.
-restore_file_atomically() { # <backup> <live>
-    local backup="$1" live="$2" tmp=""
-    if [ -z "$backup" ] || [ -z "$live" ]; then
-        warning "restore_file_atomically: 参数不能为空"
-        return 1
-    fi
-    if [ -L "$backup" ] || [ ! -f "$backup" ]; then
-        warning "备份不是普通文件（缺失或符号链接），拒绝恢复: $backup"
-        return 1
-    fi
-    if ! tmp="$(mktemp "${live}.restore.XXXXXX" 2>/dev/null)"; then
-        warning "创建恢复临时文件失败（需与目标同目录）: ${live}.restore.XXXXXX"
-        return 1
-    fi
-    if ! cp -a "$backup" "$tmp" 2>/dev/null; then
-        warning "写入恢复临时文件失败: $tmp"
-        rm -f "$tmp"
-        return 1
-    fi
-    if ! chmod 0600 "$tmp" 2>/dev/null; then
-        warning "恢复临时文件权限收紧为 0600 失败: $tmp"
-        rm -f "$tmp"
-        return 1
-    fi
-    if ! mv -f "$tmp" "$live" 2>/dev/null; then
-        warning "恢复文件原子替换失败: $live"
-        rm -f "$tmp"
-        return 1
-    fi
-    if ! cmp -s "$backup" "$live" 2>/dev/null; then
-        warning "恢复校验失败：$live 与备份 $backup 内容不一致"
-        return 1
-    fi
-    return 0
-}
-
 # rc 0 when $1 is a usable TCP/UDP port number (1-65535, digits only).
 valid_port() {
     case "$1" in
@@ -2865,7 +2736,7 @@ set_state_key() { # set_state_key <live> <candidate> <key> <replacement-line>
 # E3/Integration decision and MUST be ratified there. SB_MANAGEMENT_ACTIVE_MARKER
 # is overridable so tests can simulate the active state without inventing an
 # irreversible production contract.
-SB_MANAGEMENT_ACTIVE_MARKER="${SB_MANAGEMENT_ACTIVE_MARKER:-/root/sbox/web-management.active}"
+SB_MANAGEMENT_ACTIVE_MARKER="${SB_MANAGEMENT_ACTIVE_MARKER:-/var/lib/sbox-cm/management.active}"
 
 management_is_active() { # rc 0 when web/E3 management is marked active
     [ -e "$SB_MANAGEMENT_ACTIVE_MARKER" ]
@@ -3160,24 +3031,63 @@ backup_current_installation() {
     info "完整备份已创建: /root/${backup_name}.tar.gz"
 }
 
+# M0/G2 L-ANCHOR: uninstall is a destructive management transaction. The public
+# entry point acquires the SAME global config.lock and delegates to a no-nesting
+# helper. The lock pathname itself is a permanent control-plane anchor and is
+# never unlinked, even by uninstall.
 uninstall_singbox() {
-    # L5: refuse BEFORE any destructive mutation when web/E3 management is active.
-    # E3 is not implemented, so this only triggers when a future E3 publishes the
-    # marker; default installations behave exactly as before.
+    with_client_lock _uninstall_singbox_locked
+}
+
+_uninstall_singbox_locked() {
+    # The activation gate MUST be evaluated while holding config.lock. This
+    # closes the activate-vs-uninstall TOCTOU: either activation wins and this
+    # refuses, or uninstall wins and activation later sees the missing config.
     if ! require_management_inactive "卸载"; then
         return 1
     fi
+
     warning "开始卸载..."
     if pgrep -x sing-box >/dev/null 2>&1 && ! systemctl is-active --quiet sing-box; then
         error "sing-box 当前由手工进程运行。为防止删除运行中的配置，已拒绝卸载。"
     fi
-    disable_hy2hopping
-    systemctl disable --now sing-box > /dev/null 2>&1
-    rm -f /etc/systemd/system/sing-box.service
-    rm -f /root/sbox/sbconfig_server.json /root/sbox/sing-box /root/sbox/mianyang.sh
-    rm -f /usr/bin/mianyang /root/sbox/self-cert/private.key /root/sbox/self-cert/cert.pem /root/sbox/config
-    rm -rf /root/sbox/self-cert/ /root/sbox/
-    warning "卸载完成"
+
+    # Already inside with_client_lock: call the locked hopping helper directly
+    # so uninstall never nests a second flock acquisition.
+    if [ -f "$SB_STATE_FILE" ]; then
+        _disable_hy2hopping_locked || {
+            warning "关闭 Hysteria2 端口跳跃失败，卸载已中止（控制面锚点保留）"
+            return 1
+        }
+    else
+        systemctl disable --now sing-box-hy2-hopping.service >/dev/null 2>&1 || true
+        remove_hy2_hopping_rules
+        rm -f "$HY_HOPPING_SERVICE" "$HY_HOPPING_HELPER"
+    fi
+
+    systemctl disable --now sing-box >/dev/null 2>&1 || true
+    rm -f -- "$SB_SYSTEMD_UNIT"
+
+    # Remove installation-owned runtime/config/credential artifacts, but DO NOT
+    # rm -rf SB_ROOT_DIR. In particular, SB_LOCK_FILE must retain the same path
+    # and inode for the lifetime of this critical section and afterwards.
+    rm -f --         "$SB_SERVER_CONFIG"         "$SB_SING_BOX_BIN"         "$SB_ROOT_DIR/mianyang.sh"         "$SB_SHORTCUT"         "$SB_SELF_CERT_KEY"         "$SB_SELF_CERT_CERT"         "$SB_STATE_FILE"         "$SB_API_SECRET_FILE"
+
+    rm -rf -- "$SB_CLIENTS_DIR" "$(dirname "$SB_SELF_CERT_KEY")"
+
+    # Generated transaction residue/backups are installation-owned too. These
+    # globs deliberately target only known durable artifacts; config.lock is not
+    # matched and is never unlinked.
+    rm -f --         "$SB_SERVER_CONFIG".candidate.*         "$SB_SERVER_CONFIG".restore.*         "$SB_SERVER_CONFIG".bak.*         "$SB_STATE_FILE".candidate.*         "$SB_STATE_FILE".restore.*         "$SB_STATE_FILE".bak.* 2>/dev/null || true
+
+    systemctl daemon-reload >/dev/null 2>&1 || true
+
+    if [ ! -e "$SB_LOCK_FILE" ]; then
+        warning "控制面锚点异常消失: $SB_LOCK_FILE；需人工介入"
+        return 1
+    fi
+
+    warning "卸载完成（控制面锚点已保留: $SB_LOCK_FILE）"
     return 0
 }
 

@@ -61,15 +61,18 @@ assert_grep 'with_client_lock _process_dokoko_add_locked' "$INSTALL_SH" "dokoko 
 assert_grep 'with_client_lock _process_ssko_add_locked' "$INSTALL_SH" "ssko add takes the global lock"
 assert_grep 'with_client_lock _enable_hy2hopping_locked' "$INSTALL_SH" "enable hy2 hopping takes the global lock"
 assert_grep 'with_client_lock _disable_hy2hopping_locked' "$INSTALL_SH" "disable hy2 hopping takes the global lock"
-assert_grep 'restore_file_atomically' "$INSTALL_SH" "atomic restore primitive exists"
-assert_grep 'cmp -s "\$backup" "\$live"' "$INSTALL_SH" "restore verifies the committed file byte-for-byte"
-assert_grep '\.restore\.XXXXXX' "$INSTALL_SH" "restore uses a unique same-directory temp path"
+assert_grep 'restore_file_atomically' "$HERE/../lib/client-management.sh" "atomic restore primitive exists in shared lib"
+assert_grep 'cmp -s "\$backup" "\$live"' "$HERE/../lib/client-management.sh" "restore verifies the committed file byte-for-byte"
+assert_grep '\.restore\.XXXXXX' "$HERE/../lib/client-management.sh" "restore uses a unique same-directory temp path"
 assert_no_grep 'cp -a "\$json_bak" "\$cfg"' "$INSTALL_SH" "no direct cp restore onto the live JSON path"
 assert_no_grep 'cp -a "\$state_bak" "\$state"' "$INSTALL_SH" "no direct cp restore onto the live state path"
 # L5 guard wiring + ordering (guard BEFORE backup/uninstall in the reinstall branch).
 assert_grep 'SB_MANAGEMENT_ACTIVE_MARKER' "$INSTALL_SH" "L5 management-active marker interface exists"
 assert_grep 'require_management_inactive "重新安装"' "$INSTALL_SH" "reinstall branch checks the L5 guard"
 assert_grep 'require_management_inactive "卸载"' "$INSTALL_SH" "uninstall checks the L5 guard"
+assert_grep 'with_client_lock _uninstall_singbox_locked' "$INSTALL_SH" "uninstall takes the global lock"
+assert_no_grep 'rm -rf /root/sbox/self-cert/ /root/sbox/' "$INSTALL_SH" "uninstall never removes the config.lock parent directory"
+assert_no_grep 'cp -a "\$backup_path" "\$SB_SERVER_CONFIG"' "$INSTALL_SH" "generic commit rollback never directly copies onto live config"
 guard_line="$(grep -n 'require_management_inactive "重新安装"' "$INSTALL_SH" | head -n1 | cut -d: -f1)"
 backup_line="$(grep -n 'backup_current_installation || error' "$INSTALL_SH" | head -n1 | cut -d: -f1)"
 unin_line="$(grep -n 'if ! uninstall_singbox; then' "$INSTALL_SH" | head -n1 | cut -d: -f1)"
@@ -109,6 +112,10 @@ export SB_STATE_FILE="$SANDBOX/config"
 export SB_CLIENTS_DIR="$SANDBOX/clients"
 export SB_SING_BOX_BIN="$TMP/mock-sing-box"
 export SB_LOCK_FILE="$SANDBOX/config.lock"
+export SB_CLIENT_MANAGEMENT_LIB="$HERE/../lib/client-management.sh"
+export SB_ROOT_DIR="$SANDBOX"
+export SB_SHORTCUT="$SANDBOX/usr-bin-mianyang"
+export SB_SYSTEMD_UNIT="$SANDBOX/sing-box.service"
 export SB_HOPPING_SERVICE="$SANDBOX/sing-box-hy2-hopping.service"
 export SB_HOPPING_HELPER="$SANDBOX/hy2-hopping.sh"
 export SB_MANAGEMENT_ACTIVE_MARKER="$SANDBOX/web-management.active"
@@ -671,6 +678,46 @@ if [ ! -e "$TMP/destructive-hit" ]; then pass "no destructive step reached befor
 unset -f disable_hy2hopping systemctl
 rm -f "$SB_MANAGEMENT_ACTIVE_MARKER"
 management_is_active; assert_rc 1 $? "management_is_active false again after removing the marker"
+
+section "T18b: uninstall lock anchor survives with stable inode (M0/L-ANCHOR)"
+reset_sandbox
+rm -f "$SB_MANAGEMENT_ACTIVE_MARKER"
+: > "$SB_LOCK_FILE"
+chmod 0600 "$SB_LOCK_FILE" 2>/dev/null || true
+printf '#!/bin/sh\nexit 0\n' > "$SB_SING_BOX_BIN"
+chmod +x "$SB_SING_BOX_BIN"
+: > "$SB_SHORTCUT"
+: > "$SB_SYSTEMD_UNIT"
+mkdir -p "$SB_CLIENTS_DIR/test-client" "$(dirname "$SB_SELF_CERT_KEY")"
+: > "$SB_API_SECRET_FILE"
+: > "$SB_SELF_CERT_KEY"
+: > "$SB_SELF_CERT_CERT"
+
+inode_before="$(stat -c %i "$SB_LOCK_FILE" 2>/dev/null || stat -f %i "$SB_LOCK_FILE")"
+
+# T18 temporarily replaced/unset systemctl; reinstall the harmless sandbox mock
+# for the real inactive uninstall path.
+systemctl() {
+    case "${1:-}" in
+        is-active) return 0 ;;
+        disable|daemon-reload) return 0 ;;
+        *) return 0 ;;
+    esac
+}
+
+uninstall_singbox >"$TMP/t18b.out" 2>&1
+assert_rc 0 $? "inactive uninstall succeeds under the global lock"
+
+if [ -d "$SB_ROOT_DIR" ]; then pass "SB_ROOT_DIR survives uninstall"; else fail "SB_ROOT_DIR was removed"; fi
+if [ -e "$SB_LOCK_FILE" ]; then pass "config.lock path survives uninstall"; else fail "config.lock path was removed"; fi
+inode_after="$(stat -c %i "$SB_LOCK_FILE" 2>/dev/null || stat -f %i "$SB_LOCK_FILE")"
+assert_rc "$inode_before" "$inode_after" "config.lock inode is unchanged across uninstall"
+if [ ! -e "$SB_SERVER_CONFIG" ] && [ ! -e "$SB_STATE_FILE" ] && [ ! -e "$SB_SING_BOX_BIN" ]; then
+    pass "runtime/config artifacts removed while anchor remains"
+else
+    fail "runtime/config artifacts were not fully removed"
+fi
+assert_grep '控制面锚点已保留' "$TMP/t18b.out" "uninstall reports preserved control-plane anchor"
 
 section "T19: restore_file_atomically primitive"
 reset_sandbox
