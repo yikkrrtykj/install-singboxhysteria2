@@ -61,6 +61,10 @@ def skip(msg):
     sys.stdout.write("  SKIP %s\n" % msg)
 
 
+def note(msg):
+    sys.stdout.write("  NOTE %s\n" % msg)
+
+
 def check(condition, msg):
     ok(msg) if condition else bad(msg)
 
@@ -428,6 +432,9 @@ def socket_tests(mod, root, daemon_path):
     os.chmod(worker_path, 0o755)
 
     uid = os.getuid() if hasattr(os, "getuid") else 0
+    note("probe uid=%r allowed=%r peer_override=%r sandbox=%r" %
+         (uid, uid, os.environ.get("SBOX_CM_TEST_PEER_UID"), os.environ.get("SBOX_CM_TEST_SANDBOX")))
+    fails_before = FAIL[0]
     proc = start_daemon(mod, daemon_path, tmp, socket_path, worker_path, uid, state)
     try:
         if not wait_for_socket(socket_path):
@@ -533,6 +540,14 @@ def socket_tests(mod, root, daemon_path):
             other.terminate()
             other.wait(timeout=5)
     finally:
+        if FAIL[0] > fails_before:
+            # Diagnose from the daemon's own words instead of guessing.
+            try:
+                with open(os.path.join(tmp, "daemon.log"), "r") as fh:
+                    for line in fh.read().splitlines()[-12:]:
+                        note("daemon.log: %s" % line)
+            except OSError as exc:
+                note("daemon.log unreadable: %r" % exc)
         if proc.poll() is None:
             proc.terminate()
             try:
