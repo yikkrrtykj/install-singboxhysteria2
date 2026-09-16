@@ -35,9 +35,7 @@ ACTOR_STEPUP_FP=""
 NAME=""
 KEY=""
 GEN=0
-SESSION_FP=""
 CM_MUTATION_ENTERED=false
-W_STAGE="parse"
 
 # ------------------------------------------------------------------ output --
 warning() { printf '[sbox-cm-ops] %s\n' "$*" >&2; }
@@ -256,7 +254,6 @@ op_client_list() {
 # ------------------------------------------------------------- add --
 _add_locked() {
     local cfg="$SB_SERVER_CONFIG" problems digest rec
-    W_STAGE="revalidate"
 
     if ! live_config_ready; then
         err_exit rejected E_CONFIG_INCONSISTENT revalidate false "服务端配置缺失或非法"
@@ -330,7 +327,6 @@ _add_locked() {
     fi
 
     # ---- planned credentials + digest ----
-    W_STAGE="candidate"
     cm_plan_client_credential || err_exit rejected E_INTERNAL candidate false "生成客户端凭据失败"
     local planned
     if ! planned="$(cm_planned_cred_digest)"; then
@@ -366,10 +362,8 @@ _add_locked() {
     cm_journal_write "$REQ_ID" "client.add" "candidate" || true
 
     # ---- commit (the one canonical engine) ----
-    W_STAGE="check"
     if commit_server_config "$candidate" "client.add $NAME"; then
-        W_STAGE="outcome"
-        local data
+            local data
         data="$(add_success_data "$NAME")"
         if ! cm_ledger_append_outcome "$KEY" "client.add" "$NAME" "$digest" "$GEN" "$data"; then
             cm_journal_write "$REQ_ID" "client.add" "outcome" || true
@@ -387,7 +381,6 @@ _add_locked() {
 # ------------------------------------------------------------- delete --
 _delete_locked() {
     local cfg="$SB_SERVER_CONFIG" problems digest rec
-    W_STAGE="revalidate"
 
     if ! live_config_ready; then
         err_exit rejected E_CONFIG_INCONSISTENT revalidate false "服务端配置缺失或非法"
@@ -484,10 +477,8 @@ _delete_locked() {
     fi
     cm_journal_write "$REQ_ID" "client.delete" "candidate" || true
 
-    W_STAGE="check"
     if commit_server_config "$candidate" "client.delete $NAME"; then
-        W_STAGE="outcome"
-        local derived=true
+            local derived=true
         if [ -d "$SB_CLIENTS_DIR/$NAME" ]; then
             if ! rm -rf -- "${SB_CLIENTS_DIR:?}/$NAME" 2>/dev/null; then derived=false; fi
         fi
@@ -582,12 +573,10 @@ op_management_activate() {
 _activate_locked() {
     local cfg="$SB_SERVER_CONFIG" state
     GEN=0
-    W_STAGE="revalidate"
     if ! live_config_ready; then
         err_exit rejected E_CONFIG_INCONSISTENT revalidate false "服务端配置缺失或非法，拒绝激活"
     fi
     state="$(cm_management_state "$cfg")"
-    W_STAGE="marker"
     case "$state" in
         active)
             ok_exit ok marker \
@@ -618,7 +607,6 @@ op_management_deactivate() {
 _deactivate_locked() {
     local cfg="$SB_SERVER_CONFIG" state
     GEN=0
-    W_STAGE="marker"
     state="$(cm_management_state "$cfg")"
     if [ "$state" = "inactive" ]; then
         ok_exit ok marker '{"management_state":"inactive","no_op":true}' null "[]"
@@ -642,7 +630,9 @@ op_reconcile() {
     # waits longer than a normal op. If it STILL cannot take the lock we must
     # not silently continue: the state was never proven safe, so the helper is
     # degraded (mutations refused) while status/list stay available.
-    SB_LOCK_TIMEOUT="${SB_CM_RECONCILE_LOCK_TIMEOUT:-30}"
+    # Exported (not merely assigned) so shellcheck sees the consumer: this is
+    # read by with_client_lock() in lib/client-management.sh.
+    export SB_LOCK_TIMEOUT="${SB_CM_RECONCILE_LOCK_TIMEOUT:-30}"
     with_client_lock _reconcile_locked
     cm_degraded_set manual_intervention "startup reconcile could not acquire config.lock"
     emit_err "E_LOCK" "lock" true "配置锁不可用或超时，调和未完成（已置 degraded）" ""
@@ -765,7 +755,7 @@ main() {
         management.activate)   op_management_activate ;;
         management.deactivate) op_management_deactivate ;;
     esac
-    err_exit rejected E_INTERNAL done false "unreachable"
+    err_exit rejected E_INTERNAL "done" false "unreachable"
 }
 
 main "$@"
