@@ -692,7 +692,9 @@ SB_ROOT_DIR="${SB_ROOT_DIR:-$(dirname "$SB_SERVER_CONFIG")}"
 SB_SHORTCUT="${SB_SHORTCUT:-/usr/bin/mianyang}"
 SB_SYSTEMD_UNIT="${SB_SYSTEMD_UNIT:-/etc/systemd/system/sing-box.service}"
 RESERVED_CLIENT_NAME="legacy"
-CLIENT_NAME_PATTERN='^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$'
+# CLIENT_NAME_PATTERN lives in lib/client-management.sh together with its only
+# consumer (validate_client_name); keeping a second copy here would be an unused
+# variable (shellcheck SC2034).
 REALITY_INBOUND_TAG="vless-in"
 HY2_INBOUND_TAG="hy2-in"
 
