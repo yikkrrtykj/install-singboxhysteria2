@@ -1,11 +1,27 @@
 #!/usr/bin/env bash
-# Canonical shared transaction primitives for CLI + future E3 sbox-cm.
+# Canonical shared client-management + transaction library.
 #
 # This file is intentionally function-only: sourcing it performs no mutation.
-# Callers provide the existing install.sh environment/functions such as
-# warning/info/candidate_problems and SB_* paths. There must be exactly ONE
-# copy of these primitives in the repository; install.sh sources this library
-# and the future privileged helper will source the same file.
+# It is the SINGLE canonical source of the client-management semantics shared by
+# BOTH writers:
+#
+#     install.sh (root CLI)
+#                 \
+#                  -> lib/client-management.sh   (this file)
+#                 /
+#     sbox-cm transaction worker
+#
+# There must be exactly ONE copy of every primitive below in the repository.
+# install.sh sources this library and binds itself to the reviewed bytes via an
+# embedded SHA-256 pin; the privileged worker sources the very same file.
+#
+# Callers must provide the CLI/logging surface (warning/info); everything else
+# (paths, inbound tags, name rules) has a self-sufficient default so the library
+# is usable by a non-interactive root worker with a clean environment.
+#
+# E3 M1: this file MUST NOT print credential material, MUST NOT place
+# credential material into argv, and MUST NOT write it to any file. See the
+# "planned credentials" section for the only sanctioned credential path.
 
 # ---------------------------------------------------------------- transaction result --
 # The legacy CLI keeps the historical 0/1 function return contract. E3 can read
@@ -43,6 +59,28 @@ cm_transaction_result_json() {
 }
 
 cm_transaction_reset
+
+# --------------------------------------------------------- canonical configuration --
+# Self-sufficient defaults: the CLI exports its own (identical) values before
+# sourcing; the privileged worker sets production constants explicitly and
+# rejects environment injection. A caller may override any of these.
+SB_SERVER_CONFIG="${SB_SERVER_CONFIG:-/root/sbox/sbconfig_server.json}"
+SB_STATE_FILE="${SB_STATE_FILE:-/root/sbox/config}"
+SB_CLIENTS_DIR="${SB_CLIENTS_DIR:-/root/sbox/clients}"
+SB_SING_BOX_BIN="${SB_SING_BOX_BIN:-/root/sbox/sing-box}"
+SB_LOCK_FILE="${SB_LOCK_FILE:-/root/sbox/config.lock}"
+
+# The name "legacy" is RESERVED (pre-Phase-C shared account): it is never
+# created by "add" and never removed by "delete" in this version.
+RESERVED_CLIENT_NAME="${RESERVED_CLIENT_NAME:-legacy}"
+# NOTE: assigned with an explicit test, not ${VAR:-...}: the default value
+# itself contains "}" (the {0,31} quantifier), which would terminate a
+# parameter expansion early.
+if [ -z "${CLIENT_NAME_PATTERN:-}" ]; then
+    CLIENT_NAME_PATTERN='^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$'
+fi
+REALITY_INBOUND_TAG="${REALITY_INBOUND_TAG:-vless-in}"
+HY2_INBOUND_TAG="${HY2_INBOUND_TAG:-hy2-in}"
 
 # ---------------------------------------------------------------- global lock --
 # Seconds to wait for the exclusive config lock before aborting. Web/E3 helpers
@@ -256,5 +294,329 @@ commit_server_config() { # <candidate> <description>
 
     info "配置已提交（当前无运行中的 sing-box 进程，跳过 reload）: $description"
     info "上一份配置备份: $backup_path"
+    return 0
+}
+
+# ============================================================================
+# M1-A0: canonical client-management semantics (moved verbatim out of install.sh)
+# These were previously defined in install.sh, which forced every other writer
+# (the privileged worker) to either source the whole installer or copy them.
+# There is now exactly ONE definition of each.
+# ============================================================================
+
+validate_client_name() { # validate_client_name <name> -> rc 0 if allowed
+    local name="$1"
+    [ -n "$name" ] || return 1
+    [[ "$name" =~ $CLIENT_NAME_PATTERN ]] || return 1
+    return 0
+}
+
+get_reality_client_names() { # [config] -> one name per line ("" = unnamed user)
+    jq -r --arg tag "$REALITY_INBOUND_TAG" \
+        '.inbounds[] | select(.tag == $tag) | .users[]? | (.name // "")' \
+        "${1:-$SB_SERVER_CONFIG}" 2>/dev/null | tr -d '\r'
+}
+
+get_hy2_client_names() { # [config] -> one name per line ("" = unnamed user)
+    jq -r --arg tag "$HY2_INBOUND_TAG" \
+        '.inbounds[] | select(.tag == $tag) | .users[]? | (.name // "")' \
+        "${1:-$SB_SERVER_CONFIG}" 2>/dev/null | tr -d '\r'
+}
+
+# Structural precheck only: root must be an object, .inbounds must exist and be
+# an array, vless-in/hy2-in must each appear EXACTLY once, and their users
+# field must exist and be an array. Deliberately separate from the identity
+# audit: legacy migration must accept users WITHOUT names, so it runs only
+# this check before counting unnamed users. The jq exit code propagates to the
+# function: any runtime error means FAIL, never "no problems".
+client_structure_problems() { # client_structure_problems <config> -> prints problem lines
+    jq -r '
+      if (type != "object") then ["配置根节点不是 object"]
+      elif ((.inbounds // null) | type) != "array" then
+        (if (.inbounds // null) == null then ["缺少 inbounds 字段"] else ["inbounds 不是数组"] end)
+      else
+        (
+          ([.inbounds[] | select(.tag == "vless-in")]) as $ri |
+          ([.inbounds[] | select(.tag == "hy2-in")]) as $hi |
+          ([]
+            + (if ($ri | length) == 0 then ["缺少 vless-in 入站"] else [] end)
+            + (if ($ri | length) > 1 then ["vless-in 入站数量不是 1（实际 \($ri | length) 个）"] else [] end)
+            + (if ($hi | length) == 0 then ["缺少 hy2-in 入站"] else [] end)
+            + (if ($hi | length) > 1 then ["hy2-in 入站数量不是 1（实际 \($hi | length) 个）"] else [] end)
+            + (if ($ri | length) == 1 then
+                 (if ($ri[0] | has("users") | not) then ["vless-in 缺少 users 字段"]
+                  elif (($ri[0].users) | type) != "array" then ["vless-in 的 users 不是数组"]
+                  else [] end)
+               else [] end)
+            + (if ($hi | length) == 1 then
+                 (if ($hi[0] | has("users") | not) then ["hy2-in 缺少 users 字段"]
+                  elif (($hi[0].users) | type) != "array" then ["hy2-in 的 users 不是数组"]
+                  else [] end)
+               else [] end)
+          )
+        )
+      end | .[]
+    ' "$1" 2>/dev/null
+}
+
+# Full identity audit: structure first, then the per-user rules. FAIL-CLOSED:
+# a jq/runtime error inside either stage is an audit FAILURE, never "no
+# problems found" -- callers must check this function's exit code, not just
+# its stdout.
+candidate_problems() { # candidate_problems <config> -> prints problem lines (empty = OK)
+    local structural
+    structural="$(client_structure_problems "$1")" || return $?
+    if [ -n "$structural" ]; then
+        printf '%s\n' "$structural"
+        return 0
+    fi
+    jq -r '
+      ([.inbounds[] | select(.tag == "vless-in")][0].users) as $ru |
+      ([.inbounds[] | select(.tag == "hy2-in")][0].users) as $hu |
+      ([ $ru[] | .name // "" ]) as $rn |
+      ([ $hu[] | .name // "" ]) as $hn |
+      ([ $ru[] | .uuid // "" ]) as $rid |
+      ([ $hu[] | .password // "" ]) as $hp |
+      ([ $ru[] | .flow // "" ]) as $rf |
+      ([]
+        + (if ($rn | index("")) != null then ["vless-in 存在没有 name 的用户"] else [] end)
+        + (if ($hn | index("")) != null then ["hy2-in 存在没有 name 的用户"] else [] end)
+        + (if ($rn | sort) == ($hn | sort) then [] else ["Reality 与 HY2 的 name 集合不一致"] end)
+        + (if ($rn | length) == ($rn | unique | length) then [] else ["vless-in 存在重复 name"] end)
+        + (if ($hn | length) == ($hn | unique | length) then [] else ["hy2-in 存在重复 name"] end)
+        + (if ($rid | index("")) != null then ["vless-in 存在没有 uuid 的用户"] else [] end)
+        + (if ($hp | index("")) != null then ["hy2-in 存在没有 password 的用户"] else [] end)
+        + (if ($rid | length) == ($rid | unique | length) then [] else ["vless-in 存在重复 uuid"] end)
+        + (if ($hp | length) == ($hp | unique | length) then [] else ["hy2-in 存在重复 password"] end)
+        + (if ($rf | all(. == "xtls-rprx-vision")) then [] else ["vless-in 存在 flow 不等于 xtls-rprx-vision 的用户"] end)
+      )[]
+    ' "$1" 2>/dev/null
+}
+
+audit_client_consistency() { # audit_client_consistency [config] -> table + rc
+    local cfg="${1:-$SB_SERVER_CONFIG}" problems rn hn union name r h p
+    if [ ! -f "$cfg" ]; then
+        warning "服务端配置不存在: $cfg"
+        return 1
+    fi
+    if ! jq empty "$cfg" >/dev/null 2>&1; then
+        warning "服务端配置不是合法 JSON: $cfg"
+        return 1
+    fi
+    # FAIL-CLOSED: a jq/runtime error inside the audit is an audit failure,
+    # never equivalent to "no problems found".
+    if ! problems="$(candidate_problems "$cfg")"; then
+        warning "客户端结构审计执行失败: $cfg"
+        return 1
+    fi
+    rn="$(get_reality_client_names "$cfg")"
+    hn="$(get_hy2_client_names "$cfg")"
+    printf '%-16s %-12s %s\n' "NAME" "REALITY" "HY2"
+    union="$(printf '%s\n%s\n' "$rn" "$hn" | sed '/^$/d' | sort -u)"
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        r="MISSING"; h="MISSING"
+        grep -qxF "$name" <<<"$rn" && r="OK"
+        grep -qxF "$name" <<<"$hn" && h="OK"
+        printf '%-16s %-12s %s\n' "$name" "$r" "$h"
+    done <<< "$union"
+    if [ -n "$problems" ]; then
+        warning "客户端一致性检查发现问题:"
+        while IFS= read -r p; do
+            [ -n "$p" ] && warning "  - $p"
+        done <<< "$problems"
+        return 1
+    fi
+    info "客户端一致性检查通过（Reality 与 HY2 的 name 集合完全一致）"
+    return 0
+}
+
+client_name_exists() { # client_name_exists <name> [config] -> rc 0 if present in either inbound
+    local name="$1" cfg="${2:-$SB_SERVER_CONFIG}"
+    grep -qxF "$name" <(get_reality_client_names "$cfg") ||
+        grep -qxF "$name" <(get_hy2_client_names "$cfg")
+}
+
+get_client_credentials() { # get_client_credentials <name> [config] -> "uuid\npassword"
+    local name="$1" cfg="${2:-$SB_SERVER_CONFIG}" uuid password
+    uuid="$(jq -r --arg name "$name" --arg tag "$REALITY_INBOUND_TAG" '
+        .inbounds[] | select(.tag == $tag) | .users[]? | select(.name == $name) | .uuid // ""
+    ' "$cfg" 2>/dev/null)"
+    password="$(jq -r --arg name "$name" --arg tag "$HY2_INBOUND_TAG" '
+        .inbounds[] | select(.tag == $tag) | .users[]? | select(.name == $name) | .password // ""
+    ' "$cfg" 2>/dev/null)"
+    [ -n "$uuid" ] && [ -n "$password" ] || return 1
+    printf '%s\n%s\n' "$uuid" "$password"
+}
+
+# ============================================================================
+# M1-A: planned credential transaction interface
+#
+# The E3 path MUST NOT build candidates with `jq --arg uuid/--arg password`:
+# those values land in the jq process argv (/proc/<pid>/cmdline). The contract
+# below keeps credential material inside the privileged worker's own process
+# tree -- memory, or an anonymous pipe / inherited private FD -- and never in
+# argv, env, stdout, stderr, a temp file, the journal, or any audit stream.
+#
+# Byte-level digest definition (fixed, single implementation):
+#     digest = SHA256(uuid + "\n" + password)
+# planned_cred_digest / old_cred_digest / current_cred_digest ALL come from
+# cm_cred_digest_of, so no caller can invent a different concatenation.
+# ============================================================================
+
+# Raw digest primitive. Reads the exact bytes to hash from STDIN (never argv),
+# writes the lowercase hex digest to stdout.
+cm_cred_digest() {
+    local out=""
+    if command -v sha256sum >/dev/null 2>&1; then
+        out="$(sha256sum)" || return 1
+    elif command -v openssl >/dev/null 2>&1; then
+        out="$(openssl dgst -sha256 -r)" || return 1
+    else
+        return 1
+    fi
+    out="${out%% *}"
+    [ -n "$out" ] || return 1
+    printf '%s\n' "$out"
+}
+
+# The ONE canonical credential digest. Inputs are function arguments (never
+# argv of an external process); the value is piped through the raw primitive.
+cm_cred_digest_of() { # <uuid> <password> -> sha256(uuid + "\n" + password)
+    local uuid="${1:-}" password="${2:-}"
+    [ -n "$uuid" ] && [ -n "$password" ] || return 1
+    printf '%s\n%s' "$uuid" "$password" | cm_cred_digest
+}
+
+# Generate a planned credential. Deliberately emits NOTHING on stdout: the
+# values are held in the caller's own shell memory (CM_PLAN_UUID /
+# CM_PLAN_PASSWORD) until they are either committed or forgotten.
+cm_plan_client_credential() {
+    CM_PLAN_UUID=""
+    CM_PLAN_PASSWORD=""
+    CM_PLAN_UUID="$("$SB_SING_BOX_BIN" generate uuid)" || { cm_cred_forget; return 1; }
+    CM_PLAN_PASSWORD="$("$SB_SING_BOX_BIN" generate rand --hex 16)" || { cm_cred_forget; return 1; }
+    if [ -z "$CM_PLAN_UUID" ] || [ -z "$CM_PLAN_PASSWORD" ]; then
+        cm_cred_forget
+        return 1
+    fi
+    return 0
+}
+
+# Drop planned credential material from shell memory.
+cm_cred_forget() {
+    unset CM_PLAN_UUID CM_PLAN_PASSWORD 2>/dev/null || true
+    return 0
+}
+
+# Build an add candidate from an ALREADY PLANNED credential set delivered as a
+# JSON object over an inherited FD:
+#     {"uuid":"<uuid>","password":"<password>"}
+#
+# jq receives the live config through --slurpfile (a path, not a value) and the
+# credential object as its MAIN INPUT over the FD; therefore the jq argv
+# contains no credential material. The FD is expected to be the read end of an
+# anonymous pipe created by the caller (process substitution / pipe), never a
+# regular file on disk.
+cm_add_candidate_planned() { # <live_cfg> <name> <out> [cred_fd=8]
+    local cfg="$1" name="$2" out="$3" fd="${4:-8}"
+    [ -f "$cfg" ] || { warning "服务端配置不存在: $cfg"; return 1; }
+    jq --slurpfile cfg "$cfg" --arg name "$name" '
+      . as $cred
+      | if (($cred | type) != "object")
+           or (($cred.uuid | type) != "string") or ($cred.uuid == "")
+           or (($cred.password | type) != "string") or ($cred.password == "")
+        then error("planned credential shape invalid")
+        else
+          $cfg[0]
+          | (.inbounds[] | select(.tag == "vless-in") | .users) +=
+              [{"name": $name, "uuid": $cred.uuid, "flow": "xtls-rprx-vision"}]
+          | (.inbounds[] | select(.tag == "hy2-in") | .users) +=
+              [{"name": $name, "password": $cred.password}]
+        end
+    ' <&"$fd" > "$out"
+}
+
+# Build a delete candidate. Carries no credential material at all.
+cm_delete_candidate() { # <live_cfg> <name> <out>
+    local cfg="$1" name="$2" out="$3"
+    [ -f "$cfg" ] || { warning "服务端配置不存在: $cfg"; return 1; }
+    jq --arg name "$name" '
+      (.inbounds[] | select(.tag == "vless-in") | .users) |=
+        map(select(.name != $name)) |
+      (.inbounds[] | select(.tag == "hy2-in") | .users) |=
+        map(select(.name != $name))
+    ' "$cfg" > "$out"
+}
+
+# Current credential digest of an existing client, computed from the LIVE
+# config in the caller's head. Same primitive as planned_cred_digest.
+cm_old_cred_digest() { # <cfg> <name> -> sha256 hex
+    local cfg="$1" name="$2" uuid="" password=""
+    local -a lines=()
+    mapfile -t lines < <(get_client_credentials "$name" "$cfg") || return 1
+    [ "${#lines[@]}" -ge 2 ] || return 1
+    uuid="${lines[0]}"; password="${lines[1]}"
+    cm_cred_digest_of "$uuid" "$password"
+}
+
+# Digest of the CURRENTLY planned credential set (see cm_plan_client_credential).
+# Same primitive as every other credential digest: no caller may self-concatenate.
+cm_planned_cred_digest() {
+    if [ -z "${CM_PLAN_UUID:-}" ] || [ -z "${CM_PLAN_PASSWORD:-}" ]; then
+        return 1
+    fi
+    cm_cred_digest_of "$CM_PLAN_UUID" "$CM_PLAN_PASSWORD"
+}
+
+# Render an add candidate from the CURRENTLY planned credential set. The
+# credential set travels over an anonymous pipe owned by this shell; the
+# subscript inherits the values from memory, and nothing touches argv or disk.
+cm_render_planned_candidate() { # <live_cfg> <name> <out>
+    local cfg="$1" name="$2" out="$3"
+    if [ -z "${CM_PLAN_UUID:-}" ] || [ -z "${CM_PLAN_PASSWORD:-}" ]; then
+        warning "planned credential 尚未生成"
+        return 1
+    fi
+    exec 8< <(printf '{"uuid":"%s","password":"%s"}' "$CM_PLAN_UUID" "$CM_PLAN_PASSWORD")
+    if ! cm_add_candidate_planned "$cfg" "$name" "$out" 8; then
+        exec 8<&- 2>/dev/null || true
+        return 1
+    fi
+    exec 8<&- 2>/dev/null || true
+    return 0
+}
+
+# Convenience composition for callers that do not need to interleave a durable
+# ledger intent (i.e. the interactive CLI). The privileged worker deliberately
+# uses the three primitives above separately so it can order
+# plan -> digest -> durable intent -> candidate.
+# Sets:
+#     CM_ADD_CANDIDATE     path of the candidate (0600, same dir as live config)
+#     CM_PLAN_CRED_DIGEST  sha256(uuid + "\n" + password)
+# Credential material is forgotten before returning.
+cm_add_client_candidate_planned() { # <name> -> sets CM_ADD_CANDIDATE / CM_PLAN_CRED_DIGEST
+    local name="$1"
+    CM_ADD_CANDIDATE=""
+    CM_PLAN_CRED_DIGEST=""
+    cm_plan_client_credential || { warning "生成客户端凭据失败"; return 1; }
+    CM_PLAN_CRED_DIGEST="$(cm_planned_cred_digest)" || {
+        warning "计算凭据摘要失败"
+        cm_cred_forget
+        return 1
+    }
+    CM_ADD_CANDIDATE="$(new_candidate_path)" || {
+        warning "创建 candidate 失败"
+        cm_cred_forget
+        return 1
+    }
+    if ! cm_render_planned_candidate "$SB_SERVER_CONFIG" "$name" "$CM_ADD_CANDIDATE"; then
+        warning "生成 add candidate 失败"
+        rm -f "$CM_ADD_CANDIDATE"
+        CM_ADD_CANDIDATE=""
+        cm_cred_forget
+        return 1
+    fi
+    cm_cred_forget
     return 0
 }

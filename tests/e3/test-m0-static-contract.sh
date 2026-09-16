@@ -32,7 +32,7 @@ has_install 'lib/client-management.sh' &&
 
 EXPECTED_LIB_SHA="$(sed -n 's/^SB_CLIENT_MANAGEMENT_SHA256="\([0-9a-f]\{64\}\)"$/\1/p' "$INSTALL")"
 ACTUAL_LIB_SHA="$(sha256sum "$LIB" | awk '{print $1}')"
-if [ "$EXPECTED_LIB_SHA" = "$ACTUAL_LIB_SHA" ] && [ "$EXPECTED_LIB_SHA" = "55dc0d0a895a2f5d1d155517bc34039ef7d13e5adc81e06c81c1feb7e73dea58" ]; then
+if [ "$EXPECTED_LIB_SHA" = "$ACTUAL_LIB_SHA" ] && [ "$EXPECTED_LIB_SHA" = "310f3aa248fae9316d1d190dc70bb2a01d906cb396fd6845176ec8ef905e390d" ]; then
   ok 'install.sh digest pin matches canonical shared library bytes'
 else
   bad 'install.sh digest pin does not match canonical shared library'
@@ -47,8 +47,13 @@ has_lib 'command -v flock' && has_lib 'exec 9>>"$SB_LOCK_FILE"' && has_lib 'floc
   bad 'shared with_client_lock fail-closed primitives missing'
 
 # No second copy of the shared primitives is permitted in install.sh.
+# M1-A0 extends the uniqueness contract to the client-management semantics that
+# used to live in install.sh, so the privileged worker can never drift.
 for fn in with_client_lock reload_running_singbox reload_health_ok restore_file_atomically \
-          new_candidate_path new_backup_path commit_server_config; do
+          new_candidate_path new_backup_path commit_server_config \
+          validate_client_name client_name_exists get_reality_client_names get_hy2_client_names \
+          client_structure_problems candidate_problems audit_client_consistency \
+          get_client_credentials; do
   lib_count="$(grep -cE "^${fn}\\(\\)" "$LIB" || true)"
   install_count="$(grep -cE "^${fn}\\(\\)" "$INSTALL" || true)"
   if [ "$lib_count" = "1" ] && [ "$install_count" = "0" ]; then
@@ -57,6 +62,26 @@ for fn in with_client_lock reload_running_singbox reload_health_ok restore_file_
     bad "$fn definition count lib=$lib_count install=$install_count"
   fi
 done
+
+# M1-A: planned-credential primitives live only in the canonical library, and
+# install.sh must not build candidates with credential-bearing jq argv.
+for fn in cm_cred_digest cm_cred_digest_of cm_plan_client_credential cm_cred_forget \
+          cm_add_candidate_planned cm_delete_candidate cm_old_cred_digest \
+          cm_add_client_candidate_planned; do
+  lib_count="$(grep -cE "^${fn}\\(\\)" "$LIB" || true)"
+  install_count="$(grep -cE "^${fn}\\(\\)" "$INSTALL" || true)"
+  if [ "$lib_count" = "1" ] && [ "$install_count" = "0" ]; then
+    ok "$fn has exactly one source definition (shared lib)"
+  else
+    bad "$fn definition count lib=$lib_count install=$install_count"
+  fi
+done
+
+if no_install 'jq --arg name "$name" --arg uuid' && no_install '--arg password "$password"'; then
+  ok 'install.sh no longer passes credentials through jq argv (M1-A)'
+else
+  bad 'install.sh still passes credentials through jq argv (M1-A)'
+fi
 
 # T-1/T-2: hardened restore + structured non-sensitive transaction result.
 has_lib 'cmp -s "$backup" "$live"' &&

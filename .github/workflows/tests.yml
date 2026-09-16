@@ -50,6 +50,16 @@ jobs:
           bash -n tests/lib/journal-time.sh
           bash -n tests/lib/mock-flock.sh
           bash -n tests/test-monitor-packaging.sh
+          bash -n lib/sbox-cm-state.sh
+          bash -n sbox-cm/sbox-cm-ops
+          bash -n sbox-cm/deploy/install-sbox-cm.sh
+          bash -n tests/e3/test-m0-shared-lib.sh
+          bash -n tests/e3/test-m0-static-contract.sh
+          bash -n tests/e3/test-m1-shared-lib.sh
+          bash -n tests/e3/test-m1-worker.sh
+          bash -n tests/e3/test-m1-rpc.sh
+          bash -n tests/e3/test-m1-static.sh
+          bash -n tests/e3/test-m1-deploy.sh
 
       - name: "Journal time compatibility regression suite (B6 finding: raw RFC3339 rejected by Ubuntu 22.04 journalctl)"
         run: bash tests/test-journal-time-compat.sh
@@ -83,6 +93,56 @@ jobs:
 
       - name: Packaging/deployment regression suite (incl. runtime command preflight fail-closed)
         run: bash tests/test-monitor-packaging.sh
+
+      - name: E3 M0 shared transaction library + static contract
+        run: |
+          bash tests/e3/test-m0-shared-lib.sh
+          bash tests/e3/test-m0-static-contract.sh
+
+      - name: "E3 M1-A canonical shared library closure + planned credential hygiene"
+        run: bash tests/e3/test-m1-shared-lib.sh
+
+      - name: "E3 M1 static contract (single engine / six ops / systemd candidate)"
+        run: bash tests/e3/test-m1-static.sh
+
+      - name: "E3 M1 privileged worker (ledger / journal / idempotency / degraded)"
+        run: bash tests/e3/test-m1-worker.sh
+
+      - name: "E3 M1 RPC core (schema / framing / peer auth / replay)"
+        run: bash tests/e3/test-m1-rpc.sh
+
+      - name: "E3 M1 deployment contract (never auto-activates; disable closes socket AND service)"
+        run: bash tests/e3/test-m1-deploy.sh
+
+      - name: "systemd unit validation (sbox-cm socket + service candidate)"
+        run: |
+          set -o pipefail
+          U="$RUNNER_TEMP/sbox-cm-units"
+          mkdir -p "$U"
+          sed -e 's|@SBXCM_GROUP@|sboxweb|g' -e 's|@SBXCM_LIBEXEC@|/usr/local/lib/sbox-cm|g' \
+              sbox-cm/deploy/sbox-cm.socket.in > "$U/sbox-cm.socket"
+          sed -e 's|@SBXCM_GROUP@|sboxweb|g' -e 's|@SBXCM_LIBEXEC@|/usr/local/lib/sbox-cm|g' \
+              sbox-cm/deploy/sbox-cm.service.in > "$U/sbox-cm.service"
+          # Placeholder runtime file so ExecStart resolves during verify.
+          sudo mkdir -p /usr/local/lib/sbox-cm
+          printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/lib/sbox-cm/sbox-cm >/dev/null
+          sudo chmod 0755 /usr/local/lib/sbox-cm/sbox-cm
+          vrc=0
+          systemd-analyze verify "$U/sbox-cm.socket" "$U/sbox-cm.service" 2>&1 | tee "$U/verify.log" || vrc=$?
+          # HARD GATE: any diagnostic attributed to OUR units is a failure. A
+          # nonzero rc caused purely by unrelated runner units is tolerated (and
+          # reported) because verify walks the whole dependency graph.
+          if grep -E 'sbox-cm\.(service|socket)' "$U/verify.log" \
+             | grep -Eqi 'unknown key|unsupported|not supported|failed|error|not executable|no such file'; then
+            echo "::error::systemd on ${{ matrix.os }} rejected or ignored a directive in the sbox-cm units"
+            exit 1
+          fi
+          if [ "$vrc" -ne 0 ]; then
+            echo "note: systemd-analyze verify exited rc=$vrc on ${{ matrix.os }}; no diagnostic was attributed to the sbox-cm units (see above)."
+          fi
+          if systemd-analyze security --help >/dev/null 2>&1; then
+            systemd-analyze security --offline=yes "$U/sbox-cm.service" || true
+          fi
 
       - name: systemd unit + hardening directive validation (portable supported subset)
         run: |
@@ -167,4 +227,4 @@ jobs:
           fi
 
       - name: Integration regression complete (all prior steps green)
-        run: "echo 'Phase C + Phase D + S0 + Legacy + E1 + E2 + M0.5 + E4 + Packaging + existing-api-auth migration + journal-time compat: all green on ${{ matrix.os }}'"
+        run: "echo 'Phase C + Phase D + S0 + Legacy + E1 + E2 + M0.5 + E4 + Packaging + existing-api-auth migration + journal-time compat + E3 M0 + E3 M1: all green on ${{ matrix.os }}'"

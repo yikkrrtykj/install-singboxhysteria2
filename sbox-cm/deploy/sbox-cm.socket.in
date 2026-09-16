@@ -1,0 +1,20 @@
+[Unit]
+Description=sbox-cm privileged execution socket (E3 M1)
+Documentation=man:systemd.socket(5)
+
+# Socket activation is deliberate (rev5 M1 D-1):
+#   * PID 1 owns the path, the ownership and the mode;
+#   * no daemon-side bind / chown / stale-unlink logic is needed;
+#   * the daemon therefore never needs CAP_CHOWN.
+[Socket]
+ListenStream=/run/sbox-cm/sbox-cm.sock
+SocketUser=root
+SocketGroup=@SBXCM_GROUP@
+SocketMode=0660
+DirectoryMode=0755
+# The socket file is owned by PID 1; removing it on stop keeps a
+# disable+stop a complete shutdown of the privileged plane.
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

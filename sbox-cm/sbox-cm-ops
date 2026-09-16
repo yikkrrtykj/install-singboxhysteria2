@@ -1,0 +1,771 @@
+#!/bin/bash
+# sbox-cm privileged transaction worker (E3 M1 Transaction Backend).
+#
+# Invoked by the sbox-cm RPC daemon (root -> root), one process per request:
+#
+#     sbox-cm-ops <op>          # op is a COMPILE-TIME enum, never request data
+#       stdin : validated, NON-SECRET argument object (JSON)
+#       stdout: exactly one result object (JSON), non-sensitive
+#       stderr: human diagnostics only (journald)
+#
+# Responsibilities: config.lock, ledger, tx journal, credentials, candidate
+# generation, commit_server_config, rollback, derived cleanup, transaction
+# result, privileged audit, startup reconciliation.
+#
+# Absolute rules:
+#   * exactly ONE commit engine (lib/client-management.sh). This worker must
+#     never grow its own add/delete/candidate/commit implementation.
+#   * credential material never leaves this process tree except as
+#     IRREVERSIBLE digests in the root-only ledger. No argv, no env, no
+#     stdout/stderr, no temp file, no journal, no audit.
+#   * a durable ledger intent is written BEFORE any mutation; after that point
+#     the transaction runs to a terminal state regardless of the caller.
+#
+# `set -e` is deliberately NOT used: every failure path is explicit and must
+# still emit a protocol result.
+
+set -u
+
+# ------------------------------------------------------------------ globals --
+OP=""
+ARGS_JSON=""
+REQ_ID=""
+ACTOR_SESSION_FP=""
+ACTOR_STEPUP_FP=""
+NAME=""
+KEY=""
+GEN=0
+SESSION_FP=""
+CM_MUTATION_ENTERED=false
+W_STAGE="parse"
+
+# ------------------------------------------------------------------ output --
+warning() { printf '[sbox-cm-ops] %s\n' "$*" >&2; }
+info()    { printf '[sbox-cm-ops] %s\n' "$*" >&2; }
+
+tx_json() {
+    local entered="false"
+    if [ "${CM_MUTATION_ENTERED:-false}" = "true" ]; then entered="true"; fi
+    if command -v cm_transaction_result_json >/dev/null 2>&1; then
+        jq -cn --argjson t "$(cm_transaction_result_json)" --argjson entered "$entered" \
+            '$t + {entered:$entered}'
+        return 0
+    fi
+    printf '{"entered":%s,"phase":"parse","changed":false,"reload_performed":false,"health_verified":false,"rollback_attempted":false,"rollback_ok":null,"backup_path":null}\n' "$entered"
+}
+
+emit_ok() { # <data> [idempotency] [warnings]
+    jq -cn --argjson d "$1" --argjson i "${2:-null}" --argjson w "${3:-[]}" \
+           --argjson t "$(tx_json)" \
+        '{ok:true, code:"OK", stage:"done", data:$d, idempotency:$i,
+          warnings:$w, transaction:$t, error:null}'
+}
+
+emit_err() { # <code> <stage> <retriable> <detail> [backup]
+    jq -cn --arg code "$1" --arg stage "$2" --argjson retriable "$3" \
+           --arg detail "${4:-}" --arg backup "${5:-}" --argjson t "$(tx_json)" \
+        '{ok:false, code:$code, stage:$stage, retriable:$retriable,
+          detail:$detail, backup:(if $backup=="" then null else $backup end),
+          transaction:$t, data:null, idempotency:null, warnings:[]}'
+}
+
+# Exactly one privileged audit record per mutation attempt. The worker owns the
+# audit as soon as the daemon dispatched it (the daemon never adds a second).
+w_audit() { # <outcome> <stage> [error_code]
+    local outcome="$1" stage="$2" err="${3:-}" audit_id kfp=""
+    audit_id="${REQ_ID}:${GEN}"
+    if cm_audit_has "$audit_id"; then return 0; fi
+    if [ -n "${KEY:-}" ]; then kfp="$(cm_key_fp "$KEY" 2>/dev/null)"; fi
+    jq -cn --arg rid "${REQ_ID:-}" --arg op "${OP:-}" --arg name "${NAME:-}" \
+           --arg outcome "$outcome" --arg stage "$stage" --arg kfp "$kfp" \
+           --arg err "$err" --arg sfp "${ACTOR_SESSION_FP:-}" --arg ufp "${ACTOR_STEPUP_FP:-}" \
+           --argjson gen "${GEN:-0}" \
+        '{request_id:$rid, op:$op, name:$name, outcome:$outcome, stage:$stage,
+          key_fp:(if $kfp=="" then null else $kfp end), generation:$gen,
+          error:(if $err=="" then null else $err end),
+          actor:{session_fp:(if $sfp=="" then null else $sfp end),
+                 stepup_fp:(if $ufp=="" then null else $ufp end)},
+          source:"worker"}' \
+        | cm_audit_append "$audit_id" || warning "审计写入失败（继续，状态已持久化）"
+}
+
+ok_exit() { # <outcome> <stage> <data> [idempotency] [warnings]
+    w_audit "$1" "$2" ""
+    emit_ok "$3" "${4:-null}" "${5:-[]}"
+    exit 0
+}
+
+err_exit() { # <outcome> <code> <stage> <retriable> <detail> [backup]
+    w_audit "$1" "$3" "$2"
+    emit_err "$2" "$3" "$4" "$5" "${6:-}"
+    exit 0
+}
+
+idem_json() { # <replayed:true|false>
+    local kfp=""
+    if [ -n "${KEY:-}" ]; then kfp="$(cm_key_fp "$KEY" 2>/dev/null)"; fi
+    jq -cn --arg kfp "$kfp" --argjson replayed "$1" --argjson gen "${GEN:-0}" \
+        '{key_fp:$kfp, replayed:$replayed, generation:$gen}'
+}
+
+# ------------------------------------------------------------------ bootstrap --
+w_resolve_lib_dir() {
+    local d
+    if [ -n "${SB_CM_LIB_DIR:-}" ]; then printf '%s\n' "$SB_CM_LIB_DIR"; return 0; fi
+    d="$(cd -- "$(dirname -- "$0")" 2>/dev/null && pwd || true)"
+    if [ -n "$d" ] && [ -f "$d/lib/client-management.sh" ]; then
+        printf '%s\n' "$d/lib"; return 0
+    fi
+    if [ -n "$d" ] && [ -f "$d/../lib/client-management.sh" ]; then
+        printf '%s\n' "$d/../lib"; return 0
+    fi
+    return 1
+}
+
+# Production hardening (rev5 E-12): the worker must run from built-in constants
+# and must REJECT any SB_* environment injection. Tests use an explicit,
+# non-production sandbox flag.
+w_enforce_environment() {
+    if [ "${SBOX_CM_TEST_SANDBOX:-0}" = "1" ]; then
+        return 0
+    fi
+    if env 2>/dev/null | grep -q '^SB'; then
+        warning "检测到 SB_* 环境注入，生产 worker 拒绝运行（fail-closed）"
+        emit_err "E_INTERNAL" "parse" false "worker 检测到环境注入" ""
+        exit 0
+    fi
+    SB_SERVER_CONFIG=/root/sbox/sbconfig_server.json
+    SB_STATE_FILE=/root/sbox/config
+    SB_CLIENTS_DIR=/root/sbox/clients
+    SB_SING_BOX_BIN=/root/sbox/sing-box
+    SB_LOCK_FILE=/root/sbox/config.lock
+    SB_CM_STATE_DIR=/var/lib/sbox-cm
+    export SB_SERVER_CONFIG SB_STATE_FILE SB_CLIENTS_DIR SB_SING_BOX_BIN SB_LOCK_FILE SB_CM_STATE_DIR
+    return 0
+}
+
+# ------------------------------------------------------------------ helpers --
+w_arg() { printf '%s' "$ARGS_JSON" | jq -r --arg k "$1" '.[$k] // empty' 2>/dev/null; }
+
+w_actor_fp() { # <session_fp|stepup_fp>
+    printf '%s' "$ARGS_JSON" | jq -r --arg f "$1" '((.actor // {})[$f]) // empty' 2>/dev/null
+}
+
+live_config_ready() {
+    [ -f "$SB_SERVER_CONFIG" ] || return 1
+    jq empty "$SB_SERVER_CONFIG" >/dev/null 2>&1 || return 1
+    return 0
+}
+
+add_success_data() { # <name>
+    jq -cn --arg name "$1" \
+        '{name:$name, protocols:["reality","hy2"], mutable:true, source:"untracked",
+          yaml_available:false, credential_delivery:"cli",
+          warnings:["derived_files:generate_via_cli"]}'
+}
+
+delete_success_data() { # <derived_cleanup:true|false>
+    jq -cn --argjson derived "$1" \
+        '{deleted:true, derived_cleanup:$derived,
+          warnings:(if $derived then [] else ["derived_cleanup_failed"] end)}'
+}
+
+lock_acquirable() { # rc 0 when config.lock is free right now
+    command -v flock >/dev/null 2>&1 || return 1
+    ( exec 9>>"$SB_LOCK_FILE" 2>/dev/null && flock -n 9 2>/dev/null ) >/dev/null 2>&1
+}
+
+# ================================================================== ops ==
+# ------------------------------------------------------------- status --
+op_management_status() {
+    GEN=0
+    local cfg="$SB_SERVER_CONFIG" mgmt degraded reconcile
+    mgmt="$(cm_management_state "$cfg")"
+    if cm_degraded_active; then degraded=true; else degraded=false; fi
+    reconcile="$(cm_reconcile_state)"
+    local acq=false
+    if lock_acquirable; then acq=true; fi
+    local last="null" data
+    last="$(cm_last_tx_get 2>/dev/null)" || last="null"
+    [ -n "$last" ] || last="null"
+    data="$(jq -cn --arg mgmt "$mgmt" --argjson degraded "$degraded" --arg reconcile "$reconcile" \
+           --arg lockpath "$SB_LOCK_FILE" --argjson acq "$acq" --argjson last "$last" \
+        '{management_state:$mgmt,
+          management_active:($mgmt=="active"),
+          helper:{degraded:$degraded, reconcile:$reconcile},
+          lock:{path:$lockpath, acquirable:$acq},
+          last_transaction:$last}')" || data="{}"
+    ok_exit ok status "$data" null "[]"
+}
+
+# ------------------------------------------------------------- list --
+_list_locked() {
+    local cfg="$SB_SERVER_CONFIG" rn hn ann total
+    [ -f "$cfg" ] || return 2
+    jq empty "$cfg" >/dev/null 2>&1 || return 2
+
+    rn="$(get_reality_client_names "$cfg" | tr -d '\011')"
+    hn="$(get_hy2_client_names "$cfg" | tr -d '\011')"
+    ann="$(
+        {
+            printf '%s\n' "$rn" | sed '/^$/d' | sed 's/$/\tR/'
+            printf '%s\n' "$hn" | sed '/^$/d' | sed 's/$/\tH/'
+        } | sort | awk -F'\t' '
+            { name=$1
+              if (name != prev) {
+                  if (prev != "") print prev "\t" r "\t" h
+                  prev=name; r=0; h=0
+              }
+              if ($2=="R") r=1; else if ($2=="H") h=1
+            }
+            END { if (prev != "") print prev "\t" r "\t" h }
+        '
+    )"
+    total="$(printf '%s\n' "$ann" | sed '/^$/d' | wc -l | tr -d ' ')"
+    LIST_TRUNCATED=false
+    if [ "${total:-0}" -gt 1000 ]; then
+        ann="$(printf '%s\n' "$ann" | sed '/^$/d' | head -n 1000)"
+        LIST_TRUNCATED=true
+    fi
+    LIST_JSON="$(printf '%s\n' "$ann" | sed '/^$/d' \
+        | jq -R -s --arg reserved "$RESERVED_CLIENT_NAME" --argjson trunc "$LIST_TRUNCATED" '
+            split("\n") | map(select(length>0))
+            | map(split("\t") | {
+                  name: .[0],
+                  protocols: ((if .[1]=="1" then ["reality"] else [] end)
+                              + (if .[2]=="1" then ["hy2"] else [] end)),
+                  reserved: (.[0]==$reserved),
+                  mutable: (.[0]!=$reserved),
+                  source: "untracked"
+              })
+            | {clients: ., truncated: $trunc}')"
+    return 0
+}
+
+op_client_list() {
+    GEN=0
+    cm_state_init || err_exit rejected E_INTERNAL lock false "sbox-cm 状态目录初始化失败"
+    with_client_lock _list_locked; local rc=$?
+    case "$rc" in
+        0)  ok_exit ok lock "$LIST_JSON" null "[]" ;;
+        2)  err_exit rejected E_CONFIG_INCONSISTENT revalidate false "服务端配置缺失或非法" ;;
+        *)  err_exit rejected E_LOCK lock true "配置锁不可用或超时（fail-closed）" ;;
+    esac
+}
+
+# ------------------------------------------------------------- add --
+_add_locked() {
+    local cfg="$SB_SERVER_CONFIG" problems digest rec
+    W_STAGE="revalidate"
+
+    if ! live_config_ready; then
+        err_exit rejected E_CONFIG_INCONSISTENT revalidate false "服务端配置缺失或非法"
+    fi
+    if ! problems="$(candidate_problems "$cfg")"; then
+        err_exit rejected E_CONFIG_INCONSISTENT revalidate false "客户端结构审计执行失败"
+    fi
+    if [ -n "$problems" ]; then
+        err_exit rejected E_CONFIG_INCONSISTENT revalidate false "当前 Reality/HY2 用户集合不一致"
+    fi
+    if cm_degraded_active; then
+        err_exit manual_intervention E_MANUAL_INTERVENTION degraded false "helper 处于 degraded，拒绝一切 mutation"
+    fi
+    local mgmt
+    mgmt="$(cm_management_state "$cfg")"
+    if [ "$mgmt" != "active" ]; then
+        err_exit rejected E_ACTIVATION_STATE activation false "管理面未激活（$mgmt），拒绝 client.* 变更"
+    fi
+
+    # ---- ledger lookup (before acting on live preconditions; rev5 B.7) ----
+    digest="$(cm_request_digest "client.add" "$NAME")"
+    rec="$(cm_ledger_lookup "$KEY")"
+    if [ -n "$rec" ]; then
+        local rec_digest rec_state rec_gen rec_cred
+        rec_digest="$(cm_ledger_field "$rec" '.digest')"
+        rec_state="$(cm_ledger_field "$rec" '.state')"
+        rec_gen="$(cm_ledger_field "$rec" '.generation')"
+        if [ "$rec_digest" != "$digest" ]; then
+            err_exit rejected E_IDEMPOTENCY_CONFLICT ledger_intent false "同一 Idempotency-Key 的语义与先前请求不一致"
+        fi
+        if [ "$rec_state" = "done" ]; then
+            GEN="${rec_gen:-1}"
+            local prev
+            prev="$(printf '%s' "$rec" | jq -c '.result // {}' 2>/dev/null)"
+            [ -n "$prev" ] || prev="{}"
+            ok_exit replayed ledger_intent "$prev" "$(idem_json true)" "[]"
+        fi
+        # in_flight + same digest -> reconciliation matrix (rev5 B.9)
+        rec_cred="$(cm_ledger_field "$rec" '.planned_cred_digest')"
+        if client_name_exists "$NAME" "$cfg"; then
+            local current
+            if ! current="$(cm_old_cred_digest "$cfg" "$NAME")"; then
+                err_exit rejected E_CONFIG_INCONSISTENT revalidate false "无法读取现有客户端凭据摘要"
+            fi
+            if [ "$current" = "$rec_cred" ]; then
+                # this request already took effect: finish it and replay
+                GEN="${rec_gen:-1}"
+                local data
+                data="$(add_success_data "$NAME")"
+                if ! cm_ledger_append_outcome "$KEY" "client.add" "$NAME" "$digest" "$GEN" "$data"; then
+                    err_exit uncertain E_STATE_UNCERTAIN outcome true "变更已生效但账本 outcome 落盘失败"
+                fi
+                cm_journal_clear "$REQ_ID" || true
+                cm_last_tx_set "$GEN" "client.add" "ok"
+                ok_exit replayed outcome "$data" "$(idem_json true)" "[]"
+            fi
+            err_exit rejected E_RECONCILE_CONFLICT revalidate false "同名客户端由其他 actor 创建，拒绝覆盖"
+        fi
+        # name absent -> previous attempt did not take effect -> supersede
+        GEN=$(( ${rec_gen:-0} + 1 ))
+    else
+        GEN=1
+    fi
+
+    # ---- live precondition ----
+    if [ "$NAME" = "$RESERVED_CLIENT_NAME" ]; then
+        err_exit rejected E_RESERVED_NAME parse false "'$RESERVED_CLIENT_NAME' 是保留名称"
+    fi
+    if client_name_exists "$NAME" "$cfg"; then
+        err_exit rejected E_DUPLICATE_NAME revalidate false "客户端 '$NAME' 已存在"
+    fi
+
+    # ---- planned credentials + digest ----
+    W_STAGE="candidate"
+    cm_plan_client_credential || err_exit rejected E_INTERNAL candidate false "生成客户端凭据失败"
+    local planned
+    if ! planned="$(cm_planned_cred_digest)"; then
+        cm_cred_forget
+        err_exit rejected E_INTERNAL candidate false "计算凭据摘要失败"
+    fi
+
+    # ---- durable intent (mutation boundary) ----
+    if ! cm_ledger_append_intent "$KEY" "client.add" "$NAME" "$digest" "$GEN" "$REQ_ID" \
+            "planned_cred_digest" "$planned"; then
+        cm_cred_forget
+        err_exit rejected E_LEDGER_UNAVAILABLE ledger_intent true "账本 intent 持久化失败（零变更）"
+    fi
+    CM_MUTATION_ENTERED=true
+    if ! cm_journal_write "$REQ_ID" "client.add" "intent"; then
+        cm_cred_forget
+        cm_degraded_set manual_intervention "journal intent write failed"
+        err_exit manual_intervention E_MANUAL_INTERVENTION outcome false "journal 写入失败，进入 degraded"
+    fi
+
+    # ---- candidate from the SAME planned credentials ----
+    local candidate
+    candidate="$(new_candidate_path)" || {
+        cm_cred_forget
+        err_exit rejected E_CANDIDATE_REJECTED candidate false "创建 candidate 失败"
+    }
+    if ! cm_render_planned_candidate "$cfg" "$NAME" "$candidate"; then
+        rm -f -- "$candidate"
+        cm_cred_forget
+        err_exit rejected E_CANDIDATE_REJECTED candidate false "candidate 生成失败"
+    fi
+    cm_cred_forget
+    cm_journal_write "$REQ_ID" "client.add" "candidate" || true
+
+    # ---- commit (the one canonical engine) ----
+    W_STAGE="check"
+    if commit_server_config "$candidate" "client.add $NAME"; then
+        W_STAGE="outcome"
+        local data
+        data="$(add_success_data "$NAME")"
+        if ! cm_ledger_append_outcome "$KEY" "client.add" "$NAME" "$digest" "$GEN" "$data"; then
+            cm_journal_write "$REQ_ID" "client.add" "outcome" || true
+            cm_last_tx_set "$GEN" "client.add" "uncertain"
+            err_exit uncertain E_STATE_UNCERTAIN outcome true "变更已生效但账本 outcome 落盘失败（同一 key 重试可补账）"
+        fi
+        cm_journal_clear "$REQ_ID" || true
+        cm_last_tx_set "$GEN" "client.add" "ok"
+        ok_exit ok outcome "$data" "$(idem_json false)" "[]"
+    fi
+
+    _commit_failed "client.add"
+}
+
+# ------------------------------------------------------------- delete --
+_delete_locked() {
+    local cfg="$SB_SERVER_CONFIG" problems digest rec
+    W_STAGE="revalidate"
+
+    if ! live_config_ready; then
+        err_exit rejected E_CONFIG_INCONSISTENT revalidate false "服务端配置缺失或非法"
+    fi
+    if ! problems="$(candidate_problems "$cfg")"; then
+        err_exit rejected E_CONFIG_INCONSISTENT revalidate false "客户端结构审计执行失败"
+    fi
+    if [ -n "$problems" ]; then
+        err_exit rejected E_CONFIG_INCONSISTENT revalidate false "当前 Reality/HY2 用户集合不一致"
+    fi
+    if cm_degraded_active; then
+        err_exit manual_intervention E_MANUAL_INTERVENTION degraded false "helper 处于 degraded，拒绝一切 mutation"
+    fi
+    local mgmt
+    mgmt="$(cm_management_state "$cfg")"
+    if [ "$mgmt" != "active" ]; then
+        err_exit rejected E_ACTIVATION_STATE activation false "管理面未激活（$mgmt），拒绝 client.* 变更"
+    fi
+
+    # ---- ledger lookup first (M1 §5 order) ----
+    digest="$(cm_request_digest "client.delete" "$NAME")"
+    rec="$(cm_ledger_lookup "$KEY")"
+    if [ -n "$rec" ]; then
+        local rec_digest rec_state rec_gen rec_cred
+        rec_digest="$(cm_ledger_field "$rec" '.digest')"
+        rec_state="$(cm_ledger_field "$rec" '.state')"
+        rec_gen="$(cm_ledger_field "$rec" '.generation')"
+        if [ "$rec_digest" != "$digest" ]; then
+            err_exit rejected E_IDEMPOTENCY_CONFLICT ledger_intent false "同一 Idempotency-Key 的语义与先前请求不一致"
+        fi
+        if [ "$rec_state" = "done" ]; then
+            GEN="${rec_gen:-1}"
+            local prev
+            prev="$(printf '%s' "$rec" | jq -c '.result // {}' 2>/dev/null)"
+            [ -n "$prev" ] || prev="{}"
+            ok_exit replayed ledger_intent "$prev" "$(idem_json true)" "[]"
+        fi
+        rec_cred="$(cm_ledger_field "$rec" '.old_cred_digest')"
+        if ! client_name_exists "$NAME" "$cfg"; then
+            # desired state reached: finish derived cleanup + outcome
+            GEN="${rec_gen:-1}"
+            rm -rf -- "${SB_CLIENTS_DIR:?}/$NAME" 2>/dev/null || true
+            local data
+            data="$(delete_success_data true)"
+            cm_ledger_append_outcome "$KEY" "client.delete" "$NAME" "$digest" "$GEN" "$data" || true
+            cm_journal_clear "$REQ_ID" || true
+            cm_last_tx_set "$GEN" "client.delete" "ok"
+            ok_exit replayed ledger_intent "$data" "$(idem_json true)" "[]"
+        fi
+        local current
+        if ! current="$(cm_old_cred_digest "$cfg" "$NAME")"; then
+            err_exit rejected E_CONFIG_INCONSISTENT revalidate false "无法读取现有客户端凭据摘要"
+        fi
+        if [ "$current" != "$rec_cred" ]; then
+            err_exit rejected E_RECONCILE_CONFLICT revalidate false "同名客户端已被重建或轮换，绝对不得删除当前对象"
+        fi
+        GEN=$(( ${rec_gen:-0} + 1 ))
+    else
+        GEN=1
+    fi
+
+    # ---- live precondition ----
+    if [ "$NAME" = "$RESERVED_CLIENT_NAME" ]; then
+        err_exit rejected E_RESERVED_NAME parse false "'$RESERVED_CLIENT_NAME' 是保留名称"
+    fi
+    if ! client_name_exists "$NAME" "$cfg"; then
+        err_exit rejected E_NOT_FOUND revalidate false "客户端 '$NAME' 不存在"
+    fi
+    if ! grep -qxF "$NAME" <(get_reality_client_names "$cfg") ||
+       ! grep -qxF "$NAME" <(get_hy2_client_names "$cfg"); then
+        err_exit rejected E_CONFIG_INCONSISTENT revalidate false "客户端未同时存在于两个协议（先修复一致性）"
+    fi
+    local old_cred
+    if ! old_cred="$(cm_old_cred_digest "$cfg" "$NAME")"; then
+        err_exit rejected E_CONFIG_INCONSISTENT revalidate false "无法读取现有客户端凭据摘要"
+    fi
+
+    # ---- durable delete intent ----
+    if ! cm_ledger_append_intent "$KEY" "client.delete" "$NAME" "$digest" "$GEN" "$REQ_ID" \
+            "old_cred_digest" "$old_cred"; then
+        err_exit rejected E_LEDGER_UNAVAILABLE ledger_intent true "账本 intent 持久化失败（零变更）"
+    fi
+    CM_MUTATION_ENTERED=true
+    if ! cm_journal_write "$REQ_ID" "client.delete" "intent"; then
+        cm_degraded_set manual_intervention "journal intent write failed"
+        err_exit manual_intervention E_MANUAL_INTERVENTION outcome false "journal 写入失败，进入 degraded"
+    fi
+
+    local candidate
+    candidate="$(new_candidate_path)" || err_exit rejected E_CANDIDATE_REJECTED candidate false "创建 candidate 失败"
+    if ! cm_delete_candidate "$cfg" "$NAME" "$candidate"; then
+        rm -f -- "$candidate"
+        err_exit rejected E_CANDIDATE_REJECTED candidate false "candidate 生成失败"
+    fi
+    cm_journal_write "$REQ_ID" "client.delete" "candidate" || true
+
+    W_STAGE="check"
+    if commit_server_config "$candidate" "client.delete $NAME"; then
+        W_STAGE="outcome"
+        local derived=true
+        if [ -d "$SB_CLIENTS_DIR/$NAME" ]; then
+            if ! rm -rf -- "${SB_CLIENTS_DIR:?}/$NAME" 2>/dev/null; then derived=false; fi
+        fi
+        local data
+        data="$(delete_success_data "$derived")"
+        if ! cm_ledger_append_outcome "$KEY" "client.delete" "$NAME" "$digest" "$GEN" "$data"; then
+            cm_journal_write "$REQ_ID" "client.delete" "outcome" || true
+            cm_last_tx_set "$GEN" "client.delete" "uncertain"
+            err_exit uncertain E_STATE_UNCERTAIN outcome true "变更已生效但账本 outcome 落盘失败（同一 key 重试可补账）"
+        fi
+        cm_journal_clear "$REQ_ID" || true
+        cm_last_tx_set "$GEN" "client.delete" "ok"
+        ok_exit ok outcome "$data" "$(idem_json false)" "[]"
+    fi
+
+    _commit_failed "client.delete"
+}
+
+# Map a failed commit_server_config onto the M1 failure matrix (F4–F8).
+_commit_failed() { # <op-label>
+    local op_label="$1" phase="${CM_TX_PHASE:-}" rollback_ok="${CM_TX_ROLLBACK_OK:-null}"
+    cm_journal_write "$REQ_ID" "$op_label" "$phase" || true
+    case "$phase" in
+        candidate|check)
+            cm_journal_clear "$REQ_ID" || true
+            cm_last_tx_set "${GEN:-0}" "$op_label" "rejected"
+            err_exit rejected E_CANDIDATE_REJECTED "$phase" false "candidate 审计或 sing-box check 失败" "${CM_TX_BACKUP_PATH:-}" ;;
+        backup|replace)
+            cm_journal_clear "$REQ_ID" || true
+            cm_last_tx_set "${GEN:-0}" "$op_label" "rejected"
+            err_exit rejected E_COMMIT_FAILED "$phase" true "备份或原子替换失败（系统完好）" "${CM_TX_BACKUP_PATH:-}" ;;
+        rollback_manual)
+            cm_degraded_set manual_intervention "rollback failed or unconfirmed"
+            cm_last_tx_set "${GEN:-0}" "$op_label" "manual_intervention"
+            err_exit manual_intervention E_MANUAL_INTERVENTION "$phase" false "回滚后仍无法确认健康，需人工介入" "${CM_TX_BACKUP_PATH:-}" ;;
+        rollback|reload|health)
+            if [ "$rollback_ok" = "true" ]; then
+                cm_journal_clear "$REQ_ID" || true
+                cm_last_tx_set "${GEN:-0}" "$op_label" "rolled_back"
+                err_exit rolled_back E_ROLLED_BACK "$phase" true "reload/健康检查失败，已自动回滚" "${CM_TX_BACKUP_PATH:-}"
+            fi
+            cm_degraded_set manual_intervention "rollback unconfirmed"
+            cm_last_tx_set "${GEN:-0}" "$op_label" "manual_intervention"
+            err_exit manual_intervention E_MANUAL_INTERVENTION "$phase" false "回滚未确认，需人工介入" "${CM_TX_BACKUP_PATH:-}" ;;
+        *)
+            cm_journal_clear "$REQ_ID" || true
+            cm_last_tx_set "${GEN:-0}" "$op_label" "rejected"
+            err_exit rejected E_COMMIT_FAILED "${phase:-replace}" true "提交失败" "${CM_TX_BACKUP_PATH:-}" ;;
+    esac
+}
+
+# ------------------------------------------------------------- management --
+op_client_add() {
+    NAME="$(w_arg name)"
+    KEY="$(w_arg idempotency_key)"
+    validate_client_name "$NAME" || err_exit rejected E_SCHEMA parse false "name 非法"
+    [ "$NAME" != "$RESERVED_CLIENT_NAME" ] || err_exit rejected E_RESERVED_NAME parse false "legacy 是保留名称"
+    cm_idempotency_key_ok "$KEY" || err_exit rejected E_SCHEMA parse false "idempotency_key 非法"
+    cm_safe_id "$REQ_ID" || err_exit rejected E_SCHEMA parse false "request_id 非法"
+    cm_state_init || err_exit rejected E_INTERNAL parse false "状态目录初始化失败"
+    if cm_degraded_active; then
+        err_exit manual_intervention E_MANUAL_INTERVENTION degraded false "helper 处于 degraded，拒绝一切 mutation"
+    fi
+    with_client_lock _add_locked
+    err_exit rejected E_LOCK lock true "配置锁不可用或超时（fail-closed）"
+}
+
+op_client_delete() {
+    NAME="$(w_arg name)"
+    KEY="$(w_arg idempotency_key)"
+    validate_client_name "$NAME" || err_exit rejected E_SCHEMA parse false "name 非法"
+    [ "$NAME" != "$RESERVED_CLIENT_NAME" ] || err_exit rejected E_RESERVED_NAME parse false "legacy 是保留名称"
+    cm_idempotency_key_ok "$KEY" || err_exit rejected E_SCHEMA parse false "idempotency_key 非法"
+    cm_safe_id "$REQ_ID" || err_exit rejected E_SCHEMA parse false "request_id 非法"
+    cm_state_init || err_exit rejected E_INTERNAL parse false "状态目录初始化失败"
+    if cm_degraded_active; then
+        err_exit manual_intervention E_MANUAL_INTERVENTION degraded false "helper 处于 degraded，拒绝一切 mutation"
+    fi
+    with_client_lock _delete_locked
+    err_exit rejected E_LOCK lock true "配置锁不可用或超时（fail-closed）"
+}
+
+op_management_activate() {
+    cm_state_init || err_exit rejected E_INTERNAL parse false "状态目录初始化失败"
+    if cm_degraded_active; then
+        err_exit manual_intervention E_MANUAL_INTERVENTION degraded false "helper 处于 degraded，拒绝 mutation"
+    fi
+    with_client_lock _activate_locked
+    err_exit rejected E_LOCK lock true "配置锁不可用或超时（fail-closed）"
+}
+
+_activate_locked() {
+    local cfg="$SB_SERVER_CONFIG" state
+    GEN=0
+    W_STAGE="revalidate"
+    if ! live_config_ready; then
+        err_exit rejected E_CONFIG_INCONSISTENT revalidate false "服务端配置缺失或非法，拒绝激活"
+    fi
+    state="$(cm_management_state "$cfg")"
+    W_STAGE="marker"
+    case "$state" in
+        active)
+            ok_exit ok marker \
+                "$(jq -cn --arg p "$(cm_marker_path)" '{management_state:"active", no_op:true, marker_path:$p}')" \
+                null "[]" ;;
+        active_stale)
+            err_exit manual_intervention E_MANUAL_INTERVENTION marker false "激活标记处于 active_stale，需 root CLI mgmt-deactivate 恢复" ;;
+        *)
+            if ! cm_marker_activate "${ACTOR_SESSION_FP:-}" "$REQ_ID"; then
+                err_exit rejected E_INTERNAL marker false "写入激活标记失败"
+            fi
+            cm_last_tx_set 0 "management.activate" "ok"
+            ok_exit ok marker \
+                "$(jq -cn --arg p "$(cm_marker_path)" '{management_state:"active", no_op:false, marker_path:$p}')" \
+                null "[]" ;;
+    esac
+}
+
+op_management_deactivate() {
+    cm_state_init || err_exit rejected E_INTERNAL parse false "状态目录初始化失败"
+    if cm_degraded_active; then
+        err_exit manual_intervention E_MANUAL_INTERVENTION degraded false "helper 处于 degraded，拒绝 mutation"
+    fi
+    with_client_lock _deactivate_locked
+    err_exit rejected E_LOCK lock true "配置锁不可用或超时（fail-closed）"
+}
+
+_deactivate_locked() {
+    local cfg="$SB_SERVER_CONFIG" state
+    GEN=0
+    W_STAGE="marker"
+    state="$(cm_management_state "$cfg")"
+    if [ "$state" = "inactive" ]; then
+        ok_exit ok marker '{"management_state":"inactive","no_op":true}' null "[]"
+    fi
+    if ! cm_marker_remove; then
+        err_exit rejected E_INTERNAL marker false "删除激活标记失败"
+    fi
+    cm_last_tx_set 0 "management.deactivate" "ok"
+    ok_exit ok marker '{"management_state":"inactive","no_op":false}' null "[]"
+}
+
+# ============================================================ reconcile ==
+# Startup reconciliation (rev5 §3.2 / M1 §12). Runs under the same config.lock
+# before the daemon accepts ANY mutation. If a safe terminal state cannot be
+# PROVEN, degraded is set and every mutation is refused until a root operator
+# clears it (root CLI mgmt-deactivate / manual repair).
+op_reconcile() {
+    GEN=0
+    cm_state_init || { emit_err "E_INTERNAL" "reconcile" false "状态目录初始化失败" ""; exit 0; }
+    # Startup reconciliation may race a still-running CLI/previous helper, so it
+    # waits longer than a normal op. If it STILL cannot take the lock we must
+    # not silently continue: the state was never proven safe, so the helper is
+    # degraded (mutations refused) while status/list stay available.
+    SB_LOCK_TIMEOUT="${SB_CM_RECONCILE_LOCK_TIMEOUT:-30}"
+    with_client_lock _reconcile_locked
+    cm_degraded_set manual_intervention "startup reconcile could not acquire config.lock"
+    emit_err "E_LOCK" "lock" true "配置锁不可用或超时，调和未完成（已置 degraded）" ""
+    exit 0
+}
+
+_reconcile_locked() {
+    local cfg="$SB_SERVER_CONFIG" rid j phase jop backup gen audit_id degraded=false
+    for rid in $(cm_journal_list); do
+        j="$(cm_journal_read "$rid")" || { degraded=true; continue; }
+        phase="$(printf '%s' "$j" | jq -r '.phase // "unknown"' 2>/dev/null)"
+        jop="$(printf '%s' "$j" | jq -r '.op // "reconcile"' 2>/dev/null)"
+        backup="$(printf '%s' "$j" | jq -r '.backup_path // empty' 2>/dev/null)"
+        gen="$(printf '%s' "$j" | jq -r '.generation // 0' 2>/dev/null)"
+        case "$gen" in ''|*[!0-9]*) gen=0 ;; esac
+
+        case "$phase" in
+            intent|candidate)
+                # The mutation may or may not have been applied; the LEDGER is
+                # authoritative and a same-key retry resolves it (replay /
+                # supersede / conflict). The journal only records the phase.
+                ;;
+            check|backup|replace|reload|health|rollback|rollback_manual)
+                # live may already be replaced -> converge the runtime
+                if ! reload_running_singbox || ! reload_health_ok; then
+                    if [ -n "$backup" ] && [ -f "$backup" ]; then
+                        if ! restore_file_atomically "$backup" "$cfg" 0600; then
+                            degraded=true
+                        elif ! reload_running_singbox || ! reload_health_ok; then
+                            degraded=true
+                        fi
+                    else
+                        degraded=true
+                    fi
+                fi
+                ;;
+            *)
+                degraded=true
+                ;;
+        esac
+
+        # exactly-once: append the missing audit record for this attempt
+        audit_id="${rid}:${gen}"
+        if ! cm_audit_has "$audit_id"; then
+            local s_rid="$REQ_ID" s_op="$OP" s_gen="$GEN" s_key="$KEY" s_name="$NAME"
+            REQ_ID="$rid"; OP="$jop"; GEN="$gen"; KEY=""; NAME=""
+            if [ "$degraded" = "true" ]; then
+                w_audit manual_intervention reconcile "E_MANUAL_INTERVENTION"
+            else
+                w_audit ok reconcile ""
+            fi
+            REQ_ID="$s_rid"; OP="$s_op"; GEN="$s_gen"; KEY="$s_key"; NAME="$s_name"
+        fi
+
+        # keep the journal when the state is not proven safe
+        if [ "$degraded" != "true" ]; then
+            cm_journal_clear "$rid" || degraded=true
+        fi
+    done
+
+    if [ "$degraded" = "true" ]; then
+        cm_degraded_set manual_intervention "unfinished journal could not be proven safe"
+        emit_ok '{"reconciled":false,"degraded":true}' null "[]"
+        exit 0
+    fi
+    cm_degraded_clear || true
+    emit_ok '{"reconciled":true,"degraded":false}' null "[]"
+    exit 0
+}
+
+# ================================================================== main ==
+main() {
+    OP="${1:-}"
+    ARGS_JSON="$(cat 2>/dev/null || true)"
+
+    w_enforce_environment || exit 1
+
+    local lib_dir
+    if ! lib_dir="$(w_resolve_lib_dir)"; then
+        warning "找不到 canonical shared library"
+        emit_err "E_INTERNAL" "parse" false "worker 无法定位共享库" ""
+        exit 0
+    fi
+    # shellcheck source=/dev/null
+    . "$lib_dir/client-management.sh" || { emit_err "E_INTERNAL" "parse" false "共享库加载失败" ""; exit 0; }
+    # shellcheck source=/dev/null
+    . "$lib_dir/sbox-cm-state.sh" || { emit_err "E_INTERNAL" "parse" false "状态库加载失败" ""; exit 0; }
+
+    # Non-RPC maintenance entry point (NOT reachable over the socket). The
+    # daemon calls this once at startup, before it accepts any request.
+    if [ "$OP" = "--maintenance" ]; then
+        case "${2:-}" in
+            reconcile) op_reconcile ;;
+            *) emit_err "E_INTERNAL" "parse" false "未知维护子命令" "" ; exit 0 ;;
+        esac
+        emit_err "E_INTERNAL" "done" false "unreachable" ""
+        exit 0
+    fi
+
+    case "$OP" in
+        management.status|management.activate|management.deactivate|\
+        client.list|client.add|client.delete) : ;;
+        *) emit_err "E_OP_UNKNOWN" "parse" false "未知操作" ""; exit 0 ;;
+    esac
+
+    if ! printf '%s' "$ARGS_JSON" | jq -e 'type == "object"' >/dev/null 2>&1; then
+        emit_err "E_SCHEMA" "parse" false "参数不是 JSON 对象" ""
+        exit 0
+    fi
+
+    REQ_ID="$(w_arg request_id)"
+    ACTOR_SESSION_FP="$(w_actor_fp session_fp)"
+    ACTOR_STEPUP_FP="$(w_actor_fp stepup_fp)"
+
+    case "$OP" in
+        management.status)     op_management_status ;;
+        client.list)           op_client_list ;;
+        client.add)            op_client_add ;;
+        client.delete)         op_client_delete ;;
+        management.activate)   op_management_activate ;;
+        management.deactivate) op_management_deactivate ;;
+    esac
+    err_exit rejected E_INTERNAL done false "unreachable"
+}
+
+main "$@"
