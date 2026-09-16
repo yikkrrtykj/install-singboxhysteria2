@@ -600,6 +600,10 @@ cm_add_client_candidate_planned() { # <name> -> sets CM_ADD_CANDIDATE / CM_PLAN_
     CM_ADD_CANDIDATE=""
     CM_PLAN_CRED_DIGEST=""
     cm_plan_client_credential || { warning "生成客户端凭据失败"; return 1; }
+    # Deliberate output, not an internal: CM_PLAN_CRED_DIGEST is the digest of
+    # the credential set this call has just planned, for callers that want to
+    # journal it. Nothing inside this library consumes it.
+    # shellcheck disable=SC2034
     CM_PLAN_CRED_DIGEST="$(cm_planned_cred_digest)" || {
         warning "计算凭据摘要失败"
         cm_cred_forget

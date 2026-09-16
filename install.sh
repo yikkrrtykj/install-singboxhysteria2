@@ -705,7 +705,7 @@ HY2_INBOUND_TAG="hy2-in"
 # lib/client-management.sh. Local repository execution sources the sibling file;
 # the historical curl/process-substitution entry point fetches the same path from
 # the selected repository ref. Tests/helpers may inject SB_CLIENT_MANAGEMENT_LIB.
-SB_CLIENT_MANAGEMENT_SHA256="310f3aa248fae9316d1d190dc70bb2a01d906cb396fd6845176ec8ef905e390d"
+SB_CLIENT_MANAGEMENT_SHA256="8f16799caa6cb796575dc840659c406d3627c3cd42e42f10db6488416c3b89b6"
 
 verify_client_management_library() { # <path>
     local lib="$1" got=""

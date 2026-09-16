@@ -363,8 +363,9 @@ if jq -e '([.inbounds[]|select(.tag=="vless-in")|.users[]|select(.name=="vmix-05
 else
     fail 'the failed-lock attempt mutated the config'
 fi
-assert_eq 0 "$(ls -1 "$SB" 2>/dev/null | grep -c 'candidate' || true)" \
-    'the failed-lock attempt left no candidate behind'
+cand_count=0
+for f in "$SB"/*candidate*; do [ -e "$f" ] && cand_count=$((cand_count + 1)); done
+assert_eq 0 "$cand_count" 'the failed-lock attempt left no candidate behind'
 
 printf '\n== live lock contention (real flock) ==\n'
 if [ "$HAS_REAL_FLOCK" = "1" ]; then

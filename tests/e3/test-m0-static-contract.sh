@@ -32,7 +32,7 @@ has_install 'lib/client-management.sh' &&
 
 EXPECTED_LIB_SHA="$(sed -n 's/^SB_CLIENT_MANAGEMENT_SHA256="\([0-9a-f]\{64\}\)"$/\1/p' "$INSTALL")"
 ACTUAL_LIB_SHA="$(sha256sum "$LIB" | awk '{print $1}')"
-if [ "$EXPECTED_LIB_SHA" = "$ACTUAL_LIB_SHA" ] && [ "$EXPECTED_LIB_SHA" = "310f3aa248fae9316d1d190dc70bb2a01d906cb396fd6845176ec8ef905e390d" ]; then
+if [ "$EXPECTED_LIB_SHA" = "$ACTUAL_LIB_SHA" ] && [ "$EXPECTED_LIB_SHA" = "8f16799caa6cb796575dc840659c406d3627c3cd42e42f10db6488416c3b89b6" ]; then
   ok 'install.sh digest pin matches canonical shared library bytes'
 else
   bad 'install.sh digest pin does not match canonical shared library'
