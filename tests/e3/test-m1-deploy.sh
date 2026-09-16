@@ -19,6 +19,18 @@ fail(){ FAIL=$((FAIL+1)); printf '  FAIL %s\n' "$*"; }
 skip(){ SKIP=$((SKIP+1)); printf '  SKIP %s\n' "$*"; }
 ok(){ [ "$1" = "0" ] && pass "$2" || fail "$2"; }
 no(){ [ "$1" != "0" ] && pass "$2" || fail "$2"; }
+# Run a deploy command and surface its captured output when it fails, so a CI
+# failure is attributable instead of a bare rc.
+run_deploy(){ # <outfile> <args...>
+    local out="$1"; shift
+    "$INSTALLER" "$@" >"$out" 2>&1
+    local rc=$?
+    if [ "$rc" != "0" ]; then
+        printf '  NOTE %s rc=%s:\n' "$*" "$rc"
+        sed 's/^/    | /' "$out"
+    fi
+    return "$rc"
+}
 
 printf '===== E3 M1 DEPLOY =====\n'
 
@@ -61,7 +73,7 @@ UNITS="$PREFIX/etc/systemd/system"
 
 # ------------------------------------------------------------------ install ----
 printf '\n== install converges without activating ==\n'
-"$INSTALLER" install >"$TMP/install.out" 2>&1
+run_deploy "$TMP/install.out" install
 ok $? 'install exits 0'
 [ -f "$LIBEXEC/sbox-cm" ] && pass 'daemon staged' || fail 'daemon missing'
 [ -f "$LIBEXEC/sbox-cm-ops" ] && pass 'worker staged' || fail 'worker missing'

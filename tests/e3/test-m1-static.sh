@@ -121,6 +121,20 @@ printf '%s\n' "$disable_body" | grep -qF 'disable "$SOCKET_UNIT"' \
 want "$INSTALLER" 'mgmt-deactivate' 'root recovery CLI is referenced'
 want "$DAEMON" 'mgmt-deactivate' 'daemon exposes the root recovery CLI'
 
+printf '\n== executable bits recorded in git ==\n'
+# The deploy contract invokes the installer directly; an entry staged as 100644
+# works on a Windows dev box (no exec-bit check) and fails on Linux with
+# "Permission denied", so the mode itself is part of the contract.
+if command -v git >/dev/null 2>&1; then
+    for f in sbox-cm/sbox-cm sbox-cm/sbox-cm-ops sbox-cm/deploy/install-sbox-cm.sh; do
+        mode="$(cd "$ROOT" && git ls-files -s "$f" 2>/dev/null | awk '{print $1}')"
+        [ "$mode" = "100755" ] && pass "$f is committed as 100755" \
+            || fail "$f is committed as ${mode:-<untracked>} (want 100755)"
+    done
+else
+    skip 'git unavailable: exec-bit assertions skipped'
+fi
+
 printf '\n== syntax ==\n'
 bash -n "$WORKER" && pass 'bash -n worker' || fail 'bash -n worker'
 bash -n "$INSTALLER" && pass 'bash -n installer' || fail 'bash -n installer'
