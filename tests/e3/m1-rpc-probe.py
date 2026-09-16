@@ -191,6 +191,12 @@ def socketpair_tests(mod):
     os.environ["SB_CM_STATE_DIR"] = state
     audit = os.path.join(state, "audit", "cm.jsonl")
 
+    # These overrides must NOT leak into the real AF_UNIX section below, which
+    # relies on the kernel's SO_PEERCRED answer (the overrides would turn every
+    # connection into a fake, mismatched peer).
+    saved_env = {key: os.environ.get(key) for key in
+                 ("SBOX_CM_TEST_PEER_UID", "SB_CM_STATE_DIR", "SBOX_CM_TEST_SANDBOX")}
+
     calls = []
     real = mod.run_worker
 
@@ -321,6 +327,11 @@ def socketpair_tests(mod):
             client.close()
     finally:
         mod.run_worker = real
+        for key, value in saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 # ------------------------------------------------------------------ socket --
