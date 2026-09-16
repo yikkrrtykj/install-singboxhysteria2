@@ -189,17 +189,18 @@ def socketpair_tests(mod):
         skip("socket.socketpair unavailable")
         return
 
+    # Capture FIRST: these overrides must NOT leak into the real AF_UNIX section
+    # below, which relies on the kernel's SO_PEERCRED answer (a leaked
+    # SBOX_CM_TEST_PEER_UID turns every connection into a fake, mismatched peer
+    # and the whole transport suite answers E_PEER_AUTH).
+    saved_env = {key: os.environ.get(key) for key in
+                 ("SBOX_CM_TEST_PEER_UID", "SB_CM_STATE_DIR", "SBOX_CM_TEST_SANDBOX")}
+
     os.environ["SBOX_CM_TEST_SANDBOX"] = "1"
     os.environ["SBOX_CM_TEST_PEER_UID"] = "4242"
     state = tempfile.mkdtemp(prefix="scm-sp-")
     os.environ["SB_CM_STATE_DIR"] = state
     audit = os.path.join(state, "audit", "cm.jsonl")
-
-    # These overrides must NOT leak into the real AF_UNIX section below, which
-    # relies on the kernel's SO_PEERCRED answer (the overrides would turn every
-    # connection into a fake, mismatched peer).
-    saved_env = {key: os.environ.get(key) for key in
-                 ("SBOX_CM_TEST_PEER_UID", "SB_CM_STATE_DIR", "SBOX_CM_TEST_SANDBOX")}
 
     calls = []
     real = mod.run_worker
