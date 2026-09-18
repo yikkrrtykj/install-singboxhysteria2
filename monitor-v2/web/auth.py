@@ -99,6 +99,18 @@ def validate_password(password):
     return password
 
 
+def _stepup_fingerprint(token, granted_at):
+    """16-hex audit fingerprint for one step-up grant (M2 §12 S-A).
+
+    sha256 over the memory-only session token and the canonical grant
+    timestamp: one-way (the token is not recoverable), stable within the
+    window (every mutation in the window attributes to the same fp), and
+    guaranteed to rotate on the next grant because the timestamp differs.
+    """
+    material = "%s:%s" % (token, repr(float(granted_at)))
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
+
+
 class LoginRateLimiter:
     """Per-IP sliding-window lockout for failed logins (in memory).
 
@@ -154,11 +166,20 @@ class SessionStore:
 
     Each session record is::
 
-        {"created", "expires", "csrf_token", "step_up_expires"}
+        {"created", "expires", "csrf_token", "step_up_expires",
+         "step_up_granted_at", "stepup_fp"}
 
     where ``step_up_expires`` is ``None`` (never re-authenticated) or an
     absolute clock value. The step-up is a property of one session: dropping
     the session drops it, and it is never persisted anywhere.
+
+    M2 extends the in-memory step-up record with ``step_up_granted_at`` and
+    ``stepup_fp`` (docs/e3-m2-web-adapter-design.md §12 S-A): the fingerprint
+    is what the RPC ``actor`` carries for privileged-audit attribution. It is
+    derived from the memory-only session token, never stored on disk, never
+    returned to the browser, and cleared TOGETHER with the expiry by every
+    revocation path (logout / password change / recovery reset / recovery
+    rotate / session expiry; a web restart clears all memory state anyway).
     """
 
     def __init__(self, ttl=DEFAULT_SESSION_TTL, clock=time.time,
@@ -174,7 +195,9 @@ class SessionStore:
         token = secrets.token_urlsafe(32)
         record = {"created": now, "expires": now + self.ttl,
                   "csrf_token": secrets.token_urlsafe(32),
-                  "step_up_expires": None}
+                  "step_up_expires": None,
+                  "step_up_granted_at": None,
+                  "stepup_fp": None}
         with self._mutex:
             self._sessions[token] = record
         return token
@@ -207,6 +230,12 @@ class SessionStore:
         None means the session does not exist (or already expired), so no
         window could be opened -- the caller must answer 401, never pretend
         a grant happened.
+
+        M2: the grant also creates the audit fingerprint pair. Every grant
+        writes a FRESH ``step_up_granted_at``, so a re-grant always rotates
+        the fingerprint; within one window all mutations reuse the same fp,
+        which is what makes the helper's audit trail attributable per
+        step-up window.
         """
         ttl = self.step_up_ttl if ttl is None else ttl
         now = self._clock()
@@ -215,6 +244,8 @@ class SessionStore:
             if record is None or now >= record["expires"]:
                 return None
             record["step_up_expires"] = now + ttl
+            record["step_up_granted_at"] = now
+            record["stepup_fp"] = _stepup_fingerprint(token, now)
             return record["step_up_expires"]
 
     def step_up_active(self, token):
@@ -227,11 +258,37 @@ class SessionStore:
             expires = record.get("step_up_expires")
             return expires is not None and now < expires
 
+    def step_up_credentials(self, token):
+        """Atomic snapshot of the step-up state: ``{"active", "fp"}``.
+
+        ``fp`` is the audit fingerprint to send as the RPC actor's
+        ``stepup_fp`` while the window is live, else ``None``. Checking
+        liveness and reading the fingerprint in one locked step removes the
+        gap where a revocation lands between ``step_up_active()`` and a
+        separate fingerprint fetch. The fp NEVER goes back to the browser:
+        its only consumer is the RPC actor payload.
+        """
+        now = self._clock()
+        with self._mutex:
+            record = self._sessions.get(token)
+            if record is None or now >= record["expires"]:
+                return {"active": False, "fp": None}
+            expires = record.get("step_up_expires")
+            if expires is None or now >= expires:
+                return {"active": False, "fp": None}
+            return {"active": True, "fp": record.get("stepup_fp")}
+
     def revoke_all_step_ups(self):
-        """Drop EVERY step-up (the sessions themselves survive)."""
+        """Drop EVERY step-up (the sessions themselves survive).
+
+        M2: the fingerprint pair dies with the window -- a revoked window
+        must not leave a reusable ``stepup_fp`` behind.
+        """
         with self._mutex:
             for record in self._sessions.values():
                 record["step_up_expires"] = None
+                record["step_up_granted_at"] = None
+                record["stepup_fp"] = None
 
 
 class AuthStore:

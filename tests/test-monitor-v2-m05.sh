@@ -42,7 +42,7 @@ assert_contains() { if [ "$(printf '%s' "$2" | grep -cF -- "$1")" -gt 0 ]; then 
 assert_not_contains() { if [ "$(printf '%s' "$2" | grep -cF -- "$1")" -eq 0 ]; then pass "$3"; else fail "$3 (forbidden: $1)"; fi; }
 
 section "static checks: step-up boundary + zero filesystem bridge"
-WEB_PY="$ROOT/monitor-v2/web/__init__.py $ROOT/monitor-v2/web/access.py $ROOT/monitor-v2/web/auth.py $ROOT/monitor-v2/web/broker.py $ROOT/monitor-v2/web/recovery.py $ROOT/monitor-v2/web/server.py $ROOT/monitor-v2/web/storage.py $ROOT/monitor-v2/webapp.py"
+WEB_PY="$ROOT/monitor-v2/web/__init__.py $ROOT/monitor-v2/web/access.py $ROOT/monitor-v2/web/auth.py $ROOT/monitor-v2/web/broker.py $ROOT/monitor-v2/web/e3_broker.py $ROOT/monitor-v2/web/e3rpc.py $ROOT/monitor-v2/web/recovery.py $ROOT/monitor-v2/web/server.py $ROOT/monitor-v2/web/storage.py $ROOT/monitor-v2/webapp.py"
 if "$PY" -m py_compile $WEB_PY 2>"$TMP/py.err"; then
     pass "py_compile web backend"
 else
@@ -66,7 +66,7 @@ assert_not_contains 'verify_secret' "$SERVER_SRC" "step-up never reaches for a s
 assert_contains 'login_limiter' "$WEB_SRC" "step-up shares the existing login rate limiter"
 assert_contains 'management.activate' "$WEB_SRC" "the four-op mutation boundary is declared"
 assert_contains 'client.delete' "$WEB_SRC" "the four-op mutation boundary is declared (client.delete)"
-assert_contains 'not_implemented' "$SERVER_SRC" "the 501 boundary uses the fixed not_implemented error code"
+assert_contains 'e3_unavailable' "$SERVER_SRC" "the mutation boundary fails closed without an E3 backend (M2; the M0.5 501 was replaced by the real adapter)"
 assert_contains 'id="stepup-overlay" class="overlay hidden"' "$INDEX_SRC" "the password panel is hidden on load (never asked proactively)"
 assert_contains 'Management plane' "$INDEX_SRC" "the dashboard renders the orthogonal status model"
 # T12 (static half): no code path in the web process addresses either
@@ -457,15 +457,17 @@ def group_gate():
         session_info(port, cookie).get("step_up_active") is True
 
     # T5: inside the window the mutation is AUTHORIZED. The privileged
-    # backend does not exist in M0.5, so the honest terminal answer is 501 --
+    # backend is not wired in this harness, so the honest terminal
+    # answer is a fail-closed 503 e3_unavailable (M2) --
     # never a silent success and never a second reauth demand.
     r = mutate(port, "/api/v1/clients/add", cookie, csrf)
-    out["T5_authorized_not_401"] = r["status"] == 501
-    out["T5_op_name_reported"] = json.loads(r["body"]).get("op") == "client.add"
+    out["T5_authorized_not_401"] = r["status"] == 503
+    out["T5_op_name_reported"] = \
+        json.loads(r["body"]).get("code") == "e3_unavailable"
     out["T5_milestone_reported"] = \
-        json.loads(r["body"]).get("milestone") == "M0.5"
+        json.loads(r["body"]).get("error") == "the E3 adapter is not wired in this build"
     out["T5_error_code_not_implemented"] = \
-        json.loads(r["body"]).get("error") == "not_implemented"
+        json.loads(r["body"]).get("ok") is False
     out["T5_wrong_password_not_authorized"] = \
         step_up(port, cookie, csrf, "definitely-wrong")["status"] == 401
 
@@ -518,7 +520,7 @@ def group_gate():
     ss = csrf_of(sp, sc)
     out["T6_step_up_ok"] = step_up(sp, sc, ss)["status"] == 200
     out["T6_authorized_in_window"] = \
-        mutate(sp, "/api/v1/clients/add", sc, ss)["status"] == 501
+        mutate(sp, "/api/v1/clients/add", sc, ss)["status"] == 503
     time.sleep(1.6)
     r = mutate(sp, "/api/v1/clients/add", sc, ss)
     out["T6_expired_401"] = r["status"] == 401
@@ -685,7 +687,7 @@ def group_revocation():
     sc = csrf_of(pc, cc)
     step_up(pc, cc, sc)
     out["concurrency_first_request_passes_gate"] = \
-        mutate(pc, "/api/v1/clients/add", cc, sc)["status"] == 501
+        mutate(pc, "/api/v1/clients/add", cc, sc)["status"] == 503
     stack_c["auth"].sessions.revoke_all_step_ups()
     out["concurrency_later_request_blocked"] = \
         mutate(pc, "/api/v1/clients/add", cc, sc)["status"] == 401
@@ -845,8 +847,8 @@ check 'd["T4_expires_in_300"]' "T4: the window is 300 seconds"
 check 'd["T4_step_up_active_flag"]' "T4: the session reports a live step-up"
 check 'd["T5_authorized_not_401"]' "T5: inside the window the mutation passes authorization"
 check 'd["T5_op_name_reported"]' "T5: the authorized request reaches the op boundary (client.add)"
-check 'd["T5_milestone_reported"]' "T5: the boundary reports the M0.5 milestone (no real mutation)"
-check 'd["T5_error_code_not_implemented"]' "T5: the 501 body uses the fixed not_implemented code"
+check 'd["T5_milestone_reported"]' "T5: without an E3 backend the boundary says so honestly (M2)"
+check 'd["T5_error_code_not_implemented"]' "T5: the fail-closed body is ok:false (never success-shaped)"
 check 'd["T5_wrong_password_not_authorized"]' "T5: a wrong password never authorizes"
 check 'd["gate_no_session_401"]' "gate: mutation without a session -> 401 login required"
 check 'd["gate_no_csrf_403"]' "gate: mutation without CSRF -> 403"

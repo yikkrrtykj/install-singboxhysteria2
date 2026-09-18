@@ -35,6 +35,8 @@ from collector import Collector, resolve_secret  # noqa: E402
 from web.access import LOOPBACK_ALLOW, AccessPolicy, host_entry_for_ip  # noqa: E402
 from web.auth import AuthStore, validate_password  # noqa: E402
 from web.broker import SnapshotBroker  # noqa: E402
+from web.e3_broker import E3Broker  # noqa: E402
+from web.e3rpc import E3RpcClient  # noqa: E402
 from web.recovery import generate_key  # noqa: E402
 from web.server import (MONITOR_WEB_VERSION, MonitorWebApp,  # noqa: E402
                         build_server)
@@ -264,7 +266,8 @@ def cmd_serve(args):
 
     app = MonitorWebApp(broker=broker, access=access,
                         static_dir=os.path.join(HERE, "web", "static"),
-                        auth=auth, remote_mode=remote_mode)
+                        auth=auth, remote_mode=remote_mode,
+                        e3_broker=E3Broker(E3RpcClient()))
     server = build_server(app, args.listen, args.port, tls_context)
     scheme = "https" if tls_context is not None else "http"
     print("monitor web (%s) listening on %s:%d [%s]" %
