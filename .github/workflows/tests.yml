@@ -124,7 +124,12 @@ jobs:
       - name: "E3 M1 B-5 LIVE systemd integration (real socket+service under PID 1: PEERCRED / add / reload / rollback / reconcile)"
         run: |
           bash -n tests/e3/test-m1-systemd.sh
-          sudo -n bash tests/e3/test-m1-systemd.sh
+          # SBOX_CM_REQUIRE_LIVE=1: on CI the live gate MUST really execute; a
+          # SKIP here would be a false green. The suite also checks its own
+          # exit-status contract, so a failing run can no longer exit 0 through
+          # its teardown trap (that is how this step once stayed green at
+          # FAIL=10).
+          sudo -n env SBOX_CM_REQUIRE_LIVE=1 bash tests/e3/test-m1-systemd.sh
 
       - name: "systemd unit validation (sbox-cm socket + service candidate)"
         run: |
