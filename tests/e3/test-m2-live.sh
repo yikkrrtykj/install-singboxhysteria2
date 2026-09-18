@@ -170,6 +170,15 @@ printf '0\n' > "$FIX/reload.count"
 # privileged helper: the REAL installer, then enable the socket.
 "$ROOT/sbox-cm/deploy/install-sbox-cm.sh" install >/dev/null 2>&1 \
     || { fail 'sbox-cm installer failed'; printf '\nE3_M2_LIVE=FAIL\n'; exit 1; }
+# The B-5 suite may have run earlier on this runner and left its ledger and
+# an armed activation marker behind (its teardown stops the units but keeps
+# /var/lib/sbox-cm). This fixture owns the helper state: start from a proven
+# clean slate so management_state really starts inactive.
+systemctl stop sbox-cm.socket sbox-cm.service >/dev/null 2>&1
+rm -rf /var/lib/sbox-cm
+mkdir -p /var/lib/sbox-cm
+chown root:root /var/lib/sbox-cm
+chmod 0700 /var/lib/sbox-cm
 systemctl enable --now sbox-cm.socket >/dev/null 2>&1 \
     || { fail 'sbox-cm.socket enable failed'; printf '\nE3_M2_LIVE=FAIL\n'; exit 1; }
 for _ in $(seq 1 50); do [ -S /run/sbox-cm/sbox-cm.sock ] && break; sleep 0.1; done
@@ -255,6 +264,9 @@ start_monitor || { fail 'monitor unit (phase B) did not come up'; printf '\nE3_M
 curl -sS -c "$CJ" -H "Content-Type: application/json" \
      -d "{\"password\":\"$MPASS\"}" "$BASE/api/v1/login" >/dev/null 2>&1
 CSRF="$(curl -sS -b "$CJ" "$BASE/api/v1/session" | jqv '-' '.csrf_token')"
+# mutations need a live step-up window (M0.5 gate, unchanged)
+curl -sS -b "$CJ" -H "X-CSRF-Token: $CSRF" -H "Content-Type: application/json" \
+     -d "{\"password\":\"$MPASS\"}" "$BASE/api/v1/step-up" >/dev/null 2>&1
 STATUS_B="$(curl -sS -b "$CJ" "$BASE/api/v1/management/status")"
 assert_eq "true" "$(jqv "$STATUS_B" '.ok')" 'with the carve-out the monitor reaches the helper (phase B)'
 assert_eq "fresh" "$(jqv "$STATUS_B" '.transport')" 'the first status snapshot is fresh'
