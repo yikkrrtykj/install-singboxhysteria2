@@ -29,14 +29,13 @@ NoNewPrivileges=true
 PrivateTmp=true
 PrivateDevices=true
 # M0.5 (rev5 G4): ProtectSystem=strict makes the whole hierarchy read-only
-# except /dev, /proc, /sys; the single writable exception is the monitor's
-# own data root, re-opened explicitly below. /root/sbox and
-# /var/lib/sbox-cm stay non-writable AND non-readable (ProtectHome hides
-# /root; the sbox-cm runtime tree is root:root 0700 and outside the data
-# root). Web code has no direct filesystem path to either -- mutations can
-# only ever travel over the future sbox-cm AF_UNIX RPC.
+# except /dev, /proc, /sys; the writable exceptions are re-opened explicitly
+# below. /root/sbox and /var/lib/sbox-cm stay non-writable AND non-readable
+# (ProtectHome hides /root; the sbox-cm runtime tree is root:root 0700 and
+# outside the data root). Web code has no direct filesystem path to either --
+# mutations can only ever travel over the sbox-cm AF_UNIX RPC (M2).
 ProtectSystem=strict
-ReadWritePaths=@SBMON_STATE_ROOT@
+ReadWritePaths=@SBMON_STATE_ROOT@ -/run/sbox-cm
 ProtectHome=yes
 ProtectKernelTunables=true
 ProtectKernelModules=true
@@ -48,7 +47,7 @@ LockPersonality=true
 SystemCallArchitectures=native
 # The monitor is a loopback CLIENT and loopback LISTENER: it needs AF_INET /
 # AF_INET6 for 127.0.0.1:9091 and 127.0.0.1:9191, plus AF_UNIX for libc/NSS.
-# Future sbox-cm RPC connects over AF_UNIX as well. This deliberately does
+# The sbox-cm RPC (M2) also connects over AF_UNIX. This deliberately does
 # NOT collapse to AF_UNIX-only -- that narrowing belongs to sbox-cm itself,
 # which has no TCP surface at all. The two units keep separate address-family
 # contracts on purpose.

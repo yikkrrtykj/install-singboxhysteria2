@@ -101,16 +101,20 @@ assert_eq "ProtectControlGroups=true" "$(grep '^ProtectControlGroups=' "$UNIT")"
 assert_eq "RestrictSUIDSGID=true" "$(grep '^RestrictSUIDSGID=' "$UNIT")" "unit cannot create setuid/setgid files"
 assert_eq "CapabilityBoundingSet=" "$(grep '^CapabilityBoundingSet=' "$UNIT")" "unit drops the whole capability bounding set"
 assert_eq "AmbientCapabilities=" "$(grep '^AmbientCapabilities=' "$UNIT")" "unit holds zero ambient capabilities"
-assert_eq "1" "$(grep -c '^ReadWritePaths=' "$UNIT")" "unit declares EXACTLY ONE writable exception"
-assert_eq "ReadWritePaths=/var/lib/singbox-monitor" "$(grep '^ReadWritePaths=' "$UNIT")" "the only writable path is the monitor's own data root"
+assert_eq "1" "$(grep -c '^ReadWritePaths=' "$UNIT")" "unit declares EXACTLY ONE ReadWritePaths line (M2-E: consciously updated contract)"
+assert_eq "ReadWritePaths=/var/lib/singbox-monitor -/run/sbox-cm" "$(grep '^ReadWritePaths=' "$UNIT")" "writable exceptions = the monitor data root + the M2 socket connect carve-out"
 RW_ROOT="$(grep '^ReadWritePaths=' "$UNIT" | grep -F '/root/sbox' || true)"
 assert_eq "" "$RW_ROOT" "T12: the unit opens NO write path into /root/sbox"
 RW_CM="$(grep '^ReadWritePaths=' "$UNIT" | grep -F '/var/lib/sbox-cm' || true)"
 assert_eq "" "$RW_CM" "T12: the unit opens NO write path into the sbox-cm runtime tree"
 assert_eq "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX" "$(grep '^RestrictAddressFamilies=' "$UNIT")" \
     "monitor keeps AF_INET/AF_INET6 (it is a loopback client+listener); NOT collapsed to AF_UNIX-only"
-assert_eq "" "$(printf '%s' "$UNIT_SRC" | grep -E '^ReadWritePaths=.*sbox-cm' || true)" \
-    "no sbox-cm socket path is force-created before it exists"
+# The M2 carve-out is a CONNECT permission for the already-listening
+# sbox-cm.socket; the leading '-' tolerates its absence, so the monitor
+# unit never force-creates /run/sbox-cm and never gains any write path
+# into the proxy tree or the sbox-cm runtime state (M2-E contract).
+assert_contains "ReadWritePaths=/var/lib/singbox-monitor -/run/sbox-cm" "$UNIT_SRC" \
+    "the socket carve-out is dash-prefixed (tolerated absence, never force-created)"
 
 # ---------------------------------------------------------------------------
 # T12 runtime half: the privileged trees must be unreachable IN PRACTICE, not

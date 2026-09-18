@@ -1,11 +1,11 @@
-# E3 M2 — Web 适配层设计（sbox-cm Web Adapter，rev2）
+# E3 M2 — Web 适配层设计（sbox-cm Web Adapter，rev3）
 
 ```text
-状态           : DESIGN FROZEN（方向批准 2026-09-19；G-review #1 主体通过，
-                 rev2 并入 delta 修订，待 delta G-review）
-本文性质       : 设计文档 + 冻结裁决记录；本提交为 DOCS-ONLY
-实现面         : 本提交不含任何 M2 实现代码
-E3 MANAGEMENT  = NO（本文交付后仍保持默认安全态）
+状态           : IMPLEMENTED（M2-A0…M2-E 已随本 PR 落地；rev3 = 实现收口）
+本文性质       : 设计文档 + 冻结裁决记录 + 实现记录
+实现面         : M2-A0 helper actor；M2-B/C e3rpc+broker+HTTP adapter；
+                 M2-D UI；M2-E live 闸门（tests/e3/test-m2-live.sh）
+E3 MANAGEMENT  = NO（M2 交付后仍保持默认安全态；激活属于 M3）
 PRODUCTION     = NO TOUCH
 前置           : M0 / M0.5 / M1 已合并（main = 2ca99f37…，M1 head 1d4615da…）
 ```
@@ -465,12 +465,13 @@ S-F 无新配置面: 不新增 env key、不新增配置键；socket 路径为�
 
 ## 13. 运行时实测前置与 unit 契约变更（B-5 纪律，不可跳过）
 
-**开放问题（M2-E 的核心验证项）**：monitor unit（`User=sboxweb`，
-`ProtectSystem=strict`，`ReadWritePaths` 仅数据根）能否 `connect()` 到
-`/run/sbox-cm/sbox-cm.sock`。M1 的 B-5 实测经验：`ProtectSystem=strict` 会把 `/run`
-挂成只读，**connect 到 /run 下的 socket 需要写权限路径放行**（sbox-cm 自身为此带
-`-/run/systemd` carve-out；socket 文件本身的 DAC（root:sboxweb 0660）对 sboxweb 组
-可写，这层没问题）。
+**实测结论（M2-E，`tests/e3/test-m2-live.sh`）**：monitor unit
+（`User=sboxweb`，`ProtectSystem=strict`）连接 `/run/sbox-cm/sbox-cm.sock`
+**需要** `ReadWritePaths=-/run/sbox-cm` connect carve-out（与 M1 B-5 的
+`-/run/systemd` 同理：`/run` 在 strict 下只读，connect 需要该挂载点的写权限）。
+live 套件对两个方向都做了活体证明：先剥掉 carve-out 跑（预期 connect 被阻，
+若某基线不阻则如实记录），再恢复 shipped 模板跑（必须成功）——不许只测一边。
+socket 文件本身的 DAC（root:sboxweb 0660）对 sboxweb 组可写，这层无需改动。
 
 ```text
 预期修正     : singbox-monitor.service.in 的 ReadWritePaths 追加 -/run/sbox-cm
@@ -607,5 +608,20 @@ M2 COMPLETE 当且仅当 : A0–E 全部闸门绿 + 文档收口（本文 rev2 �
             文字修正：路由计数统一为"六个 HTTP endpoints（2 GET + 4 mutation
             POST）"；完成定义回滚方式改为明确的 code rollback / 恢复 501
             boundary（不存在 feature flag）。
-（delta G-review 结论待回填）
+
+2026-09-19  rev3（实现收口，M2-A0…M2-E）：
+            * M2-A0：daemon OPS deactivate + optional actor（单行）+ probe/
+              worker 回归；
+            * M2-B/C：web/e3rpc.py、web/e3_broker.py、auth.py stepup_fp 扩展、
+              server.py 六端点 + 白名单 + result_unknown、webapp.py 装配；
+            * M2-D：UI（management 卡 transport/degraded/as_of、client 表、
+              type-to-confirm 删除流、uncertain/reconcile-conflict 文案、
+              add 凭据走 CLI 提示）；
+            * M2-E：tests/e3/test-m2-live.sh（carve-out 双向实测 + 全事务 +
+              result_unknown 活体证明 + stale-active fail closed + breaker
+              恢复 + PEERCRED）；monitor unit 模板加 -/run/sbox-cm；
+              m05 T12 断言有意识更新为"数据根 + dash-prefixed carve-out"；
+            * 既有回归：M0.5（137 断言）、E2（272 断言）保持全绿（501→503
+              fail-closed 契约为有意识变更）。
+（M2 最终 G-review 结论待回填）
 ```
