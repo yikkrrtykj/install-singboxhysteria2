@@ -141,6 +141,19 @@ CapabilityBoundingSet=CAP_KILL CAP_DAC_OVERRIDE
 
 ## 2. RPC 协议（AF_UNIX，versioned，allowlist，显式帧）
 
+> **ERRATA（2026-09，随 M2 设计冻结入库；以下 §2.1 / §2.4 / §2.6 原文仅作历史记录）**
+>
+> 已合并的 M1 实现（B6 修订）**取代（supersede）本文 §2.1 / §2.4 / §2.6 中关于 helper per-op / overall-op deadline 的全部描述**。现行有效合同：
+>
+> * helper **不设任何整体 op deadline**；daemon 不存在 `communicate(timeout=...)`；事务一旦写入 durable intent 即不可被调用方中止（对端断连不中止 mutation）。
+> * 唯一传输时限 = **5 s 帧读取**（daemon `sbox-cm` 的 `READ_TIMEOUT`）。
+> * worker 的外部子步（sing-box check / systemctl / health 探测）由 `cm_bounded` **各自限时**，超时按事务错误/回滚路径处理。
+> * **120 s 语义 = M2 Web 调用方等待预算**（M2 冻结值：status≈5 s / client.list≈20 s / activate+deactivate≈30 s / add+delete=120 s），不是 kill timer。
+> * §2.1 的 "helper 单线程串行处理" 同样被取代：M1 daemon 为**每连接一线程**（慢 mutation 不阻塞 status/list）；全局串行化仍完全由 config.lock 承担（此点未变）。
+> * §2.6 的 `E_TIMEOUT`（504）据此重新解释：仅可能由 5 s 帧读取超时产生；调用方放弃等待**不产生**任何 helper 侧错误码，Web 层以"结果未知（`result_unknown`）"呈现（见 `docs/e3-m2-web-adapter-design.md` §8/§10）。
+>
+> 权威来源：`docs/e3-m1-privileged-execution-plane-design.md`（"Review #2 修订（B6）"行）、`sbox-cm/sbox-cm`（daemon 实现）、`sbox-cm/sbox-cm-ops`（worker 实现）。
+
 ### 2.1 传输、帧模型与三级 deadline（review #6）
 
 ```text
@@ -203,6 +216,8 @@ schema 规则（parse 阶段强制，先于一切文件访问）：
 
 ### 2.4 每操作 deadline（helper 强制；到点仅在**未进入 mutation**的阶段可中止，进入后一律跑到终态，§8-R5/R10）
 
+> **ERRATA 标记**：本节整表已被 M1 B6 实现取代——helper 不再强制任何 per-op deadline，表内数值仅作历史记录；现行合同见 §2 ERRATA 与 `docs/e3-m2-web-adapter-design.md` §8（数值成为 M2 调用方等待预算）。
+
 | op | deadline |
 | --- | --- |
 | management.status | 10 s |
@@ -248,7 +263,7 @@ schema 规则（parse 阶段强制，先于一切文件访问）：
 | `E_ROLLED_BACK` | 503 | true | reload/health 失败已回滚（F6/F7） |
 | `E_MANUAL_INTERVENTION` | 500 | false | 回滚后仍不健康（F8）/ journal 调和无法证明安全态（§3.2）⇒ degraded，拒绝一切 mutation |
 | `E_ACTIVATION_STATE` | 409 | false | client.* 在未激活时被请求；或 activate/deactivate 竞态残余 |
-| `E_TIMEOUT` | 504 | true | op deadline 到期（仅未进入 mutation 时可发生） |
+| `E_TIMEOUT` | 504 | true | op deadline 到期（仅未进入 mutation 时可发生）（ERRATA：M1 B6 后仅指 5 s 帧读取超时；见 §2 ERRATA） |
 | `E_INTERNAL` | 500 | false | 其余内部错误（审计 CRITICAL） |
 
 stage 枚举（rev4 §4.2 沿革；失败点语义见附录 D）：`parse | peer | lock | ledger_intent | revalidate | candidate | check | backup | replace | reload | health | rollback | rollback_manual | outcome | marker | audit`。
