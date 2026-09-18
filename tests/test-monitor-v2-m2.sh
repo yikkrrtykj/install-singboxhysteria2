@@ -836,6 +836,7 @@ def group_rpc_transport(tmpdir):
         out["request_id_fresh_per_attempt"] = rid1 != rid2
         out["op_carried"] = v1.get("op") == "management.status"
 
+        MOCK_MODE["slow"] = True   # hold the response 0.6s > the 0.2s budget
         slow = E3RpcClient(socket_path=path,
                            budgets={"management.status": 0.2})
         try:
@@ -844,6 +845,8 @@ def group_rpc_transport(tmpdir):
         except RpcTransportError as exc:
             out["budget_exhaustion_raises"] = True
             out["budget_exhaustion_is_uncertain"] = exc.uncertain is True
+        finally:
+            MOCK_MODE["slow"] = False
 
         dead = os.path.join(tmpdir, "absent.sock")
         absent = E3RpcClient(socket_path=dead)
