@@ -987,6 +987,7 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
                     "ok": False, "code": "E_RESERVED_NAME",
                     "error": "legacy is a reserved name", "retriable": False})
                 return
+            payload["name"] = name
 
         if op == "client.delete":
             # Server-side type-to-confirm: the echoed value must equal the
