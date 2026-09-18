@@ -125,7 +125,7 @@ fi
 # ------------------------------------------------------------------ fixture --
 getent passwd "$AXE_USER" >/dev/null 2>&1 || useradd --system --no-create-home "$AXE_USER"
 getent group  "$AXE_USER" >/dev/null 2>&1 || groupadd --system "$AXE_USER"
-mkdir -p "$FIX" "$APP" "$MDATA"
+mkdir -p "$FIX" "$APP" "$MDATA" /root/sbox
 chmod 0777 "$FIX"
 
 # mock sing-box: the production worker's built-in path, no SB_* injection.
@@ -187,8 +187,10 @@ chmod 0700 "$MDATA"
 mkdir -p /etc/sboxcm-m2
 printf '# m2 live fixture conf\n' > /etc/sboxcm-m2/monitor.conf
 if ! sudo -u "$AXE_USER" env -u SSH_CONNECTION python3 "$APP/webapp.py" setup \
-        --assume-yes --password "$MPASS" --data-dir "$MDATA" >/dev/null 2>&1; then
-    fail 'monitor setup (password bootstrap) failed'
+        --assume-yes --password "$MPASS" --data-dir "$MDATA" \
+        > "$FIX/setup.out" 2> "$FIX/setup.err"; then
+    fail 'monitor setup (password bootstrap) failed:'
+    sed 's/^/    | /' "$FIX/setup.err" "$FIX/setup.out" 2>/dev/null | head -10
     printf '\nE3_M2_LIVE=FAIL\n'; exit 1
 fi
 pass 'monitor fixture configured via webapp.py setup (as sboxweb)'
