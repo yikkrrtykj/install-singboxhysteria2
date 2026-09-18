@@ -252,9 +252,9 @@ fi
 # Phase B: with the carve-out (the shipped template), the RPC MUST work.
 render_monitor_unit yes
 start_monitor || { fail 'monitor unit (phase B) did not come up'; printf '\nE3_M2_LIVE=FAIL\n'; exit 1; }
+curl -sS -c "$CJ" -H "Content-Type: application/json" \
      -d "{\"password\":\"$MPASS\"}" "$BASE/api/v1/login" >/dev/null 2>&1
 CSRF="$(curl -sS -b "$CJ" "$BASE/api/v1/session" | jqv '-' '.csrf_token')"
-CSRF="$(curl -sS -b "$CJ" "$BASE/api/v1/session" | jqv '-''.csrf_token')"
 STATUS_B="$(curl -sS -b "$CJ" "$BASE/api/v1/management/status")"
 assert_eq "true" "$(jqv "$STATUS_B" '.ok')" 'with the carve-out the monitor reaches the helper (phase B)'
 assert_eq "fresh" "$(jqv "$STATUS_B" '.transport')" 'the first status snapshot is fresh'
