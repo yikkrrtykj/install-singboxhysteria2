@@ -181,7 +181,8 @@ pass 'privileged helper installed and socket-activated'
 # REAL webapp.py setup path, running under the REAL hardened unit template.
 cp "$ROOT"/monitor-v2/*.py "$APP"/ 2>/dev/null
 cp -r "$ROOT/monitor-v2/web" "$APP"/web
-rm -rf "$APP/web/__pycache__" "$APP"/__pycache__ 2>/dev/null
+cp -r "$ROOT/monitor-v2/api_bridge" "$APP"/api_bridge
+rm -rf "$APP/web/__pycache__" "$APP"/__pycache__        "$APP/api_bridge/__pycache__" 2>/dev/null
 chown -R "$AXE_USER":"$AXE_USER" "$APP" "$MDATA"
 chmod 0700 "$MDATA"
 mkdir -p /etc/sboxcm-m2
