@@ -307,7 +307,7 @@ BEFORE_SUM="$(sum /root/sbox/sbconfig_server.json)"
 R="$(e3_post /api/v1/management/activate - '{}')"
 assert_eq "true" "$(jqv "$R" '.ok')" 'activate over the live HTTP API'
 R="$(e3_post /api/v1/clients/add "$KEY1" '{"name":"live-01"}')"
-assert_eq "true" "$(jqv "$R" '.ok')" 'client.add over the live HTTP API'
+assert_eq "true" "$(jqv "$R" '.ok')" "client.add over the live HTTP API (raw=[$R])" 
 assert_eq "false" "$(jqv "$R" '.idempotency.replayed')" 'first add is not a replay'
 assert_ne "$BEFORE_SUM" "$(sum /root/sbox/sbconfig_server.json)" 'the live config really changed'
 assert_eq "1" "$(cat "$FIX/reload.count")" 'sing-box was reloaded exactly once'
@@ -322,7 +322,7 @@ touch "$FIX/fail-first"
 printf '0\n' > "$FIX/reload.count"
 BEFORE_SUM="$(sum /root/sbox/sbconfig_server.json)"
 R="$(e3_post /api/v1/clients/add "$KEY2" '{"name":"live-02"}')"
-assert_eq "E_ROLLED_BACK" "$(jqv "$R" '.code')" 'a failing reload reports E_ROLLED_BACK'
+assert_eq "E_ROLLED_BACK" "$(jqv "$R" '.code')" "a failing reload reports E_ROLLED_BACK (raw=[$R])" 
 assert_eq "true" "$(jqv "$R" '.retriable')" 'E_ROLLED_BACK is retriable'
 assert_eq "$BEFORE_SUM" "$(sum /root/sbox/sbconfig_server.json)" 'the rollback restored the live config byte-for-byte'
 rm -f "$FIX/fail-first"
