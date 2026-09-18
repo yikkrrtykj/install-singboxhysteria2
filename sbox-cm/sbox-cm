@@ -61,7 +61,7 @@ RESERVED_NAME = "legacy"
 OPS = {
     "management.status": {"required": (), "optional": (), "lock": False},
     "management.activate": {"required": (), "optional": ("actor",), "lock": True},
-    "management.deactivate": {"required": (), "optional": (), "lock": True},
+    "management.deactivate": {"required": (), "optional": ("actor",), "lock": True},
     "client.list": {"required": (), "optional": (), "lock": True},
     "client.add": {"required": ("name", "idempotency_key"),
                    "optional": ("actor",), "lock": True},
