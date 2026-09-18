@@ -3,8 +3,9 @@
 #
 # The phase hook (CM_TX_JOURNAL_HOOK) journals every commit phase BEFORE its
 # irreversible action -- critically BEFORE the mv in 'replace'. This suite does
-# NOT fabricate journal files: it kill -9s the shell at each phase boundary via
-# the hook itself, then verifies
+# NOT fabricate journal files: it kill -9s the shell at each journal phase
+# boundary (check / backup / replace / reload / health / rollback) via the hook
+# itself, then verifies
 #   * what the durable journal recorded at the instant of death,
 #   * what the disk (live config) did or did not change,
 #   * that the real worker's startup reconciliation converges the runtime to a
@@ -113,8 +114,8 @@ w_crash_hook() { # <phase> [backup_path]
     return 0
 }
 
-run_kill() { # <phase> -> sets J_PHASE J_BACKUP OLD_SUM NEW_DISK(bool)
-    local phase="$1" cand
+run_kill() { # <phase> [reload=ok|fail-all] -> sets J_PHASE J_BACKUP OLD_SUM NEW_SUM_EXPECTED
+    local phase="$1" reload="${2:-ok}" cand
     write_live
     clear_journal
     OLD_SUM="$(sum "$SB_SERVER_CONFIG")"
@@ -127,7 +128,9 @@ run_kill() { # <phase> -> sets J_PHASE J_BACKUP OLD_SUM NEW_DISK(bool)
     KILL_AT="$phase"
     # consumed inside lib/client-management.sh (same process)
     # shellcheck disable=SC2034
-    ( CM_TX_JOURNAL_HOOK=w_crash_hook; commit_server_config "$cand" "kill-test" ) >/dev/null 2>&1
+    ( export MOCK_RELOAD="$reload"
+      CM_TX_JOURNAL_HOOK=w_crash_hook
+      commit_server_config "$cand" "kill-test" ) >/dev/null 2>&1
     KILL_AT=""
     J_PHASE="$(jq -r '.phase // "none"' "$(journal_file)" 2>/dev/null)"
     J_BACKUP="$(jq -r '.backup_path // "null"' "$(journal_file)" 2>/dev/null)"
@@ -182,6 +185,29 @@ assert_eq false "$RES" 'reconcile refused to claim a proven-safe state'
 assert_eq "$OLD_SUM" "$(sum "$SB_SERVER_CONFIG")" 'reconcile restored the journal backup to disk'
 [ -f "$SB/state/degraded.json" ] && pass 'unprovable reconcile set the durable degraded flag' \
     || fail 'degraded flag missing after failed reconcile'
+
+# phase=rollback is killed with the reload ALREADY failed, i.e. after the mv:
+# the disk holds the NEW config and the rollback intent is only recorded in the
+# journal. Reconcile must converge the runtime onto what is on disk, and when
+# the runtime cannot be proven healthy it must restore the backup and degrade.
+printf '\n== kill -9 at phase=rollback (disk already replaced, rollback pending) ==\n'
+run_kill rollback fail-all
+assert_eq rollback "$J_PHASE" 'journal durably recorded phase=rollback at death'
+assert_ne null "$J_BACKUP" 'journal carries the backup that can undo the replaced config'
+assert_eq "$NEW_SUM_EXPECTED" "$(sum "$SB_SERVER_CONFIG")" 'live config IS the new one (the rollback had not run yet)'
+assert_eq true "$(converge_via_reconcile)" 'reconcile converged the runtime onto the config that is on disk'
+[ -f "$(journal_file)" ] && fail 'journal not cleared after proven-safe reconcile' \
+    || pass 'journal cleared after proven-safe reconcile'
+
+printf '\n== kill -9 at phase=rollback + reload still broken -> restore backup + degraded ==\n'
+run_kill rollback fail-all
+export MOCK_RELOAD=fail-all
+RES="$(converge_via_reconcile)"
+unset MOCK_RELOAD
+assert_eq false "$RES" 'reconcile refused to claim a proven-safe state'
+assert_eq "$OLD_SUM" "$(sum "$SB_SERVER_CONFIG")" 'reconcile restored the journal backup over the replaced config'
+[ -f "$SB/state/degraded.json" ] && pass 'unprovable rollback reconcile set the durable degraded flag' \
+    || fail 'degraded flag missing after failed rollback reconcile'
 
 clear_journal
 printf '\nPASS=%d FAIL=%d SKIP=%d\n' "$PASS" "$FAIL" "$SKIP"
