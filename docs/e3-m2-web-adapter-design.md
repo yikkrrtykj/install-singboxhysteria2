@@ -1,7 +1,8 @@
-# E3 M2 — Web 适配层设计（sbox-cm Web Adapter，rev1）
+# E3 M2 — Web 适配层设计（sbox-cm Web Adapter，rev2）
 
 ```text
-状态           : DESIGN FROZEN（方向批准 2026-09-19，待 G-review）
+状态           : DESIGN FROZEN（方向批准 2026-09-19；G-review #1 主体通过，
+                 rev2 并入 delta 修订，待 delta G-review）
 本文性质       : 设计文档 + 冻结裁决记录；本提交为 DOCS-ONLY
 实现面         : 本提交不含任何 M2 实现代码
 E3 MANAGEMENT  = NO（本文交付后仍保持默认安全态）
@@ -212,9 +213,9 @@ sbox-cm.service  User=root
 | 组件 | 文件（建议） | 职责 | 关键约束 |
 | --- | --- | --- | --- |
 | 传输客户端 | `monitor-v2/web/e3rpc.py` | 帧编解码、connect/收发、per-op 调用方预算、`E_TIMEOUT`/连接错误分类 | socket 路径 = 模块常量 `DEFAULT_E3_SOCKET_PATH="/run/sbox-cm/sbox-cm.sock"`；测试经构造器注入临时路径；**不新增 env key**（monitor-env.sh 六键面不扩大） |
-| broker | `monitor-v2/web/e3_broker.py` | status/list TTL 缓存、breaker 状态机、`management_active()` provider、`as_of` 时间戳 | 异常一律 fail-closed；见 §7 |
+| broker | `monitor-v2/web/e3_broker.py` | status/list TTL 缓存、breaker 状态机、`management_active()` provider、`as_of` 时间戳 | 异常一律 fail-closed；cache/breaker 全部 thread-safe；status/list 各自 single-flight；见 §7 |
 | mutation 转发 | `monitor-v2/web/e3_mutations.py` | 请求校验与组装、type-to-confirm 服务端复核、actor 指纹、白名单映射 | 不重试 mutation（S-1）；不落盘 |
-| 路由接线 | `server.py`（最小 diff） | 五条路由换实现/新增 list 路由；`management_active` provider 换 broker | M0.5 的门与 `MUTATION_ROUTES` 集合不变 |
+| 路由接线 | `server.py`（最小 diff） | 六个 HTTP endpoints（2 GET + 4 mutation POST）换实现/新增；`management_active` provider 换 broker | M0.5 的门与 `MUTATION_ROUTES` 集合不变 |
 | UI | `web/static/*`（最小 diff） | status 卡片、client 表、add/delete 确认流、uncertain/degraded 态 | §11 |
 
 `webapp.py` 接线：生产构造 `MonitorWebApp(..., e3_broker=E3Broker(E3RpcClient()))`；
@@ -234,16 +235,20 @@ TTL        : 2 s（冻结值）
 管理_active : True 当且仅当 缓存(或当次成功调用)的 management_active==true
               且 fetched_at 距今 ≤ TTL。
               TTL 过期且刷新失败 ⇒ management_active() == False（stale-active 绝不信任）。
-as_of      : 每个经 broker 的响应携带 as_of（UTC ISO8601），UI 据此展示"数据时点"。
-获取时机   : 惰性 + TTL（无后台线程；请求路径上过期即触发一次同步刷新，
-             刷新失败回退旧 payload 展示 + as_of 不变 + degraded 标记；
-             但 management_active() 的判定只认新鲜值，见上）。
+as_of      : 每个经 broker 的响应携带 as_of（UTC ISO8601）= 该 payload 的真实获取
+             时点；stale 期间保持原值不变（§7.5）。
+并发模型   : cache 与 breaker 全部 thread-safe（ThreadingHTTPServer 每请求一线程）。
+             status 与 list 各自 single-flight：同一 resource 并发最多一个 refresh
+             RPC；TTL 同时过期的并发请求只产生一次 helper RPC，其余等待同一结果
+             （成功共享新 snapshot，失败共享同一次失败判定），绝不 fan-out。
+transport  : fresh | stale | unavailable 三态（§7.5），与 helper degraded 严格分离。
 ```
 
 ### 7.2 client.list 展示缓存与删除预检
 
 ```text
 展示缓存 TTL : 5 s（冻结值）。仅用于列表展示。
+并发         : 与 status 同一 single-flight 模型，两者相互独立（§7.1）。
 删除预检     : 进入 destructive confirm 前必须绕过缓存强制拉一次 fresh list；
                fresh list 失败 ⇒ 不允许进入确认流程（UI 层）。
                delete 路由在派发 delete RPC 前再做一次同样的 fresh-list 预检
@@ -252,20 +257,30 @@ as_of      : 每个经 broker 的响应携带 as_of（UTC ISO8601），UI 据此
                重新验证（不存在 ⇒ E_NOT_FOUND；被重建/轮换 ⇒ E_RECONCILE_CONFLICT）。
 ```
 
-### 7.3 breaker（冻结：3 failures / 10s open / 1 half-open probe）
+### 7.3 breaker（冻结：3 failures / 10s open / 1 half-open probe；status-driven）
 
 ```text
-closed   --连续 3 次【传输层】失败--> open（10 s）
-open     --10 s 到期--> half-open（只放一个 status probe）
-half-open --probe 成功--> closed
-half-open --probe 失败--> open（重新计 10 s）
-
-计数范围 : 仅传输层失败 = connect 拒绝/超时、帧读写 I/O 错误、调用方预算耗尽。
-           协议层错误（helper 返回的 4xx/5xx 语义码，如 E_DUPLICATE_NAME、
-           E_ACTIVATION_STATE）【不】计数——那说明 helper 健康，只是本次操作不被允许。
-open 期间 : status/list ⇒ 503 e3_unavailable（附 as_of=最后成功时点，可展示旧值+横幅）；
-            management_active() ⇒ False；
-            mutation ⇒ 503 e3_unavailable，不派发（UI 整块退化为只读）。
+驱动（冻结修订）: breaker 只由 management.status 的 transport probe 驱动。
+                  counter = 连续失败的 status refresh 尝试；任一次成功即归零。
+                  list / mutation 的 transport 失败只作为该次请求的错误返回，
+                  【不】递增 global counter；mutation caller timeout ⇒
+                  result_unknown，绝不 poison breaker——这保证 result_unknown
+                  之后仍能立即通过 status / last_transaction 查询真实结果。
+迁移      : closed ----连续 3 次 status refresh 失败----> open（10 s）
+            open   ----10 s 到期后的下一个 status 请求----> half-open：
+                     全进程严格只允许一个 probe（由 single-flight 胜出者执行），
+                     其余并发请求按 open 语义处理、不发 RPC；
+            half-open --probe 成功--> closed（该次响应即 fresh）
+            half-open --probe 失败--> open（重新计 10 s）
+计数边界  : 仅传输层失败 = connect 拒绝/超时、帧读写 I/O 错误、status 预算耗尽。
+            协议层错误（helper 返回的 4xx/5xx 语义码，如 E_DUPLICATE_NAME、
+            E_ACTIVATION_STATE）【不】计数——那说明 helper 健康，只是本次操作不被允许。
+open 期间 : mutation ⇒ 503 e3_unavailable，不派发（UI 整块退化为只读）；
+            status ⇒ 有 snapshot 时返回 200 + transport=unavailable/stale，
+            附最后已知 payload + 原 as_of，management_active()=False
+            （绝不因 transport 失败伪造或改写任何 helper 字段，§7.5）；
+            完全无 snapshot ⇒ 503 e3_unavailable（绝不合成空数据）；
+            list ⇒ 同三态模型（仅展示）。
 ```
 
 ### 7.4 Web 侧背压（E-15，不充当全局锁）
@@ -273,6 +288,24 @@ open 期间 : status/list ⇒ 503 e3_unavailable（附 as_of=最后成功时点�
 进程内 mutation 信号量（建议 4 并发）+ 等待上限 30 s；等待超时 ⇒
 `503 e3_busy`（retriable）。作用仅是防止失联 helper 造成的线程堆积；真正的串行化
 始终是 helper 的 config.lock。
+
+### 7.5 helper degraded 与 Web transport state 严格分离（冻结修订）
+
+```text
+helper.degraded : 只能来自真实 management.status 响应中的 helper.degraded 字段。
+                  Web 禁止自行制造、覆盖或推导它——transport 失败不是 degraded。
+transport state : fresh（TTL 内成功获取）| stale（展示旧 snapshot，as_of 保持
+                  原获取时点）| unavailable（不存在任何可证明的 snapshot）。
+刷新失败        : 可返回 stale snapshot + 原 as_of 供展示；
+                  management_active() 一律 False（fresh-only 规则不变）；
+                  UI 横幅按 transport 呈现"数据时点 / helper 不可达"，
+                  绝不呈现为"helper degraded"。
+为什么必须分开口径: helper 不可达（transport 问题，可能只是重启/抖动/熔断）与
+                  helper 自报 degraded（调和无法证明安全态，特权面自身
+                  fail-closed、需 root 介入）是两类事件。混用会把一次网络抖动
+                  升级成"需要 root 修复"的错误告警，或把真 degraded 当成
+                  可等待的暂时故障——两边的运维动作完全不同。
+```
 
 ---
 
@@ -284,8 +317,9 @@ per-op 预算见 §4 表。实现上 = `e3rpc` 对 socket I/O 的总预算（ co
 
 | 场景 | Web 行为 |
 | --- | --- |
-| read-only（status/list）预算耗尽 | 计入 breaker 传输失败；`503 e3_unavailable` |
-| mutation 预算耗尽 | **不计入 breaker？——计入**（属于传输层不确定）；响应 `504 result_unknown`（retriable=true + `uncertain:true` 标记）；UI 按 S-1 呈现"结果未知"；**禁止自动重试、禁止换 key** |
+| status 预算耗尽 | 属于 breaker 的 status transport 失败：计数（§7.3）；该次请求按 §7.3 open/half-open 语义返回（`503 e3_unavailable` 或 stale snapshot） |
+| list 预算耗尽 | 仅该次请求 `503 e3_unavailable`；【不】递增 breaker counter（status-driven，§7.3） |
+| mutation 预算耗尽 | **绝不计入/毒化 breaker**（status-driven，§7.3）；响应 `504 result_unknown`（retriable=true + `uncertain:true` 标记）；UI 按 S-1 呈现"结果未知"；**禁止自动重试、禁止换 key** |
 | helper 返回 `E_TIMEOUT`（帧读取超时） | 透传映射 504（rev5 §2.6 原表；ERRATA 后语义 = 5 s 帧读取超时） |
 | deactivate 遇到旧 helper `E_SCHEMA` | 原样映射 400，UI 提示 helper 版本过旧（不自动重试） |
 
@@ -311,7 +345,7 @@ per-op 预算见 §4 表。实现上 = `e3rpc` 对 socket I/O 的总预算（ co
 status  : management_state, management_active, helper.degraded, helper.reconcile,
           lock.acquirable,                       # lock.path 排除（root 路径）
           last_transaction.{generation, op, outcome, ended_at}
-          + Web 附加: monitor_running, as_of
+          + Web 附加: monitor_running, as_of, transport(fresh|stale|unavailable)
 list    : clients[].{name, protocols, reserved, mutable, source}, truncated + as_of
 add     : name, protocols, mutable, source, yaml_available, credential_delivery,
           warnings                              # 不含凭据（helper 本就不返回）
@@ -328,8 +362,13 @@ activate/deactivate : management_state, no_op（以 M1 实际返回为准）
 
 ```text
 request_id      : 每次物理 RPC 尝试新生成（"web-" + uuid4，≤64 字节，匹配 helper 正则）
-idempotency_key : 用户动作发起时生成一次（同规则），存于确认流状态（浏览器侧）；
-                  401 step-up 重放与"结果未知后重试"必须携带同一 key（E-6 / S-1）
+idempotency_key : client.add / client.delete 经 HTTP 【Idempotency-Key header】送达
+                  （冻结修订：单一来源，body 不携带第二份 key）。Web 校验
+                  16..128 ASCII [A-Za-z0-9._:-] 后【原样】映射为 helper JSON
+                  的 idempotency_key 字段；缺失/非法 ⇒ 400 invalid_idempotency_key
+                  （不派发 RPC）。401 step-up 重放与 result_unknown 后用户显式
+                  重试必须复用同一 header 值（Browser 确认流状态持有至请求终态）；
+                  request_id 仍在每个物理 RPC attempt 重新生成（上行规则不变）。
 actor           : {session_fp, stepup_fp}——见 §12 指纹派生；仅 activate/add/delete/
                   （M2-A0 后的）deactivate 携带
 name / confirm  : name 双层校验（Web 正则 + legacy 拒绝，helper 再校验）；
@@ -347,10 +386,11 @@ helper 错误码 → HTTP 按 rev5 §2.6 原表透传（`E_LOCK`→423、`E_DUPL
 
 | code | HTTP | retriable | 语义 |
 | --- | --- | --- | --- |
-| `e3_unavailable` | 503 | true | breaker open / connect 失败（读路径与 mutation 派发前拒绝） |
+| `e3_unavailable` | 503 | true | helper 不可达且无可服务 snapshot（mutation 派发前拒绝； breaker open 时 mutation 一律此码）；status/list 有 snapshot 时按 §7.3/§7.5 返回 stale 而非本码 |
 | `list_unavailable` | 503 | true | delete 预检 fresh-list 失败（未派发 delete） |
 | `e3_busy` | 503 | true | 进程内背压等待超时（E-15） |
-| `result_unknown` | 504 | true | mutation 调用方预算耗尽；`uncertain:true`；UI 呈现"结果未知"（S-1） |
+| `result_unknown` | 504 | true | mutation 调用方预算耗尽；`uncertain:true`；UI 呈现"结果未知"（S-1）；不计入 breaker |
+| `invalid_idempotency_key` | 400 | false | Idempotency-Key header 缺失/非法（§9；未派发 RPC） |
 
 两条特殊 UX 映射（E-14）：
 
@@ -371,13 +411,18 @@ U-1 危险操作明示（E-14）: add/delete/activate/deactivate 前后果明示
 U-2 type-to-confirm     : delete 需逐字回显 name；服务端复核 confirm==name，
                           不相等 ⇒ 400 confirm_mismatch（不能只靠前端）。
 U-3 step-up 挂钩        : 401 reauth_required ⇒ 弹密码框 ⇒ 成功后自动重放原请求，
-                          confirm 与 idempotency_key 不变（E-6）。step-up 端点、
-                          TTL、五类吊销语义全部沿用 M0.5 实现，M2 不改。
+                          confirm 与 Idempotency-Key header 值不变（E-6）。
+                          step-up 端点、TTL、五类吊销语义全部沿用 M0.5 实现，
+                          M2 仅扩展 step_up 记录字段（§12 S-A），不改吊销语义。
 U-4 uncertain 态        : result_unknown ⇒ 非失败横幅 + "结果未知" + 指向 status 的
                           last_transaction + （可选）"用同一 key 重试"按钮。
-U-5 degraded 态         : status.helper.degraded==true ⇒ 全局横幅"特权助手处于
-                          degraded，变更被拒绝，需 root 恢复"；mutation 控件禁用。
-U-6 breaker/离线态      : e3_unavailable ⇒ 管理块退化为只读 + "数据时点 as_of"。
+U-5 degraded 态         : status.helper.degraded==true（且该值来自真实 status
+                          响应，§7.5）⇒ 全局横幅"特权助手处于 degraded，变更被
+                          拒绝，需 root 恢复"；mutation 控件禁用。
+U-6 transport 态         : stale ⇒ "数据时点 as_of" 横幅（可继续浏览，mutation
+                          控件按 §7.5 fresh-only 规则处理）；unavailable ⇒ 管理
+                          块退化为只读 + "helper 不可达"横幅。两者【绝不】显示为
+                          "helper degraded"。
 U-7 legacy              : 列表中 reserved:true, mutable:false 仅展示；add 名为 legacy
                           与对 legacy 的 delete 在 Web 层直接拒绝（E-7 双层防御的
                           Web 侧）。
@@ -390,11 +435,21 @@ U-8 凭据交付            : add 成功 ⇒ "已创建；凭据请在服务器�
 ## 12. 安全边界
 
 ```text
-S-A 指纹派生  : session_fp = sha256(session_token)[:16 hex]；
-                stepup_fp  = sha256(session_token + ":" + str(stepup_granted_at))[:16]，
-                在 grant 时算好存于内存 session 的 step_up 记录中，窗口内复用
-                （同一窗口的审计可归因）。指纹单向、不可还原 token；
-                helper 侧按 FP_RE 校验、仅作审计归因（S-2 rev5）。
+S-A 指纹派生与生命周期（M2 对 SessionStore 的进程内存态扩展）:
+  现状   : M0.5 SessionStore 的 step_up 仅含 expires_at——没有 granted_at / fp；
+           这两项是 M2 的内存态扩展，不持久化、不进任何存储文件。
+  grant  : 成功 grant 时同时写入 step_up_granted_at 与 stepup_fp；
+           stepup_fp = sha256(session_token + ":" + str(step_up_granted_at))[:16 hex]。
+  复用   : 同一 window 内所有 mutation 复用同一 stepup_fp（审计可归因）。
+  轮换   : 下一次 grant（含窗口过期后重新 step-up）必须生成新 granted_at ⇒ 新 fp。
+  吊销   : 既有五类吊销（logout / password / recovery reset / recovery rotate /
+           session TTL 过期；web 进程重启为既有事实）必须把 expires、granted_at、
+           stepup_fp 三元组【同时】清除——不允许残留可复用的 fp。
+  暴露面 : stepup_fp 与 step_up_granted_at 绝不出现在任何 HTTP 响应/UI；
+           仅随 RPC actor 字段发往 helper 做审计归因。
+           session_fp 仍 = sha256(session_token)[:16]，随 session 生命周期。
+           指纹单向、不可还原 token；helper 侧按 FP_RE 校验、仅作审计归因
+           （S-2 rev5）。
 S-B helper 永不接收 : 密码、恢复密钥、session cookie、CSRF token、URL、原始身份
                 （rev5 §5.3 S-2 全文继承；M2 代码结构上使这些值根本到不了 e3rpc 层）。
 S-C 日志卫生  : Web 侧新增日志/异常路径不得记录凭据、token、key 明文；
@@ -442,11 +497,22 @@ T-1 API 契约测试（mock helper，真实 AF_UNIX + 真实帧格式）
     错误映射全表（§10）与 retriable 透传；breaker 三态迁移与计数边界
     （协议错误不计数）；2s/5s TTL 与 as_of；stale-active 永不信任（TTL 过期+
     刷新失败 ⇒ provider=False）；delete 预检（fresh 失败 ⇒ 不派发）；
-    idempotency_key 跨 401 重放不变；type-to-confirm 服务端复核；
+    Idempotency-Key header 跨 401 重放不变；type-to-confirm 服务端复核；
     name/legacy 双层拒绝；白名单（lock.path / error.backup 永不出现于响应）；
     request_id 每次尝试新生成；deactivate actor 透传（M2-A0 后）。
+    并发断言 : 20 线程同时触发过期 TTL 刷新 ⇒ 恰好 1 次 helper RPC
+               （status 与 list 各测一组）；half-open 并发 ⇒ 恰好 1 个 status
+               probe、其余请求不产生 RPC；cache/breaker 并发压测无 torn state。
+    breaker 断言 : counter 仅由 status transport 失败驱动；list/mutation 失败
+               （含 caller timeout ⇒ result_unknown）后 counter 与状态不变。
+    header 断言 : Idempotency-Key 缺失/非法 ⇒ 400 invalid_idempotency_key 且
+               不派发 RPC；重放复用同一 header 值。
 T-2 既有回归必须全绿 : test-monitor-v2-m05.sh（T1–T12，含更新后的 T12 契约）、
     test-monitor-v2-e2.sh、test-platform 无关项不触碰（注意：M2 只动 monitor-v2）。
+T-2b M0.5 auth regression（M2 扩展）: 五类吊销事件各自断言 step_up 的
+    expires / granted_at / stepup_fp 同时清除；grant 轮换产生新 fp；
+    全部 HTTP 响应不含 stepup_fp / step_up_granted_at；
+    management_active provider 在无 helper 注入时仍 fail-closed False。
 T-3 卫生负向扫描 : 新代码路径无凭据泄漏面；journald/Web 日志 fixture 脱敏。
 T-4 live 闸门（M2-E）: 真实 singbox-monitor.service + 真实 sbox-cm.socket：
     status → list → add（注入首次 reload 失败 ⇒ rollback 路径）→ delete →
@@ -464,7 +530,7 @@ T-5 CI 纪律 : 沿用 B-5 结论——验收只认原始日志 summary，step �
 | --- | --- | --- |
 | **M2-A0** | daemon `OPS` deactivate + actor（单行）+ 契约测试 | M1 全套回归三基线原始日志 `FAIL=0`，B-5 真实执行 `SKIP=0` |
 | **M2-B** | `e3rpc` + broker（TTL/breaker/provider）+ webapp 接线 | T-1 契约测试全绿 + M0.5/E2 回归全绿 |
-| **M2-C** | 五条路由 + 错误映射 + 白名单 | T-1 全绿；字符串禁令扫描通过 |
+| **M2-C** | 六个 HTTP endpoints（2 GET + 4 mutation POST）+ 错误映射 + 白名单 | T-1 全绿；字符串禁令扫描通过 |
 | **M2-D** | UI（status 卡 / client 表 / 确认流 / 三态横幅） | API 层断言 + 静态断言（UI 逻辑保持薄，浏览器侧无新框架） |
 | **M2-E** | unit carve-out + live 联测套件 | T-4 原始日志三基线（或至少两基线 + 22.04）真实 `E3_M2_LIVE=PASS` |
 
@@ -472,7 +538,11 @@ T-5 CI 纪律 : 沿用 B-5 结论——验收只认原始日志 summary，step �
 M2 COMPLETE 当且仅当 : A0–E 全部闸门绿 + 文档收口（本文 rev2 记录实测结果）
                        + E3 MANAGEMENT ENABLED 仍 = NO
                        + PRODUCTION DEPLOYED 仍 = NO
-回滚方式             : web 侧功能开关回退 ⇒ 界面回只读（rev5 M2 行的回滚承诺）；
+回滚方式             : 代码级回滚——revert M2 路由接线 commit 即恢复 M0.5 的
+                       501 mutation boundary（管理面回"只读展示、变更不可达"）；
+                       不存在、也不引入 runtime config/env feature flag。
+                       rev5"web 侧熔断 ⇒ 界面回只读"的承诺由 §7.3 breaker 的
+                       运行时行为达成（helper 缺席/熔断即只读），不需要开关；
                        helper 侧 A0 为可选字段，向后兼容，可独立回退。
 ```
 
@@ -513,5 +583,29 @@ M2 COMPLETE 当且仅当 : A0–E 全部闸门绿 + 文档收口（本文 rev2 �
 ## 18. G-review 记录
 
 ```text
-（待 G-review 后回填：结论、修订项、批准人/日期）
+2026-09-19  G-review #1（rev1）: 主体方向通过；以下 delta 修订项已在 rev2 并入：
+            1. broker 并发合同：cache/breaker thread-safe；status/list 各自
+               single-flight；并发 TTL 过期不产生 RPC fan-out；half-open 全进程
+               严格单 probe；T-1 增加并发断言（20 线程 ⇒ 1 次 RPC）。
+            2. helper degraded 与 Web transport state（fresh|stale|unavailable）
+               严格分离（§7.5）：degraded 只来自真实 status 响应；刷新失败可返回
+               stale + 原 as_of 但 management_active=False；"helper 不可达"
+               绝不描述/呈现为 degraded。
+            3. stepup_fp 生命周期补全（§12 S-A）：SessionStore 内存态扩展
+               granted_at + fp；grant 创建、窗口内复用、再 grant 必换新；
+               五类吊销同时清 expires/granted_at/fp；不暴露 Browser；
+               T-2b auth regression。
+            4. Idempotency-Key 冻结为 HTTP header（§9）：Web 校验后原样映射
+               helper idempotency_key；body 不再设计第二份 key；重放/显式重试
+               复用同一 header 值；request_id 每物理 attempt 重新生成。
+            5. breaker 改为 status-driven（§7.3）：counter/迁移只由
+               management.status transport probe 驱动；list/mutation 失败返回
+               本次错误但不递增 counter；mutation caller timeout ⇒
+               result_unknown，绝不 poison breaker；open 仍拒绝新 mutation；
+               half-open 单 probe；open 期间 status 可返回 stale snapshot
+               （保住 uncertain 后的 last_transaction 查询通道）。
+            文字修正：路由计数统一为"六个 HTTP endpoints（2 GET + 4 mutation
+            POST）"；完成定义回滚方式改为明确的 code rollback / 恢复 501
+            boundary（不存在 feature flag）。
+（delta G-review 结论待回填）
 ```
