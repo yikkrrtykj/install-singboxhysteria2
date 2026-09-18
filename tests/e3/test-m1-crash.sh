@@ -125,6 +125,8 @@ run_kill() { # <phase> -> sets J_PHASE J_BACKUP OLD_SUM NEW_DISK(bool)
 ]}\n' > "$cand"
     NEW_SUM_EXPECTED="$(sum "$cand")"
     KILL_AT="$phase"
+    # consumed inside lib/client-management.sh (same process)
+    # shellcheck disable=SC2034
     ( CM_TX_JOURNAL_HOOK=w_crash_hook; commit_server_config "$cand" "kill-test" ) >/dev/null 2>&1
     KILL_AT=""
     J_PHASE="$(jq -r '.phase // "none"' "$(journal_file)" 2>/dev/null)"

@@ -449,6 +449,8 @@ _add_locked() {
     cm_journal_write "$REQ_ID" "client.add" "candidate" "" "$GEN" || true
 
     # ---- commit (the one canonical engine, with the durable phase hook) ----
+    # consumed inside lib/client-management.sh (same process)
+    # shellcheck disable=SC2034
     CM_TX_JOURNAL_HOOK=w_journal_hook
     if commit_server_config "$candidate" "client.add $NAME"; then
         local data
@@ -582,6 +584,8 @@ _delete_locked() {
     fi
     cm_journal_write "$REQ_ID" "client.delete" "candidate" "" "$GEN" || true
 
+    # consumed inside lib/client-management.sh (same process)
+    # shellcheck disable=SC2034
     CM_TX_JOURNAL_HOOK=w_journal_hook
     if commit_server_config "$candidate" "client.delete $NAME"; then
         local derived=true
