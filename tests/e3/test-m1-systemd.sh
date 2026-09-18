@@ -205,13 +205,15 @@ Description=mock sing-box (E3 M1 B-5 fixture)
 [Service]
 Type=simple
 ExecStart=/bin/sleep infinity
-ExecReload=/bin/sh -c 'if [ -f $FIX/fail-first ] && [ \$(cat $FIX/reload.count 2>/dev/null || echo 0) -eq 0 ]; then echo 1 > $FIX/reload.count; exit 1; fi; n=\$((\$(cat $FIX/reload.count 2>/dev/null || echo 0)+1)); echo \$n > $FIX/reload.count'
+ExecReload=/bin/sh -c 'n=\$(cat $FIX/reload.count 2>/dev/null); n=\${n:-0}; if [ -f $FIX/fail-first ] && [ "\$n" -eq 0 ]; then echo 1 > $FIX/reload.count; exit 1; fi; echo \$((n+1)) > $FIX/reload.count'
 [Install]
 WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
 systemctl enable --now sing-box >/dev/null 2>&1
-: > "$FIX/reload.count"
+# "0", not an empty file: the reload counter is compared arithmetically, and an
+# empty counter made the fail-first injection below silently not fire.
+printf '0\n' > "$FIX/reload.count"
 
 # The ONE RPC client: connects as the INVOKING user (sudo -u <user>), so the
 # PEERCRED uid is exactly the user we want to test. A call that never reached
@@ -260,6 +262,10 @@ rpc(){ # <user> <request-json> -> response JSON
     sudo -u "$1" /usr/bin/python3 "$PY_PROBE" "$2" 2>/dev/null
 }
 jqv(){ printf '%s' "$1" | jq -r "$2" 2>/dev/null; }
+# Deliberately separate from jqv(): only the probe's own diagnostic key is
+# tested for absence here, and jq's `//` operator would also collapse a
+# legitimate JSON `false` (e.g. idempotency.replayed) to empty.
+probe_err(){ printf '%s' "$1" | jq -r '.probe_error? // empty' 2>/dev/null; }
 sum(){ sha256sum "$1" 2>/dev/null | awk '{print $1}'; }
 reload_count(){ cat "$FIX/reload.count" 2>/dev/null || printf 0; }
 
@@ -276,17 +282,39 @@ assert_eq 'root sboxweb' "$(stat -c '%U %G' "$SOCK")" 'socket owner is root:sbox
 assert_eq '660' "$(stat -c '%a' "$SOCK")" 'socket mode is 0660'
 
 # --------------------------------------------------- B8: ownership fail-closed --
+# `failed` is NOT a reachable steady state here, so the old `systemctl is-failed`
+# sample could never have been right. Restart=on-failure with RestartSec=2s
+# restarts the daemon every ~2.2s, which sits just under the default
+# 5-starts-per-10s limiter: the unit oscillates in activating/auto-restart for
+# as long as the failure persists (CI observed the restart counter past 29 while
+# nothing was ever served). Assert the fail-closed BEHAVIOUR instead, with a
+# bounded wait for the evidence rather than for a state that never arrives:
+#   * the daemon exits with a failure code (Result=exit-code) instead of running,
+#   * its own journal attributes the refusal to the state directory,
+#   * it never reaches its listener, so the privileged plane serves nothing.
 systemctl stop sbox-cm.service 2>/dev/null
+LISTEN_BEFORE="$(journalctl -u sbox-cm.service --no-pager 2>/dev/null | grep -c 'listening on' || true)"
 chown 1001:1001 "$STATE"
 systemctl start sbox-cm.service >/dev/null 2>&1
-# The unit carries Restart=on-failure, so a failing start is first reported as
-# `activating` (SubState=auto-restart) and only becomes permanently `failed`
-# once the start limit trips. Wait for the stable state, then assert on it.
-if wait_unit_state sbox-cm.service failed 60; then
-    pass 'a non-root-owned state dir makes the daemon FAIL to start (B8 fail-closed)'
+B8_RESULT=""; B8_STATUS=""
+for _ in $(seq 1 200); do
+    B8_RESULT="$(systemctl show -p Result --value sbox-cm.service 2>/dev/null)"
+    B8_STATUS="$(systemctl show -p ExecMainStatus --value sbox-cm.service 2>/dev/null)"
+    if [ "$B8_RESULT" = "exit-code" ] && [ -n "$B8_STATUS" ] && [ "$B8_STATUS" != "0" ]; then
+        break
+    fi
+    sleep 0.1
+done
+assert_eq exit-code "$B8_RESULT" 'a non-root-owned state dir makes the daemon fail closed instead of running (Result=exit-code)'
+assert_ne 0 "${B8_STATUS:-unset}" "the daemon refused to run on a non-root-owned state dir (ExecMainStatus=[${B8_STATUS:-unset}])"
+if journalctl -u sbox-cm.service --no-pager 2>/dev/null | grep -qi 'state dir'; then
+    pass 'the daemon blames the state directory itself (B8 owner check), not an unrelated failure [detail: '"$(unit_detail sbox-cm.service)"']'
 else
-    fail "a non-root-owned state dir must make the daemon FAIL to start (B8): still [$(unit_detail sbox-cm.service)] after 60s"
+    fail "the daemon journal does not attribute the refusal to the state directory: [$(unit_detail sbox-cm.service)]"
 fi
+LISTEN_AFTER="$(journalctl -u sbox-cm.service --no-pager 2>/dev/null | grep -c 'listening on' || true)"
+assert_eq "$LISTEN_BEFORE" "$LISTEN_AFTER" 'the daemon never even reached its listener while the state dir was not root-owned'
+
 systemctl reset-failed sbox-cm.service 2>/dev/null
 chown root:root "$STATE"
 systemctl start sbox-cm.service >/dev/null 2>&1
@@ -303,7 +331,7 @@ fi
 READY_JSON=""
 for _ in $(seq 1 300); do
     o="$(rpc "$AXE_USER" '{"v":"e3-rpc/1","request_id":"reqid-live-ready001","op":"management.status"}')"
-    if [ -n "$o" ] && [ -z "$(jqv "$o" '.probe_error')" ]; then
+    if [ -n "$o" ] && [ -z "$(probe_err "$o")" ]; then
         READY_JSON="$o"
         break
     fi
@@ -323,8 +351,8 @@ else
 fi
 
 o="$(rpc "$PEER_USER" '{"v":"e3-rpc/1","request_id":"reqid-peer-other0001","op":"management.status"}')"
-if [ -n "$(jqv "$o" '.probe_error')" ]; then
-    fail "the peer-test call never reached the daemon (probe said: $(jqv "$o" '.probe_error')) -- a call refused by the socket's DAC cannot prove SO_PEERCRED"
+if [ -n "$(probe_err "$o")" ]; then
+    fail "the peer-test call never reached the daemon (probe said: $(probe_err "$o")) -- a call refused by the socket's DAC cannot prove SO_PEERCRED"
 else
     assert_eq E_PEER_AUTH "$(jqv "$o" '.error.code')" 'an unrelated uid that already passed socket DAC is rejected at SO_PEERCRED'
 fi
@@ -363,7 +391,7 @@ assert_eq inactive "$(jqv "$(rpc "$AXE_USER" '{"v":"e3-rpc/1","request_id":"reqi
 systemctl start sbox-cm.service >/dev/null 2>&1
 rpc "$AXE_USER" '{"v":"e3-rpc/1","request_id":"reqid-live-activate2","op":"management.activate"}' >/dev/null
 touch "$FIX/fail-first"
-: > "$FIX/reload.count"
+printf '0\n' > "$FIX/reload.count"
 BEFORE_SUM="$(sum "$SBROOT/sbconfig_server.json")"
 o="$(rpc "$AXE_USER" '{"v":"e3-rpc/1","request_id":"reqid-live-rlbk0001","name":"live-02","idempotency_key":"live-key-00000003","op":"client.add"}')"
 rm -f "$FIX/fail-first"
