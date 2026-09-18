@@ -110,6 +110,12 @@
       // Attach to EVERY mutation, including body-less ones (logout).
       init.headers["X-CSRF-Token"] = state.session.csrf_token;
     }
+    if (options.idempotencyKey !== undefined) {
+      // M2: the Idempotency-Key travels ONLY as this header. The caller
+      // keeps the SAME value across a 401 step-up replay and an explicit
+      // post-uncertain retry (the replay re-sends the whole options object).
+      init.headers["Idempotency-Key"] = options.idempotencyKey;
+    }
     if (options.body !== undefined) {
       init.headers["Content-Type"] = "application/json";
       init.body = JSON.stringify(options.body);
@@ -119,7 +125,13 @@
         if (!response.ok) {
           var error = new Error(data.error || ("HTTP " + response.status));
           error.status = response.status;
-          error.code = data.error;   // stable machine code, e.g. reauth_required
+          // stable machine code: M0.5 endpoints use {"error": code}; M2 E3
+          // endpoints use {"code": code, "error": detail}
+          error.code = data.code || data.error;
+          error.detail = data.error;
+          error.retriable = data.retriable === true;
+          error.uncertain = data.uncertain === true;
+          error.recovery = data.recovery || null;
           throw error;
         }
         return data;
@@ -221,7 +233,11 @@
       item.classList.toggle("active", item.getAttribute("data-view") === name);
     });
     $("view-title").textContent = VIEW_TITLES[name];
-    if (name === "settings") loadAccess();
+    if (name === "settings") {
+      loadAccess();
+      loadE3Status();
+      loadE3Clients();
+    }
   }
 
   /* ---------- rendering ---------- */
@@ -440,24 +456,235 @@
     show(el);
   }
 
-  function managementMutation(path, onSuccessMessage) {
-    // The privileged backend is not part of this milestone, so a successful
-    // authorization ends in an explicit 501. What matters here is the gate:
-    // 401 reauth_required opens the password panel and replays the request.
+  function managementMutation(path, successMessage) {
+    // M2: the mutation runs inside the root helper. A 501 can no longer
+    // happen; the interesting outcomes are success, E_RECONCILE_CONFLICT
+    // (never silently retried) and result_unknown (the caller budget
+    // expired AFTER dispatch — the transaction keeps running server-side,
+    // so there is deliberately NO automatic retry and NO new key).
     apiWithStepUp(path, { method: "POST", body: {} })
       .then(function () {
-        mgMessage(onSuccessMessage, false);
+        mgMessage(successMessage, false);
         loadSession();
+        loadE3Status();
       })
       .catch(function (error) {
-        if (error.status === 501) {
-          mgMessage("Authorized. The privileged backend is not part of this " +
-                    "build yet.", false);
+        if (error.status === 504 && error.uncertain) {
+          mgMessage("Result unknown: the request was dispatched and the " +
+                    "transaction is still running inside the privileged " +
+                    "helper (or has finished). Check the management state " +
+                    "below before doing anything else; this request was " +
+                    "NOT retried.", true);
           loadSession();
+          loadE3Status();
           return;
         }
-        mgMessage(error.message, true);
+        if (error.code === "E_RECONCILE_CONFLICT") {
+          mgMessage("Server state changed while the request was in flight. " +
+                    "Refresh and re-check before operating again — this " +
+                    "request was not retried.", true);
+          loadSession();
+          loadE3Status();
+          return;
+        }
+        if (error.code === "E_MANUAL_INTERVENTION") {
+          mgMessage("The privileged helper is degraded and refuses every " +
+                    "mutation until a root operator recovers it.", true);
+          loadE3Status();
+          return;
+        }
+        mgMessage(error.detail || error.message, error.status >= 400);
+        loadSession();
+        loadE3Status();
       });
+  }
+
+  /* ---------- E3 client management (privileged mutations) ---------- */
+
+  function newIdempotencyKey() {
+    // 32 hex chars from CSPRNG — matches the helper's key charset.
+    var bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    return Array.prototype.map.call(bytes, function (b) {
+      return ("0" + b.toString(16)).slice(-2);
+    }).join("");
+  }
+
+  function e3Message(text, isError) {
+    var el = $("e3-msg");
+    el.textContent = text;
+    el.className = "form-msg " + (isError ? "error" : "ok");
+    show(el);
+  }
+
+  function loadE3Status() {
+    if (!state.session || !state.session.authenticated) return;
+    api("/api/v1/management/status").then(function (data) {
+      state.e3Status = data;
+      renderE3Status(data);
+    }).catch(function () {
+      setBadge($("mg-transport"), "unavailable", "idle");
+      $("mg-asof").textContent = "—";
+    });
+  }
+
+  function renderE3Status(data) {
+    var stateName = data.data ? data.data.management_state : null;
+    var armed = stateName === "active";
+    var staleState = stateName === "active_stale";
+    setBadge($("mg-manage"),
+             staleState ? "active_stale" : (armed ? "active" : "inactive"),
+             staleState ? "error" : (armed ? "recent" : "idle"));
+    var transport = data.transport || "unavailable";
+    var cls = transport === "fresh" ? "ok"
+            : (transport === "stale" ? "recent" : "idle");
+    setBadge($("mg-transport"), transport, cls);
+    $("mg-asof").textContent = data.as_of || "—";
+    var degraded = data.data && data.data.helper &&
+                   data.data.helper.degraded === true;
+    if (degraded) { show($("mg-degraded")); } else { hide($("mg-degraded")); }
+    // The mutation plane badge is driven by the helper's own status, so the
+    // activate/deactivate buttons follow the real plane, not a stale view.
+    $("mg-activate").disabled = armed;
+    $("mg-deactivate").disabled = !armed;
+  }
+
+  function loadE3Clients() {
+    if (!state.session || !state.session.authenticated) return;
+    api("/api/v1/clients").then(function (data) {
+      state.e3Clients = data;
+      renderE3Clients(data);
+    }).catch(function (error) {
+      var body = $("e3-clients-body");
+      body.innerHTML = "";
+      var row = body.insertRow(-1);
+      var cell = row.insertCell(-1);
+      cell.colSpan = 5;
+      cell.textContent = "Client list unavailable (" +
+                         (data.transport || "unavailable") + ").";
+    });
+  }
+
+  function renderE3Clients(data) {
+    var body = $("e3-clients-body");
+    body.innerHTML = "";
+    var clients = (data.data && data.data.clients) || [];
+    clients.forEach(function (client) {
+      var row = body.insertRow(-1);
+      row.insertCell(-1).textContent = client.name;
+      row.insertCell(-1).textContent = (client.protocols || []).join(", ");
+      row.insertCell(-1).textContent = client.mutable ? "yes" : "no";
+      row.insertCell(-1).textContent = client.source;
+      var actions = row.insertCell(-1);
+      if (client.mutable) {
+        var btn = document.createElement("button");
+        btn.className = "btn ghost";
+        btn.type = "button";
+        btn.textContent = "Delete";
+        btn.addEventListener("click", function () {
+          beginDeleteClient(client.name);
+        });
+        actions.appendChild(btn);
+      }
+    });
+    if (!clients.length) {
+      var row = body.insertRow(-1);
+      var cell = row.insertCell(-1);
+      cell.colSpan = 5;
+      cell.textContent = "No clients known to the helper yet.";
+    }
+  }
+
+  function beginDeleteClient(name) {
+    // Fresh-list preflight happens again server-side right before the
+    // delete; the confirm box here is the type-to-confirm UX (U-2).
+    $("e3-del-name").textContent = name;
+    $("e3-del-confirm").value = "";
+    show($("e3-delete-box"));
+    $("e3-del-confirm").focus();
+    $("e3-del-btn").setAttribute("data-name", name);
+    e3Message("", false);
+    hide($("e3-msg"));
+  }
+
+  function deleteClient(name) {
+    var key = newIdempotencyKey();
+    // The SAME Idempotency-Key is kept for any explicit retry of THIS
+    // delete after an uncertain result; the retry never generates a new key.
+    apiWithStepUp("/api/v1/clients/delete", {
+      method: "POST",
+      idempotencyKey: key,
+      body: { name: name, confirm: name }
+    }).then(function () {
+      hide($("e3-delete-box"));
+      e3Message("Client deleted. The helper reloaded sing-box.", false);
+      loadSession();
+      loadE3Clients();
+      loadE3Status();
+    }).catch(function (error) {
+      if (error.status === 504 && error.uncertain) {
+        e3Message("Result unknown: the delete was dispatched and the " +
+                  "transaction is still running (or has finished) inside " +
+                  "the helper. Refresh the list below to see the real " +
+                  "state; a retry must reuse the SAME key and is only safe " +
+                  "after you re-checked the list.", true);
+        loadE3Clients();
+        loadE3Status();
+        return;
+      }
+      if (error.code === "E_RECONCILE_CONFLICT") {
+        e3Message("Server state changed: the client was rebuilt or rotated " +
+                  "in the meantime. Refresh and re-check — the delete was " +
+                  "not retried.", true);
+        loadE3Clients();
+        return;
+      }
+      if (error.code === "E_NOT_FOUND") {
+        e3Message("The client is not in the fresh server list; nothing was " +
+                  "deleted.", true);
+        loadE3Clients();
+        return;
+      }
+      e3Message(error.detail || error.message, true);
+      loadE3Clients();
+    });
+  }
+
+  function addClient(name) {
+    var key = newIdempotencyKey();
+    apiWithStepUp("/api/v1/clients/add", {
+      method: "POST",
+      idempotencyKey: key,
+      body: { name: name }
+    }).then(function (data) {
+      e3Message("Client created. Credentials / client configuration are " +
+                "NOT returned through the web UI — generate the client " +
+                "configuration on the server with the client-management CLI.",
+                false);
+      $("e3-add-name").value = "";
+      loadE3Clients();
+      loadE3Status();
+    }).catch(function (error) {
+      if (error.status === 504 && error.uncertain) {
+        e3Message("Result unknown: the add was dispatched and the " +
+                  "transaction is still running (or has finished) inside " +
+                  "the helper. Refresh the list to see the real state; a " +
+                  "retry must reuse the SAME key and is only safe after " +
+                  "you re-checked the list.", true);
+        loadE3Clients();
+        loadE3Status();
+        return;
+      }
+      if (error.code === "E_RECONCILE_CONFLICT") {
+        e3Message("Server state changed while the request was in flight. " +
+                  "Refresh and re-check — this request was not retried.",
+                  true);
+        loadE3Clients();
+        return;
+      }
+      e3Message(error.detail || error.message, true);
+      loadE3Clients();
+    });
   }
 
   /* ---------- settings: access control ---------- */
@@ -736,11 +963,40 @@
     $("rec-rotate-btn").addEventListener("click", rotateRecovery);
     $("mg-activate").addEventListener("click", function () {
       managementMutation("/api/v1/management/activate",
-                         "Management activation was authorized.");
+                         "Management plane activated by the privileged helper.");
     });
     $("mg-deactivate").addEventListener("click", function () {
       managementMutation("/api/v1/management/deactivate",
-                         "Management deactivation was authorized.");
+                         "Management plane deactivated.");
+    });
+    $("mg-refresh").addEventListener("click", function () {
+      loadE3Status();
+      loadE3Clients();
+    });
+    $("e3-add-btn").addEventListener("click", function () {
+      var name = $("e3-add-name").value.trim();
+      if (name) addClient(name);
+    });
+    $("e3-add-name").addEventListener("keydown", function (event) {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        var name = $("e3-add-name").value.trim();
+        if (name) addClient(name);
+      }
+    });
+    $("e3-del-btn").addEventListener("click", function () {
+      var name = $("e3-del-btn").getAttribute("data-name");
+      var confirm = $("e3-del-confirm").value;
+      if (!name) return;
+      if (confirm !== name) {
+        e3Message("The confirmation does not match the client name exactly; " +
+                  "nothing was deleted.", true);
+        return;
+      }
+      deleteClient(name);
+    });
+    $("e3-del-cancel").addEventListener("click", function () {
+      hide($("e3-delete-box"));
     });
     $("wl-add-btn").addEventListener("click", function () {
       var value = $("wl-add-input").value.trim();
