@@ -46,7 +46,10 @@ fail(){ FAIL=$((FAIL+1)); printf '  FAIL %s\n' "$*"; }
 skip(){ SKIP=$((SKIP+1)); printf '  SKIP %s\n' "$*"; }
 assert_eq(){ [ "$1" = "$2" ] && pass "$3" || fail "$3 (want=[$1] got=[$2])"; }
 assert_ne(){ [ "$1" != "$2" ] && pass "$3" || fail "$3 (both=[$1])"; }
-jqv(){ printf '%s' "$1" | jq -r "$2 // empty" 2>/dev/null; }
+jqv(){ printf '%s' "$1" | jq -r "$2" 2>/dev/null; }
+# NB: jqv has NO `// empty` fallback on purpose -- jq's `//` operator treats
+# a legitimate JSON false as empty, which would silently turn every
+# boolean-false assertion into "got=[]". Missing keys print as "null".
 probe_err(){ printf '%s' "$1" | jq -r '.probe_error? // empty' 2>/dev/null; }
 sum(){ sha256sum "$1" 2>/dev/null | awk '{print $1}'; }
 
@@ -265,8 +268,10 @@ curl -sS -c "$CJ" -H "Content-Type: application/json" \
      -d "{\"password\":\"$MPASS\"}" "$BASE/api/v1/login" >/dev/null 2>&1
 CSRF="$(curl -sS -b "$CJ" "$BASE/api/v1/session" | jqv '-' '.csrf_token')"
 # mutations need a live step-up window (M0.5 gate, unchanged)
-curl -sS -b "$CJ" -H "X-CSRF-Token: $CSRF" -H "Content-Type: application/json" \
-     -d "{\"password\":\"$MPASS\"}" "$BASE/api/v1/step-up" >/dev/null 2>&1
+STEPUP="$(curl -sS -b "$CJ" -H "X-CSRF-Token: $CSRF" -H "Content-Type: application/json" \
+     -d "{\"password\":\"$MPASS\"}" "$BASE/api/v1/step-up")"
+assert_eq "ok" "$(printf '%s' "$STEPUP" | jq -r '.status // "fail"' 2>/dev/null)" \
+    'the step-up grant after re-login succeeded'
 STATUS_B="$(curl -sS -b "$CJ" "$BASE/api/v1/management/status")"
 assert_eq "true" "$(jqv "$STATUS_B" '.ok')" 'with the carve-out the monitor reaches the helper (phase B)'
 assert_eq "fresh" "$(jqv "$STATUS_B" '.transport')" 'the first status snapshot is fresh'
