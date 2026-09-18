@@ -266,12 +266,15 @@ render_monitor_unit yes
 start_monitor || { fail 'monitor unit (phase B) did not come up'; printf '\nE3_M2_LIVE=FAIL\n'; exit 1; }
 curl -sS -c "$CJ" -H "Content-Type: application/json" \
      -d "{\"password\":\"$MPASS\"}" "$BASE/api/v1/login" >/dev/null 2>&1
-CSRF="$(curl -sS -b "$CJ" "$BASE/api/v1/session" | jqv '-' '.csrf_token')"
+SINFO_B="$(curl -sS -b "$CJ" "$BASE/api/v1/session")"
+assert_eq "true" "$(jqv "$SINFO_B" '.authenticated')" 'phase-B re-login produced a live session'
+CSRF="$(jqv "$SINFO_B" '.csrf_token')"
+assert_ne "null" "$CSRF" 'the re-login session exposes its CSRF token'
 # mutations need a live step-up window (M0.5 gate, unchanged)
 STEPUP="$(curl -sS -b "$CJ" -H "X-CSRF-Token: $CSRF" -H "Content-Type: application/json" \
      -d "{\"password\":\"$MPASS\"}" "$BASE/api/v1/step-up")"
-assert_eq "ok" "$(printf '%s' "$STEPUP" | jq -r '.status // "fail"' 2>/dev/null)" \
-    'the step-up grant after re-login succeeded'
+assert_eq "ok" "$(jqv "$STEPUP" '.status')" \
+    "the step-up grant after re-login succeeded (raw=[$STEPUP])"
 STATUS_B="$(curl -sS -b "$CJ" "$BASE/api/v1/management/status")"
 assert_eq "true" "$(jqv "$STATUS_B" '.ok')" 'with the carve-out the monitor reaches the helper (phase B)'
 assert_eq "fresh" "$(jqv "$STATUS_B" '.transport')" 'the first status snapshot is fresh'
