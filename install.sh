@@ -692,22 +692,20 @@ SB_ROOT_DIR="${SB_ROOT_DIR:-$(dirname "$SB_SERVER_CONFIG")}"
 SB_SHORTCUT="${SB_SHORTCUT:-/usr/bin/mianyang}"
 SB_SYSTEMD_UNIT="${SB_SYSTEMD_UNIT:-/etc/systemd/system/sing-box.service}"
 RESERVED_CLIENT_NAME="legacy"
-CLIENT_NAME_PATTERN='^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$'
+# CLIENT_NAME_PATTERN lives in lib/client-management.sh together with its only
+# consumer (validate_client_name); keeping a second copy here would be an unused
+# variable (shellcheck SC2034).
 REALITY_INBOUND_TAG="vless-in"
 HY2_INBOUND_TAG="hy2-in"
 
-validate_client_name() { # validate_client_name <name> -> rc 0 if allowed
-    local name="$1"
-    [ -n "$name" ] || return 1
-    [[ "$name" =~ $CLIENT_NAME_PATTERN ]] || return 1
-    return 0
-}
+# M1-A0: validate_client_name is defined in lib/client-management.sh -- the one
+# canonical copy shared by install.sh and the privileged sbox-cm worker.
 
 # M0/G1: the lock/commit/rollback primitives have a single canonical source in
 # lib/client-management.sh. Local repository execution sources the sibling file;
 # the historical curl/process-substitution entry point fetches the same path from
 # the selected repository ref. Tests/helpers may inject SB_CLIENT_MANAGEMENT_LIB.
-SB_CLIENT_MANAGEMENT_SHA256="55dc0d0a895a2f5d1d155517bc34039ef7d13e5adc81e06c81c1feb7e73dea58"
+SB_CLIENT_MANAGEMENT_SHA256="c63511ebf9e97fd22b62e8480ef200d134abef1105ab8eb5167fb48a675d1d46"
 
 verify_client_management_library() { # <path>
     local lib="$1" got=""
@@ -780,132 +778,13 @@ load_client_management_library() {
 
 load_client_management_library || error "共享事务库加载失败，拒绝进入管理路径"
 
-get_reality_client_names() { # [config] -> one name per line ("" = unnamed user)
-    jq -r --arg tag "$REALITY_INBOUND_TAG" \
-        '.inbounds[] | select(.tag == $tag) | .users[]? | (.name // "")' \
-        "${1:-$SB_SERVER_CONFIG}" 2>/dev/null | tr -d '\r'
-}
-
-get_hy2_client_names() { # [config] -> one name per line ("" = unnamed user)
-    jq -r --arg tag "$HY2_INBOUND_TAG" \
-        '.inbounds[] | select(.tag == $tag) | .users[]? | (.name // "")' \
-        "${1:-$SB_SERVER_CONFIG}" 2>/dev/null | tr -d '\r'
-}
-
-# Structural precheck only: root must be an object, .inbounds must exist and be
-# an array, vless-in/hy2-in must each appear EXACTLY once, and their users
-# field must exist and be an array. Deliberately separate from the identity
-# audit: legacy migration must accept users WITHOUT names, so it runs only
-# this check before counting unnamed users. The jq exit code propagates to the
-# function: any runtime error means FAIL, never "no problems".
-client_structure_problems() { # client_structure_problems <config> -> prints problem lines
-    jq -r '
-      if (type != "object") then ["配置根节点不是 object"]
-      elif ((.inbounds // null) | type) != "array" then
-        (if (.inbounds // null) == null then ["缺少 inbounds 字段"] else ["inbounds 不是数组"] end)
-      else
-        (
-          ([.inbounds[] | select(.tag == "vless-in")]) as $ri |
-          ([.inbounds[] | select(.tag == "hy2-in")]) as $hi |
-          ([]
-            + (if ($ri | length) == 0 then ["缺少 vless-in 入站"] else [] end)
-            + (if ($ri | length) > 1 then ["vless-in 入站数量不是 1（实际 \($ri | length) 个）"] else [] end)
-            + (if ($hi | length) == 0 then ["缺少 hy2-in 入站"] else [] end)
-            + (if ($hi | length) > 1 then ["hy2-in 入站数量不是 1（实际 \($hi | length) 个）"] else [] end)
-            + (if ($ri | length) == 1 then
-                 (if ($ri[0] | has("users") | not) then ["vless-in 缺少 users 字段"]
-                  elif (($ri[0].users) | type) != "array" then ["vless-in 的 users 不是数组"]
-                  else [] end)
-               else [] end)
-            + (if ($hi | length) == 1 then
-                 (if ($hi[0] | has("users") | not) then ["hy2-in 缺少 users 字段"]
-                  elif (($hi[0].users) | type) != "array" then ["hy2-in 的 users 不是数组"]
-                  else [] end)
-               else [] end)
-          )
-        )
-      end | .[]
-    ' "$1" 2>/dev/null
-}
-
-# Full identity audit: structure first, then the per-user rules. FAIL-CLOSED:
-# a jq/runtime error inside either stage is an audit FAILURE, never "no
-# problems found" -- callers must check this function's exit code, not just
-# its stdout.
-candidate_problems() { # candidate_problems <config> -> prints problem lines (empty = OK)
-    local structural
-    structural="$(client_structure_problems "$1")" || return $?
-    if [ -n "$structural" ]; then
-        printf '%s\n' "$structural"
-        return 0
-    fi
-    jq -r '
-      ([.inbounds[] | select(.tag == "vless-in")][0].users) as $ru |
-      ([.inbounds[] | select(.tag == "hy2-in")][0].users) as $hu |
-      ([ $ru[] | .name // "" ]) as $rn |
-      ([ $hu[] | .name // "" ]) as $hn |
-      ([ $ru[] | .uuid // "" ]) as $rid |
-      ([ $hu[] | .password // "" ]) as $hp |
-      ([ $ru[] | .flow // "" ]) as $rf |
-      ([]
-        + (if ($rn | index("")) != null then ["vless-in 存在没有 name 的用户"] else [] end)
-        + (if ($hn | index("")) != null then ["hy2-in 存在没有 name 的用户"] else [] end)
-        + (if ($rn | sort) == ($hn | sort) then [] else ["Reality 与 HY2 的 name 集合不一致"] end)
-        + (if ($rn | length) == ($rn | unique | length) then [] else ["vless-in 存在重复 name"] end)
-        + (if ($hn | length) == ($hn | unique | length) then [] else ["hy2-in 存在重复 name"] end)
-        + (if ($rid | index("")) != null then ["vless-in 存在没有 uuid 的用户"] else [] end)
-        + (if ($hp | index("")) != null then ["hy2-in 存在没有 password 的用户"] else [] end)
-        + (if ($rid | length) == ($rid | unique | length) then [] else ["vless-in 存在重复 uuid"] end)
-        + (if ($hp | length) == ($hp | unique | length) then [] else ["hy2-in 存在重复 password"] end)
-        + (if ($rf | all(. == "xtls-rprx-vision")) then [] else ["vless-in 存在 flow 不等于 xtls-rprx-vision 的用户"] end)
-      )[]
-    ' "$1" 2>/dev/null
-}
-
-audit_client_consistency() { # audit_client_consistency [config] -> table + rc
-    local cfg="${1:-$SB_SERVER_CONFIG}" problems rn hn union name r h p
-    if [ ! -f "$cfg" ]; then
-        warning "服务端配置不存在: $cfg"
-        return 1
-    fi
-    if ! jq empty "$cfg" >/dev/null 2>&1; then
-        warning "服务端配置不是合法 JSON: $cfg"
-        return 1
-    fi
-    # FAIL-CLOSED: a jq/runtime error inside the audit is an audit failure,
-    # never equivalent to "no problems found".
-    if ! problems="$(candidate_problems "$cfg")"; then
-        warning "客户端结构审计执行失败: $cfg"
-        return 1
-    fi
-    rn="$(get_reality_client_names "$cfg")"
-    hn="$(get_hy2_client_names "$cfg")"
-    printf '%-16s %-12s %s\n' "NAME" "REALITY" "HY2"
-    union="$(printf '%s\n%s\n' "$rn" "$hn" | sed '/^$/d' | sort -u)"
-    while IFS= read -r name; do
-        [ -n "$name" ] || continue
-        r="MISSING"; h="MISSING"
-        grep -qxF "$name" <<<"$rn" && r="OK"
-        grep -qxF "$name" <<<"$hn" && h="OK"
-        printf '%-16s %-12s %s\n' "$name" "$r" "$h"
-    done <<< "$union"
-    if [ -n "$problems" ]; then
-        warning "客户端一致性检查发现问题:"
-        while IFS= read -r p; do
-            [ -n "$p" ] && warning "  - $p"
-        done <<< "$problems"
-        return 1
-    fi
-    info "客户端一致性检查通过（Reality 与 HY2 的 name 集合完全一致）"
-    return 0
-}
-
-# Shared transaction primitives are loaded above from lib/client-management.sh.
-client_name_exists() { # client_name_exists <name> [config] -> rc 0 if present in either inbound
-    local name="$1" cfg="${2:-$SB_SERVER_CONFIG}"
-    grep -qxF "$name" <(get_reality_client_names "$cfg") ||
-        grep -qxF "$name" <(get_hy2_client_names "$cfg")
-}
+# M1-A0: the client-management semantics that used to live here have moved to
+# lib/client-management.sh so that BOTH writers share exactly one copy:
+#   validate_client_name      get_reality_client_names   get_hy2_client_names
+#   client_structure_problems candidate_problems         audit_client_consistency
+#   client_name_exists        get_client_credentials
+# They are loaded by load_client_management_library above (fail-closed digest
+# pin) and are available to the rest of this script unchanged.
 
 # One-shot, key-preserving migration of the pre-Phase-C shared account:
 #   {"uuid": "AAAA", ...}  ->  {"name": "legacy", "uuid": "AAAA", ...}
@@ -977,7 +856,7 @@ add_client() { # add_client <name> -> adds to BOTH inbounds atomically
 # so a transaction that lost the lock race starts from the winner's state
 # instead of overwriting it with a stale snapshot (no lost update).
 _add_client_locked() {
-    local name="$1" candidate uuid password
+    local name="$1" candidate
     if ! validate_client_name "$name"; then
         warning "客户端名称非法: '$name'（允许: 字母/数字开头，仅字母数字._-，长度 1-32）"
         return 1
@@ -1001,26 +880,14 @@ _add_client_locked() {
         return 1
     fi
 
-    if ! uuid="$("$SB_SING_BOX_BIN" generate uuid)" || [ -z "$uuid" ]; then
-        warning "生成 Reality UUID 失败"
+    # M1-A: the planned credentials never reach argv, env, stdout, stderr or a
+    # temp file. cm_add_client_candidate_planned generates them into shell
+    # memory, digests them, and streams them to jq over an anonymous pipe.
+    if ! cm_add_client_candidate_planned "$name"; then
+        warning "生成 add candidate 失败"
         return 1
     fi
-    if ! password="$("$SB_SING_BOX_BIN" generate rand --hex 16)" || [ -z "$password" ]; then
-        warning "生成 Hysteria2 password 失败"
-        return 1
-    fi
-
-    candidate="$(new_candidate_path)" || { warning "创建 candidate 失败"; return 1; }
-    jq --arg name "$name" --arg uuid "$uuid" --arg password "$password" '
-      (.inbounds[] | select(.tag == "vless-in") | .users) += [
-        {"name": $name, "uuid": $uuid, "flow": "xtls-rprx-vision"}
-      ] |
-      (.inbounds[] | select(.tag == "hy2-in") | .users) += [
-        {"name": $name, "password": $password}
-      ]
-    ' "$SB_SERVER_CONFIG" > "$candidate" || {
-        warning "生成 add candidate 失败"; rm -f "$candidate"; return 1
-    }
+    candidate="$CM_ADD_CANDIDATE"
 
     # Single transaction: Reality + HY2 appear together or not at all.
     if commit_server_config "$candidate" "add client $name"; then
@@ -1085,14 +952,11 @@ _delete_client_locked() {
     fi
 
     candidate="$(new_candidate_path)" || { warning "创建 candidate 失败"; return 1; }
-    jq --arg name "$name" '
-      (.inbounds[] | select(.tag == "vless-in") | .users) |=
-        map(select(.name != $name)) |
-      (.inbounds[] | select(.tag == "hy2-in") | .users) |=
-        map(select(.name != $name))
-    ' "$SB_SERVER_CONFIG" > "$candidate" || {
+    # M1-A0: the delete candidate is produced by the canonical library so the
+    # CLI and the privileged worker cannot drift.
+    if ! cm_delete_candidate "$SB_SERVER_CONFIG" "$name" "$candidate"; then
         warning "生成 delete candidate 失败"; rm -f "$candidate"; return 1
-    }
+    fi
 
     if ! commit_server_config "$candidate" "delete client $name"; then
         warning "服务端修改失败，客户端配置目录 $SB_CLIENTS_DIR/$name 保持不变"
@@ -1107,17 +971,7 @@ _delete_client_locked() {
     fi
     info "客户端 '$name' 已从 Reality 与 HY2 同时删除"
 }
-get_client_credentials() { # get_client_credentials <name> [config] -> "uuid\npassword"
-    local name="$1" cfg="${2:-$SB_SERVER_CONFIG}" uuid password
-    uuid="$(jq -r --arg name "$name" --arg tag "$REALITY_INBOUND_TAG" '
-        .inbounds[] | select(.tag == $tag) | .users[]? | select(.name == $name) | .uuid // ""
-    ' "$cfg" 2>/dev/null)"
-    password="$(jq -r --arg name "$name" --arg tag "$HY2_INBOUND_TAG" '
-        .inbounds[] | select(.tag == $tag) | .users[]? | select(.name == $name) | .password // ""
-    ' "$cfg" 2>/dev/null)"
-    [ -n "$uuid" ] && [ -n "$password" ] || return 1
-    printf '%s\n%s\n' "$uuid" "$password"
-}
+# get_client_credentials is provided by lib/client-management.sh (M1-A0).
 
 # Writes the Mihomo/Clash Meta client YAML using caller-scope variables:
 #   $server_ip $reality_port $reality_uuid $reality_server_name $public_key

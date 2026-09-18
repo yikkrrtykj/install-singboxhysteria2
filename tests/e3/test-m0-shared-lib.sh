@@ -42,7 +42,6 @@ export SB_LOCK_FILE="$SANDBOX/config.lock"
 
 info(){ :; }
 warning(){ printf '[warn] %s\n' "$*" >&2; }
-candidate_problems(){ return 0; }
 
 cat > "$SB_SING_BOX_BIN" <<'MOCK'
 #!/usr/bin/env bash
@@ -77,6 +76,11 @@ sleep(){ :; }
 
 # shellcheck source=/dev/null
 . "$LIB"
+
+# M1-A0 moved candidate_problems INTO the shared library, so this stub must be
+# installed AFTER sourcing or the library's real audit would win. The M0 suite
+# intentionally exercises the commit/rollback mechanics with a neutral audit.
+candidate_problems(){ return 0; }
 
 write_live(){
   printf '{"inbounds":[],"value":"old"}\n' > "$SB_SERVER_CONFIG"

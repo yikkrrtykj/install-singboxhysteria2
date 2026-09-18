@@ -1,0 +1,57 @@
+[Unit]
+Description=sbox-cm privileged execution plane (E3 M1)
+Documentation=docs/e3-m1-privileged-execution-plane-design.md
+Requires=sbox-cm.socket
+After=sbox-cm.socket
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=@SBXCM_LIBEXEC@/sbox-cm run
+# No TCP/UDP surface exists in this unit; the only listener is the socket unit.
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=10s
+UMask=0077
+
+# --- hardening: start from the strict candidate (B-5), verify, only then relax ---
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+SystemCallArchitectures=native
+# AF_UNIX only: RPC socket + systemd/D-Bus for `systemctl reload sing-box`.
+RestrictAddressFamilies=AF_UNIX
+# The writable trees, nothing else. /run/sbox-cm is the socket directory
+# (writable so the daemon can complete its post-bind ownership check).
+# /run/systemd is the minimal B-5 carve-out: ProtectSystem=strict mounts /run
+# read-only, and both `systemctl reload sing-box` (commit path) and
+# `systemctl is-active sing-box` (health/running probes) connect to the
+# manager's private socket at /run/systemd/private, which requires write
+# permission on that inode. The leading '-' tolerates its absence.
+ReadWritePaths=/run/sbox-cm /root/sbox /var/lib/sbox-cm -/run/systemd
+# CAP_KILL: kill -HUP fallback for a manually started sing-box.
+# CAP_DAC_OVERRIDE: cross-owner writes under /root/sbox.
+# CAP_CHOWN is deliberately NOT granted -- socket ownership belongs to PID 1.
+CapabilityBoundingSet=CAP_KILL CAP_DAC_OVERRIDE
+AmbientCapabilities=
+
+# Enablement model (intentional, not accidental): `sbox-cm.socket` is the
+# supported activation path and the only thing install-sbox-cm.sh enables. The
+# service is pulled up on the first accepted connection, so boot-time surface is
+# "a listening socket", not "a running root daemon". The [Install] section is
+# kept so an operator MAY additionally opt into `systemctl enable
+# sbox-cm.service` (a daemon up regardless of traffic) as an explicit,
+# documented choice; the deploy script never does it, and `disable` still stops
+# and disables the service if it happens to be enabled.
+[Install]
+WantedBy=multi-user.target
