@@ -10,7 +10,7 @@
 #
 # Responsibilities: config.lock, ledger, tx journal, credentials, candidate
 # generation, commit_server_config, rollback, derived cleanup, transaction
-# result, privileged audit, startup reconciliation.
+# result, privileged audit, startup reconciliation, root recovery.
 #
 # Absolute rules:
 #   * exactly ONE commit engine (lib/client-management.sh). This worker must
@@ -20,6 +20,10 @@
 #     stdout/stderr, no temp file, no journal, no audit.
 #   * a durable ledger intent is written BEFORE any mutation; after that point
 #     the transaction runs to a terminal state regardless of the caller.
+#   * terminal order is fixed: durable outcome -> durable audit -> journal
+#     clear -> response. An audit that cannot be made durable KEEPS the journal
+#     (reconciliation appends the missing record with the same audit_id and
+#     only then clears it); it is never silently swallowed.
 #
 # `set -e` is deliberately NOT used: every failure path is explicit and must
 # still emit a protocol result.
@@ -36,6 +40,9 @@ NAME=""
 KEY=""
 GEN=0
 CM_MUTATION_ENTERED=false
+# Set by _commit_failed for terminal states that are NOT proven safe: err_exit
+# then deliberately keeps the journal for startup reconciliation.
+W_JOURNAL_KEEP=false
 
 # ------------------------------------------------------------------ output --
 warning() { printf '[sbox-cm-ops] %s\n' "$*" >&2; }
@@ -69,7 +76,10 @@ emit_err() { # <code> <stage> <retriable> <detail> [backup]
 
 # Exactly one privileged audit record per mutation attempt. The worker owns the
 # audit as soon as the daemon dispatched it (the daemon never adds a second).
-w_audit() { # <outcome> <stage> [error_code]
+# Returns rc 1 when the record could NOT be made durable: callers must then
+# keep the journal so startup reconciliation appends it later (audit_id is
+# deterministic, so the retry cannot duplicate it).
+w_audit() { # <outcome> <stage> [error_code] -> rc 0 durable-or-present
     local outcome="$1" stage="$2" err="${3:-}" audit_id kfp=""
     audit_id="${REQ_ID}:${GEN}"
     if cm_audit_has "$audit_id"; then return 0; fi
@@ -84,17 +94,40 @@ w_audit() { # <outcome> <stage> [error_code]
           actor:{session_fp:(if $sfp=="" then null else $sfp end),
                  stepup_fp:(if $ufp=="" then null else $ufp end)},
           source:"worker"}' \
-        | cm_audit_append "$audit_id" || warning "审计写入失败（继续，状态已持久化）"
+        | cm_audit_append "$audit_id" || { warning "审计写入失败（保留 journal，由调和补齐）"; return 1; }
+    return 0
 }
 
+# Terminal SUCCESS. The durable outcome must already be on disk. Order is
+# fixed: durable outcome -> durable audit -> journal clear -> response. If the
+# audit cannot be made durable the journal is deliberately KEPT and the
+# response carries the audit_deferred warning instead of pretending all is
+# well; reconciliation later appends the record with the same audit_id and only
+# then clears the journal.
 ok_exit() { # <outcome> <stage> <data> [idempotency] [warnings]
-    w_audit "$1" "$2" ""
-    emit_ok "$3" "${4:-null}" "${5:-[]}"
+    local warnings="${5:-[]}"
+    if w_audit "$1" "$2" ""; then
+        cm_journal_clear "$REQ_ID" || warning "journal 清理失败（保留给调和）"
+    else
+        warnings="$(printf '%s' "$warnings" | jq -c '. + ["audit_deferred"]' 2>/dev/null || printf '["audit_deferred"]')"
+        warning "审计无法落盘：保留 journal，待调和以 audit_id=${REQ_ID}:${GEN} 补齐"
+    fi
+    emit_ok "$3" "${4:-null}" "$warnings"
     exit 0
 }
 
+# Terminal FAILURE. Same ordering contract: the audit is written first; the
+# journal is cleared only when the audit is durable AND the terminal state was
+# proven safe (W_JOURNAL_KEEP is set for degraded / unconfirmed-rollback
+# terminals, whose journals reconciliation must still see).
 err_exit() { # <outcome> <code> <stage> <retriable> <detail> [backup]
-    w_audit "$1" "$3" "$2"
+    if w_audit "$1" "$3" "$2"; then
+        if [ "$W_JOURNAL_KEEP" != "true" ]; then
+            cm_journal_clear "$REQ_ID" || warning "journal 清理失败（保留给调和）"
+        fi
+    else
+        warning "审计无法落盘：保留 journal，待调和以 audit_id=${REQ_ID}:${GEN} 补齐"
+    fi
     emit_err "$2" "$3" "$4" "$5" "${6:-}"
     exit 0
 }
@@ -104,6 +137,43 @@ idem_json() { # <replayed:true|false>
     if [ -n "${KEY:-}" ]; then kfp="$(cm_key_fp "$KEY" 2>/dev/null)"; fi
     jq -cn --arg kfp "$kfp" --argjson replayed "$1" --argjson gen "${GEN:-0}" \
         '{key_fp:$kfp, replayed:$replayed, generation:$gen}'
+}
+
+# Finalize a PREVIOUS attempt of the same Idempotency-Key whose retry arrived
+# with a NEW request_id (E3 M1 review B3): the original attempt's journal must
+# be cleared and, if it never got one, its audit record appended under the
+# ORIGINAL audit_id. Runs only after the durable outcome exists. A failure to
+# append the audit keeps the original journal (reconciliation will finish it).
+w_finalize_original() { # <orig_request_id> <generation> <op> -> rc 0 finalized
+    local orig_rid="$1" gen="$2" op="$3" audit_id
+    [ -n "$orig_rid" ] || return 0
+    audit_id="${orig_rid}:${gen}"
+    if ! cm_audit_has "$audit_id"; then
+        local s_rid="$REQ_ID" s_op="$OP" s_gen="$GEN"
+        REQ_ID="$orig_rid"; OP="$op"; GEN="$gen"
+        if ! w_audit ok outcome ""; then
+            REQ_ID="$s_rid"; OP="$s_op"; GEN="$s_gen"
+            warning "旧事务审计补齐失败：保留其 journal（$orig_rid）"
+            return 1
+        fi
+        REQ_ID="$s_rid"; OP="$s_op"; GEN="$s_gen"
+    fi
+    cm_journal_clear "$orig_rid" || { warning "旧事务 journal 清理失败: $orig_rid"; return 1; }
+    return 0
+}
+
+# Durable phase journal hook (E3 M1 review B1), installed as
+# CM_TX_JOURNAL_HOOK before the canonical commit engine runs. Every phase
+# transition -- critically the one BEFORE the irreversible mv -- is durably
+# journalled BEFORE the phase acts, so a crash at any point leaves a journal
+# from which reconciliation can prove a safe state.
+w_journal_hook() { # <phase> [backup_path]
+    if ! cm_journal_write "$REQ_ID" "$OP" "$1" "${2:-}" "$GEN"; then
+        # The journal is the crash-recovery source of truth; if it cannot be
+        # made durable the engine must not keep mutating.
+        return 1
+    fi
+    return 0
 }
 
 # ------------------------------------------------------------------ bootstrap --
@@ -168,13 +238,21 @@ delete_success_data() { # <derived_cleanup:true|false>
           warnings:(if $derived then [] else ["derived_cleanup_failed"] end)}'
 }
 
+# READ-ONLY, NON-CREATING lock probe (E3 M1 review B7): status must never
+# create the lock anchor, so a missing file means "nothing holds it" and an
+# existing anchor is opened read-only for a non-blocking flock.
 lock_acquirable() { # rc 0 when config.lock is free right now
     command -v flock >/dev/null 2>&1 || return 1
-    ( exec 9>>"$SB_LOCK_FILE" 2>/dev/null && flock -n 9 2>/dev/null ) >/dev/null 2>&1
+    [ -e "$SB_LOCK_FILE" ] || return 0
+    [ -f "$SB_LOCK_FILE" ] || return 1
+    ( exec 9<"$SB_LOCK_FILE" 2>/dev/null && flock -n 9 2>/dev/null ) >/dev/null 2>&1
 }
 
 # ================================================================== ops ==
 # ------------------------------------------------------------- status --
+# Strictly read-only: no config.lock, no mutation, no repair. The live-config
+# EXISTENCE/parse probe is part of the active_stale DEFINITION (marker present
+# but live unusable), and the lock probe never creates the anchor file.
 op_management_status() {
     GEN=0
     local cfg="$SB_SERVER_CONFIG" mgmt degraded reconcile
@@ -275,12 +353,17 @@ _add_locked() {
 
     # ---- ledger lookup (before acting on live preconditions; rev5 B.7) ----
     digest="$(cm_request_digest "client.add" "$NAME")"
-    rec="$(cm_ledger_lookup "$KEY")"
+    rec="$(cm_ledger_lookup "$KEY")"; local lrc=$?
+    if [ "$lrc" = "2" ]; then
+        # fail-closed: a corrupt ledger record must never read as "no record"
+        err_exit rejected E_LEDGER_UNAVAILABLE ledger_intent false "账本记录损坏（fail-closed），拒绝 mutation，需人工修复"
+    fi
     if [ -n "$rec" ]; then
-        local rec_digest rec_state rec_gen rec_cred
+        local rec_digest rec_state rec_gen rec_cred rec_rid
         rec_digest="$(cm_ledger_field "$rec" '.digest')"
         rec_state="$(cm_ledger_field "$rec" '.state')"
         rec_gen="$(cm_ledger_field "$rec" '.generation')"
+        rec_rid="$(cm_ledger_field "$rec" '.request_id')"
         if [ "$rec_digest" != "$digest" ]; then
             err_exit rejected E_IDEMPOTENCY_CONFLICT ledger_intent false "同一 Idempotency-Key 的语义与先前请求不一致"
         fi
@@ -289,6 +372,9 @@ _add_locked() {
             local prev
             prev="$(printf '%s' "$rec" | jq -c '.result // {}' 2>/dev/null)"
             [ -n "$prev" ] || prev="{}"
+            # finalize the original attempt (its journal may outlive a crash
+            # between the durable outcome and the journal clear)
+            w_finalize_original "${rec_rid:-$REQ_ID}" "$GEN" "client.add"
             ok_exit replayed ledger_intent "$prev" "$(idem_json true)" "[]"
         fi
         # in_flight + same digest -> reconciliation matrix (rev5 B.9)
@@ -303,10 +389,10 @@ _add_locked() {
                 GEN="${rec_gen:-1}"
                 local data
                 data="$(add_success_data "$NAME")"
-                if ! cm_ledger_append_outcome "$KEY" "client.add" "$NAME" "$digest" "$GEN" "$data"; then
-                    err_exit uncertain E_STATE_UNCERTAIN outcome true "变更已生效但账本 outcome 落盘失败"
+                if ! cm_ledger_append_outcome "$KEY" "client.add" "$NAME" "$digest" "$GEN" "${rec_rid:-$REQ_ID}" "$data"; then
+                    err_exit uncertain E_STATE_UNCERTAIN outcome true "变更已生效但账本 outcome 落盘失败（同一 key 重试可补账）"
                 fi
-                cm_journal_clear "$REQ_ID" || true
+                w_finalize_original "${rec_rid:-$REQ_ID}" "$GEN" "client.add"
                 cm_last_tx_set "$GEN" "client.add" "ok"
                 ok_exit replayed outcome "$data" "$(idem_json true)" "[]"
             fi
@@ -341,8 +427,9 @@ _add_locked() {
         err_exit rejected E_LEDGER_UNAVAILABLE ledger_intent true "账本 intent 持久化失败（零变更）"
     fi
     CM_MUTATION_ENTERED=true
-    if ! cm_journal_write "$REQ_ID" "client.add" "intent"; then
+    if ! cm_journal_write "$REQ_ID" "client.add" "intent" "" "$GEN"; then
         cm_cred_forget
+        W_JOURNAL_KEEP=true
         cm_degraded_set manual_intervention "journal intent write failed"
         err_exit manual_intervention E_MANUAL_INTERVENTION outcome false "journal 写入失败，进入 degraded"
     fi
@@ -359,18 +446,19 @@ _add_locked() {
         err_exit rejected E_CANDIDATE_REJECTED candidate false "candidate 生成失败"
     fi
     cm_cred_forget
-    cm_journal_write "$REQ_ID" "client.add" "candidate" || true
+    cm_journal_write "$REQ_ID" "client.add" "candidate" "" "$GEN" || true
 
-    # ---- commit (the one canonical engine) ----
+    # ---- commit (the one canonical engine, with the durable phase hook) ----
+    CM_TX_JOURNAL_HOOK=w_journal_hook
     if commit_server_config "$candidate" "client.add $NAME"; then
-            local data
+        local data
         data="$(add_success_data "$NAME")"
-        if ! cm_ledger_append_outcome "$KEY" "client.add" "$NAME" "$digest" "$GEN" "$data"; then
-            cm_journal_write "$REQ_ID" "client.add" "outcome" || true
+        if ! cm_ledger_append_outcome "$KEY" "client.add" "$NAME" "$digest" "$GEN" "$REQ_ID" "$data"; then
+            W_JOURNAL_KEEP=true
+            cm_journal_write "$REQ_ID" "client.add" "outcome" "" "$GEN" || true
             cm_last_tx_set "$GEN" "client.add" "uncertain"
             err_exit uncertain E_STATE_UNCERTAIN outcome true "变更已生效但账本 outcome 落盘失败（同一 key 重试可补账）"
         fi
-        cm_journal_clear "$REQ_ID" || true
         cm_last_tx_set "$GEN" "client.add" "ok"
         ok_exit ok outcome "$data" "$(idem_json false)" "[]"
     fi
@@ -402,12 +490,16 @@ _delete_locked() {
 
     # ---- ledger lookup first (M1 §5 order) ----
     digest="$(cm_request_digest "client.delete" "$NAME")"
-    rec="$(cm_ledger_lookup "$KEY")"
+    rec="$(cm_ledger_lookup "$KEY")"; local lrc=$?
+    if [ "$lrc" = "2" ]; then
+        err_exit rejected E_LEDGER_UNAVAILABLE ledger_intent false "账本记录损坏（fail-closed），拒绝 mutation，需人工修复"
+    fi
     if [ -n "$rec" ]; then
-        local rec_digest rec_state rec_gen rec_cred
+        local rec_digest rec_state rec_gen rec_cred rec_rid
         rec_digest="$(cm_ledger_field "$rec" '.digest')"
         rec_state="$(cm_ledger_field "$rec" '.state')"
         rec_gen="$(cm_ledger_field "$rec" '.generation')"
+        rec_rid="$(cm_ledger_field "$rec" '.request_id')"
         if [ "$rec_digest" != "$digest" ]; then
             err_exit rejected E_IDEMPOTENCY_CONFLICT ledger_intent false "同一 Idempotency-Key 的语义与先前请求不一致"
         fi
@@ -416,19 +508,31 @@ _delete_locked() {
             local prev
             prev="$(printf '%s' "$rec" | jq -c '.result // {}' 2>/dev/null)"
             [ -n "$prev" ] || prev="{}"
+            w_finalize_original "${rec_rid:-$REQ_ID}" "$GEN" "client.delete"
             ok_exit replayed ledger_intent "$prev" "$(idem_json true)" "[]"
         fi
         rec_cred="$(cm_ledger_field "$rec" '.old_cred_digest')"
         if ! client_name_exists "$NAME" "$cfg"; then
-            # desired state reached: finish derived cleanup + outcome
+            # desired state already reached: finish derived cleanup + outcome.
+            # The outcome MUST be durable before success is reported (F15) and
+            # derived cleanup is reported for what it actually did.
             GEN="${rec_gen:-1}"
-            rm -rf -- "${SB_CLIENTS_DIR:?}/$NAME" 2>/dev/null || true
+            local derived=true
+            if [ -d "$SB_CLIENTS_DIR/$NAME" ]; then
+                rm -rf -- "${SB_CLIENTS_DIR:?}/$NAME" 2>/dev/null || derived=false
+            fi
             local data
-            data="$(delete_success_data true)"
-            cm_ledger_append_outcome "$KEY" "client.delete" "$NAME" "$digest" "$GEN" "$data" || true
-            cm_journal_clear "$REQ_ID" || true
+            data="$(delete_success_data "$derived")"
+            if ! cm_ledger_append_outcome "$KEY" "client.delete" "$NAME" "$digest" "$GEN" "${rec_rid:-$REQ_ID}" "$data"; then
+                W_JOURNAL_KEEP=true
+                cm_journal_write "${rec_rid:-$REQ_ID}" "client.delete" "outcome" "" "$GEN" || true
+                cm_last_tx_set "$GEN" "client.delete" "uncertain"
+                err_exit uncertain E_STATE_UNCERTAIN outcome true "变更已生效但账本 outcome 落盘失败（同一 key 重试可补账）"
+            fi
+            w_finalize_original "${rec_rid:-$REQ_ID}" "$GEN" "client.delete"
             cm_last_tx_set "$GEN" "client.delete" "ok"
-            ok_exit replayed ledger_intent "$data" "$(idem_json true)" "[]"
+            ok_exit replayed ledger_intent "$data" "$(idem_json true)" \
+                "$(printf '%s' "$data" | jq -c '.warnings // []')"
         fi
         local current
         if ! current="$(cm_old_cred_digest "$cfg" "$NAME")"; then
@@ -464,7 +568,8 @@ _delete_locked() {
         err_exit rejected E_LEDGER_UNAVAILABLE ledger_intent true "账本 intent 持久化失败（零变更）"
     fi
     CM_MUTATION_ENTERED=true
-    if ! cm_journal_write "$REQ_ID" "client.delete" "intent"; then
+    if ! cm_journal_write "$REQ_ID" "client.delete" "intent" "" "$GEN"; then
+        W_JOURNAL_KEEP=true
         cm_degraded_set manual_intervention "journal intent write failed"
         err_exit manual_intervention E_MANUAL_INTERVENTION outcome false "journal 写入失败，进入 degraded"
     fi
@@ -475,56 +580,56 @@ _delete_locked() {
         rm -f -- "$candidate"
         err_exit rejected E_CANDIDATE_REJECTED candidate false "candidate 生成失败"
     fi
-    cm_journal_write "$REQ_ID" "client.delete" "candidate" || true
+    cm_journal_write "$REQ_ID" "client.delete" "candidate" "" "$GEN" || true
 
+    CM_TX_JOURNAL_HOOK=w_journal_hook
     if commit_server_config "$candidate" "client.delete $NAME"; then
-            local derived=true
+        local derived=true
         if [ -d "$SB_CLIENTS_DIR/$NAME" ]; then
-            if ! rm -rf -- "${SB_CLIENTS_DIR:?}/$NAME" 2>/dev/null; then derived=false; fi
+            rm -rf -- "${SB_CLIENTS_DIR:?}/$NAME" 2>/dev/null || derived=false
         fi
         local data
         data="$(delete_success_data "$derived")"
-        if ! cm_ledger_append_outcome "$KEY" "client.delete" "$NAME" "$digest" "$GEN" "$data"; then
-            cm_journal_write "$REQ_ID" "client.delete" "outcome" || true
+        if ! cm_ledger_append_outcome "$KEY" "client.delete" "$NAME" "$digest" "$GEN" "$REQ_ID" "$data"; then
+            W_JOURNAL_KEEP=true
+            cm_journal_write "$REQ_ID" "client.delete" "outcome" "" "$GEN" || true
             cm_last_tx_set "$GEN" "client.delete" "uncertain"
             err_exit uncertain E_STATE_UNCERTAIN outcome true "变更已生效但账本 outcome 落盘失败（同一 key 重试可补账）"
         fi
-        cm_journal_clear "$REQ_ID" || true
         cm_last_tx_set "$GEN" "client.delete" "ok"
-        ok_exit ok outcome "$data" "$(idem_json false)" "[]"
+        ok_exit ok outcome "$data" "$(idem_json false)" "$(printf '%s' "$data" | jq -c '.warnings // []')"
     fi
 
     _commit_failed "client.delete"
 }
 
-# Map a failed commit_server_config onto the M1 failure matrix (F4–F8).
+# Map a failed commit_server_config onto the M1 failure matrix (F4–F8). The
+# engine has already journalled every phase it entered (via w_journal_hook);
+# journal retention is decided here (W_JOURNAL_KEEP) and acted on in err_exit.
 _commit_failed() { # <op-label>
     local op_label="$1" phase="${CM_TX_PHASE:-}" rollback_ok="${CM_TX_ROLLBACK_OK:-null}"
-    cm_journal_write "$REQ_ID" "$op_label" "$phase" || true
     case "$phase" in
         candidate|check)
-            cm_journal_clear "$REQ_ID" || true
             cm_last_tx_set "${GEN:-0}" "$op_label" "rejected"
             err_exit rejected E_CANDIDATE_REJECTED "$phase" false "candidate 审计或 sing-box check 失败" "${CM_TX_BACKUP_PATH:-}" ;;
         backup|replace)
-            cm_journal_clear "$REQ_ID" || true
             cm_last_tx_set "${GEN:-0}" "$op_label" "rejected"
             err_exit rejected E_COMMIT_FAILED "$phase" true "备份或原子替换失败（系统完好）" "${CM_TX_BACKUP_PATH:-}" ;;
         rollback_manual)
+            W_JOURNAL_KEEP=true
             cm_degraded_set manual_intervention "rollback failed or unconfirmed"
             cm_last_tx_set "${GEN:-0}" "$op_label" "manual_intervention"
             err_exit manual_intervention E_MANUAL_INTERVENTION "$phase" false "回滚后仍无法确认健康，需人工介入" "${CM_TX_BACKUP_PATH:-}" ;;
         rollback|reload|health)
             if [ "$rollback_ok" = "true" ]; then
-                cm_journal_clear "$REQ_ID" || true
                 cm_last_tx_set "${GEN:-0}" "$op_label" "rolled_back"
                 err_exit rolled_back E_ROLLED_BACK "$phase" true "reload/健康检查失败，已自动回滚" "${CM_TX_BACKUP_PATH:-}"
             fi
+            W_JOURNAL_KEEP=true
             cm_degraded_set manual_intervention "rollback unconfirmed"
             cm_last_tx_set "${GEN:-0}" "$op_label" "manual_intervention"
             err_exit manual_intervention E_MANUAL_INTERVENTION "$phase" false "回滚未确认，需人工介入" "${CM_TX_BACKUP_PATH:-}" ;;
         *)
-            cm_journal_clear "$REQ_ID" || true
             cm_last_tx_set "${GEN:-0}" "$op_label" "rejected"
             err_exit rejected E_COMMIT_FAILED "${phase:-replace}" true "提交失败" "${CM_TX_BACKUP_PATH:-}" ;;
     esac
@@ -583,6 +688,7 @@ _activate_locked() {
                 "$(jq -cn --arg p "$(cm_marker_path)" '{management_state:"active", no_op:true, marker_path:$p}')" \
                 null "[]" ;;
         active_stale)
+            W_JOURNAL_KEEP=true
             err_exit manual_intervention E_MANUAL_INTERVENTION marker false "激活标记处于 active_stale，需 root CLI mgmt-deactivate 恢复" ;;
         *)
             if ! cm_marker_activate "${ACTOR_SESSION_FP:-}" "$REQ_ID"; then
@@ -595,6 +701,9 @@ _activate_locked() {
     esac
 }
 
+# PUBLIC RPC deactivate (E3 M1 review B4): it may cleanly deactivate an ACTIVE
+# plane, but it must NEVER be the tool that clears an active_stale marker --
+# stale-marker recovery is root-CLI-only by design.
 op_management_deactivate() {
     cm_state_init || err_exit rejected E_INTERNAL parse false "状态目录初始化失败"
     if cm_degraded_active; then
@@ -611,11 +720,40 @@ _deactivate_locked() {
     if [ "$state" = "inactive" ]; then
         ok_exit ok marker '{"management_state":"inactive","no_op":true}' null "[]"
     fi
+    if [ "$state" = "active_stale" ]; then
+        err_exit rejected E_ACTIVATION_STATE marker false "active_stale 只能由 root CLI（sbox-cm mgmt-deactivate）恢复，RPC 拒绝"
+    fi
     if ! cm_marker_remove; then
         err_exit rejected E_INTERNAL marker false "删除激活标记失败"
     fi
     cm_last_tx_set 0 "management.deactivate" "ok"
     ok_exit ok marker '{"management_state":"inactive","no_op":false}' null "[]"
+}
+
+# ROOT-ONLY recovery verb (E3 M1 review B4): reachable ONLY through the
+# maintenance entry point (never over the RPC socket, never in the six-op
+# allowlist). Same lock, explicit verification, marker removal with fsync and a
+# privileged audit record. This is the ONE sanctioned active_stale recovery.
+op_maintenance_mgmt_deactivate() {
+    GEN=0
+    OP="management.deactivate"
+    cm_state_init || { emit_err "E_INTERNAL" "parse" false "状态目录初始化失败" ""; exit 0; }
+    with_client_lock _mgmt_deactivate_maintenance
+    emit_err "E_LOCK" "lock" true "配置锁不可用或超时（fail-closed）" ""
+    exit 0
+}
+
+_mgmt_deactivate_maintenance() {
+    local state
+    state="$(cm_management_state "$SB_SERVER_CONFIG")"
+    if [ "$state" = "inactive" ]; then
+        ok_exit ok marker '{"management_state":"inactive","no_op":true}' null "[]"
+    fi
+    if ! cm_marker_remove; then
+        err_exit rejected E_INTERNAL marker false "删除激活标记失败"
+    fi
+    cm_last_tx_set 0 "management.deactivate" "ok"
+    ok_exit ok marker '{"management_state":"inactive","no_op":false,"recovery":true}' null "[]"
 }
 
 # ============================================================ reconcile ==
@@ -640,7 +778,7 @@ op_reconcile() {
 }
 
 _reconcile_locked() {
-    local cfg="$SB_SERVER_CONFIG" rid j phase jop backup gen audit_id degraded=false
+    local cfg="$SB_SERVER_CONFIG" rid j phase jop backup gen audit_id degraded=false audit_ok
     for rid in $(cm_journal_list); do
         j="$(cm_journal_read "$rid")" || { degraded=true; continue; }
         phase="$(printf '%s' "$j" | jq -r '.phase // "unknown"' 2>/dev/null)"
@@ -655,7 +793,7 @@ _reconcile_locked() {
                 # authoritative and a same-key retry resolves it (replay /
                 # supersede / conflict). The journal only records the phase.
                 ;;
-            check|backup|replace|reload|health|rollback|rollback_manual)
+            check|backup|replace|reload|health|rollback|rollback_manual|outcome)
                 # live may already be replaced -> converge the runtime
                 if ! reload_running_singbox || ! reload_health_ok; then
                     if [ -n "$backup" ] && [ -f "$backup" ]; then
@@ -674,21 +812,28 @@ _reconcile_locked() {
                 ;;
         esac
 
-        # exactly-once: append the missing audit record for this attempt
+        # exactly-once audit completion: append the record for this attempt if
+        # it is not durable yet (this also closes the audit_deferred window:
+        # a success whose audit write failed kept its journal precisely so
+        # this point could finish it).
         audit_id="${rid}:${gen}"
-        if ! cm_audit_has "$audit_id"; then
+        audit_ok=false
+        if cm_audit_has "$audit_id"; then
+            audit_ok=true
+        else
             local s_rid="$REQ_ID" s_op="$OP" s_gen="$GEN" s_key="$KEY" s_name="$NAME"
             REQ_ID="$rid"; OP="$jop"; GEN="$gen"; KEY=""; NAME=""
             if [ "$degraded" = "true" ]; then
-                w_audit manual_intervention reconcile "E_MANUAL_INTERVENTION"
+                w_audit manual_intervention reconcile "E_MANUAL_INTERVENTION" && audit_ok=true
             else
-                w_audit ok reconcile ""
+                w_audit ok reconcile "" && audit_ok=true
             fi
             REQ_ID="$s_rid"; OP="$s_op"; GEN="$s_gen"; KEY="$s_key"; NAME="$s_name"
         fi
 
-        # keep the journal when the state is not proven safe
-        if [ "$degraded" != "true" ]; then
+        # Keep the journal unless the runtime is proven safe AND the audit is
+        # durable; otherwise the next reconcile still has work to do.
+        if [ "$degraded" != "true" ] && [ "$audit_ok" = "true" ]; then
             cm_journal_clear "$rid" || degraded=true
         fi
     done
@@ -721,11 +866,14 @@ main() {
     # shellcheck source=/dev/null
     . "$lib_dir/sbox-cm-state.sh" || { emit_err "E_INTERNAL" "parse" false "状态库加载失败" ""; exit 0; }
 
-    # Non-RPC maintenance entry point (NOT reachable over the socket). The
-    # daemon calls this once at startup, before it accepts any request.
+    # Root-only maintenance entry points (NOT reachable over the RPC socket:
+    # the daemon's dispatch allowlist only ever passes the six public ops).
+    #   reconcile          startup reconciliation (daemon boot)
+    #   mgmt-deactivate    the ONE sanctioned active_stale recovery (root CLI)
     if [ "$OP" = "--maintenance" ]; then
         case "${2:-}" in
             reconcile) op_reconcile ;;
+            mgmt-deactivate) op_maintenance_mgmt_deactivate ;;
             *) emit_err "E_INTERNAL" "parse" false "未知维护子命令" "" ; exit 0 ;;
         esac
         emit_err "E_INTERNAL" "done" false "unreachable" ""

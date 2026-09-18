@@ -188,6 +188,15 @@ else
     pass 'client.list carries zero credentials'
 fi
 
+# ------------------------------------------------ status read-only contract ----
+printf '\n== status is strictly read-only: the lock probe never creates the anchor ==\n'
+rm -f "$SB_LOCK_FILE"
+o="$(wout management.status '{"request_id":"reqid-status-lockpr1"}')"
+assert_eq true "$(jqv "$o" '.ok')" 'status works without a lock anchor'
+assert_eq true "$(jqv "$o" '.data.lock.acquirable')" 'a missing anchor reads as acquirable'
+[ ! -e "$SB_LOCK_FILE" ] && pass 'status did NOT create the lock anchor' \
+    || fail 'status created the lock anchor (read-only contract violated)'
+
 # --------------------------------------------------------- activation gate ----
 printf '\n== add is refused while inactive ==\n'
 o="$(wout client.add '{"request_id":"reqid-add-inactiv1","name":"vmix-01","idempotency_key":"key-000000000001"}')"
@@ -424,6 +433,158 @@ if jq -e '([.inbounds[]|select(.tag=="vless-in")|.users[]|select(.name=="vmix-09
 else
     fail 'rolled-back client leaked into the live config'
 fi
+
+# ------------------------------------------------------- active_stale split ----
+printf '\n== active_stale: the public RPC refuses, root maintenance recovers (B4) ==\n'
+mv "$SB_SERVER_CONFIG" "$TMP/live.hidden"
+o="$(wout management.status '{"request_id":"reqid-status-stale01"}')"
+assert_eq active_stale "$(jqv "$o" '.data.management_state')" 'missing live config reports active_stale'
+o="$(wout management.deactivate '{"request_id":"reqid-deact-stale01"}')"
+assert_eq false "$(jqv "$o" '.ok')" 'public deactivate REFUSES an active_stale marker'
+assert_eq E_ACTIVATION_STATE "$(jqv "$o" '.code')" 'active_stale deactivate returns E_ACTIVATION_STATE'
+[ -f "$SB/state/management.active" ] && pass 'the public RPC did NOT remove the marker' \
+    || fail 'marker was removed through the RPC (root-recovery bypass)'
+o="$(printf '' | "${WORKER_CMD[@]}" --maintenance mgmt-deactivate 2>"$TMP/md.err")"
+assert_eq true "$(jqv "$o" '.ok')" 'root maintenance verb succeeds'
+[ ! -f "$SB/state/management.active" ] && pass 'maintenance verb removed the stale marker' \
+    || fail 'maintenance verb did not remove the marker'
+mv "$TMP/live.hidden" "$SB_SERVER_CONFIG"
+o="$(wout management.activate '{"request_id":"reqid-activate-recvr1","actor":{"session_fp":"0123456789abcdef"}}')"
+assert_eq true "$(jqv "$o" '.ok')" 'reactivation after recovery succeeds'
+
+# ------------------------------------------- delete replay original attempt ----
+printf '\n== delete replay finalizes the ORIGINAL attempt (B3) ==\n'
+o="$(wout client.add '{"request_id":"reqid-add-vmix06-0","name":"vmix-06","idempotency_key":"key-0000000000b1"}')"
+assert_eq true "$(jqv "$o" '.ok')" 'add vmix-06 for the replay scenario'
+OLD6="$(cm_old_cred_digest "$SB_SERVER_CONFIG" vmix-06)"
+DD6="$(cm_request_digest "client.delete" "vmix-06")"
+cm_ledger_append_intent "key-0000000000b2" "client.delete" "vmix-06" "$DD6" 1 \
+    "reqid-del-orig-001" "old_cred_digest" "$OLD6" \
+    || fail 'could not stage the in-flight delete intent'
+printf '%s\n' '{"v":1,"request_id":"reqid-del-orig-001","op":"client.delete","phase":"candidate","backup_path":null,"generation":1}' \
+    > "$SB/state/journal/reqid-del-orig-001.json"
+# the delete DID take effect (out-of-band), but outcome/journal/audit never landed
+jq '(.inbounds[]|select(.tag=="vless-in")|.users) |= map(select(.name != "vmix-06"))
+    | (.inbounds[]|select(.tag=="hy2-in")|.users) |= map(select(.name != "vmix-06"))' \
+    "$SB_SERVER_CONFIG" > "$SB/replay.json" && mv "$SB/replay.json" "$SB_SERVER_CONFIG"
+o="$(wout client.delete '{"request_id":"reqid-del-new-0002","name":"vmix-06","idempotency_key":"key-0000000000b2"}')"
+assert_eq true "$(jqv "$o" '.ok')" 'same-key retry with a NEW request_id replays'
+assert_eq true "$(jqv "$o" '.idempotency.replayed')" 'the retry is marked replayed'
+[ ! -f "$SB/state/journal/reqid-del-orig-001.json" ] \
+    && pass 'the ORIGINAL request journal was finalized (not the retry only)' \
+    || fail 'original orphan journal was left behind'
+assert_eq 1 "$(count "$AUDIT" '"request_id":"reqid-del-orig-001"')" \
+    'the original attempt got exactly one audit record'
+
+IS_LINUX=0
+[ "$(uname -s 2>/dev/null)" = "Linux" ] && IS_LINUX=1
+
+if [ "$IS_LINUX" = "1" ]; then
+    printf '\n== F15: replay whose outcome cannot be made durable is E_STATE_UNCERTAIN ==\n'
+    o="$(wout client.add '{"request_id":"reqid-add-vmix07-0","name":"vmix-07","idempotency_key":"key-0000000000c1"}')"
+    OLD7="$(cm_old_cred_digest "$SB_SERVER_CONFIG" vmix-07)"
+    DD7="$(cm_request_digest "client.delete" "vmix-07")"
+    cm_ledger_append_intent "key-0000000000c2" "client.delete" "vmix-07" "$DD7" 1 \
+        "reqid-del-vmix07-0" "old_cred_digest" "$OLD7" \
+        || fail 'could not stage the vmix-07 delete intent'
+    jq '(.inbounds[]|select(.tag=="vless-in")|.users) |= map(select(.name != "vmix-07"))
+        | (.inbounds[]|select(.tag=="hy2-in")|.users) |= map(select(.name != "vmix-07"))' \
+        "$SB_SERVER_CONFIG" > "$SB/replay7.json" && mv "$SB/replay7.json" "$SB_SERVER_CONFIG"
+    chmod 0400 "$LEDGER"
+    o="$(wout client.delete '{"request_id":"reqid-del-vmix07-1","name":"vmix-07","idempotency_key":"key-0000000000c2"}')"
+    chmod 0600 "$LEDGER"
+    assert_eq false "$(jqv "$o" '.ok')" 'outcome append failure is NEVER a plain success'
+    assert_eq E_STATE_UNCERTAIN "$(jqv "$o" '.code')" 'F15 maps to E_STATE_UNCERTAIN'
+    o="$(wout client.delete '{"request_id":"reqid-del-vmix07-2","name":"vmix-07","idempotency_key":"key-0000000000c2"}')"
+    assert_eq true "$(jqv "$o" '.ok')" 'the same key completes after the ledger is writable again'
+
+    printf '\n== derived cleanup is reported for what actually happened ==\n'
+    o="$(wout client.add '{"request_id":"reqid-add-vmix08-0","name":"vmix-08","idempotency_key":"key-0000000000d1"}')"
+    OLD8="$(cm_old_cred_digest "$SB_SERVER_CONFIG" vmix-08)"
+    DD8="$(cm_request_digest "client.delete" "vmix-08")"
+    cm_ledger_append_intent "key-0000000000d2" "client.delete" "vmix-08" "$DD8" 1 \
+        "reqid-del-vmix08-0" "old_cred_digest" "$OLD8" \
+        || fail 'could not stage the vmix-08 delete intent'
+    mkdir -p "$SB/clients/vmix-08"
+    jq '(.inbounds[]|select(.tag=="vless-in")|.users) |= map(select(.name != "vmix-08"))
+        | (.inbounds[]|select(.tag=="hy2-in")|.users) |= map(select(.name != "vmix-08"))' \
+        "$SB_SERVER_CONFIG" > "$SB/replay8.json" && mv "$SB/replay8.json" "$SB_SERVER_CONFIG"
+    chmod 0555 "$SB/clients"
+    o="$(wout client.delete '{"request_id":"reqid-del-vmix08-1","name":"vmix-08","idempotency_key":"key-0000000000d2"}')"
+    chmod 0755 "$SB/clients"
+    assert_eq true "$(jqv "$o" '.ok')" 'the delete itself still replays ok'
+    assert_eq false "$(jqv "$o" '.data.derived_cleanup')" \
+        'failed derived cleanup is reported as derived_cleanup=false (no false success)'
+    rm -rf "$SB/clients/vmix-08"
+
+    printf '\n== audit failure keeps the journal and defers (B5) ==\n'
+    chmod 0444 "$AUDIT"
+    o="$(wout client.add '{"request_id":"reqid-add-auditdef1","name":"vmix-11","idempotency_key":"key-0000000000e1"}')"
+    chmod 0600 "$AUDIT"
+    assert_eq true "$(jqv "$o" '.ok')" 'the mutation itself still succeeded'
+    printf '%s' "$o" | grep -qF 'audit_deferred' && pass 'the response warns audit_deferred (not a silent success)' \
+        || fail 'audit failure was not surfaced in warnings'
+    assert_eq 0 "$(count "$AUDIT" '"request_id":"reqid-add-auditdef1"')" 'no audit record was written'
+    [ -f "$SB/state/journal/reqid-add-auditdef1.json" ] \
+        && pass 'the journal was KEPT for reconciliation' \
+        || fail 'the journal was cleared despite the missing audit'
+    printf '' | "${WORKER_CMD[@]}" --maintenance reconcile >/dev/null 2>&1
+    assert_eq 1 "$(count "$AUDIT" '"request_id":"reqid-add-auditdef1"')" \
+        'reconciliation appended exactly the one missing audit'
+    [ ! -f "$SB/state/journal/reqid-add-auditdef1.json" ] \
+        && pass 'reconciliation cleared the journal only after the audit landed' \
+        || fail 'journal was not cleared after audit recovery'
+else
+    skip 'POSIX permission fault injection is exercised on Linux CI only'
+fi
+
+# ------------------------------------------------- ledger corruption (B2) ----
+printf '\n== ledger corruption is fail-closed (B2) ==\n'
+cp "$LEDGER" "$TMP/ledger.good"
+repair_ledger(){ cp "$TMP/ledger.good" "$LEDGER"; }
+
+printf '{broken json\n' >> "$LEDGER"
+o="$(wout client.add '{"request_id":"reqid-add-ledgcor1","name":"vmix-10","idempotency_key":"key-0000000000f1"}')"
+assert_eq false "$(jqv "$o" '.ok')" 'a malformed complete line refuses mutation'
+assert_eq E_LEDGER_UNAVAILABLE "$(jqv "$o" '.code')" 'corrupt ledger returns E_LEDGER_UNAVAILABLE'
+repair_ledger
+
+HEX64="$(printf 'a%.0s' $(seq 1 64))"
+printf '{"v":1,"kind":"intent","key":"key-0000000000f2","op":"client.add","name":"x","digest":"%s","generation":"two","state":"in_flight","ts":"t","request_id":"reqid-ledgcor-002","planned_cred_digest":"%s"}\n' "$HEX64" "$HEX64" >> "$LEDGER"
+o="$(wout client.add '{"request_id":"reqid-add-ledgcor2","name":"vmix-10","idempotency_key":"key-0000000000f3"}')"
+assert_eq E_LEDGER_UNAVAILABLE "$(jqv "$o" '.code')" 'a non-numeric generation refuses mutation'
+repair_ledger
+
+printf '{"v":1,"kind":"intent","key":"key-0000000000f4","op":"client.add","name":"x","digest":"%s","generation":1,"state":"done","ts":"t","request_id":"reqid-ledgcor-004","planned_cred_digest":"%s"}\n' "$HEX64" "$HEX64" >> "$LEDGER"
+o="$(wout client.add '{"request_id":"reqid-add-ledgcor3","name":"vmix-10","idempotency_key":"key-0000000000f5"}')"
+assert_eq E_LEDGER_UNAVAILABLE "$(jqv "$o" '.code')" 'a kind/state mismatch refuses mutation'
+repair_ledger
+
+printf '{"v":1,"kind":"intent","key":"short","op":"client.add","name":"x","digest":"%s","generation":1,"state":"in_flight","ts":"t","request_id":"reqid-ledgcor-005","planned_cred_digest":"%s"}\n' "$HEX64" "$HEX64" >> "$LEDGER"
+o="$(wout client.add '{"request_id":"reqid-add-ledgcor4","name":"vmix-10","idempotency_key":"key-0000000000f6"}')"
+assert_eq E_LEDGER_UNAVAILABLE "$(jqv "$o" '.code')" 'a key-schema violation refuses mutation'
+repair_ledger
+
+# partial tail: a torn write that was never durable -> truncated, op proceeds
+printf '{"v":1,"kind":"inte' >> "$LEDGER"
+[ "$(tail -c 1 "$LEDGER" | od -An -tuC | tr -d '[:space:]')" != "10" ] \
+    && pass 'partial tail staged (no trailing newline)' || fail 'partial tail staging failed'
+o="$(wout client.add '{"request_id":"reqid-add-ledgcor5","name":"vmix-10","idempotency_key":"key-0000000000f7"}')"
+assert_eq true "$(jqv "$o" '.ok')" 'a torn partial tail is repaired and the op proceeds'
+[ "$(tail -c 1 "$LEDGER" | od -An -tuC | tr -d '[:space:]')" = "10" ] \
+    && pass 'the partial tail is gone from the ledger' || fail 'partial tail survived'
+repair_ledger
+
+# complete record that only lost its terminating newline -> preserved
+printf '{"v":1,"kind":"intent","key":"key-0000000000f8","op":"client.add","name":"zz","digest":"%s","generation":1,"state":"in_flight","ts":"t","request_id":"reqid-ledgcor-008","planned_cred_digest":"%s"}' "$HEX64" "$HEX64" >> "$LEDGER"
+o="$(wout client.add '{"request_id":"reqid-add-ledgcor6","name":"vmix-12","idempotency_key":"key-0000000000f9"}')"
+assert_eq true "$(jqv "$o" '.ok')" 'a newline-less complete record does not block the helper'
+grep -qF '"key":"key-0000000000f8"' "$LEDGER" \
+    && pass 'the complete tail record was preserved (newline re-appended)' \
+    || fail 'a valid record was dropped by the repair'
+assert_eq E_IDEMPOTENCY_CONFLICT "$(jqv "$(wout client.add '{"request_id":"reqid-add-ledgcor7","name":"other-11","idempotency_key":"key-0000000000f8"}')" '.code')" \
+    'the preserved record is still authoritative for its key'
+repair_ledger
 
 printf '\nPASS=%d FAIL=%d SKIP=%d\n' "$PASS" "$FAIL" "$SKIP"
 [ "$FAIL" -eq 0 ] || { printf 'E3_M1_WORKER=FAIL\n'; exit 1; }

@@ -80,6 +80,15 @@ cmd_install() {
 
     mkdir -p -- "$dest_libexec/lib" "$dest_units" "$STATE_DIR" || die "无法创建目标目录"
     chmod 0700 -- "$STATE_DIR" 2>/dev/null || true
+    # Fail-closed ownership (E3 M1 review B8): a pre-existing state directory
+    # owned by anyone else must never keep that owner (the ledger/audit are
+    # root-only). Real installs run as root; sandboxed test prefixes skip this.
+    if [ -z "${SBXCM_PREFIX:-}" ] && [ "$(id -u 2>/dev/null)" = "0" ]; then
+        chown root:root "$STATE_DIR" 2>/dev/null \
+            || die "无法将状态目录 chown 为 root:root（fail-closed）"
+        [ "$(stat -c '%u %g' "$STATE_DIR" 2>/dev/null)" = "0 0" ] \
+            || die "状态目录所有权不是 root:root（fail-closed）"
+    fi
 
     install -m 0755 "$SRC_DIR/sbox-cm" "$dest_libexec/sbox-cm" || die "安装 sbox-cm 失败"
     install -m 0755 "$SRC_DIR/sbox-cm-ops" "$dest_libexec/sbox-cm-ops" || die "安装 sbox-cm-ops 失败"

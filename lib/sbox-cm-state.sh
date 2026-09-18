@@ -139,6 +139,31 @@ cm_state_init() {
                 "$SB_CM_STATE_DIR/journal" "$SB_CM_STATE_DIR/audit" 2>/dev/null || return 1
     chmod 0700 -- "$SB_CM_STATE_DIR" "$SB_CM_STATE_DIR/ledger" \
                   "$SB_CM_STATE_DIR/journal" "$SB_CM_STATE_DIR/audit" 2>/dev/null || return 1
+    cm_state_ensure_root_owned || return 1
+    return 0
+}
+
+# Production fail-closed ownership check (E3 M1 review B8): every runtime state
+# directory must be root:root. A pre-existing directory owned by anyone else
+# would make the root-only ledger/audit readable by that owner, so it is
+# chowned and re-verified; if the chown cannot be confirmed the caller refuses
+# to run at all. The test sandbox runs unprivileged and skips this.
+cm_state_ensure_root_owned() {
+    if [ "${SBOX_CM_TEST_SANDBOX:-0}" = "1" ]; then
+        return 0
+    fi
+    [ "$(id -u 2>/dev/null)" = "0" ] || return 1
+    local d ug
+    for d in "$SB_CM_STATE_DIR" "$SB_CM_STATE_DIR/ledger" \
+             "$SB_CM_STATE_DIR/journal" "$SB_CM_STATE_DIR/audit"; do
+        [ -d "$d" ] || continue
+        ug="$(stat -c '%u %g' "$d" 2>/dev/null)" || return 1
+        if [ "$ug" != "0 0" ]; then
+            chown root:root "$d" 2>/dev/null || return 1
+            ug="$(stat -c '%u %g' "$d" 2>/dev/null)" || return 1
+            [ "$ug" = "0 0" ] || return 1
+        fi
+    done
     return 0
 }
 
@@ -157,23 +182,101 @@ cm_ledger_append_intent() { # <key> <op> <name> <digest> <generation> <request_i
 }
 
 # Append a durable outcome. It MUST carry the same identity fields as the
-# intent (op/name/digest) so that a later same-key replay can verify that the
-# request semantics still match before returning the stored result.
-cm_ledger_append_outcome() { # <key> <op> <name> <digest> <generation> <result_json>
-    local key="$1" op="$2" name="$3" digest="$4" generation="$5" result_json="$6"
+# intent (op/name/digest/request_id) so that a later same-key replay can verify
+# that the request semantics still match AND finalize the ORIGINAL attempt's
+# journal/audit (a retry may carry a brand-new request_id).
+cm_ledger_append_outcome() { # <key> <op> <name> <digest> <generation> <request_id> <result_json>
+    local key="$1" op="$2" name="$3" digest="$4" generation="$5" request_id="$6" result_json="$7"
     if ! printf '%s' "$result_json" | jq -e 'type == "object"' >/dev/null 2>&1; then
         return 1
     fi
-    printf '{"v":1,"kind":"outcome","key":"%s","op":"%s","name":"%s","digest":"%s","generation":%s,"state":"done","ts":"%s","result":%s}\n' \
-        "$key" "$op" "$name" "$digest" "$generation" "$(cm_now_utc)" "$result_json" \
+    printf '{"v":1,"kind":"outcome","key":"%s","op":"%s","name":"%s","digest":"%s","generation":%s,"state":"done","ts":"%s","request_id":"%s","result":%s}\n' \
+        "$key" "$op" "$name" "$digest" "$generation" "$(cm_now_utc)" "$request_id" "$result_json" \
         | cm_durable_append "$(cm_ledger_path)"
 }
 
+# Schema check for ONE ledger record line (fail-closed, no silent skips).
+cm_ledger_record_ok() { # <line> -> rc 0 when schema-valid
+    printf '%s' "$1" | jq -e '
+      (type == "object") and (.v == 1)
+      and ((.kind == "intent") or (.kind == "outcome"))
+      and ((.key|type) == "string") and (.key|test("^[A-Za-z0-9._:-]{16,128}$"))
+      and ((.op|type) == "string") and ((.name|type) == "string")
+      and ((.digest|type) == "string") and (.digest|test("^[0-9a-f]{64}$"))
+      and ((.generation|type) == "number") and (.generation >= 0)
+      and ((.generation|floor) == .generation)
+      and ((.ts|type) == "string") and ((.request_id|type) == "string")
+      and (if .kind == "intent"
+           then (.state == "in_flight")
+                and (((has("planned_cred_digest") and (.planned_cred_digest|test("^[0-9a-f]{64}$")))
+                      or (has("old_cred_digest") and (.old_cred_digest|test("^[0-9a-f]{64}$")))))
+           else (.state == "done") and ((.result|type) == "object") end)
+    ' >/dev/null 2>&1
+}
+
+# Validate the WHOLE ledger fail-closed (E3 M1 review B2). Every COMPLETE line
+# must be a schema-valid record: a malformed complete line is corruption and
+# MUST refuse mutations (rc 2), never "key not found". The one sanctioned crash
+# artifact is a trailing PARTIAL line (file does not end with a newline):
+#   - if the tail parses as a complete valid record, only its terminating
+#     newline was lost by the crash -> the newline is re-appended durably;
+#   - otherwise it is a torn write that was never durable -> it is dropped.
+# Both repairs happen under the caller's exclusive lock and are fsynced.
+cm_ledger_validate() { # [file] -> rc 0 ok / 1 io error / 2 corruption
+    local file="${1:-}" line lineno
+    [ -n "$file" ] || file="$(cm_ledger_path)"
+    [ -f "$file" ] || return 0
+    [ -r "$file" ] || return 1
+
+    local has_partial=false lastb=""
+    if [ -s "$file" ]; then
+        lastb="$(tail -c 1 "$file" 2>/dev/null | od -An -tuC 2>/dev/null | tr -d '[:space:]')"
+        [ "$lastb" = "10" ] || has_partial=true
+    fi
+
+    lineno=0
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        lineno=$((lineno + 1))
+        if ! cm_ledger_record_ok "$line"; then
+            warning "ledger 第 ${lineno} 行不是合法记录（fail-closed，拒绝当作不存在）"
+            return 2
+        fi
+    done < "$file"
+
+    if [ "$has_partial" = "true" ]; then
+        local tail_line="" action="drop"
+        tail_line="$(tail -n 1 "$file" 2>/dev/null)"
+        if [ -n "$tail_line" ] && cm_ledger_record_ok "$tail_line"; then
+            action="newline"
+        fi
+        local dir tmp
+        dir="$(dirname -- "$file")"
+        tmp="$(mktemp "$dir/.ledger-fix.XXXXXX" 2>/dev/null)" || return 1
+        while IFS= read -r line; do
+            printf '%s\n' "$line"
+        done < "$file" > "$tmp"
+        [ "$action" = "newline" ] && printf '%s\n' "$tail_line" >> "$tmp"
+        if ! chmod 0600 "$tmp" 2>/dev/null; then rm -f -- "$tmp"; return 1; fi
+        if ! cm_fsync_path "$tmp"; then rm -f -- "$tmp"; return 1; fi
+        if ! mv -f -- "$tmp" "$file" 2>/dev/null; then rm -f -- "$tmp"; return 1; fi
+        cm_fsync_path "$dir" || return 1
+        if [ "$action" = "newline" ]; then
+            warning "ledger 尾部记录仅缺失换行符，已按完整记录补齐"
+        else
+            warning "ledger 尾部存在 torn 写入的半行，已在锁内截断（该行从未 durable）"
+        fi
+    fi
+    return 0
+}
+
 # Echo the LAST complete record for <key>, or nothing when there is none.
-cm_ledger_lookup() { # <key>
+# rc 2 = the ledger is corrupt (fail-closed: the caller must refuse mutation).
+cm_ledger_lookup() { # <key> [file]
     local key="$1" file="${2:-}" line last=""
     [ -n "$file" ] || file="$(cm_ledger_path)"
     [ -f "$file" ] || return 0
+    cm_ledger_validate "$file" || return $?
     while IFS= read -r line; do
         [ -n "$line" ] || continue
         case "$line" in
@@ -193,17 +296,19 @@ cm_ledger_field() { # <record-json> <jq-path>  (prints empty when absent)
     printf '%s' "$1" | jq -r "${2} // empty" 2>/dev/null
 }
 
-# Next generation for a key: 1 for a fresh key, last+1 otherwise.
+# Next generation for a key: 1 for a fresh key, last+1 otherwise. A corrupt
+# ledger propagates rc 2 (fail-closed, never silently "fresh").
 cm_ledger_next_generation() { # <key>
     local key="$1" rec gen
-    rec="$(cm_ledger_lookup "$key")"
+    rec="$(cm_ledger_lookup "$key")"; local lrc=$?
+    [ "$lrc" -ne 2 ] || return 2
     if [ -z "$rec" ]; then
         printf '1\n'
         return 0
     fi
     gen="$(cm_ledger_field "$rec" '.generation')"
     case "$gen" in
-        ''|*[!0-9]*) printf '1\n' ;;
+        ''|*[!0-9]*) return 2 ;;
         *) printf '%s\n' "$((gen + 1))" ;;
     esac
 }

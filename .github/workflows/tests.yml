@@ -60,6 +60,8 @@ jobs:
           bash -n tests/e3/test-m1-rpc.sh
           bash -n tests/e3/test-m1-static.sh
           bash -n tests/e3/test-m1-deploy.sh
+          bash -n tests/e3/test-m1-crash.sh
+          bash -n tests/e3/test-m1-systemd.sh
 
       - name: "Journal time compatibility regression suite (B6 finding: raw RFC3339 rejected by Ubuntu 22.04 journalctl)"
         run: bash tests/test-journal-time-compat.sh
@@ -114,6 +116,16 @@ jobs:
       - name: "E3 M1 deployment contract (never auto-activates; disable closes socket AND service)"
         run: bash tests/e3/test-m1-deploy.sh
 
+      - name: "E3 M1 crash points inside the commit engine (kill -9 at each journal phase)"
+        run: |
+          bash -n tests/e3/test-m1-crash.sh
+          bash tests/e3/test-m1-crash.sh
+
+      - name: "E3 M1 B-5 LIVE systemd integration (real socket+service under PID 1: PEERCRED / add / reload / rollback / reconcile)"
+        run: |
+          bash -n tests/e3/test-m1-systemd.sh
+          sudo -n bash tests/e3/test-m1-systemd.sh
+
       - name: "systemd unit validation (sbox-cm socket + service candidate)"
         run: |
           set -o pipefail
@@ -140,8 +152,16 @@ jobs:
           if [ "$vrc" -ne 0 ]; then
             echo "note: systemd-analyze verify exited rc=$vrc on ${{ matrix.os }}; no diagnostic was attributed to the sbox-cm units (see above)."
           fi
-          if systemd-analyze security --help >/dev/null 2>&1; then
-            systemd-analyze security --offline=yes "$U/sbox-cm.service" || true
+          # Informational-only BY DETECTION, never by swallowing errors: when
+          # this systemd supports --offline analysis its rc is propagated by
+          # pipefail (a nonzero rc fails the step). When it does not, the live
+          # B-5 integration step above is the enforced gate for the sbox-cm
+          # units and this line documents the capability gap explicitly.
+          if systemd-analyze security --help >"$U/security-help.log" 2>&1 \
+             && grep -q -- '--offline' "$U/security-help.log"; then
+            systemd-analyze security --offline=yes "$U/sbox-cm.service" | tee "$U/security.log"
+          else
+            echo "systemd-analyze security --offline is NOT supported on this baseline (systemd $(systemd --version | head -n1 | awk '{print $2, $3}')); the LIVE B-5 step is the enforced gate here and this analysis is documented informational-only."
           fi
 
       - name: systemd unit + hardening directive validation (portable supported subset)

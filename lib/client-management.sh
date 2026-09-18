@@ -115,9 +115,25 @@ with_client_lock() {
 }
 
 # ------------------------------------------------------------ runtime reload/health --
+# Every external substep is BOUNDED (rev5 M1 deadline revision): there is no
+# whole-op kill timer anywhere (a post-intent mutation must never be aborted),
+# so the only protection against a hung subcommand is a per-subcommand timeout.
+# `timeout` is used only for EXTERNAL commands: shell functions (the shim
+# surface the test suites inject, and anything a caller overrides) must still
+# resolve in-process -- `timeout` would exec a subshell where functions do not
+# exist and silently break every shim.
+cm_bounded() { # <seconds> <command...>
+    local secs="$1"; shift
+    if command -v timeout >/dev/null 2>&1 && ! declare -F -- "$1" >/dev/null 2>&1; then
+        timeout "$secs" "$@"
+    else
+        "$@"
+    fi
+}
+
 reload_running_singbox() {
-    if systemctl is-active --quiet sing-box 2>/dev/null; then
-        systemctl reload sing-box || return 1
+    if cm_bounded "${SB_SYSTEMCTL_TIMEOUT:-30}" systemctl is-active --quiet sing-box 2>/dev/null; then
+        cm_bounded "${SB_RELOAD_TIMEOUT:-60}" systemctl reload sing-box || return 1
     elif pgrep -x sing-box >/dev/null 2>&1; then
         kill -HUP "$(pgrep -o -x sing-box)" || return 1
     fi
@@ -126,7 +142,7 @@ reload_running_singbox() {
 
 reload_health_ok() {
     sleep 1
-    if systemctl is-active --quiet sing-box 2>/dev/null; then return 0; fi
+    if cm_bounded "${SB_SYSTEMCTL_TIMEOUT:-30}" systemctl is-active --quiet sing-box 2>/dev/null; then return 0; fi
     pgrep -x sing-box >/dev/null 2>&1
 }
 
@@ -188,9 +204,27 @@ new_backup_path() {
 # ----------------------------------------------------------- canonical commit engine --
 # The caller MUST already hold with_client_lock. Existing CLI behavior stays 0/1;
 # the non-sensitive structured state is available through cm_transaction_result_json.
+#
+# Durable phase journal hook (E3 M1 review B1): when the caller sets
+# CM_TX_JOURNAL_HOOK to a function name, that function is invoked
+#     cm_journal_hook <phase> <backup_path>
+# BEFORE each phase's irreversible action -- critically BEFORE the mv in
+# 'replace' -- so a crash at ANY point leaves a journal from which startup
+# reconciliation can prove a safe state (disk-new -> reload; unhealthy ->
+# restore backup). The hook must be durable (fsync) before returning 0. A hook
+# failure is FAIL-CLOSED: the transaction aborts (pre-replace: zero mutation;
+# post-replace: routed into the normal rollback path).
+cm_tx_journal_phase() { # <phase>
+    CM_TX_PHASE="$1"
+    if [ -n "${CM_TX_JOURNAL_HOOK:-}" ]; then
+        "$CM_TX_JOURNAL_HOOK" "$1" "${CM_TX_BACKUP_PATH:-}" || return 1
+    fi
+    return 0
+}
+
 commit_server_config() { # <candidate> <description>
     local candidate="$1" description="${2:-server config update}"
-    local backup_path was_running problems
+    local backup_path was_running problems tx_bad
 
     cm_transaction_reset
     CM_TX_PHASE="candidate"
@@ -211,8 +245,11 @@ commit_server_config() { # <candidate> <description>
         return 1
     fi
 
-    CM_TX_PHASE="check"
-    if ! "$SB_SING_BOX_BIN" check -c "$candidate" >/dev/null 2>&1; then
+    if ! cm_tx_journal_phase "check"; then
+        rm -f "$candidate"
+        return 1
+    fi
+    if ! cm_bounded "${SB_CHECK_TIMEOUT:-60}" "$SB_SING_BOX_BIN" check -c "$candidate" >/dev/null 2>&1; then
         warning "sing-box check 未通过（$description），正式配置未修改"
         rm -f "$candidate"
         return 1
@@ -226,7 +263,6 @@ commit_server_config() { # <candidate> <description>
         was_running=no
     fi
 
-    CM_TX_PHASE="backup"
     backup_path="$(new_backup_path)" || {
         warning "创建备份文件失败（$description），正式配置未修改"
         rm -f "$candidate"
@@ -245,8 +281,18 @@ commit_server_config() { # <candidate> <description>
         CM_TX_BACKUP_PATH=""
         return 1
     fi
+    if ! cm_tx_journal_phase "backup"; then
+        rm -f "$backup_path" "$candidate"
+        CM_TX_BACKUP_PATH=""
+        return 1
+    fi
 
-    CM_TX_PHASE="replace"
+    # The critical durable boundary: the journal MUST already say
+    # phase=replace + backup_path on stable storage BEFORE the live file moves.
+    if ! cm_tx_journal_phase "replace"; then
+        rm -f "$candidate"
+        return 1
+    fi
     if ! mv -f "$candidate" "$SB_SERVER_CONFIG"; then
         warning "原子替换失败（$description），已保留备份: $backup_path"
         rm -f "$candidate"
@@ -255,21 +301,29 @@ commit_server_config() { # <candidate> <description>
     CM_TX_CHANGED=true
 
     if [ "$was_running" != "no" ]; then
-        CM_TX_PHASE="reload"
+        tx_bad=false
         CM_TX_RELOAD_PERFORMED=true
-        if reload_running_singbox; then
-            CM_TX_PHASE="health"
-            if reload_health_ok; then
-                CM_TX_HEALTH_VERIFIED=true
-                info "配置已提交并重载成功: $description"
-                info "上一份配置备份: $backup_path"
-                return 0
-            fi
+        if ! cm_tx_journal_phase "reload"; then
+            tx_bad=true
+        elif ! reload_running_singbox; then
+            tx_bad=true
+        elif ! cm_tx_journal_phase "health"; then
+            tx_bad=true
+        elif ! reload_health_ok; then
+            tx_bad=true
+        fi
+        if [ "$tx_bad" != "true" ]; then
+            CM_TX_HEALTH_VERIFIED=true
+            info "配置已提交并重载成功: $description"
+            info "上一份配置备份: $backup_path"
+            return 0
         fi
 
         warning "reload 后健康检查失败（$description），自动回滚..."
-        CM_TX_PHASE="rollback"
         CM_TX_ROLLBACK_ATTEMPTED=true
+        # Journal the rollback intent best-effort: the restore itself matters
+        # more than the record, and a failed journal write must not skip it.
+        cm_tx_journal_phase "rollback" || warning "回滚前 journal 写入失败（回滚照常执行）"
         if ! restore_file_atomically "$backup_path" "$SB_SERVER_CONFIG" 0600; then
             CM_TX_PHASE="rollback_manual"
             CM_TX_ROLLBACK_OK=false

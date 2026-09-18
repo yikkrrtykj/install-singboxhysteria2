@@ -162,6 +162,29 @@ want "$LIB" 'cm_planned_cred_digest' 'canonical planned digest primitive present
 want "$WORKER" 'reconcile' 'worker supports startup reconciliation'
 want "$WORKER" 'E_MANUAL_INTERVENTION' 'degraded mutations fail closed'
 
+printf '\n== review-blocker contracts (B1-B8) ==\n'
+want "$LIB" 'cm_tx_journal_phase' 'commit engine journals each phase via the hook (B1)'
+want "$WORKER" 'w_journal_hook' 'worker installs the durable phase hook (B1)'
+want "$STATE_LIB" 'cm_ledger_validate' 'ledger is fully validated fail-closed (B2)'
+want "$STATE_LIB" 'cm_ledger_record_ok' 'ledger records carry a frozen schema (B2)'
+want "$LIB" 'cm_bounded' 'external substeps are bounded (B6)'
+want "$WORKER" 'w_finalize_original' 'replay finalizes the ORIGINAL attempt (B3)'
+want "$DAEMON" 'run_maintenance' 'daemon exposes the maintenance entry point (B4)'
+want "$DAEMON" 'threading.Thread' 'each connection is served on its own thread (B6)'
+want "$STATE_LIB" 'cm_state_ensure_root_owned' 'state ownership is fail-closed root:root (B8)'
+want "$DAEMON" 'st_uid != 0' 'daemon verifies state-dir ownership (B8)'
+want "$SERVICE_UNIT" '-/run/systemd' 'minimal manager-socket carve-out for systemctl (B-5)'
+if has "$WORKER" 'exec 9>>'; then
+    fail 'worker still probes the lock with a creating open (B7)'
+else
+    pass 'worker lock probe never creates the anchor (B7)'
+fi
+if has "$WORKER" 'exec 9<'; then
+    pass 'worker lock probe opens the anchor read-only (B7)'
+else
+    fail 'worker lock probe is not read-only (B7)'
+fi
+
 printf '\nPASS=%d FAIL=%d SKIP=%d\n' "$PASS" "$FAIL" "$SKIP"
 [ "$FAIL" -eq 0 ] || { printf 'E3_M1_STATIC=FAIL\n'; exit 1; }
 printf 'E3_M1_STATIC=PASS\n'

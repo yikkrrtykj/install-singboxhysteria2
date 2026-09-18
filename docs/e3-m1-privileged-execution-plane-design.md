@@ -13,9 +13,9 @@
 | M1-B | `sbox-cm/sbox-cm`（RPC core）+ `sbox-cm/deploy/sbox-cm.socket.in` |
 | M1-C/D | `lib/sbox-cm-state.sh`（ledger/journal/audit/marker/degraded，write→fsync(file)→fsync(dir)） |
 | M1-B..E | `sbox-cm/sbox-cm-ops`（六 op、锁内固定次序、调和、degraded、派生清理） |
-| M1-E | `management.deactivate` + `sbox-cm mgmt-deactivate` + `install-sbox-cm.sh recover`（`active_stale` 唯一恢复路径） |
-| B-5 | `sbox-cm/deploy/sbox-cm.service.in`（严格候选旗标集；CAP_CHOWN 不再需要） |
-| 测试 | `tests/e3/test-m1-{shared-lib,static,worker,rpc}.sh` + `tests/e3/m1-rpc-probe.py` |
+| M1-E | `management.deactivate`（公开 RPC，active_stale 拒绝）+ worker `--maintenance mgmt-deactivate`（root-only 恢复 verb，不在六 op allowlist）+ `sbox-cm mgmt-deactivate` CLI + `install-sbox-cm.sh recover` |
+| B-5 | `sbox-cm/deploy/sbox-cm.service.in`（严格候选旗标集 + `-/run/systemd` 最小 carve-out）+ `tests/e3/test-m1-systemd.sh`（真实 PID 1 运行时集成） |
+| 测试 | `tests/e3/test-m1-{shared-lib,static,worker,rpc,crash,systemd}.sh` + `tests/e3/m1-rpc-probe.py` |
 
 依赖链事实（已完成，均可作为本方案的基线）：
 
@@ -244,16 +244,24 @@ MA-6  CLI 与 daemon 共用同一组原语（L3 精神）；CLI 侧 0/1 返回�
 
 ## 4. 六个 op（保持 rev5 §7 原样，不增不减）
 
-| op | Lock | degraded 时 | active 要求 | deadline |
-| --- | --- | --- | --- | --- |
-| `management.status` | 不等锁 | 可用 | 无 | 10 s |
-| `client.list` | 是 | 可用（或显式报读错） | 无 | 15 s |
-| `management.activate` | 是 | **拒绝** | 无 | 30 s |
-| `management.deactivate` | 是 | **拒绝** | 无 | 30 s |
-| `client.add` | 是 | **拒绝** | active | 120 s |
-| `client.delete` | 是 | **拒绝** | active | 120 s |
+> **Review #2 修订（B6 deadline 合同改版）**：helper **不实施 per-op 整体 deadline**。原因：post-intent 事务绝不可杀，而 pre-intent/post-intent 的 handoff 无法在"dispatch 后即失联"模型下可靠判定。替代合同：
+> - 传输层唯一强制的时限是 **5 s 帧读取超时**；
+> - worker 内**每个外部子步**（`sing-box check` / `systemctl reload` / health 探测）各自有 bounded timeout（`cm_bounded`，超时按正常事务错误/回滚处理）；
+> - **120 s 仅为 M2 调用方等待预算**，不再是任何杀事务的定时器；
+> - daemon 为每个连接起独立线程 serve，单个慢 mutation 不阻塞 status/list（worker 层仍由 config.lock 串行化）。
 
-`client.list`：锁内读 live config，只返回 `name / protocols / reserved / mutable / source`，≤1000 条 + `truncated`，**零 UUID / password / 私钥 / YAML / 分享 URI**。`source` 只认正向证据（registry 有 `web` 记录），缺失一律 `untracked`，绝不推断 `cli`。`active_stale`（marker 在、配置亡）的人工恢复走 **root CLI**，不做静默自动清除。
+| op | Lock | degraded 时 | active 要求 |
+| --- | --- | --- | --- |
+| `management.status` | 不等锁 | 可用 | 无 |
+| `client.list` | 是 | 可用（或显式报读错） | 无 |
+| `management.activate` | 是 | **拒绝** | 无 |
+| `management.deactivate` | 是 | **拒绝**（active_stale 亦拒绝，见 §M1-E） | 无 |
+| `client.add` | 是 | **拒绝** | active |
+| `client.delete` | 是 | **拒绝** | active |
+
+`management.status` 的只读合同（Review #2 B7）：**无锁、零 mutation、零修复**；允许两类**只读、不创建文件**的探针——live config 的存在性/JSON 可解析性（这正是 `active_stale` 的定义依据）与 config.lock 锚点的非阻塞 flock 探测（锚点不存在 = 空闲；探测用只读打开，**绝不 `>>` 创建**）。
+
+`client.list`：锁内读 live config，只返回 `name / protocols / reserved / mutable / source`，≤1000 条 + `truncated`，**零 UUID / password / 私钥 / YAML / 分享 URI**。`source` 只认正向证据（registry 有 `web` 记录），缺失一律 `untracked`，绝不推断 `cli`。`active_stale`（marker 在、配置亡）的人工恢复走 **root CLI**（maintenance verb，见 §M1-E），不做静默自动清除。
 
 ---
 
@@ -339,7 +347,17 @@ degraded = true, reconcile = "manual_intervention"
   → 绝不 cancel；socket 断开也跑完并写 outcome + audit
 ```
 
+> **Review #2 修订（B6）**：上表原拟的 per-op helper deadline（10/15/30/120 s）**正式取消**。正式合同改为：helper 不设整体 op deadline（不存在 `communicate(timeout=...)`），唯一传输时限为 5 s 帧读取；worker 的外部子步（check/reload/health）以 `cm_bounded` 各自限时并按事务错误/回滚处理；120 s 归属 M2 调用方预算。理由：post-intent 不可杀 ⇒ 任何整体计时器要么违反该承诺、要么需要无法可靠判定的 pre/post-intent handoff。配套：daemon 每连接一线程，慢 mutation 不阻塞 status/list。
+
+**Review #2 修订（B3 delete replay 收尾）**：同 key 重试可携带**新 request_id**；outcome 记录现在也携带 `request_id`（原始 attempt 的）。replay/finalize 路径（done-replay、add 的 digest 吻合、delete 的 name 已亡）一律用 ledger 中**原始 request_id** 收尾：补齐其 audit（原 audit_id，exactly-once 守卫）并清其 journal，而非清当前重试的。 outcome 落盘失败 ⇒ `E_STATE_UNCERTAIN`（F15），绝不假成功；派生目录清理**如实上报**（失败 ⇒ `derived_cleanup:false` + warning）。
+
+**Review #2 修订（B5 audit 闭环）**：终态次序冻结为 **durable outcome → durable audit → journal clear → response**。audit 写失败 ⇒ **不清 journal**、响应携带 `audit_deferred` warning（不是普通成功），由启动调和用**同一 audit_id** 补齐后才清 journal（`cm_audit_has` 守卫防重复）。调和自身同样 gate：audit 未 durable 不清 journal。
+
 `client.add` / `client.delete` 的 120 s 是**调用方等待预算**，不是杀事务的定时器。承诺一句话：**Web / browser 断连 ≠ root transaction abort。**（M0.5 的吊销语义与之对齐：已过授权门的请求不被重新判定、也不被半途中止。）
+
+**Review #2 修订（B1 crash-phase journal）**：commit 引擎新增可选 durable phase hook（`CM_TX_JOURNAL_HOOK`）——worker 注入 `w_journal_hook`，在 `check/backup/replace/reload/health/rollback` **每个 phase 的不可逆动作之前**把 `phase + backup_path` fsync 进 tx journal；尤其 `phase=replace` 必须在真实 `mv` 之前落盘。hook 失败 = fail-closed（pre-replace 零变更中止；post-replace 走正常回滚路径）。崩溃点测试（`test-m1-crash.sh`）**真实 `kill -9` 于各 phase 边界**（经 hook 注入），并验证随后的真实 worker reconcile 收敛：disk 新 ⇒ reload；不可证 ⇒ 从 journal 的 backup_path restore + degraded。**不是第二套 commit engine**——CLI 不设 hook，行为不变。
+
+**Review #2 修订（B2 ledger fail-closed）**：`cm_ledger_validate` 在锁内 lookup 之前验证**整个 ledger 的每一条完整记录**（冻结 schema：`v/kind/key/op/name/digest/generation/ts/request_id` + intent 的 cred digest 或 outcome 的 result 对象）；任何完整 malformed record ⇒ `E_LEDGER_UNAVAILABLE`（拒绝 mutation，绝不当作"无此 key"）。唯一豁免：文件末尾**无换行的 partial tail**——能完整解析 ⇒ 视为仅丢失换行符并补齐；否则视为 torn write（从未 durable）在锁内截断。`generation` 非数字同样 fail-closed。
 
 ---
 
@@ -358,19 +376,21 @@ ProtectHome=read-only
 PrivateTmp=yes
 NoNewPrivileges=yes
 RestrictAddressFamilies=AF_UNIX
-ReadWritePaths=/run/sbox-cm /root/sbox /var/lib/sbox-cm
-CapabilityBoundingSet=CAP_KILL CAP_DAC_OVERRIDE          # D-1 若走 daemon 自 bind 则 + CAP_CHOWN
+ReadWritePaths=/run/sbox-cm /root/sbox /var/lib/sbox-cm -/run/systemd
+CapabilityBoundingSet=CAP_KILL CAP_DAC_OVERRIDE          # D-1 已定案：socket activation，无 CAP_CHOWN
 ```
 
-原则：**最严起步，出问题只移除必要那一项**，逐项留痕。
+> **Review #2 B-5 实测结论**：`ProtectSystem=strict` 将 `/run` 整体只读，而 `systemctl reload/is-active sing-box` 需要 **connect** 到 manager 私有 socket `/run/systemd/private`（connect 需要对该 inode 的写权限）——故最小 carve-out 为 `ReadWritePaths=-/run/systemd`（`-` 容忍缺席），即 D-6 预判的交互问题的落地修复。socket 属主（D-1）定案为 **systemd socket 单元**（`SocketMode=0660`/`SocketGroup=sboxweb`），daemon 侧 PEERCRED 复核保留为纵深防御。
 
-B-5 实测项（M1 验收内容）：
+B-5 实测项（M1 验收内容，`tests/e3/test-m1-systemd.sh` 于真实 PID 1 下强制执行）：
 
 ```text
-· systemctl reload sing-box（D-Bus + systemd 交互）在 ProtectSystem=strict 下是否可用
-· CapabilityBoundingSet 最小集（CAP_KILL 供 kill -HUP 回退；CAP_DAC_OVERRIDE 供跨属主写入）
-· socket 属主/模式由 daemon 还是 systemd socket 单元负责（D-1）
-· ProtectSystem=strict 下 /run 的写权限（RuntimeDirectory / ReadWritePaths 覆盖）
+· hardened socket/service 真实启动：socket root:sboxweb 0660，socket activation 生效
+· sboxweb 经真实 socket 全流程：status/activate/add(reload 计数)/list/delete/deactivate
+· PEERCRED：其他 uid 拒绝；root 也拒绝（无 RPC 后门）
+· ExecReload 失败注入 ⇒ 经 hardened unit 自动回滚，config 逐字节还原，daemon 存活
+· /var/lib/sbox-cm 属主非 root ⇒ daemon 启动 fail-closed（B8）；修复后正常
+· 孤儿 journal + restart ⇒ 启动调和清账
 ```
 
 ---
@@ -383,7 +403,7 @@ B-5 实测项（M1 验收内容）：
 | **M1-B** | AF_UNIX daemon、socket ownership、PEERCRED、frame/schema/deadline、六 op dispatch | M1-A 的调用契约 | |
 | **M1-C** | ledger + Idempotency-Key + generation/supersede/reconciliation | M1-A | |
 | **M1-D** | tx journal + crash recovery + degraded + file/dir fsync | M1-C | |
-| **M1-E** | management marker、status/list、audit exactly-once、registry advisory、`mgmt-deactivate` root CLI（active_stale 恢复） | M1-B | |
+| **M1-E** | management marker、status/list、audit exactly-once（durable 闭环）、registry advisory、root-only `--maintenance mgmt-deactivate`（active_stale 恢复；公开 RPC `management.deactivate` 对 active_stale 拒绝） | M1-B | |
 | **M1-F / G6** | frame fuzz、peer-auth、crash points、R1–R12、F1–F22 相关、systemd sandbox、全通道 secret hygiene | M1-E | |
 
 顺序约束：**M1-A 必须最先合入**，它是 M1-B..F 的调用契约；M1 不得先于 M0/M0.5（保护来自 M0）。
@@ -455,12 +475,26 @@ M1 完成后仍保持默认安全态。只有 M2 接入 Web、M3 收口 G1–G6 
 
 | # | 项 | 说明 | 归属 |
 | --- | --- | --- | --- |
-| D-1 | socket 属主责任方 | daemon 自 bind（+`CAP_CHOWN`）vs systemd socket 单元（无 `CAP_CHOWN`）二选一 | B-5 / M1-B |
-| D-2 | daemon 语言 | 本方案选 Python 3.10 stdlib（RPC Core）+ bash worker（Transaction Backend）；契约语言无关 | M1-B 前定案 |
-| D-3 | `mgmt-deactivate` root CLI | `active_stale` 恢复路径当前不存在（`require_management_inactive` 已在 `install.sh:2745`） | M1-E |
+| ~~D-1~~ | socket 属主责任方 | **已定案**：systemd socket 单元（`sbox-cm.socket`，无 `CAP_CHOWN`）；daemon 保留 PEERCRED/属主复核 | 已闭合 |
+| D-2 | daemon 语言 | Python 3.10 stdlib（RPC Core）+ bash worker（Transaction Backend）；契约语言无关 | 已定案 |
+| ~~D-3~~ | `mgmt-deactivate` root CLI | **已定案**：worker `--maintenance mgmt-deactivate`（不在六 op allowlist）；公开 RPC 对 active_stale 拒绝 | 已闭合 |
 | D-4 | registry | advisory 元数据层尚未存在；`source` 缺省 `untracked`，不得推断 | M1-E |
 | D-5 | M0.5 的 `management_active` provider | 必须从阶段性 provider 切换为 `management.status` RPC 读取，Web 永不 stat 标记 | M1-E → M2 |
-| D-6 | systemd sandbox 与 D-Bus/reload 交互 | 只能在 M1 实测，失败回退最保守旗标集 | B-5 |
+| ~~D-6~~ | systemd sandbox 与 D-Bus/reload 交互 | **已实测**：`-/run/systemd` 最小 carve-out + `test-m1-systemd.sh` 真实运行时集成 | 已闭合 |
+
+### Review #2 修复清单（本轮，同分支）
+
+| # | 修复 | 测试 |
+| --- | --- | --- |
+| B1 | commit 引擎 durable phase hook；`phase=replace` 于 `mv` 前 fsync；worker 注入 `w_journal_hook` | `test-m1-crash.sh`（各 phase 真实 kill -9 + reconcile 收敛/restore/degraded） |
+| B2 | `cm_ledger_validate` 全量 fail-closed 校验 + partial tail 规则；generation fail-closed | `test-m1-worker.sh` 账本损坏矩阵（malformed/坏 generation/坏 state/坏 key schema/partial tail/无换行完整记录） |
+| B3 | replay 用 ledger 原 request_id 收尾旧 journal/audit；outcome 记录带 request_id；F15 `E_STATE_UNCERTAIN`；derived 清理如实上报 | `test-m1-worker.sh`（新 request_id 重试收尾 / 只读 ledger 注入 / 只读 clients 目录注入） |
+| B4 | 公开 RPC `management.deactivate` 对 active_stale 拒绝；root 恢复走 `--maintenance mgmt-deactivate` | `test-m1-worker.sh`（RPC 拒绝 + marker 不灭 + maintenance 恢复） |
+| B5 | 终态次序 outcome→audit→journal clear→response；audit 失败保留 journal + `audit_deferred`；调和补 audit 后才清 | `test-m1-worker.sh`（只读 audit 文件注入 + reconcile 补账） |
+| B6 | 撤销 helper per-op deadline（本文档正式修订）；子步 `cm_bounded` 限时；daemon 每连接一线程 | static 断言 + 全套件回归 |
+| B7 | status 只读合同：lock 探测只读不创建；live 探测定位 active_stale | `test-m1-worker.sh`（status 后锚点不存在） |
+| B8 | `cm_state_init`/daemon `ensure_state_dir`/installer 三处 root:root 所有权 fail-closed | `test-m1-systemd.sh`（非 root 属主 ⇒ 启动失败） |
+| B-5 | `-/run/systemd` carve-out；真实 systemd 运行时集成测试；workflow 中 `security --offline` 的 `|| true` 改为显式能力探测 | `test-m1-systemd.sh`（socket/PEERCRED/add/reload 计数/rollback/reconcile/所有权） |
 
 ---
 

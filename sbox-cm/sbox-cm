@@ -5,7 +5,7 @@ This process is the RPC Core half of the privileged execution plane. It owns
 ONLY the transport and the connection boundary:
 
     AF_UNIX (systemd socket activation) / SO_PEERCRED / length-prefixed frame
-    schema validation / per-op deadlines / dispatch / request_id replay cache
+    schema validation / dispatch / request_id replay cache
     connection-level audit
 
 It never reads or writes sbconfig_server.json, never computes a credential
@@ -15,15 +15,23 @@ read-only ones -- is dispatched to the root transaction worker
 generation, commit_server_config and the privileged audit. There is exactly ONE
 transaction engine in the system and it is not here.
 
-After a durable ledger intent has been written the worker is NEVER killed:
-there is no `communicate(timeout=...)` anywhere in this file, and a client
-disconnect must not abort a transaction that already entered mutation.
+Deadline contract (E3 M1 review B6): the helper enforces NO whole-op deadline.
+The only enforced transport deadline is the 5s frame read. Every external
+substep inside the worker (sing-box check, systemctl reload, health probe) is
+bounded by its own timeout in the shared library, and the 120s figure is the
+M2 CALLER's wait budget. This is deliberate: after a durable ledger intent has
+been written the worker is NEVER killed -- there is no
+`communicate(timeout=...)` anywhere in this file, and a client disconnect must
+not abort a transaction that already entered mutation. So that one slow
+mutation cannot starve status/list, each accepted connection is served by its
+own daemon thread (config.lock still serializes the workers).
 
 Subcommands:
     run                serve the RPC socket
     reconcile          run startup reconciliation once (also run at boot)
-    mgmt-deactivate    root recovery CLI: clear the activation marker
-                       (active_stale recovery; the ONLY path, no manual rm)
+    mgmt-deactivate    root recovery CLI: clear the activation marker via the
+                       maintenance verb (active_stale recovery; the ONLY path,
+                       no manual rm, NOT reachable over the RPC socket)
 """
 
 import errno
@@ -34,6 +42,7 @@ import socket
 import struct
 import subprocess
 import sys
+import threading
 import time
 from collections import OrderedDict
 
@@ -138,6 +147,24 @@ def ensure_state_dir():
             os.chmod(path, 0o700)
         except OSError:
             return False
+    # Production fail-closed ownership check (E3 M1 review B8): the root-only
+    # ledger/audit must never end up readable by another owner. A pre-existing
+    # directory owned by anyone else is chowned root:root and re-verified; if
+    # that cannot be confirmed the daemon refuses to start. The unprivileged
+    # test sandbox skips this.
+    if not sandbox() and hasattr(os, "geteuid") and os.geteuid() == 0:
+        for sub in ("", "/ledger", "/journal", "/audit"):
+            path = state_dir() + sub
+            try:
+                st = os.stat(path)
+                if st.st_uid != 0 or st.st_gid != 0:
+                    os.chown(path, 0, 0)
+                    st = os.stat(path)
+                if st.st_uid != 0 or st.st_gid != 0:
+                    log("state directory %s is not root-owned (fail-closed)" % path)
+                    return False
+            except OSError:
+                return False
     return True
 
 
@@ -247,9 +274,16 @@ def run_worker(op, args):
 
 def run_reconcile():
     """Run the worker's startup reconciliation (maintenance form, argv only)."""
+    return run_maintenance("reconcile")
+
+
+def run_maintenance(verb):
+    """Run a root-only maintenance verb of the worker (argv only, never a
+    request-driven op). `reconcile` runs at daemon startup; `mgmt-deactivate`
+    is the one sanctioned active_stale recovery path."""
     try:
         proc = subprocess.Popen(
-            [worker_path(), "--maintenance", "reconcile"],
+            [worker_path(), "--maintenance", verb],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=None,
@@ -257,7 +291,7 @@ def run_reconcile():
             close_fds=True,
         )
     except OSError as exc:
-        raise RpcError("E_INTERNAL", "reconcile", False, "worker 启动失败: %s" % exc.errno)
+        raise RpcError("E_INTERNAL", verb, False, "worker 启动失败: %s" % exc.errno)
     out, _ = proc.communicate(b"")
     for line in (out or b"").decode("utf-8", "replace").splitlines():
         line = line.strip()
@@ -269,7 +303,7 @@ def run_reconcile():
             continue
         if isinstance(obj, dict) and "ok" in obj:
             return obj
-    raise RpcError("E_INTERNAL", "reconcile", False, "reconcile 未返回协议结果")
+    raise RpcError("E_INTERNAL", verb, False, "maintenance %s 未返回协议结果" % verb)
 
 
 # ------------------------------------------------------------------- validate --
@@ -406,23 +440,26 @@ def send_frame(conn, obj):
 
 # ----------------------------------------------------------------- replay cache --
 _replay = OrderedDict()
+_replay_lock = threading.Lock()
 
 
 def replay_get(request_id):
-    entry = _replay.get(request_id)
-    if entry is None:
-        return None
-    ts, resp = entry
-    if time.monotonic() - ts > REPLAY_TTL:
-        del _replay[request_id]
-        return None
-    return resp
+    with _replay_lock:
+        entry = _replay.get(request_id)
+        if entry is None:
+            return None
+        ts, resp = entry
+        if time.monotonic() - ts > REPLAY_TTL:
+            del _replay[request_id]
+            return None
+        return resp
 
 
 def replay_put(request_id, resp):
-    _replay[request_id] = (time.monotonic(), resp)
-    while len(_replay) > REPLAY_MAX:
-        _replay.popitem(last=False)
+    with _replay_lock:
+        _replay[request_id] = (time.monotonic(), resp)
+        while len(_replay) > REPLAY_MAX:
+            _replay.popitem(last=False)
 
 
 # ------------------------------------------------------------------- peer auth --
@@ -591,16 +628,15 @@ def cmd_run():
                 continue
             log("accept failed: %s" % exc)
             return 2
-        handle_connection(conn, allowed)
+        # One daemon thread per connection: a slow (but never killed) mutation
+        # worker must not stop status/list from being served. The workers
+        # themselves are still serialized by config.lock inside the worker.
+        worker = threading.Thread(target=handle_connection, args=(conn, allowed),
+                                  daemon=True)
+        worker.start()
 
 
 # ------------------------------------------------------------------- CLI verbs --
-def _run_worker_cli(op, args):
-    wres = run_worker(op, args)
-    sys.stdout.write(json.dumps(wres, ensure_ascii=False, indent=2) + "\n")
-    return 0 if wres.get("ok") else 1
-
-
 def cmd_reconcile():
     res = run_reconcile()
     sys.stdout.write(json.dumps(res, ensure_ascii=False, indent=2) + "\n")
@@ -608,8 +644,12 @@ def cmd_reconcile():
 
 
 def cmd_mgmt_deactivate():
-    request_id = "cli-mgmt-deactivate-%d" % int(time.time())
-    return _run_worker_cli("management.deactivate", {"request_id": request_id})
+    """Root recovery CLI: dispatches the worker's MAINTENANCE verb, which is
+    deliberately NOT one of the six public RPC ops -- an active_stale marker
+    must never be clearable through the RPC socket."""
+    res = run_maintenance("mgmt-deactivate")
+    sys.stdout.write(json.dumps(res, ensure_ascii=False, indent=2) + "\n")
+    return 0 if res.get("ok") else 1
 
 
 def usage():

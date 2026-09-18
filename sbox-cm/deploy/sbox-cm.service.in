@@ -31,9 +31,14 @@ LockPersonality=true
 SystemCallArchitectures=native
 # AF_UNIX only: RPC socket + systemd/D-Bus for `systemctl reload sing-box`.
 RestrictAddressFamilies=AF_UNIX
-# The three writable trees, nothing else. /run/sbox-cm is the socket directory
+# The writable trees, nothing else. /run/sbox-cm is the socket directory
 # (writable so the daemon can complete its post-bind ownership check).
-ReadWritePaths=/run/sbox-cm /root/sbox /var/lib/sbox-cm
+# /run/systemd is the minimal B-5 carve-out: ProtectSystem=strict mounts /run
+# read-only, and both `systemctl reload sing-box` (commit path) and
+# `systemctl is-active sing-box` (health/running probes) connect to the
+# manager's private socket at /run/systemd/private, which requires write
+# permission on that inode. The leading '-' tolerates its absence.
+ReadWritePaths=/run/sbox-cm /root/sbox /var/lib/sbox-cm -/run/systemd
 # CAP_KILL: kill -HUP fallback for a manually started sing-box.
 # CAP_DAC_OVERRIDE: cross-owner writes under /root/sbox.
 # CAP_CHOWN is deliberately NOT granted -- socket ownership belongs to PID 1.
