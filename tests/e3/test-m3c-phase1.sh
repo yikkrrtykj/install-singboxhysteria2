@@ -10,7 +10,7 @@ ORCH="$ROOT/monitor-v2/deploy/e3-m3c-phase1.sh"
 TMP="$(mktemp -d)"
 PASS=0
 FAIL=0
-EXPECTED_TOTAL=40
+EXPECTED_TOTAL=52
 
 pass() { PASS=$((PASS + 1)); printf '  PASS %s\n' "$*"; }
 fail() { FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "$*"; }
@@ -66,6 +66,9 @@ setup_fixture() {
     : >"$FIX/monitor-calls"
     : >"$FIX/full-rollback-count"
     : >"$FIX/monitor-rollback-count"
+    : >"$FIX/primitive-env.log"
+    : >"$FIX/status-probe-count"
+    printf 'inactive\n' >"$FIX/independent-status"
 
     make_stub "$FIX/bin/systemctl" <<'STUB'
 #!/usr/bin/env bash
@@ -132,6 +135,7 @@ STUB
     make_stub "$FIX/bin/preflight" <<'STUB'
 #!/usr/bin/env bash
 set -u
+env | sort >>"$FX/primitive-env.log"
 [ "${1:-}" = "--baseline-out" ] || exit 2
 out="${2:-}"
 sha="$(sha256sum "$E3_PHASE1_TEST_CONFIG" | awk '{print $1}')"
@@ -155,6 +159,7 @@ STUB
     make_stub "$FIX/bin/install-monitor" <<'STUB'
 #!/usr/bin/env bash
 set -u
+env | sort >>"$FX/primitive-env.log"
 printf '%s keep=%s\n' "$*" "${SBMON_KEEP_RELEASES:-unset}" >>"$FX/monitor-calls"
 case "${1:-}" in
   upgrade)
@@ -164,10 +169,20 @@ case "${1:-}" in
     fi
     n="$(($(find "$FX/releases" -mindepth 1 -maxdepth 1 -type d -name 'rel-new-*' | wc -l) + 1))"
     id="rel-new-$n"
+    if [ -e "$FX/concurrent-release" ]; then
+      mkdir -p "$FX/releases/rel-concurrent/app/monitor-v2"
+      printf '0.1.0\n' >"$FX/releases/rel-concurrent/VERSION"
+    fi
     mkdir -p "$FX/releases/$id/app/monitor-v2"
     cp "$ROOT/monitor-v2/VERSION" "$FX/releases/$id/VERSION"
     printf '# restaged\n' >"$FX/releases/$id/app/monitor-v2/webapp.py"
     printf '%s\n' "$FX/releases/$id" >"$FX/monitor.target"
+    keep="${SBMON_KEEP_RELEASES:-3}"
+    count="$(find "$FX/releases" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')"
+    # Simulate the dangerous outcome of pruning after a concurrent release:
+    # the baseline is the first candidate.  The Phase 1 no-prune value must
+    # make this branch unreachable.
+    if [ "$count" -gt "$keep" ]; then rm -rf -- "$FX/releases/rel-base"; fi
     if [ -e "$FX/d2-drift" ]; then printf 'drifted timestamp\n' >"$FX/sing-ts"; fi
     printf 'action=repair version=%s\n' "$(tr -d ' \t\r\n' <"$ROOT/monitor-v2/VERSION")"
     ;;
@@ -186,6 +201,7 @@ STUB
     make_stub "$FIX/bin/install-helper" <<'STUB'
 #!/usr/bin/env bash
 set -u
+env | sort >>"$FX/primitive-env.log"
 [ "${1:-}" = install ] || exit 2
 mkdir -p "$E3_PHASE1_TEST_SBXCM_LIBEXEC/lib" "$E3_PHASE1_TEST_UNIT_DIR"
 : >"$E3_PHASE1_TEST_SBXCM_LIBEXEC/sbox-cm"
@@ -204,6 +220,7 @@ STUB
     make_stub "$FIX/bin/verify" <<'STUB'
 #!/usr/bin/env bash
 set -u
+env | sort >>"$FX/primitive-env.log"
 [ "${1:-}" = "--baseline" ] || exit 2
 if [ "$(cat "$FX/service-active")" != inactive ]; then
   printf 'service was not inactive before first RPC\n' >&2
@@ -218,11 +235,23 @@ fi
 printf '  PASS V07 management.status (sboxweb RPC) reports inactive\n'
 printf '  PASS V05b sbox-cm.service pulled up by the real RPC (socket activation works)\n'
 printf 'E3_M3_VERIFY=PASS\n'
+if [ -e "$FX/post-verify-socket-disabled" ]; then printf 'disabled\n' >"$FX/socket-enabled"; fi
+if [ -e "$FX/post-verify-service-enabled" ]; then printf 'enabled\n' >"$FX/service-enabled"; fi
+STUB
+
+    make_stub "$FIX/bin/status-probe" <<'STUB'
+#!/usr/bin/env bash
+set -u
+env | sort >>"$FX/primitive-env.log"
+printf x >>"$FX/status-probe-count"
+jq -n --arg state "$(cat "$FX/independent-status")" \
+  '{ok:true,data:{management_state:$state}}'
 STUB
 
     make_stub "$FIX/bin/full-rollback" <<'STUB'
 #!/usr/bin/env bash
 set -u
+env | sort >>"$FX/primitive-env.log"
 [ "${1:-}" = "--baseline" ] || exit 2
 printf x >>"$FX/full-rollback-count"
 rm -rf -- "$E3_PHASE1_TEST_SBXCM_LIBEXEC"
@@ -256,6 +285,10 @@ STUB
     export E3_PHASE1_TEST_INSTALL_SBXCM="$FIX/bin/install-helper"
     export E3_PHASE1_TEST_DEPLOY_VERIFY="$FIX/bin/verify"
     export E3_PHASE1_TEST_ROLLBACK="$FIX/bin/full-rollback"
+    export E3_PHASE1_TEST_STATUS_PROBE="$FIX/bin/status-probe"
+    export E3_PHASE1_TEST_FIXTURE_ROOT="$FIX"
+    export E3_PHASE1_TEST_SOURCE_HEAD="fixture-reviewed-head"
+    export E3_PHASE1_APPROVED_HEAD="fixture-reviewed-head"
     export PATH="$FIX/bin:$ORIGINAL_PATH"
 }
 
@@ -281,18 +314,41 @@ assert_eq "$BASE_LINK" "$(readlink -f "$FIX/monitor")" \
     'same-version ordinary upgrade is a true noop in the fixture'
 assert_contains "$FIX/plain-upgrade.out" 'action=noop' \
     'ordinary same-version upgrade reports action=noop'
+: >"$FIX/primitive-env.log"
+: >"$FIX/concurrent-release"
+# Poison every known override family.  The orchestrator's clean environment
+# must keep these values out of all five primitives and the status probe.
+export E3_CONFIG=/poison/e3-config
+export E3_MONITOR_APP=/poison/e3-monitor
+export E3_SBXCM_STATE=/poison/e3-state
+export E3_SBXCM_LIBEXEC=/poison/e3-libexec
+export E3_INSTALL_MONITOR=/poison/e3-installer
+export E3_RELEASES_DIR=/poison/e3-releases
+export SBMON_APP_LINK=/poison/sbmon-app
+export SBMON_RELEASES_DIR=/poison/sbmon-releases
+export SBMON_KEEP_RELEASES=1
+export SBMON_SYSTEMCTL=/poison/systemctl
+export SBXCM_PREFIX=/poison/prefix
+export SBXCM_LIBEXEC=/poison/sbxcm-libexec
+export SBXCM_UNIT_DIR=/poison/units
+export SB_CM_STATE_DIR=/poison/cm-state
+export SBXCM_SYSTEMCTL=/poison/sbxcm-systemctl
 run_preflight || fail 'success fixture preflight unexpectedly failed'
 SHA_BEFORE="$(sha256sum "$FIX/config.json" | awk '{print $1}')"
 SIZE_BEFORE="$(stat -c %s "$FIX/config.json")"
 TS_BEFORE="$(cat "$FIX/sing-ts")"
 NR_BEFORE="$(cat "$FIX/sing-restarts")"
 if bash "$ORCH" apply >"$FIX/apply.out" 2>&1; then pass 'orchestrator success path exits zero'; else fail 'orchestrator success path failed'; fi
-assert_contains "$FIX/monitor-calls" 'upgrade --repair keep=4' \
-    'orchestrator forces repair and computes a no-prune per-process keep value'
+assert_contains "$FIX/monitor-calls" 'upgrade --repair keep=2147483647' \
+    'orchestrator forces repair with the effectively-no-prune retention value'
+assert_file "$FIX/releases/rel-concurrent" 'fixture adds a concurrent release inside the installer window'
 assert_file "$FIX/releases/rel-base" 'baseline release survives the repair restage'
+if grep -qF '/poison/' "$FIX/primitive-env.log"; then fail 'poisoned inherited overrides reached a primitive'; else pass 'clean primitive environments reject poisoned E3/SBMON/SBXCM overrides'; fi
 assert_eq 'yes' "$(cat "$FIX/service-was-inactive-before-rpc" 2>/dev/null)" \
     'service is inactive immediately before the first verifier RPC'
 assert_eq 'active' "$(cat "$FIX/service-active")" 'first RPC socket-activates the service'
+assert_eq '1' "$(wc -c <"$FIX/status-probe-count" | tr -d ' ')" \
+    'final gate executes one independent read-only status probe'
 assert_contains "$FIX/apply.out" 'PRODUCTION DEPLOYED = YES' 'final output contains deployed=yes exactly'
 assert_contains "$FIX/apply.out" 'E3 MANAGEMENT ENABLED = NO' 'final output contains management enabled=no exactly'
 assert_contains "$FIX/apply.out" 'management_state = inactive' 'final output contains inactive state exactly'
@@ -378,6 +434,37 @@ if bash "$ORCH" apply >"$FIX/apply.out" 2>&1; then fail 'deploy-verify failure m
 assert_eq '1' "$(wc -c <"$FIX/full-rollback-count" | tr -d ' ')" 'deploy-verify failure selects full rollback'
 assert_eq 'full_rollback_pass' "$(jq -r '.final_status' "$FIX/phase1/journal.json")" \
     'journal records completed full recovery after verify failure'
+
+# A forged verifier line is not evidence: the independent JSON probe decides.
+setup_fixture independent_status_active
+run_preflight || fail 'independent-status fixture preflight unexpectedly failed'
+printf 'active\n' >"$FIX/independent-status"
+if bash "$ORCH" apply >"$FIX/apply.out" 2>&1; then fail 'independent active status must fail apply'; else pass 'fake V07 inactive cannot override independent active status'; fi
+assert_eq '1' "$(wc -c <"$FIX/full-rollback-count" | tr -d ' ')" \
+    'independent active status selects full rollback'
+if [ "$(jq -r '.final_status' "$FIX/phase1/journal.json")" = deploy_disabled_complete ]; then fail 'active status must not write terminal success'; else pass 'active status never writes deploy_disabled_complete'; fi
+if grep -qF 'PRODUCTION DEPLOYED = YES' "$FIX/apply.out"; then fail 'active status must not print final success'; else pass 'active status prints none of the final success block'; fi
+
+# Post-verifier unit drift is caught by the final closed-plane remeasurement.
+setup_fixture socket_post_verify_disabled
+run_preflight || fail 'socket drift fixture preflight unexpectedly failed'
+: >"$FIX/post-verify-socket-disabled"
+if bash "$ORCH" apply >"$FIX/apply.out" 2>&1; then fail 'post-verify disabled socket must fail apply'; else pass 'post-verify socket-disabled drift fails closed'; fi
+assert_eq '1' "$(wc -c <"$FIX/full-rollback-count" | tr -d ' ')" \
+    'post-verify socket drift selects full rollback'
+
+setup_fixture service_post_verify_enabled
+run_preflight || fail 'service drift fixture preflight unexpectedly failed'
+: >"$FIX/post-verify-service-enabled"
+if bash "$ORCH" apply >"$FIX/apply.out" 2>&1; then fail 'post-verify enabled service must fail apply'; else pass 'post-verify service-enabled drift fails closed'; fi
+assert_eq '1' "$(wc -c <"$FIX/full-rollback-count" | tr -d ' ')" \
+    'post-verify service drift selects full rollback'
+
+# Execution approval names one exact reviewed head; a different checkout
+# identity is rejected before the preflight primitive runs.
+setup_fixture approved_head_mismatch
+export E3_PHASE1_APPROVED_HEAD='different-reviewed-head'
+if bash "$ORCH" preflight >"$FIX/preflight.out" 2>&1; then fail 'mismatched approved head must reject execution'; else pass 'exact approved-head mismatch rejects execution before mutation'; fi
 
 # Static safety properties supplement (not replace) the live state-machine tests.
 if rg -qF 'management.activate' "$ORCH"; then fail 'orchestrator source must not contain the activation operation'; else pass 'orchestrator source contains no activation operation'; fi

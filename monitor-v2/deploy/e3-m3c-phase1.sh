@@ -9,6 +9,11 @@ set -uo pipefail
 readonly FROZEN_PAYLOAD_BASE="f0e1480e1527ffb5906e715dd3acff8b29b8c024"
 readonly DEPLOY_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly REPO_ROOT="$(cd -- "$DEPLOY_DIR/../.." && pwd)"
+readonly SAFE_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+# Phase 1 must retain every existing rollback candidate even if another
+# release appears before the installer acquires its deploy lock.  This
+# process-only value is intentionally effectively-no-prune.
+readonly PHASE1_NO_PRUNE_KEEP="2147483647"
 
 TEST_MODE="${E3_PHASE1_TEST_MODE:-0}"
 if [ "$TEST_MODE" != "0" ] && [ "$TEST_MODE" != "1" ]; then
@@ -36,6 +41,10 @@ if [ "$TEST_MODE" = "1" ]; then
     INSTALL_SBXCM="${E3_PHASE1_TEST_INSTALL_SBXCM:?test helper installer required}"
     DEPLOY_VERIFY="${E3_PHASE1_TEST_DEPLOY_VERIFY:?test verifier required}"
     FULL_ROLLBACK="${E3_PHASE1_TEST_ROLLBACK:?test rollback required}"
+    STATUS_PROBE="${E3_PHASE1_TEST_STATUS_PROBE:?test status probe required}"
+    TEST_FIXTURE_ROOT="${E3_PHASE1_TEST_FIXTURE_ROOT:?test fixture root required}"
+    TEST_SOURCE_HEAD="${E3_PHASE1_TEST_SOURCE_HEAD:?test source head required}"
+    PRIMITIVE_PATH="$(dirname -- "$SYSTEMCTL"):$PATH"
 else
     [ "$(id -u)" = "0" ] || { printf 'ERROR: Phase 1 must run as root\n' >&2; exit 1; }
     STATE_DIR="/var/lib/e3-m3c-phase1"
@@ -47,13 +56,17 @@ else
     UNIT_DIR="/etc/systemd/system"
     SOCKET_PATH="/run/sbox-cm/sbox-cm.sock"
     MONITOR_URL="http://127.0.0.1:9191"
-    SYSTEMCTL="systemctl"
-    CURL="curl"
+    SYSTEMCTL="/usr/bin/systemctl"
+    CURL="/usr/bin/curl"
     PREFLIGHT="$DEPLOY_DIR/e3-preflight.sh"
     INSTALL_MONITOR="$DEPLOY_DIR/install-monitor.sh"
     INSTALL_SBXCM="$REPO_ROOT/sbox-cm/deploy/install-sbox-cm.sh"
     DEPLOY_VERIFY="$DEPLOY_DIR/e3-deploy-verify.sh"
     FULL_ROLLBACK="$DEPLOY_DIR/e3-rollback.sh"
+    STATUS_PROBE=""
+    TEST_FIXTURE_ROOT=""
+    TEST_SOURCE_HEAD=""
+    PRIMITIVE_PATH="$SAFE_PATH"
 fi
 
 ART_DIR="$STATE_DIR/artifacts"
@@ -96,6 +109,27 @@ same_dir() {
     left="$(canonical_dir "$1")" || return 1
     right="$(canonical_dir "$2")" || return 1
     [ "$left" = "$right" ]
+}
+
+# Every reviewed primitive runs with an empty environment.  Test fixtures get
+# only the explicitly gated E3_PHASE1_TEST_* paths they require; production
+# receives no E3/SBMON/SBXCM override from the operator's shell.
+run_primitive() {
+    if [ "$TEST_MODE" = "1" ]; then
+        env -i \
+            PATH="$PRIMITIVE_PATH" HOME="$STATE_DIR" LC_ALL=C \
+            FX="$TEST_FIXTURE_ROOT" ROOT="$REPO_ROOT" \
+            E3_PHASE1_TEST_CONFIG="$CONFIG" \
+            E3_PHASE1_TEST_MONITOR_APP="$MONITOR_APP" \
+            E3_PHASE1_TEST_RELEASES_DIR="$RELEASES_DIR" \
+            E3_PHASE1_TEST_SBXCM_STATE="$SBXCM_STATE" \
+            E3_PHASE1_TEST_SBXCM_LIBEXEC="$SBXCM_LIBEXEC" \
+            E3_PHASE1_TEST_UNIT_DIR="$UNIT_DIR" \
+            E3_PHASE1_TEST_SOCKET="$SOCKET_PATH" \
+            "$@"
+    else
+        env -i PATH="$SAFE_PATH" HOME=/root USER=root LOGNAME=root LC_ALL=C "$@"
+    fi
 }
 
 ensure_state_dir() {
@@ -167,16 +201,23 @@ journal_load() {
 }
 
 source_identity_gate() {
-    local dirty
+    local approved dirty
+    approved="${E3_PHASE1_APPROVED_HEAD:-}"
     if [ "$TEST_MODE" = "1" ]; then
-        SOURCE_HEAD="fixture"
+        SOURCE_HEAD="$TEST_SOURCE_HEAD"
+        [ -n "$approved" ] && [ "$SOURCE_HEAD" = "$approved" ] \
+            || die "checkout HEAD does not equal E3_PHASE1_APPROVED_HEAD"
         return 0
     fi
+    [[ "$approved" =~ ^[0-9a-f]{40}$ ]] \
+        || die "E3_PHASE1_APPROVED_HEAD must be the exact reviewed 40-hex merge SHA"
     git -C "$REPO_ROOT" cat-file -e "$FROZEN_PAYLOAD_BASE^{commit}" 2>/dev/null \
         || die "frozen payload commit is unavailable"
     git -C "$REPO_ROOT" merge-base --is-ancestor "$FROZEN_PAYLOAD_BASE" HEAD \
         || die "checkout does not descend from the reviewed payload"
     SOURCE_HEAD="$(git -C "$REPO_ROOT" rev-parse HEAD)" || die "cannot resolve source HEAD"
+    [ "$SOURCE_HEAD" = "$approved" ] \
+        || die "checkout HEAD does not equal E3_PHASE1_APPROVED_HEAD"
     dirty="$(git -C "$REPO_ROOT" status --porcelain)"
     [ -z "$dirty" ] || die "source checkout is dirty"
     git -C "$REPO_ROOT" diff --quiet "$FROZEN_PAYLOAD_BASE" -- \
@@ -265,6 +306,33 @@ monitor_http_ok() {
         "$MONITOR_URL/api/v1/session" 2>/dev/null || true)" = "200" ]
 }
 
+status_probe_json() {
+    if [ "$TEST_MODE" = "1" ]; then
+        run_primitive "$STATUS_PROBE"
+        return
+    fi
+    env -i PATH="$SAFE_PATH" HOME=/root USER=root LOGNAME=root LC_ALL=C \
+        /usr/bin/sudo -n -u sboxweb /usr/bin/python3 -B - \
+        "$MONITOR_APP/app/monitor-v2" <<'PY'
+import json
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from web.e3rpc import E3RpcClient
+
+print(json.dumps(E3RpcClient().call("management.status")))
+PY
+}
+
+independent_status_inactive() {
+    local result rc=0
+    result="$(status_probe_json 2>/dev/null)" || rc=$?
+    printf '%s\n' "$result" >"$ART_DIR/06-independent-status.json"
+    [ "$rc" -eq 0 ] \
+        && [ "$(printf '%s' "$result" | jq -r '.ok // false' 2>/dev/null)" = "true" ] \
+        && [ "$(printf '%s' "$result" | jq -r '.data.management_state // empty' 2>/dev/null)" = "inactive" ]
+}
+
 monitor_only_rollback() {
     local reason="$1" rc=0 target active enabled
     printf 'STOP: %s\n' "$reason" >&2
@@ -272,7 +340,7 @@ monitor_only_rollback() {
     FINAL_STATUS="rollback_in_progress"
     journal_write
     if ! same_dir "$(readlink -f "$MONITOR_APP" 2>/dev/null || true)" "$BASE_RELEASE_TARGET"; then
-        "$INSTALL_MONITOR" rollback "$BASE_RELEASE" 2>&1 \
+        run_primitive "$INSTALL_MONITOR" rollback "$BASE_RELEASE" 2>&1 \
             | tee "$ART_DIR/98-monitor-only-rollback.log"
         rc="${PIPESTATUS[0]}"
     fi
@@ -303,7 +371,7 @@ full_rollback() {
     PHASE="recovering_full"
     FINAL_STATUS="rollback_in_progress"
     journal_write
-    "$FULL_ROLLBACK" --baseline "$BASELINE" 2>&1 \
+    run_primitive "$FULL_ROLLBACK" --baseline "$BASELINE" 2>&1 \
         | tee "$ART_DIR/99-full-rollback.log"
     rc="${PIPESTATUS[0]}"
     if [ "$rc" -eq 0 ] \
@@ -340,7 +408,7 @@ cmd_preflight() {
     [ ! -e "$STATE_DIR" ] || die "Phase 1 state already exists; use status or recover"
     source_identity_gate
     ensure_state_dir
-    "$PREFLIGHT" --baseline-out "$BASELINE" 2>&1 \
+    run_primitive "$PREFLIGHT" --baseline-out "$BASELINE" 2>&1 \
         | tee "$ART_DIR/01-preflight.log"
     rc="${PIPESTATUS[0]}"
     if [ "$rc" -ne 0 ] \
@@ -371,7 +439,7 @@ apply_fail() {
 }
 
 cmd_apply() {
-    local frozen_version live_target live_version current_release count keep rc verify_log current_source
+    local frozen_version live_target live_version current_release rc verify_log current_source
     source_identity_gate
     current_source="$SOURCE_HEAD"
     journal_load
@@ -390,17 +458,13 @@ cmd_apply() {
         || die "reviewed same-version restage precondition failed"
     same_dir "$live_target" "$BASE_RELEASE_TARGET" && [ "$current_release" = "$BASE_RELEASE" ] \
         || die "live release no longer matches the preflight baseline"
-    count="$(find "$RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d ! -name '.staging-*' \
-        -printf '%f\n' 2>/dev/null | wc -l | tr -d '[:space:]')"
-    keep=$((count + 1))
-    [ "$keep" -ge 2 ] || die "computed release retention is invalid"
     {
         printf 'frozen_repo_version=%s\n' "$frozen_version"
         printf 'current_live_version=%s\n' "$live_version"
         printf 'current_release_id=%s\n' "$current_release"
         printf 'current_release_target=%s\n' "$live_target"
-        printf 'release_count_before=%s\n' "$count"
-        printf 'phase1_keep_releases=%s\n' "$keep"
+        printf 'phase1_keep_releases=%s\n' "$PHASE1_NO_PRUNE_KEEP"
+        printf 'phase1_retention_contract=effectively-no-prune\n'
     } | tee "$ART_DIR/03-monitor-before.txt"
 
     PHASE="monitor_mutation_started"
@@ -408,7 +472,8 @@ cmd_apply() {
     FINAL_STATUS="in_progress"
     journal_write
     rc=0
-    SBMON_KEEP_RELEASES="$keep" "$INSTALL_MONITOR" upgrade --repair 2>&1 \
+    run_primitive SBMON_KEEP_RELEASES="$PHASE1_NO_PRUNE_KEEP" \
+        "$INSTALL_MONITOR" upgrade --repair 2>&1 \
         | tee "$ART_DIR/03-monitor-upgrade.log"
     rc="${PIPESTATUS[0]}"
     [ "$rc" -eq 0 ] || apply_fail "monitor upgrade failed"
@@ -429,7 +494,7 @@ cmd_apply() {
     : >"$D3_EVIDENCE"
     chmod 0600 "$D3_EVIDENCE"
     rc=0
-    "$INSTALL_SBXCM" install 2>&1 | tee -a "$D3_EVIDENCE"
+    run_primitive "$INSTALL_SBXCM" install 2>&1 | tee -a "$D3_EVIDENCE"
     rc="${PIPESTATUS[0]}"
     [ "$rc" -eq 0 ] || apply_fail "helper installation failed or was partial"
     HELPER_COMPLETED=true
@@ -467,18 +532,25 @@ cmd_apply() {
 
     verify_log="$ART_DIR/05-deploy-verify.log"
     rc=0
-    "$DEPLOY_VERIFY" --baseline "$BASELINE" 2>&1 | tee "$verify_log"
+    run_primitive "$DEPLOY_VERIFY" --baseline "$BASELINE" 2>&1 | tee "$verify_log"
     rc="${PIPESTATUS[0]}"
     [ "$rc" -eq 0 ] && grep -qx 'E3_M3_VERIFY=PASS' "$verify_log" \
         || apply_fail "deploy verification failed"
-    # Independent orchestration gates: do not trust the primitive's aggregate
-    # exit alone; require its status proof and re-measure host invariants.
-    grep -q 'PASS V07 .*reports inactive' "$verify_log" \
-        || apply_fail "management status proof is not inactive"
+    # Final closed-plane gate: independently re-measure every security and
+    # no-restart invariant after the verifier.  Its V07 text is not trusted.
+    [ "$("$SYSTEMCTL" is-active sbox-cm.socket 2>/dev/null || true)" = "active" ] \
+        || apply_fail "final gate: helper socket is not active"
+    [ "$("$SYSTEMCTL" is-enabled sbox-cm.socket 2>/dev/null || true)" = "enabled" ] \
+        || apply_fail "final gate: helper socket is not enabled"
     [ "$("$SYSTEMCTL" is-active sbox-cm.service 2>/dev/null || true)" = "active" ] \
-        || apply_fail "first RPC did not socket-activate the service"
-    invariants_hold || apply_fail "post-verify config or sing-box invariant drift"
-    [ ! -e "$MARKER" ] || apply_fail "activation marker exists after verification"
+        || apply_fail "final gate: first RPC did not leave helper service active"
+    [ "$("$SYSTEMCTL" is-enabled sbox-cm.service 2>/dev/null || true)" = "disabled" ] \
+        || apply_fail "final gate: helper service must remain disabled"
+    independent_status_inactive \
+        || apply_fail "final gate: independent management status is not inactive"
+    [ ! -e "$MARKER" ] || apply_fail "final gate: activation marker exists"
+    invariants_hold || apply_fail "final gate: config or sing-box invariant drift"
+    printf 'PASS final closed-plane gate: socket active/enabled; service active/disabled; management inactive; invariants unchanged\n'
 
     VERIFY_COMPLETED=true
     PHASE="complete"
