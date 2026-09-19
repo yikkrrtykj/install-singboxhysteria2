@@ -224,6 +224,8 @@ assert_eq "$REL_ID" "$(jqv "$(cat "$BASELINE")" '.monitor.release_id')" \
 BASE_SHA="$(jqv "$(cat "$BASELINE")" '.config_sha256')"
 
 # preflight FAIL: armed marker (and a failed preflight never touches the baseline)
+mkdir -p /var/lib/sbox-cm
+chmod 0700 /var/lib/sbox-cm
 printf '%s\n' '{"v":1,"state":"active"}' > /var/lib/sbox-cm/management.active
 FAIL_BASE="$FIX/baseline-fail.json"
 printf 'SENTINEL-BASELINE\n' > "$FAIL_BASE"
