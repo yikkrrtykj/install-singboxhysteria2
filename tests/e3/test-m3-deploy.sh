@@ -235,6 +235,7 @@ fi
 assert_eq "SENTINEL-BASELINE" "$(cat "$FAIL_BASE")" \
     'a failed preflight did not create/overwrite the baseline (marker case)'
 rm -f /var/lib/sbox-cm/management.active
+rmdir /var/lib/sbox-cm 2>/dev/null || true   # restore the absent first-deploy state
 
 # preflight FAIL: broken config (check-rejected) -- no baseline either
 cp /root/sbox/sbconfig_server.json "$FIX/config.bak"
