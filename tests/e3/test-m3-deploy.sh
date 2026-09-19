@@ -244,6 +244,11 @@ printf '%s' "$VOUT" | grep -qF 'identical to the baseline' \
 printf '%s' "$VOUT" | grep -qF 'NOT restarted' \
     && pass 'verify proves sing-box was not restarted' \
     || fail 'verify did not check the restart counter'
+printf '%s' "$VOUT" | grep -qF 'pulled up by the real RPC' \
+    && pass 'verify proves socket activation pulled the service up (V05b)' \
+    || fail 'verify did not prove the socket-activation pull-up'
+assert_eq "$TREE_BEFORE" "$TREE_AFTER" \
+    'verify leaves the monitor release tree byte-identical (no probe file, no bytecode)'
 
 # deploy-verify FAIL: config modified after the baseline
 python3 - <<'PY'
@@ -268,20 +273,79 @@ printf '%s\n' "$*" >> /run/sboxcm-m3-test/stub-installer.log
 exit 0
 STUB
 chmod 0755 "$STUB_INSTALLER"
-printf 'rel-old\nrel-previous\n' > "$FIX/releases.history"
-RBOUT="$(E3_INSTALL_MONITOR="$STUB_INSTALLER" E3_RELEASES_DIR="$FIX" \
+EXPECT_REL="$(jqv "$(cat "$BASELINE")" '.monitor.release_id')"
+RBOUT="$(E3_INSTALL_MONITOR="$STUB_INSTALLER" E3_RELEASES_DIR="$FIX"\
     bash "$ROLLBACK" --baseline "$BASELINE")"
 RC=$?
-printf '%s' "$RBOUT" | grep -q 'E3_M3_ROLLBACK=PASS' \
-    && pass 'rollback reports PASS' \
+printf '%s' "$RBOUT" | grep -q 'E3_M3_ROLLBACK=PASS'\
+    && pass 'rollback reports PASS (present-helper restore path)'\
     || { FAIL=$((FAIL+1)); printf '  FAIL rollback (rc=%s):\n%s\n' "$RC" "$RBOUT"; }
-grep -qF 'rollback rel-previous' "$FIX/stub-installer.log" \
-    && pass 'rollback invoked the packaging rollback with the previous release id' \
-    || fail 'rollback did not call the packaging rollback with the previous release'
-SOCK_STATE="$(systemctl is-active sbox-cm.socket 2>/dev/null || true)"
-SOCK_EN="$(systemctl is-enabled sbox-cm.socket 2>/dev/null || true)"
-assert_eq "inactive" "$SOCK_STATE" 'rollback stopped the sbox-cm socket'
-assert_eq "disabled" "$SOCK_EN" 'rollback disabled the sbox-cm socket'
+grep -qF "rollback $EXPECT_REL" "$FIX/stub-installer.log"\
+    && pass 'rollback invoked the packaging rollback with the BASELINE release id'\
+    || fail 'rollback did not use the baseline release id'
+assert_eq "active" "$(systemctl is-active sbox-cm.socket 2>/dev/null || true)" 'rollback restored the pre-deploy socket state (active in this fixture)'
+assert_eq "inactive" "$(systemctl is-active sbox-cm.service 2>/dev/null || true)" 'rollback restored the pre-deploy service state (inactive: socket-activated)'
+NOW_SHA="$(sha256sum /root/sbox/sbconfig_server.json | awk '{print $1}')"
+assert_eq "$BASE_SHA" "$NOW_SHA" 'rollback left the config byte-identical'
+[ ! -e /var/lib/sbox-cm/management.active ] \
+    && pass 'rollback leaves the plane closed'\
+    || fail 'rollback left an activation marker'
+HTTP="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "$BASE/api/v1/session" 2>/dev/null)"
+assert_eq "200" "$HTTP" 'monitor still answers after the rollback'
+
+# rollback FAIL: missing installer (fail-closed -- never a silent pass)
+if E3_INSTALL_MONITOR="$FIX/no-such-installer.sh" E3_RELEASES_DIR="$FIX"\
+        bash "$ROLLBACK" --baseline "$BASELINE" >/dev/null 2>&1; then
+    fail 'rollback with a missing installer must FAIL'
+else
+    pass 'rollback with a missing installer FAILS'
+fi
+
+# rollback FAIL: baseline release id does not exist on disk
+jq '.monitor.release_id = "no-such-release"' "$BASELINE" > "$FIX/baseline-badrel.json"
+if E3_INSTALL_MONITOR="$STUB_INSTALLER" E3_RELEASES_DIR="$FIX"\
+        bash "$ROLLBACK" --baseline "$FIX/baseline-badrel.json" >/dev/null 2>&1; then
+    fail 'rollback with a nonexistent target release must FAIL'
+else
+    pass 'rollback with a nonexistent target release FAILS'
+fi
+
+# rollback FAIL: a service-disable failure can never be a silent pass
+cat > "$FIX/stub-systemctl" <<'STUBCTL'
+#!/usr/bin/env bash
+if [ "${1:-}" = "disable" ]; then
+    printf '%s\n' "$*" >> /run/sboxcm-m3-test/stub-systemctl.log
+    exit 1
+fi
+exec /usr/bin/systemctl "$@"
+STUBCTL
+chmod 0755 "$FIX/stub-systemctl"
+RB2="$(E3_SYSTEMCTL="$FIX/stub-systemctl" E3_INSTALL_MONITOR="$STUB_INSTALLER" E3_RELEASES_DIR="$FIX" bash "$ROLLBACK" --baseline "$BASELINE" 2>/dev/null)"
+if printf '%s' "$RB2" | grep -q 'E3_M3_ROLLBACK=FAIL'; then
+    pass 'a service-disable failure FAILS the rollback (never a silent pass)'
+else
+    fail 'a service-disable failure did not fail the rollback'
+fi
+
+# rollback: absent-before helper -> uninstall THIS round's capability
+jq '.helper = {libexec_present:false, socket_unit_present:false, service_unit_present:false, state_dir_present:false, socket_active:"inactive", socket_enabled:"disabled", service_active:"inactive", service_enabled:"disabled"}' "$BASELINE" > "$FIX/baseline-absent.json"
+ABOUT="$(E3_INSTALL_MONITOR="$STUB_INSTALLER" E3_RELEASES_DIR="$FIX" bash "$ROLLBACK" --baseline "$FIX/baseline-absent.json")"
+RC=$?
+printf '%s' "$ABOUT" | grep -q 'E3_M3_ROLLBACK=PASS'\
+    && pass 'absent-before rollback reports PASS (capability uninstalled)'\
+    || { FAIL=$((FAIL+1)); printf '  FAIL absent-before rollback (rc=%s):\n%s\n' "$RC" "$ABOUT"; }
+[ ! -e /etc/systemd/system/sbox-cm.socket ] \
+    && pass 'absent-before rollback removed the socket unit'\
+    || fail 'socket unit survived the absent-before rollback'
+[ ! -e /etc/systemd/system/sbox-cm.service ] \
+    && pass 'absent-before rollback removed the service unit'\
+    || fail 'service unit survived the absent-before rollback'
+[ ! -e /usr/local/lib/sbox-cm/sbox-cm ] \
+    && pass 'absent-before rollback removed the libexec'\
+    || fail 'libexec survived the absent-before rollback'
+[ -d /var/lib/sbox-cm ] \
+    && pass 'absent-before rollback KEEPS the state/audit tree (explicit policy)'\
+    || fail 'absent-before rollback purged the state/audit tree'
 NOW_SHA="$(sha256sum /root/sbox/sbconfig_server.json | awk '{print $1}')"
 assert_eq "$BASE_SHA" "$NOW_SHA" 'rollback left the config byte-identical'
 [ ! -e /var/lib/sbox-cm/management.active ] \

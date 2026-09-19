@@ -10,7 +10,7 @@
 
 ## M3-A — 部署前 preflight（`monitor-v2/deploy/e3-preflight.sh`）
 
-只读。唯一写动作是显式要求的 `--baseline-out FILE`（供 verify/rollback 对照）。
+只读。唯一写动作是显式要求的 `--baseline-out FILE`（供 verify/rollback 对照），且 **baseline 仅在全部检查 PASS 后原子写入（tmp+mv，mode 0600）**——任何 FAIL 都不会创建或覆盖既有 baseline。
 
 ```bash
 sudo bash monitor-v2/deploy/e3-preflight.sh --baseline-out /root/e3-baseline.json
@@ -28,7 +28,8 @@ sudo bash monitor-v2/deploy/e3-preflight.sh --baseline-out /root/e3-baseline.jso
 | P06 | monitor 只读 HTTP `/api/v1/session` 200 |
 | P07 | sboxweb user/group 存在 |
 | P08 | `/root/sbox` 存在、root 属主、配置在内 |
-| P09 | `/var/lib/sbox-cm` root:root 0700（不存在则记 INFO，首次部署创建） |
+| P09 | `/var/lib/sbox-cm` owner+group+mode = root/root/0700（不存在则记 INFO） |
+| P11+ | 部分 libexec（两文件只存在一个）或部分 unit（socket/service 只存在一个）⇒ **FAIL**；units 已安装且 socket active 但 socket 文件缺失 ⇒ **FAIL** |
 | P10 | `/run/sbox-cm/sbox-cm.sock` root:sboxweb 0660（socket 启动后才存在） |
 | P11 | sbox-cm units 是否已安装（socket/service/enabled 状态如实记录） |
 | P12 | `/` 与 `/var` 可用空间 ≥ 1024 MB |
@@ -50,7 +51,14 @@ D4  systemctl enable --now sbox-cm.socket（socket-only，service 由连接拉�
 D5  跑 M3-B 验收（e3-deploy-verify.sh --baseline /root/e3-baseline.json）。
 ```
 
-部署后必须保持 `management_state = inactive`。验收项（`E3_M3_VERIFY=PASS`）：
+部署后必须保持 `management_state = inactive`。D4 只 `enable --now sbox-cm.socket`
+（service 由第一次 RPC 经 socket activation 拉起）。验收项（`E3_M3_VERIFY=PASS`）：
+
+```text
+V05a  仅要求 sbox-cm.socket active（service 允许 inactive）
+V05b  在 V07 的真实 sboxweb RPC 成功之后，要求 sbox-cm.service active
+      —— 证明 socket activation 真正拉起了 daemon
+```
 
 ```text
 V01/V02  配置 SHA256 + size 与 baseline 完全一致
@@ -68,6 +76,8 @@ V10/V11  inactive 下 mutation fail-closed：add 尝试被 E_ACTIVATION_STATE �
 
 ### 回滚（`monitor-v2/deploy/e3-rollback.sh --baseline /root/e3-baseline.json`）
 
+回滚是 **fail-closed** 的编排：installer 缺失、目标 release 缺失、rollback 命令失败、disable 失败、恢复后 live release id 与 baseline 不一致——任何一步失败 ⇒ `E3_M3_ROLLBACK=FAIL`。`--monitor-release` 仅作为 operator 显式 override；默认 target 严格取 baseline 里的 exact release id。
+
 ```text
 R1  关闭特权面：stop+disable sbox-cm.socket（socket 会按连接拉起 service，
     必须先停），再 stop+disable sbox-cm.service；
@@ -78,6 +88,18 @@ R3  monitor 只读 HTTP 恢复 200；
 R4  配置 SHA256 与 preflight baseline 完全一致（全程不触碰 /root/sbox 配置与
     sing-box 服务）；
 R5  activation marker 不存在（回滚全程平面保持关闭）。
+
+baseline 还冻结 helper 部署前状态（libexec/两 unit/state dir 是否存在、
+socket+service 的 active/enabled）与 monitor 的 exact `release_id/release_target`
+（取自 live symlink，非 history 推断）。回滚按 baseline 恢复：
+
+```text
+helper 部署前不存在 ⇒ 卸载本轮新装能力（units + libexec 删除）；
+                      state/audit 树明确保留（审计记录绝不静默清除——写死的策略）
+helper 部署前存在   ⇒ 不删除任何文件，恢复原 active/enabled 状态
+部分安装（preflight 本就该 FAIL）⇒ 回滚 FAIL
+R5-final 同时核对 socket 与 service 的 active/enabled 与 baseline 一致
+```
 ```
 
 ## M3-C — 明确禁止（本阶段不执行）

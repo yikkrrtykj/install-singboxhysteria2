@@ -88,12 +88,13 @@ else
     fail "V04 monitor unhealthy (active=[$MON_ACTIVE], HTTP=[$HTTP_CODE])"
 fi
 
-# V05: sbox-cm units active (capability present)
-if "$E3_SYSTEMCTL" is-active --quiet sbox-cm.socket 2>/dev/null \
-        && "$E3_SYSTEMCTL" is-active --quiet sbox-cm.service 2>/dev/null; then
-    pass "V05 sbox-cm.socket and sbox-cm.service active"
+# V05a: the SOCKET must be active. The service is socket-activated and is
+# EXPECTED to be inactive until the first RPC -- requiring it here would
+# contradict the D4 socket-only enablement (final review fix).
+if "$E3_SYSTEMCTL" is-active --quiet sbox-cm.socket 2>/dev/null; then
+    pass "V05a sbox-cm.socket active (service activation deferred to the first RPC)"
 else
-    fail "V05 sbox-cm units not both active"
+    fail "V05a sbox-cm.socket is NOT active"
 fi
 
 # V06: marker absent -> management plane inactive
@@ -103,9 +104,12 @@ else
     fail "V06 activation marker EXISTS (plane armed -- deploy-disabled violated)"
 fi
 
-# V07/V08: sboxweb-context RPC -- management.status = inactive, client.list readable
-RPC_PROBE="$E3_MONITOR_APP/m3_rpc_probe.py"
-cat > "$RPC_PROBE" <<'PROBE'
+# V07/V08: sboxweb-context RPC -- management.status = inactive, client.list
+# readable. The probe runs from STDIN with -B (no bytecode writes): the
+# current monitor release tree must stay byte-identical (final review fix --
+# the previous version wrote a probe file INTO the release tree).
+E3_PROBE_APP="$E3_MONITOR_APP"
+SBOXWEB_PROBE(){ sudo -n -u sboxweb /usr/bin/python3 -B - "$E3_PROBE_APP" "$@" <<'PROBE'
 import json, sys
 sys.path.insert(0, sys.argv[1])
 from web.e3rpc import E3RpcClient
@@ -115,13 +119,21 @@ payload = json.loads(sys.argv[3]) if len(sys.argv) > 3 else None
 verdict = client.call(op, payload=payload)
 print(json.dumps(verdict))
 PROBE
-SBOXWEB_PROBE(){ sudo -n -u sboxweb /usr/bin/python3 "$RPC_PROBE" "$E3_MONITOR_APP" "$@"; }
+}
 STATUS_V="$(SBOXWEB_PROBE management.status 2>/dev/null)"
 MSTATE="$(jqv "$STATUS_V" '.data.management_state')"
 if [ "$(jqv "$STATUS_V" '.ok')" = "true" ] && [ "$MSTATE" = "inactive" ]; then
     pass "V07 management.status (sboxweb RPC) reports inactive"
 else
     fail "V07 management.status must report inactive (got [$MSTATE])"
+fi
+
+# V05b: the real RPC above proves socket activation actually pulled the
+# daemon up (this check deliberately comes AFTER the first RPC, not before).
+if "$E3_SYSTEMCTL" is-active --quiet sbox-cm.service 2>/dev/null; then
+    pass "V05b sbox-cm.service pulled up by the real RPC (socket activation works)"
+else
+    fail "V05b sbox-cm.service was NOT pulled up by the RPC"
 fi
 
 LIST_V="$(SBOXWEB_PROBE client.list 2>/dev/null)"
