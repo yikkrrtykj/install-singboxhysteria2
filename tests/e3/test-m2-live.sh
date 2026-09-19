@@ -354,14 +354,17 @@ chown "$AXE_USER":"$AXE_USER" "$TIMEOUT_DRIVER"
 TOUT="$(sudo -u "$AXE_USER" python3 "$TIMEOUT_DRIVER" 2>/dev/null)"
 assert_eq "UNCERTAIN" "$TOUT" 'a post-send caller timeout reports uncertain (result_unknown precondition)'
 # ...the helper was not killed and the transaction completed:
-LAST="null"
+LAST="null"; LAST_RAW=""; LAST_HTTP=""
 for _ in $(seq 1 40); do
-    LAST="$(curl -sS -b "$CJ" "$BASE/api/v1/management/status" | jqv '-' '.data.last_transaction.op')"
+    LAST_HTTP="$(curl -sS -o "$FIX/last.json" -w '%{http_code}' -b "$CJ"         "$BASE/api/v1/management/status" 2>/dev/null)"
+    LAST_RAW="$(cat "$FIX/last.json" 2>/dev/null)"
+    LAST="$(jqv "$LAST_RAW" '.data.last_transaction.op')"
     [ "$LAST" = "client.add" ] && break
     sleep 0.25
 done
-assert_eq "client.add" "$LAST" 'the timed-out transaction completed inside the helper (status proves it)'
-OUTCOME="$(curl -sS -b "$CJ" "$BASE/api/v1/management/status" | jqv '-' '.data.last_transaction.outcome')"
+assert_eq "200" "$LAST_HTTP" "the status endpoint stayed alive during the busy helper (got $LAST_HTTP)"
+assert_eq "client.add" "$LAST" "the timed-out transaction completed inside the helper (status proves it; last body=[$LAST_RAW])"
+OUTCOME="$(jqv "$LAST_RAW" '.data.last_transaction.outcome')"
 assert_eq "ok" "$OUTCOME" 'the timed-out transaction landed on its terminal success'
 grep -qF 'timeout-live' /root/sbox/sbconfig_server.json \
     && pass 'the timed-out client is really in the live config' \
@@ -390,8 +393,11 @@ RELOADS_NOW="$(cat "$FIX/reload.count")"
 
 R="$(e3_post /api/v1/management/deactivate - '{}')"
 assert_eq "true" "$(jqv "$R" '.ok')" 'deactivate over the live HTTP API'
+# the broker may still hold a WITHIN-TTL active snapshot (fresh-only rule);
+# past the TTL it must answer false, never carry stale-active forward.
+sleep 2.5
 SINFO="$(curl -sS -b "$CJ" "$BASE/api/v1/session")"
-assert_eq "false" "$(jqv "$SINFO" '.management_active')" 'the plane is inactive again'
+assert_eq "false" "$(jqv "$SINFO" '.management_active')" 'the plane is inactive again (past the status TTL)'
 
 # --------------------------------------- stale-active fail closed + breaker --
 R="$(e3_post /api/v1/management/activate - '{}')"
