@@ -10,6 +10,8 @@
 
 ## M3-A — 部署前 preflight（`monitor-v2/deploy/e3-preflight.sh`）
 
+**M3-B v1 = FIRST DEPLOY ONLY（冻结）**：preflight 发现任何 sbox-cm capability（sbox-cm / sbox-cm-ops / lib/client-management.sh / lib/sbox-cm-state.sh / socket unit / service unit 任一存在）即 FAIL，提示 `existing sbox-cm deployment requires a separately reviewed upgrade path`。残留的 `/var/lib/sbox-cm` state/audit 树单独存在是允许的（审计记录），但 marker 必须不存在且 owner/mode 必须安全。present-helper 升级路径留待以后单独设计。
+
 只读。唯一写动作是显式要求的 `--baseline-out FILE`（供 verify/rollback 对照），且 **baseline 仅在全部检查 PASS 后原子写入（tmp+mv，mode 0600）**——任何 FAIL 都不会创建或覆盖既有 baseline。
 
 ```bash
@@ -20,7 +22,7 @@ sudo bash monitor-v2/deploy/e3-preflight.sh --baseline-out /root/e3-baseline.jso
 
 | # | 检查 |
 | --- | --- |
-| P01 | monitor VERSION / webapp.py 入口存在；sbox-cm libexec 存在（首次部署前允许缺失，记 INFO） |
+| P01 | `$E3_MONITOR_APP` 必须是 **symlink**，readlink -f 可解析、target 目录存在、release id 非空；VERSION / webapp.py 在 release 内 |
 | P02 | `sing-box.service` active |
 | P03 | `singbox-monitor.service` active |
 | P04 | 记录当前配置 SHA256 + size（`/root/sbox/sbconfig_server.json`） |
@@ -29,10 +31,12 @@ sudo bash monitor-v2/deploy/e3-preflight.sh --baseline-out /root/e3-baseline.jso
 | P07 | sboxweb user/group 存在 |
 | P08 | `/root/sbox` 存在、root 属主、配置在内 |
 | P09 | `/var/lib/sbox-cm` owner+group+mode = root/root/0700（不存在则记 INFO） |
-| P11+ | 部分 libexec（两文件只存在一个）或部分 unit（socket/service 只存在一个）⇒ **FAIL**；units 已安装且 socket active 但 socket 文件缺失 ⇒ **FAIL** |
+| P00 | sbox-cm capability 必须完全 absent（6 个路径逐一检查）；任何一项存在 ⇒ FAIL（first-deploy-only freeze） |
 | P10 | `/run/sbox-cm/sbox-cm.sock` root:sboxweb 0660（socket 启动后才存在） |
 | P11 | sbox-cm units 是否已安装（socket/service/enabled 状态如实记录） |
 | P12 | `/` 与 `/var` 可用空间 ≥ 1024 MB |
+
+baseline 写入（仅全部 PASS 后）：umask 077 + 同目录 mktemp + 写入 + chmod 0600 + jq 校验成功 + 原子 mv——失败绝不覆盖既有 baseline。baseline 冻结 `monitor.release_id/release_target`（live symlink）与 helper 部署前状态（全 false）。
 | P13 | systemd 整体 running（degraded 记 INFO 放行） |
 | P14 | activation marker **不存在**（部署要求平面处于关闭默认态；存在 ⇒ FAIL） |
 
@@ -47,7 +51,8 @@ systemctl 仅用 is-active/is-enabled/show 等只读查询。
 D1  预跑 M3-A preflight，留存 /root/e3-baseline.json；
 D2  打包并安装新 monitor release（既有 install-monitor.sh，release-symlink 原子切换）；
 D3  安装 sbox-cm（install-sbox-cm.sh install —— 默认 disabled/inactive）；
-D4  systemctl enable --now sbox-cm.socket（socket-only，service 由连接拉起）；
+D4  systemctl enable --now sbox-cm.socket（**只 enable socket**；service 保持 inactive，
+    由第一次 RPC 经 socket activation 拉起——验收顺序见 V05a/V05b/V07）；
 D5  跑 M3-B 验收（e3-deploy-verify.sh --baseline /root/e3-baseline.json）。
 ```
 
@@ -81,13 +86,17 @@ V10/V11  inactive 下 mutation fail-closed：add 尝试被 E_ACTIVATION_STATE �
 ```text
 R1  关闭特权面：stop+disable sbox-cm.socket（socket 会按连接拉起 service，
     必须先停），再 stop+disable sbox-cm.service；
-R2  恢复旧 monitor release：调用既有 install-monitor.sh rollback [release-id]
-    （只翻转 release symlink + 重启 monitor；未给 id 时自动取 releases.history
-    中上一个 release）；
+R2  恢复 monitor release：target **唯一来源 = preflight baseline 的
+    monitor.release_id**（不提供 override，不从 releases.history 推断）。
+    installer 缺失 / target release 目录不存在 / rollback 命令失败 /
+    恢复后 live release id 与 baseline 不一致 ⇒ E3_M3_ROLLBACK=FAIL；
 R3  monitor 只读 HTTP 恢复 200；
 R4  配置 SHA256 与 preflight baseline 完全一致（全程不触碰 /root/sbox 配置与
     sing-box 服务）；
 R5  activation marker 不存在（回滚全程平面保持关闭）。
+
+R3 卸载校验覆盖全部 6 个 capability 路径 + socket 文件；disable 失败在 R1
+即 FAIL（绝不静默）。
 
 baseline 还冻结 helper 部署前状态（libexec/两 unit/state dir 是否存在、
 socket+service 的 active/enabled）与 monitor 的 exact `release_id/release_target`

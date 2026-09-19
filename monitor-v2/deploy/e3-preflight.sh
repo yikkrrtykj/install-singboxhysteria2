@@ -1,21 +1,22 @@
 #!/usr/bin/env bash
 # e3-preflight.sh -- READ-ONLY production preflight for the E3 M3 deployment.
 #
-# Checks deployment readiness WITHOUT changing anything:
-#   * no config writes          (config is only hashed; `sing-box check` runs
-#                                with -c against the CURRENT file, read-only)
-#   * no reload / restart       (only read-only systemctl queries)
-#   * no marker write           (the activation marker is only TESTED)
-#   * no activate               (no RPC mutation is sent at all)
-#   * no client create/delete
+# M3-B v1 IS FIRST-DEPLOY-ONLY (final review freeze): this preflight FAILS
+# when ANY sbox-cm capability already exists -- an existing deployment
+# requires a separately reviewed upgrade path. "Absent" means ALL of:
+#   sbox-cm, sbox-cm-ops, lib/client-management.sh, lib/sbox-cm-state.sh,
+#   the socket unit and the service unit. A leftover /var/lib/sbox-cm
+#   state/audit tree alone is tolerated (audit trail), provided the
+#   activation marker is absent and owner/group/mode are safe.
 #
-# The baseline JSON is written ONLY when every check passes (review round:
-# a failed preflight must never create or overwrite a baseline). The write is
-# atomic (tmp file + mv) with mode 0600.
+# Read-only guarantees: no config writes, no reload/restart, no marker
+# write, no activate, no client create/delete. The ONLY file written is the
+# baseline JSON, and ONLY when every check passes: atomic (same-directory
+# mktemp -> write -> chmod 0600 -> verify -> mv) so a failed write can never
+# overwrite an existing baseline.
 #
 # Output: one PASS/FAIL line per check, then
-#     E3_PREFLIGHT=PASS   (exit 0)   every check passed (baseline written)
-#     E3_PREFLIGHT=FAIL   (exit 1)   at least one check failed (NO baseline)
+#     E3_PREFLIGHT=PASS (exit 0) / E3_PREFLIGHT=FAIL (exit 1).
 #
 # Environment overrides (tests; production uses the defaults):
 #   E3_SYSTEMCTL       systemctl binary          (default: systemctl)
@@ -25,7 +26,7 @@
 #   E3_SBXCM_LIBEXEC   sbox-cm libexec dir       (default: /usr/local/lib/sbox-cm)
 #   E3_SBXCM_SOCKET    sbox-cm socket path       (default: /run/sbox-cm/sbox-cm.sock)
 #   E3_MONITOR_URL     monitor base URL          (default: http://127.0.0.1:9191)
-#   E3_MONITOR_APP     monitor app link          (default: /opt/singbox-monitor)
+#   E3_MONITOR_APP     monitor app link          (default: /opt/singbox-monitor, MUST be a symlink)
 #   E3_MONITOR_UNIT    monitor unit name         (default: singbox-monitor.service)
 #   E3_DISK_MIN_MB     min free MB on / and /var (default: 1024)
 set -uo pipefail
@@ -56,28 +57,54 @@ note(){ printf '  INFO %s\n' "$*"; }
 
 printf '===== E3 M3 PRODUCTION PREFLIGHT (read-only) =====\n'
 
-# ------------------------------------------------------------ P01 versions --
-if [ -f "$E3_MONITOR_APP/VERSION" ]; then
-    pass "P01 monitor VERSION file present ($(tr -d ' \t\r\n' < "$E3_MONITOR_APP/VERSION" 2>/dev/null))"
+# ------------------------------------------- P00 helper capability ABSENT --
+# M3-B v1 is FIRST-DEPLOY-ONLY: any existing sbox-cm capability (binaries,
+# lib scripts, unit files) means an upgrade path is needed and this
+# preflight refuses to green-light a fresh deploy.
+CAP_PRESENT=""
+[ -e "$E3_SBXCM_LIBEXEC/sbox-cm" ] && CAP_PRESENT="$CAP_PRESENT sbox-cm"
+[ -e "$E3_SBXCM_LIBEXEC/sbox-cm-ops" ] && CAP_PRESENT="$CAP_PRESENT sbox-cm-ops"
+[ -e "$E3_SBXCM_LIBEXEC/lib/client-management.sh" ] \
+    && CAP_PRESENT="$CAP_PRESENT lib/client-management.sh"
+[ -e "$E3_SBXCM_LIBEXEC/lib/sbox-cm-state.sh" ] \
+    && CAP_PRESENT="$CAP_PRESENT lib/sbox-cm-state.sh"
+[ -e /etc/systemd/system/sbox-cm.socket ] && CAP_PRESENT="$CAP_PRESENT socket-unit"
+[ -e /etc/systemd/system/sbox-cm.service ] && CAP_PRESENT="$CAP_PRESENT service-unit"
+if [ -z "$CAP_PRESENT" ]; then
+    pass "P00 no sbox-cm capability present (clean first-deploy precondition)"
 else
-    fail "P01 monitor VERSION file missing at $E3_MONITOR_APP/VERSION"
+    fail "P00 existing sbox-cm deployment requires a separately reviewed upgrade path (found:$CAP_PRESENT)"
 fi
-if [ -f "$E3_MONITOR_APP/webapp.py" ]; then
+
+# ------------------------------------------------- P01 monitor release link --
+# The monitor MUST be deployed as the packaging release symlink: the preflight
+# baseline freezes the exact rollback target from it.
+if [ -L "$E3_MONITOR_APP" ]; then
+    pass "P01 monitor app is a symlink ($E3_MONITOR_APP)"
+else
+    fail "P01 monitor app is NOT a symlink: $E3_MONITOR_APP (packaging releases deploy a symlink)"
+fi
+MON_RELEASE_TARGET="$(readlink -f "$E3_MONITOR_APP" 2>/dev/null || true)"
+MON_RELEASE_ID="$(basename "$MON_RELEASE_TARGET" 2>/dev/null || true)"
+if [ -n "$MON_RELEASE_TARGET" ] && [ -d "$MON_RELEASE_TARGET" ]; then
+    pass "P01 release target resolves and exists ($MON_RELEASE_TARGET, id=$MON_RELEASE_ID)"
+else
+    fail "P01 release target does not resolve to a directory (got [$MON_RELEASE_TARGET])"
+fi
+if [ -n "$MON_RELEASE_ID" ]; then
+    pass "P01 release id non-empty"
+else
+    fail "P01 release id is EMPTY"
+fi
+if [ -f "$MON_RELEASE_TARGET/VERSION" ]; then
+    pass "P01 monitor VERSION file present ($(tr -d ' \t\r\n' < "$MON_RELEASE_TARGET/VERSION" 2>/dev/null))"
+else
+    fail "P01 monitor VERSION file missing at $MON_RELEASE_TARGET/VERSION"
+fi
+if [ -f "$MON_RELEASE_TARGET/webapp.py" ]; then
     pass "P01 monitor entrypoint present"
 else
-    fail "P01 monitor entrypoint missing under $E3_MONITOR_APP"
-fi
-# partial-install tightening (final review): exactly one of the two libexec
-# files is a BROKEN state, not a "first deploy".
-LIBEXEC_CM="no"; LIBEXEC_OPS="no"
-[ -f "$E3_SBXCM_LIBEXEC/sbox-cm" ] && LIBEXEC_CM="yes"
-[ -f "$E3_SBXCM_LIBEXEC/sbox-cm-ops" ] && LIBEXEC_OPS="yes"
-if [ "$LIBEXEC_CM" = "yes" ] && [ "$LIBEXEC_OPS" = "yes" ]; then
-    pass "P01 sbox-cm libexec files present"
-elif [ "$LIBEXEC_CM" = "no" ] && [ "$LIBEXEC_OPS" = "no" ]; then
-    note "P01 sbox-cm libexec not present yet (first E3 deploy installs it)"
-else
-    fail "P01 PARTIAL sbox-cm libexec install (sbox-cm=$LIBEXEC_CM sbox-cm-ops=$LIBEXEC_OPS)"
+    fail "P01 monitor entrypoint missing under $MON_RELEASE_TARGET"
 fi
 
 # ------------------------------------------------------- P02/P03 services --
@@ -146,6 +173,8 @@ else
 fi
 
 # ------------------------------------------------- P09 /var/lib/sbox-cm --
+# A leftover state/audit tree alone is tolerated (audit trail), but its
+# owner/group/mode must be safe, and the marker must be absent (P14).
 if [ -d "$E3_SBXCM_STATE" ]; then
     OWNER="$(stat -c '%U %G %a' "$E3_SBXCM_STATE" 2>/dev/null)"
     if [ "$OWNER" = "root root 700" ]; then
@@ -158,9 +187,6 @@ else
 fi
 
 # ------------------------------------------------- P10 /run/sbox-cm socket --
-SOCKET_UNITS_INSTALLED="no"
-[ -f /etc/systemd/system/sbox-cm.socket ] && [ -f /etc/systemd/system/sbox-cm.service ] \
-    && SOCKET_UNITS_INSTALLED="yes"
 if [ -S "$E3_SBXCM_SOCKET" ]; then
     SOCKOWN="$(stat -c '%U %G %a' "$E3_SBXCM_SOCKET" 2>/dev/null)"
     if [ "$SOCKOWN" = "root sboxweb 660" ]; then
@@ -168,33 +194,8 @@ if [ -S "$E3_SBXCM_SOCKET" ]; then
     else
         fail "P10 sbox-cm socket ownership/mode unexpected: [$SOCKOWN]"
     fi
-elif [ "$SOCKET_UNITS_INSTALLED" = "yes" ] \
-        && [ "$("$E3_SYSTEMCTL" is-active sbox-cm.socket 2>/dev/null)" = "active" ]; then
-    fail "P10 sbox-cm socket unit is ACTIVE but the socket FILE is missing"
 else
     note "P10 sbox-cm socket absent (created when the socket unit starts)"
-fi
-
-# ------------------------------------------- P11 sbox-cm units existence --
-SOCKET_UNIT_PRESENT="no"; SERVICE_UNIT_PRESENT="no"
-[ -f /etc/systemd/system/sbox-cm.socket ] && SOCKET_UNIT_PRESENT="yes"
-[ -f /etc/systemd/system/sbox-cm.service ] && SERVICE_UNIT_PRESENT="yes"
-SB_SOCKET_STATE="$("$E3_SYSTEMCTL" is-active sbox-cm.socket 2>/dev/null || true)"
-SB_SERVICE_STATE="$("$E3_SYSTEMCTL" is-active sbox-cm.service 2>/dev/null || true)"
-SB_SOCKET_ENABLED="$("$E3_SYSTEMCTL" is-enabled sbox-cm.socket 2>/dev/null || true)"
-SB_SERVICE_ENABLED="$("$E3_SYSTEMCTL" is-enabled sbox-cm.service 2>/dev/null || true)"
-if [ "$SOCKET_UNIT_PRESENT" = "yes" ] && [ "$SERVICE_UNIT_PRESENT" = "yes" ]; then
-    pass "P11 sbox-cm units installed (socket=$SB_SOCKET_STATE service=$SB_SERVICE_STATE enabled=$SB_SOCKET_ENABLED)"
-    # once installed, the socket must be UP -- an installed-but-inactive
-    # socket is a broken capability, not a "not yet deployed" state. (The
-    # service is socket-activated: inactive is its NORMAL resting state.)
-    if [ "$SB_SOCKET_STATE" != "active" ]; then
-        fail "P11 sbox-cm.socket is installed but NOT active (socket=$SB_SOCKET_STATE)"
-    fi
-elif [ "$SOCKET_UNIT_PRESENT" = "no" ] && [ "$SERVICE_UNIT_PRESENT" = "no" ]; then
-    note "P11 sbox-cm units not installed yet (first E3 deploy installs them)"
-else
-    fail "P11 PARTIAL sbox-cm unit install (socket=$SOCKET_UNIT_PRESENT service=$SERVICE_UNIT_PRESENT)"
 fi
 
 # ------------------------------------------------------- P12 disk space --
@@ -228,8 +229,11 @@ else
 fi
 
 # ------------------------------------------------------------- baseline --
-# ONLY a fully PASSing preflight may produce a baseline (final review: a
-# failed preflight must never create or overwrite one). Atomic write, 0600.
+# ONLY a fully PASSing preflight may produce a baseline (a failed preflight
+# must never create or overwrite one). Hardened write: umask 077, a
+# SAME-DIRECTORY mktemp, write, chmod 0600, verify it parses as JSON, and
+# only then the atomic mv -- a failed write can never clobber an existing
+# baseline.
 if [ "$FAIL" -gt 0 ]; then
     if [ -n "$BASELINE_OUT" ]; then
         note "baseline NOT written: the preflight failed (an existing baseline is left untouched)"
@@ -241,61 +245,60 @@ fi
 
 MON_ENABLED="$("$E3_SYSTEMCTL" is-enabled "$E3_MONITOR_UNIT" 2>/dev/null || true)"
 MON_ACTIVE="$("$E3_SYSTEMCTL" is-active "$E3_MONITOR_UNIT" 2>/dev/null || true)"
-MON_RELEASE_TARGET="$(readlink -f "$E3_MONITOR_APP" 2>/dev/null || true)"
-MON_RELEASE_ID="$(basename "$MON_RELEASE_TARGET" 2>/dev/null || true)"
 SB_ACTIVE="$("$E3_SYSTEMCTL" is-active sing-box.service 2>/dev/null || true)"
 SB_TS="$("$E3_SYSTEMCTL" show -p ActiveEnterTimestamp --value sing-box.service 2>/dev/null)"
 SB_RESTARTS="$("$E3_SYSTEMCTL" show -p NRestarts --value sing-box.service 2>/dev/null)"
 HELPER_STATE_DIR_PRESENT="no"
 [ -d "$E3_SBXCM_STATE" ] && HELPER_STATE_DIR_PRESENT="yes"
-HELPER_LIBEXEC_PRESENT="$LIBEXEC_CM$LIBEXEC_OPS"; [ "$HELPER_LIBEXEC_PRESENT" = "yesyes" ] && HELPER_LIBEXEC_PRESENT="yes" || HELPER_LIBEXEC_PRESENT="no"
 MARKER="false"
 [ -e "$E3_SBXCM_STATE/management.active" ] && MARKER="true"
 
 if [ -n "$BASELINE_OUT" ]; then
-    TMP_BASE="$BASELINE_OUT.tmp.$$"
-    jq -n \
-        --arg config_sha256 "$CONFIG_SHA" \
-        --argjson config_size "${CONFIG_SIZE:-0}" \
-        --arg sb_active "$SB_ACTIVE" \
-        --arg sb_ts "$SB_TS" \
-        --argjson sb_restarts "${SB_RESTARTS:-0}" \
-        --arg mon_active "$MON_ACTIVE" \
-        --arg mon_enabled "$MON_ENABLED" \
-        --arg mon_release_id "$MON_RELEASE_ID" \
-        --arg mon_release_target "$MON_RELEASE_TARGET" \
-        --argjson marker "$MARKER" \
-        --argjson helper_libexec_present "$([ "$HELPER_LIBEXEC_PRESENT" = "yes" ] && echo true || echo false)" \
-        --argjson helper_socket_unit_present "$([ "$SOCKET_UNIT_PRESENT" = "yes" ] && echo true || echo false)" \
-        --argjson helper_service_unit_present "$([ "$SERVICE_UNIT_PRESENT" = "yes" ] && echo true || echo false)" \
-        --argjson helper_state_dir_present "$([ "$HELPER_STATE_DIR_PRESENT" = "yes" ] && echo true || echo false)" \
-        --arg helper_socket_active "$SB_SOCKET_STATE" \
-        --arg helper_socket_enabled "$SB_SOCKET_ENABLED" \
-        --arg helper_service_active "$SB_SERVICE_STATE" \
-        --arg helper_service_enabled "$SB_SERVICE_ENABLED" \
-        --arg saved_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-        '{config_sha256:$config_sha256, config_size:$config_size,
-          singbox:{active:$sb_active, active_enter_timestamp:$sb_ts, nrestarts:$sb_restarts},
-          monitor:{active:$mon_active, enabled:$mon_enabled,
-                   release_id:$mon_release_id, release_target:$mon_release_target},
-          marker_present:$marker,
-          helper:{libexec_present:$helper_libexec_present,
-                  socket_unit_present:$helper_socket_unit_present,
-                  service_unit_present:$helper_service_unit_present,
-                  state_dir_present:$helper_state_dir_present,
-                  socket_active:$helper_socket_active,
-                  socket_enabled:$helper_socket_enabled,
-                  service_active:$helper_service_active,
-                  service_enabled:$helper_service_enabled},
-          saved_at:$saved_at}' > "$TMP_BASE" 2>"$TMP_BASE.err"
-    JQ_RC=$?
-    if [ "$JQ_RC" -ne 0 ]; then
-        fail "baseline jq failed (rc=$JQ_RC): $(head -c 300 "$TMP_BASE.err")"
-    elif mv "$TMP_BASE" "$BASELINE_OUT" \
-        && chmod 0600 "$BASELINE_OUT"; then
+    umask 077
+    TMP_BASE="$(mktemp "${BASELINE_OUT}.tmp.XXXXXX")" \
+        || TMP_BASE=""
+    if [ -n "$TMP_BASE" ] \
+        && jq -n \
+            --arg config_sha256 "$CONFIG_SHA" \
+            --argjson config_size "${CONFIG_SIZE:-0}" \
+            --arg sb_active "$SB_ACTIVE" \
+            --arg sb_ts "$SB_TS" \
+            --argjson sb_restarts "${SB_RESTARTS:-0}" \
+            --arg mon_active "$MON_ACTIVE" \
+            --arg mon_enabled "$MON_ENABLED" \
+            --arg mon_release_id "$MON_RELEASE_ID" \
+            --arg mon_release_target "$MON_RELEASE_TARGET" \
+            --argjson marker "$MARKER" \
+            --argjson helper_libexec_present false \
+            --argjson helper_socket_unit_present false \
+            --argjson helper_service_unit_present false \
+            --argjson helper_state_dir_present "$([ "$HELPER_STATE_DIR_PRESENT" = "yes" ] && echo true || echo false)" \
+            --arg helper_socket_active "$SB_SOCKET_STATE" \
+            --arg helper_socket_enabled "$SB_SOCKET_ENABLED" \
+            --arg helper_service_active "$SB_SERVICE_STATE" \
+            --arg helper_service_enabled "$SB_SERVICE_ENABLED" \
+            --arg saved_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{config_sha256:$config_sha256, config_size:$config_size,
+              singbox:{active:$sb_active, active_enter_timestamp:$sb_ts, nrestarts:$sb_restarts},
+              monitor:{active:$mon_active, enabled:$mon_enabled,
+                       release_id:$mon_release_id, release_target:$mon_release_target},
+              marker_present:$marker,
+              helper:{libexec_present:$helper_libexec_present,
+                      socket_unit_present:$helper_socket_unit_present,
+                      service_unit_present:$helper_service_unit_present,
+                      state_dir_present:$helper_state_dir_present,
+                      socket_active:$helper_socket_active,
+                      socket_enabled:$helper_socket_enabled,
+                      service_active:$helper_service_active,
+                      service_enabled:$helper_service_enabled},
+              saved_at:$saved_at}' > "$TMP_BASE" 2>"$TMP_BASE.err" \
+        && chmod 0600 "$TMP_BASE" \
+        && jq -e . "$TMP_BASE" >/dev/null 2>&1 \
+        && mv "$TMP_BASE" "$BASELINE_OUT"; then
         pass "baseline saved atomically to $BASELINE_OUT (0600, all checks passed)"
     else
-        fail "baseline could not be moved to $BASELINE_OUT"
+        fail "baseline could not be written to $BASELINE_OUT: $(head -c 200 "${TMP_BASE:-/dev/null}.err" 2>/dev/null)"
+        [ -n "$TMP_BASE" ] && rm -f "$TMP_BASE" "$TMP_BASE.err"
     fi
 fi
 
