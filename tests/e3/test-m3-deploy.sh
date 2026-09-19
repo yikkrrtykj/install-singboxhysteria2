@@ -67,11 +67,29 @@ gate() {
 command -v systemctl >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1 \
     && command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 \
     || gate 'systemctl/python3/curl/jq missing'
+# The refuse-check covers THIS suite's own fixture paths; sbox-cm paths are
+# handled by explicit hygiene below (earlier suites in the same CI job --
+# M1 B-5 / M2 live -- legitimately leave units/libexec/state behind).
 if [ -e /root/sbox ] || [ -e "$MDATA" ] || [ -e /etc/systemd/system/singbox-monitor.service ] \
-        || [ -e "$RELLINK" ] || [ -e /usr/local/lib/sbox-cm/sbox-cm ]; then
+        || [ -e "$RELLINK" ]; then
     fail 'a fixture path already exists: refusing to run over a real deployment'
     printf '\nPASS=%d FAIL=%d SKIP=%d\nE3_M3_DEPLOY=FAIL\n' "$PASS" "$FAIL" "$SKIP"
     exit 1
+fi
+
+# CI hygiene: strip any leftover sbox-cm capability from earlier suites so
+# the fixture really starts from the ZERO-capability first-deploy state.
+systemctl stop sbox-cm.socket sbox-cm.service 2>/dev/null
+systemctl disable sbox-cm.socket sbox-cm.service 2>/dev/null
+rm -f /etc/systemd/system/sbox-cm.socket /etc/systemd/system/sbox-cm.service
+rm -rf /usr/local/lib/sbox-cm /var/lib/sbox-cm
+systemctl daemon-reload 2>/dev/null
+if [ ! -e /etc/systemd/system/sbox-cm.socket ] \
+        && [ ! -e /etc/systemd/system/sbox-cm.service ] \
+        && [ ! -e /usr/local/lib/sbox-cm/sbox-cm ]; then
+    pass 'fixture hygiene: ZERO sbox-cm capability after cleanup (true first-deploy slate)'
+else
+    fail 'fixture hygiene failed: sbox-cm capability still present'
 fi
 
 cleanup() {
