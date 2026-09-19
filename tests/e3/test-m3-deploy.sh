@@ -41,10 +41,15 @@ STUB_INSTALLER="$FIX/stub-install-monitor.sh"
 REL_ID="rel-0001"
 
 PASS=0; FAIL=0; SKIP=0
+# Frozen assertion count: PASS + FAIL + SKIP must equal this, so a
+# section that silently disappears (e.g. an undefined helper) fails
+# the suite instead of quietly shrinking it.
+EXPECTED_TOTAL=53
 pass(){ PASS=$((PASS+1)); printf '  PASS %s\n' "$*"; }
 fail(){ FAIL=$((FAIL+1)); printf '  FAIL %s\n' "$*"; }
 skip(){ SKIP=$((SKIP+1)); printf '  SKIP %s\n' "$*"; }
 assert_eq(){ [ "$1" = "$2" ] && pass "$3" || fail "$3 (want=[$1] got=[$2])"; }
+assert_ne(){ [ "$1" != "$2" ] && pass "$3" || fail "$3 (both=[$1])"; }
 jqv(){ printf '%s' "$1" | jq -r "$2" 2>/dev/null; }
 
 printf '===== E3 M3 DEPLOY TOOLING (preflight / verify / rollback) =====\n'
@@ -494,8 +499,10 @@ grep -qF '[ ! -x "$E3_INSTALL_MONITOR" ]' "$ROOT/monitor-v2/deploy/e3-rollback.s
     && pass 'B2: R2 requires the installer to be EXECUTABLE' \
     || fail 'B2: R2 does not check installer executability'
 
+TOTAL=$((PASS + FAIL + SKIP))
 printf '\nPASS=%d FAIL=%d SKIP=%d\n' "$PASS" "$FAIL" "$SKIP"
-if [ "$FAIL" -gt 0 ]; then
+printf 'TOTAL=%d (expected %d)\n' "$TOTAL" "$EXPECTED_TOTAL"
+if [ "$FAIL" -ne 0 ] || [ "$TOTAL" -ne "$EXPECTED_TOTAL" ]; then
     printf 'E3_M3_DEPLOY=FAIL\n'
     exit 1
 fi
