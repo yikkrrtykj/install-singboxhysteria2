@@ -64,6 +64,10 @@ jobs:
           bash -n tests/e3/test-m1-systemd.sh
           bash -n tests/e3/test-m2-live.sh
           bash -n tests/test-monitor-v2-m2.sh
+          bash -n tests/e3/test-m3-deploy.sh
+          bash -n monitor-v2/deploy/e3-preflight.sh
+          bash -n monitor-v2/deploy/e3-deploy-verify.sh
+          bash -n monitor-v2/deploy/e3-rollback.sh
 
       - name: "Journal time compatibility regression suite (B6 finding: raw RFC3339 rejected by Ubuntu 22.04 journalctl)"
         run: bash tests/test-journal-time-compat.sh
@@ -142,6 +146,11 @@ jobs:
           # SINGBOX_MONITOR_REQUIRE_LIVE=1: on CI the live gate MUST really
           # execute; a SKIP here is a hard failure (the B-5 lesson).
           sudo -n env SINGBOX_MONITOR_REQUIRE_LIVE=1 bash tests/e3/test-m2-live.sh
+
+      - name: "E3 M3 deploy tooling (preflight / deploy-verify / rollback against a live fixture)"
+        run: |
+          bash -n tests/e3/test-m3-deploy.sh
+          sudo -n env SBOX_E3_REQUIRE_LIVE=1 bash tests/e3/test-m3-deploy.sh
 
       - name: "systemd unit validation (sbox-cm socket + service candidate)"
         run: |

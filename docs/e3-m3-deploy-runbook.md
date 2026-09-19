@@ -1,0 +1,96 @@
+# E3 M3 — 部署上线 Runbook（deploy-disabled 阶段：M3-A / M3-B）
+
+```text
+状态       : M3-A / M3-B 工具与测试已交付；M3-C（真实激活）明确禁止，等待单独批准
+适用范围   : 生产 VPS 上的 E3 部署准备 —— 本文档与脚本本身不执行任何部署
+红线       : 不 SSH 生产 VPS；不 management.activate；不 add/delete 生产 client；
+             不 reload/restart 生产 sing-box；不写 activation marker
+基线       : main = 6bed1bd（M2 已合并，M2 COMPLETE）
+```
+
+## M3-A — 部署前 preflight（`monitor-v2/deploy/e3-preflight.sh`）
+
+只读。唯一写动作是显式要求的 `--baseline-out FILE`（供 verify/rollback 对照）。
+
+```bash
+sudo bash monitor-v2/deploy/e3-preflight.sh --baseline-out /root/e3-baseline.json
+```
+
+检查项（每项独立 PASS/FAIL，任一 FAIL ⇒ `E3_PREFLIGHT=FAIL`，退出码 1）：
+
+| # | 检查 |
+| --- | --- |
+| P01 | monitor VERSION / webapp.py 入口存在；sbox-cm libexec 存在（首次部署前允许缺失，记 INFO） |
+| P02 | `sing-box.service` active |
+| P03 | `singbox-monitor.service` active |
+| P04 | 记录当前配置 SHA256 + size（`/root/sbox/sbconfig_server.json`） |
+| P05 | `sing-box check -c` 当前配置通过（只读，不落任何文件） |
+| P06 | monitor 只读 HTTP `/api/v1/session` 200 |
+| P07 | sboxweb user/group 存在 |
+| P08 | `/root/sbox` 存在、root 属主、配置在内 |
+| P09 | `/var/lib/sbox-cm` root:root 0700（不存在则记 INFO，首次部署创建） |
+| P10 | `/run/sbox-cm/sbox-cm.sock` root:sboxweb 0660（socket 启动后才存在） |
+| P11 | sbox-cm units 是否已安装（socket/service/enabled 状态如实记录） |
+| P12 | `/` 与 `/var` 可用空间 ≥ 1024 MB |
+| P13 | systemd 整体 running（degraded 记 INFO 放行） |
+| P14 | activation marker **不存在**（部署要求平面处于关闭默认态；存在 ⇒ FAIL） |
+
+保底：脚本除 baseline 输出外零写动作；`sing-box check` 用 `-c` 只读现配置；
+systemctl 仅用 is-active/is-enabled/show 等只读查询。
+
+## M3-B — deploy-disabled 部署与验收
+
+### 部署步骤（均不打开管理面）
+
+```text
+D1  预跑 M3-A preflight，留存 /root/e3-baseline.json；
+D2  打包并安装新 monitor release（既有 install-monitor.sh，release-symlink 原子切换）；
+D3  安装 sbox-cm（install-sbox-cm.sh install —— 默认 disabled/inactive）；
+D4  systemctl enable --now sbox-cm.socket（socket-only，service 由连接拉起）；
+D5  跑 M3-B 验收（e3-deploy-verify.sh --baseline /root/e3-baseline.json）。
+```
+
+部署后必须保持 `management_state = inactive`。验收项（`E3_M3_VERIFY=PASS`）：
+
+```text
+V01/V02  配置 SHA256 + size 与 baseline 完全一致
+V03      sing-box 未被部署触发重启（ActiveEnterTimestamp + NRestarts 与 baseline 一致）
+V04      monitor active + 只读 HTTP 200
+V05      sbox-cm.socket/.service active（能力在场）
+V06      activation marker 不存在 ⇒ 管理面 inactive
+V07      sboxweb 上下文 RPC management.status = inactive
+V08      sboxweb 上下文 RPC client.list 可读
+V09      Web E3 UI 可加载（index + app.js 200，clients 表在页面中）
+V10/V11  inactive 下 mutation fail-closed：add 尝试被 E_ACTIVATION_STATE 拒绝
+         （helper 在 intent 之前拒绝 ⇒ 零变更，仅留下一条 rejected 审计），
+         且拒绝后配置 SHA 不变
+```
+
+### 回滚（`monitor-v2/deploy/e3-rollback.sh --baseline /root/e3-baseline.json`）
+
+```text
+R1  关闭特权面：stop+disable sbox-cm.socket（socket 会按连接拉起 service，
+    必须先停），再 stop+disable sbox-cm.service；
+R2  恢复旧 monitor release：调用既有 install-monitor.sh rollback [release-id]
+    （只翻转 release symlink + 重启 monitor；未给 id 时自动取 releases.history
+    中上一个 release）；
+R3  monitor 只读 HTTP 恢复 200；
+R4  配置 SHA256 与 preflight baseline 完全一致（全程不触碰 /root/sbox 配置与
+    sing-box 服务）；
+R5  activation marker 不存在（回滚全程平面保持关闭）。
+```
+
+## M3-C — 明确禁止（本阶段不执行）
+
+SSH 到生产 VPS 执行部署、`management.activate`、add/delete 生产 client、
+reload/restart 生产 sing-box、写 activation marker。
+**第一次真实生产 `management.activate` 必须单独停下等待明确批准**
+（激活属 M3-C，需 G1–G6 全绿 + canary 批准）。
+
+## 测试
+
+`tests/e3/test-m3-deploy.sh`（CI 三基线，live fixture）：preflight PASS+baseline、
+三种 preflight FAIL（marker / socket down / check 拒绝）、verify PASS（含
+fail-closed 证明 + config 不变 + sing-box 未重启）、verify FAIL（config 被改）、
+rollback PASS（plane 关闭 + config 不变 + 调用 packaging rollback 于上一个
+release id + monitor 存活）。退出码契约与 skip=FAIL 开关沿用 B-5 纪律。
