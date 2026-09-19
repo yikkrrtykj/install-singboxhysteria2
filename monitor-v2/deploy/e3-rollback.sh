@@ -137,14 +137,19 @@ PRE_SOCK_ENABLED="$(printf '%s' "$BL" | jq -r '.helper.socket_enabled // empty')
 PRE_SVC_ACTIVE="$(printf '%s' "$BL" | jq -r '.helper.service_active // empty')"
 PRE_SVC_ENABLED="$(printf '%s' "$BL" | jq -r '.helper.service_enabled // empty')"
 
+# baseline stores JSON booleans (true/false); classify with that in mind
+PRE_LIBEXEC_T="no"; [ "$PRE_LIBEXEC" = "true" ] && PRE_LIBEXEC_T="yes"
+PRE_SOCK_UNIT_T="no"; [ "$PRE_SOCK_UNIT" = "true" ] && PRE_SOCK_UNIT_T="yes"
+PRE_SVC_UNIT_T="no"; [ "$PRE_SVC_UNIT" = "true" ] && PRE_SVC_UNIT_T="yes"
+
 HELPER_WAS_ABSENT="no"
-if [ "$PRE_SOCK_UNIT" = "no" ] && [ "$PRE_SVC_UNIT" = "no" ] \
-        && [ "$PRE_LIBEXEC" = "no" ]; then
+if [ "$PRE_SOCK_UNIT_T" = "no" ] && [ "$PRE_SVC_UNIT_T" = "no" ] \
+        && [ "$PRE_LIBEXEC_T" = "no" ]; then
     HELPER_WAS_ABSENT="yes"
 fi
 HELPER_WAS_PRESENT="no"
-if [ "$PRE_SOCK_UNIT" = "yes" ] && [ "$PRE_SVC_UNIT" = "yes" ] \
-        && [ "$PRE_LIBEXEC" = "yes" ]; then
+if [ "$PRE_SOCK_UNIT_T" = "yes" ] && [ "$PRE_SVC_UNIT_T" = "yes" ] \
+        && [ "$PRE_LIBEXEC_T" = "yes" ]; then
     HELPER_WAS_PRESENT="yes"
 fi
 
