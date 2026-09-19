@@ -105,26 +105,18 @@ R2  恢复 monitor release：target **唯一来源 = preflight baseline 的
     monitor.release_id**（不提供 override，不从 releases.history 推断，不从任何其它来源猜测）。
     installer 缺失 / target release 目录不存在 / rollback 命令失败 /
     恢复后 live release id 与 baseline 不一致 ⇒ E3_M3_ROLLBACK=FAIL；
-R3  monitor 只读 HTTP 恢复 200；
-R4  配置 SHA256 与 preflight baseline 完全一致（全程不触碰 /root/sbox 配置与
-    sing-box 服务）；
-R5  activation marker 不存在（回滚全程平面保持关闭）。
-
-R3 卸载校验覆盖全部 6 个 capability 路径 + socket 文件；disable 失败在 R1
-即 FAIL（绝不静默）。
-
-baseline 还冻结 helper 部署前状态（libexec/两 unit/state dir 是否存在、
-socket+service 的 active/enabled）与 monitor 的 exact `release_id/release_target`
-（取自 live symlink，非 history 推断）。回滚按 baseline 恢复：
-
-```text
-helper 部署前不存在 ⇒ 卸载本轮新装能力（units + libexec 删除）；
-                      state/audit 树明确保留（审计记录绝不静默清除——写死的策略）
-helper 部署前存在   ⇒ 不删除任何文件，恢复原 active/enabled 状态
-部分安装（preflight 本就该 FAIL）⇒ 回滚 FAIL
-R5-final 同时核对 socket 与 service 的 active/enabled 与 baseline 一致
+R3  卸载本轮新装的 helper 能力：删除两 unit 与整个 libexec，检查 daemon-reload
+    成功，并确认 6 个 capability 路径及 runtime socket 全部消失；state/audit 树
+    明确保留（审计记录绝不静默清除）；
+R4  验证 monitor 只读 HTTP 恢复 200、配置 SHA256 与 preflight baseline 完全一致、
+    activation marker 不存在。全程不触碰 /root/sbox 配置与 sing-box 服务。
 ```
-```
+
+M3-B v1 只有这一条回滚路径：preflight 已证明 helper capability 在部署前完全
+不存在，因此 rollback 只做本轮首次安装的精确逆操作。任何 existing/partial helper
+都会在 preflight 阶段 FAIL，不进入部署，也不存在“恢复既有 helper active/enabled
+状态”的分支。baseline 的 monitor rollback target 取自 live symlink 的 exact
+`release_id`，不从 history 或其它来源推断。
 
 ## M3-C — 明确禁止（本阶段不执行）
 
@@ -135,8 +127,13 @@ reload/restart 生产 sing-box、写 activation marker。
 
 ## 测试
 
-`tests/e3/test-m3-deploy.sh`（CI 三基线，live fixture）：preflight PASS+baseline、
-三种 preflight FAIL（marker / socket down / check 拒绝）、verify PASS（含
-fail-closed 证明 + config 不变 + sing-box 未重启）、verify FAIL（config 被改）、
-rollback PASS（plane 关闭 + config 不变 + 调用 packaging rollback 于上一个
-release id + monitor 存活）。退出码契约与 skip=FAIL 开关沿用 B-5 纪律。
+`tests/e3/test-m3-deploy.sh`（CI 三基线，live fixture）按 first-deploy-only 顺序覆盖：
+真实 `app/monitor-v2` release layout、preflight PASS 与实测 baseline、无临时残留、
+marker 已存在 / 配置 check 拒绝 / monitor 非 symlink / `root:sboxweb 0660` stale
+socket / existing helper / partial helper 等 preflight FAIL，以及失败时不创建或覆盖
+baseline。随后执行真实 helper installer、socket-only D4、pre-RPC service inactive、
+post-RPC service active、verify PASS（inactive mutation fail-closed、配置不变、
+sing-box 未重启）与配置被改时 verify FAIL。rollback 覆盖 exact baseline release、
+helper absent、state/audit 保留、配置不变及 monitor 存活；missing/non-executable
+installer、目标 release 不存在、disable 失败和 daemon-reload 失败均必须 FAIL。
+套件以 `EXPECTED_TOTAL=53` 冻结 PASS+FAIL+SKIP 总数，防止断言静默消失。
