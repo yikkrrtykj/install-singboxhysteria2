@@ -210,7 +210,7 @@ pass 'monitor fixture configured via webapp.py setup (as sboxweb)'
 
 # render the REAL hardened unit template; only ExecStart is pointed at the
 # fixture entrypoint directly (the deploy shim is packaging, not sandboxing).
-render_monitor_unit() { # <with-carveout yes|no>
+render_monitor_unit() {
     sed -e "s|@SBMON_USER@|$AXE_USER|g" \
         -e "s|@SBMON_GROUP@|$AXE_USER|g" \
         -e "s|@SBMON_APP_DIR@|$APP|g" \
@@ -219,8 +219,16 @@ render_monitor_unit() { # <with-carveout yes|no>
         "$ROOT/monitor-v2/deploy/singbox-monitor.service.in" \
     | sed -e "s|^ExecStart=.*|ExecStart=/usr/bin/python3 $APP/webapp.py serve --listen 127.0.0.1 --port $MPORT --data-dir $MDATA|" \
           -e "s|^After=.*|After=network-online.target|" \
-    | if [ "$1" = "no" ]; then sed -e 's| -/run/sbox-cm||'; else cat; fi \
     > "$MUNIT"
+    # B5 least-privilege regression guard: the rendered unit must
+    # carry the data root and NOTHING else on ReadWritePaths.
+    local rw
+    rw="$(grep '^ReadWritePaths=' "$MUNIT")"
+    if [ "$rw" = "ReadWritePaths=$MDATA" ]; then
+        pass "shipped unit is least-privilege: ReadWritePaths = data root only"
+    else
+        fail "shipped unit ReadWritePaths is not minimal: [$rw]"
+    fi
     systemctl daemon-reload
 }
 
@@ -239,54 +247,27 @@ start_monitor() {
     wait_status 200 20
 }
 
-# ------------------------------------------------- carve-out experiment ----
-# Phase A: the unit WITHOUT the -/run/sbox-cm carve-out. The helper is up;
-# a 503 e3_unavailable from a fresh process means the connect itself is
-# blocked by ProtectSystem=strict. (Login still works: the whitelist/session
-# layer is independent of the E3 adapter.)
-render_monitor_unit no
-start_monitor || { fail 'monitor unit (phase A) did not come up'; printf '\nE3_M2_LIVE=FAIL\n'; exit 1; }
+# ------------------------------------------------- shipped-unit connect ----
+# (M2 final review B5) the carve-out experiment is gone: the SHIPPED template
+# carries NO -/run/sbox-cm entry, and this suite proves the monitor connects
+# to the real helper under exactly that least-privilege sandbox.
+render_monitor_unit
+start_monitor || { fail 'monitor unit did not come up'; printf '\nE3_M2_LIVE=FAIL\n'; exit 1; }
 curl -sS -c "$CJ" -H "Content-Type: application/json" \
      -d "{\"password\":\"$MPASS\"}" "$BASE/api/v1/login" >/dev/null 2>&1
-CSRF="$(curl -sS -b "$CJ" "$BASE/api/v1/session" | jqv '-' '.csrf_token')"
-CARVE_NEEDED="yes"
-STATUS_A="$(curl -sS -b "$CJ" "$BASE/api/v1/management/status")"
-CODE_A="$(jqv "$STATUS_A" '.code')"
-if [ "$CODE_A" = "e3_unavailable" ]; then
-    pass 'phase A: without the carve-out the connect IS blocked by ProtectSystem=strict (measured, not assumed)'
-elif [ "$(jqv "$STATUS_A" '.ok')" = "true" ]; then
-    CARVE_NEEDED="no"
-    pass 'phase A: this baseline connects WITHOUT the carve-out (recorded; carve-out kept as harmless tolerated-absence)'
-else
-    fail "phase A gave an unexpected answer: $STATUS_A"
-fi
-
-# Phase B: with the carve-out (the shipped template), the RPC MUST work.
-render_monitor_unit yes
-start_monitor || { fail 'monitor unit (phase B) did not come up'; printf '\nE3_M2_LIVE=FAIL\n'; exit 1; }
-curl -sS -c "$CJ" -H "Content-Type: application/json" \
-     -d "{\"password\":\"$MPASS\"}" "$BASE/api/v1/login" >/dev/null 2>&1
-SINFO_B="$(curl -sS -b "$CJ" "$BASE/api/v1/session")"
-assert_eq "true" "$(jqv "$SINFO_B" '.authenticated')" 'phase-B re-login produced a live session'
-CSRF="$(jqv "$SINFO_B" '.csrf_token')"
-assert_ne "null" "$CSRF" 'the re-login session exposes its CSRF token'
+SINFO="$(curl -sS -b "$CJ" "$BASE/api/v1/session")"
+CSRF="$(jqv "$SINFO" '.csrf_token')"
+STATUS="$(curl -sS -b "$CJ" "$BASE/api/v1/management/status")"
+assert_eq 'true' "$(jqv "$STATUS" '.ok')" \
+    'the SHIPPED unit (no carve-out) reaches the real helper under ProtectSystem=strict'
+assert_eq 'fresh' "$(jqv "$STATUS" '.transport')" 'the first status snapshot is fresh'
+assert_eq 'inactive' "$(jqv "$STATUS" '.data.management_state')" 'the plane starts inactive'
+assert_ne 'null' "$(jqv "$STATUS" '.as_of')" 'as_of is reported'
+assert_eq 'false' "$(jqv "$SINFO" '.management_active')" 'management_active is false while the plane is inactive'
 # mutations need a live step-up window (M0.5 gate, unchanged)
 STEPUP="$(curl -sS -b "$CJ" -H "X-CSRF-Token: $CSRF" -H "Content-Type: application/json" \
      -d "{\"password\":\"$MPASS\"}" "$BASE/api/v1/step-up")"
-assert_eq "ok" "$(jqv "$STEPUP" '.status')" \
-    "the step-up grant after re-login succeeded (raw=[$STEPUP])"
-STATUS_B="$(curl -sS -b "$CJ" "$BASE/api/v1/management/status")"
-assert_eq "true" "$(jqv "$STATUS_B" '.ok')" 'with the carve-out the monitor reaches the helper (phase B)'
-assert_eq "fresh" "$(jqv "$STATUS_B" '.transport')" 'the first status snapshot is fresh'
-assert_eq "inactive" "$(jqv "$STATUS_B" '.data.management_state')" 'the plane starts inactive'
-assert_ne "null" "$(jqv "$STATUS_B" '.as_of')" 'as_of is reported'
-[ "$CARVE_NEEDED" = "yes" ] && pass "carve-out verdict: REQUIRED on this baseline (mode=$CARVE_NEEDED)" \
-    || pass "carve-out verdict: not required on this baseline (mode=$CARVE_NEEDED)"
-
-# session-level contract: never a filesystem read, management_active follows
-# the broker only.
-SINFO="$(curl -sS -b "$CJ" "$BASE/api/v1/session")"
-assert_eq "false" "$(jqv "$SINFO" '.management_active')" 'management_active is false while the plane is inactive'
+assert_eq 'ok' "$(jqv "$STEPUP" '.status')" 'the step-up grant succeeded'
 
 # --------------------------------------------------------- full transaction --
 KEY1="m2-live-key-000000000001"

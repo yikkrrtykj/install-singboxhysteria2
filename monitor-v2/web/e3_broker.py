@@ -98,9 +98,29 @@ class E3Broker:
 
     def _result(self, transport, cache):
         if cache is None:
-            return {"transport": UNAVAILABLE, "payload": None, "as_of": None}
+            return {"transport": UNAVAILABLE, "payload": None, "as_of": None,
+                    "verdict_error": None}
         return {"transport": transport, "payload": cache["payload"],
-                "as_of": cache.get("fetched_wall", cache["fetched_at"])}
+                "as_of": cache.get("fetched_wall", cache["fetched_at"]),
+                "verdict_error": None}
+
+    def _verdict_error(self, verdict):
+        """Result for an ``ok:false`` HELPER verdict (B1).
+
+        The transport itself worked, so this is NOT a breaker input and the
+        last-known-good cache stays untouched. The caller maps the verdict
+        through the error table; ``transport`` is deliberately None because
+        no snapshot was obtained."""
+        error = verdict.get("error") if isinstance(verdict.get("error"),
+                                                  dict) else {}
+        return {"transport": None, "payload": None, "as_of": None,
+                "verdict_error": {
+                    "code": error.get("code") or "E_INTERNAL",
+                    "stage": error.get("stage"),
+                    "retriable": bool(error.get("retriable")),
+                    "detail": error.get("detail")
+                    or error.get("code") or "E_INTERNAL",
+                    "request_id": verdict.get("request_id")}}
 
     # ------------------------------------------------------------ status --
     def status(self):
@@ -155,6 +175,14 @@ class E3Broker:
                         self._opened_at = now
                 return self._result(
                     STALE if cache is not None else UNAVAILABLE, cache)
+
+            if isinstance(verdict, dict) and verdict.get("ok") is False:
+                # B1: a HELPER verdict, not a transport failure -- no breaker
+                # count, and the last-known-good cache stays untouched. The
+                # caller answers with the helper's own error semantics.
+                with self._mutex:
+                    self._status_attempted_at = self._clock()
+                return self._verdict_error(verdict)
 
             now = self._clock()
             with self._mutex:
@@ -234,6 +262,13 @@ class E3Broker:
                     self._list_attempted_at = self._clock()
                 return self._result(
                     STALE if cache is not None else UNAVAILABLE, cache)
+
+            if isinstance(verdict, dict) and verdict.get("ok") is False:
+                # B1: helper verdict on a working transport -- no cache write,
+                # no breaker input; the caller maps the helper semantics.
+                with self._mutex:
+                    self._list_attempted_at = self._clock()
+                return self._verdict_error(verdict)
 
             now = self._clock()
             with self._mutex:

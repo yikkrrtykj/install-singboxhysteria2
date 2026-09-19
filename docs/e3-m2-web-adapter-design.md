@@ -463,15 +463,16 @@ S-F 无新配置面: 不新增 env key、不新增配置键；socket 路径为�
 
 ---
 
-## 13. 运行时实测前置与 unit 契约变更（B-5 纪律，不可跳过）
+## 13. 运行时实测前置与 unit 契约（B-5 纪律，不可跳过）
 
-**实测结论（M2-E，`tests/e3/test-m2-live.sh`）**：monitor unit
-（`User=sboxweb`，`ProtectSystem=strict`）连接 `/run/sbox-cm/sbox-cm.sock`
-**需要** `ReadWritePaths=-/run/sbox-cm` connect carve-out（与 M1 B-5 的
-`-/run/systemd` 同理：`/run` 在 strict 下只读，connect 需要该挂载点的写权限）。
-live 套件对两个方向都做了活体证明：先剥掉 carve-out 跑（预期 connect 被阻，
-若某基线不阻则如实记录），再恢复 shipped 模板跑（必须成功）——不许只测一边。
-socket 文件本身的 DAC（root:sboxweb 0660）对 sboxweb 组可写，这层无需改动。
+**实测结论（M2-E，`tests/e3/test-m2-live.sh`，三基线原始日志）**：
+monitor unit（`User=sboxweb`，`ProtectSystem=strict`，`ReadWritePaths` 仅数据根）
+连接 `/run/sbox-cm/sbox-cm.sock` **不需要**任何 carve-out——三个 Ubuntu 基线在
+无 carve-out 的 shipped unit 下均实测 connect 成功。按 least privilege，
+`-/run/sbox-cm` 已从模板移除（final review B5），T12/packaging 的最小权限断言
+恢复原样；live 套件改为直接验证 shipped unit 连接真实 helper，并内置
+"ReadWritePaths 必须恰为数据根"的 per-baseline 回归守卫。socket DAC
+（root:sboxweb 0660）对 sboxweb 组可写，这层无需改动。
 
 ```text
 预期修正     : singbox-monitor.service.in 的 ReadWritePaths 追加 -/run/sbox-cm
@@ -623,5 +624,25 @@ M2 COMPLETE 当且仅当 : A0–E 全部闸门绿 + 文档收口（本文 rev2 �
               m05 T12 断言有意识更新为"数据根 + dash-prefixed carve-out"；
             * 既有回归：M0.5（137 断言）、E2（272 断言）保持全绿（501→503
               fail-closed 契约为有意识变更）。
-（M2 最终 G-review 结论待回填）
+
+2026-09-19  Final source/runtime review（rev3 → rev4 delta，5 个 merge
+            blocker 全部修复）：
+            B1 helper ok:false 语义 verdict 正确传播——broker 不写成功缓存、
+               不计 breaker、last-known-good 不被覆盖；HTTP 按 §2.6 表映射
+               （status E_INTERNAL→500、list E_LOCK→423、E_CONFIG_INCONSISTENT
+               →409）；delete 预检遇语义错误按原语义返回，绝不伪装 E_NOT_FOUND；
+            B2 step-up actor 在 gate 内经 step_up_credentials 原子冻结并直传
+               handler；handler 不再重读 fp；revoke race 回归证明 dispatch
+               时 helper 收到的仍是 gate 时 fp；
+            B3 uncertain same-key retry 真正落地：pending {op,name,key} 持久
+               于页面状态 + 显式 Retry 按钮复用同一 header 值；terminal
+               verdict 清除；无 key 时只能 fresh 核对、绝不称 retry；
+            B4 统一 e3Writable 门控（transport==fresh 且非 degraded）——非
+               writable 时 activate/deactivate/add 禁用、删除控件不渲染，
+               stale 只读展示；修复 loadE3Clients catch 的 ReferenceError；
+            B5 撤销未证明必要的 -/run/sbox-cm carve-out（三基线实测无需），
+               恢复 M0.5 T12/packaging 最小权限断言（M0.5 137→136：一条
+               carve-out 断言删除），live 套件直接验证 shipped unit 连接。
+（M2 merge 决策待 review 人）
+
 ```

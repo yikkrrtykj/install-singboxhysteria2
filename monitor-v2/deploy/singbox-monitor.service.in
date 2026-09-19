@@ -29,13 +29,17 @@ NoNewPrivileges=true
 PrivateTmp=true
 PrivateDevices=true
 # M0.5 (rev5 G4): ProtectSystem=strict makes the whole hierarchy read-only
-# except /dev, /proc, /sys; the writable exceptions are re-opened explicitly
-# below. /root/sbox and /var/lib/sbox-cm stay non-writable AND non-readable
-# (ProtectHome hides /root; the sbox-cm runtime tree is root:root 0700 and
-# outside the data root). Web code has no direct filesystem path to either --
-# mutations can only ever travel over the sbox-cm AF_UNIX RPC (M2).
+# except /dev, /proc, /sys; the single writable exception is the monitor's
+# own data root, re-opened explicitly below. /root/sbox and /var/lib/sbox-cm
+# stay non-writable AND non-readable (ProtectHome hides /root; the sbox-cm
+# runtime tree is root:root 0700 and outside the data root). Web code has no
+# direct filesystem path to either -- mutations can only ever travel over
+# the sbox-cm AF_UNIX RPC (M2). NOTE (M2 final review B5): the AF_UNIX
+# connect to the already-listening sbox-cm.socket needs NO ReadWritePaths
+# entry -- measured live on all three baselines by tests/e3/test-m2-live.sh
+# -- so this unit deliberately stays at the least-privilege minimum.
 ProtectSystem=strict
-ReadWritePaths=@SBMON_STATE_ROOT@ -/run/sbox-cm
+ReadWritePaths=@SBMON_STATE_ROOT@
 ProtectHome=yes
 ProtectKernelTunables=true
 ProtectKernelModules=true

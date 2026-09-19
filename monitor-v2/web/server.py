@@ -271,13 +271,10 @@ class MonitorWebApp:
             return None
         return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
 
-    def stepup_fingerprint(self, token):
-        """The live step-up window's audit fingerprint, or None. Read
-        atomically with the liveness check (auth.py step_up_credentials);
-        never disclosed to the browser."""
-        if not self.auth or not token:
-            return None
-        return self.auth.sessions.step_up_credentials(token)["fp"]
+    # (B2) the step-up fingerprint is no longer read separately anywhere:
+    # the gate captures it atomically with the liveness check via
+    # auth.step_up_credentials, freezes it into the request's actor, and
+    # the handler never re-reads it.
 
 
 class MonitorHTTPServer(ThreadingHTTPServer):
@@ -476,7 +473,10 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         op = MUTATION_ROUTES.get(path)
         if op is not None:
             # M2: the full gate chain (session -> CSRF -> step-up) is
-            # unchanged; only the terminal handler is real now.
+            # unchanged; the gate ALSO freezes the audit actor atomically
+            # with the step-up liveness check (B2), so a revocation that
+            # lands after the gate can never strip the actor from an
+            # already-authorized dispatch.
             self._require_step_up(self._handle_e3_mutation, op)
             return
         self._send_json(404, {"error": "not found"})
@@ -597,10 +597,23 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
                 not hmac.compare_digest(supplied, expected):
             self._send_json(403, {"error": "missing or invalid CSRF token"})
             return
-        if not self.app.step_up_active(token):
+        # B2: the step-up liveness check and the audit fingerprint are read
+        # in ONE atomic step (auth.step_up_credentials). The frozen actor
+        # travels with the request: a revocation that lands after this point
+        # refuses every LATER request but does not strip the actor from an
+        # already-authorized dispatch -- the helper's audit keeps the
+        # gate-time fingerprints.
+        creds = self.app.auth.sessions.step_up_credentials(token)
+        if not creds["active"]:
             self._send_json(401, {"error": "reauth_required"})
             return
-        handler(session, *args)
+        actor = {}
+        sfp = self.app.session_fingerprint(token)
+        if sfp:
+            actor["session_fp"] = sfp
+        if creds["fp"]:
+            actor["stepup_fp"] = creds["fp"]
+        handler(session, *args, actor)
 
     def _cross_origin(self):
         """True when the browser declared a foreign Origin (second CSRF
@@ -877,6 +890,16 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         self._send_json(503, {"ok": False, "code": "e3_unavailable",
                               "error": detail, "retriable": True})
 
+    def _e3_verdict_error(self, result):
+        """B1: a helper ``ok:false`` verdict on a WORKING transport maps
+        through the authoritative error table -- never disguised as a
+        snapshot, never as e3_unavailable, and the breaker was not touched."""
+        err = result["verdict_error"]
+        mapped = {"ok": False, "code": err["code"], "stage": err["stage"],
+                  "error": err["detail"], "retriable": err["retriable"],
+                  "request_id": err.get("request_id")}
+        self._send_json(E3_ERROR_HTTP.get(err["code"], 500), mapped)
+
     def _handle_e3_management_status(self, session):
         """GET /api/v1/management/status -> the whitelisted status snapshot.
 
@@ -885,12 +908,16 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         what a real management.status response said (the two are never
         conflated, design §7.5). monitor_running is web-supplied (frozen
         ruling): this process IS the monitor. An unavailable helper with no
-        snapshot is a 503 -- nothing is synthesized."""
+        snapshot is a 503 -- nothing is synthesized. A helper semantic
+        verdict (ok:false) maps through E3_ERROR_HTTP (B1)."""
         broker = self.app.e3_broker
         if broker is None:
             self._e3_unavailable("the E3 adapter is not wired in this build")
             return
         result = broker.status()
+        if result.get("verdict_error"):
+            self._e3_verdict_error(result)
+            return
         if result["payload"] is None:
             self._e3_unavailable("sbox-cm is unreachable (no snapshot)")
             return
@@ -915,6 +942,9 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             self._e3_unavailable("the E3 adapter is not wired in this build")
             return
         result = broker.list_clients()
+        if result.get("verdict_error"):
+            self._e3_verdict_error(result)
+            return
         if result["payload"] is None:
             self._e3_unavailable("sbox-cm is unreachable (no snapshot)")
             return
@@ -927,11 +957,15 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             "data": sanitize_e3_data("client.list", data or {}),
         })
 
-    def _handle_e3_mutation(self, session, op):
+    def _handle_e3_mutation(self, session, op, actor):
         """POST mutation -> dispatch to sbox-cm via the broker.
 
-        Reached only after session -> CSRF -> step-up. Contract highlights
-        (design §8-§11):
+        Reached only after session -> CSRF -> step-up, and the ``actor`` was
+        FROZEN at the gate (B2): the fingerprints are the gate-time values,
+        so a revocation racing the dispatch changes the authorization of
+        FUTURE requests, never the attribution of this one.
+
+        Contract highlights (design §8-§11):
 
         * client.add/delete take the Idempotency-Key HTTP header (16..128 of
           [A-Za-z0-9._:-]), validated here and forwarded verbatim; the body
@@ -1005,7 +1039,15 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             try:
                 fresh = broker.list_clients(force=True)
             except BrokerUnavailable:
-                fresh = {"payload": None, "transport": "unavailable"}
+                fresh = {"payload": None, "transport": "unavailable",
+                         "verdict_error": None}
+            # B1: a helper semantic verdict on the preflight keeps its own
+            # semantics (E_LOCK -> 423, E_CONFIG_INCONSISTENT -> 409, ...);
+            # it is never disguised as E_NOT_FOUND and the delete is never
+            # dispatched past a failed preflight.
+            if fresh.get("verdict_error"):
+                self._e3_verdict_error(fresh)
+                return
             fresh_ok = fresh.get("payload") is not None \
                 and fresh.get("transport") == "fresh"
             names = set()
@@ -1030,14 +1072,7 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
                     "retriable": False})
                 return
 
-        actor = {}
-        sfp = self.app.session_fingerprint(self._session_token())
-        if sfp:
-            actor["session_fp"] = sfp
-        ufp = self.app.stepup_fingerprint(self._session_token())
-        if ufp:
-            actor["stepup_fp"] = ufp
-
+        # the actor arrived FROZEN from the gate (B2) -- never re-read here
         try:
             verdict = broker.mutate(op, payload=payload, actor=actor or None)
         except BrokerUnavailable:

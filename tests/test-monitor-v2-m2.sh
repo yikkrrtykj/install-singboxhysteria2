@@ -85,6 +85,7 @@ class FakeClient:
         self.mutex = threading.Lock()
         self.script = []
         self.calls = []            # op names, one per RPC
+        self.actors = []           # the actor dict of each mutation RPC
         self.entered = threading.Event()
         self.release = threading.Event()
 
@@ -95,8 +96,11 @@ class FakeClient:
         self.script = []
 
     def call(self, op, payload=None, actor=None):
+        if getattr(self, 'on_call', None):
+            self.on_call()
         with self.mutex:
             self.calls.append(op)
+            self.actors.append(actor)
         if self.release.is_set() is False and self.script \
                 and self.script[0] == "BLOCK":
             self.script.pop(0)
@@ -363,6 +367,125 @@ def group_stale_and_degraded():
     out["unreachable_is_not_degraded"] = (
         snap["degraded"] is False and snap["transport"] == "unavailable")
     return out
+
+
+# ------------------------------------------------------- B1/B2 groups --
+def group_verdict_semantics():
+    """B1: a helper ok:false verdict is a SEMANTIC answer on a working
+    transport -- no cache write, no breaker movement, helper error mapping."""
+    out = {}
+    clock = FakeClock()
+    client = FakeClient()
+    broker = new_broker(client, clock)
+    client.record({"ok": False, "request_id": "helper-e1",
+                   "error": {"code": "E_INTERNAL", "stage": "parse",
+                             "retriable": False, "detail": "boom"}})
+    r = broker.status()
+    out["status_verdict_error_surfaced"] = (
+        r["verdict_error"] is not None
+        and r["verdict_error"]["code"] == "E_INTERNAL")
+    out["status_verdict_no_payload"] = r["payload"] is None
+    out["semantic_error_never_opens_breaker"] = broker.breaker_state() == "closed"
+    # repeat: three semantic errors still never trip the transport breaker
+    for _ in range(2):
+        client.record({"ok": False, "request_id": "x",
+                       "error": {"code": "E_INTERNAL", "stage": "parse",
+                                 "retriable": False, "detail": "d"}})
+        clock.advance(2.5)
+        broker.status()
+    out["semantic_errors_leave_breaker_closed"] = \
+        broker.breaker_state() == "closed"
+    # the last-known-good cache is untouched: a later success still lands
+    client.record(ok_status(active=True))
+    clock.advance(2.5)
+    r = broker.status()
+    out["cache_recoverable_after_semantic_errors"] = (
+        r["transport"] == "fresh" and r["payload"]["ok"] is True)
+
+    # list semantics
+    clock2 = FakeClock()
+    client2 = FakeClient()
+    broker2 = new_broker(client2, clock2)
+    client2.record({"ok": False, "request_id": "helper-lk",
+                    "error": {"code": "E_LOCK", "stage": "lock",
+                              "retriable": True, "detail": "busy"}})
+    r = broker2.list_clients(force=True)
+    out["list_verdict_error_surfaced"] = (
+        r["verdict_error"] is not None
+        and r["verdict_error"]["code"] == "E_LOCK")
+
+    # a semantic error must NOT overwrite an existing good cache
+    clock3 = FakeClock()
+    client3 = FakeClient()
+    broker3 = new_broker(client3, clock3)
+    good = {"ok": True, "data": {"clients": [{"name": "keep-me"}]}}
+    client3.record(good)
+    broker3.list_clients()
+    clock3.advance(5.5)
+    client3.record({"ok": False, "request_id": "x",
+                    "error": {"code": "E_CONFIG_INCONSISTENT", "stage": "lock",
+                              "retriable": False, "detail": "bad live"}})
+    r = broker3.list_clients()
+    out["semantic_error_keeps_last_good_cache"] = (
+        r["verdict_error"] is not None
+        and r["payload"] is None)
+    # and the old good payload is still there for a stale display
+    r2 = broker3.list_clients()
+    out["last_good_cache_not_overwritten"] = (
+        r2["transport"] == "stale"
+        and r2["payload"]["data"]["clients"][0]["name"] == "keep-me")
+    return out
+
+
+def group_actor_freeze():
+    """B2: the step-up fingerprint is captured at the GATE; a revocation
+    racing the dispatch never strips the actor from the audit."""
+    out = {}
+    client = FakeClient()
+    broker = new_broker(client, FakeClock())
+    stack = M2Stack(e3_broker=broker)
+    port = stack.port
+    cookie = login(port)
+    csrf = session_info(port, cookie)["csrf_token"]
+    step_up(port, cookie, csrf)
+    fp1 = stack.auth.sessions.step_up_credentials(
+        _token_of(stack, cookie))["fp"]
+
+    # the fake client triggers the revocation from INSIDE the dispatch, i.e.
+    # after the gate has passed and while the request is in flight
+    client.on_call = lambda: \
+        stack.auth.sessions.revoke_all_step_ups()
+    client.record({
+        "ok": True, "data": {"clients": [
+            {"name": "vmix-01", "protocols": ["reality", "hy2"],
+             "reserved": False, "mutable": True, "source": "untracked"}],
+        "truncated": False}})
+    client.record(
+        {"ok": True, "request_id": "helper-race-rid",
+         "idempotency": {"key_fp": "b" * 16, "replayed": False,
+                         "generation": 1},
+         "data": {"deleted": True, "derived_cleanup": True,
+                  "warnings": []}})
+    r = mutate(port, "/api/v1/clients/delete", cookie, csrf,
+               {"Idempotency-Key": "m2-race-key-000000000001"},
+               json.dumps({"name": "vmix-01", "confirm": "vmix-01"}))
+    out["race_delete_reaches_helper"] = \
+        json.loads(r["body"]).get("ok") is True
+    dispatched = client.actors[-1] or {}
+    out["race_actor_stepup_fp_frozen"] = \
+        dispatched.get("stepup_fp") == fp1
+    out["race_actor_session_fp_present"] = \
+        isinstance(dispatched.get("session_fp"), str)
+    out["fp_after_revoke_is_none"] = \
+        stack.auth.sessions.step_up_credentials(
+            _token_of(stack, cookie))["fp"] is None
+    stack.stop()
+    return out
+
+
+def _token_of(stack, cookie):
+    # the session token equals the cookie value (bearer token)
+    return cookie.split("=", 1)[1] if "=" in cookie else cookie
 
 
 # ---------------------------------------------------------- auth extension --
@@ -769,6 +892,56 @@ def group_http_adapter():
         r["status"] == 200 and body.get("transport") == "stale"
         and body.get("data", {}).get("management_state") is not None)
     stack.stop()
+
+    # B1: helper semantic verdicts map through the error table on a FRESH
+    # stack -- never disguised as snapshots, never as e3_unavailable, and
+    # never a breaker input.
+    client = FakeClient()
+    broker = new_broker(client, FakeClock())
+    stack = M2Stack(e3_broker=broker)
+    port = stack.port
+    cookie = login(port)
+    csrf = session_info(port, cookie)["csrf_token"]
+    step_up(port, cookie, csrf)
+
+    client.record({"ok": False, "request_id": "e1",
+                   "error": {"code": "E_INTERNAL", "stage": "parse",
+                             "retriable": False, "detail": "boom"}})
+    r = req(port, "GET", "/api/v1/management/status", {"Cookie": cookie})
+    body = json.loads(r["body"])
+    out["status_semantic_500"] = (
+        r["status"] == 500 and body.get("code") == "E_INTERNAL")
+    out["status_semantic_never_opens_breaker"] = \
+        broker.breaker_state() == "closed"
+
+    client.record({"ok": False, "request_id": "e2",
+                   "error": {"code": "E_LOCK", "stage": "lock",
+                             "retriable": True, "detail": "busy"}})
+    r = req(port, "GET", "/api/v1/clients", {"Cookie": cookie})
+    out["list_lock_423"] = r["status"] == 423
+
+    broker._clock.advance(5.5)   # past the list attempt throttle (5s)
+    client.record({"ok": False, "request_id": "e3",
+                   "error": {"code": "E_CONFIG_INCONSISTENT", "stage": "lock",
+                             "retriable": False, "detail": "bad"}})
+    r = req(port, "GET", "/api/v1/clients", {"Cookie": cookie})
+    out["list_config_409"] = r["status"] == 409
+
+    # delete preflight E_LOCK -> 423 with the helper semantics, zero
+    # client.delete dispatches
+    calls_before = len(client.calls)
+    client.record({"ok": False, "request_id": "e4",
+                   "error": {"code": "E_LOCK", "stage": "lock",
+                             "retriable": True, "detail": "busy"}})
+    r = mutate(port, "/api/v1/clients/delete", cookie, csrf,
+               {"Idempotency-Key": "m2-key-0000000000000007"},
+               json.dumps({"name": "vmix-01", "confirm": "vmix-01"}))
+    body = json.loads(r["body"])
+    out["delete_preflight_lock_423"] = (
+        r["status"] == 423 and body.get("code") == "E_LOCK")
+    out["delete_preflight_lock_no_dispatch"] = \
+        "client.delete" not in client.calls[calls_before:]
+    stack.stop()
     return out
 
 
@@ -878,6 +1051,8 @@ def main():
     out.update(group_single_flight())
     out.update(group_breaker())
     out.update(group_breaker_isolation())
+    out.update(group_verdict_semantics())
+    out.update(group_actor_freeze())
     out.update(group_stale_and_degraded())
     out.update(group_auth_lifecycle())
     out.update(group_http_adapter())
@@ -898,6 +1073,36 @@ section_py(){ printf '  -- %s --\n' "$1"; }
     || { fail 'py_compile of the M2 modules'; cat "$HARNESS.cerr"; }
 [ -s "$HARNESS.cerr" ] && fail 'compile diagnostics above' \
     || pass 'M2 modules compile'
+
+section_py 'B3/B4 static UI contracts'
+APP_SRC="$(cat "$ROOT/monitor-v2/web/static/app.js")"
+INDEX_SRC="$(cat "$ROOT/monitor-v2/web/static/index.html")"
+if printf '%s' "$APP_SRC" | grep -qF 'function e3Writable'; then
+    pass 'B4: the single writable gate (e3Writable) exists'
+else
+    fail 'B4: the single writable gate (e3Writable) is missing'
+fi
+if printf '%s' "$APP_SRC" | grep -qF 'setPendingRetry'; then
+    pass 'B3: the pending uncertain-retry mechanism exists'
+else
+    fail 'B3: the pending uncertain-retry mechanism is missing'
+fi
+if printf '%s' "$APP_SRC" | grep -qF 'idempotencyKey: p.idempotencyKey'; then
+    pass 'B3: the explicit retry reuses the stored Idempotency-Key'
+else
+    fail 'B3: the explicit retry does not reuse the stored key'
+fi
+LOAD_FN="$(sed -n '/function loadE3Clients/,/^  }/p' <<< "$APP_SRC")"
+if printf '%s' "$LOAD_FN" | grep -qF 'data.transport'; then
+    fail 'B4: loadE3Clients still references the undefined data variable'
+else
+    pass 'B4: the loadE3Clients failure branch is ReferenceError-free'
+fi
+if printf '%s' "$INDEX_SRC" | grep -qF 'e3-retry-btn'; then
+    pass 'B3: the explicit retry button is present in the UI'
+else
+    fail 'B3: the explicit retry button is missing'
+fi
 
 section_py 'running the contract harness'
 export MONITOR_V2_ROOT="$ROOT/monitor-v2"

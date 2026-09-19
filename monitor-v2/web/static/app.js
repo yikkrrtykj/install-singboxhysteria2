@@ -517,15 +517,87 @@
     show(el);
   }
 
+  // B4: ONE writable gate for every E3 mutation control. The view may be
+  // stale (still displayed), but the destructive surface only exists while
+  // the helper snapshot is FRESH and not degraded.
+  function e3Writable() {
+    var s = state.e3Status;
+    if (!s || s.transport !== "fresh") return false;
+    var degraded = s.data && s.data.helper && s.data.helper.degraded === true;
+    return !degraded;
+  }
+
+  /* B3: pending uncertain retry. After a result_unknown the operation is
+   * remembered EXACTLY as dispatched ({path, name, idempotencyKey}); the
+   * explicit Retry button replays it with the SAME key. A terminal verdict
+   * (success or a non-uncertain error) clears it. A lost key can never be
+   * "retried" -- only fresh status/list re-checking is offered then. */
+  function setPendingRetry(pending) {
+    state.e3PendingRetry = pending || null;
+    if (pending) {
+      $("e3-retry-name").textContent = pending.name || pending.path;
+      show($("e3-retry-row"));
+    } else {
+      hide($("e3-retry-row"));
+    }
+  }
+
+  function retryPending() {
+    var p = state.e3PendingRetry;
+    if (!p) return;   // no pending uncertain operation: nothing to retry
+    e3Message("Retrying with the SAME Idempotency-Key…", false);
+    apiWithStepUp(p.path, {
+      method: "POST",
+      idempotencyKey: p.idempotencyKey,   // exact same header value
+      body: p.body
+    }).then(function (data) {
+      setPendingRetry(null);
+      e3Message(p.name
+        ? "Retry finished: the operation reached a terminal state."
+        : "Retry finished.", false);
+      loadE3Clients();
+      loadE3Status();
+      loadSession();
+    }).catch(function (error) {
+      if (error.status === 504 && error.uncertain) {
+        // still uncertain: the pending op stays, still the same key
+        e3Message("Still result unknown. The pending operation keeps the " +
+                  "same Idempotency-Key; re-check status/list before " +
+                  "retrying again.", true);
+        loadE3Status();
+        return;
+      }
+      // any other terminal verdict clears the pending operation
+      setPendingRetry(null);
+      e3Message(error.detail || error.message, true);
+      loadE3Clients();
+      loadE3Status();
+    });
+  }
+
   function loadE3Status() {
     if (!state.session || !state.session.authenticated) return;
     api("/api/v1/management/status").then(function (data) {
       state.e3Status = data;
       renderE3Status(data);
     }).catch(function () {
+      state.e3Status = null;
       setBadge($("mg-transport"), "unavailable", "idle");
       $("mg-asof").textContent = "—";
+      renderE3Controls();
     });
+  }
+
+  function renderE3Controls() {
+    // B4: one writable decision drives every destructive control.
+    var writable = e3Writable();
+    var stateName = state.e3Status && state.e3Status.data
+      ? state.e3Status.data.management_state : null;
+    var armed = stateName === "active";
+    $("mg-activate").disabled = !writable || armed;
+    $("mg-deactivate").disabled = !writable || !armed;
+    $("e3-add-btn").disabled = !writable;
+    $("e3-add-name").disabled = !writable;
   }
 
   function renderE3Status(data) {
@@ -545,8 +617,7 @@
     if (degraded) { show($("mg-degraded")); } else { hide($("mg-degraded")); }
     // The mutation plane badge is driven by the helper's own status, so the
     // activate/deactivate buttons follow the real plane, not a stale view.
-    $("mg-activate").disabled = armed;
-    $("mg-deactivate").disabled = !armed;
+    renderE3Controls();
   }
 
   function loadE3Clients() {
@@ -555,13 +626,13 @@
       state.e3Clients = data;
       renderE3Clients(data);
     }).catch(function (error) {
+      // B4: only error/fixed text here -- never an undefined variable.
       var body = $("e3-clients-body");
       body.innerHTML = "";
       var row = body.insertRow(-1);
       var cell = row.insertCell(-1);
       cell.colSpan = 5;
-      cell.textContent = "Client list unavailable (" +
-                         (data.transport || "unavailable") + ").";
+      cell.textContent = "Client list unavailable.";
     });
   }
 
@@ -569,6 +640,7 @@
     var body = $("e3-clients-body");
     body.innerHTML = "";
     var clients = (data.data && data.data.clients) || [];
+    var writable = e3Writable();
     clients.forEach(function (client) {
       var row = body.insertRow(-1);
       row.insertCell(-1).textContent = client.name;
@@ -576,7 +648,8 @@
       row.insertCell(-1).textContent = client.mutable ? "yes" : "no";
       row.insertCell(-1).textContent = client.source;
       var actions = row.insertCell(-1);
-      if (client.mutable) {
+      // B4: no destructive control at all while the view is not writable.
+      if (client.mutable && writable) {
         var btn = document.createElement("button");
         btn.className = "btn ghost";
         btn.type = "button";
@@ -607,15 +680,16 @@
     hide($("e3-msg"));
   }
 
-  function deleteClient(name) {
-    var key = newIdempotencyKey();
-    // The SAME Idempotency-Key is kept for any explicit retry of THIS
-    // delete after an uncertain result; the retry never generates a new key.
+  function deleteClient(name, keyOverride) {
+    var key = keyOverride || newIdempotencyKey();
+    // B3: an explicit retry replays with the SAME key; a fresh click on the
+    // delete button is a NEW operation and gets a NEW key.
     apiWithStepUp("/api/v1/clients/delete", {
       method: "POST",
       idempotencyKey: key,
       body: { name: name, confirm: name }
     }).then(function () {
+      setPendingRetry(null);
       hide($("e3-delete-box"));
       e3Message("Client deleted. The helper reloaded sing-box.", false);
       loadSession();
@@ -623,15 +697,19 @@
       loadE3Status();
     }).catch(function (error) {
       if (error.status === 504 && error.uncertain) {
+        setPendingRetry({ path: "/api/v1/clients/delete", name: name,
+                          idempotencyKey: key,
+                          body: { name: name, confirm: name } });
         e3Message("Result unknown: the delete was dispatched and the " +
                   "transaction is still running (or has finished) inside " +
                   "the helper. Refresh the list below to see the real " +
-                  "state; a retry must reuse the SAME key and is only safe " +
-                  "after you re-checked the list.", true);
+                  "state; only the explicit Retry reuses the SAME key.",
+                  true);
         loadE3Clients();
         loadE3Status();
         return;
       }
+      setPendingRetry(null);
       if (error.code === "E_RECONCILE_CONFLICT") {
         e3Message("Server state changed: the client was rebuilt or rotated " +
                   "in the meantime. Refresh and re-check — the delete was " +
@@ -650,13 +728,14 @@
     });
   }
 
-  function addClient(name) {
-    var key = newIdempotencyKey();
+  function addClient(name, keyOverride) {
+    var key = keyOverride || newIdempotencyKey();
     apiWithStepUp("/api/v1/clients/add", {
       method: "POST",
       idempotencyKey: key,
       body: { name: name }
     }).then(function (data) {
+      setPendingRetry(null);
       e3Message("Client created. Credentials / client configuration are " +
                 "NOT returned through the web UI — generate the client " +
                 "configuration on the server with the client-management CLI.",
@@ -666,15 +745,17 @@
       loadE3Status();
     }).catch(function (error) {
       if (error.status === 504 && error.uncertain) {
+        setPendingRetry({ path: "/api/v1/clients/add", name: name,
+                          idempotencyKey: key, body: { name: name } });
         e3Message("Result unknown: the add was dispatched and the " +
                   "transaction is still running (or has finished) inside " +
-                  "the helper. Refresh the list to see the real state; a " +
-                  "retry must reuse the SAME key and is only safe after " +
-                  "you re-checked the list.", true);
+                  "the helper. Refresh the list to see the real state; " +
+                  "only the explicit Retry reuses the SAME key.", true);
         loadE3Clients();
         loadE3Status();
         return;
       }
+      setPendingRetry(null);
       if (error.code === "E_RECONCILE_CONFLICT") {
         e3Message("Server state changed while the request was in flight. " +
                   "Refresh and re-check — this request was not retried.",
@@ -998,6 +1079,7 @@
     $("e3-del-cancel").addEventListener("click", function () {
       hide($("e3-delete-box"));
     });
+    $("e3-retry-btn").addEventListener("click", retryPending);
     $("wl-add-btn").addEventListener("click", function () {
       var value = $("wl-add-input").value.trim();
       if (value) addEntry(value);

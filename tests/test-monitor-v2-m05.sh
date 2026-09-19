@@ -27,7 +27,7 @@ SKIP=0
 # or is explicitly skipped; the gate at the bottom requires
 # PASS + FAIL + SKIP == EXPECTED_TOTAL, so a section that silently disappears
 # (the classic "fewer assertions but still green") can never fake success.
-EXPECTED_TOTAL=137
+EXPECTED_TOTAL=136
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
@@ -101,20 +101,14 @@ assert_eq "ProtectControlGroups=true" "$(grep '^ProtectControlGroups=' "$UNIT")"
 assert_eq "RestrictSUIDSGID=true" "$(grep '^RestrictSUIDSGID=' "$UNIT")" "unit cannot create setuid/setgid files"
 assert_eq "CapabilityBoundingSet=" "$(grep '^CapabilityBoundingSet=' "$UNIT")" "unit drops the whole capability bounding set"
 assert_eq "AmbientCapabilities=" "$(grep '^AmbientCapabilities=' "$UNIT")" "unit holds zero ambient capabilities"
-assert_eq "1" "$(grep -c '^ReadWritePaths=' "$UNIT")" "unit declares EXACTLY ONE ReadWritePaths line (M2-E: consciously updated contract)"
-assert_eq "ReadWritePaths=/var/lib/singbox-monitor -/run/sbox-cm" "$(grep '^ReadWritePaths=' "$UNIT")" "writable exceptions = the monitor data root + the M2 socket connect carve-out"
+assert_eq "1" "$(grep -c '^ReadWritePaths=' "$UNIT")" "unit declares EXACTLY ONE writable exception"
+assert_eq "ReadWritePaths=/var/lib/singbox-monitor" "$(grep '^ReadWritePaths=' "$UNIT")" "the only writable path is the monitor's own data root (M2 final review B5: least privilege restored)"
 RW_ROOT="$(grep '^ReadWritePaths=' "$UNIT" | grep -F '/root/sbox' || true)"
 assert_eq "" "$RW_ROOT" "T12: the unit opens NO write path into /root/sbox"
 RW_CM="$(grep '^ReadWritePaths=' "$UNIT" | grep -F '/var/lib/sbox-cm' || true)"
 assert_eq "" "$RW_CM" "T12: the unit opens NO write path into the sbox-cm runtime tree"
 assert_eq "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX" "$(grep '^RestrictAddressFamilies=' "$UNIT")" \
     "monitor keeps AF_INET/AF_INET6 (it is a loopback client+listener); NOT collapsed to AF_UNIX-only"
-# The M2 carve-out is a CONNECT permission for the already-listening
-# sbox-cm.socket; the leading '-' tolerates its absence, so the monitor
-# unit never force-creates /run/sbox-cm and never gains any write path
-# into the proxy tree or the sbox-cm runtime state (M2-E contract).
-assert_contains "ReadWritePaths=/var/lib/singbox-monitor -/run/sbox-cm" "$UNIT_SRC" \
-    "the socket carve-out is dash-prefixed (tolerated absence, never force-created)"
 
 # ---------------------------------------------------------------------------
 # T12 runtime half: the privileged trees must be unreachable IN PRACTICE, not
@@ -144,7 +138,6 @@ import sys
 
 PATHS = ("/root", "/root/sbox", "/var/lib/sbox-cm")
 
-
 def probe(path):
     if os.name != "posix":
         return "not-posix"
@@ -161,7 +154,6 @@ def probe(path):
     except OSError:
         return "denied"
     return "allowed"
-
 
 def modes(path):
     if os.name != "posix":
@@ -183,7 +175,6 @@ def modes(path):
     if not os.path.isdir(path):
         return "not-a-dir"
     return "owner-only"
-
 
 mode = "--modes" in sys.argv[1:]
 report = modes if mode else probe
@@ -299,10 +290,8 @@ RECOVERY_KEY = "m05-recovery-key-0001"
 SOURCE = "127.0.0.5"
 MUTATION_PATHS = sorted(MUTATION_ROUTES)
 
-
 def _raiser():
     raise RuntimeError("management_active provider failed")
-
 
 def make_stack(data_dir, *, password=None, recovery=None,
                whitelist=(SOURCE + "/32",), poll=0.2, url="http://127.0.0.1:1",
@@ -335,7 +324,6 @@ def make_stack(data_dir, *, password=None, recovery=None,
     return {"srv": srv, "port": port, "policy": policy, "auth": auth,
             "broker": broker, "data_dir": data_dir, "app": app}
 
-
 def req(port, method, path, headers=None, body=None, timeout=8.0,
         source=SOURCE):
     try:
@@ -343,7 +331,6 @@ def req(port, method, path, headers=None, body=None, timeout=8.0,
     except (ConnectionError, OSError):
         time.sleep(0.3)
         return _req_once(port, source, method, path, headers, body, timeout)
-
 
 def _req_once(port, source, method, path, headers=None, body=None,
               timeout=8.0):
@@ -361,50 +348,40 @@ def _req_once(port, source, method, path, headers=None, body=None,
             "headers": {k.lower(): v for k, v in resp.getheaders()},
             "body": data.decode("utf-8", "replace")}
 
-
 def json_body(payload):
     return json.dumps(payload).encode("utf-8")
-
 
 def login(port, password=PASSWORD):
     return req(port, "POST", "/api/v1/login",
                {"Content-Type": "application/json"},
                json_body({"password": password}))
 
-
 def cookie_of(response):
     return response["headers"].get("set-cookie", "").split(";")[0]
-
 
 def token_of(response):
     raw = response["headers"].get("set-cookie", "").split(";")[0]
     return raw.split("=", 1)[1] if "=" in raw else ""
-
 
 def csrf_of(port, cookie):
     data = json.loads(req(port, "GET", "/api/v1/session",
                           {"Cookie": cookie})["body"])
     return data.get("csrf_token") or ""
 
-
 def session_info(port, cookie=None):
     headers = {"Cookie": cookie} if cookie else {}
     return json.loads(req(port, "GET", "/api/v1/session", headers)["body"])
-
 
 def authed(cookie, csrf):
     return {"Content-Type": "application/json", "Cookie": cookie,
             "X-CSRF-Token": csrf}
 
-
 def step_up(port, cookie, csrf, password=PASSWORD):
     return req(port, "POST", "/api/v1/step-up", authed(cookie, csrf),
                json_body({"password": password}))
 
-
 def mutate(port, path, cookie, csrf):
     return req(port, "POST", path, authed(cookie, csrf), json_body({}))
-
 
 def no_raise(func):
     try:
@@ -412,7 +389,6 @@ def no_raise(func):
     except Exception:  # noqa: BLE001
         return False
     return True
-
 
 def group_gate():
     out = {}
@@ -535,7 +511,6 @@ def group_gate():
     out["T6_session_still_valid"] = req(
         sp, "GET", "/api/v1/snapshot", {"Cookie": sc})["status"] == 200
     return out
-
 
 def group_revocation():
     out = {}
@@ -704,7 +679,6 @@ def group_revocation():
         and "stepup" not in auth_raw
     return out
 
-
 def group_ratelimit():
     out = {}
     stack = make_stack(tempfile.mkdtemp(), password=PASSWORD)
@@ -741,7 +715,6 @@ def group_ratelimit():
     out["rl_sixth_attempt_429"] = \
         step_up(p2, c2, s2, "bad-6")["status"] == 429
     return out
-
 
 def group_status():
     out = {}
@@ -796,7 +769,6 @@ def group_status():
     out["status_step_up_flag_after"] = \
         session_info(frozen["port"], cookie).get("step_up_active") is True
     return out
-
 
 GROUPS = {
     "gate": group_gate,
