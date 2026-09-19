@@ -101,10 +101,12 @@ if [ -f "$MON_RELEASE_TARGET/VERSION" ]; then
 else
     fail "P01 monitor VERSION file missing at $MON_RELEASE_TARGET/VERSION"
 fi
-if [ -f "$MON_RELEASE_TARGET/webapp.py" ]; then
-    pass "P01 monitor entrypoint present"
+# B1: the REAL packaging layout puts the runtime at
+# app/monitor-v2/ inside the release tree.
+if [ -f "$MON_RELEASE_TARGET/app/monitor-v2/webapp.py" ]; then
+    pass "P01 monitor entrypoint present (app/monitor-v2/webapp.py)"
 else
-    fail "P01 monitor entrypoint missing under $MON_RELEASE_TARGET"
+    fail "P01 monitor entrypoint missing at $MON_RELEASE_TARGET/app/monitor-v2/webapp.py"
 fi
 
 # ------------------------------------------------------- P02/P03 services --
