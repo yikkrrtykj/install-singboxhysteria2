@@ -210,7 +210,7 @@ if bash "$PREFLIGHT" >/dev/null 2>&1; then
 else
     pass 'preflight with the helper socket down FAILS'
 fi
-systemctl start sbox-cm.socket >/dev/null 2>&1
+systemctl start sbox-cm.socket sbox-cm.service >/dev/null 2>&1
 for _ in $(seq 1 50); do [ -S /run/sbox-cm/sbox-cm.sock ] && break; sleep 0.1; done
 
 # preflight FAIL: sing-box check rejects the live config

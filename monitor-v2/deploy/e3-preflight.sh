@@ -169,6 +169,12 @@ SB_SOCKET_ENABLED="$("$E3_SYSTEMCTL" is-enabled sbox-cm.socket 2>/dev/null || tr
 if [ -f /etc/systemd/system/sbox-cm.socket ] \
         && [ -f /etc/systemd/system/sbox-cm.service ]; then
     pass "P11 sbox-cm units installed (socket=$SB_SOCKET_STATE service=$SB_SERVICE_STATE enabled=$SB_SOCKET_ENABLED)"
+    # B1-consistency: once installed, the socket must be UP -- an installed
+    # but inactive socket is a broken capability, not a "not yet deployed"
+    # state. (The service is socket-activated: inactive is its NORMAL state.)
+    if [ "$SB_SOCKET_STATE" != "active" ]; then
+        fail "P11 sbox-cm.socket is installed but NOT active (socket=$SB_SOCKET_STATE)"
+    fi
 else
     note "P11 sbox-cm units not installed yet (first E3 deploy installs them)"
 fi
