@@ -230,7 +230,9 @@ cp "$FIX/config.bak" /root/sbox/sbconfig_server.json
 chmod 0600 /root/sbox/sbconfig_server.json
 
 # ------------------------------------------------- deploy-verify (PASS) --
+TREE_BEFORE="$(find "$APP" -type f | sort | xargs sha256sum 2>/dev/null | sha256sum | awk '{print $1}')"
 VOUT="$(bash "$VERIFY" --baseline "$BASELINE")"
+TREE_AFTER="$(find "$APP" -type f | sort | xargs sha256sum 2>/dev/null | sha256sum | awk '{print $1}')"
 RC=$?
 printf '%s\n' "$VOUT" | grep -q 'E3_M3_VERIFY=PASS' \
     && pass 'deploy-verify reports PASS (deploy-disabled acceptance)' \

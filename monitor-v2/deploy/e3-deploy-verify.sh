@@ -174,7 +174,6 @@ if [ "$NOW_SHA2" = "$NOW_SHA" ]; then
 else
     fail "V11 config changed during the fail-closed probe -- INVESTIGATE"
 fi
-rm -f "$RPC_PROBE" 2>/dev/null
 
 printf '\nPASS=%d FAIL=%d\n' "$PASS" "$FAIL"
 if [ "$FAIL" -gt 0 ]; then
