@@ -244,6 +244,7 @@ jq -e '
   (.config_size | type == "number" and . > 0) and
   (.singbox.active == "active") and
   (.monitor.active == "active") and
+  (.monitor.enabled | type == "string" and length > 0) and
   (.monitor.release_id | type == "string" and length > 0) and
   (.monitor.release_target | type == "string" and length > 0) and
   (.marker_present == false) and
@@ -261,6 +262,8 @@ export SB_TS_BEFORE="$(jq -er '.singbox.active_enter_timestamp' "$BASELINE")"
 export SB_RESTARTS_BEFORE="$(jq -er '.singbox.nrestarts' "$BASELINE")"
 export BASE_RELEASE="$(jq -er '.monitor.release_id' "$BASELINE")"
 export BASE_RELEASE_TARGET="$(jq -er '.monitor.release_target' "$BASELINE")"
+export BASE_MONITOR_ACTIVE="$(jq -er '.monitor.active' "$BASELINE")"
+export BASE_MONITOR_ENABLED="$(jq -er '.monitor.enabled' "$BASELINE")"
 export EXPECTED_BASE_RELEASE_TARGET="/opt/singbox-monitor-releases/$BASE_RELEASE"
 
 printf 'CONFIG_SHA_BEFORE=%s\n' "$CONFIG_SHA_BEFORE"
@@ -269,6 +272,8 @@ printf 'SB_TS_BEFORE=%s\n' "$SB_TS_BEFORE"
 printf 'SB_RESTARTS_BEFORE=%s\n' "$SB_RESTARTS_BEFORE"
 printf 'BASE_RELEASE=%s\n' "$BASE_RELEASE"
 printf 'BASE_RELEASE_TARGET=%s\n' "$BASE_RELEASE_TARGET"
+printf 'BASE_MONITOR_ACTIVE=%s\n' "$BASE_MONITOR_ACTIVE"
+printf 'BASE_MONITOR_ENABLED=%s\n' "$BASE_MONITOR_ENABLED"
 
 test "$BASE_RELEASE_TARGET" = "$EXPECTED_BASE_RELEASE_TARGET" || {
   printf 'STOP: baseline release_target does not match packaging releases dir\n' >&2
@@ -298,23 +303,29 @@ release；helper install 一旦开始，统一调用完整 rollback：
 
 ```bash
 phase1_monitor_stop() {
-  local reason="$1" current rc=0
+  local reason="$1" current_target monitor_active monitor_enabled http_code rc=0
   printf 'STOP: %s\n' "$reason" >&2
-  current="$(basename "$(readlink -f "$MONITOR_APP" 2>/dev/null || true)")"
-  if test "$current" != "$BASE_RELEASE"; then
+  current_target="$(readlink -f "$MONITOR_APP" 2>/dev/null || true)"
+  if test "$current_target" != "$BASE_RELEASE_TARGET"; then
     set +e
     bash "$SRC/monitor-v2/deploy/install-monitor.sh" rollback "$BASE_RELEASE" \
       2>&1 | tee "$ART/98-monitor-only-rollback.log"
     rc=${PIPESTATUS[0]}
     set -e
   fi
-  current="$(basename "$(readlink -f "$MONITOR_APP" 2>/dev/null || true)")"
-  if test "$rc" -ne 0 || test "$current" != "$BASE_RELEASE"; then
-    printf 'CRITICAL: monitor did not return to baseline release %s\n' \
-      "$BASE_RELEASE" >&2
+  current_target="$(readlink -f "$MONITOR_APP" 2>/dev/null || true)"
+  monitor_active="$(systemctl is-active singbox-monitor.service 2>/dev/null || true)"
+  monitor_enabled="$(systemctl is-enabled singbox-monitor.service 2>/dev/null || true)"
+  http_code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 \
+    http://127.0.0.1:9191/api/v1/session 2>/dev/null || true)"
+  if test "$rc" -eq 0 \
+      && test "$current_target" = "$BASE_RELEASE_TARGET" \
+      && test "$monitor_active" = "$BASE_MONITOR_ACTIVE" \
+      && test "$monitor_enabled" = "$BASE_MONITOR_ENABLED" \
+      && test "$http_code" = 200; then
+    printf 'ROLLBACK PASS: monitor restored to exact baseline state\n'
   else
-    printf 'ROLLBACK PASS: monitor restored to baseline release %s\n' \
-      "$BASE_RELEASE"
+    printf 'CRITICAL: monitor-only rollback did not restore the complete baseline state\n' >&2
   fi
   exit 1
 }
@@ -485,6 +496,8 @@ test -r "$BASELINE" && jq -e . "$BASELINE" >/dev/null || {
 }
 export BASE_RELEASE="$(jq -er '.monitor.release_id' "$BASELINE")"
 export BASE_RELEASE_TARGET="$(jq -er '.monitor.release_target' "$BASELINE")"
+export BASE_MONITOR_ACTIVE="$(jq -er '.monitor.active' "$BASELINE")"
+export BASE_MONITOR_ENABLED="$(jq -er '.monitor.enabled' "$BASELINE")"
 test "$BASE_RELEASE_TARGET" = "/opt/singbox-monitor-releases/$BASE_RELEASE" \
   && test -d "$BASE_RELEASE_TARGET" || {
     printf 'CRITICAL STOP: exact baseline rollback target is unavailable\n' >&2
@@ -507,28 +520,57 @@ for p in \
     printf 'ABSENT  %s\n' "$p"
   fi
 done
+if test -e "$ART/04-sbox-cm-install.log"; then
+  printf 'PRESENT %s\n' "$ART/04-sbox-cm-install.log"
+  CLASSIFICATION='helper-present-or-uncertain'
+  D3_PROVEN_NOT_STARTED='no'
+else
+  printf 'ABSENT  %s\n' "$ART/04-sbox-cm-install.log"
+  if test "$CLASSIFICATION" = 'helper-absent'; then
+    D3_PROVEN_NOT_STARTED='yes'
+  else
+    D3_PROVEN_NOT_STARTED='no'
+  fi
+fi
 printf 'interruption_classification=%s\n' "$CLASSIFICATION"
+printf 'D3_PROVEN_NOT_STARTED=%s\n' "$D3_PROVEN_NOT_STARTED"
 ```
 
 分类后的唯一动作：
 
-- 七个路径（六个 helper capability + runtime socket）全部 `ABSENT`，且操作者能
-  明确证明 D3 未开始：执行 monitor-only rollback，target 只取
+- 七个路径（六个 helper capability + runtime socket）全部 `ABSENT`，且
+  `$ART/04-sbox-cm-install.log` 不存在，脚本才设置
+  `D3_PROVEN_NOT_STARTED=yes`：执行 monitor-only rollback，target 只取
   `baseline.monitor.release_id`。
-- 任一路径存在，或无法证明 D3 尚未开始：执行第 11 节 full rollback。
+- 任一路径存在、`04-sbox-cm-install.log` 已存在，或其它原因无法证明 D3 尚未开始：
+  `D3_PROVEN_NOT_STARTED=no`，不允许走 monitor-only rollback，执行第 11 节 full
+  rollback / fail-closed recovery。
 - rollback 后本次 Phase 1 结束；不得从 D3/D4 续跑。重新尝试必须从全新的
   checkout/inventory/preflight 和全新证据目录开始。
 
 helper 全 absent 时的 monitor-only rollback：
 
 ```bash
-if test "$CLASSIFICATION" = 'helper-absent'; then
+if test "$CLASSIFICATION" = 'helper-absent' \
+    && test "$D3_PROVEN_NOT_STARTED" = yes; then
+  set +e
   bash "$SRC/monitor-v2/deploy/install-monitor.sh" rollback "$BASE_RELEASE"
-  test "$(basename "$(readlink -f "$MONITOR_APP")")" = "$BASE_RELEASE" || {
-    printf 'CRITICAL STOP: monitor-only rollback did not restore baseline\n' >&2
+  INTERRUPTION_ROLLBACK_RC=$?
+  set -e
+  INTERRUPTION_TARGET="$(readlink -f "$MONITOR_APP" 2>/dev/null || true)"
+  INTERRUPTION_ACTIVE="$(systemctl is-active singbox-monitor.service 2>/dev/null || true)"
+  INTERRUPTION_ENABLED="$(systemctl is-enabled singbox-monitor.service 2>/dev/null || true)"
+  INTERRUPTION_HTTP="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 \
+    http://127.0.0.1:9191/api/v1/session 2>/dev/null || true)"
+  test "$INTERRUPTION_ROLLBACK_RC" -eq 0 \
+    && test "$INTERRUPTION_TARGET" = "$BASE_RELEASE_TARGET" \
+    && test "$INTERRUPTION_ACTIVE" = "$BASE_MONITOR_ACTIVE" \
+    && test "$INTERRUPTION_ENABLED" = "$BASE_MONITOR_ENABLED" \
+    && test "$INTERRUPTION_HTTP" = 200 || {
+    printf 'CRITICAL: monitor-only rollback did not restore the complete baseline state\n' >&2
     exit 1
   }
-  printf 'ROLLBACK PASS: interruption restored exact baseline monitor release\n'
+  printf 'ROLLBACK PASS: monitor restored to exact baseline state\n'
   exit 1
 fi
 
@@ -780,7 +822,7 @@ rollback 预期：先关闭 socket/service，恢复 baseline 的 exact monitor r
 | D2 后 baseline release 目录消失 | CRITICAL STOP；不安装 helper、不运行 RPC；保留现场人工处置 |
 | D2 后 config/sing-box 不变量漂移 | monitor-only rollback + incident STOP；不安装 helper |
 | monitor 已切换但 helper install 尚未开始，且需撤销 | 仅用 baseline 的 `$BASE_RELEASE` 调用 monitor rollback |
-| D2 开始后的 shell/SSH/终端中断 | read-only 分类；helper 全 absent 才 monitor-only rollback，否则 full rollback；本次 Phase 1 结束 |
+| D2 开始后的 shell/SSH/终端中断 | read-only 分类；7 路径全 absent 且 `04-sbox-cm-install.log` 不存在才令 `D3_PROVEN_NOT_STARTED=yes` 并走 monitor-only rollback；否则 full rollback；本次 Phase 1 结束 |
 | helper install 开始后的任一失败 | STOP；执行第 11 节 full rollback |
 | D3 后、D4 前 config/sing-box 不变量漂移 | STOP；full rollback + incident；不开 socket |
 | socket-only / pre-RPC gate 失败 | STOP；full rollback |
@@ -832,6 +874,7 @@ sing-box。Phase 2 必须另开审批。
 - [ ] 只读 inventory 无 existing/partial helper capability、无 stale socket、无 marker。
 - [ ] `E3_PREFLIGHT=PASS`；baseline 由该 PASSing preflight 原子产生且为 root:root 0600。
 - [ ] baseline 关键字段已打印并保存；helper capability 的三项 present 均为 false。
+- [ ] baseline 的 monitor active/enabled 状态已冻结为 `BASE_MONITOR_ACTIVE/ENABLED`。
 - [ ] baseline `release_target` 精确等于 `/opt/singbox-monitor-releases/$BASE_RELEASE` 且目录存在。
 - [ ] D2 前 frozen/live VERSION 与 current release id 已打印留证。
 - [ ] `SBMON_KEEP_RELEASES` 仅对 D2 进程设置为 pre-D2 release count + 1。
@@ -848,5 +891,6 @@ sing-box。Phase 2 必须另开审批。
 - [ ] socket enabled/active；service disabled 但已由 first RPC 拉起为 active。
 - [ ] 没有实际 production client add/delete；负向 add 仅得到 `E_ACTIVATION_STATE`。
 - [ ] 没有手工改配置，没有 reload/restart sing-box，没有写 marker。
-- [ ] 已接受 D2 后任一 interruption 必须分类 rollback 并结束本次 Phase 1，禁止中途续跑。
+- [ ] monitor-only rollback 只有在 symlink target、monitor active/enabled、HTTP 200 全部恢复 baseline 时才声明 PASS。
+- [ ] 已接受 D2 后任一 interruption 必须检查 7 路径和 `04-sbox-cm-install.log`；只有二者共同证明 D3 未开始才允许 monitor-only rollback，否则 full rollback，并结束本次 Phase 1。
 - [ ] 最终四行状态已输出；Phase 2 未开始并在 activation 前硬停止。
