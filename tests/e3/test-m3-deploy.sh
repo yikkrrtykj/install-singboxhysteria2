@@ -277,13 +277,15 @@ if bash "$PREFLIGHT" >/dev/null 2>&1; then
 else
     pass 'preflight with an existing helper capability FAILS (first-deploy-only freeze)'
 fi
-bash "$PREFLIGHT" 2>&1 | grep -qF 'existing sbox-cm deployment requires a separately reviewed upgrade path' \
+P00_OUT="$(bash "$PREFLIGHT" 2>&1 || true)"
+printf '%s' "$P00_OUT" | grep -qF 'existing sbox-cm deployment requires a separately reviewed upgrade path' \
     && pass 'the freeze message is the exact approved wording' \
     || fail 'the freeze message wording is wrong'
 
 # partial libexec: remove one of the two binaries -> still FAIL, accurate list
 mv /usr/local/lib/sbox-cm/sbox-cm-ops "$FIX/sbox-cm-ops.saved"
-bash "$PREFLIGHT" 2>&1 | grep -qF 'existing sbox-cm deployment requires a separately reviewed upgrade path' \
+P00_PARTIAL="$(bash "$PREFLIGHT" 2>&1 || true)"
+printf '%s' "$P00_PARTIAL" | grep -qF 'existing sbox-cm deployment requires a separately reviewed upgrade path' \
     && pass 'partial helper capability still FAILS (freeze holds)' \
     || fail 'partial helper capability did not fail the preflight'
 bash "$PREFLIGHT" 2>&1 | grep -qF 'sbox-cm-ops' \

@@ -243,6 +243,16 @@ if [ "$FAIL" -gt 0 ]; then
     exit 1
 fi
 
+# P00 guarantees NO capability at this point, so the sbox-cm state for the
+# baseline is derived from the actual (absent) unit/binary state.
+SB_SOCKET_STATE="$("$E3_SYSTEMCTL" is-active sbox-cm.socket 2>/dev/null || true)"
+SB_SERVICE_STATE="$("$E3_SYSTEMCTL" is-active sbox-cm.service 2>/dev/null || true)"
+SB_SOCKET_ENABLED="$("$E3_SYSTEMCTL" is-enabled sbox-cm.socket 2>/dev/null || true)"
+SB_SERVICE_ENABLED="$("$E3_SYSTEMCTL" is-enabled sbox-cm.service 2>/dev/null || true)"
+SOCKET_UNIT_PRESENT="no"
+SERVICE_UNIT_PRESENT="no"
+[ -f /etc/systemd/system/sbox-cm.socket ] && SOCKET_UNIT_PRESENT="yes"
+[ -f /etc/systemd/system/sbox-cm.service ] && SERVICE_UNIT_PRESENT="yes"
 MON_ENABLED="$("$E3_SYSTEMCTL" is-enabled "$E3_MONITOR_UNIT" 2>/dev/null || true)"
 MON_ACTIVE="$("$E3_SYSTEMCTL" is-active "$E3_MONITOR_UNIT" 2>/dev/null || true)"
 SB_ACTIVE="$("$E3_SYSTEMCTL" is-active sing-box.service 2>/dev/null || true)"
