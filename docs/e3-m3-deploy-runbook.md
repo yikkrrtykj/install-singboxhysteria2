@@ -10,7 +10,7 @@
 
 ## M3-A — 部署前 preflight（`monitor-v2/deploy/e3-preflight.sh`）
 
-**M3-B v1 = FIRST DEPLOY ONLY（冻结）**：preflight 发现任何 sbox-cm capability（sbox-cm / sbox-cm-ops / lib/client-management.sh / lib/sbox-cm-state.sh / socket unit / service unit 任一存在）即 FAIL，提示 `existing sbox-cm deployment requires a separately reviewed upgrade path`。残留的 `/var/lib/sbox-cm` state/audit 树单独存在是允许的（审计记录），但 marker 必须不存在且 owner/mode 必须安全。present-helper 升级路径留待以后单独设计。
+**M3-B v1 = FIRST DEPLOY ONLY（冻结，无 helper-upgrade 路径）**：preflight 发现任何 sbox-cm capability（sbox-cm / sbox-cm-ops / lib/client-management.sh / lib/sbox-cm-state.sh / socket unit / service unit 任一存在）即 FAIL，提示 `existing sbox-cm deployment requires a separately reviewed upgrade path`。残留的 `/var/lib/sbox-cm` state/audit 树单独存在是允许的（审计记录），但 marker 必须不存在且 owner/mode 必须安全。**残留的 `/run/sbox-cm/sbox-cm.sock`（stale runtime socket）属于 leftover capability，preflight 直接 FAIL。**present-helper 的升级路径不在本版本内，需另行设计评审。
 
 只读。唯一写动作是显式要求的 `--baseline-out FILE`（供 verify/rollback 对照），且 **baseline 仅在全部检查 PASS 后原子写入（tmp+mv，mode 0600）**——任何 FAIL 都不会创建或覆盖既有 baseline。
 
@@ -42,6 +42,19 @@ baseline 写入（仅全部 PASS 后）：umask 077 + 同目录 mktemp + 写入 
 
 保底：脚本除 baseline 输出外零写动作；`sing-box check` 用 `-c` 只读现配置；
 systemctl 仅用 is-active/is-enabled/show 等只读查询。
+
+## 生产 packaging layout（M3-B 依赖的真实布局）
+
+```text
+/opt/singbox-monitor                    -> /opt/singbox-monitor-releases/<release-id>
+<release>/VERSION
+<release>/app/monitor-v2/webapp.py      <- runtime entrypoint
+<release>/app/monitor-v2/{web,api_bridge}/, collector.py, ...
+<release>/bin, <release>/lib
+<release>/install-monitor.sh            <- rollback tooling 的同目录 sibling
+```
+
+`E3_MONITOR_APP` = release symlink 根；runtime = `$E3_MONITOR_APP/app/monitor-v2`。preflight 检查 `<release>/VERSION` 与 `<release>/app/monitor-v2/webapp.py`；verify 的 sboxweb RPC probe 从 `app/monitor-v2` 导入 `web.e3rpc`。
 
 ## M3-B — deploy-disabled 部署与验收
 
@@ -81,13 +94,15 @@ V10/V11  inactive 下 mutation fail-closed：add 尝试被 E_ACTIVATION_STATE �
 
 ### 回滚（`monitor-v2/deploy/e3-rollback.sh --baseline /root/e3-baseline.json`）
 
-回滚是 **fail-closed** 的编排：installer 缺失、目标 release 缺失、rollback 命令失败、disable 失败、恢复后 live release id 与 baseline 不一致——任何一步失败 ⇒ `E3_M3_ROLLBACK=FAIL`。`--monitor-release` 仅作为 operator 显式 override；默认 target 严格取 baseline 里的 exact release id。
+回滚是 **fail-closed** 的编排：installer 缺失或不可执行、目标 release 缺失、rollback 命令失败、disable 失败、daemon-reload 失败、恢复后 live release id 与 baseline 不一致——任何一步失败 ⇒ `E3_M3_ROLLBACK=FAIL`。**rollback target 唯一来源 = `baseline.monitor.release_id`，不提供任何 override。**
+
+rollback tooling 与 `install-monitor.sh` **必须来自同一个 checkout/source tree 的同一 deploy 目录**（脚本用 `BASH_SOURCE` 解析自身目录作为默认 installer 路径，不再假设 `/opt/...` 下存在该脚本；测试可用 `E3_INSTALL_MONITOR` override）。
 
 ```text
 R1  关闭特权面：stop+disable sbox-cm.socket（socket 会按连接拉起 service，
     必须先停），再 stop+disable sbox-cm.service；
 R2  恢复 monitor release：target **唯一来源 = preflight baseline 的
-    monitor.release_id**（不提供 override，不从 releases.history 推断）。
+    monitor.release_id**（不提供 override，不从 releases.history 推断，不从任何其它来源猜测）。
     installer 缺失 / target release 目录不存在 / rollback 命令失败 /
     恢复后 live release id 与 baseline 不一致 ⇒ E3_M3_ROLLBACK=FAIL；
 R3  monitor 只读 HTTP 恢复 200；

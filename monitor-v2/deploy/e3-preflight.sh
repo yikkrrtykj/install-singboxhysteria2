@@ -304,6 +304,7 @@ if [ -n "$BASELINE_OUT" ]; then
               saved_at:$saved_at}' > "$TMP_BASE" 2>"$TMP_BASE.err" \
         && chmod 0600 "$TMP_BASE" \
         && jq -e . "$TMP_BASE" >/dev/null 2>&1 \
+        && rm -f "$TMP_BASE.err" \
         && mv "$TMP_BASE" "$BASELINE_OUT"; then
         pass "baseline saved atomically to $BASELINE_OUT (0600, all checks passed)"
     else

@@ -108,7 +108,9 @@ fi
 # readable. The probe runs from STDIN with -B (no bytecode writes): the
 # current monitor release tree must stay byte-identical (final review fix --
 # the previous version wrote a probe file INTO the release tree).
-E3_PROBE_APP="$E3_MONITOR_APP"
+# B1: import from the REAL runtime directory inside the release tree
+# (release symlink -> <release>/app/monitor-v2), never from the root.
+E3_PROBE_APP="$E3_MONITOR_APP/app/monitor-v2"
 SBOXWEB_PROBE(){ sudo -n -u sboxweb /usr/bin/python3 -B - "$E3_PROBE_APP" "$@" <<'PROBE'
 import json, sys
 sys.path.insert(0, sys.argv[1])

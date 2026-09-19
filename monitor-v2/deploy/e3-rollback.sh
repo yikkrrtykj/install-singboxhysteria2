@@ -39,7 +39,11 @@ E3_SBXCM_LIBEXEC="${E3_SBXCM_LIBEXEC:-/usr/local/lib/sbox-cm}"
 E3_MONITOR_URL="${E3_MONITOR_URL:-http://127.0.0.1:9191}"
 E3_MONITOR_APP="${E3_MONITOR_APP:-/opt/singbox-monitor}"
 E3_MONITOR_UNIT="${E3_MONITOR_UNIT:-singbox-monitor.service}"
-E3_INSTALL_MONITOR="${E3_INSTALL_MONITOR:-/opt/singbox-monitor-releases/install-monitor.sh}"
+# B2: the rollback tooling and install-monitor.sh ship in the SAME deploy
+# directory of the same checkout/source tree; the default resolver points
+# at that sibling (the old /opt/... path is not where packaging installs it).
+DEPLOY_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+E3_INSTALL_MONITOR="${E3_INSTALL_MONITOR:-$DEPLOY_DIR/install-monitor.sh}"
 E3_RELEASES_DIR="${E3_RELEASES_DIR:-/opt/singbox-monitor-releases}"
 BASELINE=""
 
@@ -93,8 +97,8 @@ done
 # R2: restore the EXACT monitor release from the baseline (fail-closed)
 if [ -z "$TARGET_RELEASE" ]; then
     fail "R2 the baseline carries NO monitor.release_id -- refusing to guess a rollback target"
-elif [ ! -f "$E3_INSTALL_MONITOR" ]; then
-    fail "R2 install-monitor.sh missing at $E3_INSTALL_MONITOR -- cannot restore release [$TARGET_RELEASE]"
+elif [ ! -x "$E3_INSTALL_MONITOR" ]; then
+    fail "R2 install-monitor.sh missing or not executable at $E3_INSTALL_MONITOR -- cannot restore release [$TARGET_RELEASE]"
 elif [ ! -d "$E3_RELEASES_DIR/$TARGET_RELEASE" ] \
         && [ ! -d "$(dirname "$E3_MONITOR_APP")/$TARGET_RELEASE" ]; then
     fail "R2 target release directory for [$TARGET_RELEASE] does not exist"
@@ -115,7 +119,9 @@ fi
 # R3: uninstall THIS round's sbox-cm capability (the preflight guaranteed it
 # did not exist before this deployment). The state/audit tree is KEPT.
 rm -f /etc/systemd/system/sbox-cm.socket /etc/systemd/system/sbox-cm.service
-"$E3_SYSTEMCTL" daemon-reload 2>/dev/null
+if ! "$E3_SYSTEMCTL" daemon-reload >/dev/null 2>&1; then
+    fail "R3 systemctl daemon-reload FAILED after removing the units"
+fi
 rm -rf -- "$E3_SBXCM_LIBEXEC"
 CAP_GONE="yes"
 for f in "$E3_SBXCM_LIBEXEC/sbox-cm" "$E3_SBXCM_LIBEXEC/sbox-cm-ops" \

@@ -165,16 +165,20 @@ systemctl daemon-reload
 systemctl enable --now sing-box >/dev/null 2>&1
 
 # monitor release tree + symlink (the packaging layout the preflight freezes)
-cp "$ROOT"/monitor-v2/*.py "$RELDIR/$REL_ID/" 2>/dev/null
-cp -r "$ROOT/monitor-v2/web" "$RELDIR/$REL_ID/web"
-cp -r "$ROOT/monitor-v2/api_bridge" "$RELDIR/$REL_ID/api_bridge"
+# B1: the REAL packaging layout -- <release>/VERSION, <release>/app/monitor-v2/
+# {webapp.py,collector.py,web/,api_bridge/}, <release>/bin, <release>/lib.
+mkdir -p "$RELDIR/$REL_ID/app/monitor-v2" "$RELDIR/$REL_ID/bin" "$RELDIR/$REL_ID/lib"
+cp "$ROOT"/monitor-v2/*.py "$RELDIR/$REL_ID/app/monitor-v2/" 2>/dev/null
+cp -r "$ROOT/monitor-v2/web" "$RELDIR/$REL_ID/app/monitor-v2/web"
+cp -r "$ROOT/monitor-v2/api_bridge" "$RELDIR/$REL_ID/app/monitor-v2/api_bridge"
 printf 'm3-test\n' > "$RELDIR/$REL_ID/VERSION"
-rm -rf "$RELDIR/$REL_ID/web/__pycache__" "$RELDIR/$REL_ID/__pycache__" \
-       "$RELDIR/$REL_ID/api_bridge/__pycache__" 2>/dev/null
+rm -rf "$RELDIR/$REL_ID/app/monitor-v2/web/__pycache__" \
+       "$RELDIR/$REL_ID/app/monitor-v2/__pycache__" \
+       "$RELDIR/$REL_ID/app/monitor-v2/api_bridge/__pycache__" 2>/dev/null
 ln -sfn "$RELDIR/$REL_ID" "$RELLINK"
 chown -R "$AXE_USER":"$AXE_USER" "$RELDIR" "$MDATA"
 chmod 0700 "$MDATA"
-sudo -u "$AXE_USER" env -u SSH_CONNECTION python3 "$RELLINK/webapp.py" setup \
+sudo -u "$AXE_USER" env -u SSH_CONNECTION python3 "$RELLINK/app/monitor-v2/webapp.py" setup \
     --assume-yes --password "m3-deploy-admin-password-01" --data-dir "$MDATA" \
     >/dev/null 2>&1 \
     || { fail 'monitor setup failed'; printf '\nE3_M3_DEPLOY=FAIL\n'; exit 1; }
@@ -184,7 +188,7 @@ sed -e "s|@SBMON_USER@|$AXE_USER|g" \
     -e "s|@SBMON_CONF@|/etc/sboxcm-m3/monitor.conf|g" \
     -e "s|@SBMON_STATE_ROOT@|$MDATA|g" \
     "$ROOT/monitor-v2/deploy/singbox-monitor.service.in" \
-| sed -e "s|^ExecStart=.*|ExecStart=/usr/bin/python3 $RELLINK/webapp.py serve --listen 127.0.0.1 --port $MPORT --data-dir $MDATA|" \
+| sed -e "s|^ExecStart=.*|ExecStart=/usr/bin/python3 $RELLINK/app/monitor-v2/webapp.py serve --listen 127.0.0.1 --port $MPORT --data-dir $MDATA|" \
       -e "s|^After=.*|After=network-online.target|" \
 > /etc/systemd/system/singbox-monitor.service
 mkdir -p /etc/sboxcm-m3
@@ -195,7 +199,12 @@ for _ in $(seq 1 40); do
     [ "$(curl -sS -o /dev/null -w '%{http_code}' --max-time 3 "$BASE/api/v1/session" 2>/dev/null)" = "200" ] && break
     sleep 0.25
 done
-pass 'fixture live: mock sing-box + deployed monitor (release symlink) + ZERO sbox-cm capability'
+pass 'fixture live: mock sing-box + deployed monitor in the REAL app/monitor-v2 release layout + ZERO sbox-cm capability'
+assert_ne '' "$(ls -1 "$RELDIR/$REL_ID/app/monitor-v2/webapp.py" 2>/dev/null)" \
+    'B1: the release tree carries app/monitor-v2/webapp.py (real packaging layout)'
+[ -f "$RELDIR/$REL_ID/VERSION" ] \
+    && pass 'B1: VERSION stays at the release root' \
+    || fail 'B1: VERSION is not at the release root'
 
 export E3_SYSTEMCTL=systemctl
 export E3_CONFIG=/root/sbox/sbconfig_server.json
@@ -217,6 +226,8 @@ assert_eq "false" "$(jqv "$(cat "$BASELINE")" '.helper.libexec_present')" \
     'baseline REALLY records helper.libexec_present=false (measured pre-deploy)'
 assert_eq "false" "$(jqv "$(cat "$BASELINE")" '.helper.socket_unit_present')" \
     'baseline REALLY records helper.socket_unit_present=false'
+RESIDUE="$(ls -1 "$BASELINE".tmp.* "$BASELINE"*.err* 2>/dev/null || true)"
+assert_eq '' "$RESIDUE" 'no baseline temp/error residue after a successful preflight'
 assert_eq "false" "$(jqv "$(cat "$BASELINE")" '.helper.service_unit_present')" \
     'baseline REALLY records helper.service_unit_present=false'
 assert_eq "$REL_ID" "$(jqv "$(cat "$BASELINE")" '.monitor.release_id')" \
@@ -268,6 +279,22 @@ if E3_MONITOR_APP="$FIX/not-a-symlink" bash "$PREFLIGHT" >/dev/null 2>&1; then
 else
     pass 'preflight with a non-symlink monitor app FAILS (release link contract)'
 fi
+
+# preflight FAIL: a stale runtime socket is leftover capability, not a
+# clean first-deploy state (final review hardening)
+mkdir -p /run/sbox-cm
+python3 - <<'PY'
+import socket
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind('/run/sbox-cm/sbox-cm.sock')
+s.close()
+PY
+if bash "$PREFLIGHT" >/dev/null 2>&1; then
+    fail 'preflight with a stale runtime socket must FAIL'
+else
+    pass 'preflight with a stale runtime socket FAILS (leftover capability)'
+fi
+rm -f /run/sbox-cm/sbox-cm.sock
 
 # ------------------------------------- D3: the REAL installer, then D4/D5 --
 "$ROOT/sbox-cm/deploy/install-sbox-cm.sh" install >/dev/null 2>&1 \
@@ -430,6 +457,42 @@ if printf '%s' "$RB2" | grep -q 'E3_M3_ROLLBACK=FAIL'; then
 else
     fail 'a service-disable failure did not fail the rollback'
 fi
+
+# rollback FAIL: a daemon-reload failure can never be a silent pass
+cat > "$FIX/stub-reload" <<'STUBRL'
+#!/usr/bin/env bash
+if [ "${1:-}" = "daemon-reload" ]; then exit 1; fi
+exec /usr/bin/systemctl "$@"
+STUBRL
+chmod 0755 "$FIX/stub-reload"
+RB3="$(E3_SYSTEMCTL="$FIX/stub-reload" E3_INSTALL_MONITOR="$STUB_INSTALLER" \
+    E3_RELEASES_DIR="$RELDIR" bash "$ROLLBACK" --baseline "$BASELINE" 2>/dev/null)"
+if printf '%s' "$RB3" | grep -q 'E3_M3_ROLLBACK=FAIL'; then
+    pass 'a daemon-reload failure FAILS the rollback (never a silent pass)'
+else
+    fail 'a daemon-reload failure did not fail the rollback'
+fi
+
+# B2: the DEFAULT installer resolver must be the sibling install-monitor.sh
+# inside the rollback script's own deploy directory (no /opt/... guess).
+DEPLOY_DIR_GOT="$(sed -n 's/^DEPLOY_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE\[0\]}")" && pwd)"$/yes/p' \
+    "$ROOT/monitor-v2/deploy/e3-rollback.sh" | head -1)"
+if [ "$DEPLOY_DIR_GOT" = "yes" ]; then
+    pass 'B2: rollback resolves its own DEPLOY_DIR from BASH_SOURCE'
+else
+    fail 'B2: rollback does not resolve DEPLOY_DIR from BASH_SOURCE'
+fi
+grep -qF 'E3_INSTALL_MONITOR="${E3_INSTALL_MONITOR:-$DEPLOY_DIR/install-monitor.sh}"' \
+    "$ROOT/monitor-v2/deploy/e3-rollback.sh" \
+    && pass 'B2: the default installer path is the sibling install-monitor.sh' \
+    || fail 'B2: the default installer path is not the sibling script'
+grep -qF '/opt/singbox-monitor-releases/install-monitor.sh' \
+    "$ROOT/monitor-v2/deploy/e3-rollback.sh" \
+    && fail 'B2: a stale /opt installer default is still present' \
+    || pass 'B2: no stale /opt installer default remains'
+grep -qF '[ ! -x "$E3_INSTALL_MONITOR" ]' "$ROOT/monitor-v2/deploy/e3-rollback.sh" \
+    && pass 'B2: R2 requires the installer to be EXECUTABLE' \
+    || fail 'B2: R2 does not check installer executability'
 
 printf '\nPASS=%d FAIL=%d SKIP=%d\n' "$PASS" "$FAIL" "$SKIP"
 if [ "$FAIL" -gt 0 ]; then
