@@ -254,8 +254,9 @@ MARKER="false"
 
 if [ -n "$BASELINE_OUT" ]; then
     TMP_BASE="$BASELINE_OUT.tmp.$$"
-    if jq -n \
-        --arg config_sha256 "$CONFIG_SHA" \        --argjson config_size "${CONFIG_SIZE:-0}" \
+    jq -n \
+        --arg config_sha256 "$CONFIG_SHA" \
+        --argjson config_size "${CONFIG_SIZE:-0}" \
         --arg sb_active "$SB_ACTIVE" \
         --arg sb_ts "$SB_TS" \
         --argjson sb_restarts "${SB_RESTARTS:-0}" \
@@ -286,13 +287,15 @@ if [ -n "$BASELINE_OUT" ]; then
                   socket_enabled:$helper_socket_enabled,
                   service_active:$helper_service_active,
                   service_enabled:$helper_service_enabled},
-          saved_at:$saved_at}' > "$TMP_BASE" 2>/dev/null \
-        && mv "$TMP_BASE" "$BASELINE_OUT" \
-        && chmod 0600 "$BASELINE_OUT"
-    then
+          saved_at:$saved_at}' > "$TMP_BASE" 2>"$TMP_BASE.err"
+    JQ_RC=$?
+    if [ "$JQ_RC" -ne 0 ]; then
+        fail "baseline jq failed (rc=$JQ_RC): $(head -c 300 "$TMP_BASE.err")"
+    elif mv "$TMP_BASE" "$BASELINE_OUT" \
+        && chmod 0600 "$BASELINE_OUT"; then
         pass "baseline saved atomically to $BASELINE_OUT (0600, all checks passed)"
     else
-        fail "baseline could not be written to $BASELINE_OUT"
+        fail "baseline could not be moved to $BASELINE_OUT"
     fi
 fi
 
