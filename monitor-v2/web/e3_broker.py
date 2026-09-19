@@ -177,10 +177,15 @@ class E3Broker:
                     STALE if cache is not None else UNAVAILABLE, cache)
 
             if isinstance(verdict, dict) and verdict.get("ok") is False:
-                # B1: a HELPER verdict, not a transport failure -- no breaker
-                # count, and the last-known-good cache stays untouched. The
-                # caller answers with the helper's own error semantics.
+                # B1-final: a HELPER verdict proves the transport itself
+                # works, so it ENDS the failure streak -- reset the counter
+                # and close the breaker (also un-sticking a half-open probe
+                # that met a semantic answer). The last-known-good cache is
+                # not touched and the caller still gets the helper's own
+                # error semantics.
                 with self._mutex:
+                    self._failures = 0
+                    self._state = "closed"
                     self._status_attempted_at = self._clock()
                 return self._verdict_error(verdict)
 
@@ -264,8 +269,10 @@ class E3Broker:
                     STALE if cache is not None else UNAVAILABLE, cache)
 
             if isinstance(verdict, dict) and verdict.get("ok") is False:
-                # B1: helper verdict on a working transport -- no cache write,
-                # no breaker input; the caller maps the helper semantics.
+                # B1: helper verdict on a working transport -- no cache write
+                # and no breaker input (the breaker is STATUS-driven only; a
+                # list call never touches it). The caller maps the helper
+                # semantics.
                 with self._mutex:
                     self._list_attempted_at = self._clock()
                 return self._verdict_error(verdict)

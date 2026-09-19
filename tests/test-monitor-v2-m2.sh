@@ -434,6 +434,35 @@ def group_verdict_semantics():
     out["last_good_cache_not_overwritten"] = (
         r2["transport"] == "stale"
         and r2["payload"]["data"]["clients"][0]["name"] == "keep-me")
+
+    # B1-final: a semantic verdict ENDS the transport-failure streak.
+    clock4 = FakeClock()
+    client4 = FakeClient()
+    broker4 = new_broker(client4, clock4)
+
+    def transport_fail():
+        client4.record(RpcTransportError("read", "down"))
+
+    def semantic_error():
+        client4.record({"ok": False, "request_id": "s",
+                        "error": {"code": "E_INTERNAL", "stage": "parse",
+                                  "retriable": False, "detail": "boom"}})
+
+    transport_fail(); clock4.advance(2.5); broker4.status()   # failure 1
+    transport_fail(); clock4.advance(2.5); broker4.status()   # failure 2
+    semantic_error(); clock4.advance(2.5); broker4.status()   # resets streak
+    transport_fail(); clock4.advance(2.5); r = broker4.status()  # only fail 1
+    out["semantic_verdict_ends_failure_streak"] = (
+        broker4.breaker_state() == "closed")
+
+    # ...and a half-open probe that meets a semantic answer also closes.
+    transport_fail(); clock4.advance(2.5); broker4.status()   # failure 2
+    transport_fail(); clock4.advance(2.5); broker4.status()   # failure 3 -> open
+    clock4.advance(10.5)                                      # cooldown over
+    semantic_error()                                          # probe answer
+    broker4.status()
+    out["half_open_semantic_probe_closes"] = \
+        broker4.breaker_state() == "closed"
     return out
 
 
@@ -1105,6 +1134,35 @@ if grep -qF 'e3-retry-btn' "$INDEX_FILE"; then
     pass 'B3: the explicit retry button is present in the UI'
 else
     fail 'B3: the explicit retry button is missing'
+fi
+
+# B3-final: while a pending uncertain operation exists, the ordinary
+# entrances are locked. Proven as control-flow ORDER inside each handler:
+# the fail-safe guard must run BEFORE any key generation, which makes a
+# normal click a zero-dispatch no-op (no request, no new key).
+GUARD='if (state.e3PendingRetry) return;'
+ADD_FN="$(sed -n '/function addClient/,/^  }/p' "$APP_FILE")"
+DEL_FN="$(sed -n '/function deleteClient/,/^  }/p' "$APP_FILE")"
+guard_before_keygen() { # <fn-body-file> -> rc 0 when guard precedes keygen
+    FN="$1"
+    g="$(grep -nF "$GUARD" "$FN" | head -1 | cut -d: -f1)"
+    k="$(grep -nF 'newIdempotencyKey()' "$FN" | head -1 | cut -d: -f1)"
+    [ -n "$g" ] && [ -n "$k" ] && [ "$g" -lt "$k" ]
+}
+printf '%s\n' "$ADD_FN" > "$ROOT/tests/.m2-add.$$"
+printf '%s\n' "$DEL_FN" > "$ROOT/tests/.m2-del.$$"
+if guard_before_keygen "$ROOT/tests/.m2-add.$$" \
+        && guard_before_keygen "$ROOT/tests/.m2-del.$$"; then
+    pass 'B3-final: the pending guard precedes key generation in add AND delete (ordinary click = zero dispatch, zero new keys)'
+else
+    fail 'B3-final: the pending guard is missing or ordered after key generation'
+fi
+rm -f "$ROOT/tests/.m2-add.$$" "$ROOT/tests/.m2-del.$$"
+N_LOCK="$(grep -cF 'var writable = e3Writable() && !state.e3PendingRetry;' "$APP_FILE")"
+if [ "$N_LOCK" -eq 2 ]; then
+    pass 'B3-final: pending locks the controls in renderE3Controls AND renderE3Clients'
+else
+    fail "B3-final: expected the pending lock in exactly 2 render paths (got $N_LOCK)"
 fi
 
 section_py 'running the contract harness'

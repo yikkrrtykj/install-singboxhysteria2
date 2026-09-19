@@ -535,11 +535,16 @@
   function setPendingRetry(pending) {
     state.e3PendingRetry = pending || null;
     if (pending) {
+      // B3-final: while a result_unknown is pending, the ordinary mutation
+      // entrances lock (renderE3Controls) and an open delete confirm is
+      // closed -- the ONLY retry path is the same-key button below.
       $("e3-retry-name").textContent = pending.name || pending.path;
       show($("e3-retry-row"));
+      hide($("e3-delete-box"));
     } else {
       hide($("e3-retry-row"));
     }
+    renderE3Controls();
   }
 
   function retryPending() {
@@ -589,8 +594,9 @@
   }
 
   function renderE3Controls() {
-    // B4: one writable decision drives every destructive control.
-    var writable = e3Writable();
+    // B4 + B3-final: one writable decision drives every destructive control,
+    // and a pending uncertain operation locks the ordinary entrances.
+    var writable = e3Writable() && !state.e3PendingRetry;
     var stateName = state.e3Status && state.e3Status.data
       ? state.e3Status.data.management_state : null;
     var armed = stateName === "active";
@@ -640,7 +646,7 @@
     var body = $("e3-clients-body");
     body.innerHTML = "";
     var clients = (data.data && data.data.clients) || [];
-    var writable = e3Writable();
+    var writable = e3Writable() && !state.e3PendingRetry;
     clients.forEach(function (client) {
       var row = body.insertRow(-1);
       row.insertCell(-1).textContent = client.name;
@@ -681,6 +687,8 @@
   }
 
   function deleteClient(name, keyOverride) {
+    // B3-final fail-safe: same lock as addClient above.
+    if (state.e3PendingRetry) return;
     var key = keyOverride || newIdempotencyKey();
     // B3: an explicit retry replays with the SAME key; a fresh click on the
     // delete button is a NEW operation and gets a NEW key.
@@ -729,6 +737,9 @@
   }
 
   function addClient(name, keyOverride) {
+    // B3-final fail-safe: a pending uncertain operation locks the ordinary
+    // entrance -- no new key is ever generated while one is unresolved.
+    if (state.e3PendingRetry) return;
     var key = keyOverride || newIdempotencyKey();
     apiWithStepUp("/api/v1/clients/add", {
       method: "POST",
