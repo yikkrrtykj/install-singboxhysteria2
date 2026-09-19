@@ -354,18 +354,22 @@ chown "$AXE_USER":"$AXE_USER" "$TIMEOUT_DRIVER"
 TOUT="$(sudo -u "$AXE_USER" python3 "$TIMEOUT_DRIVER" 2>/dev/null)"
 assert_eq "UNCERTAIN" "$TOUT" 'a post-send caller timeout reports uncertain (result_unknown precondition)'
 # ...the helper was not killed and the transaction completed:
-LAST="null"; LAST_RAW=""; LAST_HTTP=""
-for _ in $(seq 1 40); do
+# NB: last_transaction still shows the PREVIOUS transaction (the rollback
+# test's E_ROLLED_BACK) until THIS one lands. Wait for THIS add's terminal
+# outcome=ok -- the caller timed out, the transaction did not, and that is
+# exactly the result_unknown recovery contract.
+LAST_RAW=""; LAST_HTTP=""; LAST_OP=""; LAST_OUTCOME=""
+for _ in $(seq 1 60); do
     LAST_HTTP="$(curl -sS -o "$FIX/last.json" -w '%{http_code}' -b "$CJ"         "$BASE/api/v1/management/status" 2>/dev/null)"
     LAST_RAW="$(cat "$FIX/last.json" 2>/dev/null)"
-    LAST="$(jqv "$LAST_RAW" '.data.last_transaction.op')"
-    [ "$LAST" = "client.add" ] && break
-    sleep 0.25
+    LAST_OP="$(jqv "$LAST_RAW" '.data.last_transaction.op')"
+    LAST_OUTCOME="$(jqv "$LAST_RAW" '.data.last_transaction.outcome')"
+    [ "$LAST_OP" = "client.add" ] && [ "$LAST_OUTCOME" = "ok" ] && break
+    sleep 0.75
 done
 assert_eq "200" "$LAST_HTTP" "the status endpoint stayed alive during the busy helper (got $LAST_HTTP)"
-assert_eq "client.add" "$LAST" "the timed-out transaction completed inside the helper (status proves it; last body=[$LAST_RAW])"
-OUTCOME="$(jqv "$LAST_RAW" '.data.last_transaction.outcome')"
-assert_eq "ok" "$OUTCOME" 'the timed-out transaction landed on its terminal success'
+assert_eq "client.add" "$LAST_OP" "the timed-out transaction completed inside the helper (status proves it)"
+assert_eq "ok" "$LAST_OUTCOME" 'the timed-out transaction landed on its terminal success (last body shown above)'
 grep -qF 'timeout-live' /root/sbox/sbconfig_server.json \
     && pass 'the timed-out client is really in the live config' \
     || fail 'the timed-out client never reached the live config'
