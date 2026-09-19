@@ -255,8 +255,7 @@ MARKER="false"
 if [ -n "$BASELINE_OUT" ]; then
     TMP_BASE="$BASELINE_OUT.tmp.$$"
     if jq -n \
-        --arg config_sha256 "$CONFIG_SHA" \
-        --argjson config_size "${CONFIG_SIZE:-0}" \
+        --arg config_sha256 "$CONFIG_SHA" \        --argjson config_size "${CONFIG_SIZE:-0}" \
         --arg sb_active "$SB_ACTIVE" \
         --arg sb_ts "$SB_TS" \
         --argjson sb_restarts "${SB_RESTARTS:-0}" \
@@ -289,9 +288,12 @@ if [ -n "$BASELINE_OUT" ]; then
                   service_enabled:$helper_service_enabled},
           saved_at:$saved_at}' > "$TMP_BASE" 2>/dev/null \
         && mv "$TMP_BASE" "$BASELINE_OUT" \
-        && chmod 0600 "$BASELINE_OUT" \
-        && pass "baseline saved atomically to $BASELINE_OUT (0600, all checks passed)" \
-        || fail "baseline could not be written to $BASELINE_OUT"
+        && chmod 0600 "$BASELINE_OUT"
+    then
+        pass "baseline saved atomically to $BASELINE_OUT (0600, all checks passed)"
+    else
+        fail "baseline could not be written to $BASELINE_OUT"
+    fi
 fi
 
 printf '\nPASS=%d FAIL=%d\n' "$PASS" "$FAIL"
