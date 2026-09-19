@@ -7,9 +7,13 @@
 set -uo pipefail
 
 readonly FROZEN_PAYLOAD_BASE="f0e1480e1527ffb5906e715dd3acff8b29b8c024"
+readonly SAFE_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+if [ "${E3_PHASE1_TEST_MODE:-0}" != "1" ]; then
+    PATH="$SAFE_PATH"
+    export PATH
+fi
 readonly DEPLOY_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly REPO_ROOT="$(cd -- "$DEPLOY_DIR/../.." && pwd)"
-readonly SAFE_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 # Phase 1 must retain every existing rollback candidate even if another
 # release appears before the installer acquires its deploy lock.  This
 # process-only value is intentionally effectively-no-prune.
@@ -44,6 +48,9 @@ if [ "$TEST_MODE" = "1" ]; then
     STATUS_PROBE="${E3_PHASE1_TEST_STATUS_PROBE:?test status probe required}"
     TEST_FIXTURE_ROOT="${E3_PHASE1_TEST_FIXTURE_ROOT:?test fixture root required}"
     TEST_SOURCE_HEAD="${E3_PHASE1_TEST_SOURCE_HEAD:?test source head required}"
+    PHASE1_LOCK="${E3_PHASE1_TEST_LOCK:?test lock path required}"
+    FLOCK_BIN="${E3_PHASE1_TEST_FLOCK:-/usr/bin/flock}"
+    LOCK_BACKEND="${E3_PHASE1_TEST_LOCK_BACKEND:-flock}"
     PRIMITIVE_PATH="$(dirname -- "$SYSTEMCTL"):$PATH"
 else
     [ "$(id -u)" = "0" ] || { printf 'ERROR: Phase 1 must run as root\n' >&2; exit 1; }
@@ -66,6 +73,9 @@ else
     STATUS_PROBE=""
     TEST_FIXTURE_ROOT=""
     TEST_SOURCE_HEAD=""
+    PHASE1_LOCK="/run/lock/e3-m3c-phase1.lock"
+    FLOCK_BIN="/usr/bin/flock"
+    LOCK_BACKEND="flock"
     PRIMITIVE_PATH="$SAFE_PATH"
 fi
 
@@ -109,6 +119,24 @@ same_dir() {
     left="$(canonical_dir "$1")" || return 1
     right="$(canonical_dir "$2")" || return 1
     [ "$left" = "$right" ]
+}
+
+acquire_phase1_lock() {
+    local lock_parent
+    lock_parent="$(dirname -- "$PHASE1_LOCK")"
+    mkdir -p -- "$lock_parent" || die "cannot create Phase 1 lock directory"
+    if [ "$TEST_MODE" = "1" ] && [ "$LOCK_BACKEND" = "mkdir" ]; then
+        mkdir -- "$PHASE1_LOCK.fixture-held" 2>/dev/null \
+            || die "another Phase 1 command holds the exclusive lock"
+        trap 'rmdir -- "$PHASE1_LOCK.fixture-held" 2>/dev/null || true' EXIT
+        return 0
+    fi
+    [ "$LOCK_BACKEND" = "flock" ] || die "invalid Phase 1 lock backend"
+    [ -x "$FLOCK_BIN" ] || die "Phase 1 flock binary is unavailable"
+    umask 077
+    exec 8>>"$PHASE1_LOCK" || die "cannot open Phase 1 lock"
+    chmod 0600 "$PHASE1_LOCK" || die "cannot protect Phase 1 lock"
+    "$FLOCK_BIN" -n 8 || die "another Phase 1 command holds the exclusive lock"
 }
 
 # Every reviewed primitive runs with an empty environment.  Test fixtures get
@@ -564,8 +592,10 @@ cmd_apply() {
 }
 
 cmd_recover() {
+    local current_source
     RECOVERY_MODE=1
     source_identity_gate
+    current_source="$SOURCE_HEAD"
     if [ ! -r "$JOURNAL" ] || ! jq -e '
         (.schema == 1) and
         (.monitor_mutation.started | type == "boolean") and
@@ -590,6 +620,8 @@ cmd_recover() {
         exit 1
     fi
     journal_load
+    [ "$SOURCE_HEAD" = "$current_source" ] \
+        || die "journal source_head does not match the approved recovery checkout"
     case "$FINAL_STATUS" in
         deploy_disabled_complete)
             die "Phase 1 is complete; recover is not an automatic uninstall command"
@@ -624,9 +656,9 @@ usage() {
 
 [ "$#" -eq 1 ] || usage
 case "$1" in
-    preflight) cmd_preflight ;;
-    apply)     cmd_apply ;;
-    recover)   cmd_recover ;;
+    preflight) acquire_phase1_lock; cmd_preflight ;;
+    apply)     acquire_phase1_lock; cmd_apply ;;
+    recover)   acquire_phase1_lock; cmd_recover ;;
     status)    cmd_status ;;
     *)         usage ;;
 esac

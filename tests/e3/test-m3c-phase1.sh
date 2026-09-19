@@ -10,7 +10,7 @@ ORCH="$ROOT/monitor-v2/deploy/e3-m3c-phase1.sh"
 TMP="$(mktemp -d)"
 PASS=0
 FAIL=0
-EXPECTED_TOTAL=52
+EXPECTED_TOTAL=65
 
 pass() { PASS=$((PASS + 1)); printf '  PASS %s\n' "$*"; }
 fail() { FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "$*"; }
@@ -163,6 +163,10 @@ env | sort >>"$FX/primitive-env.log"
 printf '%s keep=%s\n' "$*" "${SBMON_KEEP_RELEASES:-unset}" >>"$FX/monitor-calls"
 case "${1:-}" in
   upgrade)
+    if [ -e "$FX/block-monitor-upgrade" ]; then
+      : >"$FX/monitor-upgrade-entered"
+      while [ ! -e "$FX/release-monitor-upgrade" ]; do sleep 0.05; done
+    fi
     if [ "${2:-}" != "--repair" ]; then
       printf 'action=noop\n'
       exit 0
@@ -289,6 +293,9 @@ STUB
     export E3_PHASE1_TEST_FIXTURE_ROOT="$FIX"
     export E3_PHASE1_TEST_SOURCE_HEAD="fixture-reviewed-head"
     export E3_PHASE1_APPROVED_HEAD="fixture-reviewed-head"
+    export E3_PHASE1_TEST_LOCK="$FIX/phase1.lock"
+    export E3_PHASE1_TEST_FLOCK="$TEST_FLOCK_BIN"
+    export E3_PHASE1_TEST_LOCK_BACKEND="$TEST_LOCK_BACKEND"
     export PATH="$FIX/bin:$ORIGINAL_PATH"
 }
 
@@ -304,6 +311,12 @@ set_journal() { # jq filter
 
 printf '===== E3 M3-C PHASE 1 ORCHESTRATOR =====\n'
 ORIGINAL_PATH="$PATH"
+if TEST_FLOCK_BIN="$(command -v flock 2>/dev/null)" && [ -n "$TEST_FLOCK_BIN" ]; then
+    TEST_LOCK_BACKEND=flock
+else
+    TEST_FLOCK_BIN=/usr/bin/flock
+    TEST_LOCK_BACKEND=mkdir
+fi
 
 # Success path: prove the same-version distinction, no-prune retention,
 # socket-only activation ordering, final invariants, and exact terminal output.
@@ -465,6 +478,55 @@ assert_eq '1' "$(wc -c <"$FIX/full-rollback-count" | tr -d ' ')" \
 setup_fixture approved_head_mismatch
 export E3_PHASE1_APPROVED_HEAD='different-reviewed-head'
 if bash "$ORCH" preflight >"$FIX/preflight.out" 2>&1; then fail 'mismatched approved head must reject execution'; else pass 'exact approved-head mismatch rejects execution before mutation'; fi
+
+# B5: the lock spans the whole apply, including time blocked inside a child
+# primitive.  A competing recover must fail before touching any evidence.
+setup_fixture concurrent_phase1_lock
+run_preflight || fail 'concurrency fixture preflight unexpectedly failed'
+: >"$FIX/block-monitor-upgrade"
+bash "$ORCH" apply >"$FIX/first-apply.out" 2>&1 &
+FIRST_PID=$!
+for _ in $(seq 1 200); do
+    [ -e "$FIX/monitor-upgrade-entered" ] && break
+    sleep 0.05
+done
+assert_file "$FIX/monitor-upgrade-entered" 'first apply reaches the blocked primitive while holding the Phase 1 lock'
+JOURNAL_SHA_LOCKED="$(sha256sum "$FIX/phase1/journal.json" | awk '{print $1}')"
+ENV_LINES_LOCKED="$(wc -l <"$FIX/primitive-env.log" | tr -d ' ')"
+bash "$ORCH" recover >"$FIX/second-recover.out" 2>&1
+SECOND_RC=$?
+if [ "$SECOND_RC" -ne 0 ]; then pass 'competing recover fails immediately'; else fail 'competing recover must not acquire the Phase 1 lock'; fi
+assert_contains "$FIX/second-recover.out" 'another Phase 1 command holds the exclusive lock' \
+    'competing recover reports the fail-closed lock gate'
+assert_eq "$ENV_LINES_LOCKED" "$(wc -l <"$FIX/primitive-env.log" | tr -d ' ')" \
+    'competing recover calls no primitive'
+assert_eq "$JOURNAL_SHA_LOCKED" "$(sha256sum "$FIX/phase1/journal.json" | awk '{print $1}')" \
+    'competing recover does not rewrite the journal'
+assert_absent "$FIX/libexec/sbox-cm" 'competing recover does not install helper capability'
+assert_eq 'inactive' "$(cat "$FIX/socket-active")" 'competing recover does not enable the socket'
+: >"$FIX/release-monitor-upgrade"
+wait "$FIRST_PID"
+FIRST_RC=$?
+if [ "$FIRST_RC" -eq 0 ]; then pass 'first apply completes normally after releasing its blocked primitive'; else fail 'first apply failed after lock contention'; fi
+assert_eq 'deploy_disabled_complete' "$(jq -r '.final_status' "$FIX/phase1/journal.json")" \
+    'first apply leaves a consistent terminal state after contention'
+
+# B6: valid-journal recovery is pinned to the attempt's recorded source head.
+setup_fixture recover_source_mismatch
+run_preflight || fail 'recover source mismatch fixture preflight unexpectedly failed'
+mkdir -p "$FIX/releases/rel-interrupted/app/monitor-v2"
+cp "$ROOT/monitor-v2/VERSION" "$FIX/releases/rel-interrupted/VERSION"
+printf '%s\n' "$FIX/releases/rel-interrupted" >"$FIX/monitor.target"
+set_journal '.phase="monitor_mutation_complete" | .monitor_mutation.started=true | .monitor_mutation.completed=true | .final_status="in_progress"'
+export E3_PHASE1_TEST_SOURCE_HEAD='fixture-new-head'
+export E3_PHASE1_APPROVED_HEAD='fixture-new-head'
+if bash "$ORCH" recover >"$FIX/recover.out" 2>&1; then fail 'source-mismatched recover must refuse'; else pass 'recover refuses a valid journal recorded by a different source head'; fi
+assert_contains "$FIX/recover.out" 'CRITICAL STOP: journal source_head does not match the approved recovery checkout' \
+    'recover source mismatch is a CRITICAL STOP'
+assert_eq '0' "$(wc -c <"$FIX/monitor-rollback-count" | tr -d ' ')" \
+    'source-mismatched recover never invokes monitor rollback'
+assert_eq '0' "$(wc -c <"$FIX/full-rollback-count" | tr -d ' ')" \
+    'source-mismatched recover never invokes full rollback'
 
 # Static safety properties supplement (not replace) the live state-machine tests.
 if rg -qF 'management.activate' "$ORCH"; then fail 'orchestrator source must not contain the activation operation'; else pass 'orchestrator source contains no activation operation'; fi
