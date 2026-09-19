@@ -139,11 +139,47 @@
         <div class="kv"><span class="k">Monitor (dashboard + collector)</span><span class="v"><span class="badge" id="mg-monitor" data-state="unknown">—</span></span></div>
         <div class="kv"><span class="k">Management mutations</span><span class="v"><span class="badge" id="mg-manage" data-state="unknown">—</span></span></div>
         <div class="kv"><span class="k">Re-authentication (this session)</span><span class="v"><span class="badge" id="mg-stepup" data-state="unknown">—</span></span></div>
+        <div class="kv"><span class="k">Helper snapshot freshness</span><span class="v"><span class="badge" id="mg-transport" data-state="unknown">—</span></span></div>
+        <div class="kv"><span class="k">Helper snapshot time (as of)</span><span class="v" id="mg-asof">—</span></div>
+        <p id="mg-degraded" class="form-msg error hidden" role="alert">The privileged helper reports a DEGRADED state: mutations are refused until a root operator recovers it.</p>
         <div class="row">
           <button id="mg-activate" class="btn" type="button">Activate management</button>
           <button id="mg-deactivate" class="btn ghost" type="button">Deactivate management</button>
+          <button id="mg-refresh" class="btn ghost" type="button">Refresh</button>
         </div>
         <p id="mg-msg" class="form-msg hidden" role="status"></p>
+      </div>
+
+      <div class="card">
+        <h2>Client management (E3)</h2>
+        <p class="muted">Reality/HY2 clients known to the privileged helper. Add and delete are privileged mutations: they require a recent re-authentication and run as full transactions inside the root helper (check, reload, automatic rollback). <strong>Client credentials are never displayed or returned here</strong> — after adding a client, generate its configuration on the server with the client-management CLI.</p>
+        <div class="table-card">
+          <table class="table" id="e3-clients-table">
+            <thead>
+              <tr>
+                <th>Client</th><th>Protocols</th><th>Mutable</th><th>Source</th><th></th>
+              </tr>
+            </thead>
+            <tbody id="e3-clients-body"></tbody>
+          </table>
+        </div>
+        <div class="row" id="e3-add-row">
+          <input id="e3-add-name" type="text" maxlength="32" placeholder="client name" autocomplete="off">
+          <button id="e3-add-btn" class="btn" type="button">Add client</button>
+        </div>
+        <div id="e3-delete-box" class="hidden">
+          <p class="muted">You are deleting client <strong id="e3-del-name"></strong>. This triggers a sing-box reload and cannot be undone from the web. Type the client name to confirm.</p>
+          <div class="row">
+            <input id="e3-del-confirm" type="text" maxlength="32" placeholder="type the client name" autocomplete="off">
+            <button id="e3-del-btn" class="btn" type="button">Delete permanently</button>
+            <button id="e3-del-cancel" class="btn ghost" type="button">Cancel</button>
+          </div>
+        </div>
+        <p id="e3-msg" class="form-msg hidden" role="status"></p>
+        <div id="e3-retry-row" class="row hidden">
+          <span class="muted">Pending operation: <strong id="e3-retry-name"></strong> (result unknown).</span>
+          <button id="e3-retry-btn" class="btn" type="button">Retry with the SAME key</button>
+        </div>
       </div>
 
       <div class="card">

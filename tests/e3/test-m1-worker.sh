@@ -452,6 +452,22 @@ mv "$TMP/live.hidden" "$SB_SERVER_CONFIG"
 o="$(wout management.activate '{"request_id":"reqid-activate-recvr1","actor":{"session_fp":"0123456789abcdef"}}')"
 assert_eq true "$(jqv "$o" '.ok')" 'reactivation after recovery succeeds'
 
+# ---------------------------------------------- deactivate actor (M2-A0) ----
+printf '\n== management.deactivate carries the actor into the audit (M2-A0) ==\n'
+o="$(wout management.deactivate '{"request_id":"reqid-deact-actor01","actor":{"session_fp":"0123456789abcdef","stepup_fp":"fedcba9876543210"}}')"
+assert_eq true "$(jqv "$o" '.ok')" 'deactivate accepts an actor and succeeds'
+assert_eq inactive "$(jqv "$(wout management.status '{"request_id":"reqid-status-actor02"}')" '.data.management_state')" \
+    'the plane is inactive after the actor deactivate'
+ACTOR_ROW="$(grep -F '"request_id":"reqid-deact-actor01"' "$AUDIT" | tail -n 1)"
+assert_eq 0123456789abcdef "$(jqv "$ACTOR_ROW" '.actor.session_fp')" 'the deactivate audit carries session_fp'
+assert_eq fedcba9876543210 "$(jqv "$ACTOR_ROW" '.actor.stepup_fp')" 'the deactivate audit carries stepup_fp'
+o="$(wout management.deactivate '{"request_id":"reqid-deact-noactor1"}')"
+assert_eq true "$(jqv "$o" '.ok')" 'deactivate without an actor stays compatible'
+NOACT_ROW="$(grep -F '"request_id":"reqid-deact-noactor1"' "$AUDIT" | tail -n 1)"
+assert_eq null "$(jqv "$NOACT_ROW" '.actor.session_fp')" 'the actor-less deactivate audit has a null session_fp'
+o="$(wout management.activate '{"request_id":"reqid-activate-actor3","actor":{"session_fp":"0123456789abcdef"}}')"
+assert_eq true "$(jqv "$o" '.ok')" 'reactivated with an actor for the following sections'
+
 # ------------------------------------------- delete replay original attempt ----
 printf '\n== delete replay finalizes the ORIGINAL attempt (B3) ==\n'
 o="$(wout client.add '{"request_id":"reqid-add-vmix06-0","name":"vmix-06","idempotency_key":"key-0000000000b1"}')"

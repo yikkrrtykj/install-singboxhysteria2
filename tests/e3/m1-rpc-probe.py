@@ -135,6 +135,37 @@ def schema_tests(mod):
     except Exception as exc:  # pragma: no cover
         bad("valid add request rejected: %r" % exc)
 
+    # M2-A0: management.deactivate carries an optional actor, exactly like
+    # management.activate -- a privileged mutation must be attributable in the
+    # audit. The read-only ops keep refusing the field.
+    try:
+        op, args = mod.validate_request(
+            {"v": VERSION, "request_id": rid, "op": "management.deactivate",
+             "actor": {"session_fp": "0" * 16, "stepup_fp": "1" * 16}})
+        eq(op, "management.deactivate", "deactivate request accepted")
+        eq(args.get("actor"),
+           {"session_fp": "0" * 16, "stepup_fp": "1" * 16},
+           "deactivate normalizes the actor")
+    except Exception as exc:  # pragma: no cover
+        bad("valid deactivate request rejected: %r" % exc)
+
+    try:
+        op, args = mod.validate_request(
+            {"v": VERSION, "request_id": rid, "op": "management.deactivate"})
+        eq(args, {"request_id": rid},
+           "deactivate without an actor stays compatible")
+    except Exception as exc:  # pragma: no cover
+        bad("actor-less deactivate rejected: %r" % exc)
+
+    bad_request({"v": VERSION, "request_id": rid, "op": "management.deactivate",
+                 "actor": {"nope": "x"}}, "E_SCHEMA")
+    bad_request({"v": VERSION, "request_id": rid, "op": "management.deactivate",
+                 "actor": {"session_fp": "NOTHEX"}}, "E_SCHEMA")
+    bad_request({"v": VERSION, "request_id": rid, "op": "management.status",
+                 "actor": {"session_fp": "0" * 16}}, "E_SCHEMA")
+    bad_request({"v": VERSION, "request_id": rid, "op": "client.list",
+                 "actor": {"session_fp": "0" * 16}}, "E_SCHEMA")
+
 
 # ------------------------------------------------------------------ static --
 def static_tests(daemon_path):

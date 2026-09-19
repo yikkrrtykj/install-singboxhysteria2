@@ -27,7 +27,7 @@ SKIP=0
 # or is explicitly skipped; the gate at the bottom requires
 # PASS + FAIL + SKIP == EXPECTED_TOTAL, so a section that silently disappears
 # (the classic "fewer assertions but still green") can never fake success.
-EXPECTED_TOTAL=137
+EXPECTED_TOTAL=136
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
@@ -42,7 +42,7 @@ assert_contains() { if [ "$(printf '%s' "$2" | grep -cF -- "$1")" -gt 0 ]; then 
 assert_not_contains() { if [ "$(printf '%s' "$2" | grep -cF -- "$1")" -eq 0 ]; then pass "$3"; else fail "$3 (forbidden: $1)"; fi; }
 
 section "static checks: step-up boundary + zero filesystem bridge"
-WEB_PY="$ROOT/monitor-v2/web/__init__.py $ROOT/monitor-v2/web/access.py $ROOT/monitor-v2/web/auth.py $ROOT/monitor-v2/web/broker.py $ROOT/monitor-v2/web/recovery.py $ROOT/monitor-v2/web/server.py $ROOT/monitor-v2/web/storage.py $ROOT/monitor-v2/webapp.py"
+WEB_PY="$ROOT/monitor-v2/web/__init__.py $ROOT/monitor-v2/web/access.py $ROOT/monitor-v2/web/auth.py $ROOT/monitor-v2/web/broker.py $ROOT/monitor-v2/web/e3_broker.py $ROOT/monitor-v2/web/e3rpc.py $ROOT/monitor-v2/web/recovery.py $ROOT/monitor-v2/web/server.py $ROOT/monitor-v2/web/storage.py $ROOT/monitor-v2/webapp.py"
 if "$PY" -m py_compile $WEB_PY 2>"$TMP/py.err"; then
     pass "py_compile web backend"
 else
@@ -66,7 +66,7 @@ assert_not_contains 'verify_secret' "$SERVER_SRC" "step-up never reaches for a s
 assert_contains 'login_limiter' "$WEB_SRC" "step-up shares the existing login rate limiter"
 assert_contains 'management.activate' "$WEB_SRC" "the four-op mutation boundary is declared"
 assert_contains 'client.delete' "$WEB_SRC" "the four-op mutation boundary is declared (client.delete)"
-assert_contains 'not_implemented' "$SERVER_SRC" "the 501 boundary uses the fixed not_implemented error code"
+assert_contains 'e3_unavailable' "$SERVER_SRC" "the mutation boundary fails closed without an E3 backend (M2; the M0.5 501 was replaced by the real adapter)"
 assert_contains 'id="stepup-overlay" class="overlay hidden"' "$INDEX_SRC" "the password panel is hidden on load (never asked proactively)"
 assert_contains 'Management plane' "$INDEX_SRC" "the dashboard renders the orthogonal status model"
 # T12 (static half): no code path in the web process addresses either
@@ -102,15 +102,13 @@ assert_eq "RestrictSUIDSGID=true" "$(grep '^RestrictSUIDSGID=' "$UNIT")" "unit c
 assert_eq "CapabilityBoundingSet=" "$(grep '^CapabilityBoundingSet=' "$UNIT")" "unit drops the whole capability bounding set"
 assert_eq "AmbientCapabilities=" "$(grep '^AmbientCapabilities=' "$UNIT")" "unit holds zero ambient capabilities"
 assert_eq "1" "$(grep -c '^ReadWritePaths=' "$UNIT")" "unit declares EXACTLY ONE writable exception"
-assert_eq "ReadWritePaths=/var/lib/singbox-monitor" "$(grep '^ReadWritePaths=' "$UNIT")" "the only writable path is the monitor's own data root"
+assert_eq "ReadWritePaths=/var/lib/singbox-monitor" "$(grep '^ReadWritePaths=' "$UNIT")" "the only writable path is the monitor's own data root (M2 final review B5: least privilege restored)"
 RW_ROOT="$(grep '^ReadWritePaths=' "$UNIT" | grep -F '/root/sbox' || true)"
 assert_eq "" "$RW_ROOT" "T12: the unit opens NO write path into /root/sbox"
 RW_CM="$(grep '^ReadWritePaths=' "$UNIT" | grep -F '/var/lib/sbox-cm' || true)"
 assert_eq "" "$RW_CM" "T12: the unit opens NO write path into the sbox-cm runtime tree"
 assert_eq "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX" "$(grep '^RestrictAddressFamilies=' "$UNIT")" \
     "monitor keeps AF_INET/AF_INET6 (it is a loopback client+listener); NOT collapsed to AF_UNIX-only"
-assert_eq "" "$(printf '%s' "$UNIT_SRC" | grep -E '^ReadWritePaths=.*sbox-cm' || true)" \
-    "no sbox-cm socket path is force-created before it exists"
 
 # ---------------------------------------------------------------------------
 # T12 runtime half: the privileged trees must be unreachable IN PRACTICE, not
@@ -140,7 +138,6 @@ import sys
 
 PATHS = ("/root", "/root/sbox", "/var/lib/sbox-cm")
 
-
 def probe(path):
     if os.name != "posix":
         return "not-posix"
@@ -157,7 +154,6 @@ def probe(path):
     except OSError:
         return "denied"
     return "allowed"
-
 
 def modes(path):
     if os.name != "posix":
@@ -179,7 +175,6 @@ def modes(path):
     if not os.path.isdir(path):
         return "not-a-dir"
     return "owner-only"
-
 
 mode = "--modes" in sys.argv[1:]
 report = modes if mode else probe
@@ -295,10 +290,8 @@ RECOVERY_KEY = "m05-recovery-key-0001"
 SOURCE = "127.0.0.5"
 MUTATION_PATHS = sorted(MUTATION_ROUTES)
 
-
 def _raiser():
     raise RuntimeError("management_active provider failed")
-
 
 def make_stack(data_dir, *, password=None, recovery=None,
                whitelist=(SOURCE + "/32",), poll=0.2, url="http://127.0.0.1:1",
@@ -331,7 +324,6 @@ def make_stack(data_dir, *, password=None, recovery=None,
     return {"srv": srv, "port": port, "policy": policy, "auth": auth,
             "broker": broker, "data_dir": data_dir, "app": app}
 
-
 def req(port, method, path, headers=None, body=None, timeout=8.0,
         source=SOURCE):
     try:
@@ -339,7 +331,6 @@ def req(port, method, path, headers=None, body=None, timeout=8.0,
     except (ConnectionError, OSError):
         time.sleep(0.3)
         return _req_once(port, source, method, path, headers, body, timeout)
-
 
 def _req_once(port, source, method, path, headers=None, body=None,
               timeout=8.0):
@@ -357,50 +348,40 @@ def _req_once(port, source, method, path, headers=None, body=None,
             "headers": {k.lower(): v for k, v in resp.getheaders()},
             "body": data.decode("utf-8", "replace")}
 
-
 def json_body(payload):
     return json.dumps(payload).encode("utf-8")
-
 
 def login(port, password=PASSWORD):
     return req(port, "POST", "/api/v1/login",
                {"Content-Type": "application/json"},
                json_body({"password": password}))
 
-
 def cookie_of(response):
     return response["headers"].get("set-cookie", "").split(";")[0]
-
 
 def token_of(response):
     raw = response["headers"].get("set-cookie", "").split(";")[0]
     return raw.split("=", 1)[1] if "=" in raw else ""
-
 
 def csrf_of(port, cookie):
     data = json.loads(req(port, "GET", "/api/v1/session",
                           {"Cookie": cookie})["body"])
     return data.get("csrf_token") or ""
 
-
 def session_info(port, cookie=None):
     headers = {"Cookie": cookie} if cookie else {}
     return json.loads(req(port, "GET", "/api/v1/session", headers)["body"])
-
 
 def authed(cookie, csrf):
     return {"Content-Type": "application/json", "Cookie": cookie,
             "X-CSRF-Token": csrf}
 
-
 def step_up(port, cookie, csrf, password=PASSWORD):
     return req(port, "POST", "/api/v1/step-up", authed(cookie, csrf),
                json_body({"password": password}))
 
-
 def mutate(port, path, cookie, csrf):
     return req(port, "POST", path, authed(cookie, csrf), json_body({}))
-
 
 def no_raise(func):
     try:
@@ -408,7 +389,6 @@ def no_raise(func):
     except Exception:  # noqa: BLE001
         return False
     return True
-
 
 def group_gate():
     out = {}
@@ -457,15 +437,17 @@ def group_gate():
         session_info(port, cookie).get("step_up_active") is True
 
     # T5: inside the window the mutation is AUTHORIZED. The privileged
-    # backend does not exist in M0.5, so the honest terminal answer is 501 --
+    # backend is not wired in this harness, so the honest terminal
+    # answer is a fail-closed 503 e3_unavailable (M2) --
     # never a silent success and never a second reauth demand.
     r = mutate(port, "/api/v1/clients/add", cookie, csrf)
-    out["T5_authorized_not_401"] = r["status"] == 501
-    out["T5_op_name_reported"] = json.loads(r["body"]).get("op") == "client.add"
+    out["T5_authorized_not_401"] = r["status"] == 503
+    out["T5_op_name_reported"] = \
+        json.loads(r["body"]).get("code") == "e3_unavailable"
     out["T5_milestone_reported"] = \
-        json.loads(r["body"]).get("milestone") == "M0.5"
+        json.loads(r["body"]).get("error") == "the E3 adapter is not wired in this build"
     out["T5_error_code_not_implemented"] = \
-        json.loads(r["body"]).get("error") == "not_implemented"
+        json.loads(r["body"]).get("ok") is False
     out["T5_wrong_password_not_authorized"] = \
         step_up(port, cookie, csrf, "definitely-wrong")["status"] == 401
 
@@ -518,7 +500,7 @@ def group_gate():
     ss = csrf_of(sp, sc)
     out["T6_step_up_ok"] = step_up(sp, sc, ss)["status"] == 200
     out["T6_authorized_in_window"] = \
-        mutate(sp, "/api/v1/clients/add", sc, ss)["status"] == 501
+        mutate(sp, "/api/v1/clients/add", sc, ss)["status"] == 503
     time.sleep(1.6)
     r = mutate(sp, "/api/v1/clients/add", sc, ss)
     out["T6_expired_401"] = r["status"] == 401
@@ -529,7 +511,6 @@ def group_gate():
     out["T6_session_still_valid"] = req(
         sp, "GET", "/api/v1/snapshot", {"Cookie": sc})["status"] == 200
     return out
-
 
 def group_revocation():
     out = {}
@@ -685,7 +666,7 @@ def group_revocation():
     sc = csrf_of(pc, cc)
     step_up(pc, cc, sc)
     out["concurrency_first_request_passes_gate"] = \
-        mutate(pc, "/api/v1/clients/add", cc, sc)["status"] == 501
+        mutate(pc, "/api/v1/clients/add", cc, sc)["status"] == 503
     stack_c["auth"].sessions.revoke_all_step_ups()
     out["concurrency_later_request_blocked"] = \
         mutate(pc, "/api/v1/clients/add", cc, sc)["status"] == 401
@@ -697,7 +678,6 @@ def group_revocation():
         and PASSWORD not in auth_raw \
         and "stepup" not in auth_raw
     return out
-
 
 def group_ratelimit():
     out = {}
@@ -735,7 +715,6 @@ def group_ratelimit():
     out["rl_sixth_attempt_429"] = \
         step_up(p2, c2, s2, "bad-6")["status"] == 429
     return out
-
 
 def group_status():
     out = {}
@@ -791,7 +770,6 @@ def group_status():
         session_info(frozen["port"], cookie).get("step_up_active") is True
     return out
 
-
 GROUPS = {
     "gate": group_gate,
     "revocation": group_revocation,
@@ -845,8 +823,8 @@ check 'd["T4_expires_in_300"]' "T4: the window is 300 seconds"
 check 'd["T4_step_up_active_flag"]' "T4: the session reports a live step-up"
 check 'd["T5_authorized_not_401"]' "T5: inside the window the mutation passes authorization"
 check 'd["T5_op_name_reported"]' "T5: the authorized request reaches the op boundary (client.add)"
-check 'd["T5_milestone_reported"]' "T5: the boundary reports the M0.5 milestone (no real mutation)"
-check 'd["T5_error_code_not_implemented"]' "T5: the 501 body uses the fixed not_implemented code"
+check 'd["T5_milestone_reported"]' "T5: without an E3 backend the boundary says so honestly (M2)"
+check 'd["T5_error_code_not_implemented"]' "T5: the fail-closed body is ok:false (never success-shaped)"
 check 'd["T5_wrong_password_not_authorized"]' "T5: a wrong password never authorizes"
 check 'd["gate_no_session_401"]' "gate: mutation without a session -> 401 login required"
 check 'd["gate_no_csrf_403"]' "gate: mutation without CSRF -> 403"

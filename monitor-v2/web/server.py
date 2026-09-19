@@ -25,8 +25,11 @@ no sing-box state is ever touched by this module.
 
 from __future__ import annotations
 
+import datetime
+import hashlib
 import hmac
 import json
+import re
 import sys
 import traceback
 from http.cookies import SimpleCookie
@@ -34,6 +37,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
 from web.access import host_entry_for_ip
+from web.e3_broker import BrokerUnavailable
+from web.e3rpc import RpcTransportError
 from web.recovery import (RECOVERY_SUCCESS_MESSAGE, RecoveryGlobalGuard,
                           RecoveryRateLimiter, generate_key)
 
@@ -42,18 +47,55 @@ SESSION_COOKIE = "monitor_session"
 MAX_BODY_BYTES = 65536
 SUPPORTED_METHODS = "GET, POST"
 
-# The four privileged mutation routes of rev5 §7, represented here ONLY as
-# authorization boundaries (M0.5). They resolve the session, enforce CSRF and
-# require a live step-up; the privileged execution path (sbox-cm over
-# AF_UNIX) does not exist yet and must never be faked. Until M1/M2 lands they
-# answer a deterministic 501 with the operation name, which is what lets the
-# step-up gate be tested end to end without performing any mutation.
+# The four privileged mutation routes of rev5 §7. M0.5 delivered them as a
+# 501 boundary; M2 wires them to the sbox-cm RPC adapter (below). The
+# authentication boundary above them is UNCHANGED: session -> CSRF -> step-up,
+# and a 401 reauth_required still precedes everything else.
 MUTATION_ROUTES = {
     "/api/v1/management/activate": "management.activate",
     "/api/v1/management/deactivate": "management.deactivate",
     "/api/v1/clients/add": "client.add",
     "/api/v1/clients/delete": "client.delete",
 }
+
+# ---------------------------------------------------------------- M2 adapter --
+# Validation mirrors the helper's own schema (sbox-cm OPS table): the web
+# layer is the FIRST of the two defences, the helper re-validates in-lock.
+E3_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
+E3_KEY_RE = re.compile(r"^[A-Za-z0-9._:-]{16,128}$")
+E3_RESERVED_NAME = "legacy"
+IDEMPOTENCY_HEADER = "Idempotency-Key"
+
+# Helper error code -> HTTP status (rev5 §2.6, the authoritative table). The
+# code, stage and retriable flag pass through; error.backup NEVER does (it is
+# a root-side backup path inside the proxy tree, exactly like lock.path).
+E3_ERROR_HTTP = {
+    "E_SCHEMA": 400, "E_OP_UNKNOWN": 400, "E_PEER_AUTH": 403,
+    "E_RESERVED_NAME": 403, "E_LOCK": 423, "E_DUPLICATE_NAME": 409,
+    "E_NOT_FOUND": 404, "E_CONFIG_INCONSISTENT": 409,
+    "E_IDEMPOTENCY_CONFLICT": 409, "E_RECONCILE_CONFLICT": 409,
+    "E_LEDGER_UNAVAILABLE": 503, "E_STATE_UNCERTAIN": 503,
+    "E_CANDIDATE_REJECTED": 500, "E_COMMIT_FAILED": 500,
+    "E_ROLLED_BACK": 503, "E_MANUAL_INTERVENTION": 500,
+    "E_ACTIVATION_STATE": 409, "E_TIMEOUT": 504, "E_INTERNAL": 500,
+}
+
+# Deny-by-default response whitelist (design §9). Helper fields not listed
+# here never reach the browser -- including any field the helper grows later.
+E3_DATA_WHITELIST = {
+    "management.status": ("management_state", "management_active",
+                          "helper", "lock", "last_transaction"),
+    "client.list": ("clients", "truncated"),
+    "client.add": ("name", "protocols", "mutable", "source",
+                   "yaml_available", "credential_delivery", "warnings"),
+    "client.delete": ("deleted", "derived_cleanup", "warnings"),
+    "management.activate": ("management_state", "no_op"),
+    "management.deactivate": ("management_state", "no_op"),
+}
+E3_STATUS_HELPER_KEYS = ("degraded", "reconcile")
+E3_STATUS_LOCK_KEYS = ("acquirable",)
+E3_LAST_TX_KEYS = ("generation", "op", "outcome", "ended_at")
+E3_CLIENT_KEYS = ("name", "protocols", "reserved", "mutable", "source")
 
 CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -84,12 +126,68 @@ def normalize_path(raw_path):
     return path
 
 
+def iso_utc(epoch):
+    """Epoch seconds -> ISO-8601 UTC (``...Z``); None stays None."""
+    if epoch is None:
+        return None
+    return datetime.datetime.fromtimestamp(
+        epoch, tz=datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def sanitize_e3_data(op, data):
+    """Deny-by-default whitelist of a helper ``data`` payload (M2 §9)."""
+    allowed = E3_DATA_WHITELIST.get(op, ())
+    if not isinstance(data, dict):
+        return {}
+    out = {}
+    for key in allowed:
+        if key not in data:
+            continue
+        value = data[key]
+        if key == "helper" and isinstance(value, dict):
+            value = {k: value[k] for k in E3_STATUS_HELPER_KEYS
+                     if k in value}
+        elif key == "lock" and isinstance(value, dict):
+            # lock.path names a root-side lock file inside the proxy tree:
+            # it must never leave this process
+            value = {k: value[k] for k in E3_STATUS_LOCK_KEYS
+                     if k in value}
+        elif key == "last_transaction" and isinstance(value, dict):
+            value = {k: value[k] for k in E3_LAST_TX_KEYS if k in value}
+        elif key == "clients" and isinstance(value, list):
+            value = [{k: c[k] for k in E3_CLIENT_KEYS if k in c}
+                     for c in value if isinstance(c, dict)]
+        out[key] = value
+    return out
+
+
+def sanitize_e3_idempotency(idem):
+    if not isinstance(idem, dict):
+        return None
+    out = {}
+    for key in ("key_fp", "replayed", "generation"):
+        if key in idem:
+            out[key] = idem[key]
+    return out or None
+
+
+def sanitize_e3_error(verdict):
+    """{code, stage, retriable, detail} from a failed helper verdict.
+    ``backup`` is deliberately dropped (a root-side backup path)."""
+    err = verdict.get("error") if isinstance(verdict.get("error"), dict) \
+        else {}
+    return {"code": err.get("code") or "E_INTERNAL",
+            "stage": err.get("stage"),
+            "retriable": bool(err.get("retriable")),
+            "error": err.get("detail") or err.get("code") or "E_INTERNAL"}
+
+
 class MonitorWebApp:
     """Wiring shared by all requests: broker + access policy + auth."""
 
     def __init__(self, broker, access, static_dir, auth=None,
                  remote_mode=False, version=MONITOR_WEB_VERSION,
-                 recovery_guard=None, management_active=None):
+                 recovery_guard=None, management_active=None, e3_broker=None):
         self.broker = broker
         self.access = access
         self.auth = auth
@@ -100,13 +198,16 @@ class MonitorWebApp:
         self.recovery_guard = recovery_guard or RecoveryGlobalGuard()
         # ``management_active`` is an ORTHOGONAL boolean to ``monitor_running``
         # (rev5 §4.5): the monitor being up says nothing about whether the
-        # privileged mutation plane is armed. In M0.5 it is ALWAYS false, and
-        # deliberately so: the activation marker lives in the sbox-cm runtime
-        # directory under /var/lib, owned root-only, which this process has
-        # ZERO filesystem access to. The only future read channel is the
-        # sbox-cm RPC. The provider hook exists so the state model is testable
-        # and forward-compatible; it can never be satisfied by reading a file.
+        # privileged mutation plane is armed.
+        #
+        # M2 (D-5 closure): with an ``e3_broker`` wired, the ONLY source is
+        # the broker's fresh-only derivation from management.status RPC --
+        # this module still never stats/opens/reads the activation marker,
+        # and a stale "active" is never trusted. The injectable provider hook
+        # remains ONLY for the M0.5 test harness (and answers False when no
+        # broker and no provider exist, which stays the fail-closed default).
         self._management_active = management_active
+        self.e3_broker = e3_broker
         self._static_cache = {}
 
     def static_file(self, name):
@@ -143,22 +244,17 @@ class MonitorWebApp:
     def management_active(self):
         """``management_active``: the privileged mutation plane is armed.
 
-        M0.5 PHASE-SCOPED PROVIDER -- NOT the future source of truth.
-        The only legitimate future source is:
-
-            Web -> management.status RPC -> sbox-cm
-
-        (M1). This provider exists so the orthogonal status model is testable
-        today; it must be REPLACED by that RPC adapter in M1 and NEVER be
-        reimplemented as a filesystem read. The web process is permanently
-        forbidden from stat()/open()/read() of the activation marker (it lives
-        in the root-only sbox-cm runtime tree, which sboxweb cannot reach);
-        a "shortcut" here would both break INV-1 silently and produce a status
-        that is a fabrication rather than an observation.
-
-        Fail-closed: anything undeterminable answers False. Default (M0.5) is
-        False, which is also the required production resting state.
+        M2: with an E3 broker wired, the answer is the broker's fresh-only
+        derivation of management.status (``stale active=true`` is NEVER
+        trusted; helper unreachable answers False). Without a broker, the
+        M0.5 injectable provider path applies and still fails closed.
+        There is no filesystem read anywhere on either path.
         """
+        if self.e3_broker is not None:
+            try:
+                return bool(self.e3_broker.management_active())
+            except Exception:  # noqa: BLE001 - unknown state is NOT "active"
+                return False
         provider = self._management_active
         if provider is None:
             return False
@@ -166,6 +262,19 @@ class MonitorWebApp:
             return bool(provider())
         except Exception:  # noqa: BLE001 - unknown state is NOT "active"
             return False
+
+    def session_fingerprint(self, token):
+        """sha256(session token)[:16] -- the RPC actor's ``session_fp``.
+
+        One-way: the session token itself never leaves this process. """
+        if not token:
+            return None
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+
+    # (B2) the step-up fingerprint is no longer read separately anywhere:
+    # the gate captures it atomically with the liveness check via
+    # auth.step_up_credentials, freezes it into the request's actor, and
+    # the handler never re-reads it.
 
 
 class MonitorHTTPServer(ThreadingHTTPServer):
@@ -301,6 +410,13 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/v1/whitelist":
             self._require_session(self._handle_whitelist_get, remote)
             return
+        # M2: the E3 adapter read surface (session-gated; read-level).
+        if path == "/api/v1/management/status":
+            self._require_session(self._handle_e3_management_status)
+            return
+        if path == "/api/v1/clients":
+            self._require_session(self._handle_e3_clients_list)
+            return
         self._send_json(404, {"error": "not found"})
 
     def _body_header_error(self):
@@ -356,7 +472,12 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             return
         op = MUTATION_ROUTES.get(path)
         if op is not None:
-            self._require_step_up(self._handle_mutation_boundary, op)
+            # M2: the full gate chain (session -> CSRF -> step-up) is
+            # unchanged; the gate ALSO freezes the audit actor atomically
+            # with the step-up liveness check (B2), so a revocation that
+            # lands after the gate can never strip the actor from an
+            # already-authorized dispatch.
+            self._require_step_up(self._handle_e3_mutation, op)
             return
         self._send_json(404, {"error": "not found"})
 
@@ -476,10 +597,23 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
                 not hmac.compare_digest(supplied, expected):
             self._send_json(403, {"error": "missing or invalid CSRF token"})
             return
-        if not self.app.step_up_active(token):
+        # B2: the step-up liveness check and the audit fingerprint are read
+        # in ONE atomic step (auth.step_up_credentials). The frozen actor
+        # travels with the request: a revocation that lands after this point
+        # refuses every LATER request but does not strip the actor from an
+        # already-authorized dispatch -- the helper's audit keeps the
+        # gate-time fingerprints.
+        creds = self.app.auth.sessions.step_up_credentials(token)
+        if not creds["active"]:
             self._send_json(401, {"error": "reauth_required"})
             return
-        handler(session, *args)
+        actor = {}
+        sfp = self.app.session_fingerprint(token)
+        if sfp:
+            actor["session_fp"] = sfp
+        if creds["fp"]:
+            actor["stepup_fp"] = creds["fp"]
+        handler(session, *args, actor)
 
     def _cross_origin(self):
         """True when the browser declared a foreign Origin (second CSRF
@@ -749,29 +883,245 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
                         extra_headers=[("Set-Cookie",
                                         self._session_cookie("", 0))])
 
-    def _handle_mutation_boundary(self, session, op):
-        """Authorization boundary for the four privileged mutation ops.
+    # -- M2: sbox-cm RPC adapter -------------------------------------------------
 
-        M0.5 delivers the gate, not the mutation. A request that reaches this
-        handler has already passed session + CSRF + step-up; the privileged
-        execution path (sbox-cm over AF_UNIX, with the shared config.lock and
-        commit engine) is M1/M2 work.
+    def _e3_unavailable(self, detail="the privileged execution plane is "
+                                     "unreachable"):
+        self._send_json(503, {"ok": False, "code": "e3_unavailable",
+                              "error": detail, "retriable": True})
 
-        The terminal answer is a FIXED 501 contract:
+    def _e3_verdict_error(self, result):
+        """B1: a helper ``ok:false`` verdict on a WORKING transport maps
+        through the authoritative error table -- never disguised as a
+        snapshot, never as e3_unavailable, and the breaker was not touched."""
+        err = result["verdict_error"]
+        mapped = {"ok": False, "code": err["code"], "stage": err["stage"],
+                  "error": err["detail"], "retriable": err["retriable"],
+                  "request_id": err.get("request_id")}
+        self._send_json(E3_ERROR_HTTP.get(err["code"], 500), mapped)
 
-            {"error": "not_implemented", "op": "<op>", "milestone": "M0.5"}
+    def _handle_e3_management_status(self, session):
+        """GET /api/v1/management/status -> the whitelisted status snapshot.
 
-        501 means exactly one thing here: authorization was fully satisfied
-        and only the backend is missing. It is therefore never returned
-        before the gates -- a missing/expired step-up still answers
-        401 reauth_required first. No code path in this handler (or below it)
-        reads the proxy tree, writes the activation marker, reloads anything,
-        calls a future helper, or returns anything success-shaped. M1/M2
-        replaces the body of this handler with the RPC adapter and changes
-        nothing about the authentication boundary above it.
+        transport (fresh|stale|unavailable) and as_of describe the WEB-side
+        freshness of the snapshot; helper.degraded inside data is only ever
+        what a real management.status response said (the two are never
+        conflated, design §7.5). monitor_running is web-supplied (frozen
+        ruling): this process IS the monitor. An unavailable helper with no
+        snapshot is a 503 -- nothing is synthesized. A helper semantic
+        verdict (ok:false) maps through E3_ERROR_HTTP (B1)."""
+        broker = self.app.e3_broker
+        if broker is None:
+            self._e3_unavailable("the E3 adapter is not wired in this build")
+            return
+        result = broker.status()
+        if result.get("verdict_error"):
+            self._e3_verdict_error(result)
+            return
+        if result["payload"] is None:
+            self._e3_unavailable("sbox-cm is unreachable (no snapshot)")
+            return
+        payload = result["payload"]
+        data = payload.get("data") if isinstance(payload, dict) else {}
+        self._send_json(200, {
+            "ok": True,
+            "transport": result["transport"],
+            "as_of": iso_utc(result["as_of"]),
+            "monitor_running": self.app.monitor_running(),
+            "management_active": self.app.management_active(),
+            "data": sanitize_e3_data("management.status", data or {}),
+        })
+
+    def _handle_e3_clients_list(self, session):
+        """GET /api/v1/clients -> the whitelisted client.list snapshot.
+
+        A stale snapshot is served for DISPLAY with its as_of; the delete
+        flow never trusts it (it prefetches a fresh list server-side)."""
+        broker = self.app.e3_broker
+        if broker is None:
+            self._e3_unavailable("the E3 adapter is not wired in this build")
+            return
+        result = broker.list_clients()
+        if result.get("verdict_error"):
+            self._e3_verdict_error(result)
+            return
+        if result["payload"] is None:
+            self._e3_unavailable("sbox-cm is unreachable (no snapshot)")
+            return
+        payload = result["payload"]
+        data = payload.get("data") if isinstance(payload, dict) else {}
+        self._send_json(200, {
+            "ok": True,
+            "transport": result["transport"],
+            "as_of": iso_utc(result["as_of"]),
+            "data": sanitize_e3_data("client.list", data or {}),
+        })
+
+    def _handle_e3_mutation(self, session, op, actor):
+        """POST mutation -> dispatch to sbox-cm via the broker.
+
+        Reached only after session -> CSRF -> step-up, and the ``actor`` was
+        FROZEN at the gate (B2): the fingerprints are the gate-time values,
+        so a revocation racing the dispatch changes the authorization of
+        FUTURE requests, never the attribution of this one.
+
+        Contract highlights (design §8-§11):
+
+        * client.add/delete take the Idempotency-Key HTTP header (16..128 of
+          [A-Za-z0-9._:-]), validated here and forwarded verbatim; the body
+          must NOT carry a second key. The browser keeps the header across a
+          401 replay and an explicit post-uncertain retry;
+        * client.delete runs a FRESH (cache-bypassing) list preflight and a
+          server-side confirm==name check before anything is dispatched;
+        * a connect failure is a definitive non-dispatch (503
+          e3_unavailable); a post-send budget exhaustion is 504
+          result_unknown with uncertain=true -- the transaction keeps running
+          inside the helper, so no automatic retry ever happens here;
+        * helper verdicts pass through the deny-by-default whitelist; the
+          code/stage/retriable mapping is rev5 §2.6.
         """
-        self._send_json(501, {"error": "not_implemented",
-                              "op": op, "milestone": "M0.5"})
+        broker = self.app.e3_broker
+        if broker is None:
+            self._e3_unavailable("the E3 adapter is not wired in this build")
+            return
+
+        body = self._json_body() or {}
+        payload = {}
+        key = None
+        name = None
+
+        if op in ("client.add", "client.delete"):
+            if "idempotency_key" in body:
+                self._send_json(400, {
+                    "ok": False, "code": "invalid_idempotency_key",
+                    "error": "the Idempotency-Key must be sent as the "
+                             "request header, never in the body",
+                    "retriable": False})
+                return
+            key = self.headers.get(IDEMPOTENCY_HEADER)
+            if not isinstance(key, str) or not E3_KEY_RE.match(key):
+                self._send_json(400, {
+                    "ok": False, "code": "invalid_idempotency_key",
+                    "error": "Idempotency-Key header missing or invalid "
+                             "(16..128 characters of [A-Za-z0-9._:-])",
+                    "retriable": False})
+                return
+            payload["idempotency_key"] = key
+            name = body.get("name")
+            if not isinstance(name, str) or not E3_NAME_RE.match(name):
+                self._send_json(400, {
+                    "ok": False, "code": "invalid_name",
+                    "error": "name missing or invalid (<=32 chars, "
+                             "[A-Za-z0-9][A-Za-z0-9._-]*)",
+                    "retriable": False})
+                return
+            if name == E3_RESERVED_NAME:
+                # First of the two defences; the helper re-validates in-lock.
+                self._send_json(403, {
+                    "ok": False, "code": "E_RESERVED_NAME",
+                    "error": "legacy is a reserved name", "retriable": False})
+                return
+            payload["name"] = name
+
+        if op == "client.delete":
+            # Server-side type-to-confirm: the echoed value must equal the
+            # name exactly (U-2). Then the fresh-list preflight: without a
+            # provably FRESH list (this exact request's own successful RPC,
+            # never a stale fallback) nothing destructive is dispatched (the
+            # helper's in-lock revalidation stays the correctness boundary).
+            if body.get("confirm") != name:
+                self._send_json(400, {
+                    "ok": False, "code": "confirm_mismatch",
+                    "error": "confirm must be present and equal the client "
+                             "name exactly",
+                    "retriable": False})
+                return
+            try:
+                fresh = broker.list_clients(force=True)
+            except BrokerUnavailable:
+                fresh = {"payload": None, "transport": "unavailable",
+                         "verdict_error": None}
+            # B1: a helper semantic verdict on the preflight keeps its own
+            # semantics (E_LOCK -> 423, E_CONFIG_INCONSISTENT -> 409, ...);
+            # it is never disguised as E_NOT_FOUND and the delete is never
+            # dispatched past a failed preflight.
+            if fresh.get("verdict_error"):
+                self._e3_verdict_error(fresh)
+                return
+            fresh_ok = fresh.get("payload") is not None \
+                and fresh.get("transport") == "fresh"
+            names = set()
+            if fresh_ok:
+                data = fresh["payload"].get("data")
+                if isinstance(data, dict):
+                    names = {c.get("name")
+                             for c in data.get("clients", [])
+                             if isinstance(c, dict)}
+            if not fresh_ok:
+                self._send_json(503, {
+                    "ok": False, "code": "list_unavailable",
+                    "error": "no fresh client list is available; the delete "
+                             "was NOT dispatched",
+                    "retriable": True})
+                return
+            if name not in names:
+                self._send_json(404, {
+                    "ok": False, "code": "E_NOT_FOUND",
+                    "error": "the client is not in the fresh list; nothing "
+                             "was deleted",
+                    "retriable": False})
+                return
+
+        # the actor arrived FROZEN from the gate (B2) -- never re-read here
+        try:
+            verdict = broker.mutate(op, payload=payload, actor=actor or None)
+        except BrokerUnavailable:
+            self._e3_unavailable("the helper breaker is open; the mutation "
+                                 "was NOT dispatched")
+            return
+        except RpcTransportError as exc:
+            if exc.stage == "connect":
+                # Definitively not dispatched: no transaction can have begun.
+                self._e3_unavailable("sbox-cm is unreachable; the mutation "
+                                     "was NOT dispatched")
+                return
+            # Post-send: the outcome is unknown by design (the helper never
+            # aborts a dispatched transaction). No automatic retry here.
+            response = {
+                "ok": False, "code": "result_unknown",
+                "error": "the caller budget expired after dispatch; the "
+                         "transaction keeps running inside sbox-cm",
+                "retriable": True, "uncertain": True,
+            }
+            if op in ("management.activate", "management.deactivate"):
+                # No Idempotency-Key exists for these ops by design: recovery
+                # is status-first, then an explicit new confirmation.
+                response["recovery"] = (
+                    "check GET /api/v1/management/status (management_state) "
+                    "before doing anything; if a new attempt is still needed, "
+                    "confirm it explicitly")
+            else:
+                response["recovery"] = (
+                    "check GET /api/v1/management/status and GET /api/v1/"
+                    "clients first; retry ONLY with the SAME Idempotency-Key "
+                    "if a retry is still needed")
+            self._send_json(504, response)
+            return
+
+        if verdict.get("ok"):
+            self._send_json(200, {
+                "ok": True, "op": op,
+                "request_id": verdict.get("request_id"),
+                "idempotency": sanitize_e3_idempotency(
+                    verdict.get("idempotency")),
+                "data": sanitize_e3_data(op, verdict.get("data")),
+                "warnings": verdict.get("warnings") or [],
+            })
+            return
+        mapped = sanitize_e3_error(verdict)
+        mapped.update({"ok": False,
+                       "request_id": verdict.get("request_id")})
+        self._send_json(E3_ERROR_HTTP.get(mapped["code"], 500), mapped)
 
     def _handle_password(self, session, remote):
         """POST /api/v1/password {current_password, new_password}."""

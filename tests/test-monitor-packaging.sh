@@ -433,7 +433,7 @@ assert_grep '^SBMON_WEB_POLL_SECONDS=1$' "$FIX_CONF_DIR/monitor.conf" "fresh con
 assert_grep 'NoNewPrivileges=true' "$FIX_UNIT" "unit NoNewPrivileges"
 assert_grep 'ProtectHome=yes' "$FIX_UNIT" "unit ProtectHome=yes (cannot read /root/sbox)"
 assert_grep 'ProtectSystem=strict' "$FIX_UNIT" "unit ProtectSystem=strict (M0.5 G4)"
-assert_eq "ReadWritePaths=$FIX_STATE" "$(grep '^ReadWritePaths=' "$FIX_UNIT")" "unit re-opens ONLY the monitor data root for writing (M0.5 G4)"
+assert_eq "ReadWritePaths=$FIX_STATE" "$(grep '^ReadWritePaths=' "$FIX_UNIT")" "unit re-opens ONLY the monitor data root for writing (M0.5 G4; M2 final review B5: least privilege restored)"
 assert_grep 'RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX' "$FIX_UNIT" "unit keeps the monitor address-family contract (not AF_UNIX-only)"
 assert_grep 'ProtectKernelTunables=true' "$FIX_UNIT" "unit ProtectKernelTunables"
 assert_grep 'ProtectControlGroups=true' "$FIX_UNIT" "unit ProtectControlGroups"

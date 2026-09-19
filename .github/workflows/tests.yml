@@ -62,6 +62,8 @@ jobs:
           bash -n tests/e3/test-m1-deploy.sh
           bash -n tests/e3/test-m1-crash.sh
           bash -n tests/e3/test-m1-systemd.sh
+          bash -n tests/e3/test-m2-live.sh
+          bash -n tests/test-monitor-v2-m2.sh
 
       - name: "Journal time compatibility regression suite (B6 finding: raw RFC3339 rejected by Ubuntu 22.04 journalctl)"
         run: bash tests/test-journal-time-compat.sh
@@ -130,6 +132,16 @@ jobs:
           # its teardown trap (that is how this step once stayed green at
           # FAIL=10).
           sudo -n env SBOX_CM_REQUIRE_LIVE=1 bash tests/e3/test-m1-systemd.sh
+
+      - name: "E3 M2 web adapter contract suite (broker / breaker / auth / HTTP adapter)"
+        run: bash tests/test-monitor-v2-m2.sh
+
+      - name: "E3 M2 LIVE systemd integration (real monitor unit x real sbox-cm: carve-out experiment / full transaction / result_unknown / stale-active fail closed)"
+        run: |
+          bash -n tests/e3/test-m2-live.sh
+          # SINGBOX_MONITOR_REQUIRE_LIVE=1: on CI the live gate MUST really
+          # execute; a SKIP here is a hard failure (the B-5 lesson).
+          sudo -n env SINGBOX_MONITOR_REQUIRE_LIVE=1 bash tests/e3/test-m2-live.sh
 
       - name: "systemd unit validation (sbox-cm socket + service candidate)"
         run: |
