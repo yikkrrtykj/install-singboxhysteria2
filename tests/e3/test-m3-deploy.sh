@@ -343,6 +343,13 @@ chmod 0600 /root/sbox/sbconfig_server.json
 
 # ------------------------------------------------------- rollback (PASS) --
 EXPECT_REL="$(jqv "$(cat "$BASELINE")" '.monitor.release_id')"
+cat > "$STUB_INSTALLER" <<'STUB'
+#!/usr/bin/env bash
+printf '%s
+' "$*" >> /run/sboxcm-m3-test/stub-installer.log
+exit 0
+STUB
+chmod 0755 "$STUB_INSTALLER"
 RBOUT="$(E3_INSTALL_MONITOR="$STUB_INSTALLER" E3_RELEASES_DIR="$RELDIR" \
     bash "$ROLLBACK" --baseline "$BASELINE")"
 RC=$?
