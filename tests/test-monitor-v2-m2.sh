@@ -1075,30 +1075,33 @@ section_py(){ printf '  -- %s --\n' "$1"; }
     || pass 'M2 modules compile'
 
 section_py 'B3/B4 static UI contracts'
-APP_SRC="$(cat "$ROOT/monitor-v2/web/static/app.js")"
-INDEX_SRC="$(cat "$ROOT/monitor-v2/web/static/index.html")"
-if printf '%s' "$APP_SRC" | grep -qF 'function e3Writable'; then
+# grep against FILES, not pipes: with pipefail, `printf | grep -q` can die of
+# SIGPIPE the moment grep matches, flipping a true assertion to false (this
+# exact race failed the Linux CI while passing locally).
+APP_FILE="$ROOT/monitor-v2/web/static/app.js"
+INDEX_FILE="$ROOT/monitor-v2/web/static/index.html"
+if grep -qF 'function e3Writable' "$APP_FILE"; then
     pass 'B4: the single writable gate (e3Writable) exists'
 else
     fail 'B4: the single writable gate (e3Writable) is missing'
 fi
-if printf '%s' "$APP_SRC" | grep -qF 'setPendingRetry'; then
+if grep -qF 'setPendingRetry' "$APP_FILE"; then
     pass 'B3: the pending uncertain-retry mechanism exists'
 else
     fail 'B3: the pending uncertain-retry mechanism is missing'
 fi
-if printf '%s' "$APP_SRC" | grep -qF 'idempotencyKey: p.idempotencyKey'; then
+if grep -qF 'idempotencyKey: p.idempotencyKey' "$APP_FILE"; then
     pass 'B3: the explicit retry reuses the stored Idempotency-Key'
 else
     fail 'B3: the explicit retry does not reuse the stored key'
 fi
-LOAD_FN="$(sed -n '/function loadE3Clients/,/^  }/p' <<< "$APP_SRC")"
+LOAD_FN="$(sed -n '/function loadE3Clients/,/^  }/p' "$APP_FILE")"
 if printf '%s' "$LOAD_FN" | grep -qF 'data.transport'; then
     fail 'B4: loadE3Clients still references the undefined data variable'
 else
     pass 'B4: the loadE3Clients failure branch is ReferenceError-free'
 fi
-if printf '%s' "$INDEX_SRC" | grep -qF 'e3-retry-btn'; then
+if grep -qF 'e3-retry-btn' "$INDEX_FILE"; then
     pass 'B3: the explicit retry button is present in the UI'
 else
     fail 'B3: the explicit retry button is missing'
