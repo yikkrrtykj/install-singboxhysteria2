@@ -32,8 +32,7 @@ sudo bash monitor-v2/deploy/e3-preflight.sh --baseline-out /root/e3-baseline.jso
 | P08 | `/root/sbox` 存在、root 属主、配置在内 |
 | P09 | `/var/lib/sbox-cm` owner+group+mode = root/root/0700（不存在则记 INFO） |
 | P00 | sbox-cm capability 必须完全 absent（6 个路径逐一检查）；任何一项存在 ⇒ FAIL（first-deploy-only freeze） |
-| P10 | `/run/sbox-cm/sbox-cm.sock` root:sboxweb 0660（socket 启动后才存在） |
-| P11 | sbox-cm units 是否已安装（socket/service/enabled 状态如实记录） |
+| P10 | `/run/sbox-cm/sbox-cm.sock` 必须不存在；任何已有路径（即使 root:sboxweb 0660）均视为 stale runtime capability 并 FAIL |
 | P12 | `/` 与 `/var` 可用空间 ≥ 1024 MB |
 
 baseline 写入（仅全部 PASS 后）：umask 077 + 同目录 mktemp + 写入 + chmod 0600 + jq 校验成功 + 原子 mv——失败绝不覆盖既有 baseline。baseline 冻结 `monitor.release_id/release_target`（live symlink）与 helper 部署前状态（全 false）。
@@ -51,7 +50,8 @@ systemctl 仅用 is-active/is-enabled/show 等只读查询。
 <release>/app/monitor-v2/webapp.py      <- runtime entrypoint
 <release>/app/monitor-v2/{web,api_bridge}/, collector.py, ...
 <release>/bin, <release>/lib
-<release>/install-monitor.sh            <- rollback tooling 的同目录 sibling
+<checkout>/monitor-v2/deploy/e3-rollback.sh
+<checkout>/monitor-v2/deploy/install-monitor.sh  <- rollback tooling 的同目录 sibling
 ```
 
 `E3_MONITOR_APP` = release symlink 根；runtime = `$E3_MONITOR_APP/app/monitor-v2`。preflight 检查 `<release>/VERSION` 与 `<release>/app/monitor-v2/webapp.py`；verify 的 sboxweb RPC probe 从 `app/monitor-v2` 导入 `web.e3rpc`。

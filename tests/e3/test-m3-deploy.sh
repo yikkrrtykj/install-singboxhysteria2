@@ -294,10 +294,12 @@ s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 s.bind('/run/sbox-cm/sbox-cm.sock')
 s.close()
 PY
+chown root:sboxweb /run/sbox-cm/sbox-cm.sock
+chmod 0660 /run/sbox-cm/sbox-cm.sock
 if bash "$PREFLIGHT" >/dev/null 2>&1; then
     fail 'preflight with a stale runtime socket must FAIL'
 else
-    pass 'preflight with a stale runtime socket FAILS (leftover capability)'
+    pass 'preflight with a root:sboxweb 0660 stale runtime socket FAILS solely because the path exists'
 fi
 rm -f /run/sbox-cm/sbox-cm.sock
 

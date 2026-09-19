@@ -189,13 +189,11 @@ else
 fi
 
 # ------------------------------------------------- P10 /run/sbox-cm socket --
-if [ -S "$E3_SBXCM_SOCKET" ]; then
-    SOCKOWN="$(stat -c '%U %G %a' "$E3_SBXCM_SOCKET" 2>/dev/null)"
-    if [ "$SOCKOWN" = "root sboxweb 660" ]; then
-        pass "P10 sbox-cm socket present (root:sboxweb 0660)"
-    else
-        fail "P10 sbox-cm socket ownership/mode unexpected: [$SOCKOWN]"
-    fi
+# FIRST-DEPLOY-ONLY means no runtime capability may survive from an earlier
+# deployment. Even a correctly-owned 0660 socket is stale here: accepting it
+# would let a leftover listener/path masquerade as a clean first deploy.
+if [ -e "$E3_SBXCM_SOCKET" ] || [ -L "$E3_SBXCM_SOCKET" ]; then
+    fail "P10 sbox-cm socket path already exists (stale runtime capability): $E3_SBXCM_SOCKET"
 else
     note "P10 sbox-cm socket absent (created when the socket unit starts)"
 fi
