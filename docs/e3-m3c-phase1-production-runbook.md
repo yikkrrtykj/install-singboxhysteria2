@@ -2,7 +2,9 @@
 
 > **Historical / completed:** 本文保留 Phase 1 当时的 frozen 安全合同与执行记录，
 > 不应重写为当前 go-live 指令。Phase 2 production canary 已在独立审批下完成；
-> 最终 persistent enable 使用 `docs/e3-m3c-phase3-production-runbook.md`。
+> Phase 3 已实现但尚未在生产执行，最终 persistent enable 使用
+> `docs/e3-m3c-phase3-production-runbook.md`。本文后续出现的 “Phase 2 NOT
+> STARTED / 未开始” 均是 Phase 1 执行当时的历史断言，不代表当前状态。
 
 ```text
 冻结基线                  = f0e1480e1527ffb5906e715dd3acff8b29b8c024

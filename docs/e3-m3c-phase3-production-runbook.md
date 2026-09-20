@@ -18,30 +18,47 @@ every result before continuing.
 ## 1. Frozen inputs
 
 After the Phase 3 PR is reviewed and merged, replace the placeholder with the
-exact main merge SHA. Never approve an arbitrary descendant.
+exact main merge SHA. Never approve an arbitrary descendant or the PR feature
+HEAD. Phase 3 uses one new, uniquely named, detached checkout; it never reuses
+the Phase 1/2 checkout or any mutable production source tree.
 
 ```bash
 sudo -i
 
-export REPO=/root/install-singboxhysteria2
-export E3_PHASE3_APPROVED_HEAD='<reviewed Phase 3 main merge SHA>'
-export PHASE3="$REPO/monitor-v2/deploy/e3-m3c-phase3.sh"
+export APPROVED='<reviewed Phase 3 main merge SHA>'
+[[ "$APPROVED" =~ ^[0-9a-f]{40}$ ]] || {
+  echo 'STOP: APPROVED must be the exact 40-hex Phase 3 main merge SHA' >&2
+  exit 1
+}
+export SRC="/root/e3-m3c-phase3-${APPROVED:0:8}"
+
+test ! -e "$SRC" || {
+  echo "STOP: Phase 3 checkout already exists: $SRC" >&2
+  exit 1
+}
+
+git clone https://github.com/yikkrrtykj/install-singboxhysteria2.git "$SRC" || exit 1
+git -C "$SRC" checkout --detach "$APPROVED" || exit 1
+
+test "$(git -C "$SRC" rev-parse HEAD)" = "$APPROVED" || exit 1
+test -z "$(git -C "$SRC" status --porcelain)" || exit 1
+
+export E3_PHASE3_APPROVED_HEAD="$APPROVED"
+export PHASE3="$SRC/monitor-v2/deploy/e3-m3c-phase3.sh"
 export PHASE2_STATE=/var/lib/e3-m3c-phase2
 export PHASE3_STATE=/var/lib/e3-m3c-phase3
 ```
 
-Read-only checkout gate:
+Record the frozen checkout identity:
 
 ```bash
-cd "$REPO"
-git rev-parse HEAD
-git status --short
-test "$(git rev-parse HEAD)" = "$E3_PHASE3_APPROVED_HEAD"
-test -z "$(git status --porcelain)"
+git -C "$SRC" rev-parse HEAD
+git -C "$SRC" status --short
 ```
 
-Expected: both tests return 0. Otherwise **STOP**. Do not switch commits or
-repair the tree inside this execution attempt.
+Expected: HEAD is the approved merge SHA and status output is empty. Otherwise
+**STOP**. Do not use `git pull`, overwrite/clean an existing checkout, switch
+commits, or repair the tree inside this execution attempt.
 
 ## 2. Read-only production inventory
 
@@ -199,17 +216,64 @@ production and `recover` refuses to disable it.
 
 ## 7. Final gate
 
+Final acceptance has two evidence layers. The `status` subcommand reports the
+durable Phase 3 state machine; it does not re-measure config or inventory.
+
+### 7.1 Terminal Phase 3 journal/status
+
 ```bash
 E3_PHASE3_APPROVED_HEAD="$E3_PHASE3_APPROVED_HEAD" \
   /usr/bin/bash "$PHASE3" status
-
-systemctl is-active sing-box.service
-systemctl show -p ActiveEnterTimestamp -p NRestarts sing-box.service
-test -f /var/lib/sbox-cm/management.active
-jq . /var/lib/sbox-cm/management.active
 ```
 
-Success is exactly:
+Required output:
+
+```text
+phase=complete
+source_head=<approved Phase 3 main merge SHA>
+activation_started=true completed=true
+final_status=go_live_active
+```
+
+Also inspect the terminal evidence:
+
+```bash
+jq . /var/lib/e3-m3c-phase3/journal.json
+```
+
+Its terminal `final_measurements` was independently measured by the successful
+`enable` command and must record unchanged raw config SHA, semantic config SHA,
+config size, exact inventory, sing-box `ActiveEnterTimestamp` and `NRestarts`,
+plus `management_state=active`.
+
+### 7.2 Current read-only production checks
+
+```bash
+systemctl is-active sing-box.service
+
+systemctl show sing-box.service \
+  -p ActiveEnterTimestamp \
+  -p NRestarts \
+  --no-pager
+
+test -f /var/lib/sbox-cm/management.active
+test ! -L /var/lib/sbox-cm/management.active
+
+stat -c '%U %G %a' /var/lib/sbox-cm/management.active
+
+jq -e '
+  .v == 1 and
+  .state == "active"
+' /var/lib/sbox-cm/management.active
+```
+
+Expected: sing-box is active; its timestamp/restart values equal the Phase 3
+baseline and terminal measurements; marker metadata is `root root 644`; and
+marker JSON validation returns 0.
+
+Only after both evidence layers pass may the operator record this summary. Its
+basis is **Phase 3 terminal journal + `final_measurements` + current read-only
+active/marker/service checks**, not `status` alone:
 
 ```text
 E3 PRODUCTION DEPLOYED   = YES
@@ -220,3 +284,27 @@ activation_marker        = present
 sing-box restart         = NO
 config/inventory drift   = NO
 ```
+
+## 8. Browser Production Acceptance
+
+Perform this read-only UI acceptance only after `PHASE3 GO_LIVE=PASS` and the
+terminal journal reports `final_status=go_live_active`.
+
+1. Open the production Monitor Web through its normal production entry point.
+2. Log in normally.
+3. Open the E3 / Management area.
+4. Confirm Management displays **Active**.
+5. Confirm the client list loads and shows the existing production clients.
+6. Confirm the `Add client` control is available for use.
+7. Confirm `Deactivate management` is available for use.
+8. Confirm the page shows none of: helper degraded, transport unavailable,
+   stale management state, result unknown, or manual intervention.
+9. Refresh the page once and confirm Management still displays **Active**.
+10. End acceptance without clicking Add client, Delete client, or Deactivate
+    management.
+
+This step only proves that the real production browser/Web read path observes
+the backend state already established by Phase 3. M2 CI covers the full Web
+mutation path, Phase 2 covered the real production backend canary, and Phase 3
+performed the persistent activation. Do not create a production test client
+for browser acceptance.

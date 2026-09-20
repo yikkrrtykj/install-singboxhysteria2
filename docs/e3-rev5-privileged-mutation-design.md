@@ -7,7 +7,8 @@
 > add/delete → deactivate` 被收口为 Phase 2 production canary，成功后回到
 > inactive；最终 persistent enable 被单独收口为 Phase 3，只在重新验证全部
 > gate 且获得独立 go-live 批准后执行一次 `management.activate`，正常路径不做
-> client mutation，也不自动 deactivate。
+> client mutation，也不自动 deactivate。Phase 3 工具已实现；production Phase 3
+> 尚未执行。
 
 基线锚点：
 

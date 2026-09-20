@@ -123,7 +123,7 @@ M3-B v1 只有这一条回滚路径：preflight 已证明 helper capability 在�
 - Phase 1 已实现为 production preflight + deploy-disabled，终态 inactive。
 - Phase 2 已实现为一次 production canary：activate → list → add/delete →
   deactivate，并恢复 exact inventory，终态 inactive。
-- Phase 3 是最终 persistent go-live：独立 preflight 后再次硬停止，只有收到
+- Phase 3 已实现但尚未在生产执行；它是最终 persistent go-live：独立 preflight 后再次硬停止，只有收到
   `enable --approve-go-live` 的明确批准才执行一次 `management.activate`，成功后
   保持 active。正常路径不 add/delete client，不 reload/restart sing-box。
 
