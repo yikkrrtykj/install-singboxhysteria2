@@ -2,6 +2,14 @@
 
 状态：**设计稿 rev5（已吸收独立 review 修正 #1–#8 及 PR #18 独立 source review follow-up 修正 F-1..F-3；全部代码事实重新锚定于冻结基线 `3ee9a162`；G5 FINAL DESIGN APPROVED；本轮零实现）**
 
+> **Implementation / rollout clarification（后续状态，不改写 rev5 核心设计）：**
+> rev5 的特权平面与六操作 RPC 已实现。原 M3 `status → activate → list →
+> add/delete → deactivate` 被收口为 Phase 2 production canary，成功后回到
+> inactive；最终 persistent enable 被单独收口为 Phase 3，只在重新验证全部
+> gate 且获得独立 go-live 批准后执行一次 `management.activate`，正常路径不做
+> client mutation，也不自动 deactivate。Phase 3 工具已实现；production Phase 3
+> 尚未执行。
+
 基线锚点：
 
 | 项 | 值 |

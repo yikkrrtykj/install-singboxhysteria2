@@ -1,11 +1,11 @@
 # E3 M3 — 部署上线 Runbook（deploy-disabled 阶段：M3-A / M3-B）
 
 ```text
-状态       : M3-A / M3-B 工具与测试已交付；M3-C（真实激活）明确禁止，等待单独批准
+状态       : M3-A / M3-B 已交付；M3-C 按三个独立生产阶段推进
 适用范围   : 生产 VPS 上的 E3 部署准备 —— 本文档与脚本本身不执行任何部署
-红线       : 不 SSH 生产 VPS；不 management.activate；不 add/delete 生产 client；
-             不 reload/restart 生产 sing-box；不写 activation marker
-基线       : main = 6bed1bd（M2 已合并，M2 COMPLETE）
+阶段       : Phase 1 = production deploy-disabled；Phase 2 = one production canary，结束 inactive；
+             Phase 3 = final persistent go-live enablement（独立 preflight 与批准边界）
+历史基线   : M3-A/B main = 6bed1bd；后续阶段使用各自 reviewed merge SHA
 ```
 
 ## M3-A — 部署前 preflight（`monitor-v2/deploy/e3-preflight.sh`）
@@ -118,12 +118,18 @@ M3-B v1 只有这一条回滚路径：preflight 已证明 helper capability 在�
 状态”的分支。baseline 的 monitor rollback target 取自 live symlink 的 exact
 `release_id`，不从 history 或其它来源推断。
 
-## M3-C — 明确禁止（本阶段不执行）
+## M3-C — 分阶段生产 rollout
 
-SSH 到生产 VPS 执行部署、`management.activate`、add/delete 生产 client、
-reload/restart 生产 sing-box、写 activation marker。
-**第一次真实生产 `management.activate` 必须单独停下等待明确批准**
-（激活属 M3-C，需 G1–G6 全绿 + canary 批准）。
+- Phase 1 已实现为 production preflight + deploy-disabled，终态 inactive。
+- Phase 2 已实现为一次 production canary：activate → list → add/delete →
+  deactivate，并恢复 exact inventory，终态 inactive。
+- Phase 3 已实现但尚未在生产执行；它是最终 persistent go-live：独立 preflight 后再次硬停止，只有收到
+  `enable --approve-go-live` 的明确批准才执行一次 `management.activate`，成功后
+  保持 active。正常路径不 add/delete client，不 reload/restart sing-box。
+
+各阶段必须使用自身 reviewed/merged HEAD、证据链、锁和 runbook；任何阶段 PASS
+都不会自动串联下一阶段。Phase 3 正式清单见
+`docs/e3-m3c-phase3-production-runbook.md`。
 
 ## 测试
 
