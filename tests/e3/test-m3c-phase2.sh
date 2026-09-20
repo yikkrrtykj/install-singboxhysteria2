@@ -220,7 +220,7 @@ assert_eq "$CONFIG_BEFORE" "$(sha256sum "$FIX/config.json" | awk '{print $1}')" 
 assert_eq "$P1_BEFORE" "$(sha256sum "$FIX/phase1/baseline.json" "$FIX/phase1/journal.json")" 'Phase 1 production evidence remains untouched'
 assert_eq canary_complete "$(jq -r '.final_status' "$FIX/phase2/journal.json")" 'journal records terminal canary completion'
 assert_eq true "$(jq -r '.activation.completed and .add.completed and .delete.completed and .deactivation.completed' "$FIX/phase2/journal.json")" 'journal records every completed canary stage'
-if rg -q 'uuid|password|credential' "$FIX/phase2" "$FIX/canary.out"; then fail 'Phase 2 evidence contains credential-shaped data'; else pass 'Phase 2 evidence and output contain no credentials'; fi
+if grep -ERq 'uuid|password|credential' "$FIX/phase2" "$FIX/canary.out"; then fail 'Phase 2 evidence contains credential-shaped data'; else pass 'Phase 2 evidence and output contain no credentials'; fi
 assert_absent "$FIX/forbidden-systemctl" 'orchestrator never directly reloads or restarts sing-box'
 
 # Phase 1/source/pre-activation refusals.
@@ -339,10 +339,10 @@ if /usr/bin/bash "$ORCH" recover >"$FIX/recover.out" 2>&1; then fail 'source-mis
 assert_eq "$RPC_BEFORE" "$(wc -l <"$FIX/rpc-calls" | tr -d ' ')" 'source-mismatched recovery performs no cleanup RPC'
 
 # Static safety contracts supplement the live state-machine fixture.
-if rg -q -e 'rm[[:space:]].*MARKER|rm[[:space:]].*management\.active' "$ORCH"; then fail 'orchestrator must not manually remove the marker'; else pass 'orchestrator contains no direct marker removal'; fi
-if rg -q -e '(>|mv|cp)[[:space:]].*\$CONFIG' "$ORCH"; then fail 'orchestrator must not write the live config'; else pass 'orchestrator contains no direct config write'; fi
-if rg -q -e 'systemctl.*(reload|restart).*sing-box|\$SYSTEMCTL.*(reload|restart)' "$ORCH"; then fail 'orchestrator must not reload/restart sing-box'; else pass 'orchestrator contains no manual sing-box reload/restart'; fi
-if rg -q 'socket\.|AF_UNIX|SOCK_STREAM|sendall' "$BRIDGE"; then fail 'Phase 2 adapter must not reimplement RPC transport'; else pass 'Phase 2 adapter delegates transport to E3RpcClient'; fi
+if grep -Eq 'rm[[:space:]].*MARKER|rm[[:space:]].*management\.active' "$ORCH"; then fail 'orchestrator must not manually remove the marker'; else pass 'orchestrator contains no direct marker removal'; fi
+if grep -Eq '(>|mv|cp)[[:space:]].*\$CONFIG' "$ORCH"; then fail 'orchestrator must not write the live config'; else pass 'orchestrator contains no direct config write'; fi
+if grep -Eq 'systemctl.*(reload|restart).*sing-box|\$SYSTEMCTL.*(reload|restart)' "$ORCH"; then fail 'orchestrator must not reload/restart sing-box'; else pass 'orchestrator contains no manual sing-box reload/restart'; fi
+if grep -Eq 'socket\.|AF_UNIX|SOCK_STREAM|sendall' "$BRIDGE"; then fail 'Phase 2 adapter must not reimplement RPC transport'; else pass 'Phase 2 adapter delegates transport to E3RpcClient'; fi
 assert_contains "$BRIDGE" 'from web.e3rpc import E3RpcClient' 'Phase 2 adapter imports the reviewed RPC client'
 assert_contains "$ORCH" 'canary --approve-activation' 'command surface exposes an explicit activation approval flag'
 

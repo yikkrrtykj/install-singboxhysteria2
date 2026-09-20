@@ -179,27 +179,31 @@ sanitize_result() {
 }
 
 journal_write() {
-    jq -n \
+    if ! jq -n \
       --arg source "$SOURCE_HEAD" --arg phase "$PHASE" --arg baseline "$BASELINE" \
       --arg name "$CANARY_NAME" --arg add_key "$ADD_KEY" --arg delete_key "$DELETE_KEY" \
       --arg final "$FINAL_STATUS" --arg updated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
       --argjson created "$CREATED_EPOCH" \
-      --argjson as "$ACTIVATION_STARTED" --argjson ac "$ACTIVATION_COMPLETED" \
-      --argjson ads "$ADD_STARTED" --argjson adc "$ADD_COMPLETED" \
-      --argjson ds "$DELETE_STARTED" --argjson dc "$DELETE_COMPLETED" \
-      --argjson des "$DEACTIVATION_STARTED" --argjson dec "$DEACTIVATION_COMPLETED" \
-      --argjson ar "$ACTIVATION_RESULT" --argjson adr "$ADD_RESULT" \
-      --argjson dr "$DELETE_RESULT" --argjson der "$DEACTIVATION_RESULT" \
-      --argjson fm "$FINAL_MEASUREMENTS" '
+      --argjson activation_started "$ACTIVATION_STARTED" \
+      --argjson activation_completed "$ACTIVATION_COMPLETED" \
+      --argjson add_started "$ADD_STARTED" --argjson add_completed "$ADD_COMPLETED" \
+      --argjson delete_started "$DELETE_STARTED" --argjson delete_completed "$DELETE_COMPLETED" \
+      --argjson deactivation_started "$DEACTIVATION_STARTED" \
+      --argjson deactivation_completed "$DEACTIVATION_COMPLETED" \
+      --argjson activation_result "$ACTIVATION_RESULT" --argjson add_result "$ADD_RESULT" \
+      --argjson delete_result "$DELETE_RESULT" --argjson deactivation_result "$DEACTIVATION_RESULT" \
+      --argjson final_measurements "$FINAL_MEASUREMENTS" '
       {schema:1,source_head:$source,phase:$phase,baseline_path:$baseline,
        preflight_created_epoch:$created,
        canary:{name:$name,add_idempotency_key:$add_key,delete_idempotency_key:$delete_key},
-       activation:{started:$as,completed:$ac,result:$ar},
-       add:{started:$ads,completed:$adc,result:$adr},
-       delete:{started:$ds,completed:$dc,result:$dr},
-       deactivation:{started:$des,completed:$dec,result:$der},
-       final_measurements:$fm,final_status:$final,updated_at:$updated}' \
-      | atomic_json_write "$JOURNAL"
+       activation:{started:$activation_started,completed:$activation_completed,result:$activation_result},
+       add:{started:$add_started,completed:$add_completed,result:$add_result},
+       delete:{started:$delete_started,completed:$delete_completed,result:$delete_result},
+       deactivation:{started:$deactivation_started,completed:$deactivation_completed,result:$deactivation_result},
+       final_measurements:$final_measurements,final_status:$final,updated_at:$updated}' \
+      | atomic_json_write "$JOURNAL"; then
+        die "cannot serialize the Phase 2 journal"
+    fi
 }
 
 journal_load() {
@@ -492,7 +496,7 @@ cmd_preflight() {
     ! canary_present_in "$list_json" || die "generated canary name already exists"
     CREATED_EPOCH="$(now_epoch)"
     p1_source="$(jq -er '.source_head' "$PHASE1_JOURNAL")"
-    jq -n --arg source "$SOURCE_HEAD" --argjson created "$CREATED_EPOCH" \
+    if ! jq -n --arg source "$SOURCE_HEAD" --argjson created "$CREATED_EPOCH" \
       --arg p1_source "$p1_source" --arg p1_baseline "$PHASE1_BASELINE" --arg p1_journal "$PHASE1_JOURNAL" \
       --arg sha "$BASE_CONFIG_SHA" --argjson size "$BASE_CONFIG_SIZE" \
       --arg sem "$BASE_CONFIG_SEMANTIC_SHA" --arg ts "$BASE_SING_TS" \
@@ -503,7 +507,9 @@ cmd_preflight() {
        config:{sha256:$sha,size:$size,semantic_sha256:$sem},
        singbox:{active:"active",active_enter_timestamp:$ts,nrestarts:$nr},
        inventory:{sha256:$inv,count:$count},management_state:"inactive"}' \
-      | atomic_json_write "$BASELINE"
+      | atomic_json_write "$BASELINE"; then
+        die "cannot serialize the Phase 2 baseline"
+    fi
     PHASE=preflight_complete; FINAL_STATUS=ready_for_separate_canary_approval
     journal_write
     printf 'PHASE2 PREFLIGHT=PASS\n'
