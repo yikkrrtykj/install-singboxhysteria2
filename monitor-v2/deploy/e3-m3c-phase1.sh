@@ -8,6 +8,7 @@ set -uo pipefail
 
 readonly FROZEN_PAYLOAD_BASE="f0e1480e1527ffb5906e715dd3acff8b29b8c024"
 readonly SAFE_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+readonly PRIMITIVE_BASH="/usr/bin/bash"
 if [ "${E3_PHASE1_TEST_MODE:-0}" != "1" ]; then
     PATH="$SAFE_PATH"
     export PATH
@@ -139,24 +140,61 @@ acquire_phase1_lock() {
     "$FLOCK_BIN" -n 8 || die "another Phase 1 command holds the exclusive lock"
 }
 
-# Every reviewed primitive runs with an empty environment.  Test fixtures get
-# only the explicitly gated E3_PHASE1_TEST_* paths they require; production
-# receives no E3/SBMON/SBXCM override from the operator's shell.
+# Every reviewed shell primitive runs through the fixed Bash interpreter with
+# an empty environment.  The only accepted process-local assignment is the
+# reviewed no-prune value for install-monitor.  Test fixtures get only the
+# explicitly gated E3_PHASE1_TEST_* paths they require; production receives no
+# E3/SBMON/SBXCM override from the operator's shell.
 run_primitive() {
+    local keep_assignment="" primitive
+    if [ "${1:-}" = "SBMON_KEEP_RELEASES=$PHASE1_NO_PRUNE_KEEP" ]; then
+        keep_assignment="$1"
+        shift
+    fi
+    [ "$#" -ge 1 ] || die "reviewed primitive path is missing"
+    primitive="$1"
+    shift
+    case "$primitive" in
+        "$PREFLIGHT"|"$INSTALL_MONITOR"|"$INSTALL_SBXCM"|"$DEPLOY_VERIFY"|"$FULL_ROLLBACK") ;;
+        *) die "refusing unreviewed primitive path: $primitive" ;;
+    esac
+    if [ -n "$keep_assignment" ] && [ "$primitive" != "$INSTALL_MONITOR" ]; then
+        die "SBMON_KEEP_RELEASES is only valid for install-monitor"
+    fi
     if [ "$TEST_MODE" = "1" ]; then
-        env -i \
-            PATH="$PRIMITIVE_PATH" HOME="$STATE_DIR" LC_ALL=C \
-            FX="$TEST_FIXTURE_ROOT" ROOT="$REPO_ROOT" \
-            E3_PHASE1_TEST_CONFIG="$CONFIG" \
-            E3_PHASE1_TEST_MONITOR_APP="$MONITOR_APP" \
-            E3_PHASE1_TEST_RELEASES_DIR="$RELEASES_DIR" \
-            E3_PHASE1_TEST_SBXCM_STATE="$SBXCM_STATE" \
-            E3_PHASE1_TEST_SBXCM_LIBEXEC="$SBXCM_LIBEXEC" \
-            E3_PHASE1_TEST_UNIT_DIR="$UNIT_DIR" \
-            E3_PHASE1_TEST_SOCKET="$SOCKET_PATH" \
-            "$@"
+        if [ -n "$keep_assignment" ]; then
+            env -i \
+                PATH="$PRIMITIVE_PATH" HOME="$STATE_DIR" LC_ALL=C \
+                FX="$TEST_FIXTURE_ROOT" ROOT="$REPO_ROOT" \
+                E3_PHASE1_TEST_CONFIG="$CONFIG" \
+                E3_PHASE1_TEST_MONITOR_APP="$MONITOR_APP" \
+                E3_PHASE1_TEST_RELEASES_DIR="$RELEASES_DIR" \
+                E3_PHASE1_TEST_SBXCM_STATE="$SBXCM_STATE" \
+                E3_PHASE1_TEST_SBXCM_LIBEXEC="$SBXCM_LIBEXEC" \
+                E3_PHASE1_TEST_UNIT_DIR="$UNIT_DIR" \
+                E3_PHASE1_TEST_SOCKET="$SOCKET_PATH" \
+                "$keep_assignment" "$PRIMITIVE_BASH" "$primitive" "$@"
+        else
+            env -i \
+                PATH="$PRIMITIVE_PATH" HOME="$STATE_DIR" LC_ALL=C \
+                FX="$TEST_FIXTURE_ROOT" ROOT="$REPO_ROOT" \
+                E3_PHASE1_TEST_CONFIG="$CONFIG" \
+                E3_PHASE1_TEST_MONITOR_APP="$MONITOR_APP" \
+                E3_PHASE1_TEST_RELEASES_DIR="$RELEASES_DIR" \
+                E3_PHASE1_TEST_SBXCM_STATE="$SBXCM_STATE" \
+                E3_PHASE1_TEST_SBXCM_LIBEXEC="$SBXCM_LIBEXEC" \
+                E3_PHASE1_TEST_UNIT_DIR="$UNIT_DIR" \
+                E3_PHASE1_TEST_SOCKET="$SOCKET_PATH" \
+                "$PRIMITIVE_BASH" "$primitive" "$@"
+        fi
     else
-        env -i PATH="$SAFE_PATH" HOME=/root USER=root LOGNAME=root LC_ALL=C "$@"
+        if [ -n "$keep_assignment" ]; then
+            env -i PATH="$SAFE_PATH" HOME=/root USER=root LOGNAME=root LC_ALL=C \
+                "$keep_assignment" "$PRIMITIVE_BASH" "$primitive" "$@"
+        else
+            env -i PATH="$SAFE_PATH" HOME=/root USER=root LOGNAME=root LC_ALL=C \
+                "$PRIMITIVE_BASH" "$primitive" "$@"
+        fi
     fi
 }
 
@@ -231,6 +269,7 @@ journal_load() {
 source_identity_gate() {
     local approved dirty
     approved="${E3_PHASE1_APPROVED_HEAD:-}"
+    [ -x "$PRIMITIVE_BASH" ] || die "fixed primitive interpreter is unavailable: $PRIMITIVE_BASH"
     if [ "$TEST_MODE" = "1" ]; then
         SOURCE_HEAD="$TEST_SOURCE_HEAD"
         [ -n "$approved" ] && [ "$SOURCE_HEAD" = "$approved" ] \
@@ -336,7 +375,10 @@ monitor_http_ok() {
 
 status_probe_json() {
     if [ "$TEST_MODE" = "1" ]; then
-        run_primitive "$STATUS_PROBE"
+        env -i \
+            PATH="$PRIMITIVE_PATH" HOME="$STATE_DIR" LC_ALL=C \
+            FX="$TEST_FIXTURE_ROOT" ROOT="$REPO_ROOT" \
+            "$PRIMITIVE_BASH" "$STATUS_PROBE"
         return
     fi
     env -i PATH="$SAFE_PATH" HOME=/root USER=root LOGNAME=root LC_ALL=C \
