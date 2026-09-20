@@ -31,6 +31,7 @@ if [ "$TEST_MODE" = 1 ]; then
     TEST_FIXTURE_ROOT="${E3_PHASE2_TEST_FIXTURE_ROOT:?test fixture root required}"
     TEST_SOURCE_HEAD="${E3_PHASE2_TEST_SOURCE_HEAD:?test source head required}"
     PHASE2_LOCK="${E3_PHASE2_TEST_LOCK:?test lock required}"
+    MONITOR_DEPLOY_LOCK="${E3_PHASE2_TEST_MONITOR_LOCK:?test monitor deploy lock required}"
     FLOCK_BIN="${E3_PHASE2_TEST_FLOCK:-/usr/bin/flock}"
     LOCK_BACKEND="${E3_PHASE2_TEST_LOCK_BACKEND:-flock}"
     CONFIG_LOCK="${E3_PHASE2_TEST_CONFIG_LOCK:?test config lock required}"
@@ -59,6 +60,7 @@ else
     TEST_FIXTURE_ROOT=""
     TEST_SOURCE_HEAD=""
     PHASE2_LOCK="/run/lock/e3-m3c-phase2.lock"
+    MONITOR_DEPLOY_LOCK="/run/lock/singbox-monitor-deploy.lock"
     FLOCK_BIN="/usr/bin/flock"
     LOCK_BACKEND="flock"
     CONFIG_LOCK="/root/sbox/config.lock"
@@ -97,6 +99,7 @@ BASE_ADD_KEY=""
 BASE_DELETE_KEY=""
 BASE_LIVE_MONITOR_TARGET=""
 BASE_LIVE_RPC_SHA=""
+RPC_APP_ROOT=""
 CANARY_NAME=""
 ADD_KEY=""
 DELETE_KEY=""
@@ -140,6 +143,31 @@ acquire_lock() {
     exec 8>>"$PHASE2_LOCK" || die "cannot open Phase 2 lock"
     chmod 0600 "$PHASE2_LOCK" || die "cannot protect Phase 2 lock"
     "$FLOCK_BIN" -n 8 || die "another Phase 2 command holds the exclusive lock"
+}
+
+acquire_monitor_deploy_lock() {
+    local parent
+    parent="$(dirname -- "$MONITOR_DEPLOY_LOCK")"
+    mkdir -p -- "$parent" || die "cannot create monitor deployment lock directory"
+    if [ "$TEST_MODE" = 1 ] && [ "$LOCK_BACKEND" = mkdir ]; then
+        mkdir -- "$MONITOR_DEPLOY_LOCK.fixture-held" 2>/dev/null \
+            || die "monitor deployment lock is held; refusing Phase 2 command"
+        trap 'rmdir -- "$PHASE2_LOCK.fixture-held" "$MONITOR_DEPLOY_LOCK.fixture-held" 2>/dev/null || true' EXIT
+        return 0
+    fi
+    [ "$LOCK_BACKEND" = flock ] || die "invalid monitor deployment lock backend"
+    [ -x "$FLOCK_BIN" ] || die "Phase 2 flock is unavailable"
+    umask 077
+    exec 7>>"$MONITOR_DEPLOY_LOCK" || die "cannot open canonical monitor deployment lock"
+    "$FLOCK_BIN" -n 7 || die "monitor deployment lock is held; refusing Phase 2 command"
+}
+
+acquire_command_locks() {
+    # Global order is fixed: Phase 2 lock first, canonical monitor deploy lock
+    # second. Monitor deployment takes only its own lock, so no reverse edge
+    # exists. Both locks remain held by their FDs until the command exits.
+    acquire_lock
+    acquire_monitor_deploy_lock
 }
 
 source_identity_gate() {
@@ -413,6 +441,7 @@ live_rpc_source_gate() { # optional expected target/hash
     fi
     CURRENT_LIVE_MONITOR_TARGET="$target"
     CURRENT_LIVE_RPC_SHA="$live_sha"
+    RPC_APP_ROOT="$target/app/monitor-v2"
 }
 
 rpc_call() { # op payload-json
@@ -423,11 +452,16 @@ rpc_call() { # op payload-json
     esac
     if [ "$TEST_MODE" = 1 ]; then
         printf '%s' "$payload" | env -i PATH="$RPC_PATH" HOME="$STATE_DIR" LC_ALL=C \
-          FX="$TEST_FIXTURE_ROOT" /usr/bin/bash "$RPC_FIXTURE" "$op"
+          FX="$TEST_FIXTURE_ROOT" RPC_APP_ROOT="$RPC_APP_ROOT" /usr/bin/bash "$RPC_FIXTURE" "$op"
     else
+        [ -n "$RPC_APP_ROOT" ] && [ -d "$RPC_APP_ROOT" ] &&
+        [ -r "$RPC_APP_ROOT/web/e3rpc.py" ] || {
+            printf 'ERROR: pinned reviewed RPC app root became unavailable\n' >&2
+            return 70
+        }
         env -i PATH="$SAFE_PATH" HOME=/root USER=root LOGNAME=root LC_ALL=C \
           /usr/bin/sudo -n -u sboxweb /usr/bin/python3 -B - \
-          "$op" "$MONITOR_APP/app/monitor-v2" "$payload" <"$RPC_BRIDGE"
+          "$op" "$RPC_APP_ROOT" "$payload" <"$RPC_BRIDGE"
     fi
 }
 
@@ -617,7 +651,13 @@ cleanup_attempt() { # returns 0 only when exact pre-canary state is restored
             DEACTIVATION_COMPLETED=true
             DEACTIVATION_RESULT="$(printf '%s' "$result" | sanitize_result)"
         else
-            cleanup_bad=1
+            printf 'CRITICAL: reviewed RPC deactivation unavailable; attempting sanctioned root recovery\n' >&2
+            if root_recovery_deactivate; then
+                DEACTIVATION_COMPLETED=true
+                DEACTIVATION_RESULT='{"ok":true,"code":"ROOT_RECOVERY_AFTER_RPC_FAILURE"}'
+            else
+                cleanup_bad=1
+            fi
         fi
     fi
     PHASE=cleanup_deactivation_finished
@@ -872,12 +912,12 @@ usage() {
 }
 
 case "${1:-}" in
-  preflight) [ "$#" -eq 1 ] || usage; acquire_lock; cmd_preflight ;;
+  preflight) [ "$#" -eq 1 ] || usage; acquire_command_locks; cmd_preflight ;;
   canary)
     [ "$#" -eq 2 ] && [ "${2:-}" = --approve-activation ] || usage
-    acquire_lock; cmd_canary
+    acquire_command_locks; cmd_canary
     ;;
-  recover) [ "$#" -eq 1 ] || usage; acquire_lock; cmd_recover ;;
+  recover) [ "$#" -eq 1 ] || usage; acquire_command_locks; cmd_recover ;;
   status) [ "$#" -eq 1 ] || usage; cmd_status ;;
   *) usage ;;
 esac

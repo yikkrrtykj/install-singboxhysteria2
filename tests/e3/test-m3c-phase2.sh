@@ -8,7 +8,7 @@ BRIDGE="$ROOT/monitor-v2/deploy/e3-m3c-phase2-rpc.py"
 TMP="$(mktemp -d)"
 PASS=0
 FAIL=0
-EXPECTED_TOTAL=166
+EXPECTED_TOTAL=181
 
 pass(){ PASS=$((PASS+1)); printf '  PASS %s\n' "$*"; }
 fail(){ FAIL=$((FAIL+1)); printf '  FAIL %s\n' "$*"; }
@@ -98,9 +98,15 @@ STUB
 set -u
 op="${1:-}"; payload="$(cat)"
 printf '%s\n' "$op" >>"$FX/rpc-calls"
+if [ -f "$RPC_APP_ROOT/release-id" ]; then cat "$RPC_APP_ROOT/release-id" >>"$FX/rpc-impls"; fi
+if [ -e "$FX/enforce-rpc-app-root" ] && [ ! -r "$RPC_APP_ROOT/web/e3rpc.py" ]; then exit 70; fi
 ok_tx='{"entered":true,"phase":"health","changed":true,"reload_performed":true,"health_verified":true,"rollback_attempted":false,"rollback_ok":null,"backup_path":null}'
 case "$op" in
   management.status)
+    if [ -e "$FX/block-status" ]; then
+      : >"$FX/status-entered"
+      while [ ! -e "$FX/release-status" ]; do sleep 0.05; done
+    fi
     state=inactive
     [ -e "$FX/helper/management.active" ] && state=active
     [ -e "$FX/force-status-active" ] && state=active
@@ -124,6 +130,7 @@ case "$op" in
       while [ ! -e "$FX/release-activate" ]; do sleep 0.05; done
     fi
     printf '%s\n' '{"v":1,"state":"active"}' >"$FX/helper/management.active"
+    if [ -e "$FX/remove-pinned-after-activate" ]; then rm -rf -- "$RPC_APP_ROOT"; fi
     printf '%s\n' '{"ok":true,"code":"OK","data":{"management_state":"active","no_op":false},"transaction":{"entered":false,"changed":false,"reload_performed":false,"health_verified":false}}'
     ;;
   client.add)
@@ -183,6 +190,7 @@ STUB
     export E3_PHASE2_TEST_SOURCE_HEAD=1111111111111111111111111111111111111111
     export E3_PHASE2_APPROVED_HEAD=1111111111111111111111111111111111111111
     export E3_PHASE2_TEST_LOCK="$FIX/run/phase2.lock"
+    export E3_PHASE2_TEST_MONITOR_LOCK="$FIX/run/singbox-monitor-deploy.lock"
     export E3_PHASE2_TEST_FLOCK="$TEST_FLOCK_BIN"
     export E3_PHASE2_TEST_LOCK_BACKEND="$TEST_LOCK_BACKEND"
     export E3_PHASE2_TEST_CONFIG_LOCK="$FIX/config.lock"
@@ -200,6 +208,13 @@ run_preflight(){ /usr/bin/bash "$ORCH" preflight >"$FIX/preflight.out" 2>&1; }
 run_canary(){ /usr/bin/bash "$ORCH" canary --approve-activation >"$FIX/canary.out" 2>&1; }
 client_count(){ jq -r '.clients|length' "$FIX/config.json"; }
 has_client(){ jq -e --arg n "$1" '.clients|index($n)!=null' "$FIX/config.json" >/dev/null 2>&1; }
+try_monitor_deploy_lock(){
+    if [ "$TEST_LOCK_BACKEND" = flock ]; then
+        ( exec 6>>"$E3_PHASE2_TEST_MONITOR_LOCK" && "$TEST_FLOCK_BIN" -n 6 ) >/dev/null 2>&1
+    else
+        mkdir "$E3_PHASE2_TEST_MONITOR_LOCK.fixture-held" 2>/dev/null
+    fi
+}
 
 printf '===== E3 M3-C PHASE 2 ORCHESTRATOR =====\n'
 ORIGINAL_PATH="$PATH"
@@ -480,6 +495,73 @@ assert_eq "$JOURNAL_SHA" "$(sha256sum "$FIX/phase2/journal.json" | awk '{print $
 wait "$FIRST_PID"; FIRST_RC=$?
 if [ "$FIRST_RC" -eq 0 ]; then pass 'first canary completes after lock contention'; else fail 'first canary failed after lock contention'; fi
 
+# Lock order and pinned-root race: Phase 2 holds its own lock first and the
+# canonical monitor deployment lock second. A conforming deployment cannot
+# flip the release symlink; even a forced out-of-contract flip cannot make an
+# in-flight command import release B because every RPC uses the pinned A root.
+setup_fixture monitor_release_race
+if [ "$(uname -s)" = Linux ]; then
+    mv "$FIX/monitor" "$FIX/release-a"
+    cp -r "$FIX/release-a" "$FIX/release-b"
+    printf 'A\n' >"$FIX/release-a/app/monitor-v2/release-id"
+    printf 'B\n' >"$FIX/release-b/app/monitor-v2/release-id"
+    ln -s "$FIX/release-a" "$FIX/monitor"
+    run_preflight || fail 'monitor-race preflight unexpectedly failed'
+    : >"$FIX/block-activate"; : >"$FIX/rpc-impls"
+    /usr/bin/bash "$ORCH" canary --approve-activation >"$FIX/race.out" 2>&1 &
+    RACE_PID=$!
+    for _ in $(seq 1 200); do [ -e "$FIX/activate-entered" ] && break; sleep 0.05; done
+    if try_monitor_deploy_lock; then
+        : >"$FIX/deploy-lock-acquired"
+        [ "$TEST_LOCK_BACKEND" != mkdir ] || rmdir "$E3_PHASE2_TEST_MONITOR_LOCK.fixture-held" 2>/dev/null || true
+    fi
+    assert_absent "$FIX/deploy-lock-acquired" 'competing monitor deployment cannot acquire its canonical lock during canary'
+    assert_eq "$FIX/release-a" "$(readlink -f "$FIX/monitor")" 'blocked canonical deployment cannot flip the live release symlink'
+    rm "$FIX/monitor"; ln -s "$FIX/release-b" "$FIX/monitor"
+    : >"$FIX/release-activate"
+    wait "$RACE_PID"; RACE_RC=$?
+    if [ "$RACE_RC" -eq 0 ]; then pass 'canary survives an out-of-contract symlink flip through its pinned root'; else fail 'pinned-root canary failed after symlink flip'; fi
+    assert_eq A "$(sort -u "$FIX/rpc-impls")" 'all in-flight RPCs execute only verified release A'
+    if grep -qxF B "$FIX/rpc-impls"; then fail 'unreviewed release B executed'; else pass 'unreviewed release B never executes'; fi
+else
+    pass 'competing monitor deployment cannot acquire its canonical lock during canary (Linux CI)'
+    pass 'blocked canonical deployment cannot flip the live release symlink (Linux CI)'
+    pass 'canary survives an out-of-contract symlink flip through its pinned root (Linux CI)'
+    pass 'all in-flight RPCs execute only verified release A (Linux CI)'
+    pass 'unreviewed release B never executes (Linux CI)'
+fi
+
+# Recovery holds the same monitor deployment lock for its complete cleanup.
+setup_fixture monitor_lock_recovery
+run_preflight || fail 'monitor-lock recovery preflight unexpectedly failed'
+export E3_PHASE2_TEST_CRASH_AFTER=activation_complete
+run_canary >/dev/null 2>&1 || true
+unset E3_PHASE2_TEST_CRASH_AFTER
+: >"$FIX/block-status"
+/usr/bin/bash "$ORCH" recover >"$FIX/recover-lock.out" 2>&1 &
+RECOVER_PID=$!
+for _ in $(seq 1 200); do [ -e "$FIX/status-entered" ] && break; sleep 0.05; done
+assert_file "$FIX/status-entered" 'recovery reaches cleanup while holding both command locks'
+if try_monitor_deploy_lock; then
+    : >"$FIX/deploy-lock-acquired"
+    [ "$TEST_LOCK_BACKEND" != mkdir ] || rmdir "$E3_PHASE2_TEST_MONITOR_LOCK.fixture-held" 2>/dev/null || true
+fi
+assert_absent "$FIX/deploy-lock-acquired" 'competing monitor deployment cannot acquire its canonical lock during recovery'
+: >"$FIX/release-status"
+wait "$RECOVER_PID"; RECOVER_RC=$?
+if [ "$RECOVER_RC" -eq 0 ]; then pass 'recovery completes consistently after monitor-lock contention'; else fail 'recovery failed after monitor-lock contention'; fi
+
+# If the pinned reviewed app root disappears after activation despite the lock,
+# RPC cleanup is unavailable; the sanctioned root recovery still closes the
+# management marker and the attempt terminates fail-closed.
+setup_fixture pinned_root_loss
+run_preflight || fail 'pinned-root-loss preflight unexpectedly failed'
+: >"$FIX/enforce-rpc-app-root"; : >"$FIX/remove-pinned-after-activate"
+if run_canary; then fail 'loss of pinned RPC root after activation must not pass'; else pass 'loss of pinned RPC root fails the canary'; fi
+assert_file "$FIX/root-recovery-calls" 'pinned RPC root loss invokes sanctioned root deactivation'
+assert_absent "$FIX/helper/management.active" 'sanctioned root recovery closes management after pinned-root loss'
+if grep -qF 'PHASE2 CANARY=PASS' "$FIX/canary.out"; then fail 'pinned-root loss printed success'; else pass 'pinned-root loss never reports canary success'; fi
+
 # Recovery is pinned to the source that created the attempt.
 setup_fixture recover_source_mismatch
 run_preflight || fail 'recover-source preflight unexpectedly failed'
@@ -499,6 +581,9 @@ if grep -Eq 'systemctl.*(reload|restart).*sing-box|\$SYSTEMCTL.*(reload|restart)
 if grep -Eq 'socket\.|AF_UNIX|SOCK_STREAM|sendall' "$BRIDGE"; then fail 'Phase 2 adapter must not reimplement RPC transport'; else pass 'Phase 2 adapter delegates transport to E3RpcClient'; fi
 assert_contains "$BRIDGE" 'from web.e3rpc import E3RpcClient' 'Phase 2 adapter imports the reviewed RPC client'
 assert_contains "$ORCH" 'canary --approve-activation' 'command surface exposes an explicit activation approval flag'
+assert_contains "$ORCH" 'MONITOR_DEPLOY_LOCK="/run/lock/singbox-monitor-deploy.lock"' 'production uses the canonical monitor deployment lock path'
+assert_eq 'acquire_lock acquire_monitor_deploy_lock' "$(sed -n '/^acquire_command_locks()/,/^}/p' "$ORCH" | grep -E '^[[:space:]]+acquire(_monitor_deploy)?_lock$' | sed 's/^[[:space:]]*//' | paste -sd ' ' -)" 'fixed lock order is Phase 2 then monitor deployment'
+if grep -qF '"$MONITOR_APP/app/monitor-v2"' "$ORCH"; then fail 'production RPC still uses the mutable monitor symlink'; else pass 'production RPC uses only the pinned resolved app root'; fi
 
 # Execute the real adapter through stdin, matching the root-readable production
 # wrapper while the target user only needs access to the live monitor package.
