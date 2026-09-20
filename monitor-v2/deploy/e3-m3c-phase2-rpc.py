@@ -17,14 +17,13 @@ import sys
 OPS = {
     "management.status": frozenset(),
     "client.list": frozenset(),
-    "management.activate": frozenset({"actor"}),
-    "management.deactivate": frozenset({"actor"}),
+    "management.activate": frozenset(),
+    "management.deactivate": frozenset(),
     "client.add": frozenset({"name", "idempotency_key"}),
     "client.delete": frozenset({"name", "idempotency_key"}),
 }
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
 KEY_RE = re.compile(r"^[A-Za-z0-9._:-]{16,128}$")
-FP_RE = re.compile(r"^[0-9a-f]{16}$")
 
 
 def reject(message: str) -> int:
@@ -47,12 +46,6 @@ def main() -> int:
     if not isinstance(payload, dict) or frozenset(payload) != OPS[op]:
         return reject("payload_shape")
 
-    actor = payload.pop("actor", None)
-    if actor is not None:
-        if not isinstance(actor, dict) or frozenset(actor) != {"session_fp"}:
-            return reject("actor_shape")
-        if not isinstance(actor["session_fp"], str) or not FP_RE.fullmatch(actor["session_fp"]):
-            return reject("actor_fingerprint")
     if op in ("client.add", "client.delete"):
         if not isinstance(payload["name"], str) or not NAME_RE.fullmatch(payload["name"]):
             return reject("client_name")
@@ -64,7 +57,7 @@ def main() -> int:
     try:
         from web.e3rpc import E3RpcClient, RpcTransportError
 
-        result = E3RpcClient().call(op, payload=payload or None, actor=actor)
+        result = E3RpcClient().call(op, payload=payload or None)
     except RpcTransportError as exc:
         print(json.dumps({
             "ok": False,

@@ -8,7 +8,7 @@ BRIDGE="$ROOT/monitor-v2/deploy/e3-m3c-phase2-rpc.py"
 TMP="$(mktemp -d)"
 PASS=0
 FAIL=0
-EXPECTED_TOTAL=84
+EXPECTED_TOTAL=166
 
 pass(){ PASS=$((PASS+1)); printf '  PASS %s\n' "$*"; }
 fail(){ FAIL=$((FAIL+1)); printf '  FAIL %s\n' "$*"; }
@@ -33,7 +33,8 @@ setup_fixture(){
     local name="$1" sha size
     FIX="$TMP/$name"; export FX="$FIX"
     mkdir -p "$FIX/bin" "$FIX/phase1" "$FIX/helper/journal" "$FIX/helper/ledger" \
-      "$FIX/monitor/app/monitor-v2" "$FIX/run"
+      "$FIX/monitor/app/monitor-v2/web" "$FIX/run"
+    cp "$ROOT/monitor-v2/web/e3rpc.py" "$FIX/monitor/app/monitor-v2/web/e3rpc.py"
     jq -n '{inbounds:[],clients:["legacy"],service:{api:{listen:"127.0.0.1:9090"}}}' >"$FIX/config.json"
     sha="$(sha256sum "$FIX/config.json" | awk '{print $1}')"
     size="$(stat -c %s "$FIX/config.json")"
@@ -52,7 +53,7 @@ setup_fixture(){
       '{config_sha256:$sha,config_size:$size,
         singbox:{active:"active",active_enter_timestamp:$ts,nrestarts:$nr}}' \
       >"$FIX/phase1/baseline.json"
-    jq -n '{schema:1,phase:"complete",source_head:"phase1-production-head",
+    jq -n '{schema:1,phase:"complete",source_head:"0000000000000000000000000000000000000000",
       monitor_mutation:{started:true,completed:true},helper_install:{started:true,completed:true},
       socket_enable:{started:true,completed:true},verify_completed:true,
       final_status:"deploy_disabled_complete"}' >"$FIX/phase1/journal.json"
@@ -103,6 +104,7 @@ case "$op" in
     state=inactive
     [ -e "$FX/helper/management.active" ] && state=active
     [ -e "$FX/force-status-active" ] && state=active
+    [ -e "$FX/force-status-stale" ] && state=active_stale
     [ -e "$FX/force-status-inactive" ] && state=inactive
     degraded=false; reconcile=clean; acq=true
     [ -e "$FX/degraded" ] && degraded=true
@@ -137,10 +139,17 @@ case "$op" in
       '{ok:true,code:"OK",data:{name:$n},idempotency:{key_fp:"deadbeef",replayed:false,generation:1},transaction:$tx}'
     ;;
   client.delete)
-    name="$(printf '%s' "$payload" | jq -r '.name')"
-    if [ -e "$FX/delete-fail" ]; then printf '%s\n' '{"ok":false,"code":"E_TEST"}'; exit 0; fi
+    name="$(printf '%s' "$payload" | jq -r '.name')"; key="$(printf '%s' "$payload" | jq -r '.idempotency_key')"
     [ "$name" != legacy ] || { printf '%s\n' '{"ok":false,"code":"E_RESERVED_NAME"}'; exit 0; }
+    if ! jq -se --arg key "$key" 'any(.[]; .kind=="intent" and .key==$key)' "$FX/helper/ledger/cm-ledger.jsonl" >/dev/null 2>&1; then
+      jq -cn --arg key "$key" --arg name "$name" \
+        '{v:1,kind:"intent",key:$key,op:"client.delete",name:$name,state:"in_flight",old_cred_digest:("a"*64)}' \
+        >>"$FX/helper/ledger/cm-ledger.jsonl"
+    fi
+    if [ -e "$FX/delete-disconnect" ]; then rm -f "$FX/delete-disconnect"; exit 70; fi
+    if [ -e "$FX/delete-fail" ]; then printf '%s\n' '{"ok":false,"code":"E_TEST"}'; exit 0; fi
     jq --arg n "$name" '.clients |= map(select(. != $n))' "$FX/config.json" >"$FX/config.tmp" && mv "$FX/config.tmp" "$FX/config.json"
+    if [ -e "$FX/format-drift-on-delete" ]; then jq -c . "$FX/config.json" >"$FX/config.tmp" && mv "$FX/config.tmp" "$FX/config.json"; fi
     jq -cn --argjson tx "$ok_tx" \
       '{ok:true,code:"OK",data:{deleted:true,derived_cleanup:true},idempotency:{key_fp:"feedface",replayed:false,generation:1},transaction:$tx}'
     ;;
@@ -151,6 +160,13 @@ case "$op" in
     ;;
   *) exit 64 ;;
 esac
+STUB
+
+    make_stub "$FIX/bin/root-recover" <<'STUB'
+#!/usr/bin/env bash
+rm -f -- "$FX/helper/management.active"
+rm -f -- "$FX/force-status-stale"
+printf 'root-recovery\n' >>"$FX/root-recovery-calls"
 STUB
 
     export E3_PHASE2_TEST_MODE=1
@@ -174,7 +190,10 @@ STUB
     export E3_PHASE2_TEST_LEDGER="$FIX/helper/ledger/cm-ledger.jsonl"
     export E3_PHASE2_TEST_NOW=2000000000
     export E3_PHASE2_TEST_TOKEN=0123456789abcdef
-    unset E3_PHASE2_TEST_CRASH_AFTER
+    export E3_PHASE2_TEST_PHASE1_ANCESTOR=0000000000000000000000000000000000000000
+    export E3_PHASE2_TEST_ROOT_RECOVERY="$FIX/bin/root-recover"
+    export E3_PHASE2_TEST_EVIDENCE_BACKEND=fixture
+    unset E3_PHASE2_TEST_CRASH_AFTER E3_PHASE2_TEST_EVIDENCE_FAILURES
 }
 
 run_preflight(){ /usr/bin/bash "$ORCH" preflight >"$FIX/preflight.out" 2>&1; }
@@ -220,6 +239,7 @@ assert_eq "$CONFIG_BEFORE" "$(sha256sum "$FIX/config.json" | awk '{print $1}')" 
 assert_eq "$P1_BEFORE" "$(sha256sum "$FIX/phase1/baseline.json" "$FIX/phase1/journal.json")" 'Phase 1 production evidence remains untouched'
 assert_eq canary_complete "$(jq -r '.final_status' "$FIX/phase2/journal.json")" 'journal records terminal canary completion'
 assert_eq true "$(jq -r '.activation.completed and .add.completed and .delete.completed and .deactivation.completed' "$FIX/phase2/journal.json")" 'journal records every completed canary stage'
+assert_eq true "$(jq -r '(.source_head|test("^[0-9a-f]{40}$")) and (.created_epoch|type=="number") and (.canary.name|test("^m3c-")) and (.canary.add_idempotency_key|test("^m3c2-add-")) and (.canary.delete_idempotency_key|test("^m3c2-del-"))' "$FIX/phase2/baseline.json")" 'immutable baseline carries every recovery identifier'
 if grep -ERq 'uuid|password|credential' "$FIX/phase2" "$FIX/canary.out"; then fail 'Phase 2 evidence contains credential-shaped data'; else pass 'Phase 2 evidence and output contain no credentials'; fi
 assert_absent "$FIX/forbidden-systemctl" 'orchestrator never directly reloads or restarts sing-box'
 
@@ -228,6 +248,14 @@ setup_fixture phase1_incomplete
 jq '.verify_completed=false' "$FIX/phase1/journal.json" >"$FIX/p1.tmp" && mv "$FIX/p1.tmp" "$FIX/phase1/journal.json"
 if run_preflight; then fail 'incomplete Phase 1 must be refused'; else pass 'preflight refuses incomplete Phase 1 journal'; fi
 assert_absent "$FIX/phase2" 'incomplete Phase 1 creates no Phase 2 evidence'
+
+setup_fixture phase1_bad_mode
+chmod 0644 "$FIX/phase1/baseline.json"
+if [ "$(uname -s)" = Linux ]; then
+    if run_preflight; then fail 'world-readable Phase 1 evidence must be refused'; else pass 'Phase 1 evidence mode 0600 is enforced'; fi
+else
+    pass 'Phase 1 evidence mode 0600 is enforced on Linux CI'
+fi
 
 setup_fixture source_mismatch
 export E3_PHASE2_APPROVED_HEAD=2222222222222222222222222222222222222222
@@ -291,6 +319,128 @@ if grep -qF client.delete "$FIX/rpc-calls"; then fail 'unattributable client mus
 assert_eq manual_intervention "$(jq -r '.final_status' "$FIX/phase2/journal.json")" 'uncertain identity records manual intervention'
 if has_client legacy; then pass 'uncertain cleanup preserves unrelated clients'; else fail 'uncertain cleanup deleted legacy'; fi
 
+# Durable evidence barriers fail closed before activation.
+for injected in baseline:file_fsync baseline:rename baseline:dir_fsync \
+  preflight_complete:file_fsync preflight_complete:rename preflight_complete:dir_fsync; do
+    setup_fixture "durability_${injected/:/_}"
+    export E3_PHASE2_TEST_EVIDENCE_FAILURES="$injected"
+    if run_preflight; then fail "evidence $injected must fail preflight"; else pass "evidence $injected fails closed"; fi
+    if grep -qF management.activate "$FIX/rpc-calls"; then fail "evidence $injected reached activation"; else pass "evidence $injected performs no activation"; fi
+done
+
+# Every durable post-activation checkpoint failure enters cleanup.  Some stages
+# intentionally retain an unproven client generation, but deactivation is never
+# skipped and success is never reported.
+POST_ACTIVATION_CHECKPOINTS='activation_complete active_verified list_before_add add_started add_complete add_verified delete_started delete_complete delete_verified deactivation_started deactivation_complete canary_complete'
+for checkpoint in $POST_ACTIVATION_CHECKPOINTS; do
+    setup_fixture "evidence_$checkpoint"
+    run_preflight || fail "evidence $checkpoint preflight unexpectedly failed"
+    export E3_PHASE2_TEST_EVIDENCE_FAILURES="$checkpoint:file_fsync"
+    if run_canary; then fail "post-activation evidence failure $checkpoint must not pass"; else pass "post-activation evidence failure $checkpoint fails canary"; fi
+    assert_absent "$FIX/helper/management.active" "evidence failure $checkpoint still deactivates management"
+    if grep -qF management.deactivate "$FIX/rpc-calls"; then pass "evidence failure $checkpoint reaches cleanup deactivation"; else fail "evidence failure $checkpoint skipped cleanup deactivation"; fi
+done
+
+# Evidence failures inside cleanup are best-effort and cannot block mutation
+# cleanup.  A one-shot disconnect leaves a generation-bound DELETE intent, so
+# cleanup is allowed to retry that exact generation.
+setup_fixture cleanup_evidence_failures
+run_preflight || fail 'cleanup-evidence preflight unexpectedly failed'
+: >"$FIX/delete-disconnect"
+export E3_PHASE2_TEST_EVIDENCE_FAILURES='cleanup_started:write,cleanup_delete_started:write,cleanup_delete_finished:write,cleanup_deactivation_started:write,cleanup_deactivation_finished:write,cleanup_complete:write,cleanup_manual_intervention:write'
+if run_canary; then fail 'cleanup evidence failures must not report canary success'; else pass 'cleanup evidence failures fail closed'
+fi
+assert_absent "$FIX/helper/management.active" 'cleanup evidence failures do not block deactivation'
+if grep -qF client.delete "$FIX/rpc-calls" && grep -qF management.deactivate "$FIX/rpc-calls"; then pass 'cleanup evidence failures do not block attributable delete or deactivate'; else fail 'cleanup evidence failure blocked a required cleanup RPC'; fi
+assert_contains "$FIX/canary.out" 'evidence durability failed' 'cleanup evidence failure reports manual intervention'
+
+# Missing/corrupt mutable journals recover from immutable baseline identifiers,
+# refuse unproven deletion, and still close the management plane.
+for journal_case in missing corrupt; do
+    setup_fixture "journal_$journal_case"
+    run_preflight || fail "$journal_case-journal preflight unexpectedly failed"
+    export E3_PHASE2_TEST_CRASH_AFTER=add_complete
+    run_canary >/dev/null 2>&1 || true
+    unset E3_PHASE2_TEST_CRASH_AFTER
+    if [ "$journal_case" = missing ]; then rm -f "$FIX/phase2/journal.json"; else printf '{broken\n' >"$FIX/phase2/journal.json"; fi
+    : >"$FIX/rpc-calls"
+    if /usr/bin/bash "$ORCH" recover >"$FIX/recover.out" 2>&1; then fail "$journal_case journal with unproven client must require manual intervention"; else pass "$journal_case journal recovers fail-closed from immutable baseline"; fi
+    assert_absent "$FIX/helper/management.active" "$journal_case journal recovery still deactivates management"
+    if grep -qF client.delete "$FIX/rpc-calls"; then fail "$journal_case journal guessed a client generation"; else pass "$journal_case journal never guesses/deletes the client"; fi
+done
+
+# active_stale recovery uses only the sanctioned root recovery command.
+setup_fixture stale_root_recovery
+run_preflight || fail 'active-stale recovery preflight unexpectedly failed'
+export E3_PHASE2_TEST_CRASH_AFTER=activation_complete
+run_canary >/dev/null 2>&1 || true
+unset E3_PHASE2_TEST_CRASH_AFTER
+rm -f "$FIX/phase2/journal.json"; : >"$FIX/force-status-stale"; : >"$FIX/rpc-calls"
+if /usr/bin/bash "$ORCH" recover >"$FIX/recover.out" 2>&1; then pass 'active_stale recovery converges through sanctioned root path'; else fail 'active_stale root recovery failed'; fi
+assert_file "$FIX/root-recovery-calls" 'active_stale invokes the sanctioned root recovery command'
+if grep -qF management.deactivate "$FIX/rpc-calls"; then fail 'active_stale used forbidden RPC deactivation'; else pass 'active_stale does not use RPC deactivation'; fi
+assert_absent "$FIX/helper/management.active" 'active_stale root recovery removes the marker through the sanctioned engine'
+
+# An old ADD intent and a random name never prove object generation.  Replacing
+# the canary with a second generation of the same name must not trigger delete.
+setup_fixture second_generation
+run_preflight || fail 'second-generation preflight unexpectedly failed'
+export E3_PHASE2_TEST_CRASH_AFTER=add_complete
+run_canary >/dev/null 2>&1 || true
+unset E3_PHASE2_TEST_CRASH_AFTER
+jq '.clients |= map(select(. != "m3c-0123456789abcdef")) | .clients += ["m3c-0123456789abcdef"]' "$FIX/config.json" >"$FIX/replacement.tmp" && mv "$FIX/replacement.tmp" "$FIX/config.json"
+: >"$FIX/rpc-calls"
+if /usr/bin/bash "$ORCH" recover >"$FIX/recover.out" 2>&1; then fail 'second-generation same-name client must require manual intervention'; else pass 'second-generation same-name client fails closed'; fi
+if grep -qF client.delete "$FIX/rpc-calls"; then fail 'second-generation same-name client was deleted'; else pass 'second-generation same-name client is never deleted'; fi
+if has_client m3c-0123456789abcdef; then pass 'second-generation same-name client remains for manual review'; else fail 'second-generation same-name client disappeared'; fi
+assert_absent "$FIX/helper/management.active" 'second-generation conflict still deactivates management'
+
+# The live RPC implementation imported by the bridge is pinned to the reviewed
+# checkout and to the release target captured by preflight.
+setup_fixture live_rpc_drift
+run_preflight || fail 'live-RPC drift preflight unexpectedly failed'
+printf '\n# drift\n' >>"$FIX/monitor/app/monitor-v2/web/e3rpc.py"
+if run_canary; then fail 'live RPC drift must reject canary'; else pass 'live RPC drift is rejected before activation'; fi
+if grep -qF management.activate "$FIX/rpc-calls"; then fail 'live RPC drift reached activation'; else pass 'live RPC drift performs no activation'; fi
+
+setup_fixture live_rpc_recovery_drift
+run_preflight || fail 'live-RPC recovery-drift preflight unexpectedly failed'
+export E3_PHASE2_TEST_CRASH_AFTER=activation_complete
+run_canary >/dev/null 2>&1 || true
+unset E3_PHASE2_TEST_CRASH_AFTER
+printf '\n# recovery drift\n' >>"$FIX/monitor/app/monitor-v2/web/e3rpc.py"; : >"$FIX/rpc-calls"
+if /usr/bin/bash "$ORCH" recover >"$FIX/recover.out" 2>&1; then fail 'recovery with unreviewed live RPC must stop for manual intervention'; else pass 'recovery rejects unreviewed live RPC bytes'; fi
+assert_file "$FIX/root-recovery-calls" 'RPC source drift recovery still attempts sanctioned root deactivation'
+assert_absent "$FIX/helper/management.active" 'RPC source drift recovery closes the management marker through root recovery'
+assert_eq 0 "$(wc -l <"$FIX/rpc-calls" | tr -d ' ')" 'RPC source drift recovery executes no unreviewed RPC code'
+
+setup_fixture live_target_drift
+run_preflight || fail 'live-target drift preflight unexpectedly failed'
+if [ "$(uname -s)" = Linux ]; then
+    mv "$FIX/monitor" "$FIX/monitor-original"
+    mkdir -p "$FIX/monitor-new/app/monitor-v2/web"
+    cp "$ROOT/monitor-v2/web/e3rpc.py" "$FIX/monitor-new/app/monitor-v2/web/e3rpc.py"
+    ln -s "$FIX/monitor-new" "$FIX/monitor"
+    if run_canary; then fail 'live release target drift must reject canary'; else pass 'live release target drift is rejected even when RPC bytes match'; fi
+    if grep -qF management.activate "$FIX/rpc-calls"; then fail 'live release target drift reached activation'; else pass 'live release target drift performs no activation'; fi
+else
+    pass 'live release target drift is rejected even when RPC bytes match (Linux CI)'
+    pass 'live release target drift performs no activation (Linux CI)'
+fi
+
+setup_fixture phase1_bad_ancestor
+jq '.source_head="2222222222222222222222222222222222222222"' "$FIX/phase1/journal.json" >"$FIX/p1.tmp" && mv "$FIX/p1.tmp" "$FIX/phase1/journal.json" && chmod 0600 "$FIX/phase1/journal.json"
+if run_preflight; then fail 'non-ancestor Phase 1 source must be refused'; else pass 'Phase 1 source must be a valid approved ancestor'; fi
+
+# Raw JSON reserialization is allowed only when semantic config and exact
+# inventory equivalence both hold.
+setup_fixture semantic_equivalence
+run_preflight || fail 'semantic-equivalence preflight unexpectedly failed'
+RAW_BEFORE="$(sha256sum "$FIX/config.json" | awk '{print $1}')"; : >"$FIX/format-drift-on-delete"
+if run_canary; then pass 'semantic/inventory equivalence permits canonical reserialization'; else fail 'semantic equivalence canary failed'; fi
+if [ "$RAW_BEFORE" != "$(sha256sum "$FIX/config.json" | awk '{print $1}')" ]; then pass 'semantic equivalence test proves raw SHA may change'; else fail 'semantic equivalence fixture did not change raw SHA'; fi
+assert_eq "$(jq -r '.config.semantic_sha256' "$FIX/phase2/baseline.json")" "$(jq -cS . "$FIX/config.json" | sha256sum | awk '{print $1}')" 'semantic config digest remains equal after canonical reserialization'
+
 # Crash recovery is exercised after every durable post-activation boundary.
 CRASH_STAGES='activation_complete active_verified list_before_add add_started add_complete add_verified delete_started delete_complete delete_verified deactivation_started deactivation_complete'
 for stage in $CRASH_STAGES; do
@@ -300,11 +450,15 @@ for stage in $CRASH_STAGES; do
     run_canary; rc=$?
     unset E3_PHASE2_TEST_CRASH_AFTER
     if [ "$rc" -eq 99 ]; then pass "crash hook reached $stage"; else fail "crash hook $stage returned $rc"; fi
-    if /usr/bin/bash "$ORCH" recover >"$FIX/recover.out" 2>&1; then
-        pass "recover converges safely after $stage"
-    else
-        fail "recover failed after $stage"
-    fi
+    if /usr/bin/bash "$ORCH" recover >"$FIX/recover.out" 2>&1; then rc=0; else rc=$?; fi
+    case "$stage" in
+      add_complete|add_verified|delete_started)
+        if [ "$rc" -ne 0 ]; then pass "recover fails closed after $stage without generation-bound delete proof"; else fail "recover guessed identity after $stage"; fi
+        ;;
+      *)
+        if [ "$rc" -eq 0 ]; then pass "recover converges safely after $stage"; else fail "recover failed after $stage"; fi
+        ;;
+    esac
     [ ! -e "$FIX/helper/management.active" ] || fail "marker remained after $stage recovery"
     if ! has_client legacy; then fail "legacy disappeared after $stage recovery"; fi
 done
@@ -363,6 +517,9 @@ BRIDGE_OUT="$("$PYTHON_BIN" -B - client.add "$FAKE_APP" \
   '{"name":"m3c-0123456789abcdef","idempotency_key":"m3c2-add-0123456789abcdef"}' <"$BRIDGE")"
 assert_eq true "$(printf '%s' "$BRIDGE_OUT" | jq -r '.ok')" 'real adapter executes from root-fed Python stdin'
 assert_eq m3c-0123456789abcdef "$(printf '%s' "$BRIDGE_OUT" | jq -r '.payload.name')" 'real adapter preserves the schema-validated canary payload'
+ACTIVATE_OUT="$("$PYTHON_BIN" -B - management.activate "$FAKE_APP" '{}' <"$BRIDGE")"
+assert_eq null "$(printf '%s' "$ACTIVATE_OUT" | jq -r '.actor')" 'operator activation leaves audit actor null instead of fabricating session_fp'
+if grep -qF 'SOURCE_HEAD:0:16' "$ORCH" || grep -qF 'session_fp' "$BRIDGE"; then fail 'Phase 2 must not fabricate actor.session_fp'; else pass 'Phase 2 contains no fabricated actor.session_fp'; fi
 if "$PYTHON_BIN" -B - arbitrary.exec "$FAKE_APP" '{}' <"$BRIDGE" >/dev/null 2>&1; then fail 'adapter must reject arbitrary operations'; else pass 'real adapter rejects operations outside the six-op allowlist'; fi
 
 TOTAL=$((PASS+FAIL))

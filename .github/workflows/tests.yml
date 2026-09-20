@@ -162,6 +162,11 @@ jobs:
       - name: "E3 M3-C Phase 2 canary (approval boundary / fail-closed cleanup / recovery)"
         run: bash tests/e3/test-m3c-phase2.sh
 
+      - name: "E3 M3-C Phase 2 LIVE (real socket/service + E3RpcClient + canonical worker/library)"
+        run: |
+          bash -n tests/e3/test-m3c-phase2-live.sh
+          sudo -n env E3_PHASE2_REQUIRE_LIVE=1 bash tests/e3/test-m3c-phase2-live.sh
+
       - name: "systemd unit validation (sbox-cm socket + service candidate)"
         run: |
           set -o pipefail
