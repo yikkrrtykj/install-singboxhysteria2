@@ -10,7 +10,7 @@ ORCH="$ROOT/monitor-v2/deploy/e3-m3c-phase1.sh"
 TMP="$(mktemp -d)"
 PASS=0
 FAIL=0
-EXPECTED_TOTAL=65
+EXPECTED_TOTAL=66
 
 pass() { PASS=$((PASS + 1)); printf '  PASS %s\n' "$*"; }
 fail() { FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "$*"; }
@@ -28,11 +28,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
-make_stub() { # make_stub path; body comes from stdin
+make_stub() { # make_stub path [mode]; body comes from stdin
     local path="$1"
+    local mode="${2:-0755}"
     mkdir -p "$(dirname "$path")"
     cp /dev/stdin "$path"
-    chmod 0755 "$path"
+    chmod "$mode" "$path"
 }
 
 setup_fixture() {
@@ -132,7 +133,7 @@ STUB
 cat "$FX/http-code"
 STUB
 
-    make_stub "$FIX/bin/preflight" <<'STUB'
+    make_stub "$FIX/bin/preflight" 0644 <<'STUB'
 #!/usr/bin/env bash
 set -u
 env | sort >>"$FX/primitive-env.log"
@@ -156,7 +157,7 @@ mv "$tmp" "$out"
 printf 'E3_PREFLIGHT=PASS\n'
 STUB
 
-    make_stub "$FIX/bin/install-monitor" <<'STUB'
+    make_stub "$FIX/bin/install-monitor" 0644 <<'STUB'
 #!/usr/bin/env bash
 set -u
 env | sort >>"$FX/primitive-env.log"
@@ -202,7 +203,7 @@ case "${1:-}" in
 esac
 STUB
 
-    make_stub "$FIX/bin/install-helper" <<'STUB'
+    make_stub "$FIX/bin/install-helper" 0644 <<'STUB'
 #!/usr/bin/env bash
 set -u
 env | sort >>"$FX/primitive-env.log"
@@ -221,7 +222,7 @@ printf 'inactive\n' >"$FX/service-active"
 printf 'disabled\n' >"$FX/service-enabled"
 STUB
 
-    make_stub "$FIX/bin/verify" <<'STUB'
+    make_stub "$FIX/bin/verify" 0644 <<'STUB'
 #!/usr/bin/env bash
 set -u
 env | sort >>"$FX/primitive-env.log"
@@ -252,7 +253,7 @@ jq -n --arg state "$(cat "$FX/independent-status")" \
   '{ok:true,data:{management_state:$state}}'
 STUB
 
-    make_stub "$FIX/bin/full-rollback" <<'STUB'
+    make_stub "$FIX/bin/full-rollback" 0644 <<'STUB'
 #!/usr/bin/env bash
 set -u
 env | sort >>"$FX/primitive-env.log"
@@ -322,11 +323,20 @@ fi
 # socket-only activation ordering, final invariants, and exact terminal output.
 setup_fixture success
 BASE_LINK="$(readlink -f "$FIX/monitor")"
-"$FIX/bin/install-monitor" upgrade >"$FIX/plain-upgrade.out"
+/usr/bin/bash "$FIX/bin/install-monitor" upgrade >"$FIX/plain-upgrade.out"
 assert_eq "$BASE_LINK" "$(readlink -f "$FIX/monitor")" \
     'same-version ordinary upgrade is a true noop in the fixture'
 assert_contains "$FIX/plain-upgrade.out" 'action=noop' \
     'ordinary same-version upgrade reports action=noop'
+if [ "$(uname -s)" = "Linux" ]; then
+    PRIMITIVE_MODES="$(stat -c %a "$FIX/bin/preflight" "$FIX/bin/install-monitor" \
+        "$FIX/bin/install-helper" "$FIX/bin/verify" "$FIX/bin/full-rollback" \
+        | paste -sd ' ' -)"
+    assert_eq '644 644 644 644 644' "$PRIMITIVE_MODES" \
+        '0644 reviewed shell primitives execute only via fixed /usr/bin/bash'
+else
+    pass '0644 reviewed shell primitives execute only via fixed /usr/bin/bash (enforced on Linux CI)'
+fi
 : >"$FIX/primitive-env.log"
 : >"$FIX/concurrent-release"
 # Poison every known override family.  The orchestrator's clean environment
