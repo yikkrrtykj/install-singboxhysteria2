@@ -66,10 +66,12 @@ jobs:
           bash -n tests/test-monitor-v2-m2.sh
           bash -n tests/e3/test-m3-deploy.sh
           bash -n tests/e3/test-m3c-phase1.sh
+          bash -n tests/e3/test-m3c-phase2.sh
           bash -n monitor-v2/deploy/e3-preflight.sh
           bash -n monitor-v2/deploy/e3-deploy-verify.sh
           bash -n monitor-v2/deploy/e3-rollback.sh
           bash -n monitor-v2/deploy/e3-m3c-phase1.sh
+          bash -n monitor-v2/deploy/e3-m3c-phase2.sh
 
       - name: "Journal time compatibility regression suite (B6 finding: raw RFC3339 rejected by Ubuntu 22.04 journalctl)"
         run: bash tests/test-journal-time-compat.sh
@@ -156,6 +158,14 @@ jobs:
 
       - name: "E3 M3-C Phase 1 orchestrator (journal / gates / classified recovery)"
         run: bash tests/e3/test-m3c-phase1.sh
+
+      - name: "E3 M3-C Phase 2 canary (approval boundary / fail-closed cleanup / recovery)"
+        run: bash tests/e3/test-m3c-phase2.sh
+
+      - name: "E3 M3-C Phase 2 LIVE (real socket/service + E3RpcClient + canonical worker/library)"
+        run: |
+          bash -n tests/e3/test-m3c-phase2-live.sh
+          sudo -n env E3_PHASE2_REQUIRE_LIVE=1 bash tests/e3/test-m3c-phase2-live.sh
 
       - name: "systemd unit validation (sbox-cm socket + service candidate)"
         run: |
