@@ -238,8 +238,11 @@ without logging) may contain them in flight.
 ## 7. Layer 4 — Web API `POST /api/v1/clients/export`
 
 Gate order (identical spine to other mutations, server.py `_route_post`):
-whitelist/body-framing → session → CSRF → step-up (freezes actor) → FRESH
-management gate re-check → validated body → RPC.
+whitelist/body-framing → session → CSRF → step-up (freezes actor) →
+validated body shape (free, no RPC) → broker FRESH management gate
+enforced atomically before the only dispatch → RPC. The externally
+observable contract is unchanged: zero export RPCs unless the fresh gate
+holds at dispatch time.
 (`MUTATION_ROUTES` is for mutate-style ops; export gets its own route entry
 so `_handle_e3_export` runs the export broker path — no Idempotency-Key
 required or accepted: a body/header key is rejected with 400.)
