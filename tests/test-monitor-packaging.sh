@@ -281,7 +281,8 @@ cp "$REPO_ROOT/monitor-v2/webapp.py" "$FIX_SRC/"
 cp -R "$REPO_ROOT/monitor-v2/web" "$FIX_SRC/web"
 cp -R "$REPO_ROOT/monitor-v2/api_bridge" "$FIX_SRC/api_bridge"
 rm -rf "$FIX_SRC/api_bridge/__pycache__" "$FIX_SRC/web/__pycache__"
-printf '%s\n' "$(cat "$REPO_ROOT/monitor-v2/VERSION")" > "$FIX_SRC/VERSION"
+# Freeze the installed baseline independently of the candidate repo version.
+printf '0.1.0\n' > "$FIX_SRC/VERSION"
 
 section "static checks"
 if bash -n "$INSTALL_MONITOR" 2>"$TMP/syntax.err"; then pass "bash -n install-monitor.sh"; else fail "bash -n install-monitor.sh: $(cat "$TMP/syntax.err")"; fi
@@ -405,7 +406,7 @@ for d in auth access; do
 done
 assert_dir_mode "$FIX_STATE" 700 "data root mode 0700 (private, R1)"
 assert_dir_mode "$FIX_STATE/state" 700 "state dir mode 0700"
-assert_eq "$(cat "$REPO_ROOT/monitor-v2/VERSION")" "$(cat "$FIX_APP_LINK/VERSION")" "activated VERSION matches repo"
+assert_eq '0.1.0' "$(cat "$FIX_APP_LINK/VERSION")" "installed baseline VERSION is 0.1.0"
 [ -f "$FIX_APP_LINK/app/monitor-v2/collector.py" ] && pass "release stages collector.py under app/monitor-v2" || fail "collector.py not staged under app/monitor-v2"
 [ -f "$FIX_APP_LINK/app/monitor-v2/webapp.py" ] && pass "release stages webapp.py (real E2 entrypoint)" || fail "webapp.py not staged"
 [ -d "$FIX_APP_LINK/app/monitor-v2/api_bridge" ] && pass "release stages api_bridge" || fail "api_bridge not staged"
@@ -490,21 +491,26 @@ assert_eq "$SECRET_MTIME_1" "$(stat -c '%Y' "$FIX_CONF_DIR/api.secret")" "api.se
 
 # ---------------------------------------------------------------------------
 section "T03 upgrade (monitor only; sing-box untouched)"
-printf '0.2.0\n' > "$FIX_SRC/VERSION"
+BASE_RELEASE_T03="$(readlink -f "$FIX_APP_LINK")"
+BASE_HASH_T03="$(find "$BASE_RELEASE_T03" -type f -exec sha256sum {} + | sort | sha256sum | cut -d' ' -f1)"
+RESTARTS_T03="$(grep -c 'systemctl restart singbox-monitor' "$MOCK_CALL_LOG" || true)"
+cp "$REPO_ROOT/monitor-v2/VERSION" "$FIX_SRC/VERSION"
 OUT3="$TMP/out-t03.log"
-run_install "$OUT3"
+"$INSTALL_MONITOR" upgrade > "$OUT3" 2>&1
 assert_rc 0 $? "upgrade exits 0"
 assert_grep 'action=upgrade' "$OUT3" "reports action=upgrade"
-assert_eq '0.2.0' "$(cat "$FIX_APP_LINK/VERSION")" "activated VERSION bumped to 0.2.0"
-assert_grep 'systemctl restart singbox-monitor' "$MOCK_CALL_LOG" "restart recorded for monitor service"
+assert_eq "$(cat "$REPO_ROOT/monitor-v2/VERSION")" "$(cat "$FIX_APP_LINK/VERSION")" "normal upgrade activates repo VERSION (0.1.0 -> 0.1.1)"
+assert_eq "$((RESTARTS_T03 + 1))" "$(grep -c 'systemctl restart singbox-monitor' "$MOCK_CALL_LOG")" "normal upgrade restarts monitor exactly once"
 assert_no_grep 'sing-box' "$MOCK_CALL_LOG" "systemctl log has no sing-box operation at all"
 assert_grep 'auth-marker-must-survive' "$FIX_STATE/auth/probe" "legacy auth dir preserved across upgrade"
 assert_eq "$AUTH_JSON_HASH_1" "$(sha256sum "$FIX_STATE/auth.json" | cut -d' ' -f1)" "flat auth.json byte-identical across upgrade"
 assert_eq "$ACCESS_JSON_HASH_1" "$(sha256sum "$FIX_STATE/access.json" | cut -d' ' -f1)" "flat access.json byte-identical across upgrade"
-if [ -n "$(find "$FIX_RELEASES" -maxdepth 1 -type d -name '0.1.0-*' -print -quit)" ]; then
-    pass "previous release tree retained (rollback backup)"
+if [ "$(readlink -f "$FIX_APP_LINK")" != "$BASE_RELEASE_T03" ] \
+    && [ -d "$BASE_RELEASE_T03" ] \
+    && [ "$BASE_HASH_T03" = "$(find "$BASE_RELEASE_T03" -type f -exec sha256sum {} + | sort | sha256sum | cut -d' ' -f1)" ]; then
+    pass "new immutable release activated; previous 0.1.0 release retained byte-identical"
 else
-    fail "previous release tree was removed"
+    fail "upgrade reused or modified the previous release tree"
 fi
 assert_grep ' upgrade$' "$FIX_RELEASES/releases.history" "successful upgrade recorded in history (F1)"
 
@@ -603,7 +609,7 @@ printf '0.3.0\n' > "$FIX_SRC/VERSION"
 # ---------------------------------------------------------------------------
 section "F1 history hygiene: rollback never selects a failed candidate"
 # manual rollback after the failed 0.4.0/0.5.0 attempts: the only successful
-# releases in history are 0.1.0 / 0.2.0 / 0.3.0 -- the target must come from
+# releases in history are 0.1.0 / repo VERSION / 0.3.0 -- the target must come from
 # those, never from the failed candidates.
 OUT_F1="$TMP/out-f1.log"
 if ( "$INSTALL_MONITOR" rollback ) > "$OUT_F1" 2>&1; then
