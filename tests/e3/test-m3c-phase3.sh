@@ -5,7 +5,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ORCH="$ROOT/monitor-v2/deploy/e3-m3c-phase3.sh"
 TMP="$(mktemp -d)"
-PASS=0; FAIL=0; EXPECTED_TOTAL=89
+PASS=0; FAIL=0; EXPECTED_TOTAL=94
 pass(){ PASS=$((PASS+1)); printf '  PASS %s\n' "$*"; }
 fail(){ FAIL=$((FAIL+1)); printf '  FAIL %s\n' "$*"; }
 assert_eq(){ [ "$1" = "$2" ] && pass "$3" || fail "$3 (want=[$1] got=[$2])"; }
@@ -102,6 +102,22 @@ run_recover(){ /usr/bin/bash "$ORCH" recover >"$FIX/recover.out" 2>&1; }
 printf '===== E3 M3-C PHASE 3 ORCHESTRATOR =====\n'
 if TEST_FLOCK_BIN="$(command -v flock 2>/dev/null)" && [ -n "$TEST_FLOCK_BIN" ]; then TEST_LOCK_BACKEND=flock; else TEST_FLOCK_BIN=/usr/bin/flock; TEST_LOCK_BACKEND=mkdir; fi
 
+# Exercise the production sanitizer itself without running the command dispatcher.
+# The successful flow below separately checks the durable journal evidence.
+source <(sed -n '/^sanitize_result()/,/^$/p' "$ORCH")
+for field in no_op; do
+    for value in false true missing null; do
+        case "$value" in
+          missing) input='{"data":{}}'; expected=null; label='missing optional boolean sanitizes to null' ;;
+          true) input="$(jq -cn --arg field "$field" '{data:{($field):true}}')"; expected=true; label='true remains true' ;;
+          false) input="$(jq -cn --arg field "$field" '{data:{($field):false}}')"; expected=false; label='evidence preserves optional false booleans' ;;
+          null) input="$(jq -cn --arg field "$field" '{data:{($field):null}}')"; expected=null; label='explicit null remains null' ;;
+        esac
+        result="$(printf '%s' "$input" | sanitize_result)"
+        assert_eq true "$(printf '%s' "$result" | jq -r --arg field "$field" --argjson expected "$expected" '.data | has($field) and (.[$field] == $expected)')" "phase3 $label ($field)"
+    done
+done
+
 # Happy path and hard approval boundary.
 setup_fixture happy
 CFG_SHA="$(sha256sum "$FIX/config.json"|awk '{print $1}')"; CFG_SEM="$(jq -cS . "$FIX/config.json"|sha256sum|awk '{print $1}')"; CFG_SIZE="$(stat -c %s "$FIX/config.json")"
@@ -125,6 +141,7 @@ assert_eq 0 "$(grep -c '^client.add$\|^client.delete$' "$FIX/rpc-calls")" 'succe
 assert_eq 0 "$(grep -c '^management.deactivate$' "$FIX/rpc-calls")" 'success never deactivates'
 assert_file "$FIX/helper/management.active" 'success leaves marker present'
 assert_eq go_live_active "$(jq -r .final_status "$FIX/phase3/journal.json")" 'success journal is go_live_active'
+assert_eq false "$(jq -r '.activation.result.data.no_op' "$FIX/phase3/journal.json")" 'phase3 activation evidence preserves no_op=false'
 assert_eq true "$(jq -r '.activation.started and .activation.completed' "$FIX/phase3/journal.json")" 'activation checkpoints are complete'
 assert_contains "$FIX/enable.out" 'PHASE3 GO_LIVE=PASS' 'success prints go-live PASS'
 assert_contains "$FIX/enable.out" 'E3 MANAGEMENT ENABLED = YES' 'success prints enabled contract'

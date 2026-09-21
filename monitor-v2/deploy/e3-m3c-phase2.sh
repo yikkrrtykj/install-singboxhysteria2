@@ -239,12 +239,13 @@ atomic_json_write() { # path context; JSON on stdin
     return 0
 }
 
+# Direct field lookup preserves false/true; missing and explicit null remain null.
 sanitize_result() {
     jq -c '{ok:(.ok // false),code:(.code // null),stage:(.stage // null),
       data:(if (.data|type)=="object" then {
         management_state:(.data.management_state // null),
-        no_op:(.data.no_op // null),name:(.data.name // null),
-        deleted:(.data.deleted // null),derived_cleanup:(.data.derived_cleanup // null)
+        no_op:.data.no_op,name:(.data.name // null),
+        deleted:.data.deleted,derived_cleanup:.data.derived_cleanup
       } else null end),idempotency:(.idempotency // null),
       transaction:(.transaction // null),transport_error:(.transport_error // null),
       adapter_error:(.adapter_error // null)}' 2>/dev/null
