@@ -346,6 +346,45 @@ transport state : fresh（TTL 内成功获取）| stale（展示旧 snapshot，a
            可写；"成功"本身永远不直接使 UI 可写。定时器数值一律不动。
 ```
 
+### 7.7 convergence 端点：一次读原子收敛（0.1.4 修订）
+
+§7.6 的服务端失效保留原位；0.1.4 替换其"前端配套"段：两次独立 TTL 读仍会
+出现 status 已 fresh、list 仍旧（或反之）的半新鲜窗口，且竞态窗口横跨两个
+请求。收敛改为一次服务器往返。
+
+```text
+broker   : E3Broker.status(force=False)。force=True 仅绕过 TTL 快速路径与
+           attempt-throttle；single-flight、breaker 门（open 且冷却未到 ⇒
+           零分派，force 也不例外；冷却已过 ⇒ force 可执行 half-open 探针，
+           那是 breaker 自身转移，不是绕过）、0.1.3 epoch 规则（在途失效的
+           预失效响应照样不得发布）全部不变。每次 force 因 flight 锁串行化
+           而各自发出一次真实 RPC。list_clients(force) 自 0.1.0-M2 同构。
+端点     : GET /api/v1/clients/convergence——session-gated 只读（仅
+           _require_session；无 CSRF、无 step-up、无 Idempotency-Key；
+           POST → 405）。顺序：status(force=True) 先行，其后
+           list_clients(force=True)；任一 transport 非 fresh ⇒ 503
+           e3_unavailable（helper 语义 verdict 走既有错误表映射，如
+           E_LOCK→423，不伪装成 unavailable）；两半都 fresh 才 200，
+           payload 各自过 sanitize_e3_data（deny-by-default 白名单不变）。
+响应     : {"ok":true,"status":{...同 GET management/status 形状...},
+           "clients":{...同 GET /api/v1/clients 形状...}}——服务端把新鲜度
+           耦合进同一个 JSON 信封，浏览器看到的原子性有单一事实来源。
+前端     : 确认成功的 then 分支只调 convergeAfterMutation()（delete 路径
+           仍先 loadSession()，session 不覆盖可用性，既有测试钉住）。
+           原子性三层：① state.e3Status/e3StatusAt/e3Clients 一起写入后
+           才 renderE3Controls()（一次渲染 pass 同时移动徽章、控件、表格）；
+           ② supersedePlainReads() 在收敛开始与应用时各抬升一次
+           e3StatusGeneration/e3ClientsGeneration——watchdog 或任何在途
+           普通 status/list 读的旧响应一律作废（含收敛窗口内新发的读）；
+           ③ state.e3Convergence 身份令牌——重叠的收敛后发制前发。
+失败     : fail-closed——清 e3Status ⇒ 不可写；列表行保留但无操作按钮；
+           无 sleep、无重试循环、绝无假 Available；绝不写 #e3-msg，
+           "Client created./Client deleted." 存活。非全 fresh 的 200 信封
+           在前端同样按失败处理（纵深防御）。
+边界     : Monitor-only（web/server.py、web/e3_broker.py、static/app.js）；
+           helper/sbox-cm/sing-box 零改动；VERSION 0.1.3→0.1.4。
+```
+
 ---
 
 ## 8. 调用方等待预算与超时语义（冻结）

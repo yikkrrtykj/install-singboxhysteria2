@@ -42,7 +42,7 @@ from web.e3rpc import RpcTransportError
 from web.recovery import (RECOVERY_SUCCESS_MESSAGE, RecoveryGlobalGuard,
                           RecoveryRateLimiter, generate_key)
 
-MONITOR_WEB_VERSION = "0.1.3"
+MONITOR_WEB_VERSION = "0.1.4"
 SESSION_COOKIE = "monitor_session"
 MAX_BODY_BYTES = 65536
 SUPPORTED_METHODS = "GET, POST"
@@ -417,6 +417,11 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/v1/clients":
             self._require_session(self._handle_e3_clients_list)
             return
+        # 0.1.4: the one-shot post-mutation convergence read (session-gated,
+        # read-only -- it dispatches no mutation and changes nothing).
+        if path == "/api/v1/clients/convergence":
+            self._require_session(self._handle_e3_convergence)
+            return
         # M4: the export endpoint exists but is POST-only. A GET there is a
         # method error on a known route, not a static miss -- answering 404
         # would make the endpoint look absent to anything probing the
@@ -494,6 +499,12 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             # FRESH management gate refuses dispatch unless the helper plane
             # is provably healthy at that moment.
             self._require_step_up(self._handle_e3_export)
+            return
+        if path == "/api/v1/clients/convergence":
+            # 0.1.4: GET-only. A POST on this route is a method error, not a
+            # silent 404 -- the convergence read is a pure read and must
+            # never acquire mutation-looking semantics.
+            self._method_not_allowed(allowed="GET")
             return
         self._send_json(404, {"error": "not found"})
 
@@ -971,6 +982,65 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             "transport": result["transport"],
             "as_of": iso_utc(result["as_of"]),
             "data": sanitize_e3_data("client.list", data or {}),
+        })
+
+    def _handle_e3_convergence(self, session):
+        """GET /api/v1/clients/convergence -> the one-shot post-mutation
+        read (0.1.4).
+
+        Session-gated and READ-ONLY: no step-up, no idempotency key, it
+        changes nothing. Both reads use force=True, which defeats the TTL
+        and the attempt throttle -- never the single-flight, the breaker
+        or the 0.1.3 epoch rules -- so the browser learns the post-
+        mutation truth in ONE response instead of racing the 2s/5s cache
+        windows. Success is ALL-OR-NOTHING: ok only when BOTH the status
+        and the list are FRESH; anything else answers 503 (or the helper
+        verdict table) and the caller keeps its closed view -- a stale
+        half-answer is exactly what the fail-closed UI must never see.
+        Both payloads go through the same whitelists as the ordinary GETs
+        (management.status / client.list sanitization, lock.path stripped)
+        and are applied by the frontend atomically."""
+        broker = self.app.e3_broker
+        if broker is None:
+            self._e3_unavailable("the E3 adapter is not wired in this build")
+            return
+        status = broker.status(force=True)
+        if status.get("verdict_error"):
+            self._e3_verdict_error(status)
+            return
+        if status["payload"] is None or status["transport"] != "fresh":
+            self._e3_unavailable(
+                "no fresh management.status is available; the view stays "
+                "closed")
+            return
+        clients = broker.list_clients(force=True)
+        if clients.get("verdict_error"):
+            self._e3_verdict_error(clients)
+            return
+        if clients["payload"] is None or clients["transport"] != "fresh":
+            self._e3_unavailable(
+                "no fresh client list is available; the view stays closed")
+            return
+        spayload = status["payload"]
+        sdata = spayload.get("data") if isinstance(spayload, dict) else {}
+        cpayload = clients["payload"]
+        cdata = cpayload.get("data") if isinstance(cpayload, dict) else {}
+        self._send_json(200, {
+            "ok": True,
+            "status": {
+                "ok": True,
+                "transport": status["transport"],
+                "as_of": iso_utc(status["as_of"]),
+                "monitor_running": self.app.monitor_running(),
+                "management_active": self.app.management_active(),
+                "data": sanitize_e3_data("management.status", sdata or {}),
+            },
+            "clients": {
+                "ok": True,
+                "transport": clients["transport"],
+                "as_of": iso_utc(clients["as_of"]),
+                "data": sanitize_e3_data("client.list", cdata or {}),
+            },
         })
 
     def _handle_e3_mutation(self, session, op, actor):
