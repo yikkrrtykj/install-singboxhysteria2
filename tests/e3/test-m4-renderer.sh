@@ -2,11 +2,14 @@
 # E3 M4 -- canonical Mihomo/Clash YAML renderer contract.
 #
 # lib/client-management.sh::cm_render_client_mihomo_yaml is the SINGLE source
-# of the client config: install.sh's generate_client_configuration and the
-# privileged client.export op both call it, so CLI files and Web downloads are
-# byte-identical BY CONSTRUCTION. This suite pins that construction (static
-# wiring) and the renderer's own contract (pure, deterministic, fail-closed,
-# credential pass-through, hopping variant, legacy exportability).
+# of the client config: install.sh's generate_client_configuration, the
+# shared-account display wrapper AND the privileged client.export op all
+# render through it, so CLI files and Web downloads are byte-identical BY
+# CONSTRUCTION. This suite pins that construction (static wiring: exactly one
+# template in the repo, builtin-printf-only emission, no external heredoc)
+# and the renderer's own contract (pure, deterministic, fail-closed on
+# per-client AND GLOBAL inconsistency, credential pass-through, hopping
+# variant, legacy exportability).
 #
 # Sandbox only: temporary files, no root, no network, no sing-box.
 set -uo pipefail
@@ -35,21 +38,36 @@ lc="$(grep -cE '^cm_render_client_mihomo_yaml\(\)' "$LIB" || true)"
 ic="$(grep -cE '^cm_render_client_mihomo_yaml\(\)' "$INSTALL" || true)"
 assert_eq 0 "$ic" 'install.sh does NOT define a second renderer'
 calls="$(grep -cE 'cm_render_client_mihomo_yaml "\$name" "\$cfg"' "$INSTALL" || true)"
-if [ "$lc" = "1" ] && [ "$calls" -ge 1 ]; then
-    pass 'lib defines the renderer once and install.sh calls it'
+deleg="$(grep -cE 'cm_render_client_mihomo_yaml "\$RESERVED_CLIENT_NAME"' "$INSTALL" || true)"
+if [ "$lc" = "1" ] && [ "$calls" -ge 1 ] && [ "$deleg" -ge 1 ]; then
+    pass 'lib defines the renderer once; install.sh delegates BOTH paths to it'
 else
-    fail "renderer wiring (lib=$lc install-calls=$calls)"
+    fail "renderer wiring (lib=$lc generate-calls=$calls display-calls=$deleg)"
 fi
-# the legacy inline heredoc renderer must be gone from the client path:
-# install.sh may keep its own template ONLY for the shared-account display.
+# R2: the shared-account display path used to carry a SECOND full template.
+# It must be GONE now -- ANY copy of the template body in install.sh is a
+# contract FAILURE, not an allowed case.
 tmpl_uses="$(grep -cE 'mixed-port: 7897' "$INSTALL" || true)"
-if [ "$tmpl_uses" = "0" ]; then
-    pass 'install.sh carries no client YAML template at all'
-elif [ "$tmpl_uses" = "1" ]; then
-    pass 'install.sh keeps at most the one shared-account template'
+assert_eq 0 "$tmpl_uses" 'install.sh carries NO copy of the YAML template (any copy = FAIL)'
+
+# R3: the credential-bearing renderer must emit through the shell BUILTIN
+# printf only. An external `cat`/heredoc can have its stdin backed by a temp
+# file; credential bytes must never touch one.
+rb="$(awk '/^cm_render_client_mihomo_yaml\(\)/{f=1} f{print} f&&/^\}/{exit}' "$LIB")"
+[ -n "$rb" ] && pass 'extracted the renderer function body' || fail 'could not extract renderer body'
+if printf '%s\n' "$rb" | grep -qE '<<[[:space:]]*["'"'"']?[A-Za-z_]'; then
+    fail 'R3: the renderer still contains a heredoc'
 else
-    fail "install.sh still carries $tmpl_uses template copies"
+    pass 'R3: the renderer contains no heredoc'
 fi
+if printf '%s\n' "$rb" | grep -qw cat; then
+    fail 'R3: the renderer still shells out to cat'
+else
+    pass 'R3: the renderer shells out to no cat'
+fi
+printf '%s\n' "$rb" | grep -q 'printf' \
+    && pass 'R3: emission goes through builtin printf' \
+    || fail 'R3: renderer does not emit via printf'
 bash -n "$LIB" && pass 'bash -n shared lib' || fail 'bash -n shared lib'
 
 # ------------------------------------------------------------------ sandbox --
@@ -211,6 +229,46 @@ write_live
 render_to "$B" vmix-01
 cmp -s "$A" "$B" && pass 'restored state renders the exact bytes pinned by the first section' \
     || fail 'state drifted across refusal cases'
+
+# ------------------------------------------------- R4: global fail-closed ----
+# The renderer must refuse when the SHARED source of truth is inconsistent,
+# even though the REQUESTED client is perfectly valid: mismatched name sets,
+# duplicate names/credentials, empty uuid/password on ANOTHER client, or an
+# invalid flow anywhere all mean zero YAML, zero bytes, rc only.
+printf '\n== R4: global inconsistency refuses a valid requested client ==\n'
+glob_case(){ # <label> <jq-filter>  (vmix-01 itself stays valid in every case)
+    write_live
+    if ! jq "$2" "$SB_SERVER_CONFIG" > "$TMP/broken.json" 2>/dev/null; then
+        fail "R4 fixture build failed: $1"; return
+    fi
+    cp "$TMP/broken.json" "$SB_SERVER_CONFIG"
+    : > "$EMPTY"
+    if cm_render_client_mihomo_yaml vmix-01 > "$EMPTY" 2>/dev/null; then
+        fail "R4 shipped YAML despite global inconsistency ($1)"
+    elif [ -s "$EMPTY" ]; then
+        fail "R4 printed bytes while refusing ($1)"
+    else
+        pass "R4 refuses with zero stdout ($1)"
+    fi
+}
+glob_case 'another client lost its uuid' \
+    '(.inbounds[]|select(.tag=="vless-in")|.users[]|select(.name=="legacy")|.uuid) = ""'
+glob_case 'another client duplicates the requested uuid' \
+    '(.inbounds[]|select(.tag=="vless-in")|.users[]|select(.name=="legacy")|.uuid) = "CLIENT-UUID-1"'
+glob_case 'another client carries an invalid flow' \
+    '(.inbounds[]|select(.tag=="vless-in")|.users[]|select(.name=="legacy")|.flow) = "none"'
+glob_case 'Reality/HY2 name sets diverge' \
+    '(.inbounds[]|select(.tag=="hy2-in")|.users[]|select(.name=="legacy")|.name) = "legacy2"'
+glob_case 'HY2 gains a duplicate-name user' \
+    '(.inbounds[]|select(.tag=="hy2-in")|.users) += [{"name":"vmix-01","password":"OTHER-PASS-9"}]'
+glob_case 'HY2 duplicates the requested password' \
+    '(.inbounds[]|select(.tag=="hy2-in")|.users) += [{"name":"ghost-a","password":"CLIENT-PASS-1"}]'
+glob_case 'another client lost its password' \
+    '(.inbounds[]|select(.tag=="hy2-in")|.users[]|select(.name=="legacy")|.password) = ""'
+write_live
+render_to "$B" vmix-01
+cmp -s "$A" "$B" && pass 'consistent config renders the pinned bytes again after the R4 cases' \
+    || fail 'R4 refusal cases damaged the pinned bytes'
 
 # -------------------------------------------------------------------- purity --
 printf '\n== purity: the renderer touches no files ==\n'

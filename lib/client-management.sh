@@ -508,12 +508,22 @@ get_client_credentials() { # get_client_credentials <name> [config] -> "uuid\npa
 #
 # Pure renderer: prints the client YAML to stdout and writes NOTHING
 # anywhere -- no temp file, no log line, no diagnostic. Credential material
-# never enters argv/env: jq reads the config file directly and the values
-# travel through shell memory into this shell's own heredoc expansion only.
+# never enters argv/env: jq reads the config file directly, the values
+# travel through shell memory, and the final bytes are emitted by THIS
+# shell's own builtin printf. No external `cat`, no heredoc: an external
+# command's stdin can be backed by a temp file, and credential bytes must
+# never touch one.
 #
-# install.sh `generate_client_configuration` and the privileged sbox-cm
-# `client.export` op MUST render through this exact copy; the byte-identical
-# regressions pin the output against the historical template.
+# Fail-closed on GLOBAL inconsistency, not only on the requested client's
+# own gap: any mismatched name set, duplicate name/credential, empty
+# uuid/password or invalid flow anywhere in the live config yields rc!=0
+# and ZERO stdout (the canonical candidate_problems check runs silently).
+#
+# install.sh `generate_client_configuration`, the installer's shared-account
+# display path, and the privileged sbox-cm `client.export` op ALL render
+# through this exact copy -- it is the ONE Mihomo YAML template in the
+# repository; the byte-identical regressions pin the output against the
+# historical template.
 # Failures are silent (rc only) -- the caller owns user-facing messages.
 # ============================================================================
 cm_render_client_mihomo_yaml() { # <name> [config] -> mihomo YAML on stdout
@@ -521,13 +531,21 @@ cm_render_client_mihomo_yaml() { # <name> [config] -> mihomo YAML on stdout
     local creds uuid password reality_uuid hy_password
     local server_ip public_key reality_port reality_server_name short_id
     local hy_port hy_server_name ishopping hy_hopping_start hy_hopping_end
-    local hy_clash_port_yaml formatted_range=""
+    local hy_clash_port_yaml formatted_range="" problems
 
     validate_client_name "$name" || return 1
     [ -f "$cfg" ] || return 1
     if ! jq empty "$cfg" >/dev/null 2>&1; then
         return 1
     fi
+    # Global structural gate: the SAME canonical check the sbox-cm worker
+    # runs, captured silently (stdout consumed here, stderr already
+    # suppressed by candidate_problems). Any inconsistency anywhere in the
+    # shared source of truth refuses the render -- rc only, zero YAML.
+    if ! problems="$(candidate_problems "$cfg")"; then
+        return 1
+    fi
+    [ -z "$problems" ] || return 1
     if ! creds="$(get_client_credentials "$name" "$cfg")"; then
         return 1
     fi
@@ -556,11 +574,12 @@ cm_render_client_mihomo_yaml() { # <name> [config] -> mihomo YAML on stdout
     fi
 
     # Reality/HY2 credentials exist ONLY transiently inside shell memory; the
-    # expansion below is the one intended delivery into the rendered config.
+    # builtin printf expansion below is the one intended delivery into the
+    # rendered config. Every interpolated value rides a %s ARGUMENT, so a
+    # credential containing % or \ can never be reinterpreted as format.
     reality_uuid="$uuid"
     hy_password="$password"
-    cat << EOF
-mixed-port: 7897
+    printf 'mixed-port: 7897
 allow-lan: true
 bind-address: "*"
 mode: rule
@@ -606,27 +625,27 @@ tun:
 proxies:
   - name: Reality
     type: vless
-    server: $server_ip
-    port: $reality_port
-    uuid: $reality_uuid
+    server: %s
+    port: %s
+    uuid: %s
     network: tcp
     udp: true
     tls: true
     flow: xtls-rprx-vision
-    servername: $reality_server_name
+    servername: %s
     client-fingerprint: chrome
     reality-opts:
-      public-key: $public_key
-      short-id: $short_id
+      public-key: %s
+      short-id: %s
 
   - name: Hysteria2
     type: hysteria2
-    server: $server_ip
-${hy_clash_port_yaml}
-    password: $hy_password
+    server: %s
+%s
+    password: %s
     up: "300 Mbps"
     down: "300 Mbps"
-    sni: $hy_server_name
+    sni: %s
     skip-cert-verify: true
     alpn:
       - h3
@@ -655,7 +674,9 @@ rules:
   - GEOIP,CN,DIRECT
   - MATCH,节点选择
 
-EOF
+' "$server_ip" "$reality_port" "$reality_uuid" "$reality_server_name" \
+       "$public_key" "$short_id" "$server_ip" "$hy_clash_port_yaml" \
+       "$hy_password" "$hy_server_name" || return 1
     return 0
 }
 

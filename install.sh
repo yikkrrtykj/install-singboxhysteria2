@@ -306,7 +306,8 @@ show_client_configuration() {
 
   show_notice "Mihomo/Clash Meta客户端配置参数"
   mihomo_config_path="/root/sbox/mihomo_client.yaml"
-  # 共享账号（users[0]）的展示路径；多客户端请用"客户端管理 -> 生成客户端配置"
+  # 共享账号（保留名 legacy，即两个入站的首个用户）的展示路径，渲染统一走 canonical renderer；
+  # 多客户端请用"客户端管理 -> 生成客户端配置"
   write_mihomo_template "$mihomo_config_path" || error "保存 Mihomo 客户端配置失败"
   chmod 0600 "$mihomo_config_path" || error "设置 Mihomo 客户端配置权限失败"
   cat "$mihomo_config_path"
@@ -974,113 +975,17 @@ _delete_client_locked() {
 }
 # get_client_credentials is provided by lib/client-management.sh (M1-A0).
 
-# Writes the Mihomo/Clash Meta client YAML using caller-scope variables:
-#   $server_ip $reality_port $reality_uuid $reality_server_name $public_key
-#   $short_id $hy_clash_port_yaml $hy_password $hy_server_name
-# Only the credentials differ between clients; everything else is shared.
-# M4-A: this copy now serves ONLY the installer's shared-account display
-# path. The canonical renderer for per-client files and the privileged
-# sbox-cm export op is lib/client-management.sh ::
-# cm_render_client_mihomo_yaml; a byte-identical regression pins the two.
+# M4-A / review R2: there is exactly ONE Mihomo/Clash Meta YAML template in
+# this repository -- lib/client-management.sh :: cm_render_client_mihomo_yaml.
+# This is a thin wrapper over it for the installer's shared-account display
+# path (the reserved "legacy" account, which is users[0] in both inbounds),
+# so CLI files and privileged client.export downloads are byte-identical BY
+# CONSTRUCTION. A static regression FAILS if install.sh ever carries a
+# second template body again.
 write_mihomo_template() { # write_mihomo_template <outfile>
     local outfile="$1"
-    cat > "$outfile" << EOF || return 1
-mixed-port: 7897
-allow-lan: true
-bind-address: "*"
-mode: rule
-log-level: info
-unified-delay: true
-ipv6: true
-profile:
-  store-selected: true
-  store-fake-ip: true
-dns:
-  enable: true
-  listen: "0.0.0.0:53"
-  ipv6: true
-  enhanced-mode: fake-ip
-  fake-ip-range: 198.18.0.1/16
-  default-nameserver:
-    - 223.5.5.5
-    - 8.8.8.8
-  nameserver:
-    - https://dns.alidns.com/dns-query
-    - https://doh.pub/dns-query
-  fallback:
-    - https://1.0.0.1/dns-query
-    - tls://dns.google
-  fallback-filter:
-    geoip: true
-    geoip-code: CN
-    ipcidr:
-      - 240.0.0.0/4
-
-tun:
-  enable: true
-  stack: mixed
-  device: Mihomo
-  mtu: 1420
-  auto-route: true
-  auto-redirect: true
-  auto-detect-interface: true
-  dns-hijack:
-    - any:53
-    - tcp://any:53
-
-proxies:
-  - name: Reality
-    type: vless
-    server: $server_ip
-    port: $reality_port
-    uuid: $reality_uuid
-    network: tcp
-    udp: true
-    tls: true
-    flow: xtls-rprx-vision
-    servername: $reality_server_name
-    client-fingerprint: chrome
-    reality-opts:
-      public-key: $public_key
-      short-id: $short_id
-
-  - name: Hysteria2
-    type: hysteria2
-    server: $server_ip
-${hy_clash_port_yaml}
-    password: $hy_password
-    up: "300 Mbps"
-    down: "300 Mbps"
-    sni: $hy_server_name
-    skip-cert-verify: true
-    alpn:
-      - h3
-
-proxy-groups:
-  - name: 节点选择
-    type: select
-    proxies:
-      - Reality
-      - Hysteria2
-      - 自动选择
-      - DIRECT
-
-  - name: 自动选择
-    type: url-test
-    proxies:
-      - Reality
-      - Hysteria2
-    url: "http://www.gstatic.com/generate_204"
-    interval: 300
-    tolerance: 50
-
-
-rules:
-  - GEOIP,LAN,DIRECT
-  - GEOIP,CN,DIRECT
-  - MATCH,节点选择
-
-EOF
+    cm_render_client_mihomo_yaml "$RESERVED_CLIENT_NAME" "$SB_SERVER_CONFIG" \
+        > "$outfile" || return 1
     return 0
 }
 
