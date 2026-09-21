@@ -168,7 +168,7 @@ async function main() {
     assert.equal(retry.headers['X-CSRF-Token'], 'csrf'); closed(); productText();
   });
   ui.setPendingRetry(null); setStatus(healthy());
-  responses.push(response({code: 'E_MANUAL_INTERVENTION', error: 'privileged helper Idempotency-Key'}, 409), response(clients));
+  responses.push(response({code: 'E_MANUAL_INTERVENTION', error: 'privileged helper Idempotency-Key'}, 409), response(clients), response(healthy()));
   ui.addClient('bob'); await flush();
   check('raw backend error detail is not rendered to the user', productText);
   responses.push(response({error: 'reauth_required'}, 401));
@@ -183,6 +183,25 @@ async function main() {
     assert.equal(pair[0].body, pair[1].body); assert.deepEqual(pair[0].headers, pair[1].headers);
     assert.ok(ids['stepup-overlay'].className.includes('hidden'));
   });
+  setStatus(healthy());
+  responses.push(response({}), response(clients), response(healthy()));
+  ui.addClient('bob'); await flush();
+  check('successful Add displays ordinary copy without credentials', () => {
+    assert.equal(ids['e3-msg'].textContent, 'Client created. Credentials are not displayed here. Generate the client configuration on the server.'); productText();
+  });
+  responses.push(response({}), response(ui.state.session), response(clients), response(healthy()));
+  ui.deleteClient('alice'); await flush();
+  check('successful Delete displays ordinary copy and preserves raw request name', () => {
+    assert.equal(ids['e3-msg'].textContent, 'Client deleted.');
+    assert.equal(requests.findLast(r => r.url === '/api/v1/clients/delete').body, JSON.stringify({name: 'alice', confirm: 'alice'})); productText();
+  });
+  const conflict = healthy(); conflict.data.helper.reconcile = 'conflict';
+  responses.push(response({code: 'E_RECONCILE_CONFLICT'}, 409), response(clients), response(conflict));
+  const before = requests.filter(r => r.url === '/api/v1/clients/add').length;
+  ui.addClient('bob'); await flush();
+  check('reconcile conflict refreshes status and closes changes without retry', () => {
+    closed(); assert.equal(requests.filter(r => r.url === '/api/v1/clients/add').length, before + 1); productText();
+  });
   ui.renderMonitorInfo({});
   check('no stream error => warning hidden', () => assert.ok(ids['mi-warning'].className.includes('hidden')));
   ui.renderMonitorInfo({last_error: 'collector internal error'});
@@ -196,6 +215,6 @@ async function main() {
     assert.ok(!ids['mg-activate'] && !ids['mg-deactivate']);
     assert.ok(requests.every(r => !/management\/(activate|deactivate)/.test(r.url))); productText();
   });
-  assert.equal(count, 32, 'UI assertion count guard');
+  assert.equal(count, 35, 'UI assertion count guard');
 }
 main().catch(err => { console.error(err); process.exitCode = 1; });

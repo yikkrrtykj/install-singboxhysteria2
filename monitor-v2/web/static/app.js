@@ -638,6 +638,7 @@
                   "in the meantime. Refresh and re-check — the delete was " +
                   "not retried.", true);
         loadE3Clients();
+        loadE3Status();
         return;
       }
       if (error.code === "E_NOT_FOUND") {
@@ -648,6 +649,7 @@
       }
       e3Message(CLIENT_UNAVAILABLE, true);
       loadE3Clients();
+      loadE3Status();
     });
   }
 
@@ -684,10 +686,12 @@
                   "Refresh and re-check — this request was not retried.",
                   true);
         loadE3Clients();
+        loadE3Status();
         return;
       }
       e3Message(CLIENT_UNAVAILABLE, true);
       loadE3Clients();
+      loadE3Status();
     });
   }
 
