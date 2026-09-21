@@ -60,15 +60,15 @@ wantnt "$DAEMON" 'AF_INET6' 'daemon has no IPv6 address family'
 # The "no kill timer" contract is asserted with a real AST walk in
 # m1-rpc-probe.py (a grep cannot distinguish code from the docstring).
 
-printf '\n== fixed op surface (six, no extras) ==\n'
+printf '\n== fixed op surface (seven, no extras) ==\n'
 ops="$(sed -n '/^OPS = {/,/^}/p' "$DAEMON" | grep -oE '"(management|client)\.[a-z]+"' | sort -u)"
 n="$(printf '%s\n' "$ops" | grep -c . || true)"
-[ "$n" = "6" ] && pass 'exactly six RPC ops are declared' || fail "op surface is $n (want 6)"
+[ "$n" = "7" ] && pass 'exactly seven RPC ops are declared' || fail "op surface is $n (want 7)"
 for op in management.status management.activate management.deactivate \
-          client.list client.add client.delete; do
+          client.list client.add client.delete client.export; do
     printf '%s\n' "$ops" | grep -qxF "\"$op\"" && pass "op present: $op" || fail "op missing: $op"
 done
-for banned in client.rotate client.export client.get run exec shell argv; do
+for banned in client.rotate client.get run exec shell argv; do
     printf '%s\n' "$ops" | grep -qxF "\"$banned\"" && fail "banned op exposed: $banned" \
         || pass "banned op absent: $banned"
 done

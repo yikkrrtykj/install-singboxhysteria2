@@ -5,7 +5,11 @@
 #
 #     sbox-cm-ops <op>          # op is a COMPILE-TIME enum, never request data
 #       stdin : validated, NON-SECRET argument object (JSON)
-#       stdout: exactly one result object (JSON), non-sensitive
+#       stdout: exactly one result object (JSON). It is non-sensitive for
+#               every op EXCEPT the sanctioned client.export delivery, whose
+#               data.content carries the rendered Mihomo YAML. That body
+#               travels ONLY through this process' memory and the stdout
+#               PIPE: never argv, never env, never a file, never the audit.
 #       stderr: human diagnostics only (journald)
 #
 # Responsibilities: config.lock, ledger, tx journal, credentials, candidate
@@ -327,6 +331,89 @@ op_client_list() {
         2)  err_exit rejected E_CONFIG_INCONSISTENT revalidate false "服务端配置缺失或非法" ;;
         *)  err_exit rejected E_LOCK lock true "配置锁不可用或超时（fail-closed）" ;;
     esac
+}
+
+# ------------------------------------------------------------- export --
+# client.export (M4): READ-ONLY delivery of the canonical Mihomo YAML for one
+# client -- including the reserved `legacy` account, which stays mutation-
+# reserved for add/delete only. NO ledger intent, NO journal, NO candidate,
+# NO commit/reload/restart: nothing is mutated, so the terminal ordering
+# contract reduces to durable audit -> response, and the audit is FAIL-CLOSED
+# for this op: if the metadata record cannot be made durable the YAML is NOT
+# delivered (there is no partial mutation to reconcile, so refusing delivery
+# is the only sound resolution).
+_export_locked() {
+    local cfg="$SB_SERVER_CONFIG" problems mgmt rendered="" yaml="" nbytes
+    local tx
+
+    if ! live_config_ready; then
+        err_exit rejected E_CONFIG_INCONSISTENT revalidate false "服务端配置缺失或非法"
+    fi
+    if ! problems="$(candidate_problems "$cfg")"; then
+        err_exit rejected E_CONFIG_INCONSISTENT revalidate false "客户端结构审计执行失败"
+    fi
+    if [ -n "$problems" ]; then
+        err_exit rejected E_CONFIG_INCONSISTENT revalidate false "当前 Reality/HY2 用户集合不一致"
+    fi
+    mgmt="$(cm_management_state "$cfg")"
+    if [ "$mgmt" != "active" ]; then
+        err_exit rejected E_ACTIVATION_STATE activation false "管理面未激活（$mgmt），拒绝 client.export"
+    fi
+    if cm_degraded_active; then
+        err_exit manual_intervention E_MANUAL_INTERVENTION degraded false "helper 处于 degraded，拒绝 client.export"
+    fi
+    if ! client_name_exists "$NAME" "$cfg"; then
+        err_exit rejected E_NOT_FOUND revalidate false "客户端 '$NAME' 不存在"
+    fi
+
+    # The X-sentinel preserves the renderer's EXACT bytes (the template ends
+    # with a blank line that bare command substitution would strip).
+    if ! rendered="$(cm_render_client_mihomo_yaml "$NAME" "$cfg" && printf X)"; then
+        err_exit rejected E_CONFIG_INCONSISTENT revalidate false "客户端凭据不完整，无法导出"
+    fi
+    yaml="${rendered%X}"
+
+    # Frozen frame budget: 65536 total, so the raw YAML is capped at 48 KiB
+    # and JSON escaping headroom stays ample. Over cap -> refuse, NEVER
+    # truncate a config that is about to be handed to a user.
+    nbytes="$(printf '%s' "$yaml" | wc -c | tr -d ' ')"
+    if [ "${nbytes:-0}" -gt 49152 ]; then
+        err_exit rejected E_INTERNAL revalidate false "导出内容超过帧上限，拒绝交付（fail-closed，不截断）"
+    fi
+
+    # Audit FIRST and fail-closed: metadata only (w_audit never sees the YAML;
+    # its jq inputs are request_id/op/name/outcome/actor fingerprints).
+    if ! w_audit ok export ""; then
+        warning "导出审计无法落盘：拒绝交付（fail-closed）"
+        emit_err "E_INTERNAL" "outcome" false "导出审计未能落盘，拒绝交付" ""
+        exit 0
+    fi
+
+    # The one sanctioned sensitive delivery: YAML bytes go to jq via the PIPE
+    # only (-Rs slurps stdin); filename carries the client name, never a
+    # credential. tx_json is the fixed non-secret transaction object.
+    tx="$(tx_json)"
+    printf '%s' "$yaml" \
+        | jq -Rs --arg filename "$NAME-mihomo.yaml" --argjson t "$tx" \
+            '{ok:true, code:"OK", stage:"done",
+              data:{format:"mihomo-yaml", filename:$filename, content:.},
+              idempotency:null, warnings:[], transaction:$t, error:null}'
+    exit 0
+}
+
+op_client_export() {
+    GEN=0
+    NAME="$(w_arg name)"
+    validate_client_name "$NAME" || err_exit rejected E_SCHEMA parse false "name 非法"
+    # NO reserved-name wall here: exporting `legacy` is the point (M4).
+    cm_safe_id "$REQ_ID" || err_exit rejected E_SCHEMA parse false "request_id 非法"
+    if [ -n "$(w_arg idempotency_key)" ]; then
+        # The daemon schema already refuses this field; belt and braces.
+        err_exit rejected E_SCHEMA parse false "client.export 是只读操作，不接受 idempotency_key"
+    fi
+    cm_state_init || err_exit rejected E_INTERNAL parse false "sbox-cm 状态目录初始化失败"
+    with_client_lock _export_locked
+    err_exit rejected E_LOCK lock true "配置锁不可用或超时（fail-closed）"
 }
 
 # ------------------------------------------------------------- add --
@@ -871,7 +958,7 @@ main() {
     . "$lib_dir/sbox-cm-state.sh" || { emit_err "E_INTERNAL" "parse" false "状态库加载失败" ""; exit 0; }
 
     # Root-only maintenance entry points (NOT reachable over the RPC socket:
-    # the daemon's dispatch allowlist only ever passes the six public ops).
+    # the daemon's dispatch allowlist only ever passes the seven public ops).
     #   reconcile          startup reconciliation (daemon boot)
     #   mgmt-deactivate    the ONE sanctioned active_stale recovery (root CLI)
     if [ "$OP" = "--maintenance" ]; then
@@ -886,7 +973,7 @@ main() {
 
     case "$OP" in
         management.status|management.activate|management.deactivate|\
-        client.list|client.add|client.delete) : ;;
+        client.list|client.add|client.delete|client.export) : ;;
         *) emit_err "E_OP_UNKNOWN" "parse" false "未知操作" ""; exit 0 ;;
     esac
 
@@ -904,6 +991,7 @@ main() {
         client.list)           op_client_list ;;
         client.add)            op_client_add ;;
         client.delete)         op_client_delete ;;
+        client.export)         op_client_export ;;
         management.activate)   op_management_activate ;;
         management.deactivate) op_management_deactivate ;;
     esac

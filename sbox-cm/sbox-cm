@@ -9,11 +9,17 @@ ONLY the transport and the connection boundary:
     connection-level audit
 
 It never reads or writes sbconfig_server.json, never computes a credential
-digest, and never sees a UUID or password. Every operation -- including the
-read-only ones -- is dispatched to the root transaction worker
+digest, and never constructs or parses a UUID or password. Every operation --
+including the read-only ones -- is dispatched to the root transaction worker
 (`sbox-cm-ops`), which owns config.lock, the ledger, the tx journal, candidate
 generation, commit_server_config and the privileged audit. There is exactly ONE
 transaction engine in the system and it is not here.
+
+The ONLY sanctioned exception (E3 M4): a `client.export` RESULT is an opaque
+response body that may carry credential material inside data.content (the
+rendered Mihomo YAML). The daemon forwards it to the authorized caller without
+logging, parsing or caching it -- responses of SENSITIVE_RESPONSE_OPS never
+enter the replay cache -- and it never appears in any daemon audit record.
 
 Deadline contract (E3 M1 review B6): the helper enforces NO whole-op deadline.
 The only enforced transport deadline is the 5s frame read. Every external
@@ -67,8 +73,18 @@ OPS = {
                    "optional": ("actor",), "lock": True},
     "client.delete": {"required": ("name", "idempotency_key"),
                       "optional": ("actor",), "lock": True},
+    # M4: READ-only export. `name` may be the reserved client (that is the
+    # point -- legacy must be exportable), so this op opts out of the
+    # reserved-name wall. It carries no idempotency key: nothing to dedupe.
+    "client.export": {"required": ("name",), "optional": ("actor",),
+                      "lock": True, "allow_reserved": True},
 }
 BASE_FIELDS = ("v", "request_id", "op")
+
+# M4: ops whose RESPONSE may carry credential material. Their responses are
+# never written to the replay cache, so a repeated request_id re-dispatches
+# (fresh render, fresh audit) instead of replaying a cached secret.
+SENSITIVE_RESPONSE_OPS = {"client.export"}
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
 REQID_RE = re.compile(r"^[A-Za-z0-9._-]{16,64}$")
@@ -338,7 +354,7 @@ def validate_request(obj):
         name = obj.get("name")
         if not isinstance(name, str) or not NAME_RE.match(name):
             raise RpcError("E_SCHEMA", "parse", False, "name 非法")
-        if name == RESERVED_NAME:
+        if name == RESERVED_NAME and not spec.get("allow_reserved"):
             raise RpcError("E_RESERVED_NAME", "parse", False, "%s 是保留名称" % RESERVED_NAME)
         args["name"] = name
 
@@ -523,7 +539,8 @@ def handle_connection(conn, allowed):
                                 wres.get("stage", "done"),
                                 bool(wres.get("retriable", False)),
                                 wres.get("detail", ""), wres.get("backup"))
-        replay_put(request_id, resp)
+        if op not in SENSITIVE_RESPONSE_OPS:
+            replay_put(request_id, resp)
         send_frame(conn, resp)
     finally:
         try:
@@ -645,7 +662,7 @@ def cmd_reconcile():
 
 def cmd_mgmt_deactivate():
     """Root recovery CLI: dispatches the worker's MAINTENANCE verb, which is
-    deliberately NOT one of the six public RPC ops -- an active_stale marker
+    deliberately NOT one of the seven public RPC ops -- an active_stale marker
     must never be clearable through the RPC socket."""
     res = run_maintenance("mgmt-deactivate")
     sys.stdout.write(json.dumps(res, ensure_ascii=False, indent=2) + "\n")
