@@ -292,16 +292,14 @@ terminal journal reports `final_status=go_live_active`.
 
 1. Open the production Monitor Web through its normal production entry point.
 2. Log in normally.
-3. Open the E3 / Management area.
-4. Confirm Management displays **Active**.
-5. Confirm the client list loads and shows the existing production clients.
-6. Confirm the `Add client` control is available for use.
-7. Confirm `Deactivate management` is available for use.
-8. Confirm the page shows none of: helper degraded, transport unavailable,
-   stale management state, result unknown, or manual intervention.
-9. Refresh the page once and confirm Management still displays **Active**.
-10. End acceptance without clicking Add client, Delete client, or Deactivate
-    management.
+3. Open Settings / Client management.
+4. Confirm Client management displays **Available**.
+5. Confirm the client list loads and the existing **Default** client is visible.
+6. Confirm the `Add client` control is enabled.
+7. Confirm no management activation/deactivation controls are shown.
+8. Confirm no unavailable warning or unconfirmed change is shown.
+9. Refresh the page once and confirm Client management remains **Available**.
+10. End acceptance without adding or deleting any client.
 
 This step only proves that the real production browser/Web read path observes
 the backend state already established by Phase 3. M2 CI covers the full Web

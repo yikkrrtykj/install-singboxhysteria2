@@ -8,7 +8,12 @@
 (function () {
   "use strict";
 
-  var PROTOCOL_LABELS = { "vless-in": "Reality", "hy2-in": "HY2" };
+  var PROTOCOL_LABELS = { "vless-in": "Reality", "hy2-in": "Hysteria2",
+                          reality: "Reality", hy2: "Hysteria2", hysteria2: "Hysteria2" };
+  function clientLabel(name) { return name === "legacy" ? "Default" : name; }
+  function protocolLabel(tag) { return PROTOCOL_LABELS[tag] || "Other"; }
+  var CLIENT_UNAVAILABLE = "Client management is temporarily unavailable. Check the server before making changes.";
+  var RESULT_UNCONFIRMED = "The result is not confirmed yet. Refresh the client list before retrying. Do not start another change until the current state is confirmed.";
 
   var state = {
     snapshot: null,
@@ -280,7 +285,6 @@
 
     $("st-uptime").textContent = fmtUptime(snap.collector_uptime_seconds);
     $("st-last-event").textContent = fmtTime(snap.last_success_at);
-    $("st-generated").textContent = fmtTime(snap.snapshot_generated_at);
 
     var devices = Object.keys(snap.devices || {});
     $("st-devices").textContent = String(devices.length);
@@ -294,7 +298,6 @@
     renderConnections(snap.connections || []);
     renderMonitorInfo(snap);
     renderWhitelistFromSession();
-    renderManagement();
   }
 
   function totalRate(snap, field) {
@@ -320,7 +323,7 @@
     var rowTemplate = $("protocol-row-template");
     devices.forEach(function (device) {
       var card = cardTemplate.content.cloneNode(true);
-      card.querySelector(".device-name").textContent = device.name;
+      card.querySelector(".device-name").textContent = clientLabel(device.name);
       var badge = card.querySelector(".device-status");
       badge.textContent = device.status;
       badge.className = "badge device-status " +
@@ -338,8 +341,7 @@
         var proto = device.protocols[tag];
         var row = rowTemplate.content.cloneNode(true);
         row.querySelector(".proto-label").textContent =
-          PROTOCOL_LABELS[tag] || tag;
-        row.querySelector(".proto-tag").textContent = tag;
+          protocolLabel(tag);
         row.querySelector(".pr-up").textContent = fmtRate(proto.uplink_rate);
         row.querySelector(".pr-down").textContent = fmtRate(proto.downlink_rate);
         row.querySelector(".pt-up").textContent = fmtBytes(proto.uplink_total);
@@ -364,10 +366,9 @@
     filtered.forEach(function (row) {
       var tr = document.createElement("tr");
 
-      tr.appendChild(cellText(row.user));
+      tr.appendChild(cellText(clientLabel(row.user)));
       var proto = document.createElement("td");
-      proto.textContent = (PROTOCOL_LABELS[row.inbound] || row.inbound) +
-        " (" + row.inbound + ")";
+      proto.textContent = protocolLabel(row.inbound);
       tr.appendChild(proto);
 
       var idCell = document.createElement("td");
@@ -419,86 +420,15 @@
     $("mi-version").textContent = state.session ? state.session.version : "—";
     $("mi-started").textContent = fmtTime(snap.monitor_started_at);
     $("mi-uptime").textContent = fmtUptime(snap.collector_uptime_seconds);
-    $("mi-batches").textContent = String(snap.batch_count ?? "—");
-    $("mi-skipped").textContent = String(snap.skipped_events ?? "—");
-    $("mi-conflicts").textContent = String(snap.identity_conflicts ?? "—");
-    $("mi-abandoned").textContent = String(snap.abandoned_on_reset ?? "—");
-    $("mi-error").textContent = snap.last_error ? String(snap.last_error) : "none";
+    if (snap.last_error) show($("mi-warning")); else hide($("mi-warning"));
   }
 
-  /* ---------- management plane status (orthogonal booleans) ---------- */
+  /* ---------- client availability ---------- */
 
   function setBadge(el, label, cls) {
     el.textContent = label;
     el.className = "badge " + cls;
   }
-
-  function renderManagement() {
-    var session = state.session;
-    if (!session) return;
-    var running = session.monitor_running === true;
-    var armed = session.management_active === true;
-    var authorized = session.step_up_active === true;
-    // Running the monitor says NOTHING about the mutation plane: the safe
-    // production default is running=true with management inactive.
-    setBadge($("mg-monitor"), running ? "running" : "not running",
-             running ? "ok" : "recent");
-    setBadge($("mg-manage"), armed ? "active" : "inactive (default)",
-             armed ? "recent" : "idle");
-    setBadge($("mg-stepup"), authorized ? "authorized" : "not authorized",
-             authorized ? "ok" : "idle");
-  }
-
-  function mgMessage(text, isError) {
-    var el = $("mg-msg");
-    el.textContent = text;
-    el.className = "form-msg " + (isError ? "error" : "ok");
-    show(el);
-  }
-
-  function managementMutation(path, successMessage) {
-    // M2: the mutation runs inside the root helper. A 501 can no longer
-    // happen; the interesting outcomes are success, E_RECONCILE_CONFLICT
-    // (never silently retried) and result_unknown (the caller budget
-    // expired AFTER dispatch — the transaction keeps running server-side,
-    // so there is deliberately NO automatic retry and NO new key).
-    apiWithStepUp(path, { method: "POST", body: {} })
-      .then(function () {
-        mgMessage(successMessage, false);
-        loadSession();
-        loadE3Status();
-      })
-      .catch(function (error) {
-        if (error.status === 504 && error.uncertain) {
-          mgMessage("Result unknown: the request was dispatched and the " +
-                    "transaction is still running inside the privileged " +
-                    "helper (or has finished). Check the management state " +
-                    "below before doing anything else; this request was " +
-                    "NOT retried.", true);
-          loadSession();
-          loadE3Status();
-          return;
-        }
-        if (error.code === "E_RECONCILE_CONFLICT") {
-          mgMessage("Server state changed while the request was in flight. " +
-                    "Refresh and re-check before operating again — this " +
-                    "request was not retried.", true);
-          loadSession();
-          loadE3Status();
-          return;
-        }
-        if (error.code === "E_MANUAL_INTERVENTION") {
-          mgMessage("The privileged helper is degraded and refuses every " +
-                    "mutation until a root operator recovers it.", true);
-          loadE3Status();
-          return;
-        }
-        mgMessage(error.detail || error.message, error.status >= 400);
-        loadSession();
-        loadE3Status();
-      });
-  }
-
   /* ---------- E3 client management (privileged mutations) ---------- */
 
   function newIdempotencyKey() {
@@ -519,12 +449,15 @@
 
   // B4: ONE writable gate for every E3 mutation control. The view may be
   // stale (still displayed), but the destructive surface only exists while
-  // the helper snapshot is FRESH and not degraded.
+  // the fresh status explicitly permits changes. Missing fields fail closed.
   function e3Writable() {
     var s = state.e3Status;
-    if (!s || s.transport !== "fresh") return false;
-    var degraded = s.data && s.data.helper && s.data.helper.degraded === true;
-    return !degraded;
+    if (!s || s.transport !== "fresh" ||
+        Date.now() - (state.e3StatusAt || 0) > 10000) return false;
+    var d = s.data;
+    return !!(d && d.management_state === "active" && d.helper &&
+      d.helper.degraded === false && d.helper.reconcile === "clean" &&
+      d.lock && d.lock.acquirable === true && !state.e3PendingRetry);
   }
 
   /* B3: pending uncertain retry. After a result_unknown the operation is
@@ -550,7 +483,7 @@
   function retryPending() {
     var p = state.e3PendingRetry;
     if (!p) return;   // no pending uncertain operation: nothing to retry
-    e3Message("Retrying with the SAME Idempotency-Key…", false);
+    e3Message("Checking the previous change…", false);
     apiWithStepUp(p.path, {
       method: "POST",
       idempotencyKey: p.idempotencyKey,   // exact same header value
@@ -566,29 +499,33 @@
     }).catch(function (error) {
       if (error.status === 504 && error.uncertain) {
         // still uncertain: the pending op stays, still the same key
-        e3Message("Still result unknown. The pending operation keeps the " +
-                  "same Idempotency-Key; re-check status/list before " +
-                  "retrying again.", true);
+        e3Message(RESULT_UNCONFIRMED, true);
         loadE3Status();
         return;
       }
       // any other terminal verdict clears the pending operation
       setPendingRetry(null);
-      e3Message(error.detail || error.message, true);
+      e3Message(CLIENT_UNAVAILABLE, true);
       loadE3Clients();
       loadE3Status();
     });
   }
 
-  function loadE3Status() {
+  function loadE3Status(background) {
     if (!state.session || !state.session.authenticated) return;
-    api("/api/v1/management/status").then(function (data) {
+    var generation = state.e3StatusGeneration = (state.e3StatusGeneration || 0) + 1;
+    // A background poll retains the last fresh verdict for at most 10s;
+    // it must not close a delete confirmation while the user is typing.
+    if (!background) state.e3Status = null;
+    renderE3Controls();
+    return api("/api/v1/management/status").then(function (data) {
+      if (generation !== state.e3StatusGeneration) return;
       state.e3Status = data;
-      renderE3Status(data);
+      state.e3StatusAt = Date.now();
+      renderE3Controls();
     }).catch(function () {
+      if (generation !== state.e3StatusGeneration) return;
       state.e3Status = null;
-      setBadge($("mg-transport"), "unavailable", "idle");
-      $("mg-asof").textContent = "—";
       renderE3Controls();
     });
   }
@@ -597,33 +534,15 @@
     // B4 + B3-final: one writable decision drives every destructive control,
     // and a pending uncertain operation locks the ordinary entrances.
     var writable = e3Writable() && !state.e3PendingRetry;
-    var stateName = state.e3Status && state.e3Status.data
-      ? state.e3Status.data.management_state : null;
-    var armed = stateName === "active";
-    $("mg-activate").disabled = !writable || armed;
-    $("mg-deactivate").disabled = !writable || !armed;
+    setBadge($("e3-availability"), writable ? "Available" : "Unavailable",
+             writable ? "ok" : "idle");
+    $("e3-changes").textContent = writable ? "Available" : "Unavailable";
+    if (writable) hide($("e3-unavailable")); else show($("e3-unavailable"));
     $("e3-add-btn").disabled = !writable;
     $("e3-add-name").disabled = !writable;
-  }
-
-  function renderE3Status(data) {
-    var stateName = data.data ? data.data.management_state : null;
-    var armed = stateName === "active";
-    var staleState = stateName === "active_stale";
-    setBadge($("mg-manage"),
-             staleState ? "active_stale" : (armed ? "active" : "inactive"),
-             staleState ? "error" : (armed ? "recent" : "idle"));
-    var transport = data.transport || "unavailable";
-    var cls = transport === "fresh" ? "ok"
-            : (transport === "stale" ? "recent" : "idle");
-    setBadge($("mg-transport"), transport, cls);
-    $("mg-asof").textContent = data.as_of || "—";
-    var degraded = data.data && data.data.helper &&
-                   data.data.helper.degraded === true;
-    if (degraded) { show($("mg-degraded")); } else { hide($("mg-degraded")); }
-    // The mutation plane badge is driven by the helper's own status, so the
-    // activate/deactivate buttons follow the real plane, not a stale view.
-    renderE3Controls();
+    $("e3-del-btn").disabled = !writable;
+    if (!writable) hide($("e3-delete-box"));
+    if (state.e3Clients) renderE3Clients(state.e3Clients);
   }
 
   function loadE3Clients() {
@@ -637,7 +556,7 @@
       body.innerHTML = "";
       var row = body.insertRow(-1);
       var cell = row.insertCell(-1);
-      cell.colSpan = 5;
+      cell.colSpan = 3;
       cell.textContent = "Client list unavailable.";
     });
   }
@@ -649,13 +568,11 @@
     var writable = e3Writable() && !state.e3PendingRetry;
     clients.forEach(function (client) {
       var row = body.insertRow(-1);
-      row.insertCell(-1).textContent = client.name;
-      row.insertCell(-1).textContent = (client.protocols || []).join(", ");
-      row.insertCell(-1).textContent = client.mutable ? "yes" : "no";
-      row.insertCell(-1).textContent = client.source;
+      row.insertCell(-1).textContent = clientLabel(client.name);
+      row.insertCell(-1).textContent = (client.protocols || []).map(protocolLabel).join(", ");
       var actions = row.insertCell(-1);
       // B4: no destructive control at all while the view is not writable.
-      if (client.mutable && writable) {
+      if (client.name !== "legacy" && client.mutable && writable) {
         var btn = document.createElement("button");
         btn.className = "btn ghost";
         btn.type = "button";
@@ -669,12 +586,13 @@
     if (!clients.length) {
       var row = body.insertRow(-1);
       var cell = row.insertCell(-1);
-      cell.colSpan = 5;
-      cell.textContent = "No clients known to the helper yet.";
+      cell.colSpan = 3;
+      cell.textContent = "No clients found.";
     }
   }
 
   function beginDeleteClient(name) {
+    if (!e3Writable() || name === "legacy") return;
     // Fresh-list preflight happens again server-side right before the
     // delete; the confirm box here is the type-to-confirm UX (U-2).
     $("e3-del-name").textContent = name;
@@ -689,6 +607,7 @@
   function deleteClient(name, keyOverride) {
     // B3-final fail-safe: same lock as addClient above.
     if (state.e3PendingRetry) return;
+    if (!e3Writable() || name === "legacy") return;
     var key = keyOverride || newIdempotencyKey();
     // B3: an explicit retry replays with the SAME key; a fresh click on the
     // delete button is a NEW operation and gets a NEW key.
@@ -699,7 +618,7 @@
     }).then(function () {
       setPendingRetry(null);
       hide($("e3-delete-box"));
-      e3Message("Client deleted. The helper reloaded sing-box.", false);
+      e3Message("Client deleted.", false);
       loadSession();
       loadE3Clients();
       loadE3Status();
@@ -708,11 +627,7 @@
         setPendingRetry({ path: "/api/v1/clients/delete", name: name,
                           idempotencyKey: key,
                           body: { name: name, confirm: name } });
-        e3Message("Result unknown: the delete was dispatched and the " +
-                  "transaction is still running (or has finished) inside " +
-                  "the helper. Refresh the list below to see the real " +
-                  "state; only the explicit Retry reuses the SAME key.",
-                  true);
+        e3Message(RESULT_UNCONFIRMED, true);
         loadE3Clients();
         loadE3Status();
         return;
@@ -723,6 +638,7 @@
                   "in the meantime. Refresh and re-check — the delete was " +
                   "not retried.", true);
         loadE3Clients();
+        loadE3Status();
         return;
       }
       if (error.code === "E_NOT_FOUND") {
@@ -731,8 +647,9 @@
         loadE3Clients();
         return;
       }
-      e3Message(error.detail || error.message, true);
+      e3Message(CLIENT_UNAVAILABLE, true);
       loadE3Clients();
+      loadE3Status();
     });
   }
 
@@ -740,6 +657,7 @@
     // B3-final fail-safe: a pending uncertain operation locks the ordinary
     // entrance -- no new key is ever generated while one is unresolved.
     if (state.e3PendingRetry) return;
+    if (!e3Writable()) return;
     var key = keyOverride || newIdempotencyKey();
     apiWithStepUp("/api/v1/clients/add", {
       method: "POST",
@@ -747,9 +665,8 @@
       body: { name: name }
     }).then(function (data) {
       setPendingRetry(null);
-      e3Message("Client created. Credentials / client configuration are " +
-                "NOT returned through the web UI — generate the client " +
-                "configuration on the server with the client-management CLI.",
+      e3Message("Client created. Credentials are not displayed here. " +
+                "Generate the client configuration on the server.",
                 false);
       $("e3-add-name").value = "";
       loadE3Clients();
@@ -758,10 +675,7 @@
       if (error.status === 504 && error.uncertain) {
         setPendingRetry({ path: "/api/v1/clients/add", name: name,
                           idempotencyKey: key, body: { name: name } });
-        e3Message("Result unknown: the add was dispatched and the " +
-                  "transaction is still running (or has finished) inside " +
-                  "the helper. Refresh the list to see the real state; " +
-                  "only the explicit Retry reuses the SAME key.", true);
+        e3Message(RESULT_UNCONFIRMED, true);
         loadE3Clients();
         loadE3Status();
         return;
@@ -772,10 +686,12 @@
                   "Refresh and re-check — this request was not retried.",
                   true);
         loadE3Clients();
+        loadE3Status();
         return;
       }
-      e3Message(error.detail || error.message, true);
+      e3Message(CLIENT_UNAVAILABLE, true);
       loadE3Clients();
+      loadE3Status();
     });
   }
 
@@ -908,7 +824,6 @@
       $("rec-status").textContent =
         data.recovery_configured ? "configured ✓" : "not configured";
       renderWhitelistFromSession();
-      renderManagement();
       return data;
     });
   }
@@ -1001,6 +916,7 @@
   function startWatchdog() {
     setInterval(function () {
       if (!state.session || !state.session.authenticated) return;
+      if (state.view === "settings") loadE3Status(true);
       // Fallback poll if the SSE stream is not delivering. Freshness only
       // advances when the snapshot VERSION truly moves: a frozen publisher
       // answering HTTP 200 with the same payload must never keep the
@@ -1053,15 +969,7 @@
     $("recovery-form").addEventListener("submit", submitRecovery);
     $("pw-form").addEventListener("submit", changePassword);
     $("rec-rotate-btn").addEventListener("click", rotateRecovery);
-    $("mg-activate").addEventListener("click", function () {
-      managementMutation("/api/v1/management/activate",
-                         "Management plane activated by the privileged helper.");
-    });
-    $("mg-deactivate").addEventListener("click", function () {
-      managementMutation("/api/v1/management/deactivate",
-                         "Management plane deactivated.");
-    });
-    $("mg-refresh").addEventListener("click", function () {
+    $("e3-refresh").addEventListener("click", function () {
       loadE3Status();
       loadE3Clients();
     });

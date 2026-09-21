@@ -55,9 +55,8 @@
     <!-- Overview -->
     <section id="view-overview" class="view">
       <div class="status-row card">
-        <div class="kv"><span class="k">Collector uptime</span><span class="v" id="st-uptime">—</span></div>
-        <div class="kv"><span class="k">Last event</span><span class="v" id="st-last-event">—</span></div>
-        <div class="kv"><span class="k">Snapshot generated</span><span class="v" id="st-generated">—</span></div>
+        <div class="kv"><span class="k">Uptime</span><span class="v" id="st-uptime">—</span></div>
+        <div class="kv"><span class="k">Last update</span><span class="v" id="st-last-event">—</span></div>
       </div>
       <div class="cards">
         <div class="card stat"><div class="stat-label">Devices</div><div class="stat-value" id="st-devices">—</div></div>
@@ -133,42 +132,29 @@
         <p id="rec-result" class="key-result hidden"></p>
       </div>
 
-      <div class="card">
-        <h2>Management plane</h2>
-        <p class="muted">Two independent states. The monitor can be fully online while the privileged mutation plane stays closed — that is the normal, safe default.</p>
-        <div class="kv"><span class="k">Monitor (dashboard + collector)</span><span class="v"><span class="badge" id="mg-monitor" data-state="unknown">—</span></span></div>
-        <div class="kv"><span class="k">Management mutations</span><span class="v"><span class="badge" id="mg-manage" data-state="unknown">—</span></span></div>
-        <div class="kv"><span class="k">Re-authentication (this session)</span><span class="v"><span class="badge" id="mg-stepup" data-state="unknown">—</span></span></div>
-        <div class="kv"><span class="k">Helper snapshot freshness</span><span class="v"><span class="badge" id="mg-transport" data-state="unknown">—</span></span></div>
-        <div class="kv"><span class="k">Helper snapshot time (as of)</span><span class="v" id="mg-asof">—</span></div>
-        <p id="mg-degraded" class="form-msg error hidden" role="alert">The privileged helper reports a DEGRADED state: mutations are refused until a root operator recovers it.</p>
-        <div class="row">
-          <button id="mg-activate" class="btn" type="button">Activate management</button>
-          <button id="mg-deactivate" class="btn ghost" type="button">Deactivate management</button>
-          <button id="mg-refresh" class="btn ghost" type="button">Refresh</button>
-        </div>
-        <p id="mg-msg" class="form-msg hidden" role="status"></p>
-      </div>
 
       <div class="card">
-        <h2>Client management (E3)</h2>
-        <p class="muted">Reality/HY2 clients known to the privileged helper. Add and delete are privileged mutations: they require a recent re-authentication and run as full transactions inside the root helper (check, reload, automatic rollback). <strong>Client credentials are never displayed or returned here</strong> — after adding a client, generate its configuration on the server with the client-management CLI.</p>
+        <h2>Client management <span class="badge idle" id="e3-availability">Unavailable</span></h2>
+        <p class="muted">Manage Reality and Hysteria2 clients. You may be asked to confirm your admin password before making a change. Client credentials are not displayed on this page.</p>
+        <div class="kv"><span class="k">Client changes</span><span class="v" id="e3-changes">Unavailable</span></div>
+        <p id="e3-unavailable" class="form-msg error" role="status">Client changes are temporarily unavailable. Check the server before making changes.</p>
+        <button id="e3-refresh" class="btn ghost" type="button">Refresh client list</button>
         <div class="table-card">
           <table class="table" id="e3-clients-table">
             <thead>
               <tr>
-                <th>Client</th><th>Protocols</th><th>Mutable</th><th>Source</th><th></th>
+                <th>Client</th><th>Protocols</th><th>Action</th>
               </tr>
             </thead>
             <tbody id="e3-clients-body"></tbody>
           </table>
         </div>
         <div class="row" id="e3-add-row">
-          <input id="e3-add-name" type="text" maxlength="32" placeholder="client name" autocomplete="off">
-          <button id="e3-add-btn" class="btn" type="button">Add client</button>
+          <input id="e3-add-name" type="text" maxlength="32" placeholder="client name" autocomplete="off" disabled>
+          <button id="e3-add-btn" class="btn" type="button" disabled>Add client</button>
         </div>
         <div id="e3-delete-box" class="hidden">
-          <p class="muted">You are deleting client <strong id="e3-del-name"></strong>. This triggers a sing-box reload and cannot be undone from the web. Type the client name to confirm.</p>
+          <p class="muted">You are deleting client <strong id="e3-del-name"></strong>. This cannot be undone from this page. Type the client name to confirm.</p>
           <div class="row">
             <input id="e3-del-confirm" type="text" maxlength="32" placeholder="type the client name" autocomplete="off">
             <button id="e3-del-btn" class="btn" type="button">Delete permanently</button>
@@ -177,21 +163,17 @@
         </div>
         <p id="e3-msg" class="form-msg hidden" role="status"></p>
         <div id="e3-retry-row" class="row hidden">
-          <span class="muted">Pending operation: <strong id="e3-retry-name"></strong> (result unknown).</span>
-          <button id="e3-retry-btn" class="btn" type="button">Retry with the SAME key</button>
+          <span class="muted">Unconfirmed change: <strong id="e3-retry-name"></strong>. Refresh the client list before retrying.</span>
+          <button id="e3-retry-btn" class="btn" type="button">Retry previous change</button>
         </div>
       </div>
 
       <div class="card">
         <h2>Monitor information</h2>
         <div class="kv"><span class="k">Version</span><span class="v" id="mi-version">—</span></div>
-        <div class="kv"><span class="k">Monitor started</span><span class="v" id="mi-started">—</span></div>
-        <div class="kv"><span class="k">Collector uptime</span><span class="v" id="mi-uptime">—</span></div>
-        <div class="kv"><span class="k">Batches processed</span><span class="v" id="mi-batches">—</span></div>
-        <div class="kv"><span class="k">Skipped events</span><span class="v" id="mi-skipped">—</span></div>
-        <div class="kv"><span class="k">Identity conflicts</span><span class="v" id="mi-conflicts">—</span></div>
-        <div class="kv"><span class="k">Abandoned on reset</span><span class="v" id="mi-abandoned">—</span></div>
-        <div class="kv"><span class="k">Last stream error</span><span class="v" id="mi-error">—</span></div>
+        <div class="kv"><span class="k">Started</span><span class="v" id="mi-started">—</span></div>
+        <div class="kv"><span class="k">Uptime</span><span class="v" id="mi-uptime">—</span></div>
+        <p id="mi-warning" class="form-msg error hidden" role="status">Monitoring data may be delayed.</p>
       </div>
     </section>
   </main>
@@ -217,9 +199,9 @@
   <form id="stepup-form" class="panel">
     <div class="brand center">
       <svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true"><path fill="currentColor" d="M12 2 4 5.5v5.2c0 5 3.4 9.6 8 10.8 4.6-1.2 8-5.8 8-10.8V5.5L12 2z"/><path fill="currentColor" d="M11 7h2v5.2l3.3 1.9-1 1.7L11 13.4V7z"/></svg>
-      <span>Confirm password</span>
+      <span>Confirm admin password</span>
     </div>
-    <p class="muted">This change requires a fresh re-authentication. Your password is verified once and authorizes changes for the next few minutes.</p>
+    <p class="muted">Confirm your admin password to continue with this change.</p>
     <label>Admin password<input id="stepup-password" type="password" autocomplete="current-password"></label>
     <button class="btn full" type="submit">Authorize</button>
     <button id="stepup-cancel" class="btn ghost full" type="button">Cancel</button>
@@ -258,7 +240,7 @@
 
 <template id="protocol-row-template">
   <div class="proto-row">
-    <div class="proto-name"><span class="proto-label"></span><span class="proto-tag muted"></span></div>
+    <div class="proto-name"><span class="proto-label"></span></div>
     <div class="proto-stats">
       <span class="proto-rate up">↑ <span class="pr-up"></span></span>
       <span class="proto-rate down">↓ <span class="pr-down"></span></span>

@@ -68,7 +68,7 @@ assert_contains 'management.activate' "$WEB_SRC" "the four-op mutation boundary 
 assert_contains 'client.delete' "$WEB_SRC" "the four-op mutation boundary is declared (client.delete)"
 assert_contains 'e3_unavailable' "$SERVER_SRC" "the mutation boundary fails closed without an E3 backend (M2; the M0.5 501 was replaced by the real adapter)"
 assert_contains 'id="stepup-overlay" class="overlay hidden"' "$INDEX_SRC" "the password panel is hidden on load (never asked proactively)"
-assert_contains 'Management plane' "$INDEX_SRC" "the dashboard renders the orthogonal status model"
+assert_contains 'id="e3-availability"' "$INDEX_SRC" "the dashboard renders client availability from management status"
 # T12 (static half): no code path in the web process addresses either
 # privileged tree. There is no read, no write, no path constant -- the only
 # future channel is the sbox-cm RPC.
