@@ -429,14 +429,24 @@ fi
 
 printf '\n== client.export re-executes on every dispatch (the helper caches nothing) ==\n'
 # The daemon-side replay cache is bypassed for sensitive ops (M4), so a second
-# dispatch really re-runs the read -- there is NO transactional dedup anywhere:
-# the audit-id exactly-once guard (request_id:generation) still collapses the
-# duplicate to a single audit record.
+# dispatch really re-runs the read. R8 option A: client.export is a credential
+# DISCLOSURE, so EVERY actual delivery gets its own audit record -- the
+# request_id:generation exactly-once guard stays in force for MUTATIONS only.
 o2="$(wout client.export '{"request_id":"reqid-export-000001","name":"exp-01"}')"
 assert_eq true "$(jqv "$o2" '.ok')" 'the same request_id re-executes rather than dedups'
 assert_eq "$Y" "$(jqv "$o2" '.data.content')" 'both exports render identical bytes'
-assert_eq 1 "$(count "$AUDIT" '"request_id":"reqid-export-000001"')" \
-    'the audit-id guard keeps one audit record for the repeated request_id'
+assert_eq 2 "$(count "$AUDIT" '"request_id":"reqid-export-000001"')" \
+    'each actual export delivery writes its own audit record'
+assert_eq 2 "$(grep -F '"request_id":"reqid-export-000001"' "$AUDIT" \
+    | grep -cF '"outcome":"ok"' || true)" \
+    'both export deliveries are audited ok, independently'
+# a refusal must never suppress a later DELIVERY record under the same rid
+o="$(wout client.export '{"request_id":"reqid-export-refok01","name":"ghost-98"}')"
+assert_eq false "$(jqv "$o" '.ok')" 'setup: first attempt on this rid is a refusal'
+o="$(wout client.export '{"request_id":"reqid-export-refok01","name":"exp-01"}')"
+assert_eq true "$(jqv "$o" '.ok')" 'the later delivery on the same rid succeeds'
+assert_eq 2 "$(count "$AUDIT" '"request_id":"reqid-export-refok01"')" \
+    'refusal + delivery each keep their own audit record (per-attempt audit)'
 o3="$(wout client.export '{"request_id":"reqid-export-000002","name":"exp-01"}')"
 assert_eq true "$(jqv "$o3" '.ok')" 'a fresh request_id also succeeds'
 assert_eq 1 "$(count "$AUDIT" '"request_id":"reqid-export-000002"')" 'each new request_id writes its own audit'
@@ -497,6 +507,31 @@ assert_eq E_INTERNAL "$(jqv "$o" '.code')" 'over-cap maps to E_INTERNAL (fail-cl
 printf '%s' "$o" | grep -qF "$FIXTURE_PASSWORD" && fail 'the over-cap refusal echoed credential material' \
     || pass 'the over-cap refusal is credential-free'
 fi
+
+# R6: raw bytes UNDER the 48 KiB cap, but JSON escaping inflates the FINAL
+# frame past MAX_FRAME (every '"' becomes \", one extra byte each). The
+# serialized-frame gate must refuse BEFORE the success audit: no payload,
+# and no ok audit record for the refused request_id at all.
+ESC="$(printf '"%.0s' $(seq 1 46000))"
+o="$(wout client.add '{"request_id":"reqid-add-expesc0001","name":"exp-esc1","idempotency_key":"key-000000000a09"}')"
+ESC_PW="$ESC" jq '(.inbounds[]|select(.tag=="hy2-in")|.users[]|select(.name=="exp-esc1")|.password) = $ENV.ESC_PW' \
+    "$SB_SERVER_CONFIG" > "$SB/esc.json" && mv "$SB/esc.json" "$SB_SERVER_CONFIG"
+o="$(wout client.export '{"request_id":"reqid-export-esc0001","name":"exp-esc1"}')"
+if ! printf '%s' "$o" | jq -e '.ok == false' >/dev/null 2>&1; then
+    fail 'the escape-heavy injection did not land on this platform; the frame-gate case is untested'
+else
+assert_eq false "$(jqv "$o" '.ok')" 'an escape-inflated final frame is refused'
+assert_eq E_INTERNAL "$(jqv "$o" '.code')" 'frame overflow maps to E_INTERNAL (fail-closed, no truncation)'
+printf '%s' "$o" | grep -qF '序列化' && pass 'the refusal names the SERIALIZED-frame gate, not the raw cap' \
+    || fail 'the refusal did not come from the serialized-frame gate'
+printf '%s' "$o" | grep -qF 'mihomo-yaml' && fail 'the refused frame still advertised a payload' \
+    || pass 'the frame-gate refusal carries no payload'
+assert_eq 0 "$(grep -F '"request_id":"reqid-export-esc0001"' "$AUDIT" 2>/dev/null \
+    | grep -cF '"outcome":"ok"' || true)" \
+    'a frame-gate refusal is never audited as a successful credential delivery'
+fi
+o="$(wout client.delete '{"request_id":"reqid-del-expesc0001","name":"exp-esc1","idempotency_key":"key-000000000a10"}')"
+assert_eq true "$(jqv "$o" '.ok')" 'cleanup: exp-esc1 deleted'
 
 printf '\n== client.export refusals while degraded / inactive ==\n'
 # sourcing is idempotent (pure function definitions); the later sections

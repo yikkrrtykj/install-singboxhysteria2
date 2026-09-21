@@ -86,6 +86,15 @@ emit_err() { # <code> <stage> <retriable> <detail> [backup]
 w_audit() { # <outcome> <stage> [error_code] -> rc 0 durable-or-present
     local outcome="$1" stage="$2" err="${3:-}" audit_id kfp=""
     audit_id="${REQ_ID}:${GEN}"
+    # R8: client.export is a read -- EVERY dispatch is a fresh credential
+    # delivery, so the mutation dedup key must not collapse two deliveries
+    # (or a refusal followed by a delivery) into one record. The per-
+    # process+nonce suffix makes each export attempt auditable on its own.
+    # Mutation semantics are untouched: their GEN is journal-bound and
+    # reconciliation looks them up by the deterministic request_id:gen key.
+    if [ "${OP:-}" = "client.export" ]; then
+        audit_id="${audit_id}:$(date +%s%N)-$$-${RANDOM}"
+    fi
     if cm_audit_has "$audit_id"; then return 0; fi
     if [ -n "${KEY:-}" ]; then kfp="$(cm_key_fp "$KEY" 2>/dev/null)"; fi
     jq -cn --arg rid "${REQ_ID:-}" --arg op "${OP:-}" --arg name "${NAME:-}" \
@@ -381,7 +390,31 @@ _export_locked() {
         err_exit rejected E_INTERNAL revalidate false "导出内容超过帧上限，拒绝交付（fail-closed，不截断）"
     fi
 
-    # Audit FIRST and fail-closed: metadata only (w_audit never sees the YAML;
+    # R6: the raw cap alone does NOT prove the FINAL serialized JSON frame
+    # fits MAX_FRAME -- every quote/backslash/control byte in the YAML
+    # inflates the JSON-escaped copy. Serialize the delivery response NOW
+    # (the YAML is slurped from the PIPE via jq -Rs, never argv/env), keep
+    # the serialized bytes in shell memory ONLY, and measure their exact
+    # UTF-8 length BEFORE auditing success: an export that cannot fit one
+    # RPC frame must never be audited as a delivered credential. The 1024
+    # byte margin covers the daemon envelope (v/op/request_id, bounded by
+    # the request-id schema, plus JSON separators). Fail closed, never
+    # truncate.
+    local resp rlen
+    tx="$(tx_json)"
+    if ! resp="$(printf '%s' "$yaml" \
+        | jq -Rsc --arg filename "$NAME-mihomo.yaml" --argjson t "$tx" \
+            '{ok:true, code:"OK", stage:"done",
+              data:{format:"mihomo-yaml", filename:$filename, content:.},
+              idempotency:null, warnings:[], transaction:$t, error:null}')"; then
+        err_exit rejected E_INTERNAL outcome false "导出序列化失败，拒绝交付（fail-closed）"
+    fi
+    rlen="$(printf '%s' "$resp" | wc -c | tr -d ' ')"
+    if [ "${rlen:-0}" -gt 64512 ]; then
+        err_exit rejected E_INTERNAL outcome false "序列化后的导出帧超出上限，拒绝交付（fail-closed，不截断）"
+    fi
+
+    # Audit and fail-closed: metadata only (w_audit never sees the YAML;
     # its jq inputs are request_id/op/name/outcome/actor fingerprints).
     if ! w_audit ok export ""; then
         warning "导出审计无法落盘：拒绝交付（fail-closed）"
@@ -389,15 +422,9 @@ _export_locked() {
         exit 0
     fi
 
-    # The one sanctioned sensitive delivery: YAML bytes go to jq via the PIPE
-    # only (-Rs slurps stdin); filename carries the client name, never a
-    # credential. tx_json is the fixed non-secret transaction object.
-    tx="$(tx_json)"
-    printf '%s' "$yaml" \
-        | jq -Rs --arg filename "$NAME-mihomo.yaml" --argjson t "$tx" \
-            '{ok:true, code:"OK", stage:"done",
-              data:{format:"mihomo-yaml", filename:$filename, content:.},
-              idempotency:null, warnings:[], transaction:$t, error:null}'
+    # The one sanctioned sensitive delivery: the serialized response goes to
+    # stdout as-is -- the EXACT bytes whose frame size was proven above.
+    printf '%s' "$resp"
     exit 0
 }
 
