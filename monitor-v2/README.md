@@ -550,8 +550,10 @@ POST /api/v1/clients/export   → client.export
 GET  /api/v1/clients/export   → 405（Allow: POST；导出永远不是可缓存的 GET）
 ```
 
-* 鉴权链与特权变更完全一致：session → CSRF → step-up → body 形状校验
-  （`{"name": "<client>"}`）→ broker 新鲜度闸门；
+* 鉴权链与特权变更完全一致：session → CSRF → step-up → body 形状校验 →
+  broker 新鲜度闸门；body 必须**恰好**是 `{"name": "<client>"}`——多一个键、
+  少一个键、非对象 JSON、畸形或空 body 一律 400（`invalid_request_body`），
+  全部发生在 broker 之前，对应零 export RPC；
 * **不接受 `Idempotency-Key`**：header 或 body 出现即 400——`client.export`
   是只读重渲染，不是事务，没有 ledger/journal/reload；
 * broker 闸门比 mutation 更严：breaker closed 且一条 **FRESH**

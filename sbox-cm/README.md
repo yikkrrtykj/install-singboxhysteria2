@@ -141,8 +141,12 @@ D-read：5 s（帧头收完后读满 payload 的上限）
 （字节级一致），锁内现场渲染、每次 dispatch 都重跑。它**不是事务**：无
 `Idempotency-Key`（携带即拒绝）、无 ledger、无 journal、无 reload；前置条件
 fail-closed（`E_NOT_FOUND` / `E_CONFIG_INCONSISTENT` / `E_ACTIVATION_STATE` /
-`E_MANUAL_INTERVENTION`）；渲染结果超过 48 KiB 一律拒绝、绝不截断；审计只记
-元数据。daemon 将其列入 `SENSITIVE_RESPONSE_OPS`：成功响应**永不进入
+`E_MANUAL_INTERVENTION`）；渲染结果超过 48 KiB 一律拒绝，且**先序列化、先证明
+尺寸**：YAML 经管道交给 `jq -Rs` 得到最终 JSON 响应（只留在 shell 内存），按
+UTF-8 字节度量到 `MAX_FRAME` 预算内才允许交付——超限一律 fail-closed、绝不截断，
+且尺寸证明发生在成功审计**之前**（装不进帧的导出绝不会留下"凭据已交付"的审计）。
+审计只记元数据；`client.export` 每次真实交付各写一条独立审计（见 §9）。
+daemon 将其列入 `SENSITIVE_RESPONSE_OPS`：响应**永不读写
 replay cache**，也不落任何日志。
 
 ## 5. 凭据卫生（M1-A）
@@ -236,6 +240,9 @@ durable intent 之后 → 绝不中止：browser 断连、web 重启、RPC 断�
     → worker 写一条事务审计（source="worker"），RPC core 绝不再补第二条
 audit_id = request_id + ":" + generation（mutation）
 调和时：audit_id 已 durable 则不再追加，否则补一条
+client.export 例外（敏感披露，逐次留痕）：audit_id 额外携带每次派发的
+nonce 后缀，真实交付一次 = 审计一条；mutation 的 request_id:generation
+exactly-once 语义原封不动。
 ```
 
 ## 10. 测试
