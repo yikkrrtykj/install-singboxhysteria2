@@ -48,9 +48,12 @@ MAX_FRAME = 65536
 
 # Caller wait budgets (M2 frozen ruling; NOT helper deadlines). client.list
 # gets 20s because the helper's config.lock wait alone can run 15s.
+# M4: client.export shares that 20s read budget (same lock wait, plus the
+# in-process render); it is a read -- no 120s mutation window applies.
 DEFAULT_OP_BUDGETS = {
     "management.status": 5.0,
     "client.list": 20.0,
+    "client.export": 20.0,
     "management.activate": 30.0,
     "management.deactivate": 30.0,
     "client.add": 120.0,

@@ -38,6 +38,7 @@ UNAVAILABLE = "unavailable"
 
 STATUS_OP = "management.status"
 LIST_OP = "client.list"
+EXPORT_OP = "client.export"
 
 
 class BrokerUnavailable(Exception):
@@ -295,3 +296,47 @@ class E3Broker:
                 raise BrokerUnavailable(
                     "breaker is %s; mutation not dispatched" % self._state)
         return self.client.call(op, payload=payload, actor=actor)
+
+    # ------------------------------------------------------------ export --
+    def export_client(self, name, actor=None):
+        """Dispatch exactly ONE read-only client.export RPC (M4).
+
+        Refused -- zero RPCs -- unless ALL of the following hold:
+
+        * the breaker is ``closed``;
+        * a FRESH (within-TTL) management.status snapshot reports
+        ``management_active`` true, ``helper.degraded`` false,
+        ``helper.reconcile`` clean and ``lock.acquirable`` true.
+
+        This gate is deliberately STRICTER than ``mutate``: an export hands
+        credential material to the caller, so it runs only while the helper
+        plane is provably healthy right now (a stale/unavailable/verdict
+        answer is a refusal, never a fallback). The result is SENSITIVE: it
+        is returned to this one caller for immediate delivery and NEVER
+        cached, replayed or stored by the broker. Transport errors and
+        helper verdicts propagate untouched -- same single-dispatch rule as
+        ``mutate``; no automatic retry is ever performed here."""
+        with self._mutex:
+            if self._state != "closed":
+                raise BrokerUnavailable(
+                    "breaker is %s; export not dispatched" % self._state)
+        result = self.status()
+        if result.get("transport") != FRESH or result.get("payload") is None:
+            raise BrokerUnavailable("no fresh management.status; export refused")
+        payload = result["payload"]
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, dict):
+            raise BrokerUnavailable("fresh status has no data; export refused")
+        helper = data.get("helper")
+        lock = data.get("lock")
+        ok = (data.get("management_active") is True
+              and isinstance(helper, dict)
+              and helper.get("degraded") is False
+              and helper.get("reconcile") == "clean"
+              and isinstance(lock, dict)
+              and lock.get("acquirable") is True)
+        if not ok:
+            raise BrokerUnavailable("management gate not satisfied; "
+                                    "export refused")
+        return self.client.call(EXPORT_OP, payload={"name": name},
+                                actor=actor)
