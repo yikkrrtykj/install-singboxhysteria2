@@ -1153,6 +1153,9 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
 
         * reached only after session -> CSRF -> step-up; the actor is the
           gate-frozen one (B2), exactly like the mutations;
+        * the body must be EXACTLY {"name": "..."} -- any other JSON (array,
+          scalar, malformed, empty) or any extra/missing/other key is a 400
+          answered BEFORE the broker, so it can never dispatch an RPC;
         * NO Idempotency-Key exists for a read: header or body key is a
           400 -- the export re-renders live on every dispatch;
         * `legacy` is exportable BY DESIGN (lifecycle closure); the body
@@ -1175,16 +1178,38 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             self._e3_unavailable("the E3 adapter is not wired in this build")
             return
 
-        body = self._json_body() or {}
-        if self.headers.get(IDEMPOTENCY_HEADER) is not None \
-                or "idempotency_key" in body:
+        body = self._json_body()
+        if self.headers.get(IDEMPOTENCY_HEADER) is not None:
             self._send_json(400, {
                 "ok": False, "code": "invalid_idempotency_key",
                 "error": "client.export is read-only and accepts no "
                          "Idempotency-Key",
                 "retriable": False})
             return
-        name = body.get("name")
+        if not isinstance(body, dict):
+            self._send_json(400, {
+                "ok": False, "code": "invalid_request_body",
+                "error": 'the export body must be a JSON object exactly '
+                         '{"name": "..."}',
+                "retriable": False})
+            return
+        if "idempotency_key" in body:
+            self._send_json(400, {
+                "ok": False, "code": "invalid_idempotency_key",
+                "error": "client.export is read-only and accepts no "
+                         "Idempotency-Key",
+                "retriable": False})
+            return
+        if set(body) != {"name"}:
+            # R5: one accepted key, no extras -- an unexpected field is a
+            # schema error, not something to ignore on a credential route.
+            self._send_json(400, {
+                "ok": False, "code": "invalid_request_body",
+                "error": 'the export body must contain exactly the key '
+                         '"name" and nothing else',
+                "retriable": False})
+            return
+        name = body["name"]
         if not isinstance(name, str) or not E3_NAME_RE.match(name):
             self._send_json(400, {
                 "ok": False, "code": "invalid_name",

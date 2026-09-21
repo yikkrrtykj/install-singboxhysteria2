@@ -1168,18 +1168,40 @@ def group_export_http():
     out["export_no_stepup_zero_rpc"] = "client.export" not in client.calls
     step_up(port, cookie, csrf)
 
-    # body validation happens BEFORE any dispatch (free refusals)
-    r = export(port, cookie, csrf, {"Idempotency-Key": "m2-key-0000000000000009"})
-    body = json.loads(r["body"])
-    out["export_header_key_400"] = (
-        r["status"] == 400 and body.get("code") == "invalid_idempotency_key")
-    r = export(port, cookie, csrf, None,
-               json.dumps({"name": "vmix-01", "idempotency_key": "k" * 16}))
-    out["export_body_key_400"] = r["status"] == 400
-    r = export(port, cookie, csrf, None, json.dumps({"name": "../x"}))
-    out["export_bad_name_400"] = r["status"] == 400
+    # body validation happens BEFORE any dispatch (free refusals). R5: the
+    # RPC count is sampled around EACH bad request individually -- a single
+    # before/after over the whole block would not prove any one specific
+    # rejected request dispatched nothing.
+    def bad_request(label, code, body=None, headers=None):
+        before = len(client.calls)
+        r = export(port, cookie, csrf, headers,
+                   body if body is not None
+                   else json.dumps({"name": "vmix-01"}))
+        out[label + "_400"] = (
+            r["status"] == 400 and
+            json.loads(r["body"]).get("code") == code)
+        out[label + "_zero_rpc"] = len(client.calls) == before
+        return r
+
+    bad_request("export_header_key", "invalid_idempotency_key",
+                headers={"Idempotency-Key": "m2-key-0000000000000009"})
+    bad_request("export_body_key", "invalid_idempotency_key",
+                body=json.dumps({"name": "vmix-01",
+                                 "idempotency_key": "k" * 16}))
+    bad_request("export_bad_name", "invalid_name",
+                body=json.dumps({"name": "../x"}))
+    # R5 exact shape: one and only one key, "name". Extras, omissions,
+    # non-object JSON and malformed JSON are all 400 invalid_request_body.
+    bad_request("export_extra_field", "invalid_request_body",
+                body=json.dumps({"name": "vmix-01", "extra": 1}))
+    bad_request("export_missing_name", "invalid_request_body",
+                body=json.dumps({"other": 1}))
+    bad_request("export_non_object", "invalid_request_body",
+                body=json.dumps(["vmix-01"]))
+    bad_request("export_malformed", "invalid_request_body",
+                body="{not json")
+    bad_request("export_empty_body", "invalid_request_body", body="")
     calls_before = len(client.calls)
-    out["export_bad_requests_zero_rpc"] = len(client.calls) == calls_before
 
     # the gate: breaker open -> 503 e3_unavailable, zero export RPC
     broker._state = "open"
