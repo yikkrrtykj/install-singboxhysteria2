@@ -1166,6 +1166,16 @@ else
 fi
 
 section_py 'running the contract harness'
+section_py 'executing the UI behavior regression'
+if node "$ROOT/tests/test-monitor-v2-ui.cjs" > "$HARNESS.ui" 2>&1; then
+    while IFS= read -r name; do
+        pass "$name"
+    done < "$HARNESS.ui"
+else
+    fail 'UI behavior regression failed'
+    cat "$HARNESS.ui"
+fi
+rm -f "$HARNESS.ui"
 export MONITOR_V2_ROOT="$ROOT/monitor-v2"
 export STATIC_DIR="$ROOT/monitor-v2/web/static"
 "$PY" "$HARNESS" > "$HARNESS.out" 2>"$HARNESS.err"
