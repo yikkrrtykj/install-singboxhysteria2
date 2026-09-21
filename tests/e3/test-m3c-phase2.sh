@@ -8,7 +8,7 @@ BRIDGE="$ROOT/monitor-v2/deploy/e3-m3c-phase2-rpc.py"
 TMP="$(mktemp -d)"
 PASS=0
 FAIL=0
-EXPECTED_TOTAL=181
+EXPECTED_TOTAL=197
 
 pass(){ PASS=$((PASS+1)); printf '  PASS %s\n' "$*"; }
 fail(){ FAIL=$((FAIL+1)); printf '  FAIL %s\n' "$*"; }
@@ -225,6 +225,22 @@ else
     TEST_LOCK_BACKEND=mkdir
 fi
 
+# Exercise the production sanitizer itself without running the command dispatcher.
+# The successful flow below separately checks the durable journal evidence.
+source <(sed -n '/^sanitize_result()/,/^$/p' "$ORCH")
+for field in no_op deleted derived_cleanup; do
+    for value in false true missing null; do
+        case "$value" in
+          missing) input='{"data":{}}'; expected=null; label='missing optional boolean sanitizes to null' ;;
+          true) input="$(jq -cn --arg field "$field" '{data:{($field):true}}')"; expected=true; label='true remains true' ;;
+          false) input="$(jq -cn --arg field "$field" '{data:{($field):false}}')"; expected=false; label='evidence preserves optional false booleans' ;;
+          null) input="$(jq -cn --arg field "$field" '{data:{($field):null}}')"; expected=null; label='explicit null remains null' ;;
+        esac
+        result="$(printf '%s' "$input" | sanitize_result)"
+        assert_eq true "$(printf '%s' "$result" | jq -r --arg field "$field" --argjson expected "$expected" '.data | has($field) and (.[$field] == $expected)')" "phase2 $label ($field)"
+    done
+done
+
 # Happy path: preflight evidence is the only write before separately approved canary.
 setup_fixture happy
 CONFIG_BEFORE="$(sha256sum "$FIX/config.json" | awk '{print $1}')"
@@ -253,6 +269,10 @@ if has_client legacy; then pass 'happy path preserves the unrelated legacy clien
 assert_eq "$CONFIG_BEFORE" "$(sha256sum "$FIX/config.json" | awk '{print $1}')" 'happy path restores the exact config SHA'
 assert_eq "$P1_BEFORE" "$(sha256sum "$FIX/phase1/baseline.json" "$FIX/phase1/journal.json")" 'Phase 1 production evidence remains untouched'
 assert_eq canary_complete "$(jq -r '.final_status' "$FIX/phase2/journal.json")" 'journal records terminal canary completion'
+assert_eq false "$(jq -r '.activation.result.data.no_op' "$FIX/phase2/journal.json")" 'phase2 evidence preserves no_op=false (activation)'
+assert_eq false "$(jq -r '.deactivation.result.data.no_op' "$FIX/phase2/journal.json")" 'phase2 evidence preserves no_op=false (deactivation)'
+assert_eq true "$(jq -r '.delete.result.data.deleted' "$FIX/phase2/journal.json")" 'phase2 evidence true remains true (deleted)'
+assert_eq true "$(jq -r '.delete.result.data.derived_cleanup' "$FIX/phase2/journal.json")" 'phase2 evidence true remains true (derived_cleanup)'
 assert_eq true "$(jq -r '.activation.completed and .add.completed and .delete.completed and .deactivation.completed' "$FIX/phase2/journal.json")" 'journal records every completed canary stage'
 assert_eq true "$(jq -r '(.source_head|test("^[0-9a-f]{40}$")) and (.created_epoch|type=="number") and (.canary.name|test("^m3c-")) and (.canary.add_idempotency_key|test("^m3c2-add-")) and (.canary.delete_idempotency_key|test("^m3c2-del-"))' "$FIX/phase2/baseline.json")" 'immutable baseline carries every recovery identifier'
 if grep -ERq 'uuid|password|credential' "$FIX/phase2" "$FIX/canary.out"; then fail 'Phase 2 evidence contains credential-shaped data'; else pass 'Phase 2 evidence and output contain no credentials'; fi

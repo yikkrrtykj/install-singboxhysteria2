@@ -164,7 +164,8 @@ atomic_json_write(){
     evidence_fsync "$dir" "$context" dir_fsync
 }
 
-sanitize_result(){ jq -c '{ok:(.ok//false),code:(.code//null),data:{management_state:(.data.management_state//null),no_op:(.data.no_op//null)},transport_error:(.transport_error//null),adapter_error:(.adapter_error//null)}' 2>/dev/null; }
+# Direct field lookup preserves false/true; missing and explicit null remain null.
+sanitize_result(){ jq -c '{ok:(.ok//false),code:(.code//null),data:{management_state:(.data.management_state//null),no_op:.data.no_op},transport_error:(.transport_error//null),adapter_error:(.adapter_error//null)}' 2>/dev/null; }
 
 journal_write(){
     local context="${1:-journal}"
