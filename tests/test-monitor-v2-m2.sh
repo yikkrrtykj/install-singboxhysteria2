@@ -1321,6 +1321,282 @@ def group_export_http():
     return out
 
 
+# ------------------------------------------- 0.1.3 post-mutation convergence --
+def group_post_mutation_invalidation():
+    """Broker-level A-F: invalidate_after_client_mutation must expire BOTH
+    caches and re-open the attempt throttles immediately (no TTL/watchdog
+    wait), while an in-flight pre-mutation refresh can never repopulate the
+    invalidated cache (generation epochs). Breaker, single-flight and the
+    fresh-only writable gate keep their exact semantics."""
+    out = {}
+
+    # A. status cache bypass after a confirmed mutation (< TTL elapsed).
+    clock = FakeClock()
+    client = FakeClient()
+    broker = new_broker(client, clock)
+    client.record(ok_status(active=True))
+    broker.status()                                  # RPC 1: fresh seed
+    out["A_seed_fresh_one_rpc"] = len(client.calls) == 1
+    broker.invalidate_after_client_mutation()
+    out["A_stale_active_never_trusted"] = \
+        broker.management_active() is False          # gate stays fail-closed
+    client.record(ok_status(active=True))
+    r = broker.status()                              # RPC 2 IMMEDIATELY
+    out["A_immediate_refetch_is_fresh"] = (
+        len(client.calls) == 2 and r["transport"] == "fresh")
+    broker.status()
+    out["A_ttl_cache_still_intact_after_refetch"] = len(client.calls) == 2
+
+    # B. list cache bypass (same, 5s TTL never waited out).
+    clock2 = FakeClock()
+    client2 = FakeClient()
+    broker2 = new_broker(client2, clock2)
+    LIST1 = {"ok": True, "request_id": "B1",
+             "data": {"clients": [{"name": "a"}], "truncated": False}}
+    LIST2 = {"ok": True, "request_id": "B2",
+             "data": {"clients": [{"name": "a"}, {"name": "b"}],
+                      "truncated": False}}
+    client2.record(LIST1)
+    broker2.list_clients()
+    broker2.invalidate_after_client_mutation()
+    client2.record(LIST2)
+    r = broker2.list_clients()
+    out["B_immediate_refetch_is_fresh"] = (
+        len(client2.calls) == 2 and r["transport"] == "fresh"
+        and r["payload"] is LIST2)
+
+    # C. a recent attempt stamp must not block the post-mutation refresh:
+    # first the throttle SUPPRESSES a within-TTL retry, then invalidation
+    # re-opens it.
+    clock3 = FakeClock()
+    client3 = FakeClient()
+    broker3 = new_broker(client3, clock3)
+    client3.record(RpcTransportError("read", "down"))
+    broker3.status()                                 # attempt stamped now
+    broker3.status()
+    out["C_throttle_suppresses_before"] = len(client3.calls) == 1
+    client3.record(ok_status(active=True))
+    broker3.invalidate_after_client_mutation()
+    r = broker3.status()
+    out["C_throttle_reset_allows_refetch"] = (
+        len(client3.calls) == 2 and r["transport"] == "fresh")
+
+    # D. in-flight STATUS race: the RPC began on the pre-mutation world;
+    # invalidation lands while it is blocked; its answer must never become
+    # the authoritative cache, and the next read must obtain a real
+    # post-invalidation snapshot.
+    clock4 = FakeClock()
+    client4 = FakeClient()
+    broker4 = new_broker(client4, clock4)
+    OLD = {"ok": True, "request_id": "OLD-STATUS",
+           "data": {"management_state": "inactive",
+                    "management_active": False,
+                    "helper": {"degraded": False, "reconcile": "clean"},
+                    "lock": {"acquirable": True}}}
+    NEW = {"ok": True, "request_id": "NEW-STATUS",
+           "data": {"management_state": "active",
+                    "management_active": True,
+                    "helper": {"degraded": False, "reconcile": "clean"},
+                    "lock": {"acquirable": True}}}
+    client4.record(ok_status(active=True))
+    broker4.status()                                 # seed
+    clock4.advance(2.5)                              # expire it
+    client4.record("BLOCK")
+    t = threading.Thread(target=broker4.status)
+    t.start()
+    client4.entered.wait(5)                          # old RPC is in flight
+    broker4.invalidate_after_client_mutation()       # confirmed mutation
+    client4.record(OLD)                              # the answer it will meet
+    client4.release.set()
+    t.join(15)
+    client4.release.clear()
+    cache = broker4._status_cache
+    out["D_old_rpc_never_published"] = \
+        cache is None or cache["payload"].get("request_id") != "OLD-STATUS"
+    client4.record(NEW)
+    r = broker4.status()
+    out["D_next_read_gets_post_invalidation_rpc"] = (
+        r["transport"] == "fresh"
+        and r["payload"].get("request_id") == "NEW-STATUS")
+    out["D_gate_writable_again_only_after_fresh_proof"] = \
+        broker4.management_active() is True
+
+    # E. in-flight LIST race: identical contract for client.list.
+    clock5 = FakeClock()
+    client5 = FakeClient()
+    broker5 = new_broker(client5, clock5)
+    LOLD = {"ok": True, "request_id": "OLD-LIST",
+            "data": {"clients": [], "truncated": False}}
+    LNEW = {"ok": True, "request_id": "NEW-LIST",
+            "data": {"clients": [{"name": "fresh-01"}], "truncated": False}}
+    client5.record({"ok": True, "request_id": "L0",
+                    "data": {"clients": [], "truncated": False}})
+    broker5.list_clients()
+    clock5.advance(5.5)
+    client5.record("BLOCK")
+    t = threading.Thread(target=broker5.list_clients)
+    t.start()
+    client5.entered.wait(5)
+    broker5.invalidate_after_client_mutation()
+    client5.record(LOLD)
+    client5.release.set()
+    t.join(15)
+    client5.release.clear()
+    lcache = broker5._list_cache
+    out["E_old_list_never_published"] = \
+        lcache is None or lcache["payload"].get("request_id") != "OLD-LIST"
+    client5.record(LNEW)
+    r = broker5.list_clients()
+    out["E_next_read_gets_post_invalidation_rpc"] = (
+        r["transport"] == "fresh"
+        and r["payload"].get("request_id") == "NEW-LIST")
+
+    # F. WITHOUT invalidation every existing semantic is untouched: the 20
+    # concurrent expired-TTL readers still share exactly one RPC, and a
+    # within-TTL burst still performs none.
+    clock6 = FakeClock()
+    client6 = FakeClient()
+    broker6 = new_broker(client6, clock6)
+    client6.record(ok_status())                      # seed
+    broker6.status()
+    clock6.advance(2.5)
+    client6.record("BLOCK")
+    client6.record(ok_status())
+    results = threads_barrier(20, broker6.status)
+    out["F_single_flight_unchanged"] = (
+        len(client6.calls) == 2 and len(results) == 20
+        and all(r["transport"] == "fresh" for r in results))
+    broker6.status()
+    broker6.status()
+    out["F_ttl_cache_unchanged"] = len(client6.calls) == 2
+
+    # Invalidation is idempotent and breaker-neutral by construction.
+    broker6.invalidate_after_client_mutation()
+    broker6.invalidate_after_client_mutation()
+    out["F_repeated_invalidation_breaker_untouched"] = \
+        broker6.breaker_state() == "closed"
+    return out
+
+
+def group_http_post_mutation_invalidation():
+    """Server placement (§4/§10): invalidate_after_client_mutation runs
+    EXACTLY ONCE per confirmed client.add/client.delete success, BEFORE the
+    HTTP answer, and ZERO times for failures, uncertain outcomes, exports
+    and plain reads."""
+    out = {}
+    clock = FakeClock()
+    client = FakeClient()
+    broker = new_broker(client, clock)
+    inv = {"n": 0}
+    _orig = broker.invalidate_after_client_mutation
+
+    def spy():
+        inv["n"] += 1
+        return _orig()
+
+    broker.invalidate_after_client_mutation = spy
+    stack = M2Stack(e3_broker=broker)
+    port = stack.port
+    cookie = login(port)
+    csrf = session_info(port, cookie)["csrf_token"]
+    step_up(port, cookie, csrf)
+    seq = {"k": 0}
+
+    def nextkey():
+        seq["k"] += 1
+        return "conv-key-%012d" % seq["k"]
+
+    try:
+        # confirmed add success -> exactly one invalidation, and the next
+        # status read refetches even though no TTL has elapsed.
+        n0 = inv["n"]
+        client.record({"ok": True, "request_id": "conv-add-1", "data": {}})
+        r = mutate(port, "/api/v1/clients/add", cookie, csrf,
+                   {"Idempotency-Key": nextkey()},
+                   json.dumps({"name": "conv-01"}))
+        out["add_success_200"] = r["status"] == 200
+        out["add_success_invalidates_exactly_once"] = inv["n"] == n0 + 1
+        status_before = client.calls.count("management.status")
+        client.record(ok_status(active=True))
+        r = req(port, "GET", "/api/v1/management/status", {"Cookie": cookie})
+        out["add_success_next_status_refetches_within_ttl"] = (
+            client.calls.count("management.status") == status_before + 1
+            and json.loads(r["body"]).get("transport") == "fresh")
+
+        # confirmed delete success (preflight + delete) -> exactly one.
+        n0 = inv["n"]
+        client.record({"ok": True, "request_id": "conv-list-1",
+                       "data": {"clients": [
+                           {"name": "conv-01", "protocols": ["Reality"],
+                            "mutable": True}], "truncated": False}})
+        client.record({"ok": True, "request_id": "conv-del-1", "data": {}})
+        r = mutate(port, "/api/v1/clients/delete", cookie, csrf,
+                   {"Idempotency-Key": nextkey()},
+                   json.dumps({"name": "conv-01", "confirm": "conv-01"}))
+        out["delete_success_200"] = r["status"] == 200
+        out["delete_success_invalidates_exactly_once"] = inv["n"] == n0 + 1
+
+        # helper semantic error -> zero.
+        n0 = inv["n"]
+        client.record({"ok": False, "request_id": "conv-add-2",
+                       "error": {"code": "E_LOCK", "stage": "lock",
+                                 "retriable": True, "detail": "busy"}})
+        r = mutate(port, "/api/v1/clients/add", cookie, csrf,
+                   {"Idempotency-Key": nextkey()},
+                   json.dumps({"name": "conv-02"}))
+        out["semantic_error_http_423"] = r["status"] == 423
+        out["semantic_error_invalidates_zero"] = inv["n"] == n0
+
+        # post-send budget exhaustion (result_unknown / uncertain) -> zero.
+        n0 = inv["n"]
+        client.record(RpcTransportError("read", "budget gone"))
+        r = mutate(port, "/api/v1/clients/add", cookie, csrf,
+                   {"Idempotency-Key": nextkey()},
+                   json.dumps({"name": "conv-03"}))
+        body = json.loads(r["body"])
+        out["uncertain_http_504"] = r["status"] == 504 \
+            and body.get("uncertain") is True
+        out["uncertain_invalidates_zero"] = inv["n"] == n0
+
+        # connect refusal (definitively NOT dispatched) -> zero.
+        n0 = inv["n"]
+        client.record(RpcTransportError("connect", "helper gone"))
+        r = mutate(port, "/api/v1/clients/add", cookie, csrf,
+                   {"Idempotency-Key": nextkey()},
+                   json.dumps({"name": "conv-03"}))
+        out["not_dispatched_http_503"] = r["status"] == 503
+        out["not_dispatched_invalidates_zero"] = inv["n"] == n0
+
+        # client.export (a READ) -> zero, even when it succeeds. The
+        # gate needs a fresh active status: advance past the TTL so the
+        # gate must REFRESH (and prove a refusal-free healthy snapshot).
+        clock.advance(2.5)
+        n0 = inv["n"]
+        client.record(ok_status(active=True))
+        client.record({"ok": True, "request_id": "conv-exp-1",
+                       "data": {"format": "mihomo-yaml",
+                                "filename": "conv-03-mihomo.yaml",
+                                "content": "mixed-port: 7897\n"}})
+        r = req(port, "POST", "/api/v1/clients/export",
+                {"Content-Type": "application/json", "Cookie": cookie,
+                 "X-CSRF-Token": csrf}, json.dumps({"name": "conv-03"}))
+        out["export_success_200"] = r["status"] == 200
+        out["export_invalidates_zero"] = inv["n"] == n0
+
+        # plain reads (status + list) -> zero.
+        clock.advance(2.5)
+        n0 = inv["n"]
+        client.record(ok_status(active=True))
+        req(port, "GET", "/api/v1/management/status", {"Cookie": cookie})
+        client.record({"ok": True, "data": {"clients": [],
+                                            "truncated": False}})
+        req(port, "GET", "/api/v1/clients", {"Cookie": cookie})
+        out["reads_invalidate_zero"] = inv["n"] == n0
+    finally:
+        stack.stop()
+    return out
+
+
 # --------------------------------------------------------- transport (POSIX) --
 class MockHelper(socketserver.BaseRequestHandler):
     def handle(self):
@@ -1447,6 +1723,8 @@ def main():
     out.update(group_http_adapter())
     out.update(group_export_broker())
     out.update(group_export_http())
+    out.update(group_post_mutation_invalidation())
+    out.update(group_http_post_mutation_invalidation())
     with tempfile.TemporaryDirectory() as tmpdir:
         out.update(group_rpc_transport(tmpdir))
     sys.stdout.write(json.dumps(out))

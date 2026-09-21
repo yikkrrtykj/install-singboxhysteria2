@@ -84,7 +84,9 @@ const context = vm.createContext({ document, console, Uint8Array, Date,
 vm.runInContext(app.replace('document.addEventListener("DOMContentLoaded", boot);',
   'globalThis.ui = {state, bind, render, loadSession, loadE3Status, renderE3Controls, renderE3Clients, renderMonitorInfo, addClient, deleteClient, downloadConfig, setPendingRetry, retryPending, apiWithStepUp};'), context);
 const ui = context.ui;
-const flush = async () => { for (let i = 0; i < 12; i++) await Promise.resolve(); };
+// 0.1.3: the post-mutation convergence chains status -> list across several
+// cross-realm promise reactions; 12 ticks starved it. Drain generously.
+const flush = async () => { for (let i = 0; i < 64; i++) await Promise.resolve(); };
 const response = (data, status = 200) => ({ok: status < 400, status, json: () => Promise.resolve(data)});
 // M4: api(raw) hands the FILE response straight to the caller -- only blob().
 const fileResponse = text => ({ok: true, status: 200, blob: () => Promise.resolve({size: text.length})});
@@ -200,16 +202,88 @@ async function main() {
     assert.ok(ids['stepup-overlay'].className.includes('hidden'));
   });
   setStatus(healthy());
-  responses.push(response({}), response(clients), response(healthy()));
+  responses.push(response({}), response(healthy()), response(clients));
   ui.addClient('bob'); await flush();
   check('successful Add displays the download-forward copy without credentials', () => {
     assert.equal(ids['e3-msg'].textContent, 'Client created. Download its configuration below.'); productText();
   });
-  responses.push(response({}), response(ui.state.session), response(clients), response(healthy()));
+  responses.push(response({}), response(ui.state.session), response(healthy()), response(clients));
   ui.deleteClient('alice'); await flush();
   check('successful Delete displays ordinary copy and preserves raw request name', () => {
     assert.equal(ids['e3-msg'].textContent, 'Client deleted.');
     assert.equal(requests.findLast(r => r.url === '/api/v1/clients/delete').body, JSON.stringify({name: 'alice', confirm: 'alice'})); productText();
+  });
+  // ---- 0.1.3 post-mutation immediate convergence --------------------------
+  setStatus(healthy());
+  const withBob = {data: {clients: [...clients.data.clients,
+    {name: 'bob', mutable: true, source: 'web', protocols: ['reality']}],
+  }};
+  let finishStatus;
+  const mark = requests.length;
+  responses.push(response({}),
+                 () => new Promise(res => { finishStatus = res; }),
+                 response(withBob));
+  ui.addClient('bob'); await flush();
+  check('Add success refreshes status THEN list in order, keeping the last good view while in flight', () => {
+    assert.deepEqual(requests.slice(mark).map(r => r.url),
+      ['/api/v1/clients/add', '/api/v1/management/status']);
+    // the in-flight status read did NOT erase the fresh writable state
+    assert.equal(ids['e3-availability'].textContent, 'Available');
+    assert.equal(ids['e3-add-btn'].disabled, false);
+    // the list refresh has NOT been issued yet -- strict ordering
+    assert.equal(requests.slice(mark).length, 2);
+  });
+  finishStatus(response(healthy())); await flush();
+  check('post-Add convergence renders the new client with Download/Delete without any watchdog', () => {
+    assert.equal(requests[mark + 2].url, '/api/v1/clients');
+    assert.equal(ids['e3-availability'].textContent, 'Available');
+    const row = ids['e3-clients-body'].children[2];
+    assert.match(row.textContent, /bob/);
+    assert.match(row.textContent, /Download/);
+    assert.match(row.textContent, /Delete/);
+    assert.equal(ids['e3-msg'].textContent,
+                 'Client created. Download its configuration below.');
+    productText();
+  });
+  setStatus(healthy());
+  const markBad = requests.length;
+  responses.push(response({}), response({error: 'status down'}, 503),
+                 response(withBob));
+  ui.addClient('dan'); await flush();
+  check('failed fresh-status after a successful Add fails closed and keeps no stale controls', () => {
+    assert.equal(requests[markBad + 1].url, '/api/v1/management/status');
+    closed();                       // Unavailable, zero action buttons
+    assert.ok(!/Download|Delete/.test(ids['e3-clients-body'].textContent));
+    assert.equal(ids['e3-msg'].textContent,
+                 'Client created. Download its configuration below.');
+    productText();
+  });
+  setStatus(healthy());
+  ui.state.e3Clients = clients; ui.renderE3Clients(clients);
+  const onlyLegacy = {data: {clients: [clients.data.clients[0]]}};
+  const markDel = requests.length;
+  responses.push(response({}), response(ui.state.session),
+                 response(healthy()), response(onlyLegacy));
+  ui.deleteClient('alice'); await flush();
+  check('Delete success converges immediately: status then list, removed row gone, copy survives', () => {
+    assert.deepEqual(requests.slice(markDel).map(r => r.url),
+      ['/api/v1/clients/delete', '/api/v1/session',
+       '/api/v1/management/status', '/api/v1/clients']);
+    assert.doesNotMatch(ids['e3-clients-body'].textContent, /alice/);
+    assert.match(ids['e3-clients-body'].textContent, /Default/);
+    assert.match(ids['e3-clients-body'].textContent, /Download/);
+    assert.equal(ids['e3-msg'].textContent, 'Client deleted.');
+    productText();
+  });
+  check('the convergence helper is wired into both success paths and defined once', () => {
+    const src = app;
+    assert.equal((src.match(/function refreshClientsAfterMutation/g) || []).length, 1);
+    const addBody = src.slice(src.indexOf('function addClient'), src.indexOf('/* ---------- settings: access control'));
+    const delBody = src.slice(src.indexOf('function deleteClient'), src.indexOf('function downloadConfig'));
+    assert.match(addBody.slice(addBody.indexOf('}).then('), addBody.indexOf('}).catch(')), /refreshClientsAfterMutation\(\);/);
+    assert.match(delBody.slice(delBody.indexOf('}).then('), delBody.indexOf('}).catch(')), /refreshClientsAfterMutation\(\);/);
+    assert.doesNotMatch(addBody.slice(addBody.indexOf('}).then('), addBody.indexOf('}).catch(')), /loadE3Clients\(\);/);
+    assert.doesNotMatch(delBody.slice(delBody.indexOf('}).then('), delBody.indexOf('}).catch(')), /loadE3Clients\(\);/);
   });
   // ---- M4 export: the Download button end to end --------------------------
   setStatus(healthy());
@@ -278,6 +352,6 @@ async function main() {
     assert.ok(!ids['mg-activate'] && !ids['mg-deactivate']);
     assert.ok(requests.every(r => !/management\/(activate|deactivate)/.test(r.url))); productText();
   });
-  assert.equal(count, 39, 'UI assertion count guard');
+  assert.equal(count, 44, 'UI assertion count guard');
 }
 main().catch(err => { console.error(err); process.exitCode = 1; });

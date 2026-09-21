@@ -307,6 +307,45 @@ transport state : fresh（TTL 内成功获取）| stale（展示旧 snapshot，a
                   可等待的暂时故障——两边的运维动作完全不同。
 ```
 
+### 7.6 post-mutation 立即收敛：确认成功后的定向失效（0.1.3 修订）
+
+问题：一次 CONFIRMED 的 client.add/client.delete 之后，UI 仍需等 status_ttl
+(2.0s)/list_ttl (5.0s) 与 attempt-throttle 过期才恢复可写视图——fail-closed
+本身正确，但 2–5 秒的"Unavailable"窗口是纯缓存时延造成的错觉。
+
+修订（Monitor-only，helper/RPC 契约零改动）：
+
+```text
+失效入口 : E3Broker.invalidate_after_client_mutation()——唯一新增公开方法。
+失效对象 : _status_cache / _list_cache（保留 payload，fetched_at 置 -inf，
+           即降级为 STALE 供 §7.5 展示回退，fresh-only 可写门拒绝其恢复可写）
+           + _status_attempted_at / _list_attempted_at（同时复位，否则
+           attempt-throttle 会挡住紧随其后的显式刷新）。
+触发时机 : server._handle_e3_mutation 内 verdict.ok==true 且
+           op ∈ {client.add, client.delete} 时、写出 200 响应之前，各一次。
+           幂等重放再次成功可再次失效（无害）。
+绝不失效 : 任何未确认结局——dispatch-only、504 result_unknown/uncertain、
+           post-send RpcTransportError、E_RECONCILE_CONFLICT、E_LOCK、
+           E_NOT_FOUND、一切错误路径；client.export/client.list/
+           management.status 为只读，永不触发失效。
+在途竞态 : status/list 各自维护单调 epoch（_status_epoch/_list_epoch），
+           每次刷新在 flight 锁内、_mutex 下捕获当前 epoch 后再发 RPC；
+           完成时 epoch 不匹配 ⇒ 预失效的旧响应永不成为权威缓存、永不落
+           attempted_at（transport 失败计数/breaker 仍如实结算——那是诚实
+           的传输信号，不是缓存权威）。旧调用者本人拿到 STALE/UNAVAILABLE；
+           失效后读到 STALE，被 flight 锁挡住的下一位随即发出失效之后的
+           fresh RPC。实现只复用既有 _mutex/flight 锁次序，无新锁序 ⇒
+           无死锁；single-flight、TTL、breaker 语义全部不变。
+前端配套 : 确认成功的 then 分支不再 fire-and-forget 双读，改为
+           refreshClientsAfterMutation()：先 loadE3Status(true)（背景式读，
+           在途不清掉最后已知好视图；失败仍走既有 fail-closed），再
+           loadE3Clients()。消息文本由该 helper 之外的分支写入，收敛刷新
+           不覆盖"Client created./Client deleted."。
+不可弱化 : fail-closed 纪律不变——只有 fresh 且 active 且非 degraded 且
+           reconcile clean 且 lock acquirable 且无 pending uncertain 才
+           可写；"成功"本身永远不直接使 UI 可写。定时器数值一律不动。
+```
+
 ---
 
 ## 8. 调用方等待预算与超时语义（冻结）
