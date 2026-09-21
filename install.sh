@@ -705,7 +705,7 @@ HY2_INBOUND_TAG="hy2-in"
 # lib/client-management.sh. Local repository execution sources the sibling file;
 # the historical curl/process-substitution entry point fetches the same path from
 # the selected repository ref. Tests/helpers may inject SB_CLIENT_MANAGEMENT_LIB.
-SB_CLIENT_MANAGEMENT_SHA256="c63511ebf9e97fd22b62e8480ef200d134abef1105ab8eb5167fb48a675d1d46"
+SB_CLIENT_MANAGEMENT_SHA256="4866c59e1c180f3bc7fef56f497ac93f7ab567c9eebd36a19f3a88ae66d9f4f1"
 
 verify_client_management_library() { # <path>
     local lib="$1" got=""
@@ -767,7 +767,8 @@ load_client_management_library() {
 
     for fn in with_client_lock reload_running_singbox reload_health_ok \
               restore_file_atomically new_candidate_path new_backup_path \
-              commit_server_config cm_transaction_result_json; do
+              commit_server_config cm_transaction_result_json \
+              cm_render_client_mihomo_yaml; do
         if ! declare -F "$fn" >/dev/null 2>&1; then
             warning "共享事务库缺少函数: $fn"
             return 1
@@ -977,6 +978,10 @@ _delete_client_locked() {
 #   $server_ip $reality_port $reality_uuid $reality_server_name $public_key
 #   $short_id $hy_clash_port_yaml $hy_password $hy_server_name
 # Only the credentials differ between clients; everything else is shared.
+# M4-A: this copy now serves ONLY the installer's shared-account display
+# path. The canonical renderer for per-client files and the privileged
+# sbox-cm export op is lib/client-management.sh ::
+# cm_render_client_mihomo_yaml; a byte-identical regression pins the two.
 write_mihomo_template() { # write_mihomo_template <outfile>
     local outfile="$1"
     cat > "$outfile" << EOF || return 1
@@ -1100,9 +1105,6 @@ generate_client_configuration() { # generate_client_configuration <name>
     fi
     uuid="$(printf '%s\n' "$creds" | sed -n '1p')"
     password="$(printf '%s\n' "$creds" | sed -n '2p')"
-    # write_mihomo_template reads these exact names from the caller scope
-    reality_uuid="$uuid"
-    hy_password="$password"
 
     server_ip=$(grep -o "SERVER_IP='[^']*'" "$SB_STATE_FILE" 2>/dev/null | awk -F"'" '{print $2}')
     public_key=$(grep -o "PUBLIC_KEY='[^']*'" "$SB_STATE_FILE" 2>/dev/null | awk -F"'" '{print $2}')
@@ -1132,7 +1134,10 @@ generate_client_configuration() { # generate_client_configuration <name>
     fi
     chmod 0700 "$out_dir"
     out_file="$out_dir/mihomo.yaml"
-    if ! write_mihomo_template "$out_file"; then
+    # M4-A: the file content comes from the ONE canonical renderer in
+    # lib/client-management.sh (the same copy the privileged export op uses);
+    # the output is byte-identical to the historical template.
+    if ! cm_render_client_mihomo_yaml "$name" "$cfg" > "$out_file"; then
         warning "写入客户端配置失败: $out_file"
         return 1
     fi

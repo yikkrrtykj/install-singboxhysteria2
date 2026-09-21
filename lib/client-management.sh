@@ -504,6 +504,162 @@ get_client_credentials() { # get_client_credentials <name> [config] -> "uuid\npa
 }
 
 # ============================================================================
+# M4-A: canonical Mihomo/Clash Meta client YAML renderer (single source).
+#
+# Pure renderer: prints the client YAML to stdout and writes NOTHING
+# anywhere -- no temp file, no log line, no diagnostic. Credential material
+# never enters argv/env: jq reads the config file directly and the values
+# travel through shell memory into this shell's own heredoc expansion only.
+#
+# install.sh `generate_client_configuration` and the privileged sbox-cm
+# `client.export` op MUST render through this exact copy; the byte-identical
+# regressions pin the output against the historical template.
+# Failures are silent (rc only) -- the caller owns user-facing messages.
+# ============================================================================
+cm_render_client_mihomo_yaml() { # <name> [config] -> mihomo YAML on stdout
+    local name="$1" cfg="${2:-$SB_SERVER_CONFIG}"
+    local creds uuid password reality_uuid hy_password
+    local server_ip public_key reality_port reality_server_name short_id
+    local hy_port hy_server_name ishopping hy_hopping_start hy_hopping_end
+    local hy_clash_port_yaml formatted_range=""
+
+    validate_client_name "$name" || return 1
+    [ -f "$cfg" ] || return 1
+    if ! jq empty "$cfg" >/dev/null 2>&1; then
+        return 1
+    fi
+    if ! creds="$(get_client_credentials "$name" "$cfg")"; then
+        return 1
+    fi
+    uuid="$(printf '%s\n' "$creds" | sed -n '1p')"
+    password="$(printf '%s\n' "$creds" | sed -n '2p')"
+
+    # State facts use the same frozen parsing as the historical CLI renderer.
+    server_ip="$(grep -o "SERVER_IP='[^']*'" "$SB_STATE_FILE" 2>/dev/null | awk -F"'" '{print $2}')"
+    public_key="$(grep -o "PUBLIC_KEY='[^']*'" "$SB_STATE_FILE" 2>/dev/null | awk -F"'" '{print $2}')"
+    reality_port="$(jq -r --arg tag "$REALITY_INBOUND_TAG" '.inbounds[] | select(.tag == $tag) | .listen_port' "$cfg")"
+    reality_server_name="$(jq -r --arg tag "$REALITY_INBOUND_TAG" '.inbounds[] | select(.tag == $tag) | .tls.server_name' "$cfg")"
+    short_id="$(jq -r --arg tag "$REALITY_INBOUND_TAG" '.inbounds[] | select(.tag == $tag) | .tls.reality.short_id[0]' "$cfg")"
+    hy_port="$(jq -r --arg tag "$HY2_INBOUND_TAG" '.inbounds[] | select(.tag == $tag) | .listen_port' "$cfg")"
+    hy_server_name="$(grep -o "HY_SERVER_NAME='[^']*'" "$SB_STATE_FILE" 2>/dev/null | awk -F"'" '{print $2}')"
+    ishopping="$(grep '^HY_HOPPING=' "$SB_STATE_FILE" 2>/dev/null | cut -d'=' -f2)"
+    hy_hopping_start="$(grep '^HY_HOPPING_START=' "$SB_STATE_FILE" 2>/dev/null | cut -d'=' -f2)"
+    hy_hopping_end="$(grep '^HY_HOPPING_END=' "$SB_STATE_FILE" 2>/dev/null | cut -d'=' -f2)"
+    hy_clash_port_yaml="    port: $hy_port"
+    if [ "$ishopping" = "TRUE" ] &&
+       [[ "$hy_hopping_start" =~ ^[0-9]+$ ]] &&
+       [[ "$hy_hopping_end" =~ ^[0-9]+$ ]]; then
+        formatted_range="${hy_hopping_start}-${hy_hopping_end}"
+        hy_clash_port_yaml="    port: $hy_port
+    ports: ${formatted_range}
+    hop-interval: 30"
+    fi
+
+    # Reality/HY2 credentials exist ONLY transiently inside shell memory; the
+    # expansion below is the one intended delivery into the rendered config.
+    reality_uuid="$uuid"
+    hy_password="$password"
+    cat << EOF
+mixed-port: 7897
+allow-lan: true
+bind-address: "*"
+mode: rule
+log-level: info
+unified-delay: true
+ipv6: true
+profile:
+  store-selected: true
+  store-fake-ip: true
+dns:
+  enable: true
+  listen: "0.0.0.0:53"
+  ipv6: true
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  default-nameserver:
+    - 223.5.5.5
+    - 8.8.8.8
+  nameserver:
+    - https://dns.alidns.com/dns-query
+    - https://doh.pub/dns-query
+  fallback:
+    - https://1.0.0.1/dns-query
+    - tls://dns.google
+  fallback-filter:
+    geoip: true
+    geoip-code: CN
+    ipcidr:
+      - 240.0.0.0/4
+
+tun:
+  enable: true
+  stack: mixed
+  device: Mihomo
+  mtu: 1420
+  auto-route: true
+  auto-redirect: true
+  auto-detect-interface: true
+  dns-hijack:
+    - any:53
+    - tcp://any:53
+
+proxies:
+  - name: Reality
+    type: vless
+    server: $server_ip
+    port: $reality_port
+    uuid: $reality_uuid
+    network: tcp
+    udp: true
+    tls: true
+    flow: xtls-rprx-vision
+    servername: $reality_server_name
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: $public_key
+      short-id: $short_id
+
+  - name: Hysteria2
+    type: hysteria2
+    server: $server_ip
+${hy_clash_port_yaml}
+    password: $hy_password
+    up: "300 Mbps"
+    down: "300 Mbps"
+    sni: $hy_server_name
+    skip-cert-verify: true
+    alpn:
+      - h3
+
+proxy-groups:
+  - name: 节点选择
+    type: select
+    proxies:
+      - Reality
+      - Hysteria2
+      - 自动选择
+      - DIRECT
+
+  - name: 自动选择
+    type: url-test
+    proxies:
+      - Reality
+      - Hysteria2
+    url: "http://www.gstatic.com/generate_204"
+    interval: 300
+    tolerance: 50
+
+
+rules:
+  - GEOIP,LAN,DIRECT
+  - GEOIP,CN,DIRECT
+  - MATCH,节点选择
+
+EOF
+    return 0
+}
+
+# ============================================================================
 # M1-A: planned credential transaction interface
 #
 # The E3 path MUST NOT build candidates with `jq --arg uuid/--arg password`:
