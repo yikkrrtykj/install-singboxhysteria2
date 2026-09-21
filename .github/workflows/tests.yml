@@ -120,7 +120,7 @@ jobs:
       - name: "E3 M4 canonical Mihomo renderer contract (single source / purity / fail-closed)"
         run: bash tests/e3/test-m4-renderer.sh
 
-      - name: "E3 M1 static contract (single engine / six ops / systemd candidate)"
+      - name: "E3 M1 static contract (single engine / seven ops / systemd candidate)"
         run: bash tests/e3/test-m1-static.sh
 
       - name: "E3 M1 privileged worker (ledger / journal / idempotency / degraded)"
