@@ -91,7 +91,43 @@ systemctl restart sing-box
 
 作用：直接重启 systemd 管理的 sing-box。
 
-## 3.1 安全基线（S0）
+## 3.1 打开服务器 Monitor Web
+
+Monitor Web 只通过服务器本机 `127.0.0.1:9191` 提供访问，不要把 9191 直接开放到公网。
+
+在自己的电脑（Windows PowerShell、Windows Terminal、macOS/Linux 终端均可）建立 SSH 本地端口转发：
+
+```bash
+ssh -N -L 9191:127.0.0.1:9191 root@<VPS_IP>
+```
+
+如果 SSH 不是默认 22 端口：
+
+```bash
+ssh -p <SSH_PORT> -N -L 9191:127.0.0.1:9191 root@<VPS_IP>
+```
+
+保持这个 SSH 窗口打开，然后在本机浏览器访问：
+
+```text
+http://127.0.0.1:9191/
+```
+
+按 `Ctrl+C` 关闭 SSH tunnel。
+
+如果本机的 9191 端口已被占用，可以改用其他本地端口，例如：
+
+```bash
+ssh -N -L 19191:127.0.0.1:9191 root@<VPS_IP>
+```
+
+然后访问：
+
+```text
+http://127.0.0.1:19191/
+```
+
+## 3.2 安全基线（S0）
 
 本分支对凭据与 API 边界做了基线加固：
 
