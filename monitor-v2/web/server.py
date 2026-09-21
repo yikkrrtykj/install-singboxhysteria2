@@ -42,7 +42,7 @@ from web.e3rpc import RpcTransportError
 from web.recovery import (RECOVERY_SUCCESS_MESSAGE, RecoveryGlobalGuard,
                           RecoveryRateLimiter, generate_key)
 
-MONITOR_WEB_VERSION = "0.1.2"
+MONITOR_WEB_VERSION = "0.1.3"
 SESSION_COOKIE = "monitor_session"
 MAX_BODY_BYTES = 65536
 SUPPORTED_METHODS = "GET, POST"
@@ -1125,6 +1125,17 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             return
 
         if verdict.get("ok"):
+            if op in ("client.add", "client.delete"):
+                # 0.1.3 post-mutation convergence: the helper returned a
+                # CONFIRMED terminal success, so expire the status/list
+                # caches BEFORE the browser learns about it -- the
+                # convergence reads that follow must perform fresh helper
+                # RPCs, never TTL or the watchdog. Failed, refused,
+                # uncertain (504/result_unknown) and replayed-error
+                # outcomes never reach this line; an idempotent replay of
+                # a confirmed success invalidates again, which is
+                # harmless by design.
+                broker.invalidate_after_client_mutation()
             self._send_json(200, {
                 "ok": True, "op": op,
                 "request_id": verdict.get("request_id"),

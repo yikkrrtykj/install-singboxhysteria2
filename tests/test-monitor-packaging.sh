@@ -2158,11 +2158,14 @@ assert_no_grep 'the hard gate holds for the production unit' "$WF" \
     "old note-only escape hatch (nonzero rc + no target-unit match => success) is gone"
 
 # ---------------------------------------------------------------------------
-section "T22 production-real upgrade: installed 0.1.1 -> repo 0.1.2 (isolated fixture, R7)"
-# Pins the REAL delta this branch ships: a server with 0.1.1 installed runs
-# the normal install-monitor.sh upgrade against the 0.1.2 candidate. Runs in
-# its OWN fixture root with a dedicated systemctl call log (fresh SBMON_*
+section "T22 production-real upgrade: installed 0.1.1 -> repo VERSION (isolated fixture, R7)"
+# Pins the production 0.1.1 -> current delta: a server with 0.1.1 installed
+# runs the normal install-monitor.sh upgrade against the repo candidate.
+# The candidate version is read from the repo (not hardcoded), so this
+# historical baseline stays meaningful across releases. Runs in its OWN
+# fixture root with a dedicated systemctl call log (fresh SBMON_*
 # overrides), so no historical baseline of the other sections is touched.
+T22_NEW_VER="$(cat "$REPO_ROOT/monitor-v2/VERSION")"
 T22="$TMP/t22"
 T22_APP="$T22/opt/singbox-monitor"
 T22_REL="$T22/opt/singbox-monitor-releases"
@@ -2201,17 +2204,21 @@ else
 )
 rc=$?
 if [ "$rc" != 0 ]; then
-    fail "isolated 0.1.1 install + 0.1.2 upgrade failed (rc=$rc): $(tail -n 5 "$TMP/out-t22-base.log" 2>/dev/null | tr '\n' ' ')"
+    fail "isolated 0.1.1 install + $T22_NEW_VER upgrade failed (rc=$rc): $(tail -n 5 "$TMP/out-t22-base.log" 2>/dev/null | tr '\n' ' ')"
 else
-    pass "isolated 0.1.1 install + 0.1.2 upgrade succeed (rc 0)"
-    assert_eq '0.1.2' "$(cat "$REPO_ROOT/monitor-v2/VERSION")" "candidate carries the repo VERSION 0.1.2 (the real production delta)"
-    assert_eq '0.1.2' "$(cat "$T22_APP/VERSION" 2>/dev/null)" "the new immutable 0.1.2 release is active"
+    pass "isolated 0.1.1 install + $T22_NEW_VER upgrade succeed (rc 0)"
+    if [ "$T22_NEW_VER" != '0.1.1' ]; then
+        pass "the repo candidate ($T22_NEW_VER) really differs from the 0.1.1 baseline"
+    else
+        fail "T22 candidate equals the 0.1.1 baseline -- the fixture tests no delta"
+    fi
+    assert_eq "$T22_NEW_VER" "$(cat "$T22_APP/VERSION" 2>/dev/null)" "the new immutable $T22_NEW_VER release is active"
     assert_grep 'action=upgrade' "$T22_LOG" "normal install-monitor.sh upgrade reports action=upgrade"
     BASE_DIR_T22="$(cat "$TMP/t22-basedir" 2>/dev/null || true)"
     if [ -n "$BASE_DIR_T22" ] && [ "$(readlink -f "$T22_APP")" != "$BASE_DIR_T22" ] \
        && [ -d "$BASE_DIR_T22" ] \
        && [ "$(cat "$TMP/t22-basehash")" = "$(find "$BASE_DIR_T22" -type f -exec sha256sum {} + | sort | sha256sum | cut -d' ' -f1)" ]; then
-        pass "previous 0.1.1 release retained byte-identical beside the new 0.1.2 release"
+        pass "previous 0.1.1 release retained byte-identical beside the new $T22_NEW_VER release"
     else
         fail "T22 reused or damaged the previous 0.1.1 release"
     fi
@@ -2220,7 +2227,82 @@ else
         "the upgrade restarted singbox-monitor exactly once"
     assert_no_grep 'sing-box' "$T22_CALLS" "the upgrade never restarted or reloaded sing-box"
     assert_grep ' 0\.1\.1 fresh$' "$T22_REL/releases.history" "the 0.1.1 baseline release is recorded in history"
-    assert_grep ' 0\.1\.2 upgrade$' "$T22_REL/releases.history" "the 0.1.2 upgrade is recorded in history"
+    assert_grep " ${T22_NEW_VER//./\\.} upgrade\$" "$T22_REL/releases.history" "the $T22_NEW_VER upgrade is recorded in history"
+fi
+fi
+
+section "T23 production-real upgrade: installed 0.1.2 -> repo VERSION (isolated fixture, 0.1.3)"
+# Pins the REAL production delta this release ships: a server with 0.1.2
+# installed runs the normal install-monitor.sh upgrade against the 0.1.3
+# candidate. Same isolation discipline as T22 (own fixture root, own
+# systemctl call log). Beyond T22 it also pins the Monitor-only boundary:
+# the upgrade performs ZERO sbox-cm/helper deployment or update actions.
+T23_NEW_VER="$(cat "$REPO_ROOT/monitor-v2/VERSION")"
+T23="$TMP/t23"
+T23_APP="$T23/opt/singbox-monitor"
+T23_REL="$T23/opt/singbox-monitor-releases"
+T23_LOG="$TMP/out-t23.log"
+T23_CALLS="$TMP/t23-calls.log"
+if [ "$SYMLINKS_OK" != 1 ]; then
+    printf '  SKIP T23 原子升级流（此平台无符号链接；Linux pass 是门禁）\n'
+else
+(
+    mkdir -p "$T23/etc/systemd/system" "$T23/src"
+    cp "$REPO_ROOT/monitor-v2/collector.py" "$REPO_ROOT/monitor-v2/webapp.py" "$T23/src/"
+    cp -R "$REPO_ROOT/monitor-v2/web" "$REPO_ROOT/monitor-v2/api_bridge" "$T23/src/"
+    rm -rf "$T23/src/api_bridge/__pycache__" "$T23/src/web/__pycache__"
+    printf '0.1.2\n' > "$T23/src/VERSION"
+    export SBMON_APP_LINK="$T23_APP"
+    export SBMON_RELEASES_DIR="$T23_REL"
+    export SBMON_STATE_ROOT="$T23/var/lib/singbox-monitor"
+    export SBMON_STATE_DIR="$T23/var/lib/singbox-monitor"
+    export SBMON_CONF_DIR="$T23/etc/singbox-monitor"
+    export SBMON_UNIT_FILE="$T23/etc/systemd/system/singbox-monitor.service"
+    export SBMON_BACKUP_ROOT="$T23/var/backups/singbox-monitor"
+    export SBMON_REPO_MONITOR_DIR="$T23/src"
+    export SBMON_VERSION_FILE="$T23/src/VERSION"
+    export SBMON_LOCK_FILE="$T23/deploy.lock"
+    export MOCK_CALL_LOG="$T23_CALLS"
+    : > "$T23_CALLS"
+    "$INSTALL_MONITOR" install > "$TMP/out-t23-base.log" 2>&1 || exit 1
+    base_dir="$(readlink -f "$T23_APP")"
+    [ -n "$base_dir" ] || exit 1
+    printf '%s\n' "$base_dir" > "$TMP/t23-basedir"
+    find "$base_dir" -type f -exec sha256sum {} + | sort | sha256sum | cut -d' ' -f1 \
+        > "$TMP/t23-basehash"
+    grep -c 'systemctl restart singbox-monitor' "$T23_CALLS" > "$TMP/t23-restarts-before" || true
+    cp "$REPO_ROOT/monitor-v2/VERSION" "$T23/src/VERSION"
+    "$INSTALL_MONITOR" upgrade > "$T23_LOG" 2>&1 || exit 1
+)
+rc=$?
+if [ "$rc" != 0 ]; then
+    fail "isolated 0.1.2 install + $T23_NEW_VER upgrade failed (rc=$rc): $(tail -n 5 "$TMP/out-t23-base.log" 2>/dev/null | tr '\n' ' ')"
+else
+    pass "isolated 0.1.2 install + $T23_NEW_VER upgrade succeed (rc 0)"
+    if [ "$T23_NEW_VER" != '0.1.2' ]; then
+        pass "the repo candidate ($T23_NEW_VER) really differs from the 0.1.2 baseline (the real production delta)"
+    else
+        fail "T23 candidate equals the 0.1.2 baseline -- the fixture tests no delta"
+    fi
+    assert_eq "$T23_NEW_VER" "$(cat "$T23_APP/VERSION" 2>/dev/null)" "the new immutable $T23_NEW_VER release is active"
+    assert_eq '0.1.2' "$(cat "$T23_REL/0.1.2-"*/VERSION 2>/dev/null | head -n 1)" "the 0.1.2 baseline release tree still reports 0.1.2"
+    assert_grep 'action=upgrade' "$T23_LOG" "normal install-monitor.sh upgrade reports action=upgrade"
+    BASE_DIR_T23="$(cat "$TMP/t23-basedir" 2>/dev/null || true)"
+    if [ -n "$BASE_DIR_T23" ] && [ "$(readlink -f "$T23_APP")" != "$BASE_DIR_T23" ] \
+       && [ -d "$BASE_DIR_T23" ] \
+       && [ "$(cat "$TMP/t23-basehash")" = "$(find "$BASE_DIR_T23" -type f -exec sha256sum {} + | sort | sha256sum | cut -d' ' -f1)" ]; then
+        pass "previous 0.1.2 release retained byte-identical beside the new $T23_NEW_VER release (retention within KEEP)"
+    else
+        fail "T23 reused or damaged the previous 0.1.2 release"
+    fi
+    assert_eq "$(( $(cat "$TMP/t23-restarts-before") + 1 ))" \
+        "$(grep -c 'systemctl restart singbox-monitor' "$T23_CALLS")" \
+        "the upgrade restarted singbox-monitor exactly once"
+    assert_no_grep 'sing-box' "$T23_CALLS" "the upgrade never restarted or reloaded sing-box"
+    assert_no_grep 'sbox-cm' "$T23_CALLS" "the upgrade ran ZERO sbox-cm/helper systemctl actions (Monitor-only boundary)"
+    assert_no_grep 'helper' "$T23_LOG" "the upgrade log records no helper deployment or update"
+    assert_grep ' 0\.1\.2 fresh$' "$T23_REL/releases.history" "the 0.1.2 baseline release is recorded in history"
+    assert_grep " ${T23_NEW_VER//./\\.} upgrade\$" "$T23_REL/releases.history" "the $T23_NEW_VER upgrade is recorded in history"
 fi
 fi
 

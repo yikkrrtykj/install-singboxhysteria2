@@ -23,7 +23,18 @@ Frozen semantics (docs/e3-m2-web-adapter-design.md §7):
 * a mutation is dispatched only while the breaker is ``closed``. After an
   uncertain result the status path stays available by design: an open
   breaker serves the last snapshot instead of blocking the only way to
-  learn what happened (last_transaction).
+  learn what happened (last_transaction);
+* post-mutation convergence (0.1.3): the web layer calls
+  ``invalidate_after_client_mutation()`` ONLY after a CONFIRMED successful
+  client.add/client.delete, before the HTTP answer is sent. It bumps two
+  generation epochs, forces both cached snapshots to STALE (kept for display
+  fallback only -- never writable) and re-opens the attempt throttles, so
+  the very next status/list reads perform fresh RPCs without waiting for a
+  TTL or the watchdog. Every refresh captures its epoch before dispatch and
+  may publish only while that epoch is unchanged, so a pre-mutation RPC that
+  completes after the invalidation can never repopulate the cache. The
+  caches, single-flight, the attempt throttle, the fresh-only writable gate
+  and the breaker semantics all stay exactly as before.
 
 No background threads: refreshes happen lazily on the request path.
 """
@@ -83,6 +94,12 @@ class E3Broker:
         self._failures = 0
         self._state = "closed"      # closed | open | half-open
         self._opened_at = 0.0
+        # 0.1.3 generation epochs: a refresh captures its epoch before
+        # dispatch and may publish into the cache only while the epoch has
+        # not moved (an invalidate_after_client_mutation() retires every
+        # snapshot whose RPC began before the confirmed mutation).
+        self._status_epoch = 0
+        self._list_epoch = 0
 
     # ------------------------------------------------------------ internals --
     def breaker_state(self):
@@ -163,13 +180,17 @@ class E3Broker:
                     # lock; if ever reached, do not add a second probe.
                     return self._result(
                         STALE if cache is not None else UNAVAILABLE, cache)
+                # Captured under the same lock that guards invalidation:
+                # publishing is allowed only while this epoch stands (0.1.3).
+                epoch = self._status_epoch
             try:
                 verdict = self.client.call(STATUS_OP)
             except Exception:  # noqa: BLE001 - any transport failure counts
                 now = self._clock()
                 with self._mutex:
                     self._failures += 1
-                    self._status_attempted_at = now
+                    if epoch == self._status_epoch:
+                        self._status_attempted_at = now
                     if self._state == "half-open" \
                             or self._failures >= self.breaker_failures:
                         self._state = "open"
@@ -187,14 +208,24 @@ class E3Broker:
                 with self._mutex:
                     self._failures = 0
                     self._state = "closed"
-                    self._status_attempted_at = self._clock()
+                    if epoch == self._status_epoch:
+                        self._status_attempted_at = self._clock()
                 return self._verdict_error(verdict)
 
             now = self._clock()
             with self._mutex:
                 self._failures = 0
-                self._status_attempted_at = now
                 self._state = "closed"
+                if epoch != self._status_epoch:
+                    # An explicit invalidation landed while this RPC was in
+                    # flight: its snapshot predates a confirmed mutation, so
+                    # it must never become the authoritative cache and never
+                    # re-stamps the attempt throttle. The next read performs
+                    # (or shares) its own post-invalidation fresh RPC.
+                    return self._result(
+                        STALE if self._status_cache is not None
+                        else UNAVAILABLE, self._status_cache)
+                self._status_attempted_at = now
                 self._status_cache = {"payload": verdict, "fetched_at": now,
                                       "fetched_wall": self._wall()}
             return self._result(FRESH, self._status_cache)
@@ -260,12 +291,16 @@ class E3Broker:
                         and now - self._list_attempted_at < self.list_ttl:
                     return self._result(
                         STALE if cache is not None else UNAVAILABLE, cache)
+                # Captured under the same lock that guards invalidation:
+                # publishing is allowed only while this epoch stands (0.1.3).
+                epoch = self._list_epoch
 
             try:
                 verdict = self.client.call(LIST_OP)
             except Exception:  # noqa: BLE001 - never a breaker input
                 with self._mutex:
-                    self._list_attempted_at = self._clock()
+                    if epoch == self._list_epoch:
+                        self._list_attempted_at = self._clock()
                 return self._result(
                     STALE if cache is not None else UNAVAILABLE, cache)
 
@@ -275,15 +310,52 @@ class E3Broker:
                 # list call never touches it). The caller maps the helper
                 # semantics.
                 with self._mutex:
-                    self._list_attempted_at = self._clock()
+                    if epoch == self._list_epoch:
+                        self._list_attempted_at = self._clock()
                 return self._verdict_error(verdict)
 
             now = self._clock()
             with self._mutex:
+                if epoch != self._list_epoch:
+                    # Stale-by-generation (see status()): a list RPC that
+                    # dispatched before a confirmed mutation may never
+                    # repopulate the invalidated cache.
+                    return self._result(
+                        STALE if self._list_cache is not None
+                        else UNAVAILABLE, self._list_cache)
                 self._list_attempted_at = now
                 self._list_cache = {"payload": verdict, "fetched_at": now,
                                     "fetched_wall": self._wall()}
             return self._result(FRESH, self._list_cache)
+
+    # -------------------------------------- post-mutation convergence (0.1.3)
+    def invalidate_after_client_mutation(self):
+        """Expire both caches right after a CONFIRMED successful
+        client.add/client.delete, before the HTTP success answer is sent.
+
+        The next ``status()`` / ``list_clients()`` read performs a fresh RPC
+        even when the previous attempt is still inside its TTL window: the
+        cached snapshots are forced to STALE (kept for display fallback and
+        §7.5 honesty -- a stale "active" is still never writable) and the
+        attempt throttles are re-opened. Every in-flight refresh captured
+        its generation before dispatch, so bumping the epochs here retires
+        it: a pre-mutation snapshot can never repopulate the invalidated
+        cache. Nothing else moves -- the breaker, single-flight and the
+        fresh-only gate keep their exact semantics. Failed or uncertain
+        mutations must never call this; repeated invalidation (e.g. an
+        idempotent replay of a confirmed success) is harmless by design.
+        """
+        with self._mutex:
+            self._status_epoch += 1
+            self._list_epoch += 1
+            if self._status_cache is not None:
+                self._status_cache = dict(self._status_cache,
+                                          fetched_at=float("-inf"))
+            if self._list_cache is not None:
+                self._list_cache = dict(self._list_cache,
+                                        fetched_at=float("-inf"))
+            self._status_attempted_at = float("-inf")
+            self._list_attempted_at = float("-inf")
 
     # ------------------------------------------------------------ mutations --
     def mutate(self, op, payload=None, actor=None):

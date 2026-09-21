@@ -551,7 +551,7 @@
 
   function loadE3Clients() {
     if (!state.session || !state.session.authenticated) return;
-    api("/api/v1/clients").then(function (data) {
+    return api("/api/v1/clients").then(function (data) {
       state.e3Clients = data;
       renderE3Clients(data);
     }).catch(function (error) {
@@ -562,6 +562,20 @@
       var cell = row.insertCell(-1);
       cell.colSpan = 3;
       cell.textContent = "Client list unavailable.";
+    });
+  }
+
+  function refreshClientsAfterMutation() {
+    // 0.1.3 post-mutation convergence. The server expired its status/list
+    // caches the moment the mutation reached CONFIRMED success, so these
+    // reads are answered by fresh helper RPCs immediately -- no TTL, no
+    // watchdog wait. Fixed ordering: fresh management.status FIRST (as a
+    // background-style read, so the last known good view is kept while the
+    // request is in flight; on failure loadE3Status still clears the state
+    // and the existing fail-closed path takes over), then the list. This
+    // helper never writes #e3-msg, so the success message survives it.
+    return Promise.resolve(loadE3Status(true)).then(function () {
+      return loadE3Clients();
     });
   }
 
@@ -637,8 +651,9 @@
       hide($("e3-delete-box"));
       e3Message("Client deleted.", false);
       loadSession();
-      loadE3Clients();
-      loadE3Status();
+      // 0.1.3: coordinated immediate convergence (server caches are already
+      // invalidated for this confirmed delete).
+      refreshClientsAfterMutation();
     }).catch(function (error) {
       if (error.status === 504 && error.uncertain) {
         setPendingRetry({ path: "/api/v1/clients/delete", name: name,
@@ -729,8 +744,9 @@
       e3Message("Client created. Download its configuration below.",
                 false);
       $("e3-add-name").value = "";
-      loadE3Clients();
-      loadE3Status();
+      // 0.1.3: coordinated immediate convergence (server caches are already
+      // invalidated for this confirmed add).
+      refreshClientsAfterMutation();
     }).catch(function (error) {
       if (error.status === 504 && error.uncertain) {
         setPendingRetry({ path: "/api/v1/clients/add", name: name,
