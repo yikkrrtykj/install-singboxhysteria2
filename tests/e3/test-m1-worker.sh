@@ -104,17 +104,25 @@ cat > "$SB/mock-sing-box" <<'MOCK'
 DIR="${0%/*}"
 SENTINEL_UUID="M1_SECRET_SENTINEL_UUID_0123456789abcdef"
 SENTINEL_PASSWORD="M1_SECRET_SENTINEL_PASSWORD_0123456789abcdef"
+# M4 export fixtures (spec §12): fixed credential pair driven by flag files,
+# same file-flag discipline as the sentinel above (never an env var).
+FIXTURE_UUID="11111111-2222-3333-4444-555555555555"
+FIXTURE_PASSWORD="super-secret-hy2-fixture"
 command -v proc-hygiene-probe >/dev/null 2>&1 && proc-hygiene-probe >/dev/null 2>&1
 case "${1:-}" in
     check) exit 0 ;;
     generate)
         case "${2:-}" in
-            uuid) if [ -f "$DIR/.sentinel-on" ]; then
+            uuid) if [ -f "$DIR/.fixture-on" ]; then
+                      printf '%s\n' "$FIXTURE_UUID"
+                  elif [ -f "$DIR/.sentinel-on" ]; then
                       printf '%s\n' "$SENTINEL_UUID"
                   else
                       printf 'uuid-%s-%s-%s\n' "$$" "$RANDOM" "$RANDOM"
                   fi ;;
-            rand) if [ -f "$DIR/.sentinel-on" ]; then
+            rand) if [ -f "$DIR/.fixturepw-on" ]; then
+                      printf '%s\n' "$FIXTURE_PASSWORD"
+                  elif [ -f "$DIR/.sentinel-on" ]; then
                       printf '%s\n' "$SENTINEL_PASSWORD"
                   else
                       printf 'pw-%s-%s-%s\n' "$$" "$RANDOM" "$RANDOM"
@@ -306,6 +314,214 @@ else
 fi
 [ ! -d "$SB/clients/vmix-01" ] && pass 'derived directory removed' || fail 'derived directory left behind'
 
+# ------------------------------------------------------- M4 client.export ----
+printf '\n== client.export (M4: the sanctioned sensitive read) ==\n'
+# The renderer reads the install-state facts from SB_STATE_FILE; a real
+# install writes them, the sandbox provides the same shape.
+cat > "$SB_STATE_FILE" <<'STATE'
+SERVER_IP='203.0.113.7'
+PUBLIC_KEY='PUBKEYfixture000000000000000000000000000000000000'
+HY_SERVER_NAME='www.example.com'
+HY_HOPPING=FALSE
+STATE
+# Give the live config the shape the frozen renderer parses (ports + Reality
+# block); user sets stay exactly as the transactions left them.
+jq '.inbounds |= map(
+      if .tag == "vless-in" then
+        .listen_port = 8443
+        | .tls = {"enabled":true,"server_name":"www.example.com",
+                  "reality":{"enabled":true,
+                             "handshake":{"server":"www.example.com","server_port":443},
+                             "private_key":"PRIV-NEVER-ASSERTED","short_id":["abcd1234"]}}
+      elif .tag == "hy2-in" then
+        .listen_port = 8444
+      else . end)' \
+    "$SB_SERVER_CONFIG" > "$SB/shaped.json" && mv "$SB/shaped.json" "$SB_SERVER_CONFIG"
+
+FIXTURE_UUID="11111111-2222-3333-4444-555555555555"
+FIXTURE_PASSWORD="super-secret-hy2-fixture"
+touch "$SB/.fixture-on" "$SB/.fixturepw-on"
+o="$(wout client.add '{"request_id":"reqid-add-export0","name":"exp-01","idempotency_key":"key-000000000a01"}')"
+rm -f "$SB/.fixture-on" "$SB/.fixturepw-on"
+assert_eq true "$(jqv "$o" '.ok')" 'add exp-01 with the export fixtures'
+
+LEDGER_N="$(count "$LEDGER" '"kind":"intent"')"
+AUDIT_N="$(count "$AUDIT" '"request_id"')"
+CONFIG_N="$(sum "$SB_SERVER_CONFIG")"
+export MOCK_RELOAD=fail-once
+rm -f "$MOCK_RELOAD_COUNTER"
+: > "$TMP/x.err"
+touch "$PROC_HYGIENE_LOG.on"
+o="$(wout client.export '{"request_id":"reqid-export-000001","name":"exp-01","actor":{"session_fp":"0123456789abcdef","stepup_fp":"fedcba9876543210"}}' 2>"$TMP/x.err")"
+rm -f "$PROC_HYGIENE_LOG.on"
+assert_eq true "$(jqv "$o" '.ok')" 'export succeeds while active'
+assert_eq OK "$(jqv "$o" '.code')" 'export code is OK'
+assert_eq done "$(jqv "$o" '.stage')" 'export stage is done'
+assert_eq mihomo-yaml "$(jqv "$o" '.data.format')" 'export reports the mihomo-yaml format'
+assert_eq exp-01-mihomo.yaml "$(jqv "$o" '.data.filename')" 'export filename is <name>-mihomo.yaml'
+Y="$(jqv "$o" '.data.content')"
+if printf '%s' "$Y" | grep -qF "uuid: $FIXTURE_UUID" \
+   && printf '%s' "$Y" | grep -qF "password: $FIXTURE_PASSWORD"; then
+    pass 'the exported YAML carries the client credentials'
+else
+    fail 'the exported YAML lacks the client credentials'
+fi
+assert_eq 203.0.113.7 "$(printf '%s\n' "$Y" | grep -m1 'server: ' | sed 's/.*server: //')" \
+    'export resolves the server facts from state'
+if printf '%s\n' "$Y" | head -n 1 | grep -qx 'mixed-port: 7897'; then
+    pass 'export content starts at the exact first template byte'
+else
+    fail 'export content does not start at byte 0 of the template'
+fi
+if printf '%s' "$o" | jq -e '.data.content | endswith("\n\n")' >/dev/null 2>&1; then
+    pass 'export content keeps the template trailing blank line (X-sentinel fidelity)'
+else
+    fail 'trailing bytes were stripped from the export'
+fi
+assert_eq null "$(jqv "$o" '.idempotency')" 'export is not an idempotent transaction'
+assert_eq false "$(jqv "$o" '.transaction.changed')" 'export transaction reports no change'
+assert_eq false "$(jqv "$o" '.transaction.reload_performed')" 'export performed no reload'
+[ ! -f "$MOCK_RELOAD_COUNTER" ] && pass 'export never invoked systemctl reload' \
+    || fail 'export triggered a reload'
+unset MOCK_RELOAD
+export MOCK_RELOAD=ok
+
+printf '\n== client.export is strictly read-only ==\n'
+assert_eq "$CONFIG_N" "$(sum "$SB_SERVER_CONFIG")" 'export left the live config byte-identical'
+assert_eq "$LEDGER_N" "$(count "$LEDGER" '"kind":"intent"')" 'export wrote no ledger intent'
+assert_eq "$LEDGER_N" "$(count "$LEDGER" '"kind":"outcome"')" 'export wrote no ledger outcome'
+assert_eq 0 "$(ls -1 "$SB/state/journal" 2>/dev/null | wc -l | tr -d ' ')" 'export wrote no journal'
+assert_eq 1 "$(count "$AUDIT" '"request_id":"reqid-export-000001"')" 'export wrote exactly one audit record'
+EXP_ROW="$(grep -F '"request_id":"reqid-export-000001"' "$AUDIT" | tail -n 1)"
+assert_eq client.export "$(jqv "$EXP_ROW" '.op')" 'the export audit records the op'
+assert_eq ok "$(jqv "$EXP_ROW" '.outcome')" 'the export audit records the outcome'
+assert_eq 0123456789abcdef "$(jqv "$EXP_ROW" '.actor.session_fp')" 'the export audit carries session_fp'
+assert_eq fedcba9876543210 "$(jqv "$EXP_ROW" '.actor.stepup_fp')" 'the export audit carries stepup_fp'
+assert_eq null "$(jqv "$EXP_ROW" '.key_fp')" 'the export audit has no idempotency key_fp'
+assert_eq 0 "$(jqv "$EXP_ROW" '.generation')" 'the export audit records generation 0'
+
+printf '\n== client.export fixture leak sweep ==\n'
+if grep -qF "$FIXTURE_UUID" "$AUDIT" || grep -qF "$FIXTURE_PASSWORD" "$AUDIT"; then
+    fail 'audit contains credential material'
+else
+    pass 'the audit holds only metadata'
+fi
+if grep -qF "$FIXTURE_UUID" "$LEDGER" || grep -qF "$FIXTURE_PASSWORD" "$LEDGER"; then
+    fail 'ledger contains credential material'
+else
+    pass 'the ledger was not touched by the export'
+fi
+if grep -qF "$FIXTURE_UUID" "$TMP/x.err" || grep -qF "$FIXTURE_PASSWORD" "$TMP/x.err"; then
+    fail 'worker stderr contains credential material'
+else
+    pass 'worker stderr is credential-free'
+fi
+if [ -d /proc ]; then
+    if grep -qF "$FIXTURE_UUID" "$PROC_HYGIENE_LOG" \
+       || grep -qF "$FIXTURE_PASSWORD" "$PROC_HYGIENE_LOG"; then
+        fail 'credential sentinel appeared in some /proc cmdline or environ'
+    else
+        pass 'zero fixture credential hits across /proc/*/cmdline and /proc/*/environ'
+    fi
+else
+    skip 'no /proc: dynamic process hygiene sampling skipped'
+fi
+
+printf '\n== client.export re-executes on every dispatch (the helper caches nothing) ==\n'
+# The daemon-side replay cache is bypassed for sensitive ops (M4), so a second
+# dispatch really re-runs the read -- there is NO transactional dedup anywhere:
+# the audit-id exactly-once guard (request_id:generation) still collapses the
+# duplicate to a single audit record.
+o2="$(wout client.export '{"request_id":"reqid-export-000001","name":"exp-01"}')"
+assert_eq true "$(jqv "$o2" '.ok')" 'the same request_id re-executes rather than dedups'
+assert_eq "$Y" "$(jqv "$o2" '.data.content')" 'both exports render identical bytes'
+assert_eq 1 "$(count "$AUDIT" '"request_id":"reqid-export-000001"')" \
+    'the audit-id guard keeps one audit record for the repeated request_id'
+o3="$(wout client.export '{"request_id":"reqid-export-000002","name":"exp-01"}')"
+assert_eq true "$(jqv "$o3" '.ok')" 'a fresh request_id also succeeds'
+assert_eq 1 "$(count "$AUDIT" '"request_id":"reqid-export-000002"')" 'each new request_id writes its own audit'
+assert_eq "$Y" "$(jqv "$o3" '.data.content')" 'export is never served from a cache'
+assert_eq "$CONFIG_N" "$(sum "$SB_SERVER_CONFIG")" 'the repeat exports also mutated nothing'
+
+printf '\n== client.export legacy (the shared account is exportable) ==\n'
+o="$(wout client.export '{"request_id":"reqid-export-legacy01","name":"legacy"}')"
+assert_eq true "$(jqv "$o" '.ok')" 'legacy exports'
+assert_eq legacy-mihomo.yaml "$(jqv "$o" '.data.filename')" 'legacy filename'
+if printf '%s' "$o" | grep -qF 'LEGACY-UUID' && printf '%s' "$o" | grep -qF 'LEGACY-PASS'; then
+    pass 'legacy export contains the legacy credentials'
+else
+    fail 'legacy export is missing its credentials'
+fi
+
+printf '\n== client.export refusals (fail-closed, zero YAML) ==\n'
+o="$(wout client.export '{"request_id":"reqid-export-ghost001","name":"ghost-99"}')"
+assert_eq false "$(jqv "$o" '.ok')" 'unknown client is refused'
+assert_eq E_NOT_FOUND "$(jqv "$o" '.code')" 'unknown client returns E_NOT_FOUND'
+o="$(wout client.export '{"request_id":"reqid-export-key00001","name":"exp-01","idempotency_key":"key-000000000a02"}')"
+assert_eq E_SCHEMA "$(jqv "$o" '.code')" 'export refuses an idempotency_key'
+o="$(wout client.export '{"request_id":"reqid-export-badname01","name":"../etc/passwd"}')"
+assert_eq E_SCHEMA "$(jqv "$o" '.code')" 'export refuses an invalid name'
+
+# incomplete credentials: name present, uuid emptied. candidate_problems
+# already flags an empty uuid as an inconsistent user set, so this proves the
+# preconditions gate refuses an inconsistent config BEFORE any render ships.
+o="$(wout client.add '{"request_id":"reqid-add-expbroken","name":"exp-brk1","idempotency_key":"key-000000000a03"}')"
+jq '(.inbounds[]|select(.tag=="vless-in")|.users[]|select(.name=="exp-brk1")|.uuid) = ""' \
+    "$SB_SERVER_CONFIG" > "$SB/broken.json" && mv "$SB/broken.json" "$SB_SERVER_CONFIG"
+o="$(wout client.export '{"request_id":"reqid-export-broken01","name":"exp-brk1"}')"
+assert_eq false "$(jqv "$o" '.ok')" 'a client with emptied credentials is refused'
+assert_eq E_CONFIG_INCONSISTENT "$(jqv "$o" '.code')" 'incomplete credentials map to E_CONFIG_INCONSISTENT'
+printf '%s' "$o" | grep -qF "$FIXTURE_PASSWORD" && fail 'the refusal echoed credential material' \
+    || pass 'the refusal is credential-free'
+# repair OUT OF BAND: while the config is inconsistent the helper refuses
+# every mutation, so the harness restores the bytes directly.
+jq '(.inbounds[]|select(.tag=="vless-in")|.users[]|select(.name=="exp-brk1")|.uuid) = "REPAIRED-UUID-brk1"
+    | (.inbounds[]|select(.tag=="hy2-in")|.users[]|select(.name=="exp-brk1")|.password) = "REPAIRED-PASS-brk1"' \
+    "$SB_SERVER_CONFIG" > "$SB/repair1.json" && mv "$SB/repair1.json" "$SB_SERVER_CONFIG"
+o="$(wout client.delete '{"request_id":"reqid-del-expbrk0001","name":"exp-brk1","idempotency_key":"key-000000000a08"}')"
+assert_eq true "$(jqv "$o" '.ok')" 'cleanup: exp-brk1 removed before the next scenario'
+
+# over the 48 KiB frame cap: refuse, NEVER truncate
+BIG="$(printf 'p%.0s' $(seq 1 60000))"
+o="$(wout client.add '{"request_id":"reqid-add-expbig0001","name":"exp-big1","idempotency_key":"key-000000000a04"}')"
+# the oversized value travels via ENV: --arg would blow the argv limit under
+# the jq shim on some platforms, and this value is not secret material.
+BIG_PW="$BIG" jq '(.inbounds[]|select(.tag=="hy2-in")|.users[]|select(.name=="exp-big1")|.password) = $ENV.BIG_PW' \
+    "$SB_SERVER_CONFIG" > "$SB/big.json" && mv "$SB/big.json" "$SB_SERVER_CONFIG"
+o="$(wout client.export '{"request_id":"reqid-export-big0001","name":"exp-big1"}')"
+if ! printf '%s' "$o" | jq -e '.ok == false' >/dev/null 2>&1; then
+    fail 'the oversized injection did not land on this platform; the over-cap case is untested'
+else
+assert_eq false "$(jqv "$o" '.ok')" 'an over-cap export is refused'
+assert_eq E_INTERNAL "$(jqv "$o" '.code')" 'over-cap maps to E_INTERNAL (fail-closed, no truncation)'
+printf '%s' "$o" | grep -qF "$FIXTURE_PASSWORD" && fail 'the over-cap refusal echoed credential material' \
+    || pass 'the over-cap refusal is credential-free'
+fi
+
+printf '\n== client.export refusals while degraded / inactive ==\n'
+# sourcing is idempotent (pure function definitions); the later sections
+# source the same libraries again.
+# shellcheck source=/dev/null
+. "$ROOT/lib/sbox-cm-state.sh"
+cm_degraded_set manual_intervention 'export-test'
+o="$(wout client.export '{"request_id":"reqid-export-degrad01","name":"exp-01"}')"
+assert_eq false "$(jqv "$o" '.ok')" 'export refused while degraded'
+assert_eq E_MANUAL_INTERVENTION "$(jqv "$o" '.code')" 'degraded export returns E_MANUAL_INTERVENTION'
+cm_degraded_clear
+o="$(wout management.deactivate '{"request_id":"reqid-deact-export01"}')"
+assert_eq true "$(jqv "$o" '.ok')" 'deactivated for the export gate test'
+o="$(wout client.export '{"request_id":"reqid-export-inactiv1","name":"exp-01"}')"
+assert_eq false "$(jqv "$o" '.ok')" 'export refused while inactive'
+assert_eq E_ACTIVATION_STATE "$(jqv "$o" '.code')" 'inactive export returns E_ACTIVATION_STATE'
+o="$(wout management.activate '{"request_id":"reqid-activate-exptr1","actor":{"session_fp":"0123456789abcdef"}}')"
+assert_eq true "$(jqv "$o" '.ok')" 'reactivated for the remaining sections'
+
+# clean up the export fixtures so the later sections see the state they expect
+o="$(wout client.delete '{"request_id":"reqid-del-export03","name":"exp-big1","idempotency_key":"key-000000000a07"}')"
+assert_eq true "$(jqv "$o" '.ok')" 'cleanup: exp-big1 deleted'
+o="$(wout client.delete '{"request_id":"reqid-del-export01","name":"exp-01","idempotency_key":"key-000000000a05"}')"
+assert_eq true "$(jqv "$o" '.ok')" 'cleanup: exp-01 deleted'
+
 # ------------------------------------------------------- second generation ----
 printf '\n== delete must never remove a rebuilt same-name client ==\n'
 o="$(wout client.add '{"request_id":"reqid-add-vmix02-0","name":"vmix-02","idempotency_key":"key-000000000003"}')"
@@ -375,6 +591,10 @@ fi
 cand_count=0
 for f in "$SB"/*candidate*; do [ -e "$f" ] && cand_count=$((cand_count + 1)); done
 assert_eq 0 "$cand_count" 'the failed-lock attempt left no candidate behind'
+o="$( export PATH="$FLSHIM:$PATH"; wout client.export '{"request_id":"reqid-export-lockfl1","name":"legacy"}' )"
+assert_eq E_LOCK "$(jqv "$o" '.code')" 'export refuses when the lock cannot be acquired'
+printf '%s' "$o" | grep -qF 'LEGACY-PASS' && fail 'the lock-refused export echoed YAML' \
+    || pass 'the lock-refused export dispatched no YAML'
 
 printf '\n== live lock contention (real flock) ==\n'
 if [ "$HAS_REAL_FLOCK" = "1" ]; then
@@ -550,6 +770,18 @@ if [ "$IS_LINUX" = "1" ]; then
     [ ! -f "$SB/state/journal/reqid-add-auditdef1.json" ] \
         && pass 'reconciliation cleared the journal only after the audit landed' \
         || fail 'journal was not cleared after audit recovery'
+
+    printf '\n== export fail-closed on audit failure (M4 §7): zero YAML shipped ==\n'
+    touch "$SB/audit-unwritable.marker"   # documentation only; chmod does the job
+    chmod 0444 "$AUDIT"
+    o="$(wout client.export '{"request_id":"reqid-export-auditfl1","name":"legacy"}')"
+    chmod 0600 "$AUDIT"
+    assert_eq false "$(jqv "$o" '.ok')" 'export refuses when its audit cannot be made durable'
+    assert_eq E_INTERNAL "$(jqv "$o" '.code')" 'the export audit failure maps to E_INTERNAL'
+    assert_eq 0 "$(count "$AUDIT" '"request_id":"reqid-export-auditfl1"')" 'no audit record was written'
+    printf '%s' "$o" | grep -qF 'LEGACY-PASS' && fail 'the export shipped YAML despite the audit failure' \
+        || pass 'no YAML was delivered on the export audit failure'
+    rm -f "$SB/audit-unwritable.marker"
 else
     skip 'POSIX permission fault injection is exercised on Linux CI only'
 fi

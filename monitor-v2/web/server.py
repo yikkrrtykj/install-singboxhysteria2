@@ -312,14 +312,14 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
 
     do_PATCH = do_DELETE = do_OPTIONS = do_TRACE = do_CONNECT = do_PUT
 
-    def _method_not_allowed(self):
+    def _method_not_allowed(self, allowed=SUPPORTED_METHODS):
         # Uniform surface: 405 + Allow, and never reuse a connection whose
         # method semantics (or body framing) we did not interpret.
         self.close_connection = True
         body = json.dumps({"error": "method not allowed"}).encode("utf-8")
         self.send_response(405)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Allow", SUPPORTED_METHODS)
+        self.send_header("Allow", allowed)
         self.send_header("Content-Length", str(len(body)))
         self._common_headers()
         self.end_headers()
@@ -416,6 +416,13 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/v1/clients":
             self._require_session(self._handle_e3_clients_list)
+            return
+        # M4: the export endpoint exists but is POST-only. A GET there is a
+        # method error on a known route, not a static miss -- answering 404
+        # would make the endpoint look absent to anything probing the
+        # surface. Allow names only POST; the connection is never reused.
+        if path == "/api/v1/clients/export":
+            self._method_not_allowed(allowed="POST")
             return
         self._send_json(404, {"error": "not found"})
 

@@ -301,7 +301,10 @@ class E3Broker:
     def export_client(self, name, actor=None):
         """Dispatch exactly ONE read-only client.export RPC (M4).
 
-        Refused -- zero RPCs -- unless ALL of the following hold:
+        Refused -- ZERO client.export dispatches -- unless ALL of the
+        following hold (a management.status refresh to prove freshness is
+        allowed and expected; the credential-carrying RPC never runs on a
+        refusal):
 
         * the breaker is ``closed``;
         * a FRESH (within-TTL) management.status snapshot reports
