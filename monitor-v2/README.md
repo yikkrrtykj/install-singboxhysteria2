@@ -539,6 +539,39 @@ POST /api/v1/clients/delete          → client.delete
 也不返回任何 success 形态的结果**。M1/M2 只是把这个 handler 的 body 换成
 RPC adapter，认证边界一行都不用重新设计。
 
+### M4：`POST /api/v1/clients/export`（只读配置导出）
+
+M1/M2 落地后上述 501 合同已换成真实 RPC adapter（路由登记不变，另见
+`docs/e3-m2-web-adapter-design.md` 与 `docs/e3-m4-client-export-design.md`）。
+M4 在 E3 路由面上新增且只新增一条：
+
+```text
+POST /api/v1/clients/export   → client.export
+GET  /api/v1/clients/export   → 405（Allow: POST；导出永远不是可缓存的 GET）
+```
+
+* 鉴权链与特权变更完全一致：session → CSRF → step-up → body 形状校验 →
+  broker 新鲜度闸门；body 必须**恰好**是 `{"name": "<client>"}`——多一个键、
+  少一个键、非对象 JSON、畸形或空 body 一律 400（`invalid_request_body`），
+  全部发生在 broker 之前，对应零 export RPC；
+* **不接受 `Idempotency-Key`**：header 或 body 出现即 400——`client.export`
+  是只读重渲染，不是事务，没有 ledger/journal/reload；
+* broker 闸门比 mutation 更严：breaker closed 且一条 **FRESH**
+  `management.status` 证明 active / 未 degraded / reconcile clean / lock
+  可获得，才允许 dispatch；任一不满足即 503 且**零 export RPC**；
+* 成功响应是唯一的 sanctioned 凭据投递形态——文件附件而非 JSON：
+  `Content-Type: application/x-yaml; charset=utf-8`、
+  `Content-Disposition: attachment; filename="<name>-mihomo.yaml"`（文件名由
+  regex 校验过的 name 派生，永不采用 helper 文本）、
+  `Cache-Control: no-store, no-cache, must-revalidate` + `Pragma: no-cache` +
+  `Expires: 0`；YAML 字节只写进这一个响应；
+* 响应超过 48 KiB 一律 502 拒绝，绝不截断；所有失败答案仍是 JSON，
+  不含凭据材料，也从不泄漏 `/root/sbox` 路径；
+* UI：Clients 表每行都有 Download（Default 也不例外；Delete 依旧永不给
+  Default），仅在视图 Available 时可点；401 `reauth_required` 走二次认证后
+  **原样重放同一个无 key 请求**；文件进 Blob 即 `revokeObjectURL`，绝不
+  自动下载、绝不渲染、绝不落 console/sessionStorage/localStorage。
+
 ### `monitor_running` / `management_active`（正交状态）
 
 `GET /api/v1/session` 同时返回两个 **正交** 布尔：

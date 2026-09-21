@@ -42,7 +42,7 @@ from web.e3rpc import RpcTransportError
 from web.recovery import (RECOVERY_SUCCESS_MESSAGE, RecoveryGlobalGuard,
                           RecoveryRateLimiter, generate_key)
 
-MONITOR_WEB_VERSION = "0.1.1"
+MONITOR_WEB_VERSION = "0.1.2"
 SESSION_COOKIE = "monitor_session"
 MAX_BODY_BYTES = 65536
 SUPPORTED_METHODS = "GET, POST"
@@ -312,14 +312,14 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
 
     do_PATCH = do_DELETE = do_OPTIONS = do_TRACE = do_CONNECT = do_PUT
 
-    def _method_not_allowed(self):
+    def _method_not_allowed(self, allowed=SUPPORTED_METHODS):
         # Uniform surface: 405 + Allow, and never reuse a connection whose
         # method semantics (or body framing) we did not interpret.
         self.close_connection = True
         body = json.dumps({"error": "method not allowed"}).encode("utf-8")
         self.send_response(405)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Allow", SUPPORTED_METHODS)
+        self.send_header("Allow", allowed)
         self.send_header("Content-Length", str(len(body)))
         self._common_headers()
         self.end_headers()
@@ -417,6 +417,13 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/v1/clients":
             self._require_session(self._handle_e3_clients_list)
             return
+        # M4: the export endpoint exists but is POST-only. A GET there is a
+        # method error on a known route, not a static miss -- answering 404
+        # would make the endpoint look absent to anything probing the
+        # surface. Allow names only POST; the connection is never reused.
+        if path == "/api/v1/clients/export":
+            self._method_not_allowed(allowed="POST")
+            return
         self._send_json(404, {"error": "not found"})
 
     def _body_header_error(self):
@@ -478,6 +485,15 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             # lands after the gate can never strip the actor from an
             # already-authorized dispatch.
             self._require_step_up(self._handle_e3_mutation, op)
+            return
+        if path == "/api/v1/clients/export":
+            # M4: the read-only sensitive delivery. POST-only by contract --
+            # a GET would put the client name into URLs, access logs and
+            # Referer chains. Same gate spine as the mutations (session ->
+            # CSRF -> step-up with the frozen actor), then the broker's
+            # FRESH management gate refuses dispatch unless the helper plane
+            # is provably healthy at that moment.
+            self._require_step_up(self._handle_e3_export)
             return
         self._send_json(404, {"error": "not found"})
 
@@ -1122,6 +1138,148 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         mapped.update({"ok": False,
                        "request_id": verdict.get("request_id")})
         self._send_json(E3_ERROR_HTTP.get(mapped["code"], 500), mapped)
+
+    # -- M4 export: the one sensitive delivery -------------------------------
+
+    EXPORT_MAX_BYTES = 49152   # 48 KiB; mirrors the worker cap (defence in
+                               # depth -- a larger body is refused, never
+                               # truncated, never forwarded to the browser)
+
+    def _handle_e3_export(self, session, actor):
+        """POST /api/v1/clients/export -> file download of the canonical
+        Mihomo YAML (M4).
+
+        Contract highlights (docs/e3-m4-client-export-design.md §7):
+
+        * reached only after session -> CSRF -> step-up; the actor is the
+          gate-frozen one (B2), exactly like the mutations;
+        * the body must be EXACTLY {"name": "..."} -- any other JSON (array,
+          scalar, malformed, empty) or any extra/missing/other key is a 400
+          answered BEFORE the broker, so it can never dispatch an RPC;
+        * NO Idempotency-Key exists for a read: header or body key is a
+          400 -- the export re-renders live on every dispatch;
+        * `legacy` is exportable BY DESIGN (lifecycle closure); the body
+          gate is only the shape regex, existence/consistency are the
+          helper's in-lock fail-closed preconditions;
+        * the broker refuses (ZERO RPC) unless the breaker is closed AND a
+          FRESH management.status proves active + not degraded + reconcile
+          clean + lock acquirable;
+        * success is served as an attachment with no-store semantics and
+          bypasses the JSON deny-by-default whitelist -- the YAML is the
+          intended payload, and it is written to the socket EXACTLY once,
+          from this response only. Nothing about it is logged, cached,
+          stored or echoed into any error body;
+        * the filename is derived from the regex-validated name (never
+          from helper-supplied text), so Content-Disposition cannot be
+          injected.
+        """
+        broker = self.app.e3_broker
+        if broker is None:
+            self._e3_unavailable("the E3 adapter is not wired in this build")
+            return
+
+        body = self._json_body()
+        if self.headers.get(IDEMPOTENCY_HEADER) is not None:
+            self._send_json(400, {
+                "ok": False, "code": "invalid_idempotency_key",
+                "error": "client.export is read-only and accepts no "
+                         "Idempotency-Key",
+                "retriable": False})
+            return
+        if not isinstance(body, dict):
+            self._send_json(400, {
+                "ok": False, "code": "invalid_request_body",
+                "error": 'the export body must be a JSON object exactly '
+                         '{"name": "..."}',
+                "retriable": False})
+            return
+        if "idempotency_key" in body:
+            self._send_json(400, {
+                "ok": False, "code": "invalid_idempotency_key",
+                "error": "client.export is read-only and accepts no "
+                         "Idempotency-Key",
+                "retriable": False})
+            return
+        if set(body) != {"name"}:
+            # R5: one accepted key, no extras -- an unexpected field is a
+            # schema error, not something to ignore on a credential route.
+            self._send_json(400, {
+                "ok": False, "code": "invalid_request_body",
+                "error": 'the export body must contain exactly the key '
+                         '"name" and nothing else',
+                "retriable": False})
+            return
+        name = body["name"]
+        if not isinstance(name, str) or not E3_NAME_RE.match(name):
+            self._send_json(400, {
+                "ok": False, "code": "invalid_name",
+                "error": "name missing or invalid (<=32 chars, "
+                         "[A-Za-z0-9][A-Za-z0-9._-]*)",
+                "retriable": False})
+            return
+
+        try:
+            verdict = broker.export_client(name, actor=actor or None)
+        except BrokerUnavailable:
+            self._e3_unavailable(
+                "the fresh management gate is not satisfied; the export "
+                "was NOT dispatched")
+            return
+        except RpcTransportError as exc:
+            if exc.stage == "connect":
+                self._e3_unavailable(
+                    "sbox-cm is unreachable; the export was NOT dispatched")
+                return
+            # A read leaves no transaction to resolve, but the frozen
+            # single-dispatch rule still holds: no automatic retry.
+            self._send_json(504, {
+                "ok": False, "code": "result_unknown",
+                "error": "the caller budget expired after dispatch; retry "
+                         "explicitly",
+                "retriable": True, "uncertain": True})
+            return
+
+        if not verdict.get("ok"):
+            mapped = sanitize_e3_error(verdict)
+            mapped.update({"ok": False,
+                           "request_id": verdict.get("request_id")})
+            self._send_json(E3_ERROR_HTTP.get(mapped["code"], 500), mapped)
+            return
+
+        data = verdict.get("data")
+        data = data if isinstance(data, dict) else {}
+        content = data.get("content")
+        if data.get("format") != "mihomo-yaml" \
+                or not isinstance(content, str) or not content:
+            self._send_json(502, {
+                "ok": False, "code": "E_INTERNAL",
+                "error": "the helper returned an unexpected export payload",
+                "retriable": False})
+            return
+        yaml_bytes = content.encode("utf-8")
+        if len(yaml_bytes) > self.EXPORT_MAX_BYTES:
+            self._send_json(502, {
+                "ok": False, "code": "E_INTERNAL",
+                "error": "the export exceeded the frozen size cap",
+                "retriable": False})
+            return
+
+        filename = "%s-mihomo.yaml" % name
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-yaml; charset=utf-8")
+        self.send_header("Content-Disposition",
+                         'attachment; filename="%s"' % filename)
+        self.send_header("Content-Length", str(len(yaml_bytes)))
+        self.send_header("Cache-Control",
+                         "no-store, no-cache, must-revalidate")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
+        # SECURITY_HEADERS already carries the required nosniff/CSP values;
+        # only the standard no-store Cache-Control is replaced above.
+        for hname, hvalue in SECURITY_HEADERS:
+            self.send_header(hname, hvalue)
+        self.end_headers()
+        self.wfile.write(yaml_bytes)
 
     def _handle_password(self, session, remote):
         """POST /api/v1/password {current_password, new_password}."""

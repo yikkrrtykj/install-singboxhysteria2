@@ -53,7 +53,7 @@ sys.path.insert(0, os.environ["MONITOR_V2_ROOT"])
 STATIC_DIR = os.environ["STATIC_DIR"]
 
 from web.auth import AuthStore, SessionStore  # noqa: E402
-from web.e3_broker import (BrokerUnavailable, E3Broker,  # noqa: E402
+from web.e3_broker import (BrokerUnavailable, E3Broker, FRESH,  # noqa: E402
                            STALE, UNAVAILABLE)
 from web.e3rpc import E3RpcClient, RpcTransportError  # noqa: E402
 from web.server import MonitorWebApp, build_server  # noqa: E402
@@ -974,6 +974,353 @@ def group_http_adapter():
     return out
 
 
+# ------------------------------------------------------------- M4 export --
+def _export_verdict(n=1):
+    return {"ok": True, "request_id": "helper-export-rid%d" % n,
+            "data": {"format": "mihomo-yaml",
+                     "filename": "vmix-01-mihomo.yaml",
+                     "content": "proxies:\n  - uuid: %s%d\n"
+                                % (UUID_SHAPED_SECRET, n)}}
+
+
+def _export_status(**over):
+    """A fresh, fully open export gate; `over` replaces top-level data keys
+    or, for helper/lock, merges into the nested dict (None = drop the key)."""
+    base = ok_status(active=True)
+    data = base["data"]
+    for key, value in over.items():
+        if key in ("helper", "lock") and value is not None:
+            data[key] = dict(data[key], **value)
+        elif value is None:
+            data.pop(key, None)
+        else:
+            data[key] = value
+    return base
+
+
+def _gate_refused(broker, client):
+    """True iff export_client raised BrokerUnavailable with ZERO
+    client.export RPCs. A management.status refresh is allowed -- proving
+    freshness IS the gate; only the credential-carrying dispatch must not
+    happen."""
+    before = len(client.calls)
+    try:
+        broker.export_client("vmix-01")
+        return False
+    except BrokerUnavailable:
+        return "client.export" not in client.calls[before:]
+
+
+def group_export_broker():
+    """The FRESH-only export gate: every unsatisfied condition must refuse
+    with zero client.export RPCs -- the response would carry credentials."""
+    out = {}
+
+    # happy path first: actor passthrough + the gate really opens when the
+    # FRESH status says active / not degraded / clean / lock acquirable.
+    clock = FakeClock()
+    client = FakeClient()
+    broker = new_broker(client, clock)
+    actor = {"session_fp": "0" * 16, "stepup_fp": "1" * 16}
+    client.record(_export_status())
+    client.record(_export_verdict(1))
+    v = broker.export_client("vmix-01", actor=actor)
+    out["export_happy_dispatches"] = v.get("ok") is True
+    out["export_gate_fresh_open_uses_two_rpc"] = \
+        client.calls == ["management.status", "client.export"]
+    out["export_actor_passthrough"] = client.actors[-1] == actor
+
+    # the export RESULT is never cached: a second export inside the status
+    # TTL re-dispatches and renders afresh, and the broker holds no
+    # reference to the first bytes.
+    client.record(_export_verdict(2))
+    v2 = broker.export_client("vmix-01")
+    out["export_never_cached_second_dispatch"] = \
+        client.calls.count("client.export") == 2 \
+        and v2["data"]["content"] != v["data"]["content"]
+    out["export_second_within_ttl_skips_status_refresh"] = \
+        client.calls == ["management.status", "client.export", "client.export"]
+    out["export_result_not_in_any_cache"] = (
+        broker._status_cache["payload"] is not v
+        and broker._status_cache["payload"] is not v2
+        and broker._list_cache is None)
+
+    # G1: breaker open -> zero export RPC even with a perfect cached status.
+    clock = FakeClock()
+    client = FakeClient()
+    broker = new_broker(client, clock, breaker_failures=1)
+    client.record(RpcTransportError("read", "down"))
+    broker.status()                      # one failure opens the breaker
+    out["export_breaker_state_open"] = broker.breaker_state() == "open"
+    out["export_gate_breaker_open_zero_rpc"] = _gate_refused(broker, client)
+
+    # G2: stale status (refresh fails) -> refuse, never serve stale truth.
+    clock = FakeClock()
+    client = FakeClient()
+    broker = new_broker(client, clock)
+    client.record(_export_status())
+    broker.status()                      # fresh active snapshot cached
+    clock.advance(2.5)                   # TTL expired
+    client.record(RpcTransportError("read", "down"))
+    before = len(client.calls)
+    out["export_gate_stale_zero_rpc"] = _gate_refused(broker, client)
+    out["export_gate_stale_attempted_status_only"] = \
+        client.calls[before:] == ["management.status"]
+
+    # G3: unavailable status (never any snapshot, refresh fails) -> refuse.
+    clock = FakeClock()
+    client = FakeClient()
+    broker = new_broker(client, clock)
+    client.record(RpcTransportError("connect", "down"))
+    out["export_gate_unavailable_zero_rpc"] = _gate_refused(broker, client)
+
+    # G4-G8: fresh-but-unhealthy verdicts. Each must close the gate.
+    cases = {
+        "export_gate_inactive": {"management_active": False},
+        "export_gate_degraded": {"helper": {"degraded": True}},
+        "export_gate_reconcile": {"helper": {"reconcile": "diverged"}},
+        "export_gate_lock_unacquirable": {"lock": {"acquirable": False}},
+        "export_gate_missing_helper": {"helper": None},
+        "export_gate_missing_lock": {"lock": None},
+    }
+    for name, over in cases.items():
+        clock = FakeClock()
+        client = FakeClient()
+        broker = new_broker(client, clock)
+        client.record(_export_status(**over))
+        out[name] = _gate_refused(broker, client)
+
+    # G9: a helper VERDICT error on status (transport worked, semantics did
+    # not) is a refusal too -- there is no snapshot to trust.
+    clock = FakeClock()
+    client = FakeClient()
+    broker = new_broker(client, clock)
+    client.record({"ok": False, "request_id": "e",
+                   "error": {"code": "E_INTERNAL", "stage": "probe",
+                             "retriable": False, "detail": "boom"}})
+    out["export_gate_status_verdict_zero_rpc"] = _gate_refused(broker, client)
+
+    # a transport failure of the EXPORT itself propagates untouched (the
+    # caller maps it; the broker never retries).
+    clock = FakeClock()
+    client = FakeClient()
+    broker = new_broker(client, clock)
+    client.record(_export_status())
+    client.record(RpcTransportError("read", "budget"))
+    try:
+        broker.export_client("vmix-01")
+        out["export_transport_error_propagates"] = False
+    except RpcTransportError as exc:
+        out["export_transport_error_propagates"] = exc.stage == "read" \
+            and client.calls.count("client.export") == 1
+    return out
+
+
+def group_export_http():
+    """POST /api/v1/clients/export end to end: gate order, the file-response
+    headers, and the rule that the YAML bytes ship to exactly one consumer --
+    the authenticated browser -- and land in no cache, log or JSON envelope."""
+    out = {}
+    YAML_FIXTURE = ("mixed-port: 7897\nproxies:\n"
+                    "  - name: Reality\n    uuid: %s\n"
+                    "  - name: Hysteria2\n    password: %s\n\n"
+                    % (UUID_SHAPED_SECRET, "super-secret-hy2-fixture"))
+
+    def export(port, cookie, csrf, headers=None, body=None):
+        return mutate(port, "/api/v1/clients/export", cookie, csrf,
+                      headers, body if body is not None
+                      else json.dumps({"name": "vmix-01"}))
+
+    # no broker at all -> 503, fail closed
+    stack = M2Stack(e3_broker=None)
+    port = stack.port
+    cookie = login(port)
+    csrf = session_info(port, cookie)["csrf_token"]
+    step_up(port, cookie, csrf)
+    r = export(port, cookie, csrf)
+    out["export_no_broker_503"] = r["status"] == 503
+    stack.stop()
+
+    clock = FakeClock()
+    client = FakeClient()
+    broker = new_broker(client, clock)
+    stack = M2Stack(e3_broker=broker)
+    port = stack.port
+    cookie = login(port)
+    csrf = session_info(port, cookie)["csrf_token"]
+
+    # GET is never a delivery verb for credentials
+    r = req(port, "GET", "/api/v1/clients/export", {"Cookie": cookie})
+    out["export_get_405"] = r["status"] == 405 \
+        and "content-disposition" not in r["headers"] \
+        and YAML_FIXTURE not in r["body"]
+    # no session -> 401 before anything else
+    r = req(port, "POST", "/api/v1/clients/export",
+            {"Content-Type": "application/json"},
+            json.dumps({"name": "vmix-01"}))
+    out["export_no_session_401"] = r["status"] == 401
+    out["export_no_session_zero_rpc"] = "client.export" not in client.calls
+    # session but no step-up -> the ONLY 401 the UI replays on
+    r = export(port, cookie, csrf)
+    body = json.loads(r["body"])
+    out["export_no_stepup_401_reauth"] = (
+        r["status"] == 401 and body.get("error") == "reauth_required")
+    out["export_no_stepup_zero_rpc"] = "client.export" not in client.calls
+    step_up(port, cookie, csrf)
+
+    # body validation happens BEFORE any dispatch (free refusals). R5: the
+    # RPC count is sampled around EACH bad request individually -- a single
+    # before/after over the whole block would not prove any one specific
+    # rejected request dispatched nothing.
+    def bad_request(label, code, body=None, headers=None):
+        before = len(client.calls)
+        r = export(port, cookie, csrf, headers,
+                   body if body is not None
+                   else json.dumps({"name": "vmix-01"}))
+        out[label + "_400"] = (
+            r["status"] == 400 and
+            json.loads(r["body"]).get("code") == code)
+        out[label + "_zero_rpc"] = len(client.calls) == before
+        return r
+
+    bad_request("export_header_key", "invalid_idempotency_key",
+                headers={"Idempotency-Key": "m2-key-0000000000000009"})
+    bad_request("export_body_key", "invalid_idempotency_key",
+                body=json.dumps({"name": "vmix-01",
+                                 "idempotency_key": "k" * 16}))
+    bad_request("export_bad_name", "invalid_name",
+                body=json.dumps({"name": "../x"}))
+    # R5 exact shape: one and only one key, "name". Extras, omissions,
+    # non-object JSON and malformed JSON are all 400 invalid_request_body.
+    bad_request("export_extra_field", "invalid_request_body",
+                body=json.dumps({"name": "vmix-01", "extra": 1}))
+    bad_request("export_missing_name", "invalid_request_body",
+                body=json.dumps({"other": 1}))
+    bad_request("export_non_object", "invalid_request_body",
+                body=json.dumps(["vmix-01"]))
+    bad_request("export_malformed", "invalid_request_body",
+                body="{not json")
+    bad_request("export_empty_body", "invalid_request_body", body="")
+    calls_before = len(client.calls)
+
+    # the gate: breaker open -> 503 e3_unavailable, zero export RPC
+    broker._state = "open"
+    r = export(port, cookie, csrf)
+    body = json.loads(r["body"])
+    out["export_breaker_open_503"] = (
+        r["status"] == 503 and body.get("code") == "e3_unavailable")
+    out["export_breaker_open_zero_rpc"] = \
+        "client.export" not in client.calls[calls_before:]
+    broker._state = "closed"
+
+    # fresh-but-inactive gate -> 503, still zero export RPCs
+    calls_before = len(client.calls)
+    client.record(_export_status(management_active=False))
+    r = export(port, cookie, csrf)
+    out["export_inactive_503"] = r["status"] == 503
+    out["export_inactive_zero_rpc"] = \
+        "client.export" not in client.calls[calls_before:]
+
+    # happy path: the sanctioned file response (clock past the TTL so the
+    # gate must REFRESH -- the refused inactive snapshot is still cached)
+    clock.advance(2.5)
+    client.record(_export_status())
+    client.record({"ok": True, "request_id": "helper-exp-h1",
+                   "data": {"format": "mihomo-yaml",
+                            "filename": "vmix-01-mihomo.yaml",
+                            "content": YAML_FIXTURE}})
+    r = export(port, cookie, csrf, None, json.dumps({"name": "legacy"}))
+    out["export_happy_200"] = r["status"] == 200
+    out["export_body_is_the_exact_yaml"] = r["body"] == YAML_FIXTURE
+    h = r["headers"]
+    out["export_content_type_yaml"] = \
+        h.get("content-type") == "application/x-yaml; charset=utf-8"
+    out["export_disposition_attachment_named"] = h.get("content-disposition") \
+        == 'attachment; filename="legacy-mihomo.yaml"'
+    out["export_no_store"] = h.get("cache-control") == \
+        "no-store, no-cache, must-revalidate"
+    out["export_pragma_no_cache"] = h.get("pragma") == "no-cache"
+    out["export_expires_zero"] = h.get("expires") == "0"
+    out["export_nosniff"] = h.get("x-content-type-options") == "nosniff"
+    out["export_content_length"] = \
+        h.get("content-length") == str(len(YAML_FIXTURE.encode("utf-8")))
+    out["export_csp_present"] = "content-security-policy" in h
+    # the one and only place the YAML exists on this stack
+    out["export_yaml_delivered_exactly_once"] = \
+        r["body"].count(YAML_FIXTURE) == 1
+    # every failure answer stays JSON + fail-closed headers, never YAML
+    r = export(port, cookie, csrf, None, json.dumps({"name": "../x"}))
+    hh = r["headers"]
+    out["export_error_stays_json"] = (
+        hh.get("content-type") == "application/json"
+        and hh.get("cache-control") == "no-store"
+        and hh.get("x-content-type-options") == "nosniff"
+        and "content-disposition" not in hh)
+
+    # helper verdict maps through the error table -- JSON, non-secret
+    clock.advance(2.5)
+    client.record(_export_status())
+    client.record({"ok": False, "request_id": "helper-exp-e1",
+                   "error": {"code": "E_NOT_FOUND", "stage": "revalidate",
+                             "retriable": False, "detail": "客户端 'x' 不存在",
+                             "backup": "/root/sbox/y.bak"}})
+    r = export(port, cookie, csrf)
+    body = json.loads(r["body"])
+    out["export_not_found_maps"] = r["status"] == 404 \
+        and body.get("code") == "E_NOT_FOUND"
+    out["export_error_no_backup_path"] = "/root/sbox" not in r["body"]
+    out["export_error_is_not_the_yaml"] = UUID_SHAPED_SECRET not in r["body"]
+
+    # transport: connect failure = definitive non-dispatch 503; post-send
+    # timeout = 504 result_unknown, UNCERTAIN but a read (never sets a
+    # pending mutation retry -- the UI just re-clicks Download).
+    clock.advance(30.0)
+    client.record(_export_status())
+    client.record(RpcTransportError("read", "budget exhausted"))
+    r = export(port, cookie, csrf)
+    body = json.loads(r["body"])
+    out["export_timeout_504_uncertain"] = (
+        r["status"] == 504 and body.get("uncertain") is True
+        and body.get("code") == "result_unknown")
+    clock.advance(30.0)
+    client.record(_export_status())
+    client.record(RpcTransportError("connect", "refused"))
+    r = export(port, cookie, csrf)
+    out["export_connect_503"] = r["status"] == 503
+
+    # oversized payload from a misbehaving helper -> 502, nothing ships
+    clock.advance(2.5)
+    client.record(_export_status())
+    client.record({"ok": True, "request_id": "helper-exp-big",
+                   "data": {"format": "mihomo-yaml",
+                            "filename": "vmix-01-mihomo.yaml",
+                            "content": "x" * 49153}})
+    r = export(port, cookie, csrf)
+    body = json.loads(r["body"])
+    out["export_oversized_502"] = r["status"] == 502 \
+        and "x" * 1024 not in r["body"]
+
+    # wrong format / empty content -> 502 E_INTERNAL, never a download
+    clock.advance(2.5)
+    client.record(_export_status())
+    client.record({"ok": True, "request_id": "helper-exp-fmt",
+                   "data": {"format": "singbox-json",
+                            "filename": "vmix-01.json", "content": "{}"}})
+    r = export(port, cookie, csrf)
+    out["export_bad_format_502"] = r["status"] == 502 \
+        and "content-disposition" not in r["headers"]
+
+    # the YAML lands NOWHERE else: no later JSON answer can serve it.
+    clock.advance(2.5)
+    client.record(_export_status())
+    client.record(_export_verdict(9))
+    r2 = export(port, cookie, csrf)
+    out["export_later_answer_is_the_next_file"] = \
+        UUID_SHAPED_SECRET + "9" in r2["body"] and YAML_FIXTURE not in r2["body"]
+    stack.stop()
+    return out
+
+
 # --------------------------------------------------------- transport (POSIX) --
 class MockHelper(socketserver.BaseRequestHandler):
     def handle(self):
@@ -1038,6 +1385,19 @@ def group_rpc_transport(tmpdir):
         out["request_id_fresh_per_attempt"] = rid1 != rid2
         out["op_carried"] = v1.get("op") == "management.status"
 
+        # M4: client.export travels the SAME framing with its name+actor;
+        # the frozen 20s budget is per-op and no retry ever happens.
+        out["export_budget_frozen_20s"] = \
+            E3RpcClient().budgets.get("client.export") == 20.0
+        ve = client.call("client.export", payload={"name": "vmix-01"},
+                         actor={"session_fp": "0" * 16})
+        out["export_wire_op_carried"] = ve.get("ok") is True \
+            and ve.get("op") == "client.export"
+        rid_e1 = ve.get("request_id")
+        rid_e2 = client.call("client.export", payload={"name": "vmix-01"}
+                             ).get("request_id")
+        out["export_request_id_fresh_per_attempt"] = rid_e1 != rid_e2
+
         MOCK_MODE["slow"] = True   # hold the response 0.6s > the 0.2s budget
         slow = E3RpcClient(socket_path=path,
                            budgets={"management.status": 0.2})
@@ -1085,6 +1445,8 @@ def main():
     out.update(group_stale_and_degraded())
     out.update(group_auth_lifecycle())
     out.update(group_http_adapter())
+    out.update(group_export_broker())
+    out.update(group_export_http())
     with tempfile.TemporaryDirectory() as tmpdir:
         out.update(group_rpc_transport(tmpdir))
     sys.stdout.write(json.dumps(out))

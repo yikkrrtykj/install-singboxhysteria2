@@ -25,6 +25,8 @@ class Element {
   get textContent() { return this.text + this.children.map(c => c.textContent).join(' '); }
   set innerHTML(v) { assert.equal(v, ''); this.textContent = ''; }
   appendChild(c) { this.children.push(c); return c; }
+  removeChild(c) { this.children = this.children.filter(x => x !== c); return c; }
+  click() { if (this.events.click) return this.events.click(); }
   insertRow() { return this.appendChild(new Element('tr')); }
   insertCell() { return this.appendChild(new Element('td')); }
   setAttribute(k, v) { this.attrs[k] = v; }
@@ -60,12 +62,18 @@ for (const token of html.replace(/<!--[\s\S]*?-->/g, '').match(/<[^>]*>|[^<]+/g)
 }
 const document = {
   getElementById(id) { assert.ok(ids[id], 'missing HTML element: ' + id); return ids[id]; },
-  createElement: tag => new Element(tag), querySelectorAll: () => [], addEventListener() {}
+  createElement: tag => new Element(tag), querySelectorAll: () => [], addEventListener() {},
+  body: new Element('body')
 };
 const requests = [], responses = [];
+const createdUrls = [], revokedUrls = [];
+let urlSeq = 0;
 const context = vm.createContext({ document, console, Uint8Array, Date,
   crypto: require('node:crypto').webcrypto, setTimeout() {}, clearTimeout() {},
   setInterval() {}, window: { location: {} },
+  URL: { createObjectURL: () => { const u = 'blob:ui-test-' + (++urlSeq);
+         createdUrls.push(u); return u; },
+         revokeObjectURL: u => revokedUrls.push(u) },
   fetch: (url, init) => {
     requests.push({url, ...init});
     const response = responses.shift(); assert.ok(response, 'unexpected fetch ' + url);
@@ -74,19 +82,21 @@ const context = vm.createContext({ document, console, Uint8Array, Date,
   }
 });
 vm.runInContext(app.replace('document.addEventListener("DOMContentLoaded", boot);',
-  'globalThis.ui = {state, bind, render, loadSession, loadE3Status, renderE3Controls, renderE3Clients, renderMonitorInfo, addClient, deleteClient, setPendingRetry, retryPending, apiWithStepUp};'), context);
+  'globalThis.ui = {state, bind, render, loadSession, loadE3Status, renderE3Controls, renderE3Clients, renderMonitorInfo, addClient, deleteClient, downloadConfig, setPendingRetry, retryPending, apiWithStepUp};'), context);
 const ui = context.ui;
 const flush = async () => { for (let i = 0; i < 12; i++) await Promise.resolve(); };
 const response = (data, status = 200) => ({ok: status < 400, status, json: () => Promise.resolve(data)});
+// M4: api(raw) hands the FILE response straight to the caller -- only blob().
+const fileResponse = text => ({ok: true, status: 200, blob: () => Promise.resolve({size: text.length})});
 const healthy = () => ({transport: 'fresh', data: {management_state: 'active', helper: {degraded: false, reconcile: 'clean'}, lock: {acquirable: true}}});
 const clients = {data: {clients: [{name: 'legacy', mutable: false, source: 'untracked', protocols: ['reality', 'hy2']}, {name: 'alice', mutable: true, source: 'web', protocols: ['reality']}]}};
 function setStatus(s) { ui.state.e3Status = s; ui.state.e3StatusAt = Date.now(); ui.renderE3Controls(); }
 function closed() {
   assert.equal(ids['e3-add-btn'].disabled, true);
   assert.equal(ids['e3-del-btn'].disabled, true);
-  assert.equal(ids['e3-changes'].textContent, 'Unavailable');
   assert.equal(ids['e3-availability'].textContent, 'Unavailable');
   assert.ok(!ids['e3-clients-body'].textContent.includes('Delete'));
+  assert.ok(!ids['e3-clients-body'].textContent.includes('Download'));
 }
 const forbidden = /\(E3\)|M0\.5|Management plane|privileged helper|Helper snapshot|Management mutations|Idempotency-Key|\bMUTABLE\b|\bSOURCE\b|Abandoned on reset|Batches processed|hy2-in|vless-in/i;
 function productText() { assert.doesNotMatch(dom.textContent, forbidden); }
@@ -110,6 +120,9 @@ async function main() {
     assert.equal(ids['e3-clients-body'].children[0].children.length, 3);
     assert.match(ids['e3-clients-body'].children[0].textContent, /Reality, Hysteria2/);
     assert.doesNotMatch(ids['e3-clients-body'].children[0].textContent, /Delete/);
+    // M4: Download is offered for every client while writable, Default
+    // included -- and it is the FIRST action cell entry.
+    assert.match(ids['e3-clients-body'].children[0].textContent, /Download/);
   });
   const cases = {
     inactive: s => { s.data.management_state = 'inactive'; },
@@ -123,23 +136,26 @@ async function main() {
   };
   for (const [name, change] of Object.entries(cases)) {
     const s = healthy(); change(s); setStatus(s);
-    check(name + ' removes Delete, disables Add and handler dispatch', () => {
-      closed(); const n = requests.length; ui.addClient('bob'); ui.deleteClient('alice'); assert.equal(requests.length, n); productText();
+    check(name + ' removes Delete and Download, disables Add and handler dispatch', () => {
+      closed(); const n = requests.length; ui.addClient('bob'); ui.deleteClient('alice'); ui.downloadConfig('alice'); assert.equal(requests.length, n); productText();
     });
   }
   setStatus(healthy());
-  check('fresh active clean lock-free status restores Add and mutable Delete', () => { assert.equal(ids['e3-add-btn'].disabled, false); assert.match(ids['e3-clients-body'].children[1].textContent, /Delete/); });
+  check('fresh active clean lock-free status restores Add and mutable Delete', () => { assert.equal(ids['e3-add-btn'].disabled, false); assert.match(ids['e3-clients-body'].children[1].textContent, /Delete/); assert.match(ids['e3-clients-body'].children[1].textContent, /Download/); });
   check('a locally expired fresh verdict fails closed even before a poll returns', () => {
     ui.state.e3StatusAt = Date.now() - 10001; ui.renderE3Controls(); closed();
-    const n = requests.length; ui.addClient('bob'); assert.equal(requests.length, n);
+    const n = requests.length; ui.addClient('bob'); ui.downloadConfig('alice'); assert.equal(requests.length, n);
   });
   setStatus(healthy());
-  ids['e3-clients-body'].children[1].children[2].children[0].events.click();
+  // actions cell: Download first, then Delete (mutable rows only)
+  ids['e3-clients-body'].children[1].children[2].children[1].events.click();
   responses.push(response(healthy())); await ui.loadE3Status(true);
   check('healthy background refresh preserves an open delete confirmation', () => assert.ok(!ids['e3-delete-box'].className.includes('hidden')));
   check('reserved Default never offers Delete even if metadata incorrectly says mutable', () => {
     ui.renderE3Clients({data: {clients: [{name: 'legacy', mutable: true}]}});
     assert.doesNotMatch(ids['e3-clients-body'].textContent, /Delete/);
+    // M4: Default IS exportable -- the lifecycle gap this release closes.
+    assert.match(ids['e3-clients-body'].textContent, /Download/);
     const n = requests.length; ui.deleteClient('legacy'); assert.equal(requests.length, n);
   });
   let finishOld;
@@ -157,7 +173,7 @@ async function main() {
   const original = requests.findLast(r => r.url === '/api/v1/clients/add');
   check('uncertain result locks new operations without automatic retry or internal copy', () => {
     closed(); assert.ok(ui.state.e3PendingRetry); productText();
-    const n = requests.length; ui.addClient('bob'); ui.deleteClient('alice'); assert.equal(requests.length, n);
+    const n = requests.length; ui.addClient('bob'); ui.deleteClient('alice'); ui.downloadConfig('alice'); assert.equal(requests.length, n);
     assert.equal(requests.filter(r => r.url === '/api/v1/clients/add').length, 1);
   });
   responses.push(response({code: 'result_unknown', uncertain: true}, 504), response(healthy()));
@@ -186,14 +202,61 @@ async function main() {
   setStatus(healthy());
   responses.push(response({}), response(clients), response(healthy()));
   ui.addClient('bob'); await flush();
-  check('successful Add displays ordinary copy without credentials', () => {
-    assert.equal(ids['e3-msg'].textContent, 'Client created. Credentials are not displayed here. Generate the client configuration on the server.'); productText();
+  check('successful Add displays the download-forward copy without credentials', () => {
+    assert.equal(ids['e3-msg'].textContent, 'Client created. Download its configuration below.'); productText();
   });
   responses.push(response({}), response(ui.state.session), response(clients), response(healthy()));
   ui.deleteClient('alice'); await flush();
   check('successful Delete displays ordinary copy and preserves raw request name', () => {
     assert.equal(ids['e3-msg'].textContent, 'Client deleted.');
     assert.equal(requests.findLast(r => r.url === '/api/v1/clients/delete').body, JSON.stringify({name: 'alice', confirm: 'alice'})); productText();
+  });
+  // ---- M4 export: the Download button end to end --------------------------
+  setStatus(healthy());
+  const urlsBefore = createdUrls.length;
+  responses.push(fileResponse('proxies:\n  - uuid: ui-never-render-7777\n'));
+  // Default row, FIRST action button: Download (Default has no Delete).
+  ids['e3-clients-body'].children[0].children[2].children[0].events.click();
+  await flush();
+  check('Download click POSTs the export endpoint with no Idempotency-Key', () => {
+    const ex = requests.findLast(r => r.url === '/api/v1/clients/export');
+    assert.equal(ex.method, 'POST');
+    assert.equal(ex.body, JSON.stringify({name: 'legacy'}));
+    assert.ok(!('Idempotency-Key' in ex.headers));
+    assert.equal(ex.headers['X-CSRF-Token'], 'csrf');
+  });
+  check('download success revokes the URL, removes the anchor and renders no secret', () => {
+    assert.equal(ids['e3-msg'].textContent, 'Configuration downloaded.');
+    assert.equal(createdUrls.length, urlsBefore + 1);
+    assert.deepEqual(revokedUrls.slice(urlsBefore), [createdUrls[urlsBefore]]);
+    assert.equal(document.body.children.length, 0);
+    assert.doesNotMatch(dom.textContent, /ui-never-render-7777/);
+    productText();
+  });
+  responses.push(response({error: 'reauth_required'}, 401));
+  ui.downloadConfig('alice'); await flush();
+  responses.push(response({}), response(ui.state.session),
+                 fileResponse('proxies:\n  - uuid: ui-second-8888\n'));
+  ids['stepup-password'].value = 'test-password';
+  ids['stepup-form'].events.submit({preventDefault() {}});
+  await flush();
+  check('export step-up replay resends the identical keyless request', () => {
+    const pair = requests.filter(r => r.url === '/api/v1/clients/export').slice(-2);
+    assert.equal(pair[0].body, pair[1].body);
+    assert.deepEqual(pair[0].headers, pair[1].headers);
+    assert.ok(!('Idempotency-Key' in pair[1].headers));
+    assert.equal(ids['e3-msg'].textContent, 'Configuration downloaded.');
+    assert.doesNotMatch(dom.textContent, /ui-second-8888/);
+    productText();
+  });
+  setStatus(healthy());
+  responses.push(response({code: 'result_unknown', uncertain: true}, 504),
+                 response(healthy()));
+  ui.downloadConfig('alice'); await flush();
+  check('uncertain export gives product copy and never sets a pending-operation lock', () => {
+    assert.match(ids['e3-msg'].textContent, /export result is unknown/);
+    assert.ok(!ui.state.e3PendingRetry);
+    productText();
   });
   const conflict = healthy(); conflict.data.helper.reconcile = 'conflict';
   responses.push(response({code: 'E_RECONCILE_CONFLICT'}, 409), response(clients), response(conflict));
@@ -215,6 +278,6 @@ async function main() {
     assert.ok(!ids['mg-activate'] && !ids['mg-deactivate']);
     assert.ok(requests.every(r => !/management\/(activate|deactivate)/.test(r.url))); productText();
   });
-  assert.equal(count, 35, 'UI assertion count guard');
+  assert.equal(count, 39, 'UI assertion count guard');
 }
 main().catch(err => { console.error(err); process.exitCode = 1; });

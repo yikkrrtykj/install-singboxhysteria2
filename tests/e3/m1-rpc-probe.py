@@ -166,6 +166,38 @@ def schema_tests(mod):
     bad_request({"v": VERSION, "request_id": rid, "op": "client.list",
                  "actor": {"session_fp": "0" * 16}}, "E_SCHEMA")
 
+    # M4: client.export -- read-only op, name + optional actor, reserved
+    # names ALLOWED here (exporting `legacy` is the point), but add/delete
+    # must keep refusing them.
+    sys.stdout.write("\n== M4 client.export schema ==\n")
+    try:
+        op, args = mod.validate_request(
+            {"v": VERSION, "request_id": rid, "op": "client.export",
+             "name": "vmix-01", "actor": {"session_fp": "0" * 16}})
+        eq(op, "client.export", "export request accepted")
+        eq(args.get("name"), "vmix-01", "export normalizes the name")
+        eq(args.get("actor"), {"session_fp": "0" * 16}, "export normalizes the actor")
+    except Exception as exc:  # pragma: no cover
+        bad("valid export request rejected: %r" % exc)
+    try:
+        op, args = mod.validate_request(
+            {"v": VERSION, "request_id": rid, "op": "client.export", "name": "legacy"})
+        eq(args.get("name"), "legacy", "export accepts the reserved name legacy")
+    except Exception as exc:  # pragma: no cover
+        bad("export of legacy was refused: %r" % exc)
+    for reserved_op in ("client.add", "client.delete"):
+        bad_request({"v": VERSION, "request_id": rid, "op": reserved_op,
+                     "name": "legacy", "idempotency_key": "k" * 16}, "E_RESERVED_NAME")
+    bad_request({"v": VERSION, "request_id": rid, "op": "client.export",
+                 "name": "vmix-01", "idempotency_key": "k" * 16}, "E_SCHEMA")
+    bad_request({"v": VERSION, "request_id": rid, "op": "client.export"}, "E_SCHEMA")
+    bad_request({"v": VERSION, "request_id": rid, "op": "client.export",
+                 "name": "../x"}, "E_SCHEMA")
+    bad_request({"v": VERSION, "request_id": rid, "op": "client.export",
+                 "name": "vmix-01", "actor": {"nope": "x"}}, "E_SCHEMA")
+    check("client.export" in getattr(mod, "SENSITIVE_RESPONSE_OPS", set()),
+          "client.export is declared a sensitive response op")
+
 
 # ------------------------------------------------------------------ static --
 def static_tests(daemon_path):
@@ -234,11 +266,18 @@ def socketpair_tests(mod):
     audit = os.path.join(state, "audit", "cm.jsonl")
 
     calls = []
+    export_dispatches = [0]
     real = mod.run_worker
 
     def fake_worker(op, args):
         calls.append({"op": op, "args": args})
-        return {"ok": True, "code": "OK", "stage": "done", "data": {"op": op},
+        data = {"op": op}
+        if op == "client.export":
+            # each dispatch renders DIFFERENT bytes: a cached response is
+            # then detectably impossible to confuse with a real dispatch
+            export_dispatches[0] += 1
+            data["seq"] = export_dispatches[0]
+        return {"ok": True, "code": "OK", "stage": "done", "data": data,
                 "idempotency": {"key_fp": "deadbeef", "replayed": False, "generation": 1},
                 "warnings": [], "transaction": dict(FAKE_TRANSACTION), "error": None}
 
@@ -290,6 +329,51 @@ def socketpair_tests(mod):
         c2.close()
         eq(r2, r1, "same request_id replays the cached response")
         eq(len(calls), n_before, "replay did not re-dispatch the worker")
+
+        # M4: SENSITIVE responses BYPASS the replay cache -- the core must
+        # never store (let alone serve) credential-bearing bytes.
+        rid_e = "reqid-sp-0000011"
+        p_export = frame({"v": VERSION, "request_id": rid_e,
+                          "op": "client.export", "name": "vmix-01"})
+        c1, r1 = exchange(p_export)
+        c1.close()
+        n_before = len(calls)
+        c2, r2 = exchange(p_export)
+        c2.close()
+        check(isinstance(r1, dict) and r1.get("ok") is True,
+              "export is dispatched and answered")
+        eq((r1.get("data") or {}).get("seq"), 1, "first export is a real dispatch")
+        eq(len(calls), n_before + 1, "the second export re-dispatched (no cache hit)")
+        check(r1 != r2, "a sensitive response was NOT replayed from the cache")
+        eq((r2.get("data") or {}).get("seq"), 2, "the second export rendered afresh")
+        eq((calls[-1]["args"] or {}).get("name"), "vmix-01",
+           "the export dispatch carried the validated name to the worker")
+
+        # Review R1: the bypass must be BIDIRECTIONAL. A non-sensitive op
+        # first populates the cache under request_id X; a client.export
+        # using the SAME X must still dispatch, must return its OWN fresh
+        # result, and must not overwrite or be served from that entry.
+        rid_x = "reqid-sp-0000012"
+        c1, r_store = exchange(frame({"v": VERSION, "request_id": rid_x,
+                                      "op": "management.status"}))
+        c1.close()
+        eq((r_store.get("data") or {}).get("op"), "management.status",
+           "the non-sensitive op populated the replay cache")
+        n_before = len(calls)
+        c2, r_exp = exchange(frame({"v": VERSION, "request_id": rid_x,
+                                    "op": "client.export", "name": "vmix-01"}))
+        c2.close()
+        eq(len(calls), n_before + 1,
+           "an export sharing a cached request_id still dispatched")
+        check(r_exp != r_store,
+              "the export was not served from the cross-op cache entry")
+        eq((r_exp.get("data") or {}).get("op"), "client.export",
+           "the export answered with its own result")
+        c3, r_replay = exchange(frame({"v": VERSION, "request_id": rid_x,
+                                       "op": "management.status"}))
+        c3.close()
+        eq(r_replay, r_store,
+           "the export left the cache entry untouched (no replay_put)")
 
         # schema errors are answered
         client, resp = exchange(frame({"v": VERSION, "request_id": "reqid-sp-0000004",
@@ -514,6 +598,35 @@ def socket_tests(mod, root, daemon_path):
         eq(r2, r1, "same request_id replays the cached response")
         eq(count_lines(worker_log), entries_before + 1,
            "same request_id invoked the worker exactly once")
+
+        # --- M4: sensitive export over the REAL transport ---
+        rid_e = "reqid-rpc-0000011"
+        exp_payload = frame({"v": VERSION, "request_id": rid_e,
+                             "op": "client.export", "name": "legacy",
+                             "actor": {"session_fp": "0" * 16,
+                                       "stepup_fp": "1" * 16}})
+        before_e = count_lines(worker_log)
+        c1 = send_raw(socket_path, exp_payload)
+        r1 = read_frame(c1)
+        c1.close()
+        c2 = send_raw(socket_path, exp_payload)
+        r2 = read_frame(c2)
+        c2.close()
+        check(isinstance(r1, dict) and r1.get("ok") is True,
+              "legacy export is dispatched and answered over AF_UNIX")
+        eq(count_lines(worker_log), before_e + 2,
+           "the same request_id dispatched TWICE: sensitive responses bypass the replay cache")
+        try:
+            with open(worker_log, "r") as fh:
+                logged = fh.read()
+        except OSError:
+            logged = ""
+        check(rid_e in logged and "client.export" in logged,
+              "the worker log shows the export dispatches (worker owns delivery)")
+        check("11111111-2222-3333-4444-555555555555" not in logged
+              and "super-secret-hy2-fixture" not in logged
+              and "LEGACY-UUID" not in logged and "LEGACY-PASS" not in logged,
+              "the core-side record of the export holds no credential material")
 
         # --- schema errors are answered, not dropped ---
         conn = send_raw(socket_path, frame(

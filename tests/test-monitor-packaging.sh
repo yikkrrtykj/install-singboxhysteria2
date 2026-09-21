@@ -2157,5 +2157,72 @@ assert_grep 'rejected or ignored a directive in the production unit' "$WF" \
 assert_no_grep 'the hard gate holds for the production unit' "$WF" \
     "old note-only escape hatch (nonzero rc + no target-unit match => success) is gone"
 
+# ---------------------------------------------------------------------------
+section "T22 production-real upgrade: installed 0.1.1 -> repo 0.1.2 (isolated fixture, R7)"
+# Pins the REAL delta this branch ships: a server with 0.1.1 installed runs
+# the normal install-monitor.sh upgrade against the 0.1.2 candidate. Runs in
+# its OWN fixture root with a dedicated systemctl call log (fresh SBMON_*
+# overrides), so no historical baseline of the other sections is touched.
+T22="$TMP/t22"
+T22_APP="$T22/opt/singbox-monitor"
+T22_REL="$T22/opt/singbox-monitor-releases"
+T22_LOG="$TMP/out-t22.log"
+T22_CALLS="$TMP/t22-calls.log"
+if [ "$SYMLINKS_OK" != 1 ]; then
+    printf '  SKIP T22 原子升级流（此平台无符号链接；Linux pass 是门禁）\n'
+else
+(
+    mkdir -p "$T22/etc/systemd/system" "$T22/src"
+    cp "$REPO_ROOT/monitor-v2/collector.py" "$REPO_ROOT/monitor-v2/webapp.py" "$T22/src/"
+    cp -R "$REPO_ROOT/monitor-v2/web" "$REPO_ROOT/monitor-v2/api_bridge" "$T22/src/"
+    rm -rf "$T22/src/api_bridge/__pycache__" "$T22/src/web/__pycache__"
+    printf '0.1.1\n' > "$T22/src/VERSION"
+    export SBMON_APP_LINK="$T22_APP"
+    export SBMON_RELEASES_DIR="$T22_REL"
+    export SBMON_STATE_ROOT="$T22/var/lib/singbox-monitor"
+    export SBMON_STATE_DIR="$T22/var/lib/singbox-monitor"
+    export SBMON_CONF_DIR="$T22/etc/singbox-monitor"
+    export SBMON_UNIT_FILE="$T22/etc/systemd/system/singbox-monitor.service"
+    export SBMON_BACKUP_ROOT="$T22/var/backups/singbox-monitor"
+    export SBMON_REPO_MONITOR_DIR="$T22/src"
+    export SBMON_VERSION_FILE="$T22/src/VERSION"
+    export SBMON_LOCK_FILE="$T22/deploy.lock"
+    export MOCK_CALL_LOG="$T22_CALLS"
+    : > "$T22_CALLS"
+    "$INSTALL_MONITOR" install > "$TMP/out-t22-base.log" 2>&1 || exit 1
+    base_dir="$(readlink -f "$T22_APP")"
+    [ -n "$base_dir" ] || exit 1
+    printf '%s\n' "$base_dir" > "$TMP/t22-basedir"
+    find "$base_dir" -type f -exec sha256sum {} + | sort | sha256sum | cut -d' ' -f1 \
+        > "$TMP/t22-basehash"
+    grep -c 'systemctl restart singbox-monitor' "$T22_CALLS" > "$TMP/t22-restarts-before" || true
+    cp "$REPO_ROOT/monitor-v2/VERSION" "$T22/src/VERSION"
+    "$INSTALL_MONITOR" upgrade > "$T22_LOG" 2>&1 || exit 1
+)
+rc=$?
+if [ "$rc" != 0 ]; then
+    fail "isolated 0.1.1 install + 0.1.2 upgrade failed (rc=$rc): $(tail -n 5 "$TMP/out-t22-base.log" 2>/dev/null | tr '\n' ' ')"
+else
+    pass "isolated 0.1.1 install + 0.1.2 upgrade succeed (rc 0)"
+    assert_eq '0.1.2' "$(cat "$REPO_ROOT/monitor-v2/VERSION")" "candidate carries the repo VERSION 0.1.2 (the real production delta)"
+    assert_eq '0.1.2' "$(cat "$T22_APP/VERSION" 2>/dev/null)" "the new immutable 0.1.2 release is active"
+    assert_grep 'action=upgrade' "$T22_LOG" "normal install-monitor.sh upgrade reports action=upgrade"
+    BASE_DIR_T22="$(cat "$TMP/t22-basedir" 2>/dev/null || true)"
+    if [ -n "$BASE_DIR_T22" ] && [ "$(readlink -f "$T22_APP")" != "$BASE_DIR_T22" ] \
+       && [ -d "$BASE_DIR_T22" ] \
+       && [ "$(cat "$TMP/t22-basehash")" = "$(find "$BASE_DIR_T22" -type f -exec sha256sum {} + | sort | sha256sum | cut -d' ' -f1)" ]; then
+        pass "previous 0.1.1 release retained byte-identical beside the new 0.1.2 release"
+    else
+        fail "T22 reused or damaged the previous 0.1.1 release"
+    fi
+    assert_eq "$(( $(cat "$TMP/t22-restarts-before") + 1 ))" \
+        "$(grep -c 'systemctl restart singbox-monitor' "$T22_CALLS")" \
+        "the upgrade restarted singbox-monitor exactly once"
+    assert_no_grep 'sing-box' "$T22_CALLS" "the upgrade never restarted or reloaded sing-box"
+    assert_grep ' 0\.1\.1 fresh$' "$T22_REL/releases.history" "the 0.1.1 baseline release is recorded in history"
+    assert_grep ' 0\.1\.2 upgrade$' "$T22_REL/releases.history" "the 0.1.2 upgrade is recorded in history"
+fi
+fi
+
 printf '\n== RESULT: %d passed, %d failed ==\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

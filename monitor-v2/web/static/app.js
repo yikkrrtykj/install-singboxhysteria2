@@ -126,6 +126,11 @@
       init.body = JSON.stringify(options.body);
     }
     return fetch(path, init).then(function (response) {
+      if (options.raw && response.ok) {
+        // M4 export: a FILE response. The bytes go straight to the caller's
+        // Blob handling -- never parsed, rendered, logged or stored here.
+        return response;
+      }
       return response.json().catch(function () { return {}; }).then(function (data) {
         if (!response.ok) {
           var error = new Error(data.error || ("HTTP " + response.status));
@@ -536,7 +541,6 @@
     var writable = e3Writable() && !state.e3PendingRetry;
     setBadge($("e3-availability"), writable ? "Available" : "Unavailable",
              writable ? "ok" : "idle");
-    $("e3-changes").textContent = writable ? "Available" : "Unavailable";
     if (writable) hide($("e3-unavailable")); else show($("e3-unavailable"));
     $("e3-add-btn").disabled = !writable;
     $("e3-add-name").disabled = !writable;
@@ -571,7 +575,20 @@
       row.insertCell(-1).textContent = clientLabel(client.name);
       row.insertCell(-1).textContent = (client.protocols || []).map(protocolLabel).join(", ");
       var actions = row.insertCell(-1);
-      // B4: no destructive control at all while the view is not writable.
+      // B4: no client-management control at all while the view is not
+      // writable. M4: Download is offered for EVERY client, Default
+      // included -- exporting the shared account's config was the gap this
+      // release closes. Delete keeps its original rules (never Default).
+      if (writable) {
+        var dl = document.createElement("button");
+        dl.className = "btn ghost";
+        dl.type = "button";
+        dl.textContent = "Download";
+        dl.addEventListener("click", function () {
+          downloadConfig(client.name);
+        });
+        actions.appendChild(dl);
+      }
       if (client.name !== "legacy" && client.mutable && writable) {
         var btn = document.createElement("button");
         btn.className = "btn ghost";
@@ -653,6 +670,50 @@
     });
   }
 
+  function downloadConfig(name) {
+    // M4: export is a READ -- no idempotency key, no ledger, and a pending
+    // uncertain MUTATION still blocks it (same view lock). The response is
+    // raw file bytes: they go straight into a Blob and a same-click
+    // programmatic download, and the object URL is revoked right after.
+    // The YAML never touches the DOM, the console, or any storage.
+    if (state.e3PendingRetry) return;
+    if (!e3Writable()) return;
+    e3Message("Preparing the download…", false);
+    apiWithStepUp("/api/v1/clients/export", {
+      method: "POST",
+      body: { name: name },
+      raw: true            // no Idempotency-Key header on this request
+    }).then(function (response) {
+      return response.blob().then(function (blob) {
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement("a");
+        a.href = url;
+        a.download = name + "-mihomo.yaml";
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        e3Message("Configuration downloaded.", false);
+      });
+    }).catch(function (error) {
+      if (error.status === 504 && error.uncertain) {
+        // The export may have been answered on the wire; nothing changed
+        // server-side, so retrying is simply clicking Download again.
+        e3Message("The export result is unknown. Refresh the status and try " +
+                  "the download again.", true);
+        loadE3Status();
+        return;
+      }
+      if (error.message === "step-up cancelled") {
+        hide($("e3-msg"));
+        return;
+      }
+      e3Message("The configuration could not be downloaded. Nothing was " +
+                "changed on the server.", true);
+      loadE3Status();
+    });
+  }
+
   function addClient(name, keyOverride) {
     // B3-final fail-safe: a pending uncertain operation locks the ordinary
     // entrance -- no new key is ever generated while one is unresolved.
@@ -665,8 +726,7 @@
       body: { name: name }
     }).then(function (data) {
       setPendingRetry(null);
-      e3Message("Client created. Credentials are not displayed here. " +
-                "Generate the client configuration on the server.",
+      e3Message("Client created. Download its configuration below.",
                 false);
       $("e3-add-name").value = "";
       loadE3Clients();

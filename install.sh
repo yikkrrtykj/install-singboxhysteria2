@@ -261,16 +261,12 @@ show_client_configuration() {
   hy_hopping_start=$(grep '^HY_HOPPING_START=' /root/sbox/config | cut -d'=' -f2)
   hy_hopping_end=$(grep '^HY_HOPPING_END=' /root/sbox/config | cut -d'=' -f2)
   hy_server_port_json="            \"server_port\": $hy_port,"
-  hy_clash_port_yaml="    port: $hy_port"
   formatted_range=""
   if [ "$ishopping" = "TRUE" ] &&
      [[ "$hy_hopping_start" =~ ^[0-9]+$ ]] &&
      [[ "$hy_hopping_end" =~ ^[0-9]+$ ]]; then
       formatted_range="${hy_hopping_start}-${hy_hopping_end}"
       hy_server_port_json="            \"server_ports\": [\"${hy_hopping_start}:${hy_hopping_end}\"],"
-      hy_clash_port_yaml="    port: $hy_port
-    ports: ${formatted_range}
-    hop-interval: 30"
       hy2_link="hysteria2://$hy_password@$server_ip:$hy_port?insecure=1&sni=$hy_server_name&mport=${hy_port},${formatted_range}#SING-BOX-HYSTERIA2"
   elif [ "$ishopping" = "TRUE" ]; then
       warning "端口跳跃已标记为开启，但配置中没有有效端口范围，将显示固定端口配置。"
@@ -306,7 +302,8 @@ show_client_configuration() {
 
   show_notice "Mihomo/Clash Meta客户端配置参数"
   mihomo_config_path="/root/sbox/mihomo_client.yaml"
-  # 共享账号（users[0]）的展示路径；多客户端请用"客户端管理 -> 生成客户端配置"
+  # 共享账号（保留名 legacy，即两个入站的首个用户）的展示路径，渲染统一走 canonical renderer；
+  # 多客户端请用"客户端管理 -> 生成客户端配置"
   write_mihomo_template "$mihomo_config_path" || error "保存 Mihomo 客户端配置失败"
   chmod 0600 "$mihomo_config_path" || error "设置 Mihomo 客户端配置权限失败"
   cat "$mihomo_config_path"
@@ -705,7 +702,7 @@ HY2_INBOUND_TAG="hy2-in"
 # lib/client-management.sh. Local repository execution sources the sibling file;
 # the historical curl/process-substitution entry point fetches the same path from
 # the selected repository ref. Tests/helpers may inject SB_CLIENT_MANAGEMENT_LIB.
-SB_CLIENT_MANAGEMENT_SHA256="c63511ebf9e97fd22b62e8480ef200d134abef1105ab8eb5167fb48a675d1d46"
+SB_CLIENT_MANAGEMENT_SHA256="6a2e2b97f259a0f97d7c3c16dde444603bbbacc4e619606036aca851f8984965"
 
 verify_client_management_library() { # <path>
     local lib="$1" got=""
@@ -767,7 +764,8 @@ load_client_management_library() {
 
     for fn in with_client_lock reload_running_singbox reload_health_ok \
               restore_file_atomically new_candidate_path new_backup_path \
-              commit_server_config cm_transaction_result_json; do
+              commit_server_config cm_transaction_result_json \
+              cm_render_client_mihomo_yaml; do
         if ! declare -F "$fn" >/dev/null 2>&1; then
             warning "共享事务库缺少函数: $fn"
             return 1
@@ -973,109 +971,17 @@ _delete_client_locked() {
 }
 # get_client_credentials is provided by lib/client-management.sh (M1-A0).
 
-# Writes the Mihomo/Clash Meta client YAML using caller-scope variables:
-#   $server_ip $reality_port $reality_uuid $reality_server_name $public_key
-#   $short_id $hy_clash_port_yaml $hy_password $hy_server_name
-# Only the credentials differ between clients; everything else is shared.
+# M4-A / review R2: there is exactly ONE Mihomo/Clash Meta YAML template in
+# this repository -- lib/client-management.sh :: cm_render_client_mihomo_yaml.
+# This is a thin wrapper over it for the installer's shared-account display
+# path (the reserved "legacy" account, which is users[0] in both inbounds),
+# so CLI files and privileged client.export downloads are byte-identical BY
+# CONSTRUCTION. A static regression FAILS if install.sh ever carries a
+# second template body again.
 write_mihomo_template() { # write_mihomo_template <outfile>
     local outfile="$1"
-    cat > "$outfile" << EOF || return 1
-mixed-port: 7897
-allow-lan: true
-bind-address: "*"
-mode: rule
-log-level: info
-unified-delay: true
-ipv6: true
-profile:
-  store-selected: true
-  store-fake-ip: true
-dns:
-  enable: true
-  listen: "0.0.0.0:53"
-  ipv6: true
-  enhanced-mode: fake-ip
-  fake-ip-range: 198.18.0.1/16
-  default-nameserver:
-    - 223.5.5.5
-    - 8.8.8.8
-  nameserver:
-    - https://dns.alidns.com/dns-query
-    - https://doh.pub/dns-query
-  fallback:
-    - https://1.0.0.1/dns-query
-    - tls://dns.google
-  fallback-filter:
-    geoip: true
-    geoip-code: CN
-    ipcidr:
-      - 240.0.0.0/4
-
-tun:
-  enable: true
-  stack: mixed
-  device: Mihomo
-  mtu: 1420
-  auto-route: true
-  auto-redirect: true
-  auto-detect-interface: true
-  dns-hijack:
-    - any:53
-    - tcp://any:53
-
-proxies:
-  - name: Reality
-    type: vless
-    server: $server_ip
-    port: $reality_port
-    uuid: $reality_uuid
-    network: tcp
-    udp: true
-    tls: true
-    flow: xtls-rprx-vision
-    servername: $reality_server_name
-    client-fingerprint: chrome
-    reality-opts:
-      public-key: $public_key
-      short-id: $short_id
-
-  - name: Hysteria2
-    type: hysteria2
-    server: $server_ip
-${hy_clash_port_yaml}
-    password: $hy_password
-    up: "300 Mbps"
-    down: "300 Mbps"
-    sni: $hy_server_name
-    skip-cert-verify: true
-    alpn:
-      - h3
-
-proxy-groups:
-  - name: 节点选择
-    type: select
-    proxies:
-      - Reality
-      - Hysteria2
-      - 自动选择
-      - DIRECT
-
-  - name: 自动选择
-    type: url-test
-    proxies:
-      - Reality
-      - Hysteria2
-    url: "http://www.gstatic.com/generate_204"
-    interval: 300
-    tolerance: 50
-
-
-rules:
-  - GEOIP,LAN,DIRECT
-  - GEOIP,CN,DIRECT
-  - MATCH,节点选择
-
-EOF
+    cm_render_client_mihomo_yaml "$RESERVED_CLIENT_NAME" "$SB_SERVER_CONFIG" \
+        > "$outfile" || return 1
     return 0
 }
 
@@ -1100,9 +1006,6 @@ generate_client_configuration() { # generate_client_configuration <name>
     fi
     uuid="$(printf '%s\n' "$creds" | sed -n '1p')"
     password="$(printf '%s\n' "$creds" | sed -n '2p')"
-    # write_mihomo_template reads these exact names from the caller scope
-    reality_uuid="$uuid"
-    hy_password="$password"
 
     server_ip=$(grep -o "SERVER_IP='[^']*'" "$SB_STATE_FILE" 2>/dev/null | awk -F"'" '{print $2}')
     public_key=$(grep -o "PUBLIC_KEY='[^']*'" "$SB_STATE_FILE" 2>/dev/null | awk -F"'" '{print $2}')
@@ -1114,15 +1017,11 @@ generate_client_configuration() { # generate_client_configuration <name>
     ishopping=$(grep '^HY_HOPPING=' "$SB_STATE_FILE" 2>/dev/null | cut -d'=' -f2)
     hy_hopping_start=$(grep '^HY_HOPPING_START=' "$SB_STATE_FILE" 2>/dev/null | cut -d'=' -f2)
     hy_hopping_end=$(grep '^HY_HOPPING_END=' "$SB_STATE_FILE" 2>/dev/null | cut -d'=' -f2)
-    hy_clash_port_yaml="    port: $hy_port"
     formatted_range=""
     if [ "$ishopping" = "TRUE" ] &&
        [[ "$hy_hopping_start" =~ ^[0-9]+$ ]] &&
        [[ "$hy_hopping_end" =~ ^[0-9]+$ ]]; then
         formatted_range="${hy_hopping_start}-${hy_hopping_end}"
-        hy_clash_port_yaml="    port: $hy_port
-    ports: ${formatted_range}
-    hop-interval: 30"
     fi
 
     out_dir="$SB_CLIENTS_DIR/$name"
@@ -1132,7 +1031,10 @@ generate_client_configuration() { # generate_client_configuration <name>
     fi
     chmod 0700 "$out_dir"
     out_file="$out_dir/mihomo.yaml"
-    if ! write_mihomo_template "$out_file"; then
+    # M4-A: the file content comes from the ONE canonical renderer in
+    # lib/client-management.sh (the same copy the privileged export op uses);
+    # the output is byte-identical to the historical template.
+    if ! cm_render_client_mihomo_yaml "$name" "$cfg" > "$out_file"; then
         warning "写入客户端配置失败: $out_file"
         return 1
     fi
