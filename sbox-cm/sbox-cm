@@ -518,10 +518,15 @@ def handle_connection(conn, allowed):
             return
 
         request_id = args["request_id"]
-        cached = replay_get(request_id)
-        if cached is not None:
-            send_frame(conn, cached)
-            return
+        # SENSITIVE_RESPONSE_OPS never touch the replay cache in EITHER
+        # direction: a stored response would keep credential material
+        # alive past its one delivery, and a cache HIT could silently
+        # replay an old YAML in place of a fresh render.
+        if op not in SENSITIVE_RESPONSE_OPS:
+            cached = replay_get(request_id)
+            if cached is not None:
+                send_frame(conn, cached)
+                return
 
         try:
             wres = run_worker(op, args)

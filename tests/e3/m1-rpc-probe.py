@@ -349,6 +349,32 @@ def socketpair_tests(mod):
         eq((calls[-1]["args"] or {}).get("name"), "vmix-01",
            "the export dispatch carried the validated name to the worker")
 
+        # Review R1: the bypass must be BIDIRECTIONAL. A non-sensitive op
+        # first populates the cache under request_id X; a client.export
+        # using the SAME X must still dispatch, must return its OWN fresh
+        # result, and must not overwrite or be served from that entry.
+        rid_x = "reqid-sp-0000012"
+        c1, r_store = exchange(frame({"v": VERSION, "request_id": rid_x,
+                                      "op": "management.status"}))
+        c1.close()
+        eq((r_store.get("data") or {}).get("op"), "management.status",
+           "the non-sensitive op populated the replay cache")
+        n_before = len(calls)
+        c2, r_exp = exchange(frame({"v": VERSION, "request_id": rid_x,
+                                    "op": "client.export", "name": "vmix-01"}))
+        c2.close()
+        eq(len(calls), n_before + 1,
+           "an export sharing a cached request_id still dispatched")
+        check(r_exp != r_store,
+              "the export was not served from the cross-op cache entry")
+        eq((r_exp.get("data") or {}).get("op"), "client.export",
+           "the export answered with its own result")
+        c3, r_replay = exchange(frame({"v": VERSION, "request_id": rid_x,
+                                       "op": "management.status"}))
+        c3.close()
+        eq(r_replay, r_store,
+           "the export left the cache entry untouched (no replay_put)")
+
         # schema errors are answered
         client, resp = exchange(frame({"v": VERSION, "request_id": "reqid-sp-0000004",
                                        "op": "client.rotate"}))
