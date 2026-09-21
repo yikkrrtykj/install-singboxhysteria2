@@ -2219,8 +2219,8 @@ else
         "$(grep -c 'systemctl restart singbox-monitor' "$T22_CALLS")" \
         "the upgrade restarted singbox-monitor exactly once"
     assert_no_grep 'sing-box' "$T22_CALLS" "the upgrade never restarted or reloaded sing-box"
-    assert_grep '^[0-9]\+ 0\.1\.1 0\.1\.1 ' "$T22_REL/releases.history" "the 0.1.1 baseline release is recorded in history"
-    assert_grep '^[0-9]\+ 0\.1\.2 0\.1\.2 upgrade$' "$T22_REL/releases.history" "the 0.1.2 upgrade is recorded in history"
+    assert_grep ' 0\.1\.1 fresh$' "$T22_REL/releases.history" "the 0.1.1 baseline release is recorded in history"
+    assert_grep ' 0\.1\.2 upgrade$' "$T22_REL/releases.history" "the 0.1.2 upgrade is recorded in history"
 fi
 fi
 
