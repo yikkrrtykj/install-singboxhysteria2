@@ -261,16 +261,12 @@ show_client_configuration() {
   hy_hopping_start=$(grep '^HY_HOPPING_START=' /root/sbox/config | cut -d'=' -f2)
   hy_hopping_end=$(grep '^HY_HOPPING_END=' /root/sbox/config | cut -d'=' -f2)
   hy_server_port_json="            \"server_port\": $hy_port,"
-  hy_clash_port_yaml="    port: $hy_port"
   formatted_range=""
   if [ "$ishopping" = "TRUE" ] &&
      [[ "$hy_hopping_start" =~ ^[0-9]+$ ]] &&
      [[ "$hy_hopping_end" =~ ^[0-9]+$ ]]; then
       formatted_range="${hy_hopping_start}-${hy_hopping_end}"
       hy_server_port_json="            \"server_ports\": [\"${hy_hopping_start}:${hy_hopping_end}\"],"
-      hy_clash_port_yaml="    port: $hy_port
-    ports: ${formatted_range}
-    hop-interval: 30"
       hy2_link="hysteria2://$hy_password@$server_ip:$hy_port?insecure=1&sni=$hy_server_name&mport=${hy_port},${formatted_range}#SING-BOX-HYSTERIA2"
   elif [ "$ishopping" = "TRUE" ]; then
       warning "端口跳跃已标记为开启，但配置中没有有效端口范围，将显示固定端口配置。"
@@ -706,7 +702,7 @@ HY2_INBOUND_TAG="hy2-in"
 # lib/client-management.sh. Local repository execution sources the sibling file;
 # the historical curl/process-substitution entry point fetches the same path from
 # the selected repository ref. Tests/helpers may inject SB_CLIENT_MANAGEMENT_LIB.
-SB_CLIENT_MANAGEMENT_SHA256="4866c59e1c180f3bc7fef56f497ac93f7ab567c9eebd36a19f3a88ae66d9f4f1"
+SB_CLIENT_MANAGEMENT_SHA256="6a2e2b97f259a0f97d7c3c16dde444603bbbacc4e619606036aca851f8984965"
 
 verify_client_management_library() { # <path>
     local lib="$1" got=""
@@ -1021,15 +1017,11 @@ generate_client_configuration() { # generate_client_configuration <name>
     ishopping=$(grep '^HY_HOPPING=' "$SB_STATE_FILE" 2>/dev/null | cut -d'=' -f2)
     hy_hopping_start=$(grep '^HY_HOPPING_START=' "$SB_STATE_FILE" 2>/dev/null | cut -d'=' -f2)
     hy_hopping_end=$(grep '^HY_HOPPING_END=' "$SB_STATE_FILE" 2>/dev/null | cut -d'=' -f2)
-    hy_clash_port_yaml="    port: $hy_port"
     formatted_range=""
     if [ "$ishopping" = "TRUE" ] &&
        [[ "$hy_hopping_start" =~ ^[0-9]+$ ]] &&
        [[ "$hy_hopping_end" =~ ^[0-9]+$ ]]; then
         formatted_range="${hy_hopping_start}-${hy_hopping_end}"
-        hy_clash_port_yaml="    port: $hy_port
-    ports: ${formatted_range}
-    hop-interval: 30"
     fi
 
     out_dir="$SB_CLIENTS_DIR/$name"
