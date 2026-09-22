@@ -1,101 +1,172 @@
 #!/usr/bin/env python3
 """Monitor v2 Phase E4-Diag -- client-side Mihomo failover FORENSICS (issue #41).
 
-Read-only, local-only diagnostic recorder. Where E4 (client.py) answers
-"what does the controller look like RIGHT NOW" as one display-only enrichment
-object, E4-Diag answers "WHAT ACTUALLY HAPPENED around the failover that did
-not happen" AFTER the fact, from a local JSONL evidence trail:
+Read-only, local-only diagnostic recorder implementing the reviewed design
+of issue #41. Where E4 (client.py) answers "what does the controller look
+like RIGHT NOW" as one display-only enrichment object, E4-Diag answers "WHAT
+ACTUALLY HAPPENED" around the failover that did not happen AFTER the fact,
+from a local JSONL evidence trail:
 
     H1 node marked dead        -> member alive=false + history delay 0 (RAW)
-    H2 alive-but-failing       -> alive=true + history cadence + stale chains
+    H2 alive-but-failing       -> alive=true + cached history cadence
     H3 manual outer pin        -> group type + now (selectors never inferred)
-    H4 probe healthy, relay broken -> per-test-url extra histories
+    H4 probe healthy, relay broken -> per-test-url extra histories (test_id)
     H5 not yet re-tested       -> >=2 samples inside one health interval
-    H6 connections not migrating -> chain attribution + stale_after_switch
+    H6 connections not migrating -> per-node chain aggregates (count/start)
 
 Everything the E4 security posture guarantees is reused VERBATIM from
 client.py (this module imports the audited pieces, it does not fork them):
 fail-closed loopback-only URL parsing, the GET-only-by-construction
 transport (its request surface is a single ``get(path)`` -- no mutation verb
-can be issued, deliberately), 1-3s clamped per-request timeouts, secret
-handling (Authorization header only, env/0600-file resolution) and the
-``redact()`` error-sanitization path. Active health probes
-(the upstream per-node delay-test endpoint) are NEVER requested:
-cached history only. The recorder never mutates, restarts, gates or delays
-Mihomo or proxy operation, and it imports NOTHING from model.py's enrichment
-layer: ENRICHMENT_KEYS stays a closed E4 invariant and diagnostics get their
-own record format.
+can be issued, deliberately), 1-3s clamped per-request timeouts, and secret
+handling (Authorization header only, env/0600-file resolution). Active
+health probes (the upstream per-node delay-test endpoint) are NEVER
+requested: cached history only. The recorder never mutates, restarts, gates
+or delays Mihomo or proxy operation, and it imports NOTHING from model.py's
+enrichment layer: ENRICHMENT_KEYS stays a closed E4 invariant and
+diagnostics get their own record format.
 
 IDENTITY BOUNDARY (same contract as E4): every node/group name is a Mihomo
 DISPLAY name echoed verbatim for local forensics; it is never mapped, matched
 or parsed against server-side devices. No server identity field is ever
 written.
 
-OUTPUT CONTRACT (issue #41 design, decision areas 1-2): five closed record
-kinds -- ``run`` (once per process, carries the non-secret run_id),
-``sample`` (per cycle), ``sel`` / ``alive`` (diff events, change-triggered
-only) and ``err`` (closed failure-class enum). Records are built
-field-by-field from literals, so an upstream schema surprise can never add
-a key. Connection evidence is aggregated to counts only -- ids, source and
-destination addresses, hosts and rules never leave the parser. The single
-free-text field in the format is ``err.detail``, fed exclusively by our own
-exception strings already passed through ``redact()`` and capped: no response
-body, no config, no credential ever reaches the file.
+RECORD SCHEMA (reviewed design 5777726169 + review 5778693980): schema
+version ``v=1``; EXACTLY FOUR record types -- ``sample`` (one per cycle,
+ALWAYS emitted, even when /version is unreachable: api_reachable=false,
+mihomo_version=null, endpoint statuses honestly "unavailable"),
+``selection_changed`` / ``alive_flipped`` (diff events) and ``collector``
+(closed code enum with a bounded ``scope`` field and a consecutive-cycle
+``count``). There is deliberately NO run/header record type: a process
+restart is visible evidence via the fresh ``run`` (uuid4().hex, one per
+process, carried by every record) plus the always-emitted first sample.
+Records are built field-by-field from literals, so an upstream schema
+surprise can never add a key. NOTHING arbitrary is persisted: no exception
+text, no HTTP response body bytes, no status codes, no raw URLs, no
+credentials, even redacted or truncated -- the only error vocabulary is the
+closed (code, scope, count) triple. Custom health-check test URLs are never
+stored: each is replaced by ``test_id = HMAC-SHA256(local 256-bit key, raw
+url)[:16 hex]``; the key lives in the evidence dir (0600, fail-closed) so
+ids stay stable across samples AND restarts while the URL itself never
+crosses the persistence boundary. Connection evidence is per-node
+aggregates (active chain count, oldest/newest start, invalid-start count)
+-- ids, addresses, hosts, rules and counters never leave the parser, and
+no cross-group "stale" inference is derived (it would overclaim under
+nested topologies).
 
-PERSISTENCE (decision area 5): --out-dir is REQUIRED and fail-closed
-(real dir, never a symlink, 0700); records append to diag.jsonl
-(O_NOFOLLOW + 0600, one write() per line, fsync once per cycle), rotated by
-size through a numeric shift (diag.jsonl.1 .. .{N-1}) via os.replace. A
-collection or storage failure is VISIBLE: sanitized err record plus a
-non-zero once-mode result (3 api / 4 storage / 5 both) -- never a silent
+CAUSAL BOUNDARY (review B2): selection_changed/alive_flipped events are
+emitted ONLY between two valid observations inside the SAME process run
+with no invalid/unavailable gap between them. Diff state is never seeded
+from a previous run: a restart gap is evidence of a gap, not a proven
+transition. A /version failure skips the other reads for that cycle, so it
+breaks the diff chain exactly like an unavailable /proxies sample. A
+consequence: one-shot ``--once`` invocations (systemd-timer shape) can
+never prove transition events across invocations -- the resident
+``--resident`` loop is the mode that produces edges.
+
+BOUNDS (review B5): max 8 watched groups, 32 stored members per group, 64
+observed nodes per sample, names 1..128 UTF-8 bytes without C0/C1 controls,
+history tails of 8, per-node test-id entries capped, rotation arguments
+bounded (2..32 files, <=8 MiB/file, <=32 MiB total). The hard record
+ceiling is measured on the FINAL ENCODED BYTES INCLUDING the trailing
+newline: an oversized record is trimmed STRUCTURALLY (never byte-sliced)
+and marked by a ``truncated`` flag plus an ``invalid_fields`` counter.
+History delays are BOUNDED INTEGERS only: a float -- even 1.0 -- is not a
+probe result and is dropped and counted, never coerced.
+
+PERSISTENCE (review B4): --out-dir is REQUIRED and fail-closed (no symlink
+component anywhere on the path, real directory, 0700 -- a permission-
+tightening failure is fatal on POSIX). diag.jsonl is opened O_NOFOLLOW,
+fstat-verified regular, fchmod 0600 (failure fatal), appended with one
+write-until-complete loop per batch, fsynced per cycle; a pre-existing
+torn trailing fragment is frame-protected, not destroyed. Rotation is a
+numeric size shift (diag.jsonl.1 .. .{N-1}) with file fsync before the
+rename and directory fsync after it. One diag.lock (advisory exclusive,
+non-blocking) makes a second collector on the same directory refuse to
+start. A collection or storage failure is VISIBLE: collector records plus
+a non-zero once-mode result (3 api / 4 storage / 5 both) -- never a silent
 exit 0 forever.
 
 NO FABRICATED HISTORY: ts is stamped at write time, never backfilled; each
-process generates one non-secret run_id so restarts and gaps are explicit.
-Diff state survives restarts by tail-reading the last 64 KiB of the JSONL
-(torn final line tolerated), so a --once run under a systemd timer emits
-correct transition events with zero sidecar state.
+process generates one non-secret run id so restarts and gaps are explicit.
+Error accounting (review B6): the whole cycle's error-code set is computed
+FIRST; each present code increments its consecutive-cycle counter exactly
+once (one collector record per code per cycle -- the bounded scope field,
+never detail text, is what distinguishes endpoints) and a code resets only
+after a FULL cycle in which it was absent; a /version failure shortens the
+cycle, so it increments and never resets.
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
 import datetime
+import hashlib
+import hmac
 import json
 import os
 import signal
+import stat as stat_module
 import sys
 import time
 import uuid
 
 from client import (ConfigurationError, DEFAULT_TIMEOUT, DEFAULT_URL,
-                    HttpTransport, MAX_ERROR_BODY, SecretFileError,
-                    TransportError, clamp_timeout, parse_controller_url,
-                    redact, resolve_secret)
+                    HttpTransport, SecretFileError, clamp_timeout,
+                    parse_controller_url, resolve_secret)
 
-COLLECTOR_VER = 1
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None
+
+SCHEMA_V = 1
+# The closed record vocabulary (design section 6): exactly four types, no
+# header/run record. The regression suite proves the persisted "t" set is
+# strictly within this tuple.
+RECORD_TYPES = ("sample", "selection_changed", "alive_flipped", "collector")
 DIAG_FILENAME = "diag.jsonl"
-OBS_CAP = 64               # observed-name cap per sample (a bound, not a target)
-HIST_KEEP = 3              # cached history entries kept per node/group, newest-last
-NODE_URL_KEEP = 4          # per-test-url "extra" entries per node (version-dependent)
-URL_MAX_LEN = 128          # test-url display cap
-DETAIL_MAX_LEN = 200       # err.detail cap -- the only free-text field
+KEY_FILENAME = "diag.key"
+LOCK_FILENAME = "diag.lock"
+HMAC_KEY_BYTES = 32
+TEST_ID_HEX = 16
+
+# Cardinality bounds (reviewed design section 2 -- fail-closed everywhere).
+MAX_GROUPS = 8             # caller-named groups per collector
+OBS_CAP = 64               # distinct observed nodes per sample
+MAX_MEMBERS = 32           # stored members per group (rest counted+flagged)
+NAME_MAX_BYTES = 128       # group/node names and version strings, UTF-8
+HIST_KEEP = 8              # cached history entries kept per subject, newest-last
+NODE_URL_KEEP = 8          # per-test-url extra entries per node (version-dependent)
+DELAY_MAX = 1000000        # plausible ms bound; larger values are not evidence
+RECORD_MAX_BYTES = 64 * 1024  # hard ceiling for one encoded line, newline INCLUDED
+
 MIN_INTERVAL = 30.0        # sampling floor: divisor of the 60s health interval
 MAX_INTERVAL = 60.0        # keeps >=2 samples inside the 65s worst-case window
 DEFAULT_INTERVAL = 30.0
 DEFAULT_MAX_MB = 4
 DEFAULT_FILES = 4          # diag.jsonl + .1 .. .(N-1)  -> bounded by rotation
-TAIL_BYTES = 64 * 1024     # state-recovery tail window
+MIN_FILES = 2
+MAX_FILES = 32             # reviewed retention ceiling
+MAX_FILE_MB = 8            # per-file rotation cap
+TOTAL_MB_BUDGET = 32       # whole evidence chain hard budget
 
-# Failure classes (closed enum). Cycle classes re-record every failing cycle
-# with an incrementing consecutive count n; subject classes (entity
-# transitions) record once per appearance so a persistent misconfiguration
-# never storms a 30s log.
-CYCLE_ERR_CLASSES = ("api_unreachable", "api_malformed", "storage_failed",
-                     "rotation_failed")
-SUBJECT_ERR_CLASSES = ("group_missing", "node_missing", "history_truncated",
-                       "config")
-ERR_CLASSES = CYCLE_ERR_CLASSES + SUBJECT_ERR_CLASSES
+# Collector failure codes (closed enum, design section 6D) with their fixed
+# scopes. A cycle's whole code set is computed before any record is folded
+# (review B6); CODE_SCOPE is the fail-closed definition of scope -- a code
+# outside this map can never be recorded.
+COLLECTOR_CODES = ("mihomo_unreachable", "proxies_invalid", "connections_invalid",
+                   "group_missing", "node_missing", "storage_error")
+COLLECTOR_SCOPES = ("version", "proxies", "connections", "storage")
+CODE_SCOPE = {"mihomo_unreachable": "version", "proxies_invalid": "proxies",
+              "connections_invalid": "connections", "group_missing": "proxies",
+              "node_missing": "proxies", "storage_error": "storage"}
+ENDPOINT_STATUSES = ("ok", "unavailable", "invalid")
 
 EXIT_OK = 0
 EXIT_CONFIG = 2
@@ -104,10 +175,14 @@ EXIT_STORAGE = 4
 EXIT_BOTH = 5
 
 _WINDOWS = os.name == "nt"
+# Windows CRT defaults os.open to TEXT mode, which silently rewrites 0x0A
+# bytes to CRLF -- a raw key or JSONL line must never pass through it.
+# Zero on POSIX.
+_O_BINARY = getattr(os, "O_BINARY", 0)
 
 
 class StorageError(Exception):
-    """The evidence file could not be written/rotated (path only, no data)."""
+    """The evidence chain could not be written/rotated (path only, no data)."""
 
 
 # -- small strict parsers -----------------------------------------------------
@@ -123,10 +198,18 @@ def clamp_interval(value):
     return min(max(value, MIN_INTERVAL), MAX_INTERVAL)
 
 
+def iso_z(value):
+    """Aware datetime -> "YYYY-MM-DDTHH:MM:SSZ" (design examples are Z-form)."""
+    if value is None:
+        return None
+    return (value.astimezone(datetime.timezone.utc)
+            .isoformat(timespec="seconds").replace("+00:00", "Z"))
+
+
 def utc_iso(stamp):
-    """POSIX seconds -> RFC3339 UTC with explicit offset, second precision."""
-    return datetime.datetime.fromtimestamp(
-        float(stamp), datetime.timezone.utc).isoformat(timespec="seconds")
+    """POSIX seconds -> RFC3339 UTC, second precision, Z form."""
+    return iso_z(datetime.datetime.fromtimestamp(float(stamp),
+                                                 datetime.timezone.utc))
 
 
 def parse_ts(value):
@@ -154,10 +237,23 @@ def parse_ts(value):
     return parsed.astimezone(datetime.timezone.utc)
 
 
-def as_str(value):
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    return None
+def safe_name(value):
+    """Validate one display name against the reviewed bound.
+
+    Non-empty, <=128 UTF-8 bytes, no C0/C1 control characters. Returns the
+    name or None -- an invalid name is DROPPED AND COUNTED upstream, never
+    truncated into something that looks real, never serialized raw.
+    """
+    if not isinstance(value, str):
+        return None
+    name = value.strip()
+    if not name or len(name.encode("utf-8", "replace")) > NAME_MAX_BYTES:
+        return None
+    for ch in name:
+        code = ord(ch)
+        if code < 0x20 or 0x7f <= code <= 0x9f:
+            return None
+    return name
 
 
 def as_strict_bool(value):
@@ -165,296 +261,550 @@ def as_strict_bool(value):
     return value if isinstance(value, bool) else None
 
 
+def test_identify(key, raw_url):
+    """Stable local correlation id for a health-check test URL (review B1).
+
+    The raw URL (which may embed credentials, private paths or query tokens)
+    exists only transiently during parsing; what is persisted is the 16-hex
+    HMAC-SHA256 prefix under a collector-owned random key. Same key + same
+    URL across samples AND restarts yields the same id; the id is not
+    reversible without the key file.
+    """
+    digest = hmac.new(key, raw_url.encode("utf-8", "replace"),
+                      hashlib.sha256).hexdigest()
+    return digest[:TEST_ID_HEX]
+
+
 def parse_history(raw, keep=HIST_KEEP):
-    """Mihomo history -> (entries newest-last, malformed count).
+    """Mihomo history -> (entries newest-last, dropped count, soft count).
 
     THE E4-H1 FIX: delay==0 encodes a FAILED probe and is preserved RAW as
-    ``d`` (E4 display normalized it away); ``t`` is the probe timestamp or
-    null. Entries that are not {"time","delay"} shaped are dropped
-    individually -- never an abort of the whole history.
+    ``delay_ms`` (E4 display normalized it away); ``ts`` is the probe
+    timestamp or null. Delay must be a TRUE non-negative integer within a
+    plausible bound -- a float (even 1.0), bool or string is not a probe
+    result and is dropped and counted, never coerced. A delay whose ``time``
+    does not parse is still evidence: the entry is kept with ts null and
+    counted as soft-invalid. Entries that are not {"time","delay"} shaped
+    are dropped individually and counted -- never an abort of the whole
+    history.
     """
     if not isinstance(raw, list):
-        return [], 0
+        return [], 0, 0
     entries = []
     dropped = 0
+    soft = 0
     for item in reversed(raw):
         if not isinstance(item, dict) or "delay" not in item:
             dropped += 1
             continue
-        delay = item.get("delay")
-        if isinstance(delay, bool):
-            dropped += 1
+        delay = item["delay"]
+        if isinstance(delay, bool) or not isinstance(delay, int):
+            dropped += 1          # a float or string is not a probe result
             continue
-        try:
-            delay = int(delay)
-        except (TypeError, ValueError):
+        if delay < 0 or delay > DELAY_MAX:
             dropped += 1
             continue
         when = parse_ts(item.get("time"))
-        entries.append({"d": delay, "t": when.isoformat(timespec="seconds") if when else None})
+        if when is None:
+            soft += 1             # delay kept as evidence, ts honestly null
+        entries.append({"ts": iso_z(when), "delay_ms": delay})
         if len(entries) >= keep:
             break
     entries.reverse()
-    return entries, dropped
+    return entries, dropped, soft
 
 
-def parse_proxies_summary(payload, group_names):
+def parse_proxies_summary(payload, group_names, hmac_key=None):
     """/proxies -> closed per-cycle summary for the CALLER-NAMED groups only.
 
-    Reads ONLY: per named group type/now/all/history; per observed member node
-    alive/history(kept 0)/extra per-test-url histories (newer builds only).
-    The observed set is the union of named-group members plus their current
-    selections; nodes outside it are never even looked up. Everything else in
-    the payload is dropped in-reader and never serialized.
+    Reads ONLY the design section 4 whitelist: per named group
+    name/type/now/members/alive (alive only when boolean); per observed
+    node name/type/alive/history (delay 0 preserved RAW)/extra per-test-url
+    histories (newer builds only) projected to HMAC test_id. The observed
+    set is the union of named-group members plus their current selections;
+    nodes outside it are never even looked up. Raw test-URL keys are NEVER
+    persisted (review B1); names, members and histories are bounded with
+    explicit counters (review B5). Everything else in the payload is
+    dropped in-reader and never serialized. This dict is INTERNAL to the
+    collector -- the sample record copies its closed fields, it never
+    serializes the summary itself.
     """
-    out = {"groups": [], "obs": [], "nodes": [], "missing_groups": [],
-           "missing_nodes": [], "history_dropped": False, "usable": False}
+    out = {"groups": [], "watched": [], "nodes": [], "missing_groups": [],
+           "missing_nodes": [], "broken_groups": [], "invalid_fields": 0,
+           "truncated": False, "usable": False}
+    invalid = 0
     if not isinstance(payload, dict) or not isinstance(payload.get("proxies"), dict):
         return out
     proxies = payload["proxies"]
-    observed = []
-    member_of = {}          # node -> set of named groups that list it
+    watched = []
     for name in group_names:
         entry = proxies.get(name)
         if not isinstance(entry, dict):
-            out["groups"].append({"name": name, "error": "missing"})
+            out["groups"].append({"name": name, "type": None, "now": None,
+                                  "members": []})
             out["missing_groups"].append(name)
             continue
-        rec = {"name": name}
-        gtype = as_str(entry.get("type"))
+        rec = {"name": name, "type": None, "now": None, "members": []}
+        gtype = safe_name(entry.get("type"))
         if gtype:
             rec["type"] = gtype.lower()
-        now = as_str(entry.get("now"))
+        elif entry.get("type") is not None:
+            invalid += 1
+        now = safe_name(entry.get("now"))
         if now:
             rec["now"] = now
+        elif entry.get("now") is not None:
+            invalid += 1          # present but unusable: chain-breaker below
+            out["broken_groups"].append(name)
+        galive = entry.get("alive")
+        if isinstance(galive, bool):
+            rec["alive"] = galive
+        elif galive is not None:
+            invalid += 1
         members = entry.get("all")
-        names = [m for m in members if isinstance(m, str) and m.strip()] \
-            if isinstance(members, list) else []
-        if names:
-            rec["all"] = sorted(names)
-        hist, _dropped = parse_history(entry.get("history"))
-        if hist:  # fallback/urltest groups carry their own probe history
-            rec["hist"] = hist
+        names = []
+        if isinstance(members, list):
+            for member in members:
+                checked = safe_name(member)
+                if checked is None:
+                    invalid += 1
+                elif checked not in names:
+                    names.append(checked)
+        elif members is not None:
+            invalid += 1
+        if len(names) > MAX_MEMBERS:
+            out["truncated"] = True
+            names = sorted(names)[:MAX_MEMBERS]
+        else:
+            names = sorted(names)
+        rec["members"] = names
         out["groups"].append(rec)
-        for member in names:
-            member_of.setdefault(member, set()).add(name)
-        if now:
-            member_of.setdefault(now, set()).add(name)
         for candidate in names + ([now] if now else []):
-            if candidate not in observed:
-                observed.append(candidate)
-    observed.sort()
-    if len(observed) > OBS_CAP:
-        out["history_dropped"] = True
-        observed = observed[:OBS_CAP]
-    out["obs"] = observed
-    for name in observed:
+            if candidate not in watched:
+                watched.append(candidate)
+    watched.sort()
+    if len(watched) > OBS_CAP:
+        out["truncated"] = True
+        watched = watched[:OBS_CAP]
+    out["watched"] = watched
+    for name in watched:
         entry = proxies.get(name)
         if not isinstance(entry, dict):
-            out["nodes"].append({"name": name, "alive": None})
+            out["nodes"].append({"name": name, "type": None, "alive": None,
+                                 "history": [], "extra": []})
             out["missing_nodes"].append(name)
             continue
-        rec = {"name": name, "alive": as_strict_bool(entry.get("alive"))}
-        hist, dropped = parse_history(entry.get("history"))
-        if dropped:
-            out["history_dropped"] = True
-        if hist:
-            rec["hist"] = hist
+        rec = {"name": name, "type": None, "alive": None, "history": [],
+               "extra": []}
+        ntype = safe_name(entry.get("type"))
+        if ntype:
+            rec["type"] = ntype.lower()
+        elif entry.get("type") is not None:
+            invalid += 1
+        nalive = entry.get("alive")
+        rec["alive"] = as_strict_bool(nalive)
+        if nalive is not None and not isinstance(nalive, bool):
+            invalid += 1
+        hist, dropped, soft = parse_history(entry.get("history"))
+        invalid += dropped + soft
+        rec["history"] = hist
         extra = entry.get("extra")
-        if isinstance(extra, dict):
+        if isinstance(extra, dict) and hmac_key is not None:
             urls = []
-            for test_url in sorted(extra)[:NODE_URL_KEEP]:
+            keys = sorted(k for k in extra if isinstance(k, str))
+            if len(keys) > NODE_URL_KEEP:
+                out["truncated"] = True
+            for test_url in keys[:NODE_URL_KEEP]:
                 detail = extra.get(test_url)
                 if not isinstance(detail, dict):
+                    invalid += 1
                     continue
-                entry_hist, _ = parse_history(detail.get("history"), keep=1)
-                urls.append({"u": str(test_url)[:URL_MAX_LEN],
+                entry_hist, e_dropped, e_soft = parse_history(
+                    detail.get("history"), keep=1)
+                invalid += e_dropped + e_soft
+                # the raw URL exists only on this line -- HMAC id is persisted
+                urls.append({"test_id": test_identify(hmac_key, test_url),
                              "alive": as_strict_bool(detail.get("alive")),
-                             "hist": entry_hist})
-            if urls:
-                rec["urls"] = urls
+                             "history": entry_hist})
+            rec["extra"] = urls
+        elif extra is not None and not isinstance(extra, dict):
+            invalid += 1
         out["nodes"].append(rec)
-    out["member_of"] = {k: sorted(v) for k, v in member_of.items()}
+    out["invalid_fields"] = invalid
     out["usable"] = True
     return out
 
 
-def parse_connections_summary(payload, obs, member_of, current_now, sel_ts):
-    """/connections -> CLOSED aggregate counts {n, by_node, multi, stale}.
+def parse_connections_summary(payload, watched):
+    """/connections -> per watched-node AGGREGATES (review B3, no inference).
 
     Per connection ONLY "chains" (node-name path) and "start" are read.
-    Connection ids, source/destination addresses, ports, hosts and rules are
-    structurally never touched, so they cannot leak. Semantics mirror E4:
-    "connections": null is the verified official idle shape -> n=0; a missing
-    key or wrong type is contract drift -> None (unknown, never shown as 0).
+    Connection ids, source/destination addresses, ports, hosts, rules and
+    counters are structurally never touched, so they cannot leak. Returns
+    (aggregates, malformed): aggregates is a list with one entry per
+    watched node
 
-    stale = stale_after_switch (H6): the connection's chain traverses an
-    OBSERVED member of a named group that is NOT that group's current
-    selection, AND the connection predates that group's last recorded
-    selection change. An unknown start time or an unproven switch never
-    counts as stale -- stale>0 must be evidence, not a guess.
+        {"node", "active_chain_count", "oldest_start", "newest_start",
+         "invalid_start_count"}
+
+    or None when the connections field itself is missing/wrong-typed --
+    unknown, NEVER shown as zero. "connections": null and [] are the
+    verified official empty shapes -> confirmed zero. Only VALID connection
+    objects (dict with a chains list) count toward active_chain_count;
+    malformed elements are counted separately and never inflate evidence.
+    A valid connection without a usable start raises the node's
+    invalid_start_count. NO derived staleness verdict is computed: under a
+    nested topology (outer Selector -> inner automatic group) any
+    cross-group attribution would overclaim, so the analyst compares these
+    raw-safe facts against proven same-run selection_changed records.
     """
     if not isinstance(payload, dict) or "connections" not in payload:
         return None, 0
     raw = payload["connections"]
+    stats = {name: {"node": name, "active_chain_count": 0, "oldest_start": None,
+                    "newest_start": None, "invalid_start_count": 0}
+             for name in watched}
     if raw is None:
-        return {"n": 0, "by_node": {}, "multi": 0, "stale": 0}, 0
+        return [stats[name] for name in watched], 0
     if not isinstance(raw, list):
         return None, 0
-    obs_set = set(obs)
-    by_node = {}
-    multi = 0
-    stale = 0
+    watched_set = set(watched)
     malformed = 0
     for item in raw:
-        if not isinstance(item, dict):
+        if not isinstance(item, dict) or not isinstance(item.get("chains"), list):
             malformed += 1
             continue
-        chains = item.get("chains")
-        names = {c for c in chains if isinstance(c, str)} \
-            if isinstance(chains, list) else set()
-        hit = names & obs_set
-        for node in hit:
-            by_node[node] = by_node.get(node, 0) + 1
-        if len(hit) >= 2:
-            multi += 1
+        hits = watched_set.intersection(
+            c for c in item["chains"] if isinstance(c, str))
+        if not hits:
+            continue
         start = parse_ts(item.get("start"))
-        if start is not None:
-            for node in hit:
-                for group in member_of.get(node, ()):
-                    changed = sel_ts.get(group)
-                    if node != current_now.get(group) and changed is not None \
-                            and start < changed:
-                        stale += 1
-                        break
-                else:
-                    continue
-                break
-    return {"n": len(raw), "by_node": {k: by_node[k] for k in sorted(by_node)},
-            "multi": multi, "stale": stale}, malformed
+        start_iso = iso_z(start)
+        for node in hits:
+            st = stats[node]
+            st["active_chain_count"] += 1
+            if start is None:
+                st["invalid_start_count"] += 1
+                continue
+            oldest = parse_ts(st["oldest_start"])
+            newest = parse_ts(st["newest_start"])
+            if oldest is None or start < oldest:
+                st["oldest_start"] = start_iso
+            if newest is None or start > newest:
+                st["newest_start"] = start_iso
+    return [stats[name] for name in watched], malformed
 
 
-# -- diff state and its JSONL tail recovery ------------------------------------
+# -- diff state (process-local; review B2: NEVER seeded across runs) -----------
 
 def new_state():
+    """Run-local diff/ledger state. A restart builds a fresh one on purpose."""
     return {
-        "run_id": uuid.uuid4().hex,       # non-secret, per process, never backfilled
+        "run": uuid.uuid4().hex,       # non-secret, per process, never backfilled
+        "seq": 0,                      # strictly increasing record counter
         "group_now": {},
         "node_alive": {},
-        "sel_ts": {},                     # group -> last selection change (aware dt)
-        "missing_groups": set(),
-        "missing_nodes": set(),
-        "history_dropped": False,
-        "cycle_err": {},                  # cycle class -> consecutive count
+        "proxies_gap": False,          # an invalid sample breaks diff chains
+        "err_counts": {},              # collector code -> consecutive cycles
     }
 
 
-def _observe(state, ts_iso, rec):
-    """Replay one stored record into the diff state (recovery + live cycle)."""
-    kind = rec.get("k")
-    if kind == "sample":
-        for group in rec.get("groups") or []:
-            name = group.get("name")
-            if not isinstance(name, str):
-                continue
-            if group.get("error") == "missing":
-                state["missing_groups"].add(name)
-                continue
-            state["missing_groups"].discard(name)
-            now = group.get("now")
-            if isinstance(now, str):
-                state["group_now"][name] = now
-        for node in rec.get("nodes") or []:
-            name = node.get("name")
-            if isinstance(name, str):
-                state["node_alive"][name] = node.get("alive")
-    elif kind == "sel":
-        group = rec.get("g")
-        if isinstance(group, str):
-            state["group_now"][group] = rec.get("to")
-            when = parse_ts(ts_iso)
-            if when is not None:
-                state["sel_ts"][group] = when
-    elif kind == "alive":
-        node = rec.get("node")
-        if isinstance(node, str):
-            state["node_alive"][node] = rec.get("to")
-    elif kind == "err":
-        # conservative on recovery: a truncation note seen in the tail keeps
-        # the transition-suppressed until the NEXT clean parse resets it --
-        # err counts themselves always restart with the process (new run_id)
-        if rec.get("c") == "history_truncated":
-            state["history_dropped"] = True
+def _apply_diffs(state, events, ts, proxies_summary):
+    """selection_changed / alive_flipped edges, WITHIN one run only (B2).
 
-
-def load_state(path, byte_cap=TAIL_BYTES):
-    """Recover diff state by tail-reading the JSONL (no sidecar state file).
-
-    Reads the last byte_cap bytes, drops everything before the first newline
-    (a torn first chunk is expected after a crash mid-write), and tolerates
-    any unparseable line. A missing/empty file simply yields fresh state.
+    The first valid sample seeds silently (no edge from "nothing"). After an
+    unavailable/invalid /proxies cycle the next valid sample re-seeds
+    silently too -- across the gap the change may have happened at any
+    time, so an edge there would be a fabricated causal claim. A missing
+    group/node, a group whose ``now`` is present but unusable, or a node
+    whose alive is unknown breaks that subject's chain. A group whose
+    ``now`` is simply absent is a KNOWN null and participates in diffs.
+    Events are appended WITHOUT v/run/seq -- the caller stamps those.
     """
-    state = new_state()
-    try:
-        size = os.path.getsize(path)
-    except OSError:
-        return state
-    try:
-        with open(path, "rb") as handle:
-            if size > byte_cap:
-                handle.seek(size - byte_cap)
-            blob = handle.read()
-    except OSError:
-        return state
-    newline = blob.find(b"\n")
-    if newline == -1:
-        return state            # a single torn line: nothing provably complete
-    for line in blob[newline + 1:].split(b"\n"):
-        if not line.strip():
+    if proxies_summary is None:
+        state["proxies_gap"] = True
+        return
+    gap = state["proxies_gap"]
+    state["proxies_gap"] = False
+    missing_groups = set(proxies_summary["missing_groups"])
+    broken_groups = set(proxies_summary["broken_groups"])
+    for group in proxies_summary["groups"]:
+        name = group.get("name")
+        if not isinstance(name, str):
             continue
+        if name in missing_groups or name in broken_groups:
+            state["group_now"].pop(name, None)   # absence breaks the chain
+            continue
+        now = group.get("now")      # None here is a KNOWN value, not unknown
+        prev = state["group_now"].get(name, "__unset__")
+        if not gap and prev != "__unset__" and prev != now:
+            events.append({"t": "selection_changed", "ts": ts,
+                           "group": name, "from": prev, "to": now})
+        state["group_now"][name] = now
+    missing_nodes = set(proxies_summary["missing_nodes"])
+    for node in proxies_summary["nodes"]:
+        name = node.get("name")
+        if not isinstance(name, str):
+            continue
+        if name in missing_nodes:
+            state["node_alive"].pop(name, None)
+            continue
+        alive = node.get("alive")
+        if alive is None:
+            state["node_alive"].pop(name, None)  # unknown breaks the chain
+            continue
+        prev = state["node_alive"].get(name, "__unset__")
+        if not gap and prev != "__unset__" and prev != alive:
+            events.append({"t": "alive_flipped", "ts": ts,
+                           "node": name, "from": prev, "to": alive})
+        state["node_alive"][name] = alive
+
+
+# -- fail-closed storage primitives (review B4) --------------------------------
+
+def _fsync_dir(path):
+    """fsync a directory so a rename/creation is durable (POSIX only).
+
+    Windows has no directory fsync; NTFS rename durability is handled by the
+    OS -- documented limitation, same ACL territory as E4's secret file.
+    """
+    if _WINDOWS:
+        return
+    try:
+        fd = os.open(path, os.O_RDONLY | _O_BINARY)
+    except OSError as exc:
+        raise StorageError("cannot open evidence dir for fsync: %s (%s)"
+                           % (path, type(exc).__name__)) from None
+    try:
+        os.fsync(fd)
+    except OSError as exc:
+        raise StorageError("cannot fsync evidence dir: %s (%s)"
+                           % (path, type(exc).__name__)) from None
+    finally:
+        os.close(fd)
+
+
+def _write_all(fd, data, write_fn=os.write):
+    """write-until-complete: a short os.write return never loses bytes."""
+    view = memoryview(data)
+    while view:
+        written = write_fn(fd, view)
+        if not written:      # zero/negative progress would spin forever
+            raise OSError("write made no progress")
+        view = view[written:]
+
+
+def check_no_symlink_component(path, lstat=os.lstat):
+    """Reject a path with ANY symlink component (review B4 traversal hole).
+
+    Walks every existing prefix from the first component up; a symlink
+    anywhere on the route could redirect the evidence chain. The FINAL
+    component may not exist yet (we create it); prefixes must be real dirs.
+    """
+    absolute = os.path.abspath(path)
+    prefix = absolute
+    while True:
+        parent = os.path.dirname(prefix)
+        if parent == prefix:
+            break
         try:
-            rec = json.loads(line.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
-            continue
-        if isinstance(rec, dict) and isinstance(rec.get("k"), str):
-            _observe(state, rec.get("ts"), rec)
-    return state
+            st = lstat(parent)
+        except OSError:
+            st = None                    # not existing above here: makedirs will
+        if st is not None and stat_module.S_ISLNK(st.st_mode):
+            raise ConfigurationError(
+                "diag out dir path must not contain a symlink component: %s" % parent)
+        prefix = parent
+    try:
+        st = lstat(absolute)
+    except OSError:
+        st = None                        # final component absent: allowed
+    if st is not None:
+        if stat_module.S_ISLNK(st.st_mode):
+            raise ConfigurationError("diag out dir must not be a symlink: %s" % path)
+        if not stat_module.S_ISDIR(st.st_mode):
+            raise ConfigurationError("diag out dir must be a directory: %s" % path)
+    return absolute
+
+
+def ensure_out_dir(path, chmod_fn=os.chmod):
+    """--out-dir is fail-closed: no symlink route, real directory, 0700.
+
+    The evidence file aggregates the user's whole proxy topology, so it gets
+    the same treatment as a secret file. On POSIX, failing to (tighten to)
+    0700 is FATAL (review B4): evidence that cannot be provably private is
+    not written at all. Windows relies on NTFS ACLs (mode bits carry no
+    access semantics there) -- documented, like E4's --secret-file caveat.
+    """
+    absolute = check_no_symlink_component(path, lstat=os.lstat)
+    if not os.path.isdir(absolute):
+        try:
+            os.makedirs(absolute, mode=0o700)
+        except OSError as exc:
+            raise ConfigurationError(
+                "cannot create diag out dir %s (%s)"
+                % (path, type(exc).__name__)) from None
+    if not _WINDOWS:
+        try:
+            chmod_fn(absolute, 0o700)
+        except OSError as exc:
+            raise ConfigurationError(
+                "cannot enforce 0700 on diag out dir %s (%s)"
+                % (path, type(exc).__name__)) from None
+    return absolute
+
+
+def load_or_create_hmac_key(out_dir, open_fn=os.open, fstat_fn=os.fstat,
+                            read_fn=os.read):
+    """Random 256-bit key for test-id HMACs, created once per evidence dir.
+
+    The file is 0600, regular, never a symlink (O_NOFOLLOW + fstat), and a
+    permission-violating pre-existing key refuses startup: fail-closed
+    BEFORE collection, per the reviewed design. Creation uses
+    O_CREAT|O_EXCL so a lost race never truncates or overwrites another
+    writer's key -- EEXIST falls back to re-reading through this same safe
+    loader. Key bytes never appear in any record or output -- they only
+    feed hmac.new().
+    """
+    path = os.path.join(out_dir, KEY_FILENAME)
+    try:
+        fd = open_fn(path, os.O_RDONLY | _O_BINARY | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        fd = None
+    except OSError as exc:
+        if getattr(exc, "errno", None) == getattr(os, "ELOOP", 40):
+            raise ConfigurationError(
+                "diag key file must not be a symlink: %s" % path) from exc
+        raise ConfigurationError(
+            "cannot open diag key file %s (%s)" % (path, type(exc).__name__)) from None
+    if fd is not None:
+        try:
+            st = fstat_fn(fd)
+            if not stat_module.S_ISREG(st.st_mode):
+                raise ConfigurationError(
+                    "diag key file must be a regular file: %s" % path)
+            if not _WINDOWS and st.st_mode & 0o077:
+                raise ConfigurationError(
+                    "diag key file permissions too open (%s): %s"
+                    % (oct(st.st_mode & 0o777), path))
+            # read-until-EOF: a single os.read can return a SHORT read on
+            # Windows CRT; a partial key must never be called corrupt.
+            chunks = []
+            got = 0
+            while got < HMAC_KEY_BYTES:
+                part = read_fn(fd, HMAC_KEY_BYTES * 4)
+                if not part:
+                    break
+                chunks.append(part)
+                got += len(part)
+            blob = b"".join(chunks)
+        finally:
+            os.close(fd)
+        if len(blob) != HMAC_KEY_BYTES:
+            raise ConfigurationError("diag key file corrupt: %s" % path)
+        return blob
+    try:
+        fd = open_fn(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY
+                     | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    except FileExistsError:
+        # lost race: read theirs, same injection surface
+        return load_or_create_hmac_key(out_dir, open_fn=open_fn,
+                                       fstat_fn=fstat_fn, read_fn=read_fn)
+    except OSError as exc:
+        raise ConfigurationError(
+            "cannot create diag key file %s (%s)" % (path, type(exc).__name__)) from None
+    fd_owned = True
+    key = os.urandom(HMAC_KEY_BYTES)
+    try:
+        _write_all(fd, key)
+        if not _WINDOWS:
+            try:
+                os.fchmod(fd, 0o600)
+            except OSError as exc:
+                raise ConfigurationError(
+                    "cannot enforce 0600 on diag key file (%s)"
+                    % type(exc).__name__) from None
+        os.fsync(fd)
+        fd_owned = False
+        os.close(fd)
+    except OSError as exc:
+        raise ConfigurationError(
+            "cannot write diag key file %s (%s)" % (path, type(exc).__name__)) from None
+    finally:
+        if fd_owned:
+            os.close(fd)
+    _fsync_dir(out_dir)
+    return key
+
+
+def _try_lock(fd, lock_fn=None):
+    if lock_fn is not None:
+        return lock_fn(fd)
+    if fcntl is not None:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    if msvcrt is not None:
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        return True
+    return True  # platform without advisory locks: documented, single-writer
+
+
+def acquire_instance_lock(out_dir, open_fn=os.open, lock_fn=None):
+    """One collector per evidence directory (review B4).
+
+    An advisory exclusive non-blocking lock on diag.lock; contention means
+    another resident collector owns this evidence chain and a second writer
+    would interleave/rotate under it -> refusal BEFORE polling, never two
+    writers. The fd must stay open for the process lifetime.
+    """
+    path = os.path.join(out_dir, LOCK_FILENAME)
+    try:
+        fd = open_fn(path, os.O_RDWR | os.O_CREAT | _O_BINARY
+                     | getattr(os, "O_NOFOLLOW", 0),
+                     0o600)
+    except OSError as exc:
+        raise ConfigurationError(
+            "cannot open diag lock file %s (%s)" % (path, type(exc).__name__)) from None
+    try:
+        st = os.fstat(fd)
+        if not stat_module.S_ISREG(st.st_mode):
+            raise ConfigurationError(
+                "diag lock file must be a regular file: %s" % path)
+        if not _WINDOWS:
+            try:
+                os.fchmod(fd, 0o600)
+            except OSError as exc:
+                raise ConfigurationError(
+                    "cannot enforce 0600 on diag lock file (%s)"
+                    % type(exc).__name__) from None
+        if not _try_lock(fd, lock_fn=lock_fn):
+            raise OSError("lock refused")
+    except ConfigurationError:
+        os.close(fd)
+        raise
+    except OSError as exc:
+        os.close(fd)
+        raise ConfigurationError(
+            "another diag collector holds this output dir: %s (%s)"
+            % (out_dir, type(exc).__name__)) from None
+    return fd
 
 
 # -- the evidence writer --------------------------------------------------------
 
-def ensure_out_dir(path):
-    """--out-dir is fail-closed: real directory, never a symlink, 0700.
-
-    The evidence file aggregates the user's whole proxy topology, so it gets
-    the same treatment as a secret file: refuse to be redirected through a
-    link, refuse world-readable defaults. Windows relies on NTFS ACLs (mode
-    bits carry no access semantics there) -- documented, like E4's
-    --secret-file caveat.
-    """
-    if os.path.islink(path):
-        raise ConfigurationError("diag out dir must not be a symlink: %s" % path)
-    if not os.path.isdir(path):
-        try:
-            os.makedirs(path, mode=0o700)
-        except OSError as exc:
-            raise ConfigurationError(
-                "cannot create diag out dir %s (%s)" % (path, type(exc).__name__)) from None
-    elif not _WINDOWS:
-        try:
-            os.chmod(path, 0o700)
-        except OSError:
-            pass               # best effort: the 0600 file gate still applies
-    return path
-
-
 class DiagWriter:
-    """Append-only JSONL with size-shift rotation. One open per cycle.
+    """Append-only JSONL with durable size-shift rotation (review B4).
 
-    O_APPEND + one os.write() per record line keeps every record atomic at
-    the byte level (worst case after a crash: one torn final line, which the
-    tail reader tolerates). fsync happens ONCE per cycle batch, not per
-    record: durability of a forensic cycle as a unit.
+    O_APPEND + one write-until-complete loop per batch keeps every record
+    line intact at the byte level (worst case after a crash: one torn final
+    line -- the next process frame-protects it with a leading newline
+    instead of destroying evidence). The opened fd is fstat-verified a
+    regular file and fchmod-secured to 0600; a permission-tightening
+    failure is FATAL on POSIX. fsync happens once per cycle batch:
+    durability of a forensic cycle as a unit; rotation additionally fsyncs
+    the file before the rename and the directory after it. The OS-facing
+    calls are instance attributes so the storage tests can inject failures
+    deterministically on any platform.
     """
 
     def __init__(self, out_dir, max_mb=DEFAULT_MAX_MB, files=DEFAULT_FILES):
@@ -465,65 +815,192 @@ class DiagWriter:
         except (TypeError, ValueError):
             max_mb = DEFAULT_MAX_MB
         self.max_bytes = max(int(max_mb * 1024 * 1024), 4096)
-        self.files = max(int(files or DEFAULT_FILES), 2)
+        self.files = max(int(files or DEFAULT_FILES), MIN_FILES)
+        self.open_fn = os.open
+        self.write_fn = os.write
+        self.fsync_fn = os.fsync
+        self.fstat_fn = os.fstat
+        self.fchmod_fn = os.fchmod
+        self.close_fn = os.close
+        self.replace_fn = os.replace
+        self.exists_fn = os.path.exists
+        self.getsize_fn = os.path.getsize
+        self.fsync_dir_fn = _fsync_dir
+        self._torn_pending = self._detect_torn_tail()
+
+    def _detect_torn_tail(self):
+        """A pre-existing file not ending in a newline gets frame-protected."""
+        try:
+            size = self.getsize_fn(self.path)
+        except OSError:
+            return False
+        if size == 0:
+            return False
+        try:
+            fd = self.open_fn(self.path, os.O_RDONLY | _O_BINARY
+                          | getattr(os, "O_NOFOLLOW", 0))
+        except OSError as exc:
+            raise StorageError("cannot inspect %s (%s)"
+                               % (self.path, type(exc).__name__)) from None
+        try:
+            if not stat_module.S_ISREG(self.fstat_fn(fd).st_mode):
+                raise StorageError("evidence target is not a regular file: %s" % self.path)
+            self.close_fn(fd)
+            fd = None
+            with open(self.path, "rb") as handle:
+                handle.seek(-1, os.SEEK_END)
+                return handle.read(1) != b"\n"
+        except OSError as exc:
+            raise StorageError("cannot inspect %s (%s)"
+                               % (self.path, type(exc).__name__)) from None
+        finally:
+            if fd is not None:
+                self.close_fn(fd)
 
     def write(self, records):
         if not records:
             return
         blob = b"".join(encode_record(r) for r in records)
-        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+        if self._torn_pending:
+            blob = b"\n" + blob        # keep pre-existing garbage on its own line
+        flags = (os.O_WRONLY | os.O_CREAT | os.O_APPEND | _O_BINARY
+                 | getattr(os, "O_NOFOLLOW", 0))
         try:
-            fd = os.open(self.path, flags, 0o600)
+            fd = self.open_fn(self.path, flags, 0o600)
         except OSError as exc:
             raise StorageError("cannot open %s (%s)"
                                % (self.path, type(exc).__name__)) from None
         try:
+            st = self.fstat_fn(fd)
+            if not stat_module.S_ISREG(st.st_mode):
+                raise StorageError("evidence target is not a regular file: %s"
+                                   % self.path)
             if not _WINDOWS:
-                # tighten even if the file pre-existed; Windows relies on NTFS
-                # ACLs -- mode bits carry no access semantics there (README)
+                # tighten even if the file pre-existed; FAILURE IS FATAL --
+                # non-private evidence is refused, not "best effort"
                 try:
-                    os.fchmod(fd, 0o600)
-                except OSError:
-                    pass
-            for line in blob.splitlines(True):
-                os.write(fd, line)
-            os.fsync(fd)
+                    self.fchmod_fn(fd, 0o600)
+                except OSError as exc:
+                    raise StorageError("cannot enforce 0600 on %s (%s)"
+                                       % (self.path, type(exc).__name__)) from None
+            _write_all(fd, blob, write_fn=self.write_fn)
+            self.fsync_fn(fd)
+            self._torn_pending = False
         except OSError as exc:
             raise StorageError("cannot write %s (%s)"
                                % (self.path, type(exc).__name__)) from exc
         finally:
-            os.close(fd)
+            self.close_fn(fd)
         try:
-            if os.path.getsize(self.path) > self.max_bytes:
+            if self.getsize_fn(self.path) > self.max_bytes:
                 self.rotate()
+        except StorageError:
+            raise
         except OSError as exc:
-            raise StorageError("cannot size-check/rotate %s (%s)"
+            raise StorageError("cannot size-check %s (%s)"
                                % (self.path, type(exc).__name__)) from None
 
     def rotate(self):
-        """Numeric shift: diag.jsonl -> .1 -> ... -> .{N-1} (oldest falls off)."""
+        """Durable numeric shift: diag.jsonl -> .1 -> ... -> .{N-1}.
+
+        fsync current -> rename -> fsync directory (POSIX), so a crash
+        between the rename steps never loses a whole chain generation.
+        """
         try:
+            if self.exists_fn(self.path):
+                # O_RDWR: Windows CRT _commit() rejects read-only fds, so a
+                # plain O_RDONLY fsync handle would break --prune-now there;
+                # fsync semantics on POSIX are identical either way.
+                fd = self.open_fn(self.path, os.O_RDWR | _O_BINARY)
+                try:
+                    self.fsync_fn(fd)
+                finally:
+                    self.close_fn(fd)
             for index in range(self.files - 2, 0, -1):
                 src = "%s.%d" % (self.path, index)
                 dst = "%s.%d" % (self.path, index + 1)
-                if os.path.exists(src):
-                    os.replace(src, dst)
-            if os.path.exists(self.path):
-                os.replace(self.path, self.path + ".1")
+                if self.exists_fn(src):
+                    self.replace_fn(src, dst)
+            if self.exists_fn(self.path):
+                self.replace_fn(self.path, self.path + ".1")
         except OSError as exc:
             raise StorageError("rotation failed under %s (%s)"
                                % (self.out_dir, type(exc).__name__)) from None
+        self.fsync_dir_fn(self.out_dir)
 
 
 def encode_record(record):
-    """One canonical line: compact, sorted keys, UTF-8, newline-terminated.
+    """One canonical line: compact, sorted keys, ASCII-safe, newline-terminated.
 
+    Hard 64 KiB ceiling (review B5) measured on the FINAL ENCODED BYTES
+    INCLUDING the trailing newline: an oversized record is TRIMMED
+    STRUCTURALLY (element by element, largest evidence arrays first -- never
+    byte-sliced) and marked ``truncated``; a sample that still cannot fit
+    collapses to its scalar facts, any other unfixable record collapses to
+    a storage collector note. Silent oversized serialization never happens.
     Records are built as closed literal dicts everywhere in this module;
     json.dumps never sees a raw API payload, so response bytes cannot ride
     along into the evidence file.
     """
-    return (json.dumps(record, ensure_ascii=False, sort_keys=True,
+    line = _encode(record)
+    if len(line) <= RECORD_MAX_BYTES:
+        return line
+    data = copy.deepcopy(record)
+    data["truncated"] = True
+    while len(line) > RECORD_MAX_BYTES and _trim_once(data):
+        line = _encode(data)
+    if len(line) <= RECORD_MAX_BYTES:
+        return line
+    if record.get("t") == "sample":
+        data = {"v": record.get("v"), "t": "sample", "ts": record.get("ts"),
+                "run": record.get("run"), "seq": record.get("seq"),
+                "api_reachable": record.get("api_reachable"),
+                "mihomo_version": record.get("mihomo_version"),
+                "proxies_status": record.get("proxies_status"),
+                "connections_status": record.get("connections_status"),
+                "groups": [], "nodes": [], "connection_chains": [],
+                "truncated": True,
+                "invalid_fields": record.get("invalid_fields")}
+    else:
+        data = {"v": record.get("v"), "t": "collector", "ts": record.get("ts"),
+                "run": record.get("run"), "seq": record.get("seq"),
+                "code": "storage_error", "scope": "storage", "count": 1}
+    return _encode(data)
+
+
+def _encode(record):
+    return (json.dumps(record, ensure_ascii=True, sort_keys=True,
                        separators=(",", ":")) + "\n").encode("utf-8")
+
+
+def _trim_once(data):
+    """Drop exactly one element from the largest evidence array."""
+    nodes = data.get("nodes")
+    if isinstance(nodes, list) and nodes:
+        last = nodes[-1]
+        if isinstance(last, dict):
+            if isinstance(last.get("extra"), list) and last["extra"]:
+                last["extra"].pop()
+                return True
+            if isinstance(last.get("history"), list) and last["history"]:
+                last["history"].pop()
+                return True
+        nodes.pop()
+        return True
+    chains = data.get("connection_chains")
+    if isinstance(chains, list) and chains:
+        chains.pop()
+        return True
+    groups = data.get("groups")
+    if isinstance(groups, list) and groups:
+        last = groups[-1]
+        if isinstance(last, dict):
+            if isinstance(last.get("members"), list) and last["members"]:
+                last["members"].pop()
+                return True
+        groups.pop()
+        return True
+    return False
 
 
 # -- the collector --------------------------------------------------------------
@@ -531,20 +1008,27 @@ def encode_record(record):
 class DiagCollector:
     """One forensic cycle -> the closed records that cycle. Never raises.
 
-    Reuses the audited E4 transport and redaction end to end. /version
-    decides reachability (same as E4); with it the run record cannot be
-    honestly dated, so a failed cycle records ONLY a sanitized err line --
-    never a fabricated sample, never a run header for a run that observed
-    nothing.
+    Reuses the audited E4 transport end to end. /version decides
+    reachability: ANY version failure (transport error, non-200, malformed
+    body, missing/unusable version field) maps to the single version-scope
+    collector code ``mihomo_unreachable`` and the other reads are SKIPPED
+    for that cycle -- but the sample is still emitted (api_reachable=false,
+    mihomo_version=null, endpoint statuses honestly "unavailable") and the
+    diff chain is marked broken, so an outage or restart during a version
+    failure is visible evidence, never a hole and never a fabricated edge
+    (review B2). /proxies and /connections are attempted independently; a
+    failed one yields its own status and code, never a fabricated empty
+    result.
     """
 
     def __init__(self, url, groups, secret=None, timeout=DEFAULT_TIMEOUT,
-                 transport=None, clock=time.time):
+                 transport=None, clock=time.time, hmac_key=None):
         self.url = url
         self.host, self.port, self.scheme = parse_controller_url(url)
         self.groups = list(groups or [])
         self.secret = secret or ""
         self.timeout = clamp_timeout(timeout)
+        self.hmac_key = hmac_key
         self.clock = clock
         self.transport = transport or HttpTransport(
             self.host, self.port, scheme=self.scheme, secret=self.secret,
@@ -552,190 +1036,199 @@ class DiagCollector:
 
     # -- helpers --
 
-    def _secrets(self):
-        secrets = [self.secret, os.environ.get("MIHOMO_API_SECRET", "")]
-        return [s for s in secrets if s]
+    def _get(self, path):
+        """-> (payload, status) with status in ("ok", "unavailable", "invalid").
 
-    def _sanitize(self, text):
-        return redact(text, self._secrets())[:DETAIL_MAX_LEN]
-
-    def _get_json(self, path):
-        """-> (payload, err_class, detail, http_status). At most one is set."""
+        There is deliberately NO detail channel: no exception text, no HTTP
+        status code, no response body bytes ever leave this method (review
+        B1) -- the closed status vocabulary is all the evidence gets.
+        """
         try:
-            status, body = self.transport.get(path)
-        except TransportError as exc:
-            return None, "api_unreachable", self._sanitize("%s: %s" % (type(exc).__name__, exc)), None
-        except Exception as exc:  # noqa: BLE001 -- never propagate
-            return None, "api_unreachable", self._sanitize(
-                "%s: %s" % (type(exc).__name__, exc)), None
-        if status != 200:
-            # status line + the same capped, redacted body snippet discipline
-            # as E4's ApiError -- never the full body, never an unredacted byte
-            return None, "api_malformed", self._sanitize(
-                "%s returned HTTP %s (%s)" % (path, status,
-                    body[:MAX_ERROR_BODY].decode("utf-8", "replace").replace("\n", " "))), status
+            status_code, body = self.transport.get(path)
+        except Exception:  # noqa: BLE001 -- never propagate, never describe
+            return None, "unavailable"
+        if status_code != 200:
+            return None, "unavailable"
         try:
-            return json.loads(body.decode("utf-8")), None, None, status
+            return json.loads(body.decode("utf-8")), "ok"
         except (ValueError, UnicodeDecodeError):
-            return None, "api_malformed", self._sanitize("%s returned malformed JSON" % path), status
+            return None, "invalid"
 
     # -- one cycle --
 
-    def collect_cycle(self, state, interval_s):
-        """Poll once, diff against state, return (records, flags)."""
+    def collect_cycle(self, state):
+        """Poll once, diff against run-local state, return (records, flags)."""
         ts = utc_iso(self.clock())
-        run_id = state["run_id"]
+        run = state["run"]
         records = []
-        flags = {"api_failed": False, "sample_ok": False, "malformed_conns": 0}
+        events = []
+        present = set()
+        seq_box = [state["seq"]]
 
-        cycle_errs = []      # (class, detail) -- cycle classes, re-logged per cycle
+        def next_seq():
+            seq_box[0] += 1
+            return seq_box[0]
 
-        # 1) /version: reachability + the one-shot run header
-        version_payload, err_class, detail, _status = self._get_json("/version")
+        # 1) the sample exists FIRST and is completed in place -- every
+        #    cycle produces exactly one sample no matter what fails below.
+        sample = {"v": SCHEMA_V, "t": "sample", "ts": ts, "run": run,
+                  "seq": next_seq(), "api_reachable": False,
+                  "mihomo_version": None,
+                  "proxies_status": "unavailable",
+                  "connections_status": "unavailable",
+                  "groups": [], "nodes": [], "connection_chains": [],
+                  "truncated": False, "invalid_fields": 0}
+        records.append(sample)
+        flags = {"api_failed": False, "codes": [],
+                 "proxies_status": "unavailable",
+                 "connections_status": "unavailable"}
+
+        # 2) /version: reachability + version (bounded display string; a
+        #    version field that fails the name bound is a failure, kept
+        #    honest as mihomo_unreachable, never a truncated fake).
+        payload, status = self._get("/version")
         version = None
-        if err_class is None:
-            candidate = version_payload.get("version") if isinstance(version_payload, dict) else None
-            if isinstance(candidate, str) and candidate.strip():
-                version = candidate.strip()
-            else:
-                err_class, detail = "api_malformed", "/version without a usable version field"
+        if status == "ok" and isinstance(payload, dict):
+            version = safe_name(payload.get("version"))
         if version is None:
-            flags["api_failed"] = True
-            count = state["cycle_err"].setdefault(err_class, 0) + 1
-            state["cycle_err"][err_class] = count
-            records.append({"k": "err", "ts": ts, "run_id": run_id,
-                            "c": err_class, "n": count,
-                            "detail": detail or ""})
+            present.add("mihomo_unreachable")
+            # no /proxies observation this cycle: the diff chain is broken
+            state["proxies_gap"] = True
+            codes = _fold_collector(state, records, present, ts, run, next_seq,
+                                    full_cycle=False)
+            flags.update(api_failed=True, codes=codes)
+            state["seq"] = seq_box[0]
             return records, flags
-        for err_class_name in CYCLE_ERR_CLASSES:
-            state["cycle_err"].pop(err_class_name, None)   # clean cycle resets n
-        if not state.get("_run_written"):
-            records.append({"k": "run", "ts": ts, "run_id": run_id,
-                            "url_host": self.host, "url_port": self.port,
-                            "groups": list(self.groups),
-                            "interval_s": interval_s,
-                            "collector_ver": COLLECTOR_VER,
-                            "mihomo_version": version})
-            state["_run_written"] = True
+        sample["api_reachable"] = True
+        sample["mihomo_version"] = version
 
-        # 2) /proxies for the caller-named groups (never guessed, never inferred)
+        # 3) /proxies for the caller-named groups (never guessed, never
+        #    inferred). A broken /proxies yields an honest status and its
+        #    own code; it never fabricates empty groups/nodes.
         proxies_summary = None
         if self.groups:
-            payload, err_class, detail, _status = self._get_json("/proxies")
-            if err_class is None:
-                proxies_summary = parse_proxies_summary(payload, self.groups)
+            payload, status = self._get("/proxies")
+            if status == "ok":
+                proxies_summary = parse_proxies_summary(payload, self.groups,
+                                                        hmac_key=self.hmac_key)
                 if not proxies_summary["usable"]:
-                    cycle_errs.append(("api_malformed", "/proxies shape not understood"))
                     proxies_summary = None
+                    status = "invalid"
+            if proxies_summary is not None:
+                sample["groups"] = proxies_summary["groups"]
+                sample["nodes"] = proxies_summary["nodes"]
+                sample["truncated"] = bool(proxies_summary["truncated"])
+                sample["invalid_fields"] += proxies_summary["invalid_fields"]
+                sample["proxies_status"] = "ok"
+                if proxies_summary["missing_groups"]:
+                    present.add("group_missing")
+                if proxies_summary["missing_nodes"]:
+                    present.add("node_missing")
             else:
-                cycle_errs.append((err_class, detail))
+                sample["proxies_status"] = status
+                present.add("proxies_invalid")
 
-        # 3) diff the proxy observation BEFORE reading connections: a switch
-        #    observed THIS cycle must be able to classify this cycle's
-        #    old-path connections as stale. Records stay ordered sample-then-
-        #    events; only the state movement is pulled forward.
-        diff_records = []
-        _apply_diffs(state, diff_records, ts, proxies_summary)
-
-        # 4) /connections (chain topology evidence only). Per-endpoint
-        #    isolation: a broken /proxies must not hide the connection view --
-        #    with no observed set, chains simply attribute to nothing.
-        conns = None
-        payload, err_class, detail, _status = self._get_json("/connections")
-        if err_class is None:
-            member_of = proxies_summary.get("member_of", {}) if proxies_summary else {}
-            obs = proxies_summary["obs"] if proxies_summary else []
-            current_now = {g["name"]: g.get("now") for g in proxies_summary["groups"]} \
-                if proxies_summary else {}
-            conns, malformed = parse_connections_summary(payload, obs, member_of,
-                                                         current_now, state["sel_ts"])
-            if malformed:
-                flags["malformed_conns"] = malformed
-                cycle_errs.append(("api_malformed",
-                                   "%d malformed connection entries" % malformed))
-            if conns is None:
-                cycle_errs.append(("api_malformed", "/connections shape not understood"))
+        # 4) /connections (per-node chain aggregates only). Per-endpoint
+        #    isolation: a broken /proxies must not hide the connection view.
+        payload, status = self._get("/connections")
+        if status == "ok":
+            watched = (proxies_summary["watched"]
+                       if proxies_summary is not None else [])
+            chains, malformed = parse_connections_summary(payload, watched)
+            if chains is None:
+                sample["connections_status"] = "invalid"
+                present.add("connections_invalid")
+            else:
+                sample["connection_chains"] = chains
+                sample["connections_status"] = "ok"
+                if malformed:
+                    sample["invalid_fields"] += malformed
         else:
-            cycle_errs.append((err_class, detail))
+            sample["connections_status"] = status
+            present.add("connections_invalid")
 
-        # 5) the sample record (closed keys; sections null when that endpoint
-        #    failed -- a missing optional section, never an invented zero)
-        if proxies_summary is not None or conns is not None:
-            records.append({
-                "k": "sample", "ts": ts, "run_id": run_id,
-                "obs": proxies_summary["obs"] if proxies_summary else None,
-                "groups": proxies_summary["groups"] if proxies_summary else None,
-                "nodes": proxies_summary["nodes"] if proxies_summary else None,
-                "conns": conns,
-            })
-            flags["sample_ok"] = True
-        records.extend(diff_records)
+        # 5) diff THIS run's observations only (review B2), then stamp the
+        #    events with the schema envelope.
+        _apply_diffs(state, events, ts, proxies_summary)
+        for event in events:
+            records.append({"v": SCHEMA_V, "run": run, "seq": next_seq(),
+                            **event})
 
-        # 6) subject-class records: once per appearance-transition only
-        if proxies_summary is not None:
-            for name in proxies_summary["missing_groups"]:
-                if name not in state["missing_groups"]:
-                    records.append({"k": "err", "ts": ts, "run_id": run_id,
-                                    "c": "group_missing", "n": 1,
-                                    "detail": self._sanitize("group %r absent from /proxies" % name)})
-            now_missing_groups = set(proxies_summary["missing_groups"])
-            state["missing_groups"] = now_missing_groups
-
-            for name in proxies_summary["missing_nodes"]:
-                if name not in state["missing_nodes"]:
-                    records.append({"k": "err", "ts": ts, "run_id": run_id,
-                                    "c": "node_missing", "n": 1,
-                                    "detail": self._sanitize("node %r listed but absent" % name)})
-            state["missing_nodes"] = set(proxies_summary["missing_nodes"])
-
-            dropped_now = bool(proxies_summary["history_dropped"])
-            if dropped_now and not state["history_dropped"]:
-                records.append({"k": "err", "ts": ts, "run_id": run_id,
-                                "c": "history_truncated", "n": 1,
-                                "detail": "observed set capped or malformed history dropped"})
-            state["history_dropped"] = dropped_now
-
-        # 6) fold cycle-class errors (deduped via the consecutive-count ledger)
-        for err_class_name, err_detail in cycle_errs:
-            count = state["cycle_err"].setdefault(err_class_name, 0) + 1
-            state["cycle_err"][err_class_name] = count
-            records.append({"k": "err", "ts": ts, "run_id": run_id,
-                            "c": err_class_name, "n": count,
-                            "detail": err_detail or ""})
+        # 6) whole-cycle ledger fold: one collector record per present code,
+        #    reset only absent codes and only on a full cycle (review B6).
+        codes = _fold_collector(state, records, present, ts, run, next_seq,
+                                full_cycle=True)
+        flags.update(api_failed=(sample["proxies_status"] != "ok"
+                                 or sample["connections_status"] != "ok"),
+                     codes=codes, proxies_status=sample["proxies_status"],
+                     connections_status=sample["connections_status"])
+        state["seq"] = seq_box[0]
         return records, flags
 
 
-def _apply_diffs(state, records, ts, proxies_summary):
-    """sel / alive events: change-triggered ONLY (10 identical cycles emit 0)."""
-    run_id = state["run_id"]
-    if proxies_summary is None:
-        return
-    for group in proxies_summary["groups"]:
-        name = group.get("name")
-        now = group.get("now")
-        if not isinstance(name, str) or "now" not in group or "error" in group:
-            continue
-        prev = state["group_now"].get(name, "__unset__")
-        if prev != "__unset__" and prev != now:
-            records.append({"k": "sel", "ts": ts, "run_id": run_id,
-                            "g": name, "from": prev, "to": now})
-            when = parse_ts(ts)
-            if when is not None:
-                state["sel_ts"][name] = when
-        state["group_now"][name] = now
-    for node in proxies_summary["nodes"]:
-        name = node.get("name")
-        if not isinstance(name, str):
-            continue
-        prev = state["node_alive"].get(name, "__unset__")
-        alive = node.get("alive")
-        if prev != "__unset__" and prev != alive:
-            records.append({"k": "alive", "ts": ts, "run_id": run_id,
-                            "node": name, "from": prev, "to": alive})
-        state["node_alive"][name] = alive
+def _fold_collector(state, records, present, ts, run, next_seq, full_cycle):
+    """Whole-cycle collector accounting (review B6).
+
+    present: the SET of codes this cycle produced, computed BEFORE this
+    call so one code shared by several endpoints yields exactly ONE record
+    with ONE increment. Each present code bumps its consecutive-cycle
+    count; absent codes are removed from the ledger ONLY on a full cycle
+    (all endpoints attempted) and never for a code that was present.
+    """
+    codes = []
+    for code in sorted(present):
+        count = state["err_counts"].get(code, 0) + 1
+        state["err_counts"][code] = count
+        codes.append(code)
+        records.append({"v": SCHEMA_V, "t": "collector", "ts": ts, "run": run,
+                        "seq": next_seq(), "code": code,
+                        "scope": CODE_SCOPE[code], "count": count})
+    if full_cycle:
+        for code in list(state["err_counts"]):
+            if code not in present:
+                del state["err_counts"][code]
+    return codes
 
 
 # -- CLI --------------------------------------------------------------------------
+
+def validate_cli_groups(groups):
+    """Caller-named groups: 1..8, each a valid bounded name.
+
+    At least one group is REQUIRED: a zero-group collector would sample
+    empty evidence forever, which is a misconfiguration the CLI refuses
+    outright rather than records.
+    """
+    if not groups:
+        raise ConfigurationError("at least one --group is required")
+    if len(groups) > MAX_GROUPS:
+        raise ConfigurationError(
+            "too many --group values (%s), maximum is %s" % (len(groups), MAX_GROUPS))
+    for name in groups:
+        if safe_name(name) != name:
+            raise ConfigurationError(
+                "invalid --group name (empty, over %s bytes, or control characters)"
+                % NAME_MAX_BYTES)
+    return list(groups)
+
+
+def validate_rotation_args(max_mb, files):
+    """Rotation arguments stay inside the reviewed budget (never silent)."""
+    try:
+        max_mb = float(max_mb)
+        files = int(files)
+    except (TypeError, ValueError):
+        raise ConfigurationError("--max-mb/--files must be numbers") from None
+    if not 0 < max_mb <= MAX_FILE_MB:
+        raise ConfigurationError("--max-mb must be in (0, %s]" % MAX_FILE_MB)
+    if not MIN_FILES <= files <= MAX_FILES:
+        raise ConfigurationError("--files must be in [%s, %s]" % (MIN_FILES, MAX_FILES))
+    if max_mb * files > TOTAL_MB_BUDGET:
+        raise ConfigurationError(
+            "evidence budget %.0f MiB x %s files exceeds %s MiB total"
+            % (max_mb, files, TOTAL_MB_BUDGET))
+    return max_mb, files
+
 
 def build_arg_parser():
     parser = argparse.ArgumentParser(
@@ -745,29 +1238,36 @@ def build_arg_parser():
                         help="external-controller URL; MUST be loopback "
                              "(default: %(default)s)")
     parser.add_argument("--group", action="append", default=[],
-                        help="proxy group to observe, repeatable; caller-"
-                             "named, topology-free (no group names are ever "
-                             "hard-coded)")
+                        help="proxy group to observe; REQUIRED, repeatable "
+                             "(1..%s); caller-named, topology-free (no group "
+                             "names are ever hard-coded)" % MAX_GROUPS)
     parser.add_argument("--out-dir", required=True,
-                        help="evidence directory (real dir, no symlink, 0700); "
-                             "REQUIRED fail-closed")
+                        help="evidence directory (no symlink component, "
+                             "real dir, 0700 fail-closed); REQUIRED")
     parser.add_argument("--interval", type=float, default=DEFAULT_INTERVAL,
                         help="resident sampling seconds, clamped 30-60 "
                              "(default: %(default)s)")
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT,
                         help="per-request timeout, clamped 1-3 (default: %(default)s)")
     parser.add_argument("--max-mb", type=float, default=DEFAULT_MAX_MB,
-                        help="rotate above this size (default: %(default)s)")
+                        help="rotate above this size, max %s (default: %s)"
+                             % (MAX_FILE_MB, DEFAULT_MAX_MB))
     parser.add_argument("--files", type=int, default=DEFAULT_FILES,
-                        help="diag.jsonl plus N-1 shifted files (default: %(default)s)")
+                        help="diag.jsonl plus N-1 shifted files, [%s, %s], "
+                             "max-mb*files <= %s MiB (default: %s)"
+                             % (MIN_FILES, MAX_FILES, TOTAL_MB_BUDGET,
+                                DEFAULT_FILES))
     parser.add_argument("--secret-file", default=None,
                         help="controller secret file, POSIX mode 0600/0400 "
                              "enforced; MIHOMO_API_SECRET takes precedence")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--once", action="store_true",
-                      help="single cycle and exit (systemd-timer shape; default)")
+                      help="single cycle and exit (systemd-timer shape; default). "
+                           "Cannot prove selection_changed/alive_flipped "
+                           "transitions across invocations -- see README")
     mode.add_argument("--resident", action="store_true",
-                      help="sampling loop until SIGTERM")
+                      help="sampling loop until SIGTERM; this is the mode "
+                           "that produces transition edges")
     mode.add_argument("--prune-now", action="store_true",
                       help="rotate the evidence chain without sampling")
     return parser
@@ -777,15 +1277,22 @@ def main(argv=None, transport=None, clock=time.time):
     args = build_arg_parser().parse_args(argv)
     interval = clamp_interval(args.interval)
     try:
+        groups = validate_cli_groups(args.group)
+        max_mb, files = validate_rotation_args(args.max_mb, args.files)
         secret = resolve_secret(args.secret_file)
-        collector = DiagCollector(args.url, args.group, secret=secret,
+        collector = DiagCollector(args.url, groups, secret=secret,
                                   timeout=args.timeout, transport=transport,
                                   clock=clock)
-        writer = DiagWriter(ensure_out_dir(args.out_dir), max_mb=args.max_mb,
-                            files=args.files)
+        out_dir = ensure_out_dir(args.out_dir)
+        lock_fd = acquire_instance_lock(out_dir)   # noqa: F841 -- held for process life
+        collector.hmac_key = load_or_create_hmac_key(out_dir)
+        writer = DiagWriter(out_dir, max_mb=max_mb, files=files)
     except (ConfigurationError, SecretFileError) as exc:
         print("fatal configuration error: %s" % exc, file=sys.stderr)
         return EXIT_CONFIG
+    except StorageError as exc:
+        print("storage error: %s" % exc, file=sys.stderr)
+        return EXIT_STORAGE
 
     if args.prune_now:
         try:
@@ -796,19 +1303,18 @@ def main(argv=None, transport=None, clock=time.time):
         print(json.dumps({"rotated": True, "path": writer.path}))
         return EXIT_OK
 
-    state = load_state(writer.path)
+    state = new_state()           # review B2: every process starts causally clean
     storage_failed = False
 
     def one_cycle():
         nonlocal storage_failed
-        records, flags = collector.collect_cycle(state, interval)
-        if records:
-            try:
-                writer.write(records)
-            except StorageError as exc:
-                # the failure itself must be visible, never a silent exit 0
-                print("storage error: %s" % exc, file=sys.stderr)
-                storage_failed = True
+        records, flags = collector.collect_cycle(state)
+        try:
+            writer.write(records)
+        except StorageError as exc:
+            # the failure itself must be visible, never a silent exit 0
+            print("storage error: %s" % exc, file=sys.stderr)
+            storage_failed = True
         return flags
 
     if args.resident:
@@ -831,9 +1337,10 @@ def main(argv=None, transport=None, clock=time.time):
         return EXIT_OK
 
     flags = one_cycle()
-    summary = {"records": 0, "api_failed": flags["api_failed"],
-               "sample_ok": flags["sample_ok"], "storage_failed": storage_failed,
-               "run_id": state["run_id"]}
+    summary = {"api_failed": flags["api_failed"], "codes": flags["codes"],
+               "proxies_status": flags["proxies_status"],
+               "connections_status": flags["connections_status"],
+               "storage_failed": storage_failed, "run": state["run"]}
     print(json.dumps(summary, sort_keys=True))
     if storage_failed and flags["api_failed"]:
         return EXIT_BOTH

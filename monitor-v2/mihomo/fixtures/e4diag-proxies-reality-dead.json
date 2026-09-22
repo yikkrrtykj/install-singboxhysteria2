@@ -73,11 +73,20 @@
         }
       ],
       "extra": {
-        "https://www.gstatic.com/generate_204": {
+        "https://probe.example.invalid/generate_204?tk=S3CR3T-QUERY-SENTINEL-9f": {
           "alive": false,
           "history": [
             {
               "time": "2026-09-22T12:01:00Z",
+              "delay": 0
+            }
+          ]
+        },
+        "https://cp.cloudflare.com/generate_204": {
+          "alive": false,
+          "history": [
+            {
+              "time": "2026-09-22T12:02:00Z",
               "delay": 0
             }
           ]

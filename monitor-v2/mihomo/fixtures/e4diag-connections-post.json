@@ -81,6 +81,31 @@
       "rulePayload": "",
       "chainsLength": 3
     },
+    {
+      "id": "conn-0004",
+      "metadata": {
+        "network": "tcp",
+        "type": "tcp",
+        "sourceIP": "10.0.0.5",
+        "destinationIP": "192.0.2.44",
+        "destinationPort": "55555",
+        "host": "internal-secret.example.com",
+        "processPath": "/secret/path",
+        "uid": 1000,
+        "secret": "S3CR3T-IN-METADATA"
+      },
+      "rule": "MATCH",
+      "payload": "hidden.example",
+      "chains": [
+        "节点选择",
+        "自动选择",
+        "reality-hk-01"
+      ],
+      "upload": 5,
+      "download": 6,
+      "rulePayload": "",
+      "chainsLength": 3
+    },
     "not-a-conn",
     null
   ]

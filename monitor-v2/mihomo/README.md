@@ -27,7 +27,7 @@ Consequences, all enforced by construction:
   never matched, never mapped onto a server-side Device. If the client names
   its node `香港-01`, the device stays `vmix-01` server-side;
 * this module does not import anything from the server-side monitor code and
-  never touches its state; the E1 regression suite (188/188) must stay green.
+  never touches its state; the E1 regression suite (232/232) must stay green.
 
 UI may therefore show, side by side:
 
@@ -203,7 +203,7 @@ python3 monitor-v2/mihomo/client.py --secret-file /etc/mihomo/monitor.secret ...
 ```
 
 Tests: `tests/test-monitor-v2-e4.sh` (fixture-driven, plus a real loopback
-wire check). E1 regression: `tests/test-monitor-v2-e1.sh` must stay 188/188.
+wire check). E1 regression: `tests/test-monitor-v2-e1.sh` must stay 232/232.
 
 ---
 
@@ -216,75 +216,133 @@ no switch happened" incident the client-side `/proxies` evidence needed to
 separate the candidate explanations was never captured. It changes NOTHING
 about selection or failover -- same read-only mandate as E4 (GET-only
 transport by construction, no `PUT /proxies`, no `DELETE /connections`, no
-`/delay` active probes), reusing E4's audited pieces verbatim
-(`parse_controller_url`, `HttpTransport`, `clamp_timeout`, `redact`,
-`resolve_secret`, the 0600 secret-file contract).
+`/delay` active probes; only `/version`, `/proxies` and `/connections` are
+read), reusing E4's audited pieces verbatim (`parse_controller_url`,
+`HttpTransport`, `clamp_timeout`, `resolve_secret`, the 0600 secret-file
+contract).
 
-## Record kinds (closed schemas -- nothing else is ever written)
+## Record schema (closed -- EXACTLY FOUR record types, nothing else is ever written)
 
-| `k` | emitted | keys | carries |
+Schema version `v=1`; every record carries the envelope `{v, t, ts, run, seq}`:
+`ts` is UTC Z-form (`YYYY-MM-DDTHH:MM:SSZ`), `run` is a fresh non-secret 32-hex
+id per PROCESS (restarts and gaps are explicit evidence, never backfilled),
+`seq` is a strictly increasing per-run counter. There is deliberately NO
+run/header record type: a restart is visible as the `run` change plus the
+always-emitted first `sample`.
+
+| `t` | emitted | keys beyond the envelope | carries |
 |---|---|---|---|
-| `run` | once per process | `ts, run_id, url_host, url_port, groups, interval_s, collector_ver, mihomo_version` | which collector, against which loopback port, watching WHICH caller-named groups; `run_id` (32-hex, fresh per process) makes restart gaps explicit |
-| `sample` | every cycle with any usable data | `ts, run_id, obs, groups, nodes, conns` | the per-cycle evidence snapshot below |
-| `sel` | only on change | `ts, run_id, g, from, to` | selection transitions with timestamps (H3: was it even automatic?) |
-| `alive` | only on flip | `ts, run_id, node, from, to` | health-check verdict flips (H1 vs H2) |
-| `err` | dedup-ledgered | `ts, run_id, c, n, detail` | collection failure, visible never silent; `c` is a CLOSED enum, `n` the consecutive count, `detail` redacted to <=200 chars |
+| `sample` | EVERY cycle, no matter what failed | `api_reachable, mihomo_version, proxies_status, connections_status, groups, nodes, connection_chains, truncated, invalid_fields` | the per-cycle evidence snapshot below |
+| `selection_changed` | only on change | `group, from, to` | selection transitions with timestamps (H3: was it even automatic?) |
+| `alive_flipped` | only on flip | `node, from, to` | health-check verdict flips (H1 vs H2) |
+| `collector` | once per present failure code per cycle | `code, scope, count` | closed failure vocabulary; the bounded `scope` distinguishes endpoints; `count` = consecutive cycles |
 
-`err.c` classes: cycle-level `api_unreachable` / `api_malformed` /
-`storage_failed` / `rotation_failed` (re-recorded each failing cycle with
-incrementing `n`, cleared by the first clean cycle -- downtime is measurable),
-and subject-level `group_missing` / `node_missing` / `history_truncated` /
-`config` (recorded ONCE per appearance-transition, so a permanently absent
-group never storms a 30s log).
+A `sample` is emitted even when `/version` is unreachable -- with
+`api_reachable: false`, `mihomo_version: null` and honest endpoint statuses
+`"unavailable"` -- so an outage or a restart during an outage is visible
+evidence, never a hole.
+
+`collector.code` (closed enum) with its fixed `scope`: `mihomo_unreachable`
+(version -- ANY `/version` failure: transport error, non-200 including 401,
+malformed body, or a missing/unusable version field); `proxies_invalid`
+(proxies); `connections_invalid` (connections); `group_missing` (proxies);
+`node_missing` (proxies); `storage_error` (storage). Endpoint statuses on
+`sample` are the closed set `ok | unavailable | invalid`.
+
+Accounting (whole-cycle, dedup): the cycle's whole code set is computed FIRST;
+each present code produces exactly ONE `collector` record with its count
+incremented once -- the same code on several endpoints is never recorded
+twice in one cycle. A code resets only after a FULL cycle in which it was
+absent; a `/version` failure shortens the cycle (the other reads are skipped),
+so it increments and never resets.
 
 ## What a `sample` proves
 
-* `groups`: for each caller-named group ONLY -- `type` (lower-cased: was the
-  traffic group a Selector or an URLTest?), `now`, member count. Group names
-  are never guessed or discovered; empty `--group` means connections-only.
-* `nodes` / `obs`: every observed member (named groups + chain endpoints)
-  with `alive` (strict bool, `null` when absent = "unknown", never False) and
-  its last `history` entries newest-last -- **`delay == 0` is preserved RAW as
-  `d: 0`** (E4 display normalizes 0 to null; forensics must not: 0 is a
-  FAILED probe, the single most important missing datum, E4-H1), each with
-  its `t` timestamp; plus per-test-url `extra` histories where the build
-  exposes them (H4). `obs` is capped (64, sorted) and truncation raises a
-  `history_truncated` note, never a silent loss.
-* `conns`: from `/connections` only `chains` and `start` are ever read, and
-  they are immediately aggregated to `{n, by_node, multi, stale}` -- how many
-  live connections still traverse each node, and `stale` counts those whose
-  chain crosses an observed member that is NOT its group's current `now`
-  while the connection PRE-DATES the last recorded `sel` for that group
-  (H6: old-path connections outliving a switch). Unknown `start` or no
-  recorded switch -> never counted stale: evidence, not guesswork. Connection
-  ids, IPs, hosts, rules, metadata and traffic totals are structurally never
-  written -- asserted by a whole-file leak wall in the test suite.
+* `groups`: for each caller-named group ONLY -- `name, type, now, members`
+  (plus `alive` only when the source value is a real boolean). Group names
+  are never guessed or discovered; at least one `--group` is REQUIRED (a
+  zero-group collector would record empty evidence forever -- refused).
+* `nodes`: every observed member (union of named-group members and current
+  selections), each `{name, type, alive, history, extra}`: `alive` is a
+  strict bool or `null` ("unknown", never False); `history` entries are
+  `{ts, delay_ms}` newest-last, tail of 8. **`delay == 0` is preserved RAW
+  as integer 0** (a FAILED probe, the single most important missing datum,
+  E4-H1); a delay must be a true bounded integer -- a float (even `1.0`),
+  bool or string is dropped and counted, never coerced; a delay whose
+  timestamp does not parse keeps the entry with `ts: null` (soft-invalid,
+  counted). `extra` holds per-test-URL histories (H4) where the build
+  exposes them: the RAW URL is never stored -- each is replaced by
+  `test_id = HMAC-SHA256(local 256-bit key, raw_url)[:16 hex]`, stable
+  across samples AND restarts while the URL (which may embed private query
+  tokens) never crosses the persistence boundary.
+* `connection_chains`: from `/connections` ONLY `chains` and `start` are ever
+  read, immediately aggregated per observed node to
+  `{node, active_chain_count, oldest_start, newest_start, invalid_start_count}`.
+  `"connections": null` and `[]` are the official empty shapes -> confirmed
+  zero; a missing key or wrong type -> `connections_status: "invalid"`
+  (unknown, NEVER zero). Only well-formed connection objects count toward
+  `active_chain_count`; a valid connection without a usable `start` raises
+  that node's `invalid_start_count`. NO cross-group "stale" verdict is
+  derived -- under nested topologies (outer Selector -> inner automatic
+  group) it would overclaim; the analyst compares these raw facts against
+  same-run `selection_changed` records. Connection ids, IPs, hosts, rules,
+  metadata and traffic totals are structurally never written -- asserted by
+  a whole-file leak wall in the test suite.
+* `truncated` / `invalid_fields`: cardinality caps (8 groups, 32 stored
+  members per group, 64 observed nodes, 8 history entries, 8 extra
+  test-ids per node, names 1..128 UTF-8 bytes without C0/C1 controls) and
+  the hard record ceiling -- one encoded line is at most 64 KiB INCLUDING
+  the trailing newline; an oversized record is trimmed STRUCTURALLY (never
+  byte-sliced) and flagged. Nothing arbitrary is persisted anywhere: no
+  exception text, no HTTP body bytes, no raw URLs, no credentials, no
+  paths -- the only error vocabulary is the closed (code, scope, count)
+  triple.
 
-## Cadence and persistence
+## Causal boundary (diff events are run-local)
+
+`selection_changed` / `alive_flipped` are emitted ONLY between two valid
+`/proxies` observations inside the SAME process run with no invalid or
+unavailable gap between them; the first valid sample seeds silently, and
+after a gap the next valid sample re-seeds silently (an edge across a gap
+would be a fabricated causal claim -- the change may have happened at any
+time in between). A missing group/node, a group whose `now` is present but
+unusable, or a node whose `alive` is unknown breaks that subject's chain. A
+`/version` failure breaks the chain exactly like an unavailable `/proxies`
+cycle. Consequence: one-shot `--once` invocations can never prove
+transitions across invocations -- the resident loop is the mode that
+produces edges.
+
+## Cadence, persistence, process discipline
 
 * interval clamped to 30-60s (default 30): >=2 samples inside a ~65s
   worst-case health-check detection window separates "never switched" from
-  "not yet re-tested" (H5); a 300s interval could not;
-* `--out-dir` is REQUIRED (fail-closed): real directory, symlink rejected,
-  created/normalized to 0700; evidence file `diag.jsonl` opened
-  `O_WRONLY|O_CREAT|O_APPEND|O_NOFOLLOW` and fchmod'ed 0600 on POSIX (Windows
-  relies on filesystem ACLs -- same documented limitation as the secret
-  file); one `os.write` per line, `fsync` per cycle;
-* size-shift rotation (`diag.jsonl` -> `.1` -> ... -> `.N-1` via
-  `os.replace`) above `--max-mb` (default 4, floor 4096 bytes) keeping
-  `--files` (default 4) -> total evidence bounded; `--prune-now` rotates
-  without sampling;
-* diff state is recovered by tail-reading the last 64 KiB of the JSONL
-  itself (torn final line dropped) -- no sidecar to corrupt or leak.
+  "not yet re-tested" (H5);
+* `--out-dir` is REQUIRED and fail-closed: no symlink component anywhere on
+  the path, real directory, 0700 (a permission-tightening failure is FATAL
+  on POSIX; Windows relies on NTFS ACLs -- documented limitation, same as
+  the secret file). One advisory `diag.lock` makes a second collector on
+  the same directory refuse to start. `diag.key` (the HMAC key) is created
+  once with `O_CREAT|O_EXCL` (a lost race re-reads the existing key through
+  the same safe loader, never overwrites it), `O_NOFOLLOW` +
+  fstat-verified regular, 0600 enforced fail-closed. `diag.jsonl` is opened
+  `O_APPEND|O_NOFOLLOW`, fstat-verified regular, fchmod'ed 0600 (failure
+  fatal on POSIX), appended with one write-until-complete loop per cycle
+  batch, `fsync` per cycle; a pre-existing torn trailing line is
+  frame-protected with a leading newline, never destroyed;
+* size-shift rotation (`diag.jsonl` -> `.1` -> ... -> `.N-1`) above
+  `--max-mb` (default 4) keeping `--files` (default 4, budget
+  `max-mb * files <= 32 MiB`): file fsync before the rename, directory
+  fsync after it; `--prune-now` rotates without sampling.
 
 ## Exit codes -- failures are visible, but never gate the proxy
 
-`--once` (systemd-timer shape, default): `0` ok, `2` config (incl.
-non-loopback URL, missing `--out-dir`), `3` `/version` failed, `4` storage
-failed, `5` both. `--resident`: API failures are RECORDS not exits (evidence
-must keep being collected while the controller misbehaves); a storage failure
-exits `4` immediately so the supervisor notices instead of looping blind;
-SIGTERM exits `0`. Nothing here restarts, gates or mutates Mihomo.
+`--once` (systemd-timer shape, default): `0` ok, `2` config (non-loopback
+URL, missing/invalid `--group`, missing `--out-dir`, bad rotation args, bad
+secret file), `3` any endpoint failed, `4` storage failed, `5` both.
+`--resident`: API failures are RECORDS not exits (evidence must keep being
+collected while the controller misbehaves); a storage failure exits `4`
+immediately so the supervisor notices; SIGTERM exits `0`. Nothing here
+restarts, gates or mutates Mihomo.
 
 ```bash
 # example: two caller-named groups, one cycle per systemd timer tick
@@ -293,8 +351,9 @@ python3 monitor-v2/mihomo/diag.py --url http://127.0.0.1:9090 \
     --out-dir /var/lib/mihomo-diag --once
 ```
 
-Tests: `tests/test-monitor-v2-e4diag.sh` (165 fixture-driven checks: static
-mutation-free grep, closed schemas, delay-0 raw preservation, leak wall,
-rotation/permissions, exit-code matrix, tail recovery). The E4 suite (161)
-and E1 (188) must stay green -- `diag.py` lives under `mihomo/` and is
-covered by the same static greps.
+Tests: `tests/test-monitor-v2-e4diag.sh` (343 assertions, fail-closed gate:
+static mutation-free greps plus residue greps, the strict four-type proof,
+delay-0 raw preservation, leak wall, B4 storage primitives via fault
+injection, encode bounds, B6 ledger semantics, exit-code matrix). The E4
+suite (161) and E1 (232) must stay green -- `diag.py` lives under `mihomo/`
+and is covered by the same static greps.
