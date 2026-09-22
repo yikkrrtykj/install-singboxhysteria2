@@ -319,6 +319,24 @@ web 层字段：`web_status`、`api_status`、`monitor_started_at`、
 `Tracker.snapshot()` 新增顶层 `connections` 逐连接行（ACTIVE + 有上限的
 RECENT，纯投影、无二次记账），供 Connections 表使用；188 项 E1 断言不受影响。
 
+### 0.2.0：持久化事件时间线（issue #33 P1，设计见 docs/monitor-v2-incident-history-p1.md）
+
+publisher 在 `_decorate()` 发布成功后，把 snapshot 的**白名单聚合投影**写入
+`<state-root>/diagnostics/history.sqlite3`（0700 目录 / 0600 文件，拒绝符号
+链接与非 regular 占位；journal_mode=DELETE + synchronous=FULL；一把可重入
+RLock 串行写者、HTTP 读者与 close，见 PR #44 评审 B1）：5s 一条
+`timeline_samples` 聚合行，(device, inbound) 稀疏 `device_protocol_states`
+行（计数/状态变化立即写、否则 ≤1 次/60s 心跳、仅速率变化不写）。连接 ID、
+IP、hostname、UUID、口令、密钥、secret、配置、原始 snapshot 一律不落盘；
+设备名与 inbound tag 是允许的最小元数据。保留 7 天 + 48MiB 目标 / 64MiB
+硬顶，只删最旧——尺寸裁剪把两表视为**同一条全局 epoch 时间线**，存活集恒为
+合并后的最新后缀（评审 B2）；schema 门禁严格：仅"全新库建为 v1"与"恰声明
+v1 且表齐全"两种形态被接受，其余（版本 0/畸形/更高、无 meta、缺表）一律
+fail-closed 且拒绝时零字节改动（评审 B3）。任何存储/保留失败只记
+degraded+分类码，dashboard 与 publisher 永不因此中断。读面仅
+`GET /api/v1/diagnostics/timeline?since&limit`（session 门禁、有界、列白名
+单、无 UI）。E1 collector 本体、systemd 权限、helper/sbox-cm 边界零改动。
+
 ### 请求门顺序（每个普通请求）
 
 ```text
