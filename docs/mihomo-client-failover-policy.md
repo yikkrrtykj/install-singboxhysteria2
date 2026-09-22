@@ -62,20 +62,91 @@ proxy-groups:
 
 ## Upgrade / migration matrix (`profile.store-selected: true` unchanged)
 
-The group name `自动选择` was kept and its type changed IN PLACE
-(url-test -> fallback), so no persisted selection can dangle:
+There are TWO independent cache layers to account for:
 
-| Persisted 节点选择 selection | After reload |
+1. the outer Selector cache for `节点选择`; and
+2. the cached fixed selection of the inner group named `自动选择`.
+
+The group name `自动选择` is deliberately kept while its type changes in
+place from `url-test` to `fallback`. Mihomo restores cached SelectAble
+group selections by group name, so a legacy inner `自动选择=Hysteria2`
+selection can survive this type change and fix the new fallback to Hysteria2.
+That is valid persisted state, but it is NOT the unpinned
+Reality-primary behavior.
+
+### Outer Selector cache
+
+| Persisted `节点选择` selection | After reload |
 |---|---|
-| none (fresh install) | `default-selected` routes into 自动选择 -> Reality while healthy |
-| Reality | stays Reality (manual override preserved) |
+| none (fresh/no cache) | `default-selected` routes into `自动选择`; unpinned fallback chooses Reality while healthy |
+| Reality | stays Reality (manual outer override preserved) |
 | Hysteria2 | stays Hysteria2 |
-| 自动选择 | name valid; gains priority-failover semantics immediately |
+| 自动选择 | stays 自动选择; traffic follows the inner fallback/fixed state described below |
 | DIRECT | stays DIRECT |
 
-Cache precedence (verified against upstream `hub/executor/executor.go`):
-the persisted selection is restored ONLY when a cache entry exists;
-otherwise `default-selected` applies; otherwise the first member (Reality).
-Rollout note: existing installs that had manually pinned Reality keep that
-pin after this change; they adopt automatic failover by selecting
-`自动选择` once in the panel (or by clearing the kernel selection cache).
+### Inner `自动选择` cache
+
+| Persisted inner `自动选择` state | After url-test -> fallback reload |
+|---|---|
+| none | fallback is unpinned and prefers Reality while Reality is healthy |
+| Reality | fallback starts fixed to Reality |
+| Hysteria2 | fallback starts fixed to Hysteria2, even if Reality is healthy |
+| fixed state cleared/unfixed | fallback returns to automatic priority order: Reality first, then Hysteria2 |
+
+The two layers can coexist. For example an upgraded client may have both
+`节点选择=自动选择` AND inner `自动选择=Hysteria2`; in that state the outer
+Selector correctly points at the automatic group, but the automatic group is
+still fixed to HY2 until explicitly unfixed.
+
+**Preferred recovery/migration path:** clear/unfix ONLY the inner
+`自动选择` fixed selection in the client UI/API. On the pre-merge validation
+build below, `DELETE /proxies/自动选择` returned HTTP 204, cleared the fixed
+selection, immediately restored `now=Reality` while Reality was healthy, and
+the cleared state remained automatic after restart. Deleting the entire
+selection cache is a broader reset and is NOT the primary migration
+instruction.
+
+Cache precedence remains: a persisted selection wins when present;
+otherwise `default-selected` applies for the outer Selector; an unpinned
+fallback then follows member priority. Existing installs that deliberately
+pinned outer Reality/Hysteria2/DIRECT retain that operator intent.
+
+## Pre-merge runtime validation
+
+The rendered YAML assertions are necessary but do not prove Mihomo kernel
+cache/fallback behavior. Before merge, the S1-S8 matrix was therefore run once
+continuously in a controlled client lab.
+
+### Tested build and substitutions
+
+- Kernel: **Mihomo Meta v1.19.31**, Windows amd64, Go 1.26.8, locally built
+  binary sha256 `deef9d8d…31c8bf`.
+- Members were modeled as SOCKS5 relays. This exercises Mihomo group/cache/
+  fallback selection semantics, but it is not a Reality/Hysteria2 protocol
+  interoperability test.
+- Health URL was lab-only `http://127.0.0.1:18080/hc`; the production
+  template remains `https://www.gstatic.com/generate_204`.
+- Health timing was scaled to `interval=3s`, `timeout=1500ms` only to make
+  transitions observable quickly. The production template remains 60s/5000ms.
+- Long-lived-connection evidence used SOCKS5 through the mixed port as a pure
+  TCP tunnel. The HTTP-proxy path was deliberately excluded because its
+  absolute-URI/keep-alive behavior introduced unrelated lab interference.
+- These results verify the exact build above. They do NOT claim behavior for
+  older/frozen Mihomo cores that were not tested.
+
+### S1-S8 results
+
+| Scenario | Observed result |
+|---|---|
+| S1 fresh/no cache | outer `节点选择.now=自动选择`; inner chooses Reality |
+| S2 cached outer Reality | outer Reality survives restart |
+| S3 cached outer Hysteria2 | outer Hysteria2 survives restart |
+| S4 cached outer 自动选择 | outer 自动选择 survives; inner fallback remains active |
+| S5 cached outer DIRECT | outer DIRECT survives restart |
+| S6 legacy inner fixed Hysteria2 | fixed Hysteria2 survives url-test -> fallback reload; new connections use `[Hysteria2, 自动选择, 节点选择]`; unfix via `DELETE /proxies/自动选择` -> 204 clears fixed state, `now=Reality`, and restart stays automatic |
+| S7 unpinned failover/failback | Reality failure -> HY2 in **1198 ms**; Reality recovery -> Reality in **2931 ms**; both within the scaled `interval+timeout=4.5s` window |
+| S8 established connection | connection established on Reality remained on its Reality chain after the group switched to Hysteria2 and was still present +3s later; a concurrent new connection used HY2 |
+
+S8 is evidence for the documented limit above: selection changes affect new
+dials; they do not migrate an already-established connection.
+
