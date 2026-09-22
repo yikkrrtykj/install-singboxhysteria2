@@ -1,0 +1,87 @@
+{
+  "downloadTotal": 999,
+  "uploadTotal": 333,
+  "memory": 1,
+  "connections": [
+    {
+      "id": "conn-0001",
+      "metadata": {
+        "network": "tcp",
+        "type": "tcp",
+        "sourceIP": "10.0.0.5",
+        "destinationIP": "192.0.2.44",
+        "destinationPort": "55555",
+        "host": "internal-secret.example.com",
+        "processPath": "/secret/path",
+        "uid": 1000,
+        "secret": "S3CR3T-IN-METADATA"
+      },
+      "rule": "MATCH",
+      "payload": "hidden.example",
+      "chains": [
+        "节点选择",
+        "自动选择",
+        "reality-hk-01"
+      ],
+      "start": "2026-09-22T11:50:00Z",
+      "upload": 11,
+      "download": 22,
+      "rulePayload": "",
+      "chainsLength": 3
+    },
+    {
+      "id": "conn-0002",
+      "metadata": {
+        "network": "tcp",
+        "type": "tcp",
+        "sourceIP": "10.0.0.5",
+        "destinationIP": "192.0.2.44",
+        "destinationPort": "55555",
+        "host": "internal-secret.example.com",
+        "processPath": "/secret/path",
+        "uid": 1000,
+        "secret": "S3CR3T-IN-METADATA"
+      },
+      "rule": "MATCH",
+      "payload": "hidden.example",
+      "chains": [
+        "节点选择",
+        "自动选择",
+        "reality-hk-01"
+      ],
+      "start": "2026-09-22T11:55:00Z",
+      "upload": 11,
+      "download": 22,
+      "rulePayload": "",
+      "chainsLength": 3
+    },
+    {
+      "id": "conn-0003",
+      "metadata": {
+        "network": "tcp",
+        "type": "tcp",
+        "sourceIP": "10.0.0.5",
+        "destinationIP": "192.0.2.44",
+        "destinationPort": "55555",
+        "host": "internal-secret.example.com",
+        "processPath": "/secret/path",
+        "uid": 1000,
+        "secret": "S3CR3T-IN-METADATA"
+      },
+      "rule": "MATCH",
+      "payload": "hidden.example",
+      "chains": [
+        "节点选择",
+        "自动选择",
+        "hy2-hk-02"
+      ],
+      "start": "2026-09-22T12:05:00Z",
+      "upload": 11,
+      "download": 22,
+      "rulePayload": "",
+      "chainsLength": 3
+    },
+    "not-a-conn",
+    null
+  ]
+}

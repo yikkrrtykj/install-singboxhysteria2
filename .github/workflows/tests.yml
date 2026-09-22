@@ -47,6 +47,7 @@ jobs:
           bash -n tests/test-monitor-v2-e2.sh
           bash -n tests/test-monitor-v2-m05.sh
           bash -n tests/test-monitor-v2-e4.sh
+          bash -n tests/test-monitor-v2-e4diag.sh
           bash -n tests/test-legacy-config-transactions.sh
           bash -n tests/test-existing-api-auth-migration.sh
           bash -n tests/test-journal-time-compat.sh
@@ -179,6 +180,9 @@ jobs:
 
       - name: E4 Mihomo enrichment regression suite
         run: bash tests/test-monitor-v2-e4.sh
+
+      - name: E4-Diag Mihomo failover forensics regression suite
+        run: bash tests/test-monitor-v2-e4diag.sh
 
       - name: "E3 M2 web adapter contract suite (broker / breaker / auth / HTTP adapter)"
         run: bash tests/test-monitor-v2-m2.sh
