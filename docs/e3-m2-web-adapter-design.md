@@ -198,7 +198,8 @@ Browser
 singbox-monitor.service  User=sboxweb
    ├── server.py 路由层（既有三道门原样保留：whitelist / session / CSRF+Origin）
    ├── e3_broker   status/list 缓存(TTL) + breaker + management_active provider
-   ├── e3_mutations 校验(type-to-confirm 服务端复核、name/legacy 双层、指纹派生)
+   ├── e3_mutations 校验(confirm==name 服务端复核（0.1.5 起语义名
+   │                target-binding echo）、name/legacy 双层、指纹派生)
    │                → 组帧 → 白名单映射响应/错误
    └── e3rpc       AF_UNIX 客户端：connect/帧编解码/单请求连接/调用方预算
    │
@@ -214,7 +215,7 @@ sbox-cm.service  User=root
 | --- | --- | --- | --- |
 | 传输客户端 | `monitor-v2/web/e3rpc.py` | 帧编解码、connect/收发、per-op 调用方预算、`E_TIMEOUT`/连接错误分类 | socket 路径 = 模块常量 `DEFAULT_E3_SOCKET_PATH="/run/sbox-cm/sbox-cm.sock"`；测试经构造器注入临时路径；**不新增 env key**（monitor-env.sh 六键面不扩大） |
 | broker | `monitor-v2/web/e3_broker.py` | status/list TTL 缓存、breaker 状态机、`management_active()` provider、`as_of` 时间戳 | 异常一律 fail-closed；cache/breaker 全部 thread-safe；status/list 各自 single-flight；见 §7 |
-| mutation 转发 | `monitor-v2/web/e3_mutations.py` | 请求校验与组装、type-to-confirm 服务端复核、actor 指纹、白名单映射 | 不重试 mutation（S-1）；不落盘 |
+| mutation 转发 | `monitor-v2/web/e3_mutations.py` | 请求校验与组装、confirm==name 服务端复核（target-binding echo）、actor 指纹、白名单映射 | 不重试 mutation（S-1）；不落盘 |
 | 路由接线 | `server.py`（最小 diff） | 六个 HTTP endpoints（2 GET + 4 mutation POST）换实现/新增；`management_active` provider 换 broker | M0.5 的门与 `MUTATION_ROUTES` 集合不变 |
 | UI | `web/static/*`（最小 diff） | status 卡片、client 表、add/delete 确认流、uncertain/degraded 态 | §11 |
 
@@ -391,6 +392,38 @@ broker   : E3Broker.status(force=False)。force=True 仅绕过 TTL 快速路径�
            helper/sbox-cm/sing-box 零改动；VERSION 0.1.3→0.1.4。
 ```
 
+### 7.8 两步目标绑定删除与本地 mutation 锁（0.1.5 修订，#36）
+
+"重新输入 client 名"只是服务端 confirm==name 复核在前端的第三份重复：线格式
+body 自始携带 `{name, confirm: name}`。0.1.5 把删除确认改为"明示目标 + 审慎
+二次点击"，服务端全部关卡原样保留。
+
+```text
+确认面板 : 行内 Delete 点击 ⇒ beginDeleteClient：先过单飞/pending/可写/legacy
+           守卫，再写入 e3-del-name 与 data-name（绑定先于展示与 focus），然后
+           打开面板并 focus Cancel——焦点永不默认落在销毁按钮上；无输入框、无
+           防手滑计时器（二次刻意点击本身即守卫）。第二步 "Delete permanently"
+           读取已绑定 data-name 派发；未绑定（隐藏面板的误点）直接返回。
+           集中一个 closeDeleteConfirm()（隐藏+清 data-name+清目标名）：Cancel、
+           失去可写性、进入 pending-retry、删除成功四条出路全部经过它——隐藏
+           面板不可能保留可用的陈旧绑定。面板打开期间列表重渲染不改绑，重新
+           点击别的行才改绑为新目标。
+本地锁   : state.e3Mutation={kind,name,inFlight}。setMutation 在 apiWithStepUp
+           之前同步渲染：Add/Delete 按钮、Add 输入框、行内 Delete 全锁，标签
+           Adding…/Deleting…；徽章与 Download 仍只反映服务端真相（e3Mutation
+           刻意不并入 e3Writable()——半假状态正是 0.1.4 要消灭的东西）。
+           POST 到达终态 ⇒ inFlight=false，Cancel 重新可点——已经派发的事务
+           不允许被 UI "取消"。成功时锁保持到 convergeAfterMutation() settle
+           （.then(clearMutation)），绝不在 POST-resolve 就放锁让第二次 mutation
+           与收敛读赛跑。504 ⇒ 先 setPendingRetry 再 clearMutation（锁移交
+           pending-retry fail-safe）；其它终态错误与 step-up 取消 ⇒ clearMutation。
+服务端   : confirm==name 复核、fresh-list 预检、legacy reserved/mutable 规则、
+           step-up、CSRF、Idempotency-Key、result_unknown 契约全部不变；
+           server.py 仅把注释语义改名为 target-binding echo / defence in depth。
+边界     : Monitor-only（static/app.js、static/index.html、server.py 注释+版本
+           字符串）；helper/sbox-cm/sing-box 零改动；VERSION 0.1.4→0.1.5。
+```
+
 ---
 
 ## 8. 调用方等待预算与超时语义（冻结）
@@ -456,7 +489,7 @@ idempotency_key : client.add / client.delete 经 HTTP 【Idempotency-Key header�
 actor           : {session_fp, stepup_fp}——见 §12 指纹派生；仅 activate/add/delete/
                   （M2-A0 后的）deactivate 携带
 name / confirm  : name 双层校验（Web 正则 + legacy 拒绝，helper 再校验）；
-                  type-to-confirm 的逐字回显由服务端复核（§11）
+                  confirm 逐字回显 name（target binding，§11 U-2）由服务端复核
 ```
 
 ---
@@ -492,8 +525,10 @@ E_STATE_UNCERTAIN(503)    : 明示"变更可能已生效但收尾未完成；用
 ```text
 U-1 危险操作明示（E-14）: add/delete/activate/deactivate 前后果明示（将发生什么、
                           影响哪个对象、是否触发 reload）。
-U-2 type-to-confirm     : delete 需逐字回显 name；服务端复核 confirm==name，
-                          不相等 ⇒ 400 confirm_mismatch（不能只靠前端）。
+U-2 target-binding echo : delete 请求体仍逐字携带 confirm==name（0.1.4 及以前由用户
+                          手打，称 type-to-confirm；0.1.5 起改由两步确认面板绑定目标
+                          后自动回显，§7.8）。服务端复核 confirm==name 不变，
+                          不相等 ⇒ 400 confirm_mismatch（不能只靠前端，纵深防御）。
 U-3 step-up 挂钩        : 401 reauth_required ⇒ 弹密码框 ⇒ 成功后自动重放原请求，
                           confirm 与 Idempotency-Key header 值不变（E-6）。
                           step-up 端点、TTL、五类吊销语义全部沿用 M0.5 实现，
@@ -583,7 +618,7 @@ T-1 API 契约测试（mock helper，真实 AF_UNIX + 真实帧格式）
     错误映射全表（§10）与 retriable 透传；breaker 三态迁移与计数边界
     （协议错误不计数）；2s/5s TTL 与 as_of；stale-active 永不信任（TTL 过期+
     刷新失败 ⇒ provider=False）；delete 预检（fresh 失败 ⇒ 不派发）；
-    Idempotency-Key header 跨 401 重放不变；type-to-confirm 服务端复核；
+    Idempotency-Key header 跨 401 重放不变；confirm==name 服务端复核；
     name/legacy 双层拒绝；白名单（lock.path / error.backup 永不出现于响应）；
     request_id 每次尝试新生成；deactivate actor 透传（M2-A0 后）。
     并发断言 : 20 线程同时触发过期 TTL 刷新 ⇒ 恰好 1 次 helper RPC

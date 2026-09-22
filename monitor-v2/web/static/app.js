@@ -478,7 +478,7 @@
       // closed -- the ONLY retry path is the same-key button below.
       $("e3-retry-name").textContent = pending.name || pending.path;
       show($("e3-retry-row"));
-      hide($("e3-delete-box"));
+      closeDeleteConfirm();
     } else {
       hide($("e3-retry-row"));
     }
@@ -547,13 +547,26 @@
     // B4 + B3-final: one writable decision drives every destructive control,
     // and a pending uncertain operation locks the ordinary entrances.
     var writable = e3Writable() && !state.e3PendingRetry;
+    // 0.1.5 (#36): the local mutation-busy lock is layered on top of server
+    // writability, never folded into it -- the Available/Unavailable badge
+    // and the read-only Download keep reflecting SERVER truth only.
+    var busy = !!state.e3Mutation;
+    var adding = busy && state.e3Mutation.kind === "add";
+    var deleting = busy && state.e3Mutation.kind === "delete";
     setBadge($("e3-availability"), writable ? "Available" : "Unavailable",
              writable ? "ok" : "idle");
     if (writable) hide($("e3-unavailable")); else show($("e3-unavailable"));
-    $("e3-add-btn").disabled = !writable;
-    $("e3-add-name").disabled = !writable;
-    $("e3-del-btn").disabled = !writable;
-    if (!writable) hide($("e3-delete-box"));
+    $("e3-add-btn").disabled = !writable || busy;
+    $("e3-add-btn").textContent = adding ? "Adding…" : "Add client";
+    $("e3-add-name").disabled = !writable || busy;
+    $("e3-del-btn").disabled = !writable || busy;
+    $("e3-del-btn").textContent = deleting ? "Deleting…" : "Delete permanently";
+    // A delete already dispatched (step-up or wire) cannot be "cancelled"
+    // by the UI: the transaction is real, so the Cancel control locks with
+    // it. Once the POST reaches a terminal verdict the panel is closed or
+    // the retry contract owns the view again.
+    $("e3-del-cancel").disabled = deleting && state.e3Mutation.inFlight;
+    if (!writable) closeDeleteConfirm();
     if (state.e3Clients) renderE3Clients(state.e3Clients);
   }
 
@@ -664,6 +677,9 @@
         btn.className = "btn ghost";
         btn.type = "button";
         btn.textContent = "Delete";
+        // 0.1.5: any in-flight mutation also locks the row entrances
+        // (Download above is a read and deliberately keeps its own gate).
+        if (state.e3Mutation) btn.disabled = true;
         btn.addEventListener("click", function () {
           beginDeleteClient(client.name);
         });
@@ -679,23 +695,55 @@
   }
 
   function beginDeleteClient(name) {
+    // 0.1.5 (#36): one row Delete click only OPENS a confirmation bound to
+    // exactly this client; the deliberate second step is "Delete
+    // permanently". No name re-typing -- the wire body still echoes
+    // confirm==name, which the server re-validates as a target-binding
+    // defence in depth (plus the fresh-list preflight right before
+    // dispatch, the reserved/mutable rules and step-up auth).
+    if (state.e3Mutation || state.e3PendingRetry) return;
     if (!e3Writable() || name === "legacy") return;
-    // Fresh-list preflight happens again server-side right before the
-    // delete; the confirm box here is the type-to-confirm UX (U-2).
     $("e3-del-name").textContent = name;
-    $("e3-del-confirm").value = "";
+    $("e3-del-btn").setAttribute("data-name", name);   // bind BEFORE show/focus
     show($("e3-delete-box"));
-    $("e3-del-confirm").focus();
-    $("e3-del-btn").setAttribute("data-name", name);
     e3Message("", false);
     hide($("e3-msg"));
+    // Focus the SAFE control: keyboard Enter/Space must never land on the
+    // destructive button by default.
+    $("e3-del-cancel").focus();
+  }
+
+  function closeDeleteConfirm() {
+    // The single exit for the confirmation panel: hides it AND clears the
+    // bound target, so a hidden panel can never keep a usable stale
+    // data-name for a stray click. Cancel, loss of writability, a pending
+    // retry and a successful delete all route through here.
+    hide($("e3-delete-box"));
+    $("e3-del-btn").removeAttribute("data-name");
+    $("e3-del-name").textContent = "";
+  }
+
+  function setMutation(kind, name) {
+    // 0.1.5 (#36): UI/single-flight lock around add+delete. Rendered
+    // synchronously BEFORE apiWithStepUp so the busy state is visible for
+    // the whole operation (step-up dialog included).
+    state.e3Mutation = {kind: kind, name: name, inFlight: true};
+    renderE3Controls();
+  }
+
+  function clearMutation() {
+    if (!state.e3Mutation) return;
+    state.e3Mutation = null;
+    renderE3Controls();
   }
 
   function deleteClient(name, keyOverride) {
-    // B3-final fail-safe: same lock as addClient above.
-    if (state.e3PendingRetry) return;
+    // B3-final fail-safe + 0.1.5 single-flight: neither a pending uncertain
+    // operation nor an in-flight local mutation may dispatch a second one.
+    if (state.e3PendingRetry || state.e3Mutation) return;
     if (!e3Writable() || name === "legacy") return;
     var key = keyOverride || newIdempotencyKey();
+    setMutation("delete", name);
     // B3: an explicit retry replays with the SAME key; a fresh click on the
     // delete button is a NEW operation and gets a NEW key.
     apiWithStepUp("/api/v1/clients/delete", {
@@ -704,24 +752,31 @@
       body: { name: name, confirm: name }
     }).then(function () {
       setPendingRetry(null);
-      hide($("e3-delete-box"));
+      closeDeleteConfirm();
       e3Message("Client deleted.", false);
       loadSession();
       // 0.1.4: the single convergence read applies fresh status+list
       // atomically (the server caches are already invalidated for this
-      // confirmed delete).
-      convergeAfterMutation();
+      // confirmed delete). 0.1.5: the mutation lock is held THROUGH the
+      // convergence -- clearing it at POST-resolve would let a second
+      // mutation race against the fresh read still in flight.
+      if (state.e3Mutation) state.e3Mutation.inFlight = false;
+      convergeAfterMutation().then(clearMutation);
     }).catch(function (error) {
       if (error.status === 504 && error.uncertain) {
         setPendingRetry({ path: "/api/v1/clients/delete", name: name,
                           idempotencyKey: key,
                           body: { name: name, confirm: name } });
+        // Ownership transfers to the pending-retry fail-safe, which keeps
+        // the ordinary entrances locked; clear the mutation lock AFTER it.
+        clearMutation();
         e3Message(RESULT_UNCONFIRMED, true);
         loadE3Clients();
         loadE3Status();
         return;
       }
       setPendingRetry(null);
+      clearMutation();
       if (error.code === "E_RECONCILE_CONFLICT") {
         e3Message("Server state changed: the client was rebuilt or rotated " +
                   "in the meantime. Refresh and re-check — the delete was " +
@@ -787,11 +842,13 @@
   }
 
   function addClient(name, keyOverride) {
-    // B3-final fail-safe: a pending uncertain operation locks the ordinary
-    // entrance -- no new key is ever generated while one is unresolved.
-    if (state.e3PendingRetry) return;
+    // B3-final fail-safe + 0.1.5 single-flight: a pending uncertain
+    // operation OR an in-flight mutation locks the ordinary entrance -- no
+    // new key is ever generated while one is unresolved.
+    if (state.e3PendingRetry || state.e3Mutation) return;
     if (!e3Writable()) return;
     var key = keyOverride || newIdempotencyKey();
+    setMutation("add", name);
     apiWithStepUp("/api/v1/clients/add", {
       method: "POST",
       idempotencyKey: key,
@@ -803,18 +860,21 @@
       $("e3-add-name").value = "";
       // 0.1.4: the single convergence read applies fresh status+list
       // atomically (the server caches are already invalidated for this
-      // confirmed add).
-      convergeAfterMutation();
+      // confirmed add). 0.1.5: the lock is held until convergence settles.
+      if (state.e3Mutation) state.e3Mutation.inFlight = false;
+      convergeAfterMutation().then(clearMutation);
     }).catch(function (error) {
       if (error.status === 504 && error.uncertain) {
         setPendingRetry({ path: "/api/v1/clients/add", name: name,
                           idempotencyKey: key, body: { name: name } });
+        clearMutation();   // pending-retry takes over the lock
         e3Message(RESULT_UNCONFIRMED, true);
         loadE3Clients();
         loadE3Status();
         return;
       }
       setPendingRetry(null);
+      clearMutation();
       if (error.code === "E_RECONCILE_CONFLICT") {
         e3Message("Server state changed while the request was in flight. " +
                   "Refresh and re-check — this request was not retried.",
@@ -1119,18 +1179,17 @@
       }
     });
     $("e3-del-btn").addEventListener("click", function () {
+      // 0.1.5 (#36): no name re-typing gate. The confirmation was opened
+      // with a bound data-name (set before the panel shows); this deliberate
+      // second click IS the guard. deleteClient re-checks writability,
+      // pending-retry and the single-flight lock, and the server re-checks
+      // confirm==name plus the fresh-list preflight.
       var name = $("e3-del-btn").getAttribute("data-name");
-      var confirm = $("e3-del-confirm").value;
-      if (!name) return;
-      if (confirm !== name) {
-        e3Message("The confirmation does not match the client name exactly; " +
-                  "nothing was deleted.", true);
-        return;
-      }
+      if (!name) return;   // unbound / already-closed panel dispatches nothing
       deleteClient(name);
     });
     $("e3-del-cancel").addEventListener("click", function () {
-      hide($("e3-delete-box"));
+      closeDeleteConfirm();
     });
     $("e3-retry-btn").addEventListener("click", retryPending);
     $("wl-add-btn").addEventListener("click", function () {
