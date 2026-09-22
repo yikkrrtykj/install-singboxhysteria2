@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# sbox-journal-reader -- runtime entrypoint of singbox-journal-reader.service.
+#
+# PR-2A STATUS: DARK. This wrapper is installed and bash -n'd by CI but is
+# referenced by NO production activation path: the unit template is only
+# rendered/installed by the explicitly-named sbmon_sboxjr_* helpers, which
+# install-monitor.sh never calls (statically asserted).
+#
+# Contract:
+#   * zero configuration through argv/env beyond the unit's own
+#     SBOX_JR_UNIT (validated strictly inside the reader, fail-closed);
+#   * ALL paths are the compiled-in production defaults in
+#     journal_reader/reader.py -- this shim never invents or mutates them;
+#   * `sbox-journal-reader reset --from-now` is the ONLY argv form (the
+#     reviewed operator source-gap reset; runbook: stop the service first,
+#     root invokes via runuser -u sbox-jr);
+#   * the reader's own stderr carries sanitized failure CODES only
+#     ([sbjr] failure=<code>) -- this shim adds nothing to the journal.
+set -Eeuo pipefail
+
+SBOXJR_LIB_DIR="${SBOXJR_LIB_DIR:-/usr/local/lib/singbox-journal-reader}"
+SBOXJR_PYTHON3="${SBOXJR_PYTHON3:-python3}"
+
+if [ ! -f "$SBOXJR_LIB_DIR/journal_reader/reader.py" ]; then
+    printf '[sbjr] failure=staged_tree_missing\n' >&2
+    exit 1
+fi
+
+PYTHONPATH="$SBOXJR_LIB_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+    exec "$SBOXJR_PYTHON3" -m journal_reader.reader "$@"

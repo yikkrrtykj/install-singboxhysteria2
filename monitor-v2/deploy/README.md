@@ -34,6 +34,15 @@
   拒绝 raw RFC3339（`...T...Z`）；内部时间戳保持 RFC3339/UTC，传给
   journalctl 前经 `tests/lib/journal-time.sh` 规范化为本地
   `"YYYY-MM-DD HH:MM:SS"`。
+- **sbox-journal-reader（issue #33 P2 PR-2A，DARK）**：`lib/monitor-deploy-lib.sh`
+  末尾新增 7 个 `sbmon_sboxjr_*` helper、模板
+  `singbox-journal-reader.service.in` 与入口 `app-bin/sbox-journal-reader`
+  已入库，但 `install-monitor.sh` **零调用点**、`sbmon_stage_release` 清单不
+  含 reader —— 本阶段不创建 sbox-jr 身份/目录、不安装/enable/start 单元。
+  helper 的激活语义（身份精确校验先于变更、数据树 0750/0700/2750、渲染幂等、
+  daemon-reload-only-on-change、runuser 可读性探针）及其 LIVE systemd-analyze
+  门禁详见 `docs/monitor-v2-journal-reader-p2a.md` §8–§9；启用属 PR-2B，需
+  单独评审。
 
 ---
 

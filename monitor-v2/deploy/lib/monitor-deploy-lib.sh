@@ -829,3 +829,228 @@ sbmon_wait_service_active() {
     done
     return 1
 }
+
+# ---------------------------------------------------------------------------
+# sbox-journal-reader (issue #33 P2, PR-2A) -- DARK HELPER SECTION.
+#
+# Every sbmon_sboxjr_* function below is EXPLICITLY NAMED and referenced by
+# ZERO call sites in install-monitor.sh (statically asserted by
+# tests/test-monitor-v2-jr.sh). PR-2A therefore creates NO production
+# identity, NO production directories, NO live unit, and enables/starts
+# NOTHING. The section exists so PR-2B activation reuses the exact,
+# already-tested code path instead of inventing one under deadline.
+#
+# R7 frozen identity contract: the ONLY accepted journal-read model is the
+# dedicated sbox-jr system user (nologin shell, /nonexistent home) plus OS
+# group membership systemd-journal. A partial or divergent identity is a
+# preflight STOP before ANY mutation -- there is deliberately NO root
+# fallback and NO sboxweb read path anywhere in this section.
+# ---------------------------------------------------------------------------
+SBOXJR_USER="${SBOXJR_USER:-sbox-jr}"
+SBOXJR_GROUP="${SBOXJR_GROUP:-sbox-jr}"
+SBOXJR_JOURNAL_GROUP="${SBOXJR_JOURNAL_GROUP:-systemd-journal}"
+SBOXJR_DATA_ROOT="${SBOXJR_DATA_ROOT:-/var/lib/sbox-journal}"
+SBOXJR_STATE_DIR="${SBOXJR_STATE_DIR:-$SBOXJR_DATA_ROOT/state}"
+SBOXJR_OUT_DIR="${SBOXJR_OUT_DIR:-$SBOXJR_DATA_ROOT/out}"
+SBOXJR_LIB_DIR="${SBOXJR_LIB_DIR:-/usr/local/lib/singbox-journal-reader}"
+SBOXJR_SERVICE_NAME="${SBOXJR_SERVICE_NAME:-singbox-journal-reader}"
+SBOXJR_UNIT_FILE="${SBOXJR_UNIT_FILE:-/etc/systemd/system/$SBOXJR_SERVICE_NAME.service}"
+SBOXJR_WATCHED_UNIT="${SBOXJR_WATCHED_UNIT:-sing-box.service}"
+SBOXJR_RUNUSER="${SBOXJR_RUNUSER:-runuser}"
+
+sboxjr_log() { printf '[sbjr-deploy] %s\n' "$*"; }
+sboxjr_warn() { printf '[sbjr-deploy] WARNING: %s\n' "$*" >&2; }
+sboxjr_die() { printf '[sbjr-deploy] ERROR: %s\n' "$*" >&2; return 1; }
+
+# Exact-identity validation of an EXISTING sbox-jr user (R7 fail-closed):
+# nologin shell, home /nonexistent, member of systemd-journal. Any field
+# mismatch refuses the deployment BEFORE any mutation; it is never silently
+# "converged" by a root-side repair here.
+sbmon_sboxjr_validate_identity() {
+    if [ "$SBMON_FIXTURE" = "1" ]; then
+        sboxjr_log "fixture: 身份校验跳过（真实语义由根 Linux CI 门负责）"
+        return 0
+    fi
+    local pw shell home groups
+    pw="$(getent passwd "$SBOXJR_USER" 2>/dev/null)" || {
+        sboxjr_die "用户 $SBOXJR_USER 不存在：先执行 ensure，绝不回退 root/sboxweb"
+        return 1
+    }
+    shell="$(printf '%s\n' "$pw" | cut -d: -f7)"
+    home="$(printf '%s\n' "$pw" | cut -d: -f6)"
+    case "$shell" in
+        /usr/sbin/nologin|/sbin/nologin) ;;
+        *)
+            sboxjr_die "$SBOXJR_USER shell 非 nologin（期望拒绝登录身份）"
+            return 1
+            ;;
+    esac
+    if [ "$home" != "/nonexistent" ]; then
+        sboxjr_die "$SBOXJR_USER home 非 /nonexistent"
+        return 1
+    fi
+    groups="$(id -nG "$SBOXJR_USER" 2>/dev/null)" || groups=""
+    if ! printf '%s\n' "$groups" | tr ' ' '\n' | grep -Fxq "$SBOXJR_JOURNAL_GROUP"; then
+        sboxjr_die "$SBOXJR_USER 不属于 $SBOXJR_JOURNAL_GROUP 组：journal 读取边界不成立"
+        return 1
+    fi
+    return 0
+}
+
+# Create the identity ONLY when absent (idempotent converge). An existing
+# but divergent identity is a STOP (validated above), never auto-repaired.
+sbmon_sboxjr_ensure_identity() {
+    if [ "$SBMON_FIXTURE" = "1" ]; then
+        sboxjr_log "fixture: 确认身份存在（跳过真实 useradd/usermod）: $SBOXJR_USER"
+        return 0
+    fi
+    if ! getent group "$SBOXJR_GROUP" >/dev/null 2>&1; then
+        groupadd --system "$SBOXJR_GROUP" || return 1
+    fi
+    if ! getent passwd "$SBOXJR_USER" >/dev/null 2>&1; then
+        useradd --system --gid "$SBOXJR_GROUP" --home-dir /nonexistent \
+            --no-create-home --shell /usr/sbin/nologin "$SBOXJR_USER" || return 1
+        usermod -aG "$SBOXJR_JOURNAL_GROUP" "$SBOXJR_USER" || return 1
+        sboxjr_log "已创建系统身份 $SBOXJR_USER（nologin, /nonexistent, +$SBOXJR_JOURNAL_GROUP）"
+    fi
+    sbmon_sboxjr_validate_identity
+}
+
+# Data tree boundary (mirrors the monitor service-owned-tree rules):
+#   <root>          root:sbox-jr 0750 -- root-controlled parent only.
+#   <root>/state    0700 sbox-jr      -- reader-private (cursor state and
+#                   the fingerprint key): the web identity must NOT read it.
+#   <root>/out      2750 sbox-jr:sboxweb -- the exchange group is exactly
+#                   the Monitor READ side; setgid keeps reader-created
+#                   0640 files group-readable without any chown race.
+# Root only creates/converges directories whose PARENT it owns; it never
+# recurses and never follows a symlink.
+sbmon_sboxjr_ensure_data_tree() {
+    local d
+    for d in "$SBOXJR_DATA_ROOT" "$SBOXJR_STATE_DIR" "$SBOXJR_OUT_DIR"; do
+        if [ -L "$d" ]; then
+            sboxjr_die "$d 是符号链接：fail-closed，未做任何变更"
+            return 1
+        fi
+        if [ -e "$d" ] && [ ! -d "$d" ]; then
+            sboxjr_die "$d 已存在但不是目录：fail-closed，未做任何变更"
+            return 1
+        fi
+        mkdir -p -- "$d" || return 1
+        if [ -L "$d" ] || [ ! -d "$d" ]; then
+            sboxjr_die "$d 不是真实目录：fail-closed"
+            return 1
+        fi
+    done
+    if [ "$SBMON_FIXTURE" = "1" ]; then
+        return 0
+    fi
+    chown "root:$SBOXJR_GROUP" "$SBOXJR_DATA_ROOT" || return 1
+    chmod 0750 "$SBOXJR_DATA_ROOT" || return 1
+    chown "$SBOXJR_USER:$SBOXJR_GROUP" "$SBOXJR_STATE_DIR" || return 1
+    chmod 0700 "$SBOXJR_STATE_DIR" || return 1
+    chown "$SBOXJR_USER:${SBMON_GROUP:-sboxweb}" "$SBOXJR_OUT_DIR" || return 1
+    chmod 2750 "$SBOXJR_OUT_DIR" || return 1
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Staging + unit (same render / atomic-install / never-auto-activate
+# discipline as the monitor unit; enable/start are DELIBERATELY ABSENT here
+# -- PR-2B's activation runbook owns them).
+# ---------------------------------------------------------------------------
+sbmon_sboxjr_stage_code() {
+    local src_mod="$DEPLOY_DIR/../journal_reader"
+    local src_bin="$DEPLOY_DIR/app-bin/sbox-journal-reader"
+    local staging="$SBOXJR_LIB_DIR.staging.$$"
+    if [ ! -d "$src_mod" ] || [ ! -f "$src_bin" ]; then
+        sboxjr_die "源码树不完整（journal_reader/ 或 app-bin 入口缺失）"
+        return 1
+    fi
+    rm -rf -- "$staging"
+    mkdir -p -- "$staging/journal_reader" || return 1
+    # Explicit file list (never a wildcard copy of a directory that could
+    # gain __pycache__ or stray artifacts between listing and copying).
+    local f
+    for f in __init__.py codes.py cursor.py journal_time.py normalize.py \
+             classifier.py fingerprint.py eligibility.py schema.py \
+             state.py reader.py ingest_contract.py; do
+        if [ ! -f "$src_mod/$f" ]; then
+            rm -rf -- "$staging"
+            sboxjr_die "缺少模块 $f"
+            return 1
+        fi
+        install -m 0644 "$src_mod/$f" "$staging/journal_reader/$f" || {
+            rm -rf -- "$staging"
+            return 1
+        }
+    done
+    install -m 0755 "$src_bin" "$staging/sbox-journal-reader" || {
+        rm -rf -- "$staging"
+        return 1
+    }
+    if [ -e "$SBOXJR_LIB_DIR" ]; then
+        if diff -r -- "$staging" "$SBOXJR_LIB_DIR" >/dev/null 2>&1; then
+            rm -rf -- "$staging"
+            sboxjr_log "运行时代码无变化"
+            return 0
+        fi
+        rm -rf -- "${SBOXJR_LIB_DIR:?}.old.$$"
+        mv "$SBOXJR_LIB_DIR" "${SBOXJR_LIB_DIR}.old.$$" || return 1
+    fi
+    mv "$staging" "$SBOXJR_LIB_DIR" || return 1
+    rm -rf -- "${SBOXJR_LIB_DIR:?}.old.$$"
+    sboxjr_log "运行时代码已暂存: $SBOXJR_LIB_DIR"
+    return 0
+}
+
+sbmon_sboxjr_render_unit() {
+    sed -e "s|@SBJR_USER@|$SBOXJR_USER|g" \
+        -e "s|@SBJR_GROUP@|$SBOXJR_GROUP|g" \
+        -e "s|@SBJR_LIBEXEC@|$SBOXJR_LIB_DIR|g" \
+        -e "s|@SBJR_DATA_ROOT@|$SBOXJR_DATA_ROOT|g" \
+        -e "s|@SBJR_WATCHED_UNIT@|$SBOXJR_WATCHED_UNIT|g" \
+        "$DEPLOY_DIR/singbox-journal-reader.service.in"
+}
+
+SBOXJR_UNIT_CHANGED=0
+
+sbmon_sboxjr_install_unit() { # rc 0 ok / 1 failed; NEVER enables or starts
+    local rendered
+    rendered="$(sbmon_sboxjr_render_unit)" || return 1
+    if [ -e "$SBOXJR_UNIT_FILE" ]; then
+        if [ "$(cat "$SBOXJR_UNIT_FILE" 2>/dev/null)" = "$rendered" ]; then
+            sboxjr_log "unit 无变化"
+            return 0
+        fi
+        cp -a -- "$SBOXJR_UNIT_FILE" "$SBOXJR_UNIT_FILE.bak.$(date +%Y%m%d%H%M%S)" || return 1
+        sboxjr_warn "unit 已存在且内容变化，已备份旧 unit 后覆盖"
+    fi
+    if ! sbmon_atomic_write "$SBOXJR_UNIT_FILE" 0644 <<< "$rendered"; then
+        sboxjr_warn "unit 原子写入失败"
+        return 1
+    fi
+    # shellcheck disable=SC2034  # consumed by the (future PR-2B) caller
+    SBOXJR_UNIT_CHANGED=1
+    sbmon_systemctl daemon-reload || return 1
+}
+
+# Non-mutating postcondition probe: the reader identity's EFFECTIVE groups
+# carry $SBOXJR_JOURNAL_GROUP (that membership, not any root-side reading,
+# is what grants journal access). Runs as the reader identity via runuser.
+sbmon_sboxjr_readability_probe() {
+    if [ "$SBMON_FIXTURE" = "1" ]; then
+        sboxjr_log "fixture: 可读性探针跳过（真实语义由根 Linux CI 门保证）"
+        return 0
+    fi
+    if ! command -v "$SBOXJR_RUNUSER" >/dev/null 2>&1; then
+        sboxjr_die "缺少 runuser，无法执行身份探针"
+        return 1
+    fi
+    if ! "$SBOXJR_RUNUSER" -u "$SBOXJR_USER" -- id -nG 2>/dev/null \
+        | tr ' ' '\n' | grep -Fxq "$SBOXJR_JOURNAL_GROUP"; then
+        sboxjr_die "$SBOXJR_USER 有效组缺少 $SBOXJR_JOURNAL_GROUP"
+        return 1
+    fi
+    return 0
+}
