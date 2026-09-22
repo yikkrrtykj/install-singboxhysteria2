@@ -524,12 +524,15 @@
     if (!background) state.e3Status = null;
     renderE3Controls();
     return api("/api/v1/management/status").then(function (data) {
-      if (generation !== state.e3StatusGeneration) return;
+      // Retired if superseded by a newer read OR a convergence owns the
+      // view right now (0.1.4 review: a poll started inside the convergence
+      // window must never land a stale status before the convergence does).
+      if (generation !== state.e3StatusGeneration || state.e3Convergence) return;
       state.e3Status = data;
       state.e3StatusAt = Date.now();
       renderE3Controls();
     }).catch(function () {
-      if (generation !== state.e3StatusGeneration) return;
+      if (generation !== state.e3StatusGeneration || state.e3Convergence) return;
       state.e3Status = null;
       renderE3Controls();
     });
@@ -557,11 +560,11 @@
     var generation = state.e3ClientsGeneration =
         (state.e3ClientsGeneration || 0) + 1;
     return api("/api/v1/clients").then(function (data) {
-      if (generation !== state.e3ClientsGeneration) return;
+      if (generation !== state.e3ClientsGeneration || state.e3Convergence) return;
       state.e3Clients = data;
       renderE3Clients(data);
     }).catch(function (error) {
-      if (generation !== state.e3ClientsGeneration) return;
+      if (generation !== state.e3ClientsGeneration || state.e3Convergence) return;
       // B4: only error/fixed text here -- never an undefined variable.
       var body = $("e3-clients-body");
       body.innerHTML = "";

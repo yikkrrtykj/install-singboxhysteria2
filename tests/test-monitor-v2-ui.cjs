@@ -311,6 +311,42 @@ async function main() {
     assert.doesNotMatch(addThen, /loadE3Clients\(\);|loadE3Status\(\);/);
     assert.doesNotMatch(delThen, /loadE3Clients\(\);|loadE3Status\(\);/);
   });
+  // 0.1.4 review blocker: a watchdog/manual read that STARTS inside the
+  // convergence window and lands BEFORE the convergence must not commit.
+  setStatus(healthy());
+  ui.state.e3Clients = clients; ui.renderE3Clients(clients);
+  let finishConv;
+  responses.push(response({}), () => new Promise(res => { finishConv = res; }));
+  ui.addClient('bob');
+  await flush();   // the held convergence fetch is now in flight
+  check('the convergence window is open: token active, fetch pending', () => {
+    assert.ok(ui.state.e3Convergence);
+    assert.equal(requests.slice(-1)[0].url, '/api/v1/clients/convergence');
+  });
+  responses.push(response({transport: 'stale'}),                    // watchdog: stale
+                 response({transport: 'fresh', data: {clients: []}})); // list: old/empty
+  const winStatus = ui.loadE3Status(true);   // watchdog-style start mid-window
+  const winList = ui.loadE3Clients();        // manual list start mid-window
+  await winStatus; await winList; await flush();
+  check('ordinary reads landing mid-window cannot regress the held view', () => {
+    assert.equal(ids['e3-availability'].textContent, 'Available');
+    assert.equal(ids['e3-add-btn'].disabled, false);
+    assert.equal(ids['e3-clients-body'].children.length, 2);
+    assert.match(ids['e3-clients-body'].textContent, /Download/);
+    assert.doesNotMatch(ids['e3-clients-body'].textContent, /No clients found/);
+  });
+  finishConv(conv(healthy(), withBob));
+  await flush();
+  check('the convergence then applies its fresh status+list atomically', () => {
+    assert.equal(ids['e3-availability'].textContent, 'Available');
+    assert.ok(!ui.state.e3Convergence);
+    assert.equal(ids['e3-clients-body'].children.length, 3);
+    const row = ids['e3-clients-body'].children[2];
+    assert.match(row.textContent, /bob/);
+    assert.match(row.textContent, /Download/);
+    assert.match(row.textContent, /Delete/);
+    productText();
+  });
   // ---- M4 export: the Download button end to end --------------------------
   setStatus(healthy());
   const urlsBefore = createdUrls.length;
@@ -378,6 +414,6 @@ async function main() {
     assert.ok(!ids['mg-activate'] && !ids['mg-deactivate']);
     assert.ok(requests.every(r => !/management\/(activate|deactivate)/.test(r.url))); productText();
   });
-  assert.equal(count, 47, 'UI assertion count guard');
+  assert.equal(count, 50, 'UI assertion count guard');
 }
 main().catch(err => { console.error(err); process.exitCode = 1; });

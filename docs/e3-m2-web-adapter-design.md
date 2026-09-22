@@ -376,6 +376,10 @@ broker   : E3Broker.status(force=False)。force=True 仅绕过 TTL 快速路径�
            ② supersedePlainReads() 在收敛开始与应用时各抬升一次
            e3StatusGeneration/e3ClientsGeneration——watchdog 或任何在途
            普通 status/list 读的旧响应一律作废（含收敛窗口内新发的读）；
+           普通读在 commit 时额外拒绝：若 state.e3Convergence 非空（有收敛
+           正持有视图），即便其自身 generation 仍是当前值也丢弃结果——否则
+           一个在窗口内启动、抢在收敛之前落地的 watchdog/手动读会渲染出中间
+           stale 视图，正是要消除的可见闪烁（0.1.4 评审阻塞点）；
            ③ state.e3Convergence 身份令牌——重叠的收敛后发制前发。
 失败     : fail-closed——清 e3Status ⇒ 不可写；列表行保留但无操作按钮；
            无 sleep、无重试循环、绝无假 Available；绝不写 #e3-msg，
