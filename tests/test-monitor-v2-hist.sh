@@ -28,7 +28,7 @@ export WEBAPP="$ROOT/monitor-v2/webapp.py"
 
 PASS=0
 FAIL=0
-EXPECTED_PASS=130
+EXPECTED_PASS=132
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
@@ -1018,10 +1018,31 @@ def group_concurrency():
     clock jumps past the 5s cadence each time) races four tight-loop
     readers, while close() lands mid-flight. Without the shared lock the
     writer/reader threads raise on the torn or closed shared connection;
-    with it, zero thread exceptions and zero recorded failures."""
+    with it, zero thread exceptions and zero recorded failures.
+
+    Harness rule: the writer never calls the lock-held private _cleanup()
+    primitive itself -- that unlocked call raced the readers on the shared
+    sqlite3 connection and segfaulted nondeterministically. Cleanup runs
+    only via the formal locked on_publish() path: cleanup_interval=30
+    plus the 6s/publish clock advance fires the production
+    _on_publish_locked -> _cleanup("periodic") branch every 5th publish
+    mid-contention, and retention_seconds=300 makes each pass do REAL
+    DELETE work. The counting wrapper below is observation-only evidence
+    cleanup ran."""
     out = {}
     t = [T0]
-    h = tmp_history(clock=lambda: t[0], heartbeat_interval=1e9)
+    h = tmp_history(clock=lambda: t[0], heartbeat_interval=1e9,
+                    cleanup_interval=30.0, retention_seconds=300.0)
+    cleanup_calls = {}
+    counter_lock = threading.Lock()
+    real_cleanup = h._cleanup
+
+    def counting_cleanup(phase):
+        with counter_lock:
+            cleanup_calls[phase] = cleanup_calls.get(phase, 0) + 1
+        return real_cleanup(phase)
+
+    h._cleanup = counting_cleanup
     h.open()
     errors = []
     stop = threading.Event()
@@ -1033,8 +1054,6 @@ def group_concurrency():
                 n += 1
                 t[0] = T0 + n * 6.0
                 h.on_publish(snap(active_vless=n % 4), n)
-                if n % 90 == 0:
-                    h._cleanup("stress")   # retention/VACUUM under readers
         except BaseException as exc:
             errors.append("writer:%r" % exc)
 
@@ -1083,6 +1102,10 @@ def group_concurrency():
     out["rows_durable_through_close"] = len(s2) >= 10
     out["privacy_under_contention"] = not any(
         s.encode() in raw_db_bytes(h) for s in SENTINELS)
+    # explicit evidence the retention path ran during the race (observed,
+    # never invoked directly by the writer)
+    out["cleanup_ran_under_contention"] = cleanup_calls.get("periodic", 0) >= 3
+    out["startup_cleanup_ran_once"] = cleanup_calls.get("startup", 0) == 1
     h2.close()
     return out
 
@@ -1334,6 +1357,8 @@ check 'd["zero_failures_under_contention"]' "B1: failure_count stays 0 through t
 check 'd["close_midflight_soft"]' "B1: reads racing/during close() stay soft and empty, never raise"
 check 'd["rows_durable_through_close"]' "B1: rows committed before close() reopen readable (no torn tx)"
 check 'd["privacy_under_contention"]' "B1: sentinels still absent from raw DB bytes after stress"
+check 'd["cleanup_ran_under_contention"]' "B1-fix: periodic cleanup fired via locked on_publish path mid-contention (observed, not invoked)"
+check 'd["startup_cleanup_ran_once"]' "B1-fix: startup cleanup observed exactly once"
 
 printf '\n== RESULT: %d passed, %d failed ==\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] && [ "$PASS" -eq "$EXPECTED_PASS" ] || { printf '  (failures, or a section did not fully run)\n'; exit 1; }
