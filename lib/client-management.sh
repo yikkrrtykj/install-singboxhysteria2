@@ -653,6 +653,7 @@ proxies:
 proxy-groups:
   - name: 节点选择
     type: select
+    default-selected: 自动选择
     proxies:
       - Reality
       - Hysteria2
@@ -660,13 +661,15 @@ proxy-groups:
       - DIRECT
 
   - name: 自动选择
-    type: url-test
+    type: fallback
     proxies:
       - Reality
       - Hysteria2
-    url: "http://www.gstatic.com/generate_204"
-    interval: 300
-    tolerance: 50
+    url: "https://www.gstatic.com/generate_204"
+    interval: 60
+    timeout: 5000
+    lazy: false
+    expected-status: "204"
 
 
 rules:
