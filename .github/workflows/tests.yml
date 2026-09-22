@@ -68,6 +68,7 @@ jobs:
           bash -n tests/e3/test-m1-systemd.sh
           bash -n tests/e3/test-m2-live.sh
           bash -n tests/test-monitor-v2-m2.sh
+          bash -n tests/test-monitor-v2-hist.sh
           bash -n tests/e3/test-m3-deploy.sh
           bash -n tests/e3/test-m3c-phase1.sh
           bash -n tests/e3/test-m3c-phase2.sh
@@ -182,6 +183,9 @@ jobs:
 
       - name: "E3 M2 web adapter contract suite (broker / breaker / auth / HTTP adapter)"
         run: bash tests/test-monitor-v2-m2.sh
+
+      - name: "0.2.0 incident history suite (storage / privacy / cadence / retention / failure / read endpoint, issue #33 P1)"
+        run: bash tests/test-monitor-v2-hist.sh
 
   # ---------------------------------------------------------------------
   # Lane D -- compatibility matrix. Runs on the three supported Ubuntu LTS

@@ -2454,5 +2454,85 @@ else
 fi
 fi
 
+section "T26 production-real upgrade: installed 0.1.5 -> repo VERSION (isolated fixture, 0.2.0)"
+# Same production-real discipline as T25, one release step later: a server
+# running the 0.1.5 target-binding delete UX now moves to the 0.2.0
+# incident-history candidate. The upgrade surface is unchanged: same atomic
+# release switch, ZERO sbox-cm/helper actions, and the retained 0.1.5
+# release tree stays byte-identical.
+T26_NEW_VER="$(cat "$REPO_ROOT/monitor-v2/VERSION")"
+T26="$TMP/t26"
+T26_APP="$T26/opt/singbox-monitor"
+T26_REL="$T26/opt/singbox-monitor-releases"
+T26_LOG="$TMP/out-t26.log"
+T26_CALLS="$TMP/t26-calls.log"
+if [ "$SYMLINKS_OK" != 1 ]; then
+    printf '  SKIP T26 原子升级流（此平台无符号链接；Linux pass 是门禁）\n'
+else
+(
+    mkdir -p "$T26/etc/systemd/system" "$T26/src"
+    cp "$REPO_ROOT/monitor-v2/collector.py" "$REPO_ROOT/monitor-v2/webapp.py" "$T26/src/"
+    cp -R "$REPO_ROOT/monitor-v2/web" "$REPO_ROOT/monitor-v2/api_bridge" "$T26/src/"
+    rm -rf "$T26/src/api_bridge/__pycache__" "$T26/src/web/__pycache__"
+    printf '0.1.5\n' > "$T26/src/VERSION"
+    export SBMON_APP_LINK="$T26_APP"
+    export SBMON_RELEASES_DIR="$T26_REL"
+    export SBMON_STATE_ROOT="$T26/var/lib/singbox-monitor"
+    export SBMON_STATE_DIR="$T26/var/lib/singbox-monitor"
+    export SBMON_CONF_DIR="$T26/etc/singbox-monitor"
+    export SBMON_UNIT_FILE="$T26/etc/systemd/system/singbox-monitor.service"
+    export SBMON_BACKUP_ROOT="$T26/var/backups/singbox-monitor"
+    export SBMON_REPO_MONITOR_DIR="$T26/src"
+    export SBMON_VERSION_FILE="$T26/src/VERSION"
+    export SBMON_LOCK_FILE="$T26/deploy.lock"
+    export MOCK_CALL_LOG="$T26_CALLS"
+    : > "$T26_CALLS"
+    "$INSTALL_MONITOR" install > "$TMP/out-t26-base.log" 2>&1 || exit 1
+    base_dir="$(readlink -f "$T26_APP")"
+    [ -n "$base_dir" ] || exit 1
+    printf '%s\n' "$base_dir" > "$TMP/t26-basedir"
+    find "$base_dir" -type f -exec sha256sum {} + | sort | sha256sum | cut -d' ' -f1 \
+        > "$TMP/t26-basehash"
+    grep -c 'systemctl restart singbox-monitor' "$T26_CALLS" > "$TMP/t26-restarts-before" || true
+    cp "$REPO_ROOT/monitor-v2/VERSION" "$T26/src/VERSION"
+    "$INSTALL_MONITOR" upgrade > "$T26_LOG" 2>&1 || exit 1
+)
+rc=$?
+if [ "$rc" != 0 ]; then
+    fail "isolated 0.1.5 install + $T26_NEW_VER upgrade failed (rc=$rc): $(tail -n 5 "$TMP/out-t26-base.log" 2>/dev/null | tr '\n' ' ')"
+else
+    pass "isolated 0.1.5 install + $T26_NEW_VER upgrade succeed (rc 0)"
+    if [ "$T26_NEW_VER" != '0.1.5' ]; then
+        pass "the repo candidate ($T26_NEW_VER) really differs from the 0.1.5 baseline (the real production delta)"
+    else
+        fail "T26 candidate equals the 0.1.5 baseline -- the fixture tests no delta"
+    fi
+    assert_eq "$T26_NEW_VER" "$(cat "$T26_APP/VERSION" 2>/dev/null)" "the new immutable $T26_NEW_VER release is active"
+    if [ -f "$T26_APP/app/monitor-v2/web/incident_history.py" ]; then
+        pass "0.2.0 release stages the new web/incident_history.py module (whole-web/-R copy)"
+    else
+        fail "incident_history.py missing from the staged $T26_NEW_VER release"
+    fi
+    assert_eq '0.1.5' "$(cat "$T26_REL/0.1.5-"*/VERSION 2>/dev/null | head -n 1)" "the 0.1.5 baseline release tree still reports 0.1.5"
+    assert_grep 'action=upgrade' "$T26_LOG" "normal install-monitor.sh upgrade reports action=upgrade"
+    BASE_DIR_T26="$(cat "$TMP/t26-basedir" 2>/dev/null || true)"
+    if [ -n "$BASE_DIR_T26" ] && [ "$(readlink -f "$T26_APP")" != "$BASE_DIR_T26" ] \
+       && [ -d "$BASE_DIR_T26" ] \
+       && [ "$(cat "$TMP/t26-basehash")" = "$(find "$BASE_DIR_T26" -type f -exec sha256sum {} + | sort | sha256sum | cut -d' ' -f1)" ]; then
+        pass "previous 0.1.5 release retained byte-identical beside the new $T26_NEW_VER release (retention within KEEP)"
+    else
+        fail "T26 reused or damaged the previous 0.1.5 release"
+    fi
+    assert_eq "$(( $(cat "$TMP/t26-restarts-before") + 1 ))" \
+        "$(grep -c 'systemctl restart singbox-monitor' "$T26_CALLS")" \
+        "the upgrade restarted singbox-monitor exactly once"
+    assert_no_grep 'sing-box' "$T26_CALLS" "the upgrade never restarted or reloaded sing-box"
+    assert_no_grep 'sbox-cm' "$T26_CALLS" "the upgrade ran ZERO sbox-cm/helper systemctl actions (Monitor-only boundary)"
+    assert_no_grep 'helper' "$T26_LOG" "the upgrade log records no helper deployment or update"
+    assert_grep ' 0\.1\.5 fresh$' "$T26_REL/releases.history" "the 0.1.5 baseline release is recorded in history"
+    assert_grep " ${T26_NEW_VER//./\\.} upgrade\$" "$T26_REL/releases.history" "the $T26_NEW_VER upgrade is recorded in history"
+fi
+fi
+
 printf '\n== RESULT: %d passed, %d failed ==\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

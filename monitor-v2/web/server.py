@@ -29,20 +29,22 @@ import datetime
 import hashlib
 import hmac
 import json
+import math
 import re
 import sys
 import traceback
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from web.access import host_entry_for_ip
 from web.e3_broker import BrokerUnavailable
 from web.e3rpc import RpcTransportError
+from web.incident_history import QUERY_LIMIT_DEFAULT, QUERY_LIMIT_MAX
 from web.recovery import (RECOVERY_SUCCESS_MESSAGE, RecoveryGlobalGuard,
                           RecoveryRateLimiter, generate_key)
 
-MONITOR_WEB_VERSION = "0.1.5"
+MONITOR_WEB_VERSION = "0.2.0"
 SESSION_COOKIE = "monitor_session"
 MAX_BODY_BYTES = 65536
 SUPPORTED_METHODS = "GET, POST"
@@ -126,6 +128,34 @@ def normalize_path(raw_path):
     return path
 
 
+def timeline_query_params(query):
+    """Validate the ONLY accepted timeline params: (error, since, limit).
+
+    Unknown query keys are IGNORED -- never interpreted as filters, so no
+    arbitrary filter, field or SQL surface can be expressed through the
+    URL. limit is hard-capped; since must be a finite non-negative epoch.
+    """
+    since = None
+    if "since" in query:
+        try:
+            since = float(query["since"][0])
+        except (TypeError, ValueError):
+            return "since must be a numeric epoch", None, None
+        if not math.isfinite(since) or since < 0:
+            return "since must be a finite non-negative epoch", None, None
+    limit = QUERY_LIMIT_DEFAULT
+    if "limit" in query:
+        raw = query["limit"][0]
+        try:
+            limit = int(raw)
+        except (TypeError, ValueError):
+            return "limit must be an integer", None, None
+        if limit < 1:
+            return "limit must be at least 1", None, None
+        limit = min(limit, QUERY_LIMIT_MAX)
+    return None, since, limit
+
+
 def iso_utc(epoch):
     """Epoch seconds -> ISO-8601 UTC (``...Z``); None stays None."""
     if epoch is None:
@@ -187,13 +217,17 @@ class MonitorWebApp:
 
     def __init__(self, broker, access, static_dir, auth=None,
                  remote_mode=False, version=MONITOR_WEB_VERSION,
-                 recovery_guard=None, management_active=None, e3_broker=None):
+                 recovery_guard=None, management_active=None, e3_broker=None,
+                 incident_history=None):
         self.broker = broker
         self.access = access
         self.auth = auth
         self.static_dir = static_dir
         self.remote_mode = remote_mode
         self.version = version
+        # Issue #33 P1: the bounded incident timeline. Injectable; None
+        # (standalone harnesses) keeps the read endpoint a clean 503.
+        self.incident_history = incident_history
         self.recovery_limiter = RecoveryRateLimiter()
         self.recovery_guard = recovery_guard or RecoveryGlobalGuard()
         # ``management_active`` is an ORTHOGONAL boolean to ``monitor_running``
@@ -422,6 +456,11 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/v1/clients/convergence":
             self._require_session(self._handle_e3_convergence)
             return
+        # 0.2.0 (#33 P1): the incident-timeline read (session-gated, GET-only,
+        # bounded since/limit -- no arbitrary SQL, no arbitrary filters).
+        if path == "/api/v1/diagnostics/timeline":
+            self._require_session(self._handle_diagnostics_timeline)
+            return
         # M4: the export endpoint exists but is POST-only. A GET there is a
         # method error on a known route, not a static miss -- answering 404
         # would make the endpoint look absent to anything probing the
@@ -504,6 +543,10 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             # 0.1.4: GET-only. A POST on this route is a method error, not a
             # silent 404 -- the convergence read is a pure read and must
             # never acquire mutation-looking semantics.
+            self._method_not_allowed(allowed="GET")
+            return
+        if path == "/api/v1/diagnostics/timeline":
+            # 0.2.0: same GET-only semantics as the convergence route.
             self._method_not_allowed(allowed="GET")
             return
         self._send_json(404, {"error": "not found"})
@@ -641,6 +684,34 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         if creds["fp"]:
             actor["stepup_fp"] = creds["fp"]
         handler(session, *args, actor)
+
+    def _handle_diagnostics_timeline(self, session):
+        """GET /api/v1/diagnostics/timeline[?since=<epoch>&limit=<int>]
+
+        0.2.0 (#33 P1): session-gated, read-only view of the bounded
+        incident timeline. The response shape is a deny-by-default
+        whitelist: exactly the sanitized columns that were PERSISTED,
+        plus the category-level history health. Connection ids, source /
+        destination addresses and any credential can never appear here
+        for the same reason they can never appear in the database.
+        """
+        history = self.app.incident_history
+        if history is None:
+            self._send_json(503, {"error": "incident history not enabled"})
+            return
+        error, since, limit = timeline_query_params(
+            parse_qs(urlsplit(self.path).query))
+        if error is not None:
+            self._send_json(400, {"error": error})
+            return
+        result = history.query_timeline(since=since, limit=limit)
+        self._send_json(200, {
+            "history": history.health(),
+            "samples": result["samples"],
+            "device_states": result["device_states"],
+            "truncated": result["truncated"],
+            "limit": result["limit"],
+        })
 
     def _cross_origin(self):
         """True when the browser declared a foreign Origin (second CSRF
