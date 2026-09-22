@@ -168,7 +168,11 @@ v4 → D1–D5 → **v5 (5777432304)** → 签署 (5777527361, APPROVED/FROZEN)�
 - tests.yml：fast-checks `bash -n` ×2；monitor-regression 新增本套件步骤；
   兼容矩阵在既有 systemd readiness gate 之后新增 `sudo -n env
   SBOX_JR_REQUIRE_LIVE=1 bash tests/journal-reader/test-jr-live.sh`。
-- LIVE 脚本（仅三基线）：L2 真实 journalctl 尾游标遥测（真实 `-- cursor:`
+- LIVE 脚本（仅三基线）：JSON 输出一律 `-o json` ——journalctl 长选项表已
+  对 v249/v255/v258 源码核验，**不存在 `--output-format`**（getopt 立即
+  EINVAL，毫秒级 rc≠0；首轮 CI 的 L3/L6 红即此缺陷，曾被误读为游标契约
+  破裂）。失败路径打印 rc + stderr 首两行，游标值经 sed `<cursor-redacted>`
+  脱敏。L2 真实 journalctl 尾游标遥测（真实 `-- cursor:`
   framing 提取 + D5 校验器 + 4096 上界假设探针，观测值断言 <4096，不钉死；
   游标值经 0600 文件传给校验器，绝不进 argv/日志）；L3 `--after-cursor` 对
   不透明游标的原样接受；L4 真实 Reader 先 `startup()` 再两个周期（状态
@@ -177,10 +181,14 @@ v4 → D1–D5 → **v5 (5777432304)** → 签署 (5777527361, APPROVED/FROZEN)�
   周期零移动 + hb）；L5 渲染后 unit 过 `systemd-analyze verify`（镜像生产
   步的 UNRELATED_NOISE fail-closed rc 契约）与支持基线上的 `security
   --offline`；**L6（B9，review #46）**：在三基线 runner 上创建一次性
-  exact-shape `sbox-jr` 身份（nologin/非目录主组/精确组集，先断言形状），
-  再经 `runuser -u sbox-jr` 实证尾游标提取、`--after-cursor` 跟随、非 root
-  解码真实条目、以及完整 Reader 周期（C5 选源 + C1 配方 + state 0600 +
-  32B 键 0600）——root journalctl 不作为该权限证明的替代，全程无 root
+  exact-shape `sbox-jr` 身份（nologin//nonexistent home/主组 sbox-jr/精确组集，先断言形状），
+  再经 `runuser -u sbox-jr` 实证尾游标提取；随后以 `systemd-cat` 注入
+  **一条确定性探针日志**，要求该身份在自己尾游标的严格之后 decode ≥1 条
+  `__CURSOR`（quiet unit 不可能饿死该证明），再跑完整 Reader 周期（C5 选源
+  + C1 配方 + state 0600 + 32B 键 0600）。Reader 周期所用的 `journal_reader`
+  包先复制进 `$TMP/l6-lib`（`a+rX`，`$TMP` 设 0711 仅供穿越）——一次性系统
+  用户不可穿越 runner 的 home 树，直接 PYTHONPATH 进仓库会静默
+  ModuleNotFoundError。root journalctl 不作为该权限证明的替代，全程无 root
   fallback，证明完毕立即 userdel/groupdel 并断言无残留。临时 sing-box.
   service mock 仅在缺失时创建、退出时删除；不 enable/start 任何单元。
 
@@ -205,4 +213,11 @@ root fallback、不触碰生产 VPS。
 | B6 | 非空行 decode 失败或游标不可用 ⇒ 整批 `journal_cursor_invalid` 且优先于 rc；`pfail` 只记载荷缺陷条目 | d1 组 +8（含"游标绝不跨过坏行"“payload-only 仍提交”） |
 | B7 | wrapper 冻结 `SBJR_LIB_DIR`/`SBJR_PYTHON3` 常量，删除全部运行时 env 面 | S1 +2（常量正判 + `${SBOXJR_`/`PYTHONPATH:+` 负判） |
 | B8 | hmac.key：symlink/非常规/fstat/0600/恰 32B/写失败删半成品/竞争仅走安全装载/双 fsync | fp 组 +12（unittest.mock 注入，平台稳定） |
-| B9 | LIVE 新增 L6：CI-only 一次性 exact-shape 身份，`runuser` 实证读权限 + 完整 Reader 周期，root 不可替代，用后即删 | 三基线矩阵 LIVE 门 |
+| B9 | LIVE 新增 L6：CI-only 一次性 exact-shape 身份，`runuser` 实证读权限 + 确定性探针条目（尾游标后注入一条 `systemd-cat` 日志并要求严格之后 decode）+ 完整 Reader 周期（包副本 staging），root 不可替代，用后即删 | 三基线矩阵 LIVE 门 |
+
+首轮 CI（HEAD e9f61f6）另暴露一处 LIVE harness 自身缺陷：journalctl 不存在
+`--output-format` 长选项（v249/v255/v258 选项表源码核验），L3/L6 三条命令
+毫秒级 EINVAL 被误呈现为"游标契约破裂/无条目可读"；同时一次性身份不可穿越
+runner home 树，PYTHONPATH 直指仓库导致静默 ModuleNotFoundError。两者均按
+上表 §9 的 `-o json` + 脱敏诊断 + staging 副本修复——修复的是证明的呈现
+管道，不改变任何被证明的契约。

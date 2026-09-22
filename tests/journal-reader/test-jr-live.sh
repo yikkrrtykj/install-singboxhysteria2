@@ -13,6 +13,12 @@
 #       pin). The cursor value is never echoed into a PASS/FAIL message.
 #   L3  --after-cursor round-trip: journalctl accepts an opaque cursor it
 #       never produced itself in this process (no format assumptions).
+#       JSON is requested via `-o json`: the journalctl long-option tables
+#       are source-checked on all three baselines (v249/v255/v258 know only
+#       --output / --output-fields; a nonexistent long option exits EINVAL
+#       in milliseconds -- that bug must never masquerade as a contract
+#       failure again). Failure paths echo rc + stderr with the cursor
+#       value redacted.
 #   L4  one real Reader cycle against the real journal in throwaway dirs:
 #       C1 recipe leaves committed valid + pending/scratch absent, state
 #       files are 0600, every ev file validates through the strict schema,
@@ -26,12 +32,17 @@
 #       supplementary systemd-journal and nothing else) is created on the
 #       runner and every journal read -- tail cursor, --after-cursor and a
 #       full Reader cycle -- is re-proven THROUGH THAT IDENTITY via
-#       runuser. Root journalctl never stands in for this proof; there is
-#       no root fallback. The identity is deleted on the spot.
+#       runuser. Determinism comes from ONE freshly emitted probe entry:
+#       the identity must decode it strictly after its own tail cursor.
+#       The reader package is copied into a world-readable staging dir
+#       because a disposable system user may not traverse the runner's
+#       home tree. Root journalctl never stands in for this proof; there
+#       is no root fallback. The identity is deleted on the spot.
 # PR-2A DARK: this script touches NO production host and installs nothing
 # persistent: only a disposable runner mock of sing-box.service (needed so
-# After= resolves in verify) and the disposable L6 identity are created,
-# and both are removed on the spot / at exit.
+# After= resolves in verify), the disposable L6 identity, one CI probe
+# journal line and throwaway /tmp staging are created; the identity is
+# removed on the spot and everything else lives under mktemp -d.
 set -uo pipefail
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -152,11 +163,14 @@ FIRST_CUR="$(printf '%s\n' "$CURSORS" | grep -v '^$' | head -n1)"
 if [ -z "$FIRST_CUR" ]; then
     fail "no validated cursor available for --after-cursor round-trip"
 else
+    L3_ERR="$TMP/l3.err"
     if journalctl -u systemd-journald.service --after-cursor "$FIRST_CUR" \
-        -n 10 --output-format json >/dev/null 2>&1; then
+        -n 10 -o json >/dev/null 2>"$L3_ERR"; then
         pass "journalctl accepted the opaque cursor verbatim in --after-cursor (no format assumption)"
     else
-        fail "journalctl rejected our own validated cursor in --after-cursor (source contract broken)"
+        l3rc=$?
+        l3msg="$(sed -e "s|$FIRST_CUR|<cursor-redacted>|g" "$L3_ERR" | head -n 2 | tr '\n' ' ')"
+        fail "journalctl rejected our own validated cursor in --after-cursor (rc=$l3rc stderr=$l3msg)"
     fi
 fi
 
@@ -277,7 +291,7 @@ L6_USER="sbox-jr"
 L6_GROUP="sbox-jr"
 L6_JGROUP="systemd-journal"
 L6_OK=1
-for tool in runuser useradd usermod groupadd userdel groupdel; do
+for tool in runuser useradd usermod groupadd userdel groupdel systemd-cat; do
     command -v "$tool" >/dev/null 2>&1 || { fail "L6 prerequisite missing: $tool"; L6_OK=0; }
 done
 if [ "$L6_OK" = "1" ]; then
@@ -342,28 +356,44 @@ if [ "$L6_OK" = "1" ]; then
         L6_OK=0
     fi
     if [ "$L6_OK" = "1" ]; then
-        if runuser -u "$L6_USER" -- journalctl -u systemd-journald.service \
-               --after-cursor "$L6_TAIL" -n 10 --output-format json >/dev/null 2>&1; then
-            pass "$L6_USER performed an --after-cursor follow read on the real journal"
+        # Determinism: emit ONE fresh probe entry, then require the
+        # identity to decode it strictly after its own tail cursor -- a
+        # quiet unit's own logging can never starve this proof.
+        printf 'sbox-journal-reader CI permission probe\n' \
+            | systemd-cat -t sboxjr-ci-probe 2>/dev/null || true
+        sleep 0.3
+        L6_READ="$TMP/l6-read.json"
+        L6_READ_ERR="$TMP/l6-read.err"
+        if runuser -u "$L6_USER" -- journalctl --after-cursor "$L6_TAIL" \
+               -n 200 -o json >"$L6_READ" 2>"$L6_READ_ERR"; then
+            pass "$L6_USER accepted its own opaque cursor in --after-cursor (source contract, no root fallback)"
         else
-            fail "$L6_USER --after-cursor read rejected"
+            l6rc=$?
+            l6msg="$(sed -e "s|$L6_TAIL|<cursor-redacted>|g" "$L6_READ_ERR" | head -n 2 | tr '\n' ' ')"
+            fail "$L6_USER --after-cursor read rejected (rc=$l6rc stderr=$l6msg)"
         fi
-        L6_N="$(runuser -u "$L6_USER" -- journalctl -u systemd-journald.service \
-            -n 5 --output-format json 2>/dev/null | grep -c '"__CURSOR"' || true)"
+        L6_N="$(grep -c '"__CURSOR"' "$L6_READ" || true)"
         if [ "${L6_N:-0}" -ge 1 ]; then
-            pass "$L6_USER decoded real journal entries (group read, not root)"
+            pass "$L6_USER decoded $L6_N real journal entries strictly after its cursor (group read, not root)"
         else
-            fail "$L6_USER read produced no decodable entries"
+            fail "$L6_USER after-cursor read produced no decodable entries"
         fi
     fi
     # One FULL Reader cycle as the reader identity: C5 source selection,
     # C1 recipe, 0600 state files and the R4 key all under sbox-jr only.
+    # The package is COPIED into a world-readable staging dir first: a
+    # disposable system user may not traverse the runner's home tree,
+    # and an unreadable PYTHONPATH surfaces as a silent ModuleNotFound.
     L6D="$TMP/l6"; SD6="$L6D/state"; OD6="$L6D/out"
-    mkdir -p "$SD6" "$OD6"
+    L6LIB="$TMP/l6-lib"
+    mkdir -p "$SD6" "$OD6" "$L6LIB"
+    cp -r "$ROOT/monitor-v2/journal_reader" "$L6LIB/journal_reader"
+    chmod -R a+rX "$L6LIB"
+    chmod 0711 "$TMP"   # traversal only; every payload dir keeps its own mode
     chown "$L6_USER:$L6_GROUP" "$L6D" "$SD6" "$OD6"
     chmod 0755 "$L6D"; chmod 0700 "$SD6"; chmod 0750 "$OD6"
     L6_OUT="$TMP/l6.out"; L6_ERR="$TMP/l6.err"
-    if runuser -u "$L6_USER" -- env PYTHONPATH="$ROOT/monitor-v2" \
+    if runuser -u "$L6_USER" -- env PYTHONPATH="$L6LIB" \
             "$PY" - "$SD6" "$OD6" >"$L6_OUT" 2>"$L6_ERR" <<'PY6'
 import os, sys
 from journal_reader import state
