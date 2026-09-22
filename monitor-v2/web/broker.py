@@ -87,7 +87,8 @@ class SnapshotBroker:
     """Owns the collector thread and the latest published snapshot."""
 
     def __init__(self, collector, poll_seconds=1.0, clock=time.time,
-                 health_threshold=None, health_file=None):
+                 health_threshold=None, health_file=None,
+                 incident_history=None):
         self._collector = collector
         self._poll = poll_seconds
         self._clock = clock
@@ -96,6 +97,9 @@ class SnapshotBroker:
         # Packaging health export (optional; standalone E2 passes None and
         # behaves exactly as before this parameter existed).
         self._health_file = health_file
+        # Incident history writer (issue #33 P1; optional like health_file --
+        # None keeps this runtime byte-for-byte in its prior behavior).
+        self._incident_history = incident_history
         self._lock = threading.Lock()       # tracker access
         self._cond = threading.Condition()  # snapshot publication
         self._version = 0
@@ -144,6 +148,7 @@ class SnapshotBroker:
                 version = self._version
                 self._cond.notify_all()
             self._export_health_file(snapshot, version)
+            self._record_history(snapshot, version)
             self._stop.wait(self._poll)
 
     def _export_health_file(self, snapshot, version):
@@ -186,6 +191,24 @@ class SnapshotBroker:
                         pass
         except OSError:
             return
+
+    def _record_history(self, snapshot, version):
+        """Incident-history publication hook (issue #33 P1).
+
+        Auxiliary by the SAME contract as the health export: the writer
+        only ever receives the decorated snapshot to project its
+        whitelisted, sanitized aggregates from, and a history failure can
+        NEVER kill the publisher thread or delay serving. ``on_publish``
+        already swallows its own errors; the try/except here is the
+        belt-and-braces guarantee that a third-party defect in the writer
+        cannot take the dashboard down.
+        """
+        if self._incident_history is None:
+            return
+        try:
+            self._incident_history.on_publish(snapshot, version)
+        except Exception:  # noqa: BLE001 - history never breaks publication
+            pass
 
     def _decorate(self, snapshot):
         """Add web-level fields WITHOUT touching any E1 traffic field.
