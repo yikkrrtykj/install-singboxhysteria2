@@ -2380,5 +2380,79 @@ else
 fi
 fi
 
+section "T25 production-real upgrade: installed 0.1.4 -> repo VERSION (isolated fixture, 0.1.5)"
+# Same production-real discipline as T24, one release step later: a server
+# that converged its view with the 0.1.4 convergence endpoint now moves to
+# the 0.1.5 target-binding delete UX candidate. The upgrade surface is
+# unchanged: same atomic release switch, ZERO sbox-cm/helper actions.
+T25_NEW_VER="$(cat "$REPO_ROOT/monitor-v2/VERSION")"
+T25="$TMP/t25"
+T25_APP="$T25/opt/singbox-monitor"
+T25_REL="$T25/opt/singbox-monitor-releases"
+T25_LOG="$TMP/out-t25.log"
+T25_CALLS="$TMP/t25-calls.log"
+if [ "$SYMLINKS_OK" != 1 ]; then
+    printf '  SKIP T25 原子升级流（此平台无符号链接；Linux pass 是门禁）\n'
+else
+(
+    mkdir -p "$T25/etc/systemd/system" "$T25/src"
+    cp "$REPO_ROOT/monitor-v2/collector.py" "$REPO_ROOT/monitor-v2/webapp.py" "$T25/src/"
+    cp -R "$REPO_ROOT/monitor-v2/web" "$REPO_ROOT/monitor-v2/api_bridge" "$T25/src/"
+    rm -rf "$T25/src/api_bridge/__pycache__" "$T25/src/web/__pycache__"
+    printf '0.1.4\n' > "$T25/src/VERSION"
+    export SBMON_APP_LINK="$T25_APP"
+    export SBMON_RELEASES_DIR="$T25_REL"
+    export SBMON_STATE_ROOT="$T25/var/lib/singbox-monitor"
+    export SBMON_STATE_DIR="$T25/var/lib/singbox-monitor"
+    export SBMON_CONF_DIR="$T25/etc/singbox-monitor"
+    export SBMON_UNIT_FILE="$T25/etc/systemd/system/singbox-monitor.service"
+    export SBMON_BACKUP_ROOT="$T25/var/backups/singbox-monitor"
+    export SBMON_REPO_MONITOR_DIR="$T25/src"
+    export SBMON_VERSION_FILE="$T25/src/VERSION"
+    export SBMON_LOCK_FILE="$T25/deploy.lock"
+    export MOCK_CALL_LOG="$T25_CALLS"
+    : > "$T25_CALLS"
+    "$INSTALL_MONITOR" install > "$TMP/out-t25-base.log" 2>&1 || exit 1
+    base_dir="$(readlink -f "$T25_APP")"
+    [ -n "$base_dir" ] || exit 1
+    printf '%s\n' "$base_dir" > "$TMP/t25-basedir"
+    find "$base_dir" -type f -exec sha256sum {} + | sort | sha256sum | cut -d' ' -f1 \
+        > "$TMP/t25-basehash"
+    grep -c 'systemctl restart singbox-monitor' "$T25_CALLS" > "$TMP/t25-restarts-before" || true
+    cp "$REPO_ROOT/monitor-v2/VERSION" "$T25/src/VERSION"
+    "$INSTALL_MONITOR" upgrade > "$T25_LOG" 2>&1 || exit 1
+)
+rc=$?
+if [ "$rc" != 0 ]; then
+    fail "isolated 0.1.4 install + $T25_NEW_VER upgrade failed (rc=$rc): $(tail -n 5 "$TMP/out-t25-base.log" 2>/dev/null | tr '\n' ' ')"
+else
+    pass "isolated 0.1.4 install + $T25_NEW_VER upgrade succeed (rc 0)"
+    if [ "$T25_NEW_VER" != '0.1.4' ]; then
+        pass "the repo candidate ($T25_NEW_VER) really differs from the 0.1.4 baseline (the real production delta)"
+    else
+        fail "T25 candidate equals the 0.1.4 baseline -- the fixture tests no delta"
+    fi
+    assert_eq "$T25_NEW_VER" "$(cat "$T25_APP/VERSION" 2>/dev/null)" "the new immutable $T25_NEW_VER release is active"
+    assert_eq '0.1.4' "$(cat "$T25_REL/0.1.4-"*/VERSION 2>/dev/null | head -n 1)" "the 0.1.4 baseline release tree still reports 0.1.4"
+    assert_grep 'action=upgrade' "$T25_LOG" "normal install-monitor.sh upgrade reports action=upgrade"
+    BASE_DIR_T25="$(cat "$TMP/t25-basedir" 2>/dev/null || true)"
+    if [ -n "$BASE_DIR_T25" ] && [ "$(readlink -f "$T25_APP")" != "$BASE_DIR_T25" ] \
+       && [ -d "$BASE_DIR_T25" ] \
+       && [ "$(cat "$TMP/t25-basehash")" = "$(find "$BASE_DIR_T25" -type f -exec sha256sum {} + | sort | sha256sum | cut -d' ' -f1)" ]; then
+        pass "previous 0.1.4 release retained byte-identical beside the new $T25_NEW_VER release (retention within KEEP)"
+    else
+        fail "T25 reused or damaged the previous 0.1.4 release"
+    fi
+    assert_eq "$(( $(cat "$TMP/t25-restarts-before") + 1 ))" \
+        "$(grep -c 'systemctl restart singbox-monitor' "$T25_CALLS")" \
+        "the upgrade restarted singbox-monitor exactly once"
+    assert_no_grep 'sing-box' "$T25_CALLS" "the upgrade never restarted or reloaded sing-box"
+    assert_no_grep 'sbox-cm' "$T25_CALLS" "the upgrade ran ZERO sbox-cm/helper systemctl actions (Monitor-only boundary)"
+    assert_no_grep 'helper' "$T25_LOG" "the upgrade log records no helper deployment or update"
+    assert_grep ' 0\.1\.4 fresh$' "$T25_REL/releases.history" "the 0.1.4 baseline release is recorded in history"
+    assert_grep " ${T25_NEW_VER//./\\.} upgrade\$" "$T25_REL/releases.history" "the $T25_NEW_VER upgrade is recorded in history"
+fi
+fi
+
 printf '\n== RESULT: %d passed, %d failed ==\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -2024,7 +2024,7 @@ fi
 # entrances are locked. Proven as control-flow ORDER inside each handler:
 # the fail-safe guard must run BEFORE any key generation, which makes a
 # normal click a zero-dispatch no-op (no request, no new key).
-GUARD='if (state.e3PendingRetry) return;'
+GUARD='if (state.e3PendingRetry || state.e3Mutation) return;'
 ADD_FN="$(sed -n '/function addClient/,/^  }/p' "$APP_FILE")"
 DEL_FN="$(sed -n '/function deleteClient/,/^  }/p' "$APP_FILE")"
 guard_before_keygen() { # <fn-body-file> -> rc 0 when guard precedes keygen
@@ -2037,9 +2037,9 @@ printf '%s\n' "$ADD_FN" > "$ROOT/tests/.m2-add.$$"
 printf '%s\n' "$DEL_FN" > "$ROOT/tests/.m2-del.$$"
 if guard_before_keygen "$ROOT/tests/.m2-add.$$" \
         && guard_before_keygen "$ROOT/tests/.m2-del.$$"; then
-    pass 'B3-final: the pending guard precedes key generation in add AND delete (ordinary click = zero dispatch, zero new keys)'
+    pass 'B3-final + 0.1.5 single-flight: the pending/mutation guard precedes key generation in add AND delete (ordinary click = zero dispatch, zero new keys)'
 else
-    fail 'B3-final: the pending guard is missing or ordered after key generation'
+    fail 'B3-final: the pending-or-mutation guard is missing or ordered after key generation'
 fi
 rm -f "$ROOT/tests/.m2-add.$$" "$ROOT/tests/.m2-del.$$"
 N_LOCK="$(grep -cF 'var writable = e3Writable() && !state.e3PendingRetry;' "$APP_FILE")"

@@ -30,6 +30,7 @@ class Element {
   insertRow() { return this.appendChild(new Element('tr')); }
   insertCell() { return this.appendChild(new Element('td')); }
   setAttribute(k, v) { this.attrs[k] = v; }
+  removeAttribute(k) { delete this.attrs[k]; }
   getAttribute(k) { return this.attrs[k]; }
   addEventListener(k, fn) { this.events[k] = fn; }
   removeEventListener(k) { delete this.events[k]; }
@@ -306,10 +307,23 @@ async function main() {
     const delBody = src.slice(src.indexOf('function deleteClient'), src.indexOf('function downloadConfig'));
     const addThen = addBody.slice(addBody.indexOf('}).then('), addBody.indexOf('}).catch('));
     const delThen = delBody.slice(delBody.indexOf('}).then('), delBody.indexOf('}).catch('));
-    assert.match(addThen, /convergeAfterMutation\(\);/);
-    assert.match(delThen, /convergeAfterMutation\(\);/);
+    // 0.1.5: the lock is released only by the convergence settlement.
+    assert.match(addThen, /convergeAfterMutation\(\)\.then\(clearMutation\);/);
+    assert.match(delThen, /convergeAfterMutation\(\)\.then\(clearMutation\);/);
     assert.doesNotMatch(addThen, /loadE3Clients\(\);|loadE3Status\(\);/);
     assert.doesNotMatch(delThen, /loadE3Clients\(\);|loadE3Status\(\);/);
+  });
+  // 0.1.5 (#36): the mutation lock is taken synchronously before dispatch
+  // and the single-flight guard is the FIRST line of both entrances.
+  check('both entrances take the lock only after the guards, with the single-flight check first', () => {
+    const src = app;
+    const addBody = src.slice(src.indexOf('function addClient'), src.indexOf('/* ---------- settings: access control'));
+    const delBody = src.slice(src.indexOf('function deleteClient'), src.indexOf('function downloadConfig'));
+    assert.equal((src.match(/if \(state\.e3PendingRetry \|\| state\.e3Mutation\) return;/g) || []).length, 2);
+    assert.ok(addBody.indexOf('if (state.e3PendingRetry || state.e3Mutation) return;') < addBody.indexOf('setMutation("add", name);'));
+    assert.ok(delBody.indexOf('if (state.e3PendingRetry || state.e3Mutation) return;') < delBody.indexOf('setMutation("delete", name);'));
+    assert.equal((src.match(/setMutation\("add", name\);/g) || []).length, 1);
+    assert.equal((src.match(/setMutation\("delete", name\);/g) || []).length, 1);
   });
   // 0.1.4 review blocker: a watchdog/manual read that STARTS inside the
   // convergence window and lands BEFORE the convergence must not commit.
@@ -335,7 +349,11 @@ async function main() {
     assert.equal(requests.length, reqsBefore);
     assert.equal(ui.state.e3StatusGeneration, genS);
     assert.equal(ids['e3-availability'].textContent, 'Available');
-    assert.equal(ids['e3-add-btn'].disabled, false);
+    // 0.1.5: this window has an ADD in flight, so the locked busy view
+    // (Add disabled, "Adding…") is the correct baseline -- the suppressed
+    // read must not change ANY of it.
+    assert.equal(ids['e3-add-btn'].disabled, true);
+    assert.equal(ids['e3-add-btn'].textContent, 'Adding…');
     assert.equal(ids['e3-clients-body'].children.length, 2);
     assert.match(ids['e3-clients-body'].textContent, /Download/);
   });
@@ -361,8 +379,187 @@ async function main() {
     assert.match(row.textContent, /bob/);
     assert.match(row.textContent, /Download/);
     assert.match(row.textContent, /Delete/);
+    // 0.1.5: the apply AND the settlement release the busy lock together.
+    assert.ok(!ui.state.e3Mutation);
+    assert.equal(ids['e3-add-btn'].disabled, false);
+    assert.equal(ids['e3-add-btn'].textContent, 'Add client');
+    assert.equal(ids['e3-del-btn'].textContent, 'Delete permanently');
     productText();
   });
+  // ---- 0.1.5 (#36): two-step delete without re-typing + mutation lock ----
+  check('0.1.5: the type-to-confirm input is gone from the shipped HTML', () => {
+    assert.ok(!('e3-del-confirm' in ids));
+    assert.doesNotMatch(html, /e3-del-confirm/);
+    productText();
+  });
+  check('row Delete only opens a confirmation bound to that client: zero requests, bound before display', () => {
+    const n = requests.length;
+    ids['e3-clients-body'].children[2].children[2].children[1].events.click();  // bob row, Delete
+    assert.equal(requests.length, n);
+    assert.ok(!ids['e3-delete-box'].className.includes('hidden'));
+    assert.equal(ids['e3-del-btn'].getAttribute('data-name'), 'bob');
+    assert.equal(ids['e3-del-name'].textContent, 'bob');
+    assert.ok(!ui.state.e3Mutation);
+    assert.equal(ids['e3-del-cancel'].disabled, false);
+    assert.equal(ids['e3-add-btn'].disabled, false);
+    productText();
+  });
+  responses.push(response({}), response(ui.state.session), conv(healthy(), clients));
+  const mark015 = requests.length;
+  ids['e3-del-btn'].click();   // deliberate second step -- no typing anywhere
+  check('the bound second click dispatches exactly once with the unchanged wire body {name, confirm:name}', () => {
+    assert.equal(requests.length, mark015 + 1);
+    const del = requests[mark015];
+    assert.equal(del.url, '/api/v1/clients/delete');
+    assert.equal(del.body, JSON.stringify({name: 'bob', confirm: 'bob'}));
+    assert.ok(del.headers['Idempotency-Key']);
+    assert.equal(del.headers['X-CSRF-Token'], 'csrf');
+  });
+  check('busy renders synchronously before dispatch: Deleting…, entrances locked, badge keeps server truth', () => {
+    assert.equal(ui.state.e3Mutation.kind, 'delete');
+    assert.equal(ui.state.e3Mutation.name, 'bob');
+    assert.equal(ui.state.e3Mutation.inFlight, true);
+    assert.equal(ids['e3-del-btn'].textContent, 'Deleting…');
+    assert.equal(ids['e3-del-cancel'].disabled, true);
+    assert.equal(ids['e3-add-btn'].disabled, true);
+    assert.equal(ids['e3-availability'].textContent, 'Available');
+  });
+  await flush();
+  check('success closes+unbinds the panel, converges once, and the lock releases only at settlement', () => {
+    assert.deepEqual(requests.slice(mark015).map(r => r.url),
+      ['/api/v1/clients/delete', '/api/v1/session', '/api/v1/clients/convergence']);
+    assert.ok(ids['e3-delete-box'].className.includes('hidden'));
+    assert.equal(ids['e3-del-btn'].getAttribute('data-name'), undefined);
+    assert.equal(ids['e3-del-name'].textContent, '');
+    assert.ok(!ui.state.e3Mutation);
+    assert.equal(ids['e3-del-btn'].textContent, 'Delete permanently');
+    assert.equal(ids['e3-add-btn'].disabled, false);
+    assert.equal(ids['e3-add-btn'].textContent, 'Add client');
+    assert.equal(ids['e3-msg'].textContent, 'Client deleted.');
+    assert.doesNotMatch(ids['e3-clients-body'].textContent, /bob/);
+    assert.match(ids['e3-clients-body'].textContent, /alice/);
+    productText();
+  });
+  check('Cancel closes and unbinds; a stray click on the unbound button dispatches nothing', () => {
+    ids['e3-clients-body'].children[1].children[2].children[1].events.click();  // alice row
+    assert.equal(ids['e3-del-btn'].getAttribute('data-name'), 'alice');
+    const n = requests.length;
+    ids['e3-del-cancel'].click();
+    assert.ok(ids['e3-delete-box'].className.includes('hidden'));
+    assert.equal(ids['e3-del-btn'].getAttribute('data-name'), undefined);
+    ids['e3-del-btn'].click();
+    assert.equal(requests.length, n);
+    assert.ok(!ui.state.e3Mutation);
+  });
+  check('reopening binds only the newly clicked target, and a re-render while open never retargets', () => {
+    ui.renderE3Clients(withBob);
+    ids['e3-clients-body'].children[1].children[2].children[1].events.click();  // alice
+    assert.equal(ids['e3-del-btn'].getAttribute('data-name'), 'alice');
+    ids['e3-clients-body'].children[2].children[2].children[1].events.click();  // bob rebinds
+    assert.equal(ids['e3-del-btn'].getAttribute('data-name'), 'bob');
+    assert.equal(ids['e3-del-name'].textContent, 'bob');
+    ui.renderE3Clients(clients);            // list refresh while the panel is open
+    assert.equal(ids['e3-del-btn'].getAttribute('data-name'), 'bob');
+    assert.equal(ids['e3-del-name'].textContent, 'bob');
+    const n = requests.length;
+    ids['e3-del-cancel'].click();
+    assert.equal(requests.length, n);
+    ui.state.e3Clients = clients; ui.renderE3Clients(clients);
+  });
+  responses.push(response({}), conv(healthy(), withBob));
+  const nBusy = requests.length;
+  ui.addClient('carol');
+  check('an in-flight Add locks every entrance synchronously while Download stays honest', () => {
+    assert.equal(requests[nBusy].url, '/api/v1/clients/add');
+    assert.equal(requests.length, nBusy + 1);
+    assert.equal(ids['e3-add-btn'].textContent, 'Adding…');
+    assert.equal(ids['e3-add-btn'].disabled, true);
+    assert.equal(ids['e3-add-name'].disabled, true);
+    assert.equal(ids['e3-del-btn'].disabled, true);
+    assert.equal(ids['e3-availability'].textContent, 'Available');
+    assert.equal(ids['e3-clients-body'].children[0].children[2].children[0].disabled, false); // Download
+    assert.equal(ids['e3-clients-body'].children[1].children[2].children[1].disabled, true);   // row Delete
+    productText();
+  });
+  check('single-flight: no second add or delete dispatches while one is in flight', () => {
+    const n = requests.length;
+    ui.addClient('dave'); ui.deleteClient('alice');
+    assert.equal(requests.length, n);
+  });
+  await flush();
+  let finishConvB;
+  responses.push(response({}), response(ui.state.session),
+                 () => new Promise(res => { finishConvB = res; }));
+  ui.deleteClient('alice');
+  await flush();
+  check('discriminating: POST success alone does NOT unlock — the lock is held through an in-flight convergence', () => {
+    assert.ok(ui.state.e3Convergence);
+    assert.ok(ui.state.e3Mutation);
+    assert.equal(ui.state.e3Mutation.kind, 'delete');
+    assert.equal(ui.state.e3Mutation.inFlight, false);
+    assert.equal(ids['e3-del-btn'].textContent, 'Deleting…');
+    assert.equal(ids['e3-add-btn'].disabled, true);
+    assert.equal(ids['e3-availability'].textContent, 'Available');
+    assert.equal(ids['e3-msg'].textContent, 'Client deleted.');
+  });
+  finishConvB(conv(healthy(), clients));
+  await flush();
+  check('the convergence settle releases the lock and restores the ordinary labels', () => {
+    assert.ok(!ui.state.e3Convergence);
+    assert.ok(!ui.state.e3Mutation);
+    assert.equal(ids['e3-add-btn'].disabled, false);
+    assert.equal(ids['e3-add-btn'].textContent, 'Add client');
+    assert.equal(ids['e3-del-btn'].textContent, 'Delete permanently');
+    assert.doesNotMatch(ids['e3-clients-body'].textContent, /bob/);
+    assert.match(ids['e3-clients-body'].textContent, /alice/);
+  });
+  responses.push(response({error: 'reauth_required'}, 401));
+  ids['e3-clients-body'].children[1].children[2].children[1].events.click();  // alice row
+  const markStep = requests.length;
+  ids['e3-del-btn'].click();
+  await flush();
+  check('a delete awaiting step-up is in flight: Deleting…, and Cancel cannot undo a dispatched transaction', () => {
+    assert.ok(!ids['stepup-overlay'].className.includes('hidden'));
+    assert.equal(requests.length, markStep + 1);
+    assert.equal(ui.state.e3Mutation.name, 'alice');
+    assert.equal(ui.state.e3Mutation.inFlight, true);
+    assert.equal(ids['e3-del-btn'].textContent, 'Deleting…');
+    assert.equal(ids['e3-del-cancel'].disabled, true);
+    assert.equal(ids['e3-add-btn'].disabled, true);
+  });
+  responses.push(response({}), response(ui.state.session), response({}),
+                 response(ui.state.session), conv(healthy(), onlyLegacy));
+  ids['stepup-password'].value = 'test-password';
+  ids['stepup-form'].events.submit({preventDefault() {}});
+  await flush();
+  check('the step-up replay completes the delete; the lock survives to convergence and settles free', () => {
+    assert.deepEqual(requests.slice(markStep).map(r => r.url),
+      ['/api/v1/clients/delete', '/api/v1/step-up', '/api/v1/session',
+       '/api/v1/clients/delete', '/api/v1/session',
+       '/api/v1/clients/convergence']);
+    assert.ok(!ui.state.e3Mutation);
+    assert.equal(ids['e3-del-cancel'].disabled, false);
+    assert.equal(ids['e3-del-btn'].textContent, 'Delete permanently');
+    assert.equal(ids['e3-msg'].textContent, 'Client deleted.');
+    assert.doesNotMatch(ids['e3-clients-body'].textContent, /alice|bob/);
+    productText();
+  });
+  const markUnc = requests.length;
+  responses.push(response({code: 'result_unknown', uncertain: true}, 504),
+                 response(clients), response(healthy()));
+  ui.deleteClient('alice'); await flush();
+  check('504 transfers the lock to the pending-retry fail-safe and clears e3Mutation after it', () => {
+    assert.deepEqual(requests.slice(markUnc).map(r => r.url),
+      ['/api/v1/clients/delete', '/api/v1/clients', '/api/v1/management/status']);
+    assert.ok(!ui.state.e3Mutation);
+    assert.ok(ui.state.e3PendingRetry);
+    closed();
+    assert.match(ids['e3-msg'].textContent, /result is not confirmed/);
+    productText();
+  });
+  ui.setPendingRetry(null);
+  setStatus(healthy());
+  ui.state.e3Clients = withBob; ui.renderE3Clients(withBob);
   // ---- M4 export: the Download button end to end --------------------------
   setStatus(healthy());
   const urlsBefore = createdUrls.length;
@@ -430,6 +627,6 @@ async function main() {
     assert.ok(!ids['mg-activate'] && !ids['mg-deactivate']);
     assert.ok(requests.every(r => !/management\/(activate|deactivate)/.test(r.url))); productText();
   });
-  assert.equal(count, 52, 'UI assertion count guard');
+  assert.equal(count, 67, 'UI assertion count guard');
 }
 main().catch(err => { console.error(err); process.exitCode = 1; });

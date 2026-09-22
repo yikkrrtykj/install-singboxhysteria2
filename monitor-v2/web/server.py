@@ -42,7 +42,7 @@ from web.e3rpc import RpcTransportError
 from web.recovery import (RECOVERY_SUCCESS_MESSAGE, RecoveryGlobalGuard,
                           RecoveryRateLimiter, generate_key)
 
-MONITOR_WEB_VERSION = "0.1.4"
+MONITOR_WEB_VERSION = "0.1.5"
 SESSION_COOKIE = "monitor_session"
 MAX_BODY_BYTES = 65536
 SUPPORTED_METHODS = "GET, POST"
@@ -1058,7 +1058,8 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
           must NOT carry a second key. The browser keeps the header across a
           401 replay and an explicit post-uncertain retry;
         * client.delete runs a FRESH (cache-bypassing) list preflight and a
-          server-side confirm==name check before anything is dispatched;
+          server-side confirm==name target-binding echo check before
+          anything is dispatched;
         * a connect failure is a definitive non-dispatch (503
           e3_unavailable); a post-send budget exhaustion is 504
           result_unknown with uncertain=true -- the transaction keeps running
@@ -1110,8 +1111,12 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             payload["name"] = name
 
         if op == "client.delete":
-            # Server-side type-to-confirm: the echoed value must equal the
-            # name exactly (U-2). Then the fresh-list preflight: without a
+            # Target-binding echo / defence in depth (renamed semantics in
+            # 0.1.5, was "type-to-confirm"): since #36 the frontend binds
+            # the confirmation to the selected row and echoes
+            # confirm == name itself -- no user re-typing is involved. The
+            # equality check still rejects hand-assembled or substituted
+            # targets. Then the fresh-list preflight: without a
             # provably FRESH list (this exact request's own successful RPC,
             # never a stale fallback) nothing destructive is dispatched (the
             # helper's in-lock revalidation stays the correctness boundary).
