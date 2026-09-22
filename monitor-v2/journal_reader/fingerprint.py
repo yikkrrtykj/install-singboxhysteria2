@@ -115,7 +115,6 @@ def load_or_create_key(state_dir):
     path = os.path.join(state_dir, KEY_FILENAME)
     if os.path.islink(path):
         raise OSError("hmac_key_unavailable")  # never follow a symlink key
-    created = False
     try:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError:
@@ -130,7 +129,6 @@ def load_or_create_key(state_dir):
                 handle.flush()
                 os.fsync(handle.fileno())
             os.chmod(path, 0o600)  # defeat umask, same recipe as the writer
-            created = True
         except OSError:
             try:
                 os.unlink(path)
@@ -141,10 +139,12 @@ def load_or_create_key(state_dir):
             if fd >= 0:
                 os.close(fd)
     key = _safe_read_key(path)
-    if created:
-        # Key AND its directory entry must be durable before first use.
-        try:
-            _fsync_dir(state_dir)
-        except OSError:
-            raise OSError("hmac_key_unavailable")
+    # Review #46 B8-residual: the containing directory entry must be
+    # proven durable on EVERY successful load, new or old -- an existing
+    # key whose creation run died on the dir fsync must not launder its
+    # way back in without that proof before first use.
+    try:
+        _fsync_dir(state_dir)
+    except OSError:
+        raise OSError("hmac_key_unavailable")
     return key

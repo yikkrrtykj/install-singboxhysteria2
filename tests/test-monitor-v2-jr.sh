@@ -40,11 +40,12 @@ MODS="$ROOT/monitor-v2/journal_reader"
 
 PASS=0
 FAIL=0
-# 364 = S0 static 13 + S1 unit/wrapper 10 (B7 gates +2) + S2 CI locks 3
-#     + S3 jtime 10 + S4 behavioral 306 (19->20 groups, +1 line: cursor +6
-#     B1 framing, fp +12 B8 key, d1 +8 B6 semantics, new dur group 21 B4/B5)
+# 369 = S0 static 13 + S1 unit/wrapper 10 (B7 gates +2) + S2 CI locks 3
+#     + S3 jtime 10 + S4 behavioral 311 (19->20 groups, +1 line: cursor +6
+#     B1 framing, fp +12 B8 key +2 B8r dir-fsync proof, d1 +8 B6 semantics,
+#     dur group 21 B4/B5 +3 B5r startup re-proves ceiling)
 #     + S5 identity fixtures 22 (B3 PATH-stub scenarios)
-EXPECTED_PASS=364
+EXPECTED_PASS=369
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT

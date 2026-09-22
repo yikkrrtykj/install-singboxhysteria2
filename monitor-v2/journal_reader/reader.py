@@ -262,6 +262,7 @@ class Reader:
                 self.state_dir,
                 state.make_committed(0, 1, "COLD_START", anchor),
                 self.run_id, self._gate("activate"))
+            self._enforce_retention()
             return
         if action == "finish_commit":
             # Sign-off frozen invariant: recovery row 2 executes the SAME
@@ -273,6 +274,7 @@ class Reader:
                           self.run_id, self._gate("recover_commit"))
             self._durably(state.remove_pending, self.state_dir,
                           self._gate("recover_unlink"))
+            self._enforce_retention()
             return
         if action == "repoll" and pending is not None:
             # Rows 3/4: nothing durable exists for that seq, so
@@ -282,6 +284,10 @@ class Reader:
             # the recipe's step-5 operation.
             self._durably(state.remove_pending, self.state_dir,
                           self._gate("stale_unlink"))
+        # Review #46 B5-residual: every restart re-proves the hard ceiling
+        # AFTER C2 recovery and BEFORE any new poll -- a durable GC
+        # failure can never grow out/ by one file per restart.
+        self._enforce_retention()
 
     def _load_committed(self):
         committed, ok = state.load_committed(self.state_dir)

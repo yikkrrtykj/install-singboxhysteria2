@@ -10,8 +10,8 @@ v4 → D1–D5 → **v5 (5777432304)** → 签署 (5777527361, APPROVED/FROZEN)�
 - 新增包：`monitor-v2/journal_reader/`（12 个 stdlib-only 模块）；unit 模板
   `monitor-v2/deploy/singbox-journal-reader.service.in`；运行入口
   `monitor-v2/deploy/app-bin/sbox-journal-reader`；部署库新增 7 个
-  `sbmon_sboxjr_*` DARK helper；测试 `tests/test-monitor-v2-jr.sh`（364 检查，
-  硬计数门）+ `tests/journal-reader/jr_groups.py`（20 组 305 项行为检查）+
+  `sbmon_sboxjr_*` DARK helper；测试 `tests/test-monitor-v2-jr.sh`（369 检查，
+  硬计数门）+ `tests/journal-reader/jr_groups.py`（20 组 310 项行为检查）+
   LIVE 门 `tests/journal-reader/test-jr-live.sh`（三基线矩阵，
   `SBOX_JR_REQUIRE_LIVE=1` fail-closed，无 SKIP 绿灯）。
 - **Dark 证明（判别式，套件 S0 常驻断言）**：`sbmon_stage_release` 清单不含
@@ -89,8 +89,9 @@ v4 → D1–D5 → **v5 (5777432304)** → 签署 (5777527361, APPROVED/FROZEN)�
   （绝不跟随）；`O_NOFOLLOW` + `fstat` regular-only；POSIX 模式必须恰为
   0600（chmod 抵抗 umask）；内容必须恰为 32 字节（读 33 判长，绝不静默重建
   或修复）；创建路径写失败/fsync 失败 ⇒ 删除半成品再抛错（下次干净重试）；
-  O_EXCL 竞争仅经由同一安全装载器重开；新建成功后键文件与所在目录双双
-  fsync 方可使用。
+  O_EXCL 竞争仅经由同一安全装载器重开；无论新旧键，每次成功装载后都必须
+  完成所在目录的 fsync 证明方可返回（B8-residual：创建那一次死在目录
+  fsync 上的既有键，不得在下一次装载时绕过该证明"洗白"入库）。
 - stderr 面恰好 5 处、全部 `[sbjr] failure=<code>` / `reset=ok` 消毒码；
   子进程 stderr 直接 DEVNULL。套件含隐私哨兵组：任何哨兵字符串出现在跨界
   字节流即失败。
@@ -118,6 +119,11 @@ v4 → D1–D5 → **v5 (5777432304)** → 签署 (5777527361, APPROVED/FROZEN)�
   unlink 失败、GC 后目录 fsync 失败。仅仅"候选消失"（ENOENT）不构成增长，
   跳过并继续。运行周期在保留失败时立即终止——绝不带着失控的保留继续
   生产新 ev 文件。
+- B5-residual（review #46 第二轮）：`startup()` 在 C2 恢复完成之后、任何
+  新 poll 之前，必须在全部三个正常出口（first_activation、finish_commit、
+  repoll/干净落尾）执行同一 fail-closed 保留证明——"每次重启多一个文件"
+  的跨重启增长被判别测试封死（over-cap + GC 失败状态下 startup 直接抛
+  `journal_writer_failed`，零轮询、零新增）。
 - B4：所有预期内的状态 write/fsync/unlink OSErrors 统一经由 `_durably`
   包装转换为 `ReaderFailure(journal_writer_failed)`；异常 repr 只含消毒码，
   绝不泄漏 traceback、路径或载荷（"failure str is the bare code" 判别测试）。
@@ -157,13 +163,15 @@ v4 → D1–D5 → **v5 (5777432304)** → 签署 (5777527361, APPROVED/FROZEN)�
 
 - `tests/test-monitor-v2-jr.sh`：S0 静态 + DARK 判别门、S1 unit/wrapper（含
   B7 冻结常量/零 env 面判别）、S2 CI 注册锁、S3 journal-time Python↔shell
-  等价（T31，含 4 个 fail-closed 对偶）、S4 20 组 305 项行为检查（含 T28 全
+  等价（T31，含 4 个 fail-closed 对偶）、S4 20 组 310 项行为检查（含 T28 全
   矩阵：每个耐久边界（含目录 fsync）前后崩溃 × 恢复表、reset_commit、崩溃
-  点交叉探针；新增 `dur` 组 21 项：B4 逐步注入消毒 + B5 保留 fail-closed；
-  cursor 组含真实 `-- cursor:` framing 判别；fp 组含 B8 键硬化 12 项；d1 组
+  点交叉探针；`dur` 组 24 项：B4 逐步注入消毒 + B5 保留 fail-closed + B5r
+  startup 重启重证上界 3 项；
+  cursor 组含真实 `-- cursor:` framing 判别；fp 组含 B8 键硬化 12 项 + B8r
+  既有键目录耐久证明 2 项；d1 组
   含 B6 批完整性 8 项）、S5 R7 身份 PATH 桩 22 项（B3：五类分歧 × 拒绝码/
   零变更/字节一致 + 两条创建顺序锁 + 幂等）。硬计数门
-  `EXPECTED_PASS=364`：任何静默跳过即红。POSIX 语义在 Windows 开发机上退化
+  `EXPECTED_PASS=369`：任何静默跳过即红。POSIX 语义在 Windows 开发机上退化
   为进程内布尔，计数跨平台稳定。
 - tests.yml：fast-checks `bash -n` ×2；monitor-regression 新增本套件步骤；
   兼容矩阵在既有 systemd readiness gate 之后新增 `sudo -n env
@@ -221,3 +229,17 @@ root fallback、不触碰生产 VPS。
 runner home 树，PYTHONPATH 直指仓库导致静默 ModuleNotFoundError。两者均按
 上表 §9 的 `-o json` + 脱敏诊断 + staging 副本修复——修复的是证明的呈现
 管道，不改变任何被证明的契约。
+
+## 12. Review #46 第二轮（5781255643）B5/B8 residual 修复记录
+
+第一轮已确认关闭：B1/B2/B3/B4/B6/B7/B9（三基线 LIVE L2–L6 20/0/0，JR 套件
+364/364，shell-tests 35761468171 与 monitor-packaging 35761468314 全绿）。
+第二轮只余两处跨重启/跨重试边界，修复范围严格限于此：
+
+| 项 | 残余缺陷 | 修复 | 判别测试 |
+|----|----------|------|----------|
+| B5-residual | 保留 GC 只发生在周期末尾：进程在 GC 失败后退出没错，但 systemd 重启后 `startup()` 不做保留，会先进入下一轮 poll 并再生成 ev-N+1 才再次 GC 失败 ⇒ "一次重启多一个文件"的跨重启增长 | `startup()` 在 C2 恢复完成后、任何新 poll 之前的**全部三个正常出口**（first_activation、finish_commit、repoll/干净落尾）执行同一 fail-closed `_enforce_retention()`；`fail_closed`/corruption 抛出点在其之前，零写保证不变 | dur 组 +3：先以宽上界落 3 个 committed 文件，收紧到 2 后模拟 unlink 永久失败并重启 ⇒ startup 直接抛 `journal_writer_failed`，且断言零轮询、零新增、无 pending |
+| B8-residual | 新键文件 fsync 成功但最后 `state_dir` fsync 失败时文件仍留在盘上；下一次调用看到 EEXIST 走"已有键"分支，直接返回而不再 fsync 目录 ⇒ 耐久证明可被绕过 | `_safe_read_key` 之后无条件 `_fsync_dir(state_dir)`，新旧键一视同仁；失败即 `hmac_key_unavailable`（不静默重建、不修复）。顺带删除因此变为死代码的 `created` 标记 | fp 组 +2：对**已存在**的合法 0600/32B 键注入 `_fsync_dir` 失败必须拒；恢复后仍可正常装载。补丁打在 `fingerprint._fsync_dir` 上，Windows 非 POSIX no-op 不影响判别 |
+
+硬计数门由 364 有意上调至 369（+3 dur / +2 fp），S4 行为检查 305→310 项；
+无其他文件、无其他测试、无生产改动。三次本地全绿（369/0）。

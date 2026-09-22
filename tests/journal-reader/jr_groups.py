@@ -409,6 +409,17 @@ def g_fp():
            not os.path.exists(kpath))
         ck("key recovers after removed failed create (B8)",
            len(fingerprint.load_or_create_key(t2.state_dir)) == 32)
+        # B8-residual (review #46 round 2): an EXISTING key must not skip
+        # the directory-entry durability proof.
+        with _mock.patch.object(fingerprint, "_fsync_dir",
+                                side_effect=OSError("io")):
+            try:
+                fingerprint.load_or_create_key(t2.state_dir)
+                ck("existing-key load refuses dir fsync failure (B8r)", False)
+            except OSError:
+                ck("existing-key load refuses dir fsync failure (B8r)", True)
+        ck("existing key still loads once dir fsync works (B8r)",
+           len(fingerprint.load_or_create_key(t2.state_dir)) == 32)
     finally:
         t2.close()
 
@@ -1409,6 +1420,39 @@ def g_dur():
                t.committed()["seq"] == 1 and t.seqs() == [1, 2, 3, 4])
         finally:
             t.close()
+        # B5-residual (review #46 round 2): a durable GC failure must not
+        # grow out/ by one file per restart -- startup re-proves the
+        # ceiling AFTER C2 recovery and BEFORE any new poll.
+        t = tree()
+        try:
+            batches = [(mk_entries([(cursor_at(i),
+                                     "ERROR no such host x%d" % i,
+                                     1760000000 + i)]), 0)
+                       for i in (1, 2, 3)]
+            reader_mod.RETENTION_MAX_FILES = 10
+            r = t.reader(FakePopen(list(batches)))
+            r.startup()
+            for _ in range(3):
+                r.run_cycle()
+            reader_mod.RETENTION_MAX_FILES = 2
+            ck("B5r setup: three committed batches now over the cap",
+               t.committed()["seq"] == 3 and t.seqs() == [1, 2, 3])
+            with _mock.patch("os.unlink", side_effect=OSError("EACCES")):
+                popen2 = FakePopen([(b"", 0)])
+                r2 = t.reader(popen2)
+                try:
+                    r2.startup()
+                    ck("B5r startup refuses over-cap + GC-failure state",
+                       False)
+                except ReaderFailure as f:
+                    ck("B5r startup refuses over-cap + GC-failure state",
+                       f.code == reader_mod.CODE_WRITER_FAILED)
+            ck("B5r refused restart grew nothing and polled nothing",
+               t.seqs() == [1, 2, 3] and t.committed()["seq"] == 3
+               and t.pending() is None and popen2.calls == [])
+        finally:
+            t.close()
+            reader_mod.RETENTION_MAX_FILES = 2
     finally:
         _restore(reader_mod, "RETENTION_MAX_FILES", old_files)
         _restore(reader_mod, "RETENTION_MAX_BYTES", old_bytes)
