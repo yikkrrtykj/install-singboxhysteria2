@@ -32,6 +32,32 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Bounded, fail-closed systemd readiness gate (issue #35 review): the
+      # packaging suite drives systemctl, and a freshly booted runner can
+      # transiently report is-system-running=starting. Accepted states match
+      # the bash-suites gate exactly (running|degraded); an already-ready
+      # runner falls straight through; timeout is a HARD failure, never a
+      # SKIP or soft green. No test or runtime file is touched.
+      - name: Wait for systemd runner readiness
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 60); do
+            state="$(systemctl is-system-running 2>/dev/null || true)"
+            case "$state" in
+              running|degraded)
+                echo "systemd ready: $state"
+                exit 0
+                ;;
+            esac
+            echo "systemd not ready yet: ${state:-unknown} ($i/60)"
+            sleep 2
+          done
+
+          echo "::error::systemd did not reach running/degraded within 120s"
+          systemctl is-system-running || true
+          systemctl --failed --no-pager || true
+          exit 1
       - name: Run Monitor v2 packaging test suite (root, real metadata)
         run: sudo --preserve-env=HOME bash tests/test-monitor-packaging.sh
 

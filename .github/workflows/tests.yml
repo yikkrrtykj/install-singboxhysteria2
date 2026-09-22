@@ -215,6 +215,38 @@ jobs:
           systemd --version | head -n1
           uname -r
 
+      # Runner-boot readiness gate (issue #35 review): the lane split reaches
+      # the LIVE/preflight work ~5 min earlier than the old serial matrix,
+      # which exposed a deterministic environmental race -- a freshly booted
+      # Ubuntu runner can transiently report is-system-running=starting, and
+      # e3-preflight.sh P13 correctly fails closed on it (attempt 1 of run
+      # 35696438934 on ubuntu-22.04). This is a bounded wait, NOT a retry: the
+      # accepted states are exactly P13's (running|degraded), an already-ready
+      # runner falls straight through, and a runner still unsettled after 120s
+      # is a HARD failure -- never a SKIP or soft green. Placed ahead of every
+      # suite in this matrix because journalctl-based checks are sensitive to
+      # the same transient. No test, preflight or runtime file is touched.
+      - name: Wait for systemd runner readiness
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 60); do
+            state="$(systemctl is-system-running 2>/dev/null || true)"
+            case "$state" in
+              running|degraded)
+                echo "systemd ready: $state"
+                exit 0
+                ;;
+            esac
+            echo "systemd not ready yet: ${state:-unknown} ($i/60)"
+            sleep 2
+          done
+
+          echo "::error::systemd did not reach running/degraded within 120s"
+          systemctl is-system-running || true
+          systemctl --failed --no-pager || true
+          exit 1
+
       - name: "Journal time compatibility regression suite (B6 finding: raw RFC3339 rejected by Ubuntu 22.04 journalctl)"
         run: bash tests/test-journal-time-compat.sh
 
