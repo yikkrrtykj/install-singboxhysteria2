@@ -5,17 +5,20 @@ on:
   push:
     branches: [main]
 
+# Superseded PR commits stop consuming runners; a main push is NEVER
+# auto-cancelled (the merge-SHA run is the authoritative record).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  bash-suites:
-    # Compatibility matrix: the three supported Ubuntu LTS baselines. Every
-    # suite below runs against each baseline's DEFAULT python3 and systemd
-    # (capability detection is exercised by the code under test; the matrix
-    # proves the defaults really work).
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-22.04, ubuntu-24.04, ubuntu-26.04]
-    runs-on: ${{ matrix.os }}
+  # ---------------------------------------------------------------------
+  # Lane A -- fast feedback. Every OS-independent syntax/static gate lives
+  # here so ordinary coding failures surface in ~1 minute, before the heavy
+  # regression lanes are even scheduled.
+  # ---------------------------------------------------------------------
+  fast-checks:
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -76,8 +79,24 @@ jobs:
           bash -n monitor-v2/deploy/e3-m3c-phase2.sh
           bash -n monitor-v2/deploy/e3-m3c-phase3.sh
 
-      - name: "Journal time compatibility regression suite (B6 finding: raw RFC3339 rejected by Ubuntu 22.04 journalctl)"
-        run: bash tests/test-journal-time-compat.sh
+  # ---------------------------------------------------------------------
+  # Lane B -- core regression. OS-independent product contracts that do not
+  # depend on a specific distro's systemd/PID1: the packaging suite is NOT
+  # here (it is owned by the monitor-packaging workflow); LIVE systemd gates
+  # are NOT here (they live in the compatibility matrix). Each command runs
+  # exactly once, on 24.04.
+  # ---------------------------------------------------------------------
+  core-regression:
+    runs-on: ubuntu-24.04
+    needs: fast-checks
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq shellcheck
+          flock --version || sudo apt-get install -y util-linux
 
       - name: Phase C regression suite
         run: bash tests/test-phase-c.sh
@@ -93,21 +112,6 @@ jobs:
 
       - name: Existing service.api auth migration regression suite (narrow S0 migration)
         run: bash tests/test-existing-api-auth-migration.sh
-
-      - name: E1 collector regression suite
-        run: bash tests/test-monitor-v2-e1.sh
-
-      - name: E2 web dashboard regression suite
-        run: bash tests/test-monitor-v2-e2.sh
-
-      - name: M0.5 step-up auth + monitor privilege boundary regression suite
-        run: bash tests/test-monitor-v2-m05.sh
-
-      - name: E4 Mihomo enrichment regression suite
-        run: bash tests/test-monitor-v2-e4.sh
-
-      - name: Packaging/deployment regression suite (incl. runtime command preflight fail-closed)
-        run: bash tests/test-monitor-packaging.sh
 
       - name: E3 M0 shared transaction library + static contract
         run: |
@@ -137,6 +141,115 @@ jobs:
           bash -n tests/e3/test-m1-crash.sh
           bash tests/e3/test-m1-crash.sh
 
+      - name: "E3 M3-C Phase 1 orchestrator (journal / gates / classified recovery)"
+        run: bash tests/e3/test-m3c-phase1.sh
+
+      - name: "E3 M3-C Phase 2 canary (approval boundary / fail-closed cleanup / recovery)"
+        run: bash tests/e3/test-m3c-phase2.sh
+
+      - name: "E3 M3-C Phase 3 go-live (approval boundary / persistent active / fail-closed recovery)"
+        run: bash tests/e3/test-m3c-phase3.sh
+
+  # ---------------------------------------------------------------------
+  # Lane C -- Monitor-v2 regression. The OS-independent Monitor web/collector
+  # contracts (E1/E2/E4 + M0.5 privilege boundary + the E3 M2 web-adapter
+  # broker/breaker/auth/HTTP suite). LIVE M2 systemd integration is owned by
+  # the compatibility matrix. No packaging here.
+  # ---------------------------------------------------------------------
+  monitor-regression:
+    runs-on: ubuntu-24.04
+    needs: fast-checks
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq shellcheck
+          flock --version || sudo apt-get install -y util-linux
+
+      - name: E1 collector regression suite
+        run: bash tests/test-monitor-v2-e1.sh
+
+      - name: E2 web dashboard regression suite
+        run: bash tests/test-monitor-v2-e2.sh
+
+      - name: M0.5 step-up auth + monitor privilege boundary regression suite
+        run: bash tests/test-monitor-v2-m05.sh
+
+      - name: E4 Mihomo enrichment regression suite
+        run: bash tests/test-monitor-v2-e4.sh
+
+      - name: "E3 M2 web adapter contract suite (broker / breaker / auth / HTTP adapter)"
+        run: bash tests/test-monitor-v2-m2.sh
+
+  # ---------------------------------------------------------------------
+  # Lane D -- compatibility matrix. Runs on the three supported Ubuntu LTS
+  # baselines and carries ONLY the distro / systemd / PID1-sensitive gates:
+  # journal-time behaviour and every LIVE systemd integration + the
+  # systemd-analyze unit/hardening validation. The REQUIRE_LIVE fail-closed
+  # contracts are preserved verbatim -- a SKIP on a live gate is a hard
+  # failure, never a green substitute. fail-fast:false so one baseline's
+  # failure does not hide the others.
+  # ---------------------------------------------------------------------
+  bash-suites:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04, ubuntu-26.04]
+    runs-on: ${{ matrix.os }}
+    needs: fast-checks
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq shellcheck
+          flock --version || sudo apt-get install -y util-linux
+
+      - name: Environment diagnostics (no secrets)
+        run: |
+          . /etc/os-release && printf 'os=%s %s\n' "$ID" "$VERSION_ID"
+          python3 --version
+          systemd --version | head -n1
+          uname -r
+
+      # Runner-boot readiness gate (issue #35 review): the lane split reaches
+      # the LIVE/preflight work ~5 min earlier than the old serial matrix,
+      # which exposed a deterministic environmental race -- a freshly booted
+      # Ubuntu runner can transiently report is-system-running=starting, and
+      # e3-preflight.sh P13 correctly fails closed on it (attempt 1 of run
+      # 35696438934 on ubuntu-22.04). This is a bounded wait, NOT a retry: the
+      # accepted states are exactly P13's (running|degraded), an already-ready
+      # runner falls straight through, and a runner still unsettled after 120s
+      # is a HARD failure -- never a SKIP or soft green. Placed ahead of every
+      # suite in this matrix because journalctl-based checks are sensitive to
+      # the same transient. No test, preflight or runtime file is touched.
+      - name: Wait for systemd runner readiness
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 60); do
+            state="$(systemctl is-system-running 2>/dev/null || true)"
+            case "$state" in
+              running|degraded)
+                echo "systemd ready: $state"
+                exit 0
+                ;;
+            esac
+            echo "systemd not ready yet: ${state:-unknown} ($i/60)"
+            sleep 2
+          done
+
+          echo "::error::systemd did not reach running/degraded within 120s"
+          systemctl is-system-running || true
+          systemctl --failed --no-pager || true
+          exit 1
+
+      - name: "Journal time compatibility regression suite (B6 finding: raw RFC3339 rejected by Ubuntu 22.04 journalctl)"
+        run: bash tests/test-journal-time-compat.sh
+
       - name: "E3 M1 B-5 LIVE systemd integration (real socket+service under PID 1: PEERCRED / add / reload / rollback / reconcile)"
         run: |
           bash -n tests/e3/test-m1-systemd.sh
@@ -146,9 +259,6 @@ jobs:
           # its teardown trap (that is how this step once stayed green at
           # FAIL=10).
           sudo -n env SBOX_CM_REQUIRE_LIVE=1 bash tests/e3/test-m1-systemd.sh
-
-      - name: "E3 M2 web adapter contract suite (broker / breaker / auth / HTTP adapter)"
-        run: bash tests/test-monitor-v2-m2.sh
 
       - name: "E3 M2 LIVE systemd integration (real monitor unit x real sbox-cm: carve-out experiment / full transaction / result_unknown / stale-active fail closed)"
         run: |
@@ -162,19 +272,10 @@ jobs:
           bash -n tests/e3/test-m3-deploy.sh
           sudo -n env SBOX_E3_REQUIRE_LIVE=1 bash tests/e3/test-m3-deploy.sh
 
-      - name: "E3 M3-C Phase 1 orchestrator (journal / gates / classified recovery)"
-        run: bash tests/e3/test-m3c-phase1.sh
-
-      - name: "E3 M3-C Phase 2 canary (approval boundary / fail-closed cleanup / recovery)"
-        run: bash tests/e3/test-m3c-phase2.sh
-
       - name: "E3 M3-C Phase 2 LIVE (real socket/service + E3RpcClient + canonical worker/library)"
         run: |
           bash -n tests/e3/test-m3c-phase2-live.sh
           sudo -n env E3_PHASE2_REQUIRE_LIVE=1 bash tests/e3/test-m3c-phase2-live.sh
-
-      - name: "E3 M3-C Phase 3 go-live (approval boundary / persistent active / fail-closed recovery)"
-        run: bash tests/e3/test-m3c-phase3.sh
 
       - name: "E3 M3-C Phase 3 LIVE (real inactive-to-active without client mutation)"
         run: |
@@ -301,5 +402,34 @@ jobs:
             echo "systemd-analyze security --offline is NOT supported on this baseline (systemd $(systemd --version | head -n1 | awk '{print $2, $3}')); 'verify' is the enforced hard gate here and the security analysis is informational-only on this runner (documented contract)."
           fi
 
-      - name: Integration regression complete (all prior steps green)
-        run: "echo 'Phase C + Phase D + S0 + Legacy + E1 + E2 + M0.5 + E4 + Packaging + existing-api-auth migration + journal-time compat + E3 M0 + E3 M1: all green on ${{ matrix.os }}'"
+      - name: Compatibility matrix complete (all LIVE + systemd gates green)
+        run: "echo 'journal-time + E3 M1/M2/M3/M3-C LIVE systemd + sbox-cm/monitor unit validation: all green on ${{ matrix.os }}'"
+
+  # ---------------------------------------------------------------------
+  # Aggregator -- the single merge-gate verdict. It FAILS unless fast-checks,
+  # core-regression, monitor-regression and every bash-suites matrix cell
+  # all succeeded. (The monitor-packaging workflow owns the packaging
+  # contracts and is a separate required check.)
+  # ---------------------------------------------------------------------
+  ci-gate:
+    runs-on: ubuntu-24.04
+    needs: [fast-checks, core-regression, monitor-regression, bash-suites]
+    # `if: always()` so a matrix-cell failure still reaches the gate and is
+    # reported as an explicit red verdict rather than a silent skip.
+    if: always()
+    steps:
+      - name: Aggregate shell-tests lanes
+        env:
+          FAST: ${{ needs.fast-checks.result }}
+          CORE: ${{ needs.core-regression.result }}
+          MONITOR: ${{ needs.monitor-regression.result }}
+          SUITES: ${{ needs.bash-suites.result }}
+        run: |
+          echo "fast-checks=$FAST core-regression=$CORE monitor-regression=$MONITOR bash-suites=$SUITES"
+          for lane in "$FAST" "$CORE" "$MONITOR" "$SUITES"; do
+            if [ "$lane" != "success" ]; then
+              echo "::error::ci-gate FAILED: a lane resolved to '$lane' (only 'success' passes)"
+              exit 1
+            fi
+          done
+          echo "ci-gate: all shell-tests lanes green"
