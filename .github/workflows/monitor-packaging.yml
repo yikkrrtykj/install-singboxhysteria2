@@ -1,21 +1,59 @@
 name: monitor-packaging
 
 on:
-  push:
-    branches: [feature/monitor-packaging]
   pull_request:
+  push:
+    branches: [main, feature/monitor-packaging]
+
+# Superseded PR commits stop consuming runners; a main push is NEVER
+# auto-cancelled (the merge-SHA run is the authoritative record).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  packaging-tests:
-    # The atomic release-switch tests (T02-T05, T15/T16, F1/F2, T17/F4) need
-    # real symlink rename(2) semantics, so the full suite runs on Linux.
+  # The full packaging suite is authoritative HERE and only here: the
+  # shell-tests matrix no longer executes it (its `bash -n` static syntax
+  # check remains in fast-checks). The atomic release-switch tests
+  # (T02-T05, T15/T16, F1/F2, T17/F4) need real symlink rename(2)
+  # semantics, so both passes run on Linux, in parallel and independently.
+  packaging-fixture:
+    # Fixture-identity pass: exact command previously run first.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Run Monitor v2 packaging test suite (fixture identity)
         run: bash tests/test-monitor-packaging.sh
-      # F3: a second root pass runs user/group management and file metadata
-      # FOR REAL (useradd/groupadd/chown/chgrp) and asserts the
-      # root:sboxweb 0640 ownership contract plus wrong-group repair.
+
+  packaging-root:
+    # F3: a second root pass runs user/group management and file metadata
+    # FOR REAL (useradd/groupadd/chown/chgrp) and asserts the
+    # root:sboxweb 0640 ownership contract plus wrong-group repair.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
       - name: Run Monitor v2 packaging test suite (root, real metadata)
         run: sudo --preserve-env=HOME bash tests/test-monitor-packaging.sh
+
+  # Stable aggregator: required-status consumers only ever need to track
+  # "packaging-tests"; it FAILS unless both independent passes succeeded.
+  packaging-tests:
+    needs: [packaging-fixture, packaging-root]
+    # `if: always()` so a failing pass is reported as an explicit red
+    # verdict here rather than a silent skip.
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Aggregate packaging passes
+        env:
+          FIXTURE: ${{ needs.packaging-fixture.result }}
+          ROOT: ${{ needs.packaging-root.result }}
+        run: |
+          echo "packaging-fixture=$FIXTURE packaging-root=$ROOT"
+          for pass in "$FIXTURE" "$ROOT"; do
+            if [ "$pass" != "success" ]; then
+              echo "::error::packaging-tests FAILED: a pass resolved to '$pass' (only 'success' passes)"
+              exit 1
+            fi
+          done
+          echo "packaging-tests: both packaging passes green"
