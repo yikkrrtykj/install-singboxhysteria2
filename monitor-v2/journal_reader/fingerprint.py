@@ -19,6 +19,7 @@ import hmac
 import os
 import re
 import secrets
+import stat as _stat
 
 KEY_FILENAME = "hmac.key"
 FP_HEX_LEN = 16
@@ -70,29 +71,80 @@ def fingerprint(key_bytes, template):
     return digest.hexdigest()[:FP_HEX_LEN]
 
 
+def _fsync_dir(path):
+    if os.name != "posix":
+        return
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _safe_read_key(path):
+    """THE safe loader (R4 hardening, review #46 B8): O_NOFOLLOW open,
+    fstat regular-only, POSIX mode exactly 0600, EXACTLY 32 content bytes.
+    Any deviation raises OSError -- never a silent re-create or repair."""
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        raise OSError("hmac_key_unavailable")
+    try:
+        st = os.fstat(fd)
+        if not _stat.S_ISREG(st.st_mode):
+            raise OSError("hmac_key_not_regular")
+        if os.name == "posix" and _stat.S_IMODE(st.st_mode) != 0o600:
+            raise OSError("hmac_key_mode")
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            raw = handle.read(33)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if len(raw) != 32:
+        raise OSError("hmac_key_length")
+    return raw
+
+
 def load_or_create_key(state_dir):
-    """Reader-local HMAC key: created once at first start (0600), never
-    rotated automatically. O_EXCL create race falls back to read."""
+    """Reader-local HMAC key: created once at first start (0600, fsynced
+    file + containing dir before first use), never rotated automatically.
+    An O_EXCL create race reopens ONLY through the safe loader; write or
+    fsync failure during creation is fail-closed (the partial file is
+    removed so the next call retries cleanly, never a half-durable key)."""
     path = os.path.join(state_dir, KEY_FILENAME)
+    if os.path.islink(path):
+        raise OSError("hmac_key_unavailable")  # never follow a symlink key
+    created = False
     try:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError:
         fd = -1
+    except OSError:
+        raise OSError("hmac_key_unavailable")
     if fd >= 0:
         try:
             with os.fdopen(fd, "wb") as handle:
+                fd = -1
                 handle.write(secrets.token_bytes(32))
                 handle.flush()
                 os.fsync(handle.fileno())
+            os.chmod(path, 0o600)  # defeat umask, same recipe as the writer
+            created = True
         except OSError:
-            # Best-effort: a key that could not be written must not be
-            # "remembered" -- next call re-reads or re-creates.
-            pass
-    try:
-        with open(path, "rb") as handle:
-            raw = handle.read()
-    except OSError:
-        raise OSError("hmac_key_unavailable")
-    if len(raw) != 32:
-        raise OSError("hmac_key_corrupt")  # fail closed; never silently re-create
-    return raw
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            raise OSError("hmac_key_unavailable")
+        finally:
+            if fd >= 0:
+                os.close(fd)
+    key = _safe_read_key(path)
+    if created:
+        # Key AND its directory entry must be durable before first use.
+        try:
+            _fsync_dir(state_dir)
+        except OSError:
+            raise OSError("hmac_key_unavailable")
+    return key

@@ -39,10 +39,12 @@
   `singbox-journal-reader.service.in` 与入口 `app-bin/sbox-journal-reader`
   已入库，但 `install-monitor.sh` **零调用点**、`sbmon_stage_release` 清单不
   含 reader —— 本阶段不创建 sbox-jr 身份/目录、不安装/enable/start 单元。
-  helper 的激活语义（身份精确校验先于变更、数据树 0750/0700/2750、渲染幂等、
-  daemon-reload-only-on-change、runuser 可读性探针）及其 LIVE systemd-analyze
-  门禁详见 `docs/monitor-v2-journal-reader-p2a.md` §8–§9；启用属 PR-2B，需
-  单独评审。
+  helper 的激活语义（身份精确校验先于变更——shell/home/主组/精确组集，既有
+  账户零变更零 groupadd；数据树 0750/0700/2750；渲染幂等、daemon-reload-only-
+  on-change、runuser 可读性探针）及其 LIVE systemd-analyze 门禁详见
+  `docs/monitor-v2-journal-reader-p2a.md` §8–§11；入口 wrapper 的路径/解释器
+  为冻结常量（review #46 B7：零运行时 env 面，唯一配置通道是 unit 内
+  `SBOX_JR_UNIT`）；启用属 PR-2B，需单独评审。
 
 ---
 

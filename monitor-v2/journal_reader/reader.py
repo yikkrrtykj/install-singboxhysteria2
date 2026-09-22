@@ -38,6 +38,7 @@ import io
 import json
 import os
 import re
+import stat as _stat
 import subprocess
 import sys
 import time
@@ -227,8 +228,19 @@ class Reader:
     # startup / crash recovery (C2 table; cross-run pending is legitimate)
     # ------------------------------------------------------------------
 
+    def _durably(self, fn, *args, **kwargs):
+        """Review #46 B4: an EXPECTED state-durability failure (tmp open /
+        write / fsync / rename / unlink OSError) becomes the sanitized
+        journal_writer_failed code -- never a traceback or path into
+        journald. Malformed/invalid LOADED state stays
+        journal_state_corruption at the load/validation sites."""
+        try:
+            return fn(*args, **kwargs)
+        except OSError:
+            raise ReaderFailure(CODE_WRITER_FAILED)
+
     def startup(self):
-        state.clean_scratch(self.state_dir, self.out_dir)
+        self._durably(state.clean_scratch, self.state_dir, self.out_dir)
         committed, ok = state.load_committed(self.state_dir)
         if not ok:
             raise ReaderFailure(CODE_STATE_CORRUPTION)
@@ -245,7 +257,8 @@ class Reader:
             raise ReaderFailure(CODE_STATE_CORRUPTION)
         if action == "first_activation":
             anchor = self._capture_tail_anchor()
-            state.write_committed(
+            self._durably(
+                state.write_committed,
                 self.state_dir,
                 state.make_committed(0, 1, "COLD_START", anchor),
                 self.run_id, self._gate("activate"))
@@ -255,11 +268,11 @@ class Reader:
             # logical step-4 as the original cycle (seq, epoch,
             # source=source_end, boundary cleared to NONE), then durably
             # removes pending. The durable ev-N is NEVER rewritten.
-            state.write_committed(self.state_dir,
-                                  state.step4_committed(pending),
-                                  self.run_id, self._gate("recover_commit"))
-            state.remove_pending(self.state_dir,
-                                 self._gate("recover_unlink"))
+            self._durably(state.write_committed, self.state_dir,
+                          state.step4_committed(pending),
+                          self.run_id, self._gate("recover_commit"))
+            self._durably(state.remove_pending, self.state_dir,
+                          self._gate("recover_unlink"))
             return
         if action == "repoll" and pending is not None:
             # Rows 3/4: nothing durable exists for that seq, so
@@ -267,7 +280,8 @@ class Reader:
             # the same window under the same seq (pending is rewritten by
             # the normal cycle). Unlinking stale/abandoned pending here is
             # the recipe's step-5 operation.
-            state.remove_pending(self.state_dir, self._gate("stale_unlink"))
+            self._durably(state.remove_pending, self.state_dir,
+                          self._gate("stale_unlink"))
 
     def _load_committed(self):
         committed, ok = state.load_committed(self.state_dir)
@@ -323,8 +337,14 @@ class Reader:
                 except ValueError:
                     entry = None
                 if not isinstance(entry, dict):
-                    consumed.pfail += 1
-                    continue
+                    # C4/D5 (review #46 B6): EVERY non-blank output line
+                    # must decode to a JSON dict carrying a usable
+                    # __CURSOR. A malformed line makes the WHOLE batch
+                    # non-committable -- the committed cursor may never
+                    # cross it. (`pfail` is only for valid-cursor entries
+                    # whose MESSAGE/timestamp payload is unusable.)
+                    consumed.cursor_invalid = True
+                    break
                 cursor = entry.get("__CURSOR")
                 if not cursor_mod.validate_cursor(cursor):
                     # D1 row 6: the WHOLE batch becomes non-committable --
@@ -400,17 +420,20 @@ class Reader:
                                      consumed.last_cursor)
         # Step 2: pending durable FIRST (incl. state-dir fsync) before any
         # exchange-file write begins.
-        state.write_pending(self.state_dir, pending, self._gate("pending"))
+        self._durably(state.write_pending, self.state_dir, pending,
+                      self._gate("pending"))
         # Step 3: ev-<seq>.jsonl.part -> fsync -> rename -> fsync out dir.
         body = consumed.exchange_body(seq, self.run_id, pending)
         self._write_exchange_file(seq, body)
         # Step 4: THE authoritative commit -- also the ONLY place the
         # boundary clears to NONE and since->cursor converts (v5-D2/D3):
         # one atomic object replacement.
-        state.write_committed(self.state_dir, state.step4_committed(pending),
-                              self.run_id, self._gate("committed"))
+        self._durably(state.write_committed, self.state_dir,
+                      state.step4_committed(pending),
+                      self.run_id, self._gate("committed"))
         # Step 5: settle pending.
-        state.remove_pending(self.state_dir, self._gate("settle_unlink"))
+        self._durably(state.remove_pending, self.state_dir,
+                      self._gate("settle_unlink"))
         self._write_heartbeat(seq)
         self._enforce_retention()
 
@@ -474,11 +497,18 @@ class Reader:
         """§6.3 bounded failure semantics: oldest-first (lowest-seq)
         eviction of THIS reader's own durable ev files only -- never the
         hb, never anything else in out/. A stopped Monitor causes bounded,
-        gap-detectable loss, never unbounded /var/lib growth."""
+        gap-detectable loss, never unbounded /var/lib growth.
+
+        Review #46 B5: the 720-file / 8 MiB ceiling is a HARD bound, so
+        every failure that makes it unverifiable or unenforceable is
+        fail-stop (sanitized writer failure): enumeration, stat of an
+        expected-regular ev file, unlink while still over bound, and the
+        post-GC directory fsync. A candidate that merely VANISHED is not
+        growth and never bypasses the ceiling."""
         try:
             names = os.listdir(self.out_dir)
         except OSError:
-            return
+            raise ReaderFailure(CODE_WRITER_FAILED)
         entries = []
         for name in names:
             match = re.fullmatch(r"ev-([0-9]{1,20})\.jsonl", name)
@@ -486,11 +516,16 @@ class Reader:
                 continue
             path = os.path.join(self.out_dir, name)
             try:
-                if not os.path.isfile(path) or os.path.islink(path):
-                    continue
-                entries.append((int(match.group(1)), os.path.getsize(path)))
+                st = os.lstat(path)
+            except FileNotFoundError:
+                continue  # vanished candidate: cannot contribute growth
             except OSError:
-                continue
+                raise ReaderFailure(CODE_WRITER_FAILED)
+            if not _stat.S_ISREG(st.st_mode):
+                # symlink/dir/FIFO wearing our ev grammar: the byte bound
+                # cannot be trusted around it -- fail closed.
+                raise ReaderFailure(CODE_WRITER_FAILED)
+            entries.append((int(match.group(1)), st.st_size))
         entries.sort()
         total = sum(size for _, size in entries)
         changed = False
@@ -500,15 +535,20 @@ class Reader:
             try:
                 os.unlink(os.path.join(self.out_dir,
                                        state.ev_filename(seq)))
-                changed = True
+            except FileNotFoundError:
                 total -= size
+                continue
             except OSError:
-                break
+                # unlink failure while OVER the hard bound: the growth
+                # would continue unchecked next cycle -- fail-stop.
+                raise ReaderFailure(CODE_WRITER_FAILED)
+            changed = True
+            total -= size
         if changed:
             try:
                 state.fsync_dir(self.out_dir)
             except OSError:
-                pass
+                raise ReaderFailure(CODE_WRITER_FAILED)
 
     # ------------------------------------------------------------------
     # operator source-gap reset (D1: the ONLY epoch-transition path apart
@@ -523,7 +563,7 @@ class Reader:
         epoch+1, boundary=SOURCE_GAP, seq PRESERVED, source = a freshly
         captured tail anchor (or the durable since fallback). No other
         code path ever resets a source position."""
-        state.clean_scratch(self.state_dir, self.out_dir)
+        self._durably(state.clean_scratch, self.state_dir, self.out_dir)
         committed, ok = state.load_committed(self.state_dir)
         if not ok or committed is None:
             raise ReaderFailure(CODE_RESET_REFUSED)
@@ -536,7 +576,7 @@ class Reader:
         if action == "repoll" and pending is not None:
             # Rows 3/4 settle cleanly (no durable file was ever visible
             # for that seq), so a reset may proceed afterwards.
-            state.remove_pending(self.state_dir)
+            self._durably(state.remove_pending, self.state_dir)
             pending = None
             action = "start"
         if action != "start" or pending is not None:
@@ -545,7 +585,8 @@ class Reader:
             # unexported-but-durable batch.
             raise ReaderFailure(CODE_RESET_REFUSED)
         anchor = self._capture_tail_anchor()
-        state.write_committed(
+        self._durably(
+            state.write_committed,
             self.state_dir,
             state.make_committed(committed["seq"], committed["epoch"] + 1,
                                  "SOURCE_GAP", anchor),

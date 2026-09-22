@@ -16,7 +16,13 @@ CURSOR_MAX_BYTES = 4096
 
 import re
 
-_SHOW_CURSOR_RE = re.compile(r"^cursor: (\S+)$", re.MULTILINE)
+# REAL systemd framing (review #46 B1, source-verified on all three
+# baselines): journalctl prints exactly `-- cursor: <opaque>\n`
+# (v249 journalctl.c:2782, v255:1928, main journalctl-show.c:512).
+_SHOW_CURSOR_REAL_RE = re.compile(r"^-- cursor: (\S+)$", re.MULTILINE)
+# Explicitly-accepted fixture/test framing (in-process fakes only; the LIVE
+# gate asserts the REAL form against the installed journalctl).
+_SHOW_CURSOR_FIXTURE_RE = re.compile(r"^cursor: (\S+)$", re.MULTILINE)
 
 
 def validate_cursor(value):
@@ -39,13 +45,17 @@ def validate_cursor(value):
 def parse_show_cursor(stdout_text):
     """Extract the cursor from `journalctl --show-cursor` output.
 
-    Strict single shape '^cursor: (\\S+)$'; the captured value then runs
-    through the SAME validator. Returns None when absent or invalid.
+    Only the two fixed framings above are stripped -- whole line, single
+    token -- and the captured value then runs through the SAME shared
+    validator. Anything else (trailing text, other prefixes, multiple
+    fields) yields None; the framing is strict, the token stays opaque.
+    Returns None when absent or invalid; nothing is ever logged.
     """
     if not isinstance(stdout_text, str):
         return None
-    match = _SHOW_CURSOR_RE.search(stdout_text)
-    if match is None:
-        return None
-    value = match.group(1)
-    return value if validate_cursor(value) else None
+    for rx in (_SHOW_CURSOR_REAL_RE, _SHOW_CURSOR_FIXTURE_RE):
+        match = rx.search(stdout_text)
+        if match is not None:
+            value = match.group(1)
+            return value if validate_cursor(value) else None
+    return None

@@ -14,7 +14,16 @@
 # (T27a/b/c), retention/heartbeat, the operator-only reset path, privacy
 # sentinels that must never cross the exchange, and the PR-2A DARK
 # contract (zero production call sites, no shipped manifest change, no
-# Monitor wiring).
+# Monitor wiring), and the review #46 B1-B9 fixes: real '-- cursor:'
+# framing (B1, D5 validator untouched), R7 exact-shape identity refusal
+# with zero mutation before any change (B3, PATH-stub fixtures),
+# sanitized journal_writer_failed for every expected durability OSError
+# (B4), fail-closed retention ceilings (B5), whole-batch
+# journal_cursor_invalid for undecodable output with pfail reserved for
+# payload-only defects (B6), a runtime-env-surface-free production
+# wrapper (B7), full HMAC-key fail-closed hardening (B8); the LIVE
+# permission proof through a disposable runuser identity (B9) lives in
+# test-jr-live.sh L6.
 #
 # POSIX-only semantics degrade to in-Python booleans (the harness runs the
 # same code paths), so the EXPECTED_PASS count is platform-stable. The
@@ -31,7 +40,11 @@ MODS="$ROOT/monitor-v2/journal_reader"
 
 PASS=0
 FAIL=0
-EXPECTED_PASS=293
+# 364 = S0 static 13 + S1 unit/wrapper 10 (B7 gates +2) + S2 CI locks 3
+#     + S3 jtime 10 + S4 behavioral 306 (19->20 groups, +1 line: cursor +6
+#     B1 framing, fp +12 B8 key, d1 +8 B6 semantics, new dur group 21 B4/B5)
+#     + S5 identity fixtures 22 (B3 PATH-stub scenarios)
+EXPECTED_PASS=364
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
@@ -183,6 +196,18 @@ if grep -q 'staged_tree_missing' "$ROOT/monitor-v2/deploy/app-bin/sbox-journal-r
 else
     fail "entry wrapper contract broken"
 fi
+WRAP="$ROOT/monitor-v2/deploy/app-bin/sbox-journal-reader"
+if grep -q '^SBJR_LIB_DIR=/usr/local/lib/singbox-journal-reader$' "$WRAP" \
+   && grep -q '^SBJR_PYTHON3=/usr/bin/python3$' "$WRAP"; then
+    pass "runtime wrapper paths are frozen constants (B7)"
+else
+    fail "wrapper runtime paths not frozen (B7)"
+fi
+if grep -qE '\$\{SBOXJR_(LIB_DIR|PYTHON3)|PYTHONPATH:\+' "$WRAP"; then
+    fail "wrapper still exposes a runtime env surface (B7)"
+else
+    pass "wrapper env surface is zero: only the frozen SBOX_JR_UNIT channel remains"
+fi
 for fn in sbmon_sboxjr_validate_identity sbmon_sboxjr_ensure_identity \
           sbmon_sboxjr_ensure_data_tree sbmon_sboxjr_stage_code \
           sbmon_sboxjr_render_unit sbmon_sboxjr_install_unit \
@@ -257,7 +282,7 @@ section "S4: behavioral groups (harness-driven, platform-stable)"
 # ===========================================================================
 GROUPS_OK=1
 for g in cursor jtime norm class elig fp schema state crash d1 boundary \
-         since backlog ingest retention reset cli privacy cross; do
+         since backlog ingest retention dur reset cli privacy cross; do
     OUTFILE="$TMP/group_$g.out"
     "$PY" "$JRDIR/jr_groups.py" "$g" 2>"$TMP/group_$g.err" | cat > "$OUTFILE"
     rc=$?
@@ -275,10 +300,169 @@ for g in cursor jtime norm class elig fp schema state crash d1 boundary \
     done < "$OUTFILE"
 done
 if [ "$GROUPS_OK" = "1" ]; then
-    pass "all 19 behavioral groups completed with zero internal crashes"
+    pass "all 20 behavioral groups completed with zero internal crashes"
 else
     fail "behavioral group sweep incomplete"
 fi
+
+# ===========================================================================
+section "S5: R7 identity fixtures via PATH stubs (B3, review #46)"
+# ===========================================================================
+# A file-backed fake NSS (getent/id) + logging mutators (groupadd/useradd/
+# usermod) drive the REAL library functions in a fresh bash per scenario.
+# Every divergent existing identity must be refused BEFORE any mutation,
+# and the identity store must come out byte-identical.
+S5BIN="$TMP/s5bin"; mkdir -p "$S5BIN" "$TMP/s5"
+cat > "$S5BIN/getent" <<'S5E'
+#!/usr/bin/env bash
+db="${S5_DB:?}"
+case "$1" in
+    passwd)
+        f="$db/passwd.$2"
+        [ -f "$f" ] && { cat "$f"; exit 0; }
+        exit 2
+        ;;
+    group)
+        f="$db/group.$2"
+        [ -f "$f" ] && { cat "$f"; exit 0; }
+        for gf in "$db"/group.*; do
+            [ -e "$gf" ] || continue
+            [ "$(cut -d: -f3 "$gf")" = "$2" ] && { cat "$gf"; exit 0; }
+        done
+        exit 2
+        ;;
+esac
+exit 2
+S5E
+cat > "$S5BIN/id" <<'S5E'
+#!/usr/bin/env bash
+[ "$1" = "-nG" ] || exit 1
+db="${S5_DB:?}"
+pf="$db/passwd.$2"
+[ -f "$pf" ] || exit 1
+prim="$(getent group "$(cut -d: -f4 "$pf")" | cut -d: -f1)"
+out="$prim"
+if [ -f "$db/members.$2" ]; then
+    for g in $(tr -d '\r' < "$db/members.$2"); do out="$out $g"; done
+fi
+printf '%s\n' "$out"
+S5E
+cat > "$S5BIN/groupadd" <<'S5E'
+#!/usr/bin/env bash
+printf 'groupadd %s\n' "$*" >> "${S5_MUTLOG:?}"
+name=""; for a in "$@"; do name="$a"; done
+n=900
+for gf in "$S5_DB"/group.*; do [ -e "$gf" ] && n=$((n + 1)); done
+printf '%s:x:%d:\n' "$name" "$n" > "$S5_DB/group.$name"
+S5E
+cat > "$S5BIN/useradd" <<'S5E'
+#!/usr/bin/env bash
+printf 'useradd %s\n' "$*" >> "${S5_MUTLOG:?}"
+name=""; gid=""; home=""; shell=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --gid) gid="$2"; shift ;;
+        --home-dir) home="$2"; shift ;;
+        --shell) shell="$2"; shift ;;
+        --*) ;;
+        *) name="$1" ;;
+    esac
+    shift
+done
+gnum="$(getent group "$gid" | cut -d: -f3)"
+printf '%s:x:%s:%s::%s:%s\n' "$name" "$gnum" "$gnum" "$home" "$shell" \
+    > "$S5_DB/passwd.$name"
+: > "$S5_DB/members.$name"
+S5E
+cat > "$S5BIN/usermod" <<'S5E'
+#!/usr/bin/env bash
+printf 'usermod %s\n' "$*" >> "${S5_MUTLOG:?}"
+if [ "$1" = "-aG" ]; then printf '%s\n' "$2" >> "$S5_DB/members.$3"; fi
+S5E
+chmod +x "$S5BIN"/* 2>/dev/null || true
+
+s5_invoke() {  # $1=case dir, $2=library fn -> rc; stderr lands in $1/err
+    S5_DB="$1/db" S5_MUTLOG="$1/mutlog" SBMON_FIXTURE=0 \
+    SBOXJR_LIB="$ROOT/monitor-v2/deploy/lib/monitor-deploy-lib.sh" \
+    PATH="$S5BIN:$PATH" \
+    bash -c '. "$SBOXJR_LIB" >/dev/null 2>&1; "$1" >/dev/null 2>"$2/err"' \
+        _ "$2" "$1"
+}
+s5_exact_db() {  # exact-shape existing identity (R7 want-set)
+    mkdir -p "$1"
+    printf 'sbox-jr:x:998:\n' > "$1/group.sbox-jr"
+    printf 'systemd-journal:x:999:\n' > "$1/group.systemd-journal"
+    printf 'sbox-jr:x:998:998::/nonexistent:/usr/sbin/nologin\n' \
+        > "$1/passwd.sbox-jr"
+    printf 'systemd-journal\n' > "$1/members.sbox-jr"
+}
+s5_case() { rm -rf "$TMP/s5/$1"; mkdir -p "$TMP/s5/$1/db"; \
+            : > "$TMP/s5/$1/mutlog"; printf '%s' "$TMP/s5/$1"; }
+
+D="$(s5_case ok)"; s5_exact_db "$D/db"
+s5_invoke "$D" sbmon_sboxjr_validate_identity \
+    && pass "validate accepts the exact-shape identity" || fail "validate rejects a compliant identity"
+s5_invoke "$D" sbmon_sboxjr_ensure_identity && [ ! -s "$D/mutlog" ] \
+    && pass "ensure mutates NOTHING for an existing compliant identity" \
+    || fail "ensure touched a compliant identity"
+
+s5_diverge() {  # $1=case, $2=field= token, $3=mutator fn
+    local d m rc
+    d="$(s5_case "$1")"; s5_exact_db "$d/db"; "$3" "$d/db"
+    cp -r "$d/db" "$d/db0"
+    s5_invoke "$d" sbmon_sboxjr_ensure_identity; rc=$?
+    [ "$rc" -ne 0 ] && grep -q "field=$2:" "$d/err" \
+        && pass "divergent $1 refused before anything else (field=$2)" \
+        || fail "divergent $1 not refused with field=$2 (rc=$rc)"
+    [ ! -s "$d/mutlog" ] \
+        && pass "divergent $1: zero mutations (incl. no groupadd)" \
+        || fail "divergent $1: mutator ran before refusal"
+    diff -r -- "$d/db0" "$d/db" >/dev/null 2>&1 \
+        && pass "divergent $1: passwd/group/id store byte-identical" \
+        || fail "divergent $1: identity store was modified"
+}
+s5_mut_shell()     { printf 'sbox-jr:x:998:998::/nonexistent:/bin/bash\n' > "$1/passwd.sbox-jr"; }
+s5_mut_home()      { printf 'sbox-jr:x:998:998::/home/sbox-jr:/usr/sbin/nologin\n' > "$1/passwd.sbox-jr"; }
+s5_mut_primary()   { printf 'sbox-jr:x:998:999::/nonexistent:/usr/sbin/nologin\n' > "$1/passwd.sbox-jr"; }
+s5_mut_nojournal() { : > "$1/members.sbox-jr"; }
+s5_mut_extra()     { printf 'systemd-journal\nadm\n' > "$1/members.sbox-jr"; \
+                     printf 'adm:x:997:\n' > "$1/group.adm"; }
+s5_diverge shell shell s5_mut_shell
+s5_diverge home home s5_mut_home
+s5_diverge primary primary_group s5_mut_primary
+s5_diverge journal-missing group_set s5_mut_nojournal
+s5_diverge extra-group group_set s5_mut_extra
+
+D="$(s5_case absent)"; mkdir -p "$D/db"
+s5_invoke "$D" sbmon_sboxjr_validate_identity; rc=$?
+[ "$rc" -ne 0 ] && grep -q 'field=user_exists:' "$D/err" \
+    && pass "validate refuses an absent identity (no root fallback)" \
+    || fail "validate did not refuse an absent identity"
+
+D="$(s5_case create-group-exists)"
+printf 'sbox-jr:x:998:\n' > "$D/db/group.sbox-jr"
+printf 'systemd-journal:x:999:\n' > "$D/db/group.systemd-journal"
+s5_invoke "$D" sbmon_sboxjr_ensure_identity \
+    && pass "absent-user creation converges and re-validates exact" \
+    || fail "ensure failed to create a compliant identity"
+printf 'useradd --system --gid sbox-jr --home-dir /nonexistent --no-create-home --shell /usr/sbin/nologin sbox-jr\nusermod -aG systemd-journal sbox-jr\n' \
+    > "$D/expected"
+diff -- "$D/expected" "$D/mutlog" >/dev/null 2>&1 \
+    && pass "creation order/exactness locked: useradd -> usermod, NO groupadd when the group exists" \
+    || fail "creation mutation sequence drifted: $(tr '\n' '|' < "$D/mutlog")"
+before_lines="$(grep -c . "$D/mutlog")"
+s5_invoke "$D" sbmon_sboxjr_ensure_identity
+[ "$(grep -c . "$D/mutlog")" = "$before_lines" ] \
+    && pass "second ensure on the created identity is a zero-mutation no-op" \
+    || fail "ensure is not idempotent after creation"
+
+D="$(s5_case create-group-absent)"
+printf 'systemd-journal:x:999:\n' > "$D/db/group.systemd-journal"
+s5_invoke "$D" sbmon_sboxjr_ensure_identity \
+    && head -n1 "$D/mutlog" | grep -q '^groupadd --system sbox-jr$' \
+    && [ "$(count_lines "$(cat "$D/mutlog")")" = "3" ] \
+    && pass "missing primary group: groupadd -> useradd -> usermod, exactly 3 mutations" \
+    || fail "groupadd-first creation contract broken: $(tr '\n' '|' < "$D/mutlog")"
 
 # ===========================================================================
 printf '\n== RESULT: %d passed, %d failed (expected %d) ==\n' \

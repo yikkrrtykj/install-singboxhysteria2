@@ -15,6 +15,7 @@ import re
 import shutil
 import sys
 import tempfile
+from unittest import mock as _mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import harness  # noqa: E402
@@ -27,7 +28,8 @@ from journal_reader import journal_time, normalize, reader as reader_mod  # noqa
 from journal_reader import schema, state  # noqa: E402
 from journal_reader.codes import (CODE_CURSOR_INVALID,  # noqa: E402
                                   CODE_RESET_REFUSED, CODE_SOURCE_UNAVAILABLE,
-                                  CODE_STATE_CORRUPTION, CODE_UNIT_INVALID)
+                                  CODE_STATE_CORRUPTION, CODE_UNIT_INVALID,
+                                  CODE_WRITER_FAILED)
 from journal_reader.reader import ReaderFailure  # noqa: E402
 
 OUT = []
@@ -67,6 +69,20 @@ def g_cursor():
        not cursor_mod.validate_cursor("\u3042" * 1366))  # 4098 bytes
     ck("parse --show-cursor happy path",
        cursor_mod.parse_show_cursor("cursor: " + CURSOR_TAIL) == CURSOR_TAIL)
+    ck("parse REAL '-- cursor:' framing (journalctl-show.c)",
+       cursor_mod.parse_show_cursor("-- cursor: " + CURSOR_TAIL) == CURSOR_TAIL)
+    ck("parse real form wins over fixture form",
+       cursor_mod.parse_show_cursor("cursor: " + "f" * 37 + "\n"
+                                    + "-- cursor: " + CURSOR_TAIL)
+       == CURSOR_TAIL)
+    ck("parse real form mid-line is not a cursor line",
+       cursor_mod.parse_show_cursor("x -- cursor: " + CURSOR_TAIL) is None)
+    ck("parse '--cursor:' wrong prefix -> None",
+       cursor_mod.parse_show_cursor("--cursor: " + CURSOR_TAIL) is None)
+    ck("parse real form trailing-space tail -> None",
+       cursor_mod.parse_show_cursor("-- cursor: " + CURSOR_TAIL + " ") is None)
+    ck("parse real form control-char cursor -> None",
+       cursor_mod.parse_show_cursor("-- cursor: a\x7fb") is None)
     ck("parse no match -> None",
        cursor_mod.parse_show_cursor("no cursor here") is None)
     ck("parse control-char cursor -> None",
@@ -321,6 +337,80 @@ def g_fp():
             ck("corrupt short key fails closed", True)
     finally:
         t.close()
+    # --- B8 (review #46): every key-path deviation fails closed, and a
+    # failed create NEVER leaves a half-durable key behind.
+    t2 = tree()
+    try:
+        kpath = os.path.join(t2.state_dir, fingerprint.KEY_FILENAME)
+        with _mock.patch.object(fingerprint.os.path, "islink",
+                                return_value=True):
+            try:
+                fingerprint.load_or_create_key(t2.state_dir)
+                ck("symlink key path refused (B8)", False)
+            except OSError:
+                ck("symlink key path refused (B8)", True)
+        ck("symlink refusal created no key file (B8)",
+           not os.path.exists(kpath))
+        os.mkdir(kpath)
+        try:
+            fingerprint.load_or_create_key(t2.state_dir)
+            ck("non-regular key path fails closed (B8)", False)
+        except OSError:
+            ck("non-regular key path fails closed (B8)", True)
+        os.rmdir(kpath)
+        for nlen in (31, 33):
+            with open(kpath, "wb") as h:
+                h.write(b"k" * nlen)
+            try:
+                os.chmod(kpath, 0o600)  # so the LENGTH gate is what refuses
+            except OSError:
+                pass
+            try:
+                fingerprint.load_or_create_key(t2.state_dir)
+                ck("key length %d fails closed (B8)" % nlen, False)
+            except OSError:
+                ck("key length %d fails closed (B8)" % nlen, True)
+        os.unlink(kpath)
+        with open(kpath, "wb") as h:
+            h.write(b"k" * 32)
+        os.chmod(kpath, 0o644)
+        if os.name == "posix":
+            try:
+                fingerprint.load_or_create_key(t2.state_dir)
+                ck("0644 key mode refused on POSIX (B8)", False)
+            except OSError:
+                ck("0644 key mode refused on POSIX (B8)", True)
+        else:
+            ck("0644 key mode refused on POSIX (B8)",
+               fingerprint.load_or_create_key(t2.state_dir) == b"k" * 32)
+        os.chmod(kpath, 0o600)
+        ck("mode-0600 32-byte key loads verbatim (B8)",
+           fingerprint.load_or_create_key(t2.state_dir) == b"k" * 32)
+        os.unlink(kpath)
+        with _mock.patch.object(fingerprint.secrets, "token_bytes",
+                                side_effect=OSError("no entropy")):
+            try:
+                fingerprint.load_or_create_key(t2.state_dir)
+                ck("create write failure fails closed (B8)", False)
+            except OSError:
+                ck("create write failure fails closed (B8)", True)
+        ck("failed create left no partial key (B8)", not os.path.exists(kpath))
+        ck("retry after failed create succeeds (B8)",
+           len(fingerprint.load_or_create_key(t2.state_dir)) == 32)
+        os.unlink(kpath)
+        with _mock.patch.object(fingerprint.os, "fsync",
+                                side_effect=OSError("io")):
+            try:
+                fingerprint.load_or_create_key(t2.state_dir)
+                ck("create fsync failure fails closed (B8)", False)
+            except OSError:
+                ck("create fsync failure fails closed (B8)", True)
+        ck("fsync failure removed the partial key (B8)",
+           not os.path.exists(kpath))
+        ck("key recovers after removed failed create (B8)",
+           len(fingerprint.load_or_create_key(t2.state_dir)) == 32)
+    finally:
+        t2.close()
 
 
 # ---------------------------------------------------------------------------
@@ -728,11 +818,13 @@ def g_d1():
                                                               "ts": t.hb()["ts"]})
     finally:
         t.close()
-    # row 5: non-zero BEFORE first usable cursor -- the D1 core.
+    # row 5: non-zero BEFORE first usable cursor -- the D1 core. Under
+    # B6 this row is the EMPTY-stdout failure shape (journalctl errors on
+    # stderr, not stdout); any non-empty undecodable stdout line is the
+    # batch-integrity row 6 family instead (checked right after).
     t = tree()
     try:
-        junk = b"not json at all\nalso-not-json\n"
-        r = t.reader(FakePopen([(junk, 1)] * 3))
+        r = t.reader(FakePopen([(b"", 1)] * 3))
         r.startup()
         before = open(os.path.join(t.state_dir, state.COMMITTED_NAME),
                       "rb").read()
@@ -758,6 +850,19 @@ def g_d1():
         except ReaderFailure as f:
             ck("spawn failure source_unavailable",
                f.code == CODE_SOURCE_UNAVAILABLE)
+        # B6: a malformed NON-BLANK stdout line outranks even a non-zero
+        # rc -- batch integrity is decided by content, not exit luck.
+        junk = b"not json at all\nalso-not-json\n"
+        r3 = t.reader(FakePopen([(junk, 1)]))
+        try:
+            r3.run_cycle()
+            ck("B6 malformed stdout outranks rc -> cursor_invalid", False)
+        except ReaderFailure as f:
+            ck("B6 malformed stdout outranks rc -> cursor_invalid",
+               f.code == CODE_CURSOR_INVALID)
+        ck("B6 malformed-only batch leaves zero movement",
+           t.committed()["source"]["value"] == CURSOR_TAIL
+           and t.seqs() == [] and t.pending() is None)
     finally:
         t.close()
     # row 4: non-zero AFTER at least one usable cursor -- discard, freeze.
@@ -801,6 +906,41 @@ def g_d1():
         ck("row6 nothing exported and cursor frozen",
            t.seqs() == [] and t.pending() is None
            and t.committed()["source"]["value"] == CURSOR_TAIL)
+    finally:
+        t.close()
+    # B6 core: an undecodable line AFTER usable entries freezes the WHOLE
+    # batch -- the committed cursor must never cross it.
+    t = tree()
+    try:
+        out = (mk_entries([(cursor_at(1), "ERROR dial timeout", 1760000001)])
+               + b"{broken json\n"
+               + mk_entries([(cursor_at(3), "ERROR dns fail", 1760000003)]))
+        r = t.reader(FakePopen([(out, 0)]))
+        r.startup()
+        try:
+            r.run_cycle()
+            ck("B6 mid-batch malformed raises cursor_invalid", False)
+        except ReaderFailure as f:
+            ck("B6 mid-batch malformed raises cursor_invalid",
+               f.code == CODE_CURSOR_INVALID)
+        ck("B6 cursor never crosses a malformed line",
+           t.committed()["source"]["value"] == CURSOR_TAIL
+           and t.seqs() == [] and t.pending() is None)
+        # pfail stays reserved for valid-cursor entries whose PAYLOAD is
+        # unusable: those still commit and the cursor advances past them.
+        payload_bad = (json.dumps({"__CURSOR": cursor_at(1),
+                                   "PRIORITY": "3",
+                                   "__REALTIME_TIMESTAMP":
+                                       "1760000001000000"})
+                       + "\n").encode()
+        r2 = t.reader(FakePopen([(payload_bad, 0)]))
+        r2.startup()
+        ck("B6 payload-only defect still commits",
+           r2.run_cycle() == "committed")
+        ck("B6 pfail counts the payload-defective entry",
+           t.header(1)["pfail"] == 1 and t.header(1)["lines"] == 1)
+        ck("B6 cursor advanced past payload-defective entry",
+           t.committed()["source"]["value"] == cursor_at(1))
     finally:
         t.close()
 
@@ -1081,6 +1221,200 @@ def g_ingest():
 
 
 # ---------------------------------------------------------------------------
+def _dur_started(t):
+    batch = mk_entries([(cursor_at(1), "ERROR dial timeout", 1760000001)])
+    r = t.reader(FakePopen([(batch, 0)]))
+    r.startup()
+    return r
+
+
+def _dur_dummies(t, seqs):
+    for s in seqs:
+        with open(os.path.join(t.out_dir, state.ev_filename(s)), "w") as h:
+            h.write("x")
+
+
+def g_dur():
+    """B4/B5 (review #46): EVERY expected durability OSError becomes a
+    sanitized journal_writer_failed (never a traceback, never a path), the
+    state-corruption family is NOT swallowed, and the retention ceiling
+    fails closed instead of admitting unbounded growth."""
+    # --- B4: sanitized writer failures on each commit step -----------------
+    t = tree()
+    try:
+        r = _dur_started(t)
+        with _mock.patch.object(state, "write_pending",
+                                side_effect=OSError("ENOSPC " + t.state_dir)):
+            try:
+                r.run_cycle()
+                ck("B4 pending write failure sanitized", False)
+            except ReaderFailure as f:
+                ck("B4 pending write failure sanitized",
+                   f.code == reader_mod.CODE_WRITER_FAILED)
+                ck("B4 sanitized failure carries only the code",
+                   str(f) == reader_mod.CODE_WRITER_FAILED)
+        ck("B4 pending failure leaves zero artifacts (C1 step order)",
+           t.seqs() == [] and t.pending() is None
+           and t.committed()["source"]["value"] == CURSOR_TAIL)
+    finally:
+        t.close()
+    t = tree()
+    try:
+        r = _dur_started(t)
+        with _mock.patch.object(state, "write_committed",
+                                side_effect=OSError("EIO")):
+            try:
+                r.run_cycle()
+                ck("B4 committed write failure sanitized", False)
+            except ReaderFailure as f:
+                ck("B4 committed write failure sanitized",
+                   f.code == reader_mod.CODE_WRITER_FAILED)
+        ck("B4 committed failure leaves a row-2 replayable state",
+           t.pending() is not None and t.seqs() == [1])
+        r2 = t.reader(FakePopen([(b"", 0)]))
+        r2.startup()
+        ck("B4 replay after committed failure settles seq1",
+           t.committed()["seq"] == 1 and t.pending() is None
+           and t.seqs() == [1])
+    finally:
+        t.close()
+    t = tree()
+    try:
+        r = _dur_started(t)
+        with _mock.patch.object(state, "remove_pending",
+                                side_effect=OSError("EIO")):
+            try:
+                r.run_cycle()
+                ck("B4 settle-unlink failure sanitized", False)
+            except ReaderFailure as f:
+                ck("B4 settle-unlink failure sanitized",
+                   f.code == reader_mod.CODE_WRITER_FAILED)
+        r2 = t.reader(FakePopen([(b"", 0)]))
+        r2.startup()
+        ck("B4 settle failure converges via row 4 on restart",
+           t.committed()["seq"] == 1 and t.pending() is None)
+    finally:
+        t.close()
+    t = tree()
+    try:
+        r = t.reader(FakePopen([(b"", 0)]))
+        with _mock.patch.object(state, "clean_scratch",
+                                side_effect=OSError("EIO")):
+            try:
+                r.startup()
+                ck("B4 startup scratch cleanup failure sanitized", False)
+            except ReaderFailure as f:
+                ck("B4 startup scratch cleanup failure sanitized",
+                   f.code == reader_mod.CODE_WRITER_FAILED)
+    finally:
+        t.close()
+    t = tree()
+    try:
+        r = t.reader(FakePopen([(b"", 0)]))
+        r.startup()
+        with _mock.patch.object(state, "write_committed",
+                                side_effect=OSError("EIO")):
+            try:
+                r.reset_from_now()
+                ck("B4 reset commit failure sanitized", False)
+            except ReaderFailure as f:
+                ck("B4 reset commit failure sanitized",
+                   f.code == reader_mod.CODE_WRITER_FAILED)
+        ck("B4 refused reset landed no epoch", t.committed()["epoch"] == 1)
+    finally:
+        t.close()
+    t = tree()
+    try:
+        r = t.reader(FakePopen([(b"", 0)]))
+        r.startup()
+        with open(os.path.join(t.state_dir, state.COMMITTED_NAME),
+                  "w") as h:
+            h.write("{not json")
+        r2 = t.reader(FakePopen([(b"", 0)]))
+        try:
+            r2.startup()
+            ck("B4 corrupt state stays state_corruption (not writer)", False)
+        except ReaderFailure as f:
+            ck("B4 corrupt state stays state_corruption (not writer)",
+               f.code == CODE_STATE_CORRUPTION)
+    finally:
+        t.close()
+    # --- B5: retention is a HARD ceiling: unverifiable == unenforceable ---
+    old_files = reader_mod.RETENTION_MAX_FILES
+    old_bytes = reader_mod.RETENTION_MAX_BYTES
+    reader_mod.RETENTION_MAX_FILES = 2
+    reader_mod.RETENTION_MAX_BYTES = 10 ** 12
+    try:
+        t = tree()
+        try:
+            r = t.reader(FakePopen([(b"", 0)]))
+            r.startup()
+            _dur_dummies(t, [1, 2, 3, 4])
+            with _mock.patch("os.listdir", side_effect=OSError("EIO")):
+                try:
+                    r._enforce_retention()
+                    ck("B5 enumeration failure fails closed", False)
+                except ReaderFailure as f:
+                    ck("B5 enumeration failure fails closed",
+                       f.code == reader_mod.CODE_WRITER_FAILED)
+            os.mkdir(os.path.join(t.out_dir, "ev-9.jsonl"))
+            try:
+                r._enforce_retention()
+                ck("B5 non-regular ev candidate fails closed", False)
+            except ReaderFailure as f:
+                ck("B5 non-regular ev candidate fails closed",
+                   f.code == reader_mod.CODE_WRITER_FAILED)
+            os.rmdir(os.path.join(t.out_dir, "ev-9.jsonl"))
+            with _mock.patch("os.unlink", side_effect=OSError("EACCES")):
+                try:
+                    r._enforce_retention()
+                    ck("B5 unlink failure while over cap fails closed", False)
+                except ReaderFailure as f:
+                    ck("B5 unlink failure while over cap fails closed",
+                       f.code == reader_mod.CODE_WRITER_FAILED)
+            ck("B5 failed eviction mutated nothing", t.seqs() == [1, 2, 3, 4])
+            with _mock.patch.object(state, "fsync_dir",
+                                    side_effect=OSError("EIO")):
+                try:
+                    r._enforce_retention()
+                    ck("B5 post-GC dir fsync failure fails closed", False)
+                except ReaderFailure as f:
+                    ck("B5 post-GC dir fsync failure fails closed",
+                       f.code == reader_mod.CODE_WRITER_FAILED)
+            # The fsync refusal happened AFTER this pass' legitimate
+            # evictions (ev-1, ev-2): the state is bounded-but-unflushed,
+            # and the next healthy pass must complete the job oldest-first.
+            ck("B5 fsync refusal left only evicted-oldest behind",
+               t.seqs() == [3, 4])
+            _dur_dummies(t, [5])
+            r._enforce_retention()
+            ck("B5 healthy eviction oldest-first down to cap",
+               t.seqs() == [4, 5])
+        finally:
+            t.close()
+        # The cycle itself fail-stops when retention cannot enforce: no
+        # silent continuation into unbounded ev growth.
+        t = tree()
+        try:
+            r = _dur_started(t)
+            _dur_dummies(t, [2, 3, 4])  # + real ev-1 from this batch = 4
+            with _mock.patch("os.unlink", side_effect=OSError("EACCES")):
+                try:
+                    r.run_cycle()
+                    ck("B5 cycle fail-stops when retention blocked", False)
+                except ReaderFailure as f:
+                    ck("B5 cycle fail-stops when retention blocked",
+                       f.code == reader_mod.CODE_WRITER_FAILED)
+            ck("B5 retention fail-stop is post-commit (durable evidence)",
+               t.committed()["seq"] == 1 and t.seqs() == [1, 2, 3, 4])
+        finally:
+            t.close()
+    finally:
+        _restore(reader_mod, "RETENTION_MAX_FILES", old_files)
+        _restore(reader_mod, "RETENTION_MAX_BYTES", old_bytes)
+
+
+# ---------------------------------------------------------------------------
 def g_retention():
     old_files = reader_mod.RETENTION_MAX_FILES
     old_bytes = reader_mod.RETENTION_MAX_BYTES
@@ -1344,6 +1678,7 @@ GROUPS = {
     "backlog": g_backlog,
     "ingest": g_ingest,
     "retention": g_retention,
+    "dur": g_dur,
     "reset": g_reset,
     "cli": g_cli,
     "privacy": g_privacy,

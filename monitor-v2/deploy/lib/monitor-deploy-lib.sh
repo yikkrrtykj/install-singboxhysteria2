@@ -862,57 +862,77 @@ sboxjr_log() { printf '[sbjr-deploy] %s\n' "$*"; }
 sboxjr_warn() { printf '[sbjr-deploy] WARNING: %s\n' "$*" >&2; }
 sboxjr_die() { printf '[sbjr-deploy] ERROR: %s\n' "$*" >&2; return 1; }
 
-# Exact-identity validation of an EXISTING sbox-jr user (R7 fail-closed):
-# nologin shell, home /nonexistent, member of systemd-journal. Any field
-# mismatch refuses the deployment BEFORE any mutation; it is never silently
+# EXACT-identity validation of the sbox-jr account (R7, hardened by review
+# #46 B3): nologin shell AND home /nonexistent AND primary group == sbox-jr
+# AND effective group set EXACTLY {sbox-jr, systemd-journal} -- a missing
+# group and an extra group both refuse. Refusals name only the offending
+# FIELD (never values), return nonzero, and mutate nothing. Never silently
 # "converged" by a root-side repair here.
 sbmon_sboxjr_validate_identity() {
     if [ "$SBMON_FIXTURE" = "1" ]; then
-        sboxjr_log "fixture: 身份校验跳过（真实语义由根 Linux CI 门负责）"
+        sboxjr_log "fixture: 身份校验跳过（真实语义由 PATH 桩 + 根 Linux 门负责）"
         return 0
     fi
-    local pw shell home groups
+    local pw shell home gid gname got want
     pw="$(getent passwd "$SBOXJR_USER" 2>/dev/null)" || {
-        sboxjr_die "用户 $SBOXJR_USER 不存在：先执行 ensure，绝不回退 root/sboxweb"
+        sboxjr_die "field=user_exists: 用户 $SBOXJR_USER 不存在：先执行 ensure，绝不回退 root/sboxweb"
         return 1
     }
     shell="$(printf '%s\n' "$pw" | cut -d: -f7)"
     home="$(printf '%s\n' "$pw" | cut -d: -f6)"
+    gid="$(printf '%s\n' "$pw" | cut -d: -f4)"
     case "$shell" in
         /usr/sbin/nologin|/sbin/nologin) ;;
         *)
-            sboxjr_die "$SBOXJR_USER shell 非 nologin（期望拒绝登录身份）"
+            sboxjr_die "field=shell: $SBOXJR_USER shell 非 nologin（期望拒绝登录身份）"
             return 1
             ;;
     esac
     if [ "$home" != "/nonexistent" ]; then
-        sboxjr_die "$SBOXJR_USER home 非 /nonexistent"
+        sboxjr_die "field=home: $SBOXJR_USER home 非 /nonexistent"
         return 1
     fi
-    groups="$(id -nG "$SBOXJR_USER" 2>/dev/null)" || groups=""
-    if ! printf '%s\n' "$groups" | tr ' ' '\n' | grep -Fxq "$SBOXJR_JOURNAL_GROUP"; then
-        sboxjr_die "$SBOXJR_USER 不属于 $SBOXJR_JOURNAL_GROUP 组：journal 读取边界不成立"
+    gname="$(getent group "$gid" 2>/dev/null | cut -d: -f1)"
+    if [ "$gname" != "$SBOXJR_GROUP" ]; then
+        sboxjr_die "field=primary_group: $SBOXJR_USER 主组非 $SBOXJR_GROUP"
+        return 1
+    fi
+    got="$(id -nG "$SBOXJR_USER" 2>/dev/null | tr ' ' '\n' \
+           | grep -v '^$' | LC_ALL=C sort -u | tr '\n' ' ')"
+    want="$(printf '%s\n' "$SBOXJR_GROUP" "$SBOXJR_JOURNAL_GROUP" \
+            | LC_ALL=C sort -u | tr '\n' ' ')"
+    if [ "$got" != "$want" ]; then
+        sboxjr_die "field=group_set: $SBOXJR_USER 有效组集不恰为 {$SBOXJR_GROUP, $SBOXJR_JOURNAL_GROUP}（缺组或多组均拒绝）"
         return 1
     fi
     return 0
 }
 
-# Create the identity ONLY when absent (idempotent converge). An existing
-# but divergent identity is a STOP (validated above), never auto-repaired.
+# Create the identity ONLY when the USER IS COMPLETELY ABSENT (review #46
+# B3 order): an existing account is exact-validated with ZERO mutation --
+# including zero groupadd -- even before/around any group work; only the
+# absent-user branch may create group/user/membership, then re-validates
+# the exact final shape.
 sbmon_sboxjr_ensure_identity() {
     if [ "$SBMON_FIXTURE" = "1" ]; then
         sboxjr_log "fixture: 确认身份存在（跳过真实 useradd/usermod）: $SBOXJR_USER"
         return 0
     fi
+    if getent passwd "$SBOXJR_USER" >/dev/null 2>&1; then
+        # EXISTING user: validate immediately; mutate NOTHING on any path.
+        if sbmon_sboxjr_validate_identity; then
+            sboxjr_log "既有身份 $SBOXJR_USER 精确合规（零变更）"
+            return 0
+        fi
+        return 1
+    fi
     if ! getent group "$SBOXJR_GROUP" >/dev/null 2>&1; then
         groupadd --system "$SBOXJR_GROUP" || return 1
     fi
-    if ! getent passwd "$SBOXJR_USER" >/dev/null 2>&1; then
-        useradd --system --gid "$SBOXJR_GROUP" --home-dir /nonexistent \
-            --no-create-home --shell /usr/sbin/nologin "$SBOXJR_USER" || return 1
-        usermod -aG "$SBOXJR_JOURNAL_GROUP" "$SBOXJR_USER" || return 1
-        sboxjr_log "已创建系统身份 $SBOXJR_USER（nologin, /nonexistent, +$SBOXJR_JOURNAL_GROUP）"
-    fi
+    useradd --system --gid "$SBOXJR_GROUP" --home-dir /nonexistent \
+        --no-create-home --shell /usr/sbin/nologin "$SBOXJR_USER" || return 1
+    usermod -aG "$SBOXJR_JOURNAL_GROUP" "$SBOXJR_USER" || return 1
+    sboxjr_log "已创建系统身份 $SBOXJR_USER（nologin, /nonexistent, 主组 $SBOXJR_GROUP, +$SBOXJR_JOURNAL_GROUP）"
     sbmon_sboxjr_validate_identity
 }
 
