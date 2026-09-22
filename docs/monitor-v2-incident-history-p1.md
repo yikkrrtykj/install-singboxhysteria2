@@ -38,8 +38,14 @@ staging `web/`，`py_compile web/*.py` glob 覆盖新模块）、
 - 文件 `history.sqlite3`：regular、0600；拒绝符号链接与非 regular 占位。
 - `journal_mode=DELETE`、`synchronous=FULL`、`foreign_keys=ON`、
   `busy_timeout=2000ms`、`auto_vacuum=INCREMENTAL`。
-- `meta.schema_version` 显式版本；迁移 forward-only；发现更高版本 →
-  fail-closed（`schema_unsupported`），绝不降级改写。DB 内容永不进日志。
+- `meta.schema_version` 显式版本；迁移 forward-only。**严格 schema 门禁
+  （PR #44 评审 B3）**：只接受两种形态 —— 全新库（不存在或 0 字节、无表）
+  建为 v1；既有库声明的 `schema_version` 恰为 `"1"` 且 v1 表齐全才打开。
+  其余一切形态 —— 版本 `0`/负数/更高/畸形（`abc`、`1.0`、空串）、meta 缺失
+  但带表的无关库、"声称 v1 却缺表"的被剥离库、非空但零表文件 —— 一律以
+  `schema_unsupported` **fail-closed，且拒绝路径绝不写入任何字节**（判别测试
+  以逐字节相等断言）；被评审否决的旧写法（`INSERT OR REPLACE` +
+  `CREATE IF NOT EXISTS` 静默收编）不存在。DB 内容永不进日志。
 - 表：
   - `timeline_samples`：5s 聚合行（epoch/ISO/run_id/uptime/snapshot 版本/
     generated·success 时间戳/stale/api_status/total·reality·hy2·other
@@ -68,13 +74,16 @@ last_error 内植入）断言其既不出现在行中、也不出现在 DB 文�
 ## 6. 保留策略（§5）与 VACUUM 关键事实
 
 7 天时间保留 + 目标 ≤48MiB / 硬顶 64MiB；启动时与每小时清理；只删最旧。
+**跨表全局序（PR #44 评审 B2）**：尺寸裁剪把 `timeline_samples` 与
+`device_protocol_states` 视为**同一条 epoch 时间线**——存活集恒为两表合并后
+的最新后缀，绝不允许"T2 行被删而另一表中更旧的 T1 行幸存"的逐表反例；
+平局按确定性次序（samples 先于 states、表内按 rowid）结算。
 实现教训（判别测试捕获）：SQLite 的 incremental vacuum 只能截断**文件尾部**
 空闲页，而"只删最旧"把空闲页留在存活的新行**后面** —— 因此尺寸收缩必须经
 一次全量 `VACUUM` 才可被 `page_count` 观测；否则按文件字节驱动的裁剪循环会
 先于目标耗尽整表。`_prune_to_target` 由此为：每轮按比例（≥10%、≥512 行）删
-最旧前缀 + 全量 VACUUM + 重新测量，天然保证"新行永不先于旧行被删"。
-保留失败 → degraded 标志 + 分类码 + 计数 + 最后成功时间，永不 crash、
-永不静默。
+全局最旧前缀 + 全量 VACUUM + 重新测量。保留失败 → degraded 标志 + 分类码 +
+计数 + 最后成功时间，永不 crash、永不静默。
 
 ## 7. 故障边界（§6 / §7）
 
@@ -82,8 +91,16 @@ last_error 内植入）断言其既不出现在行中、也不出现在 DB 文�
 `except Exception` 双保险；模块公共面 `open/on_publish/health/query_timeline/
 close` 全部 soft（捕获 `_HistoryError` 与 `sqlite3.Error/OSError`）。
 持久化故障时 dashboard 照常服务，publisher/consumer/web 线程均不受影响。
+**线程串行化（PR #44 评审 B1）**：共享的 `check_same_thread=False` 连接由
+一把 `threading.RLock` 串行 —— `open/on_publish/query_timeline/health/close`
+的整个临界区（含 INSERT/COMMIT、UNION 全局裁剪与 VACUUM）都在锁内；
+`_record_failure` 仅做字段记账、可重入进入同一锁，绝不高持锁做 I/O，不可能
+死锁。读线程最长等待一轮清理（有界，≤64MiB 全量重写），永不观察到撕裂事务；
+`close()` 与在途写入互斥。回归为真实线程压力（写者 + 4 读者 + 飞行中 close）
+加 S0 静态锁纪律门（H9 + B1 gate）。
 健康对象：`enabled, degraded, last_success_at, failure_count,
-last_error_code(仅分类码), run_id`。
+last_error_code(仅分类码), run_id`；开库被 fail-closed 拒绝时 `enabled`
+恒为 False（B3 语义在故障记账处一并强制）。
 
 ## 8. 读面契约（§8）
 

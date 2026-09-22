@@ -6,9 +6,14 @@
 # values that must NEVER reach a row, the file, or the HTTP surface),
 # cadence (5s aggregate / change-triggered device rows / <=1 heartbeat per
 # 60s / no row for rate-only change), restart (new run_id, no fabricated
-# backfill), retention (time + size, always oldest-first), failure (never
-# raises to the broker, degraded health, dashboard keeps serving) and the
-# session-gated bounded read endpoint.
+# backfill), retention (time + size, the two tables pruned as ONE globally
+# epoch-ordered timeline), failure (never raises to the broker, degraded
+# health, dashboard keeps serving) and the session-gated bounded read
+# endpoint. Review fixes on PR #44 add their own discriminating gates:
+# B1 (one RLock serializes writer/readers/close, proven by a REAL threaded
+# stress group H9), B2 (interleaved mixed-table epochs prune to a global
+# newest suffix), B3 (strict schema: any non-exact-v1 shape fails closed
+# with zero bytes mutated).
 #
 # POSIX-specific permission/symlink assertions run for real on Linux (the
 # CI gate) and vacuously pass on platforms without symlink/permission
@@ -23,7 +28,7 @@ export WEBAPP="$ROOT/monitor-v2/webapp.py"
 
 PASS=0
 FAIL=0
-EXPECTED_PASS=108
+EXPECTED_PASS=130
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
@@ -104,6 +109,27 @@ if grep -Eq 'ReadWritePaths|supplementaryGroups|AmbientCapabilities|journald|sud
 else
     pass "history module requests no new systemd privilege or journald access"
 fi
+if "$PY" - "$HIST_PY" <<'EOF'
+import ast, re, sys
+src = open(sys.argv[1], encoding="utf-8").read()
+assert not re.search(r"threading\.Lock\(\)", src), \
+    "bare Lock would deadlock the reentrant failure path"
+tree = ast.parse(src)
+fns = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+for name in ("open", "on_publish", "close", "_record_failure"):
+    withs = [n for n in ast.walk(fns[name]) if isinstance(n, ast.With)]
+    assert withs, "%s has no with-block" % name
+    assert any("_lock" in ast.dump(w) for w in withs), \
+        "%s does not enter self._lock" % name
+import re as _re
+assert re.search(r"self\._lock = threading\.RLock\(\)", src), \
+    "lock must be a reentrant RLock"
+EOF
+then
+    pass "B1 lock discipline: RLock + writer/readers/close/_record_failure all serialize"
+else
+    fail "B1 lock discipline broken (public section escapes the shared lock)"
+fi
 
 # -- shared python harness ---------------------------------------------------
 cat > "$TMP/hist_harness.py" <<'HARNESS_EOF'
@@ -126,6 +152,7 @@ from web.access import AccessPolicy
 from web.auth import AuthStore
 from web.broker import SnapshotBroker
 from web.incident_history import (CODE_DIR_UNSAFE, CODE_DB_UNSAFE,
+                                  CODE_OPEN_FAILED,
                                   CODE_RETENTION_FAILED,
                                   CODE_SCHEMA_UNSUPPORTED, CODE_WRITE_FAILED,
                                   DEVICE_STATE_COLUMNS, QUERY_LIMIT_MAX,
@@ -342,6 +369,103 @@ def group_storage():
     h9 = IncidentHistory(os.path.join(h8._tmpdir, "diagnostics"), "run-h")
     h9.open()
     out["no_downgrade"] = h9.health()["last_error_code"] == CODE_SCHEMA_UNSUPPORTED
+    # ---- B3 (review): the gate is STRICT in BOTH directions ----
+    # every non-exact-v1 DECLARATION is refused fail-closed, and the
+    # refusal must not touch a single byte of the existing DB.
+    b = tmp_history()
+    b.open()
+    b.on_publish(snap(), 1)
+    b.close()
+    db = os.path.join(b._tmpdir, "diagnostics", "history.sqlite3")
+    refused_all = intact_all = preserved = True
+    for raw in ("0", "-1", "2", "abc", "1.0", ""):
+        conn = sqlite3.connect(db)
+        conn.execute("UPDATE meta SET value=? WHERE key='schema_version'",
+                     (raw,))
+        conn.commit()
+        conn.close()
+        before = raw_db_bytes(b)
+        hx = IncidentHistory(os.path.join(b._tmpdir, "diagnostics"), "b3")
+        hx.open()
+        hb = hx.health()
+        hx.close()
+        refused_all = (refused_all and not hb["enabled"]
+                       and hb["last_error_code"] == CODE_SCHEMA_UNSUPPORTED)
+        intact_all = intact_all and raw_db_bytes(b) == before
+        conn = sqlite3.connect(db)
+        v = conn.execute("SELECT value FROM meta WHERE key='schema_version'"
+                         ).fetchone()[0]
+        conn.close()
+        preserved = preserved and v == raw
+    out["b3_nonv1_all_refused"] = refused_all
+    out["b3_refusal_zero_bytes"] = intact_all and preserved
+    # restore the exact-v1 shape, THEN prove an accepted re-open is pure
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE meta SET value='1' WHERE key='schema_version'")
+    conn.commit()
+    conn.close()
+    # an ACCEPTED exact-v1 re-open also mutates zero bytes (read-only gate)
+    b2 = IncidentHistory(os.path.join(b._tmpdir, "diagnostics"), "b3ok",
+                         clock=lambda: T0 + 60.0)
+    before = raw_db_bytes(b)
+    b2.open()
+    out["b3_exact_v1_reopen_readonly"] = (b2.health()["enabled"]
+                                          and raw_db_bytes(b) == before)
+    b2.close()
+    # meta CLAIMS v1 but the v1 tables are gone: refuse, never adopt via
+    # CREATE-IF-NOT-EXISTS (and the shape must stay exactly as found)
+    conn = sqlite3.connect(db)
+    conn.execute("DROP TABLE timeline_samples")
+    conn.execute("DROP TABLE device_protocol_states")
+    conn.commit()
+    conn.close()
+    before = raw_db_bytes(b)
+    b3 = IncidentHistory(os.path.join(b._tmpdir, "diagnostics"), "b3x")
+    b3.open()
+    out["b3_metaless_orphan_refused"] = (
+        not b3.health()["enabled"]
+        and b3.health()["last_error_code"] == CODE_SCHEMA_UNSUPPORTED
+        and raw_db_bytes(b) == before)
+    b3.close()
+    # an unrelated tables-only DB (no meta) is never claimed as v1
+    d10 = tempfile.mkdtemp()
+    os.makedirs(os.path.join(d10, "diagnostics"))
+    conn = sqlite3.connect(os.path.join(d10, "diagnostics",
+                                        "history.sqlite3"))
+    conn.execute("CREATE TABLE foo (x INTEGER)")
+    conn.commit()
+    conn.close()
+    b4 = IncidentHistory(os.path.join(d10, "diagnostics"), "b4")
+    b4.open()
+    out["b3_unrelated_db_refused"] = (
+        not b4.health()["enabled"]
+        and b4.health()["last_error_code"] == CODE_SCHEMA_UNSUPPORTED)
+    b4.close()
+    # zero tables but NON-empty pre-existing file: never claimed fresh
+    d11 = tempfile.mkdtemp()
+    with open(os.path.join(d11, "history.sqlite3"), "wb") as handle:
+        handle.write(b"SQLite format 3\x00" + b"\x00" * 4096)
+    b5 = IncidentHistory(d11, "b5")
+    b5.open()
+    out["b3_zero_tables_claim_refused"] = not b5.health()["enabled"]
+    b5.close()
+    # a real garbage file fails softly (sanitized code, no raise, bytes kept)
+    d12 = tempfile.mkdtemp()
+    with open(os.path.join(d12, "history.sqlite3"), "wb") as handle:
+        handle.write(b"definitely not sqlite" * 300)
+    b6 = IncidentHistory(d12, "b6")
+    b6.open()
+    out["b3_garbage_soft"] = (not b6.health()["enabled"]
+                              and b6.health()["last_error_code"]
+                              in (CODE_SCHEMA_UNSUPPORTED, CODE_OPEN_FAILED))
+    b6.close()
+    # a zero-byte pre-existing file IS genuinely fresh: must be claimed v1
+    d13 = tempfile.mkdtemp()
+    open(os.path.join(d13, "history.sqlite3"), "wb").close()
+    b7 = IncidentHistory(d13, "b7")
+    b7.open()
+    out["b3_zero_byte_claimed"] = b7.health()["enabled"]
+    b7.close()
     return out
 
 
@@ -581,6 +705,51 @@ def group_retention():
         epochs_before[len(epochs_before) - len(epochs_after):]
     out["size_prune_below_target"] = h3._db_bytes() <= h3._target_bytes
     out["size_prune_max_survives"] = max(epochs_after) == max(epochs_before)
+    # B2 (review): the two tables are ONE globally epoch-ordered timeline.
+    # Interleaved seeds discriminate the old per-table scheme, which could
+    # delete a NEWER sample while an OLDER device row survived (and vice
+    # versa) -- survivors must be the newest suffix of the MERGED order.
+    h4 = tmp_history(retention_seconds=10_000_000.0)
+    h4.open()
+    base4 = T0 - 100000
+    for k in range(1200):
+        h4._conn.execute(
+            "INSERT INTO timeline_samples (epoch, iso_utc, run_id,"
+            " collector_stale, total_active_connections,"
+            " reality_active_connections, hysteria2_active_connections,"
+            " other_active_connections, uplink_rate, downlink_rate,"
+            " skipped_events, duplicate_events, identity_conflicts,"
+            " abandoned_on_reset, snapshot_generated_at)"
+            " VALUES (?, '', ?, 0,0,0,0,0,0,0,0,0,0,0,?)",
+            (base4 + 2 * k, "z" * 48, "y" * 16))
+        h4._conn.execute(
+            "INSERT INTO device_protocol_states (epoch, iso_utc, run_id,"
+            " device, inbound, active_connections, device_status,"
+            " uplink_rate, downlink_rate, uplink_total, downlink_total,"
+            " reason) VALUES (?, '', ?, 'd', 'i', 0, 'ACTIVE',"
+            " 0, 0, 0, 0, 'heartbeat')", (base4 + 2 * k + 1, "z" * 48))
+    h4._conn.commit()
+    before4 = h4._db_bytes()
+    h4._ceiling_bytes = before4 - 1
+    h4._target_bytes = before4 // 2
+    merged_before = [r[0] for r in h4._conn.execute(
+        "SELECT epoch FROM timeline_samples"
+        " UNION ALL SELECT epoch FROM device_protocol_states"
+        " ORDER BY epoch")]
+    h4._cleanup("b2-mixed")
+    s4 = [r[0] for r in h4._conn.execute(
+        "SELECT epoch FROM timeline_samples ORDER BY epoch")]
+    st4 = [r[0] for r in h4._conn.execute(
+        "SELECT epoch FROM device_protocol_states ORDER BY epoch")]
+    merged_after = sorted(s4 + st4)
+    n4 = len(merged_after)
+    out["b2_mixed_global_suffix"] = bool(merged_after) and \
+        merged_after == merged_before[len(merged_before) - n4:]
+    out["b2_mixed_both_pruned"] = (0 < len(s4) < 1200
+                                   and 0 < len(st4) < 1200)
+    out["b2_mixed_newest_survives"] = merged_before[-1] in merged_after
+    out["b2_mixed_below_target"] = h4._db_bytes() <= h4._target_bytes
+    h4.close()
     # a retention failure records its code and never raises
     h3._conn.close()
     h3._cleanup("after-close")
@@ -613,8 +782,20 @@ def group_failure():
     # reads against the broken DB: empty + sanitized code, never a raise
     r = h.query_timeline()
     out["read_failure_empty"] = r["samples"] == [] and r["truncated"] is False
-    # repair by reopen: schema re-created, degraded + code clear again
+    # under the STRICT schema gate (review B3) a live DB whose tables were
+    # stripped is NOT silently re-adopted on reopen: open() fails closed
+    # WITHOUT mutating the corrupt file, and recovery happens only when
+    # the operator removes it (fresh v1 re-created).
     h.close()
+    db = os.path.join(h._tmpdir, "diagnostics", "history.sqlite3")
+    corrupt_bytes = raw_db_bytes(h)
+    h.open()
+    out["stripped_table_reopen_refused"] = (
+        not h.health()["enabled"]
+        and h.health()["last_error_code"] == CODE_SCHEMA_UNSUPPORTED)
+    out["stripped_refusal_zero_bytes"] = (
+        raw_db_bytes(h) == corrupt_bytes)
+    os.remove(db)
     h.open()
     t[0] = T0 + 20.0
     h.on_publish(snap(), 3)
@@ -830,9 +1011,86 @@ def group_http():
     return out
 
 
+def group_concurrency():
+    """B1 (review): ONE reentrant lock must serialize the publisher-side
+    writer, every HTTP reader thread and shutdown close(). This is a REAL
+    threaded SQLite stress: a 300-publish writer (every call writes: the
+    clock jumps past the 5s cadence each time) races four tight-loop
+    readers, while close() lands mid-flight. Without the shared lock the
+    writer/reader threads raise on the torn or closed shared connection;
+    with it, zero thread exceptions and zero recorded failures."""
+    out = {}
+    t = [T0]
+    h = tmp_history(clock=lambda: t[0], heartbeat_interval=1e9)
+    h.open()
+    errors = []
+    stop = threading.Event()
+
+    def writer():
+        n = 0
+        try:
+            while not stop.is_set() and n < 300:
+                n += 1
+                t[0] = T0 + n * 6.0
+                h.on_publish(snap(active_vless=n % 4), n)
+                if n % 90 == 0:
+                    h._cleanup("stress")   # retention/VACUUM under readers
+        except BaseException as exc:
+            errors.append("writer:%r" % exc)
+
+    def reader(i):
+        try:
+            while not stop.is_set():
+                r = h.query_timeline(limit=50)
+                if not isinstance(r["samples"], list):
+                    errors.append("reader%d:shape" % i)
+                    return
+                h.health()
+                time.sleep(0.001)
+        except BaseException as exc:
+            errors.append("reader%d:%r" % (i, exc))
+
+    def closer():
+        try:
+            time.sleep(0.3)
+            h.close()
+        except BaseException as exc:
+            errors.append("closer:%r" % exc)
+
+    w = threading.Thread(target=writer)
+    rs = [threading.Thread(target=lambda i=i: reader(i)) for i in range(4)]
+    c = threading.Thread(target=closer)
+    w.start()
+    for r_ in rs:
+        r_.start()
+    c.start()
+    w.join(timeout=90)
+    stop.set()
+    for r_ in rs + [c]:
+        r_.join(timeout=90)
+    out["no_deadlock"] = not any(
+        x.is_alive() for x in [w] + rs + [c])
+    out["no_thread_errors"] = errors == []
+    out["zero_failures_under_contention"] = h.health()["failure_count"] == 0
+    r = h.query_timeline(limit=10)
+    out["close_midflight_soft"] = (r["samples"] == []
+                                   and r["device_states"] == [])
+    # rows committed BEFORE the racing close() are durable: reopen and read
+    h2 = IncidentHistory(os.path.join(h._tmpdir, "diagnostics"), "conc-2",
+                         clock=lambda: t[0] + 6.0)
+    h2.open()
+    s2, _ = rows_of(h2)
+    out["rows_durable_through_close"] = len(s2) >= 10
+    out["privacy_under_contention"] = not any(
+        s.encode() in raw_db_bytes(h) for s in SENTINELS)
+    h2.close()
+    return out
+
+
 GROUPS = {"storage": group_storage, "privacy": group_privacy,
           "cadence": group_cadence, "restart": group_restart,
           "retention": group_retention, "failure": group_failure,
+          "concurrency": group_concurrency,
           "http": group_http}
 
 
@@ -889,6 +1147,14 @@ check 'd["symlink_db_refused"]' "symlinked history.sqlite3 refused (Linux gate)"
 check 'd["symlink_db_target_intact"]' "refused symlink db: victim file intact"
 check 'd["nonregular_db_refused"]' "directory-as-db refused (never a regular file)"
 check 'd["no_downgrade"]' "newer on-disk schema never downgraded (fail-closed)"
+check 'd["b3_nonv1_all_refused"]' "B3: version 0/-1/2/malformed/empty ALL refused fail-closed"
+check 'd["b3_refusal_zero_bytes"]' "B3: refusal mutates ZERO bytes and preserves the tampered value"
+check 'd["b3_exact_v1_reopen_readonly"]' "B3: accepted exact-v1 re-open mutates zero bytes"
+check 'd["b3_metaless_orphan_refused"]' "B3: meta claiming v1 with stripped tables is refused"
+check 'd["b3_unrelated_db_refused"]' "B3: unrelated tables-only DB never claimed as v1"
+check 'd["b3_zero_tables_claim_refused"]' "B3: non-empty zero-table file not treated as fresh"
+check 'd["b3_garbage_soft"]' "B3: garbage db file -> sanitized refusal, no raise"
+check 'd["b3_zero_byte_claimed"]' "B3: zero-byte pre-existing file IS genuinely fresh (v1)"
 
 section "H2: privacy whitelist + protocol classes (spec §3/§4/§10)"
 run_group "privacy"
@@ -944,6 +1210,10 @@ check 'd["below_ceiling_no_prune"]' "under the ceiling, cleanup keeps every row"
 check 'd["size_prune_keeps_newest_suffix"]' "size pruning removes ONLY the oldest prefix"
 check 'd["size_prune_below_target"]' "pruned down to the injected target size"
 check 'd["size_prune_max_survives"]' "newest epoch survives size pruning"
+check 'd["b2_mixed_global_suffix"]' "B2: interleaved two-table pruning keeps the GLOBAL newest suffix"
+check 'd["b2_mixed_both_pruned"]' "B2: BOTH tables trimmed (no per-table oldest-first counterexample)"
+check 'd["b2_mixed_newest_survives"]' "B2: newest evidence in the merged order always survives"
+check 'd["b2_mixed_below_target"]' "B2: mixed pruning converges to the injected target size"
 check 'd["retention_failure_code"]' "retention failure -> degraded code, never raises"
 
 section "H6: failure isolation (spec §5/§6/§7/§10)"
@@ -953,7 +1223,9 @@ check 'd["write_failure_never_raises"]' "broken DB: on_publish never raises"
 check 'd["write_failure_degrades"]' "write failure sets degraded + code + counter"
 check 'd["last_success_time_kept"]' "last successful write time preserved on failure"
 check 'd["read_failure_empty"]' "broken read -> empty sanitized result, no raise"
-check 'd["recovers_after_reopen"]' "degraded clears after the storage is repaired"
+check 'd["stripped_table_reopen_refused"]' "B3: stripped-table DB refused on reopen (no silent adoption)"
+check 'd["stripped_refusal_zero_bytes"]' "B3: that refusal leaves the corrupt file byte-identical"
+check 'd["recovers_after_reopen"]' "degraded clears once the corrupt db is removed + re-created"
 check 'd["closed_db_soft"]' "shutdown race (closed db) still soft"
 check 'd["open_never_raises"]' "hostile storage: open() fail-soft, never raises"
 check 'd["broker_survives_history_explosion"]' "exploding writer cannot kill publisher/dashboard"
@@ -1052,6 +1324,16 @@ else
 fi
 kill "$LIVE_PID" 2>/dev/null || true
 wait "$LIVE_PID" 2>/dev/null || true
+
+section "H9: writer/reader/close serialization under real threads (review B1)"
+run_group "concurrency"
+check 'd.get("_harness_error") is None' "concurrency harness ran clean"
+check 'd["no_thread_errors"]' "B1: 300-publish writer + 4 readers + racing close: zero exceptions"
+check 'd["no_deadlock"]' "B1: every thread exited (the shared RLock cannot deadlock)"
+check 'd["zero_failures_under_contention"]' "B1: failure_count stays 0 through the stress"
+check 'd["close_midflight_soft"]' "B1: reads racing/during close() stay soft and empty, never raise"
+check 'd["rows_durable_through_close"]' "B1: rows committed before close() reopen readable (no torn tx)"
+check 'd["privacy_under_contention"]' "B1: sentinels still absent from raw DB bytes after stress"
 
 printf '\n== RESULT: %d passed, %d failed ==\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] && [ "$PASS" -eq "$EXPECTED_PASS" ] || { printf '  (failures, or a section did not fully run)\n'; exit 1; }

@@ -13,7 +13,14 @@ Safety contract (all enforced, all tested):
   non-directory / non-regular type) is REFUSED, never followed. SQLite
   runs ``journal_mode=DELETE`` (no stray -wal/-shm files),
   ``synchronous=FULL``, ``foreign_keys=ON`` and a bounded busy timeout.
-  Schema version lives in ``meta``; migrations are forward-only.
+  Schema handling is strict: a genuinely fresh DB is created at v1; an
+  existing DB opens ONLY with an exactly-declared v1; any other declared
+  version (older, newer, malformed) or metadata-less SQLite file is
+  refused fail-closed and never mutated.
+* Threading: ONE reentrant lock serializes the whole of ``open`` /
+  ``on_publish`` (write + retention) / ``health`` / ``query_timeline`` /
+  ``close`` against each other -- exactly one thread may touch the shared
+  SQLite connection at any moment.
 * Privacy: only a whitelisted projection of the decorated snapshot is
   persisted -- counters, timestamps, rates, DEVICE (API USER) names and
   INBOUND tags. Connection ids, source/destination addresses, UUIDs,
@@ -27,13 +34,16 @@ Safety contract (all enforced, all tested):
 * Retention: rows older than the retention horizon are deleted at
   startup and at most hourly; if the database crosses the size ceiling
   the OLDEST rows are pruned in batches until below the target size --
-  newest rows are never sacrificed for old.
+  the two tables are pruned as ONE globally epoch-ordered timeline, so a
+  newer row is never sacrificed while a strictly older row still exists
+  in the other table.
 """
 
 from __future__ import annotations
 
 import datetime
 import os
+import re
 import sqlite3
 import stat
 import threading
@@ -54,6 +64,9 @@ RETENTION_TARGET_BYTES = 48 * 1024 * 1024
 RETENTION_CEILING_BYTES = 64 * 1024 * 1024
 CLEANUP_INTERVAL_SECONDS = 3600.0
 PRUNE_BATCH_ROWS = 512
+# One timeline, two tables: size pruning orders these epochs GLOBALLY
+# (samples first only to settle exact ties at the cut epoch).
+_PRUNE_TABLES = ("timeline_samples", "device_protocol_states")
 
 # Read surface bounds (spec §8): bounded, no arbitrary filters.
 QUERY_LIMIT_DEFAULT = 500
@@ -249,10 +262,15 @@ def project_device_rows(snapshot, run_id, now):
 class IncidentHistory:
     """Bounded SQLite timeline writer + read-only query surface.
 
-    The publisher thread owns all writes via ``on_publish``; HTTP reader
-    threads only call ``query_timeline`` / ``health``. One internal lock
-    serializes both -- writes are rare (>= 5s apart) so contention is a
-    non-issue, and correctness never depends on sqlite's own threading.
+    ONE reentrant lock serializes every public critical section --
+    ``open``, the whole ``on_publish`` write/retention pass, ``health``,
+    ``query_timeline`` and ``close`` -- so exactly one thread ever touches
+    the shared ``check_same_thread=False`` connection. Writes are rare
+    (>= 5s apart) so contention is a non-issue; a reader may wait out one
+    retention VACUUM (bounded by the 64 MiB ceiling), never a torn
+    transaction. The lock is reentrant because internal failure
+    bookkeeping re-enters it; no path acquires it twice in a way that
+    could deadlock (no blocking I/O happens under ``_record_failure``).
     """
 
     def __init__(self, diagnostics_dir, run_id, clock=time.time,
@@ -274,7 +292,7 @@ class IncidentHistory:
         self._ceiling_bytes = float(ceiling_bytes)
         self._cleanup_interval = float(cleanup_interval)
 
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._conn = None
         self._enabled = False
         self._degraded = True
@@ -293,21 +311,27 @@ class IncidentHistory:
         """Validate storage and create/migrate the schema. Fail-soft:
         a refusal flips the health state, it never raises to the caller."""
         try:
-            self._open_locked()
+            with self._lock:
+                self._open_locked()
         except _HistoryError as exc:
             self._record_failure(exc.code)
         except (sqlite3.Error, OSError):
             self._record_failure(CODE_OPEN_FAILED)
 
     def on_publish(self, snapshot, version):
-        """Publication-boundary hook (publisher thread ONLY).
+        """Publication-boundary hook (publisher thread).
+
+        Takes the SAME lock as every reader and ``close``: the whole
+        write/retention pass is one serialized critical section on the
+        shared connection.
 
         Never raises: a history failure must be invisible to the broker
         loop apart from the health state, so one bad disk cannot stop the
         dashboard from serving fresh snapshots.
         """
         try:
-            self._on_publish_locked(snapshot, version)
+            with self._lock:
+                self._on_publish_locked(snapshot, version)
         except _HistoryError as exc:
             self._record_failure(exc.code)
         except (sqlite3.Error, OSError):
@@ -383,15 +407,17 @@ class IncidentHistory:
     def _open_locked(self):
         self._validate_dir()
         self._validate_db_file()
+        # Decide BEFORE connecting whether a file already carries bytes:
+        # a non-empty pre-existing SQLite file with no schema metadata is
+        # an unrelated (or stripped) database and must never be claimed.
+        try:
+            pre_existing = os.path.getsize(self._db_path) > 0
+        except OSError:
+            pre_existing = False
         conn = sqlite3.connect(self._db_path, timeout=BUSY_TIMEOUT_MS / 1000.0,
                                check_same_thread=False)
         try:
-            conn.execute("PRAGMA journal_mode=DELETE")
-            conn.execute("PRAGMA synchronous=FULL")
-            conn.execute("PRAGMA foreign_keys=ON")
-            conn.execute("PRAGMA busy_timeout=%d" % BUSY_TIMEOUT_MS)
-            conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
-            self._ensure_schema(conn)
+            self._enforce_schema(conn, pre_existing)
             conn.commit()
         except BaseException:
             try:
@@ -444,31 +470,74 @@ class IncidentHistory:
             if mode != 0o600:
                 raise _HistoryError(CODE_DB_UNSAFE)
 
-    def _ensure_schema(self, conn):
+    def _enforce_schema(self, conn, pre_existing):
+        """STRICT schema gate -- the whole DB is opened read-only-first.
+
+        Accepted shapes are exactly two: a genuinely fresh database
+        (absent or zero-byte file, no tables) which is created at v1,
+        and an existing database that DECLARES schema_version == 1 and
+        carries the v1 tables. Everything else -- version 0, negative,
+        malformed, newer, meta-less or table-less shapes -- is refused
+        with CODE_SCHEMA_UNSUPPORTED before any pragma, DDL or write can
+        touch the file. In particular no lower version is ever silently
+        rewritten to v1: migrations are explicit and forward-only, and
+        P1 defines none.
+        """
+        conn.execute("PRAGMA busy_timeout=%d" % BUSY_TIMEOUT_MS)
+        tables = {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        if not tables:
+            if pre_existing:
+                # a NON-empty pre-existing SQLite file without our schema
+                # metadata: unrelated or stripped -- never claimed as v1
+                raise _HistoryError(CODE_SCHEMA_UNSUPPORTED)
+            self._apply_pragmas(conn)
+            self._create_schema_v1(conn)
+            return
+        row = None
+        if "meta" in tables:
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key='schema_version'").fetchone()
+        if row is None:
+            raise _HistoryError(CODE_SCHEMA_UNSUPPORTED)
+        raw = row[0]
+        if not isinstance(raw, str) or not re.fullmatch(r"-?\d{1,9}", raw):
+            raise _HistoryError(CODE_SCHEMA_UNSUPPORTED)
+        version = int(raw)
+        if version != SCHEMA_VERSION:
+            # NEWER, ZERO, NEGATIVE or otherwise unknown declared
+            # version: refuse; an explicit forward-only migration is the
+            # ONLY way a future release may adopt it.
+            raise _HistoryError(CODE_SCHEMA_UNSUPPORTED)
+        if not {"timeline_samples", "device_protocol_states"} <= tables:
+            # meta CLAIMS v1 but the v1 shape is not there: unknown old
+            # shape, refuse rather than CREATE-if-not-exists adoption
+            raise _HistoryError(CODE_SCHEMA_UNSUPPORTED)
+        self._apply_pragmas(conn)
+
+    def _apply_pragmas(self, conn):
+        conn.execute("PRAGMA journal_mode=DELETE").fetchall()
+        conn.execute("PRAGMA synchronous=FULL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        # only WRITE the header when the mode actually differs: re-setting
+        # an unchanged auto_vacuum still bumps the change counter, and an
+        # accepted re-open of an exact v1 DB must mutate zero bytes
+        if conn.execute("PRAGMA auto_vacuum").fetchone()[0] != 2:
+            conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
+
+    def _create_schema_v1(self, conn):
+        now = self._clock()
         conn.execute(
-            "CREATE TABLE IF NOT EXISTS meta ("
+            "CREATE TABLE meta ("
             " key TEXT NOT NULL PRIMARY KEY,"
             " value TEXT NOT NULL)")
-        row = conn.execute(
-            "SELECT value FROM meta WHERE key='schema_version'").fetchone()
-        if row is None:
-            now = self._clock()
-            conn.executemany(
-                "INSERT INTO meta (key, value) VALUES (?, ?)",
-                [("schema_version", str(SCHEMA_VERSION)),
-                 ("created_at", _iso(now)),
-                 ("created_by_version", str(self._monitor_version))])
-        else:
-            version = _as_int(row[0], -1)
-            if version > SCHEMA_VERSION:
-                # written by a NEWER monitor: never downgrade in place
-                raise _HistoryError(CODE_SCHEMA_UNSUPPORTED)
-            # forward-only migrations land here (P1: version 1 is current)
-            conn.execute(
-                "INSERT OR REPLACE INTO meta (key, value)"
-                " VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
+        conn.executemany(
+            "INSERT INTO meta (key, value) VALUES (?, ?)",
+            [("schema_version", str(SCHEMA_VERSION)),
+             ("created_at", _iso(now)),
+             ("created_by_version", str(self._monitor_version))])
         conn.execute(
-            "CREATE TABLE IF NOT EXISTS timeline_samples ("
+            "CREATE TABLE timeline_samples ("
             " epoch REAL NOT NULL,"
             " iso_utc TEXT NOT NULL,"
             " run_id TEXT NOT NULL,"
@@ -489,10 +558,9 @@ class IncidentHistory:
             " identity_conflicts INTEGER NOT NULL,"
             " abandoned_on_reset INTEGER NOT NULL)")
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_samples_epoch"
-            " ON timeline_samples(epoch)")
+            "CREATE INDEX idx_samples_epoch ON timeline_samples(epoch)")
         conn.execute(
-            "CREATE TABLE IF NOT EXISTS device_protocol_states ("
+            "CREATE TABLE device_protocol_states ("
             " epoch REAL NOT NULL,"
             " iso_utc TEXT NOT NULL,"
             " run_id TEXT NOT NULL,"
@@ -506,10 +574,10 @@ class IncidentHistory:
             " downlink_total REAL NOT NULL,"
             " reason TEXT NOT NULL CHECK (reason IN ('change','heartbeat')))")
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_states_epoch"
+            "CREATE INDEX idx_states_epoch"
             " ON device_protocol_states(epoch)")
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_states_device"
+            "CREATE INDEX idx_states_device"
             " ON device_protocol_states(device, inbound, epoch)")
 
     # -- publish hook internals ----------------------------------------------------
@@ -622,34 +690,58 @@ class IncidentHistory:
             self._record_failure(CODE_RETENTION_FAILED)
 
     def _prune_to_target(self):
-        """Delete OLDEST rows in proportionate batches until below the target.
+        """Delete globally OLDEST rows -- both tables as ONE timeline.
 
-        Newest-first deletion is forbidden by contract: a retention run may
-        only ever forget the past, never the present. File size can ONLY be
+        Contract: no row at time T2 may be deleted while a strictly
+        older row at T1 still exists in EITHER table; the survivors are
+        always a newest-suffix of the merged epoch order. Ties at the
+        cut epoch are settled deterministically (samples before states,
+        insertion order within a table). File size can ONLY be
         re-measured after a full VACUUM: incremental vacuum releases free
         pages at the END of the file, but oldest-first deletes free pages
         behind live newest rows -- without the rewrite the measured size
         never drops and the loop would drain the whole table.
         """
-        for _table in ("timeline_samples", "device_protocol_states"):
-            while self._db_bytes() > self._target_bytes:
-                total = self._conn.execute(
-                    "SELECT COUNT(*) FROM %s" % _table).fetchone()[0]
-                if total <= 0:
+        while self._db_bytes() > self._target_bytes:
+            bytes_now = self._db_bytes()
+            counts = [self._conn.execute(
+                "SELECT COUNT(*) FROM %s" % table).fetchone()[0]
+                for table in _PRUNE_TABLES]
+            total = sum(counts)
+            if total <= 0:
+                return
+            # k globally-oldest rows, k >= a minimum batch and >= 10% of
+            # the rows: guaranteed forward progress, never a newer time
+            # before an older one.
+            k = max(PRUNE_BATCH_ROWS,
+                    int(total * max((bytes_now - self._target_bytes)
+                                    / float(bytes_now), 0.10)) + 1)
+            k = min(k, total)
+            cut = self._conn.execute(
+                "SELECT epoch FROM ("
+                " SELECT epoch FROM timeline_samples"
+                " UNION ALL"
+                " SELECT epoch FROM device_protocol_states)"
+                " ORDER BY epoch ASC LIMIT 1 OFFSET ?",
+                (k - 1,)).fetchone()[0]
+            remaining = k
+            for table in _PRUNE_TABLES:       # strictly older than the cut
+                if remaining <= 0:
                     break
-                bytes_now = self._db_bytes()
-                # At least 10% and always a minimum batch: guarantees forward
-                # progress without ever touching the newest suffix first.
-                batch = max(PRUNE_BATCH_ROWS,
-                            int(total * max((bytes_now - self._target_bytes)
-                                            / float(bytes_now), 0.10)) + 1)
-                self._conn.execute(
+                cursor = self._conn.execute(
+                    "DELETE FROM %s WHERE epoch < ?" % table, (cut,))
+                remaining -= max(cursor.rowcount, 0)
+            for table in _PRUNE_TABLES:       # top up AT the cut epoch only
+                if remaining <= 0:
+                    break
+                cursor = self._conn.execute(
                     "DELETE FROM %s WHERE rowid IN (SELECT rowid FROM %s"
-                    " ORDER BY epoch ASC LIMIT ?)" % (_table, _table),
-                    (batch,))
-                self._conn.commit()
-                self._conn.execute("VACUUM")
-                self._conn.commit()
+                    " WHERE epoch = ? ORDER BY rowid ASC LIMIT ?)"
+                    % (table, table), (cut, remaining))
+                remaining -= max(cursor.rowcount, 0)
+            self._conn.commit()
+            self._conn.execute("VACUUM")
+            self._conn.commit()
 
     def _vacuum(self):
         try:
@@ -675,11 +767,18 @@ class IncidentHistory:
     # -- failure bookkeeping ----------------------------------------------------------
 
     def _record_failure(self, code):
-        self._failure_count += 1
-        self._degraded = True
-        self._last_error_code = code
-        if code in (CODE_DIR_UNSAFE, CODE_DB_UNSAFE, CODE_OPEN_FAILED):
-            self._enabled = False
+        # RLock: safe to re-enter from a call site that already holds it;
+        # pure field bookkeeping, no I/O, so it can never hold the lock
+        # long enough to matter and can never deadlock.
+        with self._lock:
+            self._failure_count += 1
+            self._degraded = True
+            self._last_error_code = code
+            if code in (CODE_DIR_UNSAFE, CODE_DB_UNSAFE, CODE_OPEN_FAILED,
+                        CODE_SCHEMA_UNSUPPORTED):
+                # a refused OPEN is fail-closed: the surface is NOT enabled
+                # until a later open() succeeds (never a stale True)
+                self._enabled = False
 
 
 class _HistoryError(Exception):
