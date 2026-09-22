@@ -518,18 +518,26 @@
 
   function loadE3Status(background) {
     if (!state.session || !state.session.authenticated) return;
+    // 0.1.4 review (blocker 2): while a convergence owns the view, plain
+    // reads are suppressed AT THE ENTRY -- no request, no generation bump
+    // and above all no synchronous ``state.e3Status = null`` below, which
+    // for a foreground Refresh would flicker Unavailable before any network
+    // response exists. That is the exact visible flicker convergence removes.
+    if (state.e3Convergence) return Promise.resolve();
     var generation = state.e3StatusGeneration = (state.e3StatusGeneration || 0) + 1;
     // A background poll retains the last fresh verdict for at most 10s;
     // it must not close a delete confirmation while the user is typing.
     if (!background) state.e3Status = null;
     renderE3Controls();
     return api("/api/v1/management/status").then(function (data) {
-      if (generation !== state.e3StatusGeneration) return;
+      // Defence in depth: also retired if a convergence became active while
+      // this read was in flight (generation normally catches that first).
+      if (generation !== state.e3StatusGeneration || state.e3Convergence) return;
       state.e3Status = data;
       state.e3StatusAt = Date.now();
       renderE3Controls();
     }).catch(function () {
-      if (generation !== state.e3StatusGeneration) return;
+      if (generation !== state.e3StatusGeneration || state.e3Convergence) return;
       state.e3Status = null;
       renderE3Controls();
     });
@@ -551,10 +559,20 @@
 
   function loadE3Clients() {
     if (!state.session || !state.session.authenticated) return;
+    // 0.1.4 review (blocker 2): suppressed at the entry while a convergence
+    // owns the view -- see loadE3Status above.
+    if (state.e3Convergence) return Promise.resolve();
+    // 0.1.4: the list gets the same generation discipline the status read
+    // already had -- a convergence apply (or a newer poll) retires anything
+    // still in flight, so an old list response can never overwrite the view.
+    var generation = state.e3ClientsGeneration =
+        (state.e3ClientsGeneration || 0) + 1;
     return api("/api/v1/clients").then(function (data) {
+      if (generation !== state.e3ClientsGeneration || state.e3Convergence) return;
       state.e3Clients = data;
       renderE3Clients(data);
     }).catch(function (error) {
+      if (generation !== state.e3ClientsGeneration || state.e3Convergence) return;
       // B4: only error/fixed text here -- never an undefined variable.
       var body = $("e3-clients-body");
       body.innerHTML = "";
@@ -565,17 +583,55 @@
     });
   }
 
-  function refreshClientsAfterMutation() {
-    // 0.1.3 post-mutation convergence. The server expired its status/list
-    // caches the moment the mutation reached CONFIRMED success, so these
-    // reads are answered by fresh helper RPCs immediately -- no TTL, no
-    // watchdog wait. Fixed ordering: fresh management.status FIRST (as a
-    // background-style read, so the last known good view is kept while the
-    // request is in flight; on failure loadE3Status still clears the state
-    // and the existing fail-closed path takes over), then the list. This
-    // helper never writes #e3-msg, so the success message survives it.
-    return Promise.resolve(loadE3Status(true)).then(function () {
-      return loadE3Clients();
+  function supersedePlainReads() {
+    // Bump both read generations: anything in flight is retired the moment
+    // a convergence starts AND again when it lands (a poll issued during
+    // the convergence window carries data the server answered BEFORE the
+    // freshest truth and must never overwrite the applied pair).
+    state.e3StatusGeneration = (state.e3StatusGeneration || 0) + 1;
+    state.e3ClientsGeneration = (state.e3ClientsGeneration || 0) + 1;
+  }
+
+  function convergeAfterMutation() {
+    // 0.1.4 post-mutation convergence: ONE session-gated, read-only server
+    // round-trip (GET /api/v1/clients/convergence) that force-refreshes
+    // management.status THEN client.list and answers ok ONLY when both are
+    // fresh. The frontend applies the pair atomically -- badge, controls
+    // and table all move on the same render pass, so the ~2-5s
+    // "Unavailable" window created by the separate TTL-gated reads is gone
+    // and no half-fresh state is ever displayed. Convergence outranks the
+    // watchdog: generations retire every older in-flight status/list read
+    // at start and at apply. Failure fails closed (status cleared ->
+    // e3Writable() false -> no controls): never a fake Available, never a
+    // sleep, never a retry loop. Like the 0.1.3 helper it never touches
+    // #e3-msg, so the success copy survives.
+    supersedePlainReads();
+    var token = state.e3Convergence = {};   // last call wins
+    return api("/api/v1/clients/convergence").then(function (data) {
+      if (state.e3Convergence !== token) return;   // superseded
+      state.e3Convergence = null;
+      var s = data && data.status;
+      var c = data && data.clients;
+      if (!data || data.ok !== true || !s || !c ||
+          s.transport !== "fresh" || c.transport !== "fresh") {
+        // Defence in depth: a non-all-fresh body is treated exactly like a
+        // failure -- fail closed, do not render a half-truth.
+        supersedePlainReads();
+        state.e3Status = null;
+        renderE3Controls();
+        return;
+      }
+      supersedePlainReads();
+      state.e3Status = s;
+      state.e3StatusAt = Date.now();
+      state.e3Clients = c;
+      renderE3Controls();   // one atomic pass: controls + table together
+    }).catch(function () {
+      if (state.e3Convergence !== token) return;
+      state.e3Convergence = null;
+      supersedePlainReads();
+      state.e3Status = null;   // fail closed; the list stays but unwritable
+      renderE3Controls();
     });
   }
 
@@ -651,9 +707,10 @@
       hide($("e3-delete-box"));
       e3Message("Client deleted.", false);
       loadSession();
-      // 0.1.3: coordinated immediate convergence (server caches are already
-      // invalidated for this confirmed delete).
-      refreshClientsAfterMutation();
+      // 0.1.4: the single convergence read applies fresh status+list
+      // atomically (the server caches are already invalidated for this
+      // confirmed delete).
+      convergeAfterMutation();
     }).catch(function (error) {
       if (error.status === 504 && error.uncertain) {
         setPendingRetry({ path: "/api/v1/clients/delete", name: name,
@@ -744,9 +801,10 @@
       e3Message("Client created. Download its configuration below.",
                 false);
       $("e3-add-name").value = "";
-      // 0.1.3: coordinated immediate convergence (server caches are already
-      // invalidated for this confirmed add).
-      refreshClientsAfterMutation();
+      // 0.1.4: the single convergence read applies fresh status+list
+      // atomically (the server caches are already invalidated for this
+      // confirmed add).
+      convergeAfterMutation();
     }).catch(function (error) {
       if (error.status === 504 && error.uncertain) {
         setPendingRetry({ path: "/api/v1/clients/add", name: name,

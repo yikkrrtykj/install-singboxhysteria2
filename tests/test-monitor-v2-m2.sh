@@ -1597,6 +1597,248 @@ def group_http_post_mutation_invalidation():
     return out
 
 
+def group_status_force():
+    """0.1.4 status(force=True): defeats the TTL fast path and the attempt
+    throttle, but NEVER the single-flight lock, the 0.1.3 epoch rule or an
+    OPEN breaker."""
+    out = {}
+    clock = FakeClock()
+    client = FakeClient()
+    broker = new_broker(client, clock)
+
+    # -- TTL bypass ---------------------------------------------------------
+    broker.status()                                   # seed (one RPC)
+    n = len(client.calls)
+    r = broker.status()
+    out["force_non_force_within_ttl_still_shares_cache"] = (
+        r["transport"] == "fresh" and len(client.calls) == n)
+    client.record(ok_status(active=True))
+    r = broker.status(force=True)
+    out["force_bypasses_ttl_exactly_one_new_call"] = (
+        len(client.calls) == n + 1 and r["transport"] == "fresh")
+    data = r["payload"].get("data", {})
+    out["force_result_is_the_new_snapshot"] = data.get("management_active") is True
+
+    # -- attempt-throttle bypass -------------------------------------------
+    clock.advance(2.5)                                # cache now stale
+    client.reset_script()
+    client.record(RuntimeError("stream EOF"))
+    r = broker.status()                               # fails -> throttle arms
+    out["plain_read_after_failed_attempt_is_throttled"] = (
+        r["transport"] == "stale" and len(client.calls) == n + 2)
+    client.record(ok_status())
+    r = broker.status(force=True)
+    out["force_bypasses_attempt_throttle"] = (
+        len(client.calls) == n + 3 and r["transport"] == "fresh")
+
+    # -- open breaker is NEVER bypassed ------------------------------------
+    # Trip it: three failures, each separated past the throttle window.
+    for i in range(3):
+        clock.advance(2.5)
+        client.reset_script()
+        client.record(RuntimeError("stream EOF"))
+        broker.status()
+    out["breaker_open_after_three_failures"] = broker.breaker_state() == "open"
+    n = len(client.calls)
+    r = broker.status(force=True)                     # inside the cooldown
+    out["force_does_not_bypass_open_breaker"] = (
+        len(client.calls) == n and r["transport"] == "stale")
+    # An ELAPSED cooldown still arms exactly one half-open probe: force may
+    # dispatch then (that is the breaker's own defined transition, not a
+    # bypass).
+    clock.advance(10.1)
+    client.reset_script()
+    client.record(ok_status())
+    r = broker.status(force=True)
+    out["force_performs_half_open_probe_after_cooldown"] = (
+        len(client.calls) == n + 1 and r["transport"] == "fresh"
+        and broker.breaker_state() == "closed")
+
+    # -- epoch rules still apply to forced reads ----------------------------
+    clock.advance(2.5)                                # force the next refresh
+    client.reset_script()
+    client.record("BLOCK")
+    client.record(dict(ok_status(), request_id="OLD-FORCED"))
+    box = {}
+
+    def forced():
+        box["r"] = broker.status(force=True)
+
+    t = threading.Thread(target=forced)
+    t.start()
+    client.entered.wait(5)                            # RPC is in flight
+    broker.invalidate_after_client_mutation()         # confirmed mutation
+    client.release.set()
+    t.join(10)
+    client.release.clear()
+    out["forced_pre_invalidation_result_is_not_fresh"] = (
+        box["r"]["transport"] != "fresh")
+    cached = broker._status_cache
+    out["forced_pre_invalidation_never_published"] = not (
+        isinstance(cached, dict) and isinstance(cached.get("payload"), dict)
+        and cached["payload"].get("request_id") == "OLD-FORCED")
+
+    # -- single-flight is kept under force ----------------------------------
+    clock.advance(2.5)
+    client.reset_script()
+    client.record("BLOCK")
+    client.record(ok_status())
+    holder = threading.Thread(target=lambda: broker.status(force=True))
+    holder.start()
+    client.entered.wait(5)
+    n = len(client.calls)                             # only the holder so far
+    results = threads_barrier(3, lambda: broker.status(force=True))
+    holder.join(10)
+    client.release.clear()
+    # every waiter owns its own forced refresh (force never shares a cached
+    # winner) -- but at most ONE RPC is ever inside the client at a time:
+    # the flight lock serialized all four.
+    out["force_keeps_single_flight"] = (
+        len(client.calls) == n + 3
+        and all(r["transport"] == "fresh" for r in results))
+    return out
+
+
+def group_http_convergence_endpoint():
+    """GET /api/v1/clients/convergence: session-gated, GET-only read that
+    force-refreshes status THEN list and answers ok ONLY when both are
+    fresh; everything else fails closed (503 / helper verdict table)."""
+    out = {}
+    clock = FakeClock()
+    client = FakeClient()
+    broker = new_broker(client, clock)
+    inv = {"n": 0}
+    _orig = broker.invalidate_after_client_mutation
+
+    def spy():
+        inv["n"] += 1
+        return _orig()
+
+    broker.invalidate_after_client_mutation = spy
+    stack = M2Stack(e3_broker=broker)
+    port = stack.port
+    try:
+        # -- session gate ----------------------------------------------------
+        r = req(port, "GET", "/api/v1/clients/convergence", {})
+        out["convergence_anonymous_401"] = r["status"] == 401
+        cookie = login(port)
+        csrf = session_info(port, cookie)["csrf_token"]
+
+        # -- both fresh: one atomic sanitized envelope ----------------------
+        client.record(ok_status(active=True))
+        client.record({"ok": True, "request_id": "cv-list-1",
+                       "data": {"clients": [
+                           {"name": "legacy", "mutable": False,
+                            "source": "untracked", "secret": "x"}],
+                           "truncated": False, "leaked_field": "nope"}})
+        inv0 = inv["n"]
+        r = req(port, "GET", "/api/v1/clients/convergence", {"Cookie": cookie})
+        body = json.loads(r["body"])
+        st = body.get("status") or {}
+        cl = body.get("clients") or {}
+        out["convergence_200_all_fresh"] = (
+            r["status"] == 200 and body.get("ok") is True
+            and st.get("transport") == "fresh"
+            and cl.get("transport") == "fresh")
+        out["convergence_status_sanitized"] = (
+            st.get("data", {}).get("management_state") == "active"
+            and "path" not in st.get("data", {}).get("lock", {})
+            and "leaked_field" not in st.get("data", {})
+            and "secret" not in st.get("data", {})
+            and st.get("management_active") is True
+            and isinstance(st.get("monitor_running"), bool))
+        client0 = cl.get("data", {}).get("clients", [{}])[0]
+        out["convergence_clients_sanitized"] = (
+            client0.get("name") == "legacy" and "secret" not in client0
+            and cl.get("data", {}).get("truncated") is False)
+        out["convergence_is_read_only"] = inv["n"] == inv0
+        out["convergence_no_mutation_rpc"] = "client.add" not in client.calls
+
+        # -- GET-only surface -----------------------------------------------
+        r = req(port, "POST", "/api/v1/clients/convergence",
+                {"Content-Type": "application/json", "Cookie": cookie,
+                 "X-CSRF-Token": csrf}, "{}")
+        out["convergence_post_405"] = r["status"] == 405
+
+        # -- status refresh fails -> 503, never a half-answer ---------------
+        clock.advance(2.5)
+        client.reset_script()
+        client.record(RuntimeError("stream EOF"))
+        n_status = client.calls.count("management.status")
+        n_list = client.calls.count("client.list")
+        r = req(port, "GET", "/api/v1/clients/convergence", {"Cookie": cookie})
+        body = json.loads(r["body"])
+        out["convergence_status_failure_503"] = (
+            r["status"] == 503 and body.get("ok") is False
+            and body.get("code") == "e3_unavailable")
+        out["convergence_status_failure_skips_list"] = (
+            client.calls.count("client.list") == n_list)
+
+        # -- list fails after a fresh status -> still 503 (all-or-nothing) ---
+        clock.advance(2.5)
+        client.reset_script()
+        client.record(ok_status(active=True))
+        client.record(RuntimeError("stream EOF"))
+        r = req(port, "GET", "/api/v1/clients/convergence", {"Cookie": cookie})
+        out["convergence_list_failure_503"] = r["status"] == 503
+
+        # -- helper semantic verdict keeps its own mapping (not 200) --------
+        clock.advance(2.5)
+        client.reset_script()
+        client.record({"ok": False, "request_id": "cv-lock",
+                       "error": {"code": "E_LOCK", "stage": "lock",
+                                 "retriable": True, "detail": "busy"}})
+        r = req(port, "GET", "/api/v1/clients/convergence", {"Cookie": cookie})
+        out["convergence_verdict_maps_through_error_table"] = (
+            r["status"] == 423 and json.loads(r["body"]).get("code") == "E_LOCK")
+
+        # -- open breaker is not bypassed through the endpoint --------------
+        for i in range(3):
+            clock.advance(2.5)
+            client.reset_script()
+            client.record(RuntimeError("stream EOF"))
+            broker.status()
+        out["convergence_breaker_open_setup"] = broker.breaker_state() == "open"
+        n_status = client.calls.count("management.status")
+        r = req(port, "GET", "/api/v1/clients/convergence", {"Cookie": cookie})
+        out["convergence_never_bypasses_open_breaker"] = (
+            r["status"] == 503
+            and client.calls.count("management.status") == n_status)
+        clock.advance(10.1)                           # heal via half-open
+        client.reset_script()
+        client.record(ok_status(active=True))
+        broker.status()
+
+        # -- the integration point: right after a confirmed add, with NO
+        # clock movement at all, one convergence read returns fresh truth.
+        step_up(port, cookie, csrf)
+        client.reset_script()
+        client.record({"ok": True, "request_id": "cv-add", "data": {}})
+        r = mutate(port, "/api/v1/clients/add", cookie, csrf,
+                   {"Idempotency-Key": "conv-key-%016d" % 77},
+                   json.dumps({"name": "cv-07"}))
+        out["convergence_after_add_precondition"] = r["status"] == 200
+        client.reset_script()
+        client.record(ok_status(active=True))
+        client.record({"ok": True, "request_id": "cv-list-2",
+                       "data": {"clients": [
+                           {"name": "legacy", "mutable": False},
+                           {"name": "cv-07", "mutable": True}],
+                           "truncated": False}})
+        r = req(port, "GET", "/api/v1/clients/convergence", {"Cookie": cookie})
+        body = json.loads(r["body"])
+        names = [c.get("name") for c in
+                 body.get("clients", {}).get("data", {}).get("clients", [])]
+        out["convergence_fresh_immediately_after_add_no_ttl_wait"] = (
+            r["status"] == 200
+            and body.get("status", {}).get("transport") == "fresh"
+            and body.get("clients", {}).get("transport") == "fresh"
+            and "cv-07" in names)
+    finally:
+        stack.stop()
+    return out
+
+
 # --------------------------------------------------------- transport (POSIX) --
 class MockHelper(socketserver.BaseRequestHandler):
     def handle(self):
@@ -1725,6 +1967,8 @@ def main():
     out.update(group_export_http())
     out.update(group_post_mutation_invalidation())
     out.update(group_http_post_mutation_invalidation())
+    out.update(group_status_force())
+    out.update(group_http_convergence_endpoint())
     with tempfile.TemporaryDirectory() as tmpdir:
         out.update(group_rpc_transport(tmpdir))
     sys.stdout.write(json.dumps(out))

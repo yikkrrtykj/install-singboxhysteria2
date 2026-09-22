@@ -141,15 +141,24 @@ class E3Broker:
                     "request_id": verdict.get("request_id")}}
 
     # ------------------------------------------------------------ status --
-    def status(self):
+    def status(self, force=False):
         """management.status via the cache. Returns
         ``{"transport", "payload", "as_of"}`` -- never raises for transport
-        problems (``payload is None`` marks unavailable)."""
+        problems (``payload is None`` marks unavailable).
+
+        0.1.4: ``force=True`` (the convergence endpoint) bypasses the TTL
+        fast path and the attempt throttle so the read performs a real
+        refresh -- but NOTHING else: the single-flight lock, the breaker
+        gate (an OPEN breaker within its cooldown still refuses without
+        dispatching; an elapsed cooldown still arms exactly one half-open
+        probe) and the 0.1.3 generation-epoch rule all keep their exact
+        semantics, so a forced snapshot can still be retired by a
+        confirmed mutation that lands mid-flight."""
         now = self._clock()
         with self._mutex:
             cache = self._status_cache
             transport, _ = self._serve(cache, now, self.status_ttl)
-        if transport is FRESH:
+        if transport is FRESH and not force:
             return self._result(FRESH, cache)
 
         with self._status_flight:
@@ -157,13 +166,16 @@ class E3Broker:
             with self._mutex:
                 cache = self._status_cache
                 transport, _ = self._serve(cache, now, self.status_ttl)
-                if transport is FRESH:
+                if transport is FRESH and not force:
                     return self._result(FRESH, cache)
                 # Attempt throttle first: at most one refresh attempt per TTL
                 # window, so concurrent misses share one outcome instead of
                 # fanning out. (Cooldown 10s > TTL 2s, so this never starves
-                # the half-open probe below.)
-                if now - self._status_attempted_at < self.status_ttl:
+                # the half-open probe below.) force=True is the named
+                # exception: the convergence endpoint must not be throttled
+                # by an attempt that predates its confirmed mutation.
+                if not force \
+                        and now - self._status_attempted_at < self.status_ttl:
                     return self._result(
                         STALE if cache is not None else UNAVAILABLE, cache)
                 # Breaker gate: an open breaker (cooldown active) blocks all
