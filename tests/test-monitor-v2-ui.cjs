@@ -323,16 +323,32 @@ async function main() {
     assert.ok(ui.state.e3Convergence);
     assert.equal(requests.slice(-1)[0].url, '/api/v1/clients/convergence');
   });
-  responses.push(response({transport: 'stale'}),                    // watchdog: stale
-                 response({transport: 'fresh', data: {clients: []}})); // list: old/empty
-  const winStatus = ui.loadE3Status(true);   // watchdog-style start mid-window
-  const winList = ui.loadE3Clients();        // manual list start mid-window
-  await winStatus; await winList; await flush();
-  check('ordinary reads landing mid-window cannot regress the held view', () => {
+  // 0.1.4 review blockers 1+2: reads starting inside the convergence window
+  // are suppressed AT THE ENTRY -- no request, no generation bump, and a
+  // foreground loadE3Status() must not synchronously clear the view.
+  const reqsBefore = requests.length;
+  const genS = ui.state.e3StatusGeneration;
+  const genC = ui.state.e3ClientsGeneration;
+  const fg = ui.loadE3Status();          // foreground Refresh client list
+  check('mid-window foreground loadE3Status() is a no-op: zero requests, zero UI change, synchronously', () => {
+    assert.ok(fg && typeof fg.then === 'function');   // resolved, never fetched
+    assert.equal(requests.length, reqsBefore);
+    assert.equal(ui.state.e3StatusGeneration, genS);
     assert.equal(ids['e3-availability'].textContent, 'Available');
     assert.equal(ids['e3-add-btn'].disabled, false);
     assert.equal(ids['e3-clients-body'].children.length, 2);
     assert.match(ids['e3-clients-body'].textContent, /Download/);
+  });
+  const bg = ui.loadE3Status(true);      // watchdog tick mid-window
+  const lp = ui.loadE3Clients();         // plain list read mid-window
+  check('mid-window watchdog/list reads are suppressed too, generations untouched', () => {
+    assert.equal(requests.length, reqsBefore);
+    assert.equal(ui.state.e3ClientsGeneration, genC);
+  });
+  await fg; await bg; await lp; await flush();
+  check('the held view still shows no regression after the suppressed reads', () => {
+    assert.equal(ids['e3-availability'].textContent, 'Available');
+    assert.equal(ids['e3-clients-body'].children.length, 2);
     assert.doesNotMatch(ids['e3-clients-body'].textContent, /No clients found/);
   });
   finishConv(conv(healthy(), withBob));
@@ -414,6 +430,6 @@ async function main() {
     assert.ok(!ids['mg-activate'] && !ids['mg-deactivate']);
     assert.ok(requests.every(r => !/management\/(activate|deactivate)/.test(r.url))); productText();
   });
-  assert.equal(count, 50, 'UI assertion count guard');
+  assert.equal(count, 52, 'UI assertion count guard');
 }
 main().catch(err => { console.error(err); process.exitCode = 1; });

@@ -518,15 +518,20 @@
 
   function loadE3Status(background) {
     if (!state.session || !state.session.authenticated) return;
+    // 0.1.4 review (blocker 2): while a convergence owns the view, plain
+    // reads are suppressed AT THE ENTRY -- no request, no generation bump
+    // and above all no synchronous ``state.e3Status = null`` below, which
+    // for a foreground Refresh would flicker Unavailable before any network
+    // response exists. That is the exact visible flicker convergence removes.
+    if (state.e3Convergence) return Promise.resolve();
     var generation = state.e3StatusGeneration = (state.e3StatusGeneration || 0) + 1;
     // A background poll retains the last fresh verdict for at most 10s;
     // it must not close a delete confirmation while the user is typing.
     if (!background) state.e3Status = null;
     renderE3Controls();
     return api("/api/v1/management/status").then(function (data) {
-      // Retired if superseded by a newer read OR a convergence owns the
-      // view right now (0.1.4 review: a poll started inside the convergence
-      // window must never land a stale status before the convergence does).
+      // Defence in depth: also retired if a convergence became active while
+      // this read was in flight (generation normally catches that first).
       if (generation !== state.e3StatusGeneration || state.e3Convergence) return;
       state.e3Status = data;
       state.e3StatusAt = Date.now();
@@ -554,6 +559,9 @@
 
   function loadE3Clients() {
     if (!state.session || !state.session.authenticated) return;
+    // 0.1.4 review (blocker 2): suppressed at the entry while a convergence
+    // owns the view -- see loadE3Status above.
+    if (state.e3Convergence) return Promise.resolve();
     // 0.1.4: the list gets the same generation discipline the status read
     // already had -- a convergence apply (or a newer poll) retires anything
     // still in flight, so an old list response can never overwrite the view.
