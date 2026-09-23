@@ -28,7 +28,7 @@ export WEBAPP="$ROOT/monitor-v2/webapp.py"
 
 PASS=0
 FAIL=0
-EXPECTED_PASS=196
+EXPECTED_PASS=205
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
@@ -139,6 +139,7 @@ real loopback HTTP server for the read surface."""
 import http.client
 import json
 import os
+import re
 import sqlite3
 import stat
 import sys
@@ -266,9 +267,11 @@ def rows_of(h):
 
 # -- P2B journal ingest helpers ----------------------------------------------
 from journal_reader import schema as JR  # noqa: E402 (harness-side fixture)
+from journal_reader import ingest_contract as JC  # noqa: E402
 from web.incident_history import (CODE_INGEST_APPLY_FAILED,  # noqa: E402
-                                  JOURNAL_BOUNDARIES, JOURNAL_CLASSES,
-                                  JOURNAL_DCLS, JOURNAL_PROTOS)
+                                  JOURNAL_AUDIT_CODES, JOURNAL_BOUNDARIES,
+                                  JOURNAL_CLASSES, JOURNAL_DCLS,
+                                  JOURNAL_PROTOS)
 
 JR_RUN = "0123456789abcdef0123456789abcdef"
 
@@ -1434,6 +1437,43 @@ def group_migrate():
         idem = idem and hx.health()["enabled"] and db_bytes(d2) == bytes_d2
         hx.close()
     out["v2_reopen_repeatable_zero_bytes"] = idem
+    # ---- HARDENING-2 (review): "exact shape" means table-set EQUALITY.
+    # An UNRELATED extra table alongside a declared shape is a stranger
+    # this module never created: refused under BOTH declarations, zero
+    # bytes mutated, and -- for the v1 claim -- never migrated.
+    connx = sqlite3.connect(os.path.join(d1, "diagnostics",
+                                         "history.sqlite3"))
+    connx.execute("UPDATE meta SET value='2' WHERE key='schema_version'")
+    connx.execute("CREATE TABLE stranger (x INTEGER)")
+    connx.commit()
+    connx.close()
+    bytes_x = db_bytes(d1)
+    hx1 = IncidentHistory(os.path.join(d1, "diagnostics"), "mig-extra-v2",
+                          clock=lambda: T0)
+    hx1.open()
+    out["v2_extra_table_refused_zero_bytes"] = (
+        not hx1.health()["enabled"]
+        and hx1.health()["last_error_code"] == CODE_SCHEMA_UNSUPPORTED
+        and db_bytes(d1) == bytes_x)
+    hx1.close()
+    d5 = make_v1_db(T0 - 60.0)
+    connx = sqlite3.connect(os.path.join(d5, "diagnostics",
+                                         "history.sqlite3"))
+    connx.execute("CREATE TABLE stranger (x INTEGER)")
+    connx.commit()
+    connx.close()
+    bytes_x5 = db_bytes(d5)
+    hx2 = IncidentHistory(os.path.join(d5, "diagnostics"), "mig-extra-v1",
+                          clock=lambda: T0)
+    hx2.open()
+    tables_x, meta_x, _ = _db_shape(d5)
+    out["v1_extra_table_refused_zero_bytes"] = (
+        not hx2.health()["enabled"]
+        and hx2.health()["last_error_code"] == CODE_SCHEMA_UNSUPPORTED
+        and meta_x.get("schema_version") == "1"
+        and "stranger" in tables_x and not (tables_x & JOURNAL_TABLE_NAMES)
+        and db_bytes(d5) == bytes_x5)
+    hx2.close()
     return out
 
 
@@ -1741,6 +1781,60 @@ def group_ingest():
         and JOURNAL_BOUNDARIES == tuple(JR.BOUNDS)
         and JOURNAL_DCLS[0] == "NONE"
         and JOURNAL_DCLS[1:] == tuple(JR.DCLS))
+    # ---- HARDENING-1 (review): journal_ingest_audit.code is a CLOSED
+    # vocabulary. (a) every disposition-code LITERAL in the two frozen
+    # contract sources is a member of JOURNAL_AUDIT_CODES (so no call
+    # site can ever hand the audit table a string the DB would not
+    # accept), and every member except the Monitor-derived gap marker is
+    # such a literal; (b) the DB accepts exactly that set and nothing
+    # else -- free text, a bare prefix and a credential-like string all
+    # hit the CHECK.
+    literals = set()
+    for mod in (JC, JR):
+        with open(mod.__file__, "r") as fh:
+            literals.update(re.findall(r'"(exchange_[a-z_]+)"',
+                                       fh.read()))
+    out["audit_code_enum_exact_vs_contract"] = (
+        literals == {c for c in JOURNAL_AUDIT_CODES
+                     if c != "sequence_gap"}
+        and "sequence_gap" in JOURNAL_AUDIT_CODES)
+    accepted = 0
+    for code in JOURNAL_AUDIT_CODES:
+        try:
+            h._conn.execute(
+                "INSERT INTO journal_ingest_audit (epoch, kind, seq,"
+                " code) VALUES (?, 'rejected', ?, ?)", (T0, 9000, code))
+            accepted += 1
+        except sqlite3.Error:
+            pass
+    h._conn.rollback()
+    denies = 0
+    for bad_code in ("SELECT * FROM credentials", S_PW,
+                     "exchange_" + "x" * 80, "sequence_gap "):
+        try:
+            h._conn.execute(
+                "INSERT INTO journal_ingest_audit (epoch, kind, seq,"
+                " code) VALUES (?, 'rejected', ?, ?)", (T0, 9001, bad_code))
+            h._conn.rollback()
+        except sqlite3.IntegrityError:
+            denies += 1
+    out["audit_db_rejects_arbitrary_code"] = (
+        accepted == len(JOURNAL_AUDIT_CODES) and denies == 4)
+    # (c) production call-site proof: settle a rejection with a code
+    # OUTSIDE the mirror (a future contract could invent one) -- the
+    # settlement FAILS fail-closed: no audit/state row, blocked, journal
+    # degraded, terminal NOT advanced.
+    hu = ingest_history()
+    res_u = {"consumed": 0, "gaps": 0, "rejected": 0, "blocked_at": None}
+    ok = hu._journal_settle_rejected(1, "exchange_invented_code", T0,
+                                     res_u)
+    _ru, _eu, st_u, au_u = journal_dump(hu)
+    out["audit_unknown_code_settlement_refused"] = (
+        ok is False and res_u["blocked_at"] == 1 and not au_u
+        and st_u == (0, None, 0, 0)
+        and hu.health()["degraded"]
+        and hu.health()["last_error_code"] == CODE_INGEST_APPLY_FAILED)
+    hu.close()
     h.close()
     h2.close()
     h3.close()
@@ -1943,6 +2037,45 @@ def group_ingest2():
         not any(s in payload for s in SENTINELS)
         and h6._out not in payload and h6._tmpdir not in payload)
     h6.close()
+    # ---- BLOCKER regression (review): a journal apply failure in the
+    # SAME on_publish whose ordinary sample write SUCCEEDS must still
+    # leave the history degraded with the ingest code. The write path
+    # clears only its OWN health state; the journal state survives until
+    # a later ingest pass completes with nothing blocked.
+    h7 = ingest_history()
+    write_ev(h7, 1, records=[ev_record(ts=700.0)])
+    write_ev(h7, 2, records=[ev_record(ts=701.0)])   # higher seq waits
+    real_apply7 = h7._journal_apply_locked
+
+    def flaky7(header, records, seq, now):
+        if seq == 1:
+            raise sqlite3.Error("simulated journal-apply disk fault")
+        return real_apply7(header, records, seq, now)
+
+    h7._journal_apply_locked = flaky7
+    h7.on_publish(snap(), 1)      # gate fails at seq 1; write succeeds
+    s_after = len(rows_of(h7)[0])
+    runs7, _e7, st7, _a7 = journal_dump(h7)
+    out["swallow_sample_write_succeeds"] = (
+        s_after == 1 and h7.health()["enabled"]
+        and h7.journal_status()["terminal_seq"] == 0)
+    out["swallow_health_not_swallowed"] = (
+        h7.health()["degraded"]
+        and h7.health()["last_error_code"] == CODE_INGEST_APPLY_FAILED
+        and h7.journal_status()["blocked_at"] == 1)
+    out["swallow_no_leapfrog_no_terminal"] = (
+        not runs7 and st7 == (0, None, 0, 0)
+        and h7.journal_status()["last_consumed_seq"] is None)
+    h7._journal_apply_locked = real_apply7
+    h7._t[0] = T0 + 11.0          # past the 10s ingest cadence
+    h7.on_publish(snap(), 2)
+    runs7b, _e7b, st7b, _a7b = journal_dump(h7)
+    out["swallow_recovers_on_clean_pass"] = (
+        not h7.health()["degraded"]
+        and h7.health()["last_error_code"] is None
+        and st7b == (2, 2, 0, 0) and [x[0] for x in runs7b] == [1, 2]
+        and h7.journal_status()["blocked_at"] is None)
+    h7.close()
     return out
 
 
@@ -2215,6 +2348,8 @@ check 'd["newer_schema_migrated_refused_zero_bytes"]' "schema '3' on a migrated 
 check 'd["hybrid_v1_claim_refused_zero_bytes"]' "v1 claim + journal tables hybrid: refused, zero bytes"
 check 'd["fresh_db_is_v2_immediately"]' "fresh databases are created at v2 directly"
 check 'd["v2_reopen_repeatable_zero_bytes"]' "migration is one-way: repeated v2 opens are no-ops"
+check 'd["v2_extra_table_refused_zero_bytes"]' "exact-shape: v2 claim + unrelated extra table refused, zero bytes"
+check 'd["v1_extra_table_refused_zero_bytes"]' "exact-shape: v1 claim + extra table refused, never migrated"
 
 section "H11: journal ingest contract + exactly-once (PR-2B spec §6/§7/§13)"
 run_group "ingest"
@@ -2245,6 +2380,9 @@ check 'd["journal_status_shape"]' "journal_status is the fixed sanitized surface
 check 'd["closed_db_ingest_soft"]' "closed DB: ingest entry point never raises"
 check 'd["no_exchange_dir_clean"]' "no exchange dir configured: fully inert, never degrades"
 check 'd["enum_mirrors_match"]' "DB enum CHECKs mirror the frozen PR-2A grammar exactly"
+check 'd["audit_code_enum_exact_vs_contract"]' "audit.code enum == contract disposition-code literals + gap marker"
+check 'd["audit_db_rejects_arbitrary_code"]' "audit table: enum accepted, free-text/overlong/credential denied"
+check 'd["audit_unknown_code_settlement_refused"]' "unknown-code settlement fails closed: no rows, blocked, degraded"
 
 section "H12: ingest cadence + heartbeat + unified retention (PR-2B §9/§14)"
 run_group "ingest2"
@@ -2270,6 +2408,10 @@ check 'd["size_below_target"]' "pruning converges below the injected target size
 check 'd["size_no_orphans_state_survives"]' "FK cascade leaves no orphan events; state row intact"
 check 'd["journal_status_surface"]' "status surface carries terminal + counters + reader"
 check 'd["status_payload_sanitized"]' "status JSON echoes no paths and no sentinels"
+check 'd["swallow_sample_write_succeeds"]' "same-publish: journal fail + sample write lands, still enabled"
+check 'd["swallow_health_not_swallowed"]' "same-publish: degraded + ingest code SURVIVE the successful write"
+check 'd["swallow_no_leapfrog_no_terminal"]' "same-publish: blocked seq held, terminal unmoved, no leapfrog"
+check 'd["swallow_recovers_on_clean_pass"]' "next clean ingest pass is the recovery: healthy again"
 
 printf '\n== RESULT: %d passed, %d failed ==\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] && [ "$PASS" -eq "$EXPECTED_PASS" ] || { printf '  (failures, or a section did not fully run)\n'; exit 1; }

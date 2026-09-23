@@ -14,11 +14,13 @@ Safety contract (all enforced, all tested):
   runs ``journal_mode=DELETE`` (no stray -wal/-shm files),
   ``synchronous=FULL``, ``foreign_keys=ON`` and a bounded busy timeout.
   Schema handling is strict: a genuinely fresh DB is created at v2; an
-  existing DB opens only with an exactly-declared v2, or with the exact
-  v1 shape, which is migrated FORWARD to v2 in one transaction with
-  every v1 row preserved. Any other declared version (newer, negative,
-  malformed, hybrid) or metadata-less SQLite file is refused fail-closed
-  and never mutated -- migrations are explicit and forward-only.
+  existing DB opens only with an exactly-declared v2 on EXACTLY the
+  seven v2 tables, or with EXACTLY the three v1 tables declared v1,
+  which is migrated FORWARD to v2 in one transaction with every v1 row
+  preserved. Any extra unrelated table, any other declared version
+  (newer, negative, malformed, hybrid) or metadata-less SQLite file is
+  refused fail-closed and never mutated -- migrations are explicit and
+  forward-only.
 * Threading: ONE reentrant lock serializes the whole of ``open`` /
   ``on_publish`` (write + retention) / ``health`` / ``query_timeline`` /
   ``close`` against each other -- exactly one thread may touch the shared
@@ -32,7 +34,11 @@ Safety contract (all enforced, all tested):
   records a sanitized health state (``enabled`` / ``degraded`` /
   ``last_error_code`` -- a code category, never exception text, paths or
   payload). A dead disk must degrade the dashboard's health chip, never
-  kill the publisher thread, a reader thread or the web server.
+  kill the publisher thread, a reader thread or the web server. Journal
+  ingest carries its OWN degraded state, composed into ``health()``:
+  an ingest failure survives a successful ordinary sample write in the
+  same publication and clears only when a later ingest pass completes
+  with nothing blocked.
 * Retention: rows older than the retention horizon are deleted at
   startup and at most hourly; if the database crosses the size ceiling
   the OLDEST rows are pruned in batches until below the target size --
@@ -153,11 +159,33 @@ JOURNAL_PROTOS = ("Reality", "Hysteria2", "OTHER")
 JOURNAL_DCLS = ("NONE", "https443", "http80", "quic", "dns53", "dot853",
                 "smtpish", "other")
 JOURNAL_AUDIT_KINDS = ("gap", "rejected")
+# Closed vocabulary for journal_ingest_audit.code: the sanitized
+# disposition codes the frozen PR-2A contract can EVER return
+# (ingest_contract.read_and_validate + schema.parse_exchange_text) plus
+# the Monitor-derived gap marker. Anything outside this set -- a future
+# contract code, let alone free text -- is refused by the DB CHECK, so
+# the audit table cannot store a credential-like string even if a
+# caller is buggy. The ingest suite asserts this tuple equals the code
+# literals present in the contract sources, so the mirror cannot rot.
+JOURNAL_AUDIT_CODES = ("sequence_gap", "exchange_bad_json",
+                       "exchange_bad_name", "exchange_bad_shape",
+                       "exchange_empty", "exchange_event_invalid",
+                       "exchange_header_invalid",
+                       "exchange_header_position", "exchange_no_header",
+                       "exchange_not_regular", "exchange_seq_mismatch",
+                       "exchange_too_large", "exchange_unreadable")
 
 _V1_TABLES = frozenset({"timeline_samples", "device_protocol_states"})
 _JOURNAL_TABLES = frozenset({"journal_runs", "journal_events",
                              "journal_ingest_audit",
                              "journal_ingest_state"})
+# EXACT shapes -- the schema gate is table-set EQUALITY, not a subset:
+# an unrelated extra table is a shape this module never created, so an
+# open that claims v1/v2 while carrying one is refused fail-closed
+# (zero bytes mutated), never "adopted apart from the stranger".
+_META_TABLE = "meta"
+_ALLOWED_V1_SHAPE = _V1_TABLES | {_META_TABLE}
+_ALLOWED_V2_SHAPE = _ALLOWED_V1_SHAPE | _JOURNAL_TABLES
 
 
 def classify_protocol(inbound, inbound_type=""):
@@ -374,6 +402,13 @@ class IncidentHistory:
         self._enabled = False
         self._degraded = True
         self._last_error_code = None
+        # Journal ingest health is a SEPARATE subsystem state: a journal
+        # failure is reported through health() but a successful ordinary
+        # sample write must never clear it (and vice versa) -- health()
+        # composes the two. Recovery is a later ingest pass that
+        # completes with nothing blocked.
+        self._journal_degraded = False
+        self._journal_last_error_code = None
         self._failure_count = 0
         self._last_success_ts = None
         self._last_sample_ts = None
@@ -421,13 +456,23 @@ class IncidentHistory:
 
     def health(self):
         with self._lock:
+            # Composed surface: the ordinary write path and the journal
+            # ingest path carry independent degraded states; either one
+            # makes the whole history degraded. Write-path codes win
+            # when both are set (they gate the primary data path); the
+            # journal code is NEVER swallowed by a successful sample
+            # write in the same publication.
+            degraded = bool(self._degraded or self._journal_degraded)
+            code = self._last_error_code
+            if code is None and self._journal_degraded:
+                code = self._journal_last_error_code
             return {
                 "enabled": bool(self._enabled),
-                "degraded": bool(self._degraded),
+                "degraded": degraded,
                 "last_success_at": _iso(self._last_success_ts)
                 if self._last_success_ts else None,
                 "failure_count": int(self._failure_count),
-                "last_error_code": self._last_error_code,
+                "last_error_code": code,
                 "run_id": self._run_id,
             }
 
@@ -497,7 +542,7 @@ class IncidentHistory:
             self._record_failure(exc.code)
             return None
         except (sqlite3.Error, OSError):
-            self._record_failure(CODE_INGEST_APPLY_FAILED)
+            self._record_journal_failure(CODE_INGEST_APPLY_FAILED)
             return None
 
     def journal_status(self):
@@ -563,6 +608,8 @@ class IncidentHistory:
         self._last_success_ts = self._clock()
         self._degraded = False
         self._last_error_code = None
+        self._journal_degraded = False
+        self._journal_last_error_code = None
         # startup cleanup: retention first, before any new row is added
         self._cleanup("startup")
         self._last_cleanup_ts = self._clock()
@@ -607,13 +654,13 @@ class IncidentHistory:
         Accepted shapes are exactly three: a genuinely fresh database
         (absent or zero-byte file, no tables) which is created at the
         current version, an existing database that DECLARES the current
-        schema_version and carries the full v2 shape, and an existing
-        database that declares exactly v1 and carries the EXACT v1 shape
-        (v1 tables present, no journal tables) -- migrated forward to v2
-        in ONE transaction with zero v1 rows touched. Everything else --
-        newer, zero, negative, malformed, meta-less, a v1 claim with
-        stripped tables, a v2 claim with stripped journal tables or any
-        hybrid -- is refused with CODE_SCHEMA_UNSUPPORTED before any
+        schema_version and whose tables are EXACTLY the seven v2 tables,
+        and an existing database that declares v1 and whose tables are
+        EXACTLY the three v1 tables -- migrated forward to v2 in ONE
+        transaction with zero v1 rows touched. Any extra unrelated table
+        (under either declaration), any newer, zero, negative,
+        malformed or meta-less claim, a stripped or hybrid shape -- all
+        are refused with CODE_SCHEMA_UNSUPPORTED before any
         pragma, DDL or write can touch the file. In particular no lower
         version is ever silently rewritten: migration is the explicit
         v1->v2 path below and nothing else.
@@ -640,9 +687,11 @@ class IncidentHistory:
             raise _HistoryError(CODE_SCHEMA_UNSUPPORTED)
         version = int(raw)
         if version == SCHEMA_VERSION:
-            if not (_V1_TABLES | _JOURNAL_TABLES) <= tables:
-                # meta CLAIMS v2 but the v2 shape is not there: unknown
-                # old/hybrid shape, refuse rather than adopt
+            if tables != _ALLOWED_V2_SHAPE:
+                # meta CLAIMS v2 but the shape is not EXACTLY the seven
+                # v2 tables -- stripped, hybrid, or carrying an unrelated
+                # extra table this module never created: unknown shape,
+                # refuse rather than adopt
                 raise _HistoryError(CODE_SCHEMA_UNSUPPORTED)
             self._apply_pragmas(conn)
             if conn.execute("SELECT terminal_seq FROM journal_ingest_state"
@@ -652,9 +701,11 @@ class IncidentHistory:
                 raise _HistoryError(CODE_SCHEMA_UNSUPPORTED)
             return
         if version == 1:
-            # exact-v1 only: v1 tables AND no journal tables (a hybrid
-            # is an unknown shape, never a migration candidate)
-            if not _V1_TABLES <= tables or (tables & _JOURNAL_TABLES):
+            # EXACT v1 only: precisely the three v1 tables -- no journal
+            # tables (hybrid) and no unrelated extra table either (a
+            # stranger table means this is not the file the migration
+            # was written for)
+            if tables != _ALLOWED_V1_SHAPE:
                 raise _HistoryError(CODE_SCHEMA_UNSUPPORTED)
             self._apply_pragmas(conn)
             self._migrate_v1_to_v2(conn)
@@ -810,7 +861,10 @@ class IncidentHistory:
             " kind TEXT NOT NULL"
             f" CHECK (kind IN ({cls._in_list(JOURNAL_AUDIT_KINDS)})),"
             " seq INTEGER NOT NULL,"
-            " code TEXT NOT NULL CHECK (length(code) <= 64))")
+            # closed vocabulary, NOT a length cap: even a buggy caller
+            # cannot store free text / credential-like material here
+            f" code TEXT NOT NULL CHECK (code IN"
+            f" ({cls._in_list(JOURNAL_AUDIT_CODES)})))")
         conn.execute(
             "CREATE INDEX idx_journal_audit_epoch"
             " ON journal_ingest_audit(epoch)")
@@ -967,6 +1021,11 @@ class IncidentHistory:
                   "blocked_at": None,
                   "contract_available": JOURNAL_CONTRACT_AVAILABLE}
         self._journal_last_pass = result
+        # the blocked marker and the journal degraded state describe the
+        # MOST RECENT pass: each new pass starts clean and re-proves
+        # recovery (a later pass that completes with nothing blocked IS
+        # the explicit recovery condition).
+        self._journal_blocked_at = None
         if not JOURNAL_CONTRACT_AVAILABLE:
             return result
         state = self._conn.execute(
@@ -1006,13 +1065,22 @@ class IncidentHistory:
                 # NOT terminal: nothing settled (the transaction rolled
                 # back whole), and higher seqs never leapfrog a file
                 # that merely failed to settle -- retried next pass.
+                # Journal-owned degraded state: a successful ordinary
+                # sample write later in this same publication must NOT
+                # clear it.
                 self._rollback_quiet()
-                self._record_failure(CODE_INGEST_APPLY_FAILED)
+                self._record_journal_failure(CODE_INGEST_APPLY_FAILED)
                 result["blocked_at"] = self._journal_blocked_at = seq
                 break
             result["consumed"] += 1
             seq += 1
         result["terminal_after"] = seq - 1
+        if result["blocked_at"] is None:
+            # explicit recovery condition: a pass that completed with
+            # nothing blocked -- the journal degraded state clears here
+            # and only here.
+            self._journal_degraded = False
+            self._journal_last_error_code = None
         return result
 
     def _journal_settle_gap(self, seq, nxt, now, result):
@@ -1030,7 +1098,7 @@ class IncidentHistory:
             self._conn.commit()
         except (sqlite3.Error, OSError):
             self._rollback_quiet()
-            self._record_failure(CODE_INGEST_APPLY_FAILED)
+            self._record_journal_failure(CODE_INGEST_APPLY_FAILED)
             result["blocked_at"] = self._journal_blocked_at = seq
             return False
         result["gaps"] += nxt - seq
@@ -1039,12 +1107,16 @@ class IncidentHistory:
     def _journal_settle_rejected(self, seq, code, now, result):
         """Terminally rejected file: settles ONCE (no forever-reject
         loop) and the next seq continues -- a later valid file around
-        it records NO gap (frozen contract rule)."""
+        it records NO gap (frozen contract rule). `code` is stored
+        UNMODIFIED: the DB CHECK already restricts it to the closed
+        JOURNAL_AUDIT_CODES vocabulary, so a code outside that mirror
+        (a future unknown contract code) FAILS the settlement
+        fail-closed instead of being truncated into a lie."""
         try:
             self._conn.execute(
                 "INSERT INTO journal_ingest_audit (epoch, kind, seq,"
                 " code) VALUES (?, 'rejected', ?, ?)",
-                (now, seq, code[:64]))
+                (now, seq, code))
             self._conn.execute(
                 "UPDATE journal_ingest_state SET terminal_seq = ?,"
                 " rejected_total = rejected_total + 1, updated_epoch = ?"
@@ -1052,7 +1124,7 @@ class IncidentHistory:
             self._conn.commit()
         except (sqlite3.Error, OSError):
             self._rollback_quiet()
-            self._record_failure(CODE_INGEST_APPLY_FAILED)
+            self._record_journal_failure(CODE_INGEST_APPLY_FAILED)
             result["blocked_at"] = self._journal_blocked_at = seq
             return False
         result["rejected"] += 1
@@ -1272,6 +1344,17 @@ class IncidentHistory:
                 # a refused OPEN is fail-closed: the surface is NOT enabled
                 # until a later open() succeeds (never a stale True)
                 self._enabled = False
+
+    def _record_journal_failure(self, code):
+        # Journal ingest is an INDEPENDENT health subsystem: this never
+        # touches the write-path _degraded/_last_error_code, and only a
+        # later clean ingest pass (_journal_ingest_pass with nothing
+        # blocked) clears it. A successful sample write can therefore
+        # never swallow an ingest failure inside the same publication.
+        with self._lock:
+            self._failure_count += 1
+            self._journal_degraded = True
+            self._journal_last_error_code = code
 
 
 class _HistoryError(Exception):
