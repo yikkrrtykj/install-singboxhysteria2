@@ -250,6 +250,13 @@ _cmd_install_locked() { # <install|upgrade> [flags...]
     current_id="$(sbmon_current_release_id)"
     current_version="$(sbmon_current_version)"
 
+    # PR-2B: read-only reader activation preflight occurs BEFORE any Monitor
+    # filesystem/user mutation. An existing divergent sbox-jr identity or
+    # unsafe reader path stops the whole deployment with zero convergence.
+    if sbmon_version_ge "$repo_version" "0.3.0"; then
+        sbmon_sboxjr_preflight_activation             || sbmon_die "journal-reader activation preflight failed; no changes made"
+    fi
+
     sbmon_ensure_group
     sbmon_ensure_user
     sbmon_create_layout
@@ -317,6 +324,24 @@ _cmd_install_locked() { # <install|upgrade> [flags...]
             sbmon_fresh_failure_cleanup
         fi
         return 1
+    fi
+
+    # PR-2B activation is deliberately AFTER the 0.3.0 consuming side is
+    # live. Thus a privileged producer can never run while only 0.2.x (no
+    # consumer) is active. Failure stops/disables the reader and rolls the
+    # Monitor candidate back through the existing transaction machinery.
+    if sbmon_version_ge "$repo_version" "0.3.0"; then
+        if ! sbmon_sboxjr_activate "$OPT_NO_START"; then
+            sbmon_sboxjr_stop_disable
+            sbmon_warn "journal-reader activation failed; rolling Monitor candidate back"
+            if [ "$old_unit_existed" = 1 ] || [ -n "$current_id" ]; then
+                sbmon_txn_rollback "$current_id" "$old_unit_backup" "$old_unit_existed" "$was_active" "$old_enabled"
+            else
+                rm -f -- "$old_unit_backup" 2>/dev/null || true
+                sbmon_fresh_failure_cleanup
+            fi
+            return 1
+        fi
     fi
 
     local release_changed=0
