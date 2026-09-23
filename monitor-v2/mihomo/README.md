@@ -353,8 +353,14 @@ produces edges.
   FIFO can never block it), a clean `FileNotFoundError` is the ONLY benign
   outcome, and the fd is fstat-proved a regular file BEFORE any zero-size
   short circuit -- a pre-existing zero-byte symlink or special file is
-  refused at startup as `storage_error`. Only then is AT MOST ONE incomplete trailing
-  fragment is truncated back to the last newline (file fsynced) so the
+  refused at startup as `storage_error`. Where the OS offers no
+  `O_NOFOLLOW` at all (Windows CRT -- review W1) a NON-FOLLOWING lstat
+  runs before EVERY open of `diag.jsonl`, `diag.key` and `diag.lock`:
+  symlink, non-regular or unverifiable targets are refused before the
+  open could follow them, and ENOENT still permits creating a fresh
+  regular file; where `O_NOFOLLOW` exists the atomic open remains the
+  sole defence and behaviour is unchanged. Only then is AT MOST ONE incomplete trailing
+  fragment truncated back to the last newline (file fsynced) so the
   evidence file is valid JSONL again -- more than one lost fragment fails
   closed instead of destroying evidence;
 * size-shift rotation (`diag.jsonl` -> `.1` -> ... -> `.N-1`) above
@@ -393,7 +399,7 @@ python3 monitor-v2/mihomo/diag.py --url http://127.0.0.1:9090 \
     --out-dir /var/lib/mihomo-diag --once
 ```
 
-Tests: `tests/test-monitor-v2-e4diag.sh` (441 assertions, fail-closed gate:
+Tests: `tests/test-monitor-v2-e4diag.sh` (457 assertions, fail-closed gate:
 static mutation-free greps plus residue greps, the strict four-type proof,
 delay-0 raw preservation, leak wall, B4 storage primitives via fault
 injection (torn-tail truncation, age/budget/overflow prune + fail-closed

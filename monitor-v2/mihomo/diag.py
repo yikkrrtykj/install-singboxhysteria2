@@ -94,8 +94,14 @@ repair opens O_RDWR|O_NOFOLLOW first (a FIFO can never block it), a clean
 FileNotFoundError is the ONLY benign outcome, and the fd is fstat-proved a
 regular file before any zero-size short circuit -- a pre-existing zero-byte
 symlink or special file is refused, every other fault is a storage_error
-stop. Only then is at most one incomplete trailing fragment truncated back
-to the last newline (fsynced, per frozen design section 8). Rotation is a
+stop. Review W1: where the OS offers NO O_NOFOLLOW at all (Windows CRT),
+a non-following lstat pre-check guards EVERY open of diag.jsonl, diag.key
+and diag.lock -- symlink, non-regular or unverifiable targets are refused
+before the open could follow them (ENOENT still allows creating a fresh
+regular file); where O_NOFOLLOW exists the atomic open remains the sole
+defence and behaviour is unchanged. Only then is at most one incomplete
+trailing fragment truncated back to the last newline (fsynced, per frozen
+design section 8). Rotation is a
 numeric size shift
 (diag.jsonl.1 .. .{N-1}) with file fsync before the rename and directory
 fsync after it; the same prune pass (every cycle and --prune-now) enforces
@@ -203,10 +209,45 @@ _WINDOWS = os.name == "nt"
 # bytes to CRLF -- a raw key or JSONL line must never pass through it.
 # Zero on POSIX.
 _O_BINARY = getattr(os, "O_BINARY", 0)
+# W1 (review round 5): O_NOFOLLOW is NOT a guaranteed open flag everywhere
+# -- the Windows CRT does not provide it, so getattr(..., 0) silently drops
+# the atomic symlink defence on exactly the platforms this project supports.
+_HAVE_O_NOFOLLOW = hasattr(os, "O_NOFOLLOW")
 
 
 class StorageError(Exception):
     """The evidence chain could not be written/rotated (path only, no data)."""
+
+
+def _require_openable_in_place(path, error_cls, lstat_fn=os.lstat,
+                               what="evidence state file"):
+    """Refuse to open a symlink or special-file state path when the OS has
+    no O_NOFOLLOW (review W1 fallback).
+
+    Where O_NOFOLLOW exists this is a deliberate no-op: the kernel-side
+    atomic refusal at the open stays the primary defence and behavior is
+    byte-identical. Where it does NOT exist (Windows CRT) a low-level open
+    would FOLLOW a pre-existing symlink and the post-open fstat would
+    validate only the target, never the route -- so a non-following lstat
+    must run BEFORE the open: symlink, non-regular or unverifiable all fail
+    closed; FileNotFoundError means genuinely absent and creating a fresh
+    regular file remains allowed. Without kernel support the residual
+    create-race window is narrowed, not eliminated: documented, never
+    silently assumed.
+    """
+    if _HAVE_O_NOFOLLOW:
+        return
+    try:
+        st = lstat_fn(path)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise error_cls("%s cannot be verified before opening (%s)"
+                        % (what, type(exc).__name__)) from None
+    if stat_module.S_ISLNK(st.st_mode):
+        raise error_cls("%s must not be a symlink: %s" % (what, path))
+    if not stat_module.S_ISREG(st.st_mode):
+        raise error_cls("%s must be a regular file: %s" % (what, path))
 
 
 # -- small strict parsers -----------------------------------------------------
@@ -716,10 +757,12 @@ def ensure_out_dir(path, chmod_fn=os.chmod):
 
 def load_or_create_hmac_key(out_dir, open_fn=os.open, fstat_fn=os.fstat,
                             read_fn=os.read, fsync_fn=os.fsync,
-                            fsync_dir_fn=_fsync_dir):
+                            fsync_dir_fn=_fsync_dir, lstat_fn=os.lstat):
     """Random 256-bit key for test-id HMACs, created once per evidence dir.
 
-    The file is 0600, regular, never a symlink (O_NOFOLLOW + fstat), and a
+    The file is 0600, regular, never a symlink (O_NOFOLLOW + fstat where
+    the OS offers it; the W1 non-following lstat pre-check where it does
+    not), and a
     permission-violating pre-existing key refuses startup: fail-closed
     BEFORE collection, per the reviewed design. Creation uses
     O_CREAT|O_EXCL so a lost race never truncates or overwrites another
@@ -735,6 +778,8 @@ def load_or_create_hmac_key(out_dir, open_fn=os.open, fstat_fn=os.fstat,
     or output -- they only feed hmac.new().
     """
     path = os.path.join(out_dir, KEY_FILENAME)
+    _require_openable_in_place(path, ConfigurationError, lstat_fn,
+                               "diag key file")
     try:
         # O_RDWR (not O_RDONLY): the durability fsync below must be a
         # provable write-path sync on every platform (Windows _commit
@@ -789,7 +834,8 @@ def load_or_create_hmac_key(out_dir, open_fn=os.open, fstat_fn=os.fstat,
         return load_or_create_hmac_key(out_dir, open_fn=open_fn,
                                        fstat_fn=fstat_fn, read_fn=read_fn,
                                        fsync_fn=fsync_fn,
-                                       fsync_dir_fn=fsync_dir_fn)
+                                       fsync_dir_fn=fsync_dir_fn,
+                                       lstat_fn=lstat_fn)
     except OSError as exc:
         raise ConfigurationError(
             "cannot create diag key file %s (%s)" % (path, type(exc).__name__)) from None
@@ -831,15 +877,20 @@ def _try_lock(fd, lock_fn=None):
     return True  # platform without advisory locks: documented, single-writer
 
 
-def acquire_instance_lock(out_dir, open_fn=os.open, lock_fn=None):
+def acquire_instance_lock(out_dir, open_fn=os.open, lock_fn=None,
+                          lstat_fn=os.lstat):
     """One collector per evidence directory (review B4).
 
     An advisory exclusive non-blocking lock on diag.lock; contention means
     another resident collector owns this evidence chain and a second writer
     would interleave/rotate under it -> refusal BEFORE polling, never two
-    writers. The fd must stay open for the process lifetime.
+    writers. The fd must stay open for the process lifetime. W1: on
+    platforms without O_NOFOLLOW the lock file gets the same non-following
+    pre-open lstat check as the evidence and key files.
     """
     path = os.path.join(out_dir, LOCK_FILENAME)
+    _require_openable_in_place(path, ConfigurationError, lstat_fn,
+                               "diag lock file")
     try:
         fd = open_fn(path, os.O_RDWR | os.O_CREAT | _O_BINARY
                      | getattr(os, "O_NOFOLLOW", 0),
@@ -922,6 +973,13 @@ class DiagWriter:
         # a permanently invalid JSONL line (review B4 residual).
         self._torn_bytes = self._repair_torn_tail()
 
+    def _preopen_guard(self):
+        # W1: no-op where the atomic O_NOFOLLOW open flag exists; on
+        # platforms without it, refuse a symlinked/special/unverifiable
+        # evidence path BEFORE the open could follow it.
+        _require_openable_in_place(self.path, StorageError,
+                                   self.lstat_fn, "evidence file")
+
     def _repair_torn_tail(self):
         """Drop only the incomplete trailing fragment; return bytes removed.
 
@@ -942,6 +1000,7 @@ class DiagWriter:
         """
         fd = None
         try:
+            self._preopen_guard()
             try:
                 fd = self.open_fn(self.path, os.O_RDWR | _O_BINARY
                                   | getattr(os, "O_NOFOLLOW", 0))
@@ -988,6 +1047,7 @@ class DiagWriter:
         blob = b"".join(encode_record(r) for r in records)
         flags = (os.O_WRONLY | os.O_CREAT | os.O_APPEND | _O_BINARY
                  | getattr(os, "O_NOFOLLOW", 0))
+        self._preopen_guard()      # W1 (no-op when O_NOFOLLOW is available)
         try:
             fd = self.open_fn(self.path, flags, 0o600)
         except OSError as exc:
@@ -1033,7 +1093,12 @@ class DiagWriter:
                 # O_RDWR: Windows CRT _commit() rejects read-only fds, so a
                 # plain O_RDONLY fsync handle would break --prune-now there;
                 # fsync semantics on POSIX are identical either way.
-                fd = self.open_fn(self.path, os.O_RDWR | _O_BINARY)
+                # W1: O_NOFOLLOW here too (where offered) + the lstat
+                # fallback, so rotation can never fsync/rename THROUGH a
+                # symlink that appeared after the last validated write-open.
+                self._preopen_guard()
+                fd = self.open_fn(self.path, os.O_RDWR | _O_BINARY
+                                  | getattr(os, "O_NOFOLLOW", 0))
                 try:
                     self.fsync_fn(fd)
                 finally:

@@ -25,7 +25,11 @@
 # Review round-4 residual adds: startup VALIDATES before it MEASURES -- the
 # torn-tail repair opens O_NOFOLLOW first, accepts only a clean ENOENT as
 # absence, fstat-proves regular before any zero-size return, and the
-# symlink-route check no longer reads EACCES/EIO as "absent" (B4).
+# symlink-route check no longer reads EACCES/EIO as "absent" (B4). Review
+# round-5 residual W1 adds: a platform fallback for systems WITHOUT
+# os.O_NOFOLLOW -- a non-following lstat pre-check guards every
+# diag.jsonl/diag.key/diag.lock open there, while O_NOFOLLOW platforms keep
+# the atomic open as the sole (and unchanged) defence.
 #
 # Deterministic on git-bash AND Linux: OS-divergent code paths are exercised
 # through explicit platform flags and injectable attributes, so the
@@ -44,7 +48,7 @@ PASS=0
 FAIL=0
 # The gate at the bottom of this file fails unless exactly this many
 # assertions ran AND passed, so unreachable sections can never fake success.
-EXPECTED_PASS=441
+EXPECTED_PASS=457
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
@@ -298,6 +302,32 @@ if [ "$(grep -c 'except FileNotFoundError' <<< "$ROUTE_RANGE")" = "2" ]; then
     pass "route check tolerates ENOENT at exactly the two lstat sites and fails closed otherwise"
 else
     fail "route check ENOENT tolerance is not pinned to the two lstat sites"
+fi
+# W1: the no-O_NOFOLLOW fallback must be DEFINED, and wired at every
+# state-file open class (evidence repair+write+rotate share one method,
+# key loader, lock) -- greps count call sites, not comments.
+GUARD_RANGE="$(sed -n '/def _require_openable_in_place/,/if stat_module.S_ISLNK/p' "$DIAG")"
+ROT_RANGE="$(sed -n '/def rotate/,/def prune/p' "$DIAG")"
+if grep -qF 'if _HAVE_O_NOFOLLOW' <<< "$GUARD_RANGE" \
+   && grep -qF 'except FileNotFoundError' <<< "$GUARD_RANGE"; then
+    pass "W1: fallback guard exists, is a hard no-op where O_NOFOLLOW is available, and tolerates only ENOENT"
+else
+    fail "W1: fallback guard missing its no-op short-circuit or ENOENT-only tolerance"
+fi
+if [ "$(grep -c 'self._preopen_guard()' "$DIAG")" = "3" ]; then
+    pass "W1: guard wired into repair, write AND rotate of diag.jsonl"
+else
+    fail "W1: an evidence-file open path is missing the pre-open guard"
+fi
+if grep -qF 'O_NOFOLLOW' <<< "$ROT_RANGE" && grep -qF '_preopen_guard()' <<< "$ROT_RANGE"; then
+    pass "W1: rotate opens O_NOFOLLOW where offered and guards where not"
+else
+    fail "W1: rotation can still follow a symlinked current file"
+fi
+if [ "$(grep -c '_require_openable_in_place(path, ConfigurationError' "$DIAG")" = "2" ]; then
+    pass "W1: key AND lock refuse symlinked paths via the same fallback"
+else
+    fail "W1: key or lock open lacks the fallback guard"
 fi
 if grep -qF 'EXIT_CONFIG = 2' "$DIAG" && grep -qF 'EXIT_API = 3' "$DIAG" \
    && grep -qF 'EXIT_STORAGE = 4' "$DIAG" && grep -qF 'EXIT_BOTH = 5' "$DIAG"; then
@@ -1500,6 +1530,127 @@ assert_eq "$(field "$out" 'obj["dir_fsync"]')" "True" "directory fsync after eve
 assert_eq "$(field "$out" 'obj["fsync_before_rename"]')" "True" "file fsync precedes the first rotation rename"
 assert_eq "$(field "$out" 'obj["main_alive"]')" "True" "fresh main file after rotation"
 assert_eq "$(field "$out" 'obj["virgin_rot"]')" "ok" "rotating a never-written chain is a no-op"
+
+section "W1 platform fallback: NO-O_NOFOLLOW systems still refuse symlinked state files"
+out="$(mihomo_py '
+import json, os, stat, tempfile, types, errno, diag
+res = {}
+rec = {"v": 1, "t": "collector", "ts": "2026-09-22T12:00:00Z", "run": "f" * 32,
+       "seq": 1, "code": "storage_error", "scope": "storage", "count": 1}
+LNK = stat.S_IFLNK | 0o777
+CHR = stat.S_IFCHR | 0o666
+real_have = diag._HAVE_O_NOFOLLOW
+def fake_mode(mode):
+    def f(path): return types.SimpleNamespace(st_mode=mode)
+    return f
+def fake_absent(path):
+    raise FileNotFoundError(errno.ENOENT, "No such file or directory", path)
+def fake_eio(path):
+    raise OSError(5, "I/O error")
+def poison_open(*a, **k):
+    raise AssertionError("open ran before the fallback guard")
+try:
+    # Simulate a Windows-CRT-style platform ANYWHERE: the guard must engage
+    # purely on the missing-flag condition, never on the running OS.
+    diag._HAVE_O_NOFOLLOW = False
+    # (a) startup repair: symlink refused before the open would follow it
+    w1 = diag.DiagWriter(tempfile.mkdtemp())
+    w1.lstat_fn = fake_mode(LNK)
+    w1.open_fn = poison_open
+    try:
+        w1._repair_torn_tail(); res["w1_repair_sym"] = "ACCEPTED"
+    except diag.StorageError: res["w1_repair_sym"] = "rejected"
+    except AssertionError: res["w1_repair_sym"] = "OPEN RAN"
+    # (b) write: symlinked evidence path refused pre-open
+    w2 = diag.DiagWriter(tempfile.mkdtemp())
+    w2.lstat_fn = fake_mode(LNK)
+    try:
+        w2.write([rec]); res["w1_write_sym"] = "ACCEPTED"
+    except diag.StorageError as e:
+        res["w1_write_sym"] = "rejected" if "symlink" in str(e) else "BAD"
+    # (c) special file refused too
+    w3 = diag.DiagWriter(tempfile.mkdtemp())
+    w3.lstat_fn = fake_mode(CHR)
+    try:
+        w3.write([rec]); res["w1_write_chr"] = "ACCEPTED"
+    except diag.StorageError as e:
+        res["w1_write_chr"] = "rejected" if "regular" in str(e) else "BAD"
+    # (d) an UNVERIFIABLE lstat result is not evidence of safety
+    w4 = diag.DiagWriter(tempfile.mkdtemp())
+    w4.lstat_fn = fake_eio
+    try:
+        w4.write([rec]); res["w1_write_eio"] = "ACCEPTED"
+    except diag.StorageError as e:
+        res["w1_write_eio"] = "rejected" if "verified" in str(e) else "BAD"
+    # (e) genuinely absent: creating a fresh regular file stays allowed
+    w5 = diag.DiagWriter(tempfile.mkdtemp())
+    w5.lstat_fn = fake_absent
+    w5.write([rec])
+    res["w1_absent_creates"] = os.path.isfile(w5.path)
+    # (f) rotation cannot fsync/rename THROUGH a symlink either
+    w6 = diag.DiagWriter(tempfile.mkdtemp())
+    w6.write([rec])
+    w6.lstat_fn = fake_mode(LNK)
+    try:
+        w6.rotate(); res["w1_rotate_sym"] = "ACCEPTED"
+    except diag.StorageError: res["w1_rotate_sym"] = "rejected"
+    # (g) diag.key: symlink refused as config_error; real create stays green
+    dk = tempfile.mkdtemp()
+    try:
+        diag.load_or_create_hmac_key(dk, lstat_fn=fake_mode(LNK))
+        res["w1_key_sym"] = "ACCEPTED"
+    except diag.ConfigurationError: res["w1_key_sym"] = "rejected"
+    k = diag.load_or_create_hmac_key(dk)
+    res["w1_key_creates"] = len(k) == 32
+    # (h) diag.lock: same refusal, same tolerated absence
+    dl = tempfile.mkdtemp()
+    try:
+        fd = diag.acquire_instance_lock(dl, lstat_fn=fake_mode(LNK))
+        res["w1_lock_sym"] = "ACCEPTED"
+    except diag.ConfigurationError: res["w1_lock_sym"] = "rejected"
+    fd = diag.acquire_instance_lock(dl)
+    os.close(fd)
+    res["w1_lock_ok"] = True
+    # (i) where O_NOFOLLOW EXISTS the guard is a hard no-op: the atomic
+    #     open stays the primary defence and POSIX behavior is unchanged
+    diag._HAVE_O_NOFOLLOW = True
+    w9 = diag.DiagWriter(tempfile.mkdtemp())
+    def lstat_boom(path): raise AssertionError("guard ran with O_NOFOLLOW")
+    w9.lstat_fn = lstat_boom
+    w9.write([rec])
+    res["w1_nofollow_noop"] = os.path.isfile(w9.path)
+    # (j) real-Windows e2e when the box actually allows creating one
+    dw = tempfile.mkdtemp()
+    if os.name != "nt":
+        res["w1_real_windows"] = "skipped"
+    else:
+        tgt = os.path.join(dw, "target")
+        open(tgt, "wb").close()
+        try:
+            os.symlink(tgt, os.path.join(dw, "diag.jsonl"))
+        except OSError:
+            res["w1_real_windows"] = "no privilege"
+        else:
+            try:
+                diag.DiagWriter(dw); res["w1_real_windows"] = "ACCEPTED"
+            except diag.StorageError: res["w1_real_windows"] = "rejected"
+    res["w1_real_windows_ok"] = res["w1_real_windows"] != "ACCEPTED"
+finally:
+    diag._HAVE_O_NOFOLLOW = real_have
+print(json.dumps(res))
+')"
+assert_eq "$(field "$out" 'obj["w1_repair_sym"]')" "rejected" "W1: no-O_NOFOLLOW startup repair refuses a symlink BEFORE any open could follow it"
+assert_eq "$(field "$out" 'obj["w1_write_sym"]')" "rejected" "W1: every diag.jsonl write opens only after the non-following lstat proof"
+assert_eq "$(field "$out" 'obj["w1_write_chr"]')" "rejected" "W1: special-file evidence path refused on flag-less platforms too"
+assert_eq "$(field "$out" 'obj["w1_write_eio"]')" "rejected" "W1: an unverifiable pre-open lstat is NOT evidence of safety"
+assert_eq "$(field "$out" 'obj["w1_absent_creates"]')" "True" "W1: genuinely absent still creates a fresh regular evidence file (no false refusal)"
+assert_eq "$(field "$out" 'obj["w1_rotate_sym"]')" "rejected" "W1: rotation cannot fsync/rename through a symlinked current file"
+assert_eq "$(field "$out" 'obj["w1_key_sym"]')" "rejected" "W1: diag.key symlink refused pre-open as config_error on flag-less platforms"
+assert_eq "$(field "$out" 'obj["w1_key_creates"]')" "True" "W1: the absent-key creation path stays green under the fallback"
+assert_eq "$(field "$out" 'obj["w1_lock_sym"]')" "rejected" "W1: diag.lock symlink refused before the locking open"
+assert_eq "$(field "$out" 'obj["w1_lock_ok"]')" "True" "W1: lock creation on an absent path unaffected"
+assert_eq "$(field "$out" 'obj["w1_nofollow_noop"]')" "True" "W1: with O_NOFOLLOW available the guard is a hard no-op -- POSIX behaviour byte-identical"
+assert_eq "$(field "$out" 'obj["w1_real_windows_ok"]')" "True" "W1: real Windows symlink e2e refuses construction where the box permits symlinks"
 
 section "B4 prune: 7-day age retention + chain overflow + 32 MiB budget (B4 residual) + fail-closed metadata (R1)"
 out="$(mihomo_py '
