@@ -28,7 +28,7 @@ export WEBAPP="$ROOT/monitor-v2/webapp.py"
 
 PASS=0
 FAIL=0
-EXPECTED_PASS=215
+EXPECTED_PASS=221
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
@@ -2159,6 +2159,91 @@ def group_ingest2():
     out["undecodable_next_seq_still_correct"] = (
         st3 == (3, 3, 0, 1) and not hu8.health()["degraded"])
     hu8.close()
+    # ---- BLOCKER regression (review round 3): an UNEXPECTED journal
+    # Exception (S14-style RuntimeError raised by the apply step after
+    # a partial insert) must never escape the PUBLICATION boundary.
+    # The direct-entry propagation is preserved untouched (that is the
+    # pre-commit crash-consistency vehicle); the publish path is fully
+    # isolated one level up: contained, rolled back whole, recorded
+    # ONLY as sanitized journal degradation, and the ordinary P1
+    # sample write of the same publication proceeds.
+    h9 = ingest_history()
+    write_ev(h9, 1, records=[ev_record(ts=900.0)])
+    write_ev(h9, 2, records=[ev_record(ts=901.0)])
+    write_ev(h9, 3, records=[ev_record(ts=902.0)])
+    real_apply9 = h9._journal_apply_locked
+    inject9 = {"on": True}
+
+    def crash_after_partial_insert(header, records, seq, now):
+        if inject9["on"]:
+            h9._conn.execute(
+                "INSERT INTO journal_runs (seq, run, source_epoch,"
+                " boundary, lines, eligible, info_dropped,"
+                " nomatch_dropped, priority_unusable, pfail, limited,"
+                " record_count, event_count, ingested_epoch,"
+                " ingested_at) VALUES (?, ?, 1, 'NONE', 0,0,0,0,0,0,0,"
+                " 0,0,?, '')",
+                (seq, header["run"], float(now)))
+            raise RuntimeError("SENTINEL-unexpected-journal-crash")
+        return real_apply9(header, records, seq, now)
+
+    h9._journal_apply_locked = crash_after_partial_insert
+    raised9 = None
+    try:
+        h9.on_publish(snap(), 1)
+    except Exception as exc:  # noqa: BLE001 -- the point is: none
+        raised9 = type(exc).__name__
+    runs9, events9, st9, audit9 = journal_dump(h9)
+    out["pub_crash_contained_sample_lands"] = (
+        raised9 is None and len(rows_of(h9)[0]) == 1
+        and h9.health()["enabled"])
+    out["pub_crash_full_rollback"] = (
+        not runs9 and not events9 and not audit9
+        and st9 == (0, None, 0, 0)
+        and h9.journal_status()["terminal_seq"] == 0)
+    hhs9 = h9.health()
+    out["pub_crash_sanitized_degraded"] = (
+        hhs9["degraded"]
+        and hhs9["last_error_code"] == CODE_INGEST_APPLY_FAILED
+        and not any(s in json.dumps(hhs9, default=str)
+                    for s in SENTINELS))
+    # a second publication with the crash STILL injected: containment
+    # repeats, and seqs 2 and 3 never leapfrog the untouched seq 1
+    h9._t[0] = T0 + 11.0
+    h9.on_publish(snap(), 2)
+    runs9b, _e9b, st9b, _a9b = journal_dump(h9)
+    out["pub_crash_no_leapfrog_repeat"] = (
+        len(rows_of(h9)[0]) == 2 and h9.health()["enabled"]
+        and h9.health()["degraded"] and not runs9b
+        and st9b == (0, None, 0, 0))
+    # the DIRECT entry keeps its contract: the RuntimeError still
+    # propagates out of ingest_journal_events() itself. Roll back the
+    # fresh partial BEFORE dumping -- an uncommitted insert IS visible
+    # on the same connection.
+    direct_msg = None
+    try:
+        h9.ingest_journal_events()
+    except RuntimeError as exc:
+        direct_msg = str(exc)
+    h9._conn.rollback()
+    runs9d, _e9d, st9d, _a9d = journal_dump(h9)
+    out["pub_crash_direct_entry_still_raises"] = (
+        direct_msg == "SENTINEL-unexpected-journal-crash"
+        and not runs9d and st9d == (0, None, 0, 0))
+    # real apply restored: the next clean publication consumes 1..3
+    # exactly once and the journal health recovers
+    inject9["on"] = False
+    h9._t[0] = T0 + 22.0
+    h9.on_publish(snap(), 3)
+    runs9c, events9c, st9c, _a9c = journal_dump(h9)
+    r9 = h9.ingest_journal_events()
+    out["pub_crash_clean_pass_recovers"] = (
+        [x[0] for x in runs9c] == [1, 2, 3] and st9c == (3, 3, 0, 0)
+        and [x[0] for x in events9c] == [1, 2, 3]
+        and not h9.health()["degraded"]
+        and h9.health()["last_error_code"] is None
+        and r9["consumed"] == 0)
+    h9.close()
     return out
 
 
@@ -2505,6 +2590,12 @@ check 'd["undecodable_rejected_once_frozen_code"]' "R2-B2: frozen terminal rejec
 check 'd["undecodable_zero_rows_higher_seq_continues"]' "R2-B2: zero rows for the hostile seq; higher seqs continue"
 check 'd["undecodable_hostile_bytes_absent"]' "R2-B2: hostile bytes absent from DB and status surface"
 check 'd["undecodable_next_seq_still_correct"]' "R2-B2: subsequent valid sequence stays exactly-once"
+check 'd["pub_crash_contained_sample_lands"]' "R3-B: unexpected journal Exception never escapes on_publish; P1 lands"
+check 'd["pub_crash_full_rollback"]' "R3-B: partial journal transaction rolls back completely; terminal frozen"
+check 'd["pub_crash_sanitized_degraded"]' "R3-B: containment records only the sanitized ingest code"
+check 'd["pub_crash_no_leapfrog_repeat"]' "R3-B: repeated contained publishes never leapfrog the untouched seq"
+check 'd["pub_crash_direct_entry_still_raises"]' "R3-B: direct ingest_journal_events() keeps RuntimeError propagation"
+check 'd["pub_crash_clean_pass_recovers"]' "R3-B: restored apply consumes blocked seqs exactly once, healthy"
 
 printf '\n== RESULT: %d passed, %d failed ==\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] && [ "$PASS" -eq "$EXPECTED_PASS" ] || { printf '  (failures, or a section did not fully run)\n'; exit 1; }

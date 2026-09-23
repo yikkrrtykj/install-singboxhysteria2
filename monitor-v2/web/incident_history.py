@@ -919,9 +919,12 @@ class IncidentHistory:
         now = self._clock()
         # Journal ingest rides the SAME publication cadence under the SAME
         # lock (before the write-nothing early return below, so a quiet
-        # publish still drains the exchange dir). It swallows its own
-        # failures: it can never delay or break snapshot writes.
-        self._journal_ingest_gate(now)
+        # publish still drains the exchange dir). The publisher entry uses
+        # the outer containment wrapper: NO ordinary Exception from the
+        # journal path may ever break this publication's P1 write — it is
+        # contained, rolled back, and recorded only as sanitized journal
+        # degradation.
+        self._journal_ingest_publish_gate(now)
         sample_due = (self._last_sample_ts is None or
                       (now - self._last_sample_ts) >= self._sample_interval)
         rows = project_device_rows(snapshot, self._run_id, now)
@@ -1017,14 +1020,17 @@ class IncidentHistory:
                 < self._journal_ingest_interval):
             return None
         self._last_journal_ingest_ts = now
-        # TOTAL journal containment (frozen P2 failure invariant): NO
-        # journal-path exception ever escapes into the publisher path.
-        # A structural refusal (e.g. the continuity row was mutated
-        # away mid-run -- never silently recreated) degrades and
-        # fail-closes ONLY the journal subsystem: nothing settles, no
-        # journal row is fabricated, and the ordinary P1 sample/device
-        # write of the same publication still executes on its own
-        # storage path.
+        # Journal containment (frozen P2 failure invariant): structural
+        # and storage errors fail-close ONLY the journal subsystem --
+        # nothing settles, nothing is fabricated, and the ordinary P1
+        # sample/device write of the same publication still executes on
+        # its own storage path. A missing continuity row is NEVER
+        # silently recreated. BaseException (process control) is
+        # deliberately NOT caught, and an injected RuntimeError still
+        # propagates out of the DIRECT ingest_journal_events() entry --
+        # that is the pre-commit crash-consistency vehicle; the
+        # publication path is fully isolated one level up in
+        # ``_journal_ingest_publish_gate``.
         try:
             return self._journal_ingest_pass(now)
         except _HistoryError as exc:
@@ -1032,6 +1038,19 @@ class IncidentHistory:
             self._record_journal_failure(exc.code)
             return None
         except (sqlite3.Error, OSError):
+            self._rollback_quiet()
+            self._record_journal_failure(CODE_INGEST_APPLY_FAILED)
+            return None
+
+    def _journal_ingest_publish_gate(self, now):
+        # PUBLICATION-ONLY outer containment: no journal Exception of
+        # ANY kind (including the crash-sim RuntimeError a direct
+        # ingest call lets propagate) may prevent the P1 timeline write
+        # of the same publication. Contained, rolled back whole, and
+        # recorded ONLY as sanitized journal degradation.
+        try:
+            return self._journal_ingest_gate(now)
+        except Exception:  # noqa: BLE001 -- publisher isolation is total
             self._rollback_quiet()
             self._record_journal_failure(CODE_INGEST_APPLY_FAILED)
             return None
