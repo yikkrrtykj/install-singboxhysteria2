@@ -181,6 +181,85 @@ grep -qF '    port: 8444' "$D" && pass 'hopping keeps the base hy2 port line' \
 grep -qF 'hop-interval' "$A" && fail 'non-hopping render contains hopping fields' \
     || pass 'non-hopping render is free of hopping fields'
 
+# -------------------------------------- failover policy content (issue #42) --
+# The proxy-groups block IS the client failover policy: the top-level Selector
+# keeps its member order and gains `default-selected: 自动选择` (fresh/no-cache
+# starts route through the automatic group; any persisted pin wins over it),
+# and 自动选择 was changed IN PLACE from url-test to a Reality-primary
+# fallback so every previously cached 自动选择 selection stays valid.
+printf '\n== proxy-groups failover policy (#42) ==\n'
+groups_block(){ awk '/^proxy-groups:/{f=1} /^rules:/{f=0} f && !/^[[:space:]]*$/' "$1"; }
+cat > "$TMP/exp-groups" <<'GROUPS'
+proxy-groups:
+  - name: 节点选择
+    type: select
+    default-selected: 自动选择
+    proxies:
+      - Reality
+      - Hysteria2
+      - 自动选择
+      - DIRECT
+  - name: 自动选择
+    type: fallback
+    proxies:
+      - Reality
+      - Hysteria2
+    url: "https://www.gstatic.com/generate_204"
+    interval: 60
+    timeout: 5000
+    lazy: false
+    expected-status: "204"
+GROUPS
+groups_block "$A" > "$TMP/got-groups"
+cmp -s "$TMP/exp-groups" "$TMP/got-groups" \
+    && pass 'rendered proxy-groups block equals the accepted #42 policy byte-for-byte (ignoring blank lines)' \
+    || fail 'rendered proxy-groups block drifted from the accepted #42 policy'
+
+# migration precondition: default-selected must name a Selector member, or
+# mihomo silently degrades to the FIRST member (Reality) instead of auto
+ds="$(awk '/^    default-selected: /{sub(/^    default-selected: /,"");print;exit}' "$A")"
+assert_eq '自动选择' "$ds" '节点选择 carries default-selected: 自动选择'
+sel_members="$(awk '/^  - name: 节点选择$/{s=1;next} /^  - name: /{s=0} s&&/^      - /{sub(/^      - /,"");print}' "$A")"
+printf '%s\n' "$sel_members" | grep -qxF "$ds" \
+    && pass 'default-selected resolves to a real Selector member (fresh install -> automatic group)' \
+    || fail 'default-selected names no Selector member; fresh installs would not be automatic'
+# the four Selector member NAMES are frozen: every possible store-selected
+# cached value (Reality / Hysteria2 / 自动选择 / DIRECT) stays resolvable
+# after the policy switch -- existing pins are preserved, not orphaned
+assert_eq 'Reality
+Hysteria2
+自动选择
+DIRECT' "$sel_members" 'Selector member order is exactly Reality / Hysteria2 / 自动选择 / DIRECT (pin compatibility)'
+
+assert_eq 1 "$(grep -c '^  - name: 自动选择$' "$A")" '自动选择 is defined exactly once (in-place type change, no renamed twin)'
+auto_type="$(awk '/^  - name: 自动选择$/{f=1;next} f&&/^    type: /{sub(/^    type: /,"");print;exit}' "$A")"
+assert_eq 'fallback' "$auto_type" '自动选择 is type: fallback (priority failover, not latency racing)'
+fb_first="$(awk '/^  - name: 自动选择$/{f=1} f&&/^      - /{sub(/^      - /,"");print;exit}' "$A")"
+assert_eq 'Reality' "$fb_first" 'fallback member order starts with Reality (primary preference)'
+
+grep -qF 'type: url-test' "$A" && fail 'a url-test group survived the policy switch' \
+    || pass 'no url-test group remains'
+grep -qF 'tolerance:' "$A" && fail 'stale url-test tolerance field survived' \
+    || pass 'no tolerance field remains'
+grep -qF '"http://www.gstatic.com' "$A" && fail 'plaintext probe URL survived' \
+    || pass 'health probe URL is HTTPS-only'
+
+# untouched invariants the migration matrix relies on
+grep -qF 'store-selected: true' "$A" \
+    && pass 'store-selected persistence preserved (explicit pins survive reload by design)' \
+    || fail 'store-selected was lost'
+grep -qF 'MATCH,节点选择' "$A" && pass 'terminal rule still routes into 节点选择' \
+    || fail 'terminal MATCH rule drifted'
+
+# every render path shares the one template: legacy account and the hopping
+# variant must carry the IDENTICAL policy block
+G_LEG="$TMP/g-legacy"; G_HOP="$TMP/g-hop"
+groups_block "$C" > "$G_LEG"; groups_block "$D" > "$G_HOP"
+cmp -s "$TMP/got-groups" "$G_LEG" && pass 'legacy shared-account render carries the same policy block' \
+    || fail 'legacy render drifted from the policy block'
+cmp -s "$TMP/got-groups" "$G_HOP" && pass 'port-hopping variant render carries the same policy block' \
+    || fail 'hopping render drifted from the policy block'
+
 # ----------------------------------------------------------------- fail-closed
 printf '\n== fail-closed inputs, zero stdout ==\n'
 EMPTY="$TMP/empty.out"

@@ -1,0 +1,55 @@
+[Unit]
+Description=sing-box journal reader (dedicated sbox-jr journal-read producer)
+# Ordering only: the reader consumes the TARGET unit's journal records; if
+# sing-box is absent or fails, journalctl simply yields nothing and the
+# reader keeps polling -- this unit must never block or fail the boot.
+After=sing-box.service
+# Crash-loop budget (frozen design): a fail-closed corruption state reaches
+# `failed` quickly instead of spinning, and the restart storm is bounded.
+# [Unit] placement: StartLimit* moved out of [Service]; correct on every
+# supported baseline (22.04 / 24.04 / 26.04).
+StartLimitIntervalSec=300
+StartLimitBurst=20
+
+[Service]
+Type=simple
+# R7 (frozen): the ONLY accepted journal-read model is this dedicated
+# sbox-jr identity, created with the exact audited attributes and member of
+# the OS `systemd-journal` group (membership via usermod, deliberately NOT
+# SupplementaryGroups= -- the unit must not silently re-grant what the
+# installer preflight validated). An identity mismatch is a preflight STOP,
+# never a runtime fallback: there is no root and no sboxweb read path.
+User=@SBJR_USER@
+Group=@SBJR_GROUP@
+# Passwd/dbus fallback (if any) is a name lookup, never a TCP surface:
+# AddressFamilies collapses to AF_UNIX-only, the strictest contract in
+# this product line (contrast: the monitor unit keeps AF_INET/AF_INET6).
+Environment=SBOX_JR_UNIT=@SBJR_WATCHED_UNIT@
+ExecStart=@SBJR_LIBEXEC@/sbox-journal-reader
+# The reader NEVER creates its own state tree (installer contract); the
+# single writable exception under ProtectSystem=strict is its data root.
+UMask=0077
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=15s
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ReadWritePaths=@SBJR_DATA_ROOT@
+ProtectHome=yes
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

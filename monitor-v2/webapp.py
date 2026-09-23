@@ -26,6 +26,7 @@ import argparse
 import os
 import ssl
 import sys
+import uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
@@ -37,6 +38,7 @@ from web.auth import AuthStore, validate_password  # noqa: E402
 from web.broker import SnapshotBroker  # noqa: E402
 from web.e3_broker import E3Broker  # noqa: E402
 from web.e3rpc import E3RpcClient  # noqa: E402
+from web.incident_history import IncidentHistory  # noqa: E402
 from web.recovery import generate_key  # noqa: E402
 from web.server import (MONITOR_WEB_VERSION, MonitorWebApp,  # noqa: E402
                         build_server)
@@ -256,8 +258,17 @@ def cmd_serve(args):
     collector = Collector(url=args.url, interval=args.interval,
                           secret=resolve_secret(args.secret_file),
                           closed_ttl=args.closed_ttl)
+    # Issue #33 P1 incident history: one run_id per process start (random,
+    # non-secret -- its ONLY purpose is to make restart boundaries visible
+    # in the timeline). open() never raises; a refused/unsafe storage path
+    # leaves the history degraded while everything else serves as before.
+    history = IncidentHistory(os.path.join(data_dir, "diagnostics"),
+                              uuid.uuid4().hex,
+                              monitor_version=MONITOR_WEB_VERSION)
+    history.open()
     broker = SnapshotBroker(collector, poll_seconds=args.poll,
-                            health_file=args.health_file)
+                            health_file=args.health_file,
+                            incident_history=history)
     broker.start()
 
     auth = AuthStore(data_dir, session_ttl=args.session_ttl)
@@ -267,7 +278,8 @@ def cmd_serve(args):
     app = MonitorWebApp(broker=broker, access=access,
                         static_dir=os.path.join(HERE, "web", "static"),
                         auth=auth, remote_mode=remote_mode,
-                        e3_broker=E3Broker(E3RpcClient()))
+                        e3_broker=E3Broker(E3RpcClient()),
+                        incident_history=history)
     server = build_server(app, args.listen, args.port, tls_context)
     scheme = "https" if tls_context is not None else "http"
     print("monitor web (%s) listening on %s:%d [%s]" %
@@ -280,6 +292,7 @@ def cmd_serve(args):
     finally:
         broker.stop()
         server.server_close()
+        history.close()
     return 0
 
 
