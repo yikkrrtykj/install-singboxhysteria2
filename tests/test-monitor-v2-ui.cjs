@@ -642,6 +642,6 @@ async function main() {
     assert.ok(!ids['mg-activate'] && !ids['mg-deactivate']);
     assert.ok(requests.every(r => !/management\/(activate|deactivate)/.test(r.url))); productText();
   });
-  assert.equal(count, 67, 'UI assertion count guard');
+  assert.equal(count, 68, 'UI assertion count guard');
 }
 main().catch(err => { console.error(err); process.exitCode = 1; });

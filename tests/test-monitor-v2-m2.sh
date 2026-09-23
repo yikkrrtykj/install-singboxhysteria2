@@ -511,6 +511,42 @@ def group_add_without_stepup():
         r["status"] == 401 and body.get("error") == "reauth_required")
     out["delete_without_stepup_zero_rpc"] = len(client.calls) == calls_before
 
+    # Discriminators B/C for the add gate itself: no session -> 401 login
+    # required, missing/wrong CSRF -> 403 -- each refusal sampled individually
+    # (R5-style) and each proven to dispatch ZERO client.add RPCs.
+    calls_before = len(client.calls)
+    r = req(port, "POST", "/api/v1/clients/add",
+            {"Content-Type": "application/json", "X-CSRF-Token": csrf,
+             "Idempotency-Key": "m2-no-stepup-key-000000000002"},
+            json.dumps({"name": "vmix-no-stepup"}))
+    out["add_no_session_401_login_required"] = (
+        r["status"] == 401
+        and json.loads(r["body"]).get("error") == "login required")
+    out["add_no_session_zero_rpc"] = len(client.calls) == calls_before
+    calls_before = len(client.calls)
+    r = req(port, "POST", "/api/v1/clients/add",
+            {"Content-Type": "application/json", "Cookie": cookie,
+             "Idempotency-Key": "m2-no-stepup-key-000000000003"},
+            json.dumps({"name": "vmix-no-stepup"}))
+    out["add_no_csrf_403_zero_rpc"] = (
+        r["status"] == 403 and len(client.calls) == calls_before)
+    calls_before = len(client.calls)
+    r = req(port, "POST", "/api/v1/clients/add",
+            {"Content-Type": "application/json", "Cookie": cookie,
+             "X-CSRF-Token": "wrong-" + csrf,
+             "Idempotency-Key": "m2-no-stepup-key-000000000004"},
+            json.dumps({"name": "vmix-no-stepup"}))
+    out["add_bad_csrf_403_zero_rpc"] = (
+        r["status"] == 403 and len(client.calls) == calls_before)
+    # The session-only actor is the REAL session fingerprint (never a
+    # dummy), and the successful add above neither granted nor consumed a
+    # step-up window on this session.
+    out["add_actor_session_fp_is_token_fp"] = actor.get("session_fp") == \
+        stack.app.session_fingerprint(_token_of(stack, cookie))
+    out["add_granted_no_stepup_window"] = \
+        stack.auth.sessions.step_up_credentials(
+            _token_of(stack, cookie)) == {"active": False, "fp": None}
+
     stack.stop()
     return out
 
