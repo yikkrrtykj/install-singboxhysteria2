@@ -489,7 +489,8 @@
     var p = state.e3PendingRetry;
     if (!p) return;   // no pending uncertain operation: nothing to retry
     e3Message("Checking the previous change…", false);
-    apiWithStepUp(p.path, {
+    var dispatch = p.path === "/api/v1/clients/add" ? api : apiWithStepUp;
+    dispatch(p.path, {
       method: "POST",
       idempotencyKey: p.idempotencyKey,   // exact same header value
       body: p.body
@@ -725,8 +726,9 @@
 
   function setMutation(kind, name) {
     // 0.1.5 (#36): UI/single-flight lock around add+delete. Rendered
-    // synchronously BEFORE apiWithStepUp so the busy state is visible for
-    // the whole operation (step-up dialog included).
+    // synchronously BEFORE network dispatch so the busy state is visible for
+    // the whole operation. Delete may include step-up; Add deliberately does
+    // not require a second password after login.
     state.e3Mutation = {kind: kind, name: name, inFlight: true};
     renderE3Controls();
   }
@@ -849,7 +851,10 @@
     if (!e3Writable()) return;
     var key = keyOverride || newIdempotencyKey();
     setMutation("add", name);
-    apiWithStepUp("/api/v1/clients/add", {
+    // UX contract: the authenticated admin session + CSRF token is enough
+    // for client.add. Do NOT route Add through apiWithStepUp: logging in once
+    // must not immediately ask for the same administrator password again.
+    api("/api/v1/clients/add", {
       method: "POST",
       idempotencyKey: key,
       body: { name: name }

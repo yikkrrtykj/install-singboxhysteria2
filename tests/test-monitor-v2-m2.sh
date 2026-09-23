@@ -730,6 +730,43 @@ def group_http_adapter():
     out["list_legacy_reserved"] = any(
         c["name"] == "legacy" and c["reserved"] for c in clients)
 
+    # UX hotfix: Add uses the already-authenticated session + CSRF only.
+    # Revoke the live step-up to prove there is no hidden dependency on the
+    # second password, while Delete remains protected by re-authentication.
+    stack.auth.sessions.revoke_all_step_ups()
+    client.record({"ok": True, "request_id": "helper-add-nostep-rid",
+                   "idempotency": {"key_fp": "b" * 16, "replayed": False,
+                                   "generation": 1},
+                   "data": {"name": "nostep-01",
+                            "protocols": ["reality", "hy2"],
+                            "mutable": True, "source": "untracked",
+                            "yaml_available": False,
+                            "credential_delivery": "cli"},
+                   "warnings": []})
+    calls_before = len(client.calls)
+    r = mutate(port, "/api/v1/clients/add", cookie, csrf,
+               {"Idempotency-Key": "m2-nostep-add-00000001"},
+               json.dumps({"name": "nostep-01"}))
+    out["add_without_stepup_200"] = (
+        r["status"] == 200 and json.loads(r["body"]).get("ok") is True)
+    out["add_without_stepup_dispatched_once"] =         len(client.calls) == calls_before + 1
+    actor = client.actors[-1] if client.actors else None
+    out["add_without_stepup_actor_session_only"] = (
+        isinstance(actor, dict)
+        and isinstance(actor.get("session_fp"), str)
+        and len(actor["session_fp"]) == 16
+        and "stepup_fp" not in actor)
+
+    calls_before = len(client.calls)
+    r = mutate(port, "/api/v1/clients/delete", cookie, csrf,
+               {"Idempotency-Key": "m2-nostep-del-00000001"},
+               json.dumps({"name": "vmix-01", "confirm": "vmix-01"}))
+    body = json.loads(r["body"])
+    out["delete_without_stepup_401_reauth"] = (
+        r["status"] == 401 and body.get("error") == "reauth_required")
+    out["delete_without_stepup_zero_rpc"] = len(client.calls) == calls_before
+    step_up(port, cookie, csrf)
+
     # mutations: the Idempotency-Key contract
     client.record({"ok": True, "request_id": "helper-add-rid",
                    "idempotency": {"key_fp": "a" * 16, "replayed": False,

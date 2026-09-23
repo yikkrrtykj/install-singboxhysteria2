@@ -196,14 +196,14 @@ async function main() {
   ui.addClient('bob'); await flush();
   check('raw backend error detail is not rendered to the user', productText);
   responses.push(response({error: 'reauth_required'}, 401));
-  const options = {method: 'POST', body: {name: 'bob'}, idempotencyKey: 'same-key'};
-  const stepped = ui.apiWithStepUp('/api/v1/clients/add', options); await flush();
-  check('step-up password panel appears only on demand with product copy', () => { assert.ok(!ids['stepup-overlay'].className.includes('hidden')); assert.match(ids['stepup-form'].textContent, /Confirm admin password/); });
+  const options = {method: 'POST', body: {name: 'alice', confirm: 'alice'}, idempotencyKey: 'same-key'};
+  const stepped = ui.apiWithStepUp('/api/v1/clients/delete', options); await flush();
+  check('step-up password panel still appears on demand for protected operations', () => { assert.ok(!ids['stepup-overlay'].className.includes('hidden')); assert.match(ids['stepup-form'].textContent, /Confirm admin password/); });
   responses.push(response({}), response(ui.state.session), response({}));
   ids['stepup-password'].value = 'test-password'; ids['stepup-form'].events.submit({preventDefault() {}});
   await stepped; await flush();
-  check('step-up replay retains original body and headers', () => {
-    const pair = requests.filter(r => r.url === '/api/v1/clients/add').slice(-2);
+  check('step-up replay retains original body and headers for protected operations', () => {
+    const pair = requests.filter(r => r.url === '/api/v1/clients/delete').slice(-2);
     assert.equal(pair[0].body, pair[1].body); assert.deepEqual(pair[0].headers, pair[1].headers);
     assert.ok(ids['stepup-overlay'].className.includes('hidden'));
   });
@@ -324,6 +324,14 @@ async function main() {
     assert.ok(delBody.indexOf('if (state.e3PendingRetry || state.e3Mutation) return;') < delBody.indexOf('setMutation("delete", name);'));
     assert.equal((src.match(/setMutation\("add", name\);/g) || []).length, 1);
     assert.equal((src.match(/setMutation\("delete", name\);/g) || []).length, 1);
+  });
+  check('Add and same-key Add retry bypass password step-up by construction', () => {
+    const src = app;
+    const addBody = src.slice(src.indexOf('function addClient'), src.indexOf('/* ---------- settings: access control'));
+    const retryBody = src.slice(src.indexOf('function retryPending'), src.indexOf('function loadE3Status'));
+    assert.match(addBody, /api\("\/api\/v1\/clients\/add"/);
+    assert.doesNotMatch(addBody, /apiWithStepUp\("\/api\/v1\/clients\/add"/);
+    assert.match(retryBody, /p\.path === "\/api\/v1\/clients\/add" \? api : apiWithStepUp/);
   });
   // 0.1.4 review blocker: a watchdog/manual read that STARTS inside the
   // convergence window and lands BEFORE the convergence must not commit.
@@ -627,6 +635,6 @@ async function main() {
     assert.ok(!ids['mg-activate'] && !ids['mg-deactivate']);
     assert.ok(requests.every(r => !/management\/(activate|deactivate)/.test(r.url))); productText();
   });
-  assert.equal(count, 67, 'UI assertion count guard');
+  assert.equal(count, 68, 'UI assertion count guard');
 }
 main().catch(err => { console.error(err); process.exitCode = 1; });

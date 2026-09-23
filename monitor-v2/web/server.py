@@ -523,12 +523,15 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             return
         op = MUTATION_ROUTES.get(path)
         if op is not None:
-            # M2: the full gate chain (session -> CSRF -> step-up) is
-            # unchanged; the gate ALSO freezes the audit actor atomically
-            # with the step-up liveness check (B2), so a revocation that
-            # lands after the gate can never strip the actor from an
-            # already-authorized dispatch.
-            self._require_step_up(self._handle_e3_mutation, op)
+            # UX hotfix: client.add is already behind an authenticated
+            # session + session-bound CSRF and does not require a second
+            # administrator password. Keep step-up for the destructive /
+            # higher-risk privileged operations (including client.delete).
+            # Both gates freeze the session fingerprint for helper audit.
+            if op == "client.add":
+                self._require_session_actor(self._handle_e3_mutation, op)
+            else:
+                self._require_step_up(self._handle_e3_mutation, op)
             return
         if path == "/api/v1/clients/export":
             # M4: the read-only sensitive delivery. POST-only by contract --
@@ -630,6 +633,32 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
                                 {"error": "missing or invalid CSRF token"})
                 return
         handler(session, *args)
+
+    def _require_session_actor(self, handler, *args):
+        """Authenticated mutation gate without password step-up.
+
+        Used only for operations explicitly classified as safe to perform
+        within the already-authenticated admin session (currently client.add).
+        It preserves the same session + CSRF checks as the privileged gate and
+        freezes session_fp for helper audit, but deliberately emits no
+        stepup_fp and never returns reauth_required.
+        """
+        token = self._session_token()
+        session = self.app.session_from_token(token)
+        if session is None:
+            self._send_json(401, {"error": "login required"})
+            return
+        supplied = self.headers.get("X-CSRF-Token")
+        expected = session.get("csrf_token", "")
+        if not isinstance(supplied, str) or \
+                not hmac.compare_digest(supplied, expected):
+            self._send_json(403, {"error": "missing or invalid CSRF token"})
+            return
+        actor = {}
+        sfp = self.app.session_fingerprint(token)
+        if sfp:
+            actor["session_fp"] = sfp
+        handler(session, *args, actor)
 
     def _require_step_up(self, handler, *args):
         """Gate for privileged mutations (M0.5 / rev5 §5).
@@ -1117,10 +1146,11 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
     def _handle_e3_mutation(self, session, op, actor):
         """POST mutation -> dispatch to sbox-cm via the broker.
 
-        Reached only after session -> CSRF -> step-up, and the ``actor`` was
-        FROZEN at the gate (B2): the fingerprints are the gate-time values,
-        so a revocation racing the dispatch changes the authorization of
-        FUTURE requests, never the attribution of this one.
+        Reached after an operation-specific authenticated gate. ``client.add``
+        requires session + CSRF only; destructive / higher-risk mutations keep
+        session + CSRF + step-up. In both cases the ``actor`` is FROZEN at the
+        gate so a later session change never rewrites this request's audit
+        attribution.
 
         Contract highlights (design §8-§11):
 
