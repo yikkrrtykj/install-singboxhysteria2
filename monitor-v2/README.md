@@ -319,14 +319,6 @@ web 层字段：`web_status`、`api_status`、`monitor_started_at`、
 `Tracker.snapshot()` 新增顶层 `connections` 逐连接行（ACTIVE + 有上限的
 RECENT，纯投影、无二次记账），供 Connections 表使用；188 项 E1 断言不受影响。
 
-### 0.2.1：Add client 不再重复输入管理员密码
-
-Web 中 `client.add` 现在使用已登录 session + session-bound CSRF 直接授权，
-不再要求 300s step-up（二次输入管理员密码）。审计仍保留 `session_fp`；
-`stepup_fp` 对 add 刻意缺省。Delete、Export、management activate/deactivate
-继续保留原 step-up 保护；idempotency、convergence、helper RPC 与敏感数据边界
-均未改变。
-
 ### 0.2.0：持久化事件时间线（issue #33 P1，设计见 docs/monitor-v2-incident-history-p1.md）
 
 publisher 在 `_decorate()` 发布成功后，把 snapshot 的**白名单聚合投影**写入
