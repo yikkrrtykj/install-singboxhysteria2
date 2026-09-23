@@ -264,14 +264,19 @@ so it increments and never resets.
   zero-group collector would record empty evidence forever -- refused).
 * `nodes`: every observed member (union of named-group members, current
   selections and repeatable explicit `--node` names -- 0..32, de-duplicated
-  first-seen; the union still closes at 64 observed nodes with the excess
-  flagged `truncated`), each `{name, type, alive, history, extra}`:
+  first-seen; explicit names are PROTECTED first inside the 64-node cap, so
+  a caller-demanded node is never sorted out of existence by group
+  expansion -- when the cap bites, a group-derived tail is the visible
+  `truncated` victim), each `{name, type, alive, history, extra}`:
   `alive` is a strict bool or `null` ("unknown", never False); `history`
   entries are
   `{ts, delay_ms}` newest-last, tail of 8. Names are an EXACT display
   identity: legal characters (including spaces) are stored byte-for-byte,
   never trimmed or normalized; empty/over-128-byte/control names are
-  refused and counted. **`delay == 0` is preserved RAW
+  refused and counted -- measured by STRICT UTF-8 encoding, so a string
+  that cannot be UTF-8 encoded at all (a lone surrogate from upstream
+  escaped JSON) is invalid, never laundered through a lossy length check.
+  **`delay == 0` is preserved RAW
   as integer 0** (a FAILED probe, the single most important missing datum,
   E4-H1); a delay must be a true bounded integer -- a float (even `1.0`),
   bool or string is dropped and counted, never coerced; a delay whose
@@ -298,7 +303,8 @@ so it increments and never resets.
 * `truncated` / `invalid_fields`: cardinality caps (8 groups, 32 explicit
   `--node` names, 32 stored members per group, 64 observed nodes, 8 history
   entries per node AND per test-URL view, 8 extra
-  test-ids per node, names 1..128 UTF-8 bytes without C0/C1 controls) and
+  test-ids per node, names 1..128 bytes of STRICT UTF-8 without C0/C1
+  controls) and
   the hard record ceiling -- one encoded line is at most 64 KiB INCLUDING
   the trailing newline; an oversized record is trimmed STRUCTURALLY (never
   byte-sliced) and flagged. Nothing arbitrary is persisted anywhere: no
@@ -332,7 +338,12 @@ produces edges.
   the same directory refuse to start. `diag.key` (the HMAC key) is created
   once with `O_CREAT|O_EXCL` (a lost race re-reads the existing key through
   the same safe loader, never overwrites it), `O_NOFOLLOW` +
-  fstat-verified regular, 0600 enforced fail-closed. `diag.jsonl` is opened
+  fstat-verified regular, 0600 enforced fail-closed -- and NO key is ever
+  returned until BOTH its contents (file fsync) and its directory entry
+  (dir fsync) are durably proven, on the create path AND on every later
+  load: a failed first initialization can never be laundered into a
+  trusted key by the next process, so `test_id` stability is proven, not
+  assumed. `diag.jsonl` is opened
   `O_APPEND|O_NOFOLLOW`, fstat-verified regular, fchmod'ed 0600 (failure
   fatal on POSIX), appended with one write-until-complete loop per cycle
   batch, `fsync` per cycle; on startup AT MOST ONE incomplete trailing
@@ -346,6 +357,11 @@ produces edges.
   rotated files older than 7 days drop oldest-first, and the same pass
   enforces the chain-count and 32 MiB total ceilings (the current
   `diag.jsonl` itself is under size-cap control, never pruned here).
+  Retention is fail-closed: only a FileNotFoundError race is skipped --
+  any other stat/getsize fault is a `storage_error` stop, and numeric
+  chain members are checked with a NON-FOLLOWING lstat that requires a
+  regular file (a symlinked or special-file member is never followed or
+  ignored).
   `--prune-now` rotates, prunes, prints `{"rotated", "pruned", "path"}`
   and exits without sampling.
 
@@ -370,11 +386,13 @@ python3 monitor-v2/mihomo/diag.py --url http://127.0.0.1:9090 \
     --out-dir /var/lib/mihomo-diag --once
 ```
 
-Tests: `tests/test-monitor-v2-e4diag.sh` (392 assertions, fail-closed gate:
+Tests: `tests/test-monitor-v2-e4diag.sh` (422 assertions, fail-closed gate:
 static mutation-free greps plus residue greps, the strict four-type proof,
 delay-0 raw preservation, leak wall, B4 storage primitives via fault
-injection (torn-tail truncation, age/budget/overflow prune, category-only
-stderr), encode bounds, explicit-node union + per-test-url 8-entry tails,
+injection (torn-tail truncation, age/budget/overflow prune + fail-closed
+retention metadata, category-only
+stderr), encode bounds, explicit-node protection + per-test-url 8-entry
+tails, strict-UTF-8 names, HMAC-key durability re-proof,
 B6 ledger semantics, exit-code matrix). The E4
 suite (161) and E1 (232) must stay green -- `diag.py` lives under `mihomo/`
 and is covered by the same static greps.

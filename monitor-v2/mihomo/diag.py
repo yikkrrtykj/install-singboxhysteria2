@@ -48,7 +48,10 @@ closed (code, scope, count) triple. Custom health-check test URLs are never
 stored: each is replaced by ``test_id = HMAC-SHA256(local 256-bit key, raw
 url)[:16 hex]``; the key lives in the evidence dir (0600, fail-closed) so
 ids stay stable across samples AND restarts while the URL itself never
-crosses the persistence boundary. Connection evidence is per-node
+crosses the persistence boundary -- and that stability is PROVEN, not
+assumed: no key is ever returned until its contents and its directory
+entry are both fsync-durable on every load path (review R4). Connection
+evidence is per-node
 aggregates (active chain count, oldest/newest start, invalid-start count)
 -- ids, addresses, hosts, rules and counters never leave the parser, and
 no cross-group "stale" inference is derived (it would overclaim under
@@ -65,7 +68,12 @@ never prove transition events across invocations -- the resident
 ``--resident`` loop is the mode that produces edges.
 
 BOUNDS (review B5): max 8 watched groups, 32 stored members per group, 64
-observed nodes per sample, names 1..128 UTF-8 bytes without C0/C1 controls,
+observed nodes per sample -- and caller-demanded ``--node`` names (max 32)
+are PROTECTED ahead of group expansion inside that 64 (review R2: a
+requested node is never sorted out of existence; when the cap bites, a
+group-derived tail is the visible victim), names 1..128 bytes of STRICT
+UTF-8 without C0/C1 controls (a string that cannot be UTF-8 encoded at all
+-- e.g. a lone surrogate -- is invalid, never measured lossily, review R3),
 history tails of 8, per-node test-id entries capped, rotation arguments
 bounded (2..32 files, <=8 MiB/file, <=32 MiB total). The hard record
 ceiling is measured on the FINAL ENCODED BYTES INCLUDING the trailing
@@ -84,7 +92,10 @@ one incomplete trailing fragment is truncated back to the last newline
 (diag.jsonl.1 .. .{N-1}) with file fsync before the rename and directory
 fsync after it; the same prune pass (every cycle and --prune-now) enforces
 7-day age retention oldest-first plus the 32 MiB total and chain-count
-ceilings. One diag.lock (advisory exclusive,
+ceilings -- and retention is fail-closed (review R1): only a
+FileNotFoundError race is skipped, any other stat/getsize fault stops
+storage, and chain members are verified with a NON-FOLLOWING lstat that
+demands a regular file. One diag.lock (advisory exclusive,
 non-blocking) makes a second collector on the same directory refuse to
 start. A collection or storage failure is VISIBLE: collector records plus
 a non-zero once-mode result (3 api / 4 storage / 5 both) -- never a silent
@@ -245,23 +256,29 @@ def parse_ts(value):
 def safe_name(value):
     """Validate one display name against the reviewed bound -- EXACTLY.
 
-    Non-empty, <=128 UTF-8 bytes, no C0/C1 control characters. The validated
-    string is returned UNCHANGED: a name is a display identity, so legal
-    characters (including U+0020 space) are never stripped or otherwise
-    normalized into a different name (review B5 residual). An invalid name
-    returns None -- dropped AND counted upstream, never truncated into
-    something that looks real, never serialized raw.
+    Non-empty, <=128 bytes under STRICT UTF-8 encoding, no C0/C1 control
+    characters. The validated string is returned UNCHANGED: a name is a
+    display identity, so legal characters (including U+0020 space) are never
+    stripped or otherwise normalized into a different name (review B5
+    residual). A string that cannot be encoded as UTF-8 at all (e.g. a lone
+    surrogate, which json.loads can hand back from escaped upstream input)
+    is invalid, never measured with a lossy 'replace' stand-in (review R3).
+    An invalid name returns None -- dropped AND counted upstream, never
+    truncated into something that looks real, never serialized raw.
     """
-    if not isinstance(value, str):
+    if not isinstance(value, str) or not value:
         return None
-    name = value
-    if not name or len(name.encode("utf-8", "replace")) > NAME_MAX_BYTES:
+    try:
+        encoded = value.encode("utf-8")      # STRICT: no replace-mode laundering
+    except UnicodeEncodeError:
         return None
-    for ch in name:
+    if len(encoded) > NAME_MAX_BYTES:
+        return None
+    for ch in value:
         code = ord(ch)
         if code < 0x20 or 0x7f <= code <= 0x9f:
             return None
-    return name
+    return value
 
 
 def as_strict_bool(value):
@@ -346,13 +363,14 @@ def parse_proxies_summary(payload, group_names, hmac_key=None,
     if not isinstance(payload, dict) or not isinstance(payload.get("proxies"), dict):
         return out
     proxies = payload["proxies"]
-    watched = []
+    explicit = []
     for node_name in explicit_nodes or []:
         checked = safe_name(node_name)
         if checked is None:
             invalid += 1
-        elif checked not in watched:
-            watched.append(checked)
+        elif checked not in explicit:
+            explicit.append(checked)
+    group_watched = []
     for name in group_names:
         entry = proxies.get(name)
         if not isinstance(entry, dict):
@@ -396,12 +414,19 @@ def parse_proxies_summary(payload, group_names, hmac_key=None,
         rec["members"] = names
         out["groups"].append(rec)
         for candidate in names + ([now] if now else []):
-            if candidate not in watched:
-                watched.append(candidate)
-    watched.sort()
-    if len(watched) > OBS_CAP:
+            if candidate not in group_watched:
+                group_watched.append(candidate)
+    # Review R2: caller-demanded nodes are PROTECTED first -- an explicit
+    # --node must never be sorted out of existence by group expansion.
+    # The remaining OBS_CAP slots go to the lexically-first group-derived
+    # names, so truncation always eats the group tail, never a demand.
+    protected = sorted(explicit)
+    group_only = sorted(set(group_watched) - set(protected))
+    room = max(OBS_CAP - len(protected), 0)
+    if len(group_only) > room:
         out["truncated"] = True
-        watched = watched[:OBS_CAP]
+        group_only = group_only[:room]
+    watched = sorted(protected + group_only)
     out["watched"] = watched
     for name in watched:
         entry = proxies.get(name)
@@ -671,7 +696,8 @@ def ensure_out_dir(path, chmod_fn=os.chmod):
 
 
 def load_or_create_hmac_key(out_dir, open_fn=os.open, fstat_fn=os.fstat,
-                            read_fn=os.read):
+                            read_fn=os.read, fsync_fn=os.fsync,
+                            fsync_dir_fn=_fsync_dir):
     """Random 256-bit key for test-id HMACs, created once per evidence dir.
 
     The file is 0600, regular, never a symlink (O_NOFOLLOW + fstat), and a
@@ -679,12 +705,22 @@ def load_or_create_hmac_key(out_dir, open_fn=os.open, fstat_fn=os.fstat,
     BEFORE collection, per the reviewed design. Creation uses
     O_CREAT|O_EXCL so a lost race never truncates or overwrites another
     writer's key -- EEXIST falls back to re-reading through this same safe
-    loader. Key bytes never appear in any record or output -- they only
-    feed hmac.new().
+    loader. NO KEY IS RETURNED UNTIL DURABILITY IS PROVEN (review R4, the
+    same laundering hole #46 closed for the reader key): every load path --
+    first create AND every later reuse -- fsyncs the key file itself and
+    fsyncs the containing directory before handing bytes back. A key whose
+    write or fsync failed is therefore never silently trusted by the next
+    process: that process re-proves durability and refuses while the
+    storage fault persists, so "test_id stable across restarts" cannot be
+    bypassed by a failed first init. Key bytes never appear in any record
+    or output -- they only feed hmac.new().
     """
     path = os.path.join(out_dir, KEY_FILENAME)
     try:
-        fd = open_fn(path, os.O_RDONLY | _O_BINARY | getattr(os, "O_NOFOLLOW", 0))
+        # O_RDWR (not O_RDONLY): the durability fsync below must be a
+        # provable write-path sync on every platform (Windows _commit
+        # rejects read-only handles).
+        fd = open_fn(path, os.O_RDWR | _O_BINARY | getattr(os, "O_NOFOLLOW", 0))
     except FileNotFoundError:
         fd = None
     except OSError as exc:
@@ -714,10 +750,17 @@ def load_or_create_hmac_key(out_dir, open_fn=os.open, fstat_fn=os.fstat,
                 chunks.append(part)
                 got += len(part)
             blob = b"".join(chunks)
+            if len(blob) != HMAC_KEY_BYTES:
+                raise ConfigurationError("diag key file corrupt: %s" % path)
+            try:
+                fsync_fn(fd)      # R4: contents durably on disk, or no return
+            except OSError as exc:
+                raise ConfigurationError(
+                    "cannot prove durability of diag key file %s (%s)"
+                    % (path, type(exc).__name__)) from None
         finally:
             os.close(fd)
-        if len(blob) != HMAC_KEY_BYTES:
-            raise ConfigurationError("diag key file corrupt: %s" % path)
+        fsync_dir_fn(out_dir)     # R4: the directory ENTRY is durable too
         return blob
     try:
         fd = open_fn(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY
@@ -725,7 +768,9 @@ def load_or_create_hmac_key(out_dir, open_fn=os.open, fstat_fn=os.fstat,
     except FileExistsError:
         # lost race: read theirs, same injection surface
         return load_or_create_hmac_key(out_dir, open_fn=open_fn,
-                                       fstat_fn=fstat_fn, read_fn=read_fn)
+                                       fstat_fn=fstat_fn, read_fn=read_fn,
+                                       fsync_fn=fsync_fn,
+                                       fsync_dir_fn=fsync_dir_fn)
     except OSError as exc:
         raise ConfigurationError(
             "cannot create diag key file %s (%s)" % (path, type(exc).__name__)) from None
@@ -740,16 +785,18 @@ def load_or_create_hmac_key(out_dir, open_fn=os.open, fstat_fn=os.fstat,
                 raise ConfigurationError(
                     "cannot enforce 0600 on diag key file (%s)"
                     % type(exc).__name__) from None
-        os.fsync(fd)
+        fsync_fn(fd)
         fd_owned = False
         os.close(fd)
     except OSError as exc:
+        # the (possibly partial) file stays on disk; no key is returned and
+        # every later load must re-prove durability before trusting it (R4)
         raise ConfigurationError(
             "cannot write diag key file %s (%s)" % (path, type(exc).__name__)) from None
     finally:
         if fd_owned:
             os.close(fd)
-    _fsync_dir(out_dir)
+    fsync_dir_fn(out_dir)
     return key
 
 
@@ -845,7 +892,7 @@ class DiagWriter:
         self.fsync_dir_fn = _fsync_dir
         self.clock_fn = time.time
         self.listdir_fn = os.listdir
-        self.stat_fn = os.stat
+        self.lstat_fn = os.lstat
         self.remove_fn = os.remove
         self.ftruncate_fn = os.ftruncate
         self.lseek_fn = os.lseek
@@ -982,7 +1029,14 @@ class DiagWriter:
         the same pass (overflow indexes and over-budget tails drop oldest
         first). The current diag.jsonl is never touched here -- it is under
         size-cap rotation control. Returns the number of files removed.
-        All OS surfaces are injectable for deterministic tests.
+        Retention is only provable over VERIFIABLE metadata (review R1): a
+        FileNotFoundError mid-scan is the one tolerated race; any other
+        stat/getsize error raises StorageError instead of silently dropping
+        that file from the age/count/budget accounting. Chain members are
+        checked with a NON-FOLLOWING lstat and must be regular files --
+        symlink or special-file members fail closed, they are never walked
+        through or ignored. All OS surfaces are injectable for
+        deterministic tests.
         """
         if now is None:
             now = self.clock_fn()
@@ -1002,15 +1056,24 @@ class DiagWriter:
                 continue
             path = os.path.join(self.out_dir, name)
             try:
-                st = self.stat_fn(path)
-            except OSError:
+                st = self.lstat_fn(path)
+            except FileNotFoundError:
                 continue          # vanished mid-scan: nothing left to prune
+            except OSError as exc:
+                raise StorageError("cannot verify evidence file metadata (%s)"
+                                   % type(exc).__name__) from None
+            if not stat_module.S_ISREG(st.st_mode):
+                raise StorageError(
+                    "evidence chain member is not a regular file")
             rotated.append((st.st_mtime, int(suffix), path, st.st_size))
             total += st.st_size
         try:
             total += self.getsize_fn(self.path)
-        except OSError:
+        except FileNotFoundError:
             pass                  # current file absent: nothing to budget
+        except OSError as exc:
+            raise StorageError("cannot size current evidence file (%s)"
+                               % type(exc).__name__) from None
         rotated.sort()            # oldest mtime first, index as tie-break
         budget_bytes = TOTAL_MB_BUDGET * 1024 * 1024
         removed = 0

@@ -18,7 +18,10 @@
 # residuals add: torn-tail TRUNCATION + 7-day age retention + 32 MiB budget
 # prune with category-only stderr (B4), repeatable --node with a byte-exact
 # non-normalizing display identity and per-test-url 8-entry history tails
-# (B5).
+# (B5). Review round-3 residuals add: fail-closed retention metadata --
+# ENOENT-only tolerance plus non-following regular-file chain checks (R1),
+# explicit-node protection ahead of the 64-node cap (R2), strict-UTF-8 name
+# validation (R3) and durability re-proof on EVERY HMAC-key load (R4).
 #
 # Deterministic on git-bash AND Linux: OS-divergent code paths are exercised
 # through explicit platform flags and injectable attributes, so the
@@ -37,7 +40,7 @@ PASS=0
 FAIL=0
 # The gate at the bottom of this file fails unless exactly this many
 # assertions ran AND passed, so unreachable sections can never fake success.
-EXPECTED_PASS=392
+EXPECTED_PASS=422
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
@@ -234,10 +237,33 @@ if grep -qF 'writer.prune()' "$DIAG" && grep -qF 'removed = writer.prune()' "$DI
 else
     fail "prune() is not wired into both the cycle and prune-now"
 fi
-if sed -n '/def safe_name/,/^def /p' "$DIAG" | grep -q '\.strip('; then
+if sed -n '/def safe_name/,/^def as_strict_bool/p' "$DIAG" | grep -q '\.strip('; then
     fail "safe_name normalizes names (must stay an exact display identity)"
 else
     pass "safe_name body carries no strip/normalization surface"
+fi
+if sed -n '/def safe_name/,/^def as_strict_bool/p' "$DIAG" | grep -qF '"replace"'; then
+    fail "safe_name measures names with lossy replace-mode encoding (R3 regression)"
+else
+    pass "safe_name encodes STRICT UTF-8 only (R3: no lone-surrogate laundering)"
+fi
+if sed -n '/def prune/,/^def encode_record/p' "$DIAG" | grep -qF 'lstat_fn' \
+   && sed -n '/def prune/,/^def encode_record/p' "$DIAG" | grep -qF 'FileNotFoundError' \
+   && sed -n '/def prune/,/^def encode_record/p' "$DIAG" | grep -qF 'S_ISREG'; then
+    pass "prune retention is fail-closed: non-following lstat + regular-file gate, ENOENT-only tolerance (R1)"
+else
+    fail "prune can still fail open on unverifiable retention metadata"
+fi
+if sed -n '/def load_or_create_hmac_key/,/^def _try_lock/p' "$DIAG" | grep -qF 'cannot prove durability' \
+   && sed -n '/def load_or_create_hmac_key/,/^def _try_lock/p' "$DIAG" | grep -qF 'fsync_dir_fn(out_dir)'; then
+    pass "key loader re-proves file AND dir durability on EVERY load path before returning (R4)"
+else
+    fail "key loader can still launder an unproven key across restarts"
+fi
+if grep -qF 'room = max(OBS_CAP - len(protected), 0)' "$DIAG"; then
+    pass "explicit nodes are protected before group expansion fills OBS_CAP (R2)"
+else
+    fail "explicit nodes can still be sorted out of the observed set"
 fi
 if grep -qF 'EXIT_CONFIG = 2' "$DIAG" && grep -qF 'EXIT_API = 3' "$DIAG" \
    && grep -qF 'EXIT_STORAGE = 4' "$DIAG" && grep -qF 'EXIT_BOTH = 5' "$DIAG"; then
@@ -476,7 +502,9 @@ print(json.dumps({
     "long": diag.safe_name("x" * 130),
     "edge128": diag.safe_name("y" * 128),
     "cjk": diag.safe_name("节点选择"),
-    "cjk_bytes": diag.safe_name("节" * 43)}))
+    "cjk_bytes": diag.safe_name("节" * 43),
+    "surrogate": diag.safe_name("\ud800"),
+    "surrogate_mid": diag.safe_name("ok\udfffname")}))
 ')"
 assert_eq "$(field "$out" 'obj["nonstr"]')" "None" "non-string name dropped upstream"
 assert_eq "$(field "$out" 'obj["none"]')" "None" "None name dropped"
@@ -489,6 +517,21 @@ assert_eq "$(field "$out" 'obj["long"]')" "None" "over-128-byte name refused, ne
 assert_eq "$(field "$out" 'obj["edge128"]')" "$(printf 'y%.0s' {1..128})" "128-byte name kept at the edge"
 assert_eq "$(field "$out" 'obj["cjk"]')" "节点选择" "CJK display names pass verbatim"
 assert_eq "$(field "$out" 'obj["cjk_bytes"]')" "None" "byte bound (not char count) governs: 43 CJK chars = 129 bytes"
+assert_eq "$(field "$out" 'obj["surrogate"]')" "None" "lone surrogate is NOT valid UTF-8: strict encode refuses it (R3)"
+assert_eq "$(field "$out" 'obj["surrogate_mid"]')" "None" "a mid-string lone surrogate invalidates the whole name, never laundered by replace-mode length"
+
+out="$(mihomo_py '
+import json, diag
+sur = json.loads("{\"proxies\": {\"G\": {\"type\": \"Selector\", \"now\": "
+                 "\"\\ud800\", \"all\": [\"\\ud800\", \"good\"]}}}")
+s = diag.parse_proxies_summary(sur, ["G"], hmac_key=bytes([1]) * 32)
+print(json.dumps({"watched": s["watched"], "nodes": [n["name"] for n in s["nodes"]],
+                  "invalid": s["invalid_fields"], "broken": s["broken_groups"]}))
+')"
+assert_eq "$(field "$out" 'obj["watched"]')" "['good']" "json.loads-produced lone surrogate never enters the watched set (R3 upstream)"
+assert_eq "$(field "$out" 'obj["nodes"]')" "['good']" "a surrogate name is never persisted as a display identity"
+assert_eq "$(field "$out" 'obj["invalid"]')" "2" "surrogate now + surrogate member are each dropped AND counted"
+assert_eq "$(field "$out" 'obj["broken"]')" "['G']" "surrogate now is a present-but-unusable chain breaker"
 
 section "proxies whitelist: only design-section-4 fields survive (B1/B5)"
 out="$(mihomo_py "$PY_PREAMBLE
@@ -702,6 +745,28 @@ assert_eq "$(field "$out" 'obj["pad_in_nodes"]')" "True" "a padded explicit name
 assert_eq "$(field "$out" 'obj["missing_head"]')" "['  pad  ', 'AAA-EXPLICIT']" "absent explicit nodes reported via the node_missing path"
 assert_eq "$(field "$out" 'obj["invalid"]')" "1" "an invalid explicit node is dropped AND counted, never stored raw"
 assert_eq "$(field "$out" 'obj["truncated"]')" "True" "the cap trip still flagged with explicit nodes in play"
+
+out="$(mihomo_py "$PY_PREAMBLE
+import json, diag
+payload = json.loads(load(\"e4diag-proxies-many-groups.json\"))
+s = diag.parse_proxies_summary(payload, [\"H-GROUP-%d\" % i for i in range(8)],
+                               hmac_key=$KEY,
+                               explicit_nodes=[\"zzz-explicit\"])
+names = [n[\"name\"] for n in s[\"nodes\"]]
+print(json.dumps({
+    \"watched_len\": len(s[\"watched\"]),
+    \"watched_tail\": s[\"watched\"][-1],
+    \"explicit_in_nodes\": \"zzz-explicit\" in names,
+    \"n062_kept\": \"n062\" in s[\"watched\"],
+    \"n063_dropped\": \"n063\" not in s[\"watched\"],
+    \"truncated\": s[\"truncated\"]}))
+")"
+assert_eq "$(field "$out" 'obj["watched_len"]')" "64" "protection keeps the observed set exactly at the 64-node cap"
+assert_eq "$(field "$out" 'obj["watched_tail"]')" "zzz-explicit" "R2: a LAST-lexical explicit node survives -- it can no longer be pushed over the cap by group expansion"
+assert_eq "$(field "$out" 'obj["explicit_in_nodes"]')" "True" "the demanded node gets its closed record and node_missing evidence, not eviction"
+assert_eq "$(field "$out" 'obj["n062_kept"]')" "True" "63 group slots filled from the lexically-first expansion"
+assert_eq "$(field "$out" 'obj["n063_dropped"]')" "True" "the VICTIM is the group-derived tail, never the caller demand"
+assert_eq "$(field "$out" 'obj["truncated"]')" "True" "group-node displacement stays visibly flagged"
 
 section "connections: raw-safe per-node aggregates, zero inference (B3)"
 out="$(mihomo_py "$PY_PREAMBLE
@@ -983,7 +1048,7 @@ try:
 except diag.ConfigurationError as e:
     res["key_loop"] = "symlink" if "symlink" in str(e) else "generic"
 realfile = os.path.join(base, "regfile"); open(realfile, "wb").close()
-def fd_open(*a, **k): return os.open(realfile, os.O_RDONLY)
+def fd_open(*a, **k): return os.open(realfile, os.O_RDWR)
 def fifo_fstat(fd): return types.SimpleNamespace(st_mode=stat.S_IFIFO | 0o600)
 try:
     diag.load_or_create_hmac_key(base, open_fn=fd_open, fstat_fn=fifo_fstat); res["key_fifo"] = "ACCEPTED"
@@ -1002,7 +1067,9 @@ try:
 except diag.ConfigurationError: res["key_short"] = "rejected"
 planted = bytes(range(32))
 got = diag.load_or_create_hmac_key(base, open_fn=fd_open, fstat_fn=reg_fstat,
-                                   read_fn=lambda fd, n: planted)
+                                   read_fn=lambda fd, n: planted,
+                                   fsync_fn=lambda fd: None,
+                                   fsync_dir_fn=lambda p: None)
 res["key_reload"] = got == planted and len(got) == 32
 calls = []
 class RaceExists(Exception): pass
@@ -1010,10 +1077,12 @@ def race_open(path, flags, mode=0o600, *a):
     calls.append(flags)
     if flags & getattr(os, "O_CREAT", 0x100): raise FileExistsError(17, "exists")
     if len(calls) == 1: raise FileNotFoundError(2, "gone")
-    return os.open(realfile, os.O_RDONLY)
+    return os.open(realfile, os.O_RDWR)
 def race_read(fd, n): return planted
 key2 = diag.load_or_create_hmac_key(base, open_fn=race_open, fstat_fn=reg_fstat,
-                                    read_fn=race_read)
+                                    read_fn=race_read,
+                                    fsync_fn=lambda fd: None,
+                                    fsync_dir_fn=lambda p: None)
 res["key_race"] = key2 == planted
 res["key_race_excl"] = bool(calls[1] & os.O_EXCL) if len(calls) > 1 else False
 res["race_opens"] = len(calls)
@@ -1052,6 +1121,35 @@ diag._WINDOWS = os.name == "nt"
 k1 = diag.load_or_create_hmac_key(base)
 k2 = diag.load_or_create_hmac_key(base)
 res["key_real"] = k1 == k2 and len(k1) == 32 and os.path.getsize(os.path.join(base, "diag.key")) == 32
+# -- R4: durability laundering is impossible -- no key is returned until
+#    file fsync AND containing-dir durability are proven on EVERY path
+def bad_fsync(fd): raise OSError(5, "I/O error")
+d3 = tempfile.mkdtemp()
+try:
+    diag.load_or_create_hmac_key(d3, fsync_fn=bad_fsync)
+    res["dur_create_fsync"] = "ACCEPTED"
+except diag.ConfigurationError: res["dur_create_fsync"] = "refused"
+try:
+    diag.load_or_create_hmac_key(d3, fsync_fn=bad_fsync)
+    res["dur_retry_fsync"] = "ACCEPTED"
+except diag.ConfigurationError: res["dur_retry_fsync"] = "refused"
+k3 = diag.load_or_create_hmac_key(d3)
+with open(os.path.join(d3, "diag.key"), "rb") as fh: disk3 = fh.read()
+k3b = diag.load_or_create_hmac_key(d3)
+res["dur_fsync_stable"] = (k3 == disk3 and len(k3) == 32 and k3b == k3)
+def bad_dirsync(path): raise diag.StorageError("cannot fsync evidence dir")
+d4 = tempfile.mkdtemp()
+try:
+    diag.load_or_create_hmac_key(d4, fsync_dir_fn=bad_dirsync)
+    res["dur_create_dir"] = "ACCEPTED"
+except diag.StorageError: res["dur_create_dir"] = "refused"
+try:
+    diag.load_or_create_hmac_key(d4, fsync_dir_fn=bad_dirsync)
+    res["dur_retry_dir"] = "ACCEPTED"
+except diag.StorageError: res["dur_retry_dir"] = "refused"
+k4 = diag.load_or_create_hmac_key(d4)
+with open(os.path.join(d4, "diag.key"), "rb") as fh: disk4 = fh.read()
+res["dur_dir_stable"] = (k4 == disk4 and len(k4) == 32)
 print(json.dumps(res))
 ')"
 assert_eq "$(field "$out" 'obj["sym_parent"]')" "rejected" "symlink PARENT component fails closed (traversal hole closed)"
@@ -1074,6 +1172,12 @@ assert_eq "$(field "$out" 'obj["lock_child_held"]')" "refused" "second process c
 assert_eq "$(field "$out" 'obj["lock_child_free"]')" "granted" "lock releases with the holder fd (process-lifetime semantics)"
 assert_eq "$(field "$out" 'obj["lock_file"]')" "True" "diag.lock lives inside the evidence dir"
 assert_eq "$(field "$out" 'obj["key_real"]')" "True" "real key file: exactly 32 bytes, stable across reloads, never regenerated"
+assert_eq "$(field "$out" 'obj["dur_create_fsync"]')" "refused" "R4: creation whose file fsync fails never returns a key"
+assert_eq "$(field "$out" 'obj["dur_retry_fsync"]')" "refused" "R4: the leftover key file is NOT silently trusted next time -- re-proof still fails while the fault persists"
+assert_eq "$(field "$out" 'obj["dur_fsync_stable"]')" "True" "R4: once durability works the SAME key loads and stays stable across restarts"
+assert_eq "$(field "$out" 'obj["dur_create_dir"]')" "refused" "R4: creation whose dir fsync fails raises instead of returning an unproven key"
+assert_eq "$(field "$out" 'obj["dur_retry_dir"]')" "refused" "R4: existing-key load must ALSO prove containing-directory durability before return"
+assert_eq "$(field "$out" 'obj["dur_dir_stable"]')" "True" "R4: same bytes reused (never regenerated) once the dir entry is durable"
 
 section "B4 writer: real primitives via injection, durable rotation, torn tail"
 out="$(mihomo_py '
@@ -1232,23 +1336,36 @@ assert_eq "$(field "$out" 'obj["fsync_before_rename"]')" "True" "file fsync prec
 assert_eq "$(field "$out" 'obj["main_alive"]')" "True" "fresh main file after rotation"
 assert_eq "$(field "$out" 'obj["virgin_rot"]')" "ok" "rotating a never-written chain is a no-op"
 
-section "B4 prune: 7-day age retention + chain overflow + 32 MiB budget (B4 residual)"
+section "B4 prune: 7-day age retention + chain overflow + 32 MiB budget (B4 residual) + fail-closed metadata (R1)"
 out="$(mihomo_py '
-import json, os, tempfile, types, diag
+import json, os, stat, tempfile, types, diag
 res = {}
 WEEK = diag.RETENTION_SECONDS
 NOW = 1790078400.0
-def scenario(files, entries, current=50, remove_boom=False):
-    """entries: name -> (age_seconds, size). All OS surfaces injected."""
+REG = stat.S_IFREG | 0o600
+def scenario(files, entries, current=50, remove_boom=False,
+             lstat_fail=None, modes=None, current_fail=None):
+    """entries: suffix -> (age_seconds, size). All OS surfaces injected."""
+    lstat_fail = lstat_fail or {}
+    modes = modes or {}
     d = tempfile.mkdtemp()
     w = diag.DiagWriter(d, files=files)
     w.clock_fn = lambda: NOW
     w.listdir_fn = lambda p: ["diag.jsonl." + k for k in entries] + \
         ["diag.jsonl", "diag.key", "diag.lock"]
-    w.stat_fn = lambda p: types.SimpleNamespace(
-        st_mtime=NOW - entries[os.path.basename(p)[len("diag.jsonl."):]][0],
-        st_size=entries[os.path.basename(p)[len("diag.jsonl."):]][1])
-    w.getsize_fn = lambda p: current
+    def fake_lstat(path):
+        key = os.path.basename(path)[len("diag.jsonl."):]
+        if key in lstat_fail:
+            raise lstat_fail[key]
+        return types.SimpleNamespace(
+            st_mtime=NOW - entries[key][0], st_size=entries[key][1],
+            st_mode=modes.get(key, REG))
+    w.lstat_fn = fake_lstat
+    def fake_getsize(path):
+        if current_fail is not None:
+            raise current_fail
+        return current
+    w.getsize_fn = fake_getsize
     gone = []
     def fake_remove(path):
         if remove_boom:
@@ -1256,21 +1373,21 @@ def scenario(files, entries, current=50, remove_boom=False):
         gone.append(os.path.basename(path))
     w.remove_fn = fake_remove
     removed = w.prune()
-    return gone, removed
+    return gone, removed, d
 # (a) age only: .2 is 8 days old, .1 fresh -> exactly the stale one drops
-gone, _ = scenario("4", {"1": (60, 100), "2": (WEEK + 3600, 100)})
+gone, _, _ = scenario("4", {"1": (60, 100), "2": (WEEK + 3600, 100)})
 res["age"] = gone == ["diag.jsonl.2"]
 # (b) oldest-first with two stale: .3 (10d) before .2 (9d), fresh .1 kept
-gone, n = scenario("4", {"1": (10, 100), "2": (9 * 86400, 100),
-                         "3": (10 * 86400, 100)})
+gone, n, _ = scenario("4", {"1": (10, 100), "2": (9 * 86400, 100),
+                            "3": (10 * 86400, 100)})
 res["order"] = (gone == ["diag.jsonl.3", "diag.jsonl.2"], n)
 # (c) THE break-flaw regression: overflow index .9 with a FRESH mtime sits
 #     behind kept .1 but must still be removed (no early break)
-gone, _ = scenario("4", {"1": (10, 10), "9": (10, 10)})
+gone, _, _ = scenario("4", {"1": (10, 10), "9": (10, 10)})
 res["overflow_behind_fresh"] = gone == ["diag.jsonl.9"]
 # (d) budget: everything fresh and in-chain, yet 40 MiB > 32 MiB cap ->
 #     oldest (.1) evicted until the total fits; .2 (10 MiB) stays
-gone, _ = scenario("4", {"1": (10, 40 * 1024 * 1024), "2": (10, 10 * 1024 * 1024)})
+gone, _, _ = scenario("4", {"1": (10, 40 * 1024 * 1024), "2": (10, 10 * 1024 * 1024)})
 res["budget"] = gone == ["diag.jsonl.1"]
 # (e) non-numeric + foreign names are never even stat-ed
 d = tempfile.mkdtemp()
@@ -1278,18 +1395,43 @@ w = diag.DiagWriter(d, files=4)
 w.clock_fn = lambda: NOW
 w.listdir_fn = lambda p: ["diag.jsonl.bak", "diag.jsonl.", "diag.jsonl.x1",
                           "diag.jsonl", "not-diag"]
-w.stat_fn = lambda p: (_ for _ in ()).throw(AssertionError("must not stat"))
+w.lstat_fn = lambda p: (_ for _ in ()).throw(AssertionError("must not stat"))
 w.getsize_fn = lambda p: 0
 res["foreign"] = w.prune()
 # (f) remove failure -> StorageError whose text carries NO path
 w.listdir_fn = lambda p: ["diag.jsonl.1"]
-w.stat_fn = lambda p: types.SimpleNamespace(st_mtime=NOW - WEEK - 1, st_size=5)
+w.lstat_fn = lambda p: types.SimpleNamespace(st_mtime=NOW - WEEK - 1,
+                                             st_size=5, st_mode=REG)
 def boom(path): raise OSError(13, "Permission denied")
 w.remove_fn = boom
 try:
     w.prune(); res["remove_fail"] = "ACCEPTED"
 except diag.StorageError as e:
     res["remove_fail"] = "rejected" if d not in str(e) else "BAD"
+# (g) R1: the ONE tolerated race is ENOENT (file vanished mid-scan)
+gone, _, _ = scenario("4", {"1": (60, 100), "2": (WEEK + 3600, 100)},
+                      lstat_fail={"1": FileNotFoundError(2, "No such file")})
+res["enoent_tolerated"] = gone == ["diag.jsonl.2"]
+# (h) R1: EACCES / EIO on chain metadata fail CLOSED (retention unprovable),
+#     current-file size faults likewise; ENOENT on the current file stays a
+#     tolerated absence
+def expect_storage(tag, **kw):
+    try:
+        scenario("4", {"1": (60, 100)}, **kw)
+        res[tag] = "ACCEPTED"
+    except diag.StorageError as e:
+        res[tag] = "rejected" if e else "BAD"
+expect_storage("eacces_stat", lstat_fail={"1": OSError(13, "Permission denied")})
+expect_storage("eio_stat", lstat_fail={"1": OSError(5, "I/O error")})
+expect_storage("size_eacces", current_fail=OSError(13, "Permission denied"))
+expect_storage("size_eio", current_fail=OSError(5, "I/O error"))
+gone, _, _ = scenario("4", {"1": (WEEK + 3600, 100)},
+                      current_fail=FileNotFoundError(2, "No such file"))
+res["size_enoent_tolerated"] = gone == ["diag.jsonl.1"]
+# (i) R1: a numeric chain member that is a symlink or non-regular file is
+#     NEVER followed and never ignored -- fail closed even while "fresh"
+expect_storage("member_symlink", modes={"1": stat.S_IFLNK | 0o777})
+expect_storage("member_fifo", modes={"1": stat.S_IFIFO | 0o600})
 print(json.dumps(res))
 ')"
 assert_eq "$(field "$out" 'obj["age"]')" "True" "rotated files past 7 days are pruned, fresh ones kept"
@@ -1299,6 +1441,14 @@ assert_eq "$(field "$out" 'obj["overflow_behind_fresh"]')" "True" "chain overflo
 assert_eq "$(field "$out" 'obj["budget"]')" "True" "over-budget evidence drops the OLDEST rotated file first"
 assert_eq "$(field "$out" 'obj["foreign"]')" "0" "only exact numeric .N chain members are ever considered"
 assert_eq "$(field "$out" 'obj["remove_fail"]')" "rejected" "prune failure raises StorageError without a local path (B4 residual stderr)"
+assert_eq "$(field "$out" 'obj["enoent_tolerated"]')" "True" "R1: ONLY the FileNotFoundError race is tolerated; pruning continues"
+assert_eq "$(field "$out" 'obj["eacces_stat"]')" "rejected" "R1: EACCES on chain metadata fails CLOSED as StorageError, never skipped"
+assert_eq "$(field "$out" 'obj["eio_stat"]')" "rejected" "R1: EIO on chain metadata fails CLOSED (retention must stay provable)"
+assert_eq "$(field "$out" 'obj["size_eacces"]')" "rejected" "R1: EACCES sizing current diag.jsonl fails CLOSED, not budget-blind"
+assert_eq "$(field "$out" 'obj["size_eio"]')" "rejected" "R1: EIO sizing current file fails CLOSED"
+assert_eq "$(field "$out" 'obj["size_enoent_tolerated"]')" "True" "R1: absent current file is a tolerated empty budget"
+assert_eq "$(field "$out" 'obj["member_symlink"]')" "rejected" "R1: numeric chain member that is a symlink fails closed (non-following lstat)"
+assert_eq "$(field "$out" 'obj["member_fifo"]')" "rejected" "R1: non-regular chain member fails closed, never counted or followed"
 
 section "B5 record ceiling: final encoded bytes incl. newline, structural trim only"
 out="$(mihomo_py '
