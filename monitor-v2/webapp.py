@@ -39,6 +39,7 @@ from web.broker import SnapshotBroker  # noqa: E402
 from web.e3_broker import E3Broker  # noqa: E402
 from web.e3rpc import E3RpcClient  # noqa: E402
 from web.incident_history import IncidentHistory  # noqa: E402
+from web.journal_ingest import JournalIngestWorker  # noqa: E402
 from web.recovery import generate_key  # noqa: E402
 from web.server import (MONITOR_WEB_VERSION, MonitorWebApp,  # noqa: E402
                         build_server)
@@ -266,6 +267,8 @@ def cmd_serve(args):
                               uuid.uuid4().hex,
                               monitor_version=MONITOR_WEB_VERSION)
     history.open()
+    journal_ingest = JournalIngestWorker(history)
+    journal_ingest.start()
     broker = SnapshotBroker(collector, poll_seconds=args.poll,
                             health_file=args.health_file,
                             incident_history=history)
@@ -291,6 +294,7 @@ def cmd_serve(args):
         pass
     finally:
         broker.stop()
+        journal_ingest.stop()
         server.server_close()
         history.close()
     return 0
