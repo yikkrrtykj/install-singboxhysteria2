@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # sbox-journal-reader -- runtime entrypoint of singbox-journal-reader.service.
 #
-# PR-2A STATUS: DARK. This wrapper is installed and bash -n'd by CI but is
-# referenced by NO production activation path: the unit template is only
-# rendered/installed by the explicitly-named sbmon_sboxjr_* helpers, which
-# install-monitor.sh never calls (statically asserted).
+# PR-2B STATUS: ACTIVATED, but ONLY through the reviewed installer
+# transaction (install-monitor.sh -> sbmon_sboxjr_converge). This wrapper is
+# bundled inside each immutable release tree
+# (<release>/libexec/sbox-journal-reader/) and reaches production exclusively
+# via the explicit 12+1+1 staging manifest + the atomic $SBOXJR_LIB_DIR
+# symlink flip; tests/test-monitor-v2-jr.sh statically confines every
+# activation verb to that path (health/status/web-setup must never start it).
 #
 # Contract (review #46 B7):
 #   * the ONLY runtime configuration surface is the unit's own

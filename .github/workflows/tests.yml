@@ -71,6 +71,7 @@ jobs:
           bash -n tests/test-monitor-v2-m2.sh
           bash -n tests/test-monitor-v2-hist.sh
           bash -n tests/test-monitor-v2-jr.sh
+          bash -n tests/test-monitor-v2-jr-deploy.sh
           bash -n tests/journal-reader/test-jr-live.sh
           bash -n tests/e3/test-m3-deploy.sh
           bash -n tests/e3/test-m3c-phase1.sh
@@ -193,8 +194,11 @@ jobs:
       - name: "0.2.0 incident history suite (storage / privacy / cadence / retention / failure / read endpoint, issue #33 P1)"
         run: bash tests/test-monitor-v2-hist.sh
 
-      - name: "sbox-journal-reader suite (cursor / classifier / eligibility / recovery / crash matrix / ingest contract / DARK gates, issue #33 P2 PR-2A)"
+      - name: "sbox-journal-reader suite (cursor / classifier / eligibility / recovery / crash matrix / ingest contract / wiring confinement, issue #33 P2 PR-2A)"
         run: bash tests/test-monitor-v2-jr.sh
+
+      - name: "sbox-journal-reader PR-2B deploy/activation suite (identity / directories / verify-before-install / enable-start / rollback matrix / uninstall / sing-box invariants, issue #33 P2 PR-2B)"
+        run: bash tests/test-monitor-v2-jr-deploy.sh
 
   # ---------------------------------------------------------------------
   # Lane D -- compatibility matrix. Runs on the three supported Ubuntu LTS

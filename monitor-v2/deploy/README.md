@@ -583,3 +583,41 @@ integration（modify_singbox/process_doko 等的 config.lock 问题）。
   同一函数）；非法值在 `exec` 前 fail-closed；缺省=1；健康新鲜度 `ceil(5*poll+15)`。
 - **E web-setup 干净环境**：`env -i` + 仅 HOME/PATH/SSH_CONNECTION；root 先 `command -v` 解析
   python 绝对路径；不继承调用者环境；口令/恢复键不进 argv/env/journal；stdin/stdout/stderr/TTY 保留。
+
+## 15. Integration Round PR-2B — sbox-journal-reader 激活事务（issue #33 P2）
+
+PR-2A 的 reader 资产（`journal_reader/`、wrapper、unit 模板）当时是 DARK（零生产接线）。
+PR-2B 将其接入 installer，且完全服从既有事务语义（deploy lock / 不可变 release / 原子
+链接 / 预状态捕获 → apply → 回滚 / history 只在门通过后写入）：
+
+- **激活序列（唯一路径）**：`sbmon_sboxjr_activation_preflight` →（installer 常规步骤）→
+  `sbmon_sboxjr_capture_prestate` → `sbmon_sboxjr_converge`：
+  exact identity → 数据目录 → release 内运行时链接 → unit render →
+  `systemd-analyze verify`（临时 `.jr-verify.$$.service`，dot 前缀不进 unit 加载器）→
+  unit 原子安装 + daemon-reload → enable/start → health proof。每一步只 RETURN 非零
+  （R3-7），失败即由 `_cmd_install_locked` 走 `sbmon_sboxjr_restore_prestate` + 既有
+  monitor 事务回滚；首次部署失败走 fresh cleanup。
+- **身份（§3 / R7）**：`sbox-jr` 只在完全不存在时创建（groupadd→useradd→usermod，
+  nologin + /nonexistent + 组集恰为 {sbox-jr, systemd-journal}）；既有异形身份 =
+  preflight 停机、零变更、绝不"顺手修"；无 root/sboxweb fallback。
+- **目录（§4）**：`/var/lib/sbox-journal` root:sbox-jr 0750；`state` 0700 sbox-jr；
+  `out` 2750 sbox-jr:sboxweb（交换组恰为 Monitor 读侧）；symlink/非目录 fail-closed。
+- **运行时版本共位（§8）**：reader 代码按 12+1+1 显式 manifest 打进每个不可变 release 的
+  `libexec/sbox-journal-reader/`；`/usr/local/lib/singbox-journal-reader` 只是原子翻转的
+  symlink。因此 Monitor rollback 必然带回版本一致的 reader 代码与 unit 模板；reader 已激活
+  而回滚目标缺 libexec → 直接拒绝回滚（绝不出现 Monitor 旧、reader 新）。retention 剪枝
+  保护链接所指 release。
+- **pre-state 矩阵**：install/upgrade 终态 = enabled+active；rollback 用 keep-prestate
+  语义精确保持事务前 active/enabled/unit/link 事实（enabled+inactive 不被"顺手拉起"）；
+  `--no-start` 只落文件。
+- **uninstall（§13）**：reader 先于 Monitor 拆（checked-first strict stop/disable，失败在
+  任何删除前中止）；unit 删除 + daemon-reload + 仅删 symlink（真实目录拒绝）；默认保留
+  身份与诊断数据，`--purge-state` 才清数据根；幂等。
+- **INERT 规则**：源树完全不含 `journal_reader/`（PR-2A 前基线 / packaging fixture）→
+  reader 侧零动作并显式记日志；部分缺失 = manifest fail-closed。
+- **边界不变（§9/§10/§18）**：全程零 sing-box 操作、零 sbox-cm/management.active 引用、
+  零新增 env/secret 通道（unit 唯一 Environment=SBOX_JR_UNIT）。
+- **测试**：`tests/test-monitor-v2-jr-deploy.sh`（fail-closed/回滚矩阵/invariant 扫描；
+  非符号链接平台诚实 SKIP，Linux 门零 SKIP）+ `tests/test-monitor-v2-jr.sh`（PR-2A 资产
+  契约 + 接线 confinement）。真实 systemd enable/start、PID/进程身份与 heartbeat 实机
+  证明由 `tests/journal-reader/test-jr-live.sh`（matrix lane，REQUIRE_LIVE）承担。

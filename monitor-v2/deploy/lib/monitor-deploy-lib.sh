@@ -662,24 +662,58 @@ sbmon_stage_release() { # sbmon_stage_release <version> -> prints release id on 
     cp -- "$DEPLOY_DIR/app-bin/monitor-health" "$staged/bin/monitor-health"
     cp -- "$DEPLOY_DIR/app-bin/monitor-env.sh" "$staged/lib/monitor-env.sh"
 
+    # PR-2B: the sbox-journal-reader runtime is bundled INTO the immutable
+    # release tree under the frozen explicit manifest (12 modules + entry
+    # wrapper + unit template). $SBOXJR_LIB_DIR is only ever a symlink into
+    # a release's libexec dir, so release rollback/restaging keeps the
+    # reader code, the wrapper and the unit template version-coherent.
+    # NEVER cp -R the source directory. A source tree WITHOUT
+    # journal_reader/ (pre-reader baseline) stages no libexec at all (INERT).
+    jr_staged=0
+    local jr_libexec="$staged/$SBOXJR_RELEASE_LIBEXEC_REL"
+    if sbmon_sboxjr_source_present; then
+        mkdir -p "$jr_libexec/journal_reader"
+        local jf
+        for jf in "${SBOXJR_MODULE_FILES[@]}"; do
+            [ -f "$SBMON_REPO_MONITOR_DIR/journal_reader/$jf" ] \
+                || sbmon_die "缺少 journal_reader 模块 $jf：fail-closed"
+            cp -- "$SBMON_REPO_MONITOR_DIR/journal_reader/$jf" "$jr_libexec/journal_reader/$jf"
+        done
+        [ -f "$DEPLOY_DIR/app-bin/sbox-journal-reader" ] || sbmon_die "缺少 reader 入口 wrapper：fail-closed"
+        cp -- "$DEPLOY_DIR/app-bin/sbox-journal-reader" "$jr_libexec/sbox-journal-reader"
+        [ -f "$DEPLOY_DIR/$SBOXJR_TEMPLATE_NAME" ] || sbmon_die "缺少 reader unit 模板：fail-closed"
+        cp -- "$DEPLOY_DIR/$SBOXJR_TEMPLATE_NAME" "$jr_libexec/$SBOXJR_TEMPLATE_NAME"
+        jr_staged=1
+    fi
+
     printf '%s\n' "$version" > "$staged/VERSION"
 
     # Validate BEFORE it can become live: python syntax for the WHOLE staged
     # runtime (collector, api_bridge, webapp, web/*.py) + shell syntax for
     # the shims. JS syntax is a CI/development gate -- Node.js is never a
     # production installer dependency.
+    local -a py_targets=(
+        "$staged/app/monitor-v2/collector.py"
+        "$staged/app/monitor-v2/webapp.py"
+        "$staged/app/monitor-v2/api_bridge/"*.py
+        "$staged/app/monitor-v2/web/"*.py)
+    local -a sh_targets=("$staged/bin/monitor-service" "$staged/bin/monitor-health"
+        "$staged/lib/monitor-env.sh")
+    if [ "$jr_staged" = 1 ]; then
+        py_targets+=("$jr_libexec/journal_reader/"*.py)
+        sh_targets+=("$jr_libexec/sbox-journal-reader")
+    fi
     "$SBMON_PYTHON3" -m py_compile \
-        "$staged/app/monitor-v2/collector.py" \
-        "$staged/app/monitor-v2/webapp.py" \
-        "$staged/app/monitor-v2/api_bridge/"*.py \
-        "$staged/app/monitor-v2/web/"*.py >/dev/null 2>&1 \
+        "${py_targets[@]}" >/dev/null 2>&1 \
         || { rm -rf -- "$staged"; sbmon_die "staged python 代码校验失败，放弃发布"; }
-    bash -n "$staged/bin/monitor-service" "$staged/bin/monitor-health" "$staged/lib/monitor-env.sh" \
+    bash -n "${sh_targets[@]}" \
         || { rm -rf -- "$staged"; sbmon_die "staged shell 脚本校验失败，放弃发布"; }
 
     find "$staged" -type d -exec chmod 0755 {} +
     find "$staged" -type f -exec chmod 0644 {} +
+    find "$staged" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
     chmod 0755 "$staged/bin/monitor-service" "$staged/bin/monitor-health"
+    [ "$jr_staged" = 1 ] && chmod 0755 "$jr_libexec/sbox-journal-reader"
 
     mv -- "$staged" "$SBMON_RELEASES_DIR/$id"
     printf '%s\n' "$id"
@@ -725,6 +759,12 @@ sbmon_prune_releases() {
     # records; default rollback skips history entries whose directory is gone.
     local live
     live="$(sbmon_current_release_id)"
+    # PR-2B: the release the READER runtime link points into is live too --
+    # pruning it would leave $SBOXJR_LIB_DIR dangling (the wrapper fails
+    # closed with staged_tree_missing at next start, and rollback to that
+    # release would be impossible).
+    local jr_live
+    jr_live="$(sbmon_sboxjr_runtime_linked_id)"
     local -a ordered=()
     local d
     # -type d excludes .switch-tmp (a symlink) and releases.history (a file);
@@ -740,6 +780,7 @@ sbmon_prune_releases() {
     for (( i = 0; i < total && total > keep; i++ )); do
         id="${ordered[$i]}"   # oldest -> newest
         [ "$id" = "$live" ] && continue
+        [ -n "$jr_live" ] && [ "$id" = "$jr_live" ] && continue
         sbmon_info "清理旧 release: $id"
         rm -rf -- "${SBMON_RELEASES_DIR:?}/$id"   # :? guard: never expand empty -> /
         total=$(( total - 1 ))
@@ -831,14 +872,17 @@ sbmon_wait_service_active() {
 }
 
 # ---------------------------------------------------------------------------
-# sbox-journal-reader (issue #33 P2, PR-2A) -- DARK HELPER SECTION.
+# sbox-journal-reader (issue #33 P2, PR-2A helpers / PR-2B activation) --
+# ACTIVATED HELPER SECTION.
 #
-# Every sbmon_sboxjr_* function below is EXPLICITLY NAMED and referenced by
-# ZERO call sites in install-monitor.sh (statically asserted by
-# tests/test-monitor-v2-jr.sh). PR-2A therefore creates NO production
-# identity, NO production directories, NO live unit, and enables/starts
-# NOTHING. The section exists so PR-2B activation reuses the exact,
-# already-tested code path instead of inventing one under deadline.
+# PR-2A shipped these helpers with ZERO call sites (DARK). PR-2B (Coding E,
+# deploy/activation lane) wires them into the install-monitor.sh
+# transaction: every sbmon_sboxjr_* function is still EXPLICITLY NAMED and
+# reachable only through the reviewed installer paths (install/upgrade via
+# sbmon_sboxjr_converge, rollback via the same converge in keep-prestate
+# mode, uninstall via the teardown in install-monitor.sh). tests/
+# test-monitor-v2-jr.sh statically asserts that no other surface (health /
+# status / web-setup / collector) activates the reader.
 #
 # R7 frozen identity contract: the ONLY accepted journal-read model is the
 # dedicated sbox-jr system user (nologin shell, /nonexistent home) plus OS
@@ -857,6 +901,20 @@ SBOXJR_SERVICE_NAME="${SBOXJR_SERVICE_NAME:-singbox-journal-reader}"
 SBOXJR_UNIT_FILE="${SBOXJR_UNIT_FILE:-/etc/systemd/system/$SBOXJR_SERVICE_NAME.service}"
 SBOXJR_WATCHED_UNIT="${SBOXJR_WATCHED_UNIT:-sing-box.service}"
 SBOXJR_RUNUSER="${SBOXJR_RUNUSER:-runuser}"
+SBMON_SYSTEMD_ANALYZE="${SBMON_SYSTEMD_ANALYZE:-systemd-analyze}"
+
+# Reader runtime lives INSIDE the immutable release tree
+# (<release>/libexec/sbox-journal-reader) and /usr/local/lib/... is a single
+# symlink flipped atomically -- so a Monitor release rollback can restore a
+# byte-compatible reader runtime/unit-template with it (Coding E PR-2B).
+SBOXJR_RELEASE_LIBEXEC_REL="libexec/sbox-journal-reader"
+SBOXJR_TEMPLATE_NAME="singbox-journal-reader.service.in"
+# Explicit 12+1+1 manifest (PR-2A frozen allowlist + wrapper + unit
+# template). NEVER a directory-wildcard copy: new repo files only reach
+# production by being named here AND in tests/test-monitor-v2-jr-deploy.sh.
+SBOXJR_MODULE_FILES=(__init__.py codes.py cursor.py journal_time.py
+    normalize.py classifier.py fingerprint.py eligibility.py schema.py
+    state.py reader.py ingest_contract.py)
 
 sboxjr_log() { printf '[sbjr-deploy] %s\n' "$*"; }
 sboxjr_warn() { printf '[sbjr-deploy] WARNING: %s\n' "$*" >&2; }
@@ -975,69 +1033,163 @@ sbmon_sboxjr_ensure_data_tree() {
 }
 
 # ---------------------------------------------------------------------------
-# Staging + unit (same render / atomic-install / never-auto-activate
-# discipline as the monitor unit; enable/start are DELIBERATELY ABSENT here
-# -- PR-2B's activation runbook owns them).
+# Runtime link + unit (same render / verify-before-install / atomic-switch
+# discipline as the monitor unit). PR-2B adds the activation-side helpers;
+# enable/start run ONLY inside sbmon_sboxjr_converge below, which the
+# installer transaction owns.
 # ---------------------------------------------------------------------------
-sbmon_sboxjr_stage_code() {
-    local src_mod="$DEPLOY_DIR/../journal_reader"
-    local src_bin="$DEPLOY_DIR/app-bin/sbox-journal-reader"
-    local staging="$SBOXJR_LIB_DIR.staging.$$"
-    if [ ! -d "$src_mod" ] || [ ! -f "$src_bin" ]; then
-        sboxjr_die "源码树不完整（journal_reader/ 或 app-bin 入口缺失）"
+sbmon_sboxjr_release_runtime_dir() { # <release-id> -> prints <release>/libexec/sbox-journal-reader
+    printf '%s/%s/%s\n' "$SBMON_RELEASES_DIR" "$1" "$SBOXJR_RELEASE_LIBEXEC_REL"
+}
+
+sbmon_sboxjr_runtime_linked_id() { # -> release id behind $SBOXJR_LIB_DIR, empty when absent
+    [ -L "$SBOXJR_LIB_DIR" ] || return 0
+    basename -- "$(readlink "$SBOXJR_LIB_DIR")" 2>/dev/null || true
+}
+
+# Strict allowlist audit of a staged reader runtime tree: the 12+1+1
+# manifest EXACTLY -- missing OR unexpected files/dirs fail closed. This is
+# the gate that keeps "new file in repo" out of production until the
+# manifest AND its tests are consciously updated together.
+sbmon_sboxjr_audit_runtime() { # <runtime-dir> rc only
+    local dir="$1"
+    if [ -L "$dir" ]; then
+        sboxjr_die "reader runtime 目录本身是符号链接: $dir"
         return 1
     fi
-    rm -rf -- "$staging"
-    mkdir -p -- "$staging/journal_reader" || return 1
-    # Explicit file list (never a wildcard copy of a directory that could
-    # gain __pycache__ or stray artifacts between listing and copying).
-    local f
-    for f in __init__.py codes.py cursor.py journal_time.py normalize.py \
-             classifier.py fingerprint.py eligibility.py schema.py \
-             state.py reader.py ingest_contract.py; do
-        if [ ! -f "$src_mod/$f" ]; then
-            rm -rf -- "$staging"
-            sboxjr_die "缺少模块 $f"
-            return 1
-        fi
-        install -m 0644 "$src_mod/$f" "$staging/journal_reader/$f" || {
-            rm -rf -- "$staging"
-            return 1
-        }
-    done
-    install -m 0755 "$src_bin" "$staging/sbox-journal-reader" || {
-        rm -rf -- "$staging"
+    if [ ! -d "$dir" ]; then
+        sboxjr_die "reader runtime 目录不存在: $dir"
         return 1
-    }
-    if [ -e "$SBOXJR_LIB_DIR" ]; then
-        if diff -r -- "$staging" "$SBOXJR_LIB_DIR" >/dev/null 2>&1; then
-            rm -rf -- "$staging"
-            sboxjr_log "运行时代码无变化"
-            return 0
-        fi
-        rm -rf -- "${SBOXJR_LIB_DIR:?}.old.$$"
-        mv "$SBOXJR_LIB_DIR" "${SBOXJR_LIB_DIR}.old.$$" || return 1
     fi
-    mv "$staging" "$SBOXJR_LIB_DIR" || return 1
-    rm -rf -- "${SBOXJR_LIB_DIR:?}.old.$$"
-    sboxjr_log "运行时代码已暂存: $SBOXJR_LIB_DIR"
+    local want_top got want_mod
+    want_top="$(printf '%s\n' journal_reader "$SBOXJR_TEMPLATE_NAME" sbox-journal-reader | LC_ALL=C sort)"
+    got="$(find "$dir" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null | LC_ALL=C sort)"
+    if [ "$got" != "$want_top" ]; then
+        sboxjr_die "reader runtime 顶层文件集偏离 12+1+1 manifest（多余或缺失均 fail-closed）: $dir"
+        return 1
+    fi
+    want_mod="$(printf '%s\n' "${SBOXJR_MODULE_FILES[@]}" | LC_ALL=C sort)"
+    got="$(find "$dir/journal_reader" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null | LC_ALL=C sort)"
+    if [ "$got" != "$want_mod" ]; then
+        sboxjr_die "journal_reader/ 文件集不恰为 12 模块 manifest：fail-closed: $dir"
+        return 1
+    fi
+    if [ ! -f "$dir/sbox-journal-reader" ]; then
+        sboxjr_die "reader 入口 wrapper 缺失: $dir"
+        return 1
+    fi
     return 0
 }
 
-sbmon_sboxjr_render_unit() {
+# Flip $SBOXJR_LIB_DIR (a symlink) atomically onto a release's staged
+# reader runtime. rc only -- never exits (R3-7).
+sbmon_sboxjr_link_runtime() { # <release-id>
+    local id="$1"
+    [ -n "$id" ] || { sboxjr_die "link_runtime: release id 为空"; return 1; }
+    local target_dir
+    target_dir="$(sbmon_sboxjr_release_runtime_dir "$id")"
+    sbmon_sboxjr_audit_runtime "$target_dir" || return 1
+    if [ -L "$SBOXJR_LIB_DIR" ]; then
+        if [ "$(readlink "$SBOXJR_LIB_DIR")" = "$target_dir" ]; then
+            sboxjr_log "reader 运行时代码无变化（release $id）"
+            return 0
+        fi
+    elif [ -e "$SBOXJR_LIB_DIR" ]; then
+        sboxjr_die "$SBOXJR_LIB_DIR 已存在且不是符号链接（PR-2A 直拷时代遗留？）：请人工处理后重试；fail-closed"
+        return 1
+    fi
+    local parent tmp
+    parent="$(dirname -- "$SBOXJR_LIB_DIR")"
+    mkdir -p -- "$parent" || return 1
+    tmp="$SBOXJR_LIB_DIR.switch.$$"
+    rm -f -- "$tmp" || return 1
+    ln -s -- "$target_dir" "$tmp" || { rm -f -- "$tmp"; return 1; }
+    if ! mv -T -- "$tmp" "$SBOXJR_LIB_DIR"; then
+        rm -f -- "$tmp" 2>/dev/null || true
+        sboxjr_die "reader 运行时符号链接原子切换失败"
+        return 1
+    fi
+    sboxjr_log "reader 运行时已链接到 release $id"
+    return 0
+}
+
+sbmon_sboxjr_unlink_runtime() { # remove ONLY the symlink itself; rc only
+    if [ -L "$SBOXJR_LIB_DIR" ]; then
+        rm -f -- "$SBOXJR_LIB_DIR" || return 1
+        sboxjr_log "reader 运行时链接已移除"
+    elif [ -e "$SBOXJR_LIB_DIR" ]; then
+        sboxjr_die "$SBOXJR_LIB_DIR 不是符号链接：拒绝删除真实目录（fail-closed）"
+        return 1
+    fi
+    return 0
+}
+
+sbmon_sboxjr_render_unit() { # [template-path] -> rendered unit on stdout
+    local tpl="${1:-}"
+    if [ -z "$tpl" ]; then
+        # Version coherence: render from the runtime tree that is actually
+        # linked (its bundled template), falling back to the repo template
+        # only when no runtime has been linked yet.
+        if [ -f "$SBOXJR_LIB_DIR/$SBOXJR_TEMPLATE_NAME" ]; then
+            tpl="$SBOXJR_LIB_DIR/$SBOXJR_TEMPLATE_NAME"
+        else
+            tpl="$DEPLOY_DIR/$SBOXJR_TEMPLATE_NAME"
+        fi
+    fi
+    [ -f "$tpl" ] || { sboxjr_die "reader unit 模板不存在: $tpl" >&2; return 1; }
     sed -e "s|@SBJR_USER@|$SBOXJR_USER|g" \
         -e "s|@SBJR_GROUP@|$SBOXJR_GROUP|g" \
         -e "s|@SBJR_LIBEXEC@|$SBOXJR_LIB_DIR|g" \
         -e "s|@SBJR_DATA_ROOT@|$SBOXJR_DATA_ROOT|g" \
         -e "s|@SBJR_WATCHED_UNIT@|$SBOXJR_WATCHED_UNIT|g" \
-        "$DEPLOY_DIR/singbox-journal-reader.service.in"
+        "$tpl"
+}
+
+# §7 gate: systemd-analyze verify on the RENDERED unit BEFORE it can be
+# installed. Missing verifier is fail-closed outside the fixture (there is
+# deliberately no "skip and hope" path on a production host).
+sbmon_sboxjr_verify_unit() { # <rendered-unit-file> rc only
+    local unit="$1"
+    if ! command -v "$SBMON_SYSTEMD_ANALYZE" >/dev/null 2>&1; then
+        if [ "$SBMON_FIXTURE" = "1" ]; then
+            sboxjr_log "fixture: systemd-analyze 缺席，verify 语义由 PATH 桩 + 根 Linux 门承担"
+            return 0
+        fi
+        sboxjr_die "缺少 $SBMON_SYSTEMD_ANALYZE：unit 无法验证，拒绝 install/enable/start（fail-closed）"
+        return 1
+    fi
+    if ! "$SBMON_SYSTEMD_ANALYZE" verify "$unit" >&2; then
+        sboxjr_die "systemd-analyze verify 未通过：拒绝 install/enable/start（fail-closed）"
+        return 1
+    fi
+    sboxjr_log "unit 通过 systemd-analyze verify"
+    return 0
 }
 
 SBOXJR_UNIT_CHANGED=0
 
 sbmon_sboxjr_install_unit() { # rc 0 ok / 1 failed; NEVER enables or starts
-    local rendered
+    local rendered vtmp vdir
     rendered="$(sbmon_sboxjr_render_unit)" || return 1
+    vdir="$(dirname -- "$SBOXJR_UNIT_FILE")"
+    [ -d "$vdir" ] || { sboxjr_die "unit 目录不存在: $vdir"; return 1; }
+    # Leading dot keeps the transient file invisible to the unit loader;
+    # the .service suffix gives systemd-analyze verify a valid unit name.
+    vtmp="$vdir/.jr-verify.$$.service"
+    if [ -e "$vtmp" ]; then
+        sboxjr_die "verify 临时文件已存在: $vtmp"
+        return 1
+    fi
+    if ! printf '%s\n' "$rendered" > "$vtmp"; then
+        rm -f -- "$vtmp"
+        sboxjr_die "verify 临时文件写入失败"
+        return 1
+    fi
+    if ! sbmon_sboxjr_verify_unit "$vtmp"; then
+        rm -f -- "$vtmp"
+        return 1
+    fi
+    rm -f -- "$vtmp"
     if [ -e "$SBOXJR_UNIT_FILE" ]; then
         if [ "$(cat "$SBOXJR_UNIT_FILE" 2>/dev/null)" = "$rendered" ]; then
             sboxjr_log "unit 无变化"
@@ -1050,9 +1202,34 @@ sbmon_sboxjr_install_unit() { # rc 0 ok / 1 failed; NEVER enables or starts
         sboxjr_warn "unit 原子写入失败"
         return 1
     fi
-    # shellcheck disable=SC2034  # consumed by the (future PR-2B) caller
+    # shellcheck disable=SC2034  # consumed by sbmon_sboxjr_converge
     SBOXJR_UNIT_CHANGED=1
     sbmon_systemctl daemon-reload || return 1
+}
+
+# ---------------------------------------------------------------------------
+# Reader service-state helpers. Naming mirrors the monitor helpers:
+# idempotency comes from CHECKING state first, never from swallowing
+# failures (R4-2).
+# ---------------------------------------------------------------------------
+sbmon_sboxjr_service_active() {
+    sbmon_systemctl is-active --quiet "$SBOXJR_SERVICE_NAME" 2>/dev/null
+}
+sbmon_sboxjr_service_enabled() {
+    sbmon_systemctl is-enabled "$SBOXJR_SERVICE_NAME" >/dev/null 2>&1
+}
+sbmon_sboxjr_service_restart()    { sbmon_systemctl restart "$SBOXJR_SERVICE_NAME"; }
+sbmon_sboxjr_service_enable()     { sbmon_systemctl enable "$SBOXJR_SERVICE_NAME"; }
+sbmon_sboxjr_service_enable_now() { sbmon_systemctl enable --now "$SBOXJR_SERVICE_NAME"; }
+sbmon_sboxjr_service_stop()       { sbmon_systemctl stop "$SBOXJR_SERVICE_NAME"; }
+sbmon_sboxjr_service_disable()    { sbmon_systemctl disable "$SBOXJR_SERVICE_NAME"; }
+sbmon_wait_sboxjr_active() {
+    local deadline=$(( SECONDS + SBMON_HEALTH_TIMEOUT ))
+    while (( SECONDS < deadline )); do
+        if sbmon_sboxjr_service_active; then return 0; fi
+        sleep 1
+    done
+    return 1
 }
 
 # Non-mutating postcondition probe: the reader identity's EFFECTIVE groups
@@ -1073,4 +1250,282 @@ sbmon_sboxjr_readability_probe() {
         return 1
     fi
     return 0
+}
+
+# ---------------------------------------------------------------------------
+# PR-2B ACTIVATION TRANSACTION -- reader activation is installer-owned.
+#
+# Contract (Coding E, issue #33 P2 PR-2B):
+#   preflight -> exact identity -> directories -> runtime link (release
+#   libexec) -> unit render -> systemd verify -> unit install ->
+#   enable/start -> health proof
+# Every step RETURNS nonzero on failure (never exits, R3-7); the caller in
+# install-monitor.sh owns rollback. sbmon_sboxjr_restore_prestate is the
+# single inverse: it re-establishes the captured active/enabled/unit/
+# runtime-link/identity-created facts.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Reader transaction inert rule (PR-2B): a release source tree that does NOT
+# ship journal_reader/ at all (the pre-reader baseline, and the packaging
+# fixtures that model it) activates NOTHING reader-side -- no identity, no
+# directories, no runtime, no unit. A tree that ships journal_reader/
+# PARTIALLY is the opposite case: the manifest check is fail-closed. The
+# production repo always ships the full directory, so a real install always
+# activates; INERT is loudly logged whenever it applies.
+# ---------------------------------------------------------------------------
+sbmon_sboxjr_source_present() { # rc 0 = source tree ships journal_reader/
+    [ -d "$SBMON_REPO_MONITOR_DIR/journal_reader" ]
+}
+
+sbmon_sboxjr_deployed() { # rc 0 = this host has (or had) an activated reader
+    [ -e "$SBOXJR_UNIT_FILE" ] || [ -L "$SBOXJR_LIB_DIR" ] \
+        || sbmon_sboxjr_service_active || sbmon_sboxjr_service_enabled
+}
+
+# Non-mutating precondition gate (fresh install / upgrade). A wrong-shaped
+# PRE-EXISTING identity stops the whole command here, before ANY staging or
+# mutation, with zero side effects (§3: never "quietly fix" an alien sbox-jr).
+sbmon_sboxjr_activation_preflight() {
+    sbmon_sboxjr_source_present || return 0   # inert baseline: nothing to gate
+    [ -f "$DEPLOY_DIR/$SBOXJR_TEMPLATE_NAME" ] || sbmon_die "缺少 reader unit 模板: $DEPLOY_DIR/$SBOXJR_TEMPLATE_NAME"
+    [ -f "$DEPLOY_DIR/app-bin/sbox-journal-reader" ] || sbmon_die "缺少 reader 入口 wrapper"
+    local jf
+    for jf in "${SBOXJR_MODULE_FILES[@]}"; do
+        [ -f "$SBMON_REPO_MONITOR_DIR/journal_reader/$jf" ] \
+            || sbmon_die "缺少 journal_reader 模块源文件: $jf（manifest 与源树不一致，fail-closed）"
+    done
+    if [ "$SBMON_FIXTURE" != "1" ]; then
+        command -v getent >/dev/null 2>&1 \
+            || sbmon_die "缺少 getent：sbox-jr 身份无法精确校验（fail-closed，未做任何变更）"
+        command -v "$SBMON_SYSTEMD_ANALYZE" >/dev/null 2>&1 \
+            || sbmon_die "缺少 $SBMON_SYSTEMD_ANALYZE：reader unit 无法验证（fail-closed，未做任何变更）"
+        command -v "$SBOXJR_RUNUSER" >/dev/null 2>&1 \
+            || sbmon_die "缺少 $SBOXJR_RUNUSER：journal 可读性无法证明（fail-closed，未做任何变更）"
+        if getent passwd "$SBOXJR_USER" >/dev/null 2>&1; then
+            sbmon_sboxjr_validate_identity \
+                || sbmon_die "既有 $SBOXJR_USER 身份形状不符（见上）：fail-closed，未做任何变更"
+        fi
+    fi
+}
+
+# Transaction pre-state facts (call under the deploy lock, BEFORE any
+# mutation of this transaction).
+SBOXJR_PRE_ACTIVE=0
+SBOXJR_PRE_ENABLED=0
+SBOXJR_PRE_UNIT_EXISTED=0
+SBOXJR_PRE_UNIT_BACKUP=""
+SBOXJR_PRE_LINK_ID=""
+SBOXJR_PRE_USER_EXISTED=1
+SBOXJR_PRE_GROUP_EXISTED=1
+
+sbmon_sboxjr_capture_prestate() {
+    SBOXJR_PRE_ACTIVE=0
+    SBOXJR_PRE_ENABLED=0
+    SBOXJR_PRE_UNIT_EXISTED=0
+    SBOXJR_PRE_UNIT_BACKUP=""
+    SBOXJR_PRE_LINK_ID="$(sbmon_sboxjr_runtime_linked_id)"
+    if sbmon_sboxjr_service_active; then SBOXJR_PRE_ACTIVE=1; fi
+    if sbmon_sboxjr_service_enabled; then SBOXJR_PRE_ENABLED=1; fi
+    if [ -e "$SBOXJR_UNIT_FILE" ]; then
+        SBOXJR_PRE_UNIT_EXISTED=1
+        SBOXJR_PRE_UNIT_BACKUP="$(mktemp "$(dirname -- "$SBOXJR_UNIT_FILE")/.jr-pretxn.XXXXXX")" \
+            || sbmon_die "reader unit 预状态备份创建失败"
+        cp -a -- "$SBOXJR_UNIT_FILE" "$SBOXJR_PRE_UNIT_BACKUP" \
+            || sbmon_die "reader unit 预状态备份失败"
+    fi
+    if [ "$SBMON_FIXTURE" = "1" ]; then
+        return 0
+    fi
+    SBOXJR_PRE_USER_EXISTED=0
+    SBOXJR_PRE_GROUP_EXISTED=0
+    if getent passwd "$SBOXJR_USER" >/dev/null 2>&1; then SBOXJR_PRE_USER_EXISTED=1; fi
+    if getent group "$SBOXJR_GROUP" >/dev/null 2>&1; then SBOXJR_PRE_GROUP_EXISTED=1; fi
+}
+
+# Post-activation health proof (§17). Mockable facts (systemd state via the
+# configured systemctl wrapper, identity via getent/id, journal-group via
+# the runuser probe) are HARD here. Process-level PID/proc identity and the
+# heartbeat cycle are proven on the real machine by
+# tests/journal-reader/test-jr-live.sh; this gate degrades them to
+# presence-consistency checks only (never a silent pass of the whole proof).
+sbmon_sboxjr_health_proof() {
+    sbmon_sboxjr_service_active || { sboxjr_warn "健康证明：reader 服务非 active"; return 1; }
+    if ! sbmon_sboxjr_service_enabled; then
+        sboxjr_warn "健康证明：reader 服务未 enabled（重启后不会自起）"
+        return 1
+    fi
+    sbmon_sboxjr_readability_probe || return 1
+    if [ "$SBMON_FIXTURE" = "1" ]; then
+        return 0
+    fi
+    sbmon_sboxjr_validate_identity || { sboxjr_warn "健康证明：身份在激活后发生漂移"; return 1; }
+    local hb="$SBOXJR_OUT_DIR/hb"
+    if [ -L "$hb" ]; then
+        sboxjr_warn "健康证明：heartbeat 路径是符号链接（契约违规）"
+        return 1
+    fi
+    if [ -e "$hb" ] && [ ! -f "$hb" ]; then
+        sboxjr_warn "健康证明：heartbeat 不是普通文件"
+        return 1
+    fi
+    # An absent hb only means the first poll cycle has not completed yet;
+    # heartbeat CONTENT/age is the Monitor-derived staleness contract and is
+    # proven live, not here.
+    return 0
+}
+
+# Forward convergence. <new-release-id> may be empty (noop/repair without
+# relink is then a state RE-PROOF, not a restart). <no_start>=1 deploys
+# files/unit only. <keep_prestate>=1 (rollback path) preserves the reader's
+# captured active/enabled facts instead of forcing running+enabled; with
+# keep=0 the terminal contract is enabled AND active.
+sbmon_sboxjr_converge() { # <new_id|''> <no_start 0|1> <keep_prestate 0|1>
+    local new_id="$1" no_start="$2" keep="$3"
+    if ! sbmon_sboxjr_source_present && ! sbmon_sboxjr_deployed; then
+        sboxjr_log "reader INERT：源树无 journal_reader/ 且从未激活（零变更、零启动）"
+        return 0
+    fi
+    local runtime_changed=0
+    sbmon_sboxjr_ensure_identity || { sboxjr_warn "reader 身份收敛失败"; return 1; }
+    sbmon_sboxjr_ensure_data_tree || { sboxjr_warn "reader 数据目录收敛失败"; return 1; }
+    if [ -n "$new_id" ]; then
+        sbmon_sboxjr_link_runtime "$new_id" || { sboxjr_warn "reader 运行时链接切换失败"; return 1; }
+        runtime_changed=1
+    fi
+    SBOXJR_UNIT_CHANGED=0
+    sbmon_sboxjr_install_unit || { sboxjr_warn "reader unit 验证/安装失败（未 enable/未 start）"; return 1; }
+    if [ "$no_start" = "1" ]; then
+        sboxjr_log "--no-start：跳过 reader 服务启动（仅部署文件）"
+        return 0
+    fi
+    local want_active="$SBOXJR_PRE_ACTIVE" want_enabled="$SBOXJR_PRE_ENABLED"
+    if [ "$keep" != "1" ]; then
+        want_active=1
+        want_enabled=1
+    fi
+    if sbmon_sboxjr_service_active; then
+        if [ "$runtime_changed" = "1" ] || [ "$SBOXJR_UNIT_CHANGED" = "1" ]; then
+            sbmon_info "重启 singbox-journal-reader（仅 reader；不触碰 sing-box / Monitor 之外服务）"
+            sbmon_sboxjr_service_restart || { sboxjr_warn "reader 重启失败"; return 1; }
+        fi
+    elif [ "$want_active" = "1" ]; then
+        sbmon_info "启用并启动 singbox-journal-reader"
+        sbmon_sboxjr_service_enable_now || { sboxjr_warn "reader enable/start 失败"; return 1; }
+    fi
+    if [ "$want_active" = "1" ]; then
+        sbmon_wait_sboxjr_active || { sboxjr_warn "reader 未在 ${SBMON_HEALTH_TIMEOUT}s 内 active"; return 1; }
+    elif sbmon_sboxjr_service_active; then
+        sboxjr_warn "reader 保持策略要求 inactive，但服务仍在运行"; return 1
+    fi
+    local now_enabled=0
+    if sbmon_sboxjr_service_enabled; then now_enabled=1; fi
+    if [ "$now_enabled" != "$want_enabled" ]; then
+        if [ "$want_enabled" = "1" ]; then
+            sbmon_sboxjr_service_enable || { sboxjr_warn "reader enable 补偿失败"; return 1; }
+        else
+            sbmon_sboxjr_service_disable || { sboxjr_warn "reader disable 补偿失败"; return 1; }
+        fi
+        now_enabled=0
+        if sbmon_sboxjr_service_enabled; then now_enabled=1; fi
+        if [ "$now_enabled" != "$want_enabled" ]; then
+            sboxjr_warn "reader enabled 状态漂移（want=$want_enabled got=$now_enabled）"
+            return 1
+        fi
+    fi
+    if [ "$want_active" = "1" ]; then
+        sbmon_sboxjr_health_proof || return 1
+    fi
+    sboxjr_log "reader 收敛完成（active=$( [ "$want_active" = 1 ] && printf yes || printf kept-inactive) enabled=$want_enabled）"
+    return 0
+}
+
+# Single inverse of the reader transaction: restores the captured
+# active/enabled/unit/runtime/identity-created facts. Any failed restore
+# step is CRITICAL (exit 2): the caller is already inside a failure path.
+sbmon_sboxjr_restore_prestate() {
+    sbmon_warn "恢复 reader 事务前状态（服务 + unit + 运行时链接 + 本次新建身份）"
+    if [ "$SBOXJR_PRE_ACTIVE" = "1" ]; then
+        if ! sbmon_sboxjr_service_restart; then
+            sbmon_critical "reader 回滚：restart 失败（事务前 active）；需要人工处理"
+        fi
+        if ! sbmon_wait_sboxjr_active; then
+            sbmon_critical "reader 回滚：服务未恢复 active（事务前 active）；需要人工检查 journalctl -u $SBOXJR_SERVICE_NAME"
+        fi
+    else
+        if sbmon_sboxjr_service_active; then
+            if ! sbmon_sboxjr_service_stop; then
+                sbmon_critical "reader 回滚：stop 失败（事务前 inactive）；需要人工处理"
+            fi
+            if sbmon_sboxjr_service_active; then
+                sbmon_critical "reader 回滚：服务仍处于运行状态（事务前 inactive）；需要人工处理"
+            fi
+        fi
+    fi
+    if [ "$SBOXJR_PRE_ENABLED" = "1" ]; then
+        if ! sbmon_sboxjr_service_enabled; then
+            if ! sbmon_sboxjr_service_enable; then
+                sbmon_critical "reader 回滚：enable 恢复失败；需要人工处理"
+            fi
+        fi
+    else
+        if sbmon_sboxjr_service_enabled; then
+            if ! sbmon_sboxjr_service_disable; then
+                sbmon_critical "reader 回滚：disable 恢复失败（可能残留 enabled 状态）；需要人工处理"
+            fi
+        fi
+    fi
+    local unit_touched=0
+    if [ "$SBOXJR_PRE_UNIT_EXISTED" = "1" ]; then
+        if [ ! -f "$SBOXJR_PRE_UNIT_BACKUP" ] \
+           || ! sbmon_atomic_write "$SBOXJR_UNIT_FILE" 0644 < "$SBOXJR_PRE_UNIT_BACKUP"; then
+            sbmon_critical "reader 回滚：unit 恢复失败（备份缺失或写入异常）；需要人工处理"
+        fi
+        unit_touched=1
+    else
+        if [ -e "$SBOXJR_UNIT_FILE" ]; then
+            if ! rm -f -- "$SBOXJR_UNIT_FILE"; then
+                sbmon_critical "reader 回滚：候选 unit 删除失败；需要人工处理"
+            fi
+            unit_touched=1
+        fi
+    fi
+    rm -f -- "$SBOXJR_PRE_UNIT_BACKUP" 2>/dev/null || true
+    SBOXJR_PRE_UNIT_BACKUP=""
+    if [ "$unit_touched" = "1" ]; then
+        if ! sbmon_systemctl daemon-reload; then
+            sbmon_critical "reader 回滚：daemon-reload 失败；systemd 状态可能不一致，需要人工处理"
+        fi
+    fi
+    if [ -n "$SBOXJR_PRE_LINK_ID" ]; then
+        if [ "$(sbmon_sboxjr_runtime_linked_id)" != "$SBOXJR_PRE_LINK_ID" ]; then
+            if [ ! -d "$(sbmon_sboxjr_release_runtime_dir "$SBOXJR_PRE_LINK_ID")" ]; then
+                sbmon_critical "reader 回滚：事务前运行时 release（$SBOXJR_PRE_LINK_ID）目录已不存在，无法恢复链接；需要人工处理"
+            fi
+            if ! sbmon_sboxjr_link_runtime "$SBOXJR_PRE_LINK_ID"; then
+                sbmon_critical "reader 回滚：运行时链接恢复失败（$SBOXJR_PRE_LINK_ID）；需要人工处理"
+            fi
+        fi
+    else
+        if ! sbmon_sboxjr_unlink_runtime; then
+            sbmon_critical "reader 回滚：运行时链接移除失败；需要人工处理"
+        fi
+    fi
+    # Identity: only an account THIS transaction created is removed again
+    # (never delete a pre-existing user/group -- those are restore-only facts).
+    if [ "$SBMON_FIXTURE" != "1" ]; then
+        if [ "$SBOXJR_PRE_USER_EXISTED" = "0" ] && getent passwd "$SBOXJR_USER" >/dev/null 2>&1; then
+            if ! userdel -- "$SBOXJR_USER"; then
+                sbmon_critical "reader 回滚：本次创建的用户删除失败（$SBOXJR_USER）；需要人工处理"
+            fi
+        fi
+        if [ "$SBOXJR_PRE_GROUP_EXISTED" = "0" ] && getent group "$SBOXJR_GROUP" >/dev/null 2>&1; then
+            if ! getent passwd | grep -q ":$SBOXJR_GROUP:"; then
+                if ! groupdel -- "$SBOXJR_GROUP" 2>/dev/null; then
+                    sbmon_warn "reader 回滚：本次创建的组 $SBOXJR_GROUP 删除失败（可能仍有成员）；请人工复核"
+                fi
+            fi
+        fi
+    fi
+    sbmon_warn "reader 事务前状态已恢复（active=$SBOXJR_PRE_ACTIVE enabled=$SBOXJR_PRE_ENABLED unit=$([ "$SBOXJR_PRE_UNIT_EXISTED" = 1 ] && printf restored || printf removed) runtime=${SBOXJR_PRE_LINK_ID:-<none>}）"
 }
