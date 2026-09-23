@@ -83,12 +83,20 @@ History delays are BOUNDED INTEGERS only: a float -- even 1.0 -- is not a
 probe result and is dropped and counted, never coerced.
 
 PERSISTENCE (review B4): --out-dir is REQUIRED and fail-closed (no symlink
-component anywhere on the path, real directory, 0700 -- a permission-
+component anywhere on the path -- and ONLY ENOENT may mean "absent": an
+EACCES/EIO lstat proves nothing and refuses startup, review B4 round 4;
+real directory, 0700 -- a permission-
 tightening failure is fatal on POSIX). diag.jsonl is opened O_NOFOLLOW,
 fstat-verified regular, fchmod 0600 (failure fatal), appended with one
-write-until-complete loop per batch, fsynced per cycle; on startup at most
-one incomplete trailing fragment is truncated back to the last newline
-(fsynced, per frozen design section 8). Rotation is a numeric size shift
+write-until-complete loop per batch, fsynced per cycle; on startup the
+current file is VALIDATED before it is MEASURED (review B4 round 4): the
+repair opens O_RDWR|O_NOFOLLOW first (a FIFO can never block it), a clean
+FileNotFoundError is the ONLY benign outcome, and the fd is fstat-proved a
+regular file before any zero-size short circuit -- a pre-existing zero-byte
+symlink or special file is refused, every other fault is a storage_error
+stop. Only then is at most one incomplete trailing fragment truncated back
+to the last newline (fsynced, per frozen design section 8). Rotation is a
+numeric size shift
 (diag.jsonl.1 .. .{N-1}) with file fsync before the rename and directory
 fsync after it; the same prune pass (every cycle and --prune-now) enforces
 7-day age retention oldest-first plus the 32 MiB total and chain-count
@@ -641,6 +649,9 @@ def check_no_symlink_component(path, lstat=os.lstat):
     Walks every existing prefix from the first component up; a symlink
     anywhere on the route could redirect the evidence chain. The FINAL
     component may not exist yet (we create it); prefixes must be real dirs.
+    Review B4 round 4: ONLY ENOENT may mean "absent". An EACCES/EIO lstat
+    proves nothing, so it fails closed as a ConfigurationError instead of
+    silently trusting an unverifiable route.
     """
     absolute = os.path.abspath(path)
     prefix = absolute
@@ -650,16 +661,24 @@ def check_no_symlink_component(path, lstat=os.lstat):
             break
         try:
             st = lstat(parent)
-        except OSError:
+        except FileNotFoundError:
             st = None                    # not existing above here: makedirs will
+        except OSError as exc:
+            raise ConfigurationError(
+                "cannot verify symlink-free route to diag out dir (%s)"
+                % type(exc).__name__) from None
         if st is not None and stat_module.S_ISLNK(st.st_mode):
             raise ConfigurationError(
                 "diag out dir path must not contain a symlink component: %s" % parent)
         prefix = parent
     try:
         st = lstat(absolute)
-    except OSError:
+    except FileNotFoundError:
         st = None                        # final component absent: allowed
+    except OSError as exc:
+        raise ConfigurationError(
+            "cannot verify symlink-free route to diag out dir (%s)"
+            % type(exc).__name__) from None
     if st is not None:
         if stat_module.S_ISLNK(st.st_mode):
             raise ConfigurationError("diag out dir must not be a symlink: %s" % path)
@@ -906,25 +925,35 @@ class DiagWriter:
     def _repair_torn_tail(self):
         """Drop only the incomplete trailing fragment; return bytes removed.
 
+        Review B4 round 4: the current file is VALIDATED before it is
+        measured. The only benign startup outcome is a clean
+        FileNotFoundError; the fd is then fstat-verified a regular file
+        BEFORE any size == 0 short circuit, so a pre-existing zero-byte
+        symlink or FIFO can never slip through, and every other
+        open/fstat/read/truncate/fsync OSError fails closed as a
+        StorageError. Opening O_RDWR (never O_WRONLY) also means an
+        accidental FIFO cannot block startup waiting for a reader.
+
         A well-formed line (trailing newline INCLUDED) never exceeds
         RECORD_MAX_BYTES, so if any complete line exists its final newline
         lies inside the last RECORD_MAX_BYTES window. No newline at all in a
         bigger-than-one-record file means MORE than one fragment would be
         lost -- outside the reviewed recovery contract, so fail closed.
         """
-        try:
-            size = self.getsize_fn(self.path)
-        except OSError:
-            return 0
-        if size == 0:
-            return 0
         fd = None
         try:
-            fd = self.open_fn(self.path, os.O_RDWR | _O_BINARY
-                              | getattr(os, "O_NOFOLLOW", 0))
-            if not stat_module.S_ISREG(self.fstat_fn(fd).st_mode):
+            try:
+                fd = self.open_fn(self.path, os.O_RDWR | _O_BINARY
+                                  | getattr(os, "O_NOFOLLOW", 0))
+            except FileNotFoundError:
+                return 0         # clean absence is the ONLY benign outcome
+            st = self.fstat_fn(fd)
+            if not stat_module.S_ISREG(st.st_mode):
                 raise StorageError("evidence target is not a regular file: %s"
                                    % self.path)
+            size = st.st_size
+            if size == 0:
+                return 0
             window = min(size, RECORD_MAX_BYTES)
             self.lseek_fn(fd, size - window, os.SEEK_SET)
             chunks = []

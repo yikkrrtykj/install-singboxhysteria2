@@ -332,7 +332,9 @@ produces edges.
   worst-case health-check detection window separates "never switched" from
   "not yet re-tested" (H5);
 * `--out-dir` is REQUIRED and fail-closed: no symlink component anywhere on
-  the path, real directory, 0700 (a permission-tightening failure is FATAL
+  the path -- and only ENOENT may count as "absent" there: an EACCES/EIO
+  lstat proves nothing about the route and refuses startup (config_error)
+  instead of silently trusting an unverifiable path; real directory, 0700 (a permission-tightening failure is FATAL
   on POSIX; Windows relies on NTFS ACLs -- documented limitation, same as
   the secret file). One advisory `diag.lock` makes a second collector on
   the same directory refuse to start. `diag.key` (the HMAC key) is created
@@ -346,7 +348,12 @@ produces edges.
   assumed. `diag.jsonl` is opened
   `O_APPEND|O_NOFOLLOW`, fstat-verified regular, fchmod'ed 0600 (failure
   fatal on POSIX), appended with one write-until-complete loop per cycle
-  batch, `fsync` per cycle; on startup AT MOST ONE incomplete trailing
+  batch, `fsync` per cycle; on startup the current file is VALIDATED
+  before it is MEASURED: the repair opens `O_RDWR|O_NOFOLLOW` first (a
+  FIFO can never block it), a clean `FileNotFoundError` is the ONLY benign
+  outcome, and the fd is fstat-proved a regular file BEFORE any zero-size
+  short circuit -- a pre-existing zero-byte symlink or special file is
+  refused at startup as `storage_error`. Only then is AT MOST ONE incomplete trailing
   fragment is truncated back to the last newline (file fsynced) so the
   evidence file is valid JSONL again -- more than one lost fragment fails
   closed instead of destroying evidence;
@@ -386,7 +393,7 @@ python3 monitor-v2/mihomo/diag.py --url http://127.0.0.1:9090 \
     --out-dir /var/lib/mihomo-diag --once
 ```
 
-Tests: `tests/test-monitor-v2-e4diag.sh` (422 assertions, fail-closed gate:
+Tests: `tests/test-monitor-v2-e4diag.sh` (441 assertions, fail-closed gate:
 static mutation-free greps plus residue greps, the strict four-type proof,
 delay-0 raw preservation, leak wall, B4 storage primitives via fault
 injection (torn-tail truncation, age/budget/overflow prune + fail-closed

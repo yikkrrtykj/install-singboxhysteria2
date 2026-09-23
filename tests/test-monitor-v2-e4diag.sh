@@ -22,6 +22,10 @@
 # ENOENT-only tolerance plus non-following regular-file chain checks (R1),
 # explicit-node protection ahead of the 64-node cap (R2), strict-UTF-8 name
 # validation (R3) and durability re-proof on EVERY HMAC-key load (R4).
+# Review round-4 residual adds: startup VALIDATES before it MEASURES -- the
+# torn-tail repair opens O_NOFOLLOW first, accepts only a clean ENOENT as
+# absence, fstat-proves regular before any zero-size return, and the
+# symlink-route check no longer reads EACCES/EIO as "absent" (B4).
 #
 # Deterministic on git-bash AND Linux: OS-divergent code paths are exercised
 # through explicit platform flags and injectable attributes, so the
@@ -40,7 +44,7 @@ PASS=0
 FAIL=0
 # The gate at the bottom of this file fails unless exactly this many
 # assertions ran AND passed, so unreachable sections can never fake success.
-EXPECTED_PASS=422
+EXPECTED_PASS=441
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
@@ -270,6 +274,30 @@ if grep -qF 'room = max(OBS_CAP - len(protected), 0)' "$DIAG"; then
     pass "explicit nodes are protected before group expansion fills OBS_CAP (R2)"
 else
     fail "explicit nodes can still be sorted out of the observed set"
+fi
+REPAIR_RANGE="$(sed -n '/def _repair_torn_tail/,/^    def write(self, records)/p' "$DIAG")"
+ROUTE_RANGE="$(sed -n '/def check_no_symlink_component/,/^def ensure_out_dir/p' "$DIAG")"
+if grep -qF 'getsize_fn' <<< "$REPAIR_RANGE"; then
+    fail "startup repair still probes the current file with getsize before validating (B4 round-4 regression)"
+else
+    pass "startup repair never measures before it validates: getsize is not an existence probe"
+fi
+if grep -qF 'except FileNotFoundError' <<< "$REPAIR_RANGE" \
+   && grep -qF 'st_size' <<< "$REPAIR_RANGE" \
+   && grep -qF 'O_RDWR | _O_BINARY' <<< "$REPAIR_RANGE"; then
+    pass "startup opens O_RDWR|O_NOFOLLOW first, accepts only ENOENT as absence, sizes from the verified fd (B4)"
+else
+    fail "startup repair can still accept an unvalidated zero-size path or block on a FIFO"
+fi
+if grep -qF 'except OSError:' <<< "$ROUTE_RANGE"; then
+    fail "route check still reads ANY lstat OSError as absence (B4 round-4 regression)"
+else
+    pass "route check has no bare OSError-means-absent branch left"
+fi
+if [ "$(grep -c 'except FileNotFoundError' <<< "$ROUTE_RANGE")" = "2" ]; then
+    pass "route check tolerates ENOENT at exactly the two lstat sites and fails closed otherwise"
+else
+    fail "route check ENOENT tolerance is not pinned to the two lstat sites"
 fi
 if grep -qF 'EXIT_CONFIG = 2' "$DIAG" && grep -qF 'EXIT_API = 3' "$DIAG" \
    && grep -qF 'EXIT_STORAGE = 4' "$DIAG" && grep -qF 'EXIT_BOTH = 5' "$DIAG"; then
@@ -1037,6 +1065,28 @@ try:
     res["final_file"] = "ACCEPTED"
 except diag.ConfigurationError: res["final_file"] = "rejected"
 res["clean"] = diag.check_no_symlink_component(base, lstat=fake_lstat({})) == os.path.abspath(base)
+# Review B4 round 4: only ENOENT may mean absent. EACCES/EIO proves nothing
+# about symlinks, so an unverifiable route must fail closed as a
+# ConfigurationError (category stays config_error), while a genuinely
+# absent route keeps passing through to makedirs.
+def route_raises(err, hit):
+    hit = os.path.normcase(hit)
+    def f(path):
+        if os.path.normcase(path) == hit:
+            raise err
+        return types.SimpleNamespace(st_mode=DIR)
+    return f
+for tag, err in (("eacces", OSError(13, "Permission denied")),
+                 ("eio", OSError(5, "I/O error"))):
+    try:
+        diag.check_no_symlink_component(p, lstat=route_raises(err, parent))
+        res[tag + "_parent"] = "ACCEPTED"
+    except diag.ConfigurationError: res[tag + "_parent"] = "rejected"
+    try:
+        diag.check_no_symlink_component(p, lstat=route_raises(err, os.path.abspath(p)))
+        res[tag + "_final"] = "ACCEPTED"
+    except diag.ConfigurationError: res[tag + "_final"] = "rejected"
+    res[tag + "_absent"] = diag.check_no_symlink_component(p) == os.path.abspath(p)
 modes = {}
 def ok_chmod(path, mode): modes["mode"] = mode
 diag.ensure_out_dir(p, chmod_fn=ok_chmod)
@@ -1162,6 +1212,12 @@ assert_eq "$(field "$out" 'obj["sym_parent"]')" "rejected" "symlink PARENT compo
 assert_eq "$(field "$out" 'obj["sym_final"]')" "rejected" "symlink final dir fails closed"
 assert_eq "$(field "$out" 'obj["final_file"]')" "rejected" "regular file where the evidence dir must be is refused"
 assert_eq "$(field "$out" 'obj["clean"]')" "True" "clean real path passes and resolves absolute"
+assert_eq "$(field "$out" 'obj["eacces_parent"]')" "rejected" "B4 round 4: EACCES on a PARENT component fails closed, it never masquerades as absence"
+assert_eq "$(field "$out" 'obj["eacces_final"]')" "rejected" "B4 round 4: EACCES on the FINAL component fails closed"
+assert_eq "$(field "$out" 'obj["eio_parent"]')" "rejected" "B4 round 4: EIO on a parent component fails closed"
+assert_eq "$(field "$out" 'obj["eio_final"]')" "rejected" "B4 round 4: EIO on the final component fails closed"
+assert_eq "$(field "$out" 'obj["eacces_absent"]')" "True" "B4 round 4: genuinely absent route (real ENOENT) still passes to makedirs"
+assert_eq "$(field "$out" 'obj["eio_absent"]')" "True" "B4 round 4: true-absent creation path stays green under the stricter rule"
 assert_eq "$(field "$out" 'obj["chmod_mode"]')" "448" "existing out dir re-tightened to 0700 (448 = 0o700)"
 assert_eq "$(field "$out" 'obj["created"]')" "True" "missing out dir created fail-closed"
 assert_eq "$(field "$out" 'obj["chmod_fail"]')" "rejected" "chmod FAILURE is fatal on POSIX: non-private evidence is refused, not best-effort"
@@ -1285,6 +1341,100 @@ w6.write([])
 res["empty_noop"] = not os.path.exists(w6.path)
 w6.write([rec])
 res["no_frame"] = open(w6.path, "rb").read().startswith(b"{")
+# (j2) Review B4 round 4: startup VALIDATES before it MEASURES. Only a
+#      clean FileNotFoundError means absent; the fd is fstat-proved a
+#      regular file BEFORE any size == 0 return; every other open/fstat/
+#      read/truncate fault fails closed as a StorageError; the O_RDWR
+#      open also means a FIFO can never block startup waiting for a reader.
+def poison_getsize(*a, **k):
+    raise AssertionError("getsize must never be the startup existence probe")
+# 1: a genuinely absent file is accepted end to end (real ENOENT open)
+dx = tempfile.mkdtemp()
+wx = diag.DiagWriter(dx)
+wx.getsize_fn = poison_getsize
+res["startup_absent"] = wx._repair_torn_tail() == 0
+# 2: pre-existing zero-byte REGULAR file accepted, via the verified fd
+dy = tempfile.mkdtemp()
+open(os.path.join(dy, "diag.jsonl"), "wb").close()
+wy = diag.DiagWriter(dy)
+wy.getsize_fn = poison_getsize
+res["startup_zero_regular"] = (wy._torn_bytes == 0 and
+                               wy._repair_torn_tail() == 0 and
+                               os.path.isfile(wy.path))
+# 3: the OLD fail-open shape: a symlink reads as size 0 and used to return
+#    before validation. O_NOFOLLOW turns the startup open into ELOOP.
+dz = tempfile.mkdtemp()
+wz = diag.DiagWriter(dz)
+wz.getsize_fn = poison_getsize
+loop40 = OSError(40, "Too many levels of symbolic links")
+def eloop_open(*a, **k): raise loop40
+wz.open_fn = eloop_open
+try:
+    wz._repair_torn_tail(); res["startup_sym0"] = "ACCEPTED"
+except diag.StorageError: res["startup_sym0"] = "rejected"
+# 4: the same case on the REAL filesystem (Linux gate, Windows skip)
+if os.name == "nt":
+    res["startup_sym_real"] = "skipped"
+else:
+    ds = tempfile.mkdtemp()
+    open(os.path.join(ds, "victim"), "wb").close()
+    os.symlink(os.path.join(ds, "victim"), os.path.join(ds, "diag.jsonl"))
+    try:
+        diag.DiagWriter(ds); res["startup_sym_real"] = "ACCEPTED"
+    except diag.StorageError: res["startup_sym_real"] = "rejected"
+res["sym_real_ok"] = res["startup_sym_real"] in ("rejected", "skipped")
+# 5: zero-byte FIFO: rejected by the regular-file gate BEFORE any size
+#    logic, without blocking and without ever touching the content
+df = tempfile.mkdtemp()
+wf = diag.DiagWriter(df)
+fseen = []
+def fifo_open(path, flags, *a):
+    fseen.append(flags)
+    return 99
+wf.open_fn = fifo_open
+wf.fstat_fn = lambda fd: types.SimpleNamespace(st_mode=stat.S_IFIFO | 0o600,
+                                               st_size=0)
+wf.lseek_fn = lambda *a: fseen.append("lseek")
+wf.read_fn = lambda fd, n: (fseen.append("read"), b"")[1]
+wf.ftruncate_fn = lambda fd, s: fseen.append("trunc")
+wf.close_fn = lambda fd: fseen.append("closed")
+try:
+    wf._repair_torn_tail(); res["startup_fifo"] = "ACCEPTED"
+except diag.StorageError as e:
+    res["startup_fifo"] = "rejected" if "regular" in str(e) else "BAD"
+res["fifo_no_touch"] = ("lseek" not in fseen and "read" not in fseen and
+                        "trunc" not in fseen and "closed" in fseen and
+                        (fseen[0] & os.O_WRONLY) == 0 and
+                        (fseen[0] & os.O_RDWR) != 0)
+# 6: EACCES on the startup open and EIO on the validating fstat both fail
+#    closed as StorageError (category storage_error)
+dg = tempfile.mkdtemp()
+for tag, exc in (("eacces", OSError(13, "Permission denied")),
+                 ("eio", OSError(5, "I/O error"))):
+    wg = diag.DiagWriter(dg)
+    wg.getsize_fn = poison_getsize
+    if tag == "eacces":
+        def boom_open(*a, **k): raise exc
+        wg.open_fn = boom_open
+    else:
+        wg.open_fn = lambda *a, **k: 7
+        def boom_fstat(fd): raise exc
+        wg.fstat_fn = boom_fstat
+        wg.close_fn = lambda fd: None
+    try:
+        wg._repair_torn_tail(); res["startup_" + tag] = "ACCEPTED"
+    except diag.StorageError: res["startup_" + tag] = "rejected"
+# 7: even AFTER validation passes, a truncate fault mid-repair is a
+#    StorageError, never a silent half-repair
+dt = tempfile.mkdtemp()
+wt = diag.DiagWriter(dt)
+with open(os.path.join(dt, "diag.jsonl"), "wb") as f:
+    f.write(b"{\"v\":1}\nTAIL")
+def boom_trunc(fd, length): raise OSError(5, "I/O error")
+wt.ftruncate_fn = boom_trunc
+try:
+    wt._repair_torn_tail(); res["repair_trunc_fail"] = "ACCEPTED"
+except diag.StorageError: res["repair_trunc_fail"] = "rejected"
 # (k) size-shift rotation with fsync-before-rename + dir fsync after.
 d7 = tempfile.mkdtemp()
 w7 = diag.DiagWriter(d7, max_mb=0.0039, files=3)
@@ -1334,6 +1484,15 @@ assert_eq "$(field "$out" 'obj["torn_unrecoverable"]')" "rejected" "multi-fragme
 assert_eq "$(field "$out" 'obj["virgin_torn"]')" "0" "no false torn detection on a fresh dir"
 assert_eq "$(field "$out" 'obj["empty_noop"]')" "True" "writing no records creates nothing"
 assert_eq "$(field "$out" 'obj["no_frame"]')" "True" "clean append starts straight at JSON"
+assert_eq "$(field "$out" 'obj["startup_absent"]')" "True" "B4 round 4: a clean ENOENT is the ONLY benign startup outcome, getsize never consulted"
+assert_eq "$(field "$out" 'obj["startup_zero_regular"]')" "True" "B4 round 4: pre-existing zero-byte REGULAR file accepted only AFTER the fd is fstat-validated"
+assert_eq "$(field "$out" 'obj["startup_sym0"]')" "rejected" "B4 round 4: zero-size-as-seen symlink is refused -- ELOOP on the validating open, not a silent size-0 acceptance"
+assert_eq "$(field "$out" 'obj["sym_real_ok"]')" "True" "B4 round 4: real zero-byte symlink at diag.jsonl rejected at construction on Linux (Windows skip is the only alternative)"
+assert_eq "$(field "$out" 'obj["startup_fifo"]')" "rejected" "B4 round 4: zero-byte FIFO refused by the regular-file gate BEFORE any size logic"
+assert_eq "$(field "$out" 'obj["fifo_no_touch"]')" "True" "B4 round 4: FIFO opened O_RDWR never O_WRONLY (open cannot block), never seeked/read/truncated, fd closed"
+assert_eq "$(field "$out" 'obj["startup_eacces"]')" "rejected" "B4 round 4: EACCES on the startup open fails closed as storage_error"
+assert_eq "$(field "$out" 'obj["startup_eio"]')" "rejected" "B4 round 4: EIO on the validating fstat fails closed as storage_error"
+assert_eq "$(field "$out" 'obj["repair_trunc_fail"]')" "rejected" "B4 round 4: a truncate fault mid-repair is a storage_error, never a silent half-repair"
 assert_eq "$(field "$out" 'obj["rot_1"]')" "True" "size cap rotates diag.jsonl to .1"
 assert_eq "$(field "$out" 'obj["rot_2"]')" "True" "rotation is a numeric shift (.1 -> .2)"
 assert_eq "$(field "$out" 'obj["rot_bounded"]')" "True" "files=3 keeps the chain bounded (.3 never appears)"
