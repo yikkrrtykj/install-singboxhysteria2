@@ -1168,12 +1168,17 @@ sbmon_sboxjr_stop_disable() {
 
 # Consuming side MUST already be the active 0.3.0+ Monitor before this is
 # called. The order deliberately makes "producer with no consumer" impossible.
-sbmon_sboxjr_activate() {
+sbmon_sboxjr_activate() { # <no-start 0|1>
+    local no_start="${1:-0}"
     sbmon_sboxjr_ensure_identity || return 1
     sbmon_sboxjr_ensure_data_tree || return 1
     sbmon_sboxjr_stage_code || return 1
     sbmon_sboxjr_install_unit || return 1
     sbmon_sboxjr_readability_probe || return 1
+    if [ "$no_start" = "1" ]; then
+        sboxjr_log "--no-start: reader staged but not enabled/started"
+        return 0
+    fi
     if ! sbmon_systemctl enable --now "$SBOXJR_SERVICE_NAME"; then
         sboxjr_warn "reader enable/start failed"
         return 1
