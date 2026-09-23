@@ -131,10 +131,8 @@ if [ "$(grep -c 'sys.stderr.write' "$MODS/reader.py")" = "5" ] \
 else
     fail "stderr hygiene contract broken"
 fi
-# --- DARK gates: PR-2A must touch NO activation path -----------------------
+# --- PR-2A dark / PR-2B activated wiring gate -----------------------------
 SBXJRCALLS="$(grep -c 'sbmon_sboxjr_' "$ROOT/monitor-v2/deploy/install-monitor.sh" || true)"
-assert_eq "$SBXJRCALLS" "0" \
-    "install-monitor.sh has ZERO sbmon_sboxjr_ call sites (PR-2A dark)"
 STAGE_MANIFEST="$("$PY" - "$ROOT/monitor-v2/deploy/lib/monitor-deploy-lib.sh" <<'EOF'
 import sys
 src = open(sys.argv[1], encoding="utf-8").read()
@@ -142,13 +140,24 @@ body = src.split("sbmon_stage_release()", 1)[1].split("sbmon_activate_release()"
 print("journal_reader" in body or "sbox-journal-reader" in body)
 EOF
 )"
-assert_eq "$STAGE_MANIFEST" "False" \
-    "sbmon_stage_release manifest untouched: reader code is NOT shipped by the monitor release"
 WEBREFS="$(grep -rl 'journal_reader' "$ROOT/monitor-v2/web" "$ROOT/monitor-v2/collector.py" "$ROOT/monitor-v2/webapp.py" 2>/dev/null | wc -l | tr -d ' ')"
-assert_eq "$WEBREFS" "0" \
-    "Monitor web/collector import nothing from journal_reader (ingest inert, schema-v2 not activated)"
-assert_eq "$(cat "$ROOT/monitor-v2/VERSION")" "0.2.0" \
-    "VERSION stays 0.2.0 (the 0.3.0 bump belongs to PR-2B)"
+JR_VERSION="$(cat "$ROOT/monitor-v2/VERSION")"
+if [ "$JR_VERSION" = "0.2.0" ]; then
+    assert_eq "$SBXJRCALLS" "0" "PR-2A: installer has ZERO sboxjr call sites"
+    assert_eq "$STAGE_MANIFEST" "False" "PR-2A: reader not staged in Monitor release"
+    assert_eq "$WEBREFS" "0" "PR-2A: Monitor imports nothing from journal_reader"
+    assert_eq "$JR_VERSION" "0.2.0" "PR-2A stays DARK at VERSION 0.2.0"
+elif [ "$JR_VERSION" = "0.3.0" ]; then
+    if [ "$SBXJRCALLS" -gt 0 ]; then pass "PR-2B: installer wires sboxjr activation"; else fail "PR-2B: installer has no sboxjr activation"; fi
+    assert_eq "$STAGE_MANIFEST" "True" "PR-2B: 0.3 release stages journal_reader"
+    if [ "$WEBREFS" -gt 0 ]; then pass "PR-2B: Monitor imports journal_reader ingest contract"; else fail "PR-2B: Monitor ingest wiring absent"; fi
+    assert_eq "$JR_VERSION" "0.3.0" "PR-2B activates at VERSION 0.3.0"
+else
+    fail "unexpected Monitor VERSION for P2 lifecycle gate: $JR_VERSION"
+    fail "unexpected Monitor VERSION (stage gate)"
+    fail "unexpected Monitor VERSION (webrefs gate)"
+    fail "unexpected Monitor VERSION (version gate)"
+fi
 ENVCOUNT="$(grep -rc 'os.environ' "$MODS"/*.py | awk -F: '{s+=$2} END {print s+0}')"
 assert_eq "$ENVCOUNT" "1" \
     "exactly one env read across the whole reader (SBOX_JR_UNIT, strictly validated)"
