@@ -1124,17 +1124,15 @@ sbmon_sboxjr_unlink_runtime() { # remove ONLY the symlink itself; rc only
     return 0
 }
 
-sbmon_sboxjr_render_unit() { # [template-path] -> rendered unit on stdout
-    local tpl="${1:-}"
-    if [ -z "$tpl" ]; then
-        # Version coherence: render from the runtime tree that is actually
-        # linked (its bundled template), falling back to the repo template
-        # only when no runtime has been linked yet.
-        if [ -f "$SBOXJR_LIB_DIR/$SBOXJR_TEMPLATE_NAME" ]; then
-            tpl="$SBOXJR_LIB_DIR/$SBOXJR_TEMPLATE_NAME"
-        else
-            tpl="$DEPLOY_DIR/$SBOXJR_TEMPLATE_NAME"
-        fi
+sbmon_sboxjr_render_unit() { # -> rendered unit on stdout
+    # Version coherence: render from the runtime tree that is actually
+    # linked (its bundled template), falling back to the repo template
+    # only when no runtime has been linked yet.
+    local tpl
+    if [ -f "$SBOXJR_LIB_DIR/$SBOXJR_TEMPLATE_NAME" ]; then
+        tpl="$SBOXJR_LIB_DIR/$SBOXJR_TEMPLATE_NAME"
+    else
+        tpl="$DEPLOY_DIR/$SBOXJR_TEMPLATE_NAME"
     fi
     [ -f "$tpl" ] || { sboxjr_die "reader unit 模板不存在: $tpl" >&2; return 1; }
     sed -e "s|@SBJR_USER@|$SBOXJR_USER|g" \
@@ -1527,5 +1525,5 @@ sbmon_sboxjr_restore_prestate() {
             fi
         fi
     fi
-    sbmon_warn "reader 事务前状态已恢复（active=$SBOXJR_PRE_ACTIVE enabled=$SBOXJR_PRE_ENABLED unit=$([ "$SBOXJR_PRE_UNIT_EXISTED" = 1 ] && printf restored || printf removed) runtime=${SBOXJR_PRE_LINK_ID:-<none>}）"
+    sbmon_warn "sbox-journal-reader 激活前状态恢复完成（active=$SBOXJR_PRE_ACTIVE enabled=$SBOXJR_PRE_ENABLED unit=$([ "$SBOXJR_PRE_UNIT_EXISTED" = 1 ] && printf restored || printf removed) runtime=${SBOXJR_PRE_LINK_ID:-<none>}）"
 }

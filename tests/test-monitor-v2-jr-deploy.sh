@@ -379,7 +379,11 @@ current_release_id() {
 }
 jr_link_release_id() {
     [ -L "$SBOXJR_LIB_DIR" ] || return 0
-    basename -- "$(readlink -- "$SBOXJR_LIB_DIR")"
+    # The link points at <release>/libexec/sbox-journal-reader; the release
+    # id is the FIRST component under the releases dir, not the leaf name.
+    local t
+    t="$(readlink -- "$SBOXJR_LIB_DIR")"
+    basename -- "${t%/libexec/sbox-journal-reader}"
 }
 history_first_id() { # id of the FIRST committed release (oldest history line)
     awk 'NR==1{print $2}' "$SBMON_RELEASES_DIR/releases.history" 2>/dev/null
@@ -704,7 +708,7 @@ if require_symlink "upgrade failure -> reader rollback coherence"; then
     [ "$LAST_RC" != "0" ] && pass "upgrb: failed upgrade refused rc=$LAST_RC" \
         || fail "upgrb: must refuse, rc=0"
     assert_eq "$(jr_link_release_id)" "$R1" "upgrb: runtime link RESTORED to the old release (no version mix)"
-    assert_grep "$OUT" 'reader 事务前状态已恢复' "upgrb: reader pre-state restore logged"
+    assert_grep "$OUT" 'sbox-journal-reader 激活前状态恢复完成' "upgrb: reader pre-state restore logged"
     assert_eq "$(jr_state)" "active/enabled" "upgrb: reader active+enabled preserved through the failed upgrade"
     assert_eq "$(current_release_id)" "$R1" "upgrb: monitor release also restored to v1 (one transaction)"
 fi

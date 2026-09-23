@@ -768,9 +768,7 @@ _cmd_uninstall_locked() { # F4: runs under the deploy lock
         sbmon_info "保留状态目录（auth/access/state）: $SBMON_STATE_ROOT（--purge-state 可删除）"
         sbmon_info "保留 reader 诊断数据（cursor/state/exchange）: $SBOXJR_DATA_ROOT（--purge-state 可删除）"
     fi
-    if [ "$SBMON_FIXTURE" != "1" ]; then
-        sbmon_info "保留系统身份 $SBOXJR_USER/$SBMON_USER（卸载从不删除账号；如需清除请人工 userdel）"
-    fi
+    sbmon_info "保留系统身份 $SBOXJR_USER/$SBMON_USER（卸载从不删除账号；如需清除请人工 userdel）"
     if [ "$OPT_PURGE_CONFIG" = 1 ]; then
         sbmon_info "--purge-config: 删除 $SBMON_CONF_DIR"
         rm -rf -- "$SBMON_CONF_DIR"
