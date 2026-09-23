@@ -71,6 +71,7 @@ jobs:
           bash -n tests/test-monitor-v2-m2.sh
           bash -n tests/test-monitor-v2-hist.sh
           bash -n tests/test-monitor-v2-jr.sh
+          bash -n tests/test-monitor-v2-p2b.sh
           bash -n tests/journal-reader/test-jr-live.sh
           bash -n tests/e3/test-m3-deploy.sh
           bash -n tests/e3/test-m3c-phase1.sh
@@ -195,6 +196,9 @@ jobs:
 
       - name: "sbox-journal-reader suite (cursor / classifier / eligibility / recovery / crash matrix / ingest contract / DARK gates, issue #33 P2 PR-2A)"
         run: bash tests/test-monitor-v2-jr.sh
+
+      - name: "P2B schema-v2 + sanitized journal ingest regression"
+        run: bash tests/test-monitor-v2-p2b.sh
 
   # ---------------------------------------------------------------------
   # Lane D -- compatibility matrix. Runs on the three supported Ubuntu LTS
