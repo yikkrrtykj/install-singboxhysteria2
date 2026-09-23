@@ -242,20 +242,26 @@ if sed -n '/def safe_name/,/^def as_strict_bool/p' "$DIAG" | grep -q '\.strip(';
 else
     pass "safe_name body carries no strip/normalization surface"
 fi
-if sed -n '/def safe_name/,/^def as_strict_bool/p' "$DIAG" | grep -qF '"replace"'; then
+# Range captures feed grep via here-strings, NOT pipes: under set -o
+# pipefail a multi-KB sed | grep -q pipeline can die on GNU sed with
+# "couldn't flush stdout: Broken pipe" the moment grep exits early.
+PRUNE_RANGE="$(sed -n '/def prune/,/^def encode_record/p' "$DIAG")"
+KEY_RANGE="$(sed -n '/def load_or_create_hmac_key/,/^def _try_lock/p' "$DIAG")"
+SAFE_RANGE="$(sed -n '/def safe_name/,/^def as_strict_bool/p' "$DIAG")"
+if grep -qF '"replace"' <<< "$SAFE_RANGE"; then
     fail "safe_name measures names with lossy replace-mode encoding (R3 regression)"
 else
     pass "safe_name encodes STRICT UTF-8 only (R3: no lone-surrogate laundering)"
 fi
-if sed -n '/def prune/,/^def encode_record/p' "$DIAG" | grep -qF 'lstat_fn' \
-   && sed -n '/def prune/,/^def encode_record/p' "$DIAG" | grep -qF 'FileNotFoundError' \
-   && sed -n '/def prune/,/^def encode_record/p' "$DIAG" | grep -qF 'S_ISREG'; then
+if grep -qF 'lstat_fn' <<< "$PRUNE_RANGE" \
+   && grep -qF 'FileNotFoundError' <<< "$PRUNE_RANGE" \
+   && grep -qF 'S_ISREG' <<< "$PRUNE_RANGE"; then
     pass "prune retention is fail-closed: non-following lstat + regular-file gate, ENOENT-only tolerance (R1)"
 else
     fail "prune can still fail open on unverifiable retention metadata"
 fi
-if sed -n '/def load_or_create_hmac_key/,/^def _try_lock/p' "$DIAG" | grep -qF 'cannot prove durability' \
-   && sed -n '/def load_or_create_hmac_key/,/^def _try_lock/p' "$DIAG" | grep -qF 'fsync_dir_fn(out_dir)'; then
+if grep -qF 'cannot prove durability' <<< "$KEY_RANGE" \
+   && grep -qF 'fsync_dir_fn(out_dir)' <<< "$KEY_RANGE"; then
     pass "key loader re-proves file AND dir durability on EVERY load path before returning (R4)"
 else
     fail "key loader can still launder an unproven key across restarts"
