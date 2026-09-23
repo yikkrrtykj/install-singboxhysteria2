@@ -725,8 +725,8 @@
 
   function setMutation(kind, name) {
     // 0.1.5 (#36): UI/single-flight lock around add+delete. Rendered
-    // synchronously BEFORE apiWithStepUp so the busy state is visible for
-    // the whole operation (step-up dialog included).
+    // synchronously BEFORE dispatch so the busy state is visible for the
+    // whole operation. Add no longer performs password step-up.
     state.e3Mutation = {kind: kind, name: name, inFlight: true};
     renderE3Controls();
   }
@@ -849,7 +849,7 @@
     if (!e3Writable()) return;
     var key = keyOverride || newIdempotencyKey();
     setMutation("add", name);
-    apiWithStepUp("/api/v1/clients/add", {
+    api("/api/v1/clients/add", {
       method: "POST",
       idempotencyKey: key,
       body: { name: name }
