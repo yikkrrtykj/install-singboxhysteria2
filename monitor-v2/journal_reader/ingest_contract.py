@@ -92,7 +92,7 @@ def read_and_validate(out_dir, name, filename_seq):
     return (body, records), None
 
 
-def settle(out_dir, terminal_seq, apply_fn):
+def settle(out_dir, terminal_seq, apply_fn, settle_fn=None):
     """Run one ingest pass over `out_dir` given the stored
     `journal_terminal_seq`; returns a result dict:
 
@@ -101,9 +101,12 @@ def settle(out_dir, terminal_seq, apply_fn):
        "rejected_codes": {seq: code}}
 
     `apply_fn(header, records, seq)` must persist aggregates AND the
-    terminal advance as ONE atomic storage transaction; returning normally
-    means committed, raising means nothing settled (retry next cycle --
-    safe, because re-encountering seq <= terminal is a no-op)."""
+    terminal advance as ONE atomic storage transaction. Optional
+    `settle_fn(kind, terminal, amount, code)` is the PR-2B storage hook for
+    gap/rejected dispositions; it must persist their terminal advance and
+    counter increment atomically before scanning continues. Returning
+    normally means committed; raising means nothing settled and blocks the
+    cycle at that seq."""
     files = scan_exchange_dir(out_dir)
     result = {"terminal": terminal_seq, "gaps": 0, "rejected": 0,
               "consumed": 0, "last_consumed": None, "blocked_at": None,
@@ -117,13 +120,27 @@ def settle(out_dir, terminal_seq, apply_fn):
             if not present:
                 break
             nxt = present[0]
-            result["gaps"] += nxt - seq
-            result["terminal"] = nxt - 1
+            amount = nxt - seq
+            new_terminal = nxt - 1
+            if settle_fn is not None:
+                try:
+                    settle_fn("gap", new_terminal, amount, None)
+                except Exception:
+                    result["blocked_at"] = seq
+                    break
+            result["gaps"] += amount
+            result["terminal"] = new_terminal
             seq = nxt
         payload, code = read_and_validate(out_dir, files[seq], seq)
         if code is not None:
             # Terminally rejected: settles once, never re-read again, and
             # later seqs continue (no forever-reject loop, no gap).
+            if settle_fn is not None:
+                try:
+                    settle_fn("rejected", seq, 1, code)
+                except Exception:
+                    result["blocked_at"] = seq
+                    break
             result["terminal"] = seq
             result["rejected"] += 1
             result["rejected_codes"][seq] = code
