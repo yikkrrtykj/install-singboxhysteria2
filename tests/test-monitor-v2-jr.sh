@@ -12,9 +12,11 @@
 # tagged source anchor (D3), the 50k backlog cap committed through the
 # last actually processed cursor (C4), terminal-seq continuity
 # (T27a/b/c), retention/heartbeat, the operator-only reset path, privacy
-# sentinels that must never cross the exchange, and the PR-2A DARK
-# contract (zero production call sites, no shipped manifest change, no
-# Monitor wiring), and the review #46 B1-B9 fixes: real '-- cursor:'
+# sentinels that must never cross the exchange, the PR-2B ACTIVATION
+# WIRING contract (the reader activates ONLY through the reviewed installer
+# transaction -- the PR-2A "zero call sites" DARK gate was replaced by the
+# mutation-surface allowlist confinement, never deleted), and the review
+# #46 B1-B9 fixes: real '-- cursor:'
 # framing (B1, D5 validator untouched), R7 exact-shape identity refusal
 # with zero mutation before any change (B3, PATH-stub fixtures),
 # sanitized journal_writer_failed for every expected durability OSError
@@ -40,12 +42,15 @@ MODS="$ROOT/monitor-v2/journal_reader"
 
 PASS=0
 FAIL=0
-# 369 = S0 static 13 + S1 unit/wrapper 10 (B7 gates +2) + S2 CI locks 3
+# 371 = S0 static 13 + S1 unit/wrapper 10 (B7 gates +2) + S2 CI locks 3
 #     + S3 jtime 10 + S4 behavioral 311 (19->20 groups, +1 line: cursor +6
 #     B1 framing, fp +12 B8 key +2 B8r dir-fsync proof, d1 +8 B6 semantics,
 #     dur group 21 B4/B5 +3 B5r startup re-proves ceiling)
 #     + S5 identity fixtures 22 (B3 PATH-stub scenarios)
-EXPECTED_PASS=369
+#     + PR-2B activation-wiring conversion (DARK zero-call gates replaced by
+#       the mutation-surface confinement + manifest-ship + verb-inert gates
+#       and the 25-helper registry: net +2 lines)
+EXPECTED_PASS=371
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
@@ -131,19 +136,72 @@ if [ "$(grep -c 'sys.stderr.write' "$MODS/reader.py")" = "5" ] \
 else
     fail "stderr hygiene contract broken"
 fi
-# --- DARK gates: PR-2A must touch NO activation path -----------------------
-SBXJRCALLS="$(grep -c 'sbmon_sboxjr_' "$ROOT/monitor-v2/deploy/install-monitor.sh" || true)"
-assert_eq "$SBXJRCALLS" "0" \
-    "install-monitor.sh has ZERO sbmon_sboxjr_ call sites (PR-2A dark)"
+# --- activation-wiring gates: PR-2B (Coding E) replaced the PR-2A DARK      |
+#     zero-call-site contract with: "the reader activates ONLY through the    |
+#     reviewed installer transaction". The mutating reader surface is a      |
+#     closed allowlist of helper names, reachable only from                  |
+#     _cmd_install_locked / _cmd_rollback_locked / _cmd_uninstall_locked +   |
+#     cmd_status (read-only). Anything else -- health, web-setup, a stray    |
+#     top-level call, a direct python import of journal_reader -- must be 0. |
+IM="$ROOT/monitor-v2/deploy/install-monitor.sh"
+# NB: the file path travels via the environment, NOT argv: some Windows
+# python launchers shebang-execute bash-script argv[1]s (the real gate is
+# Linux CI, but this suite is documented as platform-stable).
+WIRING="$(SBJR_WIRING_TARGET="$IM" "$PY" - <<'EOF'
+import os, re
+src = open(os.environ["SBJR_WIRING_TARGET"], encoding="utf-8").read()
+bodies = {}
+for m in re.finditer(r'^([a-z_0-9]+)\(\) \{', src, re.M):
+    name = m.group(1)
+    end = src.find('\n}\n', m.start())
+    body = src[m.start():end] if end >= 0 else src[m.start():]
+    # code-only: a comment can never BE a call site
+    body = "\n".join(l.split("#", 1)[0] for l in body.splitlines())
+    bodies[name] = body
+MUTATING = {"sbmon_sboxjr_activation_preflight", "sbmon_sboxjr_capture_prestate",
+            "sbmon_sboxjr_converge", "sbmon_sboxjr_restore_prestate",
+            "sbmon_sboxjr_release_runtime_dir", "sbmon_sboxjr_unlink_runtime",
+            "sbmon_sboxjr_service_stop", "sbmon_sboxjr_service_disable"}
+READONLY = {"sbmon_sboxjr_service_active", "sbmon_sboxjr_service_enabled",
+            "sbmon_sboxjr_runtime_linked_id"}
+ALLOWED_FNS = {"_cmd_install_locked", "_cmd_rollback_locked",
+               "_cmd_uninstall_locked", "cmd_status"}
+violations = []
+for fn, body in bodies.items():
+    for call in re.findall(r'sbmon_sboxjr_[a-z_0-9]+', body):
+        if call in READONLY and fn in {"cmd_status", "_cmd_rollback_locked",
+                                       "_cmd_uninstall_locked"}:
+            continue
+        if call in MUTATING and fn in ALLOWED_FNS:
+            continue
+        violations.append(f"{fn}:{call}")
+# top-level (column-0, non-comment) call sites outside any function body
+toplevel = "\n".join(l for l in src.splitlines()
+                     if l and l[0] not in " \t#")
+for call in re.findall(r'\b(sbmon_sboxjr_[a-z_0-9]+)', toplevel):
+    violations.append(f"toplevel:{call}")
+print(",".join(sorted(set(violations))) or "OK")
+EOF
+)"
+assert_eq "$WIRING" "OK" \
+    "reader mutation surface confined to the reviewed PR-2B installer transaction (no stray/health/status/web-setup activation)"
+if grep -Eq 'python3? .*journal_reader|import journal_reader|journal_reader\.reader' "$IM"; then
+    fail "installer directly imports/invokes the reader runtime (must go through the staged unit only)"
+else
+    pass "installer never imports/executes journal_reader directly"
+fi
 STAGE_MANIFEST="$("$PY" - "$ROOT/monitor-v2/deploy/lib/monitor-deploy-lib.sh" <<'EOF'
 import sys
 src = open(sys.argv[1], encoding="utf-8").read()
 body = src.split("sbmon_stage_release()", 1)[1].split("sbmon_activate_release()", 1)[0]
-print("journal_reader" in body or "sbox-journal-reader" in body)
+explicit = ("SBOXJR_MODULE_FILES[@]" in body
+            and "journal_reader/$jf" in body and "$SBOXJR_TEMPLATE_NAME" in body)
+no_wildcard = "cp -R -- \"$SBMON_REPO_MONITOR_DIR/journal_reader\"" not in body
+print(explicit and no_wildcard)
 EOF
 )"
-assert_eq "$STAGE_MANIFEST" "False" \
-    "sbmon_stage_release manifest untouched: reader code is NOT shipped by the monitor release"
+assert_eq "$STAGE_MANIFEST" "True" \
+    "sbmon_stage_release ships the reader ONLY via the explicit 12+1+1 manifest (never cp -R)"
 WEBREFS="$(grep -rl 'journal_reader' "$ROOT/monitor-v2/web" "$ROOT/monitor-v2/collector.py" "$ROOT/monitor-v2/webapp.py" 2>/dev/null | wc -l | tr -d ' ')"
 assert_eq "$WEBREFS" "0" \
     "Monitor web/collector import nothing from journal_reader (ingest inert, schema-v2 not activated)"
@@ -210,14 +268,45 @@ else
     pass "wrapper env surface is zero: only the frozen SBOX_JR_UNIT channel remains"
 fi
 for fn in sbmon_sboxjr_validate_identity sbmon_sboxjr_ensure_identity \
-          sbmon_sboxjr_ensure_data_tree sbmon_sboxjr_stage_code \
-          sbmon_sboxjr_render_unit sbmon_sboxjr_install_unit \
-          sbmon_sboxjr_readability_probe; do
-    grep -qx "$fn () {" <(declare -f | grep '^[a-z_]* () {$' 2>/dev/null) 2>/dev/null \
-        || grep -q "^$fn()" "$ROOT/monitor-v2/deploy/lib/monitor-deploy-lib.sh" \
+          sbmon_sboxjr_ensure_data_tree sbmon_sboxjr_audit_runtime \
+          sbmon_sboxjr_link_runtime sbmon_sboxjr_unlink_runtime \
+          sbmon_sboxjr_runtime_linked_id sbmon_sboxjr_release_runtime_dir \
+          sbmon_sboxjr_render_unit sbmon_sboxjr_verify_unit \
+          sbmon_sboxjr_install_unit \
+          sbmon_sboxjr_service_active sbmon_sboxjr_service_enabled \
+          sbmon_sboxjr_service_enable sbmon_sboxjr_service_enable_now \
+          sbmon_sboxjr_service_restart sbmon_sboxjr_service_stop \
+          sbmon_sboxjr_service_disable sbmon_wait_sboxjr_active \
+          sbmon_sboxjr_activation_preflight sbmon_sboxjr_capture_prestate \
+          sbmon_sboxjr_health_proof sbmon_sboxjr_converge \
+          sbmon_sboxjr_restore_prestate sbmon_sboxjr_readability_probe; do
+    grep -q "^${fn}()" "$ROOT/monitor-v2/deploy/lib/monitor-deploy-lib.sh" \
         || fail "helper missing: $fn"
 done
-pass "all 7 sboxjr deployment helpers defined (enable/start helpers deliberately ABSENT)"
+pass "all 25 sboxjr deployment helpers defined (enable/start confined to sbmon_sboxjr_converge / restore paths)"
+if "$PY" - "$ROOT/monitor-v2/deploy/lib/monitor-deploy-lib.sh" <<'PCEOF'
+import re, sys
+src = open(sys.argv[1], encoding="utf-8").read()
+def body(name):
+    m = re.search(r'^%s\(\) \{' % re.escape(name), src, re.M)
+    if not m:
+        sys.exit(1)
+    end = src.find('\n}\n', m.start())
+    b = "\n".join(l.split("#", 1)[0] for l in src[m.start():end].splitlines())
+    return set(re.findall(r'sbmon_sboxjr_[a-z_0-9]+\b|sbmon_wait_sboxjr_active\b', b))
+c = body("sbmon_sboxjr_converge")
+iu = body("sbmon_sboxjr_install_unit")
+start_calls = {"sbmon_sboxjr_service_enable", "sbmon_sboxjr_service_enable_now",
+               "sbmon_sboxjr_service_restart", "sbmon_wait_sboxjr_active"}
+# install_unit must stay state-inert; start verbs belong to converge (and
+# the restore path), never anywhere else in the library's helpers.
+sys.exit(0 if start_calls <= c and not (start_calls & iu) else 1)
+PCEOF
+then
+    pass "enable/start/wait verbs live ONLY in converge (install_unit stays inert)"
+else
+    fail "activation verb confinement broken (start verbs leaked outside converge)"
+fi
 grep -q 'sbox-jr' "$ROOT/monitor-v2/deploy/lib/monitor-deploy-lib.sh" \
     && grep -q 'systemd-journal' "$ROOT/monitor-v2/deploy/lib/monitor-deploy-lib.sh" \
     && pass "R7 exact identity constants (sbox-jr + systemd-journal) live in the shared library"
