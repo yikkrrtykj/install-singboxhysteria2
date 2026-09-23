@@ -1089,3 +1089,84 @@ sbmon_sboxjr_readability_probe() {
     fi
     return 0
 }
+
+# PR-2B production activation: read-only preflight MUST happen before the
+# ordinary Monitor installer mutates anything. Existing identities are exact
+# validated with zero repair; absent identities may be created only later.
+sbmon_sboxjr_preflight_activation() {
+    local cmd d
+    for cmd in getent id cut tr grep sort runuser; do
+        command -v "$cmd" >/dev/null 2>&1 || {
+            sboxjr_die "activation preflight: missing command $cmd"
+            return 1
+        }
+    done
+    getent group "$SBOXJR_JOURNAL_GROUP" >/dev/null 2>&1 || {
+        sboxjr_die "activation preflight: field=journal_group missing"
+        return 1
+    }
+    if getent passwd "$SBOXJR_USER" >/dev/null 2>&1; then
+        sbmon_sboxjr_validate_identity || return 1
+    else
+        for cmd in groupadd useradd usermod; do
+            command -v "$cmd" >/dev/null 2>&1 || {
+                sboxjr_die "activation preflight: missing command $cmd"
+                return 1
+            }
+        done
+    fi
+    for d in "$SBOXJR_DATA_ROOT" "$SBOXJR_STATE_DIR" "$SBOXJR_OUT_DIR"; do
+        if [ -L "$d" ] || { [ -e "$d" ] && [ ! -d "$d" ]; }; then
+            sboxjr_die "activation preflight: unsafe data path"
+            return 1
+        fi
+    done
+    if [ -L "$SBOXJR_UNIT_FILE" ] || { [ -e "$SBOXJR_UNIT_FILE" ] && [ ! -f "$SBOXJR_UNIT_FILE" ]; }; then
+        sboxjr_die "activation preflight: unsafe unit path"
+        return 1
+    fi
+    return 0
+}
+
+sbmon_sboxjr_service_active() {
+    sbmon_systemctl is-active --quiet "$SBOXJR_SERVICE_NAME" 2>/dev/null
+}
+
+sbmon_sboxjr_service_enabled() {
+    sbmon_systemctl is-enabled --quiet "$SBOXJR_SERVICE_NAME" 2>/dev/null
+}
+
+sbmon_sboxjr_wait_ready() {
+    local deadline=$(( SECONDS + SBMON_HEALTH_TIMEOUT ))
+    while (( SECONDS < deadline )); do
+        if sbmon_sboxjr_service_active && [ -f "$SBOXJR_OUT_DIR/hb" ] && [ ! -L "$SBOXJR_OUT_DIR/hb" ]; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+sbmon_sboxjr_stop_disable() {
+    sbmon_systemctl disable --now "$SBOXJR_SERVICE_NAME" >/dev/null 2>&1 || true
+}
+
+# Consuming side MUST already be the active 0.3.0+ Monitor before this is
+# called. The order deliberately makes "producer with no consumer" impossible.
+sbmon_sboxjr_activate() {
+    sbmon_sboxjr_ensure_identity || return 1
+    sbmon_sboxjr_ensure_data_tree || return 1
+    sbmon_sboxjr_stage_code || return 1
+    sbmon_sboxjr_install_unit || return 1
+    sbmon_sboxjr_readability_probe || return 1
+    if ! sbmon_systemctl enable --now "$SBOXJR_SERVICE_NAME"; then
+        sboxjr_warn "reader enable/start failed"
+        return 1
+    fi
+    if ! sbmon_sboxjr_wait_ready; then
+        sboxjr_warn "reader failed readiness (active + heartbeat)"
+        return 1
+    fi
+    sboxjr_log "reader active + heartbeat ready"
+    return 0
+}
