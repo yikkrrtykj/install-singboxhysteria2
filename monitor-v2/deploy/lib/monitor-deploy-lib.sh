@@ -1163,7 +1163,30 @@ sbmon_sboxjr_wait_ready() {
 }
 
 sbmon_sboxjr_stop_disable() {
-    sbmon_systemctl disable --now "$SBOXJR_SERVICE_NAME" >/dev/null 2>&1 || true
+    if sbmon_sboxjr_service_active || sbmon_sboxjr_service_enabled; then
+        sbmon_systemctl disable --now "$SBOXJR_SERVICE_NAME" || return 1
+    fi
+    if sbmon_sboxjr_service_active || sbmon_sboxjr_service_enabled; then
+        sboxjr_warn "reader remains active/enabled after disable --now"
+        return 1
+    fi
+    return 0
+}
+
+sbmon_sboxjr_restore_service_state() { # <active 0|1> <enabled 0|1>
+    local active="$1" enabled="$2"
+    if [ "$enabled" = "1" ]; then
+        sbmon_systemctl enable "$SBOXJR_SERVICE_NAME" || return 1
+    else
+        sbmon_systemctl disable "$SBOXJR_SERVICE_NAME" || return 1
+    fi
+    if [ "$active" = "1" ]; then
+        sbmon_systemctl start "$SBOXJR_SERVICE_NAME" || return 1
+        sbmon_sboxjr_wait_ready || return 1
+    else
+        sbmon_systemctl stop "$SBOXJR_SERVICE_NAME" || return 1
+    fi
+    return 0
 }
 
 # Consuming side MUST already be the active 0.3.0+ Monitor before this is
