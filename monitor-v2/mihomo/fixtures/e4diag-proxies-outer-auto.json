@@ -1,0 +1,114 @@
+{
+  "proxies": {
+    "GLOBAL": {
+      "type": "Compatible",
+      "now": "节点选择",
+      "all": [
+        "节点选择",
+        "自动选择",
+        "reality-hk-01",
+        "hy2-hk-02",
+        "DIRECT"
+      ]
+    },
+    "节点选择": {
+      "type": "Selector",
+      "udp": true,
+      "hidden": false,
+      "testUrl": "",
+      "x-extra-junk": {
+        "should": "be-dropped"
+      },
+      "now": "自动选择",
+      "all": [
+        "reality-hk-01",
+        "hy2-hk-02",
+        "自动选择",
+        "DIRECT"
+      ]
+    },
+    "自动选择": {
+      "type": "Fallback",
+      "now": "reality-hk-01",
+      "all": [
+        "reality-hk-01",
+        "hy2-hk-02",
+        "reality-hk-03"
+      ],
+      "tolo": 1,
+      "history": [
+        {
+          "time": "2026-09-22T11:59:00Z",
+          "delay": 120
+        },
+        {
+          "time": "2026-09-22T12:00:00Z",
+          "delay": 0
+        },
+        {
+          "time": "2026-09-22T12:01:00Z",
+          "delay": 88
+        }
+      ]
+    },
+    "reality-hk-01": {
+      "type": "Reality",
+      "alive": true,
+      "history": [
+        {
+          "time": "2026-09-22T11:59:00Z",
+          "delay": 90
+        },
+        {
+          "time": "2026-09-22T12:00:00Z",
+          "delay": 0
+        },
+        {
+          "time": "2026-09-22T12:01:00Z",
+          "delay": 88
+        }
+      ],
+      "extra": {
+        "https://probe.example.invalid/generate_204?tk=S3CR3T-QUERY-SENTINEL-9f": {
+          "alive": true,
+          "history": [
+            {
+              "time": "2026-09-22T12:01:00Z",
+              "delay": 88
+            }
+          ]
+        },
+        "https://cp.cloudflare.com/generate_204": {
+          "alive": true,
+          "history": [
+            {
+              "time": "2026-09-22T12:01:30Z",
+              "delay": 90
+            }
+          ]
+        }
+      }
+    },
+    "hy2-hk-02": {
+      "type": "Hysteria2",
+      "alive": true,
+      "history": [
+        {
+          "delay": 44
+        },
+        {
+          "time": "2026-09-22T12:00:30Z",
+          "delay": 55
+        },
+        {
+          "time": "not-a-time",
+          "delay": "abc"
+        }
+      ]
+    },
+    "DIRECT": {
+      "type": "Passsthrough",
+      "alive": "yes-please-drop-this"
+    }
+  }
+}

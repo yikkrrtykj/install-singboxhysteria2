@@ -27,7 +27,7 @@ Consequences, all enforced by construction:
   never matched, never mapped onto a server-side Device. If the client names
   its node `香港-01`, the device stays `vmix-01` server-side;
 * this module does not import anything from the server-side monitor code and
-  never touches its state; the E1 regression suite (188/188) must stay green.
+  never touches its state; the E1 regression suite (232/232) must stay green.
 
 UI may therefore show, side by side:
 
@@ -184,6 +184,7 @@ stale       = true whenever updated_at is null, or older than max_age
 ```text
 monitor-v2/mihomo/
 ├── client.py      # transport + fail-closed URL parse + read-only poller + CLI
+├── diag.py        # E4-Diag: stateful read-only failover-forensics recorder (JSONL)
 ├── model.py       # whitelist-sealed output object, normalizers, freshness
 └── fixtures/      # realistic endpoint payloads for the regression suite
 ```
@@ -202,4 +203,209 @@ python3 monitor-v2/mihomo/client.py --secret-file /etc/mihomo/monitor.secret ...
 ```
 
 Tests: `tests/test-monitor-v2-e4.sh` (fixture-driven, plus a real loopback
-wire check). E1 regression: `tests/test-monitor-v2-e1.sh` must stay 188/188.
+wire check). E1 regression: `tests/test-monitor-v2-e1.sh` must stay 232/232.
+
+---
+
+# E4-Diag -- failover forensics recorder (issue #41, OBSERVABILITY ONLY)
+
+`diag.py` is a separate stateful CLI, deliberately NOT part of the enrichment
+object: `model.ENRICHMENT_KEYS` is an E4 invariant and diagnostics write their
+own closed JSONL records instead. It exists because at the last "Reality broke,
+no switch happened" incident the client-side `/proxies` evidence needed to
+separate the candidate explanations was never captured. It changes NOTHING
+about selection or failover -- same read-only mandate as E4 (GET-only
+transport by construction, no `PUT /proxies`, no `DELETE /connections`, no
+`/delay` active probes; only `/version`, `/proxies` and `/connections` are
+read), reusing E4's audited pieces verbatim (`parse_controller_url`,
+`HttpTransport`, `clamp_timeout`, `resolve_secret`, the 0600 secret-file
+contract).
+
+## Record schema (closed -- EXACTLY FOUR record types, nothing else is ever written)
+
+Schema version `v=1`; every record carries the envelope `{v, t, ts, run, seq}`:
+`ts` is UTC Z-form (`YYYY-MM-DDTHH:MM:SSZ`), `run` is a fresh non-secret 32-hex
+id per PROCESS (restarts and gaps are explicit evidence, never backfilled),
+`seq` is a strictly increasing per-run counter. There is deliberately NO
+run/header record type: a restart is visible as the `run` change plus the
+always-emitted first `sample`.
+
+| `t` | emitted | keys beyond the envelope | carries |
+|---|---|---|---|
+| `sample` | EVERY cycle, no matter what failed | `api_reachable, mihomo_version, proxies_status, connections_status, groups, nodes, connection_chains, truncated, invalid_fields` | the per-cycle evidence snapshot below |
+| `selection_changed` | only on change | `group, from, to` | selection transitions with timestamps (H3: was it even automatic?) |
+| `alive_flipped` | only on flip | `node, from, to` | health-check verdict flips (H1 vs H2) |
+| `collector` | once per present failure code per cycle | `code, scope, count` | closed failure vocabulary; the bounded `scope` distinguishes endpoints; `count` = consecutive cycles |
+
+A `sample` is emitted even when `/version` is unreachable -- with
+`api_reachable: false`, `mihomo_version: null` and honest endpoint statuses
+`"unavailable"` -- so an outage or a restart during an outage is visible
+evidence, never a hole.
+
+`collector.code` (closed enum) with its fixed `scope`: `mihomo_unreachable`
+(version -- ANY `/version` failure: transport error, non-200 including 401,
+malformed body, or a missing/unusable version field); `proxies_invalid`
+(proxies); `connections_invalid` (connections); `group_missing` (proxies);
+`node_missing` (proxies); `storage_error` (storage). Endpoint statuses on
+`sample` are the closed set `ok | unavailable | invalid`.
+
+Accounting (whole-cycle, dedup): the cycle's whole code set is computed FIRST;
+each present code produces exactly ONE `collector` record with its count
+incremented once -- the same code on several endpoints is never recorded
+twice in one cycle. A code resets only after a FULL cycle in which it was
+absent; a `/version` failure shortens the cycle (the other reads are skipped),
+so it increments and never resets.
+
+## What a `sample` proves
+
+* `groups`: for each caller-named group ONLY -- `name, type, now, members`
+  (plus `alive` only when the source value is a real boolean). Group names
+  are never guessed or discovered; at least one `--group` is REQUIRED (a
+  zero-group collector would record empty evidence forever -- refused).
+* `nodes`: every observed member (union of named-group members, current
+  selections and repeatable explicit `--node` names -- 0..32, de-duplicated
+  first-seen; explicit names are PROTECTED first inside the 64-node cap, so
+  a caller-demanded node is never sorted out of existence by group
+  expansion -- when the cap bites, a group-derived tail is the visible
+  `truncated` victim), each `{name, type, alive, history, extra}`:
+  `alive` is a strict bool or `null` ("unknown", never False); `history`
+  entries are
+  `{ts, delay_ms}` newest-last, tail of 8. Names are an EXACT display
+  identity: legal characters (including spaces) are stored byte-for-byte,
+  never trimmed or normalized; empty/over-128-byte/control names are
+  refused and counted -- measured by STRICT UTF-8 encoding, so a string
+  that cannot be UTF-8 encoded at all (a lone surrogate from upstream
+  escaped JSON) is invalid, never laundered through a lossy length check.
+  **`delay == 0` is preserved RAW
+  as integer 0** (a FAILED probe, the single most important missing datum,
+  E4-H1); a delay must be a true bounded integer -- a float (even `1.0`),
+  bool or string is dropped and counted, never coerced; a delay whose
+  timestamp does not parse keeps the entry with `ts: null` (soft-invalid,
+  counted). `extra` holds per-test-URL histories (H4) where the build
+  exposes them -- EACH url keeps its own 8-entry tail: the RAW URL is never
+  stored -- each is replaced by
+  `test_id = HMAC-SHA256(local 256-bit key, raw_url)[:16 hex]`, stable
+  across samples AND restarts while the URL (which may embed private query
+  tokens) never crosses the persistence boundary.
+* `connection_chains`: from `/connections` ONLY `chains` and `start` are ever
+  read, immediately aggregated per observed node to
+  `{node, active_chain_count, oldest_start, newest_start, invalid_start_count}`.
+  `"connections": null` and `[]` are the official empty shapes -> confirmed
+  zero; a missing key or wrong type -> `connections_status: "invalid"`
+  (unknown, NEVER zero). Only well-formed connection objects count toward
+  `active_chain_count`; a valid connection without a usable `start` raises
+  that node's `invalid_start_count`. NO cross-group "stale" verdict is
+  derived -- under nested topologies (outer Selector -> inner automatic
+  group) it would overclaim; the analyst compares these raw facts against
+  same-run `selection_changed` records. Connection ids, IPs, hosts, rules,
+  metadata and traffic totals are structurally never written -- asserted by
+  a whole-file leak wall in the test suite.
+* `truncated` / `invalid_fields`: cardinality caps (8 groups, 32 explicit
+  `--node` names, 32 stored members per group, 64 observed nodes, 8 history
+  entries per node AND per test-URL view, 8 extra
+  test-ids per node, names 1..128 bytes of STRICT UTF-8 without C0/C1
+  controls) and
+  the hard record ceiling -- one encoded line is at most 64 KiB INCLUDING
+  the trailing newline; an oversized record is trimmed STRUCTURALLY (never
+  byte-sliced) and flagged. Nothing arbitrary is persisted anywhere: no
+  exception text, no HTTP body bytes, no raw URLs, no credentials, no
+  paths -- the only error vocabulary is the closed (code, scope, count)
+  triple.
+
+## Causal boundary (diff events are run-local)
+
+`selection_changed` / `alive_flipped` are emitted ONLY between two valid
+`/proxies` observations inside the SAME process run with no invalid or
+unavailable gap between them; the first valid sample seeds silently, and
+after a gap the next valid sample re-seeds silently (an edge across a gap
+would be a fabricated causal claim -- the change may have happened at any
+time in between). A missing group/node, a group whose `now` is present but
+unusable, or a node whose `alive` is unknown breaks that subject's chain. A
+`/version` failure breaks the chain exactly like an unavailable `/proxies`
+cycle. Consequence: one-shot `--once` invocations can never prove
+transitions across invocations -- the resident loop is the mode that
+produces edges.
+
+## Cadence, persistence, process discipline
+
+* interval clamped to 30-60s (default 30): >=2 samples inside a ~65s
+  worst-case health-check detection window separates "never switched" from
+  "not yet re-tested" (H5);
+* `--out-dir` is REQUIRED and fail-closed: no symlink component anywhere on
+  the path -- and only ENOENT may count as "absent" there: an EACCES/EIO
+  lstat proves nothing about the route and refuses startup (config_error)
+  instead of silently trusting an unverifiable path; real directory, 0700 (a permission-tightening failure is FATAL
+  on POSIX; Windows relies on NTFS ACLs -- documented limitation, same as
+  the secret file). One advisory `diag.lock` makes a second collector on
+  the same directory refuse to start. `diag.key` (the HMAC key) is created
+  once with `O_CREAT|O_EXCL` (a lost race re-reads the existing key through
+  the same safe loader, never overwrites it), `O_NOFOLLOW` +
+  fstat-verified regular, 0600 enforced fail-closed -- and NO key is ever
+  returned until BOTH its contents (file fsync) and its directory entry
+  (dir fsync) are durably proven, on the create path AND on every later
+  load: a failed first initialization can never be laundered into a
+  trusted key by the next process, so `test_id` stability is proven, not
+  assumed. `diag.jsonl` is opened
+  `O_APPEND|O_NOFOLLOW`, fstat-verified regular, fchmod'ed 0600 (failure
+  fatal on POSIX), appended with one write-until-complete loop per cycle
+  batch, `fsync` per cycle; on startup the current file is VALIDATED
+  before it is MEASURED: the repair opens `O_RDWR|O_NOFOLLOW` first (a
+  FIFO can never block it), a clean `FileNotFoundError` is the ONLY benign
+  outcome, and the fd is fstat-proved a regular file BEFORE any zero-size
+  short circuit -- a pre-existing zero-byte symlink or special file is
+  refused at startup as `storage_error`. Where the OS offers no
+  `O_NOFOLLOW` at all (Windows CRT -- review W1) a NON-FOLLOWING lstat
+  runs before EVERY open of `diag.jsonl`, `diag.key` and `diag.lock`:
+  symlink, non-regular or unverifiable targets are refused before the
+  open could follow them, and ENOENT still permits creating a fresh
+  regular file; where `O_NOFOLLOW` exists the atomic open remains the
+  sole defence and behaviour is unchanged. Only then is AT MOST ONE incomplete trailing
+  fragment truncated back to the last newline (file fsynced) so the
+  evidence file is valid JSONL again -- more than one lost fragment fails
+  closed instead of destroying evidence;
+* size-shift rotation (`diag.jsonl` -> `.1` -> ... -> `.N-1`) above
+  `--max-mb` (default 4) keeping `--files` (default 4, budget
+  `max-mb * files <= 32 MiB`): file fsync before the rename, directory
+  fsync after it. Age retention rides EVERY cycle and `--prune-now`:
+  rotated files older than 7 days drop oldest-first, and the same pass
+  enforces the chain-count and 32 MiB total ceilings (the current
+  `diag.jsonl` itself is under size-cap control, never pruned here).
+  Retention is fail-closed: only a FileNotFoundError race is skipped --
+  any other stat/getsize fault is a `storage_error` stop, and numeric
+  chain members are checked with a NON-FOLLOWING lstat that requires a
+  regular file (a symlinked or special-file member is never followed or
+  ignored).
+  `--prune-now` rotates, prunes, prints `{"rotated", "pruned", "path"}`
+  and exits without sampling.
+
+## Exit codes -- failures are visible, but never gate the proxy
+
+`--once` (systemd-timer shape, default): `0` ok, `2` config (non-loopback
+URL, missing/invalid `--group` or `--node`, missing `--out-dir`, bad
+rotation args, bad secret file -- argparse refusals included), `3` any
+endpoint failed, `4` storage failed, `5` both.
+Every config/storage refusal writes EXACTLY one fixed category token to
+stderr -- `config_error` or `storage_error`, never a local path (detail
+lives only inside the exception for tests).
+`--resident`: API failures are RECORDS not exits (evidence must keep being
+collected while the controller misbehaves); a storage failure exits `4`
+immediately so the supervisor notices; SIGTERM exits `0`. Nothing here
+restarts, gates or mutates Mihomo.
+
+```bash
+# example: two caller-named groups + one explicit node, one cycle per tick
+python3 monitor-v2/mihomo/diag.py --url http://127.0.0.1:9090 \
+    --group 节点选择 --group 自动选择 --node 直连兜底 \
+    --out-dir /var/lib/mihomo-diag --once
+```
+
+Tests: `tests/test-monitor-v2-e4diag.sh` (457 assertions, fail-closed gate:
+static mutation-free greps plus residue greps, the strict four-type proof,
+delay-0 raw preservation, leak wall, B4 storage primitives via fault
+injection (torn-tail truncation, age/budget/overflow prune + fail-closed
+retention metadata, category-only
+stderr), encode bounds, explicit-node protection + per-test-url 8-entry
+tails, strict-UTF-8 names, HMAC-key durability re-proof,
+B6 ledger semantics, exit-code matrix). The E4
+suite (161) and E1 (232) must stay green -- `diag.py` lives under `mihomo/`
+and is covered by the same static greps.

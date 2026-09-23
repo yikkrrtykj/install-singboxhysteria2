@@ -1,0 +1,43 @@
+{
+  "proxies": {
+    "G-HOSTILE": {
+      "type": "Selector",
+      "now": "ok-node",
+      "all": [
+        "ok-node",
+        "ok-node",
+        "bad\u0001ctrl",
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "  ok-node  ",
+        "good-node"
+      ]
+    },
+    "ok-node": {
+      "type": "Direct",
+      "alive": true,
+      "history": [
+        {
+          "time": "2026-09-22T12:00:00Z",
+          "delay": -5
+        },
+        {
+          "time": "2026-09-22T12:00:10Z",
+          "delay": 99999999
+        },
+        {
+          "time": "2026-09-22T12:00:20Z",
+          "delay": 44.5
+        },
+        {
+          "time": "2026-09-22T12:02:00Z",
+          "delay": 44
+        }
+      ]
+    },
+    "good-node": {
+      "type": "Direct",
+      "alive": "true",
+      "history": "not-a-list"
+    }
+  }
+}
