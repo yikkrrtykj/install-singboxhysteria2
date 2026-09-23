@@ -78,10 +78,13 @@ PERSISTENCE (review B4): --out-dir is REQUIRED and fail-closed (no symlink
 component anywhere on the path, real directory, 0700 -- a permission-
 tightening failure is fatal on POSIX). diag.jsonl is opened O_NOFOLLOW,
 fstat-verified regular, fchmod 0600 (failure fatal), appended with one
-write-until-complete loop per batch, fsynced per cycle; a pre-existing
-torn trailing fragment is frame-protected, not destroyed. Rotation is a
-numeric size shift (diag.jsonl.1 .. .{N-1}) with file fsync before the
-rename and directory fsync after it. One diag.lock (advisory exclusive,
+write-until-complete loop per batch, fsynced per cycle; on startup at most
+one incomplete trailing fragment is truncated back to the last newline
+(fsynced, per frozen design section 8). Rotation is a numeric size shift
+(diag.jsonl.1 .. .{N-1}) with file fsync before the rename and directory
+fsync after it; the same prune pass (every cycle and --prune-now) enforces
+7-day age retention oldest-first plus the 32 MiB total and chain-count
+ceilings. One diag.lock (advisory exclusive,
 non-blocking) makes a second collector on the same directory refuse to
 start. A collection or storage failure is VISIBLE: collector records plus
 a non-zero once-mode result (3 api / 4 storage / 5 both) -- never a silent
@@ -138,6 +141,7 @@ TEST_ID_HEX = 16
 
 # Cardinality bounds (reviewed design section 2 -- fail-closed everywhere).
 MAX_GROUPS = 8             # caller-named groups per collector
+MAX_NODES = 32             # caller-named explicit nodes per collector (B5)
 OBS_CAP = 64               # distinct observed nodes per sample
 MAX_MEMBERS = 32           # stored members per group (rest counted+flagged)
 NAME_MAX_BYTES = 128       # group/node names and version strings, UTF-8
@@ -155,6 +159,7 @@ MIN_FILES = 2
 MAX_FILES = 32             # reviewed retention ceiling
 MAX_FILE_MB = 8            # per-file rotation cap
 TOTAL_MB_BUDGET = 32       # whole evidence chain hard budget
+RETENTION_SECONDS = 7 * 24 * 3600   # frozen design section 8: 7-day age prune
 
 # Collector failure codes (closed enum, design section 6D) with their fixed
 # scopes. A cycle's whole code set is computed before any record is folded
@@ -238,15 +243,18 @@ def parse_ts(value):
 
 
 def safe_name(value):
-    """Validate one display name against the reviewed bound.
+    """Validate one display name against the reviewed bound -- EXACTLY.
 
-    Non-empty, <=128 UTF-8 bytes, no C0/C1 control characters. Returns the
-    name or None -- an invalid name is DROPPED AND COUNTED upstream, never
-    truncated into something that looks real, never serialized raw.
+    Non-empty, <=128 UTF-8 bytes, no C0/C1 control characters. The validated
+    string is returned UNCHANGED: a name is a display identity, so legal
+    characters (including U+0020 space) are never stripped or otherwise
+    normalized into a different name (review B5 residual). An invalid name
+    returns None -- dropped AND counted upstream, never truncated into
+    something that looks real, never serialized raw.
     """
     if not isinstance(value, str):
         return None
-    name = value.strip()
+    name = value
     if not name or len(name.encode("utf-8", "replace")) > NAME_MAX_BYTES:
         return None
     for ch in name:
@@ -314,20 +322,22 @@ def parse_history(raw, keep=HIST_KEEP):
     return entries, dropped, soft
 
 
-def parse_proxies_summary(payload, group_names, hmac_key=None):
+def parse_proxies_summary(payload, group_names, hmac_key=None,
+                          explicit_nodes=None):
     """/proxies -> closed per-cycle summary for the CALLER-NAMED groups only.
 
     Reads ONLY the design section 4 whitelist: per named group
     name/type/now/members/alive (alive only when boolean); per observed
     node name/type/alive/history (delay 0 preserved RAW)/extra per-test-url
     histories (newer builds only) projected to HMAC test_id. The observed
-    set is the union of named-group members plus their current selections;
-    nodes outside it are never even looked up. Raw test-URL keys are NEVER
-    persisted (review B1); names, members and histories are bounded with
-    explicit counters (review B5). Everything else in the payload is
-    dropped in-reader and never serialized. This dict is INTERNAL to the
-    collector -- the sample record copies its closed fields, it never
-    serializes the summary itself.
+    set is the union of caller-named explicit nodes (review B5: observable
+    even outside any group's expansion), named-group members and their
+    current selections; nodes outside it are never even looked up. Raw
+    test-URL keys are NEVER persisted (review B1); names, members and
+    histories are bounded with explicit counters (review B5). Everything
+    else in the payload is dropped in-reader and never serialized. This dict
+    is INTERNAL to the collector -- the sample record copies its closed
+    fields, it never serializes the summary itself.
     """
     out = {"groups": [], "watched": [], "nodes": [], "missing_groups": [],
            "missing_nodes": [], "broken_groups": [], "invalid_fields": 0,
@@ -337,6 +347,12 @@ def parse_proxies_summary(payload, group_names, hmac_key=None):
         return out
     proxies = payload["proxies"]
     watched = []
+    for node_name in explicit_nodes or []:
+        checked = safe_name(node_name)
+        if checked is None:
+            invalid += 1
+        elif checked not in watched:
+            watched.append(checked)
     for name in group_names:
         entry = proxies.get(name)
         if not isinstance(entry, dict):
@@ -420,7 +436,7 @@ def parse_proxies_summary(payload, group_names, hmac_key=None):
                     invalid += 1
                     continue
                 entry_hist, e_dropped, e_soft = parse_history(
-                    detail.get("history"), keep=1)
+                    detail.get("history"))          # tail 8 PER test URL (B5)
                 invalid += e_dropped + e_soft
                 # the raw URL exists only on this line -- HMAC id is persisted
                 urls.append({"test_id": test_identify(hmac_key, test_url),
@@ -797,8 +813,9 @@ class DiagWriter:
 
     O_APPEND + one write-until-complete loop per batch keeps every record
     line intact at the byte level (worst case after a crash: one torn final
-    line -- the next process frame-protects it with a leading newline
-    instead of destroying evidence). The opened fd is fstat-verified a
+    line -- the next process truncates that fragment back to the last
+    newline before appending, so the file stays valid JSONL). The opened fd
+    is fstat-verified a
     regular file and fchmod-secured to 0600; a permission-tightening
     failure is FATAL on POSIX. fsync happens once per cycle batch:
     durability of a forensic cycle as a unit; rotation additionally fsyncs
@@ -826,32 +843,64 @@ class DiagWriter:
         self.exists_fn = os.path.exists
         self.getsize_fn = os.path.getsize
         self.fsync_dir_fn = _fsync_dir
-        self._torn_pending = self._detect_torn_tail()
+        self.clock_fn = time.time
+        self.listdir_fn = os.listdir
+        self.stat_fn = os.stat
+        self.remove_fn = os.remove
+        self.ftruncate_fn = os.ftruncate
+        self.lseek_fn = os.lseek
+        self.read_fn = os.read
+        # frozen design section 8: on startup truncate AT MOST one
+        # incomplete trailing fragment back to the last newline, then
+        # continue collection. Torn bytes are never frame-protected into
+        # a permanently invalid JSONL line (review B4 residual).
+        self._torn_bytes = self._repair_torn_tail()
 
-    def _detect_torn_tail(self):
-        """A pre-existing file not ending in a newline gets frame-protected."""
+    def _repair_torn_tail(self):
+        """Drop only the incomplete trailing fragment; return bytes removed.
+
+        A well-formed line (trailing newline INCLUDED) never exceeds
+        RECORD_MAX_BYTES, so if any complete line exists its final newline
+        lies inside the last RECORD_MAX_BYTES window. No newline at all in a
+        bigger-than-one-record file means MORE than one fragment would be
+        lost -- outside the reviewed recovery contract, so fail closed.
+        """
         try:
             size = self.getsize_fn(self.path)
         except OSError:
-            return False
+            return 0
         if size == 0:
-            return False
+            return 0
+        fd = None
         try:
-            fd = self.open_fn(self.path, os.O_RDONLY | _O_BINARY
-                          | getattr(os, "O_NOFOLLOW", 0))
-        except OSError as exc:
-            raise StorageError("cannot inspect %s (%s)"
-                               % (self.path, type(exc).__name__)) from None
-        try:
+            fd = self.open_fn(self.path, os.O_RDWR | _O_BINARY
+                              | getattr(os, "O_NOFOLLOW", 0))
             if not stat_module.S_ISREG(self.fstat_fn(fd).st_mode):
-                raise StorageError("evidence target is not a regular file: %s" % self.path)
-            self.close_fn(fd)
-            fd = None
-            with open(self.path, "rb") as handle:
-                handle.seek(-1, os.SEEK_END)
-                return handle.read(1) != b"\n"
+                raise StorageError("evidence target is not a regular file: %s"
+                                   % self.path)
+            window = min(size, RECORD_MAX_BYTES)
+            self.lseek_fn(fd, size - window, os.SEEK_SET)
+            chunks = []
+            got = 0
+            while got < window:          # os.read may short-read; loop to EOF
+                chunk = self.read_fn(fd, window - got)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                got += len(chunk)
+            tail = b"".join(chunks)
+            cut = tail.rfind(b"\n")
+            if cut < 0 and size > RECORD_MAX_BYTES:
+                raise StorageError("evidence tail unrecoverable beyond one "
+                                   "fragment: %s" % self.path)
+            keep = size - window + cut + 1 if cut >= 0 else 0
+            removed = size - keep
+            if removed:
+                self.ftruncate_fn(fd, keep)
+                self.fsync_fn(fd)   # only file metadata changed; no dir fsync
+            return removed
         except OSError as exc:
-            raise StorageError("cannot inspect %s (%s)"
+            raise StorageError("cannot repair torn tail of %s (%s)"
                                % (self.path, type(exc).__name__)) from None
         finally:
             if fd is not None:
@@ -861,8 +910,6 @@ class DiagWriter:
         if not records:
             return
         blob = b"".join(encode_record(r) for r in records)
-        if self._torn_pending:
-            blob = b"\n" + blob        # keep pre-existing garbage on its own line
         flags = (os.O_WRONLY | os.O_CREAT | os.O_APPEND | _O_BINARY
                  | getattr(os, "O_NOFOLLOW", 0))
         try:
@@ -885,7 +932,6 @@ class DiagWriter:
                                        % (self.path, type(exc).__name__)) from None
             _write_all(fd, blob, write_fn=self.write_fn)
             self.fsync_fn(fd)
-            self._torn_pending = False
         except OSError as exc:
             raise StorageError("cannot write %s (%s)"
                                % (self.path, type(exc).__name__)) from exc
@@ -927,6 +973,63 @@ class DiagWriter:
             raise StorageError("rotation failed under %s (%s)"
                                % (self.out_dir, type(exc).__name__)) from None
         self.fsync_dir_fn(self.out_dir)
+
+    def prune(self, now=None):
+        """Age retention (frozen design section 8, review B4 residual).
+
+        Rotated files older than RETENTION_SECONDS are removed OLDEST-FIRST;
+        the 32 MiB total budget and the <=32-file chain bound are enforced by
+        the same pass (overflow indexes and over-budget tails drop oldest
+        first). The current diag.jsonl is never touched here -- it is under
+        size-cap rotation control. Returns the number of files removed.
+        All OS surfaces are injectable for deterministic tests.
+        """
+        if now is None:
+            now = self.clock_fn()
+        try:
+            names = self.listdir_fn(self.out_dir)
+        except OSError as exc:
+            raise StorageError("cannot list evidence dir (%s)"
+                               % type(exc).__name__) from None
+        prefix = DIAG_FILENAME + "."
+        rotated = []
+        total = 0
+        for name in names:
+            if not name.startswith(prefix):
+                continue
+            suffix = name[len(prefix):]
+            if not suffix.isdigit():
+                continue
+            path = os.path.join(self.out_dir, name)
+            try:
+                st = self.stat_fn(path)
+            except OSError:
+                continue          # vanished mid-scan: nothing left to prune
+            rotated.append((st.st_mtime, int(suffix), path, st.st_size))
+            total += st.st_size
+        try:
+            total += self.getsize_fn(self.path)
+        except OSError:
+            pass                  # current file absent: nothing to budget
+        rotated.sort()            # oldest mtime first, index as tie-break
+        budget_bytes = TOTAL_MB_BUDGET * 1024 * 1024
+        removed = 0
+        for mtime, index, path, size in rotated:
+            # A break would be wrong: chain indexes are not mtime-ordered,
+            # so an overflow-index (or over-budget) victim can sit behind a
+            # file the age rule keeps. The scan is bounded by MAX_FILES.
+            if not (now - mtime > RETENTION_SECONDS
+                    or index >= self.files
+                    or total > budget_bytes):
+                continue
+            try:
+                self.remove_fn(path)
+            except OSError as exc:
+                raise StorageError("cannot prune evidence file (%s)"
+                                   % type(exc).__name__) from None
+            total -= size
+            removed += 1
+        return removed
 
 
 def encode_record(record):
@@ -1022,10 +1125,11 @@ class DiagCollector:
     """
 
     def __init__(self, url, groups, secret=None, timeout=DEFAULT_TIMEOUT,
-                 transport=None, clock=time.time, hmac_key=None):
+                 transport=None, clock=time.time, hmac_key=None, nodes=None):
         self.url = url
         self.host, self.port, self.scheme = parse_controller_url(url)
         self.groups = list(groups or [])
+        self.nodes = list(nodes or [])   # caller-named explicit nodes (B5)
         self.secret = secret or ""
         self.timeout = clamp_timeout(timeout)
         self.hmac_key = hmac_key
@@ -1110,7 +1214,8 @@ class DiagCollector:
             payload, status = self._get("/proxies")
             if status == "ok":
                 proxies_summary = parse_proxies_summary(payload, self.groups,
-                                                        hmac_key=self.hmac_key)
+                                                        hmac_key=self.hmac_key,
+                                                        explicit_nodes=self.nodes)
                 if not proxies_summary["usable"]:
                     proxies_summary = None
                     status = "invalid"
@@ -1212,6 +1317,28 @@ def validate_cli_groups(groups):
     return list(groups)
 
 
+def validate_cli_nodes(nodes):
+    """Caller-named explicit nodes: 0..32, exact bounded names, first-seen dedup.
+
+    Explicit nodes are optional -- groups stay REQUIRED (a zero-group run
+    has no selection topology to forensic). A named node outside every
+    group's member expansion is still observed (review B5 residual); a
+    repeated --node collapses deterministically to its first occurrence.
+    """
+    if len(nodes) > MAX_NODES:
+        raise ConfigurationError(
+            "too many --node values (%s), maximum is %s" % (len(nodes), MAX_NODES))
+    out = []
+    for name in nodes:
+        if safe_name(name) != name:
+            raise ConfigurationError(
+                "invalid --node name (empty, over %s bytes, or control characters)"
+                % NAME_MAX_BYTES)
+        if name not in out:
+            out.append(name)
+    return out
+
+
 def validate_rotation_args(max_mb, files):
     """Rotation arguments stay inside the reviewed budget (never silent)."""
     try:
@@ -1230,8 +1357,18 @@ def validate_rotation_args(max_mb, files):
     return max_mb, files
 
 
+class _CategoryArgParser(argparse.ArgumentParser):
+    """argparse's default error() prints usage and the offending value to
+    stderr; the frozen contract (design section 9) allows only the fixed
+    category line, so parse-time refusals route through it as well."""
+
+    def error(self, message):
+        print("config_error", file=sys.stderr)
+        raise SystemExit(EXIT_CONFIG)
+
+
 def build_arg_parser():
-    parser = argparse.ArgumentParser(
+    parser = _CategoryArgParser(
         description="Monitor v2 E4-Diag read-only Mihomo failover forensics "
                     "(local JSONL evidence, display-only names, GET-only)")
     parser.add_argument("--url", default=DEFAULT_URL,
@@ -1241,6 +1378,11 @@ def build_arg_parser():
                         help="proxy group to observe; REQUIRED, repeatable "
                              "(1..%s); caller-named, topology-free (no group "
                              "names are ever hard-coded)" % MAX_GROUPS)
+    parser.add_argument("--node", action="append", default=[],
+                        help="explicit node to observe in addition to group "
+                             "expansion; optional, repeatable (0..%s), "
+                             "de-duplicated; final observed set stays capped "
+                             "at %s" % (MAX_NODES, OBS_CAP))
     parser.add_argument("--out-dir", required=True,
                         help="evidence directory (no symlink component, "
                              "real dir, 0700 fail-closed); REQUIRED")
@@ -1278,29 +1420,34 @@ def main(argv=None, transport=None, clock=time.time):
     interval = clamp_interval(args.interval)
     try:
         groups = validate_cli_groups(args.group)
+        nodes = validate_cli_nodes(args.node)
         max_mb, files = validate_rotation_args(args.max_mb, args.files)
         secret = resolve_secret(args.secret_file)
         collector = DiagCollector(args.url, groups, secret=secret,
                                   timeout=args.timeout, transport=transport,
-                                  clock=clock)
+                                  clock=clock, nodes=nodes)
         out_dir = ensure_out_dir(args.out_dir)
         lock_fd = acquire_instance_lock(out_dir)   # noqa: F841 -- held for process life
         collector.hmac_key = load_or_create_hmac_key(out_dir)
         writer = DiagWriter(out_dir, max_mb=max_mb, files=files)
-    except (ConfigurationError, SecretFileError) as exc:
-        print("fatal configuration error: %s" % exc, file=sys.stderr)
+    except (ConfigurationError, SecretFileError):
+        # category-only stderr (frozen design section 9): paths, types and
+        # messages stay inside the exception -- production never prints them
+        print("config_error", file=sys.stderr)
         return EXIT_CONFIG
-    except StorageError as exc:
-        print("storage error: %s" % exc, file=sys.stderr)
+    except StorageError:
+        print("storage_error", file=sys.stderr)
         return EXIT_STORAGE
 
     if args.prune_now:
         try:
             writer.rotate()
-        except StorageError as exc:
-            print("storage error: %s" % exc, file=sys.stderr)
+            removed = writer.prune()
+        except StorageError:
+            print("storage_error", file=sys.stderr)
             return EXIT_STORAGE
-        print(json.dumps({"rotated": True, "path": writer.path}))
+        print(json.dumps({"rotated": True, "pruned": removed,
+                          "path": writer.path}))
         return EXIT_OK
 
     state = new_state()           # review B2: every process starts causally clean
@@ -1311,9 +1458,12 @@ def main(argv=None, transport=None, clock=time.time):
         records, flags = collector.collect_cycle(state)
         try:
             writer.write(records)
-        except StorageError as exc:
+            # age retention rides every cycle: a months-long resident run
+            # and a systemd-timer --once burst both prune oldest-first
+            writer.prune()
+        except StorageError:
             # the failure itself must be visible, never a silent exit 0
-            print("storage error: %s" % exc, file=sys.stderr)
+            print("storage_error", file=sys.stderr)
             storage_failed = True
         return flags
 

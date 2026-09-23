@@ -14,7 +14,11 @@
 # collector accounting (B6), delay==0 preservation with strict-integer
 # rejection of floats (the E4-H1 fix), the leak wall (ids/IPs/hosts/rules/
 # secrets/exception text/HTTP bodies never leave the parser), GET-only
-# behavior and the once-mode exit-code matrix (0/2/3/4/5).
+# behavior and the once-mode exit-code matrix (0/2/3/4/5). Review round-2
+# residuals add: torn-tail TRUNCATION + 7-day age retention + 32 MiB budget
+# prune with category-only stderr (B4), repeatable --node with a byte-exact
+# non-normalizing display identity and per-test-url 8-entry history tails
+# (B5).
 #
 # Deterministic on git-bash AND Linux: OS-divergent code paths are exercised
 # through explicit platform flags and injectable attributes, so the
@@ -33,7 +37,7 @@ PASS=0
 FAIL=0
 # The gate at the bottom of this file fails unless exactly this many
 # assertions ran AND passed, so unreachable sections can never fake success.
-EXPECTED_PASS=343
+EXPECTED_PASS=392
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
@@ -193,6 +197,16 @@ if grep -qF 'MAX_GROUPS = 8' "$DIAG" && grep -qF 'OBS_CAP = 64' "$DIAG" && grep 
 else
     fail "cardinality bound constants missing"
 fi
+if grep -qF 'MAX_NODES = 32' "$DIAG"; then
+    pass "explicit --node ceiling constant 32"
+else
+    fail "MAX_NODES missing"
+fi
+if grep -qF '"--node"' "$DIAG"; then
+    pass "repeatable --node wired into the argument parser"
+else
+    fail "--node flag missing from the parser"
+fi
 if grep -qF 'NAME_MAX_BYTES = 128' "$DIAG" && grep -qF 'HIST_KEEP = 8' "$DIAG" && grep -qF 'NODE_URL_KEEP = 8' "$DIAG"; then
     pass "name/history/test-url caps present"
 else
@@ -209,6 +223,21 @@ if grep -qF 'MIN_FILES = 2' "$DIAG" && grep -qF 'MAX_FILES = 32' "$DIAG" \
     pass "rotation argument bounds 2..32 files / <=8 MiB / <=32 MiB budget"
 else
     fail "rotation argument bounds missing"
+fi
+if grep -qF 'RETENTION_SECONDS = 7 * 24 * 3600' "$DIAG"; then
+    pass "7-day age retention constant present"
+else
+    fail "RETENTION_SECONDS missing"
+fi
+if grep -qF 'writer.prune()' "$DIAG" && grep -qF 'removed = writer.prune()' "$DIAG"; then
+    pass "age retention rides every cycle AND the prune-now path"
+else
+    fail "prune() is not wired into both the cycle and prune-now"
+fi
+if sed -n '/def safe_name/,/^def /p' "$DIAG" | grep -q '\.strip('; then
+    fail "safe_name normalizes names (must stay an exact display identity)"
+else
+    pass "safe_name body carries no strip/normalization surface"
 fi
 if grep -qF 'EXIT_CONFIG = 2' "$DIAG" && grep -qF 'EXIT_API = 3' "$DIAG" \
    && grep -qF 'EXIT_STORAGE = 4' "$DIAG" && grep -qF 'EXIT_BOTH = 5' "$DIAG"; then
@@ -242,7 +271,8 @@ for bad in '"k":' '"t": "run"' '"obs":' '"conns":' '"hist":' '"urls":' '"stale":
            '"detail":' '"g":' '"c":' '"n":' '"d":' '"u":' '"e":' \
            run_id COLLECTOR_VER collector_ver ERR_CLASSES err_kinds \
            api_unreachable api_malformed rotation_failed history_truncated \
-           interval_s url_host url_port '"config"' sel_ts; do
+           interval_s url_host url_port '"config"' sel_ts \
+           _torn_pending 'keep=1' 'frame-protects'; do
     if grep -qF -- "$bad" "$DIAG"; then
         fail "residue of the old schema remains: $bad"
     else
@@ -314,8 +344,12 @@ try: diag.validate_cli_groups(["G%d" % i for i in range(9)]); res["many"] = "ACC
 except diag.ConfigurationError: res["many"] = "rejected"
 try: diag.validate_cli_groups(["bad\x01ctrl"]); res["ctrl"] = "ACCEPTED"
 except diag.ConfigurationError: res["ctrl"] = "rejected"
-try: diag.validate_cli_groups(["  padded  "]); res["pad"] = "ACCEPTED"
+try: res["pad"] = diag.validate_cli_groups(["  padded  "])
 except diag.ConfigurationError: res["pad"] = "rejected"
+try: diag.validate_cli_groups([""]); res["empty_name"] = "ACCEPTED"
+except diag.ConfigurationError: res["empty_name"] = "rejected"
+try: res["ws_name"] = diag.validate_cli_groups(["   "])
+except diag.ConfigurationError: res["ws_name"] = "rejected"
 try: diag.validate_cli_groups(["x" * 129]); res["long"] = "ACCEPTED"
 except diag.ConfigurationError: res["long"] = "rejected"
 res["ok"] = diag.validate_cli_groups(["节点选择", "自动选择"])
@@ -324,9 +358,33 @@ print(json.dumps(res))
 assert_eq "$(field "$out" 'obj["empty"]')" "required" "zero --group is a misconfiguration refused at the CLI"
 assert_eq "$(field "$out" 'obj["many"]')" "rejected" "more than 8 --group values rejected"
 assert_eq "$(field "$out" 'obj["ctrl"]')" "rejected" "control characters in --group rejected"
-assert_eq "$(field "$out" 'obj["pad"]')" "rejected" "padded --group refused (names stored verbatim, not silently trimmed)"
+assert_eq "$(field "$out" 'obj["pad"]')" "['  padded  ']" "padded --group accepted and stored VERBATIM (exact display identity, never trimmed)"
+assert_eq "$(field "$out" 'obj["empty_name"]')" "rejected" "the empty group name is refused"
+assert_eq "$(field "$out" 'obj["ws_name"]')" "['   ']" "all-whitespace is a legal display name kept byte-exact"
 assert_eq "$(field "$out" 'obj["long"]')" "rejected" "over-128-byte --group refused"
 assert_eq "$(field "$out" 'obj["ok"]')" "['节点选择', '自动选择']" "valid caller-named groups pass through verbatim"
+
+section "validate_cli_nodes: repeatable explicit nodes (B5 residual)"
+out="$(mihomo_py '
+import json, diag
+res = {}
+res["empty"] = diag.validate_cli_nodes([])
+try: diag.validate_cli_nodes(["N%d" % i for i in range(33)]); res["many"] = "ACCEPTED"
+except diag.ConfigurationError: res["many"] = "rejected"
+try: diag.validate_cli_nodes(["  pad  ", "x", "  pad  "]); res["dedup"] = "ACCEPTED"
+except diag.ConfigurationError: res["dedup"] = "rejected"
+res["exact"] = diag.validate_cli_nodes(["  pad  ", "x", "  pad  ", "b"])
+try: diag.validate_cli_nodes(["bad\x01ctrl"]); res["ctrl"] = "ACCEPTED"
+except diag.ConfigurationError: res["ctrl"] = "rejected"
+try: diag.validate_cli_nodes([""]); res["empty_name"] = "ACCEPTED"
+except diag.ConfigurationError: res["empty_name"] = "rejected"
+print(json.dumps(res))
+')"
+assert_eq "$(field "$out" 'obj["empty"]')" "[]" "explicit nodes are optional: zero --node is legal"
+assert_eq "$(field "$out" 'obj["many"]')" "rejected" "more than 32 explicit --node values rejected at the CLI"
+assert_eq "$(field "$out" 'obj["exact"]')" "['  pad  ', 'x', 'b']" "first-seen order, exact duplicates collapsed, padded names byte-exact"
+assert_eq "$(field "$out" 'obj["ctrl"]')" "rejected" "control characters in --node rejected"
+assert_eq "$(field "$out" 'obj["empty_name"]')" "rejected" "the empty node name is refused"
 
 section "timestamps: Z-form normalization everywhere"
 out="$(mihomo_py '
@@ -411,7 +469,8 @@ print(json.dumps({
     "nonstr": diag.safe_name(42),
     "none": diag.safe_name(None),
     "pad": diag.safe_name("  ok-node  "),
-    "blank": diag.safe_name("   "),
+    "blank": diag.safe_name(""),
+    "ws": diag.safe_name("   "),
     "ctrl": diag.safe_name("bad\x01ctrl"),
     "c1": diag.safe_name("bad\x85ctrl"),
     "long": diag.safe_name("x" * 130),
@@ -421,8 +480,9 @@ print(json.dumps({
 ')"
 assert_eq "$(field "$out" 'obj["nonstr"]')" "None" "non-string name dropped upstream"
 assert_eq "$(field "$out" 'obj["none"]')" "None" "None name dropped"
-assert_eq "$(field "$out" 'obj["pad"]')" "ok-node" "surrounding whitespace trimmed"
-assert_eq "$(field "$out" 'obj["blank"]')" "None" "blank name refused"
+assert_eq "$(field "$out" 'obj["pad"]')" "  ok-node  " "padded name kept BYTE-EXACT: display identity is never normalized (B5 residual)"
+assert_eq "$(field "$out" 'obj["blank"]')" "None" "the empty name is refused"
+assert_eq "$(field "$out" 'obj["ws"]')" "   " "all-space is legal content (U+0020), preserved as its own distinct name"
 assert_eq "$(field "$out" 'obj["ctrl"]')" "None" "C0 control characters refuse the name"
 assert_eq "$(field "$out" 'obj["c1"]')" "None" "C1 control characters refuse the name"
 assert_eq "$(field "$out" 'obj["long"]')" "None" "over-128-byte name refused, never truncated into a fake"
@@ -529,14 +589,18 @@ print(json.dumps({
     \"now\": gres[\"G-HOSTILE\"][\"now\"],
     \"invalid\": s[\"invalid_fields\"],
     \"watched\": s[\"watched\"],
+    \"missing\": s[\"missing_nodes\"],
+    \"pad_rec\": [n for n in s[\"nodes\"] if n[\"name\"] == \"  ok-node  \"],
     \"ok_hist\": [(e[\"delay_ms\"], e[\"ts\"]) for e in nres[\"ok-node\"][\"history\"]],
     \"good_alive\": nres[\"good-node\"][\"alive\"],
     \"good_hist\": nres[\"good-node\"][\"history\"]}))
 ")"
-assert_eq "$(field "$out" 'obj["members"]')" "['good-node', 'ok-node']" "duplicate + control-char + oversized + padded members refused or deduped, never stored raw"
+assert_eq "$(field "$out" 'obj["members"]')" "['  ok-node  ', 'good-node', 'ok-node']" "duplicate + control-char + oversized members refused or deduped; padded member stored byte-exact, never merged with its trimmed lookalike"
 assert_eq "$(field "$out" 'obj["now"]')" "ok-node" "hostile now kept when valid"
 assert_eq "$(field "$out" 'obj["invalid"]')" "6" "every rejected element is COUNTED (ctrl name, long name, 3 bad delays, string alive)"
-assert_eq "$(field "$out" 'obj["watched"]')" "['good-node', 'ok-node']" "invalid candidates never enter the watched set"
+assert_eq "$(field "$out" 'obj["watched"]')" "['  ok-node  ', 'good-node', 'ok-node']" "only invalid candidates stay out of the watched set"
+assert_eq "$(field "$out" 'obj["missing"]')" "['  ok-node  ']" "the padded distinct name is watched-but-absent evidence, not silently merged"
+assert_eq "$(field "$out" 'obj["pad_rec"]')" "[{'name': '  ok-node  ', 'type': None, 'alive': None, 'history': [], 'extra': []}]" "padded name degrades to its own closed null record"
 assert_eq "$(field "$out" 'obj["ok_hist"]')" "[[44, '2026-09-22T12:02:00Z']]" "negative, over-bound and float delays all dropped; the one valid probe survives"
 assert_eq "$(field "$out" 'obj["good_alive"]')" "None" "string alive is unknown"
 assert_eq "$(field "$out" 'obj["good_hist"]')" "[]" "non-list history yields empty list, not a crash"
@@ -584,6 +648,60 @@ print(json.dumps({"broken": s["broken_groups"], "invalid": s["invalid_fields"],
 assert_eq "$(field "$out" 'obj["broken"]')" "['G']" "a present-but-unusable now marks the chain breaker (B2)"
 assert_eq "$(field "$out" 'obj["invalid"]')" "1" "broken now is counted invalid"
 assert_eq "$(field "$out" 'obj["usable"]')" "True" "payload still parseable: per-subject break, not global fail"
+
+section "per-test-url history tail = 8 EACH url, explicit-node union (B5 residual)"
+out="$(mihomo_py '
+import json, diag
+hist = [{"time": "2026-09-22T12:%02d:00Z" % i, "delay": i} for i in range(12)]
+many = {}
+for u in range(9):
+    many["http://u%d.invalid/probe" % u] = {"alive": True, "history": hist}
+payload = {"proxies": {
+    "G": {"type": "Selector", "now": "N", "all": ["N"]},
+    "N": {"type": "SS", "alive": True, "history": hist, "extra": many}}}
+s = diag.parse_proxies_summary(payload, ["G"], hmac_key=bytes([1]) * 32)
+n = s["nodes"][0]
+print(json.dumps({
+    "top_hist": [e["delay_ms"] for e in n["history"]],
+    "extra_n": len(n["extra"]),
+    "each_lens": sorted(len(e["history"]) for e in n["extra"]),
+    "each_first": sorted(e["history"][0]["delay_ms"] for e in n["extra"]),
+    "ids_unique": len({e["test_id"] for e in n["extra"]}),
+    "truncated": s["truncated"]}))
+')"
+assert_eq "$(field "$out" 'obj["top_hist"]')" "[4, 5, 6, 7, 8, 9, 10, 11]" "top-level history keeps the 8 NEWEST entries"
+assert_eq "$(field "$out" 'obj["extra_n"]')" "8" "more than 8 test URLs per node are capped, oldest-id keys sorted first"
+assert_eq "$(field "$out" 'obj["each_lens"]')" "[8, 8, 8, 8, 8, 8, 8, 8]" "EACH persisted test-url view keeps its own 8-entry tail (never keep=1)"
+assert_eq "$(field "$out" 'obj["each_first"]')" "[4, 4, 4, 4, 4, 4, 4, 4]" "every test-url tail keeps the newest 8, per URL"
+assert_eq "$(field "$out" 'obj["ids_unique"]')" "8" "test ids stay distinct per URL"
+assert_eq "$(field "$out" 'obj["truncated"]')" "True" "the URL cap trip is flagged, never silent"
+
+out="$(mihomo_py "$PY_PREAMBLE
+import json, diag
+payload = json.loads(load(\"e4diag-proxies-many-groups.json\"))
+s = diag.parse_proxies_summary(payload, [\"H-GROUP-%d\" % i for i in range(8)],
+                               hmac_key=$KEY,
+                               explicit_nodes=[\"AAA-EXPLICIT\", \"AAA-EXPLICIT\",
+                                               \"bad\\x01node\", \"  pad  \"])
+names = [n[\"name\"] for n in s[\"nodes\"]]
+print(json.dumps({
+    \"watched_len\": len(s[\"watched\"]),
+    \"watched_head\": s[\"watched\"][:3],
+    \"watched_tail\": s[\"watched\"][-1],
+    \"explicit_in_nodes\": \"AAA-EXPLICIT\" in names,
+    \"pad_in_nodes\": \"  pad  \" in names,
+    \"missing_head\": s[\"missing_nodes\"][:2],
+    \"invalid\": s[\"invalid_fields\"],
+    \"truncated\": s[\"truncated\"]}))
+")"
+assert_eq "$(field "$out" 'obj["watched_len"]')" "64" "explicit nodes join the group expansion under the SAME 64-node cap"
+assert_eq "$(field "$out" 'obj["watched_head"]')" "['  pad  ', 'AAA-EXPLICIT', 'n000']" "union sorted deterministically; padded explicit name byte-exact; dedup before cap"
+assert_eq "$(field "$out" 'obj["watched_tail"]')" "n061" "explicit entries displace group tails -- cap accounting is visible, not silent"
+assert_eq "$(field "$out" 'obj["explicit_in_nodes"]')" "True" "an explicit node outside every group is still observed"
+assert_eq "$(field "$out" 'obj["pad_in_nodes"]')" "True" "a padded explicit name is its own watched subject"
+assert_eq "$(field "$out" 'obj["missing_head"]')" "['  pad  ', 'AAA-EXPLICIT']" "absent explicit nodes reported via the node_missing path"
+assert_eq "$(field "$out" 'obj["invalid"]')" "1" "an invalid explicit node is dropped AND counted, never stored raw"
+assert_eq "$(field "$out" 'obj["truncated"]')" "True" "the cap trip still flagged with explicit nodes in play"
 
 section "connections: raw-safe per-node aggregates, zero inference (B3)"
 out="$(mihomo_py "$PY_PREAMBLE
@@ -1027,22 +1145,32 @@ try:
     w4.write([rec]); res["open_fail"] = "ACCEPTED"
 except diag.StorageError as e:
     res["open_fail"] = "rejected" if "ffffffff" not in str(e) else "BAD"
-# (i) torn trailing fragment is frame-protected, not destroyed
+# (i) torn trailing fragment is TRUNCATED back to the last newline (B4 residual)
 d5 = tempfile.mkdtemp()
 with open(os.path.join(d5, "diag.jsonl"), "wb") as f:
     f.write(b"{\"k\":\"samp")
 w5 = diag.DiagWriter(d5)
-res["torn_pending"] = w5._torn_pending
+res["torn_bytes"] = w5._torn_bytes
 w5.write([rec])
-lines5 = open(os.path.join(d5, "diag.jsonl"), "rb").read().splitlines()
-res["torn_framed"] = (len(lines5) == 2 and lines5[0] == b"{\"k\":\"samp"
-                      and json.loads(lines5[1]) == rec)
-w5.write([rec])
-res["torn_once"] = len(open(os.path.join(d5, "diag.jsonl")).readlines()) == 3
-# (j) clean/empty file: no frame prefix injected
+res["torn_truncated"] = open(os.path.join(d5, "diag.jsonl"), "rb").read() \
+    == diag.encode_record(rec)
+d5b = tempfile.mkdtemp()
+with open(os.path.join(d5b, "diag.jsonl"), "wb") as f:
+    f.write(b"{\"v\":1}\nPARTIAL")
+w5b = diag.DiagWriter(d5b)
+res["torn_only_fragment"] = (w5b._torn_bytes == 7 and
+                             open(w5b.path, "rb").read() == b"{\"v\":1}\n")
+d5c = tempfile.mkdtemp()
+with open(os.path.join(d5c, "diag.jsonl"), "wb") as f:
+    f.write(b"x" * (diag.RECORD_MAX_BYTES + 1))
+try:
+    diag.DiagWriter(d5c); res["torn_unrecoverable"] = "ACCEPTED"
+except diag.StorageError as e:
+    res["torn_unrecoverable"] = "rejected" if "unrecoverable" in str(e) else "BAD"
+# (j) clean/empty dir: repair is a byte-free no-op
 d6 = tempfile.mkdtemp()
 w6 = diag.DiagWriter(d6)
-res["virgin_pending"] = w6._torn_pending
+res["virgin_torn"] = w6._torn_bytes
 w6.write([])
 res["empty_noop"] = not os.path.exists(w6.path)
 w6.write([rec])
@@ -1089,10 +1217,11 @@ assert_eq "$(field "$out" 'obj["write_fail"]')" "ctx" "write failure surfaces pa
 assert_eq "$(field "$out" 'obj["fifo"]')" "rejected" "non-regular evidence target (FIFO) refused via fstat verification"
 assert_eq "$(field "$out" 'obj["fchmod_fail"]')" "rejected" "fchmod 0600 failure is FATAL: unprovable privacy refuses the write"
 assert_eq "$(field "$out" 'obj["open_fail"]')" "rejected" "unopenable evidence file -> StorageError without payload"
-assert_eq "$(field "$out" 'obj["torn_pending"]')" "True" "pre-existing torn tail detected at startup"
-assert_eq "$(field "$out" 'obj["torn_framed"]')" "True" "torn fragment frame-protected on its own line, new record valid (evidence not destroyed)"
-assert_eq "$(field "$out" 'obj["torn_once"]')" "True" "frame protection applied exactly once"
-assert_eq "$(field "$out" 'obj["virgin_pending"]')" "False" "no false torn detection on a fresh dir"
+assert_eq "$(field "$out" 'obj["torn_bytes"]')" "10" "startup detects and ACCOUNTS the torn fragment in bytes (frozen design section 8)"
+assert_eq "$(field "$out" 'obj["torn_truncated"]')" "True" "incomplete trailing fragment TRUNCATED away; the file is valid JSONL again"
+assert_eq "$(field "$out" 'obj["torn_only_fragment"]')" "True" "at most ONE fragment drops: the last complete line survives byte-exact"
+assert_eq "$(field "$out" 'obj["torn_unrecoverable"]')" "rejected" "multi-fragment loss (>1 record, no newline) fails closed instead of destroying more evidence"
+assert_eq "$(field "$out" 'obj["virgin_torn"]')" "0" "no false torn detection on a fresh dir"
 assert_eq "$(field "$out" 'obj["empty_noop"]')" "True" "writing no records creates nothing"
 assert_eq "$(field "$out" 'obj["no_frame"]')" "True" "clean append starts straight at JSON"
 assert_eq "$(field "$out" 'obj["rot_1"]')" "True" "size cap rotates diag.jsonl to .1"
@@ -1102,6 +1231,74 @@ assert_eq "$(field "$out" 'obj["dir_fsync"]')" "True" "directory fsync after eve
 assert_eq "$(field "$out" 'obj["fsync_before_rename"]')" "True" "file fsync precedes the first rotation rename"
 assert_eq "$(field "$out" 'obj["main_alive"]')" "True" "fresh main file after rotation"
 assert_eq "$(field "$out" 'obj["virgin_rot"]')" "ok" "rotating a never-written chain is a no-op"
+
+section "B4 prune: 7-day age retention + chain overflow + 32 MiB budget (B4 residual)"
+out="$(mihomo_py '
+import json, os, tempfile, types, diag
+res = {}
+WEEK = diag.RETENTION_SECONDS
+NOW = 1790078400.0
+def scenario(files, entries, current=50, remove_boom=False):
+    """entries: name -> (age_seconds, size). All OS surfaces injected."""
+    d = tempfile.mkdtemp()
+    w = diag.DiagWriter(d, files=files)
+    w.clock_fn = lambda: NOW
+    w.listdir_fn = lambda p: ["diag.jsonl." + k for k in entries] + \
+        ["diag.jsonl", "diag.key", "diag.lock"]
+    w.stat_fn = lambda p: types.SimpleNamespace(
+        st_mtime=NOW - entries[os.path.basename(p)[len("diag.jsonl."):]][0],
+        st_size=entries[os.path.basename(p)[len("diag.jsonl."):]][1])
+    w.getsize_fn = lambda p: current
+    gone = []
+    def fake_remove(path):
+        if remove_boom:
+            raise OSError(13, "Permission denied")
+        gone.append(os.path.basename(path))
+    w.remove_fn = fake_remove
+    removed = w.prune()
+    return gone, removed
+# (a) age only: .2 is 8 days old, .1 fresh -> exactly the stale one drops
+gone, _ = scenario("4", {"1": (60, 100), "2": (WEEK + 3600, 100)})
+res["age"] = gone == ["diag.jsonl.2"]
+# (b) oldest-first with two stale: .3 (10d) before .2 (9d), fresh .1 kept
+gone, n = scenario("4", {"1": (10, 100), "2": (9 * 86400, 100),
+                         "3": (10 * 86400, 100)})
+res["order"] = (gone == ["diag.jsonl.3", "diag.jsonl.2"], n)
+# (c) THE break-flaw regression: overflow index .9 with a FRESH mtime sits
+#     behind kept .1 but must still be removed (no early break)
+gone, _ = scenario("4", {"1": (10, 10), "9": (10, 10)})
+res["overflow_behind_fresh"] = gone == ["diag.jsonl.9"]
+# (d) budget: everything fresh and in-chain, yet 40 MiB > 32 MiB cap ->
+#     oldest (.1) evicted until the total fits; .2 (10 MiB) stays
+gone, _ = scenario("4", {"1": (10, 40 * 1024 * 1024), "2": (10, 10 * 1024 * 1024)})
+res["budget"] = gone == ["diag.jsonl.1"]
+# (e) non-numeric + foreign names are never even stat-ed
+d = tempfile.mkdtemp()
+w = diag.DiagWriter(d, files=4)
+w.clock_fn = lambda: NOW
+w.listdir_fn = lambda p: ["diag.jsonl.bak", "diag.jsonl.", "diag.jsonl.x1",
+                          "diag.jsonl", "not-diag"]
+w.stat_fn = lambda p: (_ for _ in ()).throw(AssertionError("must not stat"))
+w.getsize_fn = lambda p: 0
+res["foreign"] = w.prune()
+# (f) remove failure -> StorageError whose text carries NO path
+w.listdir_fn = lambda p: ["diag.jsonl.1"]
+w.stat_fn = lambda p: types.SimpleNamespace(st_mtime=NOW - WEEK - 1, st_size=5)
+def boom(path): raise OSError(13, "Permission denied")
+w.remove_fn = boom
+try:
+    w.prune(); res["remove_fail"] = "ACCEPTED"
+except diag.StorageError as e:
+    res["remove_fail"] = "rejected" if d not in str(e) else "BAD"
+print(json.dumps(res))
+')"
+assert_eq "$(field "$out" 'obj["age"]')" "True" "rotated files past 7 days are pruned, fresh ones kept"
+assert_eq "$(field "$out" 'obj["order"][0]')" "True" "multiple stale files drop OLDEST-FIRST by mtime"
+assert_eq "$(field "$out" 'obj["order"][1]')" "2" "prune returns the number of files removed"
+assert_eq "$(field "$out" 'obj["overflow_behind_fresh"]')" "True" "chain overflow is removed even behind a fresh kept file (no early break)"
+assert_eq "$(field "$out" 'obj["budget"]')" "True" "over-budget evidence drops the OLDEST rotated file first"
+assert_eq "$(field "$out" 'obj["foreign"]')" "0" "only exact numeric .N chain members are ever considered"
+assert_eq "$(field "$out" 'obj["remove_fail"]')" "rejected" "prune failure raises StorageError without a local path (B4 residual stderr)"
 
 section "B5 record ceiling: final encoded bytes incl. newline, structural trim only"
 out="$(mihomo_py '
@@ -1187,7 +1384,7 @@ assert_eq "$(field "$out" 'obj["sorted"]')" "True" "canonical sorted-keys encodi
 
 section "CLI: exit-code matrix 0/2/3/4/5 and fail-closed configuration"
 out="$(mihomo_py "$PY_PREAMBLE
-import contextlib, io, json, os, subprocess, sys, tempfile, diag
+import contextlib, io, json, os, subprocess, sys, tempfile, time, diag
 res = {}
 base = tempfile.mkdtemp()
 def od(name): return os.path.join(base, name)
@@ -1209,6 +1406,9 @@ def run(argv, routes_=None, fail_=None, write_boom=False, holder=None):
     return rc, o.getvalue(), e.getvalue()
 
 res[\"missing_outdir\"] = run([\"--group\", \"G\"])[0]
+res[\"missing_outdir_err\"] = [run([\"--group\", \"G\"])[2].strip(),
+                              \"/\" not in run([\"--group\", \"G\"])[2]
+                              and chr(92) not in run([\"--group\", \"G\"])[2]]
 res[\"no_group\"] = run([\"--out-dir\", od(\"ng\")])[0]
 grp9 = []
 for i in range(9): grp9 += [\"--group\", \"G%d\" % i]
@@ -1229,6 +1429,15 @@ res[\"summary_codes\"] = summary[\"codes\"]
 lines = [json.loads(x) for x in open(os.path.join(d_ok, \"diag.jsonl\"), encoding=\"utf-8\")]
 res[\"first_sample\"] = [lines[0][\"t\"], lines[0][\"seq\"], lines[0][\"run\"] == summary[\"run\"]]
 res[\"types_ok\"] = all(l[\"t\"] in diag.RECORD_TYPES for l in lines)
+rc, so, se = run([\"--out-dir\", od(\"nodes\"), \"--group\", \"节点选择\",
+                  \"--node\", \"  pad  \", \"--node\", \"ZZZ-NODE\"])
+res[\"node_rc\"] = rc
+node_lines = [json.loads(x) for x in open(os.path.join(od(\"nodes\"), \"diag.jsonl\"), encoding=\"utf-8\")]
+node_sample = [x for x in node_lines if x[\"t\"] == \"sample\"][0]
+node_names = [n[\"name\"] for n in node_sample[\"nodes\"]]
+res[\"node_pad\"] = \"  pad  \" in node_names      # byte-exact explicit name sampled
+res[\"node_ghost\"] = \"ZZZ-NODE\" in node_names   # node outside every group still watched
+res[\"node_codes\"] = json.loads(so)[\"codes\"]
 res[\"artifacts\"] = sorted(f for f in os.listdir(d_ok))
 rc, so, se = run([\"--out-dir\", od(\"ghost\"), \"--group\", \"GHOST\"])
 res[\"ghost_rc\"] = rc
@@ -1239,7 +1448,9 @@ res[\"api_rc\"] = rc
 res[\"api_codes\"] = json.loads(so)[\"codes\"]
 res[\"api_sample\"] = json.loads(
     open(os.path.join(od(\"unreach\"), \"diag.jsonl\")).readline())[\"api_reachable\"]
-res[\"storage_rc\"] = run([\"--out-dir\", od(\"stor\"), \"--group\", \"G\"], write_boom=True)[0]
+rc, so, se = run([\"--out-dir\", od(\"stor\"), \"--group\", \"G\"], write_boom=True)
+res[\"storage_rc\"] = rc
+res[\"storage_err\"] = se
 res[\"both_rc\"] = run([\"--out-dir\", od(\"both\"), \"--group\", \"G\"],
                       fail_={\"/version\": OSError(\"reset\")}, write_boom=True)[0]
 res[\"resident_storage\"] = run([\"--resident\", \"--out-dir\", od(\"res\"), \"--group\", \"G\"],
@@ -1254,6 +1465,9 @@ d_pr = od(\"pr\")
 diag.DiagWriter(diag.ensure_out_dir(d_pr)).write(
     [{\"v\": 1, \"t\": \"collector\", \"ts\": \"x\", \"run\": \"c\" * 32, \"seq\": 1,
       \"code\": \"storage_error\", \"scope\": \"storage\", \"count\": 1}])
+stale = os.path.join(d_pr, \"diag.jsonl.2\")
+open(stale, \"wb\").write(b\"{\\\"v\\\": 1}\\n\")
+os.utime(stale, (time.time() - 8 * 24 * 3600, time.time() - 8 * 24 * 3600))
 env = dict(os.environ); env[\"PYTHONPATH\"] = os.environ[\"MIHOMO_DIR\"]
 r = subprocess.run([sys.executable, \"-c\",
                     \"import sys, diag; sys.exit(diag.main(sys.argv[1:]))\",
@@ -1262,10 +1476,15 @@ r = subprocess.run([sys.executable, \"-c\",
 res[\"prune\"] = r.returncode
 res[\"prune_shape\"] = sorted(json.loads(r.stdout).keys())
 res[\"prune_rotated\"] = json.loads(r.stdout)[\"rotated\"]
+res[\"prune_count\"] = json.loads(r.stdout)[\"pruned\"]
 res[\"pruned\"] = os.path.exists(os.path.join(d_pr, \"diag.jsonl.1\"))
+res[\"prune_age_dropped\"] = (not os.path.exists(stale)
+                             and not os.path.exists(os.path.join(d_pr, \"diag.jsonl.3\")))
+res[\"prune_now_stderr\"] = r.stderr
 print(json.dumps(res))
 ")"
 assert_eq "$(field "$out" 'obj["missing_outdir"]')" "2" "--out-dir is required fail-closed (argparse exit 2)"
+assert_eq "$(field "$out" 'obj["missing_outdir_err"]')" "['config_error', True]" "argparse refusal prints ONLY the fixed category to stderr, no path (B4 residual)"
 assert_eq "$(field "$out" 'obj["no_group"]')" "2" "zero --group refused before any byte leaves"
 assert_eq "$(field "$out" 'obj["nine_groups"]')" "2" "more than 8 groups refused at the CLI"
 assert_eq "$(field "$out" 'obj["bad_mb"]')" "2" "--max-mb above the per-file cap refused"
@@ -1285,14 +1504,22 @@ assert_eq "$(field "$out" 'obj["api_rc"]')" "3" "API unreachable -> visible exit
 assert_eq "$(field "$out" 'obj["api_codes"]')" "['mihomo_unreachable']" "version failure maps to the single closed code"
 assert_eq "$(field "$out" 'obj["api_sample"]')" "False" "the unreachable cycle STILL persisted its sample (run evidence survives /version downtime)"
 assert_eq "$(field "$out" 'obj["storage_rc"]')" "4" "storage failure -> exit 4"
+assert_eq "$(field "$out" 'obj["storage_err"]')" "storage_error" "the storage refusal line is the fixed category, nothing else"
 assert_eq "$(field "$out" 'obj["both_rc"]')" "5" "API + storage both failing -> exit 5"
 assert_eq "$(field "$out" 'obj["resident_storage"]')" "4" "resident mode escalates storage failure instead of looping blind"
 assert_eq "$(field "$out" 'obj["secret_missing"]')" "2" "unusable --secret-file refuses startup (config exit 2)"
 assert_eq "$(field "$out" 'obj["lock_contend"]')" "2" "a second collector on a live evidence dir is refused through main()"
-assert_eq "$(field "$out" 'obj["prune"]')" "0" "prune-now rotates without touching the API"
-assert_eq "$(field "$out" 'obj["prune_shape"]')" "['path', 'rotated']" "prune report is a closed shape"
+assert_eq "$(field "$out" 'obj["prune"]')" "0" "prune-now exits 0 without touching the API"
+assert_eq "$(field "$out" 'obj["prune_shape"]')" "['path', 'pruned', 'rotated']" "prune report is a closed shape incl. the removal count"
 assert_eq "$(field "$out" 'obj["prune_rotated"]')" "True" "prune confirms rotation happened"
+assert_eq "$(field "$out" 'obj["prune_count"]')" "1" "prune-now ACTUALLY runs age retention, not just rotation (B4 residual)"
 assert_eq "$(field "$out" 'obj["pruned"]')" "True" "prune-now shifted the chain"
+assert_eq "$(field "$out" 'obj["prune_age_dropped"]')" "True" "the 8-day-old rotated fragment is gone from the chain"
+assert_eq "$(field "$out" 'obj["prune_now_stderr"]')" "" "a successful prune-now prints nothing on stderr"
+assert_eq "$(field "$out" 'obj["node_rc"]')" "0" "explicit --node values run cleanly through once-mode"
+assert_eq "$(field "$out" 'obj["node_pad"]')" "True" "CLI --node name reaches the sample byte-exact"
+assert_eq "$(field "$out" 'obj["node_ghost"]')" "True" "an explicit node outside the group is sampled as its own subject"
+assert_eq "$(field "$out" 'obj["node_codes"]')" "['node_missing']" "absent explicit nodes close through the existing node_missing code"
 
 section "leak wall end to end (written bytes)"
 out="$(mihomo_py "$PY_PREAMBLE

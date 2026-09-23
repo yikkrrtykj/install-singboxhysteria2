@@ -262,16 +262,23 @@ so it increments and never resets.
   (plus `alive` only when the source value is a real boolean). Group names
   are never guessed or discovered; at least one `--group` is REQUIRED (a
   zero-group collector would record empty evidence forever -- refused).
-* `nodes`: every observed member (union of named-group members and current
-  selections), each `{name, type, alive, history, extra}`: `alive` is a
-  strict bool or `null` ("unknown", never False); `history` entries are
-  `{ts, delay_ms}` newest-last, tail of 8. **`delay == 0` is preserved RAW
+* `nodes`: every observed member (union of named-group members, current
+  selections and repeatable explicit `--node` names -- 0..32, de-duplicated
+  first-seen; the union still closes at 64 observed nodes with the excess
+  flagged `truncated`), each `{name, type, alive, history, extra}`:
+  `alive` is a strict bool or `null` ("unknown", never False); `history`
+  entries are
+  `{ts, delay_ms}` newest-last, tail of 8. Names are an EXACT display
+  identity: legal characters (including spaces) are stored byte-for-byte,
+  never trimmed or normalized; empty/over-128-byte/control names are
+  refused and counted. **`delay == 0` is preserved RAW
   as integer 0** (a FAILED probe, the single most important missing datum,
   E4-H1); a delay must be a true bounded integer -- a float (even `1.0`),
   bool or string is dropped and counted, never coerced; a delay whose
   timestamp does not parse keeps the entry with `ts: null` (soft-invalid,
   counted). `extra` holds per-test-URL histories (H4) where the build
-  exposes them: the RAW URL is never stored -- each is replaced by
+  exposes them -- EACH url keeps its own 8-entry tail: the RAW URL is never
+  stored -- each is replaced by
   `test_id = HMAC-SHA256(local 256-bit key, raw_url)[:16 hex]`, stable
   across samples AND restarts while the URL (which may embed private query
   tokens) never crosses the persistence boundary.
@@ -288,8 +295,9 @@ so it increments and never resets.
   same-run `selection_changed` records. Connection ids, IPs, hosts, rules,
   metadata and traffic totals are structurally never written -- asserted by
   a whole-file leak wall in the test suite.
-* `truncated` / `invalid_fields`: cardinality caps (8 groups, 32 stored
-  members per group, 64 observed nodes, 8 history entries, 8 extra
+* `truncated` / `invalid_fields`: cardinality caps (8 groups, 32 explicit
+  `--node` names, 32 stored members per group, 64 observed nodes, 8 history
+  entries per node AND per test-URL view, 8 extra
   test-ids per node, names 1..128 UTF-8 bytes without C0/C1 controls) and
   the hard record ceiling -- one encoded line is at most 64 KiB INCLUDING
   the trailing newline; an oversized record is trimmed STRUCTURALLY (never
@@ -327,33 +335,46 @@ produces edges.
   fstat-verified regular, 0600 enforced fail-closed. `diag.jsonl` is opened
   `O_APPEND|O_NOFOLLOW`, fstat-verified regular, fchmod'ed 0600 (failure
   fatal on POSIX), appended with one write-until-complete loop per cycle
-  batch, `fsync` per cycle; a pre-existing torn trailing line is
-  frame-protected with a leading newline, never destroyed;
+  batch, `fsync` per cycle; on startup AT MOST ONE incomplete trailing
+  fragment is truncated back to the last newline (file fsynced) so the
+  evidence file is valid JSONL again -- more than one lost fragment fails
+  closed instead of destroying evidence;
 * size-shift rotation (`diag.jsonl` -> `.1` -> ... -> `.N-1`) above
   `--max-mb` (default 4) keeping `--files` (default 4, budget
   `max-mb * files <= 32 MiB`): file fsync before the rename, directory
-  fsync after it; `--prune-now` rotates without sampling.
+  fsync after it. Age retention rides EVERY cycle and `--prune-now`:
+  rotated files older than 7 days drop oldest-first, and the same pass
+  enforces the chain-count and 32 MiB total ceilings (the current
+  `diag.jsonl` itself is under size-cap control, never pruned here).
+  `--prune-now` rotates, prunes, prints `{"rotated", "pruned", "path"}`
+  and exits without sampling.
 
 ## Exit codes -- failures are visible, but never gate the proxy
 
 `--once` (systemd-timer shape, default): `0` ok, `2` config (non-loopback
-URL, missing/invalid `--group`, missing `--out-dir`, bad rotation args, bad
-secret file), `3` any endpoint failed, `4` storage failed, `5` both.
+URL, missing/invalid `--group` or `--node`, missing `--out-dir`, bad
+rotation args, bad secret file -- argparse refusals included), `3` any
+endpoint failed, `4` storage failed, `5` both.
+Every config/storage refusal writes EXACTLY one fixed category token to
+stderr -- `config_error` or `storage_error`, never a local path (detail
+lives only inside the exception for tests).
 `--resident`: API failures are RECORDS not exits (evidence must keep being
 collected while the controller misbehaves); a storage failure exits `4`
 immediately so the supervisor notices; SIGTERM exits `0`. Nothing here
 restarts, gates or mutates Mihomo.
 
 ```bash
-# example: two caller-named groups, one cycle per systemd timer tick
+# example: two caller-named groups + one explicit node, one cycle per tick
 python3 monitor-v2/mihomo/diag.py --url http://127.0.0.1:9090 \
-    --group 节点选择 --group 自动选择 \
+    --group 节点选择 --group 自动选择 --node 直连兜底 \
     --out-dir /var/lib/mihomo-diag --once
 ```
 
-Tests: `tests/test-monitor-v2-e4diag.sh` (343 assertions, fail-closed gate:
+Tests: `tests/test-monitor-v2-e4diag.sh` (392 assertions, fail-closed gate:
 static mutation-free greps plus residue greps, the strict four-type proof,
 delay-0 raw preservation, leak wall, B4 storage primitives via fault
-injection, encode bounds, B6 ledger semantics, exit-code matrix). The E4
+injection (torn-tail truncation, age/budget/overflow prune, category-only
+stderr), encode bounds, explicit-node union + per-test-url 8-entry tails,
+B6 ledger semantics, exit-code matrix). The E4
 suite (161) and E1 (232) must stay green -- `diag.py` lives under `mihomo/`
 and is covered by the same static greps.
