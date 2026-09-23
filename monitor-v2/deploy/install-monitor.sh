@@ -332,7 +332,9 @@ _cmd_install_locked() { # <install|upgrade> [flags...]
     # Monitor candidate back through the existing transaction machinery.
     if sbmon_version_ge "$repo_version" "0.3.0"; then
         if ! sbmon_sboxjr_activate "$OPT_NO_START"; then
-            sbmon_sboxjr_stop_disable
+            if ! sbmon_sboxjr_stop_disable; then
+                sbmon_critical "journal-reader activation failed and reader could not be stopped; keeping 0.3 consumer active for containment"
+            fi
             sbmon_warn "journal-reader activation failed; rolling Monitor candidate back"
             if [ "$old_unit_existed" = 1 ] || [ -n "$current_id" ]; then
                 sbmon_txn_rollback "$current_id" "$old_unit_backup" "$old_unit_existed" "$was_active" "$old_enabled"
@@ -467,15 +469,45 @@ _cmd_rollback_locked() { # [release-id]   (F4: runs under the deploy lock)
     if sbmon_service_active; then orig_active=1; fi
     if sbmon_service_enabled; then orig_enabled=1; fi
 
+    local current_version target_version
+    current_version="$(tr -d ' \t\r\n' < "$SBMON_RELEASES_DIR/$current/VERSION")"
+    target_version="$(tr -d ' \t\r\n' < "$SBMON_RELEASES_DIR/$target/VERSION")"
+    local jr_orig_active=0 jr_orig_enabled=0 jr_stopped_for_rollback=0
+    if sbmon_version_ge "$current_version" "0.3.0"; then
+        if sbmon_sboxjr_service_active; then jr_orig_active=1; fi
+        if sbmon_sboxjr_service_enabled; then jr_orig_enabled=1; fi
+    fi
+    # Rolling back below 0.3 removes the consumer. Stop the producer FIRST;
+    # if this cannot be proved, refuse to remove the consuming side.
+    if sbmon_version_ge "$current_version" "0.3.0" \
+       && ! sbmon_version_ge "$target_version" "0.3.0"; then
+        if ! sbmon_sboxjr_stop_disable; then
+            sbmon_die "rollback refused: reader could not be stopped before removing the 0.3 consumer"
+        fi
+        jr_stopped_for_rollback=1
+    fi
+
     sbmon_info "回滚: $current -> $target"
     if ! sbmon_apply_rollback_target "$target" "$orig_active" "$orig_enabled"; then
         sbmon_warn "rollback target 未能健康应用：恢复原 release $current"
         if sbmon_restore_original_after_rollback "$current" "$orig_active" "$orig_enabled"; then
+            if [ "$jr_stopped_for_rollback" = "1" ]; then
+                if ! sbmon_sboxjr_restore_service_state "$jr_orig_active" "$jr_orig_enabled"; then
+                    sbmon_critical "rollback target failed; Monitor restored but reader service state could not be restored"
+                fi
+            fi
             sbmon_warn "已恢复到原 release（rollback 未完成）；未写入任何 history"
         else
             sbmon_critical "rollback 恢复亦失败（见上方 CRITICAL）"
         fi
         return 1
+    fi
+    # A rollback/forward target at 0.3+ requires the producer to be converged
+    # after the consuming side is active.
+    if sbmon_version_ge "$target_version" "0.3.0"; then
+        if ! sbmon_sboxjr_preflight_activation || ! sbmon_sboxjr_activate 0; then
+            sbmon_critical "rollback target is 0.3+ but journal-reader convergence failed"
+        fi
     fi
     # F1: history is a commit record -- recorded only after the rollback
     # target is activated AND the service state is verified.
