@@ -50,9 +50,9 @@ MAX_BODY_BYTES = 65536
 SUPPORTED_METHODS = "GET, POST"
 
 # The four privileged mutation routes of rev5 §7. M0.5 delivered them as a
-# 501 boundary; M2 wires them to the sbox-cm RPC adapter (below). The
-# authentication boundary above them is UNCHANGED: session -> CSRF -> step-up,
-# and a 401 reauth_required still precedes everything else.
+# 501 boundary; M2 wires them to the sbox-cm RPC adapter (below).
+# Product UX contract: client.add is session + CSRF only after login;
+# delete/activate/deactivate retain session + CSRF + step-up.
 MUTATION_ROUTES = {
     "/api/v1/management/activate": "management.activate",
     "/api/v1/management/deactivate": "management.deactivate",
@@ -523,12 +523,14 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             return
         op = MUTATION_ROUTES.get(path)
         if op is not None:
-            # M2: the full gate chain (session -> CSRF -> step-up) is
-            # unchanged; the gate ALSO freezes the audit actor atomically
-            # with the step-up liveness check (B2), so a revocation that
-            # lands after the gate can never strip the actor from an
-            # already-authorized dispatch.
-            self._require_step_up(self._handle_e3_mutation, op)
+            if op == "client.add":
+                # Add is non-step-up by product contract: the authenticated
+                # session plus CSRF is sufficient. Freeze session_fp for the
+                # helper audit; stepup_fp is intentionally absent.
+                self._require_csrf_actor(self._handle_e3_mutation, op)
+            else:
+                # Destructive / control-plane mutations keep full step-up.
+                self._require_step_up(self._handle_e3_mutation, op)
             return
         if path == "/api/v1/clients/export":
             # M4: the read-only sensitive delivery. POST-only by contract --
@@ -630,6 +632,30 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
                                 {"error": "missing or invalid CSRF token"})
                 return
         handler(session, *args)
+
+    def _require_csrf_actor(self, handler, *args):
+        """Session + CSRF gate with a frozen session-only audit actor.
+
+        Used only for client.add so an authenticated user is not prompted for
+        the admin password again. CSRF remains mandatory and stepup_fp is
+        deliberately absent.
+        """
+        token = self._session_token()
+        session = self.app.session_from_token(token)
+        if session is None:
+            self._send_json(401, {"error": "login required"})
+            return
+        supplied = self.headers.get("X-CSRF-Token")
+        expected = session.get("csrf_token", "")
+        if not isinstance(supplied, str) or \
+                not hmac.compare_digest(supplied, expected):
+            self._send_json(403, {"error": "missing or invalid CSRF token"})
+            return
+        actor = {}
+        sfp = self.app.session_fingerprint(token)
+        if sfp:
+            actor["session_fp"] = sfp
+        handler(session, *args, actor)
 
     def _require_step_up(self, handler, *args):
         """Gate for privileged mutations (M0.5 / rev5 §5).
@@ -1117,10 +1143,11 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
     def _handle_e3_mutation(self, session, op, actor):
         """POST mutation -> dispatch to sbox-cm via the broker.
 
-        Reached only after session -> CSRF -> step-up, and the ``actor`` was
-        FROZEN at the gate (B2): the fingerprints are the gate-time values,
-        so a revocation racing the dispatch changes the authorization of
-        FUTURE requests, never the attribution of this one.
+        Reached after an operation-specific authorization gate. client.add
+        uses session + CSRF with a session-only actor; delete and the other
+        privileged mutations use session + CSRF + step-up. In either case the
+        actor is frozen at the gate, so later revocation cannot change the
+        attribution of an already-authorized dispatch.
 
         Contract highlights (design §8-§11):
 
