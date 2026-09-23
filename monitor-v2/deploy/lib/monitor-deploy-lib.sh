@@ -1044,7 +1044,12 @@ sbmon_sboxjr_release_runtime_dir() { # <release-id> -> prints <release>/libexec/
 
 sbmon_sboxjr_runtime_linked_id() { # -> release id behind $SBOXJR_LIB_DIR, empty when absent
     [ -L "$SBOXJR_LIB_DIR" ] || return 0
-    basename -- "$(readlink "$SBOXJR_LIB_DIR")" 2>/dev/null || true
+    # The link targets <release>/libexec/sbox-journal-reader; the release id
+    # is the path component ABOVE that suffix (never the leaf basename).
+    local t
+    t="$(readlink "$SBOXJR_LIB_DIR" 2>/dev/null)" || return 0
+    t="${t%/$SBOXJR_RELEASE_LIBEXEC_REL}"
+    basename -- "$t"
 }
 
 # Strict allowlist audit of a staged reader runtime tree: the 12+1+1
