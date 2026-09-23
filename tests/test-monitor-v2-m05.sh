@@ -27,7 +27,7 @@ SKIP=0
 # or is explicitly skipped; the gate at the bottom requires
 # PASS + FAIL + SKIP == EXPECTED_TOTAL, so a section that silently disappears
 # (the classic "fewer assertions but still green") can never fake success.
-EXPECTED_TOTAL=136
+EXPECTED_TOTAL=137
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
