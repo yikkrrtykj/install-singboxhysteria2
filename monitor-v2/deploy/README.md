@@ -607,6 +607,13 @@ PR-2B 将其接入 installer，且完全服从既有事务语义（deploy lock /
   symlink。因此 Monitor rollback 必然带回版本一致的 reader 代码与 unit 模板；reader 已激活
   而回滚目标缺 libexec → 直接拒绝回滚（绝不出现 Monitor 旧、reader 新）。retention 剪枝
   保护链接所指 release。
+- **运行时链接 provenance 三态（review round）**：`sbmon_sboxjr_runtime_linked_id` 严格
+  区分 ① 非 symlink → 空（合法：reader 从未链接）；② 目标恰为
+  `$SBMON_RELEASES_DIR/<id>/libexec/sbox-journal-reader`（单段 release id + 通过 manifest
+  审计）→ 输出该精确 id；③ 其它任何 symlink（releases 外路径——即使后缀恰好相同、错误
+  深度、错误后缀、断链、审计不过）→ rc1 + 明确要求人工处理。install/upgrade 在 preflight
+  于任何 mutation 前拒绝，pre-state 捕获与 retention 剪枝同样 fail-closed 拒绝；非法链接
+  绝不做 basename 猜测、绝不视为"不存在"、绝不静默覆盖。
 - **pre-state 矩阵**：install/upgrade 终态 = enabled+active；rollback 用 keep-prestate
   语义精确保持事务前 active/enabled/unit/link 事实（enabled+inactive 不被"顺手拉起"）；
   `--no-start` 只落文件。

@@ -763,8 +763,12 @@ sbmon_prune_releases() {
     # pruning it would leave $SBOXJR_LIB_DIR dangling (the wrapper fails
     # closed with staged_tree_missing at next start, and rollback to that
     # release would be impossible).
+    # Review round (provenance): an unreadable/illegal link means the live
+    # reader release cannot be identified -- pruning anything then could
+    # delete it. Fail closed and demand human handling instead of guessing.
     local jr_live
-    jr_live="$(sbmon_sboxjr_runtime_linked_id)"
+    jr_live="$(sbmon_sboxjr_runtime_linked_id)" \
+        || sbmon_die "拒绝 prune：reader 运行时链接 provenance 非法（见上），无法确定受保护的 release；需人工处理"
     local -a ordered=()
     local d
     # -type d excludes .switch-tmp (a symlink) and releases.history (a file);
@@ -1042,14 +1046,37 @@ sbmon_sboxjr_release_runtime_dir() { # <release-id> -> prints <release>/libexec/
     printf '%s/%s/%s\n' "$SBMON_RELEASES_DIR" "$1" "$SBOXJR_RELEASE_LIBEXEC_REL"
 }
 
-sbmon_sboxjr_runtime_linked_id() { # -> release id behind $SBOXJR_LIB_DIR, empty when absent
+# Tri-state link provenance decoder (Coding E review round):
+#   (1) $SBOXJR_LIB_DIR is NOT a symlink -> prints nothing, rc 0: the
+#       runtime has never been linked (normal pre-activation state).
+#   (2) symlink whose target is EXACTLY the canonical release runtime shape
+#       "$SBMON_RELEASES_DIR/<release-id>/$SBOXJR_RELEASE_LIBEXEC_REL"
+#       (single-component release id, target passes the manifest audit)
+#       -> prints the exact release id, rc 0.
+#   (3) ANY other symlink (foreign path -- even one whose suffix happens to
+#       match, wrong depth, wrong suffix, broken link, manifest violation)
+#       -> rc 1 with a loud human-action diagnostic and NOTHING on stdout.
+#       Callers must fail closed; the link is never guessed into a release
+#       id nor silently treated as absent.
+sbmon_sboxjr_runtime_linked_id() { # -> release id | rc1 = illegal provenance
     [ -L "$SBOXJR_LIB_DIR" ] || return 0
-    # The link targets <release>/libexec/sbox-journal-reader; the release id
-    # is the path component ABOVE that suffix (never the leaf basename).
-    local t
-    t="$(readlink "$SBOXJR_LIB_DIR" 2>/dev/null)" || return 0
-    t="${t%/$SBOXJR_RELEASE_LIBEXEC_REL}"
-    basename -- "$t"
+    local t rel id
+    t="$(readlink -- "$SBOXJR_LIB_DIR")" \
+        || { sboxjr_die "无法读取 reader 运行时链接目标: $SBOXJR_LIB_DIR；需人工处理"; return 1; }
+    rel="${t#"$SBMON_RELEASES_DIR"/}"
+    if [ "$rel" = "$t" ] || [ -z "$rel" ]; then
+        sboxjr_die "reader 运行时链接指向 releases 根之外（$t）：provenance 非法，需人工处理（fail-closed）"
+        return 1
+    fi
+    id="${rel%/"$SBOXJR_RELEASE_LIBEXEC_REL"}"
+    case "$id" in
+        "$rel"|""|*/*)
+            sboxjr_die "reader 运行时链接形状非 <release-id>/$SBOXJR_RELEASE_LIBEXEC_REL（$t）：provenance 非法，需人工处理（fail-closed）"
+            return 1 ;;
+    esac
+    sbmon_sboxjr_audit_runtime "$SBMON_RELEASES_DIR/$id/$SBOXJR_RELEASE_LIBEXEC_REL" \
+        || { sboxjr_die "reader 运行时链接目标未通过 manifest 审计（$t）：需人工处理（fail-closed）"; return 1; }
+    printf '%s\n' "$id"
 }
 
 # Strict allowlist audit of a staged reader runtime tree: the 12+1+1
@@ -1290,7 +1317,13 @@ sbmon_sboxjr_deployed() { # rc 0 = this host has (or had) an activated reader
 # PRE-EXISTING identity stops the whole command here, before ANY staging or
 # mutation, with zero side effects (§3: never "quietly fix" an alien sbox-jr).
 sbmon_sboxjr_activation_preflight() {
-    sbmon_sboxjr_source_present || return 0   # inert baseline: nothing to gate
+    # Provenance gate runs FIRST, even on the inert baseline: an illegal
+    # $SBOXJR_LIB_DIR symlink (foreign target, wrong shape, broken, failed
+    # audit) must refuse the whole command before ANY mutation and demand
+    # human handling -- never guessed, never silently treated as absent.
+    sbmon_sboxjr_runtime_linked_id >/dev/null \
+        || sbmon_die "reader 运行时链接 provenance 非法：拒绝继续（fail-closed，未做任何变更，需人工处理）"
+    sbmon_sboxjr_source_present || return 0   # inert baseline: nothing else to gate
     [ -f "$DEPLOY_DIR/$SBOXJR_TEMPLATE_NAME" ] || sbmon_die "缺少 reader unit 模板: $DEPLOY_DIR/$SBOXJR_TEMPLATE_NAME"
     [ -f "$DEPLOY_DIR/app-bin/sbox-journal-reader" ] || sbmon_die "缺少 reader 入口 wrapper"
     local jf
@@ -1327,7 +1360,8 @@ sbmon_sboxjr_capture_prestate() {
     SBOXJR_PRE_ENABLED=0
     SBOXJR_PRE_UNIT_EXISTED=0
     SBOXJR_PRE_UNIT_BACKUP=""
-    SBOXJR_PRE_LINK_ID="$(sbmon_sboxjr_runtime_linked_id)"
+    SBOXJR_PRE_LINK_ID="$(sbmon_sboxjr_runtime_linked_id)" \
+        || { sboxjr_warn "reader 预状态捕获：运行时链接 provenance 非法，拒绝开始事务（需人工处理）"; return 1; }
     if sbmon_sboxjr_service_active; then SBOXJR_PRE_ACTIVE=1; fi
     if sbmon_sboxjr_service_enabled; then SBOXJR_PRE_ENABLED=1; fi
     if [ -e "$SBOXJR_UNIT_FILE" ]; then

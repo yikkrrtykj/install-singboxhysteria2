@@ -1006,6 +1006,136 @@ mk_runtime "$BADMIG/releases/any/libexec/sbox-journal-reader"
 assert_grep "$TMP/badlib.err" '人工处理' "link: refusal message asks for human action (fail-closed)"
 
 # ===========================================================================
+section "S13b: runtime link provenance tri-state (review-round fail-closed)"
+# ===========================================================================
+# sbmon_sboxjr_runtime_linked_id must STRICTLY separate three states:
+#   (1) NO symlink at $SBOXJR_LIB_DIR -> empty + rc0 (legal: never linked);
+#   (2) target EXACTLY releases/<id>/libexec/sbox-journal-reader (single-
+#       component id under the releases root, target passes the manifest
+#       audit) -> that exact id;
+#   (3) ANY other symlink -> rc1 + human-action demand. Never basename-
+#       guessed, never silently treated as absent, never auto-repaired.
+# Placed BEFORE S14 so the global §9/§10/§18 invariant roll-up also covers
+# every scenario below.
+jr_probe_id() { # -> "<rc>:<stdout>" of the decoder under the case env
+    bash -c '. "$1" >/dev/null 2>&1
+        out="$(sbmon_sboxjr_runtime_linked_id 2>/dev/null)"; rc=$?
+        printf "%s:%s\n" "$rc" "$out"' _ "$LIB"
+}
+prune_probe() { # run retention under the case env -> rc (output silenced)
+    bash -c '. "$1" >/dev/null 2>&1; sbmon_prune_releases' _ "$LIB" >/dev/null 2>&1
+}
+mk_foreign_link() { # raw-swap the runtime link slot to <target> (no validation)
+    rm -f -- "$SBOXJR_LIB_DIR"
+    ln -s "$1" "$SBOXJR_LIB_DIR"
+}
+if require_symlink "runtime link provenance tri-state"; then
+    new_case prov "$SRC"
+    inst install; assert_eq "$LAST_RC" "0" "prov: precondition install rc=0"
+    R1="$(current_release_id)"
+    # (1) legal canonical link decodes to the EXACT release id
+    assert_eq "$(jr_probe_id)" "0:$R1" "prov: canonical link -> exact release id (rc0)"
+    # (1b) absent link is legal: empty + rc0, never an error
+    rm -f -- "$SBOXJR_LIB_DIR"
+    assert_eq "$(jr_probe_id)" "0:" "prov: absent link -> empty + rc0 (legal, not guessed)"
+    # (2) foreign absolute target: rc1, stdout silent
+    mk_foreign_link /etc/hostname
+    assert_eq "$(jr_probe_id)" "1:" "prov: foreign absolute target refused (rc1, stdout silent)"
+    # (3) suffix-coincidence decoy OUTSIDE the releases dir -- a fully
+    #     manifest-valid tree must STILL be refused (no basename guessing)
+    mk_runtime "$CASE_DIR/foreign/libexec/sbox-journal-reader"
+    mk_foreign_link "$CASE_DIR/foreign/libexec/sbox-journal-reader"
+    assert_eq "$(jr_probe_id)" "1:" "prov: releases-external target ENDING IN the libexec suffix refused"
+    # (4) inside the releases dir, wrong depth in BOTH directions
+    mkdir -p "$SBMON_RELEASES_DIR/deep/er/libexec/sbox-journal-reader" \
+             "$SBMON_RELEASES_DIR/libexec/sbox-journal-reader"
+    mk_foreign_link "$SBMON_RELEASES_DIR/deep/er/libexec/sbox-journal-reader"
+    assert_eq "$(jr_probe_id)" "1:" "prov: extra directory level under releases refused"
+    mk_foreign_link "$SBMON_RELEASES_DIR/libexec/sbox-journal-reader"
+    assert_eq "$(jr_probe_id)" "1:" "prov: release id collapsing onto libexec refused"
+    # (5) right depth, wrong final component
+    mk_foreign_link "$SBMON_RELEASES_DIR/$R1/libexec/other"
+    assert_eq "$(jr_probe_id)" "1:" "prov: wrong libexec suffix refused"
+    # (6) broken link in the canonical SHAPE: dangling runtime is an
+    #     integrity finding (audit refuses), NOT the legal 'absent' state
+    mk_foreign_link "$SBMON_RELEASES_DIR/ghost/libexec/sbox-journal-reader"
+    assert_eq "$(jr_probe_id)" "1:" "prov: broken runtime link refused via manifest audit"
+    # e2e: deploy must REFUSE before any mutation and demand human action,
+    # and must never auto-repair the illegal link it found.
+    M="$(log_mark)"
+    inst install
+    [ "$LAST_RC" != "0" ] && pass "prov: deploy refuses illegal link provenance before mutation (rc=$LAST_RC)" \
+        || fail "prov: deploy accepted an illegal runtime link"
+    assert_grep "$OUT" 'provenance 非法' "prov: refusal names the provenance gate"
+    assert_grep "$OUT" '人工处理' "prov: refusal demands human action (fail-closed)"
+    tail -n +"$((M + 1))" "$MOCK_CALL_LOG" > "$CASE_DIR/calls.tail"
+    assert_no_grep "$CASE_DIR/calls.tail" 'systemctl (start|stop|restart|enable|disable|kill|daemon-reload)' \
+        "prov: zero state-changing systemctl calls in the refusal window"
+    assert_eq "$(readlink -- "$SBOXJR_LIB_DIR")" \
+        "$SBMON_RELEASES_DIR/ghost/libexec/sbox-journal-reader" \
+        "prov: the illegal link was left exactly as found (never silently overwritten)"
+    [ "$(current_release_id)" = "$R1" ] && pass "prov: live monitor release untouched by the refusal" \
+        || fail "prov: refusal mutated the live release"
+fi
+
+if require_symlink "provenance-aware retention"; then
+    new_case provprune "$SRC"
+    export SBMON_KEEP_RELEASES=2
+    mk_rel_set() { # 3 manifest-valid releases with pinned ages (old->new)
+        rm -rf -- "$SBMON_RELEASES_DIR"
+        mkdir -p "$SBMON_RELEASES_DIR"
+        local id
+        for id in r-old r-mid r-new; do
+            mkdir -p "$SBMON_RELEASES_DIR/$id"
+            mk_runtime "$SBMON_RELEASES_DIR/$id/libexec/sbox-journal-reader"
+        done
+        touch -d '2026-01-01 00:00:00' "$SBMON_RELEASES_DIR/r-old"
+        touch -d '2026-01-02 00:00:00' "$SBMON_RELEASES_DIR/r-mid"
+        touch -d '2026-01-03 00:00:00' "$SBMON_RELEASES_DIR/r-new"
+        ln -sfn -- "$SBMON_RELEASES_DIR/r-new" "$SBMON_APP_LINK"
+    }
+    # (7) a VALID link protects the release it references -- even the oldest
+    mk_rel_set
+    mk_foreign_link "$SBMON_RELEASES_DIR/r-old/libexec/sbox-journal-reader"
+    if prune_probe; then pass "prune: legal provenance prunes normally"; else fail "prune: valid link refused?"; fi
+    [ -d "$SBMON_RELEASES_DIR/r-old" ] \
+        && pass "prune: reader-referenced release protected by its EXACT id (oldest kept)" \
+        || fail "prune: protected release was deleted (link-id mismatch)"
+    [ ! -d "$SBMON_RELEASES_DIR/r-mid" ] && pass "prune: next-oldest eligible release pruned" \
+        || fail "prune: retention did not run (nothing removed)"
+    [ -d "$SBMON_RELEASES_DIR/r-new" ] && pass "prune: live monitor release untouched" \
+        || fail "prune: live release was deleted"
+    # (8) an ILLEGAL link fails the prune PRECONDITION closed -- it must not
+    #     be ignored while the other releases silently disappear
+    mk_rel_set
+    mk_foreign_link /etc/hostname
+    if prune_probe; then
+        fail "prune: pruned despite unverifiable reader link provenance"
+    else
+        pass "prune: refuses ALL retention when link provenance is illegal (fail-closed)"
+    fi
+    [ -d "$SBMON_RELEASES_DIR/r-old" ] && [ -d "$SBMON_RELEASES_DIR/r-mid" ] && [ -d "$SBMON_RELEASES_DIR/r-new" ] \
+        && pass "prune: zero releases deleted on the refused path" \
+        || fail "prune: deletion happened despite the refusal"
+    unset SBMON_KEEP_RELEASES
+fi
+
+if require_symlink "failed-upgrade restore uses only the exact captured id"; then
+    new_case provrb "$SRC"
+    inst install; assert_eq "$LAST_RC" "0" "provr: v1 install rc=0"
+    R1="$(current_release_id)"
+    printf '0.1.1\n' > "$SBMON_VERSION_FILE"
+    : > "$MOCK_MS/fail_restart_once.singbox-journal-reader"
+    inst install
+    [ "$LAST_RC" != "0" ] && pass "provr: failed upgrade refused rc=$LAST_RC" || fail "provr: must refuse, rc=0"
+    assert_grep "$OUT" "runtime=$R1" "provr: restore log carries the EXACT release id (never a leaf-name fake)"
+    assert_eq "$(readlink -- "$SBOXJR_LIB_DIR")" \
+        "$SBMON_RELEASES_DIR/$R1/libexec/sbox-journal-reader" \
+        "provr: restored link is the full canonical shape for the captured release"
+    assert_eq "$(jr_probe_id)" "0:$R1" "provr: post-restore link decodes cleanly"
+fi
+
+# ===========================================================================
 section "S14: global invariants (spec §9/§10/§18 across EVERY scenario)"
 # ===========================================================================
 ALLCALLS="$TMP/all-calls.log"; : > "$ALLCALLS"
