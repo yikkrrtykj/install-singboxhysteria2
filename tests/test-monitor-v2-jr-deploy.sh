@@ -1018,8 +1018,11 @@ section "S13b: runtime link provenance tri-state (review-round fail-closed)"
 # Placed BEFORE S14 so the global §9/§10/§18 invariant roll-up also covers
 # every scenario below.
 jr_probe_id() { # -> "<rc>:<stdout>" of the decoder under the case env
+    # The lib turns on `set -Eeuo pipefail` at source time, so the rc must
+    # be captured in a guarded `|| rc=$?` -- a bare assignment would abort
+    # the probe shell on the rc1 paths before the summary is printed.
     bash -c '. "$1" >/dev/null 2>&1
-        out="$(sbmon_sboxjr_runtime_linked_id 2>/dev/null)"; rc=$?
+        rc=0; out="$(sbmon_sboxjr_runtime_linked_id 2>/dev/null)" || rc=$?
         printf "%s:%s\n" "$rc" "$out"' _ "$LIB"
 }
 prune_probe() { # run retention under the case env -> rc (output silenced)
