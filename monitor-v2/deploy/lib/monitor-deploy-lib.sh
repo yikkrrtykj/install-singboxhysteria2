@@ -872,6 +872,9 @@ SBOXJR_SERVICE_NAME="${SBOXJR_SERVICE_NAME:-singbox-journal-reader}"
 SBOXJR_UNIT_FILE="${SBOXJR_UNIT_FILE:-/etc/systemd/system/$SBOXJR_SERVICE_NAME.service}"
 SBOXJR_WATCHED_UNIT="${SBOXJR_WATCHED_UNIT:-sing-box.service}"
 SBOXJR_RUNUSER="${SBOXJR_RUNUSER:-runuser}"
+# Reader-specific fixture gate: packaging may run Monitor metadata tests as
+# real root while still keeping reader identity creation inside temp fixtures.
+SBOXJR_FIXTURE="${SBOXJR_FIXTURE:-$SBMON_FIXTURE}"
 
 sboxjr_log() { printf '[sbjr-deploy] %s\n' "$*"; }
 sboxjr_warn() { printf '[sbjr-deploy] WARNING: %s\n' "$*" >&2; }
@@ -884,7 +887,7 @@ sboxjr_die() { printf '[sbjr-deploy] ERROR: %s\n' "$*" >&2; return 1; }
 # FIELD (never values), return nonzero, and mutate nothing. Never silently
 # "converged" by a root-side repair here.
 sbmon_sboxjr_validate_identity() {
-    if [ "$SBMON_FIXTURE" = "1" ]; then
+    if [ "$SBOXJR_FIXTURE" = "1" ]; then
         sboxjr_log "fixture: 身份校验跳过（真实语义由 PATH 桩 + 根 Linux 门负责）"
         return 0
     fi
@@ -929,7 +932,7 @@ sbmon_sboxjr_validate_identity() {
 # absent-user branch may create group/user/membership, then re-validates
 # the exact final shape.
 sbmon_sboxjr_ensure_identity() {
-    if [ "$SBMON_FIXTURE" = "1" ]; then
+    if [ "$SBOXJR_FIXTURE" = "1" ]; then
         sboxjr_log "fixture: 确认身份存在（跳过真实 useradd/usermod）: $SBOXJR_USER"
         return 0
     fi
@@ -977,7 +980,7 @@ sbmon_sboxjr_ensure_data_tree() {
             return 1
         fi
     done
-    if [ "$SBMON_FIXTURE" = "1" ]; then
+    if [ "$SBOXJR_FIXTURE" = "1" ]; then
         return 0
     fi
     chown "root:$SBOXJR_GROUP" "$SBOXJR_DATA_ROOT" || return 1
@@ -1074,7 +1077,7 @@ sbmon_sboxjr_install_unit() { # rc 0 ok / 1 failed; NEVER enables or starts
 # carry $SBOXJR_JOURNAL_GROUP (that membership, not any root-side reading,
 # is what grants journal access). Runs as the reader identity via runuser.
 sbmon_sboxjr_readability_probe() {
-    if [ "$SBMON_FIXTURE" = "1" ]; then
+    if [ "$SBOXJR_FIXTURE" = "1" ]; then
         sboxjr_log "fixture: 可读性探针跳过（真实语义由根 Linux CI 门保证）"
         return 0
     fi
@@ -1095,6 +1098,15 @@ sbmon_sboxjr_readability_probe() {
 # validated with zero repair; absent identities may be created only later.
 sbmon_sboxjr_preflight_activation() {
     local cmd d
+    if [ "$SBOXJR_FIXTURE" = "1" ]; then
+        for d in "$SBOXJR_DATA_ROOT" "$SBOXJR_STATE_DIR" "$SBOXJR_OUT_DIR"; do
+            if [ -L "$d" ] || { [ -e "$d" ] && [ ! -d "$d" ]; }; then
+                sboxjr_die "activation preflight: unsafe data path"
+                return 1
+            fi
+        done
+        return 0
+    fi
     for cmd in getent id cut tr grep sort runuser; do
         command -v "$cmd" >/dev/null 2>&1 || {
             sboxjr_die "activation preflight: missing command $cmd"
@@ -1137,6 +1149,9 @@ sbmon_sboxjr_service_enabled() {
 }
 
 sbmon_sboxjr_wait_ready() {
+    if [ "$SBOXJR_FIXTURE" = "1" ]; then
+        return 0
+    fi
     local deadline=$(( SECONDS + SBMON_HEALTH_TIMEOUT ))
     while (( SECONDS < deadline )); do
         if sbmon_sboxjr_service_active && [ -f "$SBOXJR_OUT_DIR/hb" ] && [ ! -L "$SBOXJR_OUT_DIR/hb" ]; then
