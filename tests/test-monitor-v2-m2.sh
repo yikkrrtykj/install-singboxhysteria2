@@ -466,6 +466,54 @@ def group_verdict_semantics():
     return out
 
 
+
+def group_add_without_stepup():
+    """Product UX contract: client.add needs session + CSRF, not password
+    step-up. Destructive client.delete remains step-up gated."""
+    out = {}
+    client = FakeClient()
+    broker = new_broker(client, FakeClock())
+    stack = M2Stack(e3_broker=broker)
+    port = stack.port
+    cookie = login(port)
+    csrf = session_info(port, cookie)["csrf_token"]
+
+    client.record({
+        "ok": True, "request_id": "helper-add-no-stepup",
+        "idempotency": {"key_fp": "a" * 16, "replayed": False,
+                        "generation": 1},
+        "data": {"name": "vmix-no-stepup",
+                 "protocols": ["reality", "hy2"],
+                 "mutable": True, "source": "untracked",
+                 "yaml_available": False,
+                 "credential_delivery": "cli"},
+        "warnings": []})
+    r = mutate(
+        port, "/api/v1/clients/add", cookie, csrf,
+        {"Idempotency-Key": "m2-no-stepup-key-00000001"},
+        json.dumps({"name": "vmix-no-stepup"}))
+    body = json.loads(r["body"])
+    out["add_without_stepup_200"] = (
+        r["status"] == 200 and body.get("ok") is True)
+    out["add_without_stepup_dispatched_once"] =         client.calls.count("client.add") == 1
+    actor = client.actors[-1] or {}
+    out["add_actor_session_fp_present"] =         isinstance(actor.get("session_fp"), str) and len(actor["session_fp"]) == 16
+    out["add_actor_has_no_stepup_fp"] = "stepup_fp" not in actor
+
+    calls_before = len(client.calls)
+    r = mutate(
+        port, "/api/v1/clients/delete", cookie, csrf,
+        {"Idempotency-Key": "m2-delete-stepup-key-0001"},
+        json.dumps({"name": "vmix-no-stepup",
+                    "confirm": "vmix-no-stepup"}))
+    body = json.loads(r["body"])
+    out["delete_without_stepup_still_401"] = (
+        r["status"] == 401 and body.get("error") == "reauth_required")
+    out["delete_without_stepup_zero_rpc"] = len(client.calls) == calls_before
+
+    stack.stop()
+    return out
+
 def group_actor_freeze():
     """B2: the step-up fingerprint is captured at the GATE; a revocation
     racing the dispatch never strips the actor from the audit."""
@@ -1959,6 +2007,7 @@ def main():
     out.update(group_breaker())
     out.update(group_breaker_isolation())
     out.update(group_verdict_semantics())
+    out.update(group_add_without_stepup())
     out.update(group_actor_freeze())
     out.update(group_stale_and_degraded())
     out.update(group_auth_lifecycle())
@@ -2026,6 +2075,13 @@ fi
 # normal click a zero-dispatch no-op (no request, no new key).
 GUARD='if (state.e3PendingRetry || state.e3Mutation) return;'
 ADD_FN="$(sed -n '/function addClient/,/^  }/p' "$APP_FILE")"
+if printf '%s\n' "$ADD_FN" | grep -qF 'apiWithStepUp("/api/v1/clients/add"'; then
+    fail 'UX: client.add still uses password step-up'
+elif printf '%s\n' "$ADD_FN" | grep -qF 'api("/api/v1/clients/add"'; then
+    pass 'UX: client.add uses session+CSRF without password step-up'
+else
+    fail 'UX: client.add dispatch route not found'
+fi
 DEL_FN="$(sed -n '/function deleteClient/,/^  }/p' "$APP_FILE")"
 guard_before_keygen() { # <fn-body-file> -> rc 0 when guard precedes keygen
     FN="$1"
