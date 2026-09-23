@@ -650,18 +650,22 @@ sbmon_stage_release() { # sbmon_stage_release <version> -> prints release id on 
     [ -d "$SBMON_REPO_MONITOR_DIR/api_bridge" ] || sbmon_die "缺少 api_bridge/: $SBMON_REPO_MONITOR_DIR"
     [ -f "$SBMON_REPO_MONITOR_DIR/webapp.py" ] || sbmon_die "缺少 webapp.py: $SBMON_REPO_MONITOR_DIR"
     [ -d "$SBMON_REPO_MONITOR_DIR/web" ] || sbmon_die "缺少 web/: $SBMON_REPO_MONITOR_DIR"
-    [ -d "$SBMON_REPO_MONITOR_DIR/journal_reader" ] || sbmon_die "缺少 journal_reader/: $SBMON_REPO_MONITOR_DIR"
+    if sbmon_version_ge "$version" "0.3.0"; then
+        [ -d "$SBMON_REPO_MONITOR_DIR/journal_reader" ] || sbmon_die "0.3.0+ 缺少 journal_reader/: $SBMON_REPO_MONITOR_DIR"
+    fi
     cp -- "$SBMON_REPO_MONITOR_DIR/collector.py" "$staged/app/monitor-v2/"
     cp -- "$SBMON_REPO_MONITOR_DIR/webapp.py" "$staged/app/monitor-v2/"
     cp -R -- "$SBMON_REPO_MONITOR_DIR/api_bridge" "$staged/app/monitor-v2/api_bridge"
     rm -rf -- "$staged/app/monitor-v2/api_bridge/__pycache__"
     cp -R -- "$SBMON_REPO_MONITOR_DIR/web" "$staged/app/monitor-v2/web"
     rm -rf -- "$staged/app/monitor-v2/web/__pycache__"
-    # PR-2B: the Monitor-side consumer imports only the reviewed boundary
-    # parser/contract from this package. The root-side reader runtime is
-    # staged separately under /usr/local/lib by sbmon_sboxjr_stage_code.
-    cp -R -- "$SBMON_REPO_MONITOR_DIR/journal_reader" "$staged/app/monitor-v2/journal_reader"
-    rm -rf -- "$staged/app/monitor-v2/journal_reader/__pycache__"
+    # PR-2B: 0.3.0+ Monitor-side consumer imports the reviewed boundary
+    # parser/contract. Older-version packaging fixtures intentionally do
+    # not contain this package and must remain deployable for upgrade tests.
+    if sbmon_version_ge "$version" "0.3.0"; then
+        cp -R -- "$SBMON_REPO_MONITOR_DIR/journal_reader" "$staged/app/monitor-v2/journal_reader"
+        rm -rf -- "$staged/app/monitor-v2/journal_reader/__pycache__"
+    fi
 
     # Shims + shared env lib from deploy templates.
     cp -- "$DEPLOY_DIR/app-bin/monitor-service" "$staged/bin/monitor-service"
@@ -674,12 +678,16 @@ sbmon_stage_release() { # sbmon_stage_release <version> -> prints release id on 
     # runtime (collector, api_bridge, webapp, web/*.py) + shell syntax for
     # the shims. JS syntax is a CI/development gate -- Node.js is never a
     # production installer dependency.
-    "$SBMON_PYTHON3" -m py_compile \
-        "$staged/app/monitor-v2/collector.py" \
-        "$staged/app/monitor-v2/webapp.py" \
-        "$staged/app/monitor-v2/api_bridge/"*.py \
-        "$staged/app/monitor-v2/web/"*.py \
-        "$staged/app/monitor-v2/journal_reader/"*.py >/dev/null 2>&1 \
+    local -a py_sources=(
+        "$staged/app/monitor-v2/collector.py"
+        "$staged/app/monitor-v2/webapp.py"
+        "$staged/app/monitor-v2/api_bridge/"*.py
+        "$staged/app/monitor-v2/web/"*.py
+    )
+    if [ -d "$staged/app/monitor-v2/journal_reader" ]; then
+        py_sources+=("$staged/app/monitor-v2/journal_reader/"*.py)
+    fi
+    "$SBMON_PYTHON3" -m py_compile "${py_sources[@]}" >/dev/null 2>&1 \
         || { rm -rf -- "$staged"; sbmon_die "staged python 代码校验失败，放弃发布"; }
     bash -n "$staged/bin/monitor-service" "$staged/bin/monitor-health" "$staged/lib/monitor-env.sh" \
         || { rm -rf -- "$staged"; sbmon_die "staged shell 脚本校验失败，放弃发布"; }
