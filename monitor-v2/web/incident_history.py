@@ -38,7 +38,10 @@ Safety contract (all enforced, all tested):
   ingest carries its OWN degraded state, composed into ``health()``:
   an ingest failure survives a successful ordinary sample write in the
   same publication and clears only when a later ingest pass completes
-  with nothing blocked.
+  with nothing blocked. NO journal-path exception ever escapes into
+  the publisher path (structural refusals included): the P1 timeline
+  write never acquires a dependency on journal ingest, and a missing
+  continuity row is failed closed, never recreated.
 * Retention: rows older than the retention horizon are deleted at
   startup and at most hourly; if the database crosses the size ceiling
   the OLDEST rows are pruned in batches until below the target size --
@@ -1014,7 +1017,24 @@ class IncidentHistory:
                 < self._journal_ingest_interval):
             return None
         self._last_journal_ingest_ts = now
-        return self._journal_ingest_pass(now)
+        # TOTAL journal containment (frozen P2 failure invariant): NO
+        # journal-path exception ever escapes into the publisher path.
+        # A structural refusal (e.g. the continuity row was mutated
+        # away mid-run -- never silently recreated) degrades and
+        # fail-closes ONLY the journal subsystem: nothing settles, no
+        # journal row is fabricated, and the ordinary P1 sample/device
+        # write of the same publication still executes on its own
+        # storage path.
+        try:
+            return self._journal_ingest_pass(now)
+        except _HistoryError as exc:
+            self._rollback_quiet()
+            self._record_journal_failure(exc.code)
+            return None
+        except (sqlite3.Error, OSError):
+            self._rollback_quiet()
+            self._record_journal_failure(CODE_INGEST_APPLY_FAILED)
+            return None
 
     def _journal_ingest_pass(self, now):
         result = {"consumed": 0, "gaps": 0, "rejected": 0,
@@ -1049,8 +1069,18 @@ class IncidentHistory:
                 if not self._journal_settle_gap(seq, nxt, now, result):
                     break
                 seq = nxt
-            payload, code = _journal_contract.read_and_validate(
-                self._journal_exchange_dir, files[seq], seq)
+            payload, code = None, None
+            try:
+                payload, code = _journal_contract.read_and_validate(
+                    self._journal_exchange_dir, files[seq], seq)
+            except UnicodeDecodeError:
+                # Undecodable bytes are the most malformed a file can
+                # be: the contract's text-mode read raises before any
+                # sanitized code can come back. Contained HERE (never
+                # escapes the journal boundary) and classified with the
+                # frozen closed-vocabulary disposition code -- no raw
+                # byte is ever kept or echoed.
+                payload, code = None, "exchange_unreadable"
             if code is not None:
                 if not self._journal_settle_rejected(seq, code, now,
                                                      result):

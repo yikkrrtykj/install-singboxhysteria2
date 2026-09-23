@@ -28,7 +28,7 @@ export WEBAPP="$ROOT/monitor-v2/webapp.py"
 
 PASS=0
 FAIL=0
-EXPECTED_PASS=205
+EXPECTED_PASS=215
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
@@ -138,6 +138,7 @@ cat > "$TMP/hist_harness.py" <<'HARNESS_EOF'
 real loopback HTTP server for the read surface."""
 import http.client
 import json
+import locale
 import os
 import re
 import sqlite3
@@ -2076,6 +2077,88 @@ def group_ingest2():
         and st7b == (2, 2, 0, 0) and [x[0] for x in runs7b] == [1, 2]
         and h7.journal_status()["blocked_at"] is None)
     h7.close()
+    # ---- BLOCKER-1 regression (review round 2): a journal-STRUCTURAL
+    # refusal (continuity row mutated away mid-run) is CONTAINED by the
+    # journal boundary: nothing raises into the publisher, the P1
+    # sample/device write of the SAME on_publish still lands, no
+    # journal state advances or is fabricated, the row is NEVER
+    # recreated, and the degraded surface stays sanitized.
+    hc = ingest_history()
+    write_ev(hc, 1, records=[ev_record(ts=810.0)])
+    hc._conn.execute("DELETE FROM journal_ingest_state")
+    hc._conn.commit()
+    raised = None
+    try:
+        hc.on_publish(snap(), 1)
+    except Exception as exc:  # noqa: BLE001 -- the point is: none
+        raised = type(exc).__name__
+    runs_c, events_c, st_c, audit_c = journal_dump(hc)
+    out["struct_publish_not_raised_sample_lands"] = (
+        raised is None and len(rows_of(hc)[0]) == 1
+        and hc.health()["enabled"])
+    out["struct_journal_state_frozen"] = (
+        not runs_c and not events_c and not audit_c and st_c is None
+        and hc.journal_status()["terminal_seq"] is None
+        and hc.journal_status()["blocked_at"] is None)
+    hhs = hc.health()
+    out["struct_health_degraded_sanitized"] = (
+        hhs["degraded"]
+        and hhs["last_error_code"] == CODE_SCHEMA_UNSUPPORTED
+        and not any(s in json.dumps(hhs, default=str) for s in SENTINELS))
+    hc._t[0] = T0 + 11.0
+    hc.on_publish(snap(), 2)
+    runs_c2, _ec2, st_c2, _ac2 = journal_dump(hc)
+    out["struct_second_publish_still_contained"] = (
+        len(rows_of(hc)[0]) == 2 and hc.health()["enabled"]
+        and hc.health()["degraded"])
+    out["struct_never_recreated"] = not runs_c2 and st_c2 is None
+    hc.close()
+    # ---- BLOCKER-2 regression (review round 2): a filename-valid,
+    # regular, in-size exchange file whose BYTES cannot be decoded must
+    # never escape the journal boundary through the contract's
+    # text-mode read. It is classified with a frozen CLOSED disposition
+    # code and follows the frozen malformed-file semantics exactly:
+    # terminal rejection settles ONCE, zero rows, higher seqs continue,
+    # the ordinary sample write lands, nothing hostile persists.
+    HOSTILE = bytes([0x81, 0xFF, 0x81, 0xFE, 0xFF, 0x81])
+    enc = locale.getpreferredencoding(False)
+    try:
+        HOSTILE.decode(enc)
+        # decodable junk in this locale: still a terminal rejection,
+        # carried under the OTHER frozen closed code
+        expect = "exchange_bad_json"
+    except (UnicodeDecodeError, LookupError, ValueError):
+        expect = "exchange_unreadable"
+    hu8 = ingest_history()
+    with open(os.path.join(hu8._out, "ev-1.jsonl"), "wb") as fh:
+        fh.write(json.dumps(ev_header(1), sort_keys=True).encode()
+                 + b"\n" + HOSTILE + b"\n")
+    write_ev(hu8, 2, records=[ev_record(ts=850.0)])
+    raised2 = None
+    try:
+        hu8.on_publish(snap(), 1)
+    except Exception as exc:  # noqa: BLE001
+        raised2 = type(exc).__name__
+    runs_u, events_u, st_u, audit_u = journal_dump(hu8)
+    out["undecodable_no_escape_sample_lands"] = (
+        raised2 is None and len(rows_of(hu8)[0]) == 1
+        and hu8.health()["enabled"] and not hu8.health()["degraded"])
+    out["undecodable_rejected_once_frozen_code"] = (
+        audit_u == [("rejected", 1, expect)] and st_u == (2, 2, 0, 1))
+    out["undecodable_zero_rows_higher_seq_continues"] = (
+        [x[0] for x in runs_u] == [2] and [x[0] for x in events_u] == [2])
+    blob_u = raw_db_bytes(hu8)
+    stt_u = json.dumps(hu8.journal_status(), sort_keys=True, default=str)
+    out["undecodable_hostile_bytes_absent"] = (
+        HOSTILE not in blob_u and hu8._out not in stt_u
+        and expect in JOURNAL_AUDIT_CODES)
+    write_ev(hu8, 3, records=[ev_record(ts=860.0)])
+    hu8._t[0] = T0 + 11.0
+    hu8.on_publish(snap(), 2)
+    _r3, _e3, st3, _a3 = journal_dump(hu8)
+    out["undecodable_next_seq_still_correct"] = (
+        st3 == (3, 3, 0, 1) and not hu8.health()["degraded"])
+    hu8.close()
     return out
 
 
@@ -2412,6 +2495,16 @@ check 'd["swallow_sample_write_succeeds"]' "same-publish: journal fail + sample 
 check 'd["swallow_health_not_swallowed"]' "same-publish: degraded + ingest code SURVIVE the successful write"
 check 'd["swallow_no_leapfrog_no_terminal"]' "same-publish: blocked seq held, terminal unmoved, no leapfrog"
 check 'd["swallow_recovers_on_clean_pass"]' "next clean ingest pass is the recovery: healthy again"
+check 'd["struct_publish_not_raised_sample_lands"]' "R2-B1: structural refusal never raises; P1 sample lands"
+check 'd["struct_journal_state_frozen"]' "R2-B1: journal state frozen: no rows, no terminal, never recreated"
+check 'd["struct_health_degraded_sanitized"]' "R2-B1: degraded surfaces the sanitized schema code only"
+check 'd["struct_second_publish_still_contained"]' "R2-B1: containment repeats on later publishes; P1 keeps writing"
+check 'd["struct_never_recreated"]' "R2-B1: missing continuity row is failed closed, never repaired"
+check 'd["undecodable_no_escape_sample_lands"]' "R2-B2: undecodable file never escapes on_publish; P1 lands"
+check 'd["undecodable_rejected_once_frozen_code"]' "R2-B2: frozen terminal rejection settles exactly once"
+check 'd["undecodable_zero_rows_higher_seq_continues"]' "R2-B2: zero rows for the hostile seq; higher seqs continue"
+check 'd["undecodable_hostile_bytes_absent"]' "R2-B2: hostile bytes absent from DB and status surface"
+check 'd["undecodable_next_seq_still_correct"]' "R2-B2: subsequent valid sequence stays exactly-once"
 
 printf '\n== RESULT: %d passed, %d failed ==\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] && [ "$PASS" -eq "$EXPECTED_PASS" ] || { printf '  (failures, or a section did not fully run)\n'; exit 1; }
