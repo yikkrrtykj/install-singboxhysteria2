@@ -34,16 +34,23 @@ usage() {
 
 commands:
   install [--repair] [--allow-downgrade] [--no-start]   收敛到仓库 VERSION（幂等）
+                                                        （含 journal-reader 激活事务：
+                                                        身份/目录/运行时/unit/启动，
+                                                        任一步失败整体回滚）
   upgrade                                               等价 install（未安装则拒绝）
-  rollback [release-id]                                 回滚 release（只重启 monitor）
+  rollback [release-id]                                 回滚 release（只重启 monitor +
+                                                        reader 运行时/状态按事务前恢复；
+                                                        绝不触碰 sing-box / sbox-cm）
   web-setup                                             以 sboxweb 身份运行已评审的
                                                         webapp.py setup（交互式；
                                                         白名单/口令/恢复键）
   history                                               release 历史
-  health                                                输出分离式健康 JSON
-  status                                                版本 + 目录 + 服务状态
+  health                                                输出分离式健康 JSON（只读）
+  status                                                版本 + 目录 + 服务状态（只读）
   uninstall [--purge-state] [--purge-config] [--purge-backups]
-                                                        卸载（默认保留状态/配置/备份）
+                                                        卸载 Monitor + reader（unit/运行时
+                                                        移除；reader 状态/输出与身份默认
+                                                        保留，--purge-state 一并清除数据）
 EOF
 }
 
@@ -235,6 +242,10 @@ _cmd_install_locked() { # <install|upgrade> [flags...]
     sbmon_record_environment   # diagnostics only (no secrets)
     [ -f "$DEPLOY_DIR/singbox-monitor.service.in" ] || sbmon_die "缺少 unit 模板"
     [ -d "$SBMON_REPO_MONITOR_DIR" ] || sbmon_die "缺少 monitor-v2 源目录: $SBMON_REPO_MONITOR_DIR"
+    # PR-2B: reader activation gate -- non-mutating. A wrong-shaped existing
+    # sbox-jr identity or a missing verify/readability tool stops the WHOLE
+    # command here, before any staging (spec §3: never "quietly fix").
+    sbmon_sboxjr_activation_preflight
 
     # F4: precondition re-check under the lock. A concurrent uninstall may
     # have completed between the CLI call and this point -- upgrade must
@@ -294,6 +305,10 @@ _cmd_install_locked() { # <install|upgrade> [flags...]
         old_unit_backup="$(mktemp "$(dirname -- "$SBMON_UNIT_FILE")/.pretxn.XXXXXX")"
         cp -a -- "$SBMON_UNIT_FILE" "$old_unit_backup"
     fi
+    # PR-2B: reader transaction pre-state (active/enabled/unit/runtime-link/
+    # identity-created), captured under the same deploy lock BEFORE any
+    # mutation of this transaction.
+    sbmon_sboxjr_capture_prestate
 
     local new_id=""
     if [ "$action" = "fresh" ] || [ "$action" = "upgrade" ] || [ "$action" = "repair" ] || [ "$action" = "downgrade" ]; then
@@ -308,8 +323,19 @@ _cmd_install_locked() { # <install|upgrade> [flags...]
     # activation, unit atomic write, daemon-reload, restart/enable, and the
     # active gate -- runs inside sbmon_apply_candidate, which only RETURNS
     # nonzero (never exits). Any failure enters the same rollback path here.
+    # PR-2B: the reader activation transaction is part of the SAME gate:
+    # monitor first (primary product), then the reader producer service;
+    # a reader failure rolls the whole deployment back (no Monitor-new /
+    # reader-half state can be committed).
+    local deploy_rc=0
     if ! sbmon_apply_candidate "$new_id" "$was_active" "$OPT_NO_START"; then
+        deploy_rc=1
+    elif ! sbmon_sboxjr_converge "$new_id" "$OPT_NO_START" 0; then
+        deploy_rc=1
+    fi
+    if [ "$deploy_rc" != 0 ]; then
         sbmon_warn "candidate 部署失败，进入事务回滚"
+        sbmon_sboxjr_restore_prestate
         if [ "$old_unit_existed" = 1 ] || [ -n "$current_id" ]; then
             sbmon_txn_rollback "$current_id" "$old_unit_backup" "$old_unit_existed" "$was_active" "$old_enabled"
         else
@@ -330,6 +356,7 @@ _cmd_install_locked() { # <install|upgrade> [flags...]
         sbmon_prune_releases
     fi
     rm -f -- "$old_unit_backup" 2>/dev/null || true
+    rm -f -- "$SBOXJR_PRE_UNIT_BACKUP" 2>/dev/null || true
 
     sbmon_report_health
     sbmon_info "install 完成（action=$action version=$repo_version）"
@@ -437,14 +464,43 @@ _cmd_rollback_locked() { # [release-id]   (F4: runs under the deploy lock)
     fi
     [ -d "$SBMON_RELEASES_DIR/$target" ] || sbmon_die "release 不存在: $target"
 
+    # PR-2B reader compatibility gate (BEFORE any mutation): once the reader
+    # has been activated, its runtime/unit-template live INSIDE the release
+    # tree, so a rollback target must carry them -- otherwise Monitor would
+    # roll back while the reader keeps running incompatible code (the exact
+    # mixed-version state this contract forbids). A never-activated reader
+    # (pre-PR-2B dark state) stays untouched by rollback.
+    local reader_deployed=0
+    if [ -e "$SBOXJR_UNIT_FILE" ] || [ -L "$SBOXJR_LIB_DIR" ] \
+       || sbmon_sboxjr_service_active || sbmon_sboxjr_service_enabled; then
+        reader_deployed=1
+    fi
+    if [ "$reader_deployed" = 1 ] \
+       && [ ! -d "$(sbmon_sboxjr_release_runtime_dir "$target")" ]; then
+        sbmon_die "回滚目标 $target 不含 reader 运行时（pre-PR-2B release）：reader 已激活时拒绝回滚，避免 Monitor/reader 混版本；fail-closed，未做任何变更"
+    fi
+
     # R3-2: capture the full pre-state BEFORE touching anything.
     local orig_active=0 orig_enabled=0
     if sbmon_service_active; then orig_active=1; fi
     if sbmon_service_enabled; then orig_enabled=1; fi
+    sbmon_sboxjr_capture_prestate
 
     sbmon_info "回滚: $current -> $target"
+    local rollback_rc=0
     if ! sbmon_apply_rollback_target "$target" "$orig_active" "$orig_enabled"; then
+        rollback_rc=1
+    elif [ "$reader_deployed" = 1 ] && ! sbmon_sboxjr_converge "$target" 0 1; then
+        sbmon_warn "rollback: reader 运行时/unit 收敛失败"
+        rollback_rc=2
+    fi
+    if [ "$rollback_rc" != 0 ]; then
         sbmon_warn "rollback target 未能健康应用：恢复原 release $current"
+        if [ "$rollback_rc" = 2 ]; then
+            sbmon_sboxjr_restore_prestate
+        else
+            rm -f -- "$SBOXJR_PRE_UNIT_BACKUP" 2>/dev/null || true
+        fi
         if sbmon_restore_original_after_rollback "$current" "$orig_active" "$orig_enabled"; then
             sbmon_warn "已恢复到原 release（rollback 未完成）；未写入任何 history"
         else
@@ -452,6 +508,7 @@ _cmd_rollback_locked() { # [release-id]   (F4: runs under the deploy lock)
         fi
         return 1
     fi
+    rm -f -- "$SBOXJR_PRE_UNIT_BACKUP" 2>/dev/null || true
     # F1: history is a commit record -- recorded only after the rollback
     # target is activated AND the service state is verified.
     sbmon_record_history "$target" "$(tr -d ' \t\r\n' < "$SBMON_RELEASES_DIR/$target/VERSION")" "rollback"
@@ -611,6 +668,14 @@ cmd_status() {
     printf '  state:   %s\n' "$SBMON_STATE_ROOT"
     printf '  conf:    %s\n' "$(sbmon_conf_file)"
     printf '  unit:    %s\n' "$SBMON_UNIT_FILE"
+    # PR-2B reader facts -- READ-ONLY by contract (statically asserted: no
+    # enable/start/converge/ensure may ever appear in this command body).
+    printf '  jr unit:    %s\n' "$SBOXJR_UNIT_FILE"
+    local jr_state="inactive" jr_boot="disabled"
+    if sbmon_sboxjr_service_active; then jr_state=active; fi
+    if sbmon_sboxjr_service_enabled; then jr_boot=enabled; fi
+    printf '  jr state:   %s/%s\n' "$jr_state" "$jr_boot"
+    printf '  jr runtime: %s\n' "$( [ -L "$SBOXJR_LIB_DIR" ] && readlink "$SBOXJR_LIB_DIR" || printf '<none>' )"
     if [ -x "$(sbmon_health_cmd)" ]; then
         sbmon_report_health
     fi
@@ -629,10 +694,41 @@ cmd_uninstall() {
 
 _cmd_uninstall_locked() { # F4: runs under the deploy lock
     sbmon_preflight_commands   # fail closed BEFORE any mutation
-    sbmon_info "卸载 Monitor（仅 Monitor；不触碰 sing-box / 代理凭据 / 配置）"
+    sbmon_info "卸载 Monitor + journal-reader（仅两者；不触碰 sing-box / sbox-cm / 代理凭据 / 配置）"
     # R4-2: idempotency comes from CHECKING state, never from swallowing
     # errors. Already-absent states are fine; a FAILED stop/disable aborts
     # BEFORE any destructive deletion.
+    # PR-2B: the reader is dismantled FIRST (its runtime lives inside the
+    # release tree that is deleted below). Default retention mirrors the
+    # Monitor: unit + runtime link go, identity + reader state/output data
+    # stay unless --purge-state is given explicitly.
+    if sbmon_sboxjr_service_active; then
+        if ! sbmon_sboxjr_service_stop; then
+            sbmon_die "reader 服务停止失败：拒绝在 reader 运行时删除部署文件"
+        fi
+    fi
+    if sbmon_sboxjr_service_enabled; then
+        if ! sbmon_sboxjr_service_disable; then
+            sbmon_die "reader 服务 disable 失败：拒绝在 enabled 状态下删除部署文件"
+        fi
+    fi
+    if sbmon_sboxjr_service_active; then
+        sbmon_critical "卸载前校验失败：reader 仍处于运行状态"
+    fi
+    if sbmon_sboxjr_service_enabled; then
+        sbmon_critical "卸载前校验失败：reader 仍处于 enabled 状态"
+    fi
+    if [ -e "$SBOXJR_UNIT_FILE" ]; then
+        if ! rm -f -- "$SBOXJR_UNIT_FILE"; then
+            sbmon_critical "reader unit 删除失败（卸载已开始，处于部分删除状态）；需要人工处理"
+        fi
+        if ! sbmon_systemctl daemon-reload; then
+            sbmon_critical "reader unit 删除后 daemon-reload 失败；需要人工处理"
+        fi
+    fi
+    if ! sbmon_sboxjr_unlink_runtime; then
+        sbmon_critical "reader 运行时链接删除失败（拒绝经它删除真实目录）；需要人工处理"
+    fi
     if sbmon_service_active; then
         if ! sbmon_service_stop_strict; then
             sbmon_die "服务停止失败：拒绝在 Monitor 运行时删除部署文件"
@@ -665,11 +761,14 @@ _cmd_uninstall_locked() { # F4: runs under the deploy lock
         sbmon_critical "release 树删除失败（部分卸载状态）；需要人工处理"
     fi
     if [ "$OPT_PURGE_STATE" = 1 ]; then
-        sbmon_info "--purge-state: 删除 $SBMON_STATE_ROOT（auth/access/state）"
+        sbmon_info "--purge-state: 删除 $SBMON_STATE_ROOT（auth/access/state）与 $SBOXJR_DATA_ROOT（reader cursor/state/输出）"
         rm -rf -- "$SBMON_STATE_ROOT"
+        rm -rf -- "$SBOXJR_DATA_ROOT"
     else
         sbmon_info "保留状态目录（auth/access/state）: $SBMON_STATE_ROOT（--purge-state 可删除）"
+        sbmon_info "保留 reader 诊断数据（cursor/state/exchange）: $SBOXJR_DATA_ROOT（--purge-state 可删除）"
     fi
+    sbmon_info "保留系统身份 $SBOXJR_USER/$SBMON_USER（卸载从不删除账号；如需清除请人工 userdel）"
     if [ "$OPT_PURGE_CONFIG" = 1 ]; then
         sbmon_info "--purge-config: 删除 $SBMON_CONF_DIR"
         rm -rf -- "$SBMON_CONF_DIR"

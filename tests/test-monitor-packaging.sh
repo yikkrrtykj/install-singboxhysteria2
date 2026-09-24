@@ -99,6 +99,12 @@ if [ "$SYMLINKS_OK" != 1 ]; then
 fi
 
 # Mock systemctl: records every invocation; simulates unit state transitions.
+# PR-2B: state is PER-UNIT. singbox-monitor keeps the legacy files (every
+# scenario seeds/inspects them); any other unit (e.g. singbox-journal-reader)
+# gets its own default-inactive/disabled files, so reader probes can never
+# observe -- or corrupt -- monitor state through a shared global. Failure
+# injection files stay monitor-scoped: reader activation is INERT in this
+# fixture (FIX_SRC ships no journal_reader/ tree) and must emit no calls.
 MOCK_CALL_LOG="$TMP/systemctl-calls.log"
 MOCK_SYS_STATE="$TMP/unit-state"
 MOCK_ENABLED_STATE="$TMP/unit-enabled"
@@ -109,11 +115,20 @@ cat > "$TMP/bin/systemctl-mock" <<MOCK
 #!/usr/bin/env bash
 printf 'systemctl %s\n' "\$*" >> "\$MOCK_CALL_LOG"
 op="\$1"; shift
+unit=""
+for a in "\$@"; do case "\$a" in --*) ;; *) unit="\$a" ;; esac; done
+unit="\${unit%.service}"
+MONITOR_SCOPED=1
+sf="\$MOCK_SYS_STATE"; ef="\$MOCK_ENABLED_STATE"
+if [ -n "\$unit" ] && [ "\$unit" != "singbox-monitor" ]; then
+    MONITOR_SCOPED=0
+    sf="\$MOCK_SYS_STATE.\$unit"; ef="\$MOCK_ENABLED_STATE.\$unit"
+fi
 case "\$op" in
   is-active)
     # SKIP file: first K calls behave normally (e.g. the transaction
     # capture must observe the REAL state); COUNT file: next N calls fail.
-    if [ -f "\$MOCK_FAIL_IS_ACTIVE_SKIP" ]; then
+    if [ "\$MONITOR_SCOPED" = 1 ] && [ -f "\$MOCK_FAIL_IS_ACTIVE_SKIP" ]; then
       m="\$(cat "\$MOCK_FAIL_IS_ACTIVE_SKIP" 2>/dev/null || echo 0)"
       if [ "\$m" -gt 0 ] 2>/dev/null; then
         echo "\$((m - 1))" > "\$MOCK_FAIL_IS_ACTIVE_SKIP"
@@ -126,18 +141,16 @@ case "\$op" in
         fi
       fi
       fi
-    else
-      if [ -f "\$MOCK_FAIL_IS_ACTIVE_COUNT" ]; then
+    elif [ "\$MONITOR_SCOPED" = 1 ] && [ -f "\$MOCK_FAIL_IS_ACTIVE_COUNT" ]; then
         n="\$(cat "\$MOCK_FAIL_IS_ACTIVE_COUNT" 2>/dev/null || echo 0)"
         if [ "\$n" -gt 0 ] 2>/dev/null; then
           echo "\$((n - 1))" > "\$MOCK_FAIL_IS_ACTIVE_COUNT"
           exit 1
         fi
-      fi
     fi
-    [ "\$(cat "\$MOCK_SYS_STATE" 2>/dev/null || echo inactive)" = "active" ] && exit 0 || exit 1 ;;
+    [ "\$(cat "\$sf" 2>/dev/null || echo inactive)" = "active" ] && exit 0 || exit 1 ;;
   is-enabled)
-    [ "\$(cat "\$MOCK_ENABLED_STATE" 2>/dev/null || echo disabled)" = "enabled" ] && exit 0 || exit 1 ;;
+    [ "\$(cat "\$ef" 2>/dev/null || echo disabled)" = "enabled" ] && exit 0 || exit 1 ;;
   daemon-reload)
     if [ -f "\$MOCK_FAIL_DAEMON_RELOAD_COUNT" ]; then
       n="\$(cat "\$MOCK_FAIL_DAEMON_RELOAD_COUNT" 2>/dev/null || echo 0)"
@@ -152,33 +165,33 @@ case "\$op" in
     # of enable --now fails (unit enabled, service inactive).
     now=0
     for a in "\$@"; do [ "\$a" = "--now" ] && now=1; done
-    if [ "\$now" = 1 ] && [ -n "\${MOCK_FAIL_START:-}" ]; then
-      echo enabled > "\$MOCK_ENABLED_STATE"
+    if [ "\$now" = 1 ] && [ "\$MONITOR_SCOPED" = 1 ] && [ -n "\${MOCK_FAIL_START:-}" ]; then
+      echo enabled > "\$ef"
       echo "mock: start failed" >&2; exit 1
     fi
-    echo enabled > "\$MOCK_ENABLED_STATE"
-    if [ "\$now" = 1 ]; then echo active > "\$MOCK_SYS_STATE"; fi
+    echo enabled > "\$ef"
+    if [ "\$now" = 1 ]; then echo active > "\$sf"; fi
     exit 0 ;;
   stop)
-    if [ -f "\$MOCK_FAIL_STOP" ]; then
+    if [ "\$MONITOR_SCOPED" = 1 ] && [ -f "\$MOCK_FAIL_STOP" ]; then
       echo "mock: stop failed" >&2; exit 1
     fi
-    echo inactive > "\$MOCK_SYS_STATE"; exit 0 ;;
+    echo inactive > "\$sf"; exit 0 ;;
   restart)
-    if [ -n "\${MOCK_FAIL_START:-}" ]; then echo "mock: restart failed" >&2; exit 1; fi
-    if [ -f "\$MOCK_FAIL_RESTART_ONCE" ]; then
+    if [ "\$MONITOR_SCOPED" = 1 ] && [ -n "\${MOCK_FAIL_START:-}" ]; then echo "mock: restart failed" >&2; exit 1; fi
+    if [ "\$MONITOR_SCOPED" = 1 ] && [ -f "\$MOCK_FAIL_RESTART_ONCE" ]; then
       rm -f "\$MOCK_FAIL_RESTART_ONCE"
       echo "mock: one-shot restart failure" >&2; exit 1
     fi
-    echo active > "\$MOCK_SYS_STATE"; exit 0 ;;
+    echo active > "\$sf"; exit 0 ;;
   disable)
-    if [ -f "\$MOCK_FAIL_DISABLE" ]; then
+    if [ "\$MONITOR_SCOPED" = 1 ] && [ -f "\$MOCK_FAIL_DISABLE" ]; then
       echo "mock: disable failed" >&2; exit 1
     fi
     now=0
     for a in "\$@"; do [ "\$a" = "--now" ] && now=1; done
-    echo disabled > "\$MOCK_ENABLED_STATE"
-    if [ "\$now" = 1 ]; then echo inactive > "\$MOCK_SYS_STATE"; fi
+    echo disabled > "\$ef"
+    if [ "\$now" = 1 ]; then echo inactive > "\$sf"; fi
     exit 0 ;;
   *)
     exit 0 ;;
