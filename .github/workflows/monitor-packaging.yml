@@ -24,6 +24,12 @@ jobs:
       - uses: actions/checkout@v4
       - name: Run Monitor v2 packaging test suite (fixture identity)
         run: bash tests/test-monitor-packaging.sh
+      # §3 HARD GATE of PR-2B: the formally staged immutable release must
+      # carry AND import the ingest contract. That is a packaging property, so
+      # the integration suite runs in this lane too (it also runs in
+      # shell-tests; a redundant green is cheap compared to a missed gate).
+      - name: "Run PR-2B integration suite (release packaging carries + imports the ingest contract, dual-ref retention, v1->v2 migration through the installed release)"
+        run: bash tests/test-monitor-v2-p2b-integration.sh
 
   packaging-root:
     # F3: a second root pass runs user/group management and file metadata

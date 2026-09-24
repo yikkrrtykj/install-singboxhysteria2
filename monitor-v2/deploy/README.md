@@ -583,3 +583,215 @@ integration（modify_singbox/process_doko 等的 config.lock 问题）。
   同一函数）；非法值在 `exec` 前 fail-closed；缺省=1；健康新鲜度 `ceil(5*poll+15)`。
 - **E web-setup 干净环境**：`env -i` + 仅 HOME/PATH/SSH_CONNECTION；root 先 `command -v` 解析
   python 绝对路径；不继承调用者环境；口令/恢复键不进 argv/env/journal；stdin/stdout/stderr/TTY 保留。
+
+## 15. Integration Round PR-2B — sbox-journal-reader 激活事务（issue #33 P2）
+
+PR-2A 的 reader 资产（`journal_reader/`、wrapper、unit 模板）当时是 DARK（零生产接线）。
+PR-2B 将其接入 installer，且完全服从既有事务语义（deploy lock / 不可变 release / 原子
+链接 / 预状态捕获 → apply → 回滚 / history 只在门通过后写入）：
+
+- **激活序列（唯一路径）**：`sbmon_sboxjr_activation_preflight` →（installer 常规步骤）→
+  `sbmon_sboxjr_capture_prestate` → `sbmon_sboxjr_converge`：
+  exact identity → 数据目录 → release 内运行时链接 → unit render →
+  `systemd-analyze verify`（临时 `.jr-verify.$$.service`，dot 前缀不进 unit 加载器）→
+  unit 原子安装 + daemon-reload → enable/start → health proof。每一步只 RETURN 非零
+  （R3-7），失败即由 `_cmd_install_locked` 走 `sbmon_sboxjr_restore_prestate` + 既有
+  monitor 事务回滚；首次部署失败走 fresh cleanup。
+- **身份（§3 / R7）**：`sbox-jr` 只在完全不存在时创建（groupadd→useradd→usermod，
+  nologin + /nonexistent + 组集恰为 {sbox-jr, systemd-journal}）；既有异形身份 =
+  preflight 停机、零变更、绝不"顺手修"；无 root/sboxweb fallback。
+- **目录（§4）**：`/var/lib/sbox-journal` root:sbox-jr 0750；`state` 0700 sbox-jr；
+  `out` 2750 sbox-jr:sboxweb（交换组恰为 Monitor 读侧）；symlink/非目录 fail-closed。
+- **运行时版本共位（§8）**：reader 代码按 12+1+1 显式 manifest 打进每个不可变 release 的
+  `libexec/sbox-journal-reader/`；`/usr/local/lib/singbox-journal-reader` 只是原子翻转的
+  symlink。因此 Monitor rollback 必然带回版本一致的 reader 代码与 unit 模板；reader 已激活
+  而回滚目标缺 libexec → 直接拒绝回滚（绝不出现 Monitor 旧、reader 新）。retention 剪枝
+  保护链接所指 release。
+- **运行时链接 provenance 三态（review round）**：`sbmon_sboxjr_runtime_linked_id` 严格
+  区分 ① 非 symlink → 空（合法：reader 从未链接）；② 目标恰为
+  `$SBMON_RELEASES_DIR/<id>/libexec/sbox-journal-reader`（单段 release id + 通过 manifest
+  审计）→ 输出该精确 id；③ 其它任何 symlink（releases 外路径——即使后缀恰好相同、错误
+  深度、错误后缀、断链、审计不过）→ rc1 + 明确要求人工处理。install/upgrade 在 preflight
+  于任何 mutation 前拒绝，pre-state 捕获与 retention 剪枝同样 fail-closed 拒绝；非法链接
+  绝不做 basename 猜测、绝不视为"不存在"、绝不静默覆盖。
+- **pre-state 矩阵**：install/upgrade 终态 = enabled+active；rollback 用 keep-prestate
+  语义精确保持事务前 active/enabled/unit/link 事实（enabled+inactive 不被"顺手拉起"）；
+  `--no-start` 只落文件。
+- **uninstall（§13）**：reader 先于 Monitor 拆（checked-first strict stop/disable，失败在
+  任何删除前中止）；unit 删除 + daemon-reload + 仅删 symlink（真实目录拒绝）；默认保留
+  身份与诊断数据，`--purge-state` 才清数据根；幂等。
+- **低层 INERT staging（仅 `sbmon_stage_release`）**：源树完全不含 `journal_reader/` 时，
+  低层 staging 产出一个无 libexec 的历史形状 release（建模 pre-PR-2B 回滚目标）；部分
+  缺失 = manifest fail-closed。顶层 `install` / `upgrade` 从第 18 节起**不再**接受这种源树
+  （见 §18/§19），因此这条低层分支只能由测试直接调用库来触达。
+- **边界不变（§9/§10/§18）**：全程零 sing-box 操作、零 sbox-cm/management.active 引用、
+  零新增 env/secret 通道（unit 唯一 Environment=SBOX_JR_UNIT）。
+- **测试**：`tests/test-monitor-v2-jr-deploy.sh`（fail-closed/回滚矩阵/invariant 扫描；
+  非符号链接平台诚实 SKIP，Linux 门零 SKIP）+ `tests/test-monitor-v2-jr.sh`（PR-2A 资产
+  契约 + 接线 confinement）。真实 systemd enable/start、PID/进程身份与 heartbeat 实机
+  证明由 `tests/journal-reader/test-jr-live.sh`（matrix lane，REQUIRE_LIVE）承担。
+
+## 16. Integration Round PR-2B — Monitor 侧 contract 导入与随包 probe
+
+§15 让 reader 代码进入每个不可变 release；本节是 Monitor 真正**用得到**它的唯一路径，
+以及它必须保持的性质：
+
+- **单一推导源**：`<release>/libexec/sbox-journal-reader` 由
+  `monitor_env_contract_pythonpath` 从调用者自身所在 release 推导；
+  `monitor_env_apply_contract_pythonpath` 负责把它变成运行时环境（PYTHONPATH 恰为该路径，
+  否则完全 unset）。`monitor-service` 与 `monitor-contract-probe` 都只调用这两个函数，
+  绝不各自拼路径 —— 继承来的/操作者给的 PYTHONPATH 与仓库 checkout 都不得为安装包"代答"
+  （两个方向都不行）。
+- **随包 probe**：`bin/monitor-contract-probe` 是 release 的一部分（staged、0755、
+  `bash -n` 校验）。它从**已安装 release** 内真实 import 合同模块，用被导入模块自身的
+  realpath 报告来源，rc 仅在 `contract_available && journal_status 一致 && 路径落在 release 内
+  && 环境一致` 时为 0；删除或破坏 release 内的合同文件必然让 probe 与所有引用它的门变红。
+  绝对路径只出现在这个 operator/test 面，绝不进入用户可见 status/API。
+- **导入必须零写入（关键性质）**：CPython 会把字节码缓存写进
+  `<release>/libexec/sbox-journal-reader/journal_reader/__pycache__/`，而 §15 的
+  manifest 审计是**精确文件集**比较（多余条目同样 fail-closed）。因此一次只读的 probe
+  运行就会让**下一次**部署/剪枝对一个完全健康的 release 拒绝执行。规则集中在共享 helper
+  里：`PYTHONDONTWRITEBYTECODE=1` —— 导入 release 即不改变 release。
+  `tests/test-monitor-v2-p2b-integration.sh` 在两次真实导入（probe + monitor-service 生命周期）
+  之后重新断言 release 内无 `__pycache__`、reader 链接 provenance 与 manifest 审计仍为绿。
+- **测试**：`tests/test-monitor-v2-p2b-integration.sh`（§3 packaging 硬门 + §4 双活引用版本
+  耦合 + §5 retention 双保护 + §9 v1→v2 迁移经由已安装 release + 反伪造负例）。
+
+## 17. Integration Review Round 1 — 三条顺序/完整性/路径不变量（PR #54）
+
+这一轮不改设计，只把三处**只在失败路径上才成立**的隐含假设变成显式契约：
+
+- **B1 回滚顺序：先恢复代码，最后才碰进程**（`sbmon_sboxjr_restore_prestate`）。
+  旧顺序先 restart 再恢复 unit/运行时链接：N→N+1 升级失败时，reader 会在**仍指向
+  N+1 的运行时链接**上被重启，随后链接才被指回 N —— 两条 live 链接都显示 N，
+  而**运行中的进程是 N+1**，任何基于链接的断言都看不见。新顺序为
+  unit(+daemon-reload) → enable 事实 → 运行时链接 → active 重启/停止 → 身份清理。
+  enable/disable 归入"代码组"是有意的：它们是裸 `enable`（从不 `--now`），既不启动
+  也不停止进程，因此不可能加载候选代码，却能让链接恢复失败时残留未补偿的 enabled。
+  判据：systemctl mock 在**每次调用那一刻**解析并记录 `runtime=<release-id>`，
+  `tests/test-monitor-v2-jr-deploy.sh` 据此断言"最后一次 reader 变更是恢复重启，
+  且其运行时已经是恢复后的 release"，升级失败与回滚失败两个方向各一条。
+  （第 18 节 B6 把这条顺序限定在 `PRE_ACTIVE=1`：事务前 inactive 时，stop 必须**先于**
+  unit/运行时链接的拆除。）
+- **B2 回滚目标完整性早于任何变更**（`_cmd_rollback_locked`）。旧门只检查目标 release
+  的 reader 运行时目录**存在**；一个目录在但 12+1+1 manifest 已破损的目标，要等到
+  `sbmon_sboxjr_converge()` 才发现，而那时 Monitor 已经切换链接、重启、重写了 unit。
+  现在在同一位置复用与链接切换**完全相同**的 `sbmon_sboxjr_audit_runtime`，
+  在 capture prestate 之前审计，失败即 fail-closed 且零变更。
+  负例测试证明：rc≠0、两条 live 引用不变、拒绝窗口内零状态变更 systemctl 调用、
+  零 history；把被删的模块补回去后同一回滚立即成功 —— 拒绝依据确实是 manifest。
+- **B3 真实运行时必须落在物理 release 上**。probe 早就用 `pwd -P`，而
+  `monitor-service` 的 `APP_DIR` 用的是逻辑 `pwd`：经 `$SBMON_APP_LINK` 启动的服务会把
+  合同 PYTHONPATH 导出成**可变 live 符号链接**下的路径，于是"不可变 release"里的代码
+  会随下一次激活翻转而改变。现在 `APP_DIR` 用 `pwd -P`，且共享推导
+  `monitor_env_contract_pythonpath` 自身先规范化的 `$1`（单一规则，两个调用者都继承）。
+  判据：经 live 链接启动 `bin/monitor-service`，用记录 `PYTHONPATH` 后再
+  `exec` 真解释器的 wrapper 见证，断言其恰为
+  `$(cd releases/<id> && pwd -P)/libexec/sbox-journal-reader`，且永不出现
+  `/<live-link>/` 片段；`PYTHONDONTWRITEBYTECODE=1` 保留，导入后 release 仍零
+  `__pycache__`。
+
+
+## 18. Integration Review Round 2 — 载荷缺失、boot-enable 轴与 PRE_ACTIVE 分支（PR #54）
+
+### B4：正式安装不得"成功但 INERT"
+§3 把"release 携带并可导入 ingest contract"写进了 release 的**定义**。因此顶层
+`install` / `upgrade` 在源树完全没有 `journal_reader/` 载荷时，必须在**任何变更之前**
+fail-closed —— 与"载荷不完整"（S3）同一级别、同一零副作用类别。以
+`contract_available=false` 收尾的安装不是一次成功部署，它是本分支存在的目的所禁止的
+混版本半状态，只是抵达路径从"顺序错误"变成"干脆缺失"。
+
+- 判据：`reader 载荷缺失` 拒绝发生在 `sbmon_sboxjr_activation_preflight`，位置早于
+  `ensure_user` / `create_layout` / `stage`，所以连 **Monitor 自己的 state 根**都不应出现
+  （测试同时断言 reader 三路与 `$SBMON_STATE_ROOT` 全部未创建、releases 目录为空、
+  零 reader systemctl 调用、无 history）。
+- 本轮初版曾保留一条"显式声明"例外（一个由调用方环境提供的变量）。第 19 节记录它
+  为什么被整条删除：调用方环境正是操作员敲下正式命令时的那个环境。
+
+### B5：运行时健康与 boot-enable 是两条独立的轴
+`sbmon_sboxjr_health_proof()` 过去无条件要求 enabled，于是"当前在跑、但不随开机自起"
+的主机**永远**无法完成 keep-prestate 回滚 —— 事务把"被要求保留的意图"当成故障去修复。
+现在期望值是参数：
+
+| 调用方 | want_enabled | 语义 |
+|---|---|---|
+| 前向激活（`converge keep=0`） | 1（默认） | enabled 是契约的一部分，缺失即失败 |
+| 保留事务前事实（`converge keep=1`） | `$SBOXJR_PRE_ENABLED` | 事务前 disabled 却变成 enabled = 漂移，同样失败 |
+
+两条轴任何一条都仍然被证明，改变的只是该轴应取的值。矩阵补齐 active/disabled 与
+inactive/disabled 两个象限：rc=0、active 仍 active、disabled 仍 disabled、零
+enable/disable 机会主义调用、两条 live 引用共同收敛到目标、成功回滚恰写一条
+history，并断言恢复路径**没有**运行（防止"回滚失败但被救回来"冒充绿色）。
+
+### B6："进程绝不跑在自己的代码之上"取决于 PRE_ACTIVE
+第 17 节的"代码先行、进程最后"只对 `PRE_ACTIVE=1` 成立。`PRE_ACTIVE=0` 时，候选可能
+已被本次事务拉起（`enable --now` 的 start 半段成功、enable 事务失败）而其后的步骤才失败；
+若先删 unit、先撤运行时链接，就是在一个仍在执行的进程下面拆掉它的地面，最后才 stop。
+
+- `PRE_ACTIVE=0`：**stop + 验证 inactive 是恢复的第一个动作**，然后才是 unit / enable 事实 /
+  运行时链接；结尾再复查一次"确实 inactive"，任何路径都不可能留下运行中的候选。
+- `PRE_ACTIVE=1`：恢复 unit/链接后，restart 仍是最后一个服务动作（同 B1）。
+- 判据：mock 记录每次调用瞬间的 `runtime=<id>`；`poststart` 场景断言 `stop` 出现在
+  失败 enable **之后**、恢复期 `daemon-reload` **之前**，且那一行仍写着候选 release 的
+  runtime id —— 证明 stop 发生时链接尚未被撤，顺序不可能反过来。
+
+## 19. Integration Review Round 3 —— 载荷硬门不接受任何调用方环境开关（PR #54）
+
+### 为什么第 18 节那条例外必须整条删除
+B4 残留只有一个问题：那条"显式声明"是**环境变量**，而正式命令的环境正是调用者
+（操作员）敲下命令时所在的环境。于是对被剥掉 `journal_reader/` 的源树，
+`<var>=1 install-monitor.sh install` 依旧能以 `contract_available=false` 成功收尾；
+"生产源码从不赋值"的静态扫描关闭不了它，赋值根本不在源码里。§3 要求正式
+install/upgrade 路径**不存在**成功的 contract_available=false 模式，所以这条开关被
+删除 —— 连标识符一起删除，好让"零出现"本身成为可机检的结构性判据。
+
+### 现在的形状
+- `sbmon_sboxjr_activation_preflight`：载荷判据无条件、与 `sbmon_die` 焊死，诊断文本
+  直接写出"此判据无任何环境变量或命令行开关可绕过"；位置仍早于 `ensure_user` /
+  `create_layout` / `stage`，所以拒绝时连 Monitor 自己的 state 根都不出现。
+- 低层 `sbmon_stage_release` 保留"源树无载荷 → 无 libexec"分支：那是测试建模
+  pre-PR-2B 历史 release 的唯一入口（S2b 直接调库构造，rbguard 手工 `rm -rf libexec`
+  构造）。顶层命令永远不接受这种源树。
+
+### 判据（tests/test-monitor-v2-jr-deploy.sh）
+| # | 判据 | 位置 |
+|---|---|---|
+| 1 | 载荷缺失 + 普通正式 install → rc≠0，命名缺失载荷与 §3 规则 | S2 |
+| 2 | 调用方环境带着被删除的旧名（值 `1`）→ 仍然 rc≠0 | S2 legacy 循环 |
+| 3 | 旧名的任意值（`1`/`0`/`yes`/`TRUE`/空）一律拒绝，5 个值各自断言 | S2 legacy 循环 |
+| 4 | 所有拒绝路径零变更：releases 空、无 Monitor state 根、reader unit/link/data 三路皆不出现、零 reader systemctl 调用 | S2 / legacy / S2b guard |
+| 5 | pre-PR-2B 无 libexec 回滚目标仍可构造：直接调用 `sbmon_stage_release`；对照同一原语在带载荷源树上会 stage 出 libexec，两侧 `contract_available` 分别 False / True | S2b |
+| 6 | install 与 upgrade 两条正式路径都不能以 INERT 收尾；upgrade 侧在真实部署上拒绝后，两条 live 链接、服务事实、history 行数与 contract 全部原样保留 | S2 / S2d（符号链接门控，Linux 执行） |
+
+### 结构性静态门与负控（S2c）
+标识符在全仓（除本套件的拒绝探针；`lab/` 不属于任何提交或 lane）零出现；库与顶层脚本
+不含 `ALLOW_INERT|INERT_BASELINE|--allow-inert` 任何变体；preflight 体内载荷判据恰好
+一次、不是 `if` 分支、且紧邻 `sbmon_die`。每条静态门都配负控：把被删除的名字重新加进
+一次性副本，门必须点亮 —— 否则"零出现"可能只是空转。
+
+### 打包车道的立场改变（tests/test-monitor-packaging.sh）
+这条车道原本的立场是"发布一个不含 reader 的历史基线"，因此它必须换立场而不是保留后门：
+现在它打包**当前载荷**（显式 12 模块清单，另加"本车道清单 == 库内
+`SBOXJR_MODULE_FILES`"静态门），并把 reader 的 runtime / unit / data 路径钉进夹具树。
+T01 因此新增正向判据：release 携带载荷、12 模块齐、wrapper + unit 模板、unit 渲染成功、
+`systemd-analyze verify` 命中点前缀临时文件且零残留、同一事务 `enable --now` reader、
+交换目录建立、符号链接形状。拆除类小节（F2c、R4-2 组、T06）要求 reader 链接真是符号
+链接 —— 在 `ln -s` 退化为目录复制的平台上，安装器**正确地**拒绝经它删除真实目录，所以
+这些小节按本车道既有政策诚实 SKIP，由 Linux 门零 SKIP 执行；`run_uninstall_quiet` 只在
+非符号链接平台清理夹具残留，生产判据一条未减。R4-2 的 daemon-reload 判据现在覆盖两个
+site（reader unit 删除后、monitor unit 删除后），mock 为此新增 SKIP 旋钮，把失败瞄准到
+后面的 site —— 只有计数旋钮时，第一个 site 抢先把失败吃掉，第二个 site 会静默失去证明。
+
+### F4：带外清除部署现在有两种形状，都必须拒绝
+F4 用 `flock` 模拟"锁被另一个部署占着，期间当前的 release 被带外删掉"，然后要求正在
+等锁的 `upgrade` 在锁内重查前置条件、失败而不是退化成一次全新安装。PR-2B 之后
+reader 运行时链接也属于"这次部署"，于是同一次带外清除有两种可达形状，两条都建了判据：
+
+- **F4a**：清除同时移除 reader 链接 → 链接是**合法缺失**，决定成败的仍是 Monitor 自己的
+  `升级前置检查`（这条判据原文保留，未被新门取代）。
+- **F4b**：清除只删 releases 与 app 链接，把 reader 链接留成悬空 → provenance 门**先**
+  拒绝（且发生在锁内），绝不把破损部署"恢复"成全新安装。悬空链接按契约就是非法
+  provenance，因此测试不许绕过它：夹具自己清掉这份它制造的残留，正如被要求"人工处理"
+  后操作员的动作。两条互为正负控：F4a 的"不含 provenance"只有在 F4b 能命中同一字串时
+  才有意义。
+

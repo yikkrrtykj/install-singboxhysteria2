@@ -286,3 +286,64 @@ monitor_env_record_environment() {
     fi
     printf 'monitor: environment kernel=%s\n' "$(uname -r)"
 }
+
+# ---------------------------------------------------------------------------
+# PR-2B: the journal_reader INGEST CONTRACT import path.
+#
+# The contract modules are bundled INTO the same immutable release tree as
+# the Monitor runtime, at <release>/libexec/sbox-journal-reader/journal_reader/.
+# The import path is therefore derived from the caller's OWN release location:
+# no env var steers it, no repository checkout can satisfy it, and a test can
+# only change the answer by changing the installed release itself.
+#
+# The <app-dir> argument is CANONICALIZED HERE (physical path), so a caller
+# that reached the release through the mutable live symlink
+# (/opt/singbox-monitor) still exports the immutable
+# releases/<id>/libexec/sbox-journal-reader. An import path that travels
+# through the live link would silently follow the next activation flip: the
+# running Monitor would keep ingesting through a release it is no longer
+# supposed to be, and the "one release unit" property would hold only for the
+# links, not for the process. Canonicalizing in the ONE derivation keeps the
+# runtime and the probe pinned to the same physical release by construction.
+#
+# RC is always 0 -- an absent payload is the documented INERT case (a
+# pre-PR-2B release ships no libexec), not a startup failure:
+#   <app-dir> -> prints the release reader tree path, or nothing when this
+#                release carries no complete contract payload.
+# ---------------------------------------------------------------------------
+monitor_env_contract_pythonpath() {
+    local root
+    root="$(cd -- "$1" 2>/dev/null && pwd -P)" || return 0
+    local jr="$root/libexec/sbox-journal-reader"
+    local f
+    [ -d "$jr/journal_reader" ] || return 0
+    for f in __init__.py ingest_contract.py schema.py; do
+        [ -f "$jr/journal_reader/$f" ] || return 0
+    done
+    printf '%s\n' "$jr"
+}
+
+# Apply the derivation to the environment of the runtime about to be exec'd:
+# PYTHONPATH becomes EXACTLY the release contract path (or disappears with it).
+# An inherited/operator-supplied PYTHONPATH therefore can never answer for the
+# installed release -- in either direction.
+#
+# Importing must never MUTATE the release: CPython would byte-compile the
+# contract into <release>/libexec/sbox-journal-reader/journal_reader/__pycache__,
+# and the reader-runtime audit compares that directory against the 12-module
+# manifest EXACTLY (missing OR unexpected entries fail closed). A single probe
+# run would therefore turn the NEXT deploy fail-closed on a healthy release --
+# so bytecode writing is switched off for everything imported through here.
+monitor_env_apply_contract_pythonpath() { # <app-dir> -> rc always 0
+    PYTHONDONTWRITEBYTECODE=1
+    export PYTHONDONTWRITEBYTECODE
+    SBMON_JR_CONTRACT_PATH="$(monitor_env_contract_pythonpath "$1")"
+    export SBMON_JR_CONTRACT_PATH
+    if [ -n "$SBMON_JR_CONTRACT_PATH" ]; then
+        PYTHONPATH="$SBMON_JR_CONTRACT_PATH"
+        export PYTHONPATH
+    else
+        unset PYTHONPATH
+    fi
+    return 0
+}

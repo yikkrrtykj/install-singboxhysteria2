@@ -99,6 +99,13 @@ if [ "$SYMLINKS_OK" != 1 ]; then
 fi
 
 # Mock systemctl: records every invocation; simulates unit state transitions.
+# PR-2B: state is PER-UNIT. singbox-monitor keeps the legacy files (every
+# scenario seeds/inspects them); any other unit (e.g. singbox-journal-reader)
+# gets its own default-inactive/disabled files, so reader probes can never
+# observe -- or corrupt -- monitor state through a shared global. Failure
+# injection files stay monitor-scoped ON PURPOSE: this lane proves the Monitor
+# transaction's own failure semantics, and a reader-side failure is proven by
+# test-monitor-v2-jr-deploy.sh, which owns the activation matrix.
 MOCK_CALL_LOG="$TMP/systemctl-calls.log"
 MOCK_SYS_STATE="$TMP/unit-state"
 MOCK_ENABLED_STATE="$TMP/unit-enabled"
@@ -109,11 +116,20 @@ cat > "$TMP/bin/systemctl-mock" <<MOCK
 #!/usr/bin/env bash
 printf 'systemctl %s\n' "\$*" >> "\$MOCK_CALL_LOG"
 op="\$1"; shift
+unit=""
+for a in "\$@"; do case "\$a" in --*) ;; *) unit="\$a" ;; esac; done
+unit="\${unit%.service}"
+MONITOR_SCOPED=1
+sf="\$MOCK_SYS_STATE"; ef="\$MOCK_ENABLED_STATE"
+if [ -n "\$unit" ] && [ "\$unit" != "singbox-monitor" ]; then
+    MONITOR_SCOPED=0
+    sf="\$MOCK_SYS_STATE.\$unit"; ef="\$MOCK_ENABLED_STATE.\$unit"
+fi
 case "\$op" in
   is-active)
     # SKIP file: first K calls behave normally (e.g. the transaction
     # capture must observe the REAL state); COUNT file: next N calls fail.
-    if [ -f "\$MOCK_FAIL_IS_ACTIVE_SKIP" ]; then
+    if [ "\$MONITOR_SCOPED" = 1 ] && [ -f "\$MOCK_FAIL_IS_ACTIVE_SKIP" ]; then
       m="\$(cat "\$MOCK_FAIL_IS_ACTIVE_SKIP" 2>/dev/null || echo 0)"
       if [ "\$m" -gt 0 ] 2>/dev/null; then
         echo "\$((m - 1))" > "\$MOCK_FAIL_IS_ACTIVE_SKIP"
@@ -126,19 +142,29 @@ case "\$op" in
         fi
       fi
       fi
-    else
-      if [ -f "\$MOCK_FAIL_IS_ACTIVE_COUNT" ]; then
+    elif [ "\$MONITOR_SCOPED" = 1 ] && [ -f "\$MOCK_FAIL_IS_ACTIVE_COUNT" ]; then
         n="\$(cat "\$MOCK_FAIL_IS_ACTIVE_COUNT" 2>/dev/null || echo 0)"
         if [ "\$n" -gt 0 ] 2>/dev/null; then
           echo "\$((n - 1))" > "\$MOCK_FAIL_IS_ACTIVE_COUNT"
           exit 1
         fi
+    fi
+    [ "\$(cat "\$sf" 2>/dev/null || echo inactive)" = "active" ] && exit 0 || exit 1 ;;
+  is-enabled)
+    [ "\$(cat "\$ef" 2>/dev/null || echo disabled)" = "enabled" ] && exit 0 || exit 1 ;;
+  daemon-reload)
+    # SKIP file: tolerate the first K reloads (so a probe can target a LATER
+    # reload site); COUNT file: the next N reloads fail. Same shape as
+    # is-active above. Used to aim a failure at the reader site or the
+    # monitor site of an uninstall, which the counted knob alone cannot
+    # separate (the reader always reloads first).
+    if [ -f "\$MOCK_FAIL_DAEMON_RELOAD_SKIP" ]; then
+      m="\$(cat "\$MOCK_FAIL_DAEMON_RELOAD_SKIP" 2>/dev/null || echo 0)"
+      if [ "\$m" -gt 0 ] 2>/dev/null; then
+        echo "\$((m - 1))" > "\$MOCK_FAIL_DAEMON_RELOAD_SKIP"
+        exit 0
       fi
     fi
-    [ "\$(cat "\$MOCK_SYS_STATE" 2>/dev/null || echo inactive)" = "active" ] && exit 0 || exit 1 ;;
-  is-enabled)
-    [ "\$(cat "\$MOCK_ENABLED_STATE" 2>/dev/null || echo disabled)" = "enabled" ] && exit 0 || exit 1 ;;
-  daemon-reload)
     if [ -f "\$MOCK_FAIL_DAEMON_RELOAD_COUNT" ]; then
       n="\$(cat "\$MOCK_FAIL_DAEMON_RELOAD_COUNT" 2>/dev/null || echo 0)"
       if [ "\$n" -gt 0 ] 2>/dev/null; then
@@ -152,33 +178,33 @@ case "\$op" in
     # of enable --now fails (unit enabled, service inactive).
     now=0
     for a in "\$@"; do [ "\$a" = "--now" ] && now=1; done
-    if [ "\$now" = 1 ] && [ -n "\${MOCK_FAIL_START:-}" ]; then
-      echo enabled > "\$MOCK_ENABLED_STATE"
+    if [ "\$now" = 1 ] && [ "\$MONITOR_SCOPED" = 1 ] && [ -n "\${MOCK_FAIL_START:-}" ]; then
+      echo enabled > "\$ef"
       echo "mock: start failed" >&2; exit 1
     fi
-    echo enabled > "\$MOCK_ENABLED_STATE"
-    if [ "\$now" = 1 ]; then echo active > "\$MOCK_SYS_STATE"; fi
+    echo enabled > "\$ef"
+    if [ "\$now" = 1 ]; then echo active > "\$sf"; fi
     exit 0 ;;
   stop)
-    if [ -f "\$MOCK_FAIL_STOP" ]; then
+    if [ "\$MONITOR_SCOPED" = 1 ] && [ -f "\$MOCK_FAIL_STOP" ]; then
       echo "mock: stop failed" >&2; exit 1
     fi
-    echo inactive > "\$MOCK_SYS_STATE"; exit 0 ;;
+    echo inactive > "\$sf"; exit 0 ;;
   restart)
-    if [ -n "\${MOCK_FAIL_START:-}" ]; then echo "mock: restart failed" >&2; exit 1; fi
-    if [ -f "\$MOCK_FAIL_RESTART_ONCE" ]; then
+    if [ "\$MONITOR_SCOPED" = 1 ] && [ -n "\${MOCK_FAIL_START:-}" ]; then echo "mock: restart failed" >&2; exit 1; fi
+    if [ "\$MONITOR_SCOPED" = 1 ] && [ -f "\$MOCK_FAIL_RESTART_ONCE" ]; then
       rm -f "\$MOCK_FAIL_RESTART_ONCE"
       echo "mock: one-shot restart failure" >&2; exit 1
     fi
-    echo active > "\$MOCK_SYS_STATE"; exit 0 ;;
+    echo active > "\$sf"; exit 0 ;;
   disable)
-    if [ -f "\$MOCK_FAIL_DISABLE" ]; then
+    if [ "\$MONITOR_SCOPED" = 1 ] && [ -f "\$MOCK_FAIL_DISABLE" ]; then
       echo "mock: disable failed" >&2; exit 1
     fi
     now=0
     for a in "\$@"; do [ "\$a" = "--now" ] && now=1; done
-    echo disabled > "\$MOCK_ENABLED_STATE"
-    if [ "\$now" = 1 ]; then echo inactive > "\$MOCK_SYS_STATE"; fi
+    echo disabled > "\$ef"
+    if [ "\$now" = 1 ]; then echo inactive > "\$sf"; fi
     exit 0 ;;
   *)
     exit 0 ;;
@@ -202,6 +228,28 @@ run_install() { # run_install <outdir> [args...]
 
 run_uninstall_quiet() {
     ( "$INSTALL_MONITOR" uninstall --purge-state --purge-config --purge-backups ) >/dev/null 2>&1 || true
+    # The reader runtime link is a SYMLINK by contract, and uninstall refuses
+    # (correctly, fail-closed) to delete a real directory through it. On a
+    # platform whose `ln -s` degrades to a directory copy that refusal is the
+    # only possible outcome, so the reset helper -- not the production command
+    # -- clears the fixture leftovers here. The refusal itself is proven on
+    # Linux (this section's T06/R4-2 group and the jr-deploy uninstall matrix).
+    if [ "$SYMLINKS_OK" != 1 ]; then
+        rm -rf -- "$FIX_APP_LINK" "$SBOXJR_LIB_DIR" 2>/dev/null || true
+    fi
+    return 0
+}
+
+# Teardown/cleanup sections need a reader runtime link that IS a symlink: the
+# installer refuses (correctly, fail-closed) to delete or repoint a real
+# directory through $SBOXJR_LIB_DIR, and on a platform whose `ln -s` degrades to
+# a directory copy no such deployment can even be constructed. Those sections
+# therefore run where rename(2)+symlinks are real -- the Linux pass is the gate,
+# exactly as for the atomic-switch groups above.
+symlink_gate() { # <label> -> rc 0 = run the section, rc 1 = SKIP it
+    if [ "$SYMLINKS_OK" = 1 ]; then return 0; fi
+    printf '  SKIP %s（此平台 ln -s 为复制语义；reader 链接拆除必须是真实符号链接）\n' "$1"
+    return 1
 }
 
 # R1.1-A: fixtures that pre-create <data-root>/state must mirror the production
@@ -240,11 +288,29 @@ export SBMON_UNIT_FILE="$FIX_UNIT"
 export SBMON_BACKUP_ROOT="$FIX_BACKUPS"
 export SBMON_REPO_MONITOR_DIR="$FIX_SRC"
 export SBMON_VERSION_FILE="$FIX_SRC/VERSION"
+# PR-2B: the reader unit is now rendered and verified inside every formal
+# install of this lane. systemd-analyze's REAL verification semantics (and the
+# fail-closed-on-missing-analyzer rule) are owned by
+# test-monitor-v2-jr-deploy.sh; pinning the call to a recording stub here keeps
+# this Monitor-transaction lane deterministic on both CI identities instead of
+# newly depending on the runner's systemd, and it lets the reader unit really
+# being verified be asserted rather than assumed.
+cat > "$TMP/bin/systemd-analyze-mock" <<'SAE'
+#!/usr/bin/env bash
+printf 'systemd-analyze %s\n' "$*" >> "${SBMON_ANALYZE_LOG:-/dev/null}"
+exit 0
+SAE
+chmod +x "$TMP/bin/systemd-analyze-mock"
+export SBMON_SYSTEMD_ANALYZE="$TMP/bin/systemd-analyze-mock"
+export SBMON_ANALYZE_LOG="$TMP/systemd-analyze.log"
+: > "$SBMON_ANALYZE_LOG"
 export SBMON_API_SECRET_SOURCE="$FIX_PROXY/monitor-api.secret"
 export SBMON_HEALTH_TIMEOUT=6
 export SBMON_STATE_DIR="$FIX_STATE"   # R1: explicit DATA ROOT contract
 export MOCK_CALL_LOG MOCK_SYS_STATE MOCK_ENABLED_STATE
 export MOCK_FAIL_DAEMON_RELOAD_COUNT="$TMP/mock-fail-daemon-reload-count"
+export MOCK_FAIL_DAEMON_RELOAD_SKIP="$TMP/mock-fail-daemon-reload-skip"
+rm -f "$MOCK_FAIL_DAEMON_RELOAD_SKIP"
 export MOCK_FAIL_IS_ACTIVE_COUNT="$TMP/mock-fail-is-active-count"
 export MOCK_FAIL_IS_ACTIVE_SKIP="$TMP/mock-fail-is-active-skip"
 export MOCK_FAIL_STOP="$TMP/mock-fail-stop"
@@ -281,6 +347,49 @@ cp "$REPO_ROOT/monitor-v2/webapp.py" "$FIX_SRC/"
 cp -R "$REPO_ROOT/monitor-v2/web" "$FIX_SRC/web"
 cp -R "$REPO_ROOT/monitor-v2/api_bridge" "$FIX_SRC/api_bridge"
 rm -rf "$FIX_SRC/api_bridge/__pycache__" "$FIX_SRC/web/__pycache__"
+# PR-2B (review #54 B4 + B4-residual): the reader ingest contract is part of
+# the DEFINITION of a formal release, so every formal install/upgrade in this
+# lane ships journal_reader/ and co-activates singbox-journal-reader. There is
+# no payload-less formal install anymore, and deliberately no environment
+# switch to make one succeed. The reader's runtime/unit/data paths are pinned
+# inside the fixture tree below, exactly like the monitor's.
+mkdir -p "$FIX_SRC/journal_reader"
+# The 12-module ingest-contract manifest, spelled out here on purpose: this
+# lane must catch a release that ships a silently different set. Kept honest
+# against the library's own list by the static gate in "static checks".
+JR_MANIFEST_MODULES=(__init__.py codes.py cursor.py journal_time.py \
+    normalize.py classifier.py fingerprint.py eligibility.py schema.py \
+    state.py reader.py ingest_contract.py)
+
+# One path per iteration, built by explicit concatenation: a prefix glued to
+# "${arr[@]}" expands element-wise on some bash builds and only on the first
+# element on others, which silently drops payload files from the fixture.
+jr_stage_payload() { # <src-dir> -- ship the 12-module reader payload in a source tree
+    local src="$1" m n
+    mkdir -p "$src/journal_reader"
+    for m in "${JR_MANIFEST_MODULES[@]}"; do
+        cp -- "$REPO_ROOT/monitor-v2/journal_reader/$m" "$src/journal_reader/" \
+            || { printf 'FATAL: cannot stage reader payload module %s\n' "$m" >&2; exit 70; }
+    done
+    rm -rf "$src/journal_reader/__pycache__"
+    n="$(find "$src/journal_reader" -maxdepth 1 -name '*.py' | wc -l | tr -d ' ')"
+    [ "$n" = "12" ] || { printf 'FATAL: fixture staged %s reader modules, expected 12\n' "$n" >&2; exit 70; }
+}
+
+# A formal install co-activates the reader, so EVERY isolated fixture root has
+# to pin the reader's three paths into itself -- their production defaults
+# (/etc/systemd/system, /usr/local/lib, /var/lib/sbox-journal) must never be
+# written by a test, least of all by the root lane.
+jr_pin_fixture() { # <fixture-root> <unit-dir>
+    local root="$1" unitdir="$2"
+    mkdir -p "$root/usr-local-lib" "$unitdir"
+    export SBOXJR_DATA_ROOT="$root/var/lib/sbox-journal"
+    export SBOXJR_LIB_DIR="$root/usr-local-lib/singbox-journal-reader"
+    export SBOXJR_UNIT_FILE="$unitdir/singbox-journal-reader.service"
+}
+
+jr_stage_payload "$FIX_SRC"
+jr_pin_fixture "$FIX" "$FIX_UNIT_DIR"
 # Freeze the installed baseline independently of the candidate repo version.
 printf '0.1.0\n' > "$FIX_SRC/VERSION"
 
@@ -289,6 +398,15 @@ if bash -n "$INSTALL_MONITOR" 2>"$TMP/syntax.err"; then pass "bash -n install-mo
 for f in "$DEPLOY_DIR"/lib/*.sh "$DEPLOY_DIR"/app-bin/*; do
     if bash -n "$f" 2>"$TMP/syntax.err"; then pass "bash -n $(basename "$f")"; else fail "bash -n $(basename "$f")"; fi
 done
+# The staging manifest this lane asserts must be the manifest the library
+# actually stages: an unequal pair means the release quietly drifted from the
+# contract this suite proves.
+LIB_JR_MODULES="$(awk '/^SBOXJR_MODULE_FILES=\(/{f=1} f{print} f&&/\)/{exit}' \
+    "$DEPLOY_DIR/lib/monitor-deploy-lib.sh" | grep -oE '[A-Za-z_]+\.py' \
+    | LC_ALL=C sort | tr '\n' ' ')"
+SUITE_JR_MODULES="$(printf '%s\n' "${JR_MANIFEST_MODULES[@]}" | LC_ALL=C sort | tr '\n' ' ')"
+assert_eq "$SUITE_JR_MODULES" "$LIB_JR_MODULES" \
+    "this lane's 12-module manifest == the library's SBOXJR_MODULE_FILES"
 if command -v shellcheck >/dev/null 2>&1; then
     if shellcheck -S warning "$INSTALL_MONITOR" "$DEPLOY_DIR"/lib/*.sh "$DEPLOY_DIR"/app-bin/* >"$TMP/sc.out" 2>&1; then
         pass "shellcheck deploy scripts"
@@ -444,6 +562,49 @@ assert_grep 'Restart=on-failure' "$FIX_UNIT" "unit Restart=on-failure"
 assert_grep 'CapabilityBoundingSet=$' "$FIX_UNIT" "unit drops all capabilities"
 assert_grep 'systemctl enable --now singbox-monitor' "$MOCK_CALL_LOG" "enable --now recorded"
 assert_grep '"service_active":true' "$OUT1" "health reports service_active=true after install"
+# --- PR-2B (review #54 B4-residual): this lane installs the COUPLED product.
+# A formal install that ends with the reader INERT is no longer a success, so
+# the reader half of T01 is proven positively here -- the release carries the
+# payload, the unit is rendered+verified, and the service is enabled+started in
+# the SAME transaction. -----------------------------------------------------------------
+assert_grep 'systemctl enable --now singbox-journal-reader' "$MOCK_CALL_LOG" \
+    "fresh install enables+starts the reader in the same transaction"
+# systemd-analyze verify runs against the dot-prefixed transient copy the
+# installer renders (never against the live unit path), so the recorded probe
+# is the temp name + zero residue, not the unit file itself.
+assert_grep 'verify .*\.jr-verify\.[0-9]+[.]service$' "$SBMON_ANALYZE_LOG" \
+    "reader unit is verified before it can be installed"
+assert_eq "$(find "$FIX_UNIT_DIR" -maxdepth 1 -name '.jr-verify.*' | wc -l | tr -d ' ')" "0" \
+    "reader verify temp leaves no residue in the unit dir"
+[ -f "$SBOXJR_UNIT_FILE" ] && pass "reader unit rendered at the deployment unit path" \
+    || fail "reader unit missing after a formal install"
+[ -d "$SBOXJR_DATA_ROOT/out" ] && pass "reader exchange tree created" \
+    || fail "reader exchange tree missing"
+JR_LIBEXEC="$FIX_APP_LINK/libexec/sbox-journal-reader"
+[ -d "$JR_LIBEXEC/journal_reader" ] \
+    && pass "installed release carries the journal_reader/ payload" \
+    || fail "installed release carries NO reader payload (INERT success)"
+_JR_MISSING=""
+for _jrf in "${JR_MANIFEST_MODULES[@]}"; do
+    [ -f "$JR_LIBEXEC/journal_reader/$_jrf" ] || _JR_MISSING="$_JR_MISSING $_jrf"
+done
+assert_eq "" "$_JR_MISSING" "installed release carries all 12 ingest-contract modules"
+[ -f "$JR_LIBEXEC/sbox-journal-reader" ] && pass "reader wrapper staged inside the release (12+1+1)" \
+    || fail "reader wrapper missing from the release"
+[ -f "$JR_LIBEXEC/singbox-journal-reader.service.in" ] \
+    && pass "reader unit template staged inside the release (12+1+1)" \
+    || fail "reader unit template missing from the release"
+if [ "$SYMLINKS_OK" = 1 ]; then
+    [ -L "$SBOXJR_LIB_DIR" ] && pass "reader runtime link is a symlink" \
+        || fail "reader runtime link is not a symlink"
+    case "$(readlink -- "$SBOXJR_LIB_DIR")" in
+        "$FIX_RELEASES"/*/"libexec/sbox-journal-reader") \
+            pass "reader runtime link points inside a release tree" ;;
+        *) fail "reader runtime link target is not a release libexec: $(readlink -- "$SBOXJR_LIB_DIR")" ;;
+    esac
+else
+    printf '  SKIP reader runtime link symlink shape (此平台 ln -s 为复制语义)\n'
+fi
 [ -f "$FIX_CONF_DIR/api.secret" ] && pass "derived api.secret delivered (P6)" || fail "derived api.secret missing"
 if [ "$MODES_OK" = 1 ]; then assert_dir_mode "$FIX_CONF_DIR/api.secret" 640 "api.secret mode 0640 root:group (P6)"; else printf '  SKIP api.secret mode (chmod unreliable)\n'; fi
 assert_eq "$(cat "$FIX_PROXY/monitor-api.secret")" "$(cat "$FIX_CONF_DIR/api.secret")" "api.secret content mirrors S0 anchor"
@@ -662,6 +823,7 @@ assert_no_grep ' 0\.6\.0 ' "$FIX_RELEASES/releases.history" "failed 0.6.0 absent
 printf '0.4.0\n' > "$FIX_SRC/VERSION"
 fi  # end SYMLINKS_OK block (T15/T16/F1/F2a/F2b)
 
+if symlink_gate "F2c fresh-install failure cleanup"; then
 section "F2c fresh-install failure: cleanup, never active/enabled"
 run_uninstall_quiet
 MOCK_FAIL_START=1 run_install "$TMP/out-f2c.log"
@@ -674,6 +836,10 @@ if [ ! -e "$FIX_UNIT" ]; then pass "new unit removed after fresh failure (F2c)";
 if [ ! -e "$FIX_RELEASES/releases.history" ]; then pass "no history entry for failed fresh install (F1)"; else fail "history written for failed fresh install"; fi
 assert_eq "inactive" "$(cat "$MOCK_SYS_STATE")" "service inactive after fresh failure (F2c)"
 assert_eq "disabled" "$(cat "$MOCK_ENABLED_STATE")" "service disabled after fresh failure (F2c)"
+# The cleanup is the reader's too: an inert-but-partial reader deployment is
+# exactly the half-state §3 forbids.
+if [ ! -e "$SBOXJR_UNIT_FILE" ]; then pass "reader unit removed after fresh failure (F2c)"; else fail "reader unit still present after fresh failure"; fi
+fi
 
 section "R3-3 fresh cleanup daemon-reload failure -> CRITICAL exit 2"
 run_uninstall_quiet
@@ -716,20 +882,54 @@ section "F4 upgrade precondition inside the deployment lock"
 # (out-of-band) deploy removes the current release; the lock is released.
 # The upgrade must then re-check INSIDE the lock and fail -- never
 # degrade into a fresh install.
+#
+# PR-2B makes the reader runtime link part of that deployment, so the wipe has
+# two reachable shapes and both are probed:
+#   F4a removes the reader link as well -- the link is legitimately ABSENT, so
+#       the Monitor's own upgrade precondition decides. That is the pre-PR-2B
+#       gate, kept verbatim.
+#   F4b leaves the link dangling -- the reader provenance gate decides FIRST and
+#       refuses instead of letting a broken deployment "recover" as a fresh
+#       install. A dangling link is illegal provenance by contract, so the
+#       harness clears its own leftover afterwards rather than teaching the
+#       installer to ignore it (that gate is owned by the jr-deploy lane).
 if command -v flock >/dev/null 2>&1; then
-    UNIT_F4="$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)"
-    flock "$SBMON_LOCK_FILE" -c "sleep 2; rm -rf '$SBMON_RELEASES_DIR' '$SBMON_APP_LINK'" & F4_HOLDER=$!
-    sleep 0.4
-    OUT_F4="$TMP/out-f4.log"
-    ( SBMON_LOCK_TIMEOUT=15 "$INSTALL_MONITOR" upgrade ) > "$OUT_F4" 2>&1
-    RC_F4=$?
-    assert_rc 1 "$RC_F4" "upgrade fails after concurrent removal (precondition re-checked under lock)"
+    f4_concurrent_removal() { # <label> <extra out-of-band removal command>
+        local label="$1" extra="${2:-:}"
+        UNIT_F4="$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)"
+        flock "$SBMON_LOCK_FILE" -c "sleep 2; rm -rf '$SBMON_RELEASES_DIR' '$SBMON_APP_LINK'; $extra" & F4_HOLDER=$!
+        sleep 0.4
+        OUT_F4="$TMP/out-f4-$label.log"
+        ( SBMON_LOCK_TIMEOUT=15 "$INSTALL_MONITOR" upgrade ) > "$OUT_F4" 2>&1
+        RC_F4=$?
+        assert_rc 1 "$RC_F4" "upgrade fails after concurrent removal (F4$label)"
+        if [ ! -L "$SBMON_APP_LINK" ] && [ ! -e "$SBMON_APP_LINK" ]; then pass "no fresh release created (F4$label)"; else fail "upgrade degraded into fresh install (F4$label)"; fi
+        if [ ! -d "$SBMON_RELEASES_DIR" ]; then pass "no releases dir recreated (F4$label)"; else fail "releases dir recreated (F4$label)"; fi
+        assert_eq "$UNIT_F4" "$(sha256sum "$FIX_UNIT" 2>/dev/null | cut -d' ' -f1)" "unit untouched by failed upgrade (F4$label)"
+        if [ ! -e "$SBMON_RELEASES_DIR/releases.history" ]; then pass "no history entry (F4$label)"; else fail "history entry written by failed upgrade (F4$label)"; fi
+        wait "$F4_HOLDER" 2>/dev/null || true
+    }
+
+    f4_concurrent_removal a "rm -f '$SBOXJR_LIB_DIR'"
     assert_grep '升级前置检查' "$OUT_F4" "locked precondition error message (F4)"
-    if [ ! -L "$SBMON_APP_LINK" ] && [ ! -e "$SBMON_APP_LINK" ]; then pass "no fresh release created (F4)"; else fail "upgrade degraded into fresh install"; fi
-    if [ ! -d "$SBMON_RELEASES_DIR" ]; then pass "no releases dir recreated (F4)"; else fail "releases dir recreated"; fi
-    assert_eq "$UNIT_F4" "$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)" "unit untouched by failed upgrade (F4)"
-    if [ ! -e "$SBMON_RELEASES_DIR/releases.history" ]; then pass "no history entry (F4)"; else fail "history entry written by failed upgrade"; fi
-    wait "$F4_HOLDER" 2>/dev/null || true
+    # F4b below is this scan's negative control: the same grep has to find the
+    # provenance refusal there, so "absent" here is a statement about the link.
+    assert_no_grep 'provenance 非法' "$OUT_F4" \
+        "a removed reader link is legal absence, not a provenance refusal (F4a)"
+
+    run_uninstall_quiet
+    run_install "$TMP/out-f4b-setup.log"
+    assert_rc 0 $? "reader-coupled install re-created for the dangling-link probe (F4b setup)"
+    f4_concurrent_removal b ":"
+    assert_grep 'deployment lock acquired' "$OUT_F4" \
+        "the refusal happens INSIDE the lock, not before it (F4b)"
+    assert_grep '运行时链接 provenance 非法' "$OUT_F4" \
+        "a dangling reader link is refused, never recovered as a fresh install (F4b)"
+    # The wipe above destroyed the deployment by hand, so the dangling link is
+    # this harness's own debris: clear it here, exactly as an operator would
+    # after being told to handle it by hand.
+    if [ -L "$SBOXJR_LIB_DIR" ]; then rm -f -- "$SBOXJR_LIB_DIR"; fi
+    rm -f -- "$SBOXJR_UNIT_FILE"
 else
     printf '  SKIP F4 (flock 不可用；Linux CI 为最终 gate)\n'
 fi
@@ -1070,6 +1270,7 @@ else
 fi
 assert_grep '卸载完成' "$OUT_R42A" "idempotent uninstall still completes (R4-2)"
 
+if symlink_gate "R4-2 uninstall teardown group (stop/disable/reload failures, final success)"; then
 section "R4-2 uninstall stop failure -> fail-closed, deployment retained"
 printf '0.5.0\n' > "$FIX_SRC/VERSION"
 run_install "$TMP/out-r42setup.log"
@@ -1101,7 +1302,16 @@ assert_grep '拒绝在 enabled 状态下删除部署文件' "$OUT_R42C" "disable
 if [ -e "$FIX_UNIT" ]; then pass "unit retained after disable failure (R4-2)"; else fail "unit deleted despite disable failure"; fi
 if [ -e "$FIX_APP_LINK" ]; then pass "app link retained after disable failure (R4-2)"; else fail "app link deleted despite disable failure"; fi
 
-section "R4-2 uninstall post-delete daemon-reload failure -> CRITICAL"
+# PR-2B moved the FIRST post-delete daemon-reload into the reader half of the
+# uninstall (the reader is dismantled before the release tree that holds its
+# runtime). Both reload sites are live product code, so both must be proven to
+# fail closed with CRITICAL and never print a false 卸载完成. The SKIP knob
+# aims the counted failure at the later (monitor) site.
+section "R4-2 uninstall reader-unit daemon-reload failure -> CRITICAL"
+run_uninstall_quiet
+run_install "$TMP/out-r42d1-setup.log"
+assert_rc 0 $? "baseline install for the reader reload probe"
+rm -f "$MOCK_FAIL_DAEMON_RELOAD_SKIP"
 echo 1 > "$MOCK_FAIL_DAEMON_RELOAD_COUNT"
 OUT_R42D="$TMP/out-r42d.log"
 if ( "$INSTALL_MONITOR" uninstall ) > "$OUT_R42D" 2>&1; then
@@ -1111,11 +1321,35 @@ else
     RC_R42D=$?
     pass "uninstall reports failure when post-delete daemon-reload fails (rc=$RC_R42D)"
 fi
+rm -f "$MOCK_FAIL_DAEMON_RELOAD_COUNT"
+assert_rc 2 "$RC_R42D" "reader reload failure is CRITICAL exit 2 (R4-2)"
+assert_grep 'reader unit 删除后 daemon-reload 失败' "$OUT_R42D" \
+    "CRITICAL names the reader unit-deletion reload site"
 assert_grep 'CRITICAL' "$OUT_R42D" "CRITICAL for partial destructive state (R4-2)"
 assert_no_grep '卸载完成' "$OUT_R42D" "no false uninstall-complete claim (R4-2)"
 
+section "R4-2 uninstall monitor-unit daemon-reload failure -> CRITICAL"
+run_uninstall_quiet
+run_install "$TMP/out-r42d2-setup.log"
+assert_rc 0 $? "baseline install for the monitor reload probe"
+echo 1 > "$MOCK_FAIL_DAEMON_RELOAD_SKIP"
+echo 1 > "$MOCK_FAIL_DAEMON_RELOAD_COUNT"
+OUT_R42D2="$TMP/out-r42d2.log"
+if ( "$INSTALL_MONITOR" uninstall ) > "$OUT_R42D2" 2>&1; then
+    RC_R42D2=0
+    fail "uninstall with a failing monitor-site reload must not claim success"
+else
+    RC_R42D2=$?
+    pass "uninstall reports failure when the monitor-site reload fails (rc=$RC_R42D2)"
+fi
+rm -f "$MOCK_FAIL_DAEMON_RELOAD_SKIP" "$MOCK_FAIL_DAEMON_RELOAD_COUNT"
+assert_rc 2 "$RC_R42D2" "monitor reload failure is CRITICAL exit 2 (R4-2)"
+assert_grep '卸载后 daemon-reload 失败' "$OUT_R42D2" \
+    "CRITICAL names the monitor unit-deletion reload site"
+assert_no_grep '卸载完成' "$OUT_R42D2" "no false uninstall-complete claim after the monitor-site failure (R4-2)"
+
 section "R4-2 uninstall success leaves service stopped and disabled"
-run_uninstall_quiet   # R4-2d's CRITICAL left a partial deployment behind
+run_uninstall_quiet   # the reload probes left a partial deployment behind
 run_install "$TMP/out-r42e.log"
 assert_rc 0 $? "baseline install for final uninstall check"
 OUT_R42F="$TMP/out-r42f.log"
@@ -1127,8 +1361,22 @@ fi
 assert_eq "inactive" "$(cat "$MOCK_SYS_STATE")" "final state inactive (R4-2)"
 assert_eq "disabled" "$(cat "$MOCK_ENABLED_STATE")" "final state disabled (R4-2)"
 assert_grep '卸载完成' "$OUT_R42F" "success message after verified stop/disable (R4-2)"
+# PR-2B: a successful uninstall dismantles the READER too, and says so.
+assert_grep 'systemctl stop singbox-journal-reader' "$MOCK_CALL_LOG" \
+    "reader stopped by uninstall (R4-2)"
+assert_grep 'systemctl disable singbox-journal-reader' "$MOCK_CALL_LOG" \
+    "reader disabled by uninstall (R4-2)"
+[ ! -e "$SBOXJR_UNIT_FILE" ] && pass "reader unit removed by uninstall" \
+    || fail "reader unit survived the uninstall"
+[ ! -e "$SBOXJR_LIB_DIR" ] && pass "reader runtime link removed by uninstall" \
+    || fail "reader runtime link survived the uninstall"
+fi
+run_uninstall_quiet   # every later section starts from a clean slate
 
+if symlink_gate "T06 monitor+reader uninstall preservation contract"; then
 section "T06 monitor-only uninstall (default: state/config/backups preserved)"
+run_install "$TMP/out-t06-setup.log"
+assert_rc 0 $? "T06: baseline install"
 # Seed legacy dirs + flat access files: earlier sections purge the state
 # root, and uninstall must PRESERVE whatever is there.
 mkdir -p "$FIX_STATE/auth" "$FIX_STATE/access"
@@ -1136,6 +1384,10 @@ ensure_fixture_state_dir
 printf 'legacy-auth\n' > "$FIX_STATE/auth/probe"
 printf '{"legacy": true}\n' > "$FIX_STATE/auth.json"
 printf '{"whitelist": []}\n' > "$FIX_STATE/access.json"
+mkdir -p "$SBOXJR_DATA_ROOT/out" "$SBOXJR_DATA_ROOT/state"
+# state/ is a directory in the reader's layout (the cursor lives inside it), so
+# the seed must be an entry within it.
+printf 'jr-cursor-seed\n' > "$SBOXJR_DATA_ROOT/state/cursor"
 OUT6="$TMP/out-t06.log"
 if ( "$INSTALL_MONITOR" uninstall ) > "$OUT6" 2>&1; then
     pass "uninstall exits 0"
@@ -1152,6 +1404,12 @@ assert_grep 'systemctl disable singbox-monitor' "$MOCK_CALL_LOG" "strict disable
 [ -f "$FIX_STATE/auth.json" ] && pass "flat auth.json preserved by default" || fail "flat auth.json deleted without --purge-state"
 [ -f "$FIX_CONF_DIR/monitor.conf" ] && pass "config preserved by default" || fail "config deleted without --purge-config"
 [ -d "$FIX_BACKUPS" ] && pass "backups preserved by default" || fail "backups deleted without --purge-backups"
+# PR-2B: the reader's DIAGNOSTIC data follows the same default as the
+# monitor's state -- preserved, and only --purge-state removes it.
+[ -d "$SBOXJR_DATA_ROOT" ] && pass "reader data root preserved by default" \
+    || fail "reader data root deleted without --purge-state"
+[ -f "$SBOXJR_DATA_ROOT/state/cursor" ] && pass "reader cursor/state file preserved by default" \
+    || fail "reader cursor/state file deleted without --purge-state"
 
 OUT6B="$TMP/out-t06b.log"
 if ( "$INSTALL_MONITOR" uninstall --purge-state --purge-config --purge-backups ) > "$OUT6B" 2>&1; then
@@ -1161,6 +1419,10 @@ else
 fi
 [ ! -d "$FIX_STATE" ] && pass "--purge-state removed state root" || fail "--purge-state left state root"
 [ ! -d "$FIX_CONF_DIR" ] && pass "--purge-config removed conf dir" || fail "--purge-config left conf dir"
+[ ! -d "$SBOXJR_DATA_ROOT" ] && pass "--purge-state removed the reader data root too" \
+    || fail "--purge-state left the reader data root"
+fi
+run_uninstall_quiet
 
 # ---------------------------------------------------------------------------
 section "T07 failed service start fails closed but keeps unit diagnosable"
@@ -2189,6 +2451,8 @@ else
     export SBMON_UNIT_FILE="$T22/etc/systemd/system/singbox-monitor.service"
     export SBMON_BACKUP_ROOT="$T22/var/backups/singbox-monitor"
     export SBMON_REPO_MONITOR_DIR="$T22/src"
+    jr_stage_payload "$T22/src"
+    jr_pin_fixture "$T22" "$T22/etc/systemd/system"
     export SBMON_VERSION_FILE="$T22/src/VERSION"
     export SBMON_LOCK_FILE="$T22/deploy.lock"
     export MOCK_CALL_LOG="$T22_CALLS"
@@ -2261,6 +2525,8 @@ else
     export SBMON_UNIT_FILE="$T23/etc/systemd/system/singbox-monitor.service"
     export SBMON_BACKUP_ROOT="$T23/var/backups/singbox-monitor"
     export SBMON_REPO_MONITOR_DIR="$T23/src"
+    jr_stage_payload "$T23/src"
+    jr_pin_fixture "$T23" "$T23/etc/systemd/system"
     export SBMON_VERSION_FILE="$T23/src/VERSION"
     export SBMON_LOCK_FILE="$T23/deploy.lock"
     export MOCK_CALL_LOG="$T23_CALLS"
@@ -2335,6 +2601,8 @@ else
     export SBMON_UNIT_FILE="$T24/etc/systemd/system/singbox-monitor.service"
     export SBMON_BACKUP_ROOT="$T24/var/backups/singbox-monitor"
     export SBMON_REPO_MONITOR_DIR="$T24/src"
+    jr_stage_payload "$T24/src"
+    jr_pin_fixture "$T24" "$T24/etc/systemd/system"
     export SBMON_VERSION_FILE="$T24/src/VERSION"
     export SBMON_LOCK_FILE="$T24/deploy.lock"
     export MOCK_CALL_LOG="$T24_CALLS"
@@ -2409,6 +2677,8 @@ else
     export SBMON_UNIT_FILE="$T25/etc/systemd/system/singbox-monitor.service"
     export SBMON_BACKUP_ROOT="$T25/var/backups/singbox-monitor"
     export SBMON_REPO_MONITOR_DIR="$T25/src"
+    jr_stage_payload "$T25/src"
+    jr_pin_fixture "$T25" "$T25/etc/systemd/system"
     export SBMON_VERSION_FILE="$T25/src/VERSION"
     export SBMON_LOCK_FILE="$T25/deploy.lock"
     export MOCK_CALL_LOG="$T25_CALLS"
@@ -2455,10 +2725,11 @@ else
 fi
 fi
 
-section "T26 production-real upgrade: installed 0.1.5 -> repo VERSION (isolated fixture, 0.2.0)"
+section "T26 production-real upgrade: installed 0.1.5 -> repo VERSION (isolated fixture, 0.3.0)"
 # Same production-real discipline as T25, one release step later: a server
-# running the 0.1.5 target-binding delete UX now moves to the 0.2.0
-# incident-history candidate. The upgrade surface is unchanged: same atomic
+# running the 0.1.5 target-binding delete UX now moves to the current repo
+# candidate (0.3.0: PR-2B reader payload + the 0.2.0 incident-history
+# module). The upgrade surface is unchanged: same atomic
 # release switch, ZERO sbox-cm/helper actions, and the retained 0.1.5
 # release tree stays byte-identical.
 T26_NEW_VER="$(cat "$REPO_ROOT/monitor-v2/VERSION")"
@@ -2484,6 +2755,8 @@ else
     export SBMON_UNIT_FILE="$T26/etc/systemd/system/singbox-monitor.service"
     export SBMON_BACKUP_ROOT="$T26/var/backups/singbox-monitor"
     export SBMON_REPO_MONITOR_DIR="$T26/src"
+    jr_stage_payload "$T26/src"
+    jr_pin_fixture "$T26" "$T26/etc/systemd/system"
     export SBMON_VERSION_FILE="$T26/src/VERSION"
     export SBMON_LOCK_FILE="$T26/deploy.lock"
     export MOCK_CALL_LOG="$T26_CALLS"
@@ -2510,7 +2783,7 @@ else
     fi
     assert_eq "$T26_NEW_VER" "$(cat "$T26_APP/VERSION" 2>/dev/null)" "the new immutable $T26_NEW_VER release is active"
     if [ -f "$T26_APP/app/monitor-v2/web/incident_history.py" ]; then
-        pass "0.2.0 release stages the new web/incident_history.py module (whole-web/-R copy)"
+        pass "the $T26_NEW_VER release stages the 0.2.0-era web/incident_history.py module (whole-web/-R copy)"
     else
         fail "incident_history.py missing from the staged $T26_NEW_VER release"
     fi

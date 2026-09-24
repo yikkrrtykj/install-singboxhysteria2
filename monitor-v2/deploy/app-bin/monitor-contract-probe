@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# monitor-contract-probe -- runtime probe for the PR-2B journal ingest contract.
+#
+# Purpose: prove, from the INSTALLED immutable release, that the Monitor
+# runtime can import the frozen ingest contract (journal_reader.ingest_contract
+# + journal_reader.schema) and that incident_history therefore reports
+# journal_status()["contract_available"] == true.
+#
+# Why this is a proof and not a tautology:
+#   * the import path is derived from THIS file's own release location through
+#     the very helper the Monitor runtime uses (monitor_env_contract_pythonpath
+#     in lib/monitor-env.sh) -- no caller-supplied PYTHONPATH participates, and
+#     a repository checkout cannot satisfy it (it has no libexec payload);
+#   * where the contract was REALLY loaded from is reported from the imported
+#     module's own realpath, not from the path the shim asked for, so a
+#     mis-derived path shows up as contract_module_in_release=false;
+#   * rc is non-zero whenever the contract is unavailable or was loaded from
+#     outside the release tree -- deleting a contract module from an installed
+#     release makes this probe (and every gate that runs it) fail.
+#
+# Output: ONE JSON line on stdout (operator/test surface, never a web API).
+# Absolute paths appear only here; they are deliberately absent from the
+# user-facing status/API surfaces.
+set -Eeuo pipefail
+
+SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/monitor-env.sh
+source "$SELF_DIR/../lib/monitor-env.sh"
+# -P: resolve the live symlink so the release id is the REAL release
+# directory name, whatever link the caller came through.
+APP_DIR="$(cd -- "$SELF_DIR/.." && pwd -P)"
+PYBIN="${SBMON_PYTHON3:-python3}"
+command -v "$PYBIN" >/dev/null 2>&1 || {
+    printf 'monitor-contract-probe: python3 not found\n' >&2; exit 2; }
+
+# Same derivation the runtime applies -- the probe never re-implements it.
+monitor_env_apply_contract_pythonpath "$APP_DIR"
+
+SBMON_PROBE_APP_DIR="$APP_DIR" \
+SBMON_PROBE_EXPECTED_PATH="$SBMON_JR_CONTRACT_PATH" \
+"$PYBIN" - <<'PROBE'
+import json
+import os
+import sys
+
+app_dir = os.environ["SBMON_PROBE_APP_DIR"]
+expected_path = os.environ.get("SBMON_PROBE_EXPECTED_PATH", "")
+# The cwd must never be an import candidate: running this probe from inside a
+# repository checkout would otherwise let the SOURCE journal_reader package
+# answer for the installed release (spec: no source-tree PYTHONPATH fakes).
+sys.path = [p for p in sys.path if p not in ("", ".", os.getcwd())]
+sys.path.insert(0, os.path.join(app_dir, "app", "monitor-v2"))
+
+mod_file = ""
+flag = False
+status_flag = False
+reason = ""
+try:
+    from journal_reader import ingest_contract as ic
+    from journal_reader import schema as _sc  # noqa: F401 (availability gate)
+    mod_file = os.path.realpath(ic.__file__)
+    from web import incident_history as ih
+    flag = bool(ih.JOURNAL_CONTRACT_AVAILABLE)
+    # journal_status() is the sanitized runtime surface; the instance is
+    # built but never opened, so no production state directory is touched.
+    status_flag = bool(ih.IncidentHistory(os.devnull, "probe").journal_status()
+                       ["contract_available"])
+except Exception as exc:  # sanitized: type name only, never a path or text
+    reason = type(exc).__name__
+
+release_root = os.path.realpath(app_dir)
+in_release = bool(mod_file) and mod_file.startswith(
+    release_root + os.sep + "libexec" + os.sep)
+# The env the runtime would have used must be the derived release path, and
+# nothing else (an inherited PYTHONPATH is not honored in either direction).
+env_consistent = os.environ.get("PYTHONPATH", "") == expected_path
+version = ""
+try:
+    version = open(os.path.join(app_dir, "VERSION"), encoding="utf-8").read().strip()
+except OSError:
+    pass
+
+print(json.dumps({
+    "monitor_release_id": os.path.basename(release_root),
+    "monitor_version": version,
+    "contract_pythonpath_consistent": env_consistent,
+    "contract_available": flag,
+    "journal_status_contract_available": status_flag,
+    "contract_module_in_release": in_release,
+    "contract_module_realpath": mod_file,
+    "import_error": reason,
+}, sort_keys=True))
+sys.exit(0 if (flag and status_flag and in_release and env_consistent) else 1)
+PROBE

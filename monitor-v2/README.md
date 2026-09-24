@@ -337,6 +337,30 @@ degraded+分类码，dashboard 与 publisher 永不因此中断。读面仅
 `GET /api/v1/diagnostics/timeline?since&limit`（session 门禁、有界、列白名
 单、无 UI）。E1 collector 本体、systemd 权限、helper/sbox-cm 边界零改动。
 
+### 0.3.0：journal reader 随 release 交付（issue #33 PR-2B；reader 本体见 docs/monitor-v2-journal-reader-p2a.md，激活事务与评审不变量见 deploy/README.md §15–§19）
+
+reader 载荷（冻结的 12 个 `journal_reader/` 模块 + wrapper + unit 模板，即
+12+1+1 manifest）打进每一个不可变 release 的
+`releases/<id>/libexec/sbox-journal-reader/`，Monitor 运行时从**自己所在的物理
+release**导入 ingest contract（`bin/monitor-contract-probe` 是可证明这一点的
+出货工件，导入过程以 `PYTHONDONTWRITEBYTECODE=1` 保证绝不写回 release）。
+`incident_history` 拥有非破坏性 schema v1→v2 迁移（journal runs/events/audit +
+终态 `journal_ingest_state` 行，全部 DDL 在**一个**显式事务内，中途崩溃回滚为
+逐字节未变的 v1 文件），并把交换目录结算进 v2：applied / 终态 rejected / gap
+三类结算都在同一 SQLite 事务里带上终态推进，崩溃窗口既不能重复计数也不能撤回
+证据；retention 把四条 epoch 源当作同一条全局时间线裁剪，连续性及终态行永不被
+老化掉。reader 可用性只由 `out/hb` 相对冻结的 180s 规则的年龄推出。
+
+部署面由此变成事务级的：reader 的 runtime 符号链接 / unit / data 路径与 Monitor
+release 在 install、upgrade、rollback 的同一原子事务内切换，恢复顺序"先代码后
+进程"并按事务前 `PRE_ACTIVE` 分支，keep-prestate 回滚尊重 active/enabled 两根
+轴。三条 fail-closed 判据无任何开关可绕过——源树缺 `journal_reader/` 载荷时正式
+install/upgrade 直接拒绝（绝不以 `contract_available=false` 完成部署）；reader
+运行时链接 provenance 三态判定中，悬空或形状非法一律拒绝并要求人工处理（只有
+"完全缺失"才是合法的未激活态）；reader 已激活时，回滚目标必须携带 runtime 目录
+且通过 12+1+1 manifest 审计，否则在零变更前拒绝，以避免 Monitor/reader 混版本。
+helper/sbox-cm 边界与 sing-box 本体零改动。
+
 ### 请求门顺序（每个普通请求）
 
 ```text
