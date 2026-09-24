@@ -654,3 +654,36 @@ PR-2B 将其接入 installer，且完全服从既有事务语义（deploy lock /
   之后重新断言 release 内无 `__pycache__`、reader 链接 provenance 与 manifest 审计仍为绿。
 - **测试**：`tests/test-monitor-v2-p2b-integration.sh`（§3 packaging 硬门 + §4 双活引用版本
   耦合 + §5 retention 双保护 + §9 v1→v2 迁移经由已安装 release + 反伪造负例）。
+
+## 17. Integration Review Round 1 — 三条顺序/完整性/路径不变量（PR #54）
+
+这一轮不改设计，只把三处**只在失败路径上才成立**的隐含假设变成显式契约：
+
+- **B1 回滚顺序：先恢复代码，最后才碰进程**（`sbmon_sboxjr_restore_prestate`）。
+  旧顺序先 restart 再恢复 unit/运行时链接：N→N+1 升级失败时，reader 会在**仍指向
+  N+1 的运行时链接**上被重启，随后链接才被指回 N —— 两条 live 链接都显示 N，
+  而**运行中的进程是 N+1**，任何基于链接的断言都看不见。新顺序为
+  unit(+daemon-reload) → enable 事实 → 运行时链接 → active 重启/停止 → 身份清理。
+  enable/disable 归入"代码组"是有意的：它们是裸 `enable`（从不 `--now`），既不启动
+  也不停止进程，因此不可能加载候选代码，却能让链接恢复失败时残留未补偿的 enabled。
+  判据：systemctl mock 在**每次调用那一刻**解析并记录 `runtime=<release-id>`，
+  `tests/test-monitor-v2-jr-deploy.sh` 据此断言"最后一次 reader 变更是恢复重启，
+  且其运行时已经是恢复后的 release"，升级失败与回滚失败两个方向各一条。
+- **B2 回滚目标完整性早于任何变更**（`_cmd_rollback_locked`）。旧门只检查目标 release
+  的 reader 运行时目录**存在**；一个目录在但 12+1+1 manifest 已破损的目标，要等到
+  `sbmon_sboxjr_converge()` 才发现，而那时 Monitor 已经切换链接、重启、重写了 unit。
+  现在在同一位置复用与链接切换**完全相同**的 `sbmon_sboxjr_audit_runtime`，
+  在 capture prestate 之前审计，失败即 fail-closed 且零变更。
+  负例测试证明：rc≠0、两条 live 引用不变、拒绝窗口内零状态变更 systemctl 调用、
+  零 history；把被删的模块补回去后同一回滚立即成功 —— 拒绝依据确实是 manifest。
+- **B3 真实运行时必须落在物理 release 上**。probe 早就用 `pwd -P`，而
+  `monitor-service` 的 `APP_DIR` 用的是逻辑 `pwd`：经 `$SBMON_APP_LINK` 启动的服务会把
+  合同 PYTHONPATH 导出成**可变 live 符号链接**下的路径，于是"不可变 release"里的代码
+  会随下一次激活翻转而改变。现在 `APP_DIR` 用 `pwd -P`，且共享推导
+  `monitor_env_contract_pythonpath` 自身先规范化的 `$1`（单一规则，两个调用者都继承）。
+  判据：经 live 链接启动 `bin/monitor-service`，用记录 `PYTHONPATH` 后再
+  `exec` 真解释器的 wrapper 见证，断言其恰为
+  `$(cd releases/<id> && pwd -P)/libexec/sbox-journal-reader`，且永不出现
+  `/<live-link>/` 片段；`PYTHONDONTWRITEBYTECODE=1` 保留，导入后 release 仍零
+  `__pycache__`。
+
