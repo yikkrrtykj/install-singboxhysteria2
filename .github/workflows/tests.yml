@@ -72,6 +72,8 @@ jobs:
           bash -n tests/test-monitor-v2-hist.sh
           bash -n tests/test-monitor-v2-jr.sh
           bash -n tests/test-monitor-v2-jr-deploy.sh
+          bash -n tests/test-monitor-v2-p2b-integration.sh
+          bash -n monitor-v2/deploy/app-bin/monitor-contract-probe
           bash -n tests/journal-reader/test-jr-live.sh
           bash -n tests/e3/test-m3-deploy.sh
           bash -n tests/e3/test-m3c-phase1.sh
@@ -200,6 +202,9 @@ jobs:
       - name: "sbox-journal-reader PR-2B deploy/activation suite (identity / directories / verify-before-install / enable-start / rollback matrix / uninstall / sing-box invariants, issue #33 P2 PR-2B)"
         run: bash tests/test-monitor-v2-jr-deploy.sh
 
+      - name: "PR-2B INTEGRATION suite (Coding D + Coding E as ONE immutable release unit: packaged contract import / release coupling / dual-ref retention / v1->v2 migration through the installed release, issue #33 P2)"
+        run: bash tests/test-monitor-v2-p2b-integration.sh
+
   # ---------------------------------------------------------------------
   # Lane D -- compatibility matrix. Runs on the three supported Ubuntu LTS
   # baselines and carries ONLY the distro / systemd / PID1-sensitive gates:
@@ -305,6 +310,12 @@ jobs:
           # SBOX_JR_REQUIRE_LIVE=1: on CI the live gate MUST really execute;
           # a SKIP here is a hard failure (the B-5 lesson).
           sudo -n env SBOX_JR_REQUIRE_LIVE=1 bash tests/journal-reader/test-jr-live.sh
+
+      # The PR-2B integration gates are symlink/rename(2)-semantic gates, so
+      # they must execute on EVERY baseline: the suite itself turns any SKIP on
+      # Linux into a hard failure (spec §14: a skipped gate is never a green).
+      - name: "PR-2B INTEGRATION suite on the compatibility matrix (one immutable release unit: packaged contract import / release coupling / dual-ref retention / v1->v2 migration; SKIP on Linux is a hard failure)"
+        run: bash tests/test-monitor-v2-p2b-integration.sh
 
       - name: "systemd unit validation (sbox-cm socket + service candidate)"
         run: |

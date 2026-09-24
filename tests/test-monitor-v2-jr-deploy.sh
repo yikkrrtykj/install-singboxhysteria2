@@ -389,6 +389,20 @@ history_first_id() { # id of the FIRST committed release (oldest history line)
     awk 'NR==1{print $2}' "$SBMON_RELEASES_DIR/releases.history" 2>/dev/null
 }
 
+# release_probe <link-or-release-dir> -> probe JSON on stdout, rc from probe.
+# This is the SHIPPED release artifact (never a reimplementation): it proves
+# that the release the installer just activated can itself import the ingest
+# contract from its own tree.
+release_probe() {
+    local base="$1"
+    [ -x "$base/bin/monitor-contract-probe" ] || return 9
+    SBMON_PYTHON3="$PY" "$base/bin/monitor-contract-probe"
+}
+probe_field() { # <json> <key>
+    printf '%s' "$1" | "$PY" -c 'import json,sys
+print(json.load(sys.stdin).get(sys.argv[1]))' "$2" 2>/dev/null
+}
+
 # ===========================================================================
 section "S0: static contract gates"
 # ===========================================================================
@@ -568,6 +582,17 @@ inst status
 assert_grep "$OUT" 'jr state:   active/enabled' "fresh: status reports reader active/enabled"
 if require_symlink "fresh: runtime link -> release assertion"; then
     assert_eq "$(jr_link_release_id)" "$RID" "fresh: runtime link points into the current release"
+    # PR-2B INTEGRATION coupling (spec §3/§12): the release the installer just
+    # activated must itself carry AND import the ingest contract. This is the
+    # same shipped probe the operator runs, against the same release tree.
+    PJ="$(release_probe "$SBMON_APP_LINK")"; PRC=$?
+    assert_eq "$PRC" "0" "fresh: the installer-activated release passes its own contract probe"
+    assert_eq "$(probe_field "$PJ" contract_available)" "True" \
+        "fresh: contract_available == true from the installer-activated release"
+    assert_eq "$(probe_field "$PJ" monitor_release_id)" "$RID" \
+        "fresh: the probe resolves exactly the release id the installer activated"
+    assert_eq "$(probe_field "$PJ" contract_module_in_release)" "True" \
+        "fresh: the import really came from inside the activated release tree"
 fi
 
 # ===========================================================================
@@ -691,6 +716,10 @@ if require_symlink "upgrade+reader restart"; then
     R2="$(current_release_id)"
     [ "$R2" != "$R1" ] && pass "upgrade: new release activated" || fail "upgrade: release did not change"
     assert_eq "$(jr_link_release_id)" "$R2" "upgrade: reader runtime relinked to the NEW release"
+    PJ="$(release_probe "$SBMON_APP_LINK")"; PRC=$?
+    assert_eq "$PRC" "0" "upgrade: the activated N+1 release imports its own ingest contract"
+    assert_eq "$(probe_field "$PJ" monitor_release_id)" "$R2" \
+        "upgrade: probe release id == the N+1 release both live links point at"
     assert_eq "$(grep -c 'systemctl restart singbox-journal-reader' "$CASE_DIR/calls.tail")" "1" \
         "upgrade: running reader restarted exactly once (new code live)"
     assert_eq "$(grep -c 'systemctl enable singbox-journal-reader' "$CASE_DIR/calls.tail")" "0" \
@@ -711,6 +740,10 @@ if require_symlink "upgrade failure -> reader rollback coherence"; then
     assert_grep "$OUT" 'sbox-journal-reader 激活前状态恢复完成' "upgrb: reader pre-state restore logged"
     assert_eq "$(jr_state)" "active/enabled" "upgrb: reader active+enabled preserved through the failed upgrade"
     assert_eq "$(current_release_id)" "$R1" "upgrb: monitor release also restored to v1 (one transaction)"
+    PJ="$(release_probe "$SBMON_APP_LINK")"; PRC=$?
+    assert_eq "$PRC" "0" "upgrb: the surviving release is contract-coherent (no mixed-version half-state left behind)"
+    assert_eq "$(probe_field "$PJ" monitor_release_id)" "$R1" \
+        "upgrb: probe confirms the restored release is the ONLY live version on both sides"
 fi
 
 if require_symlink "rollback keep-prestate matrix"; then
@@ -725,6 +758,10 @@ if require_symlink "rollback keep-prestate matrix"; then
     assert_eq "$LAST_RC" "0" "rb: rollback rc=0 (rc=$LAST_RC)"
     tail -n +"$((M + 1))" "$MOCK_CALL_LOG" > "$CASE_DIR/calls.tail"
     assert_eq "$(jr_link_release_id)" "$R1" "rb: reader runtime followed the release rollback (version-coherent)"
+    PJ="$(release_probe "$SBMON_APP_LINK")"; PRC=$?
+    assert_eq "$PRC" "0" "rb: the rolled-back release still imports its ingest contract"
+    assert_eq "$(probe_field "$PJ" monitor_release_id)" "$R1" \
+        "rb: probe release id == the rollback target on BOTH live links"
     assert_eq "$(grep -c 'systemctl restart singbox-journal-reader' "$CASE_DIR/calls.tail")" "1" \
         "rb: running reader restarted exactly once onto the old runtime"
     assert_eq "$(jr_state)" "active/enabled" "rb: terminal state active+enabled"
@@ -758,6 +795,8 @@ if require_symlink "rollback refusal for pre-PR-2B target"; then
         "rbguard: refusal happened before ANY state-changing systemctl call"
     [ "$(current_release_id)" != "$R1" ] && pass "rbguard: current release untouched by the refusal" \
         || fail "rbguard: release flipped despite the refusal"
+    release_probe "$SBMON_APP_LINK" >/dev/null; assert_eq "$?" "0" \
+        "rbguard: the surviving release stayed contract-coherent through the refusal"
 fi
 
 if require_symlink "noop re-convergence (needs stable link)"; then
