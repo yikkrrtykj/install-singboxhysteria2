@@ -882,20 +882,54 @@ section "F4 upgrade precondition inside the deployment lock"
 # (out-of-band) deploy removes the current release; the lock is released.
 # The upgrade must then re-check INSIDE the lock and fail -- never
 # degrade into a fresh install.
+#
+# PR-2B makes the reader runtime link part of that deployment, so the wipe has
+# two reachable shapes and both are probed:
+#   F4a removes the reader link as well -- the link is legitimately ABSENT, so
+#       the Monitor's own upgrade precondition decides. That is the pre-PR-2B
+#       gate, kept verbatim.
+#   F4b leaves the link dangling -- the reader provenance gate decides FIRST and
+#       refuses instead of letting a broken deployment "recover" as a fresh
+#       install. A dangling link is illegal provenance by contract, so the
+#       harness clears its own leftover afterwards rather than teaching the
+#       installer to ignore it (that gate is owned by the jr-deploy lane).
 if command -v flock >/dev/null 2>&1; then
-    UNIT_F4="$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)"
-    flock "$SBMON_LOCK_FILE" -c "sleep 2; rm -rf '$SBMON_RELEASES_DIR' '$SBMON_APP_LINK'" & F4_HOLDER=$!
-    sleep 0.4
-    OUT_F4="$TMP/out-f4.log"
-    ( SBMON_LOCK_TIMEOUT=15 "$INSTALL_MONITOR" upgrade ) > "$OUT_F4" 2>&1
-    RC_F4=$?
-    assert_rc 1 "$RC_F4" "upgrade fails after concurrent removal (precondition re-checked under lock)"
+    f4_concurrent_removal() { # <label> <extra out-of-band removal command>
+        local label="$1" extra="${2:-:}"
+        UNIT_F4="$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)"
+        flock "$SBMON_LOCK_FILE" -c "sleep 2; rm -rf '$SBMON_RELEASES_DIR' '$SBMON_APP_LINK'; $extra" & F4_HOLDER=$!
+        sleep 0.4
+        OUT_F4="$TMP/out-f4-$label.log"
+        ( SBMON_LOCK_TIMEOUT=15 "$INSTALL_MONITOR" upgrade ) > "$OUT_F4" 2>&1
+        RC_F4=$?
+        assert_rc 1 "$RC_F4" "upgrade fails after concurrent removal (F4$label)"
+        if [ ! -L "$SBMON_APP_LINK" ] && [ ! -e "$SBMON_APP_LINK" ]; then pass "no fresh release created (F4$label)"; else fail "upgrade degraded into fresh install (F4$label)"; fi
+        if [ ! -d "$SBMON_RELEASES_DIR" ]; then pass "no releases dir recreated (F4$label)"; else fail "releases dir recreated (F4$label)"; fi
+        assert_eq "$UNIT_F4" "$(sha256sum "$FIX_UNIT" 2>/dev/null | cut -d' ' -f1)" "unit untouched by failed upgrade (F4$label)"
+        if [ ! -e "$SBMON_RELEASES_DIR/releases.history" ]; then pass "no history entry (F4$label)"; else fail "history entry written by failed upgrade (F4$label)"; fi
+        wait "$F4_HOLDER" 2>/dev/null || true
+    }
+
+    f4_concurrent_removal a "rm -f '$SBOXJR_LIB_DIR'"
     assert_grep '升级前置检查' "$OUT_F4" "locked precondition error message (F4)"
-    if [ ! -L "$SBMON_APP_LINK" ] && [ ! -e "$SBMON_APP_LINK" ]; then pass "no fresh release created (F4)"; else fail "upgrade degraded into fresh install"; fi
-    if [ ! -d "$SBMON_RELEASES_DIR" ]; then pass "no releases dir recreated (F4)"; else fail "releases dir recreated"; fi
-    assert_eq "$UNIT_F4" "$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)" "unit untouched by failed upgrade (F4)"
-    if [ ! -e "$SBMON_RELEASES_DIR/releases.history" ]; then pass "no history entry (F4)"; else fail "history entry written by failed upgrade"; fi
-    wait "$F4_HOLDER" 2>/dev/null || true
+    # F4b below is this scan's negative control: the same grep has to find the
+    # provenance refusal there, so "absent" here is a statement about the link.
+    assert_no_grep 'provenance 非法' "$OUT_F4" \
+        "a removed reader link is legal absence, not a provenance refusal (F4a)"
+
+    run_uninstall_quiet
+    run_install "$TMP/out-f4b-setup.log"
+    assert_rc 0 $? "reader-coupled install re-created for the dangling-link probe (F4b setup)"
+    f4_concurrent_removal b ":"
+    assert_grep 'deployment lock acquired' "$OUT_F4" \
+        "the refusal happens INSIDE the lock, not before it (F4b)"
+    assert_grep '运行时链接 provenance 非法' "$OUT_F4" \
+        "a dangling reader link is refused, never recovered as a fresh install (F4b)"
+    # The wipe above destroyed the deployment by hand, so the dangling link is
+    # this harness's own debris: clear it here, exactly as an operator would
+    # after being told to handle it by hand.
+    if [ -L "$SBOXJR_LIB_DIR" ]; then rm -f -- "$SBOXJR_LIB_DIR"; fi
+    rm -f -- "$SBOXJR_UNIT_FILE"
 else
     printf '  SKIP F4 (flock 不可用；Linux CI 为最终 gate)\n'
 fi
@@ -1350,8 +1384,10 @@ ensure_fixture_state_dir
 printf 'legacy-auth\n' > "$FIX_STATE/auth/probe"
 printf '{"legacy": true}\n' > "$FIX_STATE/auth.json"
 printf '{"whitelist": []}\n' > "$FIX_STATE/access.json"
-mkdir -p "$SBOXJR_DATA_ROOT/out"
-printf 'jr-cursor-seed\n' > "$SBOXJR_DATA_ROOT/state"
+mkdir -p "$SBOXJR_DATA_ROOT/out" "$SBOXJR_DATA_ROOT/state"
+# state/ is a directory in the reader's layout (the cursor lives inside it), so
+# the seed must be an entry within it.
+printf 'jr-cursor-seed\n' > "$SBOXJR_DATA_ROOT/state/cursor"
 OUT6="$TMP/out-t06.log"
 if ( "$INSTALL_MONITOR" uninstall ) > "$OUT6" 2>&1; then
     pass "uninstall exits 0"
@@ -1372,7 +1408,7 @@ assert_grep 'systemctl disable singbox-monitor' "$MOCK_CALL_LOG" "strict disable
 # monitor's state -- preserved, and only --purge-state removes it.
 [ -d "$SBOXJR_DATA_ROOT" ] && pass "reader data root preserved by default" \
     || fail "reader data root deleted without --purge-state"
-[ -f "$SBOXJR_DATA_ROOT/state" ] && pass "reader cursor/state file preserved by default" \
+[ -f "$SBOXJR_DATA_ROOT/state/cursor" ] && pass "reader cursor/state file preserved by default" \
     || fail "reader cursor/state file deleted without --purge-state"
 
 OUT6B="$TMP/out-t06b.log"
