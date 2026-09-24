@@ -562,46 +562,211 @@ assert_no_grep "$OUT" 'staging release' "formal-nojr: refused BEFORE any staging
 [ ! -e "$SBOXJR_DATA_ROOT" ] && pass "formal-nojr: no reader data directories created" \
     || fail "formal-nojr: reader data tree created"
 assert_eq "$(calls_mut_of 'singbox-journal-reader')" "0" "formal-nojr: ZERO state-changing reader calls"
-# The refusal must be reachable-only-by-declaration, not by any other escape:
-# an empty-but-set value is NOT a declaration.
-new_case formal_nojr_empty "$SRC_NOJR"
-export SBMON_ALLOW_INERT_BASELINE=""
-inst install
-[ "$LAST_RC" != "0" ] && pass "formal-nojr-empty: an empty declaration does not open the inert path (rc=$LAST_RC)" \
-    || fail "formal-nojr-empty: empty SBMON_ALLOW_INERT_BASELINE must still refuse"
-unset SBMON_ALLOW_INERT_BASELINE
+assert_eq "$(grep -cE 'systemctl (enable|start|restart|stop|disable) ' "$MOCK_CALL_LOG")" "0" \
+    "formal-nojr: ZERO state-changing systemctl calls for EITHER unit (not just the reader's)"
+# Discriminators 2 + 3 (review #54 round 3): the removed variable is a DEAD
+# environment name. The caller -- an operator typing the formal command --
+# supplies this environment, so ANY value of it (the old magic 1, a zero, an
+# arbitrary word, or an empty one) must behave exactly like an unset variable:
+# same refusal, rc != 0, zero mutation. There is no value that opens a path.
+LEGACY_I=0
+for LEGACY_VAL in 1 0 yes TRUE ""; do
+    LEGACY_I=$((LEGACY_I + 1))
+    new_case "formal_nojr_leg$LEGACY_I" "$SRC_NOJR"
+    export "SBMON_ALLOW_INERT_BASELINE=$LEGACY_VAL"
+    inst install
+    [ "$LAST_RC" != "0" ] \
+        && pass "formal-nojr-leg$LEGACY_I: value='$LEGACY_VAL' still refused (rc=$LAST_RC)" \
+        || fail "formal-nojr-leg$LEGACY_I: a caller-set legacy value opened the inert path (rc=0)"
+    assert_grep "$OUT" '源树缺少 journal_reader/ 载荷' \
+        "formal-nojr-leg$LEGACY_I: value='$LEGACY_VAL' refused by the payload gate itself"
+    assert_grep "$OUT" '无任何环境变量或命令行开关可绕过' \
+        "formal-nojr-leg$LEGACY_I: the refusal states no switch exists"
+    assert_no_grep "$OUT" 'staging release' "formal-nojr-leg$LEGACY_I: refused BEFORE any staging"
+    [ -z "$(ls -A "$SBMON_RELEASES_DIR" 2>/dev/null)" ] \
+        && pass "formal-nojr-leg$LEGACY_I: releases dir untouched" \
+        || fail "formal-nojr-leg$LEGACY_I: staging happened anyway"
+    [ ! -e "$SBMON_STATE_ROOT" ] && pass "formal-nojr-leg$LEGACY_I: monitor state root untouched" \
+        || fail "formal-nojr-leg$LEGACY_I: the monitor layout was created before the refusal"
+    [ ! -e "$SBOXJR_UNIT_FILE" ] && pass "formal-nojr-leg$LEGACY_I: no reader unit written" \
+        || fail "formal-nojr-leg$LEGACY_I: reader unit exists"
+    [ ! -e "$SBOXJR_LIB_DIR" ] && pass "formal-nojr-leg$LEGACY_I: no runtime link created" \
+        || fail "formal-nojr-leg$LEGACY_I: runtime path created"
+    [ ! -e "$SBOXJR_DATA_ROOT" ] && pass "formal-nojr-leg$LEGACY_I: no reader data directories created" \
+        || fail "formal-nojr-leg$LEGACY_I: reader data tree created"
+    assert_eq "$(calls_mut_of 'singbox-journal-reader')" "0" \
+        "formal-nojr-leg$LEGACY_I: ZERO state-changing reader calls"
+    assert_eq "$(grep -cE 'systemctl (enable|start|restart|stop|disable) ' "$MOCK_CALL_LOG")" "0" \
+        "formal-nojr-leg$LEGACY_I: value='$LEGACY_VAL' mutated NO service of either unit"
+    unset SBMON_ALLOW_INERT_BASELINE
+done
+# The probes above must be able to fail: an always-zero-count loop would look
+# green while testing nothing.
+assert_eq "$LEGACY_I" "5" "all five legacy caller-environment values were probed"
 
 # ===========================================================================
-section "S2b: an EXPLICITLY declared pre-PR-2B baseline still stages INERT"
+section "S2b: the libexec-less legacy release is a LOW-LEVEL fixture only"
 # ===========================================================================
-# The legacy shape is preserved for exactly one purpose -- modeling a pre-PR-2B
-# release (the packaging lane fixture, and the no-libexec rollback target the
-# rbguard case builds). It is now a declaration, loudly logged, never the
-# default, and the low-level staging/converge inert paths keep working for it.
-new_case declared_legacy "$SRC_NOJR"
-export SBMON_ALLOW_INERT_BASELINE=1
+# Discriminator 5 (review #54 round 3): rollback scenarios still need a
+# pre-PR-2B, libexec-less release to EXIST (rbguard below builds one by hand;
+# the reader-coupling history needs one to roll back from). That shape is now
+# produced by calling the staging primitive DIRECTLY -- never by teaching the
+# formal top-level command to accept a payload-less source. If this section
+# breaks, the legacy fixture has to be rebuilt by hand; the installer must not
+# become reachable again.
+lowlevel_stage() { # <version> -> staged release id on stdout (PURE library call)
+    SBMON_STAGE_LIB="$LIB" SBMON_STAGE_VER="$1" bash -c '
+        . "$SBMON_STAGE_LIB" >/dev/null 2>&1
+        mkdir -p "$SBMON_RELEASES_DIR"
+        sbmon_stage_release "$SBMON_STAGE_VER" 2>/dev/null
+    '
+}
+new_case lowlevel_nojr "$SRC_NOJR"
+LL_ID="$(lowlevel_stage 0.9.9)"; LL_RC=$?
+if [ "$LL_RC" = 0 ] && [ -n "$LL_ID" ]; then
+    pass "lowlevel: the staging primitive still builds a payload-less release ($LL_ID)"
+else
+    fail "lowlevel: legacy staging must stay usable for fixtures (rc=$LL_RC id='$LL_ID')"
+fi
+[ -f "$SBMON_RELEASES_DIR/$LL_ID/VERSION" ] && [ -x "$SBMON_RELEASES_DIR/$LL_ID/bin/monitor-service" ] \
+    && pass "lowlevel: the legacy tree is a complete MONITOR release apart from the reader" \
+    || fail "lowlevel: staged tree incomplete"
+[ ! -e "$SBMON_RELEASES_DIR/$LL_ID/libexec" ] \
+    && pass "lowlevel: the legacy shape carries NO reader runtime" \
+    || fail "lowlevel: a libexec appeared from a payload-less source"
+LL_JSON="$(release_probe "$SBMON_RELEASES_DIR/$LL_ID")"
+assert_eq "$(probe_field "$LL_JSON" contract_available)" "False" \
+    "lowlevel: the fixture really is the contract_available=false shape the gate refuses to finish in"
+# Contrast, so this cannot degrade into "the primitive never stages a reader":
+new_case lowlevel_jr "$SRC"
+LL2_ID="$(lowlevel_stage 0.9.10)"; assert_eq "$?" "0" "lowlevel contrast: staging with a payload rc=0"
+[ -d "$SBMON_RELEASES_DIR/$LL2_ID/libexec/sbox-journal-reader/journal_reader" ] \
+    && pass "lowlevel contrast: the SAME primitive stages the reader runtime when the source has it" \
+    || fail "lowlevel contrast: reader runtime absent -- the inert branch is not payload-conditional"
+assert_eq "$(probe_field "$(release_probe "$SBMON_RELEASES_DIR/$LL2_ID")" contract_available)" "True" \
+    "lowlevel contrast: that release imports its contract (the difference is the payload, not the code path)"
+# Zero service/system side effects from the direct calls: staging only.
+[ ! -e "$SBOXJR_UNIT_FILE" ] && pass "lowlevel: no reader unit written by the primitive" \
+    || fail "lowlevel: the primitive wrote a unit"
+[ ! -e "$SBOXJR_LIB_DIR" ] && pass "lowlevel: no runtime link created by the primitive" \
+    || fail "lowlevel: the primitive linked a runtime"
+[ ! -e "$SBOXJR_DATA_ROOT" ] && pass "lowlevel: no reader data tree created by the primitive" \
+    || fail "lowlevel: the primitive created reader data"
+assert_eq "$(calls_mut_of 'singbox-journal-reader')" "0" "lowlevel: ZERO state-changing reader calls"
+[ ! -e "$SBMON_STATE_ROOT" ] && pass "lowlevel: the primitive created no monitor state root either" \
+    || fail "lowlevel: the primitive mutated monitor state"
+# And the existence of a legacy release on disk does NOT make a formal install
+# of a payload-less source legal -- the gate is about the CANDIDATE, not about
+# what history contains. Its own case, because new_case repoints every path.
+new_case lowlevel_guard "$SRC_NOJR"
+LLG_ID="$(lowlevel_stage 0.9.9)"; assert_eq "$?" "0" "lowlevel-guard: legacy fixture release staged"
+[ -d "$SBMON_RELEASES_DIR/$LLG_ID" ] && [ ! -e "$SBMON_RELEASES_DIR/$LLG_ID/libexec" ] \
+    && pass "lowlevel-guard: the fixture is a libexec-less release on disk" \
+    || fail "lowlevel-guard: fixture release missing or carries a libexec"
 inst install
-assert_eq "$LAST_RC" "0" "declared-legacy: declared baseline installs rc=0 (rc=$LAST_RC)"
-assert_grep "$OUT" 'SBMON_ALLOW_INERT_BASELINE=1' \
-    "declared-legacy: the legacy baseline is announced, not silently inert"
-assert_grep "$OUT" 'reader INERT' "declared-legacy: reader activation stays INERT"
-[ -n "$(ls -A "$SBMON_RELEASES_DIR" 2>/dev/null)" ] \
-    && pass "declared-legacy: the release itself still stages (low-level legacy path preserved)" \
-    || fail "declared-legacy: staging was refused too (the legacy staging must remain usable)"
-[ ! -e "$SBOXJR_UNIT_FILE" ] && pass "declared-legacy: no reader unit written" || fail "declared-legacy: reader unit exists"
-[ ! -e "$SBOXJR_LIB_DIR" ] && pass "declared-legacy: no runtime link created" || fail "declared-legacy: runtime path created"
-[ ! -e "$SBOXJR_DATA_ROOT" ] && pass "declared-legacy: no reader data directories created" \
-    || fail "declared-legacy: reader data tree created"
-assert_eq "$(calls_mut_of 'singbox-journal-reader')" "0" "declared-legacy: ZERO state-changing reader calls"
-unset SBMON_ALLOW_INERT_BASELINE
-# B4's whole point is that the declaration is test-only: production deploy code
-# must never be able to reach the inert path by itself. Command-position match
-# on purpose -- the lib's own diagnostics and comments NAME the variable (that
-# is how an operator learns the escape exists) without ever ASSIGNING it.
-PROD_INERT_SET="$(grep -rEn --exclude='*.md' \
-    '^[[:space:]]*(export[[:space:]]+)?SBMON_ALLOW_INERT_BASELINE=1([[:space:]]|$)' \
-    "$ROOT/monitor-v2/deploy" 2>/dev/null | cut -d: -f1 | LC_ALL=C sort -u || true)"
-assert_eq "$PROD_INERT_SET" "" "no production deploy code ever assigns the inert baseline (declaration is test-only)"
+[ "$LAST_RC" != "0" ] \
+    && pass "lowlevel-guard: formal install still refuses with legacy releases on disk (rc=$LAST_RC)" \
+    || fail "lowlevel-guard: an on-disk legacy release opened the inert install path"
+assert_grep "$OUT" '源树缺少 journal_reader/ 载荷' \
+    "lowlevel-guard: refused by the payload gate, not by an artifact of the fixture"
+[ -d "$SBMON_RELEASES_DIR/$LLG_ID" ] \
+    && pass "lowlevel-guard: the refusal left the fixture release alone (no prune, no mutation)" \
+    || fail "lowlevel-guard: the refusal mutated the pre-staged release"
+[ -z "$(find "$SBMON_RELEASES_DIR" -maxdepth 1 -name '.staging-*' 2>/dev/null)" ] \
+    && pass "lowlevel-guard: no candidate was staged before the refusal" \
+    || fail "lowlevel-guard: a candidate got staged despite the refusal"
+[ ! -e "$SBOXJR_UNIT_FILE" ] && [ ! -e "$SBOXJR_LIB_DIR" ] && [ ! -e "$SBOXJR_DATA_ROOT" ] \
+    && pass "lowlevel-guard: zero reader paths created by the refusal" \
+    || fail "lowlevel-guard: the refusal touched reader state"
+assert_eq "$(grep -cE 'systemctl (enable|start|restart|stop|disable) ' "$MOCK_CALL_LOG")" "0" \
+    "lowlevel-guard: the refusal mutated no service of either unit"
+
+# ===========================================================================
+section "S2c: the deleted switch exists nowhere outside these refusal probes"
+# ===========================================================================
+# Review #54 round 3 removed the caller-environment override ENTIRELY -- name
+# included -- so the strongest available static statement is a zero-occurrence
+# scan: no production source, no deploy doc, no workflow and no other test lane
+# can even name a switch that turns the payload gate off. (lab/ is untracked
+# scratch: it belongs to no release, no lane and no commit.)
+INERT_REFS="$(grep -rlI --exclude-dir=.git --exclude-dir=lab --exclude-dir=__pycache__ \
+    --exclude=test-monitor-v2-jr-deploy.sh \
+    'SBMON_ALLOW_INERT_BASELINE' "$ROOT" 2>/dev/null | sed "s|^$ROOT/||" || true)"
+assert_eq "$INERT_REFS" "" "zero references to the deleted switch outside this suite's probes"
+# The gate itself must be UNCONDITIONAL inside the formal preflight: the payload
+# check appears exactly once there, is never an `if` branch, and each occurrence
+# is welded to an sbmon_die on the following line. (The low-level staging
+# primitive legitimately still branches on source presence -- that branch is the
+# fixture path proven above, and it is not reachable from a formal command.)
+awk '/^sbmon_sboxjr_activation_preflight\(\)/{f=1} f{print} f&&/^\}/{exit}' "$LIB" \
+    > "$TMP/preflight-body.txt"
+assert_eq "$(grep -c 'sbmon_sboxjr_source_present' "$TMP/preflight-body.txt")" "1" \
+    "preflight carries exactly one payload check"
+assert_no_grep "$TMP/preflight-body.txt" 'if[[:space:]].*sbmon_sboxjr_source_present' \
+    "the formal payload check is not an if-branch (no conditional bypass)"
+assert_eq "$(grep -A1 'sbmon_sboxjr_source_present' "$TMP/preflight-body.txt" | grep -c 'sbmon_die')" "1" \
+    "the payload check is welded to sbmon_die (refusal, not a warning)"
+assert_no_grep "$LIB" 'ALLOW_INERT|INERT_BASELINE' \
+    "the library reads no inert-baseline switch of any name"
+assert_no_grep "$W_INSTALL" 'ALLOW_INERT|INERT_BASELINE|--allow-inert' \
+    "the top-level command exposes no inert flag or switch"
+# NEGATIVE CONTROL (review #54 round 3): the three static gates above must be
+# capable of firing. Re-introducing the deleted name -- in a THROWAWAY COPY, never
+# in the tree -- has to light all three up, including the zero-occurrence scan.
+NC="$TMP/negctl"; rm -rf "$NC"; mkdir -p "$NC/monitor-v2/deploy"
+cp -- "$LIB" "$NC/monitor-v2/deploy/lib-copy.sh"
+cp -- "$W_INSTALL" "$NC/monitor-v2/deploy/install-copy.sh"
+printf '%s\n' 'export SBMON_ALLOW_INERT_BASELINE=1' >> "$NC/monitor-v2/deploy/lib-copy.sh"
+printf '%s\n' 'export SBMON_ALLOW_INERT_BASELINE=1' >> "$NC/monitor-v2/deploy/install-copy.sh"
+NC_HITS="$(grep -rl --exclude-dir=.git --exclude-dir=lab --exclude-dir=__pycache__ \
+    --exclude=test-monitor-v2-jr-deploy.sh 'SBMON_ALLOW_INERT_BASELINE' "$NC" 2>/dev/null | wc -l | tr -d ' ')"
+assert_eq "$NC_HITS" "2" "negative control: the occurrence scan sees a re-added switch (it is not vacuous)"
+grep -qE 'ALLOW_INERT|INERT_BASELINE' "$NC/monitor-v2/deploy/lib-copy.sh" \
+    && pass "negative control: the library switch scan would fire on a re-added override" \
+    || fail "negative control: library scan cannot fire -- the gate is vacuous"
+grep -qE 'ALLOW_INERT|INERT_BASELINE|--allow-inert' "$NC/monitor-v2/deploy/install-copy.sh" \
+    && pass "negative control: the installer switch scan would fire on a re-added override" \
+    || fail "negative control: installer scan cannot fire -- the gate is vacuous"
+rm -rf "$NC"
+
+# ===========================================================================
+section "S2d: the UPGRADE half of the formal path refuses an absent payload too"
+# ===========================================================================
+# Discriminator 6 (review #54 round 3): install alone is not enough -- §3 talks
+# about every FORMAL top-level path, and `upgrade` is the one a real operator
+# hits with a stripped source tree. The live deployment must survive the refusal
+# exactly as it was (both links, both service facts, no new history entry),
+# because "refuse and keep running the old coherent release" is the only correct
+# outcome for a payload-less candidate. Needs real symlinks: on a platform whose
+# ln -s copies, the pre-existing reader link is an illegal provenance shape and
+# the command would refuse for the WRONG reason, so the probe is gated.
+if require_symlink "upgrade refuses an absent payload on a live deployment"; then
+    new_case upgradenojr "$SRC"
+    inst install; assert_eq "$LAST_RC" "0" "upgradenojr: v1 install rc=0"
+    R1="$(current_release_id)"
+    assert_eq "$(jr_link_release_id)" "$R1" "upgradenojr: reader runtime linked into v1"
+    H0="$(wc -l < "$SBMON_RELEASES_DIR/releases.history" | tr -d ' ')"
+    rm -rf "$SBMON_REPO_MONITOR_DIR/journal_reader"
+    printf '0.1.1\n' > "$SBMON_VERSION_FILE"
+    M="$(log_mark)"
+    inst upgrade
+    [ "$LAST_RC" != "0" ] \
+        && pass "upgradenojr: upgrade refused rc=$LAST_RC (no inert completion)" \
+        || fail "upgradenojr: an upgrade completed with the reader INERT"
+    assert_grep "$OUT" '源树缺少 journal_reader/ 载荷' \
+        "upgradenojr: the refusal is the payload gate, not a provenance artifact"
+    assert_no_grep "$OUT" 'staging release' "upgradenojr: refused BEFORE staging the candidate"
+    tail -n +"$((M + 1))" "$MOCK_CALL_LOG" > "$CASE_DIR/calls.tail"
+    assert_eq "$(grep -cE 'systemctl (enable|start|restart|stop|disable) ' "$CASE_DIR/calls.tail")" "0" \
+        "upgradenojr: ZERO state-changing systemctl calls in the refusal window"
+    assert_eq "$(current_release_id)" "$R1" "upgradenojr: live monitor release unchanged"
+    assert_eq "$(jr_link_release_id)" "$R1" "upgradenojr: live reader runtime unchanged"
+    assert_eq "$(jr_state)" "active/enabled" "upgradenojr: reader service facts preserved"
+    assert_eq "$(wc -l < "$SBMON_RELEASES_DIR/releases.history" | tr -d ' ')" "$H0" \
+        "upgradenojr: history is a commit record -- a refusal writes no entry"
+    release_probe "$SBMON_APP_LINK" >/dev/null; assert_eq "$?" "0" \
+        "upgradenojr: the surviving deployment is still contract-coherent after the refusal"
+fi
 
 # ===========================================================================
 section "S3: partial manifest source refuses BEFORE staging"
