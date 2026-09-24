@@ -25,6 +25,11 @@ Policies implemented here (frozen):
     SQLite transaction boundary; `apply` here is the injection point).
   * Header rules: exactly one header line, FIRST; header.seq == filename
     seq; any violation rejects the WHOLE file with a sanitized code only.
+  * An exchange directory that cannot be enumerated at all -- missing,
+    not searchable/readable for this identity, not a directory -- is NOT
+    "empty": the scan raises ExchangeDirUnreadable instead of returning
+    nothing, so no ingest pass can settle, advance or clear a degradation
+    on storage it never actually read (B7-B).
 """
 
 import json
@@ -43,14 +48,32 @@ DISPOSITION_REJECTED = "rejected"
 DISPOSITION_APPLY_FAILED = "apply_failed"  # NOT terminal, retried, blocks
 
 
+class ExchangeDirUnreadable(OSError):
+    """The exchange DIRECTORY itself could not be enumerated (B7-B).
+
+    An OSError SUBCLASS on purpose: every containment boundary that
+    already catches OSError keeps catching this one, while the caller who
+    must tell "storage I could not read" apart from "storage that is
+    genuinely empty" catches the class. The instance carries no path --
+    nothing raised here can put a filesystem location into a status, log
+    or API surface; the original errno stays in the exception CHAIN,
+    which no Monitor surface ever formats."""
+
+
 def scan_exchange_dir(out_dir):
     """Strict filename grammar; symlinks/non-regular are excluded here and
-    re-checked at open (regular-file-only per §7.2)."""
+    re-checked at open (regular-file-only per §7.2).
+
+    An EMPTY directory is a clean no-op; an UNREADABLE one is a storage
+    failure and raises -- the two must never collapse into the same
+    answer, or a permission break freezes the ingest at its current
+    terminal while looking exactly like a healthy pass."""
     found = {}
     try:
         names = os.listdir(out_dir)
-    except OSError:
-        return found
+    except OSError as exc:
+        raise ExchangeDirUnreadable(
+            "journal exchange directory is not enumerable") from exc
     for name in sorted(names):
         match = FILENAME_RE.match(name)
         if not match:
@@ -103,7 +126,11 @@ def settle(out_dir, terminal_seq, apply_fn):
     `apply_fn(header, records, seq)` must persist aggregates AND the
     terminal advance as ONE atomic storage transaction; returning normally
     means committed, raising means nothing settled (retry next cycle --
-    safe, because re-encountering seq <= terminal is a no-op)."""
+    safe, because re-encountering seq <= terminal is a no-op).
+
+    An exchange directory that cannot be enumerated raises
+    ExchangeDirUnreadable BEFORE anything settles: an unreadable tree is
+    never reported as a clean pass."""
     files = scan_exchange_dir(out_dir)
     result = {"terminal": terminal_seq, "gaps": 0, "rejected": 0,
               "consumed": 0, "last_consumed": None, "blocked_at": None,
