@@ -40,7 +40,11 @@ SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/monitor-env.sh
 source "$SELF_DIR/../lib/monitor-env.sh"
 
-APP_DIR="$(cd -- "$SELF_DIR/.." && pwd)"
+# -P: run the IMMUTABLE release, not the mutable live symlink. Reached through
+# /opt/singbox-monitor, this still resolves to releases/<id>, so the app tree
+# this process execs and the contract path derived below are pinned to one
+# physical release (same rule monitor-contract-probe follows).
+APP_DIR="$(cd -- "$SELF_DIR/.." && pwd -P)"
 WEBAPP="$APP_DIR/app/monitor-v2/webapp.py"
 COLLECTOR="$APP_DIR/app/monitor-v2/collector.py"
 

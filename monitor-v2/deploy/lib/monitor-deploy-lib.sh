@@ -1482,38 +1482,20 @@ sbmon_sboxjr_converge() { # <new_id|''> <no_start 0|1> <keep_prestate 0|1>
 # Single inverse of the reader transaction: restores the captured
 # active/enabled/unit/runtime/identity-created facts. Any failed restore
 # step is CRITICAL (exit 2): the caller is already inside a failure path.
+#
+# ORDER IS THE CONTRACT (review #54 B1): CODE FIRST, PROCESS LAST. The unit
+# file and the runtime link are restored before the reader is (re)started, and
+# the active-state restart is the LAST service action. Restarting first would
+# let a failed N->N+1 upgrade restart the reader on the N+1 runtime and then
+# merely repoint the symlink at N: both live links would read "N" while the
+# RUNNING process is still N+1 -- the exact mixed-version state this contract
+# exists to forbid, and one no link-based assertion can detect afterwards.
+# The boot-enable fact sits with the CODE group (before the link) rather than
+# after it: plain `enable`/`disable` never start or stop a running process, so
+# they cannot load candidate code, while a failed link step must not be able to
+# strand an uncompensated `enable`.
 sbmon_sboxjr_restore_prestate() {
-    sbmon_warn "恢复 reader 事务前状态（服务 + unit + 运行时链接 + 本次新建身份）"
-    if [ "$SBOXJR_PRE_ACTIVE" = "1" ]; then
-        if ! sbmon_sboxjr_service_restart; then
-            sbmon_critical "reader 回滚：restart 失败（事务前 active）；需要人工处理"
-        fi
-        if ! sbmon_wait_sboxjr_active; then
-            sbmon_critical "reader 回滚：服务未恢复 active（事务前 active）；需要人工检查 journalctl -u $SBOXJR_SERVICE_NAME"
-        fi
-    else
-        if sbmon_sboxjr_service_active; then
-            if ! sbmon_sboxjr_service_stop; then
-                sbmon_critical "reader 回滚：stop 失败（事务前 inactive）；需要人工处理"
-            fi
-            if sbmon_sboxjr_service_active; then
-                sbmon_critical "reader 回滚：服务仍处于运行状态（事务前 inactive）；需要人工处理"
-            fi
-        fi
-    fi
-    if [ "$SBOXJR_PRE_ENABLED" = "1" ]; then
-        if ! sbmon_sboxjr_service_enabled; then
-            if ! sbmon_sboxjr_service_enable; then
-                sbmon_critical "reader 回滚：enable 恢复失败；需要人工处理"
-            fi
-        fi
-    else
-        if sbmon_sboxjr_service_enabled; then
-            if ! sbmon_sboxjr_service_disable; then
-                sbmon_critical "reader 回滚：disable 恢复失败（可能残留 enabled 状态）；需要人工处理"
-            fi
-        fi
-    fi
+    sbmon_warn "恢复 reader 事务前状态（unit + enable 事实 + 运行时链接 → 服务状态 → 本次新建身份）"
     local unit_touched=0
     if [ "$SBOXJR_PRE_UNIT_EXISTED" = "1" ]; then
         if [ ! -f "$SBOXJR_PRE_UNIT_BACKUP" ] \
@@ -1536,6 +1518,19 @@ sbmon_sboxjr_restore_prestate() {
             sbmon_critical "reader 回滚：daemon-reload 失败；systemd 状态可能不一致，需要人工处理"
         fi
     fi
+    if [ "$SBOXJR_PRE_ENABLED" = "1" ]; then
+        if ! sbmon_sboxjr_service_enabled; then
+            if ! sbmon_sboxjr_service_enable; then
+                sbmon_critical "reader 回滚：enable 恢复失败；需要人工处理"
+            fi
+        fi
+    else
+        if sbmon_sboxjr_service_enabled; then
+            if ! sbmon_sboxjr_service_disable; then
+                sbmon_critical "reader 回滚：disable 恢复失败（可能残留 enabled 状态）；需要人工处理"
+            fi
+        fi
+    fi
     if [ -n "$SBOXJR_PRE_LINK_ID" ]; then
         if [ "$(sbmon_sboxjr_runtime_linked_id)" != "$SBOXJR_PRE_LINK_ID" ]; then
             if [ ! -d "$(sbmon_sboxjr_release_runtime_dir "$SBOXJR_PRE_LINK_ID")" ]; then
@@ -1548,6 +1543,25 @@ sbmon_sboxjr_restore_prestate() {
     else
         if ! sbmon_sboxjr_unlink_runtime; then
             sbmon_critical "reader 回滚：运行时链接移除失败；需要人工处理"
+        fi
+    fi
+    # LAST: the process is (re)started only now that the prestate code + unit
+    # are back in place, so a restart can never load the failed candidate.
+    if [ "$SBOXJR_PRE_ACTIVE" = "1" ]; then
+        if ! sbmon_sboxjr_service_restart; then
+            sbmon_critical "reader 回滚：restart 失败（事务前 active）；需要人工处理"
+        fi
+        if ! sbmon_wait_sboxjr_active; then
+            sbmon_critical "reader 回滚：服务未恢复 active（事务前 active）；需要人工检查 journalctl -u $SBOXJR_SERVICE_NAME"
+        fi
+    else
+        if sbmon_sboxjr_service_active; then
+            if ! sbmon_sboxjr_service_stop; then
+                sbmon_critical "reader 回滚：stop 失败（事务前 inactive）；需要人工处理"
+            fi
+            if sbmon_sboxjr_service_active; then
+                sbmon_critical "reader 回滚：服务仍处于运行状态（事务前 inactive）；需要人工处理"
+            fi
         fi
     fi
     # Identity: only an account THIS transaction created is removed again

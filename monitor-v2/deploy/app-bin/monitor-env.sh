@@ -296,13 +296,25 @@ monitor_env_record_environment() {
 # no env var steers it, no repository checkout can satisfy it, and a test can
 # only change the answer by changing the installed release itself.
 #
+# The <app-dir> argument is CANONICALIZED HERE (physical path), so a caller
+# that reached the release through the mutable live symlink
+# (/opt/singbox-monitor) still exports the immutable
+# releases/<id>/libexec/sbox-journal-reader. An import path that travels
+# through the live link would silently follow the next activation flip: the
+# running Monitor would keep ingesting through a release it is no longer
+# supposed to be, and the "one release unit" property would hold only for the
+# links, not for the process. Canonicalizing in the ONE derivation keeps the
+# runtime and the probe pinned to the same physical release by construction.
+#
 # RC is always 0 -- an absent payload is the documented INERT case (a
 # pre-PR-2B release ships no libexec), not a startup failure:
 #   <app-dir> -> prints the release reader tree path, or nothing when this
 #                release carries no complete contract payload.
 # ---------------------------------------------------------------------------
 monitor_env_contract_pythonpath() {
-    local jr="$1/libexec/sbox-journal-reader"
+    local root
+    root="$(cd -- "$1" 2>/dev/null && pwd -P)" || return 0
+    local jr="$root/libexec/sbox-journal-reader"
     local f
     [ -d "$jr/journal_reader" ] || return 0
     for f in __init__.py ingest_contract.py schema.py; do

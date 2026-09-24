@@ -475,9 +475,20 @@ _cmd_rollback_locked() { # [release-id]   (F4: runs under the deploy lock)
        || sbmon_sboxjr_service_active || sbmon_sboxjr_service_enabled; then
         reader_deployed=1
     fi
-    if [ "$reader_deployed" = 1 ] \
-       && [ ! -d "$(sbmon_sboxjr_release_runtime_dir "$target")" ]; then
-        sbmon_die "回滚目标 $target 不含 reader 运行时（pre-PR-2B release）：reader 已激活时拒绝回滚，避免 Monitor/reader 混版本；fail-closed，未做任何变更"
+    if [ "$reader_deployed" = 1 ]; then
+        local jr_target_dir
+        jr_target_dir="$(sbmon_sboxjr_release_runtime_dir "$target")"
+        if [ ! -d "$jr_target_dir" ]; then
+            sbmon_die "回滚目标 $target 不含 reader 运行时（pre-PR-2B release）：reader 已激活时拒绝回滚，避免 Monitor/reader 混版本；fail-closed，未做任何变更"
+        fi
+        # Existence is not integrity (review #54 B2): a target whose reader
+        # runtime directory is PRESENT but violates the 12+1+1 manifest would
+        # otherwise only be refused later by sbmon_sboxjr_converge() -- AFTER
+        # Monitor had already switched the live link and restarted. Audit it
+        # the same way the runtime link does, here, while nothing is touched.
+        if ! sbmon_sboxjr_audit_runtime "$jr_target_dir"; then
+            sbmon_die "回滚目标 $target 的 reader 运行时未通过 12+1+1 manifest 审计：拒绝回滚，避免 Monitor/reader 混版本；fail-closed，未做任何变更"
+        fi
     fi
 
     # R3-2: capture the full pre-state BEFORE touching anything.
