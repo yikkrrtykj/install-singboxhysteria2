@@ -660,6 +660,7 @@ sbmon_stage_release() { # sbmon_stage_release <version> -> prints release id on 
     # Shims + shared env lib from deploy templates.
     cp -- "$DEPLOY_DIR/app-bin/monitor-service" "$staged/bin/monitor-service"
     cp -- "$DEPLOY_DIR/app-bin/monitor-health" "$staged/bin/monitor-health"
+    cp -- "$DEPLOY_DIR/app-bin/monitor-contract-probe" "$staged/bin/monitor-contract-probe"
     cp -- "$DEPLOY_DIR/app-bin/monitor-env.sh" "$staged/lib/monitor-env.sh"
 
     # PR-2B: the sbox-journal-reader runtime is bundled INTO the immutable
@@ -698,7 +699,7 @@ sbmon_stage_release() { # sbmon_stage_release <version> -> prints release id on 
         "$staged/app/monitor-v2/api_bridge/"*.py
         "$staged/app/monitor-v2/web/"*.py)
     local -a sh_targets=("$staged/bin/monitor-service" "$staged/bin/monitor-health"
-        "$staged/lib/monitor-env.sh")
+        "$staged/bin/monitor-contract-probe" "$staged/lib/monitor-env.sh")
     if [ "$jr_staged" = 1 ]; then
         py_targets+=("$jr_libexec/journal_reader/"*.py)
         sh_targets+=("$jr_libexec/sbox-journal-reader")
@@ -712,7 +713,8 @@ sbmon_stage_release() { # sbmon_stage_release <version> -> prints release id on 
     find "$staged" -type d -exec chmod 0755 {} +
     find "$staged" -type f -exec chmod 0644 {} +
     find "$staged" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
-    chmod 0755 "$staged/bin/monitor-service" "$staged/bin/monitor-health"
+    chmod 0755 "$staged/bin/monitor-service" "$staged/bin/monitor-health" \
+        "$staged/bin/monitor-contract-probe"
     [ "$jr_staged" = 1 ] && chmod 0755 "$jr_libexec/sbox-journal-reader"
 
     mv -- "$staged" "$SBMON_RELEASES_DIR/$id"

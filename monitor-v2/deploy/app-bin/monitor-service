@@ -44,6 +44,16 @@ APP_DIR="$(cd -- "$SELF_DIR/.." && pwd)"
 WEBAPP="$APP_DIR/app/monitor-v2/webapp.py"
 COLLECTOR="$APP_DIR/app/monitor-v2/collector.py"
 
+# PR-2B: the journal_reader ingest contract lives in THIS release's libexec,
+# so the Monitor runtime imports it from its own immutable release tree. The
+# derivation + application is shared with monitor-contract-probe through
+# monitor_env_apply_contract_pythonpath (one source of truth, see
+# lib/monitor-env.sh): PYTHONPATH becomes exactly the release contract path,
+# so neither an inherited env value nor a repository checkout can answer for
+# the installed release. A release without the payload (pre-PR-2B baseline)
+# exports nothing and the ingest surface stays inert.
+monitor_env_apply_contract_pythonpath "$APP_DIR"
+
 [ -n "$CONF" ] || { echo "monitor-service: conf path required" >&2; exit 1; }
 [ -n "$DATA_ROOT" ] || { echo "monitor-service: data root required (explicit contract, no \$PWD inference)" >&2; exit 1; }
 STATE_DIR="$DATA_ROOT/state"
@@ -73,6 +83,19 @@ API_URL="${SBMON_ENV_API_URL:-http://127.0.0.1:9091}"
 CYCLE_SECONDS="${SBMON_ENV_CYCLE_SECONDS:-300}"
 
 log() { echo "monitor-service: $*"; }
+
+# PR-2B lifecycle fact: reported by an ACTUAL import through the environment
+# this runtime is about to exec in -- never by a file test -- with the cwd
+# removed as an import candidate so a repository checkout can never answer for
+# the installed release. Sanitized (state only, no path). A release without the
+# payload is the documented inert case, not a startup failure.
+if "${SBMON_PYTHON3:-python3}" -c 'import os, sys
+sys.path = [p for p in sys.path if p not in ("", ".", os.getcwd())]
+import journal_reader.ingest_contract, journal_reader.schema' >/dev/null 2>&1; then
+    log "journal_contract=available"
+else
+    log "journal_contract=inert"
+fi
 
 # --- P7: validate the API URL before doing anything else ---
 if ! monitor_env_validate_api_url "$API_URL"; then

@@ -286,3 +286,43 @@ monitor_env_record_environment() {
     fi
     printf 'monitor: environment kernel=%s\n' "$(uname -r)"
 }
+
+# ---------------------------------------------------------------------------
+# PR-2B: the journal_reader INGEST CONTRACT import path.
+#
+# The contract modules are bundled INTO the same immutable release tree as
+# the Monitor runtime, at <release>/libexec/sbox-journal-reader/journal_reader/.
+# The import path is therefore derived from the caller's OWN release location:
+# no env var steers it, no repository checkout can satisfy it, and a test can
+# only change the answer by changing the installed release itself.
+#
+# RC is always 0 -- an absent payload is the documented INERT case (a
+# pre-PR-2B release ships no libexec), not a startup failure:
+#   <app-dir> -> prints the release reader tree path, or nothing when this
+#                release carries no complete contract payload.
+# ---------------------------------------------------------------------------
+monitor_env_contract_pythonpath() {
+    local jr="$1/libexec/sbox-journal-reader"
+    local f
+    [ -d "$jr/journal_reader" ] || return 0
+    for f in __init__.py ingest_contract.py schema.py; do
+        [ -f "$jr/journal_reader/$f" ] || return 0
+    done
+    printf '%s\n' "$jr"
+}
+
+# Apply the derivation to the environment of the runtime about to be exec'd:
+# PYTHONPATH becomes EXACTLY the release contract path (or disappears with it).
+# An inherited/operator-supplied PYTHONPATH therefore can never answer for the
+# installed release -- in either direction.
+monitor_env_apply_contract_pythonpath() { # <app-dir> -> rc always 0
+    SBMON_JR_CONTRACT_PATH="$(monitor_env_contract_pythonpath "$1")"
+    export SBMON_JR_CONTRACT_PATH
+    if [ -n "$SBMON_JR_CONTRACT_PATH" ]; then
+        PYTHONPATH="$SBMON_JR_CONTRACT_PATH"
+        export PYTHONPATH
+    else
+        unset PYTHONPATH
+    fi
+    return 0
+}
