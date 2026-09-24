@@ -246,8 +246,8 @@ EOF
 )"
 assert_eq "$WEBJR" "True" \
     "journal_reader edge: only web/incident_history.py, only ingest_contract+schema (PR-2B scope)"
-assert_eq "$(cat "$ROOT/monitor-v2/VERSION")" "0.2.0" \
-    "VERSION stays 0.2.0 (the 0.3.0 bump belongs to PR-2B)"
+assert_eq "$(cat "$ROOT/monitor-v2/VERSION")" "0.3.0" \
+    "VERSION is 0.3.0 (the release-prep bump this PR ships)"
 ENVCOUNT="$(grep -rc 'os.environ' "$MODS"/*.py | awk -F: '{s+=$2} END {print s+0}')"
 assert_eq "$ENVCOUNT" "1" \
     "exactly one env read across the whole reader (SBOX_JR_UNIT, strictly validated)"

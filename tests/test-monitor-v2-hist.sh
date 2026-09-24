@@ -99,9 +99,9 @@ then
 else
     fail "broker publication hook ordering/guard contract broken"
 fi
-assert_eq '0.2.0' "$(cat "$ROOT/monitor-v2/VERSION")" "VERSION file is 0.2.0"
-assert_contains 'MONITOR_WEB_VERSION = "0.2.0"' \
-    "$(cat "$ROOT/monitor-v2/web/server.py")" "MONITOR_WEB_VERSION is 0.2.0"
+assert_eq '0.3.0' "$(cat "$ROOT/monitor-v2/VERSION")" "VERSION file is 0.3.0"
+assert_contains 'MONITOR_WEB_VERSION = "0.3.0"' \
+    "$(cat "$ROOT/monitor-v2/web/server.py")" "MONITOR_WEB_VERSION is 0.3.0"
 assert_eq "0" "$(grep -c 'diagnostics/timeline' "$ROOT/monitor-v2/web/static/app.js" "$ROOT/monitor-v2/web/static/index.html" | awk -F: '{s+=$2} END {print s+0}')" \
     "no Incidents UI in P1 (static frontend untouched by the read surface)"
 if grep -Eq 'ReadWritePaths|supplementaryGroups|AmbientCapabilities|journald|sudoers' "$HIST_PY"; then

@@ -2725,10 +2725,11 @@ else
 fi
 fi
 
-section "T26 production-real upgrade: installed 0.1.5 -> repo VERSION (isolated fixture, 0.2.0)"
+section "T26 production-real upgrade: installed 0.1.5 -> repo VERSION (isolated fixture, 0.3.0)"
 # Same production-real discipline as T25, one release step later: a server
-# running the 0.1.5 target-binding delete UX now moves to the 0.2.0
-# incident-history candidate. The upgrade surface is unchanged: same atomic
+# running the 0.1.5 target-binding delete UX now moves to the current repo
+# candidate (0.3.0: PR-2B reader payload + the 0.2.0 incident-history
+# module). The upgrade surface is unchanged: same atomic
 # release switch, ZERO sbox-cm/helper actions, and the retained 0.1.5
 # release tree stays byte-identical.
 T26_NEW_VER="$(cat "$REPO_ROOT/monitor-v2/VERSION")"
@@ -2782,7 +2783,7 @@ else
     fi
     assert_eq "$T26_NEW_VER" "$(cat "$T26_APP/VERSION" 2>/dev/null)" "the new immutable $T26_NEW_VER release is active"
     if [ -f "$T26_APP/app/monitor-v2/web/incident_history.py" ]; then
-        pass "0.2.0 release stages the new web/incident_history.py module (whole-web/-R copy)"
+        pass "the $T26_NEW_VER release stages the 0.2.0-era web/incident_history.py module (whole-web/-R copy)"
     else
         fail "incident_history.py missing from the staged $T26_NEW_VER release"
     fi
