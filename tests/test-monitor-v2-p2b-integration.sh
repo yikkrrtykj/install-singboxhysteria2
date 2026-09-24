@@ -339,10 +339,10 @@ if require_symlink "I1 formal release (stage + activate + link + probe)"; then
     # §3.4 anti-fake: neither the cwd nor an injected PYTHONPATH may answer for
     # a release that does not carry the contract.
     mv "$RELEASE/libexec" "$CASE_DIR/libexec-offline"
-    ( cd "$ROOT/monitor-v2" && run_probe > "$CASE_DIR/fake1.json" 2>&1 ); FRC=$?
+    ( cd "$ROOT/monitor-v2" && run_probe > "$CASE_DIR/fake1.json" ); FRC=$?
     assert_eq "$FRC" "1" "anti-fake: running the probe from a repository checkout cannot make a payload-less release pass"
     assert_eq "$(probe_field "$(cat "$CASE_DIR/fake1.json")" contract_available)" "False" "anti-fake: source-tree cwd is not an import candidate"
-    ( PYTHONPATH="$ROOT/monitor-v2" run_probe > "$CASE_DIR/fake2.json" 2>&1 ); FRC=$?
+    ( export PYTHONPATH="$ROOT/monitor-v2"; run_probe > "$CASE_DIR/fake2.json" ); FRC=$?
     assert_eq "$FRC" "1" "anti-fake: an injected source-tree PYTHONPATH is not honored either"
     assert_eq "$(probe_field "$(cat "$CASE_DIR/fake2.json")" contract_available)" "False" "anti-fake: contract stays false under PYTHONPATH injection"
     # ... and the runtime entrypoint agrees (inert, not fake-available).
