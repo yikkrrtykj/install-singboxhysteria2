@@ -795,3 +795,107 @@ reader 运行时链接也属于"这次部署"，于是同一次带外清除有�
   后操作员的动作。两条互为正负控：F4a 的"不含 provenance"只有在 F4b 能命中同一字串时
   才有意义。
 
+## 20. Integration Review Round B7 —— 交换目录对 Monitor 身份可达（0.3.1 热修复）
+
+### 生产事实（release `0.3.0-20260924170226`）
+reader 健康、持续产出交换文件（committed seq `9 → 10`，后续 ≥ 25，心跳新鲜，
+`NRestarts=0`），而 Monitor 侧 `journal_ingest_state` 永久停在
+`terminal_seq=0, last_consumed_seq=NULL, gaps_total=0, rejected_total=0`。
+磁盘形状与本文档 §15 的契约完全一致：`/var/lib/sbox-journal` 是
+`0750 root:sbox-jr`，`state` 是 `0700 sbox-jr:sbox-jr`，`out` 是
+`2750 sbox-jr:sboxweb`，交换文件是 `0640 sbox-jr:sboxweb`。缺陷不在叶子上：
+真实 `runuser -u sboxweb` 下 `stat("/var/lib/sbox-journal")` 成功，而
+`listdir` 同一目录就是 PermissionError —— **祖先目录没有给 sboxweb 任何遍历位**，
+于是形状正确的 `out` 从消费侧根本不可达。第二个缺陷在代码里：
+`scan_exchange_dir()` 当时把 `os.listdir()` 的任何 `OSError` 吞成 `{}`，把
+EACCES / 存储不可读降级成"交换目录为空"，于是这次冻结以一次干净 no-op 的
+面目出现，journal 子系统从不降级。
+
+### B7-A：选择哪一个 POSIX 模型，以及为什么它是_safe_ 的最小解
+唯一新增的授权是数据根上的**一条具名用户 ACL**：
+
+```
+<root>  root:sbox-jr  0750  +  setfacl -m user:sboxweb:--x
+```
+
+基模式一位未改，无 default ACL，`out`/`state`/交换文件的模式一位未改。这条
+授权恰好只传递 pathname resolution 所需的搜索位，因此它：
+
+1. **不授予列举**：`--x` 里没有 `r`，`ls <root>` 仍被拒；
+2. **不授予任何写入或读取**：具名条目按位与 `mask`，这里连 `r` 都没有；
+3. **不改变基模式**：mask 重算后仍是 `r-x`（`r-x` ∪ `--x`），所以
+   `stat -c %a` 继续打印 `750`，`sbox-jr` 自己的 `r-x` 一位不少；
+4. **不改变任何身份的成员关系**：`id -nG sbox-jr` 仍恰为
+   `{sbox-jr, systemd-journal}`，`id -nG sboxweb` 不变 —— 两侧都是冻结不变量；
+5. **作用域只在一处**：授权落在 `<root>`，`out` 的组读与交换文件的 `0640`
+   继续独立承担叶子层保护，`other::---` 保证外部身份仍然什么都拿不到。
+
+`state/` 因此仍然私有：它需要的是**遍历 `<root>`**，而 `state` 自己是
+`0700 sbox-jr:sbox-jr`，sboxweb 既非 owner、不在组内、`other` 位为 `---`。
+游标连续性（`state/committed`）与指纹密钥（`state/hmac.key`，0600）在
+B7-A 之后与之前同样不可读 —— 这一点由真实身份探针证明，不是由模式字符串
+证明。`out` 仍然是 Monitor 可读的**唯一** reader 数据面。
+
+收敛是确定性且幂等的：`setfacl -b` 先清（把基位从 `group::` 条目还原，
+所以随后的 mask 重算只取决于基模式），再 `setfacl -m` 写唯一一条，然后
+**回读**形状，任何分歧（第二条具名用户、任何 `default:` 条目、mask 丢了
+`x`、`other` 被打开）都是 fail-closed。已存在的生产形状 `0750 root:sbox-jr`
+父目录因此被原地、幂等地修复；`setfacl`/`getfacl` 缺失是 preflight 级 STOP，
+**故意没有** `chmod` 放宽兜底 —— 窄授权之外只剩宽授权。
+
+被否决（并写进库内决策记录）的替代方案：`0751`（把遍历权给全世界）；
+`chgrp sboxweb <root>`（既剥夺 `sbox-jr` 自己的访问，又改变 `id sboxweb`）；
+把 `sboxweb` 加进 `sbox-jr` 组或反向（为一个 `--x` 引入额外宽组，而且
+`sboxweb` 进了 `sbox-jr` 组就能列举 `<root>`）；把 `out` 挪到树外的兄弟目录
+（搬家数据，不更窄）；systemd bind-mount 命名空间（只在服务内部生效，修不了
+Monitor 自己的视图）。
+
+### B7-B：不可读的交换目录不再等于空目录
+`scan_exchange_dir()` 现在抛 `ExchangeDirUnreadable(OSError)` —— 刻意是
+`OSError` 的子类：所有已经按 `OSError` 收口的边界继续收得住它，而需要区分
+"读不到" 与 "真的空" 的调用方按类捕获。实例不携带路径，原始 errno 留在异常
+链里，而异常链没有任何 Monitor 表面会去格式化。Monitor 侧把它映射成
+`_HistoryError(CODE_EXCHANGE_UNREADABLE)` → `_record_journal_failure(code)`：
+零序列结算、terminal 冻结、不越过未见 seq、journal 降级为闭合词表里的脱敏
+码，而**同一次发布的 P1 时间线写入照旧落库**（journal 与写入路径是两条独立
+健康轴）。抛出点在结算循环之前，所以那次 pass 永不"完成"，底部的"清除降级"
+分支也就无从运行 —— 损坏的存储挣不到一个干净的判决。
+
+唯一的静默豁免是接线事实而非读取结果：`_journal_exchange_provisioned()` 看的是
+交换目录的**父目录**（即 reader 数据根）是否存在。父目录不存在意味着这台机器
+从未激活 reader —— 保持安静、不占用节奏、不改动健康态，并以脱敏布尔
+`exchange_dir_provisioned` 出现在状态面上。数据根一旦存在，其下任何不可枚举
+的形状（EACCES、ENOENT、非目录）都大声降级。
+
+### B7-C：消费侧部署证明
+`sbmon_sboxjr_consumer_probe` 挂在 `sbmon_sboxjr_health_proof` 里，位于
+reader 可读性探针之后，因此 enable/start 之后仍有一次真实身份复检。它以
+`runuser -u "$SBMON_USER"` 跑一段**只读**遍历：祖先可遍历（否则 exit 11）、
+`out` 可枚举（12）、`state` **不**可枚举（13）、`state/committed` 与
+`state/hmac.key` **不**可读（14/15）、每个 `ev-*.jsonl` 在消费侧视角下是
+非符号链接的普通文件（16）且能被只读打开并抽干（17）。空 `out` 本身就是合法
+终态（新激活不该被要求先有事件文件），而任何一条不成立都是 `sboxjr_die` +
+非零返回 —— 权限形状挡住 Monitor 读取交换文件的部署会被回滚，绝不会作为
+一次静默损坏的 release 提交。
+
+### 判据分布
+| # | 判据 | 位置 |
+|---|---|---|
+| 1 | 生产 0.3.0 形状必须**失败**：真实消费身份 `stat` 成功而 `listdir` EACCES；契约真抛 `ExchangeDirUnreadable`（cause=PermissionError, errno=13）；`consumer_probe` 以 exit-11 诊断拒绝 | `tests/journal-reader/test-jr-exchange-access.sh` X0/X1 |
+| 2 | 修复形状成立：`out` 可列举、reader 写出的 `0640` 文件按字节读出、`<root>` 仍不可列举、`state`/committed/hmac.key 仍不可读、`stat -c %a` 仍是 750、两侧 `id -nG` 与组成员关系零变化、无关身份读不到内容、后补的 reader 文件仍是 `0640 reader:consumer` | 同上 X3 |
+| 3 | 已存在的生产形状树安全且幂等地收敛：第二次运行命中"零变更"分支、真实 `getfacl` 文本逐字节相同、手工放宽（额外具名条目 + default ACL）被修回唯一 `--x` | 同上 X4 |
+| 4 | 不可读目录 → terminal 不动、计数器不动、journal 降级为脱敏码、P1 仍写、状态面无任何路径/errno/异常文本 | 同上 X1/X1b，`tests/test-monitor-v2-hist.sh` H13 |
+| 5 | 权限修复后同一 Monitor 进程吸入既有持久文件、terminal 从 0 追到 2、自身降级清除、重复再跑一遍不重计不重插 | 同上 X2 |
+| 6 | 空且可读的 `out` 是干净的 no-op，与 EACCES、与 ENOENT 三态可区分；从未激活 reader 的机器保持安静 | 同上 X5/X6 |
+| 7 | 库侧：ACL 形状精确性、`setfacl -b → -m` 的确切调用序列与顺序、幂等零变更、发散修复、七种逐个被拒的放宽形状、缺 acl 工具时 fail-closed 且零元数据变更、消费侧探针 exit 11–17 逐条拒绝、静态"不得放宽"门 | `tests/test-monitor-v2-jr-deploy.sh` S12b/S12c |
+
+X1→X2 是一条**跨真实收敛**的单进程链：消费者在破损形状下发布并等待，root 用
+真实库收敛同一棵树，然后同一个实例再发布、再吸入 —— 因为降级状态是实例内的，
+只有同一个进程才能证明"后来一次真正成功的 pass 才清除降级"。等待有上界
+（bash 50s / python 90s），修复未发生就 FAIL，绝不挂住 CI。
+
+### 版本立场
+生产已在跑已发布的 `0.3.0`，因此本节全部改动落地后的**可部署** release 是
+`0.3.1`；VERSION 与耦合期望（hist / jr 套件当前钉 0.3.0）留在功能修复通过
+评审之后，作为最后一个 release-prep 提交。
+
