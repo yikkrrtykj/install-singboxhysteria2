@@ -1298,22 +1298,24 @@ sbmon_sboxjr_readability_probe() {
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# Reader transaction inert rule (PR-2B, tightened by review #54 B4): a FORMAL
+# Reader payload gate (PR-2B, review #54 B4 + B4-residual): a FORMAL
 # install/upgrade whose source tree does not ship journal_reader/ is refused
-# BEFORE any staging or mutation. §3 makes "the release carries and imports the
-# ingest contract" part of the definition of a release, so a top-level install
-# that silently ends with contract_available=false is not a successful
-# deployment -- it is the exact mixed-version half-state this branch exists to
-# make unreachable, just reached by omission instead of by ordering.
+# BEFORE any staging or mutation, UNCONDITIONALLY. §3 makes "the release
+# carries and imports the ingest contract" part of the definition of a
+# release, so a top-level install that ends with contract_available=false is
+# not a successful deployment -- it is the exact mixed-version half-state this
+# branch exists to make unreachable, reached by omission instead of ordering.
 #
-# A wholly-absent payload is therefore treated exactly like a partial one (the
-# manifest gate below already refuses that): same fail-closed class, same zero
-# side effects. The only way to keep the old INERT behavior is to SAY SO:
-# SBMON_ALLOW_INERT_BASELINE=1 is a declaration that this run models a
-# pre-PR-2B baseline (the packaging fixtures and the legacy no-libexec release
-# used as a rollback target). Production code never sets it; the low-level
-# staging/converge inert paths remain so that such a baseline can still be
-# staged, audited and rolled back.
+# There is deliberately NO override of any kind here: not an environment
+# variable, not a CLI flag. An operator supplies the environment of a formal
+# invocation, so any env-readable switch is a production bypass of the gate
+# (review #54 round 3 deleted the one this gate used to honor, including its
+# name, so a repo-wide static gate now proves zero occurrences). A
+# wholly-absent payload is treated exactly like a partial one (the manifest
+# gate below already refuses that): same fail-closed class, same zero side
+# effects. Tests that must model a pre-PR-2B, libexec-less release do it by
+# STAGING that release directly (sbmon_stage_release / hand-built release
+# dir), never by making this command accept it.
 # ---------------------------------------------------------------------------
 sbmon_sboxjr_source_present() { # rc 0 = source tree ships journal_reader/
     [ -d "$SBMON_REPO_MONITOR_DIR/journal_reader" ]
@@ -1328,19 +1330,14 @@ sbmon_sboxjr_deployed() { # rc 0 = this host has (or had) an activated reader
 # PRE-EXISTING identity stops the whole command here, before ANY staging or
 # mutation, with zero side effects (§3: never "quietly fix" an alien sbox-jr).
 sbmon_sboxjr_activation_preflight() {
-    # Provenance gate runs FIRST, even on the inert baseline: an illegal
-    # $SBOXJR_LIB_DIR symlink (foreign target, wrong shape, broken, failed
-    # audit) must refuse the whole command before ANY mutation and demand
-    # human handling -- never guessed, never silently treated as absent.
+    # Provenance gate runs FIRST: an illegal $SBOXJR_LIB_DIR symlink (foreign
+    # target, wrong shape, broken, failed audit) must refuse the whole command
+    # before ANY mutation and demand human handling -- never guessed, never
+    # silently treated as absent.
     sbmon_sboxjr_runtime_linked_id >/dev/null \
         || sbmon_die "reader 运行时链接 provenance 非法：拒绝继续（fail-closed，未做任何变更，需人工处理）"
-    if ! sbmon_sboxjr_source_present; then
-        if [ "${SBMON_ALLOW_INERT_BASELINE:-0}" = "1" ]; then
-            sbmon_warn "显式声明的 pre-PR-2B legacy 基线（SBMON_ALLOW_INERT_BASELINE=1）：reader 零激活，仅用于建模历史 release"
-            return 0
-        fi
-        sbmon_die "源树缺少 journal_reader/ 载荷：正式 release 必须携带并可导入 ingest contract（PR-2B §3），拒绝以 contract_available=false 完成部署（fail-closed，未做任何变更）；确需建模 pre-PR-2B 基线时请显式设置 SBMON_ALLOW_INERT_BASELINE=1"
-    fi
+    sbmon_sboxjr_source_present \
+        || sbmon_die "源树缺少 journal_reader/ 载荷：正式 release 必须携带并可导入 ingest contract（PR-2B §3），拒绝以 contract_available=false 完成部署（fail-closed，未做任何变更；此判据无任何环境变量或命令行开关可绕过）"
     [ -f "$DEPLOY_DIR/$SBOXJR_TEMPLATE_NAME" ] || sbmon_die "缺少 reader unit 模板: $DEPLOY_DIR/$SBOXJR_TEMPLATE_NAME"
     [ -f "$DEPLOY_DIR/app-bin/sbox-journal-reader" ] || sbmon_die "缺少 reader 入口 wrapper"
     local jf
