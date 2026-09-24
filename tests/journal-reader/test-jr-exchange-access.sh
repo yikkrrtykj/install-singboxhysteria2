@@ -407,7 +407,10 @@ seed_reader_state() { # <root> -- reader-private state files, production modes
 
 STAGE="$TMP/stage"; mkdir -p "$STAGE"
 author_ev() { # <root> <seq> -- the READER identity writes it through setgid
-    local r="$1" seq="$2" src="$STAGE/ev-$seq.jsonl" dst="$r/out/ev-$seq.jsonl"
+    local r="$1" seq="$2"
+    # Two statements on purpose: in `local a=1 b=$a` bash expands b against the
+    # OUTER a, so under `set -u` the second one aborts instead of seeing seq.
+    local src="$STAGE/ev-$seq.jsonl" dst="$r/out/ev-$seq.jsonl"
     if ! "$PY" "$TMP/mkev.py" "$seq" 2 "$src"; then
         fail "ev-$seq could not be authored and schema-validated"
         return 1
