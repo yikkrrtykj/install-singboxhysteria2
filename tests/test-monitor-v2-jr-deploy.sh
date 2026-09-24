@@ -920,7 +920,10 @@ if require_symlink "rollback refusal for an existing-but-CORRUPT target runtime"
     inst rollback "$R1"
     [ "$LAST_RC" != "0" ] && pass "rbcorr: rollback to a corrupt target refused rc=$LAST_RC" \
         || fail "rbcorr: must refuse, rc=0"
-    assert_grep "$OUT" '未通过 12+1+1 manifest 审计' \
+    # The `+`es are literal characters of the message, so they must be escaped:
+    # under grep -E an unescaped "12+1+1" means "1 2.. 1.. 1" and matches nothing,
+    # turning the gate that names the refusing check into a silent false green.
+    assert_grep "$OUT" '未通过 12\+1\+1 manifest 审计' \
         "rbcorr: refusal names the manifest audit (not a directory-existence check)"
     assert_grep "$OUT" '未做任何变更' "rbcorr: refusal declares a zero-mutation abort"
     tail -n +"$((M + 1))" "$MOCK_CALL_LOG" > "$CASE_DIR/calls.tail"
