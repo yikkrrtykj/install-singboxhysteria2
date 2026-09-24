@@ -1298,13 +1298,22 @@ sbmon_sboxjr_readability_probe() {
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# Reader transaction inert rule (PR-2B): a release source tree that does NOT
-# ship journal_reader/ at all (the pre-reader baseline, and the packaging
-# fixtures that model it) activates NOTHING reader-side -- no identity, no
-# directories, no runtime, no unit. A tree that ships journal_reader/
-# PARTIALLY is the opposite case: the manifest check is fail-closed. The
-# production repo always ships the full directory, so a real install always
-# activates; INERT is loudly logged whenever it applies.
+# Reader transaction inert rule (PR-2B, tightened by review #54 B4): a FORMAL
+# install/upgrade whose source tree does not ship journal_reader/ is refused
+# BEFORE any staging or mutation. §3 makes "the release carries and imports the
+# ingest contract" part of the definition of a release, so a top-level install
+# that silently ends with contract_available=false is not a successful
+# deployment -- it is the exact mixed-version half-state this branch exists to
+# make unreachable, just reached by omission instead of by ordering.
+#
+# A wholly-absent payload is therefore treated exactly like a partial one (the
+# manifest gate below already refuses that): same fail-closed class, same zero
+# side effects. The only way to keep the old INERT behavior is to SAY SO:
+# SBMON_ALLOW_INERT_BASELINE=1 is a declaration that this run models a
+# pre-PR-2B baseline (the packaging fixtures and the legacy no-libexec release
+# used as a rollback target). Production code never sets it; the low-level
+# staging/converge inert paths remain so that such a baseline can still be
+# staged, audited and rolled back.
 # ---------------------------------------------------------------------------
 sbmon_sboxjr_source_present() { # rc 0 = source tree ships journal_reader/
     [ -d "$SBMON_REPO_MONITOR_DIR/journal_reader" ]
@@ -1325,7 +1334,13 @@ sbmon_sboxjr_activation_preflight() {
     # human handling -- never guessed, never silently treated as absent.
     sbmon_sboxjr_runtime_linked_id >/dev/null \
         || sbmon_die "reader 运行时链接 provenance 非法：拒绝继续（fail-closed，未做任何变更，需人工处理）"
-    sbmon_sboxjr_source_present || return 0   # inert baseline: nothing else to gate
+    if ! sbmon_sboxjr_source_present; then
+        if [ "${SBMON_ALLOW_INERT_BASELINE:-0}" = "1" ]; then
+            sbmon_warn "显式声明的 pre-PR-2B legacy 基线（SBMON_ALLOW_INERT_BASELINE=1）：reader 零激活，仅用于建模历史 release"
+            return 0
+        fi
+        sbmon_die "源树缺少 journal_reader/ 载荷：正式 release 必须携带并可导入 ingest contract（PR-2B §3），拒绝以 contract_available=false 完成部署（fail-closed，未做任何变更）；确需建模 pre-PR-2B 基线时请显式设置 SBMON_ALLOW_INERT_BASELINE=1"
+    fi
     [ -f "$DEPLOY_DIR/$SBOXJR_TEMPLATE_NAME" ] || sbmon_die "缺少 reader unit 模板: $DEPLOY_DIR/$SBOXJR_TEMPLATE_NAME"
     [ -f "$DEPLOY_DIR/app-bin/sbox-journal-reader" ] || sbmon_die "缺少 reader 入口 wrapper"
     local jf
@@ -1388,10 +1403,28 @@ sbmon_sboxjr_capture_prestate() {
 # heartbeat cycle are proven on the real machine by
 # tests/journal-reader/test-jr-live.sh; this gate degrades them to
 # presence-consistency checks only (never a silent pass of the whole proof).
-sbmon_sboxjr_health_proof() {
+#
+# TWO INDEPENDENT AXES (review #54 B5): RUNTIME health -- the process is
+# actually running and can read the journal -- and the BOOT-ENABLE fact -- it
+# comes back on its own after a reboot. Conflating them means a host whose
+# reader is deliberately active-but-disabled can never complete a
+# keep-prestate transaction: the proof would "repair" the very intent it was
+# told to preserve, and the rollback would fail forever instead of once. So
+# the WANTED enable state is a parameter, never a hard-coded 1:
+#   want_enabled=1 (default, forward activation) -> enabled is required;
+#   want_enabled=0 (keep-prestate)               -> enabled is DRIFT and fails.
+# Either way one of the two axes is always proven, so nothing is weakened --
+# what moves is which value that axis must hold.
+sbmon_sboxjr_health_proof() { # [want_enabled 0|1] (default 1)
+    local want_enabled="${1:-1}"
     sbmon_sboxjr_service_active || { sboxjr_warn "健康证明：reader 服务非 active"; return 1; }
-    if ! sbmon_sboxjr_service_enabled; then
-        sboxjr_warn "健康证明：reader 服务未 enabled（重启后不会自起）"
+    if [ "$want_enabled" = "1" ]; then
+        if ! sbmon_sboxjr_service_enabled; then
+            sboxjr_warn "健康证明：reader 服务未 enabled（重启后不会自起）"
+            return 1
+        fi
+    elif sbmon_sboxjr_service_enabled; then
+        sboxjr_warn "健康证明：事务前为 disabled，boot-enable 事实已漂移（现在被 enabled）"
         return 1
     fi
     sbmon_sboxjr_readability_probe || return 1
@@ -1473,7 +1506,9 @@ sbmon_sboxjr_converge() { # <new_id|''> <no_start 0|1> <keep_prestate 0|1>
         fi
     fi
     if [ "$want_active" = "1" ]; then
-        sbmon_sboxjr_health_proof || return 1
+        # B5: the proof is told WHICH boot-enable fact this transaction must
+        # leave behind -- the forward contract's 1, or the host's preserved 0.
+        sbmon_sboxjr_health_proof "$want_enabled" || return 1
     fi
     sboxjr_log "reader 收敛完成（active=$( [ "$want_active" = 1 ] && printf yes || printf kept-inactive) enabled=$want_enabled）"
     return 0
@@ -1483,19 +1518,41 @@ sbmon_sboxjr_converge() { # <new_id|''> <no_start 0|1> <keep_prestate 0|1>
 # active/enabled/unit/runtime/identity-created facts. Any failed restore
 # step is CRITICAL (exit 2): the caller is already inside a failure path.
 #
-# ORDER IS THE CONTRACT (review #54 B1): CODE FIRST, PROCESS LAST. The unit
-# file and the runtime link are restored before the reader is (re)started, and
-# the active-state restart is the LAST service action. Restarting first would
-# let a failed N->N+1 upgrade restart the reader on the N+1 runtime and then
-# merely repoint the symlink at N: both live links would read "N" while the
-# RUNNING process is still N+1 -- the exact mixed-version state this contract
-# exists to forbid, and one no link-based assertion can detect afterwards.
+# ORDER IS THE CONTRACT (review #54 B1 + B6): THE PROCESS NEVER OUTLIVES ITS
+# CODE, AND ITS CODE IS NEVER DISMANTLED UNDERNEATH IT. What "last" means is
+# decided by the CAPTURED prestate, not by the current one:
+#
+#   PRE_ACTIVE=1 -- the reader ran before this transaction, so restore must put
+#   it back to running. The unit file and the runtime link are restored FIRST
+#   and the restart is the LAST service action. Restarting first would let a
+#   failed N->N+1 upgrade restart the reader on the N+1 runtime and then merely
+#   repoint the symlink at N: both live links would read "N" while the RUNNING
+#   process is still N+1 -- the exact mixed-version state this contract exists
+#   to forbid, and one no link-based assertion can detect afterwards.
+#
+#   PRE_ACTIVE=0 -- the prestate is "not running", but the candidate may have
+#   been started by this very transaction and a LATER step failed (enable
+#   succeeded partially, health proof drifted, ...). Dismantling the unit and
+#   removing the runtime link first would tear the ground out from under a live
+#   process and only then stop it, so for this branch the stop (plus the
+#   verify-inactive proof) is the FIRST action. Either way the branch ends by
+#   re-asserting the prestate fact, so no path can leave the candidate running.
+#
 # The boot-enable fact sits with the CODE group (before the link) rather than
 # after it: plain `enable`/`disable` never start or stop a running process, so
 # they cannot load candidate code, while a failed link step must not be able to
 # strand an uncompensated `enable`.
 sbmon_sboxjr_restore_prestate() {
-    sbmon_warn "恢复 reader 事务前状态（unit + enable 事实 + 运行时链接 → 服务状态 → 本次新建身份）"
+    sbmon_warn "恢复 reader 事务前状态（服务状态 → unit + enable 事实 + 运行时链接 → 本次新建身份；顺序按事务前 active 事实分支）"
+    if [ "$SBOXJR_PRE_ACTIVE" != "1" ] && sbmon_sboxjr_service_active; then
+        # B6: quiesce the candidate BEFORE anything of its own code/unit goes away.
+        if ! sbmon_sboxjr_service_stop; then
+            sbmon_critical "reader 回滚：stop 失败（事务前 inactive，但候选进程仍在运行）；需要人工处理"
+        fi
+        if sbmon_sboxjr_service_active; then
+            sbmon_critical "reader 回滚：服务仍处于运行状态（事务前 inactive）；需要人工处理"
+        fi
+    fi
     local unit_touched=0
     if [ "$SBOXJR_PRE_UNIT_EXISTED" = "1" ]; then
         if [ ! -f "$SBOXJR_PRE_UNIT_BACKUP" ] \
@@ -1545,8 +1602,10 @@ sbmon_sboxjr_restore_prestate() {
             sbmon_critical "reader 回滚：运行时链接移除失败；需要人工处理"
         fi
     fi
-    # LAST: the process is (re)started only now that the prestate code + unit
-    # are back in place, so a restart can never load the failed candidate.
+    # LAST for the active prestate: the process is (re)started only now that the
+    # prestate code + unit are back in place, so a restart can never load the
+    # failed candidate. For the inactive prestate this block only RE-ASSERTS the
+    # fact (the stop already happened up front, before any teardown).
     if [ "$SBOXJR_PRE_ACTIVE" = "1" ]; then
         if ! sbmon_sboxjr_service_restart; then
             sbmon_critical "reader 回滚：restart 失败（事务前 active）；需要人工处理"
@@ -1556,6 +1615,9 @@ sbmon_sboxjr_restore_prestate() {
         fi
     else
         if sbmon_sboxjr_service_active; then
+            # Nothing in this restore may start the reader, so reaching here
+            # active means an outside actor did; it is still put down, never
+            # left running on top of a torn-down unit/runtime.
             if ! sbmon_sboxjr_service_stop; then
                 sbmon_critical "reader 回滚：stop 失败（事务前 inactive）；需要人工处理"
             fi

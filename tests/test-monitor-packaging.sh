@@ -253,6 +253,14 @@ export SBMON_UNIT_FILE="$FIX_UNIT"
 export SBMON_BACKUP_ROOT="$FIX_BACKUPS"
 export SBMON_REPO_MONITOR_DIR="$FIX_SRC"
 export SBMON_VERSION_FILE="$FIX_SRC/VERSION"
+# PR-2B review #54 B4: a FORMAL install with no journal_reader/ payload is now
+# refused before any mutation, because a release must carry and import the
+# ingest contract. This suite models the standalone Monitor packaging lane --
+# i.e. the pre-PR-2B baseline, deliberately without a reader payload -- so it
+# declares that legacy shape instead of silently getting the old INERT success.
+# The reader-coupled formal path is proven by test-monitor-v2-jr-deploy.sh and
+# test-monitor-v2-p2b-integration.sh, which never set this.
+export SBMON_ALLOW_INERT_BASELINE=1
 export SBMON_API_SECRET_SOURCE="$FIX_PROXY/monitor-api.secret"
 export SBMON_HEALTH_TIMEOUT=6
 export SBMON_STATE_DIR="$FIX_STATE"   # R1: explicit DATA ROOT contract
