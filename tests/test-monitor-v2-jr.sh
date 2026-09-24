@@ -202,9 +202,44 @@ EOF
 )"
 assert_eq "$STAGE_MANIFEST" "True" \
     "sbmon_stage_release ships the reader ONLY via the explicit 12+1+1 manifest (never cp -R)"
-WEBREFS="$(grep -rl 'journal_reader' "$ROOT/monitor-v2/web" "$ROOT/monitor-v2/collector.py" "$ROOT/monitor-v2/webapp.py" 2>/dev/null | wc -l | tr -d ' ')"
-assert_eq "$WEBREFS" "0" \
-    "Monitor web/collector import nothing from journal_reader (ingest inert, schema-v2 not activated)"
+# PR-2B activation edge: the journal_reader surface may be referenced by
+# EXACTLY ONE web module (incident_history.py) and ONLY through the frozen
+# ingest-contract imports -- never the reader runtime, never a second edge.
+# (This REPLACED the PR-2A "Monitor web imports nothing from journal_reader"
+# zero-ref gate: once ingest is wired the zero-ref premise no longer holds,
+# so the edge is confined by shape instead of by absence.)
+WEBJR="$("$PY" - "$ROOT" <<'EOF'
+import ast, os, sys
+root = sys.argv[1]
+web_dir = os.path.join(root, "monitor-v2", "web")
+allowed = os.path.join(web_dir, "incident_history.py")
+referrers = set()
+for name in sorted(os.listdir(web_dir)):
+    if name.endswith(".py"):
+        path = os.path.join(web_dir, name)
+        if "journal_reader" in open(path, encoding="utf-8").read():
+            referrers.add(path)
+ok = referrers <= {allowed}
+for probe in (os.path.join(root, "monitor-v2", "collector.py"),
+              os.path.join(root, "monitor-v2", "webapp.py")):
+    ok = ok and "journal_reader" not in open(probe, encoding="utf-8").read()
+tree = ast.parse(open(allowed, encoding="utf-8").read())
+for node in ast.walk(tree):
+    if (isinstance(node, ast.ImportFrom) and node.module
+            and node.module.split(".")[0] == "journal_reader"):
+        ok = ok and all(a.name in ("ingest_contract", "schema")
+                        for a in node.names)
+    elif isinstance(node, ast.Import):
+        for a in node.names:
+            parts = a.name.split(".")
+            ok = ok and (parts[0] != "journal_reader"
+                         or (len(parts) == 2
+                             and parts[1] in ("ingest_contract", "schema")))
+print(ok)
+EOF
+)"
+assert_eq "$WEBJR" "True" \
+    "journal_reader edge: only web/incident_history.py, only ingest_contract+schema (PR-2B scope)"
 assert_eq "$(cat "$ROOT/monitor-v2/VERSION")" "0.2.0" \
     "VERSION stays 0.2.0 (the 0.3.0 bump belongs to PR-2B)"
 ENVCOUNT="$(grep -rc 'os.environ' "$MODS"/*.py | awk -F: '{s+=$2} END {print s+0}')"

@@ -13,10 +13,14 @@ Safety contract (all enforced, all tested):
   non-directory / non-regular type) is REFUSED, never followed. SQLite
   runs ``journal_mode=DELETE`` (no stray -wal/-shm files),
   ``synchronous=FULL``, ``foreign_keys=ON`` and a bounded busy timeout.
-  Schema handling is strict: a genuinely fresh DB is created at v1; an
-  existing DB opens ONLY with an exactly-declared v1; any other declared
-  version (older, newer, malformed) or metadata-less SQLite file is
-  refused fail-closed and never mutated.
+  Schema handling is strict: a genuinely fresh DB is created at v2; an
+  existing DB opens only with an exactly-declared v2 on EXACTLY the
+  seven v2 tables, or with EXACTLY the three v1 tables declared v1,
+  which is migrated FORWARD to v2 in one transaction with every v1 row
+  preserved. Any extra unrelated table, any other declared version
+  (newer, negative, malformed, hybrid) or metadata-less SQLite file is
+  refused fail-closed and never mutated -- migrations are explicit and
+  forward-only.
 * Threading: ONE reentrant lock serializes the whole of ``open`` /
   ``on_publish`` (write + retention) / ``health`` / ``query_timeline`` /
   ``close`` against each other -- exactly one thread may touch the shared
@@ -30,18 +34,49 @@ Safety contract (all enforced, all tested):
   records a sanitized health state (``enabled`` / ``degraded`` /
   ``last_error_code`` -- a code category, never exception text, paths or
   payload). A dead disk must degrade the dashboard's health chip, never
-  kill the publisher thread, a reader thread or the web server.
+  kill the publisher thread, a reader thread or the web server. Journal
+  ingest carries its OWN degraded state, composed into ``health()``:
+  an ingest failure survives a successful ordinary sample write in the
+  same publication and clears only when a later ingest pass completes
+  with nothing blocked. NO journal-path exception ever escapes into
+  the publisher path (structural refusals included): the P1 timeline
+  write never acquires a dependency on journal ingest, and a missing
+  continuity row is failed closed, never recreated.
 * Retention: rows older than the retention horizon are deleted at
   startup and at most hourly; if the database crosses the size ceiling
   the OLDEST rows are pruned in batches until below the target size --
-  the two tables are pruned as ONE globally epoch-ordered timeline, so a
+  ALL tables are pruned as ONE globally epoch-ordered timeline, so a
   newer row is never sacrificed while a strictly older row still exists
-  in the other table.
+  in another table.
+
+Journal ingest (issue #33 P2, PR-2B activation):
+
+* The Monitor NEVER reads the log source itself. It consumes only the
+  reader's sanitized exchange artifacts (``ev-<seq>.jsonl``) through the
+  frozen PR-2A contract in ``journal_reader/ingest_contract.py`` --
+  strict filename grammar, regular-file-only, the 256 KiB hard cap,
+  closed record schema re-validation, and sanitized disposition codes.
+  When ``journal_reader`` is not importable (the packaged 0.2.x monitor
+  release does not ship it yet) the ingest surface is inert, not broken.
+* Continuity: ``journal_ingest_state.terminal_seq`` is the SOLE
+  authority (v3-B4); settlement is strictly ascending from
+  terminal+1 -- a terminally rejected file or a discovered gap advances
+  terminal exactly ONCE, a failed apply settles NOTHING and blocks
+  higher seqs for the pass. Every settlement (valid apply, rejected,
+  gap) is ONE SQLite transaction that carries the terminal advance with
+  it: a crash can never double-count an event batch nor leave a
+  partially applied file.
+* Only contract fields persist: sequence identity, the closed-class
+  error records (class/proto/port-class/dest-class/fingerprint/count),
+  header aggregates, reader run id and ingest timestamps. Raw journal
+  lines, addresses, credentials and free text have nowhere to go --
+  the record grammar rejects them at the boundary.
 """
 
 from __future__ import annotations
 
 import datetime
+import json
 import os
 import re
 import sqlite3
@@ -49,7 +84,16 @@ import stat
 import threading
 import time
 
-SCHEMA_VERSION = 1
+try:  # PR-2B activation surface: contract + schema ONLY, never the reader
+    from journal_reader import ingest_contract as _journal_contract
+    from journal_reader import schema as _journal_schema
+    JOURNAL_CONTRACT_AVAILABLE = True
+except ImportError:  # packaged monitor release does not (yet) ship the lib
+    _journal_contract = None
+    _journal_schema = None
+    JOURNAL_CONTRACT_AVAILABLE = False
+
+SCHEMA_VERSION = 2
 
 DB_NAME = "history.sqlite3"
 
@@ -64,9 +108,16 @@ RETENTION_TARGET_BYTES = 48 * 1024 * 1024
 RETENTION_CEILING_BYTES = 64 * 1024 * 1024
 CLEANUP_INTERVAL_SECONDS = 3600.0
 PRUNE_BATCH_ROWS = 512
-# One timeline, two tables: size pruning orders these epochs GLOBALLY
-# (samples first only to settle exact ties at the cut epoch).
-_PRUNE_TABLES = ("timeline_samples", "device_protocol_states")
+# One timeline, ALL tables: size pruning orders these epochs GLOBALLY
+# (samples first only to settle exact ties at the cut epoch). The v2
+# journal tables participate through their Monitor-clock ingest epochs;
+# journal_events rides along via ON DELETE CASCADE with journal_runs.
+_PRUNE_SOURCES = (
+    ("timeline_samples", "epoch"),
+    ("device_protocol_states", "epoch"),
+    ("journal_runs", "ingested_epoch"),
+    ("journal_ingest_audit", "epoch"),
+)
 
 # Read surface bounds (spec §8): bounded, no arbitrary filters.
 QUERY_LIMIT_DEFAULT = 500
@@ -83,6 +134,61 @@ CODE_SCHEMA_UNSUPPORTED = "history_schema_unsupported"
 CODE_WRITE_FAILED = "history_write_failed"
 CODE_RETENTION_FAILED = "history_retention_failed"
 CODE_READ_FAILED = "history_read_failed"
+CODE_INGEST_APPLY_FAILED = "history_ingest_apply_failed"
+
+# -- journal ingest surface (issue #33 P2, PR-2B) -----------------------------
+
+# Reader-owned exchange dir; pass None to disable the ingest path.
+JOURNAL_DEFAULT_EXCHANGE_DIR = "/var/lib/sbox-journal/out"
+# One pass per reader poll window (the reader writes a file at most once
+# per WINDOW_SECONDS -- faster polling proves nothing).
+JOURNAL_INGEST_INTERVAL_SECONDS = 10.0
+# PR-2A frozen heartbeat semantics: reader staleness is Monitor-derived
+# from this file's age and nothing else. NEVER re-tune the number here.
+JOURNAL_HB_NAME = "hb"
+JOURNAL_HB_STALE_SECONDS = 180.0
+JOURNAL_HB_MAX_BYTES = 4096
+
+# Mirrors of the PR-2A closed enums (journal_reader.schema). They MUST
+# equal the live contract -- asserted by the ingest suite -- because the
+# v2 CHECK constraints must be creatable even in a packaged release that
+# does not ship journal_reader.
+JOURNAL_BOUNDARIES = ("NONE", "COLD_START", "SOURCE_GAP")
+JOURNAL_CLASSES = ("dns", "dial_timeout", "reset", "net_unreachable",
+                   "tls_handshake", "quic_error", "eof_cancel", "other")
+JOURNAL_PROTOS = ("Reality", "Hysteria2", "OTHER")
+# 'NONE' is the reviewed DB sentinel for a wire-null dcls (v2-R1);
+# port uses the integer sentinel 0.
+JOURNAL_DCLS = ("NONE", "https443", "http80", "quic", "dns53", "dot853",
+                "smtpish", "other")
+JOURNAL_AUDIT_KINDS = ("gap", "rejected")
+# Closed vocabulary for journal_ingest_audit.code: the sanitized
+# disposition codes the frozen PR-2A contract can EVER return
+# (ingest_contract.read_and_validate + schema.parse_exchange_text) plus
+# the Monitor-derived gap marker. Anything outside this set -- a future
+# contract code, let alone free text -- is refused by the DB CHECK, so
+# the audit table cannot store a credential-like string even if a
+# caller is buggy. The ingest suite asserts this tuple equals the code
+# literals present in the contract sources, so the mirror cannot rot.
+JOURNAL_AUDIT_CODES = ("sequence_gap", "exchange_bad_json",
+                       "exchange_bad_name", "exchange_bad_shape",
+                       "exchange_empty", "exchange_event_invalid",
+                       "exchange_header_invalid",
+                       "exchange_header_position", "exchange_no_header",
+                       "exchange_not_regular", "exchange_seq_mismatch",
+                       "exchange_too_large", "exchange_unreadable")
+
+_V1_TABLES = frozenset({"timeline_samples", "device_protocol_states"})
+_JOURNAL_TABLES = frozenset({"journal_runs", "journal_events",
+                             "journal_ingest_audit",
+                             "journal_ingest_state"})
+# EXACT shapes -- the schema gate is table-set EQUALITY, not a subset:
+# an unrelated extra table is a shape this module never created, so an
+# open that claims v1/v2 while carrying one is refused fail-closed
+# (zero bytes mutated), never "adopted apart from the stranger".
+_META_TABLE = "meta"
+_ALLOWED_V1_SHAPE = _V1_TABLES | {_META_TABLE}
+_ALLOWED_V2_SHAPE = _ALLOWED_V1_SHAPE | _JOURNAL_TABLES
 
 
 def classify_protocol(inbound, inbound_type=""):
@@ -279,7 +385,9 @@ class IncidentHistory:
                  retention_seconds=RETENTION_SECONDS,
                  target_bytes=RETENTION_TARGET_BYTES,
                  ceiling_bytes=RETENTION_CEILING_BYTES,
-                 cleanup_interval=CLEANUP_INTERVAL_SECONDS):
+                 cleanup_interval=CLEANUP_INTERVAL_SECONDS,
+                 journal_exchange_dir=JOURNAL_DEFAULT_EXCHANGE_DIR,
+                 journal_ingest_interval=JOURNAL_INGEST_INTERVAL_SECONDS):
         self._dir = diagnostics_dir
         self._db_path = os.path.join(diagnostics_dir, DB_NAME)
         self._run_id = str(run_id)
@@ -297,6 +405,13 @@ class IncidentHistory:
         self._enabled = False
         self._degraded = True
         self._last_error_code = None
+        # Journal ingest health is a SEPARATE subsystem state: a journal
+        # failure is reported through health() but a successful ordinary
+        # sample write must never clear it (and vice versa) -- health()
+        # composes the two. Recovery is a later ingest pass that
+        # completes with nothing blocked.
+        self._journal_degraded = False
+        self._journal_last_error_code = None
         self._failure_count = 0
         self._last_success_ts = None
         self._last_sample_ts = None
@@ -304,6 +419,11 @@ class IncidentHistory:
         # (device, inbound) -> {"active": n, "status": s, "written_at": t}
         self._device_state = {}
         self._pending = None  # buffered (sample, rows) after a failed write
+        self._journal_exchange_dir = journal_exchange_dir
+        self._journal_ingest_interval = float(journal_ingest_interval)
+        self._last_journal_ingest_ts = None
+        self._journal_blocked_at = None
+        self._journal_last_pass = None
 
     # -- public surface (NONE of these ever raise) -----------------------------
 
@@ -339,13 +459,23 @@ class IncidentHistory:
 
     def health(self):
         with self._lock:
+            # Composed surface: the ordinary write path and the journal
+            # ingest path carry independent degraded states; either one
+            # makes the whole history degraded. Write-path codes win
+            # when both are set (they gate the primary data path); the
+            # journal code is NEVER swallowed by a successful sample
+            # write in the same publication.
+            degraded = bool(self._degraded or self._journal_degraded)
+            code = self._last_error_code
+            if code is None and self._journal_degraded:
+                code = self._journal_last_error_code
             return {
                 "enabled": bool(self._enabled),
-                "degraded": bool(self._degraded),
+                "degraded": degraded,
                 "last_success_at": _iso(self._last_success_ts)
                 if self._last_success_ts else None,
                 "failure_count": int(self._failure_count),
-                "last_error_code": self._last_error_code,
+                "last_error_code": code,
                 "run_id": self._run_id,
             }
 
@@ -402,6 +532,55 @@ class IncidentHistory:
                     pass
                 self._conn = None
 
+    def ingest_journal_events(self):
+        """ONE cadence-independent journal ingest pass (test/operator
+        entry point -- the publication path drives it via
+        ``on_publish``). Never raises; the returned dict is sanitized."""
+        try:
+            with self._lock:
+                if not self._enabled or self._conn is None:
+                    return None
+                return self._journal_ingest_gate(self._clock(), force=True)
+        except _HistoryError as exc:
+            self._record_failure(exc.code)
+            return None
+        except (sqlite3.Error, OSError):
+            self._record_journal_failure(CODE_INGEST_APPLY_FAILED)
+            return None
+
+    def journal_status(self):
+        """Sanitized read surface for journal ingest + reader
+        availability (heartbeat age). Never raises; never echoes file
+        content, paths or exception text."""
+        status = {
+            "enabled": False,
+            "contract_available": JOURNAL_CONTRACT_AVAILABLE,
+            "exchange_dir_configured": self._journal_exchange_dir is not None,
+            "terminal_seq": None,
+            "last_consumed_seq": None,
+            "gaps_total": None,
+            "rejected_total": None,
+            "blocked_at": self._journal_blocked_at,
+            "last_pass": self._journal_last_pass,
+            "reader": self._journal_reader_hb_status(),
+        }
+        try:
+            with self._lock:
+                if self._enabled and self._conn is not None:
+                    row = self._conn.execute(
+                        "SELECT terminal_seq, last_consumed_seq,"
+                        " gaps_total, rejected_total"
+                        " FROM journal_ingest_state WHERE id = 1").fetchone()
+                    if row is not None:
+                        status["enabled"] = True
+                        status["terminal_seq"] = row[0]
+                        status["last_consumed_seq"] = row[1]
+                        status["gaps_total"] = row[2]
+                        status["rejected_total"] = row[3]
+        except (sqlite3.Error, OSError):
+            self._record_failure(CODE_READ_FAILED)
+        return status
+
     # -- open / schema -----------------------------------------------------------
 
     def _open_locked(self):
@@ -432,6 +611,8 @@ class IncidentHistory:
         self._last_success_ts = self._clock()
         self._degraded = False
         self._last_error_code = None
+        self._journal_degraded = False
+        self._journal_last_error_code = None
         # startup cleanup: retention first, before any new row is added
         self._cleanup("startup")
         self._last_cleanup_ts = self._clock()
@@ -473,15 +654,19 @@ class IncidentHistory:
     def _enforce_schema(self, conn, pre_existing):
         """STRICT schema gate -- the whole DB is opened read-only-first.
 
-        Accepted shapes are exactly two: a genuinely fresh database
-        (absent or zero-byte file, no tables) which is created at v1,
-        and an existing database that DECLARES schema_version == 1 and
-        carries the v1 tables. Everything else -- version 0, negative,
-        malformed, newer, meta-less or table-less shapes -- is refused
-        with CODE_SCHEMA_UNSUPPORTED before any pragma, DDL or write can
-        touch the file. In particular no lower version is ever silently
-        rewritten to v1: migrations are explicit and forward-only, and
-        P1 defines none.
+        Accepted shapes are exactly three: a genuinely fresh database
+        (absent or zero-byte file, no tables) which is created at the
+        current version, an existing database that DECLARES the current
+        schema_version and whose tables are EXACTLY the seven v2 tables,
+        and an existing database that declares v1 and whose tables are
+        EXACTLY the three v1 tables -- migrated forward to v2 in ONE
+        transaction with zero v1 rows touched. Any extra unrelated table
+        (under either declaration), any newer, zero, negative,
+        malformed or meta-less claim, a stripped or hybrid shape -- all
+        are refused with CODE_SCHEMA_UNSUPPORTED before any
+        pragma, DDL or write can touch the file. In particular no lower
+        version is ever silently rewritten: migration is the explicit
+        v1->v2 path below and nothing else.
         """
         conn.execute("PRAGMA busy_timeout=%d" % BUSY_TIMEOUT_MS)
         tables = {row[0] for row in conn.execute(
@@ -489,10 +674,10 @@ class IncidentHistory:
         if not tables:
             if pre_existing:
                 # a NON-empty pre-existing SQLite file without our schema
-                # metadata: unrelated or stripped -- never claimed as v1
+                # metadata: unrelated or stripped -- never claimed fresh
                 raise _HistoryError(CODE_SCHEMA_UNSUPPORTED)
             self._apply_pragmas(conn)
-            self._create_schema_v1(conn)
+            self._create_schema(conn)
             return
         row = None
         if "meta" in tables:
@@ -504,16 +689,34 @@ class IncidentHistory:
         if not isinstance(raw, str) or not re.fullmatch(r"-?\d{1,9}", raw):
             raise _HistoryError(CODE_SCHEMA_UNSUPPORTED)
         version = int(raw)
-        if version != SCHEMA_VERSION:
-            # NEWER, ZERO, NEGATIVE or otherwise unknown declared
-            # version: refuse; an explicit forward-only migration is the
-            # ONLY way a future release may adopt it.
-            raise _HistoryError(CODE_SCHEMA_UNSUPPORTED)
-        if not {"timeline_samples", "device_protocol_states"} <= tables:
-            # meta CLAIMS v1 but the v1 shape is not there: unknown old
-            # shape, refuse rather than CREATE-if-not-exists adoption
-            raise _HistoryError(CODE_SCHEMA_UNSUPPORTED)
-        self._apply_pragmas(conn)
+        if version == SCHEMA_VERSION:
+            if tables != _ALLOWED_V2_SHAPE:
+                # meta CLAIMS v2 but the shape is not EXACTLY the seven
+                # v2 tables -- stripped, hybrid, or carrying an unrelated
+                # extra table this module never created: unknown shape,
+                # refuse rather than adopt
+                raise _HistoryError(CODE_SCHEMA_UNSUPPORTED)
+            self._apply_pragmas(conn)
+            if conn.execute("SELECT terminal_seq FROM journal_ingest_state"
+                            " WHERE id = 1").fetchone() is None:
+                # state row missing under a complete table set is an
+                # unknown shape too -- never a repair
+                raise _HistoryError(CODE_SCHEMA_UNSUPPORTED)
+            return
+        if version == 1:
+            # EXACT v1 only: precisely the three v1 tables -- no journal
+            # tables (hybrid) and no unrelated extra table either (a
+            # stranger table means this is not the file the migration
+            # was written for)
+            if tables != _ALLOWED_V1_SHAPE:
+                raise _HistoryError(CODE_SCHEMA_UNSUPPORTED)
+            self._apply_pragmas(conn)
+            self._migrate_v1_to_v2(conn)
+            return
+        # NEWER, ZERO, NEGATIVE or otherwise unknown declared version:
+        # refuse; an explicit forward-only migration is the ONLY way a
+        # future release may adopt it.
+        raise _HistoryError(CODE_SCHEMA_UNSUPPORTED)
 
     def _apply_pragmas(self, conn):
         conn.execute("PRAGMA journal_mode=DELETE").fetchall()
@@ -525,17 +728,39 @@ class IncidentHistory:
         if conn.execute("PRAGMA auto_vacuum").fetchone()[0] != 2:
             conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
 
-    def _create_schema_v1(self, conn):
+    def _create_schema(self, conn):
+        """Fresh database: the full v2 shape in ONE explicit
+        transaction (DDL auto-commits under sqlite3 legacy mode, so an
+        unbounded CREATE chain could otherwise strand a half-created
+        file that no later gate would adopt)."""
         now = self._clock()
+        try:
+            conn.execute("BEGIN")
+            self._create_meta(conn, SCHEMA_VERSION, now)
+            self._create_v1_tables(conn)
+            self._create_journal_tables(conn)
+            self._create_journal_state_row(conn, now)
+            conn.commit()
+        except BaseException:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            raise
+
+    def _create_meta(self, conn, version, now):
         conn.execute(
             "CREATE TABLE meta ("
             " key TEXT NOT NULL PRIMARY KEY,"
             " value TEXT NOT NULL)")
         conn.executemany(
             "INSERT INTO meta (key, value) VALUES (?, ?)",
-            [("schema_version", str(SCHEMA_VERSION)),
+            [("schema_version", str(version)),
              ("created_at", _iso(now)),
              ("created_by_version", str(self._monitor_version))])
+
+    @staticmethod
+    def _create_v1_tables(conn):
         conn.execute(
             "CREATE TABLE timeline_samples ("
             " epoch REAL NOT NULL,"
@@ -580,12 +805,126 @@ class IncidentHistory:
             "CREATE INDEX idx_states_device"
             " ON device_protocol_states(device, inbound, epoch)")
 
+    @staticmethod
+    def _in_list(values):
+        return ", ".join("'%s'" % value for value in values)
+
+    @classmethod
+    def _create_journal_tables(cls, conn):
+        """v2 journal tables: closed CHECKs mirror the PR-2A record
+        grammar, so a raw line / address / free text CANNOT be stored
+        even by a buggy caller (deny-by-default at the column level)."""
+        conn.execute(
+            "CREATE TABLE journal_runs ("
+            " seq INTEGER NOT NULL PRIMARY KEY,"
+            " run TEXT NOT NULL CHECK (length(run) = 32),"
+            " source_epoch INTEGER NOT NULL CHECK (source_epoch >= 1),"
+            " boundary TEXT NOT NULL"
+            f" CHECK (boundary IN ({cls._in_list(JOURNAL_BOUNDARIES)})),"
+            " lines INTEGER NOT NULL CHECK (lines >= 0),"
+            " eligible INTEGER NOT NULL CHECK (eligible >= 0),"
+            " info_dropped INTEGER NOT NULL CHECK (info_dropped >= 0),"
+            " nomatch_dropped INTEGER NOT NULL"
+            " CHECK (nomatch_dropped >= 0),"
+            " priority_unusable INTEGER NOT NULL CHECK (priority_unusable >= 0),"
+            " pfail INTEGER NOT NULL CHECK (pfail >= 0),"
+            " limited INTEGER NOT NULL CHECK (limited >= 0),"
+            " first_ts REAL,"
+            " last_ts REAL,"
+            " record_count INTEGER NOT NULL CHECK (record_count >= 0),"
+            " event_count INTEGER NOT NULL CHECK (event_count >= 0),"
+            " ingested_epoch REAL NOT NULL,"
+            " ingested_at TEXT NOT NULL)")
+        conn.execute(
+            "CREATE TABLE journal_events ("
+            " seq INTEGER NOT NULL"
+            " REFERENCES journal_runs(seq) ON DELETE CASCADE,"
+            " ts REAL NOT NULL CHECK (ts >= 0),"
+            " cls TEXT NOT NULL"
+            f" CHECK (cls IN ({cls._in_list(JOURNAL_CLASSES)})),"
+            " proto TEXT NOT NULL"
+            f" CHECK (proto IN ({cls._in_list(JOURNAL_PROTOS)})),"
+            " port INTEGER NOT NULL CHECK (port BETWEEN 0 AND 65535),"
+            " dcls TEXT NOT NULL"
+            f" CHECK (dcls IN ({cls._in_list(JOURNAL_DCLS)})),"
+            " fp TEXT CHECK (fp IS NULL OR (length(fp) = 16"
+            " AND fp NOT GLOB '*[^0-9a-f]*')),"
+            " n INTEGER NOT NULL CHECK (n >= 1),"
+            # cross-field determinism, mirroring schema.validate_event
+            # and the v2-R1 sentinels: fp only with 'other', dcls only
+            # with a real port (0 == wire null).
+            " CHECK (fp IS NULL OR cls = 'other'),"
+            " CHECK (dcls = 'NONE' OR port > 0))")
+        conn.execute(
+            "CREATE INDEX idx_journal_events_seq"
+            " ON journal_events(seq)")
+        conn.execute(
+            "CREATE TABLE journal_ingest_audit ("
+            " epoch REAL NOT NULL,"
+            " kind TEXT NOT NULL"
+            f" CHECK (kind IN ({cls._in_list(JOURNAL_AUDIT_KINDS)})),"
+            " seq INTEGER NOT NULL,"
+            # closed vocabulary, NOT a length cap: even a buggy caller
+            # cannot store free text / credential-like material here
+            f" code TEXT NOT NULL CHECK (code IN"
+            f" ({cls._in_list(JOURNAL_AUDIT_CODES)})))")
+        conn.execute(
+            "CREATE INDEX idx_journal_audit_epoch"
+            " ON journal_ingest_audit(epoch)")
+        conn.execute(
+            "CREATE TABLE journal_ingest_state ("
+            " id INTEGER PRIMARY KEY CHECK (id = 1),"
+            " terminal_seq INTEGER NOT NULL CHECK (terminal_seq >= 0),"
+            " last_consumed_seq INTEGER,"
+            " gaps_total INTEGER NOT NULL CHECK (gaps_total >= 0),"
+            " rejected_total INTEGER NOT NULL CHECK (rejected_total >= 0),"
+            " updated_epoch REAL NOT NULL)")
+
+    @staticmethod
+    def _create_journal_state_row(conn, now):
+        conn.execute(
+            "INSERT INTO journal_ingest_state (id, terminal_seq,"
+            " last_consumed_seq, gaps_total, rejected_total,"
+            " updated_epoch) VALUES (1, 0, NULL, 0, 0, ?)", (now,))
+
+    def _migrate_v1_to_v2(self, conn):
+        """The ONE forward migration: journal tables + state row + the
+        schema_version flip in a SINGLE explicit transaction (the DDL is
+        bound into it by the leading BEGIN -- under sqlite3 legacy mode
+        a bare CREATE would auto-commit and strand a half-migrated
+        hybrid that no later shape gate adopts). Zero v1 rows are read,
+        moved or rewritten; any mid-migration failure rolls the whole
+        thing back, leaving an untouched exact-v1 database, so startup
+        after a crash simply re-runs the migration."""
+        try:
+            conn.execute("BEGIN")
+            self._create_journal_tables(conn)
+            self._create_journal_state_row(conn, self._clock())
+            conn.execute("UPDATE meta SET value = ?"
+                         " WHERE key = 'schema_version'",
+                         (str(SCHEMA_VERSION),))
+            conn.commit()
+        except BaseException:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            raise
+
     # -- publish hook internals ----------------------------------------------------
 
     def _on_publish_locked(self, snapshot, version):
         if not self._enabled or self._conn is None:
             return
         now = self._clock()
+        # Journal ingest rides the SAME publication cadence under the SAME
+        # lock (before the write-nothing early return below, so a quiet
+        # publish still drains the exchange dir). The publisher entry uses
+        # the outer containment wrapper: NO ordinary Exception from the
+        # journal path may ever break this publication's P1 write — it is
+        # contained, rolled back, and recorded only as sanitized journal
+        # degradation.
+        self._journal_ingest_publish_gate(now)
         sample_due = (self._last_sample_ts is None or
                       (now - self._last_sample_ts) >= self._sample_interval)
         rows = project_device_rows(snapshot, self._run_id, now)
@@ -660,6 +999,266 @@ class IncidentHistory:
         self._degraded = False
         self._last_error_code = None
 
+    # -- journal ingest internals (issue #33 P2, PR-2B) ------------------------
+    #
+    # The decision table is the FROZEN PR-2A ingest contract (v2-R6 /
+    # v3-B4), settled per-file directly against SQLite: strictly
+    # ascending from terminal+1, gap counted exactly once at discovery,
+    # terminal rejection settles exactly once and never blocks higher
+    # seqs, a failed apply settles NOTHING and blocks the rest of the
+    # pass. Unlike the pure-contract `settle()` (whose injection point
+    # documents this activation), every settlement -- valid, rejected
+    # AND gap -- carries its terminal advance inside the SAME SQLite
+    # transaction as its rows, so no crash window can re-count or
+    # retract anything.
+
+    def _journal_ingest_gate(self, now, force=False):
+        if self._journal_exchange_dir is None:
+            return None
+        if (not force and self._last_journal_ingest_ts is not None
+                and (now - self._last_journal_ingest_ts)
+                < self._journal_ingest_interval):
+            return None
+        self._last_journal_ingest_ts = now
+        # Journal containment (frozen P2 failure invariant): structural
+        # and storage errors fail-close ONLY the journal subsystem --
+        # nothing settles, nothing is fabricated, and the ordinary P1
+        # sample/device write of the same publication still executes on
+        # its own storage path. A missing continuity row is NEVER
+        # silently recreated. BaseException (process control) is
+        # deliberately NOT caught, and an injected RuntimeError still
+        # propagates out of the DIRECT ingest_journal_events() entry --
+        # that is the pre-commit crash-consistency vehicle; the
+        # publication path is fully isolated one level up in
+        # ``_journal_ingest_publish_gate``.
+        try:
+            return self._journal_ingest_pass(now)
+        except _HistoryError as exc:
+            self._rollback_quiet()
+            self._record_journal_failure(exc.code)
+            return None
+        except (sqlite3.Error, OSError):
+            self._rollback_quiet()
+            self._record_journal_failure(CODE_INGEST_APPLY_FAILED)
+            return None
+
+    def _journal_ingest_publish_gate(self, now):
+        # PUBLICATION-ONLY outer containment: no journal Exception of
+        # ANY kind (including the crash-sim RuntimeError a direct
+        # ingest call lets propagate) may prevent the P1 timeline write
+        # of the same publication. Contained, rolled back whole, and
+        # recorded ONLY as sanitized journal degradation.
+        try:
+            return self._journal_ingest_gate(now)
+        except Exception:  # noqa: BLE001 -- publisher isolation is total
+            self._rollback_quiet()
+            self._record_journal_failure(CODE_INGEST_APPLY_FAILED)
+            return None
+
+    def _journal_ingest_pass(self, now):
+        result = {"consumed": 0, "gaps": 0, "rejected": 0,
+                  "blocked_at": None,
+                  "contract_available": JOURNAL_CONTRACT_AVAILABLE}
+        self._journal_last_pass = result
+        # the blocked marker and the journal degraded state describe the
+        # MOST RECENT pass: each new pass starts clean and re-proves
+        # recovery (a later pass that completes with nothing blocked IS
+        # the explicit recovery condition).
+        self._journal_blocked_at = None
+        if not JOURNAL_CONTRACT_AVAILABLE:
+            return result
+        state = self._conn.execute(
+            "SELECT terminal_seq, last_consumed_seq, gaps_total,"
+            " rejected_total FROM journal_ingest_state WHERE id = 1"
+        ).fetchone()
+        if state is None:
+            # the open-time shape gate guarantees the row; its absence
+            # mid-run is a hostile mutation -- fail closed, mutate zero
+            raise _HistoryError(CODE_SCHEMA_UNSUPPORTED)
+        terminal = state[0]
+        files = _journal_contract.scan_exchange_dir(
+            self._journal_exchange_dir)
+        # Loop invariant: the DB terminal is always exactly seq-1 --
+        # every settlement (applied, rejected, gap) advanced it to the
+        # seq it consumed, every failure settled NOTHING.
+        seq = terminal + 1
+        while seq in files or any(s > seq for s in files):
+            if seq not in files:
+                nxt = min(s for s in files if s >= seq)
+                if not self._journal_settle_gap(seq, nxt, now, result):
+                    break
+                seq = nxt
+            payload, code = None, None
+            try:
+                payload, code = _journal_contract.read_and_validate(
+                    self._journal_exchange_dir, files[seq], seq)
+            except UnicodeDecodeError:
+                # Undecodable bytes are the most malformed a file can
+                # be: the contract's text-mode read raises before any
+                # sanitized code can come back. Contained HERE (never
+                # escapes the journal boundary) and classified with the
+                # frozen closed-vocabulary disposition code -- no raw
+                # byte is ever kept or echoed.
+                payload, code = None, "exchange_unreadable"
+            if code is not None:
+                if not self._journal_settle_rejected(seq, code, now,
+                                                     result):
+                    break
+                seq += 1
+                continue
+            body, records = payload
+            header = json.loads(body.split("\n", 1)[0])
+            try:
+                self._journal_apply_locked(header, records, seq, now)
+            except (sqlite3.Error, OSError):
+                # NOT terminal: nothing settled (the transaction rolled
+                # back whole), and higher seqs never leapfrog a file
+                # that merely failed to settle -- retried next pass.
+                # Journal-owned degraded state: a successful ordinary
+                # sample write later in this same publication must NOT
+                # clear it.
+                self._rollback_quiet()
+                self._record_journal_failure(CODE_INGEST_APPLY_FAILED)
+                result["blocked_at"] = self._journal_blocked_at = seq
+                break
+            result["consumed"] += 1
+            seq += 1
+        result["terminal_after"] = seq - 1
+        if result["blocked_at"] is None:
+            # explicit recovery condition: a pass that completed with
+            # nothing blocked -- the journal degraded state clears here
+            # and only here.
+            self._journal_degraded = False
+            self._journal_last_error_code = None
+        return result
+
+    def _journal_settle_gap(self, seq, nxt, now, result):
+        """Missing-seq discovery (v3-B4): count the whole skipped
+        interval exactly once and move terminal to nxt-1, atomically."""
+        try:
+            self._conn.executemany(
+                "INSERT INTO journal_ingest_audit (epoch, kind, seq,"
+                " code) VALUES (?, 'gap', ?, 'sequence_gap')",
+                [[now, skipped] for skipped in range(seq, nxt)])
+            self._conn.execute(
+                "UPDATE journal_ingest_state SET terminal_seq = ?,"
+                " gaps_total = gaps_total + ?, updated_epoch = ?"
+                " WHERE id = 1", (nxt - 1, nxt - seq, now))
+            self._conn.commit()
+        except (sqlite3.Error, OSError):
+            self._rollback_quiet()
+            self._record_journal_failure(CODE_INGEST_APPLY_FAILED)
+            result["blocked_at"] = self._journal_blocked_at = seq
+            return False
+        result["gaps"] += nxt - seq
+        return True
+
+    def _journal_settle_rejected(self, seq, code, now, result):
+        """Terminally rejected file: settles ONCE (no forever-reject
+        loop) and the next seq continues -- a later valid file around
+        it records NO gap (frozen contract rule). `code` is stored
+        UNMODIFIED: the DB CHECK already restricts it to the closed
+        JOURNAL_AUDIT_CODES vocabulary, so a code outside that mirror
+        (a future unknown contract code) FAILS the settlement
+        fail-closed instead of being truncated into a lie."""
+        try:
+            self._conn.execute(
+                "INSERT INTO journal_ingest_audit (epoch, kind, seq,"
+                " code) VALUES (?, 'rejected', ?, ?)",
+                (now, seq, code))
+            self._conn.execute(
+                "UPDATE journal_ingest_state SET terminal_seq = ?,"
+                " rejected_total = rejected_total + 1, updated_epoch = ?"
+                " WHERE id = 1", (seq, now))
+            self._conn.commit()
+        except (sqlite3.Error, OSError):
+            self._rollback_quiet()
+            self._record_journal_failure(CODE_INGEST_APPLY_FAILED)
+            result["blocked_at"] = self._journal_blocked_at = seq
+            return False
+        result["rejected"] += 1
+        return True
+
+    def _journal_apply_locked(self, header, records, seq, now):
+        """THE exactly-once boundary: event rows AND the terminal
+        advance commit together (one implicit SQLite transaction,
+        synchronous=FULL). A crash anywhere before the commit leaves
+        zero rows and zero movement; a crash after it is settled
+        history -- re-encountering seq <= terminal is a no-op."""
+        timestamps = [record["ts"] for record in records]
+        self._conn.execute(
+            "INSERT INTO journal_runs (seq, run, source_epoch,"
+            " boundary, lines, eligible, info_dropped,"
+            " nomatch_dropped, priority_unusable, pfail, limited,"
+            " first_ts, last_ts, record_count, event_count,"
+            " ingested_epoch, ingested_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (seq, header["run"], header["epoch"], header["boundary"],
+             header["lines"], header["eligible"], header["info_dropped"],
+             header["nomatch_dropped"], header["priority_unusable"],
+             header["pfail"], header["limited"],
+             min(timestamps) if timestamps else None,
+             max(timestamps) if timestamps else None,
+             len(records), sum(record["n"] for record in records),
+             float(now), _iso(now)))
+        self._conn.executemany(
+            "INSERT INTO journal_events (seq, ts, cls, proto, port,"
+            " dcls, fp, n) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [[seq, record["ts"], record["cls"], record["proto"],
+              record["port"] or 0, record["dcls"] or "NONE",
+              record["fp"], record["n"]] for record in records])
+        self._conn.execute(
+            "UPDATE journal_ingest_state SET terminal_seq = ?,"
+            " last_consumed_seq = ?, updated_epoch = ? WHERE id = 1",
+            (seq, seq, now))
+        self._conn.commit()
+
+    def _journal_reader_hb_status(self):
+        """PR-2A frozen availability semantics: reader staleness is
+        derived ONLY from the age of out/hb, never from anything the
+        reader would have to say about itself."""
+        status = {"status": "disabled", "seq": None, "age_seconds": None,
+                  "stale_threshold_seconds": JOURNAL_HB_STALE_SECONDS}
+        out_dir = self._journal_exchange_dir
+        if out_dir is None:
+            return status
+        path = os.path.join(out_dir, JOURNAL_HB_NAME)
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            status["status"] = "absent"
+            return status
+        except OSError:
+            status["status"] = "unreadable"
+            return status
+        if not stat.S_ISREG(st.st_mode) or st.st_size > JOURNAL_HB_MAX_BYTES:
+            status["status"] = "invalid"
+            return status
+        try:
+            with open(path, "r") as handle:
+                obj = json.loads(handle.read(JOURNAL_HB_MAX_BYTES + 1))
+            seq, ts = obj["seq"], obj["ts"]
+            if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0:
+                raise ValueError
+            if (isinstance(ts, bool) or not isinstance(ts, (int, float))
+                    or ts != ts):
+                raise ValueError
+        except (OSError, ValueError, KeyError, TypeError):
+            status["status"] = "invalid"
+            return status
+        age = self._clock() - float(ts)
+        status["seq"] = seq
+        status["age_seconds"] = age
+        status["status"] = "stale" if age > JOURNAL_HB_STALE_SECONDS \
+            else "fresh"
+        return status
+
+    def _rollback_quiet(self):
+        try:
+            self._conn.rollback()
+        except sqlite3.Error:
+            pass
+
     # -- retention -----------------------------------------------------------------
 
     def _cleanup(self, phase):
@@ -671,6 +1270,17 @@ class IncidentHistory:
                 "DELETE FROM timeline_samples WHERE epoch < ?", (horizon,))
             self._conn.execute(
                 "DELETE FROM device_protocol_states WHERE epoch < ?",
+                (horizon,))
+            # v2 journal rows join the SAME accounting: runs age out by
+            # their ingest epoch and their events ride the FK cascade --
+            # the new tables can never grow unbounded past the horizon.
+            # journal_ingest_state is the terminal continuity authority:
+            # it is a single bounded row and is NEVER retention-pruned.
+            self._conn.execute(
+                "DELETE FROM journal_runs WHERE ingested_epoch < ?",
+                (horizon,))
+            self._conn.execute(
+                "DELETE FROM journal_ingest_audit WHERE epoch < ?",
                 (horizon,))
             self._conn.commit()
             # Spec §5: time-based retention is the normal path; SIZE pruning
@@ -690,13 +1300,15 @@ class IncidentHistory:
             self._record_failure(CODE_RETENTION_FAILED)
 
     def _prune_to_target(self):
-        """Delete globally OLDEST rows -- both tables as ONE timeline.
+        """Delete globally OLDEST rows -- ALL pruned tables as ONE timeline.
 
         Contract: no row at time T2 may be deleted while a strictly
-        older row at T1 still exists in EITHER table; the survivors are
-        always a newest-suffix of the merged epoch order. Ties at the
-        cut epoch are settled deterministically (samples before states,
-        insertion order within a table). File size can ONLY be
+        older row at T1 still exists in ANY pruned table; the survivors
+        are always a newest-suffix of the merged epoch order. Ties at
+        the cut epoch are settled deterministically (source order,
+        insertion order within a table). v2 journal_runs prunes cascade
+        their events; journal_ingest_state is continuity, not history,
+        and is never a pruning candidate. File size can ONLY be
         re-measured after a full VACUUM: incremental vacuum releases free
         pages at the END of the file, but oldest-first deletes free pages
         behind live newest rows -- without the rewrite the measured size
@@ -706,7 +1318,7 @@ class IncidentHistory:
             bytes_now = self._db_bytes()
             counts = [self._conn.execute(
                 "SELECT COUNT(*) FROM %s" % table).fetchone()[0]
-                for table in _PRUNE_TABLES]
+                for table, _column in _PRUNE_SOURCES]
             total = sum(counts)
             if total <= 0:
                 return
@@ -718,26 +1330,28 @@ class IncidentHistory:
                                     / float(bytes_now), 0.10)) + 1)
             k = min(k, total)
             cut = self._conn.execute(
-                "SELECT epoch FROM ("
-                " SELECT epoch FROM timeline_samples"
-                " UNION ALL"
-                " SELECT epoch FROM device_protocol_states)"
+                "SELECT epoch FROM (" + " UNION ALL".join(
+                    " SELECT %s AS epoch FROM %s" % (column, table)
+                    for table, column in _PRUNE_SOURCES) + ")"
                 " ORDER BY epoch ASC LIMIT 1 OFFSET ?",
                 (k - 1,)).fetchone()[0]
             remaining = k
-            for table in _PRUNE_TABLES:       # strictly older than the cut
+            # samples/states first: they settle exact ties at the cut
+            # epoch in the historical source order
+            for table, column in _PRUNE_SOURCES:  # strictly older than cut
                 if remaining <= 0:
                     break
                 cursor = self._conn.execute(
-                    "DELETE FROM %s WHERE epoch < ?" % table, (cut,))
+                    "DELETE FROM %s WHERE %s < ?" % (table, column),
+                    (cut,))
                 remaining -= max(cursor.rowcount, 0)
-            for table in _PRUNE_TABLES:       # top up AT the cut epoch only
+            for table, column in _PRUNE_SOURCES:  # top up AT the cut epoch
                 if remaining <= 0:
                     break
                 cursor = self._conn.execute(
                     "DELETE FROM %s WHERE rowid IN (SELECT rowid FROM %s"
-                    " WHERE epoch = ? ORDER BY rowid ASC LIMIT ?)"
-                    % (table, table), (cut, remaining))
+                    " WHERE %s = ? ORDER BY rowid ASC LIMIT ?)"
+                    % (table, table, column), (cut, remaining))
                 remaining -= max(cursor.rowcount, 0)
             self._conn.commit()
             self._conn.execute("VACUUM")
@@ -779,6 +1393,17 @@ class IncidentHistory:
                 # a refused OPEN is fail-closed: the surface is NOT enabled
                 # until a later open() succeeds (never a stale True)
                 self._enabled = False
+
+    def _record_journal_failure(self, code):
+        # Journal ingest is an INDEPENDENT health subsystem: this never
+        # touches the write-path _degraded/_last_error_code, and only a
+        # later clean ingest pass (_journal_ingest_pass with nothing
+        # blocked) clears it. A successful sample write can therefore
+        # never swallow an ingest failure inside the same publication.
+        with self._lock:
+            self._failure_count += 1
+            self._journal_degraded = True
+            self._journal_last_error_code = code
 
 
 class _HistoryError(Exception):
