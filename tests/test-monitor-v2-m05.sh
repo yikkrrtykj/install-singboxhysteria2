@@ -27,7 +27,7 @@ SKIP=0
 # or is explicitly skipped; the gate at the bottom requires
 # PASS + FAIL + SKIP == EXPECTED_TOTAL, so a section that silently disappears
 # (the classic "fewer assertions but still green") can never fake success.
-EXPECTED_TOTAL=136
+EXPECTED_TOTAL=137
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
@@ -288,6 +288,8 @@ PASSWORD = "m05-admin-password-1"
 NEW_PASSWORD = "m05-admin-password-2"
 RECOVERY_KEY = "m05-recovery-key-0001"
 SOURCE = "127.0.0.5"
+ADD_PATH = "/api/v1/clients/add"
+STEPUP_MUTATION_PATHS = sorted(path for path in MUTATION_ROUTES if path != ADD_PATH)
 MUTATION_PATHS = sorted(MUTATION_ROUTES)
 
 def _raiser():
@@ -416,16 +418,21 @@ def group_gate():
     out["T2_session_read_only_ok"] = req(
         port, "GET", "/api/v1/session", {"Cookie": cookie})["status"] == 200
 
-    # T3: no step-up -> 401 reauth_required on EVERY mutation route.
+    # T3: Add is the product-UX exception: session+CSRF is sufficient.
+    # Every OTHER privileged mutation remains step-up gated.
+    add = mutate(port, ADD_PATH, cookie, csrf)
+    out["T3_add_no_stepup_not_401"] = add["status"] == 503 \
+        and json.loads(add["body"]).get("code") == "e3_unavailable"
     statuses = []
     codes = []
-    for path in MUTATION_PATHS:
+    for path in STEPUP_MUTATION_PATHS:
         r = mutate(port, path, cookie, csrf)
         statuses.append(r["status"])
         codes.append(json.loads(r["body"]).get("error"))
-    out["T3_all_mutations_401"] = statuses == [401] * len(MUTATION_PATHS)
-    out["T3_all_reauth_required"] = \
-        codes == ["reauth_required"] * len(MUTATION_PATHS)
+    out["T3_protected_mutations_401"] = \
+        statuses == [401] * len(STEPUP_MUTATION_PATHS)
+    out["T3_protected_reauth_required"] = \
+        codes == ["reauth_required"] * len(STEPUP_MUTATION_PATHS)
 
     # T4: the correct password opens the window.
     r = step_up(port, cookie, csrf)
@@ -500,9 +507,9 @@ def group_gate():
     ss = csrf_of(sp, sc)
     out["T6_step_up_ok"] = step_up(sp, sc, ss)["status"] == 200
     out["T6_authorized_in_window"] = \
-        mutate(sp, "/api/v1/clients/add", sc, ss)["status"] == 503
+        mutate(sp, "/api/v1/management/activate", sc, ss)["status"] == 503
     time.sleep(1.6)
-    r = mutate(sp, "/api/v1/clients/add", sc, ss)
+    r = mutate(sp, "/api/v1/management/activate", sc, ss)
     out["T6_expired_401"] = r["status"] == 401
     out["T6_expired_reauth_required"] = \
         json.loads(r["body"]).get("error") == "reauth_required"
@@ -561,7 +568,7 @@ def group_revocation():
         not stack["auth"].sessions.step_up_active(ta)
     out["T8_other_session_dropped"] = \
         stack["auth"].sessions.resolve(tb) is None
-    r = mutate(port, "/api/v1/clients/add", ca, sa)
+    r = mutate(port, "/api/v1/management/activate", ca, sa)
     out["T8_caller_mutation_401"] = r["status"] == 401 \
         and json.loads(r["body"]).get("error") == "reauth_required"
     out["T8_caller_read_still_ok"] = req(
@@ -594,7 +601,7 @@ def group_revocation():
         stack["auth"].sessions.resolve(ta) is not None \
         and stack["auth"].sessions.resolve(tb) is not None
     out["T9_mutation_401"] = \
-        mutate(port, "/api/v1/clients/add", ca, sa)["status"] == 401
+        mutate(port, "/api/v1/management/activate", ca, sa)["status"] == 401
     store = AuthStore(tempfile.mkdtemp())
     store.set_password(PASSWORD)
     tok = store.sessions.create()
@@ -666,10 +673,10 @@ def group_revocation():
     sc = csrf_of(pc, cc)
     step_up(pc, cc, sc)
     out["concurrency_first_request_passes_gate"] = \
-        mutate(pc, "/api/v1/clients/add", cc, sc)["status"] == 503
+        mutate(pc, "/api/v1/management/activate", cc, sc)["status"] == 503
     stack_c["auth"].sessions.revoke_all_step_ups()
     out["concurrency_later_request_blocked"] = \
-        mutate(pc, "/api/v1/clients/add", cc, sc)["status"] == 401
+        mutate(pc, "/api/v1/management/activate", cc, sc)["status"] == 401
 
     # No step-up state is ever persisted: auth.json stays hash-only.
     with open(os.path.join(stack["data_dir"], "auth.json")) as handle:
@@ -699,8 +706,12 @@ def group_ratelimit():
     # The SAME counter locks the login endpoint: proof the limiter is shared,
     # not a second brute-force surface.
     out["rl_login_shares_lockout"] = login(port, PASSWORD)["status"] == 429
-    out["rl_mutation_still_401"] = \
-        mutate(port, "/api/v1/clients/add", cookie, csrf)["status"] == 401
+    # Password-rate lockout blocks password verification surfaces, not an
+    # already-authenticated Add request that no longer performs step-up.
+    r = mutate(port, ADD_PATH, cookie, csrf)
+    out["rl_add_bypasses_password_lockout"] = (
+        r["status"] == 503
+        and json.loads(r["body"]).get("code") == "e3_unavailable")
 
     # ...and the reverse direction: login failures consume the step-up budget.
     stack2 = make_stack(tempfile.mkdtemp(), password=PASSWORD)
@@ -815,8 +826,9 @@ check 'd["T2_step_up_initially_absent"]' "T2: no step-up exists merely because t
 check 'd["T2_snapshot_read_only_ok"]' "T2: snapshot is read-only, no step-up needed"
 check 'd["T2_whitelist_read_only_ok"]' "T2: whitelist view needs no step-up"
 check 'd["T2_session_read_only_ok"]' "T2: session info needs no step-up"
-check 'd["T3_all_mutations_401"]' "T3: all four mutations answer 401 without step-up"
-check 'd["T3_all_reauth_required"]' "T3: the 401 body is exactly reauth_required"
+check 'd["T3_add_no_stepup_not_401"]' "T3: Add is authorized by session+CSRF without step-up"
+check 'd["T3_protected_mutations_401"]' "T3: protected mutations still answer 401 without step-up"
+check 'd["T3_protected_reauth_required"]' "T3: protected mutations return reauth_required"
 check 'd["T4_step_up_200"]' "T4: the correct password completes step-up"
 check 'd["T4_status_ok"]' "T4: step-up answers {status: ok}"
 check 'd["T4_expires_in_300"]' "T4: the window is 300 seconds"
@@ -891,7 +903,7 @@ check 'd["rl_sixth_stepup_429"]' "the sixth step-up -> 429 (IP lockout)"
 check 'd["rl_429_code"]' "the 429 carries the rate_limited code"
 check 'd["rl_429_retry_after"]' "the 429 carries Retry-After"
 check 'd["rl_login_shares_lockout"]' "the SAME counter locks login (shared limiter)"
-check 'd["rl_mutation_still_401"]' "no mutation can slip through a locked-out IP"
+check 'd["rl_add_bypasses_password_lockout"]' "authenticated Add does not re-enter the password lockout surface"
 check 'd["rl_four_bad_logins_401"]' "four bad logins -> 401"
 check 'd["rl_fifth_attempt_401"]' "the shared budget counts the fifth attempt"
 check 'd["rl_sixth_attempt_429"]' "login failures also lock the step-up endpoint"

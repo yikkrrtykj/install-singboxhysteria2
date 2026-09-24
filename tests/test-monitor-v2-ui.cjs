@@ -195,15 +195,30 @@ async function main() {
   responses.push(response({code: 'E_MANUAL_INTERVENTION', error: 'privileged helper Idempotency-Key'}, 409), response(clients), response(healthy()));
   ui.addClient('bob'); await flush();
   check('raw backend error detail is not rendered to the user', productText);
+
+  // Product UX contract: Add client is session+CSRF only. It must never open
+  // the password step-up panel or send /api/v1/step-up.
+  setStatus(healthy());
+  const addReqBefore = requests.filter(r => r.url === '/api/v1/clients/add').length;
+  const stepReqBefore = requests.filter(r => r.url === '/api/v1/step-up').length;
+  responses.push(response({}), conv());
+  ui.addClient('no-password-again'); await flush();
+  check('Add client dispatches without password step-up', () => {
+    assert.equal(requests.filter(r => r.url === '/api/v1/clients/add').length, addReqBefore + 1);
+    assert.equal(requests.filter(r => r.url === '/api/v1/step-up').length, stepReqBefore);
+    assert.ok(ids['stepup-overlay'].className.includes('hidden'));
+  });
+
+  // Delete/export still use the generic step-up replay path.
   responses.push(response({error: 'reauth_required'}, 401));
-  const options = {method: 'POST', body: {name: 'bob'}, idempotencyKey: 'same-key'};
-  const stepped = ui.apiWithStepUp('/api/v1/clients/add', options); await flush();
+  const options = {method: 'POST', body: {name: 'alice', confirm: 'alice'}, idempotencyKey: 'same-key'};
+  const stepped = ui.apiWithStepUp('/api/v1/clients/delete', options); await flush();
   check('step-up password panel appears only on demand with product copy', () => { assert.ok(!ids['stepup-overlay'].className.includes('hidden')); assert.match(ids['stepup-form'].textContent, /Confirm admin password/); });
   responses.push(response({}), response(ui.state.session), response({}));
   ids['stepup-password'].value = 'test-password'; ids['stepup-form'].events.submit({preventDefault() {}});
   await stepped; await flush();
   check('step-up replay retains original body and headers', () => {
-    const pair = requests.filter(r => r.url === '/api/v1/clients/add').slice(-2);
+    const pair = requests.filter(r => r.url === '/api/v1/clients/delete').slice(-2);
     assert.equal(pair[0].body, pair[1].body); assert.deepEqual(pair[0].headers, pair[1].headers);
     assert.ok(ids['stepup-overlay'].className.includes('hidden'));
   });
@@ -627,6 +642,6 @@ async function main() {
     assert.ok(!ids['mg-activate'] && !ids['mg-deactivate']);
     assert.ok(requests.every(r => !/management\/(activate|deactivate)/.test(r.url))); productText();
   });
-  assert.equal(count, 67, 'UI assertion count guard');
+  assert.equal(count, 68, 'UI assertion count guard');
 }
 main().catch(err => { console.error(err); process.exitCode = 1; });

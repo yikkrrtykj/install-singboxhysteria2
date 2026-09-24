@@ -519,7 +519,8 @@ section "T04 failed upgrade (invalid staged code) leaves production untouched"
 LIVE_BEFORE_T04="$(readlink "$FIX_APP_LINK")"
 # Staging (and therefore validation) only runs when the version differs;
 # a broken candidate must ship as a new version to be exercised.
-printf '0.2.1\n' > "$FIX_SRC/VERSION"
+BROKEN_VERSION="9.9.99"
+printf '%s\n' "$BROKEN_VERSION" > "$FIX_SRC/VERSION"
 printf 'def broken(:\n' > "$FIX_SRC/collector.py"
 OUT4="$TMP/out-t04.log"
 run_install "$OUT4"
@@ -530,7 +531,7 @@ if find "$FIX_RELEASES" -maxdepth 1 -name '.staging-*' 2>/dev/null | grep -q .; 
 else
     pass "staging leftovers removed"
 fi
-assert_no_grep ' 0\.2\.1 ' "$FIX_RELEASES/releases.history" "failed candidate never enters history (F1)"
+assert_no_grep " $BROKEN_VERSION " "$FIX_RELEASES/releases.history" "failed candidate never enters history (F1)"
 cp "$REPO_ROOT/monitor-v2/collector.py" "$FIX_SRC/collector.py"
 printf '0.3.0\n' > "$FIX_SRC/VERSION"
 
