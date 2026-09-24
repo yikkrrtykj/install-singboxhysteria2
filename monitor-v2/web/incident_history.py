@@ -535,7 +535,18 @@ class IncidentHistory:
     def ingest_journal_events(self):
         """ONE cadence-independent journal ingest pass (test/operator
         entry point -- the publication path drives it via
-        ``on_publish``). Never raises; the returned dict is sanitized."""
+        ``on_publish``).
+
+        Expected operational and storage failures are fail-soft: they are
+        contained here, recorded as a sanitized status/degradation code and
+        reported as ``None``. A deliberately injected unexpected exception
+        (for instance the crash-consistency ``RuntimeError`` a test or
+        operator raises from inside the contract) is NOT swallowed by this
+        direct entry point -- it propagates to the caller, which is exactly
+        what lets the test prove that nothing settled on the way out. The
+        publication path never sees it: ``_journal_ingest_publish_gate``
+        contains every Exception of any kind one level up, so a journal
+        failure can never break a P1 timeline write."""
         try:
             with self._lock:
                 if not self._enabled or self._conn is None:
