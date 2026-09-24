@@ -620,8 +620,10 @@ PR-2B 将其接入 installer，且完全服从既有事务语义（deploy lock /
 - **uninstall（§13）**：reader 先于 Monitor 拆（checked-first strict stop/disable，失败在
   任何删除前中止）；unit 删除 + daemon-reload + 仅删 symlink（真实目录拒绝）；默认保留
   身份与诊断数据，`--purge-state` 才清数据根；幂等。
-- **INERT 规则**：源树完全不含 `journal_reader/`（PR-2A 前基线 / packaging fixture）→
-  reader 侧零动作并显式记日志；部分缺失 = manifest fail-closed。
+- **低层 INERT staging（仅 `sbmon_stage_release`）**：源树完全不含 `journal_reader/` 时，
+  低层 staging 产出一个无 libexec 的历史形状 release（建模 pre-PR-2B 回滚目标）；部分
+  缺失 = manifest fail-closed。顶层 `install` / `upgrade` 从第 18 节起**不再**接受这种源树
+  （见 §18/§19），因此这条低层分支只能由测试直接调用库来触达。
 - **边界不变（§9/§10/§18）**：全程零 sing-box 操作、零 sbox-cm/management.active 引用、
   零新增 env/secret 通道（unit 唯一 Environment=SBOX_JR_UNIT）。
 - **测试**：`tests/test-monitor-v2-jr-deploy.sh`（fail-closed/回滚矩阵/invariant 扫描；
@@ -703,11 +705,8 @@ fail-closed —— 与"载荷不完整"（S3）同一级别、同一零副作用
   `ensure_user` / `create_layout` / `stage`，所以连 **Monitor 自己的 state 根**都不应出现
   （测试同时断言 reader 三路与 `$SBMON_STATE_ROOT` 全部未创建、releases 目录为空、
   零 reader systemctl 调用、无 history）。
-- 唯一的例外必须是**显式声明**：`SBMON_ALLOW_INERT_BASELINE=1` 表示"这次运行只在建模
-  pre-PR-2B 基线"（打包夹具、以及作为回滚目标的无 libexec 历史 release）。低层
-  staging/converge 的 inert 分支因此保留。空值不算声明；生产部署代码中不存在任何
-  命令位置的赋值（静态门扫描 `^[[:space:]]*(export )?SBMON_ALLOW_INERT_BASELINE=1`，
-  诊断文本里只是**提及**变量名，操作员才知道这条逃生门的写法）。
+- 本轮初版曾保留一条"显式声明"例外（一个由调用方环境提供的变量）。第 19 节记录它
+  为什么被整条删除：调用方环境正是操作员敲下正式命令时的那个环境。
 
 ### B5：运行时健康与 boot-enable 是两条独立的轴
 `sbmon_sboxjr_health_proof()` 过去无条件要求 enabled，于是"当前在跑、但不随开机自起"
@@ -735,3 +734,50 @@ history，并断言恢复路径**没有**运行（防止"回滚失败但被救�
 - 判据：mock 记录每次调用瞬间的 `runtime=<id>`；`poststart` 场景断言 `stop` 出现在
   失败 enable **之后**、恢复期 `daemon-reload` **之前**，且那一行仍写着候选 release 的
   runtime id —— 证明 stop 发生时链接尚未被撤，顺序不可能反过来。
+
+## 19. Integration Review Round 3 —— 载荷硬门不接受任何调用方环境开关（PR #54）
+
+### 为什么第 18 节那条例外必须整条删除
+B4 残留只有一个问题：那条"显式声明"是**环境变量**，而正式命令的环境正是调用者
+（操作员）敲下命令时所在的环境。于是对被剥掉 `journal_reader/` 的源树，
+`<var>=1 install-monitor.sh install` 依旧能以 `contract_available=false` 成功收尾；
+"生产源码从不赋值"的静态扫描关闭不了它，赋值根本不在源码里。§3 要求正式
+install/upgrade 路径**不存在**成功的 contract_available=false 模式，所以这条开关被
+删除 —— 连标识符一起删除，好让"零出现"本身成为可机检的结构性判据。
+
+### 现在的形状
+- `sbmon_sboxjr_activation_preflight`：载荷判据无条件、与 `sbmon_die` 焊死，诊断文本
+  直接写出"此判据无任何环境变量或命令行开关可绕过"；位置仍早于 `ensure_user` /
+  `create_layout` / `stage`，所以拒绝时连 Monitor 自己的 state 根都不出现。
+- 低层 `sbmon_stage_release` 保留"源树无载荷 → 无 libexec"分支：那是测试建模
+  pre-PR-2B 历史 release 的唯一入口（S2b 直接调库构造，rbguard 手工 `rm -rf libexec`
+  构造）。顶层命令永远不接受这种源树。
+
+### 判据（tests/test-monitor-v2-jr-deploy.sh）
+| # | 判据 | 位置 |
+|---|---|---|
+| 1 | 载荷缺失 + 普通正式 install → rc≠0，命名缺失载荷与 §3 规则 | S2 |
+| 2 | 调用方环境带着被删除的旧名（值 `1`）→ 仍然 rc≠0 | S2 legacy 循环 |
+| 3 | 旧名的任意值（`1`/`0`/`yes`/`TRUE`/空）一律拒绝，5 个值各自断言 | S2 legacy 循环 |
+| 4 | 所有拒绝路径零变更：releases 空、无 Monitor state 根、reader unit/link/data 三路皆不出现、零 reader systemctl 调用 | S2 / legacy / S2b guard |
+| 5 | pre-PR-2B 无 libexec 回滚目标仍可构造：直接调用 `sbmon_stage_release`；对照同一原语在带载荷源树上会 stage 出 libexec，两侧 `contract_available` 分别 False / True | S2b |
+| 6 | install 与 upgrade 两条正式路径都不能以 INERT 收尾；upgrade 侧在真实部署上拒绝后，两条 live 链接、服务事实、history 行数与 contract 全部原样保留 | S2 / S2d（符号链接门控，Linux 执行） |
+
+### 结构性静态门与负控（S2c）
+标识符在全仓（除本套件的拒绝探针；`lab/` 不属于任何提交或 lane）零出现；库与顶层脚本
+不含 `ALLOW_INERT|INERT_BASELINE|--allow-inert` 任何变体；preflight 体内载荷判据恰好
+一次、不是 `if` 分支、且紧邻 `sbmon_die`。每条静态门都配负控：把被删除的名字重新加进
+一次性副本，门必须点亮 —— 否则"零出现"可能只是空转。
+
+### 打包车道的立场改变（tests/test-monitor-packaging.sh）
+这条车道原本的立场是"发布一个不含 reader 的历史基线"，因此它必须换立场而不是保留后门：
+现在它打包**当前载荷**（显式 12 模块清单，另加"本车道清单 == 库内
+`SBOXJR_MODULE_FILES`"静态门），并把 reader 的 runtime / unit / data 路径钉进夹具树。
+T01 因此新增正向判据：release 携带载荷、12 模块齐、wrapper + unit 模板、unit 渲染成功、
+`systemd-analyze verify` 命中点前缀临时文件且零残留、同一事务 `enable --now` reader、
+交换目录建立、符号链接形状。拆除类小节（F2c、R4-2 组、T06）要求 reader 链接真是符号
+链接 —— 在 `ln -s` 退化为目录复制的平台上，安装器**正确地**拒绝经它删除真实目录，所以
+这些小节按本车道既有政策诚实 SKIP，由 Linux 门零 SKIP 执行；`run_uninstall_quiet` 只在
+非符号链接平台清理夹具残留，生产判据一条未减。R4-2 的 daemon-reload 判据现在覆盖两个
+site（reader unit 删除后、monitor unit 删除后），mock 为此新增 SKIP 旋钮，把失败瞄准到
+后面的 site —— 只有计数旋钮时，第一个 site 抢先把失败吃掉，第二个 site 会静默失去证明。
