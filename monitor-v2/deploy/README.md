@@ -669,6 +669,8 @@ PR-2B 将其接入 installer，且完全服从既有事务语义（deploy lock /
   判据：systemctl mock 在**每次调用那一刻**解析并记录 `runtime=<release-id>`，
   `tests/test-monitor-v2-jr-deploy.sh` 据此断言"最后一次 reader 变更是恢复重启，
   且其运行时已经是恢复后的 release"，升级失败与回滚失败两个方向各一条。
+  （第 18 节 B6 把这条顺序限定在 `PRE_ACTIVE=1`：事务前 inactive 时，stop 必须**先于**
+  unit/运行时链接的拆除。）
 - **B2 回滚目标完整性早于任何变更**（`_cmd_rollback_locked`）。旧门只检查目标 release
   的 reader 运行时目录**存在**；一个目录在但 12+1+1 manifest 已破损的目标，要等到
   `sbmon_sboxjr_converge()` 才发现，而那时 Monitor 已经切换链接、重启、重写了 unit。
@@ -687,3 +689,49 @@ PR-2B 将其接入 installer，且完全服从既有事务语义（deploy lock /
   `/<live-link>/` 片段；`PYTHONDONTWRITEBYTECODE=1` 保留，导入后 release 仍零
   `__pycache__`。
 
+
+## 18. Integration Review Round 2 — 载荷缺失、boot-enable 轴与 PRE_ACTIVE 分支（PR #54）
+
+### B4：正式安装不得"成功但 INERT"
+§3 把"release 携带并可导入 ingest contract"写进了 release 的**定义**。因此顶层
+`install` / `upgrade` 在源树完全没有 `journal_reader/` 载荷时，必须在**任何变更之前**
+fail-closed —— 与"载荷不完整"（S3）同一级别、同一零副作用类别。以
+`contract_available=false` 收尾的安装不是一次成功部署，它是本分支存在的目的所禁止的
+混版本半状态，只是抵达路径从"顺序错误"变成"干脆缺失"。
+
+- 判据：`reader 载荷缺失` 拒绝发生在 `sbmon_sboxjr_activation_preflight`，位置早于
+  `ensure_user` / `create_layout` / `stage`，所以连 **Monitor 自己的 state 根**都不应出现
+  （测试同时断言 reader 三路与 `$SBMON_STATE_ROOT` 全部未创建、releases 目录为空、
+  零 reader systemctl 调用、无 history）。
+- 唯一的例外必须是**显式声明**：`SBMON_ALLOW_INERT_BASELINE=1` 表示"这次运行只在建模
+  pre-PR-2B 基线"（打包夹具、以及作为回滚目标的无 libexec 历史 release）。低层
+  staging/converge 的 inert 分支因此保留。空值不算声明；生产部署代码中不存在任何
+  命令位置的赋值（静态门扫描 `^[[:space:]]*(export )?SBMON_ALLOW_INERT_BASELINE=1`，
+  诊断文本里只是**提及**变量名，操作员才知道这条逃生门的写法）。
+
+### B5：运行时健康与 boot-enable 是两条独立的轴
+`sbmon_sboxjr_health_proof()` 过去无条件要求 enabled，于是"当前在跑、但不随开机自起"
+的主机**永远**无法完成 keep-prestate 回滚 —— 事务把"被要求保留的意图"当成故障去修复。
+现在期望值是参数：
+
+| 调用方 | want_enabled | 语义 |
+|---|---|---|
+| 前向激活（`converge keep=0`） | 1（默认） | enabled 是契约的一部分，缺失即失败 |
+| 保留事务前事实（`converge keep=1`） | `$SBOXJR_PRE_ENABLED` | 事务前 disabled 却变成 enabled = 漂移，同样失败 |
+
+两条轴任何一条都仍然被证明，改变的只是该轴应取的值。矩阵补齐 active/disabled 与
+inactive/disabled 两个象限：rc=0、active 仍 active、disabled 仍 disabled、零
+enable/disable 机会主义调用、两条 live 引用共同收敛到目标、成功回滚恰写一条
+history，并断言恢复路径**没有**运行（防止"回滚失败但被救回来"冒充绿色）。
+
+### B6："进程绝不跑在自己的代码之上"取决于 PRE_ACTIVE
+第 17 节的"代码先行、进程最后"只对 `PRE_ACTIVE=1` 成立。`PRE_ACTIVE=0` 时，候选可能
+已被本次事务拉起（`enable --now` 的 start 半段成功、enable 事务失败）而其后的步骤才失败；
+若先删 unit、先撤运行时链接，就是在一个仍在执行的进程下面拆掉它的地面，最后才 stop。
+
+- `PRE_ACTIVE=0`：**stop + 验证 inactive 是恢复的第一个动作**，然后才是 unit / enable 事实 /
+  运行时链接；结尾再复查一次"确实 inactive"，任何路径都不可能留下运行中的候选。
+- `PRE_ACTIVE=1`：恢复 unit/链接后，restart 仍是最后一个服务动作（同 B1）。
+- 判据：mock 记录每次调用瞬间的 `runtime=<id>`；`poststart` 场景断言 `stop` 出现在
+  失败 enable **之后**、恢复期 `daemon-reload` **之前**，且那一行仍写着候选 release 的
+  runtime id —— 证明 stop 发生时链接尚未被撤，顺序不可能反过来。

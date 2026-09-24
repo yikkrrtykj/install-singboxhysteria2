@@ -100,6 +100,8 @@ META="$TMP/meta-stub"; mkdir -p "$META"   # recording chown/chmod, separate dir
 #   dead.<unit>         start/restart "succeed" but the unit never stays active
 #   fail_restart.<unit> / fail_restart_once.<unit> / fail_stop.<unit> /
 #   fail_disable.<unit> that mutation op fails (once = marker consumed)
+#   fail_enable.<unit>  enable --now starts the unit and THEN fails the enable
+#                       transaction (review #54 B6: running, not boot-enabled)
 #   reload_fail         holds N: next N daemon-reloads succeed, then fail
 cat > "$STUB/systemctl-mock" <<'SME'
 #!/usr/bin/env bash
