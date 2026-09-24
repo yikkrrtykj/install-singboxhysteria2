@@ -315,7 +315,16 @@ monitor_env_contract_pythonpath() {
 # PYTHONPATH becomes EXACTLY the release contract path (or disappears with it).
 # An inherited/operator-supplied PYTHONPATH therefore can never answer for the
 # installed release -- in either direction.
+#
+# Importing must never MUTATE the release: CPython would byte-compile the
+# contract into <release>/libexec/sbox-journal-reader/journal_reader/__pycache__,
+# and the reader-runtime audit compares that directory against the 12-module
+# manifest EXACTLY (missing OR unexpected entries fail closed). A single probe
+# run would therefore turn the NEXT deploy fail-closed on a healthy release --
+# so bytecode writing is switched off for everything imported through here.
 monitor_env_apply_contract_pythonpath() { # <app-dir> -> rc always 0
+    PYTHONDONTWRITEBYTECODE=1
+    export PYTHONDONTWRITEBYTECODE
     SBMON_JR_CONTRACT_PATH="$(monitor_env_contract_pythonpath "$1")"
     export SBMON_JR_CONTRACT_PATH
     if [ -n "$SBMON_JR_CONTRACT_PATH" ]; then

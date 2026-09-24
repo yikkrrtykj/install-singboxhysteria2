@@ -129,6 +129,9 @@ new_case() { # new_case <name>
     export SBMON_USER=sboxweb SBMON_GROUP=sboxweb
     export SBMON_PYTHON3="$PY"
     export SBMON_SYSTEMCTL="$STUB/systemctl"
+    # The tripwire is scoped PER CASE: "this transaction touched no service
+    # manager" must describe the window being asserted, not the whole run.
+    : > "$SYSTEMCTL_CALLS"
     OUT="$CASE_DIR/out.log"
 }
 
@@ -206,6 +209,12 @@ assert_grep "$SVC" 'monitor_env_apply_contract_pythonpath "\$APP_DIR"' "monitor-
 assert_grep "$PROBE" 'monitor_env_apply_contract_pythonpath "\$APP_DIR"' "probe applies the SAME derivation (no reimplementation)"
 assert_eq "$(grep -c '^[[:space:]]*PYTHONPATH=' "$SVC")" "0" "monitor-service never hand-rolls PYTHONPATH (only the shared helper sets it)"
 assert_no_grep "$PROBE" 'PYTHONPATH=.*\$\{?' "probe never builds a PYTHONPATH of its own"
+# Importing the contract must not WRITE into the immutable release: a stray
+# journal_reader/__pycache__ breaks the exact 12+1+1 manifest audit, so the
+# next deploy of a perfectly healthy release would fail closed. The rule lives
+# in the shared helper (one place), not in either caller.
+assert_grep "$ENV_LIB" '^[[:space:]]*PYTHONDONTWRITEBYTECODE=1$' "the shared import helper disables bytecode writing"
+assert_grep "$ENV_LIB" 'export PYTHONDONTWRITEBYTECODE' "the disable reaches the exec'd interpreter's environment"
 
 # The libexec literal must agree between the deploy lib and the env lib: if
 # one moves, staging and importing stop describing the same tree.
@@ -320,6 +329,19 @@ if require_symlink "I1 formal release (stage + activate + link + probe)"; then
         > "$CASE_DIR/svc.log" 2>&1 || true
     assert_grep "$CASE_DIR/svc.log" 'journal_contract=available' "formal: the real Monitor runtime entrypoint imports the contract (lifecycle evidence)"
 
+    # Importing the release must leave it byte-identical. The runtime probe and
+    # the Monitor process both load journal_reader from the release libexec;
+    # if CPython cached bytecode there, the exact 12+1+1 manifest audit that
+    # Coding E runs on EVERY later deploy / prune would fail closed on a
+    # perfectly healthy release (and roll the version-coupling back into a
+    # mixed state). So: no cache directory anywhere in the release, and the
+    # reader link still decodes after both import paths have run.
+    assert_eq "$(find "$RELEASE" -name '__pycache__' -type d | wc -l | tr -d ' ')" "0" \
+        "formal: importing the contract writes no bytecode into the immutable release"
+    assert_eq "$(reader_linked_id)" "$RID" "formal: reader link audit is still green AFTER the imports"
+    assert_eq "$(libf sbmon_sboxjr_audit_runtime "$RELEASE/libexec/sbox-journal-reader" >/dev/null 2>&1; echo $?)" "0" \
+        "formal: runtime manifest audit still passes AFTER the imports"
+
     # -----------------------------------------------------------------------
     # §3.5 negatives: the gate must be the RELEASE, not luck.
     # -----------------------------------------------------------------------
@@ -430,10 +452,10 @@ section "I3: §5 dual-reference retention (prune protects BOTH live links)"
 if require_symlink "I3 prune chronology"; then
     new_case prune
     build_src "$SBMON_REPO_MONITOR_DIR" --with-jr
-    mk_release() { # mk_release <name> <version> <age-days>
+    mk_release() { # mk_release <name> <version> <age-days> -> release id on stdout
         local id; id="$(stage_activate_link "$2")" || return 1
         touch -d "$3 days ago" "$SBMON_RELEASES_DIR/$id"
-        printf '%s\n' "$id" > "$CASE_DIR/id-$1"
+        printf '%s\n' "$id"
     }
     R_OLD="$(mk_release old 0.1.0 30)"
     R_MID="$(mk_release mid 0.1.1 20)"

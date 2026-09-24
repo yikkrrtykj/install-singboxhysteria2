@@ -628,3 +628,29 @@ PR-2B 将其接入 installer，且完全服从既有事务语义（deploy lock /
   非符号链接平台诚实 SKIP，Linux 门零 SKIP）+ `tests/test-monitor-v2-jr.sh`（PR-2A 资产
   契约 + 接线 confinement）。真实 systemd enable/start、PID/进程身份与 heartbeat 实机
   证明由 `tests/journal-reader/test-jr-live.sh`（matrix lane，REQUIRE_LIVE）承担。
+
+## 16. Integration Round PR-2B — Monitor 侧 contract 导入与随包 probe
+
+§15 让 reader 代码进入每个不可变 release；本节是 Monitor 真正**用得到**它的唯一路径，
+以及它必须保持的性质：
+
+- **单一推导源**：`<release>/libexec/sbox-journal-reader` 由
+  `monitor_env_contract_pythonpath` 从调用者自身所在 release 推导；
+  `monitor_env_apply_contract_pythonpath` 负责把它变成运行时环境（PYTHONPATH 恰为该路径，
+  否则完全 unset）。`monitor-service` 与 `monitor-contract-probe` 都只调用这两个函数，
+  绝不各自拼路径 —— 继承来的/操作者给的 PYTHONPATH 与仓库 checkout 都不得为安装包"代答"
+  （两个方向都不行）。
+- **随包 probe**：`bin/monitor-contract-probe` 是 release 的一部分（staged、0755、
+  `bash -n` 校验）。它从**已安装 release** 内真实 import 合同模块，用被导入模块自身的
+  realpath 报告来源，rc 仅在 `contract_available && journal_status 一致 && 路径落在 release 内
+  && 环境一致` 时为 0；删除或破坏 release 内的合同文件必然让 probe 与所有引用它的门变红。
+  绝对路径只出现在这个 operator/test 面，绝不进入用户可见 status/API。
+- **导入必须零写入（关键性质）**：CPython 会把字节码缓存写进
+  `<release>/libexec/sbox-journal-reader/journal_reader/__pycache__/`，而 §15 的
+  manifest 审计是**精确文件集**比较（多余条目同样 fail-closed）。因此一次只读的 probe
+  运行就会让**下一次**部署/剪枝对一个完全健康的 release 拒绝执行。规则集中在共享 helper
+  里：`PYTHONDONTWRITEBYTECODE=1` —— 导入 release 即不改变 release。
+  `tests/test-monitor-v2-p2b-integration.sh` 在两次真实导入（probe + monitor-service 生命周期）
+  之后重新断言 release 内无 `__pycache__`、reader 链接 provenance 与 manifest 审计仍为绿。
+- **测试**：`tests/test-monitor-v2-p2b-integration.sh`（§3 packaging 硬门 + §4 双活引用版本
+  耦合 + §5 retention 双保护 + §9 v1→v2 迁移经由已安装 release + 反伪造负例）。
