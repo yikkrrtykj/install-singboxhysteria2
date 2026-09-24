@@ -650,12 +650,22 @@ sbmon_stage_release() { # sbmon_stage_release <version> -> prints release id on 
     [ -d "$SBMON_REPO_MONITOR_DIR/api_bridge" ] || sbmon_die "缺少 api_bridge/: $SBMON_REPO_MONITOR_DIR"
     [ -f "$SBMON_REPO_MONITOR_DIR/webapp.py" ] || sbmon_die "缺少 webapp.py: $SBMON_REPO_MONITOR_DIR"
     [ -d "$SBMON_REPO_MONITOR_DIR/web" ] || sbmon_die "缺少 web/: $SBMON_REPO_MONITOR_DIR"
+    if sbmon_version_ge "$version" "0.3.0"; then
+        [ -d "$SBMON_REPO_MONITOR_DIR/journal_reader" ] || sbmon_die "0.3.0+ 缺少 journal_reader/: $SBMON_REPO_MONITOR_DIR"
+    fi
     cp -- "$SBMON_REPO_MONITOR_DIR/collector.py" "$staged/app/monitor-v2/"
     cp -- "$SBMON_REPO_MONITOR_DIR/webapp.py" "$staged/app/monitor-v2/"
     cp -R -- "$SBMON_REPO_MONITOR_DIR/api_bridge" "$staged/app/monitor-v2/api_bridge"
     rm -rf -- "$staged/app/monitor-v2/api_bridge/__pycache__"
     cp -R -- "$SBMON_REPO_MONITOR_DIR/web" "$staged/app/monitor-v2/web"
     rm -rf -- "$staged/app/monitor-v2/web/__pycache__"
+    # PR-2B: 0.3.0+ Monitor-side consumer imports the reviewed boundary
+    # parser/contract. Older-version packaging fixtures intentionally do
+    # not contain this package and must remain deployable for upgrade tests.
+    if sbmon_version_ge "$version" "0.3.0"; then
+        cp -R -- "$SBMON_REPO_MONITOR_DIR/journal_reader" "$staged/app/monitor-v2/journal_reader"
+        rm -rf -- "$staged/app/monitor-v2/journal_reader/__pycache__"
+    fi
 
     # Shims + shared env lib from deploy templates.
     cp -- "$DEPLOY_DIR/app-bin/monitor-service" "$staged/bin/monitor-service"
@@ -668,11 +678,16 @@ sbmon_stage_release() { # sbmon_stage_release <version> -> prints release id on 
     # runtime (collector, api_bridge, webapp, web/*.py) + shell syntax for
     # the shims. JS syntax is a CI/development gate -- Node.js is never a
     # production installer dependency.
-    "$SBMON_PYTHON3" -m py_compile \
-        "$staged/app/monitor-v2/collector.py" \
-        "$staged/app/monitor-v2/webapp.py" \
-        "$staged/app/monitor-v2/api_bridge/"*.py \
-        "$staged/app/monitor-v2/web/"*.py >/dev/null 2>&1 \
+    local -a py_sources=(
+        "$staged/app/monitor-v2/collector.py"
+        "$staged/app/monitor-v2/webapp.py"
+        "$staged/app/monitor-v2/api_bridge/"*.py
+        "$staged/app/monitor-v2/web/"*.py
+    )
+    if [ -d "$staged/app/monitor-v2/journal_reader" ]; then
+        py_sources+=("$staged/app/monitor-v2/journal_reader/"*.py)
+    fi
+    "$SBMON_PYTHON3" -m py_compile "${py_sources[@]}" >/dev/null 2>&1 \
         || { rm -rf -- "$staged"; sbmon_die "staged python 代码校验失败，放弃发布"; }
     bash -n "$staged/bin/monitor-service" "$staged/bin/monitor-health" "$staged/lib/monitor-env.sh" \
         || { rm -rf -- "$staged"; sbmon_die "staged shell 脚本校验失败，放弃发布"; }
@@ -857,6 +872,9 @@ SBOXJR_SERVICE_NAME="${SBOXJR_SERVICE_NAME:-singbox-journal-reader}"
 SBOXJR_UNIT_FILE="${SBOXJR_UNIT_FILE:-/etc/systemd/system/$SBOXJR_SERVICE_NAME.service}"
 SBOXJR_WATCHED_UNIT="${SBOXJR_WATCHED_UNIT:-sing-box.service}"
 SBOXJR_RUNUSER="${SBOXJR_RUNUSER:-runuser}"
+# Reader-specific fixture gate: packaging may run Monitor metadata tests as
+# real root while still keeping reader identity creation inside temp fixtures.
+SBOXJR_FIXTURE="${SBOXJR_FIXTURE:-$SBMON_FIXTURE}"
 
 sboxjr_log() { printf '[sbjr-deploy] %s\n' "$*"; }
 sboxjr_warn() { printf '[sbjr-deploy] WARNING: %s\n' "$*" >&2; }
@@ -869,7 +887,7 @@ sboxjr_die() { printf '[sbjr-deploy] ERROR: %s\n' "$*" >&2; return 1; }
 # FIELD (never values), return nonzero, and mutate nothing. Never silently
 # "converged" by a root-side repair here.
 sbmon_sboxjr_validate_identity() {
-    if [ "$SBMON_FIXTURE" = "1" ]; then
+    if [ "$SBOXJR_FIXTURE" = "1" ]; then
         sboxjr_log "fixture: 身份校验跳过（真实语义由 PATH 桩 + 根 Linux 门负责）"
         return 0
     fi
@@ -914,7 +932,7 @@ sbmon_sboxjr_validate_identity() {
 # absent-user branch may create group/user/membership, then re-validates
 # the exact final shape.
 sbmon_sboxjr_ensure_identity() {
-    if [ "$SBMON_FIXTURE" = "1" ]; then
+    if [ "$SBOXJR_FIXTURE" = "1" ]; then
         sboxjr_log "fixture: 确认身份存在（跳过真实 useradd/usermod）: $SBOXJR_USER"
         return 0
     fi
@@ -962,7 +980,7 @@ sbmon_sboxjr_ensure_data_tree() {
             return 1
         fi
     done
-    if [ "$SBMON_FIXTURE" = "1" ]; then
+    if [ "$SBOXJR_FIXTURE" = "1" ]; then
         return 0
     fi
     chown "root:$SBOXJR_GROUP" "$SBOXJR_DATA_ROOT" || return 1
@@ -1059,7 +1077,7 @@ sbmon_sboxjr_install_unit() { # rc 0 ok / 1 failed; NEVER enables or starts
 # carry $SBOXJR_JOURNAL_GROUP (that membership, not any root-side reading,
 # is what grants journal access). Runs as the reader identity via runuser.
 sbmon_sboxjr_readability_probe() {
-    if [ "$SBMON_FIXTURE" = "1" ]; then
+    if [ "$SBOXJR_FIXTURE" = "1" ]; then
         sboxjr_log "fixture: 可读性探针跳过（真实语义由根 Linux CI 门保证）"
         return 0
     fi
@@ -1072,5 +1090,126 @@ sbmon_sboxjr_readability_probe() {
         sboxjr_die "$SBOXJR_USER 有效组缺少 $SBOXJR_JOURNAL_GROUP"
         return 1
     fi
+    return 0
+}
+
+# PR-2B production activation: read-only preflight MUST happen before the
+# ordinary Monitor installer mutates anything. Existing identities are exact
+# validated with zero repair; absent identities may be created only later.
+sbmon_sboxjr_preflight_activation() {
+    local cmd d
+    if [ "$SBOXJR_FIXTURE" = "1" ]; then
+        for d in "$SBOXJR_DATA_ROOT" "$SBOXJR_STATE_DIR" "$SBOXJR_OUT_DIR"; do
+            if [ -L "$d" ] || { [ -e "$d" ] && [ ! -d "$d" ]; }; then
+                sboxjr_die "activation preflight: unsafe data path"
+                return 1
+            fi
+        done
+        return 0
+    fi
+    for cmd in getent id cut tr grep sort runuser; do
+        command -v "$cmd" >/dev/null 2>&1 || {
+            sboxjr_die "activation preflight: missing command $cmd"
+            return 1
+        }
+    done
+    getent group "$SBOXJR_JOURNAL_GROUP" >/dev/null 2>&1 || {
+        sboxjr_die "activation preflight: field=journal_group missing"
+        return 1
+    }
+    if getent passwd "$SBOXJR_USER" >/dev/null 2>&1; then
+        sbmon_sboxjr_validate_identity || return 1
+    else
+        for cmd in groupadd useradd usermod; do
+            command -v "$cmd" >/dev/null 2>&1 || {
+                sboxjr_die "activation preflight: missing command $cmd"
+                return 1
+            }
+        done
+    fi
+    for d in "$SBOXJR_DATA_ROOT" "$SBOXJR_STATE_DIR" "$SBOXJR_OUT_DIR"; do
+        if [ -L "$d" ] || { [ -e "$d" ] && [ ! -d "$d" ]; }; then
+            sboxjr_die "activation preflight: unsafe data path"
+            return 1
+        fi
+    done
+    if [ -L "$SBOXJR_UNIT_FILE" ] || { [ -e "$SBOXJR_UNIT_FILE" ] && [ ! -f "$SBOXJR_UNIT_FILE" ]; }; then
+        sboxjr_die "activation preflight: unsafe unit path"
+        return 1
+    fi
+    return 0
+}
+
+sbmon_sboxjr_service_active() {
+    sbmon_systemctl is-active --quiet "$SBOXJR_SERVICE_NAME" 2>/dev/null
+}
+
+sbmon_sboxjr_service_enabled() {
+    sbmon_systemctl is-enabled --quiet "$SBOXJR_SERVICE_NAME" 2>/dev/null
+}
+
+sbmon_sboxjr_wait_ready() {
+    if [ "$SBOXJR_FIXTURE" = "1" ]; then
+        return 0
+    fi
+    local deadline=$(( SECONDS + SBMON_HEALTH_TIMEOUT ))
+    while (( SECONDS < deadline )); do
+        if sbmon_sboxjr_service_active && [ -f "$SBOXJR_OUT_DIR/hb" ] && [ ! -L "$SBOXJR_OUT_DIR/hb" ]; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+sbmon_sboxjr_stop_disable() {
+    if sbmon_sboxjr_service_active || sbmon_sboxjr_service_enabled; then
+        sbmon_systemctl disable --now "$SBOXJR_SERVICE_NAME" || return 1
+    fi
+    if sbmon_sboxjr_service_active || sbmon_sboxjr_service_enabled; then
+        sboxjr_warn "reader remains active/enabled after disable --now"
+        return 1
+    fi
+    return 0
+}
+
+sbmon_sboxjr_restore_service_state() { # <active 0|1> <enabled 0|1>
+    local active="$1" enabled="$2"
+    if [ "$enabled" = "1" ]; then
+        sbmon_systemctl enable "$SBOXJR_SERVICE_NAME" || return 1
+    else
+        sbmon_systemctl disable "$SBOXJR_SERVICE_NAME" || return 1
+    fi
+    if [ "$active" = "1" ]; then
+        sbmon_systemctl start "$SBOXJR_SERVICE_NAME" || return 1
+        sbmon_sboxjr_wait_ready || return 1
+    else
+        sbmon_systemctl stop "$SBOXJR_SERVICE_NAME" || return 1
+    fi
+    return 0
+}
+
+# Consuming side MUST already be the active 0.3.0+ Monitor before this is
+# called. The order deliberately makes "producer with no consumer" impossible.
+sbmon_sboxjr_activate() { # <no-start 0|1>
+    local no_start="${1:-0}"
+    sbmon_sboxjr_ensure_identity || return 1
+    sbmon_sboxjr_ensure_data_tree || return 1
+    sbmon_sboxjr_stage_code || return 1
+    sbmon_sboxjr_install_unit || return 1
+    sbmon_sboxjr_readability_probe || return 1
+    if [ "$no_start" = "1" ]; then
+        sboxjr_log "--no-start: reader staged but not enabled/started"
+        return 0
+    fi
+    if ! sbmon_systemctl enable --now "$SBOXJR_SERVICE_NAME"; then
+        sboxjr_warn "reader enable/start failed"
+        return 1
+    fi
+    if ! sbmon_sboxjr_wait_ready; then
+        sboxjr_warn "reader failed readiness (active + heartbeat)"
+        return 1
+    fi
+    sboxjr_log "reader active + heartbeat ready"
     return 0
 }

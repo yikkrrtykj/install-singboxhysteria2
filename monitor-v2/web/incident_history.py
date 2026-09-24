@@ -49,7 +49,7 @@ import stat
 import threading
 import time
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 DB_NAME = "history.sqlite3"
 
@@ -66,7 +66,7 @@ CLEANUP_INTERVAL_SECONDS = 3600.0
 PRUNE_BATCH_ROWS = 512
 # One timeline, two tables: size pruning orders these epochs GLOBALLY
 # (samples first only to settle exact ties at the cut epoch).
-_PRUNE_TABLES = ("timeline_samples", "device_protocol_states")
+_PRUNE_TABLES = ("timeline_samples", "device_protocol_states", "error_aggregates")
 
 # Read surface bounds (spec §8): bounded, no arbitrary filters.
 QUERY_LIMIT_DEFAULT = 500
@@ -83,6 +83,23 @@ CODE_SCHEMA_UNSUPPORTED = "history_schema_unsupported"
 CODE_WRITE_FAILED = "history_write_failed"
 CODE_RETENTION_FAILED = "history_retention_failed"
 CODE_READ_FAILED = "history_read_failed"
+CODE_INGEST_DB_FAILED = "ingest_db_failed"
+CODE_INGEST_GAP = "ingest_gap"
+CODE_INGEST_REJECTED = "ingest_rejected"
+CODE_INGEST_STALE_READER = "ingest_stale_reader"
+
+JOURNAL_META_DEFAULTS = {
+    "journal_terminal_seq": 0,
+    "journal_last_consumed_seq": 0,
+    "journal_gaps": 0,
+    "journal_cold_starts": 0,
+    "journal_source_gaps": 0,
+    "journal_rejected_files": 0,
+    "journal_reader_cv": 0,
+    "journal_skew": 0,
+}
+ERROR_AGGREGATE_LIMIT_PER_BUCKET = 64
+JOURNAL_SKEW_SECONDS = 86400.0
 
 
 def classify_protocol(inbound, inbound_type=""):
@@ -304,6 +321,11 @@ class IncidentHistory:
         # (device, inbound) -> {"active": n, "status": s, "written_at": t}
         self._device_state = {}
         self._pending = None  # buffered (sample, rows) after a failed write
+        self._ingest_enabled = False
+        self._ingest_degraded = False
+        self._ingest_last_error_code = None
+        self._ingest_failure_count = 0
+        self._ingest_last_success_ts = None
 
     # -- public surface (NONE of these ever raise) -----------------------------
 
@@ -347,6 +369,16 @@ class IncidentHistory:
                 "failure_count": int(self._failure_count),
                 "last_error_code": self._last_error_code,
                 "run_id": self._run_id,
+                "journal_ingest": {
+                    "enabled": bool(self._ingest_enabled),
+                    "degraded": bool(self._ingest_degraded),
+                    "last_success_at": _iso(self._ingest_last_success_ts)
+                    if self._ingest_last_success_ts else None,
+                    "failure_count": int(self._ingest_failure_count),
+                    "last_error_code": self._ingest_last_error_code,
+                    "terminal_seq": self._journal_terminal_locked()
+                    if self._conn is not None and self._enabled else 0,
+                },
             }
 
     def query_timeline(self, since=None, limit=QUERY_LIMIT_DEFAULT):
@@ -393,6 +425,108 @@ class IncidentHistory:
         return {"samples": samples, "device_states": states,
                 "truncated": truncated, "limit": limit}
 
+    def journal_terminal_seq(self):
+        with self._lock:
+            return self._journal_terminal_locked()
+
+    def apply_journal_records(self, header, records, seq):
+        """Atomically apply one validated exchange file + terminal advance."""
+        with self._lock:
+            if not self._enabled or not self._ingest_enabled or self._conn is None:
+                raise _HistoryError(CODE_INGEST_DB_FAILED)
+            now = self._clock()
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                for event in records:
+                    self._upsert_error_event_locked(header, event, now)
+                self._set_meta_int_locked("journal_terminal_seq", int(seq))
+                self._set_meta_int_locked("journal_last_consumed_seq", int(seq))
+                self._set_meta_int_locked("journal_reader_cv", int(header["cv"]))
+                if header.get("boundary") == "COLD_START":
+                    self._inc_meta_locked("journal_cold_starts", 1)
+                elif header.get("boundary") == "SOURCE_GAP":
+                    self._inc_meta_locked("journal_source_gaps", 1)
+                self._conn.commit()
+            except (sqlite3.Error, OSError, ValueError, TypeError):
+                try:
+                    self._conn.rollback()
+                except sqlite3.Error:
+                    pass
+                self._mark_ingest_failure_locked(CODE_INGEST_DB_FAILED)
+                raise
+            self._mark_ingest_success_locked(now)
+
+    def apply_journal_settlement(self, kind, terminal, amount, code=None):
+        """Atomically settle gap/rejected terminal movement + counters."""
+        del code  # sanitized disposition code is intentionally not persisted
+        with self._lock:
+            if not self._enabled or not self._ingest_enabled or self._conn is None:
+                raise _HistoryError(CODE_INGEST_DB_FAILED)
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                self._set_meta_int_locked("journal_terminal_seq", int(terminal))
+                if kind == "gap":
+                    self._inc_meta_locked("journal_gaps", int(amount))
+                elif kind == "rejected":
+                    self._inc_meta_locked("journal_rejected_files", int(amount))
+                else:
+                    raise ValueError("unknown settlement")
+                self._conn.commit()
+            except (sqlite3.Error, OSError, ValueError, TypeError):
+                try:
+                    self._conn.rollback()
+                except sqlite3.Error:
+                    pass
+                self._mark_ingest_failure_locked(CODE_INGEST_DB_FAILED)
+                raise
+            if kind == "gap":
+                self._mark_ingest_failure_locked(CODE_INGEST_GAP)
+            elif kind == "rejected":
+                self._mark_ingest_failure_locked(CODE_INGEST_REJECTED)
+
+    def mark_journal_ingest_success(self):
+        with self._lock:
+            if self._ingest_enabled:
+                self._mark_ingest_success_locked(self._clock())
+
+    def mark_journal_ingest_failure(self, code):
+        with self._lock:
+            self._mark_ingest_failure_locked(code)
+
+    def query_error_summary(self, since=None, until=None, limit=QUERY_LIMIT_DEFAULT):
+        """Bounded Python-only P2 read surface; no new HTTP endpoint."""
+        limit = max(1, min(_as_int(limit, QUERY_LIMIT_DEFAULT), QUERY_LIMIT_MAX))
+        where = []
+        params = []
+        if since is not None:
+            where.append("bucket_epoch >= ?")
+            params.append(int(float(since)))
+        if until is not None:
+            where.append("bucket_epoch < ?")
+            params.append(int(float(until)))
+        sql = ("SELECT bucket_epoch,classifier_version,journal_epoch,"
+               "error_class,protocol,dest_port,dest_class,fp,first_ts,last_ts,count "
+               "FROM error_aggregates")
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += (" ORDER BY bucket_epoch DESC,classifier_version,journal_epoch,"
+                "error_class,protocol,dest_port,dest_class,fp LIMIT ?")
+        params.append(limit + 1)
+        try:
+            with self._lock:
+                if not self._enabled or not self._ingest_enabled or self._conn is None:
+                    return {"rows": [], "truncated": False, "limit": limit}
+                rows = self._conn.execute(sql, tuple(params)).fetchall()
+        except (sqlite3.Error, OSError, ValueError, TypeError):
+            self._mark_ingest_failure_locked(CODE_INGEST_DB_FAILED)
+            return {"rows": [], "truncated": False, "limit": limit}
+        cols = ("bucket_epoch", "classifier_version", "journal_epoch",
+                "error_class", "protocol", "dest_port", "dest_class", "fp",
+                "first_ts", "last_ts", "count")
+        out = [_project_rows(row, cols) for row in rows[:limit]]
+        out.reverse()
+        return {"rows": out, "truncated": len(rows) > limit, "limit": limit}
+
     def close(self):
         with self._lock:
             if self._conn is not None:
@@ -427,6 +561,7 @@ class IncidentHistory:
             raise
         self._conn = conn
         self._enabled = True
+        self._ingest_enabled = True
         if os.name == "posix":
             os.chmod(self._db_path, 0o600)
         self._last_success_ts = self._clock()
@@ -471,28 +606,16 @@ class IncidentHistory:
                 raise _HistoryError(CODE_DB_UNSAFE)
 
     def _enforce_schema(self, conn, pre_existing):
-        """STRICT schema gate -- the whole DB is opened read-only-first.
-
-        Accepted shapes are exactly two: a genuinely fresh database
-        (absent or zero-byte file, no tables) which is created at v1,
-        and an existing database that DECLARES schema_version == 1 and
-        carries the v1 tables. Everything else -- version 0, negative,
-        malformed, newer, meta-less or table-less shapes -- is refused
-        with CODE_SCHEMA_UNSUPPORTED before any pragma, DDL or write can
-        touch the file. In particular no lower version is ever silently
-        rewritten to v1: migrations are explicit and forward-only, and
-        P1 defines none.
-        """
+        """Strict forward-only schema gate: fresh/v1 -> v2, exact v2 reopen."""
         conn.execute("PRAGMA busy_timeout=%d" % BUSY_TIMEOUT_MS)
         tables = {row[0] for row in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
         if not tables:
             if pre_existing:
-                # a NON-empty pre-existing SQLite file without our schema
-                # metadata: unrelated or stripped -- never claimed as v1
                 raise _HistoryError(CODE_SCHEMA_UNSUPPORTED)
             self._apply_pragmas(conn)
             self._create_schema_v1(conn)
+            self._migrate_v1_to_v2(conn)
             return
         row = None
         if "meta" in tables:
@@ -504,16 +627,17 @@ class IncidentHistory:
         if not isinstance(raw, str) or not re.fullmatch(r"-?\d{1,9}", raw):
             raise _HistoryError(CODE_SCHEMA_UNSUPPORTED)
         version = int(raw)
-        if version != SCHEMA_VERSION:
-            # NEWER, ZERO, NEGATIVE or otherwise unknown declared
-            # version: refuse; an explicit forward-only migration is the
-            # ONLY way a future release may adopt it.
-            raise _HistoryError(CODE_SCHEMA_UNSUPPORTED)
-        if not {"timeline_samples", "device_protocol_states"} <= tables:
-            # meta CLAIMS v1 but the v1 shape is not there: unknown old
-            # shape, refuse rather than CREATE-if-not-exists adoption
+        p1 = {"timeline_samples", "device_protocol_states"}
+        if not p1 <= tables:
             raise _HistoryError(CODE_SCHEMA_UNSUPPORTED)
         self._apply_pragmas(conn)
+        if version == 1:
+            self._migrate_v1_to_v2(conn)
+            return
+        if version == SCHEMA_VERSION and "error_aggregates" in tables:
+            self._ensure_journal_meta(conn)
+            return
+        raise _HistoryError(CODE_SCHEMA_UNSUPPORTED)
 
     def _apply_pragmas(self, conn):
         conn.execute("PRAGMA journal_mode=DELETE").fetchall()
@@ -533,7 +657,7 @@ class IncidentHistory:
             " value TEXT NOT NULL)")
         conn.executemany(
             "INSERT INTO meta (key, value) VALUES (?, ?)",
-            [("schema_version", str(SCHEMA_VERSION)),
+            [("schema_version", "1"),
              ("created_at", _iso(now)),
              ("created_by_version", str(self._monitor_version))])
         conn.execute(
@@ -579,6 +703,138 @@ class IncidentHistory:
         conn.execute(
             "CREATE INDEX idx_states_device"
             " ON device_protocol_states(device, inbound, epoch)")
+
+    def _migrate_v1_to_v2(self, conn):
+        """Forward-only v1 -> v2 migration; P1 tables/rows are untouched."""
+        conn.execute(
+            "CREATE TABLE error_aggregates ("
+            " bucket_epoch INTEGER NOT NULL,"
+            " classifier_version INTEGER NOT NULL,"
+            " journal_epoch INTEGER NOT NULL,"
+            " error_class TEXT NOT NULL,"
+            " protocol TEXT NOT NULL,"
+            " dest_port INTEGER NOT NULL,"
+            " dest_class TEXT NOT NULL,"
+            " fp TEXT NOT NULL,"
+            " first_ts REAL NOT NULL,"
+            " last_ts REAL NOT NULL,"
+            " count INTEGER NOT NULL,"
+            " PRIMARY KEY (bucket_epoch,classifier_version,journal_epoch,"
+            " error_class,protocol,dest_port,dest_class,fp)"
+            ") WITHOUT ROWID")
+        self._ensure_journal_meta(conn)
+        conn.execute("UPDATE meta SET value=? WHERE key='schema_version'",
+                     (str(SCHEMA_VERSION),))
+        conn.execute("PRAGMA user_version=%d" % SCHEMA_VERSION)
+
+    def _ensure_journal_meta(self, conn):
+        conn.executemany(
+            "INSERT OR IGNORE INTO meta (key,value) VALUES (?,?)",
+            [(key, str(value)) for key, value in JOURNAL_META_DEFAULTS.items()])
+
+    def _meta_int_locked(self, key, default=0):
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        if row is None:
+            return int(default)
+        try:
+            return int(row[0])
+        except (TypeError, ValueError):
+            raise _HistoryError(CODE_SCHEMA_UNSUPPORTED)
+
+    def _set_meta_int_locked(self, key, value):
+        self._conn.execute(
+            "INSERT INTO meta(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, str(int(value))))
+
+    def _inc_meta_locked(self, key, amount):
+        self._set_meta_int_locked(
+            key, self._meta_int_locked(key, 0) + int(amount))
+
+    def _journal_terminal_locked(self):
+        if self._conn is None:
+            return 0
+        return self._meta_int_locked("journal_terminal_seq", 0)
+
+    def _mark_ingest_failure_locked(self, code):
+        self._ingest_failure_count += 1
+        self._ingest_degraded = True
+        self._ingest_last_error_code = str(code)
+
+    def _mark_ingest_success_locked(self, now):
+        self._ingest_last_success_ts = now
+        self._ingest_degraded = False
+        self._ingest_last_error_code = None
+
+    def _upsert_error_event_locked(self, header, event, now):
+        ts = float(event["ts"])
+        low = now - JOURNAL_SKEW_SECONDS
+        high = now + JOURNAL_SKEW_SECONDS
+        if ts < low:
+            ts = low
+            self._inc_meta_locked("journal_skew", 1)
+        elif ts > high:
+            ts = high
+            self._inc_meta_locked("journal_skew", 1)
+        bucket = int(ts // 60) * 60
+        cv = int(header["cv"])
+        epoch = int(header["epoch"])
+        cls = event["cls"]
+        proto = event["proto"]
+        port = int(event["port"]) if event.get("port") is not None else 0
+        dcls = event["dcls"] if event.get("dcls") is not None else "NONE"
+        fp = event["fp"] if event.get("fp") is not None else "NONE"
+        if port == 0:
+            dcls = "NONE"
+        if cls != "other":
+            fp = "NONE"
+
+        exists = self._conn.execute(
+            "SELECT 1 FROM error_aggregates WHERE "
+            "bucket_epoch=? AND classifier_version=? AND journal_epoch=? "
+            "AND error_class=? AND protocol=? AND dest_port=? "
+            "AND dest_class=? AND fp=?",
+            (bucket, cv, epoch, cls, proto, port, dcls, fp)).fetchone()
+        if exists is None:
+            count = self._conn.execute(
+                "SELECT COUNT(*) FROM error_aggregates WHERE "
+                "bucket_epoch=? AND classifier_version=? AND journal_epoch=?",
+                (bucket, cv, epoch)).fetchone()[0]
+            if count >= ERROR_AGGREGATE_LIMIT_PER_BUCKET:
+                # Collapse every existing row for this class/protocol into
+                # one sentinel row before adding more context. With only
+                # 8 classes x 3 protocols this always frees capacity.
+                prior = self._conn.execute(
+                    "SELECT COALESCE(SUM(count),0),MIN(first_ts),MAX(last_ts) "
+                    "FROM error_aggregates WHERE bucket_epoch=? AND "
+                    "classifier_version=? AND journal_epoch=? AND "
+                    "error_class=? AND protocol=?",
+                    (bucket, cv, epoch, cls, proto)).fetchone()
+                self._conn.execute(
+                    "DELETE FROM error_aggregates WHERE bucket_epoch=? AND "
+                    "classifier_version=? AND journal_epoch=? AND "
+                    "error_class=? AND protocol=?",
+                    (bucket, cv, epoch, cls, proto))
+                if prior and int(prior[0] or 0) > 0:
+                    self._conn.execute(
+                        "INSERT INTO error_aggregates VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                        (bucket, cv, epoch, cls, proto, 0, "NONE", "NONE",
+                         float(prior[1]), float(prior[2]), int(prior[0])))
+                port, dcls, fp = 0, "NONE", "NONE"
+
+        self._conn.execute(
+            "INSERT INTO error_aggregates "
+            "(bucket_epoch,classifier_version,journal_epoch,error_class,"
+            "protocol,dest_port,dest_class,fp,first_ts,last_ts,count) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(bucket_epoch,classifier_version,journal_epoch,"
+            "error_class,protocol,dest_port,dest_class,fp) DO UPDATE SET "
+            "count=count+excluded.count,"
+            "first_ts=min(first_ts,excluded.first_ts),"
+            "last_ts=max(last_ts,excluded.last_ts)",
+            (bucket, cv, epoch, cls, proto, port, dcls, fp,
+             ts, ts, int(event["n"])))
 
     # -- publish hook internals ----------------------------------------------------
 
@@ -672,6 +928,9 @@ class IncidentHistory:
             self._conn.execute(
                 "DELETE FROM device_protocol_states WHERE epoch < ?",
                 (horizon,))
+            self._conn.execute(
+                "DELETE FROM error_aggregates WHERE bucket_epoch < ?",
+                (int(horizon),))
             self._conn.commit()
             # Spec §5: time-based retention is the normal path; SIZE pruning
             # kicks in only when the HARD CEILING is crossed, and then
@@ -720,24 +979,37 @@ class IncidentHistory:
             cut = self._conn.execute(
                 "SELECT epoch FROM ("
                 " SELECT epoch FROM timeline_samples"
-                " UNION ALL"
-                " SELECT epoch FROM device_protocol_states)"
+                " UNION ALL SELECT epoch FROM device_protocol_states"
+                " UNION ALL SELECT bucket_epoch AS epoch FROM error_aggregates)"
                 " ORDER BY epoch ASC LIMIT 1 OFFSET ?",
                 (k - 1,)).fetchone()[0]
             remaining = k
             for table in _PRUNE_TABLES:       # strictly older than the cut
                 if remaining <= 0:
                     break
+                epoch_col = "bucket_epoch" if table == "error_aggregates" else "epoch"
                 cursor = self._conn.execute(
-                    "DELETE FROM %s WHERE epoch < ?" % table, (cut,))
+                    "DELETE FROM %s WHERE %s < ?" % (table, epoch_col), (cut,))
                 remaining -= max(cursor.rowcount, 0)
             for table in _PRUNE_TABLES:       # top up AT the cut epoch only
                 if remaining <= 0:
                     break
-                cursor = self._conn.execute(
-                    "DELETE FROM %s WHERE rowid IN (SELECT rowid FROM %s"
-                    " WHERE epoch = ? ORDER BY rowid ASC LIMIT ?)"
-                    % (table, table), (cut, remaining))
+                if table != "error_aggregates":
+                    cursor = self._conn.execute(
+                        "DELETE FROM %s WHERE rowid IN (SELECT rowid FROM %s"
+                        " WHERE epoch = ? ORDER BY rowid ASC LIMIT ?)"
+                        % (table, table), (cut, remaining))
+                else:
+                    cursor = self._conn.execute(
+                        "DELETE FROM error_aggregates WHERE "
+                        "(bucket_epoch,classifier_version,journal_epoch,error_class,"
+                        "protocol,dest_port,dest_class,fp) IN ("
+                        "SELECT bucket_epoch,classifier_version,journal_epoch,"
+                        "error_class,protocol,dest_port,dest_class,fp "
+                        "FROM error_aggregates WHERE bucket_epoch=? "
+                        "ORDER BY classifier_version,journal_epoch,error_class,"
+                        "protocol,dest_port,dest_class,fp LIMIT ?)",
+                        (cut, remaining))
                 remaining -= max(cursor.rowcount, 0)
             self._conn.commit()
             self._conn.execute("VACUUM")

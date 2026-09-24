@@ -243,6 +243,12 @@ export SBMON_VERSION_FILE="$FIX_SRC/VERSION"
 export SBMON_API_SECRET_SOURCE="$FIX_PROXY/monitor-api.secret"
 export SBMON_HEALTH_TIMEOUT=6
 export SBMON_STATE_DIR="$FIX_STATE"   # R1: explicit DATA ROOT contract
+export SBOXJR_FIXTURE=1
+export SBOXJR_DATA_ROOT="$FIX/var/lib/sbox-journal"
+export SBOXJR_STATE_DIR="$FIX/var/lib/sbox-journal/state"
+export SBOXJR_OUT_DIR="$FIX/var/lib/sbox-journal/out"
+export SBOXJR_LIB_DIR="$FIX/usr/local/lib/singbox-journal-reader"
+export SBOXJR_UNIT_FILE="$FIX/etc/systemd/system/singbox-journal-reader.service"
 export MOCK_CALL_LOG MOCK_SYS_STATE MOCK_ENABLED_STATE
 export MOCK_FAIL_DAEMON_RELOAD_COUNT="$TMP/mock-fail-daemon-reload-count"
 export MOCK_FAIL_IS_ACTIVE_COUNT="$TMP/mock-fail-is-active-count"
@@ -280,7 +286,8 @@ cp "$REPO_ROOT/monitor-v2/collector.py" "$FIX_SRC/"
 cp "$REPO_ROOT/monitor-v2/webapp.py" "$FIX_SRC/"
 cp -R "$REPO_ROOT/monitor-v2/web" "$FIX_SRC/web"
 cp -R "$REPO_ROOT/monitor-v2/api_bridge" "$FIX_SRC/api_bridge"
-rm -rf "$FIX_SRC/api_bridge/__pycache__" "$FIX_SRC/web/__pycache__"
+cp -R "$REPO_ROOT/monitor-v2/journal_reader" "$FIX_SRC/journal_reader"
+rm -rf "$FIX_SRC/api_bridge/__pycache__" "$FIX_SRC/web/__pycache__" "$FIX_SRC/journal_reader/__pycache__"
 # Freeze the installed baseline independently of the candidate repo version.
 printf '0.1.0\n' > "$FIX_SRC/VERSION"
 
@@ -2178,7 +2185,7 @@ else
 (
     mkdir -p "$T22/etc/systemd/system" "$T22/src"
     cp "$REPO_ROOT/monitor-v2/collector.py" "$REPO_ROOT/monitor-v2/webapp.py" "$T22/src/"
-    cp -R "$REPO_ROOT/monitor-v2/web" "$REPO_ROOT/monitor-v2/api_bridge" "$T22/src/"
+    cp -R "$REPO_ROOT/monitor-v2/web" "$REPO_ROOT/monitor-v2/api_bridge" "$REPO_ROOT/monitor-v2/journal_reader" "$T22/src/"
     rm -rf "$T22/src/api_bridge/__pycache__" "$T22/src/web/__pycache__"
     printf '0.1.1\n' > "$T22/src/VERSION"
     export SBMON_APP_LINK="$T22_APP"
@@ -2250,7 +2257,7 @@ else
 (
     mkdir -p "$T23/etc/systemd/system" "$T23/src"
     cp "$REPO_ROOT/monitor-v2/collector.py" "$REPO_ROOT/monitor-v2/webapp.py" "$T23/src/"
-    cp -R "$REPO_ROOT/monitor-v2/web" "$REPO_ROOT/monitor-v2/api_bridge" "$T23/src/"
+    cp -R "$REPO_ROOT/monitor-v2/web" "$REPO_ROOT/monitor-v2/api_bridge" "$REPO_ROOT/monitor-v2/journal_reader" "$T23/src/"
     rm -rf "$T23/src/api_bridge/__pycache__" "$T23/src/web/__pycache__"
     printf '0.1.2\n' > "$T23/src/VERSION"
     export SBMON_APP_LINK="$T23_APP"
@@ -2324,7 +2331,7 @@ else
 (
     mkdir -p "$T24/etc/systemd/system" "$T24/src"
     cp "$REPO_ROOT/monitor-v2/collector.py" "$REPO_ROOT/monitor-v2/webapp.py" "$T24/src/"
-    cp -R "$REPO_ROOT/monitor-v2/web" "$REPO_ROOT/monitor-v2/api_bridge" "$T24/src/"
+    cp -R "$REPO_ROOT/monitor-v2/web" "$REPO_ROOT/monitor-v2/api_bridge" "$REPO_ROOT/monitor-v2/journal_reader" "$T24/src/"
     rm -rf "$T24/src/api_bridge/__pycache__" "$T24/src/web/__pycache__"
     printf '0.1.3\n' > "$T24/src/VERSION"
     export SBMON_APP_LINK="$T24_APP"
@@ -2398,7 +2405,7 @@ else
 (
     mkdir -p "$T25/etc/systemd/system" "$T25/src"
     cp "$REPO_ROOT/monitor-v2/collector.py" "$REPO_ROOT/monitor-v2/webapp.py" "$T25/src/"
-    cp -R "$REPO_ROOT/monitor-v2/web" "$REPO_ROOT/monitor-v2/api_bridge" "$T25/src/"
+    cp -R "$REPO_ROOT/monitor-v2/web" "$REPO_ROOT/monitor-v2/api_bridge" "$REPO_ROOT/monitor-v2/journal_reader" "$T25/src/"
     rm -rf "$T25/src/api_bridge/__pycache__" "$T25/src/web/__pycache__"
     printf '0.1.4\n' > "$T25/src/VERSION"
     export SBMON_APP_LINK="$T25_APP"
@@ -2473,7 +2480,7 @@ else
 (
     mkdir -p "$T26/etc/systemd/system" "$T26/src"
     cp "$REPO_ROOT/monitor-v2/collector.py" "$REPO_ROOT/monitor-v2/webapp.py" "$T26/src/"
-    cp -R "$REPO_ROOT/monitor-v2/web" "$REPO_ROOT/monitor-v2/api_bridge" "$T26/src/"
+    cp -R "$REPO_ROOT/monitor-v2/web" "$REPO_ROOT/monitor-v2/api_bridge" "$REPO_ROOT/monitor-v2/journal_reader" "$T26/src/"
     rm -rf "$T26/src/api_bridge/__pycache__" "$T26/src/web/__pycache__"
     printf '0.1.5\n' > "$T26/src/VERSION"
     export SBMON_APP_LINK="$T26_APP"
