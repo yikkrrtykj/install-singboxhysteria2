@@ -216,6 +216,17 @@ assert_no_grep "$PROBE" 'PYTHONPATH=.*\$\{?' "probe never builds a PYTHONPATH of
 assert_grep "$ENV_LIB" '^[[:space:]]*PYTHONDONTWRITEBYTECODE=1$' "the shared import helper disables bytecode writing"
 assert_grep "$ENV_LIB" 'export PYTHONDONTWRITEBYTECODE' "the disable reaches the exec'd interpreter's environment"
 
+# review #54 B3: the import root must be the PHYSICAL release, never the mutable
+# live symlink. The probe canonicalized with `pwd -P` from the start; the RUNTIME
+# has to follow the same rule or a Monitor started through /opt/singbox-monitor
+# would keep importing whatever the NEXT activation flip points at -- an
+# "immutable" release whose code changes under the running process. One shared
+# derivation, canonicalized inside it, so both callers inherit the rule.
+assert_grep "$SVC" 'APP_DIR="\$\(cd -- "\$SELF_DIR/\.\." && pwd -P\)"' "monitor-service resolves APP_DIR to the physical release (pwd -P)"
+assert_no_grep "$SVC" 'APP_DIR=.*pwd\)"' "monitor-service never resolves the release root with a logical pwd"
+assert_grep "$ENV_LIB" 'root="\$\(cd -- "\$1" 2>/dev/null && pwd -P\)"' "the shared derivation canonicalizes the app dir it was handed"
+assert_grep "$ENV_LIB" 'printf .*"\$jr"' "the derivation exports only the canonicalized path (no live-link component survives)"
+
 # The libexec literal must agree between the deploy lib and the env lib: if
 # one moves, staging and importing stop describing the same tree.
 LIT_LIB="$(grep -o 'SBOXJR_RELEASE_LIBEXEC_REL="[^"]*"' "$LIB" | cut -d'"' -f2)"
@@ -341,6 +352,42 @@ if require_symlink "I1 formal release (stage + activate + link + probe)"; then
     assert_eq "$(reader_linked_id)" "$RID" "formal: reader link audit is still green AFTER the imports"
     assert_eq "$(libf sbmon_sboxjr_audit_runtime "$RELEASE/libexec/sbox-journal-reader" >/dev/null 2>&1; echo $?)" "0" \
         "formal: runtime manifest audit still passes AFTER the imports"
+
+    # -----------------------------------------------------------------------
+    # review #54 B3: launch THROUGH the live symlink and read back the import
+    # root the exec'd interpreter was actually handed. A wrapper interpreter is
+    # the only honest witness: it records PYTHONPATH and then defers to the real
+    # python, so this run's own lifecycle import check still executes for real.
+    # An APP_DIR resolved by logical pwd would export
+    # <...>/opt/singbox-monitor/libexec/sbox-journal-reader -- a path that
+    # silently follows the next activation flip.
+    # -----------------------------------------------------------------------
+    cat > "$STUB/jr-path-python3" <<'PWE'
+#!/usr/bin/env bash
+printf '%s\n' "${PYTHONPATH-<unset>}" >> "${SBMON_PYPATH_LOG:?}"
+exec "$SBMON_REAL_PYTHON3" "$@"
+PWE
+    chmod +x "$STUB/jr-path-python3"
+    : > "$TMP/pypath.log"
+    printf 'SBMON_MODE=web\nSBMON_API_URL=http://127.0.0.1:19091\nSBMON_API_SECRET_FILE=%s\nSBMON_WEB_BIND=127.0.0.1:19199\n' \
+        "$CASE_DIR/api.secret" > "$CASE_DIR/monitor-link.conf"
+    SBMON_PYPATH_LOG="$TMP/pypath.log" SBMON_REAL_PYTHON3="$PY" SBMON_PYTHON3="$STUB/jr-path-python3" \
+        timeout 8 "$SBMON_APP_LINK/bin/monitor-service" "$CASE_DIR/monitor-link.conf" "$CASE_DIR/state" \
+        > "$CASE_DIR/svc-link.log" 2>&1 || true
+    LINK_PHYS="$(cd -- "$SBMON_APP_LINK" && pwd -P)"
+    REL_PHYS="$(cd -- "$RELEASE" && pwd -P)"
+    assert_eq "$LINK_PHYS" "$REL_PHYS" "B3: precondition -- the live symlink resolves to the staged release"
+    assert_grep "$CASE_DIR/svc-link.log" 'journal_contract=available' \
+        "B3: the service really launched through the live symlink and imported its contract"
+    assert_eq "$(sort -u "$TMP/pypath.log" | wc -l | tr -d ' ')" "1" \
+        "B3: every interpreter launch of one service run shares ONE import root"
+    assert_eq "$(head -n1 "$TMP/pypath.log")" "$REL_PHYS/libexec/sbox-journal-reader" \
+        "B3: the launched process received the PHYSICAL release contract path"
+    assert_no_grep "$TMP/pypath.log" "/$(basename -- "$SBMON_APP_LINK")/" \
+        "B3: the mutable live-link path never reaches the interpreter's PYTHONPATH"
+    assert_eq "$(find "$RELEASE" -name '__pycache__' -type d | wc -l | tr -d ' ')" "0" \
+        "B3: and that symlink-launched run still wrote no bytecode into the release"
+    printf '  EVIDENCE B3 launched-via=%s recorded=%s\n' "$SBMON_APP_LINK/bin/monitor-service" "$(head -n1 "$TMP/pypath.log")"
 
     # -----------------------------------------------------------------------
     # §3.5 negatives: the gate must be the RELEASE, not luck.

@@ -163,7 +163,13 @@ MUTATING = {"sbmon_sboxjr_activation_preflight", "sbmon_sboxjr_capture_prestate"
             "sbmon_sboxjr_release_runtime_dir", "sbmon_sboxjr_unlink_runtime",
             "sbmon_sboxjr_service_stop", "sbmon_sboxjr_service_disable"}
 READONLY = {"sbmon_sboxjr_service_active", "sbmon_sboxjr_service_enabled",
-            "sbmon_sboxjr_runtime_linked_id"}
+            "sbmon_sboxjr_runtime_linked_id",
+            # review #54 B2: the rollback preflight audits the TARGET's reader
+            # runtime manifest before anything is mutated. Pure inspection
+            # (find + rc, never a link/unit/service write), so it belongs to the
+            # read-only class -- and read-only calls stay confined to
+            # status/rollback/uninstall, which is what this gate exists to keep.
+            "sbmon_sboxjr_audit_runtime"}
 ALLOWED_FNS = {"_cmd_install_locked", "_cmd_rollback_locked",
                "_cmd_uninstall_locked", "cmd_status"}
 violations = []

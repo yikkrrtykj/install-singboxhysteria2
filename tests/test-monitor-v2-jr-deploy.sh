@@ -108,7 +108,20 @@ unit=""
 for a in "$@"; do case "$a" in --*) ;; *) unit="$a" ;; esac; done
 unit="${unit%.service}"
 if [ "$op" = "daemon-reload" ]; then unit="<reload>"; fi
-printf 'systemctl %s %s\n' "$op" "$unit" >> "$MOCK_CALL_LOG"
+# Evidence for review #54 B1: record the reader runtime release resolved AT
+# CALL TIME. The link alone only proves where the symlink ended up afterwards;
+# this field proves which code a given start/restart could actually have
+# loaded, so "restore the code first, touch the process last" is checkable.
+jrlink="<none>"
+if [ -n "${SBOXJR_LIB_DIR:-}" ] && [ -L "$SBOXJR_LIB_DIR" ]; then
+  tgt="$(readlink -- "$SBOXJR_LIB_DIR" 2>/dev/null || true)"
+  case "$tgt" in
+    */libexec/sbox-journal-reader)
+      jrlink="$(basename -- "${tgt%/libexec/sbox-journal-reader}")" ;;
+    *) jrlink="foreign" ;;
+  esac
+fi
+printf 'systemctl %s %s runtime=%s\n' "$op" "$unit" "$jrlink" >> "$MOCK_CALL_LOG"
 act="$MOCK_MS/$unit.active"; ena="$MOCK_MS/$unit.enabled"
 has_now=0
 for a in "$@"; do [ "$a" = "--now" ] && has_now=1; done
@@ -385,8 +398,21 @@ jr_link_release_id() {
     t="$(readlink -- "$SBOXJR_LIB_DIR")"
     basename -- "${t%/libexec/sbox-journal-reader}"
 }
+staged_release_id() { # <installer log> -> id of the LAST staged release
+    # Includes candidates whose transaction ROLLED BACK: history is a commit
+    # record, so a failed upgrade/rollback names its candidate nowhere else.
+    sed -n 's/.*staging release: \([^ ]*\).*/\1/p' "$1" | tail -n1
+}
 history_first_id() { # id of the FIRST committed release (oldest history line)
     awk 'NR==1{print $2}' "$SBMON_RELEASES_DIR/releases.history" 2>/dev/null
+}
+# Only the state-changing reader calls, in order. is-active / is-enabled polls
+# are excluded on purpose: the restore's final restart is always followed by the
+# active-wait probe, so "last reader line" without this filter would name a
+# read-only poll instead of the last mutation.
+jr_ops() { # <logfile>
+    grep -E 'systemctl (start|restart|stop|enable|disable) singbox-journal-reader ' \
+        "$1" 2>/dev/null || true
 }
 
 # release_probe <link-or-release-dir> -> probe JSON on stdout, rc from probe.
@@ -733,6 +759,9 @@ if require_symlink "upgrade failure -> reader rollback coherence"; then
     R1="$(current_release_id)"
     printf '0.1.1\n' > "$SBMON_VERSION_FILE"
     : > "$MOCK_MS/fail_restart_once.singbox-journal-reader"
+    # The window is the FAILING transaction only: reader mutations from the
+    # earlier successful v1 install would otherwise count into these totals.
+    M="$(log_mark)"
     inst install
     [ "$LAST_RC" != "0" ] && pass "upgrb: failed upgrade refused rc=$LAST_RC" \
         || fail "upgrb: must refuse, rc=0"
@@ -744,6 +773,66 @@ if require_symlink "upgrade failure -> reader rollback coherence"; then
     assert_eq "$PRC" "0" "upgrb: the surviving release is contract-coherent (no mixed-version half-state left behind)"
     assert_eq "$(probe_field "$PJ" monitor_release_id)" "$R1" \
         "upgrb: probe confirms the restored release is the ONLY live version on both sides"
+    # --- review #54 B1: WHICH code the restore restart loaded -----------------
+    # Final symlinks can look perfect while the RUNNING process still holds the
+    # failed candidate, so the mock records the reader runtime release resolved
+    # AT THE INSTANT of every systemctl call. That is the only evidence that
+    # distinguishes "restore the code, then restart" from "restart, then
+    # repoint the symlink" -- a link-based assertion cannot see the difference.
+    # R2 is the failed CANDIDATE: history never names it (commit-record rule),
+    # so it comes from the installer's own staging line.
+    R2="$(staged_release_id "$OUT")"
+    if [ -n "$R2" ] && [ "$R2" != "$R1" ]; then
+        pass "upgrb: candidate release id resolved ($R2) and differs from the pre-transaction release ($R1)"
+    else
+        fail "upgrb: candidate release id unusable (R2='$R2' R1='$R1')"
+    fi
+    tail -n +"$((M + 1))" "$MOCK_CALL_LOG" > "$CASE_DIR/calls.all"
+    assert_eq "$(jr_ops "$CASE_DIR/calls.all" | tail -n1)" \
+        "systemctl restart singbox-journal-reader runtime=$R1" \
+        "upgrb: the LAST reader mutation is the restore restart, and the runtime link was ALREADY back on $R1 when it ran (code first, process last)"
+    assert_eq "$(jr_ops "$CASE_DIR/calls.all" | grep -c "runtime=$R1\$")" "1" \
+        "upgrb: exactly one reader mutation runs against the restored runtime"
+    assert_eq "$(jr_ops "$CASE_DIR/calls.all" | grep -c "runtime=$R2\$")" "1" \
+        "upgrb: the only reader mutation ever aimed at the candidate runtime is the failing candidate restart; the restore never restarted on N+1"
+fi
+
+if require_symlink "rollback failure -> restore restarts on the PRE-transaction runtime"; then
+    # The same bug class from the other direction. Rollback moves the reader
+    # runtime link onto the OLD release FIRST (that is where a restart would
+    # load code from), then the restart there fails, so the transaction has to
+    # put the reader back on the pre-transaction (newer) runtime. A restore that
+    # restarts before repointing the link leaves the live links on N+1 while the
+    # running process loaded N's code -- invisible to any link-based assertion,
+    # visible in the per-call runtime= field.
+    new_case rollbackb "$SRC"
+    inst install; assert_eq "$LAST_RC" "0" "rbkb: v1 install rc=0"
+    printf '0.1.1\n' > "$SBMON_VERSION_FILE"
+    inst install; assert_eq "$LAST_RC" "0" "rbkb: v2 install rc=0"
+    R2="$(current_release_id)"
+    R1="$(history_first_id)"
+    if [ -n "$R1" ] && [ "$R1" != "$R2" ]; then
+        pass "rbkb: distinct rollback target ($R1) resolved"
+    else
+        fail "rbkb: rollback target unusable (R1='$R1' R2='$R2')"
+    fi
+    H0="$(wc -l < "$SBMON_RELEASES_DIR/releases.history" | tr -d ' ')"
+    M="$(log_mark)"
+    : > "$MOCK_MS/fail_restart_once.singbox-journal-reader"
+    inst rollback "$R1"
+    [ "$LAST_RC" != "0" ] && pass "rbkb: failed reader rollback refused rc=$LAST_RC" \
+        || fail "rbkb: rollback must refuse, rc=0"
+    assert_eq "$(current_release_id)" "$R2" "rbkb: monitor live link still on the pre-rollback release"
+    assert_eq "$(jr_link_release_id)" "$R2" "rbkb: reader runtime restored to the pre-transaction release"
+    assert_eq "$(jr_state)" "active/enabled" "rbkb: reader left active+enabled"
+    tail -n +"$((M + 1))" "$MOCK_CALL_LOG" > "$CASE_DIR/calls.all"
+    assert_eq "$(jr_ops "$CASE_DIR/calls.all" | tail -n1)" \
+        "systemctl restart singbox-journal-reader runtime=$R2" \
+        "rbkb: the last reader mutation is the restore restart on the PRE-transaction runtime, not on the rollback target"
+    assert_eq "$(jr_ops "$CASE_DIR/calls.all" | grep -c "runtime=$R1\$")" "1" \
+        "rbkb: exactly one reader mutation was ever aimed at the target runtime (the failing one); restore ran elsewhere"
+    assert_eq "$(wc -l < "$SBMON_RELEASES_DIR/releases.history" | tr -d ' ')" "$H0" \
+        "rbkb: a failed rollback commits no history entry"
 fi
 
 if require_symlink "rollback keep-prestate matrix"; then
@@ -797,6 +886,63 @@ if require_symlink "rollback refusal for pre-PR-2B target"; then
         || fail "rbguard: release flipped despite the refusal"
     release_probe "$SBMON_APP_LINK" >/dev/null; assert_eq "$?" "0" \
         "rbguard: the surviving release stayed contract-coherent through the refusal"
+fi
+
+audit_probe() { # <runtime-dir> -> rc of the frozen 12+1+1 manifest audit
+    bash -c '. "$1" >/dev/null 2>&1; sbmon_sboxjr_audit_runtime "$2"' \
+        _ "$LIB" "$1" >/dev/null 2>&1
+}
+
+if require_symlink "rollback refusal for an existing-but-CORRUPT target runtime"; then
+    # review #54 B2. The target's reader runtime directory EXISTS (so the old
+    # existence-only gate waved it through) but its manifest is broken -- a
+    # missing module. Before this round the only thing that noticed was
+    # sbmon_sboxjr_converge(), i.e. AFTER Monitor had already switched the live
+    # link, restarted and rewritten its unit. The audit must run here instead.
+    new_case rbcorrupt "$SRC"
+    inst install; assert_eq "$LAST_RC" "0" "rbcorr: install rc=0"
+    printf '0.1.1\n' > "$SBMON_VERSION_FILE"
+    inst install; assert_eq "$LAST_RC" "0" "rbcorr: second install rc=0"
+    R2="$(current_release_id)"
+    R1="$(history_first_id)"
+    RT="$SBMON_RELEASES_DIR/$R1/libexec/sbox-journal-reader"
+    [ -d "$RT" ] && pass "rbcorr: target runtime directory really exists (existence gate alone would pass it)" \
+        || fail "rbcorr: precondition broken - target runtime missing"
+    audit_probe "$RT"; assert_eq "$?" "0" "rbcorr: target audit green BEFORE the corruption (harness is honest)"
+    rm -f -- "$RT/journal_reader/codes.py"
+    if audit_probe "$RT"; then
+        fail "rbcorr: the audit accepted a runtime missing a manifest module"
+    else
+        pass "rbcorr: the corruption is genuinely audit-visible (12+1+1 now fails)"
+    fi
+    H0="$(wc -l < "$SBMON_RELEASES_DIR/releases.history" | tr -d ' ')"
+    M="$(log_mark)"
+    inst rollback "$R1"
+    [ "$LAST_RC" != "0" ] && pass "rbcorr: rollback to a corrupt target refused rc=$LAST_RC" \
+        || fail "rbcorr: must refuse, rc=0"
+    assert_grep "$OUT" '未通过 12+1+1 manifest 审计' \
+        "rbcorr: refusal names the manifest audit (not a directory-existence check)"
+    assert_grep "$OUT" '未做任何变更' "rbcorr: refusal declares a zero-mutation abort"
+    tail -n +"$((M + 1))" "$MOCK_CALL_LOG" > "$CASE_DIR/calls.tail"
+    assert_no_grep "$CASE_DIR/calls.tail" 'systemctl (start|stop|restart|enable|disable|kill|daemon-reload)' \
+        "rbcorr: zero state-changing systemctl calls in the whole refusal window"
+    assert_no_grep "$OUT" '回滚: .* -> ' "rbcorr: the refusal happened before rollback even began"
+    assert_eq "$(current_release_id)" "$R2" "rbcorr: monitor live link still on the pre-rollback release"
+    assert_eq "$(jr_link_release_id)" "$R2" "rbcorr: reader live runtime still on the pre-rollback release"
+    assert_eq "$(wc -l < "$SBMON_RELEASES_DIR/releases.history" | tr -d ' ')" "$H0" \
+        "rbcorr: a refused rollback commits no history entry"
+    assert_eq "$(jr_state)" "active/enabled" "rbcorr: running reader untouched by the refusal"
+    release_probe "$SBMON_APP_LINK" >/dev/null; assert_eq "$?" "0" \
+        "rbcorr: the surviving release is still contract-coherent after the refusal"
+    # The gate must be integrity-based, not existence-based: repairing the
+    # target makes the SAME rollback succeed, so the refusal above was really
+    # about the broken manifest and not about a permanently refused code path.
+    cp -- "$ROOT/monitor-v2/journal_reader/codes.py" "$RT/journal_reader/"
+    audit_probe "$RT"; assert_eq "$?" "0" "rbcorr: repaired target audits green again"
+    inst rollback "$R1"
+    assert_eq "$LAST_RC" "0" "rbcorr: rollback proceeds once the target manifest is whole (rc=$LAST_RC)"
+    assert_eq "$(current_release_id)" "$R1" "rbcorr: repaired-target rollback moved the monitor release"
+    assert_eq "$(jr_link_release_id)" "$R1" "rbcorr: repaired-target rollback moved the reader runtime too"
 fi
 
 if require_symlink "noop re-convergence (needs stable link)"; then
