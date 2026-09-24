@@ -1563,11 +1563,13 @@ assert_eq "$(default_count)" "0" \
     "B7-A: no default ACL (grant cannot leak into state/ or onto future files)"
 assert_eq "$(setfacl_calls)" "2" \
     "B7-A: convergence is exactly clear-then-grant (setfacl -b then -m)"
-if grep '^setfacl ' "$ACLROOT/meta.log" | grep -qv -- " -- $ACLROOT/data$"; then
-    fail "B7-A: a setfacl call targeted something other than the data root"
-else
-    pass "B7-A: every setfacl call targets ONLY the data root (never state/, never out/)"
-fi
+# Counted, never probed with `-qv`: the negative control has to read every
+# setfacl line, otherwise an early-exiting grep leaves a SIGPIPE behind and
+# `set -o pipefail` turns the pipeline into a verdict grep never computed.
+off_target="$(grep '^setfacl ' "$ACLROOT/meta.log" \
+    | grep -vc -- " -- $ACLROOT/data$" || true)"
+assert_eq "$off_target" "0" \
+    "B7-A: every setfacl call targets ONLY the data root (never state/, never out/)"
 grep -Fxq "chmod 0750 $ACLROOT/data" "$ACLROOT/meta.log" \
     && pass "B7-A: base mode of the data root is still pinned at 0750 (not widened)" \
     || fail "B7-A: data root base mode changed"
@@ -1803,27 +1805,37 @@ health_run 0  && pass "B7-C: health proof accepts a proven consumer view (no fal
 
 # ---- no-widening static gate: the reader section may never buy traversal with
 # a broader mode or a broader group membership.
+#
+# These gates scan an in-memory ~48KB slice, so they test it with `case`
+# instead of `printf | grep -q`. grep -q leaves as soon as it matches; the
+# writer then dies on SIGPIPE and `set -o pipefail` turns THAT into the
+# pipeline verdict -- Linux CI proved it, the four positive gates below each
+# printed "printf: write error: Broken pipe" and then failed on text they
+# really did contain. A subprocess-free test cannot be silenced by a pipe,
+# in either direction: the absence loop below is a negative control, and a
+# verdict that depends on how the pipe drains is not a control at all.
 JR_SEC="$(awk '/^SBOXJR_USER=/{f=1} f{print}' "$LIB")"
+sec_has() { case "$JR_SEC" in *"$1"*) return 0 ;; *) return 1 ;; esac; }
 for forbidden in 'chmod 0751' 'chmod 0755' 'chmod 0757' 'chmod 0770' 'chmod 0777' \
                  'chmod a+x' 'chmod o+x' 'chmod g+w' 'setfacl -R' 'setfacl -d' \
                  'setfacl -m u:sbox-jr' 'gpasswd' 'usermod -aG "$SBMON'; do
-    if printf '%s\n' "$JR_SEC" | grep -Fq -- "$forbidden"; then
+    if sec_has "$forbidden"; then
         fail "B7-A static gate: the reader section contains a widening ('$forbidden')"
     fi
 done
 pass "B7-A static gate: zero permission-widening fallbacks in the reader section"
-printf '%s\n' "$JR_SEC" | grep -Fq -- 'chmod 0750 "$SBOXJR_DATA_ROOT"' \
+sec_has 'chmod 0750 "$SBOXJR_DATA_ROOT"' \
     && pass "B7-A static gate: the data root keeps its 0750 base pin" \
     || fail "B7-A static gate: the data root lost its 0750 base pin"
-printf '%s\n' "$JR_SEC" | grep -Fq -- 'user:$SBMON_USER:--x" -- "$SBOXJR_DATA_ROOT"' \
+sec_has 'user:$SBMON_USER:--x" -- "$SBOXJR_DATA_ROOT"' \
     && pass "B7-A static gate: the only ACL grant targets the data root" \
     || fail "B7-A static gate: the ACL grant does not target the data root"
-printf '%s\n' "$JR_SEC" | grep -Fq -- 'chmod 2750 "$SBOXJR_OUT_DIR"' \
-    && printf '%s\n' "$JR_SEC" | grep -Fq -- 'chmod 0700 "$SBOXJR_STATE_DIR"' \
+sec_has 'chmod 2750 "$SBOXJR_OUT_DIR"' \
+    && sec_has 'chmod 0700 "$SBOXJR_STATE_DIR"' \
     && pass "B7-A static gate: out stays 2750 and state stays 0700 (B7-A moved neither)" \
     || fail "B7-A static gate: the state/out mode pins moved"
-printf '%s\n' "$JR_SEC" | grep -Fq -- 'sbmon_sboxjr_consumer_probe || return 1' \
-    && printf '%s\n' "$JR_SEC" | grep -Fq -- 'sbmon_sboxjr_converge_exchange_traversal || return 1' \
+sec_has 'sbmon_sboxjr_consumer_probe || return 1' \
+    && sec_has 'sbmon_sboxjr_converge_exchange_traversal || return 1' \
     && pass "B7-A/B7-C static gate: grant and consumer proof are both wired as hard steps" \
     || fail "B7-A/B7-C static gate: a B7 step is not wired fail-closed"
 # §17 readability probe (runuser -> fake id): group present vs missing
