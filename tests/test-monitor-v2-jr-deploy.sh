@@ -139,6 +139,14 @@ case "$op" in
     fi
     exit 0 ;;
   enable)
+    if [ -f "$MOCK_MS/fail_enable.$unit" ]; then
+      # Review #54 B6 shape: the start half succeeds and only the enable
+      # transaction fails (read-only /etc, conflicting alias). The unit is
+      # RUNNING while the boot-enable fact is missing -- exactly the state a
+      # restore must quiesce before dismantling that unit's own code.
+      if [ "$has_now" = 1 ] && [ ! -f "$MOCK_MS/dead.$unit" ]; then : > "$act"; fi
+      echo "mock: enable transaction failed" >&2; exit 1
+    fi
     if [ "$has_now" = 1 ] && [ -f "$MOCK_MS/fail_start.$unit" ]; then
       : > "$ena"; echo "mock: start failed" >&2; exit 1
     fi
@@ -525,16 +533,73 @@ grep -q '^RestrictAddressFamilies=AF_UNIX$' "$RENDERED_CODE" \
 assert_no_grep "$RENDERED" 'BOX_API|api_secret' "rendered unit carries no secret surface"
 
 # ===========================================================================
-section "S2: INERT baseline (source tree without journal_reader)"
+section "S2: FORMAL install refuses a wholly-absent reader payload (B4)"
 # ===========================================================================
-new_case inert "$SRC_NOJR"
+# Review #54 B4 replaced the old "INERT install succeeds" expectation. §3 makes
+# "the release carries and imports the ingest contract" part of what a release
+# IS, so an install that ends with contract_available=false is not a success --
+# it is a mixed-version half-state reached by omission. A missing payload must
+# refuse in the same class as a partial one (S3), before ANY mutation: not even
+# the MONITOR-side layout may be created, which is why the untouched-paths
+# assertions below cover the state root too, not just the reader paths.
+new_case formal_nojr "$SRC_NOJR"
 inst install
-assert_eq "$LAST_RC" "0" "inert: install succeeds rc=0 (rc=$LAST_RC)"
-assert_grep "$OUT" 'reader INERT' "inert: loudly logged as INERT"
-[ ! -e "$SBOXJR_UNIT_FILE" ] && pass "inert: no reader unit written" || fail "inert: reader unit exists"
-[ ! -e "$SBOXJR_LIB_DIR" ] && pass "inert: no runtime link created" || fail "inert: runtime path created"
-[ ! -e "$SBOXJR_DATA_ROOT" ] && pass "inert: no data directories created" || fail "inert: data tree created"
-assert_eq "$(calls_mut_of 'singbox-journal-reader')" "0" "inert: ZERO state-changing reader calls"
+[ "$LAST_RC" != "0" ] && pass "formal-nojr: install refused rc=$LAST_RC" \
+    || fail "formal-nojr: a formal install must refuse an absent payload, got rc=0"
+assert_grep "$OUT" '源树缺少 journal_reader/ 载荷' \
+    "formal-nojr: refusal names the missing payload (not a provenance/manifest artifact)"
+assert_grep "$OUT" 'PR-2B' "formal-nojr: refusal cites the §3 release-definition rule"
+assert_grep "$OUT" '未做任何变更' "formal-nojr: refusal declares a zero-mutation abort"
+assert_no_grep "$OUT" 'staging release' "formal-nojr: refused BEFORE any staging"
+[ -z "$(ls -A "$SBMON_RELEASES_DIR" 2>/dev/null)" ] \
+    && pass "formal-nojr: releases dir untouched" || fail "formal-nojr: staging happened anyway"
+[ ! -e "$SBMON_STATE_ROOT" ] && pass "formal-nojr: no monitor state root either (refusal precedes every mutation)" \
+    || fail "formal-nojr: the monitor layout was created before the refusal"
+[ ! -e "$SBOXJR_UNIT_FILE" ] && pass "formal-nojr: no reader unit written" || fail "formal-nojr: reader unit exists"
+[ ! -e "$SBOXJR_LIB_DIR" ] && pass "formal-nojr: no runtime link created" || fail "formal-nojr: runtime path created"
+[ ! -e "$SBOXJR_DATA_ROOT" ] && pass "formal-nojr: no reader data directories created" \
+    || fail "formal-nojr: reader data tree created"
+assert_eq "$(calls_mut_of 'singbox-journal-reader')" "0" "formal-nojr: ZERO state-changing reader calls"
+# The refusal must be reachable-only-by-declaration, not by any other escape:
+# an empty-but-set value is NOT a declaration.
+new_case formal_nojr_empty "$SRC_NOJR"
+export SBMON_ALLOW_INERT_BASELINE=""
+inst install
+[ "$LAST_RC" != "0" ] && pass "formal-nojr-empty: an empty declaration does not open the inert path (rc=$LAST_RC)" \
+    || fail "formal-nojr-empty: empty SBMON_ALLOW_INERT_BASELINE must still refuse"
+unset SBMON_ALLOW_INERT_BASELINE
+
+# ===========================================================================
+section "S2b: an EXPLICITLY declared pre-PR-2B baseline still stages INERT"
+# ===========================================================================
+# The legacy shape is preserved for exactly one purpose -- modeling a pre-PR-2B
+# release (the packaging lane fixture, and the no-libexec rollback target the
+# rbguard case builds). It is now a declaration, loudly logged, never the
+# default, and the low-level staging/converge inert paths keep working for it.
+new_case declared_legacy "$SRC_NOJR"
+export SBMON_ALLOW_INERT_BASELINE=1
+inst install
+assert_eq "$LAST_RC" "0" "declared-legacy: declared baseline installs rc=0 (rc=$LAST_RC)"
+assert_grep "$OUT" 'SBMON_ALLOW_INERT_BASELINE=1' \
+    "declared-legacy: the legacy baseline is announced, not silently inert"
+assert_grep "$OUT" 'reader INERT' "declared-legacy: reader activation stays INERT"
+[ -n "$(ls -A "$SBMON_RELEASES_DIR" 2>/dev/null)" ] \
+    && pass "declared-legacy: the release itself still stages (low-level legacy path preserved)" \
+    || fail "declared-legacy: staging was refused too (the legacy staging must remain usable)"
+[ ! -e "$SBOXJR_UNIT_FILE" ] && pass "declared-legacy: no reader unit written" || fail "declared-legacy: reader unit exists"
+[ ! -e "$SBOXJR_LIB_DIR" ] && pass "declared-legacy: no runtime link created" || fail "declared-legacy: runtime path created"
+[ ! -e "$SBOXJR_DATA_ROOT" ] && pass "declared-legacy: no reader data directories created" \
+    || fail "declared-legacy: reader data tree created"
+assert_eq "$(calls_mut_of 'singbox-journal-reader')" "0" "declared-legacy: ZERO state-changing reader calls"
+unset SBMON_ALLOW_INERT_BASELINE
+# B4's whole point is that the declaration is test-only: production deploy code
+# must never be able to reach the inert path by itself. Command-position match
+# on purpose -- the lib's own diagnostics and comments NAME the variable (that
+# is how an operator learns the escape exists) without ever ASSIGNING it.
+PROD_INERT_SET="$(grep -rEn --exclude='*.md' \
+    '^[[:space:]]*(export[[:space:]]+)?SBMON_ALLOW_INERT_BASELINE=1([[:space:]]|$)' \
+    "$ROOT/monitor-v2/deploy" 2>/dev/null | cut -d: -f1 | LC_ALL=C sort -u || true)"
+assert_eq "$PROD_INERT_SET" "" "no production deploy code ever assigns the inert baseline (declaration is test-only)"
 
 # ===========================================================================
 section "S3: partial manifest source refuses BEFORE staging"
@@ -664,6 +729,60 @@ if [ -e "$SBMON_RELEASES_DIR/releases.history" ]; then
     fail "startfail: history file exists for a failed fresh install"
 else
     pass "startfail: failed candidate never entered history (commit-record rule)"
+fi
+
+# ===========================================================================
+section "S6b: post-start failure -> candidate stopped BEFORE its code is torn down (B6)"
+# ===========================================================================
+# S6/S7 both fail while the candidate never runs, so their ordering is
+# unconstrained. Review #54 B6 is the missing shape: PRE_ACTIVE=0 and the
+# candidate IS live when the transaction fails (the start half of `enable --now`
+# succeeded; only the enable transaction failed). Removing the unit file and
+# pulling the runtime link out from underneath a running process -- and stopping
+# it only afterwards -- leaves a process executing code whose provenance the
+# host no longer records.
+if require_symlink "post-start failure ordering (needs real link + rename)"; then
+    new_case poststart "$SRC"
+    : > "$MOCK_MS/fail_enable.singbox-journal-reader"
+    M="$(log_mark)"
+    inst install
+    [ "$LAST_RC" != "0" ] && pass "poststart: install refused rc=$LAST_RC" \
+        || fail "poststart: a failed enable must refuse the whole install, rc=0"
+    tail -n +"$((M + 1))" "$MOCK_CALL_LOG" > "$CASE_DIR/calls.all"
+    CAND="$(staged_release_id "$OUT")"
+    if [ -n "$CAND" ]; then pass "poststart: candidate release id resolved ($CAND)"; else fail "poststart: candidate id unusable"; fi
+    # (1) the candidate really was started by THIS transaction before it failed
+    assert_grep "$CASE_DIR/calls.all" "systemctl enable singbox-journal-reader runtime=$CAND\$" \
+        "poststart: the enable attempt ran while the runtime link already pointed at the candidate"
+    L_EN="$(grep -n 'systemctl enable singbox-journal-reader ' "$CASE_DIR/calls.all" | tail -n1 | cut -d: -f1)"
+    L_STOP="$(grep -n 'systemctl stop singbox-journal-reader ' "$CASE_DIR/calls.all" | head -n1 | cut -d: -f1)"
+    L_RELOAD="$(awk -v s="$L_EN" 'NR>s && /systemctl daemon-reload/ { print NR; exit }' "$CASE_DIR/calls.all")"
+    if [ -n "$L_STOP" ]; then
+        pass "poststart: restore stops the running candidate (recorded while its runtime link is still the candidate's)"
+    else
+        fail "poststart: no stop recorded -- the candidate would be left running"
+    fi
+    if [ -n "$L_STOP" ] && [ -n "$L_RELOAD" ] && [ "$L_STOP" -lt "$L_RELOAD" ]; then
+        pass "poststart: the stop precedes the unit/runtime teardown (stop=$L_STOP < daemon-reload=$L_RELOAD)"
+    else
+        fail "poststart: teardown preceded the stop (stop='$L_STOP' reload='$L_RELOAD') -- code dismantled under a live process"
+    fi
+    assert_eq "$(sed -n "${L_STOP}p" "$CASE_DIR/calls.all")" \
+        "systemctl stop singbox-journal-reader runtime=$CAND" \
+        "poststart: the stop names the CANDIDATE runtime, i.e. it ran before the link was pulled"
+    # (2) the prestate is restored exactly: inactive/disabled, no unit, no link
+    assert_eq "$(jr_state)" "inactive/disabled" "poststart: final state matches the inactive prestate exactly"
+    [ ! -e "$SBOXJR_UNIT_FILE" ] && pass "poststart: candidate unit removed after the stop" \
+        || fail "poststart: candidate unit survived the restore"
+    [ ! -L "$SBOXJR_LIB_DIR" ] && pass "poststart: candidate runtime link removed after the stop" \
+        || fail "poststart: runtime link survived the restore"
+    assert_eq "$(grep -c 'systemctl restart singbox-journal-reader' "$CASE_DIR/calls.all")" "0" \
+        "poststart: an inactive prestate is never restarted on anyone's code"
+    if [ -e "$SBMON_RELEASES_DIR/releases.history" ]; then
+        fail "poststart: history file exists for a failed fresh install"
+    else
+        pass "poststart: failed candidate never entered history (commit-record rule)"
+    fi
 fi
 
 # ===========================================================================
@@ -865,6 +984,63 @@ if require_symlink "rollback keep-prestate matrix"; then
     assert_no_grep "$CASE_DIR/calls.tail" 'systemctl (enable|start|restart) singbox-journal-reader' \
         "rb: inactive-but-enabled reader stays inactive (no opportunistic start)"
     assert_eq "$(jr_state)" "inactive/enabled" "rb: pre-state facts restored exactly"
+fi
+
+if require_symlink "rollback keep-prestate: active+disabled (B5) and inactive+disabled"; then
+    # The matrix had two of its four quadrants. The missing pair is the
+    # boot-DISABLED one, and it is not cosmetic: an operator who runs the reader
+    # by hand without a boot link has expressed an intent the transaction is
+    # told to preserve. Before review #54 B5 the health proof demanded `enabled`
+    # unconditionally, so active+disabled could never roll back at all -- it
+    # failed the same way every single time, no matter how healthy the target
+    # release was.
+    new_case rbdisabled "$SRC"
+    inst install; assert_eq "$LAST_RC" "0" "rbd: v1 install rc=0"
+    printf '0.1.1\n' > "$SBMON_VERSION_FILE"
+    inst install; assert_eq "$LAST_RC" "0" "rbd: v2 install rc=0"
+    R2="$(current_release_id)"
+    R1="$(history_first_id)"
+    if [ -n "$R1" ] && [ "$R1" != "$R2" ]; then
+        pass "rbd: distinct rollback target ($R1) resolved"
+    else
+        fail "rbd: rollback target unusable (R1='$R1' R2='$R2')"
+    fi
+    seed_jr_state active disabled
+    assert_eq "$(jr_state)" "active/disabled" "rbd: active+disabled prestate seeded honestly"
+    H0="$(wc -l < "$SBMON_RELEASES_DIR/releases.history" | tr -d ' ')"
+    M="$(log_mark)"
+    inst rollback "$R1"
+    assert_eq "$LAST_RC" "0" "rbd: active+disabled keep-prestate rollback succeeds (rc=$LAST_RC)"
+    tail -n +"$((M + 1))" "$MOCK_CALL_LOG" > "$CASE_DIR/calls.tail"
+    assert_no_grep "$OUT" '恢复 reader 事务前状态' \
+        "rbd: the rollback genuinely completed -- no restore path ran (a rescue-then-green would be a false pass)"
+    assert_eq "$(jr_state)" "active/disabled" \
+        "rbd: BOTH facts preserved exactly (active stays active, disabled stays disabled)"
+    assert_eq "$(grep -c 'systemctl enable singbox-journal-reader ' "$CASE_DIR/calls.tail")" "0" \
+        "rbd: no opportunistic enable behind the operator's back"
+    assert_eq "$(grep -c 'systemctl disable singbox-journal-reader ' "$CASE_DIR/calls.tail")" "0" \
+        "rbd: no opportunistic disable either"
+    assert_eq "$(grep -c 'systemctl restart singbox-journal-reader ' "$CASE_DIR/calls.tail")" "1" \
+        "rbd: the running reader restarted exactly once onto the target runtime"
+    assert_eq "$(current_release_id)" "$R1" "rbd: monitor live link converged onto the target"
+    assert_eq "$(jr_link_release_id)" "$R1" "rbd: reader runtime converged onto the SAME target release"
+    PJ="$(release_probe "$SBMON_APP_LINK")"; PRC=$?
+    assert_eq "$PRC" "0" "rbd: the rolled-back release still imports its ingest contract"
+    assert_eq "$(probe_field "$PJ" monitor_release_id)" "$R1" \
+        "rbd: the release probe agrees on the one live version"
+    assert_eq "$(wc -l < "$SBMON_RELEASES_DIR/releases.history" | tr -d ' ')" "$((H0 + 1))" \
+        "rbd: a completed rollback commits exactly one history entry"
+    # Fourth quadrant: nothing running, nothing linked at boot -- the restore may
+    # not touch the service manager at all.
+    seed_jr_state inactive disabled
+    assert_eq "$(jr_state)" "inactive/disabled" "rbd: inactive+disabled prestate seeded honestly"
+    M="$(log_mark)"
+    inst rollback "$(jr_link_release_id)"
+    assert_eq "$LAST_RC" "0" "rbd: inactive+disabled rollback rc=0 (rc=$LAST_RC)"
+    tail -n +"$((M + 1))" "$MOCK_CALL_LOG" > "$CASE_DIR/calls.tail"
+    assert_no_grep "$CASE_DIR/calls.tail" 'systemctl (enable|start|restart|stop) singbox-journal-reader' \
+        "rbd: inactive+disabled reader touched no service state at all"
+    assert_eq "$(jr_state)" "inactive/disabled" "rbd: inactive+disabled preserved exactly"
 fi
 
 if require_symlink "rollback refusal for pre-PR-2B target"; then
