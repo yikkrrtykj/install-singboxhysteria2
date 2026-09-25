@@ -286,6 +286,72 @@ cat > "$META/chmod" <<'SME'
 printf 'chmod %s %s\n' "$1" "$2" >> "$JR_META_LOG"
 exit 0
 SME
+# Recording POSIX-ACL pair with a tiny faithful model (B7-A). Entries are
+# stored per-path under $JR_ACL_DIR, so the library's shape prover reads back
+# exactly what was written and the base-mode lines mirror a 0750 directory:
+# no mask line until a named entry exists, and a named entry adds mask::r-x.
+# The real permission semantics are the root Linux discriminator lane's job;
+# this model exists so the CALL SEQUENCE, the idempotent zero-mutation early
+# return and the divergent-shape repair are asserted, not assumed.
+cat > "$META/setfacl" <<'SME'
+#!/usr/bin/env bash
+printf 'setfacl %s\n' "$*" >> "${JR_META_LOG:-/dev/null}"
+aclstore() { printf '%s/%s\n' "${JR_ACL_DIR:-/tmp/jr-acl}" \
+    "$(printf '%s' "$1" | tr -c 'A-Za-z0-9' '_')"; }
+mode="" spec="" path=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -b) mode=clear ;;
+        -m) shift; mode=add; spec="$1" ;;
+        --) ;;
+        *) path="$1" ;;
+    esac
+    shift
+done
+[ -n "$path" ] || exit 2
+[ -e "$path" ] || exit 2
+mkdir -p "${JR_ACL_DIR:-/tmp/jr-acl}" || exit 1
+f="$(aclstore "$path")"
+[ -f "$f" ] || : > "$f"
+if [ "$mode" = clear ]; then
+    : > "$f"
+elif [ "$mode" = add ]; then
+    printf '%s\n' "$spec" >> "$f"
+else
+    exit 2
+fi
+exit 0
+SME
+cat > "$META/getfacl" <<'SME'
+#!/usr/bin/env bash
+path=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --) ;;
+        -*) ;;
+        *) path="$1" ;;
+    esac
+    shift
+done
+[ -n "$path" ] || exit 2
+# Raw-text override so a negative shape test can present an ACL text the tiny
+# entry model cannot produce (a masked-away grant, a world-traversable other
+# class). Only consulted when non-empty: an exported-but-empty variable must
+# not silently replace the model.
+if [ -n "${JR_ACL_RAW:-}" ]; then
+    printf '%s\n' "$JR_ACL_RAW"
+    exit 0
+fi
+[ -e "$path" ] || { printf 'getfacl: %s: No such file or directory\n' "$path" >&2; exit 1; }
+f="${JR_ACL_DIR:-/tmp/jr-acl}/$(printf '%s' "$path" | tr -c 'A-Za-z0-9' '_')"
+printf '# file: %s\n# owner: root\n# group: sbox-jr\n' "$path"
+printf 'user::rwx\n'
+[ -f "$f" ] && cat -- "$f"
+printf 'group::r-x\n'
+[ -s "$f" ] && printf 'mask::r-x\n'
+printf 'other::---\n'
+exit 0
+SME
 chmod +x "$STUB"/* "$META"/* 2>/dev/null || true
 
 # flock shim (same policy as the packaging suite)
@@ -1410,10 +1476,11 @@ grep -q 'useradd .*--system' "$JRDB/mutlog" \
     || fail "validate: rejects its own creation (contract broken)"
 
 # §4 data-tree metadata contract via recording chown/chmod
-TREED="$TMP/tree"; mkdir -p "$TREED"
+TREED="$TMP/tree"; mkdir -p "$TREED" "$TREED/acl"
 ( export SBMON_FIXTURE=0 PATH="$META:$STUB:$PATH" JR_META_LOG="$TREED/meta.log" \
       SBOXJR_DATA_ROOT="$TREED/data" SBOXJR_USER=sbox-jr SBOXJR_GROUP=sbox-jr \
-      SBMON_GROUP=sboxweb SBMON_SYSTEMD_ANALYZE="$STUB/systemd-analyze-mock" \
+      SBMON_GROUP=sboxweb SBMON_USER=sboxweb JR_ACL_DIR="$TREED/acl" \
+      SBMON_SYSTEMD_ANALYZE="$STUB/systemd-analyze-mock" \
       JRDB="$JRDB"
   bash -c '. "$1" >/dev/null 2>&1; sbmon_sboxjr_ensure_data_tree' _ "$LIB" ) \
     && pass "tree: ensure_data_tree rc=0 (stubs)" || fail "tree: ensure_data_tree failed"
@@ -1422,9 +1489,19 @@ chmod 0750 $TREED/data
 chown sbox-jr:sbox-jr $TREED/data/state
 chmod 0700 $TREED/data/state
 chown sbox-jr:sboxweb $TREED/data/out
-chmod 2750 $TREED/data/out"
+chmod 2750 $TREED/data/out
+setfacl -b -- $TREED/data
+chmod 0750 $TREED/data
+setfacl -m user:sboxweb:--x -- $TREED/data"
+# The second chmod 0750 is B7-R2's, and its POSITION is the contract: setfacl -b
+# writes the ACL's base entries back into the file mode, so a drifted owning-group
+# entry leaves -b restoring a drifted mode. The base must be re-pinned after the
+# clear and before the grant -- not instead of the first pin, which is what the
+# tree's other two children are pinned by too.
+assert_eq "$(grep -c "^chmod 0750 $TREED/data$" "$TREED/meta.log" || true)" "2" \
+    "tree: exactly two 0750 pins (tree-level, then the post-clear re-pin) and no other mode"
 assert_eq "$(cat "$TREED/meta.log")" "$EXPECTED_META" \
-    "tree: EXACT chown/chmod sequence (root:sbox-jr 0750 / state 0700 / out 2750 setgid, in order)"
+    "tree: EXACT chown/chmod/ACL sequence (root:sbox-jr 0750 / state 0700 / out 2750 setgid, base pinned BEFORE the --x grant, in order)"
 # non-dir refusal BEFORE any metadata mutation
 ND="$TMP/nondir"; mkdir -p "$ND"; printf 'x' > "$ND/data"
 ( export SBMON_FIXTURE=0 PATH="$META:$STUB:$PATH" JR_META_LOG="$ND/meta.log" \
@@ -1449,6 +1526,501 @@ else
     skip "tree: symlinked data-root refusal"
 fi
 
+
+# ===========================================================================
+section "S12b: B7-A exchange traversal grant (exact shape, idempotent repair)"
+# ===========================================================================
+# The grant is a POSIX ACL; the tiny setfacl/getfacl model above makes the
+# CALL SEQUENCE and the SHAPE PROVER assertable on every platform. Real
+# permission semantics -- does sboxweb actually traverse the root, actually
+# get EACCES on state/ -- belong to the root Linux lane
+# tests/journal-reader/test-jr-exchange-access.sh, which has no skip path.
+ACLROOT="$TMP/aclroot"; mkdir -p "$ACLROOT/acl" "$ACLROOT/jrdb"
+: > "$ACLROOT/meta.log"
+# Exported so the harness's OWN direct setfacl/getfacl calls (divergence
+# injection, readback) share the model store with the library under test.
+export JR_ACL_DIR="$ACLROOT/acl"
+acl_do() { # <lib fn> [args...] -> rc (metadata appended to $ACLROOT/meta.log)
+    ( export SBMON_FIXTURE=0 PATH="$META:$STUB:$PATH" JR_META_LOG="$ACLROOT/meta.log" \
+          SBOXJR_DATA_ROOT="$ACLROOT/data" SBOXJR_STATE_DIR="$ACLROOT/data/state" \
+          SBOXJR_OUT_DIR="$ACLROOT/data/out" SBOXJR_USER=sbox-jr SBOXJR_GROUP=sbox-jr \
+          SBMON_GROUP=sboxweb SBMON_USER=sboxweb JR_ACL_DIR="$ACLROOT/acl" \
+          JR_ACL_RAW="${JR_ACL_RAW-}" \
+          SBOXJR_SETFACL="${SBOXJR_SETFACL:-setfacl}" SBOXJR_GETFACL="${SBOXJR_GETFACL:-getfacl}" \
+          SBOXJR_RUNUSER="$STUB/runuser" SBMON_REPO_MONITOR_DIR="$ROOT/monitor-v2" \
+          SBMON_SYSTEMD_ANALYZE="$STUB/systemd-analyze-mock" JRDB="$ACLROOT/jrdb"
+      bash -c '. "$1" >/dev/null 2>&1; shift; "$@"' _ "$LIB" "$@" ) >/dev/null 2>&1
+}
+meta_lines() { wc -l < "$ACLROOT/meta.log" | tr -d ' '; }
+setfacl_calls() { grep -c '^setfacl ' "$ACLROOT/meta.log" || true; }
+root_acl() { "$META/getfacl" -- "$ACLROOT/data"; }
+root_grants() { root_acl | grep '^user:[^:][^:]*:' || true; }
+grant_count() { root_grants | grep -c . || true; }
+# Counted, not probed with `grep -q`: -q exits on the first match, and the
+# writer's resulting SIGPIPE can make the pipeline report a verdict grep never
+# gave. Same reason the library's own shape prover counts.
+default_count() { root_acl | grep -c '^default:' || true; }
+# The contract's canonical access-ACL set, spelled HERE, independently of the
+# library: five entries and nothing else. Sorted on both sides, because the
+# proof is about the SET -- a check that leaned on line order would be a check
+# of getfacl's formatting, and a widened tree could hide in the ordering.
+canon_acl_set() {
+    printf '%s\n' 'group::r-x' 'mask::r-x' 'other::---' \
+        'user::rwx' 'user:sboxweb:--x' | LC_ALL=C sort
+}
+root_acl_set() {
+    root_acl | sed -e 's/#effective:.*$//' -e 's/[[:space:]]*$//' \
+        | grep -v '^#' | grep -v '^$' | LC_ALL=C sort || true
+}
+
+acl_do sbmon_sboxjr_ensure_data_tree \
+    && pass "B7-A: data-tree run converges the grant (rc 0)" \
+    || fail "B7-A: ensure_data_tree refused while the acl tools are present"
+assert_eq "$(canon_acl_set)" "$(root_acl_set)" \
+    "B7-A: the converged root carries EXACTLY the canonical ACL set"
+assert_eq "$(grant_count)" "1" "B7-A: exactly ONE named ACL entry on the data root"
+assert_eq "$(root_grants)" "user:sboxweb:--x" \
+    "B7-A: the single grant is exactly user:\$SBMON_USER:--x (a search bit, nothing more)"
+assert_eq "$(default_count)" "0" \
+    "B7-A: no default ACL (grant cannot leak into state/ or onto future files)"
+assert_eq "$(setfacl_calls)" "2" \
+    "B7-A: convergence is exactly clear-then-grant (setfacl -b then -m)"
+# Counted, never probed with `-qv`: the negative control has to read every
+# setfacl line, otherwise an early-exiting grep leaves a SIGPIPE behind and
+# `set -o pipefail` turns the pipeline into a verdict grep never computed.
+off_target="$(grep '^setfacl ' "$ACLROOT/meta.log" \
+    | grep -vc -- " -- $ACLROOT/data$" || true)"
+assert_eq "$off_target" "0" \
+    "B7-A: every setfacl call targets ONLY the data root (never state/, never out/)"
+grep -Fxq "chmod 0750 $ACLROOT/data" "$ACLROOT/meta.log" \
+    && pass "B7-A: base mode of the data root is still pinned at 0750 (not widened)" \
+    || fail "B7-A: data root base mode changed"
+
+# ---- idempotency: a second run on the already-correct shape mutates NOTHING
+before="$(setfacl_calls)"
+acl_do sbmon_sboxjr_converge_exchange_traversal \
+    && pass "B7-A: second convergence run rc 0" || fail "B7-A: repeat run refused its own output"
+assert_eq "$(setfacl_calls)" "$before" \
+    "B7-A: an already-shaped root takes the ZERO-mutation early return (idempotent)"
+
+# ---- divergent-shape repair, driven through the same setfacl interface
+"$META/setfacl" -b -- "$ACLROOT/data" >/dev/null 2>&1
+"$META/setfacl" -m 'user:sboxweb:r-x' -- "$ACLROOT/data" >/dev/null 2>&1
+"$META/setfacl" -m 'default:group::rwx' -- "$ACLROOT/data" >/dev/null 2>&1
+assert_eq "$(root_grants)" "user:sboxweb:r-x" \
+    "B7-A: divergence injected -- an over-granted root (listing included)"
+assert_eq "$(default_count)" "1" \
+    "B7-A: divergence injected -- a leftover default ACL"
+before="$(setfacl_calls)"
+acl_do sbmon_sboxjr_converge_exchange_traversal \
+    || fail "B7-A: repair of a divergent root refused"
+assert_eq "$(root_grants)" "user:sboxweb:--x" \
+    "B7-A: an over-granted root (r-x) is repaired DOWN to exactly --x"
+assert_eq "$(default_count)" "0" \
+    "B7-A: leftover default ACL removed by repair"
+assert_eq "$(( $(setfacl_calls) - before ))" "2" \
+    "B7-A: the repair path issues exactly one clear + one grant"
+assert_eq "$(canon_acl_set)" "$(root_acl_set)" \
+    "B7-A: the repaired root carries the canonical set again (not merely one named user)"
+
+# ---- B7-R2: a NAMED GROUP is the entry class the subset predicates let
+# through. Injected through the same setfacl interface, repaired through the
+# same convergence, and refused on its own merit -- not because it changed a
+# count, and not because of what it happens to grant this identity today.
+"$META/setfacl" -m "group:sboxweb:r-x" -- "$ACLROOT/data" >/dev/null 2>&1
+acl_do sbmon_sboxjr_exchange_traversal_shape "$ACLROOT/data" \
+    && fail "B7-A: the prover accepted a named group:sboxweb:r-x entry (B7-R2 hole)" \
+    || pass "B7-R2: the exact-set prover refuses a second, named-group grant path"
+if [ "$(root_acl_set)" = "$(canon_acl_set)" ]; then
+    fail "B7-R2: the injected named group did not even change the observed set (vacuous test)"
+else
+    pass "B7-R2: control -- the injected named group really is present in the read-back"
+fi
+acl_do sbmon_sboxjr_converge_exchange_traversal \
+    || fail "B7-R2: convergence refused to repair the named-group widening"
+assert_eq "$(canon_acl_set)" "$(root_acl_set)" \
+    "B7-R2: convergence removed the named group and restored the canonical set"
+assert_eq 0 "$(root_acl | grep -c '^group:[^:]' || true)" \
+    "B7-R2: zero named-group entries survive on the data root"
+
+# ---- the shape prover refuses every widening, individually
+shape_of() { JR_ACL_RAW="$1" acl_do sbmon_sboxjr_exchange_traversal_shape "$ACLROOT/data"; }
+shape_of 'user::rwx
+user:sboxweb:--x
+group::r-x
+mask::r-x
+other::---' && pass "B7-A: shape prover accepts the target shape" \
+    || fail "B7-A: shape prover refused its own converged shape"
+# The same five entries in a different ORDER must STILL be accepted: the proof
+# is a set equality, so it cannot be an accident of how getfacl formats output.
+shape_of 'other::---
+mask::r-x
+group::r-x
+user:sboxweb:--x
+user::rwx' && pass "B7-R2: the prover is set-based (a reordered canonical dump is accepted)" \
+    || fail "B7-R2: the prover depends on entry order instead of the entry set"
+for bad in \
+    'user::rwx
+user:sboxweb:r-x
+group::r-x
+mask::r-x
+other::---|listing of the reader data root would be granted' \
+    'user::rwx
+user:sboxweb:--x
+user:intruder:--x
+group::r-x
+mask::r-x
+other::---|more than one named user' \
+    'user::rwx
+user:sboxweb:--x
+default:user:sboxweb:--x
+group::r-x
+mask::r-x
+other::---|default ACL present' \
+    'user::rwx
+user:sboxweb:--x
+group::r-x
+mask::---
+other::---|grant masked away to nothing' \
+    'user::rwx
+user:sboxweb:--x
+group::r-x
+mask::r-x
+other::r-x|world-traversable reader data root' \
+    'user::rwx
+user:sboxweb:rwx
+group::r-x
+mask::rwx
+other::---|read+write grant on the reader data root' \
+    'user::rwx
+user:sboxweb:--x
+group::r-x
+group:sboxweb:r-x
+mask::r-x
+other::---|B7-R2: a second, named-group grant path' \
+    'user::rwx
+user:sboxweb:--x
+group::r-x
+group:sbox-jr:r-x
+mask::r-x
+other::---|B7-R2: a named group the consumer does not hold is still a widening' \
+    'user::rwx
+user:sboxweb:--x
+group::r-x
+mask::rwx
+other::---|B7-R2: mask widened to rwx (a listing bit becomes grantable)' \
+    'user::rwx
+user:sboxweb:--x
+group::r--
+mask::r-x
+other::---|B7-R2: owning-group entry drifted off the canonical r-x' \
+    'user::r-x
+user:sboxweb:--x
+group::r-x
+mask::r-x
+other::---|B7-R2: owner entry drifted -- the base is 0750, not 0550' \
+    'user::rwx
+user:sboxweb:--x
+group::r-x
+mask::r-x
+other::--x|B7-R2: world traversal granted instead of a closed other class' \
+    'user::rwx
+user:sboxweb:--x
+user:sboxweb:--x
+group::r-x
+mask::r-x
+other::---|B7-R2: a duplicated entry is not one entry' \
+    'user::rwx
+group::r-x
+other::---|production 0.3.0 shape: no grant at all' ; do
+    text="${bad%|*}"; why="${bad##*|}"
+    if shape_of "$text"; then
+        fail "B7-A: shape prover ACCEPTED a bad shape ($why)"
+    else
+        pass "B7-A: shape prover refuses ($why)"
+    fi
+done
+# NEGATIVE/POSITIVE CONTROL on the model: the exact 0.3.0 shape (no ACL at
+# all) must not satisfy the prover, and the SAME directory must satisfy it
+# only after convergence -- the grant, not a widened base mode, flips the
+# verdict.
+"$META/setfacl" -b -- "$ACLROOT/data" >/dev/null 2>&1
+if shape_of "$(root_acl | grep -v '^#')"; then
+    fail "B7-A: the production 0.3.0 shape (0750, no ACL) still satisfies the prover"
+else
+    pass "B7-A: NEGATIVE CONTROL -- the 0.3.0 no-ACL shape is refused by the prover"
+fi
+acl_do sbmon_sboxjr_converge_exchange_traversal >/dev/null 2>&1
+if shape_of "$(root_acl | grep -v '^#')"; then
+    pass "B7-A: POSITIVE CONTROL -- the same directory passes only after convergence"
+else
+    fail "B7-A: convergence did not produce a satisfying shape"
+fi
+# A converged root keeps its 0750 base: shape and base pin hold together, so
+# the grant was not paid for with a mode widening.
+# Counted, not pinned to one occurrence: convergence re-pins the contract base
+# after setfacl -b, so a repair run legitimately writes the pin more than once.
+# What may NEVER appear is a chmod of the data root at any other mode -- that is
+# the widening this suite exists to refuse, whatever its call count is.
+pinned="$(grep -c "^chmod 0750 $ACLROOT/data$" "$ACLROOT/meta.log" || true)"
+wrong="$(grep '^chmod ' "$ACLROOT/meta.log" | grep -v "^chmod 0750 $ACLROOT/data\$" \
+    | grep -c " $ACLROOT/data\$" || true)"
+assert_eq 0 "$wrong" \
+    "B7-A: shape holds and EVERY chmod of the data root is 0750 (ACL is the only delta)"
+if [ "$pinned" -ge 1 ]; then
+    pass "B7-A: the data root base pin was really written ($pinned chmod 0750 calls)"
+else
+    fail "B7-A: no chmod 0750 of the data root was ever issued"
+fi
+
+# ---- missing acl tools: fail closed, never widen
+before="$(meta_lines)"
+SBOXJR_SETFACL="$TMP/definitely-not-setfacl" acl_do sbmon_sboxjr_converge_exchange_traversal \
+    && fail "B7-A: missing setfacl silently passed (a chmod-widening fallback is forbidden)" \
+    || pass "B7-A: missing acl tools refuse the convergence (fail-closed, no widening fallback)"
+assert_eq "$(meta_lines)" "$before" \
+    "B7-A: missing acl tools caused ZERO metadata calls"
+acl_do sbmon_sboxjr_activation_preflight \
+    && pass "B7-A: activation preflight accepts a host that has the acl tools" \
+    || fail "B7-A: preflight refused a host with every tool present"
+before="$(meta_lines)"
+SBOXJR_SETFACL="$TMP/definitely-not-setfacl" acl_do sbmon_sboxjr_activation_preflight \
+    && fail "B7-A: activation preflight accepted a host without acl tools" \
+    || pass "B7-A: activation preflight refuses missing acl tools BEFORE any mutation"
+assert_eq "$(meta_lines)" "$before" \
+    "B7-A: the preflight refusal caused ZERO metadata calls"
+
+# ===========================================================================
+section "S12c: B7-C consumer-side probe (Monitor identity reaches the exchange)"
+# ===========================================================================
+# runuser is a stub here: what is asserted is the verdict mapping, the
+# fail-closed contract, the identity the walk runs as, and the wiring into the
+# activation health proof. Which exit code a REAL consumer walk produces on
+# which permission shape is the root Linux lane's contract.
+cat > "$STUB/rc-runuser" <<'SME'
+#!/usr/bin/env bash
+# runuser -u NAME -- cmd... -> log the identity, then answer.
+# `id -nG` (the reader-side probe) reports $JR_PROBE_GROUPS; the consumer-side
+# exchange walk returns the scripted verdict $JR_PROBE_RC.
+[ "$1" = "-u" ] || exit 2
+printf 'runuser -u %s\n' "$2" >> "${JR_PROBE_LOG:-/dev/null}"
+[ "$2" = "${SBMON_USER:-sboxweb}" ] || [ "$2" = "${SBOXJR_USER:-sbox-jr}" ] || exit 3
+shift 3
+if [ "$(basename -- "$1")" = "id" ]; then
+    printf '%s\n' "${JR_PROBE_GROUPS:-sbox-jr systemd-journal}"
+    exit 0
+fi
+exit "${JR_PROBE_RC:-0}"
+SME
+cat > "$STUB/walk-runuser" <<'SME'
+#!/usr/bin/env bash
+# runuser -u NAME -- /bin/sh -c SCRIPT sh ARGS... -> execute the probe script
+# as the CURRENT identity. This is NOT a credential switch, so it proves only
+# that the script parses, runs and terminates inside its own exit-code
+# contract; the verdict is whatever this identity really sees.
+[ "$1" = "-u" ] || exit 2
+[ "$3" = "--" ] || exit 4
+shift 3
+case "$1" in */sh|sh|/bin/sh) ;; *) exit 5 ;; esac
+script="$3"; shift 5
+printf '%s' "$script" | sh -s -- "$@"
+SME
+chmod +x "$STUB/rc-runuser" "$STUB/walk-runuser"
+
+probe_run() { # <JR_PROBE_RC> -> library verdict rc
+    ( export SBMON_FIXTURE=0 PATH="$META:$STUB:$PATH" \
+          SBOXJR_DATA_ROOT="$ACLROOT/data" SBOXJR_STATE_DIR="$ACLROOT/data/state" \
+          SBOXJR_OUT_DIR="$ACLROOT/data/out" SBOXJR_USER=sbox-jr SBOXJR_GROUP=sbox-jr \
+          SBMON_GROUP=sboxweb SBMON_USER=sboxweb \
+          SBOXJR_RUNUSER="$STUB/rc-runuser" JR_PROBE_RC="$1" \
+          JR_PROBE_LOG="$ACLROOT/probe.log"
+      bash -c '. "$1" >/dev/null 2>&1; sbmon_sboxjr_consumer_probe' _ "$LIB" ) >/dev/null 2>&1
+}
+: > "$ACLROOT/probe.log"
+probe_run 0 && pass "B7-C: consumer probe accepts a reachable exchange (rc 0)" \
+            || fail "B7-C: a healthy consumer view was refused"
+assert_eq "$(cat "$ACLROOT/probe.log")" "runuser -u sboxweb" \
+    "B7-C: the exchange walk really runs AS the Monitor identity, not as root"
+for rc in 11 12 13 14 15 16 17 18 1 99; do
+    probe_run "$rc" && fail "B7-C: probe exit $rc was accepted" \
+                    || pass "B7-C: probe exit $rc fails the activation closed"
+done
+# The widening gets its OWN diagnosis: an operator reading a refused activation
+# must be able to tell "no traversal" (the 0.3.0 defect) from "over-granted:
+# the consumer can list the reader data root" (a contract violation in the
+# other direction), and neither message may leak content.
+# Substring test without a subprocess and without a pipe: a diagnosis check
+# that runs through `grep -q` can be decided by SIGPIPE instead of by the text.
+log_has() { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
+probe_msg() { # <JR_PROBE_RC> -> the library's diagnosis for that verdict
+    ( export SBMON_FIXTURE=0 PATH="$META:$STUB:$PATH" \
+          SBOXJR_DATA_ROOT="$ACLROOT/data" SBOXJR_STATE_DIR="$ACLROOT/data/state" \
+          SBOXJR_OUT_DIR="$ACLROOT/data/out" SBOXJR_USER=sbox-jr SBOXJR_GROUP=sbox-jr \
+          SBMON_GROUP=sboxweb SBMON_USER=sboxweb \
+          SBOXJR_RUNUSER="$STUB/rc-runuser" JR_PROBE_RC="$1" \
+          JR_PROBE_LOG="$ACLROOT/probe.log"
+      bash -c '. "$1" >/dev/null 2>&1; sbmon_sboxjr_consumer_probe' _ "$LIB" ) 2>&1
+}
+M11="$(probe_msg 11)"; M18="$(probe_msg 18)"; M13="$(probe_msg 13)"
+log_has "$M11" "无法遍历" \
+    && pass "B7-C: exit 11 diagnoses a MISSING traversal right (the production defect)" \
+    || fail "B7-C: exit 11 no longer names the traversal refusal: $M11"
+log_has "$M18" "可枚举" \
+    && pass "B7-C: exit 18 diagnoses an OVER-GRANTED root (enumerable data root)" \
+    || fail "B7-C: exit 18 does not name the enumeration widening: $M18"
+if [ "$M11" = "$M18" ] || [ "$M13" = "$M18" ]; then
+    fail "B7-C: two different refusals share one diagnosis (production cannot tell them apart)"
+else
+    pass "B7-C: 11 / 13 / 18 are three distinct diagnoses"
+fi
+( export SBMON_FIXTURE=0 PATH="$META:$STUB:$PATH" SBMON_USER=sboxweb \
+      SBOXJR_RUNUSER="$TMP/definitely-not-runuser" \
+      SBOXJR_DATA_ROOT="$ACLROOT/data" SBOXJR_STATE_DIR="$ACLROOT/data/state" \
+      SBOXJR_OUT_DIR="$ACLROOT/data/out"
+  bash -c '. "$1" >/dev/null 2>&1; sbmon_sboxjr_consumer_probe' _ "$LIB" ) 2>/dev/null \
+    && fail "B7-C: absent runuser silently passed the consumer proof" \
+    || pass "B7-C: absent runuser is fail-closed (an unproven activation never goes green)"
+before="$(meta_lines)"
+probe_run 0 >/dev/null 2>&1
+assert_eq "$(meta_lines)" "$before" \
+    "B7-C: the consumer probe is read-only (ZERO metadata mutations)"
+
+# The probe script is a real walk, not a tautology: executed as this identity
+# against this fixture tree it can enumerate the data root and read state/, so
+# it must terminate on its own guard rather than report success -- and the guard
+# it trips has to be the FIRST one in the walk (B7-R2's root-enumeration
+# refusal), because an exit code that only proves "not zero" would also be
+# produced by a script that died on line one.
+walk_rc=0
+walk_out="$( export SBMON_FIXTURE=0 PATH="$META:$STUB:$PATH" SBMON_USER="$(id -un)" \
+      SBOXJR_RUNUSER="$STUB/walk-runuser" \
+      SBOXJR_DATA_ROOT="$ACLROOT/data" SBOXJR_STATE_DIR="$ACLROOT/data/state" \
+      SBOXJR_OUT_DIR="$ACLROOT/data/out"; \
+  bash -c '. "$1" >/dev/null 2>&1; sbmon_sboxjr_consumer_probe' _ "$LIB" 2>&1 )" || walk_rc=$?
+if [ "$walk_rc" != "0" ] && log_has "$walk_out" "可枚举"; then
+    pass "B7-C: the real walk refused on the data-root enumeration guard (not a generic failure)"
+else
+    fail "B7-C: the walk did not refuse an enumerable data root (rc=$walk_rc out=$walk_out)"
+fi
+( export SBMON_FIXTURE=1 SBMON_USER=sboxweb \
+      SBOXJR_DATA_ROOT="$ACLROOT/data" SBOXJR_STATE_DIR="$ACLROOT/data/state" \
+      SBOXJR_OUT_DIR="$ACLROOT/data/out"
+  bash -c '. "$1" >/dev/null 2>&1; sbmon_sboxjr_consumer_probe' _ "$LIB" ) 2>/dev/null \
+    && pass "B7-C: fixture mode degrades the consumer probe loudly (documented platform rule)" \
+    || fail "B7-C: fixture run broke"
+
+# ---- the wiring: a refused consumer view must fail the activation proof
+seed_jr_identity() {
+    mkdir -p "$ACLROOT/jrdb" "$ACLROOT/mockstate"; : > "$ACLROOT/calls.log"
+    touch "$ACLROOT/mockstate/singbox-journal-reader.active" \
+          "$ACLROOT/mockstate/singbox-journal-reader.enabled"
+    printf 'sbox-jr:x:998:998::/nonexistent:/usr/sbin/nologin\n' > "$ACLROOT/jrdb/passwd.sbox-jr"
+    printf 'sbox-jr:x:998:\n' > "$ACLROOT/jrdb/group.sbox-jr"
+    printf 'systemd-journal:x:997:\n' > "$ACLROOT/jrdb/group.systemd-journal"
+    printf 'sbox-jr\nsystemd-journal\n' > "$ACLROOT/jrdb/members.sbox-jr"
+}
+health_run() { # <JR_PROBE_RC> -> activation health proof rc, everything else healthy
+    ( export SBMON_FIXTURE=0 PATH="$META:$STUB:$PATH" \
+          MOCK_MS="$ACLROOT/mockstate" MOCK_CALL_LOG="$ACLROOT/calls.log" \
+          SBMON_SYSTEMCTL="$STUB/systemctl-mock" \
+          SBOXJR_SERVICE_NAME=singbox-journal-reader \
+          SBOXJR_DATA_ROOT="$ACLROOT/data" SBOXJR_STATE_DIR="$ACLROOT/data/state" \
+          SBOXJR_OUT_DIR="$ACLROOT/data/out" \
+          SBOXJR_USER=sbox-jr SBOXJR_GROUP=sbox-jr SBOXJR_JOURNAL_GROUP=systemd-journal \
+          SBMON_GROUP=sboxweb SBMON_USER=sboxweb \
+          SBOXJR_RUNUSER="$STUB/rc-runuser" JR_PROBE_RC="$1" \
+          JRDB="$ACLROOT/jrdb" SBMON_HEALTH_TIMEOUT=1
+      bash -c '. "$1" >/dev/null 2>&1; sbmon_sboxjr_health_proof 1' _ "$LIB" ) >/dev/null 2>&1
+}
+seed_jr_identity
+health_run 12 && fail "B7-C: the health proof passed with an unreachable exchange (the 0.3.0 hole)" \
+              || pass "B7-C: health proof FAILS CLOSED when the Monitor identity cannot reach the exchange"
+health_run 13 && fail "B7-C: the health proof passed while state/ was consumer-readable" \
+              || pass "B7-C: health proof FAILS CLOSED on an over-readable state/"
+health_run 18 && fail "B7-C: the health proof passed while the consumer could enumerate the data root (B7-R2)" \
+              || pass "B7-C: health proof FAILS CLOSED on a named-group-widened, enumerable data root"
+health_run 0  && pass "B7-C: health proof accepts a proven consumer view (no false refusal)" \
+              || fail "B7-C: health proof refused a healthy activation"
+
+# ---- no-widening static gate: the reader section may never buy traversal with
+# a broader mode or a broader group membership.
+#
+# These gates scan an in-memory ~48KB slice, so they test it with `case`
+# instead of `printf | grep -q`. grep -q leaves as soon as it matches; the
+# writer then dies on SIGPIPE and `set -o pipefail` turns THAT into the
+# pipeline verdict -- Linux CI proved it, the four positive gates below each
+# printed "printf: write error: Broken pipe" and then failed on text they
+# really did contain. A subprocess-free test cannot be silenced by a pipe,
+# in either direction: the absence loop below is a negative control, and a
+# verdict that depends on how the pipe drains is not a control at all.
+JR_SEC="$(awk '/^SBOXJR_USER=/{f=1} f{print}' "$LIB")"
+sec_has() { case "$JR_SEC" in *"$1"*) return 0 ;; *) return 1 ;; esac; }
+# The widening scans read CODE, not prose: this section documents the very
+# forms it refuses (that is how the reader learns why 0751 is forbidden), so a
+# comment-blind scan would either fire on the explanation or force the
+# explanation out. Comment-only lines are dropped; the poisoned-copy control
+# below proves the scan still bites on a real command.
+JR_CODE="$(printf '%s\n' "$JR_SEC" | grep -v '^[[:space:]]*#' || true)"
+code_has() { case "$JR_CODE" in *"$1"*) return 0 ;; *) return 1 ;; esac; }
+for forbidden in 'chmod 0751' 'chmod 0755' 'chmod 0757' 'chmod 0770' 'chmod 0777' \
+                 'chmod a+x' 'chmod o+x' 'chmod g+w' 'setfacl -R' 'setfacl -d' \
+                 'setfacl -m u:sbox-jr' 'gpasswd' 'usermod -aG "$SBMON' \
+                 'group:$SBMON_USER:' 'group:$SBOXJR_GROUP:' \
+                 'default:user:$SBMON_USER' ; do
+    if code_has "$forbidden"; then
+        fail "B7-A static gate: the reader section contains a widening ('$forbidden')"
+    fi
+done
+pass "B7-A static gate: zero permission-widening commands in the reader section"
+# ... and the scan is not vacuous: the SAME loop over a copy that carries one
+# widening command has to light up.
+SAVED_CODE="$JR_CODE"
+JR_CODE="$JR_CODE"$'\n'"    chmod 0751 \"\$SBOXJR_DATA_ROOT\""
+if code_has 'chmod 0751'; then
+    pass "B7-A static gate: CONTROL -- the scan detects a widening injected into the code slice"
+else
+    fail "B7-A static gate: the scan cannot see an injected 'chmod 0751' (vacuous gate)"
+fi
+JR_CODE="$JR_CODE"$'\n'"    setfacl -m \"group:\$SBMON_USER:r-x\" -- \"\$SBOXJR_DATA_ROOT\""
+if code_has 'group:$SBMON_USER:'; then
+    pass "B7-R2 static gate: CONTROL -- the scan detects an injected named-group grant"
+else
+    fail "B7-R2 static gate: an injected named-group grant slips past the scan (vacuous gate)"
+fi
+JR_CODE="$SAVED_CODE"
+code_has 'chmod 0750 "$SBOXJR_DATA_ROOT"' \
+    && pass "B7-A static gate: the data root keeps its 0750 base pin" \
+    || fail "B7-A static gate: the data root lost its 0750 base pin"
+code_has 'user:$SBMON_USER:--x" -- "$SBOXJR_DATA_ROOT"' \
+    && pass "B7-A static gate: the only ACL grant targets the data root" \
+    || fail "B7-A static gate: the ACL grant does not target the data root"
+code_has 'chmod 2750 "$SBOXJR_OUT_DIR"' \
+    && code_has 'chmod 0700 "$SBOXJR_STATE_DIR"' \
+    && pass "B7-A static gate: out stays 2750 and state stays 0700 (B7-A moved neither)" \
+    || fail "B7-A static gate: the state/out mode pins moved"
+code_has 'sbmon_sboxjr_consumer_probe || return 1' \
+    && code_has 'sbmon_sboxjr_converge_exchange_traversal || return 1' \
+    && pass "B7-A/B7-C static gate: grant and consumer proof are both wired as hard steps" \
+    || fail "B7-A/B7-C static gate: a B7 step is not wired fail-closed"
+# B7-R2: the proof must stay a SET EQUALITY and the walk must keep its own
+# enumeration guard. Both are one sed away from regressing back to a subset
+# predicate, so the shape of the code is itself gated.
+code_has '[ "$have" = "$want" ]' \
+    && code_has 'sbmon_sboxjr_canonical_traversal_acl' \
+    && pass "B7-R2 static gate: the ACL proof is one canonical full-set equality, not subset predicates" \
+    || fail "B7-R2 static gate: the ACL proof has drifted back to independent subset checks"
+code_has 'if ls -A -- "$root" >/dev/null 2>&1; then exit 18; fi' \
+    && pass "B7-R2 static gate: the consumer walk carries the data-root enumeration guard" \
+    || fail "B7-R2 static gate: the consumer walk no longer proves the root is not enumerable"
+code_has 'chmod 0750 "$SBOXJR_DATA_ROOT" \' \
+    && pass "B7-R2 static gate: convergence re-pins the 0750 base after -b (a drifted group:: can be repaired)" \
+    || fail "B7-R2 static gate: convergence no longer re-pins the base after clearing the ACL"
+# The canonical set the library proves must be the set THIS suite spells out by
+# hand -- two independent spellings of one contract, agreeing line for line.
+LIB_CANON="$(bash -c '. "$1" >/dev/null 2>&1; SBMON_USER=sboxweb sbmon_sboxjr_canonical_traversal_acl' \
+    _ "$LIB" 2>/dev/null)"
+assert_eq "$(canon_acl_set)" "$LIB_CANON" \
+    "B7-R2: the library's canonical ACL set equals the set this suite spells out independently"
 # §17 readability probe (runuser -> fake id): group present vs missing
 probe_run() { # probe_run <groups-line...> -> rc
     rm -rf "$JRDB"; mkdir -p "$JRDB"

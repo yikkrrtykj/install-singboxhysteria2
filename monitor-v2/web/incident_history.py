@@ -135,6 +135,11 @@ CODE_WRITE_FAILED = "history_write_failed"
 CODE_RETENTION_FAILED = "history_retention_failed"
 CODE_READ_FAILED = "history_read_failed"
 CODE_INGEST_APPLY_FAILED = "history_ingest_apply_failed"
+# B7-B: the journal exchange directory could not be enumerated AT ALL
+# (missing, not searchable for this identity, not a directory). Distinct
+# from an empty directory on purpose: "I could not look" is a storage
+# failure, "I looked and found nothing" is a clean pass.
+CODE_EXCHANGE_UNREADABLE = "history_journal_exchange_unreadable"
 
 # -- journal ingest surface (issue #33 P2, PR-2B) -----------------------------
 
@@ -567,6 +572,10 @@ class IncidentHistory:
             "enabled": False,
             "contract_available": JOURNAL_CONTRACT_AVAILABLE,
             "exchange_dir_configured": self._journal_exchange_dir is not None,
+            # sanitized BOOLEAN only: distinguishes "this host never
+            # activated the reader" from "provisioned storage that is
+            # currently unreadable" without echoing a path.
+            "exchange_dir_provisioned": self._journal_exchange_provisioned(),
             "terminal_seq": None,
             "last_consumed_seq": None,
             "gaps_total": None,
@@ -1023,8 +1032,34 @@ class IncidentHistory:
     # transaction as its rows, so no crash window can re-count or
     # retract anything.
 
+    def _journal_exchange_provisioned(self):
+        """Is there a reader data root on this host at all?
+
+        The configured exchange directory's PARENT is the reader-owned
+        data root, so a parent that does not exist means the journal
+        reader was never activated here: there is nothing to ingest and
+        the subsystem stays quiet (NOT degraded). That is the single
+        carve-out, and it is a wiring fact rather than a read result.
+        Once the root exists, every unenumerable shape below it is a real
+        storage failure and must degrade (B7-B) -- which is exactly the
+        production shape this hotfix removes: root present and statable,
+        ``out`` unreachable through it."""
+        if self._journal_exchange_dir is None:
+            return False
+        try:
+            return os.path.isdir(
+                os.path.dirname(os.path.abspath(
+                    self._journal_exchange_dir)))
+        except OSError:
+            return False
+
     def _journal_ingest_gate(self, now, force=False):
         if self._journal_exchange_dir is None:
+            return None
+        if not self._journal_exchange_provisioned():
+            # never-activated host: quiet, no cadence stamp consumed, and
+            # above all not the "clean pass" that would clear a real
+            # journal degradation.
             return None
         if (not force and self._last_journal_ingest_ts is not None
                 and (now - self._last_journal_ingest_ts)
@@ -1087,8 +1122,19 @@ class IncidentHistory:
             # mid-run is a hostile mutation -- fail closed, mutate zero
             raise _HistoryError(CODE_SCHEMA_UNSUPPORTED)
         terminal = state[0]
-        files = _journal_contract.scan_exchange_dir(
-            self._journal_exchange_dir)
+        try:
+            files = _journal_contract.scan_exchange_dir(
+                self._journal_exchange_dir)
+        except _journal_contract.ExchangeDirUnreadable:
+            # B7-B: storage the Monitor could not enumerate is NOT an
+            # empty exchange directory. This leaves before the settlement
+            # loop opens, so ZERO seq advances, no gap and no rejection is
+            # counted, and nothing can leapfrog the unseen seq; and
+            # because the pass never completes, the recovery branch at the
+            # bottom cannot run and cannot clear a degradation the broken
+            # storage never earned. The gate turns this into the
+            # sanitized code and nothing else.
+            raise _HistoryError(CODE_EXCHANGE_UNREADABLE)
         # Loop invariant: the DB terminal is always exactly seq-1 --
         # every settlement (applied, rejected, gap) advanced it to the
         # seq it consumed, every failure settled NOTHING.

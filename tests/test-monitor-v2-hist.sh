@@ -28,7 +28,18 @@ export WEBAPP="$ROOT/monitor-v2/webapp.py"
 
 PASS=0
 FAIL=0
-EXPECTED_PASS=221
+# B7-B (review hotfix): H13 "unenumerable exchange dir is NOT an empty one"
+# adds +18 checks (221 -> 239), all inside the new group_ingest3()/H13
+# section: 1 harness-clean gate, 3 ENOENT zero-settlement/degradation/P1
+# independence, 2 not-a-directory same-disposition proofs, 2 EACCES vehicle
+# shape + real-permission-on-nonroot, 3 EACCES no-leapfrog / closed code /
+# sanitized surface, 3 repaired-access catch-up + clear + duplicate re-pass,
+# 2 readable-empty no-op and degraded->empty recovery, 1 never-activated
+# host quiet carve-out, 1 audit-vocabulary exclusion gate.
+# Nothing previously counted was removed or downgraded: the old
+# "missing_dir_soft" expectation is the bug this round fixes, so it became
+# "missing_dir_degrades" one-for-one inside the same 221 baseline.
+EXPECTED_PASS=239
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
@@ -99,9 +110,9 @@ then
 else
     fail "broker publication hook ordering/guard contract broken"
 fi
-assert_eq '0.3.0' "$(cat "$ROOT/monitor-v2/VERSION")" "VERSION file is 0.3.0"
-assert_contains 'MONITOR_WEB_VERSION = "0.3.0"' \
-    "$(cat "$ROOT/monitor-v2/web/server.py")" "MONITOR_WEB_VERSION is 0.3.0"
+assert_eq '0.3.1' "$(cat "$ROOT/monitor-v2/VERSION")" "VERSION file is 0.3.1"
+assert_contains 'MONITOR_WEB_VERSION = "0.3.1"' \
+    "$(cat "$ROOT/monitor-v2/web/server.py")" "MONITOR_WEB_VERSION is 0.3.1"
 assert_eq "0" "$(grep -c 'diagnostics/timeline' "$ROOT/monitor-v2/web/static/app.js" "$ROOT/monitor-v2/web/static/index.html" | awk -F: '{s+=$2} END {print s+0}')" \
     "no Incidents UI in P1 (static frontend untouched by the read surface)"
 if grep -Eq 'ReadWritePaths|supplementaryGroups|AmbientCapabilities|journald|sudoers' "$HIST_PY"; then
@@ -270,6 +281,7 @@ def rows_of(h):
 from journal_reader import schema as JR  # noqa: E402 (harness-side fixture)
 from journal_reader import ingest_contract as JC  # noqa: E402
 from web.incident_history import (CODE_INGEST_APPLY_FAILED,  # noqa: E402
+                                  CODE_EXCHANGE_UNREADABLE,
                                   JOURNAL_AUDIT_CODES, JOURNAL_BOUNDARIES,
                                   JOURNAL_CLASSES, JOURNAL_DCLS,
                                   JOURNAL_PROTOS)
@@ -1490,11 +1502,16 @@ def group_ingest():
                              and r["terminal_after"] == 0
                              and state == (0, None, 0, 0)
                              and not runs and not events and not audit)
-    # ---- missing/unreadable exchange dir: soft zero movement
+    # ---- B7-B (review hotfix): a missing exchange directory used to be
+    # the silent clean no-op that froze production at terminal 0 while
+    # looking healthy. Provisioned parent + missing dir is now a storage
+    # failure: zero movement AND a journal degradation.
     h._journal_exchange_dir = os.path.join(h._tmpdir, "no-such-dir")
     r = h.ingest_journal_events()
-    out["missing_dir_soft"] = (r is not None and r["consumed"] == 0
-                               and not h.health()["degraded"])
+    out["missing_dir_degrades"] = (
+        r is None and h.journal_status()["terminal_seq"] == 0
+        and h.health()["degraded"]
+        and h.health()["last_error_code"] == CODE_EXCHANGE_UNREADABLE)
     h._journal_exchange_dir = h._out
     # ---- ONE valid file: exact sanitized rows, sentinel folds applied
     recs = [ev_record(ts=100.5),
@@ -1750,7 +1767,8 @@ def group_ingest():
     stt = h.journal_status()
     out["journal_status_shape"] = (
         set(stt) == {"enabled", "contract_available",
-                     "exchange_dir_configured", "terminal_seq",
+                     "exchange_dir_configured", "exchange_dir_provisioned",
+                     "terminal_seq",
                      "last_consumed_seq", "gaps_total", "rejected_total",
                      "blocked_at", "last_pass", "reader"}
         and stt["enabled"] and stt["contract_available"]
@@ -2247,12 +2265,188 @@ def group_ingest2():
     return out
 
 
+def group_ingest3():
+    """B7-B: an exchange directory that cannot be ENUMERATED is not an
+    empty one. Missing, not-a-directory and EACCES each settle ZERO
+    sequences, freeze the continuity authority, never leapfrog the seqs
+    that were never read, keep the P1 publication of the same cycle
+    intact, and degrade ONLY the journal subsystem with one sanitized
+    code -- while a readable, empty directory stays the clean no-op it
+    has always been."""
+    out = {}
+    h = ingest_history()
+    good = h._out
+    base = h._tmpdir
+    for seq in (1, 2, 3):
+        write_ev(h, seq, records=[ev_record(ts=T0 + 100.0 + seq)])
+
+    # -- shape 1: the configured directory does not exist (ENOENT).
+    h._journal_exchange_dir = os.path.join(base, "absent-dir")
+    h.on_publish(snap(), 1)
+    runs1, events1, state1, audit1 = journal_dump(h)
+    health1, status1 = h.health(), h.journal_status()
+    out["enoent_settles_zero_rows"] = (
+        not runs1 and not events1 and not audit1
+        and state1 == (0, None, 0, 0)
+        and status1["terminal_seq"] == 0
+        and status1["last_consumed_seq"] is None)
+    out["enoent_degrades_journal_only"] = (
+        health1["degraded"] and health1["enabled"]
+        and health1["last_error_code"] == CODE_EXCHANGE_UNREADABLE
+        and status1["blocked_at"] is None)
+    p1_base = len(rows_of(h)[0])
+    out["enoent_p1_publication_independent"] = p1_base == 1
+
+    # -- shape 2: the configured path is a regular file (ENOTDIR).
+    notadir = os.path.join(base, "not-a-dir")
+    with open(notadir, "w") as handle:
+        handle.write("x")
+    h._journal_exchange_dir = notadir
+    h._t[0] = T0 + 11.0
+    h.on_publish(snap(), 2)
+    runs2, _e2, state2, _a2 = journal_dump(h)
+    out["enotdir_same_disposition"] = (
+        not runs2 and state2 == (0, None, 0, 0)
+        and h.health()["last_error_code"] == CODE_EXCHANGE_UNREADABLE)
+    out["enotdir_p1_still_writing"] = len(rows_of(h)[0]) > p1_base
+
+    # -- shape 3: EACCES on the exchange directory itself. On a POSIX
+    # non-root runner that is the REAL permission break; where the OS
+    # cannot deny a listing to its own owner, the same errno comes from a
+    # path-scoped os.listdir shim (the live CI lane proves the real
+    # shape end to end, so neither branch is a silent pass).
+    vehicle = "injected-permissionerror"
+    unshim = None
+    real_listdir = os.listdir
+    if os.name == "posix" and os.getuid() != 0:
+        os.chmod(good, 0o000)
+        try:
+            os.listdir(good)
+        except OSError:
+            vehicle = "real-mode-000"
+        if vehicle != "real-mode-000":
+            os.chmod(good, 0o755)
+    if vehicle == "injected-permissionerror":
+        target = os.path.abspath(good)
+
+        def shim(path, *args, **kwargs):
+            if os.path.abspath(str(path)) == target:
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_listdir(path, *args, **kwargs)
+
+        os.listdir = shim
+
+        def unshim():
+            os.listdir = real_listdir
+
+    h._journal_exchange_dir = good
+    h._t[0] = T0 + 22.0
+    h.on_publish(snap(), 3)
+    runs3, _e3, state3, audit3 = journal_dump(h)
+    health3, status3 = h.health(), h.journal_status()
+    out["eacces_vehicle_recorded"] = vehicle in ("real-mode-000",
+                                                 "injected-permissionerror")
+    out["eacces_vehicle_is_real_on_posix_nonroot"] = (
+        os.name != "posix" or os.getuid() == 0
+        or vehicle == "real-mode-000")
+    out["eacces_frozen_no_leapfrog"] = (
+        not runs3 and not audit3 and state3 == (0, None, 0, 0)
+        and status3["reader"]["status"] in ("unreadable", "absent"))
+    out["eacces_degrades_with_closed_code"] = (
+        health3["degraded"] and health3["enabled"]
+        and health3["last_error_code"] == CODE_EXCHANGE_UNREADABLE)
+    payload = json.dumps({"health": health3, "status": status3},
+                         sort_keys=True, default=str)
+    out["eacces_surface_carries_no_detail"] = (
+        base not in payload and good not in payload
+        and "Permission denied" not in payload
+        and "errno" not in payload.lower()
+        and not any(s in payload for s in SENTINELS))
+
+    # -- the repair: the SAME durable files become enumerable again, so
+    # the next clean pass catches up exactly once and clears the
+    # degradation, and a duplicate re-pass recounts nothing.
+    if vehicle == "real-mode-000":
+        os.chmod(good, 0o755)
+    else:
+        unshim()
+    h._t[0] = T0 + 33.0
+    h.on_publish(snap(), 4)
+    runs4, events4, state4, _a4 = journal_dump(h)
+    out["repaired_pass_catches_up_in_order"] = (
+        [r[0] for r in runs4] == [1, 2, 3]
+        and [e[0] for e in events4] == [1, 2, 3]
+        and state4 == (3, 3, 0, 0))
+    out["repaired_pass_clears_degradation"] = (
+        not h.health()["degraded"]
+        and h.health()["last_error_code"] is None)
+    repass = h.ingest_journal_events()
+    runs5, events5, state5, audit5 = journal_dump(h)
+    out["duplicate_repass_recounts_nothing"] = (
+        repass is not None and repass["consumed"] == 0
+        and repass["gaps"] == 0 and repass["rejected"] == 0
+        and runs5 == runs4 and events5 == events4
+        and state5 == (3, 3, 0, 0) and not audit5)
+    h.close()
+
+    # -- the contrast: a readable EMPTY exchange directory is the
+    # legitimate clean no-op, never the failure disposition.
+    h2 = ingest_history()
+    h2.on_publish(snap(), 1)
+    runs6, _e6, state6, _a6 = journal_dump(h2)
+    out["empty_readable_dir_is_clean_noop"] = (
+        not h2.health()["degraded"]
+        and h2.health()["last_error_code"] is None
+        and state6 == (0, None, 0, 0) and not runs6
+        and h2.journal_status()["last_pass"]["consumed"] == 0)
+    # and recovery holds the other way round too: degraded by an
+    # unenumerable directory, then facing a genuinely readable empty one,
+    # the clean pass clears WITHOUT fabricating progress.
+    h2._journal_exchange_dir = os.path.join(h2._tmpdir, "gone")
+    h2._t[0] = T0 + 11.0
+    h2.on_publish(snap(), 2)
+    degraded_now = (h2.health()["degraded"]
+                    and h2.health()["last_error_code"]
+                    == CODE_EXCHANGE_UNREADABLE)
+    h2._journal_exchange_dir = tempfile.mkdtemp()
+    h2._t[0] = T0 + 22.0
+    h2.on_publish(snap(), 3)
+    _r7, _e7, state7, _a7 = journal_dump(h2)
+    out["clean_empty_pass_recovers_without_fabricating"] = (
+        degraded_now and not h2.health()["degraded"]
+        and h2.health()["last_error_code"] is None
+        and state7 == (0, None, 0, 0))
+    h2.close()
+    # A host that never activated the reader has no data root at all:
+    # quiet, not degraded, and the distinction is surfaced as a sanitized
+    # boolean rather than a path.
+    h3_root = tempfile.mkdtemp()
+    os.rmdir(h3_root)
+    h3 = tmp_history(journal_exchange_dir=os.path.join(h3_root, "out"))
+    h3.open()
+    h3.on_publish(snap(), 1)
+    out["unprovisioned_host_stays_quiet"] = (
+        not h3.health()["degraded"]
+        and h3.health()["last_error_code"] is None
+        and h3.journal_status()["exchange_dir_provisioned"] is False
+        and h3.journal_status()["terminal_seq"] == 0)
+    h3.close()
+    # The directory-level condition is a HEALTH code, never a per-seq
+    # audit code: it writes no row, so the closed audit vocabulary stays
+    # exactly the frozen PR-2A disposition set.
+    out["dir_code_is_not_an_audit_code"] = (
+        CODE_EXCHANGE_UNREADABLE == "history_journal_exchange_unreadable"
+        and CODE_EXCHANGE_UNREADABLE not in JOURNAL_AUDIT_CODES
+        and len(JOURNAL_AUDIT_CODES) == 13)
+    return out
+
+
 GROUPS = {"storage": group_storage, "privacy": group_privacy,
           "cadence": group_cadence, "restart": group_restart,
           "retention": group_retention, "failure": group_failure,
           "concurrency": group_concurrency,
           "migrate": group_migrate, "ingest": group_ingest,
-          "ingest2": group_ingest2,
+          "ingest2": group_ingest2, "ingest3": group_ingest3,
           "http": group_http}
 
 
@@ -2523,7 +2717,7 @@ section "H11: journal ingest contract + exactly-once (PR-2B spec §6/§7/§13)"
 run_group "ingest"
 check 'd.get("_harness_error") is None' "ingest harness ran clean"
 check 'd["empty_dir_noop"]' "S1 empty exchange dir: full pass, zero movement"
-check 'd["missing_dir_soft"]' "unreadable exchange dir: soft, zero movement, no degrade"
+check 'd["missing_dir_degrades"]' "B7-B: missing exchange dir under a live data root fails closed, no longer a silent clean pass"
 check 'd["single_valid_exact_rows"]' "S2 one valid file: EXACT sanitized rows + sentinel folds"
 check 'd["replay_committed_noop"]' "S4 committed file replayed from disk: exact no-op"
 check 'd["sequential_files"]' "S3 strictly sequential files consume in order"
@@ -2596,6 +2790,27 @@ check 'd["pub_crash_sanitized_degraded"]' "R3-B: containment records only the sa
 check 'd["pub_crash_no_leapfrog_repeat"]' "R3-B: repeated contained publishes never leapfrog the untouched seq"
 check 'd["pub_crash_direct_entry_still_raises"]' "R3-B: direct ingest_journal_events() keeps RuntimeError propagation"
 check 'd["pub_crash_clean_pass_recovers"]' "R3-B: restored apply consumes blocked seqs exactly once, healthy"
+
+section "H13: unenumerable exchange directory is NOT an empty one (B7-B)"
+run_group "ingest3"
+check 'd.get("_harness_error") is None' "ingest3 harness ran clean"
+check 'd["enoent_settles_zero_rows"]' "missing exchange dir: zero rows, terminal frozen, nothing consumed"
+check 'd["enoent_degrades_journal_only"]' "missing exchange dir: journal degraded with the sanitized code, P1 surface still enabled"
+check 'd["enoent_p1_publication_independent"]' "missing exchange dir: the same publication still writes its timeline sample"
+check 'd["enotdir_same_disposition"]' "exchange path that is a file: same zero-settlement disposition"
+check 'd["enotdir_p1_still_writing"]' "exchange path that is a file: P1 keeps publishing"
+check 'd["eacces_vehicle_recorded"]' "EACCES vehicle is one of the two declared shapes"
+check 'd["eacces_vehicle_is_real_on_posix_nonroot"]' "on a POSIX non-root runner the EACCES shape is a REAL permission break"
+check 'd["eacces_frozen_no_leapfrog"]' "EACCES: no row, no counter, no leapfrog over the seqs that were never read"
+check 'd["eacces_degrades_with_closed_code"]' "EACCES: journal degraded with the closed code, history still enabled"
+check 'd["eacces_surface_carries_no_detail"]' "EACCES: health/status echo no path, no errno and no sentinel"
+check 'd["repaired_pass_catches_up_in_order"]' "access repaired: the same durable files ingest in order and terminal catches up"
+check 'd["repaired_pass_clears_degradation"]' "access repaired: the clean pass is the recovery, code cleared"
+check 'd["duplicate_repass_recounts_nothing"]' "after catch-up a duplicate pass advances nothing and duplicates no row"
+check 'd["empty_readable_dir_is_clean_noop"]' "readable EMPTY exchange dir stays a legitimate clean no-op"
+check 'd["clean_empty_pass_recovers_without_fabricating"]' "degraded -> readable empty: recovery clears it without inventing progress"
+check 'd["unprovisioned_host_stays_quiet"]' "no reader data root at all: quiet, not degraded, and surfaced as a sanitized boolean"
+check 'd["dir_code_is_not_an_audit_code"]' "the directory code is a health code, never a per-seq audit vocabulary entry"
 
 printf '\n== RESULT: %d passed, %d failed ==\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] && [ "$PASS" -eq "$EXPECTED_PASS" ] || { printf '  (failures, or a section did not fully run)\n'; exit 1; }

@@ -908,6 +908,11 @@ SBOXJR_UNIT_FILE="${SBOXJR_UNIT_FILE:-/etc/systemd/system/$SBOXJR_SERVICE_NAME.s
 SBOXJR_WATCHED_UNIT="${SBOXJR_WATCHED_UNIT:-sing-box.service}"
 SBOXJR_RUNUSER="${SBOXJR_RUNUSER:-runuser}"
 SBMON_SYSTEMD_ANALYZE="${SBMON_SYSTEMD_ANALYZE:-systemd-analyze}"
+# B7-A: the exchange-directory traversal grant is a single POSIX ACL
+# named-user entry, so the acl package is part of the activation contract.
+# Mockable indirection vars, same discipline as $SBOXJR_RUNUSER.
+SBOXJR_SETFACL="${SBOXJR_SETFACL:-setfacl}"
+SBOXJR_GETFACL="${SBOXJR_GETFACL:-getfacl}"
 
 # Reader runtime lives INSIDE the immutable release tree
 # (<release>/libexec/sbox-journal-reader) and /usr/local/lib/... is a single
@@ -1000,8 +1005,145 @@ sbmon_sboxjr_ensure_identity() {
     sbmon_sboxjr_validate_identity
 }
 
+# ---------------------------------------------------------------------------
+# B7-A -- the ONE narrow grant the Monitor identity needs on reader storage.
+#
+# Production shape (release 0.3.0, issue #33 P2 review B7): <root> was
+# `0750 root:sbox-jr`, <root>/out `2750 sbox-jr:sboxweb`. The Monitor
+# identity ($SBMON_USER) is in NEITHER class of <root>, so it cannot traverse
+# the ancestor: stat(out) fails with EACCES even though out itself is
+# correctly shaped. The exchange dir was therefore permanently unreadable and
+# ingest froze at terminal 0.
+#
+# The fix is a single POSIX ACL named-user entry of `--x` (search only) for
+# $SBMON_USER on <root>, and NOTHING else:
+#   * `--x` grants pathname traversal, not listing. <root> itself never
+#     becomes enumerable: readdir on <root> still fails, so the ACL leaks no
+#     directory inventory.
+#   * No default ACL, so the grant cannot propagate into state/ or out/ or
+#     onto any file the reader creates later.
+#   * The base mode stays exactly 0750 root:sbox-jr. With mask `r-x` the
+#     AND-ed effective grant is still `--x`, and `stat -c %a` keeps printing
+#     750 -- every existing mode assertion in this file and in the tests
+#     remains true.
+#   * state/ is 0700 sbox-jr:sbox-jr: a search bit on <root> reaches
+#     `.../state` as a NAME only; opening it needs a class that grants
+#     sboxweb anything on state itself, and none exists. Cursor state,
+#     committed/pending rows and the 0600 HMAC key therefore stay reader-
+#     private -- that is the frozen web-identity boundary and B7-A does not
+#     move it.
+#   * out/ keeps 2750 sbox-jr:sboxweb: that group bit, not the ACL, is what
+#     makes exchange files readable. out stays the ONLY Monitor-readable
+#     reader surface.
+# Rejected alternatives, each strictly wider or contract-breaking: 0751
+# (world traversal + metadata probing of reader storage); flipping <root>'s
+# group to sboxweb (drops sbox-jr's own access AND changes `id sboxweb`, a
+# frozen invariant); adding sboxweb to sbox-jr or sbox-jr to sboxweb (an
+# extra broad group for a single --x bit, and it also grants sboxweb listing
+# of <root>); a sibling out dir outside the tree (moves data, not narrower);
+# a systemd bind-mount namespace (only reachable inside the service, so it
+# cannot fix the Monitor's own view).
+# ---------------------------------------------------------------------------
+
+# Normalized ACL text for one path: entry lines only (header comments and any
+# `#effective:` annotation stripped), blank lines dropped. Parsing stays
+# anchored so a mock and the real acl tools agree.
+sbmon_sboxjr_getfacl_text() { # <path> -> prints normalized ACL entry lines
+    local p="$1" raw
+    raw="$("$SBOXJR_GETFACL" -- "$p" 2>/dev/null)" || return 1
+    printf '%s\n' "$raw" \
+        | sed -e 's/#effective:.*$//' -e 's/\t.*$//' -e 's/[[:space:]]*$//' \
+        | grep -v '^#' | grep -v '^$' || true
+}
+
+# The canonical access ACL of the B7-A contract, sorted: the full set, entry
+# for entry. A directory that carries ANYTHING ELSE -- one extra named group,
+# a widened mask, a shifted owning-group entry, a class this model never
+# imagined -- is not in this contract, however well its user: grant reads.
+# user::rwx / group::r-x / other::--- are the 0750 base bits seen through the
+# ACL interface, mask::r-x is what keeps the grant un-masked without borrowing
+# a listing bit for anyone, and user:$SBMON_USER:--x is the whole point.
+sbmon_sboxjr_canonical_traversal_acl() {
+    printf '%s\n' "user::rwx" "user:$SBMON_USER:--x" "group::r-x" \
+        "mask::r-x" "other::---" | LC_ALL=C sort
+}
+
+# Exact-shape proof of the traversal grant: the normalized ACL text must be
+# EQUAL to the canonical set. This is deliberately one full-set comparison
+# rather than a handful of independent subset predicates, because a subset form
+# only ever forbids what somebody already thought to count. A named group entry
+# is the case in point: it is a real second grant path -- any identity that
+# reaches this directory THROUGH that group is served by it -- so it is outside
+# the contract whether or not it changes what $SBMON_USER can do today. (On
+# Linux it may well change nothing for $SBMON_USER: the access check is decided
+# by a matching named USER entry and stops there, which is precisely why
+# per-identity behavioural probes cannot be the primary proof.) A new ACL class
+# therefore fails the proof by existing, instead of having to be imagined,
+# counted, and separately forbidden.
+sbmon_sboxjr_exchange_traversal_shape() { # <dir>
+    local d="$1" text have want
+    text="$(sbmon_sboxjr_getfacl_text "$d")" || return 1
+    want="$(sbmon_sboxjr_canonical_traversal_acl)"
+    # Sorted, and the sorted forms compared as wholes: getfacl emits entry
+    # classes in a fixed order, but the proof is about the SET, so neither the
+    # verdict nor a legitimately reordered dump depends on line order.
+    have="$(printf '%s\n' "$text" | LC_ALL=C sort)"
+    [ "$have" = "$want" ]
+}
+
+# Idempotent, fail-closed convergence of the traversal grant. Called at the
+# END of sbmon_sboxjr_ensure_data_tree, i.e. after the base chown/chmod, so
+# the ACL is always layered on a freshly-pinned 0750.
+#
+# setfacl -b FIRST: an existing tree may carry a divergent ACL set (a
+# leftover 0777-era default ACL, an extra named entry). Removing all entries
+# restores the base 0750 and then re-adding exactly one entry makes the
+# result a function of the base mode alone -- run it twice, the second
+# converges to the identical shape and takes the zero-mutation early return.
+#
+# The chmod 0750 BETWEEN -b and -m is not decoration: -b writes the ACL's
+# base entries back into the file mode, so a tree whose owning-group entry
+# had drifted (group::r--, or a widened mask that reads as 0770) comes out of
+# -b carrying that drift as its real mode. Re-pinning the contract base is
+# what lets the single --x grant land on 0750 again; skipping it would leave
+# a divergent tree failing its own read-back forever.
+#
+# Missing acl tools are a preflight-class STOP: there is deliberately no
+# chmod-widening fallback, because the only alternative to the narrow grant
+# is a wider one.
+sbmon_sboxjr_acl_tools_available() {
+    command -v "$SBOXJR_SETFACL" >/dev/null 2>&1 \
+        && command -v "$SBOXJR_GETFACL" >/dev/null 2>&1
+}
+
+sbmon_sboxjr_converge_exchange_traversal() {
+    if [ "$SBMON_FIXTURE" = "1" ]; then
+        sboxjr_log "fixture: 交换目录遍历授权（ACL）跳过（真实语义由根 Linux CI 门保证）"
+        return 0
+    fi
+    if ! sbmon_sboxjr_acl_tools_available; then
+        sboxjr_die "缺少 setfacl/getfacl（acl 包）：无法在不放宽权限的前提下授予 $SBMON_USER 遍历权（fail-closed）"
+        return 1
+    fi
+    if sbmon_sboxjr_exchange_traversal_shape "$SBOXJR_DATA_ROOT"; then
+        sboxjr_log "$SBOXJR_DATA_ROOT 交换目录遍历授权已是目标形状：零变更（幂等）"
+        return 0
+    fi
+    "$SBOXJR_SETFACL" -b -- "$SBOXJR_DATA_ROOT" \
+        || { sboxjr_die "$SBOXJR_DATA_ROOT：清除既有 ACL 失败（fail-closed）"; return 1; }
+    chmod 0750 "$SBOXJR_DATA_ROOT" \
+        || { sboxjr_die "$SBOXJR_DATA_ROOT：基模式 0750 重钉失败（fail-closed）"; return 1; }
+    "$SBOXJR_SETFACL" -m "user:$SBMON_USER:--x" -- "$SBOXJR_DATA_ROOT" \
+        || { sboxjr_die "$SBOXJR_DATA_ROOT：写入 $SBMON_USER 遍历授权失败（fail-closed）"; return 1; }
+    sbmon_sboxjr_exchange_traversal_shape "$SBOXJR_DATA_ROOT" \
+        || { sboxjr_die "$SBOXJR_DATA_ROOT：ACL 收敛后回读形状仍不符（fail-closed）"; return 1; }
+    sboxjr_log "$SBOXJR_DATA_ROOT 已授予 $SBMON_USER 单一 --x 遍历权（基模式 0750 未变）"
+    return 0
+}
+
 # Data tree boundary (mirrors the monitor service-owned-tree rules):
-#   <root>          root:sbox-jr 0750 -- root-controlled parent only.
+#   <root>          root:sbox-jr 0750 + ACL user:$SBMON_USER:--x (B7-A) --
+#                   root-controlled parent; the ACL is a search bit only.
 #   <root>/state    0700 sbox-jr      -- reader-private (cursor state and
 #                   the fingerprint key): the web identity must NOT read it.
 #   <root>/out      2750 sbox-jr:sboxweb -- the exchange group is exactly
@@ -1035,6 +1177,9 @@ sbmon_sboxjr_ensure_data_tree() {
     chmod 0700 "$SBOXJR_STATE_DIR" || return 1
     chown "$SBOXJR_USER:${SBMON_GROUP:-sboxweb}" "$SBOXJR_OUT_DIR" || return 1
     chmod 2750 "$SBOXJR_OUT_DIR" || return 1
+    # B7-A: the traversal grant is layered on the freshly-pinned base mode,
+    # and it is part of the data-tree contract -- not an optional extra.
+    sbmon_sboxjr_converge_exchange_traversal || return 1
     return 0
 }
 
@@ -1285,6 +1430,82 @@ sbmon_sboxjr_readability_probe() {
 }
 
 # ---------------------------------------------------------------------------
+# B7-C -- CONSUMER-side activation proof: the reader identity proving it can
+# read the journal is not the same fact as the MONITOR identity proving it can
+# reach the exchange. Production release 0.3.0 shipped with every reader-side
+# proof green and the consumer permanently locked out, so the transaction now
+# fails closed on the consumer's own view.
+#
+# Run as $SBMON_USER through runuser -- never as root, and never inferred from
+# the directory's own mode bits: only the effective identity can show whether
+# the ANCESTOR grants it traversal (the exact B7-A break).
+#
+# What must hold:
+#   <root>            searchable (test -x)                 -> exit 11
+#   <root>            NOT enumerable                        -> exit 18
+#                     B7-A grants a search bit, never a listing: the same
+#                     identity that must reach out/ must still be unable to
+#                     enumerate the reader data root. A named-group or
+#                     widened-mask ACL that hands it one is a contract
+#                     violation, and it is diagnosed on its own exit code so
+#                     production can name the widening without reading it.
+#   <root>/out        enumerable (ls)                       -> exit 12
+#                     EMPTY IS VALID: a fresh activation has no exchange file
+#                     yet, and an empty readable dir is a legitimate clean
+#                     no-op, not a failure.
+#   <root>/state      NOT enumerable                        -> exit 13
+#   <root>/state/{committed,hmac.key} NOT readable when present
+#                                                         -> exits 14 / 15
+#   every ev-*.jsonl  a regular file the consumer can OPEN READ-ONLY and
+#                     drain                             -> exits 16 / 17
+# The probe creates, modifies and deletes nothing -- a read-only walk.
+# Diagnostics carry the exit code only.
+# ---------------------------------------------------------------------------
+sbmon_sboxjr_consumer_probe() {
+    if [ "$SBMON_FIXTURE" = "1" ]; then
+        sboxjr_log "fixture: 消费侧（$SBMON_USER）交换目录探针跳过（真实语义由根 Linux CI 门保证）"
+        return 0
+    fi
+    if ! command -v "$SBOXJR_RUNUSER" >/dev/null 2>&1; then
+        sboxjr_die "缺少 runuser，无法执行消费侧交换目录探针"
+        return 1
+    fi
+    local script='
+        root=$1; st=$2; od=$3
+        test -x "$root" || exit 11
+        if ls -A -- "$root" >/dev/null 2>&1; then exit 18; fi
+        ls -A -- "$od" >/dev/null 2>&1 || exit 12
+        if ls -A -- "$st" >/dev/null 2>&1; then exit 13; fi
+        if [ -e "$st/committed" ] && [ -r "$st/committed" ]; then exit 14; fi
+        if [ -e "$st/hmac.key" ] && [ -r "$st/hmac.key" ]; then exit 15; fi
+        for f in "$od"/ev-*.jsonl; do
+            [ -e "$f" ] || continue
+            { [ -f "$f" ] && [ ! -L "$f" ]; } || exit 16
+            cat -- "$f" >/dev/null 2>&1 || exit 17
+        done
+        exit 0
+    '
+    local rc=0
+    "$SBOXJR_RUNUSER" -u "$SBMON_USER" -- /bin/sh -c "$script" sh \
+        "$SBOXJR_DATA_ROOT" "$SBOXJR_STATE_DIR" "$SBOXJR_OUT_DIR" \
+        >/dev/null 2>&1 || rc=$?
+    case "$rc" in
+        0) sboxjr_log "消费侧探针通过：$SBMON_USER 可遍历 $SBOXJR_DATA_ROOT（且不可枚举）并只读枚举 $SBOXJR_OUT_DIR"
+            return 0 ;;
+        11) sboxjr_die "$SBMON_USER 无法遍历 $SBOXJR_DATA_ROOT（祖先缺遍历权：B7-A 形状不成立，fail-closed）" ;;
+        12) sboxjr_die "$SBMON_USER 无法枚举交换目录 $SBOXJR_OUT_DIR（消费侧读不到交换文件，fail-closed）" ;;
+        13) sboxjr_die "$SBMON_USER 可枚举 reader 私有 state 目录（越界可读，权限形状不符，fail-closed）" ;;
+        14) sboxjr_die "$SBMON_USER 可读 state/committed（游标状态越界，fail-closed）" ;;
+        15) sboxjr_die "$SBMON_USER 可读 state/hmac.key（密钥越界，fail-closed）" ;;
+        16) sboxjr_die "$SBMON_USER 视角下交换条目不是普通文件（fail-closed）" ;;
+        17) sboxjr_die "$SBMON_USER 无法只读打开 0640 交换文件（消费侧读不到事件，fail-closed）" ;;
+        18) sboxjr_die "$SBMON_USER 可枚举 $SBOXJR_DATA_ROOT（数据根被放宽：契约只授予 --x 遍历权，fail-closed）" ;;
+        *) sboxjr_die "消费侧探针以未知退出码 $rc 结束（fail-closed）" ;;
+    esac
+    return 1
+}
+
+# ---------------------------------------------------------------------------
 # PR-2B ACTIVATION TRANSACTION -- reader activation is installer-owned.
 #
 # Contract (Coding E, issue #33 P2 PR-2B):
@@ -1352,6 +1573,8 @@ sbmon_sboxjr_activation_preflight() {
             || sbmon_die "缺少 $SBMON_SYSTEMD_ANALYZE：reader unit 无法验证（fail-closed，未做任何变更）"
         command -v "$SBOXJR_RUNUSER" >/dev/null 2>&1 \
             || sbmon_die "缺少 $SBOXJR_RUNUSER：journal 可读性无法证明（fail-closed，未做任何变更）"
+        sbmon_sboxjr_acl_tools_available \
+            || sbmon_die "缺少 setfacl/getfacl（acl 包）：B7-A 交换目录遍历授权无法在不放宽权限的前提下建立（fail-closed，未做任何变更）"
         if getent passwd "$SBOXJR_USER" >/dev/null 2>&1; then
             sbmon_sboxjr_validate_identity \
                 || sbmon_die "既有 $SBOXJR_USER 身份形状不符（见上）：fail-closed，未做任何变更"
@@ -1425,6 +1648,10 @@ sbmon_sboxjr_health_proof() { # [want_enabled 0|1] (default 1)
         return 1
     fi
     sbmon_sboxjr_readability_probe || return 1
+    # B7-C: the producer-side (reader identity) proof above says nothing
+    # about the CONSUMER being able to reach the exchange -- that is exactly
+    # the hole release 0.3.0 shipped through. Both sides are proven here.
+    sbmon_sboxjr_consumer_probe || return 1
     if [ "$SBMON_FIXTURE" = "1" ]; then
         return 0
     fi

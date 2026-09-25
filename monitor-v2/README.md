@@ -361,6 +361,28 @@ install/upgrade 直接拒绝（绝不以 `contract_available=false` 完成部署
 且通过 12+1+1 manifest 审计，否则在零变更前拒绝，以避免 Monitor/reader 混版本。
 helper/sbox-cm 边界与 sing-box 本体零改动。
 
+### 0.3.1：B7 热修复 —— journal 交换目录对 Monitor 身份可达（issue #33 评审 B7 / B7-R2；完整决策与门表见 deploy/README.md §20）
+
+生产 `0.3.0` 的 reader 数据根是 `0750 root:sbox-jr`，`sboxweb` 无法遍历它（`stat`
+成功、列举 EACCES），而 `scan_exchange_dir()` 把"读不到"当成"空的"，于是整条
+journal 摄取面永久冻结在 `terminal_seq=0` 却对外显示 green。0.3.1 用唯一一条窄授
+权修好遍历：`user:sboxweb:--x`，基模式仍是 `root:sbox-jr 0750`，不加组成员、不
+`chmod 0751`、不把 reader 树变成世界可读。授权证明是**规范化后的 ACL 全集相等**
+（`getfacl` 文本去注释/去 `#effective:`/排序后逐字节等于库内唯一一份 canonical
+集合 `user::rwx / user:sboxweb:--x / group::r-x / mask::r-x / other::---`），所以
+多出来的条目类型本身就是拒绝理由——具名组、`mask::rwx`、漂移的 `group::`、
+default ACL 一律 fail-closed——判定不依赖有人事先想到去数它。收敛是幂等三步：
+`setfacl -b` → `chmod 0750` 重钉基模式 → 写入那条 `--x`，最后回读比较；已存在的
+生产形状 `0750 root:sbox-jr` 父目录因此被原地修复，且已是目标形状时零 mutation。
+消费侧探针现在同时证明数据根可遍历**且不可枚举**，后者走独立退出码 18 的诊断，
+生产诊断能在不读内容的前提下点名这种放宽。`scan_exchange_dir()` 改抛
+`ExchangeDirUnreadable(OSError)`，Monitor 侧映射成降级 + 分类码：不可读的交换目录
+不再等于空目录，terminal 冻结、零伪造 gap/rejection，P1 发布面独立性、恢复追赶、
+state/HMAC 隐私、空 `out/` 合法 no-op 全部不变。部署门检查**最终**权限形状，破坏
+Monitor 交换访问的 release 会 fail-closed / 回滚而不是悄悄提交。本提交把
+`VERSION`、`MONITOR_WEB_VERSION` 与钉住当前发布版本的 hist / jr / packaging 断言
+抬到 `0.3.1`；描述生产 `0.3.0` 缺陷的历史与 fixture 字样保持不变。
+
 ### 请求门顺序（每个普通请求）
 
 ```text

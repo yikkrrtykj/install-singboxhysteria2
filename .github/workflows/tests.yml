@@ -25,7 +25,7 @@ jobs:
       - name: Install test dependencies
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y jq shellcheck
+          sudo apt-get install -y jq shellcheck acl
           flock --version || sudo apt-get install -y util-linux
 
       - name: Environment diagnostics (no secrets)
@@ -75,6 +75,7 @@ jobs:
           bash -n tests/test-monitor-v2-p2b-integration.sh
           bash -n monitor-v2/deploy/app-bin/monitor-contract-probe
           bash -n tests/journal-reader/test-jr-live.sh
+          bash -n tests/journal-reader/test-jr-exchange-access.sh
           bash -n tests/e3/test-m3-deploy.sh
           bash -n tests/e3/test-m3c-phase1.sh
           bash -n tests/e3/test-m3c-phase2.sh
@@ -102,7 +103,7 @@ jobs:
       - name: Install test dependencies
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y jq shellcheck
+          sudo apt-get install -y jq shellcheck acl
           flock --version || sudo apt-get install -y util-linux
 
       - name: Phase C regression suite
@@ -172,7 +173,7 @@ jobs:
       - name: Install test dependencies
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y jq shellcheck
+          sudo apt-get install -y jq shellcheck acl
           flock --version || sudo apt-get install -y util-linux
 
       - name: E1 collector regression suite
@@ -227,7 +228,7 @@ jobs:
       - name: Install test dependencies
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y jq shellcheck
+          sudo apt-get install -y jq shellcheck acl
           flock --version || sudo apt-get install -y util-linux
 
       - name: Environment diagnostics (no secrets)
@@ -310,6 +311,15 @@ jobs:
           # SBOX_JR_REQUIRE_LIVE=1: on CI the live gate MUST really execute;
           # a SKIP here is a hard failure (the B-5 lesson).
           sudo -n env SBOX_JR_REQUIRE_LIVE=1 bash tests/journal-reader/test-jr-live.sh
+
+      # B7: the exchange-access gates are REAL-permission gates (disposable
+      # identities, real setfacl/getfacl, real runuser), so they must execute
+      # on every baseline. A SKIP here is a hard failure: a mock cannot prove
+      # that the Monitor identity can traverse the reader data root.
+      - name: "sbox-journal-reader EXCHANGE ACCESS LIVE (production-shaped tree: consumer traversal, sanitized unreadable-storage degradation, recovery, idempotent ACL convergence)"
+        run: |
+          bash -n tests/journal-reader/test-jr-exchange-access.sh
+          sudo -n env SBOX_JR_XACCESS_REQUIRE_LIVE=1 bash tests/journal-reader/test-jr-exchange-access.sh
 
       # The PR-2B integration gates are symlink/rename(2)-semantic gates, so
       # they must execute on EVERY baseline: the suite itself turns any SKIP on

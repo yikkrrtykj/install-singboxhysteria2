@@ -64,9 +64,19 @@ jobs:
           systemctl is-system-running || true
           systemctl --failed --no-pager || true
           exit 1
+      - name: Ensure POSIX ACL tools present
+        # B7-A: the root pass runs the reader data-tree convergence FOR REAL,
+        # and that convergence is an ACL grant with no chmod-widening
+        # fallback -- so the acl package is part of this lane's contract.
+        # Fail closed here rather than inside the installer transaction.
+        run: |
+          set -euo pipefail
+          command -v setfacl >/dev/null 2>&1 && command -v getfacl >/dev/null 2>&1 \
+            || sudo apt-get install -y acl
+          command -v setfacl >/dev/null 2>&1
+          command -v getfacl >/dev/null 2>&1
       - name: Run Monitor v2 packaging test suite (root, real metadata)
         run: sudo --preserve-env=HOME bash tests/test-monitor-packaging.sh
-
   # Stable aggregator: required-status consumers only ever need to track
   # "packaging-tests"; it FAILS unless both independent passes succeeded.
   packaging-tests:
