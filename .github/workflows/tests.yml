@@ -73,6 +73,7 @@ jobs:
           bash -n tests/test-monitor-v2-jr.sh
           bash -n tests/test-monitor-v2-jr-deploy.sh
           bash -n tests/test-monitor-v2-p2b-integration.sh
+          bash -n tests/test-monitor-v2-probes.sh
           bash -n monitor-v2/deploy/app-bin/monitor-contract-probe
           bash -n tests/journal-reader/test-jr-live.sh
           bash -n tests/journal-reader/test-jr-exchange-access.sh
@@ -205,6 +206,9 @@ jobs:
 
       - name: "PR-2B INTEGRATION suite (Coding D + Coding E as ONE immutable release unit: packaged contract import / release coupling / dual-ref retention / v1->v2 migration through the installed release, issue #33 P2)"
         run: bash tests/test-monitor-v2-p2b-integration.sh
+
+      - name: "0.3.x PR-3A outbound probe engine suite (closed schema / DNS / HTTPS / UDP round-trip anti-false-positive / egress IP / sentinel privacy / deadline isolation / DARK zero-call gates, issue #33 P3)"
+        run: bash tests/test-monitor-v2-probes.sh
 
   # ---------------------------------------------------------------------
   # Lane D -- compatibility matrix. Runs on the three supported Ubuntu LTS
