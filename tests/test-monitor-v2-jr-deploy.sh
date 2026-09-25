@@ -1623,13 +1623,14 @@ assert_eq "$(( $(setfacl_calls) - before ))" "2" \
 assert_eq "$(canon_acl_set)" "$(root_acl_set)" \
     "B7-A: the repaired root carries the canonical set again (not merely one named user)"
 
-# ---- B7-R2: a NAMED GROUP is the widening the subset predicates let through.
-# Injected through the same setfacl interface, repaired through the same
-# convergence, and refused on its own merit -- not because it changed a count.
+# ---- B7-R2: a NAMED GROUP is the entry class the subset predicates let
+# through. Injected through the same setfacl interface, repaired through the
+# same convergence, and refused on its own merit -- not because it changed a
+# count, and not because of what it happens to grant this identity today.
 "$META/setfacl" -m "group:sboxweb:r-x" -- "$ACLROOT/data" >/dev/null 2>&1
 acl_do sbmon_sboxjr_exchange_traversal_shape "$ACLROOT/data" \
     && fail "B7-A: the prover accepted a named group:sboxweb:r-x entry (B7-R2 hole)" \
-    || pass "B7-R2: the exact-set prover refuses a named group that would list the data root"
+    || pass "B7-R2: the exact-set prover refuses a second, named-group grant path"
 if [ "$(root_acl_set)" = "$(canon_acl_set)" ]; then
     fail "B7-R2: the injected named group did not even change the observed set (vacuous test)"
 else
@@ -1696,7 +1697,7 @@ user:sboxweb:--x
 group::r-x
 group:sboxweb:r-x
 mask::r-x
-other::---|B7-R2: named group grants the consumer a LISTING' \
+other::---|B7-R2: a second, named-group grant path' \
     'user::rwx
 user:sboxweb:--x
 group::r-x

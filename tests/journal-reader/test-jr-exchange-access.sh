@@ -32,16 +32,15 @@
 #             idempotently: the second run takes the zero-mutation branch and
 #             the real getfacl text is byte-identical; a hand-widened tree is
 #             repaired down to the single --x entry.
-#   D3+-> X4b the B7-R2 ACL-widening battery, on real permissions: a named
-#             group:<consumer>:r-x entry makes the exact-set prover refuse the
-#             tree AND makes the data root genuinely enumerable by the real
-#             consumer identity (the hole is observable, not just a string);
-#             an unrelated named group is refused and removed though the
-#             consumer gains nothing; a widened mask::rwx is refused and
-#             repaired to the exact canonical mask; a drifted owning-group
-#             entry is refused and repaired by the full canonical set; and the
-#             canonical tree is then re-converged twice to prove the
-#             zero-mutation fixpoint.
+#   D3+-> X4b the B7-R2 ACL-widening battery, on real permissions: every named
+#             group entry, a widened mask and a drifted owning-group entry is
+#             refused by the exact-set proof and repaired by the real
+#             convergence, and the entry class is shown to be load-bearing
+#             wherever the POSIX access-check order really does let an identity
+#             list the reader data root -- measured through the disposable
+#             identities, never assumed. The consumer probe refuses an
+#             enumerable data root on its own exit code, and the canonical tree
+#             is proven to be a convergence fixed point.
 #   D6 -> X5  an empty readable exchange dir is a legitimate clean no-op,
 #             provably distinguishable from EACCES (X1) and from ENOENT (the
 #             same tree with out/ removed).
@@ -807,12 +806,16 @@ fi
 
 # ===========================================================================
 printf -- '--- X4b (D3+): the exact-set prover refuses every ACL widening, on real permissions\n'
-# B7-R2. The subset predicates counted named USERS and the shape of `other`, so
-# a named GROUP handed the Monitor identity a listing of the reader data root
-# while every count still read "correct". These cases are the widenings that
-# used to survive: each one is injected with real setfacl, refused by the real
-# prover, demonstrated through the real consumer identity where it changes what
-# that identity can do, and then repaired by the real convergence.
+# B7-R2. The subset predicates counted named USERS and the shape of `other`, so a
+# named GROUP entry survived them while still being a real grant -- for any
+# identity that reaches the directory THROUGH that group. Which identity a
+# named group helps is decided by the POSIX access-check order, and this lane
+# measures that order instead of assuming it: on Linux, a process whose euid
+# matches a named USER entry is decided BY THAT ENTRY ALONE (case 1), while a
+# process that only matches GROUP/GROUP_OBJ entries is decided by their union
+# with the mask (cases 1b and 2). Every case below is injected with real
+# setfacl, refused by the real prover, demonstrated through a real identity's
+# own syscalls, and repaired by the real convergence.
 build_prod_tree "$T4R"
 seed_reader_state "$T4R"
 author_ev "$T4R" 1
@@ -831,9 +834,41 @@ lib_run sbmon_sboxjr_exchange_traversal_shape "$T4R"; rc=$?
 assert_eq 1 "$rc" "D3+: the exact-set prover REFUSES a named group:sboxweb:r-x entry"
 assert_eq 1 "$(printf '%s\n' "$(acl_set_of "$T4R")" | grep -c "^group:$CW_GROUP:" || true)" \
     "D3+: control -- the named group really is on the directory (the refusal is not vacuous)"
-fs_matrix "$CW_USER" "$T4R" > "$TMP/x4b-widened"
-assert_eq yes "$(mval list_root "$TMP/x4b-widened")" \
-    "D3+: and the Monitor identity CAN NOW LIST the reader data root -- the hole the review named, on real permissions"
+fs_matrix "$CW_USER" "$T4R" > "$TMP/x4b-shadowed"
+assert_eq no "$(mval list_root "$TMP/x4b-shadowed")" \
+    "D3+: measured, not assumed -- the consumer's matching named USER entry decides its access by itself, so THIS pairing does not hand it a listing"
+assert_eq yes "$(mval list_out "$TMP/x4b-shadowed")" \
+    "D3+: the consumer's legitimate exchange access is untouched by the shadowed entry"
+CUR_ROOT="$T4R"
+lib_run sbmon_sboxjr_consumer_probe; rc=$?
+if [ "$rc" = "0" ]; then
+    pass "D3+: the behavioural proof accepts it too -- this tree grants the consumer nothing beyond --x"
+else
+    fail "D3+: the consumer probe refused a tree whose consumer access is still narrow (rc=$rc): $LIB_OUT"
+fi
+CUR_ROOT="$T4R"
+lib_run sbmon_sboxjr_ensure_data_tree; rc=$?
+assert_eq 0 "$rc" "D3+: the SET proof still refuses and repairs it -- an entry that helps nobody today is not in the contract"
+assert_eq "$(canon_acl_set)" "$(acl_set_of "$T4R")" \
+    "D3+: the named group is gone and the canonical set is back (not merely one named user)"
+assert_eq 0 "$(printf '%s\n' "$(acl_set_of "$T4R")" | grep -c '^group:[^:]' || true)" \
+    "D3+: zero named-group entries survive the repair"
+
+# ---- (1b) the same entry class where it IS the grant: traversal by GROUP, and
+# no named user entry at all. This is the shape the exit-18 postcondition is
+# for, and the widening is now demonstrably real for the Monitor identity.
+setfacl -b -- "$T4R"
+setfacl -m "group:$CW_GROUP:r-x" -- "$T4R"
+CUR_ROOT="$T4R"
+lib_run sbmon_sboxjr_exchange_traversal_shape "$T4R"; rc=$?
+assert_eq 1 "$rc" "D3+: a root whose only consumer grant is a named group is refused"
+fs_matrix "$CW_USER" "$T4R" > "$TMP/x4b-bygroup"
+assert_eq yes "$(mval traverse_root "$TMP/x4b-bygroup")" \
+    "D3+: that identity does reach the tree..."
+assert_eq yes "$(mval list_root "$TMP/x4b-bygroup")" \
+    "D3+: ...and here it genuinely CAN enumerate the reader data root -- a listing is exactly what B7-A withholds"
+assert_eq no "$(mval list_state "$TMP/x4b-bygroup")" \
+    "D3+: control -- state/ is still private, so the widening is precisely the root listing (and the exit it must trip)"
 CUR_ROOT="$T4R"
 lib_run sbmon_sboxjr_consumer_probe; rc=$?
 if [ "$rc" != "0" ] && log_has "$LIB_OUT" "可枚举" \
@@ -844,9 +879,9 @@ else
 fi
 CUR_ROOT="$T4R"
 lib_run sbmon_sboxjr_ensure_data_tree; rc=$?
-assert_eq 0 "$rc" "D3+: ensure_data_tree repaired the named-group widening"
+assert_eq 0 "$rc" "D3+: convergence replaced the group grant with the canonical --x user grant"
 assert_eq "$(canon_acl_set)" "$(acl_set_of "$T4R")" \
-    "D3+: the named group is gone and the canonical set is back (not merely one named user)"
+    "D3+: the canonical set is back after the exit-18 repair"
 fs_matrix "$CW_USER" "$T4R" > "$TMP/x4b-repaired"
 assert_eq no "$(mval list_root "$TMP/x4b-repaired")" \
     "D3+: root enumeration is refused again after the repair"
@@ -862,8 +897,10 @@ fixed_shape_holds "$T4R" \
     && pass "D3+: the repaired tree satisfies the whole fixed-shape discriminator" \
     || fail "D3+: the repaired tree does not satisfy the fixed-shape discriminator"
 
-# ---- (2) a named group the consumer does not even belong to
-setfacl -m "group:$NZ_GROUP:rw-" -- "$T4R"
+# ---- (2) a named group the consumer does not belong to, but a stranger does:
+# the Monitor identity gains nothing from it at all, which is exactly why only a
+# set equality can be relied on to refuse it.
+setfacl -m "group:$NZ_GROUP:r-x" -- "$T4R"
 CUR_ROOT="$T4R"
 lib_run sbmon_sboxjr_exchange_traversal_shape "$T4R"; rc=$?
 assert_eq 1 "$rc" \
@@ -871,13 +908,25 @@ assert_eq 1 "$rc" \
 fs_matrix "$CW_USER" "$T4R" > "$TMP/x4b-unrel"
 assert_eq no "$(mval list_root "$TMP/x4b-unrel")" \
     "D3+: control -- the consumer gains nothing from it, so only an exact-set proof can catch this one"
+fs_matrix "$NZ_USER" "$T4R" > "$TMP/x4b-unrel-nz"
+assert_eq yes "$(mval list_root "$TMP/x4b-unrel-nz")" \
+    "D3+: but the named identity does gain a listing of the reader data root -- a named group is never an inert decoration"
+assert_eq no "$(mval list_out "$TMP/x4b-unrel-nz")" \
+    "D3+: and its reach stops at the root: out/ is still not its group"
+assert_eq no "$(mval read_ev "$TMP/x4b-unrel-nz")" \
+    "D3+: nor is any exchange event"
+assert_eq no "$(mval read_key "$TMP/x4b-unrel-nz")" \
+    "D3+: and hmac.key is still unreadable"
 CUR_ROOT="$T4R"
 lib_run sbmon_sboxjr_converge_exchange_traversal; rc=$?
-assert_eq 0 "$rc" "D3+: convergence removes a widening that grants the consumer nothing"
+assert_eq 0 "$rc" "D3+: convergence removes a widening that grants the Monitor identity nothing"
 assert_eq 0 "$(printf '%s\n' "$(acl_set_of "$T4R")" | grep -c '^group:[^:]' || true)" \
     "D3+: zero named-group entries survive the repair"
 assert_eq "$(canon_acl_set)" "$(acl_set_of "$T4R")" \
     "D3+: and the canonical set is exactly restored"
+fs_matrix "$NZ_USER" "$T4R" > "$TMP/x4b-unrel-fixed"
+assert_eq no "$(mval list_root "$TMP/x4b-unrel-fixed")" \
+    "D3+: the stranger cannot even reach a listing of the ancestor any more"
 
 # ---- (3) the mask widened to rwx
 setfacl -m "mask::rwx" -- "$T4R"
