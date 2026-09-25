@@ -280,6 +280,10 @@ for real on Linux CI:
 bash tests/test-mihomo-multi-vps-merge.sh
 ```
 
+Measured: `pass=131 fail=0 skip=3` on the Windows dev host, and
+`pass=137 fail=0 skip=0` in the Linux CI step -- the three Windows skips are
+exactly the symlink and permission-bit gates, which Linux runs for real.
+
 Controlled runtime validation. `tests/mihomo-multi-vps-runtime-lab.py` is
 **opt-in and never part of CI**: it refuses to run without an operator-supplied
 binary whose SHA-256 matches `--expect-sha256`, and it downloads nothing. It
