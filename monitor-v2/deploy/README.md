@@ -811,7 +811,7 @@ reader 健康、持续产出交换文件（committed seq `9 → 10`，后续 ≥
 EACCES / 存储不可读降级成"交换目录为空"，于是这次冻结以一次干净 no-op 的
 面目出现，journal 子系统从不降级。
 
-### B7-A：选择哪一个 POSIX 模型，以及为什么它是_safe_ 的最小解
+### B7-A：选择哪一个 POSIX 模型，以及为什么它是最小解
 唯一新增的授权是数据根上的**一条具名用户 ACL**：
 
 ```
@@ -821,7 +821,9 @@ EACCES / 存储不可读降级成"交换目录为空"，于是这次冻结以一
 基模式一位未改，无 default ACL，`out`/`state`/交换文件的模式一位未改。这条
 授权恰好只传递 pathname resolution 所需的搜索位，因此它：
 
-1. **不授予列举**：`--x` 里没有 `r`，`ls <root>` 仍被拒；
+1. **不授予列举**：`--x` 里没有 `r`，`ls <root>` 仍被拒 —— 但这一条只在
+   **没有**任何具名组条目时成立（见上文的 ACL 判定并集规则），所以它由全集
+   相等证明与消费侧"不可列举"探针共同把守，而不是由这一位单独把守；
 2. **不授予任何写入或读取**：具名条目按位与 `mask`，这里连 `r` 都没有；
 3. **不改变基模式**：mask 重算后仍是 `r-x`（`r-x` ∪ `--x`），所以
    `stat -c %a` 继续打印 `750`，`sbox-jr` 自己的 `r-x` 一位不少；
@@ -836,12 +838,30 @@ EACCES / 存储不可读降级成"交换目录为空"，于是这次冻结以一
 B7-A 之后与之前同样不可读 —— 这一点由真实身份探针证明，不是由模式字符串
 证明。`out` 仍然是 Monitor 可读的**唯一** reader 数据面。
 
-收敛是确定性且幂等的：`setfacl -b` 先清（把基位从 `group::` 条目还原，
-所以随后的 mask 重算只取决于基模式），再 `setfacl -m` 写唯一一条，然后
-**回读**形状，任何分歧（第二条具名用户、任何 `default:` 条目、mask 丢了
-`x`、`other` 被打开）都是 fail-closed。已存在的生产形状 `0750 root:sbox-jr`
-父目录因此被原地、幂等地修复；`setfacl`/`getfacl` 缺失是 preflight 级 STOP，
-**故意没有** `chmod` 放宽兜底 —— 窄授权之外只剩宽授权。
+形状证明不是几条子集判断，而是**规范化后的全集相等**：`getfacl` 文本去掉
+注释行与 `#effective:` 尾巴、去空行、`LC_ALL=C sort`，与库内唯一一份
+`sbmon_sboxjr_canonical_traversal_acl`（`user::rwx / user:<consumer>:--x /
+group::r-x / mask::r-x / other::---`）逐字节比较。集合相等意味着**多出来的
+条目类型本身**就是拒绝理由，所以未来任何新 ACL 类型都不可能悄悄绕过证明；
+排序使它与 `getfacl` 的输出顺序无关；mask 必须恰为 `r-x`，"包含 x"不算通过。
+
+为什么必须全集相等：POSIX ACL 的访问判定是"匹配 euid 的具名 USER 条目 ∪
+匹配进程所有组的 GROUP/GROUP_OBJ 条目，再与 mask 按位与"。因此
+`user:sboxweb:--x` 旁边只要残留一条 `group:sboxweb:r-x`，sboxweb 就**真的**
+能列举 `<root>` —— 具名用户授权与具名组授权是并集，不是覆盖。子集式的
+"有一条 --x、没有 default、mask 带 x"三条判断恰好接不住这种放宽，这也是
+评审 B7-R2 的 blocker。同理，`group::` 漂到 `r--` 或 mask 被拉到 `rwx`
+（此时 `stat -c %a` 会读出 `770`）都是形状违约。
+
+收敛是确定性且幂等的三步：`setfacl -b` 先清，**再 `chmod 0750` 重钉基模式**，
+然后 `setfacl -m` 写唯一一条具名用户 `--x`，最后**回读**并与全集比较。中间
+那次重钉不是装饰：`-b` 会把被清掉的 ACL 的基条目写回文件模式，一棵已漂移的
+树（`group::r--`）在 `-b` 之后会留下 `0740` 的基模式，只靠 `-m` 收敛出来的
+mask 是 `r-x ∪ --x` 但仍补不回属组的 `r-x`，永远到不了契约集合。重钉之后
+mask 的重算只取决于契约基模式。已存在的生产形状 `0750 root:sbox-jr` 父目录
+因此被原地、幂等地修复；幂等分支（"已是目标形状"）零 mutation、零 chmod。
+`setfacl`/`getfacl` 缺失是 preflight 级 STOP，**故意没有** `chmod` 放宽兜底
+—— 窄授权之外只剩宽授权。
 
 被否决（并写进库内决策记录）的替代方案：`0751`（把遍历权给全世界）；
 `chgrp sboxweb <root>`（既剥夺 `sbox-jr` 自己的访问，又改变 `id sboxweb`）；
@@ -871,19 +891,25 @@ Monitor 自己的视图）。
 `sbmon_sboxjr_consumer_probe` 挂在 `sbmon_sboxjr_health_proof` 里，位于
 reader 可读性探针之后，因此 enable/start 之后仍有一次真实身份复检。它以
 `runuser -u "$SBMON_USER"` 跑一段**只读**遍历：祖先可遍历（否则 exit 11）、
-`out` 可枚举（12）、`state` **不**可枚举（13）、`state/committed` 与
-`state/hmac.key` **不**可读（14/15）、每个 `ev-*.jsonl` 在消费侧视角下是
-非符号链接的普通文件（16）且能被只读打开并抽干（17）。空 `out` 本身就是合法
-终态（新激活不该被要求先有事件文件），而任何一条不成立都是 `sboxjr_die` +
-非零返回 —— 权限形状挡住 Monitor 读取交换文件的部署会被回滚，绝不会作为
-一次静默损坏的 release 提交。
+`<root>` **不**可列举（18）、`out` 可枚举（12）、`state` **不**可枚举（13）、
+`state/committed` 与 `state/hmac.key` **不**可读（14/15）、每个 `ev-*.jsonl`
+在消费侧视角下是非符号链接的普通文件（16）且能被只读打开并抽干（17）。空
+`out` 本身就是合法终态（新激活不该被要求先有事件文件），而任何一条不成立都
+是 `sboxjr_die` + 非零返回 —— 权限形状挡住 Monitor 读取交换文件的部署会被
+回滚，绝不会作为一次静默损坏的 release 提交。
+
+消费侧证明**同时**断言根权限的两面：可搜索 / 可遍历，且不可列举。后者是
+B7-R2 要求的新增面，并且占一个**独立**退出码 18：生产诊断因此能把"数据根
+被具名组放宽"这一具体违约和"根本没有遍历权"（11）、"读不到 out"（12）区分
+开，而诊断文本只带码与路径，不带任何目录内容。
 
 ### 判据分布
 | # | 判据 | 位置 |
 |---|---|---|
 | 1 | 生产 0.3.0 形状必须**失败**：真实消费身份 `stat` 成功而 `listdir` EACCES；契约真抛 `ExchangeDirUnreadable`（cause=PermissionError, errno=13）；`consumer_probe` 以 exit-11 诊断拒绝 | `tests/journal-reader/test-jr-exchange-access.sh` X0/X1 |
-| 2 | 修复形状成立：`out` 可列举、reader 写出的 `0640` 文件按字节读出、`<root>` 仍不可列举、`state`/committed/hmac.key 仍不可读、`stat -c %a` 仍是 750、两侧 `id -nG` 与组成员关系零变化、无关身份读不到内容、后补的 reader 文件仍是 `0640 reader:consumer` | 同上 X3 |
+| 2 | 修复形状成立：`out` 可列举、reader 写出的 `0640` 文件按字节读出、`<root>` 仍不可列举、`state`/committed/hmac.key 仍不可读、`stat -c %a` 仍是 750、**规范化后的完整 ACL 集合与契约逐字节相等且具名组条目为 0**、两侧 `id -nG` 与组成员关系零变化、无关身份读不到内容、后补的 reader 文件仍是 `0640 reader:consumer` | 同上 X3 |
 | 3 | 已存在的生产形状树安全且幂等地收敛：第二次运行命中"零变更"分支、真实 `getfacl` 文本逐字节相同、手工放宽（额外具名条目 + default ACL）被修回唯一 `--x` | 同上 X4 |
+| 3b | B7-R2 五条真实权限判别：具名 `group:<consumer>:r-x` 被精确集合证明拒绝**且**真实消费身份确实能列举 `<root>`（漏洞可观察，不只是字符串）、收敛后具名组消失 / 列举再次被拒 / `out` 读与 state 隐私不变；无关具名组同样被拒并被清除（消费侧什么也没得到）；mask 拉到 `rwx` 被拒并修回精确 `mask::r-x`（期间 `stat` 读出 `770`）；属组条目漂到 `r--` 被拒、`-b → chmod 0750 → -m` 后完整契约集合回来（读者自身在修复前连 `<root>/out` 都无法遍历 —— 重钉是有承重作用的）；规范树再跑两次证明真零变更、`getfacl` 逐字节相同 | 同上 X4b |
 | 4 | 不可读目录 → terminal 不动、计数器不动、journal 降级为脱敏码、P1 仍写、状态面无任何路径/errno/异常文本 | 同上 X1/X1b，`tests/test-monitor-v2-hist.sh` H13 |
 | 5 | 权限修复后同一 Monitor 进程吸入既有持久文件、terminal 从 0 追到 2、自身降级清除、重复再跑一遍不重计不重插 | 同上 X2 |
 | 6 | 空且可读的 `out` 是干净的 no-op，与 EACCES、与 ENOENT 三态可区分；从未激活 reader 的机器保持安静 | 同上 X5/X6 |
