@@ -73,6 +73,7 @@ jobs:
           bash -n tests/test-monitor-v2-jr.sh
           bash -n tests/test-monitor-v2-jr-deploy.sh
           bash -n tests/test-monitor-v2-p2b-integration.sh
+          bash -n tests/test-mihomo-multi-vps-merge.sh
           bash -n monitor-v2/deploy/app-bin/monitor-contract-probe
           bash -n tests/journal-reader/test-jr-live.sh
           bash -n tests/journal-reader/test-jr-exchange-access.sh
@@ -86,6 +87,11 @@ jobs:
           bash -n monitor-v2/deploy/e3-m3c-phase1.sh
           bash -n monitor-v2/deploy/e3-m3c-phase2.sh
           bash -n monitor-v2/deploy/e3-m3c-phase3.sh
+
+      - name: "Python tool static gate (issue #48 PR-48A offline profile merge)"
+        run: |
+          python3 -m py_compile tools/mihomo-multi-vps-merge.py
+          python3 -m py_compile tests/mihomo-multi-vps-runtime-lab.py
 
   # ---------------------------------------------------------------------
   # Lane B -- core regression. OS-independent product contracts that do not
@@ -131,6 +137,9 @@ jobs:
 
       - name: "E3 M4 canonical Mihomo renderer contract (single source / purity / fail-closed)"
         run: bash tests/e3/test-m4-renderer.sh
+
+      - name: "Multi-VPS Mihomo profile merge contract (issue #48 PR-48A)"
+        run: bash tests/test-mihomo-multi-vps-merge.sh
 
       - name: "E3 M1 static contract (single engine / seven ops / systemd candidate)"
         run: bash tests/e3/test-m1-static.sh

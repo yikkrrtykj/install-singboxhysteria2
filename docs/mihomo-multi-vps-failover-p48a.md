@@ -266,6 +266,12 @@ and `output: written`.
 
 ## Verification
 
+CI placement is repo/client-management scope, not Monitor regression:
+`shell-tests` `fast-checks` runs `bash -n` on the suite plus
+`python3 -m py_compile` on both Python files, and `core-regression` runs the
+contract suite as the step "Multi-VPS Mihomo profile merge contract
+(issue #48 PR-48A)".
+
 Static contract suite (34 discriminators T1..T34 plus static gates), runs on any
 host with Python 3.10+; symlink and mode assertions skip on Windows and execute
 for real on Linux CI:
