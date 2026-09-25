@@ -1056,28 +1056,34 @@ sbmon_sboxjr_getfacl_text() { # <path> -> prints normalized ACL entry lines
         | grep -v '^#' | grep -v '^$' || true
 }
 
-# Exact-shape proof of the traversal grant: EXACTLY one named user entry,
-# equal to user:$SBMON_USER:--x, no default entries at all, a mask that still
-# carries the x bit (otherwise the grant is masked away to nothing), and a
-# closed other class. rc 1 on any divergence -- including "more than one
-# named user", which is the widening this shape exists to forbid.
+# The canonical access ACL of the B7-A contract, sorted: the full set, entry
+# for entry. A directory that carries ANYTHING ELSE -- one extra named group,
+# a widened mask, a shifted owning-group entry, a class this model never
+# imagined -- is not in this contract, however well its user: grant reads.
+# user::rwx / group::r-x / other::--- are the 0750 base bits seen through the
+# ACL interface, mask::r-x is what keeps the grant un-masked without borrowing
+# a listing bit for anyone, and user:$SBMON_USER:--x is the whole point.
+sbmon_sboxjr_canonical_traversal_acl() {
+    printf '%s\n' "user::rwx" "user:$SBMON_USER:--x" "group::r-x" \
+        "mask::r-x" "other::---" | LC_ALL=C sort
+}
+
+# Exact-shape proof of the traversal grant: the normalized ACL text must be
+# EQUAL to the canonical set. This is deliberately one full-set comparison
+# rather than a handful of independent subset predicates -- a subset form is
+# what let a named `group:$SBMON_USER:r-x` entry through (it grants a LISTING
+# of the reader data root, which is exactly what B7-A withholds) while every
+# individual count still read "correct". A new ACL class therefore fails the
+# proof by existing, instead of having to be thought of and forbidden.
 sbmon_sboxjr_exchange_traversal_shape() { # <dir>
-    local d="$1" text named granted defaults masked closed
+    local d="$1" text have want
     text="$(sbmon_sboxjr_getfacl_text "$d")" || return 1
-    # Every line class is COUNTED, never probed with `grep -q`: -q leaves the
-    # pipeline as soon as it matches, and a writer killed by the resulting
-    # SIGPIPE can make the pipeline report a failure grep itself never had --
-    # an ACL proof must not depend on how the pipe drains.
-    named="$(printf '%s\n' "$text" | grep -c '^user:[^:][^:]*:' || true)"
-    granted="$(printf '%s\n' "$text" | grep -Fxc -- "user:$SBMON_USER:--x" || true)"
-    defaults="$(printf '%s\n' "$text" | grep -c '^default:' || true)"
-    masked="$(printf '%s\n' "$text" | grep -Ec '^mask::..x$' || true)"
-    closed="$(printf '%s\n' "$text" | grep -Fxc -- 'other::---' || true)"
-    if [ "$named" != "1" ] || [ "$granted" != "1" ] || [ "$defaults" != "0" ] \
-        || [ "$masked" != "1" ] || [ "$closed" != "1" ]; then
-        return 1
-    fi
-    return 0
+    want="$(sbmon_sboxjr_canonical_traversal_acl)"
+    # Sorted, and the sorted forms compared as wholes: getfacl emits entry
+    # classes in a fixed order, but the proof is about the SET, so neither the
+    # verdict nor a legitimately reordered dump depends on line order.
+    have="$(printf '%s\n' "$text" | LC_ALL=C sort)"
+    [ "$have" = "$want" ]
 }
 
 # Idempotent, fail-closed convergence of the traversal grant. Called at the
@@ -1089,6 +1095,14 @@ sbmon_sboxjr_exchange_traversal_shape() { # <dir>
 # restores the base 0750 and then re-adding exactly one entry makes the
 # result a function of the base mode alone -- run it twice, the second
 # converges to the identical shape and takes the zero-mutation early return.
+#
+# The chmod 0750 BETWEEN -b and -m is not decoration: -b writes the ACL's
+# base entries back into the file mode, so a tree whose owning-group entry
+# had drifted (group::r--, or a widened mask that reads as 0770) comes out of
+# -b carrying that drift as its real mode. Re-pinning the contract base is
+# what lets the single --x grant land on 0750 again; skipping it would leave
+# a divergent tree failing its own read-back forever.
+#
 # Missing acl tools are a preflight-class STOP: there is deliberately no
 # chmod-widening fallback, because the only alternative to the narrow grant
 # is a wider one.
@@ -1112,6 +1126,8 @@ sbmon_sboxjr_converge_exchange_traversal() {
     fi
     "$SBOXJR_SETFACL" -b -- "$SBOXJR_DATA_ROOT" \
         || { sboxjr_die "$SBOXJR_DATA_ROOT：清除既有 ACL 失败（fail-closed）"; return 1; }
+    chmod 0750 "$SBOXJR_DATA_ROOT" \
+        || { sboxjr_die "$SBOXJR_DATA_ROOT：基模式 0750 重钉失败（fail-closed）"; return 1; }
     "$SBOXJR_SETFACL" -m "user:$SBMON_USER:--x" -- "$SBOXJR_DATA_ROOT" \
         || { sboxjr_die "$SBOXJR_DATA_ROOT：写入 $SBMON_USER 遍历授权失败（fail-closed）"; return 1; }
     sbmon_sboxjr_exchange_traversal_shape "$SBOXJR_DATA_ROOT" \
@@ -1421,6 +1437,13 @@ sbmon_sboxjr_readability_probe() {
 #
 # What must hold:
 #   <root>            searchable (test -x)                 -> exit 11
+#   <root>            NOT enumerable                        -> exit 18
+#                     B7-A grants a search bit, never a listing: the same
+#                     identity that must reach out/ must still be unable to
+#                     enumerate the reader data root. A named-group or
+#                     widened-mask ACL that hands it one is a contract
+#                     violation, and it is diagnosed on its own exit code so
+#                     production can name the widening without reading it.
 #   <root>/out        enumerable (ls)                       -> exit 12
 #                     EMPTY IS VALID: a fresh activation has no exchange file
 #                     yet, and an empty readable dir is a legitimate clean
@@ -1445,6 +1468,7 @@ sbmon_sboxjr_consumer_probe() {
     local script='
         root=$1; st=$2; od=$3
         test -x "$root" || exit 11
+        if ls -A -- "$root" >/dev/null 2>&1; then exit 18; fi
         ls -A -- "$od" >/dev/null 2>&1 || exit 12
         if ls -A -- "$st" >/dev/null 2>&1; then exit 13; fi
         if [ -e "$st/committed" ] && [ -r "$st/committed" ]; then exit 14; fi
@@ -1461,7 +1485,7 @@ sbmon_sboxjr_consumer_probe() {
         "$SBOXJR_DATA_ROOT" "$SBOXJR_STATE_DIR" "$SBOXJR_OUT_DIR" \
         >/dev/null 2>&1 || rc=$?
     case "$rc" in
-        0) sboxjr_log "消费侧探针通过：$SBMON_USER 可遍历 $SBOXJR_DATA_ROOT 并只读枚举 $SBOXJR_OUT_DIR"
+        0) sboxjr_log "消费侧探针通过：$SBMON_USER 可遍历 $SBOXJR_DATA_ROOT（且不可枚举）并只读枚举 $SBOXJR_OUT_DIR"
             return 0 ;;
         11) sboxjr_die "$SBMON_USER 无法遍历 $SBOXJR_DATA_ROOT（祖先缺遍历权：B7-A 形状不成立，fail-closed）" ;;
         12) sboxjr_die "$SBMON_USER 无法枚举交换目录 $SBOXJR_OUT_DIR（消费侧读不到交换文件，fail-closed）" ;;
@@ -1470,6 +1494,7 @@ sbmon_sboxjr_consumer_probe() {
         15) sboxjr_die "$SBMON_USER 可读 state/hmac.key（密钥越界，fail-closed）" ;;
         16) sboxjr_die "$SBMON_USER 视角下交换条目不是普通文件（fail-closed）" ;;
         17) sboxjr_die "$SBMON_USER 无法只读打开 0640 交换文件（消费侧读不到事件，fail-closed）" ;;
+        18) sboxjr_die "$SBMON_USER 可枚举 $SBOXJR_DATA_ROOT（数据根被放宽：契约只授予 --x 遍历权，fail-closed）" ;;
         *) sboxjr_die "消费侧探针以未知退出码 $rc 结束（fail-closed）" ;;
     esac
     return 1
