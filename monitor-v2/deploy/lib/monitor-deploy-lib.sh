@@ -1070,11 +1070,16 @@ sbmon_sboxjr_canonical_traversal_acl() {
 
 # Exact-shape proof of the traversal grant: the normalized ACL text must be
 # EQUAL to the canonical set. This is deliberately one full-set comparison
-# rather than a handful of independent subset predicates -- a subset form is
-# what let a named `group:$SBMON_USER:r-x` entry through (it grants a LISTING
-# of the reader data root, which is exactly what B7-A withholds) while every
-# individual count still read "correct". A new ACL class therefore fails the
-# proof by existing, instead of having to be thought of and forbidden.
+# rather than a handful of independent subset predicates, because a subset form
+# only ever forbids what somebody already thought to count. A named group entry
+# is the case in point: it is a real second grant path -- any identity that
+# reaches this directory THROUGH that group is served by it -- so it is outside
+# the contract whether or not it changes what $SBMON_USER can do today. (On
+# Linux it may well change nothing for $SBMON_USER: the access check is decided
+# by a matching named USER entry and stops there, which is precisely why
+# per-identity behavioural probes cannot be the primary proof.) A new ACL class
+# therefore fails the proof by existing, instead of having to be imagined,
+# counted, and separately forbidden.
 sbmon_sboxjr_exchange_traversal_shape() { # <dir>
     local d="$1" text have want
     text="$(sbmon_sboxjr_getfacl_text "$d")" || return 1
