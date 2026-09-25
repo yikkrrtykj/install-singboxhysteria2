@@ -270,6 +270,13 @@ E4 / Packaging / existing-api-auth migration / journal-time 兼容套件全部�
   `SBMON_REQUIRED_COMMANDS` 覆写仅限显式测试门
   （fixture / `SBMON_TEST_ALLOW_REQUIRED_COMMANDS_OVERRIDE=1`）之后生效；
   生产调用携带该覆写会被拒绝（fail-closed），预检不可被绕过。
+- **主机依赖（host dependency）**：journal reader 激活额外要求 `setfacl` `getfacl`
+  （package `acl`，最小遍历权收敛）与 `runuser`（package `util-linux`，真实身份可读
+  性证明）。顶层服务器安装脚本 `install.sh` 按 **package → command 映射**保证它们：
+  命令全部解析时一次包管理器都不调用，安装后重新解析命令才承认成功，仍缺失则
+  fail-closed 中止且绝不进入后续部署；Monitor 侧的 fail-closed 预检仍是权威，
+  不受此影响（决策与判别见 `deploy/README.md` §21）。**不**把 `acl` 当命令探测——
+  包名与被探测命令不同。
 - **service.api 契约全版本一致**：loopback-only URL 契约（`127.0.0.1` /
   `localhost` / `::1`）与鉴权要求（web 模式强制 `SBMON_API_SECRET_FILE`）
   在三个基线上逐字节相同，无任何版本例外。
