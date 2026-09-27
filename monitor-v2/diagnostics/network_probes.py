@@ -19,26 +19,45 @@ Safety contract (all enforced, all tested):
   9-member vocabulary; the only string an ``ok`` probe may emit beyond
   the vocabulary is the canonical public egress IP (the reviewed P1
   exception, see docs/monitor-v2-network-probes-p3a.md section 9).
-* Every network operation is bounded twice: a per-probe socket timeout
-  and the per-slot join budget inside the cycle deadline. A hanging
-  probe is abandoned as ``timeout`` (daemon worker + own socket timeout
-  as the backstop); it can neither delay the other slots past the cycle
-  deadline nor tear the result apart -- the result is built from a
-  fully-populated default and each slot is replaced at most once.
-* The public entry point NEVER raises to a future publisher loop.
+* Every worker is bounded by an ABSOLUTE per-worker deadline measured
+  from the cycle start -- ``cycle start + min(spec timeout, total cycle
+  deadline)`` -- plus its own socket timeout. Joins advance against those
+  absolute deadlines, so a slow slot can neither make a healthy slot miss
+  its own budget nor block the cycle past it, and EVERY late outcome --
+  ok or failed alike, by recorded completion timestamp -- is rejected and
+  adjudicated ``timeout``. Daemon workers with their own socket timeouts
+  are the backstop for a hung syscall; the result is built from a
+  fully-populated default and each slot is replaced at most once, so it
+  can never be torn.
+* At most ONE worker per slot is outstanding engine-wide: while a
+  previous cycle's worker is still hung, later cycles do not stack a new
+  thread per cycle -- the slot is adjudicated ``unavailable`` with zero
+  I/O and zero threads until the old worker dies, so abandoned workers
+  cannot accumulate across cycles.
+* The public entry point NEVER raises to a future publisher loop:
+  ``targets`` is gated by exact spec type (anything else stays dark),
+  ``cycle_id`` passes a strict token grammar (caller free text is
+  replaced by an engine-generated id, never echoed), ``clock`` is
+  coerced to a finite non-negative float, and a final containment line
+  returns the all-``unavailable`` dark result should anything ever
+  escape those gates.
 * stdlib only, no listeners, no filesystem writes, no privileged calls,
   no configuration mutation, no logging of results or exceptions.
 
 The UDP probe is an application-level DNS round trip (``udp_dns_roundtrip``
 semantics): a successful ``sendto()`` proves nothing and is never
-reported as health; it evidences generic UDP egress + return path ONLY,
-never "all UDP / Hysteria2 paths are healthy".
+reported as health; the reply is bound to the CONFIGURED resolver peer
+(connected datagram socket) AND to the exact question bytes we sent, so
+neither a stray nor an answer to somebody else's query can score a false
+positive. It evidences generic UDP egress + return path ONLY, never "all
+UDP / Hysteria2 paths are healthy".
 """
 
 from __future__ import annotations
 
 import http.client
 import ipaddress
+import re
 import socket
 import ssl
 import struct
@@ -90,9 +109,14 @@ UDP_TIMEOUT_SECONDS = 3.0
 EGRESS_TIMEOUT_SECONDS = 5.0
 CYCLE_DEADLINE_SECONDS = 12.0
 
-# Response bodies are read into a bounded discard buffer, never kept.
+# Response bodies are read only where the contract consumes them, into a
+# bounded buffer that is never kept.
 _HTTP_BODY_READ_CAP = 65536
 _UDP_DEFAULT_MAX_REPLY = 2048
+
+# Caller-supplied cycle ids are admitted only through this grammar, so a
+# future publisher's free text can never widen the result schema.
+_CYCLE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}\Z")
 
 
 class SpecError(ValueError):
@@ -161,7 +185,10 @@ class HttpsProbeSpec:
     """Direct-egress HTTPS probe (http.client NEVER consults
     HTTP_PROXY/HTTPS_PROXY, unlike urllib.request). TLS verification is
     structurally on: ``create_default_context`` is the only context
-    factory on this path and no verification-bypass field exists."""
+    factory on this path and no verification-bypass field exists.
+    ``cafile`` REPLACES the trust store that gets consulted (the loopback
+    test fakes are why it exists): it can only narrow what is trusted,
+    never disable validation."""
     host: str
     port: int = 443
     path: str = "/"
@@ -246,6 +273,10 @@ class ProbeTargets:
     egress: object = None
 
 
+_SPEC_TYPES = {"dns": DnsProbeSpec, "https": HttpsProbeSpec,
+               "udp": UdpProbeSpec, "egress": EgressProbeSpec}
+
+
 # -- closed slot builders ------------------------------------------------------
 
 def _probe_slot(error_code):
@@ -269,19 +300,62 @@ def _ok_slot(latency_ms):
             "error_code": ERR_NONE}
 
 
-def _finish_slot(started, code, timeout_seconds):
+def _dark_slots():
+    slots = {slot: _probe_slot(ERR_UNAVAILABLE) for slot in PROBE_SLOTS}
+    slots["egress"] = _egress_slot(ERR_UNAVAILABLE)
+    return slots
+
+
+def _finish_slot(started, code):
     """Close one probe observation into a slot. ``code`` decides ok vs
-    failed; latency is emitted only on the ok path. An ok observation
-    that outlived its own budget returns None: the cycle join has
-    already (or will) record the slot as timeout, and a late worker must
-    never overwrite an already-adjudicated slot."""
-    cap_ms = timeout_seconds * 1000.0
+    failed; latency is emitted only on the ok path. Deadline ownership
+    lies with the CYCLE ENGINE (absolute per-worker deadlines judged on
+    the recorded completion timestamp), not here: a worker that finishes
+    late has its whole outcome rejected there, ok or failed alike."""
     elapsed_ms = (time.monotonic() - started) * 1000.0
     if code == ERR_NONE:
-        if elapsed_ms > cap_ms:
-            return None
         return _ok_slot(elapsed_ms)
     return _probe_slot(code)
+
+
+# -- caller-input sanitizers (entry never raises, free text never echoes) ------
+
+def _sanitize_cycle_id(value):
+    """A caller id survives only if it is a str inside the strict token
+    grammar; everything else (None, free text, over-long, non-string) is
+    REPLACED by an engine-generated id, never echoed toward a result."""
+    if isinstance(value, str) and _CYCLE_ID_RE.match(value):
+        return value
+    return uuid.uuid4().hex
+
+
+def _sanitize_epoch(clock):
+    """epoch is a finite non-negative float whatever the caller's clock
+    returns or raises; a misbehaving clock is replaced by the engine's
+    own wall clock (type-only judgement -- the exception is never
+    inspected)."""
+    try:
+        value = float(clock())
+    except Exception:  # noqa: BLE001 -- type-only containment
+        return time.time()
+    if not (0.0 <= value < float("inf")):  # NaN/inf/negative fail closed
+        return time.time()
+    return value
+
+
+def _slot_spec(targets, slot):
+    """Deny-by-default spec gate: only the exact reviewed spec class for
+    this slot arms a worker. Wrong slot, junk, hostile ``__getattr__``
+    or subclassing all leave the slot dark with ZERO I/O and ZERO
+    threads -- caller-supplied objects can therefore never widen the
+    schema through a bespoke spec implementation."""
+    try:
+        spec = getattr(targets, slot, None)
+    except Exception:  # noqa: BLE001 -- containment: junk targets
+        return None
+    if type(spec) is not _SPEC_TYPES[slot]:
+        return None
+    return spec
 
 
 # -- probe workers (each returns exactly one closed slot) ----------------------
@@ -306,14 +380,20 @@ def _classify_client_error(exc):
 def _make_tls_context(spec):
     # Verification is structurally ON: create_default_context() sets
     # CERT_REQUIRED + check_hostname, and no knob on this spec can turn
-    # either off. cafile only WIDENS the trust store (test fakes).
+    # either off. cafile REPLACES the consulted trust store (test fakes
+    # and private CAs): narrower, never a bypass.
     return ssl.create_default_context(cafile=spec.cafile)
 
 
-def _https_get(spec, read_cap):
+def _https_get(spec, read_cap=None):
     """Shared direct-egress HTTPS GET. Returns
     ``(started, response_status, body_bytes)``; every failure surfaces
     as an exception for the caller's closed mapping.
+
+    ``read_cap`` None means the body is IRRELEVANT to the contract (the
+    https probe judges the status code only): it is never drained, the
+    connection is simply closed after the headers. When a cap is given
+    (egress), at most cap+1 bytes are read into a local buffer.
 
     The TLS socket is wrapped explicitly so the SNI/verification name
     (``server_hostname``) is under spec control on every Python version;
@@ -339,7 +419,7 @@ def _https_get(spec, read_cap):
         conn.sock = tls
         conn.request("GET", spec.path)
         response = conn.getresponse()
-        body = response.read(read_cap)
+        body = response.read(read_cap) if read_cap is not None else b""
         return started, response.status, body
     finally:
         if conn is not None:
@@ -351,15 +431,15 @@ def _https_get(spec, read_cap):
 
 def _run_https_probe(spec):
     try:
-        started, status, _body = _https_get(spec, _HTTP_BODY_READ_CAP)
-        # _body is DISCARDED unexamined: the success contract is the
-        # status code only, so no response byte can travel anywhere.
+        started, status, _body = _https_get(spec)
+        # No body is read at all: the success contract is the status
+        # code, so no response byte can travel anywhere.
         code = ERR_NONE if status in spec.allowed_statuses \
             else ERR_BAD_RESPONSE
     except Exception as exc:  # noqa: BLE001 -- closed mapping only
         started = time.monotonic()
         code = _classify_client_error(exc)
-    return _finish_slot(started, code, spec.timeout_seconds)
+    return _finish_slot(started, code)
 
 
 def _parse_egress_answer(body, require_global):
@@ -392,9 +472,8 @@ def _run_egress_probe(spec):
     except Exception as exc:  # noqa: BLE001 -- closed mapping only
         started = time.monotonic()
         code = _classify_client_error(exc)
-    slot = _finish_slot(started, code, spec.timeout_seconds)
-    if slot is not None:
-        slot["ip"] = ip if code == ERR_NONE else None
+    slot = _finish_slot(started, code)
+    slot["ip"] = ip if code == ERR_NONE else None
     return slot
 
 
@@ -411,15 +490,22 @@ def _udp_encode_query(hostname, query_id):
     return header + question
 
 
-def _udp_classify_reply(data, query_id, max_bytes):
+def _udp_classify_reply(data, query_id, max_bytes, question):
     """Closed code for one received datagram (ERR_NONE = the round-trip
-    contract is satisfied)."""
+    contract is satisfied). ``question`` is the exact qname+QTYPE+QCLASS
+    bytes we sent: RFC 1035 echoes the question in every reply, so the
+    echo is checked verbatim."""
     if len(data) > max_bytes:
         return ERR_BAD_RESPONSE
     if len(data) < 12:
         return ERR_PROTOCOL_FAILED
     rid, flags, qd = struct.unpack("!HHH", data[:6])
     if rid != query_id or (flags & 0x8000) == 0 or qd != 1:
+        return ERR_PROTOCOL_FAILED
+    end = 12 + len(question)
+    if len(data) < end or data[12:end] != question:
+        # QUESTION BINDING: an answer to somebody else's question is not
+        # OUR round trip, however valid it looks.
         return ERR_PROTOCOL_FAILED
     if flags & 0x0200:               # TC: a truncated answer proves nothing
         return ERR_BAD_RESPONSE
@@ -438,19 +524,23 @@ def _run_udp_probe(spec):
             query_id = struct.unpack("!H", uuid.uuid4().bytes[:2])[0]
             packet = _udp_encode_query(spec.query_hostname, query_id)
         except SpecError:
-            return _finish_slot(started, ERR_PROTOCOL_FAILED,
-                                spec.timeout_seconds)
+            return _finish_slot(started, ERR_PROTOCOL_FAILED)
+        question = packet[12:]
         family = (socket.AF_INET6 if ":" in spec.resolver_host
                   else socket.AF_INET)
         sock = socket.socket(family, socket.SOCK_DGRAM)
         sock.settimeout(spec.timeout_seconds)
-        sock.sendto(packet, (spec.resolver_host, spec.resolver_port))
+        # PEER BINDING: a CONNECTED datagram socket both pins the
+        # outgoing request to the configured resolver and lets the
+        # kernel discard any reply not coming from exactly that peer --
+        # a perfectly-formed answer from another source never reaches us.
+        sock.connect((spec.resolver_host, spec.resolver_port))
+        sock.send(packet)
         deadline = started + spec.timeout_seconds
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                return _finish_slot(started, ERR_TIMEOUT,
-                                    spec.timeout_seconds)
+                return _finish_slot(started, ERR_TIMEOUT)
             sock.settimeout(remaining)
             try:
                 data = sock.recv(spec.max_response_bytes + 1)
@@ -458,29 +548,29 @@ def _run_udp_probe(spec):
                 # sendto() success is DELIBERATELY NOT health: silence
                 # on the return path is exactly this probe's failure
                 # mode it exists to catch.
-                return _finish_slot(started, ERR_TIMEOUT,
-                                    spec.timeout_seconds)
+                return _finish_slot(started, ERR_TIMEOUT)
+            except (ConnectionResetError, ConnectionRefusedError):
+                # ICMP port-unreachable against the connected peer: the
+                # return path was refused outright.
+                return _finish_slot(started, ERR_CONNECT_FAILED)
             except OSError as exc:
                 # Windows raises WSAEMSGSIZE where POSIX truncates: an
                 # over-cap datagram is the SAME contract violation.
                 if getattr(exc, "winerror", None) == 10040:
-                    return _finish_slot(started, ERR_BAD_RESPONSE,
-                                        spec.timeout_seconds)
+                    return _finish_slot(started, ERR_BAD_RESPONSE)
                 raise
             # STRICT first-reply adjudication: the answer's contract
-            # (id match, header shape, flags) is decided on the datagram
-            # that arrives, not on a re-listen loop a noisy or hostile
-            # peer could use to stall the slot.
-            return _finish_slot(started,
-                                _udp_classify_reply(data, query_id,
-                                                    spec.max_response_bytes),
-                                spec.timeout_seconds)
+            # (peer, id, question echo, header shape, flags) is decided
+            # on the datagram that arrives, not on a re-listen loop a
+            # noisy or hostile peer could use to stall the slot.
+            return _finish_slot(started, _udp_classify_reply(
+                data, query_id, spec.max_response_bytes, question))
     except Exception as exc:  # noqa: BLE001 -- closed mapping only
         code = (ERR_TIMEOUT if isinstance(exc, (TimeoutError,
                                                 socket.timeout))
                 else ERR_CONNECT_FAILED if isinstance(exc, OSError)
                 else ERR_UNAVAILABLE)
-        return _finish_slot(started, code, spec.timeout_seconds)
+        return _finish_slot(started, code)
     finally:
         if sock is not None:
             try:
@@ -496,16 +586,15 @@ def _run_dns_probe(spec):
         answers = resolver(spec.hostname, 0, socket.AF_UNSPEC,
                            socket.SOCK_STREAM)
     except (socket.gaierror, OSError):
-        return _finish_slot(started, ERR_DNS_FAILED, spec.timeout_seconds)
+        return _finish_slot(started, ERR_DNS_FAILED)
     except Exception:  # noqa: BLE001 -- type-only classification
-        return _finish_slot(started, ERR_UNAVAILABLE, spec.timeout_seconds)
+        return _finish_slot(started, ERR_UNAVAILABLE)
     # The RESOLVED ADDRESSES ARE DISCARDED unexamined: only the FACT of
     # success is reported, so no resolved IP can ever ride toward a
     # persistence boundary through this slot.
     count = len(answers) if isinstance(answers, (list, tuple)) else 0
     return _finish_slot(started,
-                        ERR_NONE if count > 0 else ERR_DNS_FAILED,
-                        spec.timeout_seconds)
+                        ERR_NONE if count > 0 else ERR_DNS_FAILED)
 
 
 _WORKERS = {"dns": _run_dns_probe, "https": _run_https_probe,
@@ -514,20 +603,23 @@ _WORKERS = {"dns": _run_dns_probe, "https": _run_https_probe,
 
 # -- cycle engine ---------------------------------------------------------------
 
-def run_probe_cycle(targets=None, cycle_id=None, clock=time.time,
-                    total_deadline_seconds=CYCLE_DEADLINE_SECONDS):
-    """Run one bounded probe cycle; returns the CLOSED result dict.
+# One-outstanding-worker discipline per slot (A4): a hung worker HOLDS
+# its slot; later cycles neither stack threads nor wait for it, they
+# adjudicate the slot ``unavailable`` until the old worker dies.
+_INFLIGHT = {slot: None for slot in PROBE_SLOTS}
+_INFLIGHT_LOCK = threading.Lock()
 
-    Never raises: caller mistakes (bad targets objects, junk specs, even
-    an invalid total deadline -- coerced to the default) can only widen
-    failure codes, never escape. Each configured probe gets its own
-    worker thread and its own join budget
-    (``min(spec.timeout_seconds, cycle remaining)``); a worker that
-    misses its budget is abandoned as ``timeout`` (daemon thread + own
-    socket timeout as backstops). The result always carries all six
-    top-level keys and one complete slot per probe: partial
-    "exception text + half a struct" outcomes are unconstructible.
-    """
+
+def _worker_busy(slot):
+    """INTERNAL (test surface): is a previous cycle's worker still
+    occupying this slot?"""
+    with _INFLIGHT_LOCK:
+        thread = _INFLIGHT.get(slot)
+        return thread is not None and thread.is_alive()
+
+
+def _run_probe_cycle_inner(targets, cycle_id, clock,
+                           total_deadline_seconds):
     if targets is None:
         targets = ProbeTargets()
     try:
@@ -536,55 +628,98 @@ def run_probe_cycle(targets=None, cycle_id=None, clock=time.time,
     except SpecError:
         total_deadline_seconds = CYCLE_DEADLINE_SECONDS
     cycle_started = time.monotonic()
-    slots = {slot: _probe_slot(ERR_UNAVAILABLE) for slot in PROBE_SLOTS}
-    slots["egress"] = _egress_slot(ERR_UNAVAILABLE)
+    slots = _dark_slots()
     outcomes = {}
     threads = {}
+    deadlines = {}
     for slot in PROBE_SLOTS:
-        spec = getattr(targets, slot, None)
+        spec = _slot_spec(targets, slot)
         if spec is None:
-            continue  # not configured: stays the default unavailable slot
+            continue  # unconfigured or non-exact type: stays dark
+        try:
+            spec_timeout = _require_positive_timeout(
+                getattr(spec, "timeout_seconds", None), "timeout_seconds")
+        except SpecError:
+            spec_timeout = CYCLE_DEADLINE_SECONDS
         worker = _WORKERS[slot]
+        # ABSOLUTE per-worker deadline, fixed at cycle start -- never a
+        # budget recomputed relative to whenever this slot's join runs.
+        deadline = cycle_started + min(spec_timeout,
+                                       total_deadline_seconds)
 
         def _runner(slot=slot, spec=spec, worker=worker):
             try:
-                outcomes[slot] = worker(spec)
+                outcome = worker(spec)
             except Exception:  # noqa: BLE001 -- last containment line
-                outcomes[slot] = None
+                outcome = None
+            # Record completion BEFORE releasing the slot, so any
+            # accepted outcome provably belongs to THIS cycle.
+            completed = time.monotonic()
+            with _INFLIGHT_LOCK:
+                if _INFLIGHT.get(slot) is threading.current_thread():
+                    _INFLIGHT[slot] = None
+            outcomes[slot] = (outcome, completed)
 
-        thread = threading.Thread(target=_runner, name="probe-" + slot,
-                                  daemon=True)
+        with _INFLIGHT_LOCK:
+            previous = _INFLIGHT.get(slot)
+            if previous is not None and previous.is_alive():
+                continue  # occupied by a hung worker: no new thread, I/O
+            thread = threading.Thread(target=_runner, name="probe-" + slot,
+                                      daemon=True)
+            _INFLIGHT[slot] = thread
         threads[slot] = thread
+        deadlines[slot] = deadline
         thread.start()
-    for slot in PROBE_SLOTS:
-        thread = threads.get(slot)
-        if thread is None:
+    for slot in sorted(threads, key=lambda s: deadlines[s]):
+        thread = threads[slot]
+        deadline = deadlines[slot]
+        default_slot = _egress_slot if slot == "egress" else _probe_slot
+        thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        entry = outcomes.get(slot)
+        if entry is None:
+            code = ERR_TIMEOUT if thread.is_alive() else ERR_UNAVAILABLE
+            slots[slot] = default_slot(code)  # abandoned/never-recorded
             continue
-        spec = getattr(targets, slot)
-        spec_timeout = getattr(spec, "timeout_seconds", None)
-        try:
-            spec_timeout = _require_positive_timeout(spec_timeout,
-                                                     "timeout_seconds")
-        except SpecError:
-            spec_timeout = CYCLE_DEADLINE_SECONDS
-        remaining = (cycle_started + total_deadline_seconds
-                     - time.monotonic())
-        thread.join(timeout=max(0.0, min(spec_timeout, remaining)))
-        outcome = outcomes.get(slot)
-        if outcome is None and thread.is_alive():
-            slots[slot] = (_egress_slot if slot == "egress"
-                           else _probe_slot)(ERR_TIMEOUT)  # abandoned worker
-        elif outcome is None:
-            slots[slot] = (_egress_slot if slot == "egress"
-                           else _probe_slot)(ERR_UNAVAILABLE)
+        outcome, completed = entry
+        if completed > deadline:
+            # LATE outcome: rejected whatever it contains -- a failure
+            # recorded past the absolute deadline is adjudicated the
+            # same ``timeout`` an ok would be, and can never overwrite
+            # the already-decided slot.
+            slots[slot] = default_slot(ERR_TIMEOUT)
         elif slot == "egress":
             slots[slot] = _normalize_egress(outcome)
         else:
             slots[slot] = _normalize_probe(outcome)
-    result = {"v": RESULT_VERSION, "epoch": float(clock()),
-              "cycle_id": cycle_id or uuid.uuid4().hex}
-    result.update(slots)
-    return result
+    return {"v": RESULT_VERSION, "epoch": _sanitize_epoch(clock),
+            "cycle_id": _sanitize_cycle_id(cycle_id)} | slots
+
+
+def run_probe_cycle(targets=None, cycle_id=None, clock=time.time,
+                    total_deadline_seconds=CYCLE_DEADLINE_SECONDS):
+    """Run one bounded probe cycle; returns the CLOSED result dict.
+
+    Never raises: caller mistakes (junk targets objects, specs of the
+    wrong type, a free-text ``cycle_id``, a clock that blows up, even an
+    invalid total deadline -- coerced to the default) can only widen
+    failure codes or get replaced by engine defaults, never escape. Each
+    configured probe gets its own worker thread under an ABSOLUTE
+    per-worker deadline (``cycle start + min(spec timeout, total
+    deadline)``); anything a worker records later -- ok or failed alike
+    -- is rejected and adjudicated ``timeout``, and while a previous
+    cycle's worker is still alive its slot is ``unavailable`` rather than
+    accumulating another thread. The result always carries all seven
+    top-level keys and one complete slot per probe: partial
+    "exception text + half a struct" outcomes are unconstructible.
+    """
+    try:
+        return _run_probe_cycle_inner(targets, cycle_id, clock,
+                                      total_deadline_seconds)
+    except Exception:  # noqa: BLE001 -- absolute containment line
+        result = {"v": RESULT_VERSION, "epoch": time.time(),
+                  "cycle_id": uuid.uuid4().hex}
+        result.update(_dark_slots())
+        return result
 
 
 def _normalize_probe(slot):

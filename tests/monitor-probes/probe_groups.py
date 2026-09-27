@@ -7,6 +7,12 @@ line; the shell harness turns that into the counted regression gate.
 Sentinel discipline: every planted sentinel (UUID / password / private
 IP / host name) must appear NOWHERE in a result JSON, its repr, or any
 captured log line.
+
+Cycle-occupancy discipline: the engine holds ONE outstanding worker per
+slot across cycles (A4), so the `cycle()` helper drains a slot back to
+free before every measured cycle -- except calls that INTENTIONALLY test
+occupancy (hold=True). A drain failure surfaces as the next visible
+FAIL, never as a silent hang.
 """
 
 import http.server
@@ -52,6 +58,21 @@ def free_port():
     port = s.getsockname()[1]
     s.close()
     return port
+
+
+def drain(slot, budget=12.0):
+    """Wait for a previous cycle's (abandoned) worker on this slot to
+    die, so the next measured cycle starts from a provably free slot."""
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < budget:
+        if not np._worker_busy(slot):
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def worker_threads(name):
+    return sum(1 for t in threading.enumerate() if t.name == name)
 
 
 # --------------------------------------------------------------------------
@@ -131,6 +152,9 @@ class UdpFake:
         self.sock.bind(("127.0.0.1", 0))
         self.sock.settimeout(60)
         self.port = self.sock.getsockname()[1]
+        # A second, DIFFERENTLY-SOURCED socket: replies sent through it
+        # come from a peer that is NOT the configured resolver.
+        self.other = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         threading.Thread(target=self._run, daemon=True).start()
 
     def _run(self):
@@ -146,6 +170,17 @@ class UdpFake:
                 continue                    # RECEIVED: and then SILENCE
             elif self.mode == "reply":
                 self.sock.sendto(head + q, addr)
+            elif self.mode == "stray":
+                # The configured port stays SILENT: a byte-perfectly-
+                # valid reply arrives from a DIFFERENT peer. An
+                # unconnected probe accepts it (false positive); the
+                # peer-bound socket must let the deadline expire.
+                self.other.sendto(head + q, addr)
+            elif self.mode == "wrongq":
+                # Correct peer, correct id, valid header: only the
+                # echoed QUESTION names somebody else's query.
+                evil = b"\x05other\x07example\x00" + q[-4:]
+                self.sock.sendto(head + evil, addr)
             elif self.mode == "badid":
                 self.sock.sendto(struct.pack(
                     "!HHHHHH", rid ^ 0xFFFF, 0x8180, 1, 1, 0, 0) + q, addr)
@@ -163,17 +198,26 @@ class UdpFake:
                 self.sock.sendto((SENT_UUID * 2).encode()[:40], addr)
 
     def close(self):
-        try:
-            self.sock.close()
-        except OSError:
-            pass
+        for s in (self.sock, self.other):
+            try:
+                s.close()
+            except OSError:
+                pass
 
 
 # --------------------------------------------------------------------------
 # helpers
 # --------------------------------------------------------------------------
 
-def cycle(targets, total=8.0, **kw):
+def cycle(targets, total=8.0, hold=False, **kw):
+    if not hold:
+        for slot in np.PROBE_SLOTS:
+            try:
+                armed = getattr(targets, slot, None) is not None
+            except Exception:
+                armed = False
+            if armed:
+                drain(slot)
     return np.run_probe_cycle(targets, total_deadline_seconds=total, **kw)
 
 
@@ -203,6 +247,11 @@ def leak_free(result):
     blob = json.dumps(result) + repr(result) + "\n".join(LOG_CAPTURE)
     return all(sent not in blob for sent in SENTINELS) \
         and "Traceback" not in blob
+
+
+def is_hex32(value):
+    return len(value) == 32 \
+        and all(c in "0123456789abcdef" for c in value)
 
 
 def main():
@@ -246,11 +295,43 @@ def main():
     r = cycle(np.ProbeTargets(), total=2.0, cycle_id=cid)
     report("A7 cycle_id honoured", r["cycle_id"] == cid)
     r2 = cycle(np.ProbeTargets(), total=2.0)
-    report("A8 auto cycle_id is 32 hex",
-           len(r2["cycle_id"]) == 32
-           and all(c in "0123456789abcdef" for c in r2["cycle_id"]))
+    report("A8 auto cycle_id is 32 hex", is_hex32(r2["cycle_id"]))
     report("A9 epoch is float", isinstance(r["epoch"], float))
     report("A10 v constant", r["v"] == 1)
+    # A1 additions (R1-A1): the entry point sanitizes its inputs -- no
+    # caller free text can ride toward the result schema.
+    r = cycle(np.ProbeTargets(), total=2.0,
+              cycle_id="%s %s free-text!" % (SENT_UUID, SENT_PASS))
+    report("A11 free-text cycle_id replaced, never echoed",
+           is_hex32(r["cycle_id"]) and leak_free(r), r["cycle_id"])
+    r = cycle(np.ProbeTargets(), total=2.0, cycle_id="a" * 200)
+    report("A12 over-long cycle_id replaced", is_hex32(r["cycle_id"]))
+    r = cycle(np.ProbeTargets(), total=2.0, cycle_id=42)
+    report("A13 non-str cycle_id replaced, no raise",
+           is_hex32(r["cycle_id"]))
+    r = cycle(np.ProbeTargets(), total=2.0, cycle_id="run-2026.09_a:X-2")
+    report("A14 grammar-safe cycle_id kept verbatim",
+           r["cycle_id"] == "run-2026.09_a:X-2")
+
+    def mad_clock():
+        raise ValueError("%s %s" % (SENT_UUID, SENT_PASS))
+    r = cycle(np.ProbeTargets(), total=2.0, clock=mad_clock)
+    report("A15 raising clock cannot break entry; epoch float",
+           isinstance(r["epoch"], float) and r["epoch"] >= 0.0
+           and leak_free(r))
+    junk_clocks = (lambda: "%s!" % SENT_UUID, lambda: float("nan"),
+                   lambda: None, lambda: -5.0, lambda: float("inf"),
+                   lambda: object())
+    epochs_ok = True
+    leaks = False
+    for junk in junk_clocks:
+        rr = cycle(np.ProbeTargets(), total=2.0, clock=junk)
+        e = rr["epoch"]
+        epochs_ok = epochs_ok and isinstance(e, float) \
+            and 0.0 <= e < float("inf")
+        leaks = leaks or not leak_free(rr)
+    report("A16 junk clock values coerced to finite epoch, no leak",
+           epochs_ok and not leaks)
 
     # ---------------- group B: DNS ----------------------------------------
     fake_answers = [(2, 1, 6, "", (SENT_PRIV, 443))]
@@ -277,7 +358,7 @@ def main():
     report("B5 resolved IP never in result", SENT_PRIV not in json.dumps(r))
 
     def slow(*a, **k):
-        time.sleep(10)
+        time.sleep(2.0)
         return fake_answers
     t0 = time.monotonic()
     r = cycle(np.ProbeTargets(dns=np.DnsProbeSpec(
@@ -359,7 +440,8 @@ def main():
 
     # ---------------- group D: UDP -----------------------------------------
     fakes = {m: UdpFake(m) for m in ("reply", "drop", "badid", "short",
-                                     "tc", "rcode", "oversize", "garbage")}
+                                     "tc", "rcode", "oversize", "garbage",
+                                     "stray", "wrongq")}
 
     def udp_spec(mode, **kw):
         kw.setdefault("timeout_seconds", 1.2)
@@ -367,35 +449,35 @@ def main():
                                resolver_port=fakes[mode].port,
                                query_hostname="probe.example", **kw)
 
-    r = cycle(np.ProbeTargets(udp=udp_spec("reply")), total=6.0)
+    def udp_run(mode, **kw):
+        return cycle(np.ProbeTargets(udp=udp_spec(mode, **kw)), total=6.0)
+
+    r = udp_run("reply")
     report("D1 valid UDP DNS reply -> ok", r["udp"]["status"] == "ok",
            r["udp"])
     t0 = time.monotonic()
-    r = cycle(np.ProbeTargets(udp=udp_spec("drop", timeout_seconds=0.8)),
-              total=6.0)
+    r = udp_run("drop", timeout_seconds=0.8)
     report("D2 ANTI-FALSE-POSITIVE: delivered sendto + silence -> timeout",
            r["udp"]["error_code"] == "timeout"
            and r["udp"]["status"] == "failed", r["udp"])
     report("D3 silence case stayed in budget", time.monotonic() - t0 < 3.5)
-    r = cycle(np.ProbeTargets(udp=udp_spec("badid")), total=6.0)
+    r = udp_run("badid")
     report("D4 id mismatch -> protocol_failed",
            r["udp"]["error_code"] == "protocol_failed", r["udp"])
-    r = cycle(np.ProbeTargets(udp=udp_spec("short")), total=6.0)
+    r = udp_run("short")
     report("D5 short reply -> protocol_failed (fail closed)",
            r["udp"]["error_code"] == "protocol_failed", r["udp"])
-    r = cycle(np.ProbeTargets(udp=udp_spec("garbage")), total=6.0)
+    r = udp_run("garbage")
     report("D6 garbage reply -> protocol_failed",
            r["udp"]["error_code"] == "protocol_failed", r["udp"])
     report("D7 payload sentinel never retained", leak_free(r))
-    r = cycle(np.ProbeTargets(udp=udp_spec("tc")), total=6.0)
+    r = udp_run("tc")
     report("D8 TC=1 -> bad_response (truncation proves nothing)",
            r["udp"]["error_code"] == "bad_response", r["udp"])
-    r = cycle(np.ProbeTargets(udp=udp_spec("rcode")), total=6.0)
+    r = udp_run("rcode")
     report("D9 RCODE!=0 -> bad_response",
            r["udp"]["error_code"] == "bad_response", r["udp"])
-    r = cycle(np.ProbeTargets(udp=udp_spec("oversize",
-                                           max_response_bytes=128)),
-              total=6.0)
+    r = udp_run("oversize", max_response_bytes=128)
     report("D10 oversized reply -> bad_response",
            r["udp"]["error_code"] == "bad_response", r["udp"])
     rejected = False
@@ -405,6 +487,16 @@ def main():
     except np.SpecError:
         rejected = True
     report("D11 resolver_host rejects non-numeric names", rejected)
+    # R1-A2 discriminators: the reply must come from the CONFIGURED peer
+    # AND answer the question WE sent (both byte-valid, both would have
+    # scored a false positive on an unconnected recv / header-only check).
+    r = udp_run("stray", timeout_seconds=0.8)
+    report("D12 ANTI-FALSE-POSITIVE: valid reply from WRONG peer -> timeout",
+           r["udp"]["error_code"] == "timeout", r["udp"])
+    r = udp_run("wrongq")
+    report("D13 ANTI-FALSE-POSITIVE: valid id but foreign question -> "
+           "protocol_failed", r["udp"]["error_code"] == "protocol_failed",
+           r["udp"])
 
     # ---------------- group E: egress --------------------------------------
     p_ip = tls_server("200-ip")
@@ -542,11 +634,83 @@ def main():
     r = cycle(np.ProbeTargets(), total="not-a-number")
     report("H7 invalid total deadline coerced, no raise",
            set(r) == set(np.RESULT_KEYS))
-
-    # cycle_id auto uniqueness across two cycles
     a = cycle(np.ProbeTargets(), total=2.0)
     b = cycle(np.ProbeTargets(), total=2.0)
     report("H8 cycle ids unique", a["cycle_id"] != b["cycle_id"])
+    # R1-A3 discriminators: absolute per-worker deadlines judge EVERY
+    # outcome by its recorded completion timestamp -- late is late,
+    # whether the worker was about to report success or failure.
+    def late_boom(*a, **k):
+        time.sleep(1.2)
+        raise socket.gaierror(-2, "late failure")
+    r = cycle(np.ProbeTargets(dns=np.DnsProbeSpec(
+        hostname="probe.invalid", timeout_seconds=0.5,
+        resolver=late_boom)), total=4.0)
+    report("H9 LATE failure rejected: absolute deadline wins (timeout, "
+           "not dns_failed)", r["dns"]["error_code"] == "timeout", r["dns"])
+
+    def late_ok(*a, **k):
+        time.sleep(2.4)
+        return fake_answers
+    r = cycle(np.ProbeTargets(dns=np.DnsProbeSpec(
+        hostname="probe.invalid", timeout_seconds=2.5,
+        resolver=late_ok)), total=2.0)
+    report("H10 late ok beyond the CYCLE deadline rejected as timeout",
+           r["dns"]["error_code"] == "timeout"
+           and r["dns"]["status"] == "failed", r["dns"])
+
+    def mid_ok(*a, **k):
+        time.sleep(1.8)
+        return fake_answers
+    t0 = time.monotonic()
+    r = cycle(np.ProbeTargets(
+        https=https_spec(port_hang, timeout_seconds=2.0),
+        dns=np.DnsProbeSpec(hostname="probe.invalid", timeout_seconds=2.0,
+                            resolver=mid_ok)), total=2.2)
+    wall = time.monotonic() - t0
+    report("H11 absolute deadlines: a hung slot cannot starve a healthy "
+           "one past its own budget",
+           r["https"]["error_code"] == "timeout"
+           and r["dns"]["status"] == "ok" and wall < 3.5, (r["https"],
+                                                           r["dns"], wall))
+
+    # ---------------- group I: no cross-cycle worker accumulation (R1-A4) --
+    hang_gate = threading.Event()
+
+    def forever(*a, **k):
+        hang_gate.wait(8.0)
+        return fake_answers
+
+    hang_spec = np.DnsProbeSpec(hostname="probe.invalid",
+                                timeout_seconds=0.4, resolver=forever)
+    hang_targets = np.ProbeTargets(dns=hang_spec)
+    base_dns = worker_threads("probe-dns")
+    r1 = cycle(hang_targets, total=4.0)
+    report("I1 hanging worker is abandoned as timeout",
+           r1["dns"]["error_code"] == "timeout", r1["dns"])
+    codes = []
+    walls = []
+    for _ in range(3):
+        t0 = time.monotonic()
+        r = cycle(hang_targets, total=4.0, hold=True)
+        walls.append(time.monotonic() - t0)
+        codes.append(r["dns"]["error_code"])
+    report("I2 the hung worker HOLDS its slot: later cycles are "
+           "unavailable, not new probes", codes == ["unavailable"] * 3,
+           codes)
+    report("I3 occupied slot answers instantly (no per-cycle hang cost)",
+           all(w < 0.5 for w in walls), walls)
+    report("I4 exactly ONE hung worker exists after four cycles",
+           worker_threads("probe-dns") - base_dns == 1,
+           (base_dns, worker_threads("probe-dns")))
+    hang_gate.set()
+    freed = drain("dns", budget=10.0)
+    r = cycle(np.ProbeTargets(dns=np.DnsProbeSpec(
+        hostname="probe.invalid", timeout_seconds=1.0,
+        resolver=lambda *a, **k: fake_answers)), total=4.0)
+    report("I5 slot recovers for later cycles once the worker dies",
+           freed and r["dns"]["status"] == "ok",
+           (freed, r["dns"]))
 
 
 if __name__ == "__main__":

@@ -3,11 +3,14 @@
 #
 # PR-3A is a DARK delivery: the engine and this suite must prove (a) the
 # closed output contract with TRUE discriminators (anti-false-positive UDP
-# round trip, TLS verification that cannot be off, proxy-env bypass,
-# sentinel privacy, deadline/hang isolation), and (b) that NO production
-# surface calls the module: repo-wide reference scan, the release staging
-# manifest, the systemd units, the app-bin entrypoints and VERSION all
-# stay byte-identical to the dark contract.
+# round trip bound to the configured peer AND the exact question, TLS
+# verification that cannot be off, proxy-env bypass, sentinel privacy,
+# absolute per-worker deadlines that reject every late outcome, one
+# outstanding worker per slot so hung workers cannot accumulate, and an
+# entry point that sanitizes cycle_id/clock/targets and never raises),
+# and (b) that NO production surface calls the module: repo-wide reference
+# scan, the release staging manifest, the systemd units, the app-bin
+# entrypoints and VERSION all stay byte-identical to the dark contract.
 #
 # Every fake server binds 127.0.0.1 only: zero public network dependency,
 # so this lane runs identically on any runner. The TCP-refusal
@@ -25,7 +28,7 @@ export PROBE_TEST_KEY="$HERE/monitor-probes/tls-test-key.pem"
 
 PASS=0
 FAIL=0
-EXPECTED_PASS=97
+EXPECTED_PASS=113
 
 pass() { PASS=$((PASS + 1)); printf '  PASS %s\n' "$*"; }
 fail() { FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "$*"; }
@@ -68,8 +71,8 @@ case ",$IMPORTS," in
     *)
         if "$PY" -c '
 import sys
-allowed = {"http","ipaddress","socket","ssl","struct","threading","time",
-           "uuid","dataclasses","__future__"}
+allowed = {"http","ipaddress","re","socket","ssl","struct","threading",
+           "time","uuid","dataclasses","__future__"}
 mods = {m for m in sys.argv[1].split(",") if m}
 bad = mods - allowed
 sys.exit(1 if bad else 0)' "$IMPORTS"; then

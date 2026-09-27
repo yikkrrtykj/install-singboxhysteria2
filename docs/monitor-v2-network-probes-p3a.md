@@ -15,7 +15,7 @@
   `diagnostics` 零 import；`sbmon_stage_release` 清单不含该包 —— 不可变
   release 树在物理上不可能携带它；unit 模板零改动；`webapp.py`/`broker.py`/
   `server.py` 字节不变；默认空配置下引擎零外联。
-- 测试：`tests/test-monitor-v2-probes.sh`（硬计数门 `EXPECTED_PASS=97`）+
+- 测试：`tests/test-monitor-v2-probes.sh`（硬计数门 `EXPECTED_PASS=113`）+
   测试夹具 `tests/monitor-probes/`（一次性自签 TLS 证书，SAN
   localhost/127.0.0.1，仅测试用途）。全部 fake server 绑 loopback，CI 零
   公网依赖。
@@ -55,15 +55,24 @@ PR-3A 填补的正是后半句，且只以库的形态存在。
 `monitor-v2/diagnostics/network_probes.py` 的全部对外承诺：
 
 * Python ≥3.10 **stdlib only**（`socket/ssl/http.client/ipaddress/struct/
-  threading/uuid/time/json/dataclasses`）；套件 S0 用 AST 扫描强制。
+  threading/uuid/time/re/dataclasses`）；套件 S0 用 AST 扫描强制。
 * 普通 `sboxweb` 身份即可运行：无特权、无 sudo/root/journald 依赖、无
   文件系统写入（引擎完全无状态，不写任何文件）。
 * **不修改**网络/路由/防火墙/DNS 配置；**不操作** sing-box；**无 listener**
   （引擎只做出站 client；测试 fake server 属于测试夹具，不属于模块）。
-* 每一次网络操作都在双重 deadline 之下（probe 级 + cycle 级，§7）。
+* 每一次网络操作都在**绝对 deadline** 之下：worker 的 deadline 在 cycle
+  开始一刻即固定为 `cycle 起点 + min(spec timeout, cycle 总 deadline)`，
+  晚于它的任何 outcome（无论 ok 还是 failed）一律按完成时间戳拒收并判
+  `timeout`（§9）。
+* 每个 slot 全引擎**至多一个在飞 worker**：上一 cycle 的挂死 worker 尚未
+  退出时，后续 cycle 不再为它叠加线程，而是把该槽位直接判
+  `unavailable`（零 I/O、零线程）直至旧 worker 死去（§9）。
 * 任何 probe 的任何异常都不抛给未来的 publisher 主循环：公共入口
-  `run_probe_cycle` 永不 raise（含对 `BaseException` 之外的一切 `Exception`
-  的最终兜底，兜底路径同样只产出闭合词汇）。
+  `run_probe_cycle` 永不 raise —— `targets` 经精确类型门（非审核类即
+  dark）、`cycle_id` 经严格语法门（调用方自由文本只会被引擎 id 替换、
+  绝不过夜回显）、`clock` 被强制为有限非负 float（异常则回退引擎自有时
+  钟），最外层还有一条对一切 `Exception` 的最终兜底，兜底路径同样只产
+  出闭合词汇。
 * 结果对象**闭合**：顶层恰为 `v/epoch/cycle_id/dns/https/udp/egress` 六键；
   每个 probe 恰为 `status/latency_ms/error_code`（egress 另恰有一个 `ip`）。
   不允许任何自由文本：exception text、响应正文、hostname 回显、socket 地址、
@@ -102,8 +111,12 @@ PR-3A 填补的正是后半句，且只以库的形态存在。
   成立但内容不可规范化（egress 正文非 IP）。
 * `egress.ip` 仅当 `status=="ok"` 时为非 null 字符串，且必为
   `ipaddress.ip_address()` 能解析的 **canonical** 形式；failed 时恒 null。
-* `cycle_id`：32 位 hex（uuid4，非机密，测试可注入）；`epoch`：cycle 完成
-  时刻的 float 秒；`v`：schema 版本整数 1。
+* `cycle_id`：32 位 hex（uuid4，非机密）。调用方可注入 id，但只有匹配
+  严格语法 `[A-Za-z0-9][A-Za-z0-9._:-]{0,63}` 的字符串才原样存活；其余
+  一切（None、自由文本、超长、非字符串）都被**替换**为引擎生成的 hex id
+  —— 调用方文本永不越过结果边界（R1-A1 判别组）。`epoch`：cycle 完成时
+  刻的 float 秒，由注入 clock 强制消毒（抛错/非数值/NaN/inf/负数 → 回
+  退引擎 `time.time()`）；`v`：schema 版本整数 1。
 * 结果由构造器一次性组装：先填全量默认（failed/`unavailable`/null），
   每个 probe 至多替换自己槽位一次，替换值先过闭合校验 —— 撕裂结果
   （半结构 + 异常字符串）在类型上不可能出现。
@@ -133,17 +146,21 @@ HTTPSConnection`，stdlib）。它只是**原始 evidence**：单个 endpoint �
 * **direct egress 保证**：`http.client` 按构造从不读取 `HTTP_PROXY`/
   `HTTPS_PROXY`/`NO_PROXY`（区别于 `urllib.request`），故 probe 代表 VPS
   本身出站；套件用"环境注入指向死端点的代理变量、直连仍 ok"判别。
-* TLS 校验**永不可关闭**：默认 `ssl.create_default_context()`（可注入
-  `cafile`/`server_hostname` 用于测试与私有 endpoint，但无 `verify_mode`
-  豁免面；证书不匹配 → `tls_failed`）。
+* TLS 校验**永不可关闭**：默认 `ssl.create_default_context()`；可注入
+  `cafile`/`server_hostname` 用于测试与私有 endpoint，但 `cafile` 的语义
+  是**替换**所咨询的信任库（只会更窄，R1 修订措辞），且不存在任何
+  `verify_mode` 豁免面；证书不匹配 → `tls_failed`。
 * deadline 双层：probe 级 socket timeout（`spec.timeout_seconds`，作用于
-  connect/TLS/每次读写的每一段）+ cycle 级 join 预算（该 slot 的总请求
-  deadline 由主线程 `min(spec.timeout, cycle 剩余)` 强制）。任何一段超时
-  都归入 `timeout`；worker 超出自预算晚归时其结果被丢弃，永不覆写已判定
-  的槽位。
+  connect/TLS/每次读写的每一段）+ cycle 级**绝对** deadline —— 主线程
+  在 cycle 开始就把该 slot 的截止点钉为 `cycle 起点 + min(spec.timeout,
+  cycle 总 deadline)`，按截止点升序 join；worker 的 outcome 带完成时间戳
+  入账，任何晚于绝对截止点的 outcome **一律拒收判 `timeout`，无论它是
+  ok 还是失败**（R1-A3）。任何一段超时都归入 `timeout`；被判超时后迟到
+  的 worker 结果永不覆写已判定槽位。
 * 成功契约（预先定义，不接受浮动）：HTTP 状态码 ∈ `allowed_statuses`
-  （默认恰 {200}）；方法固定 GET；响应正文**读取上限内即丢弃**，任何
-  字节不进入结果。
+  （默认恰 {200}）；方法固定 GET；`https` probe 的契约只看状态码，响应
+  正文**根本不读**（头后即关，R1 修订）；`egress` 因需消费正文才读取，
+  且上限内即弃，任何字节不进入结果。
 * 失败映射：解析失败 → `dns_failed`；refused/不可达 → `connect_failed`；
   证书/握手失败 → `tls_failed`；任何超时 → `timeout`；状态码不在集合 →
   `bad_response`；HTTP 协议层错乱 → `protocol_failed`。
@@ -163,13 +180,24 @@ HTTPSConnection`，stdlib）。它只是**原始 evidence**：单个 endpoint �
   通过），否则 `UdpProbeSpec` **构造即抛 `SpecError`**（调用方错误，结果
   通道之外；`run_probe_cycle` 自身仍永不抛）。UDP 路径内不做名字解析，
   避免与 `dns` 槽位混义。
-* 成功契约（全部满足才 ok）：应答 ≤ `max_response_bytes`（默认 2048）；
-  头部 ≥12 字节可解析；**id 匹配**；QR=1；TC=0；RCODE=0；QDCOUNT=1。
-* 失败映射：sendto 后窗口内无任何应答（含"服务端收到但静默丢弃"）→
-  `timeout`（判别测试逐点覆盖）；字节数不足/不可解析/id 不匹配 →
-  `protocol_failed`；TC=1 或 RCODE≠0 → `bad_response`；connect/send 本身
-  失败 → `connect_failed`。
-* 无 listener、单 socket、`settimeout` + 剩余预算双保险。
+* **双绑定应答判定（R1-A2）**：应答必须同时满足 **对端绑定** 与 **问题绑
+  定** 才算我们的 round trip。对端绑定用 **connected datagram socket**
+  （`sock.connect(resolver_host:resolver_port)` 后 `send/recv`）：出向请
+  求钉死在配置 peer，来自任何其他源的报文（哪怕字节完全合法）在内核层
+  就被丢弃，用户态永远看不到。问题绑定利用 RFC 1035 应答必须逐字回显
+  question 段的事实：`data[12:12+len(question)] == question`（qname +
+  QTYPE + QCLASS 逐字节相等）—— 答复"别人的查询"不算我们的回程。
+* 成功契约（全部满足才 ok）：应答来自配置 peer；≤ `max_response_bytes`
+  （默认 2048）；头部 ≥12 字节可解析；**id 匹配**；QR=1；**question 逐字
+  回显**；TC=0；RCODE=0；QDCOUNT=1。
+* 失败映射：sendto 后窗口内无任何（合法）应答 —— 含"服务端收到但静默丢
+  弃"、含"只有错误 peer 在回答" —— → `timeout`（两条反假阳性判别 D2/D12
+  逐点覆盖）；字节数不足/不可解析/id 不匹配/**问题不匹配** →
+  `protocol_failed`（D13）；TC=1 或 RCODE≠0 → `bad_response`；connect/send
+  本身失败、或 connected socket 收到 ICMP port-unreachable →
+  `connect_failed`。
+* 无 listener、单 socket，`settimeout` + 绝对剩余预算双保险；首个到达的
+  应答即被严格裁决，不存在"再听一次"的循环面。
 
 ## 8. 公网出口 IP（`egress`）与 endpoint policy
 
@@ -208,12 +236,21 @@ PR-3B 冻结默认值时须逐项评审：数据流向、隐私、超时含义�
   3.0s，总请求 5.0s）/ udp 3.0s / egress 5.0s`。
 * cycle 总 deadline：`total_deadline_seconds`（默认 12.0s ≥
   max(spec deadline) + 调度余量）。四 probe 各占一个 worker 线程并行
-  执行；主线程按"该 probe 的 spec deadline 与 cycle 剩余预算取小"逐个
-  join。一个 probe 卡死只消耗自己（至多拖到 join 边界），**不能**让其它
-  probe 无限等待；超时未归的 worker 被遗弃（daemon 线程 + socket 自有
-  timeout 双兜底，无线程泄漏累积路径：每次 cycle 至多创建 4 个终局线程）。
+  执行；主线程对每个 slot 的 join 预算取自该 slot 的**绝对**截止点
+  `cycle 起点 + min(spec.timeout, total)`（按截止点升序推进，不做"相对
+  上一次 join 结束时刻"的预算重算，R1-A3）：一个慢 slot 既不能饿死处于
+  自己预算内的健康 slot，也不能把 cycle 拖过任何 slot 的绝对 deadline。
+  worker 的 outcome 携带完成时间戳；晚于绝对截止点的 outcome 无论内容
+  （ok 或 failed）一律拒收判 `timeout`。**跨 cycle 不累积（R1-A4）**：
+  引擎为每个 slot 维护"至多一个在飞 worker"的占用登记 —— 上一 cycle
+  被遗弃的挂死 worker（getaddrinfo 这类无法内部取消的调用）持有自己的
+  slot，后续 cycle 遇到占用时零线程、零 I/O、立即判 `unavailable`，直
+  至旧 worker 死亡自动恢复。全引擎被挂死 worker 占用的线程数因此恒
+  ≤ 4，与运行时长无关。
 * 结果恒为完整六键（§4 构造器）：引擎在任何失败模式下都产出"全槽位、
-  闭合词汇"的结果，绝不产出"部分异常字符串 + 半个结构"。
+  闭合词汇"的结果，绝不产出"部分异常字符串 + 半个结构"。入口消毒
+  （cycle_id/epoch/targets 类型门）+ 最外层兜底使 `run_probe_cycle` 在
+  任何调用方输入下都只返回闭合结果。
 * 引擎无状态、可重入（每次 `run_probe_cycle` 独立）；生产 cadence 归
   PR-3B 的 scheduler 决定。候选值与开销估算：60s 周期（对齐 incident
   history 5s 聚合之上的一档）≈ 每小时 60 cycle × ≤4 请求 ≈ 4 KiB 量级
@@ -248,11 +285,13 @@ PR-3B 冻结默认值时须逐项评审：数据流向、隐私、超时含义�
   hanging server（accept 不 reply）→ `timeout` 且同 cycle 其它 probe 照常
   出结果；**代理注入判别**：`HTTP_PROXY/HTTPS_PROXY=http://127.0.0.1:<死端
   点>` 环境下直连 fake 仍 ok。
-* **P4 UDP**：fake resolver 正常应答 → ok；**收到即丢弃（sendto 成功无回
-  程）→ 必须 `timeout`**（反假阳性判别）；应答 id 不匹配 / 短包 →
-  `protocol_failed`；TC=1 / NXDOMAIN 码 / 超 `max_response_bytes` →
-  `bad_response`；`resolver_host` 传 hostname → 构造抛 `SpecError`（值错
-  误判别，不进结果通道）。
+* **P4 UDP**：fake resolver 正常应答（逐字回显 question）→ ok；**收到即
+  丢弃（sendto 成功无回程）→ 必须 `timeout`**（反假阳性判别）；**配置
+  peer 沉默、另一 peer 送出字节完美的合法应答 → `timeout`（对端绑定
+  D12）**；**正确 peer + 正确 id 但回显他人问题 → `protocol_failed`
+  （问题绑定 D13）**；应答 id 不匹配 / 短包 → `protocol_failed`；TC=1 /
+  NXDOMAIN 码 / 超 `max_response_bytes` → `bad_response`；`resolver_host`
+  传 hostname → 构造抛 `SpecError`（值错误判别，不进结果通道）。
 * **P5 egress**：body `203.0.113.7` → canonical ok；IPv6 canonical →
   ok；`"not an ip"`/多行 → `parse_failed`；超限 body → `bad_response`；
   超时 → `timeout`；loopback 响应 + 默认 `require_global=True` →
@@ -264,9 +303,17 @@ PR-3B 冻结默认值时须逐项评审：数据流向、隐私、超时含义�
   sentinel；断言结果 JSON、`repr(result)`、以及 `logging` 捕获（root
   logger handler）完全不含任何 sentinel。
 * **P7 deadline/并发**：一个 probe 挂死时其它 probe 的墙钟 ≤ 各自 deadline
-  + 余量；cycle 总墙钟 ≤ `total_deadline` + 小裕度；连续 3 个 cycle 无线
+  + 余量；cycle 总墙钟 ≤ `total_deadline` + 小裕度；连续多个 cycle 无线
   程累积（active_count 有界）。
-* **硬计数门**：`EXPECTED_PASS=97`，任何静默跳过即红。
+* **P8 R1 合同判别（A1–A4）**：`cycle_id` 自由文本/超长/非字符串 → 被
+  32-hex 引擎 id **替换**且 sentinel 不过夜，语法内字符串原样存活；
+  抛错/NaN/inf/负数/非数值 clock → epoch 恒为有限非负 float 且零泄漏；
+  晚于绝对 deadline 的失败 outcome 判 `timeout` 不判 `dns_failed`、晚归
+  的 ok 同样拒收（H9/H10）；挂死 slot 不能把健康 slot 拖出其自身预算
+  （H11）；**多 cycle 永久挂死判别**：挂死 worker 被遗弃为 `timeout` 后
+  连跑 3 个 cycle —— 每 cycle 立即 `unavailable`（墙钟 <0.5s）、`probe-
+  dns` 线程数恒为 1、事件放开后槽位自动恢复 ok（I1–I5）。
+* **硬计数门**：`EXPECTED_PASS=113`，任何静默跳过即红。
 
 ## 11. CI 接线
 
@@ -295,3 +342,19 @@ endpoint 默认值。PR-3B 预留链路：probe scheduler → 闭合 ProbeResult
 schema v2→v3（继续遵守 strict schema gate、forward-only、单事务、v2 行零
 重写）→ `network_probe_samples` / egress 变更历史 → bounded timeline 读
 面。Phase 3 全部 integration 通过后再单独做 0.4.0 release-prep。
+
+## 13. R1 评审（HOLD）修复记录：A1–A4 + 两处措辞/成本修正
+
+| 项 | 缺陷 | 修复 | 判别测试 |
+|----|------|------|----------|
+| A1 | 入口未完全收容：`cycle_id` 任意对象/自由文本直接过夜进结果；caller `clock` 抛错或返回非数值即炸 `run_probe_cycle`；junk `targets` 靠 worker 内 try 兜底而非类型门 | `_sanitize_cycle_id`（严格语法 `[A-Za-z0-9][A-Za-z0-9._:-]{0,63}`，不合格一律替换为引擎 uuid hex，绝不过夜回显）；`_sanitize_epoch`（clock 抛错/非数值/NaN/inf/负数 → 回退引擎时钟，类型面判定）；`_slot_spec` 精确类型门（非审核 spec 类 = dark，零线程零 I/O，连子类都拒）；最外层绝对兜底返回全 `unavailable` 暗结果 | A11–A16（自由文本/超长/非 str/语法内存活/抛错 clock/junk clock 矩阵 + leak_free）；H1 改走类型门语义 |
+| A2 | UDP 应答未绑定来源与问题：unconnected `recv` 会接受任何源发包，头部判定也不核对 question —— 错误 peer 的合法报文可假阳性 | connected datagram socket（`connect` 后 `send/recv`）实现内核级**对端绑定**；RFC 1035 question 段**逐字回显比对**实现问题绑定；ICMP port-unreachable（connected UDP 特有回弹）显式映射 `connect_failed` | D12（配置 peer 沉默、另一 peer 送字节完美应答 → 必须 `timeout`）；D13（正确 peer+正确 id 但回显他人问题 → `protocol_failed`）；D1–D11 全矩阵在新绑定下原样绿 |
+| A3 | join 预算按"轮到该 slot 时的相对剩余"计算，可被前序 join 挤压/漂移；晚归的失败 outcome 会被接受进槽位 | slot 截止点在 cycle 开始钉死为绝对时刻 `cycle_started + min(spec.timeout, total)`，按截止点升序 join；worker outcome 附完成时间戳，`completed > deadline` 的 outcome **一律拒收判 timeout（失败也不例外）**；`_finish_slot` 不再自判晚归、由引擎统一裁决 | H9（睡 1.2s 后抛 gaierror，预算 0.5 → `timeout` 而非 `dns_failed`）；H10（晚归 ok 拒收）；H11（挂死 slot 不饿死预算内健康 slot，墙钟有界） |
+| A4 | 每 cycle 无登记地 spawn daemon 线程：getaddrinfo 类不可取消调用永久挂死时，线程随 cycle 线性累积 | 引擎级 `_INFLIGHT` 占用登记（锁保护）：slot 有在飞 worker 时后续 cycle 零线程、零 I/O、立即判 `unavailable`；worker 退出自清登记，自动恢复。全局挂死线程数恒 ≤ 4 | I1–I5：Event 门控的永久挂死 resolver 连跑 4 个 cycle —— 首 cycle `timeout`，后 3 个 `unavailable` 且各自墙钟 <0.5s，`probe-dns` 线程增量恒 1，放开事件后槽位恢复 ok |
+| 措辞 | "cafile 只加宽信任库"不实 | `create_default_context(cafile=...)` 是**替换**所咨询的信任库（更窄，测试 fake 用途），校验依旧无可关 | §6 与 spec/代码注释同步更正 |
+| 成本 | https probe 成功后仍读满 64KiB 正文再丢弃 | 契约只看状态码：`read_cap=None` 路径完全不读正文（头后即关）；仅 egress 消费正文时按 `max_body_bytes+1` 读 | C/E 组在零-drain 下全绿（挂死 fake 的判别点前移到 header） |
+
+测试套件为容纳新契约新增 16 项判别（113 = 97 + 6 A + 2 D + 3 H + 5 I；
+S0 静态门计数不变），并在 cycle helper 中加入"测量前排空占用 slot"纪律
+（I 组故意持有时除外）。DARK 边界、schema、VERSION、CI 接线均不因 R1
+移动。
