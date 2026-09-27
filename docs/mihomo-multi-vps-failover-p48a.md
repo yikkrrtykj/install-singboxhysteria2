@@ -45,7 +45,10 @@ python3 tools/mihomo-multi-vps-merge.py \
   --output  /path/event-vmix01.yaml
 ```
 
-`--primary` and `--output` are required, `--backup` is optional. Only
+`--primary` and `--output` are required, `--backup` is optional. There is
+deliberately no `--help`: the option list above is the contract, and argparse's
+generated help and error text quote `argv` (see Failure handling). Any misuse
+prints one fixed line and exits 2. Only
 Python 3.10 standard library modules are used (`argparse ipaddress os re stat
 sys tempfile`): no PyYAML, no `yq`, nothing to install.
 
@@ -74,6 +77,17 @@ File level, per input:
   is the read object);
 - at most 48 KiB;
 - strict UTF-8, no NUL, no tab, no CR anywhere;
+- **the 43 lines before `proxies:`, byte for byte**. That whole region is
+  literal in the renderer — it interpolates no value — so anything other than
+  the rendered bytes is not a current export. Comparing only the key names
+  would let a canonical SHELL carrying non-canonical CONTENT through, and
+  `build_output` copies that region into the merged profile verbatim: a widened
+  `allow-lan`, a different `mixed-port`, an added or replaced `dns` nameserver,
+  a `fake-ip-range` swap, a dropped `store-selected` (which §store-selected
+  below depends on), an extra indented option, a deleted line or a reordered
+  pair would all ride through unnoticed. The contract suite compares this
+  constant against the renderer's own `printf` block, so the two cannot drift
+  apart silently;
 - the exact top-level key sequence `mixed-port, allow-lan, bind-address, mode,
   log-level, unified-delay, ipv6, profile, dns, tun, proxies, proxy-groups,
   rules` — each key exactly once, in this order. This is also what proves
@@ -114,6 +128,14 @@ lost trailing blank line are all refused. There is no "best effort" mode.
    name; the only trusted external hint is the downloaded file name
    `<name>-mihomo.yaml`. The tool therefore requires `--name` and that both
    input basenames equal `<name>-mihomo.yaml`.
+   `--name` must satisfy the repository's existing client-name contract, and
+   the contract is imported rather than invented here:
+   `lib/client-management.sh :: CLIENT_NAME_PATTERN` is one alphanumeric
+   followed by up to 31 of `[A-Za-z0-9._-]` — 32 characters at most. A 33rd
+   character, a leading separator, an embedded newline or an empty value is
+   `E_USAGE` before any file is opened. The suite compares the tool's pattern
+   with the shell pattern textually, so a future widening or tightening of the
+   canonical rule turns this red instead of letting the two diverge.
    This is a **provenance guard against grabbing the wrong export** — it is not
    a cryptographic identity proof and it does not become one. Adding signed or
    sourced metadata to `client.export` is a separate change, deliberately not
@@ -219,13 +241,41 @@ Every failure is one fixed code on stderr, exit 1 (`E_USAGE` exits 2):
 | `E_SOURCE_COLLISION` | the exports do not look like two distinct VPSes |
 | `E_CREDENTIAL_REUSE` | a UUID or password is shared between the VPSes |
 | `E_OUTPUT_EXISTS` | the output path is already taken |
-| `E_USAGE` | bad arguments (e.g. an invalid logical name) |
-| `E_IO` | the output could not be written (e.g. missing directory) |
+| `E_USAGE` | bad arguments (invalid logical name, unknown or missing option) |
+| `E_IO` | the OUTPUT could not be written (e.g. missing directory) |
 
 No failure message ever contains a server address, a UUID, a password, a
-public-key, a short-id, a line number or an excerpt of the YAML. There are no
-tracebacks: any unexpected exception is reported as `E_IO`, because a default
-traceback can echo source lines — i.e. credentials — into stderr.
+public-key, a short-id, a line number or an excerpt of the YAML.
+
+Two rules keep that table honest.
+
+**A malformed input is never `E_IO`.** `E_IO` means "the disk or the output
+path failed", and an operator who gets it for a half-downloaded export will go
+look at storage instead of re-downloading the file. So every read position in
+the parsers is bounds-checked, a section key is looked up without relying on
+`StopIteration`, and a document cut off at any line or byte offset — including
+inside the credential-bearing blocks — is reported by the side it belongs to
+(`E_PRIMARY_NOT_CANONICAL` / `E_BACKUP_NOT_CANONICAL`). The contract suite
+proves it by rebuilding both fixture forms (plain Hysteria2 port and the
+port-hopping pair), truncating each at **every** line boundary, chopping the
+tail of one at byte level, deleting / blanking / duplicating / injecting a line
+at every position, and requiring exactly one fixed code out of all of them with
+no traceback in any captured log.
+
+**A usage failure never repeats what the operator typed.** `argparse` builds
+its usage and error text out of `argv`, and on this command line `argv` holds
+paths that sit next to credential material — so the parser's `error()` is
+overridden to raise a fixed code, `--help` is not offered, and abbreviations
+are disabled so the surface stays exactly the four documented flags. Every
+usage failure prints the single line `merge: FAIL E_USAGE`, nothing on stdout,
+and no argument value is reflected back — asserted by feeding it an unknown
+`--password=<uuid>`-shaped option, a bare export path as a positional, a
+truncated option name and an empty `--name`, then checking the combined output
+for each input token.
+
+There are no tracebacks anywhere: an unexpected exception is still reported as
+`E_IO` (exit 1) rather than printed, because a default traceback can echo source
+lines — i.e. credentials — into stderr.
 
 ## Credential hygiene
 
@@ -280,9 +330,11 @@ for real on Linux CI:
 bash tests/test-mihomo-multi-vps-merge.sh
 ```
 
-Measured: `pass=131 fail=0 skip=3` on the Windows dev host, and
-`pass=137 fail=0 skip=0` in the Linux CI step -- the three Windows skips are
-exactly the symlink and permission-bit gates, which Linux runs for real.
+Measured on the Windows dev host: `pass=176 fail=0 skip=3` (the review round 1
+fixes added the R1 discriminators to the earlier 131). The three skips are
+exactly the symlink and permission-bit gates, which Linux CI runs for real; the
+Linux totals are recorded in this PR's evidence comment rather than restated
+here, because that lane is the authority.
 
 Controlled runtime validation. `tests/mihomo-multi-vps-runtime-lab.py` is
 **opt-in and never part of CI**: it refuses to run without an operator-supplied
@@ -301,7 +353,9 @@ python3 tests/mihomo-multi-vps-runtime-lab.py \
   --workdir <scratch> --interval 3 --timeout 1500
 ```
 
-Result of the controlled run for review (2026-09-26, Windows/amd64 lab):
+Result of the controlled run for review (first run 2026-09-26; re-run
+2026-09-28 against the merged profile produced after the review round 1 fixes,
+same result — Windows/amd64 lab):
 
 - build: Mihomo Meta **v1.19.31**, `windows amd64 with go1.26.8`
 - SHA-256: `deef9d8d34152e29941840df1d339b72ed71ec0dd460c2f2db572c1db231c8bf`
@@ -326,9 +380,24 @@ connections, an explicit non-goal).
 
 ## Drift coupling
 
-The parser pins the renderer's current shape. `tests/test-mihomo-multi-vps-merge.sh`
-greps the renderer template for the markers the parser depends on
-(`flow: xtls-rprx-vision`, `skip-cert-verify: true`, `client-fingerprint:
-chrome`, `hop-interval: 30`, `expected-status: "204"`, `interval: 60`, …), so a
-future change to `cm_render_client_mihomo_yaml` turns this suite red instead of
-making every real merge fail closed with no explanation.
+The parser pins the renderer's current shape, and the pin is checked
+mechanically rather than by hand:
+
+- `tests/test-mihomo-multi-vps-merge.sh` greps the renderer template for the
+  markers the parser depends on (`flow: xtls-rprx-vision`,
+  `skip-cert-verify: true`, `client-fingerprint: chrome`, `hop-interval: 30`,
+  `expected-status: "204"`, `interval: 60`, …);
+- it loads the tool as a module and compares `CANONICAL_PREFIX_LINES` line for
+  line against the region the renderer's own `printf` emits before `proxies:`;
+- it compares `CLIENT_NAME_RE` against `CLIENT_NAME_PATTERN` in
+  `lib/client-management.sh`.
+
+So a future change to `cm_render_client_mihomo_yaml` — or to the client-name
+rule — turns this suite red instead of making every real merge fail closed with
+no explanation.
+
+Tightening validation must not change what valid input produces. Before the
+review round 1 fixes were accepted, the pre-fix and post-fix tools were run
+over the same canonical pair and their merged output compared with `cmp`: the
+bytes are identical, and single-VPS mode is still a byte-for-byte copy of the
+primary. The live lab above then ran against the post-fix merged profile.
