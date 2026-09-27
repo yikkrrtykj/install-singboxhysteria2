@@ -77,27 +77,92 @@ show_status(){
 
 }
 
-install_pkgs() {
-  # Install qrencode, jq, and iptables if not already installed
-  local pkgs=("qrencode" "jq" "iptables")
-  for pkg in "${pkgs[@]}"; do
-    if command -v "$pkg" &> /dev/null; then
-      hint "$pkg 已经安装"
-    else
-      hint "开始安装 $pkg..."
-      if command -v apt &> /dev/null; then
-        sudo apt update > /dev/null 2>&1 && sudo apt install -y "$pkg" > /dev/null 2>&1
-      elif command -v yum &> /dev/null; then
-        sudo yum install -y "$pkg"
-      elif command -v dnf &> /dev/null; then
-        sudo dnf install -y "$pkg"
-      else
-        error "Unable to install $pkg. Please install it manually and rerun the script."
-      fi
-      hint "$pkg 安装成功"
-    fi
-  done
+# >>> host-dependencies >>> ===================================================
+# Host dependency bootstrap for the top-level install path.
+#
+# A dependency is declared as PACKAGE -> COMMANDS, never as one bare word.
+# Package name and probe command differ for the two entries the Monitor 0.3.1
+# journal-reader activation depends on: package `acl` provides setfacl/getfacl
+# (least-privilege traversal convergence), package `util-linux` provides
+# runuser (the real-identity readability proof).  `command -v acl` would prove
+# nothing, so it is never used; the probe set below is resolved with exactly the
+# same `command -v` rule the consumer uses (monitor-v2/deploy/lib/
+# monitor-deploy-lib.sh: sbmon_sboxjr_acl_tools_available and its runuser
+# gate), which is what makes "the top-level bootstrap guaranteed it" a real
+# statement rather than a package-manager exit code.
+#
+# Three rules this bootstrap is held to:
+#   - every probe of a dependency already resolves => NO package-manager call
+#     at all (no apt update, no install, idempotent re-run);
+#   - an install is believed only after its probes are re-checked;
+#   - anything still missing aborts here, before any later install step, and
+#     never reports success.  The Monitor installer keeps its own fail-closed
+#     preflight regardless -- this only removes the avoidable half of the
+#     distance between "host is usable" and "deploy refuses".
+HOST_DEP_SPECS=(
+    "qrencode:qrencode"
+    "jq:jq"
+    "iptables:iptables"
+    "acl:setfacl,getfacl"
+    "util-linux:runuser"
+)
+
+# <probe list, comma separated> -> 0 when EVERY command resolves on PATH
+host_dep_probes_ok() {
+    local probe
+    # word splitting is the point: the list is one probe per field
+    # shellcheck disable=SC2086
+    for probe in ${1//,/ }; do
+        command -v "$probe" > /dev/null 2>&1 || return 1
+    done
+    return 0
 }
+
+# <package> -> the distro installer's exit status (127 when no installer exists)
+host_pkg_install() {
+    if command -v apt > /dev/null 2>&1; then
+        sudo apt update > /dev/null 2>&1 && sudo apt install -y "$1" > /dev/null 2>&1
+    elif command -v yum > /dev/null 2>&1; then
+        sudo yum install -y "$1" > /dev/null 2>&1
+    elif command -v dnf > /dev/null 2>&1; then
+        sudo dnf install -y "$1" > /dev/null 2>&1
+    else
+        return 127
+    fi
+}
+
+install_pkgs() {
+    local spec pkg probes probe missing=0 missing_list=""
+    for spec in "${HOST_DEP_SPECS[@]}"; do
+        pkg="${spec%%:*}"
+        probes="${spec#*:}"
+        if host_dep_probes_ok "$probes"; then
+            hint "$pkg 已经安装（命令: $probes）"
+            continue
+        fi
+        hint "开始安装 $pkg（提供命令: $probes）..."
+        host_pkg_install "$pkg"
+        # Not a success until the commands say so: a package manager can exit 0
+        # while the binary it owns is still absent (broken image, partial
+        # install, different split-package layout).
+        if host_dep_probes_ok "$probes"; then
+            hint "$pkg 安装完成，命令验证通过: $probes"
+            continue
+        fi
+        warning "$pkg 安装后命令仍缺失: $probes"
+        missing=$((missing + 1))
+        # Accumulate, so one run reports every gap instead of the first only.
+        # shellcheck disable=SC2086
+        for probe in ${probes//,/ }; do
+            command -v "$probe" > /dev/null 2>&1 || \
+                missing_list="$missing_list $probe"
+        done
+    done
+    if [ "$missing" -ne 0 ]; then
+        error "主机依赖缺失（命令: ${missing_list# }）。请先手动安装对应软件包（acl / util-linux 等）再重新运行；脚本已中止，未进入后续安装或部署步骤。"
+    fi
+}
+# <<< host-dependencies <<< ===================================================
 
 install_shortcut() {
   cat > /root/sbox/mianyang.sh << EOF
@@ -3689,6 +3754,8 @@ if has_any_installation_marker; then
     fi
 
     install_pkgs
+    # Ordering rule: host dependencies are guaranteed here, before anything
+    # that can reach a deployment step (see the host-dependencies block).
     # S0: fail-closed bootstrap repair on every existing install, BEFORE the
     # interactive menu runs. A failing chmod or an unrepairable derived secret
     # file aborts here (see repair_existing_install_security_baseline) -- the

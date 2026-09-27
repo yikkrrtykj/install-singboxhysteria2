@@ -42,6 +42,7 @@ jobs:
           bash -n tests/test-phase-c.sh
           bash -n tests/test-phase-d.sh
           bash -n tests/test-security-baseline.sh
+          bash -n tests/test-install-host-deps.sh
           bash -n tests/canary-api-auth.sh
           bash -n tests/test-monitor-v2-e1.sh
           bash -n tests/test-monitor-v2-e2.sh
@@ -114,6 +115,13 @@ jobs:
 
       - name: S0 security-baseline regression suite (incl. Linux-only mode assertions)
         run: bash tests/test-security-baseline.sh
+
+      # The top-level host dependency bootstrap (package -> command map: acl
+      # provides setfacl/getfacl, util-linux provides runuser) is what makes a
+      # fresh Ubuntu host able to reach Monitor 0.3.1's journal-reader
+      # activation at all, so it is a core product contract.
+      - name: "Host dependency bootstrap regression suite (install.sh package->command map, fail-closed verification)"
+        run: bash tests/test-install-host-deps.sh
 
       - name: Legacy config transaction hardening regression suite (real flock on Linux)
         run: bash tests/test-legacy-config-transactions.sh
@@ -272,6 +280,14 @@ jobs:
 
       - name: "Journal time compatibility regression suite (B6 finding: raw RFC3339 rejected by Ubuntu 22.04 journalctl)"
         run: bash tests/test-journal-time-compat.sh
+
+      # SBHOST_REQUIRE_LIVE=1: the host dependency gates are about REAL acl /
+      # util-linux binaries and the REAL Monitor consumer predicate, so they
+      # must execute on every baseline -- a SKIP here would be a false green.
+      - name: "Host dependency bootstrap LIVE (real setfacl/getfacl/runuser, real-host idempotence, Monitor predicate agreement)"
+        run: |
+          bash -n tests/test-install-host-deps.sh
+          env SBHOST_REQUIRE_LIVE=1 bash tests/test-install-host-deps.sh
 
       - name: "E3 M1 B-5 LIVE systemd integration (real socket+service under PID 1: PEERCRED / add / reload / rollback / reconcile)"
         run: |

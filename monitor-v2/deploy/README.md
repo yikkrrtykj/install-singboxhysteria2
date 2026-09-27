@@ -22,6 +22,11 @@
   依赖 = 带清晰诊断 fail-closed，未做任何更改。运行时入口
   （`monitor-service` / `monitor-health`）经 `monitor_env_require_commands`
   执行同一 fail-closed 预检。
+- **主机依赖由顶层安装路径 bootstrap**（§21）：journal reader 激活用到的
+  `setfacl` / `getfacl`（package `acl`）与 `runuser`（package `util-linux`）在
+  `install.sh` 里按 **package → command 映射**声明并保证——已满足时一次包管理器都
+  不调用，安装后必须重新解析命令才算成功，仍缺失则 fail-closed 中止且绝不进入后续
+  部署。本节的 Monitor 侧预检仍是权威，bootstrap 不替代它。
 - **环境诊断无泄密**：install 路径记录 `/etc/os-release`（ID + VERSION_ID）、
   `python3 --version`、`systemd --version` 首行、`uname -r`；存在 `ssh` 时
   记录 `ssh -V`。绝不记录 conf 值 / secret / 快照内容。
@@ -433,6 +438,9 @@ systemctl 调用并断言无 `sing-box` 字样。若某次升级明确涉及 sin
 E2/E3/本分支三线并行，避免对共享文件制造冲突；接线由 Integration Round 1 完成。
 "install → sing-box 1.14 → service.api loopback → Monitor collector → Web service → systemd units"
 的完整链路现已由 web 模式提供（collector-loop 保留为显式兼容模式）。
+接线状态不变（install.sh 里没有 `install-monitor.sh` 调用）。后续唯一进入 install.sh
+的 Monitor 相关改动是 §21 的主机依赖 bootstrap——它只保证 `setfacl`/`getfacl`/`runuser`
+在这台主机上可用，不改变本节所述的菜单接入 deferred 立场。
 
 ## 9. 迁移/测试矩阵（任务 8；`tests/test-monitor-packaging.sh`）
 
@@ -935,3 +943,51 @@ X1→X2 是一条**跨真实收敛**的单进程链：消费者在破损形状�
 "生产 release 0.3.0 带着不可遍历祖先出货"的历史注释、X0/X1 手工重建的已发布形
 状——都是**历史与 fixture 证据**，刻意保持 `0.3.0`，不做机械替换。
 
+
+## 21. 主机依赖 bootstrap —— acl / util-linux 进入顶层 install.sh（0.3.1 后续）
+
+B7 之后，部署面唯一可避免的失败是"主机上根本没有 acl"：`setfacl`/`getfacl` 是交换
+目录最小遍历权收敛（§20）的唯一手段，`runuser` 是 reader 可读性真实身份证明的唯一
+手段。缺任何一个，Monitor 侧 fail-closed 预检都会正确拒绝——但那是一次本可以把主
+机准备好从而避免的拒绝。
+
+**顶层服务器安装路径**（`install.sh` 的 `# >>> host-dependencies <<<` 块）现在按
+**package → command 映射**声明主机依赖，而不是按包名探测：
+
+| package | probe commands（全部解析才算满足） |
+| --- | --- |
+| `qrencode` | `qrencode` |
+| `jq` | `jq` |
+| `iptables` | `iptables` |
+| `acl` | `setfacl`, `getfacl` |
+| `util-linux` | `runuser` |
+
+三条规则，逐条由 `tests/test-install-host-deps.sh` 判别（F1–F9 真实执行从 install.sh
+抽出的函数，包管理器是记录调用的 stub）：
+
+1. **幂等**：映射里每个命令都已解析 ⇒ 完全不调用包管理器（既不 `apt update` 也不
+   `install`）——F2/L2；
+2. **验证后才算成功**：安装之后必须重新解析命令；旧实现"装完直接打印安装成功"已删
+   除，包管理器退出 0 而二进制仍缺失的半装状态会被抓住——F5/F6；
+3. **fail closed**：任一条命令仍缺失 ⇒ 通过 `error` 中止，报告里列出的是缺失的**命
+   令**而不只是包名，且后续任何安装/部署步骤都不被进入——F4/F7（驱动脚本里
+   `install_pkgs` 之后的流程标记必须缺失）。
+
+刻意的边界：
+
+- **B7 权限语义零改动**：`monitor-deploy-lib.sh` 的 canonical ACL 全集证明、收敛序
+  列与消费侧探针逐字节未动；
+- **Monitor 侧 fail-closed 预检不删除、不削弱**：`sbmon_sboxjr_acl_tools_available()`
+  与 runuser 门仍是权威，本节只保证"主机可用"这一半；
+- **顶层 install.sh 仍不调用 `install-monitor.sh`**：菜单接线照旧 deferred（§8），
+  本块只保证主机依赖；
+- **探测规则与消费者一致**：两边都是 `command -v`，所以"bootstrap 已经保证"是一句可
+  验证的话，而不是包管理器的退出码（L3/L4/L5 用真实库谓词与真实二进制证明这一
+  点）；
+- **`command -v acl` 永不再出现**：包名与被探测命令不同（F9 放一个真的叫 `acl` 的命
+  令作反例）。
+
+CI：`fast-checks` 做 `bash -n`，`core-regression` 跑整套 F1–F9；`bash-suites` 在三
+个 Ubuntu 基线上以 `SBHOST_REQUIRE_LIVE=1` 执行真实主机段（真实 setfacl/getfacl/
+runuser、真实主机幂等、真实库谓词一致、隐藏 acl → 安装真工具 → 谓词可继续、半装状
+态被真实库拒绝），那里的 SKIP 是硬失败。

@@ -8,6 +8,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/yikkrrtykj/install-singboxhy
 
 作用：安装 Reality + Hysteria2 服务端、systemd 服务和 `mianyang` 管理命令。全新安装会自动启用并启动 `sing-box.service`，不使用手工进程。
 
+主机依赖（host dependency）：脚本先保证这些命令在本机可用——`qrencode`、`jq`、`iptables`，以及服务器 Monitor 的 journal 诊断激活所需的 `setfacl` / `getfacl`（package `acl`）与 `runuser`（package `util-linux`）。判定按"命令是否解析"而不是包名（`command -v acl` 证明不了任何事）；全部已满足时一次包管理器都不会调用，安装之后必须重新解析到命令才算成功，仍缺任一命令则带明确诊断中止，绝不假装成功、也不进入后续部署步骤。详见 `monitor-v2/deploy/README.md` §21。
+
 默认带宽参数：
 
 - Hysteria2 服务端：`1000/1000 Mbps`
