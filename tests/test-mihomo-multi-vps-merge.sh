@@ -281,15 +281,24 @@ grep -qiE 'pyyaml|import yaml|ruamel' "$TOOL" \
     && fail 'a YAML library is referenced' || pass 'no YAML library dependency'
 
 # The CLI surface is fixed: paths plus the logical name only. A --uuid or
-# --password option would put a credential into argv.
-help_text="$("$PY" "$TOOL" --help 2>&1)"
-for forbidden in uuid password server pubkey public-key short-id secret token url host; do
-    printf '%s\n' "$help_text" | grep -qiE -- "--$forbidden" \
+# --password option would put a credential into argv. It is read from the
+# SOURCE rather than from --help, because this tool deliberately has no help
+# output: argparse builds help and error text out of argv, and argv may sit
+# next to credential material (the refusal is gated in the R1 usage section).
+cli_flags="$("$PY" - "$TOOL" <<'PY'
+import re
+import sys
+text = open(sys.argv[1], encoding="utf-8").read()
+print(" ".join(re.findall(r'add_argument\("(--[a-z-]+)"', text)))
+PY
+)"
+for forbidden in uuid password server pubkey public-key short-id secret token \
+                 url host force; do
+    printf '%s\n' "$cli_flags" | grep -qiE -- "--$forbidden" \
         && fail "the CLI exposes a --$forbidden option" || true
 done
-pass 'no credential-bearing CLI option exists'
-assert_eq '--name --primary --backup --output' \
-    "$(printf '%s\n' "$help_text" | grep -oE '^  --[a-z-]+' | tr -d ' ' | tr '\n' ' ' | sed -e 's/ *$//' -e 's/^  //')" \
+pass 'no credential-bearing or --force CLI option exists'
+assert_eq '--name --primary --backup --output' "$cli_flags" \
     'CLI flags are exactly --name / --primary / --backup / --output'
 
 # The parser pins the renderer's canonical shape. If the template ever moves,
@@ -608,6 +617,322 @@ assert_eq 0 "$(count_files "$TMP" -maxdepth 1 \( -name 'neg-out.yaml' -o -name '
     'T30b every rejected merge left no output file at all'
 assert_diff "$A" "$TMP/vpsA/$NAME-mihomo.yaml" 'the primary input is never modified'
 assert_diff "$B" "$TMP/vpsB/$NAME-mihomo.yaml" 'the backup input is never modified'
+
+# ------------------------------------------------- R1 review round 1 fixes ---
+# Each block below is the exact counterexample raised in review, not a restated
+# generic check.
+
+expect_exact() { # <label> -- run the last merge and compare rc/stdout/stderr
+    local label=$1 want_rc=$2 want_err=$3
+    if [ "$RC" = "$want_rc" ] && [ "$OUT" = "" ] && [ "$ERR" = "$want_err" ]; then
+        pass "$label"
+    else
+        fail "$label (rc=$RC stdout=[$OUT] stderr=[$ERR])"
+    fi
+}
+
+expect_usage() { # <label> <args...> : fixed E_USAGE line, nothing echoed back
+    local label=$1; shift
+    run_merge "$@"
+    local echoed=""
+    for arg in "$@"; do
+        [ -n "$arg" ] || continue
+        case "$OUT$ERR" in
+            *"$arg"*) echoed="$echoed [$arg]" ;;
+        esac
+    done
+    if [ "$RC" = 2 ] && [ "$OUT" = "" ] && [ "$ERR" = "merge: FAIL E_USAGE" ] \
+            && [ -z "$echoed" ]; then
+        pass "$label"
+    else
+        fail "$label (rc=$RC stdout=[$OUT] stderr=[$ERR] echoed:$echoed)"
+    fi
+}
+
+section 'R1 B1 the whole canonical prefix must match byte for byte'
+# Mechanical parity: whatever the renderer prints before `proxies:` IS the
+# constant. A typo in this suite or in the tool cannot hide behind the other.
+prefix_parity="$("$PY" - "$TOOL" "$RENDER_LIB" <<'PY'
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("merge_tool", sys.argv[1])
+tool = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(tool)
+
+body = open(sys.argv[2], encoding="utf-8").read()
+start = body.index("    printf 'mixed-port: 7897")
+lines = [body[start:].split("\n", 1)[0].split("printf '", 1)[1]]
+for line in body[start:].split("\n", 1)[1].split("\n"):
+    if line == "proxies:":
+        break
+    lines.append(line)
+mine, theirs = lines, list(tool.CANONICAL_PREFIX_LINES)
+if mine == theirs:
+    print("OK %d lines" % len(mine))
+else:
+    at = next((i for i, (a, b) in enumerate(zip(mine, theirs)) if a != b),
+              min(len(mine), len(theirs)))
+    print("MISMATCH renderer=%d tool=%d first difference at line %d"
+          % (len(mine), len(theirs), at + 1))
+PY
+)"
+assert_eq "OK 43 lines" "$prefix_parity" \
+    'R1 B1 CANONICAL_PREFIX_LINES equals the renderer pre-proxies region'
+
+# Every one of these is a well-formed YAML document with canonical SECTION
+# KEYS -- the old key-name-only check accepted all of them and passed the
+# result straight into the merged profile.
+prefix_case() { # <label> <python statement rewriting `text`>
+    mutate "$A" "$TMP/r1-prefix.yaml" "$2"
+    expect_code E_PRIMARY_NOT_CANONICAL "R1 B1 $1" \
+        --name "$NAME" --primary "$TMP/r1-prefix.yaml" \
+        --output "$TMP/r1-prefix-out.yaml"
+}
+prefix_case 'allow-lan widened to false' \
+    'text = text.replace("allow-lan: true", "allow-lan: false", 1)'
+prefix_case 'mixed-port changed' \
+    'text = text.replace("mixed-port: 7897", "mixed-port: 1080", 1)'
+prefix_case 'store-selected removed (store-selected is load-bearing)' \
+    'text = text.replace("  store-selected: true\n", "", 1)'
+prefix_case 'a DNS server injected under the canonical nameserver list' \
+    'text = text.replace("    - 223.5.5.5\n", "    - 223.5.5.5\n    - 185.199.108.153\n", 1)'
+prefix_case 'a fake-ip-range swapped out' \
+    'text = text.replace("198.18.0.1/16", "10.0.0.1/8", 1)'
+prefix_case 'the tun block dropped entirely' \
+    'text = text.replace("tun:\n  enable: true\n  stack: mixed\n  device: Mihomo\n  mtu: 1420\n  auto-route: true\n  auto-redirect: true\n  auto-detect-interface: true\n  dns-hijack:\n    - any:53\n    - tcp://any:53\n\n", "", 1)'
+prefix_case 'two prefix keys swapped order' \
+    'text = text.replace("mode: rule\nlog-level: info\n", "log-level: info\nmode: rule\n", 1)'
+prefix_case 'the blank line before tun removed (line cadence drift)' \
+    'text = text.replace("      - 240.0.0.0/4\n\ntun:", "      - 240.0.0.0/4\ntun:", 1)'
+prefix_case 'an extra indented option under profile' \
+    'text = text.replace("  store-fake-ip: true\n", "  store-fake-ip: true\n  whatever: yes\n", 1)'
+prefix_case 'the whole prefix duplicated before proxies' \
+    'text = text.replace("proxies:\n", "mixed-port: 7897\nproxies:\n", 1)'
+# and the shape itself must still be accepted, so the cases above prove
+# strictness rather than a broken fixture.
+expect_mode=single
+expect_ok 'R1 B1 the untouched canonical export is still accepted' \
+    --name "$NAME" --primary "$A" --output "$TMP/r1-ok.yaml"
+
+section 'R1 B2 usage failures can never echo argv'
+expect_usage 'unknown long option carrying a secret-shaped value' \
+    --name "$NAME" --primary "$A" --output "$TMP/neg-out.yaml" \
+    "--password=$UUID_A"
+expect_usage 'positional argument whose value is a real export path' \
+    --name "$NAME" --primary "$A" --output "$TMP/neg-out.yaml" "$B"
+expect_usage 'missing --primary' --name "$NAME" --output "$TMP/neg-out.yaml"
+expect_usage 'missing --output' --name "$NAME" --primary "$A"
+expect_usage '--name without a value' --name --primary "$A" --output "$TMP/neg-out.yaml"
+expect_usage 'abbreviated option name' \
+    --name "$NAME" --pri "$A" --output "$TMP/neg-out.yaml"
+expect_usage 'short option' --name "$NAME" --primary "$A" -o "$TMP/neg-out.yaml"
+expect_usage 'help is refused, not printed' --help
+expect_usage 'short help is refused, not printed' -h
+expect_usage 'no arguments at all'
+expect_usage 'an option-like token in the name position' \
+    --name "--password=$UUID_A" --primary "$A" --output "$TMP/neg-out.yaml"
+# A usage failure must not even reach the file layer.
+assert_eq 0 "$(count_files "$TMP" -name 'neg-out.yaml' -print)" \
+    'R1 B2 no usage failure created an output file'
+
+section 'R1 B3 logical name parity with the canonical client-name contract'
+name_parity="$("$PY" - "$TOOL" "$RENDER_LIB" <<'PY'
+import importlib.util
+import re
+import sys
+
+spec = importlib.util.spec_from_file_location("merge_tool", sys.argv[1])
+tool = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(tool)
+lib = open(sys.argv[2], encoding="utf-8").read()
+canonical = re.search(r"CLIENT_NAME_PATTERN='(.*)'", lib).group(1)
+mine = tool.CLIENT_NAME_RE.pattern
+strip = lambda p: re.sub(r"^(?:\^|\\A)|(?:\$|\\Z)$", "", p)
+print("OK" if strip(canonical) == strip(mine) else
+      "MISMATCH canonical=%r tool=%r" % (canonical, mine))
+PY
+)"
+assert_eq OK "$name_parity" \
+    'R1 B3 CLIENT_NAME_RE equals lib/client-management.sh CLIENT_NAME_PATTERN'
+NAME32="abcdefghij0123456789ABCDEFGH0123"   # exactly 32 chars
+assert_eq 32 "${#NAME32}" 'R1 B3 the 32-character test name really is 32 long'
+mkdir -p "$TMP/vps32"
+mk_export "$TMP/vps32/$NAME32-mihomo.yaml" "$SERVER_A" "$UUID_A" \
+          "$PASSPHRASE_A" "$PUBKEY_A" "$SHORTID_A" FALSE
+expect_ok 'R1 B3 a 32-character canonical client name is accepted' \
+    --name "$NAME32" --primary "$TMP/vps32/$NAME32-mihomo.yaml" \
+    --output "$TMP/r1-name32.yaml"
+expect_usage 'R1 B3 a 33-character name is refused' \
+    --name "${NAME32}x" --primary "$A" --output "$TMP/neg-out.yaml"
+expect_usage 'R1 B3 a name with an embedded newline is refused' \
+    --name "$NAME
+" --primary "$A" --output "$TMP/neg-out.yaml"
+expect_usage 'R1 B3 a name starting with a separator is refused' \
+    --name "_$NAME" --primary "$A" --output "$TMP/neg-out.yaml"
+expect_usage 'R1 B3 an empty name is refused' \
+    --name "" --primary "$A" --output "$TMP/neg-out.yaml"
+expect_usage 'R1 B3 a path-shaped name is refused' \
+    --name "../../etc/$NAME" --primary "$A" --output "$TMP/neg-out.yaml"
+
+section 'R1 B4 malformed and truncated input is structural, never E_IO'
+"$PY" - "$A" "$TMP/r1cut" <<'PY'
+import os
+import sys
+
+src, dst = sys.argv[1], sys.argv[2]
+raw = open(src, "rb").read()
+text = raw.decode("utf-8")
+os.makedirs(dst, exist_ok=True)
+body = text.split("\n")
+for taken in range(len(body)):          # every whole-line truncation
+    payload = "\n".join(body[:taken]) + ("\n" if taken else "")
+    if payload.encode("utf-8") == raw:
+        continue                        # reassembly of the original, not a cut
+    open(os.path.join(dst, "lines-%03d.yaml" % taken), "wb").write(
+        payload.encode("utf-8"))
+for back in (1, 2, 3, 8, 40, 200):      # cut mid-line off the tail
+    open(os.path.join(dst, "bytes-%03d.yaml" % back), "wb").write(raw[:-back])
+PY
+CUTS=0
+CUT_BAD=""
+for variant in "$TMP/r1cut"/*.yaml; do
+    CUTS=$((CUTS + 1))
+    rm -f "$TMP/r1-cut-out.yaml"
+    run_merge --name "$NAME" --primary "$variant" --output "$TMP/r1-cut-out.yaml"
+    [ "$RC" = 1 ] && [ "$ERR" = "merge: FAIL E_PRIMARY_NOT_CANONICAL" ] \
+        && [ "$OUT" = "" ] || CUT_BAD="$CUT_BAD $(basename "$variant"):rc=$RC:err=$ERR"
+done
+assert_eq '' "$CUT_BAD" \
+    "R1 B4 every one of the $CUTS truncations reports E_PRIMARY_NOT_CANONICAL, none E_IO"
+assert_eq 0 "$(count_files "$TMP" -maxdepth 1 -name 'r1-cut-out.yaml' -print)" \
+    'R1 B4 not one truncation variant produced an output file'
+
+# The same sweep on the PORT-HOPPING form: `ports:` is followed by a
+# `hop-interval:` line, and a cut between those two used to index past the end
+# of the document.
+"$PY" - "$B" "$TMP/r1cut-b" <<'PY'
+import os
+import sys
+
+src, dst = sys.argv[1], sys.argv[2]
+raw = open(src, "rb").read()
+text = raw.decode("utf-8")
+os.makedirs(dst, exist_ok=True)
+body = text.split("\n")
+for taken in range(len(body)):
+    payload = "\n".join(body[:taken]) + ("\n" if taken else "")
+    if payload.encode("utf-8") == raw:
+        continue
+    open(os.path.join(dst, "lines-%03d.yaml" % taken), "wb").write(
+        payload.encode("utf-8"))
+PY
+CUTS_B=0
+CUT_BAD_B=""
+for variant in "$TMP/r1cut-b"/*.yaml; do
+    CUTS_B=$((CUTS_B + 1))
+    rm -f "$TMP/r1-cut-b-out.yaml"
+    run_merge --name "$NAME" --primary "$A" --backup "$variant" \
+        --output "$TMP/r1-cut-b-out.yaml"
+    [ "$RC" = 1 ] && [ "$ERR" = "merge: FAIL E_BACKUP_NOT_CANONICAL" ] \
+        && [ "$OUT" = "" ] || CUT_BAD_B="$CUT_BAD_B $(basename "$variant"):rc=$RC:err=$ERR"
+done
+assert_eq '' "$CUT_BAD_B" \
+    "R1 B4 every one of the $CUTS_B hopping-form truncations reports E_BACKUP_NOT_CANONICAL"
+# Explicitly name the two read positions that the bounds helpers now guard:
+# the line after the Reality block, and the hop-interval line after `ports:`.
+"$PY" - "$A" "$TMP/r1-site1.yaml" <<'PY'
+import sys
+body = open(sys.argv[1], encoding="utf-8").read().split("\n")
+cut = next(i for i, line in enumerate(body)
+           if line.startswith("      short-id:")) + 1
+open(sys.argv[2], "w", encoding="utf-8", newline="").write("\n".join(body[:cut]))
+PY
+expect_code E_PRIMARY_NOT_CANONICAL \
+    'R1 B4 a cut right after the Reality block (guarded read position) is structural' \
+    --name "$NAME" --primary "$TMP/r1-site1.yaml" \
+    --output "$TMP/r1-site1-out.yaml"
+"$PY" - "$B" "$TMP/r1-site2.yaml" <<'PY'
+import sys
+body = open(sys.argv[1], encoding="utf-8").read().split("\n")
+cut = body.index("    ports: 40000-40100") + 1
+open(sys.argv[2], "w", encoding="utf-8", newline="").write("\n".join(body[:cut]))
+PY
+expect_code E_BACKUP_NOT_CANONICAL \
+    'R1 B4 a cut between ports: and hop-interval: (guarded read position) is structural' \
+    --name "$NAME" --primary "$A" --backup "$TMP/r1-site2.yaml" \
+    --output "$TMP/r1-site2-out.yaml"
+
+# The same classification must hold when the DAMAGE is on the backup side.
+truncate_backup() { # <label> <lines to keep>
+    "$PY" -c 'import sys
+body = open(sys.argv[1], encoding="utf-8").read().split("\n")
+open(sys.argv[2], "w", encoding="utf-8", newline="").write("\n".join(body[:int(sys.argv[3])]))' \
+        "$B" "$TMP/r1-backup.yaml" "$2"
+    expect_mode=dual
+    expect_code E_BACKUP_NOT_CANONICAL "$1" \
+        --name "$NAME" --primary "$A" --backup "$TMP/r1-backup.yaml" \
+        --output "$TMP/r1-backup-out.yaml"
+    expect_mode=single
+}
+truncate_backup 'R1 B4 a truncated backup reports its own code' 60
+truncate_backup 'R1 B4 a backup cut inside the prefix reports its own code' 20
+for missing in 'proxy-groups:' 'rules:' 'proxies:'; do
+    "$PY" -c 'import sys
+text = open(sys.argv[1], encoding="utf-8").read()
+open(sys.argv[2], "w", encoding="utf-8", newline="").write(
+    text.replace(sys.argv[3] + "\n", "", 1))' "$A" "$TMP/r1-sect.yaml" "$missing"
+    expect_code E_PRIMARY_NOT_CANONICAL \
+        "R1 B4 a document missing the $missing section is structural, not I/O" \
+        --name "$NAME" --primary "$TMP/r1-sect.yaml" \
+        --output "$TMP/r1-sect-out.yaml"
+done
+# Structural edits at EVERY position, not just truncation: a line deleted, a
+# line blanked, an extra indented option injected, a second copy of a line, and
+# an injected column-0 option (the `external-controller` shape that would open
+# the controller to the network). Each is a well-formed-ish document that must
+# be refused by the shape gate.
+"$PY" - "$A" "$TMP/r1mut" <<'PY'
+import os
+import sys
+
+src, dst = sys.argv[1], sys.argv[2]
+body = open(src, encoding="utf-8").read().split("\n")
+os.makedirs(dst, exist_ok=True)
+kinds = {
+    "del": lambda i: body[:i] + body[i + 1:],
+    "blank": lambda i: body[:i] + [""] + body[i + 1:],
+    "dup": lambda i: body[:i] + [body[i]] + body[i:],
+    "inject": lambda i: body[:i] + ["  hostile: yes"] + body[i:],
+    "option": lambda i: body[:i] + ["external-controller: 0.0.0.0:9090"] + body[i:],
+}
+for name, build in kinds.items():
+    for position in range(len(body)):
+        payload = "\n".join(build(position)) + "\n"
+        if payload == "\n".join(body):
+            continue            # an edit that reconstructs the original is not a mutation
+        with open(os.path.join(dst, "%s-%03d.yaml" % (name, position)),
+                  "w", encoding="utf-8", newline="") as handle:
+            handle.write(payload)
+PY
+MUTS=0
+MUT_BAD=""
+for variant in "$TMP/r1mut"/*.yaml; do
+    MUTS=$((MUTS + 1))
+    rm -f "$TMP/r1-mut-out.yaml"
+    run_merge --name "$NAME" --primary "$variant" --output "$TMP/r1-mut-out.yaml"
+    [ "$RC" = 1 ] && [ "$ERR" = "merge: FAIL E_PRIMARY_NOT_CANONICAL" ] \
+        && [ "$OUT" = "" ] || MUT_BAD="$MUT_BAD $(basename "$variant"):rc=$RC:err=$ERR"
+done
+assert_eq '' "$MUT_BAD" \
+    "R1 B4 every one of the $MUTS single-position structural edits reports E_PRIMARY_NOT_CANONICAL"
+
+# One directory that cannot exist is the ONLY thing allowed to say E_IO.
+expect_code E_IO 'a missing output directory still reports E_IO (real I/O)' \
+    --name "$NAME" --primary "$A" --output "$TMP/no-such-dir-r1/out.yaml"
+grep -lE 'Traceback|IndexError|StopIteration|KeyError' "$LOGS"/*.err >/dev/null 2>&1 \
+    && fail 'R1 B4 some invocation leaked a Python traceback' \
+    || pass "R1 B4 zero tracebacks across all $RUNS invocations so far"
 
 # ------------------------------------------------------- T31 credential -----
 section 'T31 credential hygiene'

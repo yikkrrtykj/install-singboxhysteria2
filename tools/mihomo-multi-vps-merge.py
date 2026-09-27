@@ -41,7 +41,11 @@ EXIT_OK = 0
 EXIT_FAILED = 1
 EXIT_USAGE = 2
 
-CLIENT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+# Byte-for-byte parity with the canonical client-name contract
+# (lib/client-management.sh :: CLIENT_NAME_PATTERN): one alnum, then up to 31
+# of [A-Za-z0-9._-] -- 32 characters at most. \A..\Z, not ^..$, because `$` also
+# matches before a trailing newline and would let `vmix01\n` through.
+CLIENT_NAME_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,31}\Z")
 UUID_RE = re.compile(r"\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
                      r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z")
 PUBKEY_RE = re.compile(r"\A[A-Za-z0-9_-]{43,44}\Z")
@@ -58,6 +62,58 @@ TOP_LEVEL_KEYS = (
     "mixed-port", "allow-lan", "bind-address", "mode", "log-level",
     "unified-delay", "ipv6", "profile", "dns", "tun",
     "proxies", "proxy-groups", "rules",
+)
+
+# Everything before `proxies:` is LITERAL in the renderer -- that whole region
+# carries no interpolated value, so a canonical export must match it byte for
+# byte. Comparing key names alone would let a widened `allow-lan`, a replaced
+# dns nameserver, a dropped `store-selected` or an injected indented option
+# ride straight through into the merged profile, because build_output() copies
+# the primary's pre-proxies region verbatim.
+CANONICAL_PREFIX_LINES = (
+    "mixed-port: 7897",
+    "allow-lan: true",
+    'bind-address: "*"',
+    "mode: rule",
+    "log-level: info",
+    "unified-delay: true",
+    "ipv6: true",
+    "profile:",
+    "  store-selected: true",
+    "  store-fake-ip: true",
+    "dns:",
+    "  enable: true",
+    '  listen: "0.0.0.0:53"',
+    "  ipv6: true",
+    "  enhanced-mode: fake-ip",
+    "  fake-ip-range: 198.18.0.1/16",
+    "  default-nameserver:",
+    "    - 223.5.5.5",
+    "    - 8.8.8.8",
+    "  nameserver:",
+    "    - https://dns.alidns.com/dns-query",
+    "    - https://doh.pub/dns-query",
+    "  fallback:",
+    "    - https://1.0.0.1/dns-query",
+    "    - tls://dns.google",
+    "  fallback-filter:",
+    "    geoip: true",
+    "    geoip-code: CN",
+    "    ipcidr:",
+    "      - 240.0.0.0/4",
+    "",
+    "tun:",
+    "  enable: true",
+    "  stack: mixed",
+    "  device: Mihomo",
+    "  mtu: 1420",
+    "  auto-route: true",
+    "  auto-redirect: true",
+    "  auto-detect-interface: true",
+    "  dns-hijack:",
+    "    - any:53",
+    "    - tcp://any:53",
+    "",
 )
 
 PROXIES_KEY = "proxies:"
@@ -216,6 +272,25 @@ def run_spec(lines, index, spec, fields, fail):
     return index
 
 
+def line_at(lines, index, fail):
+    """One line, or a structural failure -- never an IndexError.
+
+    An IndexError escaping here would surface as E_IO, which misreports a
+    truncated export as a disk problem.
+    """
+    if index >= len(lines):
+        raise fail()
+    return lines[index]
+
+
+def find_key(lines, key, fail):
+    """Index of a section key, or a structural failure -- never a StopIteration."""
+    for index, line in enumerate(lines):
+        if line == key:
+            return index
+    raise fail()
+
+
 class Profile(object):
     """One validated canonical export, kept as its original lines."""
 
@@ -269,7 +344,15 @@ def read_export(path, fail):
 
 
 def check_top_level(profile, fail):
-    """Column-0 lines must be exactly the canonical keys, in order, once each."""
+    """The pre-proxies region must be the canonical bytes, keys once each.
+
+    Two layers on purpose: the column-0 scan rejects a structure that is not
+    a key line at all (a comment, an anchor, stray text, a duplicated or
+    reordered section), while the exact prefix comparison rejects a canonical
+    SHELL carrying non-canonical CONTENT -- a changed value, a deleted line, an
+    injected indented option. Both are structural, so both report the fixed
+    NOT_CANONICAL code and neither may fall through as E_IO.
+    """
     lines = profile.lines
     keys = []
     for line in lines:
@@ -283,13 +366,14 @@ def check_top_level(profile, fail):
         keys.append(match.group(1))
     if tuple(keys) != tuple(key + ":" for key in TOP_LEVEL_KEYS):
         raise fail()
-    profile.proxies_at = next(index for index, line in enumerate(lines)
-                              if line == PROXIES_KEY)
-    profile.groups_at = next(index for index, line in enumerate(lines)
-                             if line == GROUPS_KEY)
-    profile.rules_at = next(index for index, line in enumerate(lines)
-                            if line == RULES_KEY)
+    profile.proxies_at = find_key(lines, PROXIES_KEY, fail)
+    profile.groups_at = find_key(lines, GROUPS_KEY, fail)
+    profile.rules_at = find_key(lines, RULES_KEY, fail)
     if not (profile.proxies_at < profile.groups_at < profile.rules_at):
+        raise fail()
+    if profile.proxies_at != len(CANONICAL_PREFIX_LINES):
+        raise fail()
+    if tuple(lines[:profile.proxies_at]) != CANONICAL_PREFIX_LINES:
         raise fail()
 
 
@@ -302,7 +386,7 @@ def parse_proxies(profile, fail):
     reality_at = index
     index = run_spec(lines, index, REALITY_SPEC, fields, fail)
     reality_len = index - reality_at
-    if lines[index] != "":
+    if line_at(lines, index, fail) != "":
         raise fail()
     index += 1
 
@@ -321,7 +405,7 @@ def parse_proxies(profile, fail):
             raise fail()
         hy_fields["ports"] = value
         index += 1
-        if lines[index] != "    hop-interval: 30":
+        if line_at(lines, index, fail) != "    hop-interval: 30":
             raise fail()
         index += 1
 
@@ -497,8 +581,25 @@ def merge(name, primary_path, backup_path, output_path):
     return "dual" if backup is not None else "single"
 
 
+class _SilentParser(argparse.ArgumentParser):
+    """An ArgumentParser whose failures can never name what the operator typed.
+
+    argparse's own error path writes the usage line plus the offending
+    argument text to stderr and exits -- and a path or value on this command
+    line sits next to credential material, so reflecting any of it is not
+    acceptable. Every parse failure therefore becomes a fixed MergeError that
+    main() renders as bare `merge: FAIL E_USAGE`. `--help` is off for the same
+    reason (its text is generated from the option list), and abbreviations are
+    off so the accepted flags stay exactly the four documented ones.
+    """
+
+    def error(self, message):  # noqa: ARG002 -- the message can quote argv
+        raise MergeError(E_USAGE, EXIT_USAGE)
+
+
 def build_arg_parser():
-    parser = argparse.ArgumentParser(
+    parser = _SilentParser(
+        prog="mihomo-multi-vps-merge", add_help=False, allow_abbrev=False,
         description="Offline merge of two canonical Mihomo client.export "
                     "profiles into one multi-VPS profile (operator-local; "
                     "no network, no VPS-to-VPS contact)")
@@ -517,10 +618,13 @@ def build_arg_parser():
 
 
 def main(argv=None):
-    args = build_arg_parser().parse_args(argv)
+    try:
+        args = build_arg_parser().parse_args(argv)
+    except MergeError as exc:
+        return report("merge: FAIL %s" % exc.code, exc.exit_status)
     try:
         if not CLIENT_NAME_RE.match(args.name):
-            return report("merge: FAIL %s" % E_USAGE, EXIT_USAGE)
+            raise MergeError(E_USAGE, EXIT_USAGE)
         mode = merge(args.name, args.primary, args.backup, args.output)
     except MergeError as exc:
         return report("merge: FAIL %s" % exc.code, exc.exit_status)
