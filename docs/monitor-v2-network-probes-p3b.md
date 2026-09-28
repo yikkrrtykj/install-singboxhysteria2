@@ -505,3 +505,24 @@ history_probe_result_rejected`、`persisted_total` 纹丝不动、
 门数移动：`EXPECTED_PASS` 288 → **307**（+19），S0 6 → 8（两条静态反 coercion
 墙），S5 233 → 250（boundary 30 → 35，http 30 → 42）。S1/S2/S3/S4 不动。
 VERSION / `MONITOR_WEB_VERSION` 仍为 `0.3.1`，功能评审头不携带发布准备。
+
+### R2 轮的实测取证
+
+dev 主机（Windows/Git Bash）同批全车道扫描：probe-ingest **307/0**、probes
+138/0、`m05` 全绿、hist 240/0、jr 371/0、jr-deploy 292/0（20 SKIP）、p2b 集成
+33/0（4 SKIP）、e1/e2/e4/e4diag/m2 全绿、journal-time-compat 15/0、
+packaging 268/0。带时序的两组（`threads` 25 + `http` 42 = 67 条）在 CI 网络
+守卫下连跑 **20 轮**：20/20 全绿，零非零退出。shellcheck（`-S warning`）对两条
+探测车道均零告警。
+
+**Linux CI 是真实门禁**：R2 头 `57c6fca` 首试 **10/10 全绿**
+（`shell-tests` 36468769284，`monitor-packaging` 36468769283），Linux 实测数字
+与 dev 主机**逐条相同，没有任何门因平台差异而 SKIP 掉**：probe-ingest 307/0
+（新硬门数）、probes 138/0、hist 240/0、jr 371/0、jr-deploy 464/0/0-SKIP、
+p2b 集成 132/0/0-SKIP；packaging fixture 631/0、root 646/0；三条基线
+（22.04/24.04/26.04）的 `E3_M1_SYSTEMD`、`E3_M2_LIVE`、`E3_M3_DEPLOY`、
+`E3_M3C_PHASE2_LIVE`、`E3_M3C_PHASE3_LIVE` 全 PASS。
+
+另有一条取证纪律值得写明：本轮曾在**同一工作树并发了变异实验与车道扫描**，
+于是 `306/1` 的红与一批 `e2` 红都不是被测契约的状态，而是测量环境的状态。
+两者全部作废重跑，本节的数字来自"扫描期间工作树零写入"的那一批。
