@@ -138,7 +138,10 @@
 - **staging 清单**：`DIAGNOSTICS_MODULE_FILES=(__init__.py network_probes.py
   probe_scheduler.py)`，逐文件 staging（**不是** `cp -R diagnostics`），
   staging 后 `sbmon_diagnostics_audit` 恰等审计，多余/缺失均放弃发布；三个
-  模块加入发布前 `py_compile` 校验集。新引擎文件不会"顺带"进入 release。
+  模块加入发布前 `py_compile` 校验集。这份清单是**启动必需**载荷（`webapp.py`
+  import 调度器），因此与 `journal_reader/` 的"可缺省（INERT）"分支不同：源树
+  缺任一模块即 fail-closed 拒绝发布，一切自建夹具源树都必须镜像它。新引擎文件
+  不会"顺带"进入 release。
 - **回滚 schema 兼容门**（`sbmon_rollback_schema_gate`，在任何 pre-state 捕获
   与变更之前）：
   * 读当前库声明的 `schema_version`（只读 URI，`mode=ro`，2 s 超时）；
@@ -185,6 +188,18 @@ no_public_network.py` 装在 CPython audit 钩子上（`socket.connect`/
 spec 构造）之下，套件日后新增的 import 也绕不过。S5 的 204 条全部在该守卫
 下运行，因此"泄漏"表现为崩溃，而崩溃就是 FAIL。守卫自身先跑 S4 自检，
 防止一个什么都不拒的守卫冒充证明。
+
+**全车道扫描与 reader 轨道的同批适配**：`diagnostics/` 变为无条件 staging
+依赖后，任何自建 monitor 源树的夹具都必须携带它，否则用例在门前就失败。
+本地跑遍全部 Monitor 车道抓到两处：`test-monitor-v2-jr-deploy.sh` 的
+`build_src` 未携带 → 261 passed / 31 failed 全是"夹具建不出来"噪声（staging
+rc=1、空 release 树、unit 缺失），补成与 reader 载荷同规格后 292/0（20 SKIP）；
+`test-monitor-v2-p2b-integration.sh` 同样缺载荷（它的 staging 硬门在本平台
+SKIP，问题只会在 Linux 显形），外加一条刮文本的 "history schema stays exactly
+v2" 门——该门真正的不变量是"reader 集成没有自作主张移动 schema"，因此改为
+"恰一个声明、且值为评审过的 3"，硬编码 2 会挡掉本阶段自己的迁移，而任何未评审
+漂移仍会被抓住：33/0（4 SKIP）。其余车道经清查不受影响（packaging 的 7 棵夹具
+树已同时携带两份载荷，B7 交换访问车道直接指向真实仓库树）。
 
 CI 接线：`.github/workflows/tests.yml` 的 `fast-checks` 增加
 `bash -n tests/test-monitor-v2-probe-ingest.sh`；`monitor-regression` 车道
