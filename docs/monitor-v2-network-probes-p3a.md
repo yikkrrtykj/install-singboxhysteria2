@@ -220,6 +220,13 @@ strip 后必须被 `ipaddress.ip_address()` 完全解析且必须是 **global**
 `classify_egress_change` 同样把任何非 global 输入判 `unknown`。输出仅
 canonical IP 字符串。超限 → `bad_response`；非 IP → `parse_failed`；
 其余映射同 §6。
+
+> **PR-3B 功能评审 R1 的修订（B3）**：这道门的谓词已由 "global" 收紧为
+> **global unicast** —— `ipaddress` 把 `224.0.0.0/4` 与 `ff00::/12` 判为
+> global，而组播 **组** 是一个目的地、从来不是某台主机的出口地址。谓词仍住在
+> `_canonical_ip` 这一道门里（parse / normalize / classify 三个调用点共用），
+> 因此本文 §6/§9/§12 里所有"非 global 即拒"的判别语义只变得更严、不改变方向；
+> 修订理由与判别器见 `docs/monitor-v2-network-probes-p3b.md` §4、§5、§14。
 **endpoint 失败 ≠ "IP changed"**：change 判定是纯函数
 `classify_egress_change(previous, current)`（§9），failure 参与的转移永不
 产出 `changed`。

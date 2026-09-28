@@ -991,3 +991,57 @@ CI：`fast-checks` 做 `bash -n`，`core-regression` 跑整套 F1–F9；`bash-s
 个 Ubuntu 基线上以 `SBHOST_REQUIRE_LIVE=1` 执行真实主机段（真实 setfacl/getfacl/
 runuser、真实主机幂等、真实库谓词一致、隐藏 acl → 安装真工具 → 谓词可继续、半装状
 态被真实库拒绝），那里的 SKIP 是硬失败。
+
+## 22. Issue #33 PR-3B 功能评审 R1（B4）—— 探测 opt-in 的正式持久路径
+
+问题：PR-3B 头一版把网络探测的 opt-in 做成了环境变量
+`SINGBOX_MONITOR_PROBE_TARGETS_FILE`，而**没有任何出货面提供它**——打包 unit 不写、
+`monitor.conf` 不能表达、entrypoint 不导出。于是"开启探测"只能在 systemd drop-in
+或 shell 里手工拼，一次 `restart`/重装就蒸发；它也不在装机校验的覆盖范围内。评审
+判定：opt-in 缺一条**正式的、持久的、可审计**的路径。
+
+设计（本轮落地）：
+
+- 打包 unit 恒定写明这一行，值由 deploy 库解算，不由任何调用方环境决定：
+
+  ```
+  Environment=SINGBOX_MONITOR_PROBE_TARGETS_FILE=@SBMON_PROBE_TARGETS_FILE@
+  # 渲染后：/etc/singbox-monitor/probe-targets.json
+  ```
+
+  `sbmon_render_unit()` 增第 6 条 `sed`，权威解算是
+  `sbmon_probe_targets_file() = $SBMON_CONF_DIR/probe-targets.json`。
+- **开启探测的唯一动作 = 运维者把一个评审过的目标文档放到那条路径上**。除此之外
+  没有任何旋钮：节奏、端点集仍是编译期常量，`monitor.conf` 与 conf 读取器的闭合
+  白名单都不接受探测键（车道 S3 读键**名**而非散文，并先证明键集可枚举，门非空转）。
+- 持久性由既有平台事实承担，本轮不新增权限面：`$SBMON_CONF_DIR` 是 `root` 属主
+  `0755`，服务用户无法在位种一个符号链接；`uninstall` 默认保留该目录（只有
+  `--purge-config` 才移除），因此 opt-in 跨重启、跨重装存活；`ProtectSystem=strict`
+  之下 `/etc` 仍可读，沙箱一行都不放宽。
+- `sbmon_verify_probe_targets()` 只**校验**，永不**生产**：文件缺席 → `info` +
+  调度器 dark；在场 → 走 `sbmon_require_regular_or_absent` + `sbmon_verify_runtime_meta 0640`。
+  后者是本 installer 对所有 `/etc` runtime 文件的同一套"修复后复验"契约：把文档收敛到
+  `root:$SBMON_GROUP 0640`（运维者若放成 `0600 root:root`，服务用户读不到，安装把它修好），
+  但**不改一个内容字节**。它不 `touch/cat/tee/cp/mv/install`、不重定向写入，也不解释文件
+  内容——"文档 Meaning" 仍是调度器自己的 fail-closed 职责。
+- 调用点在 `install-monitor.sh` 的 `sbmon_stage_release` **之前**：发布是不可变动作，
+  校验必须更早失败。
+
+运行期语义随之分成三态（此前"文件不存在"被误算成注入缺陷）：
+
+| 状态 | `startup_error` | 含义 |
+|------|-----------------|------|
+| 变量未设 | `target_file_not_configured` | 非打包/手工环境，异常形态 |
+| 变量已设、文件缺席 | `target_file_absent` | **打包部署后的常态**：零线程、零出站 |
+| 文件在场但畸形/非恰等 | `target_injection_invalid` | 评审文档被改坏，闭合拒绝 |
+
+判别器（`tests/test-monitor-v2-probe-ingest.sh` S3 + `tests/test-monitor-v2-probes.sh`
+门 5）：真实调用 `sbmon_render_unit` 渲染打包模板；渲染结果**恰一行** `Environment=`
+且它就是 opt-in 路径、无残留 `@SBMON_` token、值等于 `$(sbmon_probe_targets_file)`；
+`install-monitor.sh`/`app-bin/*`/reader unit 都不得书写该文档名；校验器函数体经
+awk 提取后不含任何写形态；调用行号早于 staging；出货的 `monitor.conf` 无探测键。
+四个反向实验（模板删行、模板加第二个 `Environment=`、移除渲染 `sed`、校验器写入
+文件）分别让该车道变红，见 `docs/monitor-v2-network-probes-p3b.md` §14。
+
+刻意边界：地址族、用户、`UMask`、`ReadWritePaths` 等 unit 其余各行零改动；
+`sbox-cm` 与 client-management 状态面零接触；不部署、不生产操作。
