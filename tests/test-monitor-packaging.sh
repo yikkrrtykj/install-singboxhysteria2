@@ -361,6 +361,13 @@ JR_MANIFEST_MODULES=(__init__.py codes.py cursor.py journal_time.py \
     normalize.py classifier.py fingerprint.py eligibility.py schema.py \
     state.py reader.py ingest_contract.py)
 
+# PR-3B (#33): the probe payload is a MONITOR runtime module set -- webapp.py
+# imports the scheduler at startup, so the library stages diagnostics/
+# UNCONDITIONALLY and a fixture source tree without it cannot install at all.
+# Spelled out here on purpose, exactly like the reader manifest, and kept
+# honest against the library's own list by the static gate in "static checks".
+DIAG_MANIFEST_MODULES=(__init__.py network_probes.py probe_scheduler.py)
+
 # One path per iteration, built by explicit concatenation: a prefix glued to
 # "${arr[@]}" expands element-wise on some bash builds and only on the first
 # element on others, which silently drops payload files from the fixture.
@@ -376,6 +383,22 @@ jr_stage_payload() { # <src-dir> -- ship the 12-module reader payload in a sourc
     [ "$n" = "12" ] || { printf 'FATAL: fixture staged %s reader modules, expected 12\n' "$n" >&2; exit 70; }
 }
 
+diag_stage_payload() { # <src-dir> -- ship the 3-module diagnostics payload
+    local src="$1" m n
+    mkdir -p "$src/diagnostics"
+    for m in "${DIAG_MANIFEST_MODULES[@]}"; do
+        cp -- "$REPO_ROOT/monitor-v2/diagnostics/$m" "$src/diagnostics/" \
+            || { printf 'FATAL: cannot stage diagnostics module %s\n' "$m" >&2; exit 70; }
+    done
+    rm -rf "$src/diagnostics/__pycache__"
+    n="$(find "$src/diagnostics" -maxdepth 1 -name '*.py' | wc -l | tr -d ' ')"
+    [ "$n" = "3" ] || { printf 'FATAL: fixture staged %s diagnostics modules, expected 3\n' "$n" >&2; exit 70; }
+}
+
+# Every formal release in this lane ships BOTH payloads: the reader (PR-2B)
+# and diagnostics (PR-3B). One helper, so no fixture tree can forget one.
+runtime_payload() { jr_stage_payload "$1"; diag_stage_payload "$1"; }
+
 # A formal install co-activates the reader, so EVERY isolated fixture root has
 # to pin the reader's three paths into itself -- their production defaults
 # (/etc/systemd/system, /usr/local/lib, /var/lib/sbox-journal) must never be
@@ -388,7 +411,7 @@ jr_pin_fixture() { # <fixture-root> <unit-dir>
     export SBOXJR_UNIT_FILE="$unitdir/singbox-journal-reader.service"
 }
 
-jr_stage_payload "$FIX_SRC"
+runtime_payload "$FIX_SRC"
 jr_pin_fixture "$FIX" "$FIX_UNIT_DIR"
 # Freeze the installed baseline independently of the candidate repo version.
 printf '0.1.0\n' > "$FIX_SRC/VERSION"
@@ -407,6 +430,27 @@ LIB_JR_MODULES="$(awk '/^SBOXJR_MODULE_FILES=\(/{f=1} f{print} f&&/\)/{exit}' \
 SUITE_JR_MODULES="$(printf '%s\n' "${JR_MANIFEST_MODULES[@]}" | LC_ALL=C sort | tr '\n' ' ')"
 assert_eq "$SUITE_JR_MODULES" "$LIB_JR_MODULES" \
     "this lane's 12-module manifest == the library's SBOXJR_MODULE_FILES"
+# PR-3B: the same discipline for the probe payload -- and the library must
+# name the modules ONE BY ONE (never `cp -R diagnostics`), so an unreviewed
+# file cannot ride a wildcard into the release tree.
+LIB_DIAG_MODULES="$(awk '/^DIAGNOSTICS_MODULE_FILES=\(/{f=1} f{print} f&&/\)/{exit}' \
+    "$DEPLOY_DIR/lib/monitor-deploy-lib.sh" | grep -oE '[A-Za-z_]+\.py' \
+    | LC_ALL=C sort | tr '\n' ' ')"
+SUITE_DIAG_MODULES="$(printf '%s\n' "${DIAG_MANIFEST_MODULES[@]}" | LC_ALL=C sort | tr '\n' ' ')"
+assert_eq "$SUITE_DIAG_MODULES" "$LIB_DIAG_MODULES" \
+    "this lane's 3-module diagnostics manifest == the library's DIAGNOSTICS_MODULE_FILES"
+if grep -nE '^[[:space:]]*cp[[:space:]]+-R[[:space:]].*diagnostics' \
+    "$DEPLOY_DIR/lib/monitor-deploy-lib.sh" >/dev/null; then
+    fail "library cp -R's the diagnostics tree (wildcard staging)"
+else
+    pass "diagnostics staged file-by-file from the manifest (no directory wildcard)"
+fi
+if grep -qE '^\s*\[ -f "\$SBMON_REPO_MONITOR_DIR/diagnostics/\$df" \]' \
+    "$DEPLOY_DIR/lib/monitor-deploy-lib.sh"; then
+    pass "staging REQUIRES every diagnostics source file (unconditional, fail-closed)"
+else
+    fail "staging does not require the diagnostics sources"
+fi
 if command -v shellcheck >/dev/null 2>&1; then
     if shellcheck -S warning "$INSTALL_MONITOR" "$DEPLOY_DIR"/lib/*.sh "$DEPLOY_DIR"/app-bin/* >"$TMP/sc.out" 2>&1; then
         pass "shellcheck deploy scripts"
@@ -529,6 +573,25 @@ assert_eq '0.1.0' "$(cat "$FIX_APP_LINK/VERSION")" "installed baseline VERSION i
 [ -f "$FIX_APP_LINK/app/monitor-v2/webapp.py" ] && pass "release stages webapp.py (real E2 entrypoint)" || fail "webapp.py not staged"
 [ -d "$FIX_APP_LINK/app/monitor-v2/api_bridge" ] && pass "release stages api_bridge" || fail "api_bridge not staged"
 [ -d "$FIX_APP_LINK/app/monitor-v2/web" ] && pass "release stages web/" || fail "web/ not staged"
+# PR-3B: the probe payload must be INSIDE the immutable release tree, and
+# EXACTLY the three manifest files -- webapp.py imports the scheduler, so a
+# release without it cannot boot, and a release with an extra file was not
+# built from the reviewed manifest.
+DIAG_STAGED_DIR="$FIX_APP_LINK/app/monitor-v2/diagnostics"
+if [ -f "$DIAG_STAGED_DIR/probe_scheduler.py" ] \
+   && [ -f "$DIAG_STAGED_DIR/network_probes.py" ] \
+   && [ -f "$DIAG_STAGED_DIR/__init__.py" ]; then
+    pass "release stages the diagnostics trio under app/monitor-v2 (boot-critical)"
+else
+    fail "diagnostics payload missing from the staged release"
+fi
+assert_eq "3" "$(find "$DIAG_STAGED_DIR" -maxdepth 1 -type f | wc -l | tr -d ' ')" \
+    "staged diagnostics file set is EXACTLY the 3-file manifest"
+if [ -e "$DIAG_STAGED_DIR/__pycache__" ]; then
+    fail "staged release carries __pycache__ inside diagnostics/"
+else
+    pass "no __pycache__ shipped inside the staged diagnostics tree"
+fi
 [ -f "$FIX_APP_LINK/app/monitor-v2/web/static/app.js" ] && pass "release stages web static assets" || fail "web static assets not staged"
 [ ! -e "$FIX_APP_LINK/app/collector" ] && pass "no duplicate independent collector runtime tree" || fail "legacy app/collector tree also staged (two collector runtimes)"
 if [ "$(find "$FIX_APP_LINK" -name '*mihomo*' 2>/dev/null | wc -l)" -eq 0 ]; then
@@ -2451,7 +2514,7 @@ else
     export SBMON_UNIT_FILE="$T22/etc/systemd/system/singbox-monitor.service"
     export SBMON_BACKUP_ROOT="$T22/var/backups/singbox-monitor"
     export SBMON_REPO_MONITOR_DIR="$T22/src"
-    jr_stage_payload "$T22/src"
+    runtime_payload "$T22/src"
     jr_pin_fixture "$T22" "$T22/etc/systemd/system"
     export SBMON_VERSION_FILE="$T22/src/VERSION"
     export SBMON_LOCK_FILE="$T22/deploy.lock"
@@ -2525,7 +2588,7 @@ else
     export SBMON_UNIT_FILE="$T23/etc/systemd/system/singbox-monitor.service"
     export SBMON_BACKUP_ROOT="$T23/var/backups/singbox-monitor"
     export SBMON_REPO_MONITOR_DIR="$T23/src"
-    jr_stage_payload "$T23/src"
+    runtime_payload "$T23/src"
     jr_pin_fixture "$T23" "$T23/etc/systemd/system"
     export SBMON_VERSION_FILE="$T23/src/VERSION"
     export SBMON_LOCK_FILE="$T23/deploy.lock"
@@ -2601,7 +2664,7 @@ else
     export SBMON_UNIT_FILE="$T24/etc/systemd/system/singbox-monitor.service"
     export SBMON_BACKUP_ROOT="$T24/var/backups/singbox-monitor"
     export SBMON_REPO_MONITOR_DIR="$T24/src"
-    jr_stage_payload "$T24/src"
+    runtime_payload "$T24/src"
     jr_pin_fixture "$T24" "$T24/etc/systemd/system"
     export SBMON_VERSION_FILE="$T24/src/VERSION"
     export SBMON_LOCK_FILE="$T24/deploy.lock"
@@ -2677,7 +2740,7 @@ else
     export SBMON_UNIT_FILE="$T25/etc/systemd/system/singbox-monitor.service"
     export SBMON_BACKUP_ROOT="$T25/var/backups/singbox-monitor"
     export SBMON_REPO_MONITOR_DIR="$T25/src"
-    jr_stage_payload "$T25/src"
+    runtime_payload "$T25/src"
     jr_pin_fixture "$T25" "$T25/etc/systemd/system"
     export SBMON_VERSION_FILE="$T25/src/VERSION"
     export SBMON_LOCK_FILE="$T25/deploy.lock"
@@ -2756,7 +2819,7 @@ else
     export SBMON_UNIT_FILE="$T26/etc/systemd/system/singbox-monitor.service"
     export SBMON_BACKUP_ROOT="$T26/var/backups/singbox-monitor"
     export SBMON_REPO_MONITOR_DIR="$T26/src"
-    jr_stage_payload "$T26/src"
+    runtime_payload "$T26/src"
     jr_pin_fixture "$T26" "$T26/etc/systemd/system"
     export SBMON_VERSION_FILE="$T26/src/VERSION"
     export SBMON_LOCK_FILE="$T26/deploy.lock"
@@ -2806,6 +2869,147 @@ else
     assert_no_grep 'helper' "$T26_LOG" "the upgrade log records no helper deployment or update"
     assert_grep ' 0\.1\.5 fresh$' "$T26_REL/releases.history" "the 0.1.5 baseline release is recorded in history"
     assert_grep " ${T26_NEW_VER//./\\.} upgrade\$" "$T26_REL/releases.history" "the $T26_NEW_VER upgrade is recorded in history"
+fi
+fi
+
+section "T27 PR-3B rollback history-schema gate: a v3 database refuses a pre-v3 target"
+# PR-3B ships History schema v3 (network_probe_samples). The RUNTIME half of
+# that contract -- a pre-v3 build refusing to write into a v3 database -- is
+# owned by the probe-ingest lane; this section owns the DEPLOY half: the
+# ordinary rollback path must refuse a target whose OWN release declares an
+# older schema, before it mutates anything, and must still allow a compatible
+# target. The fixture is isolated because the mocked service never creates a
+# history database, so the shared fixture would leave this gate vacuous.
+T27="$TMP/t27"
+T27_APP="$T27/opt/singbox-monitor"
+T27_REL="$T27/opt/singbox-monitor-releases"
+T27_STATE="$T27/var/lib/singbox-monitor"
+T27_DB="$T27_STATE/diagnostics/history.sqlite3"
+T27_LOG="$TMP/out-t27-refuse.log"
+T27_ALLOW_LOG="$TMP/out-t27-allow.log"
+T27_CALLS="$TMP/t27-calls.log"
+if [ "$SYMLINKS_OK" != 1 ]; then
+    printf '  SKIP T27 回滚 history schema 门（此平台无符号链接；Linux pass 是门禁）\n'
+else
+(
+    mkdir -p "$T27/etc/systemd/system" "$T27/src"
+    cp "$REPO_ROOT/monitor-v2/collector.py" "$REPO_ROOT/monitor-v2/webapp.py" "$T27/src/"
+    cp -R "$REPO_ROOT/monitor-v2/web" "$REPO_ROOT/monitor-v2/api_bridge" "$T27/src/"
+    rm -rf "$T27/src/api_bridge/__pycache__" "$T27/src/web/__pycache__"
+    printf '0.3.0\n' > "$T27/src/VERSION"
+    export SBMON_APP_LINK="$T27_APP"
+    export SBMON_RELEASES_DIR="$T27_REL"
+    export SBMON_STATE_ROOT="$T27_STATE"
+    export SBMON_STATE_DIR="$T27_STATE"
+    export SBMON_CONF_DIR="$T27/etc/singbox-monitor"
+    export SBMON_UNIT_FILE="$T27/etc/systemd/system/singbox-monitor.service"
+    export SBMON_BACKUP_ROOT="$T27/var/backups/singbox-monitor"
+    export SBMON_REPO_MONITOR_DIR="$T27/src"
+    runtime_payload "$T27/src"
+    jr_pin_fixture "$T27" "$T27/etc/systemd/system"
+    export SBMON_VERSION_FILE="$T27/src/VERSION"
+    export SBMON_LOCK_FILE="$T27/deploy.lock"
+    export MOCK_CALL_LOG="$T27_CALLS"
+    : > "$T27_CALLS"
+    "$INSTALL_MONITOR" install > "$TMP/out-t27-base.log" 2>&1 || exit 1
+    base_rel="$(basename "$(readlink -f "$T27_APP")")"
+    [ -n "$base_rel" ] || exit 1
+    cp "$REPO_ROOT/monitor-v2/VERSION" "$T27/src/VERSION"
+    "$INSTALL_MONITOR" upgrade > "$TMP/out-t27-up.log" 2>&1 || exit 1
+    live_rel="$(basename "$(readlink -f "$T27_APP")")"
+
+    # A REAL v3 database at the live path, built by the staged release's own
+    # module: the gate must judge the production meta row, not a lookalike.
+    mkdir -p "$T27_STATE/diagnostics"
+    "$PY3" - "$T27_STATE/diagnostics" "$T27_APP/app/monitor-v2" <<'PY' || exit 1
+import sys
+sys.path.insert(0, sys.argv[2])
+from web.incident_history import IncidentHistory
+h = IncidentHistory(sys.argv[1], "e" * 32, monitor_version="t27")
+h.open()
+assert h.health()["enabled"], h.health()
+h.close()
+PY
+
+    # The pre-v3 target is produced the way a real one exists: that release
+    # DECLARES an older schema. The retained baseline release's own module is
+    # demoted in place, so the refused run and the allowed run face a
+    # byte-identical tree (same reader runtime, same manifest, same VERSION)
+    # and only the declared schema differs. The file is restored and the
+    # restore is verified, so the fixture leaves nothing damaged.
+    target_ih="$T27_REL/$base_rel/app/monitor-v2/web/incident_history.py"
+    ih_sha="$(sha256sum "$target_ih" | cut -d' ' -f1)"
+    sed 's/^SCHEMA_VERSION = 3$/SCHEMA_VERSION = 2/' "$target_ih" \
+        > "$target_ih.demoted" || exit 1
+    mv -- "$target_ih.demoted" "$target_ih" || exit 1
+    grep -q '^SCHEMA_VERSION = 2$' "$target_ih" || exit 1
+
+    sha_ref="$(sha256sum "$T27_DB" | cut -d' ' -f1)"
+    hist_ref="$(cat "$T27_REL/releases.history")"
+    restarts_ref="$(grep -c 'systemctl restart singbox-monitor' "$T27_CALLS")"
+    rc_refuse=0
+    "$INSTALL_MONITOR" rollback > "$T27_LOG" 2>&1 || rc_refuse=$?
+    link_after="$(basename "$(readlink -f "$T27_APP")")"
+    sha_after="$(sha256sum "$T27_DB" | cut -d' ' -f1)"
+    hist_after="$(cat "$T27_REL/releases.history")"
+    restarts_after="$(grep -c 'systemctl restart singbox-monitor' "$T27_CALLS")"
+
+    # Positive control, only after the refusal has been proven inert: the very
+    # same command, against the very same release restored to a compatible
+    # declaration, must go through.
+    sed 's/^SCHEMA_VERSION = 2$/SCHEMA_VERSION = 3/' "$target_ih" \
+        > "$target_ih.restore" || exit 1
+    mv -- "$target_ih.restore" "$target_ih" || exit 1
+    restore_sha="$(sha256sum "$target_ih" | cut -d' ' -f1)"
+    rc_allow=0
+    "$INSTALL_MONITOR" rollback > "$T27_ALLOW_LOG" 2>&1 || rc_allow=$?
+    sha_allow="$(sha256sum "$T27_DB" | cut -d' ' -f1)"
+
+    printf '%s\n' "$rc_refuse" > "$TMP/t27.rc"
+    printf '%s\n' "$rc_allow" > "$TMP/t27.rcallow"
+    printf '%s\n' "$live_rel" > "$TMP/t27.live"
+    printf '%s\n' "$link_after" > "$TMP/t27.link"
+    printf '%s\n' "$ih_sha" > "$TMP/t27.ih.sha"
+    printf '%s\n' "$restore_sha" > "$TMP/t27.ih.restore"
+    printf '%s\n' "$sha_ref" > "$TMP/t27.sha.ref"
+    printf '%s\n' "$sha_after" > "$TMP/t27.sha.after"
+    printf '%s\n' "$sha_allow" > "$TMP/t27.sha.allow"
+    printf '%s\n' "$restarts_ref" > "$TMP/t27.restarts.ref"
+    printf '%s\n' "$restarts_after" > "$TMP/t27.restarts.after"
+    printf '%s\n' "$hist_ref" > "$TMP/t27.hist.ref"
+    printf '%s\n' "$hist_after" > "$TMP/t27.hist.after"
+)
+rc=$?
+if [ "$rc" != 0 ]; then
+    fail "isolated PR-3B rollback fixture could not be built (rc=$rc): $(tail -n 5 "$TMP/out-t27-up.log" 2>/dev/null | tr '\n' ' ')"
+else
+    assert_rc 1 "$(cat "$TMP/t27.rc")" \
+        "rollback of a v3 database to a release declaring v2 is refused (rc 1)"
+    assert_grep 'history schema 不兼容' "$T27_LOG" \
+        "the refusal names the history schema gate"
+    assert_grep '未做任何变更' "$T27_LOG" "the refusal promises zero mutation"
+    assert_grep 'v2' "$T27_LOG" "the refusal states the target's declared v2"
+    assert_grep 'v3' "$T27_LOG" "the refusal states the live database's v3"
+    assert_no_grep '混版本' "$T27_LOG" \
+        "the refusal came from the schema gate, not the PR-2B reader gate"
+    assert_eq "$(cat "$TMP/t27.live")" "$(cat "$TMP/t27.link")" \
+        "the refused rollback left the live release switch untouched"
+    assert_eq "$(cat "$TMP/t27.sha.ref")" "$(cat "$TMP/t27.sha.after")" \
+        "the refused rollback left the v3 database byte-identical"
+    assert_eq "$(cat "$TMP/t27.hist.ref")" "$(cat "$TMP/t27.hist.after")" \
+        "the refused rollback wrote no history entry"
+    assert_eq "$(cat "$TMP/t27.restarts.ref")" "$(cat "$TMP/t27.restarts.after")" \
+        "the refused rollback issued no service restart"
+    assert_eq "$(cat "$TMP/t27.ih.sha")" "$(cat "$TMP/t27.ih.restore")" \
+        "the demoted release was restored byte-identically (the fixture damages nothing it inspects)"
+    assert_rc 0 "$(cat "$TMP/t27.rcallow")" \
+        "the same rollback against the same release restored to v3 proceeds (the gate is not a blanket block)"
+    assert_grep '回滚完成' "$T27_ALLOW_LOG" \
+        "the compatible rollback completed normally while the v3 database was in place"
+    assert_eq "$(cat "$TMP/t27.sha.ref")" "$(cat "$TMP/t27.sha.allow")" \
+        "the v3 database is byte-identical after the allowed rollback too (the gate only reads)"
+    assert_no_grep 'sing-box' "$T27_CALLS" \
+        "the whole history-schema rollback sequence never touched sing-box"
 fi
 fi
 
