@@ -144,6 +144,17 @@ build_src() {
     cp -R "$ROOT/monitor-v2/web" "$dest/web"
     cp -R "$ROOT/monitor-v2/api_bridge" "$dest/api_bridge"
     rm -rf "$dest/api_bridge/__pycache__" "$dest/web/__pycache__"
+    # PR-3B: diagnostics/ joined the boot-critical monitor payload (webapp.py
+    # imports the scheduler), and the library stages it from an explicit
+    # manifest -- a formal source tree without it cannot stage at all, which
+    # would make I1's "the release carries the contract" hard gate fire for the
+    # wrong reason. Mirror it exactly like the reader payload below.
+    mkdir -p "$dest/diagnostics"
+    local d
+    for d in "$ROOT"/monitor-v2/diagnostics/*.py; do
+        cp "$d" "$dest/diagnostics/"
+    done
+    rm -rf "$dest/diagnostics/__pycache__"
     printf '0.1.0\n' > "$dest/VERSION"
     if [ "$with_jr" = "--with-jr" ]; then
         mkdir -p "$dest/journal_reader"
@@ -295,9 +306,17 @@ assert_eq "$ADD_NO_STEPUP" "OK" "#51: Add is session+CSRF only (never step-up), 
 assert_grep "$SERVER_PY" '_require_step_up\(self\._handle_e3_mutation, op\)' "#51: destructive mutations keep _require_step_up"
 assert_grep "$SERVER_PY" '_require_step_up\(self\._handle_e3_export\)' "#51: export keeps _require_step_up"
 
-# §13 row 13 (schema unsupported) + frozen-contract boundary: the integration
-# must not have widened the accepted schema set.
-assert_eq "$(grep -c 'SCHEMA_VERSION = 2' "$HIST_PY")" "1" "history schema stays exactly v2"
+# §13 row 13 (schema unsupported) + frozen-contract boundary: the reader
+# integration must not have widened or drifted the accepted schema set on its
+# own. PR-3B (#33) moved the declaration v2 -> v3 by adding the one probe table
+# through a forward-only rung, so the frozen invariant this gate protects is
+# "exactly ONE declaration, and it is the reviewed one" -- not the numeral 2.
+# Any further unreviewed move (a second declaration, or a different value)
+# still trips it.
+assert_eq "$(grep -c '^SCHEMA_VERSION = [0-9]$' "$HIST_PY")" "1" \
+    "history declares its schema version in exactly one place"
+assert_eq "$(grep -o '^SCHEMA_VERSION = [0-9]*' "$HIST_PY" | grep -c '= 3$')" "1" \
+    "history schema is exactly the reviewed v3 (PR-3B moved it from v2)"
 
 # ===========================================================================
 section "I1: HARD GATE -- formally staged release carries and imports the contract"

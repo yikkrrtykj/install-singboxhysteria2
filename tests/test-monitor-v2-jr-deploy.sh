@@ -375,6 +375,15 @@ build_src() { # build_src <dest> [--with-jr]
     cp -R "$ROOT/monitor-v2/web" "$dest/web"
     cp -R "$ROOT/monitor-v2/api_bridge" "$dest/api_bridge"
     rm -rf "$dest/api_bridge/__pycache__" "$dest/web/__pycache__"
+    # PR-3B: diagnostics/ is a BOOT-CRITICAL monitor payload (webapp.py imports
+    # the scheduler), so the library stages it unconditionally and a source
+    # tree without it cannot be staged at all. Every case mirror carries it.
+    mkdir -p "$dest/diagnostics"
+    local df
+    for df in "$ROOT"/monitor-v2/diagnostics/*.py; do
+        cp "$df" "$dest/diagnostics/"
+    done
+    rm -rf "$dest/diagnostics/__pycache__"
     printf '0.1.0\n' > "$dest/VERSION"
     if [ "$with_jr" = "--with-jr" ]; then
         mkdir -p "$dest/journal_reader"
