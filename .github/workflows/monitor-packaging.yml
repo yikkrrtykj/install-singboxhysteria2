@@ -28,7 +28,7 @@ jobs:
       # carry AND import the ingest contract. That is a packaging property, so
       # the integration suite runs in this lane too (it also runs in
       # shell-tests; a redundant green is cheap compared to a missed gate).
-      - name: "Run PR-2B integration suite (release packaging carries + imports the ingest contract, dual-ref retention, v1->v2 migration through the installed release)"
+      - name: "Run PR-2B integration suite (release packaging carries + imports the ingest contract, dual-ref retention, migration through the installed release to the current schema)"
         run: bash tests/test-monitor-v2-p2b-integration.sh
 
   packaging-root:

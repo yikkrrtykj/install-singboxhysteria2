@@ -569,7 +569,7 @@ if require_symlink "I3 prune chronology"; then
 fi
 
 # ===========================================================================
-section "I4: §9 schema v1 -> v2 migration THROUGH the installed release"
+section "I4: §9 schema v1 -> v3 migration THROUGH the installed release"
 # ===========================================================================
 if require_symlink "I4 migration via installed release code"; then
     new_case migrate
@@ -732,15 +732,22 @@ EOF
     assert_eq "$(field contract_available)" "True" "migration: the installed release's contract is what the migration used"
     assert_eq "$(field contract_from_release_libexec)" "True" "migration: contract module loaded from the release libexec ($(field contract_from))"
     assert_eq "$(field history_from_release_app)" "True" "migration: incident_history came from the release app tree ($(field history_from))"
-    assert_eq "$(field health_enabled)" "True" "migration: v1 database opens healthy under v2 code"
+    assert_eq "$(field health_enabled)" "True" "migration: v1 database opens healthy under the installed release's code"
     assert_eq "$(field health_degraded)" "False" "migration: no degraded flag after the forward migration"
-    assert_eq "$(field schema_version)" "2" "migration: meta.schema_version advanced to 2"
+    # PR-3B (#33) made the installed release v3-aware, and the rungs are
+    # forward-only and single-transaction, so a v1 database now lands on v3 in
+    # ONE step -- v1 -> v2 -> v3 in a loop would rewrite rows this gate exists
+    # to protect. The numeral is asserted structurally below (probe table).
+    assert_eq "$(field schema_version)" "3" "migration: meta.schema_version advanced to 3 in one step"
     assert_eq "$(field rows_preserved)" "True" "migration: v1 rows preserved byte-for-byte"
     for t in journal_runs journal_events journal_ingest_audit journal_ingest_state \
              timeline_samples device_protocol_states meta; do
-        printf '%s' "$MIG" | grep -q "\"$t\"" && pass "migration: v2 table $t exists in the migrated database" \
-            || fail "migration: v2 table $t missing"
+        printf '%s' "$MIG" | grep -q "\"$t\"" && pass "migration: pre-existing table $t survives in the migrated database" \
+            || fail "migration: pre-existing table $t missing"
     done
+    printf '%s' "$MIG" | grep -q '"network_probe_samples"' \
+        && pass "migration: the v3 probe table is created by the same v1->v3 rung" \
+        || fail "migration: v3 probe table network_probe_samples missing"
     assert_eq "$(field journal_status_contract)" "True" "migration: journal_status() reports the contract inside the migrated runtime"
     assert_eq "$(field ingest_terminal)" "1" "migration: first ingest settles terminal_seq exactly once"
     assert_eq "$(field ingest_idempotent)" "True" "migration: re-ingesting the same file never double-settles"
