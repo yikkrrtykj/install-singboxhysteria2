@@ -87,6 +87,7 @@ sed -e 's|@SBMON_USER@|sboxweb|g' \
     -e 's|@SBMON_APP_DIR@|/opt/singbox-monitor|g' \
     -e 's|@SBMON_CONF@|/etc/singbox-monitor/monitor.conf|g' \
     -e 's|@SBMON_STATE_ROOT@|/var/lib/singbox-monitor|g' \
+    -e 's|@SBMON_PROBE_TARGETS_FILE@|/etc/singbox-monitor/probe-targets.json|g' \
     "$ROOT/monitor-v2/deploy/singbox-monitor.service.in" > "$UNIT"
 UNIT_SRC="$(cat "$UNIT")"
 assert_eq "User=sboxweb" "$(grep '^User=' "$UNIT")" "unit runs as the non-privileged monitor user"

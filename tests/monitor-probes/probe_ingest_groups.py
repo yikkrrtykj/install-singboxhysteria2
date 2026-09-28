@@ -13,11 +13,13 @@ and every persistence proof goes through ``record_probe_result`` directly.
 """
 
 import http.client
+import ipaddress
 import json
 import os
 import sqlite3
 import ssl
 import stat
+import struct
 import sys
 import tempfile
 import threading
@@ -34,7 +36,9 @@ from web.incident_history import (                        # noqa: E402
     CODE_PROBE_RESULT_REJECTED, CODE_WRITE_FAILED, PROBE_COLUMNS,
     PROBE_CYCLE_FRESHNESS_SECONDS, PROBE_EGRESS_BASELINE_WINDOW_SECONDS,
     PROBE_LATENCY_MAX_MS, SCHEMA_VERSION, IncidentHistory)
-from web.server import MonitorWebApp, build_server        # noqa: E402
+from web.server import (  # noqa: E402
+    PROBE_STATUS_INT_KEYS, PROBE_STATUS_MAX_NUMBER, PROBE_STATUS_REAL_KEYS,
+    MonitorWebApp, build_server, closed_probe_counter, closed_probe_seconds)
 
 NOW = 1_800_000_000.0
 IP_A = "8.8.8.8"
@@ -46,19 +50,64 @@ KEY = os.environ.get("PROBE_TEST_KEY", "")
 
 # -- fixtures -----------------------------------------------------------------
 
-def good(ip=IP_A, change="unknown", cycle=None, epoch=NOW):
-    """One CLOSED engine-shaped result plus the egress token to pair it with."""
+_CYCLE_SEQ = [0]
+
+
+def next_cycle():
+    """A fresh, deterministic, EXACT 32-hex cycle id.
+
+    v3 stores one row per cycle_id (B6), so a fixture that reuses an id
+    silently tests the replay rule instead of the shape it means to test.
+    The "fc" prefix keeps these ids disjoint from the hand-written ids the
+    individual cases still pin."""
+    _CYCLE_SEQ[0] += 1
+    return "fc%030x" % _CYCLE_SEQ[0]
+
+
+def global_unicast(value):
+    """Harness-side restatement of "a public egress address": canonical
+    form of a GLOBAL, non-multicast IP literal, else None. Written here
+    independently of the two production gates so a case can state its
+    expectation without importing the code under test."""
+    if not isinstance(value, str):
+        return None
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return None
+    if not address.is_global or address.is_multicast:
+        return None
+    return str(address)
+
+
+def derive_change(previous, ip):
+    """The token a CORRECT producer claims for (baseline, this answer).
+    Every reject case is paired with its honest token, so a refusal proves
+    its own shape defect and can never be an accident of a mismatched
+    egress-change claim."""
+    before, after = global_unicast(previous), global_unicast(ip)
+    if before is None or after is None:
+        return "unknown"
+    return "changed" if before != after else "unchanged"
+
+
+def good(ip=IP_A, change=None, cycle=None, epoch=NOW):
+    """One CLOSED engine-shaped result plus the egress token to pair it with.
+
+    ``change=None`` means "derive it", which is what a well-behaved producer
+    does; a case that wants a specific (possibly dishonest) token passes it.
+    """
     slot_err = {"status": "failed", "latency_ms": None,
                 "error_code": "timeout"}
     return {
         "v": 1, "epoch": epoch, "cycle_id": cycle if cycle is not None
-        else "a" * 32,
+        else next_cycle(),
         "dns": {"status": "ok", "latency_ms": 12, "error_code": "NONE"},
         "https": dict(slot_err),
         "udp": {"status": "ok", "latency_ms": 30, "error_code": "NONE"},
         "egress": {"status": "ok", "latency_ms": 40, "error_code": "NONE",
                    "ip": ip},
-    }, change
+    }, (change if change is not None else derive_change(None, ip))
 
 
 def network_failure_cycle(cycle=None, epoch=NOW):
@@ -68,7 +117,8 @@ def network_failure_cycle(cycle=None, epoch=NOW):
     egress = dict(slot)
     egress["ip"] = None
     return {
-        "v": 1, "epoch": epoch, "cycle_id": cycle or ("b" * 32),
+        "v": 1, "epoch": epoch,
+        "cycle_id": cycle if cycle is not None else next_cycle(),
         "dns": dict(slot), "https": dict(slot), "udp": dict(slot),
         "egress": egress,
     }, "unknown"
@@ -142,9 +192,9 @@ def group_boundary():
                                  and st["last_error_code"] is None)
 
     # consistent with the durable baseline, in both directions
-    r, c = good(IP_A, "unchanged")
+    r, c = good(IP_A, derive_change(IP_A, IP_A))
     out["unchanged_consistent_accepted"] = h.record_probe_result(r, c) is True
-    r, c = good(IP_B, "changed")
+    r, c = good(IP_B, derive_change(IP_A, IP_B))
     out["changed_consistent_accepted"] = h.record_probe_result(r, c) is True
     out["baseline_follows_newest_ok"] = h.last_persisted_egress_ip() == IP_B
 
@@ -155,96 +205,151 @@ def group_boundary():
         refusals.append(h.record_probe_result(result, change) is False)
         rejected.append(label)
 
+    def row_for(ip=IP_B, cycle=None, epoch=NOW):
+        """A result paired with the token a CORRECT producer would claim
+        against the baseline this store now holds (IP_B): every case below
+        then fails for its own shape defect, never for an honest token
+        mismatch -- the masking B2 review would otherwise hide."""
+        return good(ip, derive_change(IP_B, ip), cycle, epoch)[0]
+
     # not a closed dict at all
     refuse("not_a_dict", {"203.0.113.9": 1}, "unchanged")
     # 'changed' while the durable baseline already equals the new ip
-    r, _ = good(IP_B, "changed")
-    refuse("changed_but_equal_baseline", r, "changed")
-    # non-canonical raw text (leading zeros) even though it parses
-    r, _ = good("8.008.8.8", "unknown")
-    refuse("non_canonical_ip", r, "unknown")
+    refuse("changed_but_equal_baseline", row_for(IP_B), "changed")
+    # B2: a producer may not SUPPRESS or MISDIRECT an event either. Each of
+    # these three carries the token that IS honest for its own addresses, so
+    # the refusal below can only come from the derivation, never from an
+    # unrelated shape defect (and never from a mismatched claim hiding one).
+    refuse("unchanged_across_different_addresses", row_for(IP_A), "unchanged")
+    refuse("unknown_hides_a_real_change", row_for(IP_A), "unknown")
+    refuse("unknown_hides_no_change", row_for(IP_B), "unknown")
+    # non-canonical raw text (leading zeros) even though it parses. The claim
+    # is the token a CANONICAL-FORM-ONLY world would have honoured, so this
+    # case can only fail for the byte-identity of the stored text.
+    refuse("non_canonical_ip", row_for("8.008.8.8"), "changed")
     # private / loopback / link-local / unique-local / unspecified, v4+v6.
-    # (224.0.0.0/4 is deliberately NOT in this list: ipaddress treats
-    # multicast as a GLOBAL scope, so the reviewed gate admits it -- the
-    # durable group states that boundary of the definition.)
+    # Same pairing: "changed" is exactly what a gate that only checked
+    # PARSABILITY would have accepted, so a weakened gate turns this
+    # refusal into a silent second baseline instead of a red line.
     for addr in ("127.0.0.1", "10.0.0.1", "192.168.1.1", "169.254.1.1",
                  "172.16.0.1", "::1", "fe80::1", "fc00::1", "0.0.0.0"):
-        r, _ = good(addr, "unknown")
         refuse("non_global_ip_" + addr.replace(".", "_").replace(":", "x"),
-               r, "unknown")
+               row_for(addr), "changed")
+    # IPv4 AND IPv6 multicast groups: globally scoped to ipaddress, and
+    # therefore NOT admissible as "this host's public egress address" (B3).
+    # The claim here is the one a GLOBALITY-ONLY gate would have honoured
+    # ("changed"), so this case fails loudly if the unicast half of the
+    # gate ever regressed -- it cannot be rescued by a token mismatch.
+    for addr in ("224.0.0.1", "239.255.255.255", "ff02::1", "ff00::"):
+        refuse("multicast_ip_" + addr.replace(".", "_").replace(":", "x"),
+               row_for(addr), "changed")
+    out["engine_refuses_multicast_egress_ip"] = all(
+        engine._canonical_ip(addr) is None
+        for addr in ("224.0.0.1", "239.255.255.255", "ff02::1", "ff00::"))
+    out["engine_still_admits_global_unicast_egress"] = (
+        engine._canonical_ip(IP_A) == IP_A
+        and engine._canonical_ip("2001:4860:4860::8888")
+        == "2001:4860:4860::8888")
     # a failed egress slot carrying an ip
-    r, _ = good(IP_A, "unknown")
+    r = row_for(IP_A)
     r["egress"] = {"status": "failed", "latency_ms": None,
                    "error_code": "timeout", "ip": IP_A}
     refuse("failed_egress_with_ip", r, "unknown")
     # one extra key anywhere is a different, unclosed object
-    r, _ = good(IP_B, "unknown")
+    r = row_for()
     r["host"] = "evil"
-    refuse("extra_top_level_key", r, "unknown")
-    r, _ = good(IP_B, "unknown")
+    refuse("extra_top_level_key", r, "unchanged")
+    r = row_for()
     r["dns"] = {"status": "ok", "latency_ms": 1, "error_code": "NONE",
                 "answer": IP_A}
-    refuse("extra_slot_key", r, "unknown")
+    refuse("extra_slot_key", r, "unchanged")
     # a missing slot
-    r, _ = good(IP_B, "unknown")
+    r = row_for()
     del r["udp"]
-    refuse("missing_slot", r, "unknown")
+    refuse("missing_slot", r, "unchanged")
     # result version drift
-    r, _ = good(IP_B, "unknown")
+    r = row_for()
     r["v"] = 2
-    refuse("result_version_2", r, "unknown")
-    r, _ = good(IP_B, "unknown")
+    refuse("result_version_2", r, "unchanged")
+    r = row_for()
     r["v"] = "1"
-    refuse("result_version_string", r, "unknown")
+    refuse("result_version_string", r, "unchanged")
     # stale / future epoch beyond the cycle freshness bound
     for sign, delta in (("past", -(PROBE_CYCLE_FRESHNESS_SECONDS + 1.0)),
                         ("future", PROBE_CYCLE_FRESHNESS_SECONDS + 1.0),
                         ("hour_old", -3600.0)):
-        r, _ = good(IP_B, "unknown")
+        r = row_for()
         r["epoch"] = NOW + delta
-        refuse("epoch_skew_" + sign, r, "unknown")
-    r, _ = good(IP_B, "unknown")
+        refuse("epoch_skew_" + sign, r, "unchanged")
+    r = row_for()
     r["epoch"] = float("nan")
-    refuse("epoch_nan", r, "unknown")
-    # cycle_id must be exact lowercase 32-hex (or NULL), and a non-string
-    # is refused by the boundary itself -- never by an escaping TypeError
+    refuse("epoch_nan", r, "unchanged")
+    # cycle_id must be an EXACT lowercase 32-hex token -- and never NULL:
+    # the engine always emits one, and a NULL id would be invisible to the
+    # replay rule. A non-string is refused by the boundary itself, never by
+    # an escaping TypeError.
     for index, bad in enumerate(("zz" * 16, "A" * 32, "a" * 31, "a" * 33,
-                                 12345, "  " + "a" * 30, "a" * 32 + "\n")):
-        r, _ = good(IP_B, "unknown")
+                                 12345, "  " + "a" * 30, "a" * 32 + "\n",
+                                 None, "", "f" * 31 + "F")):
+        r = row_for()
         r["cycle_id"] = bad
-        refuse("cycle_id_shape_%d" % index, r, "unknown")
+        refuse("cycle_id_shape_%d" % index, r, "unchanged")
     # closed vocabulary: an unknown status/code pair never lands
-    r, _ = good(IP_B, "unknown")
+    r = row_for()
     r["dns"] = {"status": "ok", "latency_ms": 5, "error_code": "timeout"}
-    refuse("ok_with_error_code", r, "unknown")
-    r, _ = good(IP_B, "unknown")
+    refuse("ok_with_error_code", r, "unchanged")
+    r = row_for()
     r["https"] = {"status": "failed", "latency_ms": 5, "error_code": "timeout"}
-    refuse("failed_with_latency", r, "unknown")
-    r, _ = good(IP_B, "unknown")
+    refuse("failed_with_latency", r, "unchanged")
+    r = row_for()
     r["https"] = {"status": "weird", "latency_ms": None,
                   "error_code": "timeout"}
-    refuse("unknown_status_token", r, "unknown")
-    r, _ = good(IP_B, "unknown")
+    refuse("unknown_status_token", r, "unchanged")
+    r = row_for()
     r["udp"] = {"status": "ok", "latency_ms": PROBE_LATENCY_MAX_MS + 1,
                "error_code": "NONE"}
-    refuse("latency_over_ceiling", r, "unknown")
+    refuse("latency_over_ceiling", r, "unchanged")
     # an out-of-vocabulary change token
-    r, _ = good(IP_B, "unknown")
+    r = row_for()
     refuse("unknown_change_token", r, "moved")
     refuse("none_change_token", r, None)
     # a hostile mapping type is not a closed dict
     class Sneaky(dict):
         pass
-    r, _ = good(IP_B, "unknown")
-    refuse("dict_subclass", Sneaky(r), "unknown")
+    refuse("dict_subclass", Sneaky(row_for()), "unchanged")
+    # LAST, so the plane code below is THIS case's own: a NULL cycle id is
+    # refused as the shape defect it is, with the rejection code -- never by
+    # slipping through the boundary and bouncing off the DDL wall, which
+    # would report a PERSIST failure and tell an entirely different story
+    # (a broken producer vs a broken store).
+    r = row_for()
+    r["cycle_id"] = None
+    refuse("null_cycle_id_is_a_shape_defect", r, "unchanged")
+    out["null_cycle_id_refused_with_the_rejection_code"] = (
+        h.probe_status()["last_error_code"] == CODE_PROBE_RESULT_REJECTED)
+
+    # THE REPLAY RULE (B6): the same cycle id delivered twice is ONE row,
+    # and the second delivery is a closed REJECTION -- never a second
+    # sample, never a second baseline move. The id is deliberately one that
+    # is otherwise perfectly shaped (address == the current baseline), so
+    # the replay is the ONLY defect this case can be refusing.
+    replay_cycle = "7" * 32
+    first = h.record_probe_result(row_for(IP_B, cycle=replay_cycle),
+                                  "unchanged")
+    rows_before_replay = len(probe_rows(h))
+    refuse("replayed_cycle_id", row_for(IP_B, cycle=replay_cycle), "unchanged")
+    out["replayed_cycle_is_refused"] = (
+        first is True and rows_before_replay == 4
+        and len(probe_rows(h)) == rows_before_replay)
+    out["replay_moves_no_baseline"] = h.last_persisted_egress_ip() == IP_B
 
     # the whole matrix, evaluated once every case has run
     out["all_shaped_results_refused"] = all(refusals)
-    out["reject_matrix_covers_at_least_30"] = len(refusals) >= 30
+    out["reject_matrix_covers_at_least_40"] = len(refusals) >= 40
     out["reject_matrix_labels_unique"] = len(set(rejected)) == len(rejected)
 
     st = h.probe_status()
-    out["persisted_still_three"] = st["persisted_total"] == 3
+    out["persisted_still_four"] = st["persisted_total"] == 4
     out["rejected_total_matches_matrix"] = st["rejected_total"] == len(rejected)
     out["plane_degraded_after_refusals"] = st["degraded"] is True
     out["rejection_code_is_probe_plane"] = (
@@ -347,7 +452,7 @@ def group_durable():
         " udp_status, udp_latency_ms, udp_error_code, egress_status,"
         " egress_latency_ms, egress_error_code, egress_ip, egress_change)"
         " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (NOW + 10.0, "2027-01-01T00:00:00+00:00", "raw", None, 1,
+        (NOW + 10.0, "2027-01-01T00:00:00+00:00", "raw", "9" * 32, 1,
          "ok", 1, "NONE", "ok", 1, "NONE", "ok", 1, "NONE",
          "ok", 1, "NONE", "10.0.0.1", "unknown"))
     conn.commit()
@@ -364,22 +469,110 @@ def group_durable():
         h3.record_probe_result(r, "unknown") is True)
     h3.close()
 
-    # The gate is EXACTLY ipaddress globality, stated as a test so the
-    # definition cannot drift silently: multicast is global-scoped and is
-    # therefore admissible, while every private/link-local/ULA form is not.
+    # THE GATE IS GLOBAL *UNICAST*, stated as a test so the definition can
+    # never drift back to bare globality (B3): ``ipaddress`` scopes
+    # 224.0.0.0/4 and ff00::/12 as GLOBAL, so a multicast GROUP passes a
+    # globality-only check -- and it is a destination, never this host's
+    # egress address. Each row claims "changed", the token such a gate
+    # would have honoured, so a regression here silently stores the group.
     h4 = tmp_history("run-scope", clock=lambda: NOW + 20.0)
-    r, _ = good("224.0.0.1", "unknown")
-    r["epoch"] = NOW + 20.0
-    r["cycle_id"] = "3" * 32
-    out["multicast_is_global_and_admitted"] = (
-        h4.record_probe_result(r, "unknown") is True
-        and h4.last_persisted_egress_ip() == "224.0.0.1")
+    multicast = []
+    for cid, addr in (("3" * 32, "224.0.0.1"), ("3" * 31 + "1", "239.255.255.255"),
+                      ("3" * 31 + "2", "ff02::1"), ("3" * 31 + "3", "ff00::")):
+        r, _ = good(addr, "changed")
+        r["epoch"] = NOW + 20.0
+        r["cycle_id"] = cid
+        multicast.append(h4.record_probe_result(r, "changed") is False)
+    out["multicast_refused_v4_and_v6"] = all(multicast) and len(multicast) == 4
+    out["multicast_never_becomes_the_baseline"] = (
+        h4.last_persisted_egress_ip() is None)
+    out["multicast_wrote_zero_rows"] = len(probe_rows(h4)) == 0
     r, _ = good("169.254.169.254", "unknown")
     r["epoch"] = NOW + 20.0
     r["cycle_id"] = "4" * 32
     out["metadata_ip_refused"] = (
         h4.record_probe_result(r, "unknown") is False)
+    # ...and a legitimate global unicast V6 does persist, so the multicast
+    # half cannot be paid for by shrinking the admissible address space.
+    r, _ = good("2001:4860:4860::8888", "unknown")
+    r["epoch"] = NOW + 20.0
+    r["cycle_id"] = "5" * 32
+    out["global_unicast_v6_still_admitted"] = (
+        h4.record_probe_result(r, "unknown") is True
+        and h4.last_persisted_egress_ip() == "2001:4860:4860::8888")
     h4.close()
+
+    # B2: the change token is DERIVED HERE and verified against the
+    # producer's claim for ALL THREE values, so no restart, stale view or
+    # dishonest producer can FABRICATE, SUPPRESS or MISDIRECT an event.
+    # Each triple gets its own store, seeded (when a baseline is wanted) by
+    # one genuinely accepted row, so the durable read is the only source of
+    # "previous" and no case inherits another's state.
+    FAILED = "FAILED-EGRESS"
+
+    def trial(baseline, answer, claim):
+        store = tmp_history("derive", clock=lambda: NOW)
+        if baseline is not None:
+            r, c = good(baseline, "unknown")
+            store.record_probe_result(r, c)
+        if answer == FAILED:
+            r, c = network_failure_cycle()
+        else:
+            r, c = good(answer, claim)
+        accepted = store.record_probe_result(r, claim) is True
+        current = None if answer == FAILED else answer
+        judgement = engine.classify_egress_change(baseline, current)
+        stored = probe_rows(store)
+        row_token = stored[-1]["egress_change"] if stored else None
+        store.close()
+        return (accepted, judgement, row_token,
+                derive_change(baseline, current))
+
+    grid = [(None, IP_A, "unknown"), (None, IP_A, "changed"),
+            (None, IP_A, "unchanged"),
+            (IP_A, IP_A, "unchanged"), (IP_A, IP_A, "changed"),
+            (IP_A, IP_A, "unknown"),
+            (IP_A, IP_B, "changed"), (IP_A, IP_B, "unchanged"),
+            (IP_A, IP_B, "unknown"),
+            (IP_A, FAILED, "unknown"), (IP_A, FAILED, "changed"),
+            (IP_B, IP_B, "unchanged")]
+    verdicts = {("%s|%s|%s" % c): trial(*c) for c in grid}
+    admits_only_derived = True
+    stores_derived_token = True
+    harness_matches_engine = True
+    for triple in grid:
+        accepted, judgement, row_token, harness = verdicts[
+            "%s|%s|%s" % triple]
+        if accepted != (triple[2] == judgement):
+            admits_only_derived = False
+        if accepted and row_token != judgement:
+            stores_derived_token = False
+        if harness != judgement:
+            harness_matches_engine = False
+    out["derive_grid_admits_only_the_derived_token"] = admits_only_derived
+    out["derive_grid_stores_the_derived_token"] = stores_derived_token
+    out["harness_derivation_matches_the_engine"] = harness_matches_engine
+    out["a_failure_never_surfaces_a_change_event"] = (
+        verdicts["%s|%s|%s" % (IP_A, FAILED, "changed")][0] is False
+        and verdicts["%s|%s|%s" % (IP_A, FAILED, "unknown")][0] is True)
+    out["derive_grid_covers_all_three_tokens"] = len(verdicts) >= 12
+
+    # THE SINGLE JUDGEMENT: the engine's pure classifier, the boundary's
+    # private derivation and the harness' independent restatement must be
+    # the SAME function over every shape an egress answer can arrive in.
+    # Three spellings that disagree would make a green suite meaningless,
+    # so this table is the discriminator.
+    addresses = [None, IP_A, IP_B, "224.0.0.1", "ff02::1", "10.0.0.1",
+                 "::1", "8.008.8.8", "2001:db8::1", "not-an-ip", "",
+                 "8.8.8.8 ", "0.0.0.0", "fe80::1"]
+    identical = True
+    for previous in addresses:
+        for current in addresses:
+            if not (engine.classify_egress_change(previous, current)
+                    == IH._derive_egress_change(previous, current)
+                    == derive_change(previous, current)):
+                identical = False
+    out["three_derivations_answer_identically_everywhere"] = identical
     return out
 
 
@@ -469,10 +662,25 @@ def group_schema():
     out["probe_indexes_present"] = {row[0] for row in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='index'"
         " AND tbl_name='network_probe_samples'")} == {
-        "idx_probe_samples_epoch", "idx_probe_samples_egress"}
+        "idx_probe_samples_epoch", "idx_probe_samples_egress",
+        "idx_probe_samples_cycle"}
+    out["cycle_index_is_unique"] = (
+        "UNIQUE" in (conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name='idx_probe_samples_cycle'"
+        ).fetchone()[0] or "").upper())
     cols = [row[1] for row in conn.execute(
         "PRAGMA table_info(network_probe_samples)")]
     out["probe_columns_exact"] = tuple(cols) == PROBE_COLUMNS
+    # cycle_id is NOT NULL in the durable contract too (B6): the table itself
+    # cannot hold an id-less row, so a producer bug cannot make a cycle
+    # invisible to the replay rule.
+    notnull = {row[1]: row[3] for row in conn.execute(
+        "PRAGMA table_info(network_probe_samples)")}
+    out["cycle_id_column_is_not_null"] = notnull.get("cycle_id") == 1
+    out["nullable_columns_are_latencies_and_the_ip_only"] = {
+        name for name, flag in notnull.items() if not flag} == {
+        "dns_latency_ms", "https_latency_ms", "udp_latency_ms",
+        "egress_latency_ms", "egress_ip"}
     out["single_probe_table_only"] = len(
         [t for t in table_set(db_path(h)) if "probe" in t]) == 1
     conn.close()
@@ -587,12 +795,17 @@ def group_schema():
             "udp_latency_ms", "udp_error_code", "egress_status",
             "egress_latency_ms", "egress_error_code", "egress_ip",
             "egress_change"]
-    vals = [NOW, "x", "r", None, 1, "ok", 1, "NONE", "ok", 1, "NONE", "ok", 1,
-            "NONE", "ok", 1, "NONE", IP_A, "unknown"]
+    vals = [NOW, "x", "r", "0" * 32, 1, "ok", 1, "NONE", "ok", 1, "NONE",
+            "ok", 1, "NONE", "ok", 1, "NONE", IP_A, "unknown"]
 
     def attempt(overrides):
         conn = sqlite3.connect(db_path(hw))
         row = dict(zip(base, vals))
+        # Every wall gets its OWN fresh, valid cycle id unless the id IS the
+        # defect under test: with cycle_id NOT NULL + UNIQUE (B6), one shared
+        # id would make the FIRST insert's constraint the reason every later
+        # one "held", and the whole matrix would prove nothing.
+        row["cycle_id"] = next_cycle()
         row.update(overrides)
         try:
             conn.execute("INSERT INTO network_probe_samples (%s) VALUES (%s)"
@@ -627,6 +840,13 @@ def group_schema():
         "uppercase_cycle_id": {"cycle_id": "A" * 32},
         "short_cycle_id": {"cycle_id": "abc"},
         "free_text_cycle_id": {"cycle_id": "SECRET-TOKEN-000000000000000"},
+        # B6: the id-less row is unconstructible at the DDL wall too, not
+        # only at the boundary -- NULL and the wrong-case/length spellings
+        # all bounce.
+        "null_cycle_id": {"cycle_id": None},
+        "empty_cycle_id": {"cycle_id": ""},
+        "thirty_one_char_cycle_id": {"cycle_id": "f" * 31},
+        "dotted_cycle_id": {"cycle_id": "08.8.8.8" + "a" * 24},
         "result_version_drift": {"result_version": 2},
         "latency_negative": {"dns_latency_ms": -1},
         "latency_over_ceiling": {"dns_latency_ms": PROBE_LATENCY_MAX_MS + 1},
@@ -636,6 +856,32 @@ def group_schema():
     out["every_check_wall_holds"] = all(verdicts.values())
     out["check_wall_matrix_broad"] = len(verdicts) >= 18 and sum(
         1 for v in verdicts.values() if v) == len(verdicts)
+    # THE CYCLE IDENTITY AT THE DDL WALL (B6): one row per cycle_id, even
+    # for a raw writer that bypasses the boundary -- so a redelivered cycle
+    # cannot double-count a sample or move the durable baseline twice.
+    dup_id = "6" * 32
+    conn = sqlite3.connect(db_path(hw))
+    first_row = dict(zip(base, vals))
+    first_row["cycle_id"] = dup_id
+    conn.execute("INSERT INTO network_probe_samples (%s) VALUES (%s)"
+                 % (", ".join(base), ", ".join("?" for _ in base)),
+                 [first_row[k] for k in base])
+    conn.commit()
+    replayed = False
+    try:
+        second_row = dict(first_row)
+        second_row["egress_ip"] = IP_B
+        conn.execute("INSERT INTO network_probe_samples (%s) VALUES (%s)"
+                     % (", ".join(base), ", ".join("?" for _ in base)),
+                     [second_row[k] for k in base])
+        conn.commit()
+    except sqlite3.IntegrityError:
+        replayed = True
+    finally:
+        conn.close()
+    out["duplicate_cycle_id_bounces_at_the_ddl_wall"] = (
+        replayed and len([r for r in probe_rows(hw)
+                          if r["cycle_id"] == dup_id]) == 1)
     # the only strings the table can hold are the closed vocabulary + a
     # canonical address: prove a legitimate row still writes at raw level
     conn = sqlite3.connect(db_path(hw))
@@ -685,8 +931,9 @@ def group_retention():
             " udp_status, udp_latency_ms, udp_error_code, egress_status,"
             " egress_latency_ms, egress_error_code, egress_ip, egress_change)"
             " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (epoch + 5.0, "", "seed", None, 1, "ok", 1, "NONE", "ok", 1,
-             "NONE", "ok", 1, "NONE", "ok", 1, "NONE", IP_A, "unknown"))
+            (epoch + 5.0, "", "seed", "%032x" % step, 1, "ok", 1, "NONE",
+             "ok", 1, "NONE", "ok", 1, "NONE", "ok", 1, "NONE", IP_A,
+             "unknown"))
     conn.commit()
     conn.close()
     seed.close()
@@ -898,6 +1145,7 @@ def group_activation():
         sched.TARGETS_ENV_VAR == "SINGBOX_MONITOR_PROBE_TARGETS_FILE")
     out["startup_tokens_closed"] = (
         sched.STARTUP_NOT_CONFIGURED == "target_file_not_configured"
+        and sched.STARTUP_FILE_ABSENT == "target_file_absent"
         and sched.STARTUP_INJECTION_INVALID == "target_injection_invalid"
         and sched.STARTUP_NONE is None)
     out["source_tokens_closed"] = set(
@@ -908,13 +1156,73 @@ def group_activation():
         (ep.dns_hostname, ep.https_host, ep.https_port, ep.https_path,
          ep.udp_resolver_ip, ep.udp_resolver_port, ep.udp_query_hostname,
          ep.egress_host, ep.egress_port, ep.egress_path) ==
-        ("one.one.one.one", "1.1.1.1", 443, "/", "1.1.1.1", 53,
-         "example.invalid", "api.ipify.org", 443, "/"))
+        ("one.one.one.one", "1.1.1.1", 443, "/cdn-cgi/trace", "1.1.1.1", 53,
+         "example.com", "api.ipify.org", 443, "/"))
     out["production_endpoint_set_is_frozen"] = (
         _assignment_raises(ep, "https_host", "evil.example"))
+
+    # B1: every slot is a TARGET/STATUS PAIR that can actually produce
+    # POSITIVE evidence. The offline proof is in two halves: the status
+    # contract stays 200-only (it was NOT loosened to make the old root path
+    # "work"), and the engine's own classifier, fed the status codes measured
+    # on the review host, admits the new pair and refuses the old one.
     targets = sched.production_targets()
     out["production_targets_deterministic"] = (
         targets == sched.production_targets(sched.PRODUCTION_ENDPOINTS))
+    out["production_https_status_contract_is_200_only"] = (
+        targets.https.allowed_statuses == frozenset({200})
+        and targets.egress.allowed_statuses == frozenset({200})
+        and ep.https_path != "/")
+    real_get = engine._https_get
+    https_codes = {}
+    try:
+        for status, label in ((200, "trace"), (301, "root")):
+            engine._https_get = (lambda spec, read_cap=None, _s=status:
+                                 (time.monotonic(), _s, b""))
+            https_codes[label] = engine._run_https_probe(targets.https)[
+                "error_code"]
+    finally:
+        engine._https_get = real_get
+    out["measured_https_pair_produces_evidence"] = (
+        https_codes == {"trace": "NONE", "root": "bad_response"})
+
+    # ...and the UDP slot: the engine evidences a round trip ONLY on NOERROR,
+    # while RFC 6761 makes any name under ".invalid" a guaranteed NXDOMAIN.
+    # So the query name may not live in a never-resolvable space, and the
+    # canned replies below show both halves of the pair.
+    out["production_udp_query_name_is_resolvable_space"] = (
+        not ep.udp_query_hostname.endswith((".invalid", ".test", ".localhost",
+                                            ".local", ".example")))
+    query = engine._udp_encode_query(ep.udp_query_hostname, 0x4f3b)
+    question = query[12:]
+
+    def reply(rcode):
+        return struct.pack("!HHHHHH", 0x4f3b, 0x8100 | rcode, 1, 0, 0,
+                           0) + question
+
+    udp_codes = {name: engine._udp_classify_reply(reply(rc), 0x4f3b, 2048,
+                                                  question)
+                 for name, rc in (("noerror", 0), ("nxdomain", 3))}
+    out["measured_udp_pair_produces_evidence"] = (
+        udp_codes == {"noerror": "NONE", "nxdomain": "bad_response"})
+
+    # POSITIVE EVIDENCE IS PERSISTABLE: an all-ok result shaped exactly like
+    # a successful production cycle crosses the v3 boundary. If this were
+    # refused, the whole surface would be permanently dark-in-the-DB.
+    ok_store = tmp_history("positive", clock=lambda: NOW)
+    ok_row = {"v": 1, "epoch": NOW, "cycle_id": next_cycle(),
+              "dns": {"status": "ok", "latency_ms": 5, "error_code": "NONE"},
+              "https": {"status": "ok", "latency_ms": 40,
+                        "error_code": "NONE"},
+              "udp": {"status": "ok", "latency_ms": 9, "error_code": "NONE"},
+              "egress": {"status": "ok", "latency_ms": 35,
+                         "error_code": "NONE", "ip": IP_A}}
+    out["all_ok_production_shape_persists"] = (
+        ok_store.record_probe_result(ok_row, "unknown") is True
+        and probe_rows(ok_store)[-1]["https_error_code"] == "NONE"
+        and ok_store.probe_status()["rejected_total"] == 0)
+    ok_store.close()
+
     out["scheduler_adds_no_timeout_policy"] = (
         targets.dns.timeout_seconds == engine.DNS_TIMEOUT_SECONDS
         and targets.https.timeout_seconds == engine.HTTPS_TIMEOUT_SECONDS
@@ -971,12 +1279,18 @@ def group_activation():
             st["enabled"] is False and st["running"] is False
             and st["target_source"] == "dark"
             and st["startup_error"] == "target_injection_invalid")
-    # a named-but-absent file is refused the same way
+    # B4: a variable that NAMES the packaged path and finds nothing there is
+    # the ordinary state of a host that has not opted in. It is DARK, and it
+    # is coded as ABSENCE -- not as a defect. Confusing the two would make
+    # every default host look misconfigured, and a real defect (below) look
+    # like the default.
     with env_var(os.path.join(tempfile.mkdtemp(), "gone.json")):
         st = sched.ProbeScheduler(None).status()
-    verdicts["missing_file"] = (
+    verdicts["missing_file_is_absence_not_defect"] = (
         st["enabled"] is False
-        and st["startup_error"] == "target_injection_invalid")
+        and st["running"] is False
+        and st["target_source"] == "dark"
+        and st["startup_error"] == "target_file_absent")
     out["every_defective_opt_in_goes_dark"] = all(verdicts.values())
     out["defective_matrix_broad"] = len(verdicts) >= 16 and len(
         [v for v in verdicts.values() if v]) == len(verdicts)
@@ -1364,7 +1678,14 @@ def group_threads():
     def slow_cycle(targets=None, **kw):
         inside.set()
         time.sleep(1.0)
-        return dict(real_cycle)
+        # Each delivery is a DISTINCT cycle: the schema now enforces one row
+        # per cycle_id, so handing back the same stamped result would turn
+        # this fixture into a replay-rejection loop and prove nothing about
+        # the lock convoy it is meant to measure.
+        fresh = dict(real_cycle)
+        fresh["cycle_id"] = next_cycle()
+        fresh["epoch"] = time.time()
+        return fresh
 
     h = tmp_history("convoy", clock=time.time)
     sched.engine.run_probe_cycle = slow_cycle
@@ -1436,6 +1757,25 @@ class StubScheduler:
         return self._payload
 
 
+class SwappableScheduler(StubScheduler):
+    """The same, with a payload the case can replace between requests: one
+    server then carries a whole matrix of hostile values, so every row of
+    that matrix is proved over the REAL HTTP path."""
+
+    def __init__(self, payload=None):
+        StubScheduler.__init__(self, payload)
+
+    def set(self, payload):
+        self._payload = payload
+
+
+def no_json_constant(token):
+    """``parse_constant`` hook: called for NaN / Infinity / -Infinity, the
+    three bare words Python will happily write and no JSON reader can
+    parse. Raising here turns "the body is valid JSON" into a proof."""
+    raise AssertionError("non-JSON literal in body: %s" % token)
+
+
 def group_http():
     """`/api/v1/diagnostics/timeline` is the one read surface: session
     gated, bounded, and carrying the probe rows plus a closed projection of
@@ -1464,10 +1804,15 @@ def group_http():
             return iter(())
 
     history = tmp_history("http-probe", clock=lambda: t[0], root=d)
+    # seeded with the token a CORRECT producer claims against the store's
+    # own durable baseline (B2): these rows must actually land, or the read
+    # surface below would be proving an empty table.
+    baseline = None
     for index, ip in enumerate((IP_A, IP_B, IP_A)):
-        r, _ = good(ip, "unknown")
+        r, c = good(ip, derive_change(baseline, ip))
         r["cycle_id"] = "%032x" % index
-        history.record_probe_result(r, "unknown")
+        history.record_probe_result(r, c)
+        baseline = ip
     r, c = network_failure_cycle(cycle="f" * 32)
     history.record_probe_result(r, c)
 
@@ -1586,6 +1931,93 @@ def group_http():
     finally:
         server.shutdown()
         server.server_close()
+
+    # B5: NUMBERS ARE A VALUE DOMAIN TOO. A scheduler that answers NaN or an
+    # infinity would otherwise serialize the bare words ``NaN``/``Infinity``
+    # into the response -- not JSON, so one lying float breaks this endpoint
+    # for every reader -- and a negative, fractional, bool or astronomically
+    # large counter would be repeated as a fact. Every hostile value
+    # collapses to the closed minimum (None for a real, 0 for a count) and
+    # the body stays strictly parseable JSON, proved here over real HTTP.
+    hostile = {
+        "cadence_nan": ("cadence_seconds", float("nan")),
+        "cadence_inf": ("cadence_seconds", float("inf")),
+        "cadence_neg_inf": ("cadence_seconds", float("-inf")),
+        "cadence_negative": ("cadence_seconds", -1.0),
+        "cadence_beyond_safe": ("cadence_seconds", 2.0 ** 64),
+        "cadence_bool": ("cadence_seconds", True),
+        "cadence_string": ("cadence_seconds", "fast"),
+        "cycle_epoch_nan": ("last_cycle_epoch", float("nan")),
+        "cycle_epoch_negative": ("last_cycle_epoch", -0.5),
+        "store_epoch_inf": ("last_store_epoch", float("inf")),
+        "completed_float": ("cycles_completed", 2.5),
+        "completed_negative": ("cycles_completed", -1),
+        "completed_nan": ("cycles_completed", float("nan")),
+        "completed_huge": ("cycles_completed", 2 ** 64),
+        "completed_bool": ("cycles_completed", True),
+        "completed_string": ("cycles_completed", "many"),
+        "rejected_string": ("cycles_rejected", "many"),
+        "failures_float": ("runtime_failures", 0.5),
+        "failures_negative": ("runtime_failures", -7),
+    }
+    collapsed = []
+    strict_json = True
+    swappable = SwappableScheduler(dict(healthy))
+    server, port = serve(swappable)
+    try:
+        cookie = login(port)
+        for key, value in hostile.values():
+            payload = dict(healthy)
+            payload[key] = value
+            swappable.set(payload)
+            code, body, _ = get(port, "/api/v1/diagnostics/timeline", cookie)
+            try:
+                surface = json.loads(body, parse_constant=no_json_constant)
+            except (AssertionError, ValueError):
+                strict_json = False
+                collapsed.append(False)
+                continue
+            probes = surface["probes"]
+            want = None if key in PROBE_STATUS_REAL_KEYS else 0
+            projected = probes[key]
+            # ``==`` alone would let 0.0 or False pass for a 0, and True for
+            # None, so the type is asserted alongside the value.
+            collapsed.append(code == 200
+                             and type(projected) is type(want)
+                             and projected == want)
+    finally:
+        server.shutdown()
+        server.server_close()
+    out["hostile_numerics_always_collapse"] = (
+        all(collapsed) and len(collapsed) == len(hostile))
+    out["hostile_projection_body_is_strict_json"] = strict_json
+    out["hostile_matrix_covers_every_projected_number"] = (
+        {key for key, _v in hostile.values()}
+        == set(PROBE_STATUS_REAL_KEYS) | set(PROBE_STATUS_INT_KEYS))
+
+    # the two closers, on their own table: the projection's number domains
+    # are exactly what these answer, and every rejected shape is named.
+    seconds_table = [(None, None), (0, 0), (0.0, 0), (7.5, 7.5),
+                     (60.0, 60.0), (PROBE_STATUS_MAX_NUMBER,
+                                    PROBE_STATUS_MAX_NUMBER),
+                     (-1.0, None), (float("nan"), None),
+                     (float("inf"), None), (float("-inf"), None),
+                     (2 ** 53, None), (2.0 ** 64, None), (True, None),
+                     ("60", None), ([1], None)]
+    out["closed_probe_seconds_table"] = all(
+        closed_probe_seconds(value) == want for value, want in seconds_table)
+    counter_table = [(None, 0), (0, 0), (7, 7), (PROBE_STATUS_MAX_NUMBER,
+                                                 PROBE_STATUS_MAX_NUMBER),
+                     (-1, 0), (2 ** 53, 0), (2 ** 64, 0), (2.5, 0),
+                     (float("nan"), 0), (float("inf"), 0), (True, 0),
+                     ("3", 0), (3 + 0j, 0)]
+    out["closed_probe_counter_table"] = all(
+        closed_probe_counter(value) == want for value, want in counter_table)
+    out["closers_are_the_only_number_domains"] = (
+        closed_probe_seconds(60.0) == 60.0
+        and closed_probe_counter(7) == 7
+        and closed_probe_seconds(2 ** 53) is None
+        and closed_probe_counter(2 ** 53) == 0)
 
     server, port = serve(StubScheduler(RuntimeError("boom at /x/targets")))
     try:

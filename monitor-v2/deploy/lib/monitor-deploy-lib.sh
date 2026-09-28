@@ -507,6 +507,14 @@ sbmon_create_layout() {
 # ---------------------------------------------------------------------------
 sbmon_conf_file() { printf '%s/monitor.conf\n' "$SBMON_CONF_DIR"; }
 
+# PR-3B B4: the ONE path the packaged unit hands to the probe scheduler.
+# Frozen here and in the unit template; a code review moves it, a config
+# line cannot. The installer never writes this file -- it is the operator's
+# single, persistent act of opting into real outbound probing.
+sbmon_probe_targets_file() {
+    printf '%s/probe-targets.json\n' "$SBMON_CONF_DIR";
+}
+
 sbmon_conf_get() { # sbmon_conf_get <KEY> -> value or empty (never logged)
     local key="$1" line
     line="$(grep -E "^${key}=" "$(sbmon_conf_file)" 2>/dev/null | tail -n 1)" || return 0
@@ -575,6 +583,27 @@ sbmon_repair_conf_perms() {
     # F3: monitor.conf is runtime-read by the service user -> ownership and
     # mode are functional requirements; repair is fail-closed.
     sbmon_verify_runtime_meta "$conf" 0640
+}
+
+# PR-3B B4: the probe opt-in FILE BOUNDARY. The packaged unit always names
+# one frozen path, so whatever sits there decides whether this host probes
+# the public internet -- therefore: absent is the documented DARK state,
+# and a present file must be a REGULAR file carrying the same
+# root:<SBMON_GROUP> 0640 contract monitor.conf carries (readable by the
+# service user, writable only by root). A symlink, a directory or any other
+# shape is refused fail-closed with zero mutation. The installer NEVER
+# creates, rewrites or deletes this document, and never interprets its
+# content: what the file MEANS is the scheduler's own fail-closed job.
+sbmon_verify_probe_targets() {
+    local path
+    path="$(sbmon_probe_targets_file)"
+    if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+        sbmon_info "探测目标文件不存在：调度器保持 dark（默认，零出站探测）"
+        return 0
+    fi
+    sbmon_require_regular_or_absent "$path" "probe-targets.json"
+    sbmon_verify_runtime_meta "$path" 0640
+    sbmon_info "探测目标文件已就位（root:$SBMON_GROUP 0640）：文件语义由调度器 fail-closed 校验"
 }
 
 # ---------------------------------------------------------------------------
@@ -819,6 +848,7 @@ sbmon_render_unit() {
         -e "s|@SBMON_APP_DIR@|$SBMON_APP_LINK|g" \
         -e "s|@SBMON_CONF@|$(sbmon_conf_file)|g" \
         -e "s|@SBMON_STATE_ROOT@|$SBMON_STATE_ROOT|g" \
+        -e "s|@SBMON_PROBE_TARGETS_FILE@|$(sbmon_probe_targets_file)|g" \
         "$DEPLOY_DIR/singbox-monitor.service.in"
 }
 

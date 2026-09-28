@@ -13,8 +13,10 @@
 #      journal contract).
 #   2. the boundary, durability, schema, retention, health-plane, activation,
 #      live-loopback and threading behaviour, in
-#      tests/monitor-probes/probe_ingest_groups.py: a 36-case reject matrix,
-#      the durable egress baseline (restart + window + raw-writer defense),
+#      tests/monitor-probes/probe_ingest_groups.py: a reject matrix of more
+#      than forty counterexamples (B1-B6 included),
+#      the durable egress baseline (restart + window + raw-writer defense +
+#      the three-token egress-change derivation grid),
 #      fresh/v1->v3/v2->v3 atomicity with an injected mid-migration crash and
 #      the pre-v3-build refusal that is the RUNTIME half of the rollback
 #      contract, one globally epoch-ordered prune, the two evidence planes
@@ -43,17 +45,21 @@ export PROBE_TEST_KEY="$HERE/monitor-probes/tls-test-key.pem"
 
 PASS=0
 FAIL=0
-# PR-3B first delivery of this lane -- 254 checks, measured on the dev host
-# and to be re-measured on Linux CI:
-#   S0 static + mirror gates              6
-#   S1 rollback gate wiring               6
-#   S2 rollback gate decisions on files  21
-#   S3 shipped-surface hygiene            10
-#   S4 network guard self-test             7
-#   S5 behaviour groups under the guard  204   (tests/monitor-probes/
-#        probe_ingest_groups.py: boundary 25, durable 16, schema 27,
-#        retention 12, health 21, activation 33, e2e 21, threads 25, http 24)
-EXPECTED_PASS=254
+# PR-3B functional-review head -- 288 checks, measured on the dev host and
+# to be re-measured on Linux CI. The R1 round (B1-B6) added the
+# counterexample regressions, so each section moved deliberately:
+#   S0 static + mirror gates               6   (unchanged; gate (4) was
+#        rewritten in place to the three startup tokens + exact class cover)
+#   S1 rollback gate wiring                6   (unchanged)
+#   S2 rollback gate decisions on files   21   (unchanged)
+#   S3 packaged opt-in path                15  (+5: B4 replaces the one
+#        grep that only proved an env var was absent with six render/verify
+#        gates on the real deploy lib)
+#   S4 network guard self-test              7   (unchanged)
+#   S5 behaviour groups under the guard   233  (+29, all B1-B6 regressions:
+#        boundary 30 +5, durable 25 +9, schema 31 +4, http 30 +6,
+#        activation 38 +5; retention 12, health 21, e2e 21, threads 25)
+EXPECTED_PASS=288
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
@@ -170,12 +176,23 @@ keys = set(ps.ProbeScheduler(h).status())
 assert keys == set(srv.PROBE_STATUS_KEYS), "%r != %r" % (
     sorted(keys), sorted(srv.PROBE_STATUS_KEYS))
 assert srv.PROBE_STARTUP_TOKENS == {ps.STARTUP_NOT_CONFIGURED,
+                                    ps.STARTUP_FILE_ABSENT,
                                     ps.STARTUP_INJECTION_INVALID}
 assert srv.PROBE_TARGET_SOURCES == {ps.SOURCE_PRODUCTION, ps.SOURCE_INJECTED,
                                     ps.SOURCE_DARK}
-assert set(srv.PROBE_STATUS_BOOL_KEYS | srv.PROBE_STATUS_SOURCE_KEYS
-           | srv.PROBE_STATUS_TOKEN_KEYS | srv.PROBE_STATUS_REAL_KEYS) \
-    <= keys, "a projection class names a key the scheduler does not emit"
+# The projection classes are CLOSED and total: every scheduler key names a
+# domain the surface can force back into, and no class key is invented. A
+# drifting mirror would otherwise leave the dispatch's fallback branch --
+# the one that answers the closed minimum instead of the scheduler's claim
+# -- carrying real traffic, which is exactly how a projection leak hides.
+classes = (srv.PROBE_STATUS_BOOL_KEYS | srv.PROBE_STATUS_SOURCE_KEYS
+           | srv.PROBE_STATUS_TOKEN_KEYS | srv.PROBE_STATUS_REAL_KEYS
+           | srv.PROBE_STATUS_INT_KEYS)
+assert classes == keys, (
+    "projection classes %r != scheduler keys %r" % (sorted(classes),
+                                                    sorted(keys)))
+assert len(srv.PROBE_STATUS_KEYS) == len(set(srv.PROBE_STATUS_KEYS)) \
+    == len(classes)
 EOF
 then
     pass "the HTTP probe projection covers the scheduler surface exactly"
@@ -388,11 +405,59 @@ assert_eq "$(find "$REL" -name '__pycache__' -type d 2>/dev/null | grep -c .)" \
     "0" "the target-release reader left no bytecode cache inside any release tree"
 
 
-section "S3: no shipped surface can switch probing on by omission"
-if grep -rqE 'SINGBOX_MONITOR_PROBE_TARGETS_FILE' "$ROOT/monitor-v2/deploy"; then
-    fail "a deploy surface sets the opt-in variable (probing must be operator-local)"
+section "S3: the packaged opt-in path is deploy/'s only probe surface"
+# B4: the opt-in used to be an environment variable that NO shipped unit ever
+# supplied, so the frozen production path was unreachable on a real host --
+# a reviewer-approved machine could not turn probing on persistently without
+# inventing its own plumbing. The packaged monitor unit now names the PATH,
+# the OPERATOR supplies the FILE, and nothing in the release tree can create
+# the file, read it, or switch probing on by omission.
+RENDERED="$TMP/rendered-monitor.unit"
+if bash -c '. "$1" >/dev/null 2>&1; sbmon_render_unit > "$2"' _ "$LIB" "$RENDERED" \
+    && [ -s "$RENDERED" ]; then
+    pass "the packaged monitor unit renders through the deploy lib"
 else
-    pass "no deploy/unit/conf surface names the opt-in variable"
+    fail "sbmon_render_unit could not render the monitor unit"
+fi
+if [ "$(grep -c '^Environment=' "$RENDERED")" = "1" ] \
+    && grep -q '^Environment=SINGBOX_MONITOR_PROBE_TARGETS_FILE=' "$RENDERED"; then
+    pass "the unit carries exactly one Environment= line, and it is the opt-in path"
+else
+    fail "the unit grew an Environment= knob: $(grep '^Environment=' "$RENDERED")"
+fi
+if grep -q "^Environment=SINGBOX_MONITOR_PROBE_TARGETS_FILE=$( \
+        bash -c '. "$1" >/dev/null 2>&1; sbmon_probe_targets_file' _ "$LIB")$" \
+        "$RENDERED" \
+    && ! grep -q '@SBMON_' "$RENDERED"; then
+    pass "the opt-in path is \$SBMON_CONF_DIR/probe-targets.json, fully substituted"
+else
+    fail "the rendered opt-in path is not the frozen conf-dir file, or a token is left"
+fi
+# The installer verifies the path and never writes it: no redirection, no
+# touch, no rm, no content read anywhere in deploy/ against that file.
+TARGETS_BLOCK="$(awk '/^sbmon_verify_probe_targets\(\)/,/^}/' "$LIB")"
+if [ -z "$TARGETS_BLOCK" ]; then
+    fail "the probe-targets verifier could not be located"
+elif printf '%s\n' "$TARGETS_BLOCK" \
+        | grep -qE '>[^&]|\b(touch|rm|cat|tee|cp|mv|install)\b'; then
+    fail "the deploy verifier writes to the operator's opt-in file"
+else
+    pass "deploy/ verifies the opt-in file's shape and modes, and never writes it"
+fi
+if grep -rqE 'probe-targets' "$INSTALL" "$ROOT/monitor-v2/deploy/app-bin" \
+    "$ROOT/monitor-v2/deploy/singbox-journal-reader.service.in"; then
+    fail "a shipped surface names or creates the opt-in document"
+else
+    pass "no installer, entrypoint or reader unit names the opt-in document"
+fi
+# The verification runs BEFORE anything is staged, like the P6 secret
+# delivery: a defective opt-in file must abort with nothing changed.
+PT_LN="$(grep -n 'sbmon_verify_probe_targets$' "$INSTALL" | head -1 | cut -d: -f1)"
+STAGE_LN="$(grep -n 'sbmon_stage_release' "$INSTALL" | head -1 | cut -d: -f1)"
+if [ -n "$PT_LN" ] && [ -n "$STAGE_LN" ] && [ "$PT_LN" -lt "$STAGE_LN" ]; then
+    pass "the opt-in path is verified before any release is staged"
+else
+    fail "the opt-in verification is not ordered before staging (line $PT_LN vs $STAGE_LN)"
 fi
 # The generated monitor.conf and its strict KEY=VALUE reader are the only
 # operator-tunable surface. Neither may be able to express a probe knob: the

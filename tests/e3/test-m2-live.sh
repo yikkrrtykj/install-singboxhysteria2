@@ -222,6 +222,7 @@ render_monitor_unit() {
         -e "s|@SBMON_APP_DIR@|$APP|g" \
         -e "s|@SBMON_CONF@|/etc/sboxcm-m2/monitor.conf|g" \
         -e "s|@SBMON_STATE_ROOT@|$MDATA|g" \
+        -e "s|@SBMON_PROBE_TARGETS_FILE@|/etc/sboxcm-m2/probe-targets.json|g" \
         "$ROOT/monitor-v2/deploy/singbox-monitor.service.in" \
     | sed -e "s|^ExecStart=.*|ExecStart=/usr/bin/python3 $APP/webapp.py serve --listen 127.0.0.1 --port $MPORT --data-dir $MDATA|" \
           -e "s|^After=.*|After=network-online.target|" \

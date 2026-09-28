@@ -266,6 +266,10 @@ _cmd_install_locked() { # <install|upgrade> [flags...]
     sbmon_create_layout
     sbmon_write_default_conf
     sbmon_repair_conf_perms
+    # PR-3B B4: the probe opt-in is a file the OPERATOR places, at the one
+    # path the unit names. Its boundary (regular file, root:<group> 0640) is
+    # verified here and never created; absent simply means "no probing".
+    sbmon_verify_probe_targets
     # P6: fail-closed secret delivery BEFORE any release change; failure
     # aborts the whole install with nothing staged.
     sbmon_sync_api_secret

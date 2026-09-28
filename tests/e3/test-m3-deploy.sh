@@ -197,6 +197,7 @@ sed -e "s|@SBMON_USER@|$AXE_USER|g" \
     -e "s|@SBMON_APP_DIR@|$RELLINK|g" \
     -e "s|@SBMON_CONF@|/etc/sboxcm-m3/monitor.conf|g" \
     -e "s|@SBMON_STATE_ROOT@|$MDATA|g" \
+    -e "s|@SBMON_PROBE_TARGETS_FILE@|/etc/sboxcm-m3/probe-targets.json|g" \
     "$ROOT/monitor-v2/deploy/singbox-monitor.service.in" \
 | sed -e "s|^ExecStart=.*|ExecStart=/usr/bin/python3 $RELLINK/app/monitor-v2/webapp.py serve --listen 127.0.0.1 --port $MPORT --data-dir $MDATA|" \
       -e "s|^After=.*|After=network-online.target|" \

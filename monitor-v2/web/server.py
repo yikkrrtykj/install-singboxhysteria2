@@ -67,10 +67,48 @@ PROBE_STATUS_TOKEN_KEYS = frozenset({"startup_error"})
 # result codes): an arbitrary string from a buggy scheduler is refused,
 # so this field can never carry a path, an endpoint or exception text.
 PROBE_STARTUP_TOKENS = frozenset({
-    "target_file_not_configured", "target_injection_invalid"})
+    "target_file_not_configured", "target_file_absent",
+    "target_injection_invalid"})
 PROBE_STATUS_REAL_KEYS = frozenset({"cadence_seconds", "last_cycle_epoch",
                                     "last_store_epoch"})
+PROBE_STATUS_INT_KEYS = frozenset({"cycles_completed", "cycles_rejected",
+                                   "runtime_failures"})
 PROBE_TARGET_SOURCES = frozenset({"production", "injected", "dark"})
+# Every projected number is EXACTLY typed, finite, nonnegative and inside
+# the range a JSON consumer can represent without silent rounding
+# (Number.MAX_SAFE_INTEGER). A NaN or an infinity would otherwise serialize
+# as ``NaN``/``Infinity`` -- not valid JSON, so one lying scheduler could
+# break the whole diagnostics read for every reader -- and a negative or
+# hostile-typed counter would be read as a real fact by the surface.
+PROBE_STATUS_MAX_NUMBER = 9007199254740991  # 2**53 - 1
+
+
+def closed_probe_seconds(value):
+    """One projected real, or None. EXACTLY a plain int or float (not a
+    bool, not a subclass with a private ``__float__``), finite,
+    nonnegative and representable without JSON precision loss. Anything
+    else -- ``"fast"``, ``NaN``, ``Infinity``, ``-1``, ``True`` -- is not a
+    number this surface may repeat, so it answers None (unknown) instead
+    of a coerced guess."""
+    if type(value) not in (int, float):
+        return None
+    if value < 0 or value > PROBE_STATUS_MAX_NUMBER:
+        return None
+    if not math.isfinite(value):
+        return None
+    return 0 if value == 0 else value
+
+
+def closed_probe_counter(value):
+    """One projected integer count, or 0. EXACTLY a plain int (a float
+    claim like ``2.5`` is a defect, not a count), nonnegative and
+    JSON-safe -- so a counter can never read as a fractional, negative or
+    precision-losing number."""
+    if type(value) is not int:
+        return 0
+    if value < 0 or value > PROBE_STATUS_MAX_NUMBER:
+        return 0
+    return value
 
 # The four privileged mutation routes of rev5 §7. M0.5 delivered them as a
 # 501 boundary; M2 wires them to the sbox-cm RPC adapter (below).
@@ -275,9 +313,14 @@ class MonitorWebApp:
         """Closed scheduler status for the diagnostics surface.
 
         Deny-by-default: only the frozen ``PROBE_STATUS_KEYS`` are
-        re-emitted, with their value domains coerced closed, so an
-        endpoint, a path or exception text can never reach a response --
-        and a missing, broken or lying scheduler answers ``None``.
+        re-emitted, each value forced back into its own closed domain --
+        tokens by membership, numbers by EXACT type plus finiteness,
+        nonnegativity and a JSON-safe range -- so an endpoint, a path or
+        exception text can never reach a response, and neither can a
+        ``NaN``/``Infinity`` literal (invalid JSON that would break the
+        whole read for every consumer). A missing, broken or lying
+        scheduler answers ``None``; a lying number answers ``None`` or
+        ``0``, never a guess.
         """
         getter = getattr(self.probe_scheduler, "status", None)
         if not callable(getter):
@@ -299,13 +342,16 @@ class MonitorWebApp:
                 status[key] = (value if value is None
                                or value in PROBE_STARTUP_TOKENS else None)
             elif key in PROBE_STATUS_REAL_KEYS:
-                status[key] = (float(value)
-                               if isinstance(value, (int, float))
-                               and not isinstance(value, bool) else None)
+                status[key] = closed_probe_seconds(value)
+            elif key in PROBE_STATUS_INT_KEYS:
+                status[key] = closed_probe_counter(value)
             else:
-                status[key] = (int(value)
-                               if isinstance(value, int)
-                               and not isinstance(value, bool) else 0)
+                # An unclassified key cannot exist: the probe suite asserts
+                # that the five class sets cover PROBE_STATUS_KEYS exactly.
+                # Should the mirror ever drift, the surface answers the
+                # closed minimum for a count rather than repeating whatever
+                # an unknown shape held.
+                status[key] = 0
         return status
 
     def static_file(self, name):

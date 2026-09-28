@@ -55,14 +55,17 @@ Safety contract (all enforced, all tested):
   table is the ONE network-probe surface -- one row per accepted probe
   cycle, carrying ONLY the closed engine result re-validated AT THIS
   BOUNDARY (status/error_code through the frozen 9-member vocabulary,
-  latency only with ok, the canonical GLOBAL egress IP or NULL, the
-  exact lowercase 32-hex cycle id or NULL). Free text, resolved
+  latency only with ok, the canonical GLOBAL UNICAST egress IP or NULL,
+  the NOT NULL exact lowercase 32-hex cycle id, UNIQUE -- one row per
+  cycle). Free text, resolved
   addresses and over-long values are unconstructible: the boundary
   rejects the whole result (zero bytes written) and the CHECK
   constraints reject even a buggy direct INSERT. Egress-change
-  semantics are persisted per row from the reviewer-frozen
-  ``classify_egress_change`` judgement derived against the LAST
-  SUCCESSFUL PERSISTED public egress IP. Probe persistence carries its
+  semantics are DERIVED AT THIS BOUNDARY for all three tokens
+  (``changed``/``unchanged``/``unknown``) from the reviewer-frozen
+  ``classify_egress_change`` judgement recomputed against the LAST
+  SUCCESSFUL PERSISTED public egress IP, and a producer claim that
+  disagrees with the derivation is refused. Probe persistence carries its
   OWN degraded state (like journal ingest): a probe rejection or DB
   failure can never be swallowed by a successful sample write, and --
   critically -- a probe cycle full of ordinary NETWORK failures is
@@ -763,6 +766,19 @@ class IncidentHistory:
         # a change judgement anyway.
         return _canonical_global_ip(row[0])
 
+    def _probe_cycle_is_new_locked(self, cycle_id):
+        """Replay rule (the documented cycle identity): ONE row per
+        ``cycle_id``, so a re-delivered cycle can never double-count a
+        probe sample or move the baseline twice. The UNIQUE index is the
+        durable wall; this read is what turns a replay into a closed
+        REJECTION (a producer-side defect) instead of a storage failure.
+        Bounded by retention like everything else here: an id whose row
+        has aged out of the timeline is no longer a replay."""
+        return self._conn.execute(
+            "SELECT 1 FROM network_probe_samples WHERE cycle_id = ? LIMIT 1",
+            (cycle_id,)
+        ).fetchone() is None
+
     def _probe_boundary_validate_locked(self, result, egress_change, now):
         """Re-validate the CLOSED engine result at the DB boundary.
 
@@ -771,13 +787,15 @@ class IncidentHistory:
         a trust assumption can be checked for free. Accepts ONLY a
         strictly-typed, exact-key closed result whose three timed slots
         and egress slot each satisfy the closed transition matrix, whose
-        egress IP is byte-identical to the canonical GLOBAL form (the
-        raw text is never stored, and a loopback/private/reserved
-        address is rejected even if the engine above were buggy), and
-        whose egress-change token agrees with the DURABLE baseline --
-        the last successfully persisted public IP -- so a lost in-memory
-        state after a Monitor restart can never fabricate or suppress a
-        change event. Any violation returns None (one sanitized
+        egress IP is byte-identical to the canonical GLOBAL UNICAST form
+        (the raw text is never stored, and a loopback/private/reserved/
+        multicast address is rejected even if the engine above were
+        buggy), whose ``cycle_id`` is the exact 32-hex token the engine
+        always emits AND has not been persisted yet, and whose
+        egress-change token EQUALS the one derived here from the DURABLE
+        baseline -- the last successfully persisted public IP -- so a
+        Monitor restart can neither fabricate nor suppress nor misdirect
+        a change event. Any violation returns None (one sanitized
         rejection counter, one plane code, the raw candidate never
         reaches the table)."""
         if not _result_is_closed(result, _PROBE_RESULT_KEYS):
@@ -790,13 +808,16 @@ class IncidentHistory:
                 or abs(now - epoch) > PROBE_CYCLE_FRESHNESS_SECONDS:
             return None
         cycle_id = result["cycle_id"]
-        if cycle_id is not None:
-            # a non-string is a SHAPE defect: refuse it here, with the
-            # boundary's own rejection counter, instead of letting a
-            # TypeError ride the containment wrapper.
-            if not isinstance(cycle_id, str) \
-                    or _CYCLE_ID_RE.fullmatch(cycle_id) is None:
-                return None
+        # The engine ALWAYS emits an exact lowercase 32-hex id, so NULL is
+        # not a shape this boundary may adopt: an id-less row cannot be
+        # traced back to a cycle and is invisible to the replay rule. A
+        # non-string is a SHAPE defect refused here, with the boundary's
+        # own rejection counter, never as an escaping TypeError.
+        if not isinstance(cycle_id, str) \
+                or _CYCLE_ID_RE.fullmatch(cycle_id) is None:
+            return None
+        if not self._probe_cycle_is_new_locked(cycle_id):
+            return None
         row = {
             "epoch": float(epoch),
             "iso_utc": _iso(epoch),
@@ -838,14 +859,19 @@ class IncidentHistory:
             ip = None
         row["egress_ip"] = ip
 
+        # DERIVED HERE, NOT ACCEPTED FROM THE PRODUCER: the token is
+        # recomputed from the two inputs the judgement can legitimately
+        # use -- this row's canonical address and the durable baseline --
+        # and a claim that disagrees is refused, for ALL THREE values. A
+        # lost in-memory state, a restart or a stale view can therefore
+        # neither FABRICATE an event (``changed`` with no baseline), nor
+        # SUPPRESS one (``unknown`` where both addresses are valid), nor
+        # invent a direction (``unchanged`` across different addresses).
+        previous = self._last_persisted_egress_ip_locked()
         if egress_change not in PROBE_CHANGE_VALUES:
             return None
-        if egress_change in ("unchanged", "changed"):
-            previous = self._last_persisted_egress_ip_locked()
-            if ip is None or previous is None:
-                return None
-            if (egress_change == "unchanged") != (previous == ip):
-                return None
+        if egress_change != _derive_egress_change(previous, ip):
+            return None
         row["egress_change"] = egress_change
         return {column: row[column] for column in PROBE_COLUMNS}
 
@@ -1211,9 +1237,10 @@ class IncidentHistory:
     def _create_probe_table(cls, conn):
         """v3 network probe table: the closed CHECKs mirror the PR-3A
         engine contract (status/error_code vocabulary, ok-iff-NONE,
-        latency only with ok, egress ip = canonical GLOBAL literal or
-        NULL, cycle_id = exact lowercase 32-hex or NULL), so free text,
-        a resolved address or a credential CANNOT be stored even by a
+        latency only with ok, egress ip = canonical GLOBAL UNICAST
+        literal or NULL, cycle_id = NOT NULL exact lowercase 32-hex with
+        a UNIQUE index), so free text, a resolved address or a credential
+        CANNOT be stored even by a
         buggy caller -- the same deny-by-default column discipline as
         the v2 journal tables. ONE table only: the per-slot columns are
         the closed result, not rows.
@@ -1225,8 +1252,12 @@ class IncidentHistory:
             " epoch REAL NOT NULL",
             " iso_utc TEXT NOT NULL",
             " run_id TEXT NOT NULL",
-            " cycle_id TEXT CHECK (cycle_id IS NULL OR (length(cycle_id)"
-            " = 32 AND cycle_id NOT GLOB '*[^0-9a-f]*'))",
+            # The engine NEVER emits a cycle without an id, so the column
+            # is NOT NULL and the exact lowercase 32-hex shape is the only
+            # one the table can hold; the UNIQUE index below is the
+            # documented cycle identity (one row per cycle).
+            " cycle_id TEXT NOT NULL CHECK (length(cycle_id) = 32"
+            " AND cycle_id NOT GLOB '*[^0-9a-f]*')",
             " result_version INTEGER NOT NULL CHECK (result_version = 1)",
         ]
         checks = []
@@ -1277,6 +1308,13 @@ class IncidentHistory:
         conn.execute(
             "CREATE INDEX idx_probe_samples_egress"
             " ON network_probe_samples(egress_status, epoch)")
+        # THE DOCUMENTED CYCLE IDENTITY: one row per cycle_id. A replay of
+        # an already-persisted cycle -- a redelivered result, a producer
+        # bug, a hand-replayed file -- can never double-count a sample or
+        # move the egress baseline twice.
+        conn.execute(
+            "CREATE UNIQUE INDEX idx_probe_samples_cycle"
+            " ON network_probe_samples(cycle_id)")
 
     @classmethod
     def _probe_slot_columns(cls, slot):
@@ -1910,22 +1948,39 @@ PROBE_CYCLE_FRESHNESS_SECONDS = 30.0
 
 
 def _canonical_global_ip(value):
-    """Mirror of the engine's ``_canonical_ip`` gate: canonical form of
-    a PUBLIC (global) IP literal, else None. The v3 boundary and the
+    """Mirror of the engine's ``_canonical_ip`` gate: canonical form of a
+    PUBLIC, GLOBAL UNICAST IP literal, else None. The v3 boundary and the
     durable baseline read both pass through this ONE function, so a
-    loopback/private/reserved/document address can never be persisted
-    or inform a change judgement even if the engine above were buggy
-    (defense in depth; the probe suite asserts this text-equals the
-    engine's gate)."""
+    loopback/private/reserved/document/multicast address can never be
+    persisted or inform a change judgement even if the engine above were
+    buggy (defense in depth; the probe suite AST-compares this gate with
+    the engine's). ``ipaddress`` scopes 224.0.0.0/4 and ff00::/12 as
+    GLOBAL, so globality alone would admit a multicast GROUP -- which is a
+    destination, never a host's egress address."""
     if not isinstance(value, str):
         return None
     try:
         address = ipaddress.ip_address(value)
     except ValueError:
         return None
-    if not address.is_global:
+    if not address.is_global or address.is_multicast:
         return None
     return str(address)
+
+
+def _derive_egress_change(previous, current):
+    """Mirror of the engine's pure ``classify_egress_change``: the CLOSED
+    judgement over two candidate egress answers, computed from the
+    DURABLE baseline and this cycle's own address. Kept as a separate
+    function -- not inlined into the boundary -- so the probe suite can
+    assert it answers identically to the engine's over a table of
+    addresses; the boundary then REFUSES any producer claim that
+    disagrees with it, for all three tokens."""
+    before = _canonical_global_ip(previous)
+    after = _canonical_global_ip(current)
+    if before is None or after is None:
+        return "unknown"
+    return "changed" if before != after else "unchanged"
 
 
 def _result_is_closed(value, keys):

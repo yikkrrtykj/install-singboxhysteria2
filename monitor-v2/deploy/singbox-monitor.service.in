@@ -14,6 +14,15 @@ Group=@SBMON_GROUP@
 # is a convenience only, never the source of truth for the state path.
 ExecStart=@SBMON_APP_DIR@/bin/monitor-service @SBMON_CONF@ @SBMON_STATE_ROOT@
 WorkingDirectory=@SBMON_STATE_ROOT@
+# Issue #33 PR-3B: the network-probe opt-in is a FROZEN PATH, not a knob.
+# The packaged unit always names it, so probing turns on PERSISTENTLY (it
+# survives restarts and redeploys) by ONE auditable act: the operator
+# placing a reviewed target document at that path. Nothing here, and
+# nothing in any release tree, ever creates that file -- while it is
+# absent the scheduler is provably DARK (zero cycles, zero endpoint I/O,
+# startup code "target_file_absent"). Cadence and endpoints are NOT
+# expressible through monitor.conf; they stay compiled-in review material.
+Environment=SINGBOX_MONITOR_PROBE_TARGETS_FILE=@SBMON_PROBE_TARGETS_FILE@
 # P8: private-by-default runtime files (snapshots, temp copies).
 UMask=0077
 Restart=on-failure

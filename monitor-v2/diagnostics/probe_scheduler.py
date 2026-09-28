@@ -16,27 +16,34 @@ Activation contract (all enforced, all tested):
   endpoint grammar are NOT expressible through ``monitor.conf`` (the
   conf loader only maps ``SBMON_*`` keys into ``SBMON_ENV_*``, so no
   conf line can name this surface): changing them is a code review.
-* Probing is EXPLICITLY OPT-IN, and the opt-in is one thing: the
-  existence of a valid JSON target file named by
-  ``SINGBOX_MONITOR_PROBE_TARGETS_FILE``. Absent that variable the
-  scheduler is DARK -- zero cycles, zero I/O -- even though the
-  production endpoint set is compiled in. Reason: the same process
+* Probing is EXPLICITLY OPT-IN, and the opt-in is one thing: a valid
+  JSON target document at the frozen path the packaged systemd unit
+  always names through ``SINGBOX_MONITOR_PROBE_TARGETS_FILE``
+  (``$SBMON_CONF_DIR/probe-targets.json``). The UNIT supplies the path,
+  the OPERATOR supplies the file: while the file does not exist the
+  scheduler is DARK -- zero cycles, zero outbound traffic -- even though
+  the
+  production endpoint set is compiled in, and no release tree, unit,
+  drop-in or installer ever creates that file. Reason: the same process
   image must be provably silent in CI and on every default host (the
   PR-3A §12 reservation) while a reviewer-approved host can turn real
-  probing on without a code change. A CI lane therefore cannot leak
-  into public traffic by forgetting a flag, and an operator turns
-  probing on by shipping a reviewed target file.
+  probing on persistently, across restarts and redeploys, with one
+  auditable file and no code change and no new knob. A CI lane
+  therefore cannot leak into public traffic by forgetting a flag.
 * The file names the target set in exactly one of two closed shapes:
   per-slot endpoint objects (CI/loopback injection, ``target_source``
   ``injected``), or the single token ``{"v": 1, "source": "production"}``
   (a deliberate, auditable act that selects the frozen compiled set,
   ``target_source`` ``production``). Naming the production set is thus
   something a file must SAY -- nothing selects it by omission.
-* An env var that names a missing, malformed or non-exact file also
-  fails closed into a DARK scheduler with a sanitized startup code --
-  never a partial target set and NEVER a silent fallback to the
-  production endpoints, because that would turn a test misconfiguration
-  into real public traffic.
+* A variable that names a missing file is the documented DARK state of a
+  non-opted-in host (``target_file_absent``); a variable that names a
+  malformed or non-exact document, or a path that is not a regular file,
+  fails closed into the same DARK scheduler with its own sanitized
+  startup code (``target_injection_invalid``). Neither ever yields a
+  partial target set and NEVER a silent fallback to the production
+  endpoints, because that would turn a test misconfiguration into real
+  public traffic.
 * egress-change semantics are DERIVED DURABLY from the last SUCCESSFUL
   PERSISTED public egress IP (via the history store's own read of its
   v3 table) through the engine's pure ``classify_egress_change``: a
@@ -73,10 +80,15 @@ TOTAL_DEADLINE_SECONDS = engine.CYCLE_DEADLINE_SECONDS  # 12.0
 
 TARGET_SET_CADENCE = "FROZEN-PR3B"
 
-# The single opt-in switch for probing: the EXISTENCE of a valid file
-# named here, holding loopback/injection endpoints. NOT an SBMON_* key,
-# so monitor.conf can never express it. Absent it the scheduler is dark
-# even though the production endpoint set is compiled in.
+# The single opt-in switch for probing: a valid target document at the
+# frozen path the PACKAGED UNIT always names. The unit supplies the path,
+# the operator supplies the file -- while the file is absent the scheduler
+# is DARK (zero cycles, zero outbound traffic) even though the production
+# endpoint set is compiled in. This is NOT an SBMON_* key, so
+# monitor.conf can never
+# express it, and nothing in the release tree ships a document at the path:
+# a CI lane cannot leak into public traffic by forgetting a flag, and an
+# operator turns real probing on by placing one reviewed, auditable file.
 TARGETS_ENV_VAR = "SINGBOX_MONITOR_PROBE_TARGETS_FILE"
 
 SOURCE_PRODUCTION = "production"
@@ -84,17 +96,44 @@ SOURCE_INJECTED = "injected"
 SOURCE_DARK = "dark"
 
 STARTUP_NONE = None
-# The variable is unset: the ordinary, documented DARK state.
+# The variable is unset: a scheduler started outside the packaged
+# deployment (a harness, a hand-run process). The documented dark state.
 STARTUP_NOT_CONFIGURED = "target_file_not_configured"
-# The variable names something that cannot be resolved into a complete,
+# The packaged unit named its frozen path and no file sits there yet: the
+# ORDINARY dark state of a host that has not opted in. Absence is a fact,
+# not a defect, and it must stay distinguishable from one.
+STARTUP_FILE_ABSENT = "target_file_absent"
+# The path holds something that cannot be resolved into a complete,
 # exact-shape target set.
 STARTUP_INJECTION_INVALID = "target_injection_invalid"
 
-# The reviewed production endpoint set (PR-3A §8 candidates, reviewed):
-# all four slots ride the Cloudflare anycast pair plus the plain IP-echo
-# service; the DNS probe only ever proves resolution (answers are
-# discarded by the engine), the UDP slot sends one public RFC 819-style
-# example query name, and the egress body is 64 bytes max.
+# The reviewed production endpoint set (PR-3B functional R1 B1 re-review).
+# Every slot is a TARGET/STATUS PAIR that can actually produce positive
+# evidence, measured 2026-09-29 against the live endpoints:
+#
+#   * DNS   -- ``one.one.one.one`` through the system resolver.
+#   * HTTPS -- ``https://1.1.1.1/cdn-cgi/trace``, which answers 200. The
+#     bare root (``https://1.1.1.1/``) answers 301, and the engine's
+#     reviewed contract is 200-only, so the ROOT PATH COULD NEVER PRODUCE
+#     EVIDENCE: it failed every cycle with ``bad_response`` no matter how
+#     healthy the network was. The host stays a numeric literal so this
+#     slot never re-tests the resolver (the DNS slot owns that), and the
+#     Cloudflare leaf carries ``IP Address:1.1.1.1`` in its SAN list, so
+#     TLS verification -- structurally on, no bypass knob -- passes
+#     against the literal.
+#   * UDP   -- one A/IN query for ``example.com`` to 1.1.1.1:53. The
+#     engine evidences the round trip ONLY on NOERROR, and RFC 6761
+#     requires ``.invalid`` to be NXDOMAIN, so the previous query name was
+#     deterministically WRONG: a correct resolver could only ever fail the
+#     slot, and a resolver that answered it was lying (an NXDOMAIN-shim
+#     was measured on the review host, turning the defect into a false
+#     positive). ``example.com`` is the RFC 819 documentation name and
+#     DOES resolve; the answer bytes are still discarded by the engine.
+#   * Egress-- ``https://api.ipify.org/`` -- 200, one plain-text global
+#     unicast address, 64-byte body cap.
+#
+# The DNS probe only ever proves resolution, and the UDP slot sends one
+# public documentation query name; both discard every answer byte.
 
 
 @dataclass(frozen=True)
@@ -102,10 +141,10 @@ class ProductionEndpointSet:
     dns_hostname: str = "one.one.one.one"
     https_host: str = "1.1.1.1"
     https_port: int = 443
-    https_path: str = "/"
+    https_path: str = "/cdn-cgi/trace"
     udp_resolver_ip: str = "1.1.1.1"
     udp_resolver_port: int = 53
-    udp_query_hostname: str = "example.invalid"
+    udp_query_hostname: str = "example.com"
     egress_host: str = "api.ipify.org"
     egress_port: int = 443
     egress_path: str = "/"
@@ -148,6 +187,11 @@ def _startup_targets():
     if not path:
         return None, SOURCE_DARK, STARTUP_NOT_CONFIGURED
     try:
+        if not os.path.exists(path):
+            # The packaged unit always names its frozen path, so a host
+            # that has not opted in lands HERE -- dark by absence, which
+            # is the ordinary state, not a defect and not an error.
+            return None, SOURCE_DARK, STARTUP_FILE_ABSENT
         if not os.path.isfile(path):
             raise ValueError("not a regular file")
         with open(path, "r", encoding="utf-8") as handle:

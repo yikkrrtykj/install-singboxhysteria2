@@ -228,11 +228,25 @@ else
     fail "staged diagnostics modules are not syntax-validated"
 fi
 
-# (5) the systemd units stay probe-free: nothing about probing is a unit-level
-# knob, and the opt-in variable is named by the scheduler alone.
+# (5) probing is not a unit-level KNOB. PR-3B B4 moved the opt-in from an
+# environment variable no shipped unit ever supplied (which made the frozen
+# production path unreachable for a real host) to the PACKAGED deployment:
+# the monitor unit names the frozen PATH -- and nothing else about probing.
+# Cadence, endpoints, module names and target content stay outside the unit,
+# so turning probing on remains one operator file, never a config edit. The
+# journal-reader unit names neither path nor knob.
 for f in deploy/singbox-monitor.service.in \
     deploy/singbox-journal-reader.service.in; do
-    if grep -qE 'network_probes|probe_scheduler|PROBE_TARGETS' \
+    if [ "$f" = "deploy/singbox-monitor.service.in" ]; then
+        if [ "$(grep -cE '^Environment=SINGBOX_MONITOR_PROBE_TARGETS_FILE=@SBMON_PROBE_TARGETS_FILE@$' \
+            "$ROOT/monitor-v2/$f")" = "1" ] \
+            && ! grep -qE 'network_probes|probe_scheduler|cadence_seconds|ipify|one\.one' \
+                "$ROOT/monitor-v2/$f"; then
+            pass "$f names the opt-in PATH and no other probe surface"
+        else
+            fail "$f grew a probe knob (the path is allowed, nothing else is)"
+        fi
+    elif grep -qE 'network_probes|probe_scheduler|PROBE_TARGETS' \
         "$ROOT/monitor-v2/$f" 2>/dev/null; then
         fail "$f mentions probing (units carry no probe knob)"
     else
@@ -241,11 +255,20 @@ for f in deploy/singbox-monitor.service.in \
 done
 TVAR="$(grep -rl --include='*.py' --include='*.sh' --include='*.in' \
     --exclude-dir=__pycache__ 'SINGBOX_MONITOR_PROBE_TARGETS_FILE' \
-    "$ROOT/monitor-v2" || true)"
-if [ "$TVAR" = "$ROOT/monitor-v2/diagnostics/probe_scheduler.py" ]; then
-    pass "the opt-in variable is named only by the scheduler"
+    "$ROOT/monitor-v2" | sed "s|$ROOT/monitor-v2/||" | sort | tr '\n' ' ')"
+# The path TOKEN is a deploy-renderer contract: only the template carries it
+# and only the render function substitutes it. Together the two closed sets
+# say who may speak about the opt-in at all.
+TTOK="$(grep -rl --include='*.sh' --include='*.in' \
+    --exclude-dir=__pycache__ -F '@SBMON_PROBE_TARGETS_FILE@' \
+    "$ROOT/monitor-v2" | sed "s|$ROOT/monitor-v2/||" | sort | tr '\n' ' ')"
+if [ "$TVAR" = "deploy/singbox-monitor.service.in \
+diagnostics/probe_scheduler.py " ] \
+    && [ "$TTOK" = "deploy/lib/monitor-deploy-lib.sh \
+deploy/singbox-monitor.service.in " ]; then
+    pass "the opt-in variable is named only by the unit and the scheduler"
 else
-    fail "the opt-in variable leaks outside the scheduler: $(printf '%s' "$TVAR")"
+    fail "the opt-in is named by an unexpected set: var=[$TVAR] token=[$TTOK]"
 fi
 # (6) no reviewed public endpoint literal anywhere outside diagnostics/.
 LEAK="$(grep -rl --include='*.py' --include='*.sh' --include='*.js' \
