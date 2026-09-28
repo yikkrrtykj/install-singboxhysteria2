@@ -12,6 +12,7 @@ Nothing here opens a public socket: the live scheduler runs against a
 and every persistence proof goes through ``record_probe_result`` directly.
 """
 
+import decimal
 import http.client
 import ipaddress
 import json
@@ -37,8 +38,12 @@ from web.incident_history import (                        # noqa: E402
     PROBE_CYCLE_FRESHNESS_SECONDS, PROBE_EGRESS_BASELINE_WINDOW_SECONDS,
     PROBE_LATENCY_MAX_MS, SCHEMA_VERSION, IncidentHistory)
 from web.server import (  # noqa: E402
-    PROBE_STATUS_INT_KEYS, PROBE_STATUS_MAX_NUMBER, PROBE_STATUS_REAL_KEYS,
-    MonitorWebApp, build_server, closed_probe_counter, closed_probe_seconds)
+    PROBE_STARTUP_TOKENS, PROBE_STATUS_BOOL_KEYS, PROBE_STATUS_INT_KEYS,
+    PROBE_STATUS_KEYS, PROBE_STATUS_MAX_NUMBER, PROBE_STATUS_REAL_KEYS,
+    PROBE_STATUS_SOURCE_KEYS,
+    PROBE_STATUS_TOKEN_KEYS, PROBE_TARGET_SOURCES, MonitorWebApp,
+    build_server, closed_probe_bool, closed_probe_counter,
+    closed_probe_seconds, closed_probe_source, closed_probe_startup)
 
 NOW = 1_800_000_000.0
 IP_A = "8.8.8.8"
@@ -64,12 +69,54 @@ def next_cycle():
     return "fc%030x" % _CYCLE_SEQ[0]
 
 
+class Impostor:
+    """Hashes like ``token`` and equals everything. This is the shape that
+    survives a bare ``in`` vocabulary test and is then ADOPTED as the token
+    it impersonates -- and an adopted object goes on to be handed to
+    ``json.dumps`` (which cannot serialize it) or to a SQLite binder (which
+    cannot bind it and reports a broken STORE instead of a broken
+    producer)."""
+
+    def __init__(self, token):
+        self.token = token
+
+    def __hash__(self):
+        return hash(self.token)
+
+    def __eq__(self, other):
+        return True
+
+    def __ne__(self, other):
+        return False
+
+
+class LyingStr(str):
+    """A real str, so ``isinstance`` is satisfied, that claims equality with
+    anything -- including the canonical form a gate compares against."""
+
+    def __eq__(self, other):
+        return True
+
+    def __hash__(self):
+        return str.__hash__(self)
+
+
+class LyingInt(int):
+    """A plain int wearing a subclass: ``isinstance`` admits it, exact type
+    does not."""
+
+
+class LyingFloat(float):
+    pass
+
+
 def global_unicast(value):
     """Harness-side restatement of "a public egress address": canonical
     form of a GLOBAL, non-multicast IP literal, else None. Written here
     independently of the two production gates so a case can state its
-    expectation without importing the code under test."""
-    if not isinstance(value, str):
+    expectation without importing the code under test. EXACTLY a plain str,
+    which is the same shape the two production gates now demand."""
+    if type(value) is not str:
         return None
     try:
         address = ipaddress.ip_address(value)
@@ -317,6 +364,126 @@ def group_boundary():
     class Sneaky(dict):
         pass
     refuse("dict_subclass", Sneaky(row_for()), "unchanged")
+
+    # ---------------------------------------------------------------------
+    # R2-B8: EVERY PRIMITIVE IS EXACTLY TYPED BEFORE IT IS JUDGED.
+    #
+    # The vocabularies are membership tests and the numeric bounds are
+    # comparisons, so in the defective world each one let the CANDIDATE
+    # answer the question: ``in`` over a tuple asks the object's own
+    # ``__eq__`` (a claim-everything object was ADOPTED as "ok"/"NONE"/
+    # "unchanged"), ``12 == True == 12.0 == "12"`` under the old
+    # ``latency != _as_int(latency)`` test (so a bool, an integral float or
+    # a numeric string was a latency), and ``isinstance`` admits any
+    # subclass. A string latency was never merely cosmetic either: the
+    # column has INTEGER affinity, so SQLite converts ``'12'`` on the way
+    # in and the table ends up storing a coercion the engine never emitted
+    # (its own normalize gate answers ``int(round(...))``, always a plain
+    # int). Each case below therefore asserts the boundary's OWN REJECTION
+    # code and the two counters, not just the False -- a defect that let
+    # the value through to the INSERT bounces off the DDL or the binder and
+    # reports a broken STORE (``persist_failed``) instead of the broken
+    # PRODUCER it is, which is a different story to whoever reads the plane.
+    # ---------------------------------------------------------------------
+    coded = []
+
+    def refuse_code(label, result, change):
+        before = h.probe_status()
+        rows_before = len(probe_rows(h))
+        refused = h.record_probe_result(result, change) is False
+        after = h.probe_status()
+        refusals.append(refused)
+        rejected.append(label)
+        coded.append(label and refused
+                     and after["last_error_code"] == CODE_PROBE_RESULT_REJECTED
+                     and after["persisted_total"] == before["persisted_total"]
+                     and after["rejected_total"] == before["rejected_total"] + 1
+                     and len(probe_rows(h)) == rows_before)
+
+    # a defective latency NEVER reaches the store, in either slot family.
+    # Half the table lands on the timed dns slot, half on the egress slot,
+    # so a weakened check cannot hide behind a slot-specific branch (both
+    # go through the one shared closed-slot matrix).
+    latency_defects = [True, False, 12.0, 0.0, "12", "", None, 12 + 0j,
+                       LyingInt(12), float("nan"), decimal.Decimal(12)]
+    for index, bad in enumerate(latency_defects):
+        r = row_for()
+        slot = "egress" if index % 2 else "dns"
+        r[slot]["latency_ms"] = bad
+        refuse_code("latency_exact_int_%s_%d" % (slot, index), r, "unchanged")
+    out["latency_defects_all_refused_with_the_rejection_code"] = (
+        all(coded[-len(latency_defects):])
+        and len(latency_defects) == 11)
+    # the failed path demands NULL, whatever the candidate pretends is null
+    failed_null = []
+    for bad in (0, False, "", 0.0, "0", LyingInt(0)):
+        r = row_for()
+        r["dns"]["status"] = "failed"
+        r["dns"]["error_code"] = "timeout"
+        r["dns"]["latency_ms"] = bad
+        refuse_code("failed_slot_latency_not_null_%d" % len(failed_null),
+                    r, "unchanged")
+        failed_null.append(coded[-1])
+    out["failed_slot_demands_exact_null"] = all(failed_null)
+
+    # a claim-everything object may not be ADOPTED as a vocabulary token
+    vocab = []
+    for field, value in (("status", Impostor("ok")),
+                         ("error_code", Impostor("NONE")),
+                         ("status", LyingStr("weird")),
+                         ("error_code", LyingStr("timeout")),
+                         ("latency_ms", Impostor(12)),
+                         ("status", ["ok"]),
+                         ("error_code", {"NONE": 1}),
+                         ("status", None),
+                         ("error_code", 0)):
+        r = row_for()
+        r["dns"][field] = value
+        refuse_code("slot_%s_impostor_%d" % (field, len(vocab)),
+                    r, "unchanged")
+        vocab.append(coded[-1])
+    out["closed_vocabularies_refuse_impersonators"] = (
+        all(vocab) and len(vocab) == 9)
+
+    # the other four primitives, each with the exact-type wall named
+    primitives = []
+    r = row_for()
+    r["v"] = LyingInt(1)
+    refuse_code("result_version_int_subclass", r, "unchanged")
+    primitives.append(coded[-1])
+    for index, bad in enumerate((True, False, "1700000000.0",
+                                 LyingFloat(NOW), 12 + 0j)):
+        r = row_for()
+        r["epoch"] = bad
+        refuse_code("epoch_exact_number_%d" % index, r, "unchanged")
+        primitives.append(coded[-1])
+    for index, bad in enumerate((LyingStr("a" * 32), b"b" * 32, 12345,
+                                 ("c" * 32,))):
+        r = row_for()
+        r["cycle_id"] = bad
+        refuse_code("cycle_id_exact_str_%d" % index, r, "unchanged")
+        primitives.append(coded[-1])
+    # the canonical-identity gate is a COMPARISON, so a str subclass that
+    # equals everything used to launder non-canonical raw text straight
+    # through it: ``ip != raw_ip`` is answered by the candidate, not by the
+    # gate.
+    laundered = row_for(IP_A)
+    laundered["egress"]["ip"] = LyingStr("8.008.8.8")
+    refuse_code("egress_ip_lying_str_subclass_launder", laundered, "changed")
+    primitives.append(coded[-1])
+    for index, bad in enumerate((LyingStr("8.8.8.8"), 8, ["8.8.8.8"], None)):
+        r = row_for(IP_A)
+        r["egress"]["ip"] = bad
+        refuse_code("egress_ip_exact_str_%d" % index, r, "changed")
+        primitives.append(coded[-1])
+    for index, bad in enumerate((Impostor("unchanged"), LyingStr("changed"),
+                                 "unchanged ", 1, ["unknown"])):
+        refuse_code("egress_change_exact_str_%d" % index, row_for(), bad)
+        primitives.append(coded[-1])
+    out["boundary_primitives_are_exactly_typed"] = (
+        all(primitives) and len(primitives) == 20)
+    out["every_exact_type_refusal_carried_the_rejection_code"] = all(coded)
+
     # LAST, so the plane code below is THIS case's own: a NULL cycle id is
     # refused as the shape defect it is, with the rejection code -- never by
     # slipping through the boundary and bouncing off the DDL wall, which
@@ -1917,8 +2084,13 @@ def group_http():
         out["liar_source_collapsed_to_dark"] = probes["target_source"] \
             == "dark"
         out["liar_free_text_startup_refused"] = probes["startup_error"] is None
-        out["liar_bool_coerced"] = (
-            probes["enabled"] is True and probes["running"] is True)
+        # R2-B7: a flag is EXACTLY a bool. ``bool("yes")`` and ``bool(1)``
+        # both answer True, so the lying scheduler used to be reported as
+        # ENABLED AND RUNNING from a string and an integer. The closed
+        # domain has no "unknown" shape that keeps the JSON type, so a
+        # non-bool now answers the DENY direction: False.
+        out["liar_bool_not_a_flag_refused"] = (
+            probes["enabled"] is False and probes["running"] is False)
         out["liar_counters_clamped_to_zero"] = (
             probes["cycles_completed"] == 0
             and probes["runtime_failures"] == 0)
@@ -1931,6 +2103,202 @@ def group_http():
     finally:
         server.shutdown()
         server.server_close()
+
+    # R2-B7: THE THREE NON-NUMERIC FIELDS ARE VALUE DOMAINS TOO, and each
+    # had its own failure mode behind it. ``bool(value)`` coerced. The two
+    # token fields asked a frozenset to HASH their candidate, so a list or a
+    # dict raised TypeError out of the projection -- OUTSIDE the try/except,
+    # which only wraps the scheduler call -- and the request died instead of
+    # answering the closed minimum. And membership compares with ``__eq__``,
+    # so ``Impostor`` was adopted as the token it impersonated and handed to
+    # ``json.dumps`` verbatim, which cannot serialize it. Every row here is
+    # proved over real HTTP, with the request wrapped, so a raising
+    # projection shows up as one red row instead of as a dead server.
+    shape_matrix = {}
+    for key in sorted(PROBE_STATUS_BOOL_KEYS):
+        shape_matrix["%s_string" % key] = (key, "yes", False)
+        shape_matrix["%s_int" % key] = (key, 1, False)
+        shape_matrix["%s_zero" % key] = (key, 0, False)
+        shape_matrix["%s_float" % key] = (key, 1.0, False)
+        shape_matrix["%s_none" % key] = (key, None, False)
+        shape_matrix["%s_list" % key] = (key, ["true"], False)
+        shape_matrix["%s_dict" % key] = (key, {"true": 1}, False)
+        shape_matrix["%s_impostor" % key] = (key, Impostor("True"), False)
+        shape_matrix["%s_str_subclass" % key] = (key, LyingStr("True"), False)
+    for label, value in (("source_list", ["dark"]), ("source_dict", {"dark": 1}),
+                         ("source_impostor", Impostor("production")),
+                         ("source_str_subclass", LyingStr("production")),
+                         ("source_endpoint", "api.ipify.org"),
+                         ("source_case", "PRODUCTION"),
+                         ("source_padded", " production"),
+                         ("source_empty", ""), ("source_int", 1),
+                         ("source_none", None)):
+        shape_matrix[label] = ("target_source", value, "dark")
+    for label, value in (("startup_list", ["target_file_absent"]),
+                         ("startup_dict", {"a": 1}),
+                         ("startup_impostor", Impostor("target_file_absent")),
+                         ("startup_str_subclass",
+                          LyingStr("target_injection_invalid")),
+                         ("startup_traceback", "ValueError: /etc/x"),
+                         ("startup_padded", "target_file_absent "),
+                         ("startup_empty", ""), ("startup_int", 0)):
+        shape_matrix[label] = ("startup_error", value, None)
+
+    collapsed_shapes = []
+    strict_json_shapes = True
+    surviving_projection = []
+    swappable = SwappableScheduler(dict(healthy))
+    server, port = serve(swappable)
+    try:
+        cookie = login(port)
+        for label in sorted(shape_matrix):
+            key, value, want = shape_matrix[label]
+            payload = dict(healthy)
+            payload[key] = value
+            swappable.set(payload)
+            try:
+                code, body, _ = get(port, "/api/v1/diagnostics/timeline",
+                                    cookie)
+                surface = json.loads(body, parse_constant=no_json_constant)
+            except (AssertionError, ValueError, http.client.HTTPException,
+                    OSError):
+                strict_json_shapes = False
+                collapsed_shapes.append(False)
+                surviving_projection.append(False)
+                continue
+            # a projection that RAISED answers a different route entirely
+            # (a 500 with no probes field), so this half of the row proves
+            # the read survived -- which is precisely what a membership test
+            # on an unhashable candidate used to break.
+            surviving_projection.append(code == 200
+                                        and "probes" in surface
+                                        and surface["probes"] is not None)
+            projected = surface["probes"].get(key) if "probes" in surface \
+                else None
+            collapsed_shapes.append(code == 200
+                                    and type(projected) is type(want)
+                                    and projected == want)
+    finally:
+        server.shutdown()
+        server.server_close()
+    out["hostile_shapes_always_collapse"] = (
+        all(collapsed_shapes) and len(collapsed_shapes) == len(shape_matrix))
+    out["hostile_shape_body_is_strict_json"] = strict_json_shapes
+    out["hostile_shapes_never_kill_the_projection"] = (
+        all(surviving_projection)
+        and len(surviving_projection) == len(shape_matrix))
+    out["shape_matrix_covers_every_non_numeric_key"] = (
+        {shape_matrix[label][0] for label in shape_matrix}
+        == set(PROBE_STATUS_BOOL_KEYS) | PROBE_STATUS_SOURCE_KEYS
+        | PROBE_STATUS_TOKEN_KEYS)
+
+    # the closing half of the same contract: an HONEST value must still
+    # project verbatim, or a closure that refuses everything would pass
+    # every gate above.
+    honest = []
+    swappable = SwappableScheduler(dict(healthy))
+    server, port = serve(swappable)
+    try:
+        cookie = login(port)
+        for source in sorted(PROBE_TARGET_SOURCES):
+            payload = dict(healthy)
+            payload["target_source"] = source
+            swappable.set(payload)
+            _code, body, _h = get(port, "/api/v1/diagnostics/timeline",
+                                  cookie)
+            honest.append(json.loads(body)["probes"]["target_source"] == source)
+        for token in sorted(PROBE_STARTUP_TOKENS) + [None]:
+            payload = dict(healthy)
+            payload["startup_error"] = token
+            swappable.set(payload)
+            _code, body, _h = get(port, "/api/v1/diagnostics/timeline",
+                                  cookie)
+            honest.append(json.loads(body)["probes"]["startup_error"] == token)
+        for flag in sorted(PROBE_STATUS_BOOL_KEYS):
+            payload = dict(healthy)
+            payload[flag] = True
+            swappable.set(payload)
+            _code, body, _h = get(port, "/api/v1/diagnostics/timeline",
+                                  cookie)
+            projected = json.loads(body)["probes"][flag]
+            honest.append(projected is True)
+    finally:
+        server.shutdown()
+        server.server_close()
+    out["honest_flags_sources_and_tokens_still_project"] = (
+        all(honest) and len(honest) == 3 + 4 + 2)
+
+    # the container itself: a dict SUBCLASS used to satisfy isinstance and
+    # was projected as if it were an honest status object -- and its ``get``
+    # can answer a different value per key than the mapping actually holds,
+    # which is precisely the surface the projection must not trust.
+    class SneakyStatus(dict):
+        def get(self, key, default=None):
+            if key == "target_source":
+                return "production"
+            return dict.get(self, key, default)
+
+    containers = []
+    for container in (SneakyStatus({"target_source": "dark"}), ["status"],
+                      ("status",), "status", 7, None):
+        server, port = serve(StubScheduler(container))
+        try:
+            cookie = login(port)
+            _code, body, _h = get(port, "/api/v1/diagnostics/timeline", cookie)
+            containers.append(json.loads(body)["probes"] is None)
+        finally:
+            server.shutdown()
+            server.server_close()
+    out["only_an_exact_dict_is_a_status_container"] = (
+        all(containers) and len(containers) == 6)
+
+    # the three new closers, on their own tables: what the projection
+    # answers for each field, named value by value.
+    bool_table = [(True, True), (False, False), ("yes", False), ("", False),
+                  (1, False), (0, False), (1.0, False), (None, False),
+                  ([], False), ({}, False), (Impostor("True"), False),
+                  (LyingStr("True"), False)]
+    out["closed_probe_bool_table"] = all(
+        closed_probe_bool(value) is want for value, want in bool_table)
+    source_table = [("production", "production"), ("injected", "injected"),
+                    ("dark", "dark"), ("corp.example", "dark"),
+                    ("api.ipify.org", "dark"), ("/etc/singbox-monitor", "dark"),
+                    ("PRODUCTION", "dark"), (" production", "dark"),
+                    ("production ", "dark"), ("", "dark"), (None, "dark"),
+                    (["dark"], "dark"), ({"dark": 1}, "dark"),
+                    (Impostor("production"), "dark"),
+                    (LyingStr("production"), "dark"), (1, "dark")]
+    out["closed_probe_source_table"] = all(
+        closed_probe_source(value) == want
+        for value, want in source_table)
+    startup_table = [(None, None),
+                     ("target_file_not_configured", "target_file_not_configured"),
+                     ("target_file_absent", "target_file_absent"),
+                     ("target_injection_invalid", "target_injection_invalid"),
+                     ("target_file_absent ", None), ("", None),
+                     ("/etc/x/targets.json raised", None),
+                     (["target_file_absent"], None), ({"a": 1}, None),
+                     (Impostor("target_file_absent"), None),
+                     (LyingStr("target_file_absent"), None), (0, None),
+                     (True, None)]
+    out["closed_probe_startup_table"] = all(
+        closed_probe_startup(value) is want
+        for value, want in startup_table)
+    # the closers are TOTAL over the closed vocabularies (they close the
+    # domain, they do not replace it) and they never raise on junk.
+    out["closers_are_total_over_the_vocabularies"] = (
+        all(closed_probe_source(token) == token
+            for token in PROBE_TARGET_SOURCES)
+        and all(closed_probe_startup(token) == token
+                for token in PROBE_STARTUP_TOKENS)
+        and closed_probe_startup(None) is None
+        and all(closed_probe_bool(flag) is flag for flag in (True, False)))
+    out["closers_never_raise_on_unhashable"] = all(
+        _c(bad) in (False, "dark", None)
+        for _c in (closed_probe_bool, closed_probe_source,
+                   closed_probe_startup)
+        for bad in ([1], {"a": 1}, {1, 2}, Impostor("dark"),
+                    LyingStr("dark"), object(), b"bytes", 0.0))
 
     # B5: NUMBERS ARE A VALUE DOMAIN TOO. A scheduler that answers NaN or an
     # infinity would otherwise serialize the bare words ``NaN``/``Infinity``
@@ -1994,6 +2362,13 @@ def group_http():
     out["hostile_matrix_covers_every_projected_number"] = (
         {key for key, _v in hostile.values()}
         == set(PROBE_STATUS_REAL_KEYS) | set(PROBE_STATUS_INT_KEYS))
+    # both hostile matrices together leave NO projected field untested, so
+    # the closure is proved over the whole surface and not over the half
+    # that happened to be convenient.
+    out["both_matrices_cover_every_projected_key"] = (
+        ({shape_matrix[label][0] for label in shape_matrix}
+         | {key for key, _v in hostile.values()})
+        == set(PROBE_STATUS_KEYS))
 
     # the two closers, on their own table: the projection's number domains
     # are exactly what these answer, and every rejected shape is named.

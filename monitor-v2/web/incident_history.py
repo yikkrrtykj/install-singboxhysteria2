@@ -803,7 +803,10 @@ class IncidentHistory:
         if type(result["v"]) is not int or result["v"] != PROBE_RESULT_VERSION:
             return None
         epoch = result["epoch"]
-        if isinstance(epoch, bool) or not isinstance(epoch, (int, float)) \
+        # EXACTLY a plain int/float: a bool is an int subclass that would
+        # otherwise pass as a timestamp, and a subclass can carry a private
+        # __float__ answering a different number each read.
+        if type(epoch) not in (int, float) \
                 or not math.isfinite(epoch) or epoch < 0 \
                 or abs(now - epoch) > PROBE_CYCLE_FRESHNESS_SECONDS:
             return None
@@ -812,8 +815,10 @@ class IncidentHistory:
         # not a shape this boundary may adopt: an id-less row cannot be
         # traced back to a cycle and is invisible to the replay rule. A
         # non-string is a SHAPE defect refused here, with the boundary's
-        # own rejection counter, never as an escaping TypeError.
-        if not isinstance(cycle_id, str) \
+        # own rejection counter, never as an escaping TypeError. EXACTLY a
+        # str: a subclass could answer fullmatch one way and comparison
+        # another.
+        if type(cycle_id) is not str \
                 or _CYCLE_ID_RE.fullmatch(cycle_id) is None:
             return None
         if not self._probe_cycle_is_new_locked(cycle_id):
@@ -845,12 +850,14 @@ class IncidentHistory:
 
         raw_ip = result["egress"]["ip"]
         if status == "ok":
-            if not isinstance(raw_ip, str):
+            if type(raw_ip) is not str:
                 return None
             ip = _canonical_global_ip(raw_ip)
             # canonical-form gate: stored text must be byte-identical to
             # the canonical form (no leading zeros, no brackets, no
-            # case play, no non-global address).
+            # case play, no non-global address). The candidate is EXACTLY a
+            # plain str by now, so this comparison cannot be answered by a
+            # subclass's private __eq__ that claims identity with anything.
             if ip is None or ip != raw_ip:
                 return None
         elif raw_ip is not None:
@@ -868,7 +875,11 @@ class IncidentHistory:
         # SUPPRESS one (``unknown`` where both addresses are valid), nor
         # invent a direction (``unchanged`` across different addresses).
         previous = self._last_persisted_egress_ip_locked()
-        if egress_change not in PROBE_CHANGE_VALUES:
+        # EXACTLY a plain str before the vocabulary test: ``in`` over a tuple
+        # compares with __eq__, so an object that always claims equality would
+        # be adopted as a change token and stored.
+        if type(egress_change) is not str \
+                or egress_change not in PROBE_CHANGE_VALUES:
             return None
         if egress_change != _derive_egress_change(previous, ip):
             return None
@@ -1957,7 +1968,7 @@ def _canonical_global_ip(value):
     the engine's). ``ipaddress`` scopes 224.0.0.0/4 and ff00::/12 as
     GLOBAL, so globality alone would admit a multicast GROUP -- which is a
     destination, never a host's egress address."""
-    if not isinstance(value, str):
+    if type(value) is not str:
         return None
     try:
         address = ipaddress.ip_address(value)
@@ -1993,16 +2004,28 @@ def _result_is_closed(value, keys):
 def _closed_code_slot(raw):
     """Map one result slot to its closed (status, latency, code) triple
     or reject it. The transition matrix is the engine's own invariant:
-    ok <=> NONE, latency only on the ok path, integral and bounded."""
+    ok <=> NONE, latency only on the ok path, EXACTLY a plain integer and
+    bounded.
+
+    Every primitive is type-checked BEFORE it is judged, because each
+    judgement has a coercion or a raise behind it: ``in`` over the closed
+    vocabularies compares with ``==``, so a status object whose ``__eq__``
+    always answers True would be adopted as ``"ok"``; and a latency of
+    ``True``, ``12.0`` or ``"12"`` satisfies a numeric-equality test
+    (``12 == 12.0 == True``) while being a producer defect -- and in the
+    string case SQLite's INTEGER affinity would convert it on the way in, so
+    the table would store a coercion the engine never emitted."""
     code = raw["error_code"]
     status = raw["status"]
     latency = raw["latency_ms"]
+    if type(status) is not str or type(code) is not str:
+        return None
     if code not in PROBE_ERROR_CODES or status not in PROBE_STATUSES:
         return None
     if status == "ok":
         if code != "NONE":
             return None
-        if latency is None or latency != _as_int(latency) \
+        if type(latency) is not int \
                 or not 0 <= latency <= PROBE_LATENCY_MAX_MS:
             return None
     else:

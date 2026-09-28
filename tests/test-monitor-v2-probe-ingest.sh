@@ -45,21 +45,25 @@ export PROBE_TEST_KEY="$HERE/monitor-probes/tls-test-key.pem"
 
 PASS=0
 FAIL=0
-# PR-3B functional-review head -- 288 checks, measured on the dev host and
+# PR-3B functional-review head -- 307 checks, measured on the dev host and
 # to be re-measured on Linux CI. The R1 round (B1-B6) added the
-# counterexample regressions, so each section moved deliberately:
-#   S0 static + mirror gates               6   (unchanged; gate (4) was
-#        rewritten in place to the three startup tokens + exact class cover)
+# counterexample regressions; the R2 round (B7-B8) closed the two remaining
+# value-domain holes, so each section moved deliberately:
+#   S0 static + mirror gates               8  (+2: gates (6) and (7) make the
+#        EXACT-TYPE discipline structural -- no isinstance/bool/_as_int in
+#        any probe judgement -- and pin latency to one shared exact-int wall)
 #   S1 rollback gate wiring                6   (unchanged)
 #   S2 rollback gate decisions on files   21   (unchanged)
-#   S3 packaged opt-in path                15  (+5: B4 replaces the one
-#        grep that only proved an env var was absent with six render/verify
-#        gates on the real deploy lib)
+#   S3 packaged opt-in path                15   (unchanged)
 #   S4 network guard self-test              7   (unchanged)
-#   S5 behaviour groups under the guard   233  (+29, all B1-B6 regressions:
-#        boundary 30 +5, durable 25 +9, schema 31 +4, http 30 +6,
-#        activation 38 +5; retention 12, health 21, e2e 21, threads 25)
-EXPECTED_PASS=288
+#   S5 behaviour groups under the guard   250  (+17, all B7-B8 regressions:
+#        boundary 35 +5 (exact-type latency/vocabulary/primitive matrices,
+#        each asserting the REJECTION code and both counters), http 42 +12
+#        (36-row hostile shape matrix with its own raise/leak proofs, the
+#        honest-token table, the exact-dict container, three closer tables,
+#        two coverage gates);
+#        durable 25, schema 31, retention 12, health 21, e2e 21, threads 25)
+EXPECTED_PASS=307
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
@@ -207,6 +211,81 @@ if grep -qE '^[[:space:]]*(from|import)[[:space:]]+diagnostics' \
     fail "web/ imports the probe package (the boundary must stay shape-only)"
 else
     pass "history and server persist/project probe shapes without importing diagnostics/"
+fi
+
+# (6) R2-B7/B8: the EXACT-TYPE discipline is structural, not a comment.
+# isinstance admits subclasses, bool() coerces, and _as_int() converts -- and
+# each of those three is exactly how a lying producer used to be adopted as
+# an honest value. The AST sees every call site, so a regression to any of
+# them is red even if the runtime table happens to still pass.
+if "$PY" - <<'EOF'
+import ast, os, sys
+
+FORBIDDEN = {"isinstance", "bool", "_as_int"}
+TARGETS = {
+    "web/server.py": ("probe_status", "closed_probe_bool",
+                      "closed_probe_source", "closed_probe_startup",
+                      "closed_probe_seconds", "closed_probe_counter"),
+    "web/incident_history.py": ("_closed_code_slot",
+                                "_probe_boundary_validate_locked",
+                                "_result_is_closed", "_canonical_global_ip",
+                                "_derive_egress_change"),
+}
+root = os.environ["MONITOR_V2_ROOT"]
+for rel, names in TARGETS.items():
+    tree = ast.parse(open(os.path.join(root, rel), encoding="utf-8").read())
+    found = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name in names:
+            found[node.name] = node
+    assert sorted(found) == sorted(names), "missing %s in %s" % (
+        sorted(set(names) - set(found)), rel)
+    for name, fn in found.items():
+        for call in ast.walk(fn):
+            if not isinstance(call, ast.Call):
+                continue
+            func = call.func
+            called = getattr(func, "id", None) or getattr(func, "attr", None)
+            assert called not in FORBIDDEN, "%s in %s uses %s()" % (
+                rel, name, called)
+EOF
+then
+    pass "the probe projection and boundary judge every field by EXACT type"
+else
+    fail "a probe gate coerces (isinstance/bool/_as_int is back)"
+fi
+
+# (7) the boundary's latency wall is the one shared closed-slot matrix, and
+# it names an EXACT int: two slots families (timed + egress) go through the
+# same function, so a per-slot weakening cannot hide, and _as_int must not
+# reappear as the judge.
+if "$PY" - <<'EOF'
+import ast, os, sys
+sys.path.insert(0, os.environ["MONITOR_V2_ROOT"])
+import web.incident_history as ih
+
+tree = ast.parse(open(os.path.join(
+    os.environ["MONITOR_V2_ROOT"], "web", "incident_history.py"),
+    encoding="utf-8").read())
+body = None
+for node in ast.walk(tree):
+    if isinstance(node, ast.FunctionDef) and node.name == "_closed_code_slot":
+        body = node
+assert body is not None, "_closed_code_slot is gone"
+text = ast.unparse(body)
+assert "type(latency) is not int" in text, "latency is no longer an EXACT int"
+assert "_as_int" not in text, "latency is judged by a converter again"
+# the ONE shared matrix: four slots, no slot-specific latency branch elsewhere
+callers = [node for node in ast.walk(tree)
+           if isinstance(node, ast.Call)
+           and getattr(node.func, "id", None) == "_closed_code_slot"]
+assert len(callers) == 2, "expected the timed-slot and egress call sites"
+assert ih.PROBE_LATENCY_MAX_MS == 120000
+EOF
+then
+    pass "latency has ONE exact-int wall shared by the timed and egress slots"
+else
+    fail "the latency wall stopped being an exact-int, exact-slot judgement"
 fi
 
 section "S1: the rollback schema gate, wired and non-mutating"

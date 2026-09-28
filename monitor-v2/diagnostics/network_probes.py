@@ -785,7 +785,7 @@ def _canonical_ip(value):
     CONTRACT: ``ipaddress`` scopes 224.0.0.0/4 and ff00::/12 as global,
     but a multicast GROUP is a destination, never a host's egress address,
     so the gate says what the review means -- global AND not multicast."""
-    if not isinstance(value, str):
+    if type(value) is not str:
         return None
     try:
         address = ipaddress.ip_address(value)

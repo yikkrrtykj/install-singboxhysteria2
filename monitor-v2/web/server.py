@@ -74,13 +74,50 @@ PROBE_STATUS_REAL_KEYS = frozenset({"cadence_seconds", "last_cycle_epoch",
 PROBE_STATUS_INT_KEYS = frozenset({"cycles_completed", "cycles_rejected",
                                    "runtime_failures"})
 PROBE_TARGET_SOURCES = frozenset({"production", "injected", "dark"})
-# Every projected number is EXACTLY typed, finite, nonnegative and inside
-# the range a JSON consumer can represent without silent rounding
-# (Number.MAX_SAFE_INTEGER). A NaN or an infinity would otherwise serialize
-# as ``NaN``/``Infinity`` -- not valid JSON, so one lying scheduler could
-# break the whole diagnostics read for every reader -- and a negative or
-# hostile-typed counter would be read as a real fact by the surface.
+# Every projected value is EXACTLY typed before it is judged. Numbers get a
+# finiteness, nonnegativity and JSON-safe range check (a NaN or an infinity
+# would serialize as the bare words ``NaN``/``Infinity`` -- not valid JSON, so
+# one lying scheduler would break this read for every consumer). Booleans get
+# an EXACT-type check (``bool(value)`` would otherwise turn ``"yes"`` or ``1``
+# into "enabled"). Tokens get one too, and it runs BEFORE the membership test:
+# a frozenset asks its candidate to hash, so a list or a dict used to raise
+# ``TypeError`` straight out of the projection, and an object that forges a
+# token's ``__hash__`` while ``__eq__`` always answers True used to be
+# ADOPTED as that token and then emitted verbatim into the response.
 PROBE_STATUS_MAX_NUMBER = 9007199254740991  # 2**53 - 1
+
+
+def closed_probe_bool(value):
+    """One projected flag, or the deny answer. ONLY an EXACT bool is a flag
+    this surface may repeat; ``"yes"``, ``1``, ``[]`` or a subclass with a
+    private ``__bool__`` is a producer defect, and since this field has no
+    "unknown" shape it can take without changing its JSON type, the defect
+    answers ``False`` -- the direction that can never make the probe plane
+    look enabled or running when it is not."""
+    return value if type(value) is bool else False
+
+
+def closed_probe_source(value):
+    """One projected target source, or ``"dark"``. The exact-type check runs
+    first so membership never hashes a list/dict (that raised) and never
+    adopts a hash-forging impostor (that leaked a live object into the
+    response); a string outside the closed vocabulary -- an endpoint, a
+    hostname, a path -- is refused."""
+    if type(value) is str and value in PROBE_TARGET_SOURCES:
+        return value
+    return "dark"
+
+
+def closed_probe_startup(value):
+    """One projected startup token, or None. Same discipline as the source:
+    EXACTLY a str, then EXACTLY a member of the closed startup vocabulary, so
+    an unhashable or impersonating object can neither raise nor be repeated,
+    and exception text can never be presented as a token."""
+    if value is None:
+        return None
+    if type(value) is str and value in PROBE_STARTUP_TOKENS:
+        return value
+    return None
 
 
 def closed_probe_seconds(value):
@@ -314,13 +351,15 @@ class MonitorWebApp:
 
         Deny-by-default: only the frozen ``PROBE_STATUS_KEYS`` are
         re-emitted, each value forced back into its own closed domain --
-        tokens by membership, numbers by EXACT type plus finiteness,
-        nonnegativity and a JSON-safe range -- so an endpoint, a path or
-        exception text can never reach a response, and neither can a
+        every field EXACTLY typed first (bool, str, plain int/float), then
+        tokens by membership in the closed vocabularies, then numbers by
+        finiteness, nonnegativity and a JSON-safe range -- so an endpoint, a
+        path or exception text can never reach a response, neither can a
         ``NaN``/``Infinity`` literal (invalid JSON that would break the
-        whole read for every consumer). A missing, broken or lying
-        scheduler answers ``None``; a lying number answers ``None`` or
-        ``0``, never a guess.
+        whole read for every consumer), and neither can an unhashable or
+        ``__eq__``-forging candidate raise out of the projection or be adopted
+        as a token. A missing, broken or lying scheduler answers ``None``; a
+        lying value answers its closed minimum, never a guess.
         """
         getter = getattr(self.probe_scheduler, "status", None)
         if not callable(getter):
@@ -329,18 +368,20 @@ class MonitorWebApp:
             raw = getter()
         except Exception:  # noqa: BLE001 -- a status read never propagates
             return None
-        if not isinstance(raw, dict):
+        if type(raw) is not dict:
+            # EXACTLY a dict: a subclass can override ``get`` to answer a
+            # different value per key, which is not a status container this
+            # surface may project.
             return None
         status = {}
         for key in PROBE_STATUS_KEYS:
             value = raw.get(key)
             if key in PROBE_STATUS_BOOL_KEYS:
-                status[key] = bool(value)
+                status[key] = closed_probe_bool(value)
             elif key in PROBE_STATUS_SOURCE_KEYS:
-                status[key] = value if value in PROBE_TARGET_SOURCES else "dark"
+                status[key] = closed_probe_source(value)
             elif key in PROBE_STATUS_TOKEN_KEYS:
-                status[key] = (value if value is None
-                               or value in PROBE_STARTUP_TOKENS else None)
+                status[key] = closed_probe_startup(value)
             elif key in PROBE_STATUS_REAL_KEYS:
                 status[key] = closed_probe_seconds(value)
             elif key in PROBE_STATUS_INT_KEYS:
