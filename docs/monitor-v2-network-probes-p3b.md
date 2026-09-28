@@ -23,7 +23,7 @@
   恰等审计）；`install-monitor.sh rollback` 前置 **history schema 兼容门**
   （v3 库不得经普通回滚路径落到 pre-v3 release 之下）。
 - 测试：新车道 `tests/test-monitor-v2-probe-ingest.sh`（硬计数门
-  `EXPECTED_PASS=288`，含 233 条行为判别器）+ `tests/monitor-probes/`
+  `EXPECTED_PASS=307`，含 250 条行为判别器）+ `tests/monitor-probes/`
   （行为夹具 + CI 网络守卫），`tests/test-monitor-v2-probes.sh` 126→138，
   `tests/test-monitor-v2-hist.sh` 239→240，
   `tests/test-monitor-packaging.sh` +21：6 条 diagnostics 清单/发布树审计
@@ -36,6 +36,14 @@
   面都不提供的环境变量（B4）、投影数字闭合到**精确类型/有限/非负/JSON 安全
   区间**（B5）、`cycle_id` 收到引擎契约（NOT NULL + 唯一索引 + 重放即拒）
   （B6）。每条反例都有判别器，详见 §14。
+- 功能评审 R2（B7–B8）的收口，全部落在**闭合边界**上，不动架构：HTTP 投影
+  的三个非数值字段与状态容器本身改为**恰等类型**判定（旗标只认 `bool`、
+  source/startup token 先恰 `str` 再查词汇、容器恰 `dict`），因此不可哈希或
+  伪造 `__eq__`/`__hash__` 的候选者既不能把一次读取变成 500，也不能被采纳为
+  token（B7）；History 入库边界只接受**恰为 `int`** 的 latency，其余边界原语
+  （epoch、cycle_id、raw_ip、egress_change、status/error_code 词汇）一律
+  恰等类型，且每次恰等类型拒收都必须携带 `history_probe_result_rejected`
+  而非落库成功后才报错（B8）。详见 §15。
 - 明确偏差：见 §11。
 
 ## 2. 实现前勘察（PR-3A §2 预留槽位的兑现）
@@ -110,12 +118,30 @@
   既不能重复计数一条样本，也不能二次移动出口基线。套件用 22 条 raw-INSERT
   逐条撞墙（含 NULL/空串/31 位/大写/点分），另以一条合法行证明墙不是误杀，
   并用重复 id 的直接 INSERT 证明唯一索引在**绕过边界**时仍然开火。
-- 入库边界 `_probe_boundary_validate_locked`（不信任引擎）：键集恰等、状态/
-  码/版本在闭合词汇内、latency 为 `0..PROBE_LATENCY_MAX_MS(120000)` 整数、
-  `epoch` 与 now 偏差 `<= PROBE_CYCLE_FRESHNESS_SECONDS(30.0)`、
+- 入库边界 `_probe_boundary_validate_locked`（不信任引擎）：**每个原语在
+  被判定之前先被要求恰等类型**（R2-B8），然后才是键集恰等、状态/码/版本在
+  闭合词汇内、latency 为 `0..PROBE_LATENCY_MAX_MS(120000)` 的**恰为 `int`**
+  的值、`epoch` 与 now 偏差 `<= PROBE_CYCLE_FRESHNESS_SECONDS(30.0)`、
   `cycle_id` 必须是 32 位 hex（**非字符串也在此拒绝**，不让 TypeError 逃出
   边界）、`run_id` 绑定、`egress_ip` 只接受再canonical 化的**全局单播**地址、
   `egress_change` **一律由库自己推导**并与生产方声明比对（§5）。
+- 为什么"恰等类型"而不是 `isinstance`/数值相等（R2-B8 的反例）：词汇表用
+  `in` 判定，而 `in` 拿 `__eq__` 提问——一个"逢比必真"的对象在旧边界会被
+  **采纳**为 `ok`/`NONE`/`unchanged`；`12 == True == 12.0 == "12"`，所以旧
+  的 `latency != _as_int(latency)` 判定把布尔、整数化浮点与数字串都当成
+  延迟，而列的 INTEGER affinity 会把 `'12'` **静默转换后落库**，表里存的
+  就是引擎从未发出的强制值（引擎自身的 normalize 门答 `int(round(...))`，
+  永远是 plain int）；`str` 的子类令 `ip != raw_ip` 这条 canonical 同一性
+  比较由**候选者自己回答**，非规范原文因此可被洗白入库。四类反例各有矩阵：
+  11 例 latency 表（dns 与 egress 两族交替，共用同一 `_closed_code_slot`）、
+  6 例 failed 槽"必须恰为 NULL"、9 例词汇冒充、20 例其他原语
+  （`v`/`epoch`/`cycle_id`/`ip`/`egress_change`）。
+- 这些拒收**不只断言 `False`**：每条都直接要求平面的**拒绝码**
+  `history_probe_result_rejected`、`persisted_total` 不动、
+  `rejected_total` 恰 +1 且时间线行数不变。理由是"穿透"与"拒收"讲的不是一
+  个故事——值一旦落到 INSERT，会撞 DDL 或参数绑定并报
+  `history_probe_persist_failed`，那是对**库**的指控，而缺陷在**生产者**。
+
 - `_canonical_global_ip` 与引擎 `_canonical_ip` 是**逻辑同一**（套件用 AST
   比对函数体，允许注释/函数名不同，不允许语义漂移）：loopback/私有/保留/
   文档/链路本地（含 169.254.169.254）**与组播**地址在 DB 侧同样不可能落库。
@@ -242,22 +268,43 @@ GET-only、loopback 绑定契约均不变。车道 S5 用真 `build_server` 断�
 与 `status()` 键集**恰等**，并断言响应体不含 `/etc`、路径、`targets.json`
 或 `api.ipify.org`。
 
+R2-B7 把剩下三个字段也做成**闭合值域**，每个都有各自的失效方式：
+
+- `closed_probe_bool`：旗标只接受**恰为 `bool`**。`bool("yes")` 与 `bool(1)`
+  都答 `True`，旧投影因此把一个字符串和一个整数读成"探测已启用且在跑"。
+  该字段没有能保持 JSON 类型的"未知"形状，所以缺陷答**拒绝方向** `False`。
+- `closed_probe_source` / `closed_probe_startup`： membership 之前**先做
+  恰等类型检查**。这是两条不同的漏洞——frozenset 会要求候选者**哈希**，
+  于是 `list`/`dict` 直接把 `TypeError` 抛出投影（`try` 只包住 `status()`
+  调用，包不住分派循环），一次读取变成 500 而不是闭合最小值；而 membership
+  用 `__eq__` 提问，一个伪造 token 哈希、逢比必真的对象会被**采纳**为该
+  token，然后原样交给 `json.dumps`——它序列化不了任意对象，于是同一个谎言
+  又毁掉所有读者的响应。字符串子类的 token 冒充同样被拒（`"production"`
+  的子类在旧路径上能赢过比较）。
+- 容器本身：`type(raw) is dict`，**恰等**。`isinstance` 放过 dict 子类，
+  而子类可以让 `get()` 对同一个键回答与底层映射不同的值——评审要的那句
+  "preferably require an exact dict" 在这里是硬门。
+- 反向闭合同样取证：三值 source、三个 startup token 与 `True`/`False`
+  在真 HTTP 上仍**逐字透传**（诚实表 9 行），否则"什么都不接受"的收紧
+  也能通过全部敌意矩阵。敌意 shape 矩阵（36 行）与敌意数值矩阵（19 行）
+  的键集**并起来恰等** `PROBE_STATUS_KEYS`，投影面没有未测字段。
+
 ## 10. 测试矩阵
 
 | 车道 | 判别器 |
 |------|--------|
-| S0 静态 + 镜像（6） | `py_compile` 全集；history↔engine 词汇**活值**恰等；IP 门 AST 同一；bounds/v3/`_PRUNE_SOURCES` 自洽；scheduler↔server 状态面恰等——含**三** token 的 `PROBE_STARTUP_TOKENS`，以及五个投影分类集合与 `status()` 键集**恰等**（B5：分派不得有未分类键）；`web/` 零 `diagnostics` import |
+| S0 静态 + 镜像（8） | `py_compile` 全集；history↔engine 词汇**活值**恰等；IP 门 AST 同一；bounds/v3/`_PRUNE_SOURCES` 自洽；scheduler↔server 状态面恰等——含**三** token 的 `PROBE_STARTUP_TOKENS`，以及五个投影分类集合与 `status()` 键集**恰等**（B5：分派不得有未分类键）；`web/` 零 `diagnostics` import；**R2-B7/B8 的 AST 反 coercion 门**：投影与边界的七个判据函数体内不得出现 `isinstance`/`bool`/`_as_int` 调用；**latency 墙形状门**：`_closed_code_slot` 原文里必须存在 `type(latency) is not int`、不含 `_as_int`、恰两个调用点（timed/egress），且 `PROBE_LATENCY_MAX_MS == 120000` |
 | S1 回滚门接线（6） | 调用点在首处变更之前；拒绝文案承诺零变更；整个门 helper 区无写语句；库恰一次以只读 URI 打开；目标 release 读者不继承调用方 `sys.path`；调用点 die-check |
 | S2 回滚门决定（21） | v3→v3/v4 放行，v3→v2、pre-history、缺失 release、无版本声明、非数字、负数、非数据库文件均拒绝；无库放行且不创建任何文件；真 v3 库（由被测模块自建）同判；拒绝文案含两个版本号、不含 fixture 路径；DB 字节与目录集不变；整棵发布树零 `__pycache__`（`-B` 契约） |
 | S3 打包 opt-in 面（15） | 打包 unit **经真实 deploy 库渲染**（`sbmon_render_unit` 在临时文件上跑一遍）；渲染结果恰一行 `Environment=` 且它就是 opt-in 路径、无残留 `@SBMON_` token、值等于 `$(sbmon_probe_targets_file)`；出货面（`install-monitor.sh`/`app-bin`/reader unit）无人书写该文档名；`sbmon_verify_probe_targets` 函数体 awk 提取后不含写语句或 `touch/rm/cat/tee/cp/mv/install`；调用行号早于 `sbmon_stage_release`；生成的 `monitor.conf` 无探测键（且键集可枚举，门非空转）；conf 读取器白名单无探测键；`webapp.py` 以 `ProbeScheduler(history)` 唯一构造、不传 cadence/targets；调度器 AST 只有一个 `open(...,"r")`、无写/unlink/`sqlite3`/`shutil`；夹具 AST 的每个 socket 调用点都是 `127.0.0.1`；VERSION/`MONITOR_WEB_VERSION` 仍 0.3.1；tests.yml 已接线 |
 | S4 CI 网络守卫自检（7） | 公网 TCP connect / UDP sendto / DNS 解析 / 非 loopback bind / 链路本地元数据地址全部**被拒**；loopback connect 与 `localhost` 解析放行 |
-| S5 行为组（233，全程在守卫下运行） | boundary 30（>40 例拒绝矩阵，每条都携带"缺陷世界会兑现的那个 token"，故 B2/B3 的拒收不可被掩盖）、durable 25（重启 + 窗口 + raw-writer 防御 + 三值推导网格 + 三份推导 14×14 同答）、schema 31（fresh/v1→v3/v2→v3、崩溃注入、pre-v3 运行时、22 条 CHECK 墙含 NULL/重复 id 的 DDL 撞墙）、retention 12、health 21、activation 38（DARK 默认不起线程、16 例畸形 opt-in、闭合 token/常量冻结、**B1 目标/状态配对的四条实测判别器**）、e2e 21（真调度器 + 127.0.0.1 TLS 假服务）、threads 25（20× start/stop、慢周期不 convoy 且每周期携带**新** `cycle_id`）、http 30（真 server、401、恰等投影、liar/raiser + 19 例敌意数值矩阵与两张闭合域直查表） |
+| S5 行为组（250，全程在守卫下运行） | boundary 35（>40 例拒绝矩阵，每条都携带"缺陷世界会兑现的那个 token"，故 B2/B3 的拒收不可被掩盖；**B8 再加 5 条**：11 例 latency 缺陷矩阵、6 行"失败槽位必须是恰 NULL"、9 行词汇冒充者、20 行边界原语恰等类型、以及"每一次恰等类型拒收都携带 `history_probe_result_rejected`"）、durable 25（重启 + 窗口 + raw-writer 防御 + 三值推导网格 + 三份推导 14×14 同答）、schema 31（fresh/v1→v3/v2→v3、崩溃注入、pre-v3 运行时、22 条 CHECK 墙含 NULL/重复 id 的 DDL 撞墙）、retention 12、health 21、activation 38（DARK 默认不起线程、16 例畸形 opt-in、闭合 token/常量冻结、**B1 目标/状态配对的四条实测判别器**）、e2e 21（真调度器 + 127.0.0.1 TLS 假服务）、threads 25（20× start/stop、慢周期不 convoy 且每周期携带**新** `cycle_id`）、http 42（真 server、401、恰等投影、liar/raiser + 19 例敌意数值矩阵与两张闭合域直查表；**B7 再加 12 条**：36 行敌意 shape 矩阵 + 逐行严格 JSON + "敌意形状永不杀投影"、诚实 token 表 3+4+2 行、`SneakyStatus(dict)` 证明容器须恰等 dict、三个闭合器各自的直查表与"闭合器在词汇上全定义/遇不可哈希不抛"） |
 
 **loopback-only 是构造性证明，不是 grep**：`tests/monitor-probes/
 no_public_network.py` 装在 CPython audit 钩子上（`socket.connect`/
 `socket.bind`/`socket.sendto`/`socket.getaddrinfo`），在被审计操作发生**之前**
 抛异常即失败；它位于所有库抽象（`socket`、`http.client`、`ssl`、引擎的
-spec 构造）之下，套件日后新增的 import 也绕不过。S5 的 233 条全部在该守卫
+spec 构造）之下，套件日后新增的 import 也绕不过。S5 的 250 条全部在该守卫
 下运行，因此"泄漏"表现为崩溃，而崩溃就是 FAIL。守卫自身先跑 S4 自检，
 防止一个什么都不拒的守卫冒充证明。
 
@@ -392,5 +439,69 @@ B6/B2 还回头改写了**夹具自身**的三处纪律，否则新墙会把旧�
 3. `threads` 的慢周期夹具每次投递**重 stamped** 的新 id 与新 `epoch`。旧夹具
    反复交付同一周期，v3 之后它实际测的是重放拒绝循环，而不是它命名的锁 convoy。
 
-带时序的两组（`threads` 25 + `http` 30 = 55 条）在 CI 网络守卫下连跑 **20 轮**，
-20/20 全绿、零非零退出；全车道另有一轮同批实测（§10）。
+带时序的两组（`threads` 25 + `http` 42 = 67 条）在 CI 网络守卫下连跑 **20 轮**，
+20/20 全绿、零非零退出；全车道另有一轮同批实测（§10、§15）。
+
+## 15. 功能评审 R2（B7–B8）：闭合边界的最后两个缺口
+
+R2 只动**判定方式**，不动架构、不动数据面：B1–B6 的修复与全部现有契约保持。
+两处 blocker 的共同根因是同一件事——**用会 coercion 的谓词做值域收敛**。
+`isinstance` 放过子类，`bool()` 把任何非空值读成 `True`，`_as_int()` 会**转换**，
+而 `x in (tuple | frozenset)` 是向**候选者**提问（它的 `__hash__`、它的 `__eq__`）。
+
+### B7：HTTP `probes` 投影的剩余三个字段 + 容器
+
+| 反例 | 旧行为 | 现契约 | 判别器 |
+|------|--------|--------|--------|
+| `{"enabled": "yes", "running": 1}` | `bool()` 双双读成 `True`：一个字符串加一个整数被报告为"探测已启用且在运行" | 旗标只接受**恰为 `bool`**；缺陷答拒绝方向 `False` | `http/liar_bool_not_a_flag_refused`（由 R1 的 `liar_bool_coerced` **翻转**而来）、`http/closed_probe_bool_table` |
+| `["dark"] in PROBE_TARGET_SOURCES` | frozenset 先哈希候选者 → `TypeError` 抛出投影；`try` 只包住 `status()` 调用，**包不住分派循环**，于是谎话调度器把一次读取变成 500，毁掉**所有**读者 | membership 之前先 `type(value) is str` | `http/closers_never_raise_on_unhashable`、`http/hostile_shapes_never_kill_the_projection` |
+| 伪造 token 哈希、逢比必真的对象 | membership 用候选者的 `__eq__` 提问 → 该对象被**采纳**为 token 并原样交给 `json.dumps`（序列化不了任意对象）；在边界那一侧它被交给 SQLite binder，报的是 `persist_failed`，即"存储坏了"而不是"生产者坏了" | 同上：先恰等类型再查词汇 | `http/hostile_shape_body_is_strict_json`（逐行严格 JSON）、`boundary/closed_vocabularies_refuse_impersonators` |
+| `class SneakyStatus(dict)`，其 `get()` 对 `target_source` 回答与底层映射不同的值 | `isinstance(raw, dict)` 放过子类，投影读到的是子类**编造**的值 | 容器必须 `type(raw) is dict`，**恰等** | `http/only_an_exact_dict_is_a_status_container`（6 个容器） |
+
+收紧必须被证明**不是"什么都不接受"**：诚实表（`True`/`False` 旗标、三值
+source、两个 startup token 共 3+4+2 行）在真 HTTP 上仍逐字透传，三个闭合器
+另有一张"在全部词汇上全定义"的直查表。敌意 shape 矩阵 36 行 × 数值矩阵 19 行
+的键集**并起来恰等** `PROBE_STATUS_KEYS`，投影面没有未测字段。
+
+### B8：History 入库边界的原语一律恰等类型
+
+| 字段 | 缺陷世界兑现的形状 | 现契约 | 判别器 |
+|------|--------------------|--------|--------|
+| `latency_ms` | SQLite 的 INTEGER affinity 会把 `'12'` 静默**转换**后入库，表里存下引擎从未产出过的 coercion；`12.0`/`True`/`Decimal(12)` 同理 | 只接受 `type(latency) is int`，且 `0 <= latency <= 120000` | `boundary/latency_defects_all_refused_with_the_rejection_code`（11 例矩阵，含 `bool`、整值 float、字符串、`nan`、`Decimal`、`LyingInt`） |
+| 失败槽位 | `"NONE"`/空串/`0` 被当成 NULL | 失败周期必须**恰为 `None`**（6 行表） | `boundary/failed_slot_demands_exact_null` |
+| `epoch` / `cycle_id` / `raw_ip` / `egress_change` / `status` / `error_code` | `Decimal("1.0") == 1`、`LyingStr("8.008.8.8")` 靠重写 `__eq__` 赢过 canonical-identity 门 `ip != raw_ip`（那句比较是向**候选者**提问的），于是非 canonical 的原文被**洗白**成合法出口 | 六个原语全部 `type(...) is T` 先判，再进入范围/词汇/等值判定 | `boundary/boundary_primitives_are_exactly_typed`（20 行）、`boundary/every_exact_type_refusal_carried_the_rejection_code` |
+
+**每一次恰等类型拒收都必须被命名**：断言 `last_error_code ==
+history_probe_result_rejected`、`persisted_total` 纹丝不动、
+`rejected_total` 恰 +1、timeline 行数不变。这条纪律是 B6 的
+`null_cycle_id_refused_with_the_rejection_code` 的推广——一个形状缺陷必须在
+**边界**被报告为"生产者缺陷"，而不是等到写入撞 DDL 墙才伪装成"存储坏了"。
+
+### 撤销变异取证（R2）
+
+| 变异 | 被抓 |
+|------|------|
+| `closed_probe_bool` → `bool(value)` | 4 FAIL：`http/closed_probe_bool_table`、`http/closers_never_raise_on_unhashable`、`http/hostile_shapes_always_collapse`、`http/liar_bool_not_a_flag_refused` |
+| source 去掉恰等类型前置 | 崩溃即 FAIL：`TypeError: cannot use 'list' as a set element`（**这正是**漏洞本体——一次读取变 500） |
+| startup token 去掉恰等类型前置 | 同上，崩溃即 FAIL |
+| `type(raw) is not dict` → `isinstance` | 1 FAIL：`http/only_an_exact_dict_is_a_status_container`（shell 模式下另抓 S0 门 (6)） |
+| latency 回到 `_as_int` 判等 | 7 FAIL：`boundary/latency_defects_all_refused_with_the_rejection_code`、`boundary/every_exact_type_refusal_carried_the_rejection_code`、`boundary/closed_vocabularies_refuse_impersonators` 等 + S0 门 (6)(7) |
+| 词汇 membership 去前置 | 3 FAIL |
+| `epoch` / `cycle_id` 回 `isinstance` | 各 6 FAIL |
+| `egress_change` 回 `isinstance` | 3 FAIL |
+| `raw_ip` 回 `isinstance`（两处同文件） | 6 FAIL：含 `boundary/baseline_survives_failed_egress`、`boundary/replay_moves_no_baseline` |
+
+### 一条取证工具自身的教训
+
+首轮全车道扫描报 `306 passed / 1 failed`，红在新加的 S0 反 coercion 门
+（`a probe gate coerces (isinstance/bool/_as_int is back)`），AST 扫描把命中
+指到 `web/incident_history.py` 的 `isinstance(raw_ip, str)`。那不是回归，而是
+**我自己的变异工具的残留**：它对多片段 spec 是"逐段快照原件"，而同文件的两段
+里第二段快照已含第一段的变异，按序还原就把变异**当原文写了回去**。修法是
+两阶段——先把全部原件读完，再一次性写入；修好后 `b8_ip_type` 单跑 6 FAIL 且
+`restored` 后工作树与目标内容逐字节一致。该轮的 `306/1` 与同时段的其余结果
+全部作废重跑（污染的运行不是证据），§10 的数字来自重跑后的同批扫描。
+
+门数移动：`EXPECTED_PASS` 288 → **307**（+19），S0 6 → 8（两条静态反 coercion
+墙），S5 233 → 250（boundary 30 → 35，http 30 → 42）。S1/S2/S3/S4 不动。
+VERSION / `MONITOR_WEB_VERSION` 仍为 `0.3.1`，功能评审头不携带发布准备。
