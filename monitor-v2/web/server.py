@@ -49,6 +49,29 @@ SESSION_COOKIE = "monitor_session"
 MAX_BODY_BYTES = 65536
 SUPPORTED_METHODS = "GET, POST"
 
+# Issue #33 PR-3B: the closed probe-scheduler status vocabulary re-emitted by
+# /api/v1/diagnostics/timeline. web/ never imports diagnostics/, so this is a
+# deliberate duplicate; tests/test-monitor-v2-probe-ingest.sh is the static
+# gate that keeps the two in lockstep (a scheduler key that is not listed
+# here is invisible to the surface, which is the fail-closed direction).
+PROBE_STATUS_KEYS = (
+    "enabled", "running", "target_source", "startup_error",
+    "cadence_seconds", "cycles_completed", "cycles_rejected",
+    "runtime_failures", "last_cycle_epoch", "last_store_epoch",
+)
+PROBE_STATUS_BOOL_KEYS = frozenset({"enabled", "running"})
+PROBE_STATUS_SOURCE_KEYS = frozenset({"target_source"})
+PROBE_STATUS_TOKEN_KEYS = frozenset({"startup_error"})
+# Mirror of the scheduler's closed startup vocabulary (the same no-import,
+# duplicate-shapes discipline the history module uses for the probe
+# result codes): an arbitrary string from a buggy scheduler is refused,
+# so this field can never carry a path, an endpoint or exception text.
+PROBE_STARTUP_TOKENS = frozenset({
+    "target_file_not_configured", "target_injection_invalid"})
+PROBE_STATUS_REAL_KEYS = frozenset({"cadence_seconds", "last_cycle_epoch",
+                                    "last_store_epoch"})
+PROBE_TARGET_SOURCES = frozenset({"production", "injected", "dark"})
+
 # The four privileged mutation routes of rev5 §7. M0.5 delivered them as a
 # 501 boundary; M2 wires them to the sbox-cm RPC adapter (below).
 # Product UX contract: client.add is session + CSRF only after login;
@@ -218,7 +241,7 @@ class MonitorWebApp:
     def __init__(self, broker, access, static_dir, auth=None,
                  remote_mode=False, version=MONITOR_WEB_VERSION,
                  recovery_guard=None, management_active=None, e3_broker=None,
-                 incident_history=None):
+                 incident_history=None, probe_scheduler=None):
         self.broker = broker
         self.access = access
         self.auth = auth
@@ -228,6 +251,10 @@ class MonitorWebApp:
         # Issue #33 P1: the bounded incident timeline. Injectable; None
         # (standalone harnesses) keeps the read endpoint a clean 503.
         self.incident_history = incident_history
+        # Issue #33 PR-3B: the probe scheduler's closed status object is the
+        # ONLY thing this surface can show about probing -- no endpoints, no
+        # probe results, no paths, no free text.
+        self.probe_scheduler = probe_scheduler
         self.recovery_limiter = RecoveryRateLimiter()
         self.recovery_guard = recovery_guard or RecoveryGlobalGuard()
         # ``management_active`` is an ORTHOGONAL boolean to ``monitor_running``
@@ -243,6 +270,43 @@ class MonitorWebApp:
         self._management_active = management_active
         self.e3_broker = e3_broker
         self._static_cache = {}
+
+    def probe_status(self):
+        """Closed scheduler status for the diagnostics surface.
+
+        Deny-by-default: only the frozen ``PROBE_STATUS_KEYS`` are
+        re-emitted, with their value domains coerced closed, so an
+        endpoint, a path or exception text can never reach a response --
+        and a missing, broken or lying scheduler answers ``None``.
+        """
+        getter = getattr(self.probe_scheduler, "status", None)
+        if not callable(getter):
+            return None
+        try:
+            raw = getter()
+        except Exception:  # noqa: BLE001 -- a status read never propagates
+            return None
+        if not isinstance(raw, dict):
+            return None
+        status = {}
+        for key in PROBE_STATUS_KEYS:
+            value = raw.get(key)
+            if key in PROBE_STATUS_BOOL_KEYS:
+                status[key] = bool(value)
+            elif key in PROBE_STATUS_SOURCE_KEYS:
+                status[key] = value if value in PROBE_TARGET_SOURCES else "dark"
+            elif key in PROBE_STATUS_TOKEN_KEYS:
+                status[key] = (value if value is None
+                               or value in PROBE_STARTUP_TOKENS else None)
+            elif key in PROBE_STATUS_REAL_KEYS:
+                status[key] = (float(value)
+                               if isinstance(value, (int, float))
+                               and not isinstance(value, bool) else None)
+            else:
+                status[key] = (int(value)
+                               if isinstance(value, int)
+                               and not isinstance(value, bool) else 0)
+        return status
 
     def static_file(self, name):
         cached = self._static_cache.get(name)
@@ -720,6 +784,12 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         plus the category-level history health. Connection ids, source /
         destination addresses and any credential can never appear here
         for the same reason they can never appear in the database.
+
+        0.4.0 (#33 PR-3B): the SAME bounded request also carries the v3
+        probe rows (``probe_rows``, whitelisted columns, the same
+        ``since``/``limit``) and the closed scheduler status
+        (``probes``, projected through ``PROBE_STATUS_KEYS``). One read
+        surface, one bound, no new endpoint and no new query parameter.
         """
         history = self.app.incident_history
         if history is None:
@@ -735,6 +805,8 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             "history": history.health(),
             "samples": result["samples"],
             "device_states": result["device_states"],
+            "probe_rows": result["probe_rows"],
+            "probes": self.app.probe_status(),
             "truncated": result["truncated"],
             "limit": result["limit"],
         })

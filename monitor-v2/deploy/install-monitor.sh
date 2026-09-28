@@ -491,6 +491,13 @@ _cmd_rollback_locked() { # [release-id]   (F4: runs under the deploy lock)
         fi
     fi
 
+    # PR-3B History schema compatibility gate (BEFORE any mutation), the
+    # sibling of the reader gate above: a v3 database must never end up
+    # underneath a pre-v3 runtime through the ordinary rollback path.
+    if ! sbmon_rollback_schema_gate "$target"; then
+        sbmon_die "回滚目标与当前 history schema 不兼容（见上）：fail-closed，未做任何变更"
+    fi
+
     # R3-2: capture the full pre-state BEFORE touching anything.
     local orig_active=0 orig_enabled=0
     if sbmon_service_active; then orig_active=1; fi

@@ -657,6 +657,22 @@ sbmon_stage_release() { # sbmon_stage_release <version> -> prints release id on 
     cp -R -- "$SBMON_REPO_MONITOR_DIR/web" "$staged/app/monitor-v2/web"
     rm -rf -- "$staged/app/monitor-v2/web/__pycache__"
 
+    # PR-3B: diagnostics/ (probe engine + scheduler) is UNCONDITIONALLY
+    # required by the staged runtime tree: every manifest file must exist in
+    # the source tree, and the staged set must come back EXACTLY. A missing
+    # file is a broken tree, not an optional payload to skip.
+    mkdir -p "$staged/$DIAGNOSTICS_REL"
+    local df
+    for df in "${DIAGNOSTICS_MODULE_FILES[@]}"; do
+        [ -f "$SBMON_REPO_MONITOR_DIR/diagnostics/$df" ] \
+            || sbmon_die "缺少 diagnostics 模块 $df：webapp 运行期必需，fail-closed"
+        cp -- "$SBMON_REPO_MONITOR_DIR/diagnostics/$df" \
+            "$staged/$DIAGNOSTICS_REL/$df" \
+            || sbmon_die "diagnostics 模块 $df 拷贝失败：fail-closed"
+    done
+    sbmon_diagnostics_audit "$staged/$DIAGNOSTICS_REL" \
+        || { rm -rf -- "$staged"; sbmon_die "diagnostics manifest 审计失败，放弃发布"; }
+
     # Shims + shared env lib from deploy templates.
     cp -- "$DEPLOY_DIR/app-bin/monitor-service" "$staged/bin/monitor-service"
     cp -- "$DEPLOY_DIR/app-bin/monitor-health" "$staged/bin/monitor-health"
@@ -697,7 +713,8 @@ sbmon_stage_release() { # sbmon_stage_release <version> -> prints release id on 
         "$staged/app/monitor-v2/collector.py"
         "$staged/app/monitor-v2/webapp.py"
         "$staged/app/monitor-v2/api_bridge/"*.py
-        "$staged/app/monitor-v2/web/"*.py)
+        "$staged/app/monitor-v2/web/"*.py
+        "$staged/$DIAGNOSTICS_REL/"*.py)
     local -a sh_targets=("$staged/bin/monitor-service" "$staged/bin/monitor-health"
         "$staged/bin/monitor-contract-probe" "$staged/lib/monitor-env.sh")
     if [ "$jr_staged" = 1 ]; then
@@ -926,6 +943,139 @@ SBOXJR_TEMPLATE_NAME="singbox-journal-reader.service.in"
 SBOXJR_MODULE_FILES=(__init__.py codes.py cursor.py journal_time.py
     normalize.py classifier.py fingerprint.py eligibility.py schema.py
     state.py reader.py ingest_contract.py)
+
+# PR-3B (#33): the outbound-probe payload is part of the MONITOR runtime, not
+# an optional side tree -- webapp.py imports the scheduler at startup, so a
+# release that cannot carry diagnostics/ must not be staged at all. Frozen
+# explicit manifest, staged file by file and NEVER `cp -R diagnostics`: a new
+# source file reaches production only by being named here AND by the static
+# gate in tests/test-monitor-v2-probe-ingest.sh.
+DIAGNOSTICS_MODULE_FILES=(__init__.py network_probes.py probe_scheduler.py)
+DIAGNOSTICS_REL="app/monitor-v2/diagnostics"
+
+# EXACT-set audit of a staged/persisted diagnostics tree: missing OR
+# unexpected entries both fail closed (the same manifest discipline the reader
+# runtime audit enforces). rc only -- the caller decides the abort wording.
+sbmon_diagnostics_audit() { # <dir> -> rc
+    local dir="$1"
+    if [ ! -d "$dir" ]; then
+        sbmon_warn "diagnostics 运行时目录不存在: $dir"
+        return 1
+    fi
+    local want got
+    want="$(printf '%s\n' "${DIAGNOSTICS_MODULE_FILES[@]}" | LC_ALL=C sort)"
+    got="$(find "$dir" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null \
+        | LC_ALL=C sort)"
+    if [ "$got" != "$want" ]; then
+        sbmon_warn "diagnostics 文件集偏离 manifest（多余或缺失均 fail-closed）: $dir"
+        return 1
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# PR-3B (#33): History schema compatibility -- the rollback gate's two inputs
+# ---------------------------------------------------------------------------
+# The v3 history schema ADDS a table, and EVERY pre-v3 Monitor build refuses a
+# v3 file through its own schema gate (fail-closed at runtime: the timeline
+# stops recording while the rest of the Monitor keeps serving). Rolling the
+# runtime back underneath a v3 database would therefore hand the operator a
+# silently history-dark Monitor -- so the ordinary rollback path refuses
+# BEFORE it mutates anything. Both readers here are strictly read-only: never
+# a create, never a write lock, never a migration.
+SBMON_HISTORY_DB_REL="diagnostics/history.sqlite3"
+
+sbmon_history_db_path() { printf '%s\n' "$SBMON_STATE_ROOT/$SBMON_HISTORY_DB_REL"; }
+
+sbmon_history_db_present() { # rc 0 = a history database exists on this host
+    [ -f "$SBMON_STATE_ROOT/$SBMON_HISTORY_DB_REL" ]
+}
+
+# Prints the LIVE database's declared schema_version; rc 1 when it cannot be
+# read (absent, unreadable, no meta row, not a database, non-numeric).
+sbmon_history_db_schema_version() { # -> int | rc 1
+    "$SBMON_PYTHON3" - "$SBMON_STATE_ROOT/$SBMON_HISTORY_DB_REL" <<'PY' 2>/dev/null
+import os, sqlite3, sys
+from urllib.request import pathname2url
+db = sys.argv[1]
+if not os.path.isfile(db):
+    raise SystemExit(1)
+con = sqlite3.connect("file:%s?mode=ro" % pathname2url(os.path.abspath(db)),
+                      uri=True, timeout=2.0)
+try:
+    row = con.execute(
+        "SELECT value FROM meta WHERE key='schema_version'").fetchone()
+finally:
+    con.close()
+if row is None:
+    raise SystemExit(1)
+try:
+    version = int(row[0])
+except (TypeError, ValueError):
+    raise SystemExit(1)
+if version < 0:
+    raise SystemExit(1)
+print(version)
+PY
+}
+
+# Prints the TARGET release's declared SCHEMA_VERSION by importing THAT
+# release's own module -- the release answers for itself, no text scrape. A
+# release that predates the history module declares 0 (any real database
+# outranks it); a module that cannot be imported at all is rc 1, which the
+# caller also refuses on.
+# -B is part of the contract, not an optimisation: an ordinary import writes
+# __pycache__ INTO the immutable release tree, which would make this
+# "read-only" precondition a mutator. No bytecode, no side files.
+sbmon_release_schema_version() { # <release-id> -> int | rc 1
+    local app_dir="$SBMON_RELEASES_DIR/$1/app/monitor-v2"
+    [ -d "$app_dir" ] || return 1
+    "$SBMON_PYTHON3" -B - "$app_dir" <<'PY' 2>/dev/null
+import os, sys
+sys.path = [p for p in sys.path if p not in ("", ".", os.getcwd())]
+sys.path.insert(0, sys.argv[1])
+try:
+    import web.incident_history as history
+except Exception:
+    print(0)
+    raise SystemExit(0)
+try:
+    version = int(history.SCHEMA_VERSION)
+except (AttributeError, TypeError, ValueError):
+    raise SystemExit(1)
+if version < 0:
+    raise SystemExit(1)
+print(version)
+PY
+}
+
+# Non-mutating rollback precondition gate, sibling to the PR-2B reader
+# compatibility gate: refuses a target whose declared schema is OLDER than
+# the live database, and refuses "unknown" on either side. rc 1 = do not
+# proceed; the caller aborts with 未做任何变更.
+sbmon_rollback_schema_gate() { # <target-id> -> rc
+    local target="$1"
+    sbmon_history_db_present || return 0     # no database: nothing to protect
+    local live want
+    live="$(sbmon_history_db_schema_version)" || {
+        sbmon_warn "当前 history 数据库存在但 schema 版本不可读（$SBMON_HISTORY_DB_REL）：无法证明回滚目标兼容，fail-closed"
+        return 1
+    }
+    want="$(sbmon_release_schema_version "$target")" || {
+        sbmon_warn "回滚目标 $target 的 history schema 版本不可读：无法证明兼容，fail-closed"
+        return 1
+    }
+    case "$live$want" in
+        ''|*[!0-9]*)
+            sbmon_warn "history schema 版本判定非整数：fail-closed"
+            return 1 ;;
+    esac
+    if [ "$live" -gt "$want" ]; then
+        sbmon_warn "回滚目标 $target 声明 history schema v$want，当前数据库为 v$live：该 release 无法读取现有历史库（运行期会 fail-closed 停写），拒绝回滚"
+        return 1
+    fi
+    return 0
+}
 
 sboxjr_log() { printf '[sbjr-deploy] %s\n' "$*"; }
 sboxjr_warn() { printf '[sbjr-deploy] WARNING: %s\n' "$*" >&2; }

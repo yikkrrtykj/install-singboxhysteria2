@@ -33,6 +33,7 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 from collector import Collector, resolve_secret  # noqa: E402
+from diagnostics.probe_scheduler import ProbeScheduler  # noqa: E402
 from web.access import LOOPBACK_ALLOW, AccessPolicy, host_entry_for_ip  # noqa: E402
 from web.auth import AuthStore, validate_password  # noqa: E402
 from web.broker import SnapshotBroker  # noqa: E402
@@ -266,10 +267,17 @@ def cmd_serve(args):
                               uuid.uuid4().hex,
                               monitor_version=MONITOR_WEB_VERSION)
     history.open()
+    # Issue #33 PR-3B: the probe scheduler rides its OWN daemon thread, never
+    # the publisher loop, so probe cadence or a broken persistence boundary
+    # cannot delay a snapshot. It is opt-in through a reviewed target file
+    # only -- with no such file it stays dark and does zero I/O (see
+    # diagnostics/probe_scheduler.py).
+    probes = ProbeScheduler(history)
     broker = SnapshotBroker(collector, poll_seconds=args.poll,
                             health_file=args.health_file,
                             incident_history=history)
     broker.start()
+    probes.start()
 
     auth = AuthStore(data_dir, session_ttl=args.session_ttl)
     if not auth.password_configured():
@@ -279,7 +287,8 @@ def cmd_serve(args):
                         static_dir=os.path.join(HERE, "web", "static"),
                         auth=auth, remote_mode=remote_mode,
                         e3_broker=E3Broker(E3RpcClient()),
-                        incident_history=history)
+                        incident_history=history,
+                        probe_scheduler=probes)
     server = build_server(app, args.listen, args.port, tls_context)
     scheme = "https" if tls_context is not None else "http"
     print("monitor web (%s) listening on %s:%d [%s]" %
@@ -290,6 +299,7 @@ def cmd_serve(args):
     except KeyboardInterrupt:
         pass
     finally:
+        probes.stop()
         broker.stop()
         server.server_close()
         history.close()

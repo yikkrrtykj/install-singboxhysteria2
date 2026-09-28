@@ -13,14 +13,17 @@ Safety contract (all enforced, all tested):
   non-directory / non-regular type) is REFUSED, never followed. SQLite
   runs ``journal_mode=DELETE`` (no stray -wal/-shm files),
   ``synchronous=FULL``, ``foreign_keys=ON`` and a bounded busy timeout.
-  Schema handling is strict: a genuinely fresh DB is created at v2; an
-  existing DB opens only with an exactly-declared v2 on EXACTLY the
-  seven v2 tables, or with EXACTLY the three v1 tables declared v1,
-  which is migrated FORWARD to v2 in one transaction with every v1 row
-  preserved. Any extra unrelated table, any other declared version
+  Schema handling is strict: a genuinely fresh DB is created at v3; an
+  existing DB opens only with an exactly-declared v3 on EXACTLY the
+  eight v3 tables, or with EXACTLY the seven v2 tables (migrated FORWARD
+  to v3 in one transaction), or with EXACTLY the three v1 tables
+  (migrated FORWARD to v3 in one transaction), with every pre-existing
+  row preserved. Any extra unrelated table, any other declared version
   (newer, negative, malformed, hybrid) or metadata-less SQLite file is
   refused fail-closed and never mutated -- migrations are explicit and
-  forward-only.
+  forward-only. A database at v3 opened by a pre-v3 build refuses on
+  exactly this gate, which is what the deploy-side rollback compatibility
+  gate mirrors BEFORE any mutation.
 * Threading: ONE reentrant lock serializes the whole of ``open`` /
   ``on_publish`` (write + retention) / ``health`` / ``query_timeline`` /
   ``close`` against each other -- exactly one thread may touch the shared
@@ -48,6 +51,24 @@ Safety contract (all enforced, all tested):
   ALL tables are pruned as ONE globally epoch-ordered timeline, so a
   newer row is never sacrificed while a strictly older row still exists
   in another table.
+* Probe ingest (issue #33 Phase 3, PR-3B): the v3 ``network_probe_samples``
+  table is the ONE network-probe surface -- one row per accepted probe
+  cycle, carrying ONLY the closed engine result re-validated AT THIS
+  BOUNDARY (status/error_code through the frozen 9-member vocabulary,
+  latency only with ok, the canonical GLOBAL egress IP or NULL, the
+  exact lowercase 32-hex cycle id or NULL). Free text, resolved
+  addresses and over-long values are unconstructible: the boundary
+  rejects the whole result (zero bytes written) and the CHECK
+  constraints reject even a buggy direct INSERT. Egress-change
+  semantics are persisted per row from the reviewer-frozen
+  ``classify_egress_change`` judgement derived against the LAST
+  SUCCESSFUL PERSISTED public egress IP. Probe persistence carries its
+  OWN degraded state (like journal ingest): a probe rejection or DB
+  failure can never be swallowed by a successful sample write, and --
+  critically -- a probe cycle full of ordinary NETWORK failures is
+  DATA, not degradation: network-failure evidence never touches the
+  probe health plane, and probe-plane degradation never claims the
+  network is down.
 
 Journal ingest (issue #33 P2, PR-2B activation):
 
@@ -76,7 +97,9 @@ Journal ingest (issue #33 P2, PR-2B activation):
 from __future__ import annotations
 
 import datetime
+import ipaddress
 import json
+import math
 import os
 import re
 import sqlite3
@@ -93,7 +116,7 @@ except ImportError:  # packaged monitor release does not (yet) ship the lib
     _journal_schema = None
     JOURNAL_CONTRACT_AVAILABLE = False
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 DB_NAME = "history.sqlite3"
 
@@ -115,6 +138,7 @@ PRUNE_BATCH_ROWS = 512
 _PRUNE_SOURCES = (
     ("timeline_samples", "epoch"),
     ("device_protocol_states", "epoch"),
+    ("network_probe_samples", "epoch"),
     ("journal_runs", "ingested_epoch"),
     ("journal_ingest_audit", "epoch"),
 )
@@ -135,6 +159,13 @@ CODE_WRITE_FAILED = "history_write_failed"
 CODE_RETENTION_FAILED = "history_retention_failed"
 CODE_READ_FAILED = "history_read_failed"
 CODE_INGEST_APPLY_FAILED = "history_ingest_apply_failed"
+# PR-3B probe plane: CODE_PROBE_PERSIST_FAILED is the storage-side
+# refusal (the row could not be written at all); CODE_PROBE_RESULT_REJECTED
+# is the boundary-side refusal (a result that is not a closed engine
+# object -- zero bytes written). Neither is EVER a network-failure code:
+# failed probes persist as data; only refusal to persist degrades here.
+CODE_PROBE_PERSIST_FAILED = "history_probe_persist_failed"
+CODE_PROBE_RESULT_REJECTED = "history_probe_result_rejected"
 # B7-B: the journal exchange directory could not be enumerated AT ALL
 # (missing, not searchable for this identity, not a directory). Distinct
 # from an empty directory on purpose: "I could not look" is a storage
@@ -187,13 +218,39 @@ _V1_TABLES = frozenset({"timeline_samples", "device_protocol_states"})
 _JOURNAL_TABLES = frozenset({"journal_runs", "journal_events",
                              "journal_ingest_audit",
                              "journal_ingest_state"})
+_PROBE_TABLES = frozenset({"network_probe_samples"})
 # EXACT shapes -- the schema gate is table-set EQUALITY, not a subset:
 # an unrelated extra table is a shape this module never created, so an
-# open that claims v1/v2 while carrying one is refused fail-closed
+# open that claims v1/v2/v3 while carrying one is refused fail-closed
 # (zero bytes mutated), never "adopted apart from the stranger".
 _META_TABLE = "meta"
 _ALLOWED_V1_SHAPE = _V1_TABLES | {_META_TABLE}
 _ALLOWED_V2_SHAPE = _ALLOWED_V1_SHAPE | _JOURNAL_TABLES
+_ALLOWED_V3_SHAPE = _ALLOWED_V2_SHAPE | _PROBE_TABLES
+
+# -- probe ingest surface (issue #33 Phase 3, PR-3B) ---------------------------
+
+# Mirror of the PR-3A closed vocabulary (network_probes.ERROR_CODES).
+# They MUST equal the engine's live set -- the probe suite asserts the
+# mirror against the engine source, exactly like JOURNAL_AUDIT_CODES is
+# asserted against the journal contract -- because the v3 CHECK
+# constraints must be creatable from this module alone.
+PROBE_ERROR_CODES = ("NONE", "timeout", "dns_failed", "connect_failed",
+                     "tls_failed", "bad_response", "protocol_failed",
+                     "parse_failed", "unavailable")
+PROBE_STATUSES = ("ok", "failed")
+PROBE_CHANGE_VALUES = ("unchanged", "changed", "unknown")
+# Result-schema version this boundary accepts (engine RESULT_VERSION).
+PROBE_RESULT_VERSION = 1
+# Latency budget ceiling: strictly below the engine's own bound space
+# (per-spec timeouts are < 3600 s, cycle deadlines far lower). A value
+# this large can only come from a broken producer, never from a probe.
+PROBE_LATENCY_MAX_MS = 120000
+# Egress freshness window (seconds) for the DURABLE change baseline:
+# "last successful persisted public IP" only carries change-detection
+# meaning while it is plausibly the same egress session; older than the
+# window (default retention horizon) it is history, not a baseline.
+PROBE_EGRESS_BASELINE_WINDOW_SECONDS = RETENTION_SECONDS
 
 
 def classify_protocol(inbound, inbound_type=""):
@@ -252,8 +309,17 @@ DEVICE_STATE_COLUMNS = (
 REASON_CHANGE = "change"
 REASON_HEARTBEAT = "heartbeat"
 
-_SAMPLE_SELECT = "SELECT %s FROM" % ", ".join(SAMPLE_COLUMNS)
-_STATE_SELECT = "SELECT %s FROM" % ", ".join(DEVICE_STATE_COLUMNS)
+# Exact persisted probe columns (deny-by-default like every other
+# projection here): the closed v1 engine result flattened into ONE
+# row, plus the derived durable egress-change token and ingest identity.
+PROBE_COLUMNS = (
+    "epoch", "iso_utc", "run_id", "cycle_id", "result_version",
+    "dns_status", "dns_latency_ms", "dns_error_code",
+    "https_status", "https_latency_ms", "https_error_code",
+    "udp_status", "udp_latency_ms", "udp_error_code",
+    "egress_status", "egress_latency_ms", "egress_error_code", "egress_ip",
+    "egress_change",
+)
 
 
 def _iso(timestamp):
@@ -429,6 +495,13 @@ class IncidentHistory:
         self._last_journal_ingest_ts = None
         self._journal_blocked_at = None
         self._journal_last_pass = None
+        # Probe ingest (PR-3B) is a THIRD independent health subsystem
+        # (same discipline as journal): never cleared by the ordinary
+        # write path, never confused with network-failure evidence.
+        self._probe_degraded = False
+        self._probe_last_error_code = None
+        self._probe_persisted_total = 0
+        self._probe_rejected_total = 0
 
     # -- public surface (NONE of these ever raise) -----------------------------
 
@@ -464,16 +537,21 @@ class IncidentHistory:
 
     def health(self):
         with self._lock:
-            # Composed surface: the ordinary write path and the journal
-            # ingest path carry independent degraded states; either one
-            # makes the whole history degraded. Write-path codes win
-            # when both are set (they gate the primary data path); the
-            # journal code is NEVER swallowed by a successful sample
-            # write in the same publication.
-            degraded = bool(self._degraded or self._journal_degraded)
+            # Composed surface: the ordinary write path, the journal
+            # ingest path and the probe ingest path carry INDEPENDENT
+            # degraded states; any one of them makes the whole history
+            # degraded. The code precedence is write > journal > probe
+            # (the primary data path wins), but a lower-plane code is
+            # NEVER swallowed by a successful higher-plane write in the
+            # same publication. Probe degradation is persistence-side
+            # only -- ordinary network-failure evidence never enters it.
+            degraded = bool(self._degraded or self._journal_degraded
+                            or self._probe_degraded)
             code = self._last_error_code
             if code is None and self._journal_degraded:
                 code = self._journal_last_error_code
+            if code is None and self._probe_degraded:
+                code = self._probe_last_error_code
             return {
                 "enabled": bool(self._enabled),
                 "degraded": degraded,
@@ -488,9 +566,12 @@ class IncidentHistory:
         """Bounded, sanitized read of the persisted timeline.
 
         Returns ``{"samples": [...], "device_states": [...],
-        "truncated": bool}`` with EXACTLY the whitelisted columns, or
-        empty lists if the history is unreadable (health carries the
-        reason -- reads never raise).
+        "probe_rows": [...], "truncated": bool}`` with EXACTLY the
+        whitelisted columns, or empty lists if the history is
+        unreadable (health carries the reason -- reads never raise).
+        The v3 probe rows ride the SAME ``since``/``limit`` bounds:
+        one bounded read surface, three projections, no arbitrary
+        filters.
         """
         limit = max(1, min(_as_int(limit, QUERY_LIMIT_DEFAULT),
                            QUERY_LIMIT_MAX))
@@ -498,35 +579,40 @@ class IncidentHistory:
             with self._lock:
                 if not self._enabled or self._conn is None:
                     return {"samples": [], "device_states": [],
+                            "probe_rows": [],
                             "truncated": False, "limit": limit}
-                if since is None:
-                    sample_rows = self._conn.execute(
-                        _SAMPLE_SELECT + " timeline_samples ORDER BY epoch"
-                        " DESC LIMIT ?", (limit + 1,)).fetchall()
-                    state_rows = self._conn.execute(
-                        _STATE_SELECT + " device_protocol_states ORDER BY"
-                        " epoch DESC LIMIT ?", (limit + 1,)).fetchall()
-                else:
-                    sample_rows = self._conn.execute(
-                        _SAMPLE_SELECT + " timeline_samples WHERE epoch >= ?"
-                        " ORDER BY epoch DESC LIMIT ?",
-                        (float(since), limit + 1)).fetchall()
-                    state_rows = self._conn.execute(
-                        _STATE_SELECT + " device_protocol_states WHERE epoch"
-                        " >= ? ORDER BY epoch DESC LIMIT ?",
-                        (float(since), limit + 1)).fetchall()
+                sample_rows = self._query_table("timeline_samples",
+                                                SAMPLE_COLUMNS, since, limit)
+                state_rows = self._query_table("device_protocol_states",
+                                               DEVICE_STATE_COLUMNS,
+                                               since, limit)
+                probe_rows = self._query_table("network_probe_samples",
+                                               PROBE_COLUMNS, since, limit)
         except (sqlite3.Error, OSError, ValueError):
             self._record_failure(CODE_READ_FAILED)
-            return {"samples": [], "device_states": [],
+            return {"samples": [], "device_states": [], "probe_rows": [],
                     "truncated": False, "limit": limit}
-        truncated = len(sample_rows) > limit or len(state_rows) > limit
+        truncated = (len(sample_rows) > limit or len(state_rows) > limit
+                     or len(probe_rows) > limit)
         samples = [_project_rows(r, SAMPLE_COLUMNS) for r in sample_rows[:limit]]
         states = [_project_rows(r, DEVICE_STATE_COLUMNS)
                   for r in state_rows[:limit]]
+        probes = [_project_rows(r, PROBE_COLUMNS) for r in probe_rows[:limit]]
         samples.reverse()   # chronological order for the reader
         states.reverse()
+        probes.reverse()
         return {"samples": samples, "device_states": states,
+                "probe_rows": probes,
                 "truncated": truncated, "limit": limit}
+
+    def _query_table(self, table, columns, since, limit):
+        select = "SELECT %s FROM %s" % (", ".join(columns), table)
+        if since is None:
+            return self._conn.execute(select + " ORDER BY epoch DESC"
+                                      " LIMIT ?", (limit + 1,)).fetchall()
+        return self._conn.execute(select + " WHERE epoch >= ?"
+                                  " ORDER BY epoch DESC LIMIT ?",
+                                  (float(since), limit + 1)).fetchall()
 
     def close(self):
         with self._lock:
@@ -601,6 +687,204 @@ class IncidentHistory:
             self._record_failure(CODE_READ_FAILED)
         return status
 
+    # -- probe ingest surface (issue #33 Phase 3, PR-3B) ----------------------
+
+    def record_probe_result(self, result, egress_change=None):
+        """ONE bounded probe-cycle persist (scheduler-thread entry).
+
+        Returns True iff the row landed. Like journal ingest this is an
+        INDEPENDENT health subsystem: an ordinary probe cycle full of
+        network failures is DATA and returns True; only a boundary
+        rejection (a result that is not a closed engine object) or a
+        storage failure degrades the probe plane -- and a successful
+        ordinary sample write can never swallow either. NEVER raises on
+        expected conditions; the containment wrapper below is the
+        publication-parity belt-and-braces line so a probe defect can
+        not be heard anywhere but as a sanitized counter/code.
+        """
+        try:
+            with self._lock:
+                if not self._enabled or self._conn is None:
+                    return False
+                return self._probe_record_locked(result, egress_change,
+                                                 self._clock())
+        except _HistoryError as exc:
+            self._record_probe_failure(exc.code)
+            return False
+        except (sqlite3.Error, OSError):
+            self._rollback_quiet()
+            self._record_probe_failure(CODE_PROBE_PERSIST_FAILED)
+            return False
+        except Exception:  # noqa: BLE001 -- probe plane containment
+            self._rollback_quiet()
+            self._record_probe_failure(CODE_PROBE_PERSIST_FAILED)
+            return False
+
+    def last_persisted_egress_ip(self):
+        """The DURABLE change baseline: the egress IP of the most
+        recent ACCEPTED, SUCCESSFUL probe row inside the baseline
+        window, or None ("no baseline" -- restart, retention, fresh
+        DB). Never raises; a read failure reports no baseline (change
+        then adjudicates ``unknown``, never a fabricated event)."""
+        try:
+            with self._lock:
+                if not self._enabled or self._conn is None:
+                    return None
+                return self._last_persisted_egress_ip_locked()
+        except (sqlite3.Error, OSError, ValueError):
+            self._record_probe_failure(CODE_PROBE_PERSIST_FAILED)
+            return None
+
+    def probe_status(self):
+        """Closed, sanitized probe-plane status (no endpoints, no
+        results, no paths, no exception text)."""
+        with self._lock:
+            return {
+                "enabled": bool(self._enabled),
+                "degraded": bool(self._probe_degraded),
+                "last_error_code": self._probe_last_error_code,
+                "persisted_total": int(self._probe_persisted_total),
+                "rejected_total": int(self._probe_rejected_total),
+            }
+
+    # -- probe ingest internals ------------------------------------------------
+
+    def _last_persisted_egress_ip_locked(self):
+        row = self._conn.execute(
+            "SELECT egress_ip FROM network_probe_samples"
+            " WHERE egress_status = 'ok' AND egress_ip IS NOT NULL"
+            " AND epoch >= ? ORDER BY epoch DESC, rowid DESC LIMIT 1",
+            (self._clock() - PROBE_EGRESS_BASELINE_WINDOW_SECONDS,)
+        ).fetchone()
+        if row is None:
+            return None
+        # defense-in-depth: the stored value already passed the CHECK
+        # and the boundary gate; re-canonicalize before it can inform
+        # a change judgement anyway.
+        return _canonical_global_ip(row[0])
+
+    def _probe_boundary_validate_locked(self, result, egress_change, now):
+        """Re-validate the CLOSED engine result at the DB boundary.
+
+        The engine already enforces every one of these invariants on
+        correct code; this gate exists because the DB is the last place
+        a trust assumption can be checked for free. Accepts ONLY a
+        strictly-typed, exact-key closed result whose three timed slots
+        and egress slot each satisfy the closed transition matrix, whose
+        egress IP is byte-identical to the canonical GLOBAL form (the
+        raw text is never stored, and a loopback/private/reserved
+        address is rejected even if the engine above were buggy), and
+        whose egress-change token agrees with the DURABLE baseline --
+        the last successfully persisted public IP -- so a lost in-memory
+        state after a Monitor restart can never fabricate or suppress a
+        change event. Any violation returns None (one sanitized
+        rejection counter, one plane code, the raw candidate never
+        reaches the table)."""
+        if not _result_is_closed(result, _PROBE_RESULT_KEYS):
+            return None
+        if type(result["v"]) is not int or result["v"] != PROBE_RESULT_VERSION:
+            return None
+        epoch = result["epoch"]
+        if isinstance(epoch, bool) or not isinstance(epoch, (int, float)) \
+                or not math.isfinite(epoch) or epoch < 0 \
+                or abs(now - epoch) > PROBE_CYCLE_FRESHNESS_SECONDS:
+            return None
+        cycle_id = result["cycle_id"]
+        if cycle_id is not None:
+            # a non-string is a SHAPE defect: refuse it here, with the
+            # boundary's own rejection counter, instead of letting a
+            # TypeError ride the containment wrapper.
+            if not isinstance(cycle_id, str) \
+                    or _CYCLE_ID_RE.fullmatch(cycle_id) is None:
+                return None
+        row = {
+            "epoch": float(epoch),
+            "iso_utc": _iso(epoch),
+            "run_id": self._run_id,
+            "cycle_id": cycle_id,
+            "result_version": PROBE_RESULT_VERSION,
+        }
+        for slot in ("dns", "https", "udp"):
+            if not _result_is_closed(result[slot], _PROBE_CYCLE_KEYS):
+                return None
+            triple = _closed_code_slot(result[slot])
+            if triple is None:
+                return None
+            row["%s_status" % slot], row["%s_latency_ms" % slot], \
+                row["%s_error_code" % slot] = triple
+        if not _result_is_closed(result["egress"], _PROBE_EGRESS_KEYS):
+            return None
+        egress = _closed_code_slot(result["egress"])
+        if egress is None:
+            return None
+        status, latency, code = egress
+        row["egress_status"] = status
+        row["egress_latency_ms"] = latency
+        row["egress_error_code"] = code
+
+        raw_ip = result["egress"]["ip"]
+        if status == "ok":
+            if not isinstance(raw_ip, str):
+                return None
+            ip = _canonical_global_ip(raw_ip)
+            # canonical-form gate: stored text must be byte-identical to
+            # the canonical form (no leading zeros, no brackets, no
+            # case play, no non-global address).
+            if ip is None or ip != raw_ip:
+                return None
+        elif raw_ip is not None:
+            return None
+        else:
+            ip = None
+        row["egress_ip"] = ip
+
+        if egress_change not in PROBE_CHANGE_VALUES:
+            return None
+        if egress_change in ("unchanged", "changed"):
+            previous = self._last_persisted_egress_ip_locked()
+            if ip is None or previous is None:
+                return None
+            if (egress_change == "unchanged") != (previous == ip):
+                return None
+        row["egress_change"] = egress_change
+        return {column: row[column] for column in PROBE_COLUMNS}
+
+    def _probe_record_locked(self, result, egress_change, now):
+        row = self._probe_boundary_validate_locked(result, egress_change,
+                                                   now)
+        if row is None:
+            self._probe_rejected_total += 1
+            self._record_probe_failure(CODE_PROBE_RESULT_REJECTED)
+            return False
+        columns = ", ".join(PROBE_COLUMNS)
+        marks = ", ".join("?" for _ in PROBE_COLUMNS)
+        try:
+            self._conn.execute(
+                "INSERT INTO network_probe_samples (%s) VALUES (%s)"
+                % (columns, marks),
+                [row[c] for c in PROBE_COLUMNS])
+            self._conn.commit()
+        except (sqlite3.Error, OSError):
+            # a failed commit settles NOTHING (single statement in
+            # sqlite3 legacy mode auto-commits or rolls back whole)
+            self._rollback_quiet()
+            raise
+        self._probe_persisted_total += 1
+        # explicit recovery condition: a probe row that lands clears
+        # the probe plane (same discipline as a clean journal pass).
+        self._probe_degraded = False
+        self._probe_last_error_code = None
+        return True
+
+    def _record_probe_failure(self, code):
+        # Probe plane is INDEPENDENT: never touches _degraded /
+        # _last_error_code / _journal_*; only a later accepted probe row
+        # clears it. Pure field bookkeeping under the RLock.
+        with self._lock:
+            self._failure_count += 1
+            self._probe_degraded = True
+            self._probe_last_error_code = code
+
     # -- open / schema -----------------------------------------------------------
 
     def _open_locked(self):
@@ -633,6 +917,8 @@ class IncidentHistory:
         self._last_error_code = None
         self._journal_degraded = False
         self._journal_last_error_code = None
+        self._probe_degraded = False
+        self._probe_last_error_code = None
         # startup cleanup: retention first, before any new row is added
         self._cleanup("startup")
         self._last_cleanup_ts = self._clock()
@@ -674,19 +960,24 @@ class IncidentHistory:
     def _enforce_schema(self, conn, pre_existing):
         """STRICT schema gate -- the whole DB is opened read-only-first.
 
-        Accepted shapes are exactly three: a genuinely fresh database
+        Accepted shapes are exactly four: a genuinely fresh database
         (absent or zero-byte file, no tables) which is created at the
         current version, an existing database that DECLARES the current
-        schema_version and whose tables are EXACTLY the seven v2 tables,
-        and an existing database that declares v1 and whose tables are
-        EXACTLY the three v1 tables -- migrated forward to v2 in ONE
-        transaction with zero v1 rows touched. Any extra unrelated table
-        (under either declaration), any newer, zero, negative,
-        malformed or meta-less claim, a stripped or hybrid shape -- all
-        are refused with CODE_SCHEMA_UNSUPPORTED before any
-        pragma, DDL or write can touch the file. In particular no lower
-        version is ever silently rewritten: migration is the explicit
-        v1->v2 path below and nothing else.
+        schema_version and whose tables are EXACTLY the eight v3 tables,
+        an existing database that declares v2 whose tables are EXACTLY
+        the seven v2 tables (migrated FORWARD to v3 in ONE transaction,
+        zero v2 rows touched), and an existing database that declares v1
+        whose tables are EXACTLY the three v1 tables (migrated FORWARD
+        all the way to v3 in ONE transaction, zero v1 rows touched).
+        Any extra unrelated table (under any declaration), any newer,
+        zero, negative, malformed or meta-less claim, a stripped or
+        hybrid shape -- all are refused with CODE_SCHEMA_UNSUPPORTED
+        before any pragma, DDL or write can touch the file. In
+        particular no lower version is ever silently rewritten:
+        migration is the explicit v1->v3 / v2->v3 path below and nothing
+        else -- and a v3 file opened by a PRE-v3 build is refused by the
+        SAME gate, which is the runtime half of the rollback
+        compatibility contract.
         """
         conn.execute("PRAGMA busy_timeout=%d" % BUSY_TIMEOUT_MS)
         tables = {row[0] for row in conn.execute(
@@ -710,9 +1001,9 @@ class IncidentHistory:
             raise _HistoryError(CODE_SCHEMA_UNSUPPORTED)
         version = int(raw)
         if version == SCHEMA_VERSION:
-            if tables != _ALLOWED_V2_SHAPE:
-                # meta CLAIMS v2 but the shape is not EXACTLY the seven
-                # v2 tables -- stripped, hybrid, or carrying an unrelated
+            if tables != _ALLOWED_V3_SHAPE:
+                # meta CLAIMS v3 but the shape is not EXACTLY the eight
+                # v3 tables -- stripped, hybrid, or carrying an unrelated
                 # extra table this module never created: unknown shape,
                 # refuse rather than adopt
                 raise _HistoryError(CODE_SCHEMA_UNSUPPORTED)
@@ -723,6 +1014,14 @@ class IncidentHistory:
                 # unknown shape too -- never a repair
                 raise _HistoryError(CODE_SCHEMA_UNSUPPORTED)
             return
+        if version == 2:
+            # EXACT v2 only: the seven v2 tables -- no probe table yet
+            # (hybrid) and no unrelated extra table either.
+            if tables != _ALLOWED_V2_SHAPE:
+                raise _HistoryError(CODE_SCHEMA_UNSUPPORTED)
+            self._apply_pragmas(conn)
+            self._migrate_v2_to_v3(conn)
+            return
         if version == 1:
             # EXACT v1 only: precisely the three v1 tables -- no journal
             # tables (hybrid) and no unrelated extra table either (a
@@ -731,7 +1030,7 @@ class IncidentHistory:
             if tables != _ALLOWED_V1_SHAPE:
                 raise _HistoryError(CODE_SCHEMA_UNSUPPORTED)
             self._apply_pragmas(conn)
-            self._migrate_v1_to_v2(conn)
+            self._migrate_v1_to_v3(conn)
             return
         # NEWER, ZERO, NEGATIVE or otherwise unknown declared version:
         # refuse; an explicit forward-only migration is the ONLY way a
@@ -749,7 +1048,7 @@ class IncidentHistory:
             conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
 
     def _create_schema(self, conn):
-        """Fresh database: the full v2 shape in ONE explicit
+        """Fresh database: the full v3 shape in ONE explicit
         transaction (DDL auto-commits under sqlite3 legacy mode, so an
         unbounded CREATE chain could otherwise strand a half-created
         file that no later gate would adopt)."""
@@ -760,6 +1059,7 @@ class IncidentHistory:
             self._create_v1_tables(conn)
             self._create_journal_tables(conn)
             self._create_journal_state_row(conn, now)
+            self._create_probe_table(conn)
             conn.commit()
         except BaseException:
             try:
@@ -907,19 +1207,136 @@ class IncidentHistory:
             " last_consumed_seq, gaps_total, rejected_total,"
             " updated_epoch) VALUES (1, 0, NULL, 0, 0, ?)", (now,))
 
-    def _migrate_v1_to_v2(self, conn):
-        """The ONE forward migration: journal tables + state row + the
-        schema_version flip in a SINGLE explicit transaction (the DDL is
-        bound into it by the leading BEGIN -- under sqlite3 legacy mode
-        a bare CREATE would auto-commit and strand a half-migrated
-        hybrid that no later shape gate adopts). Zero v1 rows are read,
-        moved or rewritten; any mid-migration failure rolls the whole
-        thing back, leaving an untouched exact-v1 database, so startup
-        after a crash simply re-runs the migration."""
+    @classmethod
+    def _create_probe_table(cls, conn):
+        """v3 network probe table: the closed CHECKs mirror the PR-3A
+        engine contract (status/error_code vocabulary, ok-iff-NONE,
+        latency only with ok, egress ip = canonical GLOBAL literal or
+        NULL, cycle_id = exact lowercase 32-hex or NULL), so free text,
+        a resolved address or a credential CANNOT be stored even by a
+        buggy caller -- the same deny-by-default column discipline as
+        the v2 journal tables. ONE table only: the per-slot columns are
+        the closed result, not rows.
+
+        SQLite grammar: every table-level CHECK must come AFTER all
+        column definitions, so the cross-field invariants are collected
+        separately and appended last."""
+        columns = [
+            " epoch REAL NOT NULL",
+            " iso_utc TEXT NOT NULL",
+            " run_id TEXT NOT NULL",
+            " cycle_id TEXT CHECK (cycle_id IS NULL OR (length(cycle_id)"
+            " = 32 AND cycle_id NOT GLOB '*[^0-9a-f]*'))",
+            " result_version INTEGER NOT NULL CHECK (result_version = 1)",
+        ]
+        checks = []
+        for slot in ("dns", "https", "udp"):
+            columns.extend(cls._probe_slot_columns(slot))
+            checks.append(cls._probe_slot_check(slot))
+        columns.extend([
+            " egress_status TEXT NOT NULL CHECK (egress_status IN (%s))"
+            % cls._in_list(PROBE_STATUSES),
+            " egress_latency_ms INTEGER",
+            " egress_error_code TEXT NOT NULL"
+            " CHECK (egress_error_code IN (%s))"
+            % cls._in_list(PROBE_ERROR_CODES),
+            # the ONLY string an accepted result may carry besides the
+            # vocabulary: a canonical GLOBAL IP literal. The two GLOBs
+            # are the same negated-character-class shape the v2 journal
+            # fp CHECK uses ('*[^…]*' matches only when at least one
+            # character is OUTSIDE the class; '[!…]' would mean the
+            # opposite and reject every legal address). Comma-free by
+            # construction: IPv6 canonical always carries ':'.
+            " egress_ip TEXT",
+            " egress_change TEXT NOT NULL"
+            " CHECK (egress_change IN (%s))"
+            % cls._in_list(PROBE_CHANGE_VALUES),
+        ])
+        checks.extend([
+            " CHECK ((egress_status = 'ok' AND egress_error_code = 'NONE'"
+            " AND egress_latency_ms IS NOT NULL AND egress_latency_ms >="
+            " 0 AND egress_latency_ms <= %d)"
+            " OR (egress_status = 'failed' AND egress_error_code <> 'NONE'"
+            " AND egress_latency_ms IS NULL))" % PROBE_LATENCY_MAX_MS,
+            " CHECK (egress_ip IS NULL OR ((egress_ip NOT GLOB '*,*')"
+            " AND (egress_ip NOT GLOB '*[^0-9a-fA-F.:]*')))",
+            " CHECK (egress_change <> 'changed' OR"
+            " (egress_status = 'ok' AND egress_ip IS NOT NULL))",
+            " CHECK (egress_change <> 'unchanged' OR"
+            " (egress_status = 'ok' AND egress_ip IS NOT NULL))",
+            # an ADDRESS IS ANSWERED ONLY BY A SUCCESSFUL EGRESS: a
+            # failed lookup can never carry one, so a stored public IP
+            # always names a probe that actually succeeded.
+            " CHECK (egress_status <> 'failed' OR egress_ip IS NULL)",
+        ])
+        conn.execute("CREATE TABLE network_probe_samples (%s,%s)"
+                     % (",".join(columns), ",".join(checks)))
+        conn.execute(
+            "CREATE INDEX idx_probe_samples_epoch"
+            " ON network_probe_samples(epoch)")
+        conn.execute(
+            "CREATE INDEX idx_probe_samples_egress"
+            " ON network_probe_samples(egress_status, epoch)")
+
+    @classmethod
+    def _probe_slot_columns(cls, slot):
+        """The three column definitions of one timed slot; the closed
+        cross-field invariant is a table-level CHECK (see
+        ``_probe_slot_check``)."""
+        return [
+            " %s_status TEXT NOT NULL CHECK (%s_status IN (%s))"
+            % (slot, slot, cls._in_list(PROBE_STATUSES)),
+            " %s_latency_ms INTEGER" % slot,
+            " %s_error_code TEXT NOT NULL"
+            " CHECK (%s_error_code IN (%s))"
+            % (slot, slot, cls._in_list(PROBE_ERROR_CODES)),
+        ]
+
+    @classmethod
+    def _probe_slot_check(cls, slot):
+        return (
+            " CHECK ((%s_status = 'ok' AND %s_error_code = 'NONE'"
+            " AND %s_latency_ms IS NOT NULL AND %s_latency_ms >="
+            " 0 AND %s_latency_ms <= %d)"
+            " OR (%s_status = 'failed' AND %s_error_code <> 'NONE'"
+            " AND %s_latency_ms IS NULL))"
+            % (slot, slot, slot, slot, slot, PROBE_LATENCY_MAX_MS, slot,
+               slot, slot))
+
+    def _migrate_v1_to_v3(self, conn):
+        """The v1 source jumps to v3 in ONE explicit transaction:
+        journal tables + probe table + state row + the schema_version
+        flip. Zero v1 rows are read, moved or rewritten; any
+        mid-migration failure rolls the whole thing back, leaving an
+        untouched exact-v1 database, so startup after a crash simply
+        re-runs the migration. (v1 was never meant to stop at v2: the
+        intermediate v2-only migration of the 0.3.x line is subsumed
+        here -- the end shape is identical to a v2->v3 walk.)"""
         try:
             conn.execute("BEGIN")
             self._create_journal_tables(conn)
             self._create_journal_state_row(conn, self._clock())
+            self._create_probe_table(conn)
+            conn.execute("UPDATE meta SET value = ?"
+                         " WHERE key = 'schema_version'",
+                         (str(SCHEMA_VERSION),))
+            conn.commit()
+        except BaseException:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            raise
+
+    def _migrate_v2_to_v3(self, conn):
+        """The v2 source adds EXACTLY the one v3 table and flips the
+        version in a SINGLE explicit transaction -- zero v2 rows
+        touched, no journal-shape rewrite, forward-only. A crash
+        anywhere before the commit rolls back whole and the untouched
+        exact-v2 file re-migrates on the next open."""
+        try:
+            conn.execute("BEGIN")
+            self._create_probe_table(conn)
             conn.execute("UPDATE meta SET value = ?"
                          " WHERE key = 'schema_version'",
                          (str(SCHEMA_VERSION),))
@@ -1328,6 +1745,12 @@ class IncidentHistory:
             self._conn.execute(
                 "DELETE FROM device_protocol_states WHERE epoch < ?",
                 (horizon,))
+            # v3 probe rows age out on the SAME horizon and ride the
+            # same global size-prune order: the probe table can never
+            # grow unbounded past the retention budget.
+            self._conn.execute(
+                "DELETE FROM network_probe_samples WHERE epoch < ?",
+                (horizon,))
             # v2 journal rows join the SAME accounting: runs age out by
             # their ingest epoch and their events ride the FK cascade --
             # the new tables can never grow unbounded past the horizon.
@@ -1472,3 +1895,62 @@ class _HistoryError(Exception):
 def _project_rows(row, columns):
     values = dict(zip(columns, tuple(row)))
     return {column: values.get(column) for column in columns}
+
+
+# -- probe boundary helpers (module-level, pure, closed) -----------------------
+
+_PROBE_CYCLE_KEYS = frozenset({"status", "latency_ms", "error_code"})
+_PROBE_EGRESS_KEYS = _PROBE_CYCLE_KEYS | {"ip"}
+_PROBE_RESULT_KEYS = frozenset({"v", "epoch", "cycle_id", "dns", "https",
+                                "udp", "egress"})
+_CYCLE_ID_RE = re.compile(r"\A[0-9a-f]{32}\Z")
+# The engine's cycle wall-clock budget (12 s) plus scheduling slack: the
+# largest producer->store skew a legitimate cycle can show.
+PROBE_CYCLE_FRESHNESS_SECONDS = 30.0
+
+
+def _canonical_global_ip(value):
+    """Mirror of the engine's ``_canonical_ip`` gate: canonical form of
+    a PUBLIC (global) IP literal, else None. The v3 boundary and the
+    durable baseline read both pass through this ONE function, so a
+    loopback/private/reserved/document address can never be persisted
+    or inform a change judgement even if the engine above were buggy
+    (defense in depth; the probe suite asserts this text-equals the
+    engine's gate)."""
+    if not isinstance(value, str):
+        return None
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return None
+    if not address.is_global:
+        return None
+    return str(address)
+
+
+def _result_is_closed(value, keys):
+    """Strict dict of EXACTLY ``keys`` (no subclass, no extra/missing
+    key, no hostile __getitem__ surface -- dict type is exact)."""
+    return (type(value) is dict
+            and frozenset(value.keys()) == frozenset(keys))
+
+
+def _closed_code_slot(raw):
+    """Map one result slot to its closed (status, latency, code) triple
+    or reject it. The transition matrix is the engine's own invariant:
+    ok <=> NONE, latency only on the ok path, integral and bounded."""
+    code = raw["error_code"]
+    status = raw["status"]
+    latency = raw["latency_ms"]
+    if code not in PROBE_ERROR_CODES or status not in PROBE_STATUSES:
+        return None
+    if status == "ok":
+        if code != "NONE":
+            return None
+        if latency is None or latency != _as_int(latency) \
+                or not 0 <= latency <= PROBE_LATENCY_MAX_MS:
+            return None
+    else:
+        if code == "NONE" or latency is not None:
+            return None
+    return status, latency, code
