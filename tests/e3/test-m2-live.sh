@@ -191,10 +191,16 @@ pass 'privileged helper installed and socket-activated'
 
 # monitor fixture app: a real copy of the monitor-v2 tree, configured by the
 # REAL webapp.py setup path, running under the REAL hardened unit template.
+# PR-3B: webapp.py imports the probe scheduler, so the copy must carry the
+# whole boot-critical runtime payload -- exactly what sbmon_stage_release puts
+# in a release. Probing stays DARK here: this unit never sets
+# SINGBOX_MONITOR_PROBE_TARGETS_FILE, so the scheduler starts zero threads.
 cp "$ROOT"/monitor-v2/*.py "$APP"/ 2>/dev/null
 cp -r "$ROOT/monitor-v2/web" "$APP"/web
 cp -r "$ROOT/monitor-v2/api_bridge" "$APP"/api_bridge
-rm -rf "$APP/web/__pycache__" "$APP"/__pycache__        "$APP/api_bridge/__pycache__" 2>/dev/null
+cp -r "$ROOT/monitor-v2/diagnostics" "$APP"/diagnostics
+rm -rf "$APP/web/__pycache__" "$APP"/__pycache__        "$APP/api_bridge/__pycache__" \
+    "$APP/diagnostics/__pycache__" 2>/dev/null
 chown -R "$AXE_USER":"$AXE_USER" "$APP" "$MDATA"
 chmod 0700 "$MDATA"
 mkdir -p /etc/sboxcm-m2
