@@ -116,9 +116,17 @@ def group_boundary():
     out = {}
     t = [NOW]
     h = tmp_history("boundary", clock=lambda: t[0])
-    out["harness_dir_mode_600"] = (
-        stat.S_IMODE(os.stat(os.path.join(h._tmpdir, "diagnostics")).st_mode)
-        == 0o600) or os.name != "posix"
+    # A fail-closed boundary is only proved if the harness' own evidence is as
+    # private as the boundary demands: directory 0700 (a dir needs +x to be
+    # traversable; 0600 would make the store unreadable by its own owner
+    # session), DB file 0600. Measured on the platform where modes are real --
+    # the same rule the production validator applies, so a fixture that
+    # smuggled in a wider tree cannot pass this gate either.
+    out["harness_private_evidence_modes"] = (
+        (stat.S_IMODE(os.stat(os.path.join(h._tmpdir, "diagnostics")).st_mode)
+         == 0o700
+         and stat.S_IMODE(os.stat(db_path(h)).st_mode) == 0o600)
+        or os.name != "posix")
     out["health_enabled"] = h.health()["enabled"] is True
 
     r, c = good()
