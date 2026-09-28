@@ -219,6 +219,16 @@ staging 载荷；I4 改为"一步落到 3"并追加结构断言（v3 探测表�
 发布树离线重放取证：`schema_version 3`、health enabled/degraded false、v1 行
 逐字节保留、7 张既有表 + `network_probe_samples` 齐备。
 
+**第二轮 CI 红（一条，同样 Linux-only）与最终取证**：`boundary/harness_dir_mode_600`
+在真实平台上永不可过——它把 diagnostics **目录**断成 0600，而生产校验器的规则
+是目录 0700、DB 文件 0600（目录缺 `+x` 连自身属主都无法进入）。该门会开火正是
+它具备判别力的证据；改名为 `harness_private_evidence_modes` 并在一次测量里同时
+证明两半，门数不变（254）。头 `b567e4e` 首试 10/10 全绿，Linux 实测：
+hist 240/0、jr 371/0、jr-deploy 464/0/0-SKIP、p2b 集成 132/0/0-SKIP、
+probes 138/0、probe-ingest 254/0；packaging fixture 631/0、root 646/0；
+三条基线（22.04/24.04/26.04）的 `E3_M1_SYSTEMD`、`E3_M2_LIVE`、`E3_M3_DEPLOY`、
+`E3_M3C_PHASE2_LIVE`、`E3_M3C_PHASE3_LIVE` 全 PASS。
+
 ## 11. 明确偏差
 
 1. P3A §2 曾把"`diagnostics/` 进入 staging 清单"推迟到 release-prep
