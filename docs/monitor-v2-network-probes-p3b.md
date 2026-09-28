@@ -302,6 +302,16 @@ probes 138/0、probe-ingest 254/0；packaging fixture 631/0、root 646/0；
 三条基线（22.04/24.04/26.04）的 `E3_M1_SYSTEMD`、`E3_M2_LIVE`、`E3_M3_DEPLOY`、
 `E3_M3C_PHASE2_LIVE`、`E3_M3C_PHASE3_LIVE` 全 PASS。
 
+**R1 轮的 Linux 实测**：功能评审 R1（B1–B6）头 `9e250ea` 首试 10/10 全绿，
+Linux 数字与 dev 主机同批一致且**没有任何门因平台差异而 SKIP 掉**：
+probe-ingest 288/0（新硬门数，见 §14）、probes 138/0、hist 240/0、jr 371/0、
+jr-deploy 464/0/0-SKIP、p2b 集成 132/0/0-SKIP；packaging fixture 631/0
+（T27 的 v3→pre-v3 回滚拒绝门在真实平台执行）、root 646/0；三条基线的
+`E3_M1_SYSTEMD`、`E3_M2_LIVE`、`E3_M3_DEPLOY`、`E3_M3C_PHASE2_LIVE`、
+`E3_M3C_PHASE3_LIVE` 全 PASS，其中两条自建 monitor 源树的实机车道在本轮
+携带了 `B4` 新增的第 6 条 `sed`（渲染 `@SBMON_PROBE_TARGETS_FILE@`），
+证明打包 opt-in 路径在真实 `systemd` 单元里也成立。
+
 ## 11. 明确偏差
 
 1. P3A §2 曾把"`diagnostics/` 进入 staging 清单"推迟到 release-prep
