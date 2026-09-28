@@ -5,12 +5,15 @@
 # closed output contract with TRUE discriminators (anti-false-positive UDP
 # round trip bound to the configured peer AND the exact question, TLS
 # verification that cannot be off, proxy-env bypass, sentinel privacy,
-# absolute per-worker deadlines that reject every late outcome, one
-# outstanding worker per slot so hung workers cannot accumulate, and an
-# entry point that sanitizes cycle_id/clock/targets and never raises),
-# and (b) that NO production surface calls the module: repo-wide reference
-# scan, the release staging manifest, the systemd units, the app-bin
-# entrypoints and VERSION all stay byte-identical to the dark contract.
+# absolute per-worker deadlines that reject every late outcome, ONE
+# outstanding worker per slot with reservation+start atomic under the
+# same lock (concurrent cycles cannot double-claim), hung workers cannot
+# accumulate, an entry point that never raises, caller cycle_ids admitted
+# ONLY as exact lowercase 32-hex, and egress.ip global-only end-to-end
+# with no relaxation knob), and (b) that NO production surface calls the
+# module: repo-wide reference scan, the release staging manifest, the
+# systemd units, the app-bin entrypoints and VERSION all stay
+# byte-identical to the dark contract.
 #
 # Every fake server binds 127.0.0.1 only: zero public network dependency,
 # so this lane runs identically on any runner. The TCP-refusal
@@ -28,7 +31,7 @@ export PROBE_TEST_KEY="$HERE/monitor-probes/tls-test-key.pem"
 
 PASS=0
 FAIL=0
-EXPECTED_PASS=113
+EXPECTED_PASS=126
 
 pass() { PASS=$((PASS + 1)); printf '  PASS %s\n' "$*"; }
 fail() { FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "$*"; }

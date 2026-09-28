@@ -310,8 +310,9 @@ def main():
     report("A13 non-str cycle_id replaced, no raise",
            is_hex32(r["cycle_id"]))
     r = cycle(np.ProbeTargets(), total=2.0, cycle_id="run-2026.09_a:X-2")
-    report("A14 grammar-safe cycle_id kept verbatim",
-           r["cycle_id"] == "run-2026.09_a:X-2")
+    report("A14 old-grammar safe id is NOW replaced (only 32-hex survives)",
+           is_hex32(r["cycle_id"]) and r["cycle_id"] != "run-2026.09_a:X-2",
+           r["cycle_id"])
 
     def mad_clock():
         raise ValueError("%s %s" % (SENT_UUID, SENT_PASS))
@@ -332,6 +333,23 @@ def main():
         leaks = leaks or not leak_free(rr)
     report("A16 junk clock values coerced to finite epoch, no leak",
            epochs_ok and not leaks)
+    # R2-A5: the ONLY surviving caller id is exact lowercase 32-hex --
+    # uppercase and near-miss lengths are engine ids in shape but not in
+    # grammar and must be replaced.
+    r = cycle(np.ProbeTargets(), total=2.0, cycle_id=cid.upper())
+    report("A17 UPPERCASE 32-hex id replaced, not echoed",
+           is_hex32(r["cycle_id"]) and r["cycle_id"] != cid.upper(),
+           r["cycle_id"])
+    near_miss = ("a" * 31, "a" * 33, "abc" * 11, "0" * 32 + "g")
+    all_replaced = True
+    for nm in near_miss:
+        rr = cycle(np.ProbeTargets(), total=2.0, cycle_id=nm)
+        if rr["cycle_id"] == nm or not is_hex32(rr["cycle_id"]):
+            all_replaced = False
+    keep = cycle(np.ProbeTargets(), total=2.0, cycle_id="f" * 32)
+    report("A18 wrong-length/non-hex replaced; exact lowercase 32-hex kept",
+           all_replaced and keep["cycle_id"] == "f" * 32,
+           keep["cycle_id"])
 
     # ---------------- group B: DNS ----------------------------------------
     fake_answers = [(2, 1, 6, "", (SENT_PRIV, 443))]
@@ -528,11 +546,11 @@ def main():
     report("E6 non-UTF8 body -> parse_failed",
            r["egress"]["error_code"] == "parse_failed", r["egress"])
     r = cycle(np.ProbeTargets(egress=egress_spec(p_priv)), total=6.0)
-    report("E7 loopback answer refused by require_global",
+    report("E7 loopback answer refused unconditionally",
            r["egress"]["error_code"] == "parse_failed"
            and r["egress"]["ip"] is None, r["egress"])
     r = cycle(np.ProbeTargets(egress=egress_spec(p_rfc)), total=6.0)
-    report("E8 private answer refused by require_global",
+    report("E8 private answer refused unconditionally",
            r["egress"]["error_code"] == "parse_failed", r["egress"])
     r = cycle(np.ProbeTargets(egress=egress_spec(p_404)), total=6.0)
     report("E9 bad status -> bad_response",
@@ -551,23 +569,46 @@ def main():
         p_ip, allowed_statuses=frozenset({204}))), total=6.0)
     report("E12 contract mismatch is bad_response not parse_failed",
            r["egress"]["error_code"] == "bad_response", r["egress"])
+    # R2-A7: the escape hatch itself must be GONE -- a caller can no
+    # longer ask the engine to accept a non-global answer.
+    hatch_rejected = False
+    try:
+        np.EgressProbeSpec(host="127.0.0.1", port=1, require_global=False)
+    except TypeError:
+        hatch_rejected = True
+    report("E13 require_global escape hatch REMOVED (kwarg rejected)",
+           hatch_rejected)
+    non_global_ok = True
+    for local in ("127.0.0.2", "10.11.12.13", "192.168.1.1", "100.64.0.1",
+                  "fc00::1", "2001:db8::1", "::1"):
+        if np._parse_egress_answer(local.encode())[1] != "parse_failed":
+            non_global_ok = False
+    report("E14 every non-global class rejected at the parse gate",
+           non_global_ok)
 
     # ---------------- group F: egress-change pure judgement ----------------
+    # R2-A7: NON-GLOBAL samples are unknown-terrors on BOTH sides --
+    # private/doc-range/loopback/shared addresses can never produce a
+    # changed/unchanged verdict, however well-formed they look.
     F = (("8.8.8.8", "8.8.4.4", "changed"),
          ("8.8.8.8", "8.8.8.8", "unchanged"),
-         ("2001:db8::1", "2001:DB8:0:0:0:0:0:1", "unchanged"),
+         ("2606:4700:4700::64", "2606:4700:4700:0:0:0:0:64", "unchanged"),
          (None, "8.8.8.8", "unknown"),
          ("8.8.8.8", None, "unknown"),
          (None, None, "unknown"),
          ("garbage", "8.8.8.8", "unknown"),
          ("8.8.8.8", "garbage", "unknown"),
          ("", "", "unknown"),
-         ("10.11.12.13", "10.11.12.14", "changed"))
+         ("10.11.12.13", "10.11.12.14", "unknown"),
+         ("8.8.8.8", "10.0.0.1", "unknown"),
+         ("127.0.0.1", "127.0.0.2", "unknown"),
+         ("100.64.0.1", "100.64.0.2", "unknown"),
+         ("2001:db8::1", "2001:db8::2", "unknown"))
     for i, (a, b, want) in enumerate(F):
         report("F%d classify(%s,%s)=%s" % (i + 1, a or "None", b or "None",
                                            want),
                np.classify_egress_change(a, b) == want)
-    report("F11 pure: repeated calls stable",
+    report("F15 pure: repeated calls stable",
            np.classify_egress_change("8.8.8.8", "8.8.4.4") == "changed")
 
     # ---------------- group G: privacy sentinels ----------------------------
@@ -673,6 +714,18 @@ def main():
            r["https"]["error_code"] == "timeout"
            and r["dns"]["status"] == "ok" and wall < 3.5, (r["https"],
                                                            r["dns"], wall))
+    # R2-A7 defence-in-depth: even a hypothetically buggy worker that
+    # hands the normalize gate a NON-GLOBAL "ok" ip is overwritten --
+    # the gate re-enforces globality, it does not trust the parse path.
+    n = np._normalize_egress({"status": "ok", "latency_ms": 5,
+                              "error_code": "NONE", "ip": "10.11.12.13"})
+    report("H12 ok egress with private ip degrades at the final gate",
+           n["status"] == "failed" and n["error_code"] == "parse_failed"
+           and n["ip"] is None, n)
+    n = np._normalize_egress({"status": "ok", "latency_ms": 5,
+                              "error_code": "NONE", "ip": "8.8.8.8"})
+    report("H13 ok egress with global ip survives the final gate",
+           n["status"] == "ok" and n["ip"] == "8.8.8.8", n)
 
     # ---------------- group I: no cross-cycle worker accumulation (R1-A4) --
     hang_gate = threading.Event()
@@ -711,6 +764,64 @@ def main():
     report("I5 slot recovers for later cycles once the worker dies",
            freed and r["dns"]["status"] == "ok",
            (freed, r["dns"]))
+
+    # ---------------- group J: concurrent cycles cannot double-claim (R2-A6)
+    # Reservation AND start must be ONE atomic critical section: with the
+    # old check-under-lock / start-outside-lock split, a concurrent
+    # cycle could observe the registered-but-NOT-YET-STARTED thread
+    # (is_alive() False) and claim the same slot a second time. A
+    # start-delaying Thread subclass widens that window into a CERTAIN
+    # trip, so this discriminator is deterministic, not luck-based.
+    real_thread_cls = threading.Thread
+    j_hang = threading.Event()
+
+    class SlowStartThread(real_thread_cls):
+        def start(self, *a, **k):
+            time.sleep(0.5)
+            real_thread_cls.start(self, *a, **k)
+
+    def forever_j(*a, **k):
+        j_hang.wait(30.0)
+        return fake_answers
+
+    j_targets = np.ProbeTargets(dns=np.DnsProbeSpec(
+        hostname="probe.invalid", timeout_seconds=0.4, resolver=forever_j))
+    j_results = []
+    j_barrier = threading.Barrier(2)
+
+    def contender():
+        j_barrier.wait(10.0)
+        try:
+            j_results.append(np.run_probe_cycle(
+                j_targets, total_deadline_seconds=4.0))
+        except Exception as exc:  # noqa: BLE001 -- reported, never swallowed
+            j_results.append({"dns": {"error_code": "CRASH:%s" % exc}})
+
+    np.threading.Thread = SlowStartThread
+    try:
+        base_j = worker_threads("probe-dns")
+        racers = [real_thread_cls(target=contender) for _ in range(2)]
+        for racer in racers:
+            racer.start()
+        for racer in racers:
+            racer.join(20.0)
+        codes = sorted(res["dns"]["error_code"] for res in j_results)
+        report("J1 concurrent cycles: outcomes are exactly "
+               "timeout + unavailable (never two probes, never a crash)",
+               len(j_results) == 2 and codes == ["timeout", "unavailable"],
+               codes)
+        report("J2 concurrent cycles: exactly ONE worker was spawned",
+               worker_threads("probe-dns") - base_j == 1,
+               (base_j, worker_threads("probe-dns")))
+    finally:
+        np.threading.Thread = real_thread_cls
+        j_hang.set()
+    report("J3 slot releases and works again after the concurrent storm",
+           drain("dns", budget=35.0)
+           and cycle(np.ProbeTargets(dns=np.DnsProbeSpec(
+               hostname="probe.invalid", timeout_seconds=1.0,
+               resolver=lambda *a, **k: fake_answers)),
+               total=4.0)["dns"]["status"] == "ok")
 
 
 if __name__ == "__main__":

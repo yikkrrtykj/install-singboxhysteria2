@@ -15,7 +15,7 @@
   `diagnostics` 零 import；`sbmon_stage_release` 清单不含该包 —— 不可变
   release 树在物理上不可能携带它；unit 模板零改动；`webapp.py`/`broker.py`/
   `server.py` 字节不变；默认空配置下引擎零外联。
-- 测试：`tests/test-monitor-v2-probes.sh`（硬计数门 `EXPECTED_PASS=113`）+
+- 测试：`tests/test-monitor-v2-probes.sh`（硬计数门 `EXPECTED_PASS=126`）+
   测试夹具 `tests/monitor-probes/`（一次性自签 TLS 证书，SAN
   localhost/127.0.0.1，仅测试用途）。全部 fake server 绑 loopback，CI 零
   公网依赖。
@@ -64,15 +64,17 @@ PR-3A 填补的正是后半句，且只以库的形态存在。
   开始一刻即固定为 `cycle 起点 + min(spec timeout, cycle 总 deadline)`，
   晚于它的任何 outcome（无论 ok 还是 failed）一律按完成时间戳拒收并判
   `timeout`（§9）。
-* 每个 slot 全引擎**至多一个在飞 worker**：上一 cycle 的挂死 worker 尚未
-  退出时，后续 cycle 不再为它叠加线程，而是把该槽位直接判
-  `unavailable`（零 I/O、零线程）直至旧 worker 死去（§9）。
+* 每个 slot 全引擎**至多一个在飞 worker**：占用登记与线程启动在同一条
+  锁内**原子**完成（未启动的线程 `is_alive()` 为 False，check 与 start
+  若分置于锁两侧，并发 cycle 就能双双认领同一槽位）；上一 cycle 的挂死
+  worker 尚未退出时，后续 cycle 不再为它叠加线程，而是把该槽位直接判
+  `unavailable`（零 I/O、零线程）直至旧 worker 死去（§9，R2-A6 判别组 J）。
 * 任何 probe 的任何异常都不抛给未来的 publisher 主循环：公共入口
   `run_probe_cycle` 永不 raise —— `targets` 经精确类型门（非审核类即
-  dark）、`cycle_id` 经严格语法门（调用方自由文本只会被引擎 id 替换、
-  绝不过夜回显）、`clock` 被强制为有限非负 float（异常则回退引擎自有时
-  钟），最外层还有一条对一切 `Exception` 的最终兜底，兜底路径同样只产
-  出闭合词汇。
+  dark）、`cycle_id` 只接受**精确的小写 32-hex**（与引擎自产 id 同形；
+  其余一切调用方值只会被引擎 id 替换、绝不过夜回显，R2-A5）、`clock`
+  被强制为有限非负 float（异常则回退引擎自有时钟），最外层还有一条对
+  一切 `Exception` 的最终兜底，兜底路径同样只产出闭合词汇。
 * 结果对象**闭合**：顶层恰为 `v/epoch/cycle_id/dns/https/udp/egress` 六键；
   每个 probe 恰为 `status/latency_ms/error_code`（egress 另恰有一个 `ip`）。
   不允许任何自由文本：exception text、响应正文、hostname 回显、socket 地址、
@@ -110,13 +112,15 @@ PR-3A 填补的正是后半句，且只以库的形态存在。
   `protocol_failed` = 报文根本不成立（畸形/不匹配）；`parse_failed` =
   成立但内容不可规范化（egress 正文非 IP）。
 * `egress.ip` 仅当 `status=="ok"` 时为非 null 字符串，且必为
-  `ipaddress.ip_address()` 能解析的 **canonical** 形式；failed 时恒 null。
-* `cycle_id`：32 位 hex（uuid4，非机密）。调用方可注入 id，但只有匹配
-  严格语法 `[A-Za-z0-9][A-Za-z0-9._:-]{0,63}` 的字符串才原样存活；其余
-  一切（None、自由文本、超长、非字符串）都被**替换**为引擎生成的 hex id
-  —— 调用方文本永不越过结果边界（R1-A1 判别组）。`epoch`：cycle 完成时
-  刻的 float 秒，由注入 clock 强制消毒（抛错/非数值/NaN/inf/负数 → 回
-  退引擎 `time.time()`）；`v`：schema 版本整数 1。
+  `ipaddress.ip_address()` 能解析的 **canonical 公网（global）** 形式，
+  环回/私有/保留/文档段一律无条件拒收（parse 门与最终 normalize 门双重
+  强制，spec 上不存在放宽旋钮，R2-A7）；failed 时恒 null。
+* `cycle_id`：32 位 hex（uuid4，非机密）。调用方可注入 id，但只有
+  **精确匹配 `^[0-9a-f]{32}$`**（引擎自产 id 的形状）的字符串才原样存活；
+  大写、错长度、含非 hex 字符、自由文本、非字符串都被**替换**为引擎生成
+  的 hex id —— 调用方文本永不越过结果边界（R1-A1/R2-A5 判别组）。
+  `epoch`：cycle 完成时刻的 float 秒，由注入 clock 强制消毒（抛错/非数值/
+  NaN/inf/负数 → 回退引擎 `time.time()`）；`v`：schema 版本整数 1。
 * 结果由构造器一次性组装：先填全量默认（failed/`unavailable`/null），
   每个 probe 至多替换自己槽位一次，替换值先过闭合校验 —— 撕裂结果
   （半结构 + 异常字符串）在类型上不可能出现。
@@ -208,10 +212,14 @@ HTTPSConnection`，stdlib）。它只是**原始 evidence**：单个 endpoint �
 
 `EgressProbeSpec`：GET（同样 direct egress、TLS 校验不可关）一个
 text/ip-echo 型 endpoint；响应正文上限 `max_body_bytes`（默认 64）；
-strip 后必须被 `ipaddress.ip_address()` 完全解析，默认 `require_global=True`
-（拒绝 loopback/私有/保留地址 —— 防"连接级地址借机入库"；测试 fake 服务
-经显式 `require_global=False` 注入）。输出仅 canonical IP 字符串。
-超限 → `bad_response`；非 IP → `parse_failed`；其余映射同 §6。
+strip 后必须被 `ipaddress.ip_address()` 完全解析且必须是 **global**
+地址（R2-A7：拒绝 loopback/私有/保留/文档段，防"连接级地址借机入库"）。
+**global 是无条件合同而非开关** —— spec 上不存在 `require_global` 这类
+放宽旋钮（传入未知 kwarg 直接 `TypeError`），且 parse 门与最终 normalize
+门双重强制（即使假想的缺陷 worker 交出 private ok ip 也会被降级），
+`classify_egress_change` 同样把任何非 global 输入判 `unknown`。输出仅
+canonical IP 字符串。超限 → `bad_response`；非 IP → `parse_failed`；
+其余映射同 §6。
 **endpoint 失败 ≠ "IP changed"**：change 判定是纯函数
 `classify_egress_change(previous, current)`（§9），failure 参与的转移永不
 产出 `changed`。
@@ -241,8 +249,11 @@ PR-3B 冻结默认值时须逐项评审：数据流向、隐私、超时含义�
   上一次 join 结束时刻"的预算重算，R1-A3）：一个慢 slot 既不能饿死处于
   自己预算内的健康 slot，也不能把 cycle 拖过任何 slot 的绝对 deadline。
   worker 的 outcome 携带完成时间戳；晚于绝对截止点的 outcome 无论内容
-  （ok 或 failed）一律拒收判 `timeout`。**跨 cycle 不累积（R1-A4）**：
-  引擎为每个 slot 维护"至多一个在飞 worker"的占用登记 —— 上一 cycle
+  （ok 或 failed）一律拒收判 `timeout`。**跨 cycle 不累积（R1-A4/R2-A6）**：
+  引擎为每个 slot 维护"至多一个在飞 worker"的占用登记 —— 占用判定、
+  登记与线程启动在同一条锁的**同一临界区**内原子完成（未启动线程
+  `is_alive()` 为 False，check/start 分居锁两侧会被并发 cycle 双重认领，
+  判别组 J 以延迟 start 的 Thread 子类把该窗口确定性放大）；上一 cycle
   被遗弃的挂死 worker（getaddrinfo 这类无法内部取消的调用）持有自己的
   slot，后续 cycle 遇到占用时零线程、零 I/O、立即判 `unavailable`，直
   至旧 worker 死亡自动恢复。全引擎被挂死 worker 占用的线程数因此恒
@@ -260,8 +271,9 @@ PR-3B 冻结默认值时须逐项评审：数据流向、隐私、超时含义�
 **egress 变更判定（纯函数，PR-3B 的事件源）**：
 
 `classify_egress_change(previous, current)`，两参数为历史与本次的
-`egress.ip`（或 None）：先各自过严格 canonical 解析，任何一侧无效 →
-`"unknown"`；两侧有效且相等 → `"unchanged"`；不等 → `"changed"`。
+`egress.ip`（或 None）：先各自过严格 canonical 解析**与 global 校验**，
+任何一侧无效或非公网（loopback/私有/保留/文档段）→ `"unknown"`；两侧
+均为有效公网样本且相等 → `"unchanged"`；不等 → `"changed"`。
 因此 **failure→success、success→failure、failure→failure 都只能得到
 `"unknown"`**，绝不伪造 change 事件；判别测试逐例覆盖。本函数不读任何
 存储、不产生事件 —— 事件持久化属于 PR-3B 的 v3 迁移（§12）。
@@ -292,12 +304,14 @@ PR-3B 冻结默认值时须逐项评审：数据流向、隐私、超时含义�
   （问题绑定 D13）**；应答 id 不匹配 / 短包 → `protocol_failed`；TC=1 /
   NXDOMAIN 码 / 超 `max_response_bytes` → `bad_response`；`resolver_host`
   传 hostname → 构造抛 `SpecError`（值错误判别，不进结果通道）。
-* **P5 egress**：body `203.0.113.7` → canonical ok；IPv6 canonical →
+* **P5 egress**：body `203.0.113.7` → canonical ok；global IPv6 canonical →
   ok；`"not an ip"`/多行 → `parse_failed`；超限 body → `bad_response`；
-  超时 → `timeout`；loopback 响应 + 默认 `require_global=True` →
-  `parse_failed`；`classify_egress_change` 全转移矩阵 9 格（含非法字符串
-  → unknown、两个不同成功样本 → changed、任何含 failure 的转移 →
-  unknown）。
+  超时 → `timeout`；loopback/私有/共享地址（100.64/10、文档段）响应 →
+  **无条件** `parse_failed`（R2-A7：spec 无 `require_global` 旋钮，传入
+  即 `TypeError`；parse 门与 normalize 门双重强制；classify 对任何非
+  global 输入判 unknown）；`classify_egress_change` 全转移矩阵 14 格
+  （含非法字符串 → unknown、两个不同**公网**成功样本 → changed、任何含
+  failure 或非 global 样本的转移 → unknown）。
 * **P6 隐私哨兵**：在所有 fake 的 exception message、HTTP body、TLS 握手
   失败路径、DNS 应答 payload 中植入 UUID/password/私有 IP/hostname
   sentinel；断言结果 JSON、`repr(result)`、以及 `logging` 捕获（root
@@ -306,14 +320,24 @@ PR-3B 冻结默认值时须逐项评审：数据流向、隐私、超时含义�
   + 余量；cycle 总墙钟 ≤ `total_deadline` + 小裕度；连续多个 cycle 无线
   程累积（active_count 有界）。
 * **P8 R1 合同判别（A1–A4）**：`cycle_id` 自由文本/超长/非字符串 → 被
-  32-hex 引擎 id **替换**且 sentinel 不过夜，语法内字符串原样存活；
-  抛错/NaN/inf/负数/非数值 clock → epoch 恒为有限非负 float 且零泄漏；
-  晚于绝对 deadline 的失败 outcome 判 `timeout` 不判 `dns_failed`、晚归
-  的 ok 同样拒收（H9/H10）；挂死 slot 不能把健康 slot 拖出其自身预算
-  （H11）；**多 cycle 永久挂死判别**：挂死 worker 被遗弃为 `timeout` 后
-  连跑 3 个 cycle —— 每 cycle 立即 `unavailable`（墙钟 <0.5s）、`probe-
-  dns` 线程数恒为 1、事件放开后槽位自动恢复 ok（I1–I5）。
-* **硬计数门**：`EXPECTED_PASS=113`，任何静默跳过即红。
+  32-hex 引擎 id **替换**且 sentinel 不过夜；抛错/NaN/inf/负数/非数值
+  clock → epoch 恒为有限非负 float 且零泄漏；晚于绝对 deadline 的失败
+  outcome 判 `timeout` 不判 `dns_failed`、晚归的 ok 同样拒收（H9/H10）；
+  挂死 slot 不能把健康 slot 拖出其自身预算（H11）；**多 cycle 永久挂死
+  判别**：挂死 worker 被遗弃为 `timeout` 后连跑 3 个 cycle —— 每 cycle
+  立即 `unavailable`（墙钟 <0.5s）、`probe-dns` 线程数恒为 1、事件放开
+  后槽位自动恢复 ok（I1–I5）。
+* **P9 R2 合同判别（A5/A6/A7）**：caller id 只有精确小写 32-hex 存活，
+  大写 hex、31/33 长度、含非 hex 字符、旧宽松语法的"安全"串全部被替换
+  （A14–A18）；**并发认领判别**：Barrier 对齐的两个 cycle 撞上同一 hang
+  resolver，且 Thread.start 被测试子类延迟 0.5s（把 check/start 分居锁
+  两侧的缺陷窗口确定性放大为必中）—— 两次结果必须恰为
+  {timeout, unavailable}、`probe-dns` 线程增量恒 1、风暴后槽位恢复
+  （J1–J3）；egress 公网合同端到端：`require_global` kwarg 被拒（E13）、
+  七类非 global 地址在 parse 门全拒（E14）、伪造 ok+private 的 slot 在
+  最终 normalize 门被降级（H12）、global ok 样本原样通过（H13）、
+  classify 矩阵含私有/回环/共享/文档段各格（F 组）。
+* **硬计数门**：`EXPECTED_PASS=126`，任何静默跳过即红。
 
 ## 11. CI 接线
 
@@ -347,7 +371,7 @@ schema v2→v3（继续遵守 strict schema gate、forward-only、单事务、v2
 
 | 项 | 缺陷 | 修复 | 判别测试 |
 |----|------|------|----------|
-| A1 | 入口未完全收容：`cycle_id` 任意对象/自由文本直接过夜进结果；caller `clock` 抛错或返回非数值即炸 `run_probe_cycle`；junk `targets` 靠 worker 内 try 兜底而非类型门 | `_sanitize_cycle_id`（严格语法 `[A-Za-z0-9][A-Za-z0-9._:-]{0,63}`，不合格一律替换为引擎 uuid hex，绝不过夜回显）；`_sanitize_epoch`（clock 抛错/非数值/NaN/inf/负数 → 回退引擎时钟，类型面判定）；`_slot_spec` 精确类型门（非审核 spec 类 = dark，零线程零 I/O，连子类都拒）；最外层绝对兜底返回全 `unavailable` 暗结果 | A11–A16（自由文本/超长/非 str/语法内存活/抛错 clock/junk clock 矩阵 + leak_free）；H1 改走类型门语义 |
+| A1 | 入口未完全收容：`cycle_id` 任意对象/自由文本直接过夜进结果；caller `clock` 抛错或返回非数值即炸 `run_probe_cycle`；junk `targets` 靠 worker 内 try 兜底而非类型门 | `_sanitize_cycle_id`（严格语法 `[A-Za-z0-9][A-Za-z0-9._:-]{0,63}`，不合格一律替换为引擎 uuid hex，绝不过夜回显；R1 的这层语法在 R2-A5 进一步收紧为精确小写 32-hex，见 §14）；`_sanitize_epoch`（clock 抛错/非数值/NaN/inf/负数 → 回退引擎时钟，类型面判定）；`_slot_spec` 精确类型门（非审核 spec 类 = dark，零线程零 I/O，连子类都拒）；最外层绝对兜底返回全 `unavailable` 暗结果 | A11–A16（自由文本/超长/非 str/抛错 clock/junk clock 矩阵 + leak_free）；H1 改走类型门语义 |
 | A2 | UDP 应答未绑定来源与问题：unconnected `recv` 会接受任何源发包，头部判定也不核对 question —— 错误 peer 的合法报文可假阳性 | connected datagram socket（`connect` 后 `send/recv`）实现内核级**对端绑定**；RFC 1035 question 段**逐字回显比对**实现问题绑定；ICMP port-unreachable（connected UDP 特有回弹）显式映射 `connect_failed` | D12（配置 peer 沉默、另一 peer 送字节完美应答 → 必须 `timeout`）；D13（正确 peer+正确 id 但回显他人问题 → `protocol_failed`）；D1–D11 全矩阵在新绑定下原样绿 |
 | A3 | join 预算按"轮到该 slot 时的相对剩余"计算，可被前序 join 挤压/漂移；晚归的失败 outcome 会被接受进槽位 | slot 截止点在 cycle 开始钉死为绝对时刻 `cycle_started + min(spec.timeout, total)`，按截止点升序 join；worker outcome 附完成时间戳，`completed > deadline` 的 outcome **一律拒收判 timeout（失败也不例外）**；`_finish_slot` 不再自判晚归、由引擎统一裁决 | H9（睡 1.2s 后抛 gaierror，预算 0.5 → `timeout` 而非 `dns_failed`）；H10（晚归 ok 拒收）；H11（挂死 slot 不饿死预算内健康 slot，墙钟有界） |
 | A4 | 每 cycle 无登记地 spawn daemon 线程：getaddrinfo 类不可取消调用永久挂死时，线程随 cycle 线性累积 | 引擎级 `_INFLIGHT` 占用登记（锁保护）：slot 有在飞 worker 时后续 cycle 零线程、零 I/O、立即判 `unavailable`；worker 退出自清登记，自动恢复。全局挂死线程数恒 ≤ 4 | I1–I5：Event 门控的永久挂死 resolver 连跑 4 个 cycle —— 首 cycle `timeout`，后 3 个 `unavailable` 且各自墙钟 <0.5s，`probe-dns` 线程增量恒 1，放开事件后槽位恢复 ok |
@@ -358,3 +382,15 @@ schema v2→v3（继续遵守 strict schema gate、forward-only、单事务、v2
 S0 静态门计数不变），并在 cycle helper 中加入"测量前排空占用 slot"纪律
 （I 组故意持有时除外）。DARK 边界、schema、VERSION、CI 接线均不因 R1
 移动。
+
+## 14. R2 评审（HOLD）修复记录：A5–A7
+
+| 项 | 缺陷 | 修复 | 判别测试 |
+|----|------|------|----------|
+| A5 | R1 的 `cycle_id` 语法门过宽（`[A-Za-z0-9][A-Za-z0-9._:-]{0,63}`）：调用方可注入 64 字符以内的任意"语法安全"串原样过夜，id 通道事实上未收敛到引擎自产形状 | 收紧为 `\A[0-9a-f]{32}\Z`：唯一存活形状 = 引擎自己发出的小写 32-hex；大写、错长度、非 hex、自由文本、非字符串一律替换，绝不过夜回显 | A14 翻转（旧宽松语法的串现在必须被替换）；A17（大写 32-hex 替换）；A18（31/33 长度、含非 hex 字符替换 + 精确小写 32-hex 存活正例）；A7/A8 原语义不变 |
+| A6 | `_INFLIGHT` 的 check+登记在锁内、`thread.start()` 在锁外：未启动线程 `is_alive()` 为 False，并发 cycle 可见"已登记但未启动"的占位并二次认领同一 slot（双 worker 双 I/O，登记被后者覆盖） | 占用判定、登记与 `start()` 移入**同一临界区**原子完成；worker 完成后仍"先清登记、再记 outcome"。全局挂死线程上界与 I 组语义保持 | J1–J3（新并发组）：Barrier 对齐两 cycle + 测试用 `SlowStartThread` 把 start 延迟 0.5s —— 修复前该窗口确定性放大为"2 worker / 双 timeout"，修复后恒得 {timeout, unavailable} + 线程增量 1 + 风暴后恢复 |
+| A7 | egress 的 global 合同是 spec 字段 `require_global`（默认 True 可关）：关掉开关或伪造 slot 即可让 loopback/私有 IP 通过 normalize 门过夜，且 `classify_egress_change` 对私有地址对判 `changed` —— "公网出口 IP 例外"可被用来搬运连接级地址 | 删除 `require_global` 字段（未知 kwarg 直接 TypeError）；`_parse_egress_answer` 无条件拒非 global；global 校验下沉进 `_canonical_ip`，最终 normalize 门与 classify 纯函数共用同一道门（防御纵深：假想缺陷 worker 交出 private ok slot 也降级 `parse_failed`） | E13（逃生门不存在）；E14（回环/私有/CGNAT/ULA/文档段/v6 回环 多类全拒）；H12/H13（normalize 门降级 private、放行 global）；F 矩阵 10→14 格（私有对、global×private、回环对、100.64/10、2001:db8/32 全 `unknown`；v6 unchanged 正例改用真实 global 的 `2606:4700:4700::64` 展开式） |
+
+R2 另修正 PR body 的过期元数据（head/base/计数）。套件净增 13 项判别
+（126 = 113 + 2 A + 2 E + 4 F 格 + 2 H + 3 J；S0 计数不变）。DARK 边界、
+闭合 schema 与词汇表、VERSION（0.3.1）、CI 接线均不因 R2 移动。

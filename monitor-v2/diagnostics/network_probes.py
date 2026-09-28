@@ -17,8 +17,9 @@ Safety contract (all enforced, all tested):
   response bodies, resolved addresses, peer socket addresses and host
   name echoes have no field to travel in. ``error_code`` is a frozen
   9-member vocabulary; the only string an ``ok`` probe may emit beyond
-  the vocabulary is the canonical public egress IP (the reviewed P1
-  exception, see docs/monitor-v2-network-probes-p3a.md section 9).
+  the vocabulary is the canonical PUBLIC egress IP -- globality is
+  enforced unconditionally at parse, at the final normalize gate and
+  in the change judgement (docs/monitor-v2-network-probes-p3a.md).
 * Every worker is bounded by an ABSOLUTE per-worker deadline measured
   from the cycle start -- ``cycle start + min(spec timeout, total cycle
   deadline)`` -- plus its own socket timeout. Joins advance against those
@@ -29,14 +30,18 @@ Safety contract (all enforced, all tested):
   are the backstop for a hung syscall; the result is built from a
   fully-populated default and each slot is replaced at most once, so it
   can never be torn.
-* At most ONE worker per slot is outstanding engine-wide: while a
-  previous cycle's worker is still hung, later cycles do not stack a new
-  thread per cycle -- the slot is adjudicated ``unavailable`` with zero
-  I/O and zero threads until the old worker dies, so abandoned workers
-  cannot accumulate across cycles.
+* At most ONE worker per slot is outstanding engine-wide: the
+  reservation and the thread start happen ATOMICALLY under one lock (an
+  unstarted thread is not alive, so a check-then-start split would let
+  two concurrent cycles both claim a slot), and while a previous
+  cycle's worker is still hung, later cycles do not stack a new thread
+  per cycle -- the slot is adjudicated ``unavailable`` with zero I/O and
+  zero threads until the old worker dies, so abandoned workers cannot
+  accumulate across cycles.
 * The public entry point NEVER raises to a future publisher loop:
   ``targets`` is gated by exact spec type (anything else stays dark),
-  ``cycle_id`` passes a strict token grammar (caller free text is
+  ``cycle_id`` survives only as an EXACT lowercase 32-hex token (any
+  other caller value -- free text, uppercase, wrong length -- is
   replaced by an engine-generated id, never echoed), ``clock`` is
   coerced to a finite non-negative float, and a final containment line
   returns the all-``unavailable`` dark result should anything ever
@@ -114,9 +119,11 @@ CYCLE_DEADLINE_SECONDS = 12.0
 _HTTP_BODY_READ_CAP = 65536
 _UDP_DEFAULT_MAX_REPLY = 2048
 
-# Caller-supplied cycle ids are admitted only through this grammar, so a
-# future publisher's free text can never widen the result schema.
-_CYCLE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}\Z")
+# Caller-supplied cycle ids are admitted ONLY as an exact lowercase
+# 32-hex token -- the shape the engine itself generates. Anything else
+# is replaced, so no caller free text (or near-miss id) can widen the
+# result schema.
+_CYCLE_ID_RE = re.compile(r"\A[0-9a-f]{32}\Z")
 
 
 class SpecError(ValueError):
@@ -234,11 +241,11 @@ class UdpProbeSpec:
 @dataclass(frozen=True)
 class EgressProbeSpec:
     """Public egress IP probe: the ONLY slot allowed to emit an IP
-    string, and only the canonical form of what the endpoint ANSWERED
-    (never a connection-level address). ``require_global`` rejects
-    loopback/private/reserved answers by default so the reviewed "server
-    public egress IP" exception can never be used to smuggle a
-    connection address toward persistence."""
+    string, and only the canonical form of a PUBLIC answer the endpoint
+    gave (never a connection-level address). Loopback/private/reserved
+    answers are refused UNCONDITIONALLY -- there is no spec field that
+    relaxes this, so the reviewed "server public egress IP" exception
+    can never be used to smuggle a local address toward persistence."""
     host: str
     port: int = 443
     path: str = "/"
@@ -247,7 +254,6 @@ class EgressProbeSpec:
     max_body_bytes: int = 64
     cafile: object = None
     server_hostname: object = None
-    require_global: bool = True
 
     def __post_init__(self):
         _require_text(self.host, "host")
@@ -321,9 +327,10 @@ def _finish_slot(started, code):
 # -- caller-input sanitizers (entry never raises, free text never echoes) ------
 
 def _sanitize_cycle_id(value):
-    """A caller id survives only if it is a str inside the strict token
-    grammar; everything else (None, free text, over-long, non-string) is
-    REPLACED by an engine-generated id, never echoed toward a result."""
+    """A caller id survives only as an EXACT lowercase 32-hex token --
+    the shape the engine itself emits; everything else (None, free
+    text, uppercase, wrong length, non-string) is REPLACED by an
+    engine-generated id, never echoed toward a result."""
     if isinstance(value, str) and _CYCLE_ID_RE.match(value):
         return value
     return uuid.uuid4().hex
@@ -442,10 +449,11 @@ def _run_https_probe(spec):
     return _finish_slot(started, code)
 
 
-def _parse_egress_answer(body, require_global):
+def _parse_egress_answer(body):
     """Strict answer contract: decodable text that IS exactly one
-    canonical IPv4/IPv6 literal. Everything else is refused with a
-    closed code and zero content retention."""
+    canonical GLOBAL IPv4/IPv6 literal. Loopback/private/reserved
+    answers are refused with a closed code and zero content retention
+    -- unconditionally, this path has no relaxation knob."""
     try:
         text = body.decode("utf-8").strip()
     except UnicodeDecodeError:
@@ -454,7 +462,7 @@ def _parse_egress_answer(body, require_global):
         address = ipaddress.ip_address(text)
     except ValueError:
         return None, ERR_PARSE_FAILED
-    if require_global and not address.is_global:
+    if not address.is_global:
         return None, ERR_PARSE_FAILED
     return str(address), ERR_NONE
 
@@ -468,7 +476,7 @@ def _run_egress_probe(spec):
         elif len(body) > spec.max_body_bytes:
             code = ERR_BAD_RESPONSE      # oversized answer: transport lie
         else:
-            ip, code = _parse_egress_answer(body, spec.require_global)
+            ip, code = _parse_egress_answer(body)
     except Exception as exc:  # noqa: BLE001 -- closed mapping only
         started = time.monotonic()
         code = _classify_client_error(exc)
@@ -603,9 +611,11 @@ _WORKERS = {"dns": _run_dns_probe, "https": _run_https_probe,
 
 # -- cycle engine ---------------------------------------------------------------
 
-# One-outstanding-worker discipline per slot (A4): a hung worker HOLDS
-# its slot; later cycles neither stack threads nor wait for it, they
-# adjudicate the slot ``unavailable`` until the old worker dies.
+# One-outstanding-worker discipline per slot (A4/A6): a hung worker
+# HOLDS its slot; later cycles neither stack threads nor wait for it,
+# they adjudicate the slot ``unavailable`` until the old worker dies.
+# The check-and-reserve AND the thread start share ONE atomic critical
+# section, so two concurrent cycles can never both claim a slot.
 _INFLIGHT = {slot: None for slot in PROBE_SLOTS}
 _INFLIGHT_LOCK = threading.Lock()
 
@@ -667,9 +677,13 @@ def _run_probe_cycle_inner(targets, cycle_id, clock,
             thread = threading.Thread(target=_runner, name="probe-" + slot,
                                       daemon=True)
             _INFLIGHT[slot] = thread
+            # RESERVATION AND START ARE ATOMIC under this lock: an
+            # unstarted thread is NOT alive, so starting after releasing
+            # the lock would let a concurrent cycle see a dead-looking
+            # placeholder and claim the same slot a second time.
+            thread.start()
         threads[slot] = thread
         deadlines[slot] = deadline
-        thread.start()
     for slot in sorted(threads, key=lambda s: deadlines[s]):
         thread = threads[slot]
         deadline = deadlines[slot]
@@ -700,9 +714,10 @@ def run_probe_cycle(targets=None, cycle_id=None, clock=time.time,
     """Run one bounded probe cycle; returns the CLOSED result dict.
 
     Never raises: caller mistakes (junk targets objects, specs of the
-    wrong type, a free-text ``cycle_id``, a clock that blows up, even an
-    invalid total deadline -- coerced to the default) can only widen
-    failure codes or get replaced by engine defaults, never escape. Each
+    wrong type, a ``cycle_id`` that is not an exact lowercase 32-hex
+    token, a clock that blows up, even an invalid total deadline --
+    coerced to the default) can only widen failure codes or get
+    replaced by engine defaults, never escape. Each
     configured probe gets its own worker thread under an ABSOLUTE
     per-worker deadline (``cycle start + min(spec timeout, total
     deadline)``); anything a worker records later -- ok or failed alike
@@ -741,9 +756,11 @@ def _normalize_probe(slot):
 
 
 def _normalize_egress(slot):
-    """Egress keeps ONLY a re-canonicalized answer string on the ok
-    path; every other shape (missing/invalid/private on require_global
-    re-check) degrades to failed/parse_failed with ip=None."""
+    """Egress keeps ONLY a re-canonicalized GLOBAL answer on the ok
+    path (the global gate lives in _canonical_ip, so it is enforced
+    end-to-end, not just at parse time); every other shape -- missing,
+    invalid, loopback/private/reserved -- degrades to failed/
+    parse_failed with ip=None."""
     keep_ip = slot.get("ip") if isinstance(slot, dict) else None
     slot = _normalize_probe(slot)
     slot["ip"] = None
@@ -758,22 +775,29 @@ def _normalize_egress(slot):
 # -- pure egress-change judgement (PR-3B event source) --------------------------
 
 def _canonical_ip(value):
+    """Canonical form of a PUBLIC (global) IP literal, else None. This
+    is THE egress-IP gate: the normalize gate and the change judgement
+    both pass through it, so a non-global address can never survive
+    end-to-end in either channel."""
     if not isinstance(value, str):
         return None
     try:
-        return str(ipaddress.ip_address(value))
+        address = ipaddress.ip_address(value)
     except ValueError:
         return None
+    if not address.is_global:
+        return None
+    return str(address)
 
 
 def classify_egress_change(previous, current):
-    """Pure judgement over two SUCCESSFUL egress answers.
+    """Pure judgement over two SUCCESSFUL, PUBLIC egress answers.
 
-    ``changed`` requires two independently valid canonical IPs that
-    differ; any transition that involves a failure (None / invalid /
-    missing sample) is ``unknown`` and must NEVER be surfaced as a
-    change event by a future integrator. Equal valid samples are
-    ``unchanged``.
+    ``changed`` requires two independently valid GLOBAL canonical IPs
+    that differ; any side that is None, invalid or NON-GLOBAL
+    (loopback/private/reserved) yields ``unknown``, and a transition
+    that involves a failure must NEVER be surfaced as a change event by
+    a future integrator. Equal valid global samples are ``unchanged``.
     """
     before = _canonical_ip(previous)
     after = _canonical_ip(current)
