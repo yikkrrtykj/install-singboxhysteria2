@@ -208,6 +208,17 @@ CI 接线：`.github/workflows/tests.yml` 的 `fast-checks` 增加
 改动移动，packaging 在该平台 `268 passed / 0 failed`（T27 因无符号链接
 SKIP，Linux pass 覆盖它）。
 
+**首轮 CI 红（两条均为 Linux-only 残差，非契约失败）**：① e3 的两条实机车道
+`test-m2-live.sh`/`test-m3-deploy.sh` 用 `cp` 自建 monitor 应用树，复制清单
+早于 PR-3B，`webapp.py` 在 `from diagnostics.probe_scheduler import …` 处
+`ModuleNotFoundError`，三条基线的 LIVE 门全红；m3-deploy 携带同一潜在缺口，
+只因步骤首败即停而未显形。② p2b 的 I4 迁移门断言 schema 落到 2，而安装头已
+是 v3-aware，packaging-fixture 红于 `want '2', got '3'`。修复：夹具镜像
+staging 载荷；I4 改为"一步落到 3"并追加结构断言（v3 探测表随同一 rung 建出），
+车道标签不再冻结数字。I4 在本平台 SKIP，因此迁移语义用一棵无符号链接的 stub
+发布树离线重放取证：`schema_version 3`、health enabled/degraded false、v1 行
+逐字节保留、7 张既有表 + `network_probe_samples` 齐备。
+
 ## 11. 明确偏差
 
 1. P3A §2 曾把"`diagnostics/` 进入 staging 清单"推迟到 release-prep
