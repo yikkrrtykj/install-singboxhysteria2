@@ -177,13 +177,31 @@ evidence 记完再返回，所以"没结论"永远不等于"没内容"。
 要求 `probe_endpoint_confounded`；三条对照——客户端真的在掉、簇内 `egress_ip`
 变更、`OTHER`/`https443` journal 突发——各自仍要求 `vps_outbound`。
 
-判别器的效力不靠声明。把修改前的模块换回来（只换 `incident_classifier.py`，
-夹具与车道不动）实测 **37 条红**，红名单正是本轮的语义格；反过来在第三轮
-模块上逐条**只破坏一条规则**（8 个 mutation：加宽 `_seal` 墙、把任何
-`failed` 当网络事实、摘掉端点混淆门、把 `total` 当双传输影响、取消同期反证、
-把健康度按窗口而非簇统计、按基线替 API 视图作证、折叠两簇），每次只让该规则
-对应的具名判据变红。`health.degraded` 那一格由前一次实测覆盖，故不重复列入
-mutation 清单。
+判别器的效力不靠声明，而且这两组实测都在**本轮最终模块**上重跑过（清掉本轮
+自己引入、却无人读取的 per-bucket `unusable` 标记之后重测；此前的数字作废）。
+
+**换回修改前的模块**（只换 `incident_classifier.py`，夹具、harness、车道都不动）
+在 `5962ebd` 实测 **33 条红 / 475 条绿**，其中 2 条是 harness 直接崩在
+`EMITTABLE_CATEGORIES` 不存在上（那本身就是 R1 的证据），余下 31 条按本轮八条
+语义逐一落位：R1 `destination_proof` 2、R2 `history_degraded` 3 +
+`degraded_over_real_incident` 2、R3 `probe_unavailable_is_not_a_fault` 7 +
+`probe_endpoint_answers_badly` 6、R4 `probe_outage_without_clients` 2、
+R5 `common_inbound_needs_dual_impact` 2、R6 `common_inbound_api_unproven` 2、
+R7 `common_inbound_baseline_health_cannot_vouch` 3、R8
+`two_clusters_fail_closed` 2——八条语义每条都至少有一条判据在换回旧模块后变红。
+`reality_impact_is_not_shared` / `hy2_impact_is_not_shared` 两格**不在**红名单里，
+这是如实记录而不是遗漏：旧模块对这两个夹具恰好也给出同样答案，所以它们是
+**防回归的守卫**，其判别力由下面的 R5 mutation 证明（旧行为一旦回来即红）。
+
+**反过来只破坏一条规则**（8 个 mutation：加宽 `_seal` 墙、把任何 `failed` 当网络
+事实、摘掉端点混淆门、把 `total` 当双传输影响、取消同期反证、把健康度按窗口而非
+簇统计、按基线替 API 视图作证、折叠两簇）逐个实测，红数依次是
+**2 / 14 / 3 / 16 / 5 / 4 / 3 / 3**，且每个 mutation 跑完后模块还原、整轮重测仍
+546/0。红名单里除该规则自己的具名判据外，只会多带 `invariants` 的
+`verdicts_survive_shuffling`（乱序等值 witness，任何判据变动它都该红）；R5 额外
+红在 `fixtures/reality_outage:classifies_as_expected` 上——把 `total` 当成双传输
+影响会直接改写**提交进仓的 Reality 夹具**的答案，这正是该规则禁止的事。
+`health.degraded` 那一格由换回模块的实测覆盖，故不重复列入 mutation 清单。
 
 ## 7. 车道与门计数
 
