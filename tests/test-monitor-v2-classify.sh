@@ -17,11 +17,12 @@
 #      that can be reviewed on its logic alone -- so the lane proves the
 #      absence of wiring rather than trusting a promise.
 #   2. A CLOSED VOCABULARY, PINNED AS LITERALS HERE. Seven categories, three
-#      statuses, forty-four evidence tokens, twenty-three unknown tokens.
-#      They are re-stated in this shell file -- a second, independent
-#      witness -- because a contract only the module and its own test agree
-#      on is not a contract: renaming a token to make a scenario pass has to
-#      break two files written by different hands.
+#      statuses, forty-five evidence tokens, twenty-seven unknown tokens, the
+#      six categories the sealing wall actually admits, and the two halves of
+#      the probe failure split. They are re-stated in this shell file -- a
+#      second, independent witness -- because a contract only the module and
+#      its own test agree on is not a contract: renaming a token to make a
+#      scenario pass has to break two files written by different hands.
 #   3. THE COMMITTED FIXTURES DECIDE CORRECTLY *AND MOVE*. A fixture that
 #      always classified the same way regardless of its content would satisfy
 #      a naive expectation gate forever, so the lane mutates the Reality
@@ -34,11 +35,15 @@
 #      ship.
 #   4. BEHAVIOUR, at scale, in tests/monitor-classify/classify_groups.py:
 #      vocabulary mirrors asserted against the LIVE store module and the live
-#      probe engine, a 23-scenario decision table, nineteen hostile
-#      refusals, determinism/purity/closure invariants, a privacy wall that
-#      feeds real sentinel material through every section, and a group that
-#      builds a REAL schema-v3 database, reads the rows back out of SQLite
-#      and classifies those.
+#      probe engine, a 36-scenario decision table whose rows are the review
+#      counterexamples (an unreachable destination category, degraded
+#      diagnostics that proves nothing, a probe code that is not a network
+#      fact, one endpoint outage posing as an outbound failure, impact read
+#      per transport, contemporaneous negatives, two episodes in one window),
+#      nineteen hostile refusals, determinism/purity/closure invariants, a
+#      privacy wall that feeds real sentinel material through every section,
+#      and a group that builds a REAL schema-v3 database, reads the rows back
+#      out of SQLite and classifies those.
 #
 # Everything here is pure Python over a pure-stdlib module: no network, no
 # privileges, no gate that needs Linux. The dev host and CI must therefore
@@ -53,19 +58,26 @@ export CLASSIFY_FIXTURE_DIR="$HERE/monitor-classify/fixtures"
 
 PASS=0
 FAIL=0
-# PR-4A functional-freeze head -- 433 checks, measured on the dev host and
-# to be re-measured on Linux CI. Every section moved only because a gate was
-# deliberately written or removed, and the breakdown is part of the record:
-#   S0 static + darkness gates              13   (+1: the closed result
-#        surface is pinned HERE too, so widening the answer needs two files)
-#   S1 closed vocabulary, pinned literal    10   (+1: the identity-bearing
-#        column tuple is what the classifier's own AST gate is measured
-#        against, so a new read column has to be declared here as well)
-#   S2 committed fixtures decide and move    9
-#   S3 behaviour groups (classify_groups)  401   mirrors 21, scenarios 201,
-#        hostiles 116, invariants 15, privacy 7, store 25, fixtures 14,
-#        plus the harness rc and the fixtures-unchanged proof
-EXPECTED_PASS=433
+# PR-4A round 3 -- 582 checks, measured on the dev host and to be re-measured
+# on Linux CI. The move from 433 is gates that were written, never a count
+# that was waved through, and the breakdown is part of the record:
+#   S0 static + darkness gates              13   unchanged
+#   S1 closed vocabulary, pinned literal    12   (+2: the six categories the
+#        sealing wall admits, and the network/unusable split of the probe
+#        failure codes. Both are round-3 semantics, so both get a witness
+#        outside the module.)
+#   S2 committed fixtures decide and move    9   unchanged -- the four
+#        mutations answer exactly as they did before round 3, which is the
+#        proof that the new refusals hardened the edges without moving the
+#        anchor
+#   S3 behaviour groups (classify_groups)  548   mirrors 24 (+3: emittable
+#        categories, the probe-code partition, source codes are not network
+#        codes), scenarios 344 (+143: 23 rows became 36 -- every round-3
+#        counterexample and its positive control), hostiles 116 unchanged,
+#        invariants 16 (+1: _seal() itself refuses the unemittable
+#        category), privacy 7, store 25, fixtures 14, plus the harness rc
+#        and the fixtures-unchanged proof
+EXPECTED_PASS=582
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
@@ -301,16 +313,19 @@ journal_cls_net_unreachable journal_cls_other journal_cls_quic_error
 journal_cls_reset journal_cls_tls_handshake journal_continuity_gap
 journal_rejected_batch no_anomaly probe_failed_dns probe_failed_egress
 probe_failed_https probe_failed_udp probe_generic_tcp_healthy
-sample_coverage_gap""".split()
+probe_source_unavailable sample_coverage_gap""".split()
 UNKNOWNS = """
-attribution_ambiguous baseline_evidence_absent count_drop_only
+attribution_ambiguous baseline_evidence_absent
+contemporaneous_negatives_unproven count_drop_only
 evidence_outside_window evidence_rejected_audit
 evidence_rejected_device_states evidence_rejected_health
 evidence_rejected_journal_events evidence_rejected_probe_rows
 evidence_rejected_reader evidence_rejected_samples evidence_rejected_window
 evidence_shape_rejected journal_evidence_absent journal_evidence_incomplete
+multiple_anomaly_clusters
 multiple_destinations no_corroboration no_target_specific_proof
-probe_evidence_absent process_and_network_evidence_conflict
+probe_endpoint_confounded probe_evidence_absent probe_evidence_unusable
+process_and_network_evidence_conflict
 root_cause_not_established transport_negatives_unproven
 unattributed_evidence_present""".split()
 
@@ -325,12 +340,12 @@ verdict("none_is_a_status_value_not_a_cause",
         cl.CATEGORY_NONE == "NONE" and cl.CATEGORY_NONE not in cl.CATEGORIES
         and cl.CATEGORY_INSUFFICIENT in cl.CATEGORIES)
 verdict("statuses_are_the_closed_three", sorted(cl.STATUSES) == STATUSES)
-verdict("evidence_tokens_are_the_pinned_forty_four",
+verdict("evidence_tokens_are_the_pinned_forty_five",
         sorted(cl.EVIDENCE_TOKENS) == sorted(EVIDENCE)
-        and len(cl.EVIDENCE_TOKENS) == 44)
-verdict("unknown_tokens_are_the_pinned_twenty_three",
+        and len(cl.EVIDENCE_TOKENS) == 45)
+verdict("unknown_tokens_are_the_pinned_twenty_seven",
         sorted(cl.UNKNOWN_TOKENS) == sorted(UNKNOWNS)
-        and len(cl.UNKNOWN_TOKENS) == 23)
+        and len(cl.UNKNOWN_TOKENS) == 27)
 # The two planes must not overlap: a token that is both an observation and a
 # denial would let one string mean two things in the same report.
 verdict("the_two_vocabularies_are_disjoint",
@@ -353,6 +368,27 @@ verdict("correlation_is_never_reported_as_causation",
         "root_cause_not_established" in cl.UNKNOWN_TOKENS
         and "no_target_specific_proof" in cl.UNKNOWN_TOKENS
         and cl.CATEGORY_DESTINATION in cl.CATEGORIES)
+# Two of those sentences are mechanisms, not promises. Schema v3 projects a
+# destination as (dcls, port) -- a class and a port, never an identity -- so
+# the list the sealing wall admits is the reviewed seven WITHOUT
+# destination_specific, and a category outside it cannot leave a result. A
+# 'failed' probe slot is either a fact about the network or the absence of a
+# witness, and only the first may speak for the path.
+EMITTABLE = ["common_inbound_client_office", "hysteria2_udp_path",
+             "insufficient_evidence", "reality_tcp_path", "vps_outbound",
+             "vps_process_or_api"]
+NETWORK_CODES = ["connect_failed", "dns_failed", "protocol_failed",
+                 "timeout", "tls_failed"]
+SOURCE_CODES = ["bad_response", "parse_failed", "unavailable"]
+verdict("the_unemittable_category_is_pinned_out_of_the_answer",
+        sorted(cl.EMITTABLE_CATEGORIES) == EMITTABLE
+        and set(cl.CATEGORIES) - set(cl.EMITTABLE_CATEGORIES)
+        == set([cl.CATEGORY_DESTINATION]))
+verdict("probe_failure_codes_are_split_by_what_they_prove",
+        sorted(cl.PROBE_NETWORK_CODES) == NETWORK_CODES
+        and sorted(cl.PROBE_SOURCE_CODES) == SOURCE_CODES
+        and set(cl.PROBE_NETWORK_CODES) | set(cl.PROBE_SOURCE_CODES)
+        | set(["NONE"]) == set(cl.PROBE_ERROR_CODES))
 # The store's identity-bearing columns. This is the PR-1 privacy rule
 # re-stated where the classifier can read it: "not read" is a property of the
 # code, and this is the list the code is checked against by the harness's own

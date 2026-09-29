@@ -100,14 +100,33 @@ def device_row(t, device, active, inbound="vless-in", reason="change"):
     }
 
 
+SLOT_FALLBACK_CODES = {"dns": "dns_failed", "https": "timeout",
+                       "udp": "timeout", "egress": "connect_failed"}
+
+
+def slot_pair(value, slot):
+    """A slot is written either as a bare status or as an explicit
+    (status, error_code) pair. A bare status stands for the network-significant
+    failure the engine would actually store for it; the pair form lets a
+    scenario name WHICH kind of failure it claims, because 'failed' with
+    'timeout' is a fact about the path while 'failed' with 'unavailable' is
+    the probe not looking at all. The pairing the DB CHECK enforces is asserted
+    here so the harness cannot author a row the classifier must refuse."""
+    if isinstance(value, tuple):
+        status, code = value
+        assert (status == "ok") == (code == "NONE"), (slot, value)
+        assert code in cl.PROBE_ERROR_CODES, (slot, value)
+        return status, code
+    assert value in cl.PROBE_STATUSES, (slot, value)
+    return value, ("NONE" if value == "ok" else SLOT_FALLBACK_CODES[slot])
+
+
 def probe_row(t, dns="ok", https="ok", udp="ok", egress="ok",
               egress_change="unchanged", egress_ip=None):
     """One closed engine result flattened into one stored row. The
     status/error-code pairing is the stored invariant, so a hand-made row
     that breaks it is a caller defect the classifier must refuse."""
     codes = {"dns": dns, "https": https, "udp": udp, "egress": egress}
-    fallback = {"dns": "dns_failed", "https": "timeout", "udp": "timeout",
-                "egress": "connect_failed"}
     row = {
         "epoch": float(t),
         "iso_utc": LEAK_PROBES[0],
@@ -117,11 +136,11 @@ def probe_row(t, dns="ok", https="ok", udp="ok", egress="ok",
         "egress_ip": egress_ip,
         "egress_change": egress_change,
     }
-    for slot, status in codes.items():
+    for slot, value in codes.items():
+        status, code = slot_pair(value, slot)
         row["%s_status" % slot] = status
         row["%s_latency_ms" % slot] = 12 if status == "ok" else None
-        row["%s_error_code" % slot] = ("NONE" if status == "ok"
-                                       else fallback[slot])
+        row["%s_error_code" % slot] = code
     if egress_change == "changed":
         # A change token is only ever emitted with a working egress probe,
         # and the address rides a column the classifier never reads.
@@ -129,7 +148,7 @@ def probe_row(t, dns="ok", https="ok", udp="ok", egress="ok",
         row["egress_error_code"] = "NONE"
         row["egress_latency_ms"] = 12
         row["egress_ip"] = LEAK_PROBES[3]
-    elif egress != "ok":
+    elif str(codes["egress"]) != "ok":
         row["egress_ip"] = None
     return row
 
@@ -242,15 +261,19 @@ def reality_incident_bundle(buckets=10, drop_from=3, reality_target=1,
                             reader="fresh", audit=(), degraded=False,
                             last_error_code=None, include_probes=True,
                             include_devices=True, reality_errors=8,
-                            steady=False):
+                            steady=False, api_stale_from=None,
+                            probe_from_index=0):
     """The 2026-09-22 anchor shape: Reality dial timeouts on 443 while HY2
     clients stay up, over the standing background noise."""
     samples = []
     for index in range(buckets):
         reality = 25 if (steady or index < drop_from) else reality_target
+        stale = api_stale_from is not None and index >= api_stale_from
         for step in range(12):
             t = BASE + index * BUCKET + step * 5
-            samples.append(sample_row(t, reality + 15, reality, 15, 0))
+            samples.append(sample_row(t, reality + 15, reality, 15, 0,
+                                      api="STALE" if stale else "CONNECTED",
+                                      collector_stale=1 if stale else 0))
     journal = background_journal(buckets)
     if reality_errors:
         for index in range(buckets):
@@ -265,7 +288,8 @@ def reality_incident_bundle(buckets=10, drop_from=3, reality_target=1,
                   else reality_target + 15 for index in range(buckets)]) \
         if include_devices else []
     probe_rows = probes(buckets, probe_slots, probe_at,
-                        egress_change_at) if include_probes else []
+                        egress_change_at,
+                        from_index=probe_from_index) if include_probes else []
     return bundle(samples=samples, device_states=device_states,
                   probe_rows=probe_rows, journal_events=journal,
                   audit=list(audit), reader=reader, degraded=degraded,
@@ -293,26 +317,55 @@ def hy2_incident_bundle(buckets=10):
                                                   2, 2, 2]))
 
 
-def both_paths_bundle(buckets=10):
+def both_paths_bundle(buckets=10, drop_from=3, probe_buckets=None,
+                      api_stale_from=None, minority_stale=False,
+                      hy2_steady=False):
+    """Both transports hurt at once while the VPS's own probes stay healthy.
+    ``probe_buckets`` keeps the probe plane in the leading buckets only,
+    ``minority_stale`` leaves the API view answering with a below-floor share
+    of stale rows, and ``hy2_steady`` empties Reality while HY2's own counter
+    stays up."""
     samples = []
     for index in range(buckets):
-        reality = 25 if index < 3 else 1
-        hy2 = 15 if index < 3 else 1
+        hurting = index >= drop_from
+        reality = 1 if hurting else 25
+        hy2 = 15 if (hy2_steady or not hurting) else 1
         for step in range(12):
+            stale = (api_stale_from is not None and index >= api_stale_from
+                     and (not minority_stale or step < 4))
             t = BASE + index * BUCKET + step * 5
-            samples.append(sample_row(t, reality + hy2, reality, hy2, 0))
+            samples.append(sample_row(t, reality + hy2, reality, hy2, 0,
+                                      api="STALE" if stale else "CONNECTED",
+                                      collector_stale=1 if stale else 0))
     journal = background_journal(buckets)
     for index in range(buckets):
-        if index >= 3:
+        if index >= drop_from:
             t = BASE + index * BUCKET + 25
             journal.append(journal_row(t, "dial_timeout", "Reality",
                                        "https443", 443, n=7))
             journal.append(journal_row(t + 1, "quic_error", "Hysteria2",
                                        "quic", 443, n=7))
-    return bundle(samples=samples, probe_rows=probes(buckets),
+    return bundle(samples=samples,
+                  probe_rows=probes(buckets if probe_buckets is None
+                                    else probe_buckets),
                   journal_events=journal,
                   device_states=devices(buckets, [40, 40, 40, 2, 2, 2, 2,
                                                   2, 2, 2]))
+
+
+def split_episode_bundle(buckets=10, runs=((3, 5), (7, 9))):
+    """Reality journal bursts in the named index ranges. Two runs a quiet
+    bucket apart are two episodes of unknown relation; runs that touch are
+    one episode."""
+    journal = background_journal(buckets)
+    for first, last in runs:
+        for index in range(first, last):
+            journal.append(journal_row(BASE + index * BUCKET + 25,
+                                       "dial_timeout", "Reality", "https443",
+                                       443, n=8))
+    return bundle(samples=traffic(buckets), probe_rows=probes(buckets),
+                  journal_events=journal,
+                  device_states=devices(buckets, [40] * buckets))
 
 
 def api_down_bundle(buckets=10):
@@ -357,7 +410,8 @@ def destination_bundle(buckets=10, dcls="dot853", port=853, per_bucket=2,
                   device_states=devices(buckets, [40] * buckets))
 
 
-def drop_only_bundle(buckets=10):
+def drop_only_bundle(buckets=10, probe_slots=None, at=None,
+                     egress_change_at=None, extra_journal=()):
     """Connections fall by half with nothing else in evidence: no journal
     burst, no probe failure, no process signal."""
     samples = []
@@ -366,8 +420,12 @@ def drop_only_bundle(buckets=10):
         for step in range(12):
             t = BASE + index * BUCKET + step * 5
             samples.append(sample_row(t, reality + 15, reality, 15, 0))
-    return bundle(samples=samples, probe_rows=probes(buckets),
-                  journal_events=background_journal(buckets),
+    journal = background_journal(buckets)
+    journal.extend(extra_journal)
+    return bundle(samples=samples,
+                  probe_rows=probes(buckets, probe_slots, at,
+                                    egress_change_at),
+                  journal_events=journal,
                   device_states=devices(buckets, [40, 40, 40, 40, 23, 23,
                                                   23, 23, 23, 23]))
 
@@ -435,8 +493,71 @@ def scenarios():
         ("both_paths", both_paths_bundle(), "incident",
          "common_inbound_client_office",
          ("journal_burst_reality", "journal_burst_hysteria2",
+          "count_drop_reality", "count_drop_hysteria2",
+          "probe_generic_tcp_healthy"),
+         ("journal_burst_other_generic",), ("root_cause_not_established",),
+         ("contemporaneous_negatives_unproven", "attribution_ambiguous")),
+        # Naming the shared inbound path needs impact on BOTH transports in
+        # the same buckets: Reality's counter emptying while HY2's own
+        # counter holds is one path's outage, however loud the journal is on
+        # the other.
+        ("common_inbound_needs_dual_impact",
+         both_paths_bundle(hy2_steady=True), "incident",
+         "insufficient_evidence",
+         ("journal_burst_reality", "journal_burst_hysteria2",
+          "count_drop_reality"),
+         ("count_drop_hysteria2",), ("attribution_ambiguous",), ()),
+        # ... and it needs that proof WHILE it was happening. An API view
+        # that was answering imperfectly in the incident buckets -- below the
+        # per-bucket floor, so no process fault is shown -- is not a
+        # contemporaneous witness that the VPS itself was fine.
+        ("common_inbound_api_unproven",
+         both_paths_bundle(api_stale_from=3, minority_stale=True), "incident",
+         "insufficient_evidence",
+         ("journal_burst_reality", "journal_burst_hysteria2", "api_stale"),
+         ("collector_stale",),
+         ("contemporaneous_negatives_unproven",),
+         ("process_and_network_evidence_conflict",)),
+        # Health from the baseline buckets cannot vouch for the incident: the
+        # probe plane here is complete and healthy, and stops reporting
+        # exactly where the clients start dropping.
+        ("common_inbound_baseline_health_cannot_vouch",
+         both_paths_bundle(probe_buckets=3), "incident",
+         "insufficient_evidence",
+         ("journal_burst_reality", "journal_burst_hysteria2",
           "count_drop_reality", "count_drop_hysteria2"),
-         ("journal_burst_other_generic",), (), ()),
+         ("probe_generic_tcp_healthy",),
+         ("contemporaneous_negatives_unproven",), ()),
+        # Two anomalous runs with a quiet bucket between them are two
+        # episodes. One verdict cannot describe both, and folding them would
+        # attach each episode's evidence to the other's attribution, so the
+        # window is refused with what it saw still named.
+        ("two_clusters_fail_closed", split_episode_bundle(), "incident",
+         "insufficient_evidence", ("journal_burst_reality",),
+         ("count_drop_reality", "api_stale"),
+         ("multiple_anomaly_clusters", "root_cause_not_established"), ()),
+        # The control: runs that touch are one episode, and the second
+        # bucket-shaped fact does not split it.
+        ("adjacent_runs_are_one_episode",
+         split_episode_bundle(runs=((3, 5), (5, 7))), "incident",
+         "reality_tcp_path", ("journal_burst_reality",
+                             "probe_generic_tcp_healthy"),
+         ("count_drop_reality",), ("root_cause_not_established",),
+         ("multiple_anomaly_clusters",)),
+        # The impact facts are read per transport. Reality emptying drags the
+        # TOTAL down with it -- the total is the sum of the parts -- and that
+        # is still one path's outage, not proof that HY2 lost clients too.
+        ("reality_impact_is_not_shared", reality, "incident",
+         "reality_tcp_path",
+         ("count_drop_reality", "count_drop_total"),
+         ("count_drop_hysteria2", "journal_burst_hysteria2"),
+         ("root_cause_not_established",),
+         ("contemporaneous_negatives_unproven",)),
+        ("hy2_impact_is_not_shared", hy2_incident_bundle(), "incident",
+         "hysteria2_udp_path",
+         ("count_drop_hysteria2", "journal_burst_hysteria2"),
+         ("count_drop_reality", "journal_burst_reality"),
+         ("root_cause_not_established",), ()),
         ("api_down", api_down_bundle(), "incident", "vps_process_or_api",
          ("api_stale", "collector_stale"),
          ("journal_burst_reality", "journal_burst_hysteria2",
@@ -444,19 +565,32 @@ def scenarios():
         ("coverage_gap", coverage_gap_bundle(), "incident",
          "vps_process_or_api", ("sample_coverage_gap",),
          ("journal_burst_reality", "probe_failed_dns"), (), ()),
+        # Degraded diagnostics is a statement about this classifier's OWN
+        # evidence plane. It is named, and it votes for nothing: a window with
+        # no fault in it stays a window with no incident in it.
         ("history_degraded",
          reality_incident_bundle(steady=True, reality_errors=0,
                                  degraded=True,
                                  last_error_code="history_write_failed"),
-         "incident", "vps_process_or_api", ("history_degraded",),
-         ("journal_burst_reality",), (), ()),
+         "no_incident", "NONE", ("history_degraded", "no_anomaly"),
+         ("journal_burst_reality", "sample_coverage_gap", "api_stale"), (),
+         ()),
+        # The same degraded plane over a REAL fault: the incident is named by
+        # the fault's own evidence, never by the health flag.
+        ("degraded_over_real_incident",
+         reality_incident_bundle(degraded=True,
+                                 last_error_code="history_read_failed"),
+         "incident", "reality_tcp_path",
+         ("history_degraded", "journal_burst_reality", "count_drop_reality"),
+         ("sample_coverage_gap", "api_stale"), ("root_cause_not_established",),
+         ("process_and_network_evidence_conflict",)),
         # Two planes each show a real fault: naming either one as THE cause
         # would be a claim the evidence does not support.
         ("process_and_network_conflict",
-         reality_incident_bundle(degraded=True,
-                                 last_error_code="history_write_failed"),
+         reality_incident_bundle(api_stale_from=3),
          "incident", "insufficient_evidence",
-         ("history_degraded", "journal_burst_reality", "count_drop_reality"),
+         ("api_stale", "collector_stale", "journal_burst_reality",
+          "count_drop_reality"),
          (), ("process_and_network_evidence_conflict",), ()),
         # The forbidden inference: a bare count drop with no corroboration.
         ("drop_only_no_corroboration", drop_only_bundle(), "no_incident",
@@ -469,15 +603,76 @@ def scenarios():
          "no_incident", "NONE",
          ("no_anomaly", "probe_generic_tcp_healthy", "egress_ip_changed"),
          ("probe_failed_https",), (), ()),
+        # dns and https both aim at the Cloudflare leaf and egress at ipify,
+        # so "every generic slot failed" is ALSO what one endpoint outage
+        # looks like. With no client hurting and nothing outside the probe
+        # plane agreeing, it names no fault category at all.
         ("probe_outage_without_clients",
          bundle(samples=traffic(10),
                 probe_rows=probes(10, {"dns": "failed", "https": "failed",
                                        "egress": "failed"}),
                 journal_events=background_journal(10),
                 device_states=devices(10, [40] * 10)),
-         "incident", "vps_outbound",
+         "incident", "insufficient_evidence",
          ("probe_failed_dns", "probe_failed_https", "probe_failed_egress"),
-         ("probe_generic_tcp_healthy",), (), ()),
+         ("probe_generic_tcp_healthy", "count_drop_reality"),
+         ("probe_endpoint_confounded",), ()),
+        # The three controls: the same probe outage, each with one genuinely
+        # independent witness in the same buckets.
+        ("probe_outage_with_client_impact",
+         drop_only_bundle(probe_slots={"dns": "failed", "https": "failed",
+                                      "egress": "failed"}),
+         "incident", "vps_outbound",
+         ("probe_failed_https", "count_drop_reality"),
+         ("probe_generic_tcp_healthy",), ("root_cause_not_established",),
+         ("probe_endpoint_confounded",)),
+        ("probe_outage_with_egress_change",
+         bundle(samples=traffic(10),
+                probe_rows=probes(10, {"dns": "failed", "https": "failed"},
+                                  egress_change_at=4),
+                journal_events=background_journal(10),
+                device_states=devices(10, [40] * 10)),
+         "incident", "vps_outbound",
+         ("probe_failed_dns", "probe_failed_https", "egress_ip_changed"),
+         ("probe_failed_egress", "probe_generic_tcp_healthy"),
+         ("root_cause_not_established",), ("probe_endpoint_confounded",)),
+        ("probe_outage_with_generic_journal",
+         bundle(samples=traffic(10),
+                probe_rows=probes(10, {"dns": "failed", "https": "failed",
+                                       "egress": "failed"}),
+                journal_events=background_journal(10) + [
+                    journal_row(BASE + index * BUCKET + 40, "dial_timeout",
+                                "OTHER", "https443", 443, n=9)
+                    for index in range(4, 10)],
+                device_states=devices(10, [40] * 10)),
+         "incident", "vps_outbound",
+         ("probe_failed_https", "journal_burst_other_generic"),
+         ("probe_generic_tcp_healthy",), ("root_cause_not_established",),
+         ("probe_endpoint_confounded",)),
+        # An unavailable slot is the probe not looking at all -- the dark,
+        # un-activated state -- so it cannot outrank a path-specific fault.
+        ("probe_unavailable_is_not_a_fault",
+         reality_incident_bundle(
+             probe_slots={slot: ("failed", "unavailable")
+                          for slot in cl.PROBE_SLOTS}),
+         "incident", "reality_tcp_path",
+         ("journal_burst_reality", "count_drop_reality",
+          "probe_source_unavailable"),
+         ("probe_failed_dns", "probe_failed_https", "probe_failed_egress",
+          "probe_failed_udp", "probe_generic_tcp_healthy"),
+         ("root_cause_not_established", "probe_evidence_unusable"), ()),
+        # A refused or unparseable endpoint answer is the same absence of a
+        # witness, not an outage: the attribution stays on the journal plane.
+        ("probe_endpoint_answers_badly",
+         reality_incident_bundle(probe_slots={
+             "https": ("failed", "bad_response"),
+             "dns": ("failed", "parse_failed"),
+             "egress": ("failed", "bad_response")}),
+         "incident", "reality_tcp_path",
+         ("journal_burst_reality", "probe_source_unavailable"),
+         ("probe_failed_dns", "probe_failed_https", "probe_failed_egress",
+          "probe_generic_tcp_healthy"),
+         ("probe_evidence_unusable",), ()),
         # The UDP slot proves UDP reachability, not WHICH tunnel owns it:
         # sustained UDP failure alone is evidence without an attribution.
         ("udp_probe_only",
@@ -492,13 +687,18 @@ def scenarios():
          ("probe_failed_udp", "journal_burst_reality"),
          ("journal_burst_hysteria2",),
          ("root_cause_not_established",), ()),
+        # v3 stores a destination as a CLASS and a port, never an identity,
+        # so even the strongest target-shaped evidence in this store cannot
+        # name a destination: it is recorded and the window fails closed.
         ("destination_proof", destination_bundle(), "incident",
-         "destination_specific", ("journal_burst_destination",),
+         "insufficient_evidence",
+         ("journal_burst_destination", "probe_generic_tcp_healthy"),
          ("journal_burst_reality", "journal_burst_hysteria2",
-          "journal_burst_other_generic"), ("root_cause_not_established",),
-         ()),
-        # The required fail-closed: one blip of a target signature is not
-        # target-specific proof, so no destination may be named.
+          "journal_burst_other_generic"),
+         ("no_target_specific_proof", "root_cause_not_established"), ()),
+        # The fail-closed at its narrowest. This row is NOT about one bucket
+        # being too few: after G3 no amount of recurrence would be enough, so
+        # even the weakest target-shaped window refuses on the same token.
         ("destination_single_bucket",
          destination_bundle(from_index=4, to_index=5), "incident",
          "insufficient_evidence", ("journal_burst_destination",), (),
@@ -796,8 +996,10 @@ def group_invariants():
         valid = ((result.status == "no_incident"
                   and result.category == "NONE")
                  or (result.status in ("incident", "indeterminate")
-                     and result.category in cl.CATEGORIES))
+                     and result.category in cl.EMITTABLE_CATEGORIES))
         if not valid:
+            paired = False
+        if result.category == cl.CATEGORY_DESTINATION:
             paired = False
         if result.status == "incident" and not result.unknowns:
             incident_names_unknown = False
@@ -805,6 +1007,16 @@ def group_invariants():
     out["typed_result_always"] = open_results
     out["status_category_paired"] = paired
     out["incident_never_silent_on_unknowns"] = incident_names_unknown
+    # The unemittable category is refused by the sealing wall itself, not only
+    # by the rule that avoids asking for it: a later edit that reaches for
+    # destination_specific still cannot leave one in the result.
+    sealed = cl._seal(cl.STATUS_INCIDENT, cl.CATEGORY_DESTINATION, BASE,
+                      BASE + 600.0, 10, ("journal_burst_destination",), ())
+    out["seal_refuses_the_unemittable_category"] = (
+        sealed.status == cl.STATUS_INDETERMINATE
+        and sealed.category == cl.CATEGORY_INSUFFICIENT
+        and sealed.evidence == ()
+        and sealed.unknowns == ("attribution_ambiguous",))
     untouched = True
     for obj in bundles:
         snapshot = repr(obj)
@@ -1103,6 +1315,25 @@ def group_mirrors():
     out["categories_are_the_reviewed_seven"] = (
         len(cl.CATEGORIES) == 7 and len(set(cl.CATEGORIES)) == 7
         and cl.CATEGORY_NONE not in cl.CATEGORIES)
+    # `destination_specific` is in the vocabulary the spec froze and is NOT
+    # in the vocabulary the classifier may emit. Both halves are gated: the
+    # word must not be forgotten, and it must not be reachable.
+    out["emittable_is_the_seven_minus_one"] = (
+        set(cl.EMITTABLE_CATEGORIES) == set(cl.CATEGORIES) - {
+            cl.CATEGORY_DESTINATION}
+        and len(cl.EMITTABLE_CATEGORIES) == 6
+        and cl.CATEGORY_DESTINATION in cl.CATEGORIES)
+    # A 'failed' slot is either a fact about the network or the absence of a
+    # witness, and the split must cover every code the engine can store.
+    out["probe_code_split_partitions_the_codes"] = (
+        set(cl.PROBE_NETWORK_CODES) & set(cl.PROBE_SOURCE_CODES) == set()
+        and set(cl.PROBE_NETWORK_CODES) | set(cl.PROBE_SOURCE_CODES)
+        | {"NONE"} == set(cl.PROBE_ERROR_CODES)
+        and all(code in cl.PROBE_ERROR_CODES
+                for code in cl.PROBE_NETWORK_CODES + cl.PROBE_SOURCE_CODES))
+    out["source_codes_are_not_network_codes"] = (
+        {"unavailable", "bad_response", "parse_failed"}
+        <= set(cl.PROBE_SOURCE_CODES))
     out["derived_tokens_come_from_vocabularies"] = (
         {"journal_cls_" + n for n in cl.JOURNAL_CLASSES} <= cl.EVIDENCE_TOKENS
         and {"journal_audit_" + c for c in cl.JOURNAL_AUDIT_CODES}

@@ -33,9 +33,14 @@ Contract (docs/monitor-v2-incident-classifier-p4a.md):
 * **Fail closed.** A malformed or out-of-window bundle produces the
   conservative ``indeterminate`` / ``insufficient_evidence`` result with
   closed refusal tokens; the function never raises. An attribution is
-  refused unless the negatives it relies on are positively proven: a bare
-  connection-count drop is never an incident, and
-  ``destination_specific`` needs target-specific proof.
+  refused unless the negatives it relies on are positively proven IN THE
+  SAME BUCKETS as the anomaly: a bare connection-count drop is never an
+  incident, ``destination_specific`` is in the vocabulary but is never
+  emitted because v3 stores no destination identity, a probe failure whose
+  only independent witness is another probe on the same two external
+  endpoints does not name ``vps_outbound``, degraded diagnostics says only
+  that the evidence plane is degraded, and two anomaly clusters separated by
+  a quiet bucket are refused rather than folded into one combined verdict.
 """
 
 from __future__ import annotations
@@ -64,7 +69,11 @@ JOURNAL_BURST_MIN_COUNT = 5          # absolute floor above background ...
 JOURNAL_BURST_MULTIPLIER = 3.0       # ... and a multiple of its own baseline
 PROBE_FAIL_MIN_BUCKETS = 2           # anti-flap: one failed cycle is a blip
 PROBE_HEALTH_MIN_BUCKETS = 2         # positive proof generic TCP is healthy
-DESTINATION_MIN_BUCKETS = 2          # a target signature must recur, not blink
+
+# A cluster is a maximal run of adjacent anomalous buckets. Two runs that a
+# quiet bucket separates are two DIFFERENT episodes, and one verdict cannot
+# describe both, so the window fails closed instead of folding them together.
+CLUSTER_ADJACENCY_BUCKETS = 1
 
 # -- closed category vocabulary (fixed by the PR-4A spec) --------------------
 
@@ -80,6 +89,14 @@ CATEGORIES = (CATEGORY_VPS_PROCESS, CATEGORY_VPS_OUTBOUND,
               CATEGORY_REALITY_TCP, CATEGORY_HY2_UDP,
               CATEGORY_COMMON_INBOUND, CATEGORY_DESTINATION,
               CATEGORY_INSUFFICIENT)
+# `destination_specific` is in the vocabulary and is NEVER emitted. Schema v3
+# projects a destination only as (dcls, port) -- a class and a port, not an
+# identity -- so nothing in the accepted evidence can single out one target:
+# https443:443 is "the web", not "that site". The category stays named so the
+# gap is a stated fact rather than a silently forgotten word, and _seal()
+# refuses it structurally, so no later edit can leak it out by accident.
+EMITTABLE_CATEGORIES = tuple(name for name in CATEGORIES
+                             if name != CATEGORY_DESTINATION)
 # The sentinel style this repository already uses ('NONE' in the journal and
 # probe vocabularies): a verdict that is not an incident carries no
 # attribution at all rather than an invented one.
@@ -114,10 +131,23 @@ PROBE_STATUSES = ("ok", "failed")
 PROBE_ERROR_CODES = ("NONE", "timeout", "dns_failed", "connect_failed",
                      "tls_failed", "bad_response", "protocol_failed",
                      "parse_failed", "unavailable")
+# A "failed" slot is only network-significant when the engine reached the
+# network and was refused. bad_response/parse_failed/unavailable say the
+# PROBE could not adjudicate -- a refused or unparseable answer from the
+# endpoint, or the dark/unconfigured state, which is exactly what an
+# un-activated probe stores. Reading those as an outage would turn "I could
+# not look" into "the VPS is broken", so they prove nothing about the path and
+# are named as an unusable plane instead.
+PROBE_NETWORK_CODES = ("timeout", "dns_failed", "connect_failed",
+                       "tls_failed", "protocol_failed")
+PROBE_SOURCE_CODES = ("bad_response", "parse_failed", "unavailable")
 PROBE_CHANGE_VALUES = ("unchanged", "changed", "unknown")
 PROBE_SLOTS = ("dns", "https", "udp", "egress")
 # The slots that say "the VPS can reach the internet over TCP at all": a
-# failure here is generic, not a transport the clients own.
+# failure here is generic, not a transport the clients own. Note that they
+# are not three independent witnesses -- dns and https both aim at the
+# Cloudflare leaf and egress at ipify -- so a single endpoint outage looks
+# exactly like a VPS outbound failure. See _attribute().
 GENERIC_PROBE_SLOTS = ("dns", "https", "egress")
 # Mirror of the sanitized history health codes (the CODE_* constants).
 HISTORY_ERROR_CODES = ("history_dir_unsafe", "history_db_unsafe",
@@ -205,15 +235,19 @@ BASE_EVIDENCE_TOKENS = (
     "journal_burst_other_generic", "journal_burst_destination",
     "journal_burst_unattributed",
     "probe_failed_dns", "probe_failed_https", "probe_failed_udp",
-    "probe_failed_egress", "probe_generic_tcp_healthy", "egress_ip_changed",
+    "probe_failed_egress", "probe_source_unavailable",
+    "probe_generic_tcp_healthy", "egress_ip_changed",
     "api_stale", "collector_stale", "sample_coverage_gap",
     "history_degraded", "journal_continuity_gap", "journal_rejected_batch",
 )
 BASE_UNKNOWN_TOKENS = (
     "no_corroboration", "count_drop_only", "attribution_ambiguous",
     "baseline_evidence_absent", "transport_negatives_unproven",
-    "probe_evidence_absent", "journal_evidence_absent",
-    "journal_evidence_incomplete", "no_target_specific_proof",
+    "contemporaneous_negatives_unproven", "probe_evidence_absent",
+    "probe_evidence_unusable", "probe_endpoint_confounded",
+    "multiple_anomaly_clusters",
+    "journal_evidence_absent", "journal_evidence_incomplete",
+    "no_target_specific_proof",
     "multiple_destinations", "process_and_network_evidence_conflict",
     "unattributed_evidence_present",
     "evidence_shape_rejected", "evidence_outside_window",
@@ -248,6 +282,8 @@ _AUDIT_KIND_TOKENS = frozenset(JOURNAL_AUDIT_KINDS)
 _AUDIT_CODE_TOKENS = frozenset(JOURNAL_AUDIT_CODES)
 _PROBE_STATUS_TOKENS = frozenset(PROBE_STATUSES)
 _PROBE_CODE_TOKENS = frozenset(PROBE_ERROR_CODES)
+_PROBE_NETWORK_TOKENS = frozenset(PROBE_NETWORK_CODES)
+_PROBE_SOURCE_TOKENS = frozenset(PROBE_SOURCE_CODES)
 _PROBE_CHANGE_TOKENS = frozenset(PROBE_CHANGE_VALUES)
 _HISTORY_TOKENS = frozenset(HISTORY_ERROR_CODES)
 _READER_TOKENS = frozenset(READER_STATUSES)
@@ -522,14 +558,22 @@ def _analyse(evidence, start, buckets):
         evidence["journal_events"], "ts", start, buckets)]
     audit = _audit_view(_bucketed(evidence["audit"], "epoch", start, buckets))
 
-    seen, unknown = _observations(samples, probes, journal, audit)
+    degraded = bool(evidence["health"]["degraded"])
+    seen, unknown = _observations(samples, probes, journal, audit, degraded)
     window_end = start + buckets * BUCKET_SECONDS
+    window_indices = set(range(buckets))
     probe_seen = bool(evidence["probe_rows"])
     journal_seen = bool(evidence["journal_events"])
     # A window of samples that is entirely empty says "this caller handed me
     # nothing", not "the Monitor was down": absence of input is never
     # evidence of a fault, so it must not fabricate a coverage gap.
     window_has_samples = any(stats["rows"] for stats in samples)
+
+    def note_health(indices):
+        if _generic_tcp_healthy(probes, indices):
+            seen.add("probe_generic_tcp_healthy")
+            return True
+        return False
 
     if buckets <= MIN_BASELINE_BUCKETS:
         # Too short to hold a candidate bucket: nothing here is provable,
@@ -541,28 +585,30 @@ def _analyse(evidence, start, buckets):
     reference = _baseline(samples, journal, buckets)
     if not reference["usable"]:
         unknown.add("baseline_evidence_absent")
-    slot_fail = _probe_failures(probes)
-    generic_healthy = _generic_tcp_healthy(probes)
-    if generic_healthy:
-        seen.add("probe_generic_tcp_healthy")
+    probe_marks = _probe_failures(probes)
+    # Whether the JOURNAL can prove a negative at all is a property of the
+    # window -- a gap or an unreadable reader is a gap wherever it is found.
+    # Whether the PROBE plane vouches for the outbound path is a property of
+    # the minutes being judged, so it is only ever computed per cluster.
     journal_state = _journal_view_state(evidence["reader"]["status"], audit)
-    negatives_provable = (journal_state == "complete" or generic_healthy)
+    journal_provable = journal_state == "complete"
     if journal_state == "incomplete":
         unknown.add("journal_evidence_incomplete")
     elif journal_state == "absent":
         unknown.add("journal_evidence_absent")
-    degraded = bool(evidence["health"]["degraded"])
 
     candidates = []
     for index in range(MIN_BASELINE_BUCKETS, buckets):
         anomaly = _bucket_anomaly(index, samples, devices, journal, reference,
-                                  slot_fail, degraded, window_has_samples)
+                                  probe_marks, window_has_samples)
         if anomaly is not None:
+            anomaly["index"] = index
             candidates.append(anomaly)
     if not candidates:
         # "Nothing anomalous" is only a finding when there was something to
         # look at: with no count baseline and no independent plane the
         # honest answer is that this window cannot answer the question.
+        note_health(window_indices)
         if reference["usable"] and (probe_seen or journal_seen):
             seen.add("no_anomaly")
             return _seal(STATUS_NO_INCIDENT, CATEGORY_NONE, start, window_end,
@@ -570,19 +616,64 @@ def _analyse(evidence, start, buckets):
         return _seal(STATUS_INDETERMINATE, CATEGORY_INSUFFICIENT, start,
                      window_end, buckets, seen, unknown)
 
-    flags = _collect(candidates, seen)
     families = set()
     for anomaly in candidates:
         families.update(anomaly["families"])
     if not families & set(CORROBORATING_FAMILIES):
         # Exactly the case the spec forbids from becoming an incident: the
         # API view moved and nothing independent agrees with it.
+        _collect(candidates, seen)
+        note_health(window_indices)
         unknown.update(("count_drop_only", "no_corroboration"))
         return _seal(STATUS_NO_INCIDENT, CATEGORY_NONE, start, window_end,
                      buckets, seen, unknown)
 
+    clusters = _clusters(anomaly["index"] for anomaly in candidates)
+    if len(clusters) > 1:
+        # Two episodes with a quiet bucket between them. One verdict cannot
+        # describe both, and merging them would attach the second episode's
+        # evidence to the first episode's attribution, so the window is
+        # refused as a whole instead of folded.
+        _collect(candidates, seen)
+        note_health(window_indices)
+        unknown.add("multiple_anomaly_clusters")
+        return _seal(STATUS_INCIDENT, CATEGORY_INSUFFICIENT, start, window_end,
+                     buckets, seen, unknown)
+
+    indices = set(clusters[0])
+    flags = _collect(candidates, seen)
+    generic_healthy = note_health(indices)
+    api_healthy = _api_healthy(samples, indices)
+    egress_changed = any(probes[index]["changed"] for index in indices)
+    negatives_provable = (journal_provable or generic_healthy)
     return _attribute(flags, seen, unknown, start, window_end, buckets,
-                      probe_seen, negatives_provable)
+                      probe_seen, negatives_provable, generic_healthy,
+                      api_healthy, egress_changed)
+
+
+def _clusters(indices):
+    """Maximal runs of adjacent anomalous buckets: separated runs are
+    separate episodes and are never folded into one verdict."""
+    runs = []
+    for index in sorted(indices):
+        if runs and index == runs[-1][-1] + CLUSTER_ADJACENCY_BUCKETS:
+            runs[-1].append(index)
+        else:
+            runs.append([index])
+    return runs
+
+
+def _api_healthy(samples, indices):
+    """Positive proof the API view was ANSWERING, over exactly the buckets
+    being judged. An absent or stale sample row cannot count as health, and
+    health measured in the baseline cannot vouch for the incident."""
+    if not indices:
+        return False
+    for index in indices:
+        stats = samples[index]
+        if not stats["rows"] or stats["stale"] or stats["collector_stale"]:
+            return False
+    return True
 
 
 def _bucketed(rows, key, start, buckets):
@@ -627,14 +718,21 @@ def _device_stats(rows):
 
 
 def _probe_stats(rows):
-    slots = {slot: {"ok": 0, "failed": 0} for slot in PROBE_SLOTS}
+    """Per-slot tallies split by what a failure PROVES. 'network' is the
+    engine reaching the network and being refused; 'unusable' is a refused or
+    unparseable endpoint answer, or the dark/unconfigured state. Only
+    'network' can ever speak for the path."""
+    slots = {slot: {"ok": 0, "network": 0, "unusable": 0}
+             for slot in PROBE_SLOTS}
     changed = 0
     for row in rows:
         for slot in PROBE_SLOTS:
             if row["%s_status" % slot] == "ok":
                 slots[slot]["ok"] += 1
+            elif row["%s_error_code" % slot] in _PROBE_NETWORK_TOKENS:
+                slots[slot]["network"] += 1
             else:
-                slots[slot]["failed"] += 1
+                slots[slot]["unusable"] += 1
         if row["egress_change"] == "changed":
             changed += 1
     return {"rows": len(rows), "slots": slots, "changed": changed}
@@ -687,16 +785,22 @@ def _baseline(samples, journal, buckets):
 
 
 def _probe_failures(probes):
-    """Per-slot, per-bucket failure marks with the anti-flap rule applied:
-    a slot must fail in PROBE_FAIL_MIN_BUCKETS consecutive buckets, and then
-    every bucket of that run is marked."""
+    """Per-slot, per-bucket FAULT marks with the anti-flap rule applied: a slot
+    must FAIL FOR THE NETWORK in PROBE_FAIL_MIN_BUCKETS consecutive buckets,
+    and then every bucket of that run is marked.
+
+    Unusable slots are deliberately NOT marked here: an unavailable or
+    unparseable endpoint answer is the absence of a witness, not a fault, so
+    it can only ever weaken a claim. It is read straight from the per-bucket
+    tallies by `_generic_tcp_healthy` and `_observations`, which is the only
+    place an absent witness belongs."""
     buckets = len(probes)
     marks = {slot: [False] * buckets for slot in PROBE_SLOTS}
     for slot in PROBE_SLOTS:
         run = []
         for index in range(buckets):
             stats = probes[index]["slots"][slot]
-            if stats["failed"] and not stats["ok"]:
+            if stats["network"] and not stats["ok"]:
                 run.append(index)
                 continue
             if len(run) >= PROBE_FAIL_MIN_BUCKETS:
@@ -709,11 +813,18 @@ def _probe_failures(probes):
     return marks
 
 
-def _generic_tcp_healthy(probes):
+def _generic_tcp_healthy(probes, indices):
+    """Positive proof that the VPS reaches the internet over generic TCP,
+    counted ONLY over `indices`. Health measured in the quiet baseline buckets
+    is deliberately not admitted: 'it worked before' cannot vouch for the
+    minutes that are already hurting, and only contemporaneous health is a
+    witness that the outbound path was fine WHILE the clients were dropping."""
     healthy = 0
-    for stats in probes:
+    for index in indices:
+        stats = probes[index]
         if all(stats["slots"][slot]["ok"] > 0
-               and not stats["slots"][slot]["failed"]
+               and not stats["slots"][slot]["network"]
+               and not stats["slots"][slot]["unusable"]
                for slot in GENERIC_PROBE_SLOTS):
             healthy += 1
     return healthy >= PROBE_HEALTH_MIN_BUCKETS
@@ -733,8 +844,8 @@ def _journal_view_state(reader_status, audit):
     return "absent"
 
 
-def _bucket_anomaly(index, samples, devices, journal, reference, slot_fail,
-                    degraded, window_has_samples):
+def _bucket_anomaly(index, samples, devices, journal, reference, probe_marks,
+                    window_has_samples):
     marks = {"connections": set(), "device": set(), "journal": set(),
              "probe": set(), "process": set()}
     stats = samples[index]
@@ -745,8 +856,6 @@ def _bucket_anomaly(index, samples, devices, journal, reference, slot_fail,
         marks["process"].add("api_stale")
     if stats["rows"] and stats["collector_stale"] >= floor:
         marks["process"].add("collector_stale")
-    if degraded:
-        marks["process"].add("history_degraded")
 
     if reference["usable"] and stats["rows"] >= MIN_SAMPLES_PER_BUCKET:
         # A bucket with too few samples proves only that the Monitor was
@@ -767,7 +876,7 @@ def _bucket_anomaly(index, samples, devices, journal, reference, slot_fail,
             marks["journal"].add(key)
 
     for slot in PROBE_SLOTS:
-        if slot_fail[slot][index]:
+        if probe_marks[slot][index]:
             marks["probe"].add(slot)
 
     families = set()
@@ -784,7 +893,7 @@ def _bucket_anomaly(index, samples, devices, journal, reference, slot_fail,
     return {"families": families, "marks": marks}
 
 
-def _observations(samples, probes, journal, audit):
+def _observations(samples, probes, journal, audit, degraded):
     """What the window shows even when nothing is anomalous, so a quiet
     verdict still carries its own evidence and its own unknowns."""
     seen = set()
@@ -804,6 +913,15 @@ def _observations(samples, probes, journal, audit):
         seen.add("api_stale")
     if any(stats["changed"] for stats in probes):
         seen.add("egress_ip_changed")
+    # Degraded diagnostics is a statement about THIS classifier's own evidence
+    # plane, never about the client's incident: it is named here so a quiet
+    # verdict says which plane was shaky, and it votes for nothing.
+    if degraded:
+        seen.add("history_degraded")
+    if any(stats["slots"][slot]["unusable"]
+           for stats in probes for slot in PROBE_SLOTS):
+        seen.add("probe_source_unavailable")
+        unknown.add("probe_evidence_unusable")
     if not any(stats["rows"] for stats in samples):
         unknown.add("baseline_evidence_absent")
     if not any(stats["rows"] for stats in probes):
@@ -824,23 +942,41 @@ def _collect(candidates, seen):
     """Record what every candidate bucket actually shows, then fold the
     marks into the attribution facts. Split from the verdict on purpose:
     the OBSERVATIONS belong to the window even when the classifier refuses
-    to attribute it, so a fail-closed answer still says what it saw."""
-    reality = hy2 = generic = process = unattributed = False
-    destination = {}
+    to attribute it, so a fail-closed answer still says what it saw.
+
+    Faults (what is failing) and impacts (whose clients dropped) are kept
+    apart: a Reality failure that also emptied the HY2 counter is not a
+    Reality-only incident, and only the impact facts can say that."""
+    reality = hy2 = generic_journal = generic_probe = False
+    process = unattributed = False
+    reality_impact = hy2_impact = False
+    destination = set()
     for anomaly in candidates:
         marks = anomaly["marks"]
         pairs = set()
         for name in marks["connections"]:
             seen.add(_DROP_TOKENS[name])
+            # Impact is read from a transport's OWN counter. The total is the
+            # sum of the parts, so a Reality-only collapse necessarily drops
+            # it too -- treating count_drop_total as HY2 impact would turn one
+            # path's outage into proof that the other path also lost clients.
+            if name == "reality_active_connections":
+                reality_impact = True
+            if name == "hysteria2_active_connections":
+                hy2_impact = True
         if marks["device"]:
+            # Every device quiet is impact on both transports, by definition:
+            # the device counter spans them, so no client is connected at all.
             seen.add("all_devices_quiet")
+            reality_impact = True
+            hy2_impact = True
         for token in marks["process"]:
             seen.add(token)
             process = True
         for slot in marks["probe"]:
             seen.add("probe_failed_" + slot)
             if slot in GENERIC_PROBE_SLOTS:
-                generic = True
+                generic_probe = True
         for key in marks["journal"]:
             _cls, proto, dcls, port = key
             if proto == "Reality":
@@ -850,7 +986,7 @@ def _collect(candidates, seen):
                 hy2 = True
                 seen.add("journal_burst_hysteria2")
             elif proto == "OTHER" and dcls in GENERIC_TCP_DCLS:
-                generic = True
+                generic_journal = True
                 seen.add("journal_burst_other_generic")
             elif proto == "OTHER" and dcls != "NONE":
                 pairs.add((dcls, port))
@@ -858,25 +994,27 @@ def _collect(candidates, seen):
             else:
                 unattributed = True
                 seen.add("journal_burst_unattributed")
-        # One candidate bucket is ONE vote per destination, however many
-        # failure classes arrived in it: target-specific proof needs a
-        # signature that RECURS across buckets, not a single busy bucket.
-        for pair in pairs:
-            destination[pair] = destination.get(pair, 0) + 1
-    return {"reality": reality, "hy2": hy2, "generic": generic,
-            "process": process, "unattributed": unattributed,
-            "destination": destination}
+        destination.update(pairs)
+    return {"reality": reality, "hy2": hy2,
+            "generic_journal": generic_journal,
+            "generic_probe": generic_probe, "process": process,
+            "unattributed": unattributed, "reality_impact": reality_impact,
+            "hy2_impact": hy2_impact, "destination": destination}
 
 
 def _attribute(flags, seen, unknown, start, window_end, buckets, probe_seen,
-               negatives_provable):
+               negatives_provable, generic_healthy, api_healthy,
+               egress_changed):
     reality = flags["reality"]
     hy2 = flags["hy2"]
-    generic = flags["generic"]
+    generic_journal = flags["generic_journal"]
+    generic_probe = flags["generic_probe"]
     process = flags["process"]
     destination = flags["destination"]
+    shared_impact = flags["reality_impact"] and flags["hy2_impact"]
 
-    network = reality or hy2 or generic or bool(destination)
+    network = (reality or hy2 or generic_journal or generic_probe
+               or bool(destination) or shared_impact)
     if process and network:
         # Two independent planes each show a real fault. Naming either one
         # as THE cause would be a claim the evidence does not support.
@@ -886,24 +1024,48 @@ def _attribute(flags, seen, unknown, start, window_end, buckets, probe_seen,
     if process:
         return _seal(STATUS_INCIDENT, CATEGORY_VPS_PROCESS, start, window_end,
                      buckets, seen, unknown)
-    if generic:
-        # The VPS's own TCP reachability, or generic HTTPS/OTHER-protocol
-        # journal errors, is BROADER than any one transport: it upgrades a
-        # path-specific candidate to vps_outbound.
-        return _seal(STATUS_INCIDENT, CATEGORY_VPS_OUTBOUND, start,
-                     window_end, buckets, seen, unknown)
-    if destination and not reality and not hy2:
+    if destination:
+        # v3 stores a destination as a CLASS and a port, never an identity, so
+        # this evidence is named and then set aside: it can widen a verdict to
+        # vps_outbound below, it cannot narrow one to a target.
+        unknown.add("no_target_specific_proof")
         if len(destination) > 1:
             unknown.add("multiple_destinations")
+        if not (reality or hy2 or generic_journal or generic_probe
+                or shared_impact):
             return _seal(STATUS_INCIDENT, CATEGORY_INSUFFICIENT, start,
                          window_end, buckets, seen, unknown)
-        if max(destination.values()) < DESTINATION_MIN_BUCKETS:
-            # A target signature that blinks once is not proof: fail closed
-            # rather than name a destination.
-            unknown.add("no_target_specific_proof")
+    if generic_journal or generic_probe:
+        # Generic TCP reachability, or generic HTTPS/OTHER-protocol journal
+        # errors, is BROADER than any one transport: it upgrades a
+        # path-specific candidate to vps_outbound.
+        if generic_probe and not generic_journal:
+            # dns and https both aim at the Cloudflare leaf and egress at
+            # ipify, so all three failing together is ALSO what a single
+            # endpoint outage looks like. It names vps_outbound only when a
+            # plane outside the probes agrees in the same buckets.
+            if not (reality or hy2 or flags["reality_impact"]
+                    or flags["hy2_impact"] or egress_changed):
+                unknown.add("probe_endpoint_confounded")
+                return _seal(STATUS_INCIDENT, CATEGORY_INSUFFICIENT, start,
+                             window_end, buckets, seen, unknown)
+        return _seal(STATUS_INCIDENT, CATEGORY_VPS_OUTBOUND, start,
+                     window_end, buckets, seen, unknown)
+    if shared_impact or (reality and hy2):
+        # Both transports hurt at once, so no single transport explains it.
+        # Naming the shared path needs IMPACT on both paths in these same
+        # buckets and POSITIVE contemporaneous proof that the VPS's own
+        # outbound probes and API view were healthy while it was happening;
+        # baseline health is not admitted as that proof.
+        if not shared_impact:
+            unknown.add("attribution_ambiguous")
             return _seal(STATUS_INCIDENT, CATEGORY_INSUFFICIENT, start,
                          window_end, buckets, seen, unknown)
-        return _guarded(CATEGORY_DESTINATION, flags["unattributed"], seen,
+        if not (generic_healthy and api_healthy):
+            unknown.add("contemporaneous_negatives_unproven")
+            return _seal(STATUS_INCIDENT, CATEGORY_INSUFFICIENT, start,
+                         window_end, buckets, seen, unknown)
+        return _guarded(CATEGORY_COMMON_INBOUND, flags["unattributed"], seen,
                         unknown, start, window_end, buckets,
                         negatives_provable, probe_seen)
     if reality and not hy2:
@@ -914,12 +1076,6 @@ def _attribute(flags, seen, unknown, start, window_end, buckets, probe_seen,
         return _guarded(CATEGORY_HY2_UDP, flags["unattributed"], seen, unknown,
                         start, window_end, buckets, negatives_provable,
                         probe_seen)
-    if reality and hy2:
-        return _guarded(CATEGORY_COMMON_INBOUND, flags["unattributed"], seen,
-                        unknown, start, window_end, buckets,
-                        negatives_provable, probe_seen)
-    if destination:
-        unknown.add("no_target_specific_proof")
     unknown.add("attribution_ambiguous")
     return _seal(STATUS_INCIDENT, CATEGORY_INSUFFICIENT, start, window_end,
                  buckets, seen, unknown)
@@ -971,7 +1127,7 @@ def _seal(status, category, window_start, window_end, buckets, evidence,
     pairing_valid = ((status == STATUS_NO_INCIDENT
                       and category == CATEGORY_NONE)
                      or (status in (STATUS_INCIDENT, STATUS_INDETERMINATE)
-                         and category in CATEGORIES))
+                         and category in EMITTABLE_CATEGORIES))
     if status not in STATUSES or not pairing_valid:
         return Classification(CLASSIFIER_VERSION, STATUS_INDETERMINATE,
                              CATEGORY_INSUFFICIENT, float(window_start),
