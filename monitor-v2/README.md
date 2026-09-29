@@ -405,17 +405,20 @@ History 升到 **schema v3**：恰好一张新表 `network_probe_samples`（19 �
 > 2026-09-29 补充（同版本，**未发布**）：Phase 4 第一步 PR-4A 在 `web/` 内新增
 > `incident_classifier.py`——schema v3 四证据面上的**纯函数式事件分类器**。它把 60
 > 秒有界窗口内的 timeline 样本、设备计数、journal 事件与探测结果折叠成一个闭合类型
-> 结果（七类词表 + 44 个 evidence token + 23 个 unknown token，全部字面量钉在场道里），
+> 结果（七类词表 + 45 个 evidence token + 27 个 unknown token，全部字面量钉在场道里），
 > 且**默认 DARK**：`monitor-v2/` 下没有任何模块导入它，无新端点 / 无 UI / 无 schema
 > 变更 / 无部署改动，`VERSION` 与 `MONITOR_WEB_VERSION` 仍是 `0.4.0`。三条不变量决定
 > 它可信：单纯连接数下降**永不**独立成为事件（必须有 journal / probe / process 独立
 > 证据佐证，背景 `eof_cancel` / `reset` 噪声因此保持非事件）；依赖"其它路径是安静的"
-> 这类反面结论必须先正面证明反面（journal 视图完整**或** generic TCP 探测健康，否则
-> `transport_negatives_unproven` 并降级为 `insufficient_evidence`）；`destination_specific`
-> 只在同一 `(dcls, port)` 签名跨桶复现时输出，否则 fail closed，绝不猜测目标。每个
+> 这类反面结论必须先正面证明反面，而且**作证时段必须与事故时段重叠**——健康度按异常
+> 簇而非整个窗口统计（journal 视图完整**或**该簇内 generic TCP 探测健康，否则
+> `transport_negatives_unproven` / `contemporaneous_negatives_unproven` 并降级为
+> `insufficient_evidence`）；`destination_specific` 保留在词表里但**结构性不可达**——
+> schema v3 只把目的地投影成 `(dcls, port)`，一个类别加一个端口不是身份，因此目标级
+> 证据一律命名后 fail closed，绝不猜测目标。每个
 > `incident` 无条件携带 `root_cause_not_established`：分类器说"证据指向哪里"，永远
 > 不说"为什么"。契约、阈值表与已知边界见 `docs/monitor-v2-incident-classifier-p4a.md`；
-> 车道 `tests/test-monitor-v2-classify.sh`（`EXPECTED_PASS=433`，含两份提交进仓的夹具
+> 车道 `tests/test-monitor-v2-classify.sh`（`EXPECTED_PASS=582`，含两份提交进仓的夹具
 > 与四条"改证据即改答案"的变异判别器）当前只登记在 `tests.yml`，接线属 Phase 4B。
 
 ### 请求门顺序（每个普通请求）

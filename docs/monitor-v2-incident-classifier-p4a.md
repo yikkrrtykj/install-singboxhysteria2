@@ -3,10 +3,10 @@
 状态：**DRAFT PR，未合并、未部署**。
 基线：`main @ 965751c`（PR-3B 事务预状态，`VERSION = 0.4.0`）。
 分支：`codex/incident-classifier-p4a-033`。
-交付物：`monitor-v2/web/incident_classifier.py`（纯 stdlib、993 行）
+交付物：`monitor-v2/web/incident_classifier.py`（纯 stdlib、1151 行）
 + `tests/monitor-classify/classify_groups.py`（七组行为判别器）
 + 两份提交进仓的 fixture + 新车道 `tests/test-monitor-v2-classify.sh`
-（`EXPECTED_PASS=433`）。
+（`EXPECTED_PASS=582`）。
 前序文档：`docs/monitor-v2-incident-history-p1.md`（历史库与禁持久化清单）、
 `docs/monitor-v2-journal-reader-p2a.md`（journal 闭合枚举）、
 `docs/monitor-v2-network-probes-p3a.md` / `-p3b.md`（探测引擎与入库边界）。
@@ -24,6 +24,14 @@ systemd/scheduler/deploy 改动，`VERSION` 与 `MONITOR_WEB_VERSION` 仍是
 `destination_specific` / `insufficient_evidence`，外加一个只用于非事件结果的
 `NONE` 哨兵。所有结果**同时**携带闭合的 `evidence` 与 `unknowns`：分类器说
 "证据指向哪里"，永远不说"为什么"。
+
+第三轮把"证据指向哪里"这句话收紧成可检查的纪律，八条反例逐条入门（§4、§5）：
+目的地身份在 v3 里不存在，因此 `destination_specific` 保留词汇但结构性不可达；
+`health.degraded` 只描述证据平面，不再产生进程类事件；探测失败码区分"网络
+拒绝"与"证人缺席"，后者不能证明 VPS 出口；只有探测平面的 outage 因端点共因而
+拒绝；连接数下降按传输各自的计数读成影响位；`common_inbound_client_office`
+要求同期双传输影响 **加** 同期出口/API 健康的正面反证；所有反面健康度按异常
+**簇**而非窗口计算；被安静桶隔开的两个簇一律 fail closed。
 
 ## 2. 输入契约：只有 v3 真实存在的投影
 
@@ -62,7 +70,7 @@ systemd/scheduler/deploy 改动，`VERSION` 与 `MONITOR_WEB_VERSION` 仍是
 unknowns`——没有能放句子、地址或设备名的位置（车道 S0/S1 与 harness 各自钉
 一次，改宽要同时改两个由不同人手写的文件）。
 
-- `evidence` 44 个 token、`unknowns` 23 个 token，两平面**互斥**，全部是小写
+- `evidence` 45 个 token、`unknowns` 27 个 token，两平面**互斥**，全部是小写
   snake_case；词汇字面量同时写在场道 shell 文件里（§7）。
 - 两个 tuple 排序去重；输入打乱顺序、并发调用、重复调用**逐字节等值**
   （invariants 组：8 线程 + 400 轮随机 fuzz，fuzz 只允许产生白名单 token）。
@@ -70,6 +78,9 @@ unknowns`——没有能放句子、地址或设备名的位置（车道 S0/S1 �
   只读字段被消费……一律结算为 `indeterminate` / `insufficient_evidence` 加
   闭合拒绝 token。
 - `CLASSIFIER_VERSION = 1` 随结果输出，供未来接线方判定读的是哪一版权约。
+- 可输出类别是 `EMITTABLE_CATEGORIES`（六项）。第七项 `destination_specific`
+  仍留在冻结词汇表里——缺口要说清而不是遗忘——但 `_seal()` 结构性拒绝它，
+  因此没有任何代码路径能把它送进结果（车道 S1 与 harness 各自钉一次）。
 
 ## 4. 判定规则（阈值全部是命名常量）
 
@@ -81,11 +92,21 @@ unknowns`——没有能放句子、地址或设备名的位置（车道 S0/S1 �
 | connections | 某类计数均值 ≤ 基线 ×(1−`COUNT_DROP_RATIO`)，且基线 ≥ `COUNT_DROP_MIN_BASELINE`，绝对降幅 ≥ `COUNT_DROP_MIN_ABSOLUTE` | 0.5 / 5.0 / 3.0 |
 | connections | 桶内 ≥ `ALL_DEVICES_QUIET_MIN` 台设备且全部为 0 | 2 |
 | journal | 某 `(cls, proto, dcls, port)` 键在桶内 `n` 之和 ≥ max(`JOURNAL_BURST_MIN_COUNT`, `JOURNAL_BURST_MULTIPLIER` × 该键基线中位数) | 5 / 3.0 |
-| probe | 某 slot 连续 ≥ `PROBE_FAIL_MIN_BUCKETS` 个桶失败（防抖：单周期失败只是 blip） | 2 |
-| process | 桶内 `api_status=STALE` 或 `collector_stale` 占比 ≥ `API_STALE_BUCKET_FRACTION`；或样本数 < `MIN_SAMPLES_PER_BUCKET`（覆盖缺口）；或 `health.degraded` | 0.5 / 6 |
+| probe | 某 slot **因网络而**连续 ≥ `PROBE_FAIL_MIN_BUCKETS` 个桶失败（防抖：单周期失败只是 blip）。只有 `PROBE_NETWORK_CODES = timeout / dns_failed / connect_failed / tls_failed / protocol_failed` 算"引擎抵达了网络并被拒绝" | 2 |
+| （非族）probe | `PROBE_SOURCE_CODES = bad_response / parse_failed / unavailable` 是**证人缺席**而不是故障：它们是端点拒答/无法解析，以及未启用的 DARK 状态本身。不进入任何族、不参与 corroboration，只命名 `probe_source_unavailable` + `probe_evidence_unusable`；缺席不需要防抖，一个桶就足以说明该时刻无法作证 | — |
+| process | 桶内 `api_status=STALE` 或 `collector_stale` 占比 ≥ `API_STALE_BUCKET_FRACTION`；或样本数 < `MIN_SAMPLES_PER_BUCKET`（覆盖缺口） | 0.5 / 6 |
+
+`health.degraded` **不是**一个族。它描述的是 diagnostics 自身证据平面的质量，
+因此只作为 evidence 命名（`history_degraded`），永远不产生
+`vps_process_or_api`，也不参与 corroboration——"我的记录面降级了"既不证明
+客户受影响，也不证明客户没受影响。
 
 样本数不足的桶**只**说明 Monitor 当时没在发布（process 信号），绝不推断为
 "客户端掉零"。整个窗口一行样本都没有时，不伪造覆盖缺口——那是调用方没给证据。
+
+**簇（cluster）**是极大相邻异常桶串，间隔判据是
+`CLUSTER_ADJACENCY_BUCKETS = 1`。凡"需要反面证据"的结论，其健康度只按**簇内**
+桶计算（见 G5、G8）：基线时段的健康不能替事故时段作证。
 
 ** corroboration 门（规格明令）**：只有 connections 族动过、journal/probe/
 process 三族一致沉默时，结果是 `no_incident` + `count_drop_only` +
@@ -94,21 +115,35 @@ normal-background 对照夹具因此保持非事件。
 
 ## 5. 归因规则与 fail-closed 门
 
-归因先折叠成六个事实位（`reality` / `hy2` / `generic` / `process` /
-`unattributed` / `destination`），再按**唯一一条**顺序落到类别：
+归因先把异常桶折叠成**事实位**，再按**唯一一条**顺序落到类别。事实位分两类，
+刻意不混用：
+
+- **故障位**（谁在坏）：`reality` / `hy2`（journal 突发）、`generic_journal`
+  （`OTHER` 协议落在 `https443`/`http80`）、`generic_probe`（dns/https/egress
+  因网络而失败）、`process`、`destination`（`(dcls, port)` 签名集合）、
+  `unattributed`。
+- **影响位**（谁的客户端少了）：`reality_impact`、`hy2_impact`。二者**只**从
+  各自传输自己的计数列（或"所有设备全安静"）得出。`total` 是分项之和，
+  Reality 单独塌方必然拖着 `total` 一起下降，因此 `count_drop_total`
+  **绝不**算 HY2 的影响——那会把一条路径的中断写成"另一条路径也丢了客户"。
 
 | # | 条件 | 结果 |
 | --- | --- | --- |
-| G1 | `process` 与任一网络族同时成立 | `incident` + `insufficient_evidence` + `process_and_network_evidence_conflict`（两个独立平面各自都在坏，点名任一个都是越证） |
+| G1 | `process` 与任一网络位同时成立 | `incident` + `insufficient_evidence` + `process_and_network_evidence_conflict`（两个独立平面各自都在坏，点名任一个都是越证） |
 | G2 | 仅 `process` | `vps_process_or_api` |
-| G3 | `generic`（dns/https/egress 任一探测失败，或 `OTHER` 协议在 `https443`/`http80` 上突发） | `vps_outbound`——比任何单一传输更宽的证据存在时，路径结论被抬升 |
-| G4 | 只有目标级证据且签名 `(dcls, port)` **唯一**且跨 ≥ `DESTINATION_MIN_BUCKETS` 个桶复现 | `destination_specific`（仍受 G7 约束） |
-| G5 | `reality` 且非 `hy2` | `reality_tcp_path`（受 G7 约束） |
-| G6 | `hy2` 且非 `reality` → `hysteria2_udp_path`；两者皆真 → `common_inbound_client_office` | 同受 G7 约束 |
-| G7 | 上述任何"依赖反面证据"的结论，必须先证明反面：journal 视图**完整**（reader `fresh` 且窗口内无 gap/被拒批次）**或** generic TCP 探测**健康**（≥2 桶三槽全 `ok` 且无失败）。否则 `insufficient_evidence` + `transport_negatives_unproven` | "我看不了" ≠ "我看了没有" |
-| G8 | 目标证据只有一个桶出现、或同时出现多个目标签名 | `insufficient_evidence` + `no_target_specific_proof` / `multiple_destinations`——**绝不凭猜测输出** `destination_specific` |
-| G9 | `udp` 探测失败**不**映射为 `hysteria2_udp_path`：引擎的 udp 槽是应用层 DNS 往返，不是 HY2 数据面。它作为 probe 族参与 corroboration，但归因落到 `insufficient_evidence` + `attribution_ambiguous` | 协议同名不等于证据同义 |
-| G10 | 结果里存在无法安放于任何族的 journal 突发 | 仍命名 `journal_burst_unattributed` + `unattributed_evidence_present`：正结论不冒充完整理解 |
+| G3 | 存在目标级签名 | 命名 `journal_burst_destination` 后**放下**：v3 只把目的地投影成 `(dcls, port)`——一个类别加一个端口，不是身份——因此加 `no_target_specific_proof`（多签名再加 `multiple_destinations`）。`destination_specific` 在词汇表里但**不可达**：`_seal()` 只承认 `EMITTABLE_CATEGORIES`（七类去掉它本身），所以后来的编辑也无法意外把它输出 |
+| G4 | `generic_journal` 或 `generic_probe` | 比任何单一传输更宽的证据存在时抬升为 `vps_outbound`。**但**只有探测平面作证时（`generic_probe` 且无 `generic_journal`），必须另有同期独立证人（reality/hy2 突发、任一传输的影响位、或该簇内 `egress_ip` 变更），否则 `probe_endpoint_confounded` + `insufficient_evidence`：dns 与 https 都指向 Cloudflare 叶子、egress 指向 ipify，所以"三个通用槽一起失败"与"单个端点 outage"是同一形状 |
+| G5 | 双传输影响位，或 `reality` 且 `hy2` | 命名共享入口面 `common_inbound_client_office` 需要**两重同期正面反证**：(a) 同一批簇内桶上两条传输**各自**的客户端都在掉（只有突发没有双影响 → `attribution_ambiguous`）；(b) 同一批桶上 VPS 自身 generic TCP 探测健康 **且** API 视图确实在应答（缺任一项 → `contemporaneous_negatives_unproven`）。基线时段的健康一律不算反证 |
+| G6 | `reality` 且非 `hy2` | `reality_tcp_path`（受 G8 约束） |
+| G7 | `hy2` 且非 `reality` | `hysteria2_udp_path`（受 G8 约束）；两者皆真却不同时构成影响 → 回到 G5 的拒绝 |
+| G8 | 任何"依赖反面证据"的结论，必须先证明反面：journal 视图**完整**（reader `fresh` 且窗口内无 gap/被拒批次）**或** generic TCP 探测在**该簇内**健康（≥ `PROBE_HEALTH_MIN_BUCKETS` 桶三槽皆 `ok` 且既无网络失败也无缺席）。否则 `insufficient_evidence` + `transport_negatives_unproven`；探测平面整段缺席另记 `probe_evidence_absent` | "我看不了" ≠ "我看了没有" |
+| G9 | 目标级签名永远不够：无论它在**几个**桶出现、有几个签名，都记 `no_target_specific_proof`（签名多于一个再加 `multiple_destinations`）；若没有其它网络位，整窗 `insufficient_evidence` | 旧的"同一签名跨 ≥ 2 桶复现即可点名"门槛已随 G3 的不可达一起删除——一个永远无法输出结论的门是装饰，不是纪律 |
+| G10 | `udp` 探测失败**不**映射为 `hysteria2_udp_path`：引擎的 udp 槽是应用层 DNS 往返，不是 HY2 数据面。它作为 probe 族参与 corroboration，但归因落到 `insufficient_evidence` + `attribution_ambiguous` | 协议同名不等于证据同义 |
+| G11 | 异常桶串被安静桶隔开，即**两个簇** | 折叠成一个结论必然把第二段事件的证据接到第一段事件的归因上，因此整窗拒绝：`_collect()` 仍然把看到的都命名出来，再加 `multiple_anomaly_clusters`；相邻（间隔 0）的串是一个事件，不触发本条 |
+| G12 | 结果里存在无法安放于任何位的 journal 突发 | 仍命名 `journal_burst_unattributed` + `unattributed_evidence_present`：正结论不冒充完整理解 |
+
+G1–G5 的顺序就是 fail-closed 的顺序：任何一条拒绝路径都会先把自己看到的
+evidence 记完再返回，所以"没结论"永远不等于"没内容"。
 
 每个 `incident` 无条件盖上 `root_cause_not_established`。分类器不产生自由文本、
 不做 ISP 推断、不把相关性写成因果——这是 `_seal()` 的闭合墙，不是调用纪律。
@@ -131,13 +166,28 @@ normal-background 对照夹具因此保持非事件。
 突发 → 升级 `vps_outbound`；把反面证据的可证性抽掉（reader `unreadable` +
 无探测行）→ `insufficient_evidence` + `transport_negatives_unproven`。
 
-`scenarios()` 共 23 个场景、201 条断言，覆盖上表每一格（含 G1 冲突、G8 两态、
-G9 udp、覆盖缺口、历史降级、空包、短窗）；`HOSTILES` 19 条畸形输入逐一要求
+`scenarios()` 共 36 个场景、344 条断言，覆盖上表每一格（含 G1 冲突、G5 的
+两重同期反证、G8 两态、G9 三态、G10 udp、G11 两簇与"相邻即一簇"的正向对照、
+覆盖缺口、历史降级、空包、短窗）；`HOSTILES` 19 条畸形输入逐一要求
 **恰等**的拒绝 token 集合。
+
+第三轮的每一条反例都配了**判别器**，而且是成对的：反例要求 fail closed，
+同时给出同期独立证人齐全的对照，证明新门不是"什么都拒绝"。
+`probe_outage_without_clients`（三个通用槽一起失败、没有任何客户受影响）
+要求 `probe_endpoint_confounded`；三条对照——客户端真的在掉、簇内 `egress_ip`
+变更、`OTHER`/`https443` journal 突发——各自仍要求 `vps_outbound`。
+
+判别器的效力不靠声明。把修改前的模块换回来（只换 `incident_classifier.py`，
+夹具与车道不动）实测 **37 条红**，红名单正是本轮的语义格；反过来在第三轮
+模块上逐条**只破坏一条规则**（8 个 mutation：加宽 `_seal` 墙、把任何
+`failed` 当网络事实、摘掉端点混淆门、把 `total` 当双传输影响、取消同期反证、
+把健康度按窗口而非簇统计、按基线替 API 视图作证、折叠两簇），每次只让该规则
+对应的具名判据变红。`health.degraded` 那一格由前一次实测覆盖，故不重复列入
+mutation 清单。
 
 ## 7. 车道与门计数
 
-`tests/test-monitor-v2-classify.sh`，`EXPECTED_PASS=433`：
+`tests/test-monitor-v2-classify.sh`，`EXPECTED_PASS=582`：
 
 - S0 静态 + DARK 门 13：`py_compile`；AST 证明 import 集合恰为
   `{__future__, dataclasses}`、无 I/O/时钟/反射/输出调用点；`grep` 证明
@@ -145,15 +195,21 @@ G9 udp、覆盖缺口、历史降级、空包、短窗）；`HOSTILES` 19 条畸
   collector/deploy 零引用、文件内无 SQL 关键字；`VERSION` 与
   `MONITOR_WEB_VERSION` 仍 `0.4.0`；**真实建库**证明八张 v3 表恰等且没有新表；
   结果面字段清单冻结；CI 注册；两份夹具非空且非玩具。
-- S1 词汇字面量钉死 10：七类、三态、44/23 token、两平面互斥、token 语法、
-  结果面闭合、恒等列清单。
+- S1 词汇字面量钉死 12：七类、三态、45/27 token、**`_seal` 只承认的六类**、
+  探测失败码的 network/source 切分、两平面互斥、token 语法、结果面闭合、
+  恒等列清单。
 - S2 夹具决定且会动 9：锚点、负对照、三跑+乱序等值哈希、四条变异、哨兵不回声、
-  垃圾输入不抛。
-- S3 行为组 401：mirrors 21、scenarios 201、hostiles 116、invariants 15、
+  垃圾输入不抛。第三轮改写语义之后这 9 条**一条没动**——锚点与四条变异仍给出
+  同一批具名答案，这正是"加固了拒绝路径而没有移动结论"的证据。
+- S3 行为组 548：mirrors 24、scenarios 344、hostiles 116、invariants 16、
   privacy 7、store 25、fixtures 14，外加 harness rc 与夹具未变证明。
 
+433→582 的差额全部是**新写的门**：S1 +2（emittable 六类、探测码切分），
+S3 scenarios +143（23→36 行，每条反例及其对照），mirrors +3，invariants +1
+（`_seal()` 自身拒绝不可达类别）。没有一格是为了绿灯被放宽的。
+
 本车道纯 Python、无网络、无特权、无 Linux-only 断言，因此开发机与 Linux CI
-**必须**给出同一计数；433 是这一命题的证物。
+**必须**给出同一计数；582 是这一命题的证物。
 
 这一等价性要求车道**不读取任何环境供给的变量**。首轮 CI 就是在这一点上红的：
 车道使用 `$TMP` 作为暂存目录，却依赖宿主把 `TMP` 导出给它——开发机（Git Bash）
@@ -172,8 +228,16 @@ G9 udp、覆盖缺口、历史降级、空包、短窗）；`HOSTILES` 19 条畸
   固化成历史事实"。
 - 单次调用只看一个有界窗口，没有跨调用状态：它不会"发现"事件开始/结束的
   时刻，只能判定给定窗口内证据指向何处。持续性属于接线方。
-- 没有 per-edge / Reality-target / net-counter 证据，`destination_specific`
-  只能到 `(dcls, port)` 签名粒度；要更细需要新的 schema 与新的采集面。
+- 没有 per-edge / Reality-target / net-counter 证据，目的地只能以
+  `(dcls, port)` 签名被**命名**，`destination_specific` 因此不可输出；要真的
+  指向一个目标，需要新的 schema 与新的采集面，而不是新的阈值。
+- 探测平面的三个通用槽不是三个独立证人（dns/https 同指 Cloudflare，egress 指
+  ipify）。在能区分"端点 outage"与"VPS 出口 outage"之前，只有探测证据的窗口
+  一律 `probe_endpoint_confounded`；要拆开需要多目标探测，属于 PR-3 侧的采集面
+  扩展，不是分类器可以在本轮补上的推理。
+- 两个簇的窗口一律拒绝（`multiple_anomaly_clusters`）。逐簇分别给出结论需要
+  结果对象从"一个窗口一个判定"变成"一个窗口多个判定"，那是 §3 冻结的结果面，
+  本轮不放宽。
 - 设备维度只用于"是否全部安静"的计数判断，因此
   `common_inbound_client_office` 是一条**共享面**结论，不是某台客户端的归因。
 - 阈值是针对本部署节奏（5 s 样本 / 60 s 探测 / 10 s journal 摄取）手工冻结的
