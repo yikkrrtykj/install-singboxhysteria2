@@ -1045,3 +1045,87 @@ awk 提取后不含任何写形态；调用行号早于 staging；出货的 `mon
 
 刻意边界：地址族、用户、`UMask`、`ReadWritePaths` 等 unit 其余各行零改动；
 `sbox-cm` 与 client-management 状态面零接触；不部署、不生产操作。
+
+## 23. Issue #33 PR-3B 预部署热修复 —— History 迁移进了事务内部
+
+发布阻断项（生产 0.4.0 **尚未**部署，`VERSION`/`MONITOR_WEB_VERSION` 保持 0.4.0）：
+一次 forward upgrade 会在**事务内部**改动持久状态。History 的 v2→v3 迁移不是部署
+步骤，它发生在 candidate service 启动时（`incident_history._enforce_schema`，只向前
+的 v1/v2→v3），也就是 release 激活**之后**、`sbmon_sboxjr_converge` 等剩余闸门
+**之前**。"candidate 已启动并迁移了数据库，随后某个闸门失败"因此是可达状态，而此前
+的 `sbmon_txn_rollback()` 只恢复 release/unit/enabled/active：它把声明 v2 的 0.3.1
+运行时重新点亮在一个 schema-v3 数据库上。后果不是崩溃，而是**静默的历史黑暗**
+（运行时自己的 schema 门 fail-closed 停写时间线，其余面照常服务），并且 §"the
+rollback gate's two inputs" 那道手工回滚门会从此永久拒绝这个 target——一次本可恢复
+的部署失败被回滚本身变成了不可恢复状态。
+
+事务契约（全部落在 `lib/monitor-deploy-lib.sh` + `install-monitor.sh` 的既有失败分支）：
+
+- **capture 早于激活**：`sbmon_history_txn_capture <candidate-id> <candidate-version>`
+  在 `sbmon_stage_release` 之后、`sbmon_activate_release`/任何启动**之前**跑。它先只读
+  判定 live schema 与 candidate schema，只有 `candidate > live` 才建立预状态；同 schema、
+  降级、无历史库、noop/repair 一律保持既有行为（备份根目录继续为空）。判定不了就
+  fail-closed 拒绝升级——此时 candidate 尚未激活，部署零变更。
+- **快照走 SQLite backup API**：源以 `mode=ro` URI 打开、目标先 `commit()` 再
+  `source.backup(target)`。普通 `cp` 会得到撕裂镜像（运行中的 Monitor 持有该库并在写），
+  而为备份停服务等于拿一次可用性抖动换一个回滚隐患——所以 **capture 不 stop、不
+  restart、不产生任何服务动作**。
+- **先证后收**：快照必须过 `PRAGMA quick_check=ok`，且 `declared`/`schema_sha`/`tables`
+  与迁移前的只读探测**逐项相等**才落盘（`0600`，
+  `$SBMON_BACKUP_ROOT/history-prestate-<id>.sqlite3`）。内容摘要**不在这里比相等**：
+  writer 会在探测与快照之间合法地落行；内容摘要是从快照记录、留到恢复时再证一次的
+  基线。sidecar 记录 declared/schema_sha/content_sha/tables/db_path/backup/live_owner/
+  live_group/live_mode/candidate_* /captured_utc，介质与 sidecar 都是事务私有命名，
+  临时文件用 `mktemp` 且任何失败路径都清干净。
+- **restore 的顺序是硬性的**：任一 forward 闸门失败且本事务确实捕获过 schema 预状态时，
+  `sbmon_history_txn_restore` **先停 candidate**（停不掉或停了仍在跑都拒绝继续：绝不带着
+  运行中的 writer 替换数据库），再在同目录 `mktemp` + `rename(2)` 原子替换，按 sidecar
+  还原生产属主/组/权限，只删**这一个**库的 `-journal/-wal/-shm` sidecar，不碰其他任何
+  状态；替换后重新探测 declared/schema/content/tables 并逐项相等，才置
+  `SBMON_PRE_DB_RESTORED=1`。权限比较用 `$((8#…))` 数值等值，不做"去零归一化"。
+  之后才轮到 release/unit/enabled/active 的既有恢复；reader 预状态恢复仍在同一事务内。
+- **DB 恢复失败 = `sbmon_critical`（exit 2）**，绝不声称回滚完成。完成语只有两种形态：
+  `history_db=prestate-restored+verified` 或 `history_db=untouched`。老运行时在新 schema
+  之上永远不会被重新点亮。
+- **成功即保留**：v2→v3 升级成功后，已验证的迁移前备份留在备份根目录，作为**手工降级的
+  唯一恢复物**；installer 只报告路径，既不静默删除也不自动使用。普通 `rollback` 从 v3
+  回到 pre-v3 release 依旧 fail-closed，直到运维者显式恢复兼容介质；拒绝语现在点名那份
+  介质——`sbmon_history_prestate_for` 读的是 sidecar 里记录的 `backup=` 路径，**不是**
+  按命名规则猜出来的路径（运维者可能挪动文件，指向不存在文件的清单比沉默更糟）。
+- 局限只有一条，且已写进契约：当无法从源取得一致读（backup API 失败）时，capture
+  fail-closed 拒绝升级，candidate 未激活，部署零变更。
+
+一处**刻意的版面约束**：本节代码位于只读门小节
+`# PR-3B (#33): History schema compatibility -- the rollback gate's two inputs`
+**之前**。`tests/test-monitor-v2-probe-ingest.sh` 的 S1 用 awk 区域
+（`sbmon_history_db_path()` → `sboxjr_log()`）静态证明那道门读取的代码不含任何写形态、
+且 `mode=ro` 恰一次；而"拍快照"与"替换数据库"正是两类写动作，把本节放进那个区域会让
+那道门为错误的理由变红（本轮首跑就红了 2 条）。bash 函数按调用时解析，先后顺序不影响
+语义——挪回去只会破坏证明，不会破坏行为。
+
+判别器（`tests/test-monitor-packaging.sh` T28/T29）：T28 从**精确 v2** 数据库起步
+（用模块自己的 `_create_v1_tables`/`_create_journal_tables`/`_create_journal_state_row`
+构造，附一行 ingest audit 与库旁边的诱饵文件），装好 0.3.1 基线后把 staging 载体的
+`incident_history.py` **降级**成声明 v2（sha 记录、段末复原），再让 candidate
+**真的**把它迁移到 v3，随后在 reader converge 注入失败。终态逐项断言：老 release 恢复、
+老 Monitor 健康（mock 的 boot 钩子在 `declared < db` 时**拒绝启动**，并且迁移未生效也
+算失败，所以"老运行时压在 v3 上起来了"这种事实无法悄悄通过——`open()` 是 fail-soft 的，
+只看返回码会假装成功）、DB 回到精确 v2（表集恰为 7 张、无 `network_probe_samples`、
+schema/内容摘要与事务前**逐字节相等**）、candidate 不进成功历史、原 enabled/active 与
+unit 事实复原、reader 预状态复原、诱饵文件与 sidecar/temporary 零残留、保留介质 `0600`、
+`sing-box`/`sbox-cm` 零调用、整个事务**两次 boot 一次 stop** 且 stop 在 boot 之后。
+T29 走成功路径：v2→v3 之后介质仍有效并保留，手工 `rollback` 到 pre-v3 依旧被拒且点名
+介质，按介质手工恢复之后同一次降级才被允许。
+
+变异实验（在真实库函数上跑，dev 主机原生排练，两个都红）：
+(1) 把 `sbmon_history_txn_restore` 变成空操作 → 快照仍在、恢复"返回成功"，但
+`SBMON_PRE_DB_RESTORED=0`、库仍是 v3/8 表、老运行时**拒绝启动**——正是本轮要关掉的
+发布阻断项；T28 的 `history_db=prestate-restored+verified`、摘要相等、
+"无 `network_probe_samples`"、"老 Monitor 健康"四条同时变红。
+(2) 把 `sbmon_history_txn_capture` 变成空操作 → 备份根目录为空、restore 因"本事务没有
+预状态"而合法地不动作，终态与 (1) 同样黑暗，且手工降级门此时只能拒绝而**无法点名介质**。
+
+本机立场：T28/T29 与 T15/T16/F1/F2a/F2b 同门槛，在 Git Bash 上**SKIP**（`ln -s` 是复制
+语义、`chmod` 不可靠），Linux packaging 车道（normal + root 两次 pass）才是门禁；
+`chown` 还原只在非 fixture 路径执行，由 root pass 证明。功能面零改动：不动端点、
+不动探测、不动 schema、不部署、不接触生产。

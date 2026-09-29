@@ -636,3 +636,30 @@ shellcheck `-S warning` 逐条实测：hist / probes / probe-ingest **0** 条，
 所以文档写入对 CI 是惰性的；上面的数字测自功能/基础设施头 `70528b1`，其上的文档头
 `a0f010c` 再跑一次仍是首试 10/10 全绿（runs 36517126376 / 36517126369），
 最终评审头以 PR 里的最新一轮 CI 为准。
+
+## 17. 预部署事务热修复（0.4.0 尚未上线，功能代码之外的最后一个发布阻断项）
+
+功能冻结点 `27e165c` 与 release-prep 头之后，评审在**部署事务**面上找到一条阻断项，
+它不在探测/History/web 任何一条车道里，只在"升级失败并自动回滚"这条路径上现身：
+
+**v2→v3 的 History 迁移发生在事务内部**（candidate service 启动时，
+`incident_history._enforce_schema`，位置在 release 激活之后、
+`sbmon_sboxjr_converge` 之前），而当时的 `sbmon_txn_rollback()` 只搬回
+release/unit/enabled/active。于是"迁移已提交、后续闸门失败"的回滚会把声明 v2 的
+0.3.1 运行时重新点亮在 schema-v3 数据库上：运行时的 schema 门 fail-closed 停写时间线
+（**静默历史黑暗**，其余面照常服务），并且回滚 schema 兼容门从此永久拒绝该 target。
+回滚把一个可恢复的失败变成了不可恢复的状态。
+
+修复的契约、实现细节、版面约束（prestate 小节必须留在只读门小节的 awk 审计区域**之外**）、
+判别器（`test-monitor-packaging.sh` T28/T29）与两个变异实验，全部记在
+`monitor-v2/deploy/README.md` §23。本 PR-3B 文档只补三条与本功能相关的立场：
+
+- v3 schema 的**代价面**从此有了部署期对价：一旦某个 release 把 schema 向前推，
+  事务要么把数据库带回去，要么以 exit 2 停住；它不会假装成功。
+- 迁移前的那份快照是**手工降级的唯一恢复物**，成功后被保留、由 installer 点名报告、
+  并被 T29 断言仍然有效；正常命令面不会自动使用它，也不会自动删除它。
+- 探测本身（端点、节奏、写入路径、schema 形状）零改动：本轮只增加事务的恢复能力，
+  因此本文 §1–§16 的所有功能判据逐条继续成立。
+
+`VERSION`/`MONITOR_WEB_VERSION` 保持 0.4.0（生产未部署）。不部署、不接触生产 VPS、
+不合并。
