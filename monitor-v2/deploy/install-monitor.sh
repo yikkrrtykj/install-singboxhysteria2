@@ -14,7 +14,10 @@
 #   * NEVER reads or writes the proxy tree (/root/sbox, sbconfig_server.json);
 #   * NEVER touches firewall tooling; web stays on 127.0.0.1:9191 by default;
 #   * NEVER restarts/reloads sing-box -- only singbox-monitor.service;
-#   * re-runs never overwrite monitor.conf, auth, access or state data.
+#   * re-runs never overwrite monitor.conf, auth, access or state data;
+#   * an upgrade whose candidate migrates the History database restores that
+#     database to its pre-transaction snapshot when any later gate fails, so a
+#     previous runtime is never restarted underneath a newer schema.
 set -Eeuo pipefail
 
 DEPLOY_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -145,7 +148,7 @@ sbmon_txn_rollback() { # <old_id> <old_unit_backup|''> <old_unit_existed> <old_a
         fi
     fi
 
-    sbmon_warn "事务前状态已恢复（release=${old_id:-<none>} unit=$([ "$old_unit_existed" = 1 ] && printf restored || printf removed) service_active=$old_active service_enabled=$old_enabled）"
+    sbmon_warn "事务前状态已恢复（release=${old_id:-<none>} unit=$([ "$old_unit_existed" = 1 ] && printf restored || printf removed) service_active=$old_active service_enabled=$old_enabled history_db=$([ "$SBMON_PRE_DB_RESTORED" = 1 ] && printf "prestate-restored+verified" || printf untouched)）"
 }
 
 # F2/R3-3: fresh-install failure has NO pre-state to restore. Contract
@@ -321,6 +324,18 @@ _cmd_install_locked() { # <install|upgrade> [flags...]
         # candidates never become rollback targets. Staging mutates nothing
         # live, so its failure may still die (precondition-class).
         new_id="$(sbmon_stage_release "$repo_version")"
+
+        # PR-3B hotfix: a candidate whose History schema is NEWER than the live
+        # database migrates it when the service BOOTS, which is a step inside
+        # this transaction (release + unit + reader gates follow). The
+        # prestate must therefore be captured here -- after staging (the
+        # candidate's own declared version is read from its tree) and before
+        # activation, where a refusal still means "nothing of the deployment
+        # changed". Capture never stops the running Monitor: the snapshot is a
+        # backup-API read, not a copy of an open file.
+        if ! sbmon_history_txn_capture "$new_id" "$repo_version"; then
+            sbmon_die "History 迁移前预状态无法建立（见上）：fail-closed，candidate 尚未激活"
+        fi
     fi
 
     # R3-1: EVERY forward-apply step after pre-state capture -- release
@@ -339,6 +354,17 @@ _cmd_install_locked() { # <install|upgrade> [flags...]
     fi
     if [ "$deploy_rc" != 0 ]; then
         sbmon_warn "candidate 部署失败，进入事务回滚"
+        # THE DATABASE FIRST. The candidate may already have migrated it while
+        # booting, and no later step of this transaction can undo a migration:
+        # sbmon_txn_rollback() restores release + unit + service, which would
+        # otherwise reactivate a pre-v3 runtime UNDERNEATH a v3 file -- a state
+        # the runtime itself refuses to write into, and one the manual rollback
+        # gate would keep the operator stuck in. The restore stops the candidate
+        # before touching the file and re-proves the restored shape; failure is
+        # CRITICAL because the system is then neither old nor new.
+        if ! sbmon_history_txn_restore; then
+            sbmon_critical "事务回滚：History 数据库未能恢复到事务前预状态；候选 runtime 可能仍持有迁移后的 schema，绝不重启旧 release、绝不宣称回滚完成；需要人工处理（快照见 $SBMON_BACKUP_ROOT）"
+        fi
         sbmon_sboxjr_restore_prestate
         if [ "$old_unit_existed" = 1 ] || [ -n "$current_id" ]; then
             sbmon_txn_rollback "$current_id" "$old_unit_backup" "$old_unit_existed" "$was_active" "$old_enabled"
@@ -361,6 +387,16 @@ _cmd_install_locked() { # <install|upgrade> [flags...]
     fi
     rm -f -- "$old_unit_backup" 2>/dev/null || true
     rm -f -- "$SBOXJR_PRE_UNIT_BACKUP" 2>/dev/null || true
+
+    # The pre-migration snapshot is NOT transaction scratch state: the database
+    # it holds is the only compatible history for the releases still on this
+    # host, and manual downgrade recovery depends on it surviving the upgrade
+    # that made it obsolete. It is retained deliberately (uninstall
+    # --purge-backups is the operator's way to drop it) and never applied
+    # automatically.
+    if [ -n "$SBMON_PRE_DB_BACKUP" ]; then
+        sbmon_info "已保留迁移前 History 备份（手工降级的唯一恢复物，本命令绝不自动使用）：$SBMON_PRE_DB_BACKUP"
+    fi
 
     sbmon_report_health
     sbmon_info "install 完成（action=$action version=$repo_version）"
