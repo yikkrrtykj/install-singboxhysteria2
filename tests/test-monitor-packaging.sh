@@ -233,8 +233,10 @@ case "\$op" in
     # existing scenario; a failing script fails THIS restart, so the candidate
     # provably never booted.
     if [ "\$MONITOR_SCOPED" = 1 ] && [ -n "\${MOCK_PRE_BOOT_SCRIPT:-}" ] && [ -f "\${MOCK_PRE_BOOT_SCRIPT}" ]; then
-      rm -f "\${MOCK_PRE_BOOT_SCRIPT}"
-      if ! bash "\${MOCK_PRE_BOOT_SCRIPT}"; then
+      pbs="\$MOCK_PRE_BOOT_SCRIPT"
+      bash "\$pbs"; pbs_rc=\$?
+      rm -f "\$pbs"
+      if [ "\$pbs_rc" != 0 ]; then
         echo "mock: pre-boot script failed (candidate did not boot)" >&2; exit 1
       fi
     fi
