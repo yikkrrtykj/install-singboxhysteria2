@@ -98,6 +98,24 @@ if [ "$SYMLINKS_OK" != 1 ]; then
     printf 'NOTICE: 运行精简套件（T01/T06-T10/T12/T13）；完整套件需在 Linux 上运行。\n\n'
 fi
 
+# T03 upgrades the shared fixture to the REAL repo VERSION, so that version is
+# a legitimate line in the shared releases.history for the rest of the lane.
+# A synthetic candidate carrying the same name therefore cannot be told apart
+# from that real upgrade: the F1/R3 history-hygiene gates would count, match or
+# skip entries that have nothing to do with the transaction under test (a
+# "failed candidate absent from history" gate can go red while the transaction
+# is healthy, and an "appears exactly once" gate can go green for the wrong
+# reason). Synthetic candidate versions thus live in a reserved space no
+# Monitor release has ever used, and this gate keeps them there.
+REPO_VERSION_NOW="$(tr -d '[:space:]' < "$REPO_ROOT/monitor-v2/VERSION")"
+FIXTURE_VERSION_CLASH="$(grep -oE "printf '[0-9]+\.[0-9]+\.[0-9]+" "${BASH_SOURCE[0]}" \
+    | sed "s/^printf '//" | sort -u | grep -Fx -- "$REPO_VERSION_NOW" || true)"
+if [ -z "$FIXTURE_VERSION_CLASH" ]; then
+    pass "no synthetic candidate version collides with repo VERSION (repo=$REPO_VERSION_NOW)"
+else
+    fail "synthetic candidate version collides with repo VERSION ($(printf '%s' "$FIXTURE_VERSION_CLASH" | tr '\n' ' ')) -- rename the fixture ladder, the shared releases.history can no longer tell the real upgrade apart"
+fi
+
 # Mock systemctl: records every invocation; simulates unit state transitions.
 # PR-2B: state is PER-UNIT. singbox-monitor keeps the legacy files (every
 # scenario seeds/inspects them); any other unit (e.g. singbox-journal-reader)
@@ -797,7 +815,7 @@ section "T15 transactional unit rollback (release + unit + service state)"
 echo "# admin-drift" >> "$FIX_UNIT"
 UNIT_DRIFT_HASH="$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)"
 LINK_BEFORE_T15="$(readlink "$FIX_APP_LINK")"
-printf '0.4.0\n' > "$FIX_SRC/VERSION"
+printf '9.4.0\n' > "$FIX_SRC/VERSION"
 : > "$MOCK_FAIL_RESTART_ONCE"
 RESTARTS_B15=$(grep -c 'systemctl restart singbox-monitor' "$MOCK_CALL_LOG" || true)
 OUT15="$TMP/out-t15.log"
@@ -815,11 +833,11 @@ else
 fi
 assert_eq "active" "$(cat "$MOCK_SYS_STATE")" "old service active after transaction rollback"
 assert_no_grep 'sing-box' "$MOCK_CALL_LOG" "rollback never touches sing-box"
-assert_no_grep ' 0\.4\.0 ' "$FIX_RELEASES/releases.history" "failed upgrade candidate (0.4.0) absent from history (F1)"
+assert_no_grep ' 9\.4\.0 ' "$FIX_RELEASES/releases.history" "failed upgrade candidate (9.4.0) absent from history (F1)"
 
 # ---------------------------------------------------------------------------
 section "T16 rollback restore failure -> CRITICAL, never claims success"
-printf '0.5.0\n' > "$FIX_SRC/VERSION"
+printf '9.5.0\n' > "$FIX_SRC/VERSION"
 OUT16="$TMP/out-t16.log"
 MOCK_FAIL_START=1 run_install "$OUT16"
 RC16=$?
@@ -827,13 +845,13 @@ unset MOCK_FAIL_START
 assert_rc 2 "$RC16" "restore failure exits 2 (CRITICAL)"
 assert_grep 'CRITICAL' "$OUT16" "CRITICAL reported"
 assert_no_grep '事务前状态已恢复' "$OUT16" "must NOT claim rollback complete (P3)"
-assert_no_grep ' 0\.5\.0 ' "$FIX_RELEASES/releases.history" "CRITICAL-failed candidate (0.5.0) absent from history (F1)"
+assert_no_grep ' 9\.5\.0 ' "$FIX_RELEASES/releases.history" "CRITICAL-failed candidate (9.5.0) absent from history (F1)"
 # clean state for later sections
 printf '0.3.0\n' > "$FIX_SRC/VERSION"
 
 # ---------------------------------------------------------------------------
 section "F1 history hygiene: rollback never selects a failed candidate"
-# manual rollback after the failed 0.4.0/0.5.0 attempts: the only successful
+# manual rollback after the failed 9.4.0/9.5.0 attempts: the only successful
 # releases in history are 0.1.0 / repo VERSION / 0.3.0 -- the target must come from
 # those, never from the failed candidates.
 OUT_F1="$TMP/out-f1.log"
@@ -842,48 +860,48 @@ if ( "$INSTALL_MONITOR" rollback ) > "$OUT_F1" 2>&1; then
 else
     fail "rollback exits 0"
 fi
-assert_eq '0.1.0' "$(cat "$FIX_APP_LINK/VERSION")" "rollback target is a historically successful release (not 0.4.0/0.5.0)"
-printf '0.4.0\n' > "$FIX_SRC/VERSION"
+assert_eq '0.1.0' "$(cat "$FIX_APP_LINK/VERSION")" "rollback target is a historically successful release (not 9.4.0/9.5.0)"
+printf '9.4.0\n' > "$FIX_SRC/VERSION"
 OUT_F1B="$TMP/out-f1b.log"
 run_install "$OUT_F1B"
-assert_rc 0 $? "successful 0.4.0 deploy"
-F1_COUNT=$(grep -c ' 0\.4\.0 upgrade$' "$FIX_RELEASES/releases.history" || true)
-assert_eq "1" "$F1_COUNT" "successful 0.4.0 appears exactly once in history (F1)"
+assert_rc 0 $? "successful 9.4.0 deploy"
+F1_COUNT=$(grep -c ' 9\.4\.0 upgrade$' "$FIX_RELEASES/releases.history" || true)
+assert_eq "1" "$F1_COUNT" "successful 9.4.0 appears exactly once in history (F1)"
 
 # ---------------------------------------------------------------------------
 section "F2a existing inactive+disabled install: failed deploy fully restored"
 echo inactive > "$MOCK_SYS_STATE"
 echo disabled > "$MOCK_ENABLED_STATE"
 UNIT_F2A="$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)"
-printf '0.5.0\n' > "$FIX_SRC/VERSION"
+printf '9.5.0\n' > "$FIX_SRC/VERSION"
 OUT_F2A="$TMP/out-f2a.log"
 MOCK_FAIL_START=1 run_install "$OUT_F2A"
 RC_F2A=$?
 unset MOCK_FAIL_START
 assert_rc 1 "$RC_F2A" "inactive existing install: failed deploy exits nonzero"
-assert_eq '0.4.0' "$(cat "$FIX_APP_LINK/VERSION")" "release restored (F2)"
+assert_eq '9.4.0' "$(cat "$FIX_APP_LINK/VERSION")" "release restored (F2)"
 assert_eq "$UNIT_F2A" "$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)" "unit restored (F2)"
 assert_eq "inactive" "$(cat "$MOCK_SYS_STATE")" "service inactive restored (F2)"
 assert_eq "disabled" "$(cat "$MOCK_ENABLED_STATE")" "service disabled restored (F2)"
-assert_no_grep ' 0\.5\.0 ' "$FIX_RELEASES/releases.history" "failed 0.5.0 absent from history (F1/F2)"
+assert_no_grep ' 9\.5\.0 ' "$FIX_RELEASES/releases.history" "failed 9.5.0 absent from history (F1/F2)"
 assert_grep '事务前状态已恢复' "$OUT_F2A" "rollback completion reported (F2)"
 
 section "F2b existing inactive+enabled install: failed deploy fully restored"
 echo inactive > "$MOCK_SYS_STATE"
 echo enabled > "$MOCK_ENABLED_STATE"
 UNIT_F2B="$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)"
-printf '0.6.0\n' > "$FIX_SRC/VERSION"
+printf '9.6.0\n' > "$FIX_SRC/VERSION"
 OUT_F2B="$TMP/out-f2b.log"
 MOCK_FAIL_START=1 run_install "$OUT_F2B"
 RC_F2B=$?
 unset MOCK_FAIL_START
 assert_rc 1 "$RC_F2B" "inactive+enabled existing install: failed deploy exits nonzero"
-assert_eq '0.4.0' "$(cat "$FIX_APP_LINK/VERSION")" "release restored (F2b)"
+assert_eq '9.4.0' "$(cat "$FIX_APP_LINK/VERSION")" "release restored (F2b)"
 assert_eq "$UNIT_F2B" "$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)" "unit restored (F2b)"
 assert_eq "inactive" "$(cat "$MOCK_SYS_STATE")" "service inactive restored (F2b)"
 assert_eq "enabled" "$(cat "$MOCK_ENABLED_STATE")" "service ENABLED state restored (F2b)"
-assert_no_grep ' 0\.6\.0 ' "$FIX_RELEASES/releases.history" "failed 0.6.0 absent from history (F1/F2)"
-printf '0.4.0\n' > "$FIX_SRC/VERSION"
+assert_no_grep ' 9\.6\.0 ' "$FIX_RELEASES/releases.history" "failed 9.6.0 absent from history (F1/F2)"
+printf '9.4.0\n' > "$FIX_SRC/VERSION"
 fi  # end SYMLINKS_OK block (T15/T16/F1/F2a/F2b)
 
 if symlink_gate "F2c fresh-install failure cleanup"; then
@@ -1001,12 +1019,12 @@ fi
 section "R3-1a forward unit atomic-write failure -> transaction rollback"
 if [ "$SYMLINKS_OK" = 1 ]; then
     OUT_R3A="$TMP/out-r3a.log"
-    run_install "$OUT_R3A"          # fresh 0.4.0
+    run_install "$OUT_R3A"          # fresh 9.4.0
     assert_rc 0 $? "baseline install for R3 tests"
     LINK_R3="$(readlink "$FIX_APP_LINK")"
     UNIT_R3="$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)"
     HIST_R3="$(cat "$FIX_RELEASES/releases.history")"
-    printf '0.5.0\n' > "$FIX_SRC/VERSION"
+    printf '9.5.0\n' > "$FIX_SRC/VERSION"
     # REAL atomic-write failure: mktemp under a nonexistent directory (ENOENT).
     OUT_R3B="$TMP/out-r3b.log"
     ( SBMON_UNIT_FILE="$FIX_UNIT_DIR/missing-dir/singbox-monitor.service" "$INSTALL_MONITOR" install ) > "$OUT_R3B" 2>&1
@@ -1020,7 +1038,7 @@ if [ "$SYMLINKS_OK" = 1 ]; then
     # a successful upgrade so the later rollback tests have a target
     OUT_R3C="$TMP/out-r3c.log"
     run_install "$OUT_R3C"
-    assert_rc 0 $? "successful 0.5.0 upgrade"
+    assert_rc 0 $? "successful 9.5.0 upgrade"
 else
     printf '  SKIP R3-1a/c 原子事务流（此平台无符号链接）\n'
 fi
@@ -1030,14 +1048,14 @@ if [ "$SYMLINKS_OK" = 1 ]; then
     echo "# r3-1b-drift" >> "$FIX_UNIT"   # unit must CHANGE so the reload fires
     UNIT_R3B="$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)"
     LINK_R3B="$(readlink "$FIX_APP_LINK")"
-    printf '0.6.0\n' > "$FIX_SRC/VERSION"
+    printf '9.6.0\n' > "$FIX_SRC/VERSION"
     echo 1 > "$MOCK_FAIL_DAEMON_RELOAD_COUNT"
     OUT_R3D="$TMP/out-r3d.log"
     run_install "$OUT_R3D"
     assert_rc 1 $? "daemon-reload failure -> install exits nonzero"
     assert_eq "$LINK_R3B" "$(readlink "$FIX_APP_LINK")" "release restored after daemon-reload failure (R3-1)"
     assert_eq "$UNIT_R3B" "$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)" "unit restored after daemon-reload failure (R3-1)"
-    assert_no_grep ' 0\.6\.0 ' "$FIX_RELEASES/releases.history" "failed 0.6.0 absent from history (R3-5)"
+    assert_no_grep ' 9\.6\.0 ' "$FIX_RELEASES/releases.history" "failed 9.6.0 absent from history (R3-5)"
     assert_grep '事务前状态已恢复' "$OUT_R3D" "transaction rollback ran (R3-1)"
     assert_eq "active" "$(cat "$MOCK_SYS_STATE")" "service active after rollback (R3-1b)"
 else
@@ -1051,7 +1069,7 @@ if [ "$SYMLINKS_OK" = 1 ]; then
     echo 6 > "$MOCK_FAIL_IS_ACTIVE_COUNT"  # all 6 gate polls fail (timeout 6)
     UNIT_R3C="$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)"
     LINK_R3C="$(readlink "$FIX_APP_LINK")"
-    printf '0.7.0\n' > "$FIX_SRC/VERSION"
+    printf '9.7.0\n' > "$FIX_SRC/VERSION"
     # is-active fails for the next 7 calls: all 6 polls inside the 6s gate
     # deadline fail, the rollback's own wait then succeeds on a fresh poll.
     echo 7 > "$MOCK_FAIL_IS_ACTIVE_COUNT"
@@ -1060,10 +1078,10 @@ if [ "$SYMLINKS_OK" = 1 ]; then
     assert_rc 1 $? "wait-active failure -> install exits nonzero"
     assert_eq "$LINK_R3C" "$(readlink "$FIX_APP_LINK")" "release restored after wait-active failure (R3-1)"
     assert_eq "$UNIT_R3C" "$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)" "unit restored after wait-active failure (R3-1)"
-    assert_no_grep ' 0\.7\.0 ' "$FIX_RELEASES/releases.history" "failed 0.7.0 absent from history (R3-5)"
+    assert_no_grep ' 9\.7\.0 ' "$FIX_RELEASES/releases.history" "failed 9.7.0 absent from history (R3-5)"
     assert_grep '事务前状态已恢复' "$OUT_R3E" "transaction rollback ran (R3-1)"
     assert_eq "active" "$(cat "$MOCK_SYS_STATE")" "service active after rollback (R3-1c)"
-    printf '0.5.0\n' > "$FIX_SRC/VERSION"
+    printf '9.5.0\n' > "$FIX_SRC/VERSION"
 else
     printf '  SKIP R3-1c 原子事务流（此平台无符号链接）\n'
 fi
@@ -1077,7 +1095,7 @@ if [ "$SYMLINKS_OK" = 1 ]; then
     ( "$INSTALL_MONITOR" rollback ) > "$OUT_R3F" 2>&1
     RC_R3F=$?
     assert_rc 1 "$RC_R3F" "failed rollback exits nonzero"
-    assert_eq '0.5.0' "$(cat "$FIX_APP_LINK/VERSION")" "original release restored after failed rollback (R3-2)"
+    assert_eq '9.5.0' "$(cat "$FIX_APP_LINK/VERSION")" "original release restored after failed rollback (R3-2)"
     assert_eq "active" "$(cat "$MOCK_SYS_STATE")" "service active on original release (R3-2)"
     assert_eq "$UNIT_R3D" "$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)" "unit untouched by rollback apply/restore (R3-2)"
     ROLLBACKS_A=$(grep -c ' rollback$' "$FIX_RELEASES/releases.history" || true)
@@ -1116,7 +1134,7 @@ MOCK
     rm -f -- "$FIX_UNIT"            # old unit absent at capture (old_unit_existed=0)
     LINK_R4A="$(readlink "$FIX_APP_LINK")"
     HIST_R4A="$(cat "$FIX_RELEASES/releases.history")"
-    printf '0.6.0\n' > "$FIX_SRC/VERSION"
+    printf '9.6.0\n' > "$FIX_SRC/VERSION"
     echo 1 > "$MOCK_FAIL_IS_ACTIVE_SKIP"
     echo 6 > "$MOCK_FAIL_IS_ACTIVE_COUNT"
     OUT_R4A="$TMP/out-r4a.log"
@@ -1127,7 +1145,7 @@ MOCK
     assert_rc 2 "$RC_R4A" "rollback unit-removal failure exits 2 (R4-1)"
     assert_grep 'CRITICAL' "$OUT_R4A" "CRITICAL reported (R4-1)"
     assert_no_grep '事务前状态已恢复' "$OUT_R4A" "no false restore-complete claim (R4-1)"
-    assert_no_grep ' 0\.6\.0 ' "$FIX_RELEASES/releases.history" "failed 0.6.0 absent from history (R3-5)"
+    assert_no_grep ' 9\.6\.0 ' "$FIX_RELEASES/releases.history" "failed 9.6.0 absent from history (R3-5)"
     if [ -e "$FIX_UNIT" ]; then pass "candidate unit still present (rm was refused, R4-1)"; else fail "candidate unit vanished despite rm failure"; fi
     assert_eq "$LINK_R4A" "$(readlink "$FIX_APP_LINK")" "release restored before the failing step (R4-1)"
     assert_eq "$HIST_R4A" "$(cat "$FIX_RELEASES/releases.history")" "history unchanged (R3-5)"
@@ -1138,7 +1156,7 @@ fi
 section "R4-1b rollback stop failure -> CRITICAL exit 2"
 if [ "$SYMLINKS_OK" = 1 ]; then
     echo inactive > "$MOCK_SYS_STATE"   # old_active=0
-    printf '0.6.0\n' > "$FIX_SRC/VERSION"
+    printf '9.6.0\n' > "$FIX_SRC/VERSION"
     : > "$MOCK_FAIL_STOP"
     export MOCK_FAIL_START=1   # mock reads non-emptiness only
     OUT_R4B="$TMP/out-r4b.log"
@@ -1149,7 +1167,7 @@ if [ "$SYMLINKS_OK" = 1 ]; then
     assert_rc 2 "$RC_R4B" "rollback stop failure exits 2 (R4-1)"
     assert_grep 'CRITICAL' "$OUT_R4B" "CRITICAL reported (R4-1b)"
     assert_no_grep '事务前状态已恢复' "$OUT_R4B" "no false restore-complete claim (R4-1b)"
-    assert_no_grep ' 0\.6\.0 ' "$FIX_RELEASES/releases.history" "failed 0.6.0 absent from history (R3-5)"
+    assert_no_grep ' 9\.6\.0 ' "$FIX_RELEASES/releases.history" "failed 9.6.0 absent from history (R3-5)"
 else
     printf '  SKIP R4-1b 原子事务流（此平台无符号链接）\n'
 fi
@@ -1335,7 +1353,7 @@ assert_grep '卸载完成' "$OUT_R42A" "idempotent uninstall still completes (R4
 
 if symlink_gate "R4-2 uninstall teardown group (stop/disable/reload failures, final success)"; then
 section "R4-2 uninstall stop failure -> fail-closed, deployment retained"
-printf '0.5.0\n' > "$FIX_SRC/VERSION"
+printf '9.5.0\n' > "$FIX_SRC/VERSION"
 run_install "$TMP/out-r42setup.log"
 assert_rc 0 $? "baseline install for R4-2 tests"
 : > "$MOCK_FAIL_STOP"

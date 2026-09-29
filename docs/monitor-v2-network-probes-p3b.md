@@ -2,8 +2,10 @@
 
 状态：功能评审 **R3 = PASS / APPROVE**，功能代码**冻结**在头
 `27e165c0d032b464e8686b26748ca775d4323be1`（该头 `VERSION` 与
-`MONITOR_WEB_VERSION` 为 `0.3.1`）。在此之上只有一个**仅 release-prep** 提交，
-把版本元数据与钉住当前发布版本的断言抬到 `0.4.0`（§16）；不合并、不部署。
+`MONITOR_WEB_VERSION` 为 `0.3.1`）。在此之上只有两个提交：一个**仅 release-prep**
+提交，把版本元数据与钉住当前发布版本的断言抬到 `0.4.0`；一个**纯测试基础设施**
+提交，把 packaging 夹具的合成候选版本阶梯搬进保留空间并加守卫门（两者都记在 §16）。
+功能代码依旧逐字节等于 `27e165c`；不合并、不部署。
 基线：`main @ 32a06ce`（PR-3A 引擎）。
 分支：`codex/pr3b-network-probe-ingest-033`。
 上游规格：issue #33 Phase 3；前序文档 `docs/monitor-v2-network-probes-p3a.md`
@@ -29,10 +31,11 @@
   `EXPECTED_PASS=307`，含 250 条行为判别器）+ `tests/monitor-probes/`
   （行为夹具 + CI 网络守卫），`tests/test-monitor-v2-probes.sh` 126→138，
   `tests/test-monitor-v2-hist.sh` 239→240，
-  `tests/test-monitor-packaging.sh` +21：6 条 diagnostics 清单/发布树审计
+  `tests/test-monitor-packaging.sh` +22：6 条 diagnostics 清单/发布树审计
   （套件自身清单与库声明恰等、禁目录通配 staging、逐文件强制、release 内
   三文件恰等、无 `__pycache__`；所有平台均执行）+ 末尾新增 T27 15 条端到端
-  回滚证明（仅在可建符号链接的平台执行，Linux CI 为真实门禁）。
+  回滚证明（仅在可建符号链接的平台执行，Linux CI 为真实门禁）+ 1 条
+  **夹具版本空间守卫**（§16 第 4 项；所有平台均执行）。
 - 功能评审 R1（B1–B6）的收口：生产目标/状态**配对**可产生正证据（B1）、
   `egress_change` 三值一律由边界**推导**（B2）、持久化出口收敛为**全局单播**
   且引擎与库同拒组播（B3）、opt-in 走**打包 unit 的冻结路径**而非任何出货
@@ -534,7 +537,8 @@ p2b 集成 132/0/0-SKIP；packaging fixture 631/0、root 646/0；三条基线
 ## 16. 发布准备（Monitor 0.4.0）
 
 功能评审 **R3 = PASS / APPROVE**，功能代码**冻结**在 `27e165c`。其上只允许一个
-**仅 release-prep** 提交，内容限定为三类：
+**仅 release-prep** 提交，内容限定为三类；第 4 项是 CI 在该准备头抓到红灯之后的
+**纯测试基础设施**修复（同样零行为变更），两类提交合起来就是发布头的全部：
 
 1. **版本元数据**：`monitor-v2/VERSION` 与 `web/server.py` 的
    `MONITOR_WEB_VERSION` 从 `0.3.1` 抬到 `0.4.0`（两者由 `test-monitor-v2-ui.cjs`
@@ -545,6 +549,36 @@ p2b 集成 132/0/0-SKIP；packaging fixture 631/0、root 646/0；三条基线
    probe-ingest 仍 307、probes 仍 138、hist 仍 240、jr 仍 371。
 3. **版本立场措辞**：本文头部、§10 S3 行、§12，以及 `monitor-v2/README.md`
    新增的 `### 0.4.0` 变更条目。
+4. **CI 在发布准备头 `d212ba5` 上抓到的唯一红灯 —— 夹具版本空间与真实 `0.4.0`
+   相撞**（随后一个**纯测试基础设施**提交修掉；功能代码依旧逐字节等于 `27e165c`）：
+
+   `test-monitor-packaging.sh` 的共享夹具里，T03 会把**仓库真实 VERSION** 装进
+   `$FIX_SRC` 并 `upgrade`，于是一条 ` 0.4.0 upgrade` 合法地留在整条车道共用的
+   `releases.history` 中。而 F1/F2/R3/R4 的合成候选版本阶梯原本是
+   `0.4.0 / 0.5.0 / 0.6.0 / 0.7.0`——恰好压在"下一个可能的真实发布号"上。抬到
+   `0.4.0` 之后两者同名，Linux 上两条门因此为**错误的理由**而红（CI 实测：
+   `packaging-fixture` 629/2、`packaging-root` 644/2，两条 FAIL 逐字相同；同头
+   `shell-tests` 的 7 个 job 全绿）：
+
+   - `FAIL failed upgrade candidate (0.4.0) absent from history (F1)`
+     —— 命中的其实是 T03 那次**成功**的真实升级；
+   - `FAIL successful 0.4.0 appears exactly once in history (F1)`
+     —— `want '1', got '2'`，第二条同样来自 T03。
+
+   这两条只在能建符号链接的平台执行，dev 主机的 268/0 永远看不到它们；红灯来自
+   CI，不是来自本地扫描。修复不是把断言改宽，而是把**合成候选阶梯搬进保留空间**：
+   `0.4.0→9.4.0`、`0.5.0→9.5.0`、`0.6.0→9.6.0`、`0.7.0→9.7.0`（含转义形式），
+   只改共享夹具区（前 2000 行了 31 行）；T26 段落标签里的 `0.4.0` 是**真实候选**
+   的散文，保持不变。R4-3 的 `0.9.0 / 0.10.0 / 0.2.0`（证明"按部署时序而非版本
+   字典序 prune"）与 R4.1 的 `1.x`、T22–T27 的 `0.1.1…0.1.5`/`0.3.0` 祖先基线一律
+   不动——它们与当前发布号不同名，搬走反而会削掉各自要证的性质。
+
+   并加**1 条跨平台守卫门**（在符号链接探测之后、所有平台都执行）：扫描本车道
+   自己写过的每一个合成候选字面量，断言其中**没有**一个等于
+   `monitor-v2/VERSION`；一旦将来某个发布号踩进夹具空间，门会立刻点亮，而不是
+   等到 Linux 上某条历史卫生门以错误的理由变红。守卫的判别力**已实测**（反向对照）：
+   把 3 处 `printf '9.4.0` 还原成 `printf '0.4.0` 的即用即弃副本上跑同一条提取+比对
+   管线 → 报出 `0.4.0`，真文件 → 空集。**能开火的门才是证据。**
 
 刻意**不**机械替换的 `0.3.x` 字样（它们是历史与 fixture 证据，不是过期元数据）：
 `install.sh` 与 `tests/test-install-host-deps.sh` 里描述 0.3.1 依赖 bootstrap 的
@@ -570,10 +604,14 @@ packaging T22–T26 里描述被升级**祖先** release 的注释，以及
 `sbox-cm`；不合并（仍需显式指令）；不部署、不访问生产。CI 在该发布准备头上
 重跑**全量**。
 
-发布准备头的本地取证（dev 主机 Windows/Git Bash，扫描期间工作树零写入）：
-probes 138/0、probe-ingest **307/0**、hist 240/0、jr 371/0、jr-deploy 292/0
-（20 SKIP）、p2b 集成 33/0（4 SKIP）、`m05`/`e1`/`e2`/`e4`/`e4diag`/`m2` 全绿、
-journal-time-compat 15/0、packaging 268/0（T27 的 15 条在无符号链接平台 SKIP，
-由 Linux 覆盖）；`threads`+`http` 67 条在 CI 网络守卫下连跑 **20 轮**全绿；
-shellcheck `-S warning` 对本轮改动的 5 条车道（hist / jr / probes / probe-ingest /
-packaging）零告警。**Linux CI 才是真实门禁**，该头的全量数字以 CI 为准。
+发布准备头的本地取证（dev 主机 Windows/Git Bash，扫描期间工作树零写入、车道串行
+不并发）：probes 138/0、probe-ingest **307/0**、hist 240/0、jr 371/0、jr-deploy
+292/0（20 SKIP）、p2b 集成 33/0（4 SKIP）、`m05`/`e1`/`e2`/`e4`/`e4diag`/`m2` 全绿、
+journal-time-compat 15/0；packaging 在 `d212ba5` 为 268/0，在夹具空间修复头为
+**269/0**（+1 = 上述守卫门；T27 与被搬动的 F1/F2/R3/R4 区块在无符号链接平台 SKIP，
+由 Linux 覆盖——所以本次红灯本来也只可能在 CI 现身）；`threads`+`http` 67 条在
+CI 网络守卫下连跑 **20 轮**全绿。shellcheck `-S warning` 逐条实测：hist / probes /
+probe-ingest **0** 条，jr **1** 条（`SC2034` 未用变量 `m`，line 541），packaging
+**6** 条（`SC1090` 非恒定 `source`）——后两组都是**既存**告警，与本轮改动无关：
+对 `HEAD` 版本与当前版本分别扫描，计数同为 6，本轮新增文本零告警。
+**Linux CI 才是真实门禁**，该头的全量数字以 CI 为准。
