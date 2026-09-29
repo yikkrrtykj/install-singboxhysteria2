@@ -1157,8 +1157,41 @@ sbmon_history_prestate_for() { # <declared-version> -> paths
     return 0
 }
 
+# THE ONE REFUSAL A HISTORY SCHEMA DOWNGRADE EARNS. Two doors can put an
+# older-schema runtime underneath a newer database: the manual `rollback` gate
+# below, and `install --allow-downgrade`, whose capture step is the only thing
+# that reads both schemas before activation. Both come through here so they can
+# never drift apart -- same evidence (both versions stated), same way back (the
+# retained pre-migration media, named by its RECORDED path), and the same
+# promise that neither command ever applies that media by itself.
+# -> always rc 1: a downgrade is never a decision this library makes for the
+#    operator.
+sbmon_history_downgrade_refusal() { # <mode: rollback|install> <id> <want> <live>
+    local mode="$1" id="$2" want="$3" live="$4"
+    local subject verdict media_subject
+    if [ "$mode" = "install" ]; then
+        subject="降级候选"
+        verdict="拒绝降级"
+        media_subject="该候选"
+    else
+        subject="回滚目标"
+        verdict="拒绝回滚"
+        media_subject="该 target"
+    fi
+    sbmon_warn "$subject $id 声明 history schema v$want，当前数据库为 v$live：该 release 无法读取现有历史库（运行期会 fail-closed 停写），$verdict"
+    local retained
+    retained="$(sbmon_history_prestate_for "$want")"
+    if [ -n "$retained" ]; then
+        sbmon_warn "$media_subject 兼容的迁移前备份仍保留在 $SBMON_BACKUP_ROOT（$(printf '%s' "${retained//$'\n'/ }")）：需运维人员显式恢复后才会降级；本命令绝不自动替换数据库"
+    fi
+    return 1
+}
+
 # Capture the transaction prestate. rc 0 = no schema change possible OR snapshot
-# captured AND validated; rc 1 = the transaction must not proceed. Called after
+# captured AND validated; rc 1 = the transaction must not proceed, which covers
+# both "the prestate could not be proven" and "this candidate would take the
+# schema BACKWARD" (a downgrade is refused here, before activation, by the same
+# refusal the rollback gate speaks). Called after
 # staging and BEFORE candidate activation, so a refusal here is a
 # precondition-class failure: nothing of the live deployment has changed yet.
 sbmon_history_txn_capture() { # <candidate-release-id> <candidate-version>
@@ -1181,7 +1214,25 @@ sbmon_history_txn_capture() { # <candidate-release-id> <candidate-version>
             sbmon_warn "history schema 版本判定非整数：fail-closed"
             return 1 ;;
     esac
-    if [ "$cand" -le "$live" ]; then
+    # Three doors this comparison has, and only one of them needs a snapshot:
+    #   candidate >  live -- a forward migration is coming, capture it;
+    #   candidate == live -- no schema change is possible, so there is nothing
+    #                        forward to undo (a plain VERSION downgrade with the
+    #                        same schema stays allowed, exactly as before);
+    #   candidate <  live -- a SCHEMA downgrade. That runtime boots straight
+    #                        into its own fail-closed refusal, which is the
+    #                        silent-history-darkness state this whole section
+    #                        exists to prevent, so `install --allow-downgrade`
+    #                        must not walk through here. Returning success for
+    #                        this shape made capture the one door that bypassed
+    #                        the manual rollback gate; it now refuses through
+    #                        the same helper that gate uses, before activation,
+    #                        and names the retained media that is the way back.
+    if [ "$cand" -lt "$live" ]; then
+        sbmon_history_downgrade_refusal install "$new_id" "$cand" "$live"
+        return 1
+    fi
+    if [ "$cand" = "$live" ]; then
         return 0                              # no forward migration: no prestate
     fi
 
@@ -1271,38 +1322,37 @@ sbmon_history_txn_capture() { # <candidate-release-id> <candidate-version>
 }
 
 # THE INVERSE, on the transaction's failure path only. ORDER IS THE CONTRACT:
-#   1. the candidate Monitor is stopped and proven inactive BEFORE the file it
-#      may have migrated is replaced -- replacing an open database underneath a
-#      live writer yields exactly the torn image the snapshot exists to avoid;
-#   2. the artifact is re-proven (quick_check + recorded schema/content) rather
+#   1. the captured contract is read before anything is touched, because it is
+#      the reference for the next question;
+#   2. the live file is re-probed and compared against the captured SHAPE: if it
+#      still matches, this transaction never crossed the schema boundary, so it
+#      returns having touched NOTHING -- the history the still-running old
+#      Monitor wrote after capture is this function's reason to exist;
+#   3. only then is the candidate Monitor stopped and proven inactive BEFORE the
+#      file it moved is replaced -- replacing an open database underneath a live
+#      writer yields exactly the torn image the snapshot exists to avoid;
+#   4. the artifact is re-proven (quick_check + recorded schema/content) rather
 #      than trusted, because the rollback runs minutes after capture;
-#   3. the replacement is atomic ON ITS OWN FILESYSTEM (temp in the database's
+#   5. the replacement is atomic ON ITS OWN FILESYSTEM (temp in the database's
 #      directory + rename) with the production owner/mode recorded at capture,
 #      and only THIS database's own sidecar journals are removed -- no other
 #      state file is touched, and the immutable release trees are left alone;
-#   4. the live file is re-probed and must match the prestate exactly
+#   6. the live file is re-probed and must match the prestate exactly
 #      (declared schema + shape + content digest), or the restore failed.
 # rc 1 = the caller must treat this as CRITICAL: never restart the previous
 # runtime over a database that is still at the candidate's schema, and never
-# claim the transaction was rolled back.
+# claim the transaction was rolled back. rc 0 covers both "restored and proven"
+# and "this transaction never crossed the boundary"; only the former sets
+# SBMON_PRE_DB_RESTORED, and the completion line says untouched for both.
 sbmon_history_txn_restore() {
     [ -n "$SBMON_PRE_DB_BACKUP" ] || return 0
     local db="$SBMON_PRE_DB_PATH"
     local meta="$SBMON_PRE_DB_META"
 
-    if sbmon_service_active; then
-        if ! sbmon_service_stop; then
-            sbmon_warn "history 预状态恢复：candidate Monitor 停止失败（绝不带着运行中的 writer 替换数据库）"
-            return 1
-        fi
-        if sbmon_service_active; then
-            sbmon_warn "history 预状态恢复：candidate Monitor 停止后仍在运行"
-            return 1
-        fi
-    fi
-
-    if [ ! -f "$SBMON_PRE_DB_BACKUP" ] || [ ! -f "$meta" ]; then
-        sbmon_warn "history 预状态介质缺失（$SBMON_PRE_DB_BACKUP 或元数据）：无法恢复"
+    # 1. THE CONTRACT FIRST, because it is what the next question is asked
+    #    against: did this transaction actually cross the schema boundary?
+    if [ ! -f "$meta" ]; then
+        sbmon_warn "history 预状态元数据缺失（无法判断本事务是否跨越了 schema 边界）：无法恢复"
         return 1
     fi
     local want_declared want_schema want_content want_tables
@@ -1338,7 +1388,56 @@ sbmon_history_txn_restore() {
             return 1 ;;
     esac
 
-    # 2. the artifact must still BE the validated snapshot
+    # 2. WAS THE BOUNDARY ACTUALLY CROSSED? A captured prestate is not a licence
+    #    to overwrite the live database. Most forward-apply failures happen
+    #    before the candidate ever boots -- and while it never booted, the OLD
+    #    Monitor stayed up the whole time, writing valid history this snapshot
+    #    cannot contain. Restoring blindly would delete rows this transaction
+    #    never produced: a data loss the deployment failure did not ask for.
+    #
+    #    The schema move changes the declared version, the schema-SQL digest and
+    #    the table set together and only ever forward, so a live file that still
+    #    matches all three has NOT been moved by this transaction, and there is
+    #    nothing here to undo. CONTENT is deliberately absent from that test --
+    #    the rows written after capture are exactly what it protects.
+    #
+    #    Whatever this branch cannot prove falls through to the restoration
+    #    below: an unreadable live file, a shape that moved. "Cannot rule out
+    #    that the migration committed" is precisely when recovery is required.
+    local live_now live_now_declared
+    if live_now="$(sbmon_history_db_probe "$db")"; then
+        live_now_declared="$(printf '%s\n' "$live_now" | sbmon_kv DECLARED)"
+        if [ "$live_now_declared" = "$want_declared" ] \
+           && [ "$(printf '%s\n' "$live_now" | sbmon_kv SCHEMA_SHA)" = "$want_schema" ] \
+           && [ "$(printf '%s\n' "$live_now" | sbmon_kv TABLES)" = "$want_tables" ]; then
+            sbmon_info "History 预状态未被使用：活动数据库仍是捕获时记录的形状（v$want_declared），本事务从未跨越 schema 边界；捕获之后写入的历史行全部保留，未做任何替换（快照留在 $SBMON_PRE_DB_BACKUP）"
+            return 0
+        fi
+        sbmon_warn "活动 history 数据库已被本事务前推到 v$live_now_declared（捕获时为 v$want_declared）：跨越已发生，恢复迁移前预状态"
+    else
+        sbmon_warn "活动 history 数据库无法只读探测：无法证明本事务未跨越 schema 边界，按需要恢复处理"
+    fi
+
+    # 3. quiesce BEFORE the file is replaced: a live writer underneath a
+    #    replaced database is exactly the torn image the snapshot exists to
+    #    avoid. Only reached when the boundary really was crossed.
+    if sbmon_service_active; then
+        if ! sbmon_service_stop; then
+            sbmon_warn "history 预状态恢复：candidate Monitor 停止失败（绝不带着运行中的 writer 替换数据库）"
+            return 1
+        fi
+        if sbmon_service_active; then
+            sbmon_warn "history 预状态恢复：candidate Monitor 停止后仍在运行"
+            return 1
+        fi
+    fi
+
+    if [ ! -f "$SBMON_PRE_DB_BACKUP" ]; then
+        sbmon_warn "history 预状态介质缺失（$SBMON_PRE_DB_BACKUP）：无法恢复"
+        return 1
+    fi
+
+    # 4. the artifact must still BE the validated snapshot
     local snap_probe
     if ! snap_probe="$(sbmon_history_db_probe "$SBMON_PRE_DB_BACKUP")"; then
         sbmon_warn "history 预状态快照已不可用（quick_check/schema）：无法恢复"
@@ -1352,7 +1451,7 @@ sbmon_history_txn_restore() {
         return 1
     fi
 
-    # 3. atomic in-place replacement with the production owner/mode
+    # 5. atomic in-place replacement with the production owner/mode
     local dir tmp
     dir="$(dirname -- "$db")" || return 1
     [ -d "$dir" ] || { sbmon_warn "history 数据库目录不存在（$dir）：无法恢复"; return 1; }
@@ -1393,7 +1492,7 @@ sbmon_history_txn_restore() {
         return 1
     fi
 
-    # 4. prove the live file IS the prestate, or the restore did not happen
+    # 6. prove the live file IS the prestate, or the restore did not happen
     local live_probe
     if ! live_probe="$(sbmon_history_db_probe "$db")"; then
         sbmon_warn "恢复后的 history 数据库无法只读探测：无法证明事务前状态已就位"
@@ -1523,16 +1622,14 @@ sbmon_rollback_schema_gate() { # <target-id> -> rc
             return 1 ;;
     esac
     if [ "$live" -gt "$want" ]; then
-        sbmon_warn "回滚目标 $target 声明 history schema v$want，当前数据库为 v$live：该 release 无法读取现有历史库（运行期会 fail-closed 停写），拒绝回滚"
         # The transaction's own pre-migration snapshot is the ONE legitimate
         # way back to that schema, and it is retained on purpose -- but this
         # command never applies it: restoring durable history is an operator
-        # decision, not a side effect of a rollback button.
-        local retained
-        retained="$(sbmon_history_prestate_for "$want")"
-        if [ -n "$retained" ]; then
-            sbmon_warn "该 target 兼容的迁移前备份仍保留在 $SBMON_BACKUP_ROOT（$(printf '%s' "${retained//$'\n'/ }")）：需运维人员显式恢复后才会降级；本命令绝不自动替换数据库"
-        fi
+        # decision, not a side effect of a rollback button. The refusal itself
+        # is shared with the install door (see sbmon_history_downgrade_refusal
+        # above), which is what stops --allow-downgrade from being a way around
+        # this gate.
+        sbmon_history_downgrade_refusal rollback "$target" "$want" "$live"
         return 1
     fi
     return 0

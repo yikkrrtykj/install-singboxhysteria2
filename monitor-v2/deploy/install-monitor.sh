@@ -333,8 +333,13 @@ _cmd_install_locked() { # <install|upgrade> [flags...]
         # activation, where a refusal still means "nothing of the deployment
         # changed". Capture never stops the running Monitor: the snapshot is a
         # backup-API read, not a copy of an open file.
+        # The same read also closes the --allow-downgrade hole: a candidate that
+        # declares an OLDER schema is refused here, by the same refusal the
+        # manual rollback gate speaks, so `install` can no longer walk a pre-v3
+        # runtime underneath a v3 database that `rollback` would refuse to
+        # restore. A version downgrade with the SAME schema is unaffected.
         if ! sbmon_history_txn_capture "$new_id" "$repo_version"; then
-            sbmon_die "History 迁移前预状态无法建立（见上）：fail-closed，candidate 尚未激活"
+            sbmon_die "History schema 预检未通过（见上）：fail-closed，candidate 尚未激活，线上部署零变更"
         fi
     fi
 
@@ -354,14 +359,19 @@ _cmd_install_locked() { # <install|upgrade> [flags...]
     fi
     if [ "$deploy_rc" != 0 ]; then
         sbmon_warn "candidate 部署失败，进入事务回滚"
-        # THE DATABASE FIRST. The candidate may already have migrated it while
-        # booting, and no later step of this transaction can undo a migration:
-        # sbmon_txn_rollback() restores release + unit + service, which would
-        # otherwise reactivate a pre-v3 runtime UNDERNEATH a v3 file -- a state
-        # the runtime itself refuses to write into, and one the manual rollback
-        # gate would keep the operator stuck in. The restore stops the candidate
-        # before touching the file and re-proves the restored shape; failure is
-        # CRITICAL because the system is then neither old nor new.
+        # THE DATABASE FIRST -- but only if this transaction actually moved it.
+        # The candidate migrates the file when it boots, and no later step of
+        # this transaction can undo that: sbmon_txn_rollback() restores release +
+        # unit + service, which would otherwise reactivate a pre-v3 runtime
+        # UNDERNEATH a v3 file -- a state the runtime itself refuses to write
+        # into, and one the manual rollback gate would keep the operator stuck
+        # in. So the restore is asked first, and it answers by re-probing the
+        # live shape: when the failure happened before the candidate ever booted
+        # it touches nothing at all (the history the old Monitor kept writing
+        # after capture is nobody's to delete), and only when the boundary was
+        # crossed does it stop the candidate, replace the file atomically and
+        # re-prove it. Failure is CRITICAL because the system is then neither
+        # old nor new.
         if ! sbmon_history_txn_restore; then
             sbmon_critical "事务回滚：History 数据库未能恢复到事务前预状态；候选 runtime 可能仍持有迁移后的 schema，绝不重启旧 release、绝不宣称回滚完成；需要人工处理（快照见 $SBMON_BACKUP_ROOT）"
         fi
