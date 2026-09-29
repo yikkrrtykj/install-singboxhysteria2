@@ -66,6 +66,7 @@ FAIL=0
 #        hostiles 116, invariants 15, privacy 7, store 25, fixtures 14,
 #        plus the harness rc and the fixtures-unchanged proof
 EXPECTED_PASS=433
+TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
 
