@@ -155,6 +155,16 @@ G9 udp、覆盖缺口、历史降级、空包、短窗）；`HOSTILES` 19 条畸
 本车道纯 Python、无网络、无特权、无 Linux-only 断言，因此开发机与 Linux CI
 **必须**给出同一计数；433 是这一命题的证物。
 
+这一等价性要求车道**不读取任何环境供给的变量**。首轮 CI 就是在这一点上红的：
+车道使用 `$TMP` 作为暂存目录，却依赖宿主把 `TMP` 导出给它——开发机（Git Bash）
+恰好导出，Linux runner 不导出，于是 `set -u` 在 S0 的 `py_compile`、S1 的词汇
+探针和 S3 的行为组三处直接中止，而**分类器本身一行未变**。修法与全仓 45 个
+车道一致：`TMP="$(mktemp -d)"` 自建、`trap` 自清。同时把这条约束变成静态门：
+`tests.yml` 的 fast-checks 新增
+"Shell-suite scratch-directory hygiene gate"，任何读取 `$TMP` 却没有用
+`mktemp` 自建的车道都会在被执行之前红在 fast-checks 上。该门对修复前的本车道
+判红、对当前全仓判绿，因此它是约束而不是装饰。
+
 ## 8. 已知边界（PR-4B 的前置条件，不是缺陷清单）
 
 - 分类器**不被调用**：把 `Classification` 变成端点、时间线标注或 UI 徽章属于

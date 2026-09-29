@@ -97,6 +97,24 @@ jobs:
           python3 -m py_compile tools/mihomo-multi-vps-merge.py
           python3 -m py_compile tests/mihomo-multi-vps-runtime-lab.py
 
+      # Scratch-directory hygiene, measured across every shell suite. A lane
+      # that reads an inherited $TMP instead of creating its own is green on a
+      # dev host that happens to export TMP and aborts on a Linux runner under
+      # `set -u` -- precisely the PR-4A classifier's first-attempt CI failure.
+      - name: "Shell-suite scratch-directory hygiene gate (no suite may inherit $TMP)"
+        run: |
+          offenders=0
+          while IFS= read -r f; do
+              if grep -qE '(^|[^A-Za-z_])\$"?\{?TMP' "$f" \
+                 && ! grep -qE '^[[:space:]]*TMP="\$\(mktemp' "$f"; then
+                  printf '::error::%s reads $TMP but never creates it with mktemp\n' "$f"
+                  offenders=$((offenders + 1))
+              fi
+          done < <(find tests -name '*.sh' | LC_ALL=C sort)
+          [ "$offenders" -eq 0 ] || exit 1
+          printf 'all %s shell suites own their scratch directory\n' \
+              "$(find tests -name '*.sh' | wc -l)"
+
   # ---------------------------------------------------------------------
   # Lane B -- core regression. OS-independent product contracts that do not
   # depend on a specific distro's systemd/PID1: the packaging suite is NOT
