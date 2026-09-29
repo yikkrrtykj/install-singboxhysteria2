@@ -1127,5 +1127,11 @@ T29 走成功路径：v2→v3 之后介质仍有效并保留，手工 `rollback`
 
 本机立场：T28/T29 与 T15/T16/F1/F2a/F2b 同门槛，在 Git Bash 上**SKIP**（`ln -s` 是复制
 语义、`chmod` 不可靠），Linux packaging 车道（normal + root 两次 pass）才是门禁；
-`chown` 还原只在非 fixture 路径执行，由 root pass 证明。功能面零改动：不动端点、
+`chown` 还原只在非 fixture 路径执行，由 root pass 证明。CI 在评审头 `bf28853` 首试
+10/10 全绿，该处实测为 normal pass **695/0**、root pass **711/0**（基线 `c2aa6b2`
+分别 632/647；root 多出的那 1 条正是上面那句属主证明，它被 `SBMON_FIXTURE = 0` 守卫），
+且两条 pass 的日志里都有 `== T28 ... ==` / `== T29 ... ==` 小节标题，即"SKIP"只发生在本机。
+其余车道逐条与基线相等（history 240 / probes 138 / probe-ingest 307 / jr 371 /
+jr-deploy 464 / P2B 132 / E4-Diag 457）——本轮没有为了让数字好看而放宽任何门。
+功能面零改动：不动端点、
 不动探测、不动 schema、不部署、不接触生产。

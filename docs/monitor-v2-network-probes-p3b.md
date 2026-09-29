@@ -663,3 +663,27 @@ release/unit/enabled/active。于是"迁移已提交、后续闸门失败"的回
 
 `VERSION`/`MONITOR_WEB_VERSION` 保持 0.4.0（生产未部署）。不部署、不接触生产 VPS、
 不合并。
+
+**评审头 `bf28853` 的 CI 实测：首试 10/10 全绿**（runs 36542394594 / 36542394592）。
+本轮唯一变动的车道是 packaging：normal pass **632 → 695**（+63）、root pass
+**647 → 711**（+64）。差值就是 T28/T29，两条 pass 的日志里都能搜到
+`== T28 transaction History prestate ... ==` 与 `== T29 ... ==` 小节标题，
+即这两个判别器在 Linux 上**确实执行**，不是 dev 主机那样的 SKIP。root 比 normal
+多出的那 1 条是 T28 里 `SBMON_FIXTURE = 0` 守卫下的**唯一**属主断言
+（"the restored database is owned by the service user recorded at capture"）——
+`chown` 还原只在真实路径执行，所以这条证明只能由 root pass 给出。
+
+其余车道逐条与基线（PR #59 头 `c2aa6b2`）**相等**：incident history 240、
+probes 138（expected 138）、probe-ingest 307（expected 307）、
+jr 371（expected 371）、jr-deploy 464、P2B 集成 132、E4-Diag 457/457、
+E1/E2/M0.5/E4 全绿；`bash-suites` 在 22.04/24.04/26.04 三平台通过，
+`core-regression`/`fast-checks`/`ci-gate` 通过。那道只读门的静态证明另有本地证据：
+prestate 小节最初落在 awk 审计区域**之内**时，`probe-ingest` 在 dev 主机全量清扫里
+是 **305/2**（CI 从未见过那个布局），移出之后才回到 307 并保持到本轮——
+§23 那条"版面约束是承重的"因此是被观察到的，不是推出来的。
+
+记录这些数字的是**纯文档**提交，对 CI 惰性：`tests/` 与 `.github/workflows/`
+全文搜不到 `monitor-v2-network-probes-p3b`；deploy README 只在 workflow 的一条
+**注释**里被提及，且指向的是另一个小节（"兼容性预检与环境诊断"），因此改写 §23
+不触碰任何门。本节的数字测自功能/测试头 `f0f3bce` 之上的文档头，
+最终评审头以 PR 里最新一轮 CI 为准。
