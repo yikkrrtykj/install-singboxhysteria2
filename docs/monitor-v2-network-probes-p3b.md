@@ -651,7 +651,8 @@ release/unit/enabled/active。于是"迁移已提交、后续闸门失败"的回
 回滚把一个可恢复的失败变成了不可恢复的状态。
 
 修复的契约、实现细节、版面约束（prestate 小节必须留在只读门小节的 awk 审计区域**之外**）、
-判别器（`test-monitor-packaging.sh` T28/T29）与两个变异实验，全部记在
+判别器（`test-monitor-packaging.sh` T28/T29，以及 R1 轮的 T30/T31）与变异实验
+（四个：事务级的 restore/capture 空操作各一，R1 级的跨越判定与降级门各一），全部记在
 `monitor-v2/deploy/README.md` §23。本 PR-3B 文档只补三条与本功能相关的立场：
 
 - v3 schema 的**代价面**从此有了部署期对价：一旦某个 release 把 schema 向前推，
@@ -660,6 +661,15 @@ release/unit/enabled/active。于是"迁移已提交、后续闸门失败"的回
   并被 T29 断言仍然有效；正常命令面不会自动使用它，也不会自动删除它。
 - 探测本身（端点、节奏、写入路径、schema 形状）零改动：本轮只增加事务的恢复能力，
   因此本文 §1–§16 的所有功能判据逐条继续成立。
+
+**R1 轮在同一条事务面上又找到两条边界错误**（同为部署事务契约，功能面零改动）：
+B1 把"抓到了预状态"当成"可以覆盖数据库"——而最常见的 forward 失败发生在 candidate 启动
+**之前**，那时唯一持有并写入这个库的仍是老 Monitor，它写的行是快照不可能包含的合法历史；
+现在 restore 先用形状三元组重探活动库，证明本事务确实跨越了边界才静默、才替换，否则
+`history_db=untouched` 且一行历史都不掉。B2 是 `install --allow-downgrade`：capture 曾经
+对 `candidate < live` 返回成功，于是这条命令成了唯一绕过手工回滚 schema 门的通道，把声明 v2
+的运行时放到 v3 库上（静默黑暗）；现在两道门共用同一段拒绝语，在激活之前拒绝、点名保留介质、
+恒 rc 1，而同 schema 的 VERSION 降级依旧允许。判别器 T30/T31 与 M1/M2 取证见 §23。
 
 `VERSION`/`MONITOR_WEB_VERSION` 保持 0.4.0（生产未部署）。不部署、不接触生产 VPS、
 不合并。

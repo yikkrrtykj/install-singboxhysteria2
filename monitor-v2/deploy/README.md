@@ -1063,9 +1063,18 @@ rollback gate's two inputs" 那道手工回滚门会从此永久拒绝这个 tar
 
 - **capture 早于激活**：`sbmon_history_txn_capture <candidate-id> <candidate-version>`
   在 `sbmon_stage_release` 之后、`sbmon_activate_release`/任何启动**之前**跑。它先只读
-  判定 live schema 与 candidate schema，只有 `candidate > live` 才建立预状态；同 schema、
-  降级、无历史库、noop/repair 一律保持既有行为（备份根目录继续为空）。判定不了就
-  fail-closed 拒绝升级——此时 candidate 尚未激活，部署零变更。
+  判定 live schema 与 candidate schema，这道比较**有三扇门**，只有一扇需要快照：
+  `candidate > live`（向前迁移要来 → 建预状态）、`candidate == live`（不可能有 schema
+  改动 → 直接成功，没有需要撤销的前进动作，**同 schema 的 VERSION 降级照旧允许**）、
+  `candidate < live`（**schema 降级** → 拒绝）。无历史库、noop/repair 一律保持既有行为
+  （备份根目录继续为空）。判定不了（candidate 或 live 的 schema 版本读不出、非整数）
+  就 fail-closed 拒绝升级——此时 candidate 尚未激活，部署零变更。
+- **R1-B2：install 不再绕过手工回滚门**。`candidate < live` 那一扇门曾经 `return 0`，
+  于是 `install --allow-downgrade` 成了唯一一道能绕过手工回滚 schema 门的通道：它把声明
+  v2 的运行时放到 v3 数据库上，运行时自己的门 fail-closed 停写——正是本节要防的静默黑暗。
+  现在两道门（`rollback` 与 `install --allow-downgrade`）共用 `sbmon_history_downgrade_refusal`
+  同一段拒绝语：两个整数版本都写明、点名 sidecar 里**记录过路径**的兼容迁移前介质（存在才点）、
+  承诺本命令绝不自动替换数据库、恒 rc 1。拒绝发生在激活之前，所以是前置条件类失败：线上零变更。
 - **快照走 SQLite backup API**：源以 `mode=ro` URI 打开、目标先 `commit()` 再
   `source.backup(target)`。普通 `cp` 会得到撕裂镜像（运行中的 Monitor 持有该库并在写），
   而为备份停服务等于拿一次可用性抖动换一个回滚隐患——所以 **capture 不 stop、不
@@ -1077,15 +1086,26 @@ rollback gate's two inputs" 那道手工回滚门会从此永久拒绝这个 tar
   基线。sidecar 记录 declared/schema_sha/content_sha/tables/db_path/backup/live_owner/
   live_group/live_mode/candidate_* /captured_utc，介质与 sidecar 都是事务私有命名，
   临时文件用 `mktemp` 且任何失败路径都清干净。
-- **restore 的顺序是硬性的**：任一 forward 闸门失败且本事务确实捕获过 schema 预状态时，
-  `sbmon_history_txn_restore` **先停 candidate**（停不掉或停了仍在跑都拒绝继续：绝不带着
-  运行中的 writer 替换数据库），再在同目录 `mktemp` + `rename(2)` 原子替换，按 sidecar
-  还原生产属主/组/权限，只删**这一个**库的 `-journal/-wal/-shm` sidecar，不碰其他任何
-  状态；替换后重新探测 declared/schema/content/tables 并逐项相等，才置
-  `SBMON_PRE_DB_RESTORED=1`。权限比较用 `$((8#…))` 数值等值，不做"去零归一化"。
+- **R1-B1：预状态是"可以撤销迁移"的许可，不是"可以覆盖数据库"的许可**。capture 成功
+  不代表 crossing 发生过。forward 失败最常见的位置根本在 candidate 启动**之前**——而它
+  没启动的那段时间里，**老 Monitor 一直在正常运行并写入合法历史**，这些行是快照不可能
+  包含的。盲目恢复会删掉本事务从未产生的历史：一次部署失败并没有要求的数据丢失。
+  所以 `sbmon_history_txn_restore` 的顺序是硬性的：① 先读 sidecar 契约（它是下一个问题
+  的参照系），② **重新只读探测活动库**并与捕获时记录的**形状三元组**比较
+  （`declared` + `schema_sha` + `tables`）——三项全等即本事务从未跨越边界，函数**什么都不
+  碰**地返回 0，`SBMON_PRE_DB_RESTORED` 保持未置位，完成语为 `history_db=untouched`；
+  **内容摘要刻意不在这道比较里**，它保护的正是捕获之后写入的行。凡是这一支证明不了的
+  （形状动了、库探测不了）一律落到恢复分支——"无法排除迁移已提交"恰恰就是需要恢复的时刻。
+  ③ 确认跨越之后才**先停 candidate**（停不掉或停了仍在跑都拒绝继续：绝不带着运行中的
+  writer 替换数据库），④ 介质重新过 `PRAGMA quick_check` 与记录摘要（恢复发生在捕获数分钟
+  之后，不信任只重证），⑤ 同目录 `mktemp` + `rename(2)` 原子替换、按 sidecar 还原生产
+  属主/组/权限、只删**这一个**库的 `-journal/-wal/-shm` sidecar，不碰其他任何状态，
+  ⑥ 替换后重探 declared/schema/content/tables 逐项相等才置 `SBMON_PRE_DB_RESTORED=1`。
   之后才轮到 release/unit/enabled/active 的既有恢复；reader 预状态恢复仍在同一事务内。
+  权限比较用 `$((8#…))` 数值等值，不做"去零归一化"。
 - **DB 恢复失败 = `sbmon_critical`（exit 2）**，绝不声称回滚完成。完成语只有两种形态：
-  `history_db=prestate-restored+verified` 或 `history_db=untouched`。老运行时在新 schema
+  `history_db=prestate-restored+verified`（确实跨越、已恢复并重证）或 `history_db=untouched`
+  （本事务没有前移过 schema——含"抓了预状态但从未跨越"这一支）。老运行时在新 schema
   之上永远不会被重新点亮。
 - **成功即保留**：v2→v3 升级成功后，已验证的迁移前备份留在备份根目录，作为**手工降级的
   唯一恢复物**；installer 只报告路径，既不静默删除也不自动使用。普通 `rollback` 从 v3
@@ -1117,6 +1137,33 @@ unit 事实复原、reader 预状态复原、诱饵文件与 sidecar/temporary �
 T29 走成功路径：v2→v3 之后介质仍有效并保留，手工 `rollback` 到 pre-v3 依旧被拒且点名
 介质，按介质手工恢复之后同一次降级才被允许。
 
+R1 判别器（同文件 T30/T31，同一套 `prestate_fixture_run` 隔离夹具）：
+**T30 证明"抓过快照"不等于"可以覆盖库"**。夹具在 capture 之后、candidate 启动之前注入
+失败（新 mock 旋钮 `MOCK_PRE_BOOT_SCRIPT`：先往 `journal_ingest_audit` 插一行哨兵
+`seq=9991`，再以 rc 1 失败——"写哨兵"与"拒绝启动"是同一步，所以 candidate 确实从未 boot，
+日志里既无 `boot declared=3` 也无 `boot migrated to v3`）。终态逐项断言：事务 rc 1 但**无
+`CRITICAL`**、日志同时出现"已捕获迁移前预状态"与"预状态未被使用"且**不**出现"跨越已发生"、
+完成语为 `history_db=untouched` 而非 `prestate-restored`、活动库仍是精确 v2（7 张表、无
+`network_probe_samples`）、**捕获前的连续行与捕获后写入的 9991 哨兵两行都还在**、
+快照里从未含 9991（它是事务前的镜像）、快照摘要仍等于事务前摘要、而活动库摘要**刻意不等于**
+快照（相等就说明覆盖了，这一条是反转的哨兵）、`systemctl stop singbox-monitor` 零次
+（静默只在真正跨越时才需要，没换文件就没什么要静默的）、release/unit/enabled/active/
+reader 预状态照常复原、`releases.history` 未提交、介质保留且 `0600`、`sing-box`/`sbox-cm`
+零调用。哨兵用 `seq` 识别而非新 `code`——`journal_ingest_audit.code` 是闭集 CHECK 词汇表，
+夹具无权发明新值。
+**T31 证明 install 那道降级门是真的、且是可解的**。它自己的夹具走完整**成功**路径
+（`prestate_fixture_run t31 0`），于是起点正是这道门必须推理的那个状态：v3 数据库 +
+v3 运行时 + 一份保留的 v2 介质。pre-v3 一侧另建**源码树**（VERSION 0.3.1、模块声明 v2），
+不复用别的小节损坏过的模块。跑
+`install --allow-downgrade`：rc 1、`拒绝降级`、两个整数版本都写明（`声明 history schema v2`
+/ `当前数据库为 v3`）、点名 `history-prestate-`、`绝不自动替换数据库`、`candidate 尚未激活`；
+零变更由一次 bundle 比较证明（Monitor unit、reader unit、`releases.history`、active/enabled
+事实逐项字节相等）加上数据库 sha 前后相等、Monitor 服务写操作 0 次、boot 日志 0 条
+（"老运行时压在 v3 上"从 install 不可达）、备份根目录没多出第二份快照。随后运维者**手工**
+把保留介质落回活动库，同一条命令 rc 0、pre-v3 release 上线、库回到精确 v2、介质里那行
+`7|gap|sequence_gap` 正是新运行时现在跑在其上的历史、boot 日志零次拒绝启动、`install 完成`——
+拒绝是一条 schema 事实，不是一劳永逸的封锁。两个方向都 `sing-box` 零调用。
+
 变异实验（在真实库函数上跑，dev 主机原生排练，两个都红）：
 (1) 把 `sbmon_history_txn_restore` 变成空操作 → 快照仍在、恢复"返回成功"，但
 `SBMON_PRE_DB_RESTORED=0`、库仍是 v3/8 表、老运行时**拒绝启动**——正是本轮要关掉的
@@ -1125,7 +1172,17 @@ T29 走成功路径：v2→v3 之后介质仍有效并保留，手工 `rollback`
 (2) 把 `sbmon_history_txn_capture` 变成空操作 → 备份根目录为空、restore 因"本事务没有
 预状态"而合法地不动作，终态与 (1) 同样黑暗，且手工降级门此时只能拒绝而**无法点名介质**。
 
-本机立场：T28/T29 与 T15/T16/F1/F2a/F2b 同门槛，在 Git Bash 上**SKIP**（`ln -s` 是复制
+R1 变异实验（同样在真实库函数上跑，两个都红，且各自只红自己该红的场景）：
+**M1** 把跨越判定里的 `return 0` 换成"形状相符但照常恢复"→ 未跨越场景立刻回到本轮要
+关掉的损失：哨兵被删、活动库变回快照、7 项断言同时变红；而"确实跨越"的场景仍绿（M1 没有
+削弱恢复本身）。**M2** 把 capture 的三门并成 `candidate <= live → return 0`（即 B1 之前的
+旧行为）→ 降级门失守：capture 对 schema 降级返回**成功**，事务因此越过唯一在激活前读过
+两侧 schema 的步骤，拒绝语的六项证明（rc 1、两个整数版本、点名介质、承诺不自动替换）同时
+变红；未跨越场景不受影响。M2 之后"v2 运行时被点亮在 v3 库上、服务写操作与 boot 都发生"
+这一步只有完整事务体才能观察到，它由 T31 在服务面上断言（写操作 0 次、boot 0 条）。
+T30/T31 在 Linux 上因此不是"读代码的注释"，而是这两处逻辑的机械哨兵。
+
+本机立场：T28/T29/T30/T31 与 T15/T16/F1/F2a/F2b 同门槛，在 Git Bash 上**SKIP**（`ln -s` 是复制
 语义、`chmod` 不可靠），Linux packaging 车道（normal + root 两次 pass）才是门禁；
 `chown` 还原只在非 fixture 路径执行，由 root pass 证明。CI 在评审头 `bf28853` 首试
 10/10 全绿，该处实测为 normal pass **695/0**、root pass **711/0**（基线 `c2aa6b2`
