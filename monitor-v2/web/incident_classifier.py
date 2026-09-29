@@ -7,8 +7,9 @@ token from a reviewed closed vocabulary.
 Contract (docs/monitor-v2-incident-classifier-p4a.md):
 
 * **Pure and dark.** Standard library only (the ``dataclasses`` module), no
-  clock, no state, no I/O, no imports from ``web/``, ``diagnostics/`` or
-  ``journal_reader/``. Nothing in the runtime imports this module in PR-4A:
+  clock, no state, no I/O, and no import of any sibling package -- not the
+  web surface, not the probe engine, not the journal reader. Nothing in the
+  runtime imports this module in PR-4A:
   no route, no scheduler, no service loop, no schema, no deployment surface
   touches it.
 * **Schema-v3 truth only.** The accepted record shapes are the columns the
@@ -126,7 +127,8 @@ HISTORY_ERROR_CODES = ("history_dir_unsafe", "history_db_unsafe",
                        "history_probe_persist_failed",
                        "history_probe_result_rejected",
                        "history_journal_exchange_unreadable")
-# Mirror of the reader availability tokens (_journal_reader_hb_status), of
+# Mirror of the reader availability tokens (the heartbeat-name status
+# derivation in the history store), of
 # the snapshot health field the projection carries, and of the device-row
 # reason wall in the v1 schema.
 READER_STATUSES = ("disabled", "absent", "unreadable", "invalid",
