@@ -2,10 +2,11 @@
 
 状态：功能评审 **R3 = PASS / APPROVE**，功能代码**冻结**在头
 `27e165c0d032b464e8686b26748ca775d4323be1`（该头 `VERSION` 与
-`MONITOR_WEB_VERSION` 为 `0.3.1`）。在此之上只有两个提交：一个**仅 release-prep**
+`MONITOR_WEB_VERSION` 为 `0.3.1`）。在此之上只有三类提交：一个**仅 release-prep**
 提交，把版本元数据与钉住当前发布版本的断言抬到 `0.4.0`；一个**纯测试基础设施**
-提交，把 packaging 夹具的合成候选版本阶梯搬进保留空间并加守卫门（两者都记在 §16）。
-功能代码依旧逐字节等于 `27e165c`；不合并、不部署。
+提交，把 packaging 夹具的合成候选版本阶梯搬进保留空间并加守卫门；以及记录 CI
+实测数字的**纯文档**提交（三者都记在 §16，零行为变更）。功能代码依旧逐字节等于
+`27e165c`；不合并、不部署。
 基线：`main @ 32a06ce`（PR-3A 引擎）。
 分支：`codex/pr3b-network-probe-ingest-033`。
 上游规格：issue #33 Phase 3；前序文档 `docs/monitor-v2-network-probes-p3a.md`
@@ -384,8 +385,10 @@ jr-deploy 464/0/0-SKIP、p2b 集成 132/0/0-SKIP；packaging fixture 631/0
 
 sbox-cm 二进制与 `lib/client-management.sh`/`lib/sbox-cm-state.sh` 零接触；
 无质量感知 failover；无 UI/static 改动；无生产 VPS 访问、无 SSH、无部署；
-`VERSION` 在功能评审各头保持 `0.3.1`，功能 PASS 之后由**唯一一个仅 release-prep**
-提交升到 `0.4.0` 并重跑全量 CI（§16，不带任何行为改动）；不合并（需显式指令）；
+`VERSION` 在功能评审各头保持 `0.3.1`，功能 PASS 之后由**一个仅 release-prep**
+提交升到 `0.4.0` 并重跑全量 CI（§16，不带任何行为改动；其上另有 §16 第 4 项的
+**纯测试基础设施**提交与记录 CI 数字的文档提交，三者都零行为变更）；
+不合并（需显式指令）；
 不引入浏览器/前端；unit 模板**只**新增
 一行指向 deploy 解算路径的 `Environment=`（B4），地址族、沙箱、用户、`UMask`
 等其余各行零改动；不改 `monitor.conf` 键集（探测节奏与目标集仍不是可配置项）。
@@ -536,9 +539,10 @@ p2b 集成 132/0/0-SKIP；packaging fixture 631/0、root 646/0；三条基线
 
 ## 16. 发布准备（Monitor 0.4.0）
 
-功能评审 **R3 = PASS / APPROVE**，功能代码**冻结**在 `27e165c`。其上只允许一个
-**仅 release-prep** 提交，内容限定为三类；第 4 项是 CI 在该准备头抓到红灯之后的
-**纯测试基础设施**修复（同样零行为变更），两类提交合起来就是发布头的全部：
+功能评审 **R3 = PASS / APPROVE**，功能代码**冻结**在 `27e165c`。**仅 release-prep**
+提交的内容限定为三类（1-3）；第 4 项是 CI 在该准备头抓到红灯之后的**纯测试
+基础设施**修复（同样零行为变更）；再往上的提交只搬运本节引用的 CI 实测数字，
+不带任何其他内容。这几类合起来就是发布头的全部：
 
 1. **版本元数据**：`monitor-v2/VERSION` 与 `web/server.py` 的
    `MONITOR_WEB_VERSION` 从 `0.3.1` 抬到 `0.4.0`（两者由 `test-monitor-v2-ui.cjs`
@@ -629,4 +633,6 @@ shellcheck `-S warning` 逐条实测：hist / probes / probe-ingest **0** 条，
 
 记录这一轮的数字是**纯文档**提交：`grep` 清查确认没有任何车道或 workflow 引用本文
 （`tests/` 与 `.github/workflows/` 里搜不到 `monitor-v2-network-probes-p3b`），
-所以文档写入对 CI 是惰性的。
+所以文档写入对 CI 是惰性的；上面的数字测自功能/基础设施头 `70528b1`，其上的文档头
+`a0f010c` 再跑一次仍是首试 10/10 全绿（runs 36517126376 / 36517126369），
+最终评审头以 PR 里的最新一轮 CI 为准。
