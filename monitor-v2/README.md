@@ -405,7 +405,7 @@ History 升到 **schema v3**：恰好一张新表 `network_probe_samples`（19 �
 > 2026-09-29 补充（同版本，**未发布**）：Phase 4 第一步 PR-4A 在 `web/` 内新增
 > `incident_classifier.py`——schema v3 四证据面上的**纯函数式事件分类器**。它把 60
 > 秒有界窗口内的 timeline 样本、设备计数、journal 事件与探测结果折叠成一个闭合类型
-> 结果（七类词表 + 45 个 evidence token + 27 个 unknown token，全部字面量钉在场道里），
+> 结果（七类词表 + 45 个 evidence token + 28 个 unknown token，全部字面量钉在场道里），
 > 且**默认 DARK**：`monitor-v2/` 下没有任何模块导入它，无新端点 / 无 UI / 无 schema
 > 变更 / 无部署改动，`VERSION` 与 `MONITOR_WEB_VERSION` 仍是 `0.4.0`。三条不变量决定
 > 它可信：单纯连接数下降**永不**独立成为事件（必须有 journal / probe / process 独立
@@ -418,8 +418,23 @@ History 升到 **schema v3**：恰好一张新表 `network_probe_samples`（19 �
 > 证据一律命名后 fail closed，绝不猜测目标。每个
 > `incident` 无条件携带 `root_cause_not_established`：分类器说"证据指向哪里"，永远
 > 不说"为什么"。契约、阈值表与已知边界见 `docs/monitor-v2-incident-classifier-p4a.md`；
-> 车道 `tests/test-monitor-v2-classify.sh`（`EXPECTED_PASS=582`，含两份提交进仓的夹具
-> 与四条"改证据即改答案"的变异判别器）当前只登记在 `tests.yml`，接线属 Phase 4B。
+> 车道 `tests/test-monitor-v2-classify.sh`（`EXPECTED_PASS=665`，含两份提交进仓的夹具
+> 与"改证据即改答案"的判别器：第三轮 4 条、本轮 8 条）当前只登记在 `tests.yml`，
+> 接线属 Phase 4B。
+>
+> 2026-09-30 补充（同版本，**未发布**，PR-4A 第四轮）：按复审修正三条语义，不扩范围。
+> `device_protocol_states` 的真实键是 `(device, inbound, epoch)`，一台机器每个入口各
+> 有一行且同时成立，因此"一台机器一个数字、后读的行覆盖先读的"那种折叠会把遍历顺序
+> 当成证据；现在按 `(device, inbound)` 配对折叠、epoch 相同取**较大**计数，并要求窗口
+> 内出现过的每个配对都在本桶**答过** 0 才叫"全安静"——这张表是 change/heartbeat 稀疏
+> 日志，没上报不等于报了 0。同时把 `all_devices_quiet` **降级为纯上下文证据**：它不再
+> 设置任何影响位，因而不再可能单独把窗口抬成 `common_inbound_client_office`，其局限由
+> 新 token `device_states_are_change_only` 点名（unknown 词汇 27 → 28）。`tls_failed`
+> 与 `protocol_failed` 从"网络拒绝"移到"证人缺席"一侧——它们是引擎捕获的任意
+> `ssl.SSLError`、HTTP 协议异常、短于 12 字节的 UDP 应答与 id/question 不匹配，都不
+> 证明路径断了；期望值由 harness 直接调用探测引擎自己的映射函数得出。`egress_ip_changed`
+> 不再是探测平面独证的 corroboration 证人（同一批 `ProbeScheduler` 行、且 `changed` 恰是
+> 一次成功应答），只保留为"网络上下文变了"的 evidence。判别力实测见该文档 §6.1。
 
 ### 请求门顺序（每个普通请求）
 
