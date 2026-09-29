@@ -390,6 +390,16 @@ Monitor 交换访问的 release 会 fail-closed / 回滚而不是悄悄提交。
 `VERSION`、`MONITOR_WEB_VERSION` 与钉住当前发布版本的 hist / jr / packaging 断言
 抬到 `0.3.1`；描述生产 `0.3.0` 缺陷的历史与 fixture 字样保持不变。
 
+### 0.4.0：出站探测激活 + 结果入库（issue #33 Phase 3 PR-3B；引擎见 docs/monitor-v2-network-probes-p3a.md，激活契约、门表与三轮评审取证见 docs/monitor-v2-network-probes-p3b.md）
+
+0.3.1 交付的是**测量能力**（PR-3A 的 dark 引擎），0.4.0 把它接进 Monitor 而**不改变默认行为**：新增 `diagnostics/probe_scheduler.py` 作为唯一激活面——专用 daemon 线程（不骑 publisher 循环），节奏、端点集与 deadline 全是编译期冻结常量。默认仍是 **DARK**：只有 `SINGBOX_MONITOR_PROBE_TARGETS_FILE`（打包 unit 恒定写明、由 deploy 库解算的 `/etc/singbox-monitor/probe-targets.json`）指向一个评审过的文档时才有线程与出站；变量未设 / 文件缺席 / 文档畸形分别结算为三个闭合 `startup_error` token，绝不静默回落到生产目标集。
+
+History 升到 **schema v3**：恰好一张新表 `network_probe_samples`（19 列，全部 CHECK 墙），fresh / v1→v3 / v2→v3 都在**一个**事务内 forward-only 完成。引擎的闭合 `ProbeResult` 在入库边界**再验证一次**（不信上游），且每个原语先做**恰等类型**判定再进入范围 / 词汇 / 等值判断：`bool` 不是旗标，`12.0`/`"12"`/`Decimal(12)` 不是 latency（否则 SQLite 的 INTEGER affinity 会把字符串静默转换后入库，表里存下引擎从未产出过的 coercion），不可哈希或伪造 `__eq__`/`__hash__` 的候选者既不能被采纳为 token，也不能把一次读取抛成 500。`egress_change` 一律由"最后一条成功入库的公网出口 IP"在 7 天基线窗口内**推导**——重启不伪造 `changed` 事件，失败周期不抹掉基线；探测运行时/持久化健康（`history_probe_result_rejected` / `history_probe_persist_failed` / `history_schema_unsupported`）与普通网络失败证据分属两个平面，互不吞并。
+
+读取面**复用**既有有界 `GET /api/v1/diagnostics/timeline`：同一请求多带 `probe_rows`（列白名单 + `since`/`limit`/`truncated`）与 deny-by-default 的 `probes` 闭合投影；无新端点、无新查询参数、无 UI。部署面两项：`diagnostics/` 进入**显式不可变 staging 清单**（3 个模块、恰等审计，绝不 `cp -R`），`install-monitor.sh rollback` 前置 **history schema 兼容门**——v3 库不可能经普通回滚路径落到 pre-v3 release 之下。
+
+本提交把 `VERSION`、`MONITOR_WEB_VERSION` 与钉住**当前发布版本**的 hist / jr / probes / probe-ingest / packaging 断言抬到 `0.4.0`；描述 `0.3.0`/`0.3.1` 缺陷与各轮版本立场的历史文字、`0.3.1` 依赖 bootstrap 注释、以及夹具内的版本占位值保持不变。功能代码冻结在 `27e165c`（评审 R3 = PASS），本提交不带任何行为、schema、端点、调度器或部署事务改动。
+
 ### 请求门顺序（每个普通请求）
 
 ```text

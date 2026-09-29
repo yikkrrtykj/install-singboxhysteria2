@@ -1,7 +1,10 @@
-# Monitor 0.3.x —— PR-3B 探测激活 + 结果入库（issue #33 Phase 3，功能评审头）
+# Monitor 0.4.0 —— PR-3B 探测激活 + 结果入库（issue #33 Phase 3，发布准备头）
 
-状态：已实现，**功能评审头**（`VERSION` 与 `MONITOR_WEB_VERSION` 保持
-`0.3.1`；不合并、不部署）。基线：`main @ 32a06ce`（PR-3A 引擎）。
+状态：功能评审 **R3 = PASS / APPROVE**，功能代码**冻结**在头
+`27e165c0d032b464e8686b26748ca775d4323be1`（该头 `VERSION` 与
+`MONITOR_WEB_VERSION` 为 `0.3.1`）。在此之上只有一个**仅 release-prep** 提交，
+把版本元数据与钉住当前发布版本的断言抬到 `0.4.0`（§16）；不合并、不部署。
+基线：`main @ 32a06ce`（PR-3A 引擎）。
 分支：`codex/pr3b-network-probe-ingest-033`。
 上游规格：issue #33 Phase 3；前序文档 `docs/monitor-v2-network-probes-p3a.md`
 （引擎）、`docs/monitor-v2-incident-history-p1.md`（历史库禁持久化清单）。
@@ -296,7 +299,7 @@ R2-B7 把剩下三个字段也做成**闭合值域**，每个都有各自的失�
 | S0 静态 + 镜像（8） | `py_compile` 全集；history↔engine 词汇**活值**恰等；IP 门 AST 同一；bounds/v3/`_PRUNE_SOURCES` 自洽；scheduler↔server 状态面恰等——含**三** token 的 `PROBE_STARTUP_TOKENS`，以及五个投影分类集合与 `status()` 键集**恰等**（B5：分派不得有未分类键）；`web/` 零 `diagnostics` import；**R2-B7/B8 的 AST 反 coercion 门**：投影与边界的七个判据函数体内不得出现 `isinstance`/`bool`/`_as_int` 调用；**latency 墙形状门**：`_closed_code_slot` 原文里必须存在 `type(latency) is not int`、不含 `_as_int`、恰两个调用点（timed/egress），且 `PROBE_LATENCY_MAX_MS == 120000` |
 | S1 回滚门接线（6） | 调用点在首处变更之前；拒绝文案承诺零变更；整个门 helper 区无写语句；库恰一次以只读 URI 打开；目标 release 读者不继承调用方 `sys.path`；调用点 die-check |
 | S2 回滚门决定（21） | v3→v3/v4 放行，v3→v2、pre-history、缺失 release、无版本声明、非数字、负数、非数据库文件均拒绝；无库放行且不创建任何文件；真 v3 库（由被测模块自建）同判；拒绝文案含两个版本号、不含 fixture 路径；DB 字节与目录集不变；整棵发布树零 `__pycache__`（`-B` 契约） |
-| S3 打包 opt-in 面（15） | 打包 unit **经真实 deploy 库渲染**（`sbmon_render_unit` 在临时文件上跑一遍）；渲染结果恰一行 `Environment=` 且它就是 opt-in 路径、无残留 `@SBMON_` token、值等于 `$(sbmon_probe_targets_file)`；出货面（`install-monitor.sh`/`app-bin`/reader unit）无人书写该文档名；`sbmon_verify_probe_targets` 函数体 awk 提取后不含写语句或 `touch/rm/cat/tee/cp/mv/install`；调用行号早于 `sbmon_stage_release`；生成的 `monitor.conf` 无探测键（且键集可枚举，门非空转）；conf 读取器白名单无探测键；`webapp.py` 以 `ProbeScheduler(history)` 唯一构造、不传 cadence/targets；调度器 AST 只有一个 `open(...,"r")`、无写/unlink/`sqlite3`/`shutil`；夹具 AST 的每个 socket 调用点都是 `127.0.0.1`；VERSION/`MONITOR_WEB_VERSION` 仍 0.3.1；tests.yml 已接线 |
+| S3 打包 opt-in 面（15） | 打包 unit **经真实 deploy 库渲染**（`sbmon_render_unit` 在临时文件上跑一遍）；渲染结果恰一行 `Environment=` 且它就是 opt-in 路径、无残留 `@SBMON_` token、值等于 `$(sbmon_probe_targets_file)`；出货面（`install-monitor.sh`/`app-bin`/reader unit）无人书写该文档名；`sbmon_verify_probe_targets` 函数体 awk 提取后不含写语句或 `touch/rm/cat/tee/cp/mv/install`；调用行号早于 `sbmon_stage_release`；生成的 `monitor.conf` 无探测键（且键集可枚举，门非空转）；conf 读取器白名单无探测键；`webapp.py` 以 `ProbeScheduler(history)` 唯一构造、不传 cadence/targets；调度器 AST 只有一个 `open(...,"r")`、无写/unlink/`sqlite3`/`shutil`；夹具 AST 的每个 socket 调用点都是 `127.0.0.1`；VERSION/`MONITOR_WEB_VERSION` 恰为**当前发布版本**（发布准备头为 `0.4.0`，见 §16）；tests.yml 已接线 |
 | S4 CI 网络守卫自检（7） | 公网 TCP connect / UDP sendto / DNS 解析 / 非 loopback bind / 链路本地元数据地址全部**被拒**；loopback connect 与 `localhost` 解析放行 |
 | S5 行为组（250，全程在守卫下运行） | boundary 35（>40 例拒绝矩阵，每条都携带"缺陷世界会兑现的那个 token"，故 B2/B3 的拒收不可被掩盖；**B8 再加 5 条**：11 例 latency 缺陷矩阵、6 行"失败槽位必须是恰 NULL"、9 行词汇冒充者、20 行边界原语恰等类型、以及"每一次恰等类型拒收都携带 `history_probe_result_rejected`"）、durable 25（重启 + 窗口 + raw-writer 防御 + 三值推导网格 + 三份推导 14×14 同答）、schema 31（fresh/v1→v3/v2→v3、崩溃注入、pre-v3 运行时、22 条 CHECK 墙含 NULL/重复 id 的 DDL 撞墙）、retention 12、health 21、activation 38（DARK 默认不起线程、16 例畸形 opt-in、闭合 token/常量冻结、**B1 目标/状态配对的四条实测判别器**）、e2e 21（真调度器 + 127.0.0.1 TLS 假服务）、threads 25（20× start/stop、慢周期不 convoy 且每周期携带**新** `cycle_id`）、http 42（真 server、401、恰等投影、liar/raiser + 19 例敌意数值矩阵与两张闭合域直查表；**B7 再加 12 条**：36 行敌意 shape 矩阵 + 逐行严格 JSON + "敌意形状永不杀投影"、诚实 token 表 3+4+2 行、`SneakyStatus(dict)` 证明容器须恰等 dict、三个闭合器各自的直查表与"闭合器在词汇上全定义/遇不可哈希不抛"） |
 
@@ -378,8 +381,9 @@ jr-deploy 464/0/0-SKIP、p2b 集成 132/0/0-SKIP；packaging fixture 631/0
 
 sbox-cm 二进制与 `lib/client-management.sh`/`lib/sbox-cm-state.sh` 零接触；
 无质量感知 failover；无 UI/static 改动；无生产 VPS 访问、无 SSH、无部署；
-`VERSION` 保持 `0.3.1`（功能 PASS 后再以**仅 release-prep** 提交升到 `0.4.0`
-并重跑全量 CI）；不合并（需显式指令）；不引入浏览器/前端；unit 模板**只**新增
+`VERSION` 在功能评审各头保持 `0.3.1`，功能 PASS 之后由**唯一一个仅 release-prep**
+提交升到 `0.4.0` 并重跑全量 CI（§16，不带任何行为改动）；不合并（需显式指令）；
+不引入浏览器/前端；unit 模板**只**新增
 一行指向 deploy 解算路径的 `Environment=`（B4），地址族、沙箱、用户、`UMask`
 等其余各行零改动；不改 `monitor.conf` 键集（探测节奏与目标集仍不是可配置项）。
 
@@ -526,3 +530,50 @@ p2b 集成 132/0/0-SKIP；packaging fixture 631/0、root 646/0；三条基线
 另有一条取证纪律值得写明：本轮曾在**同一工作树并发了变异实验与车道扫描**，
 于是 `306/1` 的红与一批 `e2` 红都不是被测契约的状态，而是测量环境的状态。
 两者全部作废重跑，本节的数字来自"扫描期间工作树零写入"的那一批。
+
+## 16. 发布准备（Monitor 0.4.0）
+
+功能评审 **R3 = PASS / APPROVE**，功能代码**冻结**在 `27e165c`。其上只允许一个
+**仅 release-prep** 提交，内容限定为三类：
+
+1. **版本元数据**：`monitor-v2/VERSION` 与 `web/server.py` 的
+   `MONITOR_WEB_VERSION` 从 `0.3.1` 抬到 `0.4.0`（两者由 `test-monitor-v2-ui.cjs`
+   的等值断言耦合，必须同批移动）。
+2. **钉住"当前发布版本"的断言**：`hist` 2 条、`jr` 1 条、`probes` 1 条、
+   `probe-ingest` 2 条，以及 `test-monitor-packaging.sh` 里 T26 的**段落标签**
+   （它描述"当前候选"，数值仍从 VERSION 动态读取，不是断言）。**各车道门数不变**：
+   probe-ingest 仍 307、probes 仍 138、hist 仍 240、jr 仍 371。
+3. **版本立场措辞**：本文头部、§10 S3 行、§12，以及 `monitor-v2/README.md`
+   新增的 `### 0.4.0` 变更条目。
+
+刻意**不**机械替换的 `0.3.x` 字样（它们是历史与 fixture 证据，不是过期元数据）：
+`install.sh` 与 `tests/test-install-host-deps.sh` 里描述 0.3.1 依赖 bootstrap 的
+注释、`.github/workflows/tests.yml` 里描述实机门所及祖先 release 的注释、
+`monitor-v2/README.md` 的 `0.3.0` / `0.3.1` 条目、`deploy/README.md` §20/§21 的
+轮次记录、`docs/monitor-v2-network-probes-p3a.md` 的版本立场、本文 §14/§15
+里"评审头 `VERSION` 仍为 `0.3.1`"的实测记录（那对 `27e165c` 恰好为真）、
+packaging T22–T26 里描述被升级**祖先** release 的注释，以及
+`tests/monitor-probes/probe_ingest_groups.py` 夹具的 `monitor_version="0.3.1"`
+占位值——它只是 `created_by_version` 的写入样本，没有任何门把它与 VERSION 比较。
+
+判别力（发布准备也要能被证伪，**已实测**）：只把 `monitor-v2/VERSION` 退回
+`0.3.1` → hist / jr / probes / probe-ingest **各 1 条**变红（共 **4**）；
+`VERSION` 与 `MONITOR_WEB_VERSION` **同时**退回 → 再点亮 hist 与 probe-ingest
+各自的 `MONITOR_WEB_VERSION` 门（共 **6**，即当前版本断言的全部）。两组实验测完
+后都把两个文件按字节还原，`git diff` 只剩这两行。packaging 不在此列：T26 的候选
+版本是从 VERSION **动态**读的，段落标签只是散文。另注：`tests/test-monitor-v2-ui.cjs`
+里有一条"server 常量 == VERSION 文件"的等值断言，它把两个数字耦在一起，但该车道
+**未接入 CI**，所以 CI 可见的耦合由上面那 2 条 `MONITOR_WEB_VERSION` 门承担。
+因此这些断言是真承重，不是装饰。
+
+边界：无行为、无 schema、无端点、无调度器、无部署事务变更；不碰 sing-box 与
+`sbox-cm`；不合并（仍需显式指令）；不部署、不访问生产。CI 在该发布准备头上
+重跑**全量**。
+
+发布准备头的本地取证（dev 主机 Windows/Git Bash，扫描期间工作树零写入）：
+probes 138/0、probe-ingest **307/0**、hist 240/0、jr 371/0、jr-deploy 292/0
+（20 SKIP）、p2b 集成 33/0（4 SKIP）、`m05`/`e1`/`e2`/`e4`/`e4diag`/`m2` 全绿、
+journal-time-compat 15/0、packaging 268/0（T27 的 15 条在无符号链接平台 SKIP，
+由 Linux 覆盖）；`threads`+`http` 67 条在 CI 网络守卫下连跑 **20 轮**全绿；
+shellcheck `-S warning` 对本轮改动的 5 条车道（hist / jr / probes / probe-ingest /
+packaging）零告警。**Linux CI 才是真实门禁**，该头的全量数字以 CI 为准。

@@ -287,10 +287,10 @@ done
 pass "app-bin entrypoints invoke no probe module"
 
 VERSION_NOW="$(cat "$ROOT/monitor-v2/VERSION")"
-if [ "$VERSION_NOW" = "0.3.1" ]; then
-    pass "VERSION still 0.3.1 (no bump in PR-3A)"
+if [ "$VERSION_NOW" = "0.4.0" ]; then
+    pass "VERSION is the releasable 0.4.0 (PR-3A itself added no bump)"
 else
-    fail "VERSION moved off 0.3.1: $VERSION_NOW"
+    fail "VERSION moved off the releasable 0.4.0: $VERSION_NOW"
 fi
 
 if grep -q 'test-monitor-v2-probes.sh' "$ROOT/.github/workflows/tests.yml" \
