@@ -44,10 +44,108 @@ from web.incident_history import QUERY_LIMIT_DEFAULT, QUERY_LIMIT_MAX
 from web.recovery import (RECOVERY_SUCCESS_MESSAGE, RecoveryGlobalGuard,
                           RecoveryRateLimiter, generate_key)
 
-MONITOR_WEB_VERSION = "0.3.1"
+MONITOR_WEB_VERSION = "0.4.0"
 SESSION_COOKIE = "monitor_session"
 MAX_BODY_BYTES = 65536
 SUPPORTED_METHODS = "GET, POST"
+
+# Issue #33 PR-3B: the closed probe-scheduler status vocabulary re-emitted by
+# /api/v1/diagnostics/timeline. web/ never imports diagnostics/, so this is a
+# deliberate duplicate; tests/test-monitor-v2-probe-ingest.sh is the static
+# gate that keeps the two in lockstep (a scheduler key that is not listed
+# here is invisible to the surface, which is the fail-closed direction).
+PROBE_STATUS_KEYS = (
+    "enabled", "running", "target_source", "startup_error",
+    "cadence_seconds", "cycles_completed", "cycles_rejected",
+    "runtime_failures", "last_cycle_epoch", "last_store_epoch",
+)
+PROBE_STATUS_BOOL_KEYS = frozenset({"enabled", "running"})
+PROBE_STATUS_SOURCE_KEYS = frozenset({"target_source"})
+PROBE_STATUS_TOKEN_KEYS = frozenset({"startup_error"})
+# Mirror of the scheduler's closed startup vocabulary (the same no-import,
+# duplicate-shapes discipline the history module uses for the probe
+# result codes): an arbitrary string from a buggy scheduler is refused,
+# so this field can never carry a path, an endpoint or exception text.
+PROBE_STARTUP_TOKENS = frozenset({
+    "target_file_not_configured", "target_file_absent",
+    "target_injection_invalid"})
+PROBE_STATUS_REAL_KEYS = frozenset({"cadence_seconds", "last_cycle_epoch",
+                                    "last_store_epoch"})
+PROBE_STATUS_INT_KEYS = frozenset({"cycles_completed", "cycles_rejected",
+                                   "runtime_failures"})
+PROBE_TARGET_SOURCES = frozenset({"production", "injected", "dark"})
+# Every projected value is EXACTLY typed before it is judged. Numbers get a
+# finiteness, nonnegativity and JSON-safe range check (a NaN or an infinity
+# would serialize as the bare words ``NaN``/``Infinity`` -- not valid JSON, so
+# one lying scheduler would break this read for every consumer). Booleans get
+# an EXACT-type check (``bool(value)`` would otherwise turn ``"yes"`` or ``1``
+# into "enabled"). Tokens get one too, and it runs BEFORE the membership test:
+# a frozenset asks its candidate to hash, so a list or a dict used to raise
+# ``TypeError`` straight out of the projection, and an object that forges a
+# token's ``__hash__`` while ``__eq__`` always answers True used to be
+# ADOPTED as that token and then emitted verbatim into the response.
+PROBE_STATUS_MAX_NUMBER = 9007199254740991  # 2**53 - 1
+
+
+def closed_probe_bool(value):
+    """One projected flag, or the deny answer. ONLY an EXACT bool is a flag
+    this surface may repeat; ``"yes"``, ``1``, ``[]`` or a subclass with a
+    private ``__bool__`` is a producer defect, and since this field has no
+    "unknown" shape it can take without changing its JSON type, the defect
+    answers ``False`` -- the direction that can never make the probe plane
+    look enabled or running when it is not."""
+    return value if type(value) is bool else False
+
+
+def closed_probe_source(value):
+    """One projected target source, or ``"dark"``. The exact-type check runs
+    first so membership never hashes a list/dict (that raised) and never
+    adopts a hash-forging impostor (that leaked a live object into the
+    response); a string outside the closed vocabulary -- an endpoint, a
+    hostname, a path -- is refused."""
+    if type(value) is str and value in PROBE_TARGET_SOURCES:
+        return value
+    return "dark"
+
+
+def closed_probe_startup(value):
+    """One projected startup token, or None. Same discipline as the source:
+    EXACTLY a str, then EXACTLY a member of the closed startup vocabulary, so
+    an unhashable or impersonating object can neither raise nor be repeated,
+    and exception text can never be presented as a token."""
+    if value is None:
+        return None
+    if type(value) is str and value in PROBE_STARTUP_TOKENS:
+        return value
+    return None
+
+
+def closed_probe_seconds(value):
+    """One projected real, or None. EXACTLY a plain int or float (not a
+    bool, not a subclass with a private ``__float__``), finite,
+    nonnegative and representable without JSON precision loss. Anything
+    else -- ``"fast"``, ``NaN``, ``Infinity``, ``-1``, ``True`` -- is not a
+    number this surface may repeat, so it answers None (unknown) instead
+    of a coerced guess."""
+    if type(value) not in (int, float):
+        return None
+    if value < 0 or value > PROBE_STATUS_MAX_NUMBER:
+        return None
+    if not math.isfinite(value):
+        return None
+    return 0 if value == 0 else value
+
+
+def closed_probe_counter(value):
+    """One projected integer count, or 0. EXACTLY a plain int (a float
+    claim like ``2.5`` is a defect, not a count), nonnegative and
+    JSON-safe -- so a counter can never read as a fractional, negative or
+    precision-losing number."""
+    if type(value) is not int:
+        return 0
+    if value < 0 or value > PROBE_STATUS_MAX_NUMBER:
+        return 0
+    return value
 
 # The four privileged mutation routes of rev5 §7. M0.5 delivered them as a
 # 501 boundary; M2 wires them to the sbox-cm RPC adapter (below).
@@ -218,7 +316,7 @@ class MonitorWebApp:
     def __init__(self, broker, access, static_dir, auth=None,
                  remote_mode=False, version=MONITOR_WEB_VERSION,
                  recovery_guard=None, management_active=None, e3_broker=None,
-                 incident_history=None):
+                 incident_history=None, probe_scheduler=None):
         self.broker = broker
         self.access = access
         self.auth = auth
@@ -228,6 +326,10 @@ class MonitorWebApp:
         # Issue #33 P1: the bounded incident timeline. Injectable; None
         # (standalone harnesses) keeps the read endpoint a clean 503.
         self.incident_history = incident_history
+        # Issue #33 PR-3B: the probe scheduler's closed status object is the
+        # ONLY thing this surface can show about probing -- no endpoints, no
+        # probe results, no paths, no free text.
+        self.probe_scheduler = probe_scheduler
         self.recovery_limiter = RecoveryRateLimiter()
         self.recovery_guard = recovery_guard or RecoveryGlobalGuard()
         # ``management_active`` is an ORTHOGONAL boolean to ``monitor_running``
@@ -243,6 +345,55 @@ class MonitorWebApp:
         self._management_active = management_active
         self.e3_broker = e3_broker
         self._static_cache = {}
+
+    def probe_status(self):
+        """Closed scheduler status for the diagnostics surface.
+
+        Deny-by-default: only the frozen ``PROBE_STATUS_KEYS`` are
+        re-emitted, each value forced back into its own closed domain --
+        every field EXACTLY typed first (bool, str, plain int/float), then
+        tokens by membership in the closed vocabularies, then numbers by
+        finiteness, nonnegativity and a JSON-safe range -- so an endpoint, a
+        path or exception text can never reach a response, neither can a
+        ``NaN``/``Infinity`` literal (invalid JSON that would break the
+        whole read for every consumer), and neither can an unhashable or
+        ``__eq__``-forging candidate raise out of the projection or be adopted
+        as a token. A missing, broken or lying scheduler answers ``None``; a
+        lying value answers its closed minimum, never a guess.
+        """
+        getter = getattr(self.probe_scheduler, "status", None)
+        if not callable(getter):
+            return None
+        try:
+            raw = getter()
+        except Exception:  # noqa: BLE001 -- a status read never propagates
+            return None
+        if type(raw) is not dict:
+            # EXACTLY a dict: a subclass can override ``get`` to answer a
+            # different value per key, which is not a status container this
+            # surface may project.
+            return None
+        status = {}
+        for key in PROBE_STATUS_KEYS:
+            value = raw.get(key)
+            if key in PROBE_STATUS_BOOL_KEYS:
+                status[key] = closed_probe_bool(value)
+            elif key in PROBE_STATUS_SOURCE_KEYS:
+                status[key] = closed_probe_source(value)
+            elif key in PROBE_STATUS_TOKEN_KEYS:
+                status[key] = closed_probe_startup(value)
+            elif key in PROBE_STATUS_REAL_KEYS:
+                status[key] = closed_probe_seconds(value)
+            elif key in PROBE_STATUS_INT_KEYS:
+                status[key] = closed_probe_counter(value)
+            else:
+                # An unclassified key cannot exist: the probe suite asserts
+                # that the five class sets cover PROBE_STATUS_KEYS exactly.
+                # Should the mirror ever drift, the surface answers the
+                # closed minimum for a count rather than repeating whatever
+                # an unknown shape held.
+                status[key] = 0
+        return status
 
     def static_file(self, name):
         cached = self._static_cache.get(name)
@@ -720,6 +871,12 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         plus the category-level history health. Connection ids, source /
         destination addresses and any credential can never appear here
         for the same reason they can never appear in the database.
+
+        0.4.0 (#33 PR-3B): the SAME bounded request also carries the v3
+        probe rows (``probe_rows``, whitelisted columns, the same
+        ``since``/``limit``) and the closed scheduler status
+        (``probes``, projected through ``PROBE_STATUS_KEYS``). One read
+        surface, one bound, no new endpoint and no new query parameter.
         """
         history = self.app.incident_history
         if history is None:
@@ -735,6 +892,8 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             "history": history.health(),
             "samples": result["samples"],
             "device_states": result["device_states"],
+            "probe_rows": result["probe_rows"],
+            "probes": self.app.probe_status(),
             "truncated": result["truncated"],
             "limit": result["limit"],
         })

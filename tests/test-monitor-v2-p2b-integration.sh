@@ -144,6 +144,17 @@ build_src() {
     cp -R "$ROOT/monitor-v2/web" "$dest/web"
     cp -R "$ROOT/monitor-v2/api_bridge" "$dest/api_bridge"
     rm -rf "$dest/api_bridge/__pycache__" "$dest/web/__pycache__"
+    # PR-3B: diagnostics/ joined the boot-critical monitor payload (webapp.py
+    # imports the scheduler), and the library stages it from an explicit
+    # manifest -- a formal source tree without it cannot stage at all, which
+    # would make I1's "the release carries the contract" hard gate fire for the
+    # wrong reason. Mirror it exactly like the reader payload below.
+    mkdir -p "$dest/diagnostics"
+    local d
+    for d in "$ROOT"/monitor-v2/diagnostics/*.py; do
+        cp "$d" "$dest/diagnostics/"
+    done
+    rm -rf "$dest/diagnostics/__pycache__"
     printf '0.1.0\n' > "$dest/VERSION"
     if [ "$with_jr" = "--with-jr" ]; then
         mkdir -p "$dest/journal_reader"
@@ -295,9 +306,17 @@ assert_eq "$ADD_NO_STEPUP" "OK" "#51: Add is session+CSRF only (never step-up), 
 assert_grep "$SERVER_PY" '_require_step_up\(self\._handle_e3_mutation, op\)' "#51: destructive mutations keep _require_step_up"
 assert_grep "$SERVER_PY" '_require_step_up\(self\._handle_e3_export\)' "#51: export keeps _require_step_up"
 
-# §13 row 13 (schema unsupported) + frozen-contract boundary: the integration
-# must not have widened the accepted schema set.
-assert_eq "$(grep -c 'SCHEMA_VERSION = 2' "$HIST_PY")" "1" "history schema stays exactly v2"
+# §13 row 13 (schema unsupported) + frozen-contract boundary: the reader
+# integration must not have widened or drifted the accepted schema set on its
+# own. PR-3B (#33) moved the declaration v2 -> v3 by adding the one probe table
+# through a forward-only rung, so the frozen invariant this gate protects is
+# "exactly ONE declaration, and it is the reviewed one" -- not the numeral 2.
+# Any further unreviewed move (a second declaration, or a different value)
+# still trips it.
+assert_eq "$(grep -c '^SCHEMA_VERSION = [0-9]$' "$HIST_PY")" "1" \
+    "history declares its schema version in exactly one place"
+assert_eq "$(grep -o '^SCHEMA_VERSION = [0-9]*' "$HIST_PY" | grep -c '= 3$')" "1" \
+    "history schema is exactly the reviewed v3 (PR-3B moved it from v2)"
 
 # ===========================================================================
 section "I1: HARD GATE -- formally staged release carries and imports the contract"
@@ -550,7 +569,7 @@ if require_symlink "I3 prune chronology"; then
 fi
 
 # ===========================================================================
-section "I4: §9 schema v1 -> v2 migration THROUGH the installed release"
+section "I4: §9 schema v1 -> v3 migration THROUGH the installed release"
 # ===========================================================================
 if require_symlink "I4 migration via installed release code"; then
     new_case migrate
@@ -713,15 +732,22 @@ EOF
     assert_eq "$(field contract_available)" "True" "migration: the installed release's contract is what the migration used"
     assert_eq "$(field contract_from_release_libexec)" "True" "migration: contract module loaded from the release libexec ($(field contract_from))"
     assert_eq "$(field history_from_release_app)" "True" "migration: incident_history came from the release app tree ($(field history_from))"
-    assert_eq "$(field health_enabled)" "True" "migration: v1 database opens healthy under v2 code"
+    assert_eq "$(field health_enabled)" "True" "migration: v1 database opens healthy under the installed release's code"
     assert_eq "$(field health_degraded)" "False" "migration: no degraded flag after the forward migration"
-    assert_eq "$(field schema_version)" "2" "migration: meta.schema_version advanced to 2"
+    # PR-3B (#33) made the installed release v3-aware, and the rungs are
+    # forward-only and single-transaction, so a v1 database now lands on v3 in
+    # ONE step -- v1 -> v2 -> v3 in a loop would rewrite rows this gate exists
+    # to protect. The numeral is asserted structurally below (probe table).
+    assert_eq "$(field schema_version)" "3" "migration: meta.schema_version advanced to 3 in one step"
     assert_eq "$(field rows_preserved)" "True" "migration: v1 rows preserved byte-for-byte"
     for t in journal_runs journal_events journal_ingest_audit journal_ingest_state \
              timeline_samples device_protocol_states meta; do
-        printf '%s' "$MIG" | grep -q "\"$t\"" && pass "migration: v2 table $t exists in the migrated database" \
-            || fail "migration: v2 table $t missing"
+        printf '%s' "$MIG" | grep -q "\"$t\"" && pass "migration: pre-existing table $t survives in the migrated database" \
+            || fail "migration: pre-existing table $t missing"
     done
+    printf '%s' "$MIG" | grep -q '"network_probe_samples"' \
+        && pass "migration: the v3 probe table is created by the same v1->v3 rung" \
+        || fail "migration: v3 probe table network_probe_samples missing"
     assert_eq "$(field journal_status_contract)" "True" "migration: journal_status() reports the contract inside the migrated runtime"
     assert_eq "$(field ingest_terminal)" "1" "migration: first ingest settles terminal_seq exactly once"
     assert_eq "$(field ingest_idempotent)" "True" "migration: re-ingesting the same file never double-settles"

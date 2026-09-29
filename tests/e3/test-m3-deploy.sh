@@ -171,15 +171,20 @@ systemctl enable --now sing-box >/dev/null 2>&1
 
 # monitor release tree + symlink (the packaging layout the preflight freezes)
 # B1: the REAL packaging layout -- <release>/VERSION, <release>/app/monitor-v2/
-# {webapp.py,collector.py,web/,api_bridge/}, <release>/bin, <release>/lib.
+# {webapp.py,collector.py,web/,api_bridge/,diagnostics/}, <release>/bin,
+# <release>/lib. PR-3B: diagnostics/ is part of that boot-critical payload
+# (webapp.py imports the scheduler), so the hand-built release must mirror it
+# or this fixture stops being the layout the preflight freezes.
 mkdir -p "$RELDIR/$REL_ID/app/monitor-v2" "$RELDIR/$REL_ID/bin" "$RELDIR/$REL_ID/lib"
 cp "$ROOT"/monitor-v2/*.py "$RELDIR/$REL_ID/app/monitor-v2/" 2>/dev/null
 cp -r "$ROOT/monitor-v2/web" "$RELDIR/$REL_ID/app/monitor-v2/web"
 cp -r "$ROOT/monitor-v2/api_bridge" "$RELDIR/$REL_ID/app/monitor-v2/api_bridge"
+cp -r "$ROOT/monitor-v2/diagnostics" "$RELDIR/$REL_ID/app/monitor-v2/diagnostics"
 printf 'm3-test\n' > "$RELDIR/$REL_ID/VERSION"
 rm -rf "$RELDIR/$REL_ID/app/monitor-v2/web/__pycache__" \
        "$RELDIR/$REL_ID/app/monitor-v2/__pycache__" \
-       "$RELDIR/$REL_ID/app/monitor-v2/api_bridge/__pycache__" 2>/dev/null
+       "$RELDIR/$REL_ID/app/monitor-v2/api_bridge/__pycache__" \
+       "$RELDIR/$REL_ID/app/monitor-v2/diagnostics/__pycache__" 2>/dev/null
 ln -sfn "$RELDIR/$REL_ID" "$RELLINK"
 chown -R "$AXE_USER":"$AXE_USER" "$RELDIR" "$MDATA"
 chmod 0700 "$MDATA"
@@ -192,6 +197,7 @@ sed -e "s|@SBMON_USER@|$AXE_USER|g" \
     -e "s|@SBMON_APP_DIR@|$RELLINK|g" \
     -e "s|@SBMON_CONF@|/etc/sboxcm-m3/monitor.conf|g" \
     -e "s|@SBMON_STATE_ROOT@|$MDATA|g" \
+    -e "s|@SBMON_PROBE_TARGETS_FILE@|/etc/sboxcm-m3/probe-targets.json|g" \
     "$ROOT/monitor-v2/deploy/singbox-monitor.service.in" \
 | sed -e "s|^ExecStart=.*|ExecStart=/usr/bin/python3 $RELLINK/app/monitor-v2/webapp.py serve --listen 127.0.0.1 --port $MPORT --data-dir $MDATA|" \
       -e "s|^After=.*|After=network-online.target|" \

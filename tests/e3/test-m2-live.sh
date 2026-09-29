@@ -191,10 +191,16 @@ pass 'privileged helper installed and socket-activated'
 
 # monitor fixture app: a real copy of the monitor-v2 tree, configured by the
 # REAL webapp.py setup path, running under the REAL hardened unit template.
+# PR-3B: webapp.py imports the probe scheduler, so the copy must carry the
+# whole boot-critical runtime payload -- exactly what sbmon_stage_release puts
+# in a release. Probing stays DARK here: this unit never sets
+# SINGBOX_MONITOR_PROBE_TARGETS_FILE, so the scheduler starts zero threads.
 cp "$ROOT"/monitor-v2/*.py "$APP"/ 2>/dev/null
 cp -r "$ROOT/monitor-v2/web" "$APP"/web
 cp -r "$ROOT/monitor-v2/api_bridge" "$APP"/api_bridge
-rm -rf "$APP/web/__pycache__" "$APP"/__pycache__        "$APP/api_bridge/__pycache__" 2>/dev/null
+cp -r "$ROOT/monitor-v2/diagnostics" "$APP"/diagnostics
+rm -rf "$APP/web/__pycache__" "$APP"/__pycache__        "$APP/api_bridge/__pycache__" \
+    "$APP/diagnostics/__pycache__" 2>/dev/null
 chown -R "$AXE_USER":"$AXE_USER" "$APP" "$MDATA"
 chmod 0700 "$MDATA"
 mkdir -p /etc/sboxcm-m2
@@ -216,6 +222,7 @@ render_monitor_unit() {
         -e "s|@SBMON_APP_DIR@|$APP|g" \
         -e "s|@SBMON_CONF@|/etc/sboxcm-m2/monitor.conf|g" \
         -e "s|@SBMON_STATE_ROOT@|$MDATA|g" \
+        -e "s|@SBMON_PROBE_TARGETS_FILE@|/etc/sboxcm-m2/probe-targets.json|g" \
         "$ROOT/monitor-v2/deploy/singbox-monitor.service.in" \
     | sed -e "s|^ExecStart=.*|ExecStart=/usr/bin/python3 $APP/webapp.py serve --listen 127.0.0.1 --port $MPORT --data-dir $MDATA|" \
           -e "s|^After=.*|After=network-online.target|" \

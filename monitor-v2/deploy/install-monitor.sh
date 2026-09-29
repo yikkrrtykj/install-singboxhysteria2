@@ -266,6 +266,10 @@ _cmd_install_locked() { # <install|upgrade> [flags...]
     sbmon_create_layout
     sbmon_write_default_conf
     sbmon_repair_conf_perms
+    # PR-3B B4: the probe opt-in is a file the OPERATOR places, at the one
+    # path the unit names. Its boundary (regular file, root:<group> 0640) is
+    # verified here and never created; absent simply means "no probing".
+    sbmon_verify_probe_targets
     # P6: fail-closed secret delivery BEFORE any release change; failure
     # aborts the whole install with nothing staged.
     sbmon_sync_api_secret
@@ -489,6 +493,13 @@ _cmd_rollback_locked() { # [release-id]   (F4: runs under the deploy lock)
         if ! sbmon_sboxjr_audit_runtime "$jr_target_dir"; then
             sbmon_die "回滚目标 $target 的 reader 运行时未通过 12+1+1 manifest 审计：拒绝回滚，避免 Monitor/reader 混版本；fail-closed，未做任何变更"
         fi
+    fi
+
+    # PR-3B History schema compatibility gate (BEFORE any mutation), the
+    # sibling of the reader gate above: a v3 database must never end up
+    # underneath a pre-v3 runtime through the ordinary rollback path.
+    if ! sbmon_rollback_schema_gate "$target"; then
+        sbmon_die "回滚目标与当前 history schema 不兼容（见上）：fail-closed，未做任何变更"
     fi
 
     # R3-2: capture the full pre-state BEFORE touching anything.

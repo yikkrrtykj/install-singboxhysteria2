@@ -17,9 +17,11 @@ Safety contract (all enforced, all tested):
   response bodies, resolved addresses, peer socket addresses and host
   name echoes have no field to travel in. ``error_code`` is a frozen
   9-member vocabulary; the only string an ``ok`` probe may emit beyond
-  the vocabulary is the canonical PUBLIC egress IP -- globality is
-  enforced unconditionally at parse, at the final normalize gate and
-  in the change judgement (docs/monitor-v2-network-probes-p3a.md).
+  the vocabulary is the canonical PUBLIC egress IP -- GLOBAL UNICAST
+  scope is enforced unconditionally, in ONE gate (``_canonical_ip``)
+  that the answer parser, the final normalize gate and the change
+  judgement all pass through
+  (docs/monitor-v2-network-probes-p3a.md).
 * Every worker is bounded by an ABSOLUTE per-worker deadline measured
   from the cycle start -- ``cycle start + min(spec timeout, total cycle
   deadline)`` -- plus its own socket timeout. Joins advance against those
@@ -241,11 +243,12 @@ class UdpProbeSpec:
 @dataclass(frozen=True)
 class EgressProbeSpec:
     """Public egress IP probe: the ONLY slot allowed to emit an IP
-    string, and only the canonical form of a PUBLIC answer the endpoint
-    gave (never a connection-level address). Loopback/private/reserved
-    answers are refused UNCONDITIONALLY -- there is no spec field that
-    relaxes this, so the reviewed "server public egress IP" exception
-    can never be used to smuggle a local address toward persistence."""
+    string, and only the canonical form of a PUBLIC, GLOBAL UNICAST
+    answer the endpoint gave (never a connection-level address).
+    Loopback/private/reserved/multicast answers are refused
+    UNCONDITIONALLY -- there is no spec field that relaxes this, so the
+    reviewed "server public egress IP" exception can never be used to
+    smuggle a local address toward persistence."""
     host: str
     port: int = 443
     path: str = "/"
@@ -451,20 +454,20 @@ def _run_https_probe(spec):
 
 def _parse_egress_answer(body):
     """Strict answer contract: decodable text that IS exactly one
-    canonical GLOBAL IPv4/IPv6 literal. Loopback/private/reserved
-    answers are refused with a closed code and zero content retention
-    -- unconditionally, this path has no relaxation knob."""
+    canonical GLOBAL UNICAST IPv4/IPv6 literal. Loopback/private/reserved/
+    multicast answers are refused with a closed code and zero content
+    retention -- unconditionally, this path has no relaxation knob. The
+    address judgement lives in ``_canonical_ip`` ONLY (one gate, three
+    call sites), so this parser cannot disagree with the normalize gate
+    or the change judgement about what a public egress address is."""
     try:
         text = body.decode("utf-8").strip()
     except UnicodeDecodeError:
         return None, ERR_PARSE_FAILED
-    try:
-        address = ipaddress.ip_address(text)
-    except ValueError:
+    canonical = _canonical_ip(text)
+    if canonical is None:
         return None, ERR_PARSE_FAILED
-    if not address.is_global:
-        return None, ERR_PARSE_FAILED
-    return str(address), ERR_NONE
+    return canonical, ERR_NONE
 
 
 def _run_egress_probe(spec):
@@ -756,11 +759,11 @@ def _normalize_probe(slot):
 
 
 def _normalize_egress(slot):
-    """Egress keeps ONLY a re-canonicalized GLOBAL answer on the ok
-    path (the global gate lives in _canonical_ip, so it is enforced
-    end-to-end, not just at parse time); every other shape -- missing,
-    invalid, loopback/private/reserved -- degrades to failed/
-    parse_failed with ip=None."""
+    """Egress keeps ONLY a re-canonicalized GLOBAL UNICAST answer on the
+    ok path (the public-address gate lives in _canonical_ip, so it is
+    enforced end-to-end, not just at parse time); every other shape --
+    missing, invalid, loopback/private/reserved/multicast -- degrades to
+    failed/parse_failed with ip=None."""
     keep_ip = slot.get("ip") if isinstance(slot, dict) else None
     slot = _normalize_probe(slot)
     slot["ip"] = None
@@ -775,17 +778,20 @@ def _normalize_egress(slot):
 # -- pure egress-change judgement (PR-3B event source) --------------------------
 
 def _canonical_ip(value):
-    """Canonical form of a PUBLIC (global) IP literal, else None. This
-    is THE egress-IP gate: the normalize gate and the change judgement
-    both pass through it, so a non-global address can never survive
-    end-to-end in either channel."""
-    if not isinstance(value, str):
+    """Canonical form of a PUBLIC, GLOBAL UNICAST IP literal, else None.
+    This is THE egress-IP gate: the answer parser, the normalize gate and
+    the change judgement all pass through it, so a non-public address can
+    never survive end-to-end in either channel. GLOBALITY ALONE IS NOT THE
+    CONTRACT: ``ipaddress`` scopes 224.0.0.0/4 and ff00::/12 as global,
+    but a multicast GROUP is a destination, never a host's egress address,
+    so the gate says what the review means -- global AND not multicast."""
+    if type(value) is not str:
         return None
     try:
         address = ipaddress.ip_address(value)
     except ValueError:
         return None
-    if not address.is_global:
+    if not address.is_global or address.is_multicast:
         return None
     return str(address)
 
@@ -793,11 +799,12 @@ def _canonical_ip(value):
 def classify_egress_change(previous, current):
     """Pure judgement over two SUCCESSFUL, PUBLIC egress answers.
 
-    ``changed`` requires two independently valid GLOBAL canonical IPs
-    that differ; any side that is None, invalid or NON-GLOBAL
-    (loopback/private/reserved) yields ``unknown``, and a transition
-    that involves a failure must NEVER be surfaced as a change event by
-    a future integrator. Equal valid global samples are ``unchanged``.
+    ``changed`` requires two independently valid GLOBAL UNICAST canonical
+    IPs that differ; any side that is None, invalid or NOT a public host
+    address (loopback/private/reserved/multicast) yields ``unknown``, and
+    a transition that involves a failure must NEVER be surfaced as a
+    change event by a future integrator. Equal valid global samples are
+    ``unchanged``.
     """
     before = _canonical_ip(previous)
     after = _canonical_ip(current)

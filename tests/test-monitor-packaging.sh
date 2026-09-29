@@ -98,6 +98,24 @@ if [ "$SYMLINKS_OK" != 1 ]; then
     printf 'NOTICE: 运行精简套件（T01/T06-T10/T12/T13）；完整套件需在 Linux 上运行。\n\n'
 fi
 
+# T03 upgrades the shared fixture to the REAL repo VERSION, so that version is
+# a legitimate line in the shared releases.history for the rest of the lane.
+# A synthetic candidate carrying the same name therefore cannot be told apart
+# from that real upgrade: the F1/R3 history-hygiene gates would count, match or
+# skip entries that have nothing to do with the transaction under test (a
+# "failed candidate absent from history" gate can go red while the transaction
+# is healthy, and an "appears exactly once" gate can go green for the wrong
+# reason). Synthetic candidate versions thus live in a reserved space no
+# Monitor release has ever used, and this gate keeps them there.
+REPO_VERSION_NOW="$(tr -d '[:space:]' < "$REPO_ROOT/monitor-v2/VERSION")"
+FIXTURE_VERSION_CLASH="$(grep -oE "printf '[0-9]+\.[0-9]+\.[0-9]+" "${BASH_SOURCE[0]}" \
+    | sed "s/^printf '//" | sort -u | grep -Fx -- "$REPO_VERSION_NOW" || true)"
+if [ -z "$FIXTURE_VERSION_CLASH" ]; then
+    pass "no synthetic candidate version collides with repo VERSION (repo=$REPO_VERSION_NOW)"
+else
+    fail "synthetic candidate version collides with repo VERSION ($(printf '%s' "$FIXTURE_VERSION_CLASH" | tr '\n' ' ')) -- rename the fixture ladder, the shared releases.history can no longer tell the real upgrade apart"
+fi
+
 # Mock systemctl: records every invocation; simulates unit state transitions.
 # PR-2B: state is PER-UNIT. singbox-monitor keeps the legacy files (every
 # scenario seeds/inspects them); any other unit (e.g. singbox-journal-reader)
@@ -361,6 +379,13 @@ JR_MANIFEST_MODULES=(__init__.py codes.py cursor.py journal_time.py \
     normalize.py classifier.py fingerprint.py eligibility.py schema.py \
     state.py reader.py ingest_contract.py)
 
+# PR-3B (#33): the probe payload is a MONITOR runtime module set -- webapp.py
+# imports the scheduler at startup, so the library stages diagnostics/
+# UNCONDITIONALLY and a fixture source tree without it cannot install at all.
+# Spelled out here on purpose, exactly like the reader manifest, and kept
+# honest against the library's own list by the static gate in "static checks".
+DIAG_MANIFEST_MODULES=(__init__.py network_probes.py probe_scheduler.py)
+
 # One path per iteration, built by explicit concatenation: a prefix glued to
 # "${arr[@]}" expands element-wise on some bash builds and only on the first
 # element on others, which silently drops payload files from the fixture.
@@ -376,6 +401,22 @@ jr_stage_payload() { # <src-dir> -- ship the 12-module reader payload in a sourc
     [ "$n" = "12" ] || { printf 'FATAL: fixture staged %s reader modules, expected 12\n' "$n" >&2; exit 70; }
 }
 
+diag_stage_payload() { # <src-dir> -- ship the 3-module diagnostics payload
+    local src="$1" m n
+    mkdir -p "$src/diagnostics"
+    for m in "${DIAG_MANIFEST_MODULES[@]}"; do
+        cp -- "$REPO_ROOT/monitor-v2/diagnostics/$m" "$src/diagnostics/" \
+            || { printf 'FATAL: cannot stage diagnostics module %s\n' "$m" >&2; exit 70; }
+    done
+    rm -rf "$src/diagnostics/__pycache__"
+    n="$(find "$src/diagnostics" -maxdepth 1 -name '*.py' | wc -l | tr -d ' ')"
+    [ "$n" = "3" ] || { printf 'FATAL: fixture staged %s diagnostics modules, expected 3\n' "$n" >&2; exit 70; }
+}
+
+# Every formal release in this lane ships BOTH payloads: the reader (PR-2B)
+# and diagnostics (PR-3B). One helper, so no fixture tree can forget one.
+runtime_payload() { jr_stage_payload "$1"; diag_stage_payload "$1"; }
+
 # A formal install co-activates the reader, so EVERY isolated fixture root has
 # to pin the reader's three paths into itself -- their production defaults
 # (/etc/systemd/system, /usr/local/lib, /var/lib/sbox-journal) must never be
@@ -388,7 +429,7 @@ jr_pin_fixture() { # <fixture-root> <unit-dir>
     export SBOXJR_UNIT_FILE="$unitdir/singbox-journal-reader.service"
 }
 
-jr_stage_payload "$FIX_SRC"
+runtime_payload "$FIX_SRC"
 jr_pin_fixture "$FIX" "$FIX_UNIT_DIR"
 # Freeze the installed baseline independently of the candidate repo version.
 printf '0.1.0\n' > "$FIX_SRC/VERSION"
@@ -407,6 +448,27 @@ LIB_JR_MODULES="$(awk '/^SBOXJR_MODULE_FILES=\(/{f=1} f{print} f&&/\)/{exit}' \
 SUITE_JR_MODULES="$(printf '%s\n' "${JR_MANIFEST_MODULES[@]}" | LC_ALL=C sort | tr '\n' ' ')"
 assert_eq "$SUITE_JR_MODULES" "$LIB_JR_MODULES" \
     "this lane's 12-module manifest == the library's SBOXJR_MODULE_FILES"
+# PR-3B: the same discipline for the probe payload -- and the library must
+# name the modules ONE BY ONE (never `cp -R diagnostics`), so an unreviewed
+# file cannot ride a wildcard into the release tree.
+LIB_DIAG_MODULES="$(awk '/^DIAGNOSTICS_MODULE_FILES=\(/{f=1} f{print} f&&/\)/{exit}' \
+    "$DEPLOY_DIR/lib/monitor-deploy-lib.sh" | grep -oE '[A-Za-z_]+\.py' \
+    | LC_ALL=C sort | tr '\n' ' ')"
+SUITE_DIAG_MODULES="$(printf '%s\n' "${DIAG_MANIFEST_MODULES[@]}" | LC_ALL=C sort | tr '\n' ' ')"
+assert_eq "$SUITE_DIAG_MODULES" "$LIB_DIAG_MODULES" \
+    "this lane's 3-module diagnostics manifest == the library's DIAGNOSTICS_MODULE_FILES"
+if grep -nE '^[[:space:]]*cp[[:space:]]+-R[[:space:]].*diagnostics' \
+    "$DEPLOY_DIR/lib/monitor-deploy-lib.sh" >/dev/null; then
+    fail "library cp -R's the diagnostics tree (wildcard staging)"
+else
+    pass "diagnostics staged file-by-file from the manifest (no directory wildcard)"
+fi
+if grep -qE '^\s*\[ -f "\$SBMON_REPO_MONITOR_DIR/diagnostics/\$df" \]' \
+    "$DEPLOY_DIR/lib/monitor-deploy-lib.sh"; then
+    pass "staging REQUIRES every diagnostics source file (unconditional, fail-closed)"
+else
+    fail "staging does not require the diagnostics sources"
+fi
 if command -v shellcheck >/dev/null 2>&1; then
     if shellcheck -S warning "$INSTALL_MONITOR" "$DEPLOY_DIR"/lib/*.sh "$DEPLOY_DIR"/app-bin/* >"$TMP/sc.out" 2>&1; then
         pass "shellcheck deploy scripts"
@@ -529,6 +591,25 @@ assert_eq '0.1.0' "$(cat "$FIX_APP_LINK/VERSION")" "installed baseline VERSION i
 [ -f "$FIX_APP_LINK/app/monitor-v2/webapp.py" ] && pass "release stages webapp.py (real E2 entrypoint)" || fail "webapp.py not staged"
 [ -d "$FIX_APP_LINK/app/monitor-v2/api_bridge" ] && pass "release stages api_bridge" || fail "api_bridge not staged"
 [ -d "$FIX_APP_LINK/app/monitor-v2/web" ] && pass "release stages web/" || fail "web/ not staged"
+# PR-3B: the probe payload must be INSIDE the immutable release tree, and
+# EXACTLY the three manifest files -- webapp.py imports the scheduler, so a
+# release without it cannot boot, and a release with an extra file was not
+# built from the reviewed manifest.
+DIAG_STAGED_DIR="$FIX_APP_LINK/app/monitor-v2/diagnostics"
+if [ -f "$DIAG_STAGED_DIR/probe_scheduler.py" ] \
+   && [ -f "$DIAG_STAGED_DIR/network_probes.py" ] \
+   && [ -f "$DIAG_STAGED_DIR/__init__.py" ]; then
+    pass "release stages the diagnostics trio under app/monitor-v2 (boot-critical)"
+else
+    fail "diagnostics payload missing from the staged release"
+fi
+assert_eq "3" "$(find "$DIAG_STAGED_DIR" -maxdepth 1 -type f | wc -l | tr -d ' ')" \
+    "staged diagnostics file set is EXACTLY the 3-file manifest"
+if [ -e "$DIAG_STAGED_DIR/__pycache__" ]; then
+    fail "staged release carries __pycache__ inside diagnostics/"
+else
+    pass "no __pycache__ shipped inside the staged diagnostics tree"
+fi
 [ -f "$FIX_APP_LINK/app/monitor-v2/web/static/app.js" ] && pass "release stages web static assets" || fail "web static assets not staged"
 [ ! -e "$FIX_APP_LINK/app/collector" ] && pass "no duplicate independent collector runtime tree" || fail "legacy app/collector tree also staged (two collector runtimes)"
 if [ "$(find "$FIX_APP_LINK" -name '*mihomo*' 2>/dev/null | wc -l)" -eq 0 ]; then
@@ -734,7 +815,7 @@ section "T15 transactional unit rollback (release + unit + service state)"
 echo "# admin-drift" >> "$FIX_UNIT"
 UNIT_DRIFT_HASH="$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)"
 LINK_BEFORE_T15="$(readlink "$FIX_APP_LINK")"
-printf '0.4.0\n' > "$FIX_SRC/VERSION"
+printf '9.4.0\n' > "$FIX_SRC/VERSION"
 : > "$MOCK_FAIL_RESTART_ONCE"
 RESTARTS_B15=$(grep -c 'systemctl restart singbox-monitor' "$MOCK_CALL_LOG" || true)
 OUT15="$TMP/out-t15.log"
@@ -752,11 +833,11 @@ else
 fi
 assert_eq "active" "$(cat "$MOCK_SYS_STATE")" "old service active after transaction rollback"
 assert_no_grep 'sing-box' "$MOCK_CALL_LOG" "rollback never touches sing-box"
-assert_no_grep ' 0\.4\.0 ' "$FIX_RELEASES/releases.history" "failed upgrade candidate (0.4.0) absent from history (F1)"
+assert_no_grep ' 9\.4\.0 ' "$FIX_RELEASES/releases.history" "failed upgrade candidate (9.4.0) absent from history (F1)"
 
 # ---------------------------------------------------------------------------
 section "T16 rollback restore failure -> CRITICAL, never claims success"
-printf '0.5.0\n' > "$FIX_SRC/VERSION"
+printf '9.5.0\n' > "$FIX_SRC/VERSION"
 OUT16="$TMP/out-t16.log"
 MOCK_FAIL_START=1 run_install "$OUT16"
 RC16=$?
@@ -764,13 +845,13 @@ unset MOCK_FAIL_START
 assert_rc 2 "$RC16" "restore failure exits 2 (CRITICAL)"
 assert_grep 'CRITICAL' "$OUT16" "CRITICAL reported"
 assert_no_grep '事务前状态已恢复' "$OUT16" "must NOT claim rollback complete (P3)"
-assert_no_grep ' 0\.5\.0 ' "$FIX_RELEASES/releases.history" "CRITICAL-failed candidate (0.5.0) absent from history (F1)"
+assert_no_grep ' 9\.5\.0 ' "$FIX_RELEASES/releases.history" "CRITICAL-failed candidate (9.5.0) absent from history (F1)"
 # clean state for later sections
 printf '0.3.0\n' > "$FIX_SRC/VERSION"
 
 # ---------------------------------------------------------------------------
 section "F1 history hygiene: rollback never selects a failed candidate"
-# manual rollback after the failed 0.4.0/0.5.0 attempts: the only successful
+# manual rollback after the failed 9.4.0/9.5.0 attempts: the only successful
 # releases in history are 0.1.0 / repo VERSION / 0.3.0 -- the target must come from
 # those, never from the failed candidates.
 OUT_F1="$TMP/out-f1.log"
@@ -779,48 +860,48 @@ if ( "$INSTALL_MONITOR" rollback ) > "$OUT_F1" 2>&1; then
 else
     fail "rollback exits 0"
 fi
-assert_eq '0.1.0' "$(cat "$FIX_APP_LINK/VERSION")" "rollback target is a historically successful release (not 0.4.0/0.5.0)"
-printf '0.4.0\n' > "$FIX_SRC/VERSION"
+assert_eq '0.1.0' "$(cat "$FIX_APP_LINK/VERSION")" "rollback target is a historically successful release (not 9.4.0/9.5.0)"
+printf '9.4.0\n' > "$FIX_SRC/VERSION"
 OUT_F1B="$TMP/out-f1b.log"
 run_install "$OUT_F1B"
-assert_rc 0 $? "successful 0.4.0 deploy"
-F1_COUNT=$(grep -c ' 0\.4\.0 upgrade$' "$FIX_RELEASES/releases.history" || true)
-assert_eq "1" "$F1_COUNT" "successful 0.4.0 appears exactly once in history (F1)"
+assert_rc 0 $? "successful 9.4.0 deploy"
+F1_COUNT=$(grep -c ' 9\.4\.0 upgrade$' "$FIX_RELEASES/releases.history" || true)
+assert_eq "1" "$F1_COUNT" "successful 9.4.0 appears exactly once in history (F1)"
 
 # ---------------------------------------------------------------------------
 section "F2a existing inactive+disabled install: failed deploy fully restored"
 echo inactive > "$MOCK_SYS_STATE"
 echo disabled > "$MOCK_ENABLED_STATE"
 UNIT_F2A="$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)"
-printf '0.5.0\n' > "$FIX_SRC/VERSION"
+printf '9.5.0\n' > "$FIX_SRC/VERSION"
 OUT_F2A="$TMP/out-f2a.log"
 MOCK_FAIL_START=1 run_install "$OUT_F2A"
 RC_F2A=$?
 unset MOCK_FAIL_START
 assert_rc 1 "$RC_F2A" "inactive existing install: failed deploy exits nonzero"
-assert_eq '0.4.0' "$(cat "$FIX_APP_LINK/VERSION")" "release restored (F2)"
+assert_eq '9.4.0' "$(cat "$FIX_APP_LINK/VERSION")" "release restored (F2)"
 assert_eq "$UNIT_F2A" "$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)" "unit restored (F2)"
 assert_eq "inactive" "$(cat "$MOCK_SYS_STATE")" "service inactive restored (F2)"
 assert_eq "disabled" "$(cat "$MOCK_ENABLED_STATE")" "service disabled restored (F2)"
-assert_no_grep ' 0\.5\.0 ' "$FIX_RELEASES/releases.history" "failed 0.5.0 absent from history (F1/F2)"
+assert_no_grep ' 9\.5\.0 ' "$FIX_RELEASES/releases.history" "failed 9.5.0 absent from history (F1/F2)"
 assert_grep '事务前状态已恢复' "$OUT_F2A" "rollback completion reported (F2)"
 
 section "F2b existing inactive+enabled install: failed deploy fully restored"
 echo inactive > "$MOCK_SYS_STATE"
 echo enabled > "$MOCK_ENABLED_STATE"
 UNIT_F2B="$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)"
-printf '0.6.0\n' > "$FIX_SRC/VERSION"
+printf '9.6.0\n' > "$FIX_SRC/VERSION"
 OUT_F2B="$TMP/out-f2b.log"
 MOCK_FAIL_START=1 run_install "$OUT_F2B"
 RC_F2B=$?
 unset MOCK_FAIL_START
 assert_rc 1 "$RC_F2B" "inactive+enabled existing install: failed deploy exits nonzero"
-assert_eq '0.4.0' "$(cat "$FIX_APP_LINK/VERSION")" "release restored (F2b)"
+assert_eq '9.4.0' "$(cat "$FIX_APP_LINK/VERSION")" "release restored (F2b)"
 assert_eq "$UNIT_F2B" "$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)" "unit restored (F2b)"
 assert_eq "inactive" "$(cat "$MOCK_SYS_STATE")" "service inactive restored (F2b)"
 assert_eq "enabled" "$(cat "$MOCK_ENABLED_STATE")" "service ENABLED state restored (F2b)"
-assert_no_grep ' 0\.6\.0 ' "$FIX_RELEASES/releases.history" "failed 0.6.0 absent from history (F1/F2)"
-printf '0.4.0\n' > "$FIX_SRC/VERSION"
+assert_no_grep ' 9\.6\.0 ' "$FIX_RELEASES/releases.history" "failed 9.6.0 absent from history (F1/F2)"
+printf '9.4.0\n' > "$FIX_SRC/VERSION"
 fi  # end SYMLINKS_OK block (T15/T16/F1/F2a/F2b)
 
 if symlink_gate "F2c fresh-install failure cleanup"; then
@@ -938,12 +1019,12 @@ fi
 section "R3-1a forward unit atomic-write failure -> transaction rollback"
 if [ "$SYMLINKS_OK" = 1 ]; then
     OUT_R3A="$TMP/out-r3a.log"
-    run_install "$OUT_R3A"          # fresh 0.4.0
+    run_install "$OUT_R3A"          # fresh 9.4.0
     assert_rc 0 $? "baseline install for R3 tests"
     LINK_R3="$(readlink "$FIX_APP_LINK")"
     UNIT_R3="$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)"
     HIST_R3="$(cat "$FIX_RELEASES/releases.history")"
-    printf '0.5.0\n' > "$FIX_SRC/VERSION"
+    printf '9.5.0\n' > "$FIX_SRC/VERSION"
     # REAL atomic-write failure: mktemp under a nonexistent directory (ENOENT).
     OUT_R3B="$TMP/out-r3b.log"
     ( SBMON_UNIT_FILE="$FIX_UNIT_DIR/missing-dir/singbox-monitor.service" "$INSTALL_MONITOR" install ) > "$OUT_R3B" 2>&1
@@ -957,7 +1038,7 @@ if [ "$SYMLINKS_OK" = 1 ]; then
     # a successful upgrade so the later rollback tests have a target
     OUT_R3C="$TMP/out-r3c.log"
     run_install "$OUT_R3C"
-    assert_rc 0 $? "successful 0.5.0 upgrade"
+    assert_rc 0 $? "successful 9.5.0 upgrade"
 else
     printf '  SKIP R3-1a/c 原子事务流（此平台无符号链接）\n'
 fi
@@ -967,14 +1048,14 @@ if [ "$SYMLINKS_OK" = 1 ]; then
     echo "# r3-1b-drift" >> "$FIX_UNIT"   # unit must CHANGE so the reload fires
     UNIT_R3B="$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)"
     LINK_R3B="$(readlink "$FIX_APP_LINK")"
-    printf '0.6.0\n' > "$FIX_SRC/VERSION"
+    printf '9.6.0\n' > "$FIX_SRC/VERSION"
     echo 1 > "$MOCK_FAIL_DAEMON_RELOAD_COUNT"
     OUT_R3D="$TMP/out-r3d.log"
     run_install "$OUT_R3D"
     assert_rc 1 $? "daemon-reload failure -> install exits nonzero"
     assert_eq "$LINK_R3B" "$(readlink "$FIX_APP_LINK")" "release restored after daemon-reload failure (R3-1)"
     assert_eq "$UNIT_R3B" "$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)" "unit restored after daemon-reload failure (R3-1)"
-    assert_no_grep ' 0\.6\.0 ' "$FIX_RELEASES/releases.history" "failed 0.6.0 absent from history (R3-5)"
+    assert_no_grep ' 9\.6\.0 ' "$FIX_RELEASES/releases.history" "failed 9.6.0 absent from history (R3-5)"
     assert_grep '事务前状态已恢复' "$OUT_R3D" "transaction rollback ran (R3-1)"
     assert_eq "active" "$(cat "$MOCK_SYS_STATE")" "service active after rollback (R3-1b)"
 else
@@ -988,7 +1069,7 @@ if [ "$SYMLINKS_OK" = 1 ]; then
     echo 6 > "$MOCK_FAIL_IS_ACTIVE_COUNT"  # all 6 gate polls fail (timeout 6)
     UNIT_R3C="$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)"
     LINK_R3C="$(readlink "$FIX_APP_LINK")"
-    printf '0.7.0\n' > "$FIX_SRC/VERSION"
+    printf '9.7.0\n' > "$FIX_SRC/VERSION"
     # is-active fails for the next 7 calls: all 6 polls inside the 6s gate
     # deadline fail, the rollback's own wait then succeeds on a fresh poll.
     echo 7 > "$MOCK_FAIL_IS_ACTIVE_COUNT"
@@ -997,10 +1078,10 @@ if [ "$SYMLINKS_OK" = 1 ]; then
     assert_rc 1 $? "wait-active failure -> install exits nonzero"
     assert_eq "$LINK_R3C" "$(readlink "$FIX_APP_LINK")" "release restored after wait-active failure (R3-1)"
     assert_eq "$UNIT_R3C" "$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)" "unit restored after wait-active failure (R3-1)"
-    assert_no_grep ' 0\.7\.0 ' "$FIX_RELEASES/releases.history" "failed 0.7.0 absent from history (R3-5)"
+    assert_no_grep ' 9\.7\.0 ' "$FIX_RELEASES/releases.history" "failed 9.7.0 absent from history (R3-5)"
     assert_grep '事务前状态已恢复' "$OUT_R3E" "transaction rollback ran (R3-1)"
     assert_eq "active" "$(cat "$MOCK_SYS_STATE")" "service active after rollback (R3-1c)"
-    printf '0.5.0\n' > "$FIX_SRC/VERSION"
+    printf '9.5.0\n' > "$FIX_SRC/VERSION"
 else
     printf '  SKIP R3-1c 原子事务流（此平台无符号链接）\n'
 fi
@@ -1014,7 +1095,7 @@ if [ "$SYMLINKS_OK" = 1 ]; then
     ( "$INSTALL_MONITOR" rollback ) > "$OUT_R3F" 2>&1
     RC_R3F=$?
     assert_rc 1 "$RC_R3F" "failed rollback exits nonzero"
-    assert_eq '0.5.0' "$(cat "$FIX_APP_LINK/VERSION")" "original release restored after failed rollback (R3-2)"
+    assert_eq '9.5.0' "$(cat "$FIX_APP_LINK/VERSION")" "original release restored after failed rollback (R3-2)"
     assert_eq "active" "$(cat "$MOCK_SYS_STATE")" "service active on original release (R3-2)"
     assert_eq "$UNIT_R3D" "$(sha256sum "$FIX_UNIT" | cut -d' ' -f1)" "unit untouched by rollback apply/restore (R3-2)"
     ROLLBACKS_A=$(grep -c ' rollback$' "$FIX_RELEASES/releases.history" || true)
@@ -1053,7 +1134,7 @@ MOCK
     rm -f -- "$FIX_UNIT"            # old unit absent at capture (old_unit_existed=0)
     LINK_R4A="$(readlink "$FIX_APP_LINK")"
     HIST_R4A="$(cat "$FIX_RELEASES/releases.history")"
-    printf '0.6.0\n' > "$FIX_SRC/VERSION"
+    printf '9.6.0\n' > "$FIX_SRC/VERSION"
     echo 1 > "$MOCK_FAIL_IS_ACTIVE_SKIP"
     echo 6 > "$MOCK_FAIL_IS_ACTIVE_COUNT"
     OUT_R4A="$TMP/out-r4a.log"
@@ -1064,7 +1145,7 @@ MOCK
     assert_rc 2 "$RC_R4A" "rollback unit-removal failure exits 2 (R4-1)"
     assert_grep 'CRITICAL' "$OUT_R4A" "CRITICAL reported (R4-1)"
     assert_no_grep '事务前状态已恢复' "$OUT_R4A" "no false restore-complete claim (R4-1)"
-    assert_no_grep ' 0\.6\.0 ' "$FIX_RELEASES/releases.history" "failed 0.6.0 absent from history (R3-5)"
+    assert_no_grep ' 9\.6\.0 ' "$FIX_RELEASES/releases.history" "failed 9.6.0 absent from history (R3-5)"
     if [ -e "$FIX_UNIT" ]; then pass "candidate unit still present (rm was refused, R4-1)"; else fail "candidate unit vanished despite rm failure"; fi
     assert_eq "$LINK_R4A" "$(readlink "$FIX_APP_LINK")" "release restored before the failing step (R4-1)"
     assert_eq "$HIST_R4A" "$(cat "$FIX_RELEASES/releases.history")" "history unchanged (R3-5)"
@@ -1075,7 +1156,7 @@ fi
 section "R4-1b rollback stop failure -> CRITICAL exit 2"
 if [ "$SYMLINKS_OK" = 1 ]; then
     echo inactive > "$MOCK_SYS_STATE"   # old_active=0
-    printf '0.6.0\n' > "$FIX_SRC/VERSION"
+    printf '9.6.0\n' > "$FIX_SRC/VERSION"
     : > "$MOCK_FAIL_STOP"
     export MOCK_FAIL_START=1   # mock reads non-emptiness only
     OUT_R4B="$TMP/out-r4b.log"
@@ -1086,7 +1167,7 @@ if [ "$SYMLINKS_OK" = 1 ]; then
     assert_rc 2 "$RC_R4B" "rollback stop failure exits 2 (R4-1)"
     assert_grep 'CRITICAL' "$OUT_R4B" "CRITICAL reported (R4-1b)"
     assert_no_grep '事务前状态已恢复' "$OUT_R4B" "no false restore-complete claim (R4-1b)"
-    assert_no_grep ' 0\.6\.0 ' "$FIX_RELEASES/releases.history" "failed 0.6.0 absent from history (R3-5)"
+    assert_no_grep ' 9\.6\.0 ' "$FIX_RELEASES/releases.history" "failed 9.6.0 absent from history (R3-5)"
 else
     printf '  SKIP R4-1b 原子事务流（此平台无符号链接）\n'
 fi
@@ -1272,7 +1353,7 @@ assert_grep '卸载完成' "$OUT_R42A" "idempotent uninstall still completes (R4
 
 if symlink_gate "R4-2 uninstall teardown group (stop/disable/reload failures, final success)"; then
 section "R4-2 uninstall stop failure -> fail-closed, deployment retained"
-printf '0.5.0\n' > "$FIX_SRC/VERSION"
+printf '9.5.0\n' > "$FIX_SRC/VERSION"
 run_install "$TMP/out-r42setup.log"
 assert_rc 0 $? "baseline install for R4-2 tests"
 : > "$MOCK_FAIL_STOP"
@@ -2451,7 +2532,7 @@ else
     export SBMON_UNIT_FILE="$T22/etc/systemd/system/singbox-monitor.service"
     export SBMON_BACKUP_ROOT="$T22/var/backups/singbox-monitor"
     export SBMON_REPO_MONITOR_DIR="$T22/src"
-    jr_stage_payload "$T22/src"
+    runtime_payload "$T22/src"
     jr_pin_fixture "$T22" "$T22/etc/systemd/system"
     export SBMON_VERSION_FILE="$T22/src/VERSION"
     export SBMON_LOCK_FILE="$T22/deploy.lock"
@@ -2525,7 +2606,7 @@ else
     export SBMON_UNIT_FILE="$T23/etc/systemd/system/singbox-monitor.service"
     export SBMON_BACKUP_ROOT="$T23/var/backups/singbox-monitor"
     export SBMON_REPO_MONITOR_DIR="$T23/src"
-    jr_stage_payload "$T23/src"
+    runtime_payload "$T23/src"
     jr_pin_fixture "$T23" "$T23/etc/systemd/system"
     export SBMON_VERSION_FILE="$T23/src/VERSION"
     export SBMON_LOCK_FILE="$T23/deploy.lock"
@@ -2601,7 +2682,7 @@ else
     export SBMON_UNIT_FILE="$T24/etc/systemd/system/singbox-monitor.service"
     export SBMON_BACKUP_ROOT="$T24/var/backups/singbox-monitor"
     export SBMON_REPO_MONITOR_DIR="$T24/src"
-    jr_stage_payload "$T24/src"
+    runtime_payload "$T24/src"
     jr_pin_fixture "$T24" "$T24/etc/systemd/system"
     export SBMON_VERSION_FILE="$T24/src/VERSION"
     export SBMON_LOCK_FILE="$T24/deploy.lock"
@@ -2677,7 +2758,7 @@ else
     export SBMON_UNIT_FILE="$T25/etc/systemd/system/singbox-monitor.service"
     export SBMON_BACKUP_ROOT="$T25/var/backups/singbox-monitor"
     export SBMON_REPO_MONITOR_DIR="$T25/src"
-    jr_stage_payload "$T25/src"
+    runtime_payload "$T25/src"
     jr_pin_fixture "$T25" "$T25/etc/systemd/system"
     export SBMON_VERSION_FILE="$T25/src/VERSION"
     export SBMON_LOCK_FILE="$T25/deploy.lock"
@@ -2725,11 +2806,12 @@ else
 fi
 fi
 
-section "T26 production-real upgrade: installed 0.1.5 -> repo VERSION (isolated fixture, 0.3.1)"
+section "T26 production-real upgrade: installed 0.1.5 -> repo VERSION (isolated fixture, 0.4.0)"
 # Same production-real discipline as T25, one release step later: a server
 # running the 0.1.5 target-binding delete UX now moves to the current repo
-# candidate (0.3.1: PR-2B reader payload + the B7 exchange-access fix, on
-# top of the 0.2.0 incident-history module). The upgrade surface is
+# candidate (0.4.0: PR-3B probe ingest on history schema v3, on top of the
+# 0.3.1 B7 exchange-access fix and
+# the 0.2.0 incident-history module). The upgrade surface is
 # unchanged: same atomic
 # release switch, ZERO sbox-cm/helper actions, and the retained 0.1.5
 # release tree stays byte-identical.
@@ -2756,7 +2838,7 @@ else
     export SBMON_UNIT_FILE="$T26/etc/systemd/system/singbox-monitor.service"
     export SBMON_BACKUP_ROOT="$T26/var/backups/singbox-monitor"
     export SBMON_REPO_MONITOR_DIR="$T26/src"
-    jr_stage_payload "$T26/src"
+    runtime_payload "$T26/src"
     jr_pin_fixture "$T26" "$T26/etc/systemd/system"
     export SBMON_VERSION_FILE="$T26/src/VERSION"
     export SBMON_LOCK_FILE="$T26/deploy.lock"
@@ -2806,6 +2888,147 @@ else
     assert_no_grep 'helper' "$T26_LOG" "the upgrade log records no helper deployment or update"
     assert_grep ' 0\.1\.5 fresh$' "$T26_REL/releases.history" "the 0.1.5 baseline release is recorded in history"
     assert_grep " ${T26_NEW_VER//./\\.} upgrade\$" "$T26_REL/releases.history" "the $T26_NEW_VER upgrade is recorded in history"
+fi
+fi
+
+section "T27 PR-3B rollback history-schema gate: a v3 database refuses a pre-v3 target"
+# PR-3B ships History schema v3 (network_probe_samples). The RUNTIME half of
+# that contract -- a pre-v3 build refusing to write into a v3 database -- is
+# owned by the probe-ingest lane; this section owns the DEPLOY half: the
+# ordinary rollback path must refuse a target whose OWN release declares an
+# older schema, before it mutates anything, and must still allow a compatible
+# target. The fixture is isolated because the mocked service never creates a
+# history database, so the shared fixture would leave this gate vacuous.
+T27="$TMP/t27"
+T27_APP="$T27/opt/singbox-monitor"
+T27_REL="$T27/opt/singbox-monitor-releases"
+T27_STATE="$T27/var/lib/singbox-monitor"
+T27_DB="$T27_STATE/diagnostics/history.sqlite3"
+T27_LOG="$TMP/out-t27-refuse.log"
+T27_ALLOW_LOG="$TMP/out-t27-allow.log"
+T27_CALLS="$TMP/t27-calls.log"
+if [ "$SYMLINKS_OK" != 1 ]; then
+    printf '  SKIP T27 回滚 history schema 门（此平台无符号链接；Linux pass 是门禁）\n'
+else
+(
+    mkdir -p "$T27/etc/systemd/system" "$T27/src"
+    cp "$REPO_ROOT/monitor-v2/collector.py" "$REPO_ROOT/monitor-v2/webapp.py" "$T27/src/"
+    cp -R "$REPO_ROOT/monitor-v2/web" "$REPO_ROOT/monitor-v2/api_bridge" "$T27/src/"
+    rm -rf "$T27/src/api_bridge/__pycache__" "$T27/src/web/__pycache__"
+    printf '0.3.0\n' > "$T27/src/VERSION"
+    export SBMON_APP_LINK="$T27_APP"
+    export SBMON_RELEASES_DIR="$T27_REL"
+    export SBMON_STATE_ROOT="$T27_STATE"
+    export SBMON_STATE_DIR="$T27_STATE"
+    export SBMON_CONF_DIR="$T27/etc/singbox-monitor"
+    export SBMON_UNIT_FILE="$T27/etc/systemd/system/singbox-monitor.service"
+    export SBMON_BACKUP_ROOT="$T27/var/backups/singbox-monitor"
+    export SBMON_REPO_MONITOR_DIR="$T27/src"
+    runtime_payload "$T27/src"
+    jr_pin_fixture "$T27" "$T27/etc/systemd/system"
+    export SBMON_VERSION_FILE="$T27/src/VERSION"
+    export SBMON_LOCK_FILE="$T27/deploy.lock"
+    export MOCK_CALL_LOG="$T27_CALLS"
+    : > "$T27_CALLS"
+    "$INSTALL_MONITOR" install > "$TMP/out-t27-base.log" 2>&1 || exit 1
+    base_rel="$(basename "$(readlink -f "$T27_APP")")"
+    [ -n "$base_rel" ] || exit 1
+    cp "$REPO_ROOT/monitor-v2/VERSION" "$T27/src/VERSION"
+    "$INSTALL_MONITOR" upgrade > "$TMP/out-t27-up.log" 2>&1 || exit 1
+    live_rel="$(basename "$(readlink -f "$T27_APP")")"
+
+    # A REAL v3 database at the live path, built by the staged release's own
+    # module: the gate must judge the production meta row, not a lookalike.
+    mkdir -p "$T27_STATE/diagnostics"
+    "$PY3" - "$T27_STATE/diagnostics" "$T27_APP/app/monitor-v2" <<'PY' || exit 1
+import sys
+sys.path.insert(0, sys.argv[2])
+from web.incident_history import IncidentHistory
+h = IncidentHistory(sys.argv[1], "e" * 32, monitor_version="t27")
+h.open()
+assert h.health()["enabled"], h.health()
+h.close()
+PY
+
+    # The pre-v3 target is produced the way a real one exists: that release
+    # DECLARES an older schema. The retained baseline release's own module is
+    # demoted in place, so the refused run and the allowed run face a
+    # byte-identical tree (same reader runtime, same manifest, same VERSION)
+    # and only the declared schema differs. The file is restored and the
+    # restore is verified, so the fixture leaves nothing damaged.
+    target_ih="$T27_REL/$base_rel/app/monitor-v2/web/incident_history.py"
+    ih_sha="$(sha256sum "$target_ih" | cut -d' ' -f1)"
+    sed 's/^SCHEMA_VERSION = 3$/SCHEMA_VERSION = 2/' "$target_ih" \
+        > "$target_ih.demoted" || exit 1
+    mv -- "$target_ih.demoted" "$target_ih" || exit 1
+    grep -q '^SCHEMA_VERSION = 2$' "$target_ih" || exit 1
+
+    sha_ref="$(sha256sum "$T27_DB" | cut -d' ' -f1)"
+    hist_ref="$(cat "$T27_REL/releases.history")"
+    restarts_ref="$(grep -c 'systemctl restart singbox-monitor' "$T27_CALLS")"
+    rc_refuse=0
+    "$INSTALL_MONITOR" rollback > "$T27_LOG" 2>&1 || rc_refuse=$?
+    link_after="$(basename "$(readlink -f "$T27_APP")")"
+    sha_after="$(sha256sum "$T27_DB" | cut -d' ' -f1)"
+    hist_after="$(cat "$T27_REL/releases.history")"
+    restarts_after="$(grep -c 'systemctl restart singbox-monitor' "$T27_CALLS")"
+
+    # Positive control, only after the refusal has been proven inert: the very
+    # same command, against the very same release restored to a compatible
+    # declaration, must go through.
+    sed 's/^SCHEMA_VERSION = 2$/SCHEMA_VERSION = 3/' "$target_ih" \
+        > "$target_ih.restore" || exit 1
+    mv -- "$target_ih.restore" "$target_ih" || exit 1
+    restore_sha="$(sha256sum "$target_ih" | cut -d' ' -f1)"
+    rc_allow=0
+    "$INSTALL_MONITOR" rollback > "$T27_ALLOW_LOG" 2>&1 || rc_allow=$?
+    sha_allow="$(sha256sum "$T27_DB" | cut -d' ' -f1)"
+
+    printf '%s\n' "$rc_refuse" > "$TMP/t27.rc"
+    printf '%s\n' "$rc_allow" > "$TMP/t27.rcallow"
+    printf '%s\n' "$live_rel" > "$TMP/t27.live"
+    printf '%s\n' "$link_after" > "$TMP/t27.link"
+    printf '%s\n' "$ih_sha" > "$TMP/t27.ih.sha"
+    printf '%s\n' "$restore_sha" > "$TMP/t27.ih.restore"
+    printf '%s\n' "$sha_ref" > "$TMP/t27.sha.ref"
+    printf '%s\n' "$sha_after" > "$TMP/t27.sha.after"
+    printf '%s\n' "$sha_allow" > "$TMP/t27.sha.allow"
+    printf '%s\n' "$restarts_ref" > "$TMP/t27.restarts.ref"
+    printf '%s\n' "$restarts_after" > "$TMP/t27.restarts.after"
+    printf '%s\n' "$hist_ref" > "$TMP/t27.hist.ref"
+    printf '%s\n' "$hist_after" > "$TMP/t27.hist.after"
+)
+rc=$?
+if [ "$rc" != 0 ]; then
+    fail "isolated PR-3B rollback fixture could not be built (rc=$rc): $(tail -n 5 "$TMP/out-t27-up.log" 2>/dev/null | tr '\n' ' ')"
+else
+    assert_rc 1 "$(cat "$TMP/t27.rc")" \
+        "rollback of a v3 database to a release declaring v2 is refused (rc 1)"
+    assert_grep 'history schema 不兼容' "$T27_LOG" \
+        "the refusal names the history schema gate"
+    assert_grep '未做任何变更' "$T27_LOG" "the refusal promises zero mutation"
+    assert_grep 'v2' "$T27_LOG" "the refusal states the target's declared v2"
+    assert_grep 'v3' "$T27_LOG" "the refusal states the live database's v3"
+    assert_no_grep '混版本' "$T27_LOG" \
+        "the refusal came from the schema gate, not the PR-2B reader gate"
+    assert_eq "$(cat "$TMP/t27.live")" "$(cat "$TMP/t27.link")" \
+        "the refused rollback left the live release switch untouched"
+    assert_eq "$(cat "$TMP/t27.sha.ref")" "$(cat "$TMP/t27.sha.after")" \
+        "the refused rollback left the v3 database byte-identical"
+    assert_eq "$(cat "$TMP/t27.hist.ref")" "$(cat "$TMP/t27.hist.after")" \
+        "the refused rollback wrote no history entry"
+    assert_eq "$(cat "$TMP/t27.restarts.ref")" "$(cat "$TMP/t27.restarts.after")" \
+        "the refused rollback issued no service restart"
+    assert_eq "$(cat "$TMP/t27.ih.sha")" "$(cat "$TMP/t27.ih.restore")" \
+        "the demoted release was restored byte-identically (the fixture damages nothing it inspects)"
+    assert_rc 0 "$(cat "$TMP/t27.rcallow")" \
+        "the same rollback against the same release restored to v3 proceeds (the gate is not a blanket block)"
+    assert_grep '回滚完成' "$T27_ALLOW_LOG" \
+        "the compatible rollback completed normally while the v3 database was in place"
+    assert_eq "$(cat "$TMP/t27.sha.ref")" "$(cat "$TMP/t27.sha.allow")" \
+        "the v3 database is byte-identical after the allowed rollback too (the gate only reads)"
+    assert_no_grep 'sing-box' "$T27_CALLS" \
+        "the whole history-schema rollback sequence never touched sing-box"
 fi
 fi
 

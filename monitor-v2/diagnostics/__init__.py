@@ -1,10 +1,13 @@
-"""Monitor diagnostics package (issue #33 Phase 3, PR-3A dark delivery).
+"""Monitor diagnostics package (issue #33 Phase 3).
 
-Holds the standalone outbound probe engine (``network_probes``). Nothing
-here is imported or executed by the production Monitor runtime: the
-packaged release manifest (``sbmon_stage_release``) deliberately excludes
-this package, no unit or entrypoint references it, and the engine carries
-no default external endpoint at all (activation is PR-3B+ review scope).
+Holds the outbound probe engine (``network_probes``, PR-3A) and its
+PR-3B activation surface (``probe_scheduler``): one dedicated
+non-publisher thread driving bounded cycles against the frozen,
+reviewed production endpoint set, persisting closed results through
+the IncidentHistory v3 boundary. The package ships in the immutable
+release tree through the explicit ``DIAGNOSTICS_MODULE_FILES`` staging
+manifest (``sbmon_stage_release``) -- never a ``cp -R`` of this
+directory.
 
 Python 3.10+ standard library only -- never any third-party import.
 """
