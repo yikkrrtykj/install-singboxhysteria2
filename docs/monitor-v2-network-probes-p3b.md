@@ -683,6 +683,18 @@ B1 把"抓到了预状态"当成"可以覆盖数据库"——而最常见的 for
 （"the restored database is owned by the service user recorded at capture"）——
 `chown` 还原只在真实路径执行，所以这条证明只能由 root pass 给出。
 
+**R1 评审头 `c081c3f` 的 CI 实测：首试 10/10 全绿**（runs 36560460273 / 36560460382）。
+packaging 仍是被 B1/B2 抬起的唯一车道：normal pass **695 → 755**、root pass
+**711 → 771**，两次 pass 各 +60 = T30 的 34 条 + T31 的 26 条，root/normal 差值维持 16 条；
+两条 pass 的日志里 `== T28/T29/T30/T31 ... ==` 四个小节标题都在，两条新判别器在 Linux 上
+**确实执行**且零 SKIP。其余车道与上一轮逐条相等。
+这一轮另外留下一条少见的取证：**判别器的非空转由一次真实的红证明**。头 `1211a26` 在
+Linux 上红了 3 条（packaging-fixture 752/3、packaging-root 768/3，其余 7 条车道全绿），
+三条全部落在 T30 的哨兵机制上——mock 的一次性旋钮先 `rm` 后 `bash`，钩子永远找不到自己
+要执行的文件，哨兵从未落库，而"candidate 从未 boot"那几条依旧绿。修成先执行后摘除即
+755/771 全绿。也就是说：如果"未跨越就不许覆盖"所保护的历史真的被抹掉，这几条会在门禁上
+变红，而不是默默通过。
+
 其余车道逐条与基线（PR #59 头 `c2aa6b2`）**相等**：incident history 240、
 probes 138（expected 138）、probe-ingest 307（expected 307）、
 jr 371（expected 371）、jr-deploy 464、P2B 集成 132、E4-Diag 457/457、

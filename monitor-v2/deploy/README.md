@@ -1141,7 +1141,9 @@ R1 判别器（同文件 T30/T31，同一套 `prestate_fixture_run` 隔离夹具
 **T30 证明"抓过快照"不等于"可以覆盖库"**。夹具在 capture 之后、candidate 启动之前注入
 失败（新 mock 旋钮 `MOCK_PRE_BOOT_SCRIPT`：先往 `journal_ingest_audit` 插一行哨兵
 `seq=9991`，再以 rc 1 失败——"写哨兵"与"拒绝启动"是同一步，所以 candidate 确实从未 boot，
-日志里既无 `boot declared=3` 也无 `boot migrated to v3`）。终态逐项断言：事务 rc 1 但**无
+日志里既无 `boot declared=3` 也无 `boot migrated to v3`）。旋钮是一次性的，且**先执行、
+后摘除**：先 `rm` 再 `bash` 会让钩子根本找不到文件，candidate 照样没起来（于是"从未
+boot"那几条仍绿），哨兵却永远写不进库。终态逐项断言：事务 rc 1 但**无
 `CRITICAL`**、日志同时出现"已捕获迁移前预状态"与"预状态未被使用"且**不**出现"跨越已发生"、
 完成语为 `history_db=untouched` 而非 `prestate-restored`、活动库仍是精确 v2（7 张表、无
 `network_probe_samples`）、**捕获前的连续行与捕获后写入的 9991 哨兵两行都还在**、
@@ -1184,10 +1186,16 @@ T30/T31 在 Linux 上因此不是"读代码的注释"，而是这两处逻辑的
 
 本机立场：T28/T29/T30/T31 与 T15/T16/F1/F2a/F2b 同门槛，在 Git Bash 上**SKIP**（`ln -s` 是复制
 语义、`chmod` 不可靠），Linux packaging 车道（normal + root 两次 pass）才是门禁；
-`chown` 还原只在非 fixture 路径执行，由 root pass 证明。CI 在评审头 `bf28853` 首试
-10/10 全绿，该处实测为 normal pass **695/0**、root pass **711/0**（基线 `c2aa6b2`
-分别 632/647；root 多出的那 1 条正是上面那句属主证明，它被 `SBMON_FIXTURE = 0` 守卫），
-且两条 pass 的日志里都有 `== T28 ... ==` / `== T29 ... ==` 小节标题，即"SKIP"只发生在本机。
+`chown` 还原只在非 fixture 路径执行，由 root pass 证明。CI 在评审头 `c081c3f` 首试
+10/10 全绿，该处实测为 normal pass **755/0**、root pass **771/0**（基线 `c2aa6b2`
+分别 632/647；两次 pass 各自 +60，恰等于 T30 的 34 条 + T31 的 26 条，两条 pass 里都没有
+SKIP；root 与 normal 之差仍是 16 条，比基线的 15 多出的那 1 条正是上面那句属主证明，它被
+`SBMON_FIXTURE = 0` 守卫），且两条 pass 的日志里都有 `== T28/T29/T30/T31 ... ==` 四个小节
+标题，即"SKIP"只发生在本机。
+判别器不是空转的，这一点由一次真实的红证明：上一头 `1211a26` 的 Linux packaging 两次
+pass 各红 **3** 条，全部落在 T30 的哨兵机制上（钩子上报插入未成功、捕获前后两行未同时存活、
+"活动库被快照覆盖"这条反转哨兵），其余 7 条车道全绿。也就是说，一旦"未跨越就不许覆盖"
+所保护的那批历史真的丢失，这几条会在门禁上变红，而不是默默通过。
 其余车道逐条与基线相等（history 240 / probes 138 / probe-ingest 307 / jr 371 /
 jr-deploy 464 / P2B 132 / E4-Diag 457）——本轮没有为了让数字好看而放宽任何门。
 功能面零改动：不动端点、
