@@ -64,7 +64,8 @@ COUNT_DROP_MIN_BASELINE = 5.0        # ... a baseline that is non-trivial,
 COUNT_DROP_MIN_ABSOLUTE = 3.0        # ... and by at least this many clients
 API_STALE_BUCKET_FRACTION = 0.5      # share of a bucket's samples naming the ...
                                      # API stale before that is a signal
-ALL_DEVICES_QUIET_MIN = 2            # devices needed to call "all quiet"
+ALL_DEVICES_QUIET_MIN = 2            # (device, inbound) PAIRS needed to call
+                                     # the window quiet
 JOURNAL_BURST_MIN_COUNT = 5          # absolute floor above background ...
 JOURNAL_BURST_MULTIPLIER = 3.0       # ... and a multiple of its own baseline
 PROBE_FAIL_MIN_BUCKETS = 2           # anti-flap: one failed cycle is a blip
@@ -132,15 +133,21 @@ PROBE_ERROR_CODES = ("NONE", "timeout", "dns_failed", "connect_failed",
                      "tls_failed", "bad_response", "protocol_failed",
                      "parse_failed", "unavailable")
 # A "failed" slot is only network-significant when the engine reached the
-# network and was refused. bad_response/parse_failed/unavailable say the
-# PROBE could not adjudicate -- a refused or unparseable answer from the
-# endpoint, or the dark/unconfigured state, which is exactly what an
-# un-activated probe stores. Reading those as an outage would turn "I could
-# not look" into "the VPS is broken", so they prove nothing about the path and
-# are named as an unusable plane instead.
-PROBE_NETWORK_CODES = ("timeout", "dns_failed", "connect_failed",
-                       "tls_failed", "protocol_failed")
-PROBE_SOURCE_CODES = ("bad_response", "parse_failed", "unavailable")
+# network and was refused: timeout, dns_failed and connect_failed. Everything
+# else is the PROBE being unable to adjudicate, and the engine's own error
+# mapping says so: tls_failed is what any
+# ssl.SSLError maps to, SSLCertVerificationError included, so a leaf's
+# certificate or TLS configuration reports exactly like a broken path;
+# protocol_failed is what an answer that is not ours reports -- an
+# http.client.HTTPException, a UDP reply under 12 bytes, a transaction-id or
+# question-binding mismatch. bad_response and parse_failed are the same family,
+# and unavailable is the dark/unconfigured state itself. Reading any of these as
+# an outage would turn "I could not adjudicate the answer" into "the VPS is
+# broken", so they prove nothing about the path and are named as an unusable
+# plane instead.
+PROBE_NETWORK_CODES = ("timeout", "dns_failed", "connect_failed")
+PROBE_SOURCE_CODES = ("bad_response", "parse_failed", "unavailable",
+                      "protocol_failed", "tls_failed")
 PROBE_CHANGE_VALUES = ("unchanged", "changed", "unknown")
 PROBE_SLOTS = ("dns", "https", "udp", "egress")
 # The slots that say "the VPS can reach the internet over TCP at all": a
@@ -200,9 +207,14 @@ JOURNAL_EVENT_ROW_COLUMNS = ("seq", "ts", "cls", "proto", "port", "dcls",
                              "fp", "n")
 AUDIT_ROW_COLUMNS = ("epoch", "kind", "seq", "code")
 
-# The subset actually CONSUMED. Latency numbers, the egress IP, the message
-# fingerprint and the inbound tag carry no classification meaning, so they
-# are never read; a device name is an opaque counting key and never emitted.
+# The subset actually CONSUMED. Latency numbers, the egress IP and the message
+# fingerprint carry no classification meaning, so they are never read. The two
+# naming columns ARE read, and only as opaque counting keys: `device` because
+# quiet is a statement about machines, and `inbound` because
+# `device_protocol_states` is keyed (device, inbound, epoch), so reading a
+# device's total without it would merge two inbounds into one answer. Neither
+# can be emitted: the result surface has no slot for a string that is not a
+# vocabulary token, and the privacy gate proves it of both.
 SAMPLE_FIELDS = ("epoch", "collector_stale", "api_status",
                  "total_active_connections", "reality_active_connections",
                  "hysteria2_active_connections", "other_active_connections")
@@ -210,7 +222,7 @@ SAMPLE_COUNT_FIELDS = ("total_active_connections",
                        "reality_active_connections",
                        "hysteria2_active_connections",
                        "other_active_connections")
-DEVICE_FIELDS = ("epoch", "device", "active_connections", "reason")
+DEVICE_FIELDS = ("epoch", "device", "inbound", "active_connections", "reason")
 PROBE_FIELDS = ("epoch", "dns_status", "dns_error_code", "https_status",
                 "https_error_code", "udp_status", "udp_error_code",
                 "egress_status", "egress_error_code", "egress_change")
@@ -249,6 +261,7 @@ BASE_UNKNOWN_TOKENS = (
     "journal_evidence_absent", "journal_evidence_incomplete",
     "no_target_specific_proof",
     "multiple_destinations", "process_and_network_evidence_conflict",
+    "device_states_are_change_only",
     "unattributed_evidence_present",
     "evidence_shape_rejected", "evidence_outside_window",
     # The standing unknown of every incident this classifier reports: the
@@ -550,8 +563,10 @@ def _unaligned(value):
 def _analyse(evidence, start, buckets):
     samples = [_sample_stats(rows) for rows in _bucketed(
         evidence["samples"], "epoch", start, buckets)]
-    devices = [_device_stats(rows) for rows in _bucketed(
-        evidence["device_states"], "epoch", start, buckets)]
+    device_rows = _bucketed(evidence["device_states"], "epoch", start, buckets)
+    pairs_known = {(row["device"], row["inbound"])
+                   for rows in device_rows for row in rows}
+    devices = [_device_stats(rows, pairs_known) for rows in device_rows]
     probes = [_probe_stats(rows) for rows in _bucketed(
         evidence["probe_rows"], "epoch", start, buckets)]
     journal = [_journal_stats(rows) for rows in _bucketed(
@@ -622,7 +637,7 @@ def _analyse(evidence, start, buckets):
     if not families & set(CORROBORATING_FAMILIES):
         # Exactly the case the spec forbids from becoming an incident: the
         # API view moved and nothing independent agrees with it.
-        _collect(candidates, seen)
+        _collect(candidates, seen, unknown)
         note_health(window_indices)
         unknown.update(("count_drop_only", "no_corroboration"))
         return _seal(STATUS_NO_INCIDENT, CATEGORY_NONE, start, window_end,
@@ -634,21 +649,20 @@ def _analyse(evidence, start, buckets):
         # describe both, and merging them would attach the second episode's
         # evidence to the first episode's attribution, so the window is
         # refused as a whole instead of folded.
-        _collect(candidates, seen)
+        _collect(candidates, seen, unknown)
         note_health(window_indices)
         unknown.add("multiple_anomaly_clusters")
         return _seal(STATUS_INCIDENT, CATEGORY_INSUFFICIENT, start, window_end,
                      buckets, seen, unknown)
 
     indices = set(clusters[0])
-    flags = _collect(candidates, seen)
+    flags = _collect(candidates, seen, unknown)
     generic_healthy = note_health(indices)
     api_healthy = _api_healthy(samples, indices)
-    egress_changed = any(probes[index]["changed"] for index in indices)
     negatives_provable = (journal_provable or generic_healthy)
     return _attribute(flags, seen, unknown, start, window_end, buckets,
                       probe_seen, negatives_provable, generic_healthy,
-                      api_healthy, egress_changed)
+                      api_healthy)
 
 
 def _clusters(indices):
@@ -707,14 +721,34 @@ def _sample_stats(rows):
             "stale": stale, "collector_stale": collector_stale}
 
 
-def _device_stats(rows):
+def _device_stats(rows, pairs_known):
+    """Aggregate `device_protocol_states` the way the table is actually keyed:
+    (device, inbound, epoch). One device holds a row PER INBOUND, so
+    vmix-01/vless-in=0 and vmix-01/hy2-in=3 are two facts about one machine and
+    neither overwrites the other. Within a bucket the latest row per pair wins,
+    and a tie on epoch is broken toward the LARGER count: two rows that disagree
+    about the same instant cannot support the negative claim "this pair is
+    empty", and the answer must not depend on which row happened to be read last.
+
+    The table is a change/heartbeat log, not a snapshot, so a pair with no row in
+    this bucket did not report zero -- it did not report. `pairs_known` is every
+    pair the window saw at all, and quiet therefore requires each of them to have
+    ANSWERED, with zero, in this bucket: an unreported pair blocks the claim
+    instead of silently counting as quiet."""
     latest = {}
     for row in rows:
-        latest[row["device"]] = row["active_connections"]
-    seen = len(latest)
-    quiet = sum(1 for value in latest.values() if value == 0)
-    return {"seen": seen,
-            "all_quiet": seen >= ALL_DEVICES_QUIET_MIN and quiet == seen}
+        pair = (row["device"], row["inbound"])
+        current = latest.get(pair)
+        if current is None or (row["epoch"], row["active_connections"]) > (
+                current["epoch"], current["active_connections"]):
+            latest[pair] = row
+    seen = set(latest)
+    quiet = {pair for pair, row in latest.items()
+             if row["active_connections"] == 0}
+    return {"seen": len(seen),
+            "all_quiet": (len(seen) >= ALL_DEVICES_QUIET_MIN
+                          and seen == set(pairs_known)
+                          and quiet == seen)}
 
 
 def _probe_stats(rows):
@@ -938,7 +972,7 @@ _DROP_TOKENS = {"total_active_connections": "count_drop_total",
                 "other_active_connections": "count_drop_other"}
 
 
-def _collect(candidates, seen):
+def _collect(candidates, seen, unknown):
     """Record what every candidate bucket actually shows, then fold the
     marks into the attribution facts. Split from the verdict on purpose:
     the OBSERVATIONS belong to the window even when the classifier refuses
@@ -965,11 +999,14 @@ def _collect(candidates, seen):
             if name == "hysteria2_active_connections":
                 hy2_impact = True
         if marks["device"]:
-            # Every device quiet is impact on both transports, by definition:
-            # the device counter spans them, so no client is connected at all.
+            # Every (device, inbound) pair this window knows about answered zero
+            # in this bucket. That is context, not impact: the pair set is only
+            # what this window happened to see, the table is change/heartbeat
+            # sparse, and a device's other inbound can hold the clients. Naming
+            # it must not say "both transports lost clients", so it sets no
+            # impact bit and no conclusion rests on it.
             seen.add("all_devices_quiet")
-            reality_impact = True
-            hy2_impact = True
+            unknown.add("device_states_are_change_only")
         for token in marks["process"]:
             seen.add(token)
             process = True
@@ -1003,8 +1040,7 @@ def _collect(candidates, seen):
 
 
 def _attribute(flags, seen, unknown, start, window_end, buckets, probe_seen,
-               negatives_provable, generic_healthy, api_healthy,
-               egress_changed):
+               negatives_provable, generic_healthy, api_healthy):
     reality = flags["reality"]
     hy2 = flags["hy2"]
     generic_journal = flags["generic_journal"]
@@ -1043,9 +1079,13 @@ def _attribute(flags, seen, unknown, start, window_end, buckets, probe_seen,
             # dns and https both aim at the Cloudflare leaf and egress at
             # ipify, so all three failing together is ALSO what a single
             # endpoint outage looks like. It names vps_outbound only when a
-            # plane outside the probes agrees in the same buckets.
+            # plane OUTSIDE the probe scheduler agrees in the same buckets:
+            # a path-specific journal error, or impact on a transport's own
+            # client counts. A changed egress IP is not that second plane --
+            # it is the same scheduler's own row, and `changed` means ipify
+            # ANSWERED, so it is network context rather than corroboration.
             if not (reality or hy2 or flags["reality_impact"]
-                    or flags["hy2_impact"] or egress_changed):
+                    or flags["hy2_impact"]):
                 unknown.add("probe_endpoint_confounded")
                 return _seal(STATUS_INCIDENT, CATEGORY_INSUFFICIENT, start,
                              window_end, buckets, seen, unknown)

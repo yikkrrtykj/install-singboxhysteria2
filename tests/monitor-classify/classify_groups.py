@@ -47,6 +47,11 @@ LEAK_PROBES = (
     "home-phone-beta",
     "203.0.113.19",
     "0011223344556677",
+    # The inbound tag. PR-4A round 4 made the classifier READ this column --
+    # (device, inbound) is what `device_protocol_states` is keyed by -- so the
+    # no-echo proof has to cover it exactly like the device name it sits next
+    # to, and "vless-in" is the name the real collector writes.
+    "vless-in",
 )
 # The probes every scenario bundle carries by construction (an egress
 # address only rides a cycle that reports a change).
@@ -253,6 +258,39 @@ def devices(buckets, active_by_index):
     return out
 
 
+DEVICE_INBOUNDS = ("vless-in", "hy2-in")
+
+
+def pair_devices(buckets, per_bucket):
+    """`device_protocol_states` the way the table is actually keyed:
+    (device, inbound, epoch). One machine therefore holds a row PER INBOUND and
+    both answers stand at the same instant -- `devices()` above can only ever
+    express one number per device, which is exactly the shape that hid the
+    aggregation bug.
+
+    ``per_bucket[index]`` is None (the sparse case: this bucket wrote no row at
+    all) or a list of ``(device, inbound, active)`` triples in the order to emit
+    them. That order is a scenario's own business, because a stored reader
+    promises none and a verdict must not depend on which row came last. Two
+    triples for one pair at one epoch are the "the rows disagree" case."""
+    out = []
+    for index, rows in enumerate(per_bucket):
+        if rows is None:
+            continue
+        for row in rows:
+            device, inbound, active = row[:3]
+            offset = row[3] if len(row) > 3 else 20
+            out.append(device_row(BASE + index * BUCKET + offset, device,
+                                  active, inbound=inbound))
+    return out
+
+
+def every_pair(active):
+    """One answer for every (device, inbound) pair this harness knows."""
+    return [(device, inbound, active) for inbound in DEVICE_INBOUNDS
+            for device in DEVICE_NAMES]
+
+
 # -- scenario bundles --------------------------------------------------------
 
 def reality_incident_bundle(buckets=10, drop_from=3, reality_target=1,
@@ -262,9 +300,11 @@ def reality_incident_bundle(buckets=10, drop_from=3, reality_target=1,
                             last_error_code=None, include_probes=True,
                             include_devices=True, reality_errors=8,
                             steady=False, api_stale_from=None,
-                            probe_from_index=0):
+                            probe_from_index=0, device_rows=None):
     """The 2026-09-22 anchor shape: Reality dial timeouts on 443 while HY2
-    clients stay up, over the standing background noise."""
+    clients stay up, over the standing background noise. ``device_rows``
+    replaces the device section wholesale, which is how the
+    per-(device, inbound) scenarios below get real multi-inbound material."""
     samples = []
     for index in range(buckets):
         reality = 25 if (steady or index < drop_from) else reality_target
@@ -287,6 +327,8 @@ def reality_incident_bundle(buckets=10, drop_from=3, reality_target=1,
         buckets, [40 if (steady or index < drop_from)
                   else reality_target + 15 for index in range(buckets)]) \
         if include_devices else []
+    if device_rows is not None:
+        device_states = list(device_rows)
     probe_rows = probes(buckets, probe_slots, probe_at,
                         egress_change_at,
                         from_index=probe_from_index) if include_probes else []
@@ -558,6 +600,74 @@ def scenarios():
          ("count_drop_hysteria2", "journal_burst_hysteria2"),
          ("count_drop_reality", "journal_burst_reality"),
          ("root_cause_not_established",), ()),
+        # `device_protocol_states` is keyed (device, inbound, epoch), so one
+        # machine answers once PER INBOUND and both answers stand at the same
+        # instant. These windows are the same Reality-only outage with device
+        # material a per-device reading cannot tell apart. Each disagreement
+        # window puts its zero LAST -- the traversal order that made a
+        # per-device answer look like proof that both transports had lost their
+        # clients -- and its twin puts the same two rows in the opposite order,
+        # because the reader promises none. A quiet device table is context,
+        # never impact.
+        ("device_pairs_are_read_per_inbound",
+         reality_incident_bundle(device_rows=pair_devices(10, [
+             every_pair(20)] * 3 + [
+                 [pair for device in DEVICE_NAMES
+                  for pair in ((device, "hy2-in", 3),
+                               (device, "vless-in", 0))]
+                 for _ in range(7)])),
+         "incident", "reality_tcp_path",
+         ("count_drop_reality", "journal_burst_reality",
+          "probe_generic_tcp_healthy"),
+         ("all_devices_quiet", "count_drop_hysteria2",
+          "journal_burst_hysteria2"), ("root_cause_not_established",), ()),
+        ("device_rows_that_disagree_answer_not_quiet",
+         reality_incident_bundle(device_rows=pair_devices(10, [
+             every_pair(20)] * 3 + [
+                 [(device, inbound, value) for inbound in DEVICE_INBOUNDS
+                  for device in DEVICE_NAMES for value in (3, 0)]
+                 for _ in range(7)])),
+         "incident", "reality_tcp_path",
+         ("count_drop_reality", "journal_burst_reality"),
+         ("all_devices_quiet", "count_drop_hysteria2"),
+         ("root_cause_not_established",), ()),
+        # The same disagreement read in the OTHER order. The reader promises no
+        # arrival order, so both orders have to answer "not quiet": a verdict
+        # that flips depending on which row happened to come last is not a
+        # verdict. This row is what makes the tie-break direction live in both
+        # directions -- without it a first-row-wins aggregation would agree
+        # with the correct one on every other fixture here.
+        ("device_rows_that_disagree_in_reverse_answer_not_quiet",
+         reality_incident_bundle(device_rows=pair_devices(10, [
+             every_pair(20)] * 3 + [
+                 [(device, inbound, value) for inbound in DEVICE_INBOUNDS
+                  for device in DEVICE_NAMES for value in (0, 3)]
+                 for _ in range(7)])),
+         "incident", "reality_tcp_path",
+         ("count_drop_reality", "journal_burst_reality"),
+         ("all_devices_quiet", "count_drop_hysteria2"),
+         ("root_cause_not_established",), ()),
+        ("device_pairs_silent_in_the_bucket_are_not_quiet",
+         reality_incident_bundle(device_rows=pair_devices(10, [
+             every_pair(20)] * 3 + [
+                 [(device, "vless-in", 0) for device in DEVICE_NAMES]
+                 for _ in range(7)])),
+         "incident", "reality_tcp_path",
+         ("count_drop_reality", "journal_burst_reality"),
+         ("all_devices_quiet", "count_drop_hysteria2"),
+         ("root_cause_not_established",), ()),
+        # The other half of the same rule, and the reason the mark is no longer
+        # allowed to speak for impact: here every pair really does answer zero,
+        # and that is still one transport's outage -- the HY2 counter never
+        # moved, and the device table cannot say WHY its own rows went quiet.
+        ("device_quiet_is_evidence_not_dual_impact",
+         reality_incident_bundle(device_rows=pair_devices(10, [
+             every_pair(20)] * 3 + [every_pair(0) for _ in range(7)])),
+         "incident", "reality_tcp_path",
+         ("all_devices_quiet", "count_drop_reality",
+          "journal_burst_reality"),
+         ("count_drop_hysteria2", "journal_burst_hysteria2"),
+         ("root_cause_not_established", "device_states_are_change_only"), ()),
         ("api_down", api_down_bundle(), "incident", "vps_process_or_api",
          ("api_stale", "collector_stale"),
          ("journal_burst_reality", "journal_burst_hysteria2",
@@ -617,7 +727,7 @@ def scenarios():
          ("probe_failed_dns", "probe_failed_https", "probe_failed_egress"),
          ("probe_generic_tcp_healthy", "count_drop_reality"),
          ("probe_endpoint_confounded",), ()),
-        # The three controls: the same probe outage, each with one genuinely
+        # The two genuine controls: the same probe outage, each with one
         # independent witness in the same buckets.
         ("probe_outage_with_client_impact",
          drop_only_bundle(probe_slots={"dns": "failed", "https": "failed",
@@ -626,16 +736,16 @@ def scenarios():
          ("probe_failed_https", "count_drop_reality"),
          ("probe_generic_tcp_healthy",), ("root_cause_not_established",),
          ("probe_endpoint_confounded",)),
-        ("probe_outage_with_egress_change",
+        ("probe_outage_with_egress_change_only",
          bundle(samples=traffic(10),
                 probe_rows=probes(10, {"dns": "failed", "https": "failed"},
                                   egress_change_at=4),
                 journal_events=background_journal(10),
                 device_states=devices(10, [40] * 10)),
-         "incident", "vps_outbound",
+         "incident", "insufficient_evidence",
          ("probe_failed_dns", "probe_failed_https", "egress_ip_changed"),
          ("probe_failed_egress", "probe_generic_tcp_healthy"),
-         ("root_cause_not_established",), ("probe_endpoint_confounded",)),
+         ("probe_endpoint_confounded", "root_cause_not_established"), ()),
         ("probe_outage_with_generic_journal",
          bundle(samples=traffic(10),
                 probe_rows=probes(10, {"dns": "failed", "https": "failed",
@@ -673,6 +783,33 @@ def scenarios():
          ("probe_failed_dns", "probe_failed_https", "probe_failed_egress",
           "probe_generic_tcp_healthy"),
          ("probe_evidence_unusable",), ()),
+        # The two codes this round moved across the wall, each named the way
+        # the engine produces it. tls_failed is what ANY ssl.SSLError maps to,
+        # SSLCertVerificationError included: a leaf whose certificate or TLS
+        # configuration is wrong reports exactly like a dead path.
+        # protocol_failed is what an answer that is not ours reports -- an
+        # http.client.HTTPException, a short or mismatched UDP reply. Neither
+        # may widen a path-specific fault into an outbound one.
+        ("probe_tls_failed_is_not_a_network_fault",
+         reality_incident_bundle(probe_slots={
+             slot: ("failed", "tls_failed")
+             for slot in cl.GENERIC_PROBE_SLOTS}),
+         "incident", "reality_tcp_path",
+         ("journal_burst_reality", "count_drop_reality",
+          "probe_source_unavailable"),
+         ("probe_failed_dns", "probe_failed_https", "probe_failed_egress",
+          "probe_generic_tcp_healthy"),
+         ("probe_evidence_unusable", "root_cause_not_established"), ()),
+        ("probe_protocol_failed_is_not_a_network_fault",
+         reality_incident_bundle(probe_slots={
+             slot: ("failed", "protocol_failed")
+             for slot in cl.GENERIC_PROBE_SLOTS}),
+         "incident", "reality_tcp_path",
+         ("journal_burst_reality", "count_drop_reality",
+          "probe_source_unavailable"),
+         ("probe_failed_dns", "probe_failed_https", "probe_failed_egress",
+          "probe_generic_tcp_healthy"),
+         ("probe_evidence_unusable", "root_cause_not_established"), ()),
         # The UDP slot proves UDP reachability, not WHICH tunnel owns it:
         # sustained UDP failure alone is evidence without an attribution.
         ("udp_probe_only",
@@ -1199,10 +1336,13 @@ def group_privacy():
     out["no_leak_probe_survives"] = not leaked
     out["serialized_strings_are_tokens"] = not unclosed
     # The columns that carry them are RECEIVED and never READ: the consumed
-    # subsets must exclude them, in every section. (A device name IS read --
-    # as an opaque counting key for "how many devices are quiet" -- and the
-    # closed result surface below is what proves it can never be echoed.)
-    forbidden_reads = {"iso_utc", "run_id", "inbound", "fp",
+    # subsets must exclude them, in every section. (Two names ARE read, both
+    # as opaque counting keys and nothing else -- `device`, because quiet is a
+    # statement about machines, and `inbound`, because that is the key
+    # `device_protocol_states` is actually built on. The closed result surface
+    # below and the `vless-in` probe above are what prove neither can ever be
+    # echoed.)
+    forbidden_reads = {"iso_utc", "run_id", "fp",
                        "egress_ip", "cycle_id", "dns_latency_ms",
                        "https_latency_ms", "udp_latency_ms",
                        "egress_latency_ms", "seq", "result_version",
@@ -1213,7 +1353,7 @@ def group_privacy():
                 | set(cl.AUDIT_FIELDS))
     out["identity_columns_never_consumed"] = not (consumed & forbidden_reads)
     out["device_column_is_counting_only"] = set(cl.DEVICE_FIELDS) == {
-        "epoch", "device", "active_connections", "reason"}
+        "epoch", "device", "inbound", "active_connections", "reason"}
     out["result_surface_has_no_slot_for_an_identity"] = all(
         set(cl.classify(obj).to_dict()) == {
             "version", "status", "category", "window_start", "window_end",
@@ -1332,8 +1472,8 @@ def group_mirrors():
         and all(code in cl.PROBE_ERROR_CODES
                 for code in cl.PROBE_NETWORK_CODES + cl.PROBE_SOURCE_CODES))
     out["source_codes_are_not_network_codes"] = (
-        {"unavailable", "bad_response", "parse_failed"}
-        <= set(cl.PROBE_SOURCE_CODES))
+        {"unavailable", "bad_response", "parse_failed", "protocol_failed",
+         "tls_failed"} <= set(cl.PROBE_SOURCE_CODES))
     out["derived_tokens_come_from_vocabularies"] = (
         {"journal_cls_" + n for n in cl.JOURNAL_CLASSES} <= cl.EVIDENCE_TOKENS
         and {"journal_audit_" + c for c in cl.JOURNAL_AUDIT_CODES}
@@ -1345,11 +1485,28 @@ def group_mirrors():
 
 
 def _engine_agrees():
+    import http.client
+    import ssl
     from diagnostics import network_probes as engine
+    # The source-side half of the probe split is not this harness's opinion of
+    # the engine: it is the engine's own mapping, read off the exceptions it
+    # documents. A certificate refusal and a protocol-level HTTP refusal both
+    # land on the source side of the classifier's wall.
+    tls_verdict = engine._classify_client_error(
+        ssl.SSLCertVerificationError())
+    protocol_verdict = engine._classify_client_error(
+        http.client.BadStatusLine(""))
+    short_udp_verdict = engine._udp_classify_reply(b"\x00\x01\x02", 7, 512,
+                                                   b"")
     return (set(cl.PROBE_ERROR_CODES) == set(engine.ERROR_CODES)
             and set(cl.PROBE_STATUSES) == {engine.STATUS_OK,
                                            engine.STATUS_FAILED}
-            and set(cl.PROBE_SLOTS) == set(engine.PROBE_SLOTS))
+            and set(cl.PROBE_SLOTS) == set(engine.PROBE_SLOTS)
+            and tls_verdict == engine.ERR_TLS_FAILED
+            and protocol_verdict == engine.ERR_PROTOCOL_FAILED
+            and short_udp_verdict == engine.ERR_PROTOCOL_FAILED
+            and {tls_verdict, protocol_verdict, short_udp_verdict}
+            <= set(cl.PROBE_SOURCE_CODES))
 
 
 # -- group: the real store ---------------------------------------------------

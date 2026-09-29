@@ -17,7 +17,7 @@
 #      that can be reviewed on its logic alone -- so the lane proves the
 #      absence of wiring rather than trusting a promise.
 #   2. A CLOSED VOCABULARY, PINNED AS LITERALS HERE. Seven categories, three
-#      statuses, forty-five evidence tokens, twenty-seven unknown tokens, the
+#      statuses, forty-five evidence tokens, twenty-eight unknown tokens, the
 #      six categories the sealing wall actually admits, and the two halves of
 #      the probe failure split. They are re-stated in this shell file -- a
 #      second, independent witness -- because a contract only the module and
@@ -35,11 +35,13 @@
 #      ship.
 #   4. BEHAVIOUR, at scale, in tests/monitor-classify/classify_groups.py:
 #      vocabulary mirrors asserted against the LIVE store module and the live
-#      probe engine, a 36-scenario decision table whose rows are the review
+#      probe engine, a 43-scenario decision table whose rows are the review
 #      counterexamples (an unreachable destination category, degraded
 #      diagnostics that proves nothing, a probe code that is not a network
 #      fact, one endpoint outage posing as an outbound failure, impact read
-#      per transport, contemporaneous negatives, two episodes in one window),
+#      per transport, a device table keyed per (device, inbound) that cannot
+#      grant impact at all, contemporaneous negatives, two episodes in one
+#      window),
 #      nineteen hostile refusals, determinism/purity/closure invariants, a
 #      privacy wall that feeds real sentinel material through every section,
 #      and a group that builds a REAL schema-v3 database, reads the rows back
@@ -58,26 +60,35 @@ export CLASSIFY_FIXTURE_DIR="$HERE/monitor-classify/fixtures"
 
 PASS=0
 FAIL=0
-# PR-4A round 3 -- 582 checks, measured on the dev host and to be re-measured
-# on Linux CI. The move from 433 is gates that were written, never a count
-# that was waved through, and the breakdown is part of the record:
+# PR-4A round 4 -- 665 checks, measured on the dev host and to be re-measured
+# on Linux CI. The move from 582 is gates that were written, never a count that
+# was waved through, and the breakdown is part of the record:
 #   S0 static + darkness gates              13   unchanged
-#   S1 closed vocabulary, pinned literal    12   (+2: the six categories the
-#        sealing wall admits, and the network/unusable split of the probe
-#        failure codes. Both are round-3 semantics, so both get a witness
-#        outside the module.)
-#   S2 committed fixtures decide and move    9   unchanged -- the four
-#        mutations answer exactly as they did before round 3, which is the
-#        proof that the new refusals hardened the edges without moving the
-#        anchor
-#   S3 behaviour groups (classify_groups)  548   mirrors 24 (+3: emittable
-#        categories, the probe-code partition, source codes are not network
-#        codes), scenarios 344 (+143: 23 rows became 36 -- every round-3
-#        counterexample and its positive control), hostiles 116 unchanged,
-#        invariants 16 (+1: _seal() itself refuses the unemittable
-#        category), privacy 7, store 25, fixtures 14, plus the harness rc
-#        and the fixtures-unchanged proof
-EXPECTED_PASS=582
+#   S1 closed vocabulary, pinned literal    12   unchanged in count, but two
+#        of those literals moved: the unknown vocabulary gained
+#        device_states_are_change_only (27 -> 28) and the probe failure split
+#        moved tls_failed and protocol_failed across the wall. Both are
+#        round-4 semantics restated outside the module on purpose.
+#   S2 committed fixtures decide and move   17   (+8, every one of them a
+#        window the PRE-round-4 module answers differently: a genuinely quiet
+#        per-(device, inbound) table that must name no impact; one device's
+#        other inbound holding clients, which must make the table NOT quiet;
+#        the same rows traversed in the opposite order, answering identically;
+#        a pair answering 3 and 0 at ONE epoch, pinned in BOTH arrival orders
+#        because the reader promises none and the tie must not be decided by
+#        whichever row happened to be written last; tls_failed and
+#        protocol_failed on the generic slots, once each; and a probe outage
+#        whose only extra witness is a changed egress address)
+#   S3 behaviour groups (classify_groups)  623   mirrors 24 (+0: two existing
+#        gates were strengthened, and engine_probe_codes_agree now reads the
+#        engine's OWN ssl/http/UDP mapping instead of trusting this file's
+#        prose), scenarios 419 (+75: 36 rows became 43 -- four device-table
+#        windows, the reversed-order disagreement that makes the tie-break
+#        direction live in both directions, and the two moved probe codes,
+#        each with its control),
+#        hostiles 116 unchanged, invariants 16 unchanged, privacy 7, store 25,
+#        fixtures 14, plus the harness rc and the fixtures-unchanged proof
+EXPECTED_PASS=665
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
@@ -317,6 +328,7 @@ probe_source_unavailable sample_coverage_gap""".split()
 UNKNOWNS = """
 attribution_ambiguous baseline_evidence_absent
 contemporaneous_negatives_unproven count_drop_only
+device_states_are_change_only
 evidence_outside_window evidence_rejected_audit
 evidence_rejected_device_states evidence_rejected_health
 evidence_rejected_journal_events evidence_rejected_probe_rows
@@ -343,9 +355,9 @@ verdict("statuses_are_the_closed_three", sorted(cl.STATUSES) == STATUSES)
 verdict("evidence_tokens_are_the_pinned_forty_five",
         sorted(cl.EVIDENCE_TOKENS) == sorted(EVIDENCE)
         and len(cl.EVIDENCE_TOKENS) == 45)
-verdict("unknown_tokens_are_the_pinned_twenty_seven",
+verdict("unknown_tokens_are_the_pinned_twenty_eight",
         sorted(cl.UNKNOWN_TOKENS) == sorted(UNKNOWNS)
-        and len(cl.UNKNOWN_TOKENS) == 27)
+        and len(cl.UNKNOWN_TOKENS) == 28)
 # The two planes must not overlap: a token that is both an observation and a
 # denial would let one string mean two things in the same report.
 verdict("the_two_vocabularies_are_disjoint",
@@ -373,13 +385,18 @@ verdict("correlation_is_never_reported_as_causation",
 # the list the sealing wall admits is the reviewed seven WITHOUT
 # destination_specific, and a category outside it cannot leave a result. A
 # 'failed' probe slot is either a fact about the network or the absence of a
-# witness, and only the first may speak for the path.
+# witness, and only the first may speak for the path. The engine is the
+# authority on which is which: it maps ANY ssl.SSLError -- a certificate
+# refusal included -- to tls_failed, and an http.client.HTTPException or a UDP
+# reply that is too short, has the wrong id or answers somebody else's question
+# to protocol_failed. Both are the probe failing to adjudicate an answer, so
+# they sit on the source side of this wall with bad_response and parse_failed.
 EMITTABLE = ["common_inbound_client_office", "hysteria2_udp_path",
              "insufficient_evidence", "reality_tcp_path", "vps_outbound",
              "vps_process_or_api"]
-NETWORK_CODES = ["connect_failed", "dns_failed", "protocol_failed",
-                 "timeout", "tls_failed"]
-SOURCE_CODES = ["bad_response", "parse_failed", "unavailable"]
+NETWORK_CODES = ["connect_failed", "dns_failed", "timeout"]
+SOURCE_CODES = ["bad_response", "parse_failed", "protocol_failed",
+                "tls_failed", "unavailable"]
 verdict("the_unemittable_category_is_pinned_out_of_the_answer",
         sorted(cl.EMITTABLE_CATEGORIES) == EMITTABLE
         and set(cl.CATEGORIES) - set(cl.EMITTABLE_CATEGORIES)
@@ -394,7 +411,10 @@ verdict("probe_failure_codes_are_split_by_what_they_prove",
 # code, and this is the list the code is checked against by the harness's own
 # AST gate. Exactly one of these names may appear in an accepted field list
 # at all -- `device`, as an opaque counting key and nothing else -- and none
-# of them may ever reach the result surface.
+# of them may ever reach the result surface. The device field list carries one
+# more key than that one: `inbound`, because (device, inbound, epoch) is the
+# key the table is really built on. It is not an identity column, it is read
+# for nothing but grouping, and the sentinel below proves it cannot be echoed.
 IDENTITY_COLUMNS = ["iso_utc", "run_id", "device", "egress_ip", "fp",
                     "cycle_id", "snapshot_generated_at", "last_success_at"]
 READ_FIELDS = (set(cl.SAMPLE_FIELDS) | set(cl.DEVICE_FIELDS)
@@ -405,8 +425,8 @@ verdict("identity_bearing_names_are_a_closed_tuple",
             "cycle_id", "device", "egress_ip", "fp", "iso_utc",
             "last_success_at", "run_id", "snapshot_generated_at"]
         and set(IDENTITY_COLUMNS) & READ_FIELDS == {"device"}
-        and cl.DEVICE_FIELDS == ("epoch", "device", "active_connections",
-                                 "reason")
+        and cl.DEVICE_FIELDS == ("epoch", "device", "inbound",
+                                 "active_connections", "reason")
         and not set(IDENTITY_COLUMNS) & (set(cl.EVIDENCE_TOKENS)
                                          | set(cl.UNKNOWN_TOKENS)))
 EOF
@@ -537,26 +557,149 @@ obj["probe_rows"] = []
 ')" \
     "when the negatives stop being provable the same evidence refuses attribution"
 
+# (7a)-(7f) The round-4 refusals, restated on the committed artefact rather
+# than in the harness. Each one is a fixture the PRE-round-4 module answers
+# differently, so these are discriminators and not decorations.
+quiet_rows() { # <hy2 answer> -> a per-(device, inbound) table for every bucket
+    "$PY" - "$FIX_REAL" "$1" <<'EOF'
+import copy, json, sys
+obj = json.load(open(sys.argv[1], encoding="utf-8"))
+hy2 = int(sys.argv[2])
+template = obj["device_states"][0]
+base = int(obj["window"]["start_epoch"])
+devices = sorted({row["device"] for row in obj["device_states"]})
+rows = []
+for index in range(10):
+    for device in devices:
+        pairs = [("hy2-in", hy2 if index >= 3 else 20),
+                 ("vless-in", 0 if index >= 3 else 20)]
+        for inbound, active in pairs:
+            row = copy.deepcopy(template)
+            row.update({"epoch": float(base + index * 60 + 20),
+                        "device": device, "inbound": inbound,
+                        "active_connections": active})
+            rows.append(row)
+print(json.dumps(rows))
+EOF
+}
+import_rows() { # <rows json> -> "status category unknowns" for that device table
+    "$PY" - "$FIX_REAL" "$1" <<'EOF'
+import json, os, sys
+sys.path.insert(0, os.environ["MONITOR_V2_ROOT"])
+from web import incident_classifier as cl
+obj = json.load(open(sys.argv[1], encoding="utf-8"))
+obj["device_states"] = json.loads(sys.argv[2])
+r = cl.classify(obj)
+print("%s %s %s" % (r.status, r.category, ",".join(sorted(r.unknowns))))
+EOF
+}
+QUIET_ZERO="$(quiet_rows 0)"
+QUIET_HOLD="$(quiet_rows 3)"
+assert_eq "incident reality_tcp_path device_states_are_change_only,root_cause_not_established" \
+    "$(import_rows "$QUIET_ZERO")" \
+    "a genuinely quiet device table is context: it names no impact and no shared path"
+assert_eq "incident reality_tcp_path root_cause_not_established" \
+    "$(import_rows "$QUIET_HOLD")" \
+    "one device's other inbound holding clients is read per (device, inbound), not per device"
+assert_eq "incident reality_tcp_path root_cause_not_established" \
+    "$("$PY" - "$FIX_REAL" "$QUIET_HOLD" <<'EOF'
+import json, os, sys
+sys.path.insert(0, os.environ["MONITOR_V2_ROOT"])
+from web import incident_classifier as cl
+obj = json.load(open(sys.argv[1], encoding="utf-8"))
+rows = json.loads(sys.argv[2])
+reversed_rows = []
+for index in range(10):
+    chunk = rows[index * 4:(index + 1) * 4]
+    reversed_rows = reversed_rows + chunk[::-1]
+obj["device_states"] = reversed_rows
+r = cl.classify(obj)
+print("%s %s %s" % (r.status, r.category, ",".join(sorted(r.unknowns))))
+EOF
+)" \
+    "the same device rows traversed in the opposite order answer exactly the same"
+tie_rows() { # <first>,<second> -> two rows per (device, inbound) at ONE epoch
+    "$PY" - "$FIX_REAL" "$1" <<'EOF'
+import copy, json, sys
+obj = json.load(open(sys.argv[1], encoding="utf-8"))
+order = [int(value) for value in sys.argv[2].split(",")]
+template = obj["device_states"][0]
+base = int(obj["window"]["start_epoch"])
+devices = sorted({row["device"] for row in obj["device_states"]})
+rows = []
+for index in range(10):
+    for device in devices:
+        for inbound in ("hy2-in", "vless-in"):
+            for value in (order if index >= 3 else [20, 20]):
+                row = copy.deepcopy(template)
+                row.update({"epoch": float(base + index * 60 + 20),
+                            "device": device, "inbound": inbound,
+                            "active_connections": value})
+                rows.append(row)
+print(json.dumps(rows))
+EOF
+}
+assert_eq "incident reality_tcp_path root_cause_not_established" \
+    "$(import_rows "$(tie_rows 3,0)")" \
+    "one (device, inbound) answering 3 and 0 at the same instant is not quiet"
+assert_eq "incident reality_tcp_path root_cause_not_established" \
+    "$(import_rows "$(tie_rows 0,3)")" \
+    "the same instant read in the other order answers the same: no row is last"
+for CODE in tls_failed protocol_failed; do
+assert_eq "incident reality_tcp_path probe_evidence_unusable,root_cause_not_established" \
+    "$(mutate "
+base = int(obj['window']['start_epoch'])
+for row in obj['probe_rows']:
+    if row['epoch'] >= base + 3 * 60:
+        for slot in ('dns', 'https', 'egress'):
+            row['%s_status' % slot] = 'failed'
+            row['%s_error_code' % slot] = '$CODE'
+            row['%s_latency_ms' % slot] = None
+")" \
+    "a generic slot that fails with $CODE is the probe failing to adjudicate, not a path that is down"
+done
+assert_eq "incident insufficient_evidence probe_endpoint_confounded,root_cause_not_established" \
+    "$(mutate '
+base = int(obj["window"]["start_epoch"])
+for row in obj["samples"]:
+    row["reality_active_connections"] = 25
+    row["total_active_connections"] = 40
+obj["journal_events"] = [r for r in obj["journal_events"]
+                         if not (r["proto"] == "Reality"
+                                 and r["cls"] == "dial_timeout")]
+for row in obj["probe_rows"]:
+    index = int((row["epoch"] - base) // 60)
+    if index >= 4:
+        for slot in ("dns", "https"):
+            row[slot + "_status"] = "failed"
+            row[slot + "_error_code"] = "timeout"
+            row[slot + "_latency_ms"] = None
+    if index == 4:
+        row["egress_change"] = "changed"
+')" \
+    "a changed egress address is the same scheduler answering, not a second witness"
+
 # (8) Privacy on the committed artefacts: the fixtures carry real sentinel
-# material in the columns the classifier may receive but never read, so a
-# result that repeats any of it is a leak, not a style problem.
+# material in the columns the classifier may receive but never read, plus the
+# two it reads as counting keys, so a result that repeats any of it is a leak,
+# not a style problem.
 if "$PY" - "$FIX_REAL" "$FIX_NORMAL" <<'EOF'
 import json, os, sys
 sys.path.insert(0, os.environ["MONITOR_V2_ROOT"])
 from web import incident_classifier as cl
 PROBES = ("SENTINEL-SECRET-0123456789abcdef", "office-laptop-alpha",
-          "home-phone-beta", "203.0.113.19", "0011223344556677")
+          "home-phone-beta", "203.0.113.19", "0011223344556677", "vless-in")
 for path in sys.argv[1:]:
     text = open(path, encoding="utf-8").read()
     carried = [p for p in PROBES if p in text]
-    assert len(carried) >= 4, "fixture %s carries no identity material" % path
+    assert len(carried) >= 5, "fixture %s carries no identity material" % path
     out = json.dumps(cl.classify(json.loads(text)).to_dict(), sort_keys=True)
     for probe in PROBES:
         assert probe not in out, "fixture %s leaked %s" % (path, probe)
     assert "@" not in out and "=" not in out, out
 EOF
 then
-    pass "neither fixture's result echoes a device name, address or fingerprint"
+    pass "neither fixture's result echoes a device, inbound tag, address or fp"
 else
     fail "a classifier result echoed identity material from its input"
 fi
