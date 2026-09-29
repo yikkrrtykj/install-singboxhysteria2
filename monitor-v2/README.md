@@ -398,6 +398,8 @@ History 升到 **schema v3**：恰好一张新表 `network_probe_samples`（19 �
 
 读取面**复用**既有有界 `GET /api/v1/diagnostics/timeline`：同一请求多带 `probe_rows`（列白名单 + `since`/`limit`/`truncated`）与 deny-by-default 的 `probes` 闭合投影；无新端点、无新查询参数、无 UI。部署面两项：`diagnostics/` 进入**显式不可变 staging 清单**（3 个模块、恰等审计，绝不 `cp -R`），`install-monitor.sh rollback` 前置 **history schema 兼容门**——v3 库不可能经普通回滚路径落到 pre-v3 release 之下。
 
+迁移发生在**事务内部**（candidate 服务启动时），所以部署事务另有一层预状态（`deploy/README.md` §23）：升级前若 candidate 会把 schema 向前推，installer 先用 **SQLite backup API** 拍下迁移前的一致快照（`quick_check` + schema/表集/内容摘要逐项复验，`0600` 存在备份根目录，全程不 stop 运行中的 Monitor）；后续任一闸门失败时，restore **先重新只读探测活动库**并与捕获时记录的**形状三元组**（declared + schema-SQL 摘要 + 表集）比较——相符即本事务从未跨越边界，函数什么都不碰地返回（`history_db=untouched`），因为 candidate 没启动的那段时间里老 Monitor 一直在合法地写历史，内容摘要刻意不在这道比较里；只有确实跨越（或探测不了）才**先停 candidate、再原子还原**精确的迁移前数据库并连同属主/权限一起恢复，之后才恢复 release/unit/enabled/active，还原失败一律 `CRITICAL`/exit 2，绝不声称"事务前状态已恢复"。同一道 schema 比较在激活前另有两扇门：`candidate == live` 不需要快照（**同 schema 的 VERSION 降级照旧允许**），`candidate < live` 是 schema 降级，`install --allow-downgrade` 与手工 `rollback` 走同一段拒绝语被拒（激活之前，线上零变更）。升级成功则把那份快照作为**手工降级的唯一恢复物**保留并点名报告，既不自动使用也不自动删除。
+
 本提交把 `VERSION`、`MONITOR_WEB_VERSION` 与钉住**当前发布版本**的 hist / jr / probes / probe-ingest / packaging 断言抬到 `0.4.0`；描述 `0.3.0`/`0.3.1` 缺陷与各轮版本立场的历史文字、`0.3.1` 依赖 bootstrap 注释、以及夹具内的版本占位值保持不变。功能代码冻结在 `27e165c`（评审 R3 = PASS），本提交不带任何行为、schema、端点、调度器或部署事务改动。
 
 ### 请求门顺序（每个普通请求）

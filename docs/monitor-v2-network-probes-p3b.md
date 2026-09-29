@@ -636,3 +636,76 @@ shellcheck `-S warning` 逐条实测：hist / probes / probe-ingest **0** 条，
 所以文档写入对 CI 是惰性的；上面的数字测自功能/基础设施头 `70528b1`，其上的文档头
 `a0f010c` 再跑一次仍是首试 10/10 全绿（runs 36517126376 / 36517126369），
 最终评审头以 PR 里的最新一轮 CI 为准。
+
+## 17. 预部署事务热修复（0.4.0 尚未上线，功能代码之外的最后一个发布阻断项）
+
+功能冻结点 `27e165c` 与 release-prep 头之后，评审在**部署事务**面上找到一条阻断项，
+它不在探测/History/web 任何一条车道里，只在"升级失败并自动回滚"这条路径上现身：
+
+**v2→v3 的 History 迁移发生在事务内部**（candidate service 启动时，
+`incident_history._enforce_schema`，位置在 release 激活之后、
+`sbmon_sboxjr_converge` 之前），而当时的 `sbmon_txn_rollback()` 只搬回
+release/unit/enabled/active。于是"迁移已提交、后续闸门失败"的回滚会把声明 v2 的
+0.3.1 运行时重新点亮在 schema-v3 数据库上：运行时的 schema 门 fail-closed 停写时间线
+（**静默历史黑暗**，其余面照常服务），并且回滚 schema 兼容门从此永久拒绝该 target。
+回滚把一个可恢复的失败变成了不可恢复的状态。
+
+修复的契约、实现细节、版面约束（prestate 小节必须留在只读门小节的 awk 审计区域**之外**）、
+判别器（`test-monitor-packaging.sh` T28/T29，以及 R1 轮的 T30/T31）与变异实验
+（四个：事务级的 restore/capture 空操作各一，R1 级的跨越判定与降级门各一），全部记在
+`monitor-v2/deploy/README.md` §23。本 PR-3B 文档只补三条与本功能相关的立场：
+
+- v3 schema 的**代价面**从此有了部署期对价：一旦某个 release 把 schema 向前推，
+  事务要么把数据库带回去，要么以 exit 2 停住；它不会假装成功。
+- 迁移前的那份快照是**手工降级的唯一恢复物**，成功后被保留、由 installer 点名报告、
+  并被 T29 断言仍然有效；正常命令面不会自动使用它，也不会自动删除它。
+- 探测本身（端点、节奏、写入路径、schema 形状）零改动：本轮只增加事务的恢复能力，
+  因此本文 §1–§16 的所有功能判据逐条继续成立。
+
+**R1 轮在同一条事务面上又找到两条边界错误**（同为部署事务契约，功能面零改动）：
+B1 把"抓到了预状态"当成"可以覆盖数据库"——而最常见的 forward 失败发生在 candidate 启动
+**之前**，那时唯一持有并写入这个库的仍是老 Monitor，它写的行是快照不可能包含的合法历史；
+现在 restore 先用形状三元组重探活动库，证明本事务确实跨越了边界才静默、才替换，否则
+`history_db=untouched` 且一行历史都不掉。B2 是 `install --allow-downgrade`：capture 曾经
+对 `candidate < live` 返回成功，于是这条命令成了唯一绕过手工回滚 schema 门的通道，把声明 v2
+的运行时放到 v3 库上（静默黑暗）；现在两道门共用同一段拒绝语，在激活之前拒绝、点名保留介质、
+恒 rc 1，而同 schema 的 VERSION 降级依旧允许。判别器 T30/T31 与 M1/M2 取证见 §23。
+
+`VERSION`/`MONITOR_WEB_VERSION` 保持 0.4.0（生产未部署）。不部署、不接触生产 VPS、
+不合并。
+
+**评审头 `bf28853` 的 CI 实测：首试 10/10 全绿**（runs 36542394594 / 36542394592）。
+本轮唯一变动的车道是 packaging：normal pass **632 → 695**（+63）、root pass
+**647 → 711**（+64）。差值就是 T28/T29，两条 pass 的日志里都能搜到
+`== T28 transaction History prestate ... ==` 与 `== T29 ... ==` 小节标题，
+即这两个判别器在 Linux 上**确实执行**，不是 dev 主机那样的 SKIP。root 比 normal
+多出的那 1 条是 T28 里 `SBMON_FIXTURE = 0` 守卫下的**唯一**属主断言
+（"the restored database is owned by the service user recorded at capture"）——
+`chown` 还原只在真实路径执行，所以这条证明只能由 root pass 给出。
+
+**R1 评审头 `c081c3f` 的 CI 实测：首试 10/10 全绿**（runs 36560460273 / 36560460382）。
+packaging 仍是被 B1/B2 抬起的唯一车道：normal pass **695 → 755**、root pass
+**711 → 771**，两次 pass 各 +60 = T30 的 34 条 + T31 的 26 条，root/normal 差值维持 16 条；
+两条 pass 的日志里 `== T28/T29/T30/T31 ... ==` 四个小节标题都在，两条新判别器在 Linux 上
+**确实执行**且零 SKIP。其余车道与上一轮逐条相等。
+这一轮另外留下一条少见的取证：**判别器的非空转由一次真实的红证明**。头 `1211a26` 在
+Linux 上红了 3 条（packaging-fixture 752/3、packaging-root 768/3，其余 7 条车道全绿），
+三条全部落在 T30 的哨兵机制上——mock 的一次性旋钮先 `rm` 后 `bash`，钩子永远找不到自己
+要执行的文件，哨兵从未落库，而"candidate 从未 boot"那几条依旧绿。修成先执行后摘除即
+755/771 全绿。也就是说：如果"未跨越就不许覆盖"所保护的历史真的被抹掉，这几条会在门禁上
+变红，而不是默默通过。
+
+其余车道逐条与基线（PR #59 头 `c2aa6b2`）**相等**：incident history 240、
+probes 138（expected 138）、probe-ingest 307（expected 307）、
+jr 371（expected 371）、jr-deploy 464、P2B 集成 132、E4-Diag 457/457、
+E1/E2/M0.5/E4 全绿；`bash-suites` 在 22.04/24.04/26.04 三平台通过，
+`core-regression`/`fast-checks`/`ci-gate` 通过。那道只读门的静态证明另有本地证据：
+prestate 小节最初落在 awk 审计区域**之内**时，`probe-ingest` 在 dev 主机全量清扫里
+是 **305/2**（CI 从未见过那个布局），移出之后才回到 307 并保持到本轮——
+§23 那条"版面约束是承重的"因此是被观察到的，不是推出来的。
+
+记录这些数字的是**纯文档**提交，对 CI 惰性：`tests/` 与 `.github/workflows/`
+全文搜不到 `monitor-v2-network-probes-p3b`；deploy README 只在 workflow 的一条
+**注释**里被提及，且指向的是另一个小节（"兼容性预检与环境诊断"），因此改写 §23
+不触碰任何门。本节的数字测自功能/测试头 `f0f3bce` 之上的文档头，
+最终评审头以 PR 里最新一轮 CI 为准。

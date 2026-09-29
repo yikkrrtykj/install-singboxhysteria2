@@ -1004,6 +1004,527 @@ sbmon_diagnostics_audit() { # <dir> -> rc
 }
 
 # ---------------------------------------------------------------------------
+# PR-3B pre-deploy hotfix: the deployment transaction's History prestate
+# ---------------------------------------------------------------------------
+# A forward upgrade whose CANDIDATE declares a newer History schema mutates
+# durable state INSIDE the transaction: the migration is not a deploy step, it
+# runs when the candidate service boots (incident_history._enforce_schema,
+# forward-only v1/v2 -> v3), which is AFTER release activation and BEFORE the
+# remaining gates (notably sbmon_sboxjr_converge). The release/unit/service
+# rollback in install-monitor.sh cannot undo a migration, and the manual
+# rollback schema gate below would then refuse the restored pre-v3 runtime
+# forever -- so the transaction must be able to put the database back itself.
+#
+# The snapshot uses the SQLITE BACKUP API against the live file while the
+# running Monitor keeps its connection open. A plain copy is not an option
+# (copying an open database file yields a torn image), and stopping the service
+# merely to read it would trade a rollback hazard for an availability blip in a
+# precondition phase -- so capture never touches any service.
+#
+# Nothing is captured unless the candidate can move the schema forward: noop /
+# repair / same-schema upgrades keep their exact existing behaviour, and hosts
+# that never see a migration keep an empty backup root.
+#
+# Placement is deliberate: this section stays BEFORE the read-only gate section
+# below, because tests/test-monitor-v2-probe-ingest.sh statically proves that
+# region free of any write statement, and a snapshot plus a database
+# restoration are exactly the two things it must not contain.
+SBMON_PRE_DB_PATH=""          # the live database this prestate restores
+SBMON_PRE_DB_BACKUP=""        # '' = no schema-changing prestate (rollback no-op)
+SBMON_PRE_DB_META=""          # its metadata sidecar
+SBMON_PRE_DB_RESTORED=0       # set only after a verified DB restoration
+
+sbmon_history_prestate_paths() { # <candidate-release-id>
+    SBMON_PRE_DB_BACKUP="$SBMON_BACKUP_ROOT/history-prestate-$1.sqlite3"
+    SBMON_PRE_DB_META="$SBMON_BACKUP_ROOT/history-prestate-$1.meta"
+}
+
+sbmon_history_prestate_reset() {
+    SBMON_PRE_DB_PATH=""
+    SBMON_PRE_DB_BACKUP=""
+    SBMON_PRE_DB_META=""
+    SBMON_PRE_DB_RESTORED=0
+}
+
+# Extract one key from `key=value` text on stdin (pure bash: no awk dependency
+# in the installer's required command set).
+sbmon_kv() { # <key>
+    local key="$1" line
+    while IFS= read -r line; do
+        case "$line" in
+            "$key="*) printf '%s\n' "${line#*=}" ;;
+        esac
+    done
+}
+
+# READ-ONLY structural probe of a history database. Prints
+#   DECLARED=<int> QUICK=ok SCHEMA_SHA=<hex> CONTENT_SHA=<hex> TABLES=<a,b,c>
+# rc 1 unless the file is a readable SQLite database that declares a
+# non-negative integer schema_version, carries a table set, and passes
+# quick_check. Never a write, never a migration, never a pragma that mutates
+# (mode=ro is enforced by the URI).
+sbmon_history_db_probe() { # <path> -> key=value lines | rc 1
+    "$SBMON_PYTHON3" -B - "$1" <<'PY' 2>/dev/null
+import hashlib, os, sqlite3, sys
+from urllib.request import pathname2url
+
+path = sys.argv[1]
+if not os.path.isfile(path):
+    raise SystemExit(1)
+con = sqlite3.connect("file:%s?mode=ro" % pathname2url(os.path.abspath(path)),
+                      uri=True, timeout=5.0)
+try:
+    if con.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+        raise SystemExit(1)
+    try:
+        row = con.execute(
+            "SELECT value FROM meta WHERE key='schema_version'").fetchone()
+    except sqlite3.Error:
+        row = None
+    if row is None:
+        raise SystemExit(1)
+    try:
+        declared = int(row[0])
+    except (TypeError, ValueError):
+        raise SystemExit(1)
+    if declared < 0:
+        raise SystemExit(1)
+    tables = sorted(r[0] for r in con.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"))
+    if not tables:
+        raise SystemExit(1)
+    schema = "".join("%s|%s\n" % (t or "", s or "") for t, s in con.execute(
+        "SELECT type, sql FROM sqlite_master ORDER BY type, name, sql"))
+    content = "".join("%s\n" % line for line in con.iterdump())
+finally:
+    con.close()
+print("DECLARED=%d" % declared)
+print("QUICK=ok")
+print("SCHEMA_SHA=%s" % hashlib.sha256(schema.encode("utf-8")).hexdigest())
+print("CONTENT_SHA=%s" % hashlib.sha256(content.encode("utf-8")).hexdigest())
+print("TABLES=%s" % ",".join(tables))
+PY
+}
+
+# Consistent snapshot of <src> into <dst> via the SQLite backup API: the page
+# copy is performed by SQLite itself against the live file, so a Monitor that
+# keeps its connection open cannot yield the torn image a plain copy of an open
+# database file would. <dst> must be an empty file (mktemp creates it).
+# rc 1 = no usable snapshot was produced.
+sbmon_history_db_snapshot() { # <src> <dst>
+    "$SBMON_PYTHON3" -B - "$1" "$2" <<'PY' 2>/dev/null
+import os, sqlite3, sys
+from urllib.request import pathname2url
+
+src, dst = sys.argv[1], sys.argv[2]
+if not os.path.isfile(src) or os.path.getsize(dst) != 0:
+    raise SystemExit(1)
+source = sqlite3.connect(
+    "file:%s?mode=ro" % pathname2url(os.path.abspath(src)),
+    uri=True, timeout=5.0)
+try:
+    target = sqlite3.connect(dst)
+    try:
+        # An open transaction on the target makes backup() fail outright, and
+        # a half-copied destination must never be renamed over the prestate.
+        target.commit()
+        source.backup(target)
+        target.commit()
+    finally:
+        target.close()
+finally:
+    source.close()
+PY
+}
+
+# List retained pre-migration snapshots whose recorded schema matches
+# <declared-version> and whose database file is still present.
+sbmon_history_prestate_for() { # <declared-version> -> paths
+    local want="$1" meta found declared backup
+    [ -d "$SBMON_BACKUP_ROOT" ] || return 0
+    for meta in "$SBMON_BACKUP_ROOT"/history-prestate-*.meta; do
+        [ -f "$meta" ] || continue
+        # The media path is the one RECORDED in the sidecar, not one guessed
+        # from a naming convention: an operator may move it, and a listing that
+        # points at a file that is not there would be worse than silence.
+        backup="$(sbmon_kv backup < "$meta" 2>/dev/null | head -n 1 || true)"
+        [ -n "$backup" ] && [ -f "$backup" ] || continue
+        declared="$(sbmon_kv declared < "$meta" 2>/dev/null | head -n 1 || true)"
+        found=0
+        if [ "$declared" = "$want" ]; then found=1; fi
+        [ "$found" = 1 ] && printf '%s\n' "$backup"
+    done
+    return 0
+}
+
+# THE ONE REFUSAL A HISTORY SCHEMA DOWNGRADE EARNS. Two doors can put an
+# older-schema runtime underneath a newer database: the manual `rollback` gate
+# below, and `install --allow-downgrade`, whose capture step is the only thing
+# that reads both schemas before activation. Both come through here so they can
+# never drift apart -- same evidence (both versions stated), same way back (the
+# retained pre-migration media, named by its RECORDED path), and the same
+# promise that neither command ever applies that media by itself.
+# -> always rc 1: a downgrade is never a decision this library makes for the
+#    operator.
+sbmon_history_downgrade_refusal() { # <mode: rollback|install> <id> <want> <live>
+    local mode="$1" id="$2" want="$3" live="$4"
+    local subject verdict media_subject
+    if [ "$mode" = "install" ]; then
+        subject="降级候选"
+        verdict="拒绝降级"
+        media_subject="该候选"
+    else
+        subject="回滚目标"
+        verdict="拒绝回滚"
+        media_subject="该 target"
+    fi
+    sbmon_warn "$subject $id 声明 history schema v$want，当前数据库为 v$live：该 release 无法读取现有历史库（运行期会 fail-closed 停写），$verdict"
+    local retained
+    retained="$(sbmon_history_prestate_for "$want")"
+    if [ -n "$retained" ]; then
+        sbmon_warn "$media_subject 兼容的迁移前备份仍保留在 $SBMON_BACKUP_ROOT（$(printf '%s' "${retained//$'\n'/ }")）：需运维人员显式恢复后才会降级；本命令绝不自动替换数据库"
+    fi
+    return 1
+}
+
+# Capture the transaction prestate. rc 0 = no schema change possible OR snapshot
+# captured AND validated; rc 1 = the transaction must not proceed, which covers
+# both "the prestate could not be proven" and "this candidate would take the
+# schema BACKWARD" (a downgrade is refused here, before activation, by the same
+# refusal the rollback gate speaks). Called after
+# staging and BEFORE candidate activation, so a refusal here is a
+# precondition-class failure: nothing of the live deployment has changed yet.
+sbmon_history_txn_capture() { # <candidate-release-id> <candidate-version>
+    local new_id="$1" new_ver="$2"
+    sbmon_history_prestate_reset
+    sbmon_history_db_present || return 0     # no history DB: nothing to protect
+    local db
+    db="$(sbmon_history_db_path)"
+    local cand live
+    cand="$(sbmon_release_schema_version "$new_id")" || {
+        sbmon_warn "candidate release $new_id 的 history schema 版本不可读：无法判断本次升级是否会迁移数据库，fail-closed"
+        return 1
+    }
+    live="$(sbmon_history_db_schema_version)" || {
+        sbmon_warn "当前 history 数据库存在但 schema 版本不可读（$SBMON_HISTORY_DB_REL）：无法证明迁移前预状态可建立，fail-closed"
+        return 1
+    }
+    case "$live$cand" in
+        ''|*[!0-9]*)
+            sbmon_warn "history schema 版本判定非整数：fail-closed"
+            return 1 ;;
+    esac
+    # Three doors this comparison has, and only one of them needs a snapshot:
+    #   candidate >  live -- a forward migration is coming, capture it;
+    #   candidate == live -- no schema change is possible, so there is nothing
+    #                        forward to undo (a plain VERSION downgrade with the
+    #                        same schema stays allowed, exactly as before);
+    #   candidate <  live -- a SCHEMA downgrade. That runtime boots straight
+    #                        into its own fail-closed refusal, which is the
+    #                        silent-history-darkness state this whole section
+    #                        exists to prevent, so `install --allow-downgrade`
+    #                        must not walk through here. Returning success for
+    #                        this shape made capture the one door that bypassed
+    #                        the manual rollback gate; it now refuses through
+    #                        the same helper that gate uses, before activation,
+    #                        and names the retained media that is the way back.
+    if [ "$cand" -lt "$live" ]; then
+        sbmon_history_downgrade_refusal install "$new_id" "$cand" "$live"
+        return 1
+    fi
+    if [ "$cand" = "$live" ]; then
+        return 0                              # no forward migration: no prestate
+    fi
+
+    # Record the live shape BEFORE copying, then prove the copy equals it.
+    local live_probe
+    if ! live_probe="$(sbmon_history_db_probe "$db")"; then
+        sbmon_warn "当前 history 数据库无法只读探测（quick_check/schema）：拒绝在无法证明预状态的情况下升级 schema"
+        return 1
+    fi
+    local live_declared live_schema live_tables
+    live_declared="$(printf '%s\n' "$live_probe" | sbmon_kv DECLARED)"
+    live_schema="$(printf '%s\n' "$live_probe" | sbmon_kv SCHEMA_SHA)"
+    live_tables="$(printf '%s\n' "$live_probe" | sbmon_kv TABLES)"
+    # CONTENT IS NOT COMPARED HERE ON PURPOSE: the Monitor holds this database
+    # open and writing, so rows legitimately land between the probe and the
+    # snapshot. The comparison that matters for "the snapshot is the source's
+    # schema" is the structural one below; the content digest is recorded FROM
+    # the snapshot and re-proved against it at restore time.
+
+    sbmon_history_prestate_paths "$new_id"
+    local snap_meta snap_tmp
+    snap_meta="$SBMON_PRE_DB_META"
+    snap_tmp="$(mktemp "$SBMON_BACKUP_ROOT/.prestate.XXXXXX")" || {
+        sbmon_warn "预状态快照临时文件创建失败（$SBMON_BACKUP_ROOT）：fail-closed"
+        return 1
+    }
+    if ! sbmon_history_db_snapshot "$db" "$snap_tmp"; then
+        rm -f -- "$snap_tmp"
+        sbmon_warn "SQLite backup API 未能产出一致快照：拒绝升级 schema（candidate 未激活，部署零变更）"
+        return 1
+    fi
+    local snap_probe
+    if ! snap_probe="$(sbmon_history_db_probe "$snap_tmp")"; then
+        rm -f -- "$snap_tmp"
+        sbmon_warn "预状态快照未通过 quick_check/schema 校验：fail-closed"
+        return 1
+    fi
+    if [ "$(printf '%s\n' "$snap_probe" | sbmon_kv SCHEMA_SHA)" != "$live_schema" ] \
+       || [ "$(printf '%s\n' "$snap_probe" | sbmon_kv DECLARED)" != "$live_declared" ] \
+       || [ "$(printf '%s\n' "$snap_probe" | sbmon_kv TABLES)" != "$live_tables" ]; then
+        rm -f -- "$snap_tmp"
+        sbmon_warn "预状态快照与事务前数据库的 schema 不一致（迁移前探测与快照形状不符）：fail-closed"
+        return 1
+    fi
+    local snap_content
+    snap_content="$(printf '%s\n' "$snap_probe" | sbmon_kv CONTENT_SHA)"
+
+    local owner group mode
+    owner="$(stat -c '%U' "$db" 2>/dev/null)" || owner=""
+    group="$(stat -c '%G' "$db" 2>/dev/null)" || group=""
+    mode="$(stat -c '%a' "$db" 2>/dev/null)" || mode=""
+    if [ -z "$owner" ] || [ -z "$group" ] || [ -z "$mode" ]; then
+        rm -f -- "$snap_tmp"
+        sbmon_warn "无法读取当前 history 数据库的属主/权限（恢复时必须还原它们）：fail-closed"
+        return 1
+    fi
+
+    chmod 0600 "$snap_tmp" || { rm -f -- "$snap_tmp"; sbmon_warn "预状态快照权限设置失败：fail-closed"; return 1; }
+    if ! mv -f -- "$snap_tmp" "$SBMON_PRE_DB_BACKUP"; then
+        rm -f -- "$snap_tmp"
+        sbmon_warn "预状态快照落盘失败（$SBMON_PRE_DB_BACKUP）：fail-closed"
+        return 1
+    fi
+    if ! {
+        printf 'prestate=1\n'
+        printf 'declared=%s\n' "$live_declared"
+        printf 'schema_sha=%s\n' "$live_schema"
+        printf 'content_sha=%s\n' "$snap_content"
+        printf 'tables=%s\n' "$live_tables"
+        printf 'db_path=%s\n' "$db"
+        printf 'backup=%s\n' "$SBMON_PRE_DB_BACKUP"
+        printf 'live_owner=%s\n' "$owner"
+        printf 'live_group=%s\n' "$group"
+        printf 'live_mode=%s\n' "$mode"
+        printf 'candidate_release_id=%s\n' "$new_id"
+        printf 'candidate_version=%s\n' "$new_ver"
+        printf 'candidate_schema=%s\n' "$cand"
+        printf 'captured_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } | sbmon_atomic_write "$snap_meta" 0600; then
+        rm -f -- "$SBMON_PRE_DB_BACKUP"
+        sbmon_warn "预状态元数据写入失败（恢复时无处读取属主/形状契约）：fail-closed，快照未保留"
+        return 1
+    fi
+    SBMON_PRE_DB_PATH="$db"
+    sbmon_info "已捕获 History 迁移前预状态（schema v$live_declared，candidate v$cand）：$SBMON_PRE_DB_BACKUP"
+    return 0
+}
+
+# THE INVERSE, on the transaction's failure path only. ORDER IS THE CONTRACT:
+#   1. the captured contract is read before anything is touched, because it is
+#      the reference for the next question;
+#   2. the live file is re-probed and compared against the captured SHAPE: if it
+#      still matches, this transaction never crossed the schema boundary, so it
+#      returns having touched NOTHING -- the history the still-running old
+#      Monitor wrote after capture is this function's reason to exist;
+#   3. only then is the candidate Monitor stopped and proven inactive BEFORE the
+#      file it moved is replaced -- replacing an open database underneath a live
+#      writer yields exactly the torn image the snapshot exists to avoid;
+#   4. the artifact is re-proven (quick_check + recorded schema/content) rather
+#      than trusted, because the rollback runs minutes after capture;
+#   5. the replacement is atomic ON ITS OWN FILESYSTEM (temp in the database's
+#      directory + rename) with the production owner/mode recorded at capture,
+#      and only THIS database's own sidecar journals are removed -- no other
+#      state file is touched, and the immutable release trees are left alone;
+#   6. the live file is re-probed and must match the prestate exactly
+#      (declared schema + shape + content digest), or the restore failed.
+# rc 1 = the caller must treat this as CRITICAL: never restart the previous
+# runtime over a database that is still at the candidate's schema, and never
+# claim the transaction was rolled back. rc 0 covers both "restored and proven"
+# and "this transaction never crossed the boundary"; only the former sets
+# SBMON_PRE_DB_RESTORED, and the completion line says untouched for both.
+sbmon_history_txn_restore() {
+    [ -n "$SBMON_PRE_DB_BACKUP" ] || return 0
+    local db="$SBMON_PRE_DB_PATH"
+    local meta="$SBMON_PRE_DB_META"
+
+    # 1. THE CONTRACT FIRST, because it is what the next question is asked
+    #    against: did this transaction actually cross the schema boundary?
+    if [ ! -f "$meta" ]; then
+        sbmon_warn "history 预状态元数据缺失（无法判断本事务是否跨越了 schema 边界）：无法恢复"
+        return 1
+    fi
+    local want_declared want_schema want_content want_tables
+    local want_owner want_group want_mode
+    want_declared="$(sbmon_kv declared < "$meta" | head -n 1)"
+    want_schema="$(sbmon_kv schema_sha < "$meta" | head -n 1)"
+    want_content="$(sbmon_kv content_sha < "$meta" | head -n 1)"
+    want_tables="$(sbmon_kv tables < "$meta" | head -n 1)"
+    want_owner="$(sbmon_kv live_owner < "$meta" | head -n 1)"
+    want_group="$(sbmon_kv live_group < "$meta" | head -n 1)"
+    want_mode="$(sbmon_kv live_mode < "$meta" | head -n 1)"
+    local kv
+    for kv in "$want_declared" "$want_schema" "$want_content" "$want_tables" \
+              "$want_owner" "$want_group" "$want_mode"; do
+        if [ -z "$kv" ]; then
+            sbmon_warn "history 预状态元数据不完整（恢复契约缺字段）：无法恢复"
+            return 1
+        fi
+    done
+    case "$want_declared" in
+        ''|*[!0-9]*)
+            sbmon_warn "history 预状态元数据的 schema 版本非整数：无法恢复"
+            return 1 ;;
+    esac
+    case "$want_mode" in
+        ''|*[!0-7]*)
+            sbmon_warn "history 预状态元数据的权限非八进制：无法恢复"
+            return 1 ;;
+    esac
+    case "$want_schema$want_content" in
+        ''|*[!0-9a-f]*)
+            sbmon_warn "history 预状态元数据的摘要非十六进制：无法恢复"
+            return 1 ;;
+    esac
+
+    # 2. WAS THE BOUNDARY ACTUALLY CROSSED? A captured prestate is not a licence
+    #    to overwrite the live database. Most forward-apply failures happen
+    #    before the candidate ever boots -- and while it never booted, the OLD
+    #    Monitor stayed up the whole time, writing valid history this snapshot
+    #    cannot contain. Restoring blindly would delete rows this transaction
+    #    never produced: a data loss the deployment failure did not ask for.
+    #
+    #    The schema move changes the declared version, the schema-SQL digest and
+    #    the table set together and only ever forward, so a live file that still
+    #    matches all three has NOT been moved by this transaction, and there is
+    #    nothing here to undo. CONTENT is deliberately absent from that test --
+    #    the rows written after capture are exactly what it protects.
+    #
+    #    Whatever this branch cannot prove falls through to the restoration
+    #    below: an unreadable live file, a shape that moved. "Cannot rule out
+    #    that the migration committed" is precisely when recovery is required.
+    local live_now live_now_declared
+    if live_now="$(sbmon_history_db_probe "$db")"; then
+        live_now_declared="$(printf '%s\n' "$live_now" | sbmon_kv DECLARED)"
+        if [ "$live_now_declared" = "$want_declared" ] \
+           && [ "$(printf '%s\n' "$live_now" | sbmon_kv SCHEMA_SHA)" = "$want_schema" ] \
+           && [ "$(printf '%s\n' "$live_now" | sbmon_kv TABLES)" = "$want_tables" ]; then
+            sbmon_info "History 预状态未被使用：活动数据库仍是捕获时记录的形状（v$want_declared），本事务从未跨越 schema 边界；捕获之后写入的历史行全部保留，未做任何替换（快照留在 $SBMON_PRE_DB_BACKUP）"
+            return 0
+        fi
+        sbmon_warn "活动 history 数据库已被本事务前推到 v$live_now_declared（捕获时为 v$want_declared）：跨越已发生，恢复迁移前预状态"
+    else
+        sbmon_warn "活动 history 数据库无法只读探测：无法证明本事务未跨越 schema 边界，按需要恢复处理"
+    fi
+
+    # 3. quiesce BEFORE the file is replaced: a live writer underneath a
+    #    replaced database is exactly the torn image the snapshot exists to
+    #    avoid. Only reached when the boundary really was crossed.
+    if sbmon_service_active; then
+        if ! sbmon_service_stop; then
+            sbmon_warn "history 预状态恢复：candidate Monitor 停止失败（绝不带着运行中的 writer 替换数据库）"
+            return 1
+        fi
+        if sbmon_service_active; then
+            sbmon_warn "history 预状态恢复：candidate Monitor 停止后仍在运行"
+            return 1
+        fi
+    fi
+
+    if [ ! -f "$SBMON_PRE_DB_BACKUP" ]; then
+        sbmon_warn "history 预状态介质缺失（$SBMON_PRE_DB_BACKUP）：无法恢复"
+        return 1
+    fi
+
+    # 4. the artifact must still BE the validated snapshot
+    local snap_probe
+    if ! snap_probe="$(sbmon_history_db_probe "$SBMON_PRE_DB_BACKUP")"; then
+        sbmon_warn "history 预状态快照已不可用（quick_check/schema）：无法恢复"
+        return 1
+    fi
+    if [ "$(printf '%s\n' "$snap_probe" | sbmon_kv SCHEMA_SHA)" != "$want_schema" ] \
+       || [ "$(printf '%s\n' "$snap_probe" | sbmon_kv DECLARED)" != "$want_declared" ] \
+       || [ "$(printf '%s\n' "$snap_probe" | sbmon_kv CONTENT_SHA)" != "$want_content" ] \
+       || [ "$(printf '%s\n' "$snap_probe" | sbmon_kv TABLES)" != "$want_tables" ]; then
+        sbmon_warn "history 预状态快照与元数据记录的迁移前形状/内容不符：拒绝用它覆盖当前数据库"
+        return 1
+    fi
+
+    # 5. atomic in-place replacement with the production owner/mode
+    local dir tmp
+    dir="$(dirname -- "$db")" || return 1
+    [ -d "$dir" ] || { sbmon_warn "history 数据库目录不存在（$dir）：无法恢复"; return 1; }
+    tmp="$(mktemp "$dir/.history-prestate.XXXXXX")" || {
+        sbmon_warn "history 恢复临时文件创建失败（$dir）"; return 1
+    }
+    if ! cp -- "$SBMON_PRE_DB_BACKUP" "$tmp"; then
+        rm -f -- "$tmp"
+        sbmon_warn "history 预状态快照复制失败：未替换当前数据库"
+        return 1
+    fi
+    if ! chmod -- "$want_mode" "$tmp"; then
+        rm -f -- "$tmp"
+        sbmon_warn "history 恢复权限设置失败（$want_mode）：未替换当前数据库"
+        return 1
+    fi
+    # Fixture runs (non-root dev hosts) cannot own the file as the service
+    # user; the real owner/mode restoration is proven by the root Linux pass,
+    # exactly like every other metadata step in this library.
+    if [ "$SBMON_FIXTURE" != "1" ]; then
+        if ! chown -- "$want_owner:$want_group" "$tmp"; then
+            rm -f -- "$tmp"
+            sbmon_warn "history 恢复属主设置失败（$want_owner:$want_group）：未替换当前数据库"
+            return 1
+        fi
+    fi
+    # A journal left next to a REPLACED database would roll the candidate's
+    # migration forward into the restored file. These sidecars belong to THIS
+    # database path and to nothing else; no other state file is touched.
+    if ! rm -f -- "$db-journal" "$db-wal" "$db-shm"; then
+        rm -f -- "$tmp"
+        sbmon_warn "history 数据库附属 journal 清理失败：拒绝在残留 sidecar 下恢复"
+        return 1
+    fi
+    if ! mv -f -- "$tmp" "$db"; then
+        rm -f -- "$tmp"
+        sbmon_warn "history 数据库原子替换失败（rename）：当前数据库未被覆盖或仍是候选版本"
+        return 1
+    fi
+
+    # 6. prove the live file IS the prestate, or the restore did not happen
+    local live_probe
+    if ! live_probe="$(sbmon_history_db_probe "$db")"; then
+        sbmon_warn "恢复后的 history 数据库无法只读探测：无法证明事务前状态已就位"
+        return 1
+    fi
+    if [ "$(printf '%s\n' "$live_probe" | sbmon_kv SCHEMA_SHA)" != "$want_schema" ] \
+       || [ "$(printf '%s\n' "$live_probe" | sbmon_kv DECLARED)" != "$want_declared" ] \
+       || [ "$(printf '%s\n' "$live_probe" | sbmon_kv CONTENT_SHA)" != "$want_content" ] \
+       || [ "$(printf '%s\n' "$live_probe" | sbmon_kv TABLES)" != "$want_tables" ]; then
+        sbmon_warn "恢复后的 history 数据库与迁移前形状/内容不符：拒绝宣称回滚完成"
+        return 1
+    fi
+    local got_owner got_group got_mode
+    got_owner="$(stat -c '%U' "$db" 2>/dev/null)" || got_owner=""
+    got_group="$(stat -c '%G' "$db" 2>/dev/null)" || got_group=""
+    got_mode="$(stat -c '%a' "$db" 2>/dev/null)" || got_mode=""
+    if [ "$((8#${got_mode:-0}))" != "$((8#$want_mode))" ]; then
+        sbmon_warn "恢复后的 history 数据库权限不符（want=$want_mode got=$got_mode）"
+        return 1
+    fi
+    if [ "$SBMON_FIXTURE" != "1" ] \
+       && { [ "$got_owner" != "$want_owner" ] || [ "$got_group" != "$want_group" ]; }; then
+        sbmon_warn "恢复后的 history 数据库属主不符（生产恢复契约要求 $want_owner:$want_group）"
+        return 1
+    fi
+    # shellcheck disable=SC2034  # consumed by the caller (install-monitor.sh)
+    SBMON_PRE_DB_RESTORED=1
+    sbmon_warn "History 数据库已恢复到事务前状态（schema v$want_declared，形状与内容摘要验证通过）"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # PR-3B (#33): History schema compatibility -- the rollback gate's two inputs
 # ---------------------------------------------------------------------------
 # The v3 history schema ADDS a table, and EVERY pre-v3 Monitor build refuses a
@@ -1101,11 +1622,20 @@ sbmon_rollback_schema_gate() { # <target-id> -> rc
             return 1 ;;
     esac
     if [ "$live" -gt "$want" ]; then
-        sbmon_warn "回滚目标 $target 声明 history schema v$want，当前数据库为 v$live：该 release 无法读取现有历史库（运行期会 fail-closed 停写），拒绝回滚"
+        # The transaction's own pre-migration snapshot is the ONE legitimate
+        # way back to that schema, and it is retained on purpose -- but this
+        # command never applies it: restoring durable history is an operator
+        # decision, not a side effect of a rollback button. The refusal itself
+        # is shared with the install door (see sbmon_history_downgrade_refusal
+        # above), which is what stops --allow-downgrade from being a way around
+        # this gate.
+        sbmon_history_downgrade_refusal rollback "$target" "$want" "$live"
         return 1
     fi
     return 0
 }
+
+
 
 sboxjr_log() { printf '[sbjr-deploy] %s\n' "$*"; }
 sboxjr_warn() { printf '[sbjr-deploy] WARNING: %s\n' "$*" >&2; }
