@@ -820,13 +820,13 @@ def group_schema():
     # fresh creation is v4 immediately, with the ONE probe table and the
     # two incident tables riding along (PR-4B)
     h = tmp_history("fresh")
-    out["module_schema_version_4"] = SCHEMA_VERSION == 4
-    out["fresh_claim_is_4"] = claim(db_path(h)) == "4"
-    out["fresh_shape_exact_v4"] = table_set(db_path(h)) == {
+    out["module_schema_version_5"] = SCHEMA_VERSION == 5
+    out["fresh_claim_is_5"] = claim(db_path(h)) == "5"
+    out["fresh_shape_exact_v5"] = table_set(db_path(h)) == {
         "meta", "timeline_samples", "device_protocol_states", "journal_runs",
         "journal_events", "journal_ingest_audit", "journal_ingest_state",
         "network_probe_samples", "incident_windows",
-        "incident_runtime_state"}
+        "incident_runtime_state", "operator_markers"}
     conn = sqlite3.connect(db_path(h))
     out["probe_indexes_present"] = {row[0] for row in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='index'"
@@ -859,7 +859,7 @@ def group_schema():
     d, path = v1_file()
     before = open(path, "rb").read()
     h1 = tmp_history("v1", root=d)
-    out["v1_migrated_to_4"] = claim(path) == "4"
+    out["v1_migrated_to_5"] = claim(path) == "5"
     out["v1_probe_table_created"] = "network_probe_samples" in table_set(path)
     conn = sqlite3.connect(path)
     out["v1_rows_survived"] = conn.execute(
@@ -879,7 +879,7 @@ def group_schema():
     # v2 -> v4: the probe + incident tables land, the v2 audit row untouched
     d2, path2 = v2_file()
     h2 = tmp_history("v2", root=d2)
-    out["v2_migrated_to_4"] = claim(path2) == "4"
+    out["v2_migrated_to_5"] = claim(path2) == "5"
     conn = sqlite3.connect(path2)
     out["v2_rows_survived"] = conn.execute(
         "SELECT COUNT(*) FROM journal_ingest_audit"
@@ -914,7 +914,7 @@ def group_schema():
         "network_probe_samples" not in table_set(path3))
     h3 = tmp_history("after-crash", root=d3)
     out["crash_recovers_by_remigrating"] = (
-        claim(path3) == "4" and "network_probe_samples" in table_set(path3))
+        claim(path3) == "5" and "network_probe_samples" in table_set(path3))
     h3.close()
 
     # THE ROLLBACK RUNG: a pre-v4 build meeting a v4 file refuses it through
@@ -1130,7 +1130,7 @@ def group_retention():
     conn.close()
     out["prune_source_list_names_probe_table"] = (
         ("network_probe_samples", "epoch") in IH._PRUNE_SOURCES)
-    out["prune_sources_are_five"] = len(IH._PRUNE_SOURCES) == 5
+    out["prune_sources_are_six"] = len(IH._PRUNE_SOURCES) == 6
 
     # the newest kept ok row IS the baseline: pruning old evidence never
     # invents a change event

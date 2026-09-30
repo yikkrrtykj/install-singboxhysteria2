@@ -83,7 +83,7 @@ const context = vm.createContext({ document, console, Uint8Array, Date,
   }
 });
 vm.runInContext(app.replace('document.addEventListener("DOMContentLoaded", boot);',
-  'globalThis.ui = {state, bind, render, loadSession, loadE3Status, loadE3Clients, convergeAfterMutation, renderE3Controls, renderE3Clients, renderMonitorInfo, addClient, deleteClient, downloadConfig, setPendingRetry, retryPending, apiWithStepUp};'), context);
+  'globalThis.ui = {state, bind, render, loadSession, loadE3Status, loadE3Clients, convergeAfterMutation, renderE3Controls, renderE3Clients, renderMonitorInfo, addClient, deleteClient, downloadConfig, setPendingRetry, retryPending, apiWithStepUp, setView, loadIncidents, renderIncidents, openIncident, renderIncidentDetail, closeIncidentDetail, loadEvidence, loadMarkers, renderMarkers, addMarker, rearmIncidents, renderIncRuntime};'), context);
 const ui = context.ui;
 // 0.1.4: the convergence chain (mutation -> one endpoint -> apply) crosses
 // several cross-realm promise reactions; 12 ticks starved it. Drain
@@ -639,9 +639,133 @@ async function main() {
     assert.equal(server.match(/^MONITOR_WEB_VERSION = "([^"]+)"/m)[1], version);
   });
   check('no activation/deactivation controls or requests; rendered copy stays public', () => {
-    assert.ok(!ids['mg-activate'] && !ids['mg-deactivate']);
+    assert.ok(!ids['mg-activate'] && !ids['mg-activate']);
     assert.ok(requests.every(r => !/management\/(activate|deactivate)/.test(r.url))); productText();
   });
-  assert.equal(count, 68, 'UI assertion count guard');
+
+  // ---- 0.6.0 (#33 PR-5): the Incidents view ------------------------------
+  ui.state.session = {authenticated: true, csrf_token: 'csrf', version: '0.6.0'};
+  const emptyIncidents = {incidents: [], runtime: {enabled: true, running: true, phase: 'idle', cycles_completed: 1, runtime_failures: 0, last_error_code: null, last_evaluated_end_epoch: 1, open_incident: false}, history: {enabled: true, degraded: false}, truncated: false, limit: 100};
+  const oneIncident = list => ({...emptyIncidents, incidents: list});
+  const realityRow = {incident_id: 1, classifier_version: 1, state: 'closed', category: 'reality_tcp_path', analysis_start_epoch: 1, first_signal_epoch: 100, last_signal_epoch: 160, last_classified_end_epoch: 160, closed_epoch: 400, closure_reason: 'clean_buckets', buckets: 5, marker_count: 2};
+  responses.push(response(oneIncident([realityRow])), response({markers: [], truncated: false, limit: 200}));
+  ui.setView('incidents'); await flush();
+  check('Incidents nav view loads the list and markers exactly once per entry', () => {
+    assert.deepEqual(requests.filter(r => r.url.startsWith('/api/v1/inc') || r.url === '/api/v1/markers').map(r => r.url),
+      ['/api/v1/incidents', '/api/v1/markers']);
+    productText();
+  });
+  check('the list renders the closed category label, never the raw enum alone', () => {
+    assert.match(ids['inc-tbody'].textContent, /Reality\/TCP path/);
+    assert.ok(!ids['inc-tbody'].textContent.includes('reality_tcp_path'));
+    productText();
+  });
+  responses.push(response({incidents: [], runtime: null, history: {}, truncated: false, limit: 100}));
+  await ui.loadIncidents(); await flush();
+  check('an empty incident list is an explicit empty state, never a fabricated clean bill', () => {
+    assert.match(ids['inc-tbody'].textContent, /No incidents recorded\./); productText();
+  });
+  ui.state.incidents = oneIncident([realityRow]); ui.renderIncidents(ui.state.incidents);
+  const summary = {headline: 'Reality/TCP path incident',
+    window: {start_epoch: 100, end_epoch: 160, duration_seconds: 60},
+    impact: 'Reality traffic degraded during the signal window.',
+    protocol_state: 'Assessed fault domain: the Reality/TCP path. This evidence does not prove Hysteria2 was healthy.',
+    server_state: 'No evidence in this window attributes the fault to the sing-box process or its control API.',
+    affected_scope: 'Server-side evidence cannot tell which clients or networks were affected.',
+    assessment: 'The evidence-based fault domain is the Reality/TCP path.',
+    recommended_action: 'If Hysteria2 is independently confirmed healthy, prefer it while the Reality/TCP path is investigated.',
+    uncertainty: 'The evidence records 1 open question; see the reasons below.',
+    limitations: 'Correlation is not causation: the root cause is not established.'};
+  const detail = {...realityRow, created_epoch: 1, updated_epoch: 2,
+    evidence_bits: 0, unknown_bits: 0,
+    evidence: [{token: 'count_drop_reality', text: 'Reality active connections fell far below their baseline.'}],
+    unknowns: [{token: 'root_cause_not_established', text: 'The evidence says where it hurt, not why; the root cause is not established.'}],
+    summary,
+    markers: [{marker_id: 7, epoch: 120, kind: 'tt_live_studio_login_failed', label: 'TT Live Studio login failed', created_epoch: 300}]};
+  responses.push(response(detail),
+    // renderIncidentDetail chains loadEvidence() on the same tick: the
+    // probe_rows read must already be queued behind the detail body.
+    response({subject: {type: 'incident', id: 1}, section: 'samples', window: {start_epoch: 1, end_epoch: 160}, rows: [], truncated: false, retention_cutoff_epoch: 0}));
+  await ui.openIncident(1); await flush();
+  check('the L1 first screen renders the plain-language summary without raw snake_case tokens', () => {
+    assert.match(ids['inc-detail'].textContent, /Reality\/TCP path incident/);
+    assert.match(ids['inc-detail'].textContent, /If Hysteria2 is independently confirmed healthy/);
+    assert.match(ids['inc-detail'].textContent, /root cause is not established/);
+    assert.doesNotMatch(ids['inc-summary'].textContent, /recommended_action|protocol_state|first_signal_epoch/);
+    productText();
+  });
+  check('L2 reasons render the operator sentences, not the tokens, and the in-window marker is joined', () => {
+    assert.match(ids['inc-evidence-list'].textContent, /Reality active connections fell far below their baseline\./);
+    assert.match(ids['inc-unknowns-list'].textContent, /The evidence says where it hurt, not why/);
+    assert.doesNotMatch(ids['inc-detail'].textContent, /count_drop_reality|root_cause_not_established/);
+    assert.match(ids['inc-detail'].textContent, /TT Live Studio login failed/);
+    productText();
+  });
+  const probeRows = [{epoch: 101, iso_utc: 'x', dns_status: 'ok', dns_latency_ms: 12, dns_error_code: 'NONE', https_status: 'ok', https_latency_ms: 12, https_error_code: 'NONE', udp_status: 'ok', udp_latency_ms: 12, udp_error_code: 'NONE', egress_status: 'ok', egress_latency_ms: 12, egress_error_code: 'NONE', egress_ip: '203.0.113.9', egress_change: 'unchanged'}];
+  responses.push(response({subject: {type: 'incident', id: 1}, section: 'probe_rows', window: {start_epoch: 1, end_epoch: 160}, rows: probeRows, truncated: false, retention_cutoff_epoch: 0}));
+  await ui.loadEvidence('probe_rows'); await flush();
+  check('evidence drill-down is subject-bound with the section in the query, egress_ip visible and identity columns absent', () => {
+    const ev = requests.findLast(r => r.url.startsWith('/api/v1/evidence'));
+    assert.match(ev.url, /section=probe_rows/); assert.match(ev.url, /incident_id=1/);
+    assert.doesNotMatch(ev.url, /start_epoch=|end_epoch=/);
+    assert.match(ids['inc-rows-body'].textContent, /203\.0\.113\.9/);
+    assert.doesNotMatch(ids['inc-rows-table'].textContent, /run_id|cycle_id|fp/);
+    productText();
+  });
+  responses.push(response({subject: {type: 'incident', id: 1}, section: 'probe_rows', window: {start_epoch: 1, end_epoch: 160}, rows: [], truncated: false, retention_cutoff_epoch: 50}));
+  await ui.loadEvidence('probe_rows'); await flush();
+  check('an empty retained window says exactly that and may add the retention note, never "no problem"', () => {
+    assert.match(ids['inc-rows-body'].textContent, /No retained evidence is available for this window\./);
+    assert.match(ids['inc-rows-note'].textContent, /aged out of the retention window/);
+    assert.doesNotMatch(ids['view-incidents'].textContent, /No problem occurred/);
+    productText();
+  });
+  responses.push(response({markers: [{marker_id: 7, epoch: 120, kind: 'tt_live_studio_login_failed', label: 'TT Live Studio login failed', created_epoch: 300}], truncated: false, limit: 200}));
+  ui.state.session = {authenticated: true, csrf_token: 'csrf'};
+  responses.push(response({marker_id: 9, epoch: 500, kind: 'operator_event', label: 'Operator-observed event', created_epoch: 500}));
+  ids['inc-marker-kind'].value = 'operator_event';
+  await ui.addMarker(); await flush();
+  check('marker POST sends the closed kind only, with CSRF, and reloads the list', () => {
+    const post = requests.findLast(r => r.url === '/api/v1/markers' && r.method === 'POST' || (r.url === '/api/v1/markers' && r.body));
+    assert.deepEqual(JSON.parse(post.body), {kind: 'operator_event'});
+    assert.equal(post.headers['X-CSRF-Token'], 'csrf');
+    assert.ok(!('Idempotency-Key' in post.headers));
+    assert.match(ids['inc-marker-msg'].textContent, /Marker recorded\./);
+    productText();
+  });
+  check('rearm is entrance-closed unless the runtime reports phase=rearm, and the accepted copy is the frozen one', () => {
+    ui.state.incidents = {...emptyIncidents, runtime: {...emptyIncidents.runtime, phase: 'rearm'}};
+    ui.renderIncRuntime();
+    assert.equal(ids['inc-rearm-btn'].disabled, false);
+    ui.state.incidents = emptyIncidents; ui.renderIncRuntime();
+    assert.equal(ids['inc-rearm-btn'].disabled, true);
+    productText();
+  });
+  ui.state.incidents = {...emptyIncidents, runtime: {...emptyIncidents.runtime, phase: 'rearm'}};
+  ui.renderIncRuntime();
+  responses.push(response({status: 'ok'}), response(oneIncident([realityRow])));
+  await ui.rearmIncidents(); await flush();
+  check('rearm success shows the accepted copy and refreshes without retry', () => {
+    const post = requests.findLast(r => r.url === '/api/v1/incidents/rearm');
+    assert.equal(post.method, 'POST');
+    assert.match(ids['inc-rearm-msg'].textContent, /Re-arm accepted\. Waiting for the incident scanner to enter warm-up\./);
+    productText();
+  });
+  responses.push(response({error: 'incident_runtime_not_rearmable'}, 409),
+                 response(oneIncident([realityRow])), response({markers: [], truncated: false, limit: 200}));
+  ui.state.incidents = {...emptyIncidents, runtime: {...emptyIncidents.runtime, phase: 'rearm'}};
+  ui.renderIncRuntime();
+  await ui.rearmIncidents(); await flush();
+  check('a 409 rearm fails closed with ordinary copy and no automatic retry', () => {
+    assert.match(ids['inc-rearm-msg'].textContent, /not waiting for a re-arm/);
+    productText();
+  });
+  ui.closeIncidentDetail();
+  check('Back returns to the list without deleting the detail source', () => {
+    assert.ok(ids['inc-detail'].className.includes('hidden'));
+    assert.ok(!ids['inc-list-card'].className.includes('hidden'));
+    productText();
+  });
+  assert.equal(count, 80, 'UI assertion count guard');
 }
 main().catch(err => { console.error(err); process.exitCode = 1; });

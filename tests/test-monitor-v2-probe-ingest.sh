@@ -163,12 +163,12 @@ assert ih.PROBE_LATENCY_MAX_MS > engine.CYCLE_DEADLINE_SECONDS * 1000
 assert ih.PROBE_LATENCY_MAX_MS < 3_600_000
 assert ih.PROBE_CYCLE_FRESHNESS_SECONDS > engine.CYCLE_DEADLINE_SECONDS
 assert ih.PROBE_EGRESS_BASELINE_WINDOW_SECONDS == ih.RETENTION_SECONDS
-assert ih.SCHEMA_VERSION == 4
+assert ih.SCHEMA_VERSION == 5
 assert ("network_probe_samples", "epoch") in ih._PRUNE_SOURCES
-assert len(ih._PRUNE_SOURCES) == 5
+assert len(ih._PRUNE_SOURCES) == 6
 EOF
 then
-    pass "probe bounds + v4 retention membership are coherent"
+    pass "probe bounds + v5 retention membership are coherent"
 else
     fail "a probe bound is incoherent with the engine or retention"
 fi
@@ -363,6 +363,7 @@ make_release() { # <id> <SCHEMA_VERSION value | none>
 make_release v2 2
 make_release v3 3
 make_release v4 4
+make_release v5 5
 make_release prehistory none
 
 seed_db() { # <value | nometa | garbage>
@@ -466,15 +467,15 @@ assert h.health()["enabled"], h.health()
 h.close()
 PY
 then
-    pass "the module under review still builds a v4 database at the live path"
+    pass "the module under review still builds a v5 database at the live path"
 else
-    fail "could not build a real v4 database for the rollback gate"
+    fail "could not build a real v5 database for the rollback gate"
 fi
-assert_eq "$(live_reader)" "4" "the gate's live reader parses the production meta row"
+assert_eq "$(live_reader)" "5" "the gate's live reader parses the production meta row"
+run_gate v5
+assert_eq "$RB_RC" "0" "real v5 database -> a v5 target is allowed"
 run_gate v4
-assert_eq "$RB_RC" "0" "real v4 database -> a v4 target is allowed"
-run_gate v3
-assert_eq "$RB_RC" "1" "real v4 database -> a v3 target is refused (the shipped v4 tables are unreadable there)"
+assert_eq "$RB_RC" "1" "real v5 database -> a v4 target is refused (the shipped v5 tables are unreadable there)"
 
 rm -f "$DB"
 run_gate v4
@@ -640,12 +641,12 @@ then
 else
     fail "the harness has a non-loopback socket call site"
 fi
-assert_eq '0.5.0' "$(cat "$ROOT/monitor-v2/VERSION")" \
-    "VERSION is 0.5.0 (the release-prep bump this PR ships)"
-if grep -q 'MONITOR_WEB_VERSION = "0.5.0"' "$SERVER_PY"; then
-    pass "MONITOR_WEB_VERSION is 0.5.0"
+assert_eq '0.6.0' "$(cat "$ROOT/monitor-v2/VERSION")" \
+    "VERSION is 0.6.0 (the incidents-UI release)"
+if grep -q 'MONITOR_WEB_VERSION = "0.6.0"' "$SERVER_PY"; then
+    pass "MONITOR_WEB_VERSION is 0.6.0"
 else
-    fail "MONITOR_WEB_VERSION moved off 0.5.0"
+    fail "MONITOR_WEB_VERSION moved off 0.6.0"
 fi
 if grep -q 'test-monitor-v2-probe-ingest.sh' "$ROOT/.github/workflows/tests.yml" \
     && grep -q 'bash -n tests/test-monitor-v2-probe-ingest.sh' \

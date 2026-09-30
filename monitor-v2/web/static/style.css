@@ -236,6 +236,16 @@ input[type="text"], input[type="password"] {
 
 .empty { color: var(--muted); padding: 14px; }
 
+/* ---- incidents (0.6.0, #33 PR-5) ---- */
+.inc-reason-list { margin: 0 0 10px; padding-left: 20px; }
+.inc-reason-list li { padding: 3px 0; font-size: 0.9rem; }
+#inc-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 10px 22px; }
+#inc-summary .kv .v { font-size: 0.92rem; }
+#inc-rows-table { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.76rem; }
+#inc-marker-kind { cursor: pointer; }
+#inc-detail-title { font-size: 1rem; margin: 0; }
+#inc-tbody tr { cursor: pointer; }
+
 /* ---- responsive ---- */
 @media (max-width: 860px) {
   .app { flex-direction: column; }

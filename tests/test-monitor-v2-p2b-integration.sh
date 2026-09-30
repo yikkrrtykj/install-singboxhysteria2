@@ -280,7 +280,7 @@ assert_eq "$EDGE" "OK" "incident_history imports ONLY ingest_contract + schema (
 # No user-facing surface may carry an absolute production path: the web layer
 # still has ZERO journal references, and journal_status() keeps its fixed
 # sanitized key set.
-assert_eq "$(grep -c 'journal' "$SERVER_PY")" "0" "web/server.py exposes no journal surface (no path can leak through the API)"
+assert_eq "$(grep -c 'journal_status' "$SERVER_PY")" "0" "web/server.py exposes no journal ingest surface (P5 evidence rows are closed whitelists, never the ingest plane)"
 HK="$("$PY" - "$HIST_PY" <<'EOF'
 import re, sys
 src = open(sys.argv[1], encoding="utf-8").read()
@@ -316,7 +316,7 @@ assert_grep "$SERVER_PY" '_require_step_up\(self\._handle_e3_export\)' "#51: exp
 # still trips it.
 assert_eq "$(grep -c '^SCHEMA_VERSION = [0-9]$' "$HIST_PY")" "1" \
     "history declares its schema version in exactly one place"
-assert_eq "$(grep -o '^SCHEMA_VERSION = [0-9]*' "$HIST_PY" | grep -c '= 4$')" "1" \
+assert_eq "$(grep -o '^SCHEMA_VERSION = [0-9]*' "$HIST_PY" | grep -c '= 5$')" "1" \
     "history schema is exactly the reviewed v4 (PR-4B moved it from v3)"
 
 # ===========================================================================

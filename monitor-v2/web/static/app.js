@@ -1,9 +1,13 @@
-/* sing-box Monitor — Phase E2 dashboard logic (vanilla JS, no dependencies).
+/* sing-box Monitor — dashboard logic (vanilla JS, no dependencies).
  *
- * Data source: the E1 snapshot ONLY (GET /api/v1/snapshot + SSE stream).
- * Stale semantics are inherited verbatim: when snapshot.stale is true the
- * last state keeps being rendered and an explicit banner says so — the
- * dashboard never fakes zeros, never clears devices, never invents CLOSED.
+ * Data sources: the E1 snapshot (GET /api/v1/snapshot + SSE stream) and,
+ * since 0.6.0 (#33 PR-5), the closed incidents read family
+ * (/api/v1/incidents*, /api/v1/evidence, /api/v1/markers). The timeline
+ * endpoint is NOT consumed here. Stale semantics are inherited verbatim:
+ * when snapshot.stale is true the last state keeps being rendered and an
+ * explicit banner says so — the dashboard never fakes zeros, never clears
+ * devices, never invents CLOSED. All dynamic values are rendered through
+ * textContent / DOM node APIs; no dynamic innerHTML anywhere.
  */
 (function () {
   "use strict";
@@ -15,6 +19,23 @@
   var CLIENT_UNAVAILABLE = "Client management is temporarily unavailable. Check the server before making changes.";
   var RESULT_UNCONFIRMED = "The result is not confirmed yet. Refresh the client list before retrying. Do not start another change until the current state is confirmed.";
 
+  /* ---------- incidents (0.6.0, #33 PR-5) ---------- */
+
+  // The six emittable categories' display names (the frozen 6-entry
+  // presentation enum; the 45/28 token vocabularies are NOT mirrored
+  // here -- the server decodes those, and this file holds no token copy).
+  var CATEGORY_LABELS = {
+    "reality_tcp_path": "Reality/TCP path",
+    "hysteria2_udp_path": "Hysteria2/UDP path",
+    "vps_outbound": "VPS outbound",
+    "vps_process_or_api": "sing-box process / API",
+    "common_inbound_client_office": "Common inbound / client-office",
+    "insufficient_evidence": "Insufficient evidence"
+  };
+  var INC_EMPTY_EVIDENCE = "No retained evidence is available for this window.";
+  var INC_RETENTION_NOTE = "Some evidence may have aged out of the retention window.";
+  var INC_REARM_ACCEPTED = "Re-arm accepted. Waiting for the incident scanner to enter warm-up.";
+
   var state = {
     snapshot: null,
     session: null,
@@ -24,7 +45,10 @@
     es: null,
     esGeneration: 0,
     lastSnapshotAt: 0,
-    lastVersion: 0
+    lastVersion: 0,
+    incidents: null,
+    selectedIncidentId: null,
+    incSection: "samples"
   };
 
   function $(id) { return document.getElementById(id); }
@@ -47,6 +71,15 @@
   function fmtTime(iso) {
     if (!iso) return "—";
     var d = new Date(iso);
+    if (isNaN(d.getTime())) return "—";
+    var today = new Date();
+    var sameDay = d.toDateString() === today.toDateString();
+    var time = d.toLocaleTimeString();
+    return sameDay ? time : d.toLocaleDateString() + " " + time;
+  }
+  function fmtEpoch(seconds) {
+    if (seconds === null || seconds === undefined || isNaN(seconds)) return "—";
+    var d = new Date(Number(seconds) * 1000);
     if (isNaN(d.getTime())) return "—";
     var today = new Date();
     var sameDay = d.toDateString() === today.toDateString();
@@ -231,7 +264,8 @@
   /* ---------- views ---------- */
 
   var VIEW_TITLES = { overview: "Overview", devices: "Devices",
-                      connections: "Connections", settings: "Settings" };
+                      connections: "Connections", incidents: "Incidents",
+                      settings: "Settings" };
 
   function setView(name) {
     state.view = name;
@@ -247,6 +281,10 @@
       loadAccess();
       loadE3Status();
       loadE3Clients();
+    }
+    if (name === "incidents") {
+      loadIncidents();
+      loadMarkers();
     }
   }
 
@@ -426,6 +464,303 @@
     $("mi-started").textContent = fmtTime(snap.monitor_started_at);
     $("mi-uptime").textContent = fmtUptime(snap.collector_uptime_seconds);
     if (snap.last_error) show($("mi-warning")); else hide($("mi-warning"));
+  }
+
+  /* ---------- incidents view (0.6.0, #33 PR-5) ---------- */
+
+  function incMessage(text, isError) {
+    var el = $("inc-marker-msg");
+    el.textContent = text;
+    el.className = "form-msg " + (isError ? "error" : "ok");
+    show(el);
+  }
+
+  function rearmMessage(text, isError) {
+    var el = $("inc-rearm-msg");
+    el.textContent = text;
+    el.className = "form-msg " + (isError ? "error" : "ok");
+    show(el);
+  }
+
+  function renderIncRuntime() {
+    var chip = $("inc-runtime");
+    var rearm = $("inc-rearm-btn");
+    var runtime = state.incidents ? state.incidents.runtime : null;
+    if (!runtime || !runtime.enabled) {
+      setChip(chip, "Scanner", "dark", "unknown");
+    } else {
+      setChip(chip, "Scanner", runtime.phase,
+              runtime.phase === "degraded" ? "bad" : "ok");
+    }
+    // Server-side precondition mirror (#63 R2 §10): the re-arm entrance
+    // only exists while the scanner reports the rearm phase. The server
+    // re-checks everything atomically; a stale view gets a closed 409.
+    var rearmable = !!runtime && runtime.enabled === true &&
+      runtime.running === true && runtime.phase === "rearm";
+    rearm.disabled = !rearmable;
+  }
+
+  function loadIncidents() {
+    if (!state.session || !state.session.authenticated) return;
+    return api("/api/v1/incidents").then(function (data) {
+      state.incidents = data;
+      renderIncRuntime();
+      renderIncidents(data);
+    }).catch(function (error) {
+      if (error.status === 401) { showLogin("Session expired — please log in again."); return; }
+      var body = $("inc-tbody");
+      body.textContent = "";
+      var row = body.insertRow(-1);
+      var cell = row.insertCell(-1);
+      cell.colSpan = 7;
+      cell.textContent = "Incident list unavailable.";
+    });
+  }
+
+  function renderIncidents(data) {
+    var tbody = $("inc-tbody");
+    tbody.textContent = "";
+    var incidents = (data && data.incidents) || [];
+    incidents.forEach(function (incident) {
+      var tr = document.createElement("tr");
+      var stateCell = document.createElement("td");
+      var badge = document.createElement("span");
+      badge.className = "badge " + (incident.state === "open" ? "active" : "idle");
+      badge.textContent = incident.state;
+      stateCell.appendChild(badge);
+      tr.appendChild(stateCell);
+      tr.appendChild(cellText(CATEGORY_LABELS[incident.category] || incident.category));
+      tr.appendChild(cellText(fmtEpoch(incident.first_signal_epoch)));
+      tr.appendChild(cellText(fmtEpoch(incident.last_signal_epoch)));
+      tr.appendChild(cellText(fmtUptime(incident.last_signal_epoch - incident.first_signal_epoch), "num"));
+      tr.appendChild(cellText(String(incident.buckets), "num"));
+      tr.appendChild(cellText(String(incident.marker_count), "num"));
+      tr.addEventListener("click", function () { openIncident(incident.incident_id); });
+      tbody.appendChild(tr);
+    });
+    if (!incidents.length) {
+      var row = tbody.insertRow(-1);
+      var cell = row.insertCell(-1);
+      cell.colSpan = 7;
+      cell.textContent = "No incidents recorded.";
+    }
+  }
+
+  function openIncident(id) {
+    if (!state.session || !state.session.authenticated) return;
+    return api("/api/v1/incidents/" + id).then(function (detail) {
+      state.selectedIncidentId = id;
+      renderIncidentDetail(detail);
+    }).catch(function (error) {
+      if (error.status === 401) showLogin("Session expired — please log in again.");
+    });
+  }
+
+  function kvRow(key, value) {
+    var div = document.createElement("div");
+    div.className = "kv";
+    var k = document.createElement("span");
+    k.className = "k";
+    k.textContent = key;
+    var v = document.createElement("span");
+    v.className = "v";
+    v.textContent = value;
+    div.appendChild(k);
+    div.appendChild(v);
+    return div;
+  }
+
+  function reasonItems(container, pairs) {
+    container.textContent = "";
+    (pairs || []).forEach(function (pair) {
+      var li = document.createElement("li");
+      li.textContent = pair.text;   // textContent only: never the raw token as primary
+      container.appendChild(li);
+    });
+    if (!container.children.length) {
+      var li = document.createElement("li");
+      li.className = "muted";
+      li.textContent = "None recorded.";
+      container.appendChild(li);
+    }
+  }
+
+  function renderIncidentDetail(detail) {
+    hide($("inc-list-card"));
+    show($("inc-detail"));
+    var summary = detail.summary || {};
+    $("inc-detail-title").textContent = summary.headline || "Incident";
+    var box = $("inc-summary");
+    box.textContent = "";
+    var win = summary.window || {};
+    if (win.start_epoch !== undefined) {
+      box.appendChild(kvRow("Signal window",
+        fmtEpoch(win.start_epoch) + " — " + fmtEpoch(win.end_epoch) +
+        " (" + fmtUptime(win.duration_seconds) + ")"));
+    }
+    ["impact", "protocol_state", "server_state", "affected_scope",
+     "assessment"].forEach(function (key) {
+      if (summary[key]) box.appendChild(kvRow(key.replace(/_/g, " "), summary[key]));
+    });
+    if (summary.recommended_action) {
+      box.appendChild(kvRow("recommended action", summary.recommended_action));
+    }
+    if (summary.uncertainty) box.appendChild(kvRow("uncertainty", summary.uncertainty));
+    if (summary.limitations) box.appendChild(kvRow("limitations", summary.limitations));
+    // The in-window operator markers, joined server-side (#63 R2 §4):
+    // closed labels only, never the detail's own free text.
+    if ((detail.markers || []).length) {
+      box.appendChild(kvRow("operator markers",
+        detail.markers.map(function (m) { return m.label || m.kind; })
+                      .join("; ")));
+    }
+    reasonItems($("inc-evidence-list"), detail.evidence);
+    reasonItems($("inc-unknowns-list"), detail.unknowns);
+    loadEvidence(state.incSection);
+  }
+
+  function closeIncidentDetail() {
+    state.selectedIncidentId = null;
+    hide($("inc-detail"));
+    show($("inc-list-card"));
+  }
+
+  function loadEvidence(section) {
+    state.incSection = section;
+    document.querySelectorAll("#inc-sections .seg-item").forEach(function (item) {
+      item.classList.toggle("active", item.getAttribute("data-section") === section);
+    });
+    if (!state.selectedIncidentId) return;
+    var note = $("inc-rows-note");
+    hide(note);
+    return api("/api/v1/evidence?section=" + section +
+               "&incident_id=" + state.selectedIncidentId)
+      .then(function (data) {
+        renderEvidenceRows(data);
+      }).catch(function () {
+        var head = $("inc-rows-head");
+        var body = $("inc-rows-body");
+        head.textContent = "";
+        body.textContent = "";
+        var tr = body.insertRow(-1);
+        tr.insertCell(-1).textContent = INC_EMPTY_EVIDENCE;
+      });
+  }
+
+  function renderEvidenceRows(data) {
+    var head = $("inc-rows-head");
+    var body = $("inc-rows-body");
+    var note = $("inc-rows-note");
+    head.textContent = "";
+    body.textContent = "";
+    var rows = (data && data.rows) || [];
+    if (rows.length) {
+      var hr = document.createElement("tr");
+      Object.keys(rows[0]).forEach(function (key) {
+        var th = document.createElement("th");
+        th.textContent = key;
+        hr.appendChild(th);
+      });
+      head.appendChild(hr);
+    }
+    rows.forEach(function (row) {
+      var tr = document.createElement("tr");
+      Object.keys(rows[0] || {}).forEach(function (key) {
+        var value = row[key];
+        var td = document.createElement("td");
+        td.textContent = (value === null || value === undefined) ? "—" : String(value);
+        tr.appendChild(td);
+      });
+      body.appendChild(tr);
+    });
+    if (!rows.length) {
+      var tr = body.insertRow(-1);
+      tr.insertCell(-1).textContent = INC_EMPTY_EVIDENCE;
+    }
+    // Empty is NEVER "no problem occurred": the two notes only ever add
+    // uncertainty, never a clean bill of health (#63 R2 §9).
+    var notes = [];
+    if (data && data.truncated) {
+      notes.push("Showing the first 2000 rows of this section; older rows are not shown.");
+    }
+    if (data && data.window && data.retention_cutoff_epoch !== undefined &&
+        data.window.start_epoch < data.retention_cutoff_epoch) {
+      notes.push(INC_RETENTION_NOTE);
+    }
+    if (notes.length) {
+      note.textContent = notes.join(" ");
+      show(note);
+    }
+  }
+
+  function loadMarkers() {
+    if (!state.session || !state.session.authenticated) return;
+    return api("/api/v1/markers").then(function (data) {
+      renderMarkers((data && data.markers) || []);
+    }).catch(function () { /* the list stays as it was */ });
+  }
+
+  function renderMarkers(markers) {
+    var list = $("inc-markers-list");
+    list.textContent = "";
+    markers.forEach(function (marker) {
+      var li = document.createElement("li");
+      var label = document.createElement("span");
+      label.textContent = (marker.label || marker.kind) +
+        " · " + fmtEpoch(marker.epoch);
+      li.appendChild(label);
+      list.appendChild(li);
+    });
+    if (!(markers || []).length) {
+      var li = document.createElement("li");
+      li.className = "muted";
+      li.style.fontFamily = "inherit";
+      li.textContent = "No markers recorded.";
+      list.appendChild(li);
+    }
+  }
+
+  function addMarker() {
+    if (!state.session || !state.session.authenticated) return;
+    var kind = $("inc-marker-kind").value;
+    var button = $("inc-marker-add-btn");
+    button.disabled = true;   // no automatic retry; a double click would
+    apiWithStepUp("/api/v1/markers", {   // legitimately record two events
+      method: "POST",
+      body: { kind: kind }
+    }).then(function () {
+      button.disabled = false;
+      incMessage("Marker recorded.", false);
+      loadMarkers();
+    }).catch(function (error) {
+      button.disabled = false;
+      if (error.status === 401) { showLogin("Session expired — please log in again."); return; }
+      if (error.status === 400 && error.code === "invalid_marker_epoch") {
+        incMessage("The marker time is outside the retention window.", true);
+        return;
+      }
+      incMessage("The marker could not be recorded.", true);
+    });
+  }
+
+  function rearmIncidents() {
+    if (!state.session || !state.session.authenticated) return;
+    var button = $("inc-rearm-btn");
+    button.disabled = true;
+    apiWithStepUp("/api/v1/incidents/rearm", { method: "POST" })
+      .then(function () {
+        rearmMessage(INC_REARM_ACCEPTED, false);
+        loadIncidents();
+      })
+      .catch(function (error) {
+        if (error.status === 401) { showLogin("Session expired — please log in again."); return; }
+        if (error.status === 409) {
+          rearmMessage("Discovery is not waiting for a re-arm right now.", true);
+        } else {
+          rearmMessage("The re-arm could not be recorded. Do not retry automatically.", true);
+        }
+        loadIncidents();
+      });
   }
 
   /* ---------- client availability ---------- */
@@ -1208,13 +1543,27 @@
         addEntry(state.session.current_ip);
       }
     });
-    document.querySelectorAll(".seg-item").forEach(function (item) {
+    // Scoped to the connections filter: the evidence drill-down has its
+    // own .seg-item group (#inc-sections) with its own handler below.
+    document.querySelectorAll("#conn-filter .seg-item").forEach(function (item) {
       item.addEventListener("click", function () {
         state.filter = item.getAttribute("data-filter");
-        document.querySelectorAll(".seg-item").forEach(function (other) {
+        document.querySelectorAll("#conn-filter .seg-item").forEach(function (other) {
           other.classList.toggle("active", other === item);
         });
         if (state.snapshot) renderConnections(state.snapshot.connections || []);
+      });
+    });
+    $("inc-refresh-btn").addEventListener("click", function () {
+      loadIncidents();
+      loadMarkers();
+    });
+    $("inc-back-btn").addEventListener("click", closeIncidentDetail);
+    $("inc-marker-add-btn").addEventListener("click", addMarker);
+    $("inc-rearm-btn").addEventListener("click", rearmIncidents);
+    document.querySelectorAll("#inc-sections .seg-item").forEach(function (item) {
+      item.addEventListener("click", function () {
+        loadEvidence(item.getAttribute("data-section"));
       });
     });
   }
