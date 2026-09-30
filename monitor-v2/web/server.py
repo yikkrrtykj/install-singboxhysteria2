@@ -147,6 +147,47 @@ def closed_probe_counter(value):
         return 0
     return value
 
+# 0.5.0 (#33 PR-4B): the closed IncidentScanner status vocabulary re-emitted
+# by /api/v1/diagnostics/timeline. web/ never imports the runtime module, so
+# this is a deliberate duplicate of its §12 contract (a scanner key that is
+# not listed here is invisible to the surface, which is the fail-closed
+# direction). The bool/int/real domains below reuse the exact-typing
+# primitives above: identical semantics, shared discipline.
+INCIDENT_RUNTIME_STATUS_KEYS = (
+    "enabled", "running", "phase", "cycles_completed", "runtime_failures",
+    "last_error_code", "last_evaluated_end_epoch", "open_incident",
+)
+INCIDENT_RUNTIME_BOOL_KEYS = frozenset(
+    {"enabled", "running", "open_incident"})
+INCIDENT_RUNTIME_PHASE_KEYS = frozenset(
+    {"warmup", "idle", "open", "degraded"})
+INCIDENT_RUNTIME_ERROR_TOKENS = frozenset({
+    "evidence_read_failed", "classify_failed", "persist_failed",
+    "runtime_state_corrupt"})
+INCIDENT_RUNTIME_INT_KEYS = frozenset(
+    {"cycles_completed", "runtime_failures"})
+INCIDENT_RUNTIME_REAL_KEYS = frozenset({"last_evaluated_end_epoch"})
+
+
+def closed_incident_phase(value):
+    """One projected scanner phase, or ``"warmup"``. EXACTLY a str, then
+    EXACTLY a member of the closed phase vocabulary -- warmup is the deny
+    answer because it is the scanner's dark phase (a lying phase can never
+    make the plane look more live than it is)."""
+    if type(value) is str and value in INCIDENT_RUNTIME_PHASE_KEYS:
+        return value
+    return "warmup"
+
+
+def closed_incident_error(value):
+    """One projected scanner error token, or None. Same discipline as the
+    probe startup token: EXACTLY a str, then EXACTLY a member of the
+    closed four-token vocabulary, so exception text or a path can never be
+    presented as an error code."""
+    if type(value) is str and value in INCIDENT_RUNTIME_ERROR_TOKENS:
+        return value
+    return None
+
 # The four privileged mutation routes of rev5 §7. M0.5 delivered them as a
 # 501 boundary; M2 wires them to the sbox-cm RPC adapter (below).
 # Product UX contract: client.add is session + CSRF only after login;
@@ -316,7 +357,8 @@ class MonitorWebApp:
     def __init__(self, broker, access, static_dir, auth=None,
                  remote_mode=False, version=MONITOR_WEB_VERSION,
                  recovery_guard=None, management_active=None, e3_broker=None,
-                 incident_history=None, probe_scheduler=None):
+                 incident_history=None, probe_scheduler=None,
+                 incident_scanner=None):
         self.broker = broker
         self.access = access
         self.auth = auth
@@ -330,6 +372,11 @@ class MonitorWebApp:
         # ONLY thing this surface can show about probing -- no endpoints, no
         # probe results, no paths, no free text.
         self.probe_scheduler = probe_scheduler
+        # Issue #33 PR-4B: the incident scanner's closed 8-key status object
+        # is the ONLY thing this surface can show about the automatic
+        # incident lifecycle -- no incident rows, no evidence bits, no
+        # window coordinates beyond the one bounded epoch.
+        self.incident_scanner = incident_scanner
         self.recovery_limiter = RecoveryRateLimiter()
         self.recovery_guard = recovery_guard or RecoveryGlobalGuard()
         # ``management_active`` is an ORTHOGONAL boolean to ``monitor_running``
@@ -392,6 +439,50 @@ class MonitorWebApp:
                 # Should the mirror ever drift, the surface answers the
                 # closed minimum for a count rather than repeating whatever
                 # an unknown shape held.
+                status[key] = 0
+        return status
+
+    def incident_runtime_status(self):
+        """Closed scanner status for the diagnostics surface.
+
+        Deny-by-default mirror of ``probe_status()`` for the PR-4B
+        IncidentScanner: only the frozen ``INCIDENT_RUNTIME_STATUS_KEYS``
+        are re-emitted, each value forced back into its own closed domain
+        (bool by exact type, phase/error by closed-token membership,
+        counters by plain-int nonnegativity, the one epoch by plain-real
+        finiteness/nonnegativity). A missing, broken or lying scanner
+        answers ``None``; a lying value answers its closed minimum, never
+        a guess -- a lying phase answers ``"warmup"`` (the scanner's dark
+        phase), a lying error token answers None.
+        """
+        getter = getattr(self.incident_scanner, "status", None)
+        if not callable(getter):
+            return None
+        try:
+            raw = getter()
+        except Exception:  # noqa: BLE001 -- a status read never propagates
+            return None
+        if type(raw) is not dict:
+            return None
+        status = {}
+        for key in INCIDENT_RUNTIME_STATUS_KEYS:
+            value = raw.get(key)
+            if key in INCIDENT_RUNTIME_BOOL_KEYS:
+                status[key] = closed_probe_bool(value)
+            elif key == "phase":
+                status[key] = closed_incident_phase(value)
+            elif key == "last_error_code":
+                status[key] = closed_incident_error(value)
+            elif key in INCIDENT_RUNTIME_INT_KEYS:
+                status[key] = closed_probe_counter(value)
+            elif key in INCIDENT_RUNTIME_REAL_KEYS:
+                status[key] = closed_probe_seconds(value)
+            else:
+                # An unclassified key cannot exist: the runtime suite
+                # asserts that the class sets cover
+                # INCIDENT_RUNTIME_STATUS_KEYS exactly. Should the mirror
+                # ever drift, the surface answers the closed minimum for a
+                # count rather than repeating an unknown shape.
                 status[key] = 0
         return status
 
@@ -877,6 +968,11 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         ``since``/``limit``) and the closed scheduler status
         (``probes``, projected through ``PROBE_STATUS_KEYS``). One read
         surface, one bound, no new endpoint and no new query parameter.
+
+        0.5.0 (#33 PR-4B): the same bounded request also carries the
+        incident scanner's closed 8-key status (``incident_runtime``,
+        projected through ``INCIDENT_RUNTIME_STATUS_KEYS``) -- still one
+        read surface, still no new endpoint and no incident rows.
         """
         history = self.app.incident_history
         if history is None:
@@ -894,6 +990,7 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             "device_states": result["device_states"],
             "probe_rows": result["probe_rows"],
             "probes": self.app.probe_status(),
+            "incident_runtime": self.app.incident_runtime_status(),
             "truncated": result["truncated"],
             "limit": result["limit"],
         })
