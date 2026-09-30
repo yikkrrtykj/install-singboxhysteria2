@@ -72,8 +72,10 @@ FAIL=0
 #   S0 static + darkness gates              13   unchanged in count; gate (6)
 #        is PR-4B-restated: the live store now builds the ten v4 tables (the
 #        eight v3 evidence tables plus the two incident tables) and pins
-#        SCHEMA_VERSION == 4. The darkness gates and the 0.4.0 VERSION pins
-#        still hold until PR-4B's runtime consumer lands in the packaging gate.
+#        SCHEMA_VERSION == 4. The darkness gates and the 0.5.0 VERSION pins
+#        are PR-4B's own: the runtime consumer lands behind the packaging
+#        gate's single-consumer allowlist, and the release this lane guards
+#        is Monitor 0.5.0 on history schema v4.
 #   S1 closed vocabulary, pinned literal    12   unchanged in count, but two
 #        of those literals moved: the unknown vocabulary gained
 #        device_states_are_change_only (27 -> 28) and the probe failure split
@@ -215,14 +217,14 @@ if grep -rq 'incident_classif' "$ROOT/monitor-v2/deploy" 2>/dev/null; then
 else
     pass "deploy/ is untouched by PR-4A"
 fi
-# (5) The frozen release identity this PR inherits. PR-4A ships no behaviour
-# change, so a version bump here would be a claim the lane cannot support.
-assert_eq '0.4.0' "$(cat "$ROOT/monitor-v2/VERSION")" \
-    "VERSION is still 0.4.0 (a dark classifier releases nothing)"
-if grep -q 'MONITOR_WEB_VERSION = "0.4.0"' "$SERVER_PY"; then
-    pass "MONITOR_WEB_VERSION is still 0.4.0"
+# (5) The frozen release identity this PR ships. PR-4B lands the incident
+# runtime, so the release it guards is Monitor 0.5.0 on history schema v4.
+assert_eq '0.5.0' "$(cat "$ROOT/monitor-v2/VERSION")" \
+    "VERSION is 0.5.0 (the incident-runtime release)"
+if grep -q 'MONITOR_WEB_VERSION = "0.5.0"' "$SERVER_PY"; then
+    pass "MONITOR_WEB_VERSION is 0.5.0"
 else
-    fail "MONITOR_WEB_VERSION moved off 0.4.0"
+    fail "MONITOR_WEB_VERSION moved off 0.5.0"
 fi
 # (6) Not a declaration check but a live one: build the database the module
 # actually creates and name the tables it actually made. PR-4B migrates the

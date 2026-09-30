@@ -2853,10 +2853,11 @@ else
 fi
 fi
 
-section "T26 production-real upgrade: installed 0.1.5 -> repo VERSION (isolated fixture, 0.4.0)"
+section "T26 production-real upgrade: installed 0.1.5 -> repo VERSION (isolated fixture, 0.5.0)"
 # Same production-real discipline as T25, one release step later: a server
 # running the 0.1.5 target-binding delete UX now moves to the current repo
-# candidate (0.4.0: PR-3B probe ingest on history schema v3, on top of the
+# candidate (0.5.0: PR-4B incident runtime on history schema v4, on top of
+# the 0.4.0 PR-3B probe ingest, the
 # 0.3.1 B7 exchange-access fix and
 # the 0.2.0 incident-history module). The upgrade surface is
 # unchanged: same atomic
