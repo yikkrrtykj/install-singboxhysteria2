@@ -17,11 +17,12 @@
 #      than forty counterexamples (B1-B6 included),
 #      the durable egress baseline (restart + window + raw-writer defense +
 #      the three-token egress-change derivation grid),
-#      fresh/v1->v3/v2->v3 atomicity with an injected mid-migration crash and
-#      the pre-v3-build refusal that is the RUNTIME half of the rollback
-#      contract, one globally epoch-ordered prune, the two evidence planes
-#      staying independent, a live scheduler against a 127.0.0.1-only TLS
-#      fake, and 20x start/stop thread discipline with a slow-cycle lock test.
+#      fresh/v1->v4/v2->v4/v3->v4 atomicity with an injected mid-migration
+#      crash and the pre-v4-build refusal that is the RUNTIME half of the
+#      rollback contract, one globally epoch-ordered prune, the two evidence
+#      planes staying independent, a live scheduler against a 127.0.0.1-only
+#      TLS fake, and 20x start/stop thread discipline with a slow-cycle lock
+#      test.
 #   3. the rollback schema gate at FUNCTION level, on a real fixture: both
 #      readers are read-only, every unknown shape refuses, and a refusal
 #      mutates ZERO bytes. The end-to-end `install-monitor.sh rollback`
@@ -63,6 +64,11 @@ FAIL=0
 #        honest-token table, the exact-dict container, three closer tables,
 #        two coverage gates);
 #        durable 25, schema 31, retention 12, health 21, e2e 21, threads 25)
+# PR-4B restatement (counts UNCHANGED): schema v4 adds the incident tables,
+# so this lane's v3 pins moved to 4 -- the (3) heredoc bound assert, the S2
+# live-reader parse, and the S2 real-database rollback decisions. These are
+# restated pins against the same contract, not new checks; the v3 fixture
+# rows in S2 (a synthetic OLD live database) stay v3 on purpose.
 EXPECTED_PASS=307
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
@@ -157,12 +163,12 @@ assert ih.PROBE_LATENCY_MAX_MS > engine.CYCLE_DEADLINE_SECONDS * 1000
 assert ih.PROBE_LATENCY_MAX_MS < 3_600_000
 assert ih.PROBE_CYCLE_FRESHNESS_SECONDS > engine.CYCLE_DEADLINE_SECONDS
 assert ih.PROBE_EGRESS_BASELINE_WINDOW_SECONDS == ih.RETENTION_SECONDS
-assert ih.SCHEMA_VERSION == 3
+assert ih.SCHEMA_VERSION == 4
 assert ("network_probe_samples", "epoch") in ih._PRUNE_SOURCES
 assert len(ih._PRUNE_SOURCES) == 5
 EOF
 then
-    pass "probe bounds + v3 retention membership are coherent"
+    pass "probe bounds + v4 retention membership are coherent"
 else
     fail "a probe bound is incoherent with the engine or retention"
 fi
@@ -446,7 +452,7 @@ seed_db garbage
 run_gate v3
 assert_eq "$RB_RC" "1" "a file that is not a database is refused, not adopted"
 
-# and the same decisions against a REAL v3 database, built by the module under
+# and the same decisions against a REAL v4 database, built by the module under
 # review: the reader is proven against the production meta row, not a fixture
 # that only looks like one
 rm -f "$DB"
@@ -460,18 +466,18 @@ assert h.health()["enabled"], h.health()
 h.close()
 PY
 then
-    pass "the module under review still builds a v3 database at the live path"
+    pass "the module under review still builds a v4 database at the live path"
 else
-    fail "could not build a real v3 database for the rollback gate"
+    fail "could not build a real v4 database for the rollback gate"
 fi
-assert_eq "3" "$(live_reader)" "the gate's live reader parses the production meta row"
+assert_eq "$(live_reader)" "4" "the gate's live reader parses the production meta row"
+run_gate v4
+assert_eq "$RB_RC" "0" "real v4 database -> a v4 target is allowed"
 run_gate v3
-assert_eq "$RB_RC" "0" "real v3 database -> a v3 target is allowed"
-run_gate v2
-assert_eq "$RB_RC" "1" "real v3 database -> a v2 target is refused (the shipped v3 table is unreadable there)"
+assert_eq "$RB_RC" "1" "real v4 database -> a v3 target is refused (the shipped v4 tables are unreadable there)"
 
 rm -f "$DB"
-run_gate v3
+run_gate v4
 assert_eq "$RB_RC" "0" "no database at all means there is nothing to protect"
 assert_eq "$(find "$STATE/diagnostics" -mindepth 1 | grep -c .)" "0" \
     "the gate created no database and no side files when none existed"

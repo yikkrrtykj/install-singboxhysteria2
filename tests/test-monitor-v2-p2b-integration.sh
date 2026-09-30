@@ -309,14 +309,15 @@ assert_grep "$SERVER_PY" '_require_step_up\(self\._handle_e3_export\)' "#51: exp
 # §13 row 13 (schema unsupported) + frozen-contract boundary: the reader
 # integration must not have widened or drifted the accepted schema set on its
 # own. PR-3B (#33) moved the declaration v2 -> v3 by adding the one probe table
-# through a forward-only rung, so the frozen invariant this gate protects is
-# "exactly ONE declaration, and it is the reviewed one" -- not the numeral 2.
+# through a forward-only rung; PR-4B (#33 Phase 4) moved it v3 -> v4 the same
+# way, adding the incident tables. The frozen invariant this gate protects is
+# "exactly ONE declaration, and it is the reviewed one" -- not the numeral 3.
 # Any further unreviewed move (a second declaration, or a different value)
 # still trips it.
 assert_eq "$(grep -c '^SCHEMA_VERSION = [0-9]$' "$HIST_PY")" "1" \
     "history declares its schema version in exactly one place"
-assert_eq "$(grep -o '^SCHEMA_VERSION = [0-9]*' "$HIST_PY" | grep -c '= 3$')" "1" \
-    "history schema is exactly the reviewed v3 (PR-3B moved it from v2)"
+assert_eq "$(grep -o '^SCHEMA_VERSION = [0-9]*' "$HIST_PY" | grep -c '= 4$')" "1" \
+    "history schema is exactly the reviewed v4 (PR-4B moved it from v3)"
 
 # ===========================================================================
 section "I1: HARD GATE -- formally staged release carries and imports the contract"
@@ -734,11 +735,12 @@ EOF
     assert_eq "$(field history_from_release_app)" "True" "migration: incident_history came from the release app tree ($(field history_from))"
     assert_eq "$(field health_enabled)" "True" "migration: v1 database opens healthy under the installed release's code"
     assert_eq "$(field health_degraded)" "False" "migration: no degraded flag after the forward migration"
-    # PR-3B (#33) made the installed release v3-aware, and the rungs are
-    # forward-only and single-transaction, so a v1 database now lands on v3 in
-    # ONE step -- v1 -> v2 -> v3 in a loop would rewrite rows this gate exists
-    # to protect. The numeral is asserted structurally below (probe table).
-    assert_eq "$(field schema_version)" "3" "migration: meta.schema_version advanced to 3 in one step"
+    # PR-3B (#33) made the installed release v3-aware and PR-4B made it
+    # v4-aware; the rungs are forward-only and single-transaction, so a v1
+    # database now lands on v4 in ONE step -- v1 -> v2 -> ... -> v4 in a loop
+    # would rewrite rows this gate exists to protect. The numeral is asserted
+    # structurally below (probe table).
+    assert_eq "$(field schema_version)" "4" "migration: meta.schema_version advanced to 4 in one step"
     assert_eq "$(field rows_preserved)" "True" "migration: v1 rows preserved byte-for-byte"
     for t in journal_runs journal_events journal_ingest_audit journal_ingest_state \
              timeline_samples device_protocol_states meta; do

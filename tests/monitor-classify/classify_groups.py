@@ -1746,8 +1746,8 @@ def group_store():
     import web.incident_history as ih
     history, obj, counts, root = _build_store()
     try:
-        out["store_opens_on_schema_v3"] = (
-            ih.SCHEMA_VERSION == 3 and counts["schema_version"] == 3
+        out["store_opens_on_schema_v4"] = (
+            ih.SCHEMA_VERSION == 4 and counts["schema_version"] == 4
             and counts["sample_rows"] > 0)
         out["store_probe_rows_persist"] = counts["probe_rows"] >= 8
         out["store_journal_rows_ingest"] = counts["journal_rows"] >= 40

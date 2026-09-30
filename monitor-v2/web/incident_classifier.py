@@ -164,7 +164,8 @@ HISTORY_ERROR_CODES = ("history_dir_unsafe", "history_db_unsafe",
                        "history_read_failed", "history_ingest_apply_failed",
                        "history_probe_persist_failed",
                        "history_probe_result_rejected",
-                       "history_journal_exchange_unreadable")
+                       "history_journal_exchange_unreadable",
+                       "history_incident_persist_failed")
 # Mirror of the reader availability tokens (the heartbeat-name status
 # derivation in the history store), of
 # the snapshot health field the projection carries, and of the device-row
@@ -377,6 +378,67 @@ def detect(evidence):
     first = start + indices[0] * BUCKET_SECONDS
     last = start + (indices[-1] + 1) * BUCKET_SECONDS
     return Detection(classification, tuple(indices), first, last)
+
+
+# -- PR-4B persistence bitsets: positional, derived from the closed vocabulary -
+#
+# Bit i of a stored bitset is token i of the SORTED closed vocabulary, so
+# the mapping is reviewable from the vocabulary alone and the v4 DDL's
+# upper-bound CHECKs (2**45-1 / 2**28-1) are exactly the wall that makes a
+# vocabulary growth fail a write CLOSED instead of shifting the meaning of
+# already-stored bits. These helpers stay pure and total like everything
+# else in this module: an out-of-vocabulary token (impossible from a
+# Classification produced here) is a refusal (None), never a guessed
+# position, and never an exception.
+_EVIDENCE_BIT_ORDER = tuple(sorted(EVIDENCE_TOKENS))
+_UNKNOWN_BIT_ORDER = tuple(sorted(UNKNOWN_TOKENS))
+_EVIDENCE_BIT_INDEX = {token: position
+                       for position, token in enumerate(_EVIDENCE_BIT_ORDER)}
+_UNKNOWN_BIT_INDEX = {token: position
+                      for position, token in enumerate(_UNKNOWN_BIT_ORDER)}
+
+
+def _tokens_to_bits(tokens, index):
+    if not isinstance(tokens, (tuple, list)):
+        return None
+    bits = 0
+    for token in tokens:
+        if type(token) is not str:
+            return None
+        position = index.get(token)
+        if position is None:
+            return None
+        bits |= 1 << position
+    return bits
+
+
+def _bits_to_tokens(value, order):
+    if type(value) is not int or value < 0 or value >= (1 << len(order)):
+        return None
+    return tuple(token for position, token in enumerate(order)
+                 if (value >> position) & 1)
+
+
+def evidence_to_bits(tokens):
+    """The v4 incident_windows.evidence_bits encoding of a verdict's
+    evidence tuple (bit i = sorted-vocabulary position i)."""
+    return _tokens_to_bits(tokens, _EVIDENCE_BIT_INDEX)
+
+
+def bits_to_evidence(value):
+    """The exact inverse of evidence_to_bits: the sorted token tuple a
+    stored integer decodes to, or None when the integer is no bitset."""
+    return _bits_to_tokens(value, _EVIDENCE_BIT_ORDER)
+
+
+def unknown_to_bits(tokens):
+    """The v4 incident_windows.unknown_bits encoding (same rule, 28
+    tokens wide)."""
+    return _tokens_to_bits(tokens, _UNKNOWN_BIT_INDEX)
+
+
+def bits_to_unknown(value):
+    return _bits_to_tokens(value, _UNKNOWN_BIT_ORDER)
 
 
 # -- input refusal: closed tokens only, never exception text ------------------

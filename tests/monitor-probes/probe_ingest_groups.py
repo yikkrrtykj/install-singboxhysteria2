@@ -743,7 +743,7 @@ def group_durable():
     return out
 
 
-# -- group: schema v3 shapes, migrations and the CHECK walls -------------------
+# -- group: schema v4 shapes, migrations and the CHECK walls -------------------
 
 def v1_file(now=NOW):
     """An EXACT v1 database (meta claims 1 + the three v1 tables), created
@@ -817,14 +817,16 @@ def group_schema():
     out = {}
     import web.incident_history as IH
 
-    # fresh creation is v3 immediately, with the ONE probe table
+    # fresh creation is v4 immediately, with the ONE probe table and the
+    # two incident tables riding along (PR-4B)
     h = tmp_history("fresh")
-    out["module_schema_version_3"] = SCHEMA_VERSION == 3
-    out["fresh_claim_is_3"] = claim(db_path(h)) == "3"
-    out["fresh_shape_exact_v3"] = table_set(db_path(h)) == {
+    out["module_schema_version_4"] = SCHEMA_VERSION == 4
+    out["fresh_claim_is_4"] = claim(db_path(h)) == "4"
+    out["fresh_shape_exact_v4"] = table_set(db_path(h)) == {
         "meta", "timeline_samples", "device_protocol_states", "journal_runs",
         "journal_events", "journal_ingest_audit", "journal_ingest_state",
-        "network_probe_samples"}
+        "network_probe_samples", "incident_windows",
+        "incident_runtime_state"}
     conn = sqlite3.connect(db_path(h))
     out["probe_indexes_present"] = {row[0] for row in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='index'"
@@ -853,11 +855,11 @@ def group_schema():
     conn.close()
     h.close()
 
-    # v1 -> v3 in one step, zero v1 rows touched
+    # v1 -> v4 in one step, zero v1 rows touched
     d, path = v1_file()
     before = open(path, "rb").read()
     h1 = tmp_history("v1", root=d)
-    out["v1_migrated_to_3"] = claim(path) == "3"
+    out["v1_migrated_to_4"] = claim(path) == "4"
     out["v1_probe_table_created"] = "network_probe_samples" in table_set(path)
     conn = sqlite3.connect(path)
     out["v1_rows_survived"] = conn.execute(
@@ -874,10 +876,10 @@ def group_schema():
         open(path, "rb").read().startswith(b"SQLite format 3\x00")
         and len(before) > 0)
 
-    # v2 -> v3: exactly one new table, the v2 audit row untouched
+    # v2 -> v4: the probe + incident tables land, the v2 audit row untouched
     d2, path2 = v2_file()
     h2 = tmp_history("v2", root=d2)
-    out["v2_migrated_to_3"] = claim(path2) == "3"
+    out["v2_migrated_to_4"] = claim(path2) == "4"
     conn = sqlite3.connect(path2)
     out["v2_rows_survived"] = conn.execute(
         "SELECT COUNT(*) FROM journal_ingest_audit"
@@ -887,7 +889,7 @@ def group_schema():
     conn.close()
     h2.close()
 
-    # CRASH mid-migration: the v2->v3 transaction rolls back WHOLE, the file
+    # CRASH mid-migration: the v2->v4 transaction rolls back WHOLE, the file
     # is byte-identical, and the next open re-migrates cleanly.
     d3, path3 = v2_file()
     pristine = open(path3, "rb").read()
@@ -912,21 +914,21 @@ def group_schema():
         "network_probe_samples" not in table_set(path3))
     h3 = tmp_history("after-crash", root=d3)
     out["crash_recovers_by_remigrating"] = (
-        claim(path3) == "3" and "network_probe_samples" in table_set(path3))
+        claim(path3) == "4" and "network_probe_samples" in table_set(path3))
     h3.close()
 
-    # THE ROLLBACK RUNG: a pre-v3 build meeting a v3 file refuses it through
+    # THE ROLLBACK RUNG: a pre-v4 build meeting a v4 file refuses it through
     # the SAME gate, before any pragma/DDL/write can touch it, at zero bytes.
     # open() is fail-soft by contract, so the refusal is the DISABLED STORE +
     # the schema code, and every write path behind it has to refuse too.
     d4 = tempfile.mkdtemp()
-    hv = tmp_history("v3host", root=d4)
+    hv = tmp_history("v4host", root=d4)
     hv.close()
     v3_db = os.path.join(d4, "diagnostics", "history.sqlite3")
     v3_bytes = open(v3_db, "rb").read()
     real_version = IH.SCHEMA_VERSION
-    IH.SCHEMA_VERSION = 2
-    pre = IncidentHistory(os.path.join(d4, "diagnostics"), "pre-v3",
+    IH.SCHEMA_VERSION = 3
+    pre = IncidentHistory(os.path.join(d4, "diagnostics"), "pre-v4",
                           clock=lambda: NOW)
     raised = None
     try:
@@ -939,16 +941,16 @@ def group_schema():
         health, probe_refused, write_refused = {}, False, False
     finally:
         IH.SCHEMA_VERSION = real_version
-    out["pre_v3_open_never_raises"] = raised is None
-    out["pre_v3_build_refuses_v3_db"] = (
+    out["pre_v4_open_never_raises"] = raised is None
+    out["pre_v4_build_refuses_v4_db"] = (
         health.get("enabled") is False
         and health.get("last_error_code") == IH.CODE_SCHEMA_UNSUPPORTED
         and probe_refused and write_refused)
-    out["pre_v3_refusal_zero_bytes"] = open(v3_db, "rb").read() == v3_bytes
-    # and the SAME file is still fully usable for the real v3 build
-    back = tmp_history("v3again", root=d4)
+    out["pre_v4_refusal_zero_bytes"] = open(v3_db, "rb").read() == v3_bytes
+    # and the SAME file is still fully usable for the real v4 build
+    back = tmp_history("v4again", root=d4)
     r, c = good(IP_B, "unknown")
-    out["v3_build_reads_its_own_file_after_refusal"] = (
+    out["v4_build_reads_its_own_file_after_refusal"] = (
         back.record_probe_result(r, c) is True)
     back.close()
 

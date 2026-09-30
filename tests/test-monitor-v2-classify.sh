@@ -44,7 +44,7 @@
 #      window),
 #      nineteen hostile refusals, determinism/purity/closure invariants, a
 #      privacy wall that feeds real sentinel material through every section,
-#      and a group that builds a REAL schema-v3 database, reads the rows back
+#      and a group that builds a REAL schema-v4 database, reads the rows back
 #      out of SQLite and classifies those.
 #
 # Everything here is pure Python over a pure-stdlib module: no network, no
@@ -69,7 +69,11 @@ FAIL=0
 # detect_never_raises_on_hostile_input, detect_mutates_no_input. They pin the
 # PR-4B contract that detect() is classify() plus pure bucket-position
 # metadata over the SAME single analysis path.
-#   S0 static + darkness gates              13   unchanged
+#   S0 static + darkness gates              13   unchanged in count; gate (6)
+#        is PR-4B-restated: the live store now builds the ten v4 tables (the
+#        eight v3 evidence tables plus the two incident tables) and pins
+#        SCHEMA_VERSION == 4. The darkness gates and the 0.4.0 VERSION pins
+#        still hold until PR-4B's runtime consumer lands in the packaging gate.
 #   S1 closed vocabulary, pinned literal    12   unchanged in count, but two
 #        of those literals moved: the unknown vocabulary gained
 #        device_states_are_change_only (27 -> 28) and the probe failure split
@@ -221,15 +225,18 @@ else
     fail "MONITOR_WEB_VERSION moved off 0.4.0"
 fi
 # (6) Not a declaration check but a live one: build the database the module
-# actually creates and name the tables it actually made. PR-4A may not
-# migrate, so the eight v3 tables are the whole world this classifier is
-# written against -- including the absence of a per-edge, Reality-target or
-# net-counter table.
+# actually creates and name the tables it actually made. PR-4B migrates the
+# store to v4, so the classifier now sees ten tables: the eight v3 evidence
+# tables it was written against -- still the whole vocabulary it may name,
+# still with no per-edge, Reality-target or net-counter table -- plus the two
+# incident tables the incident plane owns. The classifier still never reads
+# the new tables: gate (4) proves there is no SQL in the file, and PR-4B's
+# packaging gate pins exactly one runtime consumer for the module.
 if "$PY" - <<'EOF'
 import os, shutil, sqlite3, sys, tempfile
 sys.path.insert(0, os.environ["MONITOR_V2_ROOT"])
 import web.incident_history as ih
-assert ih.SCHEMA_VERSION == 3, "the schema moved: PR-4A may not migrate"
+assert ih.SCHEMA_VERSION == 4, "the schema moved off v4: PR-4B owns v4"
 root = tempfile.mkdtemp()
 h = ih.IncidentHistory(os.path.join(root, "diagnostics"), "c" * 32,
                        monitor_version="classify-lane")
@@ -241,12 +248,13 @@ made = {row[0] for row in sqlite3.connect(
     "SELECT name FROM sqlite_master WHERE type='table'")}
 assert made == {"meta", "timeline_samples", "device_protocol_states",
                 "journal_runs", "journal_events", "journal_ingest_audit",
-                "journal_ingest_state", "network_probe_samples"}, \
+                "journal_ingest_state", "network_probe_samples",
+                "incident_windows", "incident_runtime_state"}, \
     "the live store created %r" % (sorted(made),)
 shutil.rmtree(root, ignore_errors=True)
 EOF
 then
-    pass "a live store still builds exactly the eight v3 tables this PR read"
+    pass "a live store builds exactly the ten v4 tables (eight evidence + two incident)"
 else
     fail "the live store shape differs from the one the classifier mirrors"
 fi
