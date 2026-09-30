@@ -4201,5 +4201,36 @@ QUICK=ok" "$(cat "$TMP/t32.facts.after")" \
 fi
 fi
 
+section "T33 PR-4B single-consumer: exactly one reviewed runtime module imports the classifier"
+# Frozen requirement (14): static gates proving exactly one reviewed runtime
+# consumer imports incident_classifier. This is the packaging-tree witness of
+# the same closed allowlist the classify lane pins in its gate (3): the
+# classifier may be imported by NOTHING under monitor-v2/ except
+# web/incident_runtime.py (the IncidentScanner). A second consumer, or any
+# other importer, breaks the single-consumer contract. Static, no fixture,
+# runs on every platform -- the wiring it pins ships inside the staged
+# release this lane installs.
+T33_IMPORTERS="$(grep -rl 'incident_classifier' --include='*.py' \
+    "$REPO_ROOT/monitor-v2" 2>/dev/null | grep -v 'web/incident_classifier.py' || true)"
+assert_eq "$REPO_ROOT/monitor-v2/web/incident_runtime.py" "$T33_IMPORTERS" \
+    "exactly one runtime consumer imports the classifier: web/incident_runtime.py (closed allowlist)"
+assert_grep 'class IncidentScanner' "$REPO_ROOT/monitor-v2/web/incident_runtime.py" \
+    "the single allowed consumer is the IncidentScanner"
+assert_grep 'from web import incident_classifier' "$REPO_ROOT/monitor-v2/web/incident_runtime.py" \
+    "the single consumer imports the module under its shipped name"
+if grep -q 'incident_classif' "$REPO_ROOT/monitor-v2/web/server.py" \
+    "$REPO_ROOT/monitor-v2/web/webapp.py" \
+    "$REPO_ROOT/monitor-v2/web/incident_history.py" \
+    "$REPO_ROOT/monitor-v2/collector.py" 2>/dev/null; then
+    fail "a server, webapp, history or collector surface names the classifier"
+else
+    pass "no route, status surface, store or collector path references it"
+fi
+if grep -rq 'incident_classif' "$DEPLOY_DIR" 2>/dev/null; then
+    fail "a deploy surface references the classifier"
+else
+    pass "deploy/ is untouched by the incident runtime consumer"
+fi
+
 printf '\n== RESULT: %d passed, %d failed ==\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -9,13 +9,15 @@
 # properties the review contract demands proof of, in the order a reviewer
 # should check them:
 #
-#   1. DARKNESS. The classifier is a pure function nobody calls. Nothing in
-#      the runtime imports it, no route, schema, deploy, systemd, scheduler
-#      or collector surface references it, and the shipped VERSION /
-#      MONITOR_WEB_VERSION / SCHEMA_VERSION are exactly the values this PR
-#      inherited. A phase that changes an answer but no behaviour is a phase
-#      that can be reviewed on its logic alone -- so the lane proves the
-#      absence of wiring rather than trusting a promise.
+#   1. A SINGLE REVIEWED CONSUMER. The classifier is still a pure function,
+#      but PR-4B wires it into the runtime through exactly one reviewed
+#      consumer: web/incident_runtime.py (the IncidentScanner). The darkness
+#      gate becomes a closed allowlist pinning that single file -- no second
+#      consumer, no other surface: no route, schema, deploy, systemd,
+#      scheduler or collector path may reference the module, and the shipped
+#      VERSION / MONITOR_WEB_VERSION / SCHEMA_VERSION are exactly the values
+#      this PR froze. The lane proves the wiring is exactly the reviewed
+#      wiring rather than trusting a promise.
 #   2. A CLOSED VOCABULARY, PINNED AS LITERALS HERE. Seven categories, three
 #      statuses, forty-five evidence tokens, twenty-eight unknown tokens, the
 #      six categories the sealing wall actually admits, and the two halves of
@@ -69,13 +71,15 @@ FAIL=0
 # detect_never_raises_on_hostile_input, detect_mutates_no_input. They pin the
 # PR-4B contract that detect() is classify() plus pure bucket-position
 # metadata over the SAME single analysis path.
-#   S0 static + darkness gates              13   unchanged in count; gate (6)
-#        is PR-4B-restated: the live store now builds the ten v4 tables (the
-#        eight v3 evidence tables plus the two incident tables) and pins
-#        SCHEMA_VERSION == 4. The darkness gates and the 0.5.0 VERSION pins
-#        are PR-4B's own: the runtime consumer lands behind the packaging
-#        gate's single-consumer allowlist, and the release this lane guards
-#        is Monitor 0.5.0 on history schema v4.
+#   S0 static + darkness gates              13   unchanged in count; gate (3)
+#        is PR-4B's intentional DARK-gate rework -- the zero-importer demand
+#        is now a closed single-consumer allowlist naming web/incident_runtime.py
+#        -- and gate (6) is PR-4B-restated: the live store now builds the ten
+#        v4 tables (the eight v3 evidence tables plus the two incident tables)
+#        and pins SCHEMA_VERSION == 4. The 0.5.0 VERSION pins are PR-4B's own,
+#        the same single-consumer allowlist is pinned again in the packaging
+#        lane, and the release this lane guards is Monitor 0.5.0 on history
+#        schema v4.
 #   S1 closed vocabulary, pinned literal    12   unchanged in count, but two
 #        of those literals moved: the unknown vocabulary gained
 #        device_states_are_change_only (27 -> 28) and the probe failure split
@@ -194,12 +198,16 @@ else
     fail "the classifier is no longer a pure function"
 fi
 
-# (3) Dark means UNCALLED, and the only trustworthy proof is a search of the
-# whole shipped tree for an import of the module name.
+# (3) PR-4B ends the darkness with EXACTLY ONE reviewed runtime consumer:
+# web/incident_runtime.py (the IncidentScanner). The proof is still a search
+# of the whole shipped tree for the module name -- but the assertion is now
+# a closed allowlist pinning that single file, not a demand for zero
+# importers: a second consumer, or a different one, breaks the single-
+# consumer contract exactly as surely as an unreviewed first one would.
 IMPORTERS="$(grep -rl 'incident_classifier' --include='*.py' \
     "$ROOT/monitor-v2" 2>/dev/null | grep -v 'web/incident_classifier.py' || true)"
-assert_eq "" "$IMPORTERS" \
-    "no module under monitor-v2 imports the classifier (PR-4A stays dark)"
+assert_eq "$ROOT/monitor-v2/web/incident_runtime.py" "$IMPORTERS" \
+    "exactly one runtime consumer imports the classifier: web/incident_runtime.py (closed allowlist)"
 if grep -q 'incident_classif' "$SERVER_PY" "$WEBAPP" "$HIST_PY" "$COLLECTOR"; then
     fail "a server, webapp, history or collector surface names the classifier"
 else
