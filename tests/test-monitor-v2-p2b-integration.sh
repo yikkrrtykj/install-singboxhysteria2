@@ -740,7 +740,7 @@ EOF
     # database now lands on v4 in ONE step -- v1 -> v2 -> ... -> v4 in a loop
     # would rewrite rows this gate exists to protect. The numeral is asserted
     # structurally below (probe table).
-    assert_eq "$(field schema_version)" "4" "migration: meta.schema_version advanced to 4 in one step"
+    assert_eq "$(field schema_version)" "5" "migration: meta.schema_version advanced to 5 in one step"
     assert_eq "$(field rows_preserved)" "True" "migration: v1 rows preserved byte-for-byte"
     for t in journal_runs journal_events journal_ingest_audit journal_ingest_state \
              timeline_samples device_protocol_states meta; do

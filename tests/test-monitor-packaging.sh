@@ -2856,7 +2856,7 @@ fi
 section "T26 production-real upgrade: installed 0.1.5 -> repo VERSION (isolated fixture, 0.5.0)"
 # Same production-real discipline as T25, one release step later: a server
 # running the 0.1.5 target-binding delete UX now moves to the current repo
-# candidate (0.5.0: PR-4B incident runtime on history schema v4, on top of
+# candidate (0.6.0: PR-5 incidents UI on history schema v5, on top of
 # the 0.4.0 PR-3B probe ingest, the
 # 0.3.1 B7 exchange-access fix and
 # the 0.2.0 incident-history module). The upgrade surface is
@@ -2939,9 +2939,9 @@ else
 fi
 fi
 
-section "T27 rollback history-schema gate: a v4 database refuses a target declaring an older schema"
-# PR-4B ships History schema v4 (the incident tables). The RUNTIME half of
-# that contract -- a pre-v4 build refusing to write into a v4 database -- is
+section "T27 rollback history-schema gate: a v5 database refuses a target declaring an older schema"
+# PR-5 ships History schema v5 (the incident + marker tables). The RUNTIME half of
+# that contract -- a pre-v5 build refusing to write into a v5 database -- is
 # owned by the probe-ingest lane; this section owns the DEPLOY half: the
 # ordinary rollback path must refuse a target whose OWN release declares an
 # older schema, before it mutates anything, and must still allow a compatible
@@ -2985,7 +2985,7 @@ else
     "$INSTALL_MONITOR" upgrade > "$TMP/out-t27-up.log" 2>&1 || exit 1
     live_rel="$(basename "$(readlink -f "$T27_APP")")"
 
-    # A REAL v4 database at the live path, built by the staged release's own
+    # A REAL v5 database at the live path, built by the staged release's own
     # module: the gate must judge the production meta row, not a lookalike.
     mkdir -p "$T27_STATE/diagnostics"
     "$PY3" - "$T27_STATE/diagnostics" "$T27_APP/app/monitor-v2" <<'PY' || exit 1
@@ -2998,7 +2998,7 @@ assert h.health()["enabled"], h.health()
 h.close()
 PY
 
-    # The pre-v4 target is produced the way a real one exists: that release
+    # The pre-v5 target is produced the way a real one exists: that release
     # DECLARES an older schema. The retained baseline release's own module is
     # demoted in place, so the refused run and the allowed run face a
     # byte-identical tree (same reader runtime, same manifest, same VERSION)
@@ -3006,7 +3006,7 @@ PY
     # restore is verified, so the fixture leaves nothing damaged.
     target_ih="$T27_REL/$base_rel/app/monitor-v2/web/incident_history.py"
     ih_sha="$(sha256sum "$target_ih" | cut -d' ' -f1)"
-    sed 's/^SCHEMA_VERSION = 4$/SCHEMA_VERSION = 2/' "$target_ih" \
+    sed 's/^SCHEMA_VERSION = 5$/SCHEMA_VERSION = 2/' "$target_ih" \
         > "$target_ih.demoted" || exit 1
     mv -- "$target_ih.demoted" "$target_ih" || exit 1
     grep -q '^SCHEMA_VERSION = 2$' "$target_ih" || exit 1
@@ -3024,7 +3024,7 @@ PY
     # Positive control, only after the refusal has been proven inert: the very
     # same command, against the very same release restored to a compatible
     # declaration, must go through.
-    sed 's/^SCHEMA_VERSION = 2$/SCHEMA_VERSION = 4/' "$target_ih" \
+    sed 's/^SCHEMA_VERSION = 2$/SCHEMA_VERSION = 5/' "$target_ih" \
         > "$target_ih.restore" || exit 1
     mv -- "$target_ih.restore" "$target_ih" || exit 1
     restore_sha="$(sha256sum "$target_ih" | cut -d' ' -f1)"
@@ -3051,18 +3051,18 @@ if [ "$rc" != 0 ]; then
     fail "isolated PR-3B rollback fixture could not be built (rc=$rc): $(tail -n 5 "$TMP/out-t27-up.log" 2>/dev/null | tr '\n' ' ')"
 else
     assert_rc 1 "$(cat "$TMP/t27.rc")" \
-        "rollback of a v4 database to a release declaring v2 is refused (rc 1)"
+        "rollback of a v5 database to a release declaring v2 is refused (rc 1)"
     assert_grep 'history schema 不兼容' "$T27_LOG" \
         "the refusal names the history schema gate"
     assert_grep '未做任何变更' "$T27_LOG" "the refusal promises zero mutation"
     assert_grep 'v2' "$T27_LOG" "the refusal states the target's declared v2"
-    assert_grep 'v4' "$T27_LOG" "the refusal states the live database's v4"
+    assert_grep 'v5' "$T27_LOG" "the refusal states the live database's v5"
     assert_no_grep '混版本' "$T27_LOG" \
         "the refusal came from the schema gate, not the PR-2B reader gate"
     assert_eq "$(cat "$TMP/t27.live")" "$(cat "$TMP/t27.link")" \
         "the refused rollback left the live release switch untouched"
     assert_eq "$(cat "$TMP/t27.sha.ref")" "$(cat "$TMP/t27.sha.after")" \
-        "the refused rollback left the v4 database byte-identical"
+        "the refused rollback left the v5 database byte-identical"
     assert_eq "$(cat "$TMP/t27.hist.ref")" "$(cat "$TMP/t27.hist.after")" \
         "the refused rollback wrote no history entry"
     assert_eq "$(cat "$TMP/t27.restarts.ref")" "$(cat "$TMP/t27.restarts.after")" \
@@ -3070,11 +3070,11 @@ else
     assert_eq "$(cat "$TMP/t27.ih.sha")" "$(cat "$TMP/t27.ih.restore")" \
         "the demoted release was restored byte-identically (the fixture damages nothing it inspects)"
     assert_rc 0 "$(cat "$TMP/t27.rcallow")" \
-        "the same rollback against the same release restored to v4 proceeds (the gate is not a blanket block)"
+        "the same rollback against the same release restored to v5 proceeds (the gate is not a blanket block)"
     assert_grep '回滚完成' "$T27_ALLOW_LOG" \
-        "the compatible rollback completed normally while the v4 database was in place"
+        "the compatible rollback completed normally while the v5 database was in place"
     assert_eq "$(cat "$TMP/t27.sha.ref")" "$(cat "$TMP/t27.sha.allow")" \
-        "the v4 database is byte-identical after the allowed rollback too (the gate only reads)"
+        "the v5 database is byte-identical after the allowed rollback too (the gate only reads)"
     assert_no_grep 'sing-box' "$T27_CALLS" \
         "the whole history-schema rollback sequence never touched sing-box"
 fi
@@ -3087,13 +3087,13 @@ fi
 # database: the migration is not a deploy step, it runs when the CANDIDATE
 # SERVICE BOOTS, which is inside the transaction and BEFORE the later gates
 # (sbmon_sboxjr_converge). The release/unit/service rollback cannot undo a
-# migration, so a failed upgrade used to leave a schema-v4 file underneath a
+# migration, so a failed upgrade used to leave a newer-schema file underneath a
 # reactivated schema-v3 runtime -- which that runtime refuses to write into,
 # and which the manual rollback gate then refuses to move away from.
 #
 # What these fixtures prove is the deploy half of that contract, with REAL
 # state: an exact v3 database (built with the module's own DDL helpers, so the
-# shape cannot drift), a candidate that genuinely migrates it to v4 (the
+# shape cannot drift), a candidate that genuinely migrates it to v5 (the
 # incident-runtime schema), and a failure injected AFTER that migration.
 #   * the prestate is captured with the SQLite backup API while the Monitor
 #     keeps running -- no stop is issued merely to take it,
@@ -3102,7 +3102,7 @@ fi
 #     nothing else, and only then restores release/unit/enabled/active,
 #   * the previous runtime is never restarted over a newer schema: the boot
 #     hook records the schema it found at each start, so an ordering bug shows
-#     up as "declared=3 db=4" (and the hook refuses to boot that way, exactly
+#     up as "declared=3 db=5" (and the hook refuses to boot that way, exactly
 #     like the real Monitor would).
 # The runtime-side refusal semantics themselves belong to
 # test-monitor-v2-probe-ingest.sh; these sections own the transaction.
@@ -3180,7 +3180,7 @@ PYEOF
 
 prestate_v3_tables="device_protocol_states,journal_events,journal_ingest_audit,journal_ingest_state,journal_runs,meta,network_probe_samples,timeline_samples"
 # sorted, exactly as the facts helper emits it
-prestate_v4_tables="device_protocol_states,incident_runtime_state,incident_windows,journal_events,journal_ingest_audit,journal_ingest_state,journal_runs,meta,network_probe_samples,timeline_samples"
+prestate_v5_tables="device_protocol_states,incident_runtime_state,incident_windows,journal_events,journal_ingest_audit,journal_ingest_state,journal_runs,meta,network_probe_samples,operator_markers,timeline_samples"
 
 # Which release is live, read from the LIVE TREE ITSELF (its VERSION payload)
 # rather than from the app symlink: a dev host without symlink privilege turns
@@ -3234,7 +3234,7 @@ prestate_fixture_run() { # <tag> <fail-reader 0|1> [pre-boot-fail 0|1] [demote 0
     # comparison really does choose "upgrade". Its staged tree is demoted below
     # to declare schema v3 -- the way a genuine 0.4.0 release answers for
     # itself (the same technique T27 uses for the rollback gate). Pass
-    # demote=0 to keep the staged v4 declaration: the same-schema no-op
+    # demote=0 to keep the staged v5 declaration: the same-schema no-op
     # fixture (T32) needs a baseline that answers for the SAME schema.
     printf '0.4.0\n' > "$SRC/VERSION"
     (
@@ -3344,7 +3344,7 @@ HOOK
         [ -n "$base_rel" ] || exit 1
         printf '%s\n' "$base_rel" > "$TMP/$tag.base.rel"
 
-        # Demote the installed release to a genuine pre-v4 declaration, unless
+        # Demote the installed release to a genuine pre-v5 declaration, unless
         # the same-schema fixture asked to keep it: the baseline must answer
         # for exactly the schema the fixture's database carries.
         local target_ih ih_sha_before
@@ -3352,16 +3352,16 @@ HOOK
         ih_sha_before="$(sha256sum "$target_ih" | cut -d' ' -f1)"
         printf '%s\n' "$ih_sha_before" > "$TMP/$tag.ih.sha"
         if [ "$demote" = "1" ]; then
-            sed 's/^SCHEMA_VERSION = 4$/SCHEMA_VERSION = 3/' "$target_ih" \
+            sed 's/^SCHEMA_VERSION = 5$/SCHEMA_VERSION = 3/' "$target_ih" \
                 > "$target_ih.demoted" || exit 1
             mv -- "$target_ih.demoted" "$target_ih" || exit 1
             grep -q '^SCHEMA_VERSION = 3$' "$target_ih" || exit 1
         else
-            grep -q '^SCHEMA_VERSION = 4$' "$target_ih" || exit 1
+            grep -q '^SCHEMA_VERSION = 5$' "$target_ih" || exit 1
         fi
 
         # An EXACT database at the baseline's declared schema -- v3 for the
-        # demoted fixtures, v4 (incident tables and all) for the same-schema
+        # demoted fixtures, v5 (incident + marker tables) for the same-schema
         # no-op fixture -- built with the module's own DDL helpers, plus a
         # sentinel row (continuity) and an unrelated file in the SAME
         # directory (the restore must not sweep it away).
@@ -3430,7 +3430,7 @@ PY
         if [ "$demote" = "1" ]; then
             grep -q "^TABLES=$prestate_v3_tables\$" "$TMP/$tag.facts.ref" || exit 1
         else
-            grep -q "^TABLES=$prestate_v4_tables\$" "$TMP/$tag.facts.ref" || exit 1
+            grep -q "^TABLES=$prestate_v5_tables\$" "$TMP/$tag.facts.ref" || exit 1
         fi
 
         # Pre-transaction facts the rollback must reproduce exactly.
@@ -3489,9 +3489,9 @@ PBEOF
             : > "$MOCK_PRE_BOOT_LOG"
         fi
 
-        # The candidate is the real repo release: it declares v4, so a demoted
+        # The candidate is the real repo release: it declares v5, so a demoted
         # fixture's file migrates when it boots; the same-schema fixture's
-        # file is already v4 and the boot is a plain open.
+        # file is already v5 and the boot is a plain open.
         cp "$REPO_ROOT/monitor-v2/VERSION" "$SRC/VERSION" || exit 1
         printf '%s\n' "$(prestate_live_release_version)" > "$TMP/$tag.ver.before"
         local rc=0
@@ -3566,14 +3566,14 @@ PBEOF
 prestate_fixture_cleanup() { # <tag> -- put the staged release tree back
     local tag="$1" target_ih
     target_ih="$(cat "$TMP/$tag.ih.path")"
-    sed 's/^SCHEMA_VERSION = 3$/SCHEMA_VERSION = 4/' "$target_ih" \
+    sed 's/^SCHEMA_VERSION = 3$/SCHEMA_VERSION = 5/' "$target_ih" \
         > "$target_ih.restore" || return 1
     mv -- "$target_ih.restore" "$target_ih" || return 1
     printf '%s\n' "$(sha256sum "$target_ih" | cut -d' ' -f1)" > "$TMP/$tag.ih.restore"
     return 0
 }
 
-section "T28 transaction History prestate: a v3->v4-migrated database is restored when a later gate fails"
+section "T28 transaction History prestate: a v3->v5-migrated database is restored when a later gate fails"
 if [ "$SYMLINKS_OK" != 1 ]; then
     printf '  SKIP T28 事务 History 预状态（此平台无符号链接；Linux pass 是门禁）\n'
 else
@@ -3596,10 +3596,10 @@ else
         "the previous release is the live one again (the candidate is not)"
 
     # --- the database really was migrated by the candidate, then put back ---
-    assert_grep 'boot declared=4 db=3' "$TMP/t28-boot.log" \
+    assert_grep 'boot declared=5 db=3' "$TMP/t28-boot.log" \
         "the candidate booted over the v3 file (so a real forward migration was in play)"
-    assert_grep 'boot migrated to v4' "$TMP/t28-boot.log" \
-        "the candidate's own module migrated the live database to v4"
+    assert_grep 'boot migrated to v5' "$TMP/t28-boot.log" \
+        "the candidate's own module migrated the live database to v5"
     assert_grep 'reader 重启失败' "$TMP/out-t28-upgrade.log" \
         "the injected failure landed on the reader converge gate, after the migration"
     assert_eq "DECLARED=3
@@ -3699,7 +3699,7 @@ QUICK=ok" "$(cat "$TMP/t28.facts.snap")" \
 fi
 fi
 
-section "T29 transaction History prestate: a successful v3->v4 upgrade retains the pre-migration backup and still refuses the ordinary rollback"
+section "T29 transaction History prestate: a successful v3->v5 upgrade retains the pre-migration backup and still refuses the ordinary rollback"
 if [ "$SYMLINKS_OK" != 1 ]; then
     printf '  SKIP T29 迁移前备份保留（此平台无符号链接；Linux pass 是门禁）\n'
 else
@@ -3709,13 +3709,13 @@ if [ "$T29_RC_BUILD" != 0 ]; then
     fail "isolated success-path fixture could not be built (rc=$T29_RC_BUILD): $(tail -n 5 "$TMP/out-t29-base.log" 2>/dev/null | tr '\n' ' ')"
 else
     assert_rc 0 "$(cat "$TMP/t29.rc")" \
-        "the v3->v4 upgrade completes when no gate fails (no failure was injected)"
+        "the v3->v5 upgrade completes when no gate fails (no failure was injected)"
     assert_eq "$prestate_cand_version" "$(cat "$TMP/t29.ver.after")" \
         "the candidate release is the live one after the successful upgrade"
     assert_eq "DECLARED=4
-TABLES=$prestate_v4_tables
+TABLES=$prestate_v5_tables
 QUICK=ok" "$(cat "$TMP/t29.facts.after")" \
-        "the live database really is at v4 now (the migration committed)"
+        "the live database really is at v5 now (the migration committed)"
     assert_grep '已保留迁移前 History 备份' "$TMP/out-t29-upgrade.log" \
         "the success path names the retained pre-migration backup instead of deleting it"
     assert_eq 1 "$(wc -l < "$TMP/t29.backups" | tr -d ' ')" \
@@ -3731,7 +3731,7 @@ QUICK=ok" "$(cat "$TMP/t29.facts.snap")" \
     assert_no_grep 'history schema' "$TMP/out-t29-upgrade.log" \
         "the successful upgrade issued no schema refusal (the prestate is not a gate failure)"
 
-    # Ordinary rollback must STILL fail closed while the live file is at v4 --
+    # Ordinary rollback must STILL fail closed while the live file is at v5 --
     # and name the operator-only recovery path.
     T29_REFUSE="$TMP/out-t29-refuse.log"
     rc_refuse=0
@@ -3764,7 +3764,7 @@ QUICK=ok" "$(cat "$TMP/t29.facts.snap")" \
         prestate_live_release_version > "$TMP/t29.ver.refuse"
     )
     assert_rc 1 "$(cat "$TMP/t29.rc.refuse")" \
-        "the ordinary v4 -> pre-v4 rollback still fails closed after a successful upgrade"
+        "the ordinary v5 -> older-declaring rollback still fails closed after a successful upgrade"
     assert_grep 'history schema 不兼容' "$T29_REFUSE" \
         "the refusal comes from the history schema gate"
     assert_grep 'history-prestate-' "$T29_REFUSE" \
@@ -3867,9 +3867,9 @@ else
         "the injected failure landed before the candidate's boot (the sentinel write and the refusal to start are one step)"
     assert_eq 1 "$(grep -c 'pre-boot sentinel rc=0' "$TMP/t30.preboot.log" || true)" \
         "the post-capture row was really written by that step (the hook reported its own insert succeeding)"
-    assert_no_grep 'boot declared=4' "$TMP/t30-boot.log" \
+    assert_no_grep 'boot declared=5' "$TMP/t30-boot.log" \
         "the v4 candidate never reached its boot hook, so no migration was ever attempted"
-    assert_eq 0 "$(grep -c 'boot migrated to v4' "$TMP/t30-boot.log" || true)" \
+    assert_eq 0 "$(grep -c 'boot migrated to v5' "$TMP/t30-boot.log" || true)" \
         "the log records no forward migration in this transaction"
     assert_eq "DECLARED=3
 TABLES=$prestate_v3_tables
@@ -3956,19 +3956,19 @@ if [ "$T31_RC_BUILD" != 0 ]; then
     fail "isolated downgrade-gate fixture could not be built (rc=$T31_RC_BUILD): $(tail -n 5 "$TMP/out-t31-base.log" 2>/dev/null | tr '\n' ' ')"
 else
     assert_eq "DECLARED=4" "$(grep '^DECLARED=' "$TMP/t31.facts.after")" \
-        "T31 starts from a live database the successful upgrade really migrated to v4"
+        "T31 starts from a live database the successful upgrade really migrated to v5"
     assert_eq 1 "$(wc -l < "$TMP/t31.backups" | tr -d ' ')" \
         "and from exactly one retained pre-migration (v3) snapshot -- the media a downgrade must reason about"
-    # A pre-v4 SOURCE TREE: VERSION below the live one, module declaring schema v3.
-    mkdir -p "$TMP/t31/src-prev4"
-    cp -R "$TMP/t31/src/." "$TMP/t31/src-prev4/" \
-        || fail "T31 could not build a pre-v4 source tree"
-    printf '0.4.0\n' > "$TMP/t31/src-prev4/VERSION"
-    sed 's/^SCHEMA_VERSION = 4$/SCHEMA_VERSION = 3/' \
-        "$TMP/t31/src-prev4/web/incident_history.py" > "$TMP/t31/src-prev4/web/incident_history.py.new" \
-        && mv -- "$TMP/t31/src-prev4/web/incident_history.py.new" "$TMP/t31/src-prev4/web/incident_history.py"
-    grep -q '^SCHEMA_VERSION = 3$' "$TMP/t31/src-prev4/web/incident_history.py" \
-        || fail "T31 pre-v4 source tree does not declare schema v3"
+    # A pre-v5 SOURCE TREE: VERSION below the live one, module declaring schema v3.
+    mkdir -p "$TMP/t31/src-prev5"
+    cp -R "$TMP/t31/src/." "$TMP/t31/src-prev5/" \
+        || fail "T31 could not build a pre-v5 source tree"
+    printf '0.4.0\n' > "$TMP/t31/src-prev5/VERSION"
+    sed 's/^SCHEMA_VERSION = 5$/SCHEMA_VERSION = 3/' \
+        "$TMP/t31/src-prev5/web/incident_history.py" > "$TMP/t31/src-prev5/web/incident_history.py.new" \
+        && mv -- "$TMP/t31/src-prev5/web/incident_history.py.new" "$TMP/t31/src-prev5/web/incident_history.py"
+    grep -q '^SCHEMA_VERSION = 3$' "$TMP/t31/src-prev5/web/incident_history.py" \
+        || fail "T31 pre-v5 source tree does not declare schema v3"
 
     T31_DN="$TMP/out-t31-downgrade.log"
     rc_dn=0
@@ -3980,8 +3980,8 @@ else
         export SBMON_CONF_DIR="$TMP/t31/etc/singbox-monitor"
         export SBMON_UNIT_FILE="$TMP/t31/etc/systemd/system/singbox-monitor.service"
         export SBMON_BACKUP_ROOT="$TMP/t31/var/backups/singbox-monitor"
-        export SBMON_REPO_MONITOR_DIR="$TMP/t31/src-prev4"
-        export SBMON_VERSION_FILE="$TMP/t31/src-prev4/VERSION"
+        export SBMON_REPO_MONITOR_DIR="$TMP/t31/src-prev5"
+        export SBMON_VERSION_FILE="$TMP/t31/src-prev5/VERSION"
         export SBMON_LOCK_FILE="$TMP/t31/deploy.lock"
         export MOCK_CALL_LOG="$TMP/t31-dn-calls.log"
         export MOCK_SYS_STATE="$TMP/t31/monitor-state"
@@ -4065,8 +4065,8 @@ else
         export SBMON_CONF_DIR="$TMP/t31/etc/singbox-monitor"
         export SBMON_UNIT_FILE="$TMP/t31/etc/systemd/system/singbox-monitor.service"
         export SBMON_BACKUP_ROOT="$TMP/t31/var/backups/singbox-monitor"
-        export SBMON_REPO_MONITOR_DIR="$TMP/t31/src-prev4"
-        export SBMON_VERSION_FILE="$TMP/t31/src-prev4/VERSION"
+        export SBMON_REPO_MONITOR_DIR="$TMP/t31/src-prev5"
+        export SBMON_VERSION_FILE="$TMP/t31/src-prev5/VERSION"
         export SBMON_LOCK_FILE="$TMP/t31/deploy.lock"
         export MOCK_CALL_LOG="$TMP/t31-ok-calls.log"
         export MOCK_SYS_STATE="$TMP/t31/monitor-state"
@@ -4148,14 +4148,14 @@ else
 
     # --- the candidate really booted over the same-schema file, and migrated
     # --- nothing ---
-    assert_grep 'boot declared=4 db=4' "$TMP/t32-boot.log" \
+    assert_grep 'boot declared=5 db=5' "$TMP/t32-boot.log" \
         "the candidate booted over a file already at its own schema"
     assert_no_grep 'boot migrated' "$TMP/t32-boot.log" \
         "no migration line exists to record: declared and database already agree"
     assert_eq "DECLARED=4
-TABLES=$prestate_v4_tables
+TABLES=$prestate_v5_tables
 QUICK=ok" "$(cat "$TMP/t32.facts.after")" \
-        "the live database still declares v4 with the exact v4 table set"
+        "the live database still declares v5 with the exact v5 table set"
     assert_grep 'reader 重启失败' "$TMP/out-t32-upgrade.log" \
         "the injected failure landed on the reader converge gate (so a real rollback ran)"
     assert_grep '事务前状态已恢复' "$TMP/out-t32-upgrade.log" \
