@@ -3,13 +3,21 @@
 状态：**实现前冻结契约**。本文件在写任何功能代码之前写成，是 PR-4B 的
 完整规格；实现、判别器测试与 DRAFT PR body 都以本文件为准，实现期间不得
 变更契约条款（如需变更必须先改本文件并说明理由）。
-**R2 重冻结（本轮 review blockers）**：§8/§8.1–§8.3 的“一致 verdict
+**R2 重冻结（review blockers）**：§8/§8.1–§8.3 的“一致 verdict
 snapshot”“terminal write 不回读旧行”“`window_limit` → `rearm` 门”、
 §5 的 `incident_runtime_state` 两个新列与 CHECK、§7 的 composed bundle
 health 是在 owner 复审后重新冻结的条款，**取代**首版的 category 单向拓宽
 格；§16 判别器 2/3/5 相应原位改写，并新增 20–30。变更理由：首版把
 “历史最具体 category”放在持久化层，会用上一轮归因覆盖当前分类器的
 fail-closed 结论，属于跨 generation 拼接字段，语义错误而非计数问题。
+**R3 复审修复（本轮，两个状态语义缺陷）**：§5.1 新增“状态行形状闭包”，
+取消 R2 读取端 `discovery_floor_epoch IS NULL → 回退 activation_floor_epoch`
+的隐式放大（复审 blocker B：不可证明的状态不得等于更宽的历史，DB 与运行时
+两侧同时拒绝）；§8.4 新增“`phase` 是从持久 gate 推导的量”，取消 R2 用
+“本周期分析了什么/还没评估过任何桶”反推 warmup 的做法（复审 blocker A：
+clean close 当轮与 post-clean restart 在第一个周期之前都会误报 `idle`，
+分类行为始终正确，错的是状态面）。§16 相应新增判别器 31–34，红证据见
+§16.3。两处修复都不改分类规则、不改 schema 版本、不加列。
 基线：`origin/main = a180e7dc2def41aeaa246495a8538b3e64f4b8de`（PR-4A
 分类器 + PR-3B schema v3，VERSION / MONITOR_WEB_VERSION = 0.4.0，
 History SCHEMA_VERSION = 3）。
@@ -44,6 +52,12 @@ History SCHEMA_VERSION = 3）。
   **`rearm` 门**（自动发现 fail-closed 停止，直到显式 operator re-arm；
   本轮不发明自动恢复分类器，也不加 HTTP/UI）；一个安静桶后的第二簇仍是
   **一个**运维生命周期，不拆行。
+- 状态语义（R3）：`incident_runtime_state` 的形状被 DB CHECK 闭合成
+  惰性 / 已布防（必有 discovery floor）/ 已解除布防（无 floor、无
+  指针）三种，运行时读到不可证明的形状一律 `runtime_state_corrupt`，
+  **绝不**回退到更宽的 activation floor；`phase` 是由持久 gate 与网格
+  位置**推导**出的读数（§8.4），因此 clean close 的当轮与 post-clean
+  warmup 期间的 restart 都不会报出 `idle`。
 - reader 负证据连续性：持久化 `reader_fresh_since_epoch`；
   restart/stale/invalid/unreadable/absent 一律打断连续性；之后的 fresh
   **不能**追溯修复更早的 journal 负证据（G8 fail-closed）。
@@ -166,18 +180,23 @@ CREATE TABLE incident_runtime_state (
                                          OR reader_fresh_since_epoch >= 0),
     open_incident_id INTEGER CHECK (open_incident_id IS NULL
                                     OR open_incident_id >= 1),
-    -- PR-4B R2（本轮重冻结）：发现门与 rearm 门，仍是 v4、仍恰 10 表
+    -- PR-4B R2（重冻结轮）：发现门与 rearm 门，仍是 v4、仍恰 10 表
     discovery_floor_epoch REAL CHECK (discovery_floor_epoch IS NULL
                                       OR discovery_floor_epoch
                                          >= activation_floor_epoch),
     rearm_required INTEGER NOT NULL CHECK (rearm_required IN (0, 1)),
-    CHECK (rearm_required = 0 OR (open_incident_id IS NULL
-                                  AND discovery_floor_epoch IS NULL))
+    -- PR-4B R3（§5.1）：形状闭合。rearm 立起时必须无指针、无 floor；
+    -- 一旦 activation 落地（floor>0）且未 rearm，discovery floor 就必须存在。
+    CHECK ((rearm_required = 0
+            OR (open_incident_id IS NULL
+                AND discovery_floor_epoch IS NULL))
+           AND (activation_floor_epoch <= 0 OR rearm_required = 1
+                OR discovery_floor_epoch IS NOT NULL))
 );
 ```
 
 `incident_runtime_state` 的列集因此恰为 8 列；`discovery_floor_epoch` 与
-`rearm_required` 是本轮唯一的新增列，且**不**抬 `SCHEMA_VERSION`：v4 尚未
+`rearm_required` 是 R2 唯一的新增列，且**不**抬 `SCHEMA_VERSION`：v4 尚未
 发布，fresh/v1/v2/v3 迁移直接建出这个最终形状，不为任何旧 PR-head 的临时
 v4 形状增加兼容迁移。
 
@@ -199,6 +218,31 @@ v4 形状增加兼容迁移。
   事件”从扫描器承诺升格为 DB 硬约束（去重/崩溃幂等的最后一道墙）。
 - 禁列清单（全部不得出现）：raw log、身份、IP、UUID、凭证、自由文本、
   ISP 标签、设备名、`fp`、`egress_ip`、`run_id`、endpoint 地址。
+
+### 5.1 状态行的形状闭包（R3 新增）
+
+`incident_runtime_state` 只允许三种形状，第四种（**已 activation 且未
+rearm，却没有 discovery floor**）被 DB 与本契约同时拒绝：
+
+| 形状 | activation_floor | rearm_required | discovery_floor | open_incident |
+|---|---|---|---|---|
+| 惰性（born inert） | `0` | `0` | `NULL`（或 close 在边界外落下的值） | 任意 |
+| 已布防、正在发现 | `> 0` | `0` | **必须非 NULL** | 任意 |
+| 已解除布防（rearm 门） | `> 0` | `1` | `NULL` | `NULL` |
+
+理由是 fail-closed 的方向：R2 的读取端把「`discovery_floor` 为 NULL」当作
+**回退到 `activation_floor`**，并把这件事写在注释里叫 FAIL-CLOSED。它不是。
+activation floor 比任何 discovery floor 都**更宽**（它是 one-way 的最初下界），
+所以一次字段损坏/异常写入会让扫描器重新分析 gate 已经排除掉的更旧历史——
+"P4B 无法证明状态"绝不能等于"把分析窗口放大"。R3 因此：
+
+- DB 层：上表的第二个合取项使非法形状**无法被写入**（`UPDATE ... SET
+  discovery_floor_epoch = NULL` 在已布防的行上直接 IntegrityError）。
+- 读取层：`_discovery_gate()` 见到 `rearm=0 且 floor=NULL` 立即
+  `_CycleAbort(runtime_state_corrupt)`，**不再**回退；`_activate()` 见到同一
+  形状拒绝激活（scanner 保持 DARK、`enabled=false`、零周期），因为启动路径
+  上的放大同样不可接受。
+- 桶网格仍钉在 `activation_floor_epoch`：收紧的是发现门，不是网格。
 
 ## 6. 迁移契约
 
@@ -242,10 +286,13 @@ v4 形状增加兼容迁移。
   `ceil(now/BUCKET)*BUCKET`（激活时刻的下一个完整桶边界）；**不做**
   v3 年代历史回填——floor 之前的行永不进入分析窗。同一 activation 把
   `discovery_floor_epoch` 钉成同一个值。
-- **warmup → idle**：`discovery_floor_epoch`（NULL 时 fail-closed 回退到
-  `activation_floor_epoch`）之后存在 `DISCOVERY_BUCKETS=5` 个完整桶后，
-  首次分析；此前 `phase=warmup`、零分类调用。等价表述：最近 5 桶窗口的
-  `window_start` 早于 `discovery_floor_epoch` 时保持 warmup。
+- **warmup → idle**：`discovery_floor_epoch` 之后存在
+  `DISCOVERY_BUCKETS=5` 个完整桶后，首次分析；此前 `phase=warmup`、零分类
+  调用。等价表述：最近 5 桶窗口的 `window_start` 早于
+  `discovery_floor_epoch` 时保持 warmup。R3 §5.1 取消了两处旧回退：读取端
+  **不再**在 `discovery_floor_epoch` 为 NULL 时回退到
+  `activation_floor_epoch`（那是**放大**历史，不是 fail-closed），启动端也
+  不再用“还没有评估过任何桶”来推断 warmup。
 - **idle 分析窗**：最近 5 个完整桶 `[last_complete_end-300, last_complete_end]`。
   仅当分类结果 `status == "incident"` 才开案（`insufficient_evidence`
   由 `multiple_anomaly_clusters` 路径开案是合法且被保留的）；其余状态
@@ -295,6 +342,8 @@ v4 形状增加兼容迁移。
   `open_incident_id` 非空，直接续 OPEN（analysis_start 从持久化行恢复，
   同一 incident_id），新 run_id 不得制造第二行（DB 部分唯一索引兜底）；
   若 `rearm_required=1`，重启后仍是 `rearm`（门是持久化的，不是内存的）。
+  重启后的 `phase` 按 §8.4 从持久 gate 与当前网格位置**推导**，因此落在
+  post-clean warmup 中间的重启在第一个周期之前就已经报 `warmup`。
 
 ### 8.1 一致 verdict snapshot（取代旧的 category 拓宽格）
 
@@ -342,6 +391,47 @@ snapshot”，即行内已持久化的六列，而不是新造一个。
 - 本轮**不**发明自动恢复分类器，也**不**增加 HTTP/UI re-arm 入口；
   显式 operator re-arm 属后续阶段。
 
+
+### 8.4 `phase` 是从持久 gate 推导的，不是本周期做了什么的答案（R3）
+
+R2 的实现把 warmup 记成一条**周期事实**：
+
+```python
+self._warmup_gated = (evaluated is None and open_row is None
+                      and not self._rearm_required)
+```
+
+这一条推论有两个错误的状态面窗口，而且都被 §12 的单一可观测面如实报出去：
+
+- clean close 那一轮：`open_row` 非空、`evaluated` 也非空（闭案确实结算了
+  当轮分类），于是 `warmup_gated=False` → `phase=idle`。可是同一事务里
+  store 已经把 `discovery_floor_epoch` 抬到了本次 `last_signal_epoch`，
+  discovery 从这一轮起就被门挡住。也就是说，**运行时报告 idle 的同时，
+  它自己的持久状态正在拒绝 discovery**，直到下一个 30 秒节拍才自愈。
+- 重启路径：`_activate()` 用 `last_evaluated_end_epoch is None` 推断
+  warmup。重启时该列早就有值，于是新进程在**第一个周期之前**报告 idle，
+  即使它刚读到一个仍然挡住 discovery 的 `discovery_floor_epoch`。
+
+R3 因此把 phase 变成**推导量**，与周期动作无关，只与持久 gate 和网格位置
+有关。整个模块只有一条判定式（`_warming`）：
+
+```
+warming(gate, last_complete_end) =
+    last_complete_end - DISCOVERY_BUCKETS * BUCKET_SECONDS < gate
+```
+
+三个读取点共用它：`_discovery_cycle()`（是否分析）、`_run_one_cycle()` 的
+收尾（本轮结束后的 phase）、`_activate()`（重启后第一个周期之前的 phase）。
+闭案路径必须**先**把 store 在同一事务里落下的新 gate 镜像到扫描器缓存
+（`_close_clean` 镜像 `discovery_floor_epoch=last_signal`，
+`_close_window_limit` 镜像 `rearm_required=1` + floor NULL），推导才可能得
+出正确答案——镜像只是把“store 已经写完的那一笔”提前看见，权威始终是存储，
+下一周期仍从快照重读。`rearm` 自己拥有 phase（§8.3），所以它不参与 warmup
+推导，推导结果也不会把它报成 warmup。
+
+由此得到的两条硬约束（判别器 31、32）：clean close 的**当轮**就必须报
+`warmup`；在 post-clean warmup 期间 restart 的扫描器，在**任何周期之前**
+就报 `warmup`。
 
 ## 9. reader 负证据连续性协议
 
@@ -400,7 +490,10 @@ snapshot”，即行内已持久化的六列，而不是新造一个。
   `last_evaluated_end_epoch` / `open_incident`。
 - 域：`enabled`/`running`/`open_incident` 恰 bool；`phase` ∈
   {`warmup`,`idle`,`open`,`rearm`,`degraded`} 恰 str（五 token；`rearm`
-  是 §8.3 的正常门，跨 restart 从持久化行读出）；两个 counter 恰 int ≥ 0；
+  是 §8.3 的正常门，跨 restart 从持久化行读出）。`phase` 是 §8.4 的**推导
+  值**：它描述当前持久 gate 与网格位置，不是“上一周期做了什么”的记忆，
+  所以 clean close 的当轮与 post-clean warmup 期间的 restart 都不会报出
+  `idle`；两个 counter 恰 int ≥ 0；
   `last_error_code` 为 NULL 或 §11 四 token 之一；`last_evaluated_end_epoch`
   为 NULL 或有限非负实数。无扫描器时该键为 JSON null（与 `probes` 同
   范式）。`degraded` 的闭合定义：最近一次周期失败且其后尚无成功周期。
@@ -447,7 +540,7 @@ FD / conntrack / listen-queue；客户端 ISP 身份；目的地身份；从稀�
   是删除一个错误承诺，不是删除覆盖，且必须逐条写进车道头注释。新增的
   phase token `rearm` 进入 phase 词汇门（四→五 token），HTTP 投影域同步。
 
-## 16. 判别器清单（30 条，全部必须先红后绿）
+## 16. 判别器清单（34 条，全部必须先红后绿）
 
 1. 3 基线桶 + Reality 掉线 → 恰好开一个 `reality_tcp_path` open 行，
    `analysis_start = first_signal - 180`，单个异常桶时
@@ -517,7 +610,7 @@ FD / conntrack / listen-queue；客户端 ISP 身份；目的地身份；从稀�
 19. timeline 端点 `incident_runtime` 键集恰 8 键、域闭合；无 P5 路由、
     无新查询参数、journal 表面不变宽。
 
-**PR-4B R2（本轮重冻结）新增判别器 20–30**，全部同样必须先红后绿；红
+**PR-4B R2（重冻结轮）新增判别器 20–30**，全部同样必须先红后绿；红
 证据见 §16.2。
 
 20. `reality_tcp_path` 已开案，随后一轮得到
@@ -550,11 +643,33 @@ FD / conntrack / listen-queue；客户端 ISP 身份；目的地身份；从稀�
     **仅** incident 面 degraded 绝不进入 bundle（防自我反馈），同时仍
     进入 `health()` 与 `incident_status()`。
 
+**PR-4B R3（本轮复审后新增）判别器 31–34**，同样先红后绿；红证据见
+§16.3。
+
+31. clean close 的**当轮**（不再等下一个节拍）：指针已 NULL、
+    `open_incident=false`，而 `phase == warmup`；并证其前提——新 floor 落在
+    本轮分类窗口内（`window_start + 3*BUCKET <= floor`，即
+    `first_signal <= last_signal`），所以刚闭案的三个干净桶此刻**不可能**
+    已经是五桶 trusted baseline。
+32. post-clean warmup 期间 restart：新扫描器 `start()` 成功（enabled
+    true、零周期、无 open 指针），且在**任何 `run_once()` 之前**
+    `phase == warmup`——phase 由持久 floor 与当前网格位置推导，不再来自
+    “还没有评估过任何桶”。
+33. 形状闭包的 DB 半边：在**已 activation、未 rearm** 的状态行上执行
+    `UPDATE ... SET discovery_floor_epoch = NULL` 必须
+    `sqlite3.IntegrityError`（回滚），非法形状根本进不了存储。
+34. 形状闭包的读取半边：扫描器遇到 `rearm_required=0` 且
+    `discovery_floor_epoch IS NULL` 的已布防状态时，
+    (a) `start()` 拒绝激活（线程不建、`enabled=false`、零周期），
+    (b) 运行中的周期以 `runtime_state_corrupt` 闭合失败（failure +1、
+    `cycles_completed` 不增、phase degraded），并且**一个证据 bundle 都不
+    读**——绝不把窗口放大回 `activation_floor_epoch`。
+
 ### 16.1 变异证据（R1 世代的实测记录，dev host，不再重跑）
 
 方法：把 `monitor-v2/` 与 `tests/` 复制进隔离 scratch 树，逐个施加**单点产品
 变异**（绝不改动测试期望），要求具名门变红，随后还原。基线 scratch 树
-172 verdicts / 0 FAIL / rc=0（R2 之后该树为 203 verdicts / 车道 219 检查，
+172 verdicts / 0 FAIL / rc=0（R2 之后为 203 verdicts / 车道 219，R3 之后为 208 verdicts / 车道 224，
 本表按 R1 世代原文保留）。结果 16/16 检出：
 
 | 变异 | 变红的门 |
@@ -578,7 +693,7 @@ FD / conntrack / listen-queue；客户端 ISP 身份；目的地身份；从稀�
 
 其中 **M05 的靶标已在本轮被 §8.1 作废**：`_CATEGORY_LATTICE` / `_broaden`
 与 `static/lattice_truth_table` 等四个格门随格一起删除。R2 不重跑这张表，
-而是对本轮**新冻结语义**做五个变异（M1–M5），见 §16.2。
+而是对 R2 **新冻结语义**做五个变异（M1–M5），见 §16.2。
 
 第一轮变异研究暴露并修掉了两处**测试自身的弱点**（产品未改）：
 `warmup_makes_no_classification` 原先只在首个周期之前检查，等于用"没有周期"
@@ -587,7 +702,7 @@ FD / conntrack / listen-queue；客户端 ISP 身份；目的地身份；从稀�
 history_plane` 原先在其它面的写入之后才取样，只能证明标志位自愈；现在在故障
 发生的那一刻取样。两处修改后 verdict 计数不变（39+38），车道仍 188 检查。
 
-### 16.2 R2 变异证据（本轮 5 个**新语义**变异，dev host，实测一次）
+### 16.2 R2 变异证据（R2 的 5 个**新语义**变异，dev host，实测一次）
 
 方法与 §16.1 相同：把冻结的干净副本复制进隔离 scratch 树，每次只施加一个
 **单点产品变异**，测试期望一律不改，随后整树丢弃。基线 scratch 树
@@ -618,6 +733,51 @@ history_plane` 原先在其它面的写入之后才取样，只能证明标志�
   与"同一个完整桶重复扫描必须零写"分开的判别器（§16-22 与 §16-23 成对）；
   M3 打破前者，`repeat_scans_never_duplicate` 仍绿，说明这条对偶没有互相
   掩盖。
+
+### 16.3 R3 证据（本轮 4 个新判别器的非空洞性检查，实测一次）
+
+方法与 §16.1/§16.2 相同：整树复制进隔离 scratch 根，每次只施加一个**单点
+产品变异**，测试期望一律不改，随后整树丢弃。基线 scratch 树
+208 verdicts / 0 FAIL / rc=0。
+
+本轮**不**重跑 R1 的 14 个与 R2 的 5 个变异（复审指示：两处修复都极局部，
+17 车道 battery 也不再本地重跑，全量验证交给 GitHub CI）。下面 5 个变异只
+为证明判别器 31–34 各自咬住一处真实语义。结果 5/5 检出，**每个变异恰好红
+一条具名判别器**——车道里同时变红的只有 harness 自身的 rc 门（任何一条红判
+定都会让它红，属机械后果），计数一律是 `222 passed, 2 failed`；无连带、无
+EQUIVALENT、无静默：
+
+| 变异 | 施加位置 | 变红的门 |
+| --- | --- | --- |
+| R3-1 clean close 不把 store 在同一事务落下的新 floor 交给扫描器（镜像那一行改成自赋值，等价于删掉它，缓存留在上一周期读到的旧 floor） | `incident_runtime._close_clean` | `lifecycle/clean_close_immediately_reports_warmup` |
+| R3-2 启动端仍用“还没有评估过任何桶”推断 warmup（回到 R2 的表达式） | `incident_runtime._activate` | `lifecycle/restart_in_post_clean_warmup_reports_warmup` |
+| R3-3 启动端接受不可证明的状态形状（§5.1 的形状守卫条件置假，其余不动） | `incident_runtime._activate` | `containment/unprovable_state_keeps_activation_dark` |
+| R3-4 运行端在 floor 缺失时回退到 `activation_floor_epoch`（恢复 R2 被批评的行为） | `incident_runtime._discovery_gate` | `containment/active_missing_discovery_floor_is_runtime_state_corrupt` |
+| R3-5 状态行不再钉住“已布防必有 floor”（DDL 第二个合取项改成恒真） | `incident_history` 的 `incident_runtime_state` DDL | `store/state_check_refuses_active_without_discovery_floor` |
+
+三点诚实说明：
+
+- **其一**，R3-1 只红一条，不红 `post_clean_close_discovery_stays_warmup`
+  与 `clean_close_pins_the_discovery_floor`：那两个周期动作在下一拍确实会
+  自愈（扫描器从快照重读 floor）。变异的靶子正是复审指出的那段状态面误差
+  ——闭案的**当轮**报 `idle`，而分类行为始终正确。
+- **其二**，判别器 33 与 34 是同一件事的两半：DB 拒绝把非法形状**写进**
+  存储，运行时拒绝把它**读成**更宽的历史。去掉任何一半，另一半的判据仍
+  绿：R3-5（只松 DDL）不碰两条 containment 门，R3-3/R3-4（只改读取端）不
+  碰 store 门。读取端内部的两条半边也各自独立——启动半边（拒绝激活、保持
+  DARK）只有 R3-3 能红，运行半边（`runtime_state_corrupt` 且零 bundle 读）
+  只有 R3-4 能红，说明四条判据没有互相掩盖。
+- **其三**，R3-4 的红点是“回退”而不是“崩溃”。车道之外另跑了一次隔离探针
+  （同一 scratch 树、真实 scenario bundle `normal_background`、只打印不判定）：
+  干净代码下这个周期读到的窗口列表为 `[]`、`last_error_code=
+  runtime_state_corrupt`、`runtime_failures=1`、`cycles_completed=0`、
+  `phase=degraded`；施加 R3-4 后同一个假状态行让周期**照常完成**——读到
+  1 个 bundle（`[BASE+300, BASE+600]`，即由 `activation_floor_epoch` 而非
+  丢失的 discovery gate 放行）、`cycles_completed=1`、`runtime_failures=0`、
+  `last_error_code=None`，而 `phase` 仍报 `warmup`（缓存里的 floor 是
+  `None`），也就是"已经分析完"和"还在预热"同时成立。桶网格不受影响（网格
+  始终钉在 `activation_floor_epoch`），受影响的是发现门与状态面。**若没有
+  判别器 34，这个 bug 在所有计数器与错误码上都不可见。**
 
 ## 17. 明确不做（禁区）
 

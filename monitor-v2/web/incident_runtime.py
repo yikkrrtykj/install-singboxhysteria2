@@ -169,6 +169,10 @@ class IncidentScanner:
         # own first cycle says otherwise, so a dark/pre-activation scanner
         # and a re-warming one both report warmup.
         self._warmup_gated = True
+        # A cache of the store's durable discovery floor (§8.2), refreshed
+        # from every cycle's snapshot and moved by a close in the same
+        # cycle that settled it; the store, never this field, is authority.
+        self._discovery_floor_epoch = None
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -202,7 +206,11 @@ class IncidentScanner:
         the floor, anything else -> NULL. Never raises; False means the
         scanner stays dark. The §8.3 gates (discovery floor, rearm) are
         READ here, never written: activation cannot un-learn a rearm
-        demand, so a restart keeps whatever the store settled."""
+        demand, so a restart keeps whatever the store settled. R3 §5.1
+        adds a shape wall (an activated state with no discovery floor is
+        corrupt, so the scanner stays dark instead of falling back), and
+        R3 §8.2 derives the reported phase from those gates and the grid
+        position instead of assuming it."""
         try:
             now = self._clock()
             floor = math.ceil(now / BUCKET_SECONDS) * BUCKET_SECONDS
@@ -220,6 +228,16 @@ class IncidentScanner:
         rearm = _rearm_flag(state.get("rearm_required"))
         if rearm is None:
             return False
+        activation = _epoch(state.get("activation_floor_epoch"))
+        if activation is None or activation <= 0.0:
+            return False  # no floor landed: dark, and never an assumed one
+        discovery = _epoch(state.get("discovery_floor_epoch"))
+        if not rearm and discovery is None:
+            # R3 §5.1: an activated state that carries no discovery floor is
+            # CORRUPT. It never falls back to the activation floor here
+            # either -- the scanner stays DARK rather than re-admitting the
+            # wider history the lost gate had excluded.
+            return False
         with self._lock:
             self._enabled = True
             self._rearm_required = rearm
@@ -228,7 +246,14 @@ class IncidentScanner:
             end = _epoch(state.get("last_evaluated_end_epoch"))
             self._last_evaluated_end_epoch = \
                 end if (end is not None and end > 0.0) else None
-            self._warmup_gated = self._last_evaluated_end_epoch is None
+            self._discovery_floor_epoch = discovery
+            # R3 §8.2: the phase is DERIVED from the durable gate and the
+            # grid position, never assumed from what a previous process
+            # happened to do -- a restart in the middle of a post-clean
+            # warmup reports warmup BEFORE its first cycle. rearm owns its
+            # own phase (§8.3), so it is not read as warmup here.
+            self._warmup_gated = not rearm and self._warming(
+                discovery, self._last_complete_end(activation))
             open_id = state.get("open_incident_id")
             self._open_incident_id = open_id \
                 if type(open_id) is int and not isinstance(open_id, bool) \
@@ -271,7 +296,7 @@ class IncidentScanner:
         floor = _epoch(state.get("activation_floor_epoch"))
         if floor is None or floor <= 0.0:
             return  # inert row: activation has not landed (not a failure)
-        gate = self._discovery_gate(state, floor)
+        gate = self._discovery_gate(state)
         rfs = self._derive_rfs(state.get("reader_fresh_since_epoch"))
         last_end = self._last_complete_end(floor)
         if last_end is None:
@@ -292,31 +317,47 @@ class IncidentScanner:
         else:
             evaluated = self._discovery_cycle(gate, last_end, rfs)
         with self._lock:
-            # A discovery cycle that analyzed nothing is the §8 warmup gate
-            # (or the §8.3 rearm gate), not an idle evaluation; an open
-            # cycle always did analyze unless the window was refused.
-            self._warmup_gated = (evaluated is None
-                                  and open_row is None
-                                  and not self._rearm_required)
+            # R3 §8.2: the phase is DERIVED from the durable gate as it
+            # stands AFTER this cycle, not from what the cycle happened to
+            # write. A clean close moved the floor to its own signal end in
+            # the store's transaction, so this very cycle already reports
+            # warmup; a window-limit close raised rearm, which owns its own
+            # phase.
+            self._warmup_gated = not self._rearm_required and self._warming(
+                self._discovery_floor_epoch, last_end)
         self._mark(evaluated, rfs, state)
 
-    def _discovery_gate(self, state, floor):
+    def _warming(self, gate, last_end):
+        """ONE predicate for §8's discovery gate: automatic discovery is
+        held back until the last ``DISCOVERY_BUCKETS`` window lies wholly
+        at or after the durable gate. A missing gate or a grid with no
+        complete bucket yet warms up fail-closed."""
+        if gate is None or last_end is None:
+            return True
+        return last_end - DISCOVERY_BUCKETS * BUCKET_SECONDS < gate
+
+    def _discovery_gate(self, state):
         """The discovery gate (§8's warmup floor plus the §8.3 rearm gate),
         read from the store every cycle: ``rearm_required`` stops
         automatic discovery (None), otherwise the durable
-        ``discovery_floor_epoch`` bounds warmup. A NULL floor falls
-        back FAIL-CLOSED to the one-way activation floor, so the bucket
-        grid never shifts and an unset floor never widens the analyzed
-        window."""
+        ``discovery_floor_epoch`` bounds warmup.
+
+        R3 §5.1: an activated state with NO discovery floor is corrupt and
+        aborts the cycle. It never falls back to the one-way activation
+        floor -- a state the runtime cannot prove must not re-open the
+        wider history that the lost gate had excluded, which would be the
+        opposite of fail-closed."""
         rearm = _rearm_flag(state.get("rearm_required"))
         if rearm is None:
             raise _CycleAbort(ERROR_RUNTIME_STATE_CORRUPT)
+        discovery_floor = _epoch(state.get("discovery_floor_epoch"))
         with self._lock:
             self._rearm_required = rearm
-        if rearm:
-            return None
-        discovery_floor = _epoch(state.get("discovery_floor_epoch"))
-        return floor if discovery_floor is None else discovery_floor
+            if not rearm:
+                if discovery_floor is None:
+                    raise _CycleAbort(ERROR_RUNTIME_STATE_CORRUPT)
+                self._discovery_floor_epoch = discovery_floor
+        return None if rearm else discovery_floor
 
     # -- stage: discovery (IDLE) ---------------------------------------------
 
@@ -328,7 +369,7 @@ class IncidentScanner:
         the three just-closed clean buckets become this segment's trusted
         baseline before any new row can open."""
         window_start = last_end - DISCOVERY_BUCKETS * BUCKET_SECONDS
-        if window_start < gate:
+        if self._warming(gate, last_end):
             return None  # warmup: the window is not trusted yet
         detection = self._detect(window_start, last_end, rfs)
         classification = detection.classification
@@ -405,6 +446,11 @@ class IncidentScanner:
             raise _CycleAbort(ERROR_PERSIST_FAILED)
         with self._lock:
             self._open_incident_id = None
+            # R3 §8.2: mirror the gate the store moved in the SAME
+            # transaction, exactly as §8.3 mirrors rearm -- the closed
+            # row's clean tail is the NEXT segment's baseline, so discovery
+            # is held back from THIS cycle, not from the next one.
+            self._discovery_floor_epoch = last_signal
 
     def _close_window_limit(self, row):
         """The frozen window outgrew MAX_ANALYSIS_BUCKETS: fail CLOSED from
@@ -435,6 +481,7 @@ class IncidentScanner:
             # transaction, so the phase this cycle reports is already the
             # persisted one; the next cycle re-reads it from the store.
             self._rearm_required = True
+            self._discovery_floor_epoch = None
 
     # -- stage helpers ---------------------------------------------------------
 

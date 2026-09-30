@@ -2115,8 +2115,18 @@ class IncidentHistory:
             " NULL OR discovery_floor_epoch >= activation_floor_epoch),"
             " rearm_required INTEGER NOT NULL"
             " CHECK (rearm_required IN (0, 1)),"
-            " CHECK (rearm_required = 0 OR (open_incident_id IS NULL"
-            " AND discovery_floor_epoch IS NULL)))")
+            # R3 §5.1 closes the row's SHAPE from both sides: a raised rearm
+            # gate owns a NULL floor and no pointer, and an ACTIVATED
+            # runtime owns a discovery floor -- so an armed row can never
+            # lose its floor and have the reader fall back to the wider
+            # activation floor. Pre-activation (floor 0) stays flexible:
+            # the row is born inert and a close beyond the boundary may
+            # still settle its gate.
+            " CHECK ((rearm_required = 0"
+            " OR (open_incident_id IS NULL"
+            " AND discovery_floor_epoch IS NULL))"
+            " AND (activation_floor_epoch <= 0 OR rearm_required = 1"
+            " OR discovery_floor_epoch IS NOT NULL)))")
 
     @staticmethod
     def _create_incident_state_row(conn, now):

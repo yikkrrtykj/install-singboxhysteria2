@@ -700,7 +700,15 @@ def group_store():
                      (BASE - 60.0,)),
                     ("rearm_not_zero_or_one",
                      "UPDATE incident_runtime_state SET rearm_required = 2"
-                     " WHERE id = 1", ())):
+                     " WHERE id = 1", ()),
+                    # R3 §5.1: the armed shape requires a floor. An
+                    # activated row may NOT lose its discovery floor --
+                    # that is the state the runtime also refuses to read,
+                    # because falling back to the activation floor would
+                    # widen history instead of failing closed.
+                    ("active_without_discovery_floor",
+                     "UPDATE incident_runtime_state SET"
+                     " discovery_floor_epoch = NULL WHERE id = 1", ())):
                 try:
                     gc.execute(sql, params)
                     out["state_check_refuses_%s" % label] = False
@@ -996,13 +1004,41 @@ def group_lifecycle():
         out["close_clears_pointer_and_phase"] = (
             _state(env["history"])["open_incident_id"] is None
             and env["scanner"].status()["open_incident"] is False
-            and env["scanner"].status()["phase"] == "idle")
+            and env["scanner"].status()["phase"] != "open")
+        # R3 discriminator 31: the phase is DERIVED from the durable gate as
+        #     it stands AFTER the cycle, so a clean close settles warmup in
+        #     the very cycle that closed. The old code inferred warmup from
+        #     "this cycle analysed something", so for up to one interval the
+        #     surface claimed an IDLE runtime whose discovery floor was
+        #     still holding discovery back.
+        state_after = _state(env["history"])
+        floor_after = state_after["discovery_floor_epoch"]
+        out["clean_close_immediately_reports_warmup"] = (
+            env["scanner"].status()["phase"] == "warmup"
+            and floor_after == closed["last_signal_epoch"]
+            # The premise, proved not assumed: the new floor lies inside the
+            # window this cycle classified (first_signal <= last_signal), so
+            # the three just-closed clean buckets cannot already be five
+            # buckets of trusted baseline.
+            and env["canned"]._seen[-1][0] + 3 * BUCKET <= floor_after)
+        # R3 discriminator 32: the same derivation crosses a process
+        #     boundary. A scanner started inside the post-clean warmup
+        #     reports warmup BEFORE its first cycle, from the floor the
+        #     store already holds -- not from "nothing evaluated yet".
+        restarted = _scanner(env["canned"], env["clock"])
+        restarted.start()
+        out["restart_in_post_clean_warmup_reports_warmup"] = (
+            restarted.status()["phase"] == "warmup"
+            and restarted.status()["enabled"] is True
+            and restarted.status()["cycles_completed"] == 0
+            and restarted.status()["open_incident"] is False)
+        restarted.stop(join_timeout=0.5)
         out["no_second_row_ever"] = len(_rows(env["history"])) == 1
         # R2 §8: the three just-closed clean buckets become the NEXT
         # segment's trusted baseline, so discovery must not classify again
         # until the last-5-bucket window_start catches the new floor.
         out["clean_close_pins_the_discovery_floor"] = (
-            _state(env["history"])["discovery_floor_epoch"]
+            state_after["discovery_floor_epoch"]
             == closed["last_signal_epoch"])
         reads_before = len(env["canned"]._seen)
         env["canned"]._bundle = SCEN["reality_plus_generic_probe"]
@@ -1531,6 +1567,59 @@ def group_containment():
     out["dark_scanner_cycles_nothing"] = (
         dark.status()["cycles_completed"] == 0
         and dark.status()["runtime_failures"] == 0)
+
+    # (4b) R3 §5.1: an ACTIVATED state row with NO discovery floor is
+    #      corrupt, and "the state cannot be proved" must never mean "widen
+    #      the analyzed window". This is exactly the row the store's closed
+    #      shape CHECK now refuses to hold, so it can only arrive through
+    #      damage -- and both read points refuse it: activation stays DARK
+    #      instead of inheriting the wider activation floor, and a cycle
+    #      that meets it aborts as runtime_state_corrupt WITHOUT reading a
+    #      single evidence bundle.
+    class Unarmed:
+        def __init__(self):
+            self.bundles = 0
+
+        def incident_activate(self, floor):
+            return True
+
+        def journal_status(self):
+            return {"reader": {"status": "fresh"}}
+
+        def incident_runtime_snapshot(self):
+            return {"state": {
+                "runtime_version": 1,
+                "activation_floor_epoch": float(BASE),
+                "last_evaluated_end_epoch": float(BASE + 300.0),
+                "reader_fresh_since_epoch": None,
+                "open_incident_id": None,
+                "discovery_floor_epoch": None,
+                "rearm_required": 0},
+                "open_incident": None}
+
+        def incident_runtime_mark(self, end, rfs):
+            return True
+
+        def classifier_bundle(self, window_start, window_end, reader_status):
+            self.bundles += 1
+            return None
+
+    lying = Unarmed()
+    unarmed = ir.IncidentScanner(lying, scan_interval_seconds=3600.0,
+                                 clock=lambda: BASE)
+    unarmed.start()
+    out["unprovable_state_keeps_activation_dark"] = (
+        unarmed._thread is None and unarmed.status()["enabled"] is False)
+    met = ir.IncidentScanner(lying, scan_interval_seconds=3600.0,
+                             clock=lambda: BASE + 615.0)
+    met._enabled = True
+    met.run_once()
+    out["active_missing_discovery_floor_is_runtime_state_corrupt"] = (
+        met.status()["last_error_code"] == "runtime_state_corrupt"
+        and met.status()["runtime_failures"] == 1
+        and met.status()["cycles_completed"] == 0
+        and met.status()["phase"] == "degraded"
+        and lying.bundles == 0)
 
     # (5) The scanner thread is a daemon like the probe scheduler's.
     env = _env(SCEN["normal_background"])

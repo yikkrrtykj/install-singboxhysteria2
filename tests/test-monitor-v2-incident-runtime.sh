@@ -12,8 +12,8 @@
 #      an in-flight scan cycle must never meet a closed store. The release
 #      identity is pinned at Monitor 0.5.0 / MONITOR_WEB_VERSION 0.5.0 /
 #      history SCHEMA_VERSION 4, and the contract document that froze them is
-#      present with all thirty discriminators listed (R1's nineteen plus
-#      R2's eleven).
+#      present with all thirty-four discriminators listed (R1's nineteen,
+#      R2's eleven and R3's four).
 #   2. THE SURFACE DID NOT WIDEN. There is no P5 ``/api/v1/incidents`` route,
 #      the timeline endpoint gains EXACTLY ONE key (the closed eight-key
 #      ``incident_runtime`` object), and the incident runtime module holds no
@@ -57,27 +57,32 @@ export CLASSIFY_FIXTURE_DIR="$HERE/monitor-classify/fixtures"
 
 PASS=0
 FAIL=0
-# PR-4B R2 -- 219 checks, measured on the dev host and to be re-measured on
+# PR-4B R3 -- 224 checks, measured on the dev host and to be re-measured on
 # Linux CI. The breakdown is part of the record, and so is the reason every
-# section moved: R1 measured 188 (14 + 174); R2 re-freezes the verdict
-# snapshot and the discovery/rearm gate, so gates were ADDED where the new
-# semantics need proving and RENAMED where R1 pinned semantics this round
-# deleted. No R1 gate was dropped to make room, and no expectation was
-# loosened: static 14 -> 12 (-2, the four broadening-lattice gates deleted
-# with the lattice itself, two category-surface gates added in their place),
-# store 51 -> 69 (+18), retention 6 -> 6, lifecycle 39 -> 54 (+15),
-# continuity 10 -> 10, containment 38 -> 38, end_to_end 14 -> 14: 203
-# verdicts plus the harness rc gate plus the fixture-immutability proof.
+# section moved: R1 measured 188 (14 + 174); R2 re-froze the verdict
+# snapshot and the discovery/rearm gate (219 = 14 + 205, 203 verdicts); R3
+# fixes the two review blockers -- the derived phase (§8.4) and the closed
+# state shape (§5.1) -- and every one of its five gates is ADDED, none
+# renamed, none loosened: store 69 -> 70 (+1, the armed row may not lose its
+# discovery floor), lifecycle 54 -> 56 (+2, the clean close reports warmup
+# in the cycle that closed and a restart inside the post-clean warmup
+# reports warmup before its first cycle), containment 38 -> 40 (+2, an
+# unprovable shape keeps activation dark and aborts a running cycle as
+# runtime_state_corrupt without reading one bundle). static 14 -> 12 (-2 in
+# R2, the four broadening-lattice gates deleted with the lattice itself and
+# two category-surface gates added in their place), retention 6 -> 6,
+# continuity 10 -> 10, end_to_end 14 -> 14: 208 verdicts plus the harness rc
+# gate plus the fixture-immutability proof.
 #   S0 static + wiring gates             14   the release identity (VERSION /
 #        MONITOR_WEB_VERSION / SCHEMA_VERSION), one scanner construction site
 #        and the stop-before-close teardown order, the no-P5-route and
 #        exactly-one-new-key surface walls, the runtime module's SQL-free and
-#        I/O-free call-site walls, and the contract document's THIRTY
-#        discriminator list (R1's nineteen plus R2's eleven; a gate that went
-#        missing with a lattice that went deleted could otherwise hide behind
-#        a spec that stopped mentioning it). All static, all
-#        platform-independent.
-#   S1 behaviour groups (runtime_groups) 205  = 203 harness verdicts plus the
+#        I/O-free call-site walls, and the contract document's THIRTY-FOUR
+#        discriminator list (R1's nineteen plus R2's eleven plus R3's four; a
+#        gate that went missing with a lattice that went deleted could
+#        otherwise hide behind a spec that stopped mentioning it). All
+#        static, all platform-independent.
+#   S1 behaviour groups (runtime_groups) 210  = 208 harness verdicts plus the
 #        harness rc gate plus the cross-lane fixture-immutability proof:
 #        static 12 (the six frozen constants by value, the bucket grid
 #        REFERENCED not rewritten, the numeric-literal wall that forbids a
@@ -91,9 +96,11 @@ FAIL=0
 #        anywhere, the inert single state row now eight columns born with a
 #        NULL discovery floor and rearm 0, the six emittable categories
 #        persisting while destination_specific is refused at the boundary AND
-#        by CHECK, eleven CHECK rejections -- the four new ones being a floor
-#        below the activation floor, a rearm outside {0,1}, and rearm=1 paired
-#        with an open pointer or with a discovery floor -- the one-open
+#        by CHECK, twelve CHECK rejections -- the five new ones being a floor
+#        below the activation floor, a rearm outside {0,1}, rearm=1 paired
+#        with an open pointer or with a discovery floor, and R3's armed row
+#        (activation landed, rearm 0) losing its discovery floor, the shape
+#        the reader also refuses -- the one-open
 #        partial index, the 45/28-bit positional round-trip with one-past
 #        refused twice, no identity material reaching a row, activation
 #        pinning BOTH floors one-way, a mark that never moves the pointer,
@@ -115,7 +122,9 @@ FAIL=0
 #        BOTH directions (narrowing rewrites), the clean tail closing on
 #        THAT cycle's snapshot rather than the row's old bits, the discovery
 #        floor pinned at the closed incident's last signal with warmup holding
-#        until five post-signal buckets and discovery then resuming,
+#        until five post-signal buckets and discovery then resuming -- and
+#        that warmup is the DERIVED phase (§8.4), reported by the closing
+#        cycle itself and by a scanner restarted inside it before any cycle,
 #        pointer/row landing together and both crash orders, restart
 #        continuing the same incident, a probe-only blip and a changed egress
 #        address opening and broadening nothing, bucket 60 really persisted
@@ -129,10 +138,14 @@ FAIL=0
 #        recovery stamping THIS moment and never repairing an earlier window,
 #        a restart breaking continuity, a malformed heartbeat never starting
 #        it),
-#        containment 38 (nine stage/mode fault injections each mapping to
+#        containment 40 (nine stage/mode fault injections each mapping to
 #        exactly one closed code, an exploding detect, an unencodable verdict,
 #        a defect escaping every guard, a refused activation leaving the
-#        scanner dark, the daemon thread, plane independence on the SAME store
+#        scanner dark, R3's unprovable state shape (§5.1) keeping the scanner
+#        dark at start AND ending a running cycle in runtime_state_corrupt
+#        without reading a single evidence bundle (the failure to fall back to
+#        the wider activation floor is the gate), the daemon thread,
+#        plane independence on the SAME store
 #        while the incident plane is failing, the lying-status projection
 #        forced back into its closed domains, an exploding scanner reading as
 #        null rather than a 500, and live loopback HTTP over the shipped
@@ -143,7 +156,7 @@ FAIL=0
 #        the row's bits equal to the live reader's own verdict; the quiet
 #        scenario opening nothing while still evaluating; an over-budget
 #        evidence window refused as a contained read error).
-EXPECTED_PASS=219
+EXPECTED_PASS=224
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
@@ -263,12 +276,13 @@ else
     pass "the incident runtime touches no filesystem, network or subprocess"
 fi
 
-# (6) The frozen contract is present and complete: all THIRTY discriminators
-#     are listed in the document this lane implements, so a gate that went
-#     missing cannot hide behind a spec that stopped mentioning it.
+# (6) The frozen contract is present and complete: all THIRTY-FOUR
+#     discriminators are listed in the document this lane implements, so a
+#     gate that went missing cannot hide behind a spec that stopped
+#     mentioning it.
 DISC_COUNT="$(sed -n '/^## 16\./,/^## 17\./p' "$DOC" | grep -cE '^[0-9]+\. ')"
-assert_eq '30' "$DISC_COUNT" \
-    "the P4B contract document lists all thirty discriminators"
+assert_eq '34' "$DISC_COUNT" \
+    "the P4B contract document lists all thirty-four discriminators"
 
 # (7) This lane is registered in CI where the other Monitor behaviour lanes
 #     run: a suite nobody executes is a suite that cannot fail.
