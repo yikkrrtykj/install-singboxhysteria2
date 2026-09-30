@@ -40,6 +40,7 @@ from web.broker import SnapshotBroker  # noqa: E402
 from web.e3_broker import E3Broker  # noqa: E402
 from web.e3rpc import E3RpcClient  # noqa: E402
 from web.incident_history import IncidentHistory  # noqa: E402
+from web.incident_runtime import IncidentScanner  # noqa: E402
 from web.recovery import generate_key  # noqa: E402
 from web.server import (MONITOR_WEB_VERSION, MonitorWebApp,  # noqa: E402
                         build_server)
@@ -273,11 +274,19 @@ def cmd_serve(args):
     # only -- with no such file it stays dark and does zero I/O (see
     # diagnostics/probe_scheduler.py).
     probes = ProbeScheduler(history)
+    # Issue #33 PR-4B: the incident scanner is the classifier's ONLY runtime
+    # consumer. It rides its OWN daemon thread; a dark activation (refused
+    # history plane) leaves it enabled=False with zero cycles, and every
+    # scan exception is contained inside its four-token error vocabulary --
+    # it can never stop or delay the broker, the probe scheduler, the web
+    # server, or the collector (see web/incident_runtime.py).
+    scanner = IncidentScanner(history)
     broker = SnapshotBroker(collector, poll_seconds=args.poll,
                             health_file=args.health_file,
                             incident_history=history)
     broker.start()
     probes.start()
+    scanner.start()
 
     auth = AuthStore(data_dir, session_ttl=args.session_ttl)
     if not auth.password_configured():
@@ -288,7 +297,8 @@ def cmd_serve(args):
                         auth=auth, remote_mode=remote_mode,
                         e3_broker=E3Broker(E3RpcClient()),
                         incident_history=history,
-                        probe_scheduler=probes)
+                        probe_scheduler=probes,
+                        incident_scanner=scanner)
     server = build_server(app, args.listen, args.port, tls_context)
     scheme = "https" if tls_context is not None else "http"
     print("monitor web (%s) listening on %s:%d [%s]" %
@@ -301,6 +311,10 @@ def cmd_serve(args):
     finally:
         probes.stop()
         broker.stop()
+        # PR-4B: the scanner must be down BEFORE the History store closes --
+        # an in-flight scan cycle reads the runtime-state row, and a missing
+        # row is a fail-closed _HistoryError, never a silent recreation.
+        scanner.stop()
         server.server_close()
         history.close()
     return 0

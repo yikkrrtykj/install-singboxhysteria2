@@ -13,17 +13,19 @@ Safety contract (all enforced, all tested):
   non-directory / non-regular type) is REFUSED, never followed. SQLite
   runs ``journal_mode=DELETE`` (no stray -wal/-shm files),
   ``synchronous=FULL``, ``foreign_keys=ON`` and a bounded busy timeout.
-  Schema handling is strict: a genuinely fresh DB is created at v3; an
-  existing DB opens only with an exactly-declared v3 on EXACTLY the
-  eight v3 tables, or with EXACTLY the seven v2 tables (migrated FORWARD
-  to v3 in one transaction), or with EXACTLY the three v1 tables
-  (migrated FORWARD to v3 in one transaction), with every pre-existing
-  row preserved. Any extra unrelated table, any other declared version
-  (newer, negative, malformed, hybrid) or metadata-less SQLite file is
-  refused fail-closed and never mutated -- migrations are explicit and
-  forward-only. A database at v3 opened by a pre-v3 build refuses on
-  exactly this gate, which is what the deploy-side rollback compatibility
-  gate mirrors BEFORE any mutation.
+  Schema handling is strict: a genuinely fresh DB is created at v4; an
+  existing DB opens only with an exactly-declared v4 on EXACTLY the ten
+  v4 tables, or with EXACTLY the eight v3 tables (migrated FORWARD to v4
+  in one transaction), or with EXACTLY the seven v2 tables (migrated
+  FORWARD all the way to v4 in one transaction), or with EXACTLY the
+  three v1 tables (migrated FORWARD all the way to v4 in one
+  transaction), with every pre-existing row preserved. Any extra
+  unrelated table, any other declared version (newer, negative,
+  malformed, hybrid) or metadata-less SQLite file is refused fail-closed
+  and never mutated -- migrations are explicit and forward-only. A
+  database at v4 opened by a pre-v4 build refuses on exactly this gate,
+  which is what the deploy-side rollback compatibility gate mirrors
+  BEFORE any mutation.
 * Threading: ONE reentrant lock serializes the whole of ``open`` /
   ``on_publish`` (write + retention) / ``health`` / ``query_timeline`` /
   ``close`` against each other -- exactly one thread may touch the shared
@@ -95,6 +97,28 @@ Journal ingest (issue #33 P2, PR-2B activation):
   header aggregates, reader run id and ingest timestamps. Raw journal
   lines, addresses, credentials and free text have nowhere to go --
   the record grammar rejects them at the boundary.
+
+Incident plane (issue #33 Phase 4, PR-4B):
+
+* The v4 ``incident_windows`` / ``incident_runtime_state`` tables are the
+  persistence side of the deterministic incident lifecycle. Verdicts,
+  categories and bitsets are stored ONLY in their closed CHECK-bound
+  forms: six emittable categories, two closure reasons, positional
+  bitsets whose 45/28 widths are pinned by the classifier's closed
+  vocabularies, and the partial unique index that makes TWO OPEN
+  INCIDENTS unrepresentable. No raw logs, identities, addresses or free
+  text have a column to land in.
+* The internal ``classifier_bundle`` reader is the ONLY evidence read
+  the runtime scanner ever gets: bounded per-section row budgets, the
+  already-persisted column projections, and a caller-supplied reader
+  freshness token. It NEVER widens ``query_timeline`` and never feeds
+  anything but the classifier.
+* Incident persistence carries its OWN degraded state (fourth
+  subsystem, same discipline as journal and probe): a failed window
+  write can never be swallowed by a successful ordinary sample write,
+  and the runtime's open-incident pointer is updated in the SAME
+  transaction as the window row it mirrors, so a crash can never leave
+  the runtime pointing at a row that does not exist.
 """
 
 from __future__ import annotations
@@ -119,7 +143,7 @@ except ImportError:  # packaged monitor release does not (yet) ship the lib
     _journal_schema = None
     JOURNAL_CONTRACT_AVAILABLE = False
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 DB_NAME = "history.sqlite3"
 
@@ -174,6 +198,11 @@ CODE_PROBE_RESULT_REJECTED = "history_probe_result_rejected"
 # from an empty directory on purpose: "I could not look" is a storage
 # failure, "I looked and found nothing" is a clean pass.
 CODE_EXCHANGE_UNREADABLE = "history_journal_exchange_unreadable"
+# PR-4B incident plane: the storage-side refusal for an incident window
+# or runtime-state write. Like the probe plane this is persistence-side
+# only -- a refused evidence bundle or a quiet analysis window is DATA
+# and never degrades here.
+CODE_HISTORY_INCIDENT_PERSIST_FAILED = "history_incident_persist_failed"
 
 # -- journal ingest surface (issue #33 P2, PR-2B) -----------------------------
 
@@ -222,14 +251,17 @@ _JOURNAL_TABLES = frozenset({"journal_runs", "journal_events",
                              "journal_ingest_audit",
                              "journal_ingest_state"})
 _PROBE_TABLES = frozenset({"network_probe_samples"})
+_INCIDENT_TABLES = frozenset({"incident_windows",
+                              "incident_runtime_state"})
 # EXACT shapes -- the schema gate is table-set EQUALITY, not a subset:
 # an unrelated extra table is a shape this module never created, so an
-# open that claims v1/v2/v3 while carrying one is refused fail-closed
+# open that claims v1/v2/v3/v4 while carrying one is refused fail-closed
 # (zero bytes mutated), never "adopted apart from the stranger".
 _META_TABLE = "meta"
 _ALLOWED_V1_SHAPE = _V1_TABLES | {_META_TABLE}
 _ALLOWED_V2_SHAPE = _ALLOWED_V1_SHAPE | _JOURNAL_TABLES
 _ALLOWED_V3_SHAPE = _ALLOWED_V2_SHAPE | _PROBE_TABLES
+_ALLOWED_V4_SHAPE = _ALLOWED_V3_SHAPE | _INCIDENT_TABLES
 
 # -- probe ingest surface (issue #33 Phase 3, PR-3B) ---------------------------
 
@@ -254,6 +286,58 @@ PROBE_LATENCY_MAX_MS = 120000
 # meaning while it is plausibly the same egress session; older than the
 # window (default retention horizon) it is history, not a baseline.
 PROBE_EGRESS_BASELINE_WINDOW_SECONDS = RETENTION_SECONDS
+
+# -- incident plane (issue #33 Phase 4, PR-4B) ---------------------------------
+
+# The v4 incident tables are the FROZEN PR-4B contract (docs/
+# monitor-v2-incident-runtime-p4b.md §5). The evidence/unknown columns
+# are POSITIONAL bitsets: bit i of the sorted closed classifier
+# vocabulary is bit i of the integer. The widths below are therefore
+# PINNED by the classifier's closed vocabularies (45 evidence tokens,
+# 28 unknown tokens): a future vocabulary growth overflows the DB CHECK
+# and fails the write CLOSED, which is exactly what forces a schema v5
+# review instead of silently shifting the meaning of stored bits.
+INCIDENT_CLASSIFIER_VERSION = 1
+INCIDENT_EVIDENCE_BITS_MAX = 35184372088831   # 2**45 - 1
+INCIDENT_UNKNOWN_BITS_MAX = 268435455         # 2**28 - 1
+# The six categories the classifier can actually emit. destination_specific
+# is structurally unemittable (PR-4A) and therefore has no CHECK slot
+# here either: a buggy caller cannot store what the engine cannot say.
+INCIDENT_WINDOW_CATEGORIES = (
+    "common_inbound_client_office", "hysteria2_udp_path",
+    "insufficient_evidence", "reality_tcp_path", "vps_outbound",
+    "vps_process_or_api")
+INCIDENT_CLOSURE_CLEAN_BUCKETS = "clean_buckets"
+INCIDENT_CLOSURE_WINDOW_LIMIT = "window_limit"
+INCIDENT_CLOSURE_REASONS = (INCIDENT_CLOSURE_CLEAN_BUCKETS,
+                             INCIDENT_CLOSURE_WINDOW_LIMIT)
+# Window bucket-count bound: MUST equal the classifier's MAX_BUCKETS (60).
+# Stated locally on purpose -- this module never imports the classifier
+# (task #9's single-consumer gate) -- and mirror-checked by the lane.
+INCIDENT_BUDGET_MAX = 60
+# The internal bundle reader's per-section budget: one analysis window
+# can carry at most this many rows from EACH evidence section (§7), the
+# same bound class as QUERY_LIMIT_MAX.
+CLASSIFIER_BUNDLE_ROW_BUDGET = 2000
+# Closed reader freshness tokens the bundle reader accepts from its
+# caller (the runtime scanner derives "fresh"/"stale"; §9). The other
+# heartbeat-name tokens stay the journal reader's vocabulary -- the
+# classifier consumes "stale" for ANY non-fresh runtime derivation.
+CLASSIFIER_READER_STATUSES = ("fresh", "stale")
+
+
+def _encode_incident_bits(tokens, maximum):
+    """Boundary gate for a bitset about to be persisted: EXACTLY a plain
+    non-negative int within the frozen width. The positional mapping
+    itself is the classifier's property (``evidence_to_bits`` and its
+    siblings), so this module validates the RESULT, not the vocabulary --
+    deny-by-default on the stored integer, exactly like every other
+    column here."""
+    if type(tokens) is not int or isinstance(tokens, bool):
+        return None
+    if tokens < 0 or tokens > maximum:
+        return None
+    return tokens
 
 
 def classify_protocol(inbound, inbound_type=""):
@@ -505,6 +589,14 @@ class IncidentHistory:
         self._probe_last_error_code = None
         self._probe_persisted_total = 0
         self._probe_rejected_total = 0
+        # Incident plane (PR-4B) is a FOURTH independent health
+        # subsystem (same discipline): a failed incident-window or
+        # runtime-state write is recorded here and can never be
+        # swallowed by a successful ordinary sample write.
+        self._incident_degraded = False
+        self._incident_last_error_code = None
+        self._incident_persisted_total = 0
+        self._incident_rejected_total = 0
 
     # -- public surface (NONE of these ever raise) -----------------------------
 
@@ -548,13 +640,7 @@ class IncidentHistory:
             # NEVER swallowed by a successful higher-plane write in the
             # same publication. Probe degradation is persistence-side
             # only -- ordinary network-failure evidence never enters it.
-            degraded = bool(self._degraded or self._journal_degraded
-                            or self._probe_degraded)
-            code = self._last_error_code
-            if code is None and self._journal_degraded:
-                code = self._journal_last_error_code
-            if code is None and self._probe_degraded:
-                code = self._probe_last_error_code
+            degraded, code = self._evidence_health_locked()
             return {
                 "enabled": bool(self._enabled),
                 "degraded": degraded,
@@ -564,6 +650,24 @@ class IncidentHistory:
                 "last_error_code": code,
                 "run_id": self._run_id,
             }
+
+    def _evidence_health_locked(self):
+        """The composed health of the three planes the CLASSIFIER reads
+        (ordinary samples / journal / probe). Shared by ``health()`` and
+        the bundle reader so the two surfaces cannot drift.
+        ``_incident_degraded`` is deliberately NOT part of it: the
+        incident persistence plane is this bundle's only consumer, so
+        feeding its own degradation back into the evidence would let one
+        refused close poison the next classification's health judgement
+        (§7, PR-4B R2)."""
+        degraded = bool(self._degraded or self._journal_degraded
+                        or self._probe_degraded)
+        code = self._last_error_code
+        if code is None and self._journal_degraded:
+            code = self._journal_last_error_code
+        if code is None and self._probe_degraded:
+            code = self._probe_last_error_code
+        return degraded, code
 
     def query_timeline(self, since=None, limit=QUERY_LIMIT_DEFAULT):
         """Bounded, sanitized read of the persisted timeline.
@@ -749,6 +853,574 @@ class IncidentHistory:
                 "persisted_total": int(self._probe_persisted_total),
                 "rejected_total": int(self._probe_rejected_total),
             }
+
+    # -- incident plane surface (issue #33 Phase 4, PR-4B) ----------------------
+
+    # Exact persisted incident-window columns (deny-by-default like every
+    # other projection here).
+    INCIDENT_WINDOW_COLUMNS = (
+        "incident_id", "classifier_version", "state", "category",
+        "analysis_start_epoch", "first_signal_epoch", "last_signal_epoch",
+        "last_classified_end_epoch", "closed_epoch", "closure_reason",
+        "buckets", "evidence_bits", "unknown_bits", "created_epoch",
+        "updated_epoch")
+
+    def classifier_bundle(self, window_start, window_end, reader_status):
+        """THE internal evidence read the incident runtime gets (§7).
+
+        Projects ONLY the already-persisted columns of the six evidence
+        sections -- timeline_samples, device_protocol_states,
+        network_probe_samples, journal_events, journal_ingest_audit and
+        the health triple -- into the closed classifier bundle shape,
+        bounded by CLASSIFIER_BUNDLE_ROW_BUDGET per section over
+        ``window_start <= epoch < window_end``. A section that cannot
+        fit its rows inside the budget REFUSES THE WHOLE BUNDLE: partial
+        evidence must never be classified as if it were complete. This
+        path NEVER widens ``query_timeline`` (it is a separate, narrower
+        read) and its result feeds ONLY the classifier. Returns None on
+        any refusal or storage failure (never raises)."""
+        try:
+            with self._lock:
+                if not self._enabled or self._conn is None:
+                    return None
+                return self._classifier_bundle_locked(window_start,
+                                                      window_end,
+                                                      reader_status)
+        except _HistoryError:
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return None
+        except (sqlite3.Error, OSError):
+            self._rollback_quiet()
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return None
+        except Exception:  # noqa: BLE001 -- incident plane containment
+            self._rollback_quiet()
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return None
+
+    def incident_runtime_snapshot(self):
+        """Sanitized read of the runtime-state row plus the open incident
+        row (None when absent). This is the webapp status object's ONLY
+        incident source and the scanner's crash-recovery source. Never
+        raises."""
+        try:
+            with self._lock:
+                if not self._enabled or self._conn is None:
+                    return {"state": None, "open_incident": None}
+                return self._incident_runtime_snapshot_locked()
+        except (sqlite3.Error, OSError):
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return {"state": None, "open_incident": None}
+
+    def incident_activate(self, activation_floor_epoch):
+        """One-way activation floor (§4): the first call pins WHERE
+        runtime analysis may begin (no v3-era backfill); a later call
+        with a DIFFERENT value is a no-op that still reports True --
+        re-activation can never rewind or move the floor, so a scanner
+        restart is idempotent. Returns False only on a shape/storage
+        refusal (never raises)."""
+        try:
+            with self._lock:
+                if not self._enabled or self._conn is None:
+                    return False
+                return self._incident_activate_locked(
+                    activation_floor_epoch)
+        except _HistoryError:
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return False
+        except (sqlite3.Error, OSError):
+            self._rollback_quiet()
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return False
+        except Exception:  # noqa: BLE001 -- incident plane containment
+            self._rollback_quiet()
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return False
+
+    def incident_open_window(self, category, analysis_start_epoch,
+                             first_signal_epoch, last_signal_epoch,
+                             last_classified_end_epoch, buckets,
+                             evidence_bits, unknown_bits):
+        """Open ONE incident window AND point the runtime state at it in
+        the SAME transaction: the partial unique index refuses a second
+        open, and the pointer can never outlive a crash that lost the
+        row. Returns the new incident_id, or None on any refusal (never
+        raises)."""
+        try:
+            with self._lock:
+                if not self._enabled or self._conn is None:
+                    return None
+                return self._incident_open_window_locked(
+                    category, analysis_start_epoch, first_signal_epoch,
+                    last_signal_epoch, last_classified_end_epoch, buckets,
+                    evidence_bits, unknown_bits, self._clock())
+        except _HistoryError:
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return None
+        except (sqlite3.Error, OSError):
+            self._rollback_quiet()
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return None
+        except Exception:  # noqa: BLE001 -- incident plane containment
+            self._rollback_quiet()
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return None
+
+    def incident_update_window(self, incident_id, category,
+                               last_signal_epoch,
+                               last_classified_end_epoch, buckets,
+                               evidence_bits, unknown_bits):
+        """Refresh the SAME open row in place (§6/§8.1). The six written
+        columns are ONE snapshot of ONE classification: this boundary
+        does not know and does not care which category is "more specific"
+        -- it enforces only the durable facts (the target row exists, is
+        open, and the new values satisfy the closed CHECKs), so no
+        cross-generation stitching is possible here. A non-open or
+        missing target is a refusal, never a silent no-op. Returns True
+        iff the row landed (never raises)."""
+        try:
+            with self._lock:
+                if not self._enabled or self._conn is None:
+                    return False
+                return self._incident_update_window_locked(
+                    incident_id, category, last_signal_epoch,
+                    last_classified_end_epoch, buckets, evidence_bits,
+                    unknown_bits, self._clock())
+        except _HistoryError:
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return False
+        except (sqlite3.Error, OSError):
+            self._rollback_quiet()
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return False
+        except Exception:  # noqa: BLE001 -- incident plane containment
+            self._rollback_quiet()
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return False
+
+    def incident_close_window(self, incident_id, category, last_signal_epoch,
+                              last_classified_end_epoch, buckets,
+                              evidence_bits, unknown_bits, closure_reason):
+        """Close the open row AND move the runtime gate in the SAME
+        transaction (§6/§8.3): the pointer clears either way, a
+        clean_buckets close re-arms discovery AT this row's signal end,
+        and a window_limit close drops the discovery floor and raises
+        ``rearm_required`` so automatic discovery stops fail-closed until
+        an operator re-arms it. closure_reason is the frozen closed enum
+        (clean_buckets / window_limit). Returns True iff the row landed
+        (never raises)."""
+        try:
+            with self._lock:
+                if not self._enabled or self._conn is None:
+                    return False
+                return self._incident_close_window_locked(
+                    incident_id, category, last_signal_epoch,
+                    last_classified_end_epoch, buckets, evidence_bits,
+                    unknown_bits, closure_reason, self._clock())
+        except _HistoryError:
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return False
+        except (sqlite3.Error, OSError):
+            self._rollback_quiet()
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return False
+        except Exception:  # noqa: BLE001 -- incident plane containment
+            self._rollback_quiet()
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return False
+
+    def incident_runtime_mark(self, last_evaluated_end_epoch,
+                              reader_fresh_since_epoch):
+        """Per-cycle runtime-state advance (§6/§9): how far the scanner
+        has evaluated and where reader continuity currently begins. The
+        open_incident_id pointer is deliberately NOT a parameter -- it
+        only moves inside the open/close transactions, so a plain mark
+        can never desync it. Returns True iff the mark landed (never
+        raises)."""
+        try:
+            with self._lock:
+                if not self._enabled or self._conn is None:
+                    return False
+                return self._incident_runtime_mark_locked(
+                    last_evaluated_end_epoch, reader_fresh_since_epoch)
+        except _HistoryError:
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return False
+        except (sqlite3.Error, OSError):
+            self._rollback_quiet()
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return False
+        except Exception:  # noqa: BLE001 -- incident plane containment
+            self._rollback_quiet()
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return False
+
+    def incident_status(self):
+        """Closed, sanitized incident-plane status (parity with
+        ``probe_status``): no categories, no windows, no exception
+        text -- counters and the one code only."""
+        with self._lock:
+            return {
+                "enabled": bool(self._enabled),
+                "degraded": bool(self._incident_degraded),
+                "last_error_code": self._incident_last_error_code,
+                "persisted_total": int(self._incident_persisted_total),
+                "rejected_total": int(self._incident_rejected_total),
+            }
+
+    # -- incident plane internals ------------------------------------------------
+
+    @staticmethod
+    def _incident_epoch(value):
+        """EXACTLY a plain int/float epoch: finite, non-negative, not a
+        bool (the probe boundary's timestamp rule, reused)."""
+        if type(value) not in (int, float) or not math.isfinite(value):
+            return None
+        if value < 0:
+            return None
+        return float(value)
+
+    def _classifier_bundle_locked(self, window_start, window_end,
+                                  reader_status):
+        start = self._incident_epoch(window_start)
+        end = self._incident_epoch(window_end)
+        if (start is None or end is None or end <= start
+                or type(reader_status) is not str
+                or reader_status not in CLASSIFIER_READER_STATUSES):
+            self._incident_rejected_total += 1
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return None
+        sections = (
+            ("samples", "timeline_samples", "epoch", SAMPLE_COLUMNS),
+            ("device_states", "device_protocol_states", "epoch",
+             DEVICE_STATE_COLUMNS),
+            ("probe_rows", "network_probe_samples", "epoch",
+             PROBE_COLUMNS),
+            ("journal_events", "journal_events", "ts",
+             ("seq", "ts", "cls", "proto", "port", "dcls", "fp", "n")),
+            ("audit", "journal_ingest_audit", "epoch",
+             ("epoch", "kind", "seq", "code")),
+        )
+        evidence_degraded, evidence_code = self._evidence_health_locked()
+        bundle = {
+            "window": {"start_epoch": start, "end_epoch": end},
+            "health": {
+                "enabled": bool(self._enabled),
+                "degraded": evidence_degraded,
+                "last_error_code": evidence_code,
+            },
+            "reader": {"status": reader_status},
+        }
+        for name, table, column, columns in sections:
+            rows = self._conn.execute(
+                "SELECT %s FROM %s WHERE %s >= ? AND %s < ?"
+                " ORDER BY %s ASC LIMIT ?"
+                % (", ".join(columns), table, column, column, column),
+                (start, end, CLASSIFIER_BUNDLE_ROW_BUDGET + 1)
+            ).fetchall()
+            if len(rows) > CLASSIFIER_BUNDLE_ROW_BUDGET:
+                # over-budget evidence would be a silently TRUNCATED
+                # view classified as if complete -- refuse the whole
+                # bundle instead (§7)
+                self._incident_rejected_total += 1
+                self._record_incident_failure(
+                    CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+                return None
+            bundle[name] = [_project_rows(row, columns) for row in rows]
+        return bundle
+
+    def _incident_runtime_snapshot_locked(self):
+        state_row = self._conn.execute(
+            "SELECT runtime_version, activation_floor_epoch,"
+            " last_evaluated_end_epoch, reader_fresh_since_epoch,"
+            " open_incident_id, discovery_floor_epoch, rearm_required"
+            " FROM incident_runtime_state"
+            " WHERE id = 1").fetchone()
+        state = None
+        if state_row is not None:
+            state = {
+                "runtime_version": state_row[0],
+                "activation_floor_epoch": state_row[1],
+                "last_evaluated_end_epoch": state_row[2],
+                "reader_fresh_since_epoch": state_row[3],
+                "open_incident_id": state_row[4],
+                "discovery_floor_epoch": state_row[5],
+                "rearm_required": state_row[6],
+            }
+        open_row = None
+        if state is not None and state["open_incident_id"] is not None:
+            row = self._conn.execute(
+                "SELECT %s FROM incident_windows WHERE incident_id = ?"
+                % ", ".join(self.INCIDENT_WINDOW_COLUMNS),
+                (state["open_incident_id"],)).fetchone()
+            if row is not None:
+                open_row = _project_rows(row, self.INCIDENT_WINDOW_COLUMNS)
+        return {"state": state, "open_incident": open_row}
+
+    def _incident_runtime_row_present_locked(self):
+        if self._conn.execute(
+                "SELECT id FROM incident_runtime_state"
+                " WHERE id = 1").fetchone() is None:
+            # a missing continuity row is NEVER silently recreated
+            raise _HistoryError(CODE_SCHEMA_UNSUPPORTED)
+
+    def _incident_activate_locked(self, activation_floor_epoch):
+        floor = self._incident_epoch(activation_floor_epoch)
+        if floor is None:
+            self._incident_rejected_total += 1
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return False
+        self._incident_runtime_row_present_locked()
+        row = self._conn.execute(
+            "SELECT activation_floor_epoch FROM incident_runtime_state"
+            " WHERE id = 1").fetchone()
+        current = float(row[0])
+        if current > 0.0:
+            return True  # one-way: first activation wins, restart-safe
+        # The first activation owns three columns in ONE statement, so a
+        # crash can never leave a floor without its discovery gate (§5).
+        # activation_floor_epoch stays the one-way / no-backfill authority;
+        # discovery starts where activation starts and nothing is armed
+        # yet, so a fresh floor never inherits a stale rearm demand.
+        self._conn.execute(
+            "UPDATE incident_runtime_state SET activation_floor_epoch = ?,"
+            " discovery_floor_epoch = ?, rearm_required = 0"
+            " WHERE id = 1 AND activation_floor_epoch = 0.0",
+            (floor, floor))
+        self._conn.commit()
+        return True
+
+    def _incident_values_locked(self, category, last_signal_epoch,
+                                last_classified_end_epoch, buckets,
+                                evidence_bits, unknown_bits):
+        """The shared closed-shape validation for every window write.
+        Returns the validated tuple or None (one rejection counter, the
+        raw candidate never reaches SQL)."""
+        if type(category) is not str \
+                or category not in INCIDENT_WINDOW_CATEGORIES:
+            return None
+        last_signal = self._incident_epoch(last_signal_epoch)
+        classified_end = self._incident_epoch(last_classified_end_epoch)
+        if last_signal is None or classified_end is None \
+                or classified_end < last_signal:
+            return None
+        if type(buckets) is not int or isinstance(buckets, bool) \
+                or buckets < 1 or buckets > INCIDENT_BUDGET_MAX:
+            return None
+        evidence = _encode_incident_bits(evidence_bits,
+                                         INCIDENT_EVIDENCE_BITS_MAX)
+        unknown = _encode_incident_bits(unknown_bits,
+                                        INCIDENT_UNKNOWN_BITS_MAX)
+        if evidence is None or unknown is None:
+            return None
+        return (category, last_signal, classified_end, buckets,
+                evidence, unknown)
+
+    def _incident_open_window_locked(self, category, analysis_start_epoch,
+                                     first_signal_epoch, last_signal_epoch,
+                                     last_classified_end_epoch, buckets,
+                                     evidence_bits, unknown_bits, now):
+        analysis_start = self._incident_epoch(analysis_start_epoch)
+        first_signal = self._incident_epoch(first_signal_epoch)
+        values = self._incident_values_locked(
+            category, last_signal_epoch, last_classified_end_epoch,
+            buckets, evidence_bits, unknown_bits)
+        now = self._incident_epoch(now)
+        if (analysis_start is None or first_signal is None or now is None
+                or first_signal < analysis_start or values is None):
+            self._incident_rejected_total += 1
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return None
+        category, last_signal, classified_end, buckets, evidence, \
+            unknown = values
+        self._incident_runtime_row_present_locked()
+        cursor = self._conn.execute(
+            "INSERT INTO incident_windows (classifier_version, state,"
+            " category, analysis_start_epoch, first_signal_epoch,"
+            " last_signal_epoch, last_classified_end_epoch,"
+            " closed_epoch, closure_reason, buckets, evidence_bits,"
+            " unknown_bits, created_epoch, updated_epoch)"
+            " VALUES (?, 'open', ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?,"
+            " ?, ?)",
+            (INCIDENT_CLASSIFIER_VERSION, category, analysis_start,
+             first_signal, last_signal, classified_end, buckets, evidence,
+             unknown, now, now))
+        incident_id = int(cursor.lastrowid)
+        # the pointer rides the SAME transaction: both or neither
+        self._conn.execute(
+            "UPDATE incident_runtime_state SET open_incident_id = ?"
+            " WHERE id = 1", (incident_id,))
+        self._conn.commit()
+        self._incident_persisted_total += 1
+        self._incident_degraded = False
+        self._incident_last_error_code = None
+        return incident_id
+
+    def _incident_update_window_locked(self, incident_id, category,
+                                       last_signal_epoch,
+                                       last_classified_end_epoch, buckets,
+                                       evidence_bits, unknown_bits, now):
+        if type(incident_id) is not int or isinstance(incident_id, bool) \
+                or incident_id < 1:
+            self._incident_rejected_total += 1
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return False
+        values = self._incident_values_locked(
+            category, last_signal_epoch, last_classified_end_epoch,
+            buckets, evidence_bits, unknown_bits)
+        now = self._incident_epoch(now)
+        if values is None or now is None:
+            self._incident_rejected_total += 1
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return False
+        category, last_signal, classified_end, buckets, evidence, \
+            unknown = values
+        cursor = self._conn.execute(
+            "UPDATE incident_windows SET category = ?,"
+            " last_signal_epoch = ?, last_classified_end_epoch = ?,"
+            " buckets = ?, evidence_bits = ?, unknown_bits = ?,"
+            " updated_epoch = ?"
+            " WHERE incident_id = ? AND state = 'open'",
+            (category, last_signal, classified_end, buckets, evidence,
+             unknown, now, incident_id))
+        if cursor.rowcount != 1:
+            self._rollback_quiet()
+            self._incident_rejected_total += 1
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return False
+        self._conn.commit()
+        self._incident_persisted_total += 1
+        self._incident_degraded = False
+        self._incident_last_error_code = None
+        return True
+
+    def _incident_close_window_locked(self, incident_id, category,
+                                      last_signal_epoch,
+                                      last_classified_end_epoch, buckets,
+                                      evidence_bits, unknown_bits,
+                                      closure_reason, now):
+        if type(incident_id) is not int or isinstance(incident_id, bool) \
+                or incident_id < 1:
+            self._incident_rejected_total += 1
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return False
+        if type(closure_reason) is not str \
+                or closure_reason not in INCIDENT_CLOSURE_REASONS:
+            self._incident_rejected_total += 1
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return False
+        values = self._incident_values_locked(
+            category, last_signal_epoch, last_classified_end_epoch,
+            buckets, evidence_bits, unknown_bits)
+        now = self._incident_epoch(now)
+        if values is None or now is None or now < values[1]:
+            # closed_epoch must not precede the signal it closes over
+            self._incident_rejected_total += 1
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return False
+        category, last_signal, classified_end, buckets, evidence, \
+            unknown = values
+        cursor = self._conn.execute(
+            "UPDATE incident_windows SET state = 'closed', category = ?,"
+            " last_signal_epoch = ?, last_classified_end_epoch = ?,"
+            " buckets = ?, evidence_bits = ?, unknown_bits = ?,"
+            " closed_epoch = ?, closure_reason = ?, updated_epoch = ?"
+            " WHERE incident_id = ? AND state = 'open'",
+            (category, last_signal, classified_end, buckets, evidence,
+             unknown, now, closure_reason, now, incident_id))
+        if cursor.rowcount != 1:
+            self._rollback_quiet()
+            self._incident_rejected_total += 1
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return False
+        # The pointer clears in the SAME transaction as the close, and so
+        # does the discovery gate (§8.3): one statement, so no crash and no
+        # CHECK-visible intermediate can leave an incident closed with a
+        # stale gate. A clean close re-arms discovery AT the signal end,
+        # making its three clean buckets the next segment's baseline; a
+        # window-limit close disarms automatic discovery entirely until an
+        # operator re-arms it, and refuses to let outage rows become a new
+        # baseline by dropping the floor to NULL.
+        if closure_reason == INCIDENT_CLOSURE_CLEAN_BUCKETS:
+            gate = (" open_incident_id = NULL, discovery_floor_epoch = ?,"
+                    " rearm_required = 0")
+            gate_values: tuple = (last_signal,)
+        else:
+            gate = (" open_incident_id = NULL, discovery_floor_epoch = NULL,"
+                    " rearm_required = 1")
+            gate_values = ()
+        self._conn.execute(
+            "UPDATE incident_runtime_state SET" + gate + " WHERE id = 1",
+            gate_values)
+        self._conn.commit()
+        self._incident_persisted_total += 1
+        self._incident_degraded = False
+        self._incident_last_error_code = None
+        return True
+
+    def _incident_runtime_mark_locked(self, last_evaluated_end_epoch,
+                                      reader_fresh_since_epoch):
+        evaluated = self._incident_epoch(last_evaluated_end_epoch)
+        fresh = self._incident_epoch(reader_fresh_since_epoch) \
+            if reader_fresh_since_epoch is not None else None
+        if reader_fresh_since_epoch is not None and fresh is None:
+            self._incident_rejected_total += 1
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return False
+        if evaluated is None:
+            self._incident_rejected_total += 1
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return False
+        self._incident_runtime_row_present_locked()
+        self._conn.execute(
+            "UPDATE incident_runtime_state SET"
+            " last_evaluated_end_epoch = ?, reader_fresh_since_epoch = ?"
+            " WHERE id = 1", (evaluated, fresh))
+        self._conn.commit()
+        self._incident_persisted_total += 1
+        self._incident_degraded = False
+        self._incident_last_error_code = None
+        return True
+
+    def _record_incident_failure(self, code):
+        # Incident plane is INDEPENDENT: never touches _degraded /
+        # _journal_* / _probe_*; only a later accepted incident write
+        # clears it. Pure field bookkeeping under the RLock.
+        with self._lock:
+            self._failure_count += 1
+            self._incident_degraded = True
+            self._incident_last_error_code = code
 
     # -- probe ingest internals ------------------------------------------------
 
@@ -956,6 +1628,8 @@ class IncidentHistory:
         self._journal_last_error_code = None
         self._probe_degraded = False
         self._probe_last_error_code = None
+        self._incident_degraded = False
+        self._incident_last_error_code = None
         # startup cleanup: retention first, before any new row is added
         self._cleanup("startup")
         self._last_cleanup_ts = self._clock()
@@ -997,24 +1671,27 @@ class IncidentHistory:
     def _enforce_schema(self, conn, pre_existing):
         """STRICT schema gate -- the whole DB is opened read-only-first.
 
-        Accepted shapes are exactly four: a genuinely fresh database
+        Accepted shapes are exactly five: a genuinely fresh database
         (absent or zero-byte file, no tables) which is created at the
         current version, an existing database that DECLARES the current
-        schema_version and whose tables are EXACTLY the eight v3 tables,
-        an existing database that declares v2 whose tables are EXACTLY
-        the seven v2 tables (migrated FORWARD to v3 in ONE transaction,
-        zero v2 rows touched), and an existing database that declares v1
-        whose tables are EXACTLY the three v1 tables (migrated FORWARD
-        all the way to v3 in ONE transaction, zero v1 rows touched).
-        Any extra unrelated table (under any declaration), any newer,
-        zero, negative, malformed or meta-less claim, a stripped or
-        hybrid shape -- all are refused with CODE_SCHEMA_UNSUPPORTED
-        before any pragma, DDL or write can touch the file. In
-        particular no lower version is ever silently rewritten:
-        migration is the explicit v1->v3 / v2->v3 path below and nothing
-        else -- and a v3 file opened by a PRE-v3 build is refused by the
-        SAME gate, which is the runtime half of the rollback
-        compatibility contract.
+        schema_version and whose tables are EXACTLY the ten v4 tables,
+        an existing database that declares v3 whose tables are EXACTLY
+        the eight v3 tables (migrated FORWARD to v4 in ONE transaction,
+        zero v3 rows touched), an existing database that declares v2
+        whose tables are EXACTLY the seven v2 tables (migrated FORWARD
+        all the way to v4 in ONE transaction, zero v2 rows touched), and
+        an existing database that declares v1 whose tables are EXACTLY
+        the three v1 tables (migrated FORWARD all the way to v4 in ONE
+        transaction, zero v1 rows touched). Any extra unrelated table
+        (under any declaration), any newer, zero, negative, malformed
+        or meta-less claim, a stripped or hybrid shape -- all are
+        refused with CODE_SCHEMA_UNSUPPORTED before any pragma, DDL or
+        write can touch the file. In particular no lower version is
+        ever silently rewritten: migration is the explicit
+        v1->v4 / v2->v4 / v3->v4 path below and nothing else -- and a
+        v4 file opened by a PRE-v4 build is refused by the SAME gate,
+        which is the runtime half of the rollback compatibility
+        contract.
         """
         conn.execute("PRAGMA busy_timeout=%d" % BUSY_TIMEOUT_MS)
         tables = {row[0] for row in conn.execute(
@@ -1038,11 +1715,11 @@ class IncidentHistory:
             raise _HistoryError(CODE_SCHEMA_UNSUPPORTED)
         version = int(raw)
         if version == SCHEMA_VERSION:
-            if tables != _ALLOWED_V3_SHAPE:
-                # meta CLAIMS v3 but the shape is not EXACTLY the eight
-                # v3 tables -- stripped, hybrid, or carrying an unrelated
-                # extra table this module never created: unknown shape,
-                # refuse rather than adopt
+            if tables != _ALLOWED_V4_SHAPE:
+                # meta CLAIMS v4 but the shape is not EXACTLY the ten
+                # v4 tables -- stripped, hybrid, or carrying an
+                # unrelated extra table this module never created:
+                # unknown shape, refuse rather than adopt
                 raise _HistoryError(CODE_SCHEMA_UNSUPPORTED)
             self._apply_pragmas(conn)
             if conn.execute("SELECT terminal_seq FROM journal_ingest_state"
@@ -1050,6 +1727,20 @@ class IncidentHistory:
                 # state row missing under a complete table set is an
                 # unknown shape too -- never a repair
                 raise _HistoryError(CODE_SCHEMA_UNSUPPORTED)
+            if conn.execute("SELECT id FROM incident_runtime_state"
+                            " WHERE id = 1").fetchone() is None:
+                # the incident runtime state row is the same class of
+                # single-row continuity: present under every complete
+                # v4 shape, never recreated when missing
+                raise _HistoryError(CODE_SCHEMA_UNSUPPORTED)
+            return
+        if version == 3:
+            # EXACT v3 only: the eight v3 tables -- no incident tables
+            # yet (hybrid) and no unrelated extra table either.
+            if tables != _ALLOWED_V3_SHAPE:
+                raise _HistoryError(CODE_SCHEMA_UNSUPPORTED)
+            self._apply_pragmas(conn)
+            self._migrate_v3_to_v4(conn)
             return
         if version == 2:
             # EXACT v2 only: the seven v2 tables -- no probe table yet
@@ -1057,7 +1748,7 @@ class IncidentHistory:
             if tables != _ALLOWED_V2_SHAPE:
                 raise _HistoryError(CODE_SCHEMA_UNSUPPORTED)
             self._apply_pragmas(conn)
-            self._migrate_v2_to_v3(conn)
+            self._migrate_v2_to_v4(conn)
             return
         if version == 1:
             # EXACT v1 only: precisely the three v1 tables -- no journal
@@ -1067,7 +1758,7 @@ class IncidentHistory:
             if tables != _ALLOWED_V1_SHAPE:
                 raise _HistoryError(CODE_SCHEMA_UNSUPPORTED)
             self._apply_pragmas(conn)
-            self._migrate_v1_to_v3(conn)
+            self._migrate_v1_to_v4(conn)
             return
         # NEWER, ZERO, NEGATIVE or otherwise unknown declared version:
         # refuse; an explicit forward-only migration is the ONLY way a
@@ -1085,7 +1776,7 @@ class IncidentHistory:
             conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
 
     def _create_schema(self, conn):
-        """Fresh database: the full v3 shape in ONE explicit
+        """Fresh database: the full v4 shape in ONE explicit
         transaction (DDL auto-commits under sqlite3 legacy mode, so an
         unbounded CREATE chain could otherwise strand a half-created
         file that no later gate would adopt)."""
@@ -1097,6 +1788,8 @@ class IncidentHistory:
             self._create_journal_tables(conn)
             self._create_journal_state_row(conn, now)
             self._create_probe_table(conn)
+            self._create_incident_tables(conn)
+            self._create_incident_state_row(conn, now)
             conn.commit()
         except BaseException:
             try:
@@ -1352,20 +2045,121 @@ class IncidentHistory:
             % (slot, slot, slot, slot, slot, PROBE_LATENCY_MAX_MS, slot,
                slot, slot))
 
-    def _migrate_v1_to_v3(self, conn):
-        """The v1 source jumps to v3 in ONE explicit transaction:
-        journal tables + probe table + state row + the schema_version
-        flip. Zero v1 rows are read, moved or rewritten; any
-        mid-migration failure rolls the whole thing back, leaving an
-        untouched exact-v1 database, so startup after a crash simply
-        re-runs the migration. (v1 was never meant to stop at v2: the
-        intermediate v2-only migration of the 0.3.x line is subsumed
-        here -- the end shape is identical to a v2->v3 walk.)"""
+    @classmethod
+    def _create_incident_tables(cls, conn):
+        """v4 incident tables: the closed CHECKs mirror the FROZEN PR-4B
+        contract (docs/monitor-v2-incident-runtime-p4b.md §5) -- six
+        emittable categories (destination_specific is structurally
+        unemittable and therefore has no CHECK slot), the two closure
+        reasons, epoch ordering invariants, the positional-bitset upper
+        bounds pinned by the classifier's closed vocabularies (45
+        evidence / 28 unknown tokens), and the open-row CHECK pairing
+        state with closed_epoch/closure_reason. The partial unique index
+        is the durable ONE-OPEN-INCIDENT wall: a second concurrent open
+        INSERT is a constraint violation, not a race to be managed."""
+        conn.execute(
+            "CREATE TABLE incident_windows ("
+            " incident_id INTEGER PRIMARY KEY,"
+            " classifier_version INTEGER NOT NULL"
+            " CHECK (classifier_version = 1),"
+            " state TEXT NOT NULL CHECK (state IN ('open','closed')),"
+            " category TEXT NOT NULL CHECK (category IN (%s)),"
+            " analysis_start_epoch REAL NOT NULL"
+            " CHECK (analysis_start_epoch >= 0),"
+            " first_signal_epoch REAL NOT NULL"
+            " CHECK (first_signal_epoch >= analysis_start_epoch),"
+            " last_signal_epoch REAL NOT NULL"
+            " CHECK (last_signal_epoch >= first_signal_epoch),"
+            " last_classified_end_epoch REAL NOT NULL"
+            " CHECK (last_classified_end_epoch >= first_signal_epoch),"
+            " closed_epoch REAL CHECK (closed_epoch IS NULL"
+            " OR closed_epoch >= last_signal_epoch),"
+            " closure_reason TEXT CHECK (closure_reason IS NULL"
+            " OR closure_reason IN (%s)),"
+            " buckets INTEGER NOT NULL CHECK (buckets >= 1"
+            " AND buckets <= 60),"
+            " evidence_bits INTEGER NOT NULL CHECK (evidence_bits"
+            " BETWEEN 0 AND %d),"
+            " unknown_bits INTEGER NOT NULL CHECK (unknown_bits"
+            " BETWEEN 0 AND %d),"
+            " created_epoch REAL NOT NULL,"
+            " updated_epoch REAL NOT NULL"
+            " CHECK (updated_epoch >= created_epoch),"
+            " CHECK ((state = 'open' AND closed_epoch IS NULL"
+            " AND closure_reason IS NULL)"
+            " OR (state = 'closed' AND closed_epoch IS NOT NULL"
+            " AND closure_reason IS NOT NULL)))"
+            % (cls._in_list(INCIDENT_WINDOW_CATEGORIES),
+               cls._in_list(INCIDENT_CLOSURE_REASONS),
+               INCIDENT_EVIDENCE_BITS_MAX, INCIDENT_UNKNOWN_BITS_MAX))
+        conn.execute(
+            "CREATE UNIQUE INDEX ux_incident_windows_one_open"
+            " ON incident_windows(state) WHERE state = 'open'")
+        conn.execute(
+            "CREATE TABLE incident_runtime_state ("
+            " id INTEGER PRIMARY KEY CHECK (id = 1),"
+            " runtime_version INTEGER NOT NULL CHECK (runtime_version = 1),"
+            " activation_floor_epoch REAL NOT NULL"
+            " CHECK (activation_floor_epoch >= 0),"
+            " last_evaluated_end_epoch REAL NOT NULL"
+            " CHECK (last_evaluated_end_epoch >= 0),"
+            " reader_fresh_since_epoch REAL CHECK (reader_fresh_since_epoch"
+            " IS NULL OR reader_fresh_since_epoch >= 0),"
+            " open_incident_id INTEGER CHECK (open_incident_id IS NULL"
+            " OR open_incident_id >= 1),"
+            # PR-4B R2: the discovery gate and the rearm gate. Still v4,
+            # still exactly ten tables -- the gate is durable state, not
+            # scanner memory, because a restart must not un-learn that the
+            # frozen window was outlived (§8.3).
+            " discovery_floor_epoch REAL CHECK (discovery_floor_epoch IS"
+            " NULL OR discovery_floor_epoch >= activation_floor_epoch),"
+            " rearm_required INTEGER NOT NULL"
+            " CHECK (rearm_required IN (0, 1)),"
+            # R3 §5.1 closes the row's SHAPE from both sides: a raised rearm
+            # gate owns a NULL floor and no pointer, and an ACTIVATED
+            # runtime owns a discovery floor -- so an armed row can never
+            # lose its floor and have the reader fall back to the wider
+            # activation floor. Pre-activation (floor 0) stays exempt
+            # because that is the row's birth shape: inert with a NULL
+            # floor, and the first activation lands BOTH floors in one
+            # statement, so no armed row is ever written without a gate.
+            " CHECK ((rearm_required = 0"
+            " OR (open_incident_id IS NULL"
+            " AND discovery_floor_epoch IS NULL))"
+            " AND (activation_floor_epoch <= 0 OR rearm_required = 1"
+            " OR discovery_floor_epoch IS NOT NULL)))")
+
+    @staticmethod
+    def _create_incident_state_row(conn, now):
+        """The single runtime-state row, born INERT: no activation floor
+        (0.0 is pre-activation, not a real floor), nothing evaluated,
+        no reader continuity, no open incident, no discovery floor and no
+        rearm demand. The scanner raises the floor and starts evaluating;
+        until then the runtime is warmup."""
+        conn.execute(
+            "INSERT INTO incident_runtime_state (id, runtime_version,"
+            " activation_floor_epoch, last_evaluated_end_epoch,"
+            " reader_fresh_since_epoch, open_incident_id,"
+            " discovery_floor_epoch, rearm_required)"
+            " VALUES (1, 1, 0.0, 0.0, NULL, NULL, NULL, 0)", ())
+
+    def _migrate_v1_to_v4(self, conn):
+        """The v1 source jumps to v4 in ONE explicit transaction:
+        journal tables + probe table + incident tables + state rows +
+        the schema_version flip. Zero v1 rows are read, moved or
+        rewritten; any mid-migration failure rolls the whole thing
+        back, leaving an untouched exact-v1 database, so startup after
+        a crash simply re-runs the migration. (v1 was never meant to
+        stop at v2 or v3: the intermediate migrations of the 0.3.x /
+        0.4.x lines are subsumed here -- the end shape is identical to
+        a v2->v4 or v3->v4 walk.)"""
         try:
             conn.execute("BEGIN")
             self._create_journal_tables(conn)
             self._create_journal_state_row(conn, self._clock())
             self._create_probe_table(conn)
+            self._create_incident_tables(conn)
+            self._create_incident_state_row(conn, self._clock())
             conn.execute("UPDATE meta SET value = ?"
                          " WHERE key = 'schema_version'",
                          (str(SCHEMA_VERSION),))
@@ -1377,15 +2171,43 @@ class IncidentHistory:
                 pass
             raise
 
-    def _migrate_v2_to_v3(self, conn):
-        """The v2 source adds EXACTLY the one v3 table and flips the
-        version in a SINGLE explicit transaction -- zero v2 rows
-        touched, no journal-shape rewrite, forward-only. A crash
-        anywhere before the commit rolls back whole and the untouched
-        exact-v2 file re-migrates on the next open."""
+    def _migrate_v2_to_v4(self, conn):
+        """The v2 source adds EXACTLY the v3 probe table and the v4
+        incident tables and flips the version in a SINGLE explicit
+        transaction -- zero v2 rows touched, no journal-shape rewrite,
+        forward-only. A crash anywhere before the commit rolls back
+        whole and the untouched exact-v2 file re-migrates on the next
+        open."""
         try:
             conn.execute("BEGIN")
             self._create_probe_table(conn)
+            self._create_incident_tables(conn)
+            self._create_incident_state_row(conn, self._clock())
+            conn.execute("UPDATE meta SET value = ?"
+                         " WHERE key = 'schema_version'",
+                         (str(SCHEMA_VERSION),))
+            conn.commit()
+        except BaseException:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            raise
+
+    def _migrate_v3_to_v4(self, conn):
+        """The v3 source adds EXACTLY the two v4 incident tables and
+        their state row and flips the version in a SINGLE explicit
+        transaction -- zero v3 rows touched (every pre-existing
+        sample/state/probe/journal row survives byte-for-byte), no
+        probe-shape rewrite, forward-only. A crash anywhere before the
+        commit rolls back whole and the untouched exact-v3 file
+        re-migrates on the next open. The retained prestate snapshot
+        the deploy layer takes BEFORE this runs is what makes a
+        refused or rolled-back activation restorable."""
+        try:
+            conn.execute("BEGIN")
+            self._create_incident_tables(conn)
+            self._create_incident_state_row(conn, self._clock())
             conn.execute("UPDATE meta SET value = ?"
                          " WHERE key = 'schema_version'",
                          (str(SCHEMA_VERSION),))
@@ -1811,6 +2633,16 @@ class IncidentHistory:
             self._conn.execute(
                 "DELETE FROM journal_ingest_audit WHERE epoch < ?",
                 (horizon,))
+            # v4 incident windows join the SAME 7-day contract (§10) with
+            # their own rule: a CLOSED window ages out by its last signal
+            # age; an OPEN window is live operational state and is NEVER
+            # retention-pruned; incident_runtime_state is the continuity
+            # authority (like journal_ingest_state) and never prunes at
+            # all. Neither table is in _PRUNE_SOURCES: size pruning stays
+            # a pure-evidence-timeline discipline.
+            self._conn.execute(
+                "DELETE FROM incident_windows WHERE state = 'closed'"
+                " AND last_signal_epoch < ?", (horizon,))
             self._conn.commit()
             # Spec §5: time-based retention is the normal path; SIZE pruning
             # kicks in only when the HARD CEILING is crossed, and then

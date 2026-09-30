@@ -1250,6 +1250,66 @@ def group_invariants():
         cl.classify(value).status == "indeterminate"
         for value in hostile_inputs)
 
+    # PR-4B: detect() is classify() plus the anomalous-bucket positions, and
+    # the positions are a pure restatement of the candidate list _analyse
+    # already computed. The classification halves must be identical on EVERY
+    # bundle the harness knows -- there is no second analysis path -- and the
+    # metadata must be ()/None/None exactly when the verdict is not an
+    # incident, and exact bucket-boundary arithmetic when it is.
+    detect_same = True
+    metadata_rule = True
+    arithmetic = True
+    for obj in bundles:
+        detection = cl.detect(obj)
+        if not isinstance(detection, cl.Detection):
+            detect_same = False
+            metadata_rule = False
+            continue
+        if detection.classification.to_dict() != cl.classify(obj).to_dict():
+            detect_same = False
+        if detection.classification.status == cl.STATUS_INCIDENT:
+            if (not detection.anomaly_bucket_indices
+                    or detection.first_signal_epoch is None
+                    or detection.last_signal_epoch is None):
+                metadata_rule = False
+            start = float(obj["window"]["start_epoch"])
+            want_first = (start
+                          + detection.anomaly_bucket_indices[0]
+                          * cl.BUCKET_SECONDS)
+            want_last = (start
+                         + (detection.anomaly_bucket_indices[-1] + 1)
+                         * cl.BUCKET_SECONDS)
+            if (detection.first_signal_epoch != want_first
+                    or detection.last_signal_epoch != want_last):
+                arithmetic = False
+        else:
+            if (detection.anomaly_bucket_indices != ()
+                    or detection.first_signal_epoch is not None
+                    or detection.last_signal_epoch is not None):
+                metadata_rule = False
+    out["detect_matches_classify_everywhere"] = detect_same
+    out["detection_metadata_tracks_incidence"] = metadata_rule
+    out["detection_epochs_are_bucket_arithmetic"] = arithmetic
+    detect_never_raises = True
+    for value in hostile_inputs:
+        try:
+            detection = cl.detect(value)
+        except Exception:  # noqa: BLE001 -- the gate IS the absence
+            detect_never_raises = False
+        else:
+            if (not isinstance(detection, cl.Detection)
+                    or not isinstance(detection.classification,
+                                     cl.Classification)):
+                detect_never_raises = False
+    out["detect_never_raises_on_hostile_input"] = detect_never_raises
+    detect_untouched = True
+    for obj in bundles:
+        snapshot = repr(obj)
+        cl.detect(obj)
+        if repr(obj) != snapshot:
+            detect_untouched = False
+    out["detect_mutates_no_input"] = detect_untouched
+
     # A fuzzed bundle is refused or answered, never a crash and never an
     # open-ended object.
     fuzz_closed = True
@@ -1686,8 +1746,8 @@ def group_store():
     import web.incident_history as ih
     history, obj, counts, root = _build_store()
     try:
-        out["store_opens_on_schema_v3"] = (
-            ih.SCHEMA_VERSION == 3 and counts["schema_version"] == 3
+        out["store_opens_on_schema_v4"] = (
+            ih.SCHEMA_VERSION == 4 and counts["schema_version"] == 4
             and counts["sample_rows"] > 0)
         out["store_probe_rows_persist"] = counts["probe_rows"] >= 8
         out["store_journal_rows_ingest"] = counts["journal_rows"] >= 40

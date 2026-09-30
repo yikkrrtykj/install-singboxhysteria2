@@ -9,13 +9,15 @@
 # properties the review contract demands proof of, in the order a reviewer
 # should check them:
 #
-#   1. DARKNESS. The classifier is a pure function nobody calls. Nothing in
-#      the runtime imports it, no route, schema, deploy, systemd, scheduler
-#      or collector surface references it, and the shipped VERSION /
-#      MONITOR_WEB_VERSION / SCHEMA_VERSION are exactly the values this PR
-#      inherited. A phase that changes an answer but no behaviour is a phase
-#      that can be reviewed on its logic alone -- so the lane proves the
-#      absence of wiring rather than trusting a promise.
+#   1. A SINGLE REVIEWED CONSUMER. The classifier is still a pure function,
+#      but PR-4B wires it into the runtime through exactly one reviewed
+#      consumer: web/incident_runtime.py (the IncidentScanner). The darkness
+#      gate becomes a closed allowlist pinning that single file -- no second
+#      consumer, no other surface: no route, schema, deploy, systemd,
+#      scheduler or collector path may reference the module, and the shipped
+#      VERSION / MONITOR_WEB_VERSION / SCHEMA_VERSION are exactly the values
+#      this PR froze. The lane proves the wiring is exactly the reviewed
+#      wiring rather than trusting a promise.
 #   2. A CLOSED VOCABULARY, PINNED AS LITERALS HERE. Seven categories, three
 #      statuses, forty-five evidence tokens, twenty-eight unknown tokens, the
 #      six categories the sealing wall actually admits, and the two halves of
@@ -44,7 +46,7 @@
 #      window),
 #      nineteen hostile refusals, determinism/purity/closure invariants, a
 #      privacy wall that feeds real sentinel material through every section,
-#      and a group that builds a REAL schema-v3 database, reads the rows back
+#      and a group that builds a REAL schema-v4 database, reads the rows back
 #      out of SQLite and classifies those.
 #
 # Everything here is pure Python over a pure-stdlib module: no network, no
@@ -63,7 +65,21 @@ FAIL=0
 # PR-4A round 4 -- 665 checks, measured on the dev host and to be re-measured
 # on Linux CI. The move from 582 is gates that were written, never a count that
 # was waved through, and the breakdown is part of the record:
-#   S0 static + darkness gates              13   unchanged
+# PR-4B adds exactly 5 checks, all inside S3's invariants group, and nothing
+# previously counted moved (665 -> 670): detect_matches_classify_everywhere,
+# detection_metadata_tracks_incidence, detection_epochs_are_bucket_arithmetic,
+# detect_never_raises_on_hostile_input, detect_mutates_no_input. They pin the
+# PR-4B contract that detect() is classify() plus pure bucket-position
+# metadata over the SAME single analysis path.
+#   S0 static + darkness gates              13   unchanged in count; gate (3)
+#        is PR-4B's intentional DARK-gate rework -- the zero-importer demand
+#        is now a closed single-consumer allowlist naming web/incident_runtime.py
+#        -- and gate (6) is PR-4B-restated: the live store now builds the ten
+#        v4 tables (the eight v3 evidence tables plus the two incident tables)
+#        and pins SCHEMA_VERSION == 4. The 0.5.0 VERSION pins are PR-4B's own,
+#        the same single-consumer allowlist is pinned again in the packaging
+#        lane, and the release this lane guards is Monitor 0.5.0 on history
+#        schema v4.
 #   S1 closed vocabulary, pinned literal    12   unchanged in count, but two
 #        of those literals moved: the unknown vocabulary gained
 #        device_states_are_change_only (27 -> 28) and the probe failure split
@@ -79,16 +95,18 @@ FAIL=0
 #        whichever row happened to be written last; tls_failed and
 #        protocol_failed on the generic slots, once each; and a probe outage
 #        whose only extra witness is a changed egress address)
-#   S3 behaviour groups (classify_groups)  623   mirrors 24 (+0: two existing
+#   S3 behaviour groups (classify_groups)  628   (623 + 5 PR-4B detect()
+#        invariants, documented above); mirrors 24 (+0: two existing
 #        gates were strengthened, and engine_probe_codes_agree now reads the
 #        engine's OWN ssl/http/UDP mapping instead of trusting this file's
 #        prose), scenarios 419 (+75: 36 rows became 43 -- four device-table
 #        windows, the reversed-order disagreement that makes the tie-break
 #        direction live in both directions, and the two moved probe codes,
 #        each with its control),
-#        hostiles 116 unchanged, invariants 16 unchanged, privacy 7, store 25,
+#        hostiles 116 unchanged, invariants 16 -> 21 (PR-4B: the five detect()
+#        invariants documented above), privacy 7, store 25,
 #        fixtures 14, plus the harness rc and the fixtures-unchanged proof
-EXPECTED_PASS=665
+EXPECTED_PASS=670
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
@@ -122,6 +140,12 @@ HARNESS="$HERE/monitor-classify/classify_groups.py"
 FIX_REAL="$CLASSIFY_FIXTURE_DIR/incident-reality-outage.json"
 FIX_NORMAL="$CLASSIFY_FIXTURE_DIR/incident-normal-background.json"
 WORKFLOW="$ROOT/.github/workflows/tests.yml"
+# Every shipped module the classifier may be wired through, checked by name
+# before it is grepped: a missing file would turn a "no reference found"
+# into a vacuous pass.
+for surface in "$SERVER_PY" "$WEBAPP" "$HIST_PY" "$COLLECTOR"; do
+    [ -f "$surface" ] || fail "surface file missing: $surface"
+done
 
 section "S0: static + darkness gates"
 
@@ -180,12 +204,16 @@ else
     fail "the classifier is no longer a pure function"
 fi
 
-# (3) Dark means UNCALLED, and the only trustworthy proof is a search of the
-# whole shipped tree for an import of the module name.
+# (3) PR-4B ends the darkness with EXACTLY ONE reviewed runtime consumer:
+# web/incident_runtime.py (the IncidentScanner). The proof is still a search
+# of the whole shipped tree for the module name -- but the assertion is now
+# a closed allowlist pinning that single file, not a demand for zero
+# importers: a second consumer, or a different one, breaks the single-
+# consumer contract exactly as surely as an unreviewed first one would.
 IMPORTERS="$(grep -rl 'incident_classifier' --include='*.py' \
     "$ROOT/monitor-v2" 2>/dev/null | grep -v 'web/incident_classifier.py' || true)"
-assert_eq "" "$IMPORTERS" \
-    "no module under monitor-v2 imports the classifier (PR-4A stays dark)"
+assert_eq "$ROOT/monitor-v2/web/incident_runtime.py" "$IMPORTERS" \
+    "exactly one runtime consumer imports the classifier: web/incident_runtime.py (closed allowlist)"
 if grep -q 'incident_classif' "$SERVER_PY" "$WEBAPP" "$HIST_PY" "$COLLECTOR"; then
     fail "a server, webapp, history or collector surface names the classifier"
 else
@@ -203,25 +231,28 @@ if grep -rq 'incident_classif' "$ROOT/monitor-v2/deploy" 2>/dev/null; then
 else
     pass "deploy/ is untouched by PR-4A"
 fi
-# (5) The frozen release identity this PR inherits. PR-4A ships no behaviour
-# change, so a version bump here would be a claim the lane cannot support.
-assert_eq '0.4.0' "$(cat "$ROOT/monitor-v2/VERSION")" \
-    "VERSION is still 0.4.0 (a dark classifier releases nothing)"
-if grep -q 'MONITOR_WEB_VERSION = "0.4.0"' "$SERVER_PY"; then
-    pass "MONITOR_WEB_VERSION is still 0.4.0"
+# (5) The frozen release identity this PR ships. PR-4B lands the incident
+# runtime, so the release it guards is Monitor 0.5.0 on history schema v4.
+assert_eq '0.5.0' "$(cat "$ROOT/monitor-v2/VERSION")" \
+    "VERSION is 0.5.0 (the incident-runtime release)"
+if grep -q 'MONITOR_WEB_VERSION = "0.5.0"' "$SERVER_PY"; then
+    pass "MONITOR_WEB_VERSION is 0.5.0"
 else
-    fail "MONITOR_WEB_VERSION moved off 0.4.0"
+    fail "MONITOR_WEB_VERSION moved off 0.5.0"
 fi
 # (6) Not a declaration check but a live one: build the database the module
-# actually creates and name the tables it actually made. PR-4A may not
-# migrate, so the eight v3 tables are the whole world this classifier is
-# written against -- including the absence of a per-edge, Reality-target or
-# net-counter table.
+# actually creates and name the tables it actually made. PR-4B migrates the
+# store to v4, so the classifier now sees ten tables: the eight v3 evidence
+# tables it was written against -- still the whole vocabulary it may name,
+# still with no per-edge, Reality-target or net-counter table -- plus the two
+# incident tables the incident plane owns. The classifier still never reads
+# the new tables: gate (4) proves there is no SQL in the file, and PR-4B's
+# packaging gate pins exactly one runtime consumer for the module.
 if "$PY" - <<'EOF'
 import os, shutil, sqlite3, sys, tempfile
 sys.path.insert(0, os.environ["MONITOR_V2_ROOT"])
 import web.incident_history as ih
-assert ih.SCHEMA_VERSION == 3, "the schema moved: PR-4A may not migrate"
+assert ih.SCHEMA_VERSION == 4, "the schema moved off v4: PR-4B owns v4"
 root = tempfile.mkdtemp()
 h = ih.IncidentHistory(os.path.join(root, "diagnostics"), "c" * 32,
                        monitor_version="classify-lane")
@@ -233,12 +264,13 @@ made = {row[0] for row in sqlite3.connect(
     "SELECT name FROM sqlite_master WHERE type='table'")}
 assert made == {"meta", "timeline_samples", "device_protocol_states",
                 "journal_runs", "journal_events", "journal_ingest_audit",
-                "journal_ingest_state", "network_probe_samples"}, \
+                "journal_ingest_state", "network_probe_samples",
+                "incident_windows", "incident_runtime_state"}, \
     "the live store created %r" % (sorted(made),)
 shutil.rmtree(root, ignore_errors=True)
 EOF
 then
-    pass "a live store still builds exactly the eight v3 tables this PR read"
+    pass "a live store builds exactly the ten v4 tables (eight evidence + two incident)"
 else
     fail "the live store shape differs from the one the classifier mirrors"
 fi
