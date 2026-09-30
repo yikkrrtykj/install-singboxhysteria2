@@ -307,7 +307,10 @@ INCIDENT_WINDOW_CATEGORIES = (
     "common_inbound_client_office", "hysteria2_udp_path",
     "insufficient_evidence", "reality_tcp_path", "vps_outbound",
     "vps_process_or_api")
-INCIDENT_CLOSURE_REASONS = ("clean_buckets", "window_limit")
+INCIDENT_CLOSURE_CLEAN_BUCKETS = "clean_buckets"
+INCIDENT_CLOSURE_WINDOW_LIMIT = "window_limit"
+INCIDENT_CLOSURE_REASONS = (INCIDENT_CLOSURE_CLEAN_BUCKETS,
+                             INCIDENT_CLOSURE_WINDOW_LIMIT)
 # Window bucket-count bound: MUST equal the classifier's MAX_BUCKETS (60).
 # Stated locally on purpose -- this module never imports the classifier
 # (task #9's single-consumer gate) -- and mirror-checked by the lane.
@@ -637,13 +640,7 @@ class IncidentHistory:
             # NEVER swallowed by a successful higher-plane write in the
             # same publication. Probe degradation is persistence-side
             # only -- ordinary network-failure evidence never enters it.
-            degraded = bool(self._degraded or self._journal_degraded
-                            or self._probe_degraded)
-            code = self._last_error_code
-            if code is None and self._journal_degraded:
-                code = self._journal_last_error_code
-            if code is None and self._probe_degraded:
-                code = self._probe_last_error_code
+            degraded, code = self._evidence_health_locked()
             return {
                 "enabled": bool(self._enabled),
                 "degraded": degraded,
@@ -653,6 +650,24 @@ class IncidentHistory:
                 "last_error_code": code,
                 "run_id": self._run_id,
             }
+
+    def _evidence_health_locked(self):
+        """The composed health of the three planes the CLASSIFIER reads
+        (ordinary samples / journal / probe). Shared by ``health()`` and
+        the bundle reader so the two surfaces cannot drift.
+        ``_incident_degraded`` is deliberately NOT part of it: the
+        incident persistence plane is this bundle's only consumer, so
+        feeding its own degradation back into the evidence would let one
+        refused close poison the next classification's health judgement
+        (§7, PR-4B R2)."""
+        degraded = bool(self._degraded or self._journal_degraded
+                        or self._probe_degraded)
+        code = self._last_error_code
+        if code is None and self._journal_degraded:
+            code = self._journal_last_error_code
+        if code is None and self._probe_degraded:
+            code = self._probe_last_error_code
+        return degraded, code
 
     def query_timeline(self, since=None, limit=QUERY_LIMIT_DEFAULT):
         """Bounded, sanitized read of the persisted timeline.
@@ -965,12 +980,14 @@ class IncidentHistory:
                                last_signal_epoch,
                                last_classified_end_epoch, buckets,
                                evidence_bits, unknown_bits):
-        """Refresh the SAME open row in place (§6): the category
-        BROADENING decision is the scanner's frozen lattice duty; this
-        boundary enforces only the durable facts -- the target row
-        exists, is open, and the new values satisfy the closed CHECKs.
-        A non-open or missing target is a refusal, never a silent
-        no-op. Returns True iff the row landed (never raises)."""
+        """Refresh the SAME open row in place (§6/§8.1). The six written
+        columns are ONE snapshot of ONE classification: this boundary
+        does not know and does not care which category is "more specific"
+        -- it enforces only the durable facts (the target row exists, is
+        open, and the new values satisfy the closed CHECKs), so no
+        cross-generation stitching is possible here. A non-open or
+        missing target is a refusal, never a silent no-op. Returns True
+        iff the row landed (never raises)."""
         try:
             with self._lock:
                 if not self._enabled or self._conn is None:
@@ -997,9 +1014,12 @@ class IncidentHistory:
     def incident_close_window(self, incident_id, category, last_signal_epoch,
                               last_classified_end_epoch, buckets,
                               evidence_bits, unknown_bits, closure_reason):
-        """Close the open row AND clear the runtime pointer in the SAME
-        transaction (§6): after the commit, either both moved or
-        neither. closure_reason is the frozen closed enum
+        """Close the open row AND move the runtime gate in the SAME
+        transaction (§6/§8.3): the pointer clears either way, a
+        clean_buckets close re-arms discovery AT this row's signal end,
+        and a window_limit close drops the discovery floor and raises
+        ``rearm_required`` so automatic discovery stops fail-closed until
+        an operator re-arms it. closure_reason is the frozen closed enum
         (clean_buckets / window_limit). Returns True iff the row landed
         (never raises)."""
         try:
@@ -1101,12 +1121,13 @@ class IncidentHistory:
             ("audit", "journal_ingest_audit", "epoch",
              ("epoch", "kind", "seq", "code")),
         )
+        evidence_degraded, evidence_code = self._evidence_health_locked()
         bundle = {
             "window": {"start_epoch": start, "end_epoch": end},
             "health": {
                 "enabled": bool(self._enabled),
-                "degraded": bool(self._degraded),
-                "last_error_code": self._last_error_code,
+                "degraded": evidence_degraded,
+                "last_error_code": evidence_code,
             },
             "reader": {"status": reader_status},
         }
@@ -1132,7 +1153,8 @@ class IncidentHistory:
         state_row = self._conn.execute(
             "SELECT runtime_version, activation_floor_epoch,"
             " last_evaluated_end_epoch, reader_fresh_since_epoch,"
-            " open_incident_id FROM incident_runtime_state"
+            " open_incident_id, discovery_floor_epoch, rearm_required"
+            " FROM incident_runtime_state"
             " WHERE id = 1").fetchone()
         state = None
         if state_row is not None:
@@ -1142,6 +1164,8 @@ class IncidentHistory:
                 "last_evaluated_end_epoch": state_row[2],
                 "reader_fresh_since_epoch": state_row[3],
                 "open_incident_id": state_row[4],
+                "discovery_floor_epoch": state_row[5],
+                "rearm_required": state_row[6],
             }
         open_row = None
         if state is not None and state["open_incident_id"] is not None:
@@ -1174,9 +1198,16 @@ class IncidentHistory:
         current = float(row[0])
         if current > 0.0:
             return True  # one-way: first activation wins, restart-safe
+        # The first activation owns three columns in ONE statement, so a
+        # crash can never leave a floor without its discovery gate (§5).
+        # activation_floor_epoch stays the one-way / no-backfill authority;
+        # discovery starts where activation starts and nothing is armed
+        # yet, so a fresh floor never inherits a stale rearm demand.
         self._conn.execute(
-            "UPDATE incident_runtime_state SET activation_floor_epoch = ?"
-            " WHERE id = 1 AND activation_floor_epoch = 0.0", (floor,))
+            "UPDATE incident_runtime_state SET activation_floor_epoch = ?,"
+            " discovery_floor_epoch = ?, rearm_required = 0"
+            " WHERE id = 1 AND activation_floor_epoch = 0.0",
+            (floor, floor))
         self._conn.commit()
         return True
 
@@ -1331,10 +1362,25 @@ class IncidentHistory:
             self._record_incident_failure(
                 CODE_HISTORY_INCIDENT_PERSIST_FAILED)
             return False
-        # the pointer clears in the SAME transaction as the close
+        # The pointer clears in the SAME transaction as the close, and so
+        # does the discovery gate (§8.3): one statement, so no crash and no
+        # CHECK-visible intermediate can leave an incident closed with a
+        # stale gate. A clean close re-arms discovery AT the signal end,
+        # making its three clean buckets the next segment's baseline; a
+        # window-limit close disarms automatic discovery entirely until an
+        # operator re-arms it, and refuses to let outage rows become a new
+        # baseline by dropping the floor to NULL.
+        if closure_reason == INCIDENT_CLOSURE_CLEAN_BUCKETS:
+            gate = (" open_incident_id = NULL, discovery_floor_epoch = ?,"
+                    " rearm_required = 0")
+            gate_values: tuple = (last_signal,)
+        else:
+            gate = (" open_incident_id = NULL, discovery_floor_epoch = NULL,"
+                    " rearm_required = 1")
+            gate_values = ()
         self._conn.execute(
-            "UPDATE incident_runtime_state SET open_incident_id = NULL"
-            " WHERE id = 1")
+            "UPDATE incident_runtime_state SET" + gate + " WHERE id = 1",
+            gate_values)
         self._conn.commit()
         self._incident_persisted_total += 1
         self._incident_degraded = False
@@ -2060,19 +2106,31 @@ class IncidentHistory:
             " reader_fresh_since_epoch REAL CHECK (reader_fresh_since_epoch"
             " IS NULL OR reader_fresh_since_epoch >= 0),"
             " open_incident_id INTEGER CHECK (open_incident_id IS NULL"
-            " OR open_incident_id >= 1))")
+            " OR open_incident_id >= 1),"
+            # PR-4B R2: the discovery gate and the rearm gate. Still v4,
+            # still exactly ten tables -- the gate is durable state, not
+            # scanner memory, because a restart must not un-learn that the
+            # frozen window was outlived (§8.3).
+            " discovery_floor_epoch REAL CHECK (discovery_floor_epoch IS"
+            " NULL OR discovery_floor_epoch >= activation_floor_epoch),"
+            " rearm_required INTEGER NOT NULL"
+            " CHECK (rearm_required IN (0, 1)),"
+            " CHECK (rearm_required = 0 OR (open_incident_id IS NULL"
+            " AND discovery_floor_epoch IS NULL)))")
 
     @staticmethod
     def _create_incident_state_row(conn, now):
         """The single runtime-state row, born INERT: no activation floor
         (0.0 is pre-activation, not a real floor), nothing evaluated,
-        no reader continuity, no open incident. The scanner raises the
-        floor and starts evaluating; until then the runtime is warmup."""
+        no reader continuity, no open incident, no discovery floor and no
+        rearm demand. The scanner raises the floor and starts evaluating;
+        until then the runtime is warmup."""
         conn.execute(
             "INSERT INTO incident_runtime_state (id, runtime_version,"
             " activation_floor_epoch, last_evaluated_end_epoch,"
-            " reader_fresh_since_epoch, open_incident_id)"
-            " VALUES (1, 1, 0.0, 0.0, NULL, NULL)", ())
+            " reader_fresh_since_epoch, open_incident_id,"
+            " discovery_floor_epoch, rearm_required)"
+            " VALUES (1, 1, 0.0, 0.0, NULL, NULL, NULL, 0)", ())
 
     def _migrate_v1_to_v4(self, conn):
         """The v1 source jumps to v4 in ONE explicit transaction:
