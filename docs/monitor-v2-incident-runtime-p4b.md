@@ -386,13 +386,28 @@ FD / conntrack / listen-queue；客户端 ISP 身份；目的地身份；从稀�
     `runtime_failures` 递增、闭合 `last_error_code`、下一周期恢复。
 18. classify 车道检查全部保持绿色，除上述**被加强替换**的静态门
    （darkness→单消费者、0.4.0→0.5.0、8 表→10 表）外无任何放宽。
-   实测硬计数，基线一律取 `origin/main` = `a180e7d`（在临时 worktree 里
-   实跑测得；packaging 无 `EXPECTED_PASS`，取其 `== RESULT` 行）：
-   classify 665 → 670（+5，本 PR 的 `detect()` 恒等/纯性/闭合不变量），
-   hist 240 → 242（+2：schema-v4 平面 +1，未接扫描器时 `incident_runtime`
-   必须为 null 的 timeline 表面门 +1），packaging 269 → 274（+5，T33
-   单消费者静态门）。三条都是逐节记录过的加强，不是放宽，也没有删除
-   任何检查。
+   实测硬计数，基线一律取 `origin/main` = `a180e7d`。两个主机分别测：
+   dev host 在临时 worktree 里实跑，Linux 侧直接读 CI 日志（main 跑
+   `36664146945` / `36664146961`，本 head 跑 `36693521366` /
+   `36693521337`）。packaging 无 `EXPECTED_PASS`，取其 `== RESULT` 行。
+   - dev host：classify 665 → 670（+5，本 PR 的 `detect()` 恒等/纯性/
+     闭合不变量），hist 240 → 242（+2：schema-v4 平面 +1，未接扫描器时
+     `incident_runtime` 必须为 null 的 timeline 表面门 +1），packaging
+     269 → 274（+5，T33 单消费者静态门）。
+   - Linux CI：classify 665 → 670、hist 240 → 242、新增 incident-runtime
+     车道 188，与 dev host 逐条一致；packaging 两个 job 各自
+     `771 → 803`（root）与 `755 → 787`（fixture），净 +32/侧。+32 不是
+     放宽也不是随机漂移：把两侧 PASS 行名先把 `0.4.0`/`0.5.0`、
+     `v2`/`v3`/`v4`、`incident`/`probe` 归一化再做集合差，结果是
+     **+32 / −0**——没有任何检查在改名中消失。这 32 条拆开是 5 条 T33
+     单消费者静态门（dev host 也跑，就是上面的 +5）加 27 条新增 T32
+     “同 schema 升级是静默 no-op”场景门（captured-prestate 必须为零、
+     事务日志不得点名任何 prestate 介质、候选确实启动在自己 schema 的
+     文件上、失败注入下事务仍回滚且 `releases.history` 不被写、整笔
+     事务零 sing-box / 零 sbox-cm 动作、回滚后 unit/链接/字节一致等）；
+     后者依赖 Linux 部署事务工具链，dev host 上整节不跑，所以只显示
+     +5。其余表面差异全是原位改名（同一检查换钉值）。
+   以上都是逐节记录过的加强，不是放宽，也没有删除任何检查。
 19. timeline 端点 `incident_runtime` 键集恰 8 键、域闭合；无 P5 路由、
     无新查询参数、journal 表面不变宽。
 
