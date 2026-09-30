@@ -3,6 +3,13 @@
 状态：**实现前冻结契约**。本文件在写任何功能代码之前写成，是 PR-4B 的
 完整规格；实现、判别器测试与 DRAFT PR body 都以本文件为准，实现期间不得
 变更契约条款（如需变更必须先改本文件并说明理由）。
+**R2 重冻结（本轮 review blockers）**：§8/§8.1–§8.3 的“一致 verdict
+snapshot”“terminal write 不回读旧行”“`window_limit` → `rearm` 门”、
+§5 的 `incident_runtime_state` 两个新列与 CHECK、§7 的 composed bundle
+health 是在 owner 复审后重新冻结的条款，**取代**首版的 category 单向拓宽
+格；§16 判别器 2/3/5 相应原位改写，并新增 20–30。变更理由：首版把
+“历史最具体 category”放在持久化层，会用上一轮归因覆盖当前分类器的
+fail-closed 结论，属于跨 generation 拼接字段，语义错误而非计数问题。
 基线：`origin/main = a180e7dc2def41aeaa246495a8538b3e64f4b8de`（PR-4A
 分类器 + PR-3B schema v3，VERSION / MONITOR_WEB_VERSION = 0.4.0，
 History SCHEMA_VERSION = 3）。
@@ -28,10 +35,15 @@ History SCHEMA_VERSION = 3）。
   sing-box / sbox-cm 节奏零受影响。
 - 生命周期：IDLE 取最近 5 个完整桶（3 基线 + 2 候选）；仅
   `status == "incident"` 开案；`analysis_start` 开案时冻结；同 row 原地
-  更新（category 只沿钉死的格向上拓宽）；3 个连续干净桶闭案；
-  60 桶上限闭案 `window_limit`；一个安静桶后的第二簇仍是**一个**运维
-  生命周期，P4A 的 `insufficient_evidence + multiple_anomaly_clusters`
-  原样保留。
+  更新，**更新写入的是“最近一次成功 `detect()` 的一致 verdict snapshot”**
+  （category / last_signal / last_classified_end / buckets / evidence_bits /
+  unknown_bits 六个字段全部来自同一次分类，持久化层不得跨 generation 拼接，
+  也不得用历史最具体 category 覆盖当前分类器的 fail-closed 结论）；3 个
+  连续干净桶闭案 `clean_buckets`，闭案由**当轮** terminal `detect()` 结算；
+  60 桶上限闭案 `window_limit`，保留最后一次真实分类的 snapshot 并进入
+  **`rearm` 门**（自动发现 fail-closed 停止，直到显式 operator re-arm；
+  本轮不发明自动恢复分类器，也不加 HTTP/UI）；一个安静桶后的第二簇仍是
+  **一个**运维生命周期，不拆行。
 - reader 负证据连续性：持久化 `reader_fresh_since_epoch`；
   restart/stale/invalid/unreadable/absent 一律打断连续性；之后的 fresh
   **不能**追溯修复更早的 journal 负证据（G8 fail-closed）。
@@ -153,9 +165,21 @@ CREATE TABLE incident_runtime_state (
     reader_fresh_since_epoch REAL CHECK (reader_fresh_since_epoch IS NULL
                                          OR reader_fresh_since_epoch >= 0),
     open_incident_id INTEGER CHECK (open_incident_id IS NULL
-                                    OR open_incident_id >= 1)
+                                    OR open_incident_id >= 1),
+    -- PR-4B R2（本轮重冻结）：发现门与 rearm 门，仍是 v4、仍恰 10 表
+    discovery_floor_epoch REAL CHECK (discovery_floor_epoch IS NULL
+                                      OR discovery_floor_epoch
+                                         >= activation_floor_epoch),
+    rearm_required INTEGER NOT NULL CHECK (rearm_required IN (0, 1)),
+    CHECK (rearm_required = 0 OR (open_incident_id IS NULL
+                                  AND discovery_floor_epoch IS NULL))
 );
 ```
+
+`incident_runtime_state` 的列集因此恰为 8 列；`discovery_floor_epoch` 与
+`rearm_required` 是本轮唯一的新增列，且**不**抬 `SCHEMA_VERSION`：v4 尚未
+发布，fresh/v1/v2/v3 迁移直接建出这个最终形状，不为任何旧 PR-head 的临时
+v4 形状增加兼容迁移。
 
 - 位集编码：token 按词汇表排序后的位 i ↔ `1 << i`；版本由
   `classifier_version = 1` 钉住（词表 45 evidence / 28 unknown 已由
@@ -164,6 +188,13 @@ CREATE TABLE incident_runtime_state (
 - 禁 JSON1：列全部为 INTEGER / REAL / TEXT 标量。
 - `incident_runtime_state` **至多一行**（`id=1` CHECK）；由 scanner 激活时
   `INSERT OR IGNORE` + `UPDATE` 拥有其生命周期；迁移只建表不留行。
+- 初始行是**惰性的**：`activation_floor_epoch=0.0`、
+  `last_evaluated_end_epoch=0.0`、`reader_fresh_since_epoch=NULL`、
+  `open_incident_id=NULL`、`discovery_floor_epoch=NULL`、
+  `rearm_required=0`。首次 activation 在同一事务里把
+  `discovery_floor_epoch` 钉成 `activation_floor_epoch` 并保持
+  `rearm_required=0`；`activation_floor_epoch` 仍是 one-way / 无回填权威，
+  任何后续 activation 只能改这两列以外的东西也改不了它。
 - `ux_incident_windows_one_open` 部分唯一索引把“同一时刻至多一个 open
   事件”从扫描器承诺升格为 DB 硬约束（去重/崩溃幂等的最后一道墙）。
 - 禁列清单（全部不得出现）：raw log、身份、IP、UUID、凭证、自由文本、
@@ -193,6 +224,15 @@ CREATE TABLE incident_runtime_state (
   每段上界 2000 行（与分类器 `MAX_RECORDS_PER_SECTION` 同值），超出截断
   并按分类器既有“截断即拒/降级”语义由分类器自己结算。
 - `reader` 段的状态 token 由**运行时**保守供给（见 §9）；存储层只透传。
+- bundle 的 `health` 段是 **classifier 证据平面的 composed health**，与
+  `IncidentHistory.health()` 的构成规则逐字一致：
+  `degraded = 普通写面 OR journal OR probe`，错误码优先级同为
+  写面 > journal > probe（低平面码不被高平面成功写吞掉）。
+  **显式排除 `_incident_degraded`**：incident 持久化平面就是这条 bundle 的
+  消费者，若它自己的降康回流进 evidence，一次闭案失败就会污染下一次分类的
+  证据健康判断（自我反馈）。四向判据：ordinary / journal / probe 任一面
+  degraded 必须进入 bundle；仅 incident 面 degraded 绝不进入 bundle，但
+  仍必须进入 `health()` 与 `incident_status()`。
 - timeline HTTP 面的 journal/raw 表面**不得**因此变宽：无新端点、无新
   查询参数、journal 列白名单不变。
 
@@ -200,9 +240,12 @@ CREATE TABLE incident_runtime_state (
 
 - **激活**：`start()` 后进入 `warmup`。`activation_floor_epoch` =
   `ceil(now/BUCKET)*BUCKET`（激活时刻的下一个完整桶边界）；**不做**
-  v3 年代历史回填——floor 之前的行永不进入分析窗。
-- **warmup → idle**：存在 `DISCOVERY_BUCKETS=5` 个 floor 之后的完整桶
-  后，首次分析；此前 `phase=warmup`、零分类调用。
+  v3 年代历史回填——floor 之前的行永不进入分析窗。同一 activation 把
+  `discovery_floor_epoch` 钉成同一个值。
+- **warmup → idle**：`discovery_floor_epoch`（NULL 时 fail-closed 回退到
+  `activation_floor_epoch`）之后存在 `DISCOVERY_BUCKETS=5` 个完整桶后，
+  首次分析；此前 `phase=warmup`、零分类调用。等价表述：最近 5 桶窗口的
+  `window_start` 早于 `discovery_floor_epoch` 时保持 warmup。
 - **idle 分析窗**：最近 5 个完整桶 `[last_complete_end-300, last_complete_end]`。
   仅当分类结果 `status == "incident"` 才开案（`insufficient_evidence`
   由 `multiple_anomaly_clusters` 路径开案是合法且被保留的）；其余状态
@@ -214,41 +257,91 @@ CREATE TABLE incident_runtime_state (
   `first_signal_epoch` = 首个异常桶起点；`last_signal_epoch` = 末个
   异常桶终点（开案时相等）。
 - **OPEN 期间每扫**：窗口 = `[analysis_start, 最后完整桶终点]`；桶数
-  `> MAX_ANALYSIS_BUCKETS(60)` → 单事务闭案
-  `closure_reason='window_limit'`（fail-closed，不是继续拖长窗口）。
-  否则按 `detect` 元数据原地 **UPDATE 同一行**（`incident_id` 不变）：
-  - `evidence_bits / unknown_bits` = 最新分类结果位集；
-  - `last_signal_epoch` 推进到新的末个异常桶终点（无新异常则保持）；
+  `> MAX_ANALYSIS_BUCKETS(60)` → 走 §8.3 的 `window_limit` 闭案分支
+  （fail-closed，不是继续拖长窗口）。否则按 `detect` 元数据原地
+  **UPDATE 同一行**（`incident_id` 不变），写入的是**本次这一轮
+  `detect()` 的一致 snapshot**：
+  - `category` = 本次 `classification.category`（**没有任何格**：更具体、
+    更不具体、同级都照本次写，见 §8.1）；
+  - `evidence_bits / unknown_bits` = 本次分类结果位集；
+  - `last_signal_epoch` 推进到新的末个异常桶终点（无新异常则保持持久化值，
+    时钟偏移永不把信号末往回移）；
   - `last_classified_end_epoch` = 本次窗口终点；
-  - `category` 只沿 §8.1 格**向上拓宽**；同级/向下移动保持已持久化
-    category 不变；
-  - 无实质变化（category/bits/last_signal 全同）则**不写**，避免写放大。
-- **闭案（CLOSED）**：尾部出现 `CLOSE_CLEAN_BUCKETS=3` 个连续完整桶且
-  其中无任何异常桶 → 单事务 UPDATE state=closed、
-  `closed_epoch`=判定时刻、`closure_reason='clean_buckets'`，
-  `open_incident_id` 置 NULL。`last_signal_epoch` 保持为最后一个异常桶
-  终点（不随干净桶外推）。
+  - `buckets` = 本次窗口桶数；
+  - **no-write 的唯一条件**：本次 `last_classified_end_epoch` 与持久化值
+    相同（同一个完整桶被 30 秒节拍重复扫描）**且**上述六个字段全部相同。
+    “verdict 内容没变”不等于“没有发生新的 classification”：出现了更新的
+    完整桶时，即使 category/bits/last_signal 一字不差，也必须推进
+    `last_classified_end_epoch` 与 `buckets`。
+- **闭案（CLOSED / clean_buckets）**：尾部出现 `CLOSE_CLEAN_BUCKETS=3` 个
+  连续完整桶且其中无任何异常桶 → **结算当轮这次成功的 `detect()`**：单事务
+  UPDATE state=closed、`closed_epoch`=判定时刻、
+  `closure_reason='clean_buckets'`，并且 category / bits / last_signal /
+  `last_classified_end_epoch`=本次 `last_end` / `buckets`=本次 `count` 全部
+  取当轮值，**不得**回读 DB 行里上一轮的 category/bits 当作终值。闭案与
+  `open_incident_id` 置 NULL、`discovery_floor_epoch` 置本次
+  `last_signal_epoch`、`rearm_required=0` 在**同一事务**内完成。
+  `last_signal_epoch` 保持为最后一个异常桶终点（不随干净桶外推）。
+  效果：刚闭案的三个干净桶成为下一段的 trusted baseline，最近的 5 桶窗口
+  在 `window_start` 追上这个新 floor 之前一直是 warmup，即还要再等两个
+  候选桶才重新分类。
 - **一个安静桶后的第二簇**：窗口内 `quiet,cluster2` 同时可见时分类器给
   `insufficient_evidence + multiple_anomaly_clusters`；扫描器**不拆分**
   故障域判定——同一 open 行继续更新，P4A 的未知 token 位原样进
-  `unknown_bits`（判别器见 §16-5）。
+  `unknown_bits`。本轮的关键差异：这一行的 `category` 此时**真的**变成
+  `insufficient_evidence`（分类器已经 fail-closed 到“证据不足”，持久化层
+  没有权利替它保留旧的 Reality 归因，见 §8.1）。
 - **重启续跑**：`start()` 读 `incident_runtime_state`；若
   `open_incident_id` 非空，直接续 OPEN（analysis_start 从持久化行恢复，
-  同一 incident_id），新 run_id 不得制造第二行（DB 部分唯一索引兜底）。
+  同一 incident_id），新 run_id 不得制造第二行（DB 部分唯一索引兜底）；
+  若 `rearm_required=1`，重启后仍是 `rearm`（门是持久化的，不是内存的）。
 
-### 8.1 category 拓宽格（边集冻结）
+### 8.1 一致 verdict snapshot（取代旧的 category 拓宽格）
 
-```
-insufficient_evidence → {common_inbound_client_office,
-                         hysteria2_udp_path, reality_tcp_path,
-                         vps_outbound, vps_process_or_api}
-reality_tcp_path → vps_outbound
-hysteria2_udp_path → vps_outbound
-common_inbound_client_office → vps_outbound
-```
+**旧契约作废**：PR-4B 首版曾在扫描器里放一张 `_CATEGORY_LATTICE`
+（`insufficient_evidence → 四类`、`{reality,hysteria2,common_inbound} →
+vps_outbound`）并让持久化 category 只沿格向上移动。本轮明确删除该语义：
+`incident_runtime.py` 不再有 `_CATEGORY_LATTICE` / `_broaden`，持久化层
+也不得实现任何形式的“历史最具体 category 优先”。
 
-只允许沿边向上；`reality_tcp_path ↔ hysteria2_udp_path` 等同级移动与
-向下移动保持持久化值。格本身在车道里以字面量钉住。
+新的唯一规则：`incident_windows` 的
+`category / last_signal_epoch / last_classified_end_epoch / buckets /
+evidence_bits / unknown_bits` 六列必须是**最近一次成功 `detect()` 的一致
+snapshot**，也就是同一次分类的六个输出，来自同一个分类 generation。
+由此得到的可判别后果：
+
+1. 已有 `reality_tcp_path` 的 open 行，后来得到
+   `insufficient_evidence + multiple_anomaly_clusters` → 同一行 category
+   必须**降**为 `insufficient_evidence`，不得保留 stale Reality 归因。
+2. 反向移动（`insufficient_evidence → reality_tcp_path`）同样按本次值写：
+   两者都只是“照本次分类写”，不存在优先级。
+3. 一行永远不可能出现“category 来自第 12 轮、evidence_bits 来自第 9 轮”
+   的拼接；闭案写尤其如此（§8.2）。
+
+### 8.2 terminal write 不得回读旧行值
+
+clean 闭案与 update 走同一条一致性要求：终值来自**当轮** `detect()`。
+`window_limit` 分支是唯一例外，且是诚实的例外：那一轮**没有**成功的
+分类（超预算窗口被拒绝分析，§8.3），所以它结算的是“最后一次真实成功的
+snapshot”，即行内已持久化的六列，而不是新造一个。
+
+### 8.3 `window_limit` 之后进入 `rearm` 门
+
+- `count > MAX_ANALYSIS_BUCKETS` 时：单事务闭案
+  `closure_reason='window_limit'`，六列保持最后一次成功分类的持久值
+  （`last_classified_end_epoch`/`buckets` 不伪造成本次 60 或 61），
+  `open_incident_id=NULL`、`discovery_floor_epoch=NULL`、
+  `rearm_required=1`。同一事务，三件事一起成立。
+- `rearm_required=1` 之后：扫描器**继续正常运行**（周期继续计数、
+  连续性协议继续跑、其他平面照旧），但**自动 incident discovery
+  fail-closed 停止**：不得开第二行，不得用 outage 期间的行新建 baseline，
+  不得“再 warmup 最近 5 桶”自动学习。
+- `rearm` 是**正常 phase**，不是错误：`runtime_failures` 不增加、
+  `last_error_code` 保持 NULL。phase 词汇因此为
+  {`warmup`,`idle`,`open`,`rearm`,`degraded`} 五个 token。
+- 本轮**不**发明自动恢复分类器，也**不**增加 HTTP/UI re-arm 入口；
+  显式 operator re-arm 属后续阶段。
+
 
 ## 9. reader 负证据连续性协议
 
@@ -306,10 +399,13 @@ common_inbound_client_office → vps_outbound
   `runtime_failures` / `last_error_code` /
   `last_evaluated_end_epoch` / `open_incident`。
 - 域：`enabled`/`running`/`open_incident` 恰 bool；`phase` ∈
-  {`warmup`,`idle`,`open`,`degraded`} 恰 str；两个 counter 恰 int ≥ 0；
+  {`warmup`,`idle`,`open`,`rearm`,`degraded`} 恰 str（五 token；`rearm`
+  是 §8.3 的正常门，跨 restart 从持久化行读出）；两个 counter 恰 int ≥ 0；
   `last_error_code` 为 NULL 或 §11 四 token 之一；`last_evaluated_end_epoch`
   为 NULL 或有限非负实数。无扫描器时该键为 JSON null（与 `probes` 同
   范式）。`degraded` 的闭合定义：最近一次周期失败且其后尚无成功周期。
+  server 端投影是 deny-by-default：域外的 phase 字符串一律投影为
+  `warmup`，绝不把任意文本带到 HTTP 面。
 
 ## 13. 生产证据边界（负面清单，全部不得实现）
 
@@ -345,23 +441,31 @@ FD / conntrack / listen-queue；客户端 ISP 身份；目的地身份；从稀�
   - 纯度门、结果面 8 字段门、词表字面量门、夹具门**原样保留**；
   - harness `group_invariants` 增加 `detect` 恒等/纯性/闭合判定。
 - `EXPECTED_PASS` 硬计数只按车道头注释的分节理由变动，逐节记录。
+- R2 的静态门面：首版车道里钉 category 拓宽格的门（格边集、格的真理表、
+  “向下移动不改写 category”、“第二簇保留旧归因”）钉的是**错误语义**，
+  本轮按 §8.1 删除或改写为 snapshot 门，计数因此**下降**；下降的每一条都
+  是删除一个错误承诺，不是删除覆盖，且必须逐条写进车道头注释。新增的
+  phase token `rearm` 进入 phase 词汇门（四→五 token），HTTP 投影域同步。
 
-## 16. 判别器清单（19 条，全部必须先红后绿）
+## 16. 判别器清单（30 条，全部必须先红后绿）
 
 1. 3 基线桶 + Reality 掉线 → 恰好开一个 `reality_tcp_path` open 行，
    `analysis_start = first_signal - 180`，单个异常桶时
    `last_signal - first_signal == 60`（记法澄清：§3 冻结定义
    `first_signal` = 桶起点、`last_signal` = 桶终点，故二值不相等；
    车道按 §3 的算术钉，不改分类规则）。
-2. 重复扫描同一证据 → 行数恒 1（无重复行）。
-3. 新证据使 category 拓宽（`reality_tcp_path → vps_outbound`）→ 同一
-   `incident_id` 原地更新，无新行，格以下/同级移动不改写 category。
+2. 同一个完整桶被节拍重复扫描（六字段一字不差）→ 行数恒 1 且**零写**
+   （`updated_epoch` 不动）；出现了更新的完整桶则即使 verdict 相同也必须
+   写（见 22）。
+3. 新证据使 category 移动（`reality_tcp_path → vps_outbound`）→ 同一
+   `incident_id` 原地更新，无新行；**移动方向不再有意义**：更不具体的
+   本次分类同样改写该行（见 20）。
 4. 尾部 3 个连续干净桶 → 闭案，`closed_epoch` 为判定时刻，
    `closure_reason='clean_buckets'`，`last_signal_epoch` 保持末个异常桶
    终点。
 5. 一个安静桶后出现第二簇 → 仍是**一个** open 生命周期；行内保留
-   `insufficient_evidence` + `multiple_anomaly_clusters` 位；扫描器不
-   合并/不拆分故障域判定。
+   `multiple_anomaly_clusters` 位；扫描器不合并/不拆分故障域判定；
+   `category` 同轮降为 `insufficient_evidence`（见 20）。
 6. 仅 probe 掉线（客户端计数无恙、journal 无簇）→ 不开案
    （probe-only 不满足开案）。
 7. `egress_ip_changed` 单独出现 → 永不作为第二见证开案/拓宽。
@@ -372,7 +476,9 @@ FD / conntrack / listen-queue；客户端 ISP 身份；目的地身份；从稀�
 10. 持久化前崩溃（写 state 先行/写 windows 后崩溃两种序）：重启后幂等
     ——要么看到一致的 open 行，要么看到无 open 行且 state 无悬挂引用；
     部分唯一索引 + 单事务保证无中间态暴露。
-11. 窗口跨度超 60 桶 → `closure_reason='window_limit'` fail-closed 闭案。
+11. 窗口跨度超 60 桶 → `closure_reason='window_limit'` fail-closed 闭案，
+    并在同一事务进入 §8.3 的 `rearm` 门（`rearm_required=1`、
+    `discovery_floor_epoch=NULL`、`open_incident_id=NULL`）。
 12. 位集精确往返（全部 45/28 token 单 bit 与组合）+ 第 45/28 位（越界
     高位）在编码器与 DB CHECK 双重拒绝。
 13. `destination_specific` 无法落库：编码路径只收 EMITTABLE 六类，DB
@@ -411,11 +517,45 @@ FD / conntrack / listen-queue；客户端 ISP 身份；目的地身份；从稀�
 19. timeline 端点 `incident_runtime` 键集恰 8 键、域闭合；无 P5 路由、
     无新查询参数、journal 表面不变宽。
 
-### 16.1 变异证据（先红后绿的实测记录，dev host）
+**PR-4B R2（本轮重冻结）新增判别器 20–30**，全部同样必须先红后绿；红
+证据见 §16.2。
+
+20. `reality_tcp_path` 已开案，随后一轮得到
+    `insufficient_evidence + multiple_anomaly_clusters` → **同一行**的
+    `category` 真降为 `insufficient_evidence`（旧格语义下这条必红：它会
+    保留 stale Reality 归因）。
+21. terminal clean-close 结算**当轮** `detect()`：闭案行的 category /
+    bits / `last_classified_end_epoch` / `buckets` 等于当轮分类输出与当轮
+    窗口终点/桶数，而不是 DB 行里上一轮的值。
+22. verdict 内容一字不差但出现了新的完整桶 → `last_classified_end_epoch`
+    与 `buckets` 必须推进（“没变化所以不写”不能吞掉新 generation）。
+23. 同一个完整桶被 30 秒节拍重复扫描且六字段全同 → **零写**
+    （`updated_epoch` 不动），行数恒 1。
+24. 正常节拍一路扫到 bucket 60 → 行必须**真实**记录 `buckets=60`；
+    bucket 61 那一轮不再 classify（超预算窗口被拒绝分析），而是用已持久化
+    的最后成功 snapshot 以 `window_limit` 闭案，闭案行仍是 `buckets=60`。
+25. bucket 20 直接跳到 bucket 65 → 不得伪造 `buckets=60`：闭案行诚实保留
+    bucket 20 为最后一次成功分类。
+26. `window_limit` 闭案后持续 outage：再跑多个周期仍**不得**出现
+    incident #2（自动发现已 fail-closed 停止）。
+27. `window_limit` 闭案后 restart：`phase` 仍为 `rearm`、仍不开案
+    （门是持久化的，不是内存的）。
+28. clean close 后 `discovery_floor_epoch` 钉在闭案行的 `last_signal_epoch`；
+    最近 5 桶窗口起点仍早于它时保持 warmup，即三个干净桶成为下一段
+    trusted baseline 且还要再两个候选桶才重新分类。
+29. 越过该 floor 之后 discovery 恢复正常：outage 证据能再次开案
+    （证明 28 是门而不是永久沉默）。
+30. `classifier_bundle().health` 是 composed 证据面健康：ordinary /
+    journal / probe 任一面 degraded 都进入 bundle（含错误码优先级），
+    **仅** incident 面 degraded 绝不进入 bundle（防自我反馈），同时仍
+    进入 `health()` 与 `incident_status()`。
+
+### 16.1 变异证据（R1 世代的实测记录，dev host，不再重跑）
 
 方法：把 `monitor-v2/` 与 `tests/` 复制进隔离 scratch 树，逐个施加**单点产品
 变异**（绝不改动测试期望），要求具名门变红，随后还原。基线 scratch 树
-172 verdicts / 0 FAIL / rc=0。结果 16/16 检出：
+172 verdicts / 0 FAIL / rc=0（R2 之后该树为 203 verdicts / 车道 219 检查，
+本表按 R1 世代原文保留）。结果 16/16 检出：
 
 | 变异 | 变红的门 |
 | --- | --- |
@@ -436,12 +576,48 @@ FD / conntrack / listen-queue；客户端 ISP 身份；目的地身份；从稀�
 | M13 保留期误删 open 行 | `retention/open_window_never_pruned` |
 | M14 缩小分析基线（3→2 桶） | `lifecycle/analysis_start_frozen_at_first_minus_three` |
 
+其中 **M05 的靶标已在本轮被 §8.1 作废**：`_CATEGORY_LATTICE` / `_broaden`
+与 `static/lattice_truth_table` 等四个格门随格一起删除。R2 不重跑这张表，
+而是对本轮**新冻结语义**做五个变异（M1–M5），见 §16.2。
+
 第一轮变异研究暴露并修掉了两处**测试自身的弱点**（产品未改）：
 `warmup_makes_no_classification` 原先只在首个周期之前检查，等于用"没有周期"
 证明 warmup 不分类；现在让时钟停在完整桶不足处**真的跑一个周期**，并同时钉
 住 phase 与 `last_evaluated_end_epoch`。`incident_failure_never_degrades_the_
 history_plane` 原先在其它面的写入之后才取样，只能证明标志位自愈；现在在故障
 发生的那一刻取样。两处修改后 verdict 计数不变（39+38），车道仍 188 检查。
+
+### 16.2 R2 变异证据（本轮 5 个**新语义**变异，dev host，实测一次）
+
+方法与 §16.1 相同：把冻结的干净副本复制进隔离 scratch 树，每次只施加一个
+**单点产品变异**，测试期望一律不改，随后整树丢弃。基线 scratch 树
+203 verdicts / 0 FAIL / rc=0。R1 的 14 个变异本轮**不重跑**（其中 M05 的靶
+标格已按 §8.1 删除）。结果 5/5 检出，无 EQUIVALENT、无静默：
+
+| 变异 | 施加位置 | 变红的门 |
+| --- | --- | --- |
+| M1 恢复 §8.1 已作废的单向拓宽格（重新引入 `_CATEGORY_LATTICE` / `_broaden`，持久化 category 不再等于本轮分类） | `incident_runtime._open_cycle` 的 `category` 赋值 | `static/lattice_surface_deleted`、`lifecycle/narrowing_rewrites_category_to_the_current_verdict`、`lifecycle/second_cluster_downgrades_the_persisted_category`、`lifecycle/egress_change_never_persists_a_destination`、`lifecycle/clean_close_settles_the_current_verdict_bits`、`lifecycle/terminal_clean_close_settles_the_current_cycle` |
+| M2 terminal clean-close 回读旧行的 category/bits 当终值 | `incident_runtime._close_clean` | `lifecycle/terminal_clean_close_did_not_reuse_the_old_bits`、`lifecycle/terminal_clean_close_settles_the_current_cycle` |
+| M3 `_unchanged` 忽略 generation：不再比较 `last_classified_end_epoch` 与 `buckets` | `incident_runtime._unchanged` | `lifecycle/open_period_settles_the_frozen_window_width` |
+| M4 `window_limit` 闭案按 clean 分支落门（`rearm_required=0`、floor=`last_signal`，即闭案后回到自动发现） | `incident_history._incident_close_window_locked` | `store/window_limit_close_raises_rearm`、`store/rearm_survives_reactivation`、`lifecycle/window_limit_raises_the_persistent_rearm_gate`、lifecycle 的 `rearm_stops_discovery_over_many_cycles`、`rearm_survives_restart_and_still_opens_nothing` |
+| M5 把 `_incident_degraded` 与其错误码混进 bundle 的 composed 证据面健康 | `incident_history._classifier_bundle_locked` | `store/bundle_health_excludes_the_incident_plane` |
+
+三点诚实说明：
+
+- **其一**，M1 的 6 条红是**同一条语义**的六个表面（"持久化 category 必须
+  等于本轮 `detect()` 的分类"），其中包括 D7 那条顺带钉住的 snapshot 等值
+  条款——旧格会把 `insufficient_evidence` 的本轮判定挡在行的旧 Reality
+  归因之外。terminal 两条红是必然连带：拓宽格作用在传给 `_close_clean` 的
+  局部 `category` 上，终值因此也不再是当轮值（§8.1 与 §8.2 是同一件事）。
+- **其二**，M4 下 `lifecycle/rearm_is_a_normal_phase_not_an_error` **仍然为
+  绿**：扫描器在闭案那一轮把门镜像在内存里，所以当轮 phase 仍是 `rearm`；
+  变异暴露的是下一轮起重读存储之后的一切。这正是 §8.3 要的表达——**门的
+  所有权在存储**，内存镜像只覆盖当轮，因此红点必须落在存储门与跨周期/跨
+  重启的门上。
+- **其三**，M3 只让一条门变红，因为它是唯一把"出现更新的完整桶就必须推进"
+  与"同一个完整桶重复扫描必须零写"分开的判别器（§16-22 与 §16-23 成对）；
+  M3 打破前者，`repeat_scans_never_duplicate` 仍绿，说明这条对偶没有互相
+  掩盖。
 
 ## 17. 明确不做（禁区）
 
