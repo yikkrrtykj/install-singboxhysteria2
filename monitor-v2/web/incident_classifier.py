@@ -1,17 +1,18 @@
-"""Deterministic incident classifier -- issue #33 Phase 4, PR-4A (DARK).
+"""Deterministic incident classifier -- issue #33 Phase 4, PR-4A + PR-4B.
 
 A pure function over ALREADY-SANITIZED, ALREADY-BOUNDED evidence: one closed
 evidence bundle in, one frozen typed ``Classification`` out, every field a
 token from a reviewed closed vocabulary.
 
-Contract (docs/monitor-v2-incident-classifier-p4a.md):
+Contract (docs/monitor-v2-incident-classifier-p4a.md,
+docs/monitor-v2-incident-runtime-p4b.md):
 
-* **Pure and dark.** Standard library only (the ``dataclasses`` module), no
+* **Pure.** Standard library only (the ``dataclasses`` module), no
   clock, no state, no I/O, and no import of any sibling package -- not the
-  web surface, not the probe engine, not the journal reader. Nothing in the
-  runtime imports this module in PR-4A:
-  no route, no scheduler, no service loop, no schema, no deployment surface
-  touches it.
+  web surface, not the probe engine, not the journal reader. In PR-4B exactly
+  one runtime module consumes this package -- ``web/incident_runtime.py``,
+  through ``detect()`` -- and the single-consumer allowlist in the classify
+  lane is the gate that keeps it that way.
 * **Schema-v3 truth only.** The accepted record shapes are the columns the
   live store actually projects -- ``timeline_samples``,
   ``device_protocol_states``, ``network_probe_samples``, ``journal_events``
@@ -330,18 +331,52 @@ class Classification:
                 "unknowns": list(self.unknowns)}
 
 
+@dataclass(frozen=True)
+class Detection:
+    """The PR-4B metadata surface: the SAME verdict classify() returns, plus
+    WHERE inside the window the anomalous buckets sat. Every metadata field
+    is derived from the candidate indices _analyse already computed, so
+    detect(evidence).classification is identical to classify(evidence) by
+    construction -- there is no second analysis path and no second threshold
+    anywhere in this module, and the runtime that consumes this surface
+    inherits that. Positions are bucket indices into the analysed window;
+    the epoch fields are the bucket boundaries of the first and last
+    anomalous bucket, or None when the verdict carries no anomaly (a refused
+    bundle, a quiet window, or an unprovable one)."""
+
+    classification: Classification
+    anomaly_bucket_indices: tuple
+    first_signal_epoch: float
+    last_signal_epoch: float
+
+
 def classify(evidence):
     """Classify one bounded evidence bundle. Never raises, never blocks."""
+    return detect(evidence).classification
+
+
+def detect(evidence):
+    """classify() plus the anomalous-bucket positions behind the verdict.
+
+    Never raises, never blocks, reads nothing but the bundle: the metadata
+    is a pure restatement of _analyse's own candidate list, so
+    detect(e).classification is identical to classify(e) by construction."""
     refusals = _refusals(evidence)
     if refusals:
         start, end, count = _echo_window(evidence)
-        return _seal(STATUS_INDETERMINATE, CATEGORY_INSUFFICIENT, start, end,
-                     count, (), refusals)
+        classification = _seal(STATUS_INDETERMINATE, CATEGORY_INSUFFICIENT,
+                               start, end, count, (), refusals)
+        return Detection(classification, (), None, None)
     window = evidence["window"]
     start = float(window["start_epoch"])
     end = float(window["end_epoch"])
     count = int(round((end - start) / BUCKET_SECONDS))
-    return _analyse(evidence, start, count)
+    classification, indices = _analyse_with_meta(evidence, start, count)
+    if not indices:
+        return Detection(classification, (), None, None)
+    first = start + indices[0] * BUCKET_SECONDS
+    last = start + (indices[-1] + 1) * BUCKET_SECONDS
+    return Detection(classification, tuple(indices), first, last)
 
 
 # -- input refusal: closed tokens only, never exception text ------------------
@@ -561,6 +596,21 @@ def _unaligned(value):
 
 
 def _analyse(evidence, start, buckets):
+    """The classify() view of the analysis: the verdict only. Kept as a thin
+    wrapper so the classification and its metadata can never drift apart --
+    there is exactly one analysis path in this module, and _analyse_with_meta
+    is it."""
+    classification, _indices = _analyse_with_meta(evidence, start, buckets)
+    return classification
+
+
+def _analyse_with_meta(evidence, start, buckets):
+    """THE single analysis path, shared by classify() and detect(): the
+    verdict plus the sorted indices of the buckets that carried the anomaly.
+    Indices come from the candidate list this function already computed, so
+    detect(e).classification == classify(e) holds by construction, not by
+    re-derivation. An empty tuple means the window carried no anomaly
+    (too short, nothing anomalous, or a verdict that is not an incident)."""
     samples = [_sample_stats(rows) for rows in _bucketed(
         evidence["samples"], "epoch", start, buckets)]
     device_rows = _bucketed(evidence["device_states"], "epoch", start, buckets)
@@ -595,7 +645,7 @@ def _analyse(evidence, start, buckets):
         # and an unprovable window is never an incident.
         unknown.add("baseline_evidence_absent")
         return _seal(STATUS_INDETERMINATE, CATEGORY_INSUFFICIENT, start,
-                     window_end, buckets, seen, unknown)
+                     window_end, buckets, seen, unknown), ()
 
     reference = _baseline(samples, journal, buckets)
     if not reference["usable"]:
@@ -627,9 +677,9 @@ def _analyse(evidence, start, buckets):
         if reference["usable"] and (probe_seen or journal_seen):
             seen.add("no_anomaly")
             return _seal(STATUS_NO_INCIDENT, CATEGORY_NONE, start, window_end,
-                         buckets, seen, unknown)
+                         buckets, seen, unknown), ()
         return _seal(STATUS_INDETERMINATE, CATEGORY_INSUFFICIENT, start,
-                     window_end, buckets, seen, unknown)
+                     window_end, buckets, seen, unknown), ()
 
     families = set()
     for anomaly in candidates:
@@ -641,7 +691,7 @@ def _analyse(evidence, start, buckets):
         note_health(window_indices)
         unknown.update(("count_drop_only", "no_corroboration"))
         return _seal(STATUS_NO_INCIDENT, CATEGORY_NONE, start, window_end,
-                     buckets, seen, unknown)
+                     buckets, seen, unknown), ()
 
     clusters = _clusters(anomaly["index"] for anomaly in candidates)
     if len(clusters) > 1:
@@ -653,7 +703,8 @@ def _analyse(evidence, start, buckets):
         note_health(window_indices)
         unknown.add("multiple_anomaly_clusters")
         return _seal(STATUS_INCIDENT, CATEGORY_INSUFFICIENT, start, window_end,
-                     buckets, seen, unknown)
+                     buckets, seen, unknown), tuple(
+                         sorted(a["index"] for a in candidates))
 
     indices = set(clusters[0])
     flags = _collect(candidates, seen, unknown)
@@ -662,7 +713,7 @@ def _analyse(evidence, start, buckets):
     negatives_provable = (journal_provable or generic_healthy)
     return _attribute(flags, seen, unknown, start, window_end, buckets,
                       probe_seen, negatives_provable, generic_healthy,
-                      api_healthy)
+                      api_healthy), tuple(sorted(indices))
 
 
 def _clusters(indices):

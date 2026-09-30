@@ -63,6 +63,12 @@ FAIL=0
 # PR-4A round 4 -- 665 checks, measured on the dev host and to be re-measured
 # on Linux CI. The move from 582 is gates that were written, never a count that
 # was waved through, and the breakdown is part of the record:
+# PR-4B adds exactly 5 checks, all inside S3's invariants group, and nothing
+# previously counted moved (665 -> 670): detect_matches_classify_everywhere,
+# detection_metadata_tracks_incidence, detection_epochs_are_bucket_arithmetic,
+# detect_never_raises_on_hostile_input, detect_mutates_no_input. They pin the
+# PR-4B contract that detect() is classify() plus pure bucket-position
+# metadata over the SAME single analysis path.
 #   S0 static + darkness gates              13   unchanged
 #   S1 closed vocabulary, pinned literal    12   unchanged in count, but two
 #        of those literals moved: the unknown vocabulary gained
@@ -79,16 +85,18 @@ FAIL=0
 #        whichever row happened to be written last; tls_failed and
 #        protocol_failed on the generic slots, once each; and a probe outage
 #        whose only extra witness is a changed egress address)
-#   S3 behaviour groups (classify_groups)  623   mirrors 24 (+0: two existing
+#   S3 behaviour groups (classify_groups)  628   (623 + 5 PR-4B detect()
+#        invariants, documented above); mirrors 24 (+0: two existing
 #        gates were strengthened, and engine_probe_codes_agree now reads the
 #        engine's OWN ssl/http/UDP mapping instead of trusting this file's
 #        prose), scenarios 419 (+75: 36 rows became 43 -- four device-table
 #        windows, the reversed-order disagreement that makes the tie-break
 #        direction live in both directions, and the two moved probe codes,
 #        each with its control),
-#        hostiles 116 unchanged, invariants 16 unchanged, privacy 7, store 25,
+#        hostiles 116 unchanged, invariants 16 -> 21 (PR-4B: the five detect()
+#        invariants documented above), privacy 7, store 25,
 #        fixtures 14, plus the harness rc and the fixtures-unchanged proof
-EXPECTED_PASS=665
+EXPECTED_PASS=670
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
