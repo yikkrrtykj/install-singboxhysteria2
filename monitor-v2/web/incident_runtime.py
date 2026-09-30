@@ -16,18 +16,25 @@ Contract (frozen, all enforced, all tested):
   threshold algorithm. (The ``+ 3.0`` / ``0.5`` courtesy bounds in ``stop``
   mirror the probe scheduler's join bound; they are not analysis
   thresholds.)
-* **Lifecycle.** Activation pins a ONE-WAY floor (no v3-era backfill); five
-  complete buckets after the floor enable the first analysis; only
-  ``status == "incident"`` opens a row, in the SAME transaction as the
-  runtime pointer, so a crash can never leave a dangling one. The open row
-  updates IN PLACE: ``analysis_start_epoch`` stays frozen at open,
-  ``category`` broadens only along the §8.1 lattice, and a cycle with no
-  material change writes nothing. Three consecutive clean tail buckets close
-  ``clean_buckets`` with ``last_signal_epoch`` kept at the last anomalous
-  bucket end; a window past ``MAX_ANALYSIS_BUCKETS`` closes
-  ``window_limit`` FAIL-CLOSED from the row's own accumulated values (no
-  new classification). One quiet bucket before a second cluster stays ONE
-  operational lifecycle: the classifier's
+* **Lifecycle.** Activation pins a ONE-WAY floor (no v3-era backfill) and
+  the discovery gate at the same value; five complete buckets *after the
+  discovery floor* enable the first analysis; only ``status ==
+  "incident"`` opens a row, in the SAME transaction as the runtime
+  pointer, so a crash can never leave a dangling one. The open row updates
+  IN PLACE with ONE consistent snapshot of THIS cycle's ``detect()``:
+  ``analysis_start_epoch`` stays frozen at open, ``category`` is exactly
+  what the current classification says (no lattice, no sticky
+  attribution -- a fail-closed ``insufficient_evidence`` genuinely
+  replaces an earlier ``reality_tcp_path``), and a write is skipped ONLY
+  when this cycle evaluated the same complete bucket as the persisted row
+  AND every snapshot field matches. A clean tail closes ``clean_buckets``
+  by settling the CURRENT cycle's verdict (its category, bits, window end
+  and bucket count), never the previous row's. A window past
+  ``MAX_ANALYSIS_BUCKETS`` closes ``window_limit`` FAIL-CLOSED from the
+  row's own last successful snapshot and then enters the ``rearm`` gate:
+  automatic discovery stops until an operator re-arms it (``rearm`` is a
+  normal phase, not a failure). One quiet bucket before a second cluster
+  stays ONE operational lifecycle: the classifier's
   ``insufficient_evidence + multiple_anomaly_clusters`` verdict updates the
   same row and never splits it.
 * **Reader continuity (G8).** Every ``start()`` BREAKS continuity: a fresh
@@ -83,23 +90,8 @@ ERROR_RUNTIME_STATE_CORRUPT = "runtime_state_corrupt"
 PHASE_WARMUP = "warmup"
 PHASE_IDLE = "idle"
 PHASE_OPEN = "open"
+PHASE_REARM = "rearm"
 PHASE_DEGRADED = "degraded"
-
-# §8.1 frozen broadening lattice: edges point UP only. A same-level or
-# downward verdict keeps the persisted category, so a terminal write can
-# never narrow what the incident already claimed.
-_CATEGORY_LATTICE = {
-    ic.CATEGORY_INSUFFICIENT: frozenset((
-        ic.CATEGORY_COMMON_INBOUND,
-        ic.CATEGORY_HY2_UDP,
-        ic.CATEGORY_REALITY_TCP,
-        ic.CATEGORY_VPS_OUTBOUND,
-        ic.CATEGORY_VPS_PROCESS,
-    )),
-    ic.CATEGORY_REALITY_TCP: frozenset((ic.CATEGORY_VPS_OUTBOUND,)),
-    ic.CATEGORY_HY2_UDP: frozenset((ic.CATEGORY_VPS_OUTBOUND,)),
-    ic.CATEGORY_COMMON_INBOUND: frozenset((ic.CATEGORY_VPS_OUTBOUND,)),
-}
 
 # The conservative non-fresh projection token (§9.3); the store's bundle
 # gate validates it, an invalid token refuses the read fail-closed.
@@ -128,16 +120,14 @@ def _epoch(value):
     return float(value)
 
 
-def _broaden(persisted, incoming):
-    """§8.1: a category may move UP along the lattice only; anything else
-    (same level, downward, unknown token) keeps the persisted value."""
-    if type(persisted) is not str or type(incoming) is not str:
-        return persisted
-    if incoming == persisted:
-        return persisted
-    if incoming in _CATEGORY_LATTICE.get(persisted, frozenset()):
-        return incoming
-    return persisted
+def _rearm_flag(value):
+    """The §8.3 rearm gate's closed validation: exactly an int 0 or 1
+    (never a bool). None means the runtime-state row is not the shape this
+    module was written for -- the scanner then stays dark or fails closed
+    with the closed corrupt-state code; it never guesses the gate."""
+    if type(value) is int and value in (0, 1):
+        return value == 1
+    return None
 
 
 class IncidentScanner:
@@ -171,6 +161,14 @@ class IncidentScanner:
         self._last_cycle_failed = False
         self._last_evaluated_end_epoch = None
         self._open_incident_id = None
+        # A cache of the store's durable rearm gate (§8.3), refreshed from
+        # every cycle's snapshot; the store, never this field, is authority.
+        self._rearm_required = False
+        # Whether the newest cycle was held back by the discovery gate
+        # (§8): a restart keeps the persisted evaluation state until its
+        # own first cycle says otherwise, so a dark/pre-activation scanner
+        # and a re-warming one both report warmup.
+        self._warmup_gated = True
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -202,7 +200,9 @@ class IncidentScanner:
         """The one-way floor plus the §9 restart-continuity break, written
         before the thread exists: fresh heartbeat -> continuity restarts AT
         the floor, anything else -> NULL. Never raises; False means the
-        scanner stays dark."""
+        scanner stays dark. The §8.3 gates (discovery floor, rearm) are
+        READ here, never written: activation cannot un-learn a rearm
+        demand, so a restart keeps whatever the store settled."""
         try:
             now = self._clock()
             floor = math.ceil(now / BUCKET_SECONDS) * BUCKET_SECONDS
@@ -217,13 +217,18 @@ class IncidentScanner:
                 return False
         except Exception:  # noqa: BLE001 -- dark-start containment
             return False
+        rearm = _rearm_flag(state.get("rearm_required"))
+        if rearm is None:
+            return False
         with self._lock:
             self._enabled = True
+            self._rearm_required = rearm
             self._last_cycle_failed = False
             self._last_error_code = None
             end = _epoch(state.get("last_evaluated_end_epoch"))
             self._last_evaluated_end_epoch = \
                 end if (end is not None and end > 0.0) else None
+            self._warmup_gated = self._last_evaluated_end_epoch is None
             open_id = state.get("open_incident_id")
             self._open_incident_id = open_id \
                 if type(open_id) is int and not isinstance(open_id, bool) \
@@ -266,29 +271,65 @@ class IncidentScanner:
         floor = _epoch(state.get("activation_floor_epoch"))
         if floor is None or floor <= 0.0:
             return  # inert row: activation has not landed (not a failure)
+        gate = self._discovery_gate(state, floor)
         rfs = self._derive_rfs(state.get("reader_fresh_since_epoch"))
         last_end = self._last_complete_end(floor)
         if last_end is None:
+            with self._lock:
+                self._warmup_gated = True
             self._mark(None, rfs, state)
             return
         open_row = snapshot.get("open_incident")
         if open_row is not None and not isinstance(open_row, dict):
             raise _CycleAbort(ERROR_RUNTIME_STATE_CORRUPT)
-        if open_row is None:
-            evaluated = self._discovery_cycle(floor, last_end, rfs)
-        else:
+        if open_row is not None:
             evaluated = self._open_cycle(open_row, last_end, rfs)
+        elif gate is None:
+            # §8.3 rearm: the thread keeps running and continuity stays
+            # honest, but nothing is classified -- an outage period that
+            # outlived its frozen window must not become a new baseline.
+            evaluated = None
+        else:
+            evaluated = self._discovery_cycle(gate, last_end, rfs)
+        with self._lock:
+            # A discovery cycle that analyzed nothing is the §8 warmup gate
+            # (or the §8.3 rearm gate), not an idle evaluation; an open
+            # cycle always did analyze unless the window was refused.
+            self._warmup_gated = (evaluated is None
+                                  and open_row is None
+                                  and not self._rearm_required)
         self._mark(evaluated, rfs, state)
+
+    def _discovery_gate(self, state, floor):
+        """The discovery gate (§8's warmup floor plus the §8.3 rearm gate),
+        read from the store every cycle: ``rearm_required`` stops
+        automatic discovery (None), otherwise the durable
+        ``discovery_floor_epoch`` bounds warmup. A NULL floor falls
+        back FAIL-CLOSED to the one-way activation floor, so the bucket
+        grid never shifts and an unset floor never widens the analyzed
+        window."""
+        rearm = _rearm_flag(state.get("rearm_required"))
+        if rearm is None:
+            raise _CycleAbort(ERROR_RUNTIME_STATE_CORRUPT)
+        with self._lock:
+            self._rearm_required = rearm
+        if rearm:
+            return None
+        discovery_floor = _epoch(state.get("discovery_floor_epoch"))
+        return floor if discovery_floor is None else discovery_floor
 
     # -- stage: discovery (IDLE) ---------------------------------------------
 
-    def _discovery_cycle(self, floor, last_end, rfs):
+    def _discovery_cycle(self, gate, last_end, rfs):
         """IDLE: analyze the last DISCOVERY_BUCKETS complete buckets;
         only an ``incident`` verdict opens a row. Returns the evaluated
-        window end, or None while still warming up."""
-        if last_end - floor < DISCOVERY_BUCKETS * BUCKET_SECONDS:
-            return None  # warmup: not enough complete buckets to analyze
+        window end, or None while still warming up -- and after a clean
+        close warmup means five complete buckets AFTER the signal end, so
+        the three just-closed clean buckets become this segment's trusted
+        baseline before any new row can open."""
         window_start = last_end - DISCOVERY_BUCKETS * BUCKET_SECONDS
+        if window_start < gate:
+            return None  # warmup: the window is not trusted yet
         detection = self._detect(window_start, last_end, rfs)
         classification = detection.classification
         if classification.status != ic.STATUS_INCIDENT:
@@ -307,10 +348,11 @@ class IncidentScanner:
     # -- stage: open lifecycle ------------------------------------------------
 
     def _open_cycle(self, row, last_end, rfs):
-        """OPEN: extend the frozen window to the newest complete bucket;
-        broaden in place, close on a clean tail or a window limit.
-        Returns the evaluated window end, or None on a window-limit
-        close (the over-long window is refused, not analyzed)."""
+        """OPEN: extend the frozen window to the newest complete bucket and
+        settle THIS cycle's verdict in place; close on a clean tail or a
+        window limit. Returns the evaluated window end, or None on a
+        window-limit close (the over-long window is refused, not
+        analyzed)."""
         window_start = _epoch(row.get("analysis_start_epoch"))
         if window_start is None:
             raise _CycleAbort(ERROR_RUNTIME_STATE_CORRUPT)
@@ -322,16 +364,17 @@ class IncidentScanner:
             return None
         detection = self._detect(window_start, last_end, rfs)
         classification = detection.classification
+        category = classification.category
         bits = self._encode_bits(classification)
         indices = detection.anomaly_bucket_indices
         clean_tail = all(i < count - CLOSE_CLEAN_BUCKETS for i in indices)
         last_signal = self._advance_last_signal(row, detection, indices)
         if clean_tail:
-            self._close_clean(row, count, last_signal, last_end)
+            self._close_clean(row, category, bits, last_signal,
+                              last_end, count)
             return last_end
-        category = _broaden(row.get("category"), classification.category)
-        if self._unchanged(row, category, last_signal, bits):
-            return last_end  # §8: no material change, no write
+        if self._unchanged(row, category, last_signal, last_end, count, bits):
+            return last_end  # §8: same bucket, same verdict, no write
         evidence_bits, unknown_bits = bits
         try:
             landed = self._history.incident_update_window(
@@ -343,14 +386,18 @@ class IncidentScanner:
             raise _CycleAbort(ERROR_PERSIST_FAILED)
         return last_end
 
-    def _close_clean(self, row, count, last_signal, last_end):
-        """Three consecutive clean tail buckets: close with the row's own
-        accumulated attribution (a terminal write never re-narrows), the
-        evaluated end advanced to this window."""
-        evidence_bits, unknown_bits = self._row_bits(row)
+    def _close_clean(self, row, category, bits, last_signal, last_end,
+                     count):
+        """Three consecutive clean tail buckets: the terminal write
+        SETTLES THIS cycle's ``detect()`` -- its category and bitsets, this
+        window end and bucket count -- never the previous row's (§8.2). The
+        CLOSED row is therefore the consistent snapshot of the last real
+        classification, and the discovery gate moves in the same store
+        transaction."""
+        evidence_bits, unknown_bits = bits
         try:
             landed = self._history.incident_close_window(
-                row["incident_id"], row["category"], last_signal, last_end,
+                row["incident_id"], category, last_signal, last_end,
                 count, evidence_bits, unknown_bits, _CLOSURE_CLEAN_BUCKETS)
         except Exception:
             raise _CycleAbort(ERROR_PERSIST_FAILED)
@@ -360,10 +407,12 @@ class IncidentScanner:
             self._open_incident_id = None
 
     def _close_window_limit(self, row):
-        """The frozen window outgrew MAX_ANALYSIS_BUCKETS: fail CLOSED
-        from the row's own accumulated values -- no new classification,
-        no category motion (§8, §16-11). The evaluated end does NOT
-        advance: this window was refused, not analyzed."""
+        """The frozen window outgrew MAX_ANALYSIS_BUCKETS: fail CLOSED from
+        the row's own LAST SUCCESSFUL snapshot -- this cycle never
+        classified, so there is no current verdict to settle and inventing
+        one would fabricate a bucket (§8.2, §16-11). The evaluated end does
+        NOT advance and the gate flips to ``rearm`` in the same store
+        transaction."""
         evidence_bits, unknown_bits = self._row_bits(row)
         last_signal = _epoch(row.get("last_signal_epoch"))
         classified_end = _epoch(row.get("last_classified_end_epoch"))
@@ -382,6 +431,10 @@ class IncidentScanner:
             raise _CycleAbort(ERROR_PERSIST_FAILED)
         with self._lock:
             self._open_incident_id = None
+            # Mirror the gate the store just raised in the SAME
+            # transaction, so the phase this cycle reports is already the
+            # persisted one; the next cycle re-reads it from the store.
+            self._rearm_required = True
 
     # -- stage helpers ---------------------------------------------------------
 
@@ -438,9 +491,18 @@ class IncidentScanner:
             raise _CycleAbort(ERROR_CLASSIFY_FAILED)
         return max(persisted, advanced)
 
-    def _unchanged(self, row, category, last_signal, bits):
+    def _unchanged(self, row, category, last_signal, last_end, count, bits):
+        """§8/§8.1: no-write is a GENERATION test, not a verdict test.
+        It holds only when this cycle evaluated the same complete bucket
+        the row was last classified on AND every snapshot field matches
+        -- so the 30 s cadence re-scanning one bucket stays quiet, while
+        a genuinely newer bucket always advances
+        ``last_classified_end_epoch`` and ``buckets`` even on a
+        byte-identical verdict."""
         evidence_bits, unknown_bits = bits
-        return (category == row.get("category")
+        return (count == row.get("buckets")
+                and last_end == _epoch(row.get("last_classified_end_epoch"))
+                and category == row.get("category")
                 and last_signal == _epoch(row.get("last_signal_epoch"))
                 and evidence_bits == row.get("evidence_bits")
                 and unknown_bits == row.get("unknown_bits"))
@@ -564,6 +626,11 @@ class IncidentScanner:
             return PHASE_DEGRADED
         if self._open_incident_id is not None:
             return PHASE_OPEN
-        if self._last_evaluated_end_epoch is None:
+        # rearm dominates idle (§8.3): it is a NORMAL phase -- no failure
+        # counter, no error code -- that only says automatic discovery is
+        # durably stopped until an operator re-arms it.
+        if self._rearm_required:
+            return PHASE_REARM
+        if self._warmup_gated:
             return PHASE_WARMUP
         return PHASE_IDLE

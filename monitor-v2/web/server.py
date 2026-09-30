@@ -160,7 +160,7 @@ INCIDENT_RUNTIME_STATUS_KEYS = (
 INCIDENT_RUNTIME_BOOL_KEYS = frozenset(
     {"enabled", "running", "open_incident"})
 INCIDENT_RUNTIME_PHASE_KEYS = frozenset(
-    {"warmup", "idle", "open", "degraded"})
+    {"warmup", "idle", "open", "rearm", "degraded"})
 INCIDENT_RUNTIME_ERROR_TOKENS = frozenset({
     "evidence_read_failed", "classify_failed", "persist_failed",
     "runtime_state_corrupt"})
