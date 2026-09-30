@@ -349,7 +349,10 @@ FD / conntrack / listen-queue；客户端 ISP 身份；目的地身份；从稀�
 ## 16. 判别器清单（19 条，全部必须先红后绿）
 
 1. 3 基线桶 + Reality 掉线 → 恰好开一个 `reality_tcp_path` open 行，
-   `analysis_start = first_signal - 180`，`first == last`。
+   `analysis_start = first_signal - 180`，单个异常桶时
+   `last_signal - first_signal == 60`（记法澄清：§3 冻结定义
+   `first_signal` = 桶起点、`last_signal` = 桶终点，故二值不相等；
+   车道按 §3 的算术钉，不改分类规则）。
 2. 重复扫描同一证据 → 行数恒 1（无重复行）。
 3. 新证据使 category 拓宽（`reality_tcp_path → vps_outbound`）→ 同一
    `incident_id` 原地更新，无新行，格以下/同级移动不改写 category。
@@ -381,10 +384,46 @@ FD / conntrack / listen-queue；客户端 ISP 身份；目的地身份；从稀�
 17. 扫描器内部故障（注入证据读取/分类/持久化异常）→ broker 发布、
     probe 节奏、journal ingest、web 响应全部不受影响；
     `runtime_failures` 递增、闭合 `last_error_code`、下一周期恢复。
-18. classify 车道 665 检查全部保持绿色，除上述**被加强替换**的静态门
+18. classify 车道检查全部保持绿色，除上述**被加强替换**的静态门
    （darkness→单消费者、0.4.0→0.5.0、8 表→10 表）外无任何放宽。
+   实测硬计数：classify 665 → 670（+5，全部是本 PR 的 `detect()` 恒等/
+   纯性/闭合不变量），hist 241 → 242（+1，未接扫描器时
+   `incident_runtime` 必须为 null），packaging 269 → 274（+5，T33
+   单消费者静态门）。三条都是逐节记录过的加强，不是放宽。
 19. timeline 端点 `incident_runtime` 键集恰 8 键、域闭合；无 P5 路由、
     无新查询参数、journal 表面不变宽。
+
+### 16.1 变异证据（先红后绿的实测记录，dev host）
+
+方法：把 `monitor-v2/` 与 `tests/` 复制进隔离 scratch 树，逐个施加**单点产品
+变异**（绝不改动测试期望），要求具名门变红，随后还原。基线 scratch 树
+172 verdicts / 0 FAIL / rc=0。结果 16/16 检出：
+
+| 变异 | 变红的门 |
+| --- | --- |
+| M01 `BUCKET_GRACE_SECONDS` 15→0 | `static/constants_frozen` |
+| M02a 取消单向激活的 Python 早退 | **EQUIVALENT**（SQL 的 `AND activation_floor_epoch = 0.0` 仍守住；见 M02b） |
+| M02b 同时取消两层守护 | `store/activate_is_one_way` |
+| M03 去掉 one-open 部分唯一索引 | `store/one_open_index_refuses_second` |
+| M04a 使 category CHECK 恒真 | `store/destination_db_check_refuses` |
+| M04b 使 Python 类别墙容纳 `destination_specific` | **loud**：第一墙消失后 DB 墙以异常逃逸，车道 rc/缺行门立即变红 |
+| M05 忽略拓宽格 | `static/lattice_truth_table`（另 3 个 lifecycle 门同红） |
+| M06 关闭时不清指针 | `store/close_clears_the_pointer_atomically`、`lifecycle/close_clears_pointer_and_phase` |
+| M07 事件面故障泄漏进 history 面 | `containment/incident_failure_never_degrades_the_history_plane` |
+| M08 抬高 60 桶上限 | `lifecycle/window_limit_closes_fail_closed` |
+| M09 超预算证据被静默截断 | `store/bundle_over_budget_refuses_all` |
+| M10 stale 窗口投影成 fresh | `continuity/projection_is_stale_while_the_window_predates_continuity`、G8 门 |
+| M11 取消 warmup 守护 | `lifecycle/warmup_makes_no_classification` |
+| M12 谎言 phase 直达表面 | `containment/lying_phase_projects_warmup` |
+| M13 保留期误删 open 行 | `retention/open_window_never_pruned` |
+| M14 缩小分析基线（3→2 桶） | `lifecycle/analysis_start_frozen_at_first_minus_three` |
+
+第一轮变异研究暴露并修掉了两处**测试自身的弱点**（产品未改）：
+`warmup_makes_no_classification` 原先只在首个周期之前检查，等于用"没有周期"
+证明 warmup 不分类；现在让时钟停在完整桶不足处**真的跑一个周期**，并同时钉
+住 phase 与 `last_evaluated_end_epoch`。`incident_failure_never_degrades_the_
+history_plane` 原先在其它面的写入之后才取样，只能证明标志位自愈；现在在故障
+发生的那一刻取样。两处修改后 verdict 计数不变（39+38），车道仍 188 检查。
 
 ## 17. 明确不做（禁区）
 

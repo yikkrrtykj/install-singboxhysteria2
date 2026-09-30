@@ -78,6 +78,7 @@ jobs:
           bash -n tests/test-monitor-v2-probes.sh
           bash -n tests/test-monitor-v2-probe-ingest.sh
           bash -n tests/test-monitor-v2-classify.sh
+          bash -n tests/test-monitor-v2-incident-runtime.sh
           bash -n monitor-v2/deploy/app-bin/monitor-contract-probe
           bash -n tests/journal-reader/test-jr-live.sh
           bash -n tests/journal-reader/test-jr-exchange-access.sh
@@ -252,6 +253,9 @@ jobs:
 
       - name: "0.4.x PR-4A deterministic incident classifier suite (DARKNESS / pinned closed vocabulary / committed fixture discriminations / schema-v3-only evidence wall / fail-closed attribution, issue #33 P4)"
         run: bash tests/test-monitor-v2-classify.sh
+
+      - name: "0.5.0 PR-4B incident runtime suite (one reviewed consumer + teardown order / frozen constants + literal wall / schema v4 plane walls + bitset maxima + one-open index / lifecycle D1-D11 with restart and both crash orders / reader continuity recovery / closed four-token containment with plane independence / no P5 route and one closed 8-key surface / fixture-grounded end-to-end, issue #33 P4)"
+        run: bash tests/test-monitor-v2-incident-runtime.sh
 
   # ---------------------------------------------------------------------
   # Lane D -- compatibility matrix. Runs on the three supported Ubuntu LTS
