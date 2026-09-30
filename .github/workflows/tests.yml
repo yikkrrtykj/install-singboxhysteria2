@@ -77,6 +77,7 @@ jobs:
           bash -n tests/test-mihomo-multi-vps-merge.sh
           bash -n tests/test-monitor-v2-probes.sh
           bash -n tests/test-monitor-v2-probe-ingest.sh
+          bash -n tests/test-monitor-v2-classify.sh
           bash -n monitor-v2/deploy/app-bin/monitor-contract-probe
           bash -n tests/journal-reader/test-jr-live.sh
           bash -n tests/journal-reader/test-jr-exchange-access.sh
@@ -95,6 +96,24 @@ jobs:
         run: |
           python3 -m py_compile tools/mihomo-multi-vps-merge.py
           python3 -m py_compile tests/mihomo-multi-vps-runtime-lab.py
+
+      # Scratch-directory hygiene, measured across every shell suite. A lane
+      # that reads an inherited $TMP instead of creating its own is green on a
+      # dev host that happens to export TMP and aborts on a Linux runner under
+      # `set -u` -- precisely the PR-4A classifier's first-attempt CI failure.
+      - name: "Shell-suite scratch-directory hygiene gate (no suite may inherit $TMP)"
+        run: |
+          offenders=0
+          while IFS= read -r f; do
+              if grep -qE '(^|[^A-Za-z_])\$"?\{?TMP' "$f" \
+                 && ! grep -qE '^[[:space:]]*TMP="\$\(mktemp' "$f"; then
+                  printf '::error::%s reads $TMP but never creates it with mktemp\n' "$f"
+                  offenders=$((offenders + 1))
+              fi
+          done < <(find tests -name '*.sh' | LC_ALL=C sort)
+          [ "$offenders" -eq 0 ] || exit 1
+          printf 'all %s shell suites own their scratch directory\n' \
+              "$(find tests -name '*.sh' | wc -l)"
 
   # ---------------------------------------------------------------------
   # Lane B -- core regression. OS-independent product contracts that do not
@@ -230,6 +249,9 @@ jobs:
 
       - name: "0.3.x PR-3B probe activation + ingest suite (opt-in activation / schema v3 boundary + reject matrix / durable egress baseline / retention + timeline surface / plane independence / live loopback-only scheduler / thread discipline / HTTP projection / rollback schema gate, issue #33 P3)"
         run: bash tests/test-monitor-v2-probe-ingest.sh
+
+      - name: "0.4.x PR-4A deterministic incident classifier suite (DARKNESS / pinned closed vocabulary / committed fixture discriminations / schema-v3-only evidence wall / fail-closed attribution, issue #33 P4)"
+        run: bash tests/test-monitor-v2-classify.sh
 
   # ---------------------------------------------------------------------
   # Lane D -- compatibility matrix. Runs on the three supported Ubuntu LTS
