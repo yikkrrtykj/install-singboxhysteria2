@@ -3397,13 +3397,14 @@ path = os.path.join(d, "history.sqlite3")
 conn = sqlite3.connect(path)
 conn.execute("CREATE TABLE meta (key TEXT NOT NULL PRIMARY KEY,"
              " value TEXT NOT NULL)")
-conn.execute("INSERT INTO meta (key, value) VALUES ('schema_version','4')")
+conn.execute("INSERT INTO meta (key, value) VALUES ('schema_version','5')")
 IH.IncidentHistory._create_v1_tables(conn)
 IH.IncidentHistory._create_journal_tables(conn)
 IH.IncidentHistory._create_journal_state_row(conn, time.time())
 IH.IncidentHistory._create_probe_table(conn)
 IH.IncidentHistory._create_incident_tables(conn)
 IH.IncidentHistory._create_incident_state_row(conn, time.time())
+IH.IncidentHistory._create_marker_table(conn)
 conn.execute(
     "INSERT INTO journal_ingest_audit (epoch, kind, seq, code)"
     " VALUES (?, 'gap', 7, 'sequence_gap')", (time.time() - 5.0,))
