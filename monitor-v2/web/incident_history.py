@@ -2119,9 +2119,10 @@ class IncidentHistory:
             # gate owns a NULL floor and no pointer, and an ACTIVATED
             # runtime owns a discovery floor -- so an armed row can never
             # lose its floor and have the reader fall back to the wider
-            # activation floor. Pre-activation (floor 0) stays flexible:
-            # the row is born inert and a close beyond the boundary may
-            # still settle its gate.
+            # activation floor. Pre-activation (floor 0) stays exempt
+            # because that is the row's birth shape: inert with a NULL
+            # floor, and the first activation lands BOTH floors in one
+            # statement, so no armed row is ever written without a gate.
             " CHECK ((rearm_required = 0"
             " OR (open_incident_id IS NULL"
             " AND discovery_floor_epoch IS NULL))"

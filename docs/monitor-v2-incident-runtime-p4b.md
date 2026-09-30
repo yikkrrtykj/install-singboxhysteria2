@@ -228,7 +228,7 @@ rearm，却没有 discovery floor**）被 DB 与本契约同时拒绝：
 
 | 形状 | activation_floor | rearm_required | discovery_floor | open_incident |
 |---|---|---|---|---|
-| 惰性（born inert） | `0` | `0` | `NULL`（或 close 在边界外落下的值） | 任意 |
+| 惰性（born inert，尚未 activation） | `0` | `0` | `NULL`（行的出生形状） | `NULL` —— 这是**运行时侧**不变量（未激活就没有周期，也就不会开案），DB CHECK 不钉这一条 |
 | 已布防、正在发现 | `> 0` | `0` | **必须非 NULL** | 任意 |
 | 已解除布防（rearm 门） | `> 0` | `1` | `NULL` | `NULL` |
 
