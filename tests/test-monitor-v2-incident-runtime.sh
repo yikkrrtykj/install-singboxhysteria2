@@ -62,13 +62,18 @@ FAIL=0
 # section moved: R1 measured 188 (14 + 174); R2 re-froze the verdict
 # snapshot and the discovery/rearm gate (219 = 14 + 205, 203 verdicts); R3
 # fixes the two review blockers -- the derived phase (§8.4) and the closed
-# state shape (§5.1) -- and every one of its five gates is ADDED, none
-# renamed, none loosened: store 69 -> 70 (+1, the armed row may not lose its
-# discovery floor), lifecycle 54 -> 56 (+2, the clean close reports warmup
-# in the cycle that closed and a restart inside the post-clean warmup
-# reports warmup before its first cycle), containment 38 -> 40 (+2, an
-# unprovable shape keeps activation dark and aborts a running cycle as
-# runtime_state_corrupt without reading one bundle). static 14 -> 12 (-2 in
+# state shape (§5.1). Its five gates are all ADDED: store 69 -> 70 (+1, the
+# armed row may not lose its discovery floor), lifecycle 54 -> 56 (+2, the
+# clean close reports warmup in the cycle that closed and a restart inside
+# the post-clean warmup reports warmup before its first cycle), containment
+# 38 -> 40 (+2, an unprovable shape keeps activation dark and aborts a
+# running cycle as runtime_state_corrupt without reading one bundle). None
+# was renamed and no expectation was loosened, with ONE declared exception:
+# lifecycle/close_clears_pointer_and_phase asserted phase == "idle" on the
+# closing cycle, which is precisely the behaviour blocker A identifies as
+# wrong, so its third conjunct is restated as phase != "open". The gate's
+# count is not new and its pointer/row halves are untouched; R3's own warmup
+# claim rides on the two added lifecycle gates. static 14 -> 12 (-2 in
 # R2, the four broadening-lattice gates deleted with the lattice itself and
 # two category-surface gates added in their place), retention 6 -> 6,
 # continuity 10 -> 10, end_to_end 14 -> 14: 208 verdicts plus the harness rc

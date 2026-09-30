@@ -1001,6 +1001,12 @@ def group_lifecycle():
             == _bits(ic.detect(single).classification)
             and closed["category"] == ic.detect(
                 single).classification.category)
+        # This gate keeps only what it owns: the pointer and the row landed
+        # together, and the row is no longer open. R2's third conjunct here
+        # was `phase == "idle"`, which pinned exactly the state-face defect
+        # R3 §8.4 fixes (a clean close reported idle while its own durable
+        # gate was already holding discovery back), so it reads `!= "open"`
+        # and the warmup claim moves to the two gates right below.
         out["close_clears_pointer_and_phase"] = (
             _state(env["history"])["open_incident_id"] is None
             and env["scanner"].status()["open_incident"] is False

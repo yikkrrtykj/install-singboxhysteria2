@@ -17,7 +17,9 @@ fail-closed 结论，属于跨 generation 拼接字段，语义错误而非计�
 “本周期分析了什么/还没评估过任何桶”反推 warmup 的做法（复审 blocker A：
 clean close 当轮与 post-clean restart 在第一个周期之前都会误报 `idle`，
 分类行为始终正确，错的是状态面）。§16 相应新增判别器 31–34，红证据见
-§16.3。两处修复都不改分类规则、不改 schema 版本、不加列。
+§16.3。两处修复都不改分类规则、不改 schema 版本、不加列；唯一被重写的既有
+断言（`close_clears_pointer_and_phase` 的 `phase == "idle"` → `!= "open"`）
+在 §15 逐条申报，计数不变。
 基线：`origin/main = a180e7dc2def41aeaa246495a8538b3e64f4b8de`（PR-4A
 分类器 + PR-3B schema v3，VERSION / MONITOR_WEB_VERSION = 0.4.0，
 History SCHEMA_VERSION = 3）。
@@ -539,6 +541,13 @@ FD / conntrack / listen-queue；客户端 ISP 身份；目的地身份；从稀�
   本轮按 §8.1 删除或改写为 snapshot 门，计数因此**下降**；下降的每一条都
   是删除一个错误承诺，不是删除覆盖，且必须逐条写进车道头注释。新增的
   phase token `rearm` 进入 phase 词汇门（四→五 token），HTTP 投影域同步。
+- R3 的门面变化：五个门**全部是新增**（store +1、lifecycle +2、containment
+  +2），没有门被改名，也没有门的期望被放宽——**除了一条必须逐条申报的重写**：
+  `lifecycle/close_clears_pointer_and_phase` 的第三个合取项在 R2 写成
+  `phase == "idle"`，而 blocker A 指出的正是“clean close 的当轮报 `idle`”这个
+  错误，所以它按 §8.4 重写为 `phase != "open"`（该门只继续钉它本来该钉的：
+  指针与行在同一事务落下、`open_incident` 翻假）。这条重写的**计数不变**，
+  R3 自己的 warmup 主张由上面两条新增 lifecycle 门承担，不靠放松旧门。
 
 ## 16. 判别器清单（34 条，全部必须先红后绿）
 
