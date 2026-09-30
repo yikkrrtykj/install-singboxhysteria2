@@ -12,7 +12,8 @@
 #      an in-flight scan cycle must never meet a closed store. The release
 #      identity is pinned at Monitor 0.5.0 / MONITOR_WEB_VERSION 0.5.0 /
 #      history SCHEMA_VERSION 4, and the contract document that froze them is
-#      present with all nineteen discriminators listed.
+#      present with all thirty discriminators listed (R1's nineteen plus
+#      R2's eleven).
 #   2. THE SURFACE DID NOT WIDEN. There is no P5 ``/api/v1/incidents`` route,
 #      the timeline endpoint gains EXACTLY ONE key (the closed eight-key
 #      ``incident_runtime`` object), and the incident runtime module holds no
@@ -22,14 +23,20 @@
 #      monitor-incident-runtime/runtime_groups.py drives the real
 #      IncidentScanner over a real schema-v4 SQLite store and asserts the
 #      frozen lifecycle -- one row per incident, the analysis window frozen at
-#      ``first_signal - 3*BUCKET``, in-place broadening that never moves
-#      sideways or down, a three-clean-bucket tail, the sixty-bucket cap that
-#      closes fail-closed, restart continuation from the stored pointer, crash
-#      orders on both sides of the transaction, the bitset walls at 45 and 28
-#      bits, ``destination_specific`` refused twice over, reader-continuity
-#      recovery that is never retroactive, and every stage failure landing in
-#      one closed four-token vocabulary while the other planes of the same
-#      process keep answering.
+#      ``first_signal - 3*BUCKET``, the persisted six columns as the ONE
+#      CONSISTENT SNAPSHOT of the most recent successful ``detect()`` (which
+#      may move the category either way, because the persistence layer has no
+#      opinion to defend), a three-clean-bucket tail settled from THAT cycle,
+#      the sixty-bucket cap really persisted at 60 and closed fail-closed at
+#      61 without fabricating a bucket, the durable ``rearm`` gate that a
+#      window-limit close raises and a restart cannot forget, restart
+#      continuation from the stored pointer, crash orders on both sides of
+#      the transaction, the bitset walls at 45 and 28 bits,
+#      ``destination_specific`` refused twice over, reader-continuity recovery
+#      that is never retroactive, the composed evidence-plane health that the
+#      incident plane itself can never pollute, and every stage failure
+#      landing in one closed four-token vocabulary while the other planes of
+#      the same process keep answering.
 #   4. NOTHING CANONICALISED ITSELF: the end-to-end group cans NOTHING. It
 #      publishes the committed Reality-outage scenario into a live store,
 #      reads the evidence back out of SQLite through the live bounded reader,
@@ -50,45 +57,73 @@ export CLASSIFY_FIXTURE_DIR="$HERE/monitor-classify/fixtures"
 
 PASS=0
 FAIL=0
-# PR-4B -- 188 checks, measured on the dev host and to be re-measured on Linux
-# CI. The breakdown is part of the record:
+# PR-4B R2 -- 219 checks, measured on the dev host and to be re-measured on
+# Linux CI. The breakdown is part of the record, and so is the reason every
+# section moved: R1 measured 188 (14 + 174); R2 re-freezes the verdict
+# snapshot and the discovery/rearm gate, so gates were ADDED where the new
+# semantics need proving and RENAMED where R1 pinned semantics this round
+# deleted. No R1 gate was dropped to make room, and no expectation was
+# loosened: static 14 -> 12 (-2, the four broadening-lattice gates deleted
+# with the lattice itself, two category-surface gates added in their place),
+# store 51 -> 69 (+18), retention 6 -> 6, lifecycle 39 -> 54 (+15),
+# continuity 10 -> 10, containment 38 -> 38, end_to_end 14 -> 14: 203
+# verdicts plus the harness rc gate plus the fixture-immutability proof.
 #   S0 static + wiring gates             14   the release identity (VERSION /
 #        MONITOR_WEB_VERSION / SCHEMA_VERSION), one scanner construction site
 #        and the stop-before-close teardown order, the no-P5-route and
 #        exactly-one-new-key surface walls, the runtime module's SQL-free and
-#        I/O-free call-site walls, and the contract document's nineteen
-#        discriminator list. All static, all platform-independent.
-#   S1 behaviour groups (runtime_groups) 174  = 172 harness verdicts plus the
+#        I/O-free call-site walls, and the contract document's THIRTY
+#        discriminator list (R1's nineteen plus R2's eleven; a gate that went
+#        missing with a lattice that went deleted could otherwise hide behind
+#        a spec that stopped mentioning it). All static, all
+#        platform-independent.
+#   S1 behaviour groups (runtime_groups) 205  = 203 harness verdicts plus the
 #        harness rc gate plus the cross-lane fixture-immutability proof:
-#        static 14 (the six frozen constants by value, the bucket grid
+#        static 12 (the six frozen constants by value, the bucket grid
 #        REFERENCED not rewritten, the numeric-literal wall that forbids a
 #        second copy of 60, the import closure, the closed error/phase/
-#        closure vocabularies, the broadening lattice as an edge set plus its
-#        truth table, the eight-key ordered status surface, dark before
-#        start),
-#        store 51 (exactly ten v4 tables and their exact column sets, the
+#        closure vocabularies with rearm in the phase set, the deleted
+#        lattice's SURFACE (no _CATEGORY_LATTICE/_broaden attribute and no
+#        module attribute holding an emittable category string), the eight-key
+#        ordered status surface, dark before start),
+#        store 69 (exactly ten v4 tables and their exact column sets, the
 #        three TEXT columns as the only closed enums, no raw/identity column
-#        anywhere, the inert single state row, the six emittable categories
+#        anywhere, the inert single state row now eight columns born with a
+#        NULL discovery floor and rearm 0, the six emittable categories
 #        persisting while destination_specific is refused at the boundary AND
-#        by CHECK, seven CHECK rejections, the one-open partial index, the
-#        45/28-bit positional round-trip with one-past refused twice, no
-#        identity material reaching a row, activation one-way, a mark that
-#        never moves the pointer, update/close requiring an open row and a
-#        closed reason, the close clearing the pointer in the same
-#        transaction, the per-section 2000-row budget refusing the WHOLE
-#        bundle, and the timeline projection staying exactly as wide as it
-#        was),
+#        by CHECK, eleven CHECK rejections -- the four new ones being a floor
+#        below the activation floor, a rearm outside {0,1}, and rearm=1 paired
+#        with an open pointer or with a discovery floor -- the one-open
+#        partial index, the 45/28-bit positional round-trip with one-past
+#        refused twice, no identity material reaching a row, activation
+#        pinning BOTH floors one-way, a mark that never moves the pointer,
+#        update/close requiring an open row and a closed reason, the close
+#        moving pointer/floor/rearm in the SAME transaction for both closure
+#        reasons and rearm surviving reactivation, the composed bundle health
+#        -- clean before each of the three evidence planes, admitting each of
+#        them, error-code precedence identical to health(), and the incident
+#        plane's own degradation EXCLUDED -- the per-section 2000-row budget
+#        refusing the WHOLE bundle, and the timeline projection staying
+#        exactly as wide as it was),
 #        retention 6 (a closed window ages out by its own signal age, an open
 #        one never does, the continuity row survives, neither incident table
 #        takes part in size pruning, the seven-day contract untouched),
-#        lifecycle 39 (D1-D7 plus D9-D11: exactly one open row, the frozen
-#        analysis start, signal epochs from the detection, repeat scans
-#        writing nothing, broadening in place, narrowing never rewriting,
-#        clean tail closing with the last verdict kept, pointer/row landing
-#        together and both crash orders, restart continuing the same incident,
-#        a probe-only blip and a changed egress address opening nothing and
-#        broadening nothing, the sixty-bucket cap closing fail-closed without
-#        classifying the over-long window),
+#        lifecycle 54 (D1-D7 plus D9-D13: exactly one open row, the frozen
+#        analysis start, signal epochs from the detection, repeat scans of the
+#        SAME bucket writing nothing while a NEWER complete bucket advances
+#        the classified end, the category moving to the current verdict in
+#        BOTH directions (narrowing rewrites), the clean tail closing on
+#        THAT cycle's snapshot rather than the row's old bits, the discovery
+#        floor pinned at the closed incident's last signal with warmup holding
+#        until five post-signal buckets and discovery then resuming,
+#        pointer/row landing together and both crash orders, restart
+#        continuing the same incident, a probe-only blip and a changed egress
+#        address opening and broadening nothing, bucket 60 really persisted
+#        and bucket 61 closing fail-closed on the last SUCCESSFUL snapshot
+#        without classifying the over-long window, the 20->65 clock jump
+#        never fabricating bucket 60, and the durable rearm gate: a normal
+#        phase, no failure counter, discovery stopped over ten further
+#        cycles of continuing outage, and the same answer after a restart),
 #        continuity 10 (fresh/stale only on the projection, activation
 #        starting continuity at the floor, every non-fresh token breaking it,
 #        recovery stamping THIS moment and never repairing an earlier window,
@@ -108,7 +143,7 @@ FAIL=0
 #        the row's bits equal to the live reader's own verdict; the quiet
 #        scenario opening nothing while still evaluating; an over-budget
 #        evidence window refused as a contained read error).
-EXPECTED_PASS=188
+EXPECTED_PASS=219
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
@@ -228,12 +263,12 @@ else
     pass "the incident runtime touches no filesystem, network or subprocess"
 fi
 
-# (6) The frozen contract is present and complete: all nineteen discriminators
+# (6) The frozen contract is present and complete: all THIRTY discriminators
 #     are listed in the document this lane implements, so a gate that went
 #     missing cannot hide behind a spec that stopped mentioning it.
 DISC_COUNT="$(sed -n '/^## 16\./,/^## 17\./p' "$DOC" | grep -cE '^[0-9]+\. ')"
-assert_eq '19' "$DISC_COUNT" \
-    "the P4B contract document lists all nineteen discriminators"
+assert_eq '30' "$DISC_COUNT" \
+    "the P4B contract document lists all thirty discriminators"
 
 # (7) This lane is registered in CI where the other Monitor behaviour lanes
 #     run: a suite nobody executes is a suite that cannot fail.

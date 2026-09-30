@@ -74,15 +74,7 @@ FROZEN_CONSTANTS = {
 }
 FROZEN_ERRORS = ("evidence_read_failed", "classify_failed", "persist_failed",
                  "runtime_state_corrupt")
-FROZEN_PHASES = ("warmup", "idle", "open", "degraded")
-FROZEN_LATTICE = {
-    "insufficient_evidence": {"common_inbound_client_office",
-                              "hysteria2_udp_path", "reality_tcp_path",
-                              "vps_outbound", "vps_process_or_api"},
-    "reality_tcp_path": {"vps_outbound"},
-    "hysteria2_udp_path": {"vps_outbound"},
-    "common_inbound_client_office": {"vps_outbound"},
-}
+FROZEN_PHASES = ("warmup", "idle", "open", "rearm", "degraded")
 FROZEN_V4_TABLES = {"meta", "timeline_samples", "device_protocol_states",
                     "network_probe_samples", "journal_runs", "journal_events",
                     "journal_ingest_audit", "journal_ingest_state",
@@ -132,6 +124,10 @@ class Canned:
             raise RuntimeError("injected evidence read fault")
         if "classifier_bundle" in self._refuse:
             return None
+        if callable(self._bundle):
+            # A live-evidence fixture: the read is built for the window the
+            # scanner actually asked about (see _continuing_outage).
+            return self._bundle(window_start, window_end)
         return self._bundle
 
     def journal_status(self):
@@ -211,6 +207,13 @@ def _state(history):
     return history.incident_runtime_snapshot()["state"]
 
 
+def _bundle_health(history):
+    """The bundle's own health section -- the classifier's view of how good
+    its evidence is. None if the reader itself refused."""
+    bundle = history.classifier_bundle(BASE, BASE + 60.0, "fresh")
+    return None if bundle is None else bundle["health"]
+
+
 def _open_raw(history, category="reality_tcp_path", analysis_start=None,
               first_signal=None, last_signal=None, classified_end=None,
               buckets=5, evidence_bits=0, unknown_bits=0, state="open",
@@ -255,6 +258,25 @@ def _pump_samples(history, count, start=BASE, width=0.1):
 def _bits(cls):
     return (ic.evidence_to_bits(cls.evidence),
             ic.unknown_to_bits(cls.unknowns))
+
+
+def _continuing_outage():
+    """A canned READ for an outage that is STILL GOING: the evidence is built
+    for the window the scanner actually asks about, with the anomaly at its
+    tail, so a frozen open window keeps growing instead of cleaning its own
+    tail at bucket 13. The builders default to a ten-bucket ``window``
+    section, so a longer span has to be told the truth about itself --
+    exactly what a real reader's rows would carry.
+    """
+    def build(window_start, window_end):
+        count = int(round((window_end - window_start) / BUCKET))
+        if window_start != BASE or not 6 <= count <= ic.MAX_BUCKETS:
+            return None  # refused read fails closed; never a fake verdict
+        bundle = cg.reality_incident_bundle(buckets=count,
+                                            drop_from=count - 3)
+        bundle["window"]["end_epoch"] = float(window_end)
+        return bundle
+    return build
 
 
 # -- group: static contract --------------------------------------------------
@@ -313,42 +335,32 @@ def group_static():
     out["error_vocabulary_closed"] = frozenset(
         getattr(ir, name) for name in dir(ir)
         if name.startswith("ERROR_")) == frozenset(FROZEN_ERRORS)
-    out["phase_vocabulary_closed"] = {ir.PHASE_WARMUP, ir.PHASE_IDLE,
-                                      ir.PHASE_OPEN, ir.PHASE_DEGRADED} == \
-        set(FROZEN_PHASES)
+    out["phase_vocabulary_closed"] = frozenset(
+        getattr(ir, name) for name in dir(ir)
+        if name.startswith("PHASE_")) == frozenset(FROZEN_PHASES)
     out["closure_reasons_are_two"] = {ir._CLOSURE_CLEAN_BUCKETS,
                                       ir._CLOSURE_WINDOW_LIMIT} == \
         {"clean_buckets", "window_limit"}
-    # (6) The §8.1 broadening lattice, pinned as an edge SET (not prose).
-    lattice = {category: set(targets) for category, targets
-               in ir._CATEGORY_LATTICE.items()}
-    out["lattice_edges_exact"] = lattice == FROZEN_LATTICE
-    out["lattice_never_leaves_emittable"] = all(
-        target in ic.EMITTABLE_CATEGORIES for targets in lattice.values()
-        for target in targets)
-    out["destination_has_no_lattice_slot"] = ic.CATEGORY_DESTINATION not in \
-        lattice and all(ic.CATEGORY_DESTINATION not in targets
-                        for targets in lattice.values())
-    # (7) The lattice's own truth table, one move at a time.
-    moves = (
-        (ic.CATEGORY_INSUFFICIENT, ic.CATEGORY_REALITY_TCP, True),
-        (ic.CATEGORY_INSUFFICIENT, ic.CATEGORY_VPS_OUTBOUND, True),
-        (ic.CATEGORY_REALITY_TCP, ic.CATEGORY_VPS_OUTBOUND, True),
-        (ic.CATEGORY_HY2_UDP, ic.CATEGORY_VPS_OUTBOUND, True),
-        (ic.CATEGORY_COMMON_INBOUND, ic.CATEGORY_VPS_OUTBOUND, True),
-        (ic.CATEGORY_REALITY_TCP, ic.CATEGORY_HY2_UDP, False),
-        (ic.CATEGORY_HY2_UDP, ic.CATEGORY_REALITY_TCP, False),
-        (ic.CATEGORY_VPS_OUTBOUND, ic.CATEGORY_REALITY_TCP, False),
-        (ic.CATEGORY_VPS_OUTBOUND, ic.CATEGORY_INSUFFICIENT, False),
-        (ic.CATEGORY_REALITY_TCP, ic.CATEGORY_REALITY_TCP, True),
-    )
-    # Stated plainly: an upward move takes the incoming category; anything
-    # else -- same level, downward, an unmapped pair -- keeps the persisted
-    # value. The edge set above is the authority; this is its truth table.
-    out["lattice_truth_table"] = all(
-        ir._broaden(persisted, incoming) == (incoming if allowed_move
-                                             else persisted)
-        for persisted, incoming, allowed_move in moves)
+    # (6) PR-4B R2 §8.1: the category lattice is DELETED, not merely unused.
+    #     The persisted-category rule is now "write exactly what THIS
+    #     detect() said", so a module-level priority table (or a helper that
+    #     consults one) is a second verdict algorithm living in the runtime
+    #     plane. Both the attributes and the source tokens are pinned absent:
+    #     a renamed lattice would be the same bug, and the destination
+    #     category's unemittability is already pinned by the store's own
+    #     CHECK-boundary gates.
+    out["lattice_surface_deleted"] = (
+        not hasattr(ir, "_CATEGORY_LATTICE") and not hasattr(ir, "_broaden")
+        and "CATEGORY_LATTICE" not in source and "_broaden" not in source)
+    # (7) The same rule from the other side: the runtime module names NO
+    #     category at all. Bucketing facts are referenced from the
+    #     classifier; categories only ever flow in through
+    #     ``classification.category``, so there is nothing here that could
+    #     rank one category above another.
+    out["module_names_no_category"] = not [
+        name for name in dir(ir)
+        if isinstance(getattr(ir, name, None), str)
+        and getattr(ir, name) in ic.EMITTABLE_CATEGORIES]
     # (8) The status surface's key ORDER and count (§12): eight keys.
     env = _env(SCEN["normal_background"])
     try:
@@ -386,7 +398,7 @@ def group_store():
         out["state_columns_exact"] = state_cols == [
             "id", "runtime_version", "activation_floor_epoch",
             "last_evaluated_end_epoch", "reader_fresh_since_epoch",
-            "open_incident_id"]
+            "open_incident_id", "discovery_floor_epoch", "rearm_required"]
         # (3) No column may hold raw text, an identity or an address: the
         #     only TEXT columns in the whole plane are the three closed enums.
         types = {row[1]: row[2] for row in conn.execute(
@@ -402,16 +414,23 @@ def group_store():
             bad in [c.lower() for c in window_cols + state_cols]
             for bad in forbidden)
         # (4) The runtime-state row is born INERT and there is only ever one.
+        #     PR-4B R2: inert birth also means NO discovery floor and NO
+        #     rearm demand -- the gates exist only once activation lands.
         inert = conn.execute(
             "SELECT id, runtime_version, activation_floor_epoch,"
             " last_evaluated_end_epoch, reader_fresh_since_epoch,"
-            " open_incident_id FROM incident_runtime_state").fetchall()
+            " open_incident_id, discovery_floor_epoch, rearm_required"
+            " FROM incident_runtime_state").fetchall()
         out["state_row_born_inert_single"] = inert == [
-            (1, 1, 0.0, 0.0, None, None)]
+            (1, 1, 0.0, 0.0, None, None, None, 0)]
         try:
+            # rearm_required is carried explicitly: with a NOT NULL column
+            # omitted the refusal below would come from the NOT NULL
+            # constraint, not from the id = 1 CHECK it means to prove.
             conn.execute("INSERT INTO incident_runtime_state (id,"
                          " runtime_version, activation_floor_epoch,"
-                         " last_evaluated_end_epoch) VALUES (2, 1, 0.0, 0.0)")
+                         " last_evaluated_end_epoch, rearm_required)"
+                         " VALUES (2, 1, 0.0, 0.0, 0)")
             out["state_second_row_refused"] = False
             conn.rollback()
         except sqlite3.IntegrityError:
@@ -560,7 +579,7 @@ def group_store():
         out["snapshot_state_keys"] = set(snapshot["state"]) == {
             "runtime_version", "activation_floor_epoch",
             "last_evaluated_end_epoch", "reader_fresh_since_epoch",
-            "open_incident_id"}
+            "open_incident_id", "discovery_floor_epoch", "rearm_required"}
         out["snapshot_open_row_columns"] = (
             list(snapshot["open_incident"])
             == list(ih.IncidentHistory.INCIDENT_WINDOW_COLUMNS))
@@ -576,6 +595,11 @@ def group_store():
         out["activate_is_one_way"] = (
             history.incident_activate(BASE + 10_000.0) is True
             and _state(history)["activation_floor_epoch"] == float(BASE))
+        # R2: the first activation owns THREE columns in one statement, so a
+        # floor can never exist without its discovery gate (§5, §8).
+        out["activate_pins_the_discovery_floor"] = (
+            _state(history)["discovery_floor_epoch"] == float(BASE)
+            and _state(history)["rearm_required"] == 0)
         pointer_before = _state(history)["open_incident_id"]
         out["mark_never_moves_the_pointer"] = (
             history.incident_runtime_mark(BASE + 400.0, None) is True
@@ -660,6 +684,154 @@ def group_store():
         finally:
             small.close()
             _drop(small_root)
+        # (15) PR-4B R2 §5/§8.3: the two gate columns are CHECKed STATE, and
+        #      every close moves the gate in the SAME transaction as the row
+        #      it closes. A private store keeps these raw-SQL proofs from
+        #      disturbing the boundary-API sequence above.
+        gate, gate_root, gate_clock = _store_dir()
+        try:
+            gc = gate._conn
+            gate_clock[0] = BASE + 700.0  # a close may not precede its signal
+            gate.incident_activate(BASE)
+            for label, sql, params in (
+                    ("floor_below_activation",
+                     "UPDATE incident_runtime_state SET"
+                     " discovery_floor_epoch = ? WHERE id = 1",
+                     (BASE - 60.0,)),
+                    ("rearm_not_zero_or_one",
+                     "UPDATE incident_runtime_state SET rearm_required = 2"
+                     " WHERE id = 1", ())):
+                try:
+                    gc.execute(sql, params)
+                    out["state_check_refuses_%s" % label] = False
+                    gc.rollback()
+                except sqlite3.IntegrityError:
+                    out["state_check_refuses_%s" % label] = True
+                    gc.rollback()
+            opened = gate.incident_open_window(
+                ic.CATEGORY_REALITY_TCP, BASE, BASE + 180, BASE + 240,
+                BASE + 300, 5, 0, 0)
+            # The pairing CHECKs below only bite with an OPEN pointer, so
+            # that premise is proved rather than assumed.
+            out["gate_premise_open_pointer_lands"] = (
+                opened is not None
+                and _state(gate)["open_incident_id"] == opened)
+            try:
+                gc.execute("UPDATE incident_runtime_state SET"
+                           " rearm_required = 1 WHERE id = 1")
+                out["state_check_refuses_rearm_while_incident_open"] = False
+                gc.rollback()
+            except sqlite3.IntegrityError:
+                out["state_check_refuses_rearm_while_incident_open"] = True
+                gc.rollback()
+            # The same statement shape but with the pointer moved aside: the
+            # refusal then can only come from the floor half of the CHECK
+            # (rearm=1 requires a NULL discovery floor), not from the pointer.
+            try:
+                gc.execute("UPDATE incident_runtime_state SET"
+                           " open_incident_id = NULL, rearm_required = 1,"
+                           " discovery_floor_epoch = ? WHERE id = 1",
+                           (BASE + 240.0,))
+                out["state_check_refuses_rearm_with_discovery_floor"] = False
+                gc.rollback()
+            except sqlite3.IntegrityError:
+                out["state_check_refuses_rearm_with_discovery_floor"] = True
+                gc.rollback()
+            # clean_buckets: the gate re-arms discovery AT the signal end.
+            gate.incident_close_window(opened, ic.CATEGORY_REALITY_TCP,
+                                       BASE + 240, BASE + 300, 5, 0, 0,
+                                       "clean_buckets")
+            settled = _state(gate)
+            out["clean_close_moves_the_discovery_floor"] = (
+                settled["open_incident_id"] is None
+                and settled["discovery_floor_epoch"] == float(BASE + 240.0)
+                and settled["rearm_required"] == 0)
+            # window_limit: discovery is DISARMED, not re-baselined.
+            second = gate.incident_open_window(
+                ic.CATEGORY_HY2_UDP, BASE, BASE + 180, BASE + 240,
+                BASE + 300, 5, 0, 0)
+            gate.incident_close_window(second, ic.CATEGORY_HY2_UDP,
+                                       BASE + 240, BASE + 300, 5, 0, 0,
+                                       "window_limit")
+            disarmed = _state(gate)
+            out["window_limit_close_raises_rearm"] = (
+                disarmed["open_incident_id"] is None
+                and disarmed["discovery_floor_epoch"] is None
+                and disarmed["rearm_required"] == 1)
+            # ... and a later activation can never un-learn it: the one-way
+            # early return leaves the gate exactly where the close left it.
+            survived = gate.incident_activate(BASE + 600.0)
+            after = _state(gate)
+            out["rearm_survives_reactivation"] = (
+                survived is True and after["rearm_required"] == 1
+                and after["discovery_floor_epoch"] is None
+                and after["activation_floor_epoch"] == float(BASE))
+        finally:
+            gate.close()
+            _drop(gate_root)
+        # (16) PR-4B R2 §7: the bundle's health is the COMPOSED health of the
+        #      classifier's EVIDENCE planes (ordinary OR journal OR probe,
+        #      same code precedence as ``health()``) and explicitly NOT the
+        #      incident plane's -- otherwise the consumer's own failures would
+        #      steer the classifier that is judging it. The three evidence
+        #      flags are raised through the store's own per-plane recorders
+        #      (the same calls a real sqlite fault runs); the incident flag is
+        #      raised by a REAL boundary refusal.
+        clean = {"enabled": True, "degraded": False, "last_error_code": None}
+        for plane, recorder, code in (
+                ("ordinary", "_record_failure", ih.CODE_WRITE_FAILED),
+                ("journal", "_record_journal_failure",
+                 ih.CODE_EXCHANGE_UNREADABLE),
+                ("probe", "_record_probe_failure",
+                 ih.CODE_PROBE_PERSIST_FAILED)):
+            one, one_root, _c = _store_dir()
+            try:
+                out["bundle_health_clean_before_%s" % plane] = (
+                    _bundle_health(one) == clean)
+                getattr(one, recorder)(code)
+                out["bundle_health_admits_%s" % plane] = (
+                    _bundle_health(one) == {"enabled": True, "degraded": True,
+                                            "last_error_code": code})
+            finally:
+                one.close()
+                _drop(one_root)
+        both, both_root, _c = _store_dir()
+        try:
+            # The precedence is IDENTICAL to health(): probe < journal <
+            # ordinary, so a lower plane never swallows a higher code, and
+            # the bundle surface is the same projection of the same state.
+            both._record_probe_failure(ih.CODE_PROBE_PERSIST_FAILED)
+            both._record_journal_failure(ih.CODE_EXCHANGE_UNREADABLE)
+            stage_one = (_bundle_health(both)
+                         == {k: both.health()[k] for k in
+                             ("enabled", "degraded", "last_error_code")}
+                         and _bundle_health(both)["last_error_code"]
+                         == ih.CODE_EXCHANGE_UNREADABLE)
+            both._record_failure(ih.CODE_WRITE_FAILED)
+            out["bundle_health_code_precedence_matches_health"] = (
+                stage_one and _bundle_health(both) == {
+                    k: both.health()[k] for k in
+                    ("enabled", "degraded", "last_error_code")}
+                and _bundle_health(both)["degraded"] is True
+                and _bundle_health(both)["last_error_code"]
+                == ih.CODE_WRITE_FAILED)
+        finally:
+            both.close()
+            _drop(both_root)
+        neither, neither_root, _c = _store_dir()
+        try:
+            refused = neither.incident_open_window(
+                ic.CATEGORY_DESTINATION, BASE, BASE + 180, BASE + 240,
+                BASE + 300, 5, 0, 0)
+            out["bundle_health_incident_refusal_lands"] = (
+                refused is None and neither.incident_status()["degraded"]
+                is True)
+            out["bundle_health_excludes_the_incident_plane"] = (
+                _bundle_health(neither) == clean
+                and neither.health()["degraded"] is False)
+        finally:
+            neither.close()
+            _drop(neither_root)
     finally:
         history.close()
         _drop(root)
@@ -761,16 +933,31 @@ def group_lifecycle():
         out["status_shows_the_open_incident"] = (
             env["scanner"].status()["phase"] == "open"
             and env["scanner"].status()["open_incident"] is True)
-        # D2: the same evidence scanned again writes NOTHING new.
-        updated_before = row["updated_epoch"]
+        # D2: once a cycle has settled the generation it evaluated, the same
+        #     evidence scanned again at the SAME complete bucket writes
+        #     NOTHING new. The first OPEN-period cycle is deliberately not
+        #     treated as a repeat: the frozen analysis window is wider than
+        #     the discovery window that opened the row, so its bucket count
+        #     really moves (5 -> the frozen width) and that IS a new
+        #     classification, not a duplicate write.
+        env["scanner"].run_once()
+        settled_row = _rows(env["history"])[0]
+        updated_before = settled_row["updated_epoch"]
+        out["open_period_settles_the_frozen_window_width"] = (
+            settled_row["buckets"] == int(round(
+                (BASE + 600.0 - settled_row["analysis_start_epoch"])
+                / BUCKET)) and settled_row["buckets"] > row["buckets"])
         for _ in range(3):
             env["scanner"].run_once()
         rows = _rows(env["history"])
         out["repeat_scans_never_duplicate"] = (
             len(rows) == 1 and rows[0]["updated_epoch"] == updated_before)
 
-        # D3: broader evidence moves the SAME row up the lattice; a narrower
-        #     or sideways verdict keeps what is already persisted.
+        # D3 (R2 §8.1): BOTH directions write the current verdict. There is
+        #     no lattice and no sticky attribution -- a broader verdict moves
+        #     the row up, a narrower verdict moves it back down, and in each
+        #     case the persisted category is exactly what that cycle's
+        #     detect() said.
         env["canned"]._bundle = SCEN["reality_plus_generic_probe"]
         env["clock"][0] = BASE + 675.0
         env["scanner"].run_once()
@@ -783,15 +970,15 @@ def group_lifecycle():
         env["clock"][0] = BASE + 735.0
         env["scanner"].run_once()
         narrowed = _rows(env["history"])[0]
-        out["narrowing_never_rewrites_category"] = (
-            narrowed["category"] == "vps_outbound")
+        out["narrowing_rewrites_category_to_the_current_verdict"] = (
+            narrowed["category"] == ic.CATEGORY_REALITY_TCP
+            and narrowed["incident_id"] == row["incident_id"])
 
-        # D4: three consecutive clean tail buckets close it, with the signal
-        #     end and the LAST persisted verdict kept exactly as they were:
-        #     a close moves the lifecycle's state, it never re-classifies,
-        #     widens the bits or invents a signal.
+        # D4: three consecutive clean tail buckets close it. The signal end
+        #     is kept exactly as it was (a close never extrapolates a signal
+        #     into clean buckets), but the six snapshot columns are settled
+        #     by THIS cycle's detect() (§8.2).
         last_signal_before = narrowed["last_signal_epoch"]
-        bits_before = (narrowed["evidence_bits"], narrowed["unknown_bits"])
         env["clock"][0] = BASE + 795.0
         env["scanner"].run_once()
         closed = _rows(env["history"])[0]
@@ -801,22 +988,51 @@ def group_lifecycle():
             and closed["closed_epoch"] == BASE + 795.0)
         out["close_keeps_last_signal"] = (
             closed["last_signal_epoch"] == last_signal_before)
-        out["close_keeps_the_last_persisted_bits"] = (
-            (closed["evidence_bits"], closed["unknown_bits"]) == bits_before)
+        out["clean_close_settles_the_current_verdict_bits"] = (
+            (closed["evidence_bits"], closed["unknown_bits"])
+            == _bits(ic.detect(single).classification)
+            and closed["category"] == ic.detect(
+                single).classification.category)
         out["close_clears_pointer_and_phase"] = (
             _state(env["history"])["open_incident_id"] is None
             and env["scanner"].status()["open_incident"] is False
             and env["scanner"].status()["phase"] == "idle")
         out["no_second_row_ever"] = len(_rows(env["history"])) == 1
+        # R2 §8: the three just-closed clean buckets become the NEXT
+        # segment's trusted baseline, so discovery must not classify again
+        # until the last-5-bucket window_start catches the new floor.
+        out["clean_close_pins_the_discovery_floor"] = (
+            _state(env["history"])["discovery_floor_epoch"]
+            == closed["last_signal_epoch"])
+        reads_before = len(env["canned"]._seen)
+        env["canned"]._bundle = SCEN["reality_plus_generic_probe"]
+        env["clock"][0] = BASE + 855.0
+        env["scanner"].run_once()
+        out["post_clean_close_discovery_stays_warmup"] = (
+            len(env["canned"]._seen) == reads_before
+            and len(_rows(env["history"])) == 1
+            and env["scanner"].status()["phase"] == "warmup")
+        env["clock"][0] = BASE + 915.0
+        env["scanner"].run_once()
+        out["safe_warmup_then_discovery_resumes"] = (
+            len(env["canned"]._seen) == reads_before + 1
+            and env["scanner"].status()["phase"] != "warmup")
     finally:
         _close_env(env)
 
-    # D5: one quiet bucket then a second cluster stays ONE lifecycle.
+    # D5 (R2 discriminator 1): one quiet bucket then a second cluster stays
+    #     ONE lifecycle -- and that lifecycle's category genuinely DROPS to
+    #     the classifier's fail-closed verdict. The persistence layer has no
+    #     right to keep a Reality attribution the classifier has already
+    #     withdrawn.
     env = _env(single)
     try:
         _activate(env)
         env["scanner"].run_once()
-        first_id = _rows(env["history"])[0]["incident_id"]
+        rows = _rows(env["history"])
+        first_id = rows[0]["incident_id"]
+        out["second_cluster_starts_from_reality_attribution"] = (
+            rows[0]["category"] == ic.CATEGORY_REALITY_TCP)
         split = SCEN["two_clusters_fail_closed"]
         split_detection = ic.detect(split)
         env["canned"]._bundle = split
@@ -825,8 +1041,9 @@ def group_lifecycle():
         rows = _rows(env["history"])
         out["second_cluster_is_not_a_second_incident"] = (
             len(rows) == 1 and rows[0]["incident_id"] == first_id)
-        out["second_cluster_keeps_attribution"] = (
-            rows[0]["category"] == "reality_tcp_path")
+        out["second_cluster_downgrades_the_persisted_category"] = (
+            rows[0]["category"] == split_detection.classification.category
+            == ic.CATEGORY_INSUFFICIENT)
         out["second_cluster_records_its_own_verdict_bits"] = (
             rows[0]["evidence_bits"]
             == ic.evidence_to_bits(split_detection.classification.evidence)
@@ -865,17 +1082,26 @@ def group_lifecycle():
     finally:
         _close_env(env)
 
+    # D7 (R2 restated): an egress-address change is not an attribution
+    #        witness. The OLD form of this gate ("the row keeps the Reality
+    #        category") was the deleted lattice's semantics; under §8.1 the
+    #        honest, stronger statement is that whatever the cycle's verdict
+    #        is, it is NEVER destination_specific and it is exactly what
+    #        detect() said.
     env = _env(single)
     try:
         _activate(env)
         env["scanner"].run_once()
-        category_before = _rows(env["history"])[0]["category"]
         env["canned"]._bundle = SCEN["probe_outage_with_egress_change_only"]
         env["clock"][0] = BASE + 675.0
         env["scanner"].run_once()
         rows = _rows(env["history"])
-        out["egress_change_never_broadens_to_destination"] = (
-            len(rows) == 1 and rows[0]["category"] == category_before)
+        verdict = ic.detect(SCEN["probe_outage_with_egress_change_only"])
+        out["egress_change_never_persists_a_destination"] = (
+            len(rows) == 1
+            and rows[0]["category"] != ic.CATEGORY_DESTINATION
+            and rows[0]["category"] in ic.EMITTABLE_CATEGORIES
+            and rows[0]["category"] == verdict.classification.category)
     finally:
         _close_env(env)
 
@@ -947,30 +1173,156 @@ def group_lifecycle():
     finally:
         _close_env(env)
 
-    # D11: a window past MAX_ANALYSIS_BUCKETS closes FAIL-CLOSED.
-    env = _env(single)
+    # D11 / R2 §8.3: a window that outgrows MAX_ANALYSIS_BUCKETS closes
+    #        FAIL-CLOSED on the row's LAST SUCCESSFUL snapshot, then the
+    #        durable rearm gate stops automatic discovery -- as a NORMAL
+    #        phase, with no failure counter and no error code, and across a
+    #        restart. Bucket 60 is really persisted; bucket 61 is not
+    #        classified and not fabricated.
+    env = _env(_continuing_outage())
     try:
         _activate(env)
-        deep_start = BASE + 600.0 - 70 * BUCKET
+        # The row is opened through the STORE boundary with its analysis
+        # window frozen at the activation floor: that is the only honest way
+        # to grow a window bucket by bucket, since any fixed fixture bundle
+        # cleans its own tail long before bucket 60.
         identity = env["history"].incident_open_window(
-            ic.CATEGORY_REALITY_TCP, deep_start, deep_start + 180.0,
-            deep_start + 200.0, deep_start + 210.0, 4, 0, 0)
-        evaluated_before = _state(env["history"])[
-            "last_evaluated_end_epoch"]
-        failures_before = env["scanner"].status()["runtime_failures"]
+            ic.CATEGORY_REALITY_TCP, BASE, BASE + 180.0, BASE + 240.0,
+            BASE + 240.0, 4, 0, 0)
+        opened_row = [row for row in _rows(env["history"])
+                      if row["incident_id"] == identity][0]
         env["scanner"].run_once()
-        row = [r for r in _rows(env["history"]) if r["incident_id"] == identity][0]
+        # Settle the frozen window bucket by bucket up to the budget limit.
+        env["clock"][0] = BASE + 60 * BUCKET + 15.0
+        env["scanner"].run_once()
+        at_limit = _rows(env["history"])[0]
+        evaluated_at_limit = _state(env["history"])[
+            "last_evaluated_end_epoch"]
+        out["bucket_60_is_really_persisted"] = (
+            at_limit["buckets"] == 60
+            and at_limit["analysis_start_epoch"] == opened_row[
+                "analysis_start_epoch"]
+            and at_limit["last_classified_end_epoch"] == BASE + 60 * BUCKET
+            and at_limit["state"] == "open")
+        failures_before = env["scanner"].status()["runtime_failures"]
+        reads_before = len(env["canned"]._seen)
+        env["clock"][0] = BASE + 61 * BUCKET + 15.0
+        env["scanner"].run_once()
+        row = _rows(env["history"])[0]
+        state = _state(env["history"])
         out["window_limit_closes_fail_closed"] = (
             row["state"] == "closed"
             and row["closure_reason"] == "window_limit")
-        out["window_limit_keeps_the_rows_own_signal"] = (
-            row["last_signal_epoch"] == deep_start + 200.0
-            and row["buckets"] == 4)
+        out["window_limit_keeps_the_last_successful_snapshot"] = (
+            row["buckets"] == at_limit["buckets"] == 60
+            and row["last_classified_end_epoch"]
+            == at_limit["last_classified_end_epoch"]
+            and (row["evidence_bits"], row["unknown_bits"])
+            == (at_limit["evidence_bits"], at_limit["unknown_bits"])
+            and row["category"] == at_limit["category"])
         out["window_limit_did_not_classify_the_overlong_window"] = (
-            _state(env["history"])["last_evaluated_end_epoch"]
-            == evaluated_before)
+            len(env["canned"]._seen) == reads_before
+            and _state(env["history"])["last_evaluated_end_epoch"]
+            == evaluated_at_limit)
         out["window_limit_is_a_lifecycle_end_not_a_failure"] = (
-            env["scanner"].status()["runtime_failures"] == failures_before)
+            env["scanner"].status()["runtime_failures"] == failures_before
+            and env["scanner"].status()["last_error_code"] is None)
+        out["window_limit_raises_the_persistent_rearm_gate"] = (
+            state["open_incident_id"] is None
+            and state["discovery_floor_epoch"] is None
+            and state["rearm_required"] == 1)
+        out["rearm_is_a_normal_phase_not_an_error"] = (
+            env["scanner"].status()["phase"] == "rearm"
+            and env["scanner"].status()["open_incident"] is False
+            and env["scanner"].status()["runtime_failures"] == failures_before
+            and env["scanner"].status()["last_error_code"] is None)
+        # A continuing outage must not produce incident #2, and the rearm
+        # cycle must not "re-warmup the last 5 buckets" behind its back.
+        reads_before = len(env["canned"]._seen)
+        for step in range(10):
+            env["clock"][0] = (opened_row["analysis_start_epoch"]
+                               + (62 + step) * BUCKET + 15.0)
+            env["scanner"].run_once()
+        out["rearm_stops_discovery_over_many_cycles"] = (
+            len(_rows(env["history"])) == 1
+            and len(env["canned"]._seen) == reads_before
+            and env["scanner"].status()["phase"] == "rearm"
+            and env["scanner"].status()["runtime_failures"] == failures_before)
+        # The gate is durable state: a NEW scanner object on the SAME store
+        # reports rearm and still opens nothing.
+        env["scanner"].stop(join_timeout=0.5)
+        restarted = _scanner(env["canned"], env["clock"])
+        restarted.start()
+        restarted.run_once()
+        out["rearm_survives_restart_and_still_opens_nothing"] = (
+            restarted.status()["phase"] == "rearm"
+            and restarted.status()["runtime_failures"] == 0
+            and len(_rows(env["history"])) == 1
+            and _state(env["history"])["rearm_required"] == 1)
+        restarted.stop(join_timeout=0.5)
+    finally:
+        _close_env(env)
+
+    # D12: a clock jump from bucket 20 to bucket 65 must NOT fabricate
+    #      bucket 60. The honest terminal write is the last classification
+    #      that actually happened (bucket 20), even though the row then
+    #      closes on the window limit.
+    env = _env(_continuing_outage())
+    try:
+        _activate(env)
+        identity = env["history"].incident_open_window(
+            ic.CATEGORY_REALITY_TCP, BASE, BASE + 180.0, BASE + 240.0,
+            BASE + 240.0, 4, 0, 0)
+        env["scanner"].run_once()
+        analysis_start = [row for row in _rows(env["history"])
+                          if row["incident_id"] == identity][0][
+            "analysis_start_epoch"]
+        env["clock"][0] = analysis_start + 20 * BUCKET + 15.0
+        env["scanner"].run_once()
+        at_twenty = _rows(env["history"])[0]
+        out["jump_premise_bucket_20_persisted"] = (
+            at_twenty["buckets"] == 20
+            and at_twenty["last_classified_end_epoch"]
+            == analysis_start + 20 * BUCKET)
+        env["clock"][0] = analysis_start + 65 * BUCKET + 15.0
+        env["scanner"].run_once()
+        row = _rows(env["history"])[0]
+        out["jump_20_to_65_never_fabricates_bucket_60"] = (
+            row["closure_reason"] == "window_limit"
+            and row["buckets"] == 20
+            and row["last_classified_end_epoch"] == analysis_start + 20 * BUCKET
+            and row["buckets"] != 60 and row["buckets"] != 65)
+    finally:
+        _close_env(env)
+
+    # D13 (R2 §8.2): the TERMINAL write settles the cycle that closed the
+    #      incident, not the bits the row happened to carry before it. Here
+    #      the two differ on purpose, so a close that read the old row back
+    #      would be caught rather than looked past.
+    env = _env(SCEN["reality_plus_generic_probe"])
+    try:
+        _activate(env)
+        env["scanner"].run_once()
+        opened = _rows(env["history"])[0]
+        bits_before = (opened["evidence_bits"], opened["unknown_bits"])
+        out["terminal_premise_verdicts_differ"] = bool(
+            bits_before != _bits(ic.detect(single).classification))
+        env["canned"]._bundle = single
+        env["clock"][0] = opened["analysis_start_epoch"] + 13 * BUCKET + 15.0
+        env["scanner"].run_once()
+        closed = _rows(env["history"])[0]
+        verdict = ic.detect(single).classification
+        out["terminal_clean_close_settles_the_current_cycle"] = (
+            closed["state"] == "closed"
+            and closed["closure_reason"] == "clean_buckets"
+            and closed["category"] == verdict.category
+            and (closed["evidence_bits"], closed["unknown_bits"])
+            == _bits(verdict)
+            and closed["last_classified_end_epoch"]
+            == opened["analysis_start_epoch"] + 13 * BUCKET
+            and closed["buckets"] == 13)
+        out["terminal_clean_close_did_not_reuse_the_old_bits"] = (
+            (closed["evidence_bits"], closed["unknown_bits"]) != bits_before)
     finally:
         _close_env(env)
     return out
@@ -1254,7 +1606,7 @@ def group_containment():
             "runtime_failures", "last_error_code",
             "last_evaluated_end_epoch", "open_incident")
         and len(sv.INCIDENT_RUNTIME_STATUS_KEYS) == 8)
-    out["phase_vocabulary_is_the_frozen_four"] = (
+    out["phase_vocabulary_is_the_frozen_five"] = (
         sv.INCIDENT_RUNTIME_PHASE_KEYS == frozenset(FROZEN_PHASES))
     out["error_tokens_are_the_frozen_four"] = (
         sv.INCIDENT_RUNTIME_ERROR_TOKENS == frozenset(FROZEN_ERRORS))
