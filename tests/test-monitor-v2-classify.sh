@@ -140,6 +140,12 @@ HARNESS="$HERE/monitor-classify/classify_groups.py"
 FIX_REAL="$CLASSIFY_FIXTURE_DIR/incident-reality-outage.json"
 FIX_NORMAL="$CLASSIFY_FIXTURE_DIR/incident-normal-background.json"
 WORKFLOW="$ROOT/.github/workflows/tests.yml"
+# Every shipped module the classifier may be wired through, checked by name
+# before it is grepped: a missing file would turn a "no reference found"
+# into a vacuous pass.
+for surface in "$SERVER_PY" "$WEBAPP" "$HIST_PY" "$COLLECTOR"; do
+    [ -f "$surface" ] || fail "surface file missing: $surface"
+done
 
 section "S0: static + darkness gates"
 

@@ -4218,13 +4218,17 @@ assert_grep 'class IncidentScanner' "$REPO_ROOT/monitor-v2/web/incident_runtime.
     "the single allowed consumer is the IncidentScanner"
 assert_grep 'from web import incident_classifier' "$REPO_ROOT/monitor-v2/web/incident_runtime.py" \
     "the single consumer imports the module under its shipped name"
-if grep -q 'incident_classif' "$REPO_ROOT/monitor-v2/web/server.py" \
-    "$REPO_ROOT/monitor-v2/web/webapp.py" \
-    "$REPO_ROOT/monitor-v2/web/incident_history.py" \
-    "$REPO_ROOT/monitor-v2/collector.py" 2>/dev/null; then
-    fail "a server, webapp, history or collector surface names the classifier"
-else
+if [ -f "$REPO_ROOT/monitor-v2/web/server.py" ] \
+   && [ -f "$REPO_ROOT/monitor-v2/webapp.py" ] \
+   && [ -f "$REPO_ROOT/monitor-v2/web/incident_history.py" ] \
+   && [ -f "$REPO_ROOT/monitor-v2/collector.py" ] \
+   && ! grep -q 'incident_classif' "$REPO_ROOT/monitor-v2/web/server.py" \
+        "$REPO_ROOT/monitor-v2/webapp.py" \
+        "$REPO_ROOT/monitor-v2/web/incident_history.py" \
+        "$REPO_ROOT/monitor-v2/collector.py"; then
     pass "no route, status surface, store or collector path references it"
+else
+    fail "a server, webapp, history or collector surface names the classifier (or one of them is missing)"
 fi
 if grep -rq 'incident_classif' "$DEPLOY_DIR" 2>/dev/null; then
     fail "a deploy surface references the classifier"
