@@ -386,10 +386,13 @@ FD / conntrack / listen-queue；客户端 ISP 身份；目的地身份；从稀�
     `runtime_failures` 递增、闭合 `last_error_code`、下一周期恢复。
 18. classify 车道检查全部保持绿色，除上述**被加强替换**的静态门
    （darkness→单消费者、0.4.0→0.5.0、8 表→10 表）外无任何放宽。
-   实测硬计数：classify 665 → 670（+5，全部是本 PR 的 `detect()` 恒等/
-   纯性/闭合不变量），hist 241 → 242（+1，未接扫描器时
-   `incident_runtime` 必须为 null），packaging 269 → 274（+5，T33
-   单消费者静态门）。三条都是逐节记录过的加强，不是放宽。
+   实测硬计数，基线一律取 `origin/main` = `a180e7d`（在临时 worktree 里
+   实跑测得；packaging 无 `EXPECTED_PASS`，取其 `== RESULT` 行）：
+   classify 665 → 670（+5，本 PR 的 `detect()` 恒等/纯性/闭合不变量），
+   hist 240 → 242（+2：schema-v4 平面 +1，未接扫描器时 `incident_runtime`
+   必须为 null 的 timeline 表面门 +1），packaging 269 → 274（+5，T33
+   单消费者静态门）。三条都是逐节记录过的加强，不是放宽，也没有删除
+   任何检查。
 19. timeline 端点 `incident_runtime` 键集恰 8 键、域闭合；无 P5 路由、
     无新查询参数、journal 表面不变宽。
 
