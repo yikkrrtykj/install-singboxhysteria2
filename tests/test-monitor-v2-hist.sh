@@ -54,7 +54,12 @@ FAIL=0
 # v1->v4 flip, "5" as the newer-version refusal, v3 claim + stranger refusal
 # now carrying the incident tables as the extra-stranger case). No check was
 # deleted; the schema_version pins are restated values, not relaxations.
-EXPECTED_PASS=241
+# PR-4B (the timeline surface, §12): 241 -> 242 = +1 ("incident surface
+# closed when unwired": no scanner wired means incident_runtime == null).
+# The HTTP whitelist gate itself moved IN PLACE -- the same one check now
+# names the eighth top-level key the scanner contributes, so an unreviewed
+# extra key fails here just as a missing one would. No check was deleted.
+EXPECTED_PASS=242
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
@@ -1161,14 +1166,25 @@ def group_http():
                               cookie=session)
     data = json.loads(body)
     out["timeline_200"] = status == 200
+    # PR-4B: the same bounded request now carries ONE more key, the closed
+    # incident-scanner projection (docs/...-p4b.md §12). The key set is
+    # restated with it -- an IN PLACE strengthening of the existing whitelist
+    # gate, not a new check: an extra key that nobody reviewed would fail
+    # here exactly as a missing one does.
     out["top_level_keys"] = set(data) == {"history", "samples",
                                           "device_states", "probe_rows",
-                                          "probes", "truncated", "limit"}
+                                          "probes", "incident_runtime",
+                                          "truncated", "limit"}
     # PR-3B: this harness wires NO scheduler, so the two probe surfaces are
     # the documented empty answers -- an absent projection is None, never a
     # fabricated status object, and no probe row exists to show.
     out["probe_surface_closed_when_unwired"] = (
         data.get("probe_rows") == [] and data.get("probes") is None)
+    # PR-4B (+1): the same deny-by-default answer for the incident plane --
+    # this harness wires NO scanner, so incident_runtime is JSON null and
+    # never a fabricated all-quiet status object.
+    out["incident_surface_closed_when_unwired"] = (
+        data.get("incident_runtime") is None)
     out["history_health"] = set(data["history"]) == {"enabled", "degraded",
                                                      "last_success_at",
                                                      "failure_count",
@@ -2657,6 +2673,8 @@ check 'd["timeline_200"]' "authenticated GET answers 200"
 check 'd["top_level_keys"]' "response shape is the exact whitelist"
 check 'd["probe_surface_closed_when_unwired"]' \
     "no scheduler wired: probe_rows is [] and probes is null"
+check 'd["incident_surface_closed_when_unwired"]' \
+    "PR-4B: no scanner wired: incident_runtime is null, never a fabricated status"
 check 'd["history_health"]' "health keys: enabled/degraded/last_success/failure/code/run_id"
 check 'd["run_id_exposed"]' "current process run_id surfaced (non-secret)"
 check 'd["rows_present"]' "persisted rows are readable back"
