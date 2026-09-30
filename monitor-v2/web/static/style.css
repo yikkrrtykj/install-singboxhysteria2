@@ -245,6 +245,16 @@ input[type="text"], input[type="password"] {
 #inc-marker-kind { cursor: pointer; }
 #inc-detail-title { font-size: 1rem; margin: 0; }
 #inc-tbody tr { cursor: pointer; }
+.inc-token-list { list-style: none; margin: 0 0 10px; padding: 0; }
+.inc-token-list li {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 5px 10px; border: 1px solid var(--border); border-radius: 8px;
+  margin-bottom: 5px; font-size: 0.8rem;
+}
+.inc-token {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  word-break: break-all;
+}
 
 /* ---- responsive ---- */
 @media (max-width: 860px) {

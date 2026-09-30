@@ -42,8 +42,16 @@ from web.access import host_entry_for_ip
 from web.e3_broker import BrokerUnavailable
 from web.e3rpc import RpcTransportError
 from web import incident_presenter as incident_presenter
+from web import incident_history as ih_outcomes
 from web.incident_history import (MARKER_KINDS, QUERY_LIMIT_DEFAULT,
                                   QUERY_LIMIT_MAX, RETENTION_SECONDS)
+
+ih_outcome_ok = ih_outcomes.OUTCOME_OK
+ih_outcome_missing = ih_outcomes.OUTCOME_MISSING
+ih_outcome_store_unavailable = ih_outcomes.OUTCOME_STORE_UNAVAILABLE
+ih_outcome_rejected = ih_outcomes.OUTCOME_REJECTED
+ih_outcome_rearmed = ih_outcomes.OUTCOME_REARMED
+ih_outcome_recorded = ih_outcomes.OUTCOME_RECORDED
 from web.recovery import (RECOVERY_SUCCESS_MESSAGE, RecoveryGlobalGuard,
                           RecoveryRateLimiter, generate_key)
 
@@ -1123,7 +1131,11 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         if error is not None:
             self._send_json(400, {"error": error})
             return
-        result = history.query_incidents(state=state, limit=limit)
+        outcome, result = history.query_incidents(state=state, limit=limit)
+        if outcome != ih_outcome_ok:
+            # a storage failure is never presented as a healthy empty list
+            self._send_json(503, {"error": "incident history unavailable"})
+            return
         rows = []
         for row in result["incidents"]:
             item = {key: row[key] for key in INCIDENT_LIST_ROW_KEYS}
@@ -1153,9 +1165,13 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         if history is None:
             self._send_json(503, {"error": "incident history not enabled"})
             return
-        detail = history.incident_detail(int(raw_id))
-        if detail is None:
+        outcome, detail = history.incident_detail(int(raw_id))
+        if outcome == ih_outcome_missing:
             self._send_json(404, {"error": "incident_not_found"})
+            return
+        if outcome != ih_outcome_ok:
+            # a storage failure is never presented as a missing row
+            self._send_json(503, {"error": "incident history unavailable"})
             return
         evidence_tokens = incident_presenter.bits_to_evidence(
             detail["evidence_bits"])
@@ -1212,24 +1228,36 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             return
         subject_id = int(raw_id)
         if subject_type == "incident":
-            detail = history.incident_detail(subject_id)
-            if detail is None:
+            d_outcome, detail = history.incident_detail(subject_id)
+            if d_outcome == ih_outcome_missing:
                 self._send_json(404, {"error": "incident_not_found"})
+                return
+            if d_outcome != ih_outcome_ok:
+                self._send_json(503,
+                                {"error": "incident history unavailable"})
                 return
             start = detail["analysis_start_epoch"]
             end = detail["last_classified_end_epoch"]
         else:
-            marker = history.marker_get(subject_id)
-            if marker is None:
+            m_outcome, marker = history.marker_get(subject_id)
+            if m_outcome == ih_outcome_missing:
                 self._send_json(404, {"error": "marker_not_found"})
+                return
+            if m_outcome != ih_outcome_ok:
+                self._send_json(503,
+                                {"error": "incident history unavailable"})
                 return
             start = max(0.0, marker["epoch"] - MARKER_CONTEXT_SPAN_SECONDS)
             end = marker["epoch"] + MARKER_CONTEXT_SPAN_SECONDS
-        result = history.evidence_section(section, start, end)
-        if result is None:
-            # the window was validated above, so None is a storage-side
-            # refusal: a closed 503, never a fabricated empty section
+        e_outcome, result = history.evidence_section(section, start, end)
+        if e_outcome == ih_outcome_store_unavailable:
+            # a storage failure is never presented as an empty section
             self._send_json(503, {"error": "evidence unavailable"})
+            return
+        if e_outcome != ih_outcome_ok:
+            # the window is server-derived and validated above; a shape
+            # refusal reaching this point is a closed 400 regardless
+            self._send_json(400, {"error": "invalid_window"})
             return
         self._send_json(200, {
             "subject": {"type": subject_type, "id": subject_id},
@@ -1254,7 +1282,11 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         if error is not None:
             self._send_json(400, {"error": error})
             return
-        result = history.query_markers(limit)
+        m_outcome, result = history.query_markers(limit)
+        if m_outcome != ih_outcome_ok:
+            # a storage failure is never presented as an empty marker list
+            self._send_json(503, {"error": "incident history unavailable"})
+            return
         markers = [dict(marker, label=incident_presenter.marker_label(
             marker["kind"])) for marker in result["markers"]]
         self._send_json(200, {
@@ -1300,9 +1332,11 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             if epoch > now or epoch < now - RETENTION_SECONDS:
                 self._send_json(400, {"error": "invalid_marker_epoch"})
                 return
-        row = history.record_marker(kind, epoch)
-        if row is None:
-            self._send_json(503, {"error": "incident history not enabled"})
+        m_outcome, row = history.record_marker(kind, epoch)
+        if m_outcome != ih_outcome_recorded:
+            # a persistence failure/refusal is a closed 503, never a
+            # fabricated success and never exception text
+            self._send_json(503, {"error": "marker persistence failed"})
             return
         row["label"] = incident_presenter.marker_label(row["kind"])
         self._send_json(200, row)
@@ -1327,7 +1361,12 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
                 or runtime.get("phase") != "rearm":
             self._send_json(409, {"error": "incident_runtime_not_rearmable"})
             return
-        if not history.incident_rearm():
+        r_outcome = history.incident_rearm()
+        if r_outcome == ih_outcome_store_unavailable:
+            # a persistence failure is a closed 503, never a fake 409
+            self._send_json(503, {"error": "incident history unavailable"})
+            return
+        if r_outcome != ih_outcome_rearmed:
             self._send_json(409, {"error": "incident_runtime_not_rearmable"})
             return
         self._send_json(200, {"status": "ok"})

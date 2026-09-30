@@ -28,6 +28,16 @@
 #      action, uncertainty visible), and the quiet background store stays
 #      an empty list.
 #
+# Review round (#63 R2 implementation corrections): 139 -> 155 = +16.
+# presenter 25 -> 29 (+4, the narrowed-wording gates: probe-endpoint-only,
+# neutral destination-class, QUIC-class without Hysteria2, the actual
+# client/ISP limitation); NEW outcomes group 12 (fault-injection envelopes:
+# healthy 200/404/409 controls plus dead-disk reads that must land as
+# closed 503 -- never 404, never a healthy-looking empty list -- and
+# dead-disk marker/rearm persistence that must land as 503, never a fake
+# 200/409). api/store/live_incident/rearm_stack/fixtures verdicts moved
+# only by the envelope restatements (outcomes are now explicit tuple
+# returns asserted by token).
 # No mutation testing in this round (#63 R2 §15): these gates are
 # preventive, and the lane measures its own count each run.
 set -uo pipefail
@@ -83,7 +93,7 @@ FAIL=0
 #        root-cause limitation visible, no ISP claim, first screen without
 #        raw tokens as primary, list parity; background stays no-incident
 #        and an empty list).
-EXPECTED_PASS=139
+EXPECTED_PASS=155
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT

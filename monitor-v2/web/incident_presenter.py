@@ -143,7 +143,8 @@ EVIDENCE_EXPLANATIONS = {
     "journal_burst_other_generic":
         "Generic (non-protocol) sing-box error records spiked above baseline.",
     "journal_burst_destination":
-        "sing-box error records on plain web destinations spiked above baseline.",
+        "Destination-classed sing-box error records spiked above their "
+        "baseline.",
     "journal_burst_unattributed":
         "sing-box error records spiked, but their closed classes cannot be "
         "attributed to one protocol family.",
@@ -159,8 +160,9 @@ EVIDENCE_EXPLANATIONS = {
         "A probe could not adjudicate its own answer, so that plane proves "
         "nothing about the network.",
     "probe_generic_tcp_healthy":
-        "A generic TCP/HTTPS probe succeeded, proving the server could reach "
-        "the internet.",
+        "A generic TCP/HTTPS probe succeeded against its configured endpoint "
+        "in these buckets; one successful probe does not prove general "
+        "Internet reachability.",
     "egress_ip_changed":
         "The server's public egress IP changed.",
     "api_stale":
@@ -186,7 +188,7 @@ EVIDENCE_EXPLANATIONS = {
     "journal_cls_tls_handshake":
         "sing-box TLS-handshake error records were present.",
     "journal_cls_quic_error":
-        "sing-box QUIC/Hysteria2-class error records were present.",
+        "sing-box QUIC-class error records were present.",
     "journal_cls_eof_cancel":
         "sing-box EOF/cancellation error records were present.",
     "journal_cls_other":
@@ -421,15 +423,20 @@ _SUMMARY_TABLE = {
     },
 }
 
-# Shared, frozen: what this presentation can NEVER claim. No restart /
-# resource history is persisted (the P4A/P4B evidence plane holds no
-# PID/NRestarts/FD/conntrack series), and no client/ISP identity may be
-# inferred from server-side state (#33 client/ISP boundary).
+# Shared, frozen: what this presentation can NEVER claim. The store holds
+# only SPARSE device state (change/heartbeat rows), so it cannot
+# authoritatively determine which logical clients were affected, and it
+# holds no ISP ownership/path mapping; no process-restart or
+# resource-exhaustion history is persisted either (the P4A/P4B evidence
+# plane carries no PID/NRestarts/FD/conntrack series), and no specific
+# destination can be named.
 _LIMITATIONS = ("Correlation is not causation: the root cause is not "
-                "established. Server-side evidence cannot name an ISP, a "
-                "client identity or a specific destination, and no "
-                "process-restart or resource-exhaustion history is recorded "
-                "that could support such a claim.")
+                "established. Server-side sparse device state cannot "
+                "authoritatively determine which logical clients were "
+                "affected, and it cannot infer ISP ownership or path "
+                "identity; nor does it name a specific destination. No "
+                "process-restart or resource-exhaustion history is "
+                "recorded that could support such a claim.")
 
 SUMMARY_KEYS = ("headline", "window", "impact", "protocol_state",
                 "server_state", "affected_scope", "assessment",

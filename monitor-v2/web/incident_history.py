@@ -368,6 +368,20 @@ MARKER_COLUMNS = ("marker_id", "epoch", "kind", "created_epoch")
 # constant are the same reviewed 60).
 INCIDENT_BUCKET_SECONDS = 60
 
+# Internal outcome tokens for the P5 operator surface (review round, #63
+# R2 §6): "the row is not there", "the store could not answer" and "the
+# write landed" are EXPLICIT outcomes, never inferred from a pre-existing
+# global degraded flag and never collapsed into one None/False. The web
+# layer maps them to 404 / 503 / 200 / 409; every token stays inside this
+# module and never reaches a response body.
+OUTCOME_OK = "ok"
+OUTCOME_MISSING = "missing"
+OUTCOME_STORE_UNAVAILABLE = "store_unavailable"
+OUTCOME_REARMED = "rearmed"
+OUTCOME_NOT_REARMABLE = "not_rearmable"
+OUTCOME_RECORDED = "recorded"
+OUTCOME_REJECTED = "rejected"
+
 
 def _encode_incident_bits(tokens, maximum):
     """Boundary gate for a bitset about to be persisted: EXACTLY a plain
@@ -1147,40 +1161,46 @@ class IncidentHistory:
         the future, or is older than the retention horizon -- a marker
         that would instantly be retention-pruned is not accepted as
         history. There is no edit and no delete: a wrong marker is
-        corrected by appending another one. Returns the stored 4-key row
-        (label is presentation), or None on any refusal (never raises)."""
+        corrected by appending another one. Returns
+        ``(OUTCOME_RECORDED, row)`` with the stored 4-key row, or an
+        explicit failure outcome: ``(OUTCOME_REJECTED, None)`` when the
+        boundary refuses the candidate, ``(OUTCOME_STORE_UNAVAILABLE,
+        None)`` when the store is disabled or the write could not land
+        -- a persistence failure is never disguised as a rejection and
+        never raises."""
         try:
             with self._lock:
                 if not self._enabled or self._conn is None:
-                    return None
+                    return OUTCOME_STORE_UNAVAILABLE, None
                 return self._record_marker_locked(kind, epoch, self._clock())
         except _HistoryError:
             self._record_incident_failure(
                 CODE_HISTORY_INCIDENT_PERSIST_FAILED)
-            return None
+            return OUTCOME_STORE_UNAVAILABLE, None
         except (sqlite3.Error, OSError):
             self._rollback_quiet()
             self._record_incident_failure(
                 CODE_HISTORY_INCIDENT_PERSIST_FAILED)
-            return None
+            return OUTCOME_STORE_UNAVAILABLE, None
         except Exception:  # noqa: BLE001 -- incident plane containment
             self._rollback_quiet()
             self._record_incident_failure(
                 CODE_HISTORY_INCIDENT_PERSIST_FAILED)
-            return None
-
+            return OUTCOME_STORE_UNAVAILABLE, None
     def query_markers(self, limit):
         """Bounded, sanitized marker read, newest epoch first.
 
-        Returns ``{"markers": [...], "truncated": bool, "limit": limit}``
-        over the exact MARKER_COLUMNS, or empty rows when the history is
-        unreadable (reads never raise)."""
+        Returns ``(OUTCOME_OK, {"markers", "truncated", "limit"})`` over
+        the exact MARKER_COLUMNS, or
+        ``(OUTCOME_STORE_UNAVAILABLE, empty)`` -- a read failure is
+        distinguishable from a healthy empty marker list (never
+        raises)."""
         limit = max(1, min(_as_int(limit, 1), QUERY_LIMIT_MAX))
+        empty = {"markers": [], "truncated": False, "limit": limit}
         try:
             with self._lock:
                 if not self._enabled or self._conn is None:
-                    return {"markers": [], "truncated": False,
-                            "limit": limit}
+                    return OUTCOME_STORE_UNAVAILABLE, empty
                 rows = self._conn.execute(
                     "SELECT %s FROM operator_markers"
                     " ORDER BY epoch DESC, marker_id DESC LIMIT ?"
@@ -1188,88 +1208,91 @@ class IncidentHistory:
         except (sqlite3.Error, OSError):
             self._record_incident_failure(
                 CODE_HISTORY_INCIDENT_PERSIST_FAILED)
-            return {"markers": [], "truncated": False, "limit": limit}
-        return {"markers": [_project_rows(row, MARKER_COLUMNS)
-                            for row in rows[:limit]],
-                "truncated": len(rows) > limit, "limit": limit}
-
+            return OUTCOME_STORE_UNAVAILABLE, empty
+        return (OUTCOME_OK,
+                {"markers": [_project_rows(row, MARKER_COLUMNS)
+                             for row in rows[:limit]],
+                 "truncated": len(rows) > limit, "limit": limit})
     def marker_get(self, marker_id):
-        """ONE marker row over the closed columns, or None when the id
-        does not exist (never raises)."""
+        """ONE marker row over the closed columns. Returns
+        ``(OUTCOME_OK, row)``, ``(OUTCOME_MISSING, None)`` when the id
+        does not exist, or ``(OUTCOME_STORE_UNAVAILABLE, None)`` on a
+        storage failure -- never a bare None for two different meanings
+        (never raises)."""
         try:
             with self._lock:
                 if not self._enabled or self._conn is None:
-                    return None
-                if type(marker_id) is not int \
-                        or isinstance(marker_id, bool) or marker_id < 1:
-                    return None
+                    return OUTCOME_STORE_UNAVAILABLE, None
+                if type(marker_id) is not int or isinstance(marker_id, bool) or marker_id < 1:
+                    return OUTCOME_MISSING, None
                 row = self._conn.execute(
                     "SELECT %s FROM operator_markers WHERE marker_id = ?"
                     % ", ".join(MARKER_COLUMNS), (marker_id,)).fetchone()
-                return None if row is None \
-                    else _project_rows(row, MARKER_COLUMNS)
+                if row is None:
+                    return OUTCOME_MISSING, None
+                return OUTCOME_OK, _project_rows(row, MARKER_COLUMNS)
         except (sqlite3.Error, OSError):
             self._record_incident_failure(
                 CODE_HISTORY_INCIDENT_PERSIST_FAILED)
-            return None
-
+            return OUTCOME_STORE_UNAVAILABLE, None
     def query_incidents(self, state=None, limit=QUERY_LIMIT_DEFAULT):
         """Bounded incident read, newest incident first (#63 R2 §4).
 
         ``state`` is None (both) or exactly 'open'/'closed'. Returns
-        ``{"incidents": [...], "truncated": bool, "limit": limit}`` over
-        the closed INCIDENT_WINDOW_COLUMNS; the wire projection (12 keys,
-        marker_count) is the server layer's business."""
+        ``(OUTCOME_OK, {"incidents", "truncated", "limit"})`` or
+        ``(OUTCOME_STORE_UNAVAILABLE, empty)`` -- a read failure is
+        distinguishable from a healthy empty history (never raises)."""
         limit = max(1, min(_as_int(limit, QUERY_LIMIT_DEFAULT),
                            QUERY_LIMIT_MAX))
+        empty = {"incidents": [], "truncated": False, "limit": limit}
         try:
             with self._lock:
                 if not self._enabled or self._conn is None:
-                    return {"incidents": [], "truncated": False,
-                            "limit": limit}
+                    return OUTCOME_STORE_UNAVAILABLE, empty
                 if state is None:
                     rows = self._conn.execute(
                         "SELECT %s FROM incident_windows"
                         " ORDER BY incident_id DESC LIMIT ?"
                         % ", ".join(self.INCIDENT_WINDOW_COLUMNS),
                         (limit + 1,)).fetchall()
-                else:
-                    if state not in ("open", "closed"):
-                        return {"incidents": [], "truncated": False,
-                                "limit": limit}
+                elif state in ("open", "closed"):
                     rows = self._conn.execute(
                         "SELECT %s FROM incident_windows WHERE state = ?"
                         " ORDER BY incident_id DESC LIMIT ?"
                         % ", ".join(self.INCIDENT_WINDOW_COLUMNS),
                         (state, limit + 1)).fetchall()
+                else:
+                    return OUTCOME_OK, empty
         except (sqlite3.Error, OSError):
             self._record_incident_failure(
                 CODE_HISTORY_INCIDENT_PERSIST_FAILED)
-            return {"incidents": [], "truncated": False, "limit": limit}
-        return {"incidents": [_project_rows(row,
-                                            self.INCIDENT_WINDOW_COLUMNS)
-                              for row in rows[:limit]],
-                "truncated": len(rows) > limit, "limit": limit}
-
+            return OUTCOME_STORE_UNAVAILABLE, empty
+        return (OUTCOME_OK,
+                {"incidents": [_project_rows(row,
+                                             self.INCIDENT_WINDOW_COLUMNS)
+                               for row in rows[:limit]],
+                 "truncated": len(rows) > limit, "limit": limit})
     def incident_detail(self, incident_id):
         """ONE incident row over the closed columns plus the markers whose
         epoch falls inside its analysis window
         (analysis_start <= epoch <= last_classified_end, the #63 R2 §4
-        read join). Returns None when the id does not exist (never
-        raises)."""
+        read join). Returns ``(OUTCOME_OK, row)``,
+        ``(OUTCOME_MISSING, None)`` when the id does not exist, or
+        ``(OUTCOME_STORE_UNAVAILABLE, None)`` when the store could not
+        answer -- a read failure is never presented as a missing row
+        (never raises)."""
         try:
             with self._lock:
                 if not self._enabled or self._conn is None:
-                    return None
-                if type(incident_id) is not int \
-                        or isinstance(incident_id, bool) or incident_id < 1:
-                    return None
+                    return OUTCOME_STORE_UNAVAILABLE, None
+                if type(incident_id) is not int or isinstance(incident_id, bool) or incident_id < 1:
+                    return OUTCOME_MISSING, None
                 row = self._conn.execute(
                     "SELECT %s FROM incident_windows WHERE incident_id = ?"
                     % ", ".join(self.INCIDENT_WINDOW_COLUMNS),
                     (incident_id,)).fetchone()
                 if row is None:
-                    return None
+                    return OUTCOME_MISSING, None
                 detail = _project_rows(row, self.INCIDENT_WINDOW_COLUMNS)
                 markers = self._conn.execute(
                     "SELECT %s FROM operator_markers"
@@ -1280,12 +1303,11 @@ class IncidentHistory:
                      detail["last_classified_end_epoch"])).fetchall()
                 detail["markers"] = [_project_rows(m, MARKER_COLUMNS)
                                      for m in markers]
-                return detail
+                return OUTCOME_OK, detail
         except (sqlite3.Error, OSError):
             self._record_incident_failure(
                 CODE_HISTORY_INCIDENT_PERSIST_FAILED)
-            return None
-
+            return OUTCOME_STORE_UNAVAILABLE, None
     def marker_count(self, analysis_start_epoch, last_classified_end_epoch):
         """The list-row marker_count: a read-time count over
         ``analysis_start <= epoch <= last_classified_end`` (#63 R2 §4).
@@ -1357,12 +1379,16 @@ class IncidentHistory:
         presentation may be cut, classification may not). The response
         carries ``retention_cutoff_epoch`` so the UI can say "some
         evidence may have aged out" WITHOUT a health field: current
-        health must never be mistaken for incident-time health. Never
-        raises; a refusal or storage failure answers None."""
+        health must never be mistaken for incident-time health. Returns
+        ``(OUTCOME_OK, result)``, ``(OUTCOME_REJECTED, None)`` when the
+        window/section shape is refused here, or
+        ``(OUTCOME_STORE_UNAVAILABLE, None)`` when the store could not
+        answer -- a read failure is never presented as an empty section
+        (never raises)."""
         try:
             with self._lock:
                 if not self._enabled or self._conn is None:
-                    return None
+                    return OUTCOME_STORE_UNAVAILABLE, None
                 spec = None
                 for name, table, column, columns in self.EVIDENCE_SECTIONS_MAP:
                     if name == section:
@@ -1370,12 +1396,12 @@ class IncidentHistory:
                         break
                 start_v = self._incident_epoch(start)
                 end_v = self._incident_epoch(end)
-                if spec is None or start_v is None or end_v is None \
-                        or end_v <= start_v:
+                if (spec is None or start_v is None or end_v is None
+                        or end_v <= start_v):
                     self._incident_rejected_total += 1
                     self._record_incident_failure(
                         CODE_HISTORY_INCIDENT_PERSIST_FAILED)
-                    return None
+                    return OUTCOME_REJECTED, None
                 table, column, columns = spec
                 rows = self._conn.execute(
                     "SELECT %s FROM %s WHERE %s >= ? AND %s < ?"
@@ -1383,24 +1409,23 @@ class IncidentHistory:
                     % (", ".join(columns), table, column, column, column),
                     (start_v, end_v,
                      CLASSIFIER_BUNDLE_ROW_BUDGET + 1)).fetchall()
-                return {
+                return (OUTCOME_OK, {
                     "rows": [_project_rows(row, columns)
                              for row in rows[:CLASSIFIER_BUNDLE_ROW_BUDGET]],
                     "truncated": len(rows) > CLASSIFIER_BUNDLE_ROW_BUDGET,
                     "retention_cutoff_epoch":
                         self._clock() - self._retention_seconds,
-                }
+                })
         except (sqlite3.Error, OSError):
             self._rollback_quiet()
             self._record_incident_failure(
                 CODE_HISTORY_INCIDENT_PERSIST_FAILED)
-            return None
+            return OUTCOME_STORE_UNAVAILABLE, None
         except Exception:  # noqa: BLE001 -- incident plane containment
             self._rollback_quiet()
             self._record_incident_failure(
                 CODE_HISTORY_INCIDENT_PERSIST_FAILED)
-            return None
-
+            return OUTCOME_STORE_UNAVAILABLE, None
     def incident_rearm(self):
         """The operator re-arm (#63 R2 §10): flip the durable window-limit
         gate back to discovery, on the SAME one-minute bucket grid the
@@ -1410,28 +1435,31 @@ class IncidentHistory:
         and touches nothing else (activation floor, evaluated end, reader
         continuity, incident rows, counters). The WHERE clause restates
         every precondition the web layer checked, so a stale web view can
-        never re-arm a gate that has already moved: an UPDATE that matches
-        no row is a refusal, never a no-op success. Returns True iff the
-        gate was re-armed (never raises)."""
+        never re-arm a gate that has already moved. Returns
+        ``OUTCOME_REARMED`` iff the gate was re-armed,
+        ``OUTCOME_NOT_REARMABLE`` when the preconditions did not hold,
+        ``OUTCOME_STORE_UNAVAILABLE`` when the store could not answer --
+        a persistence failure never masquerades as a precondition
+        refusal (never raises)."""
         try:
             with self._lock:
                 if not self._enabled or self._conn is None:
-                    return False
+                    return OUTCOME_STORE_UNAVAILABLE
                 return self._incident_rearm_locked(self._clock())
         except _HistoryError:
             self._record_incident_failure(
                 CODE_HISTORY_INCIDENT_PERSIST_FAILED)
-            return False
+            return OUTCOME_STORE_UNAVAILABLE
         except (sqlite3.Error, OSError):
             self._rollback_quiet()
             self._record_incident_failure(
                 CODE_HISTORY_INCIDENT_PERSIST_FAILED)
-            return False
+            return OUTCOME_STORE_UNAVAILABLE
         except Exception:  # noqa: BLE001 -- incident plane containment
             self._rollback_quiet()
             self._record_incident_failure(
                 CODE_HISTORY_INCIDENT_PERSIST_FAILED)
-            return False
+            return OUTCOME_STORE_UNAVAILABLE
 
     # -- incident plane internals ------------------------------------------------
 
@@ -1764,20 +1792,20 @@ class IncidentHistory:
             self._incident_rejected_total += 1
             self._record_incident_failure(
                 CODE_HISTORY_INCIDENT_PERSIST_FAILED)
-            return None
+            return OUTCOME_REJECTED, None
         if epoch is None:
             epoch = now
         marker_epoch = self._incident_epoch(epoch)
         current = self._incident_epoch(now)
-        if marker_epoch is None or current is None \
-                or marker_epoch > current \
-                or marker_epoch < current - self._retention_seconds:
+        if (marker_epoch is None or current is None
+                or marker_epoch > current
+                or marker_epoch < current - self._retention_seconds):
             # future-dated or already-older-than-retention: both are
             # shapes this surface never accepts (#63 R2 §3)
             self._incident_rejected_total += 1
             self._record_incident_failure(
                 CODE_HISTORY_INCIDENT_PERSIST_FAILED)
-            return None
+            return OUTCOME_REJECTED, None
         cursor = self._conn.execute(
             "INSERT INTO operator_markers (epoch, kind, created_epoch)"
             " VALUES (?, ?, ?)", (marker_epoch, kind, current))
@@ -1786,20 +1814,19 @@ class IncidentHistory:
         self._incident_persisted_total += 1
         self._incident_degraded = False
         self._incident_last_error_code = None
-        return {"marker_id": marker_id, "epoch": marker_epoch,
-                "kind": kind, "created_epoch": current}
-
+        return (OUTCOME_RECORDED,
+                {"marker_id": marker_id, "epoch": marker_epoch,
+                 "kind": kind, "created_epoch": current})
     def _incident_rearm_locked(self, now):
         current = self._incident_epoch(now)
         if current is None:
             self._incident_rejected_total += 1
             self._record_incident_failure(
                 CODE_HISTORY_INCIDENT_PERSIST_FAILED)
-            return False
+            return OUTCOME_NOT_REARMABLE
         # The SAME bucket grid as the P4B activation floor: the re-arm
         # floor is the next whole minute boundary at/after now.
-        floor = math.ceil(current / INCIDENT_BUCKET_SECONDS) \
-            * INCIDENT_BUCKET_SECONDS
+        floor = math.ceil(current / INCIDENT_BUCKET_SECONDS)             * INCIDENT_BUCKET_SECONDS
         self._incident_runtime_row_present_locked()
         cursor = self._conn.execute(
             "UPDATE incident_runtime_state SET rearm_required = 0,"
@@ -1812,13 +1839,12 @@ class IncidentHistory:
             self._incident_rejected_total += 1
             self._record_incident_failure(
                 CODE_HISTORY_INCIDENT_PERSIST_FAILED)
-            return False
+            return OUTCOME_NOT_REARMABLE
         self._conn.commit()
         self._incident_persisted_total += 1
         self._incident_degraded = False
         self._incident_last_error_code = None
-        return True
-
+        return OUTCOME_REARMED
     def _record_incident_failure(self, code):
         # Incident plane is INDEPENDENT: never touches _degraded /
         # _journal_* / _probe_*; only a later accepted incident write

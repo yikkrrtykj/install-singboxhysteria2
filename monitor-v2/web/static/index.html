@@ -107,6 +107,7 @@
       <div class="table-toolbar">
         <div class="chips">
           <span class="chip" id="inc-runtime" data-state="unknown">Scanner · —</span>
+          <span class="chip" id="inc-history" data-state="unknown">History · —</span>
         </div>
         <div class="row" style="margin-top:0">
           <button id="inc-refresh-btn" class="btn ghost" type="button">Refresh</button>
@@ -142,7 +143,23 @@
         <h3>Open questions (unknowns)</h3>
         <ul id="inc-unknowns-list" class="inc-reason-list"></ul>
 
-        <h3>Evidence drill-down</h3>
+        <h3>Technical tokens (raw, L4)</h3>
+        <p class="muted">Raw classifier tokens for copy into tooling. The plain-language explanations above remain the primary path.</p>
+        <h4>Evidence tokens</h4>
+        <ul id="inc-evidence-tokens" class="inc-token-list"></ul>
+        <h4>Unknown tokens</h4>
+        <ul id="inc-unknown-tokens" class="inc-token-list"></ul>
+      </div>
+
+      <div class="card hidden" id="inc-evidence-card">
+        <div class="table-toolbar">
+          <h2 id="inc-evidence-title">Evidence</h2>
+          <button id="inc-evidence-close" class="btn ghost" type="button">Close evidence</button>
+        </div>
+        <p id="inc-evidence-subject" class="muted"></p>
+        <h3>Compact timeline (L3)</h3>
+        <div id="inc-l3"></div>
+        <h3>Raw rows (L4)</h3>
         <div class="seg" id="inc-sections" role="group" aria-label="Evidence section">
           <button class="seg-item active" data-section="samples" type="button">Samples</button>
           <button class="seg-item" data-section="device_states" type="button">Device states</button>

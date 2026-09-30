@@ -293,6 +293,30 @@ def group_presenter():
     out["summary_carries_the_standing_limitations"] = (
         "root cause is not established" in summary["limitations"]
         and "ISP" in summary["limitations"])
+    # Review round: the narrowed presentation wordings are frozen gates --
+    # one probe endpoint is not the Internet, the destination classes are
+    # broader than plain web, a QUIC error is not a Hysteria2 attribution,
+    # and the client-side limit is about AUTHORITATIVE determination.
+    out["generic_probe_wording_is_limited_to_its_endpoint"] = (
+        "does not prove general Internet reachability"
+        in ip.EVIDENCE_EXPLANATIONS["probe_generic_tcp_healthy"]
+        and "proving" not in
+        ip.EVIDENCE_EXPLANATIONS["probe_generic_tcp_healthy"])
+    out["destination_burst_wording_is_neutral"] = (
+        ip.EVIDENCE_EXPLANATIONS["journal_burst_destination"]
+        == "Destination-classed sing-box error records spiked above their "
+           "baseline."
+        and "plain web" not in
+        ip.EVIDENCE_EXPLANATIONS["journal_burst_destination"])
+    out["quic_class_does_not_name_hysteria2"] = (
+        "QUIC-class" in ip.EVIDENCE_EXPLANATIONS["journal_cls_quic_error"]
+        and "Hysteria2" not in
+        ip.EVIDENCE_EXPLANATIONS["journal_cls_quic_error"])
+    out["limitations_name_the_actual_boundaries"] = (
+        "cannot authoritatively determine which logical clients were "
+        "affected" in summary["limitations"]
+        and "ISP ownership or path identity" in summary["limitations"]
+        and "client identity" not in summary["limitations"])
     # (7) Every emittable category summarizes; insufficient has NO action;
     #     the uncertainty count is the only interpolation (0/1/N forms).
     for category in ip.EMITTABLE_CATEGORIES:
@@ -344,44 +368,49 @@ def group_store():
         # (2) The marker boundary: both closed kinds persist; the default
         #     epoch is now; the 4-key row is exactly the stored shape.
         clock[0] = BASE + 1000.0
-        first = history.record_marker("tt_live_studio_login_failed")
+        first_out, first = history.record_marker("tt_live_studio_login_failed")
         out["marker_lands_with_default_epoch"] = (
-            first is not None and first["epoch"] == BASE + 1000.0
+            first_out == ih.OUTCOME_RECORDED
+            and first["epoch"] == BASE + 1000.0
             and first["created_epoch"] == BASE + 1000.0
             and set(first) == {"marker_id", "epoch", "kind", "created_epoch"})
-        second = history.record_marker("operator_event", BASE + 500.0)
-        out["operator_event_lands"] = second is not None \
+        second_out, second = history.record_marker("operator_event", BASE + 500.0)
+        out["operator_event_lands"] = second_out == ih.OUTCOME_RECORDED \
             and second["epoch"] == BASE + 500.0
         # (3) The refusals: unknown kind, future epoch, already-aged-out
         #     epoch, non-epoch garbage. Zero bytes landed for any of them.
         rejected_before = history.incident_status()["rejected_total"]
         out["marker_refuses_unknown_kind"] = (
-            history.record_marker("my own note") is None
-            and history.record_marker(None) is None)
+            history.record_marker("my own note")[0] == ih.OUTCOME_REJECTED
+            and history.record_marker(None)[0] == ih.OUTCOME_REJECTED)
         out["marker_refuses_future_epoch"] = (
-            history.record_marker("operator_event", BASE + 2000.0) is None)
+            history.record_marker("operator_event", BASE + 2000.0)[0] == ih.OUTCOME_REJECTED)
         out["marker_refuses_already_aged_out"] = (
             history.record_marker("operator_event",
-                                  BASE - ih.RETENTION_SECONDS - 1.0) is None)
+                                  BASE - ih.RETENTION_SECONDS - 1.0)[0]
+            == ih.OUTCOME_REJECTED)
         out["marker_refuses_non_epoch"] = (
-            history.record_marker("operator_event", "now") is None
-            and history.record_marker("operator_event", True) is None)
+            history.record_marker("operator_event", "now")[0] == ih.OUTCOME_REJECTED
+            and history.record_marker("operator_event", True)[0] == ih.OUTCOME_REJECTED)
         out["marker_refusals_counted_closed"] = (
             history.incident_status()["rejected_total"] > rejected_before)
         out["marker_get_round_trips"] = (
-            history.marker_get(first["marker_id"]) == first
-            and history.marker_get(999_999) is None
-            and history.marker_get(True) is None)
+            history.marker_get(first["marker_id"])
+            == (ih.OUTCOME_OK, first)
+            and history.marker_get(999_999)[0] == ih.OUTCOME_MISSING
+            and history.marker_get(True)[0] == ih.OUTCOME_MISSING)
         # (4) The bounded list: newest epoch first, exact keys, honest
         #     truncation at the limit.
-        listing = history.query_markers(1)
+        l_out, listing = history.query_markers(1)
         out["marker_list_newest_first_with_truncation"] = (
-            [m["marker_id"] for m in listing["markers"]] == [first["marker_id"]]
+            l_out == ih.OUTCOME_OK
+            and [m["marker_id"] for m in listing["markers"]] == [first["marker_id"]]
             and listing["truncated"] is True
             and set(listing) == {"markers", "truncated", "limit"})
-        listing_all = history.query_markers(100)
+        la_out, listing_all = history.query_markers(100)
         out["marker_list_two_rows_untruncated"] = (
-            len(listing_all["markers"]) == 2
+            la_out == ih.OUTCOME_OK
+            and len(listing_all["markers"]) == 2
             and listing_all["truncated"] is False)
         # (5) Markers never enter the classifier bundle: the bundle read
         #     over a window containing both markers is byte-identical
@@ -401,7 +430,9 @@ def group_store():
         _open_incident(history, analysis_start=BASE + 400.0,
                        first_signal=BASE + 420.0, last_signal=BASE + 480.0,
                        classified_end=BASE + 600.0)
-        rows = history.query_incidents()["incidents"]
+        qi_out, qi_result = history.query_incidents()
+        assert qi_out == ih.OUTCOME_OK
+        rows = qi_result["incidents"]
         window_row = rows[0]
         out["marker_count_is_window_closed_join"] = (
             history.marker_count(window_row["analysis_start_epoch"],
@@ -414,8 +445,10 @@ def group_store():
         clock[0] = BASE + 1000.0 + ih.RETENTION_SECONDS
         history._cleanup("p5-retention")
         out["marker_time_retention_prunes"] = (
-            history.marker_get(second["marker_id"]) is None
-            and history.marker_get(first["marker_id"]) is not None)
+            history.marker_get(second["marker_id"])[0]
+            == ih.OUTCOME_MISSING
+            and history.marker_get(first["marker_id"])[0]
+            == ih.OUTCOME_OK)
         out["marker_size_retention_source"] = (
             ("operator_markers", "epoch") in ih._PRUNE_SOURCES)
         history.close()
@@ -498,19 +531,19 @@ def group_store():
         history, root, clock = _store_dir()
         conn = history._conn
         out["rearm_refused_on_inert_row"] = (
-            history.incident_rearm() is False)
+            history.incident_rearm() == ih.OUTCOME_NOT_REARMABLE)
         history.incident_activate(BASE)
         # The store's own clock must stand past every signal it closes
         # over (a close may not precede the signal it settles).
         clock[0] = BASE + 700.0
         out["rearm_refused_without_window_limit"] = (
-            history.incident_rearm() is False)
+            history.incident_rearm() == ih.OUTCOME_NOT_REARMABLE)
         opened = _open_incident(history)
         history.incident_close_window(opened, ic.CATEGORY_REALITY_TCP,
                                       BASE + 240, BASE + 300, 5, 0, 0,
                                       "clean_buckets")
         out["rearm_refused_after_clean_close"] = (
-            history.incident_rearm() is False)
+            history.incident_rearm() == ih.OUTCOME_NOT_REARMABLE)
         second = _open_incident(history, category=ic.CATEGORY_HY2_UDP)
         history.incident_close_window(second, ic.CATEGORY_HY2_UDP,
                                       BASE + 240, BASE + 300, 5, 0, 0,
@@ -518,7 +551,9 @@ def group_store():
         clock[0] = BASE + 700.3   # floor must be ceil(700.3/60)*60 = 720
         state_before = history.incident_runtime_snapshot()["state"]
         out["rearm_lands_on_window_limit_state"] = (
-            history.incident_rearm() is True)
+            history.incident_rearm() == ih.OUTCOME_REARMED)
+        qi2_out, qi2_result = history.query_incidents()
+        assert qi2_out == ih.OUTCOME_OK
         state_after = history.incident_runtime_snapshot()["state"]
         out["rearm_floor_is_the_bucket_grid"] = (
             state_after["discovery_floor_epoch"] == BASE + 720.0
@@ -530,9 +565,9 @@ def group_store():
             == state_before["last_evaluated_end_epoch"]
             and state_after["reader_fresh_since_epoch"]
             == state_before["reader_fresh_since_epoch"]
-            and len(history.query_incidents()["incidents"]) == 2)
+            and len(qi2_result["incidents"]) == 2)
         out["rearm_is_one_shot"] = (
-            history.incident_rearm() is False)
+            history.incident_rearm() == ih.OUTCOME_NOT_REARMABLE)
         # The rearm_required=1 shape EXCLUDES an open incident by the v4
         # shape CHECK, so the SQL precondition list is exactly what the
         # scenarios above can exercise: inert row, no window-limit gate,
@@ -939,10 +974,12 @@ def group_live_incident():
             #     The store clock first advances past both marker epochs,
             #     so neither is future-dated relative to the store.
             clock[0] = BASE + 90_500.0
-            in_window = history.record_marker("operator_event",
-                                              BASE + 100.0)
-            out_of_window = history.record_marker("operator_event",
-                                                  BASE + 90_000.0)
+            in_out, in_window = history.record_marker(
+                "operator_event", BASE + 100.0)
+            out_out, out_of_window = history.record_marker(
+                "operator_event", BASE + 90_000.0)
+            assert in_out == ih.OUTCOME_RECORDED
+            assert out_out == ih.OUTCOME_RECORDED
             status, body, _c, _a = request(
                 "GET", "/api/v1/incidents/%d" % opened, cookie=session)
             detail = json.loads(body)
@@ -1129,11 +1166,253 @@ def group_fixtures():
     return out
 
 
+# -- group: outcome envelopes under injected storage faults (#63 review B6) ----
+
+class _FaultConn:
+    """A connection proxy that raises the storage error a dead disk
+    produces for every statement while armed. The injection happens UNDER
+    the store's own containment wrappers, so the real methods run their
+    genuine failure paths (health recording, outcome envelopes) instead
+    of an exception escaping past them."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def execute(self, sql, *args):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    def executemany(self, sql, *args):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    def commit(self):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    def rollback(self):
+        try:
+            return self._conn.rollback()
+        except sqlite3.Error:
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+class _FaultHistory:
+    """Delegates EVERYTHING to a real schema-v5 store; the methods named
+    in ``faults`` run against a dead-disk connection. The vehicle for the
+    outcome-envelope gates: through the SHIPPED handler, a storage
+    failure must surface as a closed 503 -- never as a 404, a
+    healthy-looking empty list, or a fake 409."""
+
+    def __init__(self, real, faults):
+        self._real = real
+        self._faults = set(faults)
+
+    def __getattr__(self, name):
+        attr = getattr(self._real, name)
+        if name not in self._faults or not callable(attr):
+            return attr
+        def faulted(*args, **kwargs):
+            conn = self._real._conn
+            self._real._conn = _FaultConn(conn)
+            try:
+                return attr(*args, **kwargs)
+            finally:
+                self._real._conn = conn
+        return faulted
+
+
+def group_outcomes():
+    out = {}
+    history, root, clock = _store_dir()
+    try:
+        history.incident_activate(BASE)
+        _pump_evidence(history, clock)
+        opened = _open_incident(history)
+        # the store clock must stand past the marker epoch before the write
+        clock[0] = BASE + 200.0
+        m_out, marker = history.record_marker("operator_event", BASE + 100.0)
+        assert m_out == ih.OUTCOME_RECORDED
+        marker_id = marker["marker_id"]
+        # (1) HEALTHY controls over the shipped handler: a real row is 200,
+        #     a real miss is the closed 404, a healthy empty state= filter
+        #     is a 200 EMPTY list, and a not-rearmable gate is a 409.
+        server, request, login, auth = _serve(history)
+        try:
+            session = login()
+            status, body, _c, _a = request(
+                "GET", "/api/v1/incidents/%d" % opened, cookie=session)
+            out["healthy_row_is_200"] = status == 200
+            status, body, _c, _a = request(
+                "GET", "/api/v1/incidents/999999", cookie=session)
+            out["healthy_missing_is_404"] = (
+                status == 404
+                and json.loads(body)["error"] == "incident_not_found")
+            status, body, _c, _a = request(
+                "GET", "/api/v1/incidents?state=closed", cookie=session)
+            data = json.loads(body) if status == 200 else {}
+            out["healthy_empty_is_200_empty"] = (
+                status == 200 and data.get("incidents") == []
+                and data.get("truncated") is False)
+            _grant_step_up(auth, session)
+            status, body, _c, _a = request(
+                "POST", "/api/v1/incidents/rearm", cookie=session,
+                body={}, headers=_csrf_headers(session, auth))
+            out["healthy_not_rearmable_is_409"] = (
+                status == 409 and json.loads(body)["error"]
+                == "incident_runtime_not_rearmable")
+            server.shutdown()
+            server.server_close()
+        finally:
+            try:
+                server.server_close()
+            except Exception:  # noqa: BLE001 -- teardown never decides
+                pass
+        # (2) FAULTED reads: every read failure is a closed 503, never a
+        #     404 and never a healthy-looking empty list -- even when a
+        #     real row/marker EXISTS on the healthy path.
+        for fault, path in (("incident_detail",
+                             "/api/v1/incidents/%d" % opened),
+                            ("query_incidents", "/api/v1/incidents"),
+                            ("query_incidents",
+                             "/api/v1/incidents?state=closed")):
+            wrapper = _FaultHistory(history, {fault: 1})
+            server, request, login, auth = _serve(wrapper)
+            try:
+                session = login()
+                status, body, _c, _a = request("GET", path, cookie=session)
+                out["fault_read_%s_503" % fault] = (
+                    status == 503
+                    and json.loads(body)["error"]
+                    == "incident history unavailable"
+                    and "incident_not_found" not in body
+                    and '"incidents": []' not in body)
+            finally:
+                try:
+                    server.server_close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+
+        wrapper = _FaultHistory(history, {"marker_get": 1})
+        server, request, login, auth = _serve(wrapper)
+        try:
+            session = login()
+            status, body, _c, _a = request(
+                "GET", "/api/v1/evidence?section=samples&marker_id=%d"
+                % marker_id, cookie=session)
+            out["fault_marker_get_is_503_never_404"] = (
+                status == 503
+                and json.loads(body)["error"]
+                == "incident history unavailable"
+                and "marker_not_found" not in body)
+        finally:
+            try:
+                server.server_close()
+            except Exception:  # noqa: BLE001
+                pass
+        wrapper = _FaultHistory(history, {"evidence_section": 1})
+        server, request, login, auth = _serve(wrapper)
+        try:
+            session = login()
+            status, body, _c, _a = request(
+                "GET", "/api/v1/evidence?section=samples&incident_id=%d"
+                % opened, cookie=session)
+            out["fault_evidence_is_503_never_empty"] = (
+                status == 503
+                and json.loads(body)["error"] == "evidence unavailable"
+                and '"rows"' not in body)
+        finally:
+            try:
+                server.server_close()
+            except Exception:  # noqa: BLE001
+                pass
+        wrapper = _FaultHistory(history, {"query_markers": 1})
+        server, request, login, auth = _serve(wrapper)
+        try:
+            session = login()
+            status, body, _c, _a = request("GET", "/api/v1/markers",
+                                           cookie=session)
+            out["fault_marker_list_is_503_never_empty"] = (
+                status == 503
+                and json.loads(body)["error"]
+                == "incident history unavailable")
+        finally:
+            try:
+                server.server_close()
+            except Exception:  # noqa: BLE001
+                pass
+        # (3) FAULTED writes: a marker persistence failure is a closed 503,
+        #     never a fabricated success; a rearm persistence failure is a
+        #     closed 503, never a fake 409.
+        wrapper = _FaultHistory(history, {"record_marker": 1})
+        server, request, login, auth = _serve(wrapper)
+        try:
+            session = login()
+            _grant_step_up(auth, session)
+            status, body, _c, _a = request(
+                "POST", "/api/v1/markers", cookie=session,
+                body={"kind": "operator_event"},
+                headers=_csrf_headers(session, auth))
+            out["fault_marker_persist_is_503_never_200"] = (
+                status == 503
+                and json.loads(body)["error"] == "marker persistence failed"
+                and "marker_id" not in body)
+        finally:
+            try:
+                server.server_close()
+            except Exception:  # noqa: BLE001
+                pass
+        # the durable gate is driven into window_limit and a REAL scanner
+        # reports phase=rearm, so the web precondition PASSES -- only the
+        # store write fails, which must read 503, not 409.
+        clock[0] = BASE + 700.0
+        history.incident_close_window(opened, ic.CATEGORY_REALITY_TCP,
+                                      BASE + 240, BASE + 300, 5, 0, 0,
+                                      "clean_buckets")
+        opened2 = _open_incident(history, category=ic.CATEGORY_HY2_UDP)
+        history.incident_close_window(opened2, ic.CATEGORY_HY2_UDP,
+                                      BASE + 240, BASE + 300, 5, 0, 0,
+                                      "window_limit")
+        clock[0] = BASE + 700.3
+        scanner = ir.IncidentScanner(history, scan_interval_seconds=3600.0,
+                                     clock=lambda: clock[0])
+        scanner.start()
+        out["premise_scanner_reports_rearm"] = (
+            scanner.status()["phase"] == "rearm")
+        wrapper = _FaultHistory(history, {"incident_rearm": 1})
+        server, request, login, auth = _serve(wrapper, scanner=scanner)
+        try:
+            session = login()
+            _grant_step_up(auth, session)
+            status, body, _c, _a = request(
+                "POST", "/api/v1/incidents/rearm", cookie=session,
+                body={}, headers=_csrf_headers(session, auth))
+            out["fault_rearm_persist_is_503_never_409"] = (
+                status == 503
+                and json.loads(body)["error"]
+                == "incident history unavailable"
+                and "status" not in body)
+            server.shutdown()
+            server.server_close()
+        finally:
+            try:
+                server.server_close()
+            except Exception:  # noqa: BLE001
+                pass
+        scanner.stop(join_timeout=0.5)
+    finally:
+        history.close()
+        _drop(root)
+    return out
+
+
 # -- runner ------------------------------------------------------------------
 
 GROUPS = {"presenter": group_presenter, "store": group_store,
           "api": group_api, "live_incident": group_live_incident,
-          "rearm_stack": group_rearm_stack, "fixtures": group_fixtures}
+          "rearm_stack": group_rearm_stack, "fixtures": group_fixtures,
+          "outcomes": group_outcomes}
 
 
 def main():

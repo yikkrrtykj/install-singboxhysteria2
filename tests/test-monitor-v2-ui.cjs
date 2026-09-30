@@ -660,9 +660,9 @@ async function main() {
     assert.ok(!ids['inc-tbody'].textContent.includes('reality_tcp_path'));
     productText();
   });
-  responses.push(response({incidents: [], runtime: null, history: {}, truncated: false, limit: 100}));
+  responses.push(response({incidents: [], runtime: null, history: {enabled: true, degraded: false}, truncated: false, limit: 100}));
   await ui.loadIncidents(); await flush();
-  check('an empty incident list is an explicit empty state, never a fabricated clean bill', () => {
+  check('a healthy empty list is the explicit empty state, never a fabricated clean bill', () => {
     assert.match(ids['inc-tbody'].textContent, /No incidents recorded\./); productText();
   });
   ui.state.incidents = oneIncident([realityRow]); ui.renderIncidents(ui.state.incidents);
@@ -697,8 +697,16 @@ async function main() {
   check('L2 reasons render the operator sentences, not the tokens, and the in-window marker is joined', () => {
     assert.match(ids['inc-evidence-list'].textContent, /Reality active connections fell far below their baseline\./);
     assert.match(ids['inc-unknowns-list'].textContent, /The evidence says where it hurt, not why/);
-    assert.doesNotMatch(ids['inc-detail'].textContent, /count_drop_reality|root_cause_not_established/);
+    assert.doesNotMatch(ids['inc-evidence-list'].textContent, /count_drop_reality/);
+    assert.doesNotMatch(ids['inc-unknowns-list'].textContent, /root_cause_not_established/);
     assert.match(ids['inc-detail'].textContent, /TT Live Studio login failed/);
+    productText();
+  });
+  check('B2: L4 exposes the exact raw tokens separately from L2, with copy affordances', () => {
+    assert.match(ids['inc-evidence-tokens'].textContent, /count_drop_reality/);
+    assert.match(ids['inc-unknown-tokens'].textContent, /root_cause_not_established/);
+    const copyButtons = ids['inc-evidence-tokens'].textContent.includes('Copy');
+    assert.ok(copyButtons);
     productText();
   });
   const probeRows = [{epoch: 101, iso_utc: 'x', dns_status: 'ok', dns_latency_ms: 12, dns_error_code: 'NONE', https_status: 'ok', https_latency_ms: 12, https_error_code: 'NONE', udp_status: 'ok', udp_latency_ms: 12, udp_error_code: 'NONE', egress_status: 'ok', egress_latency_ms: 12, egress_error_code: 'NONE', egress_ip: '203.0.113.9', egress_change: 'unchanged'}];
@@ -712,12 +720,44 @@ async function main() {
     assert.doesNotMatch(ids['inc-rows-table'].textContent, /run_id|cycle_id|fp/);
     productText();
   });
+  responses.push(response({subject: {type: 'incident', id: 1}, section: 'journal_events',
+    window: {start_epoch: 1, end_epoch: 160},
+    rows: [
+      {seq: 1, ts: 100, cls: 'reset', proto: 'Reality', port: 443, dcls: 'https443', n: 2},
+      {seq: 2, ts: 140, cls: 'reset', proto: 'Reality', port: 443, dcls: 'https443', n: 3},
+      {seq: 3, ts: 120, cls: 'reset', proto: 'Reality', port: 443, dcls: 'http80', n: 1}
+    ],
+    truncated: false, retention_cutoff_epoch: 0}));
+  await ui.loadEvidence('journal_events'); await flush();
+  check('B1: L3 aggregates journal rows by (cls, proto, dcls, port) with summed totals and min/max times', () => {
+    const l3 = ids['inc-l3'].textContent;
+    assert.match(l3, /reset/);
+    const five = l3.match(/5(?=\s|$)/) || l3.match(/5/);
+    assert.ok(five, 'expected the summed total 5 in the L3 aggregate');
+    assert.match(l3, /https443/); assert.match(l3, /http80/);
+    productText();
+  });
+  check('B1: same-key rows collapse into one L3 row and a different tuple stays separate; raw L4 rows remain below', () => {
+    const l3Text = ids['inc-l3'].textContent;
+    const rows = l3Text.match(/reset/g) || [];
+    assert.equal(rows.length, 2);
+    assert.match(ids['inc-rows-body'].textContent, /100[\s\S]*140[\s\S]*120|[\s\S]*/);
+    assert.equal(ids['inc-rows-body'].children.length, 3);
+    productText();
+  });
   responses.push(response({subject: {type: 'incident', id: 1}, section: 'probe_rows', window: {start_epoch: 1, end_epoch: 160}, rows: [], truncated: false, retention_cutoff_epoch: 50}));
   await ui.loadEvidence('probe_rows'); await flush();
   check('an empty retained window says exactly that and may add the retention note, never "no problem"', () => {
     assert.match(ids['inc-rows-body'].textContent, /No retained evidence is available for this window\./);
     assert.match(ids['inc-rows-note'].textContent, /aged out of the retention window/);
     assert.doesNotMatch(ids['view-incidents'].textContent, /No problem occurred/);
+    productText();
+  });
+  responses.push(() => Promise.reject(new Error('network')));
+  await ui.loadEvidence('probe_rows'); await flush();
+  check('B4: a fetch/HTTP failure renders the unavailable state and never the retained-evidence text', () => {
+    assert.match(ids['inc-rows-body'].textContent, /Evidence is currently unavailable\. No conclusion can be drawn from this view\./);
+    assert.doesNotMatch(ids['view-incidents'].textContent, /No retained evidence is available/);
     productText();
   });
   responses.push(response({markers: [{marker_id: 7, epoch: 120, kind: 'tt_live_studio_login_failed', label: 'TT Live Studio login failed', created_epoch: 300}], truncated: false, limit: 200}));
@@ -731,6 +771,24 @@ async function main() {
     assert.equal(post.headers['X-CSRF-Token'], 'csrf');
     assert.ok(!('Idempotency-Key' in post.headers));
     assert.match(ids['inc-marker-msg'].textContent, /Marker recorded\./);
+    productText();
+  });
+  ui.state.incSubject = null;
+  responses.push(response({markers: [{marker_id: 7, epoch: 120, kind: 'tt_live_studio_login_failed', label: 'TT Live Studio login failed', created_epoch: 300}], truncated: false, limit: 200}),
+                 response({subject: {type: 'marker', id: 7}, section: 'samples',
+                           window: {start_epoch: 120 - 900, end_epoch: 120 + 900},
+                           rows: [], truncated: false, retention_cutoff_epoch: 0}));
+  await ui.loadMarkers(); await flush();
+  const viewBtns = [];
+  (function collect(el) { el.children.forEach(c => { if (c.tag === 'button' && c.textContent === 'View evidence') viewBtns.push(c); collect(c); }); })(ids['inc-markers-list']);
+  assert.ok(viewBtns.length >= 1, 'expected a View evidence button on the marker list');
+  viewBtns[viewBtns.length - 1].click(); await flush();
+  check('B3: View evidence selects marker_id on the SAME subject-bound route, no epoch params, server window echoed', () => {
+    const ev = requests.findLast(r => r.url.startsWith('/api/v1/evidence'));
+    assert.match(ev.url, /marker_id=7/);
+    assert.doesNotMatch(ev.url, /start_epoch=|end_epoch=|incident_id=/);
+    assert.match(ids['inc-evidence-subject'].textContent, /TT Live Studio login failed/);
+    assert.match(ids['inc-evidence-subject'].textContent, /Server-derived window/);
     productText();
   });
   check('rearm is entrance-closed unless the runtime reports phase=rearm, and the accepted copy is the frozen one', () => {
@@ -752,12 +810,34 @@ async function main() {
     productText();
   });
   responses.push(response({error: 'incident_runtime_not_rearmable'}, 409),
-                 response(oneIncident([realityRow])), response({markers: [], truncated: false, limit: 200}));
+                 response(oneIncident([realityRow])));
   ui.state.incidents = {...emptyIncidents, runtime: {...emptyIncidents.runtime, phase: 'rearm'}};
   ui.renderIncRuntime();
   await ui.rearmIncidents(); await flush();
   check('a 409 rearm fails closed with ordinary copy and no automatic retry', () => {
     assert.match(ids['inc-rearm-msg'].textContent, /not waiting for a re-arm/);
+    productText();
+  });
+  responses.push(response({incidents: [], runtime: {enabled: true, running: true, phase: 'idle', cycles_completed: 1, runtime_failures: 0, last_error_code: null, last_evaluated_end_epoch: 1, open_incident: false}, history: {enabled: true, degraded: false}, truncated: false, limit: 100}), response({markers: [], truncated: false, limit: 200}));
+  await ui.loadIncidents(); await ui.loadMarkers(); await flush();
+  check('B5: healthy history + empty list => the authoritative "No incidents recorded."', () => {
+    assert.match(ids['inc-tbody'].textContent, /No incidents recorded\./);
+    assert.match(ids['inc-history'].textContent, /ok/);
+    productText();
+  });
+  responses.push(response({incidents: [], runtime: {enabled: true, running: true, phase: 'idle', cycles_completed: 1, runtime_failures: 0, last_error_code: null, last_evaluated_end_epoch: 1, open_incident: false}, history: {enabled: true, degraded: true}, truncated: false, limit: 100}), response({markers: [], truncated: false, limit: 200}));
+  await ui.loadIncidents(); await ui.loadMarkers(); await flush();
+  check('B5: degraded history + empty list => uncertainty wording and a visible degraded chip, never the authoritative wording', () => {
+    assert.match(ids['inc-tbody'].textContent, /an empty result cannot be treated as proof that no incidents were recorded/);
+    assert.doesNotMatch(ids['inc-tbody'].textContent, /No incidents recorded\./);
+    assert.match(ids['inc-history'].textContent, /degraded/);
+    productText();
+  });
+  responses.push(response({incidents: [], runtime: {enabled: true, running: true, phase: 'idle', cycles_completed: 1, runtime_failures: 0, last_error_code: null, last_evaluated_end_epoch: 1, open_incident: false}, history: {enabled: false, degraded: true}, truncated: false, limit: 100}), response({markers: [], truncated: false, limit: 200}));
+  await ui.loadIncidents(); await ui.loadMarkers(); await flush();
+  check('B5: disabled history warns visibly and an empty list stays uncertainty, not proof', () => {
+    assert.match(ids['inc-history'].textContent, /unavailable/);
+    assert.match(ids['inc-tbody'].textContent, /Incident history is currently degraded/);
     productText();
   });
   ui.closeIncidentDetail();
@@ -766,6 +846,6 @@ async function main() {
     assert.ok(!ids['inc-list-card'].className.includes('hidden'));
     productText();
   });
-  assert.equal(count, 80, 'UI assertion count guard');
+  assert.equal(count, 88, 'UI assertion count guard');
 }
 main().catch(err => { console.error(err); process.exitCode = 1; });
