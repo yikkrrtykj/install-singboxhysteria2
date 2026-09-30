@@ -3682,7 +3682,7 @@ QUICK=ok" "$(cat "$TMP/t28.facts.snap")" \
     fi
     assert_grep 'declared=3' "$TMP/t28.meta.text" \
         "the snapshot metadata records the pre-migration schema version"
-    assert_grep 'candidate_schema=4' "$TMP/t28.meta.text" \
+    assert_grep 'candidate_schema=5' "$TMP/t28.meta.text" \
         "the snapshot metadata records the candidate schema it was taken against"
     assert_grep 'live_owner=' "$TMP/t28.meta.text" \
         "the snapshot metadata records the owner/mode the restore must reproduce"
@@ -3712,7 +3712,7 @@ else
         "the v3->v5 upgrade completes when no gate fails (no failure was injected)"
     assert_eq "$prestate_cand_version" "$(cat "$TMP/t29.ver.after")" \
         "the candidate release is the live one after the successful upgrade"
-    assert_eq "DECLARED=4
+    assert_eq "DECLARED=5
 TABLES=$prestate_v5_tables
 QUICK=ok" "$(cat "$TMP/t29.facts.after")" \
         "the live database really is at v5 now (the migration committed)"
@@ -3955,7 +3955,7 @@ T31_RC_BUILD=$?
 if [ "$T31_RC_BUILD" != 0 ]; then
     fail "isolated downgrade-gate fixture could not be built (rc=$T31_RC_BUILD): $(tail -n 5 "$TMP/out-t31-base.log" 2>/dev/null | tr '\n' ' ')"
 else
-    assert_eq "DECLARED=4" "$(grep '^DECLARED=' "$TMP/t31.facts.after")" \
+    assert_eq "DECLARED=5" "$(grep '^DECLARED=' "$TMP/t31.facts.after")" \
         "T31 starts from a live database the successful upgrade really migrated to v5"
     assert_eq 1 "$(wc -l < "$TMP/t31.backups" | tr -d ' ')" \
         "and from exactly one retained pre-migration (v3) snapshot -- the media a downgrade must reason about"
@@ -4027,7 +4027,7 @@ else
         "the refusal says plainly that it refused a downgrade"
     assert_grep '声明 history schema v3' "$T31_DN" \
         "the refusal states the candidate's schema version"
-    assert_grep '当前数据库为 v4' "$T31_DN" \
+    assert_grep '当前数据库为 v5' "$T31_DN" \
         "the refusal states the live database's schema version"
     assert_grep 'history-prestate-' "$T31_DN" \
         "the refusal names the retained pre-migration media as the way back"
@@ -4041,8 +4041,8 @@ else
         "the refused downgrade left the v4 release live"
     assert_eq "$(cat "$TMP/t31.dn.before")" "$(cat "$TMP/t31.dn.after")" \
         "unit file, reader unit, commit record and the active/enabled facts are all byte-for-byte what they were: the refusal changed nothing"
-    assert_eq "DECLARED=4" "$(grep '^DECLARED=' "$TMP/t31.facts.dn")" \
-        "the refused downgrade left the live database at v4"
+    assert_eq "DECLARED=5" "$(grep '^DECLARED=' "$TMP/t31.facts.dn")" \
+        "the refused downgrade left the live database at v5"
     assert_eq "$(head -n 1 "$TMP/t31.dn.db.sha" | cut -d' ' -f1)" \
         "$(tail -n 1 "$TMP/t31.dn.db.sha" | cut -d' ' -f1)" \
         "the refused downgrade left the history database byte-identical (the gate only reads)"
@@ -4152,7 +4152,7 @@ else
         "the candidate booted over a file already at its own schema"
     assert_no_grep 'boot migrated' "$TMP/t32-boot.log" \
         "no migration line exists to record: declared and database already agree"
-    assert_eq "DECLARED=4
+    assert_eq "DECLARED=5
 TABLES=$prestate_v5_tables
 QUICK=ok" "$(cat "$TMP/t32.facts.after")" \
         "the live database still declares v5 with the exact v5 table set"
