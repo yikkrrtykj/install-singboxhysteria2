@@ -1109,10 +1109,18 @@ def group_cycle():
         out["clock_rollback_starts_a_new_run"] = (
             instance.run != run_before and instance.clock_rollbacks == 1
             and instance.seq == 1)
-        resent = [request["body"] for request in poster.requests[1:]]
+        # Timing-independent: EVERY body that ever went out for the first
+        # record still carries its ORIGINAL sample_epoch (the rollback moved
+        # the clock, not an already-spooled timestamp), and the cycle after
+        # the rollback produced the new time instead.
+        seen = {}
+        for request in poster.requests:
+            seen.setdefault(request["body"], set()).add(
+                json.loads(request["body"])["sample_epoch"])
         out["rollback_never_rewrites_spooled_timestamps"] = (
-            first_body in resent
-            and json.loads(first_body)["sample_epoch"] == 1700000000.0)
+            bool(seen)
+            and all(len(values) == 1 for values in seen.values())
+            and any(1700000000.0 in values for values in seen.values()))
         # status is closed and sanitized
         status = instance.status()
         out["status_is_closed_and_sanitized"] = (
