@@ -88,7 +88,7 @@ FAIL=0
 # set-exactness-gated by the incidents lane); (b) containment 40 -> 39 --
 # the live "P5 route answers 404" verdict is the same retirement point
 # served over HTTP. The release-identity witnesses are RESTATED in place
-# (VERSION 0.6.0 / MONITOR_WEB_VERSION 0.6.0 / SCHEMA_VERSION 5 -- the
+# (VERSION 0.6.1 / MONITOR_WEB_VERSION 0.6.1 / SCHEMA_VERSION 5 -- the
 # store gains ONLY operator_markers) and no expectation was otherwise
 # weakened; the timeline one-key wall, all 34 contract discriminators and
 # every behaviour verdict keep their exact prior shape.
@@ -233,12 +233,12 @@ fi
 
 # (1) The release identity PR-5 restated. Three witnesses, three files: the
 #     VERSION this lane guards, the web build it ships, the schema it writes.
-assert_eq '0.6.0' "$(cat "$ROOT/monitor-v2/VERSION")" \
-    "VERSION is 0.6.0 (the incidents-UI release)"
-if grep -q 'MONITOR_WEB_VERSION = "0.6.0"' "$SERVER_PY"; then
-    pass "MONITOR_WEB_VERSION is 0.6.0"
+assert_eq '0.6.1' "$(cat "$ROOT/monitor-v2/VERSION")" \
+    "VERSION is 0.6.1 (the HTTP-disconnect-noise release)"
+if grep -q 'MONITOR_WEB_VERSION = "0.6.1"' "$SERVER_PY"; then
+    pass "MONITOR_WEB_VERSION is 0.6.1"
 else
-    fail "MONITOR_WEB_VERSION moved off 0.6.0"
+    fail "MONITOR_WEB_VERSION moved off 0.6.1"
 fi
 if grep -q '^SCHEMA_VERSION = 5$' "$HIST_PY"; then
     pass "history SCHEMA_VERSION is 5"
