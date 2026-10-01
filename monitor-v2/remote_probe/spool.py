@@ -101,11 +101,10 @@ def _write_all(fd, data):
         view = view[written:]
 
 
-def _fsync_quiet(fd):
-    try:
-        os.fsync(fd)
-    except OSError:
-        pass
+def _fsync(fd):
+    """fsync that does NOT swallow its failure: an un-fsyncable file means the
+    durability step cannot be claimed, so the caller fails closed."""
+    os.fsync(fd)
 
 
 def check_no_symlink_component(path):
@@ -139,7 +138,9 @@ def open_restricted(path, flags, mode=0o600):
     was opened is a regular file (never a FIFO/device/dir); the mode is forced
     to 0600. The checks run on the OPEN descriptor.
     """
-    open_flags = flags | BINARY | getattr(os, "O_NOFOLLOW", 0)
+    open_flags = (flags | BINARY
+                  | getattr(os, "O_NONBLOCK", 0)
+                  | getattr(os, "O_NOFOLLOW", 0))
     try:
         fd = os.open(path, open_flags, mode)
     except OSError as exc:
@@ -302,9 +303,43 @@ class Spool:
             candidate = "%s.%d" % (os.path.join(self.directory, SPOOL_FILE),
                                    index)
             if os.path.lexists(candidate):
+                self._assert_chain_member_safe(candidate)
                 paths.append(candidate)
-        paths.append(os.path.join(self.directory, SPOOL_FILE))
+        current = os.path.join(self.directory, SPOOL_FILE)
+        if os.path.lexists(current):
+            self._assert_chain_member_safe(current)
+        paths.append(current)
         return paths
+
+    @staticmethod
+    def _assert_chain_member_safe(path):
+        """EVERY existing chain member must be a regular, non-symlink file: an
+        unsafe rotated object is refused fail-closed, never skipped (a skip
+        would make the queue look complete while records hide behind it)."""
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise SpoolError("record chain member unstatable: %s"
+                             % type(exc).__name__) from None
+        if stat_module.S_ISLNK(st.st_mode):
+            raise SpoolError("record chain member must not be a symlink")
+        if not stat_module.S_ISREG(st.st_mode):
+            raise SpoolError("record chain member must be a regular file")
+
+    def _read_chain_member(self, path):
+        """Read one chain member.
+
+        ABSENT is a normal state (the current file does not exist until the
+        first append) and reads as empty; any OTHER failure is FATAL and must
+        never be skipped -- a silent skip would make the queue look complete
+        while an unreadable file hides records.
+        """
+        try:
+            return read_restricted(path, self.file_bytes * 4)
+        except FileNotFoundError:
+            return b""
 
     def _state_path(self):
         return os.path.join(self.directory, STATE_FILE)
@@ -359,7 +394,7 @@ class Spool:
         fd = open_restricted(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
         try:
             _write_all(fd, payload)
-            _fsync_quiet(fd)
+            _fsync(fd)
         finally:
             os.close(fd)
         os.replace(tmp, self._state_path())
@@ -482,10 +517,7 @@ class Spool:
         resolved = int(self._state["resolved_through"])
         counted = 0
         for path in self._record_paths():
-            try:
-                data = read_restricted(path, self.file_bytes * 4)
-            except (SpoolError, OSError):
-                continue
+            data = self._read_chain_member(path)
             for line in data.splitlines():
                 if not line or _line_is_readable(line):
                     continue
@@ -558,15 +590,20 @@ class Spool:
 
     @staticmethod
     def _rename_fsynced(source, target):
-        if os.path.lexists(source):
-            try:
-                fd = open_restricted(source, os.O_RDWR)
-            except (SpoolError, OSError):
-                fd = None
-            if fd is not None:
-                _fsync_quiet(fd)
-                os.close(fd)
+        """Publish one rotation step: file fsync -> rename -> directory fsync.
+
+        Every step is load-bearing and none is swallowed: an unsafe source
+        (symlink/special) is REFUSED and never renamed, a failed file fsync
+        raises (the rotation is not durable), and the rename is followed by
+        a directory fsync so the new name is durable too.
+        """
+        fd = open_restricted(source, os.O_RDWR)
+        try:
+            _fsync(fd)
+        finally:
+            os.close(fd)
         os.replace(source, target)
+        _fsync_dir(os.path.dirname(os.path.abspath(target)))
 
     # -- read / attempts / resolve ------------------------------------------
 
@@ -663,10 +700,7 @@ class Spool:
         for path in self._record_paths():
             if not os.path.lexists(path):
                 continue
-            try:
-                data = read_restricted(path, self.file_bytes * 4)
-            except (SpoolError, OSError):
-                continue
+            data = self._read_chain_member(path)
             keep = []
             for line in data.splitlines():
                 if not line:
@@ -684,7 +718,7 @@ class Spool:
             fd = open_restricted(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
             try:
                 _write_all(fd, b"".join(line + NL for line in keep))
-                _fsync_quiet(fd)
+                _fsync(fd)
             finally:
                 os.close(fd)
             os.replace(tmp, path)

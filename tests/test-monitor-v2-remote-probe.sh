@@ -42,23 +42,25 @@ PASS=0
 FAIL=0
 # Measured on the dev host (Windows, Python 3.14) and re-measured on Linux CI:
 # Measured on the dev host (Windows, Python 3.14) and re-measured on Linux CI:
-# 210 = S0 static + red-line gates 19 (py_compile of the package + harness, the
-# in-module reuse documentation, the FOUR frozen sha256 pins that prove the audited
-# E4 client/model/diag/README were reused and never forked, the E4 file-set
-# check, the unchanged release identity 0.6.1 in both places, History still v5
-# with its six prune sources and no remote table, the three P4/P5 modules free
-# of any remote reference, the absent server ingest route, the absent server
-# remote store, and the two CI registrations) + S1 harness 191 (190 verdicts
-# across ELEVEN groups -- including the three MIRROR gates that import the
-# audited VPS-side probe engine and prove the direct-slot vocabulary, the
-# status/change values and the canonical-IP gate still match it exactly, and the
-# RESILIENCE group that pins the reviewed fix round: durable per-record retry
-# state with bounded unknown quarantine and a consumed backoff curve, retention
-# driven by the agent's own open/cycle path, the crash window between the record
-# fsync and the state save, deadline legality (an egress-shaped failure slot),
-# egress-baseline staging and exact 256-bit key material -- plus the harness rc
-# gate).
-EXPECTED_PASS=210
+# Measured on the dev host (Windows, Python 3.14) and re-measured on Linux CI:
+# 226 = S0 static + red-line gates 19 (py_compile of the package + harness, the
+# in-module reuse documentation, the FOUR frozen sha256 pins that prove the
+# audited E4 client/model/diag/README were reused and never forked, the E4
+# file-set check, the unchanged release identity 0.6.1 in both places, History
+# still v5 with its six prune sources and no remote table, the three P4/P5
+# modules free of any remote reference, the absent server ingest route, the
+# absent server remote store, and the two CI registrations) + S1 harness 206
+# verdicts across ELEVEN groups plus the harness rc gate. The RESILIENCE group
+# (38 verdicts) pins both reviewed fix rounds: durable per-record retry state
+# with bounded unknown quarantine and a consumed backoff curve, retention driven
+# by the agent's own open/cycle path, the crash window between the record fsync
+# and the state save, deadline legality (an egress-shaped failure slot),
+# egress-baseline staging, exact 256-bit key material, and this round's
+# residuals -- startup retention fail-closed, rotation published as file fsync +
+# rename + directory fsync, unsafe chain members refused, the baseline file
+# under the same storage discipline, per-request sent_epoch freshness, and the
+# Mihomo/ingest secret non-reuse rule.
+EXPECTED_PASS=226
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT

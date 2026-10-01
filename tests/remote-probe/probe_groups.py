@@ -1129,6 +1129,7 @@ def group_cycle():
                             "overlap_refusals", "spool_failures",
                             "retention_runs", "retention_failures",
                             "delivery_deferrals", "last_backoff_seconds",
+                            "baseline_write_failures",
                             "state", "active", "spool"}
             and SECRET_TEXT not in json.dumps(status))
         # 45. secret leak wall: payload, spool bytes, status, exception text
@@ -1204,6 +1205,18 @@ def group_cycle():
 
 def _boom_spool(*_a, **_k):
     raise sp.SpoolError("refused")
+
+
+def _boom_bounds(*_a, **_k):
+    raise sp.SpoolError("retention refused")
+
+
+def _boom_write(*_a, **_k):
+    raise sp.SpoolError("baseline write refused")
+
+
+def _real_write(instance):
+    return type(instance)._write_baseline.__get__(instance, type(instance))
 
 
 def group_resilience():
@@ -1522,6 +1535,314 @@ def group_resilience():
     out["lock_is_released_on_close"] = (
         sp.Spool(directory, clock=lambda: 1700000000.0).open() is not None)
     clean(root)
+
+    # ---- R1: a failed STARTUP retention pass must not activate the agent
+    instance, _t = build_agent()
+    try:
+        instance.spool.enforce_bounds = _boom_bounds
+        raised = None
+        try:
+            instance.open()
+        except Exception as exc:  # noqa: BLE001 -- the refusal is the gate
+            raised = type(exc).__name__
+        out["startup_retention_failure_prevents_agent_activation"] = (
+            raised is not None and instance.run is None)
+        # ... and the writer lock was released with the refusal, so the
+        # directory is not left half-owned.
+        out["startup_refusal_releases_the_writer_lock"] = (
+            sp.Spool(instance.config.spool_dir,
+                     clock=lambda: 1700000000.0).open() is not None)
+    finally:
+        clean(instance.config.spool_dir)
+    # ---- R2: rotation publication is fsync + rename + directory fsync
+    root = temp_dir()
+    directory = os.path.join(root, "spool")
+    queue = sp.Spool(directory, clock=lambda: 1700000000.0,
+                     file_bytes=1200, max_files=3).open()
+    calls = {"n": 0}
+    real_fsync_dir = sp._fsync_dir
+
+    def counting_fsync_dir(path):
+        calls["n"] += 1
+        return real_fsync_dir(path)
+
+    sp._fsync_dir = counting_fsync_dir
+    try:
+        for index in range(4):
+            queue.append("office-sg-isp-a", RUN, index + 1,
+                         pl.encode_sample(_sample(index + 1)),
+                         queued_epoch=1700000000.0)
+    finally:
+        sp._fsync_dir = real_fsync_dir
+    rotated = glob.glob(os.path.join(directory, "spool.jsonl.*"))
+    out["rotation_fsyncs_directory"] = bool(rotated) and calls["n"] >= 1
+    out["rotation_fsyncs_the_file_before_renaming"] = (
+        len(glob.glob(os.path.join(directory, "spool.jsonl.*"))) >= 1)
+    queue.close()
+    # a failed FILE fsync during rotation must fail closed, not be swallowed
+    real_os_fsync = sp.os.fsync
+    boom = {"armed": True}
+
+    def failing_fsync(fd):
+        if boom["armed"]:
+            raise OSError("fsync refused")
+        return real_os_fsync(fd)
+
+    sp.os.fsync = failing_fsync
+    try:
+        try:
+            queue2 = sp.Spool(directory, clock=lambda: 1700000000.0,
+                              file_bytes=1, max_files=3).open()
+            queue2.append("office-sg-isp-a", RUN, 1, pl.encode_sample(_sample(1)),
+                          queued_epoch=1700000000.0)
+            out["rotation_file_fsync_failure_fails_closed"] = False
+        except (sp.SpoolError, OSError):
+            out["rotation_file_fsync_failure_fails_closed"] = True
+    finally:
+        sp.os.fsync = real_os_fsync
+        boom["armed"] = False
+    clean(root)
+    # an unsafe rotated SOURCE is refused and never renamed
+    root = temp_dir()
+    directory = os.path.join(root, "spool")
+    if hasattr(os, "symlink"):
+        queue = sp.Spool(directory, clock=lambda: 1700000000.0,
+                         file_bytes=1200, max_files=3).open()
+        queue.append("office-sg-isp-a", RUN, 1, pl.encode_sample(_sample(1)),
+                     queued_epoch=1700000000.0)
+        queue.close()
+        link = os.path.join(directory, "spool.jsonl.1")
+        try:
+            os.symlink(os.path.join(directory, "absent"), link)
+            rotated_source = os.path.join(directory, "spool.jsonl")
+            raised = None
+            try:
+                queue3 = sp.Spool(directory, clock=lambda: 1700000000.0,
+                                  file_bytes=1, max_files=3).open()
+                queue3.append("office-sg-isp-a", RUN, 2,
+                              pl.encode_sample(_sample(2)),
+                              queued_epoch=1700000000.0)
+            except Exception as exc:  # noqa: BLE001
+                raised = type(exc).__name__
+            out["unsafe_rotated_source_is_not_renamed"] = (
+                raised is not None
+                and os.path.islink(link)
+                and os.path.lexists(rotated_source))
+        except (OSError, NotImplementedError, AttributeError):
+            out["unsafe_rotated_source_is_not_renamed"] = True
+    else:
+        out["unsafe_rotated_source_is_not_renamed"] = True
+    clean(root)
+    # ---- R3: unsafe objects anywhere in the chain fail closed
+    root = temp_dir()
+    directory = os.path.join(root, "spool")
+    seed = sp.Spool(directory, clock=lambda: 1700000000.0).open()
+    seed.append("office-sg-isp-a", RUN, 1, pl.encode_sample(_sample(1)),
+                queued_epoch=1700000000.0)
+    seed.close()
+    rotated = os.path.join(directory, "spool.jsonl.1")
+    if hasattr(os, "symlink"):
+        try:
+            os.symlink(os.path.join(directory, "absent"), rotated)
+            try:
+                sp.Spool(directory, clock=lambda: 1700000000.0).open()
+                out["rotated_symlink_fails_closed"] = False
+            except sp.SpoolError:
+                out["rotated_symlink_fails_closed"] = True
+            os.unlink(rotated)
+        except (OSError, NotImplementedError, AttributeError):
+            out["rotated_symlink_fails_closed"] = True
+    else:
+        out["rotated_symlink_fails_closed"] = True
+    if hasattr(os, "mkfifo"):
+        os.mkfifo(rotated)
+    else:
+        os.mkdir(rotated)
+    try:
+        sp.Spool(directory, clock=lambda: 1700000000.0).open()
+        out["rotated_special_file_fails_closed"] = False
+    except sp.SpoolError:
+        out["rotated_special_file_fails_closed"] = True
+    if os.path.isdir(rotated):
+        os.rmdir(rotated)
+    else:
+        os.unlink(rotated)
+    clean(root)
+    # a SPECIAL state file must be refused WITHOUT BLOCKING (a FIFO opened
+    # O_RDONLY would hang forever otherwise). Runs in a worker with a hard
+    # timeout so a hang is a FAIL, not a stuck suite.
+    root = temp_dir()
+    directory = os.path.join(root, "spool")
+    os.makedirs(directory, exist_ok=True)
+    if hasattr(os, "mkfifo"):
+        os.mkfifo(os.path.join(directory, "spool.state.json"))
+    else:
+        os.mkdir(os.path.join(directory, "spool.state.json"))
+    result = {}
+
+    def attempt_state_open():
+        try:
+            sp.Spool(directory, clock=lambda: 1700000000.0).open()
+            result["outcome"] = "opened"
+        except sp.SpoolError:
+            result["outcome"] = "refused"
+        except OSError:
+            result["outcome"] = "refused"
+
+    worker = threading.Thread(target=attempt_state_open, daemon=True)
+    worker.start()
+    worker.join(10.0)
+    out["state_special_file_fails_closed_without_blocking"] = (
+        not worker.is_alive() and result.get("outcome") == "refused")
+    clean(root)
+    # ---- R4: the baseline file follows the same storage discipline
+    root = temp_dir()
+    directory = os.path.join(root, "spool")
+    os.makedirs(directory, exist_ok=True)
+    instance, _t = build_agent(config_over={"spool_dir": directory})
+    baseline_path = instance._baseline_path()
+    if hasattr(os, "symlink"):
+        try:
+            os.symlink(os.path.join(directory, "absent"), baseline_path)
+            raised = None
+            try:
+                instance.open()
+            except Exception as exc:  # noqa: BLE001
+                raised = type(exc).__name__
+            out["baseline_symlink_refused"] = raised is not None
+            os.unlink(baseline_path)
+        except (OSError, NotImplementedError, AttributeError):
+            out["baseline_symlink_refused"] = True
+    else:
+        out["baseline_symlink_refused"] = True
+    clean(root)
+    root = temp_dir()
+    directory = os.path.join(root, "spool")
+    os.makedirs(directory, exist_ok=True)
+    instance, _t = build_agent(config_over={"spool_dir": directory})
+    os.mkdir(instance._baseline_path())
+    result = {}
+
+    def attempt_baseline_open():
+        try:
+            instance.open()
+            result["outcome"] = "opened"
+        except (ag.ConfigError, sp.SpoolError, OSError):
+            result["outcome"] = "refused"
+
+    worker = threading.Thread(target=attempt_baseline_open, daemon=True)
+    worker.start()
+    worker.join(10.0)
+    out["baseline_special_file_refused_without_hang"] = (
+        not worker.is_alive() and result.get("outcome") == "refused")
+    clean(root)
+    # a failed durable write must NOT advance the in-memory baseline
+    root = temp_dir()
+    instance, _t = build_agent()
+    try:
+        instance.open()
+        instance._baseline = IP_A
+        instance._pending_baseline = IP_B
+        instance._write_baseline = _boom_write
+        instance._commit_baseline()
+        out["baseline_write_failure_does_not_advance_memory_baseline"] = (
+            instance._baseline == IP_A
+            and instance._pending_baseline == IP_B
+            and instance.baseline_write_failures == 1
+            and instance.last_status == ag.STATUS_DEGRADED)
+        # ... and the durable commit path fsyncs the directory
+        calls = {"n": 0}
+        real_fsync_dir = instance._fsync_directory
+
+        def counting():
+            calls["n"] += 1
+            return real_fsync_dir()
+
+        instance._fsync_directory = counting
+        instance._write_baseline = _real_write(instance)
+        instance._commit_baseline()
+        out["baseline_commit_directory_is_fsynced"] = (
+            calls["n"] >= 1 and instance._baseline == IP_B
+            and instance._pending_baseline is None)
+    finally:
+        instance.close()
+        clean(instance.config.spool_dir)
+    # ---- R5: every request refreshes its own signed transport timestamp
+    root = temp_dir()
+    directory = os.path.join(root, "spool")
+    clock = [1700000000.0]
+    queue = sp.Spool(directory, clock=lambda: clock[0]).open()
+    for index in range(2):
+        queue.append("office-sg-isp-a", RUN, index + 1,
+                     pl.encode_sample(_sample(index + 1)),
+                     queued_epoch=clock[0])
+    poster = FakePoster()
+    sent = [1700000000.0]
+
+    def advancing_clock():
+        value = sent[0]
+        sent[0] += 400.0          # each send moves the wall clock > 300 s
+        return value
+
+    dl.deliver_pending(queue, SECRET, "office-sg-isp-a", poster,
+                       clock=advancing_clock)
+    epochs = [int(request["headers"]["X-Remote-Probe-Sent-Epoch"])
+              for request in poster.requests]
+    verified = []
+    for request in poster.requests:
+        verified.append(pl.verify_signature(
+            SECRET, request["headers"]["X-Remote-Probe-Id"],
+            int(request["headers"]["X-Remote-Probe-Sent-Epoch"]),
+            request["headers"]["X-Remote-Probe-Run"],
+            int(request["headers"]["X-Remote-Probe-Seq"]),
+            request["body"],
+            request["headers"]["X-Remote-Probe-Signature"]))
+    out["each_delivery_request_refreshes_sent_epoch"] = (
+        len(poster.requests) == 2 and epochs == [1700000000, 1700000400]
+        and all(verified))
+    queue.close()
+    clean(root)
+    # ---- R6: the Mihomo secret and the ingest secret are never reused
+    same_file = os.path.join(temp_dir(), "shared.key")
+    with open(same_file, "w", encoding="utf-8") as handle:
+        handle.write(SECRET_TEXT)
+    try:
+        ag.AgentConfig.from_mapping({
+            "probe_id": "office-sg-isp-a",
+            "ingest_url": "https://monitor.example.net" + rp.INGEST_PATH,
+            "spool_dir": os.path.join(temp_dir(), "spool"),
+            "ingest_secret_file": same_file,
+            "mihomo_url": LOOPBACK_URL,
+            "mihomo_secret_file": same_file,
+            "reality_node": "office-reality-01",
+            "hy2_node": "office-hy2-01",
+            "dns_host": "www.cloudflare.com",
+            "https_host": "www.cloudflare.com",
+            "egress_host": "api.ipify.org",
+            "vps_host": "vps.example.net",
+        })
+        out["mihomo_and_ingest_secret_reuse_is_refused"] = False
+    except ag.ConfigError:
+        out["mihomo_and_ingest_secret_reuse_is_refused"] = True
+    clean(os.path.dirname(same_file))
+    # ... and the same MATERIAL under two different files is refused too
+    root = temp_dir()
+    ingest_file = os.path.join(root, "ingest.key")
+    with open(ingest_file, "w", encoding="utf-8") as handle:
+        handle.write(SECRET_TEXT)
+    instance, _t = build_agent(
+        config_over={"ingest_secret_file": ingest_file})
+    # The Mihomo controller secret is the SAME material as the ingest secret:
+    # the agent must refuse to activate (issue #67 §5).
+    instance.mihomo.secret = SECRET_TEXT
+    raised = None
+    try:
+        instance.open()
+    except Exception as exc:  # noqa: BLE001
+        raised = type(exc).__name__
+    out["identical_secret_material_is_refused"] = raised is not None
+    clean(root)
+    clean(instance.config.spool_dir)
 
     return out
 

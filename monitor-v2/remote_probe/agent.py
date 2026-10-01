@@ -32,6 +32,7 @@ from . import mihomo_probe as mp
 from .delivery import (deliver_pending, next_retry_delay)
 from .evidence import active_entry, merge_evidence, passive_entry
 from .payload import encode_sample, valid_probe_id
+from . import spool as sp
 from .spool import RETENTION_INTERVAL_SECONDS, Spool, SpoolError
 
 BASELINE_FILE = "egress.baseline.json"
@@ -92,6 +93,17 @@ class AgentConfig:
                  diagnostic_timeout=DELAY_TIMEOUT_SECONDS):
         if not valid_probe_id(probe_id):
             raise ConfigError("probe_id grammar [a-z0-9-]{1,64}")
+        if mihomo_secret_file and ingest_secret_file:
+            try:
+                same = (os.path.realpath(mihomo_secret_file)
+                        == os.path.realpath(ingest_secret_file))
+            except OSError:
+                same = False
+            if same:
+                # Issue #67 §5: "Mihomo and ingest secrets are never reused."
+                raise ConfigError(
+                    "mihomo_secret_file and ingest_secret_file must be "
+                    "different files: the secrets are never reused")
         self.probe_id = probe_id
         self.ingest_url = ingest_url
         self.spool_dir = spool_dir
@@ -196,6 +208,7 @@ class RemoteProbeAgent:
         self.retention_runs = 0
         self.retention_failures = 0
         self.last_backoff_seconds = 0.0
+        self.baseline_write_failures = 0
         self._last_sample_epoch = None
         self.cycles = 0
         self.cycle_failures = 0
@@ -219,17 +232,44 @@ class RemoteProbeAgent:
     # -- lifecycle ----------------------------------------------------------
 
     def open(self):
+        """Validate storage, take the writer lock, enforce the bounds ONCE at
+        startup, load the secrets and open a fresh run.
+
+        Startup retention is FAIL-CLOSED: an agent that cannot enforce its own
+        storage bounds must not become sampleable or deliverable (waiting an
+        hour for the next attempt is not a guarantee), so a failed startup pass
+        releases the writer lock and raises a sanitized error instead of
+        producing a half-working agent. The same handler releases the lock when
+        the baseline file or the secrets are refused.
+        """
         self.spool.open()
-        self._read_baseline()
-        # Retention runs at startup (issue #67 §5 bounds apply from the first
-        # moment this process owns the directory) and then periodically.
-        self._run_retention()
+        try:
+            self._read_baseline()
+            if not self._run_retention():
+                raise SpoolError("startup retention failed")
+            self._ingest_secret = self._secret_loader(
+                self.config.ingest_secret_file)
+            self._assert_secrets_are_distinct()
+        except BaseException:
+            self.spool.close()      # no half-open agent, no held lock
+            raise
         self._next_retention_at = (self.monotonic()
                                    + RETENTION_INTERVAL_SECONDS)
-        self._ingest_secret = self._secret_loader(
-            self.config.ingest_secret_file)
         self._start_run()
         return self
+
+    def _assert_secrets_are_distinct(self):
+        """Issue #67 §5: the Mihomo secret and the ingest secret are never
+        reused. Only a boolean comparison is ever made; no secret is printed."""
+        mihomo = getattr(self.mihomo, "secret", "") or ""
+        ingest = self._ingest_secret
+        if not mihomo or ingest is None:
+            return
+        text = mihomo.strip()
+        if text.encode("utf-8") == ingest or text == ingest.hex():
+            raise ConfigError(
+                "the Mihomo secret and the ingest secret must not be the "
+                "same material")
 
     def _start_run(self):
         """One fresh random 128-bit run per process (and per rollback)."""
@@ -450,7 +490,7 @@ class RemoteProbeAgent:
                         self._delivery_resume_at - now}
         summary = deliver_pending(self.spool, self._ingest_secret,
                                   self.config.probe_id, self._poster,
-                                  int(self.clock()), jitter=self._jitter)
+                                  clock=self.clock, jitter=self._jitter)
         retry_after = float(summary.get("retry_after") or 0.0)
         self.last_backoff_seconds = retry_after
         self._delivery_resume_at = (self.monotonic() + retry_after
@@ -462,8 +502,14 @@ class RemoteProbeAgent:
         that carries it is durable)."""
         if self._pending_baseline is None:
             return
-        self._baseline = self._pending_baseline
-        self._write_baseline(self._baseline)
+        candidate = self._pending_baseline
+        try:
+            self._write_baseline(candidate)      # durable FIRST
+        except (SpoolError, OSError):
+            self.baseline_write_failures += 1
+            self.last_status = STATUS_DEGRADED
+            return                               # memory NOT advanced
+        self._baseline = candidate               # only after the write landed
         self._pending_baseline = None
 
     def _run_retention(self):
@@ -502,30 +548,60 @@ class RemoteProbeAgent:
         return os.path.join(self.config.spool_dir, BASELINE_FILE)
 
     def _read_baseline(self):
+        """Bounded, no-follow, regular-file read of the agent-owned baseline.
+
+        A symlink or special object here is REFUSED (it is our own state,
+        exactly like the spool); undecodable CONTENT is only "no baseline",
+        which is not a storage hazard.
+        """
         path = self._baseline_path()
-        if not os.path.exists(path) or os.path.islink(path):
+        if not os.path.lexists(path):
             return
+        raw = sp.read_restricted(path, 4096)
         try:
-            with open(path, "rb") as handle:
-                payload = json.loads(handle.read(4096).decode("utf-8"))
-        except (OSError, ValueError, UnicodeDecodeError):
+            payload = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
             return
         if isinstance(payload, dict):
             self._baseline = dp.canonical_global_ip(payload.get("ip"))
 
     def _write_baseline(self, ip):
+        """Durably persist the committed baseline.
+
+        The same storage discipline as the spool: a restricted temp file
+        (regular, no-follow, 0600), a complete write loop, a file fsync, the
+        rename, and then a DIRECTORY fsync so the new name is durable. Any
+        failure raises and the caller degrades -- the in-memory baseline is
+        advanced only after this returns.
+        """
         path = self._baseline_path()
         tmp = path + ".tmp"
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC \
-            | getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(tmp, flags, 0o600)
+        payload = json.dumps({"v": 1, "ip": ip},
+                             sort_keys=True).encode("utf-8")
+        fd = sp.open_restricted(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
         try:
-            os.write(fd, json.dumps({"v": 1, "ip": ip},
-                                    sort_keys=True).encode("utf-8"))
+            view = memoryview(payload)
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    raise SpoolError("short write")
+                view = view[written:]
             os.fsync(fd)
         finally:
             os.close(fd)
         os.replace(tmp, path)
+        self._fsync_directory()
+
+    def _fsync_directory(self):
+        """fsync the spool directory (POSIX) so the rename is durable."""
+        if os.name != "posix":
+            return
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        fd = os.open(self.config.spool_dir, flags)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
     # -- status -------------------------------------------------------------
 
@@ -548,6 +624,7 @@ class RemoteProbeAgent:
             "retention_failures": self.retention_failures,
             "delivery_deferrals": self.delivery_deferrals,
             "last_backoff_seconds": self.last_backoff_seconds,
+            "baseline_write_failures": self.baseline_write_failures,
             "state": self.last_status,
             "active": dict(self.last_active),
             "spool": spool_status,

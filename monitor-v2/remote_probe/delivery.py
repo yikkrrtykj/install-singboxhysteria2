@@ -202,8 +202,9 @@ def sign_record(secret, probe_id, run, seq, body, sent_epoch):
     return headers(probe_id, sent_epoch, run, seq, signature)
 
 
-def deliver_pending(spool, secret, probe_id, poster, now_epoch, limit=None,
-                    jitter=None, max_unknown_attempts=UNKNOWN_RESPONSE_MAX_ATTEMPTS):
+def deliver_pending(spool, secret, probe_id, poster, now_epoch=None, limit=None,
+                    jitter=None, max_unknown_attempts=UNKNOWN_RESPONSE_MAX_ATTEMPTS,
+                    clock=None):
     """Drain the spool in order against ``poster``.
 
     ``poster(body, header_map) -> (status, response_body)`` is injected, so
@@ -224,6 +225,14 @@ def deliver_pending(spool, secret, probe_id, poster, now_epoch, limit=None,
 
     Every terminal record is resolved exactly once.
     """
+    if clock is None:
+        # A caller that pins one scalar keeps the old behaviour; the agent
+        # passes its own clock so every request gets FRESH transport freshness.
+        pinned = int(now_epoch if now_epoch is not None else __import__("time").time())
+
+        def clock():
+            return pinned
+
     summary = {"acked": 0, "quarantined": 0, "retries": 0, "attempts": 0,
                "stopped": None, "retry_after": 0.0}
     for record in spool.pending():
@@ -231,8 +240,11 @@ def deliver_pending(spool, secret, probe_id, poster, now_epoch, limit=None,
             break
         summary["attempts"] += 1
         record_id = record["record_id"]
+        # FRESH PER REQUEST: a long backlog pass may outlive the +/-300 s
+        # freshness window, so sent_epoch is read immediately before THIS send
+        # (the body bytes and the (probe_id, run, seq) identity are unchanged).
         header_map = sign_record(secret, probe_id, record["run"],
-                                 record["seq"], record["body"], now_epoch)
+                                 record["seq"], record["body"], clock())
         try:
             status, response_body = poster(record["body"], header_map)
         except Exception as exc:  # noqa: BLE001 -- any transport failure
