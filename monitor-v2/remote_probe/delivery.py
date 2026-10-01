@@ -29,11 +29,15 @@ from . import INGEST_PATH, MAX_BODY_BYTES
 from .payload import headers, sign
 from .spool import (QUARANTINE_CLIENT_ERROR, QUARANTINE_MALFORMED_2XX,
                     QUARANTINE_OVERSIZE, QUARANTINE_REDIRECT,
-                    QUARANTINE_UNKNOWN_RESPONSE)
+                    QUARANTINE_UNKNOWN_RESPONSE, SpoolError)
 
 ACK = "ack"
 RETRY = "retry"
 PERMANENT = "permanent"
+
+# A retry count that could not be persisted is NOT a consumed attempt: the
+# pass stops with this closed reason instead of reporting progress.
+RETRY_STATE_NOT_DURABLE = "retry_state_not_durable"
 
 # Backoff: bounded exponential. Deterministic when a jitter source is injected.
 BACKOFF_BASE_SECONDS = 1.0
@@ -235,6 +239,22 @@ def deliver_pending(spool, secret, probe_id, poster, now_epoch=None, limit=None,
 
     summary = {"acked": 0, "quarantined": 0, "retries": 0, "attempts": 0,
                "stopped": None, "retry_after": 0.0}
+
+    def note(record_id):
+        """Charge one attempt against the DURABLE budget, or report that the
+        count could not be persisted. ``None`` means no progress was made."""
+        try:
+            return spool.note_attempt(record_id)
+        except (SpoolError, OSError):
+            return None
+
+    def stop_undurable():
+        """A non-durable attempt stops the pass: nothing is claimed as sent,
+        nothing is charged, and the record stays queued."""
+        summary["stopped"] = RETRY_STATE_NOT_DURABLE
+        summary["retry_after"] = backoff_delay(1, jitter=jitter)
+        return summary
+
     for record in spool.pending():
         if limit is not None and summary["attempts"] >= limit:
             break
@@ -248,11 +268,13 @@ def deliver_pending(spool, secret, probe_id, poster, now_epoch=None, limit=None,
         try:
             status, response_body = poster(record["body"], header_map)
         except Exception as exc:  # noqa: BLE001 -- any transport failure
-            summary["attempt"] = spool.note_attempt(record_id)
+            attempt = note(record_id)
+            if attempt is None:
+                return stop_undurable()
+            summary["attempt"] = attempt
             summary["retries"] += 1
             summary["stopped"] = type(exc).__name__
-            summary["retry_after"] = backoff_delay(summary["attempt"],
-                                                   jitter=jitter)
+            summary["retry_after"] = backoff_delay(attempt, jitter=jitter)
             return summary
         disposition, token = classify_response(status, response_body)
         if disposition == ACK:
@@ -261,7 +283,9 @@ def deliver_pending(spool, secret, probe_id, poster, now_epoch=None, limit=None,
             continue
         if disposition == PERMANENT:
             if token == QUARANTINE_UNKNOWN_RESPONSE:
-                count = spool.note_attempt(record_id)
+                count = note(record_id)
+                if count is None:
+                    return stop_undurable()
                 if count < max_unknown_attempts:
                     summary["attempt"] = count
                     summary["retries"] += 1
@@ -271,11 +295,16 @@ def deliver_pending(spool, secret, probe_id, poster, now_epoch=None, limit=None,
             spool.resolve(record_id, quarantine_token=token)
             summary["quarantined"] += 1
             continue
-        summary["attempt"] = spool.note_attempt(record_id)
+        attempt = note(record_id)
+        if attempt is None:
+            # The record is NOT resolved: an un-chargeable attempt must never
+            # leave a terminal state behind (no poison head from a failed
+            # persistence).
+            return stop_undurable()
+        summary["attempt"] = attempt
         summary["retries"] += 1
         summary["stopped"] = "retryable"
-        summary["retry_after"] = backoff_delay(summary["attempt"],
-                                               jitter=jitter)
+        summary["retry_after"] = backoff_delay(attempt, jitter=jitter)
         return summary
     return summary
 

@@ -29,6 +29,7 @@ from . import (CADENCE_DEFAULT_SECONDS, CADENCE_MIN_SECONDS,
                OUTCOME_UNAVAILABLE, ROLES, ROLE_HY2, ROLE_REALITY, SEQ_MIN)
 from . import direct_probe as dp
 from . import mihomo_probe as mp
+from . import delivery as dl
 from .delivery import (deliver_pending, next_retry_delay)
 from .evidence import active_entry, merge_evidence, passive_entry
 from .payload import encode_sample, valid_probe_id
@@ -491,6 +492,12 @@ class RemoteProbeAgent:
         summary = deliver_pending(self.spool, self._ingest_secret,
                                   self.config.probe_id, self._poster,
                                   clock=self.clock, jitter=self._jitter)
+        if summary.get("stopped") == dl.RETRY_STATE_NOT_DURABLE:
+            # Storage could not make the retry count durable, so no progress
+            # was charged. Degrade the plane instead of reporting a normal
+            # backoff: the next cycle retries the same record.
+            self.cycle_failures += 1
+            self.last_status = STATUS_DEGRADED
         retry_after = float(summary.get("retry_after") or 0.0)
         self.last_backoff_seconds = retry_after
         self._delivery_resume_at = (self.monotonic() + retry_after
@@ -589,6 +596,10 @@ class RemoteProbeAgent:
             os.fsync(fd)
         finally:
             os.close(fd)
+        # The publish target is our OWN state: a symlink or special object
+        # sitting at the baseline path must fail the commit, exactly like an
+        # unsafe chain member, rather than be written through.
+        sp.assert_safe_regular(path, "egress baseline")
         os.replace(tmp, path)
         self._fsync_directory()
 

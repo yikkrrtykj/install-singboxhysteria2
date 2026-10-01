@@ -182,6 +182,28 @@ def read_restricted(path, limit):
         os.close(fd)
 
 
+def assert_safe_regular(path, what="chain member"):
+    """REFUSE an existing path that is not a regular, non-symlink file.
+
+    The ONE choke point for "our own storage is what it claims to be": the
+    record chain, the rotation targets and the agent's own baseline all call
+    it, so no caller can invent a weaker check. ABSENT is not an error -- the
+    caller decides whether a missing path is acceptable -- but an existing
+    path that cannot even be stat'ed is fail-closed, never skipped.
+    """
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise SpoolError("%s unstatable: %s"
+                         % (what, type(exc).__name__)) from None
+    if stat_module.S_ISLNK(st.st_mode):
+        raise SpoolError("%s must not be a symlink" % what)
+    if not stat_module.S_ISREG(st.st_mode):
+        raise SpoolError("%s must be a regular file" % what)
+
+
 class _InstanceLock:
     """Advisory exclusive lock over one spool directory (single writer)."""
 
@@ -316,17 +338,7 @@ class Spool:
         """EVERY existing chain member must be a regular, non-symlink file: an
         unsafe rotated object is refused fail-closed, never skipped (a skip
         would make the queue look complete while records hide behind it)."""
-        try:
-            st = os.lstat(path)
-        except FileNotFoundError:
-            return
-        except OSError as exc:
-            raise SpoolError("record chain member unstatable: %s"
-                             % type(exc).__name__) from None
-        if stat_module.S_ISLNK(st.st_mode):
-            raise SpoolError("record chain member must not be a symlink")
-        if not stat_module.S_ISREG(st.st_mode):
-            raise SpoolError("record chain member must be a regular file")
+        assert_safe_regular(path, "record chain member")
 
     def _read_chain_member(self, path):
         """Read one chain member.
@@ -427,12 +439,10 @@ class Spool:
         seen = set()
         last = 0
         for path in self._record_paths():
-            if not os.path.lexists(path):
-                continue
-            try:
-                data = read_restricted(path, self.file_bytes * 4)
-            except (SpoolError, OSError):
-                continue
+            # An EXISTING member that cannot be read is fail-closed, never
+            # skipped: a skip makes the queue look complete while records
+            # hide behind an unreadable file. ABSENT reads as empty.
+            data = self._read_chain_member(path)
             for line in data.splitlines():
                 if not line:
                     continue
@@ -491,12 +501,10 @@ class Spool:
         path = os.path.join(self.directory, SPOOL_FILE)
         if not os.path.lexists(path):
             return 0
-        try:
-            data = read_restricted(path, self.file_bytes * 4)
-        except SpoolError:
-            raise
-        except OSError:
-            return 0
+        # An EXISTING current file that cannot be read is NOT "nothing to
+        # repair": a plain I/O failure here means the queue is unreadable and
+        # the caller has to hear about it.
+        data = self._read_chain_member(path)
         if not data:
             return 0
         last_newline = data.rfind(NL)
@@ -573,8 +581,25 @@ class Spool:
         finally:
             os.close(fd)
 
+    def _preflight_chain(self):
+        """Validate EVERY existing chain member BEFORE the rotation mutates
+        anything.
+
+        Validating the source of one rename is not enough: the RENAMED-OVER
+        target is also our storage, and discovering an unsafe target halfway
+        through an oldest-outward shift would leave the chain half-mutated
+        (some members already renamed, the unsafe one still in place). So the
+        whole chain -- current and every rotated slot -- is checked first; any
+        unsafe member fails the entire rotation with nothing touched.
+        """
+        base = os.path.join(self.directory, SPOOL_FILE)
+        for index in range(self.max_files, 0, -1):
+            self._assert_chain_member_safe("%s.%d" % (base, index))
+        self._assert_chain_member_safe(base)
+
     def _rotate(self):
         """Shift the chain oldest-outward with fsync + rename + dir fsync."""
+        self._preflight_chain()
         base = os.path.join(self.directory, SPOOL_FILE)
         for index in range(self.max_files - 1, 0, -1):
             source = "%s.%d" % (base, index)
@@ -625,16 +650,35 @@ class Spool:
         return int(self._state["retry_attempts"].get(str(int(record_id)), 0))
 
     def note_attempt(self, record_id):
-        """Count one delivery attempt, durably enough that a restart cannot
-        reset the retry budget."""
+        """Count one delivery attempt DURABLY, before delivery may proceed.
+
+        ``next_record_id`` can be recovered by reconciling the durable
+        records; a retry count cannot. A soft save that failed would let a
+        restart start the same bounded budget from zero, so this save is HARD:
+        on failure the in-memory count is rolled back and ``SpoolError`` is
+        raised, leaving the last durable value as the only truth -- an attempt
+        that was never persisted is never charged against the budget.
+        """
         key = str(int(record_id))
-        value = int(self._state["retry_attempts"].get(key, 0)) + 1
+        previous = self._state["retry_attempts"].get(key)
+        previous_table = dict(self._state["retry_attempts"])
+        value = int(previous or 0) + 1
         self._state["retry_attempts"][key] = value
         if len(self._state["retry_attempts"]) > MAX_TRACKED_RETRIES:
             self._state["retry_attempts"] = dict(
                 list(self._state["retry_attempts"].items())
                 [-MAX_TRACKED_RETRIES:])
-        self._save_state_soft()
+        try:
+            self._save_state()          # HARD: the count is durable or nothing
+        except (SpoolError, OSError):
+            # Roll the in-memory count back so the DURABLE value stays the
+            # only truth, and refuse. An attempt that was never persisted must
+            # not be charged against a bounded budget: the caller has to hear
+            # that delivery cannot proceed rather than silently consume it.
+            self._state["retry_attempts"] = previous_table
+            self._state["state_save_failures"] = int(
+                self._state["state_save_failures"]) + 1
+            raise SpoolError("retry attempt count is not durable") from None
         return value
 
     def resolve(self, record_id, quarantine_token=None):

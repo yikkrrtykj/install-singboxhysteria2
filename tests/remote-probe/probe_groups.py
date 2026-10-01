@@ -1902,13 +1902,188 @@ def group_resilience():
     clean(root)
     clean(instance.config.spool_dir)
 
+    # ---- F1a: an EXISTING chain member that cannot be READ is fail-closed.
+    #      The fault is injected into read_restricted() itself, so what is
+    #      under test is the I/O failure -- not the symlink/special shape.
+    root = temp_dir()
+    directory = os.path.join(root, "spool")
+    queue = sp.Spool(directory, clock=lambda: 1700000000.0,
+                     file_bytes=1200, max_files=2).open()
+    queue.append("office-sg-isp-a", RUN, 1, pl.encode_sample(_sample(1)),
+                 queued_epoch=1700000000.0)
+    queue.append("office-sg-isp-a", RUN, 2, pl.encode_sample(_sample(2)),
+                 queued_epoch=1700000000.0)
+    queue.close()
+    rotated_member = os.path.join(directory, sp.SPOOL_FILE + ".1")
+    queue = sp.Spool(directory, clock=lambda: 1700000000.0,
+                     file_bytes=1200, max_files=2).open()
+    healthy = len(list(queue.pending()))
+    real_read = sp.read_restricted
+
+    def failing_member_read(path, limit):
+        if os.path.basename(path) == sp.SPOOL_FILE + ".1":
+            raise OSError("I/O error")
+        return real_read(path, limit)
+
+    sp.read_restricted = failing_member_read
+    raised = False
+    hidden = None
+    try:
+        try:
+            hidden = len(list(queue.pending()))
+        except (sp.SpoolError, OSError):
+            raised = True
+    finally:
+        sp.read_restricted = real_read
+    out["existing_chain_read_failure_fails_closed"] = (
+        os.path.lexists(rotated_member)
+        and healthy >= 1          # the member really held records
+        and raised                # ... and its failure was reported
+        and hidden is None)       # ... never silently hidden
+    queue.close()
+    clean(root)
+    # ---- F1b: an EXISTING CURRENT file that cannot be read is not "nothing
+    #      to repair". The fault is armed on the FIRST read of the current
+    #      file during open, which is the tail repair's own read; the scans
+    #      that follow read the same file successfully, so this pins the
+    #      repair path and not the earlier scan.
+    root = temp_dir()
+    directory = os.path.join(root, "spool")
+    queue = sp.Spool(directory, clock=lambda: 1700000000.0).open()
+    queue.append("office-sg-isp-a", RUN, 1, pl.encode_sample(_sample(1)),
+                 queued_epoch=1700000000.0)
+    queue.close()
+    current_member = os.path.join(directory, sp.SPOOL_FILE)
+    with open(current_member, "ab") as handle:
+        handle.write(b'{"torn":')          # an incomplete trailing fragment
+    real_read = sp.read_restricted
+    reads = {"n": 0}
+
+    def failing_first_current_read(path, limit):
+        if os.path.basename(path) == sp.SPOOL_FILE:
+            reads["n"] += 1
+            if reads["n"] == 1:
+                raise OSError("I/O error")
+        return real_read(path, limit)
+
+    sp.read_restricted = failing_first_current_read
+    raised = False
+    try:
+        try:
+            sp.Spool(directory, clock=lambda: 1700000000.0).open().close()
+        except (sp.SpoolError, OSError):
+            raised = True
+    finally:
+        sp.read_restricted = real_read
+    out["current_tail_read_failure_fails_closed"] = (
+        raised and reads["n"] >= 1 and os.path.lexists(current_member))
+    clean(root)
+    # ---- F2: a retry count that cannot be PERSISTED is not a consumed
+    #      attempt. No progress is claimed, the durable value survives a
+    #      restart, and the same budget resumes once storage works again.
+    root = temp_dir()
+    directory = os.path.join(root, "spool")
+    queue = sp.Spool(directory, clock=lambda: 1700000000.0).open()
+    queue.append("office-sg-isp-a", RUN, 1, pl.encode_sample(_sample(1)),
+                 queued_epoch=1700000000.0)
+    first_attempt = queue.note_attempt(1)      # durable attempt #1
+    real_save = sp.Spool._save_state
+
+    def refusing_save(self):
+        raise sp.SpoolError("state save refused")
+
+    sp.Spool._save_state = refusing_save
+    refused = False
+    try:
+        try:
+            queue.note_attempt(1)
+        except (sp.SpoolError, OSError):
+            refused = True
+        poster = FakePoster([(503, b"")] * 3)
+        summary = dl.deliver_pending(queue, SECRET, "office-sg-isp-a", poster)
+        posted = len(poster.requests)
+    finally:
+        sp.Spool._save_state = real_save
+    out["retry_attempt_state_save_failure_fails_closed"] = (
+        first_attempt == 1 and refused
+        and summary["stopped"] == "retry_state_not_durable"
+        and summary["retries"] == 0
+        and "attempt" not in summary
+        and posted >= 1
+        and queue.attempts(1) == 1           # memory rolled back
+        # ... and the record is STILL pending: a failed persistence never
+        # leaves a terminal (acked/quarantined) state behind, so no poison
+        # head can come out of it.
+        and any(item["record_id"] == 1 for item in queue.pending()))
+    queue.close()
+    reopened = sp.Spool(directory, clock=lambda: 1700000000.0).open()
+    out["retry_attempt_budget_survives_a_restart"] = reopened.attempts(1) == 1
+    out["retry_attempt_advances_once_storage_recovers"] = (
+        reopened.note_attempt(1) == 2)
+    reopened.close()
+    clean(root)
+    # ---- F3: an unsafe rotation TARGET fails the WHOLE rotation before any
+    #      mutation. The unsafe object appears while the queue is OPEN (so
+    #      open's own chain validation cannot be what refuses it), and a SAFE
+    #      member sits in a higher slot: a per-rename check would already have
+    #      shifted it -- a half-mutated chain -- by the time the unsafe target
+    #      was reached.
+    root = temp_dir()
+    directory = os.path.join(root, "spool")
+    queue = sp.Spool(directory, clock=lambda: 1700000000.0,
+                     file_bytes=1200, max_files=3).open()
+    queue.append("office-sg-isp-a", RUN, 1, pl.encode_sample(_sample(1)),
+                 queued_epoch=1700000000.0)
+    base_member = os.path.join(directory, sp.SPOOL_FILE)
+    unsafe_target = os.path.join(directory, sp.SPOOL_FILE + ".1")
+    safe_higher = os.path.join(directory, sp.SPOOL_FILE + ".2")
+    shifted = os.path.join(directory, sp.SPOOL_FILE + ".3")
+    planted = open(base_member, "rb").read()
+    with open(safe_higher, "wb") as handle:
+        handle.write(planted)              # a safe member in a higher slot
+    if hasattr(os, "mkfifo"):
+        os.mkfifo(unsafe_target)
+    else:
+        os.mkdir(unsafe_target)            # any special object will do
+    raised = False
+    try:
+        try:
+            queue.append("office-sg-isp-a", RUN, 2,
+                         pl.encode_sample(_sample(2)),
+                         queued_epoch=1700000000.0)
+        except (sp.SpoolError, OSError):
+            raised = True
+    finally:
+        queue.close()
+    def read_bytes_or_none(path):
+        # A refusal must produce a FALSE verdict, never a crash.
+        try:
+            with open(path, "rb") as handle:
+                return handle.read()
+        except OSError:
+            return None
+
+    out["unsafe_rotated_target_fails_before_any_rotation_mutation"] = (
+        raised
+        and os.path.lexists(unsafe_target)
+        and not os.path.isfile(unsafe_target)   # the target is untouched
+        and os.path.isfile(base_member)         # the source never moved
+        and read_bytes_or_none(base_member) == planted
+        and read_bytes_or_none(safe_higher) == planted
+        and not os.path.lexists(shifted))       # no partial shift happened
+    if os.path.isdir(unsafe_target):
+        os.rmdir(unsafe_target)
+    else:
+        os.unlink(unsafe_target)
+    clean(root)
+
     return out
-
-
 # -- group: contract constants ---------------------------------------------------
 
 def group_contract():
     out = {}
+    out["retry_state_stop_token_is_frozen"] = (
+        dl.RETRY_STATE_NOT_DURABLE == "retry_state_not_durable")
     out["cycle_deadline_is_20s"] = rp.CYCLE_DEADLINE_SECONDS == 20.0
     out["per_node_timeout_is_5s"] = rp.DELAY_TIMEOUT_SECONDS == 5.0
     out["body_cap_is_16kib"] = rp.MAX_BODY_BYTES == 16 * 1024

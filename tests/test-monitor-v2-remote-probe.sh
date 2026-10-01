@@ -43,7 +43,7 @@ FAIL=0
 # Measured on the dev host (Windows, Python 3.14) and re-measured on Linux CI:
 # Measured on the dev host (Windows, Python 3.14) and re-measured on Linux CI:
 # Measured on the dev host (Windows, Python 3.14) and re-measured on Linux CI:
-# 226 = S0 static + red-line gates 19 (py_compile of the package + harness, the
+# 233 = S0 static + red-line gates 19 (py_compile of the package + harness, the
 # in-module reuse documentation, the FOUR frozen sha256 pins that prove the
 # audited E4 client/model/diag/README were reused and never forked, the E4
 # file-set check, the unchanged release identity 0.6.1 in both places, History
@@ -51,7 +51,7 @@ FAIL=0
 # modules free of any remote reference, the absent server ingest route, the
 # absent server remote store, and the two CI registrations) + S1 harness 206
 # verdicts across ELEVEN groups plus the harness rc gate. The RESILIENCE group
-# (38 verdicts) pins both reviewed fix rounds: durable per-record retry state
+# (44 verdicts) pins all three reviewed fix rounds: durable per-record retry state
 # with bounded unknown quarantine and a consumed backoff curve, retention driven
 # by the agent's own open/cycle path, the crash window between the record fsync
 # and the state save, deadline legality (an egress-shaped failure slot),
@@ -66,7 +66,15 @@ FAIL=0
 # symlink privilege (Windows dev box, WinError 1314) and exercise the refusal
 # on the Linux CI runners; the special-object refusals cover the same
 # invariant host-independently.
-EXPECTED_PASS=226
+#
+# The third round adds the storage/retry closures: an EXISTING chain member or
+# current file whose READ fails is fail-closed rather than silently hidden
+# (the fault is injected into read_restricted itself, not into a symlink or a
+# FIFO), a retry count that cannot be PERSISTED is never charged as a consumed
+# attempt and survives a restart as its last durable value, and an unsafe
+# rotation TARGET fails the whole rotation BEFORE any mutation (the queue is
+# open, a safe member sits in a higher slot, and no partial shift may happen).
+EXPECTED_PASS=233
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT

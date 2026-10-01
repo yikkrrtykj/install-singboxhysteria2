@@ -13,6 +13,7 @@ import json
 import sys
 
 from .agent import AgentConfig, ConfigError, RemoteProbeAgent, read_config_file
+from .spool import SpoolError
 
 
 def build_parser():
@@ -37,6 +38,11 @@ def main(argv=None):
     except ConfigError as exc:
         print("fatal configuration error: %s" % exc, file=sys.stderr)
         return 2
+    except SpoolError as exc:
+        # A storage refusal is a designed, sanitized outcome: report it like
+        # one instead of dumping a traceback from a safe refusal.
+        print("fatal storage refusal: %s" % exc, file=sys.stderr)
+        return 3
     if args.status:
         print(json.dumps(agent.status(), indent=2, sort_keys=True))
     return 0
