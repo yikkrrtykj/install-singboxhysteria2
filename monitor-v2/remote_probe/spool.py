@@ -133,6 +133,7 @@ class Spool:
         """Validate storage, repair at most one torn tail, load the cursor,
         and count unreadable-but-complete lines exactly once."""
         self._ensure_directory()
+        self._reject_symlinked_record_path()
         self._load_state()
         self._repair_tail()
         self._opened = True
@@ -243,6 +244,17 @@ class Spool:
 
     # -- torn tail ----------------------------------------------------------
 
+    def _reject_symlinked_record_path(self):
+        """A symlink at the record path is refused whether or not its target
+        exists: ``os.path.exists`` FOLLOWS a link, so a dangling one would
+        otherwise be adopted as "no file yet"."""
+        path = os.path.join(self.directory, SPOOL_FILE)
+        if os.path.islink(path):
+            raise SpoolError("spool file must not be a symlink")
+        if os.path.lexists(path) and not stat_module.S_ISREG(
+                os.lstat(path).st_mode):
+            raise SpoolError("spool file must be a regular file")
+
     def _repair_tail(self):
         """Truncate AT MOST one incomplete trailing fragment of the current
         file. A complete-but-unparseable line is counted, never rewritten."""
@@ -306,6 +318,7 @@ class Spool:
 
     def _append_line(self, line):
         path = os.path.join(self.directory, SPOOL_FILE)
+        self._reject_symlinked_record_path()
         if os.path.exists(path):
             st = os.lstat(path)
             if stat_module.S_ISLNK(st.st_mode):

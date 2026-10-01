@@ -890,17 +890,24 @@ def group_spool():
             out["symlinked_spool_dir_refused"] = False
         except sp.SpoolError:
             out["symlinked_spool_dir_refused"] = True
-        os.makedirs(os.path.join(real, "inner"))
-        file_link = os.path.join(real, "inner", sp.SPOOL_FILE)
-        os.symlink(os.path.join(real, "target"), file_link)
-        try:
-            sp.Spool(os.path.join(real, "inner")).open()
-            out["symlinked_spool_file_refused"] = False
-        except sp.SpoolError:
-            out["symlinked_spool_file_refused"] = True
+        target_file = os.path.join(real, "target")
+        with open(target_file, "wb") as handle:
+            handle.write(b'{"v":1}' + bytes([10]))
+        for label, target in (("dangling", os.path.join(real, "absent")),
+                              ("existing", target_file)):
+            inner = os.path.join(real, "inner-" + label)
+            os.makedirs(inner)
+            os.chmod(inner, 0o700)
+            os.symlink(target, os.path.join(inner, sp.SPOOL_FILE))
+            try:
+                sp.Spool(inner).open()
+                out["symlinked_spool_file_refused_%s" % label] = False
+            except sp.SpoolError:
+                out["symlinked_spool_file_refused_%s" % label] = True
     else:
         out["symlinked_spool_dir_refused"] = True
-        out["symlinked_spool_file_refused"] = True
+        out["symlinked_spool_file_refused_dangling"] = True
+        out["symlinked_spool_file_refused_existing"] = True
     fifo_dir = os.path.join(temp_dir(), "spool")
     os.makedirs(fifo_dir)
     if hasattr(os, "mkfifo"):
@@ -919,13 +926,14 @@ def group_spool():
         loose = os.path.join(temp_dir(), "spool")
         os.makedirs(loose)
         os.chmod(loose, 0o755)
-        try:
-            sp.Spool(loose).open()
-            out["unsafe_directory_mode_refused"] = False
-        except sp.SpoolError:
-            out["unsafe_directory_mode_refused"] = True
+        # House discipline (History _validate_dir and the audited E4-Diag
+        # writer both do this): a too-loose directory this process owns is
+        # TIGHTENED, and only a tightening failure is fatal.
+        sp.Spool(loose).open()
+        out["loose_directory_is_tightened_to_0700"] = (
+            stat_module.S_IMODE(os.stat(loose).st_mode) == 0o700)
     else:
-        out["unsafe_directory_mode_refused"] = True
+        out["loose_directory_is_tightened_to_0700"] = True
     return out
 
 

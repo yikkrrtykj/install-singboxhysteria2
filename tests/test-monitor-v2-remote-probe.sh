@@ -20,8 +20,10 @@
 #      7-day / 32 MiB bounds), the total response-disposition matrix, HTTPS-only
 #      non-loopback ingest, and the secret leak wall.
 #   2. REUSE, NOT FORK. The audited E4/adapter files are BYTE-IDENTICAL: their
-#      sha256 is pinned here, so a P6 edit that quietly forked the transport or
-#      the secret-file discipline fails this gate instead of passing review.
+#      sha256 is pinned here (over LF-normalised bytes, so a CRLF working copy
+#      and the CI checkout agree), so a P6 edit that quietly forked the
+#      transport or the secret-file discipline fails this gate instead of
+#      passing review.
 #   3. THE RED LINES HOLD. No server ingest route, no remote database, History
 #      still schema v5 on the eleven-table shape with its six prune sources, no
 #      remote reference in the classifier / incident runtime / presenter, and
@@ -39,7 +41,7 @@ PY="${PYTHON:-$(command -v python3 || command -v python || true)}"
 PASS=0
 FAIL=0
 # Measured on the dev host (Windows, Python 3.14) and re-measured on Linux CI:
-# 186 = S0 static + red-line gates 19 (py_compile of the package + harness, the
+# 187 = S0 static + red-line gates 19 (py_compile of the package + harness, the
 # README/wire documentation, the FOUR frozen sha256 pins that prove the audited
 # E4 client/model/diag/README were reused and never forked, the E4 file-set
 # check, the unchanged release identity 0.6.1 in both places, History still v5
@@ -50,7 +52,7 @@ FAIL=0
 # VPS-side probe engine and prove the direct-slot vocabulary, the status/change
 # values and the canonical-IP gate still match it exactly -- plus the harness
 # rc gate).
-EXPECTED_PASS=186
+EXPECTED_PASS=187
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
@@ -76,6 +78,13 @@ if [ -z "$PY" ]; then
 fi
 
 PKG="$ROOT/monitor-v2/remote_probe"
+
+# LF-normalised sha256: identical on a CRLF checkout and on CI.
+e4_hash() {
+    "$PY" -c 'import hashlib, sys
+data = open(sys.argv[1], "rb").read().replace(bytes([13, 10]), bytes([10]))
+print(hashlib.sha256(data).hexdigest())' "$1"
+}
 HARNESS="$HERE/remote-probe/probe_groups.py"
 MIHOMO="$ROOT/monitor-v2/mihomo"
 HIST_PY="$ROOT/monitor-v2/web/incident_history.py"
@@ -103,21 +112,24 @@ else
     fail "agent README missing the reuse/wire documentation"
 fi
 
-# (2) The audited E4 pieces are byte-identical: reuse, never fork.
-assert_eq "59daf633d2d3744c0fdf6bf0126cc78c613d33ac43741a6b71928f09835ad8e8" \
-    "$(sha256sum "$MIHOMO/client.py" | cut -d' ' -f1)" \
+# (2) The audited E4 pieces are byte-identical: reuse, never fork. The pins
+# are taken over LF-normalised bytes, so a CRLF working copy and the LF CI
+# checkout agree.
+assert_eq "f33e7b2340528f592ecc756b5771dae6ed022fed905fbce2dccc36d920e957ab" \
+    "$(e4_hash "$MIHOMO/client.py")" \
     "E4 client.py is byte-identical (transport + loopback parsing + secrets)"
-assert_eq "fd2cf1256d67e0acac1ddfb11ce0a204dedffbca11acae7ec5f13ab959681f6a" \
-    "$(sha256sum "$MIHOMO/model.py" | cut -d' ' -f1)" \
+assert_eq "b837653e94409ccb420c3c4a799c7cf7cdea2ed8eb14e73aa7b15e8e17437598" \
+    "$(e4_hash "$MIHOMO/model.py")" \
     "E4 model.py is byte-identical (the /proxies payload semantics)"
-assert_eq "421130948d1260191d0d977dd00b9265b225ca56f991b30ce7d62d1824445164" \
-    "$(sha256sum "$MIHOMO/diag.py" | cut -d' ' -f1)" \
+assert_eq "a528f82a3b4634a50244f27c47088b7fd650e6b6e1f9142b42982f69138341fd" \
+    "$(e4_hash "$MIHOMO/diag.py")" \
     "E4 diag.py is byte-identical (the read-only observer)"
 assert_eq "9078a564ca31f570cb66ba95616b3613c99ffe83590359b493017f099d8e3334" \
-    "$(sha256sum "$MIHOMO/README.md" | cut -d' ' -f1)" \
+    "$(e4_hash "$MIHOMO/README.md")" \
     "E4 README is byte-identical (its no-delay contract still stands)"
-assert_eq "README.md __init__.py client.py diag.py fixtures model.py" "$(ls "$MIHOMO" | grep -v "^__pycache__$" | LC_ALL=C sort | tr "
-" " " | sed "s/ $//")" "the E4 adapter directory has exactly its original source file set"
+assert_eq "README.md __init__.py client.py diag.py fixtures model.py" \
+    "$(ls "$MIHOMO" | grep -v "^__pycache__$" | LC_ALL=C sort | tr "\n" " " | sed "s/ $//")" \
+    "the E4 adapter directory has exactly its original source file set"
 
 # (3) Red lines.
 assert_eq "0.6.1" "$(tr -d '[:space:]' < "$ROOT/monitor-v2/VERSION")" \
