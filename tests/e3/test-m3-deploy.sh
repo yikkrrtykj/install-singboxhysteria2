@@ -180,11 +180,15 @@ cp "$ROOT"/monitor-v2/*.py "$RELDIR/$REL_ID/app/monitor-v2/" 2>/dev/null
 cp -r "$ROOT/monitor-v2/web" "$RELDIR/$REL_ID/app/monitor-v2/web"
 cp -r "$ROOT/monitor-v2/api_bridge" "$RELDIR/$REL_ID/app/monitor-v2/api_bridge"
 cp -r "$ROOT/monitor-v2/diagnostics" "$RELDIR/$REL_ID/app/monitor-v2/diagnostics"
+# PR-6B: remote_probe/ joined the boot-critical monitor payload
+# (webapp.py wires the ingest plane at startup).
+cp -r "$ROOT/monitor-v2/remote_probe" "$RELDIR/$REL_ID/app/monitor-v2/remote_probe"
 printf 'm3-test\n' > "$RELDIR/$REL_ID/VERSION"
 rm -rf "$RELDIR/$REL_ID/app/monitor-v2/web/__pycache__" \
        "$RELDIR/$REL_ID/app/monitor-v2/__pycache__" \
        "$RELDIR/$REL_ID/app/monitor-v2/api_bridge/__pycache__" \
-       "$RELDIR/$REL_ID/app/monitor-v2/diagnostics/__pycache__" 2>/dev/null
+       "$RELDIR/$REL_ID/app/monitor-v2/diagnostics/__pycache__" \
+       "$RELDIR/$REL_ID/app/monitor-v2/remote_probe/__pycache__" 2>/dev/null
 ln -sfn "$RELDIR/$REL_ID" "$RELLINK"
 chown -R "$AXE_USER":"$AXE_USER" "$RELDIR" "$MDATA"
 chmod 0700 "$MDATA"
