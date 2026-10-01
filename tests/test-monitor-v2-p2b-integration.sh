@@ -155,6 +155,15 @@ build_src() {
         cp "$d" "$dest/diagnostics/"
     done
     rm -rf "$dest/diagnostics/__pycache__"
+    # PR-6B: remote_probe/ joined the boot-critical monitor payload
+    # (webapp.py wires the ingest plane at startup); mirror it exactly
+    # like diagnostics above.
+    mkdir -p "$dest/remote_probe"
+    local p
+    for p in "$ROOT"/monitor-v2/remote_probe/*.py; do
+        cp "$p" "$dest/remote_probe/"
+    done
+    rm -rf "$dest/remote_probe/__pycache__"
     printf '0.1.0\n' > "$dest/VERSION"
     if [ "$with_jr" = "--with-jr" ]; then
         mkdir -p "$dest/journal_reader"
