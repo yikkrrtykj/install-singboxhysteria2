@@ -693,9 +693,14 @@ class Spool:
         looking drained: that is the degraded signal an operator needs.
         """
         resolved = int(self._state["resolved_through"])
+        # The scan runs FIRST and the blocker is read from ITS result: a
+        # block discovered by this very scan must hold the queue on this
+        # very call. A value read before the scan would let the first call
+        # after newly-appeared corruption step straight over it.
+        records = self._scan_records()
         blocked = int(self._blocked_id)
         deliverable = []
-        for record_id, record in self._scan_records():
+        for record_id, record in records:
             if blocked and record_id >= blocked:
                 break
             if record_id <= resolved:
@@ -808,19 +813,31 @@ class Spool:
         and never deletes unresolved evidence.
         """
         self._compact_resolved()
+        # The blocker is read from THIS scan, and NEITHER pruning path may
+        # step over it: the cursor is what proves a corrupt record terminal
+        # (and what lets compaction drop it), so advancing past an
+        # unresolved one would both invent a terminal state and destroy its
+        # only evidence.
+        records = self._scan_records()
+        blocked = int(self._blocked_id)
         resolved = int(self._state["resolved_through"])
         now = float(self.clock())
-        for record_id, record in self._scan_records():
+        for record_id, record in records:
             if record_id <= resolved:
                 continue
+            if blocked and record_id >= blocked:
+                break          # age pruning stops at the corrupt record
             if now - float(record["queued_epoch"]) > self.max_age:
                 self._state["resolved_through"] = record_id
                 self._state["expired_total"] = int(
                     self._state["expired_total"]) + 1
         physical = self._physical_chain_bytes()
         while physical > self.max_bytes:
-            live = [(rid, rec) for rid, rec in self._scan_records()
-                    if rid > int(self._state["resolved_through"])]
+            records = self._scan_records()
+            blocked = int(self._blocked_id)
+            live = [(rid, rec) for rid, rec in records
+                    if rid > int(self._state["resolved_through"])
+                    and not (blocked and rid >= blocked)]
             if not live:
                 self._save_state_soft()
                 raise SpoolError(

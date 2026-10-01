@@ -43,7 +43,7 @@ FAIL=0
 # Measured on the dev host (Windows, Python 3.14) and re-measured on Linux CI:
 # Measured on the dev host (Windows, Python 3.14) and re-measured on Linux CI:
 # Measured on the dev host (Windows, Python 3.14) and re-measured on Linux CI:
-# 247 = S0 static + red-line gates 19 (py_compile of the package + harness, the
+# 250 = S0 static + red-line gates 19 (py_compile of the package + harness, the
 # in-module reuse documentation, the FOUR frozen sha256 pins that prove the
 # audited E4 client/model/diag/README were reused and never forked, the E4
 # file-set check, the unchanged release identity 0.6.1 in both places, History
@@ -51,7 +51,7 @@ FAIL=0
 # modules free of any remote reference, the absent server ingest route, the
 # absent server remote store, and the two CI registrations) + S1 harness 206
 # verdicts across ELEVEN groups plus the harness rc gate. The RESILIENCE group
-# (58 verdicts) pins all five reviewed fix rounds: durable per-record retry state
+# (61 verdicts) pins all six reviewed fix rounds: durable per-record retry state
 # with bounded unknown quarantine and a consumed backoff curve, retention driven
 # by the agent's own open/cycle path, the crash window between the record fsync
 # and the state save, deadline legality (an egress-shaped failure slot),
@@ -98,7 +98,14 @@ FAIL=0
 # oldest live record only when that actually frees bytes, failing closed when
 # it cannot. FILE_BYTES is derived so the frozen constants satisfy
 # MAX_FILES * (FILE_BYTES + RECORD_MAX_BYTES) <= MAX_TOTAL_BYTES.
-EXPECTED_PASS=247
+#
+# The seventh round makes the blocker binding on EVERY path that can move the
+# cursor: retention's age pruning and the byte-budget pruning both stop AT an
+# unresolved corrupt record (fail-closed when what remains is evidence we may
+# not delete), and pending() reads the blocker from the scan it just ran, so
+# corruption that appears after a clean scan holds the queue on the very first
+# call that discovers it.
+EXPECTED_PASS=250
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT

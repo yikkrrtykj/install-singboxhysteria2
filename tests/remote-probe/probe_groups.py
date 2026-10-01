@@ -148,6 +148,16 @@ def make_config(**over):
     return ag.AgentConfig.from_mapping(raw)
 
 
+def valid_line(record_id, seq, epoch):
+    """A canonical, decodable record line with a chosen record id."""
+    record = {"v": 1, "record_id": record_id,
+              "probe_id": "office-sg-isp-a", "run": RUN, "seq": seq,
+              "queued_epoch": epoch,
+              "body_b64": base64.b64encode(
+                  pl.encode_sample(_sample(seq))).decode("ascii")}
+    return sp.canonical_bytes(record)
+
+
 def chain_bytes(directory):
     """EXACT bytes the record chain occupies on disk (all members)."""
     total = 0
@@ -2438,6 +2448,92 @@ def group_resilience():
         and worst <= 3000
         and len(glob.glob(os.path.join(directory, sp.SPOOL_FILE + ".*")))
         <= sp.MAX_FILES)
+    queue.close()
+    clean(root)
+
+    # ---- E1-F1a: RETENTION's age pruning must not advance the cursor past an
+    #      unresolved corrupt record. Both the record before the blocker (old
+    #      enough to expire) and the record after it are ancient; only the
+    #      first may expire, because reaching the second would mean the cursor
+    #      claimed a terminal state the corrupt record never reached.
+    root = temp_dir()
+    directory = os.path.join(root, "spool")
+    ancient = 1700003600.0 - 8 * 86400.0
+    queue = sp.Spool(directory, clock=lambda: 1700003600.0).open()
+    queue.append("office-sg-isp-a", RUN, 1, pl.encode_sample(_sample(1)),
+                 queued_epoch=ancient)                  # id 1, before it
+    queue.close()
+    with open(os.path.join(directory, sp.SPOOL_FILE), "ab") as handle:
+        handle.write(corrupt_line + b"\n")              # corrupt, id 3
+        handle.write(valid_line(5, 5, ancient) + b"\n")  # id 5, after it
+    queue = sp.Spool(directory, clock=lambda: 1700003600.0).open()
+    queue.enforce_bounds()
+    status = queue.status()
+    chain_lines = [line for line in
+                   open(os.path.join(directory, sp.SPOOL_FILE), "rb")
+                   .read().splitlines() if line]
+    out["retention_cannot_advance_cursor_past_corrupt_blocker"] = (
+        int(status["resolved_through"]) < 3
+        and status["expired_total"] == 1        # only the record BEFORE it
+        and corrupt_line in chain_lines)
+    queue.close()
+    clean(root)
+    # ---- E1-F1b: the BYTE-budget pruning must not either. The chain is over
+    #      budget, the oldest record before the blocker is dropped, and what
+    #      remains (the blocker plus a record behind it) cannot be reduced by
+    #      deleting anything we are allowed to delete -- so it fails CLOSED.
+    root = temp_dir()
+    directory = os.path.join(root, "spool")
+    queue = sp.Spool(directory, clock=lambda: 1700000000.0,
+                     max_bytes=700).open()
+    queue.append("office-sg-isp-a", RUN, 1, pl.encode_sample(_sample(1)),
+                 queued_epoch=1700000000.0)
+    queue.close()
+    with open(os.path.join(directory, sp.SPOOL_FILE), "ab") as handle:
+        handle.write(corrupt_line + b"\n")
+        handle.write(valid_line(5, 5, 1700000000.0) + b"\n")
+    queue = sp.Spool(directory, clock=lambda: 1700000000.0,
+                     max_bytes=700).open()
+    over_budget = chain_bytes(directory) > 700
+    refused = False
+    try:
+        queue.enforce_bounds()
+    except (sp.SpoolError, OSError):
+        refused = True
+    status = queue.status()
+    chain_lines = [line for line in
+                   open(os.path.join(directory, sp.SPOOL_FILE), "rb")
+                   .read().splitlines() if line]
+    out["byte_budget_cannot_advance_cursor_past_corrupt_blocker"] = (
+        over_budget and refused
+        and int(status["resolved_through"]) < 3
+        and status["queue_blocked"] is True
+        and corrupt_line in chain_lines)
+    queue.close()
+    clean(root)
+    # ---- E1-F2: the blocker must come from THIS scan. Corruption that
+    #      appears after a clean scan has to hold the queue on the VERY FIRST
+    #      pending() call that discovers it -- a blocker read before the scan
+    #      would let that call walk straight past it.
+    root = temp_dir()
+    directory = os.path.join(root, "spool")
+    queue = sp.Spool(directory, clock=lambda: 1700000000.0).open()
+    queue.append("office-sg-isp-a", RUN, 1, pl.encode_sample(_sample(1)),
+                 queued_epoch=1700000000.0)
+    dl.deliver_pending(queue, SECRET, "office-sg-isp-a", FakePoster())
+    clean_scan = [item["record_id"] for item in queue.pending()]
+    with open(os.path.join(directory, sp.SPOOL_FILE), "ab") as handle:
+        handle.write(corrupt_line + b"\n")              # appears NOW
+        handle.write(valid_line(5, 5, 1700000000.0) + b"\n")
+    first_ids = None
+    refused = False
+    try:
+        first_ids = [item["record_id"] for item in queue.pending()]
+    except (sp.SpoolError, OSError):
+        refused = True
+    out["newly_discovered_corruption_blocks_on_first_pending_call"] = (
+        clean_scan == []        # the clean scan really happened first
+        and refused and first_ids is None)      # and id 5 was never offered
     queue.close()
     clean(root)
 
