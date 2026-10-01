@@ -55,7 +55,7 @@ ih_outcome_recorded = ih_outcomes.OUTCOME_RECORDED
 from web.recovery import (RECOVERY_SUCCESS_MESSAGE, RecoveryGlobalGuard,
                           RecoveryRateLimiter, generate_key)
 
-MONITOR_WEB_VERSION = "0.6.0"
+MONITOR_WEB_VERSION = "0.6.1"
 SESSION_COOKIE = "monitor_session"
 MAX_BODY_BYTES = 65536
 SUPPORTED_METHODS = "GET, POST"
@@ -650,6 +650,34 @@ class MonitorWebApp:
 class MonitorHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+
+    # The ONLY exceptions suppressed at this boundary (issue #65). Both are
+    # raised by the CLIENT going away, never by the Monitor: a client that
+    # resets or half-closes a keep-alive connection while
+    # ``BaseHTTPRequestHandler.handle()`` waits for the next request line
+    # produces them AFTER a complete, successfully answered request --
+    # outside ``MonitorRequestHandler._dispatch()``, which is why the
+    # request-level disconnect handling there cannot see them.
+    #
+    # Deliberately NOT ``ConnectionError`` (their common parent), not
+    # ``OSError``, not ``TimeoutError`` and not ``Exception``: those would
+    # hide real server defects in the same traceback channel that exists to
+    # report them. An independently reviewed need would be required to
+    # widen this tuple.
+    BENIGN_CLIENT_DISCONNECTS = (BrokenPipeError, ConnectionResetError)
+
+    def handle_error(self, request, client_address):
+        """Suppress the stdlib traceback for benign client disconnects only.
+
+        Every other exception is delegated unchanged to
+        ``super().handle_error()``, so genuine faults keep their normal
+        stderr traceback. Nothing else is touched: the socket is still
+        released by ``socketserver``'s own shutdown path after this
+        method returns.
+        """
+        if isinstance(sys.exc_info()[1], self.BENIGN_CLIENT_DISCONNECTS):
+            return
+        super().handle_error(request, client_address)
 
 
 class MonitorRequestHandler(BaseHTTPRequestHandler):

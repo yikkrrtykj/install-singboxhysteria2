@@ -20,7 +20,7 @@ PASS=0
 FAIL=0
 # The gate at the bottom fails unless exactly this many assertions ran AND
 # passed, so unreachable sections can never fake success.
-EXPECTED_PASS=272
+EXPECTED_PASS=281
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
@@ -64,6 +64,127 @@ assert_contains 'snapshot_version' "$STATIC_SRC" "watchdog keys freshness on sna
 assert_not_contains 'setup` 可用 openssl 生成自签名证书' "$README_SRC" "README no longer claims setup generates certificates"
 assert_contains '自动生成自签名证书' "$README_SRC" "README documents: no automatic self-signed generation"
 assert_contains 'Packaging' "$README_SRC" "README defers certificate provisioning to Packaging"
+
+section "HTTP client-disconnect boundary (issue #65)"
+
+# The production symptom is a stdlib traceback raised while
+# ``BaseHTTPRequestHandler.handle()`` waits for the NEXT request line on a
+# keep-alive connection the client already reset -- i.e. AFTER a complete,
+# successfully answered request and OUTSIDE
+# ``MonitorRequestHandler._dispatch()``. The gate is therefore the
+# server-level ``handle_error`` boundary, proven directly and
+# deterministically (no timing-dependent TCP RST simulation).
+if "$PY" - > "$TMP/handle_error.verdicts" 2>&1 <<'HEEOF'
+import contextlib
+import io
+import os
+import sys
+
+sys.path.insert(0, os.environ["MONITOR_V2_ROOT"])
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from socketserver import ThreadingMixIn
+from web import server as sv
+
+
+def verdict(name, ok, detail=""):
+    print(("PASS " if ok else "FAIL ") + name
+          + ((" -- " + detail) if (detail and not ok) else ""))
+
+
+class _Req:
+    """The barest socket stand-in: the boundary under test never writes to
+    it, and socketserver's own shutdown path owns it in production."""
+
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+class _App:
+    """build_server only stores the app; no request is ever served here."""
+
+    version = "probe"
+    access = None
+
+
+# A REAL MonitorHTTPServer, built the way production builds it (ephemeral
+# loopback port), so the instance under test is not a hand-rolled stub.
+server = sv.build_server(_App(), "127.0.0.1", 0, None)
+try:
+    def emitted(exc):
+        """The stderr text handle_error produces for one active exception."""
+        buffer = io.StringIO()
+        try:
+            raise exc
+        except BaseException:
+            with contextlib.redirect_stderr(buffer):
+                server.handle_error(_Req(), ("127.0.0.1", 40000))
+        return buffer.getvalue()
+
+    reset_out = emitted(ConnectionResetError(104, "Connection reset by peer"))
+    verdict("connection reset emits no stdlib traceback",
+            reset_out == "", repr(reset_out))
+
+    pipe_out = emitted(BrokenPipeError(32, "Broken pipe"))
+    verdict("broken pipe emits no stdlib traceback",
+            pipe_out == "", repr(pipe_out))
+
+    sentinel_out = emitted(RuntimeError("sentinel"))
+    verdict("runtime error still delegates to the stdlib traceback",
+            "Traceback" in sentinel_out
+            and "RuntimeError: sentinel" in sentinel_out, repr(sentinel_out))
+
+    # Non-benign neighbours must NOT be swallowed: the traceback channel
+    # exists to report real defects.
+    timeout_out = emitted(TimeoutError("probe timeout"))
+    verdict("timeout error is never swallowed",
+            "Traceback" in timeout_out, repr(timeout_out))
+
+    os_out = emitted(OSError("generic os error"))
+    verdict("generic OSError is never swallowed",
+            "Traceback" in os_out, repr(os_out))
+
+    # The suppression list itself is pinned: ConnectionError is their
+    # common PARENT, so any catch-all widening shows up here first.
+    verdict("benign list is exactly the two reviewed classes",
+            sv.MonitorHTTPServer.BENIGN_CLIENT_DISCONNECTS
+            == (BrokenPipeError, ConnectionResetError),
+            repr(sv.MonitorHTTPServer.BENIGN_CLIENT_DISCONNECTS))
+
+    verdict("server class is still a ThreadingHTTPServer",
+            issubclass(sv.MonitorHTTPServer, ThreadingHTTPServer)
+            and issubclass(sv.MonitorHTTPServer, ThreadingMixIn)
+            and issubclass(sv.MonitorHTTPServer,
+                           BaseHTTPRequestHandler.__mro__[-1]))
+
+    verdict("build_server returns the MonitorHTTPServer class",
+            isinstance(server, sv.MonitorHTTPServer)
+            and type(server) is sv.MonitorHTTPServer)
+
+    # The request-level disconnect handling this issue did NOT move.
+    import inspect
+    dispatch_src = inspect.getsource(sv.MonitorRequestHandler._dispatch)
+    verdict("request-level disconnect handling stays in _dispatch",
+            "except (BrokenPipeError, ConnectionResetError):" in dispatch_src
+            and "self.close_connection = True" in dispatch_src)
+finally:
+    server.server_close()
+HEEOF
+then
+    while IFS= read -r line; do
+        case "$line" in
+            PASS\ *) pass "handle_error: ${line#PASS }" ;;
+            FAIL\ *) fail "handle_error: ${line#FAIL }" ;;
+            '') ;;
+            *) printf '  ? %s
+' "$line" ;;
+        esac
+    done < "$TMP/handle_error.verdicts"
+else
+    fail "the handle_error gate could not run: $(cat "$TMP/handle_error.verdicts")"
+fi
 
 # -- shared python harness ---------------------------------------------------
 # -- shared python harness ---------------------------------------------------

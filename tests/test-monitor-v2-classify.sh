@@ -232,13 +232,13 @@ else
     pass "deploy/ is untouched by PR-4A"
 fi
 # (5) The frozen release identity this PR ships. PR-4B lands the incident
-# runtime, so the release it guards is Monitor 0.6.0 on history schema v5.
-assert_eq '0.6.0' "$(cat "$ROOT/monitor-v2/VERSION")" \
-    "VERSION is 0.6.0 (the incidents-UI release)"
-if grep -q 'MONITOR_WEB_VERSION = "0.6.0"' "$SERVER_PY"; then
-    pass "MONITOR_WEB_VERSION is 0.6.0"
+# runtime, so the release it guards is Monitor 0.6.1 on history schema v5.
+assert_eq '0.6.1' "$(cat "$ROOT/monitor-v2/VERSION")" \
+    "VERSION is 0.6.1 (the HTTP-disconnect-noise release)"
+if grep -q 'MONITOR_WEB_VERSION = "0.6.1"' "$SERVER_PY"; then
+    pass "MONITOR_WEB_VERSION is 0.6.1"
 else
-    fail "MONITOR_WEB_VERSION moved off 0.6.0"
+    fail "MONITOR_WEB_VERSION moved off 0.6.1"
 fi
 # (6) Not a declaration check but a live one: build the database the module
 # actually creates and name the tables it actually made. PR-4B migrates the
