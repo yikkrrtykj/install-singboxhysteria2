@@ -287,10 +287,10 @@ done
 pass "app-bin entrypoints invoke no probe module"
 
 VERSION_NOW="$(cat "$ROOT/monitor-v2/VERSION")"
-if [ "$VERSION_NOW" = "0.6.1" ]; then
-    pass "VERSION is the releasable 0.6.1 (issue #65 ships the HTTP-noise bump)"
+if [ "$VERSION_NOW" = "0.7.0" ]; then
+    pass "VERSION is the releasable 0.7.0 (PR-6B owns the release bump)"
 else
-    fail "VERSION moved off the releasable 0.6.1: $VERSION_NOW"
+    fail "VERSION moved off the releasable 0.7.0: $VERSION_NOW"
 fi
 
 if grep -q 'test-monitor-v2-probes.sh' "$ROOT/.github/workflows/tests.yml" \

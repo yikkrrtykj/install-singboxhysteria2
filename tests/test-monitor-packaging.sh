@@ -433,6 +433,14 @@ JR_MANIFEST_MODULES=(__init__.py codes.py cursor.py journal_time.py \
 # honest against the library's own list by the static gate in "static checks".
 DIAG_MANIFEST_MODULES=(__init__.py network_probes.py probe_scheduler.py)
 
+# PR-6B (#67): the remote-probe plane rides EVERY release (webapp.py
+# wires the ingest plane at startup). Same explicit-manifest discipline
+# as diagnostics: this suite's array must equal the library's
+# REMOTE_PROBE_MODULE_FILES, and the fixture helper stages it file by
+# file so a fixture tree can never half-carry the plane.
+P6_MANIFEST_MODULES=(__init__.py __main__.py agent.py delivery.py
+    direct_probe.py evidence.py mihomo_probe.py payload.py spool.py)
+
 # One path per iteration, built by explicit concatenation: a prefix glued to
 # "${arr[@]}" expands element-wise on some bash builds and only on the first
 # element on others, which silently drops payload files from the fixture.
@@ -462,7 +470,19 @@ diag_stage_payload() { # <src-dir> -- ship the 3-module diagnostics payload
 
 # Every formal release in this lane ships BOTH payloads: the reader (PR-2B)
 # and diagnostics (PR-3B). One helper, so no fixture tree can forget one.
-runtime_payload() { jr_stage_payload "$1"; diag_stage_payload "$1"; }
+p6_stage_payload() { # <src-dir> -- ship the P6 remote-probe payload
+    local src="$1" m n
+    mkdir -p "$src/remote_probe"
+    for m in "${P6_MANIFEST_MODULES[@]}"; do
+        cp -- "$REPO_ROOT/monitor-v2/remote_probe/$m" "$src/remote_probe/" \
+            || { printf 'FATAL: cannot stage remote_probe module %s\n' "$m" >&2; exit 70; }
+    done
+    rm -rf "$src/remote_probe/__pycache__"
+    n="$(find "$src/remote_probe" -maxdepth 1 -name '*.py' | wc -l | tr -d ' ')"
+    [ "$n" = 9 ] || { printf 'FATAL: fixture staged %s remote_probe modules, expected 9\n' "$n" >&2; exit 70; }
+}
+
+runtime_payload() { jr_stage_payload "$1"; diag_stage_payload "$1"; p6_stage_payload "$1"; }
 
 # A formal install co-activates the reader, so EVERY isolated fixture root has
 # to pin the reader's three paths into itself -- their production defaults
@@ -504,6 +524,21 @@ LIB_DIAG_MODULES="$(awk '/^DIAGNOSTICS_MODULE_FILES=\(/{f=1} f{print} f&&/\)/{ex
 SUITE_DIAG_MODULES="$(printf '%s\n' "${DIAG_MANIFEST_MODULES[@]}" | LC_ALL=C sort | tr '\n' ' ')"
 assert_eq "$SUITE_DIAG_MODULES" "$LIB_DIAG_MODULES" \
     "this lane's 3-module diagnostics manifest == the library's DIAGNOSTICS_MODULE_FILES"
+
+
+# PR-6B: the same manifest discipline for the remote-probe plane.
+LIB_P6_MODULES="$(awk '/^REMOTE_PROBE_MODULE_FILES=\(/{f=1} f{print} f&&/\)/{exit}' \
+    "$DEPLOY_DIR/lib/monitor-deploy-lib.sh" | grep -oE '[A-Za-z_]+\.py' \
+    | LC_ALL=C sort | tr '\n' ' ')"
+SUITE_P6_MODULES="$(printf '%s\n' "${P6_MANIFEST_MODULES[@]}" | LC_ALL=C sort | tr '\n' ' ')"
+assert_eq "$SUITE_P6_MODULES" "$LIB_P6_MODULES" \
+    "this lane's 9-module P6 manifest == the library's REMOTE_PROBE_MODULE_FILES"
+if grep -nE '^[[:space:]]*cp[[:space:]]+-R[[:space:]].*remote_probe' \
+    "$DEPLOY_DIR/lib/monitor-deploy-lib.sh" >/dev/null; then
+    fail "library cp -R's the remote_probe tree (wildcard staging)"
+else
+    pass "remote_probe staged file-by-file from the manifest (no directory wildcard)"
+fi
 if grep -nE '^[[:space:]]*cp[[:space:]]+-R[[:space:]].*diagnostics' \
     "$DEPLOY_DIR/lib/monitor-deploy-lib.sh" >/dev/null; then
     fail "library cp -R's the diagnostics tree (wildcard staging)"
@@ -550,10 +585,10 @@ if [ "$(printf '%s' "$DEPLOY_CODE" | grep -cE '(^|[^a-z])(ufw|iptables|ip6tables
 else
     pass "deploy code never invokes firewall tooling"
 fi
-if [ "$(printf '%s' "$DEPLOY_CODE" | grep -c 'mihomo')" -eq 0 ]; then
-    pass "deploy code never stages or references E4/mihomo (repo-only client component)"
+if [ "$(printf '%s' "$DEPLOY_CODE" | grep -cE 'mihomo(/|\\.py|[^_a-z])')" -gt 0 ]; then
+    fail "deploy code references the E4 mihomo tree"
 else
-    fail "deploy code references mihomo"
+    pass "deploy code never stages or references the E4 mihomo tree"
 fi
 if [ "$(printf '%s' "$DEPLOY_CODE" | grep -c 'app/web/serve')" -eq 0 ]; then
     pass "deferred app/web/serve hook gone (real E2 entrypoint wired, R1)"
@@ -659,10 +694,16 @@ else
 fi
 [ -f "$FIX_APP_LINK/app/monitor-v2/web/static/app.js" ] && pass "release stages web static assets" || fail "web static assets not staged"
 [ ! -e "$FIX_APP_LINK/app/collector" ] && pass "no duplicate independent collector runtime tree" || fail "legacy app/collector tree also staged (two collector runtimes)"
-if [ "$(find "$FIX_APP_LINK" -name '*mihomo*' 2>/dev/null | wc -l)" -eq 0 ]; then
-    pass "E4/mihomo NOT staged (repo-only)"
+if [ -e "$FIX_APP_LINK/app/monitor-v2/mihomo" ]; then
+    _MHTREE="staged"
 else
-    fail "E4/mihomo found in release tree"
+    _MHTREE="absent"
+fi
+if [ "$(find "$FIX_APP_LINK" -name '*mihomo*' ! -path '*remote_probe*' 2>/dev/null | wc -l)" -eq 0 ] \
+    && [ "$_MHTREE" = "absent" ]; then
+    pass "E4/mihomo tree NOT staged (repo-only); P6 remote_probe plane rides the release"
+else
+    fail "E4/mihomo tree found in release tree"
 fi
 assert_grep '127\.0\.0\.1:9191' "$FIX_CONF_DIR/monitor.conf" "conf binds web to 127.0.0.1:9191"
 assert_grep 'http://127\.0\.0\.1:9091' "$FIX_CONF_DIR/monitor.conf" "conf points at loopback service.api 9091"
@@ -2569,6 +2610,7 @@ else
     mkdir -p "$T22/etc/systemd/system" "$T22/src"
     cp "$REPO_ROOT/monitor-v2/collector.py" "$REPO_ROOT/monitor-v2/webapp.py" "$T22/src/"
     cp -R "$REPO_ROOT/monitor-v2/web" "$REPO_ROOT/monitor-v2/api_bridge" "$T22/src/"
+    p6_stage_payload "$T22/src"
     rm -rf "$T22/src/api_bridge/__pycache__" "$T22/src/web/__pycache__"
     printf '0.1.1\n' > "$T22/src/VERSION"
     export SBMON_APP_LINK="$T22_APP"
@@ -2643,6 +2685,7 @@ else
     mkdir -p "$T23/etc/systemd/system" "$T23/src"
     cp "$REPO_ROOT/monitor-v2/collector.py" "$REPO_ROOT/monitor-v2/webapp.py" "$T23/src/"
     cp -R "$REPO_ROOT/monitor-v2/web" "$REPO_ROOT/monitor-v2/api_bridge" "$T23/src/"
+    p6_stage_payload "$T23/src"
     rm -rf "$T23/src/api_bridge/__pycache__" "$T23/src/web/__pycache__"
     printf '0.1.2\n' > "$T23/src/VERSION"
     export SBMON_APP_LINK="$T23_APP"
@@ -2719,6 +2762,7 @@ else
     mkdir -p "$T24/etc/systemd/system" "$T24/src"
     cp "$REPO_ROOT/monitor-v2/collector.py" "$REPO_ROOT/monitor-v2/webapp.py" "$T24/src/"
     cp -R "$REPO_ROOT/monitor-v2/web" "$REPO_ROOT/monitor-v2/api_bridge" "$T24/src/"
+    p6_stage_payload "$T24/src"
     rm -rf "$T24/src/api_bridge/__pycache__" "$T24/src/web/__pycache__"
     printf '0.1.3\n' > "$T24/src/VERSION"
     export SBMON_APP_LINK="$T24_APP"
@@ -2795,6 +2839,7 @@ else
     mkdir -p "$T25/etc/systemd/system" "$T25/src"
     cp "$REPO_ROOT/monitor-v2/collector.py" "$REPO_ROOT/monitor-v2/webapp.py" "$T25/src/"
     cp -R "$REPO_ROOT/monitor-v2/web" "$REPO_ROOT/monitor-v2/api_bridge" "$T25/src/"
+    p6_stage_payload "$T25/src"
     rm -rf "$T25/src/api_bridge/__pycache__" "$T25/src/web/__pycache__"
     printf '0.1.4\n' > "$T25/src/VERSION"
     export SBMON_APP_LINK="$T25_APP"
@@ -2876,6 +2921,7 @@ else
     mkdir -p "$T26/etc/systemd/system" "$T26/src"
     cp "$REPO_ROOT/monitor-v2/collector.py" "$REPO_ROOT/monitor-v2/webapp.py" "$T26/src/"
     cp -R "$REPO_ROOT/monitor-v2/web" "$REPO_ROOT/monitor-v2/api_bridge" "$T26/src/"
+    p6_stage_payload "$T26/src"
     rm -rf "$T26/src/api_bridge/__pycache__" "$T26/src/web/__pycache__"
     printf '0.1.5\n' > "$T26/src/VERSION"
     export SBMON_APP_LINK="$T26_APP"
@@ -2962,6 +3008,7 @@ else
     mkdir -p "$T27/etc/systemd/system" "$T27/src"
     cp "$REPO_ROOT/monitor-v2/collector.py" "$REPO_ROOT/monitor-v2/webapp.py" "$T27/src/"
     cp -R "$REPO_ROOT/monitor-v2/web" "$REPO_ROOT/monitor-v2/api_bridge" "$T27/src/"
+    p6_stage_payload "$T27/src"
     rm -rf "$T27/src/api_bridge/__pycache__" "$T27/src/web/__pycache__"
     printf '0.3.0\n' > "$T27/src/VERSION"
     export SBMON_APP_LINK="$T27_APP"
@@ -3229,6 +3276,7 @@ prestate_fixture_run() { # <tag> <fail-reader 0|1> [pre-boot-fail 0|1] [demote 0
     mkdir -p "$F/etc/systemd/system" "$F/bin" "$SRC" || return 1
     cp "$REPO_ROOT/monitor-v2/collector.py" "$REPO_ROOT/monitor-v2/webapp.py" "$SRC/" || return 1
     cp -R "$REPO_ROOT/monitor-v2/web" "$REPO_ROOT/monitor-v2/api_bridge" "$SRC/" || return 1
+    p6_stage_payload "$SRC" || return 1
     rm -rf "$SRC/api_bridge/__pycache__" "$SRC/web/__pycache__"
     # The installed baseline is the PREVIOUS Monitor release, so the version
     # comparison really does choose "upgrade". Its staged tree is demoted below

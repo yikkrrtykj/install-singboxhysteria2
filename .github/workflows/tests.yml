@@ -81,6 +81,7 @@ jobs:
           bash -n tests/test-monitor-v2-incident-runtime.sh
           bash -n tests/test-monitor-v2-incidents.sh
           bash -n tests/test-monitor-v2-remote-probe.sh
+          bash -n tests/test-monitor-v2-remote-server.sh
           bash -n monitor-v2/deploy/app-bin/monitor-contract-probe
           bash -n tests/journal-reader/test-jr-live.sh
           bash -n tests/journal-reader/test-jr-exchange-access.sh
@@ -262,8 +263,11 @@ jobs:
       - name: "0.6.0 PR-5 incidents UI suite (presenter wall / schema v5 markers / subject-bound evidence / closed-enum markers without free text / rearm preconditions + bucket grid / auth matrix / timeline byte-frozen / R2 fixtures through the live stack, issue #33 P5)"
         run: bash tests/test-monitor-v2-incidents.sh
 
-      - name: "0.6.1 PR-6A dark office remote-probe agent suite (explicit roles / closed active outcomes + delay-0 failure / bounded budgets and no overlap / GET-only Mihomo reuse byte-identical to E4 / canonical body + HMAC vector / run-seq-clock rollback / durable spool bounds + refusals / total response disposition / secret leak wall, issue #67 P6A)"
+      - name: "0.7.0 PR-6A dark office remote-probe agent suite (explicit roles / closed active outcomes + delay-0 failure / bounded budgets and no overlap / GET-only Mihomo reuse byte-identical to E4 / canonical body + HMAC vector / run-seq-clock rollback / durable spool bounds + refusals / total response disposition / secret leak wall, issue #67 P6A)"
         run: bash tests/test-monitor-v2-remote-probe.sh
+
+      - name: "0.7.0 PR-6B server ingest suite (exact machine-ingest placement after framing+whitelist and before Origin/session/CSRF / 16 KiB pre-JSON route cap / canonical-byte equality / probe_id-bound constant-time HMAC + dummy-key unknown path / indistinguishable auth failures / 300s freshness + sample-epoch bounds + strict run progression / idempotency + equivocation / run capacity + 30-day expiry / soft 16 hard 24 MiB remote-only retention / per-probe + global token buckets / independent two-table user_version=1 store / remote health excluded from evidence health / deploy rollback preserves the remote store, issue #67 P6B)"
+        run: bash tests/test-monitor-v2-remote-server.sh
 
   # ---------------------------------------------------------------------
   # Lane D -- compatibility matrix. Runs on the three supported Ubuntu LTS
