@@ -434,11 +434,16 @@ def group_store():
         assert qi_out == ih.OUTCOME_OK
         rows = qi_result["incidents"]
         window_row = rows[0]
+        in_out, in_count = history.marker_count(
+            window_row["analysis_start_epoch"],
+            window_row["last_classified_end_epoch"])
+        low_out, low_count = history.marker_count(BASE + 501.0, BASE + 600.0)
+        high_out, high_count = history.marker_count(BASE + 400.0,
+                                                    BASE + 499.0)
         out["marker_count_is_window_closed_join"] = (
-            history.marker_count(window_row["analysis_start_epoch"],
-                                 window_row["last_classified_end_epoch"]) == 1
-            and history.marker_count(BASE + 501.0, BASE + 600.0) == 0
-            and history.marker_count(BASE + 400.0, BASE + 499.0) == 0)
+            in_out == ih.OUTCOME_OK and in_count == 1
+            and low_out == ih.OUTCOME_OK and low_count == 0
+            and high_out == ih.OUTCOME_OK and high_count == 0)
         # (7) Markers participate in TIME retention: an aged-out marker is
         #     pruned by the same cleanup pass, and _PRUNE_SOURCES carries
         #     the table for SIZE pruning as one more global-order source.
@@ -638,6 +643,19 @@ def group_api():
             out["detail_non_integer_is_closed_404"] = (
                 status == 404
                 and json.loads(body)["error"] == "incident_not_found")
+            # B4: str.isdigit() accepts characters int() refuses and an
+            # unbounded digit string is unbounded work -- every malformed
+            # syntax is a CLOSED 404, never an internal error.
+            status, body, _c, _a = request(
+                "GET", "/api/v1/incidents/%C2%B2", cookie=session)
+            out["detail_superscript_digit_is_closed_404"] = (
+                status == 404
+                and json.loads(body)["error"] == "incident_not_found")
+            status, body, _c, _a = request(
+                "GET", "/api/v1/incidents/" + "9" * 40, cookie=session)
+            out["detail_overlong_digits_is_closed_404"] = (
+                status == 404
+                and json.loads(body)["error"] == "incident_not_found")
             status, body, _c, _a = request(
                 "GET", "/api/v1/incidents/rearm", cookie=session)
             out["rearm_get_is_method_error"] = (
@@ -670,6 +688,18 @@ def group_api():
                 "GET", "/api/v1/evidence?section=samples&incident_id=abc",
                 cookie=session)
             out["evidence_refuses_bad_subject_id"] = (
+                status == 400
+                and json.loads(body)["error"] == "invalid_subject")
+            status, body, _c, _a = request(
+                "GET", "/api/v1/evidence?section=samples&marker_id=%C2%B2",
+                cookie=session)
+            out["evidence_superscript_subject_is_400"] = (
+                status == 400
+                and json.loads(body)["error"] == "invalid_subject")
+            status, body, _c, _a = request(
+                "GET", "/api/v1/evidence?section=samples&marker_id="
+                       + "9" * 40, cookie=session)
+            out["evidence_overlong_subject_is_400"] = (
                 status == 400
                 and json.loads(body)["error"] == "invalid_subject")
             status, body, _c, _a = request(
@@ -754,6 +784,39 @@ def group_api():
             out["marker_post_refuses_already_aged_out"] = (
                 status == 400
                 and json.loads(body)["error"] == "invalid_marker_epoch")
+            # B3: PRESENCE is the contract -- explicit JSON null is NOT
+            # "now"; only omission defaults to now, and bool/string are
+            # shape defects even before the clock rules apply.
+            status, body, _c, _a = request(
+                "POST", "/api/v1/markers", cookie=session,
+                body={"kind": "operator_event", "epoch": None},
+                headers=_csrf_headers(session, auth))
+            out["marker_post_refuses_explicit_null_epoch"] = (
+                status == 400
+                and json.loads(body)["error"] == "invalid_marker_epoch")
+            status, body, _c, _a = request(
+                "POST", "/api/v1/markers", cookie=session,
+                body={"kind": "operator_event", "epoch": True},
+                headers=_csrf_headers(session, auth))
+            out["marker_post_refuses_bool_epoch"] = (
+                status == 400
+                and json.loads(body)["error"] == "invalid_marker_epoch")
+            status, body, _c, _a = request(
+                "POST", "/api/v1/markers", cookie=session,
+                body={"kind": "operator_event", "epoch": "now"},
+                headers=_csrf_headers(session, auth))
+            out["marker_post_refuses_string_epoch"] = (
+                status == 400
+                and json.loads(body)["error"] == "invalid_marker_epoch")
+            # an explicitly SUPPLIED valid numeric epoch is accepted
+            status, body, _c, _a = request(
+                "POST", "/api/v1/markers", cookie=session,
+                body={"kind": "operator_event",
+                      "epoch": time.time() - 60.0},
+                headers=_csrf_headers(session, auth))
+            out["marker_post_accepts_explicit_numeric_epoch"] = (
+                status == 200 and json.loads(body)["kind"]
+                == "operator_event")
             # (7) The marker lands over HTTP and carries the closed label.
             status, body, _c, _a = request(
                 "POST", "/api/v1/markers", cookie=session,
@@ -1254,6 +1317,21 @@ def group_outcomes():
             out["healthy_empty_is_200_empty"] = (
                 status == 200 and data.get("incidents") == []
                 and data.get("truncated") is False)
+            # B2: zero MEANS "no joined markers" on the healthy path --
+            # this window genuinely holds no markers.
+            c_out, zero_count = history.marker_count(BASE + 500.0,
+                                                     BASE + 600.0)
+            out["marker_count_zero_is_a_real_zero"] = (
+                c_out == ih.OUTCOME_OK and zero_count == 0)
+            # ... and the marker INSIDE the opened incident's window is a
+            # real positive count on the wire, never a fabricated zero.
+            status, body, _c, _a = request(
+                "GET", "/api/v1/incidents", cookie=session)
+            data = json.loads(body) if status == 200 else {}
+            listed = (data.get("incidents") or [{}])
+            out["marker_count_positive_over_real_marker"] = (
+                status == 200 and listed
+                and listed[0]["marker_count"] == 1)
             _grant_step_up(auth, session)
             status, body, _c, _a = request(
                 "POST", "/api/v1/incidents/rearm", cookie=session,
@@ -1322,6 +1400,22 @@ def group_outcomes():
                 status == 503
                 and json.loads(body)["error"] == "evidence unavailable"
                 and '"rows"' not in body)
+        finally:
+            try:
+                server.server_close()
+            except Exception:  # noqa: BLE001
+                pass
+        wrapper = _FaultHistory(history, {"marker_count": 1})
+        server, request, login, auth = _serve(wrapper)
+        try:
+            session = login()
+            status, body, _c, _a = request("GET", "/api/v1/incidents",
+                                           cookie=session)
+            out["fault_marker_count_is_503_never_zero"] = (
+                status == 503
+                and json.loads(body)["error"]
+                == "incident history unavailable"
+                and '"marker_count"' not in body)
         finally:
             try:
                 server.server_close()

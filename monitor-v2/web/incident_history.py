@@ -1311,20 +1311,24 @@ class IncidentHistory:
     def marker_count(self, analysis_start_epoch, last_classified_end_epoch):
         """The list-row marker_count: a read-time count over
         ``analysis_start <= epoch <= last_classified_end`` (#63 R2 §4).
-        Never raises; a read failure answers 0 (the list row itself stays
-        truthful -- the count is contextual, not verdict data)."""
+        Returns ``(OUTCOME_OK, count)`` -- where 0 MEANS "no joined
+        markers" -- or ``(OUTCOME_STORE_UNAVAILABLE, None)`` when the
+        marker table could not be read: a read failure is never presented
+        as a fabricated zero (never raises)."""
         try:
             with self._lock:
                 if not self._enabled or self._conn is None:
-                    return 0
+                    return OUTCOME_STORE_UNAVAILABLE, None
                 row = self._conn.execute(
                     "SELECT COUNT(*) FROM operator_markers"
                     " WHERE epoch >= ? AND epoch <= ?",
                     (analysis_start_epoch, last_classified_end_epoch)
                 ).fetchone()
-                return int(row[0])
+                return OUTCOME_OK, int(row[0])
         except (sqlite3.Error, OSError, ValueError, TypeError):
-            return 0
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return OUTCOME_STORE_UNAVAILABLE, None
 
     # Exact EVIDENCE wire whitelists (#63 R2 §8): subsets of the persisted
     # columns with the reader/probe identity stripped -- run_id, cycle_id,

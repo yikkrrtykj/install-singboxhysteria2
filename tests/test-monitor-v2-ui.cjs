@@ -753,6 +753,37 @@ async function main() {
     assert.doesNotMatch(ids['view-incidents'].textContent, /No problem occurred/);
     productText();
   });
+  // B1 (round 3): a truncated section holds the EARLIEST rows -- the
+  // wording must say LATER rows are omitted, and the L3 aggregates must
+  // announce that they are partial.
+  responses.push(response({subject: {type: 'incident', id: 1}, section: 'journal_events',
+    window: {start_epoch: 1, end_epoch: 160},
+    rows: [
+      {seq: 1, ts: 100, cls: 'reset', proto: 'Reality', port: 443, dcls: 'https443', n: 2},
+      {seq: 2, ts: 140, cls: 'reset', proto: 'Reality', port: 443, dcls: 'https443', n: 3}
+    ],
+    truncated: true, retention_cutoff_epoch: 0}));
+  await ui.loadEvidence('journal_events'); await flush();
+  check('B1: truncation says later rows are omitted and the L3 aggregate is declared partial', () => {
+    assert.match(ids['inc-rows-note'].textContent, /later rows in this section are not shown/);
+    assert.doesNotMatch(ids['inc-rows-note'].textContent, /older rows/);
+    assert.match(ids['inc-l3'].textContent, /cover only the rows shown here, not the full window/);
+    assert.doesNotMatch(ids['inc-l3'].textContent, /full-window total|complete/i);
+    // the raw L4 rows still carry exactly the rows the API returned
+    assert.equal(ids['inc-rows-body'].children.length, 2);
+    productText();
+  });
+  responses.push(response({subject: {type: 'incident', id: 1}, section: 'journal_events',
+    window: {start_epoch: 1, end_epoch: 160},
+    rows: [{seq: 1, ts: 100, cls: 'reset', proto: 'Reality', port: 443, dcls: 'https443', n: 2}],
+    truncated: false, retention_cutoff_epoch: 0}));
+  await ui.loadEvidence('journal_events'); await flush();
+  check('B1: an untruncated section carries no partial-aggregate notice', () => {
+    assert.doesNotMatch(ids['inc-l3'].textContent, /cover only the rows shown here/);
+    assert.ok(ids['inc-rows-note'].className.includes('hidden') ||
+              !/later rows/.test(ids['inc-rows-note'].textContent));
+    productText();
+  });
   responses.push(() => Promise.reject(new Error('network')));
   await ui.loadEvidence('probe_rows'); await flush();
   check('B4: a fetch/HTTP failure renders the unavailable state and never the retained-evidence text', () => {
@@ -846,6 +877,6 @@ async function main() {
     assert.ok(!ids['inc-list-card'].className.includes('hidden'));
     productText();
   });
-  assert.equal(count, 88, 'UI assertion count guard');
+  assert.equal(count, 90, 'UI assertion count guard');
 }
 main().catch(err => { console.error(err); process.exitCode = 1; });

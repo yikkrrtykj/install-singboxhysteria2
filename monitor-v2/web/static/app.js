@@ -39,6 +39,8 @@
   var INC_EMPTY_LIST = "No incidents recorded.";
   var INC_EMPTY_DEGRADED = "Incident history is currently degraded; an empty result cannot be treated as proof that no incidents were recorded.";
   var INC_DEVICE_DISCLAIMER = "Device rows are sparse contextual state only; they do not prove which logical clients were affected.";
+  var INC_TRUNCATED_NOTE = "Showing the first 2000 chronological rows; later rows in this section are not shown.";
+  var INC_AGGREGATE_PARTIAL = "Truncated section: the aggregates below cover only the rows shown here, not the full window.";
 
   var state = {
     snapshot: null,
@@ -782,7 +784,9 @@
     }
     var notes = [];
     if (data && data.truncated) {
-      notes.push("Showing the first 2000 rows of this section; older rows are not shown.");
+      // the read is ORDER BY epoch ASC LIMIT budget: the response holds
+      // the EARLIEST rows -- LATER rows in this section are omitted
+      notes.push(INC_TRUNCATED_NOTE);
     }
     if (data && data.window && data.retention_cutoff_epoch !== undefined &&
         data.window.start_epoch < data.retention_cutoff_epoch) {
@@ -841,6 +845,15 @@
     host.textContent = "";
     var rows = (data && data.rows) || [];
     if (!rows.length) return;   // the L4 empty state speaks for both
+    if (data.truncated && (data.section === "journal_events"
+                           || data.section === "audit")) {
+      // a truncated section's totals are NOT full-window totals: say so
+      // next to the aggregates instead of labelling them complete
+      var partial = document.createElement("p");
+      partial.className = "muted";
+      partial.textContent = INC_AGGREGATE_PARTIAL;
+      host.appendChild(partial);
+    }
     if (data.section === "journal_events") {
       // EXACT grouping key: (cls, proto, dcls, port)
       var groups = {};

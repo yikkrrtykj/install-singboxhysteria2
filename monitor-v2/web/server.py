@@ -302,6 +302,28 @@ INCIDENT_LIST_ROW_KEYS = (
 )
 
 
+# Bounded positive-ID parsing for the P5 route family: EXACTLY ASCII
+# 0-9, at most nine digits (any rowid this surface can produce is far
+# smaller), positive -- and TOTAL: no exception can escape, because
+# malformed user input must never reach the internal-error path.
+MAX_ROUTE_ID_DIGITS = 9
+ASCII_DIGITS = frozenset("0123456789")
+
+
+def parse_positive_id(raw):
+    """The bounded ASCII-decimal positive ID, or None. ``str.isdigit``
+    accepts non-ASCII digit characters (e.g. "²") that ``int`` then
+    refuses, and an unbounded digit string is unbounded conversion work --
+    so the parser is character-closed and length-bounded BEFORE ``int``
+    ever runs."""
+    if (not isinstance(raw, str) or not raw
+            or len(raw) > MAX_ROUTE_ID_DIGITS
+            or not all(ch in ASCII_DIGITS for ch in raw)):
+        return None
+    value = int(raw)
+    return value if value >= 1 else None
+
+
 def incident_list_params(query):
     """Validate the ONLY accepted incident-list params:
     (error, state, limit). Unknown query keys are IGNORED -- never
@@ -786,9 +808,13 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
                 # error on a known route, never a silent 404.
                 self._method_not_allowed(allowed="POST")
                 return
-            if suffix.isdigit():
-                self._require_session(self._handle_incident_detail, suffix)
+            incident_id = parse_positive_id(suffix)
+            if incident_id is not None:
+                self._require_session(self._handle_incident_detail,
+                                      incident_id)
                 return
+            # invalid SYNTAX and a valid-but-missing id share the same
+            # closed 404 -- the route never confirms an arbitrary number
             self._send_json(404, {"error": "incident_not_found"})
             return
         if path == "/api/v1/evidence":
@@ -1139,9 +1165,17 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         rows = []
         for row in result["incidents"]:
             item = {key: row[key] for key in INCIDENT_LIST_ROW_KEYS}
-            item["marker_count"] = history.marker_count(
+            c_outcome, count = history.marker_count(
                 row["analysis_start_epoch"],
                 row["last_classified_end_epoch"])
+            if c_outcome != ih_outcome_ok:
+                # zero MEANS "no joined markers"; an unreadable marker
+                # table must never masquerade as a fabricated zero on a
+                # 200 list (the failure is recorded in health by the store)
+                self._send_json(503,
+                                {"error": "incident history unavailable"})
+                return
+            item["marker_count"] = count
             rows.append(item)
         self._send_json(200, {
             "incidents": rows,
@@ -1151,7 +1185,7 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             "limit": result["limit"],
         })
 
-    def _handle_incident_detail(self, session, raw_id):
+    def _handle_incident_detail(self, session, incident_id):
         """GET /api/v1/incidents/<id>
 
         The closed detail projection (#63 R2 §4): the 12 list fields plus
@@ -1165,7 +1199,7 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         if history is None:
             self._send_json(503, {"error": "incident history not enabled"})
             return
-        outcome, detail = history.incident_detail(int(raw_id))
+        outcome, detail = history.incident_detail(incident_id)
         if outcome == ih_outcome_missing:
             self._send_json(404, {"error": "incident_not_found"})
             return
@@ -1223,10 +1257,10 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "invalid_subject"})
             return
         subject_type, raw_id = subjects[0]
-        if not raw_id.isdigit():
+        subject_id = parse_positive_id(raw_id)
+        if subject_id is None:
             self._send_json(400, {"error": "invalid_subject"})
             return
-        subject_id = int(raw_id)
         if subject_type == "incident":
             d_outcome, detail = history.incident_detail(subject_id)
             if d_outcome == ih_outcome_missing:
@@ -1320,8 +1354,11 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         if kind not in MARKER_KINDS:
             self._send_json(400, {"error": "invalid_marker_kind"})
             return
-        epoch = body.get("epoch")
-        if epoch is not None:
+        if "epoch" in body:
+            # PRESENCE is the contract: omission means "now"; an explicit
+            # epoch -- JSON null included -- must be EXACTLY a finite,
+            # non-negative, non-bool number inside the retention window.
+            epoch = body["epoch"]
             # EXACT typing first: a bool is an int subclass that would
             # otherwise pass as a timestamp; a string would compare.
             if type(epoch) not in (int, float) or isinstance(epoch, bool) \
@@ -1332,10 +1369,19 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             if epoch > now or epoch < now - RETENTION_SECONDS:
                 self._send_json(400, {"error": "invalid_marker_epoch"})
                 return
+        else:
+            epoch = None
         m_outcome, row = history.record_marker(kind, epoch)
+        if m_outcome == ih_outcome_rejected:
+            # the body passed the HTTP time check but crossed the
+            # retention/future boundary by the time the store checked it:
+            # an honest closed 400 epoch refusal, never a persistence
+            # failure and never a fabricated success
+            self._send_json(400, {"error": "invalid_marker_epoch"})
+            return
         if m_outcome != ih_outcome_recorded:
-            # a persistence failure/refusal is a closed 503, never a
-            # fabricated success and never exception text
+            # a persistence failure is a closed 503, never a fabricated
+            # success and never exception text
             self._send_json(503, {"error": "marker persistence failed"})
             return
         row["label"] = incident_presenter.marker_label(row["kind"])
