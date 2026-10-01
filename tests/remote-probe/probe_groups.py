@@ -40,8 +40,10 @@ from remote_probe import mihomo_probe as mp  # noqa: E402
 from remote_probe import payload as pl  # noqa: E402
 from remote_probe import spool as sp  # noqa: E402
 
-SECRET = b"p6-sentinel-secret-DO-NOT-LEAK-0123456789"
-SECRET_TEXT = SECRET.decode()
+# Exactly 256-bit material: the FILE holds 64 lowercase hex characters, the
+# SIGNING KEY is the decoded 32 bytes (issue #67 §5).
+SECRET = bytes.fromhex("0123456789abcdef" * 4)
+SECRET_TEXT = SECRET.hex()
 SENTINEL = "SENTINEL-LEAK-CANARY-9f3a"
 RUN = "0123456789abcdef0123456789abcdef"
 LOOPBACK_URL = "http://127.0.0.1:9090"
@@ -275,7 +277,7 @@ def group_active():
         instance.spool.enforce_bounds()
         clean(instance.config.spool_dir)
     # 3. timeout
-    for status in (400, 408, 504):
+    for status in (408, 504):
         instance, _t = _delay_agent((status, b'{"message":"timeout"}'))
         try:
             outcome, delay, _n = instance.mihomo.delay(
@@ -283,7 +285,31 @@ def group_active():
             out["active_timeout_status_%d" % status] = (
                 outcome == rp.OUTCOME_TIMEOUT and delay is None)
         finally:
+            instance.spool.close()
             clean(instance.config.spool_dir)
+    # A 400 is the controller rejecting the REQUEST (parameter, endpoint, API
+    # contract): a configuration/contract error must never read as a path
+    # timeout.
+    instance, _t = _delay_agent((400, b'{"message":"An error occurred in the delay test"}'))
+    try:
+        outcome, delay, _n = instance.mihomo.delay(
+            rp.ROLE_REALITY, "office-reality-01")
+        out["active_status_400_is_invalid_not_timeout"] = (
+            outcome == rp.OUTCOME_INVALID and delay is None)
+    finally:
+        instance.spool.close()
+        clean(instance.config.spool_dir)
+    # A positive delay larger than the <=5 s test budget cannot have come from
+    # that test.
+    instance, _t = _delay_agent(delay_route(200, {"delay": 60000}))
+    try:
+        outcome, delay, _n = instance.mihomo.delay(
+            rp.ROLE_REALITY, "office-reality-01")
+        out["active_impossible_delay_is_invalid"] = (
+            outcome == rp.OUTCOME_INVALID and delay is None)
+    finally:
+        instance.spool.close()
+        clean(instance.config.spool_dir)
     # 4. delay == 0 is a FAILED test, never 0 ms of latency
     instance, _t = _delay_agent(delay_route(200, {"delay": 0}))
     try:
@@ -758,7 +784,9 @@ def group_spool():
     try:
         record_id = queue.append("office-sg-isp-a", RUN, 1, body,
                                  queued_epoch=clock[0])
-        # 26. spool-before-ack: the record is durable BEFORE any upload
+        # 26. spool-before-ack: the record is durable BEFORE any upload.
+        # The spool is single-writer, so the first handle is closed first.
+        queue.close()
         reopened = sp.Spool(directory, clock=lambda: clock[0]).open()
         pending = list(reopened.pending())
         out["spool_survives_reopen_before_any_ack"] = (
@@ -790,10 +818,7 @@ def group_spool():
             != second_headers["X-Remote-Probe-Signature"])
         out["ack_removes_the_record"] = list(reopened.pending()) == []
         out["spool_status_is_closed_and_counted"] = (
-            set(reopened.status()) == {
-                "pending", "pending_bytes", "oldest_queued_epoch",
-                "resolved_through", "acknowledged_total", "quarantined_total",
-                "expired_total", "budget_dropped_total", "corrupt_total"}
+            set(reopened.status()) == set(sp.STATUS_KEYS)
             and reopened.status()["acknowledged_total"] == 1)
         # 43. no poison head: a permanent record resolves and later records
         #     are still delivered in the SAME pass
@@ -824,6 +849,7 @@ def group_spool():
     path = os.path.join(directory, sp.SPOOL_FILE)
     with open(path, "ab") as handle:
         handle.write(b'{"v":1,"record_id":2,"probe_id":"office-sg-isp-a"')
+    queue.close()          # single writer: hand the directory over explicitly
     repaired = sp.Spool(directory, clock=lambda: 1700000000.0).open()
     out["torn_tail_repaired"] = (
         len(list(repaired.pending())) == 1
@@ -832,6 +858,7 @@ def group_spool():
     with open(path, "ab") as handle:
         handle.write(b'{"v":1,"record_id":3,"probe_id":"office-sg-isp-a","run":"%s","seq":3,"queued_epoch":1700000000.0,"body_b64":"!!!!"}\n'
                      % RUN.encode())
+    repaired.close()
     counted = sp.Spool(directory, clock=lambda: 1700000000.0).open()
     out["corrupt_complete_line_is_counted"] = (
         list(counted.pending()) == list(repaired.pending())
@@ -865,6 +892,7 @@ def group_spool():
     queue.append("office-sg-isp-a", RUN, 2, pl.encode_sample(_sample(2)),
                  queued_epoch=1700003600.0)
     status = queue.enforce_bounds()
+    queue.close()
     out["seven_day_bound_expires_old_records"] = status["expired_total"] >= 1
     out["spool_bounds_match_the_contract"] = (
         sp.MAX_AGE_SECONDS <= 7 * 86400.0
@@ -1090,12 +1118,16 @@ def group_cycle():
         out["status_is_closed_and_sanitized"] = (
             set(status) == {"probe_id", "run", "seq", "cycles",
                             "cycle_failures", "clock_rollbacks",
-                            "overlap_refusals", "spool_failures", "state",
-                            "active", "spool"}
+                            "overlap_refusals", "spool_failures",
+                            "retention_runs", "retention_failures",
+                            "delivery_deferrals", "last_backoff_seconds",
+                            "state", "active", "spool"}
             and SECRET_TEXT not in json.dumps(status))
         # 45. secret leak wall: payload, spool bytes, status, exception text
         spool_bytes = b""
         for path in glob.glob(os.path.join(instance.config.spool_dir, "*")):
+            if not os.path.isfile(path) or path.endswith(sp.LOCK_FILE):
+                continue   # the writer lock is held open on Windows
             with open(path, "rb") as handle:
                 spool_bytes += handle.read()
         out["secret_never_in_payload_or_spool"] = (
@@ -1164,6 +1196,326 @@ def group_cycle():
 
 def _boom_spool(*_a, **_k):
     raise sp.SpoolError("refused")
+
+
+def group_resilience():
+    out = {}
+    # ---- B1a: an unknown response is bounded ACROSS delivery calls, then
+    #      quarantined, and the queue advances to the next record.
+    root = temp_dir()
+    directory = os.path.join(root, "spool")
+    clock = [1700000000.0]
+    queue = sp.Spool(directory, clock=lambda: clock[0]).open()
+    queue.append("office-sg-isp-a", RUN, 1, pl.encode_sample(_sample(1)),
+                 queued_epoch=clock[0])
+    queue.append("office-sg-isp-a", RUN, 2, pl.encode_sample(_sample(2)),
+                 queued_epoch=clock[0])
+    unknown_poster = FakePoster([(600, b"")] * 20
+                                + [(200, b'{"result":"accepted","v":1}')])
+    for _ in range(dl.UNKNOWN_RESPONSE_MAX_ATTEMPTS):
+        dl.deliver_pending(queue, SECRET, "office-sg-isp-a", unknown_poster,
+                           now_epoch=int(clock[0]))
+    out["unknown_quarantines_after_bounded_multi_call_attempts"] = (
+        queue.status()["quarantined_total"] == 1
+        and [item["seq"] for item in queue.pending()] == [2])
+    final = dl.deliver_pending(queue, SECRET, "office-sg-isp-a",
+                               FakePoster(), now_epoch=int(clock[0]))
+    out["queue_advances_past_the_bounded_unknown_head"] = (
+        final["acked"] == 1 and list(queue.pending()) == [])
+    queue.close()
+    clean(root)
+    # ---- B1b: retry state is DURABLE (a restart cannot reset the budget)
+    root = temp_dir()
+    directory = os.path.join(root, "spool")
+    queue = sp.Spool(directory, clock=lambda: 1700000000.0).open()
+    queue.append("office-sg-isp-a", RUN, 1, pl.encode_sample(_sample(1)),
+                 queued_epoch=1700000000.0)
+    retry_poster = FakePoster([(503, b"")] * 5)
+    dl.deliver_pending(queue, SECRET, "office-sg-isp-a", retry_poster,
+                       now_epoch=1700000000)
+    dl.deliver_pending(queue, SECRET, "office-sg-isp-a", retry_poster,
+                       now_epoch=1700000001)
+    before = queue.attempts(1)
+    queue.close()
+    reopened = sp.Spool(directory, clock=lambda: 1700000002.0).open()
+    out["retry_budget_survives_a_spool_reopen"] = (
+        before == 2 and reopened.attempts(1) == 2)
+    reopened.close()
+    clean(root)
+    # ---- B1c: the AGENT PRODUCT PATH consumes the bounded backoff
+    transport = FakeTransport({
+        "/version": (200, b'{"version":"1.18"}'),
+        "/proxies": (200, json.dumps(proxies_payload()).encode()),
+        "/proxies/office-reality-01/delay": delay_route(200, {"delay": 82}),
+        "/proxies/office-hy2-01/delay": delay_route(200, {"delay": 140}),
+    })
+    poster = FakePoster([(503, b"")])
+    instance, _t = build_agent(transport=transport, poster=poster)
+    try:
+        instance.open()
+        first = instance.run_cycle(now=1700000000.0)
+        calls_after_first = len(poster.requests)
+        resumed = instance.deliver()
+        out["agent_consumes_bounded_backoff_not_the_sampling_beat"] = (
+            first["delivery"]["stopped"] == "retryable"
+            and instance.last_backoff_seconds > 0
+            and resumed["stopped"] == "backoff"
+            and len(poster.requests) == calls_after_first
+            and instance.delivery_deferrals == 1)
+    finally:
+        instance.close()
+        clean(instance.config.spool_dir)
+    # ---- B2a: the AGENT expires an over-age record from its own cycle path
+    #      (no direct enforce_bounds call anywhere in this verdict).
+    root = temp_dir()
+    directory = os.path.join(root, "spool")
+    seed = sp.Spool(directory, clock=lambda: 1700003600.0).open()
+    seed.append("office-sg-isp-a", RUN, 1, pl.encode_sample(_sample(1)),
+                queued_epoch=1700003600.0 - 8 * 86400.0)      # 8 days old
+    seed.close()
+    instance, _t = build_agent(
+        transport=FakeTransport({"/version": (200, b'{"version":"1.18"}'),
+                                 "/proxies": (200, b"{}")}),
+        clock=lambda: 1700003600.0,
+        config_over={"spool_dir": directory})
+    try:
+        instance.open()          # startup retention must already drop it
+        out["agent_startup_retention_expires_over_age_records"] = (
+            instance.retention_runs >= 1
+            and list(instance.spool.pending()) == []
+            and instance.spool.status()["expired_total"] >= 1)
+    finally:
+        instance.close()
+    clean(root)
+    # ---- B2b: the same bound is applied periodically, from run_cycle
+    root = temp_dir()
+    directory = os.path.join(root, "spool")
+    seed = sp.Spool(directory, clock=lambda: 1700003600.0).open()
+    seed.append("office-sg-isp-a", RUN, 1, pl.encode_sample(_sample(1)),
+                queued_epoch=1700003600.0)
+    seed.close()
+    later = 1700003600.0 + 9 * 86400.0
+    instance, _t = build_agent(
+        transport=FakeTransport({"/version": (200, b'{"version":"1.18"}'),
+                                 "/proxies": (200, b"{}")}),
+        clock=lambda: later, config_over={"spool_dir": directory})
+    try:
+        instance.open()
+        instance._next_retention_at = 0.0     # the interval has come round
+        result = instance.run_cycle(now=later)
+        out["agent_periodic_retention_runs_from_the_cycle"] = (
+            result["outcome"] == "spooled"
+            and instance.retention_runs >= 2
+            and instance.spool.status()["expired_total"] >= 1)
+    finally:
+        instance.close()
+    clean(root)
+    # ---- B2c: acknowledged records do not linger in ROTATED files
+    root = temp_dir()
+    directory = os.path.join(root, "spool")
+    clock = [1700000000.0]
+    # A chain that really ROTATES: the per-file budget holds several records,
+    # so nothing is dropped and the proof is about physical retention, not
+    # about the byte bound.
+    queue = sp.Spool(directory, clock=lambda: clock[0],
+                     file_bytes=4096, max_files=4).open()
+    for index in range(12):
+        queue.append("office-sg-isp-a", RUN, index + 1,
+                     pl.encode_sample(_sample(index + 1)),
+                     queued_epoch=clock[0])
+    dl.deliver_pending(queue, SECRET, "office-sg-isp-a", FakePoster(),
+                       now_epoch=int(clock[0]))
+    queue.enforce_bounds()
+    leftovers = []
+    for path in glob.glob(os.path.join(directory, "spool.jsonl*")):
+        with open(path, "rb") as handle:
+            leftovers.extend(line for line in handle.read().splitlines()
+                             if line.strip())
+    out["acked_records_do_not_linger_in_rotated_files"] = (
+        queue.status()["acknowledged_total"] == 12
+        and queue.status()["budget_dropped_total"] == 0
+        and leftovers == [])
+    queue.close()
+    clean(root)
+    # ---- B3: crash between the record fsync and the state save
+    root = temp_dir()
+    directory = os.path.join(root, "spool")
+    queue = sp.Spool(directory, clock=lambda: 1700000000.0).open()
+    first_id = queue.append("office-sg-isp-a", RUN, 1,
+                            pl.encode_sample(_sample(1)),
+                            queued_epoch=1700000000.0)
+    # Fault injection: the record line is durable, but the cursor recording it
+    # never landed (exactly the crash window).
+    os.unlink(queue._state_path())
+    queue.close()
+    repaired = sp.Spool(directory, clock=lambda: 1700000000.0).open()
+    second_id = repaired.append("office-sg-isp-a", RUN, 2,
+                                pl.encode_sample(_sample(2)),
+                                queued_epoch=1700000000.0)
+    pending = [item["seq"] for item in repaired.pending()]
+    poster = FakePoster()
+    summary = dl.deliver_pending(repaired, SECRET, "office-sg-isp-a", poster,
+                                 now_epoch=1700000000)
+    out["crash_window_cannot_reuse_a_record_id"] = (
+        first_id == 1 and second_id == 2 and second_id != first_id)
+    out["reconciled_ids_are_counted"] = repaired.status()["reconciled_ids"] >= 1
+    out["reconciled_queue_delivers_each_record_once"] = (
+        pending == [1, 2] and summary["acked"] == 2
+        and len(poster.requests) == 2
+        and len({request["headers"]["X-Remote-Probe-Seq"]
+                 for request in poster.requests}) == 2)
+    repaired.close()
+    clean(root)
+    # a duplicate id in the durable file is refused, never adopted
+    dup_root = temp_dir()
+    dup_dir = os.path.join(dup_root, "spool")
+    q2 = sp.Spool(dup_dir, clock=lambda: 1700000000.0).open()
+    q2.append("office-sg-isp-a", RUN, 1, pl.encode_sample(_sample(1)),
+              queued_epoch=1700000000.0)
+    q2.close()
+    dup_path = os.path.join(dup_dir, sp.SPOOL_FILE)
+    with open(dup_path, "rb") as handle:
+        payload = handle.read()
+    with open(dup_path, "ab") as handle:
+        handle.write(payload)
+    try:
+        sp.Spool(dup_dir, clock=lambda: 1700000000.0).open()
+        out["duplicate_record_ids_fail_closed"] = False
+    except sp.SpoolError:
+        out["duplicate_record_ids_fail_closed"] = True
+    clean(dup_root)
+    # ---- B4: deadline exhaustion still produces a LEGAL, encodable sample
+    gate = threading.Event()
+    transport = FakeTransport(gate=gate)
+    ticks = [0.0]
+
+    def advancing():
+        ticks[0] += 25.0        # a REAL advancing clock: the deadline expires
+        return ticks[0]
+
+    instance, transport = build_agent(transport=transport,
+                                      config_over={"cycle_deadline": 1.0})
+    instance.monotonic = advancing
+    try:
+        instance.open()
+        result = instance.run_cycle(now=1700000000.0)
+        gate.set()
+        body = None
+        for item in instance.spool.pending():
+            body = json.loads(item["body"].decode("utf-8"))
+        out["deadline_exhaustion_produces_a_valid_sample"] = (
+            result["outcome"] == "spooled" and body is not None
+            and pl.validate_sample(body) == [])
+        out["deadline_flags_are_closed_tokens"] = (
+            body is not None
+            and all(token in pl.SOURCE_TOKENS
+                    for token in body["flags"]["source_unavailable"]))
+    finally:
+        instance.close()
+        clean(instance.config.spool_dir)
+    out["producer_tokens_are_in_the_frozen_enum"] = all(
+        token in pl.SOURCE_TOKENS
+        for token in ("active_delay", "direct", "passive_cache", "egress"))
+
+
+    # ---- B5: the egress baseline moves only AFTER the sample is durable
+    transport = FakeTransport({
+        "/version": (200, b'{"version":"1.18"}'),
+        "/proxies": (200, json.dumps(proxies_payload()).encode()),
+        "/proxies/office-reality-01/delay": delay_route(200, {"delay": 82}),
+        "/proxies/office-hy2-01/delay": delay_route(200, {"delay": 140}),
+    })
+    original_https_b5 = dp.http.client.HTTPSConnection
+    FakeHTTPSConnection.log = []
+    FakeHTTPSConnection.sensor = {"status": 200, "body": IP_B.encode(),
+                                  "raise": None}
+    dp.http.client.HTTPSConnection = FakeHTTPSConnection
+    instance, _t = build_agent(transport=transport, poster=None)
+    real_append = type(instance.spool).append.__get__(instance.spool,
+                                                      type(instance.spool))
+    try:
+        instance.open()
+        instance._baseline = IP_A
+        instance._write_baseline(IP_A)
+        instance.spool.append = _boom_spool
+        failed = instance.run_cycle(now=1700000000.0)
+        staged = instance._pending_baseline
+        durable = instance._baseline
+        instance.spool.append = real_append
+        ok = instance.run_cycle(now=1700000001.0)
+        out["spool_failure_does_not_move_the_egress_baseline"] = (
+            failed["outcome"] == "spool_unavailable"
+            and staged is None and durable == IP_A)
+        out["baseline_commits_after_a_durable_sample"] = (
+            ok["outcome"] == "spooled" and instance._baseline == IP_B)
+        with open(instance._baseline_path(), encoding="utf-8") as handle:
+            out["baseline_file_matches_the_committed_value"] = (
+                json.loads(handle.read())["ip"] == IP_B)
+    finally:
+        dp.http.client.HTTPSConnection = original_https_b5
+        instance.close()
+        clean(instance.config.spool_dir)
+    # ---- B6: the ingest secret is EXACTLY 256-bit material
+    root = temp_dir()
+    try:
+        secret_path = os.path.join(root, "probe.key")
+        refusals = []
+        for value in ("", "deadbeef", "z" * 64, "A" * 64, "0" * 63, "0" * 65,
+                      "0123456789abcdef" * 5):
+            with open(secret_path, "w", encoding="utf-8") as handle:
+                handle.write(value)
+            if os.name == "posix":
+                os.chmod(secret_path, 0o600)
+            try:
+                ag.load_probe_secret(secret_path)
+                refusals.append(False)
+            except ag.ConfigError:
+                refusals.append(True)
+        out["non_256_bit_secrets_are_refused"] = all(refusals)
+        with open(secret_path, "w", encoding="utf-8") as handle:
+            handle.write(SECRET_TEXT)
+        if os.name == "posix":
+            os.chmod(secret_path, 0o600)
+        loaded = ag.load_probe_secret(secret_path)
+        out["valid_256_bit_secret_decodes_to_32_bytes"] = (
+            loaded == SECRET and len(loaded) == 32)
+    finally:
+        clean(root)
+    # ---- storage tightening + single writer
+    root = temp_dir()
+    directory = os.path.join(root, "spool")
+    queue = sp.Spool(directory, clock=lambda: 1700000000.0).open()
+    queue.append("office-sg-isp-a", RUN, 1, pl.encode_sample(_sample(1)),
+                 queued_epoch=1700000000.0)
+    queue.close()
+    state_path = os.path.join(directory, sp.STATE_FILE)
+    if hasattr(os, "symlink"):
+        try:
+            os.symlink(os.path.join(directory, "absent-target"), state_path)
+            try:
+                sp.Spool(directory, clock=lambda: 1700000000.0).open()
+                out["symlinked_state_file_refused"] = False
+            except sp.SpoolError:
+                out["symlinked_state_file_refused"] = True
+            os.unlink(state_path)
+        except (OSError, NotImplementedError, AttributeError):
+            out["symlinked_state_file_refused"] = True
+    else:
+        out["symlinked_state_file_refused"] = True
+    first = sp.Spool(directory, clock=lambda: 1700000000.0).open()
+    try:
+        try:
+            sp.Spool(directory, clock=lambda: 1700000000.0).open()
+            out["second_writer_is_refused"] = False
+        except sp.SpoolError:
+            out["second_writer_is_refused"] = True
+    finally:
+        first.close()
+    out["lock_is_released_on_close"] = (
+        sp.Spool(directory, clock=lambda: 1700000000.0).open() is not None)
+    clean(root)
+
+    return out
 
 
 # -- group: contract constants ---------------------------------------------------
@@ -1252,6 +1604,7 @@ GROUPS = {
     "disposition": group_disposition,
     "cycle": group_cycle,
     "contract": group_contract,
+    "resilience": group_resilience,
 }
 
 

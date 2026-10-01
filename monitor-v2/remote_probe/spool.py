@@ -3,24 +3,31 @@
 The spool exists for exactly one reason: a short server/network outage must not
 erase office-side incident evidence. It is therefore append-only, fsynced
 before a record is considered durable, and a record leaves the queue only in a
-TERMINAL state (acknowledged by the server, or resolved into the bounded
-quarantine ledger).
+TERMINAL state (acknowledged, or resolved into the bounded quarantine ledger).
 
 Crash-safety uses the same CLASS of primitives as the audited E4-Diag writer
-(``monitor-v2/mihomo/diag.py``), re-implemented here so the office agent stays
-a stdlib-only, server-independent tree:
+(``monitor-v2/mihomo/diag.py``):
 
-* directory: real, no symlink component, mode 0700;
-* record files: regular, no-follow, mode 0600, ``O_APPEND``;
+* directory: real, no symlink component, mode 0700 (tightened, matching
+  History's ``_validate_dir`` and the E4-Diag writer);
+* EVERY file this module owns -- the record chain, the state file, both temp
+  files, the compaction temp and the lock -- is opened ``O_NOFOLLOW``,
+  fstat-verified as a regular file and forced to mode 0600; a symlink, a
+  special file or an unsafe target fails closed. The checks run on the OPEN
+  descriptor, so there is no lstat-then-open TOCTOU window;
 * one complete write loop per record, then ``fsync``;
-* startup repair of AT MOST one incomplete trailing fragment;
+* startup repairs AT MOST one incomplete trailing fragment;
 * rotation with file fsync, rename, then directory fsync;
-* unsafe/symlink/special objects FAIL CLOSED (never followed, never adopted).
+* startup ID reconciliation, so a crash between the record fsync and the state
+  save can never make the next append reuse a record id;
+* an advisory single-writer lock, so two agents over one directory cannot
+  produce duplicate cursors or duplicate uploads;
+* durable per-record retry counters, so a restart cannot reset a retry budget.
 
-Ordering note: records are delivered strictly in order. Every record ends in
-exactly one terminal state, so the durable cursor advances through both
-acknowledged and quarantined records -- a permanently-rejected record can
-therefore never become a poison head that blocks later samples.
+Ordering: records are delivered strictly in order. Every record ends in exactly
+one terminal state, so the durable cursor advances through both acknowledged
+and quarantined records -- a permanently-rejected record can never become a
+poison head that blocks later samples.
 """
 
 from __future__ import annotations
@@ -38,12 +45,21 @@ from .payload import canonical_bytes
 RECORD_VERSION = 1
 SPOOL_FILE = "spool.jsonl"
 STATE_FILE = "spool.state.json"
+LOCK_FILE = "spool.lock"
 MAX_FILES = 4
 FILE_BYTES = 8 * 1024 * 1024          # per-file rotation threshold
 MAX_AGE_SECONDS = 7 * 86400.0         # <= 7 days (contract)
 MAX_TOTAL_BYTES = 32 * 1024 * 1024    # <= 32 MiB (contract)
+RETENTION_INTERVAL_SECONDS = 3600.0   # periodic enforcement while running
 QUARANTINE_MAX_ENTRIES = 512
 RECORD_MAX_BYTES = MAX_BODY_BYTES * 2  # base64 of a 16 KiB body, with slack
+STATE_MAX_BYTES = 512 * 1024
+MAX_TRACKED_RETRIES = 4096
+NL = bytes([10])
+# os.open defaults to TEXT mode on Windows, which would silently rewrite
+# every LF as CRLF and break the exact-bytes invariant of a record line.
+# The audited E4-Diag writer passes O_BINARY for the same reason.
+BINARY = getattr(os, "O_BINARY", 0)
 
 # Closed quarantine tokens (sanitized: never a server body or error string).
 QUARANTINE_MALFORMED_2XX = "malformed_2xx"
@@ -54,6 +70,11 @@ QUARANTINE_UNKNOWN_RESPONSE = "unknown_response"
 QUARANTINE_TOKENS = (QUARANTINE_MALFORMED_2XX, QUARANTINE_REDIRECT,
                      QUARANTINE_CLIENT_ERROR, QUARANTINE_OVERSIZE,
                      QUARANTINE_UNKNOWN_RESPONSE)
+
+STATUS_KEYS = ("pending", "pending_bytes", "oldest_queued_epoch",
+               "resolved_through", "acknowledged_total", "quarantined_total",
+               "expired_total", "budget_dropped_total", "corrupt_total",
+               "state_save_failures", "reconciled_ids", "tracked_attempts")
 
 
 class SpoolError(Exception):
@@ -80,9 +101,16 @@ def _write_all(fd, data):
         view = view[written:]
 
 
+def _fsync_quiet(fd):
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+
+
 def check_no_symlink_component(path):
-    """Every component of ``path`` must exist and be a real directory (or the
-    final component a real file). A symlink anywhere is refused fail-closed."""
+    """Every component of ``path`` must be a real directory (or the final
+    component a real file): a symlink anywhere is refused fail-closed."""
     current = os.path.abspath(path)
     parts = []
     while True:
@@ -103,18 +131,111 @@ def check_no_symlink_component(path):
             raise SpoolError("symlink component refused: %s" % probe)
 
 
+def open_restricted(path, flags, mode=0o600):
+    """Open ONE spool file under the full storage discipline.
+
+    ``O_NOFOLLOW`` refuses a symlink at the final component (a link at open
+    time is ELOOP, never a followed target); ``fstat`` proves the object that
+    was opened is a regular file (never a FIFO/device/dir); the mode is forced
+    to 0600. The checks run on the OPEN descriptor.
+    """
+    open_flags = flags | BINARY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, open_flags, mode)
+    except OSError as exc:
+        if getattr(exc, "errno", None) == errno.ELOOP:
+            raise SpoolError("symlink refused: %s" % path) from exc
+        if getattr(exc, "errno", None) == errno.ENXIO:
+            raise SpoolError("special file refused: %s" % path) from exc
+        raise
+    try:
+        st = os.fstat(fd)
+        if not stat_module.S_ISREG(st.st_mode):
+            raise SpoolError("not a regular file: %s" % path)
+        if os.name == "posix":
+            try:
+                if stat_module.S_IMODE(st.st_mode) != 0o600:
+                    os.fchmod(fd, 0o600)
+            except OSError:
+                raise SpoolError("mode not settable: %s" % path) from None
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def read_restricted(path, limit):
+    """Read a bounded number of bytes from a regular, no-follow file."""
+    fd = open_restricted(path, os.O_RDONLY)
+    try:
+        chunks = []
+        remaining = int(limit)
+        while remaining > 0:
+            chunk = os.read(fd, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+class _InstanceLock:
+    """Advisory exclusive lock over one spool directory (single writer)."""
+
+    def __init__(self, path):
+        self.path = path
+        self.fd = None
+
+    def acquire(self):
+        fd = open_restricted(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            if os.name == "posix":
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            elif os.name == "nt":
+                import msvcrt
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        except (OSError, ImportError):
+            os.close(fd)
+            raise SpoolError(
+                "spool directory is locked by another writer") from None
+        self.fd = fd
+
+    def release(self):
+        if self.fd is None:
+            return
+        try:
+            if os.name == "posix":
+                import fcntl
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
+            elif os.name == "nt":
+                import msvcrt
+                try:
+                    msvcrt.locking(self.fd, msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
+        except (OSError, ImportError):
+            pass
+        os.close(self.fd)
+        self.fd = None
+
+
 class Spool:
     """One bounded, durable office-side queue over a dedicated directory."""
 
     def __init__(self, directory, clock=None, max_age=MAX_AGE_SECONDS,
                  max_bytes=MAX_TOTAL_BYTES, max_files=MAX_FILES,
-                 file_bytes=FILE_BYTES):
+                 file_bytes=FILE_BYTES, lock=True):
         self.directory = directory
         self.clock = clock or (lambda: __import__("time").time())
         self.max_age = float(max_age)
         self.max_bytes = int(max_bytes)
         self.max_files = int(max_files)
         self.file_bytes = int(file_bytes)
+        self._lock_enabled = bool(lock)
+        self._instance_lock = None
         self._state = {
             "next_record_id": 1,
             "resolved_through": 0,
@@ -123,6 +244,9 @@ class Spool:
             "expired_total": 0,
             "budget_dropped_total": 0,
             "corrupt_total": 0,
+            "state_save_failures": 0,
+            "reconciled_ids": 0,
+            "retry_attempts": {},
             "quarantine": [],
         }
         self._opened = False
@@ -130,39 +254,26 @@ class Spool:
     # -- lifecycle ----------------------------------------------------------
 
     def open(self):
-        """Validate storage, repair at most one torn tail, load the cursor,
-        and count unreadable-but-complete lines exactly once."""
+        """Validate storage, take the writer lock, repair the tail, reconcile
+        ids from the durable records and count unreadable lines once."""
         self._ensure_directory()
+        if self._lock_enabled:
+            lock = _InstanceLock(os.path.join(self.directory, LOCK_FILE))
+            lock.acquire()
+            self._instance_lock = lock
         self._reject_symlinked_record_path()
         self._load_state()
         self._repair_tail()
         self._opened = True
+        self._reconcile_ids()
         self._count_corrupt_lines()
         return self
 
-    def _count_corrupt_lines(self):
-        """Count complete lines whose body cannot be recovered. Done once at
-        open so ``status()`` is stable (a counter that grew on every read
-        would misreport evidence loss)."""
-        resolved = int(self._state["resolved_through"])
-        counted = 0
-        for path in self._record_paths():
-            try:
-                with open(path, "rb") as handle:
-                    data = handle.read()
-            except OSError:
-                continue
-            for line in data.splitlines():
-                if not line:
-                    continue
-                if _line_is_readable(line):
-                    continue
-                if record_id_unresolved(line, resolved):
-                    counted += 1
-        if counted:
-            self._state["corrupt_total"] = int(
-                self._state["corrupt_total"]) + counted
-            self._save_state()
+    def close(self):
+        if self._instance_lock is not None:
+            self._instance_lock.release()
+            self._instance_lock = None
+        self._opened = False
 
     def _ensure_directory(self):
         if os.path.islink(self.directory):
@@ -190,7 +301,7 @@ class Spool:
         for index in range(self.max_files, 0, -1):
             candidate = "%s.%d" % (os.path.join(self.directory, SPOOL_FILE),
                                    index)
-            if os.path.exists(candidate):
+            if os.path.lexists(candidate):
                 paths.append(candidate)
         paths.append(os.path.join(self.directory, SPOOL_FILE))
         return paths
@@ -198,26 +309,28 @@ class Spool:
     def _state_path(self):
         return os.path.join(self.directory, STATE_FILE)
 
+    # -- state --------------------------------------------------------------
+
     def _load_state(self):
         path = self._state_path()
-        if not os.path.exists(path):
+        if not os.path.lexists(path):
             return
-        if os.path.islink(path):
-            raise SpoolError("spool state must not be a symlink")
         try:
-            with open(path, "rb") as handle:
-                raw = handle.read(64 * 1024)
+            raw = read_restricted(path, STATE_MAX_BYTES)
             loaded = json.loads(raw.decode("utf-8"))
-        except (OSError, ValueError, UnicodeDecodeError):
-            # A damaged cursor is fail-closed: we refuse rather than replay
+        except (SpoolError, OSError, ValueError, UnicodeDecodeError):
+            # A damaged cursor is fail-closed: refuse rather than replay
             # records we cannot prove were resolved.
             raise SpoolError("spool state unreadable") from None
         if not isinstance(loaded, dict):
             raise SpoolError("spool state malformed")
         for key in ("next_record_id", "resolved_through",
                     "acknowledged_total", "quarantined_total",
-                    "expired_total", "budget_dropped_total", "corrupt_total"):
+                    "expired_total", "budget_dropped_total", "corrupt_total",
+                    "state_save_failures", "reconciled_ids"):
             value = loaded.get(key)
+            if value is None:
+                continue
             if type(value) is not int or isinstance(value, bool) or value < 0:
                 raise SpoolError("spool state field %s" % key)
             self._state[key] = value
@@ -227,27 +340,109 @@ class Spool:
                 entry for entry in quarantine[-QUARANTINE_MAX_ENTRIES:]
                 if isinstance(entry, dict) and entry.get("token")
                 in QUARANTINE_TOKENS]
+        attempts = loaded.get("retry_attempts")
+        if isinstance(attempts, dict):
+            clean = {}
+            for key, value in attempts.items():
+                if (isinstance(key, str) and key.isdigit()
+                        and type(value) is int
+                        and not isinstance(value, bool) and value > 0):
+                    clean[key] = value
+            self._state["retry_attempts"] = dict(
+                list(clean.items())[-MAX_TRACKED_RETRIES:])
 
     def _save_state(self):
         payload = canonical_bytes(self._state)
+        if len(payload) > STATE_MAX_BYTES:
+            raise SpoolError("spool state oversized")
         tmp = self._state_path() + ".tmp"
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC \
-            | getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(tmp, flags, 0o600)
+        fd = open_restricted(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
         try:
             _write_all(fd, payload)
-            os.fsync(fd)
+            _fsync_quiet(fd)
         finally:
             os.close(fd)
         os.replace(tmp, self._state_path())
         _fsync_dir(self.directory)
 
+    def _save_state_soft(self):
+        """Persist the cursor; a failure is COUNTED, never fatal.
+
+        The in-memory cursor stays correct for this process, and a reopen
+        reconciles ids from the durable records, so a failed state save can
+        cost at worst a re-send (which the server answers idempotently) --
+        never a reused id and never a lost record.
+        """
+        try:
+            self._save_state()
+        except (SpoolError, OSError):
+            self._state["state_save_failures"] = int(
+                self._state["state_save_failures"]) + 1
+
+    # -- reconciliation -----------------------------------------------------
+
+    def _scan_records(self):
+        """Every readable record in chain order: ``[(record_id, record)]``.
+
+        Also the id-integrity gate: a duplicate id, or an id that is not
+        strictly increasing in chain order, is refused fail-closed rather than
+        silently adopted.
+        """
+        found = []
+        seen = set()
+        last = 0
+        for path in self._record_paths():
+            if not os.path.lexists(path):
+                continue
+            try:
+                data = read_restricted(path, self.file_bytes * 4)
+            except (SpoolError, OSError):
+                continue
+            for line in data.splitlines():
+                if not line:
+                    continue
+                record = decode_record(line)
+                if record is None:
+                    continue
+                record_id = record["record_id"]
+                if record_id in seen:
+                    raise SpoolError("duplicate record id: %d" % record_id)
+                if record_id <= last:
+                    raise SpoolError("non-monotonic record id: %d"
+                                     % record_id)
+                seen.add(record_id)
+                last = record_id
+                found.append((record_id, record))
+        return found
+
+    def _reconcile_ids(self):
+        """Startup ID reconciliation (the crash window between the record fsync
+        and the state save).
+
+        ``next_record_id`` must be strictly greater than every durable record
+        id, so a record fsynced before the cursor was persisted can never have
+        its id handed out a second time.
+        """
+        records = self._scan_records()
+        highest = records[-1][0] if records else 0
+        wanted = highest + 1
+        if wanted > int(self._state["next_record_id"]):
+            self._state["reconciled_ids"] = int(
+                self._state["reconciled_ids"]) + 1
+            self._state["next_record_id"] = wanted
+            self._save_state_soft()
+        live = {str(record_id) for record_id, _record in records
+                if record_id > int(self._state["resolved_through"])}
+        self._state["retry_attempts"] = {
+            key: value for key, value
+            in self._state["retry_attempts"].items() if key in live}
+
     # -- torn tail ----------------------------------------------------------
 
     def _reject_symlinked_record_path(self):
         """A symlink at the record path is refused whether or not its target
-        exists: ``os.path.exists`` FOLLOWS a link, so a dangling one would
-        otherwise be adopted as "no file yet"."""
+        exists (``os.path.exists`` FOLLOWS a link, so a dangling one would
+        otherwise look like "no file yet")."""
         path = os.path.join(self.directory, SPOOL_FILE)
         if os.path.islink(path):
             raise SpoolError("spool file must not be a symlink")
@@ -259,22 +454,21 @@ class Spool:
         """Truncate AT MOST one incomplete trailing fragment of the current
         file. A complete-but-unparseable line is counted, never rewritten."""
         path = os.path.join(self.directory, SPOOL_FILE)
-        if not os.path.exists(path):
+        if not os.path.lexists(path):
             return 0
-        st = os.lstat(path)
-        if stat_module.S_ISLNK(st.st_mode) or not stat_module.S_ISREG(
-                st.st_mode):
-            raise SpoolError("spool file must be a regular file")
-        with open(path, "rb") as handle:
-            data = handle.read()
+        try:
+            data = read_restricted(path, self.file_bytes * 4)
+        except SpoolError:
+            raise
+        except OSError:
+            return 0
         if not data:
             return 0
-        last_newline = data.rfind(b"\n")
+        last_newline = data.rfind(NL)
         if last_newline == len(data) - 1:
             return 0
         keep = data[:last_newline + 1] if last_newline >= 0 else b""
-        flags = os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(path, flags)
+        fd = open_restricted(path, os.O_WRONLY)
         try:
             os.ftruncate(fd, len(keep))
             os.fsync(fd)
@@ -283,15 +477,29 @@ class Spool:
         _fsync_dir(self.directory)
         return 1
 
+    def _count_corrupt_lines(self):
+        """Count complete lines whose body cannot be recovered, ONCE at open."""
+        resolved = int(self._state["resolved_through"])
+        counted = 0
+        for path in self._record_paths():
+            try:
+                data = read_restricted(path, self.file_bytes * 4)
+            except (SpoolError, OSError):
+                continue
+            for line in data.splitlines():
+                if not line or _line_is_readable(line):
+                    continue
+                if record_id_unresolved(line, resolved):
+                    counted += 1
+        if counted:
+            self._state["corrupt_total"] = int(
+                self._state["corrupt_total"]) + counted
+            self._save_state_soft()
+
     # -- append -------------------------------------------------------------
 
     def append(self, probe_id, run, seq, body, queued_epoch=None):
-        """Durably append one record and return its ``record_id``.
-
-        The body bytes are stored EXACTLY as given (base64 inside the record
-        line): the spool never holds a parsed object that would be
-        re-serialized on retry.
-        """
+        """Durably append one record and return its ``record_id``."""
         if not self._opened:
             raise SpoolError("spool not open")
         if type(body) is not bytes or len(body) > MAX_BODY_BYTES:
@@ -308,37 +516,26 @@ class Spool:
             "queued_epoch": epoch,
             "body_b64": base64.b64encode(body).decode("ascii"),
         }
-        line = canonical_bytes(record) + b"\n"
+        line = canonical_bytes(record) + NL
         if len(line) > RECORD_MAX_BYTES:
             raise SpoolError("record exceeds spool record bound")
         self._append_line(line)
         self._state["next_record_id"] = record_id + 1
-        self._save_state()
+        self._save_state_soft()
         return record_id
 
     def _append_line(self, line):
         path = os.path.join(self.directory, SPOOL_FILE)
         self._reject_symlinked_record_path()
-        if os.path.exists(path):
-            st = os.lstat(path)
-            if stat_module.S_ISLNK(st.st_mode):
-                raise SpoolError("spool file must not be a symlink")
-            if not stat_module.S_ISREG(st.st_mode):
-                raise SpoolError("spool file must be a regular file")
-            if st.st_size + len(line) > self.file_bytes:
+        if os.path.lexists(path):
+            try:
+                size = os.lstat(path).st_size
+            except OSError:
+                size = 0
+            if size + len(line) > self.file_bytes:
                 self._rotate()
-        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND \
-            | getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(path, flags, 0o600)
+        fd = open_restricted(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
         try:
-            st = os.fstat(fd)
-            if not stat_module.S_ISREG(st.st_mode):
-                raise SpoolError("spool file must be a regular file")
-            if os.name == "posix":
-                try:
-                    os.fchmod(fd, 0o600)
-                except OSError:
-                    raise SpoolError("spool file mode not settable") from None
             _write_all(fd, line)
             os.fsync(fd)          # durable BEFORE the record counts as queued
         finally:
@@ -349,162 +546,149 @@ class Spool:
         base = os.path.join(self.directory, SPOOL_FILE)
         for index in range(self.max_files - 1, 0, -1):
             source = "%s.%d" % (base, index)
-            if not os.path.exists(source):
-                continue
-            target = "%s.%d" % (base, index + 1)
-            self._rename_fsynced(source, target)
+            if os.path.lexists(source):
+                self._rename_fsynced(source, "%s.%d" % (base, index + 1))
         oldest = "%s.%d" % (base, self.max_files)
-        if os.path.exists(oldest):
-            # Beyond the chain: dropped under the byte/age budget, counted.
-            st = os.lstat(oldest)
-            self._state["budget_dropped_total"] += 1
+        if os.path.lexists(oldest):
+            self._state["budget_dropped_total"] = int(
+                self._state["budget_dropped_total"]) + 1
             os.unlink(oldest)
             _fsync_dir(self.directory)
-            del st
         self._rename_fsynced(base, "%s.1" % base)
 
     @staticmethod
     def _rename_fsynced(source, target):
-        if os.path.exists(source):
-            # fsync needs a WRITE-capable handle (Windows refuses it on a
-            # read-only one). Best-effort: the rename plus the directory fsync
-            # that follows is what actually publishes the rotation.
+        if os.path.lexists(source):
             try:
-                fd = os.open(source, os.O_RDWR)
-            except OSError:
+                fd = open_restricted(source, os.O_RDWR)
+            except (SpoolError, OSError):
                 fd = None
             if fd is not None:
-                try:
-                    os.fsync(fd)
-                except OSError:
-                    pass
-                finally:
-                    os.close(fd)
+                _fsync_quiet(fd)
+                os.close(fd)
         os.replace(source, target)
 
-    # -- read / resolve -----------------------------------------------------
+    # -- read / attempts / resolve ------------------------------------------
 
     def pending(self):
-        """Yield pending records oldest-file-first, in record order. A
-        complete-but-unparseable line is counted and skipped (it can never be
-        delivered: its body is unrecoverable)."""
+        """Yield pending records oldest-first, in record order."""
         resolved = int(self._state["resolved_through"])
-        for index, path in enumerate(self._record_paths()):
-            try:
-                with open(path, "rb") as handle:
-                    data = handle.read()
-            except FileNotFoundError:
+        for record_id, record in self._scan_records():
+            if record_id <= resolved:
                 continue
-            is_current = index == len(self._record_paths()) - 1
-            lines = data.split(b"\n")
-            if is_current and lines and lines[-1] == b"":
-                lines = lines[:-1]
-            for line in lines:
-                if not line:
-                    continue
-                try:
-                    record = json.loads(line.decode("utf-8"))
-                    body = base64.b64decode(record["body_b64"], validate=True)
-                    record_id = int(record["record_id"])
-                    int(record["seq"])
-                    float(record["queued_epoch"])
-                    if type(record["probe_id"]) is not str \
-                            or type(record["run"]) is not str:
-                        raise ValueError("record shape")
-                except (ValueError, KeyError, TypeError,
-                        binascii.Error, UnicodeDecodeError):
-                    continue          # counted once at open, never here
-                if record_id <= resolved:
-                    continue
-                yield {"record_id": record_id,
-                       "probe_id": record["probe_id"],
-                       "run": record["run"],
-                       "seq": int(record["seq"]),
-                       "queued_epoch": float(record["queued_epoch"]),
-                       "body": body}
+            yield {"record_id": record_id,
+                   "probe_id": record["probe_id"],
+                   "run": record["run"],
+                   "seq": record["seq"],
+                   "queued_epoch": record["queued_epoch"],
+                   "body": record["body"]}
+
+    def attempts(self, record_id):
+        """Durable retry count for one record (survives a restart)."""
+        return int(self._state["retry_attempts"].get(str(int(record_id)), 0))
+
+    def note_attempt(self, record_id):
+        """Count one delivery attempt, durably enough that a restart cannot
+        reset the retry budget."""
+        key = str(int(record_id))
+        value = int(self._state["retry_attempts"].get(key, 0)) + 1
+        self._state["retry_attempts"][key] = value
+        if len(self._state["retry_attempts"]) > MAX_TRACKED_RETRIES:
+            self._state["retry_attempts"] = dict(
+                list(self._state["retry_attempts"].items())
+                [-MAX_TRACKED_RETRIES:])
+        self._save_state_soft()
+        return value
 
     def resolve(self, record_id, quarantine_token=None):
-        """Mark a record terminal (acknowledged or quarantined) and persist
-        the cursor. A quarantined record is recorded in the bounded,
-        sanitized ledger -- never with a response body or error text."""
+        """Mark a record terminal (acknowledged or quarantined)."""
         if type(record_id) is not int or record_id <= 0:
             raise SpoolError("record id")
         if record_id <= self._state["resolved_through"]:
             return False
         self._state["resolved_through"] = record_id
+        self._state["retry_attempts"].pop(str(record_id), None)
         if quarantine_token is None:
-            self._state["acknowledged_total"] += 1
+            self._state["acknowledged_total"] = int(
+                self._state["acknowledged_total"]) + 1
         else:
             if quarantine_token not in QUARANTINE_TOKENS:
                 raise SpoolError("quarantine token must be closed")
-            self._state["quarantined_total"] += 1
+            self._state["quarantined_total"] = int(
+                self._state["quarantined_total"]) + 1
             ledger = self._state["quarantine"]
             ledger.append({"token": quarantine_token,
                            "record_id": record_id,
                            "epoch": float(self.clock())})
             del ledger[:-QUARANTINE_MAX_ENTRIES]
-        self._save_state()
+        self._save_state_soft()
         return True
 
     # -- bounds -------------------------------------------------------------
 
     def enforce_bounds(self):
-        """Apply the 7-day / 32 MiB bounds (and physically drop resolved
-        records). Every drop is COUNTED and visible in ``status()``."""
+        """Apply the 7-day / 32 MiB bounds and physically drop resolved records
+        from EVERY file in the chain. Every drop is counted and visible."""
         self._compact_resolved()
+        resolved = int(self._state["resolved_through"])
         now = float(self.clock())
-        pending = list(self.pending())
-        total = sum(len(item["body"]) for item in pending)
-        for item in pending:
-            if now - item["queued_epoch"] > self.max_age:
-                self._state["resolved_through"] = item["record_id"]
-                self._state["expired_total"] += 1
-                total -= len(item["body"])
-        remaining = [item for item in self.pending()]
-        index = 0
-        while total > self.max_bytes and index < len(remaining):
-            item = remaining[index]
-            self._state["resolved_through"] = item["record_id"]
-            self._state["budget_dropped_total"] += 1
-            total -= len(item["body"])
-            index += 1
-        self._save_state()
+        for record_id, record in self._scan_records():
+            if record_id <= resolved:
+                continue
+            if now - float(record["queued_epoch"]) > self.max_age:
+                self._state["resolved_through"] = record_id
+                self._state["expired_total"] = int(
+                    self._state["expired_total"]) + 1
+        live = [(rid, rec) for rid, rec in self._scan_records()
+                if rid > int(self._state["resolved_through"])]
+        total = sum(len(rec["body"]) for _rid, rec in live)
+        for record_id, record in live:
+            if total <= self.max_bytes:
+                break
+            self._state["resolved_through"] = record_id
+            self._state["budget_dropped_total"] = int(
+                self._state["budget_dropped_total"]) + 1
+            total -= len(record["body"])
+        self._save_state_soft()
         self._compact_resolved()
         return self.status()
 
     def _compact_resolved(self):
-        """Physically drop resolved records: rewrite the current file to a
-        temp file (fsynced), rename over, then fsync the directory."""
-        path = os.path.join(self.directory, SPOOL_FILE)
-        if not os.path.exists(path):
-            return
+        """Rewrite EVERY file in the chain without resolved or unreadable
+        lines, so acknowledged records cannot linger physically in the rotated
+        files. Each rewrite goes to a restricted temp file (fsynced), renames
+        over the original, then fsyncs the directory."""
         resolved = int(self._state["resolved_through"])
-        with open(path, "rb") as handle:
-            data = handle.read()
-        keep = []
-        for line in data.split(b"\n"):
-            if not line:
+        current = os.path.join(self.directory, SPOOL_FILE)
+        for path in self._record_paths():
+            if not os.path.lexists(path):
                 continue
             try:
-                record = json.loads(line.decode("utf-8"))
-                record_id = int(record.get("record_id", 0))
-            except (ValueError, TypeError, UnicodeDecodeError):
+                data = read_restricted(path, self.file_bytes * 4)
+            except (SpoolError, OSError):
                 continue
-            if record_id > resolved:
+            keep = []
+            for line in data.splitlines():
+                if not line:
+                    continue
+                record = decode_record(line)
+                if record is None or record["record_id"] <= resolved:
+                    continue
                 keep.append(line)
-        if not keep and len(self._record_paths()) == 1:
-            pass
-        tmp = path + ".tmp"
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC \
-            | getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(tmp, flags, 0o600)
-        try:
-            _write_all(fd, b"".join(line + b"\n" for line in keep))
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        os.replace(tmp, path)
-        _fsync_dir(self.directory)
+            if not keep and path != current:
+                # A fully-consumed rotated file is removed outright.
+                os.unlink(path)
+                _fsync_dir(self.directory)
+                continue
+            tmp = path + ".compact"
+            fd = open_restricted(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+            try:
+                _write_all(fd, b"".join(line + NL for line in keep))
+                _fsync_quiet(fd)
+            finally:
+                os.close(fd)
+            os.replace(tmp, path)
+            _fsync_dir(self.directory)
 
     # -- status -------------------------------------------------------------
 
@@ -522,27 +706,45 @@ class Spool:
             "expired_total": int(self._state["expired_total"]),
             "budget_dropped_total": int(self._state["budget_dropped_total"]),
             "corrupt_total": int(self._state["corrupt_total"]),
+            "state_save_failures": int(self._state["state_save_failures"]),
+            "reconciled_ids": int(self._state["reconciled_ids"]),
+            "tracked_attempts": len(self._state["retry_attempts"]),
         }
 
 
-def _line_is_readable(line):
-    """Can this record line be decoded into a deliverable record?"""
+def decode_record(line):
+    """One record line -> a closed dict, or None when unreadable."""
     try:
         record = json.loads(line.decode("utf-8"))
         base64.b64decode(record["body_b64"], validate=True)
-        int(record["record_id"])
-        int(record["seq"])
-        float(record["queued_epoch"])
-        return (type(record["probe_id"]) is str
-                and type(record["run"]) is str)
+        record_id = record["record_id"]
+        if type(record_id) is not int or isinstance(record_id, bool) \
+                or record_id < 1:
+            return None
+        seq = record["seq"]
+        if type(seq) is not int or isinstance(seq, bool):
+            return None
+        epoch = record["queued_epoch"]
+        if type(epoch) not in (int, float) or isinstance(epoch, bool):
+            return None
+        probe_id = record["probe_id"]
+        run = record["run"]
+        if type(probe_id) is not str or type(run) is not str:
+            return None
+        body = base64.b64decode(record["body_b64"], validate=True)
+        return {"record_id": record_id, "probe_id": probe_id, "run": run,
+                "seq": seq, "queued_epoch": float(epoch), "body": body}
     except (ValueError, KeyError, TypeError, binascii.Error,
             UnicodeDecodeError):
-        return False
+        return None
+
+
+def _line_is_readable(line):
+    return decode_record(line) is not None
 
 
 def record_id_unresolved(line, resolved):
-    """Best-effort: is this unparseable line one we have not resolved yet?
-    Used only to decide whether a corrupt line counts as evidence loss."""
+    """Best-effort: is this unreadable line one we have not resolved yet?"""
     try:
         record = json.loads(line.decode("utf-8"))
         return int(record.get("record_id", 0)) > resolved

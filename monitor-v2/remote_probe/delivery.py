@@ -203,47 +203,67 @@ def sign_record(secret, probe_id, run, seq, body, sent_epoch):
 
 
 def deliver_pending(spool, secret, probe_id, poster, now_epoch, limit=None,
-                    unknown_attempts=None, jitter=None):
+                    jitter=None, max_unknown_attempts=UNKNOWN_RESPONSE_MAX_ATTEMPTS):
     """Drain the spool in order against ``poster``.
 
     ``poster(body, header_map) -> (status, response_body)`` is injected, so
-    PR-6A never needs a live server (fixtures/mocks only). Returns a closed
-    summary. Every terminal record is resolved exactly once; retryable
-    outcomes stop the pass and leave the record queued.
+    PR-6A never needs a live server (fixtures/mocks only).
+
+    Retry state lives in the SPOOL (``spool.attempts`` / ``spool.note_attempt``),
+    durably, so that a new call -- or a restarted agent -- continues the same
+    retry budget rather than starting from zero. Consequences that matter:
+
+    * an unknown response class can never become a poison head: it is retried
+      only until ``max_unknown_attempts``, then quarantined and the queue
+      advances;
+    * every retryable outcome (408/429/5xx/network/TLS and a bounded unknown)
+      returns ``retry_after`` seconds of BOUNDED EXPONENTIAL BACKOFF, which the
+      agent's own loop consumes -- the helper is not decoration;
+    * a pass stops at the first retryable/unknown outcome and leaves the record
+      queued, so ordering is preserved.
+
+    Every terminal record is resolved exactly once.
     """
     summary = {"acked": 0, "quarantined": 0, "retries": 0, "attempts": 0,
-               "stopped": None}
-    attempts = dict(unknown_attempts or {})
+               "stopped": None, "retry_after": 0.0}
     for record in spool.pending():
         if limit is not None and summary["attempts"] >= limit:
             break
         summary["attempts"] += 1
+        record_id = record["record_id"]
         header_map = sign_record(secret, probe_id, record["run"],
                                  record["seq"], record["body"], now_epoch)
         try:
             status, response_body = poster(record["body"], header_map)
         except Exception as exc:  # noqa: BLE001 -- any transport failure
+            summary["attempt"] = spool.note_attempt(record_id)
             summary["retries"] += 1
             summary["stopped"] = type(exc).__name__
+            summary["retry_after"] = backoff_delay(summary["attempt"],
+                                                   jitter=jitter)
             return summary
         disposition, token = classify_response(status, response_body)
         if disposition == ACK:
-            spool.resolve(record["record_id"])
+            spool.resolve(record_id)
             summary["acked"] += 1
             continue
         if disposition == PERMANENT:
             if token == QUARANTINE_UNKNOWN_RESPONSE:
-                count = attempts.get(record["record_id"], 0) + 1
-                attempts[record["record_id"]] = count
-                if count < UNKNOWN_RESPONSE_MAX_ATTEMPTS:
+                count = spool.note_attempt(record_id)
+                if count < max_unknown_attempts:
+                    summary["attempt"] = count
                     summary["retries"] += 1
                     summary["stopped"] = "unknown_bounded"
+                    summary["retry_after"] = backoff_delay(count, jitter=jitter)
                     return summary
-            spool.resolve(record["record_id"], quarantine_token=token)
+            spool.resolve(record_id, quarantine_token=token)
             summary["quarantined"] += 1
             continue
+        summary["attempt"] = spool.note_attempt(record_id)
         summary["retries"] += 1
         summary["stopped"] = "retryable"
+        summary["retry_after"] = backoff_delay(summary["attempt"],
+                                               jitter=jitter)
         return summary
     return summary
 

@@ -79,6 +79,8 @@ class P6Mihomo:
         self.diagnostic_timeout_ms = int(diagnostic_timeout_ms
                                          if diagnostic_timeout_ms is not None
                                          else DELAY_TIMEOUT_SECONDS * 1000)
+        # Largest positive delay this test could plausibly produce.
+        self.delay_ceiling_ms = self.diagnostic_timeout_ms
         if not 0 < self.diagnostic_timeout_ms <= DELAY_TIMEOUT_SECONDS * 1000:
             raise ConfigurationError("diagnostic timeout out of bounds")
         self._transport = transport or HttpTransport(
@@ -140,8 +142,7 @@ class P6Mihomo:
         return "/proxies/%s/delay?%s" % (
             urllib.parse.quote(node, safe=""), query)
 
-    @staticmethod
-    def _classify_delay(status, body):
+    def _classify_delay(self, status, body):
         """Closed status/shape -> outcome table (never raises)."""
         import json
         if status == 200:
@@ -155,7 +156,9 @@ class P6Mihomo:
             # EXACT plain int: a bool/float/str is drift, never coerced.
             if isinstance(delay, bool) or not isinstance(delay, int):
                 return OUTCOME_INVALID, None
-            if delay < 0 or delay > 10 ** 7:
+            # The bound is the test budget itself: a delay larger than the
+            # <=5 s active test cannot have come from that test.
+            if delay < 0 or delay > self.delay_ceiling_ms:
                 return OUTCOME_INVALID, None
             if delay == 0:
                 # Mihomo encodes a FAILED node test as delay 0. It is never
@@ -166,7 +169,13 @@ class P6Mihomo:
             return OUTCOME_INVALID, None          # configured node missing
         if status in (401, 403):
             return OUTCOME_INVALID, None          # refused credentials
-        if status in (400, 408, 504):
+        if status == 400:
+            # A 400 is the controller rejecting the REQUEST (bad url/timeout
+            # parameter, unsupported endpoint, API contract drift): a
+            # configuration or contract error must never be reported as a
+            # path timeout.
+            return OUTCOME_INVALID, None
+        if status in (408, 504):
             return OUTCOME_TIMEOUT, None          # the node's test failed
         if 500 <= status < 600:
             return OUTCOME_UNAVAILABLE, None      # controller-side failure

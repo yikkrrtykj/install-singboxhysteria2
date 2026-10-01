@@ -52,8 +52,13 @@ SAMPLE_KEYS = frozenset({"v", "probe_id", "run", "seq", "sample_epoch", "dns",
                          "https", "vps_tcp", "egress", "mihomo_api", "active",
                          "flags"})
 
-# Closed tokens a sample may name as an unavailable evidence source.
-SOURCE_TOKENS = ("passive_cache", "egress", "mihomo_api")
+# Closed tokens a sample may name as an unavailable evidence source: EXACTLY
+# the evidence planes this agent reports. The producer and this enum are one
+# set -- a deadline-exhausted cycle names the plane it could not finish, and
+# the sample still encodes (dropping a whole cycle over a flag would lose
+# every other slot's evidence).
+SOURCE_TOKENS = ("active_delay", "direct", "egress", "mihomo_api",
+                 "passive_cache")
 MIHOMO_API_STATUSES = ("ok", "unavailable", "invalid")
 # At most ONE entry per (role, source): an active measurement and a
 # passive cache observation for the same role are both legitimate, but a

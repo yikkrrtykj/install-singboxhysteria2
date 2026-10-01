@@ -104,10 +104,23 @@ def _failed(code):
 
 
 def failed_slot(code):
-    """Public failure constructor (closed codes only)."""
+    """Public failure constructor for the three plain slots (closed codes)."""
     if code not in ERROR_CODES or code == ERR_NONE:
         code = ERR_UNAVAILABLE
     return _failed(code)
+
+
+def failed_egress(code):
+    """The EGRESS-shaped failure slot.
+
+    Egress carries two extra fields (``ip``/``change``), so a deadline-exhausted
+    or unadjudicable egress slot MUST use this shape: a plain slot here fails
+    the wire schema and would throw away every other slot's evidence for the
+    cycle."""
+    if code not in ERROR_CODES or code == ERR_NONE:
+        code = ERR_UNAVAILABLE
+    return {"status": STATUS_FAILED, "latency_ms": None, "error_code": code,
+            "ip": None, "change": CHANGE_UNKNOWN}
 
 
 def _latency_ms(start_epoch_seconds):

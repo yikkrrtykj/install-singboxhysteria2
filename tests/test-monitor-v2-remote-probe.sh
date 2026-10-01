@@ -41,18 +41,24 @@ PY="${PYTHON:-$(command -v python3 || command -v python || true)}"
 PASS=0
 FAIL=0
 # Measured on the dev host (Windows, Python 3.14) and re-measured on Linux CI:
-# 187 = S0 static + red-line gates 19 (py_compile of the package + harness, the
+# Measured on the dev host (Windows, Python 3.14) and re-measured on Linux CI:
+# 210 = S0 static + red-line gates 19 (py_compile of the package + harness, the
 # in-module reuse documentation, the FOUR frozen sha256 pins that prove the audited
 # E4 client/model/diag/README were reused and never forked, the E4 file-set
 # check, the unchanged release identity 0.6.1 in both places, History still v5
 # with its six prune sources and no remote table, the three P4/P5 modules free
 # of any remote reference, the absent server ingest route, the absent server
-# remote store, and the two CI registrations) + S1 harness 167 (166 verdicts
-# across ten groups -- including the three MIRROR gates that import the audited
-# VPS-side probe engine and prove the direct-slot vocabulary, the status/change
-# values and the canonical-IP gate still match it exactly -- plus the harness
-# rc gate).
-EXPECTED_PASS=187
+# remote store, and the two CI registrations) + S1 harness 191 (190 verdicts
+# across ELEVEN groups -- including the three MIRROR gates that import the
+# audited VPS-side probe engine and prove the direct-slot vocabulary, the
+# status/change values and the canonical-IP gate still match it exactly, and the
+# RESILIENCE group that pins the reviewed fix round: durable per-record retry
+# state with bounded unknown quarantine and a consumed backoff curve, retention
+# driven by the agent's own open/cycle path, the crash window between the record
+# fsync and the state save, deadline legality (an egress-shaped failure slot),
+# egress-baseline staging and exact 256-bit key material -- plus the harness rc
+# gate).
+EXPECTED_PASS=210
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
@@ -193,7 +199,7 @@ if [ "$RC" -ne 0 ]; then
     fail "probe_groups.py exited rc=$RC (a crashing harness is itself a gate)"
     tail -25 "$TMP/groups.log"
 else
-    pass "probe_groups.py exited 0 over all ten groups"
+    pass "probe_groups.py exited 0 over all eleven groups"
 fi
 
 section "RESULT"

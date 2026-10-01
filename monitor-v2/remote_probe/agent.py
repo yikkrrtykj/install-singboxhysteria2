@@ -32,7 +32,7 @@ from . import mihomo_probe as mp
 from .delivery import (deliver_pending, next_retry_delay)
 from .evidence import active_entry, merge_evidence, passive_entry
 from .payload import encode_sample, valid_probe_id
-from .spool import Spool, SpoolError
+from .spool import RETENTION_INTERVAL_SECONDS, Spool, SpoolError
 
 BASELINE_FILE = "egress.baseline.json"
 STATUS_NOT_CONFIGURED = "not_configured"
@@ -45,22 +45,38 @@ class ConfigError(Exception):
     """Fatal agent configuration problem (fail-closed, never a traceback)."""
 
 
-def load_probe_secret(path):
-    """Read the per-probe ingest secret: FILE ONLY.
+SECRET_HEX_CHARS = 64          # 64 lowercase hex == exactly 256 bits
 
-    The probe secret is deliberately NOT resolvable from the environment or
-    argv (issue #67 §5): argv is world-readable through ``ps``, and the
-    environment leaks into journald/core dumps. The audited E4 permission
-    discipline is reused verbatim (regular file, no-follow, fstat-same-object,
-    0600/0400 on POSIX)."""
+
+def load_probe_secret(path):
+    """Read the per-probe ingest secret: FILE ONLY and EXACTLY 256 bits.
+
+    Representation is frozen here (issue #67 §5: "remote-ingest secret is
+    separate 256-bit material"): the file holds 64 lowercase hex characters
+    with optional trailing whitespace, which decode to exactly 32 bytes. A
+    short, oversized, malformed or upper-case value is refused fail-closed --
+    "non-empty" is not a key length.
+
+    The secret is deliberately NOT resolvable from the environment or argv:
+    argv is world-readable through ``ps``, and the environment leaks into
+    journald/core dumps. The audited E4 permission discipline is reused
+    verbatim (regular file, no-follow, fstat-same-object, 0600/0400 on POSIX).
+    """
     from client import SecretFileError, _read_secret_file
     try:
         value = _read_secret_file(path)
     except SecretFileError as exc:
         raise ConfigError("probe secret unusable: %s" % exc) from None
-    if not value:
-        raise ConfigError("probe secret is empty")
-    return value.encode("utf-8")
+    text = value.strip()
+    if len(text) != SECRET_HEX_CHARS or any(
+            ch not in "0123456789abcdef" for ch in text):
+        raise ConfigError(
+            "probe secret must be exactly %d lowercase hex characters "
+            "(256 bits)" % SECRET_HEX_CHARS)
+    raw = bytes.fromhex(text)
+    if len(raw) != 32:
+        raise ConfigError("probe secret must decode to exactly 32 bytes")
+    return raw
 
 
 class AgentConfig:
@@ -173,6 +189,13 @@ class RemoteProbeAgent:
         self._ingest_secret = None
         self.run = None
         self.seq = 0
+        self._pending_baseline = None
+        self._delivery_resume_at = 0.0
+        self._next_retention_at = 0.0
+        self.delivery_deferrals = 0
+        self.retention_runs = 0
+        self.retention_failures = 0
+        self.last_backoff_seconds = 0.0
         self._last_sample_epoch = None
         self.cycles = 0
         self.cycle_failures = 0
@@ -198,6 +221,11 @@ class RemoteProbeAgent:
     def open(self):
         self.spool.open()
         self._read_baseline()
+        # Retention runs at startup (issue #67 §5 bounds apply from the first
+        # moment this process owns the directory) and then periodically.
+        self._run_retention()
+        self._next_retention_at = (self.monotonic()
+                                   + RETENTION_INTERVAL_SECONDS)
         self._ingest_secret = self._secret_loader(
             self.config.ingest_secret_file)
         self._start_run()
@@ -305,14 +333,19 @@ class RemoteProbeAgent:
         entries, _corroboration, _dropped = merge_evidence(active, passive)
 
         # 4. Direct slots, each bounded and skipped once the deadline is gone.
-        def slot(fn):
+        def slot(fn, fallback=dp.failed_slot):
+            # Every exhaustion path returns a SLOT-SHAPED failure (egress has
+            # its own shape): a deadline must never cost the whole cycle.
             if remaining() <= 0:
                 unavailable.append("direct")
-                return dp.failed_slot(dp.ERR_TIMEOUT)
+                return fallback(dp.ERR_TIMEOUT)
             budget = max(remaining(), 0.1)
-            completed, value = dp.run_bounded(fn, budget)
+            try:
+                completed, value = dp.run_bounded(fn, budget)
+            except (OSError, ValueError, RuntimeError):
+                return fallback(dp.ERR_UNAVAILABLE)
             if not completed:
-                return dp.failed_slot(dp.ERR_TIMEOUT)
+                return fallback(dp.ERR_TIMEOUT)
             return value
 
         dns_slot = slot(lambda: dp.probe_dns(self.config.dns_host))
@@ -320,10 +353,12 @@ class RemoteProbeAgent:
         tcp_slot = slot(lambda: dp.probe_tcp(self.config.vps_host,
                                              self.config.vps_port))
         egress_slot = slot(lambda: dp.probe_egress(
-            self.config.egress_host, previous=self._baseline))
+            self.config.egress_host, previous=self._baseline),
+            fallback=dp.failed_egress)
         if egress_slot["status"] == dp.STATUS_OK:
-            self._baseline = egress_slot["ip"]
-            self._write_baseline(egress_slot["ip"])
+            # STAGED, not committed: the durable baseline may only move after
+            # the sample carrying this observation is itself durable.
+            self._pending_baseline = egress_slot["ip"]
         elif self._baseline is None:
             unavailable.append("egress")
 
@@ -359,6 +394,13 @@ class RemoteProbeAgent:
             return {"outcome": "overlap_refused"}
         try:
             self.cycles += 1
+            # Retention is part of the product cycle, not a harness chore.
+            if self.monotonic() >= self._next_retention_at:
+                self._next_retention_at = (self.monotonic()
+                                           + RETENTION_INTERVAL_SECONDS)
+                if not self._run_retention():
+                    self.cycle_failures += 1
+                    return {"outcome": "retention_failed"}
             try:
                 sample = self.collect_sample(now=now)
                 body = encode_sample(sample)
@@ -372,11 +414,15 @@ class RemoteProbeAgent:
                     queued_epoch=sample["sample_epoch"])
             except (SpoolError, OSError):
                 # No durable local copy means NO upload: evidence is never
-                # transmitted that could not survive a crash first.
+                # transmitted that could not survive a crash first. The staged
+                # egress baseline is DROPPED with it, so the transition this
+                # sample observed is still reported by the next cycle.
+                self._pending_baseline = None
                 self.spool_failures += 1
                 self.cycle_failures += 1
                 self.last_status = STATUS_DEGRADED
                 return {"outcome": "spool_unavailable"}
+            self._commit_baseline()
             summary = {"outcome": "spooled", "record_id": record_id}
             self.last_status = STATUS_FRESH
             if self._poster is not None:
@@ -386,14 +432,55 @@ class RemoteProbeAgent:
             self._cycle_lock.release()
 
     def deliver(self):
-        """Drain the spool against the injected poster (fixtures in PR-6A)."""
+        """Drain the spool against the injected poster (fixtures in PR-6A).
+
+        A retryable or bounded-unknown outcome returns bounded exponential
+        backoff, which is RECORDED here and honoured by the cadence loop: the
+        agent never re-hammers the endpoint on the ordinary sampling beat.
+        """
         if self._ingest_secret is None or self._poster is None:
             return {"acked": 0, "quarantined": 0, "retries": 0,
-                    "attempts": 0, "stopped": "no_transport"}
-        sent_epoch = int(self.clock())
-        return deliver_pending(self.spool, self._ingest_secret,
-                               self.config.probe_id, self._poster,
-                               sent_epoch, jitter=self._jitter)
+                    "attempts": 0, "stopped": "no_transport",
+                    "retry_after": 0.0}
+        now = self.monotonic()
+        if now < self._delivery_resume_at:
+            self.delivery_deferrals += 1
+            return {"acked": 0, "quarantined": 0, "retries": 0, "attempts": 0,
+                    "stopped": "backoff", "retry_after":
+                        self._delivery_resume_at - now}
+        summary = deliver_pending(self.spool, self._ingest_secret,
+                                  self.config.probe_id, self._poster,
+                                  int(self.clock()), jitter=self._jitter)
+        retry_after = float(summary.get("retry_after") or 0.0)
+        self.last_backoff_seconds = retry_after
+        self._delivery_resume_at = (self.monotonic() + retry_after
+                                    if retry_after > 0 else 0.0)
+        return summary
+
+    def _commit_baseline(self):
+        """Commit the staged egress observation (called ONLY after the sample
+        that carries it is durable)."""
+        if self._pending_baseline is None:
+            return
+        self._baseline = self._pending_baseline
+        self._write_baseline(self._baseline)
+        self._pending_baseline = None
+
+    def _run_retention(self):
+        """Apply the spool bounds. A failure is sanitized and FAIL-CLOSED:
+        the cycle stops rather than keep adding load while storage is
+        misbehaving, and no un-durable data is ever uploaded."""
+        try:
+            self.spool.enforce_bounds()
+            self.retention_runs += 1
+            return True
+        except (SpoolError, OSError):
+            self.retention_failures += 1
+            self.last_status = STATUS_DEGRADED
+            return False
+
+    def close(self):
+        self.spool.close()
 
     def run_forever(self, cycles=None, sleep=None):
         """Cadence loop with no overlap by construction."""
@@ -457,6 +544,10 @@ class RemoteProbeAgent:
             "clock_rollbacks": self.clock_rollbacks,
             "overlap_refusals": self.overlap_refusals,
             "spool_failures": self.spool_failures,
+            "retention_runs": self.retention_runs,
+            "retention_failures": self.retention_failures,
+            "delivery_deferrals": self.delivery_deferrals,
+            "last_backoff_seconds": self.last_backoff_seconds,
             "state": self.last_status,
             "active": dict(self.last_active),
             "spool": spool_status,
