@@ -42,7 +42,7 @@ PASS=0
 FAIL=0
 # Measured on the dev host (Windows, Python 3.14) and re-measured on Linux CI:
 # 187 = S0 static + red-line gates 19 (py_compile of the package + harness, the
-# README/wire documentation, the FOUR frozen sha256 pins that prove the audited
+# in-module reuse documentation, the FOUR frozen sha256 pins that prove the audited
 # E4 client/model/diag/README were reused and never forked, the E4 file-set
 # check, the unchanged release identity 0.6.1 in both places, History still v5
 # with its six prune sources and no remote table, the three P4/P5 modules free
@@ -93,7 +93,7 @@ WEBAPP="$ROOT/monitor-v2/webapp.py"
 WORKFLOW="$ROOT/.github/workflows/tests.yml"
 for required in "$PKG/__init__.py" "$PKG/agent.py" "$PKG/payload.py" \
     "$PKG/spool.py" "$PKG/delivery.py" "$PKG/direct_probe.py" \
-    "$PKG/mihomo_probe.py" "$PKG/evidence.py" "$PKG/README.md" \
+    "$PKG/mihomo_probe.py" "$PKG/evidence.py" \
     "$HARNESS" "$HIST_PY" "$SERVER_PY" "$WEBAPP" "$WORKFLOW"; do
     [ -f "$required" ] || fail "lane input missing: $required"
 done
@@ -106,10 +106,15 @@ else
     fail "py_compile: $(cat "$TMP/py.err")"
 fi
 
-if [ -f "$PKG/README.md" ] && grep -q 'Reuse, never fork' "$PKG/README.md"; then
-    pass "the agent documents its reuse map and frozen wire contract"
+# The agent architecture and the frozen wire contract live in issue #67:
+# PR-6A documents them there rather than as a repo markdown file. What is
+# pinned here is that the reuse contract is stated BY THE MODULE that
+# implements it, and that the package ships no stray markdown.
+if grep -q "REUSE, NEVER FORK" "$PKG/mihomo_probe.py" \
+    && [ -z "$(ls "$PKG"/*.md 2>/dev/null)" ]; then
+    pass "the reuse contract is documented in the module; the package ships no markdown"
 else
-    fail "agent README missing the reuse/wire documentation"
+    fail "reuse documentation missing, or a stray markdown file appeared"
 fi
 
 # (2) The audited E4 pieces are byte-identical: reuse, never fork. The pins
