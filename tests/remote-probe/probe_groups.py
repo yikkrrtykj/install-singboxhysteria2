@@ -2218,6 +2218,88 @@ def group_resilience():
     out["unrecoverable_corrupt_record_fails_closed"] = refused
     clean(root)
 
+    # ---- D1a: an UNRESOLVED complete-corrupt record survives compaction. Its
+    #      id is still part of the durable high-water, so compaction may not
+    #      treat it as garbage while the cursor has not proven it terminal.
+    root = temp_dir()
+    directory = os.path.join(root, "spool")
+    corrupt_line = (b'{"v":1,"record_id":3,"probe_id":"office-sg-isp-a"'
+                    b',"run":"' + RUN.encode() + b'","seq":3'
+                    b',"queued_epoch":1700000000.0,"body_b64":"!!!!"}')
+    queue = sp.Spool(directory, clock=lambda: 1700000000.0).open()
+    queue.append("office-sg-isp-a", RUN, 1, pl.encode_sample(_sample(1)),
+                 queued_epoch=1700000000.0)
+    queue.close()
+    with open(os.path.join(directory, sp.SPOOL_FILE), "ab") as handle:
+        handle.write(corrupt_line + b"\n")
+    reopened = sp.Spool(directory, clock=lambda: 1700000000.0).open()
+    reopened.enforce_bounds()
+    cursor_after = int(reopened._state["resolved_through"])
+    reopened.close()          # single writer: release before re-reading
+    kept_lines = [line for line in
+                  open(os.path.join(directory, sp.SPOOL_FILE), "rb")
+                  .read().splitlines() if line]
+    out["unresolved_corrupt_record_survives_compaction"] = (
+        cursor_after < 3
+        and corrupt_line in kept_lines
+        and any(sp.recover_record_id(line) == 3 for line in kept_lines))
+    clean(root)
+    # ---- D1b: the C3 crash window itself -- reconciliation cannot persist
+    #      its cursor while compaction runs, so the ONLY evidence of id 3 is
+    #      the corrupt line on disk. Losing it would reopen reuse.
+    root = temp_dir()
+    directory = os.path.join(root, "spool")
+    queue = sp.Spool(directory, clock=lambda: 1700000000.0).open()
+    queue.append("office-sg-isp-a", RUN, 1, pl.encode_sample(_sample(1)),
+                 queued_epoch=1700000000.0)
+    queue.close()
+    with open(os.path.join(directory, sp.SPOOL_FILE), "ab") as handle:
+        handle.write(corrupt_line + b"\n")
+    real_save = sp.Spool._save_state
+
+    def refusing_save(self):
+        raise sp.SpoolError("cursor save refused")
+
+    sp.Spool._save_state = refusing_save
+    try:
+        window = sp.Spool(directory, clock=lambda: 1700000000.0).open()
+        # startup reconciliation moved the IN-MEMORY cursor to 4, but the
+        # durable cursor is still 2; retention then compacts.
+        window.enforce_bounds()
+    finally:
+        sp.Spool._save_state = real_save
+    window.close()
+    final = sp.Spool(directory, clock=lambda: 1700000000.0).open()
+    allocated = final.append("office-sg-isp-a", RUN, 2,
+                             pl.encode_sample(_sample(2)),
+                             queued_epoch=1700000000.0)
+    out["failed_cursor_save_plus_compaction_cannot_reopen_id_reuse"] = (
+        allocated >= 4 and allocated != 3)
+    final.close()
+    clean(root)
+    # ---- D1c: a corrupt line whose id cannot be recovered BLOCKS
+    #      compaction: no rewrite is published and the line stays on disk.
+    root = temp_dir()
+    directory = os.path.join(root, "spool")
+    queue = sp.Spool(directory, clock=lambda: 1700000000.0).open()
+    queue.append("office-sg-isp-a", RUN, 1, pl.encode_sample(_sample(1)),
+                 queued_epoch=1700000000.0)
+    chain = os.path.join(directory, sp.SPOOL_FILE)
+    before = open(chain, "rb").read()
+    with open(chain, "ab") as handle:
+        handle.write(b"complete but not a record at all\n")
+    planted = open(chain, "rb").read()
+    raised = False
+    try:
+        queue.enforce_bounds()
+    except (sp.SpoolError, OSError):
+        raised = True
+    out["unrecoverable_corrupt_line_blocks_compaction"] = (
+        raised and open(chain, "rb").read() == planted
+        and planted != before)
+    queue.close()
+    clean(root)
+
     return out
 # -- group: contract constants ---------------------------------------------------
 

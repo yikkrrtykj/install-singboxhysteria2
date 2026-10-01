@@ -769,10 +769,19 @@ class Spool:
         return self.status()
 
     def _compact_resolved(self):
-        """Rewrite EVERY file in the chain without resolved or unreadable
-        lines, so acknowledged records cannot linger physically in the rotated
-        files. Each rewrite goes to a restricted temp file (fsynced), renames
-        over the original, then fsyncs the directory."""
+        """Rewrite EVERY file in the chain without RESOLVED records, so
+        acknowledged records cannot linger physically in the rotated files.
+
+        A complete-but-corrupt line is NOT garbage. Its record id is part of
+        the durable high-water, so it is dropped only when the durable cursor
+        PROVES it terminal (``id <= resolved_through``); dropping an
+        unresolved one would erase the only on-disk evidence of that id and
+        reopen reuse (the crash window C3 closes). A corrupt line whose id
+        cannot be recovered fails CLOSED with no rewrite published, and the
+        ONE incomplete trailing fragment is repaired at open by
+        ``_repair_tail`` -- never silently here. Each rewrite goes to a
+        restricted temp file (fsynced), renames over the original, then
+        fsyncs the directory."""
         resolved = int(self._state["resolved_through"])
         current = os.path.join(self.directory, SPOOL_FILE)
         for path in self._record_paths():
@@ -784,7 +793,16 @@ class Spool:
                 if not line:
                     continue
                 record = decode_record(line)
-                if record is None or record["record_id"] <= resolved:
+                if record is None:
+                    reserved = recover_record_id(line)
+                    if reserved is None:
+                        raise SpoolError(
+                            "corrupt record without a recoverable id")
+                    if reserved <= resolved:
+                        continue           # the durable cursor proves it ended
+                    keep.append(line)      # verbatim: it still owns its id
+                    continue
+                if record["record_id"] <= resolved:
                     continue
                 keep.append(line)
             if not keep and path != current:
