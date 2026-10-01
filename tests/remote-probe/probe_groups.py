@@ -1554,53 +1554,111 @@ def group_resilience():
                      clock=lambda: 1700000000.0).open() is not None)
     finally:
         clean(instance.config.spool_dir)
-    # ---- R2: rotation publication is fsync + rename + directory fsync
+    # ---- R2: rotation publication is fsync + rename + directory fsync.
+    #      Isolated by an ORDERED event log: a bare call-count is satisfied
+    #      by the state save's own directory fsync, and the record write
+    #      uses a bare os.fsync, so a failure injected anywhere in the
+    #      append would surface there instead of at the rotation. The
+    #      rotation's own fsync is therefore armed by POSITION.
     root = temp_dir()
     directory = os.path.join(root, "spool")
-    queue = sp.Spool(directory, clock=lambda: 1700000000.0,
-                     file_bytes=1200, max_files=3).open()
-    calls = {"n": 0}
+    events = []
+    real_replace = sp.os.replace
     real_fsync_dir = sp._fsync_dir
 
-    def counting_fsync_dir(path):
-        calls["n"] += 1
+    def logged_replace(source, target):
+        events.append(("replace", target))
+        return real_replace(source, target)
+
+    def logged_fsync_dir(path):
+        events.append(("fsync_dir", path))
         return real_fsync_dir(path)
 
-    sp._fsync_dir = counting_fsync_dir
+    sp.os.replace = logged_replace
+    sp._fsync_dir = logged_fsync_dir
     try:
+        queue = sp.Spool(directory, clock=lambda: 1700000000.0,
+                         file_bytes=1, max_files=3).open()
         for index in range(4):
             queue.append("office-sg-isp-a", RUN, index + 1,
                          pl.encode_sample(_sample(index + 1)),
                          queued_epoch=1700000000.0)
     finally:
+        sp.os.replace = real_replace
         sp._fsync_dir = real_fsync_dir
-    rotated = glob.glob(os.path.join(directory, "spool.jsonl.*"))
-    out["rotation_fsyncs_directory"] = bool(rotated) and calls["n"] >= 1
-    out["rotation_fsyncs_the_file_before_renaming"] = (
-        len(glob.glob(os.path.join(directory, "spool.jsonl.*"))) >= 1)
-    queue.close()
-    # a failed FILE fsync during rotation must fail closed, not be swallowed
+        queue.close()
+    # Rotating the CURRENT file is the only rename whose target is slot 1,
+    # and the directory fsync must be the very NEXT event: the new name is
+    # not durable until the entry is.
+    rotated_base = os.path.join(directory, sp.SPOOL_FILE + ".1")
+    slots = [i for i, event in enumerate(events)
+             if event == ("replace", rotated_base)]
+    out["rotation_directory_fsync_follows_each_rename"] = (
+        bool(slots)
+        and all(index + 1 < len(events)
+                and events[index + 1] == ("fsync_dir", directory)
+                for index in slots))
+    clean(root)
+    # A failed fsync at the ROTATION must fail closed: the publish is
+    # withheld. The failure is armed on the first os.fsync of the append
+    # that rotates -- the rotation's own source fsync -- so a swallowed
+    # error cannot hide behind the record write's later fsync.
+    root = temp_dir()
+    directory = os.path.join(root, "spool")
+    seed = sp.Spool(directory, clock=lambda: 1700000000.0,
+                    file_bytes=1, max_files=3).open()
+    seed.append("office-sg-isp-a", RUN, 1, pl.encode_sample(_sample(1)),
+                queued_epoch=1700000000.0)
     real_os_fsync = sp.os.fsync
-    boom = {"armed": True}
+    calls = {"n": 0}
 
-    def failing_fsync(fd):
-        if boom["armed"]:
+    def armed_fsync(fd):
+        calls["n"] += 1
+        if calls["n"] == 1:
             raise OSError("fsync refused")
         return real_os_fsync(fd)
 
-    sp.os.fsync = failing_fsync
+    sp.os.fsync = armed_fsync
+    raised = False
     try:
         try:
-            queue2 = sp.Spool(directory, clock=lambda: 1700000000.0,
-                              file_bytes=1, max_files=3).open()
-            queue2.append("office-sg-isp-a", RUN, 1, pl.encode_sample(_sample(1)),
-                          queued_epoch=1700000000.0)
-            out["rotation_file_fsync_failure_fails_closed"] = False
+            seed.append("office-sg-isp-a", RUN, 2,
+                        pl.encode_sample(_sample(2)),
+                        queued_epoch=1700000000.0)
         except (sp.SpoolError, OSError):
-            out["rotation_file_fsync_failure_fails_closed"] = True
+            raised = True
     finally:
         sp.os.fsync = real_os_fsync
-        boom["armed"] = False
+    out["rotation_source_fsync_failure_withholds_the_publish"] = (
+        raised and not os.path.lexists(rotated_base))
+    # The same discipline on the COMPACTION path: a rewrite that could not
+    # be fsynced must never be published over the chain. Judged on the
+    # DURABLE artifact -- the record is resolved first (with a working
+    # fsync) and must still be on disk when the rewrite failed to flush.
+    chain_path = os.path.join(directory, sp.SPOOL_FILE)
+
+    def read_chain_bytes():
+        try:
+            with open(chain_path, "rb") as handle:
+                return handle.read()
+        except OSError:
+            return b""
+
+    seed.resolve(1)
+    before_chain = read_chain_bytes()
+    sp.os.fsync = armed_fsync
+    calls["n"] = 0
+    compaction_raised = False
+    try:
+        try:
+            seed.enforce_bounds()
+        except (sp.SpoolError, OSError):
+            compaction_raised = True
+    finally:
+        sp.os.fsync = real_os_fsync
+    out["compaction_fsync_failure_withholds_the_rewrite"] = (
+        compaction_raised and read_chain_bytes() == before_chain)
+    seed.close()
     clean(root)
     # an unsafe rotated SOURCE is refused and never renamed
     root = temp_dir()

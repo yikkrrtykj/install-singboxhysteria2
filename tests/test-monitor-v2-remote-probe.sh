@@ -59,7 +59,13 @@ FAIL=0
 # residuals -- startup retention fail-closed, rotation published as file fsync +
 # rename + directory fsync, unsafe chain members refused, the baseline file
 # under the same storage discipline, per-request sent_epoch freshness, and the
-# Mihomo/ingest secret non-reuse rule.
+# Mihomo/ingest secret non-reuse rule. The rotation and compaction durability
+# verdicts are isolated from the write path's own fsync by an ORDERED event log
+# and by judging the DURABLE artifact, so each of them fails on the pre-fix
+# implementation. The symlink-shaped refusals self-satisfy on a host without
+# symlink privilege (Windows dev box, WinError 1314) and exercise the refusal
+# on the Linux CI runners; the special-object refusals cover the same
+# invariant host-independently.
 EXPECTED_PASS=226
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
