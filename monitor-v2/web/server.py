@@ -32,6 +32,7 @@ import json
 import math
 import re
 import sys
+import time
 import traceback
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -40,11 +41,21 @@ from urllib.parse import parse_qs, urlsplit
 from web.access import host_entry_for_ip
 from web.e3_broker import BrokerUnavailable
 from web.e3rpc import RpcTransportError
-from web.incident_history import QUERY_LIMIT_DEFAULT, QUERY_LIMIT_MAX
+from web import incident_presenter as incident_presenter
+from web import incident_history as ih_outcomes
+from web.incident_history import (MARKER_KINDS, QUERY_LIMIT_DEFAULT,
+                                  QUERY_LIMIT_MAX, RETENTION_SECONDS)
+
+ih_outcome_ok = ih_outcomes.OUTCOME_OK
+ih_outcome_missing = ih_outcomes.OUTCOME_MISSING
+ih_outcome_store_unavailable = ih_outcomes.OUTCOME_STORE_UNAVAILABLE
+ih_outcome_rejected = ih_outcomes.OUTCOME_REJECTED
+ih_outcome_rearmed = ih_outcomes.OUTCOME_REARMED
+ih_outcome_recorded = ih_outcomes.OUTCOME_RECORDED
 from web.recovery import (RECOVERY_SUCCESS_MESSAGE, RecoveryGlobalGuard,
                           RecoveryRateLimiter, generate_key)
 
-MONITOR_WEB_VERSION = "0.5.0"
+MONITOR_WEB_VERSION = "0.6.0"
 SESSION_COOKIE = "monitor_session"
 MAX_BODY_BYTES = 65536
 SUPPORTED_METHODS = "GET, POST"
@@ -265,6 +276,89 @@ def normalize_path(raw_path):
     if len(path) > 1:
         path = path.rstrip("/") or "/"
     return path
+
+
+# -- P5 incidents surface (issue #33 Phase 5, #63 R2 §4/§8/§10) -----------------
+
+INCIDENT_LIST_LIMIT_DEFAULT = 100
+INCIDENT_LIST_LIMIT_MAX = 500
+MARKER_LIST_LIMIT_DEFAULT = 200
+MARKER_LIST_LIMIT_MAX = 500
+# The marker evidence context (#63 R2 §8): a marker-bound evidence window
+# is exactly the +/-900 s span around the operator-declared epoch.
+MARKER_CONTEXT_SPAN_SECONDS = 900.0
+INCIDENT_LIST_STATES = ("open", "closed")
+# The closed evidence section vocabulary: exactly the classifier's
+# LIST_SECTIONS. web/ never imports the classifier, so this is the same
+# deliberate duplicate-shapes discipline as every other mirrored enum;
+# the incidents lane equality-gates it against the live module.
+EVIDENCE_SECTION_NAMES = ("samples", "device_states", "probe_rows",
+                          "journal_events", "audit")
+INCIDENT_LIST_ROW_KEYS = (
+    "incident_id", "classifier_version", "state", "category",
+    "analysis_start_epoch", "first_signal_epoch", "last_signal_epoch",
+    "last_classified_end_epoch", "closed_epoch", "closure_reason",
+    "buckets",
+)
+
+
+# Bounded positive-ID parsing for the P5 route family: EXACTLY ASCII
+# 0-9, at most nine digits (any rowid this surface can produce is far
+# smaller), positive -- and TOTAL: no exception can escape, because
+# malformed user input must never reach the internal-error path.
+MAX_ROUTE_ID_DIGITS = 9
+ASCII_DIGITS = frozenset("0123456789")
+
+
+def parse_positive_id(raw):
+    """The bounded ASCII-decimal positive ID, or None. ``str.isdigit``
+    accepts non-ASCII digit characters (e.g. "²") that ``int`` then
+    refuses, and an unbounded digit string is unbounded conversion work --
+    so the parser is character-closed and length-bounded BEFORE ``int``
+    ever runs."""
+    if (not isinstance(raw, str) or not raw
+            or len(raw) > MAX_ROUTE_ID_DIGITS
+            or not all(ch in ASCII_DIGITS for ch in raw)):
+        return None
+    value = int(raw)
+    return value if value >= 1 else None
+
+
+def incident_list_params(query):
+    """Validate the ONLY accepted incident-list params:
+    (error, state, limit). Unknown query keys are IGNORED -- never
+    interpreted as filters (the timeline discipline). An invalid or
+    <1 limit is a 400; a too-large limit is clamped (#63 R2 §4)."""
+    state = None
+    if "state" in query:
+        state = query["state"][0]
+        if state not in INCIDENT_LIST_STATES:
+            return "invalid_state", None, None
+    limit = INCIDENT_LIST_LIMIT_DEFAULT
+    if "limit" in query:
+        try:
+            limit = int(query["limit"][0])
+        except (TypeError, ValueError):
+            return "invalid_limit", None, None
+        if limit < 1:
+            return "invalid_limit", None, None
+        limit = min(limit, INCIDENT_LIST_LIMIT_MAX)
+    return None, state, limit
+
+
+def marker_list_params(query):
+    """Validate the ONLY accepted marker-list params: (error, limit).
+    Same discipline as the incident list."""
+    limit = MARKER_LIST_LIMIT_DEFAULT
+    if "limit" in query:
+        try:
+            limit = int(query["limit"][0])
+        except (TypeError, ValueError):
+            return "invalid_limit", None, None
+        if limit < 1:
+            return "invalid_limit", None, None
+        limit = min(limit, MARKER_LIST_LIMIT_MAX)
+    return None, limit
 
 
 def timeline_query_params(query):
@@ -703,6 +797,32 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/v1/diagnostics/timeline":
             self._require_session(self._handle_diagnostics_timeline)
             return
+        # 0.6.0 (#33 PR-5, #63 R2 §4): the closed incidents read family.
+        if path == "/api/v1/incidents":
+            self._require_session(self._handle_incidents)
+            return
+        if path.startswith("/api/v1/incidents/"):
+            suffix = path[len("/api/v1/incidents/"):]
+            if suffix == "rearm":
+                # rearm is POST-only by contract: a GET here is a method
+                # error on a known route, never a silent 404.
+                self._method_not_allowed(allowed="POST")
+                return
+            incident_id = parse_positive_id(suffix)
+            if incident_id is not None:
+                self._require_session(self._handle_incident_detail,
+                                      incident_id)
+                return
+            # invalid SYNTAX and a valid-but-missing id share the same
+            # closed 404 -- the route never confirms an arbitrary number
+            self._send_json(404, {"error": "incident_not_found"})
+            return
+        if path == "/api/v1/evidence":
+            self._require_session(self._handle_evidence)
+            return
+        if path == "/api/v1/markers":
+            self._require_session(self._handle_markers_get)
+            return
         # M4: the export endpoint exists but is POST-only. A GET there is a
         # method error on a known route, not a static miss -- answering 404
         # would make the endpoint look absent to anything probing the
@@ -791,6 +911,23 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/v1/diagnostics/timeline":
             # 0.2.0: same GET-only semantics as the convergence route.
+            self._method_not_allowed(allowed="GET")
+            return
+        # 0.6.0 (#33 PR-5, #63 R2 §4/§10/§11): the two operator mutations,
+        # both behind the full step-up chain, and the method-closure
+        # answers for the read family (a POST on a GET-only route is a
+        # method error, never a silent 404).
+        if path == "/api/v1/markers":
+            self._require_step_up(self._handle_marker_post)
+            return
+        if path == "/api/v1/incidents/rearm":
+            self._require_step_up(self._handle_rearm)
+            return
+        if path == "/api/v1/incidents" or \
+                path.startswith("/api/v1/incidents/"):
+            self._method_not_allowed(allowed="GET")
+            return
+        if path == "/api/v1/evidence":
             self._method_not_allowed(allowed="GET")
             return
         self._send_json(404, {"error": "not found"})
@@ -994,6 +1131,291 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             "truncated": result["truncated"],
             "limit": result["limit"],
         })
+
+    # -- P5 handlers (#33 PR-5, #63 R2 §4/§8/§10) -----------------------------
+    #
+    # Every response below is a deny-by-default closed projection: exactly
+    # the reviewed keys, categories only from the six emittable ones,
+    # evidence only over the subject-derived window, and no
+    # run_id / cycle_id / fp / identity material anywhere. Timeline stays
+    # byte-frozen: the incidents family never widens it.
+
+    def _handle_incidents(self, session):
+        """GET /api/v1/incidents[?state=open|closed&limit=<int>]
+
+        The bounded incident list (#63 R2 §4): rows over the closed
+        12-key projection (marker_count is a read-time join over the
+        analysis window), the CURRENT closed 8-key runtime projection,
+        and the CURRENT sanitized history health -- the UI must label
+        that as diagnostics health, never as incident-time health."""
+        history = self.app.incident_history
+        if history is None:
+            self._send_json(503, {"error": "incident history not enabled"})
+            return
+        error, state, limit = incident_list_params(
+            parse_qs(urlsplit(self.path).query))
+        if error is not None:
+            self._send_json(400, {"error": error})
+            return
+        outcome, result = history.query_incidents(state=state, limit=limit)
+        if outcome != ih_outcome_ok:
+            # a storage failure is never presented as a healthy empty list
+            self._send_json(503, {"error": "incident history unavailable"})
+            return
+        rows = []
+        for row in result["incidents"]:
+            item = {key: row[key] for key in INCIDENT_LIST_ROW_KEYS}
+            c_outcome, count = history.marker_count(
+                row["analysis_start_epoch"],
+                row["last_classified_end_epoch"])
+            if c_outcome != ih_outcome_ok:
+                # zero MEANS "no joined markers"; an unreadable marker
+                # table must never masquerade as a fabricated zero on a
+                # 200 list (the failure is recorded in health by the store)
+                self._send_json(503,
+                                {"error": "incident history unavailable"})
+                return
+            item["marker_count"] = count
+            rows.append(item)
+        self._send_json(200, {
+            "incidents": rows,
+            "runtime": self.app.incident_runtime_status(),
+            "history": history.health(),
+            "truncated": result["truncated"],
+            "limit": result["limit"],
+        })
+
+    def _handle_incident_detail(self, session, incident_id):
+        """GET /api/v1/incidents/<id>
+
+        The closed detail projection (#63 R2 §4): the 12 list fields plus
+        created/updated epochs, the raw bitsets, the DECODED
+        evidence/unknowns as [{token, text}] (decoding authority is the
+        presenter, never the browser), the deterministic 10-key L1
+        summary, and the in-window markers with their closed labels. A
+        missing or non-integer id is incident_not_found -- the route
+        family never confirms that an arbitrary number exists."""
+        history = self.app.incident_history
+        if history is None:
+            self._send_json(503, {"error": "incident history not enabled"})
+            return
+        outcome, detail = history.incident_detail(incident_id)
+        if outcome == ih_outcome_missing:
+            self._send_json(404, {"error": "incident_not_found"})
+            return
+        if outcome != ih_outcome_ok:
+            # a storage failure is never presented as a missing row
+            self._send_json(503, {"error": "incident history unavailable"})
+            return
+        evidence_tokens = incident_presenter.bits_to_evidence(
+            detail["evidence_bits"])
+        unknown_tokens = incident_presenter.bits_to_unknown(
+            detail["unknown_bits"])
+        if evidence_tokens is None or unknown_tokens is None:
+            # unreachable through the CHECK-bounded columns; a decode
+            # failure is a closed 500, never a fabricated empty verdict
+            self._send_json(500, {"error": "internal error"})
+            return
+        row = {key: detail[key] for key in INCIDENT_LIST_ROW_KEYS}
+        row["marker_count"] = len(detail["markers"])
+        row["created_epoch"] = detail["created_epoch"]
+        row["updated_epoch"] = detail["updated_epoch"]
+        row["evidence_bits"] = detail["evidence_bits"]
+        row["unknown_bits"] = detail["unknown_bits"]
+        row["evidence"] = incident_presenter.evidence_texts(evidence_tokens)
+        row["unknowns"] = incident_presenter.unknown_texts(unknown_tokens)
+        row["summary"] = incident_presenter.summarize(detail, unknown_tokens)
+        row["markers"] = [dict(marker, label=incident_presenter.marker_label(
+            marker["kind"])) for marker in detail["markers"]]
+        self._send_json(200, row)
+
+    def _handle_evidence(self, session):
+        """GET /api/v1/evidence?section=...&incident_id=<n>|marker_id=<n>
+
+        The SUBJECT-BOUND evidence read (#63 R2 §8): exactly one of
+        incident_id / marker_id, the window derived by the SERVER (the
+        incident's analysis window, or the marker's +/-900 s span) --
+        arbitrary start/end browsing is structurally absent. The response
+        carries the retention cutoff so the UI can say evidence may have
+        aged out, and deliberately NO health field: current health must
+        never be mistaken for incident-time health."""
+        history = self.app.incident_history
+        if history is None:
+            self._send_json(503, {"error": "incident history not enabled"})
+            return
+        query = parse_qs(urlsplit(self.path).query)
+        section = query.get("section", [None])[0]
+        if section is None or section not in EVIDENCE_SECTION_NAMES:
+            self._send_json(400, {"error": "invalid_section"})
+            return
+        subjects = []
+        if "incident_id" in query:
+            subjects.append(("incident", query["incident_id"][0]))
+        if "marker_id" in query:
+            subjects.append(("marker", query["marker_id"][0]))
+        if len(subjects) != 1:
+            self._send_json(400, {"error": "invalid_subject"})
+            return
+        subject_type, raw_id = subjects[0]
+        subject_id = parse_positive_id(raw_id)
+        if subject_id is None:
+            self._send_json(400, {"error": "invalid_subject"})
+            return
+        if subject_type == "incident":
+            d_outcome, detail = history.incident_detail(subject_id)
+            if d_outcome == ih_outcome_missing:
+                self._send_json(404, {"error": "incident_not_found"})
+                return
+            if d_outcome != ih_outcome_ok:
+                self._send_json(503,
+                                {"error": "incident history unavailable"})
+                return
+            start = detail["analysis_start_epoch"]
+            end = detail["last_classified_end_epoch"]
+        else:
+            m_outcome, marker = history.marker_get(subject_id)
+            if m_outcome == ih_outcome_missing:
+                self._send_json(404, {"error": "marker_not_found"})
+                return
+            if m_outcome != ih_outcome_ok:
+                self._send_json(503,
+                                {"error": "incident history unavailable"})
+                return
+            start = max(0.0, marker["epoch"] - MARKER_CONTEXT_SPAN_SECONDS)
+            end = marker["epoch"] + MARKER_CONTEXT_SPAN_SECONDS
+        e_outcome, result = history.evidence_section(section, start, end)
+        if e_outcome == ih_outcome_store_unavailable:
+            # a storage failure is never presented as an empty section
+            self._send_json(503, {"error": "evidence unavailable"})
+            return
+        if e_outcome != ih_outcome_ok:
+            # the window is server-derived and validated above; a shape
+            # refusal reaching this point is a closed 400 regardless
+            self._send_json(400, {"error": "invalid_window"})
+            return
+        self._send_json(200, {
+            "subject": {"type": subject_type, "id": subject_id},
+            "section": section,
+            "window": {"start_epoch": start, "end_epoch": end},
+            "rows": result["rows"],
+            "truncated": result["truncated"],
+            "retention_cutoff_epoch": result["retention_cutoff_epoch"],
+        })
+
+    def _handle_markers_get(self, session):
+        """GET /api/v1/markers[?limit=<int>]
+
+        The bounded marker list (#63 R2 §3), newest epoch first, each row
+        the closed 5-key shape with the frozen kind label."""
+        history = self.app.incident_history
+        if history is None:
+            self._send_json(503, {"error": "incident history not enabled"})
+            return
+        error, limit = marker_list_params(
+            parse_qs(urlsplit(self.path).query))
+        if error is not None:
+            self._send_json(400, {"error": error})
+            return
+        m_outcome, result = history.query_markers(limit)
+        if m_outcome != ih_outcome_ok:
+            # a storage failure is never presented as an empty marker list
+            self._send_json(503, {"error": "incident history unavailable"})
+            return
+        markers = [dict(marker, label=incident_presenter.marker_label(
+            marker["kind"])) for marker in result["markers"]]
+        self._send_json(200, {
+            "markers": markers,
+            "truncated": result["truncated"],
+            "limit": result["limit"],
+        })
+
+    def _handle_marker_post(self, session, actor):
+        """POST /api/v1/markers {kind, epoch?}
+
+        Append one closed-enum operator marker (#63 R2 §3). The body is
+        EXACTLY {"kind": ...} or {"kind": ..., "epoch": ...} -- any other
+        key is a 400, so no free-text field can ever be smuggled in. An
+        explicit epoch must be a finite non-negative number within
+        [now - RETENTION_SECONDS, now]: future-dated and
+        older-than-retention markers are refused, never clamped. Step-up
+        already happened at the gate; no Idempotency-Key exists by
+        design (a local single-transaction append; a double submit
+        yields two markers, which is semantically two events)."""
+        history = self.app.incident_history
+        if history is None:
+            self._send_json(503, {"error": "incident history not enabled"})
+            return
+        body = self._json_body()
+        if not isinstance(body, dict) or "kind" not in body \
+                or set(body) - {"kind", "epoch"}:
+            self._send_json(400, {"error": "invalid_request_body"})
+            return
+        kind = body["kind"]
+        if kind not in MARKER_KINDS:
+            self._send_json(400, {"error": "invalid_marker_kind"})
+            return
+        if "epoch" in body:
+            # PRESENCE is the contract: omission means "now"; an explicit
+            # epoch -- JSON null included -- must be EXACTLY a finite,
+            # non-negative, non-bool number inside the retention window.
+            epoch = body["epoch"]
+            # EXACT typing first: a bool is an int subclass that would
+            # otherwise pass as a timestamp; a string would compare.
+            if type(epoch) not in (int, float) or isinstance(epoch, bool) \
+                    or not math.isfinite(epoch) or epoch < 0:
+                self._send_json(400, {"error": "invalid_marker_epoch"})
+                return
+            now = time.time()
+            if epoch > now or epoch < now - RETENTION_SECONDS:
+                self._send_json(400, {"error": "invalid_marker_epoch"})
+                return
+        else:
+            epoch = None
+        m_outcome, row = history.record_marker(kind, epoch)
+        if m_outcome == ih_outcome_rejected:
+            # the body passed the HTTP time check but crossed the
+            # retention/future boundary by the time the store checked it:
+            # an honest closed 400 epoch refusal, never a persistence
+            # failure and never a fabricated success
+            self._send_json(400, {"error": "invalid_marker_epoch"})
+            return
+        if m_outcome != ih_outcome_recorded:
+            # a persistence failure is a closed 503, never a fabricated
+            # success and never exception text
+            self._send_json(503, {"error": "marker persistence failed"})
+            return
+        row["label"] = incident_presenter.marker_label(row["kind"])
+        self._send_json(200, row)
+
+    def _handle_rearm(self, session, actor):
+        """POST /api/v1/incidents/rearm
+
+        The operator re-arm (#63 R2 §10). The web layer checks the
+        CURRENT projected runtime (enabled AND running AND phase ==
+        "rearm"); the store then re-checks the SAME preconditions
+        atomically at the SQL level, so a stale web view can never re-arm
+        a gate that has already moved. Success means ONLY that the
+        durable gate was re-armed: the in-memory phase may stay ``rearm``
+        until the next scan cadence, and the UI says exactly that."""
+        history = self.app.incident_history
+        if history is None:
+            self._send_json(503, {"error": "incident history not enabled"})
+            return
+        runtime = self.app.incident_runtime_status()
+        if not isinstance(runtime, dict) or not runtime.get("enabled") \
+                or not runtime.get("running") \
+                or runtime.get("phase") != "rearm":
+            self._send_json(409, {"error": "incident_runtime_not_rearmable"})
+            return
+        r_outcome = history.incident_rearm()
+        if r_outcome == ih_outcome_store_unavailable:
+            # a persistence failure is a closed 503, never a fake 409
+            self._send_json(503, {"error": "incident history unavailable"})
+            return
+        if r_outcome != ih_outcome_rearmed:
+            self._send_json(409, {"error": "incident_runtime_not_rearmable"})
+            return
+        self._send_json(200, {"status": "ok"})
 
     def _cross_origin(self):
         """True when the browser declared a foreign Origin (second CSRF

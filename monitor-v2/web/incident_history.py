@@ -13,19 +13,20 @@ Safety contract (all enforced, all tested):
   non-directory / non-regular type) is REFUSED, never followed. SQLite
   runs ``journal_mode=DELETE`` (no stray -wal/-shm files),
   ``synchronous=FULL``, ``foreign_keys=ON`` and a bounded busy timeout.
-  Schema handling is strict: a genuinely fresh DB is created at v4; an
-  existing DB opens only with an exactly-declared v4 on EXACTLY the ten
-  v4 tables, or with EXACTLY the eight v3 tables (migrated FORWARD to v4
-  in one transaction), or with EXACTLY the seven v2 tables (migrated
-  FORWARD all the way to v4 in one transaction), or with EXACTLY the
-  three v1 tables (migrated FORWARD all the way to v4 in one
-  transaction), with every pre-existing row preserved. Any extra
-  unrelated table, any other declared version (newer, negative,
-  malformed, hybrid) or metadata-less SQLite file is refused fail-closed
-  and never mutated -- migrations are explicit and forward-only. A
-  database at v4 opened by a pre-v4 build refuses on exactly this gate,
-  which is what the deploy-side rollback compatibility gate mirrors
-  BEFORE any mutation.
+  Schema handling is strict: a genuinely fresh DB is created at v5; an
+  existing DB opens only with an exactly-declared v5 on EXACTLY the
+  eleven v5 tables, or with EXACTLY the ten v4 tables (migrated FORWARD
+  to v5 in one transaction), or with EXACTLY the eight v3 tables
+  (migrated FORWARD all the way to v5 in one transaction), or with
+  EXACTLY the seven v2 tables (migrated FORWARD all the way to v5 in one
+  transaction), or with EXACTLY the three v1 tables (migrated FORWARD
+  all the way to v5 in one transaction), with every pre-existing row
+  preserved. Any extra unrelated table, any other declared version
+  (newer, negative, malformed, hybrid) or metadata-less SQLite file is
+  refused fail-closed and never mutated -- migrations are explicit and
+  forward-only. A database at v5 opened by a pre-v5 build refuses on
+  exactly this gate, which is what the deploy-side rollback
+  compatibility gate mirrors BEFORE any mutation.
 * Threading: ONE reentrant lock serializes the whole of ``open`` /
   ``on_publish`` (write + retention) / ``health`` / ``query_timeline`` /
   ``close`` against each other -- exactly one thread may touch the shared
@@ -119,6 +120,25 @@ Incident plane (issue #33 Phase 4, PR-4B):
   and the runtime's open-incident pointer is updated in the SAME
   transaction as the window row it mirrors, so a crash can never leave
   the runtime pointing at a row that does not exist.
+
+Operator markers + the P5 read surface (issue #33 Phase 5, PR-5):
+
+* The v5 ``operator_markers`` table holds CLOSED-ENUM event markers only
+  (``tt_live_studio_login_failed`` / ``operator_event``): there is no
+  free-text column, no edit and no delete -- a marker is an append-only
+  fact with a timestamp, never a note pad. A marker older than the
+  retention horizon or in the future is refused at the boundary, and the
+  table participates in BOTH time and size retention like every other
+  evidence table: markers are bounded history, not a permanent record.
+* Markers never enter ``classifier_bundle()``: they are operator
+  annotations, not classification input, and no bundle section reads
+  them.
+* The operator re-arm (``incident_rearm``) flips the durable gate the
+  P4B window-limit close raised, under the SAME closed preconditions at
+  the SQL level (activated, no open incident, no discovery floor,
+  rearm demanded) and the SAME one-minute bucket grid the activation
+  floor uses. It moves NOTHING else: activation floor, evaluated end,
+  reader continuity and incident rows are untouched.
 """
 
 from __future__ import annotations
@@ -143,7 +163,7 @@ except ImportError:  # packaged monitor release does not (yet) ship the lib
     _journal_schema = None
     JOURNAL_CONTRACT_AVAILABLE = False
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 DB_NAME = "history.sqlite3"
 
@@ -162,12 +182,15 @@ PRUNE_BATCH_ROWS = 512
 # (samples first only to settle exact ties at the cut epoch). The v2
 # journal tables participate through their Monitor-clock ingest epochs;
 # journal_events rides along via ON DELETE CASCADE with journal_runs.
+# PR-5: operator markers join the SAME accounting (bounded history, not a
+# permanent record -- #63 R2 §3).
 _PRUNE_SOURCES = (
     ("timeline_samples", "epoch"),
     ("device_protocol_states", "epoch"),
     ("network_probe_samples", "epoch"),
     ("journal_runs", "ingested_epoch"),
     ("journal_ingest_audit", "epoch"),
+    ("operator_markers", "epoch"),
 )
 
 # Read surface bounds (spec §8): bounded, no arbitrary filters.
@@ -253,6 +276,9 @@ _JOURNAL_TABLES = frozenset({"journal_runs", "journal_events",
 _PROBE_TABLES = frozenset({"network_probe_samples"})
 _INCIDENT_TABLES = frozenset({"incident_windows",
                               "incident_runtime_state"})
+# PR-5 (#63 R2 §2): the ONE v5 table. The gate stays table-set EQUALITY --
+# an extra or missing table under any declaration is refused fail-closed.
+_MARKER_TABLES = frozenset({"operator_markers"})
 # EXACT shapes -- the schema gate is table-set EQUALITY, not a subset:
 # an unrelated extra table is a shape this module never created, so an
 # open that claims v1/v2/v3/v4 while carrying one is refused fail-closed
@@ -262,6 +288,7 @@ _ALLOWED_V1_SHAPE = _V1_TABLES | {_META_TABLE}
 _ALLOWED_V2_SHAPE = _ALLOWED_V1_SHAPE | _JOURNAL_TABLES
 _ALLOWED_V3_SHAPE = _ALLOWED_V2_SHAPE | _PROBE_TABLES
 _ALLOWED_V4_SHAPE = _ALLOWED_V3_SHAPE | _INCIDENT_TABLES
+_ALLOWED_V5_SHAPE = _ALLOWED_V4_SHAPE | _MARKER_TABLES
 
 # -- probe ingest surface (issue #33 Phase 3, PR-3B) ---------------------------
 
@@ -324,6 +351,36 @@ CLASSIFIER_BUNDLE_ROW_BUDGET = 2000
 # heartbeat-name tokens stay the journal reader's vocabulary -- the
 # classifier consumes "stale" for ANY non-fresh runtime derivation.
 CLASSIFIER_READER_STATUSES = ("fresh", "stale")
+
+# -- operator markers + re-arm (issue #33 Phase 5, PR-5, #63 R2 §3/§10) ---------
+
+# The closed marker kinds. There is NO free-text column: a marker is an
+# append-only fact with a timestamp and a reviewed label, never a note pad.
+MARKER_KINDS = ("tt_live_studio_login_failed", "operator_event")
+# Exact projected columns of a marker row (deny-by-default like every
+# other projection here); the label is presentation (incident_presenter),
+# never storage.
+MARKER_COLUMNS = ("marker_id", "epoch", "kind", "created_epoch")
+# The re-arm floor uses the SAME one-minute bucket grid as the P4B
+# activation floor. Stated locally on purpose -- this module never imports
+# the classifier or the runtime -- and equality-gated against BOTH by the
+# lanes (the classifier's BUCKET_SECONDS and the runtime's referenced
+# constant are the same reviewed 60).
+INCIDENT_BUCKET_SECONDS = 60
+
+# Internal outcome tokens for the P5 operator surface (review round, #63
+# R2 §6): "the row is not there", "the store could not answer" and "the
+# write landed" are EXPLICIT outcomes, never inferred from a pre-existing
+# global degraded flag and never collapsed into one None/False. The web
+# layer maps them to 404 / 503 / 200 / 409; every token stays inside this
+# module and never reaches a response body.
+OUTCOME_OK = "ok"
+OUTCOME_MISSING = "missing"
+OUTCOME_STORE_UNAVAILABLE = "store_unavailable"
+OUTCOME_REARMED = "rearmed"
+OUTCOME_NOT_REARMABLE = "not_rearmable"
+OUTCOME_RECORDED = "recorded"
+OUTCOME_REJECTED = "rejected"
 
 
 def _encode_incident_bits(tokens, maximum):
@@ -1087,6 +1144,327 @@ class IncidentHistory:
                 "rejected_total": int(self._incident_rejected_total),
             }
 
+    # -- operator surface (issue #33 Phase 5, PR-5) ------------------------------
+    #
+    # The P5 read/write surface rides the SAME incident-plane health
+    # subsystem (same counters, same one code): an operator write that
+    # fails is the same class of persistence refusal as an incident-window
+    # write, and it can never swallow or be swallowed by the ordinary
+    # evidence planes.
+
+    def record_marker(self, kind, epoch=None):
+        """Append ONE closed-enum operator marker (#63 R2 §3).
+
+        ``kind`` MUST be a member of the frozen two-token vocabulary;
+        ``epoch`` (the operator-declared event time) defaults to now and
+        is refused when it is not a finite non-negative epoch, lies in
+        the future, or is older than the retention horizon -- a marker
+        that would instantly be retention-pruned is not accepted as
+        history. There is no edit and no delete: a wrong marker is
+        corrected by appending another one. Returns
+        ``(OUTCOME_RECORDED, row)`` with the stored 4-key row, or an
+        explicit failure outcome: ``(OUTCOME_REJECTED, None)`` when the
+        boundary refuses the candidate, ``(OUTCOME_STORE_UNAVAILABLE,
+        None)`` when the store is disabled or the write could not land
+        -- a persistence failure is never disguised as a rejection and
+        never raises."""
+        try:
+            with self._lock:
+                if not self._enabled or self._conn is None:
+                    return OUTCOME_STORE_UNAVAILABLE, None
+                return self._record_marker_locked(kind, epoch, self._clock())
+        except _HistoryError:
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return OUTCOME_STORE_UNAVAILABLE, None
+        except (sqlite3.Error, OSError):
+            self._rollback_quiet()
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return OUTCOME_STORE_UNAVAILABLE, None
+        except Exception:  # noqa: BLE001 -- incident plane containment
+            self._rollback_quiet()
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return OUTCOME_STORE_UNAVAILABLE, None
+    def query_markers(self, limit):
+        """Bounded, sanitized marker read, newest epoch first.
+
+        Returns ``(OUTCOME_OK, {"markers", "truncated", "limit"})`` over
+        the exact MARKER_COLUMNS, or
+        ``(OUTCOME_STORE_UNAVAILABLE, empty)`` -- a read failure is
+        distinguishable from a healthy empty marker list (never
+        raises)."""
+        limit = max(1, min(_as_int(limit, 1), QUERY_LIMIT_MAX))
+        empty = {"markers": [], "truncated": False, "limit": limit}
+        try:
+            with self._lock:
+                if not self._enabled or self._conn is None:
+                    return OUTCOME_STORE_UNAVAILABLE, empty
+                rows = self._conn.execute(
+                    "SELECT %s FROM operator_markers"
+                    " ORDER BY epoch DESC, marker_id DESC LIMIT ?"
+                    % ", ".join(MARKER_COLUMNS), (limit + 1,)).fetchall()
+        except (sqlite3.Error, OSError):
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return OUTCOME_STORE_UNAVAILABLE, empty
+        return (OUTCOME_OK,
+                {"markers": [_project_rows(row, MARKER_COLUMNS)
+                             for row in rows[:limit]],
+                 "truncated": len(rows) > limit, "limit": limit})
+    def marker_get(self, marker_id):
+        """ONE marker row over the closed columns. Returns
+        ``(OUTCOME_OK, row)``, ``(OUTCOME_MISSING, None)`` when the id
+        does not exist, or ``(OUTCOME_STORE_UNAVAILABLE, None)`` on a
+        storage failure -- never a bare None for two different meanings
+        (never raises)."""
+        try:
+            with self._lock:
+                if not self._enabled or self._conn is None:
+                    return OUTCOME_STORE_UNAVAILABLE, None
+                if type(marker_id) is not int or isinstance(marker_id, bool) or marker_id < 1:
+                    return OUTCOME_MISSING, None
+                row = self._conn.execute(
+                    "SELECT %s FROM operator_markers WHERE marker_id = ?"
+                    % ", ".join(MARKER_COLUMNS), (marker_id,)).fetchone()
+                if row is None:
+                    return OUTCOME_MISSING, None
+                return OUTCOME_OK, _project_rows(row, MARKER_COLUMNS)
+        except (sqlite3.Error, OSError):
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return OUTCOME_STORE_UNAVAILABLE, None
+    def query_incidents(self, state=None, limit=QUERY_LIMIT_DEFAULT):
+        """Bounded incident read, newest incident first (#63 R2 §4).
+
+        ``state`` is None (both) or exactly 'open'/'closed'. Returns
+        ``(OUTCOME_OK, {"incidents", "truncated", "limit"})`` or
+        ``(OUTCOME_STORE_UNAVAILABLE, empty)`` -- a read failure is
+        distinguishable from a healthy empty history (never raises)."""
+        limit = max(1, min(_as_int(limit, QUERY_LIMIT_DEFAULT),
+                           QUERY_LIMIT_MAX))
+        empty = {"incidents": [], "truncated": False, "limit": limit}
+        try:
+            with self._lock:
+                if not self._enabled or self._conn is None:
+                    return OUTCOME_STORE_UNAVAILABLE, empty
+                if state is None:
+                    rows = self._conn.execute(
+                        "SELECT %s FROM incident_windows"
+                        " ORDER BY incident_id DESC LIMIT ?"
+                        % ", ".join(self.INCIDENT_WINDOW_COLUMNS),
+                        (limit + 1,)).fetchall()
+                elif state in ("open", "closed"):
+                    rows = self._conn.execute(
+                        "SELECT %s FROM incident_windows WHERE state = ?"
+                        " ORDER BY incident_id DESC LIMIT ?"
+                        % ", ".join(self.INCIDENT_WINDOW_COLUMNS),
+                        (state, limit + 1)).fetchall()
+                else:
+                    return OUTCOME_OK, empty
+        except (sqlite3.Error, OSError):
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return OUTCOME_STORE_UNAVAILABLE, empty
+        return (OUTCOME_OK,
+                {"incidents": [_project_rows(row,
+                                             self.INCIDENT_WINDOW_COLUMNS)
+                               for row in rows[:limit]],
+                 "truncated": len(rows) > limit, "limit": limit})
+    def incident_detail(self, incident_id):
+        """ONE incident row over the closed columns plus the markers whose
+        epoch falls inside its analysis window
+        (analysis_start <= epoch <= last_classified_end, the #63 R2 §4
+        read join). Returns ``(OUTCOME_OK, row)``,
+        ``(OUTCOME_MISSING, None)`` when the id does not exist, or
+        ``(OUTCOME_STORE_UNAVAILABLE, None)`` when the store could not
+        answer -- a read failure is never presented as a missing row
+        (never raises)."""
+        try:
+            with self._lock:
+                if not self._enabled or self._conn is None:
+                    return OUTCOME_STORE_UNAVAILABLE, None
+                if type(incident_id) is not int or isinstance(incident_id, bool) or incident_id < 1:
+                    return OUTCOME_MISSING, None
+                row = self._conn.execute(
+                    "SELECT %s FROM incident_windows WHERE incident_id = ?"
+                    % ", ".join(self.INCIDENT_WINDOW_COLUMNS),
+                    (incident_id,)).fetchone()
+                if row is None:
+                    return OUTCOME_MISSING, None
+                detail = _project_rows(row, self.INCIDENT_WINDOW_COLUMNS)
+                markers = self._conn.execute(
+                    "SELECT %s FROM operator_markers"
+                    " WHERE epoch >= ? AND epoch <= ?"
+                    " ORDER BY epoch ASC, marker_id ASC"
+                    % ", ".join(MARKER_COLUMNS),
+                    (detail["analysis_start_epoch"],
+                     detail["last_classified_end_epoch"])).fetchall()
+                detail["markers"] = [_project_rows(m, MARKER_COLUMNS)
+                                     for m in markers]
+                return OUTCOME_OK, detail
+        except (sqlite3.Error, OSError):
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return OUTCOME_STORE_UNAVAILABLE, None
+    def marker_count(self, analysis_start_epoch, last_classified_end_epoch):
+        """The list-row marker_count: a read-time count over
+        ``analysis_start <= epoch <= last_classified_end`` (#63 R2 §4).
+        Returns ``(OUTCOME_OK, count)`` -- where 0 MEANS "no joined
+        markers" -- or ``(OUTCOME_STORE_UNAVAILABLE, None)`` when the
+        marker table could not be read: a read failure is never presented
+        as a fabricated zero (never raises)."""
+        try:
+            with self._lock:
+                if not self._enabled or self._conn is None:
+                    return OUTCOME_STORE_UNAVAILABLE, None
+                row = self._conn.execute(
+                    "SELECT COUNT(*) FROM operator_markers"
+                    " WHERE epoch >= ? AND epoch <= ?",
+                    (analysis_start_epoch, last_classified_end_epoch)
+                ).fetchone()
+                return OUTCOME_OK, int(row[0])
+        except (sqlite3.Error, OSError, ValueError, TypeError):
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return OUTCOME_STORE_UNAVAILABLE, None
+
+    # Exact EVIDENCE wire whitelists (#63 R2 §8): subsets of the persisted
+    # columns with the reader/probe identity stripped -- run_id, cycle_id,
+    # result_version and the reader HMAC fp have no presentation meaning
+    # and never leave the store. egress_ip is deliberately visible (#33
+    # requires public-egress correlation).
+    EVIDENCE_SAMPLE_COLUMNS = (
+        "epoch", "iso_utc", "collector_stale", "api_status",
+        "total_active_connections", "reality_active_connections",
+        "hysteria2_active_connections", "other_active_connections",
+        "uplink_rate", "downlink_rate",
+        "skipped_events", "duplicate_events", "identity_conflicts",
+        "abandoned_on_reset",
+    )
+    EVIDENCE_DEVICE_COLUMNS = (
+        "epoch", "iso_utc", "device", "inbound", "active_connections",
+        "device_status", "uplink_rate", "downlink_rate",
+        "uplink_total", "downlink_total", "reason",
+    )
+    EVIDENCE_PROBE_COLUMNS = (
+        "epoch", "iso_utc",
+        "dns_status", "dns_latency_ms", "dns_error_code",
+        "https_status", "https_latency_ms", "https_error_code",
+        "udp_status", "udp_latency_ms", "udp_error_code",
+        "egress_status", "egress_latency_ms", "egress_error_code",
+        "egress_ip", "egress_change",
+    )
+    EVIDENCE_JOURNAL_COLUMNS = ("seq", "ts", "cls", "proto", "port",
+                                "dcls", "n")
+    EVIDENCE_AUDIT_COLUMNS = ("epoch", "kind", "seq", "code")
+
+    EVIDENCE_SECTIONS_MAP = (
+        ("samples", "timeline_samples", "epoch", EVIDENCE_SAMPLE_COLUMNS),
+        ("device_states", "device_protocol_states", "epoch",
+         EVIDENCE_DEVICE_COLUMNS),
+        ("probe_rows", "network_probe_samples", "epoch",
+         EVIDENCE_PROBE_COLUMNS),
+        ("journal_events", "journal_events", "ts", EVIDENCE_JOURNAL_COLUMNS),
+        ("audit", "journal_ingest_audit", "epoch", EVIDENCE_AUDIT_COLUMNS),
+    )
+
+    def evidence_section(self, section, start, end):
+        """ONE subject-bound evidence section (#63 R2 §8).
+
+        The window is SERVER-DERIVED (the incident's analysis window or
+        the marker's +/-900 s span) -- never caller-chosen -- and this
+        method re-validates it anyway: exactly a finite, ordered,
+        non-negative epoch pair. Rows come back over the section's closed
+        whitelist, chronological, at most CLASSIFIER_BUNDLE_ROW_BUDGET of
+        them with an explicit ``truncated`` flag (honest truncation, never
+        a silent drop and never the classifier's whole-bundle refusal --
+        presentation may be cut, classification may not). The response
+        carries ``retention_cutoff_epoch`` so the UI can say "some
+        evidence may have aged out" WITHOUT a health field: current
+        health must never be mistaken for incident-time health. Returns
+        ``(OUTCOME_OK, result)``, ``(OUTCOME_REJECTED, None)`` when the
+        window/section shape is refused here, or
+        ``(OUTCOME_STORE_UNAVAILABLE, None)`` when the store could not
+        answer -- a read failure is never presented as an empty section
+        (never raises)."""
+        try:
+            with self._lock:
+                if not self._enabled or self._conn is None:
+                    return OUTCOME_STORE_UNAVAILABLE, None
+                spec = None
+                for name, table, column, columns in self.EVIDENCE_SECTIONS_MAP:
+                    if name == section:
+                        spec = (table, column, columns)
+                        break
+                start_v = self._incident_epoch(start)
+                end_v = self._incident_epoch(end)
+                if (spec is None or start_v is None or end_v is None
+                        or end_v <= start_v):
+                    self._incident_rejected_total += 1
+                    self._record_incident_failure(
+                        CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+                    return OUTCOME_REJECTED, None
+                table, column, columns = spec
+                rows = self._conn.execute(
+                    "SELECT %s FROM %s WHERE %s >= ? AND %s < ?"
+                    " ORDER BY %s ASC LIMIT ?"
+                    % (", ".join(columns), table, column, column, column),
+                    (start_v, end_v,
+                     CLASSIFIER_BUNDLE_ROW_BUDGET + 1)).fetchall()
+                return (OUTCOME_OK, {
+                    "rows": [_project_rows(row, columns)
+                             for row in rows[:CLASSIFIER_BUNDLE_ROW_BUDGET]],
+                    "truncated": len(rows) > CLASSIFIER_BUNDLE_ROW_BUDGET,
+                    "retention_cutoff_epoch":
+                        self._clock() - self._retention_seconds,
+                })
+        except (sqlite3.Error, OSError):
+            self._rollback_quiet()
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return OUTCOME_STORE_UNAVAILABLE, None
+        except Exception:  # noqa: BLE001 -- incident plane containment
+            self._rollback_quiet()
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return OUTCOME_STORE_UNAVAILABLE, None
+    def incident_rearm(self):
+        """The operator re-arm (#63 R2 §10): flip the durable window-limit
+        gate back to discovery, on the SAME one-minute bucket grid the
+        activation floor uses, under the SAME closed preconditions at the
+        SQL level. One transaction moves EXACTLY two values --
+        ``rearm_required = 0`` and ``discovery_floor_epoch = floor`` --
+        and touches nothing else (activation floor, evaluated end, reader
+        continuity, incident rows, counters). The WHERE clause restates
+        every precondition the web layer checked, so a stale web view can
+        never re-arm a gate that has already moved. Returns
+        ``OUTCOME_REARMED`` iff the gate was re-armed,
+        ``OUTCOME_NOT_REARMABLE`` when the preconditions did not hold,
+        ``OUTCOME_STORE_UNAVAILABLE`` when the store could not answer --
+        a persistence failure never masquerades as a precondition
+        refusal (never raises)."""
+        try:
+            with self._lock:
+                if not self._enabled or self._conn is None:
+                    return OUTCOME_STORE_UNAVAILABLE
+                return self._incident_rearm_locked(self._clock())
+        except _HistoryError:
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return OUTCOME_STORE_UNAVAILABLE
+        except (sqlite3.Error, OSError):
+            self._rollback_quiet()
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return OUTCOME_STORE_UNAVAILABLE
+        except Exception:  # noqa: BLE001 -- incident plane containment
+            self._rollback_quiet()
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return OUTCOME_STORE_UNAVAILABLE
+
     # -- incident plane internals ------------------------------------------------
 
     @staticmethod
@@ -1413,6 +1791,64 @@ class IncidentHistory:
         self._incident_last_error_code = None
         return True
 
+    def _record_marker_locked(self, kind, epoch, now):
+        if type(kind) is not str or kind not in MARKER_KINDS:
+            self._incident_rejected_total += 1
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return OUTCOME_REJECTED, None
+        if epoch is None:
+            epoch = now
+        marker_epoch = self._incident_epoch(epoch)
+        current = self._incident_epoch(now)
+        if (marker_epoch is None or current is None
+                or marker_epoch > current
+                or marker_epoch < current - self._retention_seconds):
+            # future-dated or already-older-than-retention: both are
+            # shapes this surface never accepts (#63 R2 §3)
+            self._incident_rejected_total += 1
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return OUTCOME_REJECTED, None
+        cursor = self._conn.execute(
+            "INSERT INTO operator_markers (epoch, kind, created_epoch)"
+            " VALUES (?, ?, ?)", (marker_epoch, kind, current))
+        marker_id = int(cursor.lastrowid)
+        self._conn.commit()
+        self._incident_persisted_total += 1
+        self._incident_degraded = False
+        self._incident_last_error_code = None
+        return (OUTCOME_RECORDED,
+                {"marker_id": marker_id, "epoch": marker_epoch,
+                 "kind": kind, "created_epoch": current})
+    def _incident_rearm_locked(self, now):
+        current = self._incident_epoch(now)
+        if current is None:
+            self._incident_rejected_total += 1
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return OUTCOME_NOT_REARMABLE
+        # The SAME bucket grid as the P4B activation floor: the re-arm
+        # floor is the next whole minute boundary at/after now.
+        floor = math.ceil(current / INCIDENT_BUCKET_SECONDS)             * INCIDENT_BUCKET_SECONDS
+        self._incident_runtime_row_present_locked()
+        cursor = self._conn.execute(
+            "UPDATE incident_runtime_state SET rearm_required = 0,"
+            " discovery_floor_epoch = ?"
+            " WHERE id = 1 AND activation_floor_epoch > 0"
+            " AND open_incident_id IS NULL AND discovery_floor_epoch IS NULL"
+            " AND rearm_required = 1", (floor,))
+        if cursor.rowcount != 1:
+            self._rollback_quiet()
+            self._incident_rejected_total += 1
+            self._record_incident_failure(
+                CODE_HISTORY_INCIDENT_PERSIST_FAILED)
+            return OUTCOME_NOT_REARMABLE
+        self._conn.commit()
+        self._incident_persisted_total += 1
+        self._incident_degraded = False
+        self._incident_last_error_code = None
+        return OUTCOME_REARMED
     def _record_incident_failure(self, code):
         # Incident plane is INDEPENDENT: never touches _degraded /
         # _journal_* / _probe_*; only a later accepted incident write
@@ -1671,27 +2107,29 @@ class IncidentHistory:
     def _enforce_schema(self, conn, pre_existing):
         """STRICT schema gate -- the whole DB is opened read-only-first.
 
-        Accepted shapes are exactly five: a genuinely fresh database
+        Accepted shapes are exactly six: a genuinely fresh database
         (absent or zero-byte file, no tables) which is created at the
         current version, an existing database that DECLARES the current
-        schema_version and whose tables are EXACTLY the ten v4 tables,
-        an existing database that declares v3 whose tables are EXACTLY
-        the eight v3 tables (migrated FORWARD to v4 in ONE transaction,
-        zero v3 rows touched), an existing database that declares v2
-        whose tables are EXACTLY the seven v2 tables (migrated FORWARD
-        all the way to v4 in ONE transaction, zero v2 rows touched), and
-        an existing database that declares v1 whose tables are EXACTLY
-        the three v1 tables (migrated FORWARD all the way to v4 in ONE
-        transaction, zero v1 rows touched). Any extra unrelated table
-        (under any declaration), any newer, zero, negative, malformed
-        or meta-less claim, a stripped or hybrid shape -- all are
-        refused with CODE_SCHEMA_UNSUPPORTED before any pragma, DDL or
-        write can touch the file. In particular no lower version is
-        ever silently rewritten: migration is the explicit
-        v1->v4 / v2->v4 / v3->v4 path below and nothing else -- and a
-        v4 file opened by a PRE-v4 build is refused by the SAME gate,
-        which is the runtime half of the rollback compatibility
-        contract.
+        schema_version and whose tables are EXACTLY the eleven v5 tables,
+        an existing database that declares v4 whose tables are EXACTLY
+        the ten v4 tables (migrated FORWARD to v5 in ONE transaction,
+        zero v4 rows touched), an existing database that declares v3
+        whose tables are EXACTLY the eight v3 tables (migrated FORWARD
+        all the way to v5 in ONE transaction, zero v3 rows touched), an
+        existing database that declares v2 whose tables are EXACTLY the
+        seven v2 tables (migrated FORWARD all the way to v5 in ONE
+        transaction, zero v2 rows touched), and an existing database that
+        declares v1 whose tables are EXACTLY the three v1 tables
+        (migrated FORWARD all the way to v5 in ONE transaction, zero v1
+        rows touched). Any extra unrelated table (under any declaration),
+        any newer, zero, negative, malformed or meta-less claim, a
+        stripped or hybrid shape -- all are refused with
+        CODE_SCHEMA_UNSUPPORTED before any pragma, DDL or write can touch
+        the file. In particular no lower version is ever silently
+        rewritten: migration is the explicit v1->v5 / v2->v5 / v3->v5 /
+        v4->v5 path below and nothing else -- and a v5 file opened by a
+        PRE-v5 build is refused by the SAME gate, which is the runtime
+        half of the rollback compatibility contract.
         """
         conn.execute("PRAGMA busy_timeout=%d" % BUSY_TIMEOUT_MS)
         tables = {row[0] for row in conn.execute(
@@ -1715,9 +2153,9 @@ class IncidentHistory:
             raise _HistoryError(CODE_SCHEMA_UNSUPPORTED)
         version = int(raw)
         if version == SCHEMA_VERSION:
-            if tables != _ALLOWED_V4_SHAPE:
-                # meta CLAIMS v4 but the shape is not EXACTLY the ten
-                # v4 tables -- stripped, hybrid, or carrying an
+            if tables != _ALLOWED_V5_SHAPE:
+                # meta CLAIMS v5 but the shape is not EXACTLY the eleven
+                # v5 tables -- stripped, hybrid, or carrying an
                 # unrelated extra table this module never created:
                 # unknown shape, refuse rather than adopt
                 raise _HistoryError(CODE_SCHEMA_UNSUPPORTED)
@@ -1731,8 +2169,16 @@ class IncidentHistory:
                             " WHERE id = 1").fetchone() is None:
                 # the incident runtime state row is the same class of
                 # single-row continuity: present under every complete
-                # v4 shape, never recreated when missing
+                # v5 shape, never recreated when missing
                 raise _HistoryError(CODE_SCHEMA_UNSUPPORTED)
+            return
+        if version == 4:
+            # EXACT v4 only: the ten v4 tables -- no marker table yet
+            # (hybrid) and no unrelated extra table either.
+            if tables != _ALLOWED_V4_SHAPE:
+                raise _HistoryError(CODE_SCHEMA_UNSUPPORTED)
+            self._apply_pragmas(conn)
+            self._migrate_v4_to_v5(conn)
             return
         if version == 3:
             # EXACT v3 only: the eight v3 tables -- no incident tables
@@ -1740,7 +2186,7 @@ class IncidentHistory:
             if tables != _ALLOWED_V3_SHAPE:
                 raise _HistoryError(CODE_SCHEMA_UNSUPPORTED)
             self._apply_pragmas(conn)
-            self._migrate_v3_to_v4(conn)
+            self._migrate_v3_to_v5(conn)
             return
         if version == 2:
             # EXACT v2 only: the seven v2 tables -- no probe table yet
@@ -1748,7 +2194,7 @@ class IncidentHistory:
             if tables != _ALLOWED_V2_SHAPE:
                 raise _HistoryError(CODE_SCHEMA_UNSUPPORTED)
             self._apply_pragmas(conn)
-            self._migrate_v2_to_v4(conn)
+            self._migrate_v2_to_v5(conn)
             return
         if version == 1:
             # EXACT v1 only: precisely the three v1 tables -- no journal
@@ -1758,7 +2204,7 @@ class IncidentHistory:
             if tables != _ALLOWED_V1_SHAPE:
                 raise _HistoryError(CODE_SCHEMA_UNSUPPORTED)
             self._apply_pragmas(conn)
-            self._migrate_v1_to_v4(conn)
+            self._migrate_v1_to_v5(conn)
             return
         # NEWER, ZERO, NEGATIVE or otherwise unknown declared version:
         # refuse; an explicit forward-only migration is the ONLY way a
@@ -1776,7 +2222,7 @@ class IncidentHistory:
             conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
 
     def _create_schema(self, conn):
-        """Fresh database: the full v4 shape in ONE explicit
+        """Fresh database: the full v5 shape in ONE explicit
         transaction (DDL auto-commits under sqlite3 legacy mode, so an
         unbounded CREATE chain could otherwise strand a half-created
         file that no later gate would adopt)."""
@@ -1790,6 +2236,7 @@ class IncidentHistory:
             self._create_probe_table(conn)
             self._create_incident_tables(conn)
             self._create_incident_state_row(conn, now)
+            self._create_marker_table(conn)
             conn.commit()
         except BaseException:
             try:
@@ -2143,16 +2590,33 @@ class IncidentHistory:
             " discovery_floor_epoch, rearm_required)"
             " VALUES (1, 1, 0.0, 0.0, NULL, NULL, NULL, 0)", ())
 
-    def _migrate_v1_to_v4(self, conn):
-        """The v1 source jumps to v4 in ONE explicit transaction:
-        journal tables + probe table + incident tables + state rows +
-        the schema_version flip. Zero v1 rows are read, moved or
-        rewritten; any mid-migration failure rolls the whole thing
-        back, leaving an untouched exact-v1 database, so startup after
-        a crash simply re-runs the migration. (v1 was never meant to
-        stop at v2 or v3: the intermediate migrations of the 0.3.x /
-        0.4.x lines are subsumed here -- the end shape is identical to
-        a v2->v4 or v3->v4 walk.)"""
+    @classmethod
+    def _create_marker_table(cls, conn):
+        """v5 operator markers (#63 R2 §3): closed two-kind vocabulary,
+        no free text anywhere, epoch <= created_epoch in the CHECK so a
+        future-dated marker is unrepresentable even by a buggy caller."""
+        conn.execute(
+            "CREATE TABLE operator_markers ("
+            " marker_id INTEGER PRIMARY KEY,"
+            " epoch REAL NOT NULL CHECK (epoch >= 0),"
+            " kind TEXT NOT NULL"
+            f" CHECK (kind IN ({cls._in_list(MARKER_KINDS)})),"
+            " created_epoch REAL NOT NULL CHECK (created_epoch >= 0"
+            " AND epoch <= created_epoch))")
+        conn.execute(
+            "CREATE INDEX ix_operator_markers_epoch"
+            " ON operator_markers(epoch)")
+
+    def _migrate_v1_to_v5(self, conn):
+        """The v1 source jumps to v5 in ONE explicit transaction:
+        journal tables + probe table + incident tables + the marker
+        table + state rows + the schema_version flip. Zero v1 rows are
+        read, moved or rewritten; any mid-migration failure rolls the
+        whole thing back, leaving an untouched exact-v1 database, so
+        startup after a crash simply re-runs the migration. (v1 was
+        never meant to stop at v2 or v3: the intermediate migrations of
+        the 0.3.x / 0.4.x / 0.5.x lines are subsumed here -- the end
+        shape is identical to a v2->v5, v3->v5 or v4->v5 walk.)"""
         try:
             conn.execute("BEGIN")
             self._create_journal_tables(conn)
@@ -2160,6 +2624,7 @@ class IncidentHistory:
             self._create_probe_table(conn)
             self._create_incident_tables(conn)
             self._create_incident_state_row(conn, self._clock())
+            self._create_marker_table(conn)
             conn.execute("UPDATE meta SET value = ?"
                          " WHERE key = 'schema_version'",
                          (str(SCHEMA_VERSION),))
@@ -2171,18 +2636,19 @@ class IncidentHistory:
                 pass
             raise
 
-    def _migrate_v2_to_v4(self, conn):
-        """The v2 source adds EXACTLY the v3 probe table and the v4
-        incident tables and flips the version in a SINGLE explicit
-        transaction -- zero v2 rows touched, no journal-shape rewrite,
-        forward-only. A crash anywhere before the commit rolls back
-        whole and the untouched exact-v2 file re-migrates on the next
-        open."""
+    def _migrate_v2_to_v5(self, conn):
+        """The v2 source adds EXACTLY the v3 probe table, the v4 incident
+        tables and the v5 marker table and flips the version in a SINGLE
+        explicit transaction -- zero v2 rows touched, no journal-shape
+        rewrite, forward-only. A crash anywhere before the commit rolls
+        back whole and the untouched exact-v2 file re-migrates on the
+        next open."""
         try:
             conn.execute("BEGIN")
             self._create_probe_table(conn)
             self._create_incident_tables(conn)
             self._create_incident_state_row(conn, self._clock())
+            self._create_marker_table(conn)
             conn.execute("UPDATE meta SET value = ?"
                          " WHERE key = 'schema_version'",
                          (str(SCHEMA_VERSION),))
@@ -2194,20 +2660,42 @@ class IncidentHistory:
                 pass
             raise
 
-    def _migrate_v3_to_v4(self, conn):
-        """The v3 source adds EXACTLY the two v4 incident tables and
-        their state row and flips the version in a SINGLE explicit
-        transaction -- zero v3 rows touched (every pre-existing
-        sample/state/probe/journal row survives byte-for-byte), no
-        probe-shape rewrite, forward-only. A crash anywhere before the
-        commit rolls back whole and the untouched exact-v3 file
-        re-migrates on the next open. The retained prestate snapshot
-        the deploy layer takes BEFORE this runs is what makes a
-        refused or rolled-back activation restorable."""
+    def _migrate_v3_to_v5(self, conn):
+        """The v3 source adds EXACTLY the two v4 incident tables, their
+        state row and the v5 marker table and flips the version in a
+        SINGLE explicit transaction -- zero v3 rows touched (every
+        pre-existing sample/state/probe/journal row survives
+        byte-for-byte), no probe-shape rewrite, forward-only. A crash
+        anywhere before the commit rolls back whole and the untouched
+        exact-v3 file re-migrates on the next open. The retained
+        prestate snapshot the deploy layer takes BEFORE this runs is
+        what makes a refused or rolled-back activation restorable."""
         try:
             conn.execute("BEGIN")
             self._create_incident_tables(conn)
             self._create_incident_state_row(conn, self._clock())
+            self._create_marker_table(conn)
+            conn.execute("UPDATE meta SET value = ?"
+                         " WHERE key = 'schema_version'",
+                         (str(SCHEMA_VERSION),))
+            conn.commit()
+        except BaseException:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            raise
+
+    def _migrate_v4_to_v5(self, conn):
+        """The v4 source adds EXACTLY the v5 marker table and flips the
+        version in a SINGLE explicit transaction -- zero v4 rows touched
+        (incident rows, runtime state and every evidence row survive
+        byte-for-byte), forward-only. A crash anywhere before the commit
+        rolls back whole and the untouched exact-v4 file re-migrates on
+        the next open."""
+        try:
+            conn.execute("BEGIN")
+            self._create_marker_table(conn)
             conn.execute("UPDATE meta SET value = ?"
                          " WHERE key = 'schema_version'",
                          (str(SCHEMA_VERSION),))
@@ -2643,6 +3131,13 @@ class IncidentHistory:
             self._conn.execute(
                 "DELETE FROM incident_windows WHERE state = 'closed'"
                 " AND last_signal_epoch < ?", (horizon,))
+            # v5 operator markers join the SAME 7-day contract (#63 R2
+            # §3): bounded history, not a permanent record -- a marker
+            # ages out by its operator-declared epoch exactly like the
+            # evidence around it, and size pruning treats it as one more
+            # source in the global epoch order.
+            self._conn.execute(
+                "DELETE FROM operator_markers WHERE epoch < ?", (horizon,))
             self._conn.commit()
             # Spec §5: time-based retention is the normal path; SIZE pruning
             # kicks in only when the HARD CEILING is crossed, and then

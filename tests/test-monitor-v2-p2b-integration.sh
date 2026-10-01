@@ -280,7 +280,7 @@ assert_eq "$EDGE" "OK" "incident_history imports ONLY ingest_contract + schema (
 # No user-facing surface may carry an absolute production path: the web layer
 # still has ZERO journal references, and journal_status() keeps its fixed
 # sanitized key set.
-assert_eq "$(grep -c 'journal' "$SERVER_PY")" "0" "web/server.py exposes no journal surface (no path can leak through the API)"
+assert_eq "$(grep -c 'journal_status' "$SERVER_PY")" "0" "web/server.py exposes no journal ingest surface (P5 evidence rows are closed whitelists, never the ingest plane)"
 HK="$("$PY" - "$HIST_PY" <<'EOF'
 import re, sys
 src = open(sys.argv[1], encoding="utf-8").read()
@@ -316,7 +316,7 @@ assert_grep "$SERVER_PY" '_require_step_up\(self\._handle_e3_export\)' "#51: exp
 # still trips it.
 assert_eq "$(grep -c '^SCHEMA_VERSION = [0-9]$' "$HIST_PY")" "1" \
     "history declares its schema version in exactly one place"
-assert_eq "$(grep -o '^SCHEMA_VERSION = [0-9]*' "$HIST_PY" | grep -c '= 4$')" "1" \
+assert_eq "$(grep -o '^SCHEMA_VERSION = [0-9]*' "$HIST_PY" | grep -c '= 5$')" "1" \
     "history schema is exactly the reviewed v4 (PR-4B moved it from v3)"
 
 # ===========================================================================
@@ -740,7 +740,7 @@ EOF
     # database now lands on v4 in ONE step -- v1 -> v2 -> ... -> v4 in a loop
     # would rewrite rows this gate exists to protect. The numeral is asserted
     # structurally below (probe table).
-    assert_eq "$(field schema_version)" "4" "migration: meta.schema_version advanced to 4 in one step"
+    assert_eq "$(field schema_version)" "5" "migration: meta.schema_version advanced to 5 in one step"
     assert_eq "$(field rows_preserved)" "True" "migration: v1 rows preserved byte-for-byte"
     for t in journal_runs journal_events journal_ingest_audit journal_ingest_state \
              timeline_samples device_protocol_states meta; do

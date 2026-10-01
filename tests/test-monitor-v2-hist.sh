@@ -59,7 +59,18 @@ FAIL=0
 # The HTTP whitelist gate itself moved IN PLACE -- the same one check now
 # names the eighth top-level key the scanner contributes, so an unreviewed
 # extra key fails here just as a missing one would. No check was deleted.
-EXPECTED_PASS=242
+# PR-5 (schema v5, #63 R2 §2): 242 -> 243 = +1 ("v4 declaration over a v5
+# shape is a hybrid: refused, zero bytes" -- the operator_markers table
+# makes a v4 claim on a migrated database a stranger, while the exact-v4
+# source itself migrates FORWARD to v5 in one transaction). Everything
+# else moved IN PLACE, never up or down: the v4-stated expectations are
+# the same checks restated against v5 (meta 5, exact-v5 re-open read-only,
+# v5 fresh creation with the inert incident runtime row + the empty
+# marker table, v1->v5 flip, "6" as the newer-version refusal, v3/v4
+# claims + stranger refusals now carrying the markers table as the
+# extra-stranger case). No check was deleted; the schema_version pins are
+# restated values, not relaxations.
+EXPECTED_PASS=243
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
@@ -130,11 +141,11 @@ then
 else
     fail "broker publication hook ordering/guard contract broken"
 fi
-assert_eq '0.5.0' "$(cat "$ROOT/monitor-v2/VERSION")" "VERSION file is 0.5.0"
-assert_contains 'MONITOR_WEB_VERSION = "0.5.0"' \
-    "$(cat "$ROOT/monitor-v2/web/server.py")" "MONITOR_WEB_VERSION is 0.5.0"
+assert_eq '0.6.0' "$(cat "$ROOT/monitor-v2/VERSION")" "VERSION file is 0.6.0"
+assert_contains 'MONITOR_WEB_VERSION = "0.6.0"' \
+    "$(cat "$ROOT/monitor-v2/web/server.py")" "MONITOR_WEB_VERSION is 0.6.0"
 assert_eq "0" "$(grep -c 'diagnostics/timeline' "$ROOT/monitor-v2/web/static/app.js" "$ROOT/monitor-v2/web/static/index.html" | awk -F: '{s+=$2} END {print s+0}')" \
-    "no Incidents UI in P1 (static frontend untouched by the read surface)"
+    "the timeline read surface is still never consumed by the static frontend (PR-5 consumes the closed incidents family instead)"
 if grep -Eq 'ReadWritePaths|supplementaryGroups|AmbientCapabilities|journald|sudoers' "$HIST_PY"; then
     fail "history module asks for new privileges/log access (spec §1/§12)"
 else
@@ -461,7 +472,7 @@ def group_storage():
                              "journal_ingest_state",
                              "network_probe_samples"}.issubset(tables)
     meta = dict(h._conn.execute("SELECT key, value FROM meta"))
-    out["meta_schema_version_4"] = meta.get("schema_version") == "4"
+    out["meta_schema_version_5"] = meta.get("schema_version") == "5"
     out["meta_creation_only"] = set(meta) == {"schema_version", "created_at",
                                               "created_by_version"}
     jm = h._conn.execute("PRAGMA journal_mode").fetchone()[0]
@@ -555,17 +566,18 @@ def group_storage():
     h9 = IncidentHistory(os.path.join(h8._tmpdir, "diagnostics"), "run-h")
     h9.open()
     out["no_downgrade"] = h9.health()["last_error_code"] == CODE_SCHEMA_UNSUPPORTED
-    # ---- B3 (review), P3B-revised, PR-4B-restated: the gate is STRICT in
-    # BOTH directions around schema v4 ---- every non-exact-v4 DECLARATION
-    # except the exact-v1/v2/v3 migration sources is refused fail-closed, and
-    # the refusal must not touch a single byte of the existing DB.
+    # ---- B3 (review), P3B-revised, PR-5-restated: the gate is STRICT in
+    # BOTH directions around schema v5 ---- every non-exact-v5 DECLARATION
+    # except the exact-v1/v2/v3/v4 migration sources is refused
+    # fail-closed, and the refusal must not touch a single byte of the
+    # existing DB.
     b = tmp_history()
     b.open()
     b.on_publish(snap(), 1)
     b.close()
     db = os.path.join(b._tmpdir, "diagnostics", "history.sqlite3")
     refused_all = intact_all = preserved = True
-    for raw in ("0", "-1", "5", "abc", "1.0", ""):
+    for raw in ("0", "-1", "6", "abc", "1.0", ""):
         conn = sqlite3.connect(db)
         conn.execute("UPDATE meta SET value=? WHERE key='schema_version'",
                      (raw,))
@@ -586,9 +598,9 @@ def group_storage():
         preserved = preserved and v == raw
     out["b3_noncurrent_all_refused"] = refused_all
     out["b3_refusal_zero_bytes"] = intact_all and preserved
-    # a v1 CLAIM on a full v4 database is a hybrid: refused, never
+    # a v1 CLAIM on a full v5 database is a hybrid: refused, never
     # "down-migrated" and never a silent accept (journal + probe + incident
-    # tables under version 1 is not a shape the migration recognizes)
+    # + marker tables under version 1 is not a shape the migration recognizes)
     conn = sqlite3.connect(db)
     conn.execute("UPDATE meta SET value='1' WHERE key='schema_version'")
     conn.commit()
@@ -601,22 +613,22 @@ def group_storage():
         and bh.health()["last_error_code"] == CODE_SCHEMA_UNSUPPORTED
         and raw_db_bytes(b) == before)
     bh.close()
-    # restore the exact-v4 shape, THEN prove an accepted re-open is pure
+    # restore the exact-v5 shape, THEN prove an accepted re-open is pure
     conn = sqlite3.connect(db)
-    conn.execute("UPDATE meta SET value='4' WHERE key='schema_version'")
+    conn.execute("UPDATE meta SET value='5' WHERE key='schema_version'")
     conn.commit()
     conn.close()
-    # an ACCEPTED exact-v4 re-open also mutates zero bytes (read-only gate)
+    # an ACCEPTED exact-v5 re-open also mutates zero bytes (read-only gate)
     b2 = IncidentHistory(os.path.join(b._tmpdir, "diagnostics"), "b3ok",
                          clock=lambda: T0 + 60.0)
     before = raw_db_bytes(b)
     b2.open()
-    out["b3_exact_v4_reopen_readonly"] = (b2.health()["enabled"]
+    out["b3_exact_v5_reopen_readonly"] = (b2.health()["enabled"]
                                           and raw_db_bytes(b) == before)
     b2.close()
-    # a v3 DECLARATION over a v4 shape (the incident tables are the extra
-    # strangers) is a hybrid: refused fail-closed, never "down-migrated",
-    # and the refusal mutates zero bytes
+    # a v3 DECLARATION over a v5 shape (the incident + marker tables are
+    # the extra strangers) is a hybrid: refused fail-closed, never
+    # "down-migrated", and the refusal mutates zero bytes
     conn = sqlite3.connect(db)
     conn.execute("UPDATE meta SET value='3' WHERE key='schema_version'")
     conn.commit()
@@ -625,11 +637,27 @@ def group_storage():
     bv = IncidentHistory(os.path.join(b._tmpdir, "diagnostics"), "b3v",
                          clock=lambda: T0 + 60.0)
     bv.open()
-    out["b3_v3_claim_on_v4_shape_refused"] = (
+    out["b3_v3_claim_on_v5_shape_refused"] = (
         not bv.health()["enabled"]
         and bv.health()["last_error_code"] == CODE_SCHEMA_UNSUPPORTED
         and raw_db_bytes(b) == before)
     bv.close()
+    # PR-5: a v4 DECLARATION over a v5 shape (the marker table is the one
+    # extra stranger) is a hybrid too -- the exact-v4 shape WITHOUT the
+    # marker table is the migration source and stays accepted (H10).
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE meta SET value='4' WHERE key='schema_version'")
+    conn.commit()
+    conn.close()
+    before = raw_db_bytes(b)
+    bw = IncidentHistory(os.path.join(b._tmpdir, "diagnostics"), "b3w",
+                         clock=lambda: T0 + 60.0)
+    bw.open()
+    out["b3_v4_claim_on_v5_shape_refused"] = (
+        not bw.health()["enabled"]
+        and bw.health()["last_error_code"] == CODE_SCHEMA_UNSUPPORTED
+        and raw_db_bytes(b) == before)
+    bw.close()
     # meta CLAIMS v3 but the tables are gone: refuse, never adopt via
     # CREATE-IF-NOT-EXISTS (and the shape must stay exactly as found).
     # meta is re-asserted to '3' here so the orphan scenario keeps its
@@ -1357,7 +1385,9 @@ JOURNAL_TABLE_NAMES = {"journal_runs", "journal_events",
 PROBE_TABLE_NAMES = {"network_probe_samples"}
 # PR-4B schema v4: the two incident tables migrate in with EVERY source
 # (fresh/v1/v2/v3), so they join the full-shape union everywhere it appears.
+# PR-5 schema v5: operator_markers joins them for every source INCLUDING v4.
 INCIDENT_TABLE_NAMES = {"incident_windows", "incident_runtime_state"}
+MARKER_TABLE_NAMES = {"operator_markers"}
 
 
 def _db_shape(d):
@@ -1397,13 +1427,14 @@ def group_migrate():
     out["v1_rows_preserved"] = v1_dump(d1) == rows_before \
         and len(rows_before[0]) == 1 and len(rows_before[1]) == 1
     tables, meta, state = _db_shape(d1)
-    out["v1_meta_flipped_to_4"] = meta.get("schema_version") == "4"
+    out["v1_meta_flipped_to_5"] = meta.get("schema_version") == "5"
     out["v1_creation_metadata_kept"] = meta.get(
         "created_by_version") == "0.2.0" and meta.get(
         "created_at") == "2026-01-01T00:00:00+00:00"
-    out["v1_full_v4_shape"] = (V1_TABLE_NAMES | JOURNAL_TABLE_NAMES
+    out["v1_full_v5_shape"] = (V1_TABLE_NAMES | JOURNAL_TABLE_NAMES
                                | PROBE_TABLE_NAMES
-                               | INCIDENT_TABLE_NAMES) <= tables \
+                               | INCIDENT_TABLE_NAMES
+                               | MARKER_TABLE_NAMES) <= tables \
         and state == (0, None, 0, 0)
     # both write paths work immediately on the migrated database (the v1
     # fixture rows are still there: 1 seeded sample + 1 seeded device row)
@@ -1457,15 +1488,15 @@ def group_migrate():
     out["post_crash_reopen_migrates_clean"] = (
         h2b.health()["enabled"]
         and (V1_TABLE_NAMES | JOURNAL_TABLE_NAMES | PROBE_TABLE_NAMES
-             | INCIDENT_TABLE_NAMES)
+             | INCIDENT_TABLE_NAMES | MARKER_TABLE_NAMES)
         <= tables2b
-        and meta2b.get("schema_version") == "4"
+        and meta2b.get("schema_version") == "5"
         and state2b == (0, None, 0, 0) and v1_dump(d2) == before2)
     h2b.close()
     # ---- a NEWER declared version on a migrated db: refused, zero bytes
     conn3 = sqlite3.connect(os.path.join(d1, "diagnostics",
                                          "history.sqlite3"))
-    conn3.execute("UPDATE meta SET value='5' WHERE key='schema_version'")
+    conn3.execute("UPDATE meta SET value='6' WHERE key='schema_version'")
     conn3.commit()
     conn3.close()
     bytes3 = db_bytes(d1)
@@ -1494,8 +1525,9 @@ def group_migrate():
         not h4.health()["enabled"]
         and h4.health()["last_error_code"] == CODE_SCHEMA_UNSUPPORTED
         and db_bytes(d4) == bytes4)
-    # ---- fresh databases are created AT v4 directly (journal state row +
-    # probe table + the two incident tables + the inert incident runtime row)
+    # ---- fresh databases are created AT v5 directly (journal state row +
+    # probe table + the two incident tables + the empty marker table +
+    # the inert incident runtime row)
     h5 = tmp_history(run_id="mig-fresh")
     h5.open()
     tables5, meta5, state5 = _db_shape(h5._tmpdir)
@@ -1504,14 +1536,17 @@ def group_migrate():
     incident_state5 = conn5.execute(
         "SELECT id, runtime_version, activation_floor_epoch,"
         " open_incident_id FROM incident_runtime_state").fetchone()
+    marker_rows5 = conn5.execute(
+        "SELECT COUNT(*) FROM operator_markers").fetchone()[0]
     conn5.close()
-    out["fresh_db_is_v4_immediately"] = (
+    out["fresh_db_is_v5_immediately"] = (
         (V1_TABLE_NAMES | JOURNAL_TABLE_NAMES | PROBE_TABLE_NAMES
-         | INCIDENT_TABLE_NAMES)
+         | INCIDENT_TABLE_NAMES | MARKER_TABLE_NAMES)
         <= tables5
-        and meta5.get("schema_version") == "4"
+        and meta5.get("schema_version") == "5"
         and state5 == (0, None, 0, 0)
         and incident_state5 == (1, 1, 0.0, None)
+        and marker_rows5 == 0
         and meta5.get("created_by_version") == "0.2.0")
     h5.close()
     # ---- migration is one-way and repeatable: further opens are no-ops
@@ -1523,7 +1558,7 @@ def group_migrate():
         hx.open()
         idem = idem and hx.health()["enabled"] and db_bytes(d2) == bytes_d2
         hx.close()
-    out["v4_reopen_repeatable_zero_bytes"] = idem
+    out["v5_reopen_repeatable_zero_bytes"] = idem
     # ---- HARDENING-2 (review): "exact shape" means table-set EQUALITY.
     # An UNRELATED extra table alongside a declared shape is a stranger
     # this module never created: refused under BOTH declarations, zero
@@ -2560,7 +2595,7 @@ section "H1: storage safety (spec §1/§10)"
 run_group "storage"
 check 'd.get("_harness_error") is None' "storage harness ran clean"
 check 'd["schema_created"]' "meta + v1 tables + journal v2 tables exist"
-check 'd["meta_schema_version_4"]' "meta carries explicit schema_version=4"
+check 'd["meta_schema_version_5"]' "meta carries explicit schema_version=5"
 check 'd["meta_creation_only"]' "meta holds schema version + creation metadata ONLY"
 check 'd["journal_mode_delete"]' "journal_mode=DELETE (no stray wal/shm)"
 check 'd["synchronous_full"]' "synchronous=FULL"
@@ -2580,8 +2615,9 @@ check 'd["no_downgrade"]' "newer on-disk schema never downgraded (fail-closed)"
 check 'd["b3_noncurrent_all_refused"]' "B3: version 0/-1/5/malformed/empty ALL refused fail-closed"
 check 'd["b3_refusal_zero_bytes"]' "B3: refusal mutates ZERO bytes and preserves the tampered value"
 check 'd["b3_hybrid_v1_claim_refused"]' "P2B: v1 claim on a full current-shape db is a hybrid: refused, zero bytes"
-check 'd["b3_exact_v4_reopen_readonly"]' "B3: accepted exact-v4 re-open mutates zero bytes"
-check 'd["b3_v3_claim_on_v4_shape_refused"]' "P4B: v3 claim over a v4 shape (incident tables) is a hybrid: refused, zero bytes"
+check 'd["b3_exact_v5_reopen_readonly"]' "B3: accepted exact-v5 re-open mutates zero bytes"
+check 'd["b3_v3_claim_on_v5_shape_refused"]' "P4B: v3 claim over a v5 shape (incident + marker tables) is a hybrid: refused, zero bytes"
+check 'd["b3_v4_claim_on_v5_shape_refused"]' "PR-5: v4 claim over a v5 shape (the marker table) is a hybrid: refused, zero bytes"
 check 'd["b3_metaless_orphan_refused"]' "B3: meta claiming v2 with stripped tables is refused"
 check 'd["b3_unrelated_db_refused"]' "B3: unrelated tables-only DB never claimed as v1"
 check 'd["b3_zero_tables_claim_refused"]' "B3: non-empty zero-table file not treated as fresh"
@@ -2773,22 +2809,22 @@ check 'd["privacy_under_contention"]' "B1: sentinels still absent from raw DB by
 check 'd["cleanup_ran_under_contention"]' "B1-fix: periodic cleanup fired via locked on_publish path mid-contention (observed, not invoked)"
 check 'd["startup_cleanup_ran_once"]' "B1-fix: startup cleanup observed exactly once"
 
-section "H10: schema v1->v4 migration (PR-2B spec §5 + PR-3B v3 + PR-4B v4)"
+section "H10: schema v1->v5 migration (PR-2B spec §5 + PR-3B v3 + PR-4B v4 + PR-5 v5)"
 run_group "migrate"
 check 'd.get("_harness_error") is None' "migrate harness ran clean"
 check 'd["v1_migration_enabled"]' "real 0.2.0 v1 db opens ENABLED after forward migration"
 check 'd["v1_rows_preserved"]' "v1 sample + device rows preserved untouched"
-check 'd["v1_meta_flipped_to_4"]' "meta schema_version flips 1 -> 4 in the migration"
+check 'd["v1_meta_flipped_to_5"]' "meta schema_version flips 1 -> 5 in the migration"
 check 'd["v1_creation_metadata_kept"]' "created_at/created_by_version (0.2.0) kept"
-check 'd["v1_full_v4_shape"]' "4 journal tables + probe table + 2 incident tables + terminal state row created"
+check 'd["v1_full_v5_shape"]' "4 journal tables + probe table + 2 incident tables + marker table + terminal state row created"
 check 'd["post_migration_publish_ingest"]' "publish + journal ingest both work post-migration"
 check 'd["migrated_reopen_adopts_zero_bytes"]' "migrated v4 re-opens: adopted, ZERO bytes mutated"
 check 'd["mid_migration_crash_rolls_back_exact_v1"]' "crash MID-migration rolls back to exact untouched v1"
 check 'd["post_crash_reopen_migrates_clean"]' "after the crash, a normal open re-runs migration cleanly"
 check 'd["newer_schema_migrated_refused_zero_bytes"]' "schema '5' on a migrated db: refused, zero bytes"
 check 'd["hybrid_v1_claim_refused_zero_bytes"]' "v1 claim + journal tables hybrid: refused, zero bytes"
-check 'd["fresh_db_is_v4_immediately"]' "fresh databases are created at v4 directly (inert incident runtime row)"
-check 'd["v4_reopen_repeatable_zero_bytes"]' "migration is one-way: repeated v4 opens are no-ops"
+check 'd["fresh_db_is_v5_immediately"]' "fresh databases are created at v5 directly (inert incident runtime row, empty marker table)"
+check 'd["v5_reopen_repeatable_zero_bytes"]' "migration is one-way: repeated v5 opens are no-ops"
 check 'd["v3_extra_table_refused_zero_bytes"]' "exact-shape: v3 claim + unrelated extra table refused, zero bytes"
 check 'd["v1_extra_table_refused_zero_bytes"]' "exact-shape: v1 claim + extra table refused, never migrated"
 

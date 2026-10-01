@@ -75,10 +75,11 @@ FROZEN_CONSTANTS = {
 FROZEN_ERRORS = ("evidence_read_failed", "classify_failed", "persist_failed",
                  "runtime_state_corrupt")
 FROZEN_PHASES = ("warmup", "idle", "open", "rearm", "degraded")
-FROZEN_V4_TABLES = {"meta", "timeline_samples", "device_protocol_states",
+FROZEN_V5_TABLES = {"meta", "timeline_samples", "device_protocol_states",
                     "network_probe_samples", "journal_runs", "journal_events",
                     "journal_ingest_audit", "journal_ingest_state",
-                    "incident_windows", "incident_runtime_state"}
+                    "incident_windows", "incident_runtime_state",
+                    "operator_markers"}
 
 
 # -- harness plumbing --------------------------------------------------------
@@ -384,10 +385,12 @@ def group_store():
     history, root, clock = _store_dir()
     try:
         conn = history._conn
-        # (1) Exactly the ten v4 tables, no more.
+        # (1) Exactly the eleven v5 tables, no more. PR-5 (#63 R2 §2)
+        #     added operator_markers as the ONLY v5 table; the incident
+        #     tables are byte-for-byte the v4 shapes.
         tables = {row[0] for row in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
-        out["exactly_ten_v4_tables"] = tables == FROZEN_V4_TABLES
+        out["exactly_eleven_v5_tables"] = tables == FROZEN_V5_TABLES
         # (2) The frozen column sets, in order.
         window_cols = [row[1] for row in conn.execute(
             "PRAGMA table_info(incident_windows)")]
@@ -1779,10 +1782,11 @@ def group_containment():
             and (surface["last_evaluated_end_epoch"] is None
                  or (type(surface["last_evaluated_end_epoch"]) in (int, float)
                      and surface["last_evaluated_end_epoch"] >= 0)))
-        # No P5 route, no new query parameter, and the journal surface did
-        # not widen with the new key.
-        _status, _body, _ = request("GET", "/api/v1/incidents", cookie=session)
-        out["no_p5_incidents_route"] = _status == 404
+        # PR-5 retirement note (#63 R2 §13): the old "no P5 route" live
+        # gate stood here and is explicitly RETIRED -- the route family is
+        # now owned and set-exactness-gated by the incidents lane. This
+        # lane keeps the timeline walls: no new query parameter, and the
+        # journal surface did not widen with the incident key.
         status2, body2, _ = request("GET",
                                     "/api/v1/diagnostics/timeline?incident=1",
                                     cookie=session)

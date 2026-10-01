@@ -1,9 +1,13 @@
-/* sing-box Monitor — Phase E2 dashboard logic (vanilla JS, no dependencies).
+/* sing-box Monitor — dashboard logic (vanilla JS, no dependencies).
  *
- * Data source: the E1 snapshot ONLY (GET /api/v1/snapshot + SSE stream).
- * Stale semantics are inherited verbatim: when snapshot.stale is true the
- * last state keeps being rendered and an explicit banner says so — the
- * dashboard never fakes zeros, never clears devices, never invents CLOSED.
+ * Data sources: the E1 snapshot (GET /api/v1/snapshot + SSE stream) and,
+ * since 0.6.0 (#33 PR-5), the closed incidents read family
+ * (/api/v1/incidents*, /api/v1/evidence, /api/v1/markers). The timeline
+ * endpoint is NOT consumed here. Stale semantics are inherited verbatim:
+ * when snapshot.stale is true the last state keeps being rendered and an
+ * explicit banner says so — the dashboard never fakes zeros, never clears
+ * devices, never invents CLOSED. All dynamic values are rendered through
+ * textContent / DOM node APIs; no dynamic innerHTML anywhere.
  */
 (function () {
   "use strict";
@@ -15,6 +19,29 @@
   var CLIENT_UNAVAILABLE = "Client management is temporarily unavailable. Check the server before making changes.";
   var RESULT_UNCONFIRMED = "The result is not confirmed yet. Refresh the client list before retrying. Do not start another change until the current state is confirmed.";
 
+  /* ---------- incidents (0.6.0, #33 PR-5) ---------- */
+
+  // The six emittable categories' display names (the frozen 6-entry
+  // presentation enum; the 45/28 token vocabularies are NOT mirrored
+  // here -- the server decodes those, and this file holds no token copy).
+  var CATEGORY_LABELS = {
+    "reality_tcp_path": "Reality/TCP path",
+    "hysteria2_udp_path": "Hysteria2/UDP path",
+    "vps_outbound": "VPS outbound",
+    "vps_process_or_api": "sing-box process / API",
+    "common_inbound_client_office": "Common inbound / client-office",
+    "insufficient_evidence": "Insufficient evidence"
+  };
+  var INC_EMPTY_EVIDENCE = "No retained evidence is available for this window.";
+  var INC_EVIDENCE_UNAVAILABLE = "Evidence is currently unavailable. No conclusion can be drawn from this view.";
+  var INC_RETENTION_NOTE = "Some evidence may have aged out of the retention window.";
+  var INC_REARM_ACCEPTED = "Re-arm accepted. Waiting for the incident scanner to enter warm-up.";
+  var INC_EMPTY_LIST = "No incidents recorded.";
+  var INC_EMPTY_DEGRADED = "Incident history is currently degraded; an empty result cannot be treated as proof that no incidents were recorded.";
+  var INC_DEVICE_DISCLAIMER = "Device rows are sparse contextual state only; they do not prove which logical clients were affected.";
+  var INC_TRUNCATED_NOTE = "Showing the first 2000 chronological rows; later rows in this section are not shown.";
+  var INC_AGGREGATE_PARTIAL = "Truncated section: the aggregates below cover only the rows shown here, not the full window.";
+
   var state = {
     snapshot: null,
     session: null,
@@ -24,7 +51,11 @@
     es: null,
     esGeneration: 0,
     lastSnapshotAt: 0,
-    lastVersion: 0
+    lastVersion: 0,
+    incidents: null,
+    selectedIncidentId: null,
+    incSubject: null,          // {type: "incident"|"marker", id, label}
+    incSection: "samples"
   };
 
   function $(id) { return document.getElementById(id); }
@@ -47,6 +78,15 @@
   function fmtTime(iso) {
     if (!iso) return "—";
     var d = new Date(iso);
+    if (isNaN(d.getTime())) return "—";
+    var today = new Date();
+    var sameDay = d.toDateString() === today.toDateString();
+    var time = d.toLocaleTimeString();
+    return sameDay ? time : d.toLocaleDateString() + " " + time;
+  }
+  function fmtEpoch(seconds) {
+    if (seconds === null || seconds === undefined || isNaN(seconds)) return "—";
+    var d = new Date(Number(seconds) * 1000);
     if (isNaN(d.getTime())) return "—";
     var today = new Date();
     var sameDay = d.toDateString() === today.toDateString();
@@ -231,7 +271,8 @@
   /* ---------- views ---------- */
 
   var VIEW_TITLES = { overview: "Overview", devices: "Devices",
-                      connections: "Connections", settings: "Settings" };
+                      connections: "Connections", incidents: "Incidents",
+                      settings: "Settings" };
 
   function setView(name) {
     state.view = name;
@@ -247,6 +288,10 @@
       loadAccess();
       loadE3Status();
       loadE3Clients();
+    }
+    if (name === "incidents") {
+      loadIncidents();
+      loadMarkers();
     }
   }
 
@@ -426,6 +471,556 @@
     $("mi-started").textContent = fmtTime(snap.monitor_started_at);
     $("mi-uptime").textContent = fmtUptime(snap.collector_uptime_seconds);
     if (snap.last_error) show($("mi-warning")); else hide($("mi-warning"));
+  }
+
+  /* ---------- incidents view (0.6.0, #33 PR-5; review round adds the
+     L3 compact timeline, L4 raw tokens, marker-subject evidence and the
+     current-history health consumption) ---------- */
+
+  function incMessage(text, isError) {
+    var el = $("inc-marker-msg");
+    el.textContent = text;
+    el.className = "form-msg " + (isError ? "error" : "ok");
+    show(el);
+  }
+
+  function rearmMessage(text, isError) {
+    var el = $("inc-rearm-msg");
+    el.textContent = text;
+    el.className = "form-msg " + (isError ? "error" : "ok");
+    show(el);
+  }
+
+  function renderIncRuntime() {
+    var chip = $("inc-runtime");
+    var rearm = $("inc-rearm-btn");
+    var data = state.incidents;
+    var runtime = data ? data.runtime : null;
+    if (!runtime || !runtime.enabled) {
+      setChip(chip, "Scanner", "dark", "unknown");
+    } else {
+      setChip(chip, "Scanner", runtime.phase,
+              runtime.phase === "degraded" ? "bad" : "ok");
+    }
+    // B5: the list response carries CURRENT diagnostics health -- it is
+    // displayed as such, never as incident-time health, and it governs
+    // whether an empty list may be called "No incidents recorded."
+    var history = data ? data.history : null;
+    var historyChip = $("inc-history");
+    if (!history || history.enabled !== true) {
+      setChip(historyChip, "History", "unavailable", "bad");
+    } else if (history.degraded === true) {
+      setChip(historyChip, "History", "degraded", "bad");
+    } else {
+      setChip(historyChip, "History", "ok", "ok");
+    }
+    // Server-side precondition mirror (#63 R2 section 10): the re-arm
+    // entrance only exists while the scanner reports the rearm phase.
+    var rearmable = !!runtime && runtime.enabled === true &&
+      runtime.running === true && runtime.phase === "rearm";
+    rearm.disabled = !rearmable;
+  }
+
+  function loadIncidents() {
+    if (!state.session || !state.session.authenticated) return;
+    return api("/api/v1/incidents").then(function (data) {
+      state.incidents = data;
+      renderIncRuntime();
+      renderIncidents(data);
+    }).catch(function (error) {
+      if (error.status === 401) { showLogin("Session expired — please log in again."); return; }
+      var body = $("inc-tbody");
+      body.textContent = "";
+      var row = body.insertRow(-1);
+      var cell = row.insertCell(-1);
+      cell.colSpan = 7;
+      cell.textContent = "Incident list unavailable.";
+    });
+  }
+
+  function renderIncidents(data) {
+    var tbody = $("inc-tbody");
+    tbody.textContent = "";
+    var incidents = (data && data.incidents) || [];
+    incidents.forEach(function (incident) {
+      var tr = document.createElement("tr");
+      var stateCell = document.createElement("td");
+      var badge = document.createElement("span");
+      badge.className = "badge " + (incident.state === "open" ? "active" : "idle");
+      badge.textContent = incident.state;
+      stateCell.appendChild(badge);
+      tr.appendChild(stateCell);
+      tr.appendChild(cellText(CATEGORY_LABELS[incident.category] || incident.category));
+      tr.appendChild(cellText(fmtEpoch(incident.first_signal_epoch)));
+      tr.appendChild(cellText(fmtEpoch(incident.last_signal_epoch)));
+      tr.appendChild(cellText(fmtUptime(incident.last_signal_epoch - incident.first_signal_epoch), "num"));
+      tr.appendChild(cellText(String(incident.buckets), "num"));
+      tr.appendChild(cellText(String(incident.marker_count), "num"));
+      tr.addEventListener("click", function () { openIncident(incident.incident_id); });
+      tbody.appendChild(tr);
+    });
+    if (!incidents.length) {
+      var row = tbody.insertRow(-1);
+      var cell = row.insertCell(-1);
+      cell.colSpan = 7;
+      // B5: an empty answer from a DEGRADED/unavailable history is
+      // uncertainty, never the authoritative empty wording.
+      var history = data && data.history;
+      var degraded = !history || history.enabled !== true ||
+        history.degraded === true;
+      cell.textContent = degraded ? INC_EMPTY_DEGRADED : INC_EMPTY_LIST;
+    }
+  }
+
+  function openIncident(id) {
+    if (!state.session || !state.session.authenticated) return;
+    return api("/api/v1/incidents/" + id).then(function (detail) {
+      state.selectedIncidentId = id;
+      state.incSubject = {type: "incident", id: id};
+      renderIncidentDetail(detail);
+      show($("inc-evidence-card"));
+      $("inc-evidence-title").textContent = "Evidence for incident #" + id;
+      hide($("inc-evidence-subject"));
+      loadEvidence(state.incSection);
+    }).catch(function (error) {
+      if (error.status === 401) showLogin("Session expired — please log in again.");
+    });
+  }
+
+  function kvRow(key, value) {
+    var div = document.createElement("div");
+    div.className = "kv";
+    var k = document.createElement("span");
+    k.className = "k";
+    k.textContent = key;
+    var v = document.createElement("span");
+    v.className = "v";
+    v.textContent = value;
+    div.appendChild(k);
+    div.appendChild(v);
+    return div;
+  }
+
+  function reasonItems(container, pairs) {
+    container.textContent = "";
+    (pairs || []).forEach(function (pair) {
+      var li = document.createElement("li");
+      li.textContent = pair.text;   // textContent only: never the raw token as primary
+      container.appendChild(li);
+    });
+    if (!container.children.length) {
+      var li = document.createElement("li");
+      li.className = "muted";
+      li.textContent = "None recorded.";
+      container.appendChild(li);
+    }
+  }
+
+  // B2: the L4 token drill-down -- the EXACT raw tokens the server
+  // returned, each with a copy affordance, rendered apart from L2 and
+  // always through textContent / DOM node APIs.
+  function tokenItems(container, pairs) {
+    container.textContent = "";
+    (pairs || []).forEach(function (pair) {
+      var li = document.createElement("li");
+      var code = document.createElement("span");
+      code.className = "inc-token";
+      code.textContent = pair.token;
+      li.appendChild(code);
+      var copy = document.createElement("button");
+      copy.type = "button";
+      copy.className = "btn ghost";
+      copy.textContent = "Copy";
+      copy.addEventListener("click", function () {
+        copyText(pair.token, "Token copied");
+      });
+      li.appendChild(copy);
+      container.appendChild(li);
+    });
+    if (!container.children.length) {
+      var li = document.createElement("li");
+      li.className = "muted";
+      li.textContent = "None recorded.";
+      container.appendChild(li);
+    }
+  }
+
+  function renderIncidentDetail(detail) {
+    hide($("inc-list-card"));
+    show($("inc-detail"));
+    var summary = detail.summary || {};
+    $("inc-detail-title").textContent = summary.headline || "Incident";
+    var box = $("inc-summary");
+    box.textContent = "";
+    var win = summary.window || {};
+    if (win.start_epoch !== undefined) {
+      box.appendChild(kvRow("Signal window",
+        fmtEpoch(win.start_epoch) + " — " + fmtEpoch(win.end_epoch) +
+        " (" + fmtUptime(win.duration_seconds) + ")"));
+    }
+    ["impact", "protocol_state", "server_state", "affected_scope",
+     "assessment"].forEach(function (key) {
+      if (summary[key]) box.appendChild(kvRow(key.replace(/_/g, " "), summary[key]));
+    });
+    if (summary.recommended_action) {
+      box.appendChild(kvRow("recommended action", summary.recommended_action));
+    }
+    if (summary.uncertainty) box.appendChild(kvRow("uncertainty", summary.uncertainty));
+    if (summary.limitations) box.appendChild(kvRow("limitations", summary.limitations));
+    // The in-window operator markers, joined server-side (#63 R2 §4):
+    // closed labels only, never the detail's own free text.
+    if ((detail.markers || []).length) {
+      box.appendChild(kvRow("operator markers",
+        detail.markers.map(function (m) { return m.label || m.kind; })
+                      .join("; ")));
+    }
+    reasonItems($("inc-evidence-list"), detail.evidence);
+    reasonItems($("inc-unknowns-list"), detail.unknowns);
+    tokenItems($("inc-evidence-tokens"), detail.evidence);
+    tokenItems($("inc-unknown-tokens"), detail.unknowns);
+  }
+
+  function closeIncidentDetail() {
+    state.selectedIncidentId = null;
+    state.incSubject = null;
+    hide($("inc-detail"));
+    hide($("inc-evidence-card"));
+    show($("inc-list-card"));
+  }
+
+  // B3: the marker evidence correlation -- the ONLY subject change the
+  // UI offers besides an incident. It reuses the same five sections, the
+  // same L3/L4 rendering and the same subject-bound route with
+  // marker_id=; the +/-900 s window is SERVER-derived and only echoed
+  // here. No hash route, no new API route, no incident is created.
+  function openMarkerEvidence(id, label) {
+    if (!state.session || !state.session.authenticated) return;
+    state.incSubject = {type: "marker", id: id, label: label};
+    $("inc-evidence-title").textContent = "Evidence around marker";
+    var line = $("inc-evidence-subject");
+    line.textContent = "Marker: " + (label || ("#" + id));
+    show(line);
+    show($("inc-evidence-card"));
+    loadEvidence(state.incSection);
+  }
+
+  function loadEvidence(section) {
+    state.incSection = section;
+    document.querySelectorAll("#inc-sections .seg-item").forEach(function (item) {
+      item.classList.toggle("active", item.getAttribute("data-section") === section);
+    });
+    var subject = state.incSubject;
+    if (!subject) return;
+    var note = $("inc-rows-note");
+    hide(note);
+    var url = "/api/v1/evidence?section=" + section;
+    if (subject.type === "marker") {
+      url += "&marker_id=" + subject.id;
+    } else {
+      url += "&incident_id=" + subject.id;
+    }
+    return api(url).then(function (data) {
+      renderEvidenceRows(data);
+    }).catch(function () {
+      // B4: a network/HTTP/read failure is NOT an empty window. No
+      // conclusion -- including the neutral retained-evidence text --
+      // may be drawn from a view that could not load.
+      var head = $("inc-rows-head");
+      var body = $("inc-rows-body");
+      head.textContent = "";
+      body.textContent = "";
+      var tr = body.insertRow(-1);
+      tr.insertCell(-1).textContent = INC_EVIDENCE_UNAVAILABLE;
+      $("inc-l3").textContent = "";
+      hide(note);
+    });
+  }
+
+  function renderEvidenceRows(data) {
+    var head = $("inc-rows-head");
+    var body = $("inc-rows-body");
+    var note = $("inc-rows-note");
+    head.textContent = "";
+    body.textContent = "";
+    $("inc-l3").textContent = "";
+    var rows = (data && data.rows) || [];
+    var subject = $("inc-evidence-subject");
+    if (state.incSubject && state.incSubject.type === "marker" && data &&
+        data.window) {
+      // B3: the server-derived window, only echoed -- never widened here.
+      subject.textContent = "Marker: " +
+        (state.incSubject.label || ("#" + state.incSubject.id)) +
+        " — Server-derived window: " +
+        fmtEpoch(data.window.start_epoch) + " — " +
+        fmtEpoch(data.window.end_epoch) +
+        " (the marker time ± 15 minutes)";
+      show(subject);
+    }
+    renderL3(data);
+    if (rows.length) {
+      var hr = document.createElement("tr");
+      Object.keys(rows[0]).forEach(function (key) {
+        var th = document.createElement("th");
+        th.textContent = key;
+        hr.appendChild(th);
+      });
+      head.appendChild(hr);
+    }
+    rows.forEach(function (row) {
+      var tr = document.createElement("tr");
+      Object.keys(rows[0] || {}).forEach(function (key) {
+        var value = row[key];
+        var td = document.createElement("td");
+        td.textContent = (value === null || value === undefined) ? "—" : String(value);
+        tr.appendChild(td);
+      });
+      body.appendChild(tr);
+    });
+    if (!rows.length) {
+      var tr = body.insertRow(-1);
+      // B4: this text is ONLY reachable after a successful 200 with an
+      // empty row set -- never from a failure path.
+      tr.insertCell(-1).textContent = INC_EMPTY_EVIDENCE;
+    }
+    var notes = [];
+    if (data && data.truncated) {
+      // the read is ORDER BY epoch ASC LIMIT budget: the response holds
+      // the EARLIEST rows -- LATER rows in this section are omitted
+      notes.push(INC_TRUNCATED_NOTE);
+    }
+    if (data && data.window && data.retention_cutoff_epoch !== undefined &&
+        data.window.start_epoch < data.retention_cutoff_epoch) {
+      notes.push(INC_RETENTION_NOTE);
+    }
+    if (notes.length) {
+      note.textContent = notes.join(" ");
+      show(note);
+    }
+  }
+
+  // ---- B1: the L3 compact timeline --------------------------------------
+  // Client-side presentation of the SAME subject-bound rows the raw L4
+  // table shows -- no new endpoint, no second fetch, no invented
+  // statistics. journal_events aggregate exactly by (cls, proto, dcls,
+  // port); audit by (kind, code); samples/probes render their operator
+  // columns; device states carry the sparse-context disclaimer.
+
+  function l3Table(headers, rows) {
+    var card = document.createElement("div");
+    card.className = "table-card";
+    var table = document.createElement("table");
+    table.className = "table";
+    var head = document.createElement("thead");
+    var hr = document.createElement("tr");
+    headers.forEach(function (h) {
+      var th = document.createElement("th");
+      th.textContent = h;
+      hr.appendChild(th);
+    });
+    head.appendChild(hr);
+    table.appendChild(head);
+    var body = document.createElement("tbody");
+    rows.forEach(function (cells) {
+      var tr = document.createElement("tr");
+      cells.forEach(function (value) {
+        var td = document.createElement("td");
+        td.textContent = (value === null || value === undefined) ? "—" : String(value);
+        tr.appendChild(td);
+      });
+      body.appendChild(tr);
+    });
+    table.appendChild(body);
+    card.appendChild(table);
+    return card;
+  }
+
+  function fmtSlot(status, latency, code) {
+    if (status === "ok") return "ok " + latency + " ms";
+    if (code === "NONE" || !code) return status || "—";
+    return status + " (" + code + ")";
+  }
+
+  function renderL3(data) {
+    var host = $("inc-l3");
+    host.textContent = "";
+    var rows = (data && data.rows) || [];
+    if (!rows.length) return;   // the L4 empty state speaks for both
+    if (data.truncated && (data.section === "journal_events"
+                           || data.section === "audit")) {
+      // a truncated section's totals are NOT full-window totals: say so
+      // next to the aggregates instead of labelling them complete
+      var partial = document.createElement("p");
+      partial.className = "muted";
+      partial.textContent = INC_AGGREGATE_PARTIAL;
+      host.appendChild(partial);
+    }
+    if (data.section === "journal_events") {
+      // EXACT grouping key: (cls, proto, dcls, port)
+      var groups = {};
+      rows.forEach(function (row) {
+        var key = [row.cls, row.proto, row.dcls, row.port].join(" ");
+        if (!groups[key]) {
+          groups[key] = {cls: row.cls, proto: row.proto, dcls: row.dcls,
+                         port: row.port, total: 0, first: row.ts,
+                         last: row.ts};
+        }
+        groups[key].total += row.n;
+        groups[key].first = Math.min(groups[key].first, row.ts);
+        groups[key].last = Math.max(groups[key].last, row.ts);
+      });
+      var headers = ["Error class", "Protocol", "Destination class",
+                     "Port", "Total", "First", "Last"];
+      var table = Object.keys(groups).sort().map(function (key) {
+        var g = groups[key];
+        return [g.cls, g.proto, g.dcls === "NONE" ? "—" : g.dcls,
+                g.port === 0 ? "—" : String(g.port), String(g.total),
+                fmtEpoch(g.first), fmtEpoch(g.last)];
+      });
+      host.appendChild(l3Table(headers, table));
+      return;
+    }
+    if (data.section === "audit") {
+      var audits = {};
+      rows.forEach(function (row) {
+        var key = [row.kind, row.code].join(" ");
+        if (!audits[key]) {
+          audits[key] = {kind: row.kind, code: row.code, total: 0,
+                         first: row.epoch, last: row.epoch};
+        }
+        audits[key].total += 1;
+        audits[key].first = Math.min(audits[key].first, row.epoch);
+        audits[key].last = Math.max(audits[key].last, row.epoch);
+      });
+      host.appendChild(l3Table(
+        ["Kind", "Code", "Total", "First", "Last"],
+        Object.keys(audits).sort().map(function (key) {
+          var g = audits[key];
+          return [g.kind, g.code, String(g.total),
+                  fmtEpoch(g.first), fmtEpoch(g.last)];
+        })));
+      return;
+    }
+    if (data.section === "samples") {
+      host.appendChild(l3Table(
+        ["Time", "Reality conns", "Hysteria2 conns", "Total conns",
+         "API", "Collector"],
+        rows.map(function (row) {
+          return [fmtEpoch(row.epoch),
+                  String(row.reality_active_connections),
+                  String(row.hysteria2_active_connections),
+                  String(row.total_active_connections),
+                  row.api_status || "—",
+                  row.collector_stale ? "stale" : "ok"];
+        })));
+      return;
+    }
+    if (data.section === "probe_rows") {
+      host.appendChild(l3Table(
+        ["Time", "DNS", "HTTPS", "UDP", "Egress", "Public egress IP",
+         "IP change"],
+        rows.map(function (row) {
+          return [fmtEpoch(row.epoch),
+                  fmtSlot(row.dns_status, row.dns_latency_ms, row.dns_error_code),
+                  fmtSlot(row.https_status, row.https_latency_ms, row.https_error_code),
+                  fmtSlot(row.udp_status, row.udp_latency_ms, row.udp_error_code),
+                  fmtSlot(row.egress_status, row.egress_latency_ms, row.egress_error_code),
+                  row.egress_ip || "—",
+                  row.egress_change || "—"];
+        })));
+      return;
+    }
+    if (data.section === "device_states") {
+      var note = document.createElement("p");
+      note.className = "muted";
+      note.textContent = INC_DEVICE_DISCLAIMER;
+      host.appendChild(note);
+      host.appendChild(l3Table(
+        ["Time", "Device", "Inbound", "Active conns", "Status"],
+        rows.map(function (row) {
+          return [fmtEpoch(row.epoch), row.device, row.inbound,
+                  String(row.active_connections), row.device_status || "—"];
+        })));
+    }
+  }
+
+  function loadMarkers() {
+    if (!state.session || !state.session.authenticated) return;
+    return api("/api/v1/markers").then(function (data) {
+      renderMarkers((data && data.markers) || []);
+    }).catch(function () { /* the list stays as it was */ });
+  }
+
+  function renderMarkers(markers) {
+    var list = $("inc-markers-list");
+    list.textContent = "";
+    markers.forEach(function (marker) {
+      var li = document.createElement("li");
+      var label = document.createElement("span");
+      label.textContent = (marker.label || marker.kind) +
+        " · " + fmtEpoch(marker.epoch);
+      li.appendChild(label);
+      // B3: non-destructive correlation entry -- selects the marker as
+      // the evidence subject on the SAME subject-bound route.
+      var view = document.createElement("button");
+      view.type = "button";
+      view.className = "btn ghost";
+      view.textContent = "View evidence";
+      view.addEventListener("click", function () {
+        openMarkerEvidence(marker.marker_id, marker.label || marker.kind);
+      });
+      li.appendChild(view);
+      list.appendChild(li);
+    });
+    if (!(markers || []).length) {
+      var li = document.createElement("li");
+      li.className = "muted";
+      li.style.fontFamily = "inherit";
+      li.textContent = "No markers recorded.";
+      list.appendChild(li);
+    }
+  }
+
+  function addMarker() {
+    if (!state.session || !state.session.authenticated) return;
+    var kind = $("inc-marker-kind").value;
+    var button = $("inc-marker-add-btn");
+    button.disabled = true;   // no automatic retry; a double click would
+    apiWithStepUp("/api/v1/markers", {   // legitimately record two events
+      method: "POST",
+      body: { kind: kind }
+    }).then(function () {
+      button.disabled = false;
+      incMessage("Marker recorded.", false);
+      loadMarkers();
+    }).catch(function (error) {
+      button.disabled = false;
+      if (error.status === 401) { showLogin("Session expired — please log in again."); return; }
+      if (error.status === 400 && error.code === "invalid_marker_epoch") {
+        incMessage("The marker time is outside the retention window.", true);
+        return;
+      }
+      incMessage("The marker could not be recorded.", true);
+    });
+  }
+
+  function rearmIncidents() {
+    if (!state.session || !state.session.authenticated) return;
+    var button = $("inc-rearm-btn");
+    button.disabled = true;
+    apiWithStepUp("/api/v1/incidents/rearm", { method: "POST" })
+      .then(function () {
+        rearmMessage(INC_REARM_ACCEPTED, false);
+        loadIncidents();
+      })
+      .catch(function (error) {
+        if (error.status === 401) { showLogin("Session expired — please log in again."); return; }
+        if (error.status === 409) {
+          rearmMessage("Discovery is not waiting for a re-arm right now.", true);
+        } else {
+          rearmMessage("The re-arm could not be recorded. Do not retry automatically.", true);
+        }
+        loadIncidents();
+      });
   }
 
   /* ---------- client availability ---------- */
@@ -1208,13 +1803,31 @@
         addEntry(state.session.current_ip);
       }
     });
-    document.querySelectorAll(".seg-item").forEach(function (item) {
+    // Scoped to the connections filter: the evidence drill-down has its
+    // own .seg-item group (#inc-sections) with its own handler below.
+    document.querySelectorAll("#conn-filter .seg-item").forEach(function (item) {
       item.addEventListener("click", function () {
         state.filter = item.getAttribute("data-filter");
-        document.querySelectorAll(".seg-item").forEach(function (other) {
+        document.querySelectorAll("#conn-filter .seg-item").forEach(function (other) {
           other.classList.toggle("active", other === item);
         });
         if (state.snapshot) renderConnections(state.snapshot.connections || []);
+      });
+    });
+    $("inc-refresh-btn").addEventListener("click", function () {
+      loadIncidents();
+      loadMarkers();
+    });
+    $("inc-back-btn").addEventListener("click", closeIncidentDetail);
+    $("inc-evidence-close").addEventListener("click", function () {
+      state.incSubject = null;
+      hide($("inc-evidence-card"));
+    });
+    $("inc-marker-add-btn").addEventListener("click", addMarker);
+    $("inc-rearm-btn").addEventListener("click", rearmIncidents);
+    document.querySelectorAll("#inc-sections .seg-item").forEach(function (item) {
+      item.addEventListener("click", function () {
+        loadEvidence(item.getAttribute("data-section"));
       });
     });
   }

@@ -14,11 +14,15 @@
 #      history SCHEMA_VERSION 4, and the contract document that froze them is
 #      present with all thirty-four discriminators listed (R1's nineteen,
 #      R2's eleven and R3's four).
-#   2. THE SURFACE DID NOT WIDEN. There is no P5 ``/api/v1/incidents`` route,
-#      the timeline endpoint gains EXACTLY ONE key (the closed eight-key
-#      ``incident_runtime`` object), and the incident runtime module holds no
-#      SQL, no file, no socket and no process call site: it reads through the
-#      store's bounded reader and writes through the store's boundary only.
+#   2. THE SURFACE DID NOT WIDEN. The timeline endpoint gains EXACTLY ONE
+#      key (the closed eight-key ``incident_runtime`` object), and the
+#      incident runtime module holds no SQL, no file, no socket and no
+#      process call site: it reads through the store's bounded reader and
+#      writes through the store's boundary only. (The old "no P5 route"
+#      gate stood in this lane and was explicitly RETIRED by PR-5, #63 R2
+#      §13 -- the route family is now owned, and set-exactness-gated, by
+#      tests/test-monitor-v2-incidents.sh. Every other gate here is
+#      untouched.)
 #   3. BEHAVIOUR, at the level a reviewer cannot fake: tests/
 #      monitor-incident-runtime/runtime_groups.py drives the real
 #      IncidentScanner over a real schema-v4 SQLite store and asserts the
@@ -78,16 +82,26 @@ FAIL=0
 # two category-surface gates added in their place), retention 6 -> 6,
 # continuity 10 -> 10, end_to_end 14 -> 14: 208 verdicts plus the harness rc
 # gate plus the fixture-immutability proof.
-#   S0 static + wiring gates             14   the release identity (VERSION /
+# PR-5 (#63 R2 §13/§14): 224 -> 222, by RETIREMENT only, never by
+# loosening: (a) S0 static 14 -> 13 -- the "no P5 route exists" static wall
+# is the one gate the R2 contract retires (the route family is now
+# set-exactness-gated by the incidents lane); (b) containment 40 -> 39 --
+# the live "P5 route answers 404" verdict is the same retirement point
+# served over HTTP. The release-identity witnesses are RESTATED in place
+# (VERSION 0.6.0 / MONITOR_WEB_VERSION 0.6.0 / SCHEMA_VERSION 5 -- the
+# store gains ONLY operator_markers) and no expectation was otherwise
+# weakened; the timeline one-key wall, all 34 contract discriminators and
+# every behaviour verdict keep their exact prior shape.
+#   S0 static + wiring gates             13   the release identity (VERSION /
 #        MONITOR_WEB_VERSION / SCHEMA_VERSION), one scanner construction site
-#        and the stop-before-close teardown order, the no-P5-route and
-#        exactly-one-new-key surface walls, the runtime module's SQL-free and
-#        I/O-free call-site walls, and the contract document's THIRTY-FOUR
-#        discriminator list (R1's nineteen plus R2's eleven plus R3's four; a
-#        gate that went missing with a lattice that went deleted could
-#        otherwise hide behind a spec that stopped mentioning it). All
-#        static, all platform-independent.
-#   S1 behaviour groups (runtime_groups) 210  = 208 harness verdicts plus the
+#        and the stop-before-close teardown order, the exactly-one-new-key
+#        surface wall, the runtime module's SQL-free and I/O-free call-site
+#        walls, and the contract document's THIRTY-FOUR discriminator list
+#        (R1's nineteen plus R2's eleven plus R3's four; a gate that went
+#        missing with a lattice that went deleted could otherwise hide
+#        behind a spec that stopped mentioning it). All static, all
+#        platform-independent.
+#   S1 behaviour groups (runtime_groups) 209  = 207 harness verdicts plus the
 #        harness rc gate plus the cross-lane fixture-immutability proof:
 #        static 12 (the six frozen constants by value, the bucket grid
 #        REFERENCED not rewritten, the numeric-literal wall that forbids a
@@ -161,7 +175,7 @@ FAIL=0
 #        the row's bits equal to the live reader's own verdict; the quiet
 #        scenario opening nothing while still evaluating; an over-budget
 #        evidence window refused as a contained read error).
-EXPECTED_PASS=224
+EXPECTED_PASS=222
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
@@ -217,19 +231,19 @@ else
     fail "py_compile: $(cat "$TMP/py.err")"
 fi
 
-# (1) The release identity PR-4B froze. Three witnesses, three files: the
+# (1) The release identity PR-5 restated. Three witnesses, three files: the
 #     VERSION this lane guards, the web build it ships, the schema it writes.
-assert_eq '0.5.0' "$(cat "$ROOT/monitor-v2/VERSION")" \
-    "VERSION is 0.5.0 (the incident-runtime release)"
-if grep -q 'MONITOR_WEB_VERSION = "0.5.0"' "$SERVER_PY"; then
-    pass "MONITOR_WEB_VERSION is 0.5.0"
+assert_eq '0.6.0' "$(cat "$ROOT/monitor-v2/VERSION")" \
+    "VERSION is 0.6.0 (the incidents-UI release)"
+if grep -q 'MONITOR_WEB_VERSION = "0.6.0"' "$SERVER_PY"; then
+    pass "MONITOR_WEB_VERSION is 0.6.0"
 else
-    fail "MONITOR_WEB_VERSION moved off 0.5.0"
+    fail "MONITOR_WEB_VERSION moved off 0.6.0"
 fi
-if grep -q '^SCHEMA_VERSION = 4$' "$HIST_PY"; then
-    pass "history SCHEMA_VERSION is 4"
+if grep -q '^SCHEMA_VERSION = 5$' "$HIST_PY"; then
+    pass "history SCHEMA_VERSION is 5"
 else
-    fail "history SCHEMA_VERSION moved off 4"
+    fail "history SCHEMA_VERSION moved off 5"
 fi
 
 # (2) ONE construction site, in the entrypoint. The class name appears in
@@ -255,15 +269,9 @@ else
     fail "the scanner is not stopped before the history store closes (stop='$STOP_LINE' close='$CLOSE_LINE')"
 fi
 
-# (4) The surface did not widen: no P5 incident route exists, and the
-#     timeline gains exactly ONE key. The eight-key whitelist itself is
-#     asserted live over HTTP in S1's containment group; this is the static
-#     wall that a new route or a second projection key would have to break.
-if grep -q '/api/v1/incidents' "$SERVER_PY"; then
-    fail "a P5 /api/v1/incidents route exists"
-else
-    pass "no P5 incidents route was added to the shipped server"
-fi
+# (4) The surface did not widen: the timeline gains exactly ONE key. (The
+#     old "no P5 route exists" wall that shared this number is RETIRED by
+#     PR-5 -- see the header; its replacement lives in the incidents lane.)
 assert_eq '1' "$(grep -c '"incident_runtime":' "$SERVER_PY")" \
     "the timeline body gains exactly one incident key (no second status surface)"
 
