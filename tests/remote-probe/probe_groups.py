@@ -148,6 +148,15 @@ def make_config(**over):
     return ag.AgentConfig.from_mapping(raw)
 
 
+def chain_bytes(directory):
+    """EXACT bytes the record chain occupies on disk (all members)."""
+    total = 0
+    for path in glob.glob(os.path.join(directory, sp.SPOOL_FILE + "*")):
+        if os.path.isfile(path):
+            total += os.lstat(path).st_size
+    return total
+
+
 def proxies_payload(reality=True, hy2=True, selected=None, delay=42):
     proxies = {}
     if reality:
@@ -2297,6 +2306,138 @@ def group_resilience():
     out["unrecoverable_corrupt_line_blocks_compaction"] = (
         raised and open(chain, "rb").read() == planted
         and planted != before)
+    queue.close()
+    clean(root)
+
+    # ---- E1a: an unresolved corrupt record is never OVERTAKEN. Records
+    #      before it stay deliverable in order, but nothing may pass it, so
+    #      the cursor can never claim a terminal state it never reached.
+    root = temp_dir()
+    directory = os.path.join(root, "spool")
+    corrupt_line = (b'{"v":1,"record_id":3,"probe_id":"office-sg-isp-a"'
+                    b',"run":"' + RUN.encode() + b'","seq":3'
+                    b',"queued_epoch":1700000000.0,"body_b64":"!!!!"}')
+    queue = sp.Spool(directory, clock=lambda: 1700000000.0).open()
+    queue.append("office-sg-isp-a", RUN, 1, pl.encode_sample(_sample(1)),
+                 queued_epoch=1700000000.0)          # valid id = 1
+    queue.close()
+    with open(os.path.join(directory, sp.SPOOL_FILE), "ab") as handle:
+        handle.write(corrupt_line + b"\n")           # corrupt, recoverable = 3
+    queue = sp.Spool(directory, clock=lambda: 1700000000.0).open()
+    fourth = queue.append("office-sg-isp-a", RUN, 4, pl.encode_sample(_sample(4)),
+                          queued_epoch=1700000000.0)  # valid id = 4
+    acked = dl.deliver_pending(queue, SECRET, "office-sg-isp-a", FakePoster())
+    blocked_poster = FakePoster(
+        [(200, b'{"result":"accepted","v":1}')] * 4)
+    blocked = dl.deliver_pending(queue, SECRET, "office-sg-isp-a",
+                                 blocked_poster)
+    chain_lines = [line for line in
+                   open(os.path.join(directory, sp.SPOOL_FILE), "rb")
+                   .read().splitlines() if line]
+    out["unresolved_corrupt_record_blocks_later_delivery"] = (
+        fourth == 4                                  # the id was reserved
+        and acked["acked"] == 1                      # the record BEFORE it goes
+        and blocked["stopped"] == "queue_blocked"
+        and len(blocked_poster.requests) == 0        # id 4 never sent
+        and int(queue._state["resolved_through"]) < 3
+        and queue.status().get("queue_blocked") is True
+        and corrupt_line in chain_lines)             # evidence still on disk
+    queue.close()
+    clean(root)
+    # ---- E1b: once the durable cursor PROVES the corrupt record terminal,
+    #      compaction may drop it and the queue continues.
+    root = temp_dir()
+    directory = os.path.join(root, "spool")
+    queue = sp.Spool(directory, clock=lambda: 1700000000.0).open()
+    queue.append("office-sg-isp-a", RUN, 1, pl.encode_sample(_sample(1)),
+                 queued_epoch=1700000000.0)
+    queue.close()
+    with open(os.path.join(directory, sp.SPOOL_FILE), "ab") as handle:
+        handle.write(corrupt_line + b"\n")
+    # a controlled fixture: the operator repaired the cursor past the corrupt
+    # record, so id 3 is provably terminal.
+    with open(os.path.join(directory, sp.STATE_FILE), "w",
+              encoding="utf-8") as handle:
+        handle.write('{"next_record_id": 4, "resolved_through": 3}')
+    reopened = sp.Spool(directory, clock=lambda: 1700000000.0).open()
+    reopened.enforce_bounds()
+    chain_lines = [line for line in
+                   open(os.path.join(directory, sp.SPOOL_FILE), "rb")
+                   .read().splitlines() if line]
+    resumed = reopened.append("office-sg-isp-a", RUN, 4,
+                              pl.encode_sample(_sample(4)),
+                              queued_epoch=1700000000.0)
+    out["resolved_corrupt_record_allows_queue_to_continue"] = (
+        corrupt_line not in chain_lines              # provably terminal
+        and resumed == 4
+        and [item["record_id"] for item in reopened.pending()] == [4]
+        and reopened.status().get("queue_blocked") is False)
+    reopened.close()
+    clean(root)
+    # ---- E2a: the byte bound is measured on the ENCODED chain, not on the
+    #      decoded bodies: two records are 1184 decoded bytes but 1868 bytes
+    #      on disk, so a 1500 byte budget must trim the chain to 934.
+    root = temp_dir()
+    directory = os.path.join(root, "spool")
+    queue = sp.Spool(directory, clock=lambda: 1700000000.0,
+                     max_bytes=1500).open()
+    for seq in (1, 2):
+        queue.append("office-sg-isp-a", RUN, seq,
+                     pl.encode_sample(_sample(seq)),
+                     queued_epoch=1700000000.0)
+    decoded = sum(len(pl.encode_sample(_sample(s))) for s in (1, 2))
+    status = queue.enforce_bounds()
+    measured = chain_bytes(directory)
+    out["physical_spool_budget_is_at_most_32_mib"] = (
+        decoded <= 1500 and measured <= 1500
+        and status["budget_dropped_total"] >= 1        # it was really dropped
+        and len(list(queue.pending())) == 1)           # trimmed, not emptied
+    queue.close()
+    clean(root)
+    # ---- E2b: unresolved corrupt evidence still COUNTS toward the budget --
+    #      it is neither forgotten nor deleted to make room.
+    root = temp_dir()
+    directory = os.path.join(root, "spool")
+    queue = sp.Spool(directory, clock=lambda: 1700000000.0,
+                     max_bytes=1000).open()
+    queue.append("office-sg-isp-a", RUN, 1, pl.encode_sample(_sample(1)),
+                 queued_epoch=1700000000.0)
+    queue.close()
+    with open(os.path.join(directory, sp.SPOOL_FILE), "ab") as handle:
+        handle.write(corrupt_line + b"\n")
+    queue = sp.Spool(directory, clock=lambda: 1700000000.0,
+                     max_bytes=1000).open()
+    status = queue.enforce_bounds()
+    measured = chain_bytes(directory)
+    chain_lines = [line for line in
+                   open(os.path.join(directory, sp.SPOOL_FILE), "rb")
+                   .read().splitlines() if line]
+    out["corrupt_lines_count_toward_physical_budget"] = (
+        measured <= 1000
+        and status["budget_dropped_total"] >= 1
+        and corrupt_line in chain_lines)               # never deleted for room
+    queue.close()
+    clean(root)
+    # ---- E2c: the frozen constants cannot contradict the contract, and a
+    #      long run with scaled parameters never settles above the bound.
+    root = temp_dir()
+    directory = os.path.join(root, "spool")
+    queue = sp.Spool(directory, clock=lambda: 1700000000.0,
+                     max_bytes=3000, file_bytes=1000, max_files=4).open()
+    worst = 0
+    for index in range(12):
+        queue.append("office-sg-isp-a", RUN, index + 1,
+                     pl.encode_sample(_sample(index + 1)),
+                     queued_epoch=1700000000.0)
+        queue.enforce_bounds()
+        worst = max(worst, chain_bytes(directory))
+    out["rotation_chain_cannot_exceed_frozen_total_budget"] = (
+        sp.MAX_FILES * (sp.FILE_BYTES + sp.RECORD_MAX_BYTES)
+        <= sp.MAX_TOTAL_BYTES
+        and sp.MAX_TOTAL_BYTES == 32 * 1024 * 1024
+        and worst <= 3000
+        and len(glob.glob(os.path.join(directory, sp.SPOOL_FILE + ".*")))
+        <= sp.MAX_FILES)
     queue.close()
     clean(root)
 

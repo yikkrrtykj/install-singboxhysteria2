@@ -492,10 +492,12 @@ class RemoteProbeAgent:
         summary = deliver_pending(self.spool, self._ingest_secret,
                                   self.config.probe_id, self._poster,
                                   clock=self.clock, jitter=self._jitter)
-        if summary.get("stopped") == dl.RETRY_STATE_NOT_DURABLE:
-            # Storage could not make the retry count durable, so no progress
-            # was charged. Degrade the plane instead of reporting a normal
-            # backoff: the next cycle retries the same record.
+        if summary.get("stopped") in (dl.RETRY_STATE_NOT_DURABLE,
+                                      dl.QUEUE_BLOCKED):
+            # Storage could not make the retry count durable, or unresolved
+            # corrupt evidence holds the queue. Either way no progress was
+            # charged: degrade the plane instead of reporting a normal
+            # backoff, and never crash the loop on a designed refusal.
             self.cycle_failures += 1
             self.last_status = STATUS_DEGRADED
         retry_after = float(summary.get("retry_after") or 0.0)

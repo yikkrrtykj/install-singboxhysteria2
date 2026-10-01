@@ -47,9 +47,15 @@ SPOOL_FILE = "spool.jsonl"
 STATE_FILE = "spool.state.json"
 LOCK_FILE = "spool.lock"
 MAX_FILES = 4
-FILE_BYTES = 8 * 1024 * 1024          # per-file rotation threshold
-MAX_AGE_SECONDS = 7 * 86400.0         # <= 7 days (contract)
+# The chain keeps at most MAX_FILES members (the current file plus
+# max_files-1 rotated ones), and a rotation is triggered only once a write
+# would push a member past FILE_BYTES -- so a member can overshoot by at
+# most ONE record line (RECORD_MAX_BYTES). FILE_BYTES is therefore derived
+# from the contract so the physical worst case stays inside it:
+# MAX_FILES * (FILE_BYTES + RECORD_MAX_BYTES) <= MAX_TOTAL_BYTES.
 MAX_TOTAL_BYTES = 32 * 1024 * 1024    # <= 32 MiB (contract)
+MAX_AGE_SECONDS = 7 * 86400.0         # <= 7 days (contract)
+FILE_BYTES = MAX_TOTAL_BYTES // MAX_FILES - MAX_BODY_BYTES * 2
 RETENTION_INTERVAL_SECONDS = 3600.0   # periodic enforcement while running
 QUARANTINE_MAX_ENTRIES = 512
 RECORD_MAX_BYTES = MAX_BODY_BYTES * 2  # base64 of a 16 KiB body, with slack
@@ -74,7 +80,8 @@ QUARANTINE_TOKENS = (QUARANTINE_MALFORMED_2XX, QUARANTINE_REDIRECT,
 STATUS_KEYS = ("pending", "pending_bytes", "oldest_queued_epoch",
                "resolved_through", "acknowledged_total", "quarantined_total",
                "expired_total", "budget_dropped_total", "corrupt_total",
-               "state_save_failures", "reconciled_ids", "tracked_attempts")
+               "state_save_failures", "reconciled_ids", "tracked_attempts",
+               "queue_blocked")
 
 
 class SpoolError(Exception):
@@ -274,6 +281,7 @@ class Spool:
         }
         self._opened = False
         self._id_ceiling = 0      # highest durable id seen by a scan
+        self._blocked_id = 0      # oldest unresolved corrupt record id
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -451,6 +459,7 @@ class Spool:
         found = []
         seen = set()
         last = 0
+        blocked = 0
         for path in self._record_paths():
             # An EXISTING member that cannot be read is fail-closed, never
             # skipped: a skip makes the queue look complete while records
@@ -477,6 +486,11 @@ class Spool:
                                          % reserved)
                     seen.add(reserved)
                     last = reserved
+                    if reserved > int(self._state["resolved_through"]):
+                        # Still unresolved: it OWNS its position, and no
+                        # later record may be delivered past it.
+                        blocked = reserved if not blocked else min(blocked,
+                                                                   reserved)
                     continue
                 record_id = record["record_id"]
                 if record_id in seen:
@@ -490,6 +504,7 @@ class Spool:
         # The id ceiling covers corrupt-but-recoverable records too, so the
         # cursor reconciled from it is strictly greater than EVERY durable id.
         self._id_ceiling = last
+        self._blocked_id = blocked
         return found
 
     def _reconcile_ids(self):
@@ -667,17 +682,35 @@ class Spool:
     # -- read / attempts / resolve ------------------------------------------
 
     def pending(self):
-        """Yield pending records oldest-first, in record order."""
+        """The deliverable records, oldest-first, in strict record order.
+
+        An UNRESOLVED corrupt record blocks the queue AT ITS POSITION: the
+        records before it are still deliverable in order, but nothing may
+        pass it -- a record that was never acked or quarantined must never be
+        overtaken by a later one, or the durable cursor would claim a terminal
+        state it never reached (and compaction would then delete its only
+        evidence). When the block IS the head, the queue REFUSES instead of
+        looking drained: that is the degraded signal an operator needs.
+        """
         resolved = int(self._state["resolved_through"])
+        blocked = int(self._blocked_id)
+        deliverable = []
         for record_id, record in self._scan_records():
+            if blocked and record_id >= blocked:
+                break
             if record_id <= resolved:
                 continue
-            yield {"record_id": record_id,
-                   "probe_id": record["probe_id"],
-                   "run": record["run"],
-                   "seq": record["seq"],
-                   "queued_epoch": record["queued_epoch"],
-                   "body": record["body"]}
+            deliverable.append({"record_id": record_id,
+                                "probe_id": record["probe_id"],
+                                "run": record["run"],
+                                "seq": record["seq"],
+                                "queued_epoch": record["queued_epoch"],
+                                "body": record["body"]})
+        if blocked and blocked > resolved and not deliverable:
+            raise SpoolError(
+                "unresolved corrupt record id=%d blocks the queue"
+                % blocked)
+        return iter(deliverable)
 
     def attempts(self, record_id):
         """Durable retry count for one record (survives a restart)."""
@@ -741,9 +774,39 @@ class Spool:
 
     # -- bounds -------------------------------------------------------------
 
+    def _physical_chain_bytes(self):
+        """EXACT bytes the record chain occupies on disk.
+
+        Every existing member's real size, including any complete-corrupt
+        line D1 preserved. This -- not the decoded body sum -- is what the
+        contract bounds: base64 expansion, the JSON envelope, the newline
+        and unresolved evidence all occupy the agent's spool.
+        """
+        total = 0
+        for path in self._record_paths():
+            try:
+                st = os.lstat(path)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise SpoolError("record chain member unstatable: %s"
+                                 % type(exc).__name__) from None
+            if stat_module.S_ISREG(st.st_mode):
+                total += int(st.st_size)
+        return total
+
     def enforce_bounds(self):
-        """Apply the 7-day / 32 MiB bounds and physically drop resolved records
-        from EVERY file in the chain. Every drop is counted and visible."""
+        """Apply the 7-day / byte bounds to REAL storage.
+
+        The byte bound is enforced on the encoded chain itself (see
+        ``_physical_chain_bytes``), so base64 expansion, the JSON envelope
+        and unresolved corrupt evidence all count. A record is only dropped
+        when dropping it actually FREES bytes: the oldest live record is
+        resolved, the chain compacted and the size measured again. If the
+        budget cannot be reached because what remains is evidence we may not
+        delete, the pass FAILS CLOSED -- it never silently exceeds the bound
+        and never deletes unresolved evidence.
+        """
         self._compact_resolved()
         resolved = int(self._state["resolved_through"])
         now = float(self.clock())
@@ -754,16 +817,27 @@ class Spool:
                 self._state["resolved_through"] = record_id
                 self._state["expired_total"] = int(
                     self._state["expired_total"]) + 1
-        live = [(rid, rec) for rid, rec in self._scan_records()
-                if rid > int(self._state["resolved_through"])]
-        total = sum(len(rec["body"]) for _rid, rec in live)
-        for record_id, record in live:
-            if total <= self.max_bytes:
-                break
-            self._state["resolved_through"] = record_id
+        physical = self._physical_chain_bytes()
+        while physical > self.max_bytes:
+            live = [(rid, rec) for rid, rec in self._scan_records()
+                    if rid > int(self._state["resolved_through"])]
+            if not live:
+                self._save_state_soft()
+                raise SpoolError(
+                    "spool cannot be reduced to its byte budget")
+            self._state["resolved_through"] = live[0][0]   # oldest first
             self._state["budget_dropped_total"] = int(
                 self._state["budget_dropped_total"]) + 1
-            total -= len(record["body"])
+            self._compact_resolved()
+            reduced = self._physical_chain_bytes()
+            if reduced >= physical:
+                # Nothing was freed: the remaining bytes are evidence we
+                # may not delete. Refuse rather than keep claiming the
+                # bound holds.
+                self._save_state_soft()
+                raise SpoolError(
+                    "spool cannot be reduced to its byte budget")
+            physical = reduced
         self._save_state_soft()
         self._compact_resolved()
         return self.status()
@@ -824,7 +898,14 @@ class Spool:
 
     def status(self):
         """Closed, sanitized local status (no bodies, no secrets)."""
-        pending = list(self.pending())
+        blocked = False
+        try:
+            pending = list(self.pending())
+        except (SpoolError, OSError):
+            # The queue is refused because unresolved corrupt evidence holds
+            # it: report the degraded state instead of an empty queue.
+            blocked = True
+            pending = []
         oldest = min((item["queued_epoch"] for item in pending), default=None)
         return {
             "pending": len(pending),
@@ -839,6 +920,7 @@ class Spool:
             "state_save_failures": int(self._state["state_save_failures"]),
             "reconciled_ids": int(self._state["reconciled_ids"]),
             "tracked_attempts": len(self._state["retry_attempts"]),
+            "queue_blocked": blocked,
         }
 
 

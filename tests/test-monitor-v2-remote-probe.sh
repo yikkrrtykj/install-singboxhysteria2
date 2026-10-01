@@ -43,7 +43,7 @@ FAIL=0
 # Measured on the dev host (Windows, Python 3.14) and re-measured on Linux CI:
 # Measured on the dev host (Windows, Python 3.14) and re-measured on Linux CI:
 # Measured on the dev host (Windows, Python 3.14) and re-measured on Linux CI:
-# 242 = S0 static + red-line gates 19 (py_compile of the package + harness, the
+# 247 = S0 static + red-line gates 19 (py_compile of the package + harness, the
 # in-module reuse documentation, the FOUR frozen sha256 pins that prove the
 # audited E4 client/model/diag/README were reused and never forked, the E4
 # file-set check, the unchanged release identity 0.6.1 in both places, History
@@ -51,7 +51,7 @@ FAIL=0
 # modules free of any remote reference, the absent server ingest route, the
 # absent server remote store, and the two CI registrations) + S1 harness 206
 # verdicts across ELEVEN groups plus the harness rc gate. The RESILIENCE group
-# (53 verdicts) pins all four reviewed fix rounds: durable per-record retry state
+# (58 verdicts) pins all five reviewed fix rounds: durable per-record retry state
 # with bounded unknown quarantine and a consumed backoff curve, retention driven
 # by the agent's own open/cycle path, the crash window between the record fsync
 # and the state save, deadline legality (an egress-shaped failure slot),
@@ -88,7 +88,17 @@ FAIL=0
 # unresolved one is kept verbatim, and one whose id cannot be recovered blocks
 # the rewrite closed. Reconciliation that could not persist its cursor plus a
 # compaction pass must still never hand out an id that is on disk.
-EXPECTED_PASS=242
+#
+# The sixth round closes the last two: an unresolved corrupt record can never
+# be OVERTAKEN (records before it stay deliverable, nothing passes it, and the
+# queue refuses -- with the closed reason queue_blocked -- when the block is
+# the head, so the cursor can never claim a terminal state it never reached),
+# and the byte bound is enforced on the REAL encoded chain (base64 expansion,
+# JSON envelope, newline and unresolved evidence all count) by dropping the
+# oldest live record only when that actually frees bytes, failing closed when
+# it cannot. FILE_BYTES is derived so the frozen constants satisfy
+# MAX_FILES * (FILE_BYTES + RECORD_MAX_BYTES) <= MAX_TOTAL_BYTES.
+EXPECTED_PASS=247
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT

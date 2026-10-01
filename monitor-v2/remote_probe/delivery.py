@@ -38,6 +38,9 @@ PERMANENT = "permanent"
 # A retry count that could not be persisted is NOT a consumed attempt: the
 # pass stops with this closed reason instead of reporting progress.
 RETRY_STATE_NOT_DURABLE = "retry_state_not_durable"
+# The queue refuses because an unresolved corrupt record holds it: nothing
+# may pass that record, and the pass must not look drained.
+QUEUE_BLOCKED = "queue_blocked"
 
 # Backoff: bounded exponential. Deterministic when a jitter source is injected.
 BACKOFF_BASE_SECONDS = 1.0
@@ -263,7 +266,14 @@ def deliver_pending(spool, secret, probe_id, poster, now_epoch=None, limit=None,
         summary["retry_after"] = backoff_delay(1, jitter=jitter)
         return summary
 
-    for record in spool.pending():
+    try:
+        records = list(spool.pending())
+    except (SpoolError, OSError):
+        # Unresolved corrupt evidence holds the head of the queue: refuse
+        # rather than report an empty queue, and send nothing.
+        summary["stopped"] = QUEUE_BLOCKED
+        return summary
+    for record in records:
         if limit is not None and summary["attempts"] >= limit:
             break
         record_id = record["record_id"]
@@ -309,7 +319,19 @@ def deliver_pending(spool, secret, probe_id, poster, now_epoch=None, limit=None,
         summary["stopped"] = "retryable"
         summary["retry_after"] = backoff_delay(attempt, jitter=jitter)
         return summary
+    if spool_blocked(spool):
+        # Every deliverable record before the corrupt one was consumed, but
+        # the queue is still refused: surface it as a closed reason too.
+        summary["stopped"] = QUEUE_BLOCKED
     return summary
+
+
+def spool_blocked(spool):
+    """True when an unresolved corrupt record is holding the queue."""
+    try:
+        return bool(spool.status().get("queue_blocked"))
+    except (SpoolError, OSError):
+        return True
 
 
 def next_retry_delay(attempt, jitter=None):
