@@ -1206,6 +1206,23 @@ def group_contract():
             if marker in text:
                 offenders.append((os.path.basename(path), marker))
     out["agent_imports_no_server_monitor_code"] = not offenders
+    # The direct-slot vocabulary is a MIRROR of the audited VPS-side engine:
+    # importing it HERE (a test may import server code; the agent may not) is
+    # what makes the mirror a gate instead of a comment.
+    from diagnostics import network_probes as engine
+    out["direct_error_codes_mirror_the_audited_engine"] = (
+        set(dp.ERROR_CODES) == set(engine.ERROR_CODES))
+    out["direct_status_and_change_mirror_the_audited_engine"] = (
+        set(dp.STATUSES) == {engine.STATUS_OK, engine.STATUS_FAILED}
+        and set(dp.CHANGE_VALUES) == {engine.CHANGE_UNCHANGED,
+                                      engine.CHANGE_CHANGED,
+                                      engine.CHANGE_UNKNOWN})
+    out["egress_gate_matches_the_audited_canonical_gate"] = all(
+        dp.canonical_global_ip(candidate)
+        == (engine._canonical_ip(candidate))
+        for candidate in (IP_A, IP_B, "10.0.0.1", "127.0.0.1", "224.0.0.1",
+                          "255.255.255.255", "2001:db8::1", "::1",
+                          "2606:4700:4700::1111", "not-an-ip", "", "1.2.3.4.5"))
     out["version_not_bumped"] = (
         open(os.path.join(ROOT, "monitor-v2", "VERSION"),
              encoding="utf-8").read().strip() == "0.6.1")

@@ -39,6 +39,10 @@ over that transport. There is no generic method/request API, so proxy
 selection, connection closing, config writes, restart and upgrade are
 unreachable by construction.
 
+The direct-slot vocabulary is a documented mirror of the audited VPS-side
+probe engine under `monitor-v2/diagnostics/`, and the lane imports that
+engine to prove the mirror equals its live tuples.
+
 The audited transport clamps every request to 1..3 s. The contract permits up
 to 5 s per active delay test, so reuse makes P6 **stricter** than the contract
 (`TRANSPORT_TIMEOUT_SECONDS <= 5 s`, pinned by the lane).

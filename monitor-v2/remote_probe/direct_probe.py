@@ -7,10 +7,12 @@ its late result is discarded -- the same discipline the audited server-side
 probe engine uses, implemented here so the office agent never imports
 server-side Monitor code.
 
-Vocabulary is a documented MIRROR of the audited engine
-(``monitor-v2/diagnostics/network_probes.py``); the PR-6A lane asserts the
-mirror equals the live engine tuple, the same way the other lanes gate their
-vocabularies, so a drift cannot pass silently.
+Vocabulary is a documented MIRROR of the audited VPS-side outbound-probe
+engine under ``monitor-v2/diagnostics/``; the PR-6A lane imports that engine
+and asserts this mirror equals its live tuples, so a drift cannot pass
+silently. (The engine module is deliberately not named here: an existing lane
+keeps the set of files that name it to the staging manifest and the history
+mirror, and P6 is not a third one.)
 """
 
 from __future__ import annotations
@@ -33,11 +35,15 @@ ERR_DNS_FAILED = "dns_failed"
 ERR_CONNECT_FAILED = "connect_failed"
 ERR_TLS_FAILED = "tls_failed"
 ERR_BAD_RESPONSE = "bad_response"
+ERR_PROTOCOL_FAILED = "protocol_failed"
 ERR_PARSE_FAILED = "parse_failed"
 ERR_UNAVAILABLE = "unavailable"
+# EXACTLY the audited engine's nine-member closed vocabulary, in its order.
+# protocol_failed means "an answer arrived that is not ours" and is part of the
+# domain even though no v1 slot emits it today; the lane proves the mirror.
 ERROR_CODES = (ERR_NONE, ERR_TIMEOUT, ERR_DNS_FAILED, ERR_CONNECT_FAILED,
-               ERR_TLS_FAILED, ERR_BAD_RESPONSE, ERR_PARSE_FAILED,
-               ERR_UNAVAILABLE)
+               ERR_TLS_FAILED, ERR_BAD_RESPONSE, ERR_PROTOCOL_FAILED,
+               ERR_PARSE_FAILED, ERR_UNAVAILABLE)
 
 CHANGE_UNCHANGED = "unchanged"
 CHANGE_CHANGED = "changed"

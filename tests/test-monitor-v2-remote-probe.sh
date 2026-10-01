@@ -39,15 +39,18 @@ PY="${PYTHON:-$(command -v python3 || command -v python || true)}"
 PASS=0
 FAIL=0
 # Measured on the dev host (Windows, Python 3.14) and re-measured on Linux CI:
-# 183 = S0 static + red-line gates 19 (py_compile of the package + harness, the
+# 186 = S0 static + red-line gates 19 (py_compile of the package + harness, the
 # README/wire documentation, the FOUR frozen sha256 pins that prove the audited
 # E4 client/model/diag/README were reused and never forked, the E4 file-set
 # check, the unchanged release identity 0.6.1 in both places, History still v5
 # with its six prune sources and no remote table, the three P4/P5 modules free
 # of any remote reference, the absent server ingest route, the absent server
-# remote store, and the two CI registrations) + S1 harness 164 (163 verdicts
-# across ten groups plus the harness rc gate).
-EXPECTED_PASS=183
+# remote store, and the two CI registrations) + S1 harness 167 (166 verdicts
+# across ten groups -- including the three MIRROR gates that import the audited
+# VPS-side probe engine and prove the direct-slot vocabulary, the status/change
+# values and the canonical-IP gate still match it exactly -- plus the harness
+# rc gate).
+EXPECTED_PASS=186
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
