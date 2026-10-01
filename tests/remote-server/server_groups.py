@@ -310,7 +310,14 @@ def group_route():
                     b"\r\nHost: 127.0.0.1\r\n"
                     b"Content-Type: application/json\r\n\r\n")
                 _first = _sock.recv(4096).decode("latin-1")
-                _first += _sock.recv(4096).decode("latin-1")
+                try:
+                    # Keep-alive: a second response never comes, so
+                    # the optional second read must not block (the
+                    # body may ride the first packet or the next).
+                    _sock.settimeout(0.5)
+                    _first += _sock.recv(4096).decode("latin-1")
+                except OSError:
+                    pass
             finally:
                 _sock.close()
             out["explicit_content_length_required"] = (
