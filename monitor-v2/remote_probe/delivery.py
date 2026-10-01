@@ -240,17 +240,25 @@ def deliver_pending(spool, secret, probe_id, poster, now_epoch=None, limit=None,
     summary = {"acked": 0, "quarantined": 0, "retries": 0, "attempts": 0,
                "stopped": None, "retry_after": 0.0}
 
-    def note(record_id):
-        """Charge one attempt against the DURABLE budget, or report that the
-        count could not be persisted. ``None`` means no progress was made."""
+    def reserve(record_id):
+        """Charge one attempt against the DURABLE budget BEFORE any byte
+        leaves, or report that the reservation could not be persisted.
+
+        Sending first and charging afterwards would let a storage that keeps
+        failing extend a bounded budget indefinitely: every backoff would send
+        a real request while the durable count stayed put. The reservation is
+        therefore taken first -- a persistence failure stops the pass with NO
+        send at all -- and the worst a crash between the two can do is waste
+        one retry budget, never exceed one.
+        """
         try:
             return spool.note_attempt(record_id)
         except (SpoolError, OSError):
             return None
 
     def stop_undurable():
-        """A non-durable attempt stops the pass: nothing is claimed as sent,
-        nothing is charged, and the record stays queued."""
+        """A non-durable reservation stops the pass: nothing is sent, nothing
+        is charged, and the record stays queued."""
         summary["stopped"] = RETRY_STATE_NOT_DURABLE
         summary["retry_after"] = backoff_delay(1, jitter=jitter)
         return summary
@@ -258,19 +266,22 @@ def deliver_pending(spool, secret, probe_id, poster, now_epoch=None, limit=None,
     for record in spool.pending():
         if limit is not None and summary["attempts"] >= limit:
             break
-        summary["attempts"] += 1
         record_id = record["record_id"]
+        attempt = reserve(record_id)
+        if attempt is None:
+            # poster is NOT called: the bounded budget is a bound on real
+            # sends, and an attempt we could not record is not one.
+            return stop_undurable()
+        summary["attempts"] += 1
         # FRESH PER REQUEST: a long backlog pass may outlive the +/-300 s
         # freshness window, so sent_epoch is read immediately before THIS send
-        # (the body bytes and the (probe_id, run, seq) identity are unchanged).
+        # (the body bytes and the (probe_id, run, seq) identity are unchanged),
+        # and only after the attempt is durably reserved.
         header_map = sign_record(secret, probe_id, record["run"],
                                  record["seq"], record["body"], clock())
         try:
             status, response_body = poster(record["body"], header_map)
         except Exception as exc:  # noqa: BLE001 -- any transport failure
-            attempt = note(record_id)
-            if attempt is None:
-                return stop_undurable()
             summary["attempt"] = attempt
             summary["retries"] += 1
             summary["stopped"] = type(exc).__name__
@@ -282,25 +293,17 @@ def deliver_pending(spool, secret, probe_id, poster, now_epoch=None, limit=None,
             summary["acked"] += 1
             continue
         if disposition == PERMANENT:
-            if token == QUARANTINE_UNKNOWN_RESPONSE:
-                count = note(record_id)
-                if count is None:
-                    return stop_undurable()
-                if count < max_unknown_attempts:
-                    summary["attempt"] = count
-                    summary["retries"] += 1
-                    summary["stopped"] = "unknown_bounded"
-                    summary["retry_after"] = backoff_delay(count, jitter=jitter)
-                    return summary
+            if (token == QUARANTINE_UNKNOWN_RESPONSE
+                    and attempt < max_unknown_attempts):
+                # Not yet at the frozen bound: back off and keep the record.
+                summary["attempt"] = attempt
+                summary["retries"] += 1
+                summary["stopped"] = "unknown_bounded"
+                summary["retry_after"] = backoff_delay(attempt, jitter=jitter)
+                return summary
             spool.resolve(record_id, quarantine_token=token)
             summary["quarantined"] += 1
             continue
-        attempt = note(record_id)
-        if attempt is None:
-            # The record is NOT resolved: an un-chargeable attempt must never
-            # leave a terminal state behind (no poison head from a failed
-            # persistence).
-            return stop_undurable()
         summary["attempt"] = attempt
         summary["retries"] += 1
         summary["stopped"] = "retryable"

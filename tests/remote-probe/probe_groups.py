@@ -2009,7 +2009,9 @@ def group_resilience():
         and summary["stopped"] == "retry_state_not_durable"
         and summary["retries"] == 0
         and "attempt" not in summary
-        and posted >= 1
+        # C2: the reservation is taken BEFORE the send, so a storage that
+        # cannot make it durable must not produce a single request.
+        and posted == 0
         and queue.attempts(1) == 1           # memory rolled back
         # ... and the record is STILL pending: a failed persistence never
         # leaves a terminal (acked/quarantined) state behind, so no poison
@@ -2075,6 +2077,145 @@ def group_resilience():
         os.rmdir(unsafe_target)
     else:
         os.unlink(unsafe_target)
+    clean(root)
+
+    # ---- C1: a FAILED Spool.open() must release its OWN writer lock. The
+    #      failure lands after the lock is taken (a malformed state file), and
+    #      the first object is deliberately kept alive: the second spool takes
+    #      the lock in the SAME process, so this cannot be explained by an
+    #      exiting process having released it.
+    root = temp_dir()
+    directory = os.path.join(root, "spool")
+    real_repair = sp.Spool._repair_tail
+
+    def exploding_repair(self):
+        raise sp.SpoolError("tail repair refused")
+
+    sp.Spool._repair_tail = exploding_repair   # one-shot startup failure
+    first = sp.Spool(directory, clock=lambda: 1700000000.0)
+    refused = False
+    try:
+        first.open()
+    except (sp.SpoolError, OSError):
+        refused = True
+    finally:
+        sp.Spool._repair_tail = real_repair
+    # the first object is NOT deleted and was never usable
+    unusable = False
+    try:
+        first.append("office-sg-isp-a", RUN, 1, pl.encode_sample(_sample(1)),
+                     queued_epoch=1700000000.0)
+    except sp.SpoolError:
+        unusable = True
+    second = None
+    try:
+        second = sp.Spool(directory, clock=lambda: 1700000000.0).open()
+    except (sp.SpoolError, OSError):
+        second = None
+    out["spool_open_failure_releases_writer_lock"] = (
+        refused and unusable and second is not None)
+    if second is not None:
+        second.close()
+    clean(root)
+    # ---- C2: the attempt is hard-reserved BEFORE the send, so a storage that
+    #      cannot persist it produces NO request at all.
+    root = temp_dir()
+    directory = os.path.join(root, "spool")
+    queue = sp.Spool(directory, clock=lambda: 1700000000.0).open()
+    queue.append("office-sg-isp-a", RUN, 1, pl.encode_sample(_sample(1)),
+                 queued_epoch=1700000000.0)
+    first_attempt = queue.note_attempt(1)              # durable N = 1
+    real_save = sp.Spool._save_state
+
+    def refusing_save(self):
+        raise sp.SpoolError("state save refused")
+
+    sp.Spool._save_state = refusing_save
+    try:
+        blocked = FakePoster([(200, b'{"result":"accepted","v":1}')] * 3)
+        summary = dl.deliver_pending(queue, SECRET, "office-sg-isp-a", blocked)
+        sent_while_blocked = len(blocked.requests)
+    finally:
+        sp.Spool._save_state = real_save
+    out["retry_state_failure_prevents_network_send"] = (
+        first_attempt == 1
+        and summary["stopped"] == "retry_state_not_durable"
+        and sent_while_blocked == 0          # poster was NEVER called
+        and len(list(queue.pending())) == 1  # record unchanged
+        and queue.attempts(1) == 1)          # durable attempt remains N
+    queue.close()
+    # (storage recovers) the next pass reserves N+1 and sends exactly once
+    reopened = sp.Spool(directory, clock=lambda: 1700000000.0).open()
+    resumed = FakePoster([(503, b"")])
+    recovered = dl.deliver_pending(reopened, SECRET, "office-sg-isp-a", resumed)
+    out["retry_reservation_then_sends_exactly_once"] = (
+        recovered["attempt"] == 2
+        and len(resumed.requests) == 1
+        and reopened.attempts(1) == 2)
+    reopened.close()
+    clean(root)
+    # ---- C2b: the frozen unknown bound counts REAL sends, and the queue
+    #      advances past the quarantined head.
+    root = temp_dir()
+    directory = os.path.join(root, "spool")
+    queue = sp.Spool(directory, clock=lambda: 1700000000.0).open()
+    queue.append("office-sg-isp-a", RUN, 1, pl.encode_sample(_sample(1)),
+                 queued_epoch=1700000000.0)
+    unknown = FakePoster([(600, b"")] * 30)
+    for _ in range(dl.UNKNOWN_RESPONSE_MAX_ATTEMPTS + 2):
+        if next(iter(queue.pending()), None) is None:
+            break
+        dl.deliver_pending(queue, SECRET, "office-sg-isp-a", unknown)
+    bounded_sends = len(unknown.requests)
+    # the queue ADVANCES past the quarantined head
+    queue.append("office-sg-isp-a", RUN, 2, pl.encode_sample(_sample(2)),
+                 queued_epoch=1700000000.0)
+    after = dl.deliver_pending(queue, SECRET, "office-sg-isp-a",
+                               FakePoster())
+    out["bounded_unknown_counts_real_sends"] = (
+        bounded_sends == dl.UNKNOWN_RESPONSE_MAX_ATTEMPTS
+        and queue.status()["quarantined_total"] == 1
+        and after["acked"] == 1
+        and list(queue.pending()) == [])
+    queue.close()
+    clean(root)
+    # ---- C3: a COMPLETE corrupt record still reserves its record id, so a
+    #      reconciled append can never hand that id out again.
+    root = temp_dir()
+    directory = os.path.join(root, "spool")
+    queue = sp.Spool(directory, clock=lambda: 1700000000.0).open()
+    queue.append("office-sg-isp-a", RUN, 1, pl.encode_sample(_sample(1)),
+                 queued_epoch=1700000000.0)           # durable id = 1
+    queue.close()
+    with open(os.path.join(directory, sp.SPOOL_FILE), "ab") as handle:
+        handle.write(b'{"v":1,"record_id":3,"probe_id":"office-sg-isp-a"'
+                     b',"run":"' + RUN.encode() + b'","seq":3'
+                     b',"queued_epoch":1700000000.0,"body_b64":"!!!!"}\n')
+    reopened = sp.Spool(directory, clock=lambda: 1700000000.0).open()
+    allocated = reopened.append("office-sg-isp-a", RUN, 2,
+                                pl.encode_sample(_sample(2)),
+                                queued_epoch=1700000000.0)
+    out["corrupt_complete_record_reserves_record_id"] = (
+        allocated >= 4 and allocated != 3
+        and reopened.status()["corrupt_total"] == 1)
+    reopened.close()
+    clean(root)
+    # ---- C3b: a corrupt line whose id CANNOT be recovered fails CLOSED --
+    #      no cursor is guessed, and none is allocated from.
+    root = temp_dir()
+    directory = os.path.join(root, "spool")
+    queue = sp.Spool(directory, clock=lambda: 1700000000.0).open()
+    queue.append("office-sg-isp-a", RUN, 1, pl.encode_sample(_sample(1)),
+                 queued_epoch=1700000000.0)
+    queue.close()
+    with open(os.path.join(directory, sp.SPOOL_FILE), "ab") as handle:
+        handle.write(b"this is not a record at all\n")
+    refused = False
+    try:
+        sp.Spool(directory, clock=lambda: 1700000000.0).open()
+    except (sp.SpoolError, OSError):
+        refused = True
+    out["unrecoverable_corrupt_record_fails_closed"] = refused
     clean(root)
 
     return out

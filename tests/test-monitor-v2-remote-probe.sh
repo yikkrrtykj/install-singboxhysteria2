@@ -43,7 +43,7 @@ FAIL=0
 # Measured on the dev host (Windows, Python 3.14) and re-measured on Linux CI:
 # Measured on the dev host (Windows, Python 3.14) and re-measured on Linux CI:
 # Measured on the dev host (Windows, Python 3.14) and re-measured on Linux CI:
-# 233 = S0 static + red-line gates 19 (py_compile of the package + harness, the
+# 239 = S0 static + red-line gates 19 (py_compile of the package + harness, the
 # in-module reuse documentation, the FOUR frozen sha256 pins that prove the
 # audited E4 client/model/diag/README were reused and never forked, the E4
 # file-set check, the unchanged release identity 0.6.1 in both places, History
@@ -51,7 +51,7 @@ FAIL=0
 # modules free of any remote reference, the absent server ingest route, the
 # absent server remote store, and the two CI registrations) + S1 harness 206
 # verdicts across ELEVEN groups plus the harness rc gate. The RESILIENCE group
-# (44 verdicts) pins all three reviewed fix rounds: durable per-record retry state
+# (50 verdicts) pins all three reviewed fix rounds: durable per-record retry state
 # with bounded unknown quarantine and a consumed backoff curve, retention driven
 # by the agent's own open/cycle path, the crash window between the record fsync
 # and the state save, deadline legality (an egress-shaped failure slot),
@@ -74,7 +74,15 @@ FAIL=0
 # attempt and survives a restart as its last durable value, and an unsafe
 # rotation TARGET fails the whole rotation BEFORE any mutation (the queue is
 # open, a safe member sits in a higher slot, and no partial shift may happen).
-EXPECTED_PASS=233
+#
+# The fourth round closes the final storage/retry gaps: a FAILED Spool.open()
+# releases its OWN writer lock and stays closed (the first object is kept
+# alive, so the second spool proves release rather than process exit), the
+# delivery attempt is HARD-RESERVED before the send so a storage that cannot
+# persist it produces no request at all, and a complete corrupt record still
+# RESERVES its record id -- a corrupt line whose id cannot be recovered fails
+# the scan closed instead of guessing a cursor forward.
+EXPECTED_PASS=239
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT

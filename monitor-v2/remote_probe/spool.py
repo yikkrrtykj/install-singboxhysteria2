@@ -273,23 +273,36 @@ class Spool:
             "quarantine": [],
         }
         self._opened = False
+        self._id_ceiling = 0      # highest durable id seen by a scan
 
     # -- lifecycle ----------------------------------------------------------
 
     def open(self):
         """Validate storage, take the writer lock, repair the tail, reconcile
-        ids from the durable records and count unreadable lines once."""
+        ids from the durable records and count unreadable lines once.
+
+        Transaction-like: the object becomes OPEN only when every startup step
+        succeeded. Any failure releases the writer lock and leaves the object
+        closed, so a refusal inside open() cannot hand back a directory that is
+        still held by an object the caller never got to use (the caller's own
+        cleanup cannot cover this, because the failure happens before it has
+        anything to clean up).
+        """
         self._ensure_directory()
         if self._lock_enabled:
             lock = _InstanceLock(os.path.join(self.directory, LOCK_FILE))
             lock.acquire()
             self._instance_lock = lock
-        self._reject_symlinked_record_path()
-        self._load_state()
-        self._repair_tail()
+        try:
+            self._reject_symlinked_record_path()
+            self._load_state()
+            self._repair_tail()
+            self._reconcile_ids()
+            self._count_corrupt_lines()
+        except BaseException:
+            self.close()          # release the writer lock, stay closed
+            raise
         self._opened = True
-        self._reconcile_ids()
-        self._count_corrupt_lines()
         return self
 
     def close(self):
@@ -448,6 +461,22 @@ class Spool:
                     continue
                 record = decode_record(line)
                 if record is None:
+                    # A COMPLETE line whose payload is unusable still occupies
+                    # its record id: the id joins the durable high-water so a
+                    # reconciled append can never hand it out again. An id that
+                    # cannot be recovered fails the scan CLOSED -- guessing one
+                    # would reopen exactly the reuse this prevents.
+                    reserved = recover_record_id(line)
+                    if reserved is None:
+                        raise SpoolError(
+                            "corrupt record without a recoverable id")
+                    if reserved in seen:
+                        raise SpoolError("duplicate record id: %d" % reserved)
+                    if reserved <= last:
+                        raise SpoolError("non-monotonic record id: %d"
+                                         % reserved)
+                    seen.add(reserved)
+                    last = reserved
                     continue
                 record_id = record["record_id"]
                 if record_id in seen:
@@ -458,6 +487,9 @@ class Spool:
                 seen.add(record_id)
                 last = record_id
                 found.append((record_id, record))
+        # The id ceiling covers corrupt-but-recoverable records too, so the
+        # cursor reconciled from it is strictly greater than EVERY durable id.
+        self._id_ceiling = last
         return found
 
     def _reconcile_ids(self):
@@ -465,11 +497,13 @@ class Spool:
         and the state save).
 
         ``next_record_id`` must be strictly greater than every durable record
-        id, so a record fsynced before the cursor was persisted can never have
-        its id handed out a second time.
+        id -- including the ids of corrupt-but-recoverable lines, which are
+        still physically on disk -- so a record fsynced before the cursor was
+        persisted can never have its id handed out a second time.
         """
         records = self._scan_records()
         highest = records[-1][0] if records else 0
+        highest = max(highest, int(self._id_ceiling))
         wanted = highest + 1
         if wanted > int(self._state["next_record_id"]):
             self._state["reconciled_ids"] = int(
@@ -828,3 +862,27 @@ def record_id_unresolved(line, resolved):
         return int(record.get("record_id", 0)) > resolved
     except (ValueError, TypeError, UnicodeDecodeError):
         return True
+
+
+def recover_record_id(line):
+    """Trustworthy ``record_id`` of a corrupt-but-complete line, or None.
+
+    A line whose body (or any other field) is unusable can still name the id
+    it DUPLICABLY occupied. That id is part of the durable high-water: a later
+    reconciled append that reused it would collide with a record that is still
+    physically on disk, so the id is reserved even though the record itself
+    cannot be delivered. When no trustworthy positive integer id can be
+    extracted the caller must FAIL CLOSED -- never guess one, and never keep
+    allocating from a cursor that may already be behind.
+    """
+    try:
+        record = json.loads(line.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(record, dict):
+        return None
+    record_id = record.get("record_id")
+    if type(record_id) is not int or isinstance(record_id, bool) \
+            or record_id < 1:
+        return None
+    return record_id
