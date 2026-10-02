@@ -304,14 +304,6 @@ jobs:
           systemd --version | head -n1
           uname -r
 
-      - name: "PR-6B real Linux filesystem authority and containment (no skipped gates)"
-        run: |
-          getent group sboxweb >/dev/null || sudo groupadd --system sboxweb
-          sudo -n python3 tests/remote-server/linux_groups.py
-
-      - name: "PR-6B real nginx parser validation and invalid-context rejection"
-        run: sudo -n bash tests/test-monitor-v2-remote-proxy.sh
-
       # Runner-boot readiness gate (issue #35 review): the lane split reaches
       # the LIVE/preflight work ~5 min earlier than the old serial matrix,
       # which exposed a deterministic environmental race -- a freshly booted
@@ -528,6 +520,17 @@ jobs:
           else
             echo "systemd-analyze security --offline is NOT supported on this baseline (systemd $(systemd --version | head -n1 | awk '{print $2, $3}')); 'verify' is the enforced hard gate here and the security analysis is informational-only on this runner (documented contract)."
           fi
+
+      # Keep the P6 fixture group after the legacy LIVE fixtures, which own
+      # their own user/group creation. No production/test contract is relaxed.
+      - name: "PR-6B re-frozen common suite and real Linux filesystem authority (no skipped gates)"
+        run: |
+          getent group sboxweb >/dev/null || sudo groupadd --system sboxweb
+          sudo -n bash tests/test-monitor-v2-remote-server.sh
+          sudo -n python3 tests/remote-server/linux_groups.py
+
+      - name: "PR-6B real nginx parser validation and invalid-context rejection"
+        run: sudo -n bash tests/test-monitor-v2-remote-proxy.sh
 
       - name: Compatibility matrix complete (all LIVE + systemd gates green)
         run: "echo 'journal-time + E3 M1/M2/M3/M3-C LIVE systemd + sbox-jr LIVE + sbox-cm/monitor unit validation: all green on ${{ matrix.os }}'"

@@ -4,7 +4,7 @@
 # Deterministic, offline, no Internet / real proxy / real VPS / wall clock.
 # The count is hard-gated:
 #
-# 187 = S0 static + red-line gates 33 (py_compile of the server modules
+# 188 = S0 static + red-line gates 33 (py_compile of the server modules
 #      + harness; the release identity 0.7.0 in both places; History still
 #      schema v5 with its six frozen prune sources and no remote words;
 #      classifier/runtime/presenter carry no remote reference; the ingest
@@ -16,7 +16,7 @@
 #      16 KiB body bound and TLS termination; the deploy tooling never
 #      references the remote store and the History prestate stays an
 #      exact path; the previous release tree has no remote-plane code)
-#      + S1 harness 153 verdicts across TWELVE groups (route/auth/epochs/
+#      + S1 harness 154 verdicts across TWELVE groups (route/auth/epochs/
 #      store/retention/continuity/capacity/concurrency/status/limits/isolation/deploy)
 #      + the harness rc gate
 #      (a crashing harness is itself a gate).
@@ -159,8 +159,8 @@ fi
 
 TOTAL=$((pass + fail))
 printf '== RESULT ==\n'
-printf 'checks: %d passed, %d failed (expected %d)\n' "$pass" "$fail" "187"
-if [ "$fail" -eq 0 ] && [ "$TOTAL" -eq 187 ]; then
+printf 'checks: %d passed, %d failed (expected %d)\n' "$pass" "$fail" "188"
+if [ "$fail" -eq 0 ] && [ "$TOTAL" -eq 188 ]; then
     printf '== PR-6B server ingest suite: GREEN ==\n'
     exit 0
 fi

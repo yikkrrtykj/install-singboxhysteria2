@@ -236,7 +236,11 @@ class RemoteStore:
                     except sqlite3.Error:
                         pass
                 if isinstance(exc, sqlite3.Error):
-                    if getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_FULL:
+                    # Python 3.10 (Ubuntu 22.04) lacks sqlite_errorcode and
+                    # the newer module result constants. Compare only the
+                    # fixed driver FULL message internally; never expose it.
+                    code = getattr(exc, "sqlite_errorcode", None)
+                    if code == 13 or (code is None and str(exc) == "database or disk is full"):
                         raise StorageCapacityError("DB page ceiling") from None
                     raise RemoteStoreError("store transaction failed") from None
                 if isinstance(exc, OSError):

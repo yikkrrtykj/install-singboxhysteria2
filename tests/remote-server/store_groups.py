@@ -304,6 +304,10 @@ def group_capacity():
             and store.status()["sample_count"] == accepted
             and os.path.getsize(store.db_path) <= store.db_budget
             and (store.run_state(h.PROBE,h.RUN) is None or store.run_state(h.PROBE,h.RUN)["max_seq"] == accepted))
+        def legacy_full():
+            with store._transaction():
+                raise sqlite3.OperationalError("database or disk is full")
+        out["pre_311_full_error_is_closed_storage_capacity"] = refused(legacy_full,rs.StorageCapacityError)
         out["frozen_run_and_receipt_count_limits"] = (
             rs.MAX_RUNS_PER_PROBE == 64 and rs.MAX_RUNS_GLOBAL == 4096
             and rs.MAX_RECEIPTS_PER_PROBE == 131072 and rs.MAX_RECEIPTS_GLOBAL == 1048576)
