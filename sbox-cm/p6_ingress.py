@@ -101,7 +101,7 @@ class Ingress:
         return {'address': str(ip), 'port': port, 'firewall': firewall,
                 'url': 'https://' + host + ':' + str(port) + p6.INGEST_PATH}
 
-    def _identity(self):
+    def _metadata(self):
         if not os.path.lexists(self.identity):
             raise Error('E_P6_NOT_PREPARED')
         self.fs._directory(str(self.identity), 0o700, 0)
@@ -118,6 +118,11 @@ class Ingress:
             raise Error('E_P6_BINDING')
         p6.require(p6.HEX32, binding['server_id'])
         p6.require(p6.HEX64, binding['certificate_sha256'])
+        return meta
+
+    def _identity(self):
+        meta = self._metadata()
+        settings, binding = meta['settings'], meta['binding']
         pem = self.read(self.identity / 'server.pem').decode('ascii')
         self.read(self.identity / 'server.key', limit=16384)
         if pem.count('-----BEGIN CERTIFICATE-----') != 1 or 'PRIVATE KEY' in pem or \
@@ -274,7 +279,7 @@ ProtectSystem=strict
 ProtectHome=yes
 ReadWritePaths={self.runtime}
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-CapabilityBoundingSet=CAP_SETUID CAP_SETGID
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_CHOWN
 LimitNOFILE=512
 MemoryMax=128M
 TasksMax=16
@@ -301,9 +306,12 @@ WantedBy=multi-user.target
             if not stat.S_ISDIR(st.st_mode) or (st.st_uid, st.st_gid, stat.S_IMODE(st.st_mode)) != (uid, gid, 0o700):
                 raise Error('E_P6_AUTHORITY')
 
-    def validate(self, meta):
+    def managed_files(self, meta):
         if self.read(self.config) != self.render(meta) or self.read(self.unit, 0o644) != self.render_unit():
             raise Error('E_P6_MANAGED_CHANGED')
+
+    def validate(self, meta):
+        self.managed_files(meta)
         self.runtime_directory()
         version = self.command(['/usr/sbin/nginx', '-v']).stderr.decode('ascii')
         match = re.search(r'nginx/(\d+)\.(\d+)\.(\d+)', version)
@@ -456,7 +464,7 @@ add rule inet {self.table} ingress tcp dport {meta['settings']['port']} accept c
             current = self.firewall_snapshot()
             if current is not None:
                 if journal['fingerprint'] is None:
-                    self.firewall_owned(self._identity())
+                    self.firewall_owned(self._metadata())
                 elif current != journal['fingerprint']:
                     raise Error('E_P6_FIREWALL_CHANGED')
                 self.command(['/usr/sbin/nft', 'delete', 'table', 'inet', self.table])
@@ -532,8 +540,11 @@ add rule inet {self.table} ingress tcp dport {meta['settings']['port']} accept c
 
     def deactivate(self):
         with self.locked():
-            meta = self._identity()
-            self.validate(meta)
+            # Stop remains available when TLS has expired or is compromised.
+            # Verify ownership/configuration; do not require a working cert/key
+            # or a successful nginx -t in order to close the owned ingress.
+            meta = self._metadata()
+            self.managed_files(meta)
             journal = self._journal()
             if journal is None:
                 if self.service_state() != (False, False):

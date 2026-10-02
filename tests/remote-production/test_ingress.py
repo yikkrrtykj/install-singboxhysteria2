@@ -61,6 +61,7 @@ class IngressTests(unittest.TestCase):
         if self.nginx is not None:
             self.nginx.terminate()
             self.nginx.wait(timeout=10)
+            self.nginx.stderr.close()
         runtime = Path(self.runtime)
         if runtime.exists():
             # Checked exact random fixture root, one Python filesystem API.
@@ -303,6 +304,7 @@ class IngressTests(unittest.TestCase):
             self.assertEqual(other.read_bytes(), before)
         finally:
             proc.terminate(); proc.wait(timeout=10)
+            proc.stderr.close()
 
     def test_native_systemd_activate_deactivate_and_failed_activation_rollback(self):
         # Random service, loopback port and temporary certificate/config.
@@ -329,6 +331,17 @@ class IngressTests(unittest.TestCase):
                 self.assertEqual(self.worker.activate()['active'], True)
                 self.assertEqual(self.worker.deactivate(), {'active': False})
                 self.assertEqual(self.worker._identity(), identity)
+            self.assertTrue(self.worker.activate()['active'])
+            key = self.worker.identity / 'server.key'
+            original = key.read_bytes()
+            key.write_bytes(b'compromised / unavailable TLS key\n')
+            self.assertEqual(self.worker.deactivate(), {'active': False})
+            self.assertEqual(self.worker.service_state(), (False, False))
+            key.write_bytes(original)
+        except Exception:
+            sys.stderr.buffer.write(self.worker.command(['/usr/bin/journalctl', '-u', self.service,
+                                    '--no-pager', '-n', '30'], check=False).stdout)
+            raise
         finally:
             self.worker.command(['/usr/bin/systemctl', 'disable', '--now', self.service], check=False)
             self.worker.unit.unlink(missing_ok=True)
@@ -409,6 +422,9 @@ class IngressTests(unittest.TestCase):
         proc = multiprocessing.get_context('fork').Process(target=child)
         try:
             proc.start(); proc.join(60)
+            if proc.exitcode != 0:
+                sys.stderr.buffer.write(self.worker.command(['/usr/bin/journalctl', '-u', self.service,
+                                        '--no-pager', '-n', '30'], check=False).stdout)
             self.assertEqual(proc.exitcode, 0)
         finally:
             if proc.is_alive(): proc.terminate(); proc.join(10)
