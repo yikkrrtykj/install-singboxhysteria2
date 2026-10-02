@@ -385,8 +385,9 @@ truthful until installer review and real client acceptance are complete.
   explicit purge can remove a selected retained profile. Cleanup checks every
   owned object and stays within the verified product directory.
 
-Native CI builds and signs a **scoped test package** with a temporary CurrentUser
-fixture certificate and random fixture service/path. Only the builder's test
+Native CI builds and signs a **scoped test package** with a temporary signing
+certificate (CurrentUser private key, isolated CI LocalMachine public trust;
+both explicitly cleaned) and random fixture service/path. Only the builder's test
 constructor can compile this name; no CLI root/service/publisher override or
 unsigned operational bypass exists. Fixtures remove their own certificate,
 service and state. This evidence is not production signing or real rollout.

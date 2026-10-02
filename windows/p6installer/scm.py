@@ -24,6 +24,11 @@ class Action(ctypes.Structure):
     _fields_ = [('kind', W.DWORD), ('delay', W.DWORD)]
 
 
+class ProcessStatus(ctypes.Structure):
+    _fields_ = [(name, W.DWORD) for name in ('kind', 'state', 'accepted', 'exit',
+                    'specific', 'checkpoint', 'hint', 'pid', 'flags')]
+
+
 class Failure(ctypes.Structure):
     _fields_ = [('reset', W.DWORD), ('reboot', W.LPWSTR), ('command', W.LPWSTR),
                 ('count', W.DWORD), ('actions', ctypes.POINTER(Action))]
@@ -46,6 +51,7 @@ class Service:
             'ChangeServiceConfigW': ([W.HANDLE, W.DWORD, W.DWORD, W.DWORD, W.LPCWSTR,
                 W.LPCWSTR, ctypes.POINTER(W.DWORD), W.LPCWSTR, W.LPCWSTR, W.LPCWSTR, W.LPCWSTR], W.BOOL),
             'QueryServiceStatus': ([W.HANDLE, ctypes.POINTER(Status)], W.BOOL),
+            'QueryServiceStatusEx': ([W.HANDLE, W.DWORD, W.LPVOID, W.DWORD, ctypes.POINTER(W.DWORD)], W.BOOL),
             'ControlService': ([W.HANDLE, W.DWORD, ctypes.POINTER(Status)], W.BOOL),
             'StartServiceW': ([W.HANDLE, W.DWORD, W.LPVOID], W.BOOL),
             'DeleteService': ([W.HANDLE], W.BOOL),
@@ -60,6 +66,9 @@ class Service:
             method = getattr(self.a, name)
             method.argtypes, method.restype = args, result
         self.k.LocalFree.argtypes, self.k.LocalFree.restype = [W.LPVOID], W.LPVOID
+        self.k.OpenProcess.argtypes, self.k.OpenProcess.restype = [W.DWORD, W.BOOL, W.DWORD], W.HANDLE
+        self.k.WaitForSingleObject.argtypes, self.k.WaitForSingleObject.restype = [W.HANDLE, W.DWORD], W.DWORD
+        self.k.CloseHandle.argtypes = [W.HANDLE]
 
     def _check(self, success):
         if not success:
@@ -132,17 +141,28 @@ class Service:
 
     def stop(self, expected):
         manager, service = self._open()
+        process = None
         try:
             if not service:
                 return
             self._config(service, expected)
+            state_ex = ProcessStatus()
+            size = W.DWORD()
+            self._check(self.a.QueryServiceStatusEx(service, 0, ctypes.byref(state_ex), ctypes.sizeof(state_ex), ctypes.byref(size)))
+            if state_ex.pid:
+                process = self.k.OpenProcess(0x100000, False, state_ex.pid)
+                self._check(process)
             current = self._state(service)
             if current != 1:
                 if current != 3:
                     state = Status()
                     self._check(self.a.ControlService(service, 1, ctypes.byref(state)))
                 self._wait(service, 1)
+            if process and self.k.WaitForSingleObject(process, 45000) != 0:
+                raise ConfigError('managed service process did not exit')
         finally:
+            if process:
+                self.k.CloseHandle(process)
             self._close(manager, service)
 
     def configure(self, command, previous=None):

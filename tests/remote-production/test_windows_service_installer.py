@@ -1,6 +1,6 @@
 """Mandatory elevated Windows CI: actual bundled runtime/signatures/SCM.
 
-Only random P6InstallerFixture services/state and a scoped CurrentUser fixture
+Only random P6InstallerFixture services/state and a scoped CI signing fixture
 certificate are touched. This is not a production signer or client rollout.
 """
 import copy
@@ -59,6 +59,7 @@ foreach($m in @('Microsoft.PowerShell.Security','Microsoft.PowerShell.Management
   Import-Module -Name ([IO.Path]::Combine($PSHOME,'Modules',$m,($m+'.psd1'))) -ErrorAction Stop
 }
 $PSModuleAutoloadingPreference='None'
+Write-Output 'fixture: native modules loaded'
 if($Package) {
   $cert=Get-Item -LiteralPath ('Cert:\\CurrentUser\\My\\'+$Thumbprint)
   New-FileCatalog -Path (Join-Path $Package 'payload') -CatalogFilePath (Join-Path $Package 'payload.cat') -CatalogVersion 2.0 | Out-Null
@@ -67,16 +68,23 @@ if($Package) {
     if($signature.Status -ne 'Valid'){throw 'fixture signature failed'}
   }
 } else {
-  $cert=New-SelfSignedCertificate -Type CodeSigningCert -Subject ('CN=P6InstallerFixture-'+[Guid]::NewGuid()) -CertStoreLocation Cert:\\CurrentUser\\My -KeyExportPolicy NonExportable
-  $store=New-Object Security.Cryptography.X509Certificates.X509Store('Root','CurrentUser')
+  $cert=New-SelfSignedCertificate -Type CodeSigningCert -Subject ('CN=P6InstallerFixture-'+[Guid]::NewGuid()) -CertStoreLocation Cert:\\CurrentUser\\My -KeyExportPolicy NonExportable -Provider 'Microsoft Software Key Storage Provider' -KeyAlgorithm RSA -KeyLength 2048
+  Write-Output 'fixture: private signing certificate generated'
+  # CurrentUser Root can display a native trust-confirmation dialog even in
+  # NonInteractive PowerShell. Elevated CI uses the isolated runner's machine
+  # store without that UI; teardown removes exactly this random public cert.
+  $store=New-Object Security.Cryptography.X509Certificates.X509Store('Root','LocalMachine')
   $store.Open('ReadWrite')
   $public=[Security.Cryptography.X509Certificates.X509Certificate2]::new([byte[]]$cert.RawData)
   $store.Add($public);$store.Close()
   Write-Output $cert.Thumbprint
 }
 ''', encoding='utf-8')
-        result = subprocess.run([cls.powershell, '-NoProfile', '-NonInteractive', '-File', str(cls.sign_script)],
-                                capture_output=True, text=True, timeout=60)
+        try:
+            result = subprocess.run([cls.powershell, '-NoProfile', '-NonInteractive', '-File', str(cls.sign_script)],
+                                    capture_output=True, text=True, timeout=60)
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError('fixture certificate setup timed out at: ' + (error.stdout or b'').decode(errors='replace')) from None
         if result.returncode:
             raise RuntimeError('native fixture signing failed: ' + result.stderr)
         cls.publisher = result.stdout.strip().splitlines()[-1]
@@ -115,7 +123,8 @@ foreach($m in @('Microsoft.PowerShell.Security','Microsoft.PowerShell.Management
   Import-Module -Name ([IO.Path]::Combine($PSHOME,'Modules',$m,($m+'.psd1'))) -ErrorAction Stop
 }
 foreach($store in @('Root','My')) {
-  $path='Cert:\\CurrentUser\\'+$store+'\\'+$Thumbprint
+  $scope=if($store -eq 'Root'){'LocalMachine'}else{'CurrentUser'}
+  $path='Cert:\\'+$scope+'\\'+$store+'\\'+$Thumbprint
   if(Test-Path -LiteralPath $path){
     if($store -eq 'My'){Remove-Item -LiteralPath $path -Force -DeleteKey}
     else{Remove-Item -LiteralPath $path -Force}
