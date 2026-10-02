@@ -409,6 +409,7 @@ fi
 mkdir -p "$FIX_SRC"
 cp "$REPO_ROOT/monitor-v2/collector.py" "$FIX_SRC/"
 cp "$REPO_ROOT/monitor-v2/webapp.py" "$FIX_SRC/"
+cp "$REPO_ROOT/monitor-v2/p6_artifact.py" "$FIX_SRC/"
 cp -R "$REPO_ROOT/monitor-v2/web" "$FIX_SRC/web"
 cp -R "$REPO_ROOT/monitor-v2/api_bridge" "$FIX_SRC/api_bridge"
 rm -rf "$FIX_SRC/api_bridge/__pycache__" "$FIX_SRC/web/__pycache__"
@@ -2608,7 +2609,7 @@ if [ "$SYMLINKS_OK" != 1 ]; then
 else
 (
     mkdir -p "$T22/etc/systemd/system" "$T22/src"
-    cp "$REPO_ROOT/monitor-v2/collector.py" "$REPO_ROOT/monitor-v2/webapp.py" "$T22/src/"
+    cp "$REPO_ROOT/monitor-v2/collector.py" "$REPO_ROOT/monitor-v2/webapp.py" "$REPO_ROOT/monitor-v2/p6_artifact.py" "$T22/src/"
     cp -R "$REPO_ROOT/monitor-v2/web" "$REPO_ROOT/monitor-v2/api_bridge" "$T22/src/"
     p6_stage_payload "$T22/src"
     rm -rf "$T22/src/api_bridge/__pycache__" "$T22/src/web/__pycache__"
@@ -2683,7 +2684,7 @@ if [ "$SYMLINKS_OK" != 1 ]; then
 else
 (
     mkdir -p "$T23/etc/systemd/system" "$T23/src"
-    cp "$REPO_ROOT/monitor-v2/collector.py" "$REPO_ROOT/monitor-v2/webapp.py" "$T23/src/"
+    cp "$REPO_ROOT/monitor-v2/collector.py" "$REPO_ROOT/monitor-v2/webapp.py" "$REPO_ROOT/monitor-v2/p6_artifact.py" "$T23/src/"
     cp -R "$REPO_ROOT/monitor-v2/web" "$REPO_ROOT/monitor-v2/api_bridge" "$T23/src/"
     p6_stage_payload "$T23/src"
     rm -rf "$T23/src/api_bridge/__pycache__" "$T23/src/web/__pycache__"
@@ -2760,7 +2761,7 @@ if [ "$SYMLINKS_OK" != 1 ]; then
 else
 (
     mkdir -p "$T24/etc/systemd/system" "$T24/src"
-    cp "$REPO_ROOT/monitor-v2/collector.py" "$REPO_ROOT/monitor-v2/webapp.py" "$T24/src/"
+    cp "$REPO_ROOT/monitor-v2/collector.py" "$REPO_ROOT/monitor-v2/webapp.py" "$REPO_ROOT/monitor-v2/p6_artifact.py" "$T24/src/"
     cp -R "$REPO_ROOT/monitor-v2/web" "$REPO_ROOT/monitor-v2/api_bridge" "$T24/src/"
     p6_stage_payload "$T24/src"
     rm -rf "$T24/src/api_bridge/__pycache__" "$T24/src/web/__pycache__"
@@ -2837,7 +2838,7 @@ if [ "$SYMLINKS_OK" != 1 ]; then
 else
 (
     mkdir -p "$T25/etc/systemd/system" "$T25/src"
-    cp "$REPO_ROOT/monitor-v2/collector.py" "$REPO_ROOT/monitor-v2/webapp.py" "$T25/src/"
+    cp "$REPO_ROOT/monitor-v2/collector.py" "$REPO_ROOT/monitor-v2/webapp.py" "$REPO_ROOT/monitor-v2/p6_artifact.py" "$T25/src/"
     cp -R "$REPO_ROOT/monitor-v2/web" "$REPO_ROOT/monitor-v2/api_bridge" "$T25/src/"
     p6_stage_payload "$T25/src"
     rm -rf "$T25/src/api_bridge/__pycache__" "$T25/src/web/__pycache__"
@@ -2919,7 +2920,7 @@ if [ "$SYMLINKS_OK" != 1 ]; then
 else
 (
     mkdir -p "$T26/etc/systemd/system" "$T26/src"
-    cp "$REPO_ROOT/monitor-v2/collector.py" "$REPO_ROOT/monitor-v2/webapp.py" "$T26/src/"
+    cp "$REPO_ROOT/monitor-v2/collector.py" "$REPO_ROOT/monitor-v2/webapp.py" "$REPO_ROOT/monitor-v2/p6_artifact.py" "$T26/src/"
     cp -R "$REPO_ROOT/monitor-v2/web" "$REPO_ROOT/monitor-v2/api_bridge" "$T26/src/"
     p6_stage_payload "$T26/src"
     rm -rf "$T26/src/api_bridge/__pycache__" "$T26/src/web/__pycache__"
@@ -3006,7 +3007,7 @@ if [ "$SYMLINKS_OK" != 1 ]; then
 else
 (
     mkdir -p "$T27/etc/systemd/system" "$T27/src"
-    cp "$REPO_ROOT/monitor-v2/collector.py" "$REPO_ROOT/monitor-v2/webapp.py" "$T27/src/"
+    cp "$REPO_ROOT/monitor-v2/collector.py" "$REPO_ROOT/monitor-v2/webapp.py" "$REPO_ROOT/monitor-v2/p6_artifact.py" "$T27/src/"
     cp -R "$REPO_ROOT/monitor-v2/web" "$REPO_ROOT/monitor-v2/api_bridge" "$T27/src/"
     p6_stage_payload "$T27/src"
     rm -rf "$T27/src/api_bridge/__pycache__" "$T27/src/web/__pycache__"
@@ -3274,7 +3275,7 @@ prestate_fixture_run() { # <tag> <fail-reader 0|1> [pre-boot-fail 0|1] [demote 0
     local CALLS="$TMP/$tag-calls.log" BOOT="$TMP/$tag-boot.log"
     local LOG="$TMP/out-$tag-upgrade.log"
     mkdir -p "$F/etc/systemd/system" "$F/bin" "$SRC" || return 1
-    cp "$REPO_ROOT/monitor-v2/collector.py" "$REPO_ROOT/monitor-v2/webapp.py" "$SRC/" || return 1
+    cp "$REPO_ROOT/monitor-v2/collector.py" "$REPO_ROOT/monitor-v2/webapp.py" "$REPO_ROOT/monitor-v2/p6_artifact.py" "$SRC/" || return 1
     cp -R "$REPO_ROOT/monitor-v2/web" "$REPO_ROOT/monitor-v2/api_bridge" "$SRC/" || return 1
     p6_stage_payload "$SRC" || return 1
     rm -rf "$SRC/api_bridge/__pycache__" "$SRC/web/__pycache__"

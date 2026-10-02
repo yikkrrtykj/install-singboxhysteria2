@@ -239,10 +239,77 @@ TLS nginx. Native /proc CPU/RSS, outcomes and concurrent session-route latency
 are emitted as a reproducible `P6_INGRESS_LOAD_RECEIPT`. This verifies server
 fixture containment/responsiveness, not real Windows/Clash/TUN measurements.
 
+## Fourth slice: sensitive Client Bundle and Download UI
+
+The Client page keeps the existing YAML Download intact and adds a separate
+Devices / Bundle panel for named Clients. Enroll each device independently;
+only an active, live-confirmed enrollment offers Download Client Bundle.
+Stored confirmation describes enrollment/revocation, not current probe health.
+Revocation requires step-up and a fresh live proof. Pending enrollment offers
+Verify again after a page reload: `probe.resume` recovers only the existing
+current-generation record/key/labels, never creates or resurrects an identity.
+An uncertain in-page enrollment retains its exact key for explicit retry;
+the browser stores neither this intent nor credential material persistently.
+
+The five POST-only routes are `/api/v1/clients/probes/{list,enroll,revoke,resume}`
+and `/api/v1/clients/bundle`. All require session, same-origin and CSRF checks;
+all except the metadata list additionally require the existing password step-up.
+They also require the fresh management gate. Browser-selected generation,
+endpoint, paths, certificate and keys are refused. Errors and lifecycle JSON
+contain only closed metadata; arbitrary helper fields are never forwarded.
+
+`client.bundle` and `probe.resume` bring the fixed RPC surface to twelve ops.
+The existing 64-KiB frame limit is unchanged. The root worker holds the canonical
+Client lock while deriving the current credential generation and rendering
+the canonical Mihomo YAML. Under the provisioning lock it verifies current
+binding, owned registry row, original key and live HMAC authentication before
+returning bounded typed parts. Export changes no enrollment state, does not
+repair missing keys and never rotates them. Both new ops bypass daemon replay;
+every delivery requires a durable secret-free audit before parts reach stdout.
+The key/YAML travel only through memory and pipes, never argv/env/audit/cache.
+
+Generic source is independently built into a deterministic `.pyz` containing
+the reviewed Agent modules and the unchanged Mihomo client/model. The installed
+public artifact is `/usr/local/lib/sbox-cm/p6-artifact/{p6-agent.pyz,artifact.json}`:
+real root-owned ancestors, root:root 0755 directory, no-follow/same-object
+root:root 0644 single-link files, maximum 4 MiB, version derived from SHA-256.
+Both helper and web revalidate the artifact. A mismatched two-file upgrade
+refuses export. The digest authenticates this protected installed build; it
+does not claim publisher signing for a Windows executable.
+
+After auth and artifact checks, the web assembles one transient ZIP response
+from typed parts plus generic bytes; no large binary crosses RPC and no ZIP is
+persisted on the server. YAML is capped at 32 KiB, the full serialized worker
+response at 64512 bytes, the ZIP at 5 MiB, active downloads at two, and response
+writes at a ten-second socket timeout. Capacity failures refuse rather than
+truncate. The root manifest and web generic hash must match during upgrades.
+The download has no-store, nosniff and fixed safe filenames. Browser delivery
+uses a Blob only, then releases its object URL and temporary anchor.
+
+Each ZIP contains exactly the canonical `<client>-mihomo.yaml`, `profile.json`,
+separate `ingest.key`, public `server.pem`, `agent/p6-agent.pyz`,
+`agent/artifact.json`, `bundle.json` and `README.txt`. No server private TLS key,
+other device key, controller credential or prebuilt credential cache is added.
+Repeated download of an unchanged enrollment/build has identical bytes.
+
+**This slice supplies a source foundation, not a Windows one-click installer.**
+The generic zipapp requires Python 3.10+. The page and README say Windows setup
+is unavailable. They do not imply successful service installation or rollout.
+The generated profile uses canonical Reality/Hysteria2 node names and loopback
+controller defaults; later Windows installation must validate the actual
+controller/credentials/nodes before enabling this profile. Server packaging
+remains independent of client-only Mihomo imports. Signed Windows packaging,
+installer/uninstaller and real host acceptance remain mandatory before P6B2
+completion. No production listener/service activation is performed here.
+
+Acceptance uses eleven portable real-artifact/profile-import cases, twenty
+native root worker/RPC/HTTP/audit/recovery cases, and thirteen new shipped-JS
+UI cases (103 total, including the previous 90). Existing cross-platform and
+native provisioning CI entrypoints run the corresponding bundle suite as a
+second explicit process and retain separate original test counts.
+
 ## Following slices — still required
 
-- step-up/no-store/audited bundle download, immutable digest-verified generic
-  artifacts, credentials excluded from replay/audit/cache/log/DOM;
 - actual VPS host/firewall/cloud-policy reachability acceptance and explicit
   replacement/retrusted-bundle operator workflow for IP/expiry/compromise;
 - local controller discovery/explicit binding and credential setup, signed

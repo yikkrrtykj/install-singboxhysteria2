@@ -169,6 +169,29 @@ class BundleLinuxTests(unittest.TestCase):
         self.assertEqual(Path(self.worker.state_path).read_bytes(), before)
         self.assertEqual(len([r for r in self.audit() if r['op'] == 'client.bundle']), 2)
 
+    def test_http_enroll_and_revoke_use_real_worker_and_closed_metadata(self):
+        status, _, raw = self.http('/api/v1/clients/probes/enroll',
+            {'name': 'event-pc', 'device': 'laptop-02', 'site_label': 'office', 'path_label': 'operator-path'},
+            headers={'Idempotency-Key': 'http-enrollment-000002'})
+        self.assertEqual(status, 200, raw)
+        row = self.row('laptop-02')
+        self.assertTrue(fixtures.p6.live_proof(self.worker.port, row, True))
+        self.assertNotIn(row['secret'].encode(), raw)
+        status, _, raw = self.http('/api/v1/clients/probes/revoke', {'name': 'event-pc', 'device': 'laptop-02'})
+        self.assertEqual(status, 200, raw)
+        self.assertTrue(json.loads(raw)['data']['revoked'])
+        self.assertTrue(fixtures.p6.live_proof(self.worker.port, row, False))
+        self.assertTrue(fixtures.p6.live_proof(self.worker.port, self.row(), True))
+
+    def test_changed_server_binding_refuses_delivery_without_rotation(self):
+        original = self.row().copy()
+        self.binding['server_id'] = 'd' * 32
+        self.write_binding()
+        status, _, raw = self.http()
+        self.assertEqual(status, 409, raw)
+        self.assertNotIn(original['secret'].encode(), raw)
+        self.assertEqual(self.row(), original)
+
     def test_auth_csrf_stepup_and_origin_refuse_before_artifact_or_rpc(self):
         with patch.object(self.app, 'bundle_artifact', side_effect=AssertionError('unauthorized artifact read')):
             for expected, kwargs in ((401, {'auth': False}), (403, {'csrf': False}),

@@ -2176,7 +2176,7 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         public.update(desired=row['desired'], verified=row['verified'], verified_epoch=epoch, ingest_url=endpoint)
         return public
 
-    def _handle_p6_request(self, session, actor, op):
+    def _handle_p6_request(self, session, op, actor):
         body = self._json_body()
         keys = {'name', 'device'} if op in ('probe.revoke', 'probe.resume', 'client.bundle') else \
                {'name', 'device', 'site_label', 'path_label'} if op == 'probe.enroll' else {'name'}
