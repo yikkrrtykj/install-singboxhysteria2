@@ -72,7 +72,7 @@ class WindowsSecurity:
                 break
             current = parent
 
-    def _descriptor(self, handle):
+    def _descriptor(self, handle, object_type=1):
         """Compare canonical native SIDs, not OS-dependent SDDL aliases.
 
         Windows Server renders a fixture's local Administrator SID as LA;
@@ -81,7 +81,7 @@ class WindowsSecurity:
         descriptor = W.LPVOID()
         owner = W.LPVOID()
         dacl = W.LPVOID()
-        code = self.a.GetSecurityInfo(handle, 1, 1 | 4, ctypes.byref(owner), None,
+        code = self.a.GetSecurityInfo(handle, object_type, 1 | 4, ctypes.byref(owner), None,
                                       ctypes.byref(dacl), None,
                                       ctypes.byref(descriptor))
         if code:
@@ -126,6 +126,13 @@ class WindowsSecurity:
             raise StorageSecurityError("file attributes unavailable")
         if attrs[0] & 0x400 or bool(attrs[0] & 0x10) != bool(directory):
             raise StorageSecurityError("unsafe storage object")
+        class Standard(ctypes.Structure):
+            _fields_ = [('allocation', ctypes.c_longlong), ('length', ctypes.c_longlong),
+                        ('links', W.DWORD), ('deleting', W.BYTE), ('directory', W.BYTE)]
+        standard = Standard()
+        if not self.k.GetFileInformationByHandleEx(handle, 1, ctypes.byref(standard), ctypes.sizeof(standard)) \
+                or standard.deleting or (not directory and standard.links != 1):
+            raise StorageSecurityError("linked/deleting storage object refused")
         owner, entries = self._descriptor(handle)
         if owner not in self.allowed:
             raise StorageSecurityError("unsafe storage owner")

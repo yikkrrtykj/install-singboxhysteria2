@@ -326,3 +326,70 @@ test or independent review pass. Monitor stays 0.7.0 in this slice. History,
 classifier, P5 response shapes and completed P6B storage semantics are unchanged.
 P6B2 implementation is incomplete; merge, production deployment, public
 activation, real client rollout, P6C and P6D are not authorized.
+## Windows installer / uninstaller checkpoint
+
+Bundle / Download UI received human independent PASS at
+`4e1ad2a89311f8326165ddf926929a525928cffc`. This slice stays on Draft PR #70;
+no release bump, production deployment, public ingress or P6C/P6D is authorized.
+
+The Windows release is a **generic, separate** package, not another per-client
+executable or a larger privileged export. The sensitive eight-member Client
+Bundle and canonical YAML stay unchanged. Existing source Bundle UI remains
+truthful until installer review and real client acceptance are complete.
+
+- Build with `tools/build-p6-windows.py` using the fixed
+  [CPython 3.13.16 x64 embeddable archive](https://www.python.org/downloads/release/python-31316/)
+  (SHA-256 `97dae5274cc54867065e8d5a3226e48c35017ed332a0fdb0e27d5b5821961297`).
+  No pip, system Python, user-site or environment import dependency. The
+  explicit `_pth` admits only bundled stdlib/runtime/Agent/installer.
+- This builder emits **unsigned staging**, not a publishable release. Supply
+  an actual publisher certificate thumbprint, then use `windows/Sign-Package.ps1`
+  on the signing host. It requires private key in the certificate store,
+  SHA-256 signatures and timestamp verification. The operator currently has no
+  production certificate; production signing remains a release blocker.
+- Both signed `Setup.ps1` and signed payload catalog must validate under native
+  Windows trust and the exact compiled publisher thumbprint. The catalog checks
+  all payload files; per-file hashes/size/release digest and ACL checks repeat
+  after protected copying. No unsigned mode, downloaded runtime at installation,
+  trust-on-first-use or machine-wide server certificate installation.
+  [Microsoft catalog validation](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.security/test-filecatalog)
+  and [Authenticode signing](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.security/set-authenticodesignature)
+  are separate checks; SHA-256 alone is not publisher authentication.
+- Run the signed setup elevated on Windows 10/11 x64. `install` stages the
+  runtime under native ProgramData/P6RemoteProbe, configures LocalSystem SCM
+  auto-start with protected service ACL and three delayed failure restarts,
+  then NONE until the one-day reset. Service has no interactive UI.
+- `install -Bundle <zip>` or subsequent `import -Bundle <zip>` validates the
+  exact bounded members without extracting/executing bundle code. It verifies
+  actual loopback `/version` and `/proxies`, explicit configured nodes/group,
+  and controller authentication before enabling. Import YAML into the existing
+  Clash client separately; the installer never changes/restarts Mihomo.
+- For authenticated local controller, supply `-ControllerKeyFile` naming an
+  already native-protected credential file. The value is never an argument,
+  URL, environment variable or diagnostic. Controller and P6 credentials are
+  separate; local credential is published atomically with a new profile.
+- `pause/resume/remove/purge -Profile <64-character profile id>` acts on exactly
+  that profile. Operations serialize, drain the verified managed service and
+  acquire its runtime lease. Resume revalidates the current controller. Remove
+  archives disabled config/secret/spool; it does **not** imply server revocation.
+  Revoke server probe separately through Monitor. Purge is explicit destruction
+  of selected retired state. Live + retained profile capacity is eight.
+- Reinstall retains identity, secrets, local credentials, control state and
+  pending spool. Durable old/new release intent permits recovery; explicit
+  `rollback` recovers the previous signed release after failed startup. A
+  mismatched/foreign service or unsafe protected object fails closed.
+- `uninstall` requires zero live profiles, deletes only the managed SCM service
+  and generic installed binaries, and preserves retired state. Subsequent
+  explicit purge can remove a selected retained profile. Cleanup checks every
+  owned object and stays within the verified product directory.
+
+Native CI builds and signs a **scoped test package** with a temporary CurrentUser
+fixture certificate and random fixture service/path. Only the builder's test
+constructor can compile this name; no CLI root/service/publisher override or
+unsigned operational bypass exists. Fixtures remove their own certificate,
+service and state. This evidence is not production signing or real rollout.
+
+Remaining whole-P6B2 requirements: production signing certificate/release,
+friendly final bundle/setup distribution integration, actual Windows 10/11 +
+Clash/TUN + VPS install/offline replay/reboot/routing/resource acceptance. Draft
+installer implementation/CI cannot claim any of these as PASS.

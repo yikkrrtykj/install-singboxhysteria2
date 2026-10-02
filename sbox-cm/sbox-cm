@@ -15,9 +15,9 @@ including the read-only ones -- is dispatched to the root transaction worker
 generation, commit_server_config and the privileged audit. There is exactly ONE
 transaction engine in the system and it is not here.
 
-The ONLY sanctioned exception (E3 M4): a `client.export` RESULT is an opaque
-response body that may carry credential material inside data.content (the
-rendered Mihomo YAML). The daemon forwards it to the authorized caller without
+Sanctioned sensitive responses: `client.export` carries rendered Mihomo YAML;
+`client.bundle` carries bounded credential-bearing typed bundle parts. The
+daemon forwards these opaque results to the authorized caller without
 logging, parsing or caching it -- responses of SENSITIVE_RESPONSE_OPS never
 enter the replay cache -- and it never appears in any daemon audit record.
 

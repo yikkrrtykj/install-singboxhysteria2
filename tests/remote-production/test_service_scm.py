@@ -67,4 +67,7 @@ class ActualServiceTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    result = unittest.main(verbosity=2, exit=False).result
+    if not result.wasSuccessful():
+        raise SystemExit(1)
+    raise SystemExit(subprocess.call([sys.executable, str(ROOT / 'tests/remote-production/test_windows_service_installer.py')]))

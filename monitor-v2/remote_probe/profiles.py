@@ -173,9 +173,13 @@ class ProfileVault:
                            ingest_secret_file=os.path.join(directory, "ingest.key"),
                            **manifest["agent"])
 
-    def import_profile(self, manifest, secret, certificate):
+    def import_profile(self, manifest, secret, certificate, controller_secret=None):
         if type(secret) is not bytes or len(secret) != 32:
             raise ConfigError("independent 256-bit secret required")
+        if controller_secret is not None and (type(controller_secret) is not str
+                or len(controller_secret.encode('utf-8')) > 4096
+                or any(ord(c) < 32 or ord(c) == 127 for c in controller_secret)):
+            raise ConfigError("invalid local controller credential")
         key = self._validate(manifest, certificate)
         lock = self._lock()
         stage = None
@@ -186,6 +190,11 @@ class ProfileVault:
                 import hmac
                 if existing != manifest or not hmac.compare_digest(self.read_secret(key), secret) or self.read_certificate(key) != certificate:
                     raise ConfigError("identity change requires explicit replacement")
+                if controller_secret is not None:
+                    path = os.path.join(target, 'mihomo.key')
+                    original = self.security.read(path, 4096).decode('utf-8') if os.path.lexists(path) else ''
+                    if not hmac.compare_digest(original.encode('utf-8'), controller_secret.encode('utf-8')):
+                        raise ConfigError("local controller credential change requires explicit replacement")
                 return key, False
             # Staging left by a crash is never activated and cannot evade capacity.
             slots = sum(1 for name in os.listdir(self.root) if re.fullmatch(r"[0-9a-f]{64}", name) or name.startswith(".enroll-"))
@@ -197,6 +206,8 @@ class ProfileVault:
             self._write(stage, "ingest.key", secret.hex().encode("ascii") + b"\n")
             self._write(stage, "server.pem", certificate.encode("ascii"))
             self._write(stage, "control.json", canonical({"enabled": True}))
+            if controller_secret:
+                self._write(stage, "mihomo.key", controller_secret.encode('utf-8'))
             self.security.mkdir(os.path.join(stage, "spool"))
             durable_replace(stage, target)
             stage = None
