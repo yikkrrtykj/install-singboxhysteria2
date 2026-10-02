@@ -686,6 +686,20 @@ sbmon_stage_release() { # sbmon_stage_release <version> -> prints release id on 
     cp -R -- "$SBMON_REPO_MONITOR_DIR/web" "$staged/app/monitor-v2/web"
     rm -rf -- "$staged/app/monitor-v2/web/__pycache__"
 
+    # PR-6B: remote_probe/ is unconditional webapp startup payload --
+    # same discipline as diagnostics (manifest, file-by-file,
+    # fail-closed).
+    mkdir -p "$staged/app/monitor-v2/remote_probe"
+    local pf
+    for pf in "${REMOTE_PROBE_MODULE_FILES[@]}"; do
+        [ -f "$SBMON_REPO_MONITOR_DIR/remote_probe/$pf" ] \
+            || sbmon_die "missing remote_probe module $pf: webapp runtime requirement, fail-closed"
+        cp -- "$SBMON_REPO_MONITOR_DIR/remote_probe/$pf" \
+            "$staged/app/monitor-v2/remote_probe/$pf" \
+            || sbmon_die "remote_probe module $pf copy failed: fail-closed"
+    done
+    rm -rf -- "$staged/app/monitor-v2/remote_probe/__pycache__"
+
     # PR-3B: diagnostics/ (probe engine + scheduler) is UNCONDITIONALLY
     # required by the staged runtime tree: every manifest file must exist in
     # the source tree, and the staged set must come back EXACTLY. A missing
@@ -982,6 +996,15 @@ SBOXJR_MODULE_FILES=(__init__.py codes.py cursor.py journal_time.py
 # gate in tests/test-monitor-v2-probe-ingest.sh.
 DIAGNOSTICS_MODULE_FILES=(__init__.py network_probes.py probe_scheduler.py)
 DIAGNOSTICS_REL="app/monitor-v2/diagnostics"
+
+# PR-6B (#67): the remote-probe plane is part of the MONITOR runtime --
+# webapp.py wires the ingest plane at startup, so a release that cannot
+# carry remote_probe/ must not be staged at all. Frozen explicit
+# manifest, staged file by file and NEVER 'cp -R remote_probe': a new
+# source file reaches production only by being named here AND by the
+# static gates in tests/test-monitor-v2-remote-server.sh.
+REMOTE_PROBE_MODULE_FILES=(__init__.py __main__.py agent.py delivery.py
+    direct_probe.py evidence.py mihomo_probe.py payload.py spool.py)
 
 # EXACT-set audit of a staged/persisted diagnostics tree: missing OR
 # unexpected entries both fail closed (the same manifest discipline the reader

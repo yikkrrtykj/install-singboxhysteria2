@@ -52,10 +52,13 @@ ih_outcome_store_unavailable = ih_outcomes.OUTCOME_STORE_UNAVAILABLE
 ih_outcome_rejected = ih_outcomes.OUTCOME_REJECTED
 ih_outcome_rearmed = ih_outcomes.OUTCOME_REARMED
 ih_outcome_recorded = ih_outcomes.OUTCOME_RECORDED
+from web.remote_ingest import (INGEST_HEADERS, INGEST_MAX_BODY,
+                               ERR_BAD_FRAMING, ERR_PAYLOAD_TOO_LARGE,
+                               ERR_CONTENT_TYPE, REMOTE_INGEST_PATH)
 from web.recovery import (RECOVERY_SUCCESS_MESSAGE, RecoveryGlobalGuard,
                           RecoveryRateLimiter, generate_key)
 
-MONITOR_WEB_VERSION = "0.6.1"
+MONITOR_WEB_VERSION = "0.7.0"
 SESSION_COOKIE = "monitor_session"
 MAX_BODY_BYTES = 65536
 SUPPORTED_METHODS = "GET, POST"
@@ -452,7 +455,7 @@ class MonitorWebApp:
                  remote_mode=False, version=MONITOR_WEB_VERSION,
                  recovery_guard=None, management_active=None, e3_broker=None,
                  incident_history=None, probe_scheduler=None,
-                 incident_scanner=None):
+                 incident_scanner=None, remote_plane=None):
         self.broker = broker
         self.access = access
         self.auth = auth
@@ -471,6 +474,10 @@ class MonitorWebApp:
         # incident lifecycle -- no incident rows, no evidence bits, no
         # window coordinates beyond the one bounded epoch.
         self.incident_scanner = incident_scanner
+        # Issue #67 PR-6B: the machine ingest plane is OPTIONAL. None
+        # (standalone harnesses) keeps the exact ingest route a plain 404;
+        # a wired plane answers only after framing -> whitelist -> HMAC.
+        self.remote_plane = remote_plane
         self.recovery_limiter = RecoveryRateLimiter()
         self.recovery_guard = recovery_guard or RecoveryGlobalGuard()
         # ``management_active`` is an ORTHOGONAL boolean to ``monitor_running``
@@ -885,6 +892,15 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
 
     def _route_post(self, path, remote):
         # Body framing was already validated in _route() before every gate.
+        # Issue #67 PR-6B: the EXACT machine-ingest route dispatches here,
+        # after the global POST framing gate and the source whitelist
+        # (both already ran in _route()) but BEFORE the browser
+        # _cross_origin / session / CSRF spine. This is the only POST
+        # route with the machine-auth exception; the recovery flow stays
+        # the single WHITELIST exception.
+        if path == REMOTE_INGEST_PATH:
+            self._handle_remote_ingest(remote)
+            return
         if self._cross_origin():
             self._send_json(403, {"error": "cross-origin request rejected"})
             return
@@ -959,6 +975,69 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             self._method_not_allowed(allowed="GET")
             return
         self._send_json(404, {"error": "not found"})
+
+    # -- machine ingest (issue #67 PR-6B) ---------------------------------------
+
+    def _ingest_framing_error(self):
+        """Route-specific framing beyond the global POST gate.
+
+        The global gate already refused Transfer-Encoding/chunked and the
+        64 KiB ceiling. The ingest route additionally requires an EXPLICIT
+        Content-Length of 1..16 KiB (checked before anything is read or
+        parsed) and exactly the ``application/json`` content type.
+        """
+        if self.request_version != "HTTP/1.1":
+            return 400, ERR_BAD_FRAMING
+        raw = self.headers.get("Content-Length")
+        if raw is None:
+            return 400, ERR_BAD_FRAMING
+        try:
+            length = int(raw)
+        except (TypeError, ValueError):
+            return 400, ERR_BAD_FRAMING
+        if length <= 0 or length > INGEST_MAX_BODY:
+            return 413, ERR_PAYLOAD_TOO_LARGE
+        content_type = (self.headers.get("Content-Type") or "").strip().lower()
+        if content_type != "application/json":
+            return 400, ERR_CONTENT_TYPE
+        return None
+
+    def _ingest_headers(self):
+        """The five exact wire headers as plain strings (missing -> None;
+        the plane treats every malformed value as an authentication
+        failure). No header value is ever logged or echoed."""
+        return {name: self.headers.get(name) for name in INGEST_HEADERS}
+
+    def _handle_remote_ingest(self, remote):
+        """POST /api/v1/remote-probes/ingest -- machine authentication.
+
+        Reached ONLY through the exact-path dispatch at the top of
+        ``_route_post`` (after framing + whitelist, before _cross_origin/
+        session/CSRF). The plane is optional: an app without one -- or with
+        a DARK (not_configured) registry -- answers the same plain 404 as
+        any other unknown path, so an unconfigured Monitor gains no
+        surface. Every plane outcome is a closed status; the raw body is
+        hashed, never logged, and never echoed.
+        """
+        plane = getattr(self.app, "remote_plane", None)
+        if plane is None or not plane.configured():
+            self._send_json(404, {"error": "not found"})
+            return
+        error = self._ingest_framing_error()
+        if error is not None:
+            if error[0] == 413:
+                self.close_connection = True   # body length untrusted
+            self._send_json(error[0], {"error": error[1]})
+            return
+        length = self._body_length()
+        try:
+            raw = self.rfile.read(length) if length > 0 else b""
+        except OSError:
+            self.close_connection = True
+            return
+        self._consumed = length       # exactly the declared bytes were read
+        status, payload, extra = plane.handle(raw, self._ingest_headers())
+        self._send_json(status, payload, extra_headers=extra)
 
     # -- gates -----------------------------------------------------------------
 

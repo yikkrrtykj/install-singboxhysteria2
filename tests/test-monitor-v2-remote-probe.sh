@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Monitor 0.6.1 -- P6A dark office remote-probe agent suite (issue #67 PR-6A).
+# Monitor 0.7.0 -- P6A dark office remote-probe agent suite (issue #67 PR-6A).
 #
 # PR-6A ships the office-side agent DARK: new namespace monitor-v2/remote_probe/,
 # no server ingest route, no server database, no History/classifier/UI/deploy
@@ -27,7 +27,7 @@
 #   3. THE RED LINES HOLD. No server ingest route, no remote database, History
 #      still schema v5 on the eleven-table shape with its six prune sources, no
 #      remote reference in the classifier / incident runtime / presenter, and
-#      the release identity is unchanged at 0.6.1.
+#      the release identity moved to 0.7.0 with PR-6B (which owns the bump).
 #   4. THE LANE IS WIRED. A suite nobody runs cannot fail.
 #
 # Deterministic by construction: no Internet, no real Mihomo, no VPS, no
@@ -46,7 +46,7 @@ FAIL=0
 # 250 = S0 static + red-line gates 19 (py_compile of the package + harness, the
 # in-module reuse documentation, the FOUR frozen sha256 pins that prove the
 # audited E4 client/model/diag/README were reused and never forked, the E4
-# file-set check, the unchanged release identity 0.6.1 in both places, History
+# file-set check, the release identity 0.7.0 in both places, History
 # still v5 with its six prune sources and no remote table, the three P4/P5
 # modules free of any remote reference, the absent server ingest route, the
 # absent server remote store, and the two CI registrations) + S1 harness 206
@@ -105,7 +105,7 @@ FAIL=0
 # not delete), and pending() reads the blocker from the scan it just ran, so
 # corruption that appears after a clean scan holds the queue on the very first
 # call that discovers it.
-EXPECTED_PASS=250
+EXPECTED_PASS=251
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
@@ -190,10 +190,10 @@ assert_eq "README.md __init__.py client.py diag.py fixtures model.py" \
     "the E4 adapter directory has exactly its original source file set"
 
 # (3) Red lines.
-assert_eq "0.6.1" "$(tr -d '[:space:]' < "$ROOT/monitor-v2/VERSION")" \
-    "VERSION is unchanged at 0.6.1 (PR-6A does not bump the release)"
-assert_eq "1" "$(grep -c 'MONITOR_WEB_VERSION = "0.6.1"' "$SERVER_PY")" \
-    "MONITOR_WEB_VERSION is unchanged at 0.6.1"
+assert_eq "0.7.0" "$(tr -d '[:space:]' < "$ROOT/monitor-v2/VERSION")" \
+    "VERSION is 0.7.0 (PR-6B owns the release bump)"
+assert_eq "1" "$(grep -c 'MONITOR_WEB_VERSION = "0.7.0"' "$SERVER_PY")" \
+    "MONITOR_WEB_VERSION is 0.7.0"
 assert_eq "1" "$(grep -c '^SCHEMA_VERSION = 5$' "$HIST_PY")" \
     "History is still schema v5 (no P6 migration)"
 if [ "$(grep -A 8 '^_PRUNE_SOURCES = (' "$HIST_PY" | grep -c '^    (\"')" = "6" ] \
@@ -214,10 +214,21 @@ for module in incident_classifier incident_runtime incident_presenter; do
         pass "$module.py carries no remote reference"
     fi
 done
-if grep -rq 'remote-probes' "$ROOT/monitor-v2/web" "$WEBAPP" 2>/dev/null; then
-    fail "a server ingest route for /api/v1/remote-probes exists"
+# PR-6B owns the machine ingest route and its plane: exactly the four
+# frozen web files may name the remote surface, the PR-6C incident
+# read route still must not exist anywhere, and webapp.py wires only
+# the optional plane (no route logic of its own).
+ROUTE_HITS="$(grep -rl 'remote-probes' "$ROOT/monitor-v2/web" "$WEBAPP" 2>/dev/null | grep -v __pycache__ | xargs -n1 basename 2>/dev/null | sort | tr '
+' ' ')"
+if grep -rq 'incidents/<incident_id>/remote-probes' "$ROOT/monitor-v2/web" 2>/dev/null; then
+    fail "the PR-6C incident remote-probes read route exists"
 else
-    pass "no server ingest route exists (PR-6A is dark)"
+    pass "no incident remote-probes read route exists (PR-6C stays out)"
+fi
+if [ "$ROUTE_HITS" = "remote_registry.py remote_store.py server.py " ]; then
+    pass "server remote surface is exactly the frozen PR-6B web file set"
+else
+    fail "unexpected server remote surface: $ROUTE_HITS"
 fi
 if [ -n "$(find "$ROOT/monitor-v2" -name 'remote-probes.sqlite3' 2>/dev/null)" ]; then
     fail "a server-side remote store was created"

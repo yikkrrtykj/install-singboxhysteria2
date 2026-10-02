@@ -40,6 +40,7 @@ from web.broker import SnapshotBroker  # noqa: E402
 from web.e3_broker import E3Broker  # noqa: E402
 from web.e3rpc import E3RpcClient  # noqa: E402
 from web.incident_history import IncidentHistory  # noqa: E402
+from web.remote_ingest import RemoteIngest  # noqa: E402
 from web.incident_runtime import IncidentScanner  # noqa: E402
 from web.recovery import generate_key  # noqa: E402
 from web.server import (MONITOR_WEB_VERSION, MonitorWebApp,  # noqa: E402
@@ -288,6 +289,13 @@ def cmd_serve(args):
     probes.start()
     scanner.start()
 
+    # Issue #67 PR-6B: the remote-probe ingest plane is OPTIONAL and
+    # fail-closed. It loads only operator-supplied config; with no config
+    # file it stays dark (the ingest route answers a plain 404) and with
+    # a malformed one it degrades only itself. Every failure here is
+    # contained: Monitor, History, IncidentScanner, the broker, the
+    # journal-reader, sing-box and Mihomo never depend on this plane.
+    remote_plane = RemoteIngest(data_dir)
     auth = AuthStore(data_dir, session_ttl=args.session_ttl)
     if not auth.password_configured():
         auth = None  # closed dashboard: every API stays "login required"
@@ -298,7 +306,8 @@ def cmd_serve(args):
                         e3_broker=E3Broker(E3RpcClient()),
                         incident_history=history,
                         probe_scheduler=probes,
-                        incident_scanner=scanner)
+                        incident_scanner=scanner,
+                        remote_plane=remote_plane)
     server = build_server(app, args.listen, args.port, tls_context)
     scheme = "https" if tls_context is not None else "http"
     print("monitor web (%s) listening on %s:%d [%s]" %
@@ -317,6 +326,10 @@ def cmd_serve(args):
         scanner.stop()
         server.server_close()
         history.close()
+        # PR-6B: the remote store closes cleanly LAST -- it is an
+        # independent plane and its shutdown can never block or fail the
+        # core shutdown sequence above.
+        remote_plane.close()
     return 0
 
 

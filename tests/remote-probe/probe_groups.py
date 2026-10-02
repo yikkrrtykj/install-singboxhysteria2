@@ -2550,15 +2550,34 @@ def group_contract():
     out["protocol_is_p6_v1"] = rp.P6_PROTOCOL == "p6-v1"
     out["ingest_path_is_frozen_and_not_implemented_here"] = (
         rp.INGEST_PATH == "/api/v1/remote-probes/ingest")
-    # The agent never ships a server route: no server file mentions ingest.
+    # PR-6A shipped no server route; PR-6B owns the EXACT machine-ingest
+    # path and its plane. The wall stays up, narrowed to the frozen
+    # PR-6B truth: exactly FOUR web files may name the remote plane
+    # (the dispatch in server.py plus the registry/store/ingest
+    # modules), no OTHER web file may, and the PR-6C incident read
+    # route still does not exist anywhere.
+    allowed_names = {"server.py", "remote_ingest.py",
+                     "remote_registry.py", "remote_store.py"}
     server_hits = []
+    scope_violations = []
     for path in (os.path.join(ROOT, "monitor-v2", "web"),
                  os.path.join(ROOT, "monitor-v2", "webapp.py")):
         for found in glob.glob(os.path.join(path, "**", "*.py"),
                                recursive=True):
-            if "remote-probes" in open(found, encoding="utf-8").read():
-                server_hits.append(found)
-    out["no_server_ingest_route_exists"] = not server_hits
+            text = open(found, encoding="utf-8").read()
+            if "remote-probes" not in text:
+                continue
+            server_hits.append(found)
+            if os.path.basename(found) not in allowed_names:
+                scope_violations.append(found)
+            if "incidents/<incident_id>/remote-probes" in text:
+                scope_violations.append(found)
+    # server.py must be among the hits (the route lives there), every
+    # hit must be an allowlisted plane file, and nothing outside the
+    # allowlist may name the surface at all.
+    out["no_server_ingest_route_exists"] = (
+        any(os.path.basename(hit) == "server.py" for hit in server_hits)
+        and not scope_violations)
     # History untouched: no remote table name in the store, and the schema
     # version is still v5 with the eleven-table shape.
     history = open(os.path.join(ROOT, "monitor-v2", "web",
@@ -2607,9 +2626,9 @@ def group_contract():
                           "2606:4700:4700::1111", "not-an-ip", "", "1.2.3.4.5"))
     out["version_not_bumped"] = (
         open(os.path.join(ROOT, "monitor-v2", "VERSION"),
-             encoding="utf-8").read().strip() == "0.6.1")
+             encoding="utf-8").read().strip() == "0.7.0")
     out["monitor_web_version_untouched"] = (
-        'MONITOR_WEB_VERSION = "0.6.1"' in open(
+        'MONITOR_WEB_VERSION = "0.7.0"' in open(
             os.path.join(ROOT, "monitor-v2", "web", "server.py"),
             encoding="utf-8").read())
     return out
