@@ -141,6 +141,7 @@ build_src() {
     mkdir -p "$dest"
     cp "$ROOT/monitor-v2/collector.py" "$dest/"
     cp "$ROOT/monitor-v2/webapp.py" "$dest/"
+    cp "$ROOT/monitor-v2/p6_artifact.py" "$dest/"
     cp -R "$ROOT/monitor-v2/web" "$dest/web"
     cp -R "$ROOT/monitor-v2/api_bridge" "$dest/api_bridge"
     rm -rf "$dest/api_bridge/__pycache__" "$dest/web/__pycache__"
