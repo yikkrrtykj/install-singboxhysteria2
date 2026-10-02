@@ -101,10 +101,70 @@ P6A's existing POST-boundary gate now enumerates both reviewed transport call
 sites and verifies both use POST/self.path and the shared frozen URL validator;
 it still excludes every other POST/Mihomo mutation surface.
 
+## Second slice: server lifecycle
+
+The existing privileged socket now accepts `probe.enroll`, `probe.revoke` and
+`probe.list`. No browser route, ZIP or credential export is added. The daemon
+forwards only bounded non-secret metadata, never returns/caches a probe key,
+and bypasses its replay cache for every lifecycle acknowledgement. Enrollment
+and Client deletion share the canonical config.lock; the worker obtains the
+current Client credential digest internally, so the browser cannot choose a
+Client generation or server trust authority.
+
+The root-only `/var/lib/sbox-cm/p6/devices.json` desired-state ledger retains
+at most 4096 device records/tombstones and is capped at 4 MiB. It contains the
+independent random 256-bit keys needed for recovery and later sensitive export;
+it is root:root 0600 inside a real 0700 directory. Keys published for Monitor
+are root:sboxweb 0640. Identity slots use Client name + current credential
+digest + device. Recreated Client accounts have new generations; old deletion
+retries cannot revoke their new profiles. Same enrollment key retries restore
+the original identity/key, changed semantics conflict, a second enrollment key
+cannot silently replace a device slot, and revoked enrollment retries remain
+revoked. Tombstones are never evicted to admit new devices. The existing
+64-identity registry limit includes manually configured identities.
+
+Enrollment requires pre-existing root-owned `p6-server.json` (0600) and
+`p6-server.pem` (root:sboxweb 0640). The binding JSON has exactly v=1,
+server_id, ingest_url and certificate_sha256. Certificate DER pin, IP SAN and
+validity are checked; the endpoint must be HTTPS/IP/high-port/exact ingest.
+Missing or changed binding fails closed. Creating/rotating that authority is
+the later ingress installer slice; this slice generates no TLS private key or
+public ingress. Revocation remains available if a binding certificate expires.
+
+Desired intent is durable before any key/config publication. One root worker
+lock orders mutations. Monitor takes a shared lock on `remote-probes.json.lock`
+and reloads authority for the entire authentication-to-commit operation. The
+root writer takes that lock exclusively to drain prior authenticated requests
+and publish the new registry. Lock release is the revocation boundary: earlier
+ingest may complete; later ingest reloads and refuses the old key. Lock waits
+are bounded and filesystem authority errors fail closed. Read/status primitives
+also reload mapping authority, preserving retired-history truthfulness.
+
+Publication alone is not success. A fresh HMAC request with the intentionally
+invalid evidence body `{}` goes through the shipped loopback Monitor handler:
+active-key `400 invalid_body` proves the authentication path succeeded;
+retired-key `401 unauthorized` proves it failed. No receipt/run/sample is
+created. Timeout/rate-limit/unexpected response keeps `verified=pending` and
+reports failure; retry reconciles the same durable intent. No new endpoint,
+framing exception or authentication bypass exists. Receipt/sample/run history
+is never provisioning cleanup. Manually managed registry rows/keys survive.
+
+Delete Client first retires probes of that exact Client generation. A failed
+P6 confirmation preserves the proxy account and reports E_P6_REVOKE_PENDING;
+the same deletion key may retry. If P6 retirement succeeds and proxy deletion
+subsequently fails, probes stay revoked and the existing Client engine recovers
+the proxy transaction. This is an explicit sequence of durable operations.
+
+The helper's systemd sandbox additionally allows AF_INET **only to localhost**
+for the authentication proof, write access to the existing Monitor config
+directory, and CAP_CHOWN to publish root:sboxweb files. Its listener remains
+AF_UNIX only; the web process gains no new filesystem authority. Deployment
+copies the lifecycle worker but does not create enrollment/binding/ingress or
+enable a service. Linux fixtures exercise actual native ownership/flock and
+the real Client worker on every supported Ubuntu baseline.
+
 ## Following slices — still required
 
-- privileged server enrollment/revocation with live-registry effectiveness,
-  partial failure recovery and existing Client lifecycle integration;
 - step-up/no-store/audited bundle download, immutable digest-verified generic
   artifacts, credentials excluded from replay/audit/cache/log/DOM;
 - nginx/certificate/firewall install integration with port-conflict handling,
@@ -115,8 +175,8 @@ it still excludes every other POST/Mihomo mutation surface.
 - real Windows + Clash/TUN + VPS installation/reboot/offline/revocation/purge
   acceptance and measured CPU/RAM/network/Clash-delay thresholds.
 
-First-slice tests are not a production resource benchmark, real-user reboot
+Slice tests are not a production resource benchmark, real-user reboot
 test or independent review pass. Monitor stays 0.7.0 in this slice. History,
-classifier, P5 response shapes and completed P6B registry/store are unchanged.
+classifier, P5 response shapes and completed P6B storage semantics are unchanged.
 P6B2 implementation is incomplete; merge, production deployment, public
 activation, real client rollout, P6C and P6D are not authorized.

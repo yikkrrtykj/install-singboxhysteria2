@@ -20,3 +20,18 @@ jobs:
       - name: Actual native SCM service start pause continue stop
         if: runner.os == 'Windows'
         run: python tests/remote-production/test_service_scm.py
+  provisioning:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04, ubuntu-26.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Linux authority and Client worker dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq openssl
+          getent group sboxweb || sudo groupadd --system sboxweb
+      - name: Actual live Monitor enrollment revocation crash concurrency and Client deletion
+        run: sudo -n python3 tests/remote-production/test_provisioning.py

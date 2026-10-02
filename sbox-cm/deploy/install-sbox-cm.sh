@@ -75,6 +75,7 @@ cmd_install() {
 
     need_file "$SRC_DIR/sbox-cm"
     need_file "$SRC_DIR/sbox-cm-ops"
+    need_file "$SRC_DIR/p6_provision.py"
     need_file "$SRC_DIR/../lib/client-management.sh"
     need_file "$SRC_DIR/../lib/sbox-cm-state.sh"
 
@@ -92,6 +93,7 @@ cmd_install() {
 
     install -m 0755 "$SRC_DIR/sbox-cm" "$dest_libexec/sbox-cm" || die "安装 sbox-cm 失败"
     install -m 0755 "$SRC_DIR/sbox-cm-ops" "$dest_libexec/sbox-cm-ops" || die "安装 sbox-cm-ops 失败"
+    install -m 0644 "$SRC_DIR/p6_provision.py" "$dest_libexec/p6_provision.py" || die "安装 P6 lifecycle worker 失败"
     install -m 0644 "$SRC_DIR/../lib/client-management.sh" \
         "$dest_libexec/lib/client-management.sh" || die "安装共享库失败"
     install -m 0644 "$SRC_DIR/../lib/sbox-cm-state.sh" \
