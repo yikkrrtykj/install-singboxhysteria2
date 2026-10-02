@@ -43,7 +43,9 @@ def port():
 
 class IngressTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix='p6-ingress-')
+        # Native PrivateTmp units must read the same fixture authority. /run
+        # avoids incorrectly depending on the host's /tmp inside a private mount.
+        self.tmp = tempfile.TemporaryDirectory(prefix='p6-ingress-', dir='/run')
         self.root = Path(self.tmp.name)
         self.unit_dir = self.root / 'units'
         self.unit_dir.mkdir()
