@@ -12,6 +12,7 @@ import sys
 import tempfile
 import unittest
 import zipfile
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'monitor-v2'))
@@ -82,6 +83,20 @@ class BundleTests(unittest.TestCase):
                              (ROOT / 'monitor-v2/mihomo/client.py').read_bytes().replace(b'\r\n', b'\n'))
             self.assertFalse(any(name.endswith(('.key', '.pem', '.json')) for name in names))
         self.assertNotIn(self.parts['secret'].encode(), self.generic)
+        source = self.root / 'source'
+        agent = source / 'monitor-v2/remote_probe'
+        agent.mkdir(parents=True)
+        for name in builder.AGENT_MODULES:
+            shutil.copyfile(ROOT / 'monitor-v2/remote_probe' / name, agent / name)
+        (source / 'monitor-v2/mihomo').mkdir()
+        for name in ('client.py', 'model.py'):
+            shutil.copyfile(ROOT / 'monitor-v2/mihomo' / name, source / 'monitor-v2/mihomo' / name)
+        (agent / 'unreviewed.py').write_text('unreviewed-secret-marker')
+        with patch.object(builder, 'ROOT', source):
+            self.assertEqual(builder.build()[1], self.generic)
+            (agent / 'payload.py').unlink()
+            with self.assertRaises(FileNotFoundError):
+                builder.build()
 
     def test_bundle_contains_exact_yaml_separate_secret_cert_and_generic(self):
         with zipfile.ZipFile(io.BytesIO(self.bundle())) as archive:

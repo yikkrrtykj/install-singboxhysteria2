@@ -15,10 +15,16 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'monitor-v2'))
 from p6_artifact import MAX_ARTIFACT_BYTES
 
+AGENT_MODULES = ('__init__.py', '__main__.py', 'agent.py', 'delivery.py',
+    'direct_probe.py', 'evidence.py', 'mihomo_probe.py', 'payload.py',
+    'pinned_transport.py', 'production.py', 'production_runtime.py',
+    'profiles.py', 'service_host.py', 'spool.py', 'windows_security.py')
+
 
 def build():
     files = {'__main__.py': b'from remote_probe.production import main\nraise SystemExit(main())\n'}
-    for path in sorted((ROOT / 'monitor-v2/remote_probe').glob('*.py')):
+    for name in AGENT_MODULES:
+        path = ROOT / 'monitor-v2/remote_probe' / name
         files['remote_probe/' + path.name] = path.read_bytes().replace(b'\r\n', b'\n')
     for name in ('client.py', 'model.py'):
         files['mihomo/' + name] = (ROOT / 'monitor-v2/mihomo' / name).read_bytes().replace(b'\r\n', b'\n')

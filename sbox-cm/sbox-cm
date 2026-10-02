@@ -82,7 +82,7 @@ OPS = {
     "probe.enroll": {"required": ("name", "device", "idempotency_key", "site_label", "path_label"),
                      "optional": ("actor",), "lock": True},
     "probe.revoke": {"required": ("name", "device"), "optional": ("actor",), "lock": True},
-    "probe.list": {"required": ("name",), "optional": ("cursor",), "lock": True},
+    "probe.list": {"required": ("name",), "optional": ("cursor", "actor"), "lock": True},
     "probe.resume": {"required": ("name", "device"), "optional": ("actor",), "lock": True},
 }
 BASE_FIELDS = ("v", "request_id", "op")
