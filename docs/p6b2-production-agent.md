@@ -148,6 +148,11 @@ created. Timeout/rate-limit/unexpected response keeps `verified=pending` and
 reports failure; retry reconciles the same durable intent. No new endpoint,
 framing exception or authentication bypass exists. Receipt/sample/run history
 is never provisioning cleanup. Manually managed registry rows/keys survive.
+`verified_epoch` records the last confirmation; listing stored lifecycle state
+does not claim ongoing health. List responses contain at most 64 rows plus an
+explicit next cursor, preserving the existing 64-KiB RPC frame limit after
+retirement tombstones accumulate. Changed owned registry rows fail closed;
+ordinary enrollment cannot silently reactivate an operator-disabled identity.
 
 Delete Client first retires probes of that exact Client generation. A failed
 P6 confirmation preserves the proxy account and reports E_P6_REVOKE_PENDING;
@@ -162,6 +167,8 @@ AF_UNIX only; the web process gains no new filesystem authority. Deployment
 copies the lifecycle worker but does not create enrollment/binding/ingress or
 enable a service. Linux fixtures exercise actual native ownership/flock and
 the real Client worker on every supported Ubuntu baseline.
+The same suite also publishes and authenticates from a real transient systemd
+unit using the shipped sandbox properties, rather than a text-only unit check.
 
 ## Following slices — still required
 
