@@ -21,7 +21,7 @@
       "RECENT ACTIVITY": "近期有活动", IDLE: "空闲", CLOSED: "已关闭",
       NONE: "无", open: "进行中", closed: "已结束", ok: "正常",
       degraded: "已降级", unavailable: "不可用", stale: "已过期", unknown: "未知",
-      dark: "未启用", warmup: "预热中", rearm: "等待重新启动", running: "运行中",
+      dark: "未启用", warmup: "预热中", rearm: "等待重新启用扫描", running: "运行中",
       idle: "空闲", connecting: "连接中", STALE: "已过期", FROZEN: "停止更新",
       RECONNECTING: "重新连接中", DISCONNECTED: "已断开"};
     return Object.prototype.hasOwnProperty.call(labels, value) ? labels[value] : value;
@@ -172,7 +172,7 @@
   var INC_EMPTY_EVIDENCE = "此窗口内没有保留的证据。";
   var INC_EVIDENCE_UNAVAILABLE = "证据暂不可用，无法据此得出结论。";
   var INC_RETENTION_NOTE = "部分证据可能已超出保留时间。";
-  var INC_REARM_ACCEPTED = "已接受重新启动请求，等待事件扫描器进入预热。";
+  var INC_REARM_ACCEPTED = "已接受重新启用扫描请求，等待事件扫描器进入预热。";
   var INC_EMPTY_LIST = "暂无事件记录。";
   var INC_EMPTY_DEGRADED = "事件历史当前处于降级状态，空结果不能证明没有记录过事件。";
   var INC_DEVICE_DISCLAIMER = "设备记录仅提供有限上下文，不能证明具体哪些逻辑客户端受到影响。";
@@ -1154,9 +1154,9 @@
       .catch(function (error) {
         if (error.status === 401) { showLogin("登录已过期，请重新登录。"); return; }
         if (error.status === 409) {
-          rearmMessage("当前发现状态无需重新启动。", true);
+          rearmMessage("当前发现状态无需重新启用扫描。", true);
         } else {
-          rearmMessage("无法记录重新启动请求，请勿自动重试。", true);
+          rearmMessage("无法记录重新启用扫描请求，请勿自动重试。", true);
         }
         loadIncidents();
       });

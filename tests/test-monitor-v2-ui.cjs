@@ -840,7 +840,7 @@ async function main() {
   check('rearm success shows the accepted copy and refreshes without retry', () => {
     const post = requests.findLast(r => r.url === '/api/v1/incidents/rearm');
     assert.equal(post.method, 'POST');
-    assert.match(ids['inc-rearm-msg'].textContent, /已接受重新启动请求，等待事件扫描器进入预热。/);
+    assert.match(ids['inc-rearm-msg'].textContent, /已接受重新启用扫描请求，等待事件扫描器进入预热。/);
     productText();
   });
   responses.push(response({error: 'incident_runtime_not_rearmable'}, 409),
@@ -849,7 +849,7 @@ async function main() {
   ui.renderIncRuntime();
   await ui.rearmIncidents(); await flush();
   check('a 409 rearm fails closed with ordinary copy and no automatic retry', () => {
-    assert.match(ids['inc-rearm-msg'].textContent, /无需重新启动/);
+    assert.match(ids['inc-rearm-msg'].textContent, /无需重新启用扫描/);
     productText();
   });
   responses.push(response({incidents: [], runtime: {enabled: true, running: true, phase: 'idle', cycles_completed: 1, runtime_failures: 0, last_error_code: null, last_evaluated_end_epoch: 1, open_incident: false}, history: {enabled: true, degraded: false}, truncated: false, limit: 100}), response({markers: [], truncated: false, limit: 200}));
