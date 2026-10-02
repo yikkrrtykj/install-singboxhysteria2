@@ -31,7 +31,9 @@ jobs:
       - name: Linux authority and Client worker dependencies
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y jq openssl
+          sudo apt-get install -y jq openssl nginx nftables
           getent group sboxweb || sudo groupadd --system sboxweb
       - name: Actual live Monitor enrollment revocation crash concurrency and Client deletion
         run: sudo -n python3 tests/remote-production/test_provisioning.py
+      - name: Actual identity nginx TLS systemd nft namespace and hostile burst load
+        run: sudo -n python3 tests/remote-production/test_ingress.py

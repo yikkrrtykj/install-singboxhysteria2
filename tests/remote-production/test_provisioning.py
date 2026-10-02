@@ -358,6 +358,14 @@ class ProvisioningTests(unittest.TestCase):
             self.enroll()
         self.assertFalse((self.state_dir / 'devices.json').exists())
 
+    def test_malformed_binding_url_has_precise_closed_binding_error(self):
+        for url in ('https://192.0.2.10:bad' + p6.INGEST_PATH, 'https://[bad]:38443' + p6.INGEST_PATH,
+                    'https://:38443' + p6.INGEST_PATH, 'https://localhost:38443' + p6.INGEST_PATH):
+            self.binding['ingest_url'] = url
+            self.write_binding()
+            self.fail_code('E_P6_BINDING', self.enroll)
+            self.assertFalse((self.state_dir / 'devices.json').exists())
+
     def test_unknown_paths_and_browser_authority_fields_rejected_by_rpc(self):
         from importlib.machinery import SourceFileLoader
         rpc = SourceFileLoader('p6_rpc', str(ROOT / 'sbox-cm/sbox-cm')).load_module()
@@ -614,6 +622,49 @@ class ProvisioningTests(unittest.TestCase):
         self.worker.revoke('event-pc', generation=original['client_generation'])
         self.assertTrue(p6.live_proof(self.worker.port, fresh, True))
         self.assertTrue(p6.live_proof(self.worker.port, original, False))
+
+    def call_cli_delete(self):
+        installer = (ROOT / 'install.sh').read_text()
+        section = installer.split('# >>> phase-c client-management >>>')[1].split('# <<< phase-c client-management <<<')[0]
+        phase = self.root / 'phase-c.sh'
+        phase.write_text(section)
+        env = self.env | {'SB_CLIENT_MANAGEMENT_LIB': str(ROOT / 'lib/client-management.sh'),
+                         'SB_P6_PROVISION_SCRIPT': str(ROOT / 'sbox-cm/p6_provision.py')}
+        command = 'warning() { echo "$*" >&2; }; info() { echo "$*"; }; error() { echo "$*" >&2; exit 1; }; . "$1"; with_client_lock _delete_client_locked event-pc'
+        return subprocess.run(['bash', '-c', command, 'fixture', str(phase)], env=env, capture_output=True, timeout=30)
+
+    def test_main_cli_delete_retires_via_same_live_worker_before_proxy_commit(self):
+        self.setup_client_worker()
+        self.assertTrue(self.call_worker('probe.enroll', name='event-pc', device='laptop-01',
+                idempotency_key='enrollment-00000001', site_label='office', path_label='path')['ok'])
+        row = self.row()
+        result = self.call_cli_delete()
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertNotIn('event-pc', self.proxy_config.read_text())
+        self.assertTrue(p6.live_proof(self.worker.port, row, False))
+        self.assertEqual(self.row()['verified'], 'revoked')
+        self.assertNotIn(row['secret'], (result.stdout + result.stderr).decode())
+
+    def test_main_cli_delete_unconfirmed_revocation_preserves_client_retry_recovers(self):
+        self.setup_client_worker()
+        self.assertTrue(self.call_worker('probe.enroll', name='event-pc', device='laptop-01',
+                idempotency_key='enrollment-00000001', site_label='office', path_label='path')['ok'])
+        with socket.socket() as unused:
+            unused.bind(('127.0.0.1', 0))
+            self.env['SB_P6_MONITOR_PORT'] = str(unused.getsockname()[1])
+            original = self.proxy_config.read_bytes()
+            result = self.call_cli_delete()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(self.proxy_config.read_bytes(), original)
+            self.assertEqual(self.row()['verified'], 'pending')
+        self.env['SB_P6_MONITOR_PORT'] = str(self.worker.port)
+        self.assertEqual(self.call_cli_delete().returncode, 0)
+        self.assertEqual(self.row()['verified'], 'revoked')
+
+    def test_main_cli_delete_without_p6_preserves_original_non_p6_behavior(self):
+        self.setup_client_worker()
+        self.assertEqual(self.call_cli_delete().returncode, 0)
+        self.assertNotIn('event-pc', self.proxy_config.read_text())
 
 
 if __name__ == '__main__':

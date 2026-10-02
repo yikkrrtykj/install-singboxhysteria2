@@ -273,11 +273,15 @@ class Provisioner:
         if type(binding['ingest_url']) is not str or len(binding['ingest_url']) > 256 or \
                 any(ord(char) <= 32 or ord(char) >= 127 for char in binding['ingest_url']):
             raise ProvisionError('E_P6_BINDING')
-        url = urlsplit(binding['ingest_url'])
-        address = ipaddress.ip_address(url.hostname)
+        try:
+            url = urlsplit(binding['ingest_url'])
+            address = ipaddress.ip_address(url.hostname)
+            port = url.port
+        except (ValueError, TypeError):
+            raise ProvisionError('E_P6_BINDING') from None
         if url.scheme != 'https' or url.username or url.password or \
                 url.path != INGEST_PATH or url.query or url.fragment or \
-                url.port is None or not 1024 <= url.port <= 65535 or \
+                port is None or not 1024 <= port <= 65535 or \
                 address.is_loopback or address.is_unspecified or address.is_multicast:
             raise ProvisionError('E_P6_BINDING')
         path = os.path.join(self.config_dir, 'p6-server.pem')
