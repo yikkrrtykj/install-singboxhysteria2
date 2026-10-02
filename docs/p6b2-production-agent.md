@@ -2,7 +2,7 @@
 
 Authoritative contract: [Issue #67 §22](https://github.com/yikkrrtykj/install-singboxhysteria2/issues/67).
 Recorded and implementation authorized 2026-10-02. This document explains the
-first reviewable code slice; it does not replace the issue body.
+reviewable implementation slices; it does not replace the issue body.
 
 ## Product direction
 
@@ -175,13 +175,76 @@ the real Client worker on every supported Ubuntu baseline.
 The same suite also publishes and authenticates from a real transient systemd
 unit using the shipped sandbox properties, rather than a text-only unit check.
 
+## Third slice: VPS identity and dedicated ingress installer
+
+The human reviewer passed the server/helper slice at `6693dda…`. Identity now
+precedes sensitive bundle/UI. The installed root helper includes
+`p6_ingress.py`; the explicit entry is
+`bash sbox-cm/deploy/install-p6-ingress.sh prepare IP [HIGH_PORT] [nft|none]`.
+It requires the installed reviewed helper and native nginx >=1.18.0 with TLS,
+OpenSSL, systemd and (for the default nft backend) nftables. It never installs
+packages, changes a cloud Security Group or downloads privileged code.
+
+`prepare` generates a root-only durable authority directory, random server_id,
+RSA-3072 key and 3650-day self-signed certificate with IP SAN/serverAuth. It
+publishes the existing provisioning JSON/public cert shape. Private key remains
+root:root 0600 in a 0700 directory. Public cert is root:sboxweb 0640. Complete
+authority publication is an atomic directory rename/fsync; interrupted public
+copies resume from that authority, not a new identity. Reinstall must retain
+the exact identity/key/cert/endpoint. Changed settings, expired/mismatched trust,
+operator-provided bindings, unsafe files and edited managed files fail closed.
+Explicit certificate/endpoint replacement is a later operator workflow, never
+an implicit ordinary reinstall or a bypass of enrolled profiles' binding.
+
+Preparation validates an independent full nginx configuration and dedicated
+`sbox-p6-ingress.service`. It opens no listener/firewall and does not enable
+anything. `activate` and `deactivate` are separate explicit commands. They
+operate only this unit and its journaled firewall table, never `nginx.service`,
+global nginx configuration, ports 80/443/9191 or Monitor's loopback bind.
+The exact raw POST route requires client HTTP/1.1, explicit CL and no TE before
+buffering; wrong methods/paths/queries/encoded aliases stay local. Body bytes
+and all five signature headers are forwarded untouched. Fixed bounded peer +
+aggregate request/connection limits, TLS/header/body/upstream deadlines, worker,
+FD/task/memory/CPU caps contain unauthenticated work. Runtime access/error logs
+are suppressed to avoid credential/header disclosure.
+
+Activation journals intent, validates native nginx/systemd, checks the port,
+creates only its owned firewall rule, enables/starts its dedicated unit and
+proves local pinned TLS + local 404. Interrupted starts reconcile closed;
+failures disable/stop this unit and remove only its verified table. Identity,
+registry, credentials and remote history remain. A changed table stays intact
+and reports failure rather than being deleted. The dedicated nft pre-start
+restores the journaled rule after reboot; the privileged root pre-start has
+firewall authority, while nginx workers have no CAP_NET_ADMIN. It is separate
+from the existing loopback-only Client helper sandbox.
+
+An nft accept in a separate base chain cannot override a drop in another
+chain. The response therefore says `external_reachability=unverified`. Existing
+UFW/nft policy and cloud Security Groups need actual host/external validation;
+this foundation does not claim that a managed accept proves the port open.
+`none` is an explicit operator-owned firewall mode. No global flush or automatic
+weakening of another firewall is supported.
+
+The main `install.sh` CLI now invokes the same retirement worker under the
+canonical Client lock, with the internally derived exact credential generation,
+before creating/committing a delete candidate. An unconfirmed live revocation
+preserves Client/derived files and permits retry. No-P6 deletion keeps its
+original behavior. This closes the previously documented CLI deletion residual.
+
+The new native Linux suite uses temporary loopback TLS, real nginx runtime,
+random real systemd services, actual process death and isolated network
+namespaces for nft rules. A separate actual Monitor process with 64 configured
+identities receives malicious missing-auth/wrong-HMAC burst traffic through
+TLS nginx. Native /proc CPU/RSS, outcomes and concurrent session-route latency
+are emitted as a reproducible `P6_INGRESS_LOAD_RECEIPT`. This verifies server
+fixture containment/responsiveness, not real Windows/Clash/TUN measurements.
+
 ## Following slices — still required
 
 - step-up/no-store/audited bundle download, immutable digest-verified generic
   artifacts, credentials excluded from replay/audit/cache/log/DOM;
-- nginx/certificate/firewall install integration with port-conflict handling,
-  existing config preservation and rollback; no automatic trust change on
-  reinstall;
+- actual VPS host/firewall/cloud-policy reachability acceptance and explicit
+  replacement/retrusted-bundle operator workflow for IP/expiry/compromise;
 - local controller discovery/explicit binding and credential setup, signed
   Windows packaging, autostart/failure-recovery installer and uninstaller;
 - real Windows + Clash/TUN + VPS installation/reboot/offline/revocation/purge

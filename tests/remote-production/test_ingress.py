@@ -102,6 +102,11 @@ class IngressTests(unittest.TestCase):
         self.assertFalse(self.worker.journal.exists())
         self.worker._port_free(self.worker._identity())
 
+    def test_unprepared_activate_does_not_poison_future_identity_creation(self):
+        self.error('E_P6_NOT_PREPARED', self.worker.activate)
+        self.assertFalse(self.worker.identity.exists())
+        self.assertTrue(self.prepare()['prepared'])
+
     def test_idempotent_reinstall_preserves_server_id_cert_pin_and_private_key(self):
         first = self.prepare()
         key = (self.worker.identity / 'server.key').read_bytes()
@@ -405,12 +410,16 @@ class IngressTests(unittest.TestCase):
             baseline = [control() for _ in range(20)]
             latencies = []
             samples = []
+            observation_errors = []
             finished = threading.Event()
             def observe():
-                while not finished.is_set():
-                    latencies.append(control())
-                    samples.append(rss(process.pid))
-                    finished.wait(.05)
+                try:
+                    while not finished.is_set():
+                        latencies.append(control())
+                        samples.append(rss(process.pid))
+                        finished.wait(.05)
+                except Exception as exc:
+                    observation_errors.append(type(exc).__name__)
             observer = threading.Thread(target=observe)
             observer.start()
             before_ticks, start = ticks(process.pid), time.monotonic()
@@ -423,6 +432,7 @@ class IngressTests(unittest.TestCase):
             seconds = time.monotonic() - start
             cpu = (ticks(process.pid) - before_ticks) / os.sysconf('SC_CLK_TCK')
             self.assertFalse(observer.is_alive())
+            self.assertEqual(observation_errors, [])
             self.assertTrue(latencies)
             self.assertTrue(samples)
             self.assertEqual(set(results) - {401, 429}, set())

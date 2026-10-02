@@ -49,6 +49,7 @@ class Ingress:
         self.runtime = runtime
         self.service, self.table = service, table
         self.listen, self.upstream = listen, upstream
+        self.fixture = fixture
         self.fault = fault or (lambda phase: None)
         if not fixture:
             self.fs._ancestors(unit_dir)
@@ -101,6 +102,8 @@ class Ingress:
                 'url': 'https://' + host + ':' + str(port) + p6.INGEST_PATH}
 
     def _identity(self):
+        if not os.path.lexists(self.identity):
+            raise Error('E_P6_NOT_PREPARED')
         self.fs._directory(str(self.identity), 0o700, 0)
         meta = json.loads(self.read(self.identity / 'metadata.json'))
         if type(meta) is not dict or set(meta) != {'v', 'settings', 'binding'} or meta['v'] != 1:
@@ -206,7 +209,6 @@ http {{
         ssl_certificate {self.identity}/server.pem;
         ssl_certificate_key {self.identity}/server.key;
         ssl_protocols TLSv1.2 TLSv1.3;
-        ssl_handshake_timeout 5s;
         client_max_body_size 16k;
         client_body_buffer_size 16k;
         client_header_buffer_size 1k;
@@ -307,7 +309,13 @@ WantedBy=multi-user.target
         match = re.search(r'nginx/(\d+)\.(\d+)\.(\d+)', version)
         if not match or tuple(map(int, match.groups())) < (1, 18, 0):
             raise Error('E_P6_NGINX_VERSION')
-        self.command(['/usr/sbin/nginx', '-t', '-p', self.runtime + '/', '-c', str(self.config)])
+        result = self.command(['/usr/sbin/nginx', '-t', '-p', self.runtime + '/', '-c', str(self.config)], check=False)
+        if result.returncode:
+            if self.fixture:
+                # Fixture-only diagnostic: generated private paths, no headers,
+                # keys or credentials. Production keeps the closed error code.
+                sys.stderr.buffer.write(result.stderr)
+            raise Error('E_P6_NGINX_CONFIG')
         self.command(['/usr/bin/systemd-analyze', 'verify', str(self.unit)])
 
     def _port_free(self, meta):
