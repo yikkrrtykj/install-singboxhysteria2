@@ -365,6 +365,59 @@ class IngressTests(unittest.TestCase):
         proc = context.Process(target=child); proc.start(); proc.join(30)
         self.assertEqual(proc.exitcode, 0)
 
+    def test_native_nft_systemd_prestart_restores_after_rule_loss_and_deactivation_cleans_only_owned_table(self):
+        # The whole dedicated unit joins a temporary child's network namespace;
+        # real pre-start permissions/boot restoration are tested, not mocked.
+        self.worker.unit = Path('/etc/systemd/system') / self.service
+        executable = Path('/opt/p6-fixture-' + os.urandom(8).hex())
+        executable.mkdir(mode=0o700)
+        for name in ('p6_ingress.py', 'p6_provision.py'):
+            shutil.copyfile(ROOT / 'sbox-cm' / name, executable / name)
+            (executable / name).chmod(0o600)
+        args = {'fixture': True, 'config_dir': self.worker.fs.config_dir, 'state_dir': self.worker.fs.state_dir,
+                'unit_dir': '/etc/systemd/system', 'runtime': self.runtime, 'service': self.service,
+                'table': self.worker.table, 'listen': '127.0.0.1'}
+        entry = executable / 'entry.py'
+        entry.write_text('import importlib.util\ns=importlib.util.spec_from_file_location("p6_ingress",' + repr(str(executable / 'p6_ingress.py')) + ')\nm=importlib.util.module_from_spec(s);s.loader.exec_module(m)\nm.Ingress(**' + repr(args) + ').firewall_ensure()\n')
+        entry.chmod(0o600)
+        def child():
+            import ctypes
+            if ctypes.CDLL(None, use_errno=True).unshare(0x40000000):
+                raise OSError(ctypes.get_errno(), 'unshare network')
+            self.worker.command(['/usr/sbin/ip', 'link', 'set', 'lo', 'up'])
+            original_render = self.worker.render_unit
+            self.worker.render_unit = lambda: original_render().replace(
+                b'/usr/local/lib/sbox-cm/p6_ingress.py firewall-ensure', str(entry).encode()).replace(
+                b'[Service]\n', ('[Service]\nNetworkNamespacePath=/proc/%d/ns/net\n' % os.getpid()).encode())
+            self.prepare('nft')
+            self.worker.command(['/usr/sbin/nft', 'add', 'table', 'inet', 'unrelated'])
+            before = self.worker.command(['/usr/sbin/nft', '-j', 'list', 'table', 'inet', 'unrelated']).stdout
+            try:
+                self.assertTrue(self.worker.activate()['active'])
+                fingerprint = self.worker.firewall_snapshot()
+                self.worker.command(['/usr/sbin/nft', 'delete', 'table', 'inet', self.worker.table])
+                self.worker.command(['/usr/bin/systemctl', 'restart', self.service])
+                self.worker._tls_probe(self.worker._identity())
+                self.assertEqual(self.worker.firewall_snapshot(), fingerprint)
+                self.assertEqual(self.worker.deactivate(), {'active': False})
+                self.assertIsNone(self.worker.firewall_snapshot())
+                self.assertEqual(before, self.worker.command(['/usr/sbin/nft', '-j', 'list', 'table', 'inet', 'unrelated']).stdout)
+            finally:
+                self.worker.command(['/usr/bin/systemctl', 'disable', '--now', self.service], check=False)
+        proc = multiprocessing.get_context('fork').Process(target=child)
+        try:
+            proc.start(); proc.join(60)
+            self.assertEqual(proc.exitcode, 0)
+        finally:
+            if proc.is_alive(): proc.terminate(); proc.join(10)
+            self.worker.command(['/usr/bin/systemctl', 'disable', '--now', self.service], check=False)
+            self.worker.unit.unlink(missing_ok=True)
+            self.worker.command(['/usr/bin/systemctl', 'daemon-reload'])
+            self.worker.command(['/usr/bin/systemctl', 'reset-failed', self.service], check=False)
+            self.assertEqual(executable.parent, Path('/opt'))
+            self.assertTrue(executable.name.startswith('p6-fixture-'))
+            shutil.rmtree(executable)
+
     def test_actual_monitor_hostile_preauth_burst_records_resource_and_control_latency(self):
         # Separate native process enables honest server-only /proc CPU/RSS.
         context = multiprocessing.get_context('fork')
