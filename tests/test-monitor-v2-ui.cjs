@@ -742,7 +742,9 @@ async function main() {
     const l3Text = ids['inc-l3'].textContent;
     const rows = l3Text.match(/reset/g) || [];
     assert.equal(rows.length, 2);
-    assert.match(ids['inc-rows-body'].textContent, /100[\s\S]*140[\s\S]*120|[\s\S]*/);
+    assert.deepEqual(ids['inc-rows-body'].children.map(row =>
+      row.children.slice(0, 2).map(cell => cell.textContent)),
+      [['1', '100'], ['2', '140'], ['3', '120']]);
     assert.equal(ids['inc-rows-body'].children.length, 3);
     productText();
   });
@@ -995,6 +997,9 @@ async function main() {
     const badge = ids['devices-grid'].querySelector('.device-status');
     assert.equal(badge.textContent, '活动'); assert.match(badge.className, /\bactive\b/);
     assert.equal(ui.state.snapshot.devices.legacy.status, 'ACTIVE');
+    ui.state.incidents.runtime.phase = 'idle'; ui.renderIncRuntime();
+    assert.match(ids['inc-runtime'].textContent, /空闲/);
+    assert.equal(ui.state.incidents.runtime.phase, 'idle');
     assert.equal(ui.incidentCopy('The evidence records 2 open questions; see the reasons below.'), '证据记录了 2 个待解问题，请查看下方原因。');
     assert.equal(ui.incidentCopy('Future server copy <b>unknown</b>'), 'Future server copy <b>unknown</b>');
   });

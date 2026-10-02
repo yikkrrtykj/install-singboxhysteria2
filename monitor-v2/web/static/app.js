@@ -20,8 +20,11 @@
     var labels = {HEALTHY: "正常", CONNECTED: "已连接", ACTIVE: "活动",
       "RECENT ACTIVITY": "近期有活动", IDLE: "空闲", CLOSED: "已关闭",
       NONE: "无", open: "进行中", closed: "已结束", ok: "正常",
-      degraded: "已降级", unavailable: "不可用", stale: "已过期", unknown: "未知", dark: "未启用", warmup: "预热中", rearm: "等待重新启动", running: "运行中"};
-    return labels[value] || value;
+      degraded: "已降级", unavailable: "不可用", stale: "已过期", unknown: "未知",
+      dark: "未启用", warmup: "预热中", rearm: "等待重新启动", running: "运行中",
+      idle: "空闲", connecting: "连接中", STALE: "已过期", FROZEN: "停止更新",
+      RECONNECTING: "重新连接中", DISCONNECTED: "已断开"};
+    return Object.prototype.hasOwnProperty.call(labels, value) ? labels[value] : value;
   }
   function errorText(error) {
     if (error.status === 429) return "请求过于频繁，请稍后重试。";
