@@ -27,7 +27,7 @@ class WindowsSecurity:
             raise StorageSecurityError("Windows storage required")
         if fixture_sid is not None and not re.fullmatch(r"S-1-[0-9-]+", fixture_sid):
             raise StorageSecurityError("invalid fixture SID")
-        self.allowed = {"SY", "BA", "S-1-5-18", "S-1-5-32-544"}
+        self.allowed = {"S-1-5-18", "S-1-5-32-544"}
         if fixture_sid:
             self.allowed.add(fixture_sid)
         self.sddl = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
@@ -48,6 +48,10 @@ class WindowsSecurity:
         self.a.ConvertSecurityDescriptorToStringSecurityDescriptorW.restype = W.BOOL
         self.a.GetSecurityInfo.argtypes = [W.HANDLE, W.DWORD, W.DWORD, W.LPVOID, W.LPVOID, W.LPVOID, W.LPVOID, ctypes.POINTER(W.LPVOID)]
         self.a.GetSecurityInfo.restype = W.DWORD
+        self.a.ConvertSidToStringSidW.argtypes = [W.LPVOID, ctypes.POINTER(W.LPWSTR)]
+        self.a.ConvertSidToStringSidW.restype = W.BOOL
+        self.a.GetAce.argtypes = [W.LPVOID, W.DWORD, ctypes.POINTER(W.LPVOID)]
+        self.a.GetAce.restype = W.BOOL
         self.k.GetFileInformationByHandleEx.argtypes = [W.HANDLE, ctypes.c_int, W.LPVOID, W.DWORD]
         self.k.GetFileInformationByHandleEx.restype = W.BOOL
 
@@ -69,20 +73,50 @@ class WindowsSecurity:
             current = parent
 
     def _descriptor(self, handle):
+        """Compare canonical native SIDs, not OS-dependent SDDL aliases.
+
+        Windows Server renders a fixture's local Administrator SID as LA;
+        client Windows often renders its full SID. They are the same SID.
+        """
         descriptor = W.LPVOID()
-        code = self.a.GetSecurityInfo(handle, 1, 1 | 4, None, None, None, None,
+        owner = W.LPVOID()
+        dacl = W.LPVOID()
+        code = self.a.GetSecurityInfo(handle, 1, 1 | 4, ctypes.byref(owner), None,
+                                      ctypes.byref(dacl), None,
                                       ctypes.byref(descriptor))
         if code:
             raise StorageSecurityError("security descriptor unavailable")
-        text = W.LPWSTR()
-        try:
-            if not self.a.ConvertSecurityDescriptorToStringSecurityDescriptorW(
-                    descriptor, 1, 1 | 4, ctypes.byref(text), None):
-                raise StorageSecurityError("security descriptor unavailable")
-            return text.value
-        finally:
-            if text:
+        def sid_string(sid):
+            text = W.LPWSTR()
+            if not self.a.ConvertSidToStringSidW(sid, ctypes.byref(text)):
+                raise StorageSecurityError("invalid security principal")
+            try:
+                return text.value
+            finally:
                 self.k.LocalFree(ctypes.cast(text, W.LPVOID))
+        try:
+            if not owner or not dacl:
+                raise StorageSecurityError("missing restricted DACL/owner")
+            class ACL(ctypes.Structure):
+                _fields_ = [("revision", W.BYTE), ("reserved", W.BYTE),
+                            ("size", W.WORD), ("count", W.WORD), ("reserved2", W.WORD)]
+            class ACE(ctypes.Structure):
+                _fields_ = [("kind", W.BYTE), ("flags", W.BYTE),
+                            ("size", W.WORD), ("mask", W.DWORD)]
+            acl = ctypes.cast(dacl, ctypes.POINTER(ACL)).contents
+            if not 0 < acl.count <= 8:
+                raise StorageSecurityError("unsafe storage DACL")
+            entries = []
+            for index in range(acl.count):
+                pointer = W.LPVOID()
+                if not self.a.GetAce(dacl, index, ctypes.byref(pointer)):
+                    raise StorageSecurityError("invalid storage DACL")
+                ace = ctypes.cast(pointer, ctypes.POINTER(ACE)).contents
+                if ace.kind != 0 or ace.size < 16:
+                    raise StorageSecurityError("unsafe storage DACL")
+                entries.append((ace.flags, ace.mask, sid_string(pointer.value + 8)))
+            return sid_string(owner), entries
+        finally:
             self.k.LocalFree(descriptor)
 
     def _check_handle(self, handle, directory):
@@ -92,23 +126,17 @@ class WindowsSecurity:
             raise StorageSecurityError("file attributes unavailable")
         if attrs[0] & 0x400 or bool(attrs[0] & 0x10) != bool(directory):
             raise StorageSecurityError("unsafe storage object")
-        sddl = self._descriptor(handle)
-        owner = re.search(r"O:(.*?)(?=[GDS]:|$)", sddl)
-        if not owner or owner.group(1) not in self.allowed:
+        owner, entries = self._descriptor(handle)
+        if owner not in self.allowed:
             raise StorageSecurityError("unsafe storage owner")
-        dacl = sddl.split("D:", 1)[1] if "D:" in sddl else ""
-        entries = re.findall(r"\(([^()]*)\)", dacl)
-        if not entries or "NO_ACCESS_CONTROL" in dacl:
-            raise StorageSecurityError("missing restricted DACL")
         principals = set()
-        for entry in entries:
-            parts = entry.split(";")
-            if len(parts) != 6 or parts[0] != "A" or parts[5] not in self.allowed:
+        for flags, mask, principal in entries:
+            if principal not in self.allowed:
                 raise StorageSecurityError("unsafe storage DACL")
-            if parts[2] not in ("FA", "0x1f01ff") or "IO" in parts[1]:
+            if mask != 0x1f01ff or flags & 0x08:
                 raise StorageSecurityError("incomplete storage authority")
-            principals.add(parts[5])
-        if not principals.intersection({"SY", "S-1-5-18"}):
+            principals.add(principal)
+        if "S-1-5-18" not in principals:
             raise StorageSecurityError("SYSTEM access required")
 
     def open_handle(self, path, directory=False):
