@@ -470,6 +470,7 @@ class IngressTests(unittest.TestCase):
             self.assertTrue(parent.poll(15))
             monitor_port = parent.recv()
             self.worker.upstream = monitor_port
+            self.worker.unit = Path('/etc/systemd/system') / self.service
             self.prepare()
             self.worker.fs.port = monitor_port
             self.worker.fs.proof = lambda row, active: p6.live_proof(monitor_port, row, active)
@@ -481,7 +482,10 @@ class IngressTests(unittest.TestCase):
                 rows.append({'probe_id': name, 'enabled': True, 'site_label': 'fixture', 'path_label': 'path', 'key_file': name + '.key'})
                 self.worker.fs._write(str(Path(self.worker.fs.key_dir) / (name + '.key')), b'b' * 64 + b'\n', 0o640, self.worker.fs.gid)
             self.worker.fs._write(self.worker.fs.config, p6.encoded({'v': 1, 'probes': rows}), 0o640, self.worker.fs.gid)
-            self.start_nginx()
+            self.assertTrue(self.worker.activate()['active'])
+            nginx_pid = int(self.worker.command(['/usr/bin/systemctl', 'show', self.service,
+                                                '--property=MainPID', '--value']).stdout)
+            self.assertGreater(nginx_pid, 0)
             def ticks(pid):
                 fields = Path('/proc/%d/stat' % pid).read_text().rsplit(')', 1)[1].split()
                 return int(fields[11]) + int(fields[12])
@@ -512,8 +516,8 @@ class IngressTests(unittest.TestCase):
             observer = threading.Thread(target=observe)
             observer.start()
             before_ticks, start = ticks(process.pid), time.monotonic()
-            nginx_pids = [self.nginx.pid] + [int(value) for value in
-                    Path('/proc/%d/task/%d/children' % (self.nginx.pid, self.nginx.pid)).read_text().split()]
+            nginx_pids = [nginx_pid] + [int(value) for value in
+                    Path('/proc/%d/task/%d/children' % (nginx_pid, nginx_pid)).read_text().split()]
             nginx_before_ticks = sum(ticks(pid) for pid in nginx_pids)
             nginx_rss = sum(rss(pid) for pid in nginx_pids)
             headers = p6.proof_headers(result['probe_id'], '0' * 64)  # deliberately wrong HMAC
@@ -548,12 +552,18 @@ class IngressTests(unittest.TestCase):
                 'nginx_cpu_percent_one_core': round(nginx_cpu / seconds * 100, 2),
                 'nginx_cpu_percent_machine': round(nginx_cpu / seconds * 100 / (os.cpu_count() or 1), 2),
                 'nginx_rss_sum_endpoint_bytes': nginx_rss,
+                'nginx_execution': 'actual-dedicated-systemd-unit', 'nginx_cpu_quota_one_core_percent': 50,
                 'control_under_load_p95_ms': round(p95(latencies), 3), 'control_max_ms': round(max(latencies), 3),
                 'proxy_outcomes': {str(x): results.count(x) for x in sorted(set(results))}, **final,
                 'production_windows_resource_acceptance': 'not_performed'}
             print('P6_INGRESS_LOAD_RECEIPT ' + json.dumps(receipt, sort_keys=True), flush=True)
             process.join(10); self.assertEqual(process.exitcode, 0)
         finally:
+            self.worker.command(['/usr/bin/systemctl', 'disable', '--now', self.service], check=False)
+            if self.worker.unit.parent == Path('/etc/systemd/system'):
+                self.worker.unit.unlink(missing_ok=True)
+                self.worker.command(['/usr/bin/systemctl', 'daemon-reload'])
+                self.worker.command(['/usr/bin/systemctl', 'reset-failed', self.service], check=False)
             if process.is_alive():
                 process.terminate(); process.join(10)
 
