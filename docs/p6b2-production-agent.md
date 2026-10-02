@@ -153,6 +153,11 @@ does not claim ongoing health. List responses contain at most 64 rows plus an
 explicit next cursor, preserving the existing 64-KiB RPC frame limit after
 retirement tombstones accumulate. Changed owned registry rows fail closed;
 ordinary enrollment cannot silently reactivate an operator-disabled identity.
+Retirement confirms at most 64 pending records per attempt and checkpoints the
+batch once. Larger accumulated pending sets report E_P6_CONFIRM_PENDING and
+resume on retry without resetting already confirmed tombstones. A repeated
+fully confirmed retirement checks one representative again; historical
+confirmation times for the other immutable tombstones remain explicit.
 
 Delete Client first retires probes of that exact Client generation. A failed
 P6 confirmation preserves the proxy account and reports E_P6_REVOKE_PENDING;

@@ -28,6 +28,7 @@ from urllib.parse import urlsplit
 MAX_RECORDS = 4096             # permanent idempotency/revocation tombstones
 MAX_STATE_BYTES = 4 * 1024 * 1024
 MAX_IDENTITIES = 64             # includes operator-managed identities
+MAX_CONFIRMATIONS = 64          # bounded retirement work per retry
 INGEST_PATH = '/api/v1/remote-probes/ingest'
 NAME = re.compile(r'\A[A-Za-z0-9][A-Za-z0-9._-]{0,31}\Z')
 IDEMPOTENCY = re.compile(r'\A[A-Za-z0-9._:-]{16,128}\Z')
@@ -434,7 +435,12 @@ class Provisioner:
             self.fault('live_confirmed')
             row['verified'] = row['desired']
             row['verified_epoch'] = int(time.time())
-            self._save(state)
+        # One durable checkpoint per bounded batch, not a ledger rewrite for
+        # every historical record. A crash before this checkpoint simply
+        # repeats proof; it never restores an authentication identity.
+        self._save(state)
+        for row in rows:
+            active = row['desired'] == 'active'
             if not active:
                 path = os.path.join(self.key_dir, row['probe_id'] + '.key')
                 if os.path.lexists(path):
@@ -506,11 +512,21 @@ class Provisioner:
                     (device is None or r['device'] == device) and
                     (generation is None or r['client_generation'] == generation)]
             for row in rows:
-                row.update(desired='revoked', verified='pending', verified_epoch=None)
+                if row['desired'] != 'revoked':
+                    row.update(desired='revoked', verified='pending', verified_epoch=None)
             self._save(state)
             self.fault('intent_durable')
             self._publish(state)
-            self._confirm(state, rows)
+            pending = [row for row in rows if row['verified'] == 'pending']
+            confirming = pending[:MAX_CONFIRMATIONS]
+            if not pending and rows:
+                # Already confirmed tombstones cannot be republished as live
+                # identities. Fresh proof of the selected device/retirement
+                # representative still checks the running Monitor on retry.
+                confirming = rows[-1:]
+            self._confirm(state, confirming)
+            if len(pending) > MAX_CONFIRMATIONS:
+                raise ProvisionError('E_P6_CONFIRM_PENDING')
             return {'revoked': True, 'count': len(rows)}
 
     def listing(self, name, cursor=None):

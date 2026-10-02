@@ -433,6 +433,29 @@ class ProvisioningTests(unittest.TestCase):
         self.assertEqual(len(seen), 150)
         self.assertEqual(len(set(seen)), 150)
 
+    def test_many_pending_retirements_checkpoint_bounded_batches(self):
+        self.enroll()
+        state = self.state()
+        original = state['records'][0]
+        state['records'] = [original | {'probe_id': 'p6-%032x' % i,
+            'device': 'device-' + str(i), 'enrollment': '%064x' % i,
+            'desired': 'revoked', 'verified': 'pending', 'verified_epoch': None}
+                           for i in range(66)]
+        self.worker._save(state)
+        calls = []
+        proof = self.worker.proof
+        def counted(row, active):
+            calls.append(row['probe_id'])
+            return proof(row, active)
+        self.worker.proof = counted
+        self.fail_code('E_P6_CONFIRM_PENDING', lambda: self.worker.revoke('event-pc'))
+        self.assertEqual(len(calls), 64)
+        self.assertEqual(sum(row['verified'] == 'revoked' for row in self.state()['records']), 64)
+        result = self.worker.revoke('event-pc')
+        self.assertTrue(result['revoked'])
+        self.assertEqual(len(calls), 66)
+        self.assertEqual(sum(row['verified'] == 'revoked' for row in self.state()['records']), 66)
+
     def test_manual_registry_rows_and_keys_preserved(self):
         self.enroll()
         registry = self.worker._registry()
