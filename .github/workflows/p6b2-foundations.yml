@@ -1,0 +1,22 @@
+name: p6b2-foundations
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  foundations:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Actual TLS, profile, bounded runtime and native Windows security
+        run: python tests/remote-production/test_foundations.py
+      - name: Actual native SCM service start pause continue stop
+        if: runner.os == 'Windows'
+        run: python tests/remote-production/test_service_scm.py
