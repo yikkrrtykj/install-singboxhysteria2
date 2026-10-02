@@ -129,6 +129,14 @@ class Provisioner:
         for path in (self.config_dir, self.state_dir):
             if not fixture:
                 self._ancestors(os.path.dirname(path))
+            # Existing Monitor installation owns a root:root 0755 config
+            # directory. Preserve it; P6 key subdirectory has its own stricter
+            # root:sboxweb 0750 contract. Never chmod/chown unrelated config.
+            if path == self.config_dir and os.path.lexists(path):
+                st = os.lstat(path)
+                if stat.S_ISDIR(st.st_mode) and (st.st_uid, st.st_gid,
+                        stat.S_IMODE(st.st_mode)) == (0, 0, 0o755):
+                    continue
             self._directory(path, 0o700 if path == self.state_dir else 0o750,
                             0 if path == self.state_dir else self.gid)
 
@@ -224,14 +232,20 @@ class Provisioner:
     def _lock(self, path, mode, gid):
         import fcntl
         if not os.path.lexists(path):
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
             try:
-                os.fchown(fd, 0, gid)
-                os.fchmod(fd, mode)
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-            self._sync(os.path.dirname(path))
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+            except FileExistsError:
+                # Another first invocation won creation. Open/authority-check
+                # the same anchor and acquire its flock; never replace it.
+                pass
+            else:
+                try:
+                    os.fchown(fd, 0, gid)
+                    os.fchmod(fd, mode)
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                self._sync(os.path.dirname(path))
         fd = self._open(path, mode, gid)
         try:
             deadline = time.monotonic() + 5
@@ -291,6 +305,14 @@ class Provisioner:
                 type(state['v']) is not int or state['v'] != 1 or \
                 type(state['records']) is not list or len(state['records']) > MAX_RECORDS:
             raise ProvisionError('E_P6_STATE')
+        stored_binding = state['binding']
+        if type(stored_binding) is not dict or set(stored_binding) != {
+                'v', 'server_id', 'ingest_url', 'certificate_sha256'} or \
+                type(stored_binding['v']) is not int or stored_binding['v'] != 1 or \
+                type(stored_binding['ingest_url']) is not str or len(stored_binding['ingest_url']) > 256:
+            raise ProvisionError('E_P6_STATE')
+        require(HEX32, stored_binding['server_id'])
+        require(HEX64, stored_binding['certificate_sha256'])
         if binding is not None and state['binding'] != binding:
             raise ProvisionError('E_P6_BINDING_CHANGED')
         probes, enrollments, slots = set(), set(), set()
@@ -317,6 +339,38 @@ class Provisioner:
             raise ProvisionError('E_P6_CAPACITY')
         self._write(self.state_path, raw, 0o600, 0)
 
+    def _clean_staging(self):
+        # Atomic publication uses a reserved root-owned .p6-* namespace.
+        # Reconcile interrupted staging only while provision.lock is held.
+        # A bounded inventory prevents adversarial/corrupt directory scans.
+        for directory in (self.state_dir, self.config_dir, self.key_dir):
+            if not os.path.lexists(directory):
+                continue
+            st = os.lstat(directory)
+            expected = {(0, 0, 0o700)} if directory == self.state_dir else {(0, self.gid, 0o750)}
+            if directory == self.config_dir:
+                expected.add((0, 0, 0o755))
+            if not stat.S_ISDIR(st.st_mode) or (st.st_uid, st.st_gid,
+                    stat.S_IMODE(st.st_mode)) not in expected:
+                raise ProvisionError('E_P6_AUTHORITY')
+            entries = []
+            with os.scandir(directory) as stream:
+                for entry in stream:
+                    if len(entries) >= MAX_RECORDS * 2 + 64:
+                        raise ProvisionError('E_P6_CAPACITY')
+                    entries.append(entry)
+            for entry in entries:
+                if not entry.name.startswith('.p6-'):
+                    continue
+                st = os.lstat(entry.path)
+                mode, gid = stat.S_IMODE(st.st_mode), st.st_gid
+                if mode not in (0o600, 0o640) or gid not in (0, self.gid):
+                    raise ProvisionError('E_P6_AUTHORITY')
+                fd = self._open(entry.path, mode, gid)
+                os.close(fd)
+                os.unlink(entry.path)
+                self._sync(directory)
+
     def _registry(self):
         if not os.path.lexists(self.config):
             return []
@@ -341,8 +395,17 @@ class Provisioner:
         self._directory(self.key_dir, 0o750, self.gid)
         with self._lock(self.gate, 0o640, self.gid):
             own = {row['probe_id'] for row in state['records']}
-            rows = [row for row in self._registry() if row['probe_id'] not in own]
+            existing = self._registry()
+            by_id = {row['probe_id']: row for row in existing}
+            rows = [row for row in existing if row['probe_id'] not in own]
             for row in state['records']:
+                expected = {'probe_id': row['probe_id'], 'enabled': True,
+                            'site_label': row['site_label'], 'path_label': row['path_label'],
+                            'key_file': row['probe_id'] + '.key'}
+                if row['probe_id'] in by_id and by_id[row['probe_id']] != expected:
+                    raise ProvisionError('E_P6_REGISTRY_CHANGED')
+                if row['desired'] == 'active' and row['verified'] == 'active' and row['probe_id'] not in by_id:
+                    raise ProvisionError('E_P6_REGISTRY_CHANGED')
                 if row['desired'] == 'active':
                     path = os.path.join(self.key_dir, row['probe_id'] + '.key')
                     raw = (row['secret'] + '\n').encode('ascii')
@@ -351,9 +414,7 @@ class Provisioner:
                             raise ProvisionError('E_P6_KEY_CHANGED')
                     else:
                         self._write(path, raw, 0o640, self.gid)
-                    rows.append({'probe_id': row['probe_id'], 'enabled': True,
-                                 'site_label': row['site_label'], 'path_label': row['path_label'],
-                                 'key_file': row['probe_id'] + '.key'})
+                    rows.append(expected)
             if len(rows) > MAX_IDENTITIES:
                 raise ProvisionError('E_P6_CAPACITY')
             self.fault('keys_durable')
@@ -390,6 +451,7 @@ class Provisioner:
                 (IDEMPOTENCY, idempotency_key), (LABEL, site_label), (LABEL, path_label)):
             require(pattern, value)
         with self._lock(os.path.join(self.state_dir, 'provision.lock'), 0o600, 0):
+            self._clean_staging()
             binding = self._binding()
             state = self._load(binding)
             enrollment = hashlib.sha256(idempotency_key.encode('ascii')).hexdigest()
@@ -432,6 +494,7 @@ class Provisioner:
         if generation is not None:
             require(HEX64, generation)
         with self._lock(os.path.join(self.state_dir, 'provision.lock'), 0o600, 0):
+            self._clean_staging()
             state = self._load()
             if state is None:
                 return {'revoked': True, 'count': 0}

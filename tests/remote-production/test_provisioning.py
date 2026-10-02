@@ -9,6 +9,7 @@ import grp
 import hashlib
 import importlib.util
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import shutil
@@ -170,17 +171,59 @@ class ProvisioningTests(unittest.TestCase):
 
     def test_crash_at_each_publication_boundary_reuses_identity(self):
         for index, phase in enumerate(('intent_durable', 'keys_durable', 'registry_durable', 'live_confirmed')):
-            def crash(value):
-                if value == phase:
-                    raise RuntimeError('fixture crash')
-            self.worker.fault = crash
-            with self.assertRaises(RuntimeError):
-                self.enroll('device-' + str(index), 'enrollment-crash-' + str(index))
+            def child():
+                worker = p6.Provisioner(str(self.state_dir), str(self.config_dir), self.worker.port,
+                                       fixture=True, fault=lambda value: os._exit(91) if value == phase else None)
+                worker.enroll('event-pc', 'device-' + str(index), self.generation,
+                              'enrollment-crash-' + str(index), 'office', 'operator-path')
+            process = multiprocessing.get_context('fork').Process(target=child)
+            process.start(); process.join(8)
+            if process.is_alive():
+                process.kill(); process.join()
+                self.fail('crash fixture exceeded bound')
+            self.assertEqual(process.exitcode, 91)
             original = self.row('device-' + str(index))
-            self.worker.fault = lambda phase: None
             restored = self.enroll('device-' + str(index), 'enrollment-crash-' + str(index))
             self.assertEqual(restored['probe_id'], original['probe_id'])
             self.assertEqual(self.row('device-' + str(index))['secret'], original['secret'])
+
+    def test_real_process_crash_revocation_recovers_tombstone(self):
+        for index, phase in enumerate(('intent_durable', 'keys_durable', 'registry_durable', 'live_confirmed')):
+            device = 'device-' + str(index)
+            self.enroll(device, 'enrollment-crash-' + str(index))
+            original = self.row(device)
+            def child():
+                worker = p6.Provisioner(str(self.state_dir), str(self.config_dir), self.worker.port,
+                                       fixture=True, fault=lambda value: os._exit(91) if value == phase else None)
+                worker.revoke('event-pc', device)
+            process = multiprocessing.get_context('fork').Process(target=child)
+            process.start(); process.join(8)
+            if process.is_alive():
+                process.kill(); process.join()
+                self.fail('crash fixture exceeded bound')
+            self.assertEqual(process.exitcode, 91)
+            self.worker.revoke('event-pc', device)
+            self.assertEqual(self.row(device)['verified'], 'revoked')
+            self.assertTrue(p6.live_proof(self.worker.port, original, False))
+
+    def test_interrupted_staging_cleanup_preserves_unrelated_files(self):
+        self.enroll()
+        staged = self.state_dir / '.p6-interrupted'
+        self.worker._write(str(staged), b'private staging', 0o600, 0)
+        unrelated = self.config_dir / 'monitor.conf'
+        unrelated.write_text('existing config')
+        self.enroll()
+        self.assertFalse(staged.exists())
+        self.assertEqual(unrelated.read_text(), 'existing config')
+
+    def test_existing_monitor_config_directory_is_preserved(self):
+        os.chown(self.config_dir, 0, 0); os.chmod(self.config_dir, 0o755)
+        again = p6.Provisioner(str(self.state_dir), str(self.config_dir), self.worker.port, fixture=True)
+        result = again.enroll('event-pc', 'laptop-01', self.generation,
+                             'enrollment-00000001', 'office', 'operator-path')
+        self.assertEqual(result['verified'], 'active')
+        st = self.config_dir.stat()
+        self.assertEqual((st.st_uid, st.st_gid, st.st_mode & 0o777), (0, 0, 0o755))
 
     def test_concurrent_same_enrollment_has_one_identity(self):
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
@@ -203,6 +246,12 @@ class ProvisioningTests(unittest.TestCase):
         sample = harness._sample(1, probe=result['probe_id'], epoch=int(time.time()))
         raw, headers = harness.body_for(sample, key=bytes.fromhex(original['secret']),
                                        probe=result['probe_id'], epoch=int(time.time()))
+        # The older P6B fixture signs its fixed NOW; this live fixture needs
+        # refreshed transport freshness while preserving exact sample bytes.
+        sent = int(time.time())
+        headers['X-Remote-Probe-Sent-Epoch'] = str(sent)
+        headers['X-Remote-Probe-Signature'] = harness.pl.sign(bytes.fromhex(original['secret']),
+                result['probe_id'], sent, sample['run'], sample['seq'], raw)
         entered, release, finished = threading.Event(), threading.Event(), threading.Event()
         real = self.plane.store.accept
         def delayed(*args):
@@ -235,6 +284,14 @@ class ProvisioningTests(unittest.TestCase):
         self.write_binding()
         self.fail_code('E_P6_BINDING_CHANGED', self.enroll)
         self.assertEqual(self.row(), original)
+
+    def test_operator_changed_managed_row_is_not_silently_reactivated(self):
+        self.enroll()
+        rows = self.worker._registry()
+        rows[0]['enabled'] = False
+        self.worker._write(self.worker.config, p6.encoded({'v': 1, 'probes': rows}), 0o640, self.gid)
+        self.fail_code('E_P6_REGISTRY_CHANGED', self.enroll)
+        self.assertFalse(self.worker._registry()[0]['enabled'])
 
     def test_bad_pin_ip_san_expired_and_missing_binding_refused(self):
         for certificate in ('server', 'expired'):
