@@ -177,11 +177,28 @@ class BundleLinuxTests(unittest.TestCase):
         row = self.row('laptop-02')
         self.assertTrue(fixtures.p6.live_proof(self.worker.port, row, True))
         self.assertNotIn(row['secret'].encode(), raw)
-        status, _, raw = self.http('/api/v1/clients/probes/revoke', {'name': 'event-pc', 'device': 'laptop-02'})
+        status, _, raw = self.http('/api/v1/clients/probes/revoke',
+            {'name': 'event-pc', 'device': 'laptop-02', 'probe_id': row['probe_id']})
         self.assertEqual(status, 200, raw)
         self.assertTrue(json.loads(raw)['data']['revoked'])
         self.assertTrue(fixtures.p6.live_proof(self.worker.port, row, False))
         self.assertTrue(fixtures.p6.live_proof(self.worker.port, self.row(), True))
+
+    def test_selected_old_identity_revoke_preserves_same_device_new_generation(self):
+        old = self.row().copy()
+        new = self.worker.enroll('event-pc', 'laptop-01', 'e' * 64,
+            'new-generation-00001', 'office', 'path')
+        current = next(r for r in self.state()['records'] if r['probe_id'] == new['probe_id'])
+        self.fail_code('E_P6_NOT_ENROLLED', lambda: self.worker.revoke(
+            'wrong-client', 'laptop-01', probe_id=old['probe_id']))
+        self.assertEqual(self.http('/api/v1/clients/probes/revoke')[0], 400)
+        status, _, raw = self.http('/api/v1/clients/probes/revoke',
+            {'name': 'event-pc', 'device': 'laptop-01', 'probe_id': old['probe_id']})
+        self.assertEqual(status, 200, raw)
+        self.assertEqual(json.loads(raw)['data']['count'], 1)
+        self.assertTrue(fixtures.p6.live_proof(self.worker.port, old, False))
+        self.assertTrue(fixtures.p6.live_proof(self.worker.port, current, True))
+        self.assertEqual(next(r for r in self.state()['records'] if r['probe_id'] == new['probe_id']), current)
 
     def test_changed_server_binding_refuses_delivery_without_rotation(self):
         original = self.row().copy()

@@ -245,6 +245,10 @@ The Client page keeps the existing YAML Download intact and adds a separate
 Devices / Bundle panel for named Clients. Enroll each device independently;
 only an active, live-confirmed enrollment offers Download Client Bundle.
 Stored confirmation describes enrollment/revocation, not current probe health.
+Browser revocation requires the selected row's probe_id; root checks the
+Client/device/identity tuple and retires exactly that record. Old rows cannot
+accidentally retire a same-device identity in a rebuilt Client generation.
+Existing internal generation-wide Client retirement keeps its original scope.
 Revocation requires step-up and a fresh live proof. Pending enrollment offers
 Verify again after a page reload: `probe.resume` recovers only the existing
 current-generation record/key/labels, never creates or resurrects an identity.
@@ -302,7 +306,7 @@ remains independent of client-only Mihomo imports. Signed Windows packaging,
 installer/uninstaller and real host acceptance remain mandatory before P6B2
 completion. No production listener/service activation is performed here.
 
-Acceptance uses eleven portable real-artifact/profile-import cases, twenty
+Acceptance uses eleven portable real-artifact/profile-import cases, twenty-one
 native root worker/RPC/HTTP/audit/recovery cases, and fourteen new shipped-JS
 UI cases (104 total, including the previous 90). Existing cross-platform and
 native provisioning CI entrypoints run the corresponding bundle suite as a

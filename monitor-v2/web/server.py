@@ -2180,6 +2180,8 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         body = self._json_body()
         keys = {'name', 'device'} if op in ('probe.revoke', 'probe.resume', 'client.bundle') else \
                {'name', 'device', 'site_label', 'path_label'} if op == 'probe.enroll' else {'name'}
+        if op == 'probe.revoke':
+            keys |= {'probe_id'}
         allowed = keys | ({'cursor'} if op == 'probe.list' else set())
         if type(body) is not dict or not keys <= set(body) or not set(body) <= allowed:
             self._p6_failure('E_P6_SCHEMA')
@@ -2188,6 +2190,10 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             if field in body and (type(body[field]) is not str or not E3_NAME_RE.fullmatch(body[field])):
                 self._p6_failure('E_P6_SCHEMA')
                 return
+        if op == 'probe.revoke' and (type(body['probe_id']) is not str or
+                not re.fullmatch(r'[a-z0-9-]{1,64}', body['probe_id'])):
+            self._p6_failure('E_P6_SCHEMA')
+            return
         if body['name'] == E3_RESERVED_NAME:
             self._p6_failure('E_RESERVED_NAME')
             return

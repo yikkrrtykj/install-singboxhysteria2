@@ -504,20 +504,27 @@ class Provisioner:
             self._confirm(state, [row])
             return self.public(state, row)
 
-    def revoke(self, name, device=None, generation=None):
+    def revoke(self, name, device=None, generation=None, probe_id=None):
         require(NAME, name)
         if device is not None:
             require(NAME, device)
         if generation is not None:
             require(HEX64, generation)
+        if probe_id is not None:
+            require(PROBE, probe_id)
         with self._lock(os.path.join(self.state_dir, 'provision.lock'), 0o600, 0):
             self._clean_staging()
             state = self._load()
             if state is None:
+                if probe_id is not None:
+                    raise ProvisionError('E_P6_NOT_ENROLLED')
                 return {'revoked': True, 'count': 0}
             rows = [r for r in state['records'] if r['name'] == name and
                     (device is None or r['device'] == device) and
-                    (generation is None or r['client_generation'] == generation)]
+                    (generation is None or r['client_generation'] == generation) and
+                    (probe_id is None or r['probe_id'] == probe_id)]
+            if probe_id is not None and not rows:
+                raise ProvisionError('E_P6_NOT_ENROLLED')
             for row in rows:
                 if row['desired'] != 'revoked':
                     row.update(desired='revoked', verified='pending', verified_epoch=None)
@@ -618,7 +625,7 @@ def main():
         args = json.loads(raw)
         allowed = {'name', 'request_id', 'actor'}
         allowed |= {'device', 'client_generation', 'idempotency_key', 'site_label', 'path_label'} if op == 'enroll' else set()
-        allowed |= {'device'} if op == 'revoke' else set()
+        allowed |= {'device', 'probe_id'} if op == 'revoke' else set()
         allowed |= {'client_generation'} if op == 'retire' else set()
         allowed |= {'cursor'} if op == 'list' else set()
         allowed |= {'device', 'client_generation'} if op == 'resume' else set()
@@ -633,7 +640,7 @@ def main():
             result = worker.enroll(*(args[field] for field in ('name', 'device', 'client_generation',
                                    'idempotency_key', 'site_label', 'path_label')))
         elif op in ('revoke', 'retire'):
-            result = worker.revoke(args['name'], args.get('device'), args.get('client_generation'))
+            result = worker.revoke(args['name'], args.get('device'), args.get('client_generation'), args.get('probe_id'))
         elif op == 'resume':
             result = worker.resume(args['name'], args['device'], args['client_generation'])
         else:

@@ -1499,7 +1499,7 @@
       if (device.desired === "active" || !confirmed) {
         action(device.desired === "active" ? "Revoke" : "Retry revocation", function () {
           if (device.desired === "active" && !window.confirm("Revoke this device's P6 upload access? Its proxy account remains available.")) return;
-          p6Operate("revoke", {name: p6View.name, device: device.device});
+          p6Operate("revoke", {name: p6View.name, device: device.device, probe_id: device.probe_id});
         });
       }
     });
@@ -1530,6 +1530,7 @@
       var pending = p6View.retry;
       if (pending && p6View.rows.some(function (row) {
         return row.device === pending.body.device && row.verified === row.desired &&
+          (pending.op !== "revoke" || row.probe_id === pending.body.probe_id) &&
           row.desired === (pending.op === "revoke" ? "revoked" : "active");
       })) p6View.retry = null;
     }).catch(function () {

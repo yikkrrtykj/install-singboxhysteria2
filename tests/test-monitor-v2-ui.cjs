@@ -941,11 +941,13 @@ async function main() {
   });
   const revoked = {...device, desired: 'revoked', verified: 'revoked'};
   responses.push(response({ok: true, data: {revoked: true, count: 1}}), listDevices([revoked]));
-  ui.p6Operate('revoke', {name: 'alice', device: 'laptop-01'}); await flush();
+  ids['p6-devices-body'].children[0].children[2].children[1].click(); await flush();
   check('P6: confirmed revocation removes download and recovery actions', () => {
     assert.match(ids['p6-devices-body'].textContent, /Revocation verified/);
     assert.doesNotMatch(ids['p6-devices-body'].textContent, /Download|Verify again|Retry revocation/);
     assert.match(ids['p6-msg'].textContent, /Revocation verified by the server/);
+    assert.deepEqual(JSON.parse(requests.findLast(r => r.url.endsWith('/revoke')).body),
+      {name: 'alice', device: 'laptop-01', probe_id: device.probe_id});
   });
   responses.push(listDevices([{...revoked, verified: 'pending'}], 'probe-cursor')); ui.loadP6Devices(); await flush();
   check('P6: pending revocation and bounded pagination remain explicit', () => {
