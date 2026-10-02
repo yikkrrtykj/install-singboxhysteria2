@@ -6,13 +6,21 @@ param(
     [string]$Operation = 'install',
     [string]$Bundle,
     [string]$Profile,
-    [string]$ControllerKeyFile
+    [string]$ControllerKeyFile,
+    [switch]$PromptControllerSecret
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Continue'
+$PSModuleAutoloadingPreference = 'None'
+foreach ($module in @('Microsoft.PowerShell.Security','Microsoft.PowerShell.Management','Microsoft.PowerShell.Utility')) {
+    try { Import-Module -Name ([IO.Path]::Combine($PSHOME,'Modules',$module,($module + '.psd1'))) -ErrorAction Stop }
+    catch { Write-Host '[FAIL] native setup modules unavailable'; exit 2 }
+}
+$PSModuleAutoloadingPreference = 'None'
 $publisher = '@P6_PUBLISHER@'
 $failed = $false
 $staging = $null
+$credentialDirectory = $null
 
 function Diagnostic([bool]$Condition, [string]$Label) {
     if ($Condition) { Write-Host "[PASS] $Label" }
@@ -20,6 +28,7 @@ function Diagnostic([bool]$Condition, [string]$Label) {
 }
 function RealPath([string]$Path) {
     $node = [IO.Path]::GetFullPath($Path)
+    if ($node.StartsWith('\\') -or $node.Substring(2).Contains(':')) { throw 'network or alternate stream path' }
     while ($node) {
         if (Test-Path -LiteralPath $node) {
             $attributes = [IO.File]::GetAttributes($node)
@@ -37,6 +46,13 @@ function ProtectedDirectory([string]$Path) {
     $acl.SetSecurityDescriptorSddlForm('O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)')
     $directory = New-Object IO.DirectoryInfo($Path)
     $directory.Create($acl)
+    $openedAcl = $directory.GetAccessControl()
+    $owner = $openedAcl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    $rules = @($openedAcl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]))
+    if ($owner -notin @('S-1-5-18','S-1-5-32-544') -or -not $openedAcl.AreAccessRulesProtected -or $rules.Count -ne 2) { throw 'unsafe staging authority' }
+    foreach ($rule in $rules) {
+        if ($rule.IdentityReference.Value -notin @('S-1-5-18','S-1-5-32-544') -or $rule.AccessControlType -ne 'Allow' -or $rule.FileSystemRights -ne 'FullControl') { throw 'unsafe staging DACL' }
+    }
 }
 function VerifyPackage([string]$Path) {
     foreach ($file in @('Setup.ps1','payload.cat')) {
@@ -98,6 +114,26 @@ try {
     $python = Join-Path $payload 'runtime\python.exe'
     $entry = Join-Path $payload 'p6-installer.pyz'
     $arguments = @('-I','-B',$entry,$Operation,'--package',$staging)
+    if ($PromptControllerSecret) {
+        if ($ControllerKeyFile -or $Operation -notin @('install','import')) { throw 'invalid credential interaction' }
+        $credentialDirectory = Join-Path $common ('P6Credential-' + [Guid]::NewGuid().ToString('N'))
+        ProtectedDirectory $credentialDirectory
+        $ControllerKeyFile = Join-Path $credentialDirectory 'mihomo.key'
+        $credential = Read-Host 'Local Mihomo controller secret (empty if no authentication)' -AsSecureString
+        $pointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($credential)
+        $bytes = $null
+        try {
+            $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($pointer)
+            $bytes = [Text.Encoding]::UTF8.GetBytes($plain)
+            if ($bytes.Length -gt 4096) { throw 'credential capacity' }
+            [IO.File]::WriteAllBytes($ControllerKeyFile,$bytes)
+        } finally {
+            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer)
+            if ($bytes) { [Array]::Clear($bytes,0,$bytes.Length) }
+            $plain = $null
+            $credential.Dispose()
+        }
+    }
     if ($Bundle) { $arguments += @('--bundle',[IO.Path]::GetFullPath($Bundle)) }
     if ($Profile) { $arguments += @('--profile',$Profile) }
     if ($ControllerKeyFile) { $arguments += @('--controller-key-file',[IO.Path]::GetFullPath($ControllerKeyFile)) }
@@ -110,6 +146,14 @@ try {
     Write-Host '[FAIL] windows_setup_unavailable'
     exit 2
 } finally {
+    if ($credentialDirectory -and (Test-Path -LiteralPath $credentialDirectory)) {
+        try {
+            RealPath $credentialDirectory
+            $keyPath = Join-Path $credentialDirectory 'mihomo.key'
+            if (Test-Path -LiteralPath $keyPath) { RealPath $keyPath; Remove-Item -LiteralPath $keyPath -Force -ErrorAction Stop }
+            Remove-Item -LiteralPath $credentialDirectory -Force -ErrorAction Stop
+        } catch { Write-Host '[SKIP] protected credential staging retained for manual cleanup' }
+    }
     if ($staging -and (Test-Path -LiteralPath $staging)) {
         try {
             # Only this exact random directory created above. Validate every

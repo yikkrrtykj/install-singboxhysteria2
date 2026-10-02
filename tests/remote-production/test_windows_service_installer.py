@@ -55,6 +55,10 @@ class NativeInstallerTests(unittest.TestCase):
         cls.sign_script = cls.root / 'sign.ps1'
         cls.sign_script.write_text('''param([string]$Package,[string]$Thumbprint)
 $ErrorActionPreference='Stop'
+foreach($m in @('Microsoft.PowerShell.Security','Microsoft.PowerShell.Management','Microsoft.PowerShell.Utility','PKI')) {
+  Import-Module -Name ([IO.Path]::Combine($PSHOME,'Modules',$m,($m+'.psd1'))) -ErrorAction Stop
+}
+$PSModuleAutoloadingPreference='None'
 if($Package) {
   $cert=Get-Item -LiteralPath ('Cert:\\CurrentUser\\My\\'+$Thumbprint)
   New-FileCatalog -Path (Join-Path $Package 'payload') -CatalogFilePath (Join-Path $Package 'payload.cat') -CatalogVersion 2.0 | Out-Null
@@ -107,9 +111,15 @@ if($Package) {
         cleanup = cls.root / 'certificate-cleanup.ps1'
         cleanup.write_text('''param([string]$Thumbprint)
 $ErrorActionPreference='Stop'
+foreach($m in @('Microsoft.PowerShell.Security','Microsoft.PowerShell.Management')) {
+  Import-Module -Name ([IO.Path]::Combine($PSHOME,'Modules',$m,($m+'.psd1'))) -ErrorAction Stop
+}
 foreach($store in @('Root','My')) {
   $path='Cert:\\CurrentUser\\'+$store+'\\'+$Thumbprint
-  if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Force}
+  if(Test-Path -LiteralPath $path){
+    if($store -eq 'My'){Remove-Item -LiteralPath $path -Force -DeleteKey}
+    else{Remove-Item -LiteralPath $path -Force}
+  }
 }
 ''')
         subprocess.run([cls.powershell, '-NoProfile', '-NonInteractive', '-File', str(cleanup),

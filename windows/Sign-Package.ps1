@@ -6,7 +6,12 @@ param([Parameter(Mandatory=$true)][string]$Package,
       [Parameter(Mandatory=$true)][ValidatePattern('^https://')][string]$TimestampServer)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Continue'
+$PSModuleAutoloadingPreference = 'None'
 try {
+    foreach ($module in @('Microsoft.PowerShell.Security','Microsoft.PowerShell.Management','Microsoft.PowerShell.Utility')) {
+        Import-Module -Name ([IO.Path]::Combine($PSHOME,'Modules',$module,($module + '.psd1'))) -ErrorAction Stop
+    }
+    $PSModuleAutoloadingPreference = 'None'
     $certificate = Get-Item -LiteralPath ('Cert:\CurrentUser\My\' + $CertificateThumbprint) -ErrorAction Stop
     if (-not $certificate.HasPrivateKey -or $certificate.NotAfter -le [DateTime]::Now) { throw 'signing unavailable' }
     $catalogPath = Join-Path $Package 'payload.cat'

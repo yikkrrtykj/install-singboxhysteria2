@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import sys
 import threading
+import time
 import unittest
 import zipfile
 
@@ -38,6 +39,20 @@ class Controller(http.server.BaseHTTPRequestHandler):
         raw = json.dumps(value).encode()
         if self.server.oversized:
             raw = b' ' * (512 * 1024 + 1)
+        if self.server.slow:
+            value = b'HTTP/1.1 200 OK\r\nContent-Length: 1024\r\n\r\n' if self.server.slow == 'headers' else raw * 1024
+            if self.server.slow == 'body':
+                self.send_response(200)
+                self.send_header('Content-Length', str(len(value)))
+                self.end_headers()
+            try:
+                for byte in value:
+                    self.wfile.write(bytes([byte]))
+                    self.wfile.flush()
+                    time.sleep(.15)
+            except (OSError, ConnectionError):
+                pass
+            return
         self.send_response(code)
         self.send_header('Content-Length', str(len(raw)))
         self.send_header('Connection', 'close')
@@ -52,6 +67,7 @@ def controller(profile, secret=''):
     server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Controller)
     server.seen = []
     server.redirect = server.oversized = False
+    server.slow = None
     server.authorization = ('Bearer ' + secret) if secret else None
     server.nodes = {'proxies': {name: {} for name in ('Reality', 'Hysteria2', '自动选择')}}
     profile['agent']['mihomo_url'] = 'http://127.0.0.1:' + str(server.server_port)
@@ -184,6 +200,15 @@ class InstallerTests(unittest.TestCase):
                 verify_controller(self.profile, '')
             self.assertNotIn('timeout', str(caught.exception))
 
+    def test_trickling_headers_and_body_have_absolute_deadline(self):
+        server = self.server()
+        for mode in ('headers', 'body'):
+            server.slow = mode
+            start = time.monotonic()
+            with self.assertRaises(ConfigError):
+                verify_controller(self.profile, '')
+            self.assertLess(time.monotonic() - start, 4.5)
+
     def test_nonloopback_and_header_injected_controller_secret_never_send(self):
         server = self.server()
         with self.assertRaises(ConfigError):
@@ -215,6 +240,6 @@ class InstallerTests(unittest.TestCase):
 
 if __name__ == '__main__':
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(InstallerTests)
-    assert suite.countTestCases() == 12
+    assert suite.countTestCases() == 13
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     raise SystemExit(0 if result.wasSuccessful() else 1)

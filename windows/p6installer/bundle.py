@@ -8,6 +8,7 @@ import socket
 import ssl
 import stat
 import time
+import threading
 import zipfile
 
 from remote_probe.agent import ConfigError
@@ -109,11 +110,33 @@ def verify_controller(profile, secret):
             if remaining <= 0:
                 raise ConfigError('controller unavailable')
             conn_type = http.client.HTTPSConnection if scheme == 'https' else http.client.HTTPConnection
-            conn = conn_type(host, port, timeout=min(2, remaining))
+            options = {'timeout': min(2, remaining)}
+            if scheme == 'https':
+                context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                context.load_default_certs()
+                options['context'] = context
+            conn = conn_type(host, port, **options)
+            connected = []
+            expired = threading.Event()
+            def abort(connection=conn, peers=connected, ended=expired):
+                ended.set()
+                sock = peers[0] if peers else connection.sock
+                if sock is not None:
+                    try:
+                        sock.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+            timer = threading.Timer(min(3, remaining), abort)
+            timer.daemon = True
+            timer.start()
             try:
                 headers = {'Accept': 'application/json'}
                 if secret:
                     headers['Authorization'] = 'Bearer ' + secret
+                conn.connect()
+                connected.append(conn.sock)
+                if expired.is_set():
+                    raise ConfigError('controller unavailable')
                 conn.request('GET', route, headers=headers)
                 response = conn.getresponse()
                 if response.status != 200:
@@ -136,8 +159,11 @@ def verify_controller(profile, secret):
                     body.extend(chunk)
                 if len(body) > 512 * 1024 or (expected_length is not None and len(body) != expected_length):
                     raise ConfigError('controller oversized')
+                if expired.is_set():
+                    raise ConfigError('controller unavailable')
                 payloads.append(object_json(bytes(body)))
             finally:
+                timer.cancel()
                 conn.close()
         version, proxies = payloads
         if type(version) is not dict or type(version.get('version')) is not str \

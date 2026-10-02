@@ -365,7 +365,9 @@ truthful until installer review and real client acceptance are complete.
   and controller authentication before enabling. Import YAML into the existing
   Clash client separately; the installer never changes/restarts Mihomo.
 - For authenticated local controller, supply `-ControllerKeyFile` naming an
-  already native-protected credential file. The value is never an argument,
+  already native-protected credential file, or use `-PromptControllerSecret`
+  for secure installer-only input and temporary protected credential staging.
+  The value is never an argument,
   URL, environment variable or diagnostic. Controller and P6 credentials are
   separate; local credential is published atomically with a new profile.
 - `pause/resume/remove/purge -Profile <64-character profile id>` acts on exactly

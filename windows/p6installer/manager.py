@@ -30,7 +30,9 @@ def verify_signatures(package, publisher):
         raise ConfigError('production publisher not configured')
     encoded = base64.b64encode(os.fspath(package).encode('utf-8')).decode('ascii')
     script = "$p=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('" + encoded + "'));"
-    script += "$ErrorActionPreference='Stop';try {"
+    script += "$ErrorActionPreference='Stop';$PSModuleAutoloadingPreference='None';try {"
+    script += "foreach($m in @('Microsoft.PowerShell.Security','Microsoft.PowerShell.Management','Microsoft.PowerShell.Utility')) {"
+    script += "Import-Module -Name ([IO.Path]::Combine($PSHOME,'Modules',$m,($m+'.psd1'))) -ErrorAction Stop};$PSModuleAutoloadingPreference='None';"
     script += "foreach($f in @('Setup.ps1','payload.cat')) {$s=Get-AuthenticodeSignature -LiteralPath (Join-Path $p $f);"
     script += "if($s.Status -ne 'Valid' -or $s.SignerCertificate.Thumbprint -ne '" + publisher + "'){exit 2}};"
     script += "if((Test-FileCatalog -Path (Join-Path $p 'payload') -CatalogFilePath (Join-Path $p 'payload.cat')) -ne 'Valid'){exit 2};exit 0}catch{exit 2}"
