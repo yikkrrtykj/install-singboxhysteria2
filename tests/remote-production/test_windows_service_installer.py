@@ -24,7 +24,6 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'monitor-v2'))
 sys.path.insert(0, str(ROOT / 'windows'))
 sys.path.insert(0, str(ROOT / 'tests/remote-production'))
-from test_foundations import fixture_policy
 from test_windows_installer import InstallerTests, controller
 from test_bundle import BundleTests
 from p6installer.bundle import read_bundle
@@ -32,7 +31,7 @@ from p6installer.manager import Manager, validate_release, verify_signatures
 from p6installer.scm import Service, Failure, Action
 from remote_probe.agent import ConfigError
 from remote_probe.profiles import canonical, profile_id
-from remote_probe.windows_security import StorageSecurityError
+from remote_probe.windows_security import StorageSecurityError, WindowsSecurity
 from remote_probe.spool import SpoolError
 
 spec = importlib.util.spec_from_file_location('windows_builder', ROOT / 'tools/build-p6-windows.py')
@@ -48,7 +47,11 @@ class NativeInstallerTests(unittest.TestCase):
         cls.tmp = tempfile.TemporaryDirectory(prefix='p6-native-installer-')
         cls.addClassCleanup(cls.tmp.cleanup)
         cls.root = Path(cls.tmp.name)
-        cls.policy = fixture_policy()
+        # This elevated fixture launches the production LocalSystem service,
+        # which must see the same SYSTEM/Administrators-only storage policy.
+        # The unprivileged portable fixture's extra user SID is intentionally
+        # rejected by that service and must not be added to its vault.
+        cls.policy = WindowsSecurity()
         cls.protected = cls.root / 'protected'
         cls.policy.mkdir(str(cls.protected))
         cls.powershell = r'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
