@@ -41,6 +41,124 @@ def port():
         return s.getsockname()[1]
 
 
+class InstallerWrapperTests(unittest.TestCase):
+    """Execute the production wrapper with only fixed paths relocated.
+
+    The disposable helper records dispatch; it never activates real ingress.
+    Ownership, symlink/link checks and the non-root child are native Linux.
+    No fixture environment override is added to the production entry point.
+    """
+    def setUp(self):
+        self.assertEqual(os.geteuid(), 0, 'native wrapper tests require root')
+        self.tmp = tempfile.TemporaryDirectory(prefix='p6-wrapper-', dir='/run')
+        self.root = Path(self.tmp.name)
+        self.root.chmod(0o755)  # The non-root diagnostic child can read the runner.
+        self.helper = self.root / 'helper'
+        self.helper.mkdir(mode=0o755)
+        self.marker = self.helper / 'dispatch.json'
+        self.source = (ROOT / 'sbox-cm/deploy/install-p6-ingress.sh').read_text()
+        self.runner = self.root / 'installer.sh'
+        self.write_runner()
+        self.reset_helpers()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write_runner(self, python='/usr/bin/python3'):
+        self.runner.write_text(self.source.replace('/usr/local/lib/sbox-cm', str(self.helper))
+                               .replace('/usr/bin/python3', python))
+        self.runner.chmod(0o644)
+
+    def reset_helpers(self):
+        self.helper.chmod(0o755)
+        for name in ('p6_ingress.py', 'p6_provision.py'):
+            path = self.helper / name
+            path.unlink(missing_ok=True)
+            path.write_text('import json, pathlib, sys\n'
+                            'pathlib.Path(__file__).with_name("dispatch.json").write_text(json.dumps(sys.argv[1:]))\n'
+                            'print(json.dumps({"operation": sys.argv[1]}))\n'
+                            'sys.exit(7 if sys.argv[1] == "deactivate" else 0)\n')
+            path.chmod(0o644)
+        self.marker.unlink(missing_ok=True)
+
+    def run_wrapper(self, *args, nonroot=False):
+        def drop_authority():
+            os.setgroups([])
+            os.setgid(65534)
+            os.setuid(65534)
+        return subprocess.run(['/bin/bash', str(self.runner), *args], cwd='/',
+                              text=True, capture_output=True, timeout=10,
+                              preexec_fn=drop_authority if nonroot else None)
+
+    def refused(self, result):
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertFalse(self.marker.exists(), 'unsafe prerequisites dispatched helper')
+        self.assertEqual(result.stdout, '')
+        self.assertIn('[SKIP] helper execution', result.stderr)
+        self.assertNotIn('Traceback', result.stderr)
+
+    def test_wrapper_diagnostics_preserve_helper_json_arguments_and_exit_code(self):
+        for args, code in ((('prepare', '192.0.2.10', '38443', 'none'), 0),
+                           (('activate',), 0), (('deactivate',), 7)):
+            with self.subTest(args=args):
+                self.marker.unlink(missing_ok=True)
+                result = self.run_wrapper(*args)
+                self.assertEqual(result.returncode, code, result.stderr)
+                self.assertEqual(json.loads(self.marker.read_text()), list(args))
+                self.assertEqual(json.loads(result.stdout), {'operation': args[0]})
+                for label in ('root authority', 'python3 available', 'helper directory ownership:',
+                              'p6_ingress.py ownership/mode', 'p6_provision.py ownership/mode'):
+                    self.assertIn('[PASS] ' + label, result.stderr)
+                self.assertIn(f'[{"PASS" if code == 0 else "FAIL"}] {args[0]}', result.stderr)
+                self.assertIn(f'(exit {code})', result.stderr)
+
+    def test_wrapper_collects_failures_and_refuses_unsafe_helper_objects(self):
+        ingress = self.helper / 'p6_ingress.py'
+        provision = self.helper / 'p6_provision.py'
+        ingress.unlink()
+        provision.chmod(0o666)
+        result = self.run_wrapper('activate')
+        self.refused(result)
+        self.assertIn('[FAIL] p6_ingress.py ownership/mode', result.stderr)
+        self.assertIn('[FAIL] p6_provision.py ownership/mode', result.stderr)
+        for case in ('symlink', 'hardlink', 'owner', 'directory'):
+            with self.subTest(case=case):
+                self.reset_helpers()
+                if case == 'symlink':
+                    ingress.unlink()
+                    ingress.symlink_to(provision)
+                elif case == 'hardlink':
+                    ingress.unlink()
+                    os.link(provision, ingress)
+                elif case == 'owner':
+                    os.chown(ingress, 65534, 65534)
+                else:
+                    self.helper.chmod(0o777)
+                result = self.run_wrapper('activate')
+                self.refused(result)
+                if case == 'directory':
+                    self.assertIn('[FAIL] helper directory ownership:', result.stderr)
+                    self.assertIn('[SKIP] p6_ingress.py ownership/mode', result.stderr)
+                else:
+                    self.assertIn('[FAIL] p6_ingress.py ownership/mode', result.stderr)
+
+    def test_wrapper_missing_python_nonroot_and_invalid_operation_never_dispatch(self):
+        self.write_runner(str(self.root / 'missing-python3'))
+        result = self.run_wrapper('activate')
+        self.refused(result)
+        self.assertIn('[FAIL] python3 available', result.stderr)
+        self.assertIn('[SKIP] p6_provision.py ownership/mode', result.stderr)
+        self.write_runner()
+        result = self.run_wrapper('activate', nonroot=True)
+        self.refused(result)
+        self.assertIn('[FAIL] root authority', result.stderr)
+        self.assertIn('[PASS] p6_provision.py ownership/mode', result.stderr)
+        result = self.run_wrapper('unknown')
+        self.refused(result)
+        self.assertIn('[FAIL] unsupported or missing operation', result.stderr)
+        self.assertIn('[PASS] p6_ingress.py ownership/mode', result.stderr)
+
+
 class IngressTests(unittest.TestCase):
     def setUp(self):
         # Native PrivateTmp units must read the same fixture authority. /run
