@@ -57,6 +57,8 @@
     incSubject: null,          // {type: "incident"|"marker", id, label}
     incSection: "samples"
   };
+  // Non-secret metadata and pending-operation key only, in page memory.
+  var p6View = {name: null, busy: false, retry: null, rows: [], next: null};
 
   function $(id) { return document.getElementById(id); }
   function show(el) { el.classList.remove("hidden"); }
@@ -858,7 +860,7 @@
       // EXACT grouping key: (cls, proto, dcls, port)
       var groups = {};
       rows.forEach(function (row) {
-        var key = [row.cls, row.proto, row.dcls, row.port].join(" ");
+        var key = [row.cls, row.proto, row.dcls, row.port].join("\u0000");
         if (!groups[key]) {
           groups[key] = {cls: row.cls, proto: row.proto, dcls: row.dcls,
                          port: row.port, total: 0, first: row.ts,
@@ -882,7 +884,7 @@
     if (data.section === "audit") {
       var audits = {};
       rows.forEach(function (row) {
-        var key = [row.kind, row.code].join(" ");
+        var key = [row.kind, row.code].join("\u0000");
         if (!audits[key]) {
           audits[key] = {kind: row.kind, code: row.code, total: 0,
                          first: row.epoch, last: row.epoch};
@@ -1163,6 +1165,7 @@
     $("e3-del-cancel").disabled = deleting && state.e3Mutation.inFlight;
     if (!writable) closeDeleteConfirm();
     if (state.e3Clients) renderE3Clients(state.e3Clients);
+    if (p6View.name && $("p6-device-panel")) renderP6Devices();
   }
 
   function loadE3Clients() {
@@ -1279,6 +1282,15 @@
           beginDeleteClient(client.name);
         });
         actions.appendChild(btn);
+      }
+      if (writable && client.name !== "legacy") {
+        var devices = document.createElement("button");
+        devices.className = "btn ghost";
+        devices.type = "button";
+        devices.textContent = "Devices / Bundle";
+        devices.disabled = !!state.e3Mutation;
+        devices.addEventListener("click", function () { openP6Devices(client.name); });
+        actions.appendChild(devices);
       }
     });
     if (!clients.length) {
@@ -1434,6 +1446,154 @@
                 "changed on the server.", true);
       loadE3Status();
     });
+  }
+
+  function p6Message(text, error) {
+    var el = $("p6-msg");
+    el.textContent = text;
+    el.className = "form-msg " + (error ? "error" : "ok");
+    show(el);
+  }
+
+  function p6Controls() {
+    ["p6-enroll", "p6-refresh", "p6-next", "p6-close"].forEach(function (id) {
+      $(id).disabled = p6View.busy || !e3Writable() || !!state.e3Mutation;
+    });
+    $("p6-enroll").disabled = $("p6-enroll").disabled || !!p6View.retry;
+    $("p6-retry").disabled = p6View.busy || !e3Writable();
+    if (p6View.retry) show($("p6-retry")); else hide($("p6-retry"));
+    if (p6View.next) show($("p6-next")); else hide($("p6-next"));
+    ["p6-device-name", "p6-site-label", "p6-path-label"].forEach(function (id) {
+      $(id).disabled = p6View.busy || !!p6View.retry || !e3Writable();
+    });
+  }
+
+  function renderP6Devices() {
+    var tbody = $("p6-devices-body");
+    while (tbody.firstChild) tbody.removeChild(tbody.firstChild);
+    p6View.rows.forEach(function (device) {
+      var row = tbody.insertRow(-1);
+      row.insertCell(-1).textContent = device.device + " / " + device.probe_id.slice(0, 11);
+      var confirmed = device.desired === device.verified;
+      row.insertCell(-1).textContent = confirmed
+        ? (device.desired === "active" ? "Enrollment verified" : "Revocation verified")
+        : (device.desired === "active" ? "Enrollment pending" : "Revocation pending");
+      var cell = row.insertCell(-1);
+      function action(text, call) {
+        var button = document.createElement("button");
+        button.className = "btn ghost";
+        button.type = "button";
+        button.textContent = text;
+        button.disabled = p6View.busy || !!p6View.retry || !e3Writable() || !!state.e3Mutation;
+        button.addEventListener("click", call);
+        cell.appendChild(button);
+      }
+      if (device.desired === "active" && device.verified === "active") {
+        action("Download Client Bundle", function () { downloadP6Bundle(device.device); });
+      }
+      if (device.desired === "active" && !confirmed) {
+        action("Verify again", function () {
+          p6Operate("resume", {name: p6View.name, device: device.device});
+        });
+      }
+      if (device.desired === "active" || !confirmed) {
+        action(device.desired === "active" ? "Revoke" : "Retry revocation", function () {
+          if (device.desired === "active" && !window.confirm("Revoke this device's P6 upload access? Its proxy account remains available.")) return;
+          p6Operate("revoke", {name: p6View.name, device: device.device});
+        });
+      }
+    });
+    p6Controls();
+  }
+
+  function openP6Devices(name) {
+    if (p6View.busy || !e3Writable() || state.e3Mutation) return;
+    if (p6View.retry && p6View.name !== name) {
+      e3Message("Resolve the previous device operation first.", true);
+      return;
+    }
+    p6View.name = name;
+    $("p6-client-name").textContent = name;
+    show($("p6-device-panel"));
+    loadP6Devices();
+  }
+
+  function loadP6Devices(cursor) {
+    if (p6View.busy || !p6View.name || !e3Writable()) return;
+    p6View.busy = true;
+    renderP6Devices();
+    var payload = {name: p6View.name};
+    if (cursor) payload.cursor = cursor;
+    api("/api/v1/clients/probes/list", {method: "POST", body: payload}).then(function (result) {
+      p6View.rows = result.data.devices;
+      p6View.next = result.data.next_cursor;
+      var pending = p6View.retry;
+      if (pending && p6View.rows.some(function (row) {
+        return row.device === pending.body.device && row.verified === row.desired &&
+          row.desired === (pending.op === "revoke" ? "revoked" : "active");
+      })) p6View.retry = null;
+    }).catch(function () {
+      p6View.rows = [];
+      p6View.next = null;
+      p6Message("Device status is unavailable. No enrollment or revocation has been confirmed.", true);
+    }).then(function () {
+      p6View.busy = false;
+      renderP6Devices();
+    });
+  }
+
+  function p6Operate(op, body, key, retry) {
+    if (p6View.busy || !e3Writable() || state.e3Mutation || (p6View.retry && !retry)) return;
+    p6View.busy = true;
+    renderP6Devices();
+    var intent = {op: op, body: body, key: key};
+    apiWithStepUp("/api/v1/clients/probes/" + op, {
+      method: "POST", body: body, idempotencyKey: key
+    }).then(function (result) {
+      p6View.retry = null;
+      if (op === "revoke") p6Message("Revocation verified by the server.", false);
+      else p6Message(result.data.verified === "active"
+        ? "Device enrollment verified. Download a bundle for this device."
+        : "This enrollment has been retired.", result.data.verified !== "active");
+    }).catch(function (error) {
+      if (error.message === "step-up cancelled") return;
+      if (error.uncertain || error.retriable) p6View.retry = intent;
+      p6Message(error.code === "E_P6_DEVICE_EXISTS"
+        ? "This device already has an enrollment. Refresh the list to download or verify it."
+        : "The operation was not confirmed. Refresh device status before retrying.", true);
+    }).then(function () {
+      p6View.busy = false;
+      renderP6Devices();
+      loadP6Devices();
+    });
+  }
+
+  function downloadP6Bundle(device) {
+    if (p6View.busy || !e3Writable() || state.e3Mutation || p6View.retry) return;
+    p6View.busy = true;
+    renderP6Devices();
+    var name = p6View.name;
+    apiWithStepUp("/api/v1/clients/bundle", {
+      method: "POST", body: {name: name, device: device}, raw: true
+    }).then(function (response) { return response.blob(); }).then(function (blob) {
+      var url = URL.createObjectURL(blob);
+      var link = document.createElement("a");
+      try {
+        link.href = url;
+        link.download = name + "-" + device + "-client-bundle.zip";
+        document.body.appendChild(link);
+        link.click();
+      } finally {
+        if (link.parentNode) link.parentNode.removeChild(link);
+        URL.revokeObjectURL(url);
+      }
+      p6Message("Client Bundle downloaded. Keep this device's credentials private.", false);
+    }).catch(function (error) {
+      if (error.message === "step-up cancelled") return;
+      p6Message(error.code === "E_P6_ARTIFACT"
+        ? "Bundle support is not prepared on the server. Contact the administrator."
+        : "The bundle could not be downloaded. Refresh status and try again explicitly.", true);
+    }).then(function () { p6View.busy = false; renderP6Devices(); });
   }
 
   function addClient(name, keyOverride) {
@@ -1748,6 +1908,20 @@
   /* ---------- wiring ---------- */
 
   function bind() {
+    if ($("p6-enroll-form")) {
+      $("p6-enroll-form").addEventListener("submit", function (event) {
+        event.preventDefault();
+        p6Operate("enroll", {name: p6View.name, device: $("p6-device-name").value.trim(),
+          site_label: $("p6-site-label").value.trim(), path_label: $("p6-path-label").value.trim()}, newIdempotencyKey());
+      });
+      $("p6-refresh").addEventListener("click", function () { loadP6Devices(); });
+      $("p6-next").addEventListener("click", function () { loadP6Devices(p6View.next); });
+      $("p6-close").addEventListener("click", function () { if (!p6View.busy) hide($("p6-device-panel")); });
+      $("p6-retry").addEventListener("click", function () {
+        var pending = p6View.retry;
+        if (pending) p6Operate(pending.op, pending.body, pending.key, true);
+      });
+    }
     document.querySelectorAll(".nav-item").forEach(function (item) {
       item.addEventListener("click", function () {
         setView(item.getAttribute("data-view"));

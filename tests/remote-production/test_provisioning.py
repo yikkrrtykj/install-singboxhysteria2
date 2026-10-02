@@ -49,7 +49,7 @@ class ProvisioningTests(unittest.TestCase):
         cls.cert_root.cleanup()
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(dir=getattr(self, 'TEMP_DIR', None))
         self.root = Path(self.tmp.name)
         self.gid = grp.getgrnam('sboxweb').gr_gid
         self.config_dir = self.root / 'config'
@@ -670,4 +670,9 @@ class ProvisioningTests(unittest.TestCase):
 if __name__ == '__main__':
     if sys.platform != 'linux' or os.geteuid() != 0:
         raise SystemExit('Linux root fixture required; no skipped acceptance')
-    unittest.main(verbosity=2)
+    result = unittest.main(verbosity=2, exit=False).result
+    if not result.wasSuccessful():
+        raise SystemExit(1)
+    # The native root CI entry exercises the sensitive download chain too;
+    # report its independent count, without rediscovering the original suite.
+    raise SystemExit(subprocess.call([sys.executable, str(ROOT / 'tests/remote-production/test_bundle_linux.py')]))

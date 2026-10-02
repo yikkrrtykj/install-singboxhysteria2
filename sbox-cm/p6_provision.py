@@ -551,10 +551,65 @@ class Provisioner:
             return {'devices': [self.public(state, row) for row in page],
                     'next_cursor': page[-1]['probe_id'] if len(rows) > 64 else None}
 
+    def export_material(self, name, device, generation):
+        """Fresh sensitive read for one live device of the current Client.
+
+        Caller holds canonical config.lock through YAML rendering and this
+        read. Never enroll, rotate, reconcile, revive or modify the ledger.
+        provision.lock orders export with revocation and identity installation.
+        """
+        for pattern, value in ((NAME, name), (NAME, device), (HEX64, generation)):
+            require(pattern, value)
+        with self._lock(os.path.join(self.state_dir, 'provision.lock'), 0o600, 0):
+            binding = self._binding()
+            state = self._load(binding)
+            row = next((row for row in state['records'] if (row['name'], row['device'],
+                        row['client_generation']) == (name, device, generation)), None)
+            if row is None:
+                raise ProvisionError('E_P6_NOT_ENROLLED')
+            if row['desired'] != 'active' or row['verified'] != 'active':
+                raise ProvisionError('E_P6_REVOKED')
+            expected = {'probe_id': row['probe_id'], 'enabled': True,
+                        'site_label': row['site_label'], 'path_label': row['path_label'],
+                        'key_file': row['probe_id'] + '.key'}
+            if next((entry for entry in self._registry() if entry['probe_id'] == row['probe_id']), None) != expected:
+                raise ProvisionError('E_P6_REGISTRY_CHANGED')
+            if self._read(os.path.join(self.key_dir, expected['key_file']), 0o640, self.gid, 128) != \
+                    (row['secret'] + '\n').encode('ascii'):
+                raise ProvisionError('E_P6_KEY_CHANGED')
+            if not self.proof(row, True):
+                raise ProvisionError('E_P6_LIVE_UNCONFIRMED')
+            certificate = self._read(os.path.join(self.config_dir, 'p6-server.pem'),
+                                     0o640, self.gid, 16384).decode('ascii')
+            if hashlib.sha256(ssl.PEM_cert_to_DER_cert(certificate)).hexdigest() != binding['certificate_sha256']:
+                raise ProvisionError('E_P6_BINDING')
+            return {'binding': binding, 'probe_id': row['probe_id'],
+                    'secret': row['secret'], 'certificate': certificate}
+
+    def resume(self, name, device, generation):
+        """Explicit recovery after the browser loses an enrollment key.
+
+        Reconcile only an existing current-generation live intent. No new
+        identity, changed labels/key, or revoked-intent resurrection is allowed.
+        """
+        for pattern, value in ((NAME, name), (NAME, device), (HEX64, generation)):
+            require(pattern, value)
+        with self._lock(os.path.join(self.state_dir, 'provision.lock'), 0o600, 0):
+            state = self._load(self._binding())
+            row = next((row for row in state['records'] if (row['name'], row['device'],
+                        row['client_generation']) == (name, device, generation)), None)
+            if row is None:
+                raise ProvisionError('E_P6_NOT_ENROLLED')
+            if row['desired'] != 'active':
+                raise ProvisionError('E_P6_REVOKED')
+            self._publish(state)
+            self._confirm(state, [row])
+            return self.public(state, row)
+
 
 def main():
     try:
-        if len(sys.argv) != 2 or sys.argv[1] not in ('enroll', 'revoke', 'retire', 'list'):
+        if len(sys.argv) != 2 or sys.argv[1] not in ('enroll', 'revoke', 'retire', 'list', 'resume'):
             raise ProvisionError('E_P6_SCHEMA')
         op = sys.argv[1]
         raw = sys.stdin.buffer.read(8193)
@@ -566,6 +621,7 @@ def main():
         allowed |= {'device'} if op == 'revoke' else set()
         allowed |= {'client_generation'} if op == 'retire' else set()
         allowed |= {'cursor'} if op == 'list' else set()
+        allowed |= {'device', 'client_generation'} if op == 'resume' else set()
         if type(args) is not dict or not set(args) <= allowed:
             raise ProvisionError('E_P6_SCHEMA')
         if os.environ.get('SBOX_CM_TEST_SANDBOX') == '1':
@@ -578,6 +634,8 @@ def main():
                                    'idempotency_key', 'site_label', 'path_label')))
         elif op in ('revoke', 'retire'):
             result = worker.revoke(args['name'], args.get('device'), args.get('client_generation'))
+        elif op == 'resume':
+            result = worker.resume(args['name'], args['device'], args['client_generation'])
         else:
             result = worker.listing(args['name'], args.get('cursor'))
         response = {'ok': True, 'data': result}

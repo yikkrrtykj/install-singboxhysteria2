@@ -543,4 +543,9 @@ def load_tests(loader, _tests, _pattern):
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    result = unittest.main(verbosity=2, exit=False).result
+    if not result.wasSuccessful():
+        raise SystemExit(1)
+    # Keep the existing cross-platform CI entry and its original count; run
+    # the separate bundle acceptance suite as a second explicit process.
+    raise SystemExit(subprocess.call([sys.executable, str(ROOT / 'tests/remote-production/test_bundle.py')]))

@@ -24,8 +24,9 @@ class Element {
   set textContent(v) { this.text = String(v); this.children = []; }
   get textContent() { return this.text + this.children.map(c => c.textContent).join(' '); }
   set innerHTML(v) { assert.equal(v, ''); this.textContent = ''; }
-  appendChild(c) { this.children.push(c); return c; }
-  removeChild(c) { this.children = this.children.filter(x => x !== c); return c; }
+  get firstChild() { return this.children[0] || null; }
+  appendChild(c) { c.parentNode = this; this.children.push(c); return c; }
+  removeChild(c) { c.parentNode = null; this.children = this.children.filter(x => x !== c); return c; }
   click() { if (this.events.click) return this.events.click(); }
   insertRow() { return this.appendChild(new Element('tr')); }
   insertCell() { return this.appendChild(new Element('td')); }
@@ -71,7 +72,7 @@ const createdUrls = [], revokedUrls = [];
 let urlSeq = 0;
 const context = vm.createContext({ document, console, Uint8Array, Date,
   crypto: require('node:crypto').webcrypto, setTimeout() {}, clearTimeout() {},
-  setInterval() {}, window: { location: {} },
+  setInterval() {}, window: { location: {}, confirm: () => true },
   URL: { createObjectURL: () => { const u = 'blob:ui-test-' + (++urlSeq);
          createdUrls.push(u); return u; },
          revokeObjectURL: u => revokedUrls.push(u) },
@@ -83,7 +84,7 @@ const context = vm.createContext({ document, console, Uint8Array, Date,
   }
 });
 vm.runInContext(app.replace('document.addEventListener("DOMContentLoaded", boot);',
-  'globalThis.ui = {state, bind, render, loadSession, loadE3Status, loadE3Clients, convergeAfterMutation, renderE3Controls, renderE3Clients, renderMonitorInfo, addClient, deleteClient, downloadConfig, setPendingRetry, retryPending, apiWithStepUp, setView, loadIncidents, renderIncidents, openIncident, renderIncidentDetail, closeIncidentDetail, loadEvidence, loadMarkers, renderMarkers, addMarker, rearmIncidents, renderIncRuntime};'), context);
+  'globalThis.ui = {state, bind, render, loadSession, loadE3Status, loadE3Clients, convergeAfterMutation, renderE3Controls, renderE3Clients, renderMonitorInfo, addClient, deleteClient, downloadConfig, setPendingRetry, retryPending, apiWithStepUp, setView, loadIncidents, renderIncidents, openIncident, renderIncidentDetail, closeIncidentDetail, loadEvidence, loadMarkers, renderMarkers, addMarker, rearmIncidents, renderIncRuntime, p6View, openP6Devices, loadP6Devices, p6Operate, downloadP6Bundle, renderP6Devices};'), context);
 const ui = context.ui;
 // 0.1.4: the convergence chain (mutation -> one endpoint -> apply) crosses
 // several cross-realm promise reactions; 12 ticks starved it. Drain
@@ -877,6 +878,97 @@ async function main() {
     assert.ok(!ids['inc-list-card'].className.includes('hidden'));
     productText();
   });
-  assert.equal(count, 90, 'UI assertion count guard');
+  assert.equal(count, 90, 'existing UI assertion count guard');
+  ui.state.e3Mutation = null; ui.state.e3PendingRetry = null;
+  ui.state.session = {authenticated: true, csrf_token: 'csrf'};
+  setStatus(healthy()); ui.renderE3Clients(clients);
+  const device = {device: 'laptop-01', probe_id: 'probe-001', desired: 'active', verified: 'active'};
+  const listDevices = (rows = [device], next = null) => response({ok: true, data: {devices: rows, next_cursor: next}});
+  check('P6: only mutable named clients have Devices / Bundle; existing YAML controls remain', () => {
+    assert.doesNotMatch(ids['e3-clients-body'].children[0].textContent, /Devices/);
+    assert.match(ids['e3-clients-body'].children[1].textContent, /Download.*Delete.*Devices \/ Bundle/);
+    assert.match(ids['p6-device-panel'].textContent, /Windows setup is not available yet/);
+  });
+  responses.push(listDevices()); ui.openP6Devices('alice'); await flush();
+  check('P6: metadata list is POST plus CSRF without an enrollment key', () => {
+    const req = requests.at(-1);
+    assert.equal(req.url, '/api/v1/clients/probes/list'); assert.equal(req.method, 'POST');
+    assert.equal(req.headers['X-CSRF-Token'], 'csrf'); assert.ok(!('Idempotency-Key' in req.headers));
+    assert.deepEqual(JSON.parse(req.body), {name: 'alice'});
+    assert.match(ids['p6-devices-body'].textContent, /Enrollment verified.*Download Client Bundle.*Revoke/);
+  });
+  const beforeUrls = createdUrls.length;
+  responses.push(fileResponse('fixture ZIP credential bytes')); ui.downloadP6Bundle('laptop-01'); await flush();
+  check('P6: ZIP goes straight to a Blob; object URL and temporary anchor are released', () => {
+    const req = requests.at(-1);
+    assert.deepEqual(JSON.parse(req.body), {name: 'alice', device: 'laptop-01'});
+    assert.equal(req.url, '/api/v1/clients/bundle'); assert.ok(!('Idempotency-Key' in req.headers));
+    assert.equal(createdUrls.length, beforeUrls + 1); assert.equal(revokedUrls.at(-1), createdUrls.at(-1));
+    assert.equal(document.body.children.length, 0);
+    assert.doesNotMatch(dom.textContent, /fixture ZIP credential bytes/);
+  });
+  responses.push(response({code: 'E_P6_ARTIFACT'}, 503)); ui.downloadP6Bundle('laptop-01'); await flush();
+  check('P6: artifact failure stays explicit and does not automatically retry a sensitive download', () => {
+    assert.match(ids['p6-msg'].textContent, /not prepared/); assert.equal(ui.p6View.busy, false);
+    assert.equal(createdUrls.length, beforeUrls + 1);
+  });
+  responses.push(listDevices([{...device, verified: 'pending'}])); ui.loadP6Devices(); await flush();
+  check('P6: pending enrollment offers Verify again and cannot download credentials', () => {
+    assert.match(ids['p6-devices-body'].textContent, /Enrollment pending.*Verify again/);
+    assert.doesNotMatch(ids['p6-devices-body'].textContent, /Download Client Bundle/);
+  });
+  responses.push(response({ok: true, data: device}), listDevices());
+  ui.p6Operate('resume', {name: 'alice', device: 'laptop-01'}); await flush();
+  check('P6: lost browser intent can verify the existing identity without a new enrollment key', () => {
+    const req = requests.findLast(r => r.url.endsWith('/resume'));
+    assert.ok(!('Idempotency-Key' in req.headers)); assert.deepEqual(JSON.parse(req.body), {name: 'alice', device: 'laptop-01'});
+    assert.match(ids['p6-msg'].textContent, /enrollment verified/);
+  });
+  const newDevice = {name: 'alice', device: 'laptop-02', site_label: 'office', path_label: 'operator-path'};
+  responses.push(response({code: 'result_unknown', uncertain: true, retriable: true}, 504), listDevices());
+  ui.p6Operate('enroll', newDevice, 'enrollment-ui-000001'); await flush();
+  check('P6: an uncertain enrollment keeps its exact intent and locks new enrollment', () => {
+    assert.equal(ui.p6View.retry.key, 'enrollment-ui-000001'); assert.equal(ids['p6-enroll'].disabled, true);
+    const n = requests.length; ui.p6Operate('enroll', {...newDevice, device: 'laptop-03'}, 'another-key');
+    ui.openP6Devices('bob'); ui.downloadP6Bundle('laptop-01'); assert.equal(requests.length, n);
+  });
+  responses.push(response({ok: true, data: {...device, device: 'laptop-02'}}), listDevices());
+  ids['p6-retry'].click(); await flush();
+  check('P6: explicit retry reuses the same enrollment key, then clears the pending intent', () => {
+    const reqs = requests.filter(r => r.url.endsWith('/enroll'));
+    assert.equal(reqs.at(-1).headers['Idempotency-Key'], reqs.at(-2).headers['Idempotency-Key']);
+    assert.equal(reqs.at(-1).body, reqs.at(-2).body); assert.equal(ui.p6View.retry, null);
+  });
+  const revoked = {...device, desired: 'revoked', verified: 'revoked'};
+  responses.push(response({ok: true, data: {revoked: true, count: 1}}), listDevices([revoked]));
+  ui.p6Operate('revoke', {name: 'alice', device: 'laptop-01'}); await flush();
+  check('P6: confirmed revocation removes download and recovery actions', () => {
+    assert.match(ids['p6-devices-body'].textContent, /Revocation verified/);
+    assert.doesNotMatch(ids['p6-devices-body'].textContent, /Download|Verify again|Retry revocation/);
+    assert.match(ids['p6-msg'].textContent, /Revocation verified by the server/);
+  });
+  responses.push(listDevices([{...revoked, verified: 'pending'}], 'probe-cursor')); ui.loadP6Devices(); await flush();
+  check('P6: pending revocation and bounded pagination remain explicit', () => {
+    assert.match(ids['p6-devices-body'].textContent, /Revocation pending.*Retry revocation/);
+    assert.equal(ids['p6-next'].className.includes('hidden'), false);
+  });
+  responses.push(listDevices([], null)); ids['p6-next'].click(); await flush();
+  check('P6: paging sends only the server-issued cursor and replaces the current page', () => {
+    assert.deepEqual(JSON.parse(requests.at(-1).body), {name: 'alice', cursor: 'probe-cursor'});
+    assert.equal(ids['p6-devices-body'].children.length, 0);
+  });
+  responses.push(() => Promise.reject(new Error('network'))); ui.loadP6Devices(); await flush();
+  check('P6: unavailable metadata does not invent successful enrollment or revocation', () => {
+    assert.match(ids['p6-msg'].textContent, /No enrollment or revocation has been confirmed/);
+    assert.equal(ids['p6-devices-body'].children.length, 0);
+  });
+  setStatus({...healthy(), transport: 'stale'});
+  check('P6: stale management disables all device dispatch paths', () => {
+    const n = requests.length; ui.openP6Devices('bob'); ui.loadP6Devices();
+    ui.p6Operate('revoke', {name: 'alice', device: 'laptop-01'}); ui.downloadP6Bundle('laptop-01');
+    assert.equal(requests.length, n); assert.equal(ids['p6-enroll'].disabled, true);
+    assert.equal(ui.p6View.busy, false);
+  });
+  assert.equal(count, 103, 'UI assertion count guard');
 }
 main().catch(err => { console.error(err); process.exitCode = 1; });

@@ -245,6 +245,30 @@
           <input id="e3-add-name" type="text" maxlength="32" placeholder="client name" autocomplete="off" disabled>
           <button id="e3-add-btn" class="btn" type="button" disabled>Add client</button>
         </div>
+        <section id="p6-device-panel" class="hidden" aria-labelledby="p6-device-heading">
+          <h3 id="p6-device-heading">Devices for <span id="p6-client-name"></span></h3>
+          <p class="muted">Each device needs its own enrollment and Client Bundle. Bundles contain credentials; keep them private. Windows setup is not available yet.</p>
+          <div class="row">
+            <button id="p6-refresh" class="btn ghost" type="button">Refresh devices</button>
+            <button id="p6-next" class="btn ghost hidden" type="button">Next page</button>
+            <button id="p6-close" class="btn ghost" type="button">Close</button>
+          </div>
+          <div class="table-card">
+            <table class="table"><thead><tr><th>Device</th><th>Enrollment</th><th>Action</th></tr></thead>
+              <tbody id="p6-devices-body"></tbody>
+            </table>
+          </div>
+          <form id="p6-enroll-form">
+            <div class="row">
+              <label>Device <input id="p6-device-name" maxlength="32" placeholder="laptop-01" autocomplete="off" required></label>
+              <label>Site <input id="p6-site-label" maxlength="64" value="office" autocomplete="off" required></label>
+              <label>Path label <input id="p6-path-label" maxlength="64" value="operator-path" autocomplete="off" required></label>
+              <button id="p6-enroll" class="btn" type="submit">Enroll device</button>
+            </div>
+          </form>
+          <p id="p6-msg" class="form-msg hidden" role="status"></p>
+          <button id="p6-retry" class="btn hidden" type="button">Retry previous operation</button>
+        </section>
         <div id="e3-delete-box" class="hidden">
           <p class="muted">You are deleting client <strong id="e3-del-name"></strong>. This cannot be undone from this page.</p>
           <div class="row">

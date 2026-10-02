@@ -78,21 +78,23 @@ OPS = {
     # reserved-name wall. It carries no idempotency key: nothing to dedupe.
     "client.export": {"required": ("name",), "optional": ("actor",),
                       "lock": True, "allow_reserved": True},
+    "client.bundle": {"required": ("name", "device"), "optional": ("actor",), "lock": True},
     "probe.enroll": {"required": ("name", "device", "idempotency_key", "site_label", "path_label"),
                      "optional": ("actor",), "lock": True},
     "probe.revoke": {"required": ("name", "device"), "optional": ("actor",), "lock": True},
     "probe.list": {"required": ("name",), "optional": ("cursor",), "lock": True},
+    "probe.resume": {"required": ("name", "device"), "optional": ("actor",), "lock": True},
 }
 BASE_FIELDS = ("v", "request_id", "op")
 
 # M4: ops whose RESPONSE may carry credential material. Their responses are
 # never written to the replay cache, so a repeated request_id re-dispatches
 # (fresh render, fresh audit) instead of replaying a cached secret.
-SENSITIVE_RESPONSE_OPS = {"client.export"}
+SENSITIVE_RESPONSE_OPS = {"client.export", "client.bundle"}
 # Lifecycle acknowledgements must be fresh, including after a failed first
 # attempt or a revocation. They carry no credentials but may not replay stale
 # live-effectiveness claims from the daemon's request_id cache.
-FRESH_RESPONSE_OPS = SENSITIVE_RESPONSE_OPS | {"probe.enroll", "probe.revoke", "probe.list"}
+FRESH_RESPONSE_OPS = SENSITIVE_RESPONSE_OPS | {"probe.enroll", "probe.revoke", "probe.list", "probe.resume"}
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
 REQID_RE = re.compile(r"^[A-Za-z0-9._-]{16,64}$")

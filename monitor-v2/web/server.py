@@ -32,6 +32,7 @@ import json
 import math
 import re
 import sys
+import threading
 import time
 import traceback
 from http.cookies import SimpleCookie
@@ -41,6 +42,8 @@ from urllib.parse import parse_qs, urlsplit
 from web.access import host_entry_for_ip
 from web.e3_broker import BrokerUnavailable
 from web.e3rpc import RpcTransportError
+from p6_artifact import ArtifactError, read_artifact
+from web.p6_bundle import BundleError, assemble as assemble_p6_bundle
 from web import incident_presenter as incident_presenter
 from web import incident_history as ih_outcomes
 from web.incident_history import (MARKER_KINDS, QUERY_LIMIT_DEFAULT,
@@ -211,6 +214,24 @@ MUTATION_ROUTES = {
     "/api/v1/management/deactivate": "management.deactivate",
     "/api/v1/clients/add": "client.add",
     "/api/v1/clients/delete": "client.delete",
+}
+
+P6_ROUTES = {
+    '/api/v1/clients/probes/list': 'probe.list',
+    '/api/v1/clients/probes/enroll': 'probe.enroll',
+    '/api/v1/clients/probes/revoke': 'probe.revoke',
+    '/api/v1/clients/probes/resume': 'probe.resume',
+    '/api/v1/clients/bundle': 'client.bundle',
+}
+P6_ERROR_HTTP = {
+    'E_P6_SCHEMA': 400, 'E_P6_NOT_ENROLLED': 404, 'E_P6_REVOKED': 409,
+    'E_P6_BINDING': 409, 'E_P6_BINDING_CHANGED': 409, 'E_P6_DEVICE_EXISTS': 409,
+    'E_P6_IDEMPOTENCY_CONFLICT': 409, 'E_P6_KEY_CHANGED': 409,
+    'E_P6_REGISTRY_CHANGED': 409, 'E_P6_LIVE_UNCONFIRMED': 503,
+    'E_P6_CONFIRM_PENDING': 503, 'E_P6_CAPACITY': 507, 'E_P6_BUSY': 423,
+    'E_P6_AUTHORITY': 503, 'E_P6_STATE': 503, 'E_P6_REGISTRY': 503,
+    'E_P6_ARTIFACT': 503, 'E_P6_UNAVAILABLE': 503, 'E_AUDIT_UNAVAILABLE': 503,
+    'E_P6_BUNDLE': 502,
 }
 
 # ---------------------------------------------------------------- M2 adapter --
@@ -455,7 +476,7 @@ class MonitorWebApp:
                  remote_mode=False, version=MONITOR_WEB_VERSION,
                  recovery_guard=None, management_active=None, e3_broker=None,
                  incident_history=None, probe_scheduler=None,
-                 incident_scanner=None, remote_plane=None):
+                 incident_scanner=None, remote_plane=None, bundle_artifact=None):
         self.broker = broker
         self.access = access
         self.auth = auth
@@ -492,6 +513,8 @@ class MonitorWebApp:
         # broker and no provider exist, which stays the fail-closed default).
         self._management_active = management_active
         self.e3_broker = e3_broker
+        self.bundle_artifact = bundle_artifact or read_artifact
+        self.bundle_slots = threading.BoundedSemaphore(2)
         self._static_cache = {}
 
     def probe_status(self):
@@ -865,6 +888,9 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/v1/clients/export":
             self._method_not_allowed(allowed="POST")
             return
+        if path in P6_ROUTES:
+            self._method_not_allowed(allowed="POST")
+            return
         self._send_json(404, {"error": "not found"})
 
     def _body_header_error(self):
@@ -946,6 +972,13 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             # FRESH management gate refuses dispatch unless the helper plane
             # is provably healthy at that moment.
             self._require_step_up(self._handle_e3_export)
+            return
+        if path in P6_ROUTES:
+            op = P6_ROUTES[path]
+            if op == 'probe.list':
+                self._require_csrf_actor(self._handle_p6_request, op)
+            else:
+                self._require_step_up(self._handle_p6_request, op)
             return
         if path == "/api/v1/clients/convergence":
             # 0.1.4: GET-only. A POST on this route is a method error, not a
@@ -2108,7 +2141,140 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
                        "request_id": verdict.get("request_id")})
         self._send_json(E3_ERROR_HTTP.get(mapped["code"], 500), mapped)
 
-    # -- M4 export: the one sensitive delivery -------------------------------
+    # -- P6B2 device lifecycle and the separate sensitive bundle read ----------
+
+    def _p6_failure(self, code):
+        # Never echo arbitrary helper detail/data on this credential surface.
+        if code not in P6_ERROR_HTTP and code not in E3_ERROR_HTTP:
+            code = 'E_P6_UNAVAILABLE'
+        self._send_json(P6_ERROR_HTTP.get(code, E3_ERROR_HTTP.get(code, 503)),
+                        {'ok': False, 'code': code, 'error': 'P6 operation unavailable',
+                         'retriable': code in ('E_P6_LIVE_UNCONFIRMED', 'E_P6_UNAVAILABLE',
+                                               'E_P6_CONFIRM_PENDING', 'E_P6_BUSY', 'E_LOCK')})
+
+    def _p6_public_device(self, row):
+        if type(row) is not dict:
+            raise BundleError()
+        public = {}
+        for field, pattern in (('name', E3_NAME_RE), ('device', E3_NAME_RE),
+                ('probe_id', re.compile(r'[a-z0-9-]{1,64}')),
+                ('server_id', re.compile(r'[0-9a-f]{32}')),
+                ('certificate_sha256', re.compile(r'[0-9a-f]{64}'))):
+            value = row.get(field)
+            if type(value) is not str or not pattern.fullmatch(value):
+                raise BundleError()
+            public[field] = value
+        if row.get('desired') not in ('active', 'revoked') or row.get('verified') not in ('pending', 'active', 'revoked'):
+            raise BundleError()
+        epoch = row.get('verified_epoch')
+        if epoch is not None and (type(epoch) is not int or epoch < 0):
+            raise BundleError()
+        endpoint = row.get('ingest_url')
+        if type(endpoint) is not str or len(endpoint) > 256 or not re.fullmatch(
+                r'https://(?:[0-9.]+|\[[0-9a-fA-F:]+\]):[0-9]+/api/v1/remote-probes/ingest', endpoint):
+            raise BundleError()
+        public.update(desired=row['desired'], verified=row['verified'], verified_epoch=epoch, ingest_url=endpoint)
+        return public
+
+    def _handle_p6_request(self, session, actor, op):
+        body = self._json_body()
+        keys = {'name', 'device'} if op in ('probe.revoke', 'probe.resume', 'client.bundle') else \
+               {'name', 'device', 'site_label', 'path_label'} if op == 'probe.enroll' else {'name'}
+        allowed = keys | ({'cursor'} if op == 'probe.list' else set())
+        if type(body) is not dict or not keys <= set(body) or not set(body) <= allowed:
+            self._p6_failure('E_P6_SCHEMA')
+            return
+        for field in ('name', 'device'):
+            if field in body and (type(body[field]) is not str or not E3_NAME_RE.fullmatch(body[field])):
+                self._p6_failure('E_P6_SCHEMA')
+                return
+        if body['name'] == E3_RESERVED_NAME:
+            self._p6_failure('E_RESERVED_NAME')
+            return
+        key = self.headers.get(IDEMPOTENCY_HEADER)
+        if op == 'probe.enroll':
+            if type(key) is not str or not E3_KEY_RE.fullmatch(key) or any(
+                    type(body[field]) is not str or not re.fullmatch(r'[ -~]{1,64}', body[field])
+                    for field in ('site_label', 'path_label')):
+                self._p6_failure('E_P6_SCHEMA')
+                return
+            body['idempotency_key'] = key
+        elif key is not None:
+            self._p6_failure('E_P6_SCHEMA')
+            return
+        if 'cursor' in body and (type(body['cursor']) is not str or not re.fullmatch(r'[a-z0-9-]{1,64}', body['cursor'])):
+            self._p6_failure('E_P6_SCHEMA')
+            return
+        broker = self.app.e3_broker
+        if broker is None:
+            self._e3_unavailable()
+            return
+        slot = op == 'client.bundle'
+        if slot and not self.app.bundle_slots.acquire(blocking=False):
+            self._send_json(429, {'ok': False, 'code': 'bundle_busy', 'error': 'try again later'})
+            return
+        try:
+            generic = None
+            if slot:
+                # No artifact I/O or credential RPC occurs before the HTTP
+                # auth spine and the broker's fresh management proof.
+                broker.require_export_ready()
+                _, generic = self.app.bundle_artifact()
+            verdict = broker.p6_request(op, body, actor=actor)
+            if verdict.get('ok') is not True:
+                error = verdict.get('error')
+                self._p6_failure(error.get('code') if type(error) is dict else 'E_P6_UNAVAILABLE')
+                return
+            data = verdict.get('data')
+            if slot:
+                content = assemble_p6_bundle(body['name'], body['device'], data, generic)
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/zip')
+                self.send_header('Content-Disposition', 'attachment; filename="%s-%s-client-bundle.zip"' %
+                                 (body['name'], body['device']))
+                self.send_header('Content-Length', str(len(content)))
+                self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate')
+                self.send_header('Pragma', 'no-cache')
+                self.send_header('Expires', '0')
+                for hname, hvalue in SECURITY_HEADERS:
+                    self.send_header(hname, hvalue)
+                self.end_headers()
+                self.connection.settimeout(10)
+                self.wfile.write(content)
+                return
+            if type(data) is not dict:
+                raise BundleError()
+            if op == 'probe.list':
+                rows = data.get('devices')
+                cursor = data.get('next_cursor')
+                if type(rows) is not list or len(rows) > 64 or (cursor is not None and
+                        (type(cursor) is not str or not re.fullmatch(r'[a-z0-9-]{1,64}', cursor))):
+                    raise BundleError()
+                result = {'devices': [self._p6_public_device(row) for row in rows], 'next_cursor': cursor}
+            elif op in ('probe.enroll', 'probe.resume'):
+                result = self._p6_public_device(data)
+            else:
+                if data.get('revoked') is not True or type(data.get('count')) is not int or not 0 <= data['count'] <= 4096:
+                    raise BundleError()
+                result = {'revoked': True, 'count': data['count']}
+            self._send_json(200, {'ok': True, 'data': result})
+        except BrokerUnavailable:
+            self._e3_unavailable('fresh management gate not satisfied; P6 was not dispatched')
+        except RpcTransportError as exc:
+            if exc.stage == 'connect':
+                self._e3_unavailable()
+            else:
+                self._send_json(504, {'ok': False, 'code': 'result_unknown',
+                                    'error': 'retry explicitly', 'uncertain': True, 'retriable': True})
+        except ArtifactError:
+            self._p6_failure('E_P6_ARTIFACT')
+        except BundleError:
+            self._p6_failure('E_P6_BUNDLE')
+        finally:
+            if slot:
+                self.app.bundle_slots.release()
+
+    # -- M4 export: canonical YAML delivery remains unchanged ------------------
 
     EXPORT_MAX_BYTES = 49152   # 48 KiB; mirrors the worker cap (defence in
                                # depth -- a larger body is refused, never

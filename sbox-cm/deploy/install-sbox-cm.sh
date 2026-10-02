@@ -77,6 +77,9 @@ cmd_install() {
     need_file "$SRC_DIR/sbox-cm-ops"
     need_file "$SRC_DIR/p6_provision.py"
     need_file "$SRC_DIR/p6_ingress.py"
+    need_file "$SRC_DIR/p6_bundle.py"
+    need_file "$SRC_DIR/../monitor-v2/p6_artifact.py"
+    need_file "$SRC_DIR/../tools/build-p6-artifact.py"
     need_file "$SRC_DIR/../lib/client-management.sh"
     need_file "$SRC_DIR/../lib/sbox-cm-state.sh"
 
@@ -96,6 +99,36 @@ cmd_install() {
     install -m 0755 "$SRC_DIR/sbox-cm-ops" "$dest_libexec/sbox-cm-ops" || die "安装 sbox-cm-ops 失败"
     install -m 0644 "$SRC_DIR/p6_provision.py" "$dest_libexec/p6_provision.py" || die "安装 P6 lifecycle worker 失败"
     install -m 0644 "$SRC_DIR/p6_ingress.py" "$dest_libexec/p6_ingress.py" || die "安装 P6 ingress worker 失败"
+    install -m 0644 "$SRC_DIR/p6_bundle.py" "$dest_libexec/p6_bundle.py" || die "安装 P6 bundle worker 失败"
+    install -m 0644 "$SRC_DIR/../monitor-v2/p6_artifact.py" "$dest_libexec/p6_artifact.py" || die "安装 P6 artifact validator 失败"
+    # Public generic code only. No device/YAML/key is ever written here.
+    # During a two-file upgrade a mismatched digest refuses export; no stale
+    # credential ZIP is cached. All new builder failures are explicit.
+    local artifact_dir="$dest_libexec/p6-artifact" artifact_stage
+    if [ -e "$artifact_dir" ] || [ -L "$artifact_dir" ]; then
+        [ -d "$artifact_dir" ] && [ ! -L "$artifact_dir" ] || die "P6 artifact 目录不安全"
+        if [ -z "${SBXCM_PREFIX:-}" ]; then
+            [ "$(stat -c '%u %g %a' "$artifact_dir")" = "0 0 755" ] || die "P6 artifact 目录权限不安全"
+        fi
+    else
+        mkdir -m 0755 "$artifact_dir" || die "无法创建 P6 artifact 目录"
+    fi
+    artifact_stage="$(mktemp -d "$dest_libexec/.p6-artifact.XXXXXX")" || die "无法暂存 P6 artifact"
+    if ! python3 -I "$SRC_DIR/../tools/build-p6-artifact.py" "$artifact_stage"; then
+        rm -r -- "$artifact_stage"
+        die "P6 artifact 生成失败"
+    fi
+    for artifact_name in p6-agent.pyz artifact.json; do
+        if [ -e "$artifact_dir/$artifact_name" ] || [ -L "$artifact_dir/$artifact_name" ]; then
+            [ -f "$artifact_dir/$artifact_name" ] && [ ! -L "$artifact_dir/$artifact_name" ] || die "P6 artifact 文件不安全"
+            if [ -z "${SBXCM_PREFIX:-}" ]; then
+                [ "$(stat -c '%u %g %a %h' "$artifact_dir/$artifact_name")" = "0 0 644 1" ] || die "P6 artifact 文件权限不安全"
+            fi
+        fi
+        chmod 0644 "$artifact_stage/$artifact_name" || die "P6 artifact 权限设置失败"
+        mv -f -- "$artifact_stage/$artifact_name" "$artifact_dir/$artifact_name" || die "P6 artifact 发布失败"
+    done
+    rmdir -- "$artifact_stage" || die "P6 artifact 暂存清理失败"
     install -m 0644 "$SRC_DIR/../lib/client-management.sh" \
         "$dest_libexec/lib/client-management.sh" || die "安装共享库失败"
     install -m 0644 "$SRC_DIR/../lib/sbox-cm-state.sh" \

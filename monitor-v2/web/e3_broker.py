@@ -403,6 +403,12 @@ class E3Broker:
         cached, replayed or stored by the broker. Transport errors and
         helper verdicts propagate untouched -- same single-dispatch rule as
         ``mutate``; no automatic retry is ever performed here."""
+        self.require_export_ready()
+        return self.client.call(EXPORT_OP, payload={"name": name},
+                                actor=actor)
+
+    def require_export_ready(self):
+        """Shared fresh-only gate; no sensitive result is stored here."""
         with self._mutex:
             if self._state != "closed":
                 raise BrokerUnavailable(
@@ -425,5 +431,9 @@ class E3Broker:
         if not ok:
             raise BrokerUnavailable("management gate not satisfied; "
                                     "export refused")
-        return self.client.call(EXPORT_OP, payload={"name": name},
-                                actor=actor)
+
+    def p6_request(self, op, payload, actor=None):
+        if op not in ('probe.enroll', 'probe.revoke', 'probe.list', 'probe.resume', 'client.bundle'):
+            raise BrokerUnavailable('unknown P6 operation')
+        self.require_export_ready()
+        return self.client.call(op, payload=payload, actor=actor)
