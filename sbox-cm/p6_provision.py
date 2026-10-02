@@ -37,7 +37,7 @@ PROBE = re.compile(r'\A[a-z0-9-]{1,64}\Z')
 LABEL = re.compile(r'\A[ -~]{1,64}\Z')
 KEYFILE = re.compile(r'\A[a-z0-9][a-z0-9._-]{0,127}\Z')
 ROW_KEYS = {'name', 'device', 'client_generation', 'enrollment', 'probe_id',
-            'secret', 'site_label', 'path_label', 'desired', 'verified'}
+            'secret', 'site_label', 'path_label', 'desired', 'verified', 'verified_epoch'}
 
 
 class ProvisionError(Exception):
@@ -328,7 +328,10 @@ class Provisioner:
             if row['probe_id'] in probes or row['enrollment'] in enrollments or slot in slots or \
                     row['desired'] not in ('active', 'revoked') or \
                     row['verified'] not in ('pending', 'active', 'revoked') or \
-                    (row['desired'] == 'revoked' and row['verified'] == 'active'):
+                    (row['desired'] == 'revoked' and row['verified'] == 'active') or \
+                    (row['verified'] == 'pending' and row['verified_epoch'] is not None) or \
+                    (row['verified'] != 'pending' and (type(row['verified_epoch']) is not int or
+                                                      row['verified_epoch'] < 0)):
                 raise ProvisionError('E_P6_STATE')
             probes.add(row['probe_id']); enrollments.add(row['enrollment']); slots.add(slot)
         return state
@@ -430,6 +433,7 @@ class Provisioner:
                 raise ProvisionError('E_P6_LIVE_UNCONFIRMED')
             self.fault('live_confirmed')
             row['verified'] = row['desired']
+            row['verified_epoch'] = int(time.time())
             self._save(state)
             if not active:
                 path = os.path.join(self.key_dir, row['probe_id'] + '.key')
@@ -441,7 +445,7 @@ class Provisioner:
 
     @staticmethod
     def public(state, row):
-        return {field: row[field] for field in ('name', 'device', 'probe_id', 'desired', 'verified')} | {
+        return {field: row[field] for field in ('name', 'device', 'probe_id', 'desired', 'verified', 'verified_epoch')} | {
             'server_id': state['binding']['server_id'],
             'certificate_sha256': state['binding']['certificate_sha256'],
             'ingest_url': state['binding']['ingest_url']}
@@ -478,7 +482,7 @@ class Provisioner:
                     raise ProvisionError('E_P6_IDENTITY_COLLISION')
                 row = dict(zip(('name', 'device', 'client_generation', 'site_label', 'path_label'), semantic))
                 row.update(enrollment=enrollment, probe_id=probe, secret=secrets.token_hex(32),
-                           desired='active', verified='pending')
+                           desired='active', verified='pending', verified_epoch=None)
                 state['records'].append(row)
                 self._save(state)
                 self.fault('intent_durable')
@@ -502,19 +506,27 @@ class Provisioner:
                     (device is None or r['device'] == device) and
                     (generation is None or r['client_generation'] == generation)]
             for row in rows:
-                row.update(desired='revoked', verified='pending')
+                row.update(desired='revoked', verified='pending', verified_epoch=None)
             self._save(state)
             self.fault('intent_durable')
             self._publish(state)
             self._confirm(state, rows)
             return {'revoked': True, 'count': len(rows)}
 
-    def listing(self, name):
+    def listing(self, name, cursor=None):
         require(NAME, name)
+        if cursor is not None:
+            require(PROBE, cursor)
         with self._lock(os.path.join(self.state_dir, 'provision.lock'), 0o600, 0):
             state = self._load()
-            return {'devices': [] if state is None else [self.public(state, row)
-                    for row in state['records'] if row['name'] == name]}
+            rows = [] if state is None else sorted((row for row in state['records']
+                    if row['name'] == name and (cursor is None or row['probe_id'] > cursor)),
+                    key=lambda row: row['probe_id'])
+            page = rows[:64]
+            # Every response remains comfortably below the existing 64-KiB
+            # RPC frame cap even after lifetime tombstones accumulate.
+            return {'devices': [self.public(state, row) for row in page],
+                    'next_cursor': page[-1]['probe_id'] if len(rows) > 64 else None}
 
 
 def main():
@@ -530,6 +542,7 @@ def main():
         allowed |= {'device', 'client_generation', 'idempotency_key', 'site_label', 'path_label'} if op == 'enroll' else set()
         allowed |= {'device'} if op == 'revoke' else set()
         allowed |= {'client_generation'} if op == 'retire' else set()
+        allowed |= {'cursor'} if op == 'list' else set()
         if type(args) is not dict or not set(args) <= allowed:
             raise ProvisionError('E_P6_SCHEMA')
         if os.environ.get('SBOX_CM_TEST_SANDBOX') == '1':
@@ -543,7 +556,7 @@ def main():
         elif op in ('revoke', 'retire'):
             result = worker.revoke(args['name'], args.get('device'), args.get('client_generation'))
         else:
-            result = worker.listing(args['name'])
+            result = worker.listing(args['name'], args.get('cursor'))
         response = {'ok': True, 'data': result}
     except ProvisionError as exc:
         response = {'ok': False, 'code': exc.code}

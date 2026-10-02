@@ -117,8 +117,11 @@ class ProvisioningTests(unittest.TestCase):
         original = self.enroll()
         secret = self.row()['secret']
         again = p6.Provisioner(str(self.state_dir), str(self.config_dir), self.worker.port, fixture=True)
-        self.assertEqual(again.enroll('event-pc', 'laptop-01', self.generation,
-                                     'enrollment-00000001', 'office', 'operator-path'), original)
+        result = again.enroll('event-pc', 'laptop-01', self.generation,
+                              'enrollment-00000001', 'office', 'operator-path')
+        self.assertEqual({k: v for k, v in result.items() if k != 'verified_epoch'},
+                         {k: v for k, v in original.items() if k != 'verified_epoch'})
+        self.assertGreaterEqual(result['verified_epoch'], original['verified_epoch'])
         self.assertEqual(self.row()['secret'], secret)
 
     def test_idempotency_semantic_conflict_and_duplicate_slot_refused(self):
@@ -224,6 +227,47 @@ class ProvisioningTests(unittest.TestCase):
         self.assertEqual(result['verified'], 'active')
         st = self.config_dir.stat()
         self.assertEqual((st.st_uid, st.st_gid, st.st_mode & 0o777), (0, 0, 0o755))
+
+    def test_real_systemd_sandbox_can_publish_group_owned_keys_and_prove_live(self):
+        self.assertTrue(Path('/run/systemd/system').is_dir(), 'real systemd fixture required')
+        # Own only this random /run directory. The transient unit uses the
+        # shipped sandbox properties, with write paths narrowed to the fixture.
+        with tempfile.TemporaryDirectory(prefix='p6b2-sandbox-', dir='/run') as root:
+            state = Path(root) / 'state'
+            config = Path(root) / 'config'
+            worker = p6.Provisioner(str(state), str(config), self.worker.port, fixture=True)
+            worker._write(str(config / 'p6-server.json'), p6.encoded(self.binding), 0o600, 0)
+            worker._write(str(config / 'p6-server.pem'), self.certs.pem('vps').encode(), 0o640, self.gid)
+            self.registry.config_path = str(config / 'remote-probes.json')
+            self.registry.key_dir = str(config / 'remote-probes.d')
+            keys = {'ProtectSystem', 'ProtectHome', 'PrivateTmp', 'PrivateDevices',
+                    'NoNewPrivileges', 'RestrictAddressFamilies', 'IPAddressDeny',
+                    'IPAddressAllow', 'CapabilityBoundingSet', 'RestrictSUIDSGID',
+                    'SystemCallArchitectures', 'LockPersonality'}
+            template = (ROOT / 'sbox-cm/deploy/sbox-cm.service.in').read_text()
+            properties = [line for line in template.splitlines() if '=' in line and
+                          line.split('=', 1)[0] in keys]
+            self.assertEqual(len(properties), len(keys))
+            command = ['systemd-run', '--quiet', '--wait', '--pipe', '--collect',
+                       '--unit=P6B2Fixture' + os.urandom(8).hex()]
+            for prop in properties + ['ReadWritePaths=' + root]:
+                command.extend(['--property', prop])
+            for name, value in {'SBOX_CM_TEST_SANDBOX': '1', 'SB_P6_STATE_DIR': str(state),
+                               'SB_P6_CONFIG_DIR': str(config), 'SB_P6_MONITOR_PORT': str(self.worker.port)}.items():
+                command.append('--setenv=' + name + '=' + value)
+            command.extend([sys.executable, '-I', str(ROOT / 'sbox-cm/p6_provision.py'), 'enroll'])
+            result = subprocess.run(command, input=p6.encoded({'name': 'event-pc',
+                'device': 'laptop-01', 'client_generation': self.generation,
+                'idempotency_key': 'enrollment-00000001', 'site_label': 'office',
+                'path_label': 'operator-path'}), capture_output=True, timeout=20)
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            response = json.loads(result.stdout)
+            self.assertTrue(response['ok'], response)
+            row = worker._load()['records'][0]
+            self.assertTrue(p6.live_proof(self.worker.port, row, True))
+            key = config / 'remote-probes.d' / (row['probe_id'] + '.key')
+            st = key.stat()
+            self.assertEqual((st.st_uid, st.st_gid, st.st_mode & 0o777), (0, self.gid, 0o640))
 
     def test_concurrent_same_enrollment_has_one_identity(self):
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
@@ -368,6 +412,26 @@ class ProvisioningTests(unittest.TestCase):
         with patch.object(p6, 'MAX_RECORDS', 1):
             self.fail_code('E_P6_CAPACITY', lambda: self.enroll('laptop-02', 'enrollment-00000002'))
         self.assertEqual(len(self.state()['records']), 1)
+
+    def test_tombstone_listing_pagination_keeps_rpc_frame_bounded(self):
+        self.enroll()
+        state = self.state()
+        original = state['records'][0]
+        state['records'] = [original | {'probe_id': 'p6-%032x' % i,
+            'device': 'device-' + str(i), 'enrollment': '%064x' % i,
+            'desired': 'revoked', 'verified': 'revoked'} for i in range(150)]
+        self.worker._save(state)
+        seen, cursor = [], None
+        while True:
+            page = self.worker.listing('event-pc', cursor)
+            self.assertLess(len(p6.encoded(page)), 60000)
+            self.assertLessEqual(len(page['devices']), 64)
+            seen.extend(row['probe_id'] for row in page['devices'])
+            cursor = page['next_cursor']
+            if cursor is None:
+                break
+        self.assertEqual(len(seen), 150)
+        self.assertEqual(len(set(seen)), 150)
 
     def test_manual_registry_rows_and_keys_preserved(self):
         self.enroll()

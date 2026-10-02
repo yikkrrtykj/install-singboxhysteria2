@@ -81,7 +81,7 @@ OPS = {
     "probe.enroll": {"required": ("name", "device", "idempotency_key", "site_label", "path_label"),
                      "optional": ("actor",), "lock": True},
     "probe.revoke": {"required": ("name", "device"), "optional": ("actor",), "lock": True},
-    "probe.list": {"required": ("name",), "optional": (), "lock": True},
+    "probe.list": {"required": ("name",), "optional": ("cursor",), "lock": True},
 }
 BASE_FIELDS = ("v", "request_id", "op")
 
@@ -379,6 +379,12 @@ def validate_request(obj):
             if type(value) is not str or not pattern.fullmatch(value):
                 raise RpcError("E_SCHEMA", "parse", False, "设备或标签非法")
             args[field] = value
+
+    if "cursor" in spec["optional"] and "cursor" in obj:
+        cursor = obj["cursor"]
+        if type(cursor) is not str or not re.fullmatch(r"[a-z0-9-]{1,64}", cursor):
+            raise RpcError("E_SCHEMA", "parse", False, "cursor 非法")
+        args["cursor"] = cursor
 
     if "actor" in spec["optional"] and "actor" in obj:
         actor = obj["actor"]
