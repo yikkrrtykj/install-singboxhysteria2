@@ -42,4 +42,4 @@ fi
 grep -q 'directive is not allowed here' "$TMP/invalid.log"
 echo 'PASS nginx/original_invalid_zone_context_rejected'
 python3 "$ROOT/tests/remote-server/proxy_runtime.py" "$TMP"
-echo 'nginx checks: 6 passed, 0 failed' 
+echo 'nginx checks: 6 passed, 0 failed'
