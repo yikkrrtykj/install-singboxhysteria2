@@ -2570,7 +2570,11 @@ def group_contract():
     # modules), no OTHER web file may, and the PR-6C incident read
     # route still does not exist anywhere.
     allowed_names = {"server.py", "remote_ingest.py",
-                     "remote_registry.py", "remote_store.py"}
+                     "remote_registry.py", "remote_store.py", "p6_bundle.py"}
+    # P6B2 adds one passive profile/ZIP validator that names the frozen URL.
+    # It implements no ingest or incident read route; portable bundle tests
+    # execute assembly with socket/connection creation forbidden. All other
+    # web modules remain outside this exact set and PR-6C stays refused.
     server_hits = []
     scope_violations = []
     for path in (os.path.join(ROOT, "monitor-v2", "web"),
