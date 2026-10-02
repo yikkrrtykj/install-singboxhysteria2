@@ -1557,7 +1557,10 @@
         : "This enrollment has been retired.", result.data.verified !== "active");
     }).catch(function (error) {
       if (error.message === "step-up cancelled") return;
-      if (error.uncertain || error.retriable) p6View.retry = intent;
+      // A failed fetch/JSON read has no HTTP status and may have happened
+      // after durable enrollment. Keep the exact intent until an explicit
+      // retry or metadata confirmation resolves it; never generate a new key.
+      if (error.uncertain || error.retriable || typeof error.status !== "number") p6View.retry = intent;
       p6Message(error.code === "E_P6_DEVICE_EXISTS"
         ? "This device already has an enrollment. Refresh the list to download or verify it."
         : "The operation was not confirmed. Refresh device status before retrying.", true);

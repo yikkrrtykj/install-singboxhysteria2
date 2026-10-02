@@ -962,6 +962,13 @@ async function main() {
     assert.match(ids['p6-msg'].textContent, /No enrollment or revocation has been confirmed/);
     assert.equal(ids['p6-devices-body'].children.length, 0);
   });
+  responses.push(() => Promise.reject(new Error('network')), listDevices());
+  ui.p6Operate('enroll', newDevice, 'network-enrollment-0001'); await flush();
+  check('P6: a network failure after dispatch retains the exact enrollment intent', () => {
+    assert.equal(ui.p6View.retry.key, 'network-enrollment-0001');
+    assert.equal(JSON.stringify(ui.p6View.retry.body), JSON.stringify(newDevice));
+    assert.equal(ids['p6-enroll'].disabled, true); assert.equal(ui.p6View.busy, false);
+  });
   setStatus({...healthy(), transport: 'stale'});
   check('P6: stale management disables all device dispatch paths', () => {
     const n = requests.length; ui.openP6Devices('bob'); ui.loadP6Devices();
@@ -969,6 +976,6 @@ async function main() {
     assert.equal(requests.length, n); assert.equal(ids['p6-enroll'].disabled, true);
     assert.equal(ui.p6View.busy, false);
   });
-  assert.equal(count, 103, 'UI assertion count guard');
+  assert.equal(count, 104, 'UI assertion count guard');
 }
 main().catch(err => { console.error(err); process.exitCode = 1; });

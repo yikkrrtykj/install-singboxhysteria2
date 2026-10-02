@@ -303,8 +303,8 @@ installer/uninstaller and real host acceptance remain mandatory before P6B2
 completion. No production listener/service activation is performed here.
 
 Acceptance uses eleven portable real-artifact/profile-import cases, twenty
-native root worker/RPC/HTTP/audit/recovery cases, and thirteen new shipped-JS
-UI cases (103 total, including the previous 90). Existing cross-platform and
+native root worker/RPC/HTTP/audit/recovery cases, and fourteen new shipped-JS
+UI cases (104 total, including the previous 90). Existing cross-platform and
 native provisioning CI entrypoints run the corresponding bundle suite as a
 second explicit process and retain separate original test counts.
 
