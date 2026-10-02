@@ -383,15 +383,21 @@ WantedBy=multi-user.target
         # An accept here does NOT override a drop in another base chain. This
         # is deliberately not a promise of host/cloud reachability. Never
         # flush/rewrite another firewall; report policy integration separately.
+        journal = self._journal()
+        if journal is None or journal['phase'] not in ('starting', 'active') or journal['firewall'] != 'nft':
+            raise Error('E_P6_STATE')
         text = f'''add table inet {self.table}
 add chain inet {self.table} ingress {{ type filter hook input priority -5; policy accept; }}
-add rule inet {self.table} ingress tcp dport {meta['settings']['port']} accept comment "P6 managed ingress"
+add rule inet {self.table} ingress tcp dport {meta['settings']['port']} accept comment "P6 {journal['owner']}"
 '''
         self.command(['/usr/sbin/nft', '-c', '-f', '-'], data=text.encode('ascii'))
         self.command(['/usr/sbin/nft', '-f', '-'], data=text.encode('ascii'))
 
     def firewall_owned(self, meta):
         """Exact native semantic proof, including recovery after add/fsync death."""
+        journal = self._journal()
+        if journal is None:
+            raise Error('E_P6_STATE')
         result = json.loads(self.command(['/usr/sbin/nft', '-j', 'list', 'table', 'inet', self.table]).stdout)
         rows = [{k: {a: b for a, b in v.items() if a != 'handle'} for k, v in row.items()}
                 for row in result['nftables'] if 'metainfo' not in row]
@@ -402,7 +408,7 @@ add rule inet {self.table} ingress tcp dport {meta['settings']['port']} accept c
             {'rule': {'family': 'inet', 'table': self.table, 'chain': 'ingress',
                       'expr': [{'match': {'op': '==', 'left': {'payload': {'protocol': 'tcp', 'field': 'dport'}},
                                          'right': meta['settings']['port']}}, {'accept': None}],
-                      'comment': 'P6 managed ingress'}}]
+                      'comment': 'P6 ' + journal['owner']}}]
         if rows != expected:
             raise Error('E_P6_FIREWALL_CHANGED')
 
@@ -429,10 +435,11 @@ add rule inet {self.table} ingress tcp dport {meta['settings']['port']} accept c
         if not os.path.lexists(self.journal):
             return None
         obj = json.loads(self.read(self.journal))
-        if type(obj) is not dict or set(obj) != {'v', 'phase', 'firewall', 'fingerprint'} or \
+        if type(obj) is not dict or set(obj) != {'v', 'phase', 'firewall', 'fingerprint', 'owner'} or \
                 type(obj['v']) is not int or obj['v'] != 1 or obj['phase'] not in ('starting', 'active', 'stopping') or \
                 obj['firewall'] not in ('nft', 'none') or \
-                (obj['fingerprint'] is not None and not p6.HEX64.fullmatch(obj['fingerprint'])):
+                type(obj['owner']) is not str or not p6.HEX32.fullmatch(obj['owner']) or \
+                (obj['fingerprint'] is not None and (type(obj['fingerprint']) is not str or not p6.HEX64.fullmatch(obj['fingerprint']))):
             raise Error('E_P6_STATE')
         return obj
 
@@ -474,7 +481,8 @@ add rule inet {self.table} ingress tcp dport {meta['settings']['port']} accept c
             self._port_free(meta)
             if meta['settings']['firewall'] == 'nft' and self.firewall_snapshot() is not None:
                 raise Error('E_P6_FIREWALL_CHANGED')
-            journal = {'v': 1, 'phase': 'starting', 'firewall': meta['settings']['firewall'], 'fingerprint': None}
+            journal = {'v': 1, 'phase': 'starting', 'firewall': meta['settings']['firewall'],
+                       'fingerprint': None, 'owner': secrets.token_hex(16)}
             self._save_journal(journal)
             self.fault('activation_intent_durable')
             try:

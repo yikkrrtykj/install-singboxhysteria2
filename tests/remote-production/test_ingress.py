@@ -317,6 +317,16 @@ class IngressTests(unittest.TestCase):
             self.assertEqual(self.worker.service_state(), (False, False))
             self.assertFalse(self.worker.journal.exists())
             self.assertEqual(self.worker._identity(), identity)
+            for phase in ('activation_intent_durable', 'service_started'):
+                def child():
+                    self.worker.fault = lambda value: os._exit(92) if value == phase else None
+                    self.worker.activate()
+                proc = multiprocessing.get_context('fork').Process(target=child)
+                proc.start(); proc.join(30)
+                self.assertEqual(proc.exitcode, 92)
+                self.assertEqual(self.worker.activate()['active'], True)
+                self.assertEqual(self.worker.deactivate(), {'active': False})
+                self.assertEqual(self.worker._identity(), identity)
         finally:
             self.worker.command(['/usr/bin/systemctl', 'disable', '--now', self.service], check=False)
             self.worker.unit.unlink(missing_ok=True)
@@ -335,7 +345,7 @@ class IngressTests(unittest.TestCase):
             self.worker.command(['/usr/sbin/nft', 'add', 'table', 'inet', 'unrelated'])
             before = self.worker.command(['/usr/sbin/nft', '-j', 'list', 'table', 'inet', 'unrelated']).stdout
             meta = self.worker._identity()
-            journal = {'v': 1, 'phase': 'starting', 'firewall': 'nft', 'fingerprint': None}
+            journal = {'v': 1, 'phase': 'starting', 'firewall': 'nft', 'fingerprint': None, 'owner': 'a' * 32}
             self.worker._save_journal(journal)
             self.worker.firewall_add(meta)
             self.worker.firewall_owned(meta)
@@ -347,6 +357,9 @@ class IngressTests(unittest.TestCase):
             self.worker.command(['/usr/sbin/nft', 'delete', 'table', 'inet', self.worker.table])
             self.worker.firewall_ensure()
             self.assertEqual(journal['fingerprint'], self.worker.firewall_snapshot())
+            # Extra external rule is never deleted/reinterpreted as owned.
+            self.worker.command(['/usr/sbin/nft', 'add', 'rule', 'inet', self.worker.table, 'ingress', 'tcp', 'dport', '12345', 'accept'])
+            self.error('E_P6_FIREWALL_CHANGED', self.worker.firewall_ensure)
             self.worker.command(['/usr/sbin/nft', 'delete', 'table', 'inet', self.worker.table])
             self.assertEqual(before, self.worker.command(['/usr/sbin/nft', '-j', 'list', 'table', 'inet', 'unrelated']).stdout)
         proc = context.Process(target=child); proc.start(); proc.join(30)
