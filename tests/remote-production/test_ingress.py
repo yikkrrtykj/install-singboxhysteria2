@@ -313,6 +313,11 @@ class IngressTests(unittest.TestCase):
         try:
             self.assertEqual(self.worker.activate()['active'], True)
             self.assertEqual(self.worker.activate()['active'], True)
+            properties = self.worker.command(['/usr/bin/systemctl', 'show', self.service,
+                    '--property=CPUQuotaPerSecUSec,MemoryMax,TasksMax,LimitNOFILE,NoNewPrivileges']).stdout.decode()
+            for expected in ('CPUQuotaPerSecUSec=500ms', 'MemoryMax=134217728', 'TasksMax=16',
+                             'LimitNOFILE=512', 'NoNewPrivileges=yes'):
+                self.assertIn(expected, properties)
             identity = self.worker._identity()
             self.assertEqual(self.worker.deactivate(), {'active': False})
             self.assertEqual(self.worker.service_state(), (False, False))
@@ -507,6 +512,10 @@ class IngressTests(unittest.TestCase):
             observer = threading.Thread(target=observe)
             observer.start()
             before_ticks, start = ticks(process.pid), time.monotonic()
+            nginx_pids = [self.nginx.pid] + [int(value) for value in
+                    Path('/proc/%d/task/%d/children' % (self.nginx.pid, self.nginx.pid)).read_text().split()]
+            nginx_before_ticks = sum(ticks(pid) for pid in nginx_pids)
+            nginx_rss = sum(rss(pid) for pid in nginx_pids)
             headers = p6.proof_headers(result['probe_id'], '0' * 64)  # deliberately wrong HMAC
             try:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
@@ -515,6 +524,8 @@ class IngressTests(unittest.TestCase):
                 finished.set(); observer.join(5)
             seconds = time.monotonic() - start
             cpu = (ticks(process.pid) - before_ticks) / os.sysconf('SC_CLK_TCK')
+            nginx_cpu = (sum(ticks(pid) for pid in nginx_pids) - nginx_before_ticks) / os.sysconf('SC_CLK_TCK')
+            nginx_rss = max(nginx_rss, sum(rss(pid) for pid in nginx_pids))
             self.assertFalse(observer.is_alive())
             self.assertEqual(observation_errors, [])
             self.assertTrue(latencies)
@@ -533,6 +544,10 @@ class IngressTests(unittest.TestCase):
                 'monitor_cpu_percent_one_core': round(cpu / seconds * 100, 2),
                 'monitor_cpu_percent_machine': round(cpu / seconds * 100 / (os.cpu_count() or 1), 2),
                 'monitor_peak_rss_bytes': max(samples), 'control_baseline_p95_ms': round(p95(baseline), 3),
+                'nginx_cpu_seconds': round(nginx_cpu, 3),
+                'nginx_cpu_percent_one_core': round(nginx_cpu / seconds * 100, 2),
+                'nginx_cpu_percent_machine': round(nginx_cpu / seconds * 100 / (os.cpu_count() or 1), 2),
+                'nginx_rss_sum_endpoint_bytes': nginx_rss,
                 'control_under_load_p95_ms': round(p95(latencies), 3), 'control_max_ms': round(max(latencies), 3),
                 'proxy_outcomes': {str(x): results.count(x) for x in sorted(set(results))}, **final,
                 'production_windows_resource_acceptance': 'not_performed'}
