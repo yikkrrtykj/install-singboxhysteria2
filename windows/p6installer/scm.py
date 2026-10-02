@@ -7,6 +7,7 @@ from ctypes import wintypes as W
 from remote_probe.agent import ConfigError
 
 ALL = 0xF01FF
+SE_SERVICE = 2  # accctrl.h SE_OBJECT_TYPE; not SE_LMSHARE (5).
 
 
 class Config(ctypes.Structure):
@@ -100,7 +101,7 @@ class Service:
 
     def _acl(self, service):
         from remote_probe.windows_security import WindowsSecurity
-        _owner, entries = WindowsSecurity()._descriptor(service, object_type=5)
+        _owner, entries = WindowsSecurity()._descriptor(service, object_type=SE_SERVICE)
         if len(entries) != 2 or {item[2] for item in entries} != {'S-1-5-18', 'S-1-5-32-544'} \
                 or any(flags != 0 or mask not in (ALL, 0x10000000) for flags, mask, _ in entries):
             raise ConfigError('unowned service ACL')

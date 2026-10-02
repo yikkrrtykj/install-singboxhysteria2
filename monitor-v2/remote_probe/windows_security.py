@@ -78,6 +78,8 @@ class WindowsSecurity:
         Windows Server renders a fixture's local Administrator SID as LA;
         client Windows often renders its full SID. They are the same SID.
         """
+        if object_type not in (1, 2):  # SE_FILE_OBJECT / SE_SERVICE only
+            raise StorageSecurityError("unsupported security object")
         descriptor = W.LPVOID()
         owner = W.LPVOID()
         dacl = W.LPVOID()
