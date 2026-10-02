@@ -18,6 +18,7 @@ import time
 import unittest
 import urllib.request
 import uuid
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'monitor-v2'))
@@ -32,6 +33,7 @@ from p6installer.scm import Service, Failure, Action
 from remote_probe.agent import ConfigError
 from remote_probe.profiles import canonical, profile_id
 from remote_probe.windows_security import StorageSecurityError
+from remote_probe.spool import SpoolError
 
 spec = importlib.util.spec_from_file_location('windows_builder', ROOT / 'tools/build-p6-windows.py')
 builder = importlib.util.module_from_spec(spec)
@@ -44,6 +46,7 @@ class NativeInstallerTests(unittest.TestCase):
         if os.name != 'nt' or not ctypes.windll.shell32.IsUserAnAdmin():
             raise RuntimeError('mandatory elevated native Windows installer CI')
         cls.tmp = tempfile.TemporaryDirectory(prefix='p6-native-installer-')
+        cls.addClassCleanup(cls.tmp.cleanup)
         cls.root = Path(cls.tmp.name)
         cls.policy = fixture_policy()
         cls.protected = cls.root / 'protected'
@@ -63,7 +66,7 @@ if($Package) {
   $cert=New-SelfSignedCertificate -Type CodeSigningCert -Subject ('CN=P6InstallerFixture-'+[Guid]::NewGuid()) -CertStoreLocation Cert:\\CurrentUser\\My -KeyExportPolicy NonExportable
   $store=New-Object Security.Cryptography.X509Certificates.X509Store('Root','CurrentUser')
   $store.Open('ReadWrite')
-  $public=New-Object Security.Cryptography.X509Certificates.X509Certificate2($cert.RawData)
+  $public=[Security.Cryptography.X509Certificates.X509Certificate2]::new([byte[]]$cert.RawData)
   $store.Add($public);$store.Close()
   Write-Output $cert.Thumbprint
 }
@@ -71,10 +74,11 @@ if($Package) {
         result = subprocess.run([cls.powershell, '-NoProfile', '-NonInteractive', '-File', str(cls.sign_script)],
                                 capture_output=True, text=True, timeout=60)
         if result.returncode:
-            raise RuntimeError('native fixture signing failed')
+            raise RuntimeError('native fixture signing failed: ' + result.stderr)
         cls.publisher = result.stdout.strip().splitlines()[-1]
         if len(cls.publisher) != 40:
             raise RuntimeError('fixture publisher unavailable')
+        cls.addClassCleanup(cls.cleanup_certificate)
         archive = cls.root / 'runtime.zip'
         with urllib.request.urlopen(builder.RUNTIME_URL, timeout=60) as source:
             raw = source.read(16 * 1024 * 1024 + 1)
@@ -95,11 +99,10 @@ if($Package) {
                                 str(cls.sign_script), '-Package', str(package), '-Thumbprint', cls.publisher],
                                 capture_output=True, timeout=60)
         if result.returncode:
-            raise RuntimeError('fixture package signing failed')
+            raise RuntimeError('fixture package signing failed: ' + result.stderr.decode(errors='replace'))
 
     @classmethod
-    def tearDownClass(cls):
-        BundleTests.tearDownClass()
+    def cleanup_certificate(cls):
         # Only the recorded random fixture certificate, never other trust.
         cleanup = cls.root / 'certificate-cleanup.ps1'
         cleanup.write_text('''param([string]$Thumbprint)
@@ -111,7 +114,10 @@ foreach($store in @('Root','My')) {
 ''')
         subprocess.run([cls.powershell, '-NoProfile', '-NonInteractive', '-File', str(cleanup),
                         '-Thumbprint', cls.publisher], check=True, capture_output=True, timeout=30)
-        cls.tmp.cleanup()
+
+    @classmethod
+    def tearDownClass(cls):
+        BundleTests.tearDownClass()
 
     def setUp(self):
         self.name = 'P6InstallerFixture' + uuid.uuid4().hex
@@ -144,6 +150,22 @@ foreach($store in @('Root','My')) {
         result = self.manager.install(self.package)
         self.assertEqual(result['service'], 'running')
         return result
+
+    def next_release(self):
+        import zipfile
+        target = self.protected / uuid.uuid4().hex
+        shutil.copytree(self.package, target)
+        os.unlink(target / 'payload.cat')
+        installer = target / 'payload/p6-installer.pyz'
+        with zipfile.ZipFile(installer, 'a') as archive:
+            archive.comment = b'isolated-fixture-release-two'
+        meta = copy.deepcopy(self.meta)
+        raw = installer.read_bytes()
+        meta['files']['p6-installer.pyz'] = {'size': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()}
+        meta['release'] = hashlib.sha256(canonical({k: meta[k] for k in meta if k != 'release'})).hexdigest()
+        (target / 'payload/release.json').write_bytes(canonical(meta))
+        self.sign(target)
+        return target, meta
 
     def profile(self, probe='p6-device-one'):
         fixture = BundleTests('test_repeat_bundle_does_not_rotate_or_add_download_timestamp')
@@ -294,6 +316,82 @@ foreach($store in @('Root','My')) {
         self.assertFalse((self.directory / 'upgrade.json').exists())
         self.assertEqual(self.service.state(self.manager._command(release)), 4)
 
+    def test_actual_upgrade_and_rollback_preserve_paused_profile_and_pending_bytes(self):
+        self.install()
+        fixture, _, _ = self.profile()
+        self.service.stop(self.manager._command(self.meta['release']))
+        key, _ = self.manager.vault.import_profile(fixture.profile, b'k' * 32, fixture.parts['certificate'], controller_secret='local-secret')
+        self.manager.vault.set_enabled(key, False)
+        self.manager.vault._write(str(Path(self.manager.vault._path(key)) / 'spool'), 'pending-fixture', b'pending bytes')
+        self.service.start(self.manager._command(self.meta['release']))
+        package, next_meta = self.next_release()
+        self.assertEqual(self.manager.install(package)['release'], next_meta['release'])
+        self.assertEqual(self.manager.rollback()['release'], self.meta['release'])
+        self.assertFalse(self.manager.vault.enabled(key))
+        self.assertEqual(self.manager.vault.read_secret(key), b'k' * 32)
+        self.assertEqual(self.policy.read(str(Path(self.manager.vault._path(key)) / 'spool/pending-fixture'), 128), b'pending bytes')
+        self.assertEqual(len(os.listdir(self.directory / 'releases')), 2)
+
+    def test_failed_native_startup_keeps_intent_and_explicit_rollback_recovers(self):
+        self.install()
+        package, meta = self.next_release()
+        start = self.service.start
+        def failure(command):
+            if command == self.manager._command(meta['release']):
+                raise ConfigError('injected startup boundary failure')
+            return start(command)
+        with patch.object(self.service, 'start', side_effect=failure):
+            with self.assertRaises(ConfigError):
+                self.manager.install(package)
+        self.assertTrue((self.directory / 'upgrade.json').exists())
+        self.assertEqual(self.manager.rollback()['release'], self.meta['release'])
+        self.assertEqual(self.service.state(self.manager._command(self.meta['release'])), 4)
+        self.assertFalse((self.directory / 'upgrade.json').exists())
+
+    def test_concurrent_installer_lock_refuses_before_service_or_state_change(self):
+        self.install()
+        before = self.manager._read('active.json')
+        lock = self.manager._lock()
+        try:
+            with self.assertRaises(SpoolError):
+                self.manager.install(self.package)
+        finally:
+            lock.release()
+        self.assertEqual(self.manager._read('active.json'), before)
+        self.assertEqual(self.service.state(self.manager._command(self.meta['release'])), 4)
+
+    def test_retired_profiles_count_toward_capacity_and_junction_purge_refuses(self):
+        self.install()
+        fixture, _, _ = self.profile()
+        self.service.stop(self.manager._command(self.meta['release']))
+        keys = []
+        for index in range(8):
+            profile = copy.deepcopy(fixture.profile)
+            profile['probe_id'] = 'capacity-' + str(index)
+            key, _ = self.manager.vault.import_profile(profile, b'k' * 32, fixture.parts['certificate'])
+            self.manager.vault.set_enabled(key, False)
+            keys.append(key)
+        self.service.start(self.manager._command(self.meta['release']))
+        self.manager.operate('remove', profile=keys[0])
+        _, path, server = self.profile('capacity-nine')
+        with self.assertRaises(ConfigError):
+            self.manager.operate('import', bundle=path, controller_secret='local-secret')
+        self.assertEqual(server.seen, [])
+        self.assertEqual(self.manager._slots(), 8)
+        target = self.directory / 'sentinel'
+        self.policy.mkdir(str(target))
+        self.manager.vault._write(str(target), 'marker', b'keep')
+        junction = self.directory / 'retired' / keys[0] / 'spool' / 'unsafe'
+        result = subprocess.run(['cmd.exe', '/c', 'mklink', '/J', str(junction), str(target)], capture_output=True)
+        self.assertEqual(result.returncode, 0)
+        try:
+            with self.assertRaises(StorageSecurityError):
+                self.manager.operate('purge', profile=keys[0])
+            self.assertEqual(self.policy.read(str(target / 'marker'), 128), b'keep')
+            self.assertEqual(len(self.manager.vault.keys()), 7)
+        finally:
+            os.rmdir(junction)
+
     def test_real_signed_setup_uses_embedded_installer_and_no_production_root(self):
         # Production setup intentionally targets fixed ProgramData. Only the
         # negative signature gate is exercised through that public entry; all
@@ -347,6 +445,6 @@ foreach($store in @('Root','My')) {
 
 if __name__ == '__main__':
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(NativeInstallerTests)
-    assert suite.countTestCases() == 10
+    assert suite.countTestCases() == 14
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     raise SystemExit(0 if result.wasSuccessful() else 1)

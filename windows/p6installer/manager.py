@@ -217,10 +217,30 @@ class Manager:
         if exists:
             self.service.stop(command)
         self.service.configure(self._command(new), previous=command if exists else None)
+        if old is not None and old != new:
+            self._write(self.root / 'previous.json', {'v': 1, 'release': old})
         self._write(self.root / 'active.json', {'v': 1, 'release': new})
         self.service.start(self._command(new))
         self.security.validate(str(self.root / 'upgrade.json'))
         os.unlink(self.root / 'upgrade.json')
+        self._collect_releases()
+
+    def _collect_releases(self):
+        """Retain current and explicit rollback target. Profiles are separate."""
+        keep = {self._active()}
+        previous = self._read('previous.json')
+        if previous is not None:
+            if type(previous) is not dict or set(previous) != {'v', 'release'} or previous['v'] != 1:
+                raise ConfigError('invalid previous release')
+            keep.add(self._id(previous['release']))
+        for name in os.listdir(self.root / 'releases'):
+            if name in keep:
+                continue
+            if not re.fullmatch(r'[0-9a-f]{64}|\.stage-[0-9a-f]{32}', name):
+                raise ConfigError('unknown release state')
+            target = self.root / 'releases' / name
+            self._tree(target)
+            shutil.rmtree(target)
 
     def _recover_uninstall(self):
         intent = self._read('uninstall.json')
@@ -244,6 +264,9 @@ class Manager:
             if (self.root / 'active.json').exists():
                 self.security.validate(str(self.root / 'active.json'))
                 os.unlink(self.root / 'active.json')
+            if (self.root / 'previous.json').exists():
+                self.security.validate(str(self.root / 'previous.json'))
+                os.unlink(self.root / 'previous.json')
             self.security.validate(str(self.root / 'uninstall.json'))
             os.unlink(self.root / 'uninstall.json')
         finally:
@@ -285,6 +308,17 @@ class Manager:
         lock = self._lock()
         try:
             intent = self._read('upgrade.json')
+            if intent is None:
+                previous = self._read('previous.json')
+                current = self._active()
+                if type(previous) is not dict or set(previous) != {'v', 'release'} or previous['v'] != 1 \
+                        or current is None:
+                    raise ConfigError('no previous release')
+                self._check_release(current)
+                self._check_release(self._id(previous['release']))
+                self._write(self.root / 'upgrade.json', {'v': 1, 'old': current, 'new': previous['release']})
+                self._recover()
+                return {'release': previous['release'], 'rollback': True}
             if type(intent) is not dict or set(intent) != {'v', 'old', 'new'} or intent['v'] != 1 \
                     or intent['old'] is None or self._active() not in (intent['old'], intent['new']):
                 raise ConfigError('no recoverable previous release')
@@ -303,6 +337,8 @@ class Manager:
             self.service.start(self._command(old))
             self.security.validate(str(self.root / 'upgrade.json'))
             os.unlink(self.root / 'upgrade.json')
+            self._write(self.root / 'previous.json', {'v': 1, 'release': new})
+            self._collect_releases()
             return {'release': old, 'rollback': True}
         finally:
             lock.release()
