@@ -82,6 +82,7 @@ jobs:
           bash -n tests/test-monitor-v2-incidents.sh
           bash -n tests/test-monitor-v2-remote-probe.sh
           bash -n tests/test-monitor-v2-remote-server.sh
+          bash -n tests/test-monitor-v2-remote-proxy.sh
           bash -n monitor-v2/deploy/app-bin/monitor-contract-probe
           bash -n tests/journal-reader/test-jr-live.sh
           bash -n tests/journal-reader/test-jr-exchange-access.sh
@@ -266,8 +267,10 @@ jobs:
       - name: "0.7.0 PR-6A dark office remote-probe agent suite (explicit roles / closed active outcomes + delay-0 failure / bounded budgets and no overlap / GET-only Mihomo reuse byte-identical to E4 / canonical body + HMAC vector / run-seq-clock rollback / durable spool bounds + refusals / total response disposition / secret leak wall, issue #67 P6A)"
         run: bash tests/test-monitor-v2-remote-probe.sh
 
-      - name: "0.7.0 PR-6B server ingest suite (exact machine-ingest placement after framing+whitelist and before Origin/session/CSRF / 16 KiB pre-JSON route cap / canonical-byte equality / probe_id-bound constant-time HMAC + dummy-key unknown path / indistinguishable auth failures / 300s freshness + sample-epoch bounds + strict run progression / idempotency + equivocation / run capacity + 30-day expiry / soft 16 hard 24 MiB remote-only retention / per-probe + global token buckets / independent two-table user_version=1 store / remote health excluded from evidence health / deploy rollback preserves the remote store, issue #67 P6B)"
-        run: bash tests/test-monitor-v2-remote-server.sh
+      - name: "0.7.0 PR-6B re-frozen three-table receipts, atomic ingest, independent budgets, lifecycle/status/read and isolation"
+        run: |
+          getent group sboxweb >/dev/null || sudo groupadd --system sboxweb
+          sudo -n bash tests/test-monitor-v2-remote-server.sh
 
   # ---------------------------------------------------------------------
   # Lane D -- compatibility matrix. Runs on the three supported Ubuntu LTS
@@ -291,7 +294,7 @@ jobs:
       - name: Install test dependencies
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y jq shellcheck acl
+          sudo apt-get install -y jq shellcheck acl nginx openssl
           flock --version || sudo apt-get install -y util-linux
 
       - name: Environment diagnostics (no secrets)
@@ -300,6 +303,14 @@ jobs:
           python3 --version
           systemd --version | head -n1
           uname -r
+
+      - name: "PR-6B real Linux filesystem authority and containment (no skipped gates)"
+        run: |
+          getent group sboxweb >/dev/null || sudo groupadd --system sboxweb
+          sudo -n python3 tests/remote-server/linux_groups.py
+
+      - name: "PR-6B real nginx parser validation and invalid-context rejection"
+        run: sudo -n bash tests/test-monitor-v2-remote-proxy.sh
 
       # Runner-boot readiness gate (issue #35 review): the lane split reaches
       # the LIVE/preflight work ~5 min earlier than the old serial matrix,

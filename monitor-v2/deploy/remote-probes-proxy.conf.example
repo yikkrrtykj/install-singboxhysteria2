@@ -18,9 +18,14 @@
 # (127.0.0.1), which the whitelist must contain (webapp setup adds it). No
 # X-Forwarded-For / X-Real-IP is read or set anywhere in Monitor.
 
+# Include this file from nginx's http {} context. Supported baseline:
+# nginx >= 1.18.0 with TLS support. HTTP/2 is optional and is not enabled
+# here, so the example also validates before the 1.25.1 http2 directive.
+limit_req_zone  $binary_remote_addr zone=probe_ingest:10m rate=20r/s;
+limit_conn_zone $binary_remote_addr zone=probe_conns:10m;
+
 server {
     listen 443 ssl;
-    http2 on;
     server_name probes.example.com;          # operator DNS name
 
     ssl_certificate     /etc/ssl/probes.example.com.fullchain.pem;
@@ -32,8 +37,6 @@ server {
     # Monitor; this stops oversized junk before it reaches the app.
     client_max_body_size 16k;
     client_body_timeout  10s;
-    limit_req_zone  $binary_remote_addr zone=probe_ingest:10m rate=20r/s;
-    limit_conn_zone $binary_remote_addr zone=probe_conns:10m;
 
     # ONLY the exact ingest path is exposed. `location =` is an exact match:
     # /api/v1/remote-probes/ingest/extra, /api/v1/remote-probes and every

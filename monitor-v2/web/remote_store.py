@@ -1,143 +1,130 @@
-"""Physically independent remote-probe store (issue #67 §11-§13, PR-6B).
+"""Independent three-table remote plane, Issue #67 re-freeze 2026-10-02.
 
-The remote plane owns a SEPARATE SQLite database:
-
-    <data_dir>/remote-probes/remote-probes.sqlite3   (0600, in a 0700 dir)
-
-Core History stays exactly ``<data_dir>/diagnostics/history.sqlite3`` on
-schema v5 with its current ``_PRUNE_SOURCES``; this store never touches it,
-never enters History pruning, and can never make core History unavailable.
-
-Schema v1 -- EXACTLY two application tables:
-
-    remote_probe_samples  the retained evidence rows (the ONLY budget/age
-                          pruning source);
-    remote_probe_runs     continuity/idempotency state (never a pruning
-                          source; lifetime 30 days after last activity).
-
-`PRAGMA user_version = 1`, `journal_mode=DELETE`, `synchronous=FULL`, a
-bounded busy timeout, exact table-set equality, and
-unknown/newer/malformed schema -> the REMOTE plane fails closed (core
-Monitor is untouched).
-
-### The two-table idempotency proof (contract §7 gate)
-
-The frozen semantics are: same ``(probe_id, run, seq)`` + same body hash ->
-idempotent success (never a second evidence row); same tuple + different
-hash -> equivocation reject; retained samples live up to 7 days subject to
-the byte budget; run state lives 30 days after last activity. The exact
-two-table model satisfies this because server acceptance enforces a STRICT
-per-run progression: ``seq`` strictly increases with every accepted tuple
-and ``sample_epoch`` strictly increases with every newly accepted one, and
-the run row records the high-water of both. Therefore a tuple whose sample
-row has aged out (or been budget-pruned) is provably one the server ALREADY
-accepted -- its ``seq <= runs.max_seq`` -- and a replay is answered
-idempotently (``duplicate``) without storing anything, exactly the §9
-"idempotently accounted ... then age out" case. Equivocation detection is
-defined over RETAINED evidence: while the sample row survives, its hash is
-compared and a mismatch is an equivocation reject; once the evidence itself
-has legitimately aged out there is no retained byte to contradict, and no
-second evidence row can be created either way. No third table is needed and
-none may be added.
-
-A captured old HTTP request is rejected before any of this by the ±300 s
-``sent_epoch`` freshness window -- aged-out run state never reopens replay.
+Disposable samples are evidence. Immutable receipts owned by continuity
+runs authorize retries after pruning. High-water never proves receipt
+existence. This module has no History or classifier dependency.
 """
-
 from __future__ import annotations
 
+from contextlib import contextmanager
+import hashlib
+import json
+import math
 import os
+import shutil
 import sqlite3
-import stat as stat_module
+import stat
 import threading
+import time
 
 DB_DIR_NAME = "remote-probes"
 DB_NAME = "remote-probes.sqlite3"
 SCHEMA_USER_VERSION = 1
-BUSY_TIMEOUT_MS = 5000               # bounded
-
+BUSY_TIMEOUT_MS = 5000
 TABLE_SAMPLES = "remote_probe_samples"
 TABLE_RUNS = "remote_probe_runs"
-EXPECTED_TABLES = frozenset({TABLE_SAMPLES, TABLE_RUNS})
-
-# §12 retention: up to 7 days, soft 16 MiB / hard 24 MiB on the STORE's own
-# bytes (page_count * page_size). Never a History byte.
+TABLE_RECEIPTS = "remote_probe_receipts"
+EXPECTED_TABLES = frozenset({TABLE_SAMPLES, TABLE_RUNS, TABLE_RECEIPTS})
 MAX_AGE_SECONDS = 7 * 86400.0
+NEW_SAMPLE_MAX_AGE = MAX_AGE_SECONDS + 12 * 3600
 SOFT_BUDGET_BYTES = 16 * 1024 * 1024
 HARD_BUDGET_BYTES = 24 * 1024 * 1024
-PRUNE_BATCH = 256
-
-# §13 continuity bounds.
+SAMPLE_ROW_CHARGE = RECEIPT_ROW_CHARGE = 256
+RUN_ROW_CHARGE = 1024
 MAX_RUNS_PER_PROBE = 64
 MAX_RUNS_GLOBAL = 4096
+MAX_RECEIPTS_PER_PROBE = 131072
+MAX_RECEIPTS_GLOBAL = 1048576
+RECEIPT_BUDGET_BYTES = 256 * 1024 * 1024
+RUN_BUDGET_BYTES = 4 * 1024 * 1024
+DB_BUDGET_BYTES = 320 * 1024 * 1024
+WORKING_BUDGET_BYTES = 1024 * 1024 * 1024
 RUN_LIFETIME_SECONDS = 30 * 86400.0
-
+PRUNE_BATCH = READ_LIMIT = 256
 STATUS_KEYS = ("budget_pruned", "budget_pruned_total", "retained_since_epoch",
-               "sample_count", "db_bytes", "run_count")
+               "sample_count", "sample_bytes", "receipt_count", "receipt_bytes",
+               "run_count", "run_bytes", "db_live_bytes", "db_allocated_bytes",
+               "capacity_code")
+
+# DDL is also the v1 constraint gate: names alone establish no authority.
+SCHEMA = (
+    "CREATE TABLE remote_probe_runs (probe_id TEXT NOT NULL, run TEXT NOT NULL, "
+    "max_seq INTEGER NOT NULL CHECK(max_seq >= 1), "
+    "max_sample_epoch REAL NOT NULL CHECK(max_sample_epoch >= 0), "
+    "created_epoch REAL NOT NULL, last_activity_epoch REAL NOT NULL, "
+    "PRIMARY KEY(probe_id, run))",
+    "CREATE TABLE remote_probe_receipts (probe_id TEXT NOT NULL, run TEXT NOT NULL, "
+    "seq INTEGER NOT NULL CHECK(seq >= 1), body_hash BLOB NOT NULL "
+    "CHECK(typeof(body_hash) = 'blob' AND length(body_hash) = 32), "
+    "accepted_epoch REAL NOT NULL, PRIMARY KEY(probe_id, run, seq), "
+    "FOREIGN KEY(probe_id, run) REFERENCES remote_probe_runs(probe_id, run) ON DELETE CASCADE)",
+    "CREATE TABLE remote_probe_samples (probe_id TEXT NOT NULL, run TEXT NOT NULL, "
+    "seq INTEGER NOT NULL, sample_epoch REAL NOT NULL CHECK(sample_epoch >= 0), "
+    "received_epoch REAL NOT NULL, body_hash BLOB NOT NULL "
+    "CHECK(typeof(body_hash) = 'blob' AND length(body_hash) = 32), body BLOB NOT NULL "
+    "CHECK(typeof(body) = 'blob' AND length(body) BETWEEN 1 AND 16384), "
+    "PRIMARY KEY(probe_id, run, seq), FOREIGN KEY(probe_id, run, seq) "
+    "REFERENCES remote_probe_receipts(probe_id, run, seq) ON DELETE CASCADE)",
+    "CREATE INDEX remote_probe_samples_age ON remote_probe_samples(sample_epoch, probe_id, run, seq)",
+    "CREATE INDEX remote_probe_runs_activity ON remote_probe_runs(last_activity_epoch)",
+)
 
 
 class RemoteStoreError(Exception):
-    """The remote store is unusable right now (sanitized text only)."""
+    """Sanitized remote-only failure."""
+    code = "remote_store_unavailable"
 
 
 class RunCapacityError(RemoteStoreError):
-    """A new run would exceed a frozen continuity bound with no legally
-    expirable row. Live state is never deleted to make room."""
+    code = "remote_run_capacity"
+
+
+class ReceiptCapacityError(RemoteStoreError):
+    code = "remote_receipt_capacity"
+
+
+class StorageCapacityError(RemoteStoreError):
+    code = "remote_storage_capacity"
 
 
 class RemoteStore:
-    """One closed SQLite plane: samples + continuity runs."""
-
     def __init__(self, data_dir, clock=None):
-        import time
         self.directory = os.path.join(data_dir, DB_DIR_NAME)
         self.db_path = os.path.join(self.directory, DB_NAME)
-        self.clock = clock or (lambda: time.time())
+        self.clock = clock or time.time
         self._conn = None
-        self._lock = threading.RLock()
         self._opened = False
-        # Instance-level budget numbers: the defaults are the FROZEN
-        # contract constants; deterministic tests may scale them and
-        # exercise the exact product prune loop.
-        self.hard_budget = HARD_BUDGET_BYTES
-        self.soft_budget = SOFT_BUDGET_BYTES
+        self._lock = threading.RLock()
+        # Injectable bounds for deterministic tests, with no HTTP/config knobs.
+        self.hard_budget, self.soft_budget = HARD_BUDGET_BYTES, SOFT_BUDGET_BYTES
         self.prune_batch = PRUNE_BATCH
-        self._budget_pruned = False          # runtime-generation bool
-        self._budget_pruned_total = 0        # runtime explanatory counter
-
-    # -- lifecycle -----------------------------------------------------------
+        self.max_runs_per_probe, self.max_runs_global = MAX_RUNS_PER_PROBE, MAX_RUNS_GLOBAL
+        self.max_receipts_per_probe = MAX_RECEIPTS_PER_PROBE
+        self.max_receipts_global = MAX_RECEIPTS_GLOBAL
+        self.receipt_budget, self.run_budget = RECEIPT_BUDGET_BYTES, RUN_BUDGET_BYTES
+        self.db_budget, self.working_budget = DB_BUDGET_BYTES, WORKING_BUDGET_BYTES
+        self._budget_pruned = False
+        self._budget_pruned_total = 0
 
     def open(self):
-        """Create/open the store. Every failure is a sanitized
-        ``RemoteStoreError`` -- the caller degrades the REMOTE plane only."""
-        self._ensure_directory()
-        self._ensure_db_file()
-        try:
-            # The plane serialises every access with its own RLock (the
-            # History store's pattern), so the connection may be used from
-            # whatever thread the HTTP handler runs on.
-            conn = sqlite3.connect(self.db_path,
-                                   timeout=BUSY_TIMEOUT_MS / 1000.0,
-                                   isolation_level=None,
-                                   check_same_thread=False)
-        except sqlite3.Error as exc:
-            raise RemoteStoreError("store connect refused: %s"
-                                   % type(exc).__name__) from None
-        self._conn = conn
-        try:
-            conn.execute("PRAGMA busy_timeout=%d" % BUSY_TIMEOUT_MS)
-            conn.execute("PRAGMA journal_mode=DELETE").fetchall()
-            conn.execute("PRAGMA synchronous=FULL")
-            self._verify_schema(conn)
-        except sqlite3.Error as exc:
-            self.close()
-            raise RemoteStoreError("store unusable: %s"
-                                   % type(exc).__name__) from None
-        except BaseException:
-            self.close()
-            raise
-        self._opened = True
-        return self
+        with self._lock:
+            try:
+                self._ensure_paths()
+                self._conn = sqlite3.connect(self.db_path, timeout=BUSY_TIMEOUT_MS / 1000,
+                                            isolation_level=None, check_same_thread=False)
+                self._conn.execute("PRAGMA busy_timeout=%d" % BUSY_TIMEOUT_MS)
+                self._conn.execute("PRAGMA foreign_keys=ON")
+                # Gate BEFORE journal/retention writes. Draft v1 stays intact.
+                self._verify_schema()
+                self._conn.execute("PRAGMA journal_mode=DELETE").fetchall()
+                self._conn.execute("PRAGMA synchronous=FULL")
+                self._set_page_ceiling()
+                self._opened = True
+                self.enforce_retention()
+                return self
+            except (sqlite3.Error, OSError, ValueError, TypeError, KeyError, RemoteStoreError):
+                self.close()
+                raise RemoteStoreError("remote store open refused") from None
 
     def close(self):
         with self._lock:
@@ -146,264 +133,377 @@ class RemoteStore:
                     self._conn.close()
                 except sqlite3.Error:
                     pass
-                self._conn = None
-            self._opened = False
+            self._conn, self._opened = None, False
 
-    def _ensure_directory(self):
+    def _ensure_paths(self):
         if os.path.islink(self.directory):
-            raise RemoteStoreError("store directory must not be a symlink")
-        try:
-            os.makedirs(self.directory, mode=0o700, exist_ok=True)
-        except OSError as exc:
-            raise RemoteStoreError("store directory unusable: %s"
-                                   % type(exc).__name__) from None
-        if not os.path.isdir(self.directory):
-            raise RemoteStoreError("store path is not a directory")
-        if os.name == "posix":
-            try:
-                os.chmod(self.directory, 0o700)
-                mode = stat_module.S_IMODE(os.stat(self.directory).st_mode)
-            except OSError:
-                raise RemoteStoreError("store directory not statable") from None
-            if mode != 0o700:
-                raise RemoteStoreError("store directory mode must be 0700")
-
-    def _ensure_db_file(self):
-        """The DB file exists only as a regular 0600 file (never a symlink,
-        never a special object, never created with a looser mode)."""
-        if os.path.lexists(self.db_path):
-            if os.path.islink(self.db_path):
-                raise RemoteStoreError("store DB must not be a symlink")
-            try:
-                st = os.lstat(self.db_path)
-            except OSError as exc:
-                raise RemoteStoreError("store DB unstatable: %s"
-                                       % type(exc).__name__) from None
-            if not stat_module.S_ISREG(st.st_mode):
-                raise RemoteStoreError("store DB must be a regular file")
-            if os.name == "posix" \
-                    and stat_module.S_IMODE(st.st_mode) != 0o600:
-                raise RemoteStoreError("store DB mode must be 0600")
-            return
-        flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL
-                 | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0))
-        try:
-            fd = os.open(self.db_path, flags, 0o600)
+            raise RemoteStoreError("unsafe directory")
+        os.makedirs(self.directory, mode=0o700, exist_ok=True)
+        st = os.lstat(self.directory)
+        if not stat.S_ISDIR(st.st_mode) or (os.name == "posix" and
+                (stat.S_IMODE(st.st_mode) != 0o700 or st.st_uid != os.geteuid())):
+            raise RemoteStoreError("unsafe directory")
+        if not os.path.lexists(self.db_path):
+            fd = os.open(self.db_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                         getattr(os, "O_NOFOLLOW", 0), 0o600)
             os.close(fd)
-        except OSError as exc:
-            raise RemoteStoreError("store DB not creatable: %s"
-                                   % type(exc).__name__) from None
-
-    def _verify_schema(self, conn):
-        """Exact schema gate: user_version == 1 and EXACTLY the two
-        application tables. Unknown/newer/malformed fails the REMOTE plane
-        closed; a foreign table is never auto-adopted. A fresh empty file
-        (no tables, user_version 0) is created at v1; an empty table set
-        with any OTHER user_version is malformed, not fresh."""
-        rows = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' "
-            "AND name NOT LIKE 'sqlite_%'").fetchall()
-        names = {row[0] for row in rows}
-        if not names:
-            version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-            if version in (0, SCHEMA_USER_VERSION):
-                self._create_schema(conn)
-                return
-            raise RemoteStoreError("store schema user_version=%d" % version)
-        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-        if version != SCHEMA_USER_VERSION:
-            raise RemoteStoreError("store schema user_version=%d" % version)
-        if names != EXPECTED_TABLES:
-            raise RemoteStoreError("store table set mismatch")
+        before = os.lstat(self.db_path)
+        if not stat.S_ISREG(before.st_mode):
+            raise RemoteStoreError("unsafe DB")
+        fd = os.open(self.db_path, os.O_RDONLY | getattr(os, "O_BINARY", 0) |
+                     getattr(os, "O_NOFOLLOW", 0))
+        try:
+            opened = os.fstat(fd)
+            if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino) \
+                    or (os.name == "posix" and
+                        (stat.S_IMODE(opened.st_mode) != 0o600 or opened.st_uid != os.geteuid())):
+                raise RemoteStoreError("unsafe DB")
+        finally:
+            os.close(fd)
 
     @staticmethod
-    def _create_schema(conn):
-        conn.execute(
-            "CREATE TABLE %s ("
-            " probe_id TEXT NOT NULL,"
-            " run TEXT NOT NULL,"
-            " seq INTEGER NOT NULL,"
-            " sample_epoch REAL NOT NULL,"
-            " received_epoch REAL NOT NULL,"
-            " body_hash TEXT NOT NULL,"
-            " body BLOB NOT NULL,"
-            " PRIMARY KEY (probe_id, run, seq))" % TABLE_SAMPLES)
-        conn.execute(
-            "CREATE INDEX %s_age ON %s (probe_id, sample_epoch)"
-            % (TABLE_SAMPLES, TABLE_SAMPLES))
-        conn.execute(
-            "CREATE TABLE %s ("
-            " probe_id TEXT NOT NULL,"
-            " run TEXT NOT NULL,"
-            " max_seq INTEGER NOT NULL,"
-            " max_sample_epoch REAL NOT NULL,"
-            " created_epoch REAL NOT NULL,"
-            " last_activity_epoch REAL NOT NULL,"
-            " PRIMARY KEY (probe_id, run))" % TABLE_RUNS)
-        conn.execute("PRAGMA user_version=%d" % SCHEMA_USER_VERSION)
+    def _normalized(sql):
+        return " ".join(sql.lower().split())
 
-    # -- continuity / idempotency primitives ---------------------------------
+    def _verify_schema(self):
+        conn = self._conn
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        objects = conn.execute("SELECT type,name,sql FROM sqlite_master "
+                               "WHERE name NOT LIKE 'sqlite_%'").fetchall()
+        if not objects and version == 0:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                for sql in SCHEMA:
+                    conn.execute(sql)
+                conn.execute("PRAGMA user_version=1")
+                conn.execute("COMMIT")
+            except sqlite3.Error:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+                raise
+        elif version != 1 or len(objects) != len(SCHEMA) or \
+                {self._normalized(row[2] or "") for row in objects} != \
+                {self._normalized(sql) for sql in SCHEMA}:
+            raise RemoteStoreError("incompatible schema")
+        if conn.execute("PRAGMA quick_check").fetchone()[0] != "ok" \
+                or conn.execute("PRAGMA foreign_key_check").fetchone():
+            raise RemoteStoreError("inconsistent store")
+        if conn.execute(
+                "SELECT 1 FROM remote_probe_runs r LEFT JOIN remote_probe_receipts p "
+                "ON p.probe_id=r.probe_id AND p.run=r.run AND p.seq=r.max_seq "
+                "WHERE p.seq IS NULL OR EXISTS (SELECT 1 FROM remote_probe_receipts q "
+                "WHERE q.probe_id=r.probe_id AND q.run=r.run AND q.seq>r.max_seq) LIMIT 1").fetchone():
+            raise RemoteStoreError("inconsistent progression")
+        if conn.execute(
+                "SELECT 1 FROM remote_probe_samples s JOIN remote_probe_receipts p "
+                "USING(probe_id,run,seq) JOIN remote_probe_runs r USING(probe_id,run) "
+                "WHERE s.body_hash != p.body_hash OR s.sample_epoch>r.max_sample_epoch "
+                "OR (s.seq=r.max_seq AND s.sample_epoch != r.max_sample_epoch) LIMIT 1").fetchone():
+            raise RemoteStoreError("inconsistent evidence")
+        from remote_probe.payload import valid_probe_id, valid_run, validate_sample, canonical_bytes
+        for probe, run, seq, epoch, created, activity in conn.execute("SELECT * FROM remote_probe_runs"):
+            if not valid_probe_id(probe) or not valid_run(run) or type(seq) is not int \
+                    or not 1 <= seq <= (1 << 63)-1 \
+                    or not all(type(x) in (int, float) and math.isfinite(x) and x >= 0
+                               for x in (epoch, created, activity)) or activity < created:
+                raise RemoteStoreError("invalid run state")
+        if conn.execute("SELECT 1 FROM remote_probe_receipts p JOIN remote_probe_runs r "
+                "USING(probe_id,run) WHERE typeof(seq)!='integer' OR seq<1 "
+                "OR typeof(accepted_epoch) NOT IN ('integer','real') OR accepted_epoch<0 "
+                "OR accepted_epoch>r.last_activity_epoch LIMIT 1").fetchone():
+            raise RemoteStoreError("invalid receipt state")
+        for probe, run, seq, epoch, received, digest, body in conn.execute("SELECT * FROM remote_probe_samples"):
+            sample = json.loads(body)
+            if validate_sample(sample) or canonical_bytes(sample) != body \
+                    or hashlib.sha256(body).digest() != digest \
+                    or (sample['probe_id'],sample['run'],sample['seq'],sample['sample_epoch']) != (probe,run,seq,epoch) \
+                    or type(received) not in (int,float) or not math.isfinite(received) or received < 0:
+                raise RemoteStoreError("inconsistent evidence hash")
 
-    def sample_hash(self, probe_id, run, seq):
-        """The retained body hash for one identity tuple, or None."""
+    @contextmanager
+    def _transaction(self):
         with self._lock:
-            row = self._conn.execute(
-                "SELECT body_hash FROM %s WHERE probe_id=? AND run=? AND seq=?"
-                % TABLE_SAMPLES, (probe_id, run, int(seq))).fetchone()
-        return row[0] if row else None
-
-    def run_state(self, probe_id, run):
-        """The continuity row for one (probe_id, run), or None."""
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT max_seq, max_sample_epoch, created_epoch, "
-                "last_activity_epoch FROM %s WHERE probe_id=? AND run=?"
-                % TABLE_RUNS, (probe_id, run)).fetchone()
-        if not row:
-            return None
-        return {"max_seq": int(row[0]), "max_sample_epoch": float(row[1]),
-                "created_epoch": float(row[2]),
-                "last_activity_epoch": float(row[3])}
-
-    def begin_run(self, probe_id, run, now):
-        """Create the continuity row for a NEW run, honouring the frozen
-        bounds. Expired rows are removed first (they are legally expirable);
-        a full capacity with none expirable raises ``RunCapacityError`` --
-        live idempotency state is NEVER deleted to make room."""
-        with self._lock:
-            self._expire_runs(now)
-            probe_count = int(self._conn.execute(
-                "SELECT COUNT(*) FROM %s WHERE probe_id=?"
-                % TABLE_RUNS, (probe_id,)).fetchone()[0])
-            if probe_count >= MAX_RUNS_PER_PROBE:
-                raise RunCapacityError("probe run capacity")
-            global_count = int(self._conn.execute(
-                "SELECT COUNT(*) FROM %s" % TABLE_RUNS).fetchone()[0])
-            if global_count >= MAX_RUNS_GLOBAL:
-                raise RunCapacityError("global run capacity")
-            self._conn.execute(
-                "INSERT INTO %s (probe_id, run, max_seq, max_sample_epoch,"
-                " created_epoch, last_activity_epoch)"
-                " VALUES (?, ?, 0, -1.0, ?, ?)"
-                % TABLE_RUNS, (probe_id, run, float(now), float(now)))
-
-    def note_activity(self, probe_id, run, now):
-        """Record that an authenticated request touched this run (accepted,
-        idempotently accounted or retried): the 30-day lifetime counts from
-        the LAST such activity."""
-        with self._lock:
-            self._conn.execute(
-                "UPDATE %s SET last_activity_epoch=? WHERE probe_id=? AND run=?"
-                % TABLE_RUNS, (float(now), probe_id, run))
-
-    def record_accepted(self, probe_id, run, seq, sample_epoch, body_hash,
-                        body, now):
-        """Insert one evidence row and advance the run's progression in ONE
-        transaction. The caller has already proven: identity authenticated,
-        tuple not retained, seq > run.max_seq, sample_epoch > run.max_sample_epoch."""
-        with self._lock:
+            if not self._opened or self._conn is None:
+                raise RemoteStoreError("store closed")
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
-                self._conn.execute(
-                    "INSERT INTO %s (probe_id, run, seq, sample_epoch,"
-                    " received_epoch, body_hash, body)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?)" % TABLE_SAMPLES,
-                    (probe_id, run, int(seq), float(sample_epoch),
-                     float(now), body_hash, sqlite3.Binary(body)))
-                self._conn.execute(
-                    "UPDATE %s SET max_seq=?, max_sample_epoch=?,"
-                    " last_activity_epoch=? WHERE probe_id=? AND run=?"
-                    % TABLE_RUNS,
-                    (int(seq), float(sample_epoch), float(now),
-                     probe_id, run))
+                yield
                 self._conn.execute("COMMIT")
-            except sqlite3.Error as exc:
-                try:
-                    self._conn.execute("ROLLBACK")
-                except sqlite3.Error:
-                    pass
-                raise RemoteStoreError("sample not stored: %s"
-                                       % type(exc).__name__) from None
+            except BaseException as exc:
+                if self._conn.in_transaction:
+                    try:
+                        self._conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                if isinstance(exc, sqlite3.Error):
+                    if getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_FULL:
+                        raise StorageCapacityError("DB page ceiling") from None
+                    raise RemoteStoreError("store transaction failed") from None
+                if isinstance(exc, OSError):
+                    raise RemoteStoreError("store I/O failed") from None
+                raise
 
-    def _expire_runs(self, now):
-        """Remove ONLY runs whose 30-day lifetime has passed."""
-        horizon = float(now) - RUN_LIFETIME_SECONDS
-        self._conn.execute(
-            "DELETE FROM %s WHERE last_activity_epoch < ?" % TABLE_RUNS,
-            (horizon,))
+    def _count(self, table, probe_id=None):
+        sql, args = "SELECT COUNT(*) FROM " + table, ()
+        if probe_id is not None:
+            sql += " WHERE probe_id=?"
+            args = (probe_id,)
+        return self._conn.execute(sql, args).fetchone()[0]
 
-    # -- retention -----------------------------------------------------------
+    def _sample_bytes(self):
+        return self._conn.execute("SELECT COALESCE(SUM(length(body)+?),0) "
+                                  "FROM remote_probe_samples", (SAMPLE_ROW_CHARGE,)).fetchone()[0]
 
-    def _db_bytes(self):
-        """The store's LIVE data size in bytes.
+    def _page_bytes(self):
+        size = self._conn.execute("PRAGMA page_size").fetchone()[0]
+        count = self._conn.execute("PRAGMA page_count").fetchone()[0]
+        free = self._conn.execute("PRAGMA freelist_count").fetchone()[0]
+        return (count - free) * size, count * size
 
-        Freelist pages are excluded: deleted-but-not-yet-reclaimed pages
-        are not evidence, and counting them would make the prune loop
-        unable to see its own progress (it would keep deleting past the
-        soft target -- all the way to an empty store). The final VACUUM
-        reclaims the freelist so the file matches this number.
-        """
-        with self._lock:
-            page_size = int(self._conn.execute("PRAGMA page_size").fetchone()[0])
-            page_count = int(self._conn.execute(
-                "PRAGMA page_count").fetchone()[0])
-            freelist = int(self._conn.execute(
-                "PRAGMA freelist_count").fetchone()[0])
-        return page_size * (page_count - freelist)
+    def _set_page_ceiling(self):
+        size = self._conn.execute("PRAGMA page_size").fetchone()[0]
+        self._conn.execute("PRAGMA max_page_count=%d" % max(1, self.db_budget // size))
 
-    def enforce_retention(self, now=None):
-        """Age + budget retention over ``remote_probe_samples`` ONLY.
+    def _reserve_working_space(self):
+        # Bound/reserve main DB + DELETE journal + VACUUM copy. Each original
+        # page is journaled once; 8 MiB covers journal headers/rounding.
+        overhead = 8 * 1024 * 1024
+        footprint = journal_bytes = 0
+        for item in os.scandir(self.directory):
+            st = item.stat(follow_symlinks=False)
+            if not stat.S_ISREG(st.st_mode):
+                raise RemoteStoreError("unsafe store working object")
+            footprint += st.st_size
+            if item.name == DB_NAME + "-journal":
+                journal_bytes = st.st_size
+        # The current DELETE journal is already one of the reserved copies,
+        # not unrelated directory data; do not double-charge large expiry.
+        other = max(0, footprint - os.path.getsize(self.db_path) - journal_bytes)
+        if 3 * self.db_budget + overhead + other > self.working_budget \
+                or footprint > self.working_budget \
+                or journal_bytes > self.db_budget + overhead \
+                or shutil.disk_usage(self.directory).free < max(0,2*self.db_budget+overhead-journal_bytes):
+            raise StorageCapacityError("working space capacity")
 
-        Samples older than 7 days are removed. When the store's own byte
-        size crosses the 24 MiB hard ceiling, the OLDEST samples are pruned
-        until below the 16 MiB soft target, then space is reclaimed with
-        VACUUM. ``remote_probe_runs`` is never a pruning source, and core
-        History is unreachable from here by construction.
+    def _physical_admission(self):
+        self._set_page_ceiling()
+        live, allocated = self._page_bytes()
+        if live > self.db_budget or allocated > self.db_budget:
+            raise StorageCapacityError("DB capacity")
+        self._reserve_working_space()
+
+    def _prune(self, now, prospective_sample_bytes=0):
+        # Only legal run expiry cascades into receipts; sample pruning cannot.
+        self._conn.execute("DELETE FROM remote_probe_runs WHERE last_activity_epoch < ?",
+                           (now - RUN_LIFETIME_SECONDS,))
+        self._conn.execute("DELETE FROM remote_probe_samples WHERE sample_epoch < ?",
+                           (now - MAX_AGE_SECONDS,))
+        pruned = 0
+        if self._sample_bytes() + prospective_sample_bytes > self.hard_budget:
+            while self._sample_bytes() + prospective_sample_bytes > self.soft_budget:
+                removed = self._conn.execute("DELETE FROM remote_probe_samples WHERE rowid IN "
+                    "(SELECT rowid FROM remote_probe_samples ORDER BY sample_epoch,probe_id,run,seq LIMIT ?)",
+                    (self.prune_batch,)).rowcount
+                if removed <= 0:
+                    break
+                pruned += removed
+        return pruned
+
+    def _note_pruned(self, count):
+        if count:
+            self._budget_pruned = True
+            self._budget_pruned_total += 1
+
+    def _activity(self, probe_id, run, now):
+        self._conn.execute("UPDATE remote_probe_runs SET last_activity_epoch=MAX(last_activity_epoch,?) "
+                           "WHERE probe_id=? AND run=?", (now, probe_id, run))
+
+    def _capacity(self, probe_id, new_run):
+        runs = self._count(TABLE_RUNS)
+        if new_run and (self._count(TABLE_RUNS, probe_id) >= self.max_runs_per_probe
+                        or runs >= self.max_runs_global or (runs+1)*RUN_ROW_CHARGE > self.run_budget):
+            return RunCapacityError
+        receipts = self._count(TABLE_RECEIPTS)
+        if self._count(TABLE_RECEIPTS, probe_id) >= self.max_receipts_per_probe \
+                or receipts >= self.max_receipts_global \
+                or (receipts+1)*RECEIPT_ROW_CHARGE > self.receipt_budget:
+            return ReceiptCapacityError
+        return None
+
+    def accept(self, probe_id, run, seq, sample_epoch, body, now=None):
+        """Atomic receipt classification, new-tuple admission and durable write.
+
+        Caller supplies authenticated canonical bytes. Hash is computed here.
+        Return a closed verdict; capacity failures are typed exceptions.
         """
         now = float(self.clock() if now is None else now)
         with self._lock:
-            self._expire_runs(now)
-            self._conn.execute(
-                "DELETE FROM %s WHERE sample_epoch < ?" % TABLE_SAMPLES,
-                (now - MAX_AGE_SECONDS,))
-            pruned = 0
-            if self._db_bytes() > self.hard_budget:
-                self._budget_pruned = True
-                while self._db_bytes() > self.soft_budget:
-                    cursor = self._conn.execute(
-                        "DELETE FROM %s WHERE rowid IN (SELECT rowid FROM %s"
-                        " ORDER BY sample_epoch ASC, seq ASC LIMIT ?)"
-                        % (TABLE_SAMPLES, TABLE_SAMPLES),
-                        (self.prune_batch,))
-                    removed = cursor.rowcount if cursor.rowcount > 0 else 0
-                    if removed <= 0:
-                        break            # nothing left we may delete
-                    pruned += removed
-                self._conn.execute("VACUUM")   # reclaim the freelist
-            if pruned:
-                self._budget_pruned_total += 1
-            return self.status()
+            try:
+                return self._accept_locked(probe_id, run, seq, sample_epoch, body, now)
+            except StorageCapacityError:
+                # SQLITE_FULL may automatically roll back the entire SQLite
+                # transaction, including activity. Refresh only a canonical,
+                # progression-valid existing-run capacity retry in a fresh
+                # bounded transaction; never manufacture accepted state.
+                with self._transaction():
+                    state = self._conn.execute("SELECT max_seq,max_sample_epoch,last_activity_epoch "
+                        "FROM remote_probe_runs WHERE probe_id=? AND run=?", (probe_id,run)).fetchone()
+                    if state and state[2] >= now-RUN_LIFETIME_SECONDS and seq > state[0] \
+                            and sample_epoch > state[1] and now-NEW_SAMPLE_MAX_AGE <= sample_epoch <= now+300:
+                        self._activity(probe_id,run,now)
+                raise
 
-    # -- closed status -------------------------------------------------------
+    def _accept_locked(self, probe_id, run, seq, sample_epoch, body, now):
+        digest = hashlib.sha256(body).digest()
+        failure, verdict = None, None
+        with self._transaction():
+            pruned = self._prune(now)
+            receipt = self._conn.execute("SELECT body_hash FROM remote_probe_receipts "
+                "WHERE probe_id=? AND run=? AND seq=?", (probe_id, run, seq)).fetchone()
+            if receipt is not None:
+                verdict = "duplicate" if receipt[0] == digest else "equivocation"
+                if verdict == "duplicate":
+                    self._activity(probe_id, run, now)
+            else:
+                state = self._conn.execute("SELECT max_seq,max_sample_epoch FROM remote_probe_runs "
+                    "WHERE probe_id=? AND run=?", (probe_id, run)).fetchone()
+                if type(sample_epoch) not in (int, float) or not math.isfinite(sample_epoch) or sample_epoch < 0:
+                    verdict = "sample_epoch_out_of_range"
+                elif state is not None and seq <= state[0]:
+                    verdict = "sequence_not_increasing"
+                elif state is not None and sample_epoch <= state[1]:
+                    verdict = "sample_epoch_not_increasing"
+                elif sample_epoch > now+300 or sample_epoch < now-NEW_SAMPLE_MAX_AGE:
+                    verdict = "sample_epoch_out_of_range"
+                else:
+                    failure = self._capacity(probe_id, state is None)
+                    if failure is None:
+                        self._conn.execute("SAVEPOINT admission")
+                        try:
+                            # Prune prospective sample pressure before insert,
+                            # so page ceilings do not preempt legal retention.
+                            new_pruned = self._prune(now, len(body)+SAMPLE_ROW_CHARGE)
+                            self._physical_admission()
+                            if state is None:
+                                self._conn.execute("INSERT INTO remote_probe_runs VALUES(?,?,?,?,?,?)",
+                                    (probe_id, run, seq, sample_epoch, now, now))
+                            self._conn.execute("INSERT INTO remote_probe_receipts VALUES(?,?,?,?,?)",
+                                (probe_id, run, seq, digest, now))
+                            self._conn.execute("INSERT INTO remote_probe_samples VALUES(?,?,?,?,?,?,?)",
+                                (probe_id, run, seq, sample_epoch, now, digest, body))
+                            self._conn.execute("UPDATE remote_probe_runs SET max_seq=?,max_sample_epoch=?,"
+                                "last_activity_epoch=MAX(last_activity_epoch,?) WHERE probe_id=? AND run=?",
+                                (seq, sample_epoch, now, probe_id, run))
+                            new_pruned += self._prune(now)
+                            self._physical_admission()
+                            self._conn.execute("RELEASE admission")
+                            pruned += new_pruned
+                            verdict = "accepted"
+                        except StorageCapacityError:
+                            self._conn.execute("ROLLBACK TO admission")
+                            self._conn.execute("RELEASE admission")
+                            failure = StorageCapacityError
+                    if failure is not None and state is not None:
+                        self._activity(probe_id, run, now)
+        with self._lock:
+            self._note_pruned(pruned)
+        if failure:
+            raise failure("remote admission capacity")
+        return verdict
 
-    def status(self):
-        """Closed, sanitized store status (§12 minimum fields plus the
-        store's own byte size and the continuity row count)."""
+    def enforce_retention(self, now=None):
+        now = float(self.clock() if now is None else now)
+        with self._lock:
+            with self._transaction():
+                pruned = self._prune(now)
+            self._note_pruned(pruned)
+            return self._status_snapshot()
+
+    def receipt_hash(self, probe_id, run, seq):
+        with self._lock:
+            self.enforce_retention()
+            rows = self._query_rows("SELECT body_hash FROM remote_probe_receipts "
+                "WHERE probe_id=? AND run=? AND seq=?", (probe_id, run, seq))
+            return rows[0][0] if rows else None
+
+    def _query_rows(self, sql, args=()):
+        try:
+            if not self._opened or self._conn is None:
+                raise RemoteStoreError("store closed")
+            return self._conn.execute(sql,args).fetchall()
+        except sqlite3.Error:
+            raise RemoteStoreError("remote query failed") from None
+
+    def run_state(self, probe_id, run):
+        with self._lock:
+            self.enforce_retention()
+            rows = self._query_rows("SELECT max_seq,max_sample_epoch,created_epoch,last_activity_epoch "
+                "FROM remote_probe_runs WHERE probe_id=? AND run=?", (probe_id, run))
+            return dict(zip(("max_seq", "max_sample_epoch", "created_epoch", "last_activity_epoch"), rows[0])) if rows else None
+
+    def read_samples(self, start_epoch, end_epoch, probe_id=None, limit=READ_LIMIT):
+        """Bounded retained evidence; no HTTP/incident route here."""
+        if type(limit) is not int or not 1 <= limit <= READ_LIMIT \
+                or not all(type(x) in (int, float) and math.isfinite(x) and x >= 0
+                           for x in (start_epoch, end_epoch)) \
+                or not 0 <= end_epoch-start_epoch <= MAX_AGE_SECONDS:
+            raise ValueError("invalid remote read bounds")
+        with self._lock:
+            self.enforce_retention()
+            sql = "SELECT body FROM remote_probe_samples WHERE sample_epoch BETWEEN ? AND ?"
+            args = [start_epoch, end_epoch]
+            if probe_id is not None:
+                sql += " AND probe_id=?"
+                args.append(probe_id)
+            sql += " ORDER BY sample_epoch,probe_id,run,seq LIMIT ?"
+            args.append(limit)
+            try:
+                return [json.loads(row[0]) for row in self._query_rows(sql, args)]
+            except (sqlite3.Error, ValueError, UnicodeError):
+                raise RemoteStoreError("remote read failed") from None
+
+    def probe_sample_times(self):
+        with self._lock:
+            self.enforce_retention()
+            return dict(self._query_rows("SELECT probe_id,MAX(sample_epoch) "
+                                           "FROM remote_probe_samples GROUP BY probe_id"))
+
+    def capacity_code(self, probe_id=None):
+        with self._lock:
+            try:
+                live, allocated = self._page_bytes()
+                if live >= self.db_budget or allocated > self.db_budget:
+                    return StorageCapacityError.code
+                self._reserve_working_space()
+                if probe_id is not None:
+                    failure = self._capacity(probe_id, True)
+                    return failure.code if failure else None
+                if self._count(TABLE_RECEIPTS) >= self.max_receipts_global \
+                        or (self._count(TABLE_RECEIPTS)+1)*RECEIPT_ROW_CHARGE > self.receipt_budget:
+                    return ReceiptCapacityError.code
+                if self._count(TABLE_RUNS) >= self.max_runs_global \
+                        or (self._count(TABLE_RUNS)+1)*RUN_ROW_CHARGE > self.run_budget:
+                    return RunCapacityError.code
+                return None
+            except StorageCapacityError:
+                return StorageCapacityError.code
+            except (sqlite3.Error, OSError):
+                raise RemoteStoreError("remote capacity status failed") from None
+
+    def _status_snapshot(self):
         with self._lock:
             if not self._opened:
                 return {key: None for key in STATUS_KEYS}
-            row = self._conn.execute(
-                "SELECT MIN(sample_epoch), COUNT(*) FROM %s"
-                % TABLE_SAMPLES).fetchone()
-            run_count = int(self._conn.execute(
-                "SELECT COUNT(*) FROM %s" % TABLE_RUNS).fetchone()[0])
-            return {
-                "budget_pruned": bool(self._budget_pruned),
-                "budget_pruned_total": int(self._budget_pruned_total),
-                "retained_since_epoch": (float(row[0])
-                                         if row and row[0] is not None
-                                         else None),
-                "sample_count": int(row[1]) if row else 0,
-                "db_bytes": self._db_bytes(),
-                "run_count": run_count,
-            }
+            try:
+                oldest, count = self._conn.execute(
+                    "SELECT MIN(sample_epoch),COUNT(*) FROM remote_probe_samples").fetchone()
+                receipts, runs = self._count(TABLE_RECEIPTS), self._count(TABLE_RUNS)
+                live, allocated = self._page_bytes()
+                return dict(zip(STATUS_KEYS, (self._budget_pruned, self._budget_pruned_total,
+                    oldest, count, self._sample_bytes(), receipts, receipts*RECEIPT_ROW_CHARGE,
+                    runs, runs*RUN_ROW_CHARGE, live, allocated, self.capacity_code())))
+            except (sqlite3.Error, OSError):
+                raise RemoteStoreError("remote status failed") from None
+
+    def status(self):
+        return self.enforce_retention() if self._opened else self._status_snapshot()

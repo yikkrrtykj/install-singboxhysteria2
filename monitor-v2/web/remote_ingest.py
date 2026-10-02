@@ -28,13 +28,13 @@ Ordering inside :meth:`RemoteIngest.handle` is load-bearing:
    legitimate probe's capacity);
 7. body: parse -> frozen closed sample schema (PR-6A's own validator, never
    a forked grammar) -> canonical re-encode == exact received bytes;
-8. ``sample_epoch`` bounds (<= now + 300 s, >= now - 7d12h, finite,
-   non-negative) and strict per-run progression;
-9. store: idempotency / equivocation / continuity with the frozen two-table
-   semantics.
+8. one serialized store transaction: exact receipt lookup and hash verdict,
+   then NEW-tuple sample_epoch/progression/admission checks and a durable
+   receipt + sample + run commit under the re-frozen three-table contract.
 
-No secret, signature, header value, raw body or exception text is ever
-logged, stored in a response, or persisted.
+No secret, signature, header value or exception text is logged or persisted.
+Raw bodies are never logged/echoed; validated canonical samples are evidence
+rows only. Receipts contain the original hash, never the body.
 """
 
 from __future__ import annotations
@@ -50,8 +50,9 @@ from remote_probe import (INGEST_PATH, MAX_BODY_BYTES as ROUTE_MAX_BODY,
 from remote_probe.payload import (validate_sample, valid_probe_id,
                                   valid_run, verify_signature)
 
-from web.remote_registry import DUMMY_KEY, REGISTRY_READY
+from web.remote_registry import DUMMY_KEY
 from web.remote_store import (RemoteStore, RemoteStoreError, RunCapacityError)
+from web.remote_store import ReceiptCapacityError, StorageCapacityError
 
 INGEST_METHOD = "POST"
 
@@ -98,6 +99,9 @@ ERR_EPOCH_NOT_INCREASING = "sample_epoch_not_increasing"
 ERR_EQUIVOCATION = "equivocation"            # same tuple, different hash
 ERR_REMOTE_STORE = "remote_store_unavailable"  # 503, retryable
 ERR_REMOTE_RUN_CAPACITY = "remote_run_capacity"  # 503, retryable
+ERR_REMOTE_RECEIPT_CAPACITY = "remote_receipt_capacity"
+ERR_REMOTE_STORAGE_CAPACITY = "remote_storage_capacity"
+PROBE_REPORTING_SECONDS = 180.0  # three default 60-second generation cycles
 ERR_BAD_FRAMING = "invalid_framing"         # 400: CL/Content-Type rules
 ERR_PAYLOAD_TOO_LARGE = "payload_too_large"  # 413: > 16 KiB route cap
 ERR_CONTENT_TYPE = "unsupported_media_type"  # 400: not application/json
@@ -125,13 +129,18 @@ class TokenBucket:
         self.clock = clock or (lambda: time.monotonic())
         self._tokens = float(burst)
         self._updated = self.clock()
+        self._lock = threading.Lock()
 
     def check(self):
         """(allowed, retry_after_seconds) -- deterministic, no jitter."""
+        with self._lock:
+            return self._check_locked()
+
+    def _check_locked(self):
         now = self.clock()
         with_token = min(self.burst,
-                         self._tokens + (now - self._updated) * self.rate)
-        self._updated = now
+                         self._tokens + max(0, now - self._updated) * self.rate)
+        self._updated = max(now, self._updated)
         if with_token >= 1.0:
             self._tokens = with_token - 1.0
             return True, 0.0
@@ -205,7 +214,8 @@ class RemoteIngest:
         self.preauth = TokenBucket(PREAUTH_RATE, PREAUTH_BURST,
                                    clock=lambda: time.monotonic())
         self._store_error = None
-        self._suspended = set()              # probe_ids that hit capacity
+        self._state_lock = threading.RLock()
+        self._capacity_failures = {}  # bounded to authenticated registry IDs
         if store is None:
             try:
                 self.store = RemoteStore(data_dir, clock=self.clock).open()
@@ -234,23 +244,89 @@ class RemoteIngest:
         surface belongs to a later PR). A store failure never touches the
         History health object -- this dict is not consumed by
         ``_evidence_health_locked()`` or ``classifier_bundle()``."""
+        now = float(self.clock())
         state, subcode = self.registry.health()
+        store_status, times, probes = None, {}, {}
+        try:
+            if self.store is not None:
+                store_status = self.store.status()
+                times = self.store.probe_sample_times()
+                with self._state_lock:
+                    for probe_id in list(self._capacity_failures):
+                        if self.store.capacity_code(probe_id) is None:
+                            del self._capacity_failures[probe_id]
+                    failures = dict(self._capacity_failures)
+                self._store_error = None
+            else:
+                failures = {}
+        except RemoteStoreError:
+            self._store_error = ERR_REMOTE_STORE
+            failures = {}
+        for probe_id, entry in sorted(self.registry.entries.items()):
+            if not entry.enabled:
+                continue
+            epoch = times.get(probe_id)
+            code = failures.get(probe_id)
+            if code is None and self.store is not None and self._store_error is None:
+                try:
+                    code = self.store.capacity_code(probe_id)
+                except RemoteStoreError:
+                    self._store_error = ERR_REMOTE_STORE
+            if self._store_error is not None:
+                probe_state, code = "degraded", ERR_REMOTE_STORE
+            elif code:
+                probe_state = "degraded"
+            elif epoch is None or now - epoch > PROBE_REPORTING_SECONDS:
+                probe_state, code = "source_unavailable", "probe_not_reporting"
+            elif store_status and store_status["budget_pruned"]:
+                probe_state, code = "degraded", "remote_budget_pruned"
+            else:
+                probe_state, code = "fresh", None
+            probes[probe_id] = {"status": probe_state, "subcode": code,
+                                "last_sample_epoch": epoch,
+                                "site_label": entry.site_label,
+                                "path_label": entry.path_label}
+        for probe_id in self.registry.identity_problems():
+            probes[probe_id] = {"status": "degraded", "subcode": "remote_config_invalid",
+                                "last_sample_epoch": None, "site_label": None, "path_label": None}
         if state == "ready":
-            state = "fresh"
-        if self._store_error is not None:
-            state = "degraded"
-            subcode = "remote_store_unavailable"
-        if self._suspended:
-            state = "degraded"
-            subcode = "remote_run_capacity"
-        store_status = self.store.status() if self.store is not None else None
+            state, subcode = "not_configured", None
+            if probes:
+                state = "fresh"
+                for target in ("degraded", "source_unavailable"):
+                    matches = [p for p in probes.values() if p["status"] == target]
+                    if matches:
+                        state, subcode = target, matches[0]["subcode"]
+                        break
+        if state != "not_configured" and self._store_error is not None:
+            state, subcode = "degraded", ERR_REMOTE_STORE
         return {
             "status": state,
             "subcode": subcode,
-            "probes_configured": len(self.registry.entries),
-            "suspended_probes": sorted(self._suspended),
+            "probes_configured": len(self.registry.entries) + len(self.registry.identity_problems()),
+            "suspended_probes": sorted(p for p, row in probes.items()
+                                       if row["subcode"] in (ERR_REMOTE_RUN_CAPACITY,
+                                          ERR_REMOTE_RECEIPT_CAPACITY, ERR_REMOTE_STORAGE_CAPACITY)),
+            "probes": probes,
             "store": store_status,
         }
+
+    def read_samples(self, start_epoch, end_epoch, probe_id=None, limit=256):
+        """Internal retained-sample primitive for later presentation work.
+
+        No incident/HTTP route is added. Labels are current operator assertions;
+        retired mappings return no labels. Receipts are never evidence rows.
+        """
+        if self.store is None:
+            raise RemoteStoreError("remote store unavailable")
+        result = []
+        for sample in self.store.read_samples(start_epoch, end_epoch, probe_id, limit):
+            entry = self.registry.lookup(sample["probe_id"])
+            mapped = entry is not None and entry.enabled
+            result.append({"sample": sample, "mapping_retired": not mapped,
+                           "site_label": entry.site_label if mapped else None,
+                           "path_label": entry.path_label if mapped else None})
+        return result
 
     # -- the one machine entry point -----------------------------------------
 
@@ -314,50 +390,25 @@ class RemoteIngest:
                 return 400, {"error": ERR_NON_CANONICAL}, ()
         except (TypeError, ValueError):
             return 400, {"error": ERR_NON_CANONICAL}, ()
-        # 8. sample_epoch bounds (finite, non-negative, future/age window).
+        # 8. The store classifies receipts BEFORE applying NEW-sample bounds.
         epoch = sample.get("sample_epoch")
-        if not self._epoch_ok(epoch, now):
-            return 400, {"error": ERR_SAMPLE_EPOCH_RANGE}, ()
         # 9. store: idempotency / equivocation / continuity.
         if self.store is None:
             return 503, {"error": ERR_REMOTE_STORE}, ()
-        body_hash = hashlib.sha256(raw_body).hexdigest()
         try:
-            return self._store_sample(self.store, probe_id, run, seq, epoch,
-                                      body_hash, raw_body, now)
+            verdict = self.store.accept(probe_id, run, seq, epoch, raw_body, now)
+            if verdict in (RESULT_ACCEPTED, RESULT_DUPLICATE):
+                with self._state_lock:
+                    self._capacity_failures.pop(probe_id, None)
+                return 200, {"v": SUCCESS_VERSION, "result": verdict}, ()
+            return (400 if verdict == ERR_SAMPLE_EPOCH_RANGE else 409), {"error": verdict}, ()
         except RemoteStoreError as exc:
-            if isinstance(exc, RunCapacityError):
-                self._suspended.add(probe_id)
-                return 503, {"error": ERR_REMOTE_RUN_CAPACITY}, ()
+            if isinstance(exc, (RunCapacityError, ReceiptCapacityError, StorageCapacityError)):
+                with self._state_lock:
+                    self._capacity_failures[probe_id] = exc.code
+                return 503, {"error": exc.code}, ()
+            self._store_error = ERR_REMOTE_STORE
             return 503, {"error": ERR_REMOTE_STORE}, ()
-
-    # -- store acceptance ----------------------------------------------------
-
-    def _store_sample(self, store, probe_id, run, seq, epoch, body_hash,
-                      body, now):
-        retained = store.sample_hash(probe_id, run, seq)
-        if retained is not None:
-            if retained == body_hash:
-                store.note_activity(probe_id, run, now)
-                return 200, {"v": SUCCESS_VERSION,
-                             "result": RESULT_DUPLICATE}, ()
-            return 409, {"error": ERR_EQUIVOCATION}, ()
-        run_row = store.run_state(probe_id, run)
-        if run_row is None:
-            store.begin_run(probe_id, run, now)
-            run_row = store.run_state(probe_id, run)
-        if seq <= run_row["max_seq"]:
-            # The tuple was already accepted once and its evidence has since
-            # aged out (strict per-run progression makes this exact):
-            # idempotently accounted, nothing re-stored (§9).
-            store.note_activity(probe_id, run, now)
-            return 200, {"v": SUCCESS_VERSION,
-                         "result": RESULT_DUPLICATE}, ()
-        if epoch <= run_row["max_sample_epoch"]:
-            return 409, {"error": ERR_EPOCH_NOT_INCREASING}, ()
-        store.record_accepted(probe_id, run, seq, epoch, body_hash, body, now)
-        self._suspended.discard(probe_id)
-        return 200, {"v": SUCCESS_VERSION, "result": RESULT_ACCEPTED}, ()
 
     # -- helpers -------------------------------------------------------------
 
@@ -383,19 +434,6 @@ class RemoteIngest:
         if not isinstance(sample, dict) or validate_sample(sample):
             return None
         return sample
-
-    @staticmethod
-    def _epoch_ok(epoch, now):
-        import math
-        if type(epoch) not in (int, float) or isinstance(epoch, bool):
-            return False
-        if not math.isfinite(epoch) or epoch < 0:
-            return False
-        if epoch > now + SAMPLE_EPOCH_FUTURE_SECONDS:
-            return False
-        if epoch < now - SAMPLE_EPOCH_AGE_SECONDS:
-            return False
-        return True
 
     def _unauthorized(self):
         """THE closed authentication failure: unknown, disabled, malformed,

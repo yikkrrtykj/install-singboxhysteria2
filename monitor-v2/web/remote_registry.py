@@ -7,9 +7,9 @@ provider, and no IP/ASN inference exists anywhere in this module.
 
 Frozen filesystem contract (production):
 
-- config ``/etc/singbox-monitor/remote-probes.json``  regular, 0640;
-- key dir  ``/etc/singbox-monitor/remote-probes.d/``  real dir, 0750;
-- keys     ``.../remote-probes.d/<name>.key``         regular, no-follow, 0640.
+- config ``/etc/singbox-monitor/remote-probes.json``  regular, root:sboxweb 0640;
+- key dir  ``/etc/singbox-monitor/remote-probes.d/``  real dir, root:sboxweb 0750;
+- keys     ``.../remote-probes.d/<name>.key``         regular, no-follow, root:sboxweb 0640.
 
 Loading uses exactly the E4-Diag class of primitives: open with
 ``O_NOFOLLOW``, fstat the open descriptor (regular file, same object), and
@@ -69,15 +69,31 @@ class RegistryError(Exception):
     """The registry is unusable for the whole plane (sanitized text only)."""
 
 
-def _open_regular(path, mode_bits):
+def _authority(st, mode_bits):
+    if os.name == "posix":
+        import grp
+        try:
+            gid = grp.getgrnam("sboxweb").gr_gid
+        except KeyError:
+            raise RegistryError("registry service group absent") from None
+        if st.st_uid != 0 or st.st_gid != gid \
+                or stat_module.S_IMODE(st.st_mode) != mode_bits:
+            raise RegistryError("registry filesystem authority refused")
+
+
+def _open_regular(path, mode_bits, dir_fd=None):
     """Open a regular, no-follow file and verify it on the OPEN descriptor.
 
     Returns ``(fd, st)`` or raises ``RegistryError``. On POSIX the frozen
     permission bits are enforced; on other hosts the shape checks still run.
     """
-    flags = getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = (getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+             | getattr(os, "O_NONBLOCK", 0))
     try:
-        fd = os.open(path, os.O_RDONLY | flags)
+        before = os.stat(path, dir_fd=dir_fd, follow_symlinks=False)
+        if not stat_module.S_ISREG(before.st_mode):
+            raise RegistryError("registry file must be regular")
+        fd = os.open(path, os.O_RDONLY | flags, dir_fd=dir_fd)
     except FileNotFoundError:
         raise RegistryError("registry file absent") from None
     except OSError as exc:
@@ -88,10 +104,11 @@ def _open_regular(path, mode_bits):
         st = os.fstat(fd)
         if not stat_module.S_ISREG(st.st_mode):
             raise RegistryError("registry file must be a regular file")
-        if os.name == "posix":
-            if stat_module.S_IMODE(st.st_mode) != mode_bits:
-                raise RegistryError("registry file mode must be %04o"
-                                    % mode_bits)
+        after = os.stat(path, dir_fd=dir_fd, follow_symlinks=False)
+        if (before.st_dev, before.st_ino) != (st.st_dev, st.st_ino) \
+                or (after.st_dev, after.st_ino) != (st.st_dev, st.st_ino):
+            raise RegistryError("registry file changed during open")
+        _authority(st, mode_bits)
     except BaseException:
         os.close(fd)
         raise
@@ -119,8 +136,11 @@ def parse_secret_key(raw):
     """
     if type(raw) is not bytes:
         return None
-    text = raw.decode("ascii", errors="strict").strip(" \t\r\n") \
-        if len(raw) <= 4096 else None
+    try:
+        text = raw.decode("ascii", errors="strict").strip(" \t\r\n") \
+            if len(raw) <= 4096 else None
+    except UnicodeDecodeError:
+        return None
     if type(text) is not str or len(text) != _SECRET_HEX_CHARS:
         return None
     if any(ch not in "0123456789abcdef" for ch in text):
@@ -156,6 +176,7 @@ class RemoteRegistry:
         self.config_path = config_path
         self.key_dir = key_dir
         self.entries = {}
+        self._identity_problems = {}
         self.state = REGISTRY_NOT_CONFIGURED
         self.subcode = None
         self.load()
@@ -172,42 +193,45 @@ class RemoteRegistry:
         authenticates nobody.
         """
         self.entries = {}
+        self._identity_problems = {}
         self.state = REGISTRY_NOT_CONFIGURED
         self.subcode = None
         if not os.path.lexists(self.config_path):
             return                      # DARK: no remote plane configured
         try:
             entries, per_identity = self._load_config()
-        except RegistryError as exc:
+        except (RegistryError, OSError, UnicodeError):
             self.state = REGISTRY_DEGRADED
             self.subcode = SUBCODE_REMOTE_CONFIG_INVALID
-            self._reason = str(exc)
             return
         self.entries = entries
         self._identity_problems = per_identity
-        self.state = REGISTRY_READY if entries else REGISTRY_DEGRADED
-        if not entries:
+        self.state = REGISTRY_READY if entries and not per_identity else REGISTRY_DEGRADED
+        if not entries or per_identity:
             self.subcode = SUBCODE_REMOTE_CONFIG_INVALID
 
     def _load_config(self):
         fd, _st = _open_regular(self.config_path, 0o640)
         try:
-            raw = _read_bounded(fd, 256 * 1024)
+            raw = _read_bounded(fd, 256 * 1024 + 1)
         finally:
             os.close(fd)
         import json
+        if len(raw) > 256 * 1024:
+            raise RegistryError("config too large")
         try:
             config = json.loads(raw.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
             raise RegistryError("config is not JSON") from None
         if not isinstance(config, dict) or set(config) != _CONFIG_KEYS:
             raise RegistryError("config key-set")
-        if config["v"] != _CONFIG_VERSION or isinstance(config["v"], bool):
+        if type(config["v"]) is not int or config["v"] != _CONFIG_VERSION:
             raise RegistryError("config version")
         probes = config["probes"]
         if not isinstance(probes, list) or len(probes) > MAX_PROBES:
             raise RegistryError("config probes list")
         entries = {}
+        seen = set()
         per_identity = {}
         for item in probes:
             if not isinstance(item, dict) or set(item) != _PROBE_ENTRY_KEYS:
@@ -215,8 +239,9 @@ class RemoteRegistry:
             probe_id = item["probe_id"]
             if type(probe_id) is not str or not _PROBE_ID_RE.match(probe_id):
                 raise RegistryError("probe_id grammar")
-            if probe_id in entries:
+            if probe_id in seen:
                 raise RegistryError("duplicate probe_id")
+            seen.add(probe_id)
             enabled = item["enabled"]
             if type(enabled) is not bool:
                 raise RegistryError("enabled must be bool")
@@ -241,22 +266,34 @@ class RemoteRegistry:
         return entries, per_identity
 
     def _load_key(self, key_file):
-        path = os.path.join(self.key_dir, key_file)
-        if os.path.abspath(path) \
-                != os.path.abspath(os.path.join(self.key_dir, key_file)):
-            return None, "key path escapes the key directory"
+        directory_fd = None
         try:
-            fd, _st = _open_regular(path, 0o640)
-        except RegistryError as exc:
-            return None, str(exc)
-        try:
-            raw = _read_bounded(fd, 4096)
+            before = os.lstat(self.key_dir)
+            if not stat_module.S_ISDIR(before.st_mode):
+                raise RegistryError("key directory must be real")
+            _authority(before, 0o750)
+            if os.name == "posix":
+                directory_fd = os.open(self.key_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                opened = os.fstat(directory_fd)
+                after = os.lstat(self.key_dir)
+                if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino) \
+                        or (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino):
+                    raise RegistryError("key directory changed")
+                _authority(opened, 0o750)
+                fd, _st = _open_regular(key_file, 0o640, directory_fd)
+            else:
+                fd, _st = _open_regular(os.path.join(self.key_dir, key_file), 0o640)
+            try:
+                raw = _read_bounded(fd, 4097)
+            finally:
+                os.close(fd)
+            key = parse_secret_key(raw)
+            return (key, None) if key is not None else (None, SUBCODE_REMOTE_CONFIG_INVALID)
+        except (RegistryError, OSError, UnicodeError):
+            return None, SUBCODE_REMOTE_CONFIG_INVALID
         finally:
-            os.close(fd)
-        key = parse_secret_key(raw)
-        if key is None:
-            return None, "key material is not 64 lowercase hex"
-        return key, None
+            if directory_fd is not None:
+                os.close(directory_fd)
 
     # -- lookups -------------------------------------------------------------
 

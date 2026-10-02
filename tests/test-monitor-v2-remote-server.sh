@@ -4,7 +4,7 @@
 # Deterministic, offline, no Internet / real proxy / real VPS / wall clock.
 # The count is hard-gated:
 #
-# 105 = S0 static + red-line gates 31 (py_compile of the server modules
+# 187 = S0 static + red-line gates 33 (py_compile of the server modules
 #      + harness; the release identity 0.7.0 in both places; History still
 #      schema v5 with its six frozen prune sources and no remote words;
 #      classifier/runtime/presenter carry no remote reference; the ingest
@@ -16,15 +16,14 @@
 #      16 KiB body bound and TLS termination; the deploy tooling never
 #      references the remote store and the History prestate stays an
 #      exact path; the previous release tree has no remote-plane code)
-#      + S1 harness 73 verdicts across EIGHT groups (route/auth/epochs/
-#      store/retention/limits/isolation/deploy) + the harness rc gate
+#      + S1 harness 153 verdicts across TWELVE groups (route/auth/epochs/
+#      store/retention/continuity/capacity/concurrency/status/limits/isolation/deploy)
+#      + the harness rc gate
 #      (a crashing harness is itself a gate).
 #
-# Host note: file-MODE gates (0640/0750/0600/0700) are enforced by the
-# product on POSIX; on a Windows dev box they self-satisfy and are
-# exercised on the Linux CI runners. The symlink-shaped store refusal
-# behaves the same way; the special-object refusals cover the invariant
-# host-independently.
+# Real owner/group/mode/no-follow/rename-race gates are separate mandatory
+# Linux CI checks, as is nginx -t. Common tests do not count skipped host
+# assertions as PASS. Linux fixtures require root and the real sboxweb group.
 
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -60,6 +59,13 @@ if "$PY3" -m py_compile tests/remote-server/server_groups.py 2>/dev/null; then
 else
     no "server_groups.py compiles"
 fi
+for harness in store_groups linux_groups; do
+    if "$PY3" -m py_compile "tests/remote-server/$harness.py" 2>/dev/null; then
+        ok "$harness.py compiles"
+    else
+        no "$harness.py compiles"
+    fi
+done
 
 assert_eq '0.7.0' "$(cat "$ROOT/monitor-v2/VERSION")" "VERSION is 0.7.0 (PR-6B owns the release bump)"
 assert_contains 'MONITOR_WEB_VERSION = "0.7.0"' "$(cat "$SERVER_PY")" "MONITOR_WEB_VERSION is 0.7.0"
@@ -153,8 +159,8 @@ fi
 
 TOTAL=$((pass + fail))
 printf '== RESULT ==\n'
-printf 'checks: %d passed, %d failed (expected %d)\n' "$pass" "$fail" "105"
-if [ "$fail" -eq 0 ] && [ "$TOTAL" -eq 105 ]; then
+printf 'checks: %d passed, %d failed (expected %d)\n' "$pass" "$fail" "187"
+if [ "$fail" -eq 0 ] && [ "$TOTAL" -eq 187 ]; then
     printf '== PR-6B server ingest suite: GREEN ==\n'
     exit 0
 fi

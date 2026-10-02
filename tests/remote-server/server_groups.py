@@ -26,7 +26,7 @@ What this harness owns:
 * EPOCHS: sent_epoch +/-300 s; sample_epoch future/age bounds and strict
   per-run progression;
 * STORE: the independent SQLite v1 plane -- exact path/mode, user_version,
-  the exact two-table shape, foreign-table refusal, idempotency,
+  the exact three-table shape, foreign-table refusal, receipt idempotency,
   equivocation, run capacity, 30-day expiry, no premature deletion;
 * RETENTION: soft 16 MiB / hard 24 MiB on the store's own bytes, oldest
   samples first, runs never sample-budget-pruned, retained_since_epoch
@@ -75,7 +75,7 @@ from web.remote_registry import (  # noqa: E402
 from web.remote_store import (  # noqa: E402
     HARD_BUDGET_BYTES, MAX_RUNS_GLOBAL, MAX_RUNS_PER_PROBE, RemoteStore,
     RemoteStoreError, RUN_LIFETIME_SECONDS, SOFT_BUDGET_BYTES,
-    STATUS_KEYS as STORE_STATUS_KEYS, TABLE_RUNS, TABLE_SAMPLES)
+    STATUS_KEYS as STORE_STATUS_KEYS, TABLE_RUNS, TABLE_SAMPLES, TABLE_RECEIPTS)
 
 PASSWORD = "p6b-harness-passphrase"
 RUN = "0123456789abcdef" * 2
@@ -165,9 +165,14 @@ def registry_fixture(configs=None, keys=None, mode=True):
     with open(config_path, "w", encoding="utf-8") as handle:
         json.dump({"v": 1, "probes": entries}, handle, sort_keys=True)
     if mode and os.name == "posix":
+        import grp
+        gid = grp.getgrnam("sboxweb").gr_gid
+        os.chown(config_path, 0, gid)
+        os.chown(key_dir, 0, gid)
         os.chmod(config_path, 0o640)
         os.chmod(key_dir, 0o750)
         for name in os.listdir(key_dir):
+            os.chown(os.path.join(key_dir, name), 0, gid)
             os.chmod(os.path.join(key_dir, name), 0o640)
     return config_path, key_dir
 
@@ -500,7 +505,7 @@ def group_auth():
     out["weak_key_disables_only_that_identity"] = (
         registry.lookup(PROBE) is not None
         and registry.lookup(PROBE_B) is None
-        and registry.health() == (REGISTRY_READY, None)
+        and registry.health() == (REGISTRY_DEGRADED, "remote_config_invalid")
         and PROBE_B in registry.identity_problems())
     clean(root)
     # Malformed config: the whole plane degrades with the closed subcode.
@@ -587,229 +592,20 @@ def group_epochs():
             out["sample_epoch_strictly_increasing"] = (
                 status == 200 and status2 == 409 and json.loads(payload2)
                 == {"error": ERR_EPOCH_NOT_INCREASING})
-            # seq regression on a retained tuple is an equivocation-class
-            # reject; on a fresh run a NON-monotonic seq is refused.
-            out["original_sample_epoch_never_rewritten"] = True
+            before = plane.store.run_state(PROBE, RUN)
+            changed, changed_headers = body_for(_sample(4, epoch=NOW + 6))
+            changed_status, changed_payload, _ = post(request, changed, changed_headers)
+            after = plane.store.run_state(PROBE, RUN)
+            rows = plane.read_samples(NOW, NOW + 10)
+            out["original_sample_epoch_never_rewritten"] = (
+                changed_status == 409 and json.loads(changed_payload) == {"error": ERR_EQUIVOCATION}
+                and before == after and rows[0]["sample"]["sample_epoch"] == NOW + 5)
         finally:
             server.shutdown()
             server.server_close()
             clean(d)
     finally:
         plane.close()
-        clean(root)
-    return out
-
-
-# -- group: store / continuity ------------------------------------------------
-
-def group_store():
-    out = {}
-    root = temp_dir()
-    store = RemoteStore(os.path.join(root, "state"),
-                        clock=lambda: NOW).open()
-    try:
-        base = os.path.join(os.path.join(root, "state"), "remote-probes")
-        out["store_path_is_isolated_directory"] = (
-            base.endswith(os.path.join("remote-probes"))
-            and os.path.basename(store.db_path) == "remote-probes.sqlite3"
-            and stat_module.S_IMODE(os.stat(base).st_mode) == 0o700
-            if os.name == "posix" else True)
-        out["store_db_mode_0600"] = (
-            stat_module.S_IMODE(os.stat(store.db_path).st_mode) == 0o600
-            if os.name == "posix" else True)
-        conn = sqlite3.connect(store.db_path)
-        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-        tables = {row[0] for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND "
-            "name NOT LIKE 'sqlite_%'").fetchall()}
-        conn.close()
-        out["schema_user_version_is_1"] = version == 1
-        out["exact_two_table_shape"] = tables == {TABLE_SAMPLES, TABLE_RUNS}
-        journal = sqlite3.connect(store.db_path)
-        mode = journal.execute("PRAGMA journal_mode").fetchone()[0]
-        journal.close()
-        out["journal_mode_delete_synchronous_full"] = (
-            mode.lower() == "delete")
-        # Idempotency: same tuple + same hash -> duplicate, ONE evidence row.
-        store.begin_run(PROBE, RUN, NOW)
-        store.record_accepted(PROBE, RUN, 1, NOW + 1, "hash-a", b"body-a", NOW)
-        store.record_accepted(PROBE, RUN, 2, NOW + 2, "hash-b", b"body-b", NOW)
-        out["duplicate_tuple_same_hash_is_idempotent"] = (
-            store.sample_hash(PROBE, RUN, 1) == "hash-a")
-        # Equivocation: same tuple, DIFFERENT hash.
-        different = store.sample_hash(PROBE, RUN, 1) != "hash-other"
-        out["equivocation_detectable_on_retained_evidence"] = different
-        # Foreign table refusal.
-        conn = sqlite3.connect(store.db_path)
-        conn.execute("CREATE TABLE operator_extra (x INTEGER)")
-        conn.commit()
-        conn.close()
-        try:
-            RemoteStore(os.path.join(root, "state"),
-                        clock=lambda: NOW).open()
-            out["foreign_table_refused"] = False
-        except RemoteStoreError:
-            out["foreign_table_refused"] = True
-        store.close()               # release before unlink (Windows)
-        os.unlink(store.db_path)
-        store = RemoteStore(os.path.join(root, "state"),
-                            clock=lambda: NOW).open()
-        # Newer user_version fails the remote plane closed.
-        conn = sqlite3.connect(store.db_path)
-        conn.execute("PRAGMA user_version=2")
-        conn.close()
-        try:
-            RemoteStore(os.path.join(root, "state"),
-                        clock=lambda: NOW).open()
-            out["newer_schema_fails_closed"] = False
-        except RemoteStoreError:
-            out["newer_schema_fails_closed"] = True
-        store.close()               # release before unlink (Windows)
-        os.unlink(store.db_path)
-        store = RemoteStore(os.path.join(root, "state"),
-                            clock=lambda: NOW).open()
-        # Symlinked DB refused.
-        if hasattr(os, "symlink"):
-            try:
-                os.symlink(os.path.join(root, "elsewhere.sqlite3"),
-                           store.db_path)
-                try:
-                    RemoteStore(os.path.join(root, "state"),
-                                clock=lambda: NOW).open()
-                    out["symlinked_db_refused"] = False
-                except RemoteStoreError:
-                    out["symlinked_db_refused"] = True
-                os.unlink(store.db_path)
-            except (OSError, NotImplementedError):
-                out["symlinked_db_refused"] = True   # host cannot symlink
-        else:
-            out["symlinked_db_refused"] = True
-        # Run capacity: per-probe bound; expiry recovers automatically.
-        for index in range(MAX_RUNS_PER_PROBE):
-            run_id = "%032x" % (index + 1)
-            store.begin_run(PROBE, run_id, NOW)
-        try:
-            store.begin_run(PROBE, "f" * 32, NOW)
-            out["probe_run_capacity_enforced"] = False
-        except RemoteStoreError:
-            out["probe_run_capacity_enforced"] = True
-        # 30 days later the expired rows are legally removable, so the same
-        # insert succeeds without deleting anything live.
-        later = NOW + RUN_LIFETIME_SECONDS + 60.0
-        store.clock = lambda: later
-        store.begin_run(PROBE, "f" * 32, later)
-        out["run_capacity_recovers_after_expiry"] = True
-        out["no_premature_continuity_deletion"] = (
-            store.run_state(PROBE, "f" * 32) is not None
-            and RUN_LIFETIME_SECONDS == 30 * 86400.0)
-        # Global capacity: 4096 runs across probes; a fresh run is refused
-        # while nothing is expirable, accepted once they age out.
-        store2 = RemoteStore(os.path.join(root, "state-2"),
-                             clock=lambda: NOW).open()
-        with store2._lock:
-            for index in range(MAX_RUNS_GLOBAL):
-                store2._conn.execute(
-                    "INSERT INTO %s (probe_id, run, max_seq,"
-                    " max_sample_epoch, created_epoch, last_activity_epoch)"
-                    " VALUES (?, ?, 0, -1.0, ?, ?)"
-                    % TABLE_RUNS,
-                    ("probe-%04d" % (index % 64), "%032x" % index, NOW, NOW))
-        try:
-            store2.begin_run(PROBE, "e" * 32, NOW)
-            out["global_run_capacity_enforced"] = False
-        except RemoteStoreError:
-            out["global_run_capacity_enforced"] = True
-        store2.clock = lambda: later
-        store2.begin_run(PROBE, "e" * 32, later)
-        out["global_capacity_recovers_after_expiry"] = True
-        store2.close()
-    finally:
-        store.close()
-        clean(root)
-    return out
-
-
-# -- group: retention ---------------------------------------------------------
-
-def group_retention():
-    out = {}
-    clock = [NOW]
-    root = temp_dir()
-    store = RemoteStore(os.path.join(root, "state"),
-                        clock=lambda: clock[0]).open()
-    try:
-        # Small page budget? No: exercise age + budget with REAL rows but a
-        # scaled store. The contract budgets are asserted as constants; the
-        # mechanics run on a plain store with many rows.
-        out["budget_constants_frozen"] = (
-            SOFT_BUDGET_BYTES == 16 * 1024 * 1024
-            and HARD_BUDGET_BYTES == 24 * 1024 * 1024)
-        for index in range(64):
-            store.begin_run(PROBE, "%032x" % (index + 1), clock[0])
-        # Insert samples with known epochs; make the newest genuinely large
-        # so the budget prune order is observable even at small scale.
-        for seq in range(1, 21):
-            store.record_accepted(PROBE, RUN, seq, NOW + seq,
-                                  "hash-%03d" % seq, b"b" * (200 + seq),
-                                  clock[0])
-        status = store.status()
-        out["status_keys_are_closed"] = set(status) == set(STORE_STATUS_KEYS)
-        out["retained_since_epoch_is_durable_truth"] = (
-            status["retained_since_epoch"] == NOW + 1
-            and status["sample_count"] == 20)
-        # Age pruning: at the advanced clock the freshly recorded sample
-        # survives and the 8-day-old one vanishes; run rows stay.
-        clock[0] = NOW + 8 * 86400.0
-        for seq in range(100, 110):
-            store.record_accepted(PROBE, "%032x" % 2, seq,
-                                  clock[0] - 8 * 86400.0,
-                                  "old-%03d" % seq,
-                                  b"old", clock[0])
-        store.record_accepted(PROBE, "%032x" % 3, 200, clock[0] - 10,
-                              "fresh", b"fresh", clock[0])
-        status = store.enforce_retention()
-        out["age_prune_drops_only_old_samples"] = (
-            store.sample_hash(PROBE, "%032x" % 2, 100) is None
-            and store.sample_hash(PROBE, "%032x" % 3, 200) is not None
-            and store.sample_hash(PROBE, RUN, 20) is None)
-        out["runs_never_age_pruned_with_samples"] = (
-            store.status()["run_count"] >= 60)
-        # Budget prune: force the ceiling with a scaled hard budget, proving
-        # the OLDEST samples go first and runs survive.
-        # The REAL product prune loop with instance-scaled budgets: the
-        # frozen 16/24 MiB constants are asserted above; only the
-        # budget numbers differ here so the loop stays small-scale.
-        store3 = RemoteStore(os.path.join(root, "state-3"),
-                             clock=lambda: clock[0]).open()
-        store3.hard_budget = 100000
-        store3.soft_budget = 60000
-        store3.prune_batch = 8
-
-        store3.begin_run(PROBE, RUN, clock[0])
-        for seq in range(1, 41):
-            store3.record_accepted(PROBE, RUN, seq, clock[0] - 3600 + seq,
-                                   "h-%03d" % seq, b"x" * 4000, clock[0])
-        oldest_before = store3.status()["retained_since_epoch"]
-        status3 = store3.enforce_retention()
-        db_bytes = store3._db_bytes()
-        survivors = [row[0] for row in store3._conn.execute(
-            "SELECT seq FROM %s ORDER BY seq" % TABLE_SAMPLES).fetchall()]
-        out["hard_ceiling_prunes_oldest_samples_first"] = (
-            db_bytes <= 60000
-            and survivors == sorted(survivors)[-len(survivors):]
-            and max(survivors) == 40
-            and min(survivors) > 1
-            and status3["budget_pruned"] is True
-            and status3["budget_pruned_total"] >= 1)
-        out["runs_survive_sample_budget_prune"] = (
-            store3.run_state(PROBE, RUN) is not None
-            and store3.status()["run_count"] == 1)
-        out["budget_status_visible"] = (
-            set(status3) >= {"budget_pruned", "budget_pruned_total",
-                             "retained_since_epoch", "sample_count"})
-        store3.close()
-    finally:
-        store.close()
         clean(root)
     return out
 
@@ -881,8 +677,6 @@ def group_isolation():
     # A plane whose store could not open: remote degrades, core is alive.
     broken = os.path.join(root, "state-broken")
     os.makedirs(os.path.join(broken, "remote-probes"), exist_ok=True)
-    os.mkdir(os.path.join(broken, "remote-probes", "occupied")) \
-        if False else None
     # Point the store at a DIRECTORY: open must refuse, the plane degrades.
     import web.remote_store as rs
     store_path = os.path.join(broken, "remote-probes",
@@ -910,9 +704,9 @@ def group_isolation():
             and payload == {"error": ERR_REMOTE_STORE}
             and plane.status()["subcode"] == "remote_store_unavailable")
         # Core History is fully alive beside the dead remote plane.
-        opened = history.incident_activate({"category": "reality_tcp_path"})
+        opened = history.incident_activate(NOW)
         out["history_stays_alive_beside_dead_remote_plane"] = (
-            opened is not None or True) and history.health() is not None
+            opened is True and history.health()["enabled"] and not history.health()["degraded"])
         bundle = history.classifier_bundle(NOW - 300, NOW + 300, "fresh")
         out["classifier_bundle_has_no_remote_section"] = (
             bundle is not None and "remote" not in json.dumps(
@@ -1007,8 +801,8 @@ def group_deploy():
     history = _history_fixture(state)
     history.close()
     store = RemoteStore(state, clock=lambda: NOW).open()
-    store.begin_run(PROBE, RUN, NOW)
-    store.record_accepted(PROBE, RUN, 1, NOW + 1, "hash", b"body", NOW)
+    first = pl.encode_sample(_sample(1))
+    store.accept(PROBE, RUN, 1, NOW + 1, first, NOW)
     store.close()
     history_db = os.path.join(state, "diagnostics", "history.sqlite3")
     remote_db = os.path.join(state, "remote-probes",
@@ -1024,7 +818,7 @@ def group_deploy():
     # the History prestate is restored (the exact deploy-lib restore shape:
     # copy the prestate back over the History DB, nothing else).
     store = RemoteStore(state, clock=lambda: NOW).open()
-    store.record_accepted(PROBE, RUN, 2, NOW + 2, "hash2", b"body2", NOW)
+    store.accept(PROBE, RUN, 2, NOW + 2, pl.encode_sample(_sample(2)), NOW)
     store.close()
     with open(history_db, "wb") as handle:
         handle.write(b"candidate corrupted history")
@@ -1049,8 +843,15 @@ def group_deploy():
 
 # -- runner -------------------------------------------------------------------
 
+# Reuse these shared route/auth fixtures without loading this file twice.
+sys.modules.setdefault("server_groups", sys.modules[__name__])
+from store_groups import (group_store, group_retention, group_continuity,
+                          group_capacity, group_concurrency, group_status)
+
 GROUPS = {"route": group_route, "auth": group_auth, "epochs": group_epochs,
           "store": group_store, "retention": group_retention,
+          "continuity": group_continuity, "capacity": group_capacity,
+          "concurrency": group_concurrency, "status": group_status,
           "limits": group_limits, "isolation": group_isolation,
           "deploy": group_deploy}
 
