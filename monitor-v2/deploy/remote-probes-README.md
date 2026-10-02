@@ -108,3 +108,11 @@ or activated automatically. CI validates the real template with disposable
 certificates on all supported Ubuntu baselines and confirms nginx rejects
 the former invalid server-context zone placement. It starts no proxy service
 and performs no production deployment.
+
+The exact public ingest location rejects non-HTTP/1.1 client requests,
+Transfer-Encoding and missing original Content-Length before nginx request
+buffering can normalize framing. Monitor separately checks request_version.
+The Linux nginx lane exercises a real temporary TLS proxy and capture upstream:
+only HTTP/1.1 with explicit Content-Length reaches upstream, with byte-exact
+body and all five signature headers; HTTP/1.0, chunked and missing-CL requests
+return 400 without reaching upstream (six parser/runtime checks in total).

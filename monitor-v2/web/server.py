@@ -986,6 +986,8 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         Content-Length of 1..16 KiB (checked before anything is read or
         parsed) and exactly the ``application/json`` content type.
         """
+        if self.request_version != "HTTP/1.1":
+            return 400, ERR_BAD_FRAMING
         raw = self.headers.get("Content-Length")
         if raw is None:
             return 400, ERR_BAD_FRAMING

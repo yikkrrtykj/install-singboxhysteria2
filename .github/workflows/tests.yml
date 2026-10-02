@@ -529,7 +529,7 @@ jobs:
           sudo -n bash tests/test-monitor-v2-remote-server.sh
           sudo -n python3 tests/remote-server/linux_groups.py
 
-      - name: "PR-6B real nginx parser validation and invalid-context rejection"
+      - name: "PR-6B nginx parser and runtime wire-framing validation"
         run: sudo -n bash tests/test-monitor-v2-remote-proxy.sh
 
       - name: Compatibility matrix complete (all LIVE + systemd gates green)

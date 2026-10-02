@@ -328,6 +328,18 @@ def group_route():
             out["explicit_content_length_required"] = (
                 _first.startswith("HTTP/1.1 400")
                 and ERR_BAD_FRAMING in _first)
+            with _socket.create_connection(
+                    ("127.0.0.1", _server.server_address[1]), timeout=5) as sock:
+                sock.sendall(b"POST /api/v1/remote-probes/ingest HTTP/1.0\r\n"
+                             b"Host: localhost\r\nContent-Type: application/json\r\n"
+                             b"Content-Length: 2\r\n\r\n{}")
+                response = sock.makefile("rb")
+                status_line = response.readline()
+                while response.readline() not in (b"\r\n", b""):
+                    pass
+                payload = response.read(len(b'{"error": "invalid_framing"}'))
+                out["http_1_0_ingest_refused"] = (
+                    b" 400 " in status_line and ERR_BAD_FRAMING.encode() in payload)
             raw, headers = body_for(_sample(2))
             send = dict(headers)
             # Chunked refused (the global gate answers before the route).

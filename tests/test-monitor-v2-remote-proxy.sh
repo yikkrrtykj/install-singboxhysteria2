@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Real nginx parser gate. No service is installed, started or contacted.
+# Real nginx parser and ephemeral loopback TLS runtime gates.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TMP="$(mktemp -d)"
@@ -41,4 +41,5 @@ if nginx -t -p "$TMP/" -c "$TMP/invalid-nginx.conf" > "$TMP/invalid.log" 2>&1; t
 fi
 grep -q 'directive is not allowed here' "$TMP/invalid.log"
 echo 'PASS nginx/original_invalid_zone_context_rejected'
-echo 'nginx parser checks: 2 passed, 0 failed'
+python3 "$ROOT/tests/remote-server/proxy_runtime.py" "$TMP"
+echo 'nginx checks: 6 passed, 0 failed' 
