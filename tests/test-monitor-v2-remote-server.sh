@@ -103,8 +103,10 @@ else
     ok "no PR-6C incident remote-probes read route exists"
 fi
 ROUTE_FILES="$(grep -rl 'remote-probes' "$SERVER_DIR" "$WEBAPP" 2>/dev/null | grep -v '__pycache__' | xargs -n1 basename 2>/dev/null | sort | tr '\n' ' ')"
-assert_eq 'remote_registry.py remote_store.py server.py ' "$ROUTE_FILES" \
-    "server remote surface is exactly the frozen PR-6B web file set"
+# P6B2 adds exactly one passive generated-profile validator, not an ingest or
+# incident endpoint. Keep the exact set closed; PR-6C remains refused above.
+assert_eq 'p6_bundle.py remote_registry.py remote_store.py server.py ' "$ROUTE_FILES" \
+    "remote references are exactly P6B plus the passive P6B2 bundle validator"
 
 # Reverse-proxy template contract.
 PROXY_TXT="$(cat "$PROXY_CONF")"

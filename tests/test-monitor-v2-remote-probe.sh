@@ -225,8 +225,10 @@ if grep -rq 'incidents/<incident_id>/remote-probes' "$ROOT/monitor-v2/web" 2>/de
 else
     pass "no incident remote-probes read route exists (PR-6C stays out)"
 fi
-if [ "$ROUTE_HITS" = "remote_registry.py remote_store.py server.py " ]; then
-    pass "server remote surface is exactly the frozen PR-6B web file set"
+# The P6B2 passive bundle validator names the existing ingest URL without
+# creating a server ingest/read route. All other files remain disallowed.
+if [ "$ROUTE_HITS" = "p6_bundle.py remote_registry.py remote_store.py server.py " ]; then
+    pass "remote references are exactly P6B plus the passive P6B2 bundle validator"
 else
     fail "unexpected server remote surface: $ROUTE_HITS"
 fi

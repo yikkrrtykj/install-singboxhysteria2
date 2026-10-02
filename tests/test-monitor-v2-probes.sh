@@ -270,10 +270,13 @@ deploy/singbox-monitor.service.in " ]; then
 else
     fail "the opt-in is named by an unexpected set: var=[$TVAR] token=[$TTOK]"
 fi
-# (6) no reviewed public endpoint literal anywhere outside diagnostics/.
+# (6) no reviewed public endpoint literal outside diagnostics/, except the
+# fixed P6B2 passive bundle validator. It compares generated profile values;
+# portable bundle acceptance refuses any socket during actual ZIP assembly.
 LEAK="$(grep -rl --include='*.py' --include='*.sh' --include='*.js' \
     --include='*.html' --exclude-dir=__pycache__ --exclude-dir=diagnostics \
-    -E 'api\.ipify\.org|one\.one\.one\.one' "$ROOT/monitor-v2" || true)"
+    -E 'api\.ipify\.org|one\.one\.one\.one' "$ROOT/monitor-v2" \
+    | grep -vFx "$ROOT/monitor-v2/web/p6_bundle.py" || true)"
 if [ -z "$LEAK" ]; then
     pass "no production endpoint literal outside diagnostics/"
 else

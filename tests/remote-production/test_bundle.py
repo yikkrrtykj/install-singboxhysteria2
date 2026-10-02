@@ -99,7 +99,10 @@ class BundleTests(unittest.TestCase):
                 builder.build()
 
     def test_bundle_contains_exact_yaml_separate_secret_cert_and_generic(self):
-        with zipfile.ZipFile(io.BytesIO(self.bundle())) as archive:
+        with patch('socket.socket', side_effect=AssertionError('passive bundle opened socket')), \
+                patch('socket.create_connection', side_effect=AssertionError('passive bundle connected')):
+            raw = self.bundle()
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
             self.assertEqual(set(archive.namelist()), {'event-pc-mihomo.yaml', 'profile.json', 'ingest.key',
                 'server.pem', 'agent/p6-agent.pyz', 'agent/artifact.json', 'bundle.json', 'README.txt'})
             self.assertEqual(archive.read('event-pc-mihomo.yaml'), self.parts['yaml'].encode())
