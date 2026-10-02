@@ -338,6 +338,14 @@ class ProvisioningTests(unittest.TestCase):
         self.assertFalse(self.worker._registry()[0]['enabled'])
 
     def test_bad_pin_ip_san_expired_and_missing_binding_refused(self):
+        original_url = self.binding['ingest_url']
+        for url in ('https://192.0.2.10:' + '0' * 280 + '38443' + p6.INGEST_PATH,
+                    'https://192.0.2.10:\n38443' + p6.INGEST_PATH):
+            self.binding['ingest_url'] = url
+            self.write_binding()
+            self.fail_code('E_P6_BINDING', self.enroll)
+            self.assertFalse((self.state_dir / 'devices.json').exists())
+        self.binding['ingest_url'] = original_url
         for certificate in ('server', 'expired'):
             self.binding['certificate_sha256'] = self.certs.pin(certificate)
             self.write_binding(certificate)

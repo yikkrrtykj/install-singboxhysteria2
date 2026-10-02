@@ -270,6 +270,9 @@ class Provisioner:
             raise ProvisionError('E_P6_BINDING')
         require(HEX32, binding['server_id'])
         require(HEX64, binding['certificate_sha256'])
+        if type(binding['ingest_url']) is not str or len(binding['ingest_url']) > 256 or \
+                any(ord(char) <= 32 or ord(char) >= 127 for char in binding['ingest_url']):
+            raise ProvisionError('E_P6_BINDING')
         url = urlsplit(binding['ingest_url'])
         address = ipaddress.ip_address(url.hostname)
         if url.scheme != 'https' or url.username or url.password or \
