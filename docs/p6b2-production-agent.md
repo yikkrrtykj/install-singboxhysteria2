@@ -274,7 +274,7 @@ The key/YAML travel only through memory and pipes, never argv/env/audit/cache.
 
 Generic source is independently built into a deterministic `.pyz` containing
 the reviewed Agent modules and the unchanged Mihomo client/model. The installed
-public artifact is `/usr/local/lib/sbox-cm/p6-artifact/{p6-agent.pyz,artifact.json}`:
+public artifact is `/usr/local/share/sbox-p6-artifact/{p6-agent.pyz,artifact.json}`:
 real root-owned ancestors, root:root 0755 directory, no-follow/same-object
 root:root 0644 single-link files, maximum 4 MiB, version derived from SHA-256.
 Both helper and web revalidate the artifact. A mismatched two-file upgrade
@@ -396,3 +396,30 @@ Remaining whole-P6B2 requirements: production signing certificate/release,
 friendly final bundle/setup distribution integration, actual Windows 10/11 +
 Clash/TUN + VPS install/offline replay/reboot/routing/resource acceptance. Draft
 installer implementation/CI cannot claim any of these as PASS.
+
+## Test-host Bundle repair and Chinese display
+
+Actual test-VPS download failed because the generic artifact was installed below
+`/usr/local/lib/sbox-cm` mode 0700; a root-only fixture could read it while the
+Monitor user could not. Generic code now lives at the fixed public read-only
+`/usr/local/share/sbox-p6-artifact`, root:root 0755, with the same root:root 0644
+single-link, no-follow and digest-verified files. Protected ancestors must also
+be world-traversable. The privileged helper and all credentials remain in their
+existing protected locations. Updating both helper and Monitor is required;
+mixed old/new readers fail closed. This repair does not rotate enrollments,
+server identity, trust, secrets or pending evidence. Uninstall removes only the
+two known generic files and preserves any foreign file and runtime state.
+
+The shipped Web now displays Chinese navigation, controls, warnings, status and
+existing incident explanations. English server display sentences are translated
+only at rendering; closed API enums, identity/protocol names, raw evidence tokens,
+request bodies and backend judgments remain unchanged. Unknown future display
+copy stays verbatim. This is localization of existing P5 UI, not P6C presentation.
+The signed Windows release remains unavailable; the page says so explicitly.
+
+Repair verification adds actual unprivileged reads after the actual installer
+under a private umask with a 0700 helper, generic uninstall/state preservation,
+and root-validator refusal of a private ancestor. Native Bundle tests are now
+23; shipped UI checks are 108. Prior independent PASS applies to its reviewed
+head only; this repair awaits independent review and actual test-VPS readback.
+PR #70 stays Draft; no merge, production deployment or P6C/P6D.

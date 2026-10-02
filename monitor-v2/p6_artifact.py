@@ -9,7 +9,9 @@ import os
 import re
 import stat
 
-ARTIFACT_DIR = '/usr/local/lib/sbox-cm/p6-artifact'
+# Generic code is public/read-only. The root-only helper tree is intentionally
+# not traversable by sboxweb and must never become an artifact parent.
+ARTIFACT_DIR = '/usr/local/share/sbox-p6-artifact'
 MAX_ARTIFACT_BYTES = 4 * 1024 * 1024
 MANIFEST_KEYS = {'v', 'version', 'sha256', 'size'}
 
@@ -58,7 +60,8 @@ def read_artifact(directory=ARTIFACT_DIR):
         path = os.path.abspath(directory)
         while True:
             st = os.lstat(path)
-            if not stat.S_ISDIR(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022:
+            if not stat.S_ISDIR(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022 \
+                    or not st.st_mode & 0o001:
                 raise ArtifactError()
             if path == os.path.abspath(directory) and (st.st_gid, stat.S_IMODE(st.st_mode)) != (0, 0o755):
                 raise ArtifactError()

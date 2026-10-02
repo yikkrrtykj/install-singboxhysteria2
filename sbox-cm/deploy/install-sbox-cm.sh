@@ -44,6 +44,23 @@ die()  { warn "$*"; exit 1; }
 
 need_file() { [ -f "$1" ] || die "缺少文件: $1"; }
 
+check_public_parent() {
+    [ -z "${SBXCM_PREFIX:-}" ] || return 0
+    # Root access alone cannot prove that the Monitor user can read the build.
+    python3 -I - "$1" <<'PY'
+import os, stat, sys
+path = os.path.abspath(sys.argv[1])
+while True:
+    st = os.lstat(path)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022 or not st.st_mode & 0o001:
+        raise SystemExit(1)
+    parent = os.path.dirname(path)
+    if parent == path:
+        break
+    path = parent
+PY
+}
+
 # ------------------------------------------------------------------ install --
 render_unit() { # <template> <destination>
     local tmpl="$1" dest="$2" tmp
@@ -104,7 +121,17 @@ cmd_install() {
     # Public generic code only. No device/YAML/key is ever written here.
     # During a two-file upgrade a mismatched digest refuses export; no stale
     # credential ZIP is cached. All new builder failures are explicit.
-    local artifact_dir="$dest_libexec/p6-artifact" artifact_stage
+    # Public generic code must not live below the 0700 privileged helper.
+    # Preserve helper/ledger permissions; publish one shared read-only artifact.
+    local artifact_parent artifact_dir artifact_stage
+    artifact_parent="$(tgt /usr/local/share)"
+    artifact_dir="$artifact_parent/sbox-p6-artifact"
+    if [ -e "$artifact_parent" ] || [ -L "$artifact_parent" ]; then
+        [ -d "$artifact_parent" ] && [ ! -L "$artifact_parent" ] || die "P6 public parent 不安全"
+    else
+        mkdir -m 0755 "$artifact_parent" || die "无法创建 P6 public parent"
+    fi
+    check_public_parent "$artifact_parent" || die "P6 public parent ownership/mode 不安全"
     if [ -e "$artifact_dir" ] || [ -L "$artifact_dir" ]; then
         [ -d "$artifact_dir" ] && [ ! -L "$artifact_dir" ] || die "P6 artifact 目录不安全"
         if [ -z "${SBXCM_PREFIX:-}" ]; then
@@ -113,7 +140,7 @@ cmd_install() {
     else
         mkdir -m 0755 "$artifact_dir" || die "无法创建 P6 artifact 目录"
     fi
-    artifact_stage="$(mktemp -d "$dest_libexec/.p6-artifact.XXXXXX")" || die "无法暂存 P6 artifact"
+    artifact_stage="$(mktemp -d "$artifact_parent/.p6-artifact.XXXXXX")" || die "无法暂存 P6 artifact"
     if ! python3 -I "$SRC_DIR/../tools/build-p6-artifact.py" "$artifact_stage"; then
         rm -r -- "$artifact_stage"
         die "P6 artifact 生成失败"
@@ -193,6 +220,26 @@ cmd_uninstall() {
         shift
     done
 
+    # Remove only these two public, generic files. Never remove share itself
+    # or follow a substituted directory/file; credentials are elsewhere.
+    local artifact_dir artifact_name
+    artifact_dir="$(tgt /usr/local/share)/sbox-p6-artifact"
+    if [ -e "$artifact_dir" ] || [ -L "$artifact_dir" ]; then
+        check_public_parent "$(dirname -- "$artifact_dir")" || die "P6 public parent ownership/mode 不安全"
+        [ -d "$artifact_dir" ] && [ ! -L "$artifact_dir" ] || die "P6 artifact 目录不安全，拒绝卸载"
+        if [ -z "${SBXCM_PREFIX:-}" ]; then
+            [ "$(stat -c '%u %g %a' "$artifact_dir")" = "0 0 755" ] || die "P6 artifact 目录权限不安全"
+        fi
+        for artifact_name in p6-agent.pyz artifact.json; do
+            if [ -e "$artifact_dir/$artifact_name" ] || [ -L "$artifact_dir/$artifact_name" ]; then
+                [ -f "$artifact_dir/$artifact_name" ] && [ ! -L "$artifact_dir/$artifact_name" ] || die "P6 artifact 文件不安全"
+                if [ -z "${SBXCM_PREFIX:-}" ]; then
+                    [ "$(stat -c '%u %g %a %h' "$artifact_dir/$artifact_name")" = "0 0 644 1" ] || die "P6 artifact 文件权限不安全"
+                fi
+            fi
+        done
+    fi
+
     cmd_disable || warn "disable 未完全成功，继续卸载"
 
     local dest_libexec dest_units
@@ -205,6 +252,10 @@ cmd_uninstall() {
 
     rm -f -- "$dest_units/$SOCKET_UNIT" "$dest_units/$SERVICE_UNIT" 2>/dev/null || true
     rm -rf -- "$dest_libexec" 2>/dev/null || die "删除 $dest_libexec 失败"
+    if [ -d "$artifact_dir" ]; then
+        rm -f -- "$artifact_dir/p6-agent.pyz" "$artifact_dir/artifact.json" || die "删除 P6 generic artifact 失败"
+        rmdir -- "$artifact_dir" 2>/dev/null || warn "保留包含其他文件的 P6 artifact 目录"
+    fi
     "$SYSTEMCTL" daemon-reload >/dev/null 2>&1 || warn "daemon-reload 失败"
 
     if [ "$purge_state" = "1" ]; then

@@ -14,10 +14,144 @@
 
   var PROTOCOL_LABELS = { "vless-in": "Reality", "hy2-in": "Hysteria2",
                           reality: "Reality", hy2: "Hysteria2", hysteria2: "Hysteria2" };
-  function clientLabel(name) { return name === "legacy" ? "Default" : name; }
-  function protocolLabel(tag) { return PROTOCOL_LABELS[tag] || "Other"; }
-  var CLIENT_UNAVAILABLE = "Client management is temporarily unavailable. Check the server before making changes.";
-  var RESULT_UNCONFIRMED = "The result is not confirmed yet. Refresh the client list before retrying. Do not start another change until the current state is confirmed.";
+  function clientLabel(name) { return name === "legacy" ? "默认客户端" : name; }
+  function protocolLabel(tag) { return PROTOCOL_LABELS[tag] || "其他"; }
+  function stateLabel(value) {
+    var labels = {HEALTHY: "正常", CONNECTED: "已连接", ACTIVE: "活动",
+      "RECENT ACTIVITY": "近期有活动", IDLE: "空闲", CLOSED: "已关闭",
+      NONE: "无", open: "进行中", closed: "已结束", ok: "正常",
+      degraded: "已降级", unavailable: "不可用", stale: "已过期", unknown: "未知", dark: "未启用", warmup: "预热中", rearm: "等待重新启动", running: "运行中"};
+    return labels[value] || value;
+  }
+  function errorText(error) {
+    if (error.status === 429) return "请求过于频繁，请稍后重试。";
+    if (error.status === 401) return "认证未通过，请检查密码或重新登录。";
+    if (error.status === 403) return "当前请求未获授权，请检查访问权限。";
+    return "操作失败，请刷新状态后手动重试。";
+  }
+  // Translate only server-supplied display copy. Never decode, replace or
+  // classify raw evidence tokens; unknown future copy remains verbatim.
+  var INCIDENT_COPY = {
+    "TT Live Studio login failed": "TT Live Studio 登录失败",
+    "Operator-observed event": "人工观察到的事件",
+    "Analysed buckets in this window showed no anomaly signal.": "此窗口内已分析的时间段没有出现异常信号。",
+    "The total active-connection count fell far below its own baseline.": "总活动连接数远低于自身基线。",
+    "Reality active connections fell far below their baseline.": "Reality 活动连接数远低于其基线。",
+    "Hysteria2 active connections fell far below their baseline.": "Hysteria2 活动连接数远低于其基线。",
+    "Other inbounds' active connections fell far below their baseline.": "其他入站的活动连接数远低于其基线。",
+    "Every observed device/inbound pair went quiet in the same buckets.": "所有已观察到的设备与入站组合在相同时间段内均无活动。",
+    "Reality-classed sing-box error records spiked above their baseline.": "Reality 类 sing-box 错误记录大幅超过其基线。",
+    "Hysteria2-classed sing-box error records spiked above their baseline.": "Hysteria2 类 sing-box 错误记录大幅超过其基线。",
+    "Generic (non-protocol) sing-box error records spiked above baseline.": "通用（非协议）sing-box 错误记录大幅超过基线。",
+    "Destination-classed sing-box error records spiked above their baseline.": "目标地址类 sing-box 错误记录大幅超过其基线。",
+    "sing-box error records spiked, but their closed classes cannot be attributed to one protocol family.": "sing-box 错误记录激增，但这些封闭类别无法归属于单一协议族。",
+    "The server-side DNS probe failed.": "服务器端 DNS 探测失败。",
+    "The server-side HTTPS probe failed.": "服务器端 HTTPS 探测失败。",
+    "The server-side UDP probe failed.": "服务器端 UDP 探测失败。",
+    "The server-side public-egress probe failed.": "服务器端公网出口探测失败。",
+    "A probe could not adjudicate its own answer, so that plane proves nothing about the network.": "探测未能判定自身结果，因此该探测层不能证明网络状态。",
+    "A generic TCP/HTTPS probe succeeded against its configured endpoint in these buckets; one successful probe does not prove general Internet reachability.": "通用 TCP/HTTPS 探测在这些时间段内成功访问了配置的端点；一次探测成功不能证明互联网整体可达。",
+    "The server's public egress IP changed.": "服务器公网出口 IP 发生变化。",
+    "The sing-box service API was reported stale by the collector.": "采集器报告 sing-box 服务 API 数据已过期。",
+    "The collector marked its own snapshot stale.": "采集器将自身快照标为已过期。",
+    "Some buckets in this window hold too few samples to judge.": "此窗口内部分时间段的样本不足，无法判断。",
+    "The evidence store reported its own degradation during this window.": "证据存储在此窗口内报告自身处于降级状态。",
+    "The journal ingest recorded a sequence gap.": "日志接收记录了序列缺口。",
+    "A journal batch was terminally rejected by the ingest contract.": "一批日志被接收契约最终拒绝。",
+    "sing-box error records of the DNS class were present.": "存在 DNS 类 sing-box 错误记录。",
+    "sing-box dial-timeout error records were present.": "存在 sing-box 拨号超时错误记录。",
+    "sing-box connection-reset error records were present.": "存在 sing-box 连接重置错误记录。",
+    "sing-box network-unreachable error records were present.": "存在 sing-box 网络不可达错误记录。",
+    "sing-box TLS-handshake error records were present.": "存在 sing-box TLS 握手错误记录。",
+    "sing-box QUIC-class error records were present.": "存在 sing-box QUIC 类错误记录。",
+    "sing-box EOF/cancellation error records were present.": "存在 sing-box EOF / 取消错误记录。",
+    "sing-box error records outside the named classes were present.": "存在命名类别以外的 sing-box 错误记录。",
+    "The journal ingest audit recorded a missing sequence interval.": "日志接收审计记录了缺失的序列区间。",
+    "The journal ingest rejected a reader file (invalid JSON).": "日志接收拒绝了读取器文件（JSON 无效）。",
+    "The journal ingest rejected a reader file (invalid file name).": "日志接收拒绝了读取器文件（文件名无效）。",
+    "The journal ingest rejected a reader file (invalid shape).": "日志接收拒绝了读取器文件（结构无效）。",
+    "The journal ingest rejected an empty reader file.": "日志接收拒绝了空的读取器文件。",
+    "The journal ingest rejected a reader file (an event failed validation).": "日志接收拒绝了读取器文件（事件验证失败）。",
+    "The journal ingest rejected a reader file (invalid header).": "日志接收拒绝了读取器文件（头部无效）。",
+    "The journal ingest rejected a reader file (misplaced header).": "日志接收拒绝了读取器文件（头部位置错误）。",
+    "The journal ingest rejected a reader file (no header).": "日志接收拒绝了读取器文件（缺少头部）。",
+    "The journal ingest refused a non-regular reader file.": "日志接收拒绝了非常规读取器文件。",
+    "The journal ingest rejected a reader file (sequence mismatch).": "日志接收拒绝了读取器文件（序列不匹配）。",
+    "The journal ingest rejected an oversized reader file.": "日志接收拒绝了过大的读取器文件。",
+    "The journal ingest could not read a reader file.": "日志接收无法读取读取器文件。",
+    "No independent evidence family corroborated the anomaly.": "没有独立的证据类别印证此异常。",
+    "The only signal was a connection-count drop, which alone cannot name a fault domain.": "唯一信号是连接数下降，仅凭这一点无法确定故障域。",
+    "The evidence points in more than one direction; no single attribution is supported.": "证据指向多个方向，不支持单一归因。",
+    "There is not enough baseline evidence to judge the anomaly against.": "基线证据不足，无法据此判断异常。",
+    "The evidence cannot prove transport-level causes were absent.": "证据不能证明传输层原因不存在。",
+    "Negative checks were not proven in the same buckets as the anomaly.": "未能证明排除性检查与异常发生在相同时间段。",
+    "No probe evidence covers this window.": "没有覆盖此窗口的探测证据。",
+    "Probe evidence exists but cannot adjudicate this window.": "存在探测证据，但无法判定此窗口。",
+    "The probes share external endpoints, so one endpoint outage can look like a VPS outbound failure.": "探测共用外部端点，因此单一端点故障可能表现为 VPS 出站故障。",
+    "The window holds more than one separated anomaly episode; no single verdict can describe both.": "此窗口包含多个相互分离的异常阶段，单一结论无法描述所有阶段。",
+    "No journal evidence covers this window.": "没有覆盖此窗口的日志证据。",
+    "Journal evidence covers this window only partially.": "日志证据仅部分覆盖此窗口。",
+    "No evidence can single out one specific destination.": "没有证据可以指明某个具体目标地址。",
+    "Errors span several destination classes, so no single destination fits.": "错误跨越多个目标地址类别，无法归属于单一目标地址。",
+    "Process and network evidence disagree; neither attribution is supported.": "进程与网络证据相互冲突，两种归因均不受支持。",
+    "Device rows in this window are ordinary change records, not failure proof.": "此窗口内的设备记录是普通变更记录，不能证明故障。",
+    "Evidence is present that no closed rule can attribute.": "存在无法由任何封闭规则归因的证据。",
+    "The evidence bundle was malformed and was refused.": "证据包结构无效，已被拒绝。",
+    "Evidence outside the analysed window was refused.": "分析窗口以外的证据已被拒绝。",
+    "The evidence says where it hurt, not why; the root cause is not established.": "证据表明问题发生在哪个范围，但无法解释原因；根因尚未确定。",
+    "The samples section of the evidence was refused.": "样本证据部分已被拒绝。",
+    "The device-states section of the evidence was refused.": "设备状态证据部分已被拒绝。",
+    "The probe-rows section of the evidence was refused.": "探测记录证据部分已被拒绝。",
+    "The journal-events section of the evidence was refused.": "日志事件证据部分已被拒绝。",
+    "The ingest-audit section of the evidence was refused.": "接收审计证据部分已被拒绝。",
+    "The evidence window itself was unusable.": "证据窗口本身不可用。",
+    "The evidence health section was refused.": "证据健康状态部分已被拒绝。",
+    "The evidence reader-freshness section was refused.": "证据读取器新鲜度部分已被拒绝。",
+    "Reality/TCP path incident": "Reality/TCP 链路事件",
+    "Reality traffic degraded during the signal window.": "信号窗口内 Reality 流量出现降级。",
+    "Assessed fault domain: the Reality/TCP path. This evidence does not prove Hysteria2 was healthy.": "评估故障域：Reality/TCP 链路。此证据不能证明 Hysteria2 当时正常。",
+    "No evidence in this window attributes the fault to the sing-box process or its control API.": "此窗口内没有证据将故障归因于 sing-box 进程或其控制 API。",
+    "Server-side evidence cannot tell which clients or networks were affected.": "服务器端证据无法确定哪些客户端或网络受到影响。",
+    "The evidence-based fault domain is the Reality/TCP path.": "证据支持的故障域为 Reality/TCP 链路。",
+    "If Hysteria2 is independently confirmed healthy, prefer it while the Reality/TCP path is investigated.": "如果已经独立确认 Hysteria2 正常，可在调查 Reality/TCP 链路期间优先使用它。",
+    "Hysteria2/UDP path incident": "Hysteria2/UDP 链路事件",
+    "Hysteria2 traffic degraded during the signal window.": "信号窗口内 Hysteria2 流量出现降级。",
+    "Assessed fault domain: the Hysteria2/UDP path. This evidence does not prove Reality was healthy.": "评估故障域：Hysteria2/UDP 链路。此证据不能证明 Reality 当时正常。",
+    "The evidence-based fault domain is the Hysteria2/UDP path.": "证据支持的故障域为 Hysteria2/UDP 链路。",
+    "If Reality is independently confirmed healthy, prefer it while the Hysteria2/UDP path is investigated.": "如果已经独立确认 Reality 正常，可在调查 Hysteria2/UDP 链路期间优先使用它。",
+    "VPS outbound connectivity incident": "VPS 出站连接事件",
+    "The server lost reachability to parts of the internet during the signal window.": "信号窗口内服务器无法访问部分互联网目标。",
+    "Assessed fault domain: VPS outbound connectivity (DNS/HTTPS/UDP/egress), upstream of both proxy protocols.": "评估故障域：VPS 出站连接（DNS/HTTPS/UDP/出口），位于两种代理协议的上游。",
+    "The evidence-based fault domain is VPS outbound connectivity.": "证据支持的故障域为 VPS 出站连接。",
+    "Inspect the outbound DNS/HTTPS/UDP probe rows below and the public-egress context; if the egress IP changed, check the provider network state before changing sing-box.": "检查下方出站 DNS/HTTPS/UDP 探测记录与公网出口上下文；若出口 IP 发生变化，请先检查服务商网络状态，再考虑修改 sing-box。",
+    "sing-box process / control API incident": "sing-box 进程 / 控制 API 事件",
+    "The sing-box process or its service API showed failure evidence during the signal window.": "信号窗口内 sing-box 进程或其服务 API 出现故障证据。",
+    "Assessed fault domain: the control plane and process health, not one proxy path.": "评估故障域：控制平面与进程健康状态，并非某一条代理链路。",
+    "This window was attributed to the sing-box process / service API domain.": "此窗口归属于 sing-box 进程 / 服务 API 故障域。",
+    "The evidence-based fault domain is the sing-box process / service API.": "证据支持的故障域为 sing-box 进程 / 服务 API。",
+    "Inspect the process and control-API evidence below (API status, connection counts, error classes). Do not assume a restart without restart evidence.": "检查下方进程与控制 API 证据（API 状态、连接数、错误类别）；没有重启证据时，不要假定发生了重启。",
+    "Common inbound / client-office path incident": "公共入站 / 客户端现场链路事件",
+    "The shared inbound path observed for the clients showed failure evidence during the signal window.": "信号窗口内，观察到客户端共用的入站链路出现故障证据。",
+    "Assessed fault domain: the common inbound / client-office domain shared by the affected paths.": "评估故障域：受影响链路共用的公共入站 / 客户端现场范围。",
+    "The evidence-based fault domain is the common inbound / client-office path.": "证据支持的故障域为公共入站 / 客户端现场链路。",
+    "Inspect the shared-domain evidence below. The current evidence cannot distinguish which component of that domain caused this window.": "检查下方公共范围证据；当前证据无法区分该范围内具体哪个组件导致了此窗口的异常。",
+    "Unclassified incident window (insufficient evidence)": "未分类事件窗口（证据不足）",
+    "An anomaly window was recorded, but the retained evidence cannot say what it affected.": "已记录异常窗口，但保留的证据无法确定影响范围。",
+    "No protocol or path attribution is supported by this evidence.": "此证据不支持任何协议或链路归因。",
+    "No server-side fault can be claimed or excluded from this evidence.": "此证据无法确认或排除服务器端故障。",
+    "The evidence supports no fault domain: insufficient evidence.": "证据不支持任何故障域：证据不足。",
+    "Correlation is not causation: the root cause is not established. Server-side sparse device state cannot authoritatively determine which logical clients were affected, and it cannot infer ISP ownership or path identity; nor does it name a specific destination. No process-restart or resource-exhaustion history is recorded that could support such a claim.": "相关性不等于因果关系：根因尚未确定。服务器端有限的设备状态记录无法权威判断哪些逻辑客户端受到影响，也不能推断 ISP 归属、链路身份或某个具体目标地址。没有记录可以支持进程重启或资源耗尽判断的历史数据。",
+    "Correlation is not causation: the root cause is not established.": "相关性不等于因果关系：根因尚未确定。",
+    "No open questions were recorded for this verdict.": "此结论没有记录待解问题。"
+};
+  function incidentCopy(value) {
+    if (Object.prototype.hasOwnProperty.call(INCIDENT_COPY, value)) return INCIDENT_COPY[value];
+    var question = /^The evidence records ([1-9][0-9]*) open questions?; see the reasons below\.$/.exec(value);
+    if (question) return "证据记录了 " + question[1] + " 个待解问题，请查看下方原因。";
+    return value;
+  }
+  var CLIENT_UNAVAILABLE = "客户端管理暂不可用，请先检查服务器状态。";
+  var RESULT_UNCONFIRMED = "结果尚未确认，请先刷新客户端列表。在确认当前状态前，请勿发起另一项修改。";
 
   /* ---------- incidents (0.6.0, #33 PR-5) ---------- */
 
@@ -25,22 +159,22 @@
   // presentation enum; the 45/28 token vocabularies are NOT mirrored
   // here -- the server decodes those, and this file holds no token copy).
   var CATEGORY_LABELS = {
-    "reality_tcp_path": "Reality/TCP path",
-    "hysteria2_udp_path": "Hysteria2/UDP path",
-    "vps_outbound": "VPS outbound",
-    "vps_process_or_api": "sing-box process / API",
-    "common_inbound_client_office": "Common inbound / client-office",
-    "insufficient_evidence": "Insufficient evidence"
+    "reality_tcp_path": "Reality/TCP 链路",
+    "hysteria2_udp_path": "Hysteria2/UDP 链路",
+    "vps_outbound": "VPS 出站",
+    "vps_process_or_api": "sing-box 进程 / API",
+    "common_inbound_client_office": "公共入站 / 客户端现场",
+    "insufficient_evidence": "证据不足"
   };
-  var INC_EMPTY_EVIDENCE = "No retained evidence is available for this window.";
-  var INC_EVIDENCE_UNAVAILABLE = "Evidence is currently unavailable. No conclusion can be drawn from this view.";
-  var INC_RETENTION_NOTE = "Some evidence may have aged out of the retention window.";
-  var INC_REARM_ACCEPTED = "Re-arm accepted. Waiting for the incident scanner to enter warm-up.";
-  var INC_EMPTY_LIST = "No incidents recorded.";
-  var INC_EMPTY_DEGRADED = "Incident history is currently degraded; an empty result cannot be treated as proof that no incidents were recorded.";
-  var INC_DEVICE_DISCLAIMER = "Device rows are sparse contextual state only; they do not prove which logical clients were affected.";
-  var INC_TRUNCATED_NOTE = "Showing the first 2000 chronological rows; later rows in this section are not shown.";
-  var INC_AGGREGATE_PARTIAL = "Truncated section: the aggregates below cover only the rows shown here, not the full window.";
+  var INC_EMPTY_EVIDENCE = "此窗口内没有保留的证据。";
+  var INC_EVIDENCE_UNAVAILABLE = "证据暂不可用，无法据此得出结论。";
+  var INC_RETENTION_NOTE = "部分证据可能已超出保留时间。";
+  var INC_REARM_ACCEPTED = "已接受重新启动请求，等待事件扫描器进入预热。";
+  var INC_EMPTY_LIST = "暂无事件记录。";
+  var INC_EMPTY_DEGRADED = "事件历史当前处于降级状态，空结果不能证明没有记录过事件。";
+  var INC_DEVICE_DISCLAIMER = "设备记录仅提供有限上下文，不能证明具体哪些逻辑客户端受到影响。";
+  var INC_TRUNCATED_NOTE = "仅显示按时间排序的前 2000 条记录，其余记录未展示。";
+  var INC_AGGREGATE_PARTIAL = "本节已截断，下方汇总只覆盖已展示记录，而非完整时间窗口。";
 
   var state = {
     snapshot: null,
@@ -120,7 +254,7 @@
   }
 
   function copyText(text, label) {
-    function done() { toast(label || "Copied"); }
+    function done() { toast(label || "已复制"); }
     if (navigator.clipboard && navigator.clipboard.writeText) {
       navigator.clipboard.writeText(text).then(done, function () { legacyCopy(text); done(); });
     } else {
@@ -227,7 +361,7 @@
       function onSubmit(event) {
         event.preventDefault();
         var password = input.value;
-        if (!password) { fail("Password required."); return; }
+        if (!password) { fail("请输入密码。"); return; }
         api("/api/v1/step-up", { method: "POST", body: { password: password } })
           .then(function () {
             close();
@@ -236,11 +370,11 @@
           })
           .catch(function (error) {
             if (error.status === 429) {
-              fail("Too many failed attempts — try again later.");
+              fail("失败次数过多，请稍后重试。");
             } else if (error.status === 401) {
-              fail("Incorrect password.");
+              fail("密码错误。");
             } else {
-              fail(error.message);
+              fail(errorText(error));
             }
           });
       }
@@ -272,9 +406,9 @@
 
   /* ---------- views ---------- */
 
-  var VIEW_TITLES = { overview: "Overview", devices: "Devices",
-                      connections: "Connections", incidents: "Incidents",
-                      settings: "Settings" };
+  var VIEW_TITLES = { overview: "概览", devices: "设备",
+                      connections: "连接", incidents: "事件",
+                      settings: "设置" };
 
   function setView(name) {
     state.view = name;
@@ -300,7 +434,7 @@
   /* ---------- rendering ---------- */
 
   function setChip(el, label, status, stateName) {
-    el.textContent = label + " · " + status;
+    el.textContent = label + " · " + stateLabel(status);
     el.setAttribute("data-state", stateName);
   }
 
@@ -312,7 +446,7 @@
       state.lastVersion = snap.snapshot_version;
     }
 
-    setChip($("chip-monitor"), "Monitor",
+    setChip($("chip-monitor"), "监控",
             snap.web_status || "—",
             snap.web_status === "HEALTHY" ? "ok" : "bad");
     setChip($("chip-api"), "sing-box API",
@@ -324,11 +458,11 @@
     //   frozen -- the web backend itself stopped publishing new snapshots.
     var banner = $("stale-text");
     if (snap.stale) {
-      banner.textContent = "Data stale — Last successful API event: " +
+      banner.textContent = "数据已过期，最近一次 API 事件：" +
         fmtTime(snap.last_success_at);
       show($("stale-banner"));
     } else if (snap.web_status !== "HEALTHY") {
-      banner.textContent = "Monitor data frozen — last publish: " +
+      banner.textContent = "监控数据停止更新，最近发布：" +
         fmtTime(snap.last_publish_at);
       show($("stale-banner"));
     } else {
@@ -367,7 +501,7 @@
     if (!devices.length) {
       var empty = document.createElement("div");
       empty.className = "empty";
-      empty.textContent = "No devices observed yet.";
+      empty.textContent = "尚未观察到设备。";
       grid.appendChild(empty);
       return;
     }
@@ -377,7 +511,7 @@
       var card = cardTemplate.content.cloneNode(true);
       card.querySelector(".device-name").textContent = clientLabel(device.name);
       var badge = card.querySelector(".device-status");
-      badge.textContent = device.status;
+      badge.textContent = stateLabel(device.status);
       badge.className = "badge device-status " +
         (device.status === "ACTIVE" ? "active"
          : device.status === "RECENT ACTIVITY" ? "recent" : "idle");
@@ -386,7 +520,7 @@
       if (!tags.length) {
         var none = document.createElement("div");
         none.className = "empty";
-        none.textContent = "No traffic observed yet.";
+        none.textContent = "尚未观察到流量。";
         container.appendChild(none);
       }
       tags.forEach(function (tag) {
@@ -414,7 +548,7 @@
       return row.state === state.filter;
     });
     $("conn-count").textContent =
-      filtered.length + " of " + rows.length + " shown";
+      filtered.length + " / " + rows.length + " 条已显示";
     filtered.forEach(function (row) {
       var tr = document.createElement("tr");
 
@@ -428,9 +562,9 @@
       idButton.type = "button";
       idButton.className = "conn-id";
       idButton.textContent = shortId(row.id);
-      idButton.title = "Copy full ID";
+      idButton.title = "复制完整 ID";
       idButton.addEventListener("click", function () {
-        copyText(row.id, "Connection ID copied");
+        copyText(row.id, "连接 ID 已复制");
       });
       idCell.appendChild(idButton);
       tr.appendChild(idCell);
@@ -453,7 +587,7 @@
       var badge = document.createElement("span");
       badge.className = "badge " +
         (row.state === "ACTIVE" ? "active" : "recent");
-      badge.textContent = row.state;
+      badge.textContent = stateLabel(row.state);
       stateCell.appendChild(badge);
       tr.appendChild(stateCell);
 
@@ -499,22 +633,22 @@
     var data = state.incidents;
     var runtime = data ? data.runtime : null;
     if (!runtime || !runtime.enabled) {
-      setChip(chip, "Scanner", "dark", "unknown");
+      setChip(chip, "扫描器", "dark", "unknown");
     } else {
-      setChip(chip, "Scanner", runtime.phase,
+      setChip(chip, "扫描器", runtime.phase,
               runtime.phase === "degraded" ? "bad" : "ok");
     }
     // B5: the list response carries CURRENT diagnostics health -- it is
     // displayed as such, never as incident-time health, and it governs
-    // whether an empty list may be called "No incidents recorded."
+    // whether an empty list may be called "暂无事件记录。"
     var history = data ? data.history : null;
     var historyChip = $("inc-history");
     if (!history || history.enabled !== true) {
-      setChip(historyChip, "History", "unavailable", "bad");
+      setChip(historyChip, "历史", "unavailable", "bad");
     } else if (history.degraded === true) {
-      setChip(historyChip, "History", "degraded", "bad");
+      setChip(historyChip, "历史", "degraded", "bad");
     } else {
-      setChip(historyChip, "History", "ok", "ok");
+      setChip(historyChip, "历史", "ok", "ok");
     }
     // Server-side precondition mirror (#63 R2 section 10): the re-arm
     // entrance only exists while the scanner reports the rearm phase.
@@ -530,13 +664,13 @@
       renderIncRuntime();
       renderIncidents(data);
     }).catch(function (error) {
-      if (error.status === 401) { showLogin("Session expired — please log in again."); return; }
+      if (error.status === 401) { showLogin("登录已过期，请重新登录。"); return; }
       var body = $("inc-tbody");
       body.textContent = "";
       var row = body.insertRow(-1);
       var cell = row.insertCell(-1);
       cell.colSpan = 7;
-      cell.textContent = "Incident list unavailable.";
+      cell.textContent = "事件列表暂不可用。";
     });
   }
 
@@ -549,7 +683,7 @@
       var stateCell = document.createElement("td");
       var badge = document.createElement("span");
       badge.className = "badge " + (incident.state === "open" ? "active" : "idle");
-      badge.textContent = incident.state;
+      badge.textContent = stateLabel(incident.state);
       stateCell.appendChild(badge);
       tr.appendChild(stateCell);
       tr.appendChild(cellText(CATEGORY_LABELS[incident.category] || incident.category));
@@ -581,11 +715,11 @@
       state.incSubject = {type: "incident", id: id};
       renderIncidentDetail(detail);
       show($("inc-evidence-card"));
-      $("inc-evidence-title").textContent = "Evidence for incident #" + id;
+      $("inc-evidence-title").textContent = "事件证据 #" + id;
       hide($("inc-evidence-subject"));
       loadEvidence(state.incSection);
     }).catch(function (error) {
-      if (error.status === 401) showLogin("Session expired — please log in again.");
+      if (error.status === 401) showLogin("登录已过期，请重新登录。");
     });
   }
 
@@ -597,7 +731,7 @@
     k.textContent = key;
     var v = document.createElement("span");
     v.className = "v";
-    v.textContent = value;
+    v.textContent = incidentCopy(value);
     div.appendChild(k);
     div.appendChild(v);
     return div;
@@ -607,13 +741,13 @@
     container.textContent = "";
     (pairs || []).forEach(function (pair) {
       var li = document.createElement("li");
-      li.textContent = pair.text;   // textContent only: never the raw token as primary
+      li.textContent = incidentCopy(pair.text);   // textContent only: never the raw token as primary
       container.appendChild(li);
     });
     if (!container.children.length) {
       var li = document.createElement("li");
       li.className = "muted";
-      li.textContent = "None recorded.";
+      li.textContent = "暂无记录。";
       container.appendChild(li);
     }
   }
@@ -632,9 +766,9 @@
       var copy = document.createElement("button");
       copy.type = "button";
       copy.className = "btn ghost";
-      copy.textContent = "Copy";
+      copy.textContent = "复制";
       copy.addEventListener("click", function () {
-        copyText(pair.token, "Token copied");
+        copyText(pair.token, "技术标记已复制");
       });
       li.appendChild(copy);
       container.appendChild(li);
@@ -642,7 +776,7 @@
     if (!container.children.length) {
       var li = document.createElement("li");
       li.className = "muted";
-      li.textContent = "None recorded.";
+      li.textContent = "暂无记录。";
       container.appendChild(li);
     }
   }
@@ -651,29 +785,29 @@
     hide($("inc-list-card"));
     show($("inc-detail"));
     var summary = detail.summary || {};
-    $("inc-detail-title").textContent = summary.headline || "Incident";
+    $("inc-detail-title").textContent = incidentCopy(summary.headline) || "事件";
     var box = $("inc-summary");
     box.textContent = "";
     var win = summary.window || {};
     if (win.start_epoch !== undefined) {
-      box.appendChild(kvRow("Signal window",
+      box.appendChild(kvRow("信号窗口",
         fmtEpoch(win.start_epoch) + " — " + fmtEpoch(win.end_epoch) +
         " (" + fmtUptime(win.duration_seconds) + ")"));
     }
     ["impact", "protocol_state", "server_state", "affected_scope",
      "assessment"].forEach(function (key) {
-      if (summary[key]) box.appendChild(kvRow(key.replace(/_/g, " "), summary[key]));
+      if (summary[key]) box.appendChild(kvRow({impact: "影响", protocol_state: "协议状态", server_state: "服务器状态", affected_scope: "影响范围", assessment: "评估"}[key], summary[key]));
     });
     if (summary.recommended_action) {
-      box.appendChild(kvRow("recommended action", summary.recommended_action));
+      box.appendChild(kvRow("建议操作", summary.recommended_action));
     }
-    if (summary.uncertainty) box.appendChild(kvRow("uncertainty", summary.uncertainty));
-    if (summary.limitations) box.appendChild(kvRow("limitations", summary.limitations));
+    if (summary.uncertainty) box.appendChild(kvRow("不确定性", summary.uncertainty));
+    if (summary.limitations) box.appendChild(kvRow("限制", summary.limitations));
     // The in-window operator markers, joined server-side (#63 R2 §4):
     // closed labels only, never the detail's own free text.
     if ((detail.markers || []).length) {
-      box.appendChild(kvRow("operator markers",
-        detail.markers.map(function (m) { return m.label || m.kind; })
+      box.appendChild(kvRow("人工标记",
+        detail.markers.map(function (m) { return incidentCopy(m.label || m.kind); })
                       .join("; ")));
     }
     reasonItems($("inc-evidence-list"), detail.evidence);
@@ -698,9 +832,9 @@
   function openMarkerEvidence(id, label) {
     if (!state.session || !state.session.authenticated) return;
     state.incSubject = {type: "marker", id: id, label: label};
-    $("inc-evidence-title").textContent = "Evidence around marker";
+    $("inc-evidence-title").textContent = "标记附近的证据";
     var line = $("inc-evidence-subject");
-    line.textContent = "Marker: " + (label || ("#" + id));
+    line.textContent = "标记：" + (label || ("#" + id));
     show(line);
     show($("inc-evidence-card"));
     loadEvidence(state.incSection);
@@ -750,12 +884,12 @@
     if (state.incSubject && state.incSubject.type === "marker" && data &&
         data.window) {
       // B3: the server-derived window, only echoed -- never widened here.
-      subject.textContent = "Marker: " +
+      subject.textContent = "标记：" +
         (state.incSubject.label || ("#" + state.incSubject.id)) +
-        " — Server-derived window: " +
+        " — 服务器给出的时间窗口：" +
         fmtEpoch(data.window.start_epoch) + " — " +
         fmtEpoch(data.window.end_epoch) +
-        " (the marker time ± 15 minutes)";
+        "（标记前后各 15 分钟）";
       show(subject);
     }
     renderL3(data);
@@ -870,8 +1004,8 @@
         groups[key].first = Math.min(groups[key].first, row.ts);
         groups[key].last = Math.max(groups[key].last, row.ts);
       });
-      var headers = ["Error class", "Protocol", "Destination class",
-                     "Port", "Total", "First", "Last"];
+      var headers = ["错误类型", "协议", "目标类型",
+                     "端口", "总计", "首次", "最近"];
       var table = Object.keys(groups).sort().map(function (key) {
         var g = groups[key];
         return [g.cls, g.proto, g.dcls === "NONE" ? "—" : g.dcls,
@@ -894,7 +1028,7 @@
         audits[key].last = Math.max(audits[key].last, row.epoch);
       });
       host.appendChild(l3Table(
-        ["Kind", "Code", "Total", "First", "Last"],
+        ["类型", "代码", "总计", "首次", "最近"],
         Object.keys(audits).sort().map(function (key) {
           var g = audits[key];
           return [g.kind, g.code, String(g.total),
@@ -904,8 +1038,8 @@
     }
     if (data.section === "samples") {
       host.appendChild(l3Table(
-        ["Time", "Reality conns", "Hysteria2 conns", "Total conns",
-         "API", "Collector"],
+        ["时间", "Reality 连接", "Hysteria2 连接", "连接总数",
+         "API", "采集器"],
         rows.map(function (row) {
           return [fmtEpoch(row.epoch),
                   String(row.reality_active_connections),
@@ -918,8 +1052,8 @@
     }
     if (data.section === "probe_rows") {
       host.appendChild(l3Table(
-        ["Time", "DNS", "HTTPS", "UDP", "Egress", "Public egress IP",
-         "IP change"],
+        ["时间", "DNS", "HTTPS", "UDP", "出站", "公网出口 IP",
+         "IP 变化"],
         rows.map(function (row) {
           return [fmtEpoch(row.epoch),
                   fmtSlot(row.dns_status, row.dns_latency_ms, row.dns_error_code),
@@ -937,7 +1071,7 @@
       note.textContent = INC_DEVICE_DISCLAIMER;
       host.appendChild(note);
       host.appendChild(l3Table(
-        ["Time", "Device", "Inbound", "Active conns", "Status"],
+        ["时间", "设备", "入站", "活动连接", "状态"],
         rows.map(function (row) {
           return [fmtEpoch(row.epoch), row.device, row.inbound,
                   String(row.active_connections), row.device_status || "—"];
@@ -958,7 +1092,7 @@
     markers.forEach(function (marker) {
       var li = document.createElement("li");
       var label = document.createElement("span");
-      label.textContent = (marker.label || marker.kind) +
+      label.textContent = incidentCopy(marker.label || marker.kind) +
         " · " + fmtEpoch(marker.epoch);
       li.appendChild(label);
       // B3: non-destructive correlation entry -- selects the marker as
@@ -966,9 +1100,9 @@
       var view = document.createElement("button");
       view.type = "button";
       view.className = "btn ghost";
-      view.textContent = "View evidence";
+      view.textContent = "查看证据";
       view.addEventListener("click", function () {
-        openMarkerEvidence(marker.marker_id, marker.label || marker.kind);
+        openMarkerEvidence(marker.marker_id, incidentCopy(marker.label || marker.kind));
       });
       li.appendChild(view);
       list.appendChild(li);
@@ -977,7 +1111,7 @@
       var li = document.createElement("li");
       li.className = "muted";
       li.style.fontFamily = "inherit";
-      li.textContent = "No markers recorded.";
+      li.textContent = "暂无人工标记。";
       list.appendChild(li);
     }
   }
@@ -992,16 +1126,16 @@
       body: { kind: kind }
     }).then(function () {
       button.disabled = false;
-      incMessage("Marker recorded.", false);
+      incMessage("人工标记已记录。", false);
       loadMarkers();
     }).catch(function (error) {
       button.disabled = false;
-      if (error.status === 401) { showLogin("Session expired — please log in again."); return; }
+      if (error.status === 401) { showLogin("登录已过期，请重新登录。"); return; }
       if (error.status === 400 && error.code === "invalid_marker_epoch") {
-        incMessage("The marker time is outside the retention window.", true);
+        incMessage("标记时间已超出保留窗口。", true);
         return;
       }
-      incMessage("The marker could not be recorded.", true);
+      incMessage("无法记录人工标记。", true);
     });
   }
 
@@ -1015,11 +1149,11 @@
         loadIncidents();
       })
       .catch(function (error) {
-        if (error.status === 401) { showLogin("Session expired — please log in again."); return; }
+        if (error.status === 401) { showLogin("登录已过期，请重新登录。"); return; }
         if (error.status === 409) {
-          rearmMessage("Discovery is not waiting for a re-arm right now.", true);
+          rearmMessage("当前发现状态无需重新启动。", true);
         } else {
-          rearmMessage("The re-arm could not be recorded. Do not retry automatically.", true);
+          rearmMessage("无法记录重新启动请求，请勿自动重试。", true);
         }
         loadIncidents();
       });
@@ -1085,7 +1219,7 @@
   function retryPending() {
     var p = state.e3PendingRetry;
     if (!p) return;   // no pending uncertain operation: nothing to retry
-    e3Message("Checking the previous change…", false);
+    e3Message("正在核验上次修改…", false);
     apiWithStepUp(p.path, {
       method: "POST",
       idempotencyKey: p.idempotencyKey,   // exact same header value
@@ -1093,8 +1227,8 @@
     }).then(function (data) {
       setPendingRetry(null);
       e3Message(p.name
-        ? "Retry finished: the operation reached a terminal state."
-        : "Retry finished.", false);
+        ? "重试已结束，操作已达到最终状态。"
+        : "重试已结束。", false);
       loadE3Clients();
       loadE3Status();
       loadSession();
@@ -1150,14 +1284,14 @@
     var busy = !!state.e3Mutation;
     var adding = busy && state.e3Mutation.kind === "add";
     var deleting = busy && state.e3Mutation.kind === "delete";
-    setBadge($("e3-availability"), writable ? "Available" : "Unavailable",
+    setBadge($("e3-availability"), writable ? "可用" : "不可用",
              writable ? "ok" : "idle");
     if (writable) hide($("e3-unavailable")); else show($("e3-unavailable"));
     $("e3-add-btn").disabled = !writable || busy;
-    $("e3-add-btn").textContent = adding ? "Adding…" : "Add client";
+    $("e3-add-btn").textContent = adding ? "正在添加…" : "添加客户端";
     $("e3-add-name").disabled = !writable || busy;
     $("e3-del-btn").disabled = !writable || busy;
-    $("e3-del-btn").textContent = deleting ? "Deleting…" : "Delete permanently";
+    $("e3-del-btn").textContent = deleting ? "正在删除…" : "永久删除";
     // A delete already dispatched (step-up or wire) cannot be "cancelled"
     // by the UI: the transaction is real, so the Cancel control locks with
     // it. Once the POST reaches a terminal verdict the panel is closed or
@@ -1190,7 +1324,7 @@
       var row = body.insertRow(-1);
       var cell = row.insertCell(-1);
       cell.colSpan = 3;
-      cell.textContent = "Client list unavailable.";
+      cell.textContent = "客户端列表暂不可用。";
     });
   }
 
@@ -1209,7 +1343,7 @@
     // management.status THEN client.list and answers ok ONLY when both are
     // fresh. The frontend applies the pair atomically -- badge, controls
     // and table all move on the same render pass, so the ~2-5s
-    // "Unavailable" window created by the separate TTL-gated reads is gone
+    // "不可用" window created by the separate TTL-gated reads is gone
     // and no half-fresh state is ever displayed. Convergence outranks the
     // watchdog: generations retire every older in-flight status/list read
     // at start and at apply. Failure fails closed (status cleared ->
@@ -1264,7 +1398,7 @@
         var dl = document.createElement("button");
         dl.className = "btn ghost";
         dl.type = "button";
-        dl.textContent = "Download";
+        dl.textContent = "下载 YAML";
         dl.addEventListener("click", function () {
           downloadConfig(client.name);
         });
@@ -1274,7 +1408,7 @@
         var btn = document.createElement("button");
         btn.className = "btn ghost";
         btn.type = "button";
-        btn.textContent = "Delete";
+        btn.textContent = "删除";
         // 0.1.5: any in-flight mutation also locks the row entrances
         // (Download above is a read and deliberately keeps its own gate).
         if (state.e3Mutation) btn.disabled = true;
@@ -1287,7 +1421,7 @@
         var devices = document.createElement("button");
         devices.className = "btn ghost";
         devices.type = "button";
-        devices.textContent = "Devices / Bundle";
+        devices.textContent = "设备 / 客户端包";
         devices.disabled = !!state.e3Mutation;
         devices.addEventListener("click", function () { openP6Devices(client.name); });
         actions.appendChild(devices);
@@ -1297,7 +1431,7 @@
       var row = body.insertRow(-1);
       var cell = row.insertCell(-1);
       cell.colSpan = 3;
-      cell.textContent = "No clients found.";
+      cell.textContent = "暂无客户端。";
     }
   }
 
@@ -1360,7 +1494,7 @@
     }).then(function () {
       setPendingRetry(null);
       closeDeleteConfirm();
-      e3Message("Client deleted.", false);
+      e3Message("客户端已删除。", false);
       loadSession();
       // 0.1.4: the single convergence read applies fresh status+list
       // atomically (the server caches are already invalidated for this
@@ -1385,16 +1519,13 @@
       setPendingRetry(null);
       clearMutation();
       if (error.code === "E_RECONCILE_CONFLICT") {
-        e3Message("Server state changed: the client was rebuilt or rotated " +
-                  "in the meantime. Refresh and re-check — the delete was " +
-                  "not retried.", true);
+        e3Message("服务器上的客户端已重建或轮换，请刷新并重新核验，本次删除未自动重试。", true);
         loadE3Clients();
         loadE3Status();
         return;
       }
       if (error.code === "E_NOT_FOUND") {
-        e3Message("The client is not in the fresh server list; nothing was " +
-                  "deleted.", true);
+        e3Message("最新列表中没有此客户端，未执行删除。", true);
         loadE3Clients();
         return;
       }
@@ -1412,7 +1543,7 @@
     // The YAML never touches the DOM, the console, or any storage.
     if (state.e3PendingRetry) return;
     if (!e3Writable()) return;
-    e3Message("Preparing the download…", false);
+    e3Message("正在准备下载…", false);
     apiWithStepUp("/api/v1/clients/export", {
       method: "POST",
       body: { name: name },
@@ -1427,14 +1558,13 @@
         a.click();
         document.body.removeChild(a);
         URL.revokeObjectURL(url);
-        e3Message("Configuration downloaded.", false);
+        e3Message("YAML 配置已下载。", false);
       });
     }).catch(function (error) {
       if (error.status === 504 && error.uncertain) {
         // The export may have been answered on the wire; nothing changed
         // server-side, so retrying is simply clicking Download again.
-        e3Message("The export result is unknown. Refresh the status and try " +
-                  "the download again.", true);
+        e3Message("下载结果尚未确认，请刷新状态后手动重试下载。", true);
         loadE3Status();
         return;
       }
@@ -1442,8 +1572,7 @@
         hide($("e3-msg"));
         return;
       }
-      e3Message("The configuration could not be downloaded. Nothing was " +
-                "changed on the server.", true);
+      e3Message("配置下载失败，服务器配置未被修改。", true);
       loadE3Status();
     });
   }
@@ -1476,8 +1605,8 @@
       row.insertCell(-1).textContent = device.device + " / " + device.probe_id.slice(0, 11);
       var confirmed = device.desired === device.verified;
       row.insertCell(-1).textContent = confirmed
-        ? (device.desired === "active" ? "Enrollment verified" : "Revocation verified")
-        : (device.desired === "active" ? "Enrollment pending" : "Revocation pending");
+        ? (device.desired === "active" ? "登记已确认" : "撤销已确认")
+        : (device.desired === "active" ? "登记待确认" : "撤销待确认");
       var cell = row.insertCell(-1);
       function action(text, call) {
         var button = document.createElement("button");
@@ -1489,16 +1618,16 @@
         cell.appendChild(button);
       }
       if (device.desired === "active" && device.verified === "active") {
-        action("Download Client Bundle", function () { downloadP6Bundle(device.device); });
+        action("下载客户端包", function () { downloadP6Bundle(device.device); });
       }
       if (device.desired === "active" && !confirmed) {
-        action("Verify again", function () {
+        action("重新核验", function () {
           p6Operate("resume", {name: p6View.name, device: device.device});
         });
       }
       if (device.desired === "active" || !confirmed) {
-        action(device.desired === "active" ? "Revoke" : "Retry revocation", function () {
-          if (device.desired === "active" && !window.confirm("Revoke this device's P6 upload access? Its proxy account remains available.")) return;
+        action(device.desired === "active" ? "撤销上传权限" : "重试撤销", function () {
+          if (device.desired === "active" && !window.confirm("是否撤销此设备的 P6 上传权限？代理账号仍会保留。")) return;
           p6Operate("revoke", {name: p6View.name, device: device.device, probe_id: device.probe_id});
         });
       }
@@ -1509,7 +1638,7 @@
   function openP6Devices(name) {
     if (p6View.busy || !e3Writable() || state.e3Mutation) return;
     if (p6View.retry && p6View.name !== name) {
-      e3Message("Resolve the previous device operation first.", true);
+      e3Message("请先确认上一次设备操作的结果。", true);
       return;
     }
     p6View.name = name;
@@ -1536,7 +1665,7 @@
     }).catch(function () {
       p6View.rows = [];
       p6View.next = null;
-      p6Message("Device status is unavailable. No enrollment or revocation has been confirmed.", true);
+      p6Message("设备状态暂不可用，尚未确认任何登记或撤销结果。", true);
     }).then(function () {
       p6View.busy = false;
       renderP6Devices();
@@ -1552,10 +1681,10 @@
       method: "POST", body: body, idempotencyKey: key
     }).then(function (result) {
       p6View.retry = null;
-      if (op === "revoke") p6Message("Revocation verified by the server.", false);
+      if (op === "revoke") p6Message("服务器已确认撤销上传权限。", false);
       else p6Message(result.data.verified === "active"
-        ? "Device enrollment verified. Download a bundle for this device."
-        : "This enrollment has been retired.", result.data.verified !== "active");
+        ? "设备登记已确认，可以下载该设备的客户端包。"
+        : "此登记已撤销。", result.data.verified !== "active");
     }).catch(function (error) {
       if (error.message === "step-up cancelled") return;
       // A failed fetch/JSON read has no HTTP status and may have happened
@@ -1563,8 +1692,8 @@
       // retry or metadata confirmation resolves it; never generate a new key.
       if (error.uncertain || error.retriable || typeof error.status !== "number") p6View.retry = intent;
       p6Message(error.code === "E_P6_DEVICE_EXISTS"
-        ? "This device already has an enrollment. Refresh the list to download or verify it."
-        : "The operation was not confirmed. Refresh device status before retrying.", true);
+        ? "该设备已有登记，请刷新列表后下载或核验。"
+        : "操作结果尚未确认，请刷新设备状态后再重试。", true);
     }).then(function () {
       p6View.busy = false;
       renderP6Devices();
@@ -1591,12 +1720,12 @@
         if (link.parentNode) link.parentNode.removeChild(link);
         URL.revokeObjectURL(url);
       }
-      p6Message("Client Bundle downloaded. Keep this device's credentials private.", false);
+      p6Message("客户端包已下载，请妥善保管其中的设备凭据。", false);
     }).catch(function (error) {
       if (error.message === "step-up cancelled") return;
       p6Message(error.code === "E_P6_ARTIFACT"
-        ? "Bundle support is not prepared on the server. Contact the administrator."
-        : "The bundle could not be downloaded. Refresh status and try again explicitly.", true);
+        ? "客户端包读取失败，请让管理员检查通用 Agent 文件的权限、完整性及版本是否一致。"
+        : "客户端包下载失败，请刷新设备状态后手动重试。", true);
     }).then(function () { p6View.busy = false; renderP6Devices(); });
   }
 
@@ -1614,7 +1743,7 @@
       body: { name: name }
     }).then(function (data) {
       setPendingRetry(null);
-      e3Message("Client created. Download its configuration below.",
+      e3Message("客户端已创建，可在下方下载 YAML 配置。",
                 false);
       $("e3-add-name").value = "";
       // 0.1.4: the single convergence read applies fresh status+list
@@ -1635,8 +1764,8 @@
       setPendingRetry(null);
       clearMutation();
       if (error.code === "E_RECONCILE_CONFLICT") {
-        e3Message("Server state changed while the request was in flight. " +
-                  "Refresh and re-check — this request was not retried.",
+        e3Message("请求处理期间服务器状态发生变化。" +
+                  "请刷新并重新核验，本次请求未自动重试。",
                   true);
         loadE3Clients();
         loadE3Status();
@@ -1675,7 +1804,7 @@
       var remove = document.createElement("button");
       remove.type = "button";
       remove.className = "btn danger";
-      remove.textContent = "Remove";
+      remove.textContent = "移除";
       remove.addEventListener("click", function () { removeEntry(entry); });
       li.appendChild(remove);
       list.appendChild(li);
@@ -1684,7 +1813,7 @@
       var empty = document.createElement("li");
       empty.className = "muted";
       empty.style.fontFamily = "inherit";
-      empty.textContent = "Whitelist is empty — only loopback can reach the dashboard.";
+      empty.textContent = "白名单为空，仅本机或 SSH 隧道可访问监控页面。";
       list.appendChild(empty);
     }
   }
@@ -1700,10 +1829,10 @@
     api("/api/v1/whitelist", { method: "POST", body: { entry: entry } })
       .then(function () {
         $("wl-add-input").value = "";
-        wlMessage("Added " + entry, false);
+        wlMessage("已添加 " + entry, false);
         loadAccess();
       })
-      .catch(function (error) { wlMessage(error.message, true); });
+      .catch(function (error) { wlMessage(errorText(error), true); });
   }
 
   function removeEntry(entry, confirmed) {
@@ -1714,15 +1843,15 @@
     var body = { entry: entry };
     if (confirmed) { body.confirm = true; }
     api("/api/v1/whitelist/remove", { method: "POST", body: body })
-      .then(function () { wlMessage("Removed " + entry, false); loadAccess(); })
+      .then(function () { wlMessage("已移除 " + entry, false); loadAccess(); })
       .catch(function (error) {
         if (error.status === 409 && !confirmed &&
-            window.confirm("Removing this entry will lock this browser out.\n" +
-                           "Recovery key will be required. Continue?")) {
+            window.confirm("移除此条目将使当前浏览器失去访问权限。\n" +
+                           "之后需要恢复密钥才能访问，是否继续？")) {
           removeEntry(entry, true);
           return;
         }
-        wlMessage(error.message, true);
+        wlMessage(errorText(error), true);
       });
   }
 
@@ -1740,31 +1869,31 @@
     var current = $("pw-current").value;
     var next = $("pw-new").value;
     var repeat = $("pw-repeat").value;
-    if (next.length < 8) { pwMessage("New password must be at least 8 characters.", true); return; }
-    if (next !== repeat) { pwMessage("New passwords do not match.", true); return; }
+    if (next.length < 8) { pwMessage("新密码至少需要 8 个字符。", true); return; }
+    if (next !== repeat) { pwMessage("两次输入的新密码不一致。", true); return; }
     api("/api/v1/password", {
       method: "POST",
       body: { current_password: current, new_password: next }
     }).then(function () {
       $("pw-form").reset();
-      pwMessage("Password changed.", false);
-    }).catch(function (error) { pwMessage(error.message, true); });
+      pwMessage("密码已修改。", false);
+    }).catch(function (error) { pwMessage(errorText(error), true); });
   }
 
   function rotateRecovery() {
-    var current = window.prompt("Confirm your current admin password to regenerate the recovery key:");
+    var current = window.prompt("请输入当前管理员密码，以重新生成恢复密钥：");
     if (current === null) return;
     api("/api/v1/recovery/rotate", {
       method: "POST", body: { current_password: current }
     }).then(function (data) {
       var el = $("rec-result");
-      el.textContent = "New recovery key (shown ONLY once — store it now): " +
+      el.textContent = "新恢复密钥（仅显示一次，请立即保存）：" +
         data.recovery_key;
       show(el);
       loadSession();
     }).catch(function (error) {
       var el = $("rec-result");
-      el.textContent = "Failed: " + error.message;
+      el.textContent = "失败：" + errorText(error);
       show(el);
     });
   }
@@ -1775,7 +1904,7 @@
     return api("/api/v1/session").then(function (data) {
       state.session = data;
       $("rec-status").textContent =
-        data.recovery_configured ? "configured ✓" : "not configured";
+        data.recovery_configured ? "已配置 ✓" : "未配置";
       renderWhitelistFromSession();
       return data;
     });
@@ -1801,8 +1930,8 @@
       })
       .catch(function (error) {
         var message = error.status === 429
-          ? "Too many failed attempts — locked, try again later."
-          : "Invalid password.";
+          ? "失败次数过多，已暂时锁定，请稍后重试。"
+          : "密码无效。";
         showLogin(message);
       });
   }
@@ -1819,16 +1948,15 @@
     var message = $("recovery-msg");
     api("/api/v1/recovery", { method: "POST", body: { key: key } })
       .then(function (data) {
-        message.textContent = data.message +
-          " Your IP (" + data.ip + ") was added. Please login normally.";
+        message.textContent = "已恢复访问，当前 IP（" + data.ip + "）已加入白名单，请正常登录。";
         message.className = "form-msg ok";
         show(message);
         $("recovery-key").value = "";
       })
       .catch(function (error) {
         message.textContent = error.status === 429
-          ? "Too many attempts — locked, try again later."
-          : error.message;
+          ? "尝试次数过多，已暂时锁定，请稍后重试。"
+          : errorText(error);
         message.className = "form-msg error";
         show(message);
       });
@@ -1850,7 +1978,7 @@
       } catch (err) { /* malformed frame: ignore, next tick arrives */ }
     });
     source.onopen = function () {
-      setChip($("chip-monitor"), "Monitor", "connecting", "unknown");
+      setChip($("chip-monitor"), "监控", "connecting", "unknown");
     };
     source.onerror = function () {
       // EventSource retries automatically (server hints retry: 3000).
@@ -1860,7 +1988,7 @@
         if (!data.authenticated) {
           state.esGeneration++;
           source.close();
-          showLogin("Session expired — please log in again.");
+          showLogin("登录已过期，请重新登录。");
         }
       }).catch(function () { /* transient; EventSource keeps retrying */ });
     };
@@ -1904,8 +2032,8 @@
       });
     }).catch(function (error) {
       showLogin(error.status === 403
-        ? "Your address is not whitelisted. Use the recovery key."
-        : "Failed to reach the dashboard API.");
+        ? "当前地址不在白名单中，请使用恢复密钥。"
+        : "无法连接监控 API。");
     });
   }
 

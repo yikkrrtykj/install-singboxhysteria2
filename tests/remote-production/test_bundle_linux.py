@@ -386,6 +386,62 @@ print(len(raw),denied)
         finally:
             self.app.bundle_slots.release(); self.app.bundle_slots.release()
 
+    def test_installer_under_private_umask_publishes_outside_0700_helper(self):
+        prefix = self.root / 'installed'
+        helper = prefix / 'usr/local/lib/sbox-cm'
+        helper.mkdir(parents=True)
+        helper.chmod(0o700)
+        state = prefix / 'state'
+        def private_umask():
+            os.umask(0o077)
+        installed = subprocess.run(['bash', str(ROOT / 'sbox-cm/deploy/install-sbox-cm.sh'), 'install'],
+            env=os.environ | {'SBXCM_PREFIX': str(prefix), 'SBXCM_SYSTEMCTL': '/usr/bin/true',
+                              'SB_CM_STATE_DIR': str(state)}, preexec_fn=private_umask,
+            capture_output=True, timeout=30)
+        self.assertEqual(installed.returncode, 0, installed.stderr.decode())
+        self.assertEqual(helper.stat().st_mode & 0o777, 0o700)
+        public = prefix / 'usr/local/share/sbox-p6-artifact'
+        self.assertEqual(read_artifact(str(public))[0], self.manifest)
+        # Actual non-root file reads after the actual deployment script. This
+        # reproduces the real private-parent failure missed by root HTTP tests.
+        reader = self.root / 'public-reader'
+        reader.mkdir(mode=0o755)
+        shutil.copyfile(ROOT / 'monitor-v2/p6_artifact.py', reader / 'p6_artifact.py')
+        (reader / 'p6_artifact.py').chmod(0o644)
+        def unprivileged():
+            os.setgroups([]); os.setgid(65534); os.setuid(65534)
+        code = '''import sys
+sys.path.insert(0,sys.argv[1])
+from p6_artifact import read_artifact
+m,b=read_artifact(sys.argv[2])
+denied=False
+try: open(sys.argv[3],'rb')
+except PermissionError: denied=True
+assert denied
+print(m['sha256'])
+'''
+        result = subprocess.run([sys.executable, '-I', '-c', code, str(reader), str(public),
+                                 str(helper / 'sbox-cm')], preexec_fn=unprivileged,
+                                cwd='/', capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertEqual(result.stdout.decode().strip(), self.manifest['sha256'])
+        uninstalled = subprocess.run(['bash', str(ROOT / 'sbox-cm/deploy/install-sbox-cm.sh'), 'uninstall'],
+            env=os.environ | {'SBXCM_PREFIX': str(prefix), 'SBXCM_SYSTEMCTL': '/usr/bin/true',
+                              'SB_CM_STATE_DIR': str(state)}, capture_output=True, timeout=15)
+        self.assertEqual(uninstalled.returncode, 0, uninstalled.stderr.decode())
+        self.assertFalse(public.exists())
+        self.assertTrue(state.is_dir())
+
+    def test_root_validator_refuses_private_artifact_parent(self):
+        # Root can read both files; the validator must still refuse a layout
+        # that the actual unprivileged HTTP process cannot traverse.
+        private = self.root / 'private'
+        private.mkdir(mode=0o700)
+        moved = private / 'artifact'
+        shutil.move(str(self.artifact_dir), str(moved))
+        with self.assertRaises(ArtifactError):
+            read_artifact(str(moved))
+
 
 if __name__ == '__main__':
     if sys.platform != 'linux' or os.geteuid() != 0:
