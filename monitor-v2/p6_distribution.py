@@ -216,7 +216,16 @@ def publish(package, manifest_path, expected_digest, publisher, scope, artifact,
     if m['publisher'] != publisher or m['scope'] != scope or m['artifact'] != artifact:
         raise DistributionError()
     if not os.path.exists(root):
-        directory(os.path.dirname(root), exact=False); os.mkdir(root, 0o755); os.chmod(root, 0o755)
+        directory(os.path.dirname(root), exact=False)
+        try:
+            os.mkdir(root, 0o755)
+        except FileExistsError:
+            # Another root publisher may win first creation before our flock
+            # exists. Never chmod/adopt its object: the full exact directory
+            # authority/no-link check below still decides admission.
+            pass
+        else:
+            os.chmod(root, 0o755)
     directory(root)
     lock = os.path.join(root, '.publish.lock')
     fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)

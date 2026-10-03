@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 import uuid
 import zipfile
@@ -125,7 +126,15 @@ class PublicationTests(unittest.TestCase):
         d.retire(selector, str(self.root), stage=True); self.assertFalse(path.exists())
 
     def test_concurrent_retry_and_switch_preserve_held_reader(self):
-        with concurrent.futures.ThreadPoolExecutor(2) as pool:
+        # Force both publishers past the missing-root check before either
+        # mkdir succeeds. This deterministically exercises EEXIST, rather than
+        # relying on runner scheduling to reproduce first-publication races.
+        barrier=threading.Barrier(2)
+        original_mkdir=os.mkdir
+        def first_directory(path, *args, **kwargs):
+            if os.fspath(path)==str(self.root):barrier.wait(timeout=10)
+            return original_mkdir(path,*args,**kwargs)
+        with patch.object(d.os,'mkdir',side_effect=first_directory), concurrent.futures.ThreadPoolExecutor(2) as pool:
             values = list(pool.map(lambda _: self.publish(), range(2)))
         self.assertEqual(values[0], values[1])
         with d.open_release(self.m['artifact'], str(self.root)) as (_, old):
