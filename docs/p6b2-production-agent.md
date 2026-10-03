@@ -471,3 +471,64 @@ Real GUI/operator acceptance, offline/reboot/TUN/multiple-profile/resource
 benchmarks, production signing/distribution and independent review remain
 pending. Existing running lab service is unchanged while this slice is built.
 PR #70 stays Draft; no merge, production deployment, P6C or P6D.
+
+## Signed Windows software distribution (separate from device Bundle)
+
+The device panel has two downloads: generic Windows software and per-device
+sensitive configuration. Download/extract the software ZIP, run P6Setup.exe,
+then choose the separate device Bundle in the Chinese manager. The software
+archive contains only signed entry files/catalog and the bounded runtime/Agent/
+installer inventory. It contains no device/YAML/profile/P6 secret. Closing the
+manager leaves the Agent service running.
+
+The native Windows build host exports an already signed protected package:
+
+```powershell
+python tools/export-p6-windows.py --package <protected-signed-package> --publisher <expected-thumbprint> --output <protected-export>
+```
+
+Production export requires native Valid signatures for PE/Setup/catalog,
+Test-FileCatalog, exact compiled publisher binding and timestamps on all three
+signatures. Explicit `--lab` labels a previously signed controlled test package;
+it creates/imports no signing key or trust and is not production signing.
+The exporter reports the manifest SHA-256, publisher and scope for the operator.
+The staging builder alone produces unsigned output and cannot pass this gate.
+
+After securely transferring the two exported files to root-owned regular 0644
+files, the root operator publishes with independently expected values:
+
+```bash
+python3 -I /usr/local/lib/sbox-cm/publish-p6-windows.py publish --package /root/p6-export/windows-installer.zip --manifest /root/p6-export/release.json --manifest-sha256 <exported-manifest-sha256> --publisher <expected-thumbprint> --scope production
+```
+
+Use explicit `--scope lab` only for the controlled acceptance export. Linux
+checks operator-provided expected hash/publisher/scope, closed inventory, exact
+file hashes and current generic Agent compatibility; it does not perform or
+claim native Authenticode validation. The expected manifest is admission
+authority, not an untrusted uploaded manifest declaring itself signed. Windows
+retains its native signature/catalog/compiled publisher gates on installation.
+No implicit signer/scope replacement or unsigned fallback exists.
+
+The fixed public root `/usr/local/share/sbox-p6-windows` holds immutable version
+directories and an atomic `current.json`, all root:root, directories 0755, files
+0644, single-link/no-follow/same-object checks. Each archive is <=64 MiB; at most
+two retained versions plus one staging copy bound archive bytes to 192 MiB,
+with <=97 KiB bounded manifest/pointer metadata and an empty private lock file.
+Publication is serialized with flock/fsync, never auto-evicts, and supports
+idempotent retry. Explicit `retire --archive <inactive-sha256>` refuses current
+and foreign files. An interrupted `.stage-<32hex>` stops new publication until
+explicit `discard-stage --stage <32hex>` removes only its checked managed files.
+Ordinary helper/Monitor reinstall preserves published packages and identities.
+
+The exact POST `/api/v1/clients/windows` accepts only `{}`, behind existing peer
+whitelist/origin/session/CSRF/step-up plus fresh management authorization. It
+never calls credential export RPC. Software and device Bundles share two
+download slots. The archive is checked before headers and streamed in 64 KiB
+chunks from the held root file with socket/total deadlines and no-store headers.
+Missing/corrupt/incompatible software returns `E_P6_WINDOWS_UNAVAILABLE`; lab
+scope is labeled in the filename, response and Chinese instructions. The public
+nginx ingress still exposes only the existing machine ingest route.
+
+Production signer and actual signed GUI delivery/test-VPS publication remain
+pending. A server code update does not manufacture a signed EXE. PR #70 remains
+Draft; no merge, production deployment, P6C/P6D or whole P6B2 PASS is claimed.

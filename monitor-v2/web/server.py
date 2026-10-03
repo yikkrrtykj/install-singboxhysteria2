@@ -43,6 +43,7 @@ from web.access import host_entry_for_ip
 from web.e3_broker import BrokerUnavailable
 from web.e3rpc import RpcTransportError
 from p6_artifact import ArtifactError, read_artifact
+from p6_distribution import DistributionError, open_release
 from web.p6_bundle import BundleError, assemble as assemble_p6_bundle
 from web import incident_presenter as incident_presenter
 from web import incident_history as ih_outcomes
@@ -222,6 +223,7 @@ P6_ROUTES = {
     '/api/v1/clients/probes/revoke': 'probe.revoke',
     '/api/v1/clients/probes/resume': 'probe.resume',
     '/api/v1/clients/bundle': 'client.bundle',
+    '/api/v1/clients/windows': 'windows.download',
 }
 P6_ERROR_HTTP = {
     'E_P6_SCHEMA': 400, 'E_P6_NOT_ENROLLED': 404, 'E_P6_REVOKED': 409,
@@ -231,7 +233,7 @@ P6_ERROR_HTTP = {
     'E_P6_CONFIRM_PENDING': 503, 'E_P6_CAPACITY': 507, 'E_P6_BUSY': 423,
     'E_P6_AUTHORITY': 503, 'E_P6_STATE': 503, 'E_P6_REGISTRY': 503,
     'E_P6_ARTIFACT': 503, 'E_P6_UNAVAILABLE': 503, 'E_AUDIT_UNAVAILABLE': 503,
-    'E_P6_BUNDLE': 502,
+    'E_P6_BUNDLE': 502, 'E_P6_WINDOWS_UNAVAILABLE': 503,
 }
 
 # ---------------------------------------------------------------- M2 adapter --
@@ -476,7 +478,7 @@ class MonitorWebApp:
                  remote_mode=False, version=MONITOR_WEB_VERSION,
                  recovery_guard=None, management_active=None, e3_broker=None,
                  incident_history=None, probe_scheduler=None,
-                 incident_scanner=None, remote_plane=None, bundle_artifact=None):
+                 incident_scanner=None, remote_plane=None, bundle_artifact=None, windows_distribution=None):
         self.broker = broker
         self.access = access
         self.auth = auth
@@ -514,6 +516,7 @@ class MonitorWebApp:
         self._management_active = management_active
         self.e3_broker = e3_broker
         self.bundle_artifact = bundle_artifact or read_artifact
+        self.windows_distribution = windows_distribution or open_release
         self.bundle_slots = threading.BoundedSemaphore(2)
         self._static_cache = {}
 
@@ -2177,6 +2180,9 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         return public
 
     def _handle_p6_request(self, session, op, actor):
+        if op == 'windows.download':
+            self._handle_windows_download()
+            return
         body = self._json_body()
         keys = {'name', 'device'} if op in ('probe.revoke', 'probe.resume', 'client.bundle') else \
                {'name', 'device', 'site_label', 'path_label'} if op == 'probe.enroll' else {'name'}
@@ -2279,6 +2285,61 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         finally:
             if slot:
                 self.app.bundle_slots.release()
+
+    def _handle_windows_download(self):
+        # Reached through the existing whitelist/origin/session/CSRF/step-up
+        # spine. Neither caller paths nor credential RPCs enter this read.
+        body = self._json_body()
+        if type(body) is not dict or body or self.headers.get(IDEMPOTENCY_HEADER) is not None:
+            self._p6_failure('E_P6_SCHEMA')
+            return
+        broker = self.app.e3_broker
+        if broker is None:
+            self._e3_unavailable()
+            return
+        if not self.app.bundle_slots.acquire(blocking=False):
+            self._send_json(429, {'ok': False, 'code': 'bundle_busy', 'error': 'try again later'})
+            return
+        started = False
+        try:
+            broker.require_export_ready()
+            artifact, _ = self.app.bundle_artifact()
+            with self.app.windows_distribution(artifact) as (manifest, stream):
+                size = manifest['archive']['size']
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/zip')
+                self.send_header('Content-Disposition', 'attachment; filename="p6-windows-%s.zip"' % manifest['scope'])
+                self.send_header('Content-Length', str(size))
+                self.send_header('X-P6-Distribution-Scope', manifest['scope'])
+                self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate')
+                self.send_header('Pragma', 'no-cache')
+                self.send_header('Expires', '0')
+                for name, value in SECURITY_HEADERS:
+                    self.send_header(name, value)
+                self.connection.settimeout(10)
+                self.end_headers()
+                started = True
+                deadline = time.monotonic() + 60
+                remaining = size
+                while remaining:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError()
+                    chunk = stream.read(min(65536, remaining))
+                    if not chunk:
+                        raise DistributionError()
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+        except BrokerUnavailable:
+            self._e3_unavailable('fresh management gate not satisfied; software was not read')
+        except (ArtifactError, DistributionError):
+            if started:
+                self.close_connection = True
+            else:
+                self._p6_failure('E_P6_WINDOWS_UNAVAILABLE')
+        except OSError:
+            self.close_connection = True
+        finally:
+            self.app.bundle_slots.release()
 
     # -- M4 export: canonical YAML delivery remains unchanged ------------------
 

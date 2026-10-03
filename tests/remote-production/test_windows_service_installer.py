@@ -39,6 +39,11 @@ builder = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(builder)
 
 
+spec = importlib.util.spec_from_file_location('windows_exporter', ROOT / 'tools/export-p6-windows.py')
+exporter = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(exporter)
+
+
 class NativeInstallerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -217,6 +222,45 @@ foreach($store in @('Root','My')) {
                 target.writestr(item, canonical(fixture.profile) if item.filename == 'profile.json' else source.read(item))
         path.write_bytes(output.getvalue())
         return fixture, path, server
+
+    def test_native_signed_lab_export_roundtrip_retains_native_catalog_and_publisher(self):
+        import zipfile
+        from p6_distribution import object_json, verify_archive
+        output = self.protected / uuid.uuid4().hex
+        result = exporter.export(self.package, self.publisher, output, lab=True)
+        raw = (output / 'release.json').read_bytes()
+        self.assertEqual(hashlib.sha256(raw).hexdigest(), result['manifest_sha256'])
+        manifest = object_json(raw)
+        self.assertEqual(manifest['publisher'], self.publisher)
+        self.assertEqual(manifest['scope'], 'lab')
+        self.assertFalse(manifest['timestamped'])
+        with (output / 'windows-installer.zip').open('rb') as stream:
+            verify_archive(stream, manifest)
+        extracted = self.protected / uuid.uuid4().hex
+        self.policy.mkdir(str(extracted))
+        with zipfile.ZipFile(output / 'windows-installer.zip') as archive:
+            archive.extractall(extracted)
+        verify_signatures(extracted, self.publisher)
+        self.assertEqual(validate_release(extracted, self.policy), self.meta)
+        self.assertFalse((extracted / 'profile.json').exists())
+
+    def test_native_export_refuses_missing_production_timestamps_and_wrong_publisher(self):
+        for publisher, lab in ((self.publisher, False), ('0' * 40, True)):
+            output = self.protected / uuid.uuid4().hex
+            with self.assertRaises(Exception):
+                exporter.export(self.package, publisher, output, lab=lab)
+            self.assertFalse((output / 'release.json').exists())
+        self.assertEqual(validate_release(self.package, self.policy), self.meta)
+
+    def test_native_export_refuses_tampered_signed_entry_before_publication(self):
+        bad = self.protected / uuid.uuid4().hex
+        shutil.copytree(self.package, bad)
+        with (bad / 'P6Setup.exe').open('ab') as stream:
+            stream.write(b'fixture signature tamper')
+        output = self.protected / uuid.uuid4().hex
+        with self.assertRaises(Exception):
+            exporter.export(bad, self.publisher, output, lab=True)
+        self.assertFalse((output / 'windows-installer.zip').exists())
 
     def test_actual_bundled_interpreter_isolated_from_pythonpath_and_repo(self):
         environment = dict(os.environ, PYTHONPATH=str(self.root / 'untrusted'), PYTHONHOME=str(self.root / 'untrusted'))

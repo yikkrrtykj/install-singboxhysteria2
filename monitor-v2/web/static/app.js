@@ -1588,7 +1588,7 @@
   }
 
   function p6Controls() {
-    ["p6-enroll", "p6-refresh", "p6-next", "p6-close"].forEach(function (id) {
+    ["p6-enroll", "p6-refresh", "p6-next", "p6-close", "p6-windows-download"].forEach(function (id) {
       $(id).disabled = p6View.busy || !e3Writable() || !!state.e3Mutation;
     });
     $("p6-enroll").disabled = $("p6-enroll").disabled || !!p6View.retry;
@@ -1621,7 +1621,7 @@
         cell.appendChild(button);
       }
       if (device.desired === "active" && device.verified === "active") {
-        action("下载客户端包", function () { downloadP6Bundle(device.device); });
+        action("下载设备配置包", function () { downloadP6Bundle(device.device); });
       }
       if (device.desired === "active" && !confirmed) {
         action("重新核验", function () {
@@ -1702,6 +1702,38 @@
       renderP6Devices();
       loadP6Devices();
     });
+  }
+
+  function downloadP6Windows() {
+    if (p6View.busy || !e3Writable() || state.e3Mutation || p6View.retry) return;
+    p6View.busy = true;
+    renderP6Devices();
+    var scope;
+    apiWithStepUp("/api/v1/clients/windows", {method: "POST", body: {}, raw: true}).then(function (response) {
+      scope = response.headers.get("X-P6-Distribution-Scope");
+      if (scope !== "lab" && scope !== "production") throw new Error("invalid software response");
+      return response.blob();
+    }).then(function (blob) {
+      var url = URL.createObjectURL(blob);
+      var link = document.createElement("a");
+      try {
+        link.href = url;
+        link.download = "p6-windows-" + scope + ".zip";
+        document.body.appendChild(link);
+        link.click();
+      } finally {
+        if (link.parentNode) link.parentNode.removeChild(link);
+        URL.revokeObjectURL(url);
+      }
+      p6Message(scope === "lab"
+        ? "已下载受控测试程序，不能用于正式发布。解压后运行 P6Setup.exe，再选择该设备的配置包。"
+        : "Windows 程序已下载。解压后运行 P6Setup.exe，再选择该设备的配置包。", false);
+    }).catch(function (error) {
+      if (error.message === "step-up cancelled") return;
+      p6Message(error.code === "E_P6_WINDOWS_UNAVAILABLE"
+        ? "本服务器尚未准备好经过校验的 Windows 程序，请管理员发布签名程序包后再下载。"
+        : "Windows 程序下载失败，请手动重试。", true);
+    }).then(function () { p6View.busy = false; renderP6Devices(); });
   }
 
   function downloadP6Bundle(device) {
@@ -2049,6 +2081,7 @@
         p6Operate("enroll", {name: p6View.name, device: $("p6-device-name").value.trim(),
           site_label: $("p6-site-label").value.trim(), path_label: $("p6-path-label").value.trim()}, newIdempotencyKey());
       });
+      $("p6-windows-download").addEventListener("click", downloadP6Windows);
       $("p6-refresh").addEventListener("click", function () { loadP6Devices(); });
       $("p6-next").addEventListener("click", function () { loadP6Devices(p6View.next); });
       $("p6-close").addEventListener("click", function () { if (!p6View.busy) hide($("p6-device-panel")); });

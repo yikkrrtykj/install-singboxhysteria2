@@ -111,7 +111,8 @@ class BundleTests(unittest.TestCase):
             self.assertNotIn(self.parts['secret'], archive.read('profile.json').decode())
             self.assertEqual(archive.read('agent/p6-agent.pyz'), self.generic)
             self.assertNotIn(b'PRIVATE KEY', archive.read('server.pem'))
-            self.assertIn(b'no one-click Windows installer', archive.read('README.txt'))
+            self.assertIn(b'separate administrator-published signed download', archive.read('README.txt'))
+            self.assertIn(b'P6Setup.exe', archive.read('README.txt'))
 
     def test_repeat_bundle_does_not_rotate_or_add_download_timestamp(self):
         self.assertEqual(self.bundle(), self.bundle())
@@ -201,7 +202,8 @@ print(json.dumps({'created':created,'again':again,'refused':refused,'key':key}))
         for name in ('__init__.py', '__main__.py', 'agent.py', 'delivery.py', 'direct_probe.py',
                      'evidence.py', 'mihomo_probe.py', 'payload.py', 'spool.py'):
             shutil.copyfile(ROOT / 'monitor-v2/remote_probe' / name, probe / name)
-        shutil.copyfile(ROOT / 'monitor-v2/p6_artifact.py', stage / 'p6_artifact.py')
+        for name in ('p6_artifact.py', 'p6_distribution.py'):
+            shutil.copyfile(ROOT / 'monitor-v2' / name, stage / name)
         code = 'import sys; sys.path.insert(0,sys.argv[1]); from web.server import MonitorWebApp; print("server_import_ok")'
         result = subprocess.run([sys.executable, '-I', '-c', code, str(stage)],
                                 cwd=self.root, capture_output=True, timeout=20)

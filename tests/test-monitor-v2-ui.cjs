@@ -84,7 +84,7 @@ const context = vm.createContext({ document, console, Uint8Array, Date,
   }
 });
 vm.runInContext(app.replace('document.addEventListener("DOMContentLoaded", boot);',
-  'globalThis.ui = {state, bind, render, loadSession, loadE3Status, loadE3Clients, convergeAfterMutation, renderE3Controls, renderE3Clients, renderMonitorInfo, addClient, deleteClient, downloadConfig, setPendingRetry, retryPending, apiWithStepUp, setView, loadIncidents, renderIncidents, openIncident, renderIncidentDetail, closeIncidentDetail, loadEvidence, loadMarkers, renderMarkers, addMarker, rearmIncidents, renderIncRuntime, p6View, openP6Devices, loadP6Devices, p6Operate, downloadP6Bundle, renderP6Devices, incidentCopy};'), context);
+  'globalThis.ui = {state, bind, render, loadSession, loadE3Status, loadE3Clients, convergeAfterMutation, renderE3Controls, renderE3Clients, renderMonitorInfo, addClient, deleteClient, downloadConfig, setPendingRetry, retryPending, apiWithStepUp, setView, loadIncidents, renderIncidents, openIncident, renderIncidentDetail, closeIncidentDetail, loadEvidence, loadMarkers, renderMarkers, addMarker, rearmIncidents, renderIncRuntime, p6View, openP6Devices, loadP6Devices, p6Operate, downloadP6Bundle, downloadP6Windows, renderP6Devices, incidentCopy};'), context);
 const ui = context.ui;
 // 0.1.4: the convergence chain (mutation -> one endpoint -> apply) crosses
 // several cross-realm promise reactions; 12 ticks starved it. Drain
@@ -889,7 +889,7 @@ async function main() {
   check('P6: only mutable named clients have Devices / Bundle; existing YAML controls remain', () => {
     assert.doesNotMatch(ids['e3-clients-body'].children[0].textContent, /设备/);
     assert.match(ids['e3-clients-body'].children[1].textContent, /下载.*删除.*设备 \/ 客户端包/);
-    assert.match(ids['p6-device-panel'].textContent, /正式 Windows 安装包尚未发布/);
+    assert.match(ids['p6-device-panel'].textContent, /Windows 程序需由管理员先发布/);
   });
   responses.push(listDevices()); ui.openP6Devices('alice'); await flush();
   check('P6: metadata list is POST plus CSRF without an enrollment key', () => {
@@ -897,7 +897,7 @@ async function main() {
     assert.equal(req.url, '/api/v1/clients/probes/list'); assert.equal(req.method, 'POST');
     assert.equal(req.headers['X-CSRF-Token'], 'csrf'); assert.ok(!('Idempotency-Key' in req.headers));
     assert.deepEqual(JSON.parse(req.body), {name: 'alice'});
-    assert.match(ids['p6-devices-body'].textContent, /登记已确认.*下载客户端包.*撤销上传权限/);
+    assert.match(ids['p6-devices-body'].textContent, /登记已确认.*下载设备配置包.*撤销上传权限/);
   });
   const beforeUrls = createdUrls.length;
   responses.push(fileResponse('fixture ZIP credential bytes')); ui.downloadP6Bundle('laptop-01'); await flush();
@@ -917,7 +917,7 @@ async function main() {
   responses.push(listDevices([{...device, verified: 'pending'}])); ui.loadP6Devices(); await flush();
   check('P6: pending enrollment offers Verify again and cannot download credentials', () => {
     assert.match(ids['p6-devices-body'].textContent, /登记待确认.*重新核验/);
-    assert.doesNotMatch(ids['p6-devices-body'].textContent, /下载客户端包/);
+    assert.doesNotMatch(ids['p6-devices-body'].textContent, /下载设备配置包/);
   });
   responses.push(response({ok: true, data: device}), listDevices());
   ui.p6Operate('resume', {name: 'alice', device: 'laptop-01'}); await flush();
@@ -984,7 +984,7 @@ async function main() {
     assert.match(html, /lang="zh-CN"/); assert.match(html, /概览/); assert.match(html, /客户端管理/);
   });
   check('Chinese setup caveat and recovery warning retain product boundaries', () => {
-    assert.match(ids['p6-device-panel'].textContent, /正式 Windows 安装包尚未发布/);
+    assert.match(ids['p6-device-panel'].textContent, /Windows 程序需由管理员先发布/);
     assert.match(html, /服务器只保存其哈希/);
   });
   check('Chinese transport labels preserve raw identity and protocol data', () => {
@@ -1003,6 +1003,41 @@ async function main() {
     assert.equal(ui.incidentCopy('The evidence records 2 open questions; see the reasons below.'), '证据记录了 2 个待解问题，请查看下方原因。');
     assert.equal(ui.incidentCopy('Future server copy <b>unknown</b>'), 'Future server copy <b>unknown</b>');
   });
-  assert.equal(count, 108, 'UI assertion count guard');
+  ui.p6View.retry = null; setStatus(healthy());
+  const softwareResponse = scope => ({...fileResponse('generic software'), headers: {get: () => scope}});
+  const softwareUrls = createdUrls.length;
+  responses.push(softwareResponse('lab')); ids['p6-windows-download'].click(); await flush();
+  check('Windows software uses separate authenticated POST, empty body, no credential selector', () => {
+    const req = requests.at(-1); assert.equal(req.url, '/api/v1/clients/windows');
+    assert.equal(req.method, 'POST'); assert.deepEqual(JSON.parse(req.body), {});
+    assert.equal(req.headers['X-CSRF-Token'], 'csrf'); assert.ok(!('Idempotency-Key' in req.headers));
+    assert.match(ids['p6-msg'].textContent, /受控测试程序.*不能用于正式发布.*P6Setup.exe/);
+    assert.equal(createdUrls.length, softwareUrls + 1); assert.equal(revokedUrls.at(-1), createdUrls.at(-1));
+    assert.equal(document.body.children.length, 0);
+  });
+  responses.push(softwareResponse('production')); ui.downloadP6Windows(); await flush();
+  check('Production software instructions select a separate device Bundle', () => {
+    assert.match(ids['p6-msg'].textContent, /Windows 程序已下载.*选择该设备的配置包/);
+    assert.doesNotMatch(ids['p6-msg'].textContent, /受控测试/); assert.equal(ui.p6View.busy, false);
+  });
+  responses.push(response({code: 'E_P6_WINDOWS_UNAVAILABLE'}, 503)); ui.downloadP6Windows(); await flush();
+  check('Missing or corrupt signed distribution is explicit and never silently retried', () => {
+    assert.match(ids['p6-msg'].textContent, /管理员发布签名程序包后再下载/);
+    assert.equal(createdUrls.length, softwareUrls + 2); assert.equal(ui.p6View.busy, false);
+  });
+  responses.push(softwareResponse('unexpected')); ui.downloadP6Windows(); await flush();
+  check('Unknown distribution scope cannot become a downloaded release', () => {
+    assert.equal(createdUrls.length, softwareUrls + 2); assert.match(ids['p6-msg'].textContent, /下载失败/);
+  });
+  ui.p6View.retry = {op: 'enroll'};
+  check('Pending enrollment prevents software dispatch too', () => {
+    const n = requests.length; ui.downloadP6Windows(); assert.equal(requests.length, n);
+  });
+  ui.p6View.retry = null; setStatus({...healthy(), transport: 'stale'});
+  check('Stale management disables Windows download button and dispatch', () => {
+    const n = requests.length; ui.renderP6Devices(); ui.downloadP6Windows();
+    assert.equal(requests.length, n); assert.equal(ids['p6-windows-download'].disabled, true);
+  });
+  assert.equal(count, 114, 'UI assertion count guard');
 }
 main().catch(err => { console.error(err); process.exitCode = 1; });

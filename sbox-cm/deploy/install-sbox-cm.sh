@@ -96,6 +96,8 @@ cmd_install() {
     need_file "$SRC_DIR/p6_ingress.py"
     need_file "$SRC_DIR/p6_bundle.py"
     need_file "$SRC_DIR/../monitor-v2/p6_artifact.py"
+    need_file "$SRC_DIR/../monitor-v2/p6_distribution.py"
+    need_file "$SRC_DIR/../tools/publish-p6-windows.py"
     need_file "$SRC_DIR/../tools/build-p6-artifact.py"
     need_file "$SRC_DIR/../lib/client-management.sh"
     need_file "$SRC_DIR/../lib/sbox-cm-state.sh"
@@ -117,6 +119,8 @@ cmd_install() {
     install -m 0644 "$SRC_DIR/p6_provision.py" "$dest_libexec/p6_provision.py" || die "安装 P6 lifecycle worker 失败"
     install -m 0644 "$SRC_DIR/p6_ingress.py" "$dest_libexec/p6_ingress.py" || die "安装 P6 ingress worker 失败"
     install -m 0644 "$SRC_DIR/p6_bundle.py" "$dest_libexec/p6_bundle.py" || die "安装 P6 bundle worker 失败"
+    install -m 0644 "$SRC_DIR/../monitor-v2/p6_distribution.py" "$dest_libexec/p6_distribution.py" || die "安装 Windows distribution validator 失败"
+    install -m 0644 "$SRC_DIR/../tools/publish-p6-windows.py" "$dest_libexec/publish-p6-windows.py" || die "安装 Windows distribution publisher 失败"
     install -m 0644 "$SRC_DIR/../monitor-v2/p6_artifact.py" "$dest_libexec/p6_artifact.py" || die "安装 P6 artifact validator 失败"
     # Public generic code only. No device/YAML/key is ever written here.
     # During a two-file upgrade a mismatched digest refuses export; no stale

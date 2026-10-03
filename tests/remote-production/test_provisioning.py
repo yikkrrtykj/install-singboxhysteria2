@@ -675,4 +675,8 @@ if __name__ == '__main__':
         raise SystemExit(1)
     # The native root CI entry exercises the sensitive download chain too;
     # report its independent count, without rediscovering the original suite.
-    raise SystemExit(subprocess.call([sys.executable, str(ROOT / 'tests/remote-production/test_bundle_linux.py')]))
+    for suite in ('test_bundle_linux.py', 'test_distribution_linux.py'):
+        code = subprocess.call([sys.executable, str(ROOT / 'tests/remote-production' / suite)])
+        if code:
+            raise SystemExit(code)
+    raise SystemExit(0)
