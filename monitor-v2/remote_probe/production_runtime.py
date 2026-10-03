@@ -13,6 +13,8 @@ import threading
 import time
 
 from . import delivery as dl
+from . import direct_probe as dp
+from .production_storage import ProductionSpool
 from .agent import ConfigError, RemoteProbeAgent
 from .mihomo_probe import P6Mihomo
 from .pinned_transport import PinnedHttpsIngest
@@ -24,7 +26,12 @@ DELIVERY_SECONDS = 10.0
 
 
 class ProductionAgent(RemoteProbeAgent):
-    """Only delivery scheduling changes; payload and evidence rules are reused."""
+    """Production scheduling/target policy; payload and evidence rules reused."""
+    def _probe_https(self):
+        if self.config.https_host == "www.gstatic.com":
+            return dp.probe_https("www.gstatic.com", path="/generate_204", expected_status=204)
+        return super()._probe_https()
+
     def deliver(self):
         now = self.monotonic()
         if now < self._delivery_resume_at:
@@ -81,6 +88,7 @@ def make_agent(vault, key, manifest):
     poster = PinnedHttpsIngest(config.ingest_url, vault.read_certificate(key),
                                manifest["certificate_sha256"])
     agent = ProductionAgent(config, mihomo=mihomo, poster=poster,
+                             spool=ProductionSpool(config.spool_dir, security=vault.security),
                              secret_loader=lambda _path: vault.read_secret(key))
     return agent.open()
 

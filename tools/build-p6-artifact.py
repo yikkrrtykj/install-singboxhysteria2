@@ -17,7 +17,7 @@ from p6_artifact import MAX_ARTIFACT_BYTES
 
 AGENT_MODULES = ('__init__.py', '__main__.py', 'agent.py', 'delivery.py',
     'direct_probe.py', 'evidence.py', 'mihomo_probe.py', 'payload.py',
-    'pinned_transport.py', 'production.py', 'production_runtime.py',
+    'pinned_transport.py', 'production.py', 'production_runtime.py', 'production_storage.py',
     'profiles.py', 'service_host.py', 'spool.py', 'windows_security.py')
 
 

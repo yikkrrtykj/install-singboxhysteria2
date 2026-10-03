@@ -122,6 +122,19 @@ class SnapshotTests(FixtureBase):
         self.assertNotIn('LOCAL-CANARY', json.dumps(value))
         self.assertEqual(value['service_state'], 4)
 
+    def test_closed_egress_detail_and_configured_cadence_without_ip(self):
+        record = self.record(3)
+        sample = json.loads(base64.b64decode(record['body_b64']))
+        sample['egress'] = {'status': 'failed', 'latency_ms': None,
+                            'error_code': 'connect_failed', 'ip': None, 'change': 'unknown'}
+        record['body_b64'] = base64.b64encode(canonical(sample)).decode()
+        value = latest_sample(canonical(record) + b'\n', 'device-one')
+        self.assertEqual(value['egress_error_code'], 'connect_failed')
+        self.assertIsNone(value['egress_latency_ms'])
+        self.assertNotIn('ip', value)
+        self.assertNotIn('egress', value)
+        self.assertEqual(snapshot(self.manager, self.reader)['profiles'][0]['cadence_seconds'], 60)
+
     def test_pending_intent_is_observed_and_preserved(self):
         for name in ('upgrade.json', 'uninstall.json'):
             self.vault._write(str(self.root), name, b'{"v":1,"intent":"do-not-recover"}')

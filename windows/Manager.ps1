@@ -76,6 +76,11 @@ function P6Token($Value) {
         'ok' {'正常'} 'timeout' {'超时'} 'unavailable' {'不可用'} 'invalid' {'配置无效'}
         'failed' {'失败'} 'active_delay' {'主动测试'} 'passive_cache' {'缓存观察'}
         'reality' {'Reality'} 'hy2' {'Hysteria2'}
+        'sharing_violation' {'文件暂被占用'}
+        'permission_denied' {'写入权限不足'}
+        'disk_full' {'磁盘空间不足'}
+        'io_error' {'本地读写失败'}
+        'state_invalid' {'本地状态无效'}
         default {if ([string]$Value -match '^[A-Za-z0-9_-]{1,64}$') {[string]$Value} else {'未知'}}
     }
 }
@@ -105,7 +110,12 @@ function Update-P6Selection {
                 Add-P6Row '尚未解决的记录跨度' ([string]$s.unresolved_record_span) '不是精确待上传条数'
                 Add-P6Row '正在重试的记录' ([string]$s.tracked_retry_records) ''
                 Add-P6Row '已隔离 / 过期 / 容量丢弃' "$($s.quarantined_total) / $($s.expired_total) / $($s.budget_dropped_total)" ''
-                Add-P6Row '损坏 / 状态写入失败' "$($s.corrupt_total) / $($s.state_save_failures)" ''
+                $storageNote='累计次数，不表示当前仍在失败'
+                if ($s.PSObject.Properties['storage_diagnostics'] -and $s.storage_diagnostics) {
+                    $storageNote+='；最近原因：'+(P6Token $s.storage_diagnostics.last_failure)
+                    Add-P6Row '文件占用重试' ([string]$s.storage_diagnostics.sharing_retries) '累计次数，最多两次短暂重试'
+                } elseif ($s.state_save_failures -gt 0) {$storageNote+='；旧版本未记录原因'}
+                Add-P6Row '损坏 / 状态写入失败' "$($s.corrupt_total) / $($s.state_save_failures)" $storageNote
             } else {Add-P6Row '上传计数' '暂时无状态文件' ''}
             if ($profile.sample) {
                 $sample = $profile.sample
@@ -116,7 +126,8 @@ function Update-P6Selection {
                     $delay = if ($null -ne $value.latency_ms) {[string]$value.latency_ms + ' ms'} else {P6Token $value.error_code}
                     Add-P6Row $slot[0] (P6Token $value.status) $delay
                 }
-                Add-P6Row '公网出口' (P6Token $sample.egress_status) ''
+                $egressDetail=if ($sample.PSObject.Properties['egress_error_code']) {P6Token $sample.egress_error_code} else {''}
+                Add-P6Row '公网出口' (P6Token $sample.egress_status) $egressDetail
                 Add-P6Row 'Clash API' (P6Token $sample.mihomo_api.status) ''
                 foreach ($value in @($sample.active)) {
                     $delay = if ($null -ne $value.delay_ms) {[string]$value.delay_ms + ' ms'} else {'—'}
@@ -157,7 +168,12 @@ function Refresh-P6Status {
         $script:p6Buttons['import'].Enabled=[bool]$status.installed -and -not $script:p6Pending
         $script:p6Buttons['uninstall'].Enabled=[bool]$status.installed -and @($status.profiles).Count -eq 0 -and -not $script:p6Pending
         $script:p6Buttons['rollback'].Enabled=[bool]$status.installed -or $script:p6Pending
-        $script:p6Notice.Text='最后刷新：' + [DateTime]::Now.ToString('HH:mm:ss') + '。本地采样不证明某一条已在 VPS 入库，也不推断故障原因。'
+        $cadence=60
+        if ($script:p6Profiles.SelectedIndex -ge 0) {
+            $selectedValue=$script:p6Entries[$script:p6Profiles.SelectedIndex].value
+            if ($selectedValue -and $selectedValue.PSObject.Properties['cadence_seconds']) {$cadence=$selectedValue.cadence_seconds}
+        }
+        $script:p6Notice.Text='状态每 15 秒刷新，采样间隔 '+$cadence+' 秒；刷新不会立即检测或上传。最后刷新：'+[DateTime]::Now.ToString('HH:mm:ss')+'。本机确认不替代 VPS 入库核对。'
     } catch {
         $script:p6Heading.Text='暂时无法读取状态，请稍后刷新。现有服务和队列未被刷新操作修改。'
         $script:p6Pending=$true

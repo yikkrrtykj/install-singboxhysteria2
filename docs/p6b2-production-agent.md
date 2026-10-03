@@ -551,3 +551,74 @@ nginx ingress still exposes only the existing machine ingest route.
 Production signer and actual signed GUI delivery/test-VPS publication remain
 pending. A server code update does not manufacture a signed EXE. PR #70 remains
 Draft; no merge, production deployment, P6C/P6D or whole P6B2 PASS is claimed.
+
+
+### P6B2 field repair boundary — HTTPS target and local storage diagnostics (2026-10-03)
+
+The human authorized continuing field repairs after the real offline/reconnect
+screenshots. This narrow amendment supersedes the earlier blanket P6A source
+zero-diff restriction only for the following two compatibility hooks: the base
+collector may dispatch its HTTPS slot through an overridable method whose base
+behavior remains exactly GET / + HTTP 200; the shared HTTPS primitive may accept
+one explicit expected status (200 or 204, never arbitrary 2xx). Existing P6A
+defaults/tests, TLS validation, deadlines/response bounds, wire payload/HMAC,
+sample meaning, server store/retention/History/classifier remain unchanged.
+
+Production HTTPS for the already generated https_host=www.gstatic.com is fixed
+to https://www.gstatic.com/generate_204, exact HTTP 204 success. The hostname
+and immutable profile bytes/identity/keys stay unchanged; path/status are
+compiled production policy, not user/body input. Other previously supported
+HTTPS hosts retain / + 200 semantics. No redirects, proxy fallback, arbitrary
+URL/status, certificate weakening or reserialization of queued records.
+A bounded normal-TLS foreground request on this PC returned 204 with zero body
+bytes; it is not a LocalSystem/TUN acceptance proof. Reference: Chromium's
+reviewed generate_204 connectivity endpoint history:
+https://chromium.googlesource.com/chromium/src/+/0307e728703a96f6c86b35e705937e85821cde0d
+
+Keep P6A spool.py byte-identical. A production-only Spool subclass may retry
+Windows sharing/lock violations (native codes 32/33) at most twice with 20/50ms
+delays. No retries for permission, disk, fsync, schema or unknown failure; no
+deletion, DACL weakening, cursor reset or acknowledgment before durable retry
+accounting. Preserve inherited hard/soft failure and rollback semantics.
+Add optional bounded local-only diagnostics to spool state: last closed failure
+class and cumulative sharing retry count, no raw errors/paths/keys/bodies.
+Persist diagnostics on the next successful state write; permanent storage
+failure cannot be claimed durably recorded. Legacy state without diagnostics
+remains supported; historical failures retain their count and unknown cause.
+This is robustness plus diagnosis, not proof that sharing caused the field
+state_save_failures=1. Include actual native Windows held-file/read-sharing tests.
+
+Windows read-only snapshot may expose those closed diagnostics plus existing
+egress error_code/latency only; never the egress IP/body. Explain 15-second status
+refresh versus configured collection cadence in the UI, and that refreshing
+does not initiate sampling/upload. Keep snapshot mutation-free. No endpoint
+replacement/proxying to force egress green; exact field egress cause remains
+pending. No new enrollment/profile mutation/SCM change/signing trust or test
+deployment in this source repair. Batch a new signed lab build only after tests.
+PR #70 remains Draft; whole COMPLETE/final review/MERGE/production deploy/P6C/P6D
+remain NO. Reboot/TUN/multi-profile/resource/retirement acceptance still pending.
+
+
+### Field repair native replacement refinement (2026-10-03)
+
+Actual isolated native Windows tests on this PC reproduced os.replace /
+MoveFileExW failure (native 5) while a target reader had FILE_SHARE_READ |
+FILE_SHARE_WRITE | FILE_SHARE_DELETE. ReplaceFileW with flags=0 succeeded
+under the same shared reader, and refused an exclusive reader with native 32.
+This establishes a concurrency defect compatible with the GUI workload, not
+proof of the one historical field failure's cause.
+
+The production-only state persistence adapter therefore uses the existing
+canonical-size/open_restricted/complete-write/fsync-before-publication sequence,
+then ReplaceFileW(flags=0, no backup, no IGNORE_ACL/MERGE_ERRORS flags) for an
+existing regular non-link target. Initial absent target keeps os.replace.
+Validate source/target components and regular objects before publication.
+Never delete an existing target or fall back to overwrite on refusal. Only
+native 32/33 get the already bounded two retries; native 5 remains a refusal.
+Preserve target ACL, inherited hard retry rollback/soft failure counting, exact
+queued bodies and the P6A spool source. Do not claim stronger power-loss metadata
+durability than the existing Windows fsync/publication contract. Require native
+shared-reader success, locked-reader refusal/recovery, transient-lock success,
+old/new cursor readability, retained DACL, and permission/fsync refusal tests.
+Microsoft API reference:
+https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-replacefilew

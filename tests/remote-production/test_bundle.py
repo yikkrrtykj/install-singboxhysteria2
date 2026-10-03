@@ -76,7 +76,9 @@ class BundleTests(unittest.TestCase):
     def test_generic_contains_reviewed_source_only_and_no_credentials(self):
         with zipfile.ZipFile(io.BytesIO(self.generic)) as archive:
             names = set(archive.namelist())
-            self.assertEqual(len(names), 18)
+            self.assertEqual(len(names), 19)
+            self.assertEqual(archive.read('remote_probe/production_storage.py'),
+                             (ROOT / 'monitor-v2/remote_probe/production_storage.py').read_bytes().replace(b'\r\n', b'\n'))
             self.assertEqual(archive.read('remote_probe/production.py'),
                              (ROOT / 'monitor-v2/remote_probe/production.py').read_bytes().replace(b'\r\n', b'\n'))
             self.assertEqual(archive.read('mihomo/client.py'),

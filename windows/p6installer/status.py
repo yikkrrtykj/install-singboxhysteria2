@@ -7,6 +7,7 @@ import re
 
 from remote_probe.agent import ConfigError
 from remote_probe.payload import validate_sample
+from remote_probe.production_storage import closed_diagnostics, DIAGNOSTIC_KEY
 from remote_probe.windows_security import StorageSecurityError
 from .bundle import object_json, validate_display, DISPLAY_LIMIT
 
@@ -65,6 +66,7 @@ def summarize_spool(raw):
     retry = state.get('retry_attempts')
     if type(retry) is not dict or len(retry) > 8192:
         raise ConfigError('local observation invalid')
+    result['storage_diagnostics'] = closed_diagnostics(state.get(DIAGNOSTIC_KEY))
     result['tracked_retry_records'] = len(retry)
     # This is deliberately not described as the exact number of pending records.
     result['unresolved_record_span'] = result['next_record_id'] - 1 - result['resolved_through']
@@ -91,6 +93,8 @@ def latest_sample(raw, probe):
                 continue
             result = {k: sample[k] for k in ('sample_epoch', 'seq', 'dns', 'https', 'vps_tcp', 'mihomo_api', 'active')}
             result['egress_status'] = sample['egress']['status']
+            result['egress_error_code'] = sample['egress']['error_code']
+            result['egress_latency_ms'] = sample['egress']['latency_ms']
             return result
         except (ValueError, TypeError, KeyError, AttributeError, ConfigError):
             continue
@@ -130,7 +134,8 @@ def snapshot(manager, reader=None):
             path = Path(manager.vault._path(key)) / 'spool'
             manager.security.validate(str(path), True)
             profile = {'id': key, 'probe_id': manifest['probe_id'], 'server_id': manifest['server_id'],
-                       'enabled': manager.vault.enabled(key), 'spool': None, 'sample': None}
+                       'enabled': manager.vault.enabled(key), 'cadence_seconds': manifest['agent'].get('cadence', 60),
+                       'spool': None, 'sample': None}
             display_path=Path(manager.vault._path(key))/'display.json'
             if os.path.lexists(display_path):
                 profile['display']=validate_display(object_json(read(display_path,DISPLAY_LIMIT)),manifest)

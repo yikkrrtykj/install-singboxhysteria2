@@ -180,9 +180,11 @@ def probe_dns(host, port=443, budget=DNS_TIMEOUT_SECONDS):
 
 
 def probe_https(host, path="/", port=443, budget=HTTPS_TIMEOUT_SECONDS,
-                context=None):
+                context=None, expected_status=200):
     """Direct HTTPS request with NORMAL TLS validation (a failed certificate
     is a failure, never silently accepted)."""
+    if type(expected_status) is not int or expected_status not in (200, 204):
+        return _failed(ERR_UNAVAILABLE)
     start = _now()
 
     def request():
@@ -212,7 +214,7 @@ def probe_https(host, path="/", port=443, budget=HTTPS_TIMEOUT_SECONDS,
         return _failed(ERR_UNAVAILABLE)
     if not completed:
         return _failed(ERR_TIMEOUT)
-    if status != 200:
+    if status != expected_status:
         return _failed(ERR_BAD_RESPONSE)
     return _slot(STATUS_OK, _latency_ms(start))
 
