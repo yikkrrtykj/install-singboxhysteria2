@@ -59,7 +59,11 @@ internal static class P6Launcher {
             using (var shell = PowerShell.Create()) {
                 shell.Runspace = space;
                 shell.AddScript(code, false).AddParameter("Operation", "gui").Invoke();
-                if (shell.HadErrors) {
+                // The UI handles recoverable refresh/operation diagnostics.
+                // HadErrors is an invocation-history flag, not its final result.
+                // Unhandled errors and the explicit hosted setup exit still fail.
+                // The pre-UI signature gate above remains strictly HadErrors-based.
+                if (shell.Streams.Error.Count != 0) {
                     stage = "ui_pipeline";
                     if (shell.Streams.Error.Count > 0) stage += "_" + shell.Streams.Error[0].CategoryInfo.Category.ToString();
                     throw new InvalidOperationException();
