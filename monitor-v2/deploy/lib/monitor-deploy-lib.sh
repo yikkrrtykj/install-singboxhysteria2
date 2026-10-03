@@ -681,6 +681,10 @@ sbmon_stage_release() { # sbmon_stage_release <version> -> prints release id on 
     [ -d "$SBMON_REPO_MONITOR_DIR/web" ] || sbmon_die "缺少 web/: $SBMON_REPO_MONITOR_DIR"
     cp -- "$SBMON_REPO_MONITOR_DIR/collector.py" "$staged/app/monitor-v2/"
     cp -- "$SBMON_REPO_MONITOR_DIR/webapp.py" "$staged/app/monitor-v2/"
+    [ -f "$SBMON_REPO_MONITOR_DIR/p6_distribution.py" ] || sbmon_die "missing Windows distribution validator"
+    cp -- "$SBMON_REPO_MONITOR_DIR/p6_distribution.py" "$staged/app/monitor-v2/" || sbmon_die "Windows distribution validator copy failed"
+    [ -f "$SBMON_REPO_MONITOR_DIR/p6_artifact.py" ] || sbmon_die "missing P6 bundle artifact validator"
+    cp -- "$SBMON_REPO_MONITOR_DIR/p6_artifact.py" "$staged/app/monitor-v2/" || sbmon_die "P6 artifact validator copy failed"
     cp -R -- "$SBMON_REPO_MONITOR_DIR/api_bridge" "$staged/app/monitor-v2/api_bridge"
     rm -rf -- "$staged/app/monitor-v2/api_bridge/__pycache__"
     cp -R -- "$SBMON_REPO_MONITOR_DIR/web" "$staged/app/monitor-v2/web"
@@ -755,6 +759,8 @@ sbmon_stage_release() { # sbmon_stage_release <version> -> prints release id on 
     local -a py_targets=(
         "$staged/app/monitor-v2/collector.py"
         "$staged/app/monitor-v2/webapp.py"
+        "$staged/app/monitor-v2/p6_artifact.py"
+        "$staged/app/monitor-v2/p6_distribution.py"
         "$staged/app/monitor-v2/api_bridge/"*.py
         "$staged/app/monitor-v2/web/"*.py
         "$staged/$DIAGNOSTICS_REL/"*.py)

@@ -92,7 +92,7 @@ w_audit() { # <outcome> <stage> [error_code] -> rc 0 durable-or-present
     # process+nonce suffix makes each export attempt auditable on its own.
     # Mutation semantics are untouched: their GEN is journal-bound and
     # reconciliation looks them up by the deterministic request_id:gen key.
-    if [ "${OP:-}" = "client.export" ]; then
+    if [ "${OP:-}" = "client.export" ] || [ "${OP:-}" = "client.bundle" ] || [[ "${OP:-}" == probe.* ]]; then
         audit_id="${audit_id}:$(date +%s%N)-$$-${RANDOM}"
     fi
     if cm_audit_has "$audit_id"; then return 0; fi
@@ -100,13 +100,15 @@ w_audit() { # <outcome> <stage> [error_code] -> rc 0 durable-or-present
     jq -cn --arg rid "${REQ_ID:-}" --arg op "${OP:-}" --arg name "${NAME:-}" \
            --arg outcome "$outcome" --arg stage "$stage" --arg kfp "$kfp" \
            --arg err "$err" --arg sfp "${ACTOR_SESSION_FP:-}" --arg ufp "${ACTOR_STEPUP_FP:-}" \
-           --argjson gen "${GEN:-0}" \
+           --argjson gen "${GEN:-0}" --arg device "$(w_arg device)" \
         '{request_id:$rid, op:$op, name:$name, outcome:$outcome, stage:$stage,
           key_fp:(if $kfp=="" then null else $kfp end), generation:$gen,
           error:(if $err=="" then null else $err end),
           actor:{session_fp:(if $sfp=="" then null else $sfp end),
                  stepup_fp:(if $ufp=="" then null else $ufp end)},
-          source:"worker"}' \
+          source:"worker"}
+          + (if $op == "client.bundle" or ($op | startswith("probe."))
+             then {device:(if $device=="" then null else $device end)} else {} end)' \
         | cm_audit_append "$audit_id" || { warning "审计写入失败（保留 journal，由调和补齐）"; return 1; }
     return 0
 }
@@ -236,6 +238,61 @@ live_config_ready() {
     [ -f "$SB_SERVER_CONFIG" ] || return 1
     jq empty "$SB_SERVER_CONFIG" >/dev/null 2>&1 || return 1
     return 0
+}
+
+# P6B2 lifecycle has its own root-only desired-state ledger. Proxy credentials
+# remain owned by the canonical Client engine. Only a credential DIGEST crosses
+# this internal pipe, never UUID/password; all P6 responses are non-secret.
+p6_call() { # <enroll|revoke|retire|list> <non-secret argument JSON>
+    local script
+    script="$(cd -- "$(dirname -- "$0")" && pwd)/p6_provision.py"
+    printf '%s' "$2" | python3 -I "$script" "$1"
+}
+
+p6_retire_before_delete() { # <credential digest of the object being deleted>
+    local response args
+    local state="${SB_P6_STATE_DIR:-/var/lib/sbox-cm/p6}/devices.json"
+    # Existing non-P6 Client deletion remains unchanged. config.lock prevents
+    # enrollment from racing this absent-state check.
+    if [ ! -e "$state" ] && [ ! -L "$state" ]; then return 0; fi
+    args="$(jq -cn --arg name "$NAME" --arg gen "$1" '{name:$name,client_generation:$gen}')"
+    response="$(p6_call retire "$args")" || return 1
+    printf '%s' "$response" | jq -e '.ok == true and .data.revoked == true' >/dev/null 2>&1
+}
+
+_probe_locked() {
+    if ! live_config_ready || [ "$(cm_management_state "$SB_SERVER_CONFIG")" != "active" ] || cm_degraded_active; then
+        err_exit rejected E_ACTIVATION_STATE activation false "管理面未就绪，拒绝 probe 操作"
+    fi
+    local args="$ARGS_JSON" verb gen response code
+    case "$OP" in
+        probe.enroll|probe.resume)
+            client_name_exists "$NAME" "$SB_SERVER_CONFIG" || err_exit rejected E_NOT_FOUND revalidate false "Client 不存在"
+            gen="$(cm_old_cred_digest "$SB_SERVER_CONFIG" "$NAME")" || err_exit rejected E_CONFIG_INCONSISTENT revalidate false "Client 代次无法验证"
+            args="$(printf '%s' "$args" | jq -c --arg gen "$gen" '. + {client_generation:$gen}')"
+            if [ "$OP" = "probe.resume" ]; then verb=resume; else verb=enroll; fi ;;
+        probe.revoke) verb=revoke ;;
+        probe.list) verb=list ;;
+    esac
+    response="$(p6_call "$verb" "$args")" || err_exit uncertain E_P6_UNAVAILABLE provisioning true "P6 状态未确认，可重试"
+    if ! printf '%s' "$response" | jq -e '.ok == true' >/dev/null 2>&1; then
+        code="$(printf '%s' "$response" | jq -r '.code // "E_P6_UNAVAILABLE"')"
+        err_exit uncertain "$code" provisioning true "P6 状态未确认，可重试"
+    fi
+    # P6 ledger/proof are durable first; audit failure cannot produce success.
+    w_audit ok provisioning "" || { emit_err E_AUDIT_UNAVAILABLE provisioning true "审计未落盘，可重试" ""; exit 0; }
+    emit_ok "$(printf '%s' "$response" | jq -c '.data')" null '[]'
+    exit 0
+}
+
+op_probe() {
+    NAME="$(w_arg name)"
+    KEY="$(w_arg idempotency_key)"
+    validate_client_name "$NAME" || err_exit rejected E_SCHEMA parse false "name 非法"
+    [ "$NAME" != "$RESERVED_CLIENT_NAME" ] || err_exit rejected E_RESERVED_NAME parse false "legacy 是保留名称"
+    cm_state_init || err_exit rejected E_INTERNAL parse false "状态目录初始化失败"
+    with_client_lock _probe_locked
+    err_exit rejected E_LOCK lock true "配置锁不可用或超时"
 }
 
 add_success_data() { # <name>
@@ -443,6 +500,58 @@ op_client_export() {
     err_exit rejected E_LOCK lock true "配置锁不可用或超时（fail-closed）"
 }
 
+# Bundle is another sensitive read. Canonical config.lock spans both the
+# renderer and the current-generation P6 lookup, preventing mixed-generation
+# YAML/key delivery during concurrent Client delete/recreate.
+_bundle_locked() {
+    local problems rendered yaml gen server_ip vps_port response script code
+    if ! live_config_ready || ! problems="$(candidate_problems "$SB_SERVER_CONFIG")" || [ -n "$problems" ]; then
+        err_exit rejected E_CONFIG_INCONSISTENT revalidate false "Client 结构无法验证"
+    fi
+    if [ "$(cm_management_state "$SB_SERVER_CONFIG")" != "active" ] || cm_degraded_active; then
+        err_exit rejected E_ACTIVATION_STATE activation false "管理面未就绪"
+    fi
+    client_name_exists "$NAME" "$SB_SERVER_CONFIG" || err_exit rejected E_NOT_FOUND revalidate false "Client 不存在"
+    gen="$(cm_old_cred_digest "$SB_SERVER_CONFIG" "$NAME")" || err_exit rejected E_CONFIG_INCONSISTENT revalidate false "Client 代次无法验证"
+    if ! rendered="$(cm_render_client_mihomo_yaml "$NAME" "$SB_SERVER_CONFIG" && printf X)"; then
+        err_exit rejected E_CONFIG_INCONSISTENT revalidate false "Client 配置无法导出"
+    fi
+    yaml="${rendered%X}"
+    server_ip="$(grep -o "SERVER_IP='[^']*'" "$SB_STATE_FILE" | awk -F"'" '{print $2}')"
+    vps_port="$(jq -r --arg tag "$REALITY_INBOUND_TAG" '.inbounds[] | select(.tag == $tag) | .listen_port' "$SB_SERVER_CONFIG")"
+    script="$(cd -- "$(dirname -- "$0")" && pwd)/p6_bundle.py"
+    # Only non-secret metadata rides jq argv. YAML and all returned secrets
+    # remain in pipes/process memory; no ZIP or credential temporary file.
+    if ! response="$(printf '%s' "$yaml" | jq -Rsc --arg name "$NAME" --arg device "$(w_arg device)" \
+            --arg gen "$gen" --arg ip "$server_ip" --argjson port "$vps_port" \
+            '{name:$name,device:$device,client_generation:$gen,yaml:.,server_ip:$ip,vps_port:$port}' \
+            | python3 -I "$script")"; then
+        err_exit rejected E_P6_UNAVAILABLE export true "资料包准备失败"
+    fi
+    if ! printf '%s' "$response" | jq -e '.ok == true' >/dev/null 2>&1; then
+        code="$(printf '%s' "$response" | jq -r '.code // "E_P6_UNAVAILABLE"')"
+        err_exit rejected "$code" export true "资料包无法交付"
+    fi
+    if [ "$(printf '%s' "$response" | wc -c | tr -d ' ')" -gt 64512 ]; then
+        err_exit rejected E_P6_CAPACITY export false "资料包材料超出帧上限"
+    fi
+    # Audit must become durable before the sensitive response can leave root.
+    w_audit ok export "" || err_exit rejected E_AUDIT_UNAVAILABLE export true "审计未落盘，拒绝交付"
+    printf '%s' "$response"
+    exit 0
+}
+
+op_client_bundle() {
+    GEN=0
+    NAME="$(w_arg name)"
+    validate_client_name "$NAME" || err_exit rejected E_SCHEMA parse false "name 非法"
+    [ "$NAME" != "$RESERVED_CLIENT_NAME" ] || err_exit rejected E_RESERVED_NAME parse false "legacy 是保留名称"
+    validate_client_name "$(w_arg device)" || err_exit rejected E_SCHEMA parse false "device 非法"
+    cm_state_init || err_exit rejected E_INTERNAL parse false "状态目录初始化失败"
+    with_client_lock _bundle_locked
+    err_exit rejected E_LOCK lock true "配置锁不可用或超时"
+}
+
 # ------------------------------------------------------------- add --
 _add_locked() {
     local cfg="$SB_SERVER_CONFIG" problems digest rec
@@ -633,6 +742,7 @@ _delete_locked() {
             # The outcome MUST be durable before success is reported (F15) and
             # derived cleanup is reported for what it actually did.
             GEN="${rec_gen:-1}"
+            p6_retire_before_delete "$rec_cred" || err_exit uncertain E_P6_REVOKE_PENDING provisioning true "P6 撤销未确认，Delete Client 未完成；同一 key 重试"
             local derived=true
             if [ -d "$SB_CLIENTS_DIR/$NAME" ]; then
                 rm -rf -- "${SB_CLIENTS_DIR:?}/$NAME" 2>/dev/null || derived=false
@@ -677,6 +787,10 @@ _delete_locked() {
     if ! old_cred="$(cm_old_cred_digest "$cfg" "$NAME")"; then
         err_exit rejected E_CONFIG_INCONSISTENT revalidate false "无法读取现有客户端凭据摘要"
     fi
+
+    # Separate durable operations: failure here keeps the proxy account and
+    # deletion ledger intact; P6 retirement is retried, never falsely complete.
+    p6_retire_before_delete "$old_cred" || err_exit uncertain E_P6_REVOKE_PENDING provisioning true "P6 撤销未确认，Client 保留；同一 key 重试"
 
     # ---- durable delete intent ----
     if ! cm_ledger_append_intent "$KEY" "client.delete" "$NAME" "$digest" "$GEN" "$REQ_ID" \
@@ -1000,7 +1114,7 @@ main() {
 
     case "$OP" in
         management.status|management.activate|management.deactivate|\
-        client.list|client.add|client.delete|client.export) : ;;
+        client.list|client.add|client.delete|client.export|client.bundle|probe.enroll|probe.revoke|probe.list|probe.resume) : ;;
         *) emit_err "E_OP_UNKNOWN" "parse" false "未知操作" ""; exit 0 ;;
     esac
 
@@ -1019,6 +1133,8 @@ main() {
         client.add)            op_client_add ;;
         client.delete)         op_client_delete ;;
         client.export)         op_client_export ;;
+        client.bundle)         op_client_bundle ;;
+        probe.enroll|probe.revoke|probe.list|probe.resume) op_probe ;;
         management.activate)   op_management_activate ;;
         management.deactivate) op_management_deactivate ;;
     esac

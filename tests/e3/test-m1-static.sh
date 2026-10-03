@@ -60,12 +60,12 @@ wantnt "$DAEMON" 'AF_INET6' 'daemon has no IPv6 address family'
 # The "no kill timer" contract is asserted with a real AST walk in
 # m1-rpc-probe.py (a grep cannot distinguish code from the docstring).
 
-printf '\n== fixed op surface (seven, no extras) ==\n'
-ops="$(sed -n '/^OPS = {/,/^}/p' "$DAEMON" | grep -oE '"(management|client)\.[a-z]+"' | sort -u)"
+printf '\n== fixed op surface (twelve, no extras) ==\n'
+ops="$(sed -n '/^OPS = {/,/^}/p' "$DAEMON" | grep -oE '"(management|client|probe)\.[a-z]+"' | sort -u)"
 n="$(printf '%s\n' "$ops" | grep -c . || true)"
-[ "$n" = "7" ] && pass 'exactly seven RPC ops are declared' || fail "op surface is $n (want 7)"
+[ "$n" = "12" ] && pass 'exactly twelve RPC ops are declared' || fail "op surface is $n (want 12)"
 for op in management.status management.activate management.deactivate \
-          client.list client.add client.delete client.export; do
+          client.list client.add client.delete client.export client.bundle probe.enroll probe.revoke probe.list probe.resume; do
     printf '%s\n' "$ops" | grep -qxF "\"$op\"" && pass "op present: $op" || fail "op missing: $op"
 done
 for banned in client.rotate client.get run exec shell argv; do
@@ -92,14 +92,14 @@ want "$SERVICE_UNIT" 'ProtectSystem=strict' 'ProtectSystem=strict'
 want "$SERVICE_UNIT" 'ProtectHome=read-only' 'ProtectHome=read-only'
 want "$SERVICE_UNIT" 'PrivateTmp=yes' 'PrivateTmp=yes'
 want "$SERVICE_UNIT" 'NoNewPrivileges=yes' 'NoNewPrivileges=yes'
-want "$SERVICE_UNIT" 'RestrictAddressFamilies=AF_UNIX' 'AF_UNIX only'
-want "$SERVICE_UNIT" 'ReadWritePaths=/run/sbox-cm /root/sbox /var/lib/sbox-cm' \
-     'exactly the three writable trees'
-want "$SERVICE_UNIT" 'CapabilityBoundingSet=CAP_KILL CAP_DAC_OVERRIDE' 'minimal capability set'
-if grep -vE '^[[:space:]]*#' "$SERVICE_UNIT" | grep -qF 'CAP_CHOWN'; then
-    fail 'CAP_CHOWN granted (socket activation should make it unnecessary)'
+want "$SERVICE_UNIT" 'RestrictAddressFamilies=AF_UNIX AF_INET' 'RPC Unix and loopback proof families only'
+want "$SERVICE_UNIT" 'ReadWritePaths=/run/sbox-cm /root/sbox /var/lib/sbox-cm -/run/systemd -/etc/singbox-monitor' \
+     'only Client/state/systemd and P6 authority paths writable'
+want "$SERVICE_UNIT" 'CapabilityBoundingSet=CAP_KILL CAP_DAC_OVERRIDE CAP_CHOWN' 'bounded capabilities including P6 file group ownership'
+if grep -qFx 'IPAddressDeny=any' "$SERVICE_UNIT" && grep -qFx 'IPAddressAllow=localhost' "$SERVICE_UNIT"; then
+    pass 'IP proof restricted to localhost'
 else
-    pass 'CAP_CHOWN not needed (socket activation owns the socket)'
+    fail 'external IP access not denied'
 fi
 want "$SERVICE_UNIT" 'User=root' 'service runs as root'
 

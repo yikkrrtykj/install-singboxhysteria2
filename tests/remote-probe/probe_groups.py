@@ -457,20 +457,33 @@ def group_boundary():
     out["mihomo_surface_has_no_mutation_verb"] = not any(
         ('"%s"' % verb) in mihomo_src or ("'%s'" % verb) in mihomo_src
         for verb in ("PUT", "POST", "PATCH", "DELETE"))
-    # The single POST in the tree is the machine ingestion call to the frozen
-    # path, issued by the delivery client -- never against Mihomo.
+    # P6B2 adds pinned TLS alongside the original delivery transport. Both
+    # callers must still use the same frozen URL validator/path, never Mihomo.
+    import ast
     posts = []
     for path in glob.glob(os.path.join(ROOT, "monitor-v2", "remote_probe",
                                        "*.py")):
         text = open(path, encoding="utf-8").read()
         if 'conn.request("POST"' in text:
             posts.append(os.path.basename(path))
+    ingest_sources = [open(os.path.join(ROOT, "monitor-v2", "remote_probe", name),
+                           encoding="utf-8").read()
+                      for name in ("delivery.py", "pinned_transport.py")]
+    post_nodes = [node for text in ingest_sources for node in ast.walk(ast.parse(text))
+                  if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                  and node.func.attr == "request"]
     out["only_the_frozen_ingest_post_exists"] = (
-        posts == ["delivery.py"]
+        sorted(posts) == ["delivery.py", "pinned_transport.py"]
         and rp.INGEST_METHOD == "POST"
-        and "INGEST_PATH" in open(os.path.join(
-            ROOT, "monitor-v2", "remote_probe", "delivery.py"),
-            encoding="utf-8").read())
+        and len(post_nodes) == 2
+        and all(len(node.args) >= 2 and isinstance(node.args[0], ast.Constant)
+                and node.args[0].value == "POST"
+                and isinstance(node.args[1], ast.Attribute)
+                and isinstance(node.args[1].value, ast.Name)
+                and node.args[1].value.id == "self" and node.args[1].attr == "path"
+                for node in post_nodes)
+        and all("classify_url(url)" in text for text in ingest_sources)
+        and "path != INGEST_PATH" in ingest_sources[0])
     out["p6_surface_exposes_named_ops_only"] = all(
         hasattr(mp.P6Mihomo, name)
         for name in ("version", "proxies", "delay"))
@@ -2557,7 +2570,11 @@ def group_contract():
     # modules), no OTHER web file may, and the PR-6C incident read
     # route still does not exist anywhere.
     allowed_names = {"server.py", "remote_ingest.py",
-                     "remote_registry.py", "remote_store.py"}
+                     "remote_registry.py", "remote_store.py", "p6_bundle.py"}
+    # P6B2 adds one passive profile/ZIP validator that names the frozen URL.
+    # It implements no ingest or incident read route; portable bundle tests
+    # execute assembly with socket/connection creation forbidden. All other
+    # web modules remain outside this exact set and PR-6C stays refused.
     server_hits = []
     scope_violations = []
     for path in (os.path.join(ROOT, "monitor-v2", "web"),

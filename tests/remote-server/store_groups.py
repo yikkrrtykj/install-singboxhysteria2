@@ -279,7 +279,10 @@ def group_capacity():
             setattr(store,attr,previous)
             out[name+"_automatically_recovers"] = plane.status()["suspended_probes"] == []
         # Retired registry mapping still consumes live continuity capacity.
-        plane.registry.entries.clear()
+        # P6B2 reloads live authority; retire the mapping on disk rather than
+        # clearing a cached dictionary that the next read correctly replaces.
+        with open(plane.registry.config_path, 'w', encoding='utf-8') as handle:
+            json.dump({'v': 1, 'probes': []}, handle)
         store.max_receipts_global = 1
         out["retired_mapping_continuity_still_counts"] = (
             store.status()["receipt_count"] == 1 and store.status()["capacity_code"] == "remote_receipt_capacity"

@@ -180,9 +180,11 @@ def probe_dns(host, port=443, budget=DNS_TIMEOUT_SECONDS):
 
 
 def probe_https(host, path="/", port=443, budget=HTTPS_TIMEOUT_SECONDS,
-                context=None):
+                context=None, expected_status=200):
     """Direct HTTPS request with NORMAL TLS validation (a failed certificate
     is a failure, never silently accepted)."""
+    if type(expected_status) is not int or expected_status not in (200, 204):
+        return _failed(ERR_UNAVAILABLE)
     start = _now()
 
     def request():
@@ -212,7 +214,7 @@ def probe_https(host, path="/", port=443, budget=HTTPS_TIMEOUT_SECONDS,
         return _failed(ERR_UNAVAILABLE)
     if not completed:
         return _failed(ERR_TIMEOUT)
-    if status != 200:
+    if status != expected_status:
         return _failed(ERR_BAD_RESPONSE)
     return _slot(STATUS_OK, _latency_ms(start))
 
@@ -245,13 +247,15 @@ def probe_tcp(host, port, budget=TCP_TIMEOUT_SECONDS):
 
 
 def probe_egress(host, path="/", port=443, budget=EGRESS_TIMEOUT_SECONDS,
-                 previous=None, context=None):
+                 previous=None, context=None, strict_ip=False):
     """Office public egress IP through the reviewed egress endpoint.
 
     The answer text is validated by the SAME canonical global-IP gate as the
     audited engine (loopback/private/reserved/multicast are refused), so a
     broken endpoint can never inject a private address as an egress identity.
     """
+    if type(strict_ip) is not bool:
+        return failed_egress(ERR_UNAVAILABLE)
     start = _now()
 
     def request():
@@ -262,7 +266,7 @@ def probe_egress(host, path="/", port=443, budget=EGRESS_TIMEOUT_SECONDS,
             conn.request("GET", path, headers={"Accept": "text/plain",
                                                "User-Agent": "p6-remote-probe/1"})
             response = conn.getresponse()
-            body = response.read(MAX_RESPONSE_BYTES)
+            body = response.read(MAX_RESPONSE_BYTES + (1 if strict_ip else 0))
             return response.status, body
         finally:
             conn.close()
@@ -290,7 +294,7 @@ def probe_egress(host, path="/", port=443, budget=EGRESS_TIMEOUT_SECONDS,
                 "error_code": ERR_TIMEOUT, "ip": None,
                 "change": CHANGE_UNKNOWN}
     status, body = result
-    if status != 200:
+    if status != 200 or (strict_ip and len(body) > MAX_RESPONSE_BYTES):
         return {"status": STATUS_FAILED, "latency_ms": None,
                 "error_code": ERR_BAD_RESPONSE, "ip": None,
                 "change": CHANGE_UNKNOWN}
@@ -303,11 +307,12 @@ def probe_egress(host, path="/", port=443, budget=EGRESS_TIMEOUT_SECONDS,
     # An endpoint may answer with a single token or a small "ip=..." style
     # line: take the first whitespace/comma-separated token that parses as a
     # canonical global address, and refuse anything else.
-    candidate = None
-    for token in text.replace(",", " ").split():
-        if canonical_global_ip(token) is not None:
-            candidate = token
-            break
+    candidate = canonical_global_ip(text) if strict_ip else None
+    if not strict_ip:
+        for token in text.replace(",", " ").split():
+            if canonical_global_ip(token) is not None:
+                candidate = token
+                break
     if candidate is None:
         return {"status": STATUS_FAILED, "latency_ms": None,
                 "error_code": ERR_PARSE_FAILED, "ip": None,

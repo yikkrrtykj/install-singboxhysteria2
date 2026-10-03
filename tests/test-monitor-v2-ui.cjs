@@ -24,8 +24,9 @@ class Element {
   set textContent(v) { this.text = String(v); this.children = []; }
   get textContent() { return this.text + this.children.map(c => c.textContent).join(' '); }
   set innerHTML(v) { assert.equal(v, ''); this.textContent = ''; }
-  appendChild(c) { this.children.push(c); return c; }
-  removeChild(c) { this.children = this.children.filter(x => x !== c); return c; }
+  get firstChild() { return this.children[0] || null; }
+  appendChild(c) { c.parentNode = this; this.children.push(c); return c; }
+  removeChild(c) { c.parentNode = null; this.children = this.children.filter(x => x !== c); return c; }
   click() { if (this.events.click) return this.events.click(); }
   insertRow() { return this.appendChild(new Element('tr')); }
   insertCell() { return this.appendChild(new Element('td')); }
@@ -68,10 +69,11 @@ const document = {
 };
 const requests = [], responses = [];
 const createdUrls = [], revokedUrls = [];
-let urlSeq = 0;
-const context = vm.createContext({ document, console, Uint8Array, Date,
+let urlSeq = 0; let monoNow = 0; const intervalCallbacks = new Map(); let intervalId = 0;
+const context = vm.createContext({ document, console, Uint8Array, Date, performance: {now: () => monoNow},
   crypto: require('node:crypto').webcrypto, setTimeout() {}, clearTimeout() {},
-  setInterval() {}, window: { location: {} },
+  setInterval(fn) { const id = ++intervalId; intervalCallbacks.set(id, fn); return id; },
+  clearInterval(id) { intervalCallbacks.delete(id); }, window: { location: {}, confirm: () => true },
   URL: { createObjectURL: () => { const u = 'blob:ui-test-' + (++urlSeq);
          createdUrls.push(u); return u; },
          revokeObjectURL: u => revokedUrls.push(u) },
@@ -83,7 +85,7 @@ const context = vm.createContext({ document, console, Uint8Array, Date,
   }
 });
 vm.runInContext(app.replace('document.addEventListener("DOMContentLoaded", boot);',
-  'globalThis.ui = {state, bind, render, loadSession, loadE3Status, loadE3Clients, convergeAfterMutation, renderE3Controls, renderE3Clients, renderMonitorInfo, addClient, deleteClient, downloadConfig, setPendingRetry, retryPending, apiWithStepUp, setView, loadIncidents, renderIncidents, openIncident, renderIncidentDetail, closeIncidentDetail, loadEvidence, loadMarkers, renderMarkers, addMarker, rearmIncidents, renderIncRuntime};'), context);
+  'globalThis.ui = {state, bind, render, loadSession, loadE3Status, loadE3Clients, convergeAfterMutation, renderE3Controls, renderE3Clients, renderMonitorInfo, addClient, deleteClient, downloadConfig, setPendingRetry, retryPending, apiWithStepUp, setView, loadIncidents, renderIncidents, openIncident, renderIncidentDetail, closeIncidentDetail, loadEvidence, loadMarkers, renderMarkers, addMarker, rearmIncidents, renderIncRuntime, p6View, openP6Devices, loadP6Devices, p6Operate, downloadP6Bundle, downloadP6Windows, downloadP6Client, renderP6Devices, incidentCopy, userActivity, setIdleDeadline, startWatchdog};'), context);
 const ui = context.ui;
 // 0.1.4: the convergence chain (mutation -> one endpoint -> apply) crosses
 // several cross-realm promise reactions; 12 ticks starved it. Drain
@@ -102,9 +104,9 @@ function setStatus(s) { ui.state.e3Status = s; ui.state.e3StatusAt = Date.now();
 function closed() {
   assert.equal(ids['e3-add-btn'].disabled, true);
   assert.equal(ids['e3-del-btn'].disabled, true);
-  assert.equal(ids['e3-availability'].textContent, 'Unavailable');
-  assert.ok(!ids['e3-clients-body'].textContent.includes('Delete'));
-  assert.ok(!ids['e3-clients-body'].textContent.includes('Download'));
+  assert.equal(ids['e3-availability'].textContent, "不可用");
+  assert.ok(!ids['e3-clients-body'].textContent.includes("删除"));
+  assert.ok(!ids['e3-clients-body'].textContent.includes("下载 YAML"));
 }
 const forbidden = /\(E3\)|M0\.5|Management plane|privileged helper|Helper snapshot|Management mutations|Idempotency-Key|\bMUTABLE\b|\bSOURCE\b|Abandoned on reset|Batches processed|hy2-in|vless-in/i;
 function productText() { assert.doesNotMatch(dom.textContent, forbidden); }
@@ -114,23 +116,23 @@ async function main() {
   ui.state.session = {authenticated: true, management_active: false, csrf_token: 'csrf', version: '0.1.0'};
   ui.state.e3Clients = clients;
   responses.push(response(healthy())); await ui.loadE3Status();
-  check('old inactive session + fresh active status => Available and Add enabled', () => { assert.equal(ids['e3-availability'].textContent, 'Available'); assert.equal(ids['e3-add-btn'].disabled, false); });
+  check('old inactive session + fresh active status => Available and Add enabled', () => { assert.equal(ids['e3-availability'].textContent, "可用"); assert.equal(ids['e3-add-btn'].disabled, false); });
   ui.state.snapshot = {web_status: 'HEALTHY', devices: {legacy: {name: 'legacy', status: 'ACTIVE', protocols: {'hy2-in': {}, 'vless-in': {}}}}, connections: [{user: 'legacy', inbound: 'hy2-in', id: 'conn1'}]};
   ui.render();
   responses.push(response({...ui.state.session, management_active: false})); await ui.loadSession(); ui.render();
-  check('session reload and subsequent snapshot do not overwrite availability', () => { assert.equal(ids['e3-availability'].textContent, 'Available'); assert.equal(ids['e3-add-btn'].disabled, false); });
+  check('session reload and subsequent snapshot do not overwrite availability', () => { assert.equal(ids['e3-availability'].textContent, "可用"); assert.equal(ids['e3-add-btn'].disabled, false); });
   check('Default mapping in Devices, Connections and Clients leaves raw data intact', () => {
-    for (const id of ['devices-grid', 'conn-tbody', 'e3-clients-body']) { assert.match(ids[id].textContent, /Default/); assert.doesNotMatch(ids[id].textContent, /legacy/); }
+    for (const id of ['devices-grid', 'conn-tbody', 'e3-clients-body']) { assert.match(ids[id].textContent, /默认客户端/); assert.doesNotMatch(ids[id].textContent, /legacy/); }
     assert.equal(clients.data.clients[0].name, 'legacy'); assert.equal(ui.state.snapshot.connections[0].user, 'legacy');
   });
   check('protocol labels hide inbound tags and client table has three columns', () => {
     productText(); assert.match(ids['devices-grid'].textContent, /Hysteria2/); assert.match(ids['devices-grid'].textContent, /Reality/);
     assert.equal(ids['e3-clients-body'].children[0].children.length, 3);
     assert.match(ids['e3-clients-body'].children[0].textContent, /Reality, Hysteria2/);
-    assert.doesNotMatch(ids['e3-clients-body'].children[0].textContent, /Delete/);
+    assert.doesNotMatch(ids['e3-clients-body'].children[0].textContent, /删除/);
     // M4: Download is offered for every client while writable, Default
     // included -- and it is the FIRST action cell entry.
-    assert.match(ids['e3-clients-body'].children[0].textContent, /Download/);
+    assert.match(ids['e3-clients-body'].children[0].textContent, /下载/);
   });
   const cases = {
     inactive: s => { s.data.management_state = 'inactive'; },
@@ -149,7 +151,7 @@ async function main() {
     });
   }
   setStatus(healthy());
-  check('fresh active clean lock-free status restores Add and mutable Delete', () => { assert.equal(ids['e3-add-btn'].disabled, false); assert.match(ids['e3-clients-body'].children[1].textContent, /Delete/); assert.match(ids['e3-clients-body'].children[1].textContent, /Download/); });
+  check('fresh active clean lock-free status restores Add and mutable Delete', () => { assert.equal(ids['e3-add-btn'].disabled, false); assert.match(ids['e3-clients-body'].children[1].textContent, /删除/); assert.match(ids['e3-clients-body'].children[1].textContent, /下载/); });
   check('a locally expired fresh verdict fails closed even before a poll returns', () => {
     ui.state.e3StatusAt = Date.now() - 10001; ui.renderE3Controls(); closed();
     const n = requests.length; ui.addClient('bob'); ui.downloadConfig('alice'); assert.equal(requests.length, n);
@@ -161,9 +163,9 @@ async function main() {
   check('healthy background refresh preserves an open delete confirmation', () => assert.ok(!ids['e3-delete-box'].className.includes('hidden')));
   check('reserved Default never offers Delete even if metadata incorrectly says mutable', () => {
     ui.renderE3Clients({data: {clients: [{name: 'legacy', mutable: true}]}});
-    assert.doesNotMatch(ids['e3-clients-body'].textContent, /Delete/);
+    assert.doesNotMatch(ids['e3-clients-body'].textContent, /删除/);
     // M4: Default IS exportable -- the lifecycle gap this release closes.
-    assert.match(ids['e3-clients-body'].textContent, /Download/);
+    assert.match(ids['e3-clients-body'].textContent, /下载/);
     const n = requests.length; ui.deleteClient('legacy'); assert.equal(requests.length, n);
   });
   let finishOld;
@@ -206,32 +208,36 @@ async function main() {
   check('Add client dispatches without password step-up', () => {
     assert.equal(requests.filter(r => r.url === '/api/v1/clients/add').length, addReqBefore + 1);
     assert.equal(requests.filter(r => r.url === '/api/v1/step-up').length, stepReqBefore);
-    assert.ok(ids['stepup-overlay'].className.includes('hidden'));
+    assert.equal(ids['stepup-overlay'], undefined);
   });
 
-  // Delete/export still use the generic step-up replay path.
-  responses.push(response({error: 'reauth_required'}, 401));
+  // An expired session returns to login; a mutation is never replayed.
+  const savedSession = {...ui.state.session};
+  responses.push(response({error: 'login required'}, 401));
   const options = {method: 'POST', body: {name: 'alice', confirm: 'alice'}, idempotencyKey: 'same-key'};
-  const stepped = ui.apiWithStepUp('/api/v1/clients/delete', options); await flush();
-  check('step-up password panel appears only on demand with product copy', () => { assert.ok(!ids['stepup-overlay'].className.includes('hidden')); assert.match(ids['stepup-form'].textContent, /Confirm admin password/); });
-  responses.push(response({}), response(ui.state.session), response({}));
-  ids['stepup-password'].value = 'test-password'; ids['stepup-form'].events.submit({preventDefault() {}});
-  await stepped; await flush();
-  check('step-up replay retains original body and headers', () => {
-    const pair = requests.filter(r => r.url === '/api/v1/clients/delete').slice(-2);
-    assert.equal(pair[0].body, pair[1].body); assert.deepEqual(pair[0].headers, pair[1].headers);
-    assert.ok(ids['stepup-overlay'].className.includes('hidden'));
+  const expiredRequestMark = requests.length;
+  await assert.rejects(ui.apiWithStepUp('/api/v1/clients/delete', options)); await flush();
+  check('expired authorization returns to login without a second password panel', () => {
+    assert.ok(!ids['login-overlay'].className.includes('hidden'));
+    assert.equal(ids['stepup-overlay'], undefined); assert.equal(ui.state.session, null);
   });
+  check('expired mutation is sent exactly once and never automatically replayed', () => {
+    assert.equal(requests.length, expiredRequestMark + 1);
+    assert.equal(requests.at(-1).body, JSON.stringify(options.body));
+    assert.equal(requests.at(-1).headers['Idempotency-Key'], 'same-key');
+    assert.equal(requests.at(-1).headers['X-CSRF-Token'], 'csrf');
+  });
+  ui.state.session = savedSession;
   setStatus(healthy());
   responses.push(response({}), conv());
   ui.addClient('bob'); await flush();
   check('successful Add displays the download-forward copy without credentials', () => {
-    assert.equal(ids['e3-msg'].textContent, 'Client created. Download its configuration below.'); productText();
+    assert.equal(ids['e3-msg'].textContent, "客户端已创建，可在下方下载 YAML 配置。"); productText();
   });
   responses.push(response({}), response(ui.state.session), conv());
   ui.deleteClient('alice'); await flush();
   check('successful Delete displays ordinary copy and preserves raw request name', () => {
-    assert.equal(ids['e3-msg'].textContent, 'Client deleted.');
+    assert.equal(ids['e3-msg'].textContent, "客户端已删除。");
     assert.equal(requests.findLast(r => r.url === '/api/v1/clients/delete').body, JSON.stringify({name: 'alice', confirm: 'alice'})); productText();
   });
   // ---- 0.1.4 post-mutation convergence endpoint ---------------------------
@@ -248,13 +254,13 @@ async function main() {
       ['/api/v1/clients/add', '/api/v1/clients/convergence']);
   });
   check('convergence applies status+list atomically: new row writable, copy survives', () => {
-    assert.equal(ids['e3-availability'].textContent, 'Available');
+    assert.equal(ids['e3-availability'].textContent, "可用");
     const row = ids['e3-clients-body'].children[2];
     assert.match(row.textContent, /bob/);
-    assert.match(row.textContent, /Download/);
-    assert.match(row.textContent, /Delete/);
+    assert.match(row.textContent, /下载/);
+    assert.match(row.textContent, /删除/);
     assert.equal(ids['e3-msg'].textContent,
-                 'Client created. Download its configuration below.');
+                 "客户端已创建，可在下方下载 YAML 配置。");
     productText();
   });
   const markBad = requests.length;
@@ -264,9 +270,9 @@ async function main() {
     assert.deepEqual(requests.slice(markBad).map(r => r.url),
       ['/api/v1/clients/add', '/api/v1/clients/convergence']);
     closed();
-    assert.ok(!/Download|Delete/.test(ids['e3-clients-body'].textContent));
+    assert.ok(!/下载|删除/.test(ids['e3-clients-body'].textContent));
     assert.equal(ids['e3-msg'].textContent,
-                 'Client created. Download its configuration below.');
+                 "客户端已创建，可在下方下载 YAML 配置。");
     productText();
   });
   setStatus(healthy());
@@ -285,9 +291,9 @@ async function main() {
       ['/api/v1/clients/delete', '/api/v1/session',
        '/api/v1/clients/convergence']);
     assert.doesNotMatch(ids['e3-clients-body'].textContent, /alice|bob/);
-    assert.match(ids['e3-clients-body'].textContent, /Default/);
-    assert.match(ids['e3-clients-body'].textContent, /Download/);
-    assert.equal(ids['e3-msg'].textContent, 'Client deleted.');
+    assert.match(ids['e3-clients-body'].textContent, /默认客户端/);
+    assert.match(ids['e3-clients-body'].textContent, /下载/);
+    assert.equal(ids['e3-msg'].textContent, "客户端已删除。");
     productText();
   });
   // Plain reads in flight across the whole convergence window are retired
@@ -304,14 +310,14 @@ async function main() {
   check('convergence outranks in-flight plain reads and lands immediately', () => {
     assert.deepEqual(requests.slice(markRace).map(r => r.url),
       ['/api/v1/clients/add', '/api/v1/clients/convergence']);
-    assert.equal(ids['e3-availability'].textContent, 'Available');
+    assert.equal(ids['e3-availability'].textContent, "可用");
     assert.match(ids['e3-clients-body'].textContent, /bob/);
   });
   finishList(response({transport: 'fresh', data: onlyLegacy.data}));
   finishStatus(response({transport: 'stale'}));
   await staleList; await staleStatus; await flush();
   check('late old status/list responses cannot overwrite the converged view', () => {
-    assert.equal(ids['e3-availability'].textContent, 'Available');
+    assert.equal(ids['e3-availability'].textContent, "可用");
     assert.match(ids['e3-clients-body'].textContent, /bob/);
   });
   check('convergeAfterMutation is defined once, wired into both success paths, and the 0.1.3 helper is gone', () => {
@@ -363,14 +369,14 @@ async function main() {
     assert.ok(fg && typeof fg.then === 'function');   // resolved, never fetched
     assert.equal(requests.length, reqsBefore);
     assert.equal(ui.state.e3StatusGeneration, genS);
-    assert.equal(ids['e3-availability'].textContent, 'Available');
+    assert.equal(ids['e3-availability'].textContent, "可用");
     // 0.1.5: this window has an ADD in flight, so the locked busy view
     // (Add disabled, "Adding…") is the correct baseline -- the suppressed
     // read must not change ANY of it.
     assert.equal(ids['e3-add-btn'].disabled, true);
-    assert.equal(ids['e3-add-btn'].textContent, 'Adding…');
+    assert.equal(ids['e3-add-btn'].textContent, "正在添加…");
     assert.equal(ids['e3-clients-body'].children.length, 2);
-    assert.match(ids['e3-clients-body'].textContent, /Download/);
+    assert.match(ids['e3-clients-body'].textContent, /下载/);
   });
   const bg = ui.loadE3Status(true);      // watchdog tick mid-window
   const lp = ui.loadE3Clients();         // plain list read mid-window
@@ -380,25 +386,25 @@ async function main() {
   });
   await fg; await bg; await lp; await flush();
   check('the held view still shows no regression after the suppressed reads', () => {
-    assert.equal(ids['e3-availability'].textContent, 'Available');
+    assert.equal(ids['e3-availability'].textContent, "可用");
     assert.equal(ids['e3-clients-body'].children.length, 2);
-    assert.doesNotMatch(ids['e3-clients-body'].textContent, /No clients found/);
+    assert.doesNotMatch(ids['e3-clients-body'].textContent, /暂无客户端/);
   });
   finishConv(conv(healthy(), withBob));
   await flush();
   check('the convergence then applies its fresh status+list atomically', () => {
-    assert.equal(ids['e3-availability'].textContent, 'Available');
+    assert.equal(ids['e3-availability'].textContent, "可用");
     assert.ok(!ui.state.e3Convergence);
     assert.equal(ids['e3-clients-body'].children.length, 3);
     const row = ids['e3-clients-body'].children[2];
     assert.match(row.textContent, /bob/);
-    assert.match(row.textContent, /Download/);
-    assert.match(row.textContent, /Delete/);
+    assert.match(row.textContent, /下载/);
+    assert.match(row.textContent, /删除/);
     // 0.1.5: the apply AND the settlement release the busy lock together.
     assert.ok(!ui.state.e3Mutation);
     assert.equal(ids['e3-add-btn'].disabled, false);
-    assert.equal(ids['e3-add-btn'].textContent, 'Add client');
-    assert.equal(ids['e3-del-btn'].textContent, 'Delete permanently');
+    assert.equal(ids['e3-add-btn'].textContent, "添加客户端");
+    assert.equal(ids['e3-del-btn'].textContent, "永久删除");
     productText();
   });
   // ---- 0.1.5 (#36): two-step delete without re-typing + mutation lock ----
@@ -434,10 +440,10 @@ async function main() {
     assert.equal(ui.state.e3Mutation.kind, 'delete');
     assert.equal(ui.state.e3Mutation.name, 'bob');
     assert.equal(ui.state.e3Mutation.inFlight, true);
-    assert.equal(ids['e3-del-btn'].textContent, 'Deleting…');
+    assert.equal(ids['e3-del-btn'].textContent, "正在删除…");
     assert.equal(ids['e3-del-cancel'].disabled, true);
     assert.equal(ids['e3-add-btn'].disabled, true);
-    assert.equal(ids['e3-availability'].textContent, 'Available');
+    assert.equal(ids['e3-availability'].textContent, "可用");
   });
   await flush();
   check('success closes+unbinds the panel, converges once, and the lock releases only at settlement', () => {
@@ -447,10 +453,10 @@ async function main() {
     assert.equal(ids['e3-del-btn'].getAttribute('data-name'), undefined);
     assert.equal(ids['e3-del-name'].textContent, '');
     assert.ok(!ui.state.e3Mutation);
-    assert.equal(ids['e3-del-btn'].textContent, 'Delete permanently');
+    assert.equal(ids['e3-del-btn'].textContent, "永久删除");
     assert.equal(ids['e3-add-btn'].disabled, false);
-    assert.equal(ids['e3-add-btn'].textContent, 'Add client');
-    assert.equal(ids['e3-msg'].textContent, 'Client deleted.');
+    assert.equal(ids['e3-add-btn'].textContent, "添加客户端");
+    assert.equal(ids['e3-msg'].textContent, "客户端已删除。");
     assert.doesNotMatch(ids['e3-clients-body'].textContent, /bob/);
     assert.match(ids['e3-clients-body'].textContent, /alice/);
     productText();
@@ -487,11 +493,11 @@ async function main() {
   check('an in-flight Add locks every entrance synchronously while Download stays honest', () => {
     assert.equal(requests[nBusy].url, '/api/v1/clients/add');
     assert.equal(requests.length, nBusy + 1);
-    assert.equal(ids['e3-add-btn'].textContent, 'Adding…');
+    assert.equal(ids['e3-add-btn'].textContent, "正在添加…");
     assert.equal(ids['e3-add-btn'].disabled, true);
     assert.equal(ids['e3-add-name'].disabled, true);
     assert.equal(ids['e3-del-btn'].disabled, true);
-    assert.equal(ids['e3-availability'].textContent, 'Available');
+    assert.equal(ids['e3-availability'].textContent, "可用");
     assert.equal(ids['e3-clients-body'].children[0].children[2].children[0].disabled, false); // Download
     assert.equal(ids['e3-clients-body'].children[1].children[2].children[1].disabled, true);   // row Delete
     productText();
@@ -512,10 +518,10 @@ async function main() {
     assert.ok(ui.state.e3Mutation);
     assert.equal(ui.state.e3Mutation.kind, 'delete');
     assert.equal(ui.state.e3Mutation.inFlight, false);
-    assert.equal(ids['e3-del-btn'].textContent, 'Deleting…');
+    assert.equal(ids['e3-del-btn'].textContent, "正在删除…");
     assert.equal(ids['e3-add-btn'].disabled, true);
-    assert.equal(ids['e3-availability'].textContent, 'Available');
-    assert.equal(ids['e3-msg'].textContent, 'Client deleted.');
+    assert.equal(ids['e3-availability'].textContent, "可用");
+    assert.equal(ids['e3-msg'].textContent, "客户端已删除。");
   });
   finishConvB(conv(healthy(), clients));
   await flush();
@@ -523,41 +529,32 @@ async function main() {
     assert.ok(!ui.state.e3Convergence);
     assert.ok(!ui.state.e3Mutation);
     assert.equal(ids['e3-add-btn'].disabled, false);
-    assert.equal(ids['e3-add-btn'].textContent, 'Add client');
-    assert.equal(ids['e3-del-btn'].textContent, 'Delete permanently');
+    assert.equal(ids['e3-add-btn'].textContent, "添加客户端");
+    assert.equal(ids['e3-del-btn'].textContent, "永久删除");
     assert.doesNotMatch(ids['e3-clients-body'].textContent, /bob/);
     assert.match(ids['e3-clients-body'].textContent, /alice/);
   });
-  responses.push(response({error: 'reauth_required'}, 401));
-  ids['e3-clients-body'].children[1].children[2].children[1].events.click();  // alice row
+  let completeAuthorizedDelete;
+  responses.push(() => new Promise(resolve => { completeAuthorizedDelete = resolve; }));
+  ids['e3-clients-body'].children[1].children[2].children[1].events.click();
   const markStep = requests.length;
-  ids['e3-del-btn'].click();
-  await flush();
-  check('a delete awaiting step-up is in flight: Deleting…, and Cancel cannot undo a dispatched transaction', () => {
-    assert.ok(!ids['stepup-overlay'].className.includes('hidden'));
+  ids['e3-del-btn'].click(); await flush();
+  check('authorized delete remains single-flight while its HTTP result is pending', () => {
+    assert.equal(ids['stepup-overlay'], undefined);
     assert.equal(requests.length, markStep + 1);
-    assert.equal(ui.state.e3Mutation.name, 'alice');
-    assert.equal(ui.state.e3Mutation.inFlight, true);
-    assert.equal(ids['e3-del-btn'].textContent, 'Deleting…');
-    assert.equal(ids['e3-del-cancel'].disabled, true);
-    assert.equal(ids['e3-add-btn'].disabled, true);
+    assert.equal(ui.state.e3Mutation.name, 'alice'); assert.equal(ui.state.e3Mutation.inFlight, true);
+    assert.equal(ids['e3-del-btn'].textContent, "正在删除…");
+    assert.equal(ids['e3-del-cancel'].disabled, true); assert.equal(ids['e3-add-btn'].disabled, true);
   });
-  responses.push(response({}), response(ui.state.session), response({}),
-                 response(ui.state.session), conv(healthy(), onlyLegacy));
-  ids['stepup-password'].value = 'test-password';
-  ids['stepup-form'].events.submit({preventDefault() {}});
-  await flush();
-  check('the step-up replay completes the delete; the lock survives to convergence and settles free', () => {
+  responses.push(response(ui.state.session), conv(healthy(), onlyLegacy));
+  completeAuthorizedDelete(response({})); await flush();
+  check('login-authorized delete completes once and holds its lock through convergence', () => {
     assert.deepEqual(requests.slice(markStep).map(r => r.url),
-      ['/api/v1/clients/delete', '/api/v1/step-up', '/api/v1/session',
-       '/api/v1/clients/delete', '/api/v1/session',
-       '/api/v1/clients/convergence']);
-    assert.ok(!ui.state.e3Mutation);
-    assert.equal(ids['e3-del-cancel'].disabled, false);
-    assert.equal(ids['e3-del-btn'].textContent, 'Delete permanently');
-    assert.equal(ids['e3-msg'].textContent, 'Client deleted.');
-    assert.doesNotMatch(ids['e3-clients-body'].textContent, /alice|bob/);
-    productText();
+      ['/api/v1/clients/delete', '/api/v1/session', '/api/v1/clients/convergence']);
+    assert.ok(!ui.state.e3Mutation); assert.equal(ids['e3-del-cancel'].disabled, false);
+    assert.equal(ids['e3-del-btn'].textContent, "永久删除");
+    assert.equal(ids['e3-msg'].textContent, "客户端已删除。");
+    assert.doesNotMatch(ids['e3-clients-body'].textContent, /alice|bob/); productText();
   });
   const markUnc = requests.length;
   responses.push(response({code: 'result_unknown', uncertain: true}, 504),
@@ -569,7 +566,7 @@ async function main() {
     assert.ok(!ui.state.e3Mutation);
     assert.ok(ui.state.e3PendingRetry);
     closed();
-    assert.match(ids['e3-msg'].textContent, /result is not confirmed/);
+    assert.match(ids['e3-msg'].textContent, /结果尚未确认/);
     productText();
   });
   ui.setPendingRetry(null);
@@ -590,35 +587,30 @@ async function main() {
     assert.equal(ex.headers['X-CSRF-Token'], 'csrf');
   });
   check('download success revokes the URL, removes the anchor and renders no secret', () => {
-    assert.equal(ids['e3-msg'].textContent, 'Configuration downloaded.');
+    assert.equal(ids['e3-msg'].textContent, "YAML 配置已下载。");
     assert.equal(createdUrls.length, urlsBefore + 1);
     assert.deepEqual(revokedUrls.slice(urlsBefore), [createdUrls[urlsBefore]]);
     assert.equal(document.body.children.length, 0);
     assert.doesNotMatch(dom.textContent, /ui-never-render-7777/);
     productText();
   });
-  responses.push(response({error: 'reauth_required'}, 401));
+  const exportRequestMark = requests.length;
+  responses.push(response({error: 'login required'}, 401));
   ui.downloadConfig('alice'); await flush();
-  responses.push(response({}), response(ui.state.session),
-                 fileResponse('proxies:\n  - uuid: ui-second-8888\n'));
-  ids['stepup-password'].value = 'test-password';
-  ids['stepup-form'].events.submit({preventDefault() {}});
-  await flush();
-  check('export step-up replay resends the identical keyless request', () => {
-    const pair = requests.filter(r => r.url === '/api/v1/clients/export').slice(-2);
-    assert.equal(pair[0].body, pair[1].body);
-    assert.deepEqual(pair[0].headers, pair[1].headers);
-    assert.ok(!('Idempotency-Key' in pair[1].headers));
-    assert.equal(ids['e3-msg'].textContent, 'Configuration downloaded.');
-    assert.doesNotMatch(dom.textContent, /ui-second-8888/);
-    productText();
+  check('expired export is keyless, is not replayed, and returns to the login view', () => {
+    const attempts = requests.slice(exportRequestMark).filter(r => r.url === '/api/v1/clients/export');
+    assert.equal(attempts.length, 1); assert.equal(attempts[0].body, JSON.stringify({name: 'alice'}));
+    assert.ok(!('Idempotency-Key' in attempts[0].headers));
+    assert.equal(ui.state.session, null); assert.equal(ids['stepup-overlay'], undefined);
+    assert.ok(!ids['login-overlay'].className.includes('hidden')); productText();
   });
+  ui.state.session = savedSession;
   setStatus(healthy());
   responses.push(response({code: 'result_unknown', uncertain: true}, 504),
                  response(healthy()));
   ui.downloadConfig('alice'); await flush();
   check('uncertain export gives product copy and never sets a pending-operation lock', () => {
-    assert.match(ids['e3-msg'].textContent, /export result is unknown/);
+    assert.match(ids['e3-msg'].textContent, /下载结果尚未确认/);
     assert.ok(!ui.state.e3PendingRetry);
     productText();
   });
@@ -632,7 +624,7 @@ async function main() {
   ui.renderMonitorInfo({});
   check('no stream error => warning hidden', () => assert.ok(ids['mi-warning'].className.includes('hidden')));
   ui.renderMonitorInfo({last_error: 'collector internal error'});
-  check('stream error => ordinary warning only', () => { assert.ok(!ids['mi-warning'].className.includes('hidden')); assert.equal(ids['mi-warning'].textContent, 'Monitoring data may be delayed.'); });
+  check('stream error => ordinary warning only', () => { assert.ok(!ids['mi-warning'].className.includes('hidden')); assert.equal(ids['mi-warning'].textContent, "监控数据可能存在延迟。"); });
   check('public version equals release VERSION', () => {
     const version = fs.readFileSync(path.join(root, 'monitor-v2/VERSION'), 'utf8').trim();
     const server = fs.readFileSync(path.join(root, 'monitor-v2/web/server.py'), 'utf8');
@@ -656,14 +648,14 @@ async function main() {
     productText();
   });
   check('the list renders the closed category label, never the raw enum alone', () => {
-    assert.match(ids['inc-tbody'].textContent, /Reality\/TCP path/);
+    assert.match(ids['inc-tbody'].textContent, /Reality\/TCP 链路/);
     assert.ok(!ids['inc-tbody'].textContent.includes('reality_tcp_path'));
     productText();
   });
   responses.push(response({incidents: [], runtime: null, history: {enabled: true, degraded: false}, truncated: false, limit: 100}));
   await ui.loadIncidents(); await flush();
   check('a healthy empty list is the explicit empty state, never a fabricated clean bill', () => {
-    assert.match(ids['inc-tbody'].textContent, /No incidents recorded\./); productText();
+    assert.match(ids['inc-tbody'].textContent, /暂无事件记录。/); productText();
   });
   ui.state.incidents = oneIncident([realityRow]); ui.renderIncidents(ui.state.incidents);
   const summary = {headline: 'Reality/TCP path incident',
@@ -688,24 +680,24 @@ async function main() {
     response({subject: {type: 'incident', id: 1}, section: 'samples', window: {start_epoch: 1, end_epoch: 160}, rows: [], truncated: false, retention_cutoff_epoch: 0}));
   await ui.openIncident(1); await flush();
   check('the L1 first screen renders the plain-language summary without raw snake_case tokens', () => {
-    assert.match(ids['inc-detail'].textContent, /Reality\/TCP path incident/);
-    assert.match(ids['inc-detail'].textContent, /If Hysteria2 is independently confirmed healthy/);
-    assert.match(ids['inc-detail'].textContent, /root cause is not established/);
+    assert.match(ids['inc-detail'].textContent, /Reality\/TCP 链路事件/);
+    assert.match(ids['inc-detail'].textContent, /如果已经独立确认 Hysteria2 正常/);
+    assert.match(ids['inc-detail'].textContent, /根因尚未确定/);
     assert.doesNotMatch(ids['inc-summary'].textContent, /recommended_action|protocol_state|first_signal_epoch/);
     productText();
   });
   check('L2 reasons render the operator sentences, not the tokens, and the in-window marker is joined', () => {
-    assert.match(ids['inc-evidence-list'].textContent, /Reality active connections fell far below their baseline\./);
-    assert.match(ids['inc-unknowns-list'].textContent, /The evidence says where it hurt, not why/);
+    assert.match(ids['inc-evidence-list'].textContent, /Reality 活动连接数远低于其基线。/);
+    assert.match(ids['inc-unknowns-list'].textContent, /证据表明问题发生在哪个范围，但无法解释原因/);
     assert.doesNotMatch(ids['inc-evidence-list'].textContent, /count_drop_reality/);
     assert.doesNotMatch(ids['inc-unknowns-list'].textContent, /root_cause_not_established/);
-    assert.match(ids['inc-detail'].textContent, /TT Live Studio login failed/);
+    assert.match(ids['inc-detail'].textContent, /TT Live Studio 登录失败/);
     productText();
   });
   check('B2: L4 exposes the exact raw tokens separately from L2, with copy affordances', () => {
     assert.match(ids['inc-evidence-tokens'].textContent, /count_drop_reality/);
     assert.match(ids['inc-unknown-tokens'].textContent, /root_cause_not_established/);
-    const copyButtons = ids['inc-evidence-tokens'].textContent.includes('Copy');
+    const copyButtons = ids['inc-evidence-tokens'].textContent.includes("复制");
     assert.ok(copyButtons);
     productText();
   });
@@ -741,15 +733,17 @@ async function main() {
     const l3Text = ids['inc-l3'].textContent;
     const rows = l3Text.match(/reset/g) || [];
     assert.equal(rows.length, 2);
-    assert.match(ids['inc-rows-body'].textContent, /100[\s\S]*140[\s\S]*120|[\s\S]*/);
+    assert.deepEqual(ids['inc-rows-body'].children.map(row =>
+      row.children.slice(0, 2).map(cell => cell.textContent)),
+      [['1', '100'], ['2', '140'], ['3', '120']]);
     assert.equal(ids['inc-rows-body'].children.length, 3);
     productText();
   });
   responses.push(response({subject: {type: 'incident', id: 1}, section: 'probe_rows', window: {start_epoch: 1, end_epoch: 160}, rows: [], truncated: false, retention_cutoff_epoch: 50}));
   await ui.loadEvidence('probe_rows'); await flush();
   check('an empty retained window says exactly that and may add the retention note, never "no problem"', () => {
-    assert.match(ids['inc-rows-body'].textContent, /No retained evidence is available for this window\./);
-    assert.match(ids['inc-rows-note'].textContent, /aged out of the retention window/);
+    assert.match(ids['inc-rows-body'].textContent, /此窗口内没有保留的证据。/);
+    assert.match(ids['inc-rows-note'].textContent, /超出保留时间/);
     assert.doesNotMatch(ids['view-incidents'].textContent, /No problem occurred/);
     productText();
   });
@@ -765,9 +759,9 @@ async function main() {
     truncated: true, retention_cutoff_epoch: 0}));
   await ui.loadEvidence('journal_events'); await flush();
   check('B1: truncation says later rows are omitted and the L3 aggregate is declared partial', () => {
-    assert.match(ids['inc-rows-note'].textContent, /later rows in this section are not shown/);
+    assert.match(ids['inc-rows-note'].textContent, /其余记录未展示/);
     assert.doesNotMatch(ids['inc-rows-note'].textContent, /older rows/);
-    assert.match(ids['inc-l3'].textContent, /cover only the rows shown here, not the full window/);
+    assert.match(ids['inc-l3'].textContent, /只覆盖已展示记录，而非完整时间窗口/);
     assert.doesNotMatch(ids['inc-l3'].textContent, /full-window total|complete/i);
     // the raw L4 rows still carry exactly the rows the API returned
     assert.equal(ids['inc-rows-body'].children.length, 2);
@@ -779,21 +773,21 @@ async function main() {
     truncated: false, retention_cutoff_epoch: 0}));
   await ui.loadEvidence('journal_events'); await flush();
   check('B1: an untruncated section carries no partial-aggregate notice', () => {
-    assert.doesNotMatch(ids['inc-l3'].textContent, /cover only the rows shown here/);
+    assert.doesNotMatch(ids['inc-l3'].textContent, /只覆盖已展示记录/);
     assert.ok(ids['inc-rows-note'].className.includes('hidden') ||
-              !/later rows/.test(ids['inc-rows-note'].textContent));
+              !/其余记录/.test(ids['inc-rows-note'].textContent));
     productText();
   });
   responses.push(() => Promise.reject(new Error('network')));
   await ui.loadEvidence('probe_rows'); await flush();
   check('B4: a fetch/HTTP failure renders the unavailable state and never the retained-evidence text', () => {
-    assert.match(ids['inc-rows-body'].textContent, /Evidence is currently unavailable\. No conclusion can be drawn from this view\./);
-    assert.doesNotMatch(ids['view-incidents'].textContent, /No retained evidence is available/);
+    assert.match(ids['inc-rows-body'].textContent, /证据暂不可用，无法据此得出结论。/);
+    assert.doesNotMatch(ids['view-incidents'].textContent, /没有保留的证据/);
     productText();
   });
   responses.push(response({markers: [{marker_id: 7, epoch: 120, kind: 'tt_live_studio_login_failed', label: 'TT Live Studio login failed', created_epoch: 300}], truncated: false, limit: 200}));
   ui.state.session = {authenticated: true, csrf_token: 'csrf'};
-  responses.push(response({marker_id: 9, epoch: 500, kind: 'operator_event', label: 'Operator-observed event', created_epoch: 500}));
+  responses.push(response({marker_id: 9, epoch: 500, kind: 'operator_event', label: "人工观察到的事件", created_epoch: 500}));
   ids['inc-marker-kind'].value = 'operator_event';
   await ui.addMarker(); await flush();
   check('marker POST sends the closed kind only, with CSRF, and reloads the list', () => {
@@ -801,7 +795,7 @@ async function main() {
     assert.deepEqual(JSON.parse(post.body), {kind: 'operator_event'});
     assert.equal(post.headers['X-CSRF-Token'], 'csrf');
     assert.ok(!('Idempotency-Key' in post.headers));
-    assert.match(ids['inc-marker-msg'].textContent, /Marker recorded\./);
+    assert.match(ids['inc-marker-msg'].textContent, /人工标记已记录。/);
     productText();
   });
   ui.state.incSubject = null;
@@ -811,15 +805,15 @@ async function main() {
                            rows: [], truncated: false, retention_cutoff_epoch: 0}));
   await ui.loadMarkers(); await flush();
   const viewBtns = [];
-  (function collect(el) { el.children.forEach(c => { if (c.tag === 'button' && c.textContent === 'View evidence') viewBtns.push(c); collect(c); }); })(ids['inc-markers-list']);
+  (function collect(el) { el.children.forEach(c => { if (c.tag === 'button' && c.textContent === "查看证据") viewBtns.push(c); collect(c); }); })(ids['inc-markers-list']);
   assert.ok(viewBtns.length >= 1, 'expected a View evidence button on the marker list');
   viewBtns[viewBtns.length - 1].click(); await flush();
   check('B3: View evidence selects marker_id on the SAME subject-bound route, no epoch params, server window echoed', () => {
     const ev = requests.findLast(r => r.url.startsWith('/api/v1/evidence'));
     assert.match(ev.url, /marker_id=7/);
     assert.doesNotMatch(ev.url, /start_epoch=|end_epoch=|incident_id=/);
-    assert.match(ids['inc-evidence-subject'].textContent, /TT Live Studio login failed/);
-    assert.match(ids['inc-evidence-subject'].textContent, /Server-derived window/);
+    assert.match(ids['inc-evidence-subject'].textContent, /TT Live Studio 登录失败/);
+    assert.match(ids['inc-evidence-subject'].textContent, /服务器给出的时间窗口/);
     productText();
   });
   check('rearm is entrance-closed unless the runtime reports phase=rearm, and the accepted copy is the frozen one', () => {
@@ -837,7 +831,7 @@ async function main() {
   check('rearm success shows the accepted copy and refreshes without retry', () => {
     const post = requests.findLast(r => r.url === '/api/v1/incidents/rearm');
     assert.equal(post.method, 'POST');
-    assert.match(ids['inc-rearm-msg'].textContent, /Re-arm accepted\. Waiting for the incident scanner to enter warm-up\./);
+    assert.match(ids['inc-rearm-msg'].textContent, /已接受重新启用扫描请求，等待事件扫描器进入预热。/);
     productText();
   });
   responses.push(response({error: 'incident_runtime_not_rearmable'}, 409),
@@ -846,29 +840,29 @@ async function main() {
   ui.renderIncRuntime();
   await ui.rearmIncidents(); await flush();
   check('a 409 rearm fails closed with ordinary copy and no automatic retry', () => {
-    assert.match(ids['inc-rearm-msg'].textContent, /not waiting for a re-arm/);
+    assert.match(ids['inc-rearm-msg'].textContent, /无需重新启用扫描/);
     productText();
   });
   responses.push(response({incidents: [], runtime: {enabled: true, running: true, phase: 'idle', cycles_completed: 1, runtime_failures: 0, last_error_code: null, last_evaluated_end_epoch: 1, open_incident: false}, history: {enabled: true, degraded: false}, truncated: false, limit: 100}), response({markers: [], truncated: false, limit: 200}));
   await ui.loadIncidents(); await ui.loadMarkers(); await flush();
   check('B5: healthy history + empty list => the authoritative "No incidents recorded."', () => {
-    assert.match(ids['inc-tbody'].textContent, /No incidents recorded\./);
-    assert.match(ids['inc-history'].textContent, /ok/);
+    assert.match(ids['inc-tbody'].textContent, /暂无事件记录。/);
+    assert.match(ids['inc-history'].textContent, /正常/);
     productText();
   });
   responses.push(response({incidents: [], runtime: {enabled: true, running: true, phase: 'idle', cycles_completed: 1, runtime_failures: 0, last_error_code: null, last_evaluated_end_epoch: 1, open_incident: false}, history: {enabled: true, degraded: true}, truncated: false, limit: 100}), response({markers: [], truncated: false, limit: 200}));
   await ui.loadIncidents(); await ui.loadMarkers(); await flush();
   check('B5: degraded history + empty list => uncertainty wording and a visible degraded chip, never the authoritative wording', () => {
-    assert.match(ids['inc-tbody'].textContent, /an empty result cannot be treated as proof that no incidents were recorded/);
-    assert.doesNotMatch(ids['inc-tbody'].textContent, /No incidents recorded\./);
-    assert.match(ids['inc-history'].textContent, /degraded/);
+    assert.match(ids['inc-tbody'].textContent, /空结果不能证明没有记录过事件/);
+    assert.doesNotMatch(ids['inc-tbody'].textContent, /暂无事件记录。/);
+    assert.match(ids['inc-history'].textContent, /已降级/);
     productText();
   });
   responses.push(response({incidents: [], runtime: {enabled: true, running: true, phase: 'idle', cycles_completed: 1, runtime_failures: 0, last_error_code: null, last_evaluated_end_epoch: 1, open_incident: false}, history: {enabled: false, degraded: true}, truncated: false, limit: 100}), response({markers: [], truncated: false, limit: 200}));
   await ui.loadIncidents(); await ui.loadMarkers(); await flush();
   check('B5: disabled history warns visibly and an empty list stays uncertainty, not proof', () => {
-    assert.match(ids['inc-history'].textContent, /unavailable/);
-    assert.match(ids['inc-tbody'].textContent, /Incident history is currently degraded/);
+    assert.match(ids['inc-history'].textContent, /不可用/);
+    assert.match(ids['inc-tbody'].textContent, /事件历史当前处于降级状态/);
     productText();
   });
   ui.closeIncidentDetail();
@@ -877,6 +871,222 @@ async function main() {
     assert.ok(!ids['inc-list-card'].className.includes('hidden'));
     productText();
   });
-  assert.equal(count, 90, 'UI assertion count guard');
+  assert.equal(count, 90, 'existing UI assertion count guard');
+  ui.state.e3Mutation = null; ui.state.e3PendingRetry = null;
+  ui.state.session = {authenticated: true, csrf_token: 'csrf'};
+  setStatus(healthy()); ui.renderE3Clients(clients);
+  const device = {device: 'laptop-01', probe_id: 'probe-001', site_label: 'office', path_label: 'wifi', ingest_url: 'https://192.0.2.1:38443/api/v1/remote-probes/ingest', desired: 'active', verified: 'active'};
+  const listDevices = (rows = [device], next = null) => response({ok: true, data: {devices: rows, next_cursor: next}});
+  check('P6: only mutable named clients have Devices / Bundle; existing YAML controls remain', () => {
+    assert.doesNotMatch(ids['e3-clients-body'].children[0].textContent, /设备/);
+    assert.match(ids['e3-clients-body'].children[1].textContent, /下载.*删除.*设备 \/ 客户端包/);
+    assert.match(ids['p6-device-panel'].textContent, /Windows 程序需由管理员先发布/);
+  });
+  responses.push(listDevices()); ui.openP6Devices('alice'); await flush();
+  check('P6: metadata list is POST plus CSRF without an enrollment key', () => {
+    const req = requests.at(-1);
+    assert.equal(req.url, '/api/v1/clients/probes/list'); assert.equal(req.method, 'POST');
+    assert.equal(req.headers['X-CSRF-Token'], 'csrf'); assert.ok(!('Idempotency-Key' in req.headers));
+    assert.deepEqual(JSON.parse(req.body), {name: 'alice'});
+    assert.match(ids['p6-devices-body'].textContent, /登记已确认.*下载 Windows 客户端包.*单独下载配置.*撤销上传权限/);
+  });
+  const beforeUrls = createdUrls.length;
+  responses.push(fileResponse('fixture ZIP credential bytes')); ui.downloadP6Bundle('laptop-01'); await flush();
+  check('P6: ZIP goes straight to a Blob; object URL and temporary anchor are released', () => {
+    const req = requests.at(-1);
+    assert.deepEqual(JSON.parse(req.body), {name: 'alice', device: 'laptop-01'});
+    assert.equal(req.url, '/api/v1/clients/bundle'); assert.ok(!('Idempotency-Key' in req.headers));
+    assert.equal(createdUrls.length, beforeUrls + 1); assert.equal(revokedUrls.at(-1), createdUrls.at(-1));
+    assert.equal(document.body.children.length, 0);
+    assert.doesNotMatch(dom.textContent, /fixture ZIP credential bytes/);
+  });
+  responses.push(response({code: 'E_P6_ARTIFACT'}, 503)); ui.downloadP6Bundle('laptop-01'); await flush();
+  check('P6: artifact failure stays explicit and does not automatically retry a sensitive download', () => {
+    assert.match(ids['p6-msg'].textContent, /客户端包读取失败/); assert.equal(ui.p6View.busy, false);
+    assert.equal(createdUrls.length, beforeUrls + 1);
+  });
+  responses.push(listDevices([{...device, verified: 'pending'}])); ui.loadP6Devices(); await flush();
+  check('P6: pending enrollment offers Verify again and cannot download credentials', () => {
+    assert.match(ids['p6-devices-body'].textContent, /登记待确认.*重新核验/);
+    assert.doesNotMatch(ids['p6-devices-body'].textContent, /下载 Windows 客户端包|单独下载配置/);
+  });
+  responses.push(response({ok: true, data: device}), listDevices());
+  ui.p6Operate('resume', {name: 'alice', device: 'laptop-01'}); await flush();
+  check('P6: lost browser intent can verify the existing identity without a new enrollment key', () => {
+    const req = requests.findLast(r => r.url.endsWith('/resume'));
+    assert.ok(!('Idempotency-Key' in req.headers)); assert.deepEqual(JSON.parse(req.body), {name: 'alice', device: 'laptop-01'});
+    assert.match(ids['p6-msg'].textContent, /设备登记已确认/);
+  });
+  const newDevice = {name: 'alice', device: 'laptop-02', site_label: 'office', path_label: 'operator-path'};
+  responses.push(response({code: 'result_unknown', uncertain: true, retriable: true}, 504), listDevices());
+  ui.p6Operate('enroll', newDevice, 'enrollment-ui-000001'); await flush();
+  check('P6: an uncertain enrollment keeps its exact intent and locks new enrollment', () => {
+    assert.equal(ui.p6View.retry.key, 'enrollment-ui-000001'); assert.equal(ids['p6-enroll'].disabled, true);
+    const n = requests.length; ui.p6Operate('enroll', {...newDevice, device: 'laptop-03'}, 'another-key');
+    ui.openP6Devices('bob'); ui.downloadP6Bundle('laptop-01'); assert.equal(requests.length, n);
+  });
+  responses.push(response({ok: true, data: {...device, device: 'laptop-02'}}), listDevices());
+  ids['p6-retry'].click(); await flush();
+  check('P6: explicit retry reuses the same enrollment key, then clears the pending intent', () => {
+    const reqs = requests.filter(r => r.url.endsWith('/enroll'));
+    assert.equal(reqs.at(-1).headers['Idempotency-Key'], reqs.at(-2).headers['Idempotency-Key']);
+    assert.equal(reqs.at(-1).body, reqs.at(-2).body); assert.equal(ui.p6View.retry, null);
+  });
+  const revoked = {...device, desired: 'revoked', verified: 'revoked'};
+  responses.push(response({ok: true, data: {revoked: true, count: 1}}), listDevices([revoked]));
+  ids['p6-devices-body'].children[0].children[5].children.find(c => c.tag === 'button' && c.textContent === '撤销上传权限').click(); await flush();
+  check('P6: confirmed revocation removes download and recovery actions', () => {
+    assert.match(ids['p6-devices-body'].textContent, /撤销已确认/);
+    assert.doesNotMatch(ids['p6-devices-body'].textContent, /下载|重新核验|重试撤销/);
+    assert.match(ids['p6-msg'].textContent, /服务器已确认撤销上传权限/);
+    assert.deepEqual(JSON.parse(requests.findLast(r => r.url.endsWith('/revoke')).body),
+      {name: 'alice', device: 'laptop-01', probe_id: device.probe_id});
+  });
+  responses.push(listDevices([{...revoked, verified: 'pending'}], 'probe-cursor')); ui.loadP6Devices(); await flush();
+  check('P6: pending revocation and bounded pagination remain explicit', () => {
+    assert.match(ids['p6-devices-body'].textContent, /撤销待确认.*重试撤销/);
+    assert.equal(ids['p6-next'].className.includes('hidden'), false);
+  });
+  responses.push(listDevices([], null)); ids['p6-next'].click(); await flush();
+  check('P6: paging sends only the server-issued cursor and replaces the current page', () => {
+    assert.deepEqual(JSON.parse(requests.at(-1).body), {name: 'alice', cursor: 'probe-cursor'});
+    assert.equal(ids['p6-devices-body'].children.length, 0);
+  });
+  responses.push(() => Promise.reject(new Error('network'))); ui.loadP6Devices(); await flush();
+  check('P6: unavailable metadata does not invent successful enrollment or revocation', () => {
+    assert.match(ids['p6-msg'].textContent, /尚未确认任何登记或撤销结果/);
+    assert.equal(ids['p6-devices-body'].children.length, 0);
+  });
+  responses.push(() => Promise.reject(new Error('network')), listDevices());
+  ui.p6Operate('enroll', newDevice, 'network-enrollment-0001'); await flush();
+  check('P6: a network failure after dispatch retains the exact enrollment intent', () => {
+    assert.equal(ui.p6View.retry.key, 'network-enrollment-0001');
+    assert.equal(JSON.stringify(ui.p6View.retry.body), JSON.stringify(newDevice));
+    assert.equal(ids['p6-enroll'].disabled, true); assert.equal(ui.p6View.busy, false);
+  });
+  setStatus({...healthy(), transport: 'stale'});
+  check('P6: stale management disables all device dispatch paths', () => {
+    const n = requests.length; ui.openP6Devices('bob'); ui.loadP6Devices();
+    ui.p6Operate('revoke', {name: 'alice', device: 'laptop-01'}); ui.downloadP6Bundle('laptop-01');
+    assert.equal(requests.length, n); assert.equal(ids['p6-enroll'].disabled, true);
+    assert.equal(ui.p6View.busy, false);
+  });
+  check('Chinese page declares language and translated navigation', () => {
+    assert.match(html, /lang="zh-CN"/); assert.match(html, /概览/); assert.match(html, /客户端管理/);
+  });
+  check('Chinese setup caveat and recovery warning retain product boundaries', () => {
+    assert.match(ids['p6-device-panel'].textContent, /Windows 程序需由管理员先发布/);
+    assert.match(html, /服务器只保存其哈希/);
+  });
+  check('Chinese transport labels preserve raw identity and protocol data', () => {
+    assert.equal(clients.data.clients[0].name, 'legacy');
+    assert.equal(clients.data.clients[0].protocols[0], 'reality');
+    assert.match(html, /监控信息/);
+  });
+  check('Chinese state rendering keeps active CSS and English wire enums', () => {
+    ui.state.snapshot.devices.legacy.status = 'ACTIVE'; ui.render();
+    const badge = ids['devices-grid'].querySelector('.device-status');
+    assert.equal(badge.textContent, '活动'); assert.match(badge.className, /\bactive\b/);
+    assert.equal(ui.state.snapshot.devices.legacy.status, 'ACTIVE');
+    ui.state.incidents.runtime.phase = 'idle'; ui.renderIncRuntime();
+    assert.match(ids['inc-runtime'].textContent, /空闲/);
+    assert.equal(ui.state.incidents.runtime.phase, 'idle');
+    assert.equal(ui.incidentCopy('The evidence records 2 open questions; see the reasons below.'), '证据记录了 2 个待解问题，请查看下方原因。');
+    assert.equal(ui.incidentCopy('Future server copy <b>unknown</b>'), 'Future server copy <b>unknown</b>');
+  });
+  ui.p6View.retry = null; setStatus(healthy());
+  const softwareResponse = scope => ({...fileResponse('generic software'), headers: {get: () => scope}});
+  const softwareUrls = createdUrls.length;
+  responses.push(softwareResponse('lab')); ids['p6-windows-download'].click(); await flush();
+  check('Windows software uses separate authenticated POST, empty body, no credential selector', () => {
+    const req = requests.at(-1); assert.equal(req.url, '/api/v1/clients/windows');
+    assert.equal(req.method, 'POST'); assert.deepEqual(JSON.parse(req.body), {});
+    assert.equal(req.headers['X-CSRF-Token'], 'csrf'); assert.ok(!('Idempotency-Key' in req.headers));
+    assert.match(ids['p6-msg'].textContent, /受控测试程序.*不能用于正式发布.*P6Setup.exe/);
+    assert.equal(createdUrls.length, softwareUrls + 1); assert.equal(revokedUrls.at(-1), createdUrls.at(-1));
+    assert.equal(document.body.children.length, 0);
+  });
+  responses.push(softwareResponse('production')); ui.downloadP6Windows(); await flush();
+  check('Production software instructions select a separate device Bundle', () => {
+    assert.match(ids['p6-msg'].textContent, /Windows 程序已下载.*选择该设备的配置包/);
+    assert.doesNotMatch(ids['p6-msg'].textContent, /受控测试/); assert.equal(ui.p6View.busy, false);
+  });
+  responses.push(response({code: 'E_P6_WINDOWS_UNAVAILABLE'}, 503)); ui.downloadP6Windows(); await flush();
+  check('Missing or corrupt signed distribution is explicit and never silently retried', () => {
+    assert.match(ids['p6-msg'].textContent, /管理员发布签名程序包后再下载/);
+    assert.equal(createdUrls.length, softwareUrls + 2); assert.equal(ui.p6View.busy, false);
+  });
+  responses.push(softwareResponse('unexpected')); ui.downloadP6Windows(); await flush();
+  check('Unknown distribution scope cannot become a downloaded release', () => {
+    assert.equal(createdUrls.length, softwareUrls + 2); assert.match(ids['p6-msg'].textContent, /下载失败/);
+  });
+  ui.p6View.retry = {op: 'enroll'};
+  check('Pending enrollment prevents software dispatch too', () => {
+    const n = requests.length; ui.downloadP6Windows(); assert.equal(requests.length, n);
+  });
+  ui.p6View.retry = null; setStatus({...healthy(), transport: 'stale'});
+  check('Stale management disables Windows download button and dispatch', () => {
+    const n = requests.length; ui.renderP6Devices(); ui.downloadP6Windows();
+    assert.equal(requests.length, n); assert.equal(ids['p6-windows-download'].disabled, true);
+  });
+  ui.state.session = {authenticated: true, csrf_token: 'csrf'};
+
+  setStatus(healthy()); ui.p6View.retry = null; ui.p6View.name = 'alice';
+  ui.p6View.rows = [device]; ui.renderP6Devices();
+  check('Client package primary fields hide engineering identities in technical details', () => {
+    const cells = ids['p6-devices-body'].children[0].children;
+    assert.deepEqual(cells.slice(0, 4).map(c => c.textContent), ['alice', 'laptop-01', 'office', 'wifi']);
+    assert.equal(cells.length, 6);
+    assert.match(cells[5].textContent, /技术详情.*probe_id: probe-001/);
+    assert.ok(cells[5].children.some(c => c.tag === 'details'));
+  });
+  let combinedUrls = createdUrls.length;
+  responses.push(softwareResponse('lab')); ui.downloadP6Client('laptop-01'); await flush();
+  check('One private Windows client download binds exact Device and releases Blob resources', () => {
+    const req = requests.at(-1); assert.equal(req.url, '/api/v1/clients/windows-bundle');
+    assert.deepEqual(JSON.parse(req.body), {name: 'alice', device: 'laptop-01'});
+    assert.equal(req.headers['X-CSRF-Token'], 'csrf'); assert.ok(!('Idempotency-Key' in req.headers));
+    assert.equal(createdUrls.length, combinedUrls + 1); assert.equal(revokedUrls.at(-1), createdUrls.at(-1));
+    assert.equal(document.body.children.length, 0);
+    assert.match(ids['p6-msg'].textContent, /受控测试.*自动识别.*安装仍需你确认.*私密保管/);
+  });
+  responses.push(response({code: 'E_P6_WINDOWS_UNAVAILABLE'}, 503)); ui.downloadP6Client('laptop-01'); await flush();
+  check('Combined unavailable software never retries or invents a successful device package', () => {
+    assert.equal(createdUrls.length, combinedUrls + 1);
+    assert.match(ids['p6-msg'].textContent, /管理员发布签名程序包/); assert.equal(ui.p6View.busy, false);
+  });
+  responses.push(softwareResponse('unknown')); ui.downloadP6Client('laptop-01'); await flush();
+  check('Combined download refuses unknown release scope before creating a file', () => {
+    assert.equal(createdUrls.length, combinedUrls + 1); assert.match(ids['p6-msg'].textContent, /下载失败/);
+  });
+  setStatus({...healthy(), transport: 'stale'});
+  check('Combined download preserves stale-management containment', () => {
+    const n = requests.length; ui.downloadP6Client('laptop-01'); assert.equal(requests.length, n);
+  });
+
+  document.visibilityState = 'visible'; monoNow = 100; ui.setIdleDeadline(900);
+  let activityMark = requests.length;
+  ui.userActivity({isTrusted: false}); await flush();
+  check('programmatic input never renews idle expiry', () => assert.equal(requests.length, activityMark));
+  document.visibilityState = 'hidden'; ui.userActivity({isTrusted: true}); await flush();
+  check('hidden-page input never renews idle expiry', () => assert.equal(requests.length, activityMark));
+  document.visibilityState = 'visible'; responses.push(response({idle_remaining_seconds: 900}));
+  ui.userActivity({isTrusted: true}); await flush();
+  check('genuine visible input sends a closed CSRF-protected activity notification', () => {
+    assert.equal(requests.length, activityMark + 1); assert.equal(requests.at(-1).url, '/api/v1/session/activity');
+    assert.equal(requests.at(-1).body, '{}'); assert.equal(requests.at(-1).headers['X-CSRF-Token'], 'csrf');
+  });
+  activityMark = requests.length; monoNow += 20000; ui.userActivity({isTrusted: true}); await flush();
+  check('input activity notifications are throttled', () => assert.equal(requests.length, activityMark));
+  ui.state.view = 'overview'; ui.state.lastSnapshotAt = Date.now(); ui.startWatchdog();
+  const watchdog = [...intervalCallbacks.values()].at(-1); monoNow += 10000; watchdog(); await flush();
+  check('background watchdog never generates activity renewal', () => assert.equal(requests.length, activityMark));
+  monoNow += 900000; watchdog(); await flush();
+  check('inactivity closes the dashboard and stops its watchdog without retrying a mutation', () => {
+    assert.equal(ui.state.session, null); assert.ok(!ids['login-overlay'].className.includes('hidden'));
+    assert.match(ids['login-error'].textContent, /15 分钟/); assert.equal(intervalCallbacks.size, 0);
+    assert.equal(requests.length, activityMark);
+  });
+  assert.equal(count, 125, 'UI assertion count guard');
 }
 main().catch(err => { console.error(err); process.exitCode = 1; });

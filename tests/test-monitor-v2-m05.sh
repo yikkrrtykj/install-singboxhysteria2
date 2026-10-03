@@ -58,8 +58,8 @@ SERVER_SRC="$(cat "$ROOT/monitor-v2/web/server.py")"
 INDEX_SRC="$(cat "$ROOT/monitor-v2/web/static/index.html")"
 APP_SRC="$(cat "$ROOT/monitor-v2/web/static/app.js")"
 assert_contains 'reauth_required' "$SERVER_SRC" "backend emits the reauth_required signal"
-assert_contains 'reauth_required' "$APP_SRC" "frontend keys its password panel on reauth_required"
-assert_contains 'error.code === "reauth_required"' "$APP_SRC" "the panel is opened ONLY by that machine code"
+assert_contains '/api/v1/session/activity' "$APP_SRC" "frontend reports explicit user activity"
+assert_contains 'event.isTrusted' "$APP_SRC" "programmatic events cannot renew browser inactivity"
 assert_contains '/api/v1/step-up' "$SERVER_SRC" "backend exposes the step-up endpoint"
 assert_contains 'verify_password' "$SERVER_SRC" "step-up reuses the existing password verification"
 assert_not_contains 'verify_secret' "$SERVER_SRC" "step-up never reaches for a second verification path"
@@ -67,7 +67,7 @@ assert_contains 'login_limiter' "$WEB_SRC" "step-up shares the existing login ra
 assert_contains 'management.activate' "$WEB_SRC" "the four-op mutation boundary is declared"
 assert_contains 'client.delete' "$WEB_SRC" "the four-op mutation boundary is declared (client.delete)"
 assert_contains 'e3_unavailable' "$SERVER_SRC" "the mutation boundary fails closed without an E3 backend (M2; the M0.5 501 was replaced by the real adapter)"
-assert_contains 'id="stepup-overlay" class="overlay hidden"' "$INDEX_SRC" "the password panel is hidden on load (never asked proactively)"
+assert_not_contains 'id="stepup-overlay"' "$INDEX_SRC" "ordinary operations have no second password overlay"
 assert_contains 'id="e3-availability"' "$INDEX_SRC" "the dashboard renders client availability from management status"
 # T12 (static half): no code path in the web process addresses either
 # privileged tree. There is no read, no write, no path constant -- the only
@@ -408,10 +408,9 @@ def group_gate():
     out["T1_dashboard_snapshot_ok"] = req(
         port, "GET", "/api/v1/snapshot", {"Cookie": cookie})["status"] == 200
 
-    # T2: every read-only API works with NO step-up, and no second password
-    # is ever requested just for loading.
-    out["T2_step_up_initially_absent"] = \
-        session_info(port, cookie).get("step_up_active") is False
+    # T2: password login already authorizes; reads need no second password.
+    out["T2_login_authorization_present"] = \
+        session_info(port, cookie).get("step_up_active") is True
     out["T2_snapshot_read_only_ok"] = req(
         port, "GET", "/api/v1/snapshot", {"Cookie": cookie})["status"] == 200
     out["T2_whitelist_read_only_ok"] = req(
@@ -419,8 +418,7 @@ def group_gate():
     out["T2_session_read_only_ok"] = req(
         port, "GET", "/api/v1/session", {"Cookie": cookie})["status"] == 200
 
-    # T3: Add is the product-UX exception: session+CSRF is sufficient.
-    # Every OTHER privileged mutation remains step-up gated.
+    # T3: all operations accept the password-login grant; backend is unwired.
     add = mutate(port, ADD_PATH, cookie, csrf)
     out["T3_add_no_stepup_not_401"] = add["status"] == 503 \
         and json.loads(add["body"]).get("code") == "e3_unavailable"
@@ -430,10 +428,10 @@ def group_gate():
         r = mutate(port, path, cookie, csrf)
         statuses.append(r["status"])
         codes.append(json.loads(r["body"]).get("error"))
-    out["T3_protected_mutations_401"] = \
-        statuses == [401] * len(STEPUP_MUTATION_PATHS)
-    out["T3_protected_reauth_required"] = \
-        codes == ["reauth_required"] * len(STEPUP_MUTATION_PATHS)
+    out["T3_login_authorized_mutations_503"] = \
+        statuses == [503] * len(STEPUP_MUTATION_PATHS)
+    out["T3_login_authorized_backend_unavailable"] = \
+        codes == ["the E3 adapter is not wired in this build"] * len(STEPUP_MUTATION_PATHS)
 
     # T4: the correct password opens the window.
     r = step_up(port, cookie, csrf)
@@ -542,9 +540,7 @@ def group_revocation():
     out["T7_mutation_after_logout_401"] = \
         mutate(port, "/api/v1/clients/add", cookie, csrf)["status"] == 401
 
-    # T8: a password change revokes EVERY step-up (the caller's too) while
-    # keeping the caller's ordinary session -- no abrupt logout, no mutation
-    # privilege.
+    # T8: a password change revokes every session and its authorization.
     stack = make_stack(tempfile.mkdtemp(), password=PASSWORD)
     port = stack["port"]
     a = login(port)
@@ -563,19 +559,19 @@ def group_revocation():
             json_body({"current_password": PASSWORD,
                        "new_password": NEW_PASSWORD}))
     out["T8_password_change_200"] = r["status"] == 200
-    out["T8_caller_session_kept"] = \
-        stack["auth"].sessions.resolve(ta) is not None
+    out["T8_caller_session_dropped"] = \
+        stack["auth"].sessions.resolve(ta) is None
     out["T8_caller_step_up_revoked"] = \
         not stack["auth"].sessions.step_up_active(ta)
     out["T8_other_session_dropped"] = \
         stack["auth"].sessions.resolve(tb) is None
     r = mutate(port, "/api/v1/management/activate", ca, sa)
     out["T8_caller_mutation_401"] = r["status"] == 401 \
-        and json.loads(r["body"]).get("error") == "reauth_required"
-    out["T8_caller_read_still_ok"] = req(
-        port, "GET", "/api/v1/snapshot", {"Cookie": ca})["status"] == 200
+        and json.loads(r["body"]).get("error") == "login required"
+    out["T8_caller_read_refused"] = req(
+        port, "GET", "/api/v1/snapshot", {"Cookie": ca})["status"] == 401
 
-    # T9: recovery rotation revokes every step-up; sessions survive.
+    # T9: recovery rotation revokes every session and its authorization.
     stack = make_stack(tempfile.mkdtemp(), password=PASSWORD,
                        recovery=RECOVERY_KEY)
     port = stack["port"]
@@ -598,9 +594,9 @@ def group_revocation():
     out["T9_all_step_ups_revoked"] = \
         not stack["auth"].sessions.step_up_active(ta) \
         and not stack["auth"].sessions.step_up_active(tb)
-    out["T9_sessions_kept"] = \
-        stack["auth"].sessions.resolve(ta) is not None \
-        and stack["auth"].sessions.resolve(tb) is not None
+    out["T9_sessions_dropped"] = \
+        stack["auth"].sessions.resolve(ta) is None \
+        and stack["auth"].sessions.resolve(tb) is None
     out["T9_mutation_401"] = \
         mutate(port, "/api/v1/management/activate", ca, sa)["status"] == 401
     store = AuthStore(tempfile.mkdtemp())
@@ -775,7 +771,7 @@ def group_status():
 
     # step_up_active is reported per session, false before any grant.
     info5 = session_info(frozen["port"], cookie)
-    out["status_step_up_flag_before"] = info5.get("step_up_active") is False
+    out["status_login_authorization_before_legacy_grant"] = info5.get("step_up_active") is True
     csrf = info5.get("csrf_token") or ""
     step_up(frozen["port"], cookie, csrf)
     out["status_step_up_flag_after"] = \
@@ -823,13 +819,13 @@ check 'd.get("_harness_error") is None' "gate harness ran clean"
 check 'd["T1_login_ok"]' "T1: an ordinary login succeeds"
 check 'd["T1_cookie_httponly"]' "T1: login yields an HttpOnly session cookie"
 check 'd["T1_dashboard_snapshot_ok"]' "T1: the dashboard reads the snapshot right after login"
-check 'd["T2_step_up_initially_absent"]' "T2: no step-up exists merely because the page loaded"
+check 'd["T2_login_authorization_present"]' "T2: password login grants administrative authorization"
 check 'd["T2_snapshot_read_only_ok"]' "T2: snapshot is read-only, no step-up needed"
 check 'd["T2_whitelist_read_only_ok"]' "T2: whitelist view needs no step-up"
 check 'd["T2_session_read_only_ok"]' "T2: session info needs no step-up"
 check 'd["T3_add_no_stepup_not_401"]' "T3: Add is authorized by session+CSRF without step-up"
-check 'd["T3_protected_mutations_401"]' "T3: protected mutations still answer 401 without step-up"
-check 'd["T3_protected_reauth_required"]' "T3: protected mutations return reauth_required"
+check 'd["T3_login_authorized_mutations_503"]' "T3: protected operations pass login authorization before unavailable backend"
+check 'd["T3_login_authorized_backend_unavailable"]' "T3: protected operations return the honest unavailable-backend verdict"
 check 'd["T4_step_up_200"]' "T4: the correct password completes step-up"
 check 'd["T4_status_ok"]' "T4: step-up answers {status: ok}"
 check 'd["T4_expires_in_300"]' "T4: the window is 300 seconds"
@@ -867,16 +863,16 @@ check 'd["T7_step_up_dropped"]' "T7: logout drops the step-up immediately"
 check 'd["T7_mutation_after_logout_401"]' "T7: mutations are refused after logout"
 check 'd["T8_both_live"]' "T8: two sessions each hold a step-up"
 check 'd["T8_password_change_200"]' "T8: the password change succeeds"
-check 'd["T8_caller_session_kept"]' "T8: the caller keeps an ordinary session (no abrupt logout)"
+check 'd["T8_caller_session_dropped"]' "T8: password change drops the caller session"
 check 'd["T8_caller_step_up_revoked"]' "T8: the caller's step-up is revoked by the change"
 check 'd["T8_other_session_dropped"]' "T8: other sessions are dropped outright"
 check 'd["T8_caller_mutation_401"]' "T8: the caller must re-authenticate to mutate"
-check 'd["T8_caller_read_still_ok"]' "T8: read-only access keeps working"
+check 'd["T8_caller_read_refused"]' "T8: reads are denied after password change"
 check 'd["T9_both_live"]' "T9: two sessions each hold a step-up"
 check 'd["T9_rotate_200"]' "T9: recovery rotation succeeds"
 check 'd["T9_rotate_new_key"]' "T9: rotation issues a new key"
 check 'd["T9_all_step_ups_revoked"]' "T9: rotation revokes ALL step-ups"
-check 'd["T9_sessions_kept"]' "T9: rotation keeps the sessions themselves"
+check 'd["T9_sessions_dropped"]' "T9: rotation drops every session"
 check 'd["T9_mutation_401"]' "T9: mutation refused after rotation"
 check 'd["T9_set_recovery_key_revokes"]' "T9: the store revokes on recovery-key change"
 check 'd["T10_first_live"]' "T10: session + step-up live before the restart"
@@ -921,7 +917,7 @@ check 'd["status_provider_error_fails_closed"]' "an undeterminable management st
 check 'd["status_frozen_monitor_not_running"]' "a wedged publisher degrades monitor_running"
 check 'd["status_frozen_management_still_false"]' "management_active stays independent of that failure"
 check 'd["status_frozen_snapshot_still_served"]' "the read-only dashboard keeps serving while degraded"
-check 'd["status_step_up_flag_before"]' "step_up_active is false before any grant"
+check 'd["status_login_authorization_before_legacy_grant"]' "password login authorizes before any legacy step-up"
 check 'd["status_step_up_flag_after"]' "step_up_active is true after a grant"
 
 printf '\n== summary ==\n'

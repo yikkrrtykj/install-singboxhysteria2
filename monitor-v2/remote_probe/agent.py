@@ -300,6 +300,14 @@ class RemoteProbeAgent:
         return {ROLE_REALITY: self.config.reality_node,
                 ROLE_HY2: self.config.hy2_node}
 
+    def _probe_egress(self):
+        """Base/DARK egress policy; production may choose a fixed provider."""
+        return dp.probe_egress(self.config.egress_host, previous=self._baseline)
+
+    def _probe_https(self):
+        """Base/DARK behavior remains GET / with exact HTTP 200."""
+        return dp.probe_https(self.config.https_host)
+
     def collect_sample(self, now=None):
         """Run one bounded evidence cycle and return the closed sample dict."""
         now = self.clock() if now is None else now
@@ -390,12 +398,10 @@ class RemoteProbeAgent:
             return value
 
         dns_slot = slot(lambda: dp.probe_dns(self.config.dns_host))
-        https_slot = slot(lambda: dp.probe_https(self.config.https_host))
+        https_slot = slot(self._probe_https)
         tcp_slot = slot(lambda: dp.probe_tcp(self.config.vps_host,
                                              self.config.vps_port))
-        egress_slot = slot(lambda: dp.probe_egress(
-            self.config.egress_host, previous=self._baseline),
-            fallback=dp.failed_egress)
+        egress_slot = slot(self._probe_egress, fallback=dp.failed_egress)
         if egress_slot["status"] == dp.STATUS_OK:
             # STAGED, not committed: the durable baseline may only move after
             # the sample carrying this observation is itself durable.

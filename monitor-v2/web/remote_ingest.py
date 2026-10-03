@@ -234,12 +234,29 @@ class RemoteIngest:
         """False while the operator has not configured the remote plane at
         all (the DARK default): the route then answers a plain 404 like any
         other unknown path, so an unconfigured Monitor gains no surface."""
+        # An enrollment can bring a running DARK plane online without restart.
+        # The definitive reload/authentication/commit fence is in handle().
+        import os
+        if hasattr(self.registry, 'config_path'):
+            return os.path.lexists(self.registry.config_path)
         state, _sub = self.registry.health()
         return state != "not_configured"
 
     # -- status --------------------------------------------------------------
 
     def status(self):
+        from web.remote_registry import RegistryError
+        if hasattr(self.registry, 'config_path'):
+            try:
+                with self.registry.live():
+                    return self._status_live()
+            except (RegistryError, OSError):
+                return {'status': 'degraded', 'subcode': 'remote_config_invalid',
+                        'probes_configured': 0, 'suspended_probes': [],
+                        'probes': {}, 'store': None}
+        return self._status_live()
+
+    def _status_live(self):
         """Closed remote-plane status (§12/§14 primitives; the HTTP read
         surface belongs to a later PR). A store failure never touches the
         History health object -- this dict is not consumed by
@@ -312,6 +329,12 @@ class RemoteIngest:
         }
 
     def read_samples(self, start_epoch, end_epoch, probe_id=None, limit=256):
+        if hasattr(self.registry, 'config_path'):
+            with self.registry.live():
+                return self._read_samples_live(start_epoch, end_epoch, probe_id, limit)
+        return self._read_samples_live(start_epoch, end_epoch, probe_id, limit)
+
+    def _read_samples_live(self, start_epoch, end_epoch, probe_id=None, limit=256):
         """Internal retained-sample primitive for later presentation work.
 
         No incident/HTTP route is added. Labels are current operator assertions;
@@ -331,6 +354,20 @@ class RemoteIngest:
     # -- the one machine entry point -----------------------------------------
 
     def handle(self, raw_body, headers, now=None):
+        from web.remote_registry import RegistryError
+        # Apply the identity-blind bound before any config/key filesystem work.
+        allowed, retry_after = self.preauth.check()
+        if not allowed:
+            return self._rate_limited(retry_after)
+        if hasattr(self.registry, 'config_path'):
+            try:
+                with self.registry.live():
+                    return self._handle_live(raw_body, headers, now)
+            except (RegistryError, OSError):
+                return 503, {'error': 'remote_config_invalid'}, ()
+        return self._handle_live(raw_body, headers, now)
+
+    def _handle_live(self, raw_body, headers, now=None):
         """The full ingest verdict -> ``(status, payload, extra_headers)``.
 
         ``raw_body`` is the EXACT received byte string; ``headers`` is the
@@ -338,10 +375,6 @@ class RemoteIngest:
         raises: every outcome is a closed status.
         """
         now = float(self.clock() if now is None else now)
-        # 1. pre-auth process guard: bounded, unkeyed, identity-blind.
-        allowed, retry_after = self.preauth.check()
-        if not allowed:
-            return self._rate_limited(retry_after)
         # 2. header grammar.
         probe_id = headers.get(HEADER_PROBE_ID)
         run = headers.get(HEADER_RUN)
