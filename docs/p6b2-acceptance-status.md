@@ -54,3 +54,10 @@ fixes should invalidate only affected evidence, not restart all field steps.
   queues, acceptance counters and server behavior.
 - Review source/CI now; batch later signed delivery instead of making the
   operator reinstall solely to confirm these wording changes.
+
+## Next-stage tracking
+
+Continue the ordered checklist in [p6b2-todo.md](p6b2-todo.md). Existing sampler
+preparation is retained; tools/p6-resource-report.py verifies its saved single-
+profile reports without service or controller operations. Tool unit tests do
+not claim real30min performance; network/latency and field gates stay open.
