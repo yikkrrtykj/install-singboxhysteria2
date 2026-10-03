@@ -29,7 +29,7 @@ def export(package, publisher, output, lab=False):
         raise ValueError('native release host required')
     policy = WindowsSecurity(); package = Path(package); output = Path(output)
     meta = validate_release(package, policy)
-    if meta.get('entry') != 'gui-v1':
+    if meta.get('entry') not in ('gui-v1', 'gui-v2'):
         raise ValueError('graphical package required')
     verify_signatures(package, publisher)
     # Verify timestamps through the exact native system verifier, never PATH.

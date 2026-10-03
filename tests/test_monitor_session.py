@@ -62,7 +62,7 @@ class SessionTests(unittest.TestCase):
     def test_password_login_authorizes_all_protected_families_without_step_up(self):
         self.assertTrue(self.auth.sessions.step_up_active(self.token))
         self.assertRegex(self.auth.sessions.step_up_credentials(self.token)['fp'], '^[0-9a-f]{16}$')
-        expected = {'/api/v1/clients/windows': 503, '/api/v1/clients/bundle': 400,
+        expected = {'/api/v1/clients/windows-bundle': 400, '/api/v1/clients/windows': 503, '/api/v1/clients/bundle': 400,
                     '/api/v1/clients/export': 503, '/api/v1/clients/probes/enroll': 400,
                     '/api/v1/clients/probes/revoke': 400, '/api/v1/clients/delete': 503,
                     '/api/v1/management/activate': 503, '/api/v1/incidents/rearm': 503}

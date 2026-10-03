@@ -1,6 +1,7 @@
 """Root admission/HTTP authority fixtures, not Linux Authenticode claims."""
 import concurrent.futures
 import hashlib
+import io
 import importlib.util
 import json
 import os
@@ -11,6 +12,7 @@ import sys
 import tempfile
 import unittest
 import uuid
+import zipfile
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -219,6 +221,64 @@ class DownloadTests(BundleLinuxTests):
             self.assertEqual(r.returncode, 0, r.stderr.decode())
             self.assertEqual(marker.read_bytes(), b'public existing fixture')
             self.assertTrue((prefix / 'usr/local/lib/sbox-cm/publish-p6-windows.py').is_file())
+
+
+
+    def test_combined_client_real_http_contains_exact_software_and_current_device(self):
+        status,headers,raw=self.http(path='/api/v1/clients/windows-bundle')
+        self.assertEqual(status,200,raw)
+        self.assertEqual(int(headers['Content-Length']),len(raw))
+        self.assertIn('no-store',headers['Cache-Control'])
+        self.assertEqual(headers['X-P6-Distribution-Scope'],'lab')
+        self.assertIn('event-pc-laptop-01-windows-client.zip',headers['Content-Disposition'])
+        with zipfile.ZipFile(io.BytesIO(raw)) as outer,zipfile.ZipFile(io.BytesIO(self.dist_raw)) as software:
+            for name in software.namelist():self.assertEqual(outer.read(name),software.read(name))
+            with zipfile.ZipFile(io.BytesIO(outer.read('device-bundle.zip'))) as config:
+                self.assertEqual(config.read('ingest.key'),(self.row()['secret']+'\n').encode())
+                self.assertEqual(config.read('event-pc-mihomo.yaml'),outer.read('event-pc-mihomo.yaml'))
+                meta=json.loads(config.read('bundle.json'))
+                self.assertEqual(meta['v'],2);self.assertEqual(meta['location'],self.row()['site_label'])
+                self.assertEqual(meta['network_path'],self.row()['path_label'])
+                self.assertEqual(json.loads(config.read('profile.json'))['probe_id'],self.row()['probe_id'])
+        self.assertIn('client.bundle',self.calls)
+        self.assertTrue(any(row['op']=='client.bundle' for row in self.audit()))
+
+    def test_combined_unavailable_software_fails_before_sensitive_rpc(self):
+        self.app.windows_distribution=lambda artifact:d.open_release(artifact,str(self.root/'missing'))
+        status,_,raw=self.http(path='/api/v1/clients/windows-bundle')
+        self.assertEqual(status,503);self.assertEqual(json.loads(raw)['code'],'E_P6_WINDOWS_UNAVAILABLE')
+        self.assertEqual(self.calls,[])
+        self.assertTrue(self.app.bundle_slots.acquire(blocking=False));self.app.bundle_slots.release()
+
+    def test_combined_old_signed_release_fails_before_credential_export(self):
+        old, raw = fixture(self.generic, entry='gui-v1')
+        archive=self.root/'old.zip'; metadata=self.root/'old.json'
+        archive.write_bytes(raw);archive.chmod(0o644)
+        record=d.canonical(old);metadata.write_bytes(record);metadata.chmod(0o644)
+        d.publish(str(archive),str(metadata),hashlib.sha256(record).hexdigest(),old['publisher'],
+                  'lab',self.manifest,str(self.distribution))
+        status,_,body=self.http(path='/api/v1/clients/windows-bundle')
+        self.assertEqual(status,503);self.assertEqual(json.loads(body)['code'],'E_P6_WINDOWS_UNAVAILABLE')
+        self.assertEqual(self.calls,[])
+        self.assertEqual(self.download()[0],200)
+
+    def test_combined_closed_schema_auth_origin_and_shared_capacity(self):
+        route='/api/v1/clients/windows-bundle'
+        self.assertEqual(self.http(path=route,auth=False)[0],401)
+        self.assertEqual(self.http(path=route,csrf=False)[0],403)
+        self.assertEqual(self.http(path=route,headers={'Origin':'https://foreign'})[0],403)
+        for body in ({},{'name':'event-pc'},{'name':'event-pc','device':'laptop-01','path':'/root/secret'}):
+            self.assertEqual(self.http(path=route,body=body)[0],400)
+        for method in ('GET','PUT','DELETE'):self.assertEqual(self.http(path=route,method=method)[0],405)
+        self.app.bundle_slots.acquire();self.app.bundle_slots.acquire()
+        try:self.assertEqual(self.http(path=route)[0],429)
+        finally:self.app.bundle_slots.release();self.app.bundle_slots.release()
+        self.assertEqual(self.calls,[])
+
+    def test_combined_retired_device_cannot_download_and_other_identity_is_not_created(self):
+        self.worker.revoke('event-pc','laptop-01',self.generation,self.row()['probe_id'])
+        self.assertNotEqual(self.http(path='/api/v1/clients/windows-bundle')[0],200)
+        self.assertNotIn(self.row()['secret'].encode(),self.http(path='/api/v1/clients/windows-bundle')[2])
 
 
 def load_tests(loader, tests, pattern):

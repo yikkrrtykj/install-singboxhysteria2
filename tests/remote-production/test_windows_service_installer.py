@@ -650,10 +650,10 @@ try {
             kind, title = ctypes.create_unicode_buffer(256), ctypes.create_unicode_buffer(256)
             user.GetClassNameW(hwnd, kind, 256)
             user.GetWindowTextW(hwnd, title, 256)
-            if title.value.startswith('P6 管理 · E_'):
+            if title.value.startswith('客户端管理 · E_'):
                 faults.append(title.value)
                 user.PostMessageW(hwnd, 0x0010, 0, 0)
-            if title.value == 'P6 管理' and kind.value.startswith('WindowsForms10.'):
+            if title.value == '客户端管理' and kind.value.startswith('WindowsForms10.'):
                 observed.append(hwnd)
                 # This exact CI-owned application only, never another desktop app.
                 user.PostMessageW(hwnd, 0x0010, 0, 0)
@@ -675,8 +675,65 @@ try {
                 process.wait(timeout=10)
 
 
+
+    def test_native_combined_download_keeps_signatures_and_passive_adjacent_selection(self):
+        import io,zipfile
+        from p6_distribution import object_json
+        from web.p6_windows_bundle import WindowsClientPackage
+        from p6installer.bundle import discover_adjacent
+        output=self.protected/uuid.uuid4().hex
+        exporter.export(self.package,self.publisher,output,lab=True)
+        manifest=object_json((output/'release.json').read_bytes())
+        fx,config,_=self.profile()
+        with (output/'windows-installer.zip').open('rb') as source:
+            package=WindowsClientPackage(source,manifest,config.read_bytes(),'event-pc-mihomo.yaml',fx.parts['yaml'].encode())
+            try:raw=b''.join(package.chunks())
+            finally:package.close()
+        extracted=self.protected/uuid.uuid4().hex;self.policy.mkdir(str(extracted))
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:archive.extractall(extracted)
+        # Setup copies only signed software into protected staging. Adjacent
+        # private configuration stays in the original download directory and
+        # must never widen validate_release's closed package inventory.
+        verified=self.protected/uuid.uuid4().hex;self.policy.mkdir(str(verified))
+        for name in ('P6Setup.exe','Setup.ps1','payload.cat'):
+            (verified/name).write_bytes((extracted/name).read_bytes())
+        shutil.copytree(extracted/'payload',verified/'payload')
+        verify_signatures(verified,self.publisher)
+        self.assertEqual(validate_release(verified,self.policy),self.meta)
+        before={p.relative_to(extracted).as_posix():hashlib.sha256(p.read_bytes()).hexdigest() for p in extracted.rglob('*') if p.is_file()}
+        result=discover_adjacent(extracted,self.meta['artifact'])
+        self.assertEqual(result['state'],'selected');self.assertEqual(result['display']['device'],'laptop-01')
+        self.assertEqual(before,{p.relative_to(extracted).as_posix():hashlib.sha256(p.read_bytes()).hexdigest() for p in extracted.rglob('*') if p.is_file()})
+        self.assertEqual(self.service.state(self.manager._command(self.meta['release'])),0)
+
+    def test_native_display_import_conflict_and_retirement_preserve_identity_and_bytes(self):
+        import io,zipfile
+        from p6installer.status import snapshot
+        self.install();_,path,_=self.profile()
+        original=path.read_bytes()
+        imported=self.manager.operate('import',bundle=path,controller_secret='local-secret')
+        key=imported['profile'];profile_root=Path(self.manager.vault._path(key))
+        display_bytes=(profile_root/'display.json').read_bytes()
+        display=snapshot(self.manager)['profiles'][0]['display']
+        self.assertEqual(display['client'],'event-pc');self.assertEqual(display['device'],'laptop-01')
+        changed=io.BytesIO()
+        with zipfile.ZipFile(io.BytesIO(original)) as source,zipfile.ZipFile(changed,'w') as target:
+            for item in source.infolist():
+                value=source.read(item)
+                if item.filename=='bundle.json':
+                    meta=json.loads(value);meta['device']='different-device';value=canonical(meta)
+                target.writestr(item,value)
+        path.write_bytes(changed.getvalue())
+        with self.assertRaises(ConfigError):self.manager.operate('import',bundle=path,controller_secret='local-secret')
+        self.assertEqual((profile_root/'display.json').read_bytes(),display_bytes)
+        self.assertEqual(self.manager.vault.read_secret(key),bytes.fromhex('b'*64))
+        self.assertEqual(self.service.state(self.manager._command(self.meta['release'])),4)
+        self.manager.operate('remove',profile=key)
+        self.assertEqual((self.manager.root/'retired'/key/'display.json').read_bytes(),display_bytes)
+
+
 if __name__ == '__main__':
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(NativeInstallerTests)
-    assert suite.countTestCases() == 22
+    assert suite.countTestCases() == 24
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     raise SystemExit(0 if result.wasSuccessful() else 1)

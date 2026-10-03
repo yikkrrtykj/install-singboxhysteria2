@@ -16,13 +16,13 @@ def record(raw):
     return {'sha256': hashlib.sha256(raw).hexdigest(), 'size': len(raw)}
 
 
-def fixture(agent=b'FORMAT FIXTURE, NOT SIGNED', setup=b'FORMAT FIXTURE, NOT PE', publisher='A' * 40):
+def fixture(agent=b'FORMAT FIXTURE, NOT SIGNED', setup=b'FORMAT FIXTURE, NOT PE', publisher='A' * 40, entry='gui-v2'):
     artifact = dict(v=1, version='p6-agent-source-1-' + record(agent)['sha256'][:16], **record(agent))
     payload = {'p6-agent.pyz': agent, 'p6-installer.pyz': b'fixture installer', 'runtime/python.exe': b'fixture python',
                'runtime/pythonw.exe': b'fixture pythonw', 'runtime/python313.dll': b'fixture dll',
                'runtime/python313.zip': b'fixture stdlib',
                'runtime/python313._pth': b'python313.zip\n.\n../p6-agent.pyz\n../p6-installer.pyz\n'}
-    meta = {'v': 1, 'entry': 'gui-v1', 'runtime': 'cpython-3.13.16-amd64', 'artifact': artifact,
+    meta = {'v': 1, 'entry': entry, 'runtime': 'cpython-3.13.16-amd64', 'artifact': artifact,
             'files': {k: record(v) for k, v in payload.items()}}
     meta['release'] = hashlib.sha256(canonical(meta)).hexdigest()
     files = {'P6Setup.exe': setup, 'Setup.ps1': b'fixture script', 'payload.cat': b'fixture catalog',
@@ -103,6 +103,78 @@ class FormatTests(unittest.TestCase):
         # Use the artifact record from another fixture, not its whole manifest.
         self.m['artifact'] = self.m['artifact']['artifact']
         with self.assertRaises(DistributionError): verify_archive(io.BytesIO(self.raw), self.m)
+
+
+
+class ClientPackageTests(unittest.TestCase):
+    def prepare(self, agent=b'fixture signed-file bytes'):
+        from web.p6_windows_bundle import WindowsClientPackage
+        self.manifest,self.raw=fixture(agent)
+        self.source=io.BytesIO(self.raw)
+        verify_archive(self.source,self.manifest)
+        package=WindowsClientPackage(self.source,self.manifest,b'fixture-private-config',
+            'client-mihomo.yaml',b'canonical YAML\n')
+        self.addCleanup(package.close)
+        return package
+
+    def test_client_zip_interop_preserves_every_software_file_byte(self):
+        package=self.prepare()
+        raw=b''.join(package.chunks())
+        self.assertEqual(len(raw),package.size)
+        with zipfile.ZipFile(io.BytesIO(self.raw)) as original,zipfile.ZipFile(io.BytesIO(raw)) as combined:
+            self.assertEqual(combined.testzip(),None)
+            self.assertEqual(set(combined.namelist()),set(original.namelist())|{'device-bundle.zip','client-mihomo.yaml','README-client.txt'})
+            for name in original.namelist():
+                self.assertEqual(combined.read(name),original.read(name))
+            self.assertEqual(combined.read('device-bundle.zip'),b'fixture-private-config')
+            self.assertEqual(combined.read('client-mihomo.yaml'),b'canonical YAML\n')
+            self.assertIn('受控测试版',combined.read('README-client.txt').decode())
+
+    def test_large_software_uses_bounded_chunks_not_one_archive_buffer(self):
+        package=self.prepare(b'x'*(2*1024*1024))
+        sizes=[len(chunk) for chunk in package.chunks()]
+        self.assertEqual(sum(sizes),package.size)
+        self.assertLessEqual(max(sizes),65536)
+        self.assertGreater(len(sizes),32)
+
+    def test_input_and_total_capacity_are_closed(self):
+        from web.p6_windows_bundle import WindowsClientPackage
+        from unittest.mock import patch
+        m,raw=fixture()
+        for name,yaml,bundle in [('../bad',b'y',b'b'),('x-mihomo.yaml',b'',b'b'),('x-mihomo.yaml',b'y',b'x'*(5*1024*1024+1))]:
+            with self.subTest(name=name),self.assertRaises(DistributionError):
+                WindowsClientPackage(io.BytesIO(raw),m,bundle,name,yaml)
+        with patch('web.p6_windows_bundle.MAX_CLIENT_PACKAGE',100),self.assertRaises(DistributionError):
+            WindowsClientPackage(io.BytesIO(raw),m,b'b','x-mihomo.yaml',b'y')
+
+    def test_wrong_inventory_is_refused_before_chunks(self):
+        from web.p6_windows_bundle import WindowsClientPackage
+        m,raw=fixture(); changed=copy.deepcopy(m);changed['files']['payload/runtime/unexpected.dll']=record(b'x')
+        with self.assertRaises(DistributionError):
+            WindowsClientPackage(io.BytesIO(raw),changed,b'b','x-mihomo.yaml',b'y')
+
+    def test_single_use_and_software_mutation_abort(self):
+        package=self.prepare()
+        list(package.chunks())
+        with self.assertRaises(DistributionError):list(package.chunks())
+        package=self.prepare()
+        row=package.archive.getinfo('P6Setup.exe')
+        self.source.seek(row.header_offset+30+len(row.filename));self.source.write(b'X')
+        with self.assertRaises(DistributionError):list(package.chunks())
+
+    def test_old_software_is_still_valid_but_combined_export_requires_new_capability(self):
+        from web.p6_windows_bundle import require_client_package
+        old, raw = fixture(entry='gui-v1')
+        source = io.BytesIO(raw)
+        verify_archive(source, old)
+        with self.assertRaises(DistributionError): require_client_package(source, old)
+        self.assertEqual(source.tell(), 0)
+        new, raw = fixture()
+        require_client_package(io.BytesIO(raw), new)
+
+    def test_aborted_generator_keeps_file_owned_by_caller(self):
+        package=self.prepare();iterator=package.chunks();next(iterator);iterator.close();package.close()
+        self.assertFalse(self.source.closed)
 
 
 if __name__ == '__main__':

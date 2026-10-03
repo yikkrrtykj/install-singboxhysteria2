@@ -8,7 +8,7 @@ import re
 from remote_probe.agent import ConfigError
 from remote_probe.payload import validate_sample
 from remote_probe.windows_security import StorageSecurityError
-from .bundle import object_json
+from .bundle import object_json, validate_display, DISPLAY_LIMIT
 
 COUNTERS = ('next_record_id', 'resolved_through', 'acknowledged_total',
             'quarantined_total', 'expired_total', 'budget_dropped_total',
@@ -131,6 +131,12 @@ def snapshot(manager, reader=None):
             manager.security.validate(str(path), True)
             profile = {'id': key, 'probe_id': manifest['probe_id'], 'server_id': manifest['server_id'],
                        'enabled': manager.vault.enabled(key), 'spool': None, 'sample': None}
+            display_path=Path(manager.vault._path(key))/'display.json'
+            if os.path.lexists(display_path):
+                profile['display']=validate_display(object_json(read(display_path,DISPLAY_LIMIT)),manifest)
+            else:
+                profile['display']=validate_display({'v':1,'client':'','device':'','location':'','network_path':'',
+                    'probe_id':manifest['probe_id'],'server_id':manifest['server_id']},manifest)
             state = path / 'spool.state.json'
             if state.exists():
                 profile['spool'] = summarize_spool(read(state, 524288))

@@ -476,9 +476,11 @@ PR #70 stays Draft; no merge, production deployment, P6C or P6D.
 
 ## Signed Windows software distribution (separate from device Bundle)
 
-The device panel has two downloads: generic Windows software and per-device
-sensitive configuration. Download/extract the software ZIP, run P6Setup.exe,
-then choose the separate device Bundle in the Chinese manager. The software
+The ordinary device action is now one Windows client package containing
+the unchanged signed software, device-bundle.zip, the canonical Mihomo YAML
+and Chinese README-client.txt. Extract it and run P6Setup.exe: a sole valid
+adjacent device configuration is preselected for an explicit install action.
+Separate software/configuration downloads remain advanced compatible actions. The software
 archive contains only signed entry files/catalog and the bounded runtime/Agent/
 installer inventory. It contains no device/YAML/profile/P6 secret. Closing the
 manager leaves the Agent service running.
@@ -523,7 +525,8 @@ explicit `discard-stage --stage <32hex>` removes only its checked managed files.
 Ordinary helper/Monitor reinstall preserves published packages and identities.
 
 The exact POST `/api/v1/clients/windows` accepts only `{}`, behind existing peer
-whitelist/origin/session/CSRF/step-up plus fresh management authorization. It
+whitelist/origin/password-verified session/CSRF plus fresh management authorization.
+The single-login policy supersedes the old separate step-up grant. It
 never calls credential export RPC. Software and device Bundles share two
 download slots. The archive is checked before headers and streamed in 64 KiB
 chunks from the held root file with socket/total deadlines and no-store headers.

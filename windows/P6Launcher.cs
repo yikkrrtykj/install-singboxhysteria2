@@ -72,7 +72,7 @@ internal static class P6Launcher {
             }
             return 0;
         } catch {
-            MessageBox.Show("无法打开 P6 管理。请确认安装包来自可信发布者、签名有效且文件完整。", "P6 管理 · E_" + stage, MessageBoxButtons.OK, MessageBoxIcon.Error);
+            MessageBox.Show("无法打开客户端管理。请确认安装包来自可信发布者、签名有效且文件完整。", "客户端管理 · E_" + stage, MessageBoxButtons.OK, MessageBoxIcon.Error);
             return 2;
         } finally {
             if (space != null) {

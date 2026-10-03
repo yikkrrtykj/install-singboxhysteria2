@@ -120,7 +120,7 @@ try {
     $entry = Join-Path $payload 'p6-installer.pyz'
     if ($Operation -eq 'gui') {
         if ($Bundle -or $Profile -or $ControllerKeyFile -or $PromptControllerSecret) { throw 'graphical input must be selected in window' }
-        Show-P6Manager $python $entry $staging $common
+        Show-P6Manager $python $entry $staging $common $PSScriptRoot
         exit 0
     }
     $arguments = @('-I','-B',$entry,$Operation,'--package',$staging)

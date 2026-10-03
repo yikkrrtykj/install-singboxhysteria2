@@ -118,7 +118,7 @@ def verify_archive(stream, m):
                 raise DistributionError()
         meta = object_json(archive.read('payload/release.json'))
         if type(meta) is not dict or set(meta) != {'v', 'entry', 'release', 'runtime', 'artifact', 'files'} or type(meta['v']) is not int or meta['v'] != 1 \
-                or meta['entry'] != 'gui-v1' or meta['runtime'] != 'cpython-3.13.16-amd64' \
+                or meta['entry'] not in ('gui-v1', 'gui-v2') or meta['runtime'] != 'cpython-3.13.16-amd64' \
                 or type(meta['files']) is not dict or meta['release'] != m['release'] or meta['artifact'] != m['artifact'] \
                 or hashlib.sha256(canonical({k: v for k, v in meta.items() if k != 'release'})).hexdigest() != m['release'] \
                 or {'payload/' + name for name in meta['files']} != set(m['files']) - {'P6Setup.exe', 'Setup.ps1', 'payload.cat', 'payload/release.json'}:

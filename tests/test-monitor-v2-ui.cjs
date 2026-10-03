@@ -85,7 +85,7 @@ const context = vm.createContext({ document, console, Uint8Array, Date, performa
   }
 });
 vm.runInContext(app.replace('document.addEventListener("DOMContentLoaded", boot);',
-  'globalThis.ui = {state, bind, render, loadSession, loadE3Status, loadE3Clients, convergeAfterMutation, renderE3Controls, renderE3Clients, renderMonitorInfo, addClient, deleteClient, downloadConfig, setPendingRetry, retryPending, apiWithStepUp, setView, loadIncidents, renderIncidents, openIncident, renderIncidentDetail, closeIncidentDetail, loadEvidence, loadMarkers, renderMarkers, addMarker, rearmIncidents, renderIncRuntime, p6View, openP6Devices, loadP6Devices, p6Operate, downloadP6Bundle, downloadP6Windows, renderP6Devices, incidentCopy, userActivity, setIdleDeadline, startWatchdog};'), context);
+  'globalThis.ui = {state, bind, render, loadSession, loadE3Status, loadE3Clients, convergeAfterMutation, renderE3Controls, renderE3Clients, renderMonitorInfo, addClient, deleteClient, downloadConfig, setPendingRetry, retryPending, apiWithStepUp, setView, loadIncidents, renderIncidents, openIncident, renderIncidentDetail, closeIncidentDetail, loadEvidence, loadMarkers, renderMarkers, addMarker, rearmIncidents, renderIncRuntime, p6View, openP6Devices, loadP6Devices, p6Operate, downloadP6Bundle, downloadP6Windows, downloadP6Client, renderP6Devices, incidentCopy, userActivity, setIdleDeadline, startWatchdog};'), context);
 const ui = context.ui;
 // 0.1.4: the convergence chain (mutation -> one endpoint -> apply) crosses
 // several cross-realm promise reactions; 12 ticks starved it. Drain
@@ -875,7 +875,7 @@ async function main() {
   ui.state.e3Mutation = null; ui.state.e3PendingRetry = null;
   ui.state.session = {authenticated: true, csrf_token: 'csrf'};
   setStatus(healthy()); ui.renderE3Clients(clients);
-  const device = {device: 'laptop-01', probe_id: 'probe-001', desired: 'active', verified: 'active'};
+  const device = {device: 'laptop-01', probe_id: 'probe-001', site_label: 'office', path_label: 'wifi', ingest_url: 'https://192.0.2.1:38443/api/v1/remote-probes/ingest', desired: 'active', verified: 'active'};
   const listDevices = (rows = [device], next = null) => response({ok: true, data: {devices: rows, next_cursor: next}});
   check('P6: only mutable named clients have Devices / Bundle; existing YAML controls remain', () => {
     assert.doesNotMatch(ids['e3-clients-body'].children[0].textContent, /设备/);
@@ -888,7 +888,7 @@ async function main() {
     assert.equal(req.url, '/api/v1/clients/probes/list'); assert.equal(req.method, 'POST');
     assert.equal(req.headers['X-CSRF-Token'], 'csrf'); assert.ok(!('Idempotency-Key' in req.headers));
     assert.deepEqual(JSON.parse(req.body), {name: 'alice'});
-    assert.match(ids['p6-devices-body'].textContent, /登记已确认.*下载设备配置包.*撤销上传权限/);
+    assert.match(ids['p6-devices-body'].textContent, /登记已确认.*下载 Windows 客户端包.*单独下载配置.*撤销上传权限/);
   });
   const beforeUrls = createdUrls.length;
   responses.push(fileResponse('fixture ZIP credential bytes')); ui.downloadP6Bundle('laptop-01'); await flush();
@@ -908,7 +908,7 @@ async function main() {
   responses.push(listDevices([{...device, verified: 'pending'}])); ui.loadP6Devices(); await flush();
   check('P6: pending enrollment offers Verify again and cannot download credentials', () => {
     assert.match(ids['p6-devices-body'].textContent, /登记待确认.*重新核验/);
-    assert.doesNotMatch(ids['p6-devices-body'].textContent, /下载设备配置包/);
+    assert.doesNotMatch(ids['p6-devices-body'].textContent, /下载 Windows 客户端包|单独下载配置/);
   });
   responses.push(response({ok: true, data: device}), listDevices());
   ui.p6Operate('resume', {name: 'alice', device: 'laptop-01'}); await flush();
@@ -934,7 +934,7 @@ async function main() {
   });
   const revoked = {...device, desired: 'revoked', verified: 'revoked'};
   responses.push(response({ok: true, data: {revoked: true, count: 1}}), listDevices([revoked]));
-  ids['p6-devices-body'].children[0].children[2].children[1].click(); await flush();
+  ids['p6-devices-body'].children[0].children[5].children.find(c => c.tag === 'button' && c.textContent === '撤销上传权限').click(); await flush();
   check('P6: confirmed revocation removes download and recovery actions', () => {
     assert.match(ids['p6-devices-body'].textContent, /撤销已确认/);
     assert.doesNotMatch(ids['p6-devices-body'].textContent, /下载|重新核验|重试撤销/);
@@ -1030,6 +1030,40 @@ async function main() {
     assert.equal(requests.length, n); assert.equal(ids['p6-windows-download'].disabled, true);
   });
   ui.state.session = {authenticated: true, csrf_token: 'csrf'};
+
+  setStatus(healthy()); ui.p6View.retry = null; ui.p6View.name = 'alice';
+  ui.p6View.rows = [device]; ui.renderP6Devices();
+  check('Client package primary fields hide engineering identities in technical details', () => {
+    const cells = ids['p6-devices-body'].children[0].children;
+    assert.deepEqual(cells.slice(0, 4).map(c => c.textContent), ['alice', 'laptop-01', 'office', 'wifi']);
+    assert.equal(cells.length, 6);
+    assert.match(cells[5].textContent, /技术详情.*probe_id: probe-001/);
+    assert.ok(cells[5].children.some(c => c.tag === 'details'));
+  });
+  let combinedUrls = createdUrls.length;
+  responses.push(softwareResponse('lab')); ui.downloadP6Client('laptop-01'); await flush();
+  check('One private Windows client download binds exact Device and releases Blob resources', () => {
+    const req = requests.at(-1); assert.equal(req.url, '/api/v1/clients/windows-bundle');
+    assert.deepEqual(JSON.parse(req.body), {name: 'alice', device: 'laptop-01'});
+    assert.equal(req.headers['X-CSRF-Token'], 'csrf'); assert.ok(!('Idempotency-Key' in req.headers));
+    assert.equal(createdUrls.length, combinedUrls + 1); assert.equal(revokedUrls.at(-1), createdUrls.at(-1));
+    assert.equal(document.body.children.length, 0);
+    assert.match(ids['p6-msg'].textContent, /受控测试.*自动识别.*安装仍需你确认.*私密保管/);
+  });
+  responses.push(response({code: 'E_P6_WINDOWS_UNAVAILABLE'}, 503)); ui.downloadP6Client('laptop-01'); await flush();
+  check('Combined unavailable software never retries or invents a successful device package', () => {
+    assert.equal(createdUrls.length, combinedUrls + 1);
+    assert.match(ids['p6-msg'].textContent, /管理员发布签名程序包/); assert.equal(ui.p6View.busy, false);
+  });
+  responses.push(softwareResponse('unknown')); ui.downloadP6Client('laptop-01'); await flush();
+  check('Combined download refuses unknown release scope before creating a file', () => {
+    assert.equal(createdUrls.length, combinedUrls + 1); assert.match(ids['p6-msg'].textContent, /下载失败/);
+  });
+  setStatus({...healthy(), transport: 'stale'});
+  check('Combined download preserves stale-management containment', () => {
+    const n = requests.length; ui.downloadP6Client('laptop-01'); assert.equal(requests.length, n);
+  });
+
   document.visibilityState = 'visible'; monoNow = 100; ui.setIdleDeadline(900);
   let activityMark = requests.length;
   ui.userActivity({isTrusted: false}); await flush();
@@ -1053,6 +1087,6 @@ async function main() {
     assert.match(ids['login-error'].textContent, /15 分钟/); assert.equal(intervalCallbacks.size, 0);
     assert.equal(requests.length, activityMark);
   });
-  assert.equal(count, 120, 'UI assertion count guard');
+  assert.equal(count, 125, 'UI assertion count guard');
 }
 main().catch(err => { console.error(err); process.exitCode = 1; });

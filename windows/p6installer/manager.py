@@ -17,7 +17,7 @@ from remote_probe.production import incoming
 from remote_probe.profiles import ProfileVault, canonical, durable_replace, profile_id
 from remote_probe.spool import SpoolError, _InstanceLock
 from remote_probe.windows_security import StorageSecurityError, WindowsSecurity
-from .bundle import object_json, read_bundle, verify_controller
+from .bundle import object_json, read_bundle, verify_controller, validate_display, discover_adjacent, DISPLAY_LIMIT
 from .scm import Service
 from .controller import DiscoveryError, discover_credential
 
@@ -69,7 +69,7 @@ def validate_release(package, security):
             or type(meta['files']) is not dict or not 4 <= len(meta['files']) <= 64:
         raise ConfigError('invalid release manifest')
     if 'entry' in meta:
-        if meta['entry'] != 'gui-v1' or 'P6Setup.exe' not in entries:
+        if meta['entry'] not in ('gui-v1', 'gui-v2') or 'P6Setup.exe' not in entries:
             raise ConfigError('invalid graphical release entry')
         security.validate(str(package / 'P6Setup.exe'))
     elif 'P6Setup.exe' in entries:
@@ -383,10 +383,15 @@ class Manager:
                         'profiles': [{'id': key, 'enabled': self.vault.enabled(key)} for key in self.vault.keys()],
                         'retired': sorted(os.listdir(self.root / 'retired'))}
             if operation == 'import':
-                manifest, secret, certificate = read_bundle(bundle, meta['artifact'])
+                manifest, secret, certificate, display = read_bundle(bundle, meta['artifact'], include_display=True)
                 key = profile_id(manifest)
                 if (self.root / 'retired' / key).exists() or (key not in self.vault.keys() and self._slots() >= 8):
                     raise ConfigError('profile retired or capacity reached')
+                display_path=Path(self.vault._path(key))/'display.json'
+                if os.path.lexists(display_path):
+                    existing=validate_display(object_json(self.security.read(str(display_path),DISPLAY_LIMIT)),manifest)
+                    if existing!=display:
+                        raise ConfigError('display identity change requires explicit replacement')
                 verify_controller(manifest, controller_secret)
             elif operation in ('pause', 'resume', 'remove'):
                 self.vault._path(profile)
@@ -421,6 +426,7 @@ class Manager:
                 if operation == 'import':
                     key, created = self.vault.import_profile(manifest, secret, certificate,
                                                            controller_secret=controller_secret)
+                    self._write(Path(self.vault._path(key))/'display.json',display)
                     result = {'profile': key, 'created': created}
                 elif operation in ('pause', 'resume'):
                     self.vault.set_enabled(profile, operation == 'resume')
@@ -464,7 +470,7 @@ class Manager:
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description='P6 Windows lifecycle installer')
-    parser.add_argument('operation', choices=('install', 'rollback', 'import', 'status', 'ui-status', 'pause', 'resume', 'remove', 'purge', 'uninstall'))
+    parser.add_argument('operation', choices=('install', 'rollback', 'import', 'status', 'ui-status', 'adjacent-bundle', 'pause', 'resume', 'remove', 'purge', 'uninstall'))
     parser.add_argument('--package', required=True)
     parser.add_argument('--bundle')
     parser.add_argument('--profile')
@@ -491,7 +497,13 @@ def main(argv=None):
             manifest, _, _ = read_bundle(args.bundle, meta['artifact'])
             discovered = discover_credential(manifest['agent']['mihomo_url'])
             verify_controller(manifest, discovered)
-        if args.operation == 'ui-status':
+        if args.operation == 'adjacent-bundle':
+            if not args.bundle or args.profile or args.controller_key_file or args.discover_controller:
+                raise ConfigError('invalid adjacent selector')
+            manager.verifier(args.package,PUBLISHER)
+            meta=validate_release(args.package,manager.security)
+            result=discover_adjacent(args.bundle,meta['artifact'])
+        elif args.operation == 'ui-status':
             if args.bundle or args.profile or args.controller_key_file or args.discover_controller:
                 raise ConfigError('invalid snapshot selector')
             from .status import snapshot

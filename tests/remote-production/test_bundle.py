@@ -145,7 +145,8 @@ class BundleTests(unittest.TestCase):
 
     def test_shape_secret_yaml_and_filename_bounds(self):
         for field, value in (('yaml', 'x' * 32769), ('secret', 'b' * 63), ('secret', 'B' * 64),
-                             ('certificate', 'PRIVATE KEY'), ('format', 'unknown')):
+                             ('certificate', 'PRIVATE KEY'), ('format', 'unknown'), ('display', None)):
+
             changed = copy.deepcopy(self.parts)
             changed[field] = value
             with self.subTest(field=field), self.assertRaises(BundleError):

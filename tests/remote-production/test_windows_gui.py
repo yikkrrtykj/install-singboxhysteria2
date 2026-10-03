@@ -185,6 +185,27 @@ class SnapshotTests(FixtureBase):
             snapshot(self.manager, self.reader)
 
 
+    def test_protected_display_labels_are_read_only_and_identity_bound(self):
+        value={'v':1,'client':'event-pc','device':'laptop-01','location':'office','network_path':'wifi',
+               'probe_id':self.manifest_value['probe_id'],'server_id':self.manifest_value['server_id']}
+        path=Path(self.vault._path(self.key))
+        self.vault._write(str(path),'display.json',canonical(value))
+        before=self.tree();result=snapshot(self.manager,self.reader)
+        self.assertEqual(result['profiles'][0]['display'],value)
+        self.assertEqual(self.tree(),before)
+        self.assertNotIn('ingest.key',self.read_names);self.assertNotIn('mihomo.key',self.read_names)
+        changed=dict(value,probe_id='unrelated')
+        (path/'display.json').unlink();self.vault._write(str(path),'display.json',canonical(changed))
+        with self.assertRaises(ConfigError):snapshot(self.manager,self.reader)
+
+    def test_legacy_profile_display_fallback_does_not_change_profile_or_spool(self):
+        before=self.tree();result=snapshot(self.manager,self.reader)
+        self.assertEqual(result['profiles'][0]['display']['client'],'')
+        self.assertEqual(result['profiles'][0]['display']['network_path'],'')
+        self.assertEqual(self.tree(),before)
+
+
+
 @unittest.skipUnless(os.name == 'nt', 'native Windows only')
 class NativeSourceTests(unittest.TestCase):
     def test_actual_current_user_source_policy_and_writer_sharing(self):
@@ -226,6 +247,87 @@ class NativeSourceTests(unittest.TestCase):
                     source.read(str(link / 'config.yaml'), SOURCE_LIMIT)
             finally:
                 os.rmdir(link)
+
+
+
+
+class AdjacentBundleTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import test_bundle as fixtures
+        fixtures.BundleTests.setUpClass()
+        cls.fixture_class=fixtures.BundleTests
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.fixture_class.tearDownClass()
+
+    def setUp(self):
+        self.fixture=self.fixture_class('test_repeat_bundle_does_not_rotate_or_add_download_timestamp')
+        self.fixture.setUp();self.addCleanup(self.fixture.tearDown)
+        self.root=self.fixture.root
+        self.artifact=self.fixture.manifest
+        from p6installer.bundle import discover_adjacent,read_bundle
+        self.discover=discover_adjacent;self.read=read_bundle
+
+    def write(self,name='device-bundle.zip',v2=True):
+        parts=copy.deepcopy(self.fixture.parts)
+        if v2:parts['display']={'client':'event-pc','device':'laptop-01','location':'office','network_path':'wifi'}
+        path=self.root/name;path.write_bytes(self.fixture.bundle(parts));return path
+
+    def test_single_adjacent_v2_returns_validated_display_without_installing(self):
+        path=self.write();before={p.name:p.read_bytes() for p in self.root.iterdir()}
+        result=self.discover(self.root,self.artifact)
+        self.assertEqual(result['state'],'selected');self.assertEqual(result['path'],str(path))
+        self.assertEqual(result['display']['location'],'office');self.assertEqual(result['display']['device'],'laptop-01')
+        self.assertEqual({p.name:p.read_bytes() for p in self.root.iterdir()},before)
+        self.assertNotIn(self.fixture.parts['secret'],json.dumps(result))
+
+    def test_zero_multiple_and_parent_config_never_auto_select(self):
+        self.assertEqual(self.discover(self.root,self.artifact),{'state':'missing'})
+        nested=self.root/'setup';nested.mkdir();self.write()
+        self.assertEqual(self.discover(nested,self.artifact),{'state':'missing'})
+        self.write('event-pc-laptop-02-client-bundle.zip')
+        self.assertEqual(self.discover(self.root,self.artifact),{'state':'ambiguous'})
+
+    def test_legacy_v1_bundle_is_readable_with_truthful_unset_location(self):
+        path=self.write(v2=False)
+        result=self.discover(self.root,self.artifact)
+        self.assertEqual(result['display']['client'],'event-pc')
+        self.assertEqual(result['display']['location'],'')
+        self.assertEqual(len(self.read(path,self.artifact)),3)
+
+    def test_wrong_artifact_corrupt_and_oversize_are_not_selected(self):
+        path=self.write();changed=copy.deepcopy(self.artifact);changed['sha256']='a'*64
+        with self.assertRaises(ConfigError):self.discover(self.root,changed)
+        for raw in (b'not a ZIP',b'x'*(5*1024*1024+1)):
+            path.write_bytes(raw)
+            with self.assertRaises(ConfigError):self.discover(self.root,self.artifact)
+
+    def test_directory_link_and_native_reparse_candidate_are_refused(self):
+        target=self.root/'target';target.mkdir();self.write('target/device-bundle.zip')
+        link=self.root/'device-bundle.zip'
+        if os.name=='nt':
+            subprocess.run(['cmd','/c','mklink','/J',str(link),str(target)],check=True,capture_output=True)
+            self.addCleanup(lambda:os.rmdir(link))
+        else:
+            link.symlink_to(target/'device-bundle.zip')
+        with self.assertRaises((ConfigError,StorageSecurityError)):self.discover(self.root,self.artifact)
+
+    def test_directory_capacity_and_unrelated_archives_do_not_expand_search(self):
+        (self.root/'unrelated.zip').write_bytes(b'not read')
+        self.assertEqual(self.discover(self.root,self.artifact),{'state':'missing'})
+        for n in range(129):(self.root/('unrelated-%d'%n)).write_bytes(b'x')
+        with self.assertRaises(ConfigError):self.discover(self.root,self.artifact)
+
+    def test_display_closed_binding_label_limits_and_zip_directory_bomb(self):
+        from p6installer.bundle import validate_display
+        path=self.write();_,_,_,display=self.read(path,self.artifact,include_display=True)
+        for key,value in [('client','bad/name'),('location','x'*65),('network_path','line\nbreak'),('probe_id','other'),('v',True),('extra',1)]:
+            with self.subTest(key=key),self.assertRaises(ConfigError):
+                validate_display(dict(display,**{key:value}),self.fixture.profile)
+        raw=bytearray(path.read_bytes());raw[-12:-10]=(65535).to_bytes(2,'little');path.write_bytes(raw)
+        with self.assertRaises(ConfigError):self.read(path,self.artifact)
 
 
 if __name__ == '__main__':

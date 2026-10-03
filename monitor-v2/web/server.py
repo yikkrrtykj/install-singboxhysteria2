@@ -45,6 +45,7 @@ from web.e3rpc import RpcTransportError
 from p6_artifact import ArtifactError, read_artifact
 from p6_distribution import DistributionError, open_release
 from web.p6_bundle import BundleError, assemble as assemble_p6_bundle
+from web.p6_windows_bundle import WindowsClientPackage, require_client_package
 from web import incident_presenter as incident_presenter
 from web import incident_history as ih_outcomes
 from web.incident_history import (MARKER_KINDS, QUERY_LIMIT_DEFAULT,
@@ -224,6 +225,7 @@ P6_ROUTES = {
     '/api/v1/clients/probes/resume': 'probe.resume',
     '/api/v1/clients/bundle': 'client.bundle',
     '/api/v1/clients/windows': 'windows.download',
+    '/api/v1/clients/windows-bundle': 'windows.bundle',
 }
 P6_ERROR_HTTP = {
     'E_P6_SCHEMA': 400, 'E_P6_NOT_ENROLLED': 404, 'E_P6_REVOKED': 409,
@@ -2196,10 +2198,18 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         if type(endpoint) is not str or len(endpoint) > 256 or not re.fullmatch(
                 r'https://(?:[0-9.]+|\[[0-9a-fA-F:]+\]):[0-9]+/api/v1/remote-probes/ingest', endpoint):
             raise BundleError()
+        for field in ('site_label', 'path_label'):
+            label=row.get(field,'')
+            if type(label) is not str or not re.fullmatch(r'[ -~]{0,64}',label):
+                raise BundleError()
+            public[field]=label
         public.update(desired=row['desired'], verified=row['verified'], verified_epoch=epoch, ingest_url=endpoint)
         return public
 
     def _handle_p6_request(self, session, op, actor):
+        if op == 'windows.bundle':
+            self._handle_windows_client_bundle(actor)
+            return
         if op == 'windows.download':
             self._handle_windows_download()
             return
@@ -2304,6 +2314,79 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             self._p6_failure('E_P6_BUNDLE')
         finally:
             if slot:
+                self.app.bundle_slots.release()
+
+    def _handle_windows_client_bundle(self, actor):
+        # Same session/CSRF/origin spine as other private exports. Software
+        # must pass authority/integrity/compatibility before credential dispatch.
+        body = self._json_body()
+        if type(body) is not dict or set(body) != {'name', 'device'} or any(
+                type(body[k]) is not str or not E3_NAME_RE.fullmatch(body[k]) for k in ('name', 'device')) \
+                or body['name'] == E3_RESERVED_NAME or self.headers.get(IDEMPOTENCY_HEADER) is not None:
+            self._p6_failure('E_P6_SCHEMA')
+            return
+        broker = self.app.e3_broker
+        if broker is None:
+            self._e3_unavailable()
+            return
+        if not self.app.bundle_slots.acquire(blocking=False):
+            self._send_json(429, {'ok': False, 'code': 'bundle_busy', 'error': 'try again later'})
+            return
+        started = False
+        package = None
+        deadline = time.monotonic()+60
+        try:
+            broker.require_export_ready()
+            artifact, generic = self.app.bundle_artifact()
+            with self.app.windows_distribution(artifact) as (manifest, stream):
+                require_client_package(stream, manifest)
+                verdict = broker.p6_request('client.bundle', body, actor=actor)
+                if verdict.get('ok') is not True:
+                    error = verdict.get('error')
+                    self._p6_failure(error.get('code') if type(error) is dict else 'E_P6_UNAVAILABLE')
+                    return
+                parts = verdict.get('data')
+                bundle = assemble_p6_bundle(body['name'], body['device'], parts, generic)
+                package = WindowsClientPackage(stream, manifest, bundle,
+                    body['name']+'-mihomo.yaml', parts['yaml'].encode('utf-8'))
+                if time.monotonic()>=deadline:
+                    raise DistributionError()
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/zip')
+                self.send_header('Content-Disposition', 'attachment; filename="%s-%s-windows-client.zip"' % (body['name'], body['device']))
+                self.send_header('Content-Length', str(package.size))
+                self.send_header('X-P6-Distribution-Scope', manifest['scope'])
+                self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate')
+                self.send_header('Pragma', 'no-cache')
+                self.send_header('Expires', '0')
+                for name,value in SECURITY_HEADERS:
+                    self.send_header(name,value)
+                self.connection.settimeout(10)
+                self.end_headers()
+                started = True
+                for chunk in package.chunks():
+                    if time.monotonic()>=deadline:
+                        raise TimeoutError()
+                    self.wfile.write(chunk)
+        except BrokerUnavailable:
+            self._e3_unavailable('fresh management gate not satisfied; private package not dispatched')
+        except RpcTransportError as exc:
+            if exc.stage=='connect':
+                self._e3_unavailable()
+            else:
+                self._send_json(504, {'ok': False, 'code': 'result_unknown', 'error': 'retry explicitly', 'uncertain': True, 'retriable': True})
+        except (ArtifactError, BundleError, DistributionError, ValueError, TypeError, KeyError):
+            if started:
+                self.close_connection = True
+            else:
+                self._p6_failure('E_P6_WINDOWS_UNAVAILABLE')
+        except OSError:
+            self.close_connection = True
+        finally:
+            try:
+                if package is not None:
+                    package.close()
+            finally:
                 self.app.bundle_slots.release()
 
     def _handle_windows_download(self):

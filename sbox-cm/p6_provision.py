@@ -458,7 +458,7 @@ class Provisioner:
 
     @staticmethod
     def public(state, row):
-        return {field: row[field] for field in ('name', 'device', 'probe_id', 'desired', 'verified', 'verified_epoch')} | {
+        return {field: row[field] for field in ('name', 'device', 'probe_id', 'desired', 'verified', 'verified_epoch', 'site_label', 'path_label')} | {
             'server_id': state['binding']['server_id'],
             'certificate_sha256': state['binding']['certificate_sha256'],
             'ingest_url': state['binding']['ingest_url']}
@@ -591,7 +591,8 @@ class Provisioner:
             if hashlib.sha256(ssl.PEM_cert_to_DER_cert(certificate)).hexdigest() != binding['certificate_sha256']:
                 raise ProvisionError('E_P6_BINDING')
             return {'binding': binding, 'probe_id': row['probe_id'],
-                    'secret': row['secret'], 'certificate': certificate}
+                    'secret': row['secret'], 'certificate': certificate,
+                    'site_label': row['site_label'], 'path_label': row['path_label']}
 
     def resume(self, name, device, generation):
         """Explicit recovery after the browser loses an enrollment key.

@@ -67,7 +67,7 @@ def build(runtime_archive, publisher, destination, fixture_name=None):
             item.create_system, item.external_attr = 3, 0o100644 << 16
             archive.writestr(item, raw)
     files['p6-installer.pyz'] = output.getvalue()
-    meta = {'v': 1, 'entry': 'gui-v1', 'runtime': 'cpython-3.13.16-amd64', 'artifact': artifact,
+    meta = {'v': 1, 'entry': 'gui-v2', 'runtime': 'cpython-3.13.16-amd64', 'artifact': artifact,
             'files': {name: {'sha256': hashlib.sha256(raw).hexdigest(), 'size': len(raw)}
                       for name, raw in sorted(files.items())}}
     from remote_probe.profiles import canonical

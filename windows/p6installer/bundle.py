@@ -7,6 +7,9 @@ import re
 import socket
 import ssl
 import stat
+import struct
+import os
+from pathlib import Path
 import time
 import threading
 import zipfile
@@ -35,10 +38,68 @@ def object_json(raw):
                       parse_constant=lambda _: (_ for _ in ()).throw(ConfigError('nonfinite JSON')))
 
 
-def read_bundle(path, expected_artifact):
+
+DISPLAY_LIMIT = 4096
+
+
+def validate_display(value, profile):
+    if type(value) is not dict or set(value) != {'v','client','device','location','network_path','probe_id','server_id'} \
+            or type(value['v']) is not int or value['v'] != 1 \
+            or value['probe_id'] != profile['probe_id'] or value['server_id'] != profile['server_id']:
+        raise ConfigError('display identity mismatch')
+    for key in ('client','device'):
+        if type(value[key]) is not str or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,31}|',value[key]):
+            raise ConfigError('invalid display label')
+    for key in ('location','network_path'):
+        if type(value[key]) is not str or not re.fullmatch(r'[ -~]{0,64}',value[key]):
+            raise ConfigError('invalid display label')
+    if len(json_bytes(value)) > DISPLAY_LIMIT:
+        raise ConfigError('display capacity')
+    return value
+
+
+def json_bytes(value):
+    import json
+    return json.dumps(value,sort_keys=True,separators=(',',':'),allow_nan=False).encode('utf-8')
+
+
+def discover_adjacent(directory, expected_artifact):
+    """Only the explicitly supplied original setup directory; passive input."""
+    from remote_probe.spool import check_no_symlink_component
+    root = os.path.abspath(directory)
+    if root.startswith('\\\\'):
+        raise ConfigError('network input directory')
+    check_no_symlink_component(root)
+    if os.name == 'nt':
+        from remote_probe.windows_security import WindowsSecurity
+        WindowsSecurity().check_components(root)
+    if not stat.S_ISDIR(os.lstat(root).st_mode):
+        raise ConfigError('invalid input directory')
+    candidates=[]
+    with os.scandir(root) as entries:
+        for index,entry in enumerate(entries):
+            if index>=128:
+                raise ConfigError('input directory capacity')
+            if entry.name=='device-bundle.zip' or re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,100}-client-bundle\.zip',entry.name):
+                candidates.append(entry.path)
+    if not candidates:
+        return {'state':'missing'}
+    if len(candidates)!=1:
+        return {'state':'ambiguous'}
+    _,_,_,display=read_bundle(candidates[0],expected_artifact,include_display=True)
+    return {'state':'selected','path':candidates[0],'display':display}
+
+
+def read_bundle(path, expected_artifact, include_display=False):
     """Never extract or execute bundle code. The installed Agent is authority."""
     try:
         raw = incoming(path, MAX_BUNDLE)
+        if len(raw)<22:
+            raise ConfigError('invalid bundle directory')
+        end=struct.unpack('<4s4H2LH',raw[-22:])
+        if end[0]!=b'PK\x05\x06' or end[1:3]!=(0,0) or end[3:5]!=(8,8) \
+                or end[5]>4096 or end[6]+end[5]!=len(raw)-22 or end[7]!=0:
+            raise ConfigError('invalid bundle directory')
         with zipfile.ZipFile(io.BytesIO(raw)) as archive:
             items = archive.infolist()
             if len(items) != 8 or len({i.filename for i in items}) != 8:
@@ -70,8 +131,10 @@ def read_bundle(path, expected_artifact):
                 data[item.filename] = value
         meta = object_json(data['bundle.json'])
         artifact = object_json(data['agent/artifact.json'])
-        if type(meta) is not dict or set(meta) != {'v', 'client', 'device', 'artifact', 'kind'} \
-                or type(meta['v']) is not int or meta['v'] != 1 or meta['kind'] != 'source-foundation' \
+        fields = {'v', 'client', 'device', 'artifact', 'kind'}
+        if type(meta) is not dict or type(meta.get('v')) is not int or meta['v'] not in (1,2) \
+                or set(meta) != (fields if meta['v']==1 else fields|{'location','network_path'}) \
+                or meta['kind'] != 'source-foundation' \
                 or artifact != expected_artifact or meta['artifact'] != artifact \
                 or len(data['agent/p6-agent.pyz']) != artifact['size'] \
                 or hashlib.sha256(data['agent/p6-agent.pyz']).hexdigest() != artifact['sha256']:
@@ -88,7 +151,11 @@ def read_bundle(path, expected_artifact):
         certificate = data['server.pem'].decode('ascii')
         # Use the real Agent parser, including pinned certificate/IP/URL gate.
         ProfileVault('.')._validate(profile, certificate)
-        return profile, bytes.fromhex(secret.decode('ascii')), certificate
+        display = validate_display({'v':1,'client':meta['client'],'device':meta['device'],
+            'location':meta.get('location',''),'network_path':meta.get('network_path',''),
+            'probe_id':profile['probe_id'],'server_id':profile['server_id']},profile)
+        result=(profile,bytes.fromhex(secret.decode('ascii')),certificate)
+        return result+(display,) if include_display else result
     except (OSError, ValueError, TypeError, KeyError, UnicodeError, UploadConfigError, zipfile.BadZipFile,
             NotImplementedError, RuntimeError):
         raise ConfigError('invalid client bundle') from None

@@ -47,7 +47,9 @@ def make_parts(worker, args, artifact_dir=artifact.ARTIFACT_DIR):
         'cadence': 60, 'cycle_deadline': 20, 'diagnostic_timeout': 5})
     result = {'format': 'p6-client-bundle-parts/1', 'yaml': args['yaml'],
               'profile': profile, 'secret': material['secret'],
-              'certificate': material['certificate'], 'artifact': manifest}
+              'certificate': material['certificate'], 'artifact': manifest,
+              'display': {'client': args['name'], 'device': args['device'],
+                          'location': material['site_label'], 'network_path': material['path_label']}}
     response = {'ok': True, 'data': result}
     if len(p6.encoded(response)) > PARTS_LIMIT:
         raise p6.ProvisionError('E_P6_CAPACITY')

@@ -1562,7 +1562,10 @@
     while (tbody.firstChild) tbody.removeChild(tbody.firstChild);
     p6View.rows.forEach(function (device) {
       var row = tbody.insertRow(-1);
-      row.insertCell(-1).textContent = device.device + " / " + device.probe_id.slice(0, 11);
+      row.insertCell(-1).textContent = p6View.name;
+      row.insertCell(-1).textContent = device.device;
+      row.insertCell(-1).textContent = device.site_label || "未设置";
+      row.insertCell(-1).textContent = device.path_label || "未设置";
       var confirmed = device.desired === device.verified;
       row.insertCell(-1).textContent = confirmed
         ? (device.desired === "active" ? "登记已确认" : "撤销已确认")
@@ -1578,16 +1581,25 @@
         cell.appendChild(button);
       }
       if (device.desired === "active" && device.verified === "active") {
-        action("下载设备配置包", function () { downloadP6Bundle(device.device); });
+        action("下载 Windows 客户端包", function () { downloadP6Client(device.device); });
+        action("单独下载配置", function () { downloadP6Bundle(device.device); });
       }
       if (device.desired === "active" && !confirmed) {
         action("重新核验", function () {
           p6Operate("resume", {name: p6View.name, device: device.device});
         });
       }
+      var details = document.createElement("details");
+      var summary = document.createElement("summary");
+      summary.textContent = "技术详情";
+      details.appendChild(summary);
+      var identifiers = document.createElement("p");
+      identifiers.textContent = "probe_id: " + device.probe_id + " · server_id: " + device.server_id + " · 上传地址: " + device.ingest_url;
+      details.appendChild(identifiers);
+      cell.appendChild(details);
       if (device.desired === "active" || !confirmed) {
         action(device.desired === "active" ? "撤销上传权限" : "重试撤销", function () {
-          if (device.desired === "active" && !window.confirm("是否撤销此设备的 P6 上传权限？代理账号仍会保留。")) return;
+          if (device.desired === "active" && !window.confirm("是否撤销此设备的上传权限？代理账号仍会保留。")) return;
           p6Operate("revoke", {name: p6View.name, device: device.device, probe_id: device.probe_id});
         });
       }
@@ -1658,6 +1670,39 @@
       renderP6Devices();
       loadP6Devices();
     });
+  }
+
+  function downloadP6Client(device) {
+    if (p6View.busy || !e3Writable() || state.e3Mutation || p6View.retry) return;
+    p6View.busy = true;
+    renderP6Devices();
+    var name = p6View.name;
+    var scope;
+    apiWithStepUp("/api/v1/clients/windows-bundle", {
+      method: "POST", body: {name: name, device: device}, raw: true
+    }).then(function (response) {
+      scope = response.headers.get("X-P6-Distribution-Scope");
+      if (scope !== "lab" && scope !== "production") throw new Error("invalid client package response");
+      return response.blob();
+    }).then(function (blob) {
+      var url = URL.createObjectURL(blob);
+      var link = document.createElement("a");
+      try {
+        link.href = url;
+        link.download = name + "-" + device + "-windows-client.zip";
+        document.body.appendChild(link);
+        link.click();
+      } finally {
+        if (link.parentNode) link.parentNode.removeChild(link);
+        URL.revokeObjectURL(url);
+      }
+      p6Message((scope === "lab" ? "受控测试客户端包已准备，不能用于正式发布。" : "Windows 客户端包已准备。") +
+        "解压后打开安装程序，自动识别本设备配置；安装仍需你确认。包内含密钥，请私密保管。", false);
+    }).catch(function (error) {
+      p6Message(error.code === "E_P6_WINDOWS_UNAVAILABLE"
+        ? "本服务器尚未准备好兼容且经过校验的 Windows 程序，请管理员发布签名程序包。"
+        : "客户端包下载失败，请刷新设备状态后手动重试。", true);
+    }).then(function () { p6View.busy = false; renderP6Devices(); });
   }
 
   function downloadP6Windows() {

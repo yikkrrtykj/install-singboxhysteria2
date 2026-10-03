@@ -93,7 +93,12 @@ function Update-P6Selection {
         $retired = -not $live
         if ($live) {
             $profile = $entry.value
-            $script:p6Details.Text = 'Probe：' + $profile.probe_id + '   ·   VPS：' + $profile.server_id
+            $d=$profile.display
+            $client=if ($d.client) {$d.client} else {'未命名客户端（旧配置）'}
+            $device=if ($d.device) {$d.device} else {'未命名设备（旧配置）'}
+            $location=if ($d.location) {$d.location} else {'未设置'}
+            $network=if ($d.network_path) {$d.network_path} else {'未设置'}
+            $script:p6Details.Text='客户端：'+$client+' / 设备：'+$device+"`r`n位置："+$location+' / 网络路径：'+$network
             if ($profile.spool) {
                 $s = $profile.spool
                 Add-P6Row '已确认上传' ([string]$s.acknowledged_total) 'accepted 或 duplicate 的本机确认总数'
@@ -118,8 +123,8 @@ function Update-P6Selection {
                     Add-P6Row ((P6Token $value.role) + ' / ' + (P6Token $value.source)) (P6Token $value.outcome) $delay
                 }
             } else {Add-P6Row '最近本地采样' '暂时无可读取样本' '样本可能尚未生成或已清理'}
-        } else {$script:p6Details.Text='已移除，本机密钥和队列仍保留。Profile：' + $entry.id}
-    } else {$script:p6Details.Text='请选择一个 Profile 查看本地状态。'}
+        } else {$script:p6Details.Text='已移除设备，本机密钥和队列仍保留。内部标识可在技术详情查看。'}
+    } else {$script:p6Details.Text='请选择一个设备查看本地状态。'}
     foreach ($action in @('pause','resume','remove')) {$script:p6Buttons[$action].Enabled=$live -and -not $script:p6Busy -and -not $script:p6Pending}
     $script:p6Buttons['purge'].Enabled=$retired -and -not $script:p6Busy -and -not $script:p6Pending
 }
@@ -136,19 +141,19 @@ function Refresh-P6Status {
         $script:p6Profiles.Items.Clear()
         foreach ($profile in @($status.profiles)) {
             $script:p6Entries+=@{id=$profile.id; live=$true; value=$profile}
-            [void]$script:p6Profiles.Items.Add($(if ($profile.enabled) {'已启用'} else {'已暂停'}) + ' · ' + $profile.probe_id)
+            [void]$script:p6Profiles.Items.Add($(if ($profile.enabled) {'已启用'} else {'已暂停'}) + ' · ' + $(if ($profile.display.device) {$profile.display.client+' / '+$profile.display.device} else {'旧设备 '+$script:p6Entries.Count}))
         }
         foreach ($id in @($status.retired)) {
             $script:p6Entries+=@{id=$id; live=$false; value=$null}
-            [void]$script:p6Profiles.Items.Add('已移除（数据保留） · ' + $id.Substring(0,12))
+            [void]$script:p6Profiles.Items.Add('已移除设备（数据保留） '+$script:p6Entries.Count)
         }
         for ($i=0; $i -lt $script:p6Entries.Count; $i++) {if ($script:p6Entries[$i].id -eq $selected) {$script:p6Profiles.SelectedIndex=$i}}
         if ($script:p6Profiles.SelectedIndex -lt 0 -and $script:p6Entries.Count -gt 0) {$script:p6Profiles.SelectedIndex=0}
         if ($script:p6Pending) {$script:p6Heading.Text='存在未完成的安装操作。请明确点击“安装 / 更新”或“回滚”。状态刷新不会自动恢复。'}
         elseif ($status.installed) {
             $state = switch ([int]$status.service_state) {0 {'未注册'} 1 {'已停止'} 4 {'运行中'} 7 {'已暂停'} default {'转换中'}}
-            $script:p6Heading.Text='P6 后台服务：' + $state
-        } else {$script:p6Heading.Text='尚未安装 P6。选择 Client Bundle 后点击“安装 / 更新”。'}
+            $script:p6Heading.Text='客户端后台服务：' + $state
+        } else {$script:p6Heading.Text='尚未安装客户端。选择设备配置后点击“安装 / 更新”。'}
         $script:p6Buttons['import'].Enabled=[bool]$status.installed -and -not $script:p6Pending
         $script:p6Buttons['uninstall'].Enabled=[bool]$status.installed -and @($status.profiles).Count -eq 0 -and -not $script:p6Pending
         $script:p6Buttons['rollback'].Enabled=[bool]$status.installed -or $script:p6Pending
@@ -201,7 +206,7 @@ function Run-P6Action([string]$Action) {
     if ($Action -in @('install','import')) {
         $bundle=$script:p6Bundle.Text
         if ($Action -eq 'import' -and -not $bundle) {
-            [void][Windows.Forms.MessageBox]::Show('请先选择从 Monitor 下载的 Client Bundle ZIP。','P6 管理'); return
+            [void][Windows.Forms.MessageBox]::Show('请先选择从网页下载的设备配置 ZIP。','客户端管理'); return
         }
         if ($bundle) {
             if ($script:p6Automatic.Checked) {$auto=$true}
@@ -213,29 +218,30 @@ function Run-P6Action([string]$Action) {
         }
     }
     $description = switch ($Action) {
-        'remove' {'移除此 Profile，将停止它的采集上传并保留本机密钥和队列。此操作不会撤销 VPS 身份。'}
-        'purge' {'永久清除此已移除 Profile 的本机密钥和队列，无法撤销。此操作不会删除 VPS 历史。'}
-        'uninstall' {'卸载本机 P6 服务和运行程序。已移除 Profile 的保留数据不会被清除。'}
-        'rollback' {'恢复上一套已验证的签名运行程序，保留 Profile、密钥和队列。'}
+        'remove' {'移除此设备，将停止它的采集上传并保留本机密钥和队列。此操作不会撤销 VPS 身份。'}
+        'purge' {'永久清除此已移除设备的本机密钥和队列，无法撤销。此操作不会删除 VPS 历史。'}
+        'uninstall' {'卸载本机客户端服务和程序。已移除设备 的保留数据不会被清除。'}
+        'rollback' {'恢复上一套已验证的签名运行程序，保留设备配置、密钥和队列。'}
         default {''}
     }
-    if ($description -and [Windows.Forms.MessageBox]::Show(($description + $(if ($profile) {"`r`nProfile："+$profile} else {''})),'P6 管理','OKCancel','Warning') -ne 'OK') {return}
+    $targetLabel = if ($profile) {[string]$script:p6Profiles.Items[$script:p6Profiles.SelectedIndex]} else {''}
+    if ($description -and [Windows.Forms.MessageBox]::Show(($description + $(if ($targetLabel) {"`r`n目标设备："+$targetLabel} else {''})),'客户端管理','OKCancel','Warning') -ne 'OK') {return}
     $script:p6Busy=$true
     foreach ($button in $script:p6Buttons.Values) {$button.Enabled=$false}
     $script:p6Notice.Text='正在执行，请等待安全完成；不会强制结束服务进程。'
     try {
         $result=Invoke-P6Backend $Action $profile $bundle $auto $credential
         if (-not $result.ok -and $result.kind -eq 'discovery') {
-            [void][Windows.Forms.MessageBox]::Show('未能安全读取匹配的 Clash Verge 配置。请确认 API 已启用，端口与 Bundle 一致；也可在下一窗口手动填写本机密钥。程序不会自动修改 Clash。','P6 管理')
+            [void][Windows.Forms.MessageBox]::Show('未能安全读取匹配的 Clash Verge 配置。请确认 API 已启用，端口与设备配置一致；也可在下一窗口手动填写本机密钥。程序不会自动修改 Clash。','客户端管理')
             $manual=Get-P6ManualCredential
             if (-not $manual.accepted) {return}
             $result=Invoke-P6Backend $Action $profile $bundle $false $manual.value
             $manual.value=$null
         }
         if (-not $result.ok -and $result.kind -eq 'cleanup') {
-            [void][Windows.Forms.MessageBox]::Show('凭据暂存未能清理，操作结果需要回读。请保留安装包并联系管理员；暂存文件仍受本机管理员权限保护。','P6 管理','OK','Warning')
+            [void][Windows.Forms.MessageBox]::Show('凭据暂存未能清理，操作结果需要回读。请保留安装包并联系管理员；暂存文件仍受本机管理员权限保护。','客户端管理','OK','Warning')
         } elseif (-not $result.ok) {
-            [void][Windows.Forms.MessageBox]::Show('操作未完成。请核对 Bundle 版本、本机 Clash API、显式节点和访问密钥，再重试。已保留可恢复的安装状态；请勿重复创建身份。','P6 管理','OK','Error')
+            [void][Windows.Forms.MessageBox]::Show('操作未完成。请核对设备配置版本、本机 Clash API、显式节点和访问密钥，再重试。已保留可恢复的安装状态；请勿重复创建身份。','客户端管理','OK','Error')
         } else {$script:p6Notice.Text='操作已完成。上传和队列状态可在下面查看。'}
     } finally {
         $credential=$null
@@ -253,7 +259,7 @@ function New-P6ManagerForm {
     $script:p6Entries=@()
     $script:p6Buttons=@{}
     $script:p6Form=New-Object Windows.Forms.Form
-    $script:p6Form.Text='P6 管理'
+    $script:p6Form.Text='客户端管理'
     $script:p6Form.Size=New-Object Drawing.Size(1040,820)
     $script:p6Form.AutoScroll=$true
     $script:p6Form.MinimumSize=New-Object Drawing.Size(780,520)
@@ -264,24 +270,36 @@ function New-P6ManagerForm {
     $script:p6Heading.SetBounds(20,15,980,45)
     $script:p6Heading.Text='读取状态中…'
     $label=New-Object Windows.Forms.Label
-    $label.Text='Client Bundle（包含密钥，请妥善保管）：'
+    $label.Text='设备配置（包含密钥，请妥善保管）：'
     $label.SetBounds(20,70,400,25)
     $script:p6Bundle=New-Object Windows.Forms.TextBox
     $script:p6Bundle.ReadOnly=$true
     $script:p6Bundle.SetBounds(20,100,800,30)
     $pick=New-Object Windows.Forms.Button
-    $pick.Text='选择 ZIP'
+    $pick.Text='选择配置'
     $pick.SetBounds(835,98,165,35)
-    $pick.Add_Click({if ($script:p6Busy) {return}; $dialog=New-Object Windows.Forms.OpenFileDialog; $dialog.Filter='Client Bundle ZIP|*.zip'; $dialog.Multiselect=$false; try {if ($dialog.ShowDialog($script:p6Form) -eq 'OK') {$script:p6Bundle.Text=$dialog.FileName}} finally {$dialog.Dispose()}})
+    $pick.Add_Click({if ($script:p6Busy) {return}; $dialog=New-Object Windows.Forms.OpenFileDialog; $dialog.Filter='设备配置 ZIP|*.zip'; $dialog.Multiselect=$false; try {if ($dialog.ShowDialog($script:p6Form) -eq 'OK') {$script:p6Bundle.Text=$dialog.FileName}} finally {$dialog.Dispose()}})
     $script:p6Automatic=New-Object Windows.Forms.CheckBox
-    $script:p6Automatic.Text='尝试安全读取当前用户的 Clash Verge 配置（地址必须与 Bundle 一致）'
+    $script:p6Automatic.Text='尝试安全读取当前用户的 Clash Verge 配置（地址必须与设备配置一致）'
     $script:p6Automatic.Checked=$true
     $script:p6Automatic.SetBounds(20,140,900,30)
     $script:p6Profiles=New-Object Windows.Forms.ListBox
     $script:p6Profiles.SetBounds(20,240,335,420)
     $script:p6Profiles.Add_SelectedIndexChanged({if (-not $script:p6Busy) {Update-P6Selection}})
     $script:p6Details=New-Object Windows.Forms.Label
-    $script:p6Details.SetBounds(370,240,630,50)
+    $script:p6Details.SetBounds(370,240,510,50)
+    $technical=New-Object Windows.Forms.Button
+    $technical.Text='技术详情'
+    $technical.SetBounds(885,240,115,35)
+    $technical.Add_Click({
+        $i=$script:p6Profiles.SelectedIndex
+        if ($i -ge 0 -and $i -lt $script:p6Entries.Count) {
+            $entry=$script:p6Entries[$i]
+            $text='配置内部标识：'+$entry.id
+            if ($entry.live) {$text+="`r`nprobe_id："+$entry.value.probe_id+"`r`nserver_id："+$entry.value.server_id}
+            [void][Windows.Forms.MessageBox]::Show($text,'技术详情')
+        }
+    })
     $script:p6Grid=New-Object Windows.Forms.DataGridView
     $script:p6Grid.SetBounds(370,295,630,365)
     $script:p6Grid.ReadOnly=$true
@@ -294,8 +312,8 @@ function New-P6ManagerForm {
     [void]$script:p6Grid.Columns.Add('detail','说明')
     $script:p6Notice=New-Object Windows.Forms.Label
     $script:p6Notice.SetBounds(20,720,980,45)
-    $script:p6Form.Controls.AddRange(@($script:p6Heading,$label,$script:p6Bundle,$pick,$script:p6Automatic,$script:p6Profiles,$script:p6Details,$script:p6Grid,$script:p6Notice))
-    $actions=@(@('install','安装 / 更新'),@('import','导入 Bundle'),@('refresh','刷新状态'),@('rollback','回滚'),@('pause','暂停'),@('resume','恢复'),@('remove','移除 Profile'),@('purge','永久清除'),@('uninstall','卸载服务'))
+    $script:p6Form.Controls.AddRange(@($script:p6Heading,$label,$script:p6Bundle,$pick,$script:p6Automatic,$script:p6Profiles,$script:p6Details,$technical,$script:p6Grid,$script:p6Notice))
+    $actions=@(@('install','安装 / 更新'),@('import','导入设备配置'),@('refresh','刷新状态'),@('rollback','回滚'),@('pause','暂停'),@('resume','恢复'),@('remove','移除设备'),@('purge','永久清除'),@('uninstall','卸载服务'))
     for ($i=0; $i -lt $actions.Count; $i++) {
         $button=New-Object Windows.Forms.Button
         $button.Text=$actions[$i][1]
@@ -308,7 +326,7 @@ function New-P6ManagerForm {
     $script:p6Form.Add_FormClosing({param($sender,$event); if ($script:p6Busy) {$event.Cancel=$true}})
     return $script:p6Form
 }
-function Show-P6Manager([string]$Python,[string]$Entry,[string]$Package,[string]$Common) {
+function Show-P6Manager([string]$Python,[string]$Entry,[string]$Package,[string]$Common,[string]$OriginalDirectory) {
     $script:p6Python=$Python
     $script:p6Entry=$Entry
     $script:p6Package=$Package
@@ -317,7 +335,19 @@ function Show-P6Manager([string]$Python,[string]$Entry,[string]$Package,[string]
     $timer=New-Object Windows.Forms.Timer
     $timer.Interval=15000
     $timer.Add_Tick({Refresh-P6Status})
-    $form.Add_Shown({Refresh-P6Status})
+    $form.Add_Shown({
+        Refresh-P6Status
+        $candidate=Invoke-P6Backend 'adjacent-bundle' '' $OriginalDirectory $false $null
+        if ($candidate.ok -and $candidate.value.state -eq 'selected') {
+            $script:p6Bundle.Text=$candidate.value.path
+            $d=$candidate.value.display
+            $script:p6Heading.Text='已识别配置：客户端 ' + $d.client + ' / 设备 ' + $d.device + '。核对后点击“安装 / 更新”。'
+        } elseif ($candidate.ok -and $candidate.value.state -eq 'ambiguous') {
+            $script:p6Heading.Text='同目录有多个设备配置，请点击“选择配置”明确选择。'
+        } elseif (-not $candidate.ok) {
+            $script:p6Heading.Text='同目录配置未通过校验，请重新下载客户端包或明确选择有效配置。'
+        }
+    })
     try {$timer.Start(); [void]$form.ShowDialog()}
     finally {$timer.Stop(); $timer.Dispose(); $form.Dispose()}
 }

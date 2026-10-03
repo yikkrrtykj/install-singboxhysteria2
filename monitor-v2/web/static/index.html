@@ -247,23 +247,23 @@
         </div>
         <section id="p6-device-panel" class="hidden" aria-labelledby="p6-device-heading">
           <h3 id="p6-device-heading">所属客户端： <span id="p6-client-name"></span></h3>
-          <p class="muted">先下载 Windows 程序，解压后运行 P6Setup.exe；再下载该设备的配置包，在程序中选择它完成安装。设备配置包含凭据，请妥善保管。Windows 程序需由管理员先发布到本服务器。</p>
+          <p class="muted">在设备行下载 Windows 客户端包，完整解压后打开安装程序；程序会识别同目录配置。每台设备独立登记，包内含密钥，请私密保管。Windows 程序需由管理员先发布到本服务器。</p>
           <div class="row">
-            <button id="p6-windows-download" class="btn ghost" type="button">下载 Windows 程序</button>
+            <button id="p6-windows-download" class="btn ghost" type="button">单独下载程序（高级）</button>
             <button id="p6-refresh" class="btn ghost" type="button">刷新设备</button>
             <button id="p6-next" class="btn ghost hidden" type="button">下一页</button>
             <button id="p6-close" class="btn ghost" type="button">关闭</button>
           </div>
           <div class="table-card">
-            <table class="table"><thead><tr><th>设备</th><th>登记状态</th><th>操作</th></tr></thead>
+            <table class="table"><thead><tr><th>客户端</th><th>设备</th><th>位置</th><th>网络路径</th><th>登记状态</th><th>操作</th></tr></thead>
               <tbody id="p6-devices-body"></tbody>
             </table>
           </div>
           <form id="p6-enroll-form">
             <div class="row">
               <label>设备 <input id="p6-device-name" type="text" maxlength="32" placeholder="例如 laptop-01" autocomplete="off" required></label>
-              <label>站点 <input id="p6-site-label" type="text" maxlength="64" value="office" autocomplete="off" required></label>
-              <label>路径标签 <input id="p6-path-label" type="text" maxlength="64" value="operator-path" autocomplete="off" required></label>
+              <label>位置 <input id="p6-site-label" type="text" maxlength="64" value="office" autocomplete="off" required></label>
+              <label>网络路径 <input id="p6-path-label" type="text" maxlength="64" value="operator-path" autocomplete="off" required></label>
               <button id="p6-enroll" class="btn" type="submit">登记设备</button>
             </div>
           </form>

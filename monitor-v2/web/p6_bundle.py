@@ -68,7 +68,7 @@ def assemble(name, device, parts, generic):
         for value in (name, device):
             if type(value) is not str or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,31}', value):
                 raise BundleError()
-        if type(parts) is not dict or set(parts) != PARTS_KEYS or parts['format'] != 'p6-client-bundle-parts/1':
+        if type(parts) is not dict or set(parts) not in (PARTS_KEYS, PARTS_KEYS | {'display'}) or parts['format'] != 'p6-client-bundle-parts/1':
             raise BundleError()
         manifest = validate_manifest(parts['artifact'])
         if type(generic) is not bytes or len(generic) > MAX_ARTIFACT_BYTES \
@@ -84,6 +84,15 @@ def assemble(name, device, parts, generic):
             raise BundleError()
         profile = parts['profile']
         validate_profile(profile, certificate)
+        display = parts.get('display')
+        metadata = {'v': 1, 'client': name, 'device': device, 'artifact': manifest, 'kind': 'source-foundation'}
+        if 'display' in parts:
+            if type(display) is not dict or set(display) != {'client', 'device', 'location', 'network_path'} \
+                    or display['client'] != name or display['device'] != device \
+                    or any(type(display[k]) is not str or not re.fullmatch(r'[ -~]{1,64}', display[k])
+                           for k in ('location', 'network_path')):
+                raise BundleError()
+            metadata.update(v=2, location=display['location'], network_path=display['network_path'])
         output = io.BytesIO()
         files = {
             name + '-mihomo.yaml': yaml.encode('utf-8'),
@@ -92,10 +101,9 @@ def assemble(name, device, parts, generic):
             'server.pem': certificate.encode('ascii'),
             'agent/p6-agent.pyz': generic,
             'agent/artifact.json': canonical(manifest) + b'\n',
-            'bundle.json': canonical({'v': 1, 'client': name, 'device': device,
-                                     'artifact': manifest, 'kind': 'source-foundation'}) + b'\n',
+            'bundle.json': canonical(metadata) + b'\n',
             'README.txt': (
-                'P6 Client Bundle — source foundation\n\n'
+                '客户端设备配置包\n\n'
                 'Sensitive: contains this device\'s proxy and P6 credentials.\n'
                 'Use only on the selected device. Enroll other devices separately.\n'
                 'Import the Mihomo YAML through your existing client.\n'
