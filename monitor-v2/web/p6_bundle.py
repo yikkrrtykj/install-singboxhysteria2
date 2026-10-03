@@ -48,7 +48,7 @@ def validate_profile(profile, certificate):
         raise BundleError()
     expected = {'mihomo_url': 'http://127.0.0.1:9090', 'reality_node': 'Reality', 'hy2_node': 'Hysteria2',
                 'watched_group': '自动选择', 'dns_host': 'dns.google', 'https_host': 'www.gstatic.com',
-                'egress_host': 'api.ipify.org', 'vps_host': url.hostname, 'vps_port': agent['vps_port'],
+                'egress_host': 'iplark.com', 'vps_host': url.hostname, 'vps_port': agent['vps_port'],
                 'cadence': 60, 'cycle_deadline': 20, 'diagnostic_timeout': 5}
     if canonical(agent) != canonical(expected) or certificate.count('-----BEGIN CERTIFICATE-----') != 1 \
             or hashlib.sha256(ssl.PEM_cert_to_DER_cert(certificate)).hexdigest() != profile['certificate_sha256']:

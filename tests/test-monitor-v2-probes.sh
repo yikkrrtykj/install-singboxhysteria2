@@ -271,12 +271,14 @@ else
     fail "the opt-in is named by an unexpected set: var=[$TVAR] token=[$TTOK]"
 fi
 # (6) no reviewed public endpoint literal outside diagnostics/, except the
-# fixed P6B2 passive bundle validator. It compares generated profile values;
-# portable bundle acceptance refuses any socket during actual ZIP assembly.
+# fixed passive bundle validator and the explicit P6B2 production-only adapter.
+# Issue #67 IPLark amendment preserves api.ipify.org as a legacy profile alias;
+# base/DARK collection and network-zero-call gates below remain unchanged.
 LEAK="$(grep -rl --include='*.py' --include='*.sh' --include='*.js' \
     --include='*.html' --exclude-dir=__pycache__ --exclude-dir=diagnostics \
     -E 'api\.ipify\.org|one\.one\.one\.one' "$ROOT/monitor-v2" \
-    | grep -vFx "$ROOT/monitor-v2/web/p6_bundle.py" || true)"
+    | grep -vFx "$ROOT/monitor-v2/web/p6_bundle.py" \
++    | grep -vFx "$ROOT/monitor-v2/remote_probe/production_runtime.py" || true)"
 if [ -z "$LEAK" ]; then
     pass "no production endpoint literal outside diagnostics/"
 else

@@ -45,7 +45,7 @@ class BundleTests(unittest.TestCase):
                 'certificate_sha256': self.certs.pin('bundle'), 'agent': {
                     'mihomo_url': 'http://127.0.0.1:9090', 'reality_node': 'Reality',
                     'hy2_node': 'Hysteria2', 'watched_group': '自动选择', 'dns_host': 'dns.google',
-                    'https_host': 'www.gstatic.com', 'egress_host': 'api.ipify.org',
+                    'https_host': 'www.gstatic.com', 'egress_host': 'iplark.com',
                     'vps_host': '192.0.2.10', 'vps_port': 443,
                     'cadence': 60, 'cycle_deadline': 20, 'diagnostic_timeout': 5}}
         self.parts = {'format': 'p6-client-bundle-parts/1', 'yaml': 'canonical YAML\n\n',
