@@ -64,9 +64,9 @@ class WindowsClientPackage:
                 self.entries.append((row.filename,row.file_size,row.CRC,row,None))
             scope = '受控测试版，不能用于正式发布。\n' if manifest['scope']=='lab' else ''
             readme = (scope+'Windows 客户端包\n\n'
-                '1. 完整解压本包，双击 P6Setup.exe 打开客户端管理。\n'
-                '2. 程序会识别同目录设备配置；核对设备后点击安装 / 更新。\n'
-                '3. 将同目录的 '+yaml_name+' 导入现有 Clash 客户端。\n'
+                '1. 完整解压本包，保留同目录文件。\n'
+                '2. 先将 '+yaml_name+' 导入并启用现有 Clash 客户端；按配置要求启用本机 API。\n'
+                '3. 双击 P6Setup.exe 打开客户端管理；核对识别的设备后点击安装 / 更新。\n'
                 '4. 关闭管理窗口后，后台服务继续采样和上传。\n\n'
                 '本包包含此设备的密钥和代理配置，请私密保管，仅用于该设备。\n'
                 '其他设备请分别登记并下载。不要将服务器证书安装到系统信任库。\n'
