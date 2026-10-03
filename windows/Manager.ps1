@@ -76,6 +76,7 @@ function P6Token($Value) {
         'ok' {'正常'} 'timeout' {'超时'} 'unavailable' {'不可用'} 'invalid' {'配置无效'}
         'failed' {'失败'} 'active_delay' {'主动测试'} 'passive_cache' {'缓存观察'}
         'reality' {'Reality'} 'hy2' {'Hysteria2'}
+        'NONE' {'无错误'}
         'sharing_violation' {'文件暂被占用'}
         'permission_denied' {'写入权限不足'}
         'disk_full' {'磁盘空间不足'}
@@ -126,10 +127,12 @@ function Update-P6Selection {
                     $delay = if ($null -ne $value.latency_ms) {[string]$value.latency_ms + ' ms'} else {P6Token $value.error_code}
                     Add-P6Row $slot[0] (P6Token $value.status) $delay
                 }
-                $egressDetail=if ($sample.PSObject.Properties['egress_error_code']) {P6Token $sample.egress_error_code} else {''}
-                Add-P6Row '公网出口' (P6Token $sample.egress_status) $egressDetail
+                $egressDetail=if ($sample.egress_status -eq 'ok' -and $null -ne $sample.egress_latency_ms) {
+                    [string]$sample.egress_latency_ms + ' ms'
+                } elseif ($sample.PSObject.Properties['egress_error_code']) {P6Token $sample.egress_error_code} else {''}
+                Add-P6Row '本机出口检测' (P6Token $sample.egress_status) $egressDetail
                 $egressIp=if ($sample.PSObject.Properties['egress_ip'] -and $sample.egress_ip) {[string]$sample.egress_ip} else {'未获取'}
-                Add-P6Row '公网 IP' $egressIp ('对应本次采样：'+$time)
+                Add-P6Row '本机网络出口 IP' $egressIp ('本次请求的出口；采样：'+$time)
                 Add-P6Row 'Clash API' (P6Token $sample.mihomo_api.status) ''
                 foreach ($value in @($sample.active)) {
                     $delay = if ($null -ne $value.delay_ms) {[string]$value.delay_ms + ' ms'} else {'—'}

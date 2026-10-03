@@ -660,3 +660,38 @@ status tests verify success display, failure clearing and no snapshot mutation.
 New signed distribution/native service acceptance remains required before claiming
 the installed service uses IPLark. PR remains Draft; whole COMPLETE, independent
 final PASS, MERGE, production deploy, P6C/P6D remain NO.
+
+
+### Field closeout: direct-egress wording and retained acceptance (2026-10-04)
+
+The operator requested forward progress after the first IPLark sample/receipt
+readback and rejected repeating the earlier offline/reconnect exercise. Retain
+the existing operator screenshots (local acknowledgments20→22, unresolved span
+1→0, tracked retries1→0) as historical field recovery evidence. Their historical
+state-save-failure count was1; subsequent native sharing/ReplaceFileW fixes and
+latest zero-failure snapshots are separate evidence, not a retroactive cause
+assignment or a claim that the old exercise ran on today's build. This small
+display-only closeout does not restart that field test sequence.
+
+Windows labels the actual request observation as 本机出口检测 / 本机网络出口 IP.
+Successful egress details show existing latency_ms; a missing latency falls back
+to the translated NONE=无错误 token. Failure retains its existing closed error.
+The IP note explains that this is this request's route and sample time, which
+can be a direct local-network egress rather than a configured VPS or proxy-node
+address. Request routing, observation fields, parser/TLS, upload/spool/server
+semantics and acceptance evidence remain unchanged.
+
+Current field evidence: test VPS updated/published 9ac74e4, native LAB archive
+verified, Windows successful IPLark sample at2026-10-04 02:37:13 +08:00. Operator
+readonly SSH readback matched its run and actual seq1 receipt, max_seq10,
+receipts10, latest acceptance age9.1s. This establishes the first matched LAB
+collection/upload, not completed resource/TUN/multiple-profile/retirement or
+production acceptance. The historical seq restart establishes a new process
+run; it alone does not prove full Windows reboot/autostart.
+
+The earlier LAB preparer showed a generic error despite an exact native-Valid
+export/receipt. Detailed launcher exception remains unavailable; no new trust
+or package installation is required for this wording source commit. Publish one
+review head, retain existing field evidence, and batch any later signed delivery.
+Draft PR70 remains unmerged; full completion/final independent review, production
+signer/timestamp and the remaining unproven field gates stay explicitly open.
