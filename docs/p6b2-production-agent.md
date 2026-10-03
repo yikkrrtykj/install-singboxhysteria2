@@ -423,3 +423,51 @@ and root-validator refusal of a private ancestor. Native Bundle tests are now
 23; shipped UI checks are 108. Prior independent PASS applies to its reviewed
 head only; this repair awaits independent review and actual test-VPS readback.
 PR #70 stays Draft; no merge, production deployment or P6C/P6D.
+
+## Graphical Windows manager and scoped controller discovery
+
+The unsigned Windows staging builder now requires the native Windows x64 .NET
+compiler and emits `P6Setup.exe` alongside signed `Setup.ps1`, `payload.cat` and
+the bounded payload. The executable requests normal administrator consent and
+hosts build-embedded authenticated GUI/setup code on an STA runspace and opens
+a Chinese graphical manager without a console or script-policy override. It does
+not execute downloaded script code; the native Windows PowerShell assembly comes
+from the fixed machine GAC. Trusted distribution and
+external publisher verification remain entry requirements. All three entry
+objects must have native Valid signatures from the compiled publisher; the
+production signer requires timestamps for all three. No production signing
+certificate is available yet, so this is not a publishable Windows release.
+
+The manager selects a separate sensitive Bundle and exposes explicit install /
+update, import, rollback, per-profile pause/resume/removal, retired-data purge,
+and zero-live-profile uninstall. Remove retains local credentials/queues and
+does not revoke the VPS identity; purge has separate irreversible confirmation.
+Closing the manager leaves the background service running. Legacy signed
+three-member packages are recognized only with their original closed manifest;
+the new gui-v1 manifest requires its signed executable. Upgrade/rollback keeps
+the original profile and spool semantics.
+
+Refresh uses a separate read-only snapshot, not the legacy installer status
+operation that can recover durable intent. It never creates installation state,
+executes recovery, controls the service, opens a spool writer or reads credential
+files. Exact native object checks permit read sharing with append/atomic replace.
+Display contains selected closed local metrics and counters only; the unresolved
+record span is not an exact pending count, and a local sample is not proof of a
+particular server receipt. Pending upgrade/uninstall requires explicit recovery.
+
+Automatic discovery supports only the current administrator user's native
+RoamingAppData Clash Verge Rev `clash-verge.yaml`. The reader is bounded to
+256 KiB with same-object owner/DACL/single-link/reparse checks, using a separate
+current-user source policy that never widens the installed vault policy. Only
+unambiguous top-level controller/secret scalars are recognized. Address and port
+must match the existing immutable Bundle controller; existing real GET-only
+authentication and explicit node/group verification still run. No scanning other
+users, config edits, API enablement, restarts or implicit profile rewrites.
+Unsupported/ambiguous sources get a Chinese explanation and masked one-time
+credential fallback. Credential bytes never enter argv/env/output/evidence and
+temporary fallback staging keeps SYSTEM/Administrators authority.
+
+Real GUI/operator acceptance, offline/reboot/TUN/multiple-profile/resource
+benchmarks, production signing/distribution and independent review remain
+pending. Existing running lab service is unchanged while this slice is built.
+PR #70 stays Draft; no merge, production deployment, P6C or P6D.

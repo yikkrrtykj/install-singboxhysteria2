@@ -2,7 +2,7 @@
 # Do not add an unsigned fallback or change machine-wide execution/TLS policy.
 [CmdletBinding()]
 param(
-    [ValidateSet('install','rollback','import','status','pause','resume','remove','purge','uninstall')]
+    [ValidateSet('install','rollback','import','status','gui','pause','resume','remove','purge','uninstall')]
     [string]$Operation = 'install',
     [string]$Bundle,
     [string]$Profile,
@@ -54,8 +54,10 @@ function ProtectedDirectory([string]$Path) {
         if ($rule.IdentityReference.Value -notin @('S-1-5-18','S-1-5-32-544') -or $rule.AccessControlType -ne 'Allow' -or $rule.FileSystemRights -ne 'FullControl') { throw 'unsafe staging DACL' }
     }
 }
+# P6_GUI_CODE
+
 function VerifyPackage([string]$Path) {
-    foreach ($file in @('Setup.ps1','payload.cat')) {
+    foreach ($file in @('P6Setup.exe','Setup.ps1','payload.cat')) {
         $signature = Get-AuthenticodeSignature -LiteralPath (Join-Path $Path $file) -ErrorAction Stop
         if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Thumbprint -ne $publisher) {
             throw 'publisher verification failed'
@@ -82,9 +84,13 @@ try {
     ProtectedDirectory $staging
     # Never use recursive Copy-Item on untrusted input. Explicitly enumerate
     # the finite package tree; copied bytes are revalidated under protected ACL.
-    foreach ($name in @('Setup.ps1','payload.cat')) {
+    $total = 0L
+    foreach ($name in @('P6Setup.exe','Setup.ps1','payload.cat')) {
         $source = Join-Path $PSScriptRoot $name
         RealPath $source
+        $length = (Get-Item -LiteralPath $source -ErrorAction Stop).Length
+        if ($length -gt 4194304) { throw 'entry capacity' }
+        $total += $length
         [IO.File]::Copy($source, (Join-Path $staging $name), $false)
     }
     $payload = Join-Path $staging 'payload'
@@ -96,7 +102,6 @@ try {
     $objects = @(Get-ChildItem -LiteralPath $sourcePayload -Force -ErrorAction Stop)
     $objects += @(Get-ChildItem -LiteralPath (Join-Path $sourcePayload 'runtime') -Force -ErrorAction Stop)
     if ($objects.Count -gt 68) { throw 'payload capacity' }
-    $total = 0L
     foreach ($object in $objects) {
         RealPath $object.FullName
         if ($object.PSIsContainer) {
@@ -113,6 +118,11 @@ try {
     Write-Host '[PASS] protected payload copy verified'
     $python = Join-Path $payload 'runtime\python.exe'
     $entry = Join-Path $payload 'p6-installer.pyz'
+    if ($Operation -eq 'gui') {
+        if ($Bundle -or $Profile -or $ControllerKeyFile -or $PromptControllerSecret) { throw 'graphical input must be selected in window' }
+        Show-P6Manager $python $entry $staging $common
+        exit 0
+    }
     $arguments = @('-I','-B',$entry,$Operation,'--package',$staging)
     if ($PromptControllerSecret) {
         if ($ControllerKeyFile -or $Operation -notin @('install','import')) { throw 'invalid credential interaction' }

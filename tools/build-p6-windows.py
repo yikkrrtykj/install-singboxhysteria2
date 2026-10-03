@@ -6,6 +6,11 @@ by the build operator/CI and must match the fixed upstream SHA-256. This tool
 produces an UNSIGNED staging payload, never a publishable release by itself.
 """
 import argparse
+import ctypes
+import base64
+import os
+import subprocess
+import tempfile
 import hashlib
 import importlib.util
 import io
@@ -48,7 +53,7 @@ def build(runtime_archive, publisher, destination, fixture_name=None):
     with zipfile.ZipFile(io.BytesIO(agent)) as archive:
         installer_files = {name: archive.read(name) for name in archive.namelist()}
     installer_files['__main__.py'] = b'from p6installer.manager import main\nraise SystemExit(main())\n'
-    for name in ('__init__.py', 'bundle.py', 'scm.py', 'manager.py'):
+    for name in ('__init__.py', 'bundle.py', 'scm.py', 'manager.py', 'controller.py', 'status.py'):
         installer_files['p6installer/' + name] = (ROOT / 'windows/p6installer' / name).read_bytes().replace(b'\r\n', b'\n')
     installer_files['p6_artifact.py'] = (ROOT / 'monitor-v2/p6_artifact.py').read_bytes().replace(b'\r\n', b'\n')
     # No operational flag permits changing root/service. Native CI compiles a
@@ -62,7 +67,7 @@ def build(runtime_archive, publisher, destination, fixture_name=None):
             item.create_system, item.external_attr = 3, 0o100644 << 16
             archive.writestr(item, raw)
     files['p6-installer.pyz'] = output.getvalue()
-    meta = {'v': 1, 'runtime': 'cpython-3.13.16-amd64', 'artifact': artifact,
+    meta = {'v': 1, 'entry': 'gui-v1', 'runtime': 'cpython-3.13.16-amd64', 'artifact': artifact,
             'files': {name: {'sha256': hashlib.sha256(raw).hexdigest(), 'size': len(raw)}
                       for name, raw in sorted(files.items())}}
     from remote_probe.profiles import canonical
@@ -71,8 +76,37 @@ def build(runtime_archive, publisher, destination, fixture_name=None):
         (payload / name).write_bytes(raw)
     (payload / 'release.json').write_bytes(canonical(meta))
     setup = (ROOT / 'windows/Setup.ps1').read_text(encoding='utf-8-sig')
-    (target / 'Setup.ps1').write_bytes(setup.replace('@P6_PUBLISHER@', publisher).encode('utf-8-sig'))
+    gui = (ROOT / 'windows/Manager.ps1').read_text(encoding='utf-8-sig')
+    (target / 'Setup.ps1').write_bytes(setup.replace('@P6_PUBLISHER@', publisher).replace('# P6_GUI_CODE', gui).encode('utf-8-sig'))
+    compile_launcher(target, publisher)
     return meta
+
+
+def compile_launcher(target, publisher):
+    if os.name != 'nt':
+        raise ValueError('native Windows release builder required')
+    buffer = ctypes.create_unicode_buffer(32768)
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.GetSystemWindowsDirectoryW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint]
+    if not kernel.GetSystemWindowsDirectoryW(buffer, len(buffer)):
+        raise ValueError('native compiler directory unavailable')
+    framework = Path(buffer.value) / 'Microsoft.NET/Framework64/v4.0.30319'
+    with tempfile.TemporaryDirectory(prefix='p6-launcher-build-') as temporary:
+        script = Path(temporary) / 'P6Launcher.cs'
+        embedded = (Path(target) / 'Setup.ps1').read_text(encoding='utf-8-sig').replace('$PSScriptRoot', '$script:P6CompiledPackageRoot')
+        code = base64.b64encode(embedded.encode('utf-8')).decode('ascii')
+        script.write_text((ROOT / 'windows/P6Launcher.cs').read_text(encoding='utf-8').replace('@P6_PUBLISHER@', publisher).replace('@P6_COMPILED_SETUP@', code), encoding='utf-8')
+        result = subprocess.run([str(framework / 'csc.exe'), '/nologo', '/noconfig', '/nostdlib+',
+            '/target:winexe', '/platform:x64', '/optimize+',
+            '/reference:' + str(framework / 'mscorlib.dll'), '/reference:' + str(framework / 'System.dll'),
+            '/reference:' + str(framework / 'System.Windows.Forms.dll'),
+            '/reference:' + str(framework / 'System.Core.dll'),
+            '/reference:' + str(Path(buffer.value) / 'Microsoft.NET/assembly/GAC_MSIL/System.Management.Automation/v4.0_3.0.0.0__31bf3856ad364e35/System.Management.Automation.dll'),
+            '/win32manifest:' + str(ROOT / 'windows/P6Launcher.manifest'),
+            '/out:' + str(Path(target) / 'P6Setup.exe'), str(script)],
+            capture_output=True, timeout=60, creationflags=0x08000000)
+    if result.returncode:
+        raise ValueError('native graphical launcher build unavailable')
 
 
 def main():

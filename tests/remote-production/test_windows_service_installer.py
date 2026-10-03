@@ -66,7 +66,7 @@ Write-Output 'fixture: native modules loaded'
 if($Package) {
   $cert=Get-Item -LiteralPath ('Cert:\\CurrentUser\\My\\'+$Thumbprint)
   New-FileCatalog -Path (Join-Path $Package 'payload') -CatalogFilePath (Join-Path $Package 'payload.cat') -CatalogVersion 2.0 | Out-Null
-  foreach($name in @('Setup.ps1','payload.cat')) {
+  foreach($name in @('P6Setup.exe','Setup.ps1','payload.cat')) {
     $signature=Set-AuthenticodeSignature -LiteralPath (Join-Path $Package $name) -Certificate $cert -HashAlgorithm SHA256
     if($signature.Status -ne 'Valid'){throw 'fixture signature failed'}
   }
@@ -465,8 +465,168 @@ foreach($store in @('Root','My')) {
                 shutil.rmtree(target)
 
 
+    def test_graphical_entry_signature_tamper_and_missing_entry_refused(self):
+        bad = self.protected / uuid.uuid4().hex
+        shutil.copytree(self.package, bad)
+        exe = bad / 'P6Setup.exe'
+        raw = bytearray(exe.read_bytes())
+        raw[0x80] ^= 1
+        exe.write_bytes(raw)
+        with self.assertRaises(ConfigError):
+            self.manager.install(bad)
+        self.assertIsNone(self.manager._active())
+        exe.write_bytes(b'x' * (4 * 1024 * 1024 + 1))
+        with self.assertRaises(StorageSecurityError):
+            validate_release(bad, self.policy)
+        exe.unlink()
+        with self.assertRaises(ConfigError):
+            validate_release(bad, self.policy)
+        self.assertEqual(self.service.state(self.manager._command(self.meta['release'])), 0)
+
+    def test_actual_native_graphical_form_and_backend_dispatch(self):
+        # Construct our own native controls without an interactive runner session.
+        # A fixed recording backend exercises the real GUI handlers, not a grep.
+        source = self.root / ('gui-' + uuid.uuid4().hex + '.ps1')
+        gui = (ROOT / 'windows/Manager.ps1').read_text(encoding='utf-8-sig')
+        source.write_text(gui + r'''
+
+$ErrorActionPreference='Stop'
+$form=New-P6ManagerForm
+$script:seen=@()
+function Invoke-P6Backend($Action,$SelectedProfile,$SelectedBundle,$Auto,$Credential) {
+    $script:seen+=@{action=$Action;profile=$SelectedProfile;bundle=$SelectedBundle;auto=$Auto;hasCredential=($null -ne $Credential)}
+    if($Action -eq 'ui-status') {
+        return @{ok=$true;value=@{v=1;installed=$true;pending_recovery=$false;service_state=4;
+          profiles=@(@{id=('a'*64);probe_id='fixture-probe';server_id=('b'*32);enabled=$true;spool=$null;sample=$null});retired=@()}}
+    }
+    return @{ok=$true;value=@{}}
+}
+try {
+  Refresh-P6Status
+  if($script:p6Profiles.Items.Count -ne 1 -or $script:p6Grid.Columns.Count -ne 3 -or $form.Controls.Count -ne 18){throw 'form shape'}
+  $script:p6Bundle.Text='C:\fixture-only\client.zip'
+  Run-P6Action 'import'
+  Run-P6Action 'pause'
+  Run-P6Action 'resume'
+  $imports=@($script:seen | Where-Object {$_.action -eq 'import'})
+  if($imports.Count -ne 1 -or -not $imports[0].auto -or $imports[0].hasCredential){throw 'discovery dispatch'}
+  foreach($action in @('pause','resume')) {
+    $calls=@($script:seen | Where-Object {$_.action -eq $action})
+    if($calls.Count -ne 1 -or $calls[0].profile -ne ('a'*64) -or $calls[0].hasCredential){throw 'profile dispatch'}
+  }
+  if(-not $script:p6Buttons['pause'].Enabled -or $script:p6Buttons['purge'].Enabled){throw 'action containment'}
+  Write-Output 'GUI_NATIVE_FORM_AND_DISPATCH_PASS'
+} finally {$form.Dispose()}
+''', encoding='utf-8-sig')
+        result = subprocess.run([self.powershell, '-NoProfile', '-NonInteractive', '-STA', '-File', str(source)],
+                                capture_output=True, timeout=45)
+        self.assertEqual(result.returncode, 0, result.stderr.decode(errors='replace'))
+        self.assertIn(b'GUI_NATIVE_FORM_AND_DISPATCH_PASS', result.stdout)
+
+    def test_actual_snapshot_preserves_live_service_queues_and_pending_intent(self):
+        from p6installer.status import snapshot
+        self.install()
+        _, path, _ = self.profile()
+        key = self.manager.operate('import', bundle=path, controller_secret='local-secret')['profile']
+        self.manager.operate('pause', profile=key)
+        spool = Path(self.manager.vault._path(key)) / 'spool'
+        self.manager.vault._write(str(spool), 'pending-fixture', b'pending bytes')
+        self.manager._write(spool / 'spool.state.json', {'next_record_id': 2, 'resolved_through': 0, 'acknowledged_total': 0,
+            'quarantined_total': 0, 'expired_total': 0, 'budget_dropped_total': 0, 'corrupt_total': 0,
+            'state_save_failures': 0, 'retry_attempts': {'1': 1}})
+        before = self.policy.read(str(spool / 'pending-fixture'), 128)
+        state = self.service.state(self.manager._command(self.meta['release']))
+        result = snapshot(self.manager)
+        self.assertEqual(result['service_state'], state)
+        self.assertEqual(result['profiles'][0]['id'], key)
+        self.assertEqual(result['profiles'][0]['spool']['acknowledged_total'], 0)
+        self.assertEqual(self.policy.read(str(spool / 'pending-fixture'), 128), before)
+        self.assertFalse(self.manager.vault.enabled(key))
+        intent = {'v': 1, 'old': self.meta['release'], 'new': self.meta['release']}
+        self.manager._write(self.directory / 'upgrade.json', intent)
+        self.assertTrue(snapshot(self.manager)['pending_recovery'])
+        self.assertEqual(self.manager._read('upgrade.json'), intent)
+        self.assertEqual(self.service.state(self.manager._command(self.meta['release'])), state)
+
+    def test_legacy_signed_three_member_release_still_allows_upgrade_and_rollback(self):
+        legacy = self.protected / uuid.uuid4().hex
+        shutil.copytree(self.package, legacy)
+        (legacy / 'P6Setup.exe').unlink()
+        (legacy / 'payload.cat').unlink()
+        meta = copy.deepcopy(self.meta)
+        del meta['entry']
+        meta['release'] = hashlib.sha256(canonical({k: meta[k] for k in meta if k != 'release'})).hexdigest()
+        (legacy / 'payload/release.json').write_bytes(canonical(meta))
+        # The legacy entry is the actual previous trusted template, not the GUI
+        # template pretending it can launch with a missing required executable.
+        old_setup = subprocess.check_output(['git', 'show', '27d23e35254f4a8f472d782ad76d80cdc97281b1:windows/Setup.ps1'], cwd=ROOT).decode('utf-8-sig')
+        (legacy / 'Setup.ps1').write_bytes(old_setup.replace('@P6_PUBLISHER@', self.publisher).encode('utf-8-sig'))
+        legacy_sign = self.root / ('legacy-sign-' + uuid.uuid4().hex + '.ps1')
+        text = self.sign_script.read_text().replace("@('P6Setup.exe','Setup.ps1','payload.cat')", "@('Setup.ps1','payload.cat')")
+        legacy_sign.write_text(text)
+        signed = subprocess.run([self.powershell, '-NoProfile', '-NonInteractive', '-File', str(legacy_sign),
+            '-Package', str(legacy), '-Thumbprint', self.publisher], capture_output=True, timeout=60)
+        self.assertEqual(signed.returncode, 0)
+        self.manager.install(legacy)
+        self.assertEqual(self.manager._active(), meta['release'])
+        self.manager.install(self.package)
+        self.assertEqual(self.manager._active(), self.meta['release'])
+        self.assertEqual(self.manager.rollback()['release'], meta['release'])
+        self.assertEqual(self.service.state(self.manager._command(meta['release'])), 4)
+
+
+
+    def test_actual_signed_windowed_entry_opens_and_closes_without_install(self):
+        from ctypes import wintypes as W
+        name = 'P6InstallerFixture' + uuid.uuid4().hex
+        package = self.protected / uuid.uuid4().hex
+        builder.build(self.runtime_archive, self.publisher, package, fixture_name=name)
+        self.sign(package)
+        buffer = ctypes.create_unicode_buffer(32768)
+        self.assertEqual(ctypes.windll.shell32.SHGetFolderPathW(None, 35, None, 0, buffer), 0)
+        target = Path(buffer.value) / name
+        self.assertFalse(target.exists())
+        user = ctypes.WinDLL('user32', use_last_error=True)
+        user.GetWindowThreadProcessId.argtypes = [W.HWND, ctypes.POINTER(W.DWORD)]
+        user.GetClassNameW.argtypes = [W.HWND, W.LPWSTR, ctypes.c_int]
+        user.GetWindowTextW.argtypes = [W.HWND, W.LPWSTR, ctypes.c_int]
+        user.PostMessageW.argtypes = [W.HWND, W.UINT, W.WPARAM, W.LPARAM]
+        callback_type = ctypes.WINFUNCTYPE(W.BOOL, W.HWND, W.LPARAM)
+        user.EnumWindows.argtypes = [callback_type, W.LPARAM]
+        process = subprocess.Popen([str(package / 'P6Setup.exe')], creationflags=0x08000000)
+        observed = []
+        def owned_window(hwnd, _):
+            pid = W.DWORD()
+            user.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value != process.pid:
+                return True
+            kind, title = ctypes.create_unicode_buffer(256), ctypes.create_unicode_buffer(256)
+            user.GetClassNameW(hwnd, kind, 256)
+            user.GetWindowTextW(hwnd, title, 256)
+            if title.value == 'P6 管理' and kind.value.startswith('WindowsForms10.'):
+                observed.append(hwnd)
+                # This exact CI-owned application only, never another desktop app.
+                user.PostMessageW(hwnd, 0x0010, 0, 0)
+            return True
+        callback = callback_type(owned_window)
+        deadline = time.monotonic() + 60
+        try:
+            while process.poll() is None and time.monotonic() < deadline:
+                user.EnumWindows(callback, 0)
+                time.sleep(.25)
+            self.assertTrue(observed, 'signed native manager window did not open')
+            self.assertEqual(process.wait(timeout=5), 0)
+            self.assertFalse(target.exists(), 'opening/closing GUI must not install or create fixture state')
+        finally:
+            if process.poll() is None:
+                # No install/profile action was sent. Kill only this CI-owned
+                # window process on test failure, never SCM/runtime or host apps.
+                process.terminate()
+                process.wait(timeout=10)
+
+
 if __name__ == '__main__':
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(NativeInstallerTests)
-    assert suite.countTestCases() == 14
+    assert suite.countTestCases() == 19
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     raise SystemExit(0 if result.wasSuccessful() else 1)

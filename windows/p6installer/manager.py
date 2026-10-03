@@ -19,6 +19,7 @@ from remote_probe.spool import SpoolError, _InstanceLock
 from remote_probe.windows_security import StorageSecurityError, WindowsSecurity
 from .bundle import object_json, read_bundle, verify_controller
 from .scm import Service
+from .controller import DiscoveryError, discover_credential
 
 MAX_RELEASE = 64 * 1024 * 1024
 SERVICE = 'P6RemoteProbe'
@@ -33,7 +34,8 @@ def verify_signatures(package, publisher):
     script += "$ErrorActionPreference='Stop';$PSModuleAutoloadingPreference='None';try {"
     script += "foreach($m in @('Microsoft.PowerShell.Security','Microsoft.PowerShell.Management','Microsoft.PowerShell.Utility')) {"
     script += "Import-Module -Name ([IO.Path]::Combine($PSHOME,'Modules',$m,($m+'.psd1'))) -ErrorAction Stop};$PSModuleAutoloadingPreference='None';"
-    script += "foreach($f in @('Setup.ps1','payload.cat')) {$s=Get-AuthenticodeSignature -LiteralPath (Join-Path $p $f);"
+    script += "$files=@('Setup.ps1','payload.cat');if(Test-Path -LiteralPath (Join-Path $p 'P6Setup.exe')){$files+= 'P6Setup.exe'};"
+    script += "foreach($f in $files) {$s=Get-AuthenticodeSignature -LiteralPath (Join-Path $p $f);"
     script += "if($s.Status -ne 'Valid' -or $s.SignerCertificate.Thumbprint -ne '" + publisher + "'){exit 2}};"
     script += "if((Test-FileCatalog -Path (Join-Path $p 'payload') -CatalogFilePath (Join-Path $p 'payload.cat')) -ne 'Valid'){exit 2};exit 0}catch{exit 2}"
     # Windows directory from a native API, never PATH/COMSPEC/PYTHONPATH/env.
@@ -53,17 +55,25 @@ def verify_signatures(package, publisher):
 def validate_release(package, security):
     package = Path(package)
     security.validate(str(package), True)
-    if set(os.listdir(package)) != {'Setup.ps1', 'payload.cat', 'payload'}:
+    entries = set(os.listdir(package))
+    if entries not in ({'Setup.ps1', 'payload.cat', 'payload'}, {'P6Setup.exe', 'Setup.ps1', 'payload.cat', 'payload'}):
         raise ConfigError('unexpected package files')
     security.validate(str(package / 'payload'), True)
     for name in ('Setup.ps1', 'payload.cat'):
         security.validate(str(package / name))
     raw = security.read(str(package / 'payload/release.json'), 32768)
     meta = object_json(raw)
-    if type(meta) is not dict or set(meta) != {'v', 'release', 'runtime', 'artifact', 'files'} \
+    if type(meta) is not dict or set(meta) not in ({'v', 'release', 'runtime', 'artifact', 'files'},
+                                                   {'v', 'release', 'runtime', 'artifact', 'files', 'entry'}) \
             or type(meta['v']) is not int or meta['v'] != 1 or meta['runtime'] != 'cpython-3.13.16-amd64' \
             or type(meta['files']) is not dict or not 4 <= len(meta['files']) <= 64:
         raise ConfigError('invalid release manifest')
+    if 'entry' in meta:
+        if meta['entry'] != 'gui-v1' or 'P6Setup.exe' not in entries:
+            raise ConfigError('invalid graphical release entry')
+        security.validate(str(package / 'P6Setup.exe'))
+    elif 'P6Setup.exe' in entries:
+        raise ConfigError('unexpected graphical release entry')
     from p6_artifact import ArtifactError, validate_manifest
     try:
         validate_manifest(meta['artifact'])
@@ -72,7 +82,9 @@ def validate_release(package, security):
     expected = hashlib.sha256(canonical({k: meta[k] for k in meta if k != 'release'})).hexdigest()
     if meta['release'] != expected:
         raise ConfigError('invalid release identity')
-    total = 0
+    total = len(raw)
+    for name in sorted(entries - {'payload'}):
+        total += len(security.read(str(package / name), 4 * 1024 * 1024))
     actual = set()
     for root, dirs, files in os.walk(package / 'payload', followlinks=False):
         security.validate(root, True)
@@ -452,11 +464,12 @@ class Manager:
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description='P6 Windows lifecycle installer')
-    parser.add_argument('operation', choices=('install', 'rollback', 'import', 'status', 'pause', 'resume', 'remove', 'purge', 'uninstall'))
+    parser.add_argument('operation', choices=('install', 'rollback', 'import', 'status', 'ui-status', 'pause', 'resume', 'remove', 'purge', 'uninstall'))
     parser.add_argument('--package', required=True)
     parser.add_argument('--bundle')
     parser.add_argument('--profile')
     parser.add_argument('--controller-key-file')
+    parser.add_argument('--discover-controller', action='store_true')
     args = parser.parse_args(argv)
     try:
         if os.name != 'nt' or not ctypes.windll.shell32.IsUserAnAdmin() or ctypes.sizeof(ctypes.c_void_p) != 8:
@@ -469,15 +482,29 @@ def main(argv=None):
         if ctypes.windll.shell32.SHGetFolderPathW(None, 35, None, 0, buffer):
             raise ConfigError('system state directory unavailable')
         manager = Manager(Path(buffer.value) / INSTALLATION_NAME, Service(INSTALLATION_NAME), publisher=PUBLISHER)
-        if args.operation == 'install':
+        discovered = ''
+        if args.discover_controller:
+            if args.operation not in ('install', 'import') or not args.bundle or args.controller_key_file:
+                raise ConfigError('invalid local discovery interaction')
+            manager.verifier(args.package, PUBLISHER)
+            meta = validate_release(args.package, manager.security)
+            manifest, _, _ = read_bundle(args.bundle, meta['artifact'])
+            discovered = discover_credential(manifest['agent']['mihomo_url'])
+            verify_controller(manifest, discovered)
+        if args.operation == 'ui-status':
+            if args.bundle or args.profile or args.controller_key_file or args.discover_controller:
+                raise ConfigError('invalid snapshot selector')
+            from .status import snapshot
+            result = snapshot(manager)
+        elif args.operation == 'install':
             result = manager.install(args.package)
             if args.bundle:
-                credential = manager.security.read(args.controller_key_file, 4096).decode('utf-8').rstrip('\r\n') if args.controller_key_file else ''
+                credential = manager.security.read(args.controller_key_file, 4096).decode('utf-8').rstrip('\r\n') if args.controller_key_file else discovered
                 result['import'] = manager.operate('import', bundle=args.bundle, controller_secret=credential)
         elif args.operation == 'rollback':
             result = manager.rollback()
         else:
-            credential = ''
+            credential = discovered
             if args.controller_key_file:
                 if args.operation != 'import':
                     raise ConfigError('controller credential only accepted for import')
@@ -485,6 +512,9 @@ def main(argv=None):
             result = manager.operate(args.operation, args.profile, args.bundle, credential)
         print('[PASS] ' + json.dumps(result, sort_keys=True))
         return 0
+    except DiscoveryError:
+        print('[FAIL] local_controller_discovery_unavailable', file=sys.stderr)
+        return 2
     except (ConfigError, SpoolError, StorageSecurityError, OSError, ValueError, TypeError, KeyError,
             subprocess.SubprocessError):
         print('[FAIL] p6_installer_unavailable', file=sys.stderr)
