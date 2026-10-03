@@ -21,6 +21,7 @@ internal static class P6Launcher {
     [STAThread]
     private static int Main(string[] args) {
         Runspace space = null;
+        string stage = "entry";
         try {
             if (args.Length != 0 || !Environment.Is64BitProcess) throw new InvalidOperationException();
             string root = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
@@ -45,6 +46,7 @@ internal static class P6Launcher {
                 "$h+=New-Object IO.FileStream($x,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read);if($h[-1].Length -gt 4194304){throw 'capacity'};" +
                 "$s=Get-AuthenticodeSignature -LiteralPath $x;" +
                 "if($s.Status -ne 'Valid' -or $s.SignerCertificate.Thumbprint -ne '" + Publisher + "'){throw 'publisher'}}";
+            stage = "signature";
             using (var shell = PowerShell.Create()) {
                 shell.Runspace = space;
                 shell.AddScript(gate, false).Invoke();
@@ -52,15 +54,21 @@ internal static class P6Launcher {
             }
             // Authenticode covers these build-embedded bytes. No script code is
             // loaded from Setup.ps1 and no execution-policy setting is changed.
+            stage = "window";
             string code = Encoding.UTF8.GetString(Convert.FromBase64String(CompiledSetup));
             using (var shell = PowerShell.Create()) {
                 shell.Runspace = space;
                 shell.AddScript(code, false).AddParameter("Operation", "gui").Invoke();
-                if (shell.HadErrors || host.ExitCode != 0) throw new InvalidOperationException();
+                if (shell.HadErrors) {
+                    stage = "ui_pipeline";
+                    if (shell.Streams.Error.Count > 0) stage += "_" + shell.Streams.Error[0].CategoryInfo.Category.ToString();
+                    throw new InvalidOperationException();
+                }
+                if (host.ExitCode != 0) { stage = "ui_exit"; throw new InvalidOperationException(); }
             }
             return 0;
         } catch {
-            MessageBox.Show("无法打开 P6 管理。请确认安装包来自可信发布者、签名有效且文件完整。", "P6 管理", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            MessageBox.Show("无法打开 P6 管理。请确认安装包来自可信发布者、签名有效且文件完整。", "P6 管理 · E_" + stage, MessageBoxButtons.OK, MessageBoxIcon.Error);
             return 2;
         } finally {
             if (space != null) {

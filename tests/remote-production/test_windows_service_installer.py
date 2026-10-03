@@ -559,7 +559,9 @@ try {
         (legacy / 'payload/release.json').write_bytes(canonical(meta))
         # The legacy entry is the actual previous trusted template, not the GUI
         # template pretending it can launch with a missing required executable.
-        old_setup = subprocess.check_output(['git', 'show', '27d23e35254f4a8f472d782ad76d80cdc97281b1:windows/Setup.ps1'], cwd=ROOT).decode('utf-8-sig')
+        old_raw = (ROOT / 'tests/remote-production/fixtures/Setup-pre-gui.ps1').read_bytes().replace(b'\r\n', b'\n')
+        self.assertEqual(hashlib.sha256(old_raw).hexdigest(), 'c636f551801d1ba5719a9005b66c1ff5aeb6a1e73f79821f592648ef71922c80')
+        old_setup = old_raw.decode('utf-8-sig')
         (legacy / 'Setup.ps1').write_bytes(old_setup.replace('@P6_PUBLISHER@', self.publisher).encode('utf-8-sig'))
         legacy_sign = self.root / ('legacy-sign-' + uuid.uuid4().hex + '.ps1')
         text = self.sign_script.read_text().replace("@('P6Setup.exe','Setup.ps1','payload.cat')", "@('Setup.ps1','payload.cat')")
@@ -595,6 +597,7 @@ try {
         user.EnumWindows.argtypes = [callback_type, W.LPARAM]
         process = subprocess.Popen([str(package / 'P6Setup.exe')], creationflags=0x08000000)
         observed = []
+        faults = []
         def owned_window(hwnd, _):
             pid = W.DWORD()
             user.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
@@ -603,6 +606,9 @@ try {
             kind, title = ctypes.create_unicode_buffer(256), ctypes.create_unicode_buffer(256)
             user.GetClassNameW(hwnd, kind, 256)
             user.GetWindowTextW(hwnd, title, 256)
+            if title.value.startswith('P6 管理 · E_'):
+                faults.append(title.value)
+                user.PostMessageW(hwnd, 0x0010, 0, 0)
             if title.value == 'P6 管理' and kind.value.startswith('WindowsForms10.'):
                 observed.append(hwnd)
                 # This exact CI-owned application only, never another desktop app.
@@ -614,8 +620,8 @@ try {
             while process.poll() is None and time.monotonic() < deadline:
                 user.EnumWindows(callback, 0)
                 time.sleep(.25)
-            self.assertTrue(observed, 'signed native manager window did not open')
-            self.assertEqual(process.wait(timeout=5), 0)
+            self.assertTrue(observed, 'signed native manager window did not open: ' + repr(faults))
+            self.assertEqual(process.wait(timeout=5), 0, repr(faults))
             self.assertFalse(target.exists(), 'opening/closing GUI must not install or create fixture state')
         finally:
             if process.poll() is None:
