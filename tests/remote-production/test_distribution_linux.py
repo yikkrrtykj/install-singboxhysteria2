@@ -161,6 +161,137 @@ else:raise AssertionError('non-root retirement')
         self.assertEqual(r.stdout.decode().splitlines(), [self.m['archive']['sha256'], 'authority_denied'])
 
 
+    def lab_from(self, m=None):
+        m = m or self.m
+        return {'publisher': m['publisher'], 'archive_sha256': m['archive']['sha256']}
+
+    def test_explicit_lab_switch_retry_held_reader_and_reverse_preserve_old(self):
+        self.publish()
+        other, raw = fixture(setup=b'new LAB bytes', publisher='B' * 40)
+        with d.open_release(self.m['artifact'], str(self.root)) as (_, held):
+            self.sources(other, raw)
+            first = self.publish(other, replace_lab=self.lab_from())
+            self.assertEqual(first, self.publish(other, replace_lab=self.lab_from()))
+            self.assertEqual(held.read(), self.raw)
+        self.assertTrue((self.root / self.m['archive']['sha256']).is_dir())
+        with d.open_release(other['artifact'], str(self.root)) as (m, f):
+            self.assertEqual(m, other); self.assertEqual(f.read(), raw)
+        self.sources(self.m, self.raw)
+        self.publish(replace_lab=self.lab_from(other))
+        with d.open_release(self.m['artifact'], str(self.root)) as (m, f):
+            self.assertEqual(m, self.m); self.assertEqual(f.read(), self.raw)
+
+    def test_explicit_lab_switch_wrong_old_authority_preserves_pointer(self):
+        self.publish(); pointer = (self.root / 'current.json').read_bytes()
+        other, raw = fixture(setup=b'new LAB bytes', publisher='B' * 40)
+        self.sources(other, raw)
+        for old in ({'publisher': 'C' * 40, 'archive_sha256': self.m['archive']['sha256']},
+                    {'publisher': self.m['publisher'], 'archive_sha256': 'f' * 64}):
+            with self.subTest(old=old), self.assertRaises(d.DistributionError):
+                self.publish(other, replace_lab=old)
+            self.assertEqual((self.root / 'current.json').read_bytes(), pointer)
+
+    def test_explicit_lab_switch_closed_authority_requires_root_and_current(self):
+        other, raw = fixture(setup=b'new LAB bytes', publisher='B' * 40)
+        self.sources(other, raw)
+        for old in ({}, [], {'publisher': 'a' * 40, 'archive_sha256': 'f' * 64},
+                    {'publisher': 'A' * 40, 'archive_sha256': 'bad'},
+                    dict(self.lab_from(), extra=True),
+                    {'publisher': other['publisher'], 'archive_sha256': self.m['archive']['sha256']}):
+            with self.subTest(old=old), self.assertRaises(d.DistributionError):
+                self.publish(other, replace_lab=old)
+        with patch.object(os, 'geteuid', return_value=65534), self.assertRaises(d.DistributionError):
+            self.publish(other, replace_lab=self.lab_from())
+        self.assertFalse(self.root.exists())
+        with self.assertRaises(d.DistributionError): self.publish(other, replace_lab=self.lab_from())
+        self.assertFalse((self.root / 'current.json').exists())
+
+    def test_explicit_lab_switch_never_crosses_production_scope(self):
+        self.publish(); pointer = (self.root / 'current.json').read_bytes()
+        other, raw = fixture(setup=b'new LAB bytes', publisher='B' * 40)
+        production = json.loads(d.canonical(other)); production.update(scope='production', timestamped=True)
+        self.sources(production, raw)
+        with self.assertRaises(d.DistributionError): self.publish(production, replace_lab=self.lab_from())
+        self.assertEqual((self.root / 'current.json').read_bytes(), pointer)
+        root2 = self.base / 'production'
+        old = json.loads(d.canonical(self.m)); old.update(scope='production', timestamped=True)
+        self.sources(old, self.raw); self.publish(old, root=str(root2))
+        pointer = (root2 / 'current.json').read_bytes()
+        self.sources(other, raw)
+        with self.assertRaises(d.DistributionError):
+            self.publish(other, root=str(root2), replace_lab=self.lab_from(old))
+        self.assertEqual((root2 / 'current.json').read_bytes(), pointer)
+
+    def test_explicit_lab_switch_corrupt_target_preserves_old_and_inventory(self):
+        self.publish(); pointer = (self.root / 'current.json').read_bytes()
+        other, raw = fixture(setup=b'new LAB bytes', publisher='B' * 40)
+        self.sources(other, raw[:-1])
+        with self.assertRaises(d.DistributionError): self.publish(other, replace_lab=self.lab_from())
+        self.assertEqual((self.root / 'current.json').read_bytes(), pointer)
+        self.assertFalse((self.root / other['archive']['sha256']).exists())
+        with d.open_release(self.m['artifact'], str(self.root)) as (_, f): self.assertEqual(f.read(), self.raw)
+
+    def test_explicit_lab_switch_full_capacity_no_eviction(self):
+        self.publish()
+        second, raw = fixture(setup=b'second same-publisher bytes'); self.sources(second, raw); self.publish(second)
+        pointer = (self.root / 'current.json').read_bytes()
+        other, raw = fixture(setup=b'new LAB bytes', publisher='B' * 40); self.sources(other, raw)
+        with self.assertRaises(d.DistributionError): self.publish(other, replace_lab=self.lab_from(second))
+        self.assertEqual((self.root / 'current.json').read_bytes(), pointer)
+        self.assertTrue((self.root / self.m['archive']['sha256']).is_dir())
+        self.assertTrue((self.root / second['archive']['sha256']).is_dir())
+
+    def test_explicit_lab_switch_concurrent_different_targets_only_one_wins(self):
+        self.publish(); gate = threading.Barrier(2)
+        targets = []
+        for index, publisher in enumerate(('B' * 40, 'C' * 40)):
+            m, raw = fixture(setup=('new LAB ' + publisher).encode(), publisher=publisher)
+            package = self.base / ('target%d.zip' % index); package.write_bytes(raw); package.chmod(0o644)
+            manifest = self.base / ('target%d.json' % index); manifest.write_bytes(d.canonical(m)); manifest.chmod(0o644)
+            targets.append((m, package, manifest))
+        def switch(target):
+            m, package, manifest = target; gate.wait(timeout=10)
+            try:
+                return d.publish(str(package), str(manifest), hashlib.sha256(manifest.read_bytes()).hexdigest(),
+                                 m['publisher'], 'lab', m['artifact'], str(self.root), replace_lab=self.lab_from())
+            except d.DistributionError:
+                return None
+        with concurrent.futures.ThreadPoolExecutor(2) as pool: results = list(pool.map(switch, targets))
+        winners = [r for r in results if r is not None]; self.assertEqual(len(winners), 1)
+        with d.open_release(self.m['artifact'], str(self.root)) as (m, _):
+            self.assertEqual(m['archive']['sha256'], winners[0]['archive_sha256'])
+        self.assertEqual(len([p for p in self.root.iterdir() if d.HEX.fullmatch(p.name)]), 2)
+        self.assertTrue((self.root / self.m['archive']['sha256']).is_dir())
+
+    def test_explicit_lab_switch_pointer_failure_preserves_old_and_retry_recovers(self):
+        self.publish(); pointer = (self.root / 'current.json').read_bytes()
+        other, raw = fixture(setup=b'new LAB bytes', publisher='B' * 40); self.sources(other, raw)
+        with patch.object(d.os, 'replace', side_effect=OSError('fixture interruption')), self.assertRaises(OSError):
+            self.publish(other, replace_lab=self.lab_from())
+        self.assertEqual((self.root / 'current.json').read_bytes(), pointer)
+        with d.open_release(self.m['artifact'], str(self.root)) as (_, f): self.assertEqual(f.read(), self.raw)
+        stage = next(p.name for p in self.root.iterdir() if p.name.startswith('.stage-'))
+        d.retire(stage[7:], str(self.root), stage=True)
+        self.publish(other, replace_lab=self.lab_from())
+        self.assertTrue((self.root / self.m['archive']['sha256']).is_dir())
+
+    def test_root_cli_lab_switch_uses_explicit_old_authority_and_common_admission(self):
+        self.publish()
+        other, raw = fixture(setup=b'new LAB bytes', publisher='B' * 40); self.sources(other, raw)
+        spec = importlib.util.spec_from_file_location('fixture_publisher_cli', ROOT / 'tools/publish-p6-windows.py')
+        cli = importlib.util.module_from_spec(spec); spec.loader.exec_module(cli)
+        original = d.publish
+        def admitted(*args, **kwargs): return original(*args, root=str(self.root), **kwargs)
+        args = ['publisher', 'replace-lab-publisher', '--package', str(self.package), '--manifest', str(self.manifest),
+                '--manifest-sha256', hashlib.sha256(self.manifest.read_bytes()).hexdigest(), '--publisher', other['publisher'],
+                '--from-publisher', self.m['publisher'], '--from-archive', self.m['archive']['sha256']]
+        with patch.object(sys, 'argv', args), patch.object(cli, 'read_artifact', return_value=(self.m['artifact'], b'')), \
+             patch.object(cli, 'publish', side_effect=admitted):
+            self.assertEqual(cli.main(), 0); self.assertEqual(cli.main(), 0)
+        with d.open_release(self.m['artifact'], str(self.root)) as (m, _): self.assertEqual(m, other)
+
+
+
 class DownloadTests(BundleLinuxTests):
     def setUp(self):
         super().setUp()

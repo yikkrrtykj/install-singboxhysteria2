@@ -205,10 +205,16 @@ def sync_dir(path):
         os.close(fd)
 
 
-def publish(package, manifest_path, expected_digest, publisher, scope, artifact, root=DISTRIBUTION_DIR):
+def publish(package, manifest_path, expected_digest, publisher, scope, artifact, root=DISTRIBUTION_DIR, *, replace_lab=None):
     """Root CLI only. No automatic eviction/replacement of another publisher."""
     if os.geteuid() != 0 or not HEX.fullmatch(expected_digest) or not re.fullmatch(r'[0-9A-F]{40}', publisher):
         raise DistributionError()
+    if replace_lab is not None:
+        if type(replace_lab) is not dict or set(replace_lab) != {'publisher', 'archive_sha256'} \
+                or type(replace_lab['publisher']) is not str or not re.fullmatch(r'[0-9A-F]{40}', replace_lab['publisher']) \
+                or type(replace_lab['archive_sha256']) is not str or not HEX.fullmatch(replace_lab['archive_sha256']) \
+                or replace_lab['publisher'] == publisher or scope != 'lab':
+            raise DistributionError()
     raw = _read(manifest_path, MAX_MANIFEST)
     if hashlib.sha256(raw).hexdigest() != expected_digest:
         raise DistributionError()
@@ -249,7 +255,24 @@ def publish(package, manifest_path, expected_digest, publisher, scope, artifact,
                 raise DistributionError()
             with opened(os.path.join(retained, 'windows-installer.zip')) as (stream, _):
                 verify_archive(stream, old)
-        if 'current.json' in children:
+        if replace_lab is not None:
+            # Explicit root LAB authority only. Never delete/clear the pointer,
+            # automatically authorize a new signer or cross a production scope.
+            old_id = replace_lab['archive_sha256']
+            if 'current.json' not in children or old_id not in versions or old_id == m['archive']['sha256']:
+                raise DistributionError()
+            old = validate_manifest_record(object_json(_read(os.path.join(root, old_id, 'release.json'), MAX_MANIFEST)))
+            if old['publisher'] != replace_lab['publisher'] or old['scope'] != 'lab':
+                raise DistributionError()
+            with open_release(None, root) as (current, _):
+                previous = (replace_lab['publisher'], old_id)
+                target = (publisher, m['archive']['sha256'])
+                selected = (current['publisher'], current['archive']['sha256'])
+                if current['scope'] != 'lab' or selected not in (previous, target):
+                    raise DistributionError()
+                # target permits retry after a durable pointer commit. The old
+                # archive must remain validated and retained for that retry.
+        elif 'current.json' in children:
             with open_release(None, root) as (current, _):
                 if current['publisher'] != publisher or current['scope'] != scope:
                     raise DistributionError()

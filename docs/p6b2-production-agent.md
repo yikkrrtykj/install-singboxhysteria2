@@ -513,6 +513,20 @@ authority, not an untrusted uploaded manifest declaring itself signed. Windows
 retains its native signature/catalog/compiled publisher gates on installation.
 No implicit signer/scope replacement or unsigned fallback exists.
 
+A disposable lab signer may change between acceptance builds. Root can explicitly
+use `replace-lab-publisher` with the new package, independently expected new
+manifest digest/publisher, plus `--from-publisher <old-thumbprint>` and
+`--from-archive <old-archive-sha256>`. This operation only accepts lab-to-lab.
+Under the existing publication flock it validates the exact selected old package
+and retained inventory, admits the new package through the unchanged gates and
+atomically replaces current.json. It retains the old archive and never clears
+the selection, evicts versions, imports trust or restarts services. Retry after
+commit requires the exact new selection and the validated old archive still
+retained. Stale old selection, a third retained version, tamper or any production
+scope fails closed. This is a controlled acceptance tool, not production signer
+rotation or automatic release fetching.
+
+
 The fixed public root `/usr/local/share/sbox-p6-windows` holds immutable version
 directories and an atomic `current.json`, all root:root, directories 0755, files
 0644, single-link/no-follow/same-object checks. Each archive is <=64 MiB; at most
