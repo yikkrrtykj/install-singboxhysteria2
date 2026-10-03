@@ -541,13 +541,15 @@ function Invoke-P6Backend($Action,$SelectedProfile,$SelectedBundle,$Auto,$Creden
     $script:seen+=@{action=$Action;profile=$SelectedProfile;bundle=$SelectedBundle;auto=$Auto;hasCredential=($null -ne $Credential)}
     if($Action -eq 'ui-status') {
         return @{ok=$true;value=@{v=1;installed=$true;pending_recovery=$false;service_state=4;
-          profiles=@(@{id=('a'*64);probe_id='fixture-probe';server_id=('b'*32);enabled=$true;spool=$null;sample=$null});retired=@()}}
+          profiles=@(@{id=('a'*64);probe_id='fixture-probe';server_id=('b'*32);enabled=$true;spool=$null;sample=$null;display=@{client='event-pc';device='laptop-01';location='office';network_path='wifi'}});retired=@()}}
     }
     return @{ok=$true;value=@{}}
 }
 try {
   Refresh-P6Status
-  if($script:p6Profiles.Items.Count -ne 1 -or $script:p6Grid.Columns.Count -ne 3 -or $form.Controls.Count -ne 18){throw 'form shape'}
+  if($script:p6Profiles.Items.Count -ne 1 -or $script:p6Grid.Columns.Count -ne 3 -or $form.Controls.Count -ne 19){throw 'form shape'}
+  if($form.Text -ne '客户端管理' -or @($form.Controls | Where-Object {$_.Text -eq '技术详情'}).Count -ne 1){throw 'primary title or technical details'}
+  if($script:p6Details.Text -notmatch '客户端：event-pc / 设备：laptop-01' -or $script:p6Details.Text -match 'fixture-probe'){throw 'primary device labels'}
   $script:p6Bundle.Text='C:\fixture-only\client.zip'
   Run-P6Action 'import'
   Run-P6Action 'pause'

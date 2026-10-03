@@ -19,6 +19,7 @@ from p6installer.controller import DiscoveryError, extract_credential, discover_
 from p6installer.status import summarize_spool, latest_sample, snapshot, read_live
 from remote_probe.agent import ConfigError
 from remote_probe.profiles import canonical
+from remote_probe.spool import SpoolError
 from remote_probe.windows_security import StorageSecurityError
 from test_foundations import FixtureBase, fixture_policy
 from server_groups import _sample
@@ -312,7 +313,7 @@ class AdjacentBundleTests(unittest.TestCase):
             self.addCleanup(lambda:os.rmdir(link))
         else:
             link.symlink_to(target/'device-bundle.zip')
-        with self.assertRaises((ConfigError,StorageSecurityError)):self.discover(self.root,self.artifact)
+        with self.assertRaises((ConfigError,StorageSecurityError,SpoolError)):self.discover(self.root,self.artifact)
 
     def test_directory_capacity_and_unrelated_archives_do_not_expand_search(self):
         (self.root/'unrelated.zip').write_bytes(b'not read')

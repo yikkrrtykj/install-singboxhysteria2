@@ -247,7 +247,7 @@ class DownloadTests(BundleLinuxTests):
         self.app.windows_distribution=lambda artifact:d.open_release(artifact,str(self.root/'missing'))
         status,_,raw=self.http(path='/api/v1/clients/windows-bundle')
         self.assertEqual(status,503);self.assertEqual(json.loads(raw)['code'],'E_P6_WINDOWS_UNAVAILABLE')
-        self.assertEqual(self.calls,[])
+        self.assertEqual(self.calls,['management.status'])  # read-only fresh gate; zero credential RPC
         self.assertTrue(self.app.bundle_slots.acquire(blocking=False));self.app.bundle_slots.release()
 
     def test_combined_old_signed_release_fails_before_credential_export(self):
@@ -259,7 +259,7 @@ class DownloadTests(BundleLinuxTests):
                   'lab',self.manifest,str(self.distribution))
         status,_,body=self.http(path='/api/v1/clients/windows-bundle')
         self.assertEqual(status,503);self.assertEqual(json.loads(body)['code'],'E_P6_WINDOWS_UNAVAILABLE')
-        self.assertEqual(self.calls,[])
+        self.assertEqual(self.calls,['management.status'])  # read-only fresh gate; zero credential RPC
         self.assertEqual(self.download()[0],200)
 
     def test_combined_closed_schema_auth_origin_and_shared_capacity(self):
