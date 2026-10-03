@@ -321,6 +321,9 @@
           error.retriable = data.retriable === true;
           error.uncertain = data.uncertain === true;
           error.recovery = data.recovery || null;
+          if (error.status === 401 && !CSRF_EXEMPT_PATHS.test(path)) {
+            showLogin("登录已过期，请重新登录。");
+          }
           throw error;
         }
         return data;
@@ -328,83 +331,41 @@
     });
   }
 
-  /* ---------- step-up (re-authentication) ----------
-   *
-   * Privileged mutations answer 401 {"error":"reauth_required"} when this
-   * session has no live step-up window. ONLY that response opens the password
-   * panel: the page never asks for a second password on load. After a
-   * successful POST /api/v1/step-up the ORIGINAL request is replayed
-   * unchanged (same body, same CSRF token).
-   */
+  /* Login is the authorization event. Never replay a mutation after login. */
+  function apiWithStepUp(path, options) { return api(path, options); }
 
-  var stepUpPending = null;
-
-  function promptStepUp() {
-    if (stepUpPending) return stepUpPending;   // one panel at a time
-    stepUpPending = new Promise(function (resolve, reject) {
-      var overlay = $("stepup-overlay");
-      var input = $("stepup-password");
-      var errorEl = $("stepup-error");
-      var form = $("stepup-form");
-      var cancel = $("stepup-cancel");
-
-      function close() {
-        hide(overlay);
-        input.value = "";
-        hide(errorEl);
-        form.removeEventListener("submit", onSubmit);
-        cancel.removeEventListener("click", onCancel);
-        stepUpPending = null;
-      }
-      function fail(message) {
-        errorEl.textContent = message;
-        show(errorEl);
-        input.focus();
-      }
-      function onSubmit(event) {
-        event.preventDefault();
-        var password = input.value;
-        if (!password) { fail("请输入密码。"); return; }
-        api("/api/v1/step-up", { method: "POST", body: { password: password } })
-          .then(function () {
-            close();
-            loadSession().catch(function () { /* status refresh is best effort */ });
-            resolve();
-          })
-          .catch(function (error) {
-            if (error.status === 429) {
-              fail("失败次数过多，请稍后重试。");
-            } else if (error.status === 401) {
-              fail("密码错误。");
-            } else {
-              fail(errorText(error));
-            }
-          });
-      }
-      function onCancel(event) {
-        event.preventDefault();
-        close();
-        reject(new Error("step-up cancelled"));
-      }
-
-      show(overlay);
-      errorEl.className = "form-msg error hidden";
-      errorEl.textContent = "";
-      input.value = "";
-      form.addEventListener("submit", onSubmit);
-      cancel.addEventListener("click", onCancel);
-      input.focus();
-    });
-    return stepUpPending;
+  var watchdogTimer = null;
+  var idleDeadline = 0;
+  var activityInFlight = false;
+  var lastActivitySent = -Infinity;
+  function setIdleDeadline(remaining) {
+    if (typeof remaining !== "number" || !isFinite(remaining) || remaining <= 0) {
+      idleDeadline = 0;
+      return;
+    }
+    idleDeadline = performance.now() + Math.min(remaining, 900) * 1000;
   }
-
-  function apiWithStepUp(path, options) {
-    return api(path, options).catch(function (error) {
-      if (error.status === 401 && error.code === "reauth_required") {
-        return promptStepUp().then(function () { return api(path, options); });
-      }
-      throw error;
-    });
+  function userActivity(event) {
+    if (!event.isTrusted || document.visibilityState !== "visible" ||
+        !state.session || !state.session.authenticated || activityInFlight) return;
+    var now = performance.now();
+    if (!idleDeadline || now >= idleDeadline) {
+      showLogin("闲置时间已超过 15 分钟，请重新登录。");
+      return;
+    }
+    // Bounded traffic only on genuine input, never on a timer or focus event.
+    if (now - lastActivitySent < 30000) return;
+    activityInFlight = true;
+    var sentAt = now;
+    var activityCsrf = state.session.csrf_token;
+    api("/api/v1/session/activity", {method: "POST", body: {}}).then(function (data) {
+      if (!state.session || state.session.csrf_token !== activityCsrf) return;
+      // Subtract response latency instead of extending a server deadline.
+      setIdleDeadline(Math.max(0, data.idle_remaining_seconds -
+        (performance.now() - sentAt) / 1000));
+      lastActivitySent = sentAt;
+    }).catch(function () { /* failures never renew the local deadline */ })
+      .then(function () { activityInFlight = false; });
   }
 
   /* ---------- views ---------- */
@@ -1571,10 +1532,6 @@
         loadE3Status();
         return;
       }
-      if (error.message === "step-up cancelled") {
-        hide($("e3-msg"));
-        return;
-      }
       e3Message("配置下载失败，服务器配置未被修改。", true);
       loadE3Status();
     });
@@ -1689,7 +1646,6 @@
         ? "设备登记已确认，可以下载该设备的客户端包。"
         : "此登记已撤销。", result.data.verified !== "active");
     }).catch(function (error) {
-      if (error.message === "step-up cancelled") return;
       // A failed fetch/JSON read has no HTTP status and may have happened
       // after durable enrollment. Keep the exact intent until an explicit
       // retry or metadata confirmation resolves it; never generate a new key.
@@ -1729,7 +1685,6 @@
         ? "已下载受控测试程序，不能用于正式发布。解压后运行 P6Setup.exe，再选择该设备的配置包。"
         : "Windows 程序已下载。解压后运行 P6Setup.exe，再选择该设备的配置包。", false);
     }).catch(function (error) {
-      if (error.message === "step-up cancelled") return;
       p6Message(error.code === "E_P6_WINDOWS_UNAVAILABLE"
         ? "本服务器尚未准备好经过校验的 Windows 程序，请管理员发布签名程序包后再下载。"
         : "Windows 程序下载失败，请手动重试。", true);
@@ -1757,7 +1712,6 @@
       }
       p6Message("客户端包已下载，请妥善保管其中的设备凭据。", false);
     }).catch(function (error) {
-      if (error.message === "step-up cancelled") return;
       p6Message(error.code === "E_P6_ARTIFACT"
         ? "客户端包读取失败，请让管理员检查通用 Agent 文件的权限、完整性及版本是否一致。"
         : "客户端包下载失败，请刷新设备状态后手动重试。", true);
@@ -1911,7 +1865,7 @@
       body: { current_password: current, new_password: next }
     }).then(function () {
       $("pw-form").reset();
-      pwMessage("密码已修改。", false);
+      showLogin("密码已修改，请使用新密码重新登录。");
     }).catch(function (error) { pwMessage(errorText(error), true); });
   }
 
@@ -1925,7 +1879,12 @@
       el.textContent = "新恢复密钥（仅显示一次，请立即保存）：" +
         data.recovery_key;
       show(el);
-      loadSession();
+      // The new key stays visible once until the next explicit input.
+      state.session = null;
+      idleDeadline = 0;
+      if (state.es) { state.es.close(); state.es = null; }
+      if (watchdogTimer) { clearInterval(watchdogTimer); watchdogTimer = null; }
+      toast("恢复密钥已更新；保存后请重新登录。");
     }).catch(function (error) {
       var el = $("rec-result");
       el.textContent = "失败：" + errorText(error);
@@ -1938,6 +1897,7 @@
   function loadSession() {
     return api("/api/v1/session").then(function (data) {
       state.session = data;
+      setIdleDeadline(data.idle_remaining_seconds);
       $("rec-status").textContent =
         data.recovery_configured ? "已配置 ✓" : "未配置";
       renderWhitelistFromSession();
@@ -1946,6 +1906,12 @@
   }
 
   function showLogin(message) {
+    state.session = null;
+    idleDeadline = 0;
+    lastActivitySent = -Infinity;
+    state.esGeneration++;
+    if (state.es) { state.es.close(); state.es = null; }
+    if (watchdogTimer) { clearInterval(watchdogTimer); watchdogTimer = null; }
     hide($("app"));
     hide($("recovery-view"));
     show($("login-overlay"));
@@ -2030,8 +1996,13 @@
   }
 
   function startWatchdog() {
-    setInterval(function () {
+    if (watchdogTimer) clearInterval(watchdogTimer);
+    watchdogTimer = setInterval(function () {
       if (!state.session || !state.session.authenticated) return;
+      if (!idleDeadline || performance.now() >= idleDeadline) {
+        showLogin("闲置时间已超过 15 分钟，请重新登录。");
+        return;
+      }
       if (state.view === "settings") loadE3Status(true);
       // Fallback poll if the SSE stream is not delivering. Freshness only
       // advances when the snapshot VERSION truly moves: a frozen publisher
@@ -2075,6 +2046,9 @@
   /* ---------- wiring ---------- */
 
   function bind() {
+    ["pointerdown", "keydown", "wheel", "touchstart"].forEach(function (kind) {
+      document.addEventListener(kind, userActivity, {capture: true, passive: true});
+    });
     if ($("p6-enroll-form")) {
       $("p6-enroll-form").addEventListener("submit", function (event) {
         event.preventDefault();

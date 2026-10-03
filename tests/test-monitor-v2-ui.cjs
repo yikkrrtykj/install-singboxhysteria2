@@ -69,10 +69,11 @@ const document = {
 };
 const requests = [], responses = [];
 const createdUrls = [], revokedUrls = [];
-let urlSeq = 0;
-const context = vm.createContext({ document, console, Uint8Array, Date,
+let urlSeq = 0; let monoNow = 0; const intervalCallbacks = new Map(); let intervalId = 0;
+const context = vm.createContext({ document, console, Uint8Array, Date, performance: {now: () => monoNow},
   crypto: require('node:crypto').webcrypto, setTimeout() {}, clearTimeout() {},
-  setInterval() {}, window: { location: {}, confirm: () => true },
+  setInterval(fn) { const id = ++intervalId; intervalCallbacks.set(id, fn); return id; },
+  clearInterval(id) { intervalCallbacks.delete(id); }, window: { location: {}, confirm: () => true },
   URL: { createObjectURL: () => { const u = 'blob:ui-test-' + (++urlSeq);
          createdUrls.push(u); return u; },
          revokeObjectURL: u => revokedUrls.push(u) },
@@ -84,7 +85,7 @@ const context = vm.createContext({ document, console, Uint8Array, Date,
   }
 });
 vm.runInContext(app.replace('document.addEventListener("DOMContentLoaded", boot);',
-  'globalThis.ui = {state, bind, render, loadSession, loadE3Status, loadE3Clients, convergeAfterMutation, renderE3Controls, renderE3Clients, renderMonitorInfo, addClient, deleteClient, downloadConfig, setPendingRetry, retryPending, apiWithStepUp, setView, loadIncidents, renderIncidents, openIncident, renderIncidentDetail, closeIncidentDetail, loadEvidence, loadMarkers, renderMarkers, addMarker, rearmIncidents, renderIncRuntime, p6View, openP6Devices, loadP6Devices, p6Operate, downloadP6Bundle, downloadP6Windows, renderP6Devices, incidentCopy};'), context);
+  'globalThis.ui = {state, bind, render, loadSession, loadE3Status, loadE3Clients, convergeAfterMutation, renderE3Controls, renderE3Clients, renderMonitorInfo, addClient, deleteClient, downloadConfig, setPendingRetry, retryPending, apiWithStepUp, setView, loadIncidents, renderIncidents, openIncident, renderIncidentDetail, closeIncidentDetail, loadEvidence, loadMarkers, renderMarkers, addMarker, rearmIncidents, renderIncRuntime, p6View, openP6Devices, loadP6Devices, p6Operate, downloadP6Bundle, downloadP6Windows, renderP6Devices, incidentCopy, userActivity, setIdleDeadline, startWatchdog};'), context);
 const ui = context.ui;
 // 0.1.4: the convergence chain (mutation -> one endpoint -> apply) crosses
 // several cross-realm promise reactions; 12 ticks starved it. Drain
@@ -207,22 +208,26 @@ async function main() {
   check('Add client dispatches without password step-up', () => {
     assert.equal(requests.filter(r => r.url === '/api/v1/clients/add').length, addReqBefore + 1);
     assert.equal(requests.filter(r => r.url === '/api/v1/step-up').length, stepReqBefore);
-    assert.ok(ids['stepup-overlay'].className.includes('hidden'));
+    assert.equal(ids['stepup-overlay'], undefined);
   });
 
-  // 删除/export still use the generic step-up replay path.
-  responses.push(response({error: 'reauth_required'}, 401));
+  // An expired session returns to login; a mutation is never replayed.
+  const savedSession = {...ui.state.session};
+  responses.push(response({error: 'login required'}, 401));
   const options = {method: 'POST', body: {name: 'alice', confirm: 'alice'}, idempotencyKey: 'same-key'};
-  const stepped = ui.apiWithStepUp('/api/v1/clients/delete', options); await flush();
-  check('step-up password panel appears only on demand with product copy', () => { assert.ok(!ids['stepup-overlay'].className.includes('hidden')); assert.match(ids['stepup-form'].textContent, /确认管理员密码/); });
-  responses.push(response({}), response(ui.state.session), response({}));
-  ids['stepup-password'].value = 'test-password'; ids['stepup-form'].events.submit({preventDefault() {}});
-  await stepped; await flush();
-  check('step-up replay retains original body and headers', () => {
-    const pair = requests.filter(r => r.url === '/api/v1/clients/delete').slice(-2);
-    assert.equal(pair[0].body, pair[1].body); assert.deepEqual(pair[0].headers, pair[1].headers);
-    assert.ok(ids['stepup-overlay'].className.includes('hidden'));
+  const expiredRequestMark = requests.length;
+  await assert.rejects(ui.apiWithStepUp('/api/v1/clients/delete', options)); await flush();
+  check('expired authorization returns to login without a second password panel', () => {
+    assert.ok(!ids['login-overlay'].className.includes('hidden'));
+    assert.equal(ids['stepup-overlay'], undefined); assert.equal(ui.state.session, null);
   });
+  check('expired mutation is sent exactly once and never automatically replayed', () => {
+    assert.equal(requests.length, expiredRequestMark + 1);
+    assert.equal(requests.at(-1).body, JSON.stringify(options.body));
+    assert.equal(requests.at(-1).headers['Idempotency-Key'], 'same-key');
+    assert.equal(requests.at(-1).headers['X-CSRF-Token'], 'csrf');
+  });
+  ui.state.session = savedSession;
   setStatus(healthy());
   responses.push(response({}), conv());
   ui.addClient('bob'); await flush();
@@ -529,36 +534,27 @@ async function main() {
     assert.doesNotMatch(ids['e3-clients-body'].textContent, /bob/);
     assert.match(ids['e3-clients-body'].textContent, /alice/);
   });
-  responses.push(response({error: 'reauth_required'}, 401));
-  ids['e3-clients-body'].children[1].children[2].children[1].events.click();  // alice row
+  let completeAuthorizedDelete;
+  responses.push(() => new Promise(resolve => { completeAuthorizedDelete = resolve; }));
+  ids['e3-clients-body'].children[1].children[2].children[1].events.click();
   const markStep = requests.length;
-  ids['e3-del-btn'].click();
-  await flush();
-  check('a delete awaiting step-up is in flight: Deleting…, and Cancel cannot undo a dispatched transaction', () => {
-    assert.ok(!ids['stepup-overlay'].className.includes('hidden'));
+  ids['e3-del-btn'].click(); await flush();
+  check('authorized delete remains single-flight while its HTTP result is pending', () => {
+    assert.equal(ids['stepup-overlay'], undefined);
     assert.equal(requests.length, markStep + 1);
-    assert.equal(ui.state.e3Mutation.name, 'alice');
-    assert.equal(ui.state.e3Mutation.inFlight, true);
+    assert.equal(ui.state.e3Mutation.name, 'alice'); assert.equal(ui.state.e3Mutation.inFlight, true);
     assert.equal(ids['e3-del-btn'].textContent, "正在删除…");
-    assert.equal(ids['e3-del-cancel'].disabled, true);
-    assert.equal(ids['e3-add-btn'].disabled, true);
+    assert.equal(ids['e3-del-cancel'].disabled, true); assert.equal(ids['e3-add-btn'].disabled, true);
   });
-  responses.push(response({}), response(ui.state.session), response({}),
-                 response(ui.state.session), conv(healthy(), onlyLegacy));
-  ids['stepup-password'].value = 'test-password';
-  ids['stepup-form'].events.submit({preventDefault() {}});
-  await flush();
-  check('the step-up replay completes the delete; the lock survives to convergence and settles free', () => {
+  responses.push(response(ui.state.session), conv(healthy(), onlyLegacy));
+  completeAuthorizedDelete(response({})); await flush();
+  check('login-authorized delete completes once and holds its lock through convergence', () => {
     assert.deepEqual(requests.slice(markStep).map(r => r.url),
-      ['/api/v1/clients/delete', '/api/v1/step-up', '/api/v1/session',
-       '/api/v1/clients/delete', '/api/v1/session',
-       '/api/v1/clients/convergence']);
-    assert.ok(!ui.state.e3Mutation);
-    assert.equal(ids['e3-del-cancel'].disabled, false);
+      ['/api/v1/clients/delete', '/api/v1/session', '/api/v1/clients/convergence']);
+    assert.ok(!ui.state.e3Mutation); assert.equal(ids['e3-del-cancel'].disabled, false);
     assert.equal(ids['e3-del-btn'].textContent, "永久删除");
     assert.equal(ids['e3-msg'].textContent, "客户端已删除。");
-    assert.doesNotMatch(ids['e3-clients-body'].textContent, /alice|bob/);
-    productText();
+    assert.doesNotMatch(ids['e3-clients-body'].textContent, /alice|bob/); productText();
   });
   const markUnc = requests.length;
   responses.push(response({code: 'result_unknown', uncertain: true}, 504),
@@ -598,22 +594,17 @@ async function main() {
     assert.doesNotMatch(dom.textContent, /ui-never-render-7777/);
     productText();
   });
-  responses.push(response({error: 'reauth_required'}, 401));
+  const exportRequestMark = requests.length;
+  responses.push(response({error: 'login required'}, 401));
   ui.downloadConfig('alice'); await flush();
-  responses.push(response({}), response(ui.state.session),
-                 fileResponse('proxies:\n  - uuid: ui-second-8888\n'));
-  ids['stepup-password'].value = 'test-password';
-  ids['stepup-form'].events.submit({preventDefault() {}});
-  await flush();
-  check('export step-up replay resends the identical keyless request', () => {
-    const pair = requests.filter(r => r.url === '/api/v1/clients/export').slice(-2);
-    assert.equal(pair[0].body, pair[1].body);
-    assert.deepEqual(pair[0].headers, pair[1].headers);
-    assert.ok(!('Idempotency-Key' in pair[1].headers));
-    assert.equal(ids['e3-msg'].textContent, "YAML 配置已下载。");
-    assert.doesNotMatch(dom.textContent, /ui-second-8888/);
-    productText();
+  check('expired export is keyless, is not replayed, and returns to the login view', () => {
+    const attempts = requests.slice(exportRequestMark).filter(r => r.url === '/api/v1/clients/export');
+    assert.equal(attempts.length, 1); assert.equal(attempts[0].body, JSON.stringify({name: 'alice'}));
+    assert.ok(!('Idempotency-Key' in attempts[0].headers));
+    assert.equal(ui.state.session, null); assert.equal(ids['stepup-overlay'], undefined);
+    assert.ok(!ids['login-overlay'].className.includes('hidden')); productText();
   });
+  ui.state.session = savedSession;
   setStatus(healthy());
   responses.push(response({code: 'result_unknown', uncertain: true}, 504),
                  response(healthy()));
@@ -1038,6 +1029,30 @@ async function main() {
     const n = requests.length; ui.renderP6Devices(); ui.downloadP6Windows();
     assert.equal(requests.length, n); assert.equal(ids['p6-windows-download'].disabled, true);
   });
-  assert.equal(count, 114, 'UI assertion count guard');
+  ui.state.session = {authenticated: true, csrf_token: 'csrf'};
+  document.visibilityState = 'visible'; monoNow = 100; ui.setIdleDeadline(900);
+  let activityMark = requests.length;
+  ui.userActivity({isTrusted: false}); await flush();
+  check('programmatic input never renews idle expiry', () => assert.equal(requests.length, activityMark));
+  document.visibilityState = 'hidden'; ui.userActivity({isTrusted: true}); await flush();
+  check('hidden-page input never renews idle expiry', () => assert.equal(requests.length, activityMark));
+  document.visibilityState = 'visible'; responses.push(response({idle_remaining_seconds: 900}));
+  ui.userActivity({isTrusted: true}); await flush();
+  check('genuine visible input sends a closed CSRF-protected activity notification', () => {
+    assert.equal(requests.length, activityMark + 1); assert.equal(requests.at(-1).url, '/api/v1/session/activity');
+    assert.equal(requests.at(-1).body, '{}'); assert.equal(requests.at(-1).headers['X-CSRF-Token'], 'csrf');
+  });
+  activityMark = requests.length; monoNow += 20000; ui.userActivity({isTrusted: true}); await flush();
+  check('input activity notifications are throttled', () => assert.equal(requests.length, activityMark));
+  ui.state.view = 'overview'; ui.state.lastSnapshotAt = Date.now(); ui.startWatchdog();
+  const watchdog = [...intervalCallbacks.values()].at(-1); monoNow += 10000; watchdog(); await flush();
+  check('background watchdog never generates activity renewal', () => assert.equal(requests.length, activityMark));
+  monoNow += 900000; watchdog(); await flush();
+  check('inactivity closes the dashboard and stops its watchdog without retrying a mutation', () => {
+    assert.equal(ui.state.session, null); assert.ok(!ids['login-overlay'].className.includes('hidden'));
+    assert.match(ids['login-error'].textContent, /15 分钟/); assert.equal(intervalCallbacks.size, 0);
+    assert.equal(requests.length, activityMark);
+  });
+  assert.equal(count, 120, 'UI assertion count guard');
 }
 main().catch(err => { console.error(err); process.exitCode = 1; });

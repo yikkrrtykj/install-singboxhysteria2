@@ -589,9 +589,9 @@ def group_auth():
     out["other_session_invalidated"] = req(
         port_p, "127.0.0.5", "GET", "/api/v1/snapshot",
         {"Cookie": cookie_b2})["status"] == 401
-    out["own_session_kept"] = req(
+    out["own_session_revoked"] = req(
         port_p, "127.0.0.5", "GET", "/api/v1/snapshot",
-        {"Cookie": cookie_a})["status"] == 200
+        {"Cookie": cookie_a})["status"] == 401
     out["new_password_accepted"] = login(
         port_p, "127.0.0.5", NEW_PASSWORD)["status"] == 200
     out["old_password_rejected"] = login(
@@ -1501,7 +1501,7 @@ check 'd["pw_change_wrong_current_403"]' "password change re-verifies current pa
 check 'd["pw_change_too_short_400"]' "password change enforces minimum length"
 check 'd["pw_change_ok_200"]' "password change succeeds"
 check 'd["other_session_invalidated"]' "password change invalidates other sessions"
-check 'd["own_session_kept"]' "password change keeps the caller logged in"
+check 'd["own_session_revoked"]' "password change revokes the caller session"
 check 'd["new_password_accepted"]' "new password authenticates"
 check 'd["old_password_rejected"]' "old password rejected afterwards"
 
@@ -1777,6 +1777,11 @@ printf '\n== summary ==\n'
 printf '  pass=%d fail=%d (expected pass=%d)\n' "$PASS" "$FAIL" "$EXPECTED_PASS"
 if [ "$FAIL" -ne 0 ] || [ "$PASS" -ne "$EXPECTED_PASS" ]; then
     printf '  RESULT: FAILED (failures, or a section did not run)\n'
+    exit 1
+fi
+section "Single-login authorization and idle expiry (real HTTP)"
+if ! "$PY" "$HERE/test_monitor_session.py"; then
+    printf '  RESULT: FAILED (single-login session regression)\n'
     exit 1
 fi
 printf '  RESULT: ALL GREEN\n'

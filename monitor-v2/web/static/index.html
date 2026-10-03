@@ -228,7 +228,7 @@
 
       <div class="card">
         <h2>客户端管理 <span class="badge idle" id="e3-availability">不可用</span></h2>
-        <p class="muted">管理 Reality 和 Hysteria2 客户端。修改前可能需要确认管理员密码，此页面不会显示客户端凭据。</p>
+        <p class="muted">管理 Reality 和 Hysteria2 客户端。登录后即可操作，闲置 15 分钟自动退出。删除或撤销仍需确认目标，此页面不会显示客户端凭据。</p>
         <p id="e3-unavailable" class="form-msg error" role="status">暂时无法修改客户端，请先检查服务器状态。</p>
         <button id="e3-refresh" class="btn ghost" type="button">刷新客户端</button>
         <div class="table-card">
@@ -303,28 +303,13 @@
       <span>sing-box Monitor</span>
     </div>
     <label>管理员密码<input id="login-password" type="password" autocomplete="current-password" autofocus></label>
+    <p class="muted">登录一次即可操作；闲置 15 分钟自动退出。</p>
     <button class="btn full" type="submit">登录</button>
     <p id="login-error" class="form-msg error hidden" role="alert"></p>
   </form>
 </div>
 
 <!-- Recovery (path /recovery) -->
-<!-- Step-up: only ever shown in response to a 401 reauth_required. The page
-     never asks for a second password on load. -->
-<div id="stepup-overlay" class="overlay hidden">
-  <form id="stepup-form" class="panel">
-    <div class="brand center">
-      <svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true"><path fill="currentColor" d="M12 2 4 5.5v5.2c0 5 3.4 9.6 8 10.8 4.6-1.2 8-5.8 8-10.8V5.5L12 2z"/><path fill="currentColor" d="M11 7h2v5.2l3.3 1.9-1 1.7L11 13.4V7z"/></svg>
-      <span>确认管理员密码</span>
-    </div>
-    <p class="muted">请输入管理员密码以继续此操作。</p>
-    <label>管理员密码<input id="stepup-password" type="password" autocomplete="current-password"></label>
-    <button class="btn full" type="submit">确认授权</button>
-    <button id="stepup-cancel" class="btn ghost full" type="button">取消</button>
-    <p id="stepup-error" class="form-msg error hidden" role="alert"></p>
-  </form>
-</div>
-
 <div id="recovery-view" class="overlay hidden">
   <form id="recovery-form" class="panel">
     <div class="brand center">

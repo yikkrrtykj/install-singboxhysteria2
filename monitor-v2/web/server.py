@@ -891,6 +891,9 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/v1/clients/export":
             self._method_not_allowed(allowed="POST")
             return
+        if path == "/api/v1/session/activity":
+            self._method_not_allowed(allowed="POST")
+            return
         if path in P6_ROUTES:
             self._method_not_allowed(allowed="POST")
             return
@@ -952,6 +955,9 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/v1/recovery/rotate":
             self._require_session(self._handle_recovery_rotate, csrf=True)
+            return
+        if path == "/api/v1/session/activity":
+            self._require_session(self._handle_session_activity, csrf=True)
             return
         if path == "/api/v1/step-up":
             self._require_session(self._handle_step_up, csrf=True)
@@ -1180,14 +1186,16 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         handler(session, *args, actor)
 
     def _require_step_up(self, handler, *args):
-        """Gate for privileged mutations (M0.5 / rev5 §5).
+        """Session administrative authorization (Issue #67, 2026-10-03).
 
-        Chain, in order: session -> session-bound CSRF token -> live step-up.
-        A missing/expired step-up is a 401 ``reauth_required``, which is the
-        ONLY signal the web UI acts on (it pops the password box and replays
-        the identical request). The step-up credential itself never leaves
-        this process: the backend would only ever receive an actor
-        fingerprint, never the password.
+        Chain: live session -> session-bound CSRF -> password-login authorization.
+        Password login grants this authorization atomically with the session.
+        Background reads do not renew the 900s idle deadline. The legacy
+        step-up fields retain the existing frozen helper audit actor format.
+        Missing authorization is refused; the new UI returns to login and
+        never prompts for an operation password or automatically replays it.
+        Only anonymous event fingerprints cross the helper boundary.
+
 
         REVOCATION CONCURRENCY SEMANTICS (contract, aligned with M1's
         "a transaction is uncancellable once its durable intent is written"):
@@ -1195,7 +1203,7 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         * the check above is evaluated PER REQUEST, at the moment the request
           reaches the gate. Logout / password change / recovery reset-rotate
           therefore strip the step-up from every request that has NOT yet
-          passed the gate -- immediately, not after the 300s window;
+          passed the gate -- immediately, without waiting for a deadline;
         * a request that has ALREADY passed the gate is not reconsidered. Its
           step-up was valid when authorization happened, and it must not be
           aborted mid-flight by a revocation that lands afterwards;
@@ -1622,9 +1630,8 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             # plane DISARMED is the normal, safe production default.
             "monitor_running": self.app.monitor_running(),
             "management_active": self.app.management_active(),
-            # The step-up state of THIS session, so the page can show whether
-            # a re-authentication is still live. It is an opaque boolean --
-            # no password, no token, no expiry value is disclosed.
+            # Existing boolean/actor vocabulary is retained; its current
+            # grant originates at password login. No credential is disclosed.
             "step_up_active": session is not None
             and self.app.step_up_active(self._session_token()),
         }
@@ -1632,6 +1639,7 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             # The CSRF half of the session: safe to expose to the page's own
             # scripting context, unlike the HttpOnly session cookie.
             payload["csrf_token"] = session.get("csrf_token")
+            payload["idle_remaining_seconds"] = self.app.auth.sessions.remaining(self._session_token())
         self._send_json(200, payload)
 
     def _handle_login(self, remote):
@@ -1657,12 +1665,12 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
                  "retry_after": retry_after},
                 extra_headers=[("Retry-After", str(retry_after))])
             return
-        if not auth.verify_password(password):
+        token = auth.login(password)
+        if token is None:
             auth.login_limiter.record_failure(remote)
             self._send_json(401, {"error": "invalid password"})
             return
         auth.login_limiter.record_success(remote)
-        token = auth.sessions.create()
         self._send_json(200, {"status": "ok"},
                         extra_headers=[("Set-Cookie",
                                         self._session_cookie(
@@ -1683,6 +1691,18 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
                 getattr(self.server, "scheme", "http") == "https":
             parts.append("Secure")
         return "; ".join(parts)
+
+    def _handle_session_activity(self, session):
+        # Origin/peer/session/CSRF checks precede this closed, bounded body.
+        # Reads/SSE never call activity; expiry is rechecked under the mutex.
+        if self._json_body() != {}:
+            self._send_json(400, {"error": "invalid activity body"})
+            return
+        remaining = self.app.auth.sessions.activity(self._session_token())
+        if remaining is None:
+            self._send_json(401, {"error": "login required"})
+            return
+        self._send_json(200, {"status": "ok", "idle_remaining_seconds": remaining})
 
     def _handle_step_up(self, session):
         """POST /api/v1/step-up {password} -> open a 300s mutation window.
@@ -2506,7 +2526,7 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             return
         auth.login_limiter.record_success(remote)
         try:
-            auth.set_password(new, keep_session=self._session_token())
+            auth.set_password(new)
         except ValueError as exc:
             self._send_json(400, {"error": str(exc)})
             return

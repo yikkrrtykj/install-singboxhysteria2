@@ -1,5 +1,7 @@
 # P6B2 — production Agent / provisioning
 
+> 当前登录策略：2026-10-03 用户确认的[单次登录与闲置退出](monitor-single-login.md)取代本文中的独立 300 秒密码确认；旧实现与 review 记录仅描述对应历史 head。客户端操作与下载仍保留会话、CSRF、来源、审计及实时管理状态门禁。
+
 Authoritative contract: [Issue #67 §22](https://github.com/yikkrrtykj/install-singboxhysteria2/issues/67).
 Recorded and implementation authorized 2026-10-02. This document explains the
 reviewable implementation slices; it does not replace the issue body.
