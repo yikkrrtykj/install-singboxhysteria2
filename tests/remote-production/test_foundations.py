@@ -548,7 +548,7 @@ if __name__ == "__main__":
         raise SystemExit(1)
     # Keep the existing cross-platform CI entry and its original count; run
     # the separate bundle acceptance suite as a second explicit process.
-    for suite in ('test_field_repairs.py', 'test_bundle.py', 'test_windows_installer.py', 'test_windows_gui.py', 'test_distribution.py'):
+    for suite in ('test_field_repairs.py', 'test_iplark_egress.py', 'test_bundle.py', 'test_windows_installer.py', 'test_windows_gui.py', 'test_distribution.py'):
         code = subprocess.call([sys.executable, str(ROOT / 'tests/remote-production' / suite)])
         if code:
             raise SystemExit(code)

@@ -43,7 +43,7 @@ def make_parts(worker, args, artifact_dir=artifact.ARTIFACT_DIR):
         # protocol guesses from Client names, labels or arbitrary YAML.
         'reality_node': 'Reality', 'hy2_node': 'Hysteria2', 'watched_group': '自动选择',
         'dns_host': 'dns.google', 'https_host': 'www.gstatic.com',
-        'egress_host': 'api.ipify.org', 'vps_host': host, 'vps_port': args['vps_port'],
+        'egress_host': 'iplark.com', 'vps_host': host, 'vps_port': args['vps_port'],
         'cadence': 60, 'cycle_deadline': 20, 'diagnostic_timeout': 5})
     result = {'format': 'p6-client-bundle-parts/1', 'yaml': args['yaml'],
               'profile': profile, 'secret': material['secret'],

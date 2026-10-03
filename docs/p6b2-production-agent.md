@@ -622,3 +622,41 @@ shared-reader success, locked-reader refusal/recovery, transient-lock success,
 old/new cursor readability, retained DACL, and permission/fsync refusal tests.
 Microsoft API reference:
 https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-replacefilew
+
+
+### User-directed IPLark and current public-IP display amendment (2026-10-04)
+
+Issue #67's user-directed amendment supersedes the earlier no-IP display and
+no-provider-replacement field boundaries for this narrow production repair.
+Production observes the actual request egress using exactly
+https://iplark.com/ipapi/public/ip. A current-PC normal-TLS foreground request
+returned HTTP 200 text/plain containing a valid global IP; the response/IP was
+not logged. This does not prove LocalSystem/TUN acceptance of the future build.
+The homepage and richer IP database route returned 403 and are not scraped.
+
+New exports use egress_host=iplark.com. Production also maps the legacy
+api.ipify.org profile token to this compiled endpoint, preserving installed
+immutable profile/identity/key bytes and all already queued bodies. Base/DARK
+collection and other reviewed hosts retain their original behavior. The shared
+egress primitive has an opt-in strict mode requiring the complete bounded answer
+to be one canonical global IP. Reject oversized replies, JSON/HTML/multiple tokens,
+private/reserved/multicast addresses, non-200/redirects and TLS/timeout failures.
+Retain normal TLS, no redirect/proxy fallback, five-second slot, 4096-byte reply,
+20-second cycle and 60-second default cadence. No arbitrary provider/UI URL input.
+
+Use a distinct fixed egress.iplark.baseline.json (and bounded .tmp) per profile;
+do not delete or compare the untagged legacy provider baseline. First IPLark
+observation is change=unknown. Only a durably committed IPLark observation becomes
+its next/restarted baseline. The existing protected profile removal/purge handles
+this finite additional state under the same lock and object-authority checks.
+
+Read-only Windows snapshot exposes only the validated current sample's egress_ip
+on success, not a raw response/geo/risk record. GUI shows the IP with its sample
+time. Failure displays not obtained and the existing closed error, never a stale
+baseline as a current result. No secret/YAML/credential exposure or P6C UI work.
+Real TLS/strict response/deadline, legacy compatibility and provider-baseline
+restart/commit tests run on the existing Linux/Windows foundation entry. Local
+status tests verify success display, failure clearing and no snapshot mutation.
+New signed distribution/native service acceptance remains required before claiming
+the installed service uses IPLark. PR remains Draft; whole COMPLETE, independent
+final PASS, MERGE, production deploy, P6C/P6D remain NO.

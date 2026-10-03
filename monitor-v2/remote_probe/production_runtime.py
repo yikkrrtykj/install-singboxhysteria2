@@ -23,10 +23,26 @@ from .windows_security import StorageSecurityError
 
 DELIVERY_RECORD_LIMIT = 8
 DELIVERY_SECONDS = 10.0
+IPLARK_PROFILE_HOSTS = ("api.ipify.org", "iplark.com")
+IPLARK_HOST = "iplark.com"
+IPLARK_PATH = "/ipapi/public/ip"
 
 
 class ProductionAgent(RemoteProbeAgent):
     """Production scheduling/target policy; payload and evidence rules reused."""
+    def _baseline_path(self):
+        if self.config.egress_host in IPLARK_PROFILE_HOSTS:
+            # Keep untagged legacy/provider baselines untouched. The first
+            # IPLark observation must not imply a network change on migration.
+            return os.path.join(self.config.spool_dir, "egress.iplark.baseline.json")
+        return super()._baseline_path()
+
+    def _probe_egress(self):
+        if self.config.egress_host in IPLARK_PROFILE_HOSTS:
+            return dp.probe_egress(IPLARK_HOST, path=IPLARK_PATH,
+                                   previous=self._baseline, strict_ip=True)
+        return super()._probe_egress()
+
     def _probe_https(self):
         if self.config.https_host == "www.gstatic.com":
             return dp.probe_https("www.gstatic.com", path="/generate_204", expected_status=204)

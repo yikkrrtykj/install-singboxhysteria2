@@ -151,6 +151,7 @@ class BundleLinuxTests(unittest.TestCase):
             self.assertEqual(profile['agent']['reality_node'], 'Reality')
             self.assertEqual(profile['agent']['hy2_node'], 'Hysteria2')
             self.assertEqual(profile['agent']['vps_port'], 443)
+            self.assertEqual(profile['agent']['egress_host'], 'iplark.com')
             self.assertEqual(archive.read('agent/p6-agent.pyz'), self.generic)
         self.assertEqual(self.plane.store.status()['sample_count'], 0)
         self.assertEqual(self.plane.store.status()['receipt_count'], 0)

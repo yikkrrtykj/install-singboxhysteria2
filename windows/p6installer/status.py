@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 
 from remote_probe.agent import ConfigError
+from remote_probe.direct_probe import canonical_global_ip
 from remote_probe.payload import validate_sample
 from remote_probe.production_storage import closed_diagnostics, DIAGNOSTIC_KEY
 from remote_probe.windows_security import StorageSecurityError
@@ -93,6 +94,8 @@ def latest_sample(raw, probe):
                 continue
             result = {k: sample[k] for k in ('sample_epoch', 'seq', 'dns', 'https', 'vps_tcp', 'mihomo_api', 'active')}
             result['egress_status'] = sample['egress']['status']
+            result['egress_ip'] = (canonical_global_ip(sample['egress']['ip'])
+                                   if sample['egress']['status'] == 'ok' else None)
             result['egress_error_code'] = sample['egress']['error_code']
             result['egress_latency_ms'] = sample['egress']['latency_ms']
             return result

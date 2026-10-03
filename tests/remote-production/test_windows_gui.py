@@ -122,7 +122,7 @@ class SnapshotTests(FixtureBase):
         self.assertNotIn('LOCAL-CANARY', json.dumps(value))
         self.assertEqual(value['service_state'], 4)
 
-    def test_closed_egress_detail_and_configured_cadence_without_ip(self):
+    def test_closed_egress_detail_and_configured_cadence_failed_ip_is_none(self):
         record = self.record(3)
         sample = json.loads(base64.b64decode(record['body_b64']))
         sample['egress'] = {'status': 'failed', 'latency_ms': None,
@@ -131,6 +131,7 @@ class SnapshotTests(FixtureBase):
         value = latest_sample(canonical(record) + b'\n', 'device-one')
         self.assertEqual(value['egress_error_code'], 'connect_failed')
         self.assertIsNone(value['egress_latency_ms'])
+        self.assertIsNone(value['egress_ip'])
         self.assertNotIn('ip', value)
         self.assertNotIn('egress', value)
         self.assertEqual(snapshot(self.manager, self.reader)['profiles'][0]['cadence_seconds'], 60)

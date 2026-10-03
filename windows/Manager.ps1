@@ -128,6 +128,8 @@ function Update-P6Selection {
                 }
                 $egressDetail=if ($sample.PSObject.Properties['egress_error_code']) {P6Token $sample.egress_error_code} else {''}
                 Add-P6Row '公网出口' (P6Token $sample.egress_status) $egressDetail
+                $egressIp=if ($sample.PSObject.Properties['egress_ip'] -and $sample.egress_ip) {[string]$sample.egress_ip} else {'未获取'}
+                Add-P6Row '公网 IP' $egressIp ('对应本次采样：'+$time)
                 Add-P6Row 'Clash API' (P6Token $sample.mihomo_api.status) ''
                 foreach ($value in @($sample.active)) {
                     $delay = if ($null -ne $value.delay_ms) {[string]$value.delay_ms + ' ms'} else {'—'}
