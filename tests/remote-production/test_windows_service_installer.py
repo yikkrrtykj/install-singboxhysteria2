@@ -677,6 +677,6 @@ try {
 
 if __name__ == '__main__':
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(NativeInstallerTests)
-    assert suite.countTestCases() == 19
+    assert suite.countTestCases() == 22
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     raise SystemExit(0 if result.wasSuccessful() else 1)
