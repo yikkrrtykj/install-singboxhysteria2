@@ -24,7 +24,7 @@ change the field Agent payload; they are not new field runtime builds.
 | Process restart | Earlier ack93/newseq1 supports a new process run; full OS reboot remains distinct |
 | Signing tools CI | e2c6faa:15/15 jobs; foundations37194441609, shell-tests37194441612, packaging37194441649; native Windows internal-publisher suite9/9 including real machine trust/sign reuse/removal. Synthetic-merge checkout, not raw head checkout |
 | Short observer field validation | 182.48s,62 valid points,0 failures/retries, stable exact service/PID/release, sampled private maximum9.02MiB, local ack929→932; observer gap only |
-| Fixed company identity | Real nonexportable code-signing key created locally; public cert exported, two-year validity. Actual trust and timestamped signing verified; protected export/rollout pending |
+| Fixed company identity | Real nonexportable code-signing key created locally; public cert exported, two-year validity. Actual trust, timestamped signing and protected export verified; test-server publication complete; controlled device install/update pending |
 
 ## Finished repaired native resource capture
 
@@ -63,8 +63,14 @@ now signed and timestamped. Native exact-publisher/signature/timestamp/catalog
 validation passed. Source01586cc has15/15 CI jobs success:37196950313,
 37196950312,37196950334; synthetic merge81061673d53b63a5f5170578e93671ba5cc6a81e
 has parents base + that head. Field Agent bytes match the already tested repair.
-Protected release export, controlled-device installation/update and server
-publication remain separate pending actions; no deployment is claimed.
+Protected release export completed; operator SSH output now confirms software-only
+publication on TEST VPS64.83.37.46: publisher92E0176599764946F7E5AB332A5CEF150355BE9B,
+releasee5277d4778630089488a808de83c5da58e384497be2c439117baa062dfb1e008,
+archive6b2c30252cbced851a276cbf3a22430f67815aa24a9c166d3b67de49d533520f.
+Installed Monitor account validates the normal P6RemoteProbe download; five
+identity/config digests unchanged. No service/client reinstall, trust/firewall or
+ingress change. Head792d85a CI15/15; root distribution suites37/37 on three Ubuntu
+versions. Controlled device install/update still pending; production VPS not deployed.
 
 ## Open conditions — three batches, no new feature stages
 

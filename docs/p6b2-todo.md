@@ -77,11 +77,19 @@ Missing second environments remain explicit gaps, never fabricated PASS.
 - [x] Actual protected production-scope native export completed; exact signed
       software manifest/archive digests confirmed. No credentials or private keys
       included, no service/trust/VPS changes from export.
-- [ ] Explicit exact-old-LAB to fixed-company publication admission: implemented
-      in the same serialized transaction, eight Linux authority/retry/crash/capacity/
-      concurrency regression cases added; actual root CI observation pending.
-- [ ] Controlled test-server publication and controlled-device install/update
-      verification using the fixed company publisher.
+- [x] Explicit exact-old-LAB to fixed-company publication admission: serialized
+      transaction and eight Linux authority/retry/crash/capacity/concurrency cases.
+      Head792d85a actual CI15/15; three Ubuntu root distribution suites37/37 each.
+- [x] Controlled TEST VPS64.83.37.46 publication completed: fixed publisher
+      92E0176599764946F7E5AB332A5CEF150355BE9B, signed releasee5277d47,
+      archive6b2c3025. Operator SSH output confirms installed Monitor account
+      validates the exact normal P6RemoteProbe download; five identity/config
+      digests unchanged. No service reinstall, trust/firewall/ingress change.
+      Initial transport quoting error fixed; the same uploaded archive reused.
+- [ ] Controlled GUI download/device installation/update verification. Normal
+      P6RemoteProbe service does not adopt LAB fixture roots. Use a separately
+      enrolled test Device; preserve current test/my identity and queue, never
+      silently run two services with the same Device credential.
 - [x] Retain native exact-publisher/signature/catalog/hash/timestamp gates,
       controlled expiry/revocation and recovery/rollover. No unsigned fallback,
       silent self-trust or globally disabled protection. Private signing keys
