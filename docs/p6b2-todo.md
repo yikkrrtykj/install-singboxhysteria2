@@ -16,6 +16,27 @@ physical acceptance. Preserve exact source/build scope of existing receipts.
 - [x] Existing readonly native 30min CPU/private-working-set sampler prepared.
 - [x] Resource report verifier: recompute units and refuse partial/gapped/restarted reports.
 
+## Blocking repair: Windows native storage memory growth
+
+- [x] Reproduce retained native pointer types on the actual Windows interpreter.
+      1,000 directory DACL checks retained2,000 pointer-cache entries and
+      12,074,488 traced bytes after collection. An isolated fixture only;
+      no installed service/profile, controller or network changes.
+- [x] Reuse module-level ACL/ACE/file-information layouts; preserve all native
+      owner/DACL/reparse/hard-link checks and handle/descriptor lifetime rules.
+- [x] Native regressions cover repeated directory/file/open-fd checks, recurring
+      one-profile idle runtime checks, and subsequent unsafe-DACL refusal.
+      Both regressions fail on the old source and pass after the repair.
+      Repeated1,000 directory checks now add zero pointer types and retain
+      1,224 traced bytes. This is not a whole-service working-set benchmark.
+- [ ] Publish/test the changed Agent through the signed LAB package gates;
+      never patch installed signed bytes or downgrade permission enforcement.
+- [ ] Re-measure the repaired exact service's CPU/private working set. Keep the
+      running original capture as a pre-repair result; do not mark it PASS.
+      Operator reports rising~100→230MiB; independent protected Python process
+      snapshots showed~239–242MiB private sets, but exact service PID binding
+      must come from the administrator-authorized capture before attribution.
+
 ## Next: resource evidence
 
 - [ ] Bind the existing sampler to the actually installed, exact LAB service/profile/release.

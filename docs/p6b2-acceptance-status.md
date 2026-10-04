@@ -4,7 +4,8 @@ Issue #67 section22 and its latest amendments remain authoritative. PR70 stays
 Draft. This is a review checkpoint, not whole-implementation or independent PASS.
 Implementation base/merge-base: be7fbc047827a563b52c8e82c1d310446cdd72c1.
 Current field-deployed source: 9ac74e40f953863621ca179b44723b05ac2a22eb.
-This closeout changes UI wording/documentation only; retain prior field evidence.
+Current closeout includes a Windows native storage memory-growth repair;
+retain earlier field evidence with its exact source/build scope.
 
 ## Completed checkpoints
 
@@ -54,6 +55,30 @@ fixes should invalidate only affected evidence, not restart all field steps.
   queues, acceptance counters and server behavior.
 - Review source/CI now; batch later signed delivery instead of making the
   operator reinstall solely to confirm these wording changes.
+
+## Windows memory-growth repair
+
+The operator reports private memory growing from~100MiB to~230MiB. Readonly
+process snapshots found protected SCM-child Python processes at~239–242MiB;
+their exact service binding is not readable to the non-administrator agent.
+The authorized capture remains running and must preserve its original result.
+No affected memory acceptance can be called PASS on this evidence.
+
+A separate native Windows fixture reproduced a definite unbounded allocation:
+_descriptor created fresh ACL and ACE classes on every check. CPython3.12's
+ctypes pointer-type cache retained those class identities permanently.
+After1,000 real directory checks and collection, it added2,000 cache entries
+and retained12,074,488 traced bytes. Module-level stable native layouts remove
+this growth: the same fixture adds zero entries and retains1,224 traced bytes.
+File-information layout allocation is also shared. Native ownership/DACL,
+reparse, hard-link and descriptor/handle release behavior stays unchanged.
+
+Two native regressions fail before the repair and pass after it: repeated
+directory/file/open-fd validation with subsequent unsafe-DACL refusal, and
+one-profile paused runtime's recurring vault checks. These isolate the leak;
+they do not assert a full-service128MiB or30-minute performance PASS.
+Signed LAB delivery and an exact repaired-service measurement remain required;
+no installed service, profile, Clash/TUN setting or signing trust was changed.
 
 ## Next-stage tracking
 

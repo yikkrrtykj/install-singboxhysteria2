@@ -21,6 +21,23 @@ class SecurityAttributes(ctypes.Structure):
     _fields_ = [("length", W.DWORD), ("descriptor", W.LPVOID), ("inherit", W.BOOL)]
 
 
+# ctypes caches POINTER types by structure identity. These layouts must be
+# defined once, rather than recreated on each recurring storage check.
+class ACL(ctypes.Structure):
+    _fields_ = [("revision", W.BYTE), ("reserved", W.BYTE),
+                ("size", W.WORD), ("count", W.WORD), ("reserved2", W.WORD)]
+
+
+class ACE(ctypes.Structure):
+    _fields_ = [("kind", W.BYTE), ("flags", W.BYTE),
+                ("size", W.WORD), ("mask", W.DWORD)]
+
+
+class FileStandardInfo(ctypes.Structure):
+    _fields_ = [('allocation', ctypes.c_longlong), ('length', ctypes.c_longlong),
+                ('links', W.DWORD), ('deleting', W.BYTE), ('directory', W.BYTE)]
+
+
 class WindowsSecurity:
     def __init__(self, fixture_sid=None):
         if os.name != "nt":
@@ -99,12 +116,6 @@ class WindowsSecurity:
         try:
             if not owner or not dacl:
                 raise StorageSecurityError("missing restricted DACL/owner")
-            class ACL(ctypes.Structure):
-                _fields_ = [("revision", W.BYTE), ("reserved", W.BYTE),
-                            ("size", W.WORD), ("count", W.WORD), ("reserved2", W.WORD)]
-            class ACE(ctypes.Structure):
-                _fields_ = [("kind", W.BYTE), ("flags", W.BYTE),
-                            ("size", W.WORD), ("mask", W.DWORD)]
             acl = ctypes.cast(dacl, ctypes.POINTER(ACL)).contents
             if not 0 < acl.count <= 8:
                 raise StorageSecurityError("unsafe storage DACL")
@@ -128,10 +139,7 @@ class WindowsSecurity:
             raise StorageSecurityError("file attributes unavailable")
         if attrs[0] & 0x400 or bool(attrs[0] & 0x10) != bool(directory):
             raise StorageSecurityError("unsafe storage object")
-        class Standard(ctypes.Structure):
-            _fields_ = [('allocation', ctypes.c_longlong), ('length', ctypes.c_longlong),
-                        ('links', W.DWORD), ('deleting', W.BYTE), ('directory', W.BYTE)]
-        standard = Standard()
+        standard = FileStandardInfo()
         if not self.k.GetFileInformationByHandleEx(handle, 1, ctypes.byref(standard), ctypes.sizeof(standard)) \
                 or standard.deleting or (not directory and standard.links != 1):
             raise StorageSecurityError("linked/deleting storage object refused")

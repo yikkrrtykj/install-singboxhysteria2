@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import copy
+import ctypes
+import gc
 import hashlib
 import http.server
 import json
@@ -505,6 +507,54 @@ class IntegrationTests(FixtureBase):
 
 
 class WindowsTests(FixtureBase):
+    def test_repeated_native_storage_checks_keep_pointer_types_bounded(self):
+        vault = self.vault()
+        key, _ = vault.import_profile(self.manifest(), b"k" * 32, self.certs.pem())
+        path = os.path.join(vault._path(key), "ingest.key")
+        # Warm actual directory, file and opened-fd checks before the baseline.
+        def check():
+            vault.security.validate(vault.root, True)
+            self.assertEqual(vault.security.read(path, 128).strip(),
+                             (b"k" * 32).hex().encode())
+            with open(path, "rb") as stream:
+                vault.security.validate_fd(stream.fileno())
+        check()
+        gc.collect()
+        baseline = set(ctypes._pointer_type_cache)
+        for _ in range(1000):
+            check()
+        gc.collect()
+        self.assertTrue(set(ctypes._pointer_type_cache) == baseline,
+                        "native checks retained new pointer types")
+        # Retaining the same native types must still enforce current DACLs.
+        result = subprocess.run(["icacls", path, "/grant", "*S-1-1-0:(R)"],
+                                capture_output=True)
+        self.assertEqual(result.returncode, 0)
+        with self.assertRaises(StorageSecurityError):
+            vault.security.read(path, 128)
+        self.assertTrue(set(ctypes._pointer_type_cache) == baseline,
+                        "native checks retained new pointer types")
+
+    def test_native_idle_runtime_does_not_accumulate_pointer_types(self):
+        vault = self.vault()
+        key, _ = vault.import_profile(self.manifest(), b"k" * 32, self.certs.pem())
+        runtime = ProductionRuntime(vault).open()
+        self.addCleanup(runtime.close)
+        # Paused runtime still performs the real recurring vault checks, with
+        # no collector/network calls or timing dependence on a worker thread.
+        runtime.pause.set()
+        runtime.tick()
+        gc.collect()
+        baseline = set(ctypes._pointer_type_cache)
+        for _ in range(1000):
+            runtime.tick()
+        gc.collect()
+        self.assertTrue(set(ctypes._pointer_type_cache) == baseline,
+                        "native checks retained new pointer types")
+        self.assertEqual(vault.keys(), [key])
+        self.assertTrue(vault.enabled(key))
+        self.assertEqual(runtime.status()["active_cycles"], 0)
+
     def test_real_dacl_inheritance_and_unsafe_acl_refusal(self):
         vault = self.vault()
         key, _ = vault.import_profile(self.manifest(), b"k" * 32, self.certs.pem())
@@ -546,7 +596,7 @@ if __name__ == "__main__":
     result = unittest.main(verbosity=2, exit=False).result
     if not result.wasSuccessful():
         raise SystemExit(1)
-    # Keep the existing cross-platform CI entry and its original count; run
+    # Keep the existing cross-platform CI entry; run
     # the separate bundle acceptance suite as a second explicit process.
     for suite in ('test_resource_report.py', 'test_field_repairs.py', 'test_iplark_egress.py', 'test_bundle.py', 'test_windows_installer.py', 'test_windows_gui.py', 'test_distribution.py'):
         code = subprocess.call([sys.executable, str(ROOT / 'tests/remote-production' / suite)])
