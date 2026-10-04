@@ -23,6 +23,9 @@ def main():
     switch = commands.add_parser('replace-lab-publisher')
     for flag in ('package', 'manifest', 'manifest-sha256', 'publisher', 'from-publisher', 'from-archive'):
         switch.add_argument('--' + flag, required=True)
+    promote = commands.add_parser('promote-lab-publisher')
+    for flag in ('package', 'manifest', 'manifest-sha256', 'publisher', 'from-publisher', 'from-archive'):
+        promote.add_argument('--' + flag, required=True)
     remove = commands.add_parser('retire'); remove.add_argument('--archive', required=True)
     discard = commands.add_parser('discard-stage'); discard.add_argument('--stage', required=True)
     args = p.parse_args()
@@ -30,13 +33,15 @@ def main():
         print('[FAIL] root authority'); return 2
     print('[PASS] root authority')
     try:
-        if args.operation in ('publish', 'replace-lab-publisher'):
+        if args.operation in ('publish', 'replace-lab-publisher', 'promote-lab-publisher'):
             artifact, _ = read_artifact()
-            replace_lab = None if args.operation == 'publish' else {
+            previous = None if args.operation == 'publish' else {
                 'publisher': args.from_publisher.upper(), 'archive_sha256': args.from_archive}
-            scope = args.scope if args.operation == 'publish' else 'lab'
+            scope = args.scope if args.operation == 'publish' else (
+                'production' if args.operation == 'promote-lab-publisher' else 'lab')
             result = publish(args.package, args.manifest, args.manifest_sha256, args.publisher.upper(), scope, artifact,
-                             replace_lab=replace_lab)
+                             replace_lab=previous if args.operation == 'replace-lab-publisher' else None,
+                             promote_lab=previous if args.operation == 'promote-lab-publisher' else None)
             print('[PASS] Windows distribution published ' + json.dumps(result, sort_keys=True))
         else:
             retire(args.stage if args.operation == 'discard-stage' else args.archive, stage=args.operation == 'discard-stage')

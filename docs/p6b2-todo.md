@@ -74,7 +74,13 @@ Missing second environments remain explicit gaps, never fabricated PASS.
       native publisher/signature/timestamp/catalog validation passes. Signing
       identity is reused, no private key exported. Source01586cc; Agent bytes match
       the already tested memory repair. This is build evidence, not installed rollout.
-- [ ] Protected native release export/publication and controlled-device install/update
+- [x] Actual protected production-scope native export completed; exact signed
+      software manifest/archive digests confirmed. No credentials or private keys
+      included, no service/trust/VPS changes from export.
+- [ ] Explicit exact-old-LAB to fixed-company publication admission: implemented
+      in the same serialized transaction, eight Linux authority/retry/crash/capacity/
+      concurrency regression cases added; actual root CI observation pending.
+- [ ] Controlled test-server publication and controlled-device install/update
       verification using the fixed company publisher.
 - [x] Retain native exact-publisher/signature/catalog/hash/timestamp gates,
       controlled expiry/revocation and recovery/rollover. No unsigned fallback,

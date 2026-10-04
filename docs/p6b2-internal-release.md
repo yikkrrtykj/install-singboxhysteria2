@@ -50,6 +50,24 @@ client service update, Clash/TUN change or VPS publication occurs in these tools
    releases reuse the identity. Installation still requires ordinary Windows
    administrator authority and remains subject to local security policy.
 
+## Initial transition from a retained LAB package
+
+Ordinary publish continues to refuse publisher/scope replacement. On an explicitly
+authorized test server with a previously admitted LAB distribution, root may use
+`promote-lab-publisher` with independently known new manifest digest/publisher and
+the exact old `from-publisher`/`from-archive`. Target must be timestamped production
+scope with the normal installation identity. All archive/DAC/capacity checks and
+the serialized atomic pointer commit remain. It retains the old validated LAB
+archive, admits only exact-target retries, and never automatically evicts software.
+Stale source pins, existing production rotation, downgrade or concurrent different
+targets refuse. This only changes the selected software download, never Windows
+trust, device credentials, proxy services, firewall or ingress activation.
+
+Linux admission checks bytes/authority against the independent Windows native
+export receipt; it does not claim Linux Authenticode verification. This explicit
+initial transition does not waive production rollout authorization or replace the
+controlled-device signing/trust/installation tests.
+
 ## Expiry, loss or compromise
 
 Nonexportable signing keys are not backed up in a PFX. Preserve administrator

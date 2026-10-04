@@ -181,6 +181,105 @@ else:raise AssertionError('non-root retirement')
         with d.open_release(self.m['artifact'], str(self.root)) as (m, f):
             self.assertEqual(m, self.m); self.assertEqual(f.read(), self.raw)
 
+    @staticmethod
+    def company_fixture(publisher='B' * 40, setup=b'company format fixture'):
+        # Root admission format fixture, not a Linux Authenticode claim.
+        m, raw = fixture(publisher=publisher, setup=setup)
+        m.update(scope='production', timestamped=True)
+        return m, raw
+
+    def test_explicit_promotion_retry_and_held_reader_preserve_old_bytes(self):
+        self.publish()
+        other, raw = self.company_fixture(); self.sources(other, raw)
+        with d.open_release(self.m['artifact'], str(self.root)) as (_, old):
+            result = self.publish(other, promote_lab=self.lab_from())
+            self.assertEqual(result, self.publish(other, promote_lab=self.lab_from()))
+            self.assertEqual(old.read(), self.raw)
+        with d.open_release(other['artifact'], str(self.root)) as (m, stream):
+            self.assertEqual(m, other); self.assertEqual(stream.read(), raw)
+        self.assertTrue((self.root / self.m['archive']['sha256']).is_dir())
+
+    def test_promotion_requires_explicit_exact_old_authority_and_root(self):
+        self.publish(); original = (self.root / 'current.json').read_bytes()
+        other, raw = self.company_fixture(); self.sources(other, raw)
+        for old in ({}, [], dict(self.lab_from(), extra=True),
+                    {'publisher':'C' * 40, 'archive_sha256':self.m['archive']['sha256']},
+                    {'publisher':self.m['publisher'], 'archive_sha256':'f' * 64}):
+            with self.subTest(old=old), self.assertRaises(d.DistributionError):
+                self.publish(other, promote_lab=old)
+        with self.assertRaises(d.DistributionError): self.publish(other)
+        with patch.object(os, 'geteuid', return_value=65534), self.assertRaises(d.DistributionError):
+            self.publish(other, promote_lab=self.lab_from())
+        self.assertEqual((self.root / 'current.json').read_bytes(), original)
+
+    def test_promotion_refuses_missing_source_and_mixed_transition_modes(self):
+        other, raw = self.company_fixture(); self.sources(other, raw)
+        with self.assertRaises(d.DistributionError): self.publish(other, promote_lab=self.lab_from())
+        self.sources(self.m, self.raw); self.publish()
+        original = (self.root / 'current.json').read_bytes(); self.sources(other, raw)
+        with self.assertRaises(d.DistributionError):
+            self.publish(other, promote_lab=self.lab_from(), replace_lab=self.lab_from())
+        self.assertEqual((self.root / 'current.json').read_bytes(), original)
+
+    def test_promotion_requires_timestamp_normal_installation_and_production_target(self):
+        self.publish(); original = (self.root / 'current.json').read_bytes()
+        for override in ({'timestamped':False}, {'installation':'P6InstallerFixture'+'b'*32}, {'scope':'lab'}):
+            other, raw = self.company_fixture(); other.update(override); self.sources(other, raw)
+            with self.subTest(override=override), self.assertRaises(d.DistributionError):
+                self.publish(other, promote_lab=self.lab_from())
+        self.assertEqual((self.root / 'current.json').read_bytes(), original)
+
+    def test_promotion_never_rotates_existing_production_or_downgrades(self):
+        original, raw = self.company_fixture('A'*40); self.sources(original, raw); self.publish(original)
+        pointer = (self.root / 'current.json').read_bytes()
+        other, raw = self.company_fixture(); self.sources(other, raw)
+        with self.assertRaises(d.DistributionError): self.publish(other, promote_lab=self.lab_from(original))
+        self.sources(self.m, self.raw)
+        with self.assertRaises(d.DistributionError): self.publish(promote_lab=self.lab_from(original))
+        with self.assertRaises(d.DistributionError): self.publish(replace_lab=self.lab_from(original))
+        self.assertEqual((self.root / 'current.json').read_bytes(), pointer)
+
+    def test_promotion_corrupt_target_and_capacity_preserve_current(self):
+        self.publish(); original = (self.root / 'current.json').read_bytes()
+        other, raw = self.company_fixture(); self.sources(other, raw[:-1])
+        with self.assertRaises(d.DistributionError): self.publish(other, promote_lab=self.lab_from())
+        self.assertEqual((self.root / 'current.json').read_bytes(), original)
+        second, second_raw = fixture(setup=b'second retained LAB'); self.sources(second, second_raw); self.publish(second)
+        pointer = (self.root / 'current.json').read_bytes(); self.sources(other, raw)
+        with self.assertRaises(d.DistributionError): self.publish(other, promote_lab=self.lab_from(second))
+        self.assertEqual((self.root / 'current.json').read_bytes(), pointer)
+        self.assertTrue((self.root / self.m['archive']['sha256']).is_dir())
+
+    def test_promotion_pointer_interruption_requires_explicit_stage_recovery(self):
+        self.publish(); pointer = (self.root / 'current.json').read_bytes()
+        other, raw = self.company_fixture(); self.sources(other, raw)
+        with patch.object(d.os, 'replace', side_effect=OSError('pointer interruption')), self.assertRaises(OSError):
+            self.publish(other, promote_lab=self.lab_from())
+        self.assertEqual((self.root / 'current.json').read_bytes(), pointer)
+        stage = next(x.name for x in self.root.iterdir() if x.name.startswith('.stage-'))
+        with self.assertRaises(d.DistributionError): self.publish(other, promote_lab=self.lab_from())
+        d.retire(stage[7:], str(self.root), stage=True)
+        self.publish(other, promote_lab=self.lab_from())
+
+    def test_concurrent_different_company_promotions_only_one_wins(self):
+        self.publish(); barrier = threading.Barrier(2); targets=[]
+        for index, publisher in enumerate(('B'*40, 'C'*40)):
+            m, raw = self.company_fixture(publisher, ('company '+publisher).encode())
+            package=self.base/('company%d.zip'%index); package.write_bytes(raw); package.chmod(0o644)
+            manifest=self.base/('company%d.json'%index); manifest.write_bytes(d.canonical(m)); manifest.chmod(0o644)
+            targets.append((m,package,manifest))
+        def promote(target):
+            m, package, manifest = target; barrier.wait(timeout=10)
+            try:
+                return self.publish(m, package=str(package), manifest_path=str(manifest),
+                    expected_digest=hashlib.sha256(manifest.read_bytes()).hexdigest(), promote_lab=self.lab_from())
+            except d.DistributionError: return None
+        with concurrent.futures.ThreadPoolExecutor(2) as pool: results=list(pool.map(promote, targets))
+        self.assertEqual(sum(x is not None for x in results),1)
+        winner=next(x for x in results if x is not None)
+        with d.open_release(self.m['artifact'], str(self.root)) as (m, _):
+            self.assertEqual(m['publisher'],winner['publisher']); self.assertEqual(m['scope'],'production')
+
     def test_explicit_lab_switch_wrong_old_authority_preserves_pointer(self):
         self.publish(); pointer = (self.root / 'current.json').read_bytes()
         other, raw = fixture(setup=b'new LAB bytes', publisher='B' * 40)
