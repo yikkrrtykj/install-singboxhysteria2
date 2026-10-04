@@ -32,6 +32,28 @@ production rollout or P6C/P6D authorization. Preserve each receipt scope.
 - [x] MIT confirmed and added. SignPath application cancelled before submission;
       public certificate approval is not a company-internal release prerequisite.
 
+## Completed company-device and native lifecycle evidence
+
+- [x] Fixed-company download inventory matches the native signed export. Normal
+      P6RemoteProbe Auto/LocalSystem installation uses separately enrolled
+      test/company-check; current test/my credentials and queue are preserved.
+- [x] Actual company-device GUI pause/resume and continuing acknowledgements.
+      Post-reboot fresh sample21:54:19/seq20, acknowledgements43, all displayed
+      unresolved/retry/drop/corrupt/save/share-retry counters0.
+- [x] Real Windows reboot/autostart independently checked with administrator
+      service/process readback: exact service/image, unchanged Running PID5732,
+      OS boot21:35:00.500 +08:00, process start21:35:13.594,13.094s after boot.
+      The management window was opened manually later; its readonly ui-status
+      path does not start the service. This check made no service-control calls.
+- [x] Current-head native Windows CI includes reinstall preserving identity/spool,
+      actual upgrade/rollback with pending bytes, remove-one/preserve-other,
+      zero-profile uninstall and explicit purge. Native installer suite24/24.
+      Foundation CI includes two-server profile isolation and real offline
+      reopen/HTTPS replay. These are native fixture evidence, not the user's
+      company-device field actions; retain that distinction during final review.
+- [x] Controlled download includes the bundled Python license/notices:
+      payload/runtime/LICENSE.txt,33861 bytes, matches the signed archive exactly.
+
 ## 1. Complete only missing field evidence
 
 - [x] Short field validation closes the observer repair gap:62 valid/0 failures.
@@ -45,10 +67,12 @@ production rollout or P6C/P6D authorization. Preserve each receipt scope.
       resource comparisons. Process IO bytes are not measured network bytes.
 - [ ] Matched baseline/Agent-active Clash comparison: added p95 <=5ms;
       displayed active node-test delays are not that comparison.
-- [ ] Real OS reboot/autostart and user-controlled TUN scenario. Existing process
-      restart records do not prove a Windows reboot; never change Clash/TUN automatically.
-- [ ] Multiple-profile/server isolation and retirement/revoke/remove/purge/uninstall
-      using dedicated test identities; preserve the active Device and its queue.
+- [ ] User-controlled TUN routing scenario. Real OS reboot/autostart is complete
+      as recorded above; never change Clash/TUN automatically.
+- [ ] Assess remaining real-device multiple-profile/server and retirement/revoke
+      coverage against the frozen contract. Native isolation/reinstall/update/
+      rollback/remove/purge/uninstall CI above is already complete; do not reset
+      that evidence or repeat destructive actions on the active Device.
 - [x] Readonly administrator inventory identified four old Running/Auto fixtures
       and the exact current service. Current profile/queue preserved.
 - [x] Exact four old fixtures stopped/disabled by the administrator entry;
@@ -86,21 +110,25 @@ Missing second environments remain explicit gaps, never fabricated PASS.
       validates the exact normal P6RemoteProbe download; five identity/config
       digests unchanged. No service reinstall, trust/firewall/ingress change.
       Initial transport quoting error fixed; the same uploaded archive reused.
-- [ ] Controlled GUI download/device installation/update verification. Normal
-      P6RemoteProbe service does not adopt LAB fixture roots. Use a separately
-      enrolled test Device; preserve current test/my identity and queue, never
-      silently run two services with the same Device credential.
+- [x] Controlled GUI download and separately enrolled company Device installation
+      verified above. Normal P6RemoteProbe did not adopt a LAB fixture root.
+- [ ] Assess any remaining controlled-device update field coverage; native
+      reinstall/upgrade/rollback retention already passes. A documentation change
+      is not a new Agent release and does not require a repeat installation.
 - [x] Retain native exact-publisher/signature/catalog/hash/timestamp gates,
       controlled expiry/revocation and recovery/rollover. No unsigned fallback,
       silent self-trust or globally disabled protection. Private signing keys
       never go to the VPS or client; VPS TLS trust stays profile-local and separate.
-- [ ] Verify internal release and accompanying third-party notices on a controlled
-      company device. Disposable LAB certificates are not this release authority.
+- [x] Fixed internal release and accompanying bundled runtime notices verified
+      on the controlled company device. Native publisher/catalog/timestamp/hash
+      gates use the fixed company authority, not a disposable LAB certificate.
 
 ## 3. Final review and release decision
 
-- [ ] Final head/base/merge-base, full changed files, synthetic-merge parents,
-      actual CI run/job/test counts, protected-path zero diff and residual issues.
+- [x] d220190 review packet records head/base/merge-base, all92 changed files,
+      synthetic-merge parents,15/15 actual CI jobs and13 protected zero-diff paths;
+      both protected functions are unchanged. This is an evidence packet, not
+      final independent review. Later heads require their own CI/status receipt.
 - [x] Human conditional merge authorization after remaining acceptance/final review.
 - [ ] Final human independent review and satisfaction of remaining conditions.
 - [ ] After an authorized merge: merge-commit CI, then separately authorized rollout.

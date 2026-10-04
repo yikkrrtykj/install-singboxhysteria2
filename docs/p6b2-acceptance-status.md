@@ -24,7 +24,12 @@ change the field Agent payload; they are not new field runtime builds.
 | Process restart | Earlier ack93/newseq1 supports a new process run; full OS reboot remains distinct |
 | Signing tools CI | e2c6faa:15/15 jobs; foundations37194441609, shell-tests37194441612, packaging37194441649; native Windows internal-publisher suite9/9 including real machine trust/sign reuse/removal. Synthetic-merge checkout, not raw head checkout |
 | Short observer field validation | 182.48s,62 valid points,0 failures/retries, stable exact service/PID/release, sampled private maximum9.02MiB, local ack929→932; observer gap only |
-| Fixed company identity | Real nonexportable code-signing key created locally; public cert exported, two-year validity. Actual trust, timestamped signing and protected export verified; test-server publication complete; controlled device install/update pending |
+| Fixed company identity | Fixed company trust/signatures/timestamps/protected export and test-server publication complete; controlled company-device download/install now verified, native update/rollback24/24 remains distinct from field coverage |
+| Company Device | test/company-check uses normal P6RemoteProbe; downloaded program bytes match signed export; actual pause/resume and continuing samples/upload confirmations, active test/my preserved |
+| Real OS reboot/autostart | Administrator readonly exact SCM/process readback: OS boot21:35:00.500 +08:00, Auto/LocalSystem service PID5732 starts21:35:13.594,13.094s after boot; subsequent GUI confirms new samples. Window manually opened, readonly opening does not start service |
+| Current review packet | d220190:15/15 jobs, synthetic merge39055a3 with base+head parents,92 files,13 protected paths zero diff/two functions unchanged. Evidence packet only; final independent review pending |
+| Native lifecycle coverage | Actual Windows fixture reinstall/upgrade/rollback/pending bytes/remove-one/keep-other/zero-profile uninstall/purge24/24; foundation isolation and offline reopen/HTTPS replay passed; not falsely labelled company-device field actions |
+| Runtime notices | Controlled download payload/runtime/LICENSE.txt33861 bytes matches the signed archive |
 
 ## Finished repaired native resource capture
 
@@ -70,7 +75,10 @@ archive6b2c30252cbced851a276cbf3a22430f67815aa24a9c166d3b67de49d533520f.
 Installed Monitor account validates the normal P6RemoteProbe download; five
 identity/config digests unchanged. No service/client reinstall, trust/firewall or
 ingress change. Head792d85a CI15/15; root distribution suites37/37 on three Ubuntu
-versions. Controlled device install/update still pending; production VPS not deployed.
+versions. Controlled company Device installation, pause/resume and real Windows
+reboot/autostart are now verified. Ordinary update field coverage remains an
+assessment item; actual native fixture upgrade/rollback already passes.
+Production VPS is not deployed.
 
 ## Open conditions — three batches, no new feature stages
 
@@ -79,15 +87,18 @@ versions. Controlled device install/update still pending; production VPS not dep
    targets remain30min average CPU<=2% total machine and private memory<=128MiB.
    The short observer check passed; assess prior30min adequacy before deciding
    on any repeated full capture.
-   Real OS reboot, user-controlled TUN, multi-server isolation and dedicated
-   test-identity retirement records remain pending. Inventory old fixtures before
-   cleanup; preserve the current active Device and do not alter Clash automatically.
-2. Company-internal durable signing identity, independently trusted first setup,
-   ordinary same-identity updates and expiry/revocation/recovery handling. SignPath
-   was cancelled before submission; public approval is not a blocker for the
-   human's company-only audience. Keep native publisher/catalog/hash/timestamp
-   gates, no unsigned fallback. Current disposable LAB signing is not internal
-   production authority; signing keys never enter VPS/client and TLS trust stays separate.
+   Real OS reboot/autostart is complete using native process creation time.
+   User-controlled TUN and any missing real-device multi-server/retirement coverage
+   remain pending; preserve native CI evidence and the active Device. Four old
+   fixtures were already disabled with data retained. Do not repeat their cleanup
+   or alter Clash automatically.
+2. Company identity/trust/timestamped release/export/test-server publication and
+   actual normal company-device installation are complete. The signer is fixed,
+   not a disposable LAB certificate. Native expiry/revocation/update/recovery tests
+   remain valid; assess only additional controlled-device field coverage. SignPath
+   was cancelled before submission; public approval is not a company-only blocker.
+   Keep native publisher/catalog/hash/timestamp gates with no unsigned fallback;
+   signing keys never enter VPS/client and TLS trust stays separate.
 3. Final exact-head review packet, human independent review and satisfaction of
    the human's conditional merge authorization. Merge-commit CI follows merge;
    production rollout remains separately authorized.
