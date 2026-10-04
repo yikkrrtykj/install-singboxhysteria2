@@ -51,11 +51,11 @@ production rollout or P6C/P6D authorization. Preserve each receipt scope.
       using dedicated test identities; preserve the active Device and its queue.
 - [x] Readonly administrator inventory identified four old Running/Auto fixtures
       and the exact current service. Current profile/queue preserved.
-- [ ] Verify authorized old-fixture stop/disable and fixed trust installation.
-      Operator reports completion, but readonly registry still shows old Start=2,
-      both pinned trust entries absent and no matching operation receipt.
-      The repaired encoded launcher saves an initial/final receipt and refuses
-      success without native state readback; no automatic reinstallation.
+- [x] Exact four old fixtures stopped/disabled by the administrator entry;
+      native receipt reports completed and readonly registry confirms Start=4.
+      Fixed code-signing identity is present in machine Root/TrustedPublisher;
+      current service stays Auto and current Device/queue are preserved.
+      No old data deletion, VPS TLS trust import, Clash/TUN or VPS change.
 
 Use one consolidated runbook and a stable repaired version. Reuse upload,
 download and recovery receipts; retest only evidence affected by a real change.
@@ -69,9 +69,13 @@ Missing second environments remain explicit gaps, never fabricated PASS.
       do not attest a timestamped company release.
 - [x] Actual fixed company publisher created on the build host; nonexportable
       private key retained locally, public certificate only in staging. Never send
-      the private key to VPS/client. Initial machine trust remains unverified.
-- [ ] Independently trusted initial provisioning followed by an actual same-identity
-      signed/timestamped setup/catalog update and controlled-device verification.
+      the private key to VPS/client. Initial machine trust is independently read back present.
+- [x] Actual fixed-publisher setup executable, script and payload catalog signed;
+      native publisher/signature/timestamp/catalog validation passes. Signing
+      identity is reused, no private key exported. Source01586cc; Agent bytes match
+      the already tested memory repair. This is build evidence, not installed rollout.
+- [ ] Protected native release export/publication and controlled-device install/update
+      verification using the fixed company publisher.
 - [x] Retain native exact-publisher/signature/catalog/hash/timestamp gates,
       controlled expiry/revocation and recovery/rollover. No unsigned fallback,
       silent self-trust or globally disabled protection. Private signing keys

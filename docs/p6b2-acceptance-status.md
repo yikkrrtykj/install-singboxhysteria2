@@ -24,7 +24,7 @@ change the field Agent payload; they are not new field runtime builds.
 | Process restart | Earlier ack93/newseq1 supports a new process run; full OS reboot remains distinct |
 | Signing tools CI | e2c6faa:15/15 jobs; foundations37194441609, shell-tests37194441612, packaging37194441649; native Windows internal-publisher suite9/9 including real machine trust/sign reuse/removal. Synthetic-merge checkout, not raw head checkout |
 | Short observer field validation | 182.48s,62 valid points,0 failures/retries, stable exact service/PID/release, sampled private maximum9.02MiB, local ack929→932; observer gap only |
-| Fixed company identity | Real nonexportable code-signing key created locally; public cert exported, two-year validity. Actual trust/release remains independently unverified |
+| Fixed company identity | Real nonexportable code-signing key created locally; public cert exported, two-year validity. Actual trust and timestamped signing verified; protected export/rollout pending |
 
 ## Finished repaired native resource capture
 
@@ -50,13 +50,21 @@ it remains distinct from full resource acceptance and requires no client/VPS rei
 
 ## Administrator closeout readback
 
-The administrator inventory found four old Running/Auto fixture instances and
-the exact current service. The operator reports the cleanup/trust window completed.
-Independent readonly registry still reports old Start=2 and no fixed-publisher
-Root/TrustedPublisher entries, and no matching operation receipt is visible.
-Do not mark cleanup/trust complete from the dialog report alone. A repaired
-encoded launcher records its administrator start and final native readback;
-old data, current Device/queue and Clash/TUN are preserved.
+The repaired administrator entry completed and saved a native state receipt:
+four exact old fixtures Stopped/Disabled, current exact service Running/Auto and
+fixed internal code-signing trust installed. Independent readonly registry now
+confirms old Start=4/current Start=2 and both exact Root/TrustedPublisher entries.
+Unprivileged direct SCM queries remain denied; stopped state comes from the
+administrator's native readback, not a fabricated unprivileged observation.
+Old data/current Device/queue are preserved; no VPS TLS trust/Clash/TUN/VPS change.
+
+Actual fixed-publisher company setup executable, script and payload catalog are
+now signed and timestamped. Native exact-publisher/signature/timestamp/catalog
+validation passed. Source01586cc has15/15 CI jobs success:37196950313,
+37196950312,37196950334; synthetic merge81061673d53b63a5f5170578e93671ba5cc6a81e
+has parents base + that head. Field Agent bytes match the already tested repair.
+Protected release export, controlled-device installation/update and server
+publication remain separate pending actions; no deployment is claimed.
 
 ## Open conditions — three batches, no new feature stages
 
