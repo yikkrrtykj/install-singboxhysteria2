@@ -260,3 +260,9 @@ mihomo-gateway-installer --restore /var/backups/mihomo-gateway/<备份目录名>
 ```
 
 作用：恢复安装前的 Mihomo、systemd、DNS 和网络配置。
+
+## License / Code signing policy
+
+本项目自有代码采用 [MIT License](LICENSE)。第三方软件及代码保留其原有许可证和版权声明，不因本项目采用 MIT 而改变。
+
+Windows 客户端正在准备申请免费开源代码签名，尚未获批。签名状态和发布边界见 [Code signing policy](docs/p6b2-free-signing.md)；测试包不代表正式签名发布。

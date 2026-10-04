@@ -81,3 +81,13 @@ exit1 means a measured subcheck exceeds its target; exit2 means invalid/incomple
 input. Every outcome keeps whole_resource_acceptance_pass=false: recorded-input
 validation neither attests real execution nor substitutes for network/latency,
 workload comparisons, lifecycle field evidence or independent review.
+
+## 2026-10-04 免费代码签名准备
+
+- [x] 用户确认 MIT 草案，并加入根目录 LICENSE；第三方许可不变。
+- [x] 免费签名路线、政策和申请前数据流说明已记录：`docs/p6b2-free-signing.md`。
+- [ ] 核对 Windows 首次公开发布资格及随包第三方通知；当前 GitHub Releases 无已发布客户端。
+- [ ] 仓库所有者完成真实联系人、MFA 和申请条款确认，取得 SignPath 审核结果。
+- [ ] 获批后接入 GitHub-hosted 构建与签名审批，并验证真实时间戳签名包。
+
+以上是文档和授权变更，不修改客户端、采样器、Clash/TUN、VPS 或签名验证门禁；不重置现有通过证据。PR 仍为 Draft，不授权合并/部署。
