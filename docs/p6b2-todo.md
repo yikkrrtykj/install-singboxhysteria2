@@ -82,12 +82,12 @@ input. Every outcome keeps whole_resource_acceptance_pass=false: recorded-input
 validation neither attests real execution nor substitutes for network/latency,
 workload comparisons, lifecycle field evidence or independent review.
 
-## 2026-10-04 免费代码签名准备
+## 2026-10-04 公司内部发行（取代免费公众签名申请）
 
-- [x] 用户确认 MIT 草案，并加入根目录 LICENSE；第三方许可不变。
-- [x] 免费签名路线、政策和申请前数据流说明已记录：`docs/p6b2-free-signing.md`。
-- [ ] 核对 Windows 首次公开发布资格及随包第三方通知；当前 GitHub Releases 无已发布客户端。
-- [ ] 仓库所有者完成真实联系人、MFA 和申请条款确认，取得 SignPath 审核结果。
-- [ ] 获批后接入 GitHub-hosted 构建与签名审批，并验证真实时间戳签名包。
+- [x] 用户确认 MIT，根目录 LICENSE 已加入；第三方许可不变。
+- [x] 用户明确仅公司内部使用，取消 SignPath 申请及公众发行资格准备。
+- [x] 固定内部代码签名身份、首次受控信任和集中发布方向已记录。
+- [ ] 完成管理员持有的固定签名身份、可信首次部署和同身份更新入口；保留 native publisher/catalog/hash/timestamp 验证。
+- [ ] 核对内部发行的随包通知、恢复/轮换与真实部署证据。
 
-以上是文档和授权变更，不修改客户端、采样器、Clash/TUN、VPS 或签名验证门禁；不重置现有通过证据。PR 仍为 Draft，不授权合并/部署。
+无需公众签名机构审批或公众已发布包记录。既有资源、生命周期和最终独立 review 继续收尾；当前短期 lab 包不能直接声明正式内部发布 PASS。PR 保持 Draft，不授权合并/部署。
