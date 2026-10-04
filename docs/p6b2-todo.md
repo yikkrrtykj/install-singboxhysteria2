@@ -1,93 +1,75 @@
-# PR #70 remaining work
+# PR #70 closeout checklist
 
-Authoritative contract: Issue #67 section22 and current amendments. Keep PR70
-Draft; no merge, production deployment or P6C/P6D until separately authorized.
-Use this checklist with p6b2-acceptance-status.md; checked tooling is not checked
-physical acceptance. Preserve exact source/build scope of existing receipts.
+Issue #67 section 22 and its current company-only distribution amendment are
+authoritative. PR70 stays Draft. No merge, production rollout or P6C/P6D is
+authorized. Preserve the version and scope of each existing receipt.
 
-## Completed evidence to retain
+## Completed — retain these results
 
 - [x] Foundation, provisioning/revocation, ingress, Bundle and installer slice reviews.
-- [x] Combined Windows client package and adjacent Device configuration discovery.
-- [x] Chinese Client/Device/Location/Network Path interfaces; single login/15min idle policy.
-- [x] Historical offline/reconnect recovery (ack20→22, unresolved1→0, retry1→0).
-- [x] Current IPLark sample matched to actual originating-VPS seq1 receipt.
-- [x] UI NONE/direct-egress wording source fix; defer signed delivery to a batch.
-- [x] Existing readonly native 30min CPU/private-working-set sampler prepared.
-- [x] Resource report verifier: recompute units and refuse partial/gapped/restarted reports.
+- [x] Combined Windows program/device package, adjacent configuration discovery,
+      Chinese Client/Device/Location/Network Path UI and single-login/15min idle policy.
+- [x] Historical real offline/reconnect recovery and originating-VPS IPLark receipts.
+- [x] Native ctypes pointer-cache leak reproduced and repaired; native regression
+      tests fail on the old source and pass with shared layouts. Ownership/DACL,
+      reparse, hard-link and same-object enforcement remain intact.
+- [x] Repaired Agent delivered through native signed LAB gates; actual in-place
+      upgrade preserves the current Device, credentials and spool.
+- [x] Test VPS source a07bc85 and repaired signed distribution synchronized;
+      final health healthy, identity/Client configuration digests unchanged.
+- [x] Exact repaired-service binding and native private-working-set collector.
+- [x] Finished repaired native capture analyzed without changing its report/verdict.
+      1803.80s, 119 valid snapshots, two service-query failures; observed private
+      memory 12.54→8.73MiB, sampled maximum 12.54MiB, endpoint CPU estimate 0.041%.
+      This is partial evidence, not formal whole-resource PASS or an exceeded target.
+- [x] Local observer repair prepared and short native tests passed: one bounded
+      retry only for CIM provider exceptions, recorded failures/retries, persistent
+      failures and foreign/missing identity still refuse. No operator run started.
+- [x] MIT confirmed and added. SignPath application cancelled before submission;
+      public certificate approval is not a company-internal release prerequisite.
 
-## Blocking repair: Windows native storage memory growth
+## 1. Complete only missing field evidence
 
-- [x] Reproduce retained native pointer types on the actual Windows interpreter.
-      1,000 directory DACL checks retained2,000 pointer-cache entries and
-      12,074,488 traced bytes after collection. An isolated fixture only;
-      no installed service/profile, controller or network changes.
-- [x] Reuse module-level ACL/ACE/file-information layouts; preserve all native
-      owner/DACL/reparse/hard-link checks and handle/descriptor lifetime rules.
-- [x] Native regressions cover repeated directory/file/open-fd checks, recurring
-      one-profile idle runtime checks, and subsequent unsafe-DACL refusal.
-      Both regressions fail on the old source and pass after the repair.
-      Repeated1,000 directory checks now add zero pointer types and retain
-      1,224 traced bytes. This is not a whole-service working-set benchmark.
-- [ ] Publish/test the changed Agent through the signed LAB package gates;
-      never patch installed signed bytes or downgrade permission enforcement.
-- [ ] Re-measure the repaired exact service's CPU/private working set. Keep the
-      running original capture as a pre-repair result; do not mark it PASS.
-      Operator reports rising~100→230MiB; independent protected Python process
-      snapshots showed~239–242MiB private sets, but exact service PID binding
-      must come from the administrator-authorized capture before attribution.
+- [ ] Resolve the resource-record completeness gap. Preserve all old reports;
+      first validate the observer repair in a short check, then assess whether
+      another full capture is necessary. Do not automatically restart 30min tests.
+- [ ] Close one-profile CPU <=2% total-machine average over30min and private
+      working set <=128MiB acceptance with adequate evidence/reviewer assessment.
+      The observer's 121-point/zero-failure rules are not new product requirements.
+- [ ] Missing idle/active/offline-backlog network/queue and one/multiple-profile
+      resource comparisons. Process IO bytes are not measured network bytes.
+- [ ] Matched baseline/Agent-active Clash comparison: added p95 <=5ms;
+      displayed active node-test delays are not that comparison.
+- [ ] Real OS reboot/autostart and user-controlled TUN scenario. Existing process
+      restart records do not prove a Windows reboot; never change Clash/TUN automatically.
+- [ ] Multiple-profile/server isolation and retirement/revoke/remove/purge/uninstall
+      using dedicated test identities; preserve the active Device and its queue.
+- [ ] Readonly inventory of historical test instances before any authorized cleanup.
 
-## Next: resource evidence
+Use one consolidated runbook and a stable repaired version. Reuse upload,
+download and recovery receipts; retest only evidence affected by a real change.
+Missing second environments remain explicit gaps, never fabricated PASS.
 
-- [ ] Bind the existing sampler to the actually installed, exact LAB service/profile/release.
-      The original prepared sampler names an older fixture; do not reuse that binding blindly.
-      No current P6 SCM entry was available in this agent's readonly service inventory;
-      this is an evidence/access gap, not proof that the operator's service is absent.
-- [ ] Record one-profile steady CPU for30min (<=2% total-machine capacity) and
-      sampled private working set (<=128MiB); total working set is a different metric.
-- [ ] Record idle/active/offline-backlog CPU, private memory, network/queue and
-      one/multiple-profile comparisons. Retain passed recovery; collect only missing metrics.
-- [ ] Record matched baseline/Agent-active Clash latency comparison, added p95<=5ms.
-      Process IO bytes are not network bytes; active diagnostic delay is not added Clash delay.
+## 2. Company-internal release, once
 
-## Then: missing lifecycle field records
+- [ ] Administrator-held durable signing identity and independently trusted initial
+      provisioning, followed by same-identity signed setup/catalog updates.
+- [ ] Retain native exact-publisher/signature/catalog/hash/timestamp gates,
+      controlled expiry/revocation and recovery/rollover. No unsigned fallback,
+      silent self-trust or globally disabled protection. Private signing keys
+      never go to the VPS or client; VPS TLS trust stays profile-local and separate.
+- [ ] Verify internal release and accompanying third-party notices on a controlled
+      company device. Disposable LAB certificates are not this release authority.
 
-- [ ] Actual full Windows reboot/autostart, exact installed release and run continuity.
-      Existing process-run seq restart is retained but does not prove an OS reboot.
-- [ ] TUN off/on routing and collection/upload evidence; no automatic network-mode changes.
-- [ ] Multi-profile isolation and project retirement/revocation/purge recovery.
-      Perform destructive lifecycle checks on dedicated test identities, preserving the active Device.
-- [ ] Close or explicitly assess the generic LAB preparation error; valid native export
-      and later publication remain separate verified facts, cause currently unknown.
+## 3. Final review and release decision
 
-## Final review and release
-
-- [ ] Batch only necessary signed delivery; exact native package/catalog/hash gates unchanged.
-- [ ] Production publisher certificate/timestamp. Human reports no production certificate;
-      implement/test gates now, production publication remains closed until authority exists.
-- [ ] Final review packet: head/base/merge-base, full changed files, actual synthetic-merge
-      parents, run/job/test counts, protected-path zero diff and residual issues.
+- [ ] Final head/base/merge-base, full changed files, synthetic-merge parents,
+      actual CI run/job/test counts, protected-path zero diff and residual issues.
 - [ ] Final human independent review and explicit merge authorization.
-- [ ] Merge-commit CI after an authorized merge, then separately authorized production rollout.
-- [ ] Only after P6B2 completion and explicit authorization: P6C presentation, then P6D.
+- [ ] After an authorized merge: merge-commit CI, then separately authorized rollout.
+- [ ] P6C/P6D only after P6B2 completion and explicit authorization.
 
-## Report analysis boundary
-
-tools/p6-resource-report.py consumes the existing resource_window report using
-explicit expected service/probe/profile and an expected report SHA256. It emits
-only calculated aggregate metrics and closed status, never input sample bodies
-or credentials. Exit0 means the recorded CPU/sampled-memory subchecks pass;
-exit1 means a measured subcheck exceeds its target; exit2 means invalid/incomplete
-input. Every outcome keeps whole_resource_acceptance_pass=false: recorded-input
-validation neither attests real execution nor substitutes for network/latency,
-workload comparisons, lifecycle field evidence or independent review.
-
-## 2026-10-04 公司内部发行（取代免费公众签名申请）
-
-- [x] 用户确认 MIT，根目录 LICENSE 已加入；第三方许可不变。
-- [x] 用户明确仅公司内部使用，取消 SignPath 申请及公众发行资格准备。
-- [x] 固定内部代码签名身份、首次受控信任和集中发布方向已记录。
-- [ ] 完成管理员持有的固定签名身份、可信首次部署和同身份更新入口；保留 native publisher/catalog/hash/timestamp 验证。
-- [ ] 核对内部发行的随包通知、恢复/轮换与真实部署证据。
-
-无需公众签名机构审批或公众已发布包记录。既有资源、生命周期和最终独立 review 继续收尾；当前短期 lab 包不能直接声明正式内部发布 PASS。PR 保持 Draft，不授权合并/部署。
+tools/p6-resource-report.py remains fail closed for invalid/incomplete input.
+No local observer repair changes its verdict or retroactively repairs old data.
+Generic historical LAB launcher failure is retained as a tool diagnostic;
+verified later export/publication stands and does not need repetition for it.

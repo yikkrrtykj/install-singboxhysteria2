@@ -1,88 +1,64 @@
 # P6B2 closeout status
 
-Issue #67 section22 and its latest amendments remain authoritative. PR70 stays
-Draft. This is a review checkpoint, not whole-implementation or independent PASS.
-Implementation base/merge-base: be7fbc047827a563b52c8e82c1d310446cdd72c1.
-Current field-deployed source: 9ac74e40f953863621ca179b44723b05ac2a22eb.
-Current closeout includes a Windows native storage memory-growth repair;
-retain earlier field evidence with its exact source/build scope.
+Updated 2026-10-04. Issue #67 section22 and current amendments are authoritative.
+PR70 remains Draft; whole completion/final review/MERGE/production/P6C/P6D are NO.
+Base/merge-base: be7fbc047827a563b52c8e82c1d310446cdd72c1.
+Current field runtime source: a07bc85e22e0855ea226d6ce32ef6af88f168f0d.
+Later license/route/checklist commits are documentation changes, not new field builds.
 
 ## Completed checkpoints
 
-| Item | Evidence |
+| Item | Evidence and scope |
 | --- | --- |
-| Foundation, server/helper lifecycle, ingress, Bundle and installer slices | Earlier human independent reviews; keep their exact reviewed heads distinct from later source |
-| Protocol/store/History/classifier separation | Protected base-to-head paths unchanged; classifier_bundle and _evidence_health_locked byte-identical |
-| Current deployed-source integration CI | 15/15 jobs; synthetic merge959af8de4c1a38b38f7978f8acfeb98464a4449a has base+9ac74e4 parents |
-| Native signed LAB export | Exact native-Valid entries/catalog and digest-pinned export independently read back; temporary LAB authority, no production signer |
-| Real current test VPS update | Operator output: release0.7.0-20261003183326, healthy, identity hashes unchanged, generic source/distribution verified |
-| Current IPLark collection/upload | Operator GUI successful sample2026-10-04 02:37:13 +08:00; exact run/seq1 receipt query: max_seq10, receipts10, latest acceptance age9.1s |
-| Earlier real offline/reconnect behavior | Operator screenshots: ack20→22, unresolved span1→0, retries1→0. Retain this historical evidence rather than repeat the whole exercise for UI/provider changes |
-| Process restart continuity evidence | Earlier screenshot: ack93 and new seq1. This supports a new process run; full Windows reboot is a distinct unproven assertion |
-| Native automated lifecycle/resource bounds | Existing Linux/Windows fixtures verify bounded profiles, spool, native SCM, recovery and retirement. They are not real-host performance measurements |
+| Foundation, server/helper lifecycle, ingress, Bundle and installer | Earlier human slice reviews; final-head review remains distinct |
+| Repaired runtime CI | a07bc85: 15/15 jobs; shell-tests37182322620, foundations37182322564, packaging37182322624 |
+| License/company-route documentation CI | 30a1967: all three workflows successful; shell-tests37192254899, foundations37192254826, packaging37192255005; later commits require their own CI |
+| Native memory-leak regression | Old layout creates2,000 retained pointer types after1,000 directory checks; shared layouts create zero, with unsafe-DACL refusal preserved |
+| Repaired signed LAB delivery | Native export and in-place upgrade receipts; release b0e65304dd0726e4f338b54f4c9bfa9cedee7280397a30bbeae95526160096e4, publisher E98C97A9F64573C0E727E5B6B7657A27F695CDC2; current Device/spool preserved |
+| Test VPS | Operator SSH output: a07bc85, Monitor0.7.0-20261004081332, final healthy, identity/Client digests unchanged, exact new distribution readable by Monitor |
+| Upload/offline/IPLark | Preserved real-origin receipts and historical ack20→22/unresolved1→0/retry1→0; do not repeat for observer/documentation edits |
+| Process restart | Earlier ack93/newseq1 supports a new process run; full OS reboot remains distinct |
 
-## Open acceptance and release conditions
+## Finished repaired native resource capture
 
-1. Resource evidence under the frozen protocol: one-profile steady CPU <=2% of
-   total machine capacity over30minutes, private working set <=128MiB, matched
-   baseline added Clash diagnostic latency p95 <=5ms. Record idle/active/offline
-   backlog CPU/memory/network/queue and one/multiple-profile comparisons. The old
-   single working-set snapshot is not a private-set or30-minute benchmark.
-2. Real Windows reboot/autostart, TUN routing and multiple-profile/retirement
-   field records have not been found in the preserved acceptance receipts.
-   Do not turn absent records into PASS, nor automatically reset passed tests.
-3. Production code-signing publisher and timestamp are unavailable; keep the
-   frozen production admission gate closed. Existing temporary LAB signatures
-   expire; production publication cannot rely on them.
-4. A LAB preparation tool showed a generic failure despite valid signed export.
-   Its detailed launcher exception is unknown. Preserve verified output, avoid
-   repeating trust/export merely to collect the same result; improve diagnostics
-   in a later batched lab-tool build if that workflow remains needed.
-5. Final independent review of the final source and explicit merge authorization
-   remain required. No merge, production deployment or P6C/P6D is authorized.
+Original report SHA256:
+380ea78cfa724c7d7efe82601aad7073d1967764951add256129c801ef86394e.
+Exact repaired LAB service binding, one configured/enabled profile, one stable
+PID/creation identity and Running at all119 valid points. Window1803.80s;
+two failures at service_query/service_recheck, maximum gap30.17s.
 
-Open items above are distinct from already passed collection/upload recovery.
-The operator rejected another offline exercise for this narrow repair; retain
-historical coverage and note its source/build scope transparently. New source
-fixes should invalidate only affected evidence, not restart all field steps.
+Observed private working set: first12.54MiB, last8.73MiB, sampled maximum12.54MiB.
+CPU endpoint estimate0.041% of total machine capacity. Recorded snapshots do not
+show the former growing private memory, but cannot attest unseen continuous peaks.
+The closed verifier keeps invalid_or_incomplete_resource_report and whole-resource
+PASS=false. False acceptance flags from invalid input are not measured target
+exceedances. Network/matched latency remain unmeasured.
 
-## Current UI closeout
+Local observer-only repair now records CIM-provider failures and permits at most
+one retry after250ms. Short native tests verify recovered/persistent failure,
+foreign/missing identity refusal and exact release binding. No cached state,
+weakened identity checks, original-report rewrite or new operator run. This is
+tool validation, not new field acceptance; it requires no client/VPS reinstall.
 
-- Translate NONE as 无错误; successful egress shows existing latency_ms.
-- Label direct observation 本机出口检测 / 本机网络出口 IP, with this sample's
-  request-route note. Do not display configured VPS IP as a measured result.
-- Preserve actual routing, collection/upload cadence, payloads, keys, profiles,
-  queues, acceptance counters and server behavior.
-- Review source/CI now; batch later signed delivery instead of making the
-  operator reinstall solely to confirm these wording changes.
+## Open conditions — three batches, no new feature stages
 
-## Windows memory-growth repair
+1. Adequate resource coverage/reviewer assessment; missing real network/workload,
+   single/multiple-profile and matched added-Clash p95<=5ms evidence. One-profile
+   targets remain30min average CPU<=2% total machine and private memory<=128MiB.
+   Short-check the observer gap before deciding on any repeated full capture.
+   Real OS reboot, user-controlled TUN, multi-server isolation and dedicated
+   test-identity retirement records remain pending. Inventory old fixtures before
+   cleanup; preserve the current active Device and do not alter Clash automatically.
+2. Company-internal durable signing identity, independently trusted first setup,
+   ordinary same-identity updates and expiry/revocation/recovery handling. SignPath
+   was cancelled before submission; public approval is not a blocker for the
+   human's company-only audience. Keep native publisher/catalog/hash/timestamp
+   gates, no unsigned fallback. Current disposable LAB signing is not internal
+   production authority; signing keys never enter VPS/client and TLS trust stays separate.
+3. Final exact-head review packet, human independent review and explicit merge
+   authorization. Merge-commit CI and production rollout follow separate approval.
 
-The operator reports private memory growing from~100MiB to~230MiB. Readonly
-process snapshots found protected SCM-child Python processes at~239–242MiB;
-their exact service binding is not readable to the non-administrator agent.
-The authorized capture remains running and must preserve its original result.
-No affected memory acceptance can be called PASS on this evidence.
-
-A separate native Windows fixture reproduced a definite unbounded allocation:
-_descriptor created fresh ACL and ACE classes on every check. CPython3.12's
-ctypes pointer-type cache retained those class identities permanently.
-After1,000 real directory checks and collection, it added2,000 cache entries
-and retained12,074,488 traced bytes. Module-level stable native layouts remove
-this growth: the same fixture adds zero entries and retains1,224 traced bytes.
-File-information layout allocation is also shared. Native ownership/DACL,
-reparse, hard-link and descriptor/handle release behavior stays unchanged.
-
-Two native regressions fail before the repair and pass after it: repeated
-directory/file/open-fd validation with subsequent unsafe-DACL refusal, and
-one-profile paused runtime's recurring vault checks. These isolate the leak;
-they do not assert a full-service128MiB or30-minute performance PASS.
-Signed LAB delivery and an exact repaired-service measurement remain required;
-no installed service, profile, Clash/TUN setting or signing trust was changed.
-
-## Next-stage tracking
-
-Continue the ordered checklist in [p6b2-todo.md](p6b2-todo.md). Existing sampler
-preparation is retained; tools/p6-resource-report.py verifies its saved single-
-profile reports without service or controller operations. Tool unit tests do
-not claim real30min performance; network/latency and field gates stay open.
+Use [p6b2-todo.md](p6b2-todo.md) as the current checklist. Earlier receipts retain
+their historical build scope. Completed upload/export/recovery is not reset by
+local observer repairs, licensing or checklist updates. A historical generic LAB
+launcher diagnostic does not undo independently verified subsequent exports.
