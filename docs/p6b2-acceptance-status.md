@@ -1,10 +1,14 @@
 # P6B2 closeout status
 
 Updated 2026-10-04. Issue #67 section22 and current amendments are authoritative.
-PR70 remains Draft; whole completion/final review/MERGE/production/P6C/P6D are NO.
+The human has authorized merge after remaining conditions and final review.
+PR70 remains Draft/unmerged; whole completion/final review/production/P6C/P6D
+remain pending. This conditional authorization supersedes historical MERGE=NO,
+without waiving acceptance or authorizing production.
 Base/merge-base: be7fbc047827a563b52c8e82c1d310446cdd72c1.
 Current field runtime source: a07bc85e22e0855ea226d6ce32ef6af88f168f0d.
-Later license/route/checklist commits are documentation changes, not new field builds.
+Later license/route/checklist and administrator signing-tool commits do not
+change the field Agent payload; they are not new field runtime builds.
 
 ## Completed checkpoints
 
@@ -18,6 +22,9 @@ Later license/route/checklist commits are documentation changes, not new field b
 | Test VPS | Operator SSH output: a07bc85, Monitor0.7.0-20261004081332, final healthy, identity/Client digests unchanged, exact new distribution readable by Monitor |
 | Upload/offline/IPLark | Preserved real-origin receipts and historical ack20→22/unresolved1→0/retry1→0; do not repeat for observer/documentation edits |
 | Process restart | Earlier ack93/newseq1 supports a new process run; full OS reboot remains distinct |
+| Signing tools CI | e2c6faa:15/15 jobs; foundations37194441609, shell-tests37194441612, packaging37194441649; native Windows internal-publisher suite9/9 including real machine trust/sign reuse/removal. Synthetic-merge checkout, not raw head checkout |
+| Short observer field validation | 182.48s,62 valid points,0 failures/retries, stable exact service/PID/release, sampled private maximum9.02MiB, local ack929→932; observer gap only |
+| Fixed company identity | Real nonexportable code-signing key created locally; public cert exported, two-year validity. Actual trust/release remains independently unverified |
 
 ## Finished repaired native resource capture
 
@@ -37,15 +44,27 @@ exceedances. Network/matched latency remain unmeasured.
 Local observer-only repair now records CIM-provider failures and permits at most
 one retry after250ms. Short native tests verify recovered/persistent failure,
 foreign/missing identity refusal and exact release binding. No cached state,
-weakened identity checks, original-report rewrite or new operator run. This is
-tool validation, not new field acceptance; it requires no client/VPS reinstall.
+weakened identity checks or original-report rewrite. The actual short operator
+capture now validates this observer repair with62 valid points/zero failures;
+it remains distinct from full resource acceptance and requires no client/VPS reinstall.
+
+## Administrator closeout readback
+
+The administrator inventory found four old Running/Auto fixture instances and
+the exact current service. The operator reports the cleanup/trust window completed.
+Independent readonly registry still reports old Start=2 and no fixed-publisher
+Root/TrustedPublisher entries, and no matching operation receipt is visible.
+Do not mark cleanup/trust complete from the dialog report alone. A repaired
+encoded launcher records its administrator start and final native readback;
+old data, current Device/queue and Clash/TUN are preserved.
 
 ## Open conditions — three batches, no new feature stages
 
 1. Adequate resource coverage/reviewer assessment; missing real network/workload,
    single/multiple-profile and matched added-Clash p95<=5ms evidence. One-profile
    targets remain30min average CPU<=2% total machine and private memory<=128MiB.
-   Short-check the observer gap before deciding on any repeated full capture.
+   The short observer check passed; assess prior30min adequacy before deciding
+   on any repeated full capture.
    Real OS reboot, user-controlled TUN, multi-server isolation and dedicated
    test-identity retirement records remain pending. Inventory old fixtures before
    cleanup; preserve the current active Device and do not alter Clash automatically.
@@ -55,8 +74,9 @@ tool validation, not new field acceptance; it requires no client/VPS reinstall.
    human's company-only audience. Keep native publisher/catalog/hash/timestamp
    gates, no unsigned fallback. Current disposable LAB signing is not internal
    production authority; signing keys never enter VPS/client and TLS trust stays separate.
-3. Final exact-head review packet, human independent review and explicit merge
-   authorization. Merge-commit CI and production rollout follow separate approval.
+3. Final exact-head review packet, human independent review and satisfaction of
+   the human's conditional merge authorization. Merge-commit CI follows merge;
+   production rollout remains separately authorized.
 
 Use [p6b2-todo.md](p6b2-todo.md) as the current checklist. Earlier receipts retain
 their historical build scope. Completed upload/export/recovery is not reset by

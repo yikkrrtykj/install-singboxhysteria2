@@ -25,15 +25,19 @@ production rollout or P6C/P6D authorization. Preserve each receipt scope.
       This is partial evidence, not formal whole-resource PASS or an exceeded target.
 - [x] Local observer repair prepared and short native tests passed: one bounded
       retry only for CIM provider exceptions, recorded failures/retries, persistent
-      failures and foreign/missing identity still refuse. No operator run started.
+      failures and foreign/missing identity still refuse. Actual short operator capture
+      completed: 182.48s, 62 valid points, zero failures/retries, stable exact PID/release,
+      sampled private maximum9.02MiB, local acknowledgements929→932. This validates
+      the observer; it does not manufacture a full-resource/network/latency PASS.
 - [x] MIT confirmed and added. SignPath application cancelled before submission;
       public certificate approval is not a company-internal release prerequisite.
 
 ## 1. Complete only missing field evidence
 
-- [ ] Resolve the resource-record completeness gap. Preserve all old reports;
-      first validate the observer repair in a short check, then assess whether
-      another full capture is necessary. Do not automatically restart 30min tests.
+- [x] Short field validation closes the observer repair gap:62 valid/0 failures.
+      Preserve the earlier30min119-point/two-failure report unchanged. Remaining
+      full-resource adequacy requires reviewer assessment; do not automatically
+      restart30min measurements.
 - [ ] Close one-profile CPU <=2% total-machine average over30min and private
       working set <=128MiB acceptance with adequate evidence/reviewer assessment.
       The observer's 121-point/zero-failure rules are not new product requirements.
@@ -45,7 +49,13 @@ production rollout or P6C/P6D authorization. Preserve each receipt scope.
       restart records do not prove a Windows reboot; never change Clash/TUN automatically.
 - [ ] Multiple-profile/server isolation and retirement/revoke/remove/purge/uninstall
       using dedicated test identities; preserve the active Device and its queue.
-- [ ] Readonly inventory of historical test instances before any authorized cleanup.
+- [x] Readonly administrator inventory identified four old Running/Auto fixtures
+      and the exact current service. Current profile/queue preserved.
+- [ ] Verify authorized old-fixture stop/disable and fixed trust installation.
+      Operator reports completion, but readonly registry still shows old Start=2,
+      both pinned trust entries absent and no matching operation receipt.
+      The repaired encoded launcher saves an initial/final receipt and refuses
+      success without native state readback; no automatic reinstallation.
 
 Use one consolidated runbook and a stable repaired version. Reuse upload,
 download and recovery receipts; retest only evidence affected by a real change.
@@ -54,10 +64,15 @@ Missing second environments remain explicit gaps, never fabricated PASS.
 ## 2. Company-internal release, once
 
 - [x] Fixed internal identity creation/reuse and independently pinned trust tools
-      implemented; native local tests pass8, machine-trust test awaits administrator CI.
-- [ ] Actual administrator-held identity and independently trusted initial
-      provisioning, followed by same-identity signed setup/catalog updates.
-- [ ] Retain native exact-publisher/signature/catalog/hash/timestamp gates,
+      implemented; actual Windows administrator CI passes9/9, including two files
+      signed by the same identity, trust reuse and exact removal. Fixture signatures
+      do not attest a timestamped company release.
+- [x] Actual fixed company publisher created on the build host; nonexportable
+      private key retained locally, public certificate only in staging. Never send
+      the private key to VPS/client. Initial machine trust remains unverified.
+- [ ] Independently trusted initial provisioning followed by an actual same-identity
+      signed/timestamped setup/catalog update and controlled-device verification.
+- [x] Retain native exact-publisher/signature/catalog/hash/timestamp gates,
       controlled expiry/revocation and recovery/rollover. No unsigned fallback,
       silent self-trust or globally disabled protection. Private signing keys
       never go to the VPS or client; VPS TLS trust stays profile-local and separate.
