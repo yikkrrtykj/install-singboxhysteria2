@@ -20,6 +20,9 @@ jobs:
       - name: Actual native SCM service start pause continue stop
         if: runner.os == 'Windows'
         run: python tests/remote-production/test_service_scm.py
+      - name: Native internal publisher identity trust reuse and exact removal
+        if: runner.os == 'Windows'
+        run: python tests/remote-production/test_internal_publisher.py --require-admin
   provisioning:
     strategy:
       fail-fast: false

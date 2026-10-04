@@ -1,8 +1,9 @@
 # PR #70 closeout checklist
 
 Issue #67 section 22 and its current company-only distribution amendment are
-authoritative. PR70 stays Draft. No merge, production rollout or P6C/P6D is
-authorized. Preserve the version and scope of each existing receipt.
+authoritative. The human has authorized merging after remaining conditions are
+resolved and the final version is reviewed. PR70 stays Draft until then; no
+production rollout or P6C/P6D authorization. Preserve each receipt scope.
 
 ## Completed — retain these results
 
@@ -52,7 +53,9 @@ Missing second environments remain explicit gaps, never fabricated PASS.
 
 ## 2. Company-internal release, once
 
-- [ ] Administrator-held durable signing identity and independently trusted initial
+- [x] Fixed internal identity creation/reuse and independently pinned trust tools
+      implemented; native local tests pass8, machine-trust test awaits administrator CI.
+- [ ] Actual administrator-held identity and independently trusted initial
       provisioning, followed by same-identity signed setup/catalog updates.
 - [ ] Retain native exact-publisher/signature/catalog/hash/timestamp gates,
       controlled expiry/revocation and recovery/rollover. No unsigned fallback,
@@ -65,7 +68,8 @@ Missing second environments remain explicit gaps, never fabricated PASS.
 
 - [ ] Final head/base/merge-base, full changed files, synthetic-merge parents,
       actual CI run/job/test counts, protected-path zero diff and residual issues.
-- [ ] Final human independent review and explicit merge authorization.
+- [x] Human conditional merge authorization after remaining acceptance/final review.
+- [ ] Final human independent review and satisfaction of remaining conditions.
 - [ ] After an authorized merge: merge-commit CI, then separately authorized rollout.
 - [ ] P6C/P6D only after P6B2 completion and explicit authorization.
 

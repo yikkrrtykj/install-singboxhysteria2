@@ -3,7 +3,7 @@
 [CmdletBinding()]
 param([Parameter(Mandatory=$true)][string]$Package,
       [Parameter(Mandatory=$true)][ValidatePattern('^[A-Fa-f0-9]{40}$')][string]$CertificateThumbprint,
-      [Parameter(Mandatory=$true)][ValidatePattern('^https://')][string]$TimestampServer)
+      [Parameter(Mandatory=$true)][ValidatePattern('^https?://')][string]$TimestampServer)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Continue'
 $PSModuleAutoloadingPreference = 'None'
@@ -12,6 +12,8 @@ try {
         Import-Module -Name ([IO.Path]::Combine($PSHOME,'Modules',$module,($module + '.psd1'))) -ErrorAction Stop
     }
     $PSModuleAutoloadingPreference = 'None'
+    $uri = [Uri]$TimestampServer
+    if (-not $uri.IsAbsoluteUri -or $uri.Scheme -notin @('http','https') -or -not $uri.Host -or $uri.UserInfo -or $uri.Fragment) { throw 'invalid timestamp endpoint' }
     $certificate = Get-Item -LiteralPath ('Cert:\CurrentUser\My\' + $CertificateThumbprint) -ErrorAction Stop
     if (-not $certificate.HasPrivateKey -or $certificate.NotAfter -le [DateTime]::Now) { throw 'signing unavailable' }
     $catalogPath = Join-Path $Package 'payload.cat'
