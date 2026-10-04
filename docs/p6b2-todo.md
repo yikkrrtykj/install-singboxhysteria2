@@ -67,8 +67,25 @@ production rollout or P6C/P6D authorization. Preserve each receipt scope.
       resource comparisons. Process IO bytes are not measured network bytes.
 - [ ] Matched baseline/Agent-active Clash comparison: added p95 <=5ms;
       displayed active node-test delays are not that comparison.
-- [ ] User-controlled TUN routing scenario. Real OS reboot/autostart is complete
-      as recorded above; never change Clash/TUN automatically.
+- [x] User-enabled TUN runtime scenario: authenticated controller readback true
+      before/after120s; both exact service PIDs unchanged/Running/Enabled,
+      acknowledgements158->160 and1267->1269; pending/retry/write failures0.
+      Reality/HY2 each38/38 actual diagnostics successful. No service/config/TUN
+      changes by this readback. This is runtime evidence, not packet-route tracing.
+      Real OS reboot/autostart is complete; never change Clash/TUN automatically.
+- [x] Actual short zero/one/two-client comparison collected, originals retained.
+      Single client CPU0.0395% total-machine, sampled private maximum15.29MiB;
+      two separate service processes CPU0.0874%, combined30.11MiB. Observed
+      process TCP/UDP send/receive14459/39568 and27971/71541 bytes; ETW loss
+      not attested. Two processes each one profile is not one-process multiprofile.
+      This120s/group evidence does not replace the retained30min capture.
+- [ ] Resolve added-delay target/attribution: nearest-rank Reality p95 baseline
+      340ms, single373ms, two389ms (+33/+49); HY2 156/163/144 (+7/-12).
+      Observed <=5ms target not met; single Reality also one unavailable result.
+      Baseline Reality59-572ms/median69; single median66. Sequential short
+      phases, Internet tails, diagnostic cache updates and cold starts confound
+      attribution. Neither causal regression nor non-regression is established.
+      Do not manufacture PASS or silently relax the frozen target.
 - [ ] Assess remaining real-device multiple-profile/server and retirement/revoke
       coverage against the frozen contract. Native isolation/reinstall/update/
       rollback/remove/purge/uninstall CI above is already complete; do not reset
@@ -125,7 +142,7 @@ Missing second environments remain explicit gaps, never fabricated PASS.
 
 ## 3. Final review and release decision
 
-- [x] d220190 review packet records head/base/merge-base, all92 changed files,
+- [x] d220190 and3c5bee4 review packets record head/base/merge-base, all92 changed files,
       synthetic-merge parents,15/15 actual CI jobs and13 protected zero-diff paths;
       both protected functions are unchanged. This is an evidence packet, not
       final independent review. Later heads require their own CI/status receipt.

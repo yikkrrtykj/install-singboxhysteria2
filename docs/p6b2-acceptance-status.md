@@ -44,7 +44,7 @@ CPU endpoint estimate0.041% of total machine capacity. Recorded snapshots do not
 show the former growing private memory, but cannot attest unseen continuous peaks.
 The closed verifier keeps invalid_or_incomplete_resource_report and whole-resource
 PASS=false. False acceptance flags from invalid input are not measured target
-exceedances. Network/matched latency remain unmeasured.
+exceedances. Short network/latency results below are now recorded; full adequacy remains open.
 
 Local observer-only repair now records CIM-provider failures and permits at most
 one retry after250ms. Short native tests verify recovered/persistent failure,
@@ -88,8 +88,9 @@ Production VPS is not deployed.
    The short observer check passed; assess prior30min adequacy before deciding
    on any repeated full capture.
    Real OS reboot/autostart is complete using native process creation time.
-   User-controlled TUN and any missing real-device multi-server/retirement coverage
-   remain pending; preserve native CI evidence and the active Device. Four old
+   User-enabled TUN runtime verification is complete as recorded below; any
+   missing real-device multi-server/retirement coverage still needs assessment.
+   Preserve native CI evidence and the active Device. Four old
    fixtures were already disabled with data retained. Do not repeat their cleanup
    or alter Clash automatically.
 2. Company identity/trust/timestamped release/export/test-server publication and
@@ -107,3 +108,35 @@ Use [p6b2-todo.md](p6b2-todo.md) as the current checklist. Earlier receipts reta
 their historical build scope. Completed upload/export/recovery is not reset by
 local observer repairs, licensing or checklist updates. A historical generic LAB
 launcher diagnostic does not undo independently verified subsequent exports.
+
+## Actual short performance and user-enabled TUN readback
+
+Three sequential120s phases used the same host/nodes, TUN off: no clients,
+one normal company client, then two separate service processes with one profile
+each. Both initial Running states were restored and acknowledgements continued;
+original Device secrets/spools retained. Not one-process multiprofile evidence.
+
+| Scenario | Average CPU, total machine | Sampled private maximum | Observed send/receive bytes | Reality p95 | HY2 p95 |
+| --- | --- | --- | --- | --- | --- |
+| Baseline | 0% | 0MiB | 0/0 | 340ms | 156ms |
+| One company client | 0.0395% | 15.29MiB | 14459/39568 | 373ms | 163ms |
+| Two separate clients | 0.0874% | 30.11MiB | 27971/71541 | 389ms | 144ms |
+
+Nearest-rank percentiles use38-40 successful positive delays per role; failure
+outcomes retained separately, including one single-client Reality unavailable.
+Added p95 point estimates +33/+49ms Reality and +7/-12ms HY2 do not satisfy the
+frozen <=5ms target. Baseline Reality already ranges59-572ms, median69ms;
+single-client median66ms. Short sequential phases, Internet jitter, observer
+active diagnostics/cache updates and service cold starts confound attribution.
+Do not conclude Agent-caused regression, non-regression or whole-resource PASS.
+Observed network bytes exclude delegated DNS/proxy-core/wire framing; ETW
+zero-loss is not attested. This does not replace the retained30min record.
+Raw result SHA256: ffac49f7b20feb9e64c8563387cc61fa3d28885c374361ab27a6dfd068a0d8c3.
+
+The user then enabled TUN, reporting working network. Authenticated controller
+readback was true before/after120s; both existing service PIDs unchanged and
+Running/Enabled. Local upload acknowledgements158->160 and1267->1269, pending/
+retry/state-save failures0; Reality/HY2 each38/38 successful actual diagnostics.
+No service, settings, trust, firewall or TUN mutations by this readback. Runtime
+TUN evidence does not assert packet-level route attribution or whole P6B2 PASS.
+No repeat install/reboot/TUN smoke is needed for this documentation change.
