@@ -188,3 +188,46 @@ profile/queue bytes, stopped-state preservation and pending recovery refusal;
 native suite now has26 tests. Source change is not an installed-device update.
 This feature does not close the remaining matched latency/workload evidence or
 final review conditions, and does not repeat accepted30min CPU/memory checks.
+
+## Consolidated field check — 2026-10-06
+
+The first consolidated acceptance helper stopped during A1, before active
+comparison or idle/offline/recovery/multiple-profile phases. The retained
+receipt records 36.27 seconds overall, one successful observation per protocol,
+capture_complete=false and whole_p6b2_pass=false. It is incomplete evidence,
+not a product-performance failure or acceptance PASS.
+
+Restoration and cleanup readback completed: both exact original services are
+Stopped/Manual, both original enrollment hashes and enabled flags match, queue
+counters are unchanged, and authenticated controller settings match the initial
+snapshot. Do not restore historical Auto/Running preferences.
+
+The old helper suppressed the exception class/code, so its precise exception
+cannot be recovered from that receipt. A real Windows temporary-file test
+reproduced a failure path in its report persistence: CPython os.replace refuses
+an open destination while the GUI reads it, including with delete sharing.
+The helper now uses ReplaceFileW, a snapshot reader with read/write/delete
+sharing, and two bounded retries only for sharing violations. Other permission
+failures remain fatal. Future failures retain phase/class/Windows error code,
+without raw exception messages, credentials or sample bodies.
+
+Actual local verification: old locked replacement refused; new delete-sharing
+snapshot replacement passed; 200 overlapping atomic writes and 12,867 valid
+snapshot reads completed without errors. Ten protocol/restore/analysis tests
+pass. Native PS5 parser, ETW layout/foreign-session guard, actual WinForms
+recording-backend events and the actual report-reader fixture pass. These tests
+do not control installed services, networking, trust or profiles.
+
+A separate repaired helper was signed and timestamped with the existing fixed
+company publisher; native payload catalog validation passed. Original package
+and receipt remain preserved. No Agent bytes, installed program, identity,
+startup choice, Clash/TUN, signing trust or VPS deployment changed.
+
+The repaired helper is prepared, not a completed field run. Remaining field
+gates stay open: matched added-Clash-diagnostic p95 <=5ms and the missing short
+idle/offline/recovery/same-process multiple-profile resource coverage. Reuse
+the previously reviewed 30-minute CPU/private-working-set evidence; do not
+restart it. PR remains Draft pending those gates and final review. Source/CI
+review packet for head7398693 records 15/15 successful jobs, thirteen protected
+zero-diff paths and both unchanged protected functions; this packet alone is
+not final review or merge approval.
