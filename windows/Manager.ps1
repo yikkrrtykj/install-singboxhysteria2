@@ -147,11 +147,18 @@ function Update-P6Selection {
 function Refresh-P6Status {
     if ($script:p6Busy) {return}
     $script:p6Busy=$true
+    $script:p6Autostart.Enabled=$false
     try {
         $result = Invoke-P6Backend 'ui-status' '' '' $false $null
         if (-not $result.ok) {throw 'snapshot unavailable'}
         $status = $result.value
         $script:p6Pending=[bool]$status.pending_recovery
+        $knownStartup=$status.installed -and -not $script:p6Pending -and $status.autostart -is [bool]
+        $script:p6Autostart.Checked=$knownStartup -and $status.autostart
+        $script:p6Autostart.Enabled=$knownStartup
+        $script:p6StartupNote.Text=if ($knownStartup) {
+            $(if ($status.autostart) {'已开启'} else {'已关闭'})+'；下次开机生效，当前运行状态不变'
+        } else {'安装完成并读取状态后可设置'}
         $selected = if ($script:p6Profiles.SelectedIndex -ge 0 -and $script:p6Profiles.SelectedIndex -lt $script:p6Entries.Count) {$script:p6Entries[$script:p6Profiles.SelectedIndex].id} else {''}
         $script:p6Entries=@()
         $script:p6Profiles.Items.Clear()
@@ -182,6 +189,8 @@ function Refresh-P6Status {
     } catch {
         $script:p6Heading.Text='暂时无法读取状态，请稍后刷新。现有服务和队列未被刷新操作修改。'
         $script:p6Pending=$true
+        $script:p6Autostart.Enabled=$false
+        $script:p6StartupNote.Text='暂时无法读取开机设置，请刷新后再试'
         foreach ($action in @('import','uninstall','pause','resume','remove','purge')) {$script:p6Buttons[$action].Enabled=$false}
     } finally {$script:p6Busy=$false; Update-P6Selection}
 }
@@ -249,6 +258,7 @@ function Run-P6Action([string]$Action) {
     if ($description -and [Windows.Forms.MessageBox]::Show(($description + $(if ($targetLabel) {"`r`n目标设备："+$targetLabel} else {''})),'客户端管理','OKCancel','Warning') -ne 'OK') {return}
     $script:p6Busy=$true
     foreach ($button in $script:p6Buttons.Values) {$button.Enabled=$false}
+    $script:p6Autostart.Enabled=$false
     $script:p6Notice.Text='正在执行，请等待安全完成；不会强制结束服务进程。'
     try {
         $result=Invoke-P6Backend $Action $profile $bundle $auto $credential
@@ -261,6 +271,8 @@ function Run-P6Action([string]$Action) {
         }
         if (-not $result.ok -and $result.kind -eq 'cleanup') {
             [void][Windows.Forms.MessageBox]::Show('凭据暂存未能清理，操作结果需要回读。请保留安装包并联系管理员；暂存文件仍受本机管理员权限保护。','客户端管理','OK','Warning')
+        } elseif (-not $result.ok -and $Action -in @('autostart-on','autostart-off')) {
+            [void][Windows.Forms.MessageBox]::Show('开机设置未能确认。请刷新查看实际设置；若仍无法读取，请联系管理员。','客户端管理','OK','Error')
         } elseif (-not $result.ok) {
             [void][Windows.Forms.MessageBox]::Show('操作未完成。请核对设备配置版本、本机 Clash API、显式节点和访问密钥，再重试。已保留可恢复的安装状态；请勿重复创建身份。','客户端管理','OK','Error')
         } else {$script:p6Notice.Text='操作已完成。上传和队列状态可在下面查看。'}
@@ -290,6 +302,19 @@ function New-P6ManagerForm {
     $script:p6Heading=New-Object Windows.Forms.Label
     $script:p6Heading.SetBounds(20,15,980,45)
     $script:p6Heading.Text='读取状态中…'
+    $script:p6Autostart=New-Object Windows.Forms.CheckBox
+    $script:p6Autostart.Text='开机自动运行'
+    $script:p6Autostart.AutoCheck=$false
+    $script:p6Autostart.Enabled=$false
+    $script:p6Autostart.SetBounds(20,48,145,24)
+    $script:p6Autostart.Add_Click({
+        if ($script:p6Busy -or $script:p6Pending -or -not $script:p6Autostart.Enabled) {return}
+        Run-P6Action $(if ($script:p6Autostart.Checked) {'autostart-off'} else {'autostart-on'})
+    })
+    $script:p6StartupNote=New-Object Windows.Forms.Label
+    $script:p6StartupNote.Text='读取开机设置中…'
+    $script:p6StartupNote.SetBounds(170,48,830,24)
+    $script:p6Heading.Height=30
     $label=New-Object Windows.Forms.Label
     $label.Text='设备配置（包含密钥，请妥善保管）：'
     $label.SetBounds(20,70,400,25)
@@ -333,7 +358,7 @@ function New-P6ManagerForm {
     [void]$script:p6Grid.Columns.Add('detail','说明')
     $script:p6Notice=New-Object Windows.Forms.Label
     $script:p6Notice.SetBounds(20,720,980,45)
-    $script:p6Form.Controls.AddRange(@($script:p6Heading,$label,$script:p6Bundle,$pick,$script:p6Automatic,$script:p6Profiles,$script:p6Details,$technical,$script:p6Grid,$script:p6Notice))
+    $script:p6Form.Controls.AddRange(@($script:p6Heading,$script:p6Autostart,$script:p6StartupNote,$label,$script:p6Bundle,$pick,$script:p6Automatic,$script:p6Profiles,$script:p6Details,$technical,$script:p6Grid,$script:p6Notice))
     $actions=@(@('install','安装 / 更新'),@('import','导入设备配置'),@('refresh','刷新状态'),@('rollback','回滚'),@('pause','暂停'),@('resume','恢复'),@('remove','移除设备'),@('purge','永久清除'),@('uninstall','卸载服务'))
     for ($i=0; $i -lt $actions.Count; $i++) {
         $button=New-Object Windows.Forms.Button

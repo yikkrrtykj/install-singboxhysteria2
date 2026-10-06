@@ -357,6 +357,30 @@ class Manager:
         finally:
             lock.release()
 
+    def set_autostart(self, enabled):
+        if type(enabled) is not bool:
+            raise ConfigError('invalid startup preference')
+        if not self.root.exists():
+            raise ConfigError('installed client required')
+        lock = self._lock()
+        try:
+            # Startup preferences must not implicitly recover an interrupted
+            # upgrade, or restart a currently stopped client.
+            if any(os.path.lexists(self.root / name) for name in ('upgrade.json', 'uninstall.json')):
+                raise ConfigError('explicit recovery required')
+            active = self._active()
+            if active is None:
+                raise ConfigError('installed client required')
+            self._check_release(active)
+            command = self._command(active)
+            self.service.set_autostart(command, enabled)
+            mode = self.service.start_mode(command)
+            if mode != (2 if enabled else 3):
+                raise ConfigError('startup preference readback failed')
+            return {'autostart': enabled, 'service_state': self.service.state(command)}
+        finally:
+            lock.release()
+
     def operate(self, operation, profile=None, bundle=None, controller_secret=''):
         lock = self._lock()
         try:
@@ -470,7 +494,7 @@ class Manager:
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description='P6 Windows lifecycle installer')
-    parser.add_argument('operation', choices=('install', 'rollback', 'import', 'status', 'ui-status', 'adjacent-bundle', 'pause', 'resume', 'remove', 'purge', 'uninstall'))
+    parser.add_argument('operation', choices=('install', 'rollback', 'import', 'status', 'ui-status', 'adjacent-bundle', 'autostart-on', 'autostart-off', 'pause', 'resume', 'remove', 'purge', 'uninstall'))
     parser.add_argument('--package', required=True)
     parser.add_argument('--bundle')
     parser.add_argument('--profile')
@@ -508,6 +532,10 @@ def main(argv=None):
                 raise ConfigError('invalid snapshot selector')
             from .status import snapshot
             result = snapshot(manager)
+        elif args.operation in ('autostart-on', 'autostart-off'):
+            if args.bundle or args.profile or args.controller_key_file or args.discover_controller:
+                raise ConfigError('invalid startup selector')
+            result = manager.set_autostart(args.operation == 'autostart-on')
         elif args.operation == 'install':
             result = manager.install(args.package)
             if args.bundle:

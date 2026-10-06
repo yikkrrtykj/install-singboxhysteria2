@@ -141,6 +141,32 @@ class Service:
         finally:
             self._close(manager, service)
 
+    def start_mode(self, expected):
+        manager, service = self._open()
+        try:
+            return self._config(service, expected) if service else None
+        finally:
+            self._close(manager, service)
+
+    def set_autostart(self, expected, enabled):
+        if type(enabled) is not bool:
+            raise ConfigError('invalid startup preference')
+        manager, service = self._open()
+        try:
+            self._check(service)
+            current = self._config(service, expected)
+            desired = 2 if enabled else 3
+            if current != desired:
+                # SERVICE_NO_CHANGE + NULL preserve image/account/dependencies,
+                # error policy and display name. Never start or stop the service.
+                self._check(self.a.ChangeServiceConfigW(service, 0xffffffff,
+                    desired, 0xffffffff, None, None, None, None, None, None, None))
+            if self._config(service, expected) != desired:
+                raise ConfigError('startup preference readback failed')
+            return enabled
+        finally:
+            self._close(manager, service)
+
     def stop(self, expected):
         manager, service = self._open()
         process = None

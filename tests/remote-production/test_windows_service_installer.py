@@ -334,6 +334,48 @@ foreach($store in @('Root','My')) {
             # Restore the scoped fixture even if old code fails at Manual.
             start_mode(2)
 
+    def test_native_autostart_switch_preserves_pid_data_and_stopped_state(self):
+        from p6installer.scm import ProcessStatus
+        self.install()
+        _, path, _ = self.profile()
+        key = self.manager.operate('import', bundle=path, controller_secret='local-secret')['profile']
+        self.manager.operate('pause', profile=key)
+        spool = Path(self.manager.vault._path(key)) / 'spool'
+        self.manager.vault._write(str(spool), 'pending-fixture', b'pending bytes')
+        profile_root = Path(self.manager.vault._path(key))
+        def files():
+            return {p.relative_to(profile_root).as_posix(): p.read_bytes()
+                    for p in profile_root.rglob('*') if p.is_file()}
+        def process():
+            scm, handle = self.service._open()
+            try:
+                info = ProcessStatus()
+                size = ctypes.wintypes.DWORD()
+                self.service._check(self.service.a.QueryServiceStatusEx(handle, 0,
+                    ctypes.byref(info), ctypes.sizeof(info), ctypes.byref(size)))
+                return info.state, info.pid
+            finally:
+                self.service._close(scm, handle)
+        before, running = files(), process()
+        command = self.manager._command(self.meta['release'])
+        for enabled in (False, False, True):
+            result = self.manager.set_autostart(enabled)
+            self.assertIs(result['autostart'], enabled)
+            self.assertEqual(self.service.start_mode(command), 2 if enabled else 3)
+            self.assertEqual(process(), running)
+            self.assertEqual(files(), before)
+        self.service.stop(command)
+        for enabled in (False, True):
+            self.assertEqual(self.manager.set_autostart(enabled)['service_state'], 1)
+            self.assertEqual(process(), (1, 0))
+            self.assertEqual(files(), before)
+        self.manager._write(self.directory / 'upgrade.json', {'v': 1, 'old': self.meta['release'], 'new': self.meta['release']})
+        with self.assertRaises(ConfigError):
+            self.manager.set_autostart(False)
+        self.assertTrue((self.directory / 'upgrade.json').exists())
+        self.assertEqual(self.service.start_mode(command), 2)
+        self.assertEqual(process(), (1, 0))
+
     def test_native_import_pause_resume_reinstall_preserve_secret_spool(self):
         self.install()
         fixture, path, server = self.profile()
@@ -579,21 +621,41 @@ foreach($store in @('Root','My')) {
         source.write_text(gui + r'''
 
 $ErrorActionPreference='Stop'
+Set-StrictMode -Version Latest
 $form=New-P6ManagerForm
 $script:seen=@()
+$script:startup=$true
 function Invoke-P6Backend($Action,$SelectedProfile,$SelectedBundle,$Auto,$Credential) {
     $script:seen+=@{action=$Action;profile=$SelectedProfile;bundle=$SelectedBundle;auto=$Auto;hasCredential=($null -ne $Credential)}
     if($Action -eq 'ui-status') {
-        return @{ok=$true;value=@{v=1;installed=$true;pending_recovery=$false;service_state=4;
+        return @{ok=$true;value=@{v=1;installed=$true;pending_recovery=$false;service_state=4;autostart=$script:startup;
           profiles=@(@{id=('a'*64);probe_id='fixture-probe';server_id=('b'*32);enabled=$true;spool=$null;sample=$null;display=@{client='event-pc';device='laptop-01';location='office';network_path='wifi'}});retired=@()}}
     }
+    if($Action -eq 'autostart-off') {$script:startup=$false}
+    if($Action -eq 'autostart-on') {$script:startup=$true}
     return @{ok=$true;value=@{}}
 }
 try {
   Refresh-P6Status
-  if($script:p6Profiles.Items.Count -ne 1 -or $script:p6Grid.Columns.Count -ne 3 -or $form.Controls.Count -ne 19){throw 'form shape'}
+  if($script:p6Profiles.Items.Count -ne 1 -or $script:p6Grid.Columns.Count -ne 3 -or $form.Controls.Count -ne 21){throw 'form shape'}
   if($form.Text -ne '客户端管理' -or @($form.Controls | Where-Object {$_.Text -eq '技术详情'}).Count -ne 1){throw 'primary title or technical details'}
   if($script:p6Details.Text -notmatch '客户端：event-pc / 设备：laptop-01' -or $script:p6Details.Text -match 'fixture-probe'){throw 'primary device labels'}
+  if(-not $script:p6Autostart.Checked -or -not $script:p6Autostart.Enabled){throw 'startup readback'}
+  $script:p6Autostart.Checked=$false
+  Refresh-P6Status
+  if(@($script:seen | Where-Object {$_.action -like 'autostart-*'}).Count -ne 0){throw 'refresh mutated startup'}
+  $script:p6Autostart.GetType().GetMethod('OnClick',[Reflection.BindingFlags]'Instance,NonPublic').Invoke($script:p6Autostart,@([EventArgs]::Empty))
+  if($script:p6Autostart.Checked -or $script:p6StartupNote.Text -notmatch '已关闭'){throw 'startup off'}
+  $script:p6Autostart.GetType().GetMethod('OnClick',[Reflection.BindingFlags]'Instance,NonPublic').Invoke($script:p6Autostart,@([EventArgs]::Empty))
+  if(-not $script:p6Autostart.Checked -or $script:p6StartupNote.Text -notmatch '已开启'){throw 'startup on'}
+  $script:p6Busy=$true
+  $script:p6Autostart.GetType().GetMethod('OnClick',[Reflection.BindingFlags]'Instance,NonPublic').Invoke($script:p6Autostart,@([EventArgs]::Empty))
+  $script:p6Busy=$false
+  $script:p6Pending=$true
+  $script:p6Autostart.GetType().GetMethod('OnClick',[Reflection.BindingFlags]'Instance,NonPublic').Invoke($script:p6Autostart,@([EventArgs]::Empty))
+  $script:p6Pending=$false
+  $startupCalls=@($script:seen | Where-Object {$_.action -like 'autostart-*'})
+  if($startupCalls.Count -ne 2 -or @($startupCalls | Where-Object {$_.profile -or $_.bundle -or $_.auto -or $_.hasCredential}).Count){throw 'startup containment'}
   $script:p6Bundle.Text='C:\fixture-only\client.zip'
   Run-P6Action 'import'
   Run-P6Action 'pause'
@@ -780,6 +842,6 @@ try {
 
 if __name__ == '__main__':
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(NativeInstallerTests)
-    assert suite.countTestCases() == 25
+    assert suite.countTestCases() == 26
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     raise SystemExit(0 if result.wasSuccessful() else 1)

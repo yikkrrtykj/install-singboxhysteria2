@@ -95,7 +95,7 @@ class SnapshotTests(FixtureBase):
         self.read_names = []
         self.manager = types.SimpleNamespace(root=self.root, security=self.policy, vault=self.vault,
             _active=lambda: 'a' * 64, _check_release=lambda _: None, _command=lambda _: 'fixture-only',
-            service=types.SimpleNamespace(state=lambda _: 4))
+            service=types.SimpleNamespace(state=lambda _: 4, start_mode=lambda _: 2))
 
     def reader(self, path, limit, tail=False):
         self.read_names.append(Path(path).name)
@@ -109,6 +109,16 @@ class SnapshotTests(FixtureBase):
         sample = _sample(seq, probe='device-one', epoch=1000)
         return {'probe_id': sample['probe_id'], 'run': sample['run'], 'seq': seq,
                 'body_b64': base64.b64encode(canonical(sample)).decode()}
+
+    def test_startup_observation_is_actual_and_mutation_free(self):
+        before = self.tree()
+        for mode, expected in ((2, True), (3, False), (None, None)):
+            self.manager.service.start_mode = lambda _, mode=mode: mode
+            self.assertIs(snapshot(self.manager, self.reader)['autostart'], expected)
+            self.assertEqual(self.tree(), before)
+        self.manager.service.start_mode = lambda _: 4
+        with self.assertRaises(ConfigError):
+            snapshot(self.manager, self.reader)
 
     def test_status_never_recovers_mutates_or_reads_credentials(self):
         before = self.tree()

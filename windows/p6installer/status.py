@@ -129,6 +129,10 @@ def snapshot(manager, reader=None):
     if active is not None:
         manager._check_release(active)
         result.update(release=active, service_state=manager.service.state(manager._command(active)))
+        mode = manager.service.start_mode(manager._command(active))
+        if mode not in (None, 2, 3):
+            raise ConfigError('local startup observation invalid')
+        result['autostart'] = None if mode is None else mode == 2
         keys = manager.vault.keys()
         if len(keys) + len(retired) > 8:
             raise ConfigError('local observation invalid')

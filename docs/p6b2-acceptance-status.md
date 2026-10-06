@@ -160,3 +160,20 @@ retry/state-save failures0; Reality/HY2 each38/38 successful actual diagnostics.
 No service, settings, trust, firewall or TUN mutations by this readback. Runtime
 TUN evidence does not assert packet-level route attribution or whole P6B2 PASS.
 No repeat install/reboot/TUN smoke is needed for this documentation change.
+
+## Simple startup preference control
+
+The client manager now contains a single “开机自动运行” checkbox with actual
+Auto/Manual readback. Changing it affects the monitoring service's next boot,
+leaves its current Running/Stopped state intact, and never changes Clash/TUN.
+Refresh is readonly; unavailable or pending-recovery state disables the control
+instead of displaying a false successful setting. Upgrade/rollback preserve
+the preference. Startup actions accept no profile, Bundle or credential inputs.
+
+Local configuration/startup policy8/8, GUI observation29/29 and the actual
+WinForms recording-backend click/refresh/busy/pending checks pass. Isolated
+Windows CI additionally verifies native same-PID service control, unchanged
+profile/queue bytes, stopped-state preservation and pending recovery refusal;
+native suite now has26 tests. Source change is not an installed-device update.
+This feature does not close the remaining matched latency/workload evidence or
+final review conditions, and does not repeat accepted30min CPU/memory checks.
