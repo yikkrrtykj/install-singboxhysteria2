@@ -5,6 +5,17 @@ authoritative. The human has authorized merging after remaining conditions are
 resolved and the final version is reviewed. PR70 stays Draft until then; no
 production rollout or P6C/P6D authorization. Preserve each receipt scope.
 
+## Current administrator preference and remaining fix
+
+The human requested Manual start for the two controlled monitoring services.
+Historical Auto/reboot evidence below remains valid; it is not the current
+preference. Do not restore Auto or start services for a documentation review.
+SCM checks now accept only Auto or Manual with the same exact image/account/ACL
+checks, and reconfiguration preserves the existing start mode. New installations
+still default to Auto. This is source work, not a changed installed client.
+Local configuration-policy4/4 and portable installer13/13 pass; native Windows
+reinstall/upgrade/rollback preservation is a mandatory current-head CI gate.
+
 ## Completed — retain these results
 
 - [x] Foundation, provisioning/revocation, ingress, Bundle and installer slice reviews.
@@ -60,9 +71,14 @@ production rollout or P6C/P6D authorization. Preserve each receipt scope.
       Preserve the earlier30min119-point/two-failure report unchanged. Remaining
       full-resource adequacy requires reviewer assessment; do not automatically
       restart30min measurements.
-- [ ] Close one-profile CPU <=2% total-machine average over30min and private
-      working set <=128MiB acceptance with adequate evidence/reviewer assessment.
-      The observer's 121-point/zero-failure rules are not new product requirements.
+- [x] Retained resource evidence reviewed: the recorded single-profile30min
+      cumulative CPU average0.04118% is below2%; sampled private maximum12.54MiB
+      is below128MiB. Stable process identity at119 valid points; two observer
+      failures/max gap30.166s disclosed, no invented observations. Reuse these
+      scoped measurements; do not rerun the whole window solely for query gaps.
+      The original strict verifier refusal stays unchanged; workload/network/
+      matched-latency coverage and whole resource acceptance remain incomplete.
+      The observer's121-point/zero-failure rules are not new product requirements.
 - [ ] Missing idle/active/offline-backlog network/queue and one/multiple-profile
       resource comparisons. Process IO bytes are not measured network bytes.
 - [ ] Matched baseline/Agent-active Clash comparison: added p95 <=5ms;

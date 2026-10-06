@@ -1,6 +1,6 @@
 # P6B2 closeout status
 
-Updated 2026-10-04. Issue #67 section22 and current amendments are authoritative.
+Updated 2026-10-06. Issue #67 section22 and current amendments are authoritative.
 The human has authorized merge after remaining conditions and final review.
 PR70 remains Draft/unmerged; whole completion/final review/production/P6C/P6D
 remain pending. This conditional authorization supersedes historical MERGE=NO,
@@ -9,6 +9,26 @@ Base/merge-base: be7fbc047827a563b52c8e82c1d310446cdd72c1.
 Current field runtime source: a07bc85e22e0855ea226d6ce32ef6af88f168f0d.
 Later license/route/checklist and administrator signing-tool commits do not
 change the field Agent payload; they are not new field runtime builds.
+
+## Current scoped follow-up
+
+The administrator chose Manual service start. The previous native SCM ownership
+check required Auto and rejected this legitimate preference. The source now
+accepts only Auto/Manual while retaining exact command, LocalSystem, service
+kind, dependencies/group and ACL validation; existing start mode is preserved
+on reconfiguration, including upgrade and rollback. Default fresh installation
+remains Auto. No installed service, signing trust or Clash/TUN was changed.
+Local policy4/4 and portable installer13/13 pass. The added native fixture
+exercises Manual stop/start, reinstall, upgrade/rollback and Disabled refusal;
+its current-head CI result is required before claiming native completion.
+
+The retained resource evidence review accepted the recorded single-profile
+30minute cumulative CPU average and private-working-set sampling below their
+targets, with query gaps and the original strict verifier refusal preserved.
+This does not close missing workload/network/multiple-profile coverage or the
+unproven added diagnostic p95<=5ms target; whole resource acceptance is NO.
+Agent measurement code is unchanged by this installer SCM fix. Previous
+field records retain their scope; a source fix is not an installed update.
 
 ## Completed checkpoints
 

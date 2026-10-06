@@ -28,7 +28,7 @@ from test_windows_installer import InstallerTests, controller
 from test_bundle import BundleTests
 from p6installer.bundle import read_bundle
 from p6installer.manager import Manager, validate_release, verify_signatures
-from p6installer.scm import Service, Failure, Action
+from p6installer.scm import Service, Failure, Action, Config
 from remote_probe.agent import ConfigError
 from remote_probe.profiles import canonical, profile_id
 from remote_probe.windows_security import StorageSecurityError, WindowsSecurity
@@ -289,6 +289,50 @@ foreach($store in @('Root','My')) {
         finally:
             self.service._close(manager, handle)
         self.assertEqual(self.service.state(self.manager._command(self.meta['release'])), 4)
+
+    def test_native_manual_start_survives_reinstall_upgrade_and_rollback(self):
+        self.install()
+
+        def start_mode(value=None):
+            manager, handle = self.service._open()
+            try:
+                if value is not None:
+                    # Only this random fixture service's start mode changes.
+                    self.service._check(self.service.a.ChangeServiceConfigW(
+                        handle, 0xffffffff, value, 0xffffffff, None, None,
+                        None, None, None, None, None))
+                buffer = self.service._buffer(self.service.a.QueryServiceConfigW, handle)
+                return ctypes.cast(buffer, ctypes.POINTER(Config)).contents.start
+            finally:
+                self.service._close(manager, handle)
+
+        self.assertEqual(start_mode(), 2)
+        try:
+            self.assertEqual(start_mode(3), 3)
+            command = self.manager._command(self.meta['release'])
+            self.assertEqual(self.service.state(command), 4)
+            self.service.stop(command)
+            self.assertEqual(self.service.state(command), 1)
+            self.service.start(command)
+            self.assertEqual(self.service.state(command), 4)
+            self.install()
+            self.assertEqual(start_mode(), 3)
+            package, next_meta = self.next_release()
+            self.assertEqual(self.manager.install(package)['release'], next_meta['release'])
+            self.assertEqual(start_mode(), 3)
+            self.assertEqual(self.manager.rollback()['release'], self.meta['release'])
+            self.assertEqual(start_mode(), 3)
+            self.service.stop(command)
+            self.assertEqual(start_mode(4), 4)
+            for operation in (lambda: self.service.state(command),
+                              lambda: self.service.start(command),
+                              lambda: self.service.configure(command)):
+                with self.assertRaises(ConfigError):
+                    operation()
+            self.assertEqual(start_mode(), 4)
+        finally:
+            # Restore the scoped fixture even if old code fails at Manual.
+            start_mode(2)
 
     def test_native_import_pause_resume_reinstall_preserve_secret_spool(self):
         self.install()

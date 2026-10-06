@@ -110,9 +110,10 @@ class Service:
         buffer = self._buffer(self.a.QueryServiceConfigW, service)
         config = ctypes.cast(buffer, ctypes.POINTER(Config)).contents
         self._acl(service)
-        if config.kind != 0x10 or config.start != 2 or config.binary != expected \
+        if config.kind != 0x10 or config.start not in (2, 3) or config.binary != expected \
                 or config.account != 'LocalSystem' or config.dependencies or config.group:
             raise ConfigError('unowned service configuration')
+        return config.start
 
     def _state(self, handle):
         state = Status()
@@ -170,10 +171,12 @@ class Service:
         manager, service = self._open()
         try:
             if service:
-                self._config(service, previous or command)
+                # Preserve the administrator's Auto/Manual preference through
+                # updates and rollback; validate every ownership field first.
+                start_mode = self._config(service, previous or command)
                 if self._state(service) != 1:
                     raise ConfigError('stop managed service before configure')
-                self._check(self.a.ChangeServiceConfigW(service, 0x10, 2, 1, command, '', None, '', 'LocalSystem', None, None))
+                self._check(self.a.ChangeServiceConfigW(service, 0x10, start_mode, 1, command, '', None, '', 'LocalSystem', None, None))
             else:
                 service = self.a.CreateServiceW(manager, self.name, self.name, ALL,
                             0x10, 2, 1, command, None, None, None, 'LocalSystem', None)
