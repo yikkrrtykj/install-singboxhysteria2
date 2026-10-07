@@ -105,12 +105,19 @@ reinstall/upgrade/rollback preservation is a mandatory current-head CI gate.
       Partial A4 and earlier failed comparisons remain retained. The old export
       omitted direct controller snapshots; consistency has only the worker's
       phase-completion guard. No population/causal noninferiority claim.
-- [ ] Complete the genuinely missing same-process multiple-profile matched
-      Clash delay comparison. The completed two-profile resource run collected
-      no delay observations. One fixed A/B/B/A block, four60s phases with10s
-      warmup each, compares monitoring stopped with both profiles enabled in
-      one process; retain every outcome and restore original settings. No repeat
-      of memory, idle, offline/recovery, installation, reboot or TUN checks.
+- [x] Fixed same-process multiple-profile matched delay check captured and
+      independently reviewed: complete A1/B1/B2/A2, four60s windows with10s
+      warmup, all48 diagnostics successful,12 baseline/12 active per role.
+      Both profiles progressed in the same unchanged process. Controller
+      snapshots match in every phase; temporary profile removed and both
+      original Stopped/Manual services/enrollment/enabled choices restored.
+- [ ] Resolve the observed multiple-profile Reality added-p95 failure before
+      merge: baseline74ms -> active87ms (+13ms), exceeding the frozen <=5ms
+      target. HY2 71->71ms (+0) meets it. Reality medians62->62.5ms do not
+      replace p95. With12 observations/group nearest-rank p95 is the maximum;
+      retain all values, no deletion of tails or repeated runs until favorable.
+      Attribution remains unproven; investigate existing timestamps/scheduler
+      behavior before another field request or any product change.
 - [x] User-enabled TUN runtime scenario: authenticated controller readback true
       before/after120s; both exact service PIDs unchanged/Running/Enabled,
       acknowledgements158->160 and1267->1269; pending/retry/write failures0.
@@ -131,7 +138,8 @@ reinstall/upgrade/rollback preservation is a mandatory current-head CI gate.
       attribution. Neither causal regression nor non-regression is established.
       The later all-completed-phase estimate above is separate evidence; it does
       not erase these tails or establish causation. The multiple-profile target
-      remains open. Do not manufacture PASS or relax the frozen target.
+      is now measured but Reality did not meet it. Do not manufacture PASS or
+      relax the frozen target.
 - [x] Assess profile/server and retirement/revoke coverage against the contract:
       same-process two-profile actual field operation is complete. Native fixture
       tests exercise two-server isolation, actual SCM remove-one/preserve-other,
@@ -199,7 +207,7 @@ Missing second environments remain explicit gaps, never fabricated PASS.
       final independent review. Later heads require their own CI/status receipt.
 - [x] Human conditional merge authorization after remaining acceptance/final review.
 - [ ] Final exact-head code/evidence review requested of this agent, and
-      satisfaction of the remaining multiple-profile latency condition. No new
+      resolution of the observed multiple-profile Reality delay failure. No new
       outside-reviewer approval gate is introduced.
 - [ ] After an authorized merge: merge-commit CI, then separately authorized rollout.
 - [ ] P6C/P6D only after P6B2 completion and explicit authorization.

@@ -48,13 +48,29 @@ also remain retained. These are observed estimates, not causal/population proof.
 The old projection omitted direct controller snapshots, so controller consistency
 is limited to the historical worker phase-completion guard, explicitly disclosed.
 
-The completed same-process two-profile resource run collected no delay samples.
-Its matched latency comparison remains open: one predeclared A/B/B/A block,
-four60s phases plus10s warmup each, with direct controller snapshots and both
-profiles recorded. The signed bounded helper does not install a new Agent,
-create network filters, change startup preferences or repeat accepted scopes.
-The eight-phase format is not an extra product requirement. Do not repeat idle,
-offline/recovery, signing, reboot, TUN or30min CPU/memory for this missing item.
+The fixed same-process two-profile matched latency check is now recorded and
+independently reviewed: A1/B1/B2/A2 all complete, four60s windows with10s warmup,
+48 successful diagnostics and12 baseline/12 active observations per role. Both
+profiles made upload progress in the same unchanged process. Direct controller
+snapshots match throughout; temporary profile removed, both original services
+and enrollment/enabled/startup settings restored Stopped/Manual. Total tool
+elapsed312.63s. This closes missing collection, not the performance target.
+
+Reality nearest-rank p95 is74ms baseline and87ms active: +13ms fails the original
+<=5ms target. HY2 71->71ms (+0) meets it. Reality median62->62.5ms is descriptive,
+not a substitute acceptance metric. With12 observations/group, nearest-rank p95
+is the group maximum; the high87ms value must remain included. All original
+older failed/partial comparisons are retained. Short Internet diagnostics and
+shared-controller activity do not establish Agent causation or non-regression.
+B1/B2 total-machine average CPU0.07436/0.07659%,3s sampled peak0.29654/0.43319%,
+sampled private maxima15.56/15.59MiB; these observations do not prove the latency
+cause. No new network trace was collected in this latency-only check.
+
+Do not merge while the observed frozen target remains unresolved. Investigate
+existing timestamps and scheduling before requesting further field work or
+making a speculative product change. No immediate repeat, no discarded tail,
+no implicit relaxation of the human's requirement. No repeat of accepted idle,
+offline/recovery, signing, reboot, TUN or30min CPU/memory scopes.
 
 Lifecycle assessment accepts existing actual native SCM/HTTPS fixtures for
 cross-server isolation, revocation, remove-one/preserve-other, uninstall and
@@ -65,7 +81,7 @@ active Device is needed. Native fixtures and field actions remain distinguished.
 Predecessor source head ea4ed6749ffc8de6d74724dba46fc7974781dfde has15/15 actual
 CI successes with exact logs and verified synthetic-merge parents. A later
 documentation head requires its own status receipt. PR70 remains Draft pending
-the multiple-profile delay result and final exact-head review requested of this
+resolution of the multiple-profile Reality target failure and final review by this
 agent. No new external-reviewer approval requirement, merge or rollout is added.
 
 ## Current scoped follow-up
@@ -165,8 +181,8 @@ Production VPS is not deployed.
    resource/network scopes, with query gaps and the original verifier preserved.
    All six completed one-profile comparison phases meet the observed5ms point
    target, with partial/older failed comparisons and attribution limits disclosed.
-   Only the missing matched same-process multiple-profile delay result remains
-   open in field coverage. Real reboot/autostart and user-enabled TUN operation
+   Matched same-process multiple-profile delay collection is now complete, but
+   its observed Reality +13ms p95 fails the <=5ms target and remains a merge blocker. Real reboot/autostart and user-enabled TUN operation
    are complete. Native server isolation, revocation and retirement/lifecycle
    evidence has been assessed; do not repeat destructive active-Device actions.
 2. Company identity/trust/timestamped release/export/test-server publication and
