@@ -91,14 +91,26 @@ reinstall/upgrade/rollback preservation is a mandatory current-head CI gate.
       error counters0. Agent TCP/UDP send17127/receive42188 bytes; zero ETW loss.
       Both services restored Stopped/Manual; original profile/controller/startup
       choices preserved and temporary profile removed. No repeat is needed.
-- [ ] Remaining offline-backlog/recovery resource and queue observations.
-      Historical real reconnect and native replay tests remain completed;
-      they do not measure this missing resource scope. Process IO bytes are
-      not measured network bytes. Current workstation firewall profiles are
-      disabled; no profile was enabled. The workload helper therefore stopped
-      after idle, before offline. Do not blindly rerun it unchanged.
-- [ ] Matched baseline/Agent-active Clash comparison: added p95 <=5ms;
-      displayed active node-test delays are not that comparison.
+- [x] Focused offline/backlog and recovery field check independently verified:
+      90.86s/30 readings offline and90.88s/29 recovery, same exact process.
+      Total-machine CPU0.04522%/0.04040%, sampled private maxima14.98/14.94MiB;
+      unresolved span0->2->0, confirmations274->274->278, no drops/storage errors.
+      Per-process send/receive4218/17416 and20023/45869 bytes; ETW loss0.
+      Upload-only isolation smoke and dynamic-rule removal verified. Original
+      enrollment/controller/settings and both Stopped/Manual services restored.
+- [x] Independently recompute all six completed one-profile comparison phases,
+      selected by numeric completion timestamp and valid final metadata, never
+      by observed delay. All18 baseline/18 active observations per role included:
+      Reality p95 77->73ms (-4), HY2 65->67ms (+2), observed <=5ms target met.
+      Partial A4 and earlier failed comparisons remain retained. The old export
+      omitted direct controller snapshots; consistency has only the worker's
+      phase-completion guard. No population/causal noninferiority claim.
+- [ ] Complete the genuinely missing same-process multiple-profile matched
+      Clash delay comparison. The completed two-profile resource run collected
+      no delay observations. One fixed A/B/B/A block, four60s phases with10s
+      warmup each, compares monitoring stopped with both profiles enabled in
+      one process; retain every outcome and restore original settings. No repeat
+      of memory, idle, offline/recovery, installation, reboot or TUN checks.
 - [x] User-enabled TUN runtime scenario: authenticated controller readback true
       before/after120s; both exact service PIDs unchanged/Running/Enabled,
       acknowledgements158->160 and1267->1269; pending/retry/write failures0.
@@ -111,17 +123,22 @@ reinstall/upgrade/rollback preservation is a mandatory current-head CI gate.
       process TCP/UDP send/receive14459/39568 and27971/71541 bytes; ETW loss
       not attested. Two processes each one profile is not one-process multiprofile.
       This120s/group evidence does not replace the retained30min capture.
-- [ ] Resolve added-delay target/attribution: nearest-rank Reality p95 baseline
+- [x] Review older failed added-delay comparisons and retain attribution limits: nearest-rank Reality p95 baseline
       340ms, single373ms, two389ms (+33/+49); HY2 156/163/144 (+7/-12).
-      Observed <=5ms target not met; single Reality also one unavailable result.
+      Those older observed <=5ms targets were not met; one Reality unavailable.
       Baseline Reality59-572ms/median69; single median66. Sequential short
       phases, Internet tails, diagnostic cache updates and cold starts confound
       attribution. Neither causal regression nor non-regression is established.
-      Do not manufacture PASS or silently relax the frozen target.
-- [ ] Assess remaining real-device multiple-profile/server and retirement/revoke
-      coverage against the frozen contract. Native isolation/reinstall/update/
-      rollback/remove/purge/uninstall CI above is already complete; do not reset
-      that evidence or repeat destructive actions on the active Device.
+      The later all-completed-phase estimate above is separate evidence; it does
+      not erase these tails or establish causation. The multiple-profile target
+      remains open. Do not manufacture PASS or relax the frozen target.
+- [x] Assess profile/server and retirement/revoke coverage against the contract:
+      same-process two-profile actual field operation is complete. Native fixture
+      tests exercise two-server isolation, actual SCM remove-one/preserve-other,
+      zero-profile uninstall, selected retired-data purge and server revocation
+      refusing the old secret while another Device remains accepted. These are
+      real native/HTTPS fixture operations, not actions on the user's Device.
+      No new destructive field repetition is required; preserve this distinction.
 - [x] Readonly administrator inventory identified four old Running/Auto fixtures
       and the exact current service. Current profile/queue preserved.
 - [x] Exact four old fixtures stopped/disabled by the administrator entry;
@@ -161,9 +178,11 @@ Missing second environments remain explicit gaps, never fabricated PASS.
       Initial transport quoting error fixed; the same uploaded archive reused.
 - [x] Controlled GUI download and separately enrolled company Device installation
       verified above. Normal P6RemoteProbe did not adopt a LAB fixture root.
-- [ ] Assess any remaining controlled-device update field coverage; native
-      reinstall/upgrade/rollback retention already passes. A documentation change
-      is not a new Agent release and does not require a repeat installation.
+- [x] Assess controlled-device update coverage: repaired Agent was upgraded in
+      place with existing Device/queue retained. Company-device install and
+      native signed SCM reinstall/upgrade/rollback with paused profile, secret
+      and pending bytes cover lifecycle behavior. No new Agent change in this
+      documentation update; do not repeat an installation solely for a new head.
 - [x] Retain native exact-publisher/signature/catalog/hash/timestamp gates,
       controlled expiry/revocation and recovery/rollover. No unsigned fallback,
       silent self-trust or globally disabled protection. Private signing keys
@@ -179,7 +198,9 @@ Missing second environments remain explicit gaps, never fabricated PASS.
       both protected functions are unchanged. This is an evidence packet, not
       final independent review. Later heads require their own CI/status receipt.
 - [x] Human conditional merge authorization after remaining acceptance/final review.
-- [ ] Final human independent review and satisfaction of remaining conditions.
+- [ ] Final exact-head code/evidence review requested of this agent, and
+      satisfaction of the remaining multiple-profile latency condition. No new
+      outside-reviewer approval gate is introduced.
 - [ ] After an authorized merge: merge-commit CI, then separately authorized rollout.
 - [ ] P6C/P6D only after P6B2 completion and explicit authorization.
 

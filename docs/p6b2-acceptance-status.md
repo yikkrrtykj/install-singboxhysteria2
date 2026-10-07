@@ -24,28 +24,49 @@ restored Stopped/Manual, original enrollment/enabled/controller/startup choices
 match, temporary profile removed, cleanup complete. No Agent, trust, Clash/TUN,
 firewall or VPS change accompanies this documentation review.
 
-The retained earlier comparison has six complete phases and an incomplete A4.
-Its first complete predeclared A1/B1/B2/A2 block gives Reality77->73ms (-4),
-HY2 65->67ms (+2); these are scoped descriptive estimates. The full saved
-analysis includes partial A4 and gives -3/+9ms with unbalanced observation
-counts. Keep both scopes and older failed targets; do not select favorable
-subsets as a replacement whole-acceptance PASS. The frozen added diagnostic
-p95<=5ms target remains unresolved. The helper's eight-phase capture plan is
-an observation protocol, not an additional product requirement in Issue67.
+Focused offline/backlog/recovery resource coverage is now complete. Independent
+review recalculated CPU from cumulative process time and monotonic elapsed time,
+validated all30/29 same-process readings and the >=90s windows, and checked
+original/final identities, enrollment/enabled/controller/settings and restoration.
+Offline CPU0.04522%, sampled private maximum14.98MiB, unresolved span0->2 with
+confirmations unchanged; recovery CPU0.04040%, maximum14.94MiB, span2->0 and
+confirmations +4. No drops/corruption/state-save errors. Per-process send/receive
+4218/17416 and20023/45869 bytes, ETW zero loss. Exact-image upload isolation,
+local-controller/other-image allowance, dynamic-filter cleanup and restoration
+of both Stopped/Manual services were verified. The failed predecessor is retained:
+BFE added the documented0x40 indexing flag, which the old checker rejected.
+The repair accepts only that optimization flag while retaining all policy gates.
 
-The workload-only run completed idle, then stopped before offline. All current
-firewall profiles are disabled, an unmet prerequisite for its upload-block rule;
-no firewall profile was enabled. Its exact old exception message was not saved,
-so this known prerequisite is not claimed as the unique proven exception cause.
-Historical reconnect/replay remains completed, while actual offline/backlog
-resource coverage remains missing. Do not repeat idle, two-profile, installation,
-signing, reboot or30min CPU/memory just to fill this gap. Any changed environment
-or revised acceptance scope requires explicit human agreement.
+The retained one-profile comparison has six completed phases and partial A4.
+Independent review uses numeric completion timestamps and valid final metadata,
+including ALL six completed phases:18 baseline/18 active observations per role.
+Reality p95 77->73ms (-4), HY2 65->67ms (+2); the measured one-profile <=5ms
+point target is met. No completed phase is excluded based on its observed value.
+Partial A4 remains separately retained; the older saved analysis includes it
+and gives -3/+9ms with unbalanced counts. Older sequential failed comparisons
+also remain retained. These are observed estimates, not causal/population proof.
+The old projection omitted direct controller snapshots, so controller consistency
+is limited to the historical worker phase-completion guard, explicitly disclosed.
 
-Source head04b530577ed9bb318af02abe164bce2a2f2843ec has15/15 successful CI jobs
-after the endpoint-guard fix; that is the verified predecessor of this docs-only
-update. A later documentation head needs its own CI receipt. PR70 remains Draft;
-whole acceptance, final review and merge are not declared complete.
+The completed same-process two-profile resource run collected no delay samples.
+Its matched latency comparison remains open: one predeclared A/B/B/A block,
+four60s phases plus10s warmup each, with direct controller snapshots and both
+profiles recorded. The signed bounded helper does not install a new Agent,
+create network filters, change startup preferences or repeat accepted scopes.
+The eight-phase format is not an extra product requirement. Do not repeat idle,
+offline/recovery, signing, reboot, TUN or30min CPU/memory for this missing item.
+
+Lifecycle assessment accepts existing actual native SCM/HTTPS fixtures for
+cross-server isolation, revocation, remove-one/preserve-other, uninstall and
+selected purge. Actual repaired-device in-place upgrade plus native signed
+upgrade/rollback retention covers update behavior; no destructive repeat on the
+active Device is needed. Native fixtures and field actions remain distinguished.
+
+Predecessor source head ea4ed6749ffc8de6d74724dba46fc7974781dfde has15/15 actual
+CI successes with exact logs and verified synthetic-merge parents. A later
+documentation head requires its own status receipt. PR70 remains Draft pending
+the multiple-profile delay result and final exact-head review requested of this
+agent. No new external-reviewer approval requirement, merge or rollout is added.
 
 ## Current scoped follow-up
 
@@ -139,17 +160,15 @@ Production VPS is not deployed.
 
 ## Open conditions — three batches, no new feature stages
 
-1. Adequate resource coverage/reviewer assessment; missing real network/workload,
-   single/multiple-profile and matched added-Clash p95<=5ms evidence. One-profile
-   targets remain30min average CPU<=2% total machine and private memory<=128MiB.
-   The short observer check passed; assess prior30min adequacy before deciding
-   on any repeated full capture.
-   Real OS reboot/autostart is complete using native process creation time.
-   User-enabled TUN runtime verification is complete as recorded below; any
-   missing real-device multi-server/retirement coverage still needs assessment.
-   Preserve native CI evidence and the active Device. Four old
-   fixtures were already disabled with data retained. Do not repeat their cleanup
-   or alter Clash automatically.
+1. Resource evidence review is complete for retained30min one-profile CPU and
+   sampled private memory, active/idle/offline/recovery and same-process two-profile
+   resource/network scopes, with query gaps and the original verifier preserved.
+   All six completed one-profile comparison phases meet the observed5ms point
+   target, with partial/older failed comparisons and attribution limits disclosed.
+   Only the missing matched same-process multiple-profile delay result remains
+   open in field coverage. Real reboot/autostart and user-enabled TUN operation
+   are complete. Native server isolation, revocation and retirement/lifecycle
+   evidence has been assessed; do not repeat destructive active-Device actions.
 2. Company identity/trust/timestamped release/export/test-server publication and
    actual normal company-device installation are complete. The signer is fixed,
    not a disposable LAB certificate. Native expiry/revocation/update/recovery tests
@@ -157,7 +176,7 @@ Production VPS is not deployed.
    was cancelled before submission; public approval is not a company-only blocker.
    Keep native publisher/catalog/hash/timestamp gates with no unsigned fallback;
    signing keys never enter VPS/client and TLS trust stays separate.
-3. Final exact-head review packet, human independent review and satisfaction of
+3. Final exact-head code/evidence review requested of the agent and satisfaction of
    the human's conditional merge authorization. Merge-commit CI follows merge;
    production rollout remains separately authorized.
 
