@@ -127,6 +127,15 @@ reinstall/upgrade/rollback preservation is a mandatory current-head CI gate.
       Exploratory missing-delay sensitivity+7ms with p0.4998..0.7217 is not
       confirmatory/native acceptance. No supported cause of old+13ms, no universal
       no-effect proof; no speculative fix. Existing core logs omit timeout interval.
+- [x] Classify transport failures without changing signed probe logic: six local
+      diagnostics tests pass; a loopback fixture reproduces the original3s
+      response-header socket timeout while a5s-budget backend remains active.
+      That stricter client limit is intentional in the frozen adapter, not an
+      established product regression. A fixed12-call live trace completes with
+      HTTP200 and no transport faults; neither proves the earlier failure's
+      cause or replaces the native+13ms acceptance failure. No service, queue,
+      Clash/TUN or timeout change. Diagnostic tools/data remain local.
+      Exact documentation predecessor4294dd66 has15/15 successful CI jobs.
 - [ ] Resolve the observed multiple-profile Reality added-p95 failure before
       merge: baseline74ms -> active87ms (+13ms), exceeding the frozen <=5ms
       target. HY2 71->71ms (+0) meets it. Reality medians62->62.5ms do not

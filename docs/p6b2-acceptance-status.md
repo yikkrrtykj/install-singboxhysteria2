@@ -116,6 +116,21 @@ close the original target. No speculative production fix or favorable retest.
 Documentation predecessor75b31772 has15/15 actual CI jobs successful; this new
 head requires its own status. Raw tools/intervals/logs/device material stay local.
 
+A bounded follow-up distinguishes controller transport errors from core
+HTTP failures while delegating every request/read/close exactly once to the
+unchanged signed adapter. Six local tests cover connect/send, response-header
+and body timeouts, successful replies, core503 and core504. A loopback HTTP
+fixture reproduces the intentional3s client cutoff while its5s-budget backend
+continues; this proves the mechanism, not the historical failure cause. The
+core v1.19.32 delay handler uses a separate background context for its test.
+The original adapter documents its stricter3s limit, so no timeout relaxation
+or speculative product patch is made. A fixed12-request live trace completes
+with HTTP200/positive delay and no transport faults; this does not erase the
+retained unavailable request or the native+13ms target failure. No service,
+queue, configuration or Clash/TUN change. Full source review remains pending.
+Exact predecessor4294dd66064cfde00f031e6ffe369be141fc12cd has15/15 successful
+CI jobs; that status is scoped to that head. Raw diagnostic files stay local.
+
 Lifecycle assessment accepts existing actual native SCM/HTTPS fixtures for
 cross-server isolation, revocation, remove-one/preserve-other, uninstall and
 selected purge. Actual repaired-device in-place upgrade plus native signed
