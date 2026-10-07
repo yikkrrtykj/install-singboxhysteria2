@@ -93,6 +93,29 @@ This evidence update changes only two documentation files; its new head still
 requires its own CI/status and final review. Local diagnostic executables,
 shortcuts, raw interval records and device material are not committed.
 
+A subsequent preregistered component intervention directly changes concurrency:
+48 neighboring paired comparisons, randomized mode order, two original signed
+P6Mihomo calls per mode, identical targets/parameters;3s spacing per mode batch.
+Reality and HY2 each have24 verified parallel-overlap and zero serialized-overlap
+pairs. All192 API intervals retained; original services/profiles/queues/settings
+restored, no Runtime/collector/upload/profile import or Clash/TUN changes.
+Higher diagnostic frequency and component hosting explicitly exclude native
+SCM/default60s performance acceptance. Total elapsed298.13s.
+
+HY2 all96 requests succeed: parallel/serialized p95 67/70ms (-3), cluster paired
+two-sided randomization p=1.0; approximate97.5% cluster bootstrap interval[-5,+5]ms.
+No detectable effect is not a universal no-effect proof. Reality parallel has
+47 successes and one3006ms unavailable API exchange; serialized has48 successes.
+Preregistered primary inference remains inconclusive, failure retained. Exploratory
+missing-delay bounds identify parallel/serialized p95 82/75ms (+7) for every
+completion-order region; paired randomization p ranges0.4998..0.7217. This is
+sensitivity-only, never substituted for failed primary/native acceptance. Existing
+core log files do not cover the timeout interval. The intervention does not
+support assigning the earlier+13ms to concurrency, nor prove it unrelated or
+close the original target. No speculative production fix or favorable retest.
+Documentation predecessor75b31772 has15/15 actual CI jobs successful; this new
+head requires its own status. Raw tools/intervals/logs/device material stay local.
+
 Lifecycle assessment accepts existing actual native SCM/HTTPS fixtures for
 cross-server isolation, revocation, remove-one/preserve-other, uninstall and
 selected purge. Actual repaired-device in-place upgrade plus native signed

@@ -119,6 +119,14 @@ reinstall/upgrade/rollback preservation is a mandatory current-head CI gate.
       NOT native SCM acceptance. Reality96->76ms/HY2 67->73ms retained as diagnostic
       values only; neither substitutes the original failed native comparison.
       No production patch or proven cause. Do not repeat unchanged checks.
+- [x] Preregistered randomized concurrency intervention executed and independently
+      reviewed:192 original API calls,48 paired comparisons, both protocols24
+      parallel overlaps/zero serialized overlaps, original queues/settings restored.
+      HY2 p95 67/70ms, paired p=1.0, approximate97.5% interval[-5,+5]ms. Reality
+      retains one3006ms unavailable parallel request: primary inconclusive.
+      Exploratory missing-delay sensitivity+7ms with p0.4998..0.7217 is not
+      confirmatory/native acceptance. No supported cause of old+13ms, no universal
+      no-effect proof; no speculative fix. Existing core logs omit timeout interval.
 - [ ] Resolve the observed multiple-profile Reality added-p95 failure before
       merge: baseline74ms -> active87ms (+13ms), exceeding the frozen <=5ms
       target. HY2 71->71ms (+0) meets it. Reality medians62->62.5ms do not
