@@ -79,8 +79,24 @@ reinstall/upgrade/rollback preservation is a mandatory current-head CI gate.
       The original strict verifier refusal stays unchanged; workload/network/
       matched-latency coverage and whole resource acceptance remain incomplete.
       The observer's121-point/zero-failure rules are not new product requirements.
-- [ ] Missing idle/active/offline-backlog network/queue and one/multiple-profile
-      resource comparisons. Process IO bytes are not measured network bytes.
+- [x] Retained active-phase resource/network evidence reviewed with zero-loss
+      ETW attestation; average total-machine CPU0.038-0.046%, sampled private
+      working-set maximum15.26MiB. Earlier incomplete phases remain retained.
+- [x] Completed idle/pause resource check:60.88s, CPU0.03793% total-machine,
+      sampled private working-set maximum13.72MiB, unchanged spool counters
+      and zero Agent network events with zero-loss ETW attestation.
+- [x] Completed same-process two-profile resource check:90.92s/30 valid points,
+      CPU0.06373% total-machine, sampled private working-set maximum15.79MiB.
+      Both enabled profiles confirmed two uploads each; pending/retry/storage
+      error counters0. Agent TCP/UDP send17127/receive42188 bytes; zero ETW loss.
+      Both services restored Stopped/Manual; original profile/controller/startup
+      choices preserved and temporary profile removed. No repeat is needed.
+- [ ] Remaining offline-backlog/recovery resource and queue observations.
+      Historical real reconnect and native replay tests remain completed;
+      they do not measure this missing resource scope. Process IO bytes are
+      not measured network bytes. Current workstation firewall profiles are
+      disabled; no profile was enabled. The workload helper therefore stopped
+      after idle, before offline. Do not blindly rerun it unchanged.
 - [ ] Matched baseline/Agent-active Clash comparison: added p95 <=5ms;
       displayed active node-test delays are not that comparison.
 - [x] User-enabled TUN runtime scenario: authenticated controller readback true

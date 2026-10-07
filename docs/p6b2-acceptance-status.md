@@ -1,6 +1,6 @@
 # P6B2 closeout status
 
-Updated 2026-10-06. Issue #67 section22 and current amendments are authoritative.
+Updated 2026-10-07. Issue #67 section22 and current amendments are authoritative.
 The human has authorized merge after remaining conditions and final review.
 PR70 remains Draft/unmerged; whole completion/final review/production/P6C/P6D
 remain pending. This conditional authorization supersedes historical MERGE=NO,
@@ -9,6 +9,43 @@ Base/merge-base: be7fbc047827a563b52c8e82c1d310446cdd72c1.
 Current field runtime source: a07bc85e22e0855ea226d6ce32ef6af88f168f0d.
 Later license/route/checklist and administrator signing-tool commits do not
 change the field Agent payload; they are not new field runtime builds.
+
+## Latest retained field review — 2026-10-07
+
+Idle/pause and same-process two-profile short resource coverage is now complete.
+Independent recomputation matches each saved analysis, with original records
+retained. Idle60.88s: CPU0.03793% total-machine, sampled private working set
+13.72MiB, unchanged counters and zero Agent network events. Two-profile90.92s:
+30 stable-process readings, CPU0.06373%, sampled private maximum15.79MiB,
+two confirmations per profile, no pending/retry/storage errors. Agent send/receive
+17127/42188 bytes are attested by zero-loss per-process TCP/UDP ETW accounting;
+they exclude delegated DNS, Clash and wire framing. Both original services are
+restored Stopped/Manual, original enrollment/enabled/controller/startup choices
+match, temporary profile removed, cleanup complete. No Agent, trust, Clash/TUN,
+firewall or VPS change accompanies this documentation review.
+
+The retained earlier comparison has six complete phases and an incomplete A4.
+Its first complete predeclared A1/B1/B2/A2 block gives Reality77->73ms (-4),
+HY2 65->67ms (+2); these are scoped descriptive estimates. The full saved
+analysis includes partial A4 and gives -3/+9ms with unbalanced observation
+counts. Keep both scopes and older failed targets; do not select favorable
+subsets as a replacement whole-acceptance PASS. The frozen added diagnostic
+p95<=5ms target remains unresolved. The helper's eight-phase capture plan is
+an observation protocol, not an additional product requirement in Issue67.
+
+The workload-only run completed idle, then stopped before offline. All current
+firewall profiles are disabled, an unmet prerequisite for its upload-block rule;
+no firewall profile was enabled. Its exact old exception message was not saved,
+so this known prerequisite is not claimed as the unique proven exception cause.
+Historical reconnect/replay remains completed, while actual offline/backlog
+resource coverage remains missing. Do not repeat idle, two-profile, installation,
+signing, reboot or30min CPU/memory just to fill this gap. Any changed environment
+or revised acceptance scope requires explicit human agreement.
+
+Source head04b530577ed9bb318af02abe164bce2a2f2843ec has15/15 successful CI jobs
+after the endpoint-guard fix; that is the verified predecessor of this docs-only
+update. A later documentation head needs its own CI receipt. PR70 remains Draft;
+whole acceptance, final review and merge are not declared complete.
 
 ## Current scoped follow-up
 
