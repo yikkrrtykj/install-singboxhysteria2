@@ -145,6 +145,24 @@ class RemoteTests(unittest.TestCase):
         self.assertEqual(result['current_status']['subcode'], 'remote_store_unavailable')
         self.assertNotIn('private disk path', json.dumps(result))
         self.assertEqual(result['rows'], [])
+    def test_malformed_retained_sample_cannot_leak_nested_fields(self):
+        valid = sample(1)
+        extra = sample(2)
+        extra['dns']['private'] = 'must-not-leak-nested-field'
+        malformed = sample(3)
+        malformed['active'][0]['role'] = []
+        for bad in (extra, malformed, {}):
+            with self.subTest(bad=bad):
+                wrapped = lambda row: dict(sample=row, mapping_retired=False,
+                                          site_label='office', path_label='a')
+                with patch.object(self.plane, 'read_samples',
+                                  return_value=[wrapped(valid), wrapped(bad)]):
+                    result = self.read()
+                self.assertEqual(result['rows'], [])
+                self.assertEqual(result['current_status']['subcode'],
+                                 'remote_store_unavailable')
+                self.assertNotIn('must-not-leak-nested-field', json.dumps(result))
+
     def test_budget_status_is_explicit(self):
         self.store._budget_pruned = True
         self.assertTrue(self.read()['retention']['budget_pruned'])

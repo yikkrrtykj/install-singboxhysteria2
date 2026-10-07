@@ -1,5 +1,6 @@
 """Incident-bound P6C presentation. No History/classifier writes or imports.
 
+GET /api/v1/incidents/<incident_id>/remote-probes presents retained facts.
 Current source status and historical samples are deliberately separate. The
 only evidence source is retained, authenticated samples, never tuple receipts.
 Registry labels are current operator assertions; no IP-to-provider inference.
@@ -8,6 +9,7 @@ from contextlib import nullcontext
 import math
 import time
 
+from remote_probe.payload import validate_sample
 from web.remote_registry import RegistryError
 from web.remote_store import MAX_AGE_SECONDS, RemoteStoreError
 
@@ -68,6 +70,14 @@ def incident_remote(plane, incident_id, start_epoch, end_epoch, now=None):
             result['truncated'] = len(rows) > ROW_LIMIT
             for entry in rows[:ROW_LIMIT]:
                 sample = entry['sample']
+                # Reuse the admission schema before exposing nested slots;
+                # malformed retained data must never leak extra fields.
+                try:
+                    invalid = validate_sample(sample)
+                except (TypeError, ValueError, KeyError):
+                    invalid = True
+                if invalid:
+                    raise RemoteStoreError('invalid retained sample')
                 row = {key: sample[key] for key in ROW_KEYS}
                 row.update(mapping_retired=entry['mapping_retired'],
                            site_label=entry['site_label'], path_label=entry['path_label'])

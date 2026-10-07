@@ -2586,7 +2586,8 @@ def group_contract():
             server_hits.append(found)
             if os.path.basename(found) not in allowed_names:
                 scope_violations.append(found)
-            if "incidents/<incident_id>/remote-probes" in text and os.path.basename(found) != "server.py":
+            if ("incidents/<incident_id>/remote-probes" in text
+                    and os.path.basename(found) not in {"server.py", "incident_remote.py"}):
                 scope_violations.append(found)
     # server.py must be among the hits (the route lives there), every
     # hit must be an allowlisted plane file, and nothing outside the

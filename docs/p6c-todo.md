@@ -11,8 +11,8 @@ Candidate Monitor version: **0.8.0**, subject to PR review. History stays v5; re
 - [x] Operator position/path labels, retired mapping uncertainty, egress changes, stale/unavailable and retention/budget limits visible.
 - [x] DOM-safe Chinese incident presentation with explicit refresh, technical identifiers behind details, passive cache labelled non-independent.
 - [x] P5 list/detail keys, History/classifier/runtime/presenter and collection/ingest/storage implementations unchanged.
-- [x] Local 22 P6C SQLite/HTTP tests, 129 DOM checks, 148 P5 behavior checks and 230 Agent behavior checks passed.
-- [ ] Observe CI on the exact PR head (including Linux route/framing and full packaging regressions).
+- [x] Local 23 P6C SQLite/HTTP tests, 129 DOM checks, 148 P5 behavior checks and 230 Agent behavior checks passed.
+- [ ] Exact-head CI acceptance: track PR checks (Linux route/framing and full packaging regressions). The first run exposed an obsolete pre-P6C static reference allowlist; the P6C session dispatch and closed module-set gates now restate the authorized scope without removing History/classifier isolation checks.
 - [ ] PR review and merge decision.
 - [ ] Update the existing VPS after review/merge; no Windows reinstall needed for this server/UI-only change.
 
