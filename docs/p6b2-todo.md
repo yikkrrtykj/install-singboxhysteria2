@@ -231,3 +231,26 @@ restart it. PR remains Draft pending those gates and final review. Source/CI
 review packet for head7398693 records 15/15 successful jobs, thirteen protected
 zero-diff paths and both unchanged protected functions; this packet alone is
 not final review or merge approval.
+
+## Review follow-up — 2026-10-07
+
+A review found one stray `+` in the public-endpoint guard pipeline. The
+character was interpreted as a grep input filename; the existing `|| true`
+could hide its error and report an empty leak list. The one-character fix
+restores the intended check without expanding the two approved exclusions.
+An isolated Windows/Git Bash fixture reproduced the old false negative and
+proved that the corrected actual pipeline catches an injected unauthorized
+endpoint. Shell syntax validation also passed. Fresh CI is required for this
+new head; the previous head's 15 successful jobs are not assigned to it.
+
+Readonly field readback confirms the interrupted second attempt restored its
+original service settings. Both monitoring services currently remain stopped
+with manual startup. Another retained field record was refused by the local
+reader because it counted duplicate privileged ACEs as unsafe. Reader source
+now checks the bounded privileged principal/right set instead; unauthorized
+principals, rights, owners and reparse paths remain refused. No signed client
+package or installed service was changed by this helper repair. Review of the
+retained record is still pending; no new sampling or field PASS is claimed.
+Keep the previously scoped CPU/memory evidence, existing functional acceptance
+and original latency/workload requirements. PR remains Draft until the missing
+field evidence and final review actually close.
