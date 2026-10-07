@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import os
+import ssl
 import threading
 import time
 
@@ -28,8 +29,40 @@ IPLARK_HOST = "iplark.com"
 IPLARK_PATH = "/ipapi/public/ip"
 
 
+class _DirectTLSContext:
+    """Profile-local default trust snapshot, refreshed after 60s before use.
+
+    Resolve in the direct slot worker, not before its deadline starts. Reuse
+    never mutates a context already attached to a connection and never applies
+    to the independently pinned ingest transport.
+    """
+    def __init__(self, monotonic=time.monotonic):
+        self._clock = monotonic
+        self._lock = threading.Lock()
+        self._context = None
+        self._expires = 0.0
+
+    def __call__(self):
+        if not self._lock.acquire(timeout=dp.HTTPS_TIMEOUT_SECONDS):
+            raise TimeoutError("direct TLS initialization busy")
+        try:
+            if self._context is None or self._clock() >= self._expires:
+                # Publish only successful complete initialization. On failure
+                # the caller refuses this request; stale trust is not fallback.
+                context = ssl.create_default_context()
+                self._context = context
+                self._expires = self._clock() + 60.0
+            return self._context
+        finally:
+            self._lock.release()
+
+
 class ProductionAgent(RemoteProbeAgent):
     """Production scheduling/target policy; payload and evidence rules reused."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._direct_tls = _DirectTLSContext()
+
     def _baseline_path(self):
         if self.config.egress_host in IPLARK_PROFILE_HOSTS:
             # Keep untagged legacy/provider baselines untouched. The first
@@ -40,12 +73,14 @@ class ProductionAgent(RemoteProbeAgent):
     def _probe_egress(self):
         if self.config.egress_host in IPLARK_PROFILE_HOSTS:
             return dp.probe_egress(IPLARK_HOST, path=IPLARK_PATH,
-                                   previous=self._baseline, strict_ip=True)
+                                   previous=self._baseline, strict_ip=True,
+                                   context=getattr(self, "_direct_tls", None))
         return super()._probe_egress()
 
     def _probe_https(self):
         if self.config.https_host == "www.gstatic.com":
-            return dp.probe_https("www.gstatic.com", path="/generate_204", expected_status=204)
+            return dp.probe_https("www.gstatic.com", path="/generate_204", expected_status=204,
+                                  context=getattr(self, "_direct_tls", None))
         return super()._probe_https()
 
     def deliver(self):

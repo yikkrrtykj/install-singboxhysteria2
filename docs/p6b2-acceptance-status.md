@@ -328,3 +328,32 @@ successful. The repair requires new-head CI. Source/evidence risk review is
 complete with the findings above; it does not satisfy the retained native
 Reality+13ms added-p95 failure or establish its cause. PR stays Draft/unmerged
 until that original acceptance condition and the repair's CI are satisfied.
+
+## Default-trust initialization optimization — 2026-10-07
+
+A concrete component cost is now reproduced and repaired. Fixed production
+gstatic HTTPS and IPLark egress slots each previously built a default TLS context;
+two profiles therefore loaded the Windows trust store four times per cycle.
+Each ProductionAgent now owns one lazy immutable context shared by those two
+slots. It refreshes from current default trust after60s before reuse. Profiles
+never share contexts; failed initialization/refresh refuses the request rather
+than falling back to stale trust. Certificate and hostname validation remain
+required. Initialization occurs inside the existing bounded slot worker; the
+independently pinned ingest transport and other/DARK target policies are unchanged.
+
+A fixed24-pair component comparison using the client's actual embedded CPython
+3.13.16, two parallel profiles and a fresh trust snapshot each modeled cycle
+confirms four->two default-context initializations. Median component wall time
+26.46->13.43ms; aggregate process CPU687.5->359.375ms over24 pairs. HTTP is an
+in-memory fixture, default-context trust loading is real. These are TLS setup
+costs, not native SCM Reality latency, network measurements or proof of the
+historical+13ms cause. Raw component records remain local.
+
+The full production foundation entry passes152 tests, including six new tests
+for actual slot reuse, per-profile isolation, expiry, failed-refresh refusal,
+concurrent initialization, bounded initialization and real TLS certificate/
+hostname refusal. Final review of this delta confirms no timeout relaxation,
+profile/wire changes, queue changes or trust-store modification. This source
+change is not yet installed; its own exact-head CI and signed native comparison
+remain pending. The historical Reality+13ms failure is retained and the original
+<=5ms merge gate remains open. No repeat of accepted resource/lifecycle scopes.

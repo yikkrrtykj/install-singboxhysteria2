@@ -342,3 +342,21 @@ failed and exceptional results. Actual WinForms dispatch passes; the existing
 not an update to the user's installed package. CI for predecessor7ec33515 is
 15/15 successful; the new product commit needs its own CI. The native two-profile
 Reality+13ms result remains unresolved and blocks merge. No new field run.
+
+## Concrete performance repair — 2026-10-07
+
+- [x] Reproduce repeated Windows default-trust initialization in actual fixed
+      production HTTPS/egress hooks; add a profile-local immutable context with
+      on-use60s trust refresh inside existing slot deadlines. Retain certificate/
+      hostname validation and independent ingest pinning; refuse failed refresh.
+- [x] Review this delta and pass full production foundation entry152 tests,
+      including six real-context/real-TLS/cache/deadline regressions. Fixed24-pair
+      embedded-Python component comparison reduces context loads4->2 and median
+      TLS setup cost26.46->13.43ms; HTTP is a fixture, not native latency acceptance.
+- [ ] Build the updated client with the existing fixed company publisher and
+      complete this new source head's CI. Preserve existing field evidence.
+- [ ] Check the changed source once in the native same-process two-profile
+      scenario, retaining every outcome and the original added-p95<=5ms gate.
+      The historical+13ms observation remains failed; component savings neither
+      attribute that failure nor constitute a field PASS. Preserve Stopped/Manual
+      preference and all existing profiles/queues; do not repeat accepted scopes.

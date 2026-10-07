@@ -67,6 +67,7 @@ class ProviderTests(FixtureBase):
         calls = []
         def local(host, **kwargs):
             calls.append((host, kwargs.copy()))
+            kwargs.pop('context', None)  # This fixture explicitly supplies local TLS trust.
             return original('127.0.0.1', port=server.server_port, budget=budget,
                             context=context if trusted else ssl.create_default_context(), **kwargs)
         with patch('remote_probe.production_runtime.dp.probe_egress', side_effect=local):

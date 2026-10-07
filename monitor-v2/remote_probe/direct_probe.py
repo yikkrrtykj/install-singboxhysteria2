@@ -188,7 +188,12 @@ def probe_https(host, path="/", port=443, budget=HTTPS_TIMEOUT_SECONDS,
     start = _now()
 
     def request():
-        ctx = context if context is not None else ssl.create_default_context()
+        # A production-owned provider resolves inside this slot's bounded
+        # worker. Default/DARK callers and explicit fixture contexts retain
+        # their existing behavior; no callable comes from profile input.
+        ctx = context() if callable(context) else context
+        if ctx is None:
+            ctx = ssl.create_default_context()
         conn = http.client.HTTPSConnection(host, port, timeout=budget,
                                            context=ctx)
         try:
@@ -259,7 +264,12 @@ def probe_egress(host, path="/", port=443, budget=EGRESS_TIMEOUT_SECONDS,
     start = _now()
 
     def request():
-        ctx = context if context is not None else ssl.create_default_context()
+        # A production-owned provider resolves inside this slot's bounded
+        # worker. Default/DARK callers and explicit fixture contexts retain
+        # their existing behavior; no callable comes from profile input.
+        ctx = context() if callable(context) else context
+        if ctx is None:
+            ctx = ssl.create_default_context()
         conn = http.client.HTTPSConnection(host, port, timeout=budget,
                                            context=ctx)
         try:

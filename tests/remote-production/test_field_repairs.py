@@ -54,6 +54,7 @@ class TargetTests(FixtureBase):
         original = dp.probe_https
         def request(host, **kwargs):
             self.assertEqual(host, 'www.gstatic.com')
+            kwargs.pop('context', None)  # This fixture explicitly supplies local TLS trust.
             return original('127.0.0.1', port=server.server_port,
                             context=context if trusted else ssl.create_default_context(), **kwargs)
         agent = object.__new__(ProductionAgent)
