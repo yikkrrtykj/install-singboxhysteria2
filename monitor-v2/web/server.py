@@ -47,6 +47,7 @@ from p6_distribution import DistributionError, open_release
 from web.p6_bundle import BundleError, assemble as assemble_p6_bundle
 from web.p6_windows_bundle import WindowsClientPackage, require_client_package
 from web import incident_presenter as incident_presenter
+from web.incident_remote import incident_remote
 from web import incident_history as ih_outcomes
 from web.incident_history import (MARKER_KINDS, QUERY_LIMIT_DEFAULT,
                                   QUERY_LIMIT_MAX, RETENTION_SECONDS)
@@ -63,7 +64,7 @@ from web.remote_ingest import (INGEST_HEADERS, INGEST_MAX_BODY,
 from web.recovery import (RECOVERY_SUCCESS_MESSAGE, RecoveryGlobalGuard,
                           RecoveryRateLimiter, generate_key)
 
-MONITOR_WEB_VERSION = "0.7.0"
+MONITOR_WEB_VERSION = "0.8.0"
 SESSION_COOKIE = "monitor_session"
 MAX_BODY_BYTES = 65536
 SUPPORTED_METHODS = "GET, POST"
@@ -871,6 +872,14 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
                 # error on a known route, never a silent 404.
                 self._method_not_allowed(allowed="POST")
                 return
+            if suffix.endswith('/remote-probes'):
+                id_text = suffix[:-len('/remote-probes')]
+                incident_id = parse_positive_id(id_text)
+                if incident_id is not None and id_text == str(incident_id):
+                    self._require_session(self._handle_incident_remote, incident_id)
+                else:
+                    self._send_json(404, {"error": "incident_not_found"})
+                return
             incident_id = parse_positive_id(suffix)
             if incident_id is not None:
                 self._require_session(self._handle_incident_detail,
@@ -1381,6 +1390,25 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         row["markers"] = [dict(marker, label=incident_presenter.marker_label(
             marker["kind"])) for marker in detail["markers"]]
         self._send_json(200, row)
+
+    def _handle_incident_remote(self, session, incident_id):
+        """P6C: separate GET-only supporting evidence, never P5 row enrichment."""
+        history = self.app.incident_history
+        if history is None:
+            self._send_json(503, {"error": "incident history not enabled"})
+            return
+        outcome, detail = history.incident_detail(incident_id)
+        if outcome == ih_outcome_missing:
+            self._send_json(404, {"error": "incident_not_found"})
+            return
+        if outcome != ih_outcome_ok:
+            self._send_json(503, {"error": "incident history unavailable"})
+            return
+        # URL bounds/filters cannot widen or narrow the stored analysis span.
+        result = incident_remote(self.app.remote_plane, incident_id,
+                                 detail['analysis_start_epoch'],
+                                 detail['last_classified_end_epoch'])
+        self._send_json(200, result)
 
     def _handle_evidence(self, session):
         """GET /api/v1/evidence?section=...&incident_id=<n>|marker_id=<n>
