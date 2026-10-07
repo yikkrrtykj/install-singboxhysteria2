@@ -111,6 +111,14 @@ reinstall/upgrade/rollback preservation is a mandatory current-head CI gate.
       Both profiles progressed in the same unchanged process. Controller
       snapshots match in every phase; temporary profile removed and both
       original Stopped/Manual services/enrollment/enabled choices restored.
+- [x] Close the missing Agent/observer API timing question with a fixed local
+      instrumented diagnostic: four complete phases,48 observer/12 Agent calls,
+      all60 intervals closed, no overflow; six same-node Agent overlap pairs,
+      zero observer/Agent overlaps in this run. Original states/settings restored.
+      Agent source bytes unchanged; Runtime hosted in diagnostic worker, explicitly
+      NOT native SCM acceptance. Reality96->76ms/HY2 67->73ms retained as diagnostic
+      values only; neither substitutes the original failed native comparison.
+      No production patch or proven cause. Do not repeat unchanged checks.
 - [ ] Resolve the observed multiple-profile Reality added-p95 failure before
       merge: baseline74ms -> active87ms (+13ms), exceeding the frozen <=5ms
       target. HY2 71->71ms (+0) meets it. Reality medians62->62.5ms do not

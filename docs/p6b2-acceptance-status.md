@@ -72,6 +72,27 @@ making a speculative product change. No immediate repeat, no discarded tail,
 no implicit relaxation of the human's requirement. No repeat of accepted idle,
 offline/recovery, signing, reboot, TUN or30min CPU/memory scopes.
 
+A subsequent timing-only diagnostic closes the missing local API timestamps.
+It hosts the unchanged signed Agent/ProductionRuntime in an instrumented worker,
+not the native SCM service, and cannot replace the failed native field result.
+Four fixed phases completed in309.88s; all60 intervals closed with no overflow:
+48 observer calls and12 Agent calls. Six pairs of the two profiles' same-node
+Agent requests overlap; zero observer requests overlap Agent requests in this
+run. Both original Stopped/Manual services, enrollment/enabled/controller/startup
+choices were restored and the temporary profile removed. This confirms the
+shared-controller parallel diagnostic path in the instrumented run, not the
+cause of the earlier87ms observation. Instrumented Reality p95 96->76ms (-20)
+and HY2 67->73ms (+6) are retained as diagnostic values, never native acceptance
+or a selected favorable retest. No production code, collector/wire, installed
+Agent, Clash/TUN, trust, firewall or VPS change; no new root cause claim. Timing
+collection is complete; do not repeat this diagnostic without a new concrete
+question or implementation change. Original Reality +13ms failure remains open.
+
+The documentation predecessor8dc3d913 has all15 actual CI jobs successful.
+This evidence update changes only two documentation files; its new head still
+requires its own CI/status and final review. Local diagnostic executables,
+shortcuts, raw interval records and device material are not committed.
+
 Lifecycle assessment accepts existing actual native SCM/HTTPS fixtures for
 cross-server isolation, revocation, remove-one/preserve-other, uninstall and
 selected purge. Actual repaired-device in-place upgrade plus native signed
