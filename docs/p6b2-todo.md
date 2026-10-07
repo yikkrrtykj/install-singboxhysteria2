@@ -136,13 +136,14 @@ reinstall/upgrade/rollback preservation is a mandatory current-head CI gate.
       cause or replaces the native+13ms acceptance failure. No service, queue,
       Clash/TUN or timeout change. Diagnostic tools/data remain local.
       Exact documentation predecessor4294dd66 has15/15 successful CI jobs.
-- [ ] Resolve the observed multiple-profile Reality added-p95 failure before
+- [x] Resolve the observed multiple-profile Reality added-p95 failure before
       merge: baseline74ms -> active87ms (+13ms), exceeding the frozen <=5ms
       target. HY2 71->71ms (+0) meets it. Reality medians62->62.5ms do not
       replace p95. With12 observations/group nearest-rank p95 is the maximum;
       retain all values, no deletion of tails or repeated runs until favorable.
-      Attribution remains unproven; investigate existing timestamps/scheduler
-      behavior before another field request or any product change.
+      Historical attribution remains unproven. The changed-source prospective
+      native result below resolves the original point target: Reality -4ms and
+      HY2 +1ms, with every outcome retained. No historical verdict is rewritten.
 - [x] User-enabled TUN runtime scenario: authenticated controller readback true
       before/after120s; both exact service PIDs unchanged/Running/Enabled,
       acknowledgements158->160 and1267->1269; pending/retry/write failures0.
@@ -236,8 +237,11 @@ Missing second environments remain explicit gaps, never fabricated PASS.
       provisioning/revocation/ingress, credential packaging/download, session/
       CSRF and frontend operation boundaries reviewed. One initial GUI discovery
       race was reproduced and repaired; no claim that latency acceptance passed.
-- [ ] Fresh CI for the GUI repair and resolution of the observed multiple-profile
-      Reality delay failure. No new outside-reviewer approval gate is introduced.
+- [x] Fresh source CI for GUI/TLS repairs15/15 and changed-source native matched
+      two-profile delay gate: Reality71->67ms (-4), HY2 71->72ms (+1), all48
+      successful outcomes retained. Original+13ms failure remains historical.
+      No new outside-reviewer approval gate is introduced.
+- [ ] Final documentation head CI and human-authorized merge; no new field run.
 - [ ] After an authorized merge: merge-commit CI, then separately authorized rollout.
 - [ ] P6C/P6D only after P6B2 completion and explicit authorization.
 
@@ -353,10 +357,30 @@ Reality+13ms result remains unresolved and blocks merge. No new field run.
       including six real-context/real-TLS/cache/deadline regressions. Fixed24-pair
       embedded-Python component comparison reduces context loads4->2 and median
       TLS setup cost26.46->13.43ms; HTTP is a fixture, not native latency acceptance.
-- [ ] Build the updated client with the existing fixed company publisher and
-      complete this new source head's CI. Preserve existing field evidence.
-- [ ] Check the changed source once in the native same-process two-profile
+- [x] Build the updated client with the existing fixed company publisher and
+      complete this source head's CI15/15. Preserve existing field evidence.
+- [x] Check the changed source once in the native same-process two-profile
       scenario, retaining every outcome and the original added-p95<=5ms gate.
       The historical+13ms observation remains failed; component savings neither
       attribute that failure nor constitute a field PASS. Preserve Stopped/Manual
       preference and all existing profiles/queues; do not repeat accepted scopes.
+
+## Final scoped closeout — 2026-10-07
+
+- [x] Native in-place company update/source binding and all original enrollment
+      fingerprints verified; original queue retained, temporary profile removed,
+      both services restored Stopped/Manual, controller/settings unchanged.
+- [x] One sealed changed-source ABBA block completed318.27s, all48 successful
+      diagnostics retained. Reality71/67ms (-4), HY2 71/72ms (+1) meet the original
+      observed added-p95<=5ms target. No threshold change, discarded maximum or
+      selected favorable repeat; retain every historical failure/partial result.
+- [x] Final product/evidence review incorporates prior risk-path review and the
+      TLS delta, exact-head15/15 CI, native26 lifecycle tests, actual source/Device
+      update, retained30min/resource/lifecycle evidence and explicit limitations.
+      Implementation and scoped acceptance complete; causal/population latency
+      proof is not claimed. Source is installed; VPS rollout remains separate.
+- [ ] Complete final documentation-head CI, authorized merge and merge-commit CI.
+      No new runtime change or repeat of field/resource checks for this doc head.
+
+This latest decision supersedes older pending/no-merge statements for P6B2 only.
+Production rollout and P6C/P6D remain separate, explicitly authorized work.

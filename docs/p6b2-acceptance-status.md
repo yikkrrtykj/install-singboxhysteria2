@@ -2,13 +2,18 @@
 
 Updated 2026-10-07. Issue #67 section22 and current amendments are authoritative.
 The human has authorized merge after remaining conditions and final review.
-PR70 remains Draft/unmerged; whole completion/final review/production/P6C/P6D
-remain pending. This conditional authorization supersedes historical MERGE=NO,
-without waiving acceptance or authorizing production.
+P6B2 implementation, scoped acceptance and product risk-path review are complete
+after the changed-source native comparison below. PR70 remains Draft/unmerged
+only while the final documentation head's CI and authorized merge are completed.
+This supersedes historical pending/MERGE=NO statements without waiving acceptance
+or authorizing production rollout/P6C/P6D. Original failed reports/verdicts remain
+unchanged; sampled field evidence is not a population-level causal proof.
 Base/merge-base: be7fbc047827a563b52c8e82c1d310446cdd72c1.
-Current field runtime source: a07bc85e22e0855ea226d6ce32ef6af88f168f0d.
-Later license/route/checklist and administrator signing-tool commits do not
-change the field Agent payload; they are not new field runtime builds.
+Current controlled company runtime source: 8ccf439d36332076a8c8243be24232d63c22169e.
+Company release fd38a87321465b9250054f0bbb528e843a8eb6bc30f48655e14d1372a932f24c
+was updated through existing native signature/catalog gates. The separate stopped
+LAB runtime remains source a07bc85e22e0855ea226d6ce32ef6af88f168f0d. Historical
+entries below apply to their recorded version and are retained, not overwritten.
 
 ## Latest retained field review — 2026-10-07
 
@@ -357,3 +362,40 @@ profile/wire changes, queue changes or trust-store modification. This source
 change is not yet installed; its own exact-head CI and signed native comparison
 remain pending. The historical Reality+13ms failure is retained and the original
 <=5ms merge gate remains open. No repeat of accepted resource/lifecycle scopes.
+
+## Changed-source native acceptance and final decision — 2026-10-07
+
+The fixed company-signed TLS repair source8ccf439 was installed in place on the
+existing company Device; configuration, credentials, queue and Manual preference
+were preserved. A prospective comparison was sealed before execution: the same
+A1/B1/B2/A2 phases,60s windows,10s warmup and10s observer cadence as the retained
+pre-fix native failure, with the original added-p95<=5ms point target. One run
+was executed after the actual implementation change; no favorable repeat or
+selected sample was used. Total318.27s. All four phases completed and all48
+diagnostics succeeded;12 baseline/12 active observations per role were retained.
+
+Independent recomputation matches the saved analysis. Reality baseline/active
+p95 71/67ms (-4), HY2 71/72ms (+1): the original observed point gate is met on
+the repaired source. Nearest-rank p95 with12 observations is the maximum; this
+is not a causal/population non-inferiority claim. Historical Reality+13ms and
+older failed/unavailable/partial records and strict verifier verdicts stay intact.
+TLS setup savings do not prove the historical latency cause.
+
+Actual signed new-release/Agent binding, same process identity in both active
+phases, both profiles' upload progress, before/after controller equality and all
+original enrollment fingerprints were independently checked. Temporary profile
+removed; both original services restored Stopped/Manual; no trust, Clash/TUN,
+firewall, ingress or VPS change. Original company queue remains present; final
+pending/retry/storage-error counters0. B1/B2 average total-machine CPU0.05554/
+0.05571%, sampled private maxima15.875/15.887MiB, scoped to these short phases.
+Reuse previously reviewed30min, idle/offline/recovery and lifecycle evidence.
+
+Source8ccf439 has15/15 actual CI jobs successful; the native Windows job executes
+all six TLS regressions and26 signed installer/service tests. The exact synthetic
+merge parents,94-file full diff,13 protected zero-diff paths and two unchanged
+protected functions were verified. Final review incorporates the prior full
+product risk-path review, repaired GUI discovery and current TLS delta, all
+retained field limitations and the original authoritative Issue67 section22.
+No implementation or scoped acceptance blocker remains. This documentation-only
+head needs its own CI before the human-authorized merge; no runtime rebuild,
+additional field run or production/P6C/P6D work is required for that step.
