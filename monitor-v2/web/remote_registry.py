@@ -32,6 +32,9 @@ import hashlib
 import os
 import re
 import stat as stat_module
+import threading
+import time
+from contextlib import contextmanager
 
 from remote_probe import PROBE_ID_PATTERN, RUN_PATTERN
 
@@ -179,7 +182,41 @@ class RemoteRegistry:
         self._identity_problems = {}
         self.state = REGISTRY_NOT_CONFIGURED
         self.subcode = None
+        self._lifecycle_lock = threading.RLock()
         self.load()
+
+    @contextmanager
+    def live(self):
+        """Reload and fence authentication THROUGH the evidence commit.
+
+        P6B2's root writer creates config_path + '.lock' before publishing any
+        enrollment. Its exclusive flock drains previously authenticated ingest;
+        new readers reload the published registry before authenticating. The
+        unconfigured/operator-managed P6B registry needs no new file.
+        """
+        with self._lifecycle_lock:
+            fd = None
+            try:
+                path = self.config_path + '.lock'
+                if os.path.lexists(path):
+                    if os.name != 'posix':
+                        raise RegistryError('managed registry requires POSIX locking')
+                    import fcntl
+                    fd, _ = _open_regular(path, 0o640)
+                    deadline = time.monotonic() + 2.0
+                    while True:
+                        try:
+                            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                            break
+                        except BlockingIOError:
+                            if time.monotonic() >= deadline:
+                                raise RegistryError('registry busy') from None
+                            time.sleep(0.01)
+                self.load()
+                yield self
+            finally:
+                if fd is not None:
+                    os.close(fd)
 
     # -- loading -------------------------------------------------------------
 

@@ -1,5 +1,7 @@
 # Monitor v2 — Phase E3 Design rev5: Privileged Mutation Architecture（AF_UNIX RPC 特权变更架构）
 
+> 当前登录策略：2026-10-03 用户确认的[单次登录与闲置退出](monitor-single-login.md)取代本文中的独立 300 秒密码确认；旧实现与 review 记录仅描述对应历史 head。客户端操作与下载仍保留会话、CSRF、来源、审计及实时管理状态门禁。
+
 状态：**设计稿 rev5（已吸收独立 review 修正 #1–#8 及 PR #18 独立 source review follow-up 修正 F-1..F-3；全部代码事实重新锚定于冻结基线 `3ee9a162`；G5 FINAL DESIGN APPROVED；本轮零实现）**
 
 > **Implementation / rollout clarification（后续状态，不改写 rev5 核心设计）：**

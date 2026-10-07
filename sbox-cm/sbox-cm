@@ -15,9 +15,9 @@ including the read-only ones -- is dispatched to the root transaction worker
 generation, commit_server_config and the privileged audit. There is exactly ONE
 transaction engine in the system and it is not here.
 
-The ONLY sanctioned exception (E3 M4): a `client.export` RESULT is an opaque
-response body that may carry credential material inside data.content (the
-rendered Mihomo YAML). The daemon forwards it to the authorized caller without
+Sanctioned sensitive responses: `client.export` carries rendered Mihomo YAML;
+`client.bundle` carries bounded credential-bearing typed bundle parts. The
+daemon forwards these opaque results to the authorized caller without
 logging, parsing or caching it -- responses of SENSITIVE_RESPONSE_OPS never
 enter the replay cache -- and it never appears in any daemon audit record.
 
@@ -78,13 +78,23 @@ OPS = {
     # reserved-name wall. It carries no idempotency key: nothing to dedupe.
     "client.export": {"required": ("name",), "optional": ("actor",),
                       "lock": True, "allow_reserved": True},
+    "client.bundle": {"required": ("name", "device"), "optional": ("actor",), "lock": True},
+    "probe.enroll": {"required": ("name", "device", "idempotency_key", "site_label", "path_label"),
+                     "optional": ("actor",), "lock": True},
+    "probe.revoke": {"required": ("name", "device"), "optional": ("actor", "probe_id"), "lock": True},
+    "probe.list": {"required": ("name",), "optional": ("cursor", "actor"), "lock": True},
+    "probe.resume": {"required": ("name", "device"), "optional": ("actor",), "lock": True},
 }
 BASE_FIELDS = ("v", "request_id", "op")
 
 # M4: ops whose RESPONSE may carry credential material. Their responses are
 # never written to the replay cache, so a repeated request_id re-dispatches
 # (fresh render, fresh audit) instead of replaying a cached secret.
-SENSITIVE_RESPONSE_OPS = {"client.export"}
+SENSITIVE_RESPONSE_OPS = {"client.export", "client.bundle"}
+# Lifecycle acknowledgements must be fresh, including after a failed first
+# attempt or a revocation. They carry no credentials but may not replay stale
+# live-effectiveness claims from the daemon's request_id cache.
+FRESH_RESPONSE_OPS = SENSITIVE_RESPONSE_OPS | {"probe.enroll", "probe.revoke", "probe.list", "probe.resume"}
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
 REQID_RE = re.compile(r"^[A-Za-z0-9._-]{16,64}$")
@@ -364,6 +374,26 @@ def validate_request(obj):
             raise RpcError("E_SCHEMA", "parse", False, "idempotency_key 非法")
         args["idempotency_key"] = key
 
+    for field in ("device", "site_label", "path_label"):
+        if field in spec["required"]:
+            value = obj.get(field)
+            pattern = NAME_RE if field == "device" else re.compile(r"\A[ -~]{1,64}\Z")
+            if type(value) is not str or not pattern.fullmatch(value):
+                raise RpcError("E_SCHEMA", "parse", False, "设备或标签非法")
+            args[field] = value
+
+    if "probe_id" in spec["optional"] and "probe_id" in obj:
+        probe = obj['probe_id']
+        if type(probe) is not str or not re.fullmatch(r"[a-z0-9-]{1,64}", probe):
+            raise RpcError("E_SCHEMA", "parse", False, "probe_id 非法")
+        args['probe_id'] = probe
+
+    if "cursor" in spec["optional"] and "cursor" in obj:
+        cursor = obj["cursor"]
+        if type(cursor) is not str or not re.fullmatch(r"[a-z0-9-]{1,64}", cursor):
+            raise RpcError("E_SCHEMA", "parse", False, "cursor 非法")
+        args["cursor"] = cursor
+
     if "actor" in spec["optional"] and "actor" in obj:
         actor = obj["actor"]
         if not isinstance(actor, dict):
@@ -522,7 +552,7 @@ def handle_connection(conn, allowed):
         # direction: a stored response would keep credential material
         # alive past its one delivery, and a cache HIT could silently
         # replay an old YAML in place of a fresh render.
-        if op not in SENSITIVE_RESPONSE_OPS:
+        if op not in FRESH_RESPONSE_OPS:
             cached = replay_get(request_id)
             if cached is not None:
                 send_frame(conn, cached)
@@ -544,7 +574,7 @@ def handle_connection(conn, allowed):
                                 wres.get("stage", "done"),
                                 bool(wres.get("retriable", False)),
                                 wres.get("detail", ""), wres.get("backup"))
-        if op not in SENSITIVE_RESPONSE_OPS:
+        if op not in FRESH_RESPONSE_OPS:
             replay_put(request_id, resp)
         send_frame(conn, resp)
     finally:

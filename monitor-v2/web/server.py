@@ -32,6 +32,7 @@ import json
 import math
 import re
 import sys
+import threading
 import time
 import traceback
 from http.cookies import SimpleCookie
@@ -41,6 +42,10 @@ from urllib.parse import parse_qs, urlsplit
 from web.access import host_entry_for_ip
 from web.e3_broker import BrokerUnavailable
 from web.e3rpc import RpcTransportError
+from p6_artifact import ArtifactError, read_artifact
+from p6_distribution import DistributionError, open_release
+from web.p6_bundle import BundleError, assemble as assemble_p6_bundle
+from web.p6_windows_bundle import WindowsClientPackage, require_client_package
 from web import incident_presenter as incident_presenter
 from web import incident_history as ih_outcomes
 from web.incident_history import (MARKER_KINDS, QUERY_LIMIT_DEFAULT,
@@ -211,6 +216,26 @@ MUTATION_ROUTES = {
     "/api/v1/management/deactivate": "management.deactivate",
     "/api/v1/clients/add": "client.add",
     "/api/v1/clients/delete": "client.delete",
+}
+
+P6_ROUTES = {
+    '/api/v1/clients/probes/list': 'probe.list',
+    '/api/v1/clients/probes/enroll': 'probe.enroll',
+    '/api/v1/clients/probes/revoke': 'probe.revoke',
+    '/api/v1/clients/probes/resume': 'probe.resume',
+    '/api/v1/clients/bundle': 'client.bundle',
+    '/api/v1/clients/windows': 'windows.download',
+    '/api/v1/clients/windows-bundle': 'windows.bundle',
+}
+P6_ERROR_HTTP = {
+    'E_P6_SCHEMA': 400, 'E_P6_NOT_ENROLLED': 404, 'E_P6_REVOKED': 409,
+    'E_P6_BINDING': 409, 'E_P6_BINDING_CHANGED': 409, 'E_P6_DEVICE_EXISTS': 409,
+    'E_P6_IDEMPOTENCY_CONFLICT': 409, 'E_P6_KEY_CHANGED': 409,
+    'E_P6_REGISTRY_CHANGED': 409, 'E_P6_LIVE_UNCONFIRMED': 503,
+    'E_P6_CONFIRM_PENDING': 503, 'E_P6_CAPACITY': 507, 'E_P6_BUSY': 423,
+    'E_P6_AUTHORITY': 503, 'E_P6_STATE': 503, 'E_P6_REGISTRY': 503,
+    'E_P6_ARTIFACT': 503, 'E_P6_UNAVAILABLE': 503, 'E_AUDIT_UNAVAILABLE': 503,
+    'E_P6_BUNDLE': 502, 'E_P6_WINDOWS_UNAVAILABLE': 503,
 }
 
 # ---------------------------------------------------------------- M2 adapter --
@@ -455,7 +480,7 @@ class MonitorWebApp:
                  remote_mode=False, version=MONITOR_WEB_VERSION,
                  recovery_guard=None, management_active=None, e3_broker=None,
                  incident_history=None, probe_scheduler=None,
-                 incident_scanner=None, remote_plane=None):
+                 incident_scanner=None, remote_plane=None, bundle_artifact=None, windows_distribution=None):
         self.broker = broker
         self.access = access
         self.auth = auth
@@ -492,6 +517,9 @@ class MonitorWebApp:
         # broker and no provider exist, which stays the fail-closed default).
         self._management_active = management_active
         self.e3_broker = e3_broker
+        self.bundle_artifact = bundle_artifact or read_artifact
+        self.windows_distribution = windows_distribution or open_release
+        self.bundle_slots = threading.BoundedSemaphore(2)
         self._static_cache = {}
 
     def probe_status(self):
@@ -865,6 +893,12 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/v1/clients/export":
             self._method_not_allowed(allowed="POST")
             return
+        if path == "/api/v1/session/activity":
+            self._method_not_allowed(allowed="POST")
+            return
+        if path in P6_ROUTES:
+            self._method_not_allowed(allowed="POST")
+            return
         self._send_json(404, {"error": "not found"})
 
     def _body_header_error(self):
@@ -924,6 +958,9 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/v1/recovery/rotate":
             self._require_session(self._handle_recovery_rotate, csrf=True)
             return
+        if path == "/api/v1/session/activity":
+            self._require_session(self._handle_session_activity, csrf=True)
+            return
         if path == "/api/v1/step-up":
             self._require_session(self._handle_step_up, csrf=True)
             return
@@ -946,6 +983,13 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             # FRESH management gate refuses dispatch unless the helper plane
             # is provably healthy at that moment.
             self._require_step_up(self._handle_e3_export)
+            return
+        if path in P6_ROUTES:
+            op = P6_ROUTES[path]
+            if op == 'probe.list':
+                self._require_csrf_actor(self._handle_p6_request, op)
+            else:
+                self._require_step_up(self._handle_p6_request, op)
             return
         if path == "/api/v1/clients/convergence":
             # 0.1.4: GET-only. A POST on this route is a method error, not a
@@ -1144,14 +1188,16 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         handler(session, *args, actor)
 
     def _require_step_up(self, handler, *args):
-        """Gate for privileged mutations (M0.5 / rev5 §5).
+        """Session administrative authorization (Issue #67, 2026-10-03).
 
-        Chain, in order: session -> session-bound CSRF token -> live step-up.
-        A missing/expired step-up is a 401 ``reauth_required``, which is the
-        ONLY signal the web UI acts on (it pops the password box and replays
-        the identical request). The step-up credential itself never leaves
-        this process: the backend would only ever receive an actor
-        fingerprint, never the password.
+        Chain: live session -> session-bound CSRF -> password-login authorization.
+        Password login grants this authorization atomically with the session.
+        Background reads do not renew the 900s idle deadline. The legacy
+        step-up fields retain the existing frozen helper audit actor format.
+        Missing authorization is refused; the new UI returns to login and
+        never prompts for an operation password or automatically replays it.
+        Only anonymous event fingerprints cross the helper boundary.
+
 
         REVOCATION CONCURRENCY SEMANTICS (contract, aligned with M1's
         "a transaction is uncancellable once its durable intent is written"):
@@ -1159,7 +1205,7 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         * the check above is evaluated PER REQUEST, at the moment the request
           reaches the gate. Logout / password change / recovery reset-rotate
           therefore strip the step-up from every request that has NOT yet
-          passed the gate -- immediately, not after the 300s window;
+          passed the gate -- immediately, without waiting for a deadline;
         * a request that has ALREADY passed the gate is not reconsidered. Its
           step-up was valid when authorization happened, and it must not be
           aborted mid-flight by a revocation that lands afterwards;
@@ -1586,9 +1632,8 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             # plane DISARMED is the normal, safe production default.
             "monitor_running": self.app.monitor_running(),
             "management_active": self.app.management_active(),
-            # The step-up state of THIS session, so the page can show whether
-            # a re-authentication is still live. It is an opaque boolean --
-            # no password, no token, no expiry value is disclosed.
+            # Existing boolean/actor vocabulary is retained; its current
+            # grant originates at password login. No credential is disclosed.
             "step_up_active": session is not None
             and self.app.step_up_active(self._session_token()),
         }
@@ -1596,6 +1641,7 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             # The CSRF half of the session: safe to expose to the page's own
             # scripting context, unlike the HttpOnly session cookie.
             payload["csrf_token"] = session.get("csrf_token")
+            payload["idle_remaining_seconds"] = self.app.auth.sessions.remaining(self._session_token())
         self._send_json(200, payload)
 
     def _handle_login(self, remote):
@@ -1621,12 +1667,12 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
                  "retry_after": retry_after},
                 extra_headers=[("Retry-After", str(retry_after))])
             return
-        if not auth.verify_password(password):
+        token = auth.login(password)
+        if token is None:
             auth.login_limiter.record_failure(remote)
             self._send_json(401, {"error": "invalid password"})
             return
         auth.login_limiter.record_success(remote)
-        token = auth.sessions.create()
         self._send_json(200, {"status": "ok"},
                         extra_headers=[("Set-Cookie",
                                         self._session_cookie(
@@ -1647,6 +1693,18 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
                 getattr(self.server, "scheme", "http") == "https":
             parts.append("Secure")
         return "; ".join(parts)
+
+    def _handle_session_activity(self, session):
+        # Origin/peer/session/CSRF checks precede this closed, bounded body.
+        # Reads/SSE never call activity; expiry is rechecked under the mutex.
+        if self._json_body() != {}:
+            self._send_json(400, {"error": "invalid activity body"})
+            return
+        remaining = self.app.auth.sessions.activity(self._session_token())
+        if remaining is None:
+            self._send_json(401, {"error": "login required"})
+            return
+        self._send_json(200, {"status": "ok", "idle_remaining_seconds": remaining})
 
     def _handle_step_up(self, session):
         """POST /api/v1/step-up {password} -> open a 300s mutation window.
@@ -2108,7 +2166,285 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
                        "request_id": verdict.get("request_id")})
         self._send_json(E3_ERROR_HTTP.get(mapped["code"], 500), mapped)
 
-    # -- M4 export: the one sensitive delivery -------------------------------
+    # -- P6B2 device lifecycle and the separate sensitive bundle read ----------
+
+    def _p6_failure(self, code):
+        # Never echo arbitrary helper detail/data on this credential surface.
+        if code not in P6_ERROR_HTTP and code not in E3_ERROR_HTTP:
+            code = 'E_P6_UNAVAILABLE'
+        self._send_json(P6_ERROR_HTTP.get(code, E3_ERROR_HTTP.get(code, 503)),
+                        {'ok': False, 'code': code, 'error': 'P6 operation unavailable',
+                         'retriable': code in ('E_P6_LIVE_UNCONFIRMED', 'E_P6_UNAVAILABLE',
+                                               'E_P6_CONFIRM_PENDING', 'E_P6_BUSY', 'E_LOCK')})
+
+    def _p6_public_device(self, row):
+        if type(row) is not dict:
+            raise BundleError()
+        public = {}
+        for field, pattern in (('name', E3_NAME_RE), ('device', E3_NAME_RE),
+                ('probe_id', re.compile(r'[a-z0-9-]{1,64}')),
+                ('server_id', re.compile(r'[0-9a-f]{32}')),
+                ('certificate_sha256', re.compile(r'[0-9a-f]{64}'))):
+            value = row.get(field)
+            if type(value) is not str or not pattern.fullmatch(value):
+                raise BundleError()
+            public[field] = value
+        if row.get('desired') not in ('active', 'revoked') or row.get('verified') not in ('pending', 'active', 'revoked'):
+            raise BundleError()
+        epoch = row.get('verified_epoch')
+        if epoch is not None and (type(epoch) is not int or epoch < 0):
+            raise BundleError()
+        endpoint = row.get('ingest_url')
+        if type(endpoint) is not str or len(endpoint) > 256 or not re.fullmatch(
+                r'https://(?:[0-9.]+|\[[0-9a-fA-F:]+\]):[0-9]+/api/v1/remote-probes/ingest', endpoint):
+            raise BundleError()
+        for field in ('site_label', 'path_label'):
+            label=row.get(field,'')
+            if type(label) is not str or not re.fullmatch(r'[ -~]{0,64}',label):
+                raise BundleError()
+            public[field]=label
+        public.update(desired=row['desired'], verified=row['verified'], verified_epoch=epoch, ingest_url=endpoint)
+        return public
+
+    def _handle_p6_request(self, session, op, actor):
+        if op == 'windows.bundle':
+            self._handle_windows_client_bundle(actor)
+            return
+        if op == 'windows.download':
+            self._handle_windows_download()
+            return
+        body = self._json_body()
+        keys = {'name', 'device'} if op in ('probe.revoke', 'probe.resume', 'client.bundle') else \
+               {'name', 'device', 'site_label', 'path_label'} if op == 'probe.enroll' else {'name'}
+        if op == 'probe.revoke':
+            keys |= {'probe_id'}
+        allowed = keys | ({'cursor'} if op == 'probe.list' else set())
+        if type(body) is not dict or not keys <= set(body) or not set(body) <= allowed:
+            self._p6_failure('E_P6_SCHEMA')
+            return
+        for field in ('name', 'device'):
+            if field in body and (type(body[field]) is not str or not E3_NAME_RE.fullmatch(body[field])):
+                self._p6_failure('E_P6_SCHEMA')
+                return
+        if op == 'probe.revoke' and (type(body['probe_id']) is not str or
+                not re.fullmatch(r'[a-z0-9-]{1,64}', body['probe_id'])):
+            self._p6_failure('E_P6_SCHEMA')
+            return
+        if body['name'] == E3_RESERVED_NAME:
+            self._p6_failure('E_RESERVED_NAME')
+            return
+        key = self.headers.get(IDEMPOTENCY_HEADER)
+        if op == 'probe.enroll':
+            if type(key) is not str or not E3_KEY_RE.fullmatch(key) or any(
+                    type(body[field]) is not str or not re.fullmatch(r'[ -~]{1,64}', body[field])
+                    for field in ('site_label', 'path_label')):
+                self._p6_failure('E_P6_SCHEMA')
+                return
+            body['idempotency_key'] = key
+        elif key is not None:
+            self._p6_failure('E_P6_SCHEMA')
+            return
+        if 'cursor' in body and (type(body['cursor']) is not str or not re.fullmatch(r'[a-z0-9-]{1,64}', body['cursor'])):
+            self._p6_failure('E_P6_SCHEMA')
+            return
+        broker = self.app.e3_broker
+        if broker is None:
+            self._e3_unavailable()
+            return
+        slot = op == 'client.bundle'
+        if slot and not self.app.bundle_slots.acquire(blocking=False):
+            self._send_json(429, {'ok': False, 'code': 'bundle_busy', 'error': 'try again later'})
+            return
+        try:
+            generic = None
+            if slot:
+                # No artifact I/O or credential RPC occurs before the HTTP
+                # auth spine and the broker's fresh management proof.
+                broker.require_export_ready()
+                _, generic = self.app.bundle_artifact()
+            verdict = broker.p6_request(op, body, actor=actor)
+            if verdict.get('ok') is not True:
+                error = verdict.get('error')
+                self._p6_failure(error.get('code') if type(error) is dict else 'E_P6_UNAVAILABLE')
+                return
+            data = verdict.get('data')
+            if slot:
+                content = assemble_p6_bundle(body['name'], body['device'], data, generic)
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/zip')
+                self.send_header('Content-Disposition', 'attachment; filename="%s-%s-client-bundle.zip"' %
+                                 (body['name'], body['device']))
+                self.send_header('Content-Length', str(len(content)))
+                self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate')
+                self.send_header('Pragma', 'no-cache')
+                self.send_header('Expires', '0')
+                for hname, hvalue in SECURITY_HEADERS:
+                    self.send_header(hname, hvalue)
+                self.end_headers()
+                self.connection.settimeout(10)
+                self.wfile.write(content)
+                return
+            if type(data) is not dict:
+                raise BundleError()
+            if op == 'probe.list':
+                rows = data.get('devices')
+                cursor = data.get('next_cursor')
+                if type(rows) is not list or len(rows) > 64 or (cursor is not None and
+                        (type(cursor) is not str or not re.fullmatch(r'[a-z0-9-]{1,64}', cursor))):
+                    raise BundleError()
+                result = {'devices': [self._p6_public_device(row) for row in rows], 'next_cursor': cursor}
+            elif op in ('probe.enroll', 'probe.resume'):
+                result = self._p6_public_device(data)
+            else:
+                if data.get('revoked') is not True or type(data.get('count')) is not int or not 0 <= data['count'] <= 4096:
+                    raise BundleError()
+                result = {'revoked': True, 'count': data['count']}
+            self._send_json(200, {'ok': True, 'data': result})
+        except BrokerUnavailable:
+            self._e3_unavailable('fresh management gate not satisfied; P6 was not dispatched')
+        except RpcTransportError as exc:
+            if exc.stage == 'connect':
+                self._e3_unavailable()
+            else:
+                self._send_json(504, {'ok': False, 'code': 'result_unknown',
+                                    'error': 'retry explicitly', 'uncertain': True, 'retriable': True})
+        except ArtifactError:
+            self._p6_failure('E_P6_ARTIFACT')
+        except BundleError:
+            self._p6_failure('E_P6_BUNDLE')
+        finally:
+            if slot:
+                self.app.bundle_slots.release()
+
+    def _handle_windows_client_bundle(self, actor):
+        # Same session/CSRF/origin spine as other private exports. Software
+        # must pass authority/integrity/compatibility before credential dispatch.
+        body = self._json_body()
+        if type(body) is not dict or set(body) != {'name', 'device'} or any(
+                type(body[k]) is not str or not E3_NAME_RE.fullmatch(body[k]) for k in ('name', 'device')) \
+                or body['name'] == E3_RESERVED_NAME or self.headers.get(IDEMPOTENCY_HEADER) is not None:
+            self._p6_failure('E_P6_SCHEMA')
+            return
+        broker = self.app.e3_broker
+        if broker is None:
+            self._e3_unavailable()
+            return
+        if not self.app.bundle_slots.acquire(blocking=False):
+            self._send_json(429, {'ok': False, 'code': 'bundle_busy', 'error': 'try again later'})
+            return
+        started = False
+        package = None
+        deadline = time.monotonic()+60
+        try:
+            broker.require_export_ready()
+            artifact, generic = self.app.bundle_artifact()
+            with self.app.windows_distribution(artifact) as (manifest, stream):
+                require_client_package(stream, manifest)
+                verdict = broker.p6_request('client.bundle', body, actor=actor)
+                if verdict.get('ok') is not True:
+                    error = verdict.get('error')
+                    self._p6_failure(error.get('code') if type(error) is dict else 'E_P6_UNAVAILABLE')
+                    return
+                parts = verdict.get('data')
+                bundle = assemble_p6_bundle(body['name'], body['device'], parts, generic)
+                package = WindowsClientPackage(stream, manifest, bundle,
+                    body['name']+'-mihomo.yaml', parts['yaml'].encode('utf-8'))
+                if time.monotonic()>=deadline:
+                    raise DistributionError()
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/zip')
+                self.send_header('Content-Disposition', 'attachment; filename="%s-%s-windows-client.zip"' % (body['name'], body['device']))
+                self.send_header('Content-Length', str(package.size))
+                self.send_header('X-P6-Distribution-Scope', manifest['scope'])
+                self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate')
+                self.send_header('Pragma', 'no-cache')
+                self.send_header('Expires', '0')
+                for name,value in SECURITY_HEADERS:
+                    self.send_header(name,value)
+                self.connection.settimeout(10)
+                self.end_headers()
+                started = True
+                for chunk in package.chunks():
+                    if time.monotonic()>=deadline:
+                        raise TimeoutError()
+                    self.wfile.write(chunk)
+        except BrokerUnavailable:
+            self._e3_unavailable('fresh management gate not satisfied; private package not dispatched')
+        except RpcTransportError as exc:
+            if exc.stage=='connect':
+                self._e3_unavailable()
+            else:
+                self._send_json(504, {'ok': False, 'code': 'result_unknown', 'error': 'retry explicitly', 'uncertain': True, 'retriable': True})
+        except (ArtifactError, BundleError, DistributionError, ValueError, TypeError, KeyError):
+            if started:
+                self.close_connection = True
+            else:
+                self._p6_failure('E_P6_WINDOWS_UNAVAILABLE')
+        except OSError:
+            self.close_connection = True
+        finally:
+            try:
+                if package is not None:
+                    package.close()
+            finally:
+                self.app.bundle_slots.release()
+
+    def _handle_windows_download(self):
+        # Reached through the existing whitelist/origin/session/CSRF/step-up
+        # spine. Neither caller paths nor credential RPCs enter this read.
+        body = self._json_body()
+        if type(body) is not dict or body or self.headers.get(IDEMPOTENCY_HEADER) is not None:
+            self._p6_failure('E_P6_SCHEMA')
+            return
+        broker = self.app.e3_broker
+        if broker is None:
+            self._e3_unavailable()
+            return
+        if not self.app.bundle_slots.acquire(blocking=False):
+            self._send_json(429, {'ok': False, 'code': 'bundle_busy', 'error': 'try again later'})
+            return
+        started = False
+        try:
+            broker.require_export_ready()
+            artifact, _ = self.app.bundle_artifact()
+            with self.app.windows_distribution(artifact) as (manifest, stream):
+                size = manifest['archive']['size']
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/zip')
+                self.send_header('Content-Disposition', 'attachment; filename="p6-windows-%s.zip"' % manifest['scope'])
+                self.send_header('Content-Length', str(size))
+                self.send_header('X-P6-Distribution-Scope', manifest['scope'])
+                self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate')
+                self.send_header('Pragma', 'no-cache')
+                self.send_header('Expires', '0')
+                for name, value in SECURITY_HEADERS:
+                    self.send_header(name, value)
+                self.connection.settimeout(10)
+                self.end_headers()
+                started = True
+                deadline = time.monotonic() + 60
+                remaining = size
+                while remaining:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError()
+                    chunk = stream.read(min(65536, remaining))
+                    if not chunk:
+                        raise DistributionError()
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+        except BrokerUnavailable:
+            self._e3_unavailable('fresh management gate not satisfied; software was not read')
+        except (ArtifactError, DistributionError):
+            if started:
+                self.close_connection = True
+            else:
+                self._p6_failure('E_P6_WINDOWS_UNAVAILABLE')
+        except OSError:
+            self.close_connection = True
+        finally:
+            self.app.bundle_slots.release()
+
+    # -- M4 export: canonical YAML delivery remains unchanged ------------------
 
     EXPORT_MAX_BYTES = 49152   # 48 KiB; mirrors the worker cap (defence in
                                # depth -- a larger body is refused, never
@@ -2273,7 +2609,7 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             return
         auth.login_limiter.record_success(remote)
         try:
-            auth.set_password(new, keep_session=self._session_token())
+            auth.set_password(new)
         except ValueError as exc:
             self._send_json(400, {"error": str(exc)})
             return

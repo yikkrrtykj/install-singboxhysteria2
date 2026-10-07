@@ -1,0 +1,401 @@
+# P6B2 closeout status
+
+Updated 2026-10-07. Issue #67 section22 and current amendments are authoritative.
+The human has authorized merge after remaining conditions and final review.
+P6B2 implementation, scoped acceptance and product risk-path review are complete
+after the changed-source native comparison below. PR70 remains Draft/unmerged
+only while the final documentation head's CI and authorized merge are completed.
+This supersedes historical pending/MERGE=NO statements without waiving acceptance
+or authorizing production rollout/P6C/P6D. Original failed reports/verdicts remain
+unchanged; sampled field evidence is not a population-level causal proof.
+Base/merge-base: be7fbc047827a563b52c8e82c1d310446cdd72c1.
+Current controlled company runtime source: 8ccf439d36332076a8c8243be24232d63c22169e.
+Company release fd38a87321465b9250054f0bbb528e843a8eb6bc30f48655e14d1372a932f24c
+was updated through existing native signature/catalog gates. The separate stopped
+LAB runtime remains source a07bc85e22e0855ea226d6ce32ef6af88f168f0d. Historical
+entries below apply to their recorded version and are retained, not overwritten.
+
+## Latest retained field review — 2026-10-07
+
+Idle/pause and same-process two-profile short resource coverage is now complete.
+Independent recomputation matches each saved analysis, with original records
+retained. Idle60.88s: CPU0.03793% total-machine, sampled private working set
+13.72MiB, unchanged counters and zero Agent network events. Two-profile90.92s:
+30 stable-process readings, CPU0.06373%, sampled private maximum15.79MiB,
+two confirmations per profile, no pending/retry/storage errors. Agent send/receive
+17127/42188 bytes are attested by zero-loss per-process TCP/UDP ETW accounting;
+they exclude delegated DNS, Clash and wire framing. Both original services are
+restored Stopped/Manual, original enrollment/enabled/controller/startup choices
+match, temporary profile removed, cleanup complete. No Agent, trust, Clash/TUN,
+firewall or VPS change accompanies this documentation review.
+
+Focused offline/backlog/recovery resource coverage is now complete. Independent
+review recalculated CPU from cumulative process time and monotonic elapsed time,
+validated all30/29 same-process readings and the >=90s windows, and checked
+original/final identities, enrollment/enabled/controller/settings and restoration.
+Offline CPU0.04522%, sampled private maximum14.98MiB, unresolved span0->2 with
+confirmations unchanged; recovery CPU0.04040%, maximum14.94MiB, span2->0 and
+confirmations +4. No drops/corruption/state-save errors. Per-process send/receive
+4218/17416 and20023/45869 bytes, ETW zero loss. Exact-image upload isolation,
+local-controller/other-image allowance, dynamic-filter cleanup and restoration
+of both Stopped/Manual services were verified. The failed predecessor is retained:
+BFE added the documented0x40 indexing flag, which the old checker rejected.
+The repair accepts only that optimization flag while retaining all policy gates.
+
+The retained one-profile comparison has six completed phases and partial A4.
+Independent review uses numeric completion timestamps and valid final metadata,
+including ALL six completed phases:18 baseline/18 active observations per role.
+Reality p95 77->73ms (-4), HY2 65->67ms (+2); the measured one-profile <=5ms
+point target is met. No completed phase is excluded based on its observed value.
+Partial A4 remains separately retained; the older saved analysis includes it
+and gives -3/+9ms with unbalanced counts. Older sequential failed comparisons
+also remain retained. These are observed estimates, not causal/population proof.
+The old projection omitted direct controller snapshots, so controller consistency
+is limited to the historical worker phase-completion guard, explicitly disclosed.
+
+The fixed same-process two-profile matched latency check is now recorded and
+independently reviewed: A1/B1/B2/A2 all complete, four60s windows with10s warmup,
+48 successful diagnostics and12 baseline/12 active observations per role. Both
+profiles made upload progress in the same unchanged process. Direct controller
+snapshots match throughout; temporary profile removed, both original services
+and enrollment/enabled/startup settings restored Stopped/Manual. Total tool
+elapsed312.63s. This closes missing collection, not the performance target.
+
+Reality nearest-rank p95 is74ms baseline and87ms active: +13ms fails the original
+<=5ms target. HY2 71->71ms (+0) meets it. Reality median62->62.5ms is descriptive,
+not a substitute acceptance metric. With12 observations/group, nearest-rank p95
+is the group maximum; the high87ms value must remain included. All original
+older failed/partial comparisons are retained. Short Internet diagnostics and
+shared-controller activity do not establish Agent causation or non-regression.
+B1/B2 total-machine average CPU0.07436/0.07659%,3s sampled peak0.29654/0.43319%,
+sampled private maxima15.56/15.59MiB; these observations do not prove the latency
+cause. No new network trace was collected in this latency-only check.
+
+Do not merge while the observed frozen target remains unresolved. Investigate
+existing timestamps and scheduling before requesting further field work or
+making a speculative product change. No immediate repeat, no discarded tail,
+no implicit relaxation of the human's requirement. No repeat of accepted idle,
+offline/recovery, signing, reboot, TUN or30min CPU/memory scopes.
+
+A subsequent timing-only diagnostic closes the missing local API timestamps.
+It hosts the unchanged signed Agent/ProductionRuntime in an instrumented worker,
+not the native SCM service, and cannot replace the failed native field result.
+Four fixed phases completed in309.88s; all60 intervals closed with no overflow:
+48 observer calls and12 Agent calls. Six pairs of the two profiles' same-node
+Agent requests overlap; zero observer requests overlap Agent requests in this
+run. Both original Stopped/Manual services, enrollment/enabled/controller/startup
+choices were restored and the temporary profile removed. This confirms the
+shared-controller parallel diagnostic path in the instrumented run, not the
+cause of the earlier87ms observation. Instrumented Reality p95 96->76ms (-20)
+and HY2 67->73ms (+6) are retained as diagnostic values, never native acceptance
+or a selected favorable retest. No production code, collector/wire, installed
+Agent, Clash/TUN, trust, firewall or VPS change; no new root cause claim. Timing
+collection is complete; do not repeat this diagnostic without a new concrete
+question or implementation change. Original Reality +13ms failure remains open.
+
+The documentation predecessor8dc3d913 has all15 actual CI jobs successful.
+This evidence update changes only two documentation files; its new head still
+requires its own CI/status and final review. Local diagnostic executables,
+shortcuts, raw interval records and device material are not committed.
+
+A subsequent preregistered component intervention directly changes concurrency:
+48 neighboring paired comparisons, randomized mode order, two original signed
+P6Mihomo calls per mode, identical targets/parameters;3s spacing per mode batch.
+Reality and HY2 each have24 verified parallel-overlap and zero serialized-overlap
+pairs. All192 API intervals retained; original services/profiles/queues/settings
+restored, no Runtime/collector/upload/profile import or Clash/TUN changes.
+Higher diagnostic frequency and component hosting explicitly exclude native
+SCM/default60s performance acceptance. Total elapsed298.13s.
+
+HY2 all96 requests succeed: parallel/serialized p95 67/70ms (-3), cluster paired
+two-sided randomization p=1.0; approximate97.5% cluster bootstrap interval[-5,+5]ms.
+No detectable effect is not a universal no-effect proof. Reality parallel has
+47 successes and one3006ms unavailable API exchange; serialized has48 successes.
+Preregistered primary inference remains inconclusive, failure retained. Exploratory
+missing-delay bounds identify parallel/serialized p95 82/75ms (+7) for every
+completion-order region; paired randomization p ranges0.4998..0.7217. This is
+sensitivity-only, never substituted for failed primary/native acceptance. Existing
+core log files do not cover the timeout interval. The intervention does not
+support assigning the earlier+13ms to concurrency, nor prove it unrelated or
+close the original target. No speculative production fix or favorable retest.
+Documentation predecessor75b31772 has15/15 actual CI jobs successful; this new
+head requires its own status. Raw tools/intervals/logs/device material stay local.
+
+A bounded follow-up distinguishes controller transport errors from core
+HTTP failures while delegating every request/read/close exactly once to the
+unchanged signed adapter. Six local tests cover connect/send, response-header
+and body timeouts, successful replies, core503 and core504. A loopback HTTP
+fixture reproduces the intentional3s client cutoff while its5s-budget backend
+continues; this proves the mechanism, not the historical failure cause. The
+core v1.19.32 delay handler uses a separate background context for its test.
+The original adapter documents its stricter3s limit, so no timeout relaxation
+or speculative product patch is made. A fixed12-request live trace completes
+with HTTP200/positive delay and no transport faults; this does not erase the
+retained unavailable request or the native+13ms target failure. No service,
+queue, configuration or Clash/TUN change. Full source review remains pending.
+Exact predecessor4294dd66064cfde00f031e6ffe369be141fc12cd has15/15 successful
+CI jobs; that status is scoped to that head. Raw diagnostic files stay local.
+
+Lifecycle assessment accepts existing actual native SCM/HTTPS fixtures for
+cross-server isolation, revocation, remove-one/preserve-other, uninstall and
+selected purge. Actual repaired-device in-place upgrade plus native signed
+upgrade/rollback retention covers update behavior; no destructive repeat on the
+active Device is needed. Native fixtures and field actions remain distinguished.
+
+Predecessor source head ea4ed6749ffc8de6d74724dba46fc7974781dfde has15/15 actual
+CI successes with exact logs and verified synthetic-merge parents. A later
+documentation head requires its own status receipt. PR70 remains Draft pending
+resolution of the multiple-profile Reality target failure and final review by this
+agent. No new external-reviewer approval requirement, merge or rollout is added.
+
+## Current scoped follow-up
+
+The administrator chose Manual service start. The previous native SCM ownership
+check required Auto and rejected this legitimate preference. The source now
+accepts only Auto/Manual while retaining exact command, LocalSystem, service
+kind, dependencies/group and ACL validation; existing start mode is preserved
+on reconfiguration, including upgrade and rollback. Default fresh installation
+remains Auto. No installed service, signing trust or Clash/TUN was changed.
+Local policy4/4 and portable installer13/13 pass. The added native fixture
+exercises Manual stop/start, reinstall, upgrade/rollback and Disabled refusal;
+its current-head CI result is required before claiming native completion.
+
+The retained resource evidence review accepted the recorded single-profile
+30minute cumulative CPU average and private-working-set sampling below their
+targets, with query gaps and the original strict verifier refusal preserved.
+This does not close missing workload/network/multiple-profile coverage or the
+unproven added diagnostic p95<=5ms target; whole resource acceptance is NO.
+Agent measurement code is unchanged by this installer SCM fix. Previous
+field records retain their scope; a source fix is not an installed update.
+
+## Completed checkpoints
+
+| Item | Evidence and scope |
+| --- | --- |
+| Foundation, server/helper lifecycle, ingress, Bundle and installer | Earlier human slice reviews; final-head review remains distinct |
+| Repaired runtime CI | a07bc85: 15/15 jobs; shell-tests37182322620, foundations37182322564, packaging37182322624 |
+| License/company-route documentation CI | 30a1967: all three workflows successful; shell-tests37192254899, foundations37192254826, packaging37192255005; later commits require their own CI |
+| Native memory-leak regression | Old layout creates2,000 retained pointer types after1,000 directory checks; shared layouts create zero, with unsafe-DACL refusal preserved |
+| Repaired signed LAB delivery | Native export and in-place upgrade receipts; release b0e65304dd0726e4f338b54f4c9bfa9cedee7280397a30bbeae95526160096e4, publisher E98C97A9F64573C0E727E5B6B7657A27F695CDC2; current Device/spool preserved |
+| Test VPS | Operator SSH output: a07bc85, Monitor0.7.0-20261004081332, final healthy, identity/Client digests unchanged, exact new distribution readable by Monitor |
+| Upload/offline/IPLark | Preserved real-origin receipts and historical ack20→22/unresolved1→0/retry1→0; do not repeat for observer/documentation edits |
+| Process restart | Earlier ack93/newseq1 supports a new process run; full OS reboot remains distinct |
+| Signing tools CI | e2c6faa:15/15 jobs; foundations37194441609, shell-tests37194441612, packaging37194441649; native Windows internal-publisher suite9/9 including real machine trust/sign reuse/removal. Synthetic-merge checkout, not raw head checkout |
+| Short observer field validation | 182.48s,62 valid points,0 failures/retries, stable exact service/PID/release, sampled private maximum9.02MiB, local ack929→932; observer gap only |
+| Fixed company identity | Fixed company trust/signatures/timestamps/protected export and test-server publication complete; controlled company-device download/install now verified, native update/rollback24/24 remains distinct from field coverage |
+| Company Device | test/company-check uses normal P6RemoteProbe; downloaded program bytes match signed export; actual pause/resume and continuing samples/upload confirmations, active test/my preserved |
+| Real OS reboot/autostart | Administrator readonly exact SCM/process readback: OS boot21:35:00.500 +08:00, Auto/LocalSystem service PID5732 starts21:35:13.594,13.094s after boot; subsequent GUI confirms new samples. Window manually opened, readonly opening does not start service |
+| Current review packet | d220190:15/15 jobs, synthetic merge39055a3 with base+head parents,92 files,13 protected paths zero diff/two functions unchanged. Evidence packet only; final independent review pending |
+| Native lifecycle coverage | Actual Windows fixture reinstall/upgrade/rollback/pending bytes/remove-one/keep-other/zero-profile uninstall/purge24/24; foundation isolation and offline reopen/HTTPS replay passed; not falsely labelled company-device field actions |
+| Runtime notices | Controlled download payload/runtime/LICENSE.txt33861 bytes matches the signed archive |
+
+## Finished repaired native resource capture
+
+Original report SHA256:
+380ea78cfa724c7d7efe82601aad7073d1967764951add256129c801ef86394e.
+Exact repaired LAB service binding, one configured/enabled profile, one stable
+PID/creation identity and Running at all119 valid points. Window1803.80s;
+two failures at service_query/service_recheck, maximum gap30.17s.
+
+Observed private working set: first12.54MiB, last8.73MiB, sampled maximum12.54MiB.
+CPU endpoint estimate0.041% of total machine capacity. Recorded snapshots do not
+show the former growing private memory, but cannot attest unseen continuous peaks.
+The closed verifier keeps invalid_or_incomplete_resource_report and whole-resource
+PASS=false. False acceptance flags from invalid input are not measured target
+exceedances. Short network/latency results below are now recorded; full adequacy remains open.
+
+Local observer-only repair now records CIM-provider failures and permits at most
+one retry after250ms. Short native tests verify recovered/persistent failure,
+foreign/missing identity refusal and exact release binding. No cached state,
+weakened identity checks or original-report rewrite. The actual short operator
+capture now validates this observer repair with62 valid points/zero failures;
+it remains distinct from full resource acceptance and requires no client/VPS reinstall.
+
+## Administrator closeout readback
+
+The repaired administrator entry completed and saved a native state receipt:
+four exact old fixtures Stopped/Disabled, current exact service Running/Auto and
+fixed internal code-signing trust installed. Independent readonly registry now
+confirms old Start=4/current Start=2 and both exact Root/TrustedPublisher entries.
+Unprivileged direct SCM queries remain denied; stopped state comes from the
+administrator's native readback, not a fabricated unprivileged observation.
+Old data/current Device/queue are preserved; no VPS TLS trust/Clash/TUN/VPS change.
+
+Actual fixed-publisher company setup executable, script and payload catalog are
+now signed and timestamped. Native exact-publisher/signature/timestamp/catalog
+validation passed. Source01586cc has15/15 CI jobs success:37196950313,
+37196950312,37196950334; synthetic merge81061673d53b63a5f5170578e93671ba5cc6a81e
+has parents base + that head. Field Agent bytes match the already tested repair.
+Protected release export completed; operator SSH output now confirms software-only
+publication on TEST VPS64.83.37.46: publisher92E0176599764946F7E5AB332A5CEF150355BE9B,
+releasee5277d4778630089488a808de83c5da58e384497be2c439117baa062dfb1e008,
+archive6b2c30252cbced851a276cbf3a22430f67815aa24a9c166d3b67de49d533520f.
+Installed Monitor account validates the normal P6RemoteProbe download; five
+identity/config digests unchanged. No service/client reinstall, trust/firewall or
+ingress change. Head792d85a CI15/15; root distribution suites37/37 on three Ubuntu
+versions. Controlled company Device installation, pause/resume and real Windows
+reboot/autostart are now verified. Ordinary update field coverage remains an
+assessment item; actual native fixture upgrade/rollback already passes.
+Production VPS is not deployed.
+
+## Open conditions — three batches, no new feature stages
+
+1. Resource evidence review is complete for retained30min one-profile CPU and
+   sampled private memory, active/idle/offline/recovery and same-process two-profile
+   resource/network scopes, with query gaps and the original verifier preserved.
+   All six completed one-profile comparison phases meet the observed5ms point
+   target, with partial/older failed comparisons and attribution limits disclosed.
+   Matched same-process multiple-profile delay collection is now complete, but
+   its observed Reality +13ms p95 fails the <=5ms target and remains a merge blocker. Real reboot/autostart and user-enabled TUN operation
+   are complete. Native server isolation, revocation and retirement/lifecycle
+   evidence has been assessed; do not repeat destructive active-Device actions.
+2. Company identity/trust/timestamped release/export/test-server publication and
+   actual normal company-device installation are complete. The signer is fixed,
+   not a disposable LAB certificate. Native expiry/revocation/update/recovery tests
+   remain valid; assess only additional controlled-device field coverage. SignPath
+   was cancelled before submission; public approval is not a company-only blocker.
+   Keep native publisher/catalog/hash/timestamp gates with no unsigned fallback;
+   signing keys never enter VPS/client and TLS trust stays separate.
+3. Final exact-head code/evidence review requested of the agent and satisfaction of
+   the human's conditional merge authorization. Merge-commit CI follows merge;
+   production rollout remains separately authorized.
+
+Use [p6b2-todo.md](p6b2-todo.md) as the current checklist. Earlier receipts retain
+their historical build scope. Completed upload/export/recovery is not reset by
+local observer repairs, licensing or checklist updates. A historical generic LAB
+launcher diagnostic does not undo independently verified subsequent exports.
+
+## Actual short performance and user-enabled TUN readback
+
+Three sequential120s phases used the same host/nodes, TUN off: no clients,
+one normal company client, then two separate service processes with one profile
+each. Both initial Running states were restored and acknowledgements continued;
+original Device secrets/spools retained. Not one-process multiprofile evidence.
+
+| Scenario | Average CPU, total machine | Sampled private maximum | Observed send/receive bytes | Reality p95 | HY2 p95 |
+| --- | --- | --- | --- | --- | --- |
+| Baseline | 0% | 0MiB | 0/0 | 340ms | 156ms |
+| One company client | 0.0395% | 15.29MiB | 14459/39568 | 373ms | 163ms |
+| Two separate clients | 0.0874% | 30.11MiB | 27971/71541 | 389ms | 144ms |
+
+Nearest-rank percentiles use38-40 successful positive delays per role; failure
+outcomes retained separately, including one single-client Reality unavailable.
+Added p95 point estimates +33/+49ms Reality and +7/-12ms HY2 do not satisfy the
+frozen <=5ms target. Baseline Reality already ranges59-572ms, median69ms;
+single-client median66ms. Short sequential phases, Internet jitter, observer
+active diagnostics/cache updates and service cold starts confound attribution.
+Do not conclude Agent-caused regression, non-regression or whole-resource PASS.
+Observed network bytes exclude delegated DNS/proxy-core/wire framing; ETW
+zero-loss is not attested. This does not replace the retained30min record.
+Raw result SHA256: ffac49f7b20feb9e64c8563387cc61fa3d28885c374361ab27a6dfd068a0d8c3.
+
+The user then enabled TUN, reporting working network. Authenticated controller
+readback was true before/after120s; both existing service PIDs unchanged and
+Running/Enabled. Local upload acknowledgements158->160 and1267->1269, pending/
+retry/state-save failures0; Reality/HY2 each38/38 successful actual diagnostics.
+No service, settings, trust, firewall or TUN mutations by this readback. Runtime
+TUN evidence does not assert packet-level route attribution or whole P6B2 PASS.
+No repeat install/reboot/TUN smoke is needed for this documentation change.
+
+## Simple startup preference control
+
+The client manager now contains a single “开机自动运行” checkbox with actual
+Auto/Manual readback. Changing it affects the monitoring service's next boot,
+leaves its current Running/Stopped state intact, and never changes Clash/TUN.
+Refresh is readonly; unavailable or pending-recovery state disables the control
+instead of displaying a false successful setting. Upgrade/rollback preserve
+the preference. Startup actions accept no profile, Bundle or credential inputs.
+
+Local configuration/startup policy8/8, GUI observation29/29 and the actual
+WinForms recording-backend click/refresh/busy/pending checks pass. Isolated
+Windows CI additionally verifies native same-PID service control, unchanged
+profile/queue bytes, stopped-state preservation and pending recovery refusal;
+native suite now has26 tests. Source change is not an installed-device update.
+This feature does not close the remaining matched latency/workload evidence or
+final review conditions, and does not repeat accepted30min CPU/memory checks.
+
+## Final product risk-path review and GUI discovery repair
+
+Review covers Windows installer/SCM authority, catalog/signature/publication,
+profile/queue lifecycle, GUI actions/status, bounded Agent runtime/persistence/
+TLS, root provisioning/revocation/ingress, secret export/package/download and
+Web session/CSRF/frontend boundaries. This review found an initial GUI discovery
+race: its backend wait pumped window events without the busy guard, allowing
+another action or closing the window to race the read and setup staging cleanup.
+The initial discovery now acquires the existing guard and releases it in finally.
+Native controls and the actual Shown callback reproduce the old defect and verify
+blocked reentrant dispatch/close plus guard release after selected, failed and
+exceptional results. Existing controller/status/adjacent-Bundle tests29/29 pass.
+No installed client, service, signing trust, Clash/TUN or VPS change is claimed.
+
+Predecessor7ec335151e4ee0009140978a5e0fea42f552629a has15/15 actual CI jobs
+successful. The repair requires new-head CI. Source/evidence risk review is
+complete with the findings above; it does not satisfy the retained native
+Reality+13ms added-p95 failure or establish its cause. PR stays Draft/unmerged
+until that original acceptance condition and the repair's CI are satisfied.
+
+## Default-trust initialization optimization — 2026-10-07
+
+A concrete component cost is now reproduced and repaired. Fixed production
+gstatic HTTPS and IPLark egress slots each previously built a default TLS context;
+two profiles therefore loaded the Windows trust store four times per cycle.
+Each ProductionAgent now owns one lazy immutable context shared by those two
+slots. It refreshes from current default trust after60s before reuse. Profiles
+never share contexts; failed initialization/refresh refuses the request rather
+than falling back to stale trust. Certificate and hostname validation remain
+required. Initialization occurs inside the existing bounded slot worker; the
+independently pinned ingest transport and other/DARK target policies are unchanged.
+
+A fixed24-pair component comparison using the client's actual embedded CPython
+3.13.16, two parallel profiles and a fresh trust snapshot each modeled cycle
+confirms four->two default-context initializations. Median component wall time
+26.46->13.43ms; aggregate process CPU687.5->359.375ms over24 pairs. HTTP is an
+in-memory fixture, default-context trust loading is real. These are TLS setup
+costs, not native SCM Reality latency, network measurements or proof of the
+historical+13ms cause. Raw component records remain local.
+
+The full production foundation entry passes152 tests, including six new tests
+for actual slot reuse, per-profile isolation, expiry, failed-refresh refusal,
+concurrent initialization, bounded initialization and real TLS certificate/
+hostname refusal. Final review of this delta confirms no timeout relaxation,
+profile/wire changes, queue changes or trust-store modification. This source
+change is not yet installed; its own exact-head CI and signed native comparison
+remain pending. The historical Reality+13ms failure is retained and the original
+<=5ms merge gate remains open. No repeat of accepted resource/lifecycle scopes.
+
+## Changed-source native acceptance and final decision — 2026-10-07
+
+The fixed company-signed TLS repair source8ccf439 was installed in place on the
+existing company Device; configuration, credentials, queue and Manual preference
+were preserved. A prospective comparison was sealed before execution: the same
+A1/B1/B2/A2 phases,60s windows,10s warmup and10s observer cadence as the retained
+pre-fix native failure, with the original added-p95<=5ms point target. One run
+was executed after the actual implementation change; no favorable repeat or
+selected sample was used. Total318.27s. All four phases completed and all48
+diagnostics succeeded;12 baseline/12 active observations per role were retained.
+
+Independent recomputation matches the saved analysis. Reality baseline/active
+p95 71/67ms (-4), HY2 71/72ms (+1): the original observed point gate is met on
+the repaired source. Nearest-rank p95 with12 observations is the maximum; this
+is not a causal/population non-inferiority claim. Historical Reality+13ms and
+older failed/unavailable/partial records and strict verifier verdicts stay intact.
+TLS setup savings do not prove the historical latency cause.
+
+Actual signed new-release/Agent binding, same process identity in both active
+phases, both profiles' upload progress, before/after controller equality and all
+original enrollment fingerprints were independently checked. Temporary profile
+removed; both original services restored Stopped/Manual; no trust, Clash/TUN,
+firewall, ingress or VPS change. Original company queue remains present; final
+pending/retry/storage-error counters0. B1/B2 average total-machine CPU0.05554/
+0.05571%, sampled private maxima15.875/15.887MiB, scoped to these short phases.
+Reuse previously reviewed30min, idle/offline/recovery and lifecycle evidence.
+
+Source8ccf439 has15/15 actual CI jobs successful; the native Windows job executes
+all six TLS regressions and26 signed installer/service tests. The exact synthetic
+merge parents,94-file full diff,13 protected zero-diff paths and two unchanged
+protected functions were verified. Final review incorporates the prior full
+product risk-path review, repaired GUI discovery and current TLS delta, all
+retained field limitations and the original authoritative Issue67 section22.
+No implementation or scoped acceptance blocker remains. This documentation-only
+head needs its own CI before the human-authorized merge; no runtime rebuild,
+additional field run or production/P6C/P6D work is required for that step.

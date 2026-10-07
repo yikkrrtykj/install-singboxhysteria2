@@ -10,8 +10,10 @@ password. Requirements implemented here:
   persisting bearer tokens on disk. Each session also carries its own
   CSRF token (exposed to the page via ``/api/v1/session``; every
   authenticated mutation must present it);
-* a session may additionally hold a **step-up** (M0.5 / rev5 G3): a
-  300-second re-authentication window that privileged mutations require.
+* a verified password login grants administrative authorization for its
+  session. Explicit user activity renews a 15-minute inactivity deadline;
+  background reads never renew it and the eight-hour ceiling stays fixed.
+  The legacy 300-second step-up endpoint remains a compatibility operation.
   It too is memory-only and bound to its session -- logout, password
   change, recovery-key rotation, session expiry and web restart each make
   it vanish (``revoke_all_step_ups`` / session drop), never a disk write;
@@ -40,11 +42,12 @@ import time
 from web.storage import atomic_write_json, ensure_private_dir, read_json
 
 DEFAULT_SESSION_TTL = 8 * 3600.0
+DEFAULT_IDLE_TTL = 15 * 60.0
 MIN_PASSWORD_LENGTH = 8
 
 # Step-up (re-authentication) window for privileged mutations. Deliberately a
-# process constant, not a per-session value: the 300s figure is a contract
-# (rev5 §5.1 U-7), not a tunable.
+# compatibility constant for explicit legacy re-authentication. Production
+# password login authorizes until session idle/absolute expiry (Issue #67).
 DEFAULT_STEP_UP_TTL = 300.0
 
 SCRYPT_N = 1 << 14
@@ -166,11 +169,12 @@ class SessionStore:
 
     Each session record is::
 
-        {"created", "expires", "csrf_token", "step_up_expires",
+        {"created", "expires", "idle_expires", "csrf_token", "step_up_expires",
          "step_up_granted_at", "stepup_fp"}
 
-    where ``step_up_expires`` is ``None`` (never re-authenticated) or an
-    absolute clock value. The step-up is a property of one session: dropping
+    Password login grants ``step_up_expires`` up to the absolute session
+    ceiling. Unverified internal/test sessions have no grant. All deadlines
+    use monotonic time in production; only explicit activity renews idle time. The step-up is a property of one session: dropping
     the session drops it, and it is never persisted anywhere.
 
     M2 extends the in-memory step-up record with ``step_up_granted_at`` and
@@ -182,22 +186,24 @@ class SessionStore:
     rotate / session expiry; a web restart clears all memory state anyway).
     """
 
-    def __init__(self, ttl=DEFAULT_SESSION_TTL, clock=time.time,
-                 step_up_ttl=DEFAULT_STEP_UP_TTL):
+    def __init__(self, ttl=DEFAULT_SESSION_TTL, clock=time.monotonic,
+                 step_up_ttl=DEFAULT_STEP_UP_TTL, idle_ttl=DEFAULT_IDLE_TTL):
+        self.idle_ttl = idle_ttl
         self.ttl = ttl
         self.step_up_ttl = step_up_ttl
         self._clock = clock
         self._mutex = threading.Lock()
         self._sessions = {}  # token -> {"created", "expires", "csrf_token"}
 
-    def create(self):
+    def create(self, *, password_verified=False):
         now = self._clock()
         token = secrets.token_urlsafe(32)
         record = {"created": now, "expires": now + self.ttl,
                   "csrf_token": secrets.token_urlsafe(32),
-                  "step_up_expires": None,
-                  "step_up_granted_at": None,
-                  "stepup_fp": None}
+                  "idle_expires": min(now + self.idle_ttl, now + self.ttl),
+                  "step_up_expires": now + self.ttl if password_verified else None,
+                  "step_up_granted_at": now if password_verified else None,
+                  "stepup_fp": _stepup_fingerprint(token, now) if password_verified else None}
         with self._mutex:
             self._sessions[token] = record
         return token
@@ -207,10 +213,36 @@ class SessionStore:
             record = self._sessions.get(token)
             if record is None:
                 return None
-            if self._clock() >= record["expires"]:
+            if self._expired(record, self._clock()):
                 del self._sessions[token]
                 return None
             return record
+
+    @staticmethod
+    def _expired(record, now):
+        return now >= min(record["expires"], record["idle_expires"])
+
+    def activity(self, token):
+        """Record explicit CSRF-protected user activity; never revive a session."""
+        with self._mutex:
+            now = self._clock()
+            record = self._sessions.get(token)
+            if record is None:
+                return None
+            if self._expired(record, now):
+                del self._sessions[token]
+                return None
+            record["idle_expires"] = min(now + self.idle_ttl, record["expires"])
+            return max(0.0, record["idle_expires"] - now)
+
+    def remaining(self, token):
+        """A non-renewing read of the server-enforced inactivity deadline."""
+        with self._mutex:
+            now = self._clock()
+            record = self._sessions.get(token)
+            if record is None or self._expired(record, now):
+                return 0.0
+            return min(record["expires"], record["idle_expires"]) - now
 
     def drop(self, token):
         with self._mutex:
@@ -238,22 +270,22 @@ class SessionStore:
         step-up window.
         """
         ttl = self.step_up_ttl if ttl is None else ttl
-        now = self._clock()
         with self._mutex:
+            now = self._clock()
             record = self._sessions.get(token)
-            if record is None or now >= record["expires"]:
+            if record is None or self._expired(record, now):
                 return None
-            record["step_up_expires"] = now + ttl
+            record["step_up_expires"] = min(now + ttl, record["expires"])
             record["step_up_granted_at"] = now
             record["stepup_fp"] = _stepup_fingerprint(token, now)
             return record["step_up_expires"]
 
     def step_up_active(self, token):
         """True while a valid, unexpired step-up window exists on the session."""
-        now = self._clock()
         with self._mutex:
+            now = self._clock()
             record = self._sessions.get(token)
-            if record is None or now >= record["expires"]:
+            if record is None or self._expired(record, now):
                 return False
             expires = record.get("step_up_expires")
             return expires is not None and now < expires
@@ -268,10 +300,10 @@ class SessionStore:
         separate fingerprint fetch. The fp NEVER goes back to the browser:
         its only consumer is the RPC actor payload.
         """
-        now = self._clock()
         with self._mutex:
+            now = self._clock()
             record = self._sessions.get(token)
-            if record is None or now >= record["expires"]:
+            if record is None or self._expired(record, now):
                 return {"active": False, "fp": None}
             expires = record.get("step_up_expires")
             if expires is None or now >= expires:
@@ -301,7 +333,7 @@ class AuthStore:
     """
 
     def __init__(self, data_dir, session_ttl=DEFAULT_SESSION_TTL,
-                 clock=time.time, step_up_ttl=DEFAULT_STEP_UP_TTL):
+                 clock=time.monotonic, step_up_ttl=DEFAULT_STEP_UP_TTL):
         self.data_dir = data_dir
         self.path = "%s/auth.json" % data_dir
         self.sessions = SessionStore(ttl=session_ttl, clock=clock,
@@ -356,6 +388,13 @@ class AuthStore:
             return False
         return verify_secret(password, record)
 
+    def login(self, password):
+        """Verify and grant atomically against password/root changes."""
+        with self._mutex:
+            if self._password is None or not verify_secret(password, self._password):
+                return None
+            return self.sessions.create(password_verified=True)
+
     def set_password(self, password, keep_session=None):
         validate_password(password)
         record = hash_secret(password)
@@ -366,15 +405,9 @@ class AuthStore:
             ensure_private_dir(self.data_dir)
             atomic_write_json(self.path, self._payload(password_record=record))
             self._password = record
-            # A new password invalidates every OTHER session (admin may be
-            # locking out a compromised browser); the caller stays logged in.
-            self.sessions.drop_all(except_token=keep_session)
-            # ...but EVERY step-up dies, including the caller's own: the
-            # credential the step-up was based on no longer exists, so the
-            # mutation privilege is revoked immediately rather than after
-            # the 300s window. The caller keeps a normal read-only session
-            # and must re-authenticate before the next mutation.
-            self.sessions.revoke_all_step_ups()
+            # Authentication-root changes require a fresh password login.
+            # Do not leave the caller with a session-only bypass or regrant.
+            self.sessions.drop_all()
 
     # -- recovery record (hash only; the flow lives in web/recovery.py) ------
 
@@ -389,11 +422,8 @@ class AuthStore:
             atomic_write_json(self.path,
                               self._payload(recovery_record=record))
             self._recovery = record
-            # Rotating (or first configuring) the recovery key changes the
-            # authentication root, so every outstanding step-up is revoked:
-            # the same rule as a password change, applied to the recovery
-            # credential. Sessions stay logged in.
-            self.sessions.revoke_all_step_ups()
+            # Recovery authority changes revoke every browser session too.
+            self.sessions.drop_all()
 
     def verify_recovery_key(self, key):
         with self._mutex:

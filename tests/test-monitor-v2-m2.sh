@@ -500,6 +500,9 @@ def group_add_without_stepup():
     out["add_actor_session_fp_present"] =         isinstance(actor.get("session_fp"), str) and len(actor["session_fp"]) == 16
     out["add_actor_has_no_stepup_fp"] = "stepup_fp" not in actor
 
+    # A normal password login is authorized. Explicitly revoke this test
+    # grant to prove an absent authorization still dispatches no helper RPC.
+    stack.auth.sessions.revoke_all_step_ups()
     calls_before = len(client.calls)
     r = mutate(
         port, "/api/v1/clients/delete", cookie, csrf,
@@ -630,7 +633,7 @@ def group_auth_lifecycle():
     out["expired_window_cleared"] = \
         store.step_up_credentials(token) == {"active": False, "fp": None}
 
-    # Revocation 2: password change (revoke_all_step_ups, sessions survive).
+    # Revocation 2: password change drops all sessions and authorization.
     clock2 = FakeClock()
     tmp = tempfile.mkdtemp()
     auth = AuthStore(tmp, clock=clock2)
@@ -644,8 +647,8 @@ def group_auth_lifecycle():
         auth.sessions.step_up_credentials(t1)["fp"] is None
     out["password_change_clears_fp_others"] = \
         auth.sessions.step_up_credentials(t2)["fp"] is None
-    out["password_change_keeps_sessions"] = \
-        auth.sessions.resolve(t1) is not None
+    out["password_change_drops_sessions"] = \
+        auth.sessions.resolve(t1) is None
 
     # Revocation 3: recovery rotate behaves the same.
     auth.sessions.grant_step_up(t1)
@@ -1244,7 +1247,8 @@ def group_export_http():
             json.dumps({"name": "vmix-01"}))
     out["export_no_session_401"] = r["status"] == 401
     out["export_no_session_zero_rpc"] = "client.export" not in client.calls
-    # session but no step-up -> the ONLY 401 the UI replays on
+    # Explicitly revoked authorization must still refuse sensitive export.
+    stack.auth.sessions.revoke_all_step_ups()
     r = export(port, cookie, csrf)
     body = json.loads(r["body"])
     out["export_no_stepup_401_reauth"] = (

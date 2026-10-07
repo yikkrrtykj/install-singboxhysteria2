@@ -29,8 +29,11 @@ RestrictSUIDSGID=true
 RestrictRealtime=true
 LockPersonality=true
 SystemCallArchitectures=native
-# AF_UNIX only: RPC socket + systemd/D-Bus for `systemctl reload sing-box`.
-RestrictAddressFamilies=AF_UNIX
+# AF_INET is needed only for P6B2's loopback live-authentication proof. The
+# privileged daemon still has exactly one AF_UNIX listener; deny external IP.
+RestrictAddressFamilies=AF_UNIX AF_INET
+IPAddressDeny=any
+IPAddressAllow=localhost
 # The writable trees, nothing else. /run/sbox-cm is the socket directory
 # (writable so the daemon can complete its post-bind ownership check).
 # /run/systemd is the minimal B-5 carve-out: ProtectSystem=strict mounts /run
@@ -38,11 +41,12 @@ RestrictAddressFamilies=AF_UNIX
 # `systemctl is-active sing-box` (health/running probes) connect to the
 # manager's private socket at /run/systemd/private, which requires write
 # permission on that inode. The leading '-' tolerates its absence.
-ReadWritePaths=/run/sbox-cm /root/sbox /var/lib/sbox-cm -/run/systemd
+ReadWritePaths=/run/sbox-cm /root/sbox /var/lib/sbox-cm -/run/systemd -/etc/singbox-monitor
 # CAP_KILL: kill -HUP fallback for a manually started sing-box.
 # CAP_DAC_OVERRIDE: cross-owner writes under /root/sbox.
-# CAP_CHOWN is deliberately NOT granted -- socket ownership belongs to PID 1.
-CapabilityBoundingSet=CAP_KILL CAP_DAC_OVERRIDE
+# CAP_CHOWN is needed for new root:sboxweb registry/key files. Socket ownership
+# still belongs to PID 1; no capability or filesystem access is given to web.
+CapabilityBoundingSet=CAP_KILL CAP_DAC_OVERRIDE CAP_CHOWN
 AmbientCapabilities=
 
 # Enablement model (intentional, not accidental): `sbox-cm.socket` is the

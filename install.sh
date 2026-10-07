@@ -960,6 +960,49 @@ _add_client_locked() {
     return 1
 }
 
+p6_retire_cli() { # <name> -> caller holds canonical Client config.lock
+    # No proxy UUID/password leaves this process; the canonical generation
+    # digest travels via stdin to the same reviewed retirement worker.
+    local name="$1" generation args
+    # A machine without the helper's state directory has no enrolled probes.
+    # Preserve the original non-P6 CLI without introducing a Python dependency.
+    # If the directory exists (including any symlink), native authority checks
+    # below decide whether absence of devices.json is trustworthy.
+    if [ "${SBOX_CM_TEST_SANDBOX:-}" = 1 ]; then
+        if [ ! -e "${SB_P6_STATE_DIR:?}/devices.json" ] && [ ! -L "$SB_P6_STATE_DIR/devices.json" ]; then return 0; fi
+    elif [ ! -e /var/lib/sbox-cm ] && [ ! -L /var/lib/sbox-cm ]; then
+        return 0
+    fi
+    generation="$(cm_old_cred_digest "$SB_SERVER_CONFIG" "$name")" || return 1
+    args="$(jq -cn --arg name "$name" --arg gen "$generation" '{name:$name,client_generation:$gen}')" || return 1
+    printf '%s' "$args" | python3 -I -c '
+import os,stat,sys,subprocess,json
+fixture=os.environ.get("SBOX_CM_TEST_SANDBOX")=="1"
+state=os.environ["SB_P6_STATE_DIR"] if fixture else "/var/lib/sbox-cm/p6"
+module=os.environ["SB_P6_PROVISION_SCRIPT"] if fixture else "/usr/local/lib/sbox-cm/p6_provision.py"
+if not fixture:
+    for directory in ("/var", "/var/lib", "/var/lib/sbox-cm", state):
+        if not os.path.lexists(directory):
+            raise SystemExit(0)
+        st=os.lstat(directory)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022:
+            raise SystemExit("E_P6_AUTHORITY")
+if not os.path.lexists(state+"/devices.json"):
+    raise SystemExit(0)
+if not fixture:
+    for directory in ("/usr", "/usr/local", "/usr/local/lib", "/usr/local/lib/sbox-cm"):
+        st=os.lstat(directory)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022:
+            raise SystemExit("E_P6_AUTHORITY")
+    st=os.lstat(module)
+    if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or (st.st_uid,st.st_gid,stat.S_IMODE(st.st_mode)) != (0,0,0o644):
+        raise SystemExit("E_P6_AUTHORITY")
+result=subprocess.run([sys.executable,"-I",module,"retire"],input=sys.stdin.buffer.read(8193),stdout=subprocess.PIPE,timeout=240)
+reply=json.loads(result.stdout)
+raise SystemExit(0 if result.returncode==0 and reply.get("ok") is True and reply.get("data",{}).get("revoked") is True else 1)
+'
+}
+
 delete_client() { # delete_client <name> -> removes from BOTH inbounds atomically
     # Confirmation happens outside the lock (it is interactive UI), but every
     # safety judgement is re-made against the LIVE config inside the lock, so a
@@ -1014,6 +1057,12 @@ _delete_client_locked() {
         return 1
     fi
 
+    # Retire this exact credential generation before proxy mutation. Failure
+    # keeps the Client and derived files; retry resumes durable P6 retirement.
+    if ! p6_retire_cli "$name"; then
+        warning "P6 撤销未确认，Client 保持不变；请重试删除"
+        return 1
+    fi
     candidate="$(new_candidate_path)" || { warning "创建 candidate 失败"; return 1; }
     # M1-A0: the delete candidate is produced by the canonical library so the
     # CLI and the privileged worker cannot drift.

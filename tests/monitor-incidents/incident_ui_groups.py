@@ -737,6 +737,8 @@ def group_api():
                 status == 403
                 and json.loads(body)["error"] == "missing or invalid CSRF"
                                                  " token")
+            # Explicit revocation, not ordinary login, removes the grant.
+            auth.sessions.revoke_all_step_ups()
             status, body, _c, _a = request(
                 "POST", "/api/v1/incidents/rearm", cookie=session,
                 body={}, headers=_csrf_headers(session, auth))
