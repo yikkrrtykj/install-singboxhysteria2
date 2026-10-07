@@ -631,6 +631,21 @@ function Invoke-P6Backend($Action,$SelectedProfile,$SelectedBundle,$Auto,$Creden
         return @{ok=$true;value=@{v=1;installed=$true;pending_recovery=$false;service_state=4;autostart=$script:startup;
           profiles=@(@{id=('a'*64);probe_id='fixture-probe';server_id=('b'*32);enabled=$true;spool=$null;sample=$null;display=@{client='event-pc';device='laptop-01';location='office';network_path='wifi'}});retired=@()}}
     }
+    if($Action -eq 'adjacent-bundle') {
+        if(-not $script:p6Busy){throw 'discovery is not guarded'}
+        $count=$script:seen.Count
+        Run-P6Action 'install'
+        Run-P6Action 'pause'
+        Refresh-P6Status
+        if($script:seen.Count -ne $count){throw 'discovery allowed reentrant dispatch'}
+        $closing=[Windows.Forms.FormClosingEventArgs]::new([Windows.Forms.CloseReason]::UserClosing,$false)
+        [void]$form.GetType().GetMethod('OnFormClosing',[Reflection.BindingFlags]'Instance,NonPublic').Invoke($form,@($closing))
+        if(-not $closing.Cancel){throw 'discovery allowed staging cleanup on close'}
+        if($script:discoveryThrow){throw 'fixture backend failure'}
+        if($script:discoveryFail){return @{ok=$false;value=$null}}
+        return @{ok=$true;value=@{state='selected';path='C:\fixture-only\device-bundle.zip';
+            display=@{client='event-pc';device='laptop-01'}}}
+    }
     if($Action -eq 'autostart-off') {$script:startup=$false}
     if($Action -eq 'autostart-on') {$script:startup=$true}
     return @{ok=$true;value=@{}}
@@ -656,6 +671,26 @@ try {
   $script:p6Pending=$false
   $startupCalls=@($script:seen | Where-Object {$_.action -like 'autostart-*'})
   if($startupCalls.Count -ne 2 -or @($startupCalls | Where-Object {$_.profile -or $_.bundle -or $_.auto -or $_.hasCredential}).Count){throw 'startup containment'}
+  $script:discoveryThrow=$false
+  $script:discoveryFail=$false
+  $OriginalDirectory='C:\fixture-only'
+  $shown=(Get-Command Show-P6Manager).ScriptBlock.Ast.Find({param($n)
+      $n -is [Management.Automation.Language.InvokeMemberExpressionAst] -and $n.Member.Value -eq 'Add_Shown'
+  },$true)
+  if($null -eq $shown){throw 'actual shown event missing'}
+  [void]$shown.Arguments[0].ScriptBlock.GetScriptBlock().Invoke()
+  if($script:p6Busy -or $script:p6Bundle.Text -ne 'C:\fixture-only\device-bundle.zip' `
+     -or $script:p6Heading.Text -notmatch 'event-pc / 设备 laptop-01'){throw 'selected discovery guard not released'}
+  $script:discoveryFail=$true
+  Initialize-P6BundleSelection 'C:\fixture-only'
+  if($script:p6Busy -or $script:p6Heading.Text -notmatch '未通过校验'){throw 'failed discovery guard not released'}
+  $script:discoveryThrow=$true
+  $caught=$false
+  try {Initialize-P6BundleSelection 'C:\fixture-only'} catch {$caught=$true}
+  if(-not $caught -or $script:p6Busy -or -not $script:p6Buttons['pause'].Enabled){throw 'exception left discovery busy'}
+  $closing=[Windows.Forms.FormClosingEventArgs]::new([Windows.Forms.CloseReason]::UserClosing,$false)
+  [void]$form.GetType().GetMethod('OnFormClosing',[Reflection.BindingFlags]'Instance,NonPublic').Invoke($form,@($closing))
+  if($closing.Cancel){throw 'completed discovery still prevents close'}
   $script:p6Bundle.Text='C:\fixture-only\client.zip'
   Run-P6Action 'import'
   Run-P6Action 'pause'

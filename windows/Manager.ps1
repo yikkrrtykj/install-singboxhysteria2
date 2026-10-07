@@ -372,6 +372,28 @@ function New-P6ManagerForm {
     $script:p6Form.Add_FormClosing({param($sender,$event); if ($script:p6Busy) {$event.Cancel=$true}})
     return $script:p6Form
 }
+function Initialize-P6BundleSelection([string]$OriginalDirectory) {
+    if ($script:p6Busy) {return}
+    # Discovery pumps window events while its readonly backend is running.
+    # Keep actions, refresh and FormClosing gated until it has returned, so
+    # neither another operation nor setup staging cleanup can race this read.
+    $script:p6Busy=$true
+    try {
+        $candidate=Invoke-P6Backend 'adjacent-bundle' '' $OriginalDirectory $false $null
+        if ($candidate.ok -and $candidate.value.state -eq 'selected') {
+            $script:p6Bundle.Text=$candidate.value.path
+            $d=$candidate.value.display
+            $script:p6Heading.Text='已识别配置：客户端 ' + $d.client + ' / 设备 ' + $d.device + '。核对后点击“安装 / 更新”。'
+        } elseif ($candidate.ok -and $candidate.value.state -eq 'ambiguous') {
+            $script:p6Heading.Text='同目录有多个设备配置，请点击“选择配置”明确选择。'
+        } elseif (-not $candidate.ok) {
+            $script:p6Heading.Text='同目录配置未通过校验，请重新下载客户端包或明确选择有效配置。'
+        }
+    } finally {
+        $script:p6Busy=$false
+        Update-P6Selection
+    }
+}
 function Show-P6Manager([string]$Python,[string]$Entry,[string]$Package,[string]$Common,[string]$OriginalDirectory) {
     $script:p6Python=$Python
     $script:p6Entry=$Entry
@@ -383,16 +405,7 @@ function Show-P6Manager([string]$Python,[string]$Entry,[string]$Package,[string]
     $timer.Add_Tick({Refresh-P6Status})
     $form.Add_Shown({
         Refresh-P6Status
-        $candidate=Invoke-P6Backend 'adjacent-bundle' '' $OriginalDirectory $false $null
-        if ($candidate.ok -and $candidate.value.state -eq 'selected') {
-            $script:p6Bundle.Text=$candidate.value.path
-            $d=$candidate.value.display
-            $script:p6Heading.Text='已识别配置：客户端 ' + $d.client + ' / 设备 ' + $d.device + '。核对后点击“安装 / 更新”。'
-        } elseif ($candidate.ok -and $candidate.value.state -eq 'ambiguous') {
-            $script:p6Heading.Text='同目录有多个设备配置，请点击“选择配置”明确选择。'
-        } elseif (-not $candidate.ok) {
-            $script:p6Heading.Text='同目录配置未通过校验，请重新下载客户端包或明确选择有效配置。'
-        }
+        Initialize-P6BundleSelection $OriginalDirectory
     })
     try {$timer.Start(); [void]$form.ShowDialog()}
     finally {$timer.Stop(); $timer.Dispose(); $form.Dispose()}

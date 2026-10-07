@@ -231,9 +231,13 @@ Missing second environments remain explicit gaps, never fabricated PASS.
       both protected functions are unchanged. This is an evidence packet, not
       final independent review. Later heads require their own CI/status receipt.
 - [x] Human conditional merge authorization after remaining acceptance/final review.
-- [ ] Final exact-head code/evidence review requested of this agent, and
-      resolution of the observed multiple-profile Reality delay failure. No new
-      outside-reviewer approval gate is introduced.
+- [x] Final product risk-path and retained-evidence review requested of this
+      agent: Windows authority/lifecycle/UI, bounded runtime/storage/transport,
+      provisioning/revocation/ingress, credential packaging/download, session/
+      CSRF and frontend operation boundaries reviewed. One initial GUI discovery
+      race was reproduced and repaired; no claim that latency acceptance passed.
+- [ ] Fresh CI for the GUI repair and resolution of the observed multiple-profile
+      Reality delay failure. No new outside-reviewer approval gate is introduced.
 - [ ] After an authorized merge: merge-commit CI, then separately authorized rollout.
 - [ ] P6C/P6D only after P6B2 completion and explicit authorization.
 
@@ -324,3 +328,17 @@ retained record is still pending; no new sampling or field PASS is claimed.
 Keep the previously scoped CPU/memory evidence, existing functional acceptance
 and original latency/workload requirements. PR remains Draft until the missing
 field evidence and final review actually close.
+## Final source review — GUI discovery fix
+
+Initial adjacent-Bundle discovery waited for its backend while pumping WinForms
+messages without setting the existing busy guard. A second action or window
+close could therefore race that read and the setup staging lifetime. Discovery
+now holds the same guard through success/failure and releases it in finally.
+The actual Shown event and native FormClosing/action handlers are exercised:
+old source fails the guard assertion; repaired source refuses reentrant install,
+pause, refresh and premature close, then permits completion/close after selected,
+failed and exceptional results. Actual WinForms dispatch passes; the existing
+29-test controller/status/adjacent-Bundle suite passes. This is source validation,
+not an update to the user's installed package. CI for predecessor7ec33515 is
+15/15 successful; the new product commit needs its own CI. The native two-profile
+Reality+13ms result remains unresolved and blocks merge. No new field run.

@@ -308,3 +308,23 @@ profile/queue bytes, stopped-state preservation and pending recovery refusal;
 native suite now has26 tests. Source change is not an installed-device update.
 This feature does not close the remaining matched latency/workload evidence or
 final review conditions, and does not repeat accepted30min CPU/memory checks.
+
+## Final product risk-path review and GUI discovery repair
+
+Review covers Windows installer/SCM authority, catalog/signature/publication,
+profile/queue lifecycle, GUI actions/status, bounded Agent runtime/persistence/
+TLS, root provisioning/revocation/ingress, secret export/package/download and
+Web session/CSRF/frontend boundaries. This review found an initial GUI discovery
+race: its backend wait pumped window events without the busy guard, allowing
+another action or closing the window to race the read and setup staging cleanup.
+The initial discovery now acquires the existing guard and releases it in finally.
+Native controls and the actual Shown callback reproduce the old defect and verify
+blocked reentrant dispatch/close plus guard release after selected, failed and
+exceptional results. Existing controller/status/adjacent-Bundle tests29/29 pass.
+No installed client, service, signing trust, Clash/TUN or VPS change is claimed.
+
+Predecessor7ec335151e4ee0009140978a5e0fea42f552629a has15/15 actual CI jobs
+successful. The repair requires new-head CI. Source/evidence risk review is
+complete with the findings above; it does not satisfy the retained native
+Reality+13ms added-p95 failure or establish its cause. PR stays Draft/unmerged
+until that original acceptance condition and the repair's CI are satisfied.
