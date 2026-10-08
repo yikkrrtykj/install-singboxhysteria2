@@ -679,6 +679,7 @@ sbmon_stage_release() { # sbmon_stage_release <version> -> prints release id on 
     [ -d "$SBMON_REPO_MONITOR_DIR/api_bridge" ] || sbmon_die "缺少 api_bridge/: $SBMON_REPO_MONITOR_DIR"
     [ -f "$SBMON_REPO_MONITOR_DIR/webapp.py" ] || sbmon_die "缺少 webapp.py: $SBMON_REPO_MONITOR_DIR"
     [ -d "$SBMON_REPO_MONITOR_DIR/web" ] || sbmon_die "缺少 web/: $SBMON_REPO_MONITOR_DIR"
+    [ -f "$SBMON_REPO_MONITOR_DIR/web/host_evidence.py" ] || sbmon_die "缺少 host_evidence.py：服务器证据启动模块必需"
     cp -- "$SBMON_REPO_MONITOR_DIR/collector.py" "$staged/app/monitor-v2/"
     cp -- "$SBMON_REPO_MONITOR_DIR/webapp.py" "$staged/app/monitor-v2/"
     [ -f "$SBMON_REPO_MONITOR_DIR/p6_distribution.py" ] || sbmon_die "missing Windows distribution validator"

@@ -1267,26 +1267,26 @@ if [ "$SYMLINKS_OK" != 1 ]; then
 fi
 if [ "$SYMLINKS_OK" = 1 ]; then
 run_uninstall_quiet
-printf '0.9.0\n' > "$FIX_SRC/VERSION"
+printf '98.9.0\n' > "$FIX_SRC/VERSION"
 run_install "$TMP/out-r43a.log"
-assert_rc 0 $? "deploy 0.9.0"
-touch -d '3 hours ago' "$FIX_RELEASES"/0.9.0-* 2>/dev/null   # distinct creation ages
-printf '0.10.0\n' > "$FIX_SRC/VERSION"
+assert_rc 0 $? "deploy 98.9.0"
+touch -d '3 hours ago' "$FIX_RELEASES"/98.9.0-* 2>/dev/null   # distinct creation ages
+printf '98.10.0\n' > "$FIX_SRC/VERSION"
 run_install "$TMP/out-r43b.log"
-assert_rc 0 $? "deploy 0.10.0"
-touch -d '2 hours ago' "$FIX_RELEASES"/0.10.0-* 2>/dev/null   # distinct creation ages
+assert_rc 0 $? "deploy 98.10.0"
+touch -d '2 hours ago' "$FIX_RELEASES"/98.10.0-* 2>/dev/null   # distinct creation ages
 printf '0.2.0\n' > "$FIX_SRC/VERSION"
 ( SBMON_KEEP_RELEASES=2 "$INSTALL_MONITOR" install --allow-downgrade ) > "$TMP/out-r43c.log" 2>&1
 assert_rc 0 $? "deploy 0.2.0 --allow-downgrade (prune keeps 2 by deployment age)"
-if ls -d "$FIX_RELEASES/0.9.0-"* >/dev/null 2>&1; then
-    fail "0.9.0 retained -- lexicographic order leaked into prune"
+if ls -d "$FIX_RELEASES/98.9.0-"* >/dev/null 2>&1; then
+    fail "98.9.0 retained -- lexicographic order leaked into prune"
 else
-    pass "oldest DEPLOYED release (0.9.0) pruned first (chronology)"
+    pass "oldest DEPLOYED release (98.9.0) pruned first (chronology)"
 fi
-if ls -d "$FIX_RELEASES/0.10.0-"* >/dev/null 2>&1; then
-    pass "0.10.0 retained (lexicographically smallest, deployment-newer)"
+if ls -d "$FIX_RELEASES/98.10.0-"* >/dev/null 2>&1; then
+    pass "98.10.0 retained (lexicographically smallest, deployment-newer)"
 else
-    fail "0.10.0 was pruned by version lexical order (R4-3)"
+    fail "98.10.0 was pruned by version lexical order (R4-3)"
 fi
 
 section "R4-3 default rollback skips pruned history entries"
@@ -1296,12 +1296,12 @@ if ( "$INSTALL_MONITOR" rollback ) > "$OUT_R43D" 2>&1; then
 else
     fail "default rollback exits 0"
 fi
-assert_eq '0.10.0' "$(cat "$FIX_APP_LINK/VERSION")" "default rollback selects 0.10.0, skipping the pruned 0.9.0 (R4-3)"
+assert_eq '98.10.0' "$(cat "$FIX_APP_LINK/VERSION")" "default rollback selects 98.10.0, skipping the pruned 98.9.0 (R4-3)"
 
 section "R4-3 no retained rollback target -> clean fail"
-# remove every NON-current release tree (the live 0.10.0 stays; removing the
+# remove every NON-current release tree (the live 98.10.0 stays; removing the
 # live tree would not exercise the pruned-target scan)
-rm -rf "$FIX_RELEASES"/0.2.0-* "$FIX_RELEASES"/0.9.0-* 2>/dev/null
+rm -rf "$FIX_RELEASES"/0.2.0-* "$FIX_RELEASES"/98.9.0-* 2>/dev/null
 HIST_R43="$(cat "$FIX_RELEASES/releases.history")"
 VER_R43="$(cat "$FIX_APP_LINK/VERSION")"
 OUT_R43E="$TMP/out-r43e.log"
@@ -1313,8 +1313,8 @@ else
     pass "rollback with no retained target fails (rc=$RC_R43E)"
 fi
 assert_grep '没有仍保留的可回滚' "$OUT_R43E" "clean fail message (R4-3)"
-assert_eq "$VER_R43" "$(cat "$FIX_APP_LINK/VERSION")" "current (0.10.0) unchanged after clean fail (R4-3)"
-assert_eq '0.10.0' "$(cat "$FIX_APP_LINK/VERSION")" "live release still 0.10.0 after clean fail (R4-3)"
+assert_eq "$VER_R43" "$(cat "$FIX_APP_LINK/VERSION")" "current (98.10.0) unchanged after clean fail (R4-3)"
+assert_eq '98.10.0' "$(cat "$FIX_APP_LINK/VERSION")" "live release still 98.10.0 after clean fail (R4-3)"
 assert_eq "$HIST_R43" "$(cat "$FIX_RELEASES/releases.history")" "no new history entry after clean fail (R4-3)"
 fi  # end SYMLINKS_OK block (R4-3)
 
@@ -1937,6 +1937,7 @@ assert_grep '"age_stale":true' <(printf '%s' "$H_JSON") "age_stale=true for old 
 
 printf '{"schema_version":1,"snapshot_version":11,"published_at":"2030-01-01T00:00:00+00:00","collector_stale":false,"consumer_alive":true}\n' > "$HEALTH_FILE"
 kill "$WEB_LIVE_PID" 2>/dev/null
+wait "$WEB_LIVE_PID" 2>/dev/null || true
 WEB_LIVE_PID=""
 sleep 0.5
 H_JSON="$(hw_probe)"; H_RC=$?
@@ -2062,6 +2063,7 @@ assert_rc 0 "$H_RC" "extra session fields tolerated (stable shape check) (R1.1-C
 assert_no_grep "$C_SENTINEL" <(printf '%s' "$H_JSON") "session body contents never appear in probe output (R1.1-C)"
 
 kill "$C_STUB_PID" 2>/dev/null
+wait "$C_STUB_PID" 2>/dev/null || true
 C_STUB_PID=""
 sleep 0.4
 H_JSON="$(c_probe)"; H_RC=$?
@@ -2100,6 +2102,7 @@ else
     fail "real E2 web server did not come up for the identity probe (R1.1-C)"
 fi
 kill "$C_REAL_PID" 2>/dev/null
+wait "$C_REAL_PID" 2>/dev/null || true
 rm -rf "$C_REAL_DATA"
 [ -n "$C_API_PID" ] && kill "$C_API_PID" 2>/dev/null
 
@@ -2960,6 +2963,11 @@ else
         fail "T26 candidate equals the 0.1.5 baseline -- the fixture tests no delta"
     fi
     assert_eq "$T26_NEW_VER" "$(cat "$T26_APP/VERSION" 2>/dev/null)" "the new immutable $T26_NEW_VER release is active"
+    if [ -f "$T26_APP/app/monitor-v2/web/host_evidence.py" ]; then
+        pass "server service/resource evidence startup payload is packaged"
+    else
+        fail "server service/resource evidence startup payload missing"
+    fi
     if [ -f "$T26_APP/app/monitor-v2/web/incident_history.py" ]; then
         pass "the $T26_NEW_VER release stages the 0.2.0-era web/incident_history.py module (whole-web/-R copy)"
     else

@@ -141,9 +141,9 @@ then
 else
     fail "broker publication hook ordering/guard contract broken"
 fi
-assert_eq '0.8.1' "$(cat "$ROOT/monitor-v2/VERSION")" "VERSION file is 0.8.1"
-assert_contains 'MONITOR_WEB_VERSION = "0.8.1"' \
-    "$(cat "$ROOT/monitor-v2/web/server.py")" "MONITOR_WEB_VERSION is 0.8.1"
+assert_eq '0.9.0' "$(cat "$ROOT/monitor-v2/VERSION")" "VERSION file is 0.9.0"
+assert_contains 'MONITOR_WEB_VERSION = "0.9.0"' \
+    "$(cat "$ROOT/monitor-v2/web/server.py")" "MONITOR_WEB_VERSION is 0.9.0"
 assert_eq "0" "$(grep -c 'diagnostics/timeline' "$ROOT/monitor-v2/web/static/app.js" "$ROOT/monitor-v2/web/static/index.html" | awk -F: '{s+=$2} END {print s+0}')" \
     "the timeline read surface is still never consumed by the static frontend (PR-5 consumes the closed incidents family instead)"
 if grep -Eq 'ReadWritePaths|supplementaryGroups|AmbientCapabilities|journald|sudoers' "$HIST_PY"; then

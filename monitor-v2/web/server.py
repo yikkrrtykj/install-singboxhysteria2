@@ -64,7 +64,7 @@ from web.remote_ingest import (INGEST_HEADERS, INGEST_MAX_BODY,
 from web.recovery import (RECOVERY_SUCCESS_MESSAGE, RecoveryGlobalGuard,
                           RecoveryRateLimiter, generate_key)
 
-MONITOR_WEB_VERSION = "0.8.1"
+MONITOR_WEB_VERSION = "0.9.0"
 SESSION_COOKIE = "monitor_session"
 MAX_BODY_BYTES = 65536
 SUPPORTED_METHODS = "GET, POST"
@@ -481,7 +481,7 @@ class MonitorWebApp:
                  remote_mode=False, version=MONITOR_WEB_VERSION,
                  recovery_guard=None, management_active=None, e3_broker=None,
                  incident_history=None, probe_scheduler=None,
-                 incident_scanner=None, remote_plane=None, bundle_artifact=None, windows_distribution=None):
+                 incident_scanner=None, remote_plane=None, bundle_artifact=None, windows_distribution=None, host_evidence=None):
         self.broker = broker
         self.access = access
         self.auth = auth
@@ -491,6 +491,7 @@ class MonitorWebApp:
         # Issue #33 P1: the bounded incident timeline. Injectable; None
         # (standalone harnesses) keeps the read endpoint a clean 503.
         self.incident_history = incident_history
+        self.host_evidence = host_evidence
         # Issue #33 PR-3B: the probe scheduler's closed status object is the
         # ONLY thing this surface can show about probing -- no endpoints, no
         # probe results, no paths, no free text.
@@ -871,6 +872,14 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
                 # rearm is POST-only by contract: a GET here is a method
                 # error on a known route, never a silent 404.
                 self._method_not_allowed(allowed="POST")
+                return
+            if suffix.endswith('/host-evidence'):
+                id_text = suffix[:-len('/host-evidence')]
+                incident_id = parse_positive_id(id_text)
+                if incident_id is not None and id_text == str(incident_id):
+                    self._require_session(self._handle_incident_host, incident_id)
+                else:
+                    self._send_json(404, {"error": "incident_not_found"})
                 return
             if suffix.endswith('/remote-probes'):
                 id_text = suffix[:-len('/remote-probes')]
@@ -1390,6 +1399,31 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         row["markers"] = [dict(marker, label=incident_presenter.marker_label(
             marker["kind"])) for marker in detail["markers"]]
         self._send_json(200, row)
+
+    def _handle_incident_host(self, session, incident_id):
+        """Server-derived window only; separate supporting facts, no P5 keys."""
+        history = self.app.incident_history
+        if history is None:
+            self._send_json(503, {"error": "incident history not enabled"})
+            return
+        outcome, detail = history.incident_detail(incident_id)
+        if outcome == ih_outcome_missing:
+            self._send_json(404, {"error": "incident_not_found"})
+            return
+        if outcome != ih_outcome_ok:
+            self._send_json(503, {"error": "incident history unavailable"})
+            return
+        plane = self.app.host_evidence
+        if plane is None:
+            self._send_json(503, {"error": "host evidence unavailable"})
+            return
+        try:
+            result = plane.incident(incident_id, detail["analysis_start_epoch"],
+                                    detail["last_classified_end_epoch"])
+        except Exception:
+            self._send_json(503, {"error": "host evidence unavailable"})
+            return
+        self._send_json(200, result)
 
     def _handle_incident_remote(self, session, incident_id):
         """P6C: separate GET-only supporting evidence, never P5 row enrichment."""
