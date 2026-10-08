@@ -143,7 +143,8 @@
     "No protocol or path attribution is supported by this evidence.": "此证据不支持任何协议或链路归因。",
     "No server-side fault can be claimed or excluded from this evidence.": "此证据无法确认或排除服务器端故障。",
     "The evidence supports no fault domain: insufficient evidence.": "证据不支持任何故障域：证据不足。",
-    "Correlation is not causation: the root cause is not established. Server-side sparse device state cannot authoritatively determine which logical clients were affected, and it cannot infer ISP ownership or path identity; nor does it name a specific destination. No process-restart or resource-exhaustion history is recorded that could support such a claim.": "相关性不等于因果关系：根因尚未确定。服务器端有限的设备状态记录无法权威判断哪些逻辑客户端受到影响，也不能推断 ISP 归属、链路身份或某个具体目标地址。没有记录可以支持进程重启或资源耗尽判断的历史数据。",
+    "Correlation is not causation: the root cause is not established. Server-side sparse device state cannot authoritatively determine which logical clients were affected, and it cannot infer ISP ownership or path identity; nor does it name a specific destination. No process-restart or resource-exhaustion history is recorded that could support such a claim.": "相关性不等于因果关系：根因尚未确定。设备记录不能确定全部受影响客户端，也不能推断 ISP 或具体故障位置。原事件分类未使用独立的服务重启和资源记录；请结合「服务器状态 · 事件时段」查看。",
+    "Correlation is not causation: the root cause is not established. Server-side sparse device state cannot authoritatively determine which logical clients were affected, and it cannot infer ISP ownership or path identity; nor does it name a specific destination. Process-restart and resource facts, when available, are shown separately; they were not inputs to this stored classification.": "相关性不等于因果关系：根因尚未确定。设备记录不能确定全部受影响客户端，也不能推断 ISP 或具体故障位置。原事件分类未使用独立的服务重启和资源记录；请结合「服务器状态 · 事件时段」查看。",
     "Correlation is not causation: the root cause is not established.": "相关性不等于因果关系：根因尚未确定。",
     "No open questions were recorded for this verdict.": "此结论没有记录待解问题。"
 };
@@ -816,6 +817,7 @@
     if (!state.session || !state.session.authenticated || state.selectedIncidentId !== id) return;
     var generation = ++hostRequestGeneration;
     $("inc-host-brief").textContent = "服务器侧：正在读取事件时段的服务与资源记录。";
+    $("inc-host-action").textContent = "";
     $("inc-host-summary").textContent = "";
     $("inc-host-resources").textContent = "";
     return api("/api/v1/incidents/" + id + "/host-evidence").then(function (data) {
@@ -825,10 +827,29 @@
     }).catch(function () {
       if (generation !== hostRequestGeneration || state.selectedIncidentId !== id) return;
       $("inc-host-brief").textContent = "服务器记录暂不可读取，无法确认当时的服务与资源状态。";
+      $("inc-host-action").textContent = "建议先看：同一时段的设备检测和网络探测，待服务器记录可读取后再对照。";
     });
+  }
+  function hostNextStep(data) {
+    var service = data.service || {};
+    if (data.availability === "no_records" || data.availability === "unavailable" || !data.sample_count)
+      return "同一时段的设备检测和网络探测；服务器记录缺失时不能判断当时是否停止或重启。";
+    if (!service.observations) return "同一时段的设备检测和网络探测；当前没有取得服务状态。";
+    if (service.not_running_samples > 0)
+      return "服务未运行的记录及同一时段错误；停运与网络异常是否相关，仍需对照确认。";
+    if (service.automatic_restart_increments > 0)
+      return "自动重启前后的服务错误和设备检测，核对时间是否吻合。";
+    if (service.process_changes_observed > 0)
+      return "是否有人工更新或重启，再对照进程变化前后的设备检测。";
+    if (data.availability !== "available" || data.truncated || data.gaps ||
+        service.incomparable_transitions || service.counter_resets ||
+        service.observations !== data.sample_count || data.sample_count < 2)
+      return "记录缺口与同一时段的设备检测；现有记录不足以排除服务变化。";
+    return "同一时段的网络探测和设备检测；采样点未显示停运或重启变化，但仍可能遗漏短暂异常。";
   }
   function renderIncidentHost(data) {
     var brief = $("inc-host-brief"), service = data.service || {};
+    $("inc-host-action").textContent = "建议先看：" + hostNextStep(data);
     if (data.availability === "no_records" || data.availability === "unavailable" || !data.sample_count) {
       brief.textContent = data.availability === "unavailable" ?
         "服务器记录暂不可读取，无法确认当时的服务与资源状态。" :

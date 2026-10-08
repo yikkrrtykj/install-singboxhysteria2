@@ -238,6 +238,15 @@ class ReaderTests(unittest.TestCase):
         self.assertIsNotNone(second['cpu_percent'])
         self.assertIsNotNone(second['disk_percent'])
 
+class PresenterBoundaryTests(unittest.TestCase):
+    def test_summary_limits_do_not_deny_separate_recorded_facts(self):
+        from web.incident_presenter import summarize, SUMMARY_KEYS
+        result = summarize(dict(category='insufficient_evidence',first_signal_epoch=1,last_signal_epoch=2),())
+        self.assertEqual(set(result),set(SUMMARY_KEYS))
+        self.assertIn('shown separately',result['limitations'])
+        self.assertIn('not inputs to this stored classification',result['limitations'])
+        self.assertNotIn('No process-restart or resource-exhaustion history is recorded',result['limitations'])
+
 class HTTPTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

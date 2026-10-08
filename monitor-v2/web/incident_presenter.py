@@ -426,17 +426,18 @@ _SUMMARY_TABLE = {
 # Shared, frozen: what this presentation can NEVER claim. The store holds
 # only SPARSE device state (change/heartbeat rows), so it cannot
 # authoritatively determine which logical clients were affected, and it
-# holds no ISP ownership/path mapping; no process-restart or
-# resource-exhaustion history is persisted either (the P4A/P4B evidence
-# plane carries no PID/NRestarts/FD/conntrack series), and no specific
+# holds no ISP ownership/path mapping. The stored P4 verdict does not
+# consume the separate host-evidence plane, so its limits must not deny
+# that newer independent service/resource records exist. No specific
 # destination can be named.
 _LIMITATIONS = ("Correlation is not causation: the root cause is not "
                 "established. Server-side sparse device state cannot "
                 "authoritatively determine which logical clients were "
                 "affected, and it cannot infer ISP ownership or path "
-                "identity; nor does it name a specific destination. No "
-                "process-restart or resource-exhaustion history is "
-                "recorded that could support such a claim.")
+                "identity; nor does it name a specific destination. "
+                "Process-restart and resource facts, when available, "
+                "are shown separately; they were not inputs to this "
+                "stored classification.")
 
 SUMMARY_KEYS = ("headline", "window", "impact", "protocol_state",
                 "server_state", "affected_scope", "assessment",
