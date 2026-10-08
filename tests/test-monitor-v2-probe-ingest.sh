@@ -641,12 +641,12 @@ then
 else
     fail "the harness has a non-loopback socket call site"
 fi
-assert_eq '0.7.0' "$(cat "$ROOT/monitor-v2/VERSION")" \
-    "VERSION is 0.7.0 (the remote-probe ingest release)"
-if grep -q 'MONITOR_WEB_VERSION = "0.7.0"' "$SERVER_PY"; then
-    pass "MONITOR_WEB_VERSION is 0.7.0"
+assert_eq '0.8.0' "$(cat "$ROOT/monitor-v2/VERSION")" \
+    "VERSION is 0.8.0 (the incident remote-evidence release)"
+if grep -q 'MONITOR_WEB_VERSION = "0.8.0"' "$SERVER_PY"; then
+    pass "MONITOR_WEB_VERSION is 0.8.0"
 else
-    fail "MONITOR_WEB_VERSION moved off 0.7.0"
+    fail "MONITOR_WEB_VERSION moved off 0.8.0"
 fi
 if grep -q 'test-monitor-v2-probe-ingest.sh' "$ROOT/.github/workflows/tests.yml" \
     && grep -q 'bash -n tests/test-monitor-v2-probe-ingest.sh' \

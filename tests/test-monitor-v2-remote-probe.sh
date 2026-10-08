@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Monitor 0.7.0 -- P6A dark office remote-probe agent suite (issue #67 PR-6A).
+# Monitor 0.8.0 -- P6A dark office remote-probe agent suite (issue #67 PR-6A).
 #
 # PR-6A ships the office-side agent DARK: new namespace monitor-v2/remote_probe/,
 # no server ingest route, no server database, no History/classifier/UI/deploy
@@ -27,7 +27,7 @@
 #   3. THE RED LINES HOLD. No server ingest route, no remote database, History
 #      still schema v5 on the eleven-table shape with its six prune sources, no
 #      remote reference in the classifier / incident runtime / presenter, and
-#      the release identity moved to 0.7.0 with PR-6B (which owns the bump).
+#      the release identity is 0.8.0 for the authorized P6C candidate.
 #   4. THE LANE IS WIRED. A suite nobody runs cannot fail.
 #
 # Deterministic by construction: no Internet, no real Mihomo, no VPS, no
@@ -46,7 +46,7 @@ FAIL=0
 # 250 = S0 static + red-line gates 19 (py_compile of the package + harness, the
 # in-module reuse documentation, the FOUR frozen sha256 pins that prove the
 # audited E4 client/model/diag/README were reused and never forked, the E4
-# file-set check, the release identity 0.7.0 in both places, History
+# file-set check, the release identity 0.8.0 in both places, History
 # still v5 with its six prune sources and no remote table, the three P4/P5
 # modules free of any remote reference, the absent server ingest route, the
 # absent server remote store, and the two CI registrations) + S1 harness 206
@@ -190,10 +190,10 @@ assert_eq "README.md __init__.py client.py diag.py fixtures model.py" \
     "the E4 adapter directory has exactly its original source file set"
 
 # (3) Red lines.
-assert_eq "0.7.0" "$(tr -d '[:space:]' < "$ROOT/monitor-v2/VERSION")" \
-    "VERSION is 0.7.0 (PR-6B owns the release bump)"
-assert_eq "1" "$(grep -c 'MONITOR_WEB_VERSION = "0.7.0"' "$SERVER_PY")" \
-    "MONITOR_WEB_VERSION is 0.7.0"
+assert_eq "0.8.0" "$(tr -d '[:space:]' < "$ROOT/monitor-v2/VERSION")" \
+    "VERSION is 0.8.0 (PR-6C release candidate)"
+assert_eq "1" "$(grep -c 'MONITOR_WEB_VERSION = "0.8.0"' "$SERVER_PY")" \
+    "MONITOR_WEB_VERSION is 0.8.0"
 assert_eq "1" "$(grep -c '^SCHEMA_VERSION = 5$' "$HIST_PY")" \
     "History is still schema v5 (no P6 migration)"
 if [ "$(grep -A 8 '^_PRUNE_SOURCES = (' "$HIST_PY" | grep -c '^    (\"')" = "6" ] \
@@ -214,21 +214,20 @@ for module in incident_classifier incident_runtime incident_presenter; do
         pass "$module.py carries no remote reference"
     fi
 done
-# PR-6B owns the machine ingest route and its plane: exactly the four
-# frozen web files may name the remote surface, the PR-6C incident
-# read route still must not exist anywhere, and webapp.py wires only
-# the optional plane (no route logic of its own).
+# Collection and ingest remain isolated. P6C adds only a separate
+# session-gated incident GET and its presentation; webapp.py still wires
+# the optional plane without route logic of its own.
 ROUTE_HITS="$(grep -rl 'remote-probes' "$ROOT/monitor-v2/web" "$WEBAPP" 2>/dev/null | grep -v __pycache__ | xargs -n1 basename 2>/dev/null | sort | tr '
 ' ' ')"
-if grep -rq 'incidents/<incident_id>/remote-probes' "$ROOT/monitor-v2/web" 2>/dev/null; then
-    fail "the PR-6C incident remote-probes read route exists"
+if grep -q 'self._require_session(self._handle_incident_remote, incident_id)' "$SERVER_PY"; then
+    pass "P6C incident read dispatch requires a browser session"
 else
-    pass "no incident remote-probes read route exists (PR-6C stays out)"
+    fail "P6C incident read dispatch lacks its required session gate"
 fi
-# The P6B2 passive bundle validator names the existing ingest URL without
-# creating a server ingest/read route. All other files remain disallowed.
-if [ "$ROUTE_HITS" = "p6_bundle.py remote_registry.py remote_store.py server.py " ]; then
-    pass "remote references are exactly P6B plus the passive P6B2 bundle validator"
+# Keep the exact reference file set closed; History and classifier gates
+# above are unchanged. HTTP behavior is separately exercised by P6C tests.
+if [ "$ROUTE_HITS" = "app.js incident_remote.py p6_bundle.py remote_registry.py remote_store.py server.py " ]; then
+    pass "remote references are exactly P6B2 plus authorized P6C presentation"
 else
     fail "unexpected server remote surface: $ROUTE_HITS"
 fi

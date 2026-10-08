@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
-# PR-6B server ingest / remote store suite (issue #67 PR-6B, Monitor 0.7.0).
+# PR-6B server ingest / remote store suite (issue #67 PR-6B, Monitor 0.8.0).
 #
 # Deterministic, offline, no Internet / real proxy / real VPS / wall clock.
 # The count is hard-gated:
 #
 # 189 = S0 static + red-line gates 33 (py_compile of the server modules
-#      + harness; the release identity 0.7.0 in both places; History still
+#      + harness; the release identity 0.8.0 in both places; History still
 #      schema v5 with its six frozen prune sources and no remote words;
 #      classifier/runtime/presenter carry no remote reference; the ingest
 #      dispatch appears once and sits before the browser cross-origin gate
-#      with a single whitelist evaluation; the PR-6C incident read route
-#      does not exist and the server remote surface is exactly the frozen
-#      PR-6B web file set; the proxy template exposes ONLY the exact
+#      with a single whitelist evaluation; the authorized PR-6C incident
+#      read dispatch is session-gated and the remote reference file set is
+#      closed to ingest, bundle validation and incident presentation;
+#      the proxy template exposes ONLY the exact
 #      ingest path on a loopback upstream with no forwarded headers, a
 #      16 KiB body bound and TLS termination; the deploy tooling never
 #      references the remote store and the History prestate stays an
@@ -67,8 +68,8 @@ for harness in store_groups linux_groups; do
     fi
 done
 
-assert_eq '0.7.0' "$(cat "$ROOT/monitor-v2/VERSION")" "VERSION is 0.7.0 (PR-6B owns the release bump)"
-assert_contains 'MONITOR_WEB_VERSION = "0.7.0"' "$(cat "$SERVER_PY")" "MONITOR_WEB_VERSION is 0.7.0"
+assert_eq '0.8.0' "$(cat "$ROOT/monitor-v2/VERSION")" "VERSION is 0.8.0 (PR-6C release candidate)"
+assert_contains 'MONITOR_WEB_VERSION = "0.8.0"' "$(cat "$SERVER_PY")" "MONITOR_WEB_VERSION is 0.8.0"
 
 HIST_TXT="$(cat "$HIST_PY")"
 assert_contains 'SCHEMA_VERSION = 5' "$HIST_TXT" "History schema stays v5"
@@ -96,17 +97,15 @@ fi
 assert_contains 'def _handle_remote_ingest' "$(cat "$SERVER_PY")" "the ingest handler exists on the shipped handler"
 assert_eq '1' "$(grep -c '\.is_allowed(' "$SERVER_PY")" "the whitelist keeps exactly one evaluation (no new exemption)"
 
-# The PR-6C incident read route must not exist anywhere in web/.
-if grep -rq 'incidents/<incident_id>/remote-probes' "$SERVER_DIR" 2>/dev/null; then
-    no "no PR-6C incident remote-probes read route exists"
-else
-    ok "no PR-6C incident remote-probes read route exists"
-fi
+# P6C authorizes only a separate session-gated incident read. Its method,
+# canonical ID, stored-window and closed-schema gates run in the HTTP suite.
+assert_contains 'self._require_session(self._handle_incident_remote, incident_id)' \
+    "$(cat "$SERVER_PY")" "P6C incident read dispatch requires a browser session"
 ROUTE_FILES="$(grep -rl 'remote-probes' "$SERVER_DIR" "$WEBAPP" 2>/dev/null | grep -v '__pycache__' | xargs -n1 basename 2>/dev/null | sort | tr '\n' ' ')"
-# P6B2 adds exactly one passive generated-profile validator, not an ingest or
-# incident endpoint. Keep the exact set closed; PR-6C remains refused above.
-assert_eq 'p6_bundle.py remote_registry.py remote_store.py server.py ' "$ROUTE_FILES" \
-    "remote references are exactly P6B plus the passive P6B2 bundle validator"
+# Preserve the closed file set and all History/classifier/proxy walls above.
+# P6C adds only its incident read module and DOM presentation to the P6B2 set.
+assert_eq 'app.js incident_remote.py p6_bundle.py remote_registry.py remote_store.py server.py ' "$ROUTE_FILES" \
+    "remote references are exactly P6B2 plus authorized P6C presentation"
 
 # Reverse-proxy template contract.
 PROXY_TXT="$(cat "$PROXY_CONF")"

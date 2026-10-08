@@ -272,3 +272,7 @@ input[type="text"], input[type="password"] {
   .status-row { gap: 14px; }
   .dest { max-width: 150px; }
 }
+
+/* P6C uses the existing table scroll container on narrow screens. */
+.inc-remote-device { margin: .75rem 0; padding: .5rem; border: 1px solid var(--border); border-radius: .5rem; }
+#inc-remote { margin-top: 1.25rem; }

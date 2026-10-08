@@ -143,6 +143,17 @@
         <h3>尚未确定的问题</h3>
         <ul id="inc-unknowns-list" class="inc-reason-list"></ul>
 
+        <section id="inc-remote" aria-labelledby="inc-remote-title">
+          <div class="table-toolbar">
+            <h3 id="inc-remote-title">设备监测 · 事件时段</h3>
+            <button id="inc-remote-refresh" class="btn ghost" type="button">刷新设备记录</button>
+          </div>
+          <p class="muted">这里只展示辅助事实，不改变事件判断。位置和网络路径是管理员登记的标签；不同标签不代表独立线路。缓存观察可能来自主动测试，不作为第二份独立证据。</p>
+          <p id="inc-remote-msg" role="status"></p>
+          <div id="inc-remote-status"></div>
+          <div id="inc-remote-rows"></div>
+        </section>
+
         <h3>技术标记（原始值，L4）</h3>
         <p class="muted">原始分类标记供复制到诊断工具，判断时请优先阅读上方文字说明。</p>
         <h4>证据标记</h4>

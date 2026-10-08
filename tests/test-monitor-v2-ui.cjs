@@ -85,8 +85,16 @@ const context = vm.createContext({ document, console, Uint8Array, Date, performa
   }
 });
 vm.runInContext(app.replace('document.addEventListener("DOMContentLoaded", boot);',
-  'globalThis.ui = {state, bind, render, loadSession, loadE3Status, loadE3Clients, convergeAfterMutation, renderE3Controls, renderE3Clients, renderMonitorInfo, addClient, deleteClient, downloadConfig, setPendingRetry, retryPending, apiWithStepUp, setView, loadIncidents, renderIncidents, openIncident, renderIncidentDetail, closeIncidentDetail, loadEvidence, loadMarkers, renderMarkers, addMarker, rearmIncidents, renderIncRuntime, p6View, openP6Devices, loadP6Devices, p6Operate, downloadP6Bundle, downloadP6Windows, downloadP6Client, renderP6Devices, incidentCopy, userActivity, setIdleDeadline, startWatchdog};'), context);
+  'globalThis.ui = {state, bind, render, loadSession, loadE3Status, loadE3Clients, convergeAfterMutation, renderE3Controls, renderE3Clients, renderMonitorInfo, addClient, deleteClient, downloadConfig, setPendingRetry, retryPending, apiWithStepUp, setView, loadIncidents, renderIncidents, openIncident, renderIncidentDetail, renderIncidentRemote, loadIncidentRemote, closeIncidentDetail, loadEvidence, loadMarkers, renderMarkers, addMarker, rearmIncidents, renderIncRuntime, p6View, openP6Devices, loadP6Devices, p6Operate, downloadP6Bundle, downloadP6Windows, downloadP6Client, renderP6Devices, incidentCopy, userActivity, setIdleDeadline, startWatchdog};'), context);
 const ui = context.ui;
+function remoteFixture(rows = []) {
+  return {v: 1, incident_id: 1, window: {start_epoch: 1, end_epoch: 160},
+    retention: {max_age_seconds: 604800, retention_cutoff_epoch: 0, retained_since_epoch: 100, budget_pruned: false},
+    current_status: {observed_epoch: 200, status: 'source_unavailable', subcode: 'probe_not_reporting',
+      probes: [{probe_id: 'device-a', status: 'source_unavailable', subcode: 'probe_not_reporting',
+                last_sample_epoch: 100, site_label: 'office', path_label: 'path-a'}]},
+    rows, truncated: false, limit: 255};
+}
 // 0.1.4: the convergence chain (mutation -> one endpoint -> apply) crosses
 // several cross-realm promise reactions; 12 ticks starved it. Drain
 // generously.
@@ -677,7 +685,7 @@ async function main() {
   responses.push(response(detail),
     // renderIncidentDetail chains loadEvidence() on the same tick: the
     // probe_rows read must already be queued behind the detail body.
-    response({subject: {type: 'incident', id: 1}, section: 'samples', window: {start_epoch: 1, end_epoch: 160}, rows: [], truncated: false, retention_cutoff_epoch: 0}));
+    response({subject: {type: 'incident', id: 1}, section: 'samples', window: {start_epoch: 1, end_epoch: 160}, rows: [], truncated: false, retention_cutoff_epoch: 0}), response(remoteFixture()));
   await ui.openIncident(1); await flush();
   check('the L1 first screen renders the plain-language summary without raw snake_case tokens', () => {
     assert.match(ids['inc-detail'].textContent, /Reality\/TCP 链路事件/);
@@ -1087,6 +1095,47 @@ async function main() {
     assert.match(ids['login-error'].textContent, /15 分钟/); assert.equal(intervalCallbacks.size, 0);
     assert.equal(requests.length, activityMark);
   });
-  assert.equal(count, 125, 'UI assertion count guard');
+  const remoteRow = {sample_epoch: 100, probe_id: 'device-a', mapping_retired: false,
+    site_label: '<img src=x onerror=alert(1)>', path_label: 'operator-path',
+    dns: {status: 'ok', latency_ms: 7, error_code: 'NONE'},
+    https: {status: 'failed', latency_ms: null, error_code: 'connect_failed'},
+    vps_tcp: {status: 'ok', latency_ms: 10, error_code: 'NONE'},
+    egress: {status: 'ok', latency_ms: 9, error_code: 'NONE', ip: '203.0.113.7', change: 'changed'},
+    mihomo_api: {status: 'ok'}, flags: {truncated: false, source_unavailable: []},
+    active: [{role: 'reality', source: 'active_delay', outcome: 'timeout', delay_ms: null, independent: true},
+             {role: 'reality', source: 'passive_cache', outcome: 'ok', delay_ms: 71, independent: false}]};
+  check('P6C shows historical facts separately from current reporting, labels and IP are DOM text', () => {
+    ui.renderIncidentRemote(remoteFixture([remoteRow]));
+    assert.match(ids['inc-remote-status'].textContent, /不是事件时状态/);
+    assert.match(ids['inc-remote-status'].textContent, /不代表网络故障/);
+    assert.match(ids['inc-remote-rows'].textContent, /<img src=x onerror=alert\(1\)>/);
+    assert.match(ids['inc-remote-rows'].textContent, /203\.0\.113\.7.*出口变化/);
+    assert.match(ids['inc-remote-rows'].textContent, /缓存观察（非独立佐证）/);
+    assert.match(ids['inc-remote-rows'].textContent, /超时/);
+    assert.ok(!ids['inc-remote-rows'].children.some(c => c.tag === 'img'));
+  });
+  check('P6C retired mappings and truncated/empty history preserve uncertainty', () => {
+    ui.renderIncidentRemote({...remoteFixture([{...remoteRow, mapping_retired: true, site_label: null, path_label: null}]), truncated: true});
+    assert.match(ids['inc-remote-rows'].textContent, /登记已撤销或不可用/);
+    assert.match(ids['inc-remote-msg'].textContent, /不能据此概括全部设备/);
+    ui.renderIncidentRemote(remoteFixture());
+    assert.match(ids['inc-remote-rows'].textContent, /不代表网络正常/);
+  });
+  ui.state.session = {...ui.state.session, authenticated: true}; ui.state.selectedIncidentId = 1;
+  let completeRemote;
+  responses.push(() => new Promise(resolve => {completeRemote = resolve;}));
+  const staleRemote = ui.loadIncidentRemote(1);
+  ui.closeIncidentDetail();
+  completeRemote(response(remoteFixture([remoteRow]))); await staleRemote; await flush();
+  check('P6C discards a pending read after closing the incident', () => {
+    assert.equal(ids['inc-remote-rows'].textContent, '');
+  });
+  ui.state.selectedIncidentId = 1;
+  responses.push(response({error: 'unavailable'}, 503)); await ui.loadIncidentRemote(1); await flush();
+  check('P6C a failed read never displays old or healthy evidence', () => {
+    assert.match(ids['inc-remote-msg'].textContent, /不能据此判断网络正常或故障/);
+    assert.equal(ids['inc-remote-rows'].textContent, '');
+  });
+  assert.equal(count, 129, 'UI assertion count guard');
 }
 main().catch(err => { console.error(err); process.exitCode = 1; });

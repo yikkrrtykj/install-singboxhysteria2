@@ -264,6 +264,9 @@ jobs:
       - name: "0.6.0 PR-5 incidents UI suite (presenter wall / schema v5 markers / subject-bound evidence / closed-enum markers without free text / rearm preconditions + bucket grid / auth matrix / timeline byte-frozen / R2 fixtures through the live stack, issue #33 P5)"
         run: bash tests/test-monitor-v2-incidents.sh
 
+      - name: "P6C incident-bound remote evidence (session, closed schema, retention, mapping and source isolation)"
+        run: python3 tests/test-monitor-v2-incident-remote.py
+
       - name: "0.7.0 PR-6A dark office remote-probe agent suite (explicit roles / closed active outcomes + delay-0 failure / bounded budgets and no overlap / GET-only Mihomo reuse byte-identical to E4 / canonical body + HMAC vector / run-seq-clock rollback / durable spool bounds + refusals / total response disposition / secret leak wall, issue #67 P6A)"
         run: bash tests/test-monitor-v2-remote-probe.sh
 
