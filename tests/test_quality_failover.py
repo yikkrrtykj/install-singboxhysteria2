@@ -540,5 +540,51 @@ class BoundaryTests(unittest.TestCase):
             link=Path(directory)/"alias.json";link.symlink_to(target)
             with self.assertRaises((ValueError,OSError)):read_json(link)
 
+
+class RunnerControlTests(unittest.TestCase):
+    def test_runner_switch_recovery_and_exit_touch_only_owned_group(self):
+        cfg=configuration();cfg["control_enabled"]=True
+        runner=Runner(cfg);value=snapshot();mutations=[]
+        def api(method,path,payload=None):
+            if method=="GET":return {"connections":[]}
+            mutations.append((method,path,payload))
+            if method=="PUT":
+                value[GROUP]["fixed"]=payload["name"];value[GROUP]["now"]=payload["name"]
+            else:
+                value[GROUP]["fixed"]="";value[GROUP]["now"]="Reality"
+            return {}
+        with patch.object(runner.controller,"proxies",return_value=value),patch.object(
+                runner.controller,"request",side_effect=api),patch.object(
+                runner.probes["Reality"],"measure",return_value=BAD) as real,patch.object(
+                runner.probes["Hysteria2"],"measure",return_value=GOOD):
+            for at in (0,30):
+                with patch("quality_failover.runtime.time.monotonic",return_value=at):
+                    result=runner.cycle(confirm=True)
+            self.assertEqual(value[GROUP]["fixed"],"Hysteria2")
+            self.assertEqual(result["action"],"selected")
+            real.return_value=GOOD
+            for at in (60,90,120):
+                with patch("quality_failover.runtime.time.monotonic",return_value=at):
+                    runner.cycle(confirm=True)
+            self.assertEqual(value[GROUP]["fixed"],"")
+            self.assertEqual(mutations[-1][0],"DELETE")
+            self.assertEqual(value[AUTO]["fixed"],"")
+            self.assertEqual(value[OUTER]["now"],GROUP)
+            self.assertTrue(all(path.endswith("%E8%B4%A8%E9%87%8F%E8%87%AA%E5%8A%A8%E9%80%89%E6%8B%A9")
+                                for _,path,_ in mutations))
+            runner.close()
+
+    def test_idle_manual_override_neither_probes_nor_writes(self):
+        cfg=configuration();cfg["control_enabled"]=True
+        runner=Runner(cfg);value=snapshot();value[OUTER]["now"]="Reality"
+        with patch.object(runner.controller,"proxies",return_value=value),patch.object(
+                runner.controller,"request",return_value={"connections":[]}),patch.object(
+                runner.controller,"select") as select,patch.object(
+                runner.probes["Reality"],"measure") as real,patch.object(
+                runner.probes["Hysteria2"],"measure") as hy:
+            result=runner.cycle()
+            self.assertEqual(result["action"],"manual_override")
+            select.assert_not_called();real.assert_not_called();hy.assert_not_called()
+
 if __name__=="__main__":
     unittest.main()

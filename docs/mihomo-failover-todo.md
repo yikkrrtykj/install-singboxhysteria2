@@ -16,7 +16,7 @@ Current quality work: [PR-48B](mihomo-protocol-quality-failover-p48b.md).
 - [x] Normal exit restore; foreign/cached selection suspends ownership.
 - [x] Closed time-stamped state/reason records; no raw metadata or secrets.
 - [x] Bounded receiver, byte/cadence/timeout caps and no automatic installation.
-- [x] Local hermetic suite: 54 tests, 52 pass and 2 POSIX-only skips on Windows.
+- [x] Local hermetic suite: 56 tests, 54 pass and 2 POSIX-only skips on Windows.
 - [x] Pinned-core loopback lab: 24 checks pass; actual TLS receipt/body
       measurements and real Mihomo groups/listeners, mock SOCKS node bodies.
 - [ ] Linux CI completion on the final PR commit.
