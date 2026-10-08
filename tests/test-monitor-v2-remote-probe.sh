@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Monitor 0.8.0 -- P6A dark office remote-probe agent suite (issue #67 PR-6A).
+# Monitor 0.8.1 -- P6A dark office remote-probe agent suite (issue #67 PR-6A).
 #
 # PR-6A ships the office-side agent DARK: new namespace monitor-v2/remote_probe/,
 # no server ingest route, no server database, no History/classifier/UI/deploy
@@ -27,7 +27,7 @@
 #   3. THE RED LINES HOLD. No server ingest route, no remote database, History
 #      still schema v5 on the eleven-table shape with its six prune sources, no
 #      remote reference in the classifier / incident runtime / presenter, and
-#      the release identity is 0.8.0 for the authorized P6C candidate.
+#      the release identity is 0.8.1 for the authorized P6C candidate.
 #   4. THE LANE IS WIRED. A suite nobody runs cannot fail.
 #
 # Deterministic by construction: no Internet, no real Mihomo, no VPS, no
@@ -46,7 +46,7 @@ FAIL=0
 # 250 = S0 static + red-line gates 19 (py_compile of the package + harness, the
 # in-module reuse documentation, the FOUR frozen sha256 pins that prove the
 # audited E4 client/model/diag/README were reused and never forked, the E4
-# file-set check, the release identity 0.8.0 in both places, History
+# file-set check, the release identity 0.8.1 in both places, History
 # still v5 with its six prune sources and no remote table, the three P4/P5
 # modules free of any remote reference, the absent server ingest route, the
 # absent server remote store, and the two CI registrations) + S1 harness 206
@@ -190,10 +190,10 @@ assert_eq "README.md __init__.py client.py diag.py fixtures model.py" \
     "the E4 adapter directory has exactly its original source file set"
 
 # (3) Red lines.
-assert_eq "0.8.0" "$(tr -d '[:space:]' < "$ROOT/monitor-v2/VERSION")" \
-    "VERSION is 0.8.0 (PR-6C release candidate)"
-assert_eq "1" "$(grep -c 'MONITOR_WEB_VERSION = "0.8.0"' "$SERVER_PY")" \
-    "MONITOR_WEB_VERSION is 0.8.0"
+assert_eq "0.8.1" "$(tr -d '[:space:]' < "$ROOT/monitor-v2/VERSION")" \
+    "VERSION is 0.8.1 (PR-6C release candidate)"
+assert_eq "1" "$(grep -c 'MONITOR_WEB_VERSION = "0.8.1"' "$SERVER_PY")" \
+    "MONITOR_WEB_VERSION is 0.8.1"
 assert_eq "1" "$(grep -c '^SCHEMA_VERSION = 5$' "$HIST_PY")" \
     "History is still schema v5 (no P6 migration)"
 if [ "$(grep -A 8 '^_PRUNE_SOURCES = (' "$HIST_PY" | grep -c '^    (\"')" = "6" ] \

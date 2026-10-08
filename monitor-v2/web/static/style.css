@@ -239,7 +239,7 @@ input[type="text"], input[type="password"] {
 /* ---- incidents (0.6.0, #33 PR-5) ---- */
 .inc-reason-list { margin: 0 0 10px; padding-left: 20px; }
 .inc-reason-list li { padding: 3px 0; font-size: 0.9rem; }
-#inc-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 10px 22px; }
+#inc-summary, .inc-summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 10px 22px; }
 #inc-summary .kv .v { font-size: 0.92rem; }
 #inc-rows-table { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.76rem; }
 #inc-marker-kind { cursor: pointer; }
@@ -276,3 +276,13 @@ input[type="text"], input[type="password"] {
 /* P6C uses the existing table scroll container on narrow screens. */
 .inc-remote-device { margin: .75rem 0; padding: .5rem; border: 1px solid var(--border); border-radius: .5rem; }
 #inc-remote { margin-top: 1.25rem; }
+
+/* Compact incident reading; changing records never resizes the page below tabs. */
+.inc-meaning { font-size: 1rem; line-height: 1.6; margin: .8rem 0; }
+.inc-fold { border-top: 1px solid var(--border); padding-top: .75rem; margin-top: .75rem; }
+.inc-fold > summary { cursor: pointer; font-weight: 600; padding: .35rem 0; }
+.inc-fold[open] > summary { margin-bottom: .75rem; }
+.inc-record-scroll { height: min(56vh, 32rem); min-height: 12rem; overflow: auto; overscroll-behavior: contain; margin: .75rem 0; padding: 0 .5rem; }
+#inc-evidence-card { overflow-anchor: none; }
+#inc-sections { flex-wrap: wrap; }
+.inc-device-records { max-height: 32rem; overflow: auto; }

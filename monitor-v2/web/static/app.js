@@ -682,7 +682,9 @@
       state.incSubject = {type: "incident", id: id};
       renderIncidentDetail(detail);
       show($("inc-evidence-card"));
-      $("inc-evidence-title").textContent = "事件证据 #" + id;
+      $("inc-evidence-title").textContent = "查看记录明细";
+      $("inc-evidence-card").open = false;
+      $("inc-raw-values").open = false;
       hide($("inc-evidence-subject"));
       loadEvidence(state.incSection);
       loadIncidentRemote(id);
@@ -753,10 +755,34 @@
     hide($("inc-list-card"));
     show($("inc-detail"));
     var summary = detail.summary || {};
-    $("inc-detail-title").textContent = incidentCopy(summary.headline) || "事件";
-    var box = $("inc-summary");
-    box.textContent = "";
+    var uncertain = summary.headline === "Unclassified incident window (insufficient evidence)";
+    $("inc-detail-title").textContent = uncertain ? "发现异常，原因尚未确定" : incidentCopy(summary.headline) || "事件";
+    $("inc-meaning").textContent = uncertain ?
+      "系统记录到了异常迹象，但现有记录不足以确定原因或影响范围。" : incidentCopy(summary.impact) || "请结合本次记录查看判断与未确认的问题。";
+    ["inc-analysis-details", "inc-remote", "inc-technical-details"].forEach(function (id) { $(id).open = false; });
+    var brief = $("inc-summary"); brief.textContent = "";
     var win = summary.window || {};
+    if (win.start_epoch !== undefined) brief.appendChild(kvRow("异常记录范围",
+      fmtEpoch(win.start_epoch) + " — " + fmtEpoch(win.end_epoch) + "（跨度 " + fmtUptime(win.duration_seconds) + "）"));
+    if (summary.assessment) brief.appendChild(kvRow("目前判断", uncertain ?
+      "暂时无法确定问题来自服务器、网络线路还是具体目标。" : summary.assessment));
+    if (summary.affected_scope) brief.appendChild(kvRow("影响范围",
+      summary.affected_scope === "Server-side evidence cannot tell which clients or networks were affected." ?
+        "暂时无法确定哪些客户端或网络受到影响。" : summary.affected_scope));
+    if (summary.recommended_action) brief.appendChild(kvRow("建议操作", summary.recommended_action));
+    reasonItems($("inc-main-evidence"), (detail.evidence || []).slice(0, 3).map(function (pair) {
+      var plain = {
+        "The total active-connection count fell far below its own baseline.": "总连接数明显少于平时。",
+        "Reality active connections fell far below their baseline.": "Reality 的连接数明显少于平时。",
+        "Hysteria2 active connections fell far below their baseline.": "Hysteria2 的连接数明显少于平时。",
+        "Reality-classed sing-box error records spiked above their baseline.": "Reality 相关的错误记录明显多于平时。",
+        "Hysteria2-classed sing-box error records spiked above their baseline.": "Hysteria2 相关的错误记录明显多于平时。"
+      };
+      return {token: pair.token, text: plain[pair.text] || pair.text};
+    }));
+    $("inc-evidence-count").textContent = "共 " + (detail.evidence || []).length + " 条判断依据、" +
+      (detail.unknowns || []).length + " 项未确认问题；可展开完整判断查看。";
+    var box = $("inc-analysis-summary"); box.textContent = "";
     if (win.start_epoch !== undefined) {
       box.appendChild(kvRow("信号窗口",
         fmtEpoch(win.start_epoch) + " — " + fmtEpoch(win.end_epoch) +
@@ -799,6 +825,7 @@
     if (!state.session || !state.session.authenticated || state.selectedIncidentId !== id) return;
     var generation = ++remoteRequestGeneration;
     $("inc-remote-msg").textContent = "正在读取事件时段的设备记录…";
+    $("inc-remote-brief").textContent = "设备侧：正在读取该时段的记录。";
     $("inc-remote-status").textContent = "";
     $("inc-remote-rows").textContent = "";
     return api("/api/v1/incidents/" + id + "/remote-probes").then(function (data) {
@@ -809,11 +836,21 @@
       if (generation !== remoteRequestGeneration || state.selectedIncidentId !== id) return;
       if (error.status === 401) { showLogin("登录已过期，请重新登录。"); return; }
       $("inc-remote-msg").textContent = "设备记录暂不可读取，不能据此判断网络正常或故障。";
+      $("inc-remote-brief").textContent = "设备侧记录暂不可读取，无法交叉核对当时的情况。";
     });
   }
   function renderIncidentRemote(data) {
     var current = data.current_status;
     var retention = data.retention;
+    var brief = $("inc-remote-brief");
+    if (current.status === "degraded") {
+      brief.textContent = "设备侧数据暂不可用或不完整，无法据此确定当时的网络状态。";
+    } else if (!data.rows.length) {
+      brief.textContent = "设备侧：该时段没有可展示的保留记录，无法交叉核对；不代表当时网络正常。";
+    } else {
+      brief.textContent = "设备侧：本次展示该时段 " + data.rows.length + " 条检测记录" +
+        (data.truncated ? "（还有未展示记录）" : "") + "；展开设备监测查看，当前上报状态另列。";
+    }
     $("inc-remote-msg").textContent = "事件窗口：" + fmtEpoch(data.window.start_epoch) + " — " +
       fmtEpoch(data.window.end_epoch) + "。记录最多保留 7 天，受容量限制；全局最早保留：" +
       (retention.retained_since_epoch === null ? "无保留记录" : fmtEpoch(retention.retained_since_epoch)) +
@@ -885,6 +922,7 @@
   function closeIncidentDetail() {
     ++incidentOpenGeneration;
     ++remoteRequestGeneration;
+    ++evidenceRequestGeneration;
     state.selectedIncidentId = null;
     state.incSubject = null;
     hide($("inc-detail"));
@@ -900,7 +938,9 @@
   function openMarkerEvidence(id, label) {
     if (!state.session || !state.session.authenticated) return;
     state.incSubject = {type: "marker", id: id, label: label};
-    $("inc-evidence-title").textContent = "标记附近的证据";
+    $("inc-evidence-title").textContent = "标记附近的记录明细";
+    $("inc-evidence-card").open = true;
+    $("inc-raw-values").open = false;
     var line = $("inc-evidence-subject");
     line.textContent = "标记：" + (label || ("#" + id));
     show(line);
@@ -908,7 +948,9 @@
     loadEvidence(state.incSection);
   }
 
+  var evidenceRequestGeneration = 0;
   function loadEvidence(section) {
+    var generation = ++evidenceRequestGeneration;
     state.incSection = section;
     document.querySelectorAll("#inc-sections .seg-item").forEach(function (item) {
       item.classList.toggle("active", item.getAttribute("data-section") === section);
@@ -917,6 +959,10 @@
     if (!subject) return;
     var note = $("inc-rows-note");
     hide(note);
+    $("inc-l3").textContent = "正在读取记录…";
+    $("inc-rows-head").textContent = "";
+    $("inc-rows-body").textContent = "";
+    $("inc-record-scroll").scrollTop = 0;
     var url = "/api/v1/evidence?section=" + section;
     if (subject.type === "marker") {
       url += "&marker_id=" + subject.id;
@@ -924,8 +970,10 @@
       url += "&incident_id=" + subject.id;
     }
     return api(url).then(function (data) {
+      if (generation !== evidenceRequestGeneration || state.incSubject !== subject) return;
       renderEvidenceRows(data);
     }).catch(function () {
+      if (generation !== evidenceRequestGeneration || state.incSubject !== subject) return;
       // B4: a network/HTTP/read failure is NOT an empty window. No
       // conclusion -- including the neutral retained-evidence text --
       // may be drawn from a view that could not load.
@@ -935,7 +983,7 @@
       body.textContent = "";
       var tr = body.insertRow(-1);
       tr.insertCell(-1).textContent = INC_EVIDENCE_UNAVAILABLE;
-      $("inc-l3").textContent = "";
+      $("inc-l3").textContent = INC_EVIDENCE_UNAVAILABLE;
       hide(note);
     });
   }
@@ -1044,11 +1092,17 @@
     return status + " (" + code + ")";
   }
 
+  function journalLabel(value) {
+    return {dns: "DNS 解析错误", dial_timeout: "连接超时", reset: "连接被重置",
+      net_unreachable: "网络不可达", tls_handshake: "TLS 握手错误", quic_error: "QUIC 错误",
+      eof_cancel: "连接结束或取消", other: "其他类别"}[value] || value;
+  }
+
   function renderL3(data) {
     var host = $("inc-l3");
     host.textContent = "";
     var rows = (data && data.rows) || [];
-    if (!rows.length) return;   // the L4 empty state speaks for both
+    if (!rows.length) { host.textContent = INC_EMPTY_EVIDENCE; return; }
     if (data.truncated && (data.section === "journal_events"
                            || data.section === "audit")) {
       // a truncated section's totals are NOT full-window totals: say so
@@ -1076,7 +1130,8 @@
                      "端口", "总计", "首次", "最近"];
       var table = Object.keys(groups).sort().map(function (key) {
         var g = groups[key];
-        return [g.cls, g.proto, g.dcls === "NONE" ? "—" : g.dcls,
+        return [journalLabel(g.cls), g.proto === "OTHER" ? "未归属某个协议" : g.proto,
+                g.dcls === "NONE" ? "—" : journalLabel(g.dcls),
                 g.port === 0 ? "—" : String(g.port), String(g.total),
                 fmtEpoch(g.first), fmtEpoch(g.last)];
       });
@@ -2320,8 +2375,7 @@
       if (state.selectedIncidentId !== null) loadIncidentRemote(state.selectedIncidentId);
     });
     $("inc-evidence-close").addEventListener("click", function () {
-      state.incSubject = null;
-      hide($("inc-evidence-card"));
+      $("inc-evidence-card").open = false;
     });
     $("inc-marker-add-btn").addEventListener("click", addMarker);
     $("inc-rearm-btn").addEventListener("click", rearmIncidents);

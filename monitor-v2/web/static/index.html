@@ -136,56 +136,72 @@
           <h2 id="inc-detail-title">事件</h2>
           <button id="inc-back-btn" class="btn ghost" type="button">返回列表</button>
         </div>
+        <p id="inc-meaning" class="inc-meaning"></p>
         <div id="inc-summary"></div>
+        <p id="inc-range-note" class="muted">时间范围表示异常信号从首次到末次的跨度，不等于这段时间一直断网。</p>
+        <h3>主要记录</h3>
+        <ul id="inc-main-evidence" class="inc-reason-list"></ul>
+        <p id="inc-evidence-count" class="muted"></p>
+        <p id="inc-remote-brief" class="muted" role="status"></p>
 
-        <h3>判断依据</h3>
-        <ul id="inc-evidence-list" class="inc-reason-list"></ul>
-        <h3>尚未确定的问题</h3>
-        <ul id="inc-unknowns-list" class="inc-reason-list"></ul>
+        <details id="inc-analysis-details" class="inc-fold">
+          <summary>完整判断与依据</summary>
+          <div id="inc-analysis-summary" class="inc-summary-grid"></div>
+          <h3>判断依据</h3>
+          <ul id="inc-evidence-list" class="inc-reason-list"></ul>
+          <h3>尚未确定的问题</h3>
+          <ul id="inc-unknowns-list" class="inc-reason-list"></ul>
+        </details>
 
-        <section id="inc-remote" aria-labelledby="inc-remote-title">
+        <details id="inc-remote" class="inc-fold">
+          <summary id="inc-remote-title">设备监测 · 事件时段</summary>
           <div class="table-toolbar">
-            <h3 id="inc-remote-title">设备监测 · 事件时段</h3>
+            <p class="muted">事件时段的记录和当前上报状态分开显示。</p>
             <button id="inc-remote-refresh" class="btn ghost" type="button">刷新设备记录</button>
           </div>
           <p class="muted">这里只展示辅助事实，不改变事件判断。位置和网络路径是管理员登记的标签；不同标签不代表独立线路。缓存观察可能来自主动测试，不作为第二份独立证据。</p>
           <p id="inc-remote-msg" role="status"></p>
           <div id="inc-remote-status"></div>
-          <div id="inc-remote-rows"></div>
-        </section>
+          <div id="inc-remote-rows" class="inc-device-records"></div>
+        </details>
 
-        <h3>技术标记（原始值，L4）</h3>
-        <p class="muted">原始分类标记供复制到诊断工具，判断时请优先阅读上方文字说明。</p>
-        <h4>证据标记</h4>
-        <ul id="inc-evidence-tokens" class="inc-token-list"></ul>
-        <h4>未知标记</h4>
-        <ul id="inc-unknown-tokens" class="inc-token-list"></ul>
+        <details id="inc-technical-details" class="inc-fold">
+          <summary>技术标记</summary>
+          <p class="muted">原始分类标记供复制到诊断工具，判断时请优先阅读上方文字说明。</p>
+          <h4>证据标记</h4>
+          <ul id="inc-evidence-tokens" class="inc-token-list"></ul>
+          <h4>未知标记</h4>
+          <ul id="inc-unknown-tokens" class="inc-token-list"></ul>
+        </details>
       </div>
 
-      <div class="card hidden" id="inc-evidence-card">
-        <div class="table-toolbar">
-          <h2 id="inc-evidence-title">证据</h2>
-          <button id="inc-evidence-close" class="btn ghost" type="button">关闭证据</button>
-        </div>
+      <details class="card hidden inc-fold" id="inc-evidence-card">
+        <summary><span id="inc-evidence-title">查看记录明细</span></summary>
         <p id="inc-evidence-subject" class="muted"></p>
-        <h3>简要时间线（L3）</h3>
-        <div id="inc-l3"></div>
-        <h3>原始记录（L4）</h3>
-        <div class="seg" id="inc-sections" role="group" aria-label="Evidence section">
-          <button class="seg-item active" data-section="samples" type="button">样本</button>
-          <button class="seg-item" data-section="device_states" type="button">设备状态</button>
-          <button class="seg-item" data-section="probe_rows" type="button">探测</button>
-          <button class="seg-item" data-section="journal_events" type="button">日志</button>
-          <button class="seg-item" data-section="audit" type="button">审计</button>
+        <p class="muted">先看记录概览。逐条原始字段供技术排查，不会单独给出故障原因。</p>
+        <div class="seg" id="inc-sections" role="group" aria-label="记录类别">
+          <button class="seg-item active" data-section="samples" type="button">连接采样</button>
+          <button class="seg-item" data-section="device_states" type="button">设备变更</button>
+          <button class="seg-item" data-section="probe_rows" type="button">网络检测</button>
+          <button class="seg-item" data-section="journal_events" type="button">错误日志</button>
+          <button class="seg-item" data-section="audit" type="button">接收记录</button>
         </div>
-        <p id="inc-rows-note" class="muted hidden"></p>
-        <div class="table-card">
-          <table class="table" id="inc-rows-table">
-            <thead id="inc-rows-head"></thead>
-            <tbody id="inc-rows-body"></tbody>
-          </table>
+        <div id="inc-record-scroll" class="inc-record-scroll" tabindex="0" aria-label="所选类别的记录">
+          <h3>记录概览</h3>
+          <p id="inc-rows-note" class="muted hidden"></p>
+          <div id="inc-l3"></div>
+          <details id="inc-raw-values" class="inc-fold">
+            <summary>逐条原始数据（技术详情）</summary>
+            <div class="table-card">
+              <table class="table" id="inc-rows-table">
+                <thead id="inc-rows-head"></thead>
+                <tbody id="inc-rows-body"></tbody>
+              </table>
+            </div>
+          </details>
         </div>
-      </div>
+        <button id="inc-evidence-close" class="btn ghost" type="button">收起记录明细</button>
+      </details>
 
       <div class="card">
         <h2>人工标记</h2>

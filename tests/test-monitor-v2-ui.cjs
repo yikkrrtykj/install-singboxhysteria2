@@ -731,7 +731,7 @@ async function main() {
   await ui.loadEvidence('journal_events'); await flush();
   check('B1: L3 aggregates journal rows by (cls, proto, dcls, port) with summed totals and min/max times', () => {
     const l3 = ids['inc-l3'].textContent;
-    assert.match(l3, /reset/);
+    assert.match(l3, /连接被重置/);
     const five = l3.match(/5(?=\s|$)/) || l3.match(/5/);
     assert.ok(five, 'expected the summed total 5 in the L3 aggregate');
     assert.match(l3, /https443/); assert.match(l3, /http80/);
@@ -739,7 +739,7 @@ async function main() {
   });
   check('B1: same-key rows collapse into one L3 row and a different tuple stays separate; raw L4 rows remain below', () => {
     const l3Text = ids['inc-l3'].textContent;
-    const rows = l3Text.match(/reset/g) || [];
+    const rows = l3Text.match(/连接被重置/g) || [];
     assert.equal(rows.length, 2);
     assert.deepEqual(ids['inc-rows-body'].children.map(row =>
       row.children.slice(0, 2).map(cell => cell.textContent)),
@@ -751,6 +751,7 @@ async function main() {
   await ui.loadEvidence('probe_rows'); await flush();
   check('an empty retained window says exactly that and may add the retention note, never "no problem"', () => {
     assert.match(ids['inc-rows-body'].textContent, /此窗口内没有保留的证据。/);
+    assert.match(ids['inc-l3'].textContent, /此窗口内没有保留的证据。/);
     assert.match(ids['inc-rows-note'].textContent, /超出保留时间/);
     assert.doesNotMatch(ids['view-incidents'].textContent, /No problem occurred/);
     productText();
@@ -790,6 +791,7 @@ async function main() {
   await ui.loadEvidence('probe_rows'); await flush();
   check('B4: a fetch/HTTP failure renders the unavailable state and never the retained-evidence text', () => {
     assert.match(ids['inc-rows-body'].textContent, /证据暂不可用，无法据此得出结论。/);
+    assert.match(ids['inc-l3'].textContent, /证据暂不可用，无法据此得出结论。/);
     assert.doesNotMatch(ids['view-incidents'].textContent, /没有保留的证据/);
     productText();
   });
@@ -1178,6 +1180,87 @@ async function main() {
     assert.match(ids['inc-remote-msg'].textContent, /不能据此判断网络正常或故障/);
     assert.equal(ids['inc-remote-rows'].textContent, '');
   });
-  assert.equal(count, 135, 'UI assertion count guard');
+  // Incident reading: default summaries keep classification unchanged;
+  // delayed responses must not paint another selected section or subject.
+  ui.state.session = {...ui.state.session, authenticated: true};
+  const longDetail = {...detail, evidence: Array.from({length: 7}, (_, i) => ({
+    token: 'technical_' + i, text: 'observed fact ' + i})), unknowns: detail.unknowns};
+  ui.renderIncidentDetail(longDetail);
+  check('incident opens with bounded primary facts and all diagnostic sections collapsed', () => {
+    assert.equal(ids['inc-main-evidence'].children.length, 3);
+    assert.equal(ids['inc-evidence-list'].children.length, 7);
+    assert.match(ids['inc-evidence-count'].textContent, /共 7 条/);
+    assert.match(ids['inc-range-note'].textContent, /不等于.*一直断网/);
+    ['inc-analysis-details', 'inc-remote', 'inc-technical-details'].forEach(id => assert.equal(ids[id].open, false));
+  });
+  const insufficient = {...longDetail, summary: {...summary,
+    headline: 'Unclassified incident window (insufficient evidence)',
+    assessment: 'The evidence supports no fault domain: insufficient evidence.',
+    recommended_action: null}};
+  ui.renderIncidentDetail(insufficient);
+  check('insufficient evidence is explained without inventing a fault or suggesting protocol switching', () => {
+    assert.match(ids['inc-detail-title'].textContent, /原因尚未确定/);
+    assert.match(ids['inc-meaning'].textContent, /不足以确定原因或影响范围/);
+    assert.match(ids['inc-summary'].textContent, /暂时无法确定/);
+    assert.doesNotMatch(ids['inc-summary'].textContent, /建议操作|优先使用|服务器正常/);
+    assert.equal(ids['inc-evidence-list'].children.length, 7);
+  });
+  ui.renderIncidentDetail({...longDetail, summary: {...summary, headline: '<img src=x onerror=alert(1)>'}});
+  check('future summary text remains literal and diagnostic facts are not decoded or removed', () => {
+    assert.equal(ids['inc-detail-title'].textContent, '<img src=x onerror=alert(1)>');
+    assert.match(ids['inc-evidence-tokens'].textContent, /technical_6/);
+    assert.ok(!ids['inc-detail-title'].children.length);
+  });
+  ui.renderIncidentRemote(remoteFixture());
+  check('short device summary cannot turn absent incident records into healthy current evidence', () => {
+    assert.match(ids['inc-remote-brief'].textContent, /该时段没有.*保留记录/);
+    assert.match(ids['inc-remote-brief'].textContent, /不代表当时网络正常/);
+    assert.equal(ids['inc-remote'].open, false);
+  });
+  ui.renderIncidentRemote({...remoteFixture([remoteRow]), truncated: true,
+    current_status: {...remoteFixture().current_status, status: 'degraded'}});
+  check('degraded device summary stays uncertain even when some historical rows exist', () => {
+    assert.match(ids['inc-remote-brief'].textContent, /暂不可用或不完整/);
+    assert.doesNotMatch(ids['inc-remote-brief'].textContent, /当前.*正常/);
+  });
+  ui.state.incSubject = {type: 'incident', id: 1};
+  let resolveOldSection;
+  responses.push(() => new Promise(resolve => {resolveOldSection = resolve;}));
+  const oldSection = ui.loadEvidence('samples');
+  responses.push(response({section: 'journal_events', rows: [{seq: 77, ts: 100, cls: 'dial_timeout', proto: 'OTHER', dcls: 'other', port: 443, n: 2}]}));
+  await ui.loadEvidence('journal_events'); await flush();
+  resolveOldSection(response({section: 'samples', rows: [{epoch: 666, reality_active_connections: 0}]}));
+  await oldSection; await flush();
+  check('late previous-tab data cannot overwrite the selected records; raw values stay exact', () => {
+    assert.match(ids['inc-l3'].textContent, /连接超时/);
+    assert.match(ids['inc-l3'].textContent, /未归属某个协议/);
+    assert.match(ids['inc-rows-body'].textContent, /dial_timeout/);
+    assert.doesNotMatch(ids['inc-rows-body'].textContent, /666/);
+    assert.equal(ids['inc-record-scroll'].scrollTop, 0);
+  });
+  let resolveClosed;
+  responses.push(() => new Promise(resolve => {resolveClosed = resolve;}));
+  const closedRead = ui.loadEvidence('samples');
+  ui.closeIncidentDetail();
+  resolveClosed(response({section: 'samples', rows: [{epoch: 999}]}));
+  await closedRead; await flush();
+  check('closing an incident prevents its unfinished raw read from restoring old rows', () => {
+    assert.doesNotMatch(ids['inc-rows-body'].textContent, /999/);
+  });
+  ids['inc-analysis-details'].open = ids['inc-remote'].open = ids['inc-technical-details'].open = true;
+  ui.renderIncidentDetail(detail);
+  check('opening another incident resets expansion while keeping the exact detailed summary', () => {
+    ['inc-analysis-details', 'inc-remote', 'inc-technical-details'].forEach(id => assert.equal(ids[id].open, false));
+    assert.match(ids['inc-analysis-summary'].textContent, /此证据不能证明 Hysteria2 当时正常/);
+    assert.match(ids['inc-analysis-summary'].textContent, /根因尚未确定/);
+  });
+  const baselineText = 'Reality active connections fell far below their baseline.';
+  ui.renderIncidentDetail({...longDetail, evidence: [{token: 'count_drop_reality', text: baselineText}]});
+  check('primary facts explain the baseline in plain language while full evidence retains its wording', () => {
+    assert.match(ids['inc-main-evidence'].textContent, /Reality 的连接数明显少于平时/);
+    assert.match(ids['inc-evidence-list'].textContent, /Reality 活动连接数远低于其基线/);
+    assert.match(ids['inc-evidence-tokens'].textContent, /count_drop_reality/);
+  });
+  assert.equal(count, 144, 'UI assertion count guard');
 }
 main().catch(err => { console.error(err); process.exitCode = 1; });
