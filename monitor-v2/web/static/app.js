@@ -672,9 +672,12 @@
     }
   }
 
+  var incidentOpenGeneration = 0;
   function openIncident(id) {
     if (!state.session || !state.session.authenticated) return;
+    var generation = ++incidentOpenGeneration;
     return api("/api/v1/incidents/" + id).then(function (detail) {
+      if (generation !== incidentOpenGeneration || !state.session || !state.session.authenticated) return;
       state.selectedIncidentId = id;
       state.incSubject = {type: "incident", id: id};
       renderIncidentDetail(detail);
@@ -682,6 +685,7 @@
       $("inc-evidence-title").textContent = "事件证据 #" + id;
       hide($("inc-evidence-subject"));
       loadEvidence(state.incSection);
+      loadIncidentRemote(id);
     }).catch(function (error) {
       if (error.status === 401) showLogin("登录已过期，请重新登录。");
     });
@@ -780,7 +784,107 @@
     tokenItems($("inc-unknown-tokens"), detail.unknowns);
   }
 
+  var remoteRequestGeneration = 0;
+  var REMOTE_STATES = {fresh: "近期有上报", not_configured: "未配置设备监测",
+    source_unavailable: "设备未及时上报", degraded: "设备数据暂不可用或不完整"};
+  var REMOTE_CODES = {probe_not_reporting: "未及时上报，不代表网络故障",
+    remote_store_unavailable: "监测记录暂不可读取", remote_config_invalid: "设备登记配置不可用",
+    remote_budget_pruned: "部分记录因容量限制已清理", remote_run_capacity: "运行记录达到容量限制",
+    remote_receipt_capacity: "上传回执达到容量限制", remote_storage_capacity: "存储容量不足"};
+  function remoteOutcome(value) {
+    return {ok: "正常", failed: "检测失败", timeout: "超时", unavailable: "未取得结果",
+      invalid: "配置或结果无效", skipped: "未执行"}[value] || "未知";
+  }
+  function loadIncidentRemote(id) {
+    if (!state.session || !state.session.authenticated || state.selectedIncidentId !== id) return;
+    var generation = ++remoteRequestGeneration;
+    $("inc-remote-msg").textContent = "正在读取事件时段的设备记录…";
+    $("inc-remote-status").textContent = "";
+    $("inc-remote-rows").textContent = "";
+    return api("/api/v1/incidents/" + id + "/remote-probes").then(function (data) {
+      if (generation !== remoteRequestGeneration || state.selectedIncidentId !== id ||
+          !state.session || !state.session.authenticated) return;
+      renderIncidentRemote(data);
+    }).catch(function (error) {
+      if (generation !== remoteRequestGeneration || state.selectedIncidentId !== id) return;
+      if (error.status === 401) { showLogin("登录已过期，请重新登录。"); return; }
+      $("inc-remote-msg").textContent = "设备记录暂不可读取，不能据此判断网络正常或故障。";
+    });
+  }
+  function renderIncidentRemote(data) {
+    var current = data.current_status;
+    var retention = data.retention;
+    $("inc-remote-msg").textContent = "事件窗口：" + fmtEpoch(data.window.start_epoch) + " — " +
+      fmtEpoch(data.window.end_epoch) + "。记录最多保留 7 天，受容量限制；全局最早保留：" +
+      (retention.retained_since_epoch === null ? "无保留记录" : fmtEpoch(retention.retained_since_epoch)) +
+      (retention.budget_pruned ? "。部分记录已因容量限制清理。" : "。") +
+      (data.truncated ? "本次只展示前 " + data.limit + " 条，尚有更多记录；不能据此概括全部设备。" : "");
+    var status = $("inc-remote-status");
+    status.textContent = "";
+    status.appendChild(kvRow("当前上报状态（不是事件时状态）", REMOTE_STATES[current.status] || "未知"));
+    if (current.subcode) status.appendChild(kvRow("说明", REMOTE_CODES[current.subcode] || "数据不可用"));
+    current.probes.forEach(function (probe, index) {
+      var card = document.createElement("div");
+      card.className = "inc-remote-device";
+      card.appendChild(kvRow("设备 " + (index + 1) + " · 位置 / 网络路径",
+        (probe.site_label || "登记不可用") + " / " + (probe.path_label || "登记不可用")));
+      card.appendChild(kvRow("当前上报", REMOTE_STATES[probe.status] || "未知"));
+      card.appendChild(kvRow("最近保留样本", probe.last_sample_epoch === null ? "暂无" : fmtEpoch(probe.last_sample_epoch)));
+      if (probe.subcode) card.appendChild(kvRow("说明", REMOTE_CODES[probe.subcode] || "数据不可用"));
+      var technical = document.createElement("details");
+      var title = document.createElement("summary"); title.textContent = "技术详情";
+      technical.appendChild(title); technical.appendChild(kvRow("设备标识", probe.probe_id));
+      card.appendChild(technical); status.appendChild(card);
+    });
+    var container = $("inc-remote-rows"); container.textContent = "";
+    var title = document.createElement("h4"); title.textContent = "事件时段的检测记录"; container.appendChild(title);
+    if (!data.rows.length) {
+      container.appendChild(kvRow("记录", "该时段无可展示记录，可能未上报、已经过期或被清理；不代表网络正常。"));
+      return;
+    }
+    var wrap = document.createElement("div"); wrap.className = "table-card";
+    var table = document.createElement("table"); table.className = "table";
+    var head = document.createElement("thead"); var hr = document.createElement("tr");
+    ["采样时间", "位置 / 网络路径", "DNS", "HTTPS", "VPS TCP", "本机出口 IP", "Clash 接口", "节点检测 / 缓存观察", "技术详情"].forEach(function (name) {
+      var th = document.createElement("th"); th.textContent = name; hr.appendChild(th);
+    }); head.appendChild(hr); table.appendChild(head);
+    var body = document.createElement("tbody");
+    data.rows.forEach(function (row) {
+      var tr = document.createElement("tr"); tr.appendChild(cellText(fmtEpoch(row.sample_epoch)));
+      tr.appendChild(cellText(row.mapping_retired ? "登记已撤销或不可用" : row.site_label + " / " + row.path_label));
+      ["dns", "https", "vps_tcp"].forEach(function (key) {
+        var slot = row[key]; tr.appendChild(cellText(remoteOutcome(slot.status) +
+          (slot.latency_ms === null ? "" : " · " + slot.latency_ms + " ms")));
+      });
+      tr.appendChild(cellText(row.egress.status === "ok" && row.egress.ip ? row.egress.ip +
+        (row.egress.change === "changed" ? " · 出口变化" : "") : remoteOutcome(row.egress.status)));
+      tr.appendChild(cellText(remoteOutcome(row.mihomo_api.status)));
+      var active = document.createElement("td");
+      row.active.forEach(function (item) {
+        var line = document.createElement("div");
+        line.textContent = (item.role === "reality" ? "Reality" : "Hysteria2") +
+          (item.source === "active_delay" ? " / 主动测试：" : " / 缓存观察（非独立佐证）：") +
+          remoteOutcome(item.outcome) + (item.delay_ms === null ? "" : " · " + item.delay_ms + " ms");
+        active.appendChild(line);
+      });
+      if (!row.active.length) active.textContent = "未取得节点结果";
+      tr.appendChild(active);
+      var td = document.createElement("td"); var detail = document.createElement("details");
+      var summary = document.createElement("summary"); summary.textContent = "技术详情"; detail.appendChild(summary);
+      detail.appendChild(kvRow("设备标识", row.probe_id));
+      ["dns", "https", "vps_tcp", "egress"].forEach(function (key) {
+        detail.appendChild(kvRow(key, row[key].error_code));
+      });
+      detail.appendChild(kvRow("采样未完成", row.flags.truncated ? "是" : "否"));
+      detail.appendChild(kvRow("未取得的数据源", row.flags.source_unavailable.join(", ") || "无"));
+      td.appendChild(detail); tr.appendChild(td); body.appendChild(tr);
+    });
+    table.appendChild(body); wrap.appendChild(table); container.appendChild(wrap);
+  }
+
   function closeIncidentDetail() {
+    ++incidentOpenGeneration;
+    ++remoteRequestGeneration;
     state.selectedIncidentId = null;
     state.incSubject = null;
     hide($("inc-detail"));
@@ -2212,6 +2316,9 @@
       loadMarkers();
     });
     $("inc-back-btn").addEventListener("click", closeIncidentDetail);
+    $("inc-remote-refresh").addEventListener("click", function () {
+      if (state.selectedIncidentId !== null) loadIncidentRemote(state.selectedIncidentId);
+    });
     $("inc-evidence-close").addEventListener("click", function () {
       state.incSubject = null;
       hide($("inc-evidence-card"));
