@@ -19,7 +19,11 @@ Current quality work: [PR-48B](mihomo-protocol-quality-failover-p48b.md).
 - [x] Local hermetic suite: 56 tests, 54 pass and 2 POSIX-only skips on Windows.
 - [x] Pinned-core loopback lab: 24 checks pass; actual TLS receipt/body
       measurements and real Mihomo groups/listeners, mock SOCKS node bodies.
-- [ ] Linux CI completion on the final PR commit.
+- [x] Previous head 45e4028: all 15 GitHub checks passed.
+- [x] Unified isolated pilot GUI/CLI; receiver preparation without trust/firewall/service changes.
+- [x] 18 pilot contracts pass: byte forwarding, hopping, startup history, cancel/failure cleanup.
+- [x] Two-core genuine Reality/HY2 loopback suite: seven stages pass with wall-clock waits (~297s).
+- [ ] GitHub CI completion on the updated pilot commit.
 
 ## Operator acceptance deferred
 

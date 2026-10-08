@@ -54,6 +54,12 @@ worker cannot detect a later quality-only failure. On worker restart an
 unrecognised cached quality pin suspends control instead of claiming ownership.
 The original automatic outer choice remains a reversible escape hatch.
 
+## Unified isolated test entry
+
+For one complete disposable-core check, see [the pilot entry](mihomo-quality-pilot.md).
+It prepares receiver files, offers one client window and applies faults only to
+local test relays. This does not enable the normal client worker or deploy a receiver.
+
 ## Operator commands (Python 3.10+, standard library)
 
 Files below contain credentials and must stay in an operator-private folder,
