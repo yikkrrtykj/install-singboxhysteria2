@@ -944,13 +944,55 @@ async function main() {
   responses.push(response({ok: true, data: {revoked: true, count: 1}}), listDevices([revoked]));
   ids['p6-devices-body'].children[0].children[5].children.find(c => c.tag === 'button' && c.textContent === '撤销上传权限').click(); await flush();
   check('P6: confirmed revocation removes download and recovery actions', () => {
-    assert.match(ids['p6-devices-body'].textContent, /撤销已确认/);
-    assert.doesNotMatch(ids['p6-devices-body'].textContent, /下载|重新核验|重试撤销/);
+    assert.equal(ids['p6-devices-body'].children.length, 0);
+    assert.equal(ui.p6View.rows.length, 1, 'revocation identity remains retained');
+    assert.match(ids['p6-retired-toggle'].textContent, /已停用设备（本页 1）/);
+    assert.equal(ids['p6-retired-toggle'].className.includes('hidden'), false);
     assert.match(ids['p6-msg'].textContent, /服务器已确认撤销上传权限/);
     assert.deepEqual(JSON.parse(requests.findLast(r => r.url.endsWith('/revoke')).body),
       {name: 'alice', device: 'laptop-01', probe_id: device.probe_id});
   });
-  responses.push(listDevices([{...revoked, verified: 'pending'}], 'probe-cursor')); ui.loadP6Devices(); await flush();
+  const retirementRequests = requests.length;
+  ids['p6-retired-toggle'].click();
+  check('P6: viewing retired records sends no request and never exposes revival or downloads', () => {
+    assert.equal(requests.length, retirementRequests);
+    assert.match(ids['p6-devices-body'].textContent, /撤销已确认/);
+    assert.doesNotMatch(ids['p6-devices-body'].textContent, /下载|重新核验|重试撤销/);
+    assert.equal(ids['p6-retired-toggle'].getAttribute('aria-expanded'), 'true');
+  });
+  ids['p6-retired-toggle'].click();
+  check('P6: hiding retired rows changes visibility without deleting retained identities', () => {
+    assert.equal(requests.length, retirementRequests);
+    assert.equal(ui.p6View.rows.length, 1);
+    assert.equal(ids['p6-devices-body'].children.length, 0);
+    assert.equal(ids['p6-retired-toggle'].getAttribute('aria-expanded'), 'false');
+  });
+  responses.push(listDevices([revoked], 'retired-page-cursor')); ui.loadP6Devices(); await flush();
+  check('P6: a fully retired page preserves pagination and cannot claim the whole client is empty', () => {
+    assert.match(ids['p6-list-note'].textContent, /当前页.*上方.*还有更多记录.*下一页/);
+    assert.equal(ids['p6-next'].className.includes('hidden'), false);
+  });
+  responses.push(listDevices([revoked, {...device, device: 'still-active'},
+    {...revoked, device: 'pending-retirement', verified: 'pending'}])); ui.loadP6Devices(); await flush();
+  check('P6: active and pending-revocation devices remain actionable beside hidden retired records', () => {
+    assert.equal(ids['p6-devices-body'].children.length, 2);
+    assert.match(ids['p6-devices-body'].textContent, /still-active.*下载.*pending-retirement.*撤销待确认.*重试撤销/);
+    assert.doesNotMatch(ids['p6-devices-body'].textContent, /撤销已确认/);
+  });
+  ui.p6View.busy = true; ui.renderP6Devices(); ids['p6-retired-toggle'].click();
+  check('P6: in-flight lifecycle operations lock presentation switching without extra dispatch', () => {
+    assert.equal(ui.p6View.showRetired, false);
+    assert.equal(ids['p6-retired-toggle'].disabled, true);
+  });
+  ui.p6View.busy = false; ids['p6-retired-toggle'].click();
+  responses.push(listDevices([{...device, device: 'bob-device'}])); ui.openP6Devices('bob'); await flush();
+  check('P6: changing clients resets retired view and does not relabel the previous client rows', () => {
+    assert.equal(ui.p6View.showRetired, false);
+    assert.match(ids['p6-devices-body'].textContent, /bob-device/);
+    assert.doesNotMatch(ids['p6-devices-body'].textContent, /still-active|pending-retirement/);
+    assert.equal(ids['p6-retired-toggle'].className.includes('hidden'), true);
+  });
+  responses.push(listDevices([{...revoked, verified: 'pending'}], 'probe-cursor')); ui.openP6Devices('alice'); await flush();
   check('P6: pending revocation and bounded pagination remain explicit', () => {
     assert.match(ids['p6-devices-body'].textContent, /撤销待确认.*重试撤销/);
     assert.equal(ids['p6-next'].className.includes('hidden'), false);
@@ -1136,6 +1178,6 @@ async function main() {
     assert.match(ids['inc-remote-msg'].textContent, /不能据此判断网络正常或故障/);
     assert.equal(ids['inc-remote-rows'].textContent, '');
   });
-  assert.equal(count, 129, 'UI assertion count guard');
+  assert.equal(count, 135, 'UI assertion count guard');
 }
 main().catch(err => { console.error(err); process.exitCode = 1; });

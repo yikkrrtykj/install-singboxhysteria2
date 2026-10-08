@@ -695,3 +695,17 @@ or package installation is required for this wording source commit. Publish one
 review head, retain existing field evidence, and batch any later signed delivery.
 Draft PR70 remains unmerged; full completion/final independent review, production
 signer/timestamp and the remaining unproven field gates stay explicitly open.
+
+## Device retirement in the browser
+
+Revoking upload authority stops further monitoring uploads; it does not uninstall
+the Windows program or delete the proxy Client. After server confirmation, the
+device leaves the main list. **已停用设备** expands retained records on the current
+page, with no lifecycle request or credential download. Pending revocations stay
+in the main list with their retry action. Pagination remains explicit even if a
+page contains only retired devices; its count does not describe other pages.
+
+This is presentation only. Durable revocation tombstones, identity-slot rules,
+sample retention, and the closed provisioning API are unchanged. Deleting the
+parent Client first revokes all devices of that generation and then removes its
+proxy account. Remove a local device separately in Windows client management.
