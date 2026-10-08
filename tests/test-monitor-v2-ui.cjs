@@ -1297,6 +1297,58 @@ async function main() {
     assert.match(ids['inc-host-brief'].textContent, /未取得服务状态/);
     assert.doesNotMatch(ids['inc-host-brief'].textContent, /均处于运行状态|自动重启/);
   });
+  check('host limitations acknowledge separate recorded facts and keep the classifier boundary', () => {
+    const text = ui.incidentCopy('Correlation is not causation: the root cause is not established. Server-side sparse device state cannot authoritatively determine which logical clients were affected, and it cannot infer ISP ownership or path identity; nor does it name a specific destination. Process-restart and resource facts, when available, are shown separately; they were not inputs to this stored classification.');
+    assert.match(text, /分类未使用独立的服务重启和资源记录/);
+    assert.doesNotMatch(text, /没有记录.*历史/);
+  });
+  const quietHost = {...hostData, service: {...hostData.service, not_running_samples: 0,
+    automatic_restart_increments: 0, process_changes_observed: 0}};
+  ui.renderIncidentHost(hostData);
+  check('stopped service suggests examining matching errors without declaring network causality', () => {
+    assert.match(ids['inc-host-action'].textContent, /服务未运行的记录/);
+    assert.match(ids['inc-host-action'].textContent, /仍需对照确认/);
+    assert.doesNotMatch(ids['inc-host-action'].textContent, /立即重启|已确认.*导致/);
+  });
+  ui.renderIncidentHost({...quietHost, service: {...quietHost.service, automatic_restart_increments: 1}});
+  check('automatic restart suggests time comparison, not another restart', () => {
+    assert.match(ids['inc-host-action'].textContent, /自动重启前后/);
+    assert.doesNotMatch(ids['inc-host-action'].textContent, /立即重启|重装/);
+  });
+  ui.renderIncidentHost({...quietHost, service: {...quietHost.service, process_changes_observed: 1}});
+  check('process change checks operator updates without turning it into an automatic restart', () => {
+    assert.match(ids['inc-host-action'].textContent, /人工更新或重启/);
+    assert.doesNotMatch(ids['inc-host-action'].textContent, /自动重启前后/);
+  });
+  ui.renderIncidentHost({...quietHost, availability: 'partial', gaps: 1});
+  check('coverage gap does not redirect the operator on an assumed healthy service', () => {
+    assert.match(ids['inc-host-action'].textContent, /记录缺口/);
+    assert.match(ids['inc-host-action'].textContent, /不足以排除/);
+  });
+  ui.renderIncidentHost({...quietHost, service: {...quietHost.service, counter_resets: 1}});
+  check('reset counters cannot imply absence of restarts', () => {
+    assert.match(ids['inc-host-action'].textContent, /不足以排除服务变化/);
+  });
+  ui.renderIncidentHost({...quietHost, service: {...quietHost.service, observations: 1}});
+  check('partial service observations remain unknown even with complete time coverage', () => {
+    assert.match(ids['inc-host-action'].textContent, /不足以排除服务变化/);
+  });
+  ui.renderIncidentHost({...quietHost, sample_count: 1, service: {...quietHost.service, observations: 1}});
+  check('one sample cannot establish restart comparison', () => {
+    assert.match(ids['inc-host-action'].textContent, /不足以排除服务变化/);
+  });
+  ui.renderIncidentHost(quietHost);
+  check('a high resource peak alone never becomes a resource-exhaustion verdict or switch command', () => {
+    assert.match(ids['inc-host-action'].textContent, /网络探测和设备检测/);
+    assert.match(ids['inc-host-action'].textContent, /仍可能遗漏短暂异常/);
+    assert.doesNotMatch(ids['inc-host-action'].textContent, /耗尽|切换|重装/);
+    assert.match(ids['inc-host-resources'].textContent, /99.5%/);
+  });
+  ui.renderIncidentHost({availability: 'no_records', sample_count: 0});
+  check('missing history clears the earlier guidance and cannot backfill server behavior', () => {
+    assert.match(ids['inc-host-action'].textContent, /记录缺失/);
+    assert.doesNotMatch(ids['inc-host-action'].textContent, /采样点未显示/);
+  });
   ui.state.selectedIncidentId = 1;
   let deliverHost;
   responses.push(() => new Promise(resolve => { deliverHost = resolve; }));
@@ -1305,6 +1357,7 @@ async function main() {
   check('late host response after closing an incident cannot render facts', () => {
     assert.doesNotMatch(ids['inc-host-brief'].textContent, /自动重启计数增加/);
     assert.equal(ids['inc-host-summary'].textContent, '');
+    assert.equal(ids['inc-host-action'].textContent, '');
   });
   ui.state.selectedIncidentId = 1;
   responses.push(() => new Promise(resolve => { deliverHost = resolve; }));
@@ -1319,6 +1372,6 @@ async function main() {
     assert.match(ids['inc-host-brief'].textContent, /记录暂不可读取/);
     assert.doesNotMatch(ids['inc-host-brief'].textContent, /private-backend-detail/);
   });
-  assert.equal(count, 153, 'UI assertion count guard');
+  assert.equal(count, 163, 'UI assertion count guard');
 }
 main().catch(err => { console.error(err); process.exitCode = 1; });

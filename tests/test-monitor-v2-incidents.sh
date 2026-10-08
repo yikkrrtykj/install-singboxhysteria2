@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Monitor 0.9.0 -- PR-5 incidents UI / operator-readable diagnostics
+# Monitor 0.9.1 -- PR-5 incidents UI / operator-readable diagnostics
 # (issue #33 Phase 5, #63 R2) suite.
 #
 # PR-4B left the persisted incident lifecycle with exactly one runtime
 # consumer and a closed 8-key timeline projection. PR-5 is the operator
 # surface over that same plane, under the R2 re-freeze (#63):
 #
-#   1. THE RELEASE IDENTITY is 0.9.0 / schema v5 (PR-5 landed 0.6.0;
+#   1. THE RELEASE IDENTITY is 0.9.1 / schema v5 (PR-5 landed 0.6.0;
 #      issue #65 bumps the patch level with no schema change): the eleven-table
 #      store gains ONLY operator_markers, and the release pins are
 #      restated by this lane and the hist/runtime lanes together.
@@ -60,7 +60,7 @@ FAIL=0
 # Python 3.14) and re-measured on Linux CI. Breakdown:
 #   S0 static + wiring gates            17   py_compile over server + history
 #        + presenter + webapp + harness; the release identity (VERSION /
-#        MONITOR_WEB_VERSION 0.9.0 / SCHEMA_VERSION 5); the route family's
+#        MONITOR_WEB_VERSION 0.9.1 / SCHEMA_VERSION 5); the route family's
 #        five frozen literals (the explicit retirement-replacement of P4B's
 #        darkness gate); the timeline one-incident-key wall; the
 #        classifier/runtime import wall over server+history+presenter; the
@@ -147,14 +147,14 @@ else
     fail "py_compile: $(cat "$TMP/py.err")"
 fi
 
-# (1) The release identity: Monitor 0.9.0 on history schema v5 -- PR-5 froze
+# (1) The release identity: Monitor 0.9.1 on history schema v5 -- PR-5 froze
 #     0.6.0, and issue #65 bumps the patch level with no schema change.
-assert_eq '0.9.0' "$(cat "$ROOT/monitor-v2/VERSION")" \
-    "VERSION is 0.9.0 (the incident remote-evidence release)"
-if grep -q 'MONITOR_WEB_VERSION = "0.9.0"' "$SERVER_PY"; then
-    pass "MONITOR_WEB_VERSION is 0.9.0"
+assert_eq '0.9.1' "$(cat "$ROOT/monitor-v2/VERSION")" \
+    "VERSION is 0.9.1 (the incident remote-evidence release)"
+if grep -q 'MONITOR_WEB_VERSION = "0.9.1"' "$SERVER_PY"; then
+    pass "MONITOR_WEB_VERSION is 0.9.1"
 else
-    fail "MONITOR_WEB_VERSION moved off 0.9.0"
+    fail "MONITOR_WEB_VERSION moved off 0.9.1"
 fi
 if grep -q '^SCHEMA_VERSION = 5$' "$HIST_PY"; then
     pass "history SCHEMA_VERSION is 5"

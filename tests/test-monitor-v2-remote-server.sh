@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# PR-6B server ingest / remote store suite (issue #67 PR-6B, Monitor 0.9.0).
+# PR-6B server ingest / remote store suite (issue #67 PR-6B, Monitor 0.9.1).
 #
 # Deterministic, offline, no Internet / real proxy / real VPS / wall clock.
 # The count is hard-gated:
 #
 # 189 = S0 static + red-line gates 33 (py_compile of the server modules
-#      + harness; the release identity 0.9.0 in both places; History still
+#      + harness; the release identity 0.9.1 in both places; History still
 #      schema v5 with its six frozen prune sources and no remote words;
 #      classifier/runtime/presenter carry no remote reference; the ingest
 #      dispatch appears once and sits before the browser cross-origin gate
@@ -68,8 +68,8 @@ for harness in store_groups linux_groups; do
     fi
 done
 
-assert_eq '0.9.0' "$(cat "$ROOT/monitor-v2/VERSION")" "VERSION is 0.9.0 (PR-6C release candidate)"
-assert_contains 'MONITOR_WEB_VERSION = "0.9.0"' "$(cat "$SERVER_PY")" "MONITOR_WEB_VERSION is 0.9.0"
+assert_eq '0.9.1' "$(cat "$ROOT/monitor-v2/VERSION")" "VERSION is 0.9.1 (PR-6C release candidate)"
+assert_contains 'MONITOR_WEB_VERSION = "0.9.1"' "$(cat "$SERVER_PY")" "MONITOR_WEB_VERSION is 0.9.1"
 
 HIST_TXT="$(cat "$HIST_PY")"
 assert_contains 'SCHEMA_VERSION = 5' "$HIST_TXT" "History schema stays v5"
