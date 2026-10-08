@@ -1937,6 +1937,7 @@ assert_grep '"age_stale":true' <(printf '%s' "$H_JSON") "age_stale=true for old 
 
 printf '{"schema_version":1,"snapshot_version":11,"published_at":"2030-01-01T00:00:00+00:00","collector_stale":false,"consumer_alive":true}\n' > "$HEALTH_FILE"
 kill "$WEB_LIVE_PID" 2>/dev/null
+wait "$WEB_LIVE_PID" 2>/dev/null || true
 WEB_LIVE_PID=""
 sleep 0.5
 H_JSON="$(hw_probe)"; H_RC=$?
@@ -2062,6 +2063,7 @@ assert_rc 0 "$H_RC" "extra session fields tolerated (stable shape check) (R1.1-C
 assert_no_grep "$C_SENTINEL" <(printf '%s' "$H_JSON") "session body contents never appear in probe output (R1.1-C)"
 
 kill "$C_STUB_PID" 2>/dev/null
+wait "$C_STUB_PID" 2>/dev/null || true
 C_STUB_PID=""
 sleep 0.4
 H_JSON="$(c_probe)"; H_RC=$?
@@ -2100,6 +2102,7 @@ else
     fail "real E2 web server did not come up for the identity probe (R1.1-C)"
 fi
 kill "$C_REAL_PID" 2>/dev/null
+wait "$C_REAL_PID" 2>/dev/null || true
 rm -rf "$C_REAL_DATA"
 [ -n "$C_API_PID" ] && kill "$C_API_PID" 2>/dev/null
 

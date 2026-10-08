@@ -20,9 +20,9 @@ Operator authorized this next feature after 0.8.1 deployment on 2026-10-08.
 - [ ] Packaging/compatibility and exact-head CI pass; review and PR.
 - [ ] Existing VPS update and one server-health receipt; no client reinstall or old native acceptance repetition.
 
-Local verification: 30 host-evidence tests, 28 passed and 2 Linux-only checks pending Linux CI;
+Local verification: 32 host-evidence tests, 30 passed and 2 Linux-only checks covered by Linux CI;
 153 DOM behavior checks; all 23 existing remote-evidence HTTP/SQLite tests;
 166 existing incidents checks. The initial Windows packaging attempt exposed the
 synthetic 0.9.0 collision (corrected to 98.9.0 / 98.10.0) and three mock-listener
 shutdown failures from the local shell/Python adapter; retain that failed run,
-use a native test entry and leave full atomic/Linux ownership gates to CI.
+use a native test entry and leave full atomic/Linux ownership gates to CI. The first PR head passed all 15 CI checks, including all 30 initial host tests on Linux and the non-root reader/store test on Ubuntu 22.04, 24.04 and 26.04. Final-head CI covers two additional worker-start/storage-full cases and explicit mock-listener waits.

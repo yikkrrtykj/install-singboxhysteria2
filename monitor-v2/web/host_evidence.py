@@ -318,12 +318,17 @@ class HostEvidence:
             return
         try:
             self.store.open()
-        except (OSError, ValueError, sqlite3.Error):
+            self.stop_event.clear()
+            self.thread = threading.Thread(target=self._loop, name='host-evidence', daemon=True)
+            self.thread.start()
+        except Exception:  # even a refused worker cannot prevent web startup
             self.collection_status = 'unavailable'
+            self.thread = None
+            try:
+                self.store.close()
+            except Exception:
+                pass
             return
-        self.stop_event.clear()
-        self.thread = threading.Thread(target=self._loop, name='host-evidence', daemon=True)
-        self.thread.start()
 
     def cycle(self):
         try:
@@ -355,5 +360,8 @@ class HostEvidence:
                 # Don't close an in-flight writer; it is daemon-isolated.
                 return
             self.thread = None
-        self.store.close()
-        self.collection_status = 'disabled'
+        try:
+            self.store.close()
+            self.collection_status = 'disabled'
+        except Exception:
+            self.collection_status = 'unavailable'

@@ -166,6 +166,22 @@ class EvidenceTests(unittest.TestCase):
         with patch.object(reader, 'sample', side_effect=RuntimeError('private-secret')): plane.cycle()
         self.assertEqual(plane.collection_status, 'unavailable')
         plane.stop(); self.assertIsNone(plane.thread)
+    def test_worker_start_refusal_is_isolated_and_leaves_no_open_store(self):
+        plane = h.HostEvidence(self.temp.name, store=self.store)
+        with patch.object(threading.Thread, 'start', side_effect=RuntimeError('private-secret')):
+            plane.start()
+        self.assertEqual(plane.collection_status, 'unavailable')
+        self.assertIsNone(plane.thread); self.assertIsNone(self.store.conn)
+        plane.stop()
+    def test_storage_full_refuses_only_host_record_and_preserves_existing_rows(self):
+        self.store.conn.execute('PRAGMA max_page_count=4')
+        failure = False
+        for i in range(1000):
+            try: self.store.append(sample(NOW+i))
+            except sqlite3.Error:
+                failure = True; break
+        self.assertTrue(failure)
+        self.assertGreater(self.store.conn.execute('SELECT count(*) FROM samples').fetchone()[0],0)
 
 class ReaderTests(unittest.TestCase):
     def setUp(self):
