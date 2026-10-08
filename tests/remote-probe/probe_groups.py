@@ -2643,9 +2643,9 @@ def group_contract():
                           "2606:4700:4700::1111", "not-an-ip", "", "1.2.3.4.5"))
     out["version_not_bumped"] = (
         open(os.path.join(ROOT, "monitor-v2", "VERSION"),
-             encoding="utf-8").read().strip() == "0.8.0")
+             encoding="utf-8").read().strip() == "0.8.1")
     out["monitor_web_version_untouched"] = (
-        'MONITOR_WEB_VERSION = "0.8.0"' in open(
+        'MONITOR_WEB_VERSION = "0.8.1"' in open(
             os.path.join(ROOT, "monitor-v2", "web", "server.py"),
             encoding="utf-8").read())
     return out

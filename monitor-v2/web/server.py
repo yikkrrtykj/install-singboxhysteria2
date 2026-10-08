@@ -64,7 +64,7 @@ from web.remote_ingest import (INGEST_HEADERS, INGEST_MAX_BODY,
 from web.recovery import (RECOVERY_SUCCESS_MESSAGE, RecoveryGlobalGuard,
                           RecoveryRateLimiter, generate_key)
 
-MONITOR_WEB_VERSION = "0.8.0"
+MONITOR_WEB_VERSION = "0.8.1"
 SESSION_COOKIE = "monitor_session"
 MAX_BODY_BYTES = 65536
 SUPPORTED_METHODS = "GET, POST"
