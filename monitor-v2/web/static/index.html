@@ -251,6 +251,7 @@
           <div class="row">
             <button id="p6-windows-download" class="btn ghost" type="button">单独下载程序（高级）</button>
             <button id="p6-refresh" class="btn ghost" type="button">刷新设备</button>
+            <button id="p6-retired-toggle" class="btn ghost hidden" type="button" aria-expanded="false" aria-controls="p6-devices-body">已停用设备</button>
             <button id="p6-next" class="btn ghost hidden" type="button">下一页</button>
             <button id="p6-close" class="btn ghost" type="button">关闭</button>
           </div>
@@ -259,6 +260,8 @@
               <tbody id="p6-devices-body"></tbody>
             </table>
           </div>
+          <p id="p6-list-note" class="muted hidden" role="status"></p>
+          <p class="muted">撤销上传权限会停用设备，确认后从主列表收起；登记记录仍会保留。电脑上的程序请在 Windows 客户端管理中移除。删除上一级客户端会同时停用它的所有设备，并删除代理账号。</p>
           <form id="p6-enroll-form">
             <div class="row">
               <label>设备 <input id="p6-device-name" type="text" maxlength="32" placeholder="例如 laptop-01" autocomplete="off" required></label>

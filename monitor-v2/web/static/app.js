@@ -195,7 +195,7 @@
     incSection: "samples"
   };
   // Non-secret metadata and pending-operation key only, in page memory.
-  var p6View = {name: null, busy: false, retry: null, rows: [], next: null};
+  var p6View = {name: null, busy: false, retry: null, rows: [], next: null, showRetired: false};
 
   function $(id) { return document.getElementById(id); }
   function show(el) { el.classList.remove("hidden"); }
@@ -1548,6 +1548,7 @@
     ["p6-enroll", "p6-refresh", "p6-next", "p6-close", "p6-windows-download"].forEach(function (id) {
       $(id).disabled = p6View.busy || !e3Writable() || !!state.e3Mutation;
     });
+    $("p6-retired-toggle").disabled = p6View.busy;
     $("p6-enroll").disabled = $("p6-enroll").disabled || !!p6View.retry;
     $("p6-retry").disabled = p6View.busy || !e3Writable();
     if (p6View.retry) show($("p6-retry")); else hide($("p6-retry"));
@@ -1560,7 +1561,28 @@
   function renderP6Devices() {
     var tbody = $("p6-devices-body");
     while (tbody.firstChild) tbody.removeChild(tbody.firstChild);
-    p6View.rows.forEach(function (device) {
+    // Only confirmed revocations leave the main list; a pending revocation
+    // must remain actionable. This changes visibility, never authority/rows.
+    var retired = p6View.rows.filter(function (device) {
+      return device.desired === "revoked" && device.verified === "revoked";
+    });
+    var visible = p6View.rows.filter(function (device) {
+      return p6View.showRetired || retired.indexOf(device) === -1;
+    });
+    var toggle = $("p6-retired-toggle");
+    toggle.textContent = (p6View.showRetired ? "收起已停用设备" : "已停用设备") +
+      "（本页 " + retired.length + "）";
+    toggle.setAttribute("aria-expanded", p6View.showRetired ? "true" : "false");
+    if (retired.length) show(toggle); else hide(toggle);
+    var note = $("p6-list-note");
+    note.textContent = "";
+    hide(note);
+    if (!visible.length && retired.length) {
+      note.textContent = "当前页的设备均已停用，可在上方展开查看。" +
+        (p6View.next ? "还有更多记录，请点击下一页。" : "");
+      show(note);
+    }
+    visible.forEach(function (device) {
       var row = tbody.insertRow(-1);
       row.insertCell(-1).textContent = p6View.name;
       row.insertCell(-1).textContent = device.device;
@@ -1613,6 +1635,11 @@
       e3Message("请先确认上一次设备操作的结果。", true);
       return;
     }
+    if (p6View.name !== name) {
+      p6View.showRetired = false;
+      p6View.rows = [];
+      p6View.next = null;
+    }
     p6View.name = name;
     $("p6-client-name").textContent = name;
     show($("p6-device-panel"));
@@ -1653,7 +1680,7 @@
       method: "POST", body: body, idempotencyKey: key
     }).then(function (result) {
       p6View.retry = null;
-      if (op === "revoke") p6Message("服务器已确认撤销上传权限。", false);
+      if (op === "revoke") p6Message("服务器已确认撤销上传权限；确认后的设备会收起到已停用设备。电脑上的程序不会自动卸载。", false);
       else p6Message(result.data.verified === "active"
         ? "设备登记已确认，可以下载该设备的客户端包。"
         : "此登记已撤销。", result.data.verified !== "active");
@@ -2101,6 +2128,11 @@
           site_label: $("p6-site-label").value.trim(), path_label: $("p6-path-label").value.trim()}, newIdempotencyKey());
       });
       $("p6-windows-download").addEventListener("click", downloadP6Windows);
+      $("p6-retired-toggle").addEventListener("click", function () {
+        if (p6View.busy) return;
+        p6View.showRetired = !p6View.showRetired;
+        renderP6Devices();
+      });
       $("p6-refresh").addEventListener("click", function () { loadP6Devices(); });
       $("p6-next").addEventListener("click", function () { loadP6Devices(p6View.next); });
       $("p6-close").addEventListener("click", function () { if (!p6View.busy) hide($("p6-device-panel")); });
