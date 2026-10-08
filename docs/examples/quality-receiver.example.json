@@ -1,0 +1,9 @@
+{
+  "v": 1,
+  "listen": "0.0.0.0",
+  "port": 8448,
+  "token": "REPLACEWithPrivateReceiverToken123",
+  "certificate": "/private/controlled-vps-ip-san.pem",
+  "private_key": "/private/controlled-vps-key.pem",
+  "minute_bytes": 2097152
+}

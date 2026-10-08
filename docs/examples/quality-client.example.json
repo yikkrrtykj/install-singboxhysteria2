@@ -1,0 +1,48 @@
+{
+  "v": 1,
+  "controller": "http://127.0.0.1:9090",
+  "controller_secret": "REPLACEWithPrivateControllerSecret123",
+  "control_enabled": false,
+  "cycle_seconds": 5,
+  "probe_interval_seconds": 30,
+  "probe_bytes_per_minute": 2097152,
+  "churn_connections": 3,
+  "paths": [
+    {
+      "name": "Reality",
+      "listener_port": 19200,
+      "endpoint": "https://203.0.113.1:8448",
+      "token": "REPLACEWithPrivateReceiverToken123",
+      "ca_file": "/private/controlled-vps-ca.pem",
+      "payload_bytes": 524288,
+      "rate_mbps": 20,
+      "timeout_seconds": 6,
+      "policy": {
+        "fail_mbps": 4,
+        "recover_mbps": 8,
+        "hold_seconds": 120,
+        "freshness_seconds": 90,
+        "fail_samples": 2,
+        "recover_samples": 3
+      }
+    },
+    {
+      "name": "Hysteria2",
+      "listener_port": 19201,
+      "endpoint": "https://203.0.113.1:8448",
+      "token": "REPLACEWithPrivateReceiverToken123",
+      "ca_file": "/private/controlled-vps-ca.pem",
+      "payload_bytes": 524288,
+      "rate_mbps": 20,
+      "timeout_seconds": 6,
+      "policy": {
+        "fail_mbps": 4,
+        "recover_mbps": 8,
+        "hold_seconds": 120,
+        "freshness_seconds": 90,
+        "fail_samples": 2,
+        "recover_samples": 3
+      }
+    }
+  ]
+}
