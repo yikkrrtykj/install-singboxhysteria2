@@ -688,6 +688,7 @@
       hide($("inc-evidence-subject"));
       loadEvidence(state.incSection);
       loadIncidentRemote(id);
+      loadIncidentHost(id);
     }).catch(function (error) {
       if (error.status === 401) showLogin("登录已过期，请重新登录。");
     });
@@ -759,7 +760,7 @@
     $("inc-detail-title").textContent = uncertain ? "发现异常，原因尚未确定" : incidentCopy(summary.headline) || "事件";
     $("inc-meaning").textContent = uncertain ?
       "系统记录到了异常迹象，但现有记录不足以确定原因或影响范围。" : incidentCopy(summary.impact) || "请结合本次记录查看判断与未确认的问题。";
-    ["inc-analysis-details", "inc-remote", "inc-technical-details"].forEach(function (id) { $(id).open = false; });
+    ["inc-analysis-details", "inc-host", "inc-remote", "inc-technical-details"].forEach(function (id) { $(id).open = false; });
     var brief = $("inc-summary"); brief.textContent = "";
     var win = summary.window || {};
     if (win.start_epoch !== undefined) brief.appendChild(kvRow("异常记录范围",
@@ -808,6 +809,55 @@
     reasonItems($("inc-unknowns-list"), detail.unknowns);
     tokenItems($("inc-evidence-tokens"), detail.evidence);
     tokenItems($("inc-unknown-tokens"), detail.unknowns);
+  }
+
+  var hostRequestGeneration = 0;
+  function loadIncidentHost(id) {
+    if (!state.session || !state.session.authenticated || state.selectedIncidentId !== id) return;
+    var generation = ++hostRequestGeneration;
+    $("inc-host-brief").textContent = "服务器侧：正在读取事件时段的服务与资源记录。";
+    $("inc-host-summary").textContent = "";
+    $("inc-host-resources").textContent = "";
+    return api("/api/v1/incidents/" + id + "/host-evidence").then(function (data) {
+      if (generation !== hostRequestGeneration || state.selectedIncidentId !== id ||
+          !state.session || !state.session.authenticated) return;
+      renderIncidentHost(data);
+    }).catch(function () {
+      if (generation !== hostRequestGeneration || state.selectedIncidentId !== id) return;
+      $("inc-host-brief").textContent = "服务器记录暂不可读取，无法确认当时的服务与资源状态。";
+    });
+  }
+  function renderIncidentHost(data) {
+    var brief = $("inc-host-brief"), service = data.service || {};
+    if (data.availability === "no_records" || data.availability === "unavailable" || !data.sample_count) {
+      brief.textContent = data.availability === "unavailable" ?
+        "服务器记录暂不可读取，无法确认当时的服务与资源状态。" :
+        "该事件时段没有保留服务器记录；新版本仅从启用后开始记录，旧事件无法补回。";
+      return;
+    }
+    var facts = [];
+    if (service.observations) {
+      facts.push(service.not_running_samples ? "有 " + service.not_running_samples + " 个采样点服务未处于运行状态" : "服务采样点均处于运行状态");
+      facts.push("自动重启计数增加 " + service.automatic_restart_increments + " 次");
+      facts.push("观察到进程变化 " + service.process_changes_observed + " 次");
+    } else facts.push("未取得服务状态");
+    brief.textContent = "服务器侧：" + facts.join("；") + "。" +
+      (data.availability !== "available" ? "记录不完整，不能排除缺口中的异常。" : "采样间隙仍可能遗漏短暂变化。");
+    var box = $("inc-host-summary"); box.textContent = "";
+    box.appendChild(kvRow("记录范围", fmtEpoch(data.first_sample_epoch) + " — " + fmtEpoch(data.last_sample_epoch)));
+    box.appendChild(kvRow("采样点", data.sample_count + " 个；间隔 " + data.cadence_seconds + " 秒"));
+    box.appendChild(kvRow("记录缺口", data.gaps + " 段" + (data.truncated ? "；记录已截断" : "")));
+    if (service.counter_resets) box.appendChild(kvRow("重启计数重置", service.counter_resets + " 次，不能按差值补算"));
+    if (service.incomparable_transitions) box.appendChild(kvRow("无法比较的相邻记录", service.incomparable_transitions + " 处（间隔、开机或监测进程边界等）"));
+    var resources = $("inc-host-resources"); resources.textContent = "";
+    var names = {cpu_percent: "CPU 使用率峰值", memory_percent: "内存使用率峰值", load_1m: "1分钟负载峰值",
+      disk_percent: "监测数据所在磁盘占用峰值", fd_percent: "系统文件句柄占用峰值", conntrack_percent: "连接跟踪表占用峰值"};
+    Object.keys(names).forEach(function (key) {
+      var metric = (data.resources || {})[key] || {};
+      resources.appendChild(kvRow(names[key], metric.peak === null || metric.peak === undefined ?
+        "未取得结果" : Number(metric.peak).toFixed(1) + (key === "load_1m" ? "" : "%") + "（" + metric.observations + " 个采样点）"));
+    });
+    box.appendChild(kvRow("当前记录器（不是事件当时状态）", {recording: "正在记录", unavailable: "当前记录失败", disabled: "未运行"}[data.collection_status] || "未知"));
   }
 
   var remoteRequestGeneration = 0;
@@ -922,6 +972,7 @@
   function closeIncidentDetail() {
     ++incidentOpenGeneration;
     ++remoteRequestGeneration;
+    ++hostRequestGeneration;
     ++evidenceRequestGeneration;
     state.selectedIncidentId = null;
     state.incSubject = null;

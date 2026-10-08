@@ -41,6 +41,7 @@ from web.e3_broker import E3Broker  # noqa: E402
 from web.e3rpc import E3RpcClient  # noqa: E402
 from web.incident_history import IncidentHistory  # noqa: E402
 from web.remote_ingest import RemoteIngest  # noqa: E402
+from web.host_evidence import HostEvidence
 from web.incident_runtime import IncidentScanner  # noqa: E402
 from web.recovery import generate_key  # noqa: E402
 from web.server import (MONITOR_WEB_VERSION, MonitorWebApp,  # noqa: E402
@@ -288,6 +289,9 @@ def cmd_serve(args):
     broker.start()
     probes.start()
     scanner.start()
+    # Independent server facts, no History migration or classifier input.
+    host_evidence = HostEvidence(data_dir)
+    host_evidence.start()
 
     # Issue #67 PR-6B: the remote-probe ingest plane is OPTIONAL and
     # fail-closed. It loads only operator-supplied config; with no config
@@ -307,7 +311,8 @@ def cmd_serve(args):
                         incident_history=history,
                         probe_scheduler=probes,
                         incident_scanner=scanner,
-                        remote_plane=remote_plane)
+                        remote_plane=remote_plane,
+                        host_evidence=host_evidence)
     server = build_server(app, args.listen, args.port, tls_context)
     scheme = "https" if tls_context is not None else "http"
     print("monitor web (%s) listening on %s:%d [%s]" %
@@ -318,6 +323,7 @@ def cmd_serve(args):
     except KeyboardInterrupt:
         pass
     finally:
+        host_evidence.stop()
         probes.stop()
         broker.stop()
         # PR-4B: the scanner must be down BEFORE the History store closes --

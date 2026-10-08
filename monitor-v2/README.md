@@ -861,3 +861,14 @@ Mihomo API（仅补充展示）:  version / mode / selected proxy / delay /
 文件：`monitor-v2/mihomo/{client.py,model.py,fixtures/}`；
 测试：`tests/test-monitor-v2-e4.sh`（E1 回归必须保持 188/188）。
 
+
+## 0.9.0：事件时段的服务器服务与资源记录
+
+更新服务器 Monitor 后，每10秒记录 sing-box 服务状态、自动重启计数和进程变化，
+以及 CPU、内存、磁盘、系统文件句柄和连接跟踪表占用。事件详情首页显示简短的服务事实，
+资源峰值在「服务器状态 · 事件时段」中展开。缺失数据、记录间断和计数重置都会明确标注。
+
+只从更新后开始记录，不能补回旧事件。峰值和相关变化不单独证明故障原因；自动判因规则不变。
+只更新服务器，无需重装 Windows 客户端；不会修改 Clash/TUN、自启动或代理服务配置。
+记录独立保存7天，数据库最多16 MiB；具体权限、限制和回滚说明见
+[服务器证据说明](../docs/monitor-v2-host-evidence.md)。

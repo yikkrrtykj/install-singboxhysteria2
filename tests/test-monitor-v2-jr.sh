@@ -246,8 +246,8 @@ EOF
 )"
 assert_eq "$WEBJR" "True" \
     "journal_reader edge: only web/incident_history.py, only ingest_contract+schema (PR-2B scope)"
-assert_eq "$(cat "$ROOT/monitor-v2/VERSION")" "0.8.1" \
-    "VERSION is 0.8.1 (the incident remote-evidence release)"
+assert_eq "$(cat "$ROOT/monitor-v2/VERSION")" "0.9.0" \
+    "VERSION is 0.9.0 (the incident remote-evidence release)"
 ENVCOUNT="$(grep -rc 'os.environ' "$MODS"/*.py | awk -F: '{s+=$2} END {print s+0}')"
 assert_eq "$ENVCOUNT" "1" \
     "exactly one env read across the whole reader (SBOX_JR_UNIT, strictly validated)"

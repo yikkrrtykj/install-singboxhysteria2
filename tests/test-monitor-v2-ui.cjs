@@ -85,7 +85,7 @@ const context = vm.createContext({ document, console, Uint8Array, Date, performa
   }
 });
 vm.runInContext(app.replace('document.addEventListener("DOMContentLoaded", boot);',
-  'globalThis.ui = {state, bind, render, loadSession, loadE3Status, loadE3Clients, convergeAfterMutation, renderE3Controls, renderE3Clients, renderMonitorInfo, addClient, deleteClient, downloadConfig, setPendingRetry, retryPending, apiWithStepUp, setView, loadIncidents, renderIncidents, openIncident, renderIncidentDetail, renderIncidentRemote, loadIncidentRemote, closeIncidentDetail, loadEvidence, loadMarkers, renderMarkers, addMarker, rearmIncidents, renderIncRuntime, p6View, openP6Devices, loadP6Devices, p6Operate, downloadP6Bundle, downloadP6Windows, downloadP6Client, renderP6Devices, incidentCopy, userActivity, setIdleDeadline, startWatchdog};'), context);
+  'globalThis.ui = {state, bind, render, loadSession, loadE3Status, loadE3Clients, convergeAfterMutation, renderE3Controls, renderE3Clients, renderMonitorInfo, addClient, deleteClient, downloadConfig, setPendingRetry, retryPending, apiWithStepUp, setView, loadIncidents, renderIncidents, openIncident, renderIncidentDetail, renderIncidentRemote, loadIncidentRemote, renderIncidentHost, loadIncidentHost, closeIncidentDetail, loadEvidence, loadMarkers, renderMarkers, addMarker, rearmIncidents, renderIncRuntime, p6View, openP6Devices, loadP6Devices, p6Operate, downloadP6Bundle, downloadP6Windows, downloadP6Client, renderP6Devices, incidentCopy, userActivity, setIdleDeadline, startWatchdog};'), context);
 const ui = context.ui;
 function remoteFixture(rows = []) {
   return {v: 1, incident_id: 1, window: {start_epoch: 1, end_epoch: 160},
@@ -685,7 +685,7 @@ async function main() {
   responses.push(response(detail),
     // renderIncidentDetail chains loadEvidence() on the same tick: the
     // probe_rows read must already be queued behind the detail body.
-    response({subject: {type: 'incident', id: 1}, section: 'samples', window: {start_epoch: 1, end_epoch: 160}, rows: [], truncated: false, retention_cutoff_epoch: 0}), response(remoteFixture()));
+    response({subject: {type: 'incident', id: 1}, section: 'samples', window: {start_epoch: 1, end_epoch: 160}, rows: [], truncated: false, retention_cutoff_epoch: 0}), response(remoteFixture()), response({availability: 'no_records', sample_count: 0}));
   await ui.openIncident(1); await flush();
   check('the L1 first screen renders the plain-language summary without raw snake_case tokens', () => {
     assert.match(ids['inc-detail'].textContent, /Reality\/TCP 链路事件/);
@@ -1261,6 +1261,64 @@ async function main() {
     assert.match(ids['inc-evidence-list'].textContent, /Reality 活动连接数远低于其基线/);
     assert.match(ids['inc-evidence-tokens'].textContent, /count_drop_reality/);
   });
-  assert.equal(count, 144, 'UI assertion count guard');
+  check('host evidence resource details are collapsed on event open', () => {
+    assert.equal(ids['inc-host'].open, false);
+    assert.match(ids['inc-host'].textContent, /采样间隙/);
+  });
+  ui.renderIncidentHost({availability: 'no_records', sample_count: 0});
+  check('missing historical host evidence does not fabricate service health', () => {
+    assert.match(ids['inc-host-brief'].textContent, /没有保留服务器记录/);
+    assert.doesNotMatch(ids['inc-host-brief'].textContent, /均处于运行状态/);
+  });
+  const hostData = {availability: 'available', sample_count: 3, cadence_seconds: 10,
+    first_sample_epoch: 100, last_sample_epoch: 120, gaps: 0, truncated: false,
+    collection_status: 'recording', service: {observations: 3, not_running_samples: 1,
+      automatic_restart_increments: 2, process_changes_observed: 1, counter_resets: 0, incomparable_transitions: 0},
+    resources: {cpu_percent: {peak: 99.5, observations: 2}, memory_percent: {peak: null, observations: 0}}};
+  ui.renderIncidentHost(hostData);
+  check('restart increments and process observations remain separate from the verdict', () => {
+    assert.match(ids['inc-host-brief'].textContent, /自动重启计数增加 2 次/);
+    assert.match(ids['inc-host-brief'].textContent, /进程变化 1 次/);
+    assert.match(ids['inc-host-brief'].textContent, /1 个采样点服务未处于运行状态/);
+    assert.doesNotMatch(ids['inc-host-brief'].textContent, /原因确定|服务器故障导致/);
+  });
+  check('resource peaks and unknown measurements are readable without causal inference', () => {
+    assert.match(ids['inc-host-resources'].textContent, /99.5%/);
+    assert.match(ids['inc-host-resources'].textContent, /未取得结果/);
+    assert.doesNotMatch(ids['inc-host-resources'].textContent, /null|NaN|undefined/);
+  });
+  ui.renderIncidentHost({...hostData, availability: 'partial', gaps: 2, truncated: true});
+  check('partial and truncated host evidence cannot rule out unobserved faults', () => {
+    assert.match(ids['inc-host-brief'].textContent, /记录不完整/);
+    assert.match(ids['inc-host-summary'].textContent, /2 段；记录已截断/);
+  });
+  ui.renderIncidentHost({...hostData, service: {...hostData.service, observations: 0}});
+  check('unreadable service state is distinct from running or failed', () => {
+    assert.match(ids['inc-host-brief'].textContent, /未取得服务状态/);
+    assert.doesNotMatch(ids['inc-host-brief'].textContent, /均处于运行状态|自动重启/);
+  });
+  ui.state.selectedIncidentId = 1;
+  let deliverHost;
+  responses.push(() => new Promise(resolve => { deliverHost = resolve; }));
+  const lateHost = ui.loadIncidentHost(1); await flush();
+  ui.closeIncidentDetail(); deliverHost(response(hostData)); await lateHost; await flush();
+  check('late host response after closing an incident cannot render facts', () => {
+    assert.doesNotMatch(ids['inc-host-brief'].textContent, /自动重启计数增加/);
+    assert.equal(ids['inc-host-summary'].textContent, '');
+  });
+  ui.state.selectedIncidentId = 1;
+  responses.push(() => new Promise(resolve => { deliverHost = resolve; }));
+  const otherHost = ui.loadIncidentHost(1); await flush();
+  ui.state.selectedIncidentId = 2; deliverHost(response(hostData)); await otherHost; await flush();
+  check('late host response cannot overwrite another selected event', () => {
+    assert.doesNotMatch(ids['inc-host-brief'].textContent, /自动重启计数增加/);
+  });
+  responses.push(response({error: 'private-backend-detail'}, 503));
+  await ui.loadIncidentHost(2); await flush();
+  check('host read error stays explicit and never exposes raw backend detail', () => {
+    assert.match(ids['inc-host-brief'].textContent, /记录暂不可读取/);
+    assert.doesNotMatch(ids['inc-host-brief'].textContent, /private-backend-detail/);
+  });
+  assert.equal(count, 153, 'UI assertion count guard');
 }
 main().catch(err => { console.error(err); process.exitCode = 1; });
