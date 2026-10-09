@@ -26,11 +26,17 @@ Current quality work: [PR-48B](mihomo-protocol-quality-failover-p48b.md).
 - [x] Pilot head 24af6898: all 15 GitHub checks passed.
 - [x] Correct proxy/group blank-line boundary to match the actual full server renderer;
       non-hopping and hopping template round trips and malformed boundaries covered.
-- [ ] GitHub CI completion on the renderer-boundary correction commit.
+- [x] Renderer-boundary correction head 8378b27a: all 15 GitHub checks passed.
 
-## Operator acceptance deferred
+## Operator acceptance
 
-The operator explicitly requested development first and will test later.
+The existing-VPS operator pilot passed all seven controlled stages in 311.3 seconds
+using the original export. Owned-process cleanup completed. The result stays local;
+no raw result or credential files are committed. The daily Clash core was not controlled.
+
+- [x] Single-VPS genuine Reality/HY2 controlled degradation, hard failure, recovery,
+      connection continuity and manual-choice pilot.
+- [ ] Daily Clash opt-in integration and live-application acceptance.
 
 - [ ] Actual Reality/HY2 and both opposite network cases.
 - [ ] Site thresholds / payload / probe rate and receiver resource capacity.
