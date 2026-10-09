@@ -19,7 +19,7 @@ class Controller:
                 or not ipaddress.ip_address(parts.hostname).is_loopback
                 or not parts.port or parts.path not in ("", "/")
                 or parts.query or parts.fragment or parts.username or parts.password
-                or type(secret) is not str or not 16 <= len(secret) <= 256
+                or type(secret) is not str or not 1 <= len(secret) <= 256
                 or any(ord(c) < 33 or ord(c) > 126 for c in secret)):
             raise ValueError("controller")
         self.host, self.port, self.secret = parts.hostname, parts.port, secret

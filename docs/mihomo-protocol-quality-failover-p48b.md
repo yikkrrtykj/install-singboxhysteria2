@@ -2,9 +2,10 @@
 
 Status: opt-in pilot implementation. No installer, auto-start, live deployment,
 Windows-agent change, Monitor-classifier change or firewall change is included.
-The existing offline multi-VPS merge remains unchanged. Real Reality/HY2,
-two independent providers and production thresholds are operator acceptance
-items; loopback relay results below do not prove those items.
+The merge parser boundary now matches the server renderer; its generated policy
+remains unchanged. Actual single-VPS Reality/HY2 passed the controlled operator
+pilot. Daily-core/application use, independent providers and production thresholds
+remain operator acceptance items; loopback relay results do not prove those items.
 
 ## Decision and topology
 
@@ -59,6 +60,15 @@ The original automatic outer choice remains a reversible escape hatch.
 For one complete disposable-core check, see [the pilot entry](mihomo-quality-pilot.md).
 It prepares receiver files, offers one client window and applies faults only to
 local test relays. This does not enable the normal client worker or deploy a receiver.
+
+## Daily Clash opt-in window
+
+See [the daily integration entry](mihomo-quality-daily.md) for a single window
+that prepares a new private profile, verifies loaded-profile identity, observes
+first and requires explicit enable. It never imports/reloads live profiles.
+Manual outer choices take priority; stop restores only the exact owned group.
+The window supports existing authenticated Verge loopback settings without
+changing them. Its local integration receipt remains private.
 
 ## Operator commands (Python 3.10+, standard library)
 
@@ -192,12 +202,14 @@ route independent of DIRECT/other nodes, ownership, recovery, normal cache
 restart, native fallback without worker intervention, and old/new connections.
 
 Remaining real-environment acceptance is deliberately unchecked:
-- [ ] Actual Reality/HY2 interoperability and per-site threshold calibration.
+- [x] Actual single-VPS Reality/HY2 controlled operator pilot (seven stages, 311.3s).
+- [ ] Daily Clash/application acceptance and per-site threshold calibration.
 - [ ] Receiver deployment/capacity/resource-health review.
 - [ ] Two genuinely independent providers/paths and real common-VPS outage.
 - [ ] Live application quality incident and quiet-uplink negative control.
 - [ ] Real HY2 loss/churn/broad UDP restriction versus single-port hopping.
-- [ ] Safe operator UX/package integration after the pilot is accepted.
+- [x] Observe-first daily window and generated-profile identity guards.
+- [ ] Company distribution and long-lived receiver operation.
 - [ ] Optional #33 quality-state ingest/UI contract, separate from current schema.
 
 Do not close #48 or claim production failover accepted from loopback tests.

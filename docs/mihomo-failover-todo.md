@@ -28,6 +28,14 @@ Current quality work: [PR-48B](mihomo-protocol-quality-failover-p48b.md).
       non-hopping and hopping template round trips and malformed boundaries covered.
 - [x] Renderer-boundary correction head 8378b27a: all 15 GitHub checks passed.
 
+- [x] Daily opt-in GUI: private preparation, loaded-profile marker, observation first,
+      explicit enable, manual precedence and owned stop restoration.
+- [x] 26 hermetic daily contracts pass; real pinned-core API identity/selection
+      smoke check passes without touching daily Clash.
+- [x] Latest-state receipt is atomic/bounded; controller credentials remain in memory.
+- [x] Pilot evidence follow-up head 8452b76: all 15 GitHub checks passed.
+- [ ] Daily-entry head CI (pending publication of this change).
+
 ## Operator acceptance
 
 The existing-VPS operator pilot passed all seven controlled stages in 311.3 seconds
@@ -45,6 +53,6 @@ no raw result or credential files are committed. The daily Clash core was not co
 - [ ] Actual HY2 loss/churn/broad UDP impairment versus single-port hopping.
 - [ ] Company-facing package/UX and optional #33 evidence integration contract.
 
-The work is an opt-in pilot; do not close #48, deploy it or claim real-world
+The work is an opt-in trial; do not close #48, deploy unattended or claim real-world
 HA acceptance from mock-path tests. Monitor 0.9.1 and its scanner follow-up
 remain separate. No new Windows administrator/test step is requested here.

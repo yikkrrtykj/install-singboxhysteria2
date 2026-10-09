@@ -17,6 +17,9 @@ jobs:
           python-version: '3.12'
       - name: Actual TLS, profile, bounded runtime and native Windows security
         run: python tests/remote-production/test_foundations.py
+      - name: Daily Clash opt-in private preparation and worker lifecycle
+        if: runner.os == 'Windows'
+        run: python -B tests/test_quality_daily.py
       - name: Actual native SCM service start pause continue stop
         if: runner.os == 'Windows'
         run: python tests/remote-production/test_service_scm.py
