@@ -79,7 +79,7 @@ def export(path, backup=False, hopping=False):
         "  - name: Hysteria2", "    type: hysteria2", f"    server: {server}",
         "    port: 8444", *hop, f"    password: {password}",
         '    up: "300 Mbps"', '    down: "300 Mbps"', "    sni: www.example.com",
-        "    skip-cert-verify: true", "    alpn:", "      - h3", "", "",
+        "    skip-cert-verify: true", "    alpn:", "      - h3", "",
         "proxy-groups:", *MERGE.GROUPS_SINGLE_OUTER, "", *MERGE.GROUPS_SINGLE_AUTO,
         "", "", "rules:", "  - GEOIP,LAN,DIRECT", "  - GEOIP,CN,DIRECT",
         "  - MATCH,节点选择", "", ""]
@@ -308,6 +308,36 @@ class TelemetryTests(unittest.TestCase):
 
 
 class ProfileConfigTests(unittest.TestCase):
+    def test_full_server_renderer_template_parses_and_preserves_bytes(self):
+        # Use the actual full printf template, not a fixture rebuilt from parser constants.
+        renderer = (ROOT / "lib/client-management.sh").read_text(encoding="utf-8")
+        template = "mixed-port:" + renderer.split("    printf 'mixed-port:", 1)[1].split("' \"$server_ip\"", 1)[0]
+        for hopping in (False, True):
+            with self.subTest(hopping=hopping), tempfile.TemporaryDirectory() as directory:
+                source, output = Path(directory) / "event-mihomo.yaml", Path(directory) / "quality.yaml"
+                ports = "    port: 8444" + ("\n    ports: 40000-40100\n    hop-interval: 30" if hopping else "")
+                raw = (template % ("203.0.113.1", "8443", "11111111-1111-4111-8111-111111111111",
+                                   "www.example.com", "A" * 43, "0123456789abcdef", "203.0.113.1",
+                                   ports, "synthetic-primary-password", "www.example.com")).encode("utf-8")
+                source.write_bytes(raw)
+                profile = MERGE.parse_export(source, lambda: ValueError("canonical"))
+                self.assertEqual(MERGE.build_output(profile, None), raw)
+                CLI.prepare("event", str(source), None, str(output), configuration())
+                self.assertIn("\n".join(profile.block("hysteria")) + "\n", output.read_text(encoding="utf-8"))
+                self.assertEqual(source.read_bytes(), raw)
+
+    def test_extra_missing_or_injected_proxy_boundary_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "event-mihomo.yaml"
+            export(source)
+            original = source.read_bytes()
+            for boundary in (b"\n", b"\n\n\n", b"\n  hostile: yes\n\n"):
+                with self.subTest(boundary=boundary):
+                    source.write_bytes(original.replace(b"      - h3\n\nproxy-groups:",
+                                                        b"      - h3" + boundary + b"proxy-groups:"))
+                    with self.assertRaises(ValueError):
+                        MERGE.parse_export(source, lambda: ValueError("canonical"))
+
     def test_single_and_dual_profiles_preserve_canonical_and_hopping(self):
         for dual in (False, True):
             with self.subTest(dual=dual), tempfile.TemporaryDirectory() as directory:
