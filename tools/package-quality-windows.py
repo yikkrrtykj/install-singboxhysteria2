@@ -64,7 +64,9 @@ def package(exe, yaml, receiver, output):
     try:
         with os.fdopen(fd, "wb") as stream, zipfile.ZipFile(stream, "w", zipfile.ZIP_DEFLATED) as archive:
             archive.write(exe, EXE_NAME)
-            for n, raw in dict(files, **{"quality-package.json": manifest_raw, "先看这里.txt": readme}).items():
+            notices = Path(__file__).with_name("quality-windows-notices.txt").read_bytes()
+            for n, raw in dict(files, **{"quality-package.json": manifest_raw, "先看这里.txt": readme,
+                                        "第三方许可.txt": notices}).items():
                 archive.writestr(n, raw)
     except BaseException:
         output.unlink(missing_ok=True)

@@ -104,7 +104,7 @@ class RecipientTests(unittest.TestCase):
                 signature.assert_called_once_with(exe)
             with zipfile.ZipFile(output) as archive:
                 self.assertEqual(set(archive.namelist()), {desktop.EXE_NAME, "colleague-mihomo.yaml", "receiver-info.json",
-                                                         "receiver-ca.pem", "quality-package.json", "先看这里.txt"})
+                                                         "receiver-ca.pem", "quality-package.json", "先看这里.txt", "第三方许可.txt"})
                 self.assertEqual(archive.read(desktop.EXE_NAME), exe.read_bytes())
                 self.assertNotIn(str(root), archive.read("quality-package.json").decode())
 
