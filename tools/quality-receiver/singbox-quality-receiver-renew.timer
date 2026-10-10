@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily private receiver certificate renewal check
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+Unit=singbox-quality-receiver-renew.service
+
+[Install]
+WantedBy=timers.target
