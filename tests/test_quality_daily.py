@@ -126,9 +126,11 @@ class BundleTests(unittest.TestCase):
                     path = daily.prepare_bundle(root / "private", a, "event", info, home, b)
                     meta, config = daily.load_bundle(path, home)
                 text = (path.parent / meta["profile"]).read_text("utf-8")
-                self.assertIn("    default-selected: 自动选择", text)
+                self.assertIn("    default-selected: 质量自动选择", text)
+                self.assertNotIn("  - name: 自动选择\n", text)
+                self.assertNotIn("  - name: quality-profile-", text)
                 self.assertIn("    interval: 60", text)
-                self.assertIn(meta["marker"], text)
+                self.assertIn("手动选择 · " + meta["marker"].removeprefix("quality-profile-"), text)
                 self.assertEqual(text.count("    hop-interval: 30"), 2 if dual else 1)
                 self.assertFalse(config["control_enabled"])
                 saved = (path.parent / "client.json").read_text("utf-8")
@@ -137,6 +139,23 @@ class BundleTests(unittest.TestCase):
                 self.assertEqual(meta["nodes"], list(NODES if dual else NODES[:2]))
                 for source, raw in before.items():
                     self.assertEqual(source.read_bytes(), raw)
+
+    def test_compact_identity_and_manual_override(self):
+        marker = "quality-profile-" + "a" * 32
+        nodes = list(NODES[:2])
+        manual = "手动选择 · " + "a" * 32
+        proxies = {manual: {"type": "Selector", "all": [*nodes, GROUP, "DIRECT"], "now": GROUP},
+                   GROUP: {"type": "Fallback", "all": nodes, "fixed": "", "hidden": True, "now": nodes[0]},
+                   nodes[0]: {"type": "Vless"}, nodes[1]: {"type": "Hysteria2"}}
+        normalized = daily.compact_snapshot(proxies, marker, nodes)
+        daily.marker_shape(normalized, marker, nodes)
+        self.assertTrue(daily.DailyOwnership(nodes).permitted(daily.RoutingSnapshot(normalized, "rule")))
+        proxies[manual]["now"] = nodes[1]
+        normalized = daily.compact_snapshot(proxies, marker, nodes)
+        self.assertFalse(daily.DailyOwnership(nodes).permitted(daily.RoutingSnapshot(normalized, "rule")))
+        with self.assertRaises(ValueError):
+            daily.marker_shape(daily.compact_snapshot(proxies, "quality-profile-" + "b" * 32, nodes), "quality-profile-" + "b" * 32, nodes)
+        self.assertNotIn(AUTO, proxies)
 
     def test_unknown_existing_working_directory_never_adopted(self):
         with tempfile.TemporaryDirectory() as directory:
