@@ -51,7 +51,10 @@ Current quality work: [PR-48B](mihomo-protocol-quality-failover-p48b.md).
 - [x] New sticky-policy existing-VPS pilot: seven stages pass in 311.1s,
       including recovered-primary retention, current-HY2 failure, recovered-HY2
       retention and completed cleanup. Daily Clash was not controlled.
-- [ ] Sticky-policy follow-up head CI.
+- [x] Sticky-policy code head2ab51082: all15 CI checks passed.
+- [x] Reopened daily window: matching delivered source, sticky-policy receipt,
+      global control enabled, exact current Reality pin and continuing fresh
+      state records. This verifies normal integration, not an application fault.
 - [x] Rule/global effective selection and direct-mode refusal; eight routing
       regressions plus real-core global/manual/restore coverage.
 - [x] Read-only operator snapshot reproduced GLOBAL=quality with unused rule=HY2;

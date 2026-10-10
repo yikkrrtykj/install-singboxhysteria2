@@ -1,6 +1,8 @@
 # Protocol-quality failover (issue #48, PR-48B)
 
-Status: opt-in pilot implementation. No installer, auto-start, live deployment,
+Status: reviewed opt-in trial implementation. Controlled fault tests and normal
+daily integration passed; broader operator acceptance stays open in #48.
+No installer, auto-start, unattended live deployment,
 Windows-agent change, Monitor-classifier change or firewall change is included.
 The merge parser boundary now matches the server renderer; its generated policy
 remains unchanged. Actual single-VPS Reality/HY2 passed the controlled operator
