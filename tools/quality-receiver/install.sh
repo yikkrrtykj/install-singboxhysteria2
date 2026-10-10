@@ -20,7 +20,7 @@ for name in singbox-quality-receiver.service singbox-quality-receiver-renew.serv
   [[ $(systemctl show "$name" -p LoadState --value) == not-found ]] || fail 'Unit name already in use'
 done
 # Reserve-check the new port before any install. The old foreground pilot uses 8448.
-/usr/bin/python3 -I -c 'import socket; s=socket.socket(); s.bind(("0.0.0.0",8449)); s.close()' || fail 'Port 8449 already in use'
+/usr/bin/python3 -I -c 'import ipaddress,socket,sys; v=ipaddress.ip_address(sys.argv[1]).version; s=socket.socket(socket.AF_INET6 if v==6 else socket.AF_INET); s.bind(("::" if v==6 else "0.0.0.0",8449)); s.close()' "$1" || fail 'Port 8449 already in use'
 files=(quality-receiver-service.py quality_failover/__init__.py quality_failover/persistent.py quality_failover/receiver.py quality_failover/transport.py quality_failover/policy.py)
 for name in "${files[@]}"; do [[ -f $source_root/$name && ! -L $source_root/$name ]] || fail 'Missing source'; done
 install -d -m0755 "$code" "$code/quality_failover"
