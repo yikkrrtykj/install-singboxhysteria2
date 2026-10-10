@@ -106,3 +106,21 @@ control; native hard-failure fallback remains available.
 The normal daily session proves profile identification, explicit enable and
 normal upload confirmation only. Actual switching is verified separately in
 disposable cores; no natural daily/application fault is inferred from uptime.
+
+## Idle traffic and upload status
+
+The 4 Mbps failure threshold compares a bounded active test upload, not the
+application traffic counter. Zero demand is never a quality fault. Passive traffic
+changes can request confirmation, but cannot directly degrade a protocol. Two
+consecutive authenticated bad uploads are needed for a quality fault, and a switch
+requires a freshly upload-confirmed usable alternative. Missing receiver evidence
+is unknown; a failed native connection probe can independently mark a path down.
+
+The window reports recent confirmed test quality, consecutive slow tests, hard
+connection failure or an unconfirmed upload. After the last positive upload ages
+out, it reports connection reachability without claiming current upload quality.
+No scheduled upload on an idle tick is a missing observation, not a failed test.
+A healthy current protocol is retained; standby recovery is not a switch-back timer.
+
+For an explicitly installed receiver that survives VPS reboot and renews its leaf
+certificate, see [persistent receiver](mihomo-quality-receiver-service.md).

@@ -1,0 +1,31 @@
+[Unit]
+Description=Controlled protocol-quality upload receiver
+After=network.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+ExecStart=/usr/bin/python3 -I -B /usr/local/lib/singbox-quality-receiver/quality-receiver-service.py serve
+LoadCredential=receiver.json:/etc/singbox-quality-receiver/receiver.json
+LoadCredential=receiver-ca.pem:/etc/singbox-quality-receiver/receiver-ca.pem
+LoadCredential=server-cert.pem:/etc/singbox-quality-receiver/server-cert.pem
+LoadCredential=server-key.pem:/etc/singbox-quality-receiver/server-key.pem
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+MemoryMax=96M
+TasksMax=32
+CPUQuota=20%
+
+[Install]
+WantedBy=multi-user.target

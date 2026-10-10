@@ -82,3 +82,19 @@ no raw result or credential files are committed. The daily Clash core was not co
 The work is an opt-in trial; do not close #48, deploy unattended or claim real-world
 HA acceptance from mock-path tests. Monitor 0.9.1 and its scanner follow-up
 remain separate. No new Windows administrator/test step is requested here.
+
+
+## Persistent receiver follow-up
+
+- [x] Explicit standalone receiver installer and daily certificate renewal; no
+      Monitor, sing-box, firewall, client startup or system trust mutation.
+- [x] Actual OpenSSL/TLS contracts: stable client pair, expired-leaf recovery,
+      durable failed-restart retry and identity/permission refusal.
+- [x] Idle/expired confirmation display: no idle traffic quality verdict and no
+      indefinitely retained successful-upload text.
+- [x] Existing-bundle migration: every path positively confirms the new receiver
+      before saving; active/foreign refusal, original profile and failed-save rollback.
+- [x] Actual systemd DynamicUser/LoadCredential and restricted renewal unit
+      verification on Ubuntu 22.04; stable client pair across receiver restart.
+- [ ] Existing VPS explicit installation, external port reachability and paired
+      daily-client migration. No activation is implied by source tests.

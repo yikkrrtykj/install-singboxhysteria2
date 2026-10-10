@@ -628,6 +628,44 @@ class RunnerControlTests(unittest.TestCase):
             select.assert_not_called();real.assert_not_called();hy.assert_not_called()
 
 
+
+class IdleDisplayTests(unittest.TestCase):
+    def test_expired_upload_confirmation_is_not_displayed_as_current_good(self):
+        engine=Engine({name:Policy(4,8) for name in NODES[:2]})
+        engine.update(0,{name:(True,GOOD) for name in NODES[:2]})
+        engine.update(91,{name:(True,None) for name in NODES[:2]})
+        self.assertEqual(engine.paths['Reality'].reason,'reachable_only')
+        self.assertEqual(engine.paths['Reality'].state,'UP')
+        self.assertFalse(engine.paths['Reality'].usable(91,engine.policies['Reality']))
+        self.assertIsNone(engine.target(91,'Reality'))
+
+    def test_first_slow_test_is_visible_but_requires_second_before_switch(self):
+        engine=Engine({name:Policy(4,8) for name in NODES[:2]})
+        engine.update(0,{name:(True,GOOD) for name in NODES[:2]})
+        engine.update(30,{'Reality':(True,BAD),'Hysteria2':(True,GOOD)})
+        self.assertEqual(engine.paths['Reality'].reason,'upload_slow_pending')
+        self.assertIsNone(engine.target(30,'Reality'))
+        engine.update(60,{'Reality':(True,BAD),'Hysteria2':(True,GOOD)})
+        self.assertEqual(engine.paths['Reality'].reason,'upload_confirmed_bad')
+        self.assertEqual(engine.target(60,'Reality'),'Hysteria2')
+
+    def test_middle_test_does_not_claim_success_or_fault(self):
+        engine=Engine({name:Policy(4,8) for name in NODES[:2]})
+        engine.update(0,{name:(True,GOOD) for name in NODES[:2]})
+        engine.update(30,{'Reality':(True,Confirmation(6,endpoint_ready=True)),'Hysteria2':(True,GOOD)})
+        self.assertEqual(engine.paths['Reality'].reason,'upload_middle')
+        self.assertEqual(engine.paths['Reality'].state,'UP')
+        self.assertIsNone(engine.target(30,'Reality'))
+
+    def test_inconclusive_upload_is_visible_but_never_a_fault(self):
+        engine=Engine({name:Policy(4,8) for name in NODES[:2]})
+        engine.update(0,{name:(True,GOOD) for name in NODES[:2]})
+        engine.update(30,{'Reality':(True,Confirmation()),'Hysteria2':(True,GOOD)})
+        self.assertEqual(engine.paths['Reality'].reason,'upload_unconfirmed')
+        self.assertEqual(engine.paths['Reality'].state,'UP')
+        self.assertIsNone(engine.target(30,'Reality'))
+
+
 class StickyPolicyTests(unittest.TestCase):
     def test_every_healthy_priority_is_retained_even_with_better_recovered_nodes(self):
         engine = Engine({name: Policy(4,8) for name in NODES})

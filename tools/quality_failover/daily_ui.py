@@ -32,8 +32,9 @@ MESSAGES = {"clash_settings": "未找到可用的 Clash Verge 本机设置；请
             "record_unavailable": "本机状态记录未能保存，已请求停止质量窗口；请保留现状。",
             "operation_unavailable": "操作未完成；请核对 Clash、接收端及本机连接状态。"}
 REASONS = {"no_evidence": "等待探测", "missing_reachability": "探测记录缺失或过期",
-           "reachable_only": "连接可达，未确认上传质量", "upload_confirmed_good": "上传确认正常",
-           "upload_confirmed_bad": "多次确认上传变慢", "recovery_pending": "等待稳定恢复",
+           "reachable_only": "连接可达，未确认上传质量", "upload_confirmed_good": "最近测试上传正常", "upload_unconfirmed": "测试上传未确认，暂不判故障",
+           "upload_confirmed_bad": "连续测试上传偏慢", "upload_slow_pending": "测试上传偏慢，等待复核",
+           "upload_middle": "测试未达恢复值，继续观察", "recovery_pending": "等待稳定恢复",
            "hard_probe_failed": "连接探测失败", "quality_recovered": "稳定恢复"}
 STATES = {"UP": "可达", "DEGRADED": "变慢／恢复中", "DOWN": "不可达", "UNKNOWN": "待确认"}
 
@@ -48,7 +49,7 @@ def show(workspace, home, primary_path=None, receiver_info_path=None):
     frame.pack(fill="both", expand=True)
     ttk.Label(frame, text="生成新配置后，在 Clash 手动导入并启用；原配置保留，可随时切回。\n"
               "窗口先观察，点击启用后只控制新增分组。不会安装服务、设开机自启或改 TUN。\n"
-              "接入试用使用已有的7天临时证书，VPS 接收端需要保持运行。", wraplength=800).pack(anchor="w")
+              "开始观察前确认接收端正在运行；已有准备文件可以直接复用。", wraplength=800).pack(anchor="w")
     primary, backup, info = (tk.StringVar() for _ in range(3))
     primary.set(primary_path or "")
     info.set(receiver_info_path or "")
@@ -62,10 +63,10 @@ def show(workspace, home, primary_path=None, receiver_info_path=None):
     settings = ttk.Frame(frame)
     settings.pack(fill="x", pady=8)
     fail, recover = tk.StringVar(value="4"), tk.StringVar(value="8")
-    for title, value in (("上传慢于（Mbps）", fail), ("恢复至少（Mbps）", recover)):
+    for title, value in (("测试上传慢于（Mbps）", fail), ("测试恢复至少（Mbps）", recover)):
         ttk.Label(settings, text=title).pack(side="left")
         ttk.Entry(settings, textvariable=value, width=6).pack(side="left", padx=(4, 12))
-    ttk.Label(settings, text="当前协议正常就保持，不自动切回；恢复确认只用于下次故障的备选。", wraplength=370).pack(side="left")
+    ttk.Label(settings, text="阈值用于主动测试；空闲不会触发切换。当前协议正常就保持，不自动切回。", wraplength=330).pack(side="left")
     ttk.Label(frame, textvariable=status, wraplength=800).pack(anchor="w", pady=10)
     ttk.Entry(frame, textvariable=profile_path, state="readonly").pack(fill="x")
     ttk.Label(frame, text="在 Clash → 配置中导入以上文件并启用，然后点“开始观察”。规则模式在“节点选择”里选“质量自动选择”；全局模式直接选这个分组。",

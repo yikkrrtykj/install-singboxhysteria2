@@ -91,12 +91,16 @@ class Path:
             # inconclusive probe; don't reset consecutive confirmation counts.
             if self.quality_verified_at is not None and now - self.quality_verified_at > policy.freshness_seconds:
                 self.quality_verified_at = None
+                if self.state == "UP":
+                    self.reason = "reachable_only"
             return
         result = confirmation.verdict(policy)
         if result == "bad":
             self.good = 0
             self.bad = min(policy.fail_samples, self.bad + 1)
             self.quality_verified_at = None
+            if self.state == "UP":
+                self.reason = "upload_slow_pending"
             if self.bad >= policy.fail_samples:
                 self.needs_recovery = True
                 self.state, self.reason = "DEGRADED", "upload_confirmed_bad"
@@ -119,6 +123,10 @@ class Path:
                     or now - self.quality_verified_at > policy.freshness_seconds):
                 self.quality_verified_at = None
                 self.reason = "reachable_only"
+            if self.state == "UP" and result == "unknown":
+                self.reason = "upload_unconfirmed"
+            elif self.state == "UP" and result == "middle":
+                self.reason = "upload_middle"
 
     def usable(self, now, policy):
         return (self.state == "UP" and not self.needs_recovery

@@ -120,7 +120,8 @@ implementations. They prove switching mechanics in the tested environment,
 **not** real provider outages, application incidents, root cause, fleet capacity
 or two independent VPS routes. Quality-only HY2 impairment/loss/churn and real
 hopping under Internet loss remain separate operator acceptance items. #48 stays
-open and the PR stays draft until the agreed real-environment acceptance is done.
+open for the agreed real-environment acceptance. The opt-in implementation was
+merged in PR #76; that merge does not establish real application/HA acceptance.
 
 `tests/test_quality_pilot.py` covers isolated configuration, private preparation,
 byte-preserving TCP/UDP relays, hopping mappings, cancellation, no-clobber output,

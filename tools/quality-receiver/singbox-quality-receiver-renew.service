@@ -1,0 +1,15 @@
+[Unit]
+Description=Renew the private protocol-quality receiver certificate
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I -B /usr/local/lib/singbox-quality-receiver/quality-receiver-service.py renew --restart
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/etc/singbox-quality-receiver
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=
