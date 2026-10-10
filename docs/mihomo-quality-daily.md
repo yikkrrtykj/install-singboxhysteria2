@@ -124,3 +124,14 @@ A healthy current protocol is retained; standby recovery is not a switch-back ti
 
 For an explicitly installed receiver that survives VPS reboot and renews its leaf
 certificate, see [persistent receiver](mihomo-quality-receiver-service.md).
+
+## Explicit window handoff
+
+A new window does not silently assume ownership of a pre-existing dedicated
+quality-group pin. Start first asks to retain that protocol and continue observing.
+Acknowledgement is tied to the named member: the fresh identified snapshot must
+still have both that fixed member and that effective member. A changed or unknown
+member is refused without writes. Acceptance changes only in-memory ownership;
+quality control remains disabled until fresh uploads and explicit Enable. Closing
+an observe-only window leaves the acknowledged pin unchanged. Existing foreign
+profile, concurrent-window and manual outer/global selection guards still apply.

@@ -415,5 +415,53 @@ class RoutingTests(unittest.TestCase):
             self.assertEqual(json.loads((Path(directory) / "state.json").read_bytes())["last"]["routing_mode"], "global")
 
 
+
+class HandoffTests(unittest.TestCase):
+    def exercise(self, fixed, acknowledged=None, now=None):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            bundle,home,*_=BundleTests().build(root)
+            meta=json.loads(bundle.read_bytes())
+            values=topology()
+            values[meta['marker']]=values.pop(MARKER)
+            values[GROUP]['fixed']=fixed
+            values[GROUP]['now']=fixed if now is None and fixed else (now or 'Reality')
+            calls=[]
+            handler=api(values)
+            def request(method,path,payload=None):
+                calls.append(method)
+                return handler(method,path,payload)
+            session=daily.Session(bundle,home)
+            try:
+                with patch('quality_failover.transport.ssl.create_default_context'), patch.object(daily.IdentifiedController,'request',side_effect=request):
+                    try:session.start(acknowledged_pin=acknowledged)
+                    except ValueError as error:
+                        self.assertTrue(all(method=='GET' for method in calls))
+                        other=daily.WorkerLock(session.lock.path);other.acquire();other.close()
+                        return daily.error_code(error), None
+                    self.assertFalse(session.runner.config['control_enabled'])
+                    session.runner.close() # observe-only exit cannot clear an acknowledged pin
+                    self.assertTrue(all(method=='GET' for method in calls))
+                    return 'started',session.runner.owner.expected
+            finally:session.lock.close()
+
+    def test_pin_requires_explicit_acknowledgement(self):
+        self.assertEqual(self.exercise('Reality')[0],'selection_handoff_required')
+
+    def test_matching_ack_preserves_current_and_observe_only(self):
+        self.assertEqual(self.exercise('Hysteria2','Hysteria2'),('started','Hysteria2'))
+
+    def test_changed_pin_after_ack_is_refused_without_write(self):
+        self.assertEqual(self.exercise('Reality','Hysteria2')[0],'selection_handoff_changed')
+
+    def test_changed_effective_member_after_ack_is_refused(self):
+        self.assertEqual(self.exercise('Reality','Reality',now='Hysteria2')[0],'selection_handoff_changed')
+
+    def test_unpinned_start_remains_observe_first(self):
+        self.assertEqual(self.exercise(''),('started',AUTO))
+
+    def test_unknown_pin_cannot_be_adopted(self):
+        self.assertEqual(self.exercise('DIRECT','DIRECT')[0],'profile_shape')
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

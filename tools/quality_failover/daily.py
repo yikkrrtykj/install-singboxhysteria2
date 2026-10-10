@@ -25,7 +25,8 @@ REASONS = {"clash_settings", "clash_controller", "live_profile_not_loaded", "pro
            "probe_ports", "canonical_profile", "canonical_name", "receiver_info",
            "certificate_file", "certificate_digest", "already_running", "control_not_ready",
            "manual_choice", "restore_unconfirmed", "record_unavailable",
-           "routing_mode_unavailable", "routing_mode_changed"}
+           "routing_mode_unavailable", "routing_mode_changed",
+           "selection_handoff_required", "selection_handoff_changed"}
 
 
 def error_code(exception):
@@ -348,7 +349,7 @@ class Session:
         self.session_id, self.started_epoch = secrets.token_hex(16), round(time.time(), 3)
         self.lock = WorkerLock(self.bundle_path.parent / "worker.lock")
 
-    def start(self):
+    def start(self, acknowledged_pin=None):
         self.lock.acquire()
         try:
             meta, config = load_bundle(self.bundle_path, self.home)
@@ -357,7 +358,20 @@ class Session:
                                                           meta["marker"], meta["nodes"])
             self.runner.owner = DailyOwnership(self.runner.engine.paths)
             owner = self.runner.owner
-            owner.permitted(self.runner.controller.proxies(), require_outer=False)
+            proxies = self.runner.controller.proxies()
+            fixed = proxies[GROUP].get("fixed")
+            if type(fixed) is not str or (fixed and fixed not in meta["nodes"]):
+                raise ValueError("profile_shape")
+            if acknowledged_pin is not None:
+                if (acknowledged_pin not in meta["nodes"] or fixed != acknowledged_pin
+                        or proxies[GROUP].get("now") != acknowledged_pin):
+                    raise ValueError("selection_handoff_changed")
+                # Explicit acknowledgement transfers only the matching dedicated
+                # pin into memory. No controller write or implicit enable occurs.
+                owner.committed(acknowledged_pin)
+            elif fixed:
+                raise ValueError("selection_handoff_required", fixed)
+            owner.permitted(proxies, require_outer=False)
             if owner.suspended:
                 raise ValueError("profile_shape")
         except Exception:

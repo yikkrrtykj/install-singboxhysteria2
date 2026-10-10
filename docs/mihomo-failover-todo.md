@@ -98,3 +98,12 @@ remain separate. No new Windows administrator/test step is requested here.
       verification on Ubuntu 22.04; stable client pair across receiver restart.
 - [ ] Existing VPS explicit installation, external port reachability and paired
       daily-client migration. No activation is implied by source tests.
+
+
+## Window handoff repair
+
+- [x] Explicit protocol-specific acknowledgement of an existing dedicated pin;
+      fresh fixed/effective member checks, no implicit controller write or enable.
+- [x] 40 daily contracts: first-start acknowledgement, changed selection refusal,
+      observe-only preservation and unchanged ordinary unpinned startup.
+- [ ] Natural application-fault acceptance remains separate from this UX repair.
