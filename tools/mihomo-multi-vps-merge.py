@@ -174,6 +174,7 @@ RULES_LINES = (
 )
 
 TRAILING_BLANKS = ["", ""]             # the template's final blank line
+PROXY_GROUP_BLANKS = [""]              # one blank after the Hysteria2 block
 
 
 class MergeError(Exception):
@@ -411,7 +412,7 @@ def parse_proxies(profile, fail):
 
     index = run_spec(lines, index, HISTERIA2_TAIL, hy_fields, fail)
     hysteria_len = index - hysteria_at
-    if lines[index:index + 2] != TRAILING_BLANKS or index + 2 != end:
+    if lines[index:end] != PROXY_GROUP_BLANKS:
         raise fail()
 
     profile.reality = fields
