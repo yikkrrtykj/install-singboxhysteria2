@@ -33,7 +33,8 @@ MESSAGES = {"clash_settings": "未找到可用的 Clash Verge 本机设置；请
             "operation_unavailable": "操作未完成；请核对 Clash、接收端及本机连接状态。"}
 REASONS = {"no_evidence": "等待探测", "missing_reachability": "探测记录缺失或过期",
            "reachable_only": "连接可达，未确认上传质量", "upload_confirmed_good": "最近测试上传正常", "upload_unconfirmed": "测试上传未确认，暂不判故障",
-           "upload_confirmed_bad": "连续测试上传偏慢", "recovery_pending": "等待稳定恢复",
+           "upload_confirmed_bad": "连续测试上传偏慢", "upload_slow_pending": "测试上传偏慢，等待复核",
+           "upload_middle": "测试未达恢复值，继续观察", "recovery_pending": "等待稳定恢复",
            "hard_probe_failed": "连接探测失败", "quality_recovered": "稳定恢复"}
 STATES = {"UP": "可达", "DEGRADED": "变慢／恢复中", "DOWN": "不可达", "UNKNOWN": "待确认"}
 

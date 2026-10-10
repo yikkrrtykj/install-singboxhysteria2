@@ -99,6 +99,8 @@ class Path:
             self.good = 0
             self.bad = min(policy.fail_samples, self.bad + 1)
             self.quality_verified_at = None
+            if self.state == "UP":
+                self.reason = "upload_slow_pending"
             if self.bad >= policy.fail_samples:
                 self.needs_recovery = True
                 self.state, self.reason = "DEGRADED", "upload_confirmed_bad"
@@ -123,6 +125,8 @@ class Path:
                 self.reason = "reachable_only"
             if self.state == "UP" and result == "unknown":
                 self.reason = "upload_unconfirmed"
+            elif self.state == "UP" and result == "middle":
+                self.reason = "upload_middle"
 
     def usable(self, now, policy):
         return (self.state == "UP" and not self.needs_recovery
