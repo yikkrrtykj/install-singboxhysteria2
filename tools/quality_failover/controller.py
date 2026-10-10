@@ -89,10 +89,14 @@ class Controller:
                                 ("Reality", "Hysteria2", "Backup-Reality", "Backup-Hysteria2")))
         return matched == [True]
 
-    def select(self, name, ownership):
+    def select(self, name, ownership, *, retain_current=False):
         # Re-read immediately before mutation. Never touch outer or legacy
         # automatic groups and never DELETE live connections.
-        if name not in ownership.members or not ownership.permitted(self.proxies()):
+        proxies = self.proxies()
+        if name not in ownership.members or not ownership.permitted(proxies):
+            return False
+        if retain_current and (name == AUTO or proxies[GROUP].get("now") != name
+                or type(proxies.get(name)) is not dict or proxies[name].get("alive") is not True):
             return False
         if name == AUTO:
             self.request("DELETE", "/proxies/" + quote(GROUP, safe=""))

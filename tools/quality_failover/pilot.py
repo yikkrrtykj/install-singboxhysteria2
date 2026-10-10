@@ -173,7 +173,8 @@ def ordinary_route(controller, source, host, port, node):
 def connections_check(runner, mixed_port):
     """Hold one bounded upload across a selection; don't close/migrate old flows."""
     controller, probe = runner.controller, runner.probes["Reality"]
-    if not controller.select(AUTO, runner.owner):
+    prior = runner.owner.expected
+    if not controller.select("Reality", runner.owner):
         raise ValueError("session_selection")
     sock = socks_connect(mixed_port, probe.host, probe.port, time.monotonic() + 3)
     tls = None
@@ -202,7 +203,7 @@ def connections_check(runner, mixed_port):
                 or receipt.get("nonce") != nonce or receipt.get("bytes") != len(body)
                 or receipt.get("sha256") != hashlib.sha256(body).hexdigest()):
             raise ValueError("session_receipt")
-        if not controller.select(AUTO, runner.owner):
+        if not controller.select(prior, runner.owner):
             raise ValueError("session_restore")
     finally:
         (tls or sock).close()
@@ -216,6 +217,10 @@ class Suite:
         self.records = []
         self.started = time.monotonic()
         self.stage = "baseline"
+        self.outer_group = OUTER
+
+    def choose_outer(self, node):
+        self.runner.controller.request("PUT", "/proxies/" + quote(self.outer_group, safe=""), {"name": node})
 
     def record(self, stage, passed, states=None):
         value = {"stage": stage, "passed": passed, "elapsed_seconds": round(time.monotonic() - self.started, 1)}
@@ -266,7 +271,7 @@ class Suite:
         verified = all(path.usable(time.monotonic(), self.runner.engine.policies[name])
                        for name, path in self.runner.engine.paths.items())
         self.record("baseline", verified, result["paths"])
-        controller.request("PUT", "/proxies/" + quote(OUTER, safe=""), {"name": GROUP})
+        self.choose_outer(GROUP)
         self.pause(30)
         self.wires[0].fault(rate=1)
         self.rounds("reality_degraded", 2, lambda r:
@@ -278,8 +283,8 @@ class Suite:
         self.pause(30)
         self.rounds("recovery", 3, lambda r:
                     r["paths"]["Reality"]["state"] == "UP"
-                    and controller.proxies()[GROUP].get("now") == "Reality"
-                    and controller.proxies()[GROUP].get("fixed") == "")
+                    and controller.proxies()[GROUP].get("now") == "Hysteria2"
+                    and controller.proxies()[GROUP].get("fixed") == "Hysteria2")
         self.stage = "existing_and_new_connections"
         self.record(self.stage, connections_check(self.runner, self.mixed_port) is None)
         self.pause(30)
@@ -296,12 +301,14 @@ class Suite:
         self.stage = "hy2_recovery"
         self.await_native("Hysteria2", True)
         self.pause(30)
-        self.rounds("hy2_recovery", 3, lambda r: r["paths"]["Hysteria2"]["state"] == "UP")
+        self.rounds("hy2_recovery", 3, lambda r: r["paths"]["Hysteria2"]["state"] == "UP"
+                    and controller.proxies()[GROUP].get("now") == "Reality"
+                    and controller.proxies()[GROUP].get("fixed") == "Reality")
         self.stage = "manual_override"
-        controller.request("PUT", "/proxies/" + quote(OUTER, safe=""), {"name": "Reality"})
+        self.choose_outer("Reality")
         result = self.cycle()
         self.record("manual_override", result["action"] == "manual_override"
-                    and controller.proxies()[OUTER].get("now") == "Reality")
+                    and controller.proxies()[self.outer_group].get("now") == "Reality")
         return self.records
 
 
@@ -327,6 +334,7 @@ def run_pilot(profile_path, name, info_path, ca_path, binary_path, binary_digest
         raise ValueError("result_exists_or_parent_missing")
     wires, process, runner, suite = [], None, None, None
     result = {"v": 1, "mode": "isolated_real_protocol_simulated_wire_faults",
+              "selection_policy": "retain_healthy_current",
               "passed": False, "cancelled": False, "cleanup_complete": False,
               "real_provider_outage_proven": False, "records": []}
     root = Path(tempfile.mkdtemp(prefix="p48-isolated-")).resolve()

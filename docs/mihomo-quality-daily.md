@@ -88,3 +88,21 @@ offline preparation, so this is not TLS/throughput acceptance. It checks real
 profile marker/type shape, refusal of a foreign marker, dedicated selection and
 restoration. The seven-stage operator pilot separately exercised real TLS and
 both actual protocols through the existing VPS.
+
+## Retain the current healthy protocol
+
+The running enabled worker holds the current protocol while it remains healthy.
+It switches only after that current protocol is confirmed degraded or down, to
+a freshly verified alternative. Recovery of a former protocol does not switch
+back. The two-minute hold confirms standby recovery for a later failure, not
+a scheduled return. Native fallback selections are latched in the dedicated
+group to prevent priority-based failback while the worker runs.
+
+Explicit stop still clears only the worker's exact owned pin and returns the
+group to native fallback policy. Manual outer/global selections remain prior
+to automatic control. A stopped/crashed worker cannot promise sticky quality
+control; native hard-failure fallback remains available.
+
+The normal daily session proves profile identification, explicit enable and
+normal upload confirmation only. Actual switching is verified separately in
+disposable cores; no natural daily/application fault is inferred from uptime.

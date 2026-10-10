@@ -35,10 +35,23 @@ Current quality work: [PR-48B](mihomo-protocol-quality-failover-p48b.md).
 - [x] Latest-state receipt is atomic/bounded; controller credentials remain in memory.
 - [x] Pilot evidence follow-up head 8452b76: all 15 GitHub checks passed.
 - [x] Daily-entry head18b8072a: all15 GitHub checks passed.
-- [ ] Latest routing-correction head CI.
-- [ ] Windows early-rejection receiver response review: follow-up broad suite
-      observed WinError10053 in auth/nonce and budget refusal; receiver source
-      is unchanged. No failure is treated as a passing regression.
+- [x] Routing-correction head0ce8fb70: all15 CI checks passed.
+- [x] Windows early-rejection test framing: exact403/400/429 checks send
+      headers with declared body length before reading the immediate rejection;
+      previously sending an unread body could reset the socket on Windows.
+      Receiver source and fail-closed production behavior are unchanged.
+- [x] Retain healthy current at every priority; recovery does not cause failback.
+      Two-minute recovery hold only makes a standby eligible for a later failure.
+- [x] 63 quality contracts (61 pass, 2 POSIX skips), including sticky decision,
+      recovered-primary/current-failure and fresh native-member retention guards.
+- [x] Genuine Reality/HY2 daily-global adapter lab: controlled quality switch,
+      recovered primary stays standby, current HY2 fails and switches to Reality,
+      recovered HY2 stays standby, manual precedence and cleanup all pass.
+      Local lab policy clock accelerated; no live Clash mutation.
+- [x] New sticky-policy existing-VPS pilot: seven stages pass in 311.1s,
+      including recovered-primary retention, current-HY2 failure, recovered-HY2
+      retention and completed cleanup. Daily Clash was not controlled.
+- [ ] Sticky-policy follow-up head CI.
 - [x] Rule/global effective selection and direct-mode refusal; eight routing
       regressions plus real-core global/manual/restore coverage.
 - [x] Read-only operator snapshot reproduced GLOBAL=quality with unused rule=HY2;
@@ -52,7 +65,9 @@ no raw result or credential files are committed. The daily Clash core was not co
 
 - [x] Single-VPS genuine Reality/HY2 controlled degradation, hard failure, recovery,
       connection continuity and manual-choice pilot.
-- [ ] Daily Clash opt-in integration and live-application acceptance.
+- [x] Daily Clash normal integration: loaded-profile identification, global opt-in,
+      positive uploads and enabled continuing records. This does not prove a fault.
+- [ ] Daily Clash actual-fault/application acceptance of the new sticky policy.
 
 - [ ] Actual Reality/HY2 and both opposite network cases.
 - [ ] Site thresholds / payload / probe rate and receiver resource capacity.

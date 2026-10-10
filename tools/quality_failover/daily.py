@@ -379,7 +379,7 @@ class Session:
             record = dict(record, routing_mode=mode)
         self.enabled_once |= self.runner.config["control_enabled"]
         self.manual_seen |= record.get("action") == "manual_override"
-        allowed = ("v", "action", "mode", "observed_epoch", "paths", "suggested", "owned_selection", "restore_confirmed", "routing_mode")
+        allowed = ("v", "action", "mode", "observed_epoch", "paths", "suggested", "owned_selection", "restore_confirmed", "routing_mode", "selection_policy")
         closed = {key: record[key] for key in allowed if key in record}
         state = {"v": 1, "mode": "daily_clash_session", "cycles": self.cycles,
                  "session_id": self.session_id, "started_epoch": self.started_epoch, "written_epoch": round(time.time(), 3),

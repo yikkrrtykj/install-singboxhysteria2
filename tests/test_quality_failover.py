@@ -119,14 +119,14 @@ class PolicyTests(unittest.TestCase):
                      "Backup-Reality": (True, None), "Backup-Hysteria2": (True, GOOD)})
         self.assertEqual(e.target(0, "Reality"), "Backup-Hysteria2")
 
-    def test_primary_recovery_preference(self):
+    def test_primary_recovery_does_not_displace_healthy_backup(self):
         e = self.engine(True)
         for at in (0, 30):
             e.update(at, {name: (True, BAD if name in NODES[:2] else GOOD) for name in NODES})
         self.assertEqual(e.target(30, "Reality"), "Backup-Reality")
         for at in (60, 90, 120):
             e.update(at, {name: (True, GOOD) for name in NODES})
-        self.assertEqual(e.target(120, "Backup-Reality"), "Reality")
+        self.assertIsNone(e.target(120, "Backup-Reality"))
 
     def test_hold_down_and_multiple_recovery_checks(self):
         e = self.engine()
@@ -412,10 +412,11 @@ class ReceiverTests(unittest.TestCase):
     def tearDown(self):
         self.server.shutdown(); self.server.server_close(); self.worker.join()
 
-    def request(self, method, path, payload=b"", token=None, nonce=None):
+    def request(self, method, path, payload=b"", token=None, nonce=None, headers_only=False):
         conn=http.client.HTTPConnection("127.0.0.1",self.server.server_port,timeout=2)
-        conn.request(method,path,payload,{"Authorization":"Bearer "+(token or "a"*32),
-            "X-Probe-Nonce":nonce or "b"*32})
+        headers = {"Authorization":"Bearer "+(token or "a"*32),
+                   "X-Probe-Nonce":nonce or "b"*32, "Content-Length":str(len(payload))}
+        conn.request(method,path,None if headers_only else payload,headers)
         response=conn.getresponse(); code, body=response.status,response.read(); conn.close()
         return code,body
 
@@ -436,13 +437,13 @@ class ReceiverTests(unittest.TestCase):
         self.assertEqual(self.request("GET","/arbitrary")[0],403)
 
     def test_bad_auth_and_nonce_refused(self):
-        self.assertEqual(self.request("POST","/quality-v1/upload",b"x",token="c"*32)[0],403)
-        self.assertEqual(self.request("POST","/quality-v1/upload",b"x",nonce="invalid")[0],400)
+        self.assertEqual(self.request("POST","/quality-v1/upload",b"x",token="c"*32,headers_only=True)[0],403)
+        self.assertEqual(self.request("POST","/quality-v1/upload",b"x",nonce="invalid",headers_only=True)[0],400)
 
     def test_over_budget_does_not_receive_body(self):
         self.assertEqual(self.request("POST","/quality-v1/upload",b"x"*32768)[0],200)
         self.assertEqual(self.request("POST","/quality-v1/upload",b"x"*32768)[0],200)
-        self.assertEqual(self.request("POST","/quality-v1/upload",b"x")[0],429)
+        self.assertEqual(self.request("POST","/quality-v1/upload",b"x",headers_only=True)[0],429)
 
     def test_duplicate_and_chunked_headers_refused(self):
         for extra in ("Authorization: Bearer "+"a"*32+"\r\n", "Transfer-Encoding: chunked\r\n",
@@ -596,13 +597,23 @@ class RunnerControlTests(unittest.TestCase):
             for at in (60,90,120):
                 with patch("quality_failover.runtime.time.monotonic",return_value=at):
                     runner.cycle(confirm=True)
-            self.assertEqual(value[GROUP]["fixed"],"")
-            self.assertEqual(mutations[-1][0],"DELETE")
+            self.assertEqual(value[GROUP]["fixed"],"Hysteria2")
+            self.assertEqual(mutations[-1][0],"PUT")
+            self.assertFalse(any(method == "DELETE" for method, _, _ in mutations))
+            # The current alternative must fail before recovery of the primary
+            # can cause another protocol change.
+            with patch.object(runner.probes["Hysteria2"], "measure", return_value=BAD):
+                for at in (150,180):
+                    with patch("quality_failover.runtime.time.monotonic",return_value=at):
+                        runner.cycle(confirm=True)
+            self.assertEqual(value[GROUP]["fixed"], "Reality")
             self.assertEqual(value[AUTO]["fixed"],"")
             self.assertEqual(value[OUTER]["now"],GROUP)
             self.assertTrue(all(path.endswith("%E8%B4%A8%E9%87%8F%E8%87%AA%E5%8A%A8%E9%80%89%E6%8B%A9")
                                 for _,path,_ in mutations))
             runner.close()
+            self.assertEqual(value[GROUP]["fixed"], "")
+            self.assertEqual(mutations[-1][0], "DELETE")
 
     def test_idle_manual_override_neither_probes_nor_writes(self):
         cfg=configuration();cfg["control_enabled"]=True
@@ -615,6 +626,55 @@ class RunnerControlTests(unittest.TestCase):
             result=runner.cycle()
             self.assertEqual(result["action"],"manual_override")
             select.assert_not_called();real.assert_not_called();hy.assert_not_called()
+
+
+class StickyPolicyTests(unittest.TestCase):
+    def test_every_healthy_priority_is_retained_even_with_better_recovered_nodes(self):
+        engine = Engine({name: Policy(4,8) for name in NODES})
+        engine.update(0, {name:(True,GOOD) for name in NODES})
+        for current in NODES:
+            self.assertIsNone(engine.target(0,current))
+
+    def test_unknown_current_does_not_authorize_switch(self):
+        engine = Engine({name: Policy(4,8) for name in NODES[:2]})
+        engine.update(0, {"Reality":(True,GOOD),"Hysteria2":(None,None)})
+        self.assertIsNone(engine.target(0,"Hysteria2"))
+
+    def test_recovered_primary_only_selected_after_current_alternative_fails(self):
+        engine = Engine({name: Policy(4,8,hold_seconds=120) for name in NODES[:2]})
+        for at in (0,30): engine.update(at, {"Reality":(True,BAD),"Hysteria2":(True,GOOD)})
+        self.assertEqual(engine.target(30,"Reality"), "Hysteria2")
+        for at in (60,90,150): engine.update(at, {"Reality":(True,GOOD),"Hysteria2":(True,GOOD)})
+        self.assertEqual(engine.paths["Reality"].state, "UP")
+        self.assertIsNone(engine.target(150,"Hysteria2"))
+        for at in (180,210): engine.update(at, {"Reality":(True,GOOD),"Hysteria2":(True,BAD)})
+        self.assertEqual(engine.target(210,"Hysteria2"), "Reality")
+
+    def test_retaining_native_choice_refuses_changed_member_before_write(self):
+        owner = Ownership(NODES[:2]); controller = Controller("http://127.0.0.1:19091", "test-only-secret")
+        values = snapshot(); values[GROUP]["now"] = "Hysteria2"
+        with patch.object(controller,"proxies",return_value=values), patch.object(controller,"request") as request:
+            self.assertFalse(controller.select("Reality",owner,retain_current=True))
+            request.assert_not_called()
+
+    def test_native_hard_failover_current_is_latched_before_old_node_recovers(self):
+        cfg=configuration(); cfg["control_enabled"]=True
+        runner=Runner(cfg); runner.owner.committed("Reality")
+        values=snapshot(); values[GROUP]["now"]="Hysteria2"
+        values["Reality"]["alive"]=False
+        mutations=[]
+        def api(method,path,payload=None):
+            if method == "GET": return {"connections":[]}
+            mutations.append(payload["name"])
+            values[GROUP]["fixed"]=payload["name"]; values[GROUP]["now"]=payload["name"]
+            return {}
+        with patch.object(runner.controller,"proxies",return_value=values), patch.object(runner.controller,"request",side_effect=api):
+            result=runner.cycle()
+            self.assertEqual(result["action"],"retained_current")
+            self.assertEqual(values[GROUP]["fixed"],"Hysteria2")
+            values["Reality"]["alive"]=True
+            runner.cycle()
+            self.assertEqual(mutations,["Hysteria2"])
 
 if __name__=="__main__":
     unittest.main()

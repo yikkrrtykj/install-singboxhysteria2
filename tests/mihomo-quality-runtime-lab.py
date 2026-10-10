@@ -238,7 +238,7 @@ def main():
             for at in (60,90,120):
                 sample=measure("Reality")
                 engine.update(at,{"Reality":(True,sample),"Hysteria2":(True,None)})
-            check("three upload passes recover preferred path after hold",engine.target(120,"Hysteria2")=="Reality")
+            check("recovery makes primary available without displacing healthy HY2",engine.paths["Reality"].state=="UP" and engine.target(120,"Hysteria2") is None)
             controller.request("PUT","/proxies/%E8%8A%82%E7%82%B9%E9%80%89%E6%8B%A9",{"name":GROUP})
             check("recovered path selected in dedicated group",controller.select("Reality",owner))
             from quality_failover.transport import socks_connect

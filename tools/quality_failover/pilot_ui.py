@@ -7,10 +7,10 @@ from .pilot import run_pilot, error_code
 
 LABELS = {"baseline": "检查两个协议的正常上传",
           "reality_degraded": "模拟测试连接变慢，检查切换",
-          "recovery": "撤销限速，检查稳定恢复",
+          "recovery": "恢复原协议，检查不自动切回",
           "existing_and_new_connections": "检查已有连接与新连接",
           "hy2_hard_failure": "模拟测试 UDP 中断，检查备用协议",
-          "hy2_recovery": "恢复测试 UDP，检查协议恢复",
+          "hy2_recovery": "恢复测试 UDP，检查保持当前协议",
           "manual_override": "检查手动选择优先"}
 
 ERROR_LABELS = {"binary_digest": "测试程序版本与校验记录不一致",

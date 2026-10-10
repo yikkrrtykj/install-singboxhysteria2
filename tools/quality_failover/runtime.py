@@ -35,6 +35,11 @@ class Runner:
 
     def cycle(self, confirm=False):
         proxies = self.controller.proxies()
+        if self.config["control_enabled"]:
+            # Recognize a native hard-failure release before deriving the
+            # current path. Otherwise a recovered preferred path could displace
+            # the already-healthy native alternative from a stale owned pin.
+            self.owner.permitted(proxies)
         suspect = self.passive.suspicion(self.controller.request("GET", "/connections"), time.monotonic())
         observed = {}
         effective = self.owner.effective(proxies)
@@ -71,10 +76,15 @@ class Runner:
             if not self.owner.permitted(proxies):
                 action = "control_suspended" if self.owner.suspended else "manual_override"
             elif desired is not None:
-                # select() does a fresh ownership/manual-override check.
-                selected = AUTO if desired == next(iter(self.engine.paths)) else desired
-                action = "selected" if self.controller.select(selected, self.owner) else "control_suspended"
-        return {"v": 1, "observed_epoch": round(time.time(), 3), "mode": "control" if self.config["control_enabled"] else "observe",
+                # Fix the actual chosen path, including the primary. A recovered
+                # higher-priority node must not steal a healthy current choice.
+                action = "selected" if self.controller.select(desired, self.owner) else "control_suspended"
+            elif current in self.engine.paths and self.engine.paths[current].state == "UP" and self.owner.expected == AUTO:
+                # Native fallback alone reverts by priority. Latch its existing
+                # reachable choice without routing to a different protocol.
+                # A fresh guard verifies it is still the effective live member.
+                action = "retained_current" if self.controller.select(current, self.owner, retain_current=True) else "control_suspended"
+        return {"v": 1, "selection_policy": "retain_healthy_current", "observed_epoch": round(time.time(), 3), "mode": "control" if self.config["control_enabled"] else "observe",
                 "paths": self.engine.summary(), "action": action,
                 "suggested": desired, "owned_selection": self.owner.expected}
 

@@ -29,8 +29,13 @@ the configured hold-down **and** consecutive passing confirmations. Missing or
 middle-band active results break the consecutive series; a cadence tick with no
 scheduled test does not.
 
-Priority is the existing order: Reality, Hysteria2, Backup-Reality,
-Backup-Hysteria2. Each path has its own thresholds and recovery state. No
+Retain the healthy current protocol, regardless of priority. Only confirmed
+DEGRADED or DOWN on that current path authorizes a change. When it fails,
+choose a freshly upload-confirmed candidate in the existing order: Reality,
+Hysteria2, Backup-Reality, Backup-Hysteria2. Recovery of a former path does
+not trigger failback. The two-minute hold and consecutive recovery tests make
+it eligible for a later current-path failure; they are not a return timer.
+Each path has its own thresholds and recovery state. No
 permanent "HY2 is safe" assumption and no coarse VPS boolean is introduced.
 
 The prepared opt-in profile adds a hidden `质量自动选择` **fallback** group
@@ -41,9 +46,12 @@ The old default remains `自动选择`: the operator explicitly selects
 `质量自动选择` to use the new feature. No existing manual pin is auto-released.
 Hopping fields stay exactly as exported.
 
-Only the new hidden group is writable. Quality switching temporarily fixes that
-group to a verified alternative; recovery to the preferred path clears only
-that group's fixed selection. Native fallback continues handling a fixed
+Only the new hidden group is writable. While control is enabled, latch its
+existing reachable member after a fresh ownership/effective-member check, so
+native priority recovery cannot steal a healthy current choice. This retention
+does not route to a different unconfirmed node. Quality switching fixes the
+actual verified alternative, including Reality; recovery leaves that choice
+intact. Native fallback continues handling a fixed
 member's **hard** failure even if the worker is absent. Normal worker exit
 clears its own fixed selection, preserving the outer choice and both original
 groups. Established connections are never closed or migrated.

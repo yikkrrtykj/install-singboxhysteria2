@@ -151,8 +151,10 @@ class Engine:
         if current not in self.paths:
             return None
         path = self.paths[current]
-        # No switching solely because a passive counter is small or missing.
-        if path.state not in ("DEGRADED", "DOWN") and current == next(iter(self.paths)):
+        # Retain a healthy current path at every priority. Recovery of another
+        # path only makes it eligible for a future failure, never a failback.
+        # UNKNOWN is not a failure and cannot authorize a preference switch.
+        if path.state not in ("DEGRADED", "DOWN"):
             return None
         candidates = [name for name, item in self.paths.items()
                       if item.usable(now, self.policies[name])]
@@ -160,10 +162,6 @@ class Engine:
             return None
         best = candidates[0]
         if best == current:
-            return None
-        # Don't move a still-usable preferred member to a lower preference.
-        order = list(self.paths)
-        if order.index(best) > order.index(current) and path.state not in ("DEGRADED", "DOWN"):
             return None
         return best
 

@@ -6,6 +6,7 @@ only policy pauses in this lab, never in the operator pilot.
 """
 import argparse
 import base64
+from contextlib import ExitStack
 import hashlib
 import http.server
 import importlib.util
@@ -23,6 +24,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 from quality_failover import pilot
 from quality_failover.receiver import Server
+from quality_failover.daily import IdentifiedController, DailyOwnership
+from quality_failover.policy import NODES
 import ssl
 
 
@@ -51,6 +54,7 @@ def main():
     parser.add_argument("--expect-sha256", required=True)
     parser.add_argument("--openssl", required=True)
     parser.add_argument("--quick", action="store_true")
+    parser.add_argument("--daily-mode", choices=("rule", "global"))
     args = parser.parse_args()
     binary = pilot.pinned_binary(args.mihomo, args.expect_sha256)
     fixture = load(ROOT / "tests/test_quality_failover.py")
@@ -118,13 +122,32 @@ def main():
             text = text.replace("      public-key: " + "A" * 43, "      public-key: " + public_key)
             source.write_bytes(text.encode())
             original_builder, original_clock = pilot.isolated_profile, time.monotonic
+            original_runner = pilot.Runner
+            marker = "quality-profile-" + "a" * 32
             offset = [0]
 
             def local_profile(*values):
                 text = original_builder(*values)
-                return text.replace("https://www.gstatic.com/generate_204", "http://127.0.0.1:%d/hc" % origin.server_port)
+                text = text.replace("https://www.gstatic.com/generate_204", "http://127.0.0.1:%d/hc" % origin.server_port)
+                if args.daily_mode:
+                    tag = "  - name: " + marker + "\n    type: select\n    hidden: true\n    proxies:\n      - DIRECT\n\n"
+                    text = text.replace("rules:\n", tag + "rules:\n", 1)
+                    if args.daily_mode == "global":
+                        text = text.replace("mode: rule", "mode: global", 1)
+                return text
+
+            class DailyLabRunner(original_runner):
+                def __init__(self, cfg):
+                    super().__init__(cfg)
+                    self.controller = IdentifiedController(cfg["controller"], cfg["controller_secret"], marker, NODES[:2])
+                    self.owner = DailyOwnership(self.engine.paths)
 
             class LabSuite(pilot.Suite):
+                def __init__(self, *values, **kwargs):
+                    super().__init__(*values, **kwargs)
+                    if args.daily_mode == "global":
+                        self.outer_group = "GLOBAL"
+
                 def pause(self, seconds):
                     if args.quick and seconds >= 30:
                         offset[0] += seconds
@@ -133,9 +156,12 @@ def main():
                     else:
                         super().pause(seconds)
 
-            with patch.object(pilot, "isolated_profile", side_effect=local_profile), \
-                 patch.object(pilot, "Suite", LabSuite), \
-                 patch.object(time, "monotonic", side_effect=lambda: original_clock() + offset[0]):
+            with ExitStack() as patches:
+                patches.enter_context(patch.object(pilot, "isolated_profile", side_effect=local_profile))
+                patches.enter_context(patch.object(pilot, "Suite", LabSuite))
+                patches.enter_context(patch.object(time, "monotonic", side_effect=lambda: original_clock() + offset[0]))
+                if args.daily_mode:
+                    patches.enter_context(patch.object(pilot, "Runner", DailyLabRunner))
                 result = pilot.run_pilot(str(source), "event", str(info_path), str(receiver_root / "receiver-ca.pem"),
                                         str(binary), args.expect_sha256, str(root / "result.json"),
                                         emit=lambda item: print(json.dumps(item), flush=True))
@@ -143,7 +169,7 @@ def main():
                 print(json.dumps({"lab": "FAIL", "result": result}), flush=True)
                 raise SystemExit(1)
             print("lab: PASS actual Reality/HY2 local endpoints, isolated fault suite; "
-                  + ("accelerated policy clock" if args.quick else "wall-clock policy"), flush=True)
+                  + (("accelerated policy clock" if args.quick else "wall-clock policy") + "; daily mode=" + str(args.daily_mode)), flush=True)
         finally:
             if process is not None:
                 process.terminate()

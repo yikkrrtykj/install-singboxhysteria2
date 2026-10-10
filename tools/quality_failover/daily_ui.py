@@ -65,7 +65,7 @@ def show(workspace, home, primary_path=None, receiver_info_path=None):
     for title, value in (("上传慢于（Mbps）", fail), ("恢复至少（Mbps）", recover)):
         ttk.Label(settings, text=title).pack(side="left")
         ttk.Entry(settings, textvariable=value, width=6).pack(side="left", padx=(4, 12))
-    ttk.Label(settings, text="稳定等待2分钟；仅异常、恢复或主动检查时确认上传。", wraplength=370).pack(side="left")
+    ttk.Label(settings, text="当前协议正常就保持，不自动切回；恢复确认只用于下次故障的备选。", wraplength=370).pack(side="left")
     ttk.Label(frame, textvariable=status, wraplength=800).pack(anchor="w", pady=10)
     ttk.Entry(frame, textvariable=profile_path, state="readonly").pack(fill="x")
     ttk.Label(frame, text="在 Clash → 配置中导入以上文件并启用，然后点“开始观察”。规则模式在“节点选择”里选“质量自动选择”；全局模式直接选这个分组。",
@@ -209,10 +209,14 @@ def show(workspace, home, primary_path=None, receiver_info_path=None):
                         table.insert("", "end", values=(node, STATES.get(facts["state"], "待确认"), REASONS.get(facts["reason"], "待确认")))
                     text = {"manual_override": "手动选择优先，质量切换暂停。",
                                 "control_suspended": "分组或临时选择发生变化，控制已暂停。",
-                                "selected": "已更新质量分组，新连接使用确认过的协议。"}.get(action,
+                                "selected": "已切到确认过的协议；只要正常就保持，不自动切回。",
+                                "retained_current": "已保持当前协议；原协议恢复不会触发自动切回。"}.get(action,
                                 "质量切换已启用，正在观察。" if value["mode"] == "control" else "观察中；尚未启用质量切换。")
                     if value["mode"] == "control":
                         notice[0] = None
+                        selected = value.get("owned_selection")
+                        if action in ("observe", "selected", "retained_current") and selected in value["paths"]:
+                            text += " 当前协议：" + selected + "。"
                     mode = MODES.get(value.get("routing_mode"))
                     status.set(notice[0] or ((mode + "：") if mode else "") + text)
                 else:

@@ -77,12 +77,14 @@ none of the pilot's state is installed into the normal application or autostart.
    reachability. Require consecutive bad upload confirmations and healthy HY2,
    then verify the dedicated group's effective selection is HY2.
 3. Remove that limit. Require hold-down and three consecutive passing upload
-   confirmations; verify recovery to preferred Reality without a cached pin.
+   confirmations; verify Reality becomes eligible but the healthy current
+   Hysteria2 remains selected and fixed. No automatic failback is allowed.
 4. Hold one bounded authenticated upload across a selection change. Verify its
    Reality chain persists, a new flow follows HY2, and the original upload completes.
 5. Drop only the disposable HY2 UDP relay. Require fresh native DOWN evidence,
    successful Reality upload and actual fallback to Reality.
-6. Restore UDP forwarding and verify HY2 recovery. Explicitly choose Reality in
+6. Restore UDP forwarding and verify HY2 recovery while Reality stays selected
+   and fixed. Explicitly choose Reality in
    the disposable outer group and verify the worker reports manual override.
 7. Stop the disposable core/relays and save the closed stage report.
 
@@ -136,3 +138,8 @@ python3 tests/mihomo-quality-pilot-lab.py --mihomo /private/mihomo \
 ```
 
 This supplements, and does not replace, the earlier SOCKS-mock kernel lab.
+
+The sticky policy is `retain_healthy_current`. The local two-core lab can also
+exercise the daily identified-controller and ownership adapter with
+`--daily-mode global` or `--daily-mode rule`; it never attaches to live Clash.
+`--quick` advances only the local lab policy clock, not operator pilot waits.
