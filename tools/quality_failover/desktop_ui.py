@@ -38,7 +38,9 @@ def show(workspace, home, primary, info):
     messages = queue.Queue(maxsize=128)
     for candidate in sorted(Path(workspace).glob("bundle-*/bundle.json"), key=lambda p: p.stat().st_mtime, reverse=True):
         try:
-            load_bundle(candidate, home)
+            meta, _ = load_bundle(candidate, home)
+            if "  - name: 手动选择 · " not in (candidate.parent / meta["profile"]).read_text("utf-8"):
+                continue
             bundle[0] = candidate
             break
         except Exception:
@@ -134,7 +136,7 @@ def show(workspace, home, primary, info):
 
     def import_hint():
         status.set("首次使用：打开配置文件夹，把其中的“" + Path(primary).name.replace("-mihomo.yaml", "-quality.yaml") +
-                   "”导入 Clash 并启用。在 Clash 选择“质量自动选择”，然后回来点“开启质量切换”。")
+                   "”导入 Clash 并启用。规则模式在“手动选择”中选“质量自动选择”；全局模式直接选“质量自动选择”，然后回来点“开启质量切换”。")
 
     def poll():
         try:
@@ -195,7 +197,7 @@ def show(workspace, home, primary, info):
                         status.set(notice[0])
                 else:
                     if action in ("manual_choice", "control_suspended", "control_not_ready", "record_unavailable"):
-                        notice[0] = ("请在 Clash 选择“质量自动选择”，然后回来点“开启质量切换”。"
+                        notice[0] = ("请规则模式在“手动选择”中选“质量自动选择”；全局模式直接选“质量自动选择”，然后回来点“开启质量切换”。"
                                      if action == "manual_choice" else MESSAGES.get(action, MESSAGES["operation_unavailable"]))
                         enable_requested[0] = False
                         start_button.configure(state="normal")

@@ -114,6 +114,22 @@ def working_directory(path):
     return path.resolve()
 
 
+def compact_snapshot(proxies, marker, nodes):
+    """Normalize recipient groups for the legacy ownership guard; never write them."""
+    name = "手动选择 · " + marker.removeprefix("quality-profile-")
+    if name not in proxies:
+        return proxies
+    manual = proxies[name]
+    if (type(manual) is not dict or manual.get("type") != "Selector"
+            or manual.get("all") != [*nodes, GROUP, "DIRECT"] or AUTO in proxies or marker in proxies):
+        raise ValueError("profile_shape")
+    result = dict(proxies)
+    result[OUTER] = dict(manual, all=[*nodes, AUTO, GROUP, "DIRECT"])
+    result[AUTO] = {"type": "Fallback", "all": list(nodes), "fixed": ""}
+    result[marker] = {"type": "Selector", "all": ["DIRECT"], "hidden": True}
+    return result
+
+
 def marker_shape(proxies, marker, nodes):
     expected = {marker: ("Selector", ["DIRECT"]), OUTER: ("Selector", [*nodes, AUTO, GROUP, "DIRECT"]),
                 GROUP: ("Fallback", list(nodes)), AUTO: ("Fallback", list(nodes))}
@@ -173,7 +189,7 @@ class IdentifiedController(Controller):
     def proxies(self):
         self.last_routing_mode = None
         before = self.routing_mode()
-        value = super().proxies()
+        value = compact_snapshot(super().proxies(), self.marker, self.nodes)
         marker_shape(value, self.marker, self.nodes)
         after = self.routing_mode()
         if before != after:
@@ -242,10 +258,21 @@ def prepare_bundle(workspace, profile_path, name, info_path, home, backup_path=N
     output = directory / (name + "-quality.yaml")
     cli.prepare(name, str(source), str(backup_path) if backup_path else None, str(output), config)
     raw = output.read_bytes()
-    tag = ("  - name: " + marker + "\n    type: select\n    hidden: true\n    proxies:\n      - DIRECT\n\n").encode()
+    # Fold the unique configuration identity into the usable manual group.
+    # Verge displays hidden groups, so no separate identification card is emitted.
+    text = raw.decode("utf-8")
+    begin = text.index("  - name: " + AUTO + "\n")
+    end = text.index("  - name: " + GROUP + "\n", begin)
+    text = text[:begin] + text[end:]
+    text = text.replace("      - " + AUTO + "\n", "")
+    text = text.replace("    default-selected: " + AUTO + "\n", "    default-selected: " + GROUP + "\n")
+    manual_name = "手动选择 · " + marker.removeprefix("quality-profile-")
+    text = text.replace("  - name: " + OUTER + "\n", "  - name: " + manual_name + "\n")
+    text = text.replace("MATCH," + OUTER, "MATCH," + manual_name)
+    raw = text.encode("utf-8")
     # This new private file has not been published/imported. Source files are never rewritten.
     with output.open("wb") as handle:
-        handle.write(raw.replace(b"rules:\n", tag + b"rules:\n", 1))
+        handle.write(raw)
         handle.flush()
         os.fsync(handle.fileno())
     saved = {key: value for key, value in config.items() if key not in ("controller", "controller_secret")}
