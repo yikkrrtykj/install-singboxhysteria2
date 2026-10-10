@@ -12,6 +12,8 @@ CHOICE_MESSAGES = {"rule": "请在 Clash 的“节点选择”里选择“质量
 MESSAGES = {"clash_settings": "未找到可用的 Clash Verge 本机设置；请保持 Clash 运行。",
             "clash_controller": "Clash 控制接口必须是带认证的本机地址。",
             "live_profile_not_loaded": "请先在 Clash 导入并启用本窗口生成的新配置。",
+            "selection_handoff_required": "已有固定协议，需要确认后继续观察。",
+            "selection_handoff_changed": "确认期间选择发生变化，请重新开始观察。",
             "profile_shape": "当前配置的分组发生变化，已停止接管；请使用本窗口生成的配置。",
             "routing_mode_unavailable": "未能读取 Clash 当前模式，暂不控制；请保持现有设置。",
             "routing_mode_changed": "Clash 模式刚发生变化，等待下一次核对。",
@@ -41,7 +43,7 @@ STATES = {"UP": "可达", "DEGRADED": "变慢／恢复中", "DOWN": "不可达",
 
 def show(workspace, home, primary_path=None, receiver_info_path=None):
     import tkinter as tk
-    from tkinter import filedialog, ttk
+    from tkinter import filedialog, messagebox, ttk
     root = tk.Tk()
     root.title("Clash 质量切换 · 接入试用")
     root.geometry("850x630")
@@ -127,7 +129,7 @@ def show(workspace, home, primary_path=None, receiver_info_path=None):
                 emit({"action": "prepare_failed", "reason": error_code(exception)})
         threading.Thread(target=work, daemon=False).start()
 
-    def observe():
+    def observe(acknowledged_pin=None):
         if active[0] or bundle[0] is None:
             return
         active[0] = True
@@ -136,10 +138,16 @@ def show(workspace, home, primary_path=None, receiver_info_path=None):
         status.set("正在核对已导入的配置；先观察，不切换节点。")
         def work():
             try:
-                current.start()
+                current.start(acknowledged_pin=acknowledged_pin)
                 current.loop(emit)
             except Exception as exception:
-                emit({"action": "start_failed", "reason": error_code(exception)})
+                reason = error_code(exception)
+                event = {"action": "start_failed", "reason": reason}
+                if reason == "selection_handoff_required" and len(exception.args) == 2:
+                    from .policy import NODES
+                    if exception.args[1] in NODES:
+                        event["pin"] = exception.args[1]
+                emit(event)
         threading.Thread(target=work, daemon=False).start()
 
     def enable():
@@ -199,6 +207,13 @@ def show(workspace, home, primary_path=None, receiver_info_path=None):
                     active[0] = False
                     session[0] = None
                     status.set(MESSAGES.get(value.get("reason"), MESSAGES["operation_unavailable"]))
+                    if action == "start_failed" and value.get("reason") == "selection_handoff_required":
+                        from .policy import NODES
+                        pin = value.get("pin")
+                        if pin in NODES and not closing[0] and messagebox.askyesno(
+                                "保留当前协议继续观察", "质量分组已固定为 " + pin +
+                                "。\n是否保留这个协议并由本窗口继续观察？\n不会切换协议；质量控制仍需之后点击启用。", parent=root):
+                            observe(acknowledged_pin=pin)
                 elif action == "stopped":
                     active[0] = False
                     session[0] = None
