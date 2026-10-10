@@ -100,14 +100,16 @@ def working_directory(path):
         path.mkdir(mode=0o700)
         if os.name == "nt":
             result = subprocess.run(["whoami", "/user", "/fo", "csv", "/nh"], check=True,
-                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5)
+                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5,
+                                    creationflags=0x08000000)
             rows = list(csv.reader(result.stdout.decode("utf-8", errors="replace").splitlines()))
             sid = rows[0][-1] if len(rows) == 1 and len(rows[0]) == 2 else ""
             if not re.fullmatch(r"S-1-[0-9-]{4,160}", sid):
                 raise ValueError("working_permissions")
             subprocess.run(["icacls", str(path), "/inheritance:r", "/grant:r",
                             "*" + sid + ":(OI)(CI)F", "*S-1-5-18:(OI)(CI)F"], check=True,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5,
+                           creationflags=0x08000000)
         private_file(path / "quality-workspace.json", b'{"v":1,"kind":"quality-client"}')
     return path.resolve()
 
