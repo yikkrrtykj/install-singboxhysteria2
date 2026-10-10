@@ -48,7 +48,7 @@ def show(workspace, home, primary_path=None, receiver_info_path=None):
     frame.pack(fill="both", expand=True)
     ttk.Label(frame, text="生成新配置后，在 Clash 手动导入并启用；原配置保留，可随时切回。\n"
               "窗口先观察，点击启用后只控制新增分组。不会安装服务、设开机自启或改 TUN。\n"
-              "接入试用使用已有的7天临时证书，VPS 接收端需要保持运行。", wraplength=800).pack(anchor="w")
+              "开始观察前确认接收端正在运行；已有准备文件可以直接复用。", wraplength=800).pack(anchor="w")
     primary, backup, info = (tk.StringVar() for _ in range(3))
     primary.set(primary_path or "")
     info.set(receiver_info_path or "")

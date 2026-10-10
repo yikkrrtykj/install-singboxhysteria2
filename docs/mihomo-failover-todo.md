@@ -94,6 +94,7 @@ remain separate. No new Windows administrator/test step is requested here.
       indefinitely retained successful-upload text.
 - [x] Existing-bundle migration: every path positively confirms the new receiver
       before saving; active/foreign refusal, original profile and failed-save rollback.
-- [ ] Actual systemd DynamicUser/LoadCredential and renewal CI verification.
+- [x] Actual systemd DynamicUser/LoadCredential and restricted renewal unit
+      verification on Ubuntu 22.04; stable client pair across receiver restart.
 - [ ] Existing VPS explicit installation, external port reachability and paired
       daily-client migration. No activation is implied by source tests.
