@@ -135,3 +135,13 @@ member is refused without writes. Acceptance changes only in-memory ownership;
 quality control remains disabled until fresh uploads and explicit Enable. Closing
 an observe-only window leaves the acknowledged pin unchanged. Existing foreign
 profile, concurrent-window and manual outer/global selection guards still apply.
+
+## Daily window layout
+
+When an existing private bundle is valid, configuration files, thresholds and
+profile generation are collapsed under configuration and advanced options.
+First-time setup opens that section automatically. Expanding it enlarges the
+window so setup actions remain visible. Observation, upload confirmation,
+explicit enable and stop remain on the daily view. Aged upload confirmation is
+labelled as missing recent testing rather than a failure. This layout does not
+change the worker, thresholds, ownership or startup behavior.

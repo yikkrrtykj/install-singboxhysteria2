@@ -33,8 +33,8 @@ MESSAGES = {"clash_settings": "未找到可用的 Clash Verge 本机设置；请
             "certificate_digest": "连接文件与证书不是同一批。",
             "record_unavailable": "本机状态记录未能保存，已请求停止质量窗口；请保留现状。",
             "operation_unavailable": "操作未完成；请核对 Clash、接收端及本机连接状态。"}
-REASONS = {"no_evidence": "等待探测", "missing_reachability": "探测记录缺失或过期",
-           "reachable_only": "连接可达，未确认上传质量", "upload_confirmed_good": "最近测试上传正常", "upload_unconfirmed": "测试上传未确认，暂不判故障",
+REASONS = {"no_evidence": "等待首次检查", "missing_reachability": "探测记录缺失或过期",
+           "reachable_only": "连接正常；暂无近期上传测试，不代表故障", "upload_confirmed_good": "最近测试上传正常", "upload_unconfirmed": "测试上传未确认，暂不判故障",
            "upload_confirmed_bad": "连续测试上传偏慢", "upload_slow_pending": "测试上传偏慢，等待复核",
            "upload_middle": "测试未达恢复值，继续观察", "recovery_pending": "等待稳定恢复",
            "hard_probe_failed": "连接探测失败", "quality_recovered": "稳定恢复"}
@@ -45,24 +45,35 @@ def show(workspace, home, primary_path=None, receiver_info_path=None):
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
     root = tk.Tk()
-    root.title("Clash 质量切换 · 接入试用")
-    root.geometry("850x630")
+    root.title("Clash 质量切换")
+    root.geometry("850x580")
     frame = ttk.Frame(root, padding=18)
     frame.pack(fill="both", expand=True)
-    ttk.Label(frame, text="生成新配置后，在 Clash 手动导入并启用；原配置保留，可随时切回。\n"
-              "窗口先观察，点击启用后只控制新增分组。不会安装服务、设开机自启或改 TUN。\n"
-              "开始观察前确认接收端正在运行；已有准备文件可以直接复用。", wraplength=800).pack(anchor="w")
+    ttk.Label(frame, text="当前协议正常就保持；出现确认过的故障才切换，恢复后不自动切回。", wraplength=800).pack(anchor="w")
+    ttk.Label(frame, text="空闲不会触发切换。关闭窗口后停止质量控制；Clash 仍可继续使用。", wraplength=800).pack(anchor="w", pady=(4, 10))
+    advanced = ttk.Frame(frame)
+    def toggle_settings():
+        if advanced.winfo_manager():
+            advanced.pack_forget()
+            root.geometry('850x580')
+            settings_toggle.configure(text="配置与高级选项 ▸")
+        else:
+            advanced.pack(fill="x", after=settings_toggle, pady=6)
+            root.geometry('850x760')
+            settings_toggle.configure(text="收起配置与高级选项 ▾")
+    settings_toggle = ttk.Button(frame, text="配置与高级选项 ▸", command=toggle_settings)
+    settings_toggle.pack(anchor="w")
     primary, backup, info = (tk.StringVar() for _ in range(3))
     primary.set(primary_path or "")
     info.set(receiver_info_path or "")
     for title, value in (("原始客户端 YAML", primary), ("备用 VPS YAML（可留空）", backup), ("接收端 receiver-info.json", info)):
-        row = ttk.Frame(frame)
+        row = ttk.Frame(advanced)
         row.pack(fill="x", pady=6)
         ttk.Label(row, text=title, width=30).pack(side="left")
         ttk.Entry(row, textvariable=value).pack(side="left", fill="x", expand=True)
         ttk.Button(row, text="选择文件", command=lambda item=value: item.set(filedialog.askopenfilename())).pack(side="right")
     profile_path, status = tk.StringVar(), tk.StringVar(value="选择原始 YAML 和已有连接文件，点“生成配置”。")
-    settings = ttk.Frame(frame)
+    settings = ttk.Frame(advanced)
     settings.pack(fill="x", pady=8)
     fail, recover = tk.StringVar(value="4"), tk.StringVar(value="8")
     for title, value in (("测试上传慢于（Mbps）", fail), ("测试恢复至少（Mbps）", recover)):
@@ -70,8 +81,8 @@ def show(workspace, home, primary_path=None, receiver_info_path=None):
         ttk.Entry(settings, textvariable=value, width=6).pack(side="left", padx=(4, 12))
     ttk.Label(settings, text="阈值用于主动测试；空闲不会触发切换。当前协议正常就保持，不自动切回。", wraplength=330).pack(side="left")
     ttk.Label(frame, textvariable=status, wraplength=800).pack(anchor="w", pady=10)
-    ttk.Entry(frame, textvariable=profile_path, state="readonly").pack(fill="x")
-    ttk.Label(frame, text="在 Clash → 配置中导入以上文件并启用，然后点“开始观察”。规则模式在“节点选择”里选“质量自动选择”；全局模式直接选这个分组。",
+    ttk.Entry(advanced, textvariable=profile_path, state="readonly").pack(fill="x")
+    ttk.Label(advanced, text="首次使用：在 Clash → 配置中导入以上文件并启用，然后点“开始观察”。规则模式在“节点选择”里选“质量自动选择”；全局模式直接选这个分组。",
               wraplength=800).pack(anchor="w", pady=6)
     table = ttk.Treeview(frame, columns=("node", "state", "reason"), show="headings", height=5)
     for name, title in (("node", "协议"), ("state", "状态"), ("reason", "说明")):
@@ -90,9 +101,12 @@ def show(workspace, home, primary_path=None, receiver_info_path=None):
             fail.set(str(saved["paths"][0]["policy"]["fail_mbps"]))
             recover.set(str(saved["paths"][0]["policy"]["recover_mbps"]))
             profile_path.set(str(bundle[0].parent / meta["profile"]))
-            status.set("已有准备文件。请确认 Clash 已导入这份配置，再开始观察。")
+            status.set("已找到现有配置，点“开始观察”继续使用。")
         except Exception:
             bundle[0] = None
+
+    if bundle[0] is None:
+        toggle_settings()
 
     def emit(value):
         try:
@@ -181,9 +195,13 @@ def show(workspace, home, primary_path=None, receiver_info_path=None):
 
     row = ttk.Frame(frame)
     row.pack(fill="x", pady=8)
-    for title, command in (("生成配置", prepare), ("复制配置路径", copy_path), ("开始观察", observe),
+    for title, command in (("开始观察", observe),
                            ("检查上传", confirm), ("启用质量切换", enable), ("停止", stop)):
         ttk.Button(row, text=title, command=command).pack(side="left", padx=3)
+    preparation = ttk.Frame(advanced)
+    preparation.pack(fill="x", pady=6)
+    ttk.Button(preparation, text="生成配置", command=prepare).pack(side="left")
+    ttk.Button(preparation, text="复制配置路径", command=copy_path).pack(side="left", padx=6)
     ttk.Button(frame, text="关闭", command=close).pack(anchor="e")
 
     def poll():
