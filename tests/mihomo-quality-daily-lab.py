@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
-from quality_failover.daily import IdentifiedController, prepare_bundle
+from quality_failover.daily import DailyOwnership, IdentifiedController, prepare_bundle
 from quality_failover.pilot import isolated_profile, module, pinned_binary, tcp_port
 from quality_failover.policy import GROUP, OUTER, NODES, Ownership
 
@@ -70,7 +70,7 @@ def main():
             foreign = IdentifiedController("http://127.0.0.1:%d" % port, secret,
                                            "quality-profile-" + "b" * 32, NODES[:2])
             try:
-                foreign.select("Hysteria2", Ownership(NODES[:2]))
+                foreign.select("Hysteria2", DailyOwnership(NODES[:2]))
                 raise AssertionError("foreign_marker_wrote")
             except ValueError:
                 pass
@@ -78,14 +78,29 @@ def main():
             # This PUT simulates the operator's choice, only in this disposable core.
             from urllib.parse import quote
             controller.request("PUT", "/proxies/" + quote(OUTER, safe=""), {"name": GROUP})
-            owner = Ownership(NODES[:2])
+            owner = DailyOwnership(NODES[:2])
             assert controller.select("Hysteria2", owner)
             controller.restore(owner)
             after = controller.proxies()
             assert after[GROUP]["fixed"] == ""
             assert after[OUTER]["now"] == GROUP
             assert after["自动选择"]["fixed"] == before["自动选择"]["fixed"]
-            print("lab: PASS real-core marker, foreign-profile refusal, dedicated selection and restore; no live Clash touched")
+            # Global mode must use GLOBAL, not the stale rule-mode outer pin.
+            controller.request("PUT", "/proxies/" + quote(OUTER, safe=""), {"name": "Hysteria2"})
+            controller.request("PATCH", "/configs", {"mode": "global"})
+            controller.request("PUT", "/proxies/GLOBAL", {"name": GROUP})
+            global_owner = DailyOwnership(NODES[:2])
+            assert controller.select("Hysteria2", global_owner)
+            controller.request("PUT", "/proxies/GLOBAL", {"name": "Reality"})
+            assert not controller.select("Reality", global_owner)
+            controller.restore(global_owner)
+            after = controller.proxies()
+            assert after[GROUP]["fixed"] == ""
+            assert after["GLOBAL"]["now"] == "Reality"
+            assert after[OUTER]["now"] == "Hysteria2"
+            controller.request("PATCH", "/configs", {"mode": "direct"})
+            assert not controller.select("Hysteria2", DailyOwnership(NODES[:2]))
+            print("lab: PASS rule/global selection, manual precedence, direct refusal, identity and restore; no live Clash touched")
         finally:
             if process is not None:
                 process.terminate()

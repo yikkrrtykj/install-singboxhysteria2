@@ -5,13 +5,19 @@ from pathlib import Path
 from .daily import Session, error_code, prepare_bundle, working_directory
 from .policy import GROUP
 
+MODES = {"rule": "规则模式", "global": "全局模式", "direct": "直连模式"}
+CHOICE_MESSAGES = {"rule": "请在 Clash 的“节点选择”里选择“质量自动选择”，再点启用。",
+                   "global": "请在 Clash 全局代理中选择“质量自动选择”，再点启用。",
+                   "direct": "当前是直连模式；切到规则或全局模式并选择“质量自动选择”，才会启用切换。"}
 MESSAGES = {"clash_settings": "未找到可用的 Clash Verge 本机设置；请保持 Clash 运行。",
             "clash_controller": "Clash 控制接口必须是带认证的本机地址。",
             "live_profile_not_loaded": "请先在 Clash 导入并启用本窗口生成的新配置。",
             "profile_shape": "当前配置的分组发生变化，已停止接管；请使用本窗口生成的配置。",
+            "routing_mode_unavailable": "未能读取 Clash 当前模式，暂不控制；请保持现有设置。",
+            "routing_mode_changed": "Clash 模式刚发生变化，等待下一次核对。",
             "already_running": "这份配置已有一个质量窗口正在运行，请使用原窗口。",
             "control_not_ready": "还没有两个协议的有效上传确认；可点“检查上传”并确认 VPS 接收端在线。",
-            "manual_choice": "请在 Clash 的“节点选择”里手动选择“质量自动选择”，再点启用。",
+            "manual_choice": "请在 Clash 当前模式中选择“质量自动选择”，再点启用。",
             "control_suspended": "临时选择与本窗口记录不一致，质量控制暂停，请保留现状。",
             "canonical_profile": "原始 YAML 格式不匹配；请选择网页直接下载的文件，避免另存为改变换行。",
             "canonical_name": "请保留原始文件名，例如 test-mihomo.yaml。",
@@ -62,7 +68,7 @@ def show(workspace, home, primary_path=None, receiver_info_path=None):
     ttk.Label(settings, text="稳定等待2分钟；仅异常、恢复或主动检查时确认上传。", wraplength=370).pack(side="left")
     ttk.Label(frame, textvariable=status, wraplength=800).pack(anchor="w", pady=10)
     ttk.Entry(frame, textvariable=profile_path, state="readonly").pack(fill="x")
-    ttk.Label(frame, text="在 Clash → 配置中导入以上文件并启用，然后点“开始观察”。启用切换前，在节点选择里选“质量自动选择”。",
+    ttk.Label(frame, text="在 Clash → 配置中导入以上文件并启用，然后点“开始观察”。规则模式在“节点选择”里选“质量自动选择”；全局模式直接选这个分组。",
               wraplength=800).pack(anchor="w", pady=6)
     table = ttk.Treeview(frame, columns=("node", "state", "reason"), show="headings", height=5)
     for name, title in (("node", "协议"), ("state", "状态"), ("reason", "说明")):
@@ -207,9 +213,12 @@ def show(workspace, home, primary_path=None, receiver_info_path=None):
                                 "质量切换已启用，正在观察。" if value["mode"] == "control" else "观察中；尚未启用质量切换。")
                     if value["mode"] == "control":
                         notice[0] = None
-                    status.set(notice[0] or text)
+                    mode = MODES.get(value.get("routing_mode"))
+                    status.set(notice[0] or ((mode + "：") if mode else "") + text)
                 else:
                     text = MESSAGES.get(action, MESSAGES["operation_unavailable"])
+                    if action == "manual_choice":
+                        text = CHOICE_MESSAGES.get(value.get("routing_mode"), text)
                     if action in ("control_not_ready", "manual_choice", "record_unavailable", "control_suspended"):
                         notice[0] = text
                     status.set(text)

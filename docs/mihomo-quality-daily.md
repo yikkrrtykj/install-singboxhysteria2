@@ -18,7 +18,8 @@ The isolated pilot does not substitute for daily-core/application acceptance.
    Existing source files, manual/default group meanings and HY2 hopping survive.
 3. Click **Start observation**. This only observes and requests a bounded initial
    upload confirmation. When both paths show a positive upload confirmation,
-   manually choose `质量自动选择` under `节点选择` in Clash, then click
+   manually choose `质量自动选择` in Clash: under `节点选择` for rule
+   mode, or directly in the global proxy selection for global mode. Then click
    **Enable quality switching**. Confirmation expires; stale or missing facts
    refuse enable. `Check upload` requests another bounded confirmation window.
 
@@ -45,6 +46,11 @@ Never upload the private workspace or generated YAML: they contain credentials.
   on each start, used only in memory, and not copied into the saved client bundle.
   Verge's existing nonempty short secret is supported; authentication is neither
   disabled nor rewritten. Empty/unsafe secrets and nonloopback addresses fail.
+- Current routing mode is read around the proxy snapshot and checked again
+  before mutations. Rule mode uses `节点选择`; global mode uses `GLOBAL`.
+  An unused remembered choice in the other mode cannot override active opt-in.
+  Direct/unknown mode or an observed mode change refuses control; mode changes
+  and global/manual selections are never written by the window.
 - Only the added hidden quality group is writable. The outer/legacy groups are
   read-only. Manually choosing another outer node pauses quality decisions.
   Reloading another profile or changing ownership prevents clearing its choice.
@@ -70,9 +76,9 @@ Never upload the private workspace or generated YAML: they contain credentials.
 
 ## Verification
 
-`tests/test_quality_daily.py`: 26 hermetic contracts covering preparation,
+`tests/test_quality_daily.py`: 34 hermetic contracts covering preparation,
 source preservation, credential handling, profile identity, observe-first enable,
-manual precedence, stop/failure restoration, locking and bounded receipts.
+rule/global routing and manual precedence, direct/unknown refusal, stop/failure restoration, locking and bounded receipts.
 Existing quality/pilot suites remain required. Python 3.10 syntax is retained.
 
 `tests/mihomo-quality-daily-lab.py` is an explicit supplied-digest real-Mihomo

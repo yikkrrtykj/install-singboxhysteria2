@@ -24,7 +24,8 @@ REASONS = {"clash_settings", "clash_controller", "live_profile_not_loaded", "pro
            "working_directory", "working_permissions", "bundle", "bundle_file",
            "probe_ports", "canonical_profile", "canonical_name", "receiver_info",
            "certificate_file", "certificate_digest", "already_running", "control_not_ready",
-           "manual_choice", "restore_unconfirmed", "record_unavailable"}
+           "manual_choice", "restore_unconfirmed", "record_unavailable",
+           "routing_mode_unavailable", "routing_mode_changed"}
 
 
 def error_code(exception):
@@ -126,15 +127,56 @@ def marker_shape(proxies, marker, nodes):
             raise ValueError("profile_shape")
 
 
+class RoutingSnapshot(dict):
+    """Proxy records plus separately observed routing mode; no synthetic proxy edits."""
+    def __init__(self, proxies, mode):
+        super().__init__(proxies)
+        self.routing_mode = mode
+
+
+class DailyOwnership(Ownership):
+    """Use the active routing selection, never rewrite GLOBAL/outer/mode."""
+    def permitted(self, proxies, require_outer=True):
+        if not super().permitted(proxies, require_outer=False):
+            return False
+        if not require_outer:
+            return True
+        mode = proxies.routing_mode if isinstance(proxies, RoutingSnapshot) else None
+        if mode == "rule":
+            return super().permitted(proxies, require_outer=True)
+        if mode == "global":
+            group = proxies.get("GLOBAL")
+            return (type(group) is dict and group.get("type") == "Selector"
+                    and type(group.get("all")) is list and GROUP in group["all"]
+                    and group.get("now") == GROUP)
+        # Direct/unknown modes have no effective quality opt-in. Missing mode
+        # does not inherit an unrelated remembered rule-mode outer selection.
+        return False
+
+
 class IdentifiedController(Controller):
     def __init__(self, url, secret, marker, nodes):
         super().__init__(url, secret)
         self.marker, self.nodes = marker, nodes
+        self.last_routing_mode = None
+
+    def routing_mode(self):
+        value = self.request("GET", "/configs")
+        mode = value.get("mode") if type(value) is dict else None
+        if type(mode) is not str or mode not in ("rule", "global", "direct"):
+            raise ValueError("routing_mode_unavailable")
+        return mode
 
     def proxies(self):
+        self.last_routing_mode = None
+        before = self.routing_mode()
         value = super().proxies()
         marker_shape(value, self.marker, self.nodes)
-        return value
+        after = self.routing_mode()
+        if before != after:
+            raise ValueError("routing_mode_changed")
+        self.last_routing_mode = after
+        return RoutingSnapshot(value, after)
 
 
 def choose_ports(count):
@@ -313,8 +355,8 @@ class Session:
             self.runner = Runner(config)
             self.runner.controller = IdentifiedController(config["controller"], config["controller_secret"],
                                                           meta["marker"], meta["nodes"])
-            self.runner.controller.proxies()
-            owner = Ownership(self.runner.engine.paths)
+            self.runner.owner = DailyOwnership(self.runner.engine.paths)
+            owner = self.runner.owner
             owner.permitted(self.runner.controller.proxies(), require_outer=False)
             if owner.suspended:
                 raise ValueError("profile_shape")
@@ -332,9 +374,12 @@ class Session:
         self.stop_event.set()
 
     def publish(self, record, emit):
+        mode = self.runner.controller.last_routing_mode
+        if type(mode) is str and mode in ("rule", "global", "direct"):
+            record = dict(record, routing_mode=mode)
         self.enabled_once |= self.runner.config["control_enabled"]
         self.manual_seen |= record.get("action") == "manual_override"
-        allowed = ("v", "action", "mode", "observed_epoch", "paths", "suggested", "owned_selection", "restore_confirmed")
+        allowed = ("v", "action", "mode", "observed_epoch", "paths", "suggested", "owned_selection", "restore_confirmed", "routing_mode")
         closed = {key: record[key] for key in allowed if key in record}
         state = {"v": 1, "mode": "daily_clash_session", "cycles": self.cycles,
                  "session_id": self.session_id, "started_epoch": self.started_epoch, "written_epoch": round(time.time(), 3),

@@ -30,7 +30,16 @@ def topology(nodes=NODES[:2], outer=GROUP):
     values[MARKER] = {"type": "Selector", "all": ["DIRECT"], "hidden": True, "now": "DIRECT"}
     for index, node in enumerate(nodes):
         values[node]["type"] = "Vless" if index % 2 == 0 else "Hysteria2"
-    return values
+    values["GLOBAL"] = {"type": "Selector", "all": [GROUP, "Reality", "Hysteria2", "DIRECT"], "now": GROUP}
+    return daily.RoutingSnapshot(values, "rule")
+
+
+def api(values, mode="rule"):
+    def request(method, path, payload=None):
+        if path == "/configs": return {"mode": mode}
+        if path == "/proxies": return {"proxies": dict(values)}
+        return {}
+    return request
 
 
 def settings(path, address="127.0.0.1:19091", secret="verge-test-only"):
@@ -203,32 +212,32 @@ class IdentityTests(unittest.TestCase):
                 elif kind == "shape": values[GROUP]["all"].reverse()
                 else: values["Reality"]["type"] = "Direct"
                 controller = self.controller()
-                with patch.object(controller, "request", return_value={"proxies": values}) as request:
+                with patch.object(controller, "request", side_effect=api(values)) as request:
                     with self.assertRaises(ValueError):
-                        controller.select("Hysteria2", Ownership(NODES[:2]))
-                    self.assertEqual([call.args[0] for call in request.call_args_list], ["GET"])
+                        controller.select("Hysteria2", daily.DailyOwnership(NODES[:2]))
+                    self.assertTrue(all(call.args[0] == "GET" for call in request.call_args_list))
 
     def test_own_group_only_written_with_matching_loaded_profile(self):
-        controller = self.controller(); owner = Ownership(NODES[:2])
-        with patch.object(controller, "request", side_effect=[{"proxies": topology()}, {}]) as request:
+        controller = self.controller(); owner = daily.DailyOwnership(NODES[:2])
+        with patch.object(controller, "request", side_effect=api(topology())) as request:
             self.assertTrue(controller.select("Hysteria2", owner))
-        self.assertEqual(request.call_args_list[1].args[:2], ("PUT", "/proxies/" + __import__("urllib.parse", fromlist=["quote"]).quote(GROUP, safe="")))
+        self.assertEqual(request.call_args_list[3].args[:2], ("PUT", "/proxies/" + __import__("urllib.parse", fromlist=["quote"]).quote(GROUP, safe="")))
         self.assertEqual(owner.expected, "Hysteria2")
 
     def test_stop_does_not_clear_another_loaded_profile(self):
         values = topology(); values.pop(MARKER)
-        controller = self.controller(); owner = Ownership(NODES[:2]); owner.committed("Hysteria2")
-        with patch.object(controller, "request", return_value={"proxies": values}) as request:
+        controller = self.controller(); owner = daily.DailyOwnership(NODES[:2]); owner.committed("Hysteria2")
+        with patch.object(controller, "request", side_effect=api(values)) as request:
             with self.assertRaises(ValueError):
                 controller.restore(owner)
-            self.assertEqual([call.args[0] for call in request.call_args_list], ["GET"])
+            self.assertTrue(all(call.args[0] == "GET" for call in request.call_args_list))
 
     def test_manual_outer_choice_kept_even_with_matching_identity(self):
         controller = self.controller()
         values = topology(outer="Reality")
-        with patch.object(controller, "request", return_value={"proxies": values}) as request:
-            self.assertFalse(controller.select("Hysteria2", Ownership(NODES[:2])))
-            self.assertEqual(request.call_count, 1)
+        with patch.object(controller, "request", side_effect=api(values)) as request:
+            self.assertFalse(controller.select("Hysteria2", daily.DailyOwnership(NODES[:2])))
+            self.assertEqual(request.call_count, 3)
 
 
 class SessionTests(unittest.TestCase):
@@ -238,7 +247,7 @@ class SessionTests(unittest.TestCase):
         runner = session.runner
         runner.config = {"control_enabled": False, "cycle_seconds": .01}
         runner.engine = Engine({name: Policy(4, 8) for name in NODES[:2]})
-        runner.owner = Ownership(NODES[:2])
+        runner.owner = daily.DailyOwnership(NODES[:2])
         runner.controller.proxies.return_value = topology(outer=outer)
         if good:
             runner.engine.update(time.monotonic(), {node: (True, Confirmation(12, endpoint_ready=True)) for node in NODES[:2]})
@@ -328,6 +337,82 @@ class SessionTests(unittest.TestCase):
             session.runner.close.assert_called_once()
             self.assertIn("record_unavailable", [row["action"] for row in messages])
             self.assertNotIn("private-token-never-echoed", json.dumps(messages))
+
+
+class RoutingTests(unittest.TestCase):
+    def controller(self):
+        return daily.IdentifiedController("http://127.0.0.1:19091", "test-only-secret", MARKER, NODES[:2])
+
+    def test_global_quality_selection_ignores_unused_rule_pin_and_only_writes_quality(self):
+        values = topology(outer="Hysteria2")
+        before = copy.deepcopy(values)
+        controller = self.controller()
+        with patch.object(controller, "request", side_effect=api(values, "global")) as request:
+            self.assertTrue(controller.select("Hysteria2", daily.DailyOwnership(NODES[:2])))
+            writes = [call for call in request.call_args_list if call.args[0] != "GET"]
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(writes[0].args[0], "PUT")
+        self.assertNotIn("GLOBAL", writes[0].args[1])
+        self.assertEqual(values, before)
+
+    def test_global_manual_pin_blocks_even_if_rule_outer_still_quality(self):
+        values = topology(); values["GLOBAL"]["now"] = "Hysteria2"
+        controller = self.controller()
+        with patch.object(controller, "request", side_effect=api(values, "global")) as request:
+            self.assertFalse(controller.select("Reality", daily.DailyOwnership(NODES[:2])))
+            self.assertTrue(all(call.args[0] == "GET" for call in request.call_args_list))
+
+    def test_direct_and_unknown_modes_never_inherit_remembered_quality_selection(self):
+        for mode in ("direct", "unknown", None, True):
+            with self.subTest(mode=mode):
+                controller = self.controller()
+                with patch.object(controller, "request", side_effect=api(topology(), mode)) as request:
+                    if mode == "direct":
+                        self.assertFalse(controller.select("Reality", daily.DailyOwnership(NODES[:2])))
+                    else:
+                        with self.assertRaises(ValueError): controller.select("Reality", daily.DailyOwnership(NODES[:2]))
+                    self.assertTrue(all(call.args[0] == "GET" for call in request.call_args_list))
+
+    def test_rule_mode_uses_outer_not_global(self):
+        values = topology(outer="Reality")
+        controller = self.controller()
+        with patch.object(controller, "request", side_effect=api(values)) as request:
+            self.assertFalse(controller.select("Hysteria2", daily.DailyOwnership(NODES[:2])))
+            self.assertTrue(all(call.args[0] == "GET" for call in request.call_args_list))
+
+    def test_mode_change_during_snapshot_refuses_mutation(self):
+        controller = self.controller()
+        with patch.object(controller, "request", side_effect=[{"mode":"global"}, {"proxies":dict(topology())}, {"mode":"rule"}]) as request:
+            with self.assertRaisesRegex(ValueError, "routing_mode_changed"):
+                controller.select("Hysteria2", daily.DailyOwnership(NODES[:2]))
+            self.assertTrue(all(call.args[0] == "GET" for call in request.call_args_list))
+
+    def test_missing_routing_context_is_not_optin(self):
+        owner = daily.DailyOwnership(NODES[:2])
+        self.assertFalse(owner.permitted(dict(topology())))
+        self.assertFalse(owner.suspended)
+
+    def test_global_manual_override_still_restores_only_owned_quality_pin(self):
+        values = topology(outer="Reality")
+        values["GLOBAL"]["now"] = "Reality"
+        values[GROUP]["fixed"] = "Hysteria2"
+        controller = self.controller(); owner = daily.DailyOwnership(NODES[:2]); owner.committed("Hysteria2")
+        with patch.object(controller, "request", side_effect=api(values, "global")) as request:
+            controller.restore(owner)
+            writes = [call for call in request.call_args_list if call.args[0] != "GET"]
+        self.assertEqual([call.args[0] for call in writes], ["DELETE"])
+        self.assertNotIn("GLOBAL", writes[0].args[1])
+
+    def test_session_enable_uses_global_quality_choice_with_unused_rule_pin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session = SessionTests().setup_session(Path(directory), good=True, outer="Hysteria2")
+            values = topology(outer="Hysteria2"); values.routing_mode = "global"
+            session.runner.controller.proxies.return_value = values
+            session.runner.controller.last_routing_mode = "global"
+            session.enable(); messages = []; session.loop(messages.append)
+            self.assertTrue(session.runner.config["control_enabled"])
+            self.assertEqual(messages[-1]["routing_mode"], "global")
+            self.assertEqual(json.loads((Path(directory) / "state.json").read_bytes())["last"]["routing_mode"], "global")
 
 
 if __name__ == "__main__":

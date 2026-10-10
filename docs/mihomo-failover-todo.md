@@ -30,11 +30,19 @@ Current quality work: [PR-48B](mihomo-protocol-quality-failover-p48b.md).
 
 - [x] Daily opt-in GUI: private preparation, loaded-profile marker, observation first,
       explicit enable, manual precedence and owned stop restoration.
-- [x] 26 hermetic daily contracts pass; real pinned-core API identity/selection
+- [x] 34 hermetic daily contracts pass; real pinned-core API identity/selection
       smoke check passes without touching daily Clash.
 - [x] Latest-state receipt is atomic/bounded; controller credentials remain in memory.
 - [x] Pilot evidence follow-up head 8452b76: all 15 GitHub checks passed.
-- [ ] Daily-entry head CI (pending publication of this change).
+- [x] Daily-entry head18b8072a: all15 GitHub checks passed.
+- [ ] Latest routing-correction head CI.
+- [ ] Windows early-rejection receiver response review: follow-up broad suite
+      observed WinError10053 in auth/nonce and budget refusal; receiver source
+      is unchanged. No failure is treated as a passing regression.
+- [x] Rule/global effective selection and direct-mode refusal; eight routing
+      regressions plus real-core global/manual/restore coverage.
+- [x] Read-only operator snapshot reproduced GLOBAL=quality with unused rule=HY2;
+      no live mode/selection was changed during diagnosis.
 
 ## Operator acceptance
 
