@@ -169,10 +169,10 @@ class BundleTests(unittest.TestCase):
             self.assertEqual((root / "important").read_text(), "keep")
 
     def test_bundle_profile_or_certificate_edit_refused(self):
-        for target in ("event-quality.yaml", "receiver-ca.pem"):
+        for target in ("profile", "receiver-ca.pem"):
             with self.subTest(target=target), tempfile.TemporaryDirectory() as directory:
                 path, home, *_ = self.build(Path(directory))
-                (path.parent / target).write_bytes(b"changed")
+                (path.parent / (json.loads(path.read_bytes())["profile"] if target == "profile" else target)).write_bytes(b"changed")
                 with patch("quality_failover.transport.ssl.create_default_context"), self.assertRaises(ValueError):
                     daily.load_bundle(path, home)
 
