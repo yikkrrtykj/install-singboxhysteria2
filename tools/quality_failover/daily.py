@@ -130,6 +130,21 @@ def compact_snapshot(proxies, marker, nodes):
     return result
 
 
+def recipient_snapshot(proxies, marker, nodes):
+    """Invisible identity is checked separately through the core's global UA."""
+    if any(key in proxies for key in (AUTO, OUTER, marker)) or any(key.startswith("手动选择 · ") for key in proxies):
+        raise ValueError("profile_shape")
+    result = dict(proxies)
+    result[OUTER] = {"type": "Selector", "all": [*nodes, AUTO, GROUP, "DIRECT"], "now": GROUP}
+    result[AUTO] = {"type": "Fallback", "all": list(nodes), "fixed": ""}
+    result[marker] = {"type": "Selector", "all": ["DIRECT"], "hidden": True}
+    return result
+
+
+def identity_ua(marker):
+    return "ClashQualitySwitch/2 " + marker
+
+
 def marker_shape(proxies, marker, nodes):
     expected = {marker: ("Selector", ["DIRECT"]), OUTER: ("Selector", [*nodes, AUTO, GROUP, "DIRECT"]),
                 GROUP: ("Fallback", list(nodes)), AUTO: ("Fallback", list(nodes))}
@@ -174,13 +189,16 @@ class DailyOwnership(Ownership):
 
 
 class IdentifiedController(Controller):
-    def __init__(self, url, secret, marker, nodes):
+    def __init__(self, url, secret, marker, nodes, recipient=False):
         super().__init__(url, secret)
         self.marker, self.nodes = marker, nodes
+        self.recipient = recipient
         self.last_routing_mode = None
 
     def routing_mode(self):
         value = self.request("GET", "/configs")
+        if self.recipient and (type(value) is not dict or value.get("global-ua") != identity_ua(self.marker)):
+            raise ValueError("live_profile_not_loaded")
         mode = value.get("mode") if type(value) is dict else None
         if type(mode) is not str or mode not in ("rule", "global", "direct"):
             raise ValueError("routing_mode_unavailable")
@@ -189,7 +207,16 @@ class IdentifiedController(Controller):
     def proxies(self):
         self.last_routing_mode = None
         before = self.routing_mode()
-        value = compact_snapshot(super().proxies(), self.marker, self.nodes)
+        raw = super().proxies()
+        value = (recipient_snapshot(raw, self.marker, self.nodes) if self.recipient
+                 else compact_snapshot(raw, self.marker, self.nodes))
+        if self.recipient and before == "rule":
+            rules = self.request("GET", "/rules")
+            expected = [("GeoIP", "lan", "DIRECT"), ("GeoIP", "cn", "DIRECT"), ("Match", "", GROUP)]
+            rows = rules.get("rules") if type(rules) is dict else None
+            if type(rows) is not list or any(type(row) is not dict for row in rows) or [
+                    (row.get("type"), row.get("payload"), row.get("proxy")) for row in rows] != expected:
+                raise ValueError("profile_shape")
         marker_shape(value, self.marker, self.nodes)
         after = self.routing_mode()
         if before != after:
@@ -258,17 +285,19 @@ def prepare_bundle(workspace, profile_path, name, info_path, home, backup_path=N
     output = directory / (name + "-quality.yaml")
     cli.prepare(name, str(source), str(backup_path) if backup_path else None, str(output), config)
     raw = output.read_bytes()
-    # Fold the unique configuration identity into the usable manual group.
-    # Verge displays hidden groups, so no separate identification card is emitted.
+    # Verge displays hidden groups. Store identity in the global user agent
+    # instead, and route rules directly to the dedicated quality group.
     text = raw.decode("utf-8")
     begin = text.index("  - name: " + AUTO + "\n")
     end = text.index("  - name: " + GROUP + "\n", begin)
     text = text[:begin] + text[end:]
     text = text.replace("      - " + AUTO + "\n", "")
     text = text.replace("    default-selected: " + AUTO + "\n", "    default-selected: " + GROUP + "\n")
-    manual_name = "手动选择 · " + marker.removeprefix("quality-profile-")
-    text = text.replace("  - name: " + OUTER + "\n", "  - name: " + manual_name + "\n")
-    text = text.replace("MATCH," + OUTER, "MATCH," + manual_name)
+    begin = text.index("  - name: " + OUTER + "\n")
+    end = text.index("  - name: " + GROUP + "\n", begin)
+    text = text[:begin] + text[end:]
+    text = text.replace("MATCH," + OUTER, "MATCH," + GROUP)
+    text = "global-ua: " + json.dumps(identity_ua(marker)) + "\n" + text
     raw = text.encode("utf-8")
     # This new private file has not been published/imported. Source files are never rewritten.
     with output.open("wb") as handle:
@@ -277,7 +306,7 @@ def prepare_bundle(workspace, profile_path, name, info_path, home, backup_path=N
         os.fsync(handle.fileno())
     saved = {key: value for key, value in config.items() if key not in ("controller", "controller_secret")}
     private_file(directory / "client.json", json.dumps(saved).encode())
-    meta = {"v": 1, "marker": marker, "name": name, "nodes": list(nodes), "profile": output.name,
+    meta = {"v": 2, "marker": marker, "name": name, "nodes": list(nodes), "profile": output.name,
             "profile_sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
             "certificate_sha256": hashlib.sha256(certificate.read_bytes()).hexdigest()}
     private_file(directory / "bundle.json", json.dumps(meta).encode())
@@ -291,7 +320,7 @@ def load_bundle(path, home):
     directory_check(path.parent)
     meta = read_json(path)
     if (type(meta) is not dict or set(meta) != {"v", "marker", "name", "nodes", "profile", "profile_sha256", "certificate_sha256"}
-            or type(meta["v"]) is not int or meta["v"] != 1 or type(meta["marker"]) is not str
+            or type(meta["v"]) is not int or meta["v"] not in (1, 2) or type(meta["marker"]) is not str
             or not re.fullmatch(r"quality-profile-[0-9a-f]{32}", meta["marker"])
             or type(meta["name"]) is not str or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,31}", meta["name"])
             or meta["profile"] != meta["name"] + "-quality.yaml"
@@ -384,7 +413,7 @@ class Session:
             meta, config = load_bundle(self.bundle_path, self.home)
             self.runner = Runner(config)
             self.runner.controller = IdentifiedController(config["controller"], config["controller_secret"],
-                                                          meta["marker"], meta["nodes"])
+                                                          meta["marker"], meta["nodes"], recipient=meta.get("v", 1) == 2)
             self.runner.owner = DailyOwnership(self.runner.engine.paths)
             owner = self.runner.owner
             proxies = self.runner.controller.proxies()

@@ -1835,6 +1835,7 @@
       }
       if (device.desired === "active" && device.verified === "active") {
         action("下载 Windows 客户端包", function () { downloadP6Client(device.device); });
+        action("下载质量切换 EXE 包", function () { downloadQualityClient(device.device); });
         action("单独下载配置", function () { downloadP6Bundle(device.device); });
       }
       if (device.desired === "active" && !confirmed) {
@@ -1928,6 +1929,29 @@
       renderP6Devices();
       loadP6Devices();
     });
+  }
+
+  function downloadQualityClient(device) {
+    if (p6View.busy || !e3Writable() || state.e3Mutation || p6View.retry) return;
+    p6View.busy = true; renderP6Devices();
+    var name = p6View.name;
+    apiWithStepUp("/api/v1/clients/quality-bundle", {
+      method: "POST", body: {name: name, device: device}, raw: true
+    }).then(function (response) { return response.blob(); }).then(function (blob) {
+      var url = URL.createObjectURL(blob), link = document.createElement("a");
+      try {
+        link.href = url; link.download = name + "-" + device + "-quality.zip";
+        document.body.appendChild(link); link.click();
+      } finally {
+        if (link.parentNode) link.parentNode.removeChild(link);
+        URL.revokeObjectURL(url);
+      }
+      p6Message("质量切换包已准备：完整解压，打开 EXE，按提示导入配置并开启。仅供本设备使用；当前限两台试用。", false);
+    }).catch(function (error) {
+      p6Message(error.code === "E_QUALITY_UNAVAILABLE"
+        ? "管理员尚未为此设备准备质量切换包，或程序校验未通过。当前限两台试用，请联系管理员准备。"
+        : "下载失败，请刷新设备状态后手动重试。", true);
+    }).then(function () { p6View.busy = false; renderP6Devices(); });
   }
 
   function downloadP6Client(device) {

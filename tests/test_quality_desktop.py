@@ -164,7 +164,7 @@ class GuiTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory); (root / "bundle-test").mkdir(); (root / "bundle-test/bundle.json").write_text("{}")
             (root / "bundle-test/test-quality.yaml").write_text("  - name: 手动选择 · synthetic", encoding="utf-8")
-            with patch.object(tk.Tk, "mainloop", acceptance), patch.object(desktop_ui, "load_bundle", return_value=({"profile": "test-quality.yaml"}, {})), patch.object(desktop_ui, "Session", FakeSession):
+            with patch.object(tk.Tk, "mainloop", acceptance), patch.object(desktop_ui, "load_bundle", return_value=({"v": 2, "profile": "test-quality.yaml"}, {})), patch.object(desktop_ui, "Session", FakeSession):
                 desktop_ui.show(root, root, root / "colleague-mihomo.yaml", root / "receiver-info.json")
 
     def test_user_click_and_both_upload_confirmations_required(self): self.exercise(True)

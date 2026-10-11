@@ -46,6 +46,7 @@ from p6_artifact import ArtifactError, read_artifact
 from p6_distribution import DistributionError, open_release
 from web.p6_bundle import BundleError, assemble as assemble_p6_bundle
 from web.p6_windows_bundle import WindowsClientPackage, require_client_package
+from web.quality_distribution import QualityUnavailable, recipient as quality_recipient, package as quality_package
 from web import incident_presenter as incident_presenter
 from web.incident_remote import incident_remote
 from web import incident_history as ih_outcomes
@@ -64,7 +65,7 @@ from web.remote_ingest import (INGEST_HEADERS, INGEST_MAX_BODY,
 from web.recovery import (RECOVERY_SUCCESS_MESSAGE, RecoveryGlobalGuard,
                           RecoveryRateLimiter, generate_key)
 
-MONITOR_WEB_VERSION = "0.9.1"
+MONITOR_WEB_VERSION = "0.10.0"
 SESSION_COOKIE = "monitor_session"
 MAX_BODY_BYTES = 65536
 SUPPORTED_METHODS = "GET, POST"
@@ -227,6 +228,7 @@ P6_ROUTES = {
     '/api/v1/clients/bundle': 'client.bundle',
     '/api/v1/clients/windows': 'windows.download',
     '/api/v1/clients/windows-bundle': 'windows.bundle',
+    '/api/v1/clients/quality-bundle': 'quality.bundle',
 }
 P6_ERROR_HTTP = {
     'E_P6_SCHEMA': 400, 'E_P6_NOT_ENROLLED': 404, 'E_P6_REVOKED': 409,
@@ -236,7 +238,7 @@ P6_ERROR_HTTP = {
     'E_P6_CONFIRM_PENDING': 503, 'E_P6_CAPACITY': 507, 'E_P6_BUSY': 423,
     'E_P6_AUTHORITY': 503, 'E_P6_STATE': 503, 'E_P6_REGISTRY': 503,
     'E_P6_ARTIFACT': 503, 'E_P6_UNAVAILABLE': 503, 'E_AUDIT_UNAVAILABLE': 503,
-    'E_P6_BUNDLE': 502, 'E_P6_WINDOWS_UNAVAILABLE': 503,
+    'E_P6_BUNDLE': 502, 'E_P6_WINDOWS_UNAVAILABLE': 503, 'E_QUALITY_UNAVAILABLE': 503,
 }
 
 # ---------------------------------------------------------------- M2 adapter --
@@ -521,6 +523,7 @@ class MonitorWebApp:
         self.e3_broker = e3_broker
         self.bundle_artifact = bundle_artifact or read_artifact
         self.windows_distribution = windows_distribution or open_release
+        self.quality_distribution = quality_recipient
         self.bundle_slots = threading.BoundedSemaphore(2)
         self._static_cache = {}
 
@@ -2269,6 +2272,9 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         return public
 
     def _handle_p6_request(self, session, op, actor):
+        if op == 'quality.bundle':
+            self._handle_quality_bundle(actor)
+            return
         if op == 'windows.bundle':
             self._handle_windows_client_bundle(actor)
             return
@@ -2377,6 +2383,61 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         finally:
             if slot:
                 self.app.bundle_slots.release()
+
+    def _handle_quality_bundle(self, actor):
+        body = self._json_body()
+        if (type(body) is not dict or set(body) != {'name','device'} or any(
+                type(body[k]) is not str or not E3_NAME_RE.fullmatch(body[k]) for k in ('name','device'))
+                or body['name'] == E3_RESERVED_NAME or self.headers.get(IDEMPOTENCY_HEADER) is not None):
+            self._p6_failure('E_P6_SCHEMA'); return
+        broker = self.app.e3_broker
+        if broker is None:
+            self._e3_unavailable(); return
+        if not self.app.bundle_slots.acquire(blocking=False):
+            self._send_json(429, {'ok':False,'code':'bundle_busy','error':'try again later'}); return
+        output, started = None, False
+        deadline = time.monotonic() + 60
+        try:
+            broker.require_export_ready()
+            # Root publication and exact device preparation precede credential RPC.
+            with self.app.quality_distribution(body['name'],body['device']) as (software,pair,notices):
+                verdict = broker.p6_request('client.bundle',body,actor=actor)
+                if verdict.get('ok') is not True:
+                    error = verdict.get('error')
+                    self._p6_failure(error.get('code') if type(error) is dict else 'E_P6_UNAVAILABLE'); return
+                parts = verdict.get('data')
+                if type(parts) is not dict or parts.get('format') != 'p6-client-bundle-parts/1':
+                    raise QualityUnavailable()
+                output,size = quality_package(software,pair,parts['yaml'],notices)
+            if time.monotonic() >= deadline: raise QualityUnavailable()
+            self.send_response(200)
+            self.send_header('Content-Type','application/zip')
+            self.send_header('Content-Disposition','attachment; filename="%s-%s-quality.zip"' % (body['name'],body['device']))
+            self.send_header('Content-Length',str(size))
+            self.send_header('Cache-Control','no-store, no-cache, must-revalidate')
+            self.send_header('Pragma','no-cache')
+            self.send_header('Expires','0')
+            for key,value in SECURITY_HEADERS: self.send_header(key,value)
+            self.connection.settimeout(10); self.end_headers(); started = True
+            while True:
+                raw = output.read(65536)
+                if not raw: break
+                if time.monotonic() >= deadline: raise TimeoutError()
+                self.wfile.write(raw)
+        except BrokerUnavailable:
+            self._e3_unavailable('fresh management gate not satisfied; quality package not dispatched')
+        except RpcTransportError as error:
+            if error.stage == 'connect': self._e3_unavailable()
+            else: self._send_json(504,{'ok':False,'code':'result_unknown','error':'retry explicitly','uncertain':True,'retriable':True})
+        except (QualityUnavailable,ValueError,KeyError,TypeError,AttributeError):
+            if started: self.close_connection = True
+            else: self._p6_failure('E_QUALITY_UNAVAILABLE')
+        except OSError:
+            if started: self.close_connection = True
+            else: self._p6_failure('E_QUALITY_UNAVAILABLE')
+        finally:
+            if output is not None: output.close()
+            self.app.bundle_slots.release()
 
     def _handle_windows_client_bundle(self, actor):
         # Same session/CSRF/origin spine as other private exports. Software

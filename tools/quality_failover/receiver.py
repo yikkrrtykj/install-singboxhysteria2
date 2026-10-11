@@ -1,4 +1,5 @@
 """Controlled-VPS HTTPS upload sink. Never part of Monitor, no payload persistence."""
+from collections import deque
 import hashlib
 import hmac
 import json
@@ -17,11 +18,19 @@ class Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address, token, context=None, minute_bytes=2 * MAX_BODY):
+    def __init__(self, address, token, context=None, minute_bytes=2 * MAX_BODY, *, accounts=None):
         if type(token) is not str or not token.isascii() or not token.isalnum() or not 32 <= len(token) <= 128:
             raise ValueError("token")
         self.address_family = socket.AF_INET6 if ":" in address[0] else socket.AF_INET
         self.token, self.context = token, context
+        self.accounts = accounts
+        if accounts is not None:
+            if (type(accounts) is not dict or not 1 <= len(accounts) <= 3
+                    or any(not re.fullmatch(r"[0-9a-f]{64}", k) or not re.fullmatch(r"[0-9a-f]{64}", v) for k,v in accounts.items())
+                    or len(set(accounts.values())) > 2):
+                raise ValueError("accounts")
+        self.account_gates = {account: threading.BoundedSemaphore(1) for account in set((accounts or {}).values())}
+        self.records = deque()
         self.gate = threading.BoundedSemaphore(2)
         self.budget_lock = threading.Lock()
         self.minute_start, self.minute_used = time.monotonic(), 0
@@ -52,14 +61,29 @@ class Server(ThreadingHTTPServer):
     def handle_error(self, request, address):
         pass
 
-    def reserve(self, size):
+    def authorize(self, authorization):
+        if type(authorization) is not str or not authorization.startswith("Bearer "):
+            return None
+        token = authorization[7:]
+        if self.accounts is None:
+            return "legacy" if hmac.compare_digest(token, self.token) else None
+        if not re.fullmatch(r"[0-9a-f]{64}", token):
+            return None
+        return self.accounts.get(hashlib.sha256(token.encode("ascii")).hexdigest())
+
+    def reserve(self, size, account="legacy"):
+        if size == 0:
+            return True
         with self.budget_lock:
             now = time.monotonic()
-            if now - self.minute_start >= 60:
-                self.minute_start, self.minute_used = now, 0
-            if self.minute_used + size > self.minute_bytes:
+            while self.records and now - self.records[0][0] >= 60:
+                self.records.popleft()
+            total = sum(row[1] for row in self.records)
+            used = sum(row[1] for row in self.records if row[2] == account)
+            if total + size > self.minute_bytes or (self.accounts is not None and used + size > 2097152):
                 return False
-            self.minute_used += size
+            self.records.append((now,size,account))
+            self.minute_used = total + size
             return True
 
 
@@ -67,6 +91,7 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"
 
     def setup(self):
+        self.account_gate = None
         self.request.settimeout(2)
         super().setup()
         def abort():
@@ -83,6 +108,9 @@ class Handler(BaseHTTPRequestHandler):
             super().finish()
         finally:
             self.deadline_timer.cancel()
+            if self.account_gate is not None:
+                self.account_gate.release()
+                self.account_gate = None
 
     def log_message(self, *args):
         pass
@@ -98,8 +126,7 @@ class Handler(BaseHTTPRequestHandler):
         if (self.path != "/quality-v1/" + ("upload" if upload else "ready")
                 or len(self.headers.get_all("Authorization", [])) != 1
                 or not self.headers.get("Authorization", "").isascii()
-                or not hmac.compare_digest(self.headers.get("Authorization", ""),
-                                            "Bearer " + self.server.token)
+                or self.server.authorize(self.headers.get("Authorization", "")) is None
                 or self.headers.get("Transfer-Encoding") is not None
                 or len(self.headers.get_all("Content-Length", [])) != 1
                 or len(self.headers.get_all("X-Probe-Nonce", [])) != 1):
@@ -116,7 +143,14 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             self.send_error(400)
             return None
-        if not self.server.reserve(size):
+        account = self.server.authorize(self.headers["Authorization"])
+        if upload and self.server.accounts is not None:
+            gate = self.server.account_gates[account]
+            if not gate.acquire(blocking=False):
+                self.send_error(429)
+                return None
+            self.account_gate = gate
+        if not self.server.reserve(size, account):
             self.send_error(429)
             return None
         return nonce, size

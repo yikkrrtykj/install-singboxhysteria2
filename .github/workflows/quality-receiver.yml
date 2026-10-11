@@ -26,6 +26,8 @@ jobs:
           subprocess.run([sys.executable, '-B', 'tests/test_quality_failover.py'], check=True)
           subprocess.run([sys.executable, '-B', 'tests/test_quality_receiver_update.py'], check=True)
           subprocess.run([sys.executable, '-B', 'tests/test_quality_desktop.py'], check=True)
+          subprocess.run([sys.executable, '-B', 'tests/test_quality_daily.py'], check=True)
+          subprocess.run([sys.executable, '-B', 'tests/test_quality_rollout.py'], check=True)
       - name: Python syntax
         run: python -m py_compile tools/quality-receiver-service.py tools/quality_failover/persistent.py tests/quality-receiver-systemd-lab.py
   systemd-credentials:
@@ -34,6 +36,12 @@ jobs:
       - uses: actions/checkout@v4
       - name: Isolated service and renewal with real systemd credentials
         run: sudo python3 -B tests/quality-receiver-systemd-lab.py
+      - name: Quality download publication and authenticated HTTP
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq openssl
+          getent group sboxweb || sudo groupadd --system sboxweb
+          sudo python3 -B tests/remote-production/test_quality_distribution_linux.py
       - name: Installer syntax
         run: bash -n tools/quality-receiver/install.sh
 
