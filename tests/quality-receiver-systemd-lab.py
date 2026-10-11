@@ -11,7 +11,7 @@ import time
 
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'tools'))
-from quality_failover import persistent
+from quality_failover import persistent, fleet
 
 
 def main():
@@ -28,7 +28,7 @@ def main():
         code=root/'code';(code/'quality_failover').mkdir(parents=True,mode=0o755)
         code.chmod(0o755)
         for relative in ('quality-receiver-service.py','quality_failover/__init__.py','quality_failover/persistent.py',
-                         'quality_failover/receiver.py','quality_failover/transport.py','quality_failover/policy.py'):
+                         'quality_failover/fleet.py','quality_failover/receiver.py','quality_failover/transport.py','quality_failover/policy.py'):
             destination=code/relative;shutil.copyfile(ROOT/'tools'/relative,destination);destination.chmod(0o644)
         module=code/'quality_failover/persistent.py'
         module.write_text(module.read_text('utf-8').replace(persistent.SERVICE,name),'utf-8')
@@ -64,6 +64,12 @@ def main():
             subprocess.run(['journalctl','-u',name,'-n','8','--no-pager','-o','cat'],check=False)
             raise ValueError('credential_service_readiness')
         verify_started()
+        updated,pairs=fleet.prepare(state,[{'name':'event','device':'one'},{'name':'event','device':'two'}])
+        fleet.activate(state,updated)
+        subprocess.run(['systemctl','restart',name],check=True)
+        verify_started()
+        assert persistent.config(state)['v']==2
+        assert len(set(persistent.config(state)['accounts'].values()))==2
         assert subprocess.check_output(['systemctl','show',name,'-p','DynamicUser','--value'],text=True).strip()=='yes'
         assert not (Path('/run/credentials')/name/'authority-key.pem').exists()
         assert persistent.renew(state,force=True)['renewed']

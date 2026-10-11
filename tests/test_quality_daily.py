@@ -126,11 +126,14 @@ class BundleTests(unittest.TestCase):
                     path = daily.prepare_bundle(root / "private", a, "event", info, home, b)
                     meta, config = daily.load_bundle(path, home)
                 text = (path.parent / meta["profile"]).read_text("utf-8")
-                self.assertIn("    default-selected: 质量自动选择", text)
+                self.assertNotIn("  - name: 手动选择", text)
+                self.assertNotIn("  - name: 节点选择", text)
                 self.assertNotIn("  - name: 自动选择\n", text)
                 self.assertNotIn("  - name: quality-profile-", text)
                 self.assertIn("    interval: 60", text)
-                self.assertIn("手动选择 · " + meta["marker"].removeprefix("quality-profile-"), text)
+                self.assertIn(daily.identity_ua(meta["marker"]), text)
+                self.assertEqual(meta["v"], 2)
+                self.assertIn("MATCH,质量自动选择", text)
                 self.assertEqual(text.count("    hop-interval: 30"), 2 if dual else 1)
                 self.assertFalse(config["control_enabled"])
                 saved = (path.parent / "client.json").read_text("utf-8")
@@ -166,10 +169,10 @@ class BundleTests(unittest.TestCase):
             self.assertEqual((root / "important").read_text(), "keep")
 
     def test_bundle_profile_or_certificate_edit_refused(self):
-        for target in ("event-quality.yaml", "receiver-ca.pem"):
+        for target in ("profile", "receiver-ca.pem"):
             with self.subTest(target=target), tempfile.TemporaryDirectory() as directory:
                 path, home, *_ = self.build(Path(directory))
-                (path.parent / target).write_bytes(b"changed")
+                (path.parent / (json.loads(path.read_bytes())["profile"] if target == "profile" else target)).write_bytes(b"changed")
                 with patch("quality_failover.transport.ssl.create_default_context"), self.assertRaises(ValueError):
                     daily.load_bundle(path, home)
 
@@ -216,6 +219,54 @@ class BundleTests(unittest.TestCase):
     def test_error_text_never_echoes_sensitive_exception_payload(self):
         self.assertEqual(daily.error_code(ValueError("synthetic-private-token")), "operation_unavailable")
         self.assertEqual(daily.error_code(OSError("synthetic-private-token")), "operation_unavailable")
+
+
+class RecipientIdentityTests(unittest.TestCase):
+    def request(self, ua=None, mode="global", selected=GROUP, rules=None):
+        values = dict(topology())
+        for key in (AUTO, OUTER, MARKER): values.pop(key)
+        values["GLOBAL"]["now"] = selected
+        def call(method, path, payload=None):
+            if path == "/configs": return {"mode": mode, "global-ua": daily.identity_ua(MARKER) if ua is None else ua}
+            if path == "/proxies": return {"proxies": values}
+            if path == "/rules": return {"rules": rules if rules is not None else [
+                {"type": "GeoIP", "payload": "lan", "proxy": "DIRECT"},
+                {"type": "GeoIP", "payload": "cn", "proxy": "DIRECT"},
+                {"type": "Match", "payload": "", "proxy": GROUP}]}
+            return {}
+        return call
+
+    def controller(self):
+        return daily.IdentifiedController("http://127.0.0.1:19091", "test-only-secret", MARKER, NODES[:2], recipient=True)
+
+    def test_invisible_identity_and_selected_group_allow_only_quality_write(self):
+        for mode in ("global", "rule"):
+            c = self.controller()
+            with patch.object(c, "request", side_effect=self.request(mode=mode)) as req:
+                self.assertTrue(c.select("Hysteria2", daily.DailyOwnership(NODES[:2])))
+                writes = [call for call in req.call_args_list if call.args[0] != "GET"]
+                self.assertEqual(len(writes), 1)
+                self.assertIn(GROUP, __import__('urllib.parse', fromlist=['unquote']).unquote(writes[0].args[1]))
+
+    def test_foreign_identity_changed_rules_and_manual_global_selection_refuse(self):
+        for kwargs in ({"ua": "foreign"}, {"mode": "rule", "rules": []}, {"selected": "Reality"}):
+            c = self.controller()
+            with patch.object(c, "request", side_effect=self.request(**kwargs)) as req:
+                try: self.assertFalse(c.select("Hysteria2", daily.DailyOwnership(NODES[:2])))
+                except ValueError: pass
+                self.assertTrue(all(call.args[0] == "GET" for call in req.call_args_list))
+
+    def test_identity_change_between_reads_refuses(self):
+        c = self.controller(); base = self.request(); reads = [0]
+        def changing(method,path,payload=None):
+            value = base(method,path,payload)
+            if path == "/configs":
+                reads[0] += 1
+                if reads[0] == 2: value["global-ua"] = "foreign"
+            return value
+        with patch.object(c, "request", side_effect=changing) as req:
+            with self.assertRaises(ValueError): c.select("Hysteria2", daily.DailyOwnership(NODES[:2]))
+            self.assertTrue(all(call.args[0] == "GET" for call in req.call_args_list))
 
 
 class IdentityTests(unittest.TestCase):
@@ -442,13 +493,16 @@ class HandoffTests(unittest.TestCase):
             bundle,home,*_=BundleTests().build(root)
             meta=json.loads(bundle.read_bytes())
             values=topology()
-            values[meta['marker']]=values.pop(MARKER)
+            values.pop(MARKER)
+            values.pop(AUTO)
+            values.pop(OUTER)
             values[GROUP]['fixed']=fixed
             values[GROUP]['now']=fixed if now is None and fixed else (now or 'Reality')
             calls=[]
             handler=api(values)
             def request(method,path,payload=None):
                 calls.append(method)
+                if path == '/configs': return {'mode':'global','global-ua':daily.identity_ua(meta['marker'])}
                 return handler(method,path,payload)
             session=daily.Session(bundle,home)
             try:

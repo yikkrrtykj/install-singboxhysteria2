@@ -71,13 +71,18 @@ def private_write(path, data):
 def config(root):
     root = root_check(root)
     value = decode_json(checked_file(root / "receiver.json"))
-    if (type(value) is not dict or set(value) != {"v","address","port","token","minute_bytes"}
-            or type(value["v"]) is not int or value["v"] != 1
+    if (type(value) is not dict or set(value) not in ({"v","address","port","token","minute_bytes"}, {"v","address","port","token","minute_bytes","accounts"})
+            or type(value["v"]) is not int or value["v"] not in (1, 2)
             or type(value["port"]) is not int or not 1024 <= value["port"] <= 65535
             or type(value["token"]) is not str or len(value["token"]) != 64
             or any(c not in "0123456789abcdef" for c in value["token"])
             or type(value["minute_bytes"]) is not int or not 32768 <= value["minute_bytes"] <= 4 * 1024 * 1024):
         raise ValueError("receiver_config")
+    if (value["v"] == 2) != ("accounts" in value):
+        raise ValueError("receiver_config")
+    if value["v"] == 2:
+        from .fleet import validate_accounts
+        validate_accounts(value["accounts"], value["token"])
     address = ipaddress.ip_address(value["address"])
     if address.is_unspecified or address.is_multicast:
         raise ValueError("receiver_address")
@@ -216,7 +221,7 @@ def serve(credentials, openssl="openssl"):
     root=root_check(credentials); value=config(root)
     context=validate_leaf(root,root / "server-cert.pem",openssl)
     listen="::" if ":" in value["address"] else "0.0.0.0"
-    with Server((listen,value["port"]),value["token"],context,value["minute_bytes"]) as server:
+    with Server((listen,value["port"]),value["token"],context,value["minute_bytes"], accounts=value.get("accounts")) as server:
         print('{"receiver":"ready","mode":"persistent"}',flush=True)
         server.serve_forever()
 
