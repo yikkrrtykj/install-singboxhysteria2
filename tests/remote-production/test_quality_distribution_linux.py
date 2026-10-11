@@ -96,7 +96,7 @@ class QualityDownloadTests(BundleLinuxTests):
         old=exe.read_bytes();exe.write_bytes(b'tampered')
         self.assertEqual(self.download()[0],503);self.assertNotIn('client.bundle',self.calls)
         exe.write_bytes(old)
-        result=self.call_worker('probe.revoke',name='event-pc',device='laptop-01',idempotency_key='quality-revoke-0001')
+        result=self.call_worker('probe.revoke',name='event-pc',device='laptop-01')
         self.assertTrue(result['ok'],result)
         self.assertNotEqual(self.download()[0],200)
 

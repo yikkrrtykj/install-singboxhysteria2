@@ -82,8 +82,10 @@ def publish(input_directory, bindings, *, root=distribution.ROOT, state='/etc/si
         # Input must come from the local Windows signature-gated publication builder.
         # Linux verifies exact bytes and root authority; it does not claim Authenticode validation.
         meta=distribution.object_json(distribution.read(source/'software.json',16384))
-        if set(meta)!={'v','publisher','software','notices'} or meta['v']!=1 or meta['publisher']!=distribution.PUBLISHER:
+        if set(meta)!={'v','publisher','software','notices'} or type(meta['v']) is not int or meta['v']!=1 or meta['publisher']!=distribution.PUBLISHER:
             raise ValueError('software')
+        distribution.record_checked(meta['software'],16*1024*1024)
+        distribution.record_checked(meta['notices'],65536)
         exe=distribution.read(source/'quality.exe',16*1024*1024)
         notices=distribution.read(source/'notices.txt',65536)
         if record(exe)!=meta['software'] or record(notices)!=meta['notices']:raise ValueError('software')

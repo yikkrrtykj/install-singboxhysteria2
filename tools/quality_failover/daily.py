@@ -282,7 +282,7 @@ def prepare_bundle(workspace, profile_path, name, info_path, home, backup_path=N
                   for index, node in enumerate(nodes)]}
     client(config)
     cli = module("mihomo-quality-failover.py", "daily_cli")
-    output = directory / (name + "-quality.yaml")
+    output = directory / (name + "-quality-" + marker[-8:] + ".yaml")
     cli.prepare(name, str(source), str(backup_path) if backup_path else None, str(output), config)
     raw = output.read_bytes()
     # Verge displays hidden groups. Store identity in the global user agent
@@ -323,7 +323,8 @@ def load_bundle(path, home):
             or type(meta["v"]) is not int or meta["v"] not in (1, 2) or type(meta["marker"]) is not str
             or not re.fullmatch(r"quality-profile-[0-9a-f]{32}", meta["marker"])
             or type(meta["name"]) is not str or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,31}", meta["name"])
-            or meta["profile"] != meta["name"] + "-quality.yaml"
+            or meta["profile"] != (meta["name"] + "-quality.yaml" if meta["v"] == 1
+                                   else meta["name"] + "-quality-" + meta["marker"][-8:] + ".yaml")
             or meta["nodes"] not in (list(NODES[:2]), list(NODES))):
         raise ValueError("bundle")
     profile, ca = path.parent / meta["profile"], path.parent / "receiver-ca.pem"

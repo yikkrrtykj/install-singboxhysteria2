@@ -32,6 +32,7 @@ def show(workspace, home, primary, info):
     for node in NODES[:2]:
         table.insert("", "end", iid=node, values=(node, "等待检查", "开启后自动检查"))
     bundle, session, busy, closing = [None], [None], [False], [False]
+    profile_name = [None]
     enable_requested, enable_sent, notice = [False], [False], [None]
     deadline = [0.0]
     restart_after_stop = [False]
@@ -42,6 +43,7 @@ def show(workspace, home, primary, info):
             if meta.get("v") != 2:
                 continue
             bundle[0] = candidate
+            profile_name[0] = meta["profile"]
             break
         except Exception:
             continue
@@ -74,7 +76,8 @@ def show(workspace, home, primary, info):
             def prepare():
                 try:
                     path = prepare_bundle(workspace, primary, Path(primary).name[:-len("-mihomo.yaml")], info, home)
-                    emit({"action": "prepared", "path": str(path)})
+                    meta, _ = load_bundle(path, home)
+                    emit({"action": "prepared", "path": str(path), "profile": meta["profile"]})
                 except Exception as exception:
                     emit({"action": "failed", "reason": error_code(exception)})
             threading.Thread(target=prepare, daemon=False).start()
@@ -135,7 +138,7 @@ def show(workspace, home, primary, info):
     ttk.Button(frame, text="关闭", command=close).pack(anchor="e", pady=(8, 0))
 
     def import_hint():
-        status.set("首次使用：打开配置文件夹，把其中的“" + Path(primary).name.replace("-mihomo.yaml", "-quality.yaml") +
+        status.set("首次使用：打开配置文件夹，把其中的“" + (profile_name[0] or "本窗口生成的配置") +
                    "”导入 Clash 并启用。在 Clash 选“质量自动选择”，然后回来点“开启质量切换”。")
 
     def poll():
@@ -145,6 +148,7 @@ def show(workspace, home, primary, info):
                 action = value.get("action")
                 if action == "prepared":
                     bundle[0] = Path(value["path"])
+                    profile_name[0] = value["profile"]
                     busy[0] = False
                     start_button.configure(state="normal")
                     import_hint()
