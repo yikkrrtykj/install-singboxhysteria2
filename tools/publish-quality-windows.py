@@ -11,6 +11,8 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
+import ssl
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT/'monitor-v2'),str(ROOT/'tools')]
@@ -33,6 +35,17 @@ def write(path,raw,mode=0o644,gid=0):
         with os.fdopen(fd,'wb',closefd=False) as stream:
             stream.write(raw);stream.flush();os.fsync(stream.fileno())
     finally:os.close(fd)
+
+
+def wait_receiver_ready(state):
+    """systemd active precedes socket readiness; never bypass TLS/auth checks."""
+    deadline=time.monotonic()+10
+    while True:
+        try:return persistent.check(state)
+        except ssl.SSLError:raise
+        except OSError:
+            if time.monotonic()>=deadline:raise
+            time.sleep(.5)
 
 
 def active_bindings(bindings, path='/var/lib/sbox-cm/p6/devices.json'):
@@ -121,7 +134,7 @@ def publish(input_directory, bindings, *, root=distribution.ROOT, state='/etc/si
                 subprocess.run(['systemctl','restart',persistent.SERVICE],check=True,timeout=30,
                                stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
             else:restart()
-            persistent.check(state)
+            wait_receiver_ready(state)
             pointer(canonical({'v':1,'release':release}))
             for pair in pairs.values():
                 with distribution.recipient(pair['name'],pair['device'],str(root)):pass
@@ -145,8 +158,10 @@ def main():
     try:
         bindings=distribution.object_json(persistent.checked_file(args.bindings,16384))
         print(json.dumps(publish(args.input,bindings)))
-    except Exception:
-        print('[FAIL] Quality publication incomplete; private values not displayed',file=sys.stderr);return 1
+    except Exception as error:
+        code=type(error).__name__
+        if isinstance(error,OSError) and type(error.errno) is int:code+=':'+str(error.errno)
+        print('[FAIL] Quality publication incomplete; error_type='+code+'; private values not displayed',file=sys.stderr);return 1
     return 0
 
 
