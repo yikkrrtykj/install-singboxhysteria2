@@ -525,8 +525,6 @@ cat > "$client_config_path" << EOF || error "保存 sing-box 客户端配置失�
             "server": "$server_ip",
 ${hy_server_port_json}
             "tag": "sing-box-hysteria2",
-            "up_mbps": 300,
-            "down_mbps": 300,
             "password": "$hy_password",
             "tls": {
                 "enabled": true,
@@ -767,7 +765,7 @@ HY2_INBOUND_TAG="hy2-in"
 # lib/client-management.sh. Local repository execution sources the sibling file;
 # the historical curl/process-substitution entry point fetches the same path from
 # the selected repository ref. Tests/helpers may inject SB_CLIENT_MANAGEMENT_LIB.
-SB_CLIENT_MANAGEMENT_SHA256="7a5b11a64a80ef8c398c42129fb8492a40dc8afb451cbeb92b73466d451d5911"
+SB_CLIENT_MANAGEMENT_SHA256="52e08db43b8c94dc42a3c8eea96e8bc3c6adb64155002e82ac3dee985e3b6a53"
 
 verify_client_management_library() { # <path>
     local lib="$1" got=""
@@ -4043,8 +4041,7 @@ cat > /root/sbox/sbconfig_server.json << EOF
         "tag": "hy2-in",
         "listen": "::",
         "listen_port": $hy_port,
-        "up_mbps": 1000,
-        "down_mbps": 1000,
+        "ignore_client_bandwidth": true,
         "users": [
             {
                 "name": "legacy",

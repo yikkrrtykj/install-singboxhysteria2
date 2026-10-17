@@ -133,8 +133,6 @@ proxies:
     server: $server
 $hyports
     password: $password
-    up: "300 Mbps"
-    down: "300 Mbps"
     sni: www.example.com
     skip-cert-verify: true
     alpn:

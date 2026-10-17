@@ -245,10 +245,9 @@ HISTERIA2_HEAD = (
     _field("    port: ", is_port, "port"),
 )
 
+LEGACY_BANDWIDTH_LINES = ('    up: "300 Mbps"', '    down: "300 Mbps"')
+
 HISTERIA2_TAIL = (
-    _field("    password: ", PASSWORD_RE.match, "password"),
-    _literal('    up: "300 Mbps"'),
-    _literal('    down: "300 Mbps"'),
     _field("    sni: ", HOSTNAME_RE.match, "sni"),
     _literal("    skip-cert-verify: true"),
     _literal("    alpn:"),
@@ -311,7 +310,8 @@ class Profile(object):
     def block(self, which):
         if which == "reality":
             return self.lines[self.reality_at:self.reality_at + self.reality_len]
-        return self.lines[self.hysteria_at:self.hysteria_at + self.hysteria_len]
+        return [line for line in self.lines[self.hysteria_at:self.hysteria_at + self.hysteria_len]
+                if line not in LEGACY_BANDWIDTH_LINES]
 
 
 def read_export(path, fail):
@@ -410,6 +410,14 @@ def parse_proxies(profile, fail):
             raise fail()
         index += 1
 
+    index = run_spec(lines, index, (_field("    password: ", PASSWORD_RE.match, "password"),), hy_fields, fail)
+    # Accept only the exact historical defaults, or the new bandwidth-free export.
+    # Reject partial/custom declarations; remove historical defaults only in output.
+    if line_at(lines, index, fail).startswith("    up:"):
+        for expected in LEGACY_BANDWIDTH_LINES:
+            if line_at(lines, index, fail) != expected:
+                raise fail()
+            index += 1
     index = run_spec(lines, index, HISTERIA2_TAIL, hy_fields, fail)
     hysteria_len = index - hysteria_at
     if lines[index:end] != PROXY_GROUP_BLANKS:
@@ -511,9 +519,9 @@ def renamed(block, new_name):
 
 
 def build_output(primary, backup):
-    """Single mode returns the primary bytes untouched; dual mode splices."""
+    """Retain routing/credentials; omit historical default bandwidth in new files."""
     if backup is None:
-        return primary.raw
+        return "\n".join(line for line in primary.lines if line not in LEGACY_BANDWIDTH_LINES).encode("utf-8")
     lines = [GROUPS_KEY] + list(dual_groups_block()) + TRAILING_BLANKS
     proxies = []
     proxies += primary.block("reality")
@@ -611,7 +619,7 @@ def build_arg_parser():
                         help="path to the primary VPS export")
     parser.add_argument("--backup",
                         help="path to the backup VPS export; omit for "
-                             "single-VPS mode (byte-for-byte passthrough)")
+                             "single-VPS mode (historical default bandwidth omitted)")
     parser.add_argument("--output", required=True,
                         help="path to write the merged profile (0600; an "
                              "existing file is refused)")
