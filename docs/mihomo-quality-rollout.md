@@ -62,7 +62,7 @@ only the unchanged Windows signature gate can create publication input.
 Acceptance uses four complete synthetic packages (new/legacy × hopping/plain),
 ZIP extraction to Chinese paths, Windows-only PATH and isolated APPDATA and
 LOCALAPPDATA. It drives the actual child EXE's GUI buttons with targeted window
-messages; no global mouse/keyboard input or real Clash home is used. Real
+navigation keys; no global mouse/keyboard input or real Clash home is used. Real
 authenticated TLS uploads go through loopback SOCKS relays to a disposable
 receiver. A simulated local controller supplies liveness/route records and checks
 that only the dedicated quality group is written. Tests cover switching on a
@@ -84,10 +84,11 @@ No receipt or public CI artifact may contain recipient inputs or private keys.
    commit, maintenance window and devices. Retain the old signed EXE/software
    input and each old complete recipient ZIP privately.
 2. Before publication, as root create a **root-only** backup of the existing
-   publication `current.json` and `/etc/singbox-quality-receiver/receiver.json`.
+   publication `/var/lib/singbox-quality-distribution/current.json` and
+   `/etc/singbox-quality-receiver/receiver.json`.
    Preserve the old immutable release directory and record its release ID.
-   Verify the publisher's configured root in the reviewed source; do not guess
-   paths or copy private receiver keys into the software input.
+   Confirm these configured paths in the reviewed source for this deployment;
+   do not copy private receiver keys into the software input.
 3. Transfer only `quality.exe`, `software.json`, `notices.txt` from the Windows
    signature-gated builder, checking every SHA256 after transfer. Use the exact
    approved merged publisher and the existing active device bindings. Do not
@@ -116,7 +117,7 @@ recipient ZIP for clients that need the old app; do not feed a new BBR-only expo
 to the old parser.
 
 During the approved maintenance window, use the saved root-private backup and
-the deployment lock used by the publisher to restore `current.json` atomically
+the publisher lock `/var/lib/singbox-quality-distribution/.publish.lock` to restore `current.json` atomically
 to the retained old release. If `receiver.json` changed, restore its exact backup
 with its original owner/mode and restart **only Quality Receiver**, then verify
 TLS, existing device-token authentication and the old Monitor download hash.

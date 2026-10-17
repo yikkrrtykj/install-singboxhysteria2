@@ -1,6 +1,6 @@
 """External Windows acceptance fixtures. Never imported or shipped by the EXE.
 
-Only the child process's Tk buttons receive posted mouse messages. No global
+Only the child process's Tk window receives posted navigation keys. No global
 cursor/keyboard events, real Clash settings, external hosts or production tokens.
 """
 import ctypes
@@ -159,7 +159,7 @@ class ChildWindow:
     """Address only visible Tk children owned by this exact test process.
 
     Tk does not expose ttk button text through Win32. Identify the known four
-    button layout, then post client-coordinate mouse events to its HWND. Fail
+    button layout, then post Tab/Space to its own Tk HWND. Fail
     closed if that layout changes; never send input to the foreground window.
     """
     def __init__(self, process):
@@ -175,6 +175,7 @@ class ChildWindow:
         # PyInstaller onefile's parent waits for its GUI child. Both are scoped
         # to the copied executable, checked by process ancestry below.
         self.pids = {process.pid}
+        self.focus = -1  # Initial toplevel, then Treeview/start/stop/folder/close.
 
     def children(self):
         # Query only descendants of the Popen PID; do not match window titles.
@@ -215,10 +216,14 @@ class ChildWindow:
             buttons = [item for item in buttons if item[2] >= bottom - 100]
         if len(buttons) != 4:
             raise AssertionError("unexpected child button layout: " + repr(buttons))
-        close = max(buttons, key=lambda item: item[2])
-        row = sorted((item for item in buttons if item != close), key=lambda item: item[1])
-        target = {"start": row[0], "stop": row[1], "close": close}[name]
-        hwnd = target[0]
-        point = 10 | (10 << 16)
-        assert self.user.PostMessageW(hwnd, 0x0201, 1, point)
-        assert self.user.PostMessageW(hwnd, 0x0202, 0, point)
+        hwnd = max(items, key=lambda item: item[3] * item[4])[0]
+        target = {"start": 1, "stop": 2, "close": 4}[name]
+        def key(value):
+            assert self.user.PostMessageW(hwnd, 0x0100, value, 1)
+            time.sleep(.08)
+            assert self.user.PostMessageW(hwnd, 0x0101, value, 1)
+            time.sleep(.08)
+        for _ in range((target - self.focus) % 5):
+            key(9)
+        key(32)
+        self.focus = target
