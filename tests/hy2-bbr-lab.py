@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import socket
 import ssl
 import subprocess
@@ -41,7 +42,7 @@ def wait_port(number, process):
     raise AssertionError('loopback readiness timed out')
 
 
-def templates(home, binary, bash, mihomo):
+def templates(home, binary, bash, mihomo, geoip=None):
     text=(ROOT/'install.sh').read_text()
     block=re.search(r'#generate singbox server config\n(.*?\nEOF\n)',text,re.S).group(1)
     fn=text.split('show_client_configuration() {',1)[1]
@@ -86,6 +87,9 @@ def templates(home, binary, bash, mihomo):
     if (ROOT/'lib/client-management.sh').exists():
         helper+='export SB_SERVER_CONFIG='+shlex.quote(str(home/'sbconfig_server.json'))+'\nexport SB_STATE_FILE='+shlex.quote(str(home/'config'))+'\n'
         helper+='source '+shlex.quote((ROOT/'lib/client-management.sh').as_posix())+'\n'+exported_function('write_mihomo_template')
+    if geoip:
+        (home/'yaml-check').mkdir()
+        shutil.copyfile(geoip,home/'yaml-check/geoip.metadb')
     variants=[]
     for ipv6 in (False,True):
         for hopping in (False,True):
@@ -227,10 +231,10 @@ def reality_live(home,server,pair,binary):
 
 
 def main():
-    parser=argparse.ArgumentParser();parser.add_argument('--sing-box',required=True,type=Path);parser.add_argument('--mihomo',required=True,type=Path);parser.add_argument('--bash',default='bash');parser.add_argument('--legacy-sing-box',type=Path)
+    parser=argparse.ArgumentParser();parser.add_argument('--sing-box',required=True,type=Path);parser.add_argument('--mihomo',required=True,type=Path);parser.add_argument('--bash',default='bash');parser.add_argument('--legacy-sing-box',type=Path);parser.add_argument('--geoip',type=Path)
     args=parser.parse_args()
     with tempfile.TemporaryDirectory(prefix='hy2-bbr-') as temporary:
-        home=Path(temporary);server,pair,fixture=templates(home,args.sing_box.resolve(),args.bash,args.mihomo.resolve())
+        home=Path(temporary);server,pair,fixture=templates(home,args.sing_box.resolve(),args.bash,args.mihomo.resolve(),args.geoip.resolve() if args.geoip else None)
         live(home,server,pair,fixture,args.sing_box.resolve(),args.mihomo.resolve(),args.legacy_sing_box.resolve() if args.legacy_sing_box else None)
         reality_live(home,server,pair,args.sing_box.resolve())
     print('PASS: fresh server + IPv4/IPv6 and hopping exports omit fixed HY2 bandwidth; Reality unchanged')
