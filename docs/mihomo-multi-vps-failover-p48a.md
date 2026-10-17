@@ -35,8 +35,9 @@ python3 tools/mihomo-multi-vps-merge.py \
   --output  /path/event-vmix01-ha.yaml
 ```
 
-Single VPS (the existing workflow does not drift — a validated primary is
-written out byte-for-byte, it is never re-serialised):
+Single VPS (new bandwidth-free exports remain byte-identical; an exact historical
+300 Mbps pair is removed from newly generated output, without re-serialising
+other lines or changing the source file):
 
 ```sh
 python3 tools/mihomo-multi-vps-merge.py \
@@ -105,8 +106,9 @@ line between them and two before `proxy-groups`:
   `public-key` and an even-length hex `short-id`;
 - `Hysteria2`: `type: hysteria2`, the same `server` field shape, `port`,
   optionally `ports: A-B` + `hop-interval: 30` (a half pair is refused),
-  `password` (single token, 8–128 chars), `up: "300 Mbps"`,
-  `down: "300 Mbps"`, hostname `sni`, `skip-cert-verify: true`, and
+  `password` (single token, 8–128 chars), optionally the exact historical pair
+  `up: "300 Mbps"` + `down: "300 Mbps"` (neither field is emitted in new output),
+  hostname `sni`, `skip-cert-verify: true`, and
   `alpn:` with the single entry `- h3`.
 
 `proxy-groups` section — byte-identical to the accepted #42 policy (plus its
@@ -401,3 +403,8 @@ review round 1 fixes were accepted, the pre-fix and post-fix tools were run
 over the same canonical pair and their merged output compared with `cmp`: the
 bytes are identical, and single-VPS mode is still a byte-for-byte copy of the
 primary. The live lab above then ran against the post-fix merged profile.
+
+The historical R1 byte-equivalence statement above predates the HY2 BBR default.
+The only current exception is removing the exact old bandwidth pair; all other
+source lines, credentials and routing retain their previous contract. See
+[HY2 BBR defaults and migration](hysteria2-bbr.md).

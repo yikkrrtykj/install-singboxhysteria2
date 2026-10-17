@@ -619,7 +619,7 @@ def build_arg_parser():
                         help="path to the primary VPS export")
     parser.add_argument("--backup",
                         help="path to the backup VPS export; omit for "
-                             "single-VPS mode (byte-for-byte passthrough)")
+                             "single-VPS mode (historical default bandwidth omitted)")
     parser.add_argument("--output", required=True,
                         help="path to write the merged profile (0600; an "
                              "existing file is refused)")
