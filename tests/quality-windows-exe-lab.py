@@ -74,6 +74,7 @@ def gui(app, root, environment, controller, sink, hopping, full_recovery):
     source_digest = digest(app.parent / "synthetic-mihomo.yaml")
     process = subprocess.Popen([str(app)], env=environment, cwd=root, creationflags=0x08000000)
     window = ChildWindow(process)
+    bundle = None
     with ExitStack() as stack:
         try:
             until(lambda: len(window.children()) > 10, label="actual GUI opens")
@@ -106,12 +107,23 @@ def gui(app, root, environment, controller, sink, hopping, full_recovery):
             window.click("start")
             until(lambda: read_state(bundle).get("control_enabled_once"), seconds=40, label="confirmed uploads enable control")
             until(lambda: controller.fixed == "Reality", label="healthy Reality retained")
+            def ready_to_inject():
+                last = read_state(bundle).get("last", {})
+                paths = last.get("paths", {})
+                return (last.get("mode") == "control" and set(paths) == {"Reality", "Hysteria2"}
+                        and all(item.get("state") == "UP" and item.get("reason") in (
+                            "upload_confirmed_good", "quality_recovered") for item in paths.values()))
+            until(ready_to_inject, seconds=40, label="current confirmed control baseline")
             state = read_state(bundle)
             assert state["quality_confirmed_both"]
             assert all(server.upload_connections >= 2 for server in servers)
             assert sink.minute_used >= 2 * 524288
             controller.reachable["Reality"] = False
-            until(lambda: controller.fixed == "Hysteria2", seconds=15, label="actual EXE switches protocol")
+            # A transient telemetry failure invalidates quality evidence. Allow
+            # the normal 30-second probe budget/cadence to reconfirm the alternate
+            # instead of imposing a shorter, unsupported 15-second test SLA.
+            switch_wait = config["probe_interval_seconds"] + 3 * config["cycle_seconds"]
+            until(lambda: controller.fixed == "Hysteria2", seconds=switch_wait, label="actual EXE switches protocol")
             controller.reachable["Reality"] = True
             if full_recovery:
                 until(lambda: read_state(bundle).get("last", {}).get("paths", {}).get("Reality", {}).get(
@@ -130,6 +142,20 @@ def gui(app, root, environment, controller, sink, hopping, full_recovery):
             assert digest(app.parent / "synthetic-mihomo.yaml") == source_digest
             window.click("close")
             assert process.wait(timeout=15) == 0
+        except Exception:
+            # Closed, credential-free facts make CI failures diagnosable. Never
+            # dump client.json, adjacent inputs, endpoint tokens or controller secrets.
+            try:
+                state = read_state(bundle) if bundle is not None else {}
+            except (OSError, ValueError):
+                state = {}
+            last = state.get("last", {})
+            print(json.dumps({"lab_failure": True, "process_exit": process.poll(),
+                "cycles": state.get("cycles"), "confirmed_both": state.get("quality_confirmed_both"),
+                "last": {key: last[key] for key in ("action", "mode", "paths", "owned_selection", "routing_mode") if key in last},
+                "mock_fixed": controller.fixed, "mock_writes": controller.writes,
+                "mock_reachable": controller.reachable, "unexpected_requests": controller.unexpected}), flush=True)
+            raise
         finally:
             if process.poll() is None:
                 subprocess.run(["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
