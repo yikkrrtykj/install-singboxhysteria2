@@ -73,6 +73,11 @@ synthetic recipient bundle, Windows-only PATH and no PYTHONPATH/PYTHONHOME.
 `--self-check <new-report.json>` is a closed build diagnostic: it checks adjacent
 pairing, dynamically bundled code and Tk, without a workspace, sampling or any
 controller request. It never writes raw configuration into the report.
+The diagnostic also checks the embedded source commit and actual bundled parser
+and CLI SHA256 values against the build receipt. See
+[the BBR release checklist](mihomo-quality-rollout.md#bbr-compatible-windows-release-manual-approval-required)
+for the frozen new/legacy/hopping matrix, GUI and local TLS tests, signing and
+manual Monitor publication/rollback steps.
 
 The existing 9191 P6 Windows download is unchanged by this EXE builder. Uploading
 and adding a new authenticated quality-package download remain a server release
