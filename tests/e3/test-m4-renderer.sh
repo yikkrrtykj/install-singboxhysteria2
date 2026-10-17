@@ -362,6 +362,12 @@ assert_eq "$BEFORE" "$AFTER" 'the renderer modified no watched file'
 LIST_AFTER="$(ls -1 "$TMP" | sort | sha256sum | awk '{print $1}')"
 assert_eq "$LIST_BEFORE" "$LIST_AFTER" 'the renderer left no temp files behind'
 
+if grep -qE '^    (up|down):' "$A" "$C" "$D"; then
+    fail 'HY2 renderer reintroduced a fixed bandwidth declaration'
+else
+    pass 'HY2 reserved/named renderer uses bandwidth-free BBR defaults'
+fi
+
 printf '\nPASS=%d FAIL=%d SKIP=%d\n' "$PASS" "$FAIL" "$SKIP"
 [ "$FAIL" -eq 0 ] || { printf 'E3_M4_RENDERER=FAIL\n'; exit 1; }
 printf 'E3_M4_RENDERER=PASS\n'

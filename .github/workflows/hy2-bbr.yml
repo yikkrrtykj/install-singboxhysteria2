@@ -1,0 +1,40 @@
+name: HY2 BBR defaults
+on:
+  pull_request:
+  push:
+    branches: [main]
+concurrency:
+  group: hy2-bbr-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  hy2-bbr-runtime:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test-only dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y jq openssl python3-yaml
+      - name: Fetch official pinned test cores and verify SHA256
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="$RUNNER_TEMP/hy2-bbr-tools"
+          mkdir -p "$bin"
+          curl -fL --retry 3 --max-time 120 https://github.com/SagerNet/sing-box/releases/download/v1.14.3/sing-box-1.14.3-linux-amd64.tar.gz -o "$bin/server.tar.gz"
+          echo "e2bdf179c15a3652955dc44867e33ca0965c9c9b91b34267dcc5a5d639a5feee  $bin/server.tar.gz" | sha256sum -c -
+          tar -xzf "$bin/server.tar.gz" -C "$bin"
+          curl -fL --retry 3 --max-time 120 https://github.com/SagerNet/sing-box/releases/download/v1.11.15/sing-box-1.11.15-linux-amd64.tar.gz -o "$bin/client.tar.gz"
+          echo "950af37eb2d7e55dddae34a18411cd617303fd99d2dc75bc76b6dd9fcd97d9c5  $bin/client.tar.gz" | sha256sum -c -
+          tar -xzf "$bin/client.tar.gz" -C "$bin"
+          curl -fL --retry 3 --max-time 120 https://github.com/MetaCubeX/mihomo/releases/download/v1.19.31/mihomo-linux-amd64-v1.19.31.gz -o "$bin/mihomo.gz"
+          echo "d5e74bbddbdfff49a1aef7775bf5911da59f0d7196ed509a0ac914b3653dd5f1  $bin/mihomo.gz" | sha256sum -c -
+          gzip -dc "$bin/mihomo.gz" > "$bin/mihomo"
+          chmod +x "$bin/mihomo"
+          "$bin/sing-box-1.14.3-linux-amd64/sing-box" version
+          "$bin/sing-box-1.11.15-linux-amd64/sing-box" version
+          "$bin/mihomo" -v
+      - name: Generate real configs, authenticate, transfer, reject invalid credentials
+        run: |
+          python3 tests/hy2-bbr-lab.py --sing-box "$RUNNER_TEMP/hy2-bbr-tools/sing-box-1.14.3-linux-amd64/sing-box" --legacy-sing-box "$RUNNER_TEMP/hy2-bbr-tools/sing-box-1.11.15-linux-amd64/sing-box" --mihomo "$RUNNER_TEMP/hy2-bbr-tools/mihomo"
+      - name: New and legacy canonical exports
+        run: python3 -m unittest discover -s tests -p test_hy2_bbr_exports.py

@@ -64,11 +64,12 @@ def snapshot(nodes=NODES[:2]):
     return result
 
 
-def export(path, backup=False, hopping=False):
+def export(path, backup=False, hopping=False, legacy_bandwidth=False):
     server = "198.51.100.2" if backup else "203.0.113.1"
     uuid = "22222222-2222-4222-8222-222222222222" if backup else "11111111-1111-4111-8111-111111111111"
     password = "synthetic-backup-password" if backup else "synthetic-primary-password"
     hop = ["    ports: 40000-40100", "    hop-interval: 30"] if hopping else []
+    bandwidth = ['    up: "300 Mbps"', '    down: "300 Mbps"'] if legacy_bandwidth else []
     lines = list(MERGE.CANONICAL_PREFIX_LINES) + ["proxies:",
         "  - name: Reality", "    type: vless", f"    server: {server}",
         "    port: 8443", f"    uuid: {uuid}", "    network: tcp",
@@ -78,7 +79,7 @@ def export(path, backup=False, hopping=False):
         "      short-id: 0123456789abcdef", "",
         "  - name: Hysteria2", "    type: hysteria2", f"    server: {server}",
         "    port: 8444", *hop, f"    password: {password}",
-        '    up: "300 Mbps"', '    down: "300 Mbps"', "    sni: www.example.com",
+        *bandwidth, "    sni: www.example.com",
         "    skip-cert-verify: true", "    alpn:", "      - h3", "",
         "proxy-groups:", *MERGE.GROUPS_SINGLE_OUTER, "", *MERGE.GROUPS_SINGLE_AUTO,
         "", "", "rules:", "  - GEOIP,LAN,DIRECT", "  - GEOIP,CN,DIRECT",
