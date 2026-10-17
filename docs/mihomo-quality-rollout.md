@@ -72,6 +72,13 @@ a physical Python-uninstalled machine, or production traffic/capacity acceptance
 It proves the packaged program needs no Python installed on its search path.
 PR #84's separate real-core lab covers the HY2/Reality protocol change.
 
+BBR is the new-deployment default, not a guarantee of equal or higher throughput
+on every public network path. Neither lab proves the performance limit of a
+specific Internet route or establishes that prior abnormal outbound traffic is
+fixed. Treat any reported production-path slowdown as a separate measured
+observation with its client/core versions, workload, duration and counters; do
+not infer causality from TX/RX ratios or compatibility test success alone.
+
 The fixed signer remains `92E0176599764946F7E5AB332A5CEF150355BE9B` with a
 valid Authenticode signature and timestamp. If that certificate is unavailable,
 stop at the explicitly unsigned test EXE. Do not create substitute certificates,

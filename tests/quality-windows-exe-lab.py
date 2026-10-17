@@ -194,6 +194,13 @@ def accept(exe, build_receipt):
         fixture.export(yaml, legacy_bandwidth=True)
         original = yaml.read_text(encoding="utf-8")
         pair = '    up: "300 Mbps"\n    down: "300 Mbps"\n'
+        # Windows write_text would introduce CRLF. The strict parser rejects
+        # CR before it examines any bandwidth fields, masking every case below.
+        # Prove the same LF-only write/manifest pipeline accepts an unmodified
+        # canonical export before relying on its malformed-field refusals.
+        yaml.write_bytes(original.encode("utf-8"))
+        manifest(recipient)
+        check(app, root, environment, expected_source, "negative-control-valid")
         invalid = {
             "partial-up": original.replace('    down: "300 Mbps"\n', ''),
             "partial-down": original.replace('    up: "300 Mbps"\n', ''),
@@ -209,17 +216,19 @@ def accept(exe, build_receipt):
             "wrong-provenance": original.replace('  - name: Hysteria2', '  - name: Renamed'),
         }
         for label, raw in invalid.items():
-            yaml.write_text(raw, encoding="utf-8")
+            yaml.write_bytes(raw.encode("utf-8"))
+            assert b"\r" not in yaml.read_bytes(), "field test masked by noncanonical line endings"
             manifest(recipient)
             check(app, root, environment, expected_source, label, valid=False)
-        yaml.write_text(original, encoding="utf-8")
+        yaml.write_bytes(original.encode("utf-8"))
         manifest(recipient)
         yaml.write_bytes(yaml.read_bytes() + b"# changed without a new manifest\n")
         check(app, root, environment, expected_source, "stale-digest", valid=False)
         print("[PASS] frozen EXE: 11 malformed/provenance cases and stale package digest refused", flush=True)
     return {"v": 1, "exe_sha256": digest(exe), "source_commit": expected_source["source_commit"],
             "bundled_data_sha256": expected_source["bundled_data_sha256"], "cases": results,
-            "negative_cases": len(invalid) + 1, "windows_only_path": True, "production_contacted": False}
+            "negative_cases": len(invalid) + 1, "negative_control_valid": True,
+            "windows_only_path": True, "production_contacted": False}
 
 
 if __name__ == "__main__":
