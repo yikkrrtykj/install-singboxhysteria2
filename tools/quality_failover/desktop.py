@@ -93,7 +93,16 @@ def main():
         try:
             package_inputs(directory)
             phase = "bundled_modules"
-            module("mihomo-quality-failover.py", "desktop_selfcheck_cli")
+            modules = [module(name, "desktop_selfcheck_" + str(index)) for index, name in enumerate(
+                ("mihomo-multi-vps-merge.py", "mihomo-quality-failover.py"))]
+            digests = {Path(value.__file__).name: hashlib.sha256(Path(value.__file__).read_bytes()).hexdigest()
+                       for value in modules}
+            provenance = read_json(Path(modules[0].__file__).with_name("quality-build-source.json"))
+            if (set(provenance) != {"v", "source_commit", "bundled_data_sha256"}
+                    or provenance["v"] != 1 or type(provenance["source_commit"]) is not str
+                    or not re.fullmatch(r"[0-9a-f]{40}", provenance["source_commit"])
+                    or provenance["bundled_data_sha256"] != digests):
+                raise ValueError("build_provenance")
             phase = "tk_runtime"
             import tkinter as tk
             root = tk.Tk()
@@ -101,7 +110,8 @@ def main():
             root.update_idletasks()
             root.destroy()
             result = {"v": 1, "portable_package_valid": True, "tk_available": True,
-                      "frozen": bool(getattr(sys, "frozen", False)), "controller_contacted": False}
+                      "frozen": bool(getattr(sys, "frozen", False)), "controller_contacted": False,
+                      "source_commit": provenance["source_commit"], "bundled_data_sha256": digests}
             code = 0
         except Exception as exception:
             result = {"v": 1, "portable_package_valid": False, "controller_contacted": False,

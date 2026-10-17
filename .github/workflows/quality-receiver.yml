@@ -61,6 +61,15 @@ jobs:
         shell: pwsh
         run: |
           $env:P48_TEST_OPENSSL = 'C:\Program Files\Git\usr\bin\openssl.exe'
-          python -B tests/quality-windows-exe-lab.py --exe 'quality-build/software/质量切换.exe'
+          python -B tests/quality-windows-exe-lab.py --exe 'quality-build/software/质量切换.exe' --build-receipt quality-build/build.json --report quality-build/acceptance.json
+      - name: Keep unsigned build and acceptance receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-windows-test-receipts
+          path: |
+            quality-build/build.json
+            quality-build/acceptance.json
+          if-no-files-found: warn
       - name: Recipient and user-start contracts
         run: python -B tests/test_quality_desktop.py

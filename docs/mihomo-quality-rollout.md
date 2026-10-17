@@ -22,3 +22,105 @@ This is **two prepared devices maximum**, not a fleet deployment. Each has 2 MiB
 The old operator token remains a compatibility alias of the first operator device and shares that device's quota. It is not distributed to coworkers. To cancel a coworker's quality-test access, republish with that coworker removed; the receiver reload drops their token. Canceling the Monitor evidence-upload permission alone does not revoke a previously downloaded quality-test token: these are distinct services. Removing the legacy operator requires an explicit compatibility-token migration, so this publisher refuses that operation.
 
 The two-device quota is admission isolation, not a promise that this VPS always has enough bandwidth. Receiver overload, 429 responses and missing receipts are UNKNOWN, never direct throughput-failure evidence. Real application usage by one additional person and the VPS's measured capacity remain deployment acceptance steps. More users need a separate capacity increase and validation. Multi-VPS failover under issue #48 still requires an independently hosted backup VPS.
+
+## BBR-compatible Windows release (manual approval required)
+
+The compatibility build depends on PR #84, starting at
+`efa4440bb0cc6da453d245c2cc20037315faf015`. Do not build this release from the
+older main branch. Review the dependent EXE PR and #84 together; merge order is
+#84 first, then the EXE PR after retargeting/rechecking its base. Neither a branch
+push nor a CI run changes the existing Monitor download or a deployed HY2 config.
+
+The existing strict canonical-export parser is reused, not replaced with a
+general YAML loader. Complete administrator exports may omit HY2 bandwidth or
+contain the exact historical paired `up/down: "300 Mbps"` lines. Both support
+port hopping. Partial, custom, duplicate or malformed declarations remain errors.
+Newly generated quality profiles always omit both bandwidth declarations, while
+the input export, Reality credentials, HY2 password/SNI, hopping and routing rules
+are preserved. Arbitrary hand-written YAML fragments are not complete packages.
+
+### Build and accept before transferring anything
+
+On the authorized Windows build machine, with the existing pinned PyInstaller
+6.22.3, use a clean committed checkout and a new output directory:
+
+```powershell
+python -B tools/build-quality-windows.py --output <new-build-directory>
+python -B tests/quality-windows-exe-lab.py --exe <new-build-directory>/software/质量切换.exe --build-receipt <new-build-directory>/build.json --report <new-unsigned-test-report.json>
+powershell.exe -NoProfile -File windows/Sign-Quality.ps1 -Executable <new-build-directory>/software/质量切换.exe
+python -B tests/quality-windows-exe-lab.py --exe <new-build-directory>/software/质量切换.exe --build-receipt <new-build-directory>/build.json --report <new-signed-test-report.json>
+python -B tools/build-quality-publication.py --exe <new-build-directory>/software/质量切换.exe --output <new-publication-input>
+```
+
+`build.json` records the exact commit and dynamically bundled module digests. The
+frozen diagnostic reads its embedded receipt and hashes the modules actually
+extracted by PyInstaller; acceptance compares them with the checkout. Signing
+changes the EXE's SHA256: retain both unsigned build and final signed acceptance
+receipts. The build receipt deliberately remains `signed:false, publishable:false`;
+only the unchanged Windows signature gate can create publication input.
+
+Acceptance uses four complete synthetic packages (new/legacy × hopping/plain),
+ZIP extraction to Chinese paths, Windows-only PATH and isolated APPDATA and
+LOCALAPPDATA. It drives the actual child EXE's GUI buttons with targeted window
+messages; no global mouse/keyboard input or real Clash home is used. Real
+authenticated TLS uploads go through loopback SOCKS relays to a disposable
+receiver. A simulated local controller supplies liveness/route records and checks
+that only the dedicated quality group is written. Tests cover switching on a
+confirmed hard failure, retaining the healthy alternative after a full recovery
+hold, and stop/restore. This does not claim to be a real Internet HY2 connection,
+a physical Python-uninstalled machine, or production traffic/capacity acceptance.
+It proves the packaged program needs no Python installed on its search path.
+PR #84's separate real-core lab covers the HY2/Reality protocol change.
+
+The fixed signer remains `92E0176599764946F7E5AB332A5CEF150355BE9B` with a
+valid Authenticode signature and timestamp. If that certificate is unavailable,
+stop at the explicitly unsigned test EXE. Do not create substitute certificates,
+change trust stores, skip the signature gate, or publish a CI-built unsigned EXE.
+No receipt or public CI artifact may contain recipient inputs or private keys.
+
+### Maintenance-window publication and acceptance
+
+1. Obtain explicit human approval for the exact signed EXE hash, merged source
+   commit, maintenance window and devices. Retain the old signed EXE/software
+   input and each old complete recipient ZIP privately.
+2. Before publication, as root create a **root-only** backup of the existing
+   publication `current.json` and `/etc/singbox-quality-receiver/receiver.json`.
+   Preserve the old immutable release directory and record its release ID.
+   Verify the publisher's configured root in the reviewed source; do not guess
+   paths or copy private receiver keys into the software input.
+3. Transfer only `quality.exe`, `software.json`, `notices.txt` from the Windows
+   signature-gated builder, checking every SHA256 after transfer. Use the exact
+   approved merged publisher and the existing active device bindings. Do not
+   rotate TLS/receiver keys or tokens as part of this software update.
+4. Run the existing root publisher from the administrator flow above. **It
+   restarts Quality Receiver even on a software update**; schedule that explicitly.
+   No Monitor restart, HY2 reinstall, live proxy edit or production deployment is
+   performed by the Windows build/acceptance process.
+5. Log in to Monitor and download the device's complete **质量切换 EXE 包** again.
+   Verify the extracted EXE's final SHA256, signer and timestamp on Windows.
+   Check the three adjacent-file digests and receiver pairing with `--self-check`.
+   Never replace just the EXE inside an old private ZIP as a substitute for
+   generating a verified complete package.
+6. On one approved non-streaming test client, keep its old export/profile and ZIP
+   for rollback, import the new generated profile, explicitly select the quality
+   group and enable it. Check both uploads, start/stop, and authorized controlled
+   failure handling before distributing more device-specific ZIPs privately.
+
+### Rollback
+
+The root publisher automatically restores its previous receiver configuration
+and publication pointer if its own activation checks fail. If later acceptance
+fails, stop the new quality app on test clients; retain their original Clash
+profile and switch back to it manually if necessary. Restore the old **complete**
+recipient ZIP for clients that need the old app; do not feed a new BBR-only export
+to the old parser.
+
+During the approved maintenance window, use the saved root-private backup and
+the deployment lock used by the publisher to restore `current.json` atomically
+to the retained old release. If `receiver.json` changed, restore its exact backup
+with its original owner/mode and restart **only Quality Receiver**, then verify
+TLS, existing device-token authentication and the old Monitor download hash.
+Do not delete old immutable releases or change keys/certificates. A failure to
+verify the old pair or receiver means stop and investigate, not regenerate tokens
+or reinstall Monitor/sing-box. None of these rollback actions run automatically
+from this PR or the local acceptance lab.
