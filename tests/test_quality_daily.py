@@ -457,6 +457,20 @@ class SessionTests(unittest.TestCase):
             self.assertTrue(end["restore_confirmed"])
             self.assertNotIn("private-exception", json.dumps(end))
 
+    def test_stopped_notification_has_completed_receipt_and_released_worker_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            session = self.setup_session(root)
+            session.lock.acquire()
+            observed = []
+            def emit(value):
+                if value.get("action") == "stopped":
+                    other = daily.WorkerLock(session.lock.path)
+                    other.acquire(); other.close()
+                    observed.append(json.loads((root / "session-end.json").read_bytes())["reason"])
+            session.loop(emit)
+            self.assertEqual(observed, ["requested"])
+
 
 class RoutingTests(unittest.TestCase):
     def controller(self):

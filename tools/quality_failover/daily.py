@@ -521,8 +521,9 @@ class Session:
             except Exception:
                 restored = False
             self.finished = True
+            final_events = []
             try:
-                callback({"v": 1, "action": "stopped", "restore_confirmed": restored})
+                self.publish({"v": 1, "action": "stopped", "restore_confirmed": restored}, final_events.append)
             finally:
                 # Separate bounded receipt survives a lock on state.json. It
                 # describes control-worker termination, not GUI process exit.
@@ -533,6 +534,10 @@ class Session:
                 try:
                     write_state(self.bundle_path.parent / "session-end.json", end)
                 except Exception:
-                    emit({"v": 1, "action": "record_unavailable"})
+                    final_events.append({"v": 1, "action": "record_unavailable"})
                 finally:
                     self.lock.close()
+            # A stopped notification may immediately start another worker.
+            # Finish all writes and release ownership before notifying the UI.
+            for event in final_events:
+                emit(event)
