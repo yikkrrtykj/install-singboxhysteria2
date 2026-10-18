@@ -18,8 +18,7 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 from quality_failover.pilot import receiver_init
-from quality_failover.receiver import Server
-from quality_windows_lab import ChildWindow, LoopbackController, SocksServer, read_state, serve, until
+from quality_windows_lab import ChildWindow, LoopbackController, SocksServer, TrackedReceiver, serve, until
 
 spec = importlib.util.spec_from_file_location("exe_export_fixture", ROOT / "tests/test_quality_failover.py")
 fixture = importlib.util.module_from_spec(spec)
@@ -28,6 +27,17 @@ spec.loader.exec_module(fixture)
 
 def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def verify_checkout(expected_commit):
+    """Reject old receipts even when their two dynamic scripts are unchanged."""
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+    if expected_commit != head:
+        raise ValueError("build receipt source_commit does not match checkout HEAD")
+    dirty = subprocess.check_output(["git", "status", "--porcelain", "--untracked-files=no"],
+                                    cwd=ROOT, text=True)
+    if dirty:
+        raise ValueError("acceptance requires a clean tracked checkout")
 
 
 def manifest(recipient):
@@ -98,24 +108,15 @@ def gui(app, root, environment, controller, sink, hopping, full_recovery):
             config = json.loads((bundle.parent / "client.json").read_text(encoding="utf-8"))
             servers = []
             for entry in config["paths"]:
-                server = serve(SocksServer(entry["listener_port"], entry["name"], controller, sink.server_port))
+                server = serve(SocksServer(entry["listener_port"], entry["name"], controller, sink))
                 servers.append(server)
                 stack.callback(server.server_close)
                 stack.callback(server.shutdown)
             time.sleep(.5)
             assert controller.writes == []
             window.click("start")
-            until(lambda: read_state(bundle).get("control_enabled_once"), seconds=40, label="confirmed uploads enable control")
-            until(lambda: controller.fixed == "Reality", label="healthy Reality retained")
-            def ready_to_inject():
-                last = read_state(bundle).get("last", {})
-                paths = last.get("paths", {})
-                return (last.get("mode") == "control" and set(paths) == {"Reality", "Hysteria2"}
-                        and all(item.get("state") == "UP" and item.get("reason") in (
-                            "upload_confirmed_good", "quality_recovered") for item in paths.values()))
-            until(ready_to_inject, seconds=40, label="current confirmed control baseline")
-            state = read_state(bundle)
-            assert state["quality_confirmed_both"]
+            until(lambda: controller.fixed == "Reality", seconds=40, label="confirmed uploads enable control")
+            assert all(sink.confirmed(node, controller.started) for node in ("Reality", "Hysteria2"))
             assert all(server.upload_connections >= 2 for server in servers)
             assert sink.minute_used >= 2 * 524288
             controller.reachable["Reality"] = False
@@ -124,17 +125,24 @@ def gui(app, root, environment, controller, sink, hopping, full_recovery):
             # instead of imposing a shorter, unsupported 15-second test SLA.
             switch_wait = config["probe_interval_seconds"] + 3 * config["cycle_seconds"]
             until(lambda: controller.fixed == "Hysteria2", seconds=switch_wait, label="actual EXE switches protocol")
+            selected_at = time.monotonic()
             controller.reachable["Reality"] = True
+            recovered_at = time.monotonic()
             if full_recovery:
-                until(lambda: read_state(bundle).get("last", {}).get("paths", {}).get("Reality", {}).get(
-                    "reason") == "quality_recovered", seconds=155, label="real 120-second recovery hold")
+                policy = config["paths"][0]["policy"]
+                def recovery_confirmed():
+                    assert controller.fixed == "Hysteria2", "healthy alternate displaced during recovery"
+                    rows = sink.uploads("Reality", recovered_at)
+                    return (sink.confirmed("Reality", recovered_at, policy["recover_mbps"], policy["recover_samples"])
+                            and rows[-1]["at"] >= selected_at + policy["hold_seconds"])
+                until(recovery_confirmed, seconds=155, label="real 120-second hold and confirmed recovery uploads")
             else:
-                cycles = read_state(bundle)["cycles"]
-                until(lambda: read_state(bundle).get("cycles", 0) >= cycles + 2, seconds=18, label="healthy choice remains sticky")
+                observations = controller.observations
+                until(lambda: controller.observations >= observations + 2 and time.monotonic() >= recovered_at + 10,
+                      seconds=20, label="healthy choice remains sticky across observation cycles")
             assert controller.fixed == "Hysteria2"
             window.click("stop")
-            until(lambda: read_state(bundle).get("stopped"), label="GUI stop completes")
-            assert read_state(bundle)["last"]["restore_confirmed"] is True
+            until(lambda: controller.fixed == "" and controller.writes[-1:] == [("DELETE", "")], label="GUI stop restores group")
             assert controller.fixed == ""
             assert controller.writes == [("PUT", "Reality"), ("PUT", "Hysteria2"), ("DELETE", "")], controller.writes
             assert not controller.unexpected, controller.unexpected
@@ -143,16 +151,11 @@ def gui(app, root, environment, controller, sink, hopping, full_recovery):
             window.click("close")
             assert process.wait(timeout=15) == 0
         except Exception:
-            # Closed, credential-free facts make CI failures diagnosable. Never
-            # dump client.json, adjacent inputs, endpoint tokens or controller secrets.
-            try:
-                state = read_state(bundle) if bundle is not None else {}
-            except (OSError, ValueError):
-                state = {}
-            last = state.get("last", {})
+            # Do not poll state.json: a Windows observer can block its writer.
+            # Observe actual API mutations/authenticated receipts, never credentials.
             print(json.dumps({"lab_failure": True, "process_exit": process.poll(),
-                "cycles": state.get("cycles"), "confirmed_both": state.get("quality_confirmed_both"),
-                "last": {key: last[key] for key in ("action", "mode", "paths", "owned_selection", "routing_mode") if key in last},
+                "observations": controller.observations,
+                "confirmed_receipts": {node: len(sink.uploads(node, controller.started)) for node in ("Reality", "Hysteria2")},
                 "mock_fixed": controller.fixed, "mock_writes": controller.writes,
                 "mock_reachable": controller.reachable, "unexpected_requests": controller.unexpected}), flush=True)
             raise
@@ -168,13 +171,14 @@ def gui(app, root, environment, controller, sink, hopping, full_recovery):
 def accept(exe, build_receipt):
     exe = Path(exe).resolve()
     expected_source = json.loads(Path(build_receipt).read_text(encoding="utf-8"))
+    verify_checkout(expected_source["source_commit"])
     assert expected_source["configuration_embedded"] is False
     for name, value in expected_source["bundled_data_sha256"].items():
         assert digest(ROOT / "tools" / name) == value, "receipt does not match test checkout"
     results = []
     with tempfile.TemporaryDirectory(prefix="quality-exe-acceptance-") as temporary, ExitStack() as stack:
         root = Path(temporary)
-        sink = Server(("127.0.0.1", 0), "a" * 64, minute_bytes=16 * 1024 * 1024)
+        sink = TrackedReceiver()
         stack.callback(sink.server_close)
         receiver_init(root / "sink", "127.0.0.1", sink.server_port, os.environ.get("P48_TEST_OPENSSL", "openssl"))
         info_file = root / "sink/receiver-info.json"
@@ -206,7 +210,7 @@ def accept(exe, build_receipt):
                     zipped.extractall(recipient)
                 app = recipient / "质量切换.exe"
                 check(app, case, environment, expected_source, "valid")
-                controller = serve(LoopbackController())
+                controller = serve(LoopbackController(sink))
                 try:
                     facts = gui(app, case, environment, controller, sink, hopping,
                                 full_recovery=legacy and hopping)
@@ -251,9 +255,11 @@ def accept(exe, build_receipt):
         yaml.write_bytes(yaml.read_bytes() + b"# changed without a new manifest\n")
         check(app, root, environment, expected_source, "stale-digest", valid=False)
         print("[PASS] frozen EXE: 11 malformed/provenance cases and stale package digest refused", flush=True)
+    verify_checkout(expected_source["source_commit"])
     return {"v": 1, "exe_sha256": digest(exe), "source_commit": expected_source["source_commit"],
             "bundled_data_sha256": expected_source["bundled_data_sha256"], "cases": results,
-            "negative_cases": len(invalid) + 1, "negative_control_valid": True,
+            "negative_cases": len(invalid) + 1, "negative_control_valid": True, "checkout_verified": True,
+            "observation": "controller_mutations_and_authenticated_upload_receipts",
             "windows_only_path": True, "production_contacted": False}
 
 

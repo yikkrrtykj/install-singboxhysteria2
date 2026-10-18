@@ -54,7 +54,13 @@ python -B tools/build-quality-publication.py --exe <new-build-directory>/softwar
 
 `build.json` records the exact commit and dynamically bundled module digests. The
 frozen diagnostic reads its embedded receipt and hashes the modules actually
-extracted by PyInstaller; acceptance compares them with the checkout. Signing
+extracted by PyInstaller; acceptance compares them with the checkout.
+Acceptance also requires the receipt commit to equal the current clean tracked
+checkout, and rechecks it before emitting success; matching parser hashes alone
+cannot accept an older EXE containing different compiled modules. The external
+Windows lab observes controller mutations and actual authenticated upload replies
+instead of polling the app's mutable state file, so the test observer cannot
+lock its atomic status replacement. Signing
 changes the EXE's SHA256: retain both unsigned build and final signed acceptance
 receipts. The build receipt deliberately remains `signed:false, publishable:false`;
 only the unchanged Windows signature gate can create publication input.

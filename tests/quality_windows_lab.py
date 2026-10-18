@@ -9,7 +9,6 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
-from pathlib import Path
 import select
 import socket
 import socketserver
@@ -19,6 +18,7 @@ import time
 from urllib.parse import quote
 
 from quality_failover.policy import GROUP, NODES
+from quality_failover.receiver import Handler, Server
 from quality_failover.transport import recv_exact
 
 
@@ -32,17 +32,41 @@ def until(predicate, seconds=30, label="condition"):
     raise AssertionError("timed out: " + label)
 
 
-def read_state(bundle):
-    try:
-        return json.loads((Path(bundle).parent / "state.json").read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return {}
+class TrackedReceiver(Server):
+    """Observe real authenticated replies without reading the app's state file."""
+    def __init__(self):
+        self.node_by_peer_port = {}
+        self.completed_uploads = []
+        self.receipt_lock = threading.Lock()
+        super().__init__(("127.0.0.1", 0), "a" * 64, minute_bytes=16 * 1024 * 1024)
+        self.RequestHandlerClass = TrackedHandler
+
+    def uploads(self, node, after):
+        with self.receipt_lock:
+            return [row for row in self.completed_uploads if row["node"] == node and row["at"] >= after]
+
+    def confirmed(self, node, after, minimum=8, count=1):
+        rows = self.uploads(node, after)
+        return len(rows) >= count and all(row["mbps"] >= minimum for row in rows[-count:])
+
+
+class TrackedHandler(Handler):
+    def reply(self, nonce, size, digest, measured_bytes=0, seconds=0):
+        node = self.server.node_by_peer_port.get(self.client_address[1])
+        super().reply(nonce, size, digest, measured_bytes, seconds)
+        if node in NODES[:2] and size == 524288 and seconds > 0:
+            with self.server.receipt_lock:
+                self.server.completed_uploads.append({"node": node, "at": time.monotonic(),
+                    "mbps": min(20, measured_bytes * 8 / seconds / 1e6)})
 
 
 class LoopbackController(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self):
+    def __init__(self, sink):
+        self.sink = sink
+        self.started = time.monotonic()
+        self.observations = 0
         self.secret = "synthetic-exe-controller-only"
         self.marker = None
         self.fixed = ""
@@ -77,9 +101,14 @@ class ControllerHandler(BaseHTTPRequestHandler):
         elif valid and self.command == "GET" and self.path == "/proxies":
             result = server.snapshot()
         elif valid and self.command == "GET" and self.path == "/connections":
+            server.observations += 1
             result = {"connections": list(server.routes.values())}
         elif valid and self.path == permitted and self.command == "PUT" and body in (
                 {"name": NODES[0]}, {"name": NODES[1]}):
+            if not server.writes and not all(server.sink.confirmed(node, server.started) for node in NODES[:2]):
+                server.unexpected.append(("selection_before_both_confirmed", self.path))
+                self.send_error(403)
+                return
             server.fixed = body["name"]
             server.writes.append(("PUT", server.fixed))
             result = {}
@@ -105,8 +134,9 @@ class SocksServer(socketserver.ThreadingTCPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, port, node, controller, receiver_port):
-        self.node, self.controller, self.receiver_port = node, controller, receiver_port
+    def __init__(self, port, node, controller, sink):
+        self.node, self.controller, self.sink = node, controller, sink
+        self.receiver_port = sink.server_port
         self.upload_connections = 0
         super().__init__(("127.0.0.1", port), SocksHandler)
 
@@ -116,6 +146,7 @@ class SocksHandler(socketserver.BaseRequestHandler):
         incoming, server = self.request, self.server
         source = self.client_address[1]
         outgoing = None
+        sink_peer = None
         try:
             deadline = time.monotonic() + 15
             if recv_exact(incoming, 3, deadline) != b"\x05\x01\x00":
@@ -126,6 +157,8 @@ class SocksHandler(socketserver.BaseRequestHandler):
             if recv_exact(incoming, 10, deadline) != expected:
                 return
             outgoing = socket.create_connection(("127.0.0.1", server.receiver_port), timeout=5)
+            sink_peer = outgoing.getsockname()[1]
+            server.sink.node_by_peer_port[sink_peer] = server.node
             index = list(NODES[:2]).index(server.node)
             server.controller.routes[source] = {"id": str(source), "upload": 0,
                 "chains": [server.node], "metadata": {
@@ -145,6 +178,8 @@ class SocksHandler(socketserver.BaseRequestHandler):
             pass
         finally:
             server.controller.routes.pop(source, None)
+            if sink_peer is not None:
+                server.sink.node_by_peer_port.pop(sink_peer, None)
             if outgoing is not None:
                 outgoing.close()
 
