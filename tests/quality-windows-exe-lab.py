@@ -84,7 +84,7 @@ def gui(app, root, environment, controller, sink, hopping, full_recovery):
     source_digest = digest(app.parent / "synthetic-mihomo.yaml")
     process = subprocess.Popen([str(app)], env=environment, cwd=root, creationflags=0x08000000)
     window = ChildWindow(process)
-    bundle = None
+    bundle, failed = None, False
     with ExitStack() as stack:
         try:
             until(lambda: len(window.children()) > 10, label="actual GUI opens")
@@ -150,7 +150,11 @@ def gui(app, root, environment, controller, sink, hopping, full_recovery):
             assert digest(app.parent / "synthetic-mihomo.yaml") == source_digest
             window.click("close")
             assert process.wait(timeout=15) == 0
+            # The writer has exited; reading its final receipt cannot interfere.
+            final_state = json.loads((bundle.parent / "state.json").read_text(encoding="utf-8"))
+            assert final_state["stopped"] and final_state["last"]["restore_confirmed"] is True
         except Exception:
+            failed = True
             # Do not poll state.json: a Windows observer can block its writer.
             # Observe actual API mutations/authenticated receipts, never credentials.
             print(json.dumps({"lab_failure": True, "process_exit": process.poll(),
@@ -164,6 +168,16 @@ def gui(app, root, environment, controller, sink, hopping, full_recovery):
                 subprocess.run(["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=0x08000000)
                 process.wait(timeout=15)
+            if failed and bundle is not None:
+                # Post-exit only. Never dump inputs, connection files or tokens.
+                try:
+                    state = json.loads((bundle.parent / "state.json").read_text(encoding="utf-8"))
+                    last = state.get("last", {})
+                    print(json.dumps({"post_exit_state": True, "cycles": state.get("cycles"),
+                        "stopped": state.get("stopped"), "last": {key: last[key] for key in (
+                            "action", "mode", "paths", "restore_confirmed", "owned_selection") if key in last}}), flush=True)
+                except (OSError, ValueError) as error:
+                    print(json.dumps({"post_exit_state_unavailable": type(error).__name__}), flush=True)
     return {"generated_without_bandwidth": True, "gui_start_stop": True, "real_tls_upload": True,
             "protocol_switch": True, "healthy_current_retained": True, "full_recovery_hold": full_recovery}
 
