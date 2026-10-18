@@ -643,8 +643,6 @@ proxies:
     server: %s
 %s
     password: %s
-    up: "300 Mbps"
-    down: "300 Mbps"
     sni: %s
     skip-cert-verify: true
     alpn:
