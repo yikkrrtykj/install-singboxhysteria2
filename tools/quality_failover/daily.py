@@ -405,6 +405,7 @@ class Session:
         self.finished = False
         self.cycles, self.confirmed_both, self.enabled_once, self.manual_seen = 0, False, False, False
         self.record_failed = False
+        self.stop_reason, self.record_error = None, None
         self.session_id, self.started_epoch = secrets.token_hex(16), round(time.time(), 3)
         self.lock = WorkerLock(self.bundle_path.parent / "worker.lock")
 
@@ -444,6 +445,7 @@ class Session:
         self.confirm_event.set()
 
     def stop(self):
+        self.stop_reason = self.stop_reason or "requested"
         self.stop_event.set()
 
     def publish(self, record, emit):
@@ -460,8 +462,17 @@ class Session:
                  "manual_override_observed": self.manual_seen, "stopped": self.finished, "last": closed}
         try:
             write_state(self.bundle_path.parent / "state.json", state)
-        except Exception:
+        except Exception as exception:
             self.record_failed = True
+            self.stop_reason = self.stop_reason or "record_unavailable"
+            if self.record_error is None:
+                # Closed diagnostics only: never persist exception text/paths.
+                self.record_error = {"kind": "PermissionError" if isinstance(exception, PermissionError)
+                                     else "OSError" if isinstance(exception, OSError) else "state_write_failed"}
+                for name in ("errno", "winerror"):
+                    value = getattr(exception, name, None)
+                    if type(value) is int and 0 <= value <= 65535:
+                        self.record_error[name] = value
             self.stop_event.set()
             emit({"v": 1, "action": "record_unavailable"})
         emit(record)
@@ -500,12 +511,28 @@ class Session:
                     self.runner.engine.update(time.monotonic(), {})
                     callback({"v": 1, "action": error_code(exception)})
                 self.stop_event.wait(max(.01, self.runner.config["cycle_seconds"] - (time.monotonic() - started)))
+        except BaseException:
+            self.stop_reason = self.stop_reason or "loop_exception"
+            raise
         finally:
             restored = not (self.runner.config["control_enabled"] and self.runner.owner.suspended)
             try:
                 self.runner.close()
             except Exception:
                 restored = False
-            self.lock.close()
             self.finished = True
-            callback({"v": 1, "action": "stopped", "restore_confirmed": restored})
+            try:
+                callback({"v": 1, "action": "stopped", "restore_confirmed": restored})
+            finally:
+                # Separate bounded receipt survives a lock on state.json. It
+                # describes control-worker termination, not GUI process exit.
+                end = {"v": 1, "session_id": self.session_id,
+                       "started_epoch": self.started_epoch, "ended_epoch": round(time.time(), 3),
+                       "reason": self.stop_reason or "stop_signal", "record_failed": self.record_failed,
+                       "record_error": self.record_error, "restore_confirmed": restored}
+                try:
+                    write_state(self.bundle_path.parent / "session-end.json", end)
+                except Exception:
+                    emit({"v": 1, "action": "record_unavailable"})
+                finally:
+                    self.lock.close()

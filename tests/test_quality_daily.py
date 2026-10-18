@@ -408,6 +408,55 @@ class SessionTests(unittest.TestCase):
             self.assertIn("record_unavailable", [row["action"] for row in messages])
             self.assertNotIn("private-token-never-echoed", json.dumps(messages))
 
+    def test_end_receipt_distinguishes_requested_stop_and_restore_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            session = self.setup_session(root, good=True)
+            session.runner.close.side_effect = OSError("private-restore-details")
+            session.loop(lambda value: None)
+            end = json.loads((root / "session-end.json").read_bytes())
+            self.assertEqual(end["reason"], "requested")
+            self.assertFalse(end["record_failed"])
+            self.assertIsNone(end["record_error"])
+            self.assertFalse(end["restore_confirmed"])
+            self.assertEqual(end["session_id"], session.session_id)
+            self.assertNotIn("private-restore-details", json.dumps(end))
+
+    def test_end_receipt_survives_state_failure_and_preserves_first_cause(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            session = self.setup_session(root, good=True)
+            session.runner.cycle.side_effect = lambda **kwargs: {"v": 1, "action": "observe"}
+            failure = PermissionError(13, "private-path-and-token")
+            failure.winerror = 32
+            original = daily.write_state
+            def write(path, value):
+                if path.name == "state.json":
+                    raise failure
+                return original(path, value)
+            with patch.object(daily, "write_state", side_effect=write):
+                session.loop(lambda value: None)
+            session.stop()  # A later GUI close cannot overwrite the cause.
+            end = json.loads((root / "session-end.json").read_bytes())
+            self.assertEqual(end["reason"], "record_unavailable")
+            self.assertTrue(end["record_failed"])
+            self.assertEqual(end["record_error"], {"kind": "PermissionError", "errno": 13, "winerror": 32})
+            self.assertTrue(end["restore_confirmed"])
+            session.runner.close.assert_called_once()
+            self.assertNotIn("private-path-and-token", json.dumps(end))
+
+    def test_end_receipt_distinguishes_worker_exception(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            session = self.setup_session(root)
+            session.runner.cycle.side_effect = KeyboardInterrupt("private-exception")
+            with self.assertRaises(KeyboardInterrupt):
+                session.loop(lambda value: None)
+            end = json.loads((root / "session-end.json").read_bytes())
+            self.assertEqual(end["reason"], "loop_exception")
+            self.assertTrue(end["restore_confirmed"])
+            self.assertNotIn("private-exception", json.dumps(end))
+
 
 class RoutingTests(unittest.TestCase):
     def controller(self):

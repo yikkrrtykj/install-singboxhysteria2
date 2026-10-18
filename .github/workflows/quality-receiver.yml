@@ -62,7 +62,7 @@ jobs:
         shell: pwsh
         run: |
           $env:P48_TEST_OPENSSL = 'C:\Program Files\Git\usr\bin\openssl.exe'
-          python -B tests/quality-windows-exe-lab.py --exe 'quality-build/software/质量切换.exe' --build-receipt quality-build/build.json --report quality-build/acceptance.json
+          python -B tests/quality-windows-exe-lab.py --exe 'quality-build/software/质量切换.exe' --build-receipt quality-build/build.json --recovery-repetitions 3 --report quality-build/acceptance.json
       - name: Keep unsigned build and acceptance receipts
         if: always()
         uses: actions/upload-artifact@v4

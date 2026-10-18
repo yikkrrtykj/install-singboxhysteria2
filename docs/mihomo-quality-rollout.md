@@ -46,9 +46,9 @@ On the authorized Windows build machine, with the existing pinned PyInstaller
 
 ```powershell
 python -B tools/build-quality-windows.py --output <new-build-directory>
-python -B tests/quality-windows-exe-lab.py --exe <new-build-directory>/software/质量切换.exe --build-receipt <new-build-directory>/build.json --report <new-unsigned-test-report.json>
+python -B tests/quality-windows-exe-lab.py --exe <new-build-directory>/software/质量切换.exe --build-receipt <new-build-directory>/build.json --recovery-repetitions 3 --report <new-unsigned-test-report.json>
 powershell.exe -NoProfile -File windows/Sign-Quality.ps1 -Executable <new-build-directory>/software/质量切换.exe
-python -B tests/quality-windows-exe-lab.py --exe <new-build-directory>/software/质量切换.exe --build-receipt <new-build-directory>/build.json --report <new-signed-test-report.json>
+python -B tests/quality-windows-exe-lab.py --exe <new-build-directory>/software/质量切换.exe --build-receipt <new-build-directory>/build.json --recovery-repetitions 3 --report <new-signed-test-report.json>
 python -B tools/build-quality-publication.py --exe <new-build-directory>/software/质量切换.exe --output <new-publication-input>
 ```
 
@@ -77,6 +77,42 @@ hold, and stop/restore. This does not claim to be a real Internet HY2 connection
 a physical Python-uninstalled machine, or production traffic/capacity acceptance.
 It proves the packaged program needs no Python installed on its search path.
 PR #84's separate real-core lab covers the HY2/Reality protocol change.
+
+### Unexplained local restore: bounded verification and release block
+
+One local run on `983ab14` recorded `PUT Reality`, `PUT Hysteria2`, then an
+unexpected `DELETE` during recovery, while the GUI process was still alive.
+There was no second `PUT Reality`: the recorded operation was group restoration,
+not an explicit protocol failback command. The original worker exit reason was
+not captured. Later success must not be described as fixing that historical event.
+
+The worker now writes a separate private, bounded `session-end.json` after
+cleanup, identifying its session, requested stop/state-record failure/exception,
+numeric OS error codes if available, and whether restoration was confirmed.
+It contains no exception text, path, proxy credentials, endpoints or tokens.
+Its purpose is diagnosis; selection policy, fail-closed state-save behavior and
+group restoration remain unchanged. A missing or mismatched end receipt leaves
+the termination unconfirmed; it is not permission to infer a clean stop.
+
+The native frozen lab records relative-time test actions and actual controller
+mutations, GUI process status before cleanup, and the worker end receipt read
+only after process exit. Three full switch/recovery/stop runs are the fixed
+verification budget (`--recovery-repetitions 3`, bounded to 1..3). They fail on an
+unrequested restore, protocol failback, premature GUI exit, record failure or
+unconfirmed restore. A separate intentional Windows state-file lock test proves
+that a state-save failure can stop the worker and restore the group while the
+GUI stays alive. It records `record_unavailable` and a numeric permission error;
+this controlled reproduction demonstrates a mechanism, not the original cause.
+On any failure the report preserves closed diagnostics, including whether the
+test itself killed the process afterward. Do not relabel that cleanup as a crash
+or rerun repeatedly until green.
+
+The unexplained historical restore remains a Review item and production release
+block until explicitly dispositioned by the reviewer/operator. New unexpected
+writes, early termination, missing receipts or contradictory results block final
+acceptance as well. Bounded successful repeats alone do not authorize merging
+this PR, signing a release or updating Monitor downloads. Human PR approval and
+production approval remain separate; no production validation occurs in this lab.
 
 BBR is the new-deployment default, not a guarantee of equal or higher throughput
 on every public network path. Neither lab proves the performance limit of a

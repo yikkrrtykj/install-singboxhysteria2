@@ -67,12 +67,17 @@ class LoopbackController(ThreadingHTTPServer):
         self.sink = sink
         self.started = time.monotonic()
         self.observations = 0
+        self.timeline, self.timeline_lock = [], threading.Lock()
         self.secret = "synthetic-exe-controller-only"
         self.marker = None
         self.fixed = ""
         self.reachable = dict.fromkeys(NODES[:2], True)
         self.routes, self.writes, self.unexpected = {}, [], []
         super().__init__(("127.0.0.1", 0), ControllerHandler)
+
+    def event(self, kind, **facts):
+        with self.timeline_lock:
+            self.timeline.append(dict(at=round(time.monotonic() - self.started, 3), kind=kind, **facts))
 
     def snapshot(self):
         rows = {name: {"type": "Vless" if index == 0 else "Hysteria2",
@@ -111,10 +116,12 @@ class ControllerHandler(BaseHTTPRequestHandler):
                 return
             server.fixed = body["name"]
             server.writes.append(("PUT", server.fixed))
+            server.event("controller_write", method="PUT", name=server.fixed)
             result = {}
         elif valid and self.path == permitted and self.command == "DELETE" and body is None:
             server.fixed = ""
             server.writes.append(("DELETE", ""))
+            server.event("controller_write", method="DELETE", name="")
             result = {}
         else:
             server.unexpected.append((self.command, self.path))

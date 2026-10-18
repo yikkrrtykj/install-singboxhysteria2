@@ -65,5 +65,30 @@ class UploadObservationTests(unittest.TestCase):
         self.assertTrue(self.sink.confirmed("Reality", 0, count=3))
 
 
+class LifecycleTests(unittest.TestCase):
+    def test_restore_before_stop_is_not_mislabelled_as_protocol_failback(self):
+        events = [{"kind": "alternate_selected"}, {"kind": "controller_write", "method": "DELETE", "name": ""}]
+        self.assertEqual(lab.lifecycle_failure(events, None), "worker_restored_before_stop")
+        events[1] = {"kind": "controller_write", "method": "PUT", "name": "Reality"}
+        self.assertEqual(lab.lifecycle_failure(events, None), "protocol_failback_before_stop")
+
+    def test_requested_restore_and_intentional_fault_are_not_unexplained_failures(self):
+        for cause in ("stop_requested", "state_write_fault_injected"):
+            events = [{"kind": "alternate_selected"}, {"kind": cause},
+                      {"kind": "controller_write", "method": "DELETE", "name": ""}, {"kind": "close_requested"}]
+            self.assertIsNone(lab.lifecycle_failure(events, 0))
+
+    def test_cleanup_kill_is_not_used_as_original_process_exit(self):
+        events = [{"kind": "test_cleanup_forced_kill"}]
+        self.assertIsNone(lab.lifecycle_failure(events, None))
+        self.assertEqual(lab.lifecycle_failure(events, 1), "gui_exited_before_close")
+
+    def test_repetition_count_is_bounded_before_any_network(self):
+        for invalid in (0, 4, True):
+            with patch.object(lab, "receiver_init") as receiver, self.assertRaises(ValueError):
+                lab.accept("not-run.exe", "not-read.json", invalid)
+            receiver.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
