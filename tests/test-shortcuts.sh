@@ -2,7 +2,7 @@
 # shellcheck disable=SC1090,SC1091,SC2034,SC2317
 set -Eeuo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-TMP=$(mktemp -d)
+TMP="$(mktemp -d)"
 trap 'rm -rf -- "$TMP"' EXIT
 # Only load the shortcut functions; the installer itself runs on import.
 source <(awk '/^remove_legacy_miaomiao_shortcut\(\) \{/,/^\}/; /^install_shortcut\(\) \{/,/^\}/; /^SB_SHORTCUT=/' "$ROOT/install.sh")
