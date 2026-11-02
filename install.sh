@@ -164,13 +164,34 @@ install_pkgs() {
 }
 # <<< host-dependencies <<< ===================================================
 
+remove_legacy_miaomiao_shortcut() {
+  local legacy_file="$SB_ROOT_DIR/mianyang.sh"
+  local legacy_link="${SB_SHORTCUT%/*}/mianyang"
+  if [ -f "$legacy_file" ] && [ ! -L "$legacy_file" ] &&
+     grep -Fq 'https://raw.githubusercontent.com/yikkrrtykj/install-singboxhysteria2/main/install.sh' "$legacy_file"; then
+    if [ -L "$legacy_link" ] && [ "$(readlink "$legacy_link")" = "$legacy_file" ]; then
+      rm -f -- "$legacy_link" || return 1
+    elif [ -e "$legacy_link" ] || [ -L "$legacy_link" ]; then
+      warning "旧 mianyang 入口不是本仓库的标准链接，已保留，请手动核对。"
+      return 0
+    fi
+    rm -f -- "$legacy_file" || return 1
+    info "本仓库管理命令已改为 miaomiao。"
+  fi
+}
+
 install_shortcut() {
-  cat > /root/sbox/mianyang.sh << EOF
+  cat > "$SB_ROOT_DIR/miaomiao.sh" << EOF
 #!/usr/bin/env bash
-bash <(curl -fsSL https://raw.githubusercontent.com/yikkrrtykj/install-singboxhysteria2/main/install.sh) \$1
+set -euo pipefail
+task_script=\$(mktemp)
+trap 'rm -f -- "\$task_script"' EXIT
+curl -fsSL --connect-timeout 15 --max-time 120 -o "\$task_script" "https://raw.githubusercontent.com/yikkrrtykj/install-singboxhysteria2/main/install.sh"
+bash "\$task_script" "\$@"
 EOF
-  chmod +x /root/sbox/mianyang.sh
-  ln -sf /root/sbox/mianyang.sh /usr/bin/mianyang
+  chmod 0700 "$SB_ROOT_DIR/miaomiao.sh" || return 1
+  ln -sf "$SB_ROOT_DIR/miaomiao.sh" "$SB_SHORTCUT" || return 1
+  remove_legacy_miaomiao_shortcut || return 1
 }
 
 reload_singbox() {
@@ -749,7 +770,7 @@ SB_CLIENTS_DIR="${SB_CLIENTS_DIR:-/root/sbox/clients}"
 SB_SING_BOX_BIN="${SB_SING_BOX_BIN:-/root/sbox/sing-box}"
 SB_LOCK_FILE="${SB_LOCK_FILE:-/root/sbox/config.lock}"
 SB_ROOT_DIR="${SB_ROOT_DIR:-$(dirname "$SB_SERVER_CONFIG")}"
-SB_SHORTCUT="${SB_SHORTCUT:-/usr/bin/mianyang}"
+SB_SHORTCUT="${SB_SHORTCUT:-/usr/bin/miaomiao}"
 SB_SYSTEMD_UNIT="${SB_SYSTEMD_UNIT:-/etc/systemd/system/sing-box.service}"
 RESERVED_CLIENT_NAME="legacy"
 # CLIENT_NAME_PATTERN lives in lib/client-management.sh together with its only
@@ -2248,7 +2269,7 @@ _upgrade_singbox_1_14_locked() {
     if [ -n "$problems" ]; then
         if grep -q '没有 name' <<<"$problems"; then
             warning "检测到旧的无名共享账号（Phase C legacy migration 尚未执行），Phase D 不自动迁移"
-            warning "请先运行: mianyang → 10 客户端管理 → 5 迁移旧客户端为 legacy，然后再升级"
+            warning "请先运行: miaomiao → 10 客户端管理 → 5 迁移旧客户端为 legacy，然后再升级"
         else
             warning "客户端身份审计未通过（先在客户端管理中修复一致性）:"
             while IFS= read -r p; do
@@ -2871,7 +2892,7 @@ _modify_singbox_locked() { # <reality_port> <hy_port> <server_name> <hy_cert> <h
 
 
 backup_current_installation() {
-    local backup_dir backup_name unit_path
+    local backup_dir backup_name unit_path shortcut
 
     backup_name="sbox-backup-$(date +%Y%m%d-%H%M%S)"
     backup_dir="/root/${backup_name}"
@@ -2884,9 +2905,11 @@ backup_current_installation() {
     elif [ -e /etc/systemd/system/sing-box.service ]; then
         cp -a /etc/systemd/system/sing-box.service "$backup_dir/sing-box.service.source"
     fi
-    if [ -e /usr/bin/mianyang ] || [ -L /usr/bin/mianyang ]; then
-        cp -a --no-dereference /usr/bin/mianyang "$backup_dir/usr-bin-mianyang"
-    fi
+    for shortcut in "$SB_SHORTCUT" "${SB_SHORTCUT%/*}/mianyang"; do
+        if [ -e "$shortcut" ] || [ -L "$shortcut" ]; then
+            cp -a --no-dereference "$shortcut" "$backup_dir/usr-bin-${shortcut##*/}" || return 1
+        fi
+    done
     systemctl cat sing-box > "$backup_dir/sing-box.unit.txt" 2>&1 || true
     systemctl show sing-box -p LoadState -p ActiveState -p FragmentPath -p MainPID > "$backup_dir/sing-box.state.txt" 2>&1 || true
     ps -ef | grep '[s]ing-box' > "$backup_dir/sing-box.process.txt" 2>&1 || true
@@ -2939,7 +2962,7 @@ _uninstall_singbox_locked() {
     # Remove installation-owned runtime/config/credential artifacts, but DO NOT
     # rm -rf SB_ROOT_DIR. In particular, SB_LOCK_FILE must retain the same path
     # and inode for the lifetime of this critical section and afterwards.
-    rm -f --         "$SB_SERVER_CONFIG"         "$SB_SING_BOX_BIN"         "$SB_ROOT_DIR/mianyang.sh"         "$SB_SHORTCUT"         "$SB_SELF_CERT_KEY"         "$SB_SELF_CERT_CERT"         "$SB_STATE_FILE"         "$SB_API_SECRET_FILE"
+    rm -f --         "$SB_SERVER_CONFIG"         "$SB_SING_BOX_BIN"         "$SB_ROOT_DIR/miaomiao.sh"         "$SB_SHORTCUT"         "$SB_SELF_CERT_KEY"         "$SB_SELF_CERT_CERT"         "$SB_STATE_FILE"         "$SB_API_SECRET_FILE"
 
     rm -rf -- "$SB_CLIENTS_DIR" "$(dirname "$SB_SELF_CERT_KEY")"
 
@@ -3731,6 +3754,8 @@ INSTALLATION_MARKERS=(
     /root/sbox/config
     /root/sbox/mianyang.sh
     /usr/bin/mianyang
+    /root/sbox/miaomiao.sh
+    /usr/bin/miaomiao
     /root/sbox/sing-box
     /etc/systemd/system/sing-box.service
     /lib/systemd/system/sing-box.service
@@ -3760,10 +3785,10 @@ show_installation_markers() {
         fi
     done
 
-    if [ -x /root/sbox/mianyang.sh ] && { [ -e /usr/bin/mianyang ] || [ -L /usr/bin/mianyang ]; }; then
-        info "管理命令: /usr/bin/mianyang"
+    if [ -x /root/sbox/miaomiao.sh ] && { [ -e /usr/bin/miaomiao ] || [ -L /usr/bin/miaomiao ]; }; then
+        info "管理命令: /usr/bin/miaomiao"
     else
-        warning "管理命令不完整: /usr/bin/mianyang"
+        warning "管理命令不完整: /usr/bin/miaomiao"
     fi
 
     service_unit=$(systemctl show sing-box -p FragmentPath --value 2>/dev/null || true)
@@ -3785,7 +3810,7 @@ show_installation_markers() {
     fi
 }
 
-print_with_delay "Reality Hysteria2 二合一脚本" 0.03
+print_with_delay "Reality Hysteria2 二合一脚本（miaomiao）" 0.03
 echo ""
 echo ""
 
@@ -3816,6 +3841,7 @@ if has_any_installation_marker; then
     # returns nonzero and aborts the existing-install flow right here -- the
     # menu is never entered on a failed migration (fail-closed).
     maybe_migrate_existing_api_auth
+    install_shortcut || error "修复 miaomiao 管理入口失败。"
     echo ""
     info "sing-box-reality-hysteria2 已安装"
     show_status
@@ -4110,9 +4136,9 @@ if /root/sbox/sing-box check -c /root/sbox/sbconfig_server.json; then
     systemctl daemon-reload
     systemctl enable sing-box > /dev/null 2>&1
     systemctl start sing-box
-    install_shortcut
+    install_shortcut || error "写入 miaomiao 管理入口失败。"
     show_client_configuration
-    warning "输入mianyang,即可打开菜单"
+    warning "输入miaomiao,即可打开菜单"
 else
     error "配置文件检查失败，启动失败!"
 fi

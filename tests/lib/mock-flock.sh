@@ -29,15 +29,16 @@ flock() {
     fi
     local fd="${1:?flock: fd argument required}"
     local lock="${SB_LOCK_FILE:?SB_LOCK_FILE must be set}.mocklock"
-    local staging="${lock}.incoming.$$"
+    local current_pid="${BASHPID:-$$}"
+    local staging="${lock}.incoming.${current_pid}"
     local lock_target
     lock_target="$(readlink -f -- "$SB_LOCK_FILE" 2>/dev/null || printf '%s' "$SB_LOCK_FILE")"
     local deadline=$(( ${SECONDS:-0} + wait_secs ))
-    local owner owner_fd owner_pid fd_target
+    local owner owner_fd fd_target
     while :; do
         rm -rf -- "$staging"
         if mkdir "$staging" 2>/dev/null &&
-           printf '%s\n%s\n' "$$" "$fd" > "$staging/owner" &&
+           printf '%s\n%s\n' "$current_pid" "$fd" > "$staging/owner" &&
            mv -T "$staging" "$lock" 2>/dev/null; then
             return 0
         fi
@@ -49,7 +50,7 @@ flock() {
         if [ -z "$owner" ]; then
             continue    # lock vanished between mv failure and read: retry claim
         fi
-        if [ "$owner" = "$$" ]; then
+        if [ "$owner" = "$current_pid" ]; then
             rm -rf -- "$lock"    # our own previous scope: never nested, released
             continue
         fi
