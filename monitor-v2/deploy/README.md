@@ -59,7 +59,7 @@
 
 | 文件 | 角色 |
 | --- | --- |
-| `install.sh`（2904 行） | **唯一服务端安装器**。顶部脚本直接执行：已有安装标记 → 进入 0–10 管理菜单；否则走全新安装。管理快捷方式 `/root/sbox/mianyang.sh` → `ln -sf` 到 `/usr/bin/mianyang`，内容是重新 `curl | bash` 本脚本 |
+| `install.sh`（2904 行） | **唯一服务端安装器**。顶部脚本直接执行：已有安装标记 → 进入 0–10 管理菜单；否则走全新安装。管理快捷方式 `/root/sbox/miaomiao.sh` → `ln -sf` 到 `/usr/bin/miaomiao`，内容是重新 `curl | bash` 本脚本 |
 | `install-linux-gateway.sh`（603 行） | **客户端** mihomo TUN 网关安装器（另一台机器），自带 `--restore` 备份恢复、`/var/backups/mihomo-gateway` 备份根。与服务器栈无关，但它的备份/参数/`set -Eeuo pipefail` 风格是本项目内已有的部署工程先例 |
 
 ### 安装路径（全部硬编码在 `/root/sbox`）

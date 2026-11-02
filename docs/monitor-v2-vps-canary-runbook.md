@@ -55,7 +55,7 @@
 
 ### 0.2 硬性禁令（canary 全程）
 
-1. **不 restart / reload sing-box**（`systemctl restart sing-box`、`kill -HUP`、`mianyang` 菜单 4 一律禁止）。
+1. **不 restart / reload sing-box**（`systemctl restart sing-box`、`kill -HUP`、`miaomiao` 菜单 4 一律禁止）。
 2. **不写 `/root/sbox/`** 任何文件；不修改 `sbconfig_server.json`、`/root/sbox/config`、端口、证书、密钥、MTU。
 3. **不碰防火墙 / TLS / 反向代理**；不 rotate 凭据；不 expose 9191。
 4. **不使用宽泛进程击杀**（`pkill`、`killall`、按名 kill）。任何必须引用进程的命令，**必须先**用 `/proc/$PID/cmdline` 精确验证该 PID 的身份。
@@ -318,7 +318,7 @@ systemctl is-enabled singbox-monitor   # 期望 disabled / 非 enabled —— en
 
 ```bash
 # 以下命令在本 canary 中绝对禁止出现（P4 用 journal 复核）：
-#   systemctl restart sing-box / reload sing-box / kill <sing-box> / mianyang（菜单 4）
+#   systemctl restart sing-box / reload sing-box / kill <sing-box> / miaomiao（菜单 4）
 #   ufw / iptables / nftables 任何写操作；对 /root/sbox 下任何文件的写操作
 #   systemctl enable singbox-monitor（fresh 首装路径）
 ```

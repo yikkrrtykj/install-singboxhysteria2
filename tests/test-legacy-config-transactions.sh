@@ -18,6 +18,8 @@ set -uo pipefail
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_SH="$HERE/../install.sh"
+bash "$HERE/test-shortcuts.sh" || exit 1
+if command -v shellcheck >/dev/null 2>&1; then shellcheck "$HERE/test-shortcuts.sh" || exit 1; fi
 
 PASS=0
 FAIL=0
@@ -114,7 +116,7 @@ export SB_SING_BOX_BIN="$TMP/mock-sing-box"
 export SB_LOCK_FILE="$SANDBOX/config.lock"
 export SB_CLIENT_MANAGEMENT_LIB="$HERE/../lib/client-management.sh"
 export SB_ROOT_DIR="$SANDBOX"
-export SB_SHORTCUT="$SANDBOX/usr-bin-mianyang"
+export SB_SHORTCUT="$SANDBOX/usr-bin-miaomiao"
 export SB_SYSTEMD_UNIT="$SANDBOX/sing-box.service"
 export SB_HOPPING_SERVICE="$SANDBOX/sing-box-hy2-hopping.service"
 export SB_HOPPING_HELPER="$SANDBOX/hy2-hopping.sh"

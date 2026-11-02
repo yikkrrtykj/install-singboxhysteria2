@@ -6,7 +6,7 @@
 bash <(curl -fsSL https://raw.githubusercontent.com/yikkrrtykj/install-singboxhysteria2/main/install.sh)
 ```
 
-作用：安装 Reality + Hysteria2 服务端、systemd 服务和 `mianyang` 管理命令。全新安装会自动启用并启动 `sing-box.service`，不使用手工进程。
+作用：安装 Reality + Hysteria2 服务端、systemd 服务和 `miaomiao` 管理命令。全新安装会自动启用并启动 `sing-box.service`，不使用手工进程。
 
 主机依赖（host dependency）：脚本先保证这些命令在本机可用——`qrencode`、`jq`、`iptables`，以及服务器 Monitor 的 journal 诊断激活所需的 `setfacl` / `getfacl`（package `acl`）与 `runuser`（package `util-linux`）。判定按"命令是否解析"而不是包名（`command -v acl` 证明不了任何事）；全部已满足时一次包管理器都不会调用，安装之后必须重新解析到命令才算成功，仍缺任一命令则带明确诊断中止，绝不假装成功、也不进入后续部署步骤。详见 `monitor-v2/deploy/README.md` §21。
 
@@ -24,10 +24,12 @@ BBR 不保证零丢包，也不是公网带宽限速或流量配额控制。需�
 ## 2. 打开管理菜单
 
 ```bash
-mianyang
+miaomiao
 ```
 
 作用：修改服务端配置、显示客户端配置、重启或更新 sing-box、启用 BBR、管理端口跳跃和中转规则。
+
+本仓库使用独立命令 `miaomiao`，Personal 仓库使用 `xun`。旧服务器重新运行本仓库安装脚本后，会创建 `/root/sbox/miaomiao.sh` 和 `/usr/bin/miaomiao`，并仅清理确认指向本仓库的标准旧 `mianyang` 入口；其他来源或自定义的旧入口会保留。两版仍共享配置和服务，不支持靠改名在同机并行部署。
 
 选择 `3. 显示客户端配置和 Linux 安装命令` 后会显示：
 
@@ -47,7 +49,7 @@ mianyang
 作用：检查服务端配置，成功后才能重启。
 
 ```bash
-mianyang
+miaomiao
 ```
 
 作用：进入 `4. sing-box基础操作`。子菜单功能：
@@ -162,7 +164,7 @@ bash tests/canary-api-auth.sh --with-collector
 ## 4. 网络优化
 
 ```bash
-mianyang
+miaomiao
 ```
 
 作用：选择菜单 5，启用内核支持的 BBR 和 `fq`，并把 Hysteria2/QUIC UDP 收发缓冲上限提高到至少 16 MiB。配置保存在 `/etc/sysctl.d/99-sing-box-network.conf`，不依赖第三方优化脚本，也不需要更新客户端配置。
@@ -170,7 +172,7 @@ mianyang
 ## 5. Windows 客户端
 
 ```bash
-mianyang
+miaomiao
 ```
 
 作用：选择菜单 3，把显示的 Mihomo/Clash Meta YAML 导入 Windows 客户端。默认选择 Reality，也可以切换到 Hysteria2。
@@ -180,7 +182,7 @@ mianyang
 先在服务端执行：
 
 ```bash
-mianyang
+miaomiao
 ```
 
 作用：选择菜单 3，在输出末尾取得当前节点专用的 Linux 客户端命令。
