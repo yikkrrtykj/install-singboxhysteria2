@@ -184,7 +184,6 @@ install_shortcut() {
   cat > "$SB_ROOT_DIR/miaomiao.sh" << EOF
 #!/usr/bin/env bash
 set -euo pipefail
-umask 077
 task_script=\$(mktemp)
 trap 'rm -f -- "\$task_script"' EXIT
 curl -fsSL --connect-timeout 15 --max-time 120 -o "\$task_script" "https://raw.githubusercontent.com/yikkrrtykj/install-singboxhysteria2/main/install.sh"
