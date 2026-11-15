@@ -241,10 +241,7 @@ ss -lntup | grep mihomo
 
 作用：查看 Mihomo 监听端口。
 
-局域网设备需要设置：
-
-- 默认网关：Linux 网关 IP；
-- DNS：Linux 网关 IP。
+网关安装一次后，其他服务器可通过应用显式代理或 TUN 网关接入。新机的网关、DNS、跨网段 SSH 回程和验收步骤见 [Linux 服务器接入共享 Mihomo TUN 网关](docs/linux-mihomo-gateway-clients.md)。
 
 不要把 `53/7897/9090` 直接开放到公网。
 
