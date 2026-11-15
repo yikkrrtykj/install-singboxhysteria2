@@ -265,7 +265,7 @@ echo
 
 #### 同网段服务器透明接入
 
-本例使用 Ubuntu 的 Netplan 和静态 IPv4。按现场地址和掩码替换示例值。
+按现场地址、掩码和网卡名替换示例值。
 
 | 项目 | 示例 |
 | --- | --- |
@@ -280,6 +280,35 @@ echo
 ip -4 route get 10.70.10.2
 ip -4 route get 10.70.99.10
 ```
+
+##### 临时接入
+
+新服务器使用单网卡、单 IPv4 默认路由，并由 `systemd-resolved` 处理系统 DNS 时，可以直接运行下面的命令。按上表替换变量。`SSH_CLIENT_IP` 填当前 SSH 管理端在服务器看来使用的源地址，`/32` 只保留这个地址经原网关的回程。确认管理回程和网卡后，在新服务器上执行。
+
+```bash
+IFACE=ens160
+MIHOMO_IP=10.70.10.2
+OLD_GATEWAY=10.70.10.1
+SSH_CLIENT_IP=10.70.99.10
+
+sudo ip -4 route replace "$SSH_CLIENT_IP/32" via "$OLD_GATEWAY" dev "$IFACE" &&
+sudo resolvectl dns "$IFACE" "$MIHOMO_IP" &&
+sudo ip -4 route replace default via "$MIHOMO_IP" dev "$IFACE"
+```
+
+三条命令依次保留 SSH 回程、设置接口 DNS、切换 IPv4 默认网关。执行后新开一个 SSH 会话，确认可登录，再验证实际业务访问。
+
+```bash
+ip -4 route get "$SSH_CLIENT_IP"
+ip -4 route get 1.1.1.1
+resolvectl dns "$IFACE"
+```
+
+预期管理端回程经原网关 `10.70.10.1`，公网目的地址的下一跳和接口 DNS 均为 `10.70.10.2`。这些改动立即生效，重启或网络重新配置后可能恢复原设置。
+
+##### 持久化接入
+
+下面以 Ubuntu 的 Netplan 和静态 IPv4 为例。
 
 备份现有 Netplan 文件，再修改客户端现有网卡配置。保留该接口的其他地址和业务路由，替换原有的 IPv4 默认路由与 DNS。本例给一个固定的管理端保留 `/32` 回程。实际由多个管理地址连接时，使用确认过的管理网段。
 
