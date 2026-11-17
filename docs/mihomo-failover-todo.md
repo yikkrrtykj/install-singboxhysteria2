@@ -107,3 +107,35 @@ remain separate. No new Windows administrator/test step is requested here.
 - [x] 40 daily contracts: first-start acknowledgement, changed selection refusal,
       observe-only preservation and unchanged ordinary unpinned startup.
 - [ ] Natural application-fault acceptance remains separate from this UX repair.
+
+## Competition Windows dual-active HA (not accepted)
+
+Parent [#48](https://github.com/yikkrrtykj/install-singboxhysteria2/issues/48) remains open. Requirements:
+[competition contract](mihomo-competition-ha-contract.md) and
+[measurement/acceptance gates](mihomo-competition-ha-acceptance.md).
+
+This competition workstream preserves all trial results and outstanding gates
+above. HA-01 is documentation only; no automatic switching implementation,
+client release, profile activation or production mutation. All new functions
+default OFF. Native hard-failure testing does not complete the existing
+protocol-quality trial's acceptance. No 10s, application or fleet PASS is claimed.
+
+| Stage | Issue | Dependency | Status |
+| --- | --- | --- | --- |
+| HA-01 contract | [#89](https://github.com/yikkrrtykj/install-singboxhysteria2/issues/89) | None; Draft review, CI and human approval; then merge-SHA main CI | REVIEW DRAFT / NOT ACCEPTED |
+| HA-02 batch generation | [#90](https://github.com/yikkrrtykj/install-singboxhysteria2/issues/90) | HA-01 accepted/merged; main CI green | BLOCKED / NOT RUN |
+| HA-03 Windows safety | [#91](https://github.com/yikkrrtykj/install-singboxhysteria2/issues/91) | HA-02 accepted | BLOCKED / NOT RUN |
+| HA-04 timing/failback | [#92](https://github.com/yikkrrtykj/install-singboxhysteria2/issues/92) | HA-03 accepted | BLOCKED / NOT RUN |
+| HA-05 actual applications | [#93](https://github.com/yikkrrtykj/install-singboxhysteria2/issues/93) | HA-04 accepted | BLOCKED / NOT RUN |
+| HA-06 fleet/capacity/rollback | [#94](https://github.com/yikkrrtykj/install-singboxhysteria2/issues/94) | HA-05 accepted; independent event Go-Live approval | BLOCKED / NOT RUN |
+
+- [ ] HA-01 approved and merged; main CI revalidated. Failure stops HA-02.
+- [ ] A-first and B-first batch/profile/effective-route/cache/rollback evidence.
+- [ ] Real T0/T1/T2/T3 data, symmetric faults, failback review and 30-client probe load.
+- [ ] At least 30 real three-application fault experiments, both directions;
+      Drive integrity and per-app <=10s met/unmet verdicts reported separately.
+- [ ] Both VPSes independently carry all 30 equivalent clients with measured reserve.
+- [ ] 2/4/8/16/final rollout, manual takeover, original-profile rollback and Go-Live approval.
+
+Linux Mihomo gateway: Deferred. `srt-cam` and Haivision SRT Tools: Out of Scope.
+No production fault injection; no private YAML, secrets or complete connection metadata.
