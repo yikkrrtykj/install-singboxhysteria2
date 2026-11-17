@@ -83,11 +83,11 @@ as immediate refusal.
 | M08 | Both VPSes unavailable simultaneously | Common outage/no usable route; no protected-recovery claim |
 | M09 | P recovers Reality first, then HY2 | Record native failback, any business interruption and review disposition |
 | M10 | P recovers HY2 first, then Reality | Same; test different restoration ordering |
-| M11 | Current S path fails after P recovery | Verify selection follows usable candidates and reviewed policy |
+| M11 | After P recovery, identify and fail whichever path is actually current | Verify the next usable selection; do not assume native failback left S current |
 | M12 | Repeat down/up on P and S in different orders | Measure switch count, false positives and flapping; block unacceptable behavior |
 
-M03/M04/M06/M07 ensure HY2 is actually selected and failed, not merely an idle
-broken candidate while Reality works. Record that TCP or UDP fault injection
+M03 is the idle-HY2 negative control. M04/M06/M07 together cover HY2 actually
+selected and subsequently failed, rather than only an idle broken candidate. Record that TCP or UDP fault injection
 targets the intended protocol and preserves the other path. With HY2 hopping,
 test one blocked port separately from the whole configured port range/broad UDP
 impairment; port hopping must not conceal global UDP degradation.
