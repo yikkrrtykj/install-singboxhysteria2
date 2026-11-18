@@ -133,7 +133,8 @@ M3-B v1 只有这一条回滚路径：preflight 已证明 helper capability 在�
 
 ## 测试
 
-`tests/e3/test-m3-deploy.sh`（CI 三基线，live fixture）按 first-deploy-only 顺序覆盖：
+`tests/e3/test-m3-deploy.sh`（CI 三基线 live fixture，ubuntu-24.04 另有
+noexec `/run` 模拟）按 first-deploy-only 顺序覆盖：
 真实 `app/monitor-v2` release layout、preflight PASS 与实测 baseline、无临时残留、
 marker 已存在 / 配置 check 拒绝 / monitor 非 symlink / `root:sboxweb 0660` stale
 socket / existing helper / partial helper 等 preflight FAIL，以及失败时不创建或覆盖
@@ -141,5 +142,10 @@ baseline。随后执行真实 helper installer、socket-only D4、pre-RPC servic
 post-RPC service active、verify PASS（inactive mutation fail-closed、配置不变、
 sing-box 未重启）与配置被改时 verify FAIL。rollback 覆盖 exact baseline release、
 helper absent、state/audit 保留、配置不变及 monitor 存活；missing/non-executable
-installer、目标 release 不存在、disable 失败和 daemon-reload 失败均必须 FAIL。
-套件以 `EXPECTED_TOTAL=53` 冻结 PASS+FAIL+SKIP 总数，防止断言静默消失。
+installer、目标 release 不存在、可执行但失败的 installer、disable 失败和
+daemon-reload 失败均必须 FAIL，且每个负向用例同时断言其具体失败原因，避免环境
+故障被误当成预期拒绝。可执行 fixture 放在独立的 `EXECROOT`（以真实执行探针
+选定），`/run` 状态根只保存数据，从而在 `/run` 为 noexec 的 runner 镜像上仍然
+有效；CI 另在 ubuntu-24.04 用 noexec tmpfs 复现该环境并先证明 noexec 生效。
+套件以 `EXPECTED_TOTAL=64` 冻结 PASS+FAIL+SKIP 总数（noexec 模拟为 65），
+防止断言静默消失。
