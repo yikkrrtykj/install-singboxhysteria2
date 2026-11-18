@@ -12,7 +12,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from test_bundle_linux import BundleLinuxTests, fixtures
+import test_bundle_linux as bundle
 
 
 TARGET = 'test_real_rpc_http_zip_has_canonical_yaml_and_one_device_key'
@@ -20,6 +20,7 @@ TARGET = 'test_real_rpc_http_zip_has_canonical_yaml_and_one_device_key'
 
 class ClientFixtureExecTest(unittest.TestCase):
     def test_legacy_placement_fails_before_mutation_and_split_placement_works(self):
+        BundleLinuxTests = bundle.BundleLinuxTests
         runtime = Path(os.environ['P6_FIXTURE_NOEXEC_DIR'])
         self.assertTrue(os.statvfs(runtime).f_flag & os.ST_NOEXEC, 'isolated noexec mount required')
         print('fixture-mounts /run_noexec=%s temp_noexec=%s isolated_noexec=True' % (
@@ -33,7 +34,7 @@ class ClientFixtureExecTest(unittest.TestCase):
             try:
                 old = BundleLinuxTests(TARGET)
                 try:
-                    with patch.object(fixtures.ProvisioningTests, 'new_client_fixture_exec_dir',
+                    with patch.object(bundle.fixtures.ProvisioningTests, 'new_client_fixture_exec_dir',
                                       lambda case: case.root):
                         with self.assertRaisesRegex(AssertionError, r'^client[.]add failed: ') as failed:
                             old.setUp()
