@@ -127,6 +127,37 @@ Do not force-install a second switching program. Controlled import/activation
 must preserve a complete original profile/settings/selection backup and permit
 immediate restoration; HA-03 and HA-06 require actual rollback verification.
 
+### Hysteria2 server identity (HA-03 #91)
+
+The legacy canonical renderer emits `skip-cert-verify: true` and the merge
+parser requires that literal. HA-01 and HA-02 preserve this input contract.
+Successful use of such an export does not establish the server's TLS identity
+or qualify a profile for competition use. HA-03 owns the separate competition
+profile design on the exact validated Windows/Verge/Mihomo combination.
+
+For each physical VPS, document the expected peer identity and evaluate
+trusted certificate validation (trust chain and expected name) or explicit
+certificate pinning with securely provisioned pins. Justify the chosen policy
+and validate it independently on VPS A and VPS B, including when each endpoint
+is used as a backup. Failed identity verification must reject the affected
+candidate. Any subsequent selection must use another eligible candidate under
+its own approved policy. Import, failover, renewal, restart, and rollback
+within the competition profile must never silently weaken verification.
+
+If verified identity cannot be delivered for an endpoint, an exception needs
+explicit security approval before use. Record the affected endpoint and
+workloads, residual impersonation risk, compensating controls, owner, expiry,
+and revocation or removal plan. Record the endpoint as operating under an
+exception and keep its identity verification verdict separate. Unapproved,
+expired, or out-of-scope exceptions block the affected competition scope.
+
+The [HY2 acceptance matrix](mihomo-competition-ha-acceptance.md#hysteria2-tls-identity-ha-03-91)
+covers expected and unexpected certificates, identity mismatch, expiry, renewal,
+recovery, and rollback. Record independent evidence for A and B. Restoring
+the old profile is an exit from competition mode. HA-01 specifies only the
+gate. Leave canonical rendering/parsing, production certificates, server
+configuration, and deployed clients in place.
+
 ## Fault model and selection boundaries (HA-04)
 
 Track each of the four candidate paths independently; do not reduce them to one
@@ -162,6 +193,23 @@ Open a separate sticky-policy design/review if needed; do not implicitly reuse
 or enable PR-48B or another controller. Preserve intentional manual overrides.
 Both-VPS and local-network outages require explicit No-Go/contingency reporting;
 they are not promised protection by two VPSes.
+
+### Upload degradation handoff (HA-04 to HA-06)
+
+Record the [N02 disposition](mihomo-competition-ha-acceptance.md#n02-upload-degradation-disposition-ha-04-92)
+for a path that continues to return 204 while effective upload falls below the
+reviewed usable threshold. Carry the run IDs, observed impact, and separate
+automatic quality failover verdict into the HA-06 decision. A native hard
+failure PASS applies only to the tested hard failure cases. It gives no
+automatic protection claim for the known upload collapse scenario.
+
+If automatic quality recovery is unavailable, failed, or unproven, identify
+the affected workloads and routes. HA-06 must record a tested manual or
+application contingency for any scope proposed to operate with that residual
+risk, or independently approve a narrower scope that excludes the unsupported
+cases. With neither disposition, the affected scope is No-Go. Preserve
+PR-48B's opt-in trial boundary and open gates. The competition baseline leaves
+the quality-switch EXE disabled and requires no additional background controller.
 
 ## Time and business success (HA-04 / HA-05)
 
@@ -203,6 +251,11 @@ approval after review; implementation completion does not grant that approval.
 For any application that misses recovery requirements, preserve a reviewed
 independent application backup; no blanket PASS or automatic waiver.
 
+The final Go/No-Go record includes HA-04 N02's evidence, the automatic quality
+verdict, the scope covered by a tested contingency or excluded by separate
+approval, and the remaining risk. Manual recovery and narrower approval leave
+the original automatic quality verdict visible and do not waive the <=10s gates.
+
 ## Security and evidence boundary (all stages)
 
 Never store or submit real YAML, UUIDs, passwords, keys, tokens, customer
@@ -225,10 +278,10 @@ measurement uncertainty.
 | --- | --- | --- | --- |
 | HA-01 [#89](https://github.com/yikkrrtykj/install-singboxhysteria2/issues/89) | Architecture, fault/timing contract, mapping and gates | None; docs-only Draft, review/CI/human merge approval required | REVIEW DRAFT |
 | HA-02 [#90](https://github.com/yikkrrtykj/install-singboxhysteria2/issues/90) | Canonical batch generation, A/B order, identities, permissions, hashes | HA-01 merged and main CI green; reject missing/mixed/reused/invalid inputs | BLOCKED |
-| HA-03 [#91](https://github.com/yikkrrtykj/install-singboxhysteria2/issues/91) | Verified Verge/core, Windows safety, cache/effective routes, rollback | HA-02 accepted; block unsafe binds, unattributed paths, unverified versions or rollback failure | BLOCKED |
-| HA-04 [#92](https://github.com/yikkrrtykj/install-singboxhysteria2/issues/92) | Native timing/false positives, full fault matrix, failback, probe load | HA-03 accepted; block missing/>10s hard-fail data, flapping or unreviewed sticky control | BLOCKED |
+| HA-03 [#91](https://github.com/yikkrrtykj/install-singboxhysteria2/issues/91) | Verified Verge/core, Windows safety, per-VPS HY2 TLS identity, cache/routes and rollback | HA-02 accepted; block unsafe binds, unattributed paths, unverified versions, failed TLS gates without an approved exception, or rollback failure | BLOCKED |
+| HA-04 [#92](https://github.com/yikkrrtykj/install-singboxhysteria2/issues/92) | Native timing/false positives, fault matrix, N02 disposition, failback and probe load | HA-03 accepted; block missing/>10s hard-fail data, flapping or unreviewed sticky control | BLOCKED |
 | HA-05 [#93](https://github.com/yikkrrtykj/install-singboxhysteria2/issues/93) | Three actual apps, >=30 real trials, recovery distributions, integrity | HA-04 accepted; block missing tests, integrity failure or app target misses | BLOCKED |
-| HA-06 [#94](https://github.com/yikkrrtykj/install-singboxhysteria2/issues/94) | Staged fleet, both-VPS takeover capacity, manual fallback, Go/No-Go | HA-05 accepted; missing capacity, rollback, authorization or Go-Live approval is No-Go | BLOCKED |
+| HA-06 [#94](https://github.com/yikkrrtykj/install-singboxhysteria2/issues/94) | Staged fleet, both-VPS capacity, manual fallback, N02 disposition in Go/No-Go | HA-05 accepted; missing capacity, rollback, N02 disposition, authorization or Go-Live approval is No-Go for affected scope | BLOCKED |
 
 Issue bodies and this contract must remain consistent; changes require explicit
 review with affected gates reopened. None of the new stage references is PASS.

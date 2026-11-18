@@ -139,3 +139,18 @@ protocol-quality trial's acceptance. No 10s, application or fleet PASS is claime
 
 Linux Mihomo gateway: Deferred. `srt-cam` and Haivision SRT Tools: Out of Scope.
 No production fault injection; no private YAML, secrets or complete connection metadata.
+
+### Competition contract review follow-up
+
+- [ ] HA-03 [#91](https://github.com/yikkrrtykj/install-singboxhysteria2/issues/91)
+      independently validates VPS A and VPS B HY2 peer identity. Review a trusted
+      certificate, pin, or explicit security exception. Exercise wrong certificate,
+      identity mismatch, expiry, renewal, recovery and rollback. HA-01 and HA-02
+      preserve the legacy canonical input and existing deployments.
+- [ ] HA-04 [#92](https://github.com/yikkrrtykj/install-singboxhysteria2/issues/92)
+      records N02 upload degradation with 204 still successful. HA-06
+      [#94](https://github.com/yikkrrtykj/install-singboxhysteria2/issues/94)
+      carries the separate quality verdict into Go/No-Go and records a tested
+      manual contingency or independently approved scope exclusion where needed.
+      Preserve PR-48B trial gates. The quality-switch EXE remains disabled and
+      the competition baseline adds no background controller.

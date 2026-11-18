@@ -99,7 +99,7 @@ Run relevant rows with both preferences; also cover Rule, Global and Direct.
 | Case | Condition | Required evidence / non-claim |
 | --- | --- | --- |
 | N01 | Health URL fails while real business works | Endpoint/check failure is distinct from confirmed tunnel DOWN; record false switching |
-| N02 | 204 succeeds while selected path upload collapses | Mark upload DEGRADED/automation gap with bounded/real transfer evidence; no native quality PASS |
+| N02 | 204 succeeds while selected path upload collapses | Measure upload DEGRADED and application impact. Record a separate [N02 disposition](#n02-upload-degradation-disposition-ha-04-92) for HA-06 |
 | N03 | HY2 UDP/QUIC broadly degraded while Reality works | Per-protocol state; do not assume HY2 always healthy or label VPS dead |
 | N04 | Same ISP/site exit/DNS/NAT/firewall affects both VPSes | Common failure domain; two VPSes do not solve it |
 | N05 | Terminal network/TUN/DNS fails | Client fault distinct from remote host failure |
@@ -115,6 +115,55 @@ A core/controller outage is not a VPS fault. A manual fixed path does not prove
 automatic failover. Direct mode and intentional LAN exceptions must be recorded
 as bypasses, never claimed as VPS-protected traffic. Native-only quality gaps
 remain explicit; #48's reviewed trial design and open gates are unchanged.
+
+## Hysteria2 TLS identity (HA-03 #91)
+
+Run each case independently against authorized test endpoints representing
+VPS A and VPS B, including each as the active and backup candidate. Use the
+exact validated core and observe the actual connection outcome. A group may
+recover through another candidate, so capture the result of the specific HY2
+candidate under test. Record sanitized endpoint alias, policy and configuration
+version, expected and observed outcomes, and evidence references.
+
+| Case | Expected outcome under the verification policy |
+| --- | --- |
+| TLS1 Expected peer | A fresh HY2 connection succeeds with the approved chain/name or pin for that endpoint |
+| TLS2 Wrong certificate or identity | Fresh connections reject an untrusted chain or incorrect expected name under chain validation, or a mismatched pin under pinning. Include an otherwise trusted wrong-name certificate for name validation and the other test VPS's identity where distinct |
+| TLS3 Expired certificate | Demonstrate expiry handling under the approved policy. Reject an expired peer where validity is enforced by TLS. If the pinned mechanism does not enforce expiry, require a reviewed validity control and prove it prevents use of the expired identity |
+| TLS4 Planned renewal or pin rotation | The approved new identity works at the intended stage. Any overlap is reviewed and bounded. Retired identities or pins are rejected according to the approved cutover policy |
+| TLS5 Failed renewal, recovery and rollback | The failed candidate stays ineligible until a verified valid configuration is restored. Review safe alternate routing and verify fresh connections after rotation recovery or rollback to a known-good, still-trusted identity and profile |
+
+For TLS2–TLS5, verify that failed identity checks never cause an unverified
+retry or acceptance of the affected candidate. Test manual selection and
+automatic failover as applicable. The legacy canonical export's
+`skip-cert-verify: true` is an input compatibility setting. A rollback to the
+original legacy profile exits the competition mode and cannot count as TLS
+recovery within it.
+
+If HA-03 proposes a security exception, record independent A/B test outcomes
+and the observed wrong-certificate, identity-mismatch and expiry behavior.
+Record any acceptance of an invalid peer as residual exposure, never as
+verification PASS. The exception needs explicit security sign-off covering
+scope, controls, owner, expiry, revocation and tested recovery/rollback.
+Test the approved compensating controls and show the exception's removal or
+expiry blocks use under the exception. Without verified identity or a valid
+reviewed exception, the affected competition scope is BLOCKED.
+
+## N02 upload degradation disposition (HA-04 #92)
+
+Exercise both preferences. Keep the selected path's 204 probe successful
+while measuring effective upload and application impact against the reviewed
+threshold. Record run IDs, affected routes/workloads, the attribution and
+observed recovery, any manual action, and the automatic quality failover
+verdict independently from hard failure results. Use NOT MET for an observed
+failure to switch/recover automatically, UNKNOWN for inconclusive evidence,
+or NOT RUN for unperformed automation tests. A 204 or a native hard failure
+PASS supplies no automatic quality PASS.
+
+Hand the N02 evidence and documented disposition to HA-06 #94. Include any
+proposed contingency or scope exclusion and keep PR-48B's trial and
+outstanding acceptance separate. The competition baseline keeps the
+quality-switch EXE disabled and adds no background controller.
 
 ## Timing, failback and probe load study (HA-04 #92)
 
@@ -230,6 +279,7 @@ backup; this does not automatically waive its failed <=10s gate.
 - [ ] Draft PR targets main; diff is exactly the three allowed document paths.
 - [ ] Existing #48 design/trial limits and historical TODO entries preserved.
 - [ ] Every requirement maps to #89–#94; dependencies, methods and blockers complete.
+- [ ] HA-03 defines per-VPS HY2 identity, negative tests and certificate lifecycle. HA-06 explicitly consumes the HA-04 N02 verdict and disposition.
 - [ ] No real IPs, accounts, private YAML, secrets, customer data or full connection metadata.
 - [ ] No executable code, deployment, runtime or CI changes.
 - [ ] All five existing workflows pass: shell-tests, monitor-packaging, HY2 BBR defaults, p6b2-foundations, quality-receiver; inspect every job and existing required checks on the final revision.
@@ -248,6 +298,23 @@ and main CI green, both-VPS 30-client takeover with measured reserve, complete
 reviewable app evidence and clear per-app <=10s met/unmet scope, tested manual
 takeover and original-profile rollback, company/account/security authorization,
 and independent Go-Live approval before the event.
+
+HA-06 must cite the HA-04 N02 run IDs and include the automatic quality
+verdict for the documented reachable-but-upload-degraded scenario. For
+unavailable, failed, or unproven automatic quality recovery:
+
+- For affected workloads retained in service, exercise the manual switching
+  or independent application contingency under N02. Record its trigger,
+  operator, action, measured business recovery, and accepted residual risk
+  in the independent Go-Live decision.
+- For unsupported cases excluded from service, obtain separate explicit
+  approval of the narrower scope. Record the affected routes and workloads,
+  exclusions, and any applicable contingency.
+
+No documented disposition means No-Go for affected scope. A manual
+contingency or approved exclusion is a different result from an automatic
+quality failover PASS. Keep the original quality verdict and any missed app
+or timing gate visible. A hard failure PASS cannot waive these gates.
 
 Missing evidence, unresolved unsafe exposure, P0/P1, capacity/integrity/rollback
 failure, an unmet required app target or missing approval means No-Go for the
