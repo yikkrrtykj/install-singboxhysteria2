@@ -39,6 +39,17 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y jq openssl nginx nftables
           getent group sboxweb || sudo groupadd --system sboxweb
+      - name: Reproduce Client fixture under an isolated noexec runtime
+        if: matrix.os == 'ubuntu-24.04'
+        run: |
+          sudo -n unshare --mount --propagation private bash -euo pipefail -c '
+            runtime="$(mktemp -d /run/p6b2-noexec.XXXXXXXX)"
+            cleanup() { if mountpoint -q -- "$runtime"; then umount -- "$runtime"; fi; rmdir -- "$runtime"; }
+            trap cleanup EXIT
+            mount --bind "$runtime" "$runtime"
+            mount -o remount,bind,noexec "$runtime"
+            P6_FIXTURE_NOEXEC_DIR="$runtime" python3 tests/remote-production/test_client_fixture_exec_linux.py
+          '
       - name: Actual live Monitor enrollment revocation crash concurrency and Client deletion
         run: sudo -n python3 tests/remote-production/test_provisioning.py
       - name: Actual identity nginx TLS systemd nft namespace and hostile burst load

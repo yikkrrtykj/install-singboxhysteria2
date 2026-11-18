@@ -1,6 +1,7 @@
 """Native root fixture: real worker, peer-authenticated RPC and Monitor HTTP.
 
-All state/socket/listeners are disposable /run or loopback fixtures. Production
+State and sockets stay in disposable /run directories, with loopback listeners.
+Fixture executables live under /opt so /run can be mounted noexec. Production
 peer policy stays sboxweb-only; only this daemon's explicit TEST sandbox admits
 the root fixture client. No real VPS/service/firewall is touched.
 """
@@ -47,14 +48,18 @@ class BundleLinuxTests(unittest.TestCase):
         fixtures.ProvisioningTests.setUp(self)
         self.addCleanup(fixtures.ProvisioningTests.tearDown, self)
         self.root.chmod(0o755)
-        self.helper = self.root / 'helper'
+        exec_root = fixtures.ProvisioningTests.new_client_fixture_exec_dir(self)
+        # The unprivileged-reader case imports the public helper module. Give
+        # it traverse only on the scratch root; the mock shim stays private.
+        exec_root.chmod(0o711)
+        self.helper = exec_root / 'helper'
         self.helper.mkdir(mode=0o755)
         for name in ('sbox-cm-ops', 'p6_provision.py', 'p6_bundle.py'):
             shutil.copyfile(ROOT / 'sbox-cm' / name, self.helper / name)
             (self.helper / name).chmod(0o755 if name == 'sbox-cm-ops' else 0o644)
         shutil.copyfile(ROOT / 'monitor-v2/p6_artifact.py', self.helper / 'p6_artifact.py')
         (self.helper / 'p6_artifact.py').chmod(0o644)
-        fixtures.ProvisioningTests.setup_client_worker(self)
+        fixtures.ProvisioningTests.setup_client_worker(self, exec_root)
         self.proxy_config.parent.chmod(0o700)
         config = json.loads(self.proxy_config.read_bytes())
         config['inbounds'][0].update(listen_port=443, tls={
@@ -109,10 +114,8 @@ class BundleLinuxTests(unittest.TestCase):
 
     def call_worker(self, op, **args):
         args['request_id'] = 'bundle-request-' + os.urandom(12).hex()
-        result = subprocess.run(['bash', str(self.helper / 'sbox-cm-ops'), op], input=json.dumps(args).encode(),
-                                env=self.env, capture_output=True, timeout=35)
-        self.assertEqual(result.returncode, 0, result.stderr.decode())
-        return json.loads(result.stdout)
+        return fixtures.ProvisioningTests.fixture_worker_response(
+            self, self.helper / 'sbox-cm-ops', op, json.dumps(args).encode(), 35)
 
     def http(self, path='/api/v1/clients/bundle', body=None, method='POST', auth=True, csrf=True, headers=None):
         sending = {'Content-Type': 'application/json'}

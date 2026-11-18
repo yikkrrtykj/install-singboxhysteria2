@@ -545,18 +545,31 @@ class ProvisioningTests(unittest.TestCase):
         self.assertFalse(p6.live_proof(self.worker.port, wrong, True))
         self.assertEqual(self.plane.store.status()['receipt_count'], 0)
 
-    def setup_client_worker(self):
+    def new_client_fixture_exec_dir(self):
+        # Match the existing native ingress fixture's executable location.
+        # Keep configs, lock, ledger and sockets in their existing fixture roots.
+        scratch = tempfile.TemporaryDirectory(prefix='p6b2-client-exec-', dir='/opt')
+        self.addCleanup(scratch.cleanup)
+        root = Path(scratch.name)
+        self.assertFalse(os.statvfs(root).f_flag & os.ST_NOEXEC,
+                         'Client fixture executable filesystem is noexec')
+        return root
+
+    def setup_client_worker(self, exec_root=None):
+        if exec_root is None:
+            exec_root = ProvisioningTests.new_client_fixture_exec_dir(self)
+        self.client_fixture_exec_root = exec_root
         proxy = self.root / 'proxy'
         proxy.mkdir()
         self.proxy_config = proxy / 'server.json'
         self.proxy_config.write_text(json.dumps({'inbounds': [
             {'type': 'vless', 'tag': 'vless-in', 'users': [{'name': 'legacy', 'uuid': 'legacy-uuid', 'flow': 'xtls-rprx-vision'}]},
             {'type': 'hysteria2', 'tag': 'hy2-in', 'users': [{'name': 'legacy', 'password': 'legacy-pass'}]}]}))
-        shim = self.root / 'shim'
-        shim.mkdir()
-        mock = proxy / 'sing-box'
+        shim = exec_root / 'shim'
+        shim.mkdir(mode=0o700)
+        mock = exec_root / 'sing-box'
         mock.write_text('#!/bin/bash\ncase "$1" in\ncheck) exit 0;;\ngenerate) cat /proc/sys/kernel/random/uuid;;\nesac\n')
-        mock.chmod(0o755)
+        mock.chmod(0o700)
         for name, body in (('systemctl', 'exit 0'), ('pgrep', 'exit 1')):
             file = shim / name
             file.write_text('#!/bin/bash\n' + body + '\n'); file.chmod(0o755)
@@ -574,8 +587,9 @@ class ProvisioningTests(unittest.TestCase):
     def require_client_fixture_ok(self, op, response):
         if response.get('ok') is True:
             if op == 'management.activate':
-                self.assertEqual(response.get('data', {}).get('management_state') == 'active', True,
-                                 'management.activate did not report active')
+                data = response.get('data')
+                self.assertTrue(isinstance(data, dict) and data.get('management_state') == 'active',
+                                'management.activate did not report active')
             return
 
         # Worker details, stdout, stderr and transaction paths can contain
@@ -604,7 +618,7 @@ class ProvisioningTests(unittest.TestCase):
                 return {'timeout': True}
 
         mock = Path(self.env['SB_SING_BOX_BIN'])
-        shim = self.root / 'shim'
+        shim = self.client_fixture_exec_root / 'shim'
         worker_state = Path(self.env['SB_CM_STATE_DIR'])
         transaction = response.get('transaction')
         transaction = transaction if isinstance(transaction, dict) else {}
@@ -624,6 +638,7 @@ class ProvisioningTests(unittest.TestCase):
             'transaction_entered': transaction.get('entered') is True,
             'euid': os.geteuid(), 'egid': os.getegid(), 'umask': umask,
             'root': path_state(self.root), 'run': path_state(Path('/run')),
+            'exec_root': path_state(self.client_fixture_exec_root),
             'temp': path_state(Path(tempfile.gettempdir())),
             'config': path_state(self.proxy_config), 'state': path_state(worker_state),
             'lock': path_state(Path(self.env['SB_LOCK_FILE'])),
@@ -633,12 +648,26 @@ class ProvisioningTests(unittest.TestCase):
             'pgrep_lookup_is_shim': shutil.which('pgrep', path=self.env['PATH']) == str(shim / 'pgrep'),
         }, sort_keys=True))
 
+    def fixture_worker_response(self, script, op, payload, timeout):
+        try:
+            result = subprocess.run(['bash', str(script), op], input=payload,
+                                    env=self.env, capture_output=True, timeout=timeout)
+        except OSError as exc:
+            self.fail(f'{op} fixture worker launch failed (errno={exc.errno})')
+        except subprocess.TimeoutExpired:
+            self.fail(f'{op} fixture worker timed out')
+        self.assertEqual(result.returncode, 0, f'{op} fixture worker exited nonzero')
+        try:
+            response = json.loads(result.stdout)
+        except ValueError:
+            self.fail(f'{op} fixture worker returned invalid JSON')
+        self.assertTrue(isinstance(response, dict), f'{op} fixture worker did not return an object')
+        return response
+
     def call_worker(self, op, **args):
         args['request_id'] = 'request-' + os.urandom(12).hex()
-        result = subprocess.run(['bash', str(ROOT / 'sbox-cm/sbox-cm-ops'), op],
-                                input=p6.encoded(args), env=self.env, capture_output=True, timeout=30)
-        self.assertEqual(result.returncode, 0, result.stderr.decode())
-        return json.loads(result.stdout)
+        return ProvisioningTests.fixture_worker_response(
+            self, ROOT / 'sbox-cm/sbox-cm-ops', op, p6.encoded(args), 30)
 
     def test_real_client_worker_enrollment_and_retirement_gate(self):
         self.setup_client_worker()
