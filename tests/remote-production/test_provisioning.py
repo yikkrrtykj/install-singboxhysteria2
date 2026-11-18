@@ -566,8 +566,72 @@ class ProvisioningTests(unittest.TestCase):
             'SB_CM_STATE_DIR': str(proxy / 'state'), 'SB_CM_LIB_DIR': str(ROOT / 'lib'),
             'SB_P6_STATE_DIR': str(self.state_dir), 'SB_P6_CONFIG_DIR': str(self.config_dir),
             'SB_P6_MONITOR_PORT': str(self.worker.port), 'PATH': str(shim) + ':' + os.environ['PATH']}
-        self.call_worker('management.activate')
-        self.assertTrue(self.call_worker('client.add', name='event-pc', idempotency_key='client-add-000001')['ok'])
+        ProvisioningTests.require_client_fixture_ok(self, 'management.activate',
+                                                     self.call_worker('management.activate'))
+        ProvisioningTests.require_client_fixture_ok(self, 'client.add', self.call_worker(
+            'client.add', name='event-pc', idempotency_key='client-add-000001'))
+
+    def require_client_fixture_ok(self, op, response):
+        if response.get('ok') is True:
+            if op == 'management.activate':
+                self.assertEqual(response.get('data', {}).get('management_state') == 'active', True,
+                                 'management.activate did not report active')
+            return
+
+        # Worker details, stdout, stderr and transaction paths can contain
+        # credentials. Only report closed enums and fixture-local metadata.
+        def closed(value, allowed):
+            return value if isinstance(value, str) and value in allowed else 'other'
+
+        def path_state(path):
+            try:
+                st = path.stat()
+                flags = os.statvfs(path).f_flag
+                return {'uid': st.st_uid, 'gid': st.st_gid, 'mode': oct(st.st_mode & 0o777),
+                        'noexec': bool(flags & os.ST_NOEXEC)}
+            except OSError as exc:
+                return {'errno': exc.errno}
+
+        def exec_state(path, *args):
+            try:
+                probe = subprocess.run([str(path), *args], env=self.env,
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                       timeout=5)
+                return {'exit': probe.returncode}
+            except OSError as exc:
+                return {'errno': exc.errno}
+            except subprocess.TimeoutExpired:
+                return {'timeout': True}
+
+        mock = Path(self.env['SB_SING_BOX_BIN'])
+        shim = self.root / 'shim'
+        worker_state = Path(self.env['SB_CM_STATE_DIR'])
+        transaction = response.get('transaction')
+        transaction = transaction if isinstance(transaction, dict) else {}
+        umask = next((line.split()[1] for line in Path('/proc/self/status').read_text().splitlines()
+                      if line.startswith('Umask:')), 'unknown')
+        codes = ('E_INTERNAL', 'E_LOCK', 'E_CONFIG_INCONSISTENT',
+                 'E_CANDIDATE_REJECTED', 'E_NOT_ACTIVE', 'E_MANAGEMENT_INACTIVE',
+                 'E_LEDGER_UNAVAILABLE', 'E_STATE_UNCERTAIN', 'E_MANUAL_INTERVENTION',
+                 'E_COMMIT_FAILED', 'E_ROLLED_BACK')
+        stages = ('parse', 'marker', 'lock', 'degraded', 'revalidate', 'candidate',
+                  'ledger_intent', 'intent', 'backup', 'check', 'replace', 'reload',
+                  'health', 'rollback', 'outcome', 'done')
+        self.fail(f'{op} failed: ' + json.dumps({
+            'code': closed(response.get('code'), codes),
+            'stage': closed(response.get('stage'), stages),
+            'transaction_phase': closed(transaction.get('phase'), stages),
+            'transaction_entered': transaction.get('entered') is True,
+            'euid': os.geteuid(), 'egid': os.getegid(), 'umask': umask,
+            'root': path_state(self.root), 'run': path_state(Path('/run')),
+            'temp': path_state(Path(tempfile.gettempdir())),
+            'config': path_state(self.proxy_config), 'state': path_state(worker_state),
+            'lock': path_state(Path(self.env['SB_LOCK_FILE'])),
+            'mock': path_state(mock), 'mock_check_exec': exec_state(mock, 'check'),
+            'shim': path_state(shim), 'shim_systemctl_exec': exec_state(shim / 'systemctl'),
+            'systemctl_lookup_is_shim': shutil.which('systemctl', path=self.env['PATH']) == str(shim / 'systemctl'),
+            'pgrep_lookup_is_shim': shutil.which('pgrep', path=self.env['PATH']) == str(shim / 'pgrep'),
+        }, sort_keys=True))
 
     def call_worker(self, op, **args):
         args['request_id'] = 'request-' + os.urandom(12).hex()
