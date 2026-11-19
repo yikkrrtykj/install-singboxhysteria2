@@ -6,8 +6,9 @@
 #
 # The unit directory is a FIXED default. There is deliberately no new
 # environment override for it: a destructive rollback must never be retargeted
-# away from the directory the preflight checked. (The installer keeps its
-# pre-existing fixture override SBXCM_UNIT_DIR; tests use a sandbox path.)
+# away from the directory the preflight checked. The installer keeps its
+# pre-existing fixture override SBXCM_UNIT_DIR; preflight/rollback use the
+# fixed default above and expose no new override.
 SBXCM_UNIT_DIR_DEFAULT="/etc/systemd/system"
 SBXCM_SOCKET_UNIT_NAME="sbox-cm.socket"
 SBXCM_SERVICE_UNIT_NAME="sbox-cm.service"

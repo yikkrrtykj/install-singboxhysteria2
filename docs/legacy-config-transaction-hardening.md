@@ -12,8 +12,8 @@ Status: **implemented — integrated (Integration Round 2, cherry-picked).**
   enablement is STILL BLOCKED pending the E3 rev5 activation /
   privileged-helper design.
 
-This closes the `I0-7` PRE-E3 blocker (option **A** from
-`docs/monitor-v2-integration.md`): every runtime durable sing-box management
+This closes the `I0-7` PRE-E3 blocker (option **A**, recorded in the deleted
+Round 2 integration record; history remains in PR #16 / `5ac39978`): every runtime durable sing-box management
 mutation now serializes under the SAME global lock used by Phase C / Phase D.
 
 ## Single lock domain

@@ -848,7 +848,7 @@ grep -qF 'E3_SBXCM_SOCKET="${E3_SBXCM_SOCKET:-/run/sbox-cm/sbox-cm.sock}"' \
     "$ROOT/monitor-v2/deploy/e3-rollback.sh" \
     && pass 'B3: rollback mirrors the preflight default socket path' \
     || fail 'B3: rollback does not mirror the preflight default socket path'
-grep -qF 'E3_SBXCM_UNIT_DIR' "$ROOT/monitor-v2/deploy/e3-rollback.sh" \
+grep -qE '^E3_SBXCM_UNIT_DIR=' "$ROOT/monitor-v2/deploy/e3-rollback.sh" \
     && fail 'B3: rollback still accepts a new unit-dir environment override' \
     || pass 'B3: rollback exposes no new unit-dir environment override'
 

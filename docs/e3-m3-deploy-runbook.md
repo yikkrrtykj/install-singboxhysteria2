@@ -1,11 +1,13 @@
 # E3 M3 — 部署上线 Runbook（deploy-disabled 阶段：M3-A / M3-B）
 
 ```text
-状态       : M3-A / M3-B 已交付；M3-C 按三个独立生产阶段推进
+状态       : M3-A / M3-B 已交付（历史手工流程）；M3-C 为首选自动化编排
 适用范围   : 生产 VPS 上的 E3 部署准备 —— 本文档与脚本本身不执行任何部署
 阶段       : Phase 1 = production deploy-disabled；Phase 2 = one production canary，结束 inactive；
              Phase 3 = final persistent go-live enablement（独立 preflight 与批准边界）
 历史基线   : M3-A/B main = 6bed1bd；后续阶段使用各自 reviewed merge SHA
+手工流程   : 重复的逐步部署/验收清单以 M3-C Phase 1/3 runbook 与脚本为准；
+             本文保留边界、人工诊断命令与应急回滚说明
 ```
 
 ## M3-A — 部署前 preflight（`monitor-v2/deploy/e3-preflight.sh`）
@@ -58,43 +60,32 @@ systemctl 仅用 is-active/is-enabled/show 等只读查询。
 
 ## M3-B — deploy-disabled 部署与验收
 
-### 部署步骤（均不打开管理面）
+### 部署/验收的安全边界（不是可复制的命令清单）
 
-```text
-D1  预跑 M3-A preflight，留存 /root/e3-baseline.json；
-D2  打包并安装新 monitor release（既有 install-monitor.sh，release-symlink 原子切换）；
-D3  安装 sbox-cm（install-sbox-cm.sh install —— 默认 disabled/inactive）；
-D4  systemctl enable --now sbox-cm.socket（**只 enable socket**；service 保持 inactive，
-    由第一次 RPC 经 socket activation 拉起——验收顺序见 V05a/V05b/V07）；
-D5  跑 M3-B 验收（e3-deploy-verify.sh --baseline /root/e3-baseline.json）。
-```
+M3-C Phase 1 是首选且唯一推荐的部署编排。正式部署、baseline 验证、
+reviewed release 安装（`upgrade --repair`）与回滚版本保留要求以
+`docs/e3-m3c-phase1-production-runbook.md`、`monitor-v2/deploy/e3-m3c-phase1.sh`
+及已评审脚本为准；本文不提供可整段粘贴执行的部署命令序列，也不构成执行授权。
 
-部署后必须保持 `management_state = inactive`。D4 只 `enable --now sbox-cm.socket`
-（service 由第一次 RPC 经 socket activation 拉起）。验收项（`E3_M3_VERIFY=PASS`）：
+- **preflight 失败立即 STOP**：任何 FAIL（包括 existing-helper 拒绝）都必须停止，
+  不得继续安装、启用 socket 或执行后续阶段。
+- **不得用失败或过期 baseline 部署或回滚**：baseline 必须是本次 PASS 的 preflight
+  原子产生并经 mode/JSON/字段校验；失败、过期或不属于本次部署的 baseline 一律拒绝使用。
+- **只读诊断保留**：preflight/verify/rollback 的只读检查、日志与只读系统查询可用于
+  人工诊断。
+- **独立应急恢复必须显式授权**：仅在已获授权的独立恢复流程中，按 first-deploy
+  baseline 约束和保留的 R1–R4 应急回滚说明执行；不得把本文当作自动执行入口。
 
-```text
-V05a  仅要求 sbox-cm.socket active（service 允许 inactive）
-V05b  在 V07 的真实 sboxweb RPC 成功之后，要求 sbox-cm.service active
-      —— 证明 socket activation 真正拉起了 daemon
-```
-
-```text
-V01/V02  配置 SHA256 + size 与 baseline 完全一致
-V03      sing-box 未被部署触发重启（ActiveEnterTimestamp + NRestarts 与 baseline 一致）
-V04      monitor active + 只读 HTTP 200
-V05      sbox-cm.socket/.service active（能力在场）
-V06      activation marker 不存在 ⇒ 管理面 inactive
-V07      sboxweb 上下文 RPC management.status = inactive
-V08      sboxweb 上下文 RPC client.list 可读
-V09      Web E3 UI 可加载（index + app.js 200，clients 表在页面中）
-V10/V11  inactive 下 mutation fail-closed：add 尝试被 E_ACTIVATION_STATE 拒绝
-         （helper 在 intent 之前拒绝 ⇒ 零变更，仅留下一条 rejected 审计），
-         且拒绝后配置 SHA 不变
-```
+所有底层工具（`e3-preflight.sh`、`install-monitor.sh`、`install-sbox-cm.sh`、
+`e3-deploy-verify.sh`、`e3-rollback.sh`）均保留，不新增 shell wrapper。
+部署后必须保持 `management_state = inactive`；任何 Phase 2/3 动作仍需各自的
+独立批准、reviewed HEAD 与证据链。
 
 ### 回滚（`monitor-v2/deploy/e3-rollback.sh --baseline /root/e3-baseline.json`）
 
 回滚是 **fail-closed** 的编排：installer 缺失或不可执行、目标 release 缺失、rollback 命令失败、disable 失败、daemon-reload 失败、恢复后 live release id 与 baseline 不一致——任何一步失败 ⇒ `E3_M3_ROLLBACK=FAIL`。**rollback target 唯一来源 = `baseline.monitor.release_id`，不提供任何 override。**
+
+任何 preflight 未 PASS、baseline 非本次 PASS 原子生成/已过期或未经 mode/JSON 校验时，**禁止用该 baseline 执行回滚**；只能保留现状并走已授权的独立应急恢复/人工诊断。
 
 rollback tooling 与 `install-monitor.sh` **必须来自同一个 checkout/source tree 的同一 deploy 目录**（脚本用 `BASH_SOURCE` 解析自身目录作为默认 installer 路径，不再假设 `/opt/...` 下存在该脚本；测试可用 `E3_INSTALL_MONITOR` override）。
 
@@ -118,7 +109,12 @@ M3-B v1 只有这一条回滚路径：preflight 已证明 helper capability 在�
 状态”的分支。baseline 的 monitor rollback target 取自 live symlink 的 exact
 `release_id`，不从 history 或其它来源推断。
 
-## M3-C — 分阶段生产 rollout
+## M3-C — 分阶段生产 rollout（首选自动化编排）
+
+M3-C 是优先推荐的自动化编排流程；它直接依赖
+`e3-preflight.sh`、`install-monitor.sh`、`install-sbox-cm.sh`、
+`e3-deploy-verify.sh`、`e3-rollback.sh`，这些是保留的底层工具，不是废弃入口。
+各阶段不同的 journal/rollback/审批语义保持独立，不强行合并。
 
 - Phase 1 已实现为 production preflight + deploy-disabled，终态 inactive。
 - Phase 2 已实现为一次 production canary：activate → list → add/delete →
@@ -133,11 +129,14 @@ M3-B v1 只有这一条回滚路径：preflight 已证明 helper capability 在�
 
 ## 共享 capability 合同
 
-`monitor-v2/deploy/e3-rollback.sh` 与 `sbox-cm/deploy/install-sbox-cm.sh` 现在共用
-`lib/sbox-cm-capability.sh`：unit 名称与 libexec 文件清单只在该文件维护，R1/R3 的
-停止/删除顺序、失败计数、fail-closed 检查与 state 保留策略仍保留在各自脚本中。
-rollback 工具必须在包含仓库 `lib/` 的 checkout/source tree 内运行；缺少该文件时
-rollback 会显式 fail-closed 退出，不会猜测 capability 名称。
+`monitor-v2/deploy/e3-rollback.sh`、`monitor-v2/deploy/e3-preflight.sh` 与
+`sbox-cm/deploy/install-sbox-cm.sh` 共用 `lib/sbox-cm-capability.sh`：unit 目录/
+名称与 libexec 文件清单只在该文件维护（installer 安装后校验、preflight P00 检查、
+rollback R3 删除/校验）；unit 目录是无新增覆盖入口的固定默认 `/etc/systemd/system`。
+各工具自己的停止/删除顺序、失败计数、fail-closed 检查与 state 保留策略保持不变。
+上述工具必须在包含仓库 `lib/` 的 checkout/source tree 内运行；缺少该文件时显式
+fail-closed，不会猜测 capability 名称。Phase-1 orchestrator 的独立 capability
+probe 仍保留（CLEAN-04 记录为剩余债务，不强行合并逻辑）。
 
 ## 测试
 
@@ -159,7 +158,7 @@ rollback 非零退出、R1/R3 对应分支、installer 正常执行/R2 成功以
 无执行位/未被执行证据。可执行 fixture 和证据目录位于根用户所有、不可被组/其他
 用户写入的受信父目录下（0700），`/run` 状态根只保存数据，从而在 `/run` 为
 noexec 的 runner 镜像上仍然有效；CI 另在 ubuntu-24.04 用 noexec tmpfs 复现该
-环境并先证明 noexec 生效。套件以 `EXPECTED_TOTAL=85` 冻结 PASS+FAIL+SKIP 总数
-（noexec 模拟为 86），防止断言静默消失。运行日志会打印 `/run`、状态根和
+环境并先证明 noexec 生效。套件以 `EXPECTED_TOTAL=88` 冻结 PASS+FAIL+SKIP 总数
+（noexec 模拟为 89），防止断言静默消失。运行日志会打印 `/run`、状态根和
 `EXECROOT` 的实际挂载选项以及该 runner 上状态根的原生执行结果，用于区分真实
 noexec 环境与受控模拟。
