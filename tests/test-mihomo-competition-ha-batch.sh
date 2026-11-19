@@ -90,10 +90,20 @@ LEGACY_ALL=0
 HOPA=0
 HOPB=0
 
-uuid_a() { printf '1%07d-1111-2222-3333-%012d' "$1" "$1"; }
-uuid_b() { printf '2%07d-1111-2222-3333-%012d' "$1" "$1"; }
+uuid_a() { printf 'a1%06d-1111-2222-3333-%012d' "$1" "$1"; }
+uuid_b() { printf 'b2%06d-1111-2222-3333-%012d' "$1" "$1"; }
 pw_a() { printf 'ha-A-%02d-pppppppppppppppppppppppp' "$1"; }
 pw_b() { printf 'ha-B-%02d-qqqqqqqqqqqqqqqqqqqqqqqq' "$1"; }
+upper_hex() { printf '%s' "$1" | tr 'a-f' 'A-F'; }
+edit_replace() { # <path> <old> <new>
+    "$PY" - "$1" "$2" "$3" <<'PY'
+import sys
+path, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
+text = open(path, encoding="utf-8").read()
+assert old in text
+open(path, "w", encoding="utf-8", newline="").write(text.replace(old, new))
+PY
+}
 
 mk_export() { # <path> <server> <uuid> <password> <pubkey> <shortid> <ports|""> <legacy 0|1>
     local out=$1 server=$2 uuid=$3 password=$4 pubkey=$5 shortid=$6
@@ -213,10 +223,13 @@ EOF
 
 mk_tree() { # <dir> <count> <a_first>
     local dir=$1 count=$2 a_first=$3
+    rm -rf -- "$dir"
     mkdir -p "$dir/exports/A" "$dir/exports/B" "$dir/delivery"
     if [ "$POSIX_HOST" = "1" ]; then
         chmod 700 "$dir" "$dir/exports" "$dir/exports/A" "$dir/exports/B" "$dir/delivery"
     fi
+    win_private_acl "$dir" "$dir/exports" "$dir/exports/A" "$dir/exports/B" \
+        "$dir/delivery"
     printf 'terminal,group\n' > "$dir/terminals.csv"
     local i name group hop_a hop_b legacy
     for ((i = 1; i <= count; i++)); do
@@ -245,11 +258,33 @@ mk_tree() { # <dir> <count> <a_first>
     [ "$POSIX_HOST" = "1" ] && chmod 600 "$dir/terminals.csv"
 }
 
-clone_tree() { # <src> <name> ; echoes the clone path
-    local src=$1 dst="$TMP/$2"
-    rm -rf -- "$dst"
-    cp -R "$src" "$dst"
-    printf '%s\n' "$dst"
+# Real NTFS ACL helpers. The suite must build directories that satisfy the
+# product's conservative allowlist, and must be able to add an "other local
+# user" grant for the negative case. MSYS_NO_PATHCONV keeps icacls' own
+# `/inheritance:r` switches from being rewritten into POSIX paths.
+win_private_acl() { # <path...>
+    [ "$IS_WINDOWS" = "1" ] || return 0
+    local path win
+    for path in "$@"; do
+        win=$(cygpath -w "$path" 2>/dev/null) || win=$path
+        MSYS_NO_PATHCONV=1 icacls "$win" /inheritance:r \
+            /grant:r "$(whoami):(OI)(CI)F" "SYSTEM:(OI)(CI)F" \
+            "Administrators:(OI)(CI)F" >/dev/null 2>&1 || true
+    done
+}
+
+win_grant() { # <path> <principal-spec>
+    [ "$IS_WINDOWS" = "1" ] || return 0
+    local win
+    win=$(cygpath -w "$1" 2>/dev/null) || win=$1
+    MSYS_NO_PATHCONV=1 icacls "$win" /grant "$2" >/dev/null 2>&1 || true
+}
+
+win_acl_has() { # <path> <substring> ; true when icacls reports it
+    [ "$IS_WINDOWS" = "1" ] || return 1
+    local win
+    win=$(cygpath -w "$1" 2>/dev/null) || win=$1
+    MSYS_NO_PATHCONV=1 icacls "$win" 2>/dev/null | tr -d '\r' | grep -qF -- "$2"
 }
 
 in_args() { # <root> [version] ; one whitespace-separated argument line
@@ -345,7 +380,7 @@ PY
 bad=""
 for module in $imports; do
     case "$module" in
-        __future__|hashlib|importlib|json|os|re|stat|sys|time) ;;
+        __future__|hashlib|importlib|ipaddress|json|os|re|stat|sys|tempfile|time) ;;
         *) bad="$bad $module" ;;
     esac
 done
@@ -373,6 +408,20 @@ pass 'no canonical parser internals are duplicated in the batch tool'
 grep -qE 'generate_204|gstatic|expected-status|interval: [0-9]|timeout: [0-9]|lazy: (true|false)' "$TOOL" \
     && fail 'the batch tool hardcodes a health-probe parameter' \
     || pass 'the batch tool never rewrites the #42 probe policy'
+for marker in 'def uuid_key' 'def normalize_server' 'ALLOWED_PRINCIPAL_SIDS' \
+              'INHERIT_ONLY_SIDS' 'def verify_temp_inheritance' \
+              'def check_local_boundary' 'def is_reparse' 'skipped=%d'; do
+    grep -qF -- "$marker" "$TOOL" \
+        && pass "identity/permission contract present [$marker]" \
+        || fail "identity/permission contract missing [$marker]"
+done
+grep -qE 'BROAD_SIDS|broad_sid|TRUSTED_OWNER_SIDS|DOMAIN_SID_RE' "$TOOL" \
+    && fail 'the old ACL denylist is still present' \
+    || pass 'the ACL gate is an allowlist, not a denylist'
+grep -qF 'normalize_server(profile.reality["server"])' "$TOOL" \
+    && grep -qF 'uuid_key(profile.reality["uuid"])' "$TOOL" \
+    && pass 'batch identity uses normalized UUID/address keys' \
+    || fail 'batch identity still compares raw UUID/server strings'
 
 # The exact CLI surface: paths and a version label only.
 cli_flags="$("$PY" - "$TOOL" <<'PY'
@@ -875,6 +924,67 @@ text = open(path, encoding="utf-8").read()
 open(path, "w", encoding="utf-8", newline="").write(text.replace(old, new))
 PY
 expect_code E_CREDENTIAL_REUSE 'T8n password shared across VPS and terminal' "${T8ARGS[@]}"
+
+# --- identity normalization: same identity in another spelling is the same ---
+mk_tree "$T8" 1 1
+edit_replace "$T8/exports/B/event-ob01-mihomo.yaml" "$(uuid_b 1)" \
+    "$(upper_hex "$(uuid_a 1)")"
+expect_code E_CREDENTIAL_REUSE 'T8q mixed-case UUID reused across A/B of one terminal' "${T8ARGS[@]}"
+assert_contains "$ERR" 'detail=uuid' 'T8q mixed-case A/B reuse is reported as a uuid reuse'
+mk_tree "$T8" 2 1
+cp "$T8/exports/A/event-ob01-mihomo.yaml" "$T8/exports/A/event-ob02-mihomo.yaml"
+edit_replace "$T8/exports/A/event-ob02-mihomo.yaml" "$(uuid_a 1)" \
+    "$(upper_hex "$(uuid_a 1)")"
+expect_code E_CREDENTIAL_REUSE 'T8r mixed-case UUID reused across terminals' "${T8ARGS[@]}"
+assert_contains "$ERR" 'terminal=event-ob02 vps=A' \
+    'T8r cross-terminal mixed-case reuse is attributed to the second terminal'
+mk_tree "$T8" 2 1
+edit_replace "$T8/exports/B/event-ob02-mihomo.yaml" "$(uuid_b 2)" \
+    "$(upper_hex "$(uuid_a 1)")"
+expect_code E_CREDENTIAL_REUSE 'T8s mixed-case UUID reused across VPS and terminal' "${T8ARGS[@]}"
+mk_tree "$T8" 1 1
+edit_replace "$T8/exports/B/event-ob01-mihomo.yaml" "$(pw_b 1)" \
+    "$(printf '%s' "$(pw_b 1)" | tr 'a-z' 'A-Z')"
+read -r -a T8ARGS <<< "$(in_args "$T8")"
+expect_ok_lines 1 1 0 test-r1 'T8t password stays case-sensitive (case change is allowed)' \
+    "${T8ARGS[@]}"
+assert_contains "$(cat "$T8/delivery/event-ob01-ha.yaml")" \
+    "$(printf '%s' "$(pw_b 1)" | tr 'a-z' 'A-Z')" \
+    'T8t output preserves the password spelling from the source'
+mk_tree "$T8" 1 1
+edit_replace "$T8/exports/A/event-ob01-mihomo.yaml" "$(uuid_a 1)" \
+    "$(upper_hex "$(uuid_a 1)")"
+expect_ok_lines 1 1 0 test-r1 'T8u a unique UUID in another case is accepted' "${T8ARGS[@]}"
+assert_contains "$(cat "$T8/delivery/event-ob01-ha.yaml")" \
+    "$(upper_hex "$(uuid_a 1)")" \
+    'T8u output preserves the source UUID bytes (no normalization rewrite)'
+mk_tree "$T8" 2 2
+edit_replace "$T8/exports/A/event-ob01-mihomo.yaml" "$SERVER_A" "www.example-ha.com"
+edit_replace "$T8/exports/A/event-ob02-mihomo.yaml" "$SERVER_A" "WWW.EXAMPLE-HA.COM"
+edit_replace "$T8/exports/B/event-ob01-mihomo.yaml" "$SERVER_B" "www.backup-ha.com"
+edit_replace "$T8/exports/B/event-ob02-mihomo.yaml" "$SERVER_B" "www.backup-ha.com"
+expect_ok_lines 2 2 0 test-r1 'T8v DNS-case variants of one source are one A identity' \
+    "${T8ARGS[@]}"
+assert_contains "$(cat "$T8/delivery/event-ob02-ha.yaml")" \
+    "WWW.EXAMPLE-HA.COM" 'T8v output preserves the DNS spelling from the source'
+mk_tree "$T8" 1 1
+edit_replace "$T8/exports/A/event-ob01-mihomo.yaml" "$SERVER_A" "example-ha.com"
+edit_replace "$T8/exports/B/event-ob01-mihomo.yaml" "$SERVER_B" "EXAMPLE-HA.COM"
+expect_code E_SOURCE_COLLISION 'T8w DNS-case variants cannot pose as two VPSes' "${T8ARGS[@]}"
+mk_tree "$T8" 2 2
+edit_replace "$T8/exports/A/event-ob01-mihomo.yaml" "$SERVER_A" "2001:db8::1"
+edit_replace "$T8/exports/A/event-ob02-mihomo.yaml" "$SERVER_A" \
+    "2001:0db8:0000:0000:0000:0000:0000:0001"
+edit_replace "$T8/exports/B/event-ob01-mihomo.yaml" "$SERVER_B" "2001:db8::2"
+edit_replace "$T8/exports/B/event-ob02-mihomo.yaml" "$SERVER_B" "2001:db8::2"
+expect_ok_lines 2 2 0 test-r1 'T8x IPv6 equivalent spellings are one source identity' \
+    "${T8ARGS[@]}"
+mk_tree "$T8" 1 1
+edit_replace "$T8/exports/A/event-ob01-mihomo.yaml" "$SERVER_A" \
+    "2001:0db8:0000:0000:0000:0000:0000:0001"
+edit_replace "$T8/exports/B/event-ob01-mihomo.yaml" "$SERVER_B" "2001:db8::1"
+expect_code E_SOURCE_COLLISION 'T8y IPv6-equivalent A and B cannot pose as two VPSes' \
+    "${T8ARGS[@]}"
 if [ "$POSIX_HOST" = "1" ]; then
     mk_tree "$T8" 1 1
     chmod 000 "$T8/exports/A/event-ob01-mihomo.yaml"
@@ -981,70 +1091,175 @@ if [ "$POSIX_HOST" = "1" ]; then
     assert_contains "$ERR" 'role=output-dir' 'T10e error names the output directory'
     chmod 700 "$T10/delivery"
     expect_ok_lines 1 1 0 test-r1 'T10f restored modes generate cleanly' "${T10ARGS[@]}"
+    assert_eq "$(id -u)" "$(stat -c '%u' "$T10/delivery/event-ob01-ha.yaml")" \
+        'T10f output file is owned by the operator'
+    assert_eq 600 "$(stat -c '%a' "$T10/delivery/event-ob01-ha.yaml")" \
+        'T10f output file mode is 0600'
+    DELIVERED_POSIX=$("$PY" - "$TOOL" "$T10/delivery/event-ob01-ha.yaml" \
+        "$T10/delivery/ha-delivery-test-r1.json" <<'PY'
+import importlib.util
+import sys
+spec = importlib.util.spec_from_file_location("batch", sys.argv[1])
+batch = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(batch)
+for path in sys.argv[2:]:
+    batch.check_private_path(path, "output-file")
+print("ok")
+PY
+)
+    assert_eq 'ok' "$DELIVERED_POSIX" \
+        'T10f delivered YAML and manifest pass the real mode/owner check'
+    # A world-writable non-sticky ancestor can replace the private root.
+    T10B="$TMP/world/tree"
+    mkdir -p "$TMP/world"
+    chmod 777 "$TMP/world"
+    mk_tree "$T10B" 1 1
+    read -r -a T10BARGS <<< "$(in_args "$T10B")"
+    expect_code E_INSECURE_PERMISSIONS \
+        'T10n world-writable ancestor is refused' "${T10BARGS[@]}"
+    assert_contains "$ERR" 'detail=boundary-ancestor-writable' \
+        'T10n boundary failure reports the ancestor, not a path'
+    chmod 700 "$TMP/world"
 else
     skip 'T10a-T10f POSIX mode gates (NTFS carries no POSIX mode)'
 fi
 
-# Real Windows ACL: a well-known shared directory is refused by reading its
-# actual DACL from the kernel. No ACL is modified by this suite.
+# Real Windows ACL: the conservative allowlist is exercised against live
+# DACLs. The suite builds its own private tree and modifies only its own
+# fixtures; no production directory is touched.
 if [ "$IS_WINDOWS" = "1" ]; then
     PUBLIC_DIR="$(cygpath -w /c/Users/Public 2>/dev/null || printf 'C:\\Users\\Public')"
     T10W="$TMP/t10w"
     mk_tree "$T10W" 1 1
     run_batch --inventory "$T10W/terminals.csv" --exports "$PUBLIC_DIR" \
         --output-dir "$T10W/delivery" --config-version test-r1
-    if [ "$RC" -ne 0 ] && [ "${ERR1#ha-batch: FAIL E_INSECURE_PERMISSIONS role=exports-root}" != "$ERR1" ] \
-       && [ "${ERR1#*sid=S-1-5-}" != "$ERR1" ]; then
-        pass "T10g real broad Windows ACL on the exports root is refused"
+    if [ "$RC" -ne 0 ] \
+       && [ "${ERR1#ha-batch: FAIL E_INSECURE_PERMISSIONS role=exports-root}" != "$ERR1" ] \
+       && [ "${ERR1#*principal=}" != "$ERR1" ]; then
+        pass 'T10g real broad Windows ACL on the exports root is refused'
     else
         fail "T10g (rc=$RC stderr=[$ERR])"
     fi
-    T10W2="$TMP/t10w2"
-    mk_tree "$T10W2" 1 1
-    read -r -a T10W2ARGS <<< "$(in_args "$T10W2")"
-    expect_ok_lines 1 1 0 test-r1 'T10h private Windows ACL passes' "${T10W2ARGS[@]}"
-    assert_eq 'windows-acl' "$(jget "$T10W2/delivery/ha-delivery-test-r1.json" permission_gate)" \
-        'T10h manifest records the Windows ACL gate'
+    # A grant to another local user class must defeat the allowlist.
+    T10X="$TMP/t10x"
+    mk_tree "$T10X" 1 1
+    win_grant "$T10X/exports" "Users:(OI)(CI)R"
+    if win_acl_has "$T10X/exports" 'BUILTIN\Users'; then
+        read -r -a T10XARGS <<< "$(in_args "$T10X")"
+        expect_code E_INSECURE_PERMISSIONS \
+            'T10j grant to another local user class is refused' "${T10XARGS[@]}"
+        assert_contains "$ERR" 'role=exports-root' \
+            'T10j other-user grant is attributed to the exports root'
+        assert_contains "$ERR" 'principal=S-1-5-32-545' \
+            'T10j other-user grant is reported by SID'
+    else
+        skip 'T10j could not add a BUILTIN\\Users ACE to the fixture'
+    fi
+    # A single source file with a broad ACE is refused even in a private tree.
+    T10F="$TMP/t10f"
+    mk_tree "$T10F" 1 1
+    win_grant "$T10F/exports/A/event-ob01-mihomo.yaml" "Users:R"
+    if win_acl_has "$T10F/exports/A/event-ob01-mihomo.yaml" 'BUILTIN\Users'; then
+        read -r -a T10FARGS <<< "$(in_args "$T10F")"
+        expect_code E_INSECURE_PERMISSIONS \
+            'T10k broad ACE on an actual source file is refused' "${T10FARGS[@]}"
+        assert_contains "$ERR" 'role=source-A' \
+            'T10k file-level grant is attributed to the source role'
+    else
+        skip 'T10k could not add a BUILTIN\\Users ACE to the source file'
+    fi
+    # Native positive: the private tree succeeds, the delivered files
+    # themselves pass the real ACL checker, and the manifest records the gate.
+    T10Y="$TMP/t10y"
+    mk_tree "$T10Y" 1 1
+    read -r -a T10YARGS <<< "$(in_args "$T10Y")"
+    expect_ok_lines 1 1 0 test-r1 'T10h private Windows ACL passes' "${T10YARGS[@]}"
+    assert_eq 'windows-acl-allowlist' \
+        "$(jget "$T10Y/delivery/ha-delivery-test-r1.json" permission_gate)" \
+        'T10h manifest records the Windows ACL allowlist gate'
+    DELIVERED_ACL=$("$PY" - "$TOOL" "$T10Y/delivery/event-ob01-ha.yaml" \
+        "$T10Y/delivery/ha-delivery-test-r1.json" <<'PY'
+import importlib.util
+import sys
+spec = importlib.util.spec_from_file_location("batch", sys.argv[1])
+batch = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(batch)
+for path in sys.argv[2:]:
+    batch.check_private_path(path, "output-file")
+print("ok")
+PY
+)
+    assert_eq 'ok' "$DELIVERED_ACL" \
+        'T10l delivered YAML and manifest pass the real per-file ACL check'
+    # Junction/reparse: a directory redirect must be refused, not followed.
+    T10Z="$TMP/t10z"
+    mk_tree "$T10Z" 1 1
+    rm -rf "$T10Z/exports/A"
+    MSYS_NO_PATHCONV=1 cmd.exe /c mklink /J "$(cygpath -w "$T10Z/exports/A")" \
+        "$(cygpath -w "$T10Z/delivery")" >/dev/null 2>&1
+    if [ -d "$T10Z/exports/A" ]; then
+        read -r -a T10ZARGS <<< "$(in_args "$T10Z")"
+        expect_code E_PATH_CONFLICT \
+            'T10m a Windows junction in the source tree is refused' "${T10ZARGS[@]}"
+        assert_contains "$ERR" 'role=exports-A' \
+            'T10m junction is attributed to the redirected directory'
+    else
+        skip 'T10m could not create a directory junction'
+    fi
 else
-    skip 'T10g/T10h real Windows ACL gates (not a Windows host)'
+    skip 'T10g/T10h/T10j-T10m real Windows ACL gates (not a Windows host)'
 fi
-# The SDDL classifier is platform-independent and unit-tested on every host.
-SDDL_VERDICT=$("$PY" - "$TOOL" <<'PY'
+# The SDDL/POSIX classifiers are platform-independent and unit-tested here.
+CLASSIFIER_VERDICT=$("$PY" - "$TOOL" <<'PY'
 import importlib.util
 import sys
 spec = importlib.util.spec_from_file_location("batch", sys.argv[1])
 batch = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(batch)
 user = "S-1-5-21-1-2-3-1001"
+base = "O:%sD:PAI" % user
 cases = [
-    ("broad-everyone", "O:%sD:PAI(A;OICI;FA;;;WD)" % user, ["sid=S-1-1-0"]),
-    ("broad-users", "O:%sD:PAI(A;OICI;FA;;;BU)" % user, ["sid=S-1-5-32-545"]),
-    ("broad-interactive", "O:%sD:PAI(A;OICI;0x1200a9;;;IU)" % user,
-     ["sid=S-1-5-4"]),
-    ("broad-service", "O:%sD:PAI(A;OICIIO;0x1301ff;;;SU)" % user,
-     ["sid=S-1-5-6"]),
-    ("broad-domain-users", "O:%sD:PAI(A;OICI;FA;;;S-1-5-21-9-8-7-513)" % user,
-     ["sid=S-1-5-21-9-8-7-513"]),
-    ("null-dacl", "O:SYD:NO_ACCESS_CONTROL", ["null-dacl"]),
-    ("owner-elsewhere", "O:S-1-5-21-9-8-7-1001D:PAI(A;OICI;FA;;;SY)", ["owner="]),
-    ("private", "O:%sD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
-                "(A;OICI;FA;;;%s)" % (user, user), []),
-    ("creator-owner", "O:%sD:PAI(A;OICIIO;FA;;;CO)(A;OICI;FA;;;SY)"
-                      "(A;OICI;FA;;;%s)" % (user, user), []),
-    ("deny-everyone", "O:%sD:PAI(D;OICI;FA;;;WD)(A;OICI;FA;;;SY)"
-                      "(A;OICI;FA;;;%s)" % (user, user), []),
+    ("broad-everyone", base + "(A;OICI;FA;;;WD)", ["principal=S-1-1-0"]),
+    ("broad-users", base + "(A;OICI;FA;;;BU)", ["principal=S-1-5-32-545"]),
+    ("broad-interactive", base + "(A;OICI;0x1200a9;;;IU)",
+     ["principal=S-1-5-4"]),
+    ("unknown-local-group", base + "(A;OICI;FA;;;S-1-5-21-9-8-7-1005)",
+     ["principal=S-1-5-21-9-8-7-1005"]),
+    ("creator-owner-inherit-only",
+     base + "(A;OICIIO;FA;;;CO)(A;OICI;FA;;;SY)", []),
+    ("creator-owner-direct", base + "(A;OICI;FA;;;CO)",
+     ["principal=S-1-3-0"]),
+    ("unknown-allow-ace", base + "(XA;OICI;FA;;;SY)", ["ace-type=XA"]),
+    ("missing-dacl", "O:%s" % user, ["missing-dacl"]),
+    ("null-dacl", "O:%sD:NO_ACCESS_CONTROL" % user, ["null-dacl"]),
+    ("unparsable-ace", "O:%sD:(A;FA;;;SY)" % user, ["unparsable-ace"]),
+    ("owner-elsewhere", "O:S-1-5-21-9-8-7-1001D:PAI(A;OICI;FA;;;SY)",
+     ["owner="]),
+    ("private", base + "(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
+                "(A;OICI;FA;;;%s)" % user, []),
+    ("deny-everyone", base + "(D;OICI;FA;;;WD)(A;OICI;FA;;;SY)"
+                     "(A;OICI;FA;;;%s)" % user, []),
 ]
 bad = []
 for label, sddl, expected in cases:
-    problems = batch.sddl_problems(sddl, sddl[2:sddl.index("D:")], user)
+    problems = batch.acl_problems(sddl, sddl[2:sddl.index("D:")]
+                                  if "D:" in sddl else sddl[2:], user)
     if expected and not any(p.startswith(expected[0]) for p in problems):
         bad.append(label + ":want=" + expected[0] + " got=" + ",".join(problems))
     if not expected and problems:
         bad.append(label + ":unexpected=" + ",".join(problems))
+private = batch.posix_problems(0o600, 7, 7)
+if private:
+    bad.append("posix-private:" + ",".join(private))
+if batch.posix_problems(0o640, 7, 7) != ["mode=640"]:
+    bad.append("posix-mode")
+if batch.posix_problems(0o600, 8, 7) != ["owner=8"]:
+    bad.append("posix-owner")
 print("ok" if not bad else ";".join(bad))
 PY
 )
-assert_eq 'ok' "$SDDL_VERDICT" 'T10i SDDL classifier: broad/private/null/owner cases'
+assert_eq 'ok' "$CLASSIFIER_VERDICT" \
+    'T10i SDDL allowlist + POSIX mode/owner classifier cases'
 
 # --------------------------------------------------------------- T11 usage ---
 section 'T11 usage, argv hygiene and tool presence'
@@ -1106,13 +1321,18 @@ spec.loader.exec_module(batch)
 merge = batch.load_merge_tool()
 real = merge.write_output
 calls = {"n": 0}
+written = []
 def flaky(payload, path):
     calls["n"] += 1
     if calls["n"] == int(fail_at):
+        if mode == "replace" and written:
+            with open(written[0], "wb") as handle:
+                handle.write(b"substituted by another process\n")
         if mode == "exists":
             raise merge.MergeError("E_OUTPUT_EXISTS")
         raise OSError("injected")
     real(payload, path)
+    written.append(path)
 merge.write_output = flaky
 if mode == "unlink":
     import os
@@ -1120,8 +1340,10 @@ if mode == "unlink":
     state = {"n": 0}
     def flaky_unlink(path):
         # The atomic writer cleans its own private temp file in a finally
-        # block; only the delivery files are the rollback under test.
-        if os.path.basename(path).startswith(".mihomo-merge-"):
+        # block and the pre-write ACL probe does the same; only delivery files
+        # are the rollback under test.
+        base = os.path.basename(path)
+        if base.startswith(".mihomo-merge-") or base.startswith(".ha-acl-probe-"):
             return real_unlink(path)
         state["n"] += 1
         if state["n"] == 1:
@@ -1130,11 +1352,12 @@ if mode == "unlink":
     batch.os.unlink = flaky_unlink
 try:
     batch.generate(inventory, exports, delivery, "test-r1", merge=merge)
-    print("res code=NONE removed=0 complete=yes")
+    print("res code=NONE removed=0 skipped=0 complete=yes")
 except batch.BatchError as exc:
-    print("res code=%s removed=%d complete=%s" % (
-        exc.code, exc.rollback["removed"],
-        "yes" if exc.rollback["complete"] else "no"))
+    rb = exc.rollback or {"removed": 0, "skipped": 0, "complete": True}
+    print("res code=%s removed=%d skipped=%d complete=%s" % (
+        exc.code, rb["removed"], rb["skipped"],
+        "yes" if rb["complete"] else "no"))
 '
 rollback_case() { # <root> <fail_at> <mode> ; echoes driver output
     "$PY" -c "$ROLLBACK_DRIVER" "$TOOL" "$1/terminals.csv" "$1/exports" \
@@ -1145,7 +1368,7 @@ mk_tree "$T12" 3 2
 printf 'operator note\n' > "$T12/delivery/keep-me.txt"
 printf 'previous delivery\n' > "$T12/delivery/event-ob99-ha.yaml"
 R12="$(rollback_case "$T12" 2 oserror)"
-assert_contains "$R12" 'code=E_IO removed=1 complete=yes' \
+assert_contains "$R12" 'code=E_IO removed=1 skipped=0 complete=yes' \
     'T12a a mid-batch write failure rolls back the created profile'
 assert_eq 2 "$(count_entries "$T12/delivery")" 'T12a only the pre-existing files remain'
 assert_file "$T12/delivery/keep-me.txt" 'T12a unrelated file preserved'
@@ -1153,22 +1376,31 @@ assert_file "$T12/delivery/event-ob99-ha.yaml" 'T12a existing delivery preserved
 T12B="$TMP/t12b"
 mk_tree "$T12B" 3 2
 R12B="$(rollback_case "$T12B" 4 oserror)"
-assert_contains "$R12B" 'code=E_IO removed=3 complete=yes' \
+assert_contains "$R12B" 'code=E_IO removed=3 skipped=0 complete=yes' \
     'T12b a manifest write failure rolls back every profile'
 assert_eq 0 "$(count_entries "$T12B/delivery")" 'T12b the delivery directory is empty again'
 T12C="$TMP/t12c"
 mk_tree "$T12C" 3 2
 R12C="$(rollback_case "$T12C" 1 exists)"
-assert_contains "$R12C" 'code=E_OUTPUT_EXISTS removed=0 complete=yes' \
+assert_contains "$R12C" 'code=E_OUTPUT_EXISTS removed=0 skipped=0 complete=yes' \
     'T12c a no-clobber failure at write time reports E_OUTPUT_EXISTS'
 assert_eq 0 "$(count_entries "$T12C/delivery")" 'T12c nothing was left behind'
 T12D="$TMP/t12d"
 mk_tree "$T12D" 3 2
 R12D="$(rollback_case "$T12D" 2 unlink)"
-assert_contains "$R12D" 'code=E_IO removed=0 complete=no' \
+assert_contains "$R12D" 'code=E_IO removed=0 skipped=0 complete=no' \
     'T12d an incomplete rollback is reported as complete=no'
 assert_eq 1 "$(count_entries "$T12D/delivery")" \
     'T12d the file that could not be removed is still listed for the operator'
+T12E="$TMP/t12e"
+mk_tree "$T12E" 3 2
+R12E="$(rollback_case "$T12E" 2 replace)"
+assert_contains "$R12E" 'code=E_IO removed=0 skipped=1 complete=no' \
+    'T12e a substituted delivery file is NOT deleted by rollback'
+assert_eq 1 "$(count_entries "$T12E/delivery")" \
+    'T12e the substituted file is left as residual'
+assert_contains "$(cat "$T12E/delivery/event-ob01-ha.yaml")" 'substituted by another process' \
+    'T12e the substituted content is preserved for the operator'
 
 # -------------------------------------------------------- T13 redaction -----
 section 'T13 redaction under failure'
@@ -1275,6 +1507,45 @@ run_core_load --mihomo "$T15/fake/core" --expect-sha256 "$FAKE_HASH" \
     --delivery "$T15/delivery" --workdir "$T15/work" --expect-terminals 3
 [ "$RC" -eq 1 ] && [ "$ERR1" = 'core-load: FAIL E_MANIFEST' ] \
     && pass 'T15g an unexpected terminal count is refused' || fail "T15g (rc=$RC stderr=[$ERR])"
+# Manifest boundary: a path, a wrong-case duplicate or a bad name must not be
+# accepted by the validator.
+tamper_manifest() { # <python statement rewriting `doc`>
+    "$PY" - "$T15/delivery/ha-delivery-test-r1.json" "$1" <<'PY'
+import json
+import sys
+path, code = sys.argv[1], sys.argv[2]
+doc = json.load(open(path, encoding="utf-8"))
+exec(code)
+with open(path, "w", encoding="utf-8", newline="") as handle:
+    json.dump(doc, handle, sort_keys=True, indent=2)
+    handle.write("\n")
+PY
+}
+cp -R "$T3/delivery/." "$T15/delivery/"
+tamper_manifest 'doc["terminals"][0]["output"] = "../escape-ha.yaml"'
+run_core_load --mihomo "$T15/fake/core" --expect-sha256 "$FAKE_HASH" \
+    --delivery "$T15/delivery" --workdir "$T15/work"
+[ "$RC" -eq 1 ] && [ "$ERR1" = 'core-load: FAIL E_MANIFEST' ] \
+    && pass 'T15i a manifest output path with .. is refused' || fail "T15i (rc=$RC stderr=[$ERR])"
+cp -R "$T3/delivery/." "$T15/delivery/"
+tamper_manifest 'doc["terminals"][1]["name"] = "Event-OB01"; doc["terminals"][1]["output"] = "Event-OB01-ha.yaml"'
+run_core_load --mihomo "$T15/fake/core" --expect-sha256 "$FAKE_HASH" \
+    --delivery "$T15/delivery" --workdir "$T15/work"
+[ "$RC" -eq 1 ] && [ "$ERR1" = 'core-load: FAIL E_MANIFEST' ] \
+    && pass 'T15j case-duplicate manifest names are refused' || fail "T15j (rc=$RC stderr=[$ERR])"
+cp -R "$T3/delivery/." "$T15/delivery/"
+tamper_manifest 'doc["terminals"][0]["output"] = "sub\\event-ob01-ha.yaml"'
+run_core_load --mihomo "$T15/fake/core" --expect-sha256 "$FAKE_HASH" \
+    --delivery "$T15/delivery" --workdir "$T15/work"
+[ "$RC" -eq 1 ] && [ "$ERR1" = 'core-load: FAIL E_MANIFEST' ] \
+    && pass 'T15k a manifest output path with a separator is refused' || fail "T15k (rc=$RC stderr=[$ERR])"
+cp -R "$T3/delivery/." "$T15/delivery/"
+mv "$T15/delivery/ha-delivery-test-r1.json" "$T15/delivery/ha-delivery-evil name.json"
+run_core_load --mihomo "$T15/fake/core" --expect-sha256 "$FAKE_HASH" \
+    --delivery "$T15/delivery" --workdir "$T15/work"
+[ "$RC" -eq 1 ] && [ "$ERR1" = 'core-load: FAIL E_MANIFEST' ] \
+    && pass 'T15l a non-canonical manifest filename is refused' || fail "T15l (rc=$RC stderr=[$ERR])"
+rm -rf "$T15/delivery"; cp -R "$T3/delivery" "$T15/delivery"
 if [ -n "${HA02_MIHOMO:-}" ] && [ -n "${HA02_MIHOMO_SHA256:-}" ]; then
     T15R="$TMP/t15real"
     mkdir -p "$T15R"

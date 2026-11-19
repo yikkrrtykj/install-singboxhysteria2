@@ -23,12 +23,15 @@ import glob
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
 
 PROFILE_SUFFIX = "-ha.yaml"
 MANIFEST_GLOB = "ha-delivery-*.json"
+MANIFEST_RE = re.compile(r"\Aha-delivery-[A-Za-z0-9][A-Za-z0-9._-]{0,63}\.json\Z")
+CLIENT_NAME_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,31}\Z")
 
 E_USAGE = "E_USAGE"
 E_CORE_HASH = "E_CORE_HASH"
@@ -57,16 +60,29 @@ def file_sha256(path):
     return digest.hexdigest()
 
 
-def one_manifest(delivery):
+def find_manifest(delivery):
+    """The one canonical manifest file inside the delivery directory.
+
+    Restricted to the tool's own naming pattern and to a direct child of the
+    delivery directory, so a crafted or renamed file cannot point the loader at
+    a path outside the delivery.
+    """
+    if os.path.islink(delivery) or not os.path.isdir(delivery):
+        raise LoadError(E_MANIFEST)
     manifests = sorted(glob.glob(os.path.join(delivery, MANIFEST_GLOB)))
     if len(manifests) != 1:
         raise LoadError(E_MANIFEST)
+    path = manifests[0]
+    if (not MANIFEST_RE.match(os.path.basename(path)) or os.path.islink(path)
+            or not os.path.isfile(path)):
+        raise LoadError(E_MANIFEST)
+    return path
 
 
 def check_delivery(delivery, expect_terminals=None):
     """Verify the manifest and return [(name, profile_path)] in manifest order."""
-    one_manifest(delivery)
-    manifest_path = sorted(glob.glob(os.path.join(delivery, MANIFEST_GLOB)))[0]
+    manifest_path = find_manifest(delivery)
+    root = os.path.realpath(delivery)
     try:
         with open(manifest_path, encoding="utf-8") as handle:
             manifest = json.load(handle)
@@ -82,15 +98,26 @@ def check_delivery(delivery, expect_terminals=None):
     if manifest.get("terminal_count") != len(entries):
         raise LoadError(E_MANIFEST)
     files = []
-    seen = set()
+    seen_names = set()
+    seen_outputs = set()
     for entry in entries:
         name = entry.get("name")
         output = entry.get("output")
         if (not isinstance(name, str) or not isinstance(output, str)
-                or output != name + PROFILE_SUFFIX or name in seen):
+                or not CLIENT_NAME_RE.match(name)
+                or output != name + PROFILE_SUFFIX
+                or os.path.basename(output) != output
+                or "/" in output or "\\" in output):
             raise LoadError(E_MANIFEST)
-        seen.add(name)
+        # Docker-style case-insensitive duplicates break on the Windows target
+        # even when this host can hold both names.
+        if name.casefold() in seen_names or output.casefold() in seen_outputs:
+            raise LoadError(E_MANIFEST)
+        seen_names.add(name.casefold())
+        seen_outputs.add(output.casefold())
         path = os.path.join(delivery, output)
+        if os.path.dirname(os.path.realpath(path)) != root:
+            raise LoadError(E_MANIFEST)
         if not os.path.isfile(path) or os.path.islink(path):
             raise LoadError(E_MANIFEST)
         digest = file_sha256(path)

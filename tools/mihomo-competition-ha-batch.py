@@ -28,11 +28,13 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import ipaddress
 import json
 import os
 import re
 import stat
 import sys
+import tempfile
 import time
 
 MAX_INVENTORY_BYTES = 128 * 1024
@@ -72,43 +74,30 @@ EXIT_OK = 0
 EXIT_FAILED = 1
 EXIT_USAGE = 2
 
-# Windows allow-ACEs naming one of these principals expose a credential-bearing
-# directory to a class of local/domain identities wider than the operator, so
-# they are refused. This is a denylist by design: a site-specific local group
-# cannot be classified offline, so the documentation states that residual
-# explicitly instead of implying a complete ACL proof.
-BROAD_SIDS = frozenset({
-    "S-1-1-0",       # Everyone
-    "S-1-2-0",       # LOCAL
-    "S-1-2-1",       # CONSOLE LOGON
-    "S-1-5-2",       # NETWORK
-    "S-1-5-4",       # INTERACTIVE
-    "S-1-5-6",       # SERVICE
-    "S-1-5-7",       # ANONYMOUS LOGON
-    "S-1-5-11",      # Authenticated Users
-    "S-1-5-12",      # RESTRICTED
-    "S-1-5-15",      # This Organization
-    "S-1-5-19",      # LOCAL SERVICE
-    "S-1-5-20",      # NETWORK SERVICE
-    "S-1-5-32-545",  # BUILTIN\\Users
-    "S-1-5-32-546",  # BUILTIN\\Guests
-    "S-1-5-32-555",  # BUILTIN\\Remote Desktop Users
-    "S-1-5-113",     # LOCAL ACCOUNT
-    "S-1-5-114",     # LOCAL ACCOUNT AND MEMBER OF ADMINISTRATORS GROUP
-})
-BROAD_ALIAS = {
+# A Windows delivery directory is only accepted with a conservative
+# allowlist: the current operator, SYSTEM, Administrators, plus the two
+# owner/inheritance pseudo-principals when (and only when) they are limited to
+# inherited child objects. Every other allowed principal -- an unknown local or
+# domain group, an object/callback ACE, a missing or NULL DACL -- is refused.
+# This is deliberately not a general ACL engine and not a denylist.
+ALLOWED_PRINCIPAL_SIDS = frozenset({"S-1-5-18",      # NT AUTHORITY\SYSTEM
+                                    "S-1-5-32-544"})  # BUILTIN\Administrators
+INHERIT_ONLY_SIDS = frozenset({"S-1-3-0",           # CREATOR OWNER
+                               "S-1-3-4"})          # OWNER RIGHTS
+# Canonical SID spelling for the SDDL aliases a DACL can contain. Mapping is
+# for reporting (and to keep the allowlist comparison exact); aliases outside
+# the allowlist remain refused.
+SDD_ALIAS = {
+    "SY": "S-1-5-18", "BA": "S-1-5-32-544", "CO": "S-1-3-0", "OW": "S-1-3-4",
     "WD": "S-1-1-0", "NU": "S-1-5-2", "IU": "S-1-5-4", "SU": "S-1-5-6",
     "AN": "S-1-5-7", "AU": "S-1-5-11", "RC": "S-1-5-12", "LS": "S-1-5-19",
     "NS": "S-1-5-20", "BU": "S-1-5-32-545", "BG": "S-1-5-32-546",
-    "RD": "S-1-5-32-555",
+    "RD": "S-1-5-32-555", "AC": "S-1-15-2-1", "PS": "S-1-5-10",
 }
-TRUSTED_ALIAS = {"SY": "S-1-5-18", "BA": "S-1-5-32-544",
-                 "CO": "S-1-3-0", "OW": "S-1-3-4"}
-TRUSTED_OWNER_SIDS = frozenset({"S-1-5-18", "S-1-5-32-544"})
-DOMAIN_BROAD_RIDS = (513, 514, 515)   # Domain Users / Guests / Computers
 ALLOW_ACE_TYPES = frozenset({"A", "OA"})
-DOMAIN_SID_RE = re.compile(r"\AS-1-5-21-\d+-\d+-\d+-(\d+)\Z")
-OWNER_RE = re.compile(r"\AO:([^GDS]*)")
+DENY_ACE_TYPES = frozenset({"D", "OD"})
+IGNORED_ACE_TYPES = frozenset({"AU", "AL", "OU", "OL", "ML", "ID", "RA", "SP"})
+KNOWN_ACE_TYPES = ALLOW_ACE_TYPES | DENY_ACE_TYPES | IGNORED_ACE_TYPES
 
 _CURRENT_USER_SID = []
 
@@ -176,6 +165,34 @@ def path_key(path):
     return os.path.normcase(os.path.normpath(os.path.abspath(path))).casefold()
 
 
+def uuid_key(value):
+    """Credential identity of a canonical UUID: case-insensitive.
+
+    The canonical parser accepts upper and lower hex, and a UUID has no case
+    distinction, so two spellings of the same UUID are the same credential.
+    This key is used only for comparisons; build_output still copies the source
+    bytes, so the delivered UUID spelling is unchanged.
+    """
+    return value.lower()
+
+
+def normalize_server(value):
+    """Equivalent-address key for source-identity comparisons only.
+
+    IP literals compare by parsed value; hostnames compare case-insensitively
+    and without the DNS root dot. Two different keys therefore still prove two
+    different *addresses*, never two independent providers or fault domains.
+    """
+    try:
+        return "ip:" + str(ipaddress.ip_address(value))
+    except ValueError:
+        pass
+    name = value.casefold()
+    while name.endswith("."):
+        name = name[:-1]
+    return "dns:" + name
+
+
 def read_inventory(path):
     """Strict operator-file reader: no symlink, size cap, UTF-8, no NUL/tab.
 
@@ -184,6 +201,11 @@ def read_inventory(path):
     """
     if os.path.islink(path):
         raise BatchError(E_INVENTORY)
+    try:
+        if is_reparse(os.lstat(path)):
+            raise BatchError(E_INVENTORY)
+    except OSError:
+        raise BatchError(E_INVENTORY) from None
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(path, flags)
@@ -252,13 +274,25 @@ def parse_inventory(lines):
     return terminals
 
 
+def is_reparse(info):
+    """True for a Windows symlink, junction or any other reparse point.
+
+    `os.path.islink` is not sufficient: a directory junction is still
+    `S_ISDIR` and reports no link, but it redirects the path (and therefore the
+    credential check) elsewhere.
+    """
+    return bool(getattr(info, "st_file_attributes", 0)
+                & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+
+
 def check_directory(path, role):
     """An existing real directory that is not a link or reparse point."""
     try:
         info = os.lstat(path)
     except OSError:
         raise BatchError(E_PATH_CONFLICT, role=role) from None
-    if not stat.S_ISDIR(info.st_mode) or os.path.islink(path):
+    if (not stat.S_ISDIR(info.st_mode) or os.path.islink(path)
+            or is_reparse(info)):
         raise BatchError(E_PATH_CONFLICT, role=role)
 
 
@@ -267,14 +301,15 @@ def check_inventory_file(path):
         info = os.lstat(path)
     except OSError:
         raise BatchError(E_INVENTORY) from None
-    if not stat.S_ISREG(info.st_mode) or os.path.islink(path):
+    if (not stat.S_ISREG(info.st_mode) or os.path.islink(path)
+            or is_reparse(info)):
         raise BatchError(E_INVENTORY)
 
 
 def _sddl_dacl(sddl):
     start = sddl.find("D:")
     if start < 0:
-        return ""
+        return None
     section = sddl[start + 2:]
     end = section.find("S:")
     if end >= 0:
@@ -282,54 +317,89 @@ def _sddl_dacl(sddl):
     return section
 
 
+def _sddl_owner(sddl):
+    """Owner token from an SDDL string (`O:<owner><G|D|S>:...`).
+
+    The section marker letter sits immediately before its colon, so the owner
+    region ends at the first colon and may carry that trailing marker letter.
+    """
+    region = sddl[2:] if sddl.startswith("O:") else sddl
+    colon = region.find(":")
+    if colon < 0:
+        return region.strip()
+    token = region[:colon].strip()
+    if token and token[-1] in "GDS":
+        token = token[:-1]
+    return token
+
+
 def _canonical_sdd_sid(token):
     token = (token or "").strip()
     if token.startswith("S-"):
         return token
-    return BROAD_ALIAS.get(token) or TRUSTED_ALIAS.get(token) or token
+    return SDD_ALIAS.get(token, token)
+
+
+def sddl_aces(sddl):
+    """All DACL ACEs as (type, flags, sid-token) tuples, or None if unparsable."""
+    section = _sddl_dacl(sddl)
+    if section is None:
+        return None
+    aces = []
+    for match in re.finditer(r"\(([^()]*)\)", section):
+        fields = match.group(1).split(";")
+        if len(fields) != 6:
+            return None
+        ace_type, flags, _rights, _object, _inherit, sid = fields
+        aces.append((ace_type.strip(), flags.strip(), sid.strip()))
+    return aces
 
 
 def sddl_allow_aces(sddl):
     """Every allow-ACE in an SDDL DACL as (sid-token, rights-token) pairs."""
-    aces = []
-    for match in re.finditer(r"\(([^()]*)\)", _sddl_dacl(sddl)):
-        fields = match.group(1).split(";")
-        if len(fields) != 6:
-            continue
-        ace_type, _flags, rights, _object, _inherit, sid = fields
-        if ace_type in ALLOW_ACE_TYPES:
-            aces.append((sid.strip(), rights.strip()))
-    return aces
+    aces = sddl_aces(sddl) or []
+    return [(sid, "") for ace_type, _flags, sid in aces
+            if ace_type in ALLOW_ACE_TYPES]
 
 
-def broad_sid(sid):
-    """True when a SID token denotes a principal class wider than the operator."""
-    if sid in BROAD_SIDS:
-        return True
-    match = DOMAIN_SID_RE.match(sid)
-    return match is not None and int(match.group(1)) in DOMAIN_BROAD_RIDS
+def acl_problems(sddl, owner_token, current_user_sid):
+    """Classify one SDDL descriptor against the conservative allowlist.
 
-
-def sddl_problems(sddl, owner_token, current_user_sid):
-    """Classify one SDDL descriptor: [] means no known-broad exposure.
-
-    A NULL DACL (SDDL `NO_ACCESS_CONTROL`) grants everyone, and an owner other
-    than the current user, SYSTEM or Administrators can rewrite the DACL, so
-    both are refused.
+    [] means: a DACL is present, every allow-ACE names the current operator,
+    SYSTEM, Administrators, or an inherit-only owner pseudo-principal, every
+    ACE type is understood, and the owner cannot rewrite the DACL. Anything
+    else is refused; unknown principals are not assumed to be benign.
     """
     problems = []
+    aces = sddl_aces(sddl)
+    if aces is None:
+        problems.append("missing-dacl" if _sddl_dacl(sddl) is None
+                        else "unparsable-ace")
+        aces = []
     if "NO_ACCESS_CONTROL" in sddl:
         problems.append("null-dacl")
-    seen = []
-    for token, _rights in sddl_allow_aces(sddl):
+    for ace_type, flags, token in aces:
+        if ace_type in IGNORED_ACE_TYPES or ace_type in DENY_ACE_TYPES:
+            continue
+        if ace_type not in ALLOW_ACE_TYPES:
+            problems.append("ace-type=" + ace_type)
+            continue
         sid = _canonical_sdd_sid(token)
-        if broad_sid(sid) and sid not in seen:
-            seen.append(sid)
-    problems.extend("sid=" + sid for sid in seen)
+        if sid == current_user_sid or sid in ALLOWED_PRINCIPAL_SIDS:
+            continue
+        if sid in INHERIT_ONLY_SIDS and "IO" in flags:
+            continue
+        problems.append("principal=" + sid)
     owner = _canonical_sdd_sid(owner_token)
-    if owner and owner != current_user_sid and owner not in TRUSTED_OWNER_SIDS:
+    if not owner:
+        problems.append("missing-owner")
+    elif owner != current_user_sid and owner not in ALLOWED_PRINCIPAL_SIDS:
         problems.append("owner=" + owner)
     return problems
+
+
+# Kept as the platform-independent entry point the contract suite exercises.
+sddl_problems = acl_problems
 
 
 def _windows_token_sid():
@@ -436,23 +506,115 @@ def _windows_sddl(path):
         kernel32.LocalFree(descriptor)
 
 
+def posix_problems(mode, uid, euid):
+    """POSIX problems for one credential-bearing path; [] means private."""
+    problems = []
+    if mode & 0o077:
+        problems.append("mode=%03o" % mode)
+    if uid != euid:
+        problems.append("owner=%d" % uid)
+    return problems
+
+
+def posix_ancestor_writable(path):
+    """True when another local user could replace an ancestor of `path`.
+
+    A group/other-writable directory above the private root lets someone swap
+    the directory itself, so the private-mode check on the leaf alone is not a
+    boundary. Sticky directories (e.g. /tmp, 1777) are accepted: a sticky
+    directory does not let another user replace the operator's entry.
+    """
+    current = os.path.dirname(os.path.abspath(path))
+    while True:
+        try:
+            mode = stat.S_IMODE(os.stat(current).st_mode)
+        except OSError:
+            return True
+        if mode & 0o022 and not mode & stat.S_ISVTX:
+            return True
+        parent = os.path.dirname(current)
+        if parent == current:
+            return False
+        current = parent
+
+
+def windows_local_problem(path):
+    """Reject UNC and non-fixed local drives for credential-bearing paths."""
+    if path.startswith("\\\\") or path.startswith("//"):
+        return "unc"
+    drive = os.path.splitdrive(os.path.abspath(path))[0]
+    if not drive:
+        return "no-drive"
+    import ctypes
+    drive_type_fixed = 3
+    try:
+        drive_type = ctypes.windll.kernel32.GetDriveTypeW(drive + "\\")
+    except Exception:
+        return "drive-type-unreadable"
+    if drive_type != drive_type_fixed:
+        return "drive-type=%d" % drive_type
+    return None
+
+
+def check_local_boundary(path, role):
+    """Keep credential-bearing paths on private local storage."""
+    if os.name == "nt":
+        problem = windows_local_problem(path)
+        if problem is not None:
+            raise BatchError(E_INSECURE_PERMISSIONS, role=role,
+                             detail="boundary-" + problem)
+        return
+    if posix_ancestor_writable(path):
+        raise BatchError(E_INSECURE_PERMISSIONS, role=role,
+                         detail="boundary-ancestor-writable")
+
+
+def verify_temp_inheritance(directory):
+    """Prove the delivery directory's permissions are inherited by new files.
+
+    The canonical writer creates its private temp file in this same directory;
+    checking a probe file of the same shape before any sensitive write proves
+    the inherited ACL/mode rather than assuming it.
+    """
+    try:
+        fd, probe = tempfile.mkstemp(prefix=".ha-acl-probe-", dir=directory)
+    except OSError:
+        raise BatchError(E_INSECURE_PERMISSIONS, role="temp-probe",
+                         detail="create-failed") from None
+    try:
+        os.close(fd)
+        if os.name != "nt":
+            os.chmod(probe, 0o600)
+        check_private_path(probe, "temp-probe")
+    finally:
+        try:
+            os.unlink(probe)
+        except OSError:
+            pass
+
+
 def check_private_path(path, role):
     """Refuse a credential-bearing path other local principals can reach.
 
-    POSIX hosts are judged on their real mode bits. Windows hosts are judged on
-    the owner + DACL read from the kernel (never on `chmod`, which has no access
-    semantics on NTFS), because the exported profiles and the delivery
-    directory both carry credentials.
+    POSIX hosts are judged on the real mode bits and the file owner. Windows
+    hosts are judged on the owner + DACL read from the kernel (`chmod` has no
+    access semantics on NTFS) against a conservative allowlist: the current
+    operator, SYSTEM, Administrators, and inherit-only owner pseudo-principals.
+    Unknown allow principals, unparsable/unknown allow ACEs and missing or NULL
+    DACLs are refused. This is used for directories, source files, inventory
+    files and the delivered files themselves.
     """
     if os.name != "nt":
         try:
-            mode = stat.S_IMODE(os.stat(path).st_mode)
+            info = os.stat(path)
         except OSError:
             raise BatchError(E_INSECURE_PERMISSIONS, role=role,
                              detail="unreadable") from None
-        if mode & 0o077:
+        problems = posix_problems(stat.S_IMODE(info.st_mode), info.st_uid,
+                                  os.geteuid())
+        if problems:
             raise BatchError(E_INSECURE_PERMISSIONS, role=role,
-                             detail="mode=%03o" % mode)
+                             detail=problems[0])
         return
     try:
         current_user = _windows_token_sid()
@@ -460,8 +622,8 @@ def check_private_path(path, role):
     except Exception:
         raise BatchError(E_INSECURE_PERMISSIONS, role=role,
                          detail="acl-unreadable") from None
-    match = OWNER_RE.match(sddl)
-    problems = sddl_problems(sddl, match.group(1) if match else "", current_user)
+    match = _sddl_owner(sddl)
+    problems = acl_problems(sddl, match, current_user)
     if problems:
         raise BatchError(E_INSECURE_PERMISSIONS, role=role,
                          detail=problems[0])
@@ -478,6 +640,13 @@ def read_sources(terminals, exports_root, merge):
             if not os.path.exists(path):
                 raise BatchError(E_SOURCE_MISSING, terminal=terminal.name,
                                  vps=vps)
+            try:
+                if is_reparse(os.lstat(path)):
+                    raise BatchError(E_SOURCE_NOT_CANONICAL,
+                                     terminal=terminal.name, vps=vps)
+            except OSError:
+                raise BatchError(E_SOURCE_MISSING, terminal=terminal.name,
+                                 vps=vps) from None
             check_private_path(path, "source-" + vps)
         for vps, attr in (("A", "a"), ("B", "b")):
             path = paths[vps]
@@ -498,10 +667,12 @@ def read_sources(terminals, exports_root, merge):
 def check_batch_identity(terminals, merge):
     """Batch-wide A/B source and credential independence.
 
-    Two distinct server addresses do not prove two distinct providers, but a
-    batch in which one terminal claims a third "A" address, or reuses another
-    terminal's UUID/password, is a real operator error that must fail before
-    any file is written.
+    The canonical parser validates each document; this layer validates the
+    batch. Identity comparisons use normalised keys -- UUIDs are case-
+    insensitive, passwords stay case-sensitive, IP literals compare by value and
+    hostnames case-insensitively without the DNS root dot -- because two
+    spellings of one identity are one identity. Nothing here rewrites a source
+    byte, and two distinct address keys still do not prove two providers.
     """
     fingerprints = {"A": {}, "B": {}}
     uuids = {}
@@ -510,7 +681,7 @@ def check_batch_identity(terminals, merge):
         for vps in ("A", "B"):
             profile = getattr(terminal, vps.lower() + "_profile")
             fingerprint = sha256_hex(
-                profile.reality["server"].encode("utf-8"))[:16]
+                normalize_server(profile.reality["server"]).encode("utf-8"))[:16]
             fingerprints[vps].setdefault(fingerprint, 0)
             fingerprints[vps][fingerprint] += 1
         try:
@@ -518,9 +689,18 @@ def check_batch_identity(terminals, merge):
             merge.check_credentials(terminal.a_profile, terminal.b_profile)
         except merge.MergeError as exc:
             raise BatchError(exc.code, terminal=terminal.name) from None
+        # The merge tool compares the rendered strings; these comparisons also
+        # catch equivalent spellings (IPv6 forms, DNS case/trailing dot).
+        for profile in (terminal.a_profile, terminal.b_profile):
+            if (normalize_server(profile.reality["server"])
+                    != normalize_server(profile.hysteria["server"])):
+                raise BatchError(E_SOURCE_COLLISION, terminal=terminal.name)
+        if (normalize_server(terminal.a_profile.reality["server"])
+                == normalize_server(terminal.b_profile.reality["server"])):
+            raise BatchError(E_SOURCE_COLLISION, terminal=terminal.name)
         for vps in ("A", "B"):
             profile = getattr(terminal, vps.lower() + "_profile")
-            uuid = profile.reality["uuid"]
+            uuid = uuid_key(profile.reality["uuid"])
             password = profile.hysteria["password"]
             if uuid in uuids:
                 raise BatchError(E_CREDENTIAL_REUSE, terminal=terminal.name,
@@ -606,7 +786,8 @@ def manifest_document(config_version, inventory_sha, terminals, fingerprints,
             "config_version": config_version,
         },
         "canonical_validator": "tools/" + MERGE_TOOL_NAME,
-        "permission_gate": "windows-acl" if os.name == "nt" else "posix-mode",
+        "permission_gate": ("windows-acl-allowlist" if os.name == "nt"
+                            else "posix-mode-owner"),
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "inventory_sha256": inventory_sha,
         "terminal_count": len(terminals),
@@ -623,18 +804,34 @@ def manifest_document(config_version, inventory_sha, terminals, fingerprints,
 
 
 def rollback(created):
-    """Delete only the files this batch created; report anything left behind."""
+    """Delete only files that are still byte-identical to what this batch wrote.
+
+    `created` holds (path, sha256-of-written-bytes, size). A file whose current
+    content no longer matches may have been replaced by another process; it is
+    reported as skipped/residual instead of being deleted.
+    """
     removed = 0
+    skipped = 0
     complete = True
-    for path in reversed(created):
+    for path, expected_hash, expected_size in reversed(created):
         try:
+            if os.path.islink(path):
+                skipped += 1
+                complete = False
+                continue
+            with open(path, "rb") as handle:
+                data = handle.read(expected_size + 1)
+            if len(data) != expected_size or sha256_hex(data) != expected_hash:
+                skipped += 1
+                complete = False
+                continue
             os.unlink(path)
             removed += 1
         except FileNotFoundError:
             pass
         except OSError:
             complete = False
-    return {"removed": removed, "complete": complete}
+    return {"removed": removed, "skipped": skipped, "complete": complete}
 
 
 def read_back(path, expected):
@@ -670,7 +867,9 @@ def generate(inventory_path, exports_root, output_dir, config_version,
                        (output_dir, "output-dir")):
         check_directory(path, role)
         check_private_path(path, role)
+        check_local_boundary(path, role)
     check_private_path(inventory_path, "inventory")
+    check_local_boundary(inventory_path, "inventory")
     for path, role in ((a_dir, "exports-A"), (b_dir, "exports-B")):
         check_directory(path, role)
         check_private_path(path, role)
@@ -682,6 +881,9 @@ def generate(inventory_path, exports_root, output_dir, config_version,
         if output_key == source_key or output_key.startswith(
                 source_key + os.sep):
             raise BatchError(E_PATH_CONFLICT, role="output-dir")
+    # Prove the temp-file inheritance of the delivery directory before any
+    # sensitive write, then verify the real ACL/mode of every delivered file.
+    verify_temp_inheritance(output_dir)
 
     read_sources(terminals, exports_root, merge)
     fingerprints = check_batch_identity(terminals, merge)
@@ -737,8 +939,9 @@ def generate(inventory_path, exports_root, output_dir, config_version,
             except merge.MergeError as exc:
                 raise BatchError(exc.code, terminal=terminal.name,
                                  role="output") from None
-            created.append(output_path)
+            created.append((output_path, sha256_hex(payload), len(payload)))
             data = read_back(output_path, payload)
+            check_private_path(output_path, "output-file")
             written.append((terminal, output_path, sha256_hex(data), len(data)))
         document = manifest_document(config_version,
                                      sha256_hex(inventory_raw), terminals,
@@ -750,8 +953,10 @@ def generate(inventory_path, exports_root, output_dir, config_version,
             merge.write_output(manifest_payload, manifest_path)
         except merge.MergeError as exc:
             raise BatchError(exc.code, role="manifest") from None
-        created.append(manifest_path)
+        created.append((manifest_path, sha256_hex(manifest_payload),
+                        len(manifest_payload)))
         read_back(manifest_path, manifest_payload)
+        check_private_path(manifest_path, "manifest-file")
     except BaseException as exc:
         result = rollback(created)
         if isinstance(exc, BatchError):
@@ -803,8 +1008,8 @@ def report_failure(error):
         line += " detail=%s" % error.detail
     print(line, file=sys.stderr)
     if error.rollback is not None:
-        print("ha-batch: ROLLBACK removed=%d complete=%s"
-              % (error.rollback["removed"],
+        print("ha-batch: ROLLBACK removed=%d skipped=%d complete=%s"
+              % (error.rollback["removed"], error.rollback["skipped"],
                  "yes" if error.rollback["complete"] else "no"),
               file=sys.stderr)
 
