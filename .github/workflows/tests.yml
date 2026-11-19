@@ -386,6 +386,28 @@ jobs:
           bash -n tests/e3/test-m3-deploy.sh
           sudo -n env SBOX_E3_REQUIRE_LIVE=1 bash tests/e3/test-m3-deploy.sh
 
+      # Deterministic reproduction of the runner-image condition behind the
+      # E3 M3 main-CI failure: the fixture state root is mounted noexec, so an
+      # executable fixture placed there cannot run. The suite must still pass
+      # by keeping data under /run and running every stub from an exec-capable
+      # EXECROOT; it proves the noexec mount really rejects execution first.
+      - name: "E3 M3 deploy tooling under a simulated noexec state root (issue #96 E3 follow-up)"
+        if: matrix.os == 'ubuntu-24.04'
+        run: |
+          cat > "$RUNNER_TEMP/e3-m3-noexec.sh" <<'EOS'
+          set -euo pipefail
+          root=/run/sboxcm-m3-test
+          mkdir -p "$root"
+          mount -t tmpfs -o rw,nosuid,nodev,noexec,size=64m tmpfs "$root"
+          cleanup() {
+              if mountpoint -q -- "$root"; then umount -- "$root"; fi
+              rmdir -- "$root" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          SBOX_E3_REQUIRE_LIVE=1 SBOX_E3_EXPECT_FIX_NOEXEC=1 bash tests/e3/test-m3-deploy.sh
+          EOS
+          sudo -n unshare --mount --propagation private bash "$RUNNER_TEMP/e3-m3-noexec.sh"
+
       - name: "E3 M3-C Phase 2 LIVE (real socket/service + E3RpcClient + canonical worker/library)"
         run: |
           bash -n tests/e3/test-m3c-phase2-live.sh
