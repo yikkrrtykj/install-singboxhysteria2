@@ -43,14 +43,7 @@ export SB_LOCK_FILE="$SANDBOX/config.lock"
 info(){ :; }
 warning(){ printf '[warn] %s\n' "$*" >&2; }
 
-cat > "$SB_SING_BOX_BIN" <<'MOCK'
-#!/usr/bin/env bash
-case "${1:-}" in
-  check) exit 0 ;;
-  *) exit 2 ;;
-esac
-MOCK
-chmod +x "$SB_SING_BOX_BIN"
+install -m 0755 "$ROOT/tests/lib/mock-sing-box" "$SB_SING_BOX_BIN"
 
 SYSTEMCTL_MODE=stopped
 RELOAD_COUNT=0

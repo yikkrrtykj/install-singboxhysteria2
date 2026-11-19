@@ -53,20 +53,7 @@ trap 'exit 143' TERM
 getent group sboxweb >/dev/null 2>&1 || groupadd --system sboxweb
 getent passwd sboxweb >/dev/null 2>&1 || useradd --system --no-create-home -g sboxweb sboxweb
 mkdir -p /root/sbox "$APP" "$FIX"
-cat > /root/sbox/sing-box <<'MOCK'
-#!/usr/bin/env bash
-case "${1:-}" in
-  check) exit 0 ;;
-  generate)
-    case "${2:-}" in
-      uuid) printf 'uuid-%s-%s-%s\n' "$$" "$RANDOM" "$RANDOM" ;;
-      rand) printf 'pw-%s-%s-%s\n' "$$" "$RANDOM" "$RANDOM" ;;
-      *) exit 2 ;;
-    esac ;;
-  *) exit 2 ;;
-esac
-MOCK
-chmod 0755 /root/sbox/sing-box
+install -m 0755 "$ROOT/tests/lib/mock-sing-box" /root/sbox/sing-box
 # Deliberately non-canonical formatting proves that final equivalence is
 # semantic config + exact inventory, not raw-byte identity.
 cat > "$CONFIG" <<'JSON'

@@ -61,20 +61,7 @@ printf '#!/usr/bin/env bash\nexit 1\n' > "$SHIM/pgrep"
 chmod +x "$SHIM/pgrep"
 export PATH="$SHIM:$PATH"
 
-cat > "$SB/mock-sing-box" <<'MOCK'
-#!/usr/bin/env bash
-case "${1:-}" in
-    check) exit 0 ;;
-    generate)
-        case "${2:-}" in
-            uuid) printf 'uuid-%s-%s-%s\n' "$$" "$RANDOM" "$RANDOM" ;;
-            rand) printf 'pw-%s-%s-%s\n' "$$" "$RANDOM" "$RANDOM" ;;
-            *) exit 2 ;;
-        esac ;;
-    *) exit 2 ;;
-esac
-MOCK
-chmod +x "$SB/mock-sing-box"
+install -m 0755 "$ROOT/tests/lib/mock-sing-box" "$SB/mock-sing-box"
 
 warning(){ :; }
 info(){ :; }

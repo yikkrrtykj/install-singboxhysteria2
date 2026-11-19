@@ -38,11 +38,7 @@ trap cleanup EXIT; trap 'exit 130' INT; trap 'exit 143' TERM
 getent group sboxweb >/dev/null 2>&1 || groupadd --system sboxweb
 getent passwd sboxweb >/dev/null 2>&1 || useradd --system --no-create-home -g sboxweb sboxweb
 mkdir -p /root/sbox "$APP" "$FIX"
-cat > /root/sbox/sing-box <<'MOCK'
-#!/usr/bin/env bash
-case "${1:-}" in check) exit 0;; generate) [ "${2:-}" = uuid ] && printf 'uuid-%s\n' "$RANDOM" || printf 'pw-%s\n' "$RANDOM";; *) exit 2;; esac
-MOCK
-chmod 0755 /root/sbox/sing-box
+install -m 0755 "$ROOT/tests/lib/mock-sing-box" /root/sbox/sing-box
 cat > "$CONFIG" <<'JSON'
 {"inbounds":[{"type":"vless","tag":"vless-in","users":[{"name":"legacy","uuid":"LEGACY","flow":"xtls-rprx-vision"}]},{"type":"hysteria2","tag":"hy2-in","users":[{"name":"legacy","password":"PASS"}]}]}
 JSON

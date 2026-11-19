@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Shared test-only mock for the production `sing-box` CLI surface used by the
+# E3 LIVE suites. It is never installed on a real host and carries no secrets.
+#
+# Behaviour (union of the previously duplicated per-suite mocks):
+#   * check: succeeds unless the checked config is armed with __BROKEN__;
+#   * generate uuid|rand: unique values, separated by '-', for the fixture
+#     config audit;
+#   * when a file named `.mock-sleep` sits NEXT TO this mock, every invocation
+#     sleeps 3s first (slow-check experiments drive this through real code).
+#
+# Tests install this file with mode 0755:
+#   install -m 0755 "$ROOT/tests/lib/mock-sing-box" <destination>
+set -uo pipefail
+
+DIR="${0%/*}"
+[ -f "$DIR/.mock-sleep" ] && sleep 3
+
+case "${1:-}" in
+    check)
+        if grep -q "__BROKEN__" "${3:-}" 2>/dev/null; then exit 1; fi
+        exit 0 ;;
+    generate)
+        case "${2:-}" in
+            uuid) printf 'uuid-%s-%s-%s\n' "$$" "$RANDOM" "$RANDOM" ;;
+            rand) printf 'pw-%s-%s-%s\n' "$$" "$RANDOM" "$RANDOM" ;;
+            *) exit 2 ;;
+        esac ;;
+    *) exit 2 ;;
+esac

@@ -267,22 +267,7 @@ if [ "${SBOX_E3_EXPECT_FIX_NOEXEC:-0}" = "1" ]; then
     rm -f "$FIX/.noexec-probe.sh"
 fi
 
-cat > /root/sbox/sing-box <<'MOCK'
-#!/usr/bin/env bash
-case "${1:-}" in
-    check)
-        if grep -q "__BROKEN__" "${3:-}" 2>/dev/null; then exit 1; fi
-        exit 0 ;;
-    generate)
-        case "${2:-}" in
-            uuid) printf 'uuid-%s-%s-%s\n' "$$" "$RANDOM" "$RANDOM" ;;
-            rand) printf 'pw-%s-%s-%s\n' "$$" "$RANDOM" "$RANDOM" ;;
-            *) exit 2 ;;
-        esac ;;
-    *) exit 2 ;;
-esac
-MOCK
-chmod 0755 /root/sbox/sing-box
+install -m 0755 "$ROOT/tests/lib/mock-sing-box" /root/sbox/sing-box
 write_config() {
     cat > /root/sbox/sbconfig_server.json <<'JSON'
 {"inbounds":[

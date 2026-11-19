@@ -177,20 +177,7 @@ chmod 0777 "$FIX"
 # its sing-box is /root/sbox/sing-box, full stop. The fixture therefore has to
 # BE that path -- a `mock-sing-box` file would never be executed, credential
 # generation would fail and every mutation would come back E_INTERNAL.
-cat > "$SBROOT/sing-box" <<'MOCK'
-#!/usr/bin/env bash
-case "${1:-}" in
-    check) exit 0 ;;
-    generate)
-        case "${2:-}" in
-            uuid) printf 'uuid-%s-%s-%s\n' "$$" "$RANDOM" "$RANDOM" ;;
-            rand) printf 'pw-%s-%s-%s\n' "$$" "$RANDOM" "$RANDOM" ;;
-            *) exit 2 ;;
-        esac ;;
-    *) exit 2 ;;
-esac
-MOCK
-chmod 0755 "$SBROOT/sing-box"
+install -m 0755 "$ROOT/tests/lib/mock-sing-box" "$SBROOT/sing-box"
 cat > "$SBROOT/sbconfig_server.json" <<'JSON'
 {"inbounds":[
  {"type":"vless","tag":"vless-in","users":[{"name":"legacy","uuid":"LEGACY-UUID","flow":"xtls-rprx-vision"}]},
