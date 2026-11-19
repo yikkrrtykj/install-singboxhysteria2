@@ -27,7 +27,7 @@ def main():
     try:
         code=root/'code';(code/'quality_failover').mkdir(parents=True,mode=0o755)
         code.chmod(0o755)
-        for relative in ('quality-receiver-service.py','quality_failover/__init__.py','quality_failover/persistent.py',
+        for relative in ('quality-receiver-service.py','quality_failover/__init__.py','quality_failover/canonical.py','quality_failover/persistent.py',
                          'quality_failover/fleet.py','quality_failover/receiver.py','quality_failover/transport.py','quality_failover/policy.py'):
             destination=code/relative;shutil.copyfile(ROOT/'tools'/relative,destination);destination.chmod(0o644)
         module=code/'quality_failover/persistent.py'
