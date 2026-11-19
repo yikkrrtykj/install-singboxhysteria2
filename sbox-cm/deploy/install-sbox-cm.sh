@@ -34,13 +34,19 @@ UNIT_DIR="${SBXCM_UNIT_DIR:-/etc/systemd/system}"
 STATE_DIR="${SB_CM_STATE_DIR:-/var/lib/sbox-cm}"
 SYSTEMCTL="${SBXCM_SYSTEMCTL:-systemctl}"
 GROUP="${SBXCM_GROUP:-sboxweb}"
-SOCKET_UNIT="sbox-cm.socket"
-SERVICE_UNIT="sbox-cm.service"
 
 tgt() { printf '%s%s' "${PREFIX%/}" "$1"; }
 
 warn() { printf '[sbox-cm-deploy] %s\n' "$*" >&2; }
 die()  { warn "$*"; exit 1; }
+
+# Shared capability contract: ONE source for the sbox-cm unit names and the
+# libexec file list (also used by the E3 rollback). Names/paths only --
+# install/uninstall ordering, fail-closed behavior and state policy stay here.
+# shellcheck source=../../lib/sbox-cm-capability.sh
+. "$SRC_DIR/../lib/sbox-cm-capability.sh" || die "缺少共享 capability 合同"
+SOCKET_UNIT="$SBXCM_SOCKET_UNIT_NAME"
+SERVICE_UNIT="$SBXCM_SERVICE_UNIT_NAME"
 
 need_file() { [ -f "$1" ] || die "缺少文件: $1"; }
 

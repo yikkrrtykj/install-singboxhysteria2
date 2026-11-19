@@ -40,6 +40,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 from web.access import host_entry_for_ip
+from web.canonical_names import CLIENT_NAME_RE as E3_NAME_RE
 from web.e3_broker import BrokerUnavailable
 from web.e3rpc import RpcTransportError
 from p6_artifact import ArtifactError, read_artifact
@@ -244,7 +245,6 @@ P6_ERROR_HTTP = {
 # ---------------------------------------------------------------- M2 adapter --
 # Validation mirrors the helper's own schema (sbox-cm OPS table): the web
 # layer is the FIRST of the two defences, the helper re-validates in-lock.
-E3_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
 E3_KEY_RE = re.compile(r"^[A-Za-z0-9._:-]{16,128}$")
 E3_RESERVED_NAME = "legacy"
 IDEMPOTENCY_HEADER = "Idempotency-Key"

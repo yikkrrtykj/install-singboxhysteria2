@@ -47,6 +47,18 @@ E3_INSTALL_MONITOR="${E3_INSTALL_MONITOR:-$DEPLOY_DIR/install-monitor.sh}"
 E3_RELEASES_DIR="${E3_RELEASES_DIR:-/opt/singbox-monitor-releases}"
 BASELINE=""
 
+# Shared capability contract: ONE source for the sbox-cm unit names and the
+# libexec file list. The rollback tooling runs from the repository checkout
+# (same source tree as the installer); a missing contract fails closed instead
+# of guessing names. Only names/paths are shared -- R1/R3 ordering, failure
+# accounting, fail-closed checks and the state-retention policy stay below.
+# shellcheck source=../../lib/sbox-cm-capability.sh
+. "$(cd -- "$DEPLOY_DIR/../.." && pwd)/lib/sbox-cm-capability.sh" \
+    || { printf 'missing shared sbox-cm capability contract under the checkout\n' >&2; exit 1; }
+E3_SBXCM_UNIT_DIR="${E3_SBXCM_UNIT_DIR:-$SBXCM_UNIT_DIR_DEFAULT}"
+SBXCM_SOCKET_UNIT="$SBXCM_SOCKET_UNIT_NAME"
+SBXCM_SERVICE_UNIT="$SBXCM_SERVICE_UNIT_NAME"
+
 while (($# > 0)); do
     case "$1" in
         --baseline) BASELINE="${2:-}"; shift 2 ;;
@@ -68,23 +80,23 @@ printf '===== E3 M3 ROLLBACK =====\n'
 
 # R1: close the privileged plane (socket FIRST, then the service). A disable
 # failure must fail the rollback (never a silent pass).
-"$E3_SYSTEMCTL" stop sbox-cm.socket 2>/dev/null
-if ! "$E3_SYSTEMCTL" disable sbox-cm.socket >/dev/null 2>&1; then
-    fail "R1 disabling sbox-cm.socket FAILED"
+"$E3_SYSTEMCTL" stop "$SBXCM_SOCKET_UNIT" 2>/dev/null
+if ! "$E3_SYSTEMCTL" disable "$SBXCM_SOCKET_UNIT" >/dev/null 2>&1; then
+    fail "R1 disabling $SBXCM_SOCKET_UNIT FAILED"
 fi
-"$E3_SYSTEMCTL" stop sbox-cm.service 2>/dev/null
-if ! "$E3_SYSTEMCTL" disable sbox-cm.service >/dev/null 2>&1; then
-    fail "R1 disabling sbox-cm.service FAILED"
+"$E3_SYSTEMCTL" stop "$SBXCM_SERVICE_UNIT" 2>/dev/null
+if ! "$E3_SYSTEMCTL" disable "$SBXCM_SERVICE_UNIT" >/dev/null 2>&1; then
+    fail "R1 disabling $SBXCM_SERVICE_UNIT FAILED"
 fi
-SOCK_STATE="$("$E3_SYSTEMCTL" is-active sbox-cm.socket 2>/dev/null || true)"
-SVC_STATE="$("$E3_SYSTEMCTL" is-active sbox-cm.service 2>/dev/null || true)"
+SOCK_STATE="$("$E3_SYSTEMCTL" is-active "$SBXCM_SOCKET_UNIT" 2>/dev/null || true)"
+SVC_STATE="$("$E3_SYSTEMCTL" is-active "$SBXCM_SERVICE_UNIT" 2>/dev/null || true)"
 if [ "$SOCK_STATE" = "inactive" ] && [ "$SVC_STATE" = "inactive" ]; then
     pass "R1 privileged plane closed (socket+service stopped)"
 else
     fail "R1 privileged plane not fully closed (socket=[$SOCK_STATE] service=[$SVC_STATE])"
 fi
-for unit in sbox-cm.socket sbox-cm.service; do
-    if [ -f "/etc/systemd/system/$unit" ]; then
+for unit in "$SBXCM_SOCKET_UNIT" "$SBXCM_SERVICE_UNIT"; do
+    if [ -f "$E3_SBXCM_UNIT_DIR/$unit" ]; then
         EN="$("$E3_SYSTEMCTL" is-enabled "$unit" 2>/dev/null || true)"
         if [ "$EN" = "disabled" ]; then
             pass "R1 $unit is disabled"
@@ -118,19 +130,21 @@ fi
 
 # R3: uninstall THIS round's sbox-cm capability (the preflight guaranteed it
 # did not exist before this deployment). The state/audit tree is KEPT.
-rm -f /etc/systemd/system/sbox-cm.socket /etc/systemd/system/sbox-cm.service
+rm -f "$E3_SBXCM_UNIT_DIR/$SBXCM_SOCKET_UNIT" "$E3_SBXCM_UNIT_DIR/$SBXCM_SERVICE_UNIT"
 if ! "$E3_SYSTEMCTL" daemon-reload >/dev/null 2>&1; then
     fail "R3 systemctl daemon-reload FAILED after removing the units"
 fi
 rm -rf -- "$E3_SBXCM_LIBEXEC"
 CAP_GONE="yes"
-for f in "$E3_SBXCM_LIBEXEC/sbox-cm" "$E3_SBXCM_LIBEXEC/sbox-cm-ops" \
-         "$E3_SBXCM_LIBEXEC/lib/client-management.sh" \
-         "$E3_SBXCM_LIBEXEC/lib/sbox-cm-state.sh" \
-         /etc/systemd/system/sbox-cm.socket /etc/systemd/system/sbox-cm.service \
-         "$E3_SBXCM_SOCKET"; do
+for rel in "${SBXCM_LIBEXEC_FILE_LIST[@]}"; do
+    f="$E3_SBXCM_LIBEXEC/$rel"
     [ -e "$f" ] && { CAP_GONE="no"; fail "R3 capability path still present: $f"; }
 done
+for unit in "$SBXCM_SOCKET_UNIT" "$SBXCM_SERVICE_UNIT"; do
+    f="$E3_SBXCM_UNIT_DIR/$unit"
+    [ -e "$f" ] && { CAP_GONE="no"; fail "R3 capability path still present: $f"; }
+done
+[ -e "$E3_SBXCM_SOCKET" ] && { CAP_GONE="no"; fail "R3 capability path still present: $E3_SBXCM_SOCKET"; }
 if [ "$CAP_GONE" = "yes" ]; then
     pass "R3 capability uninstalled: all unit files, libexec binaries and lib scripts are gone (socket file included)"
 fi

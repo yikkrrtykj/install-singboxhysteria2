@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """Issue #48 opt-in protocol quality worker / HTTPS sink / offline profile preparation."""
 import argparse
-import importlib.util
 import ipaddress
 import ssl
 import sys
-from pathlib import Path
+from quality_failover.canonical import merge as canonical_merge
 from quality_failover.config import read_json, client
 from quality_failover.policy import AUTO, GROUP
 from quality_failover.runtime import run
@@ -18,10 +17,7 @@ class Parser(argparse.ArgumentParser):
 
 
 def prepare(name, primary_path, backup_path, output, config):
-    path = Path(__file__).with_name("mihomo-multi-vps-merge.py")
-    spec = importlib.util.spec_from_file_location("canonical_merge", path)
-    merge = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(merge)
+    merge = canonical_merge()
     if type(name) is not str or not merge.CLIENT_NAME_RE.fullmatch(name):
         raise ValueError("name")
     primary = merge.parse_export(primary_path, lambda: ValueError("canonical"))

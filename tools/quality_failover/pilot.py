@@ -1,7 +1,6 @@
 """Explicit, disposable real-protocol pilot; never attaches to a live Clash core."""
 import hashlib
 import http.client
-import importlib.util
 import ipaddress
 import json
 import os
@@ -17,6 +16,7 @@ import threading
 import time
 from urllib.parse import quote
 
+from .canonical import module
 from .config import read_json
 from .controller import alive
 from .policy import AUTO, GROUP, OUTER, number
@@ -113,13 +113,6 @@ def pinned_binary(path, digest):
     if hasher.hexdigest() != digest:
         raise ValueError("binary_digest")
     return path.resolve()
-
-
-def module(filename, name):
-    spec = importlib.util.spec_from_file_location(name, Path(__file__).resolve().parents[1] / filename)
-    value = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(value)
-    return value
 
 
 def tcp_port():

@@ -131,6 +131,14 @@ M3-B v1 只有这一条回滚路径：preflight 已证明 helper capability 在�
 都不会自动串联下一阶段。Phase 3 正式清单见
 `docs/e3-m3c-phase3-production-runbook.md`。
 
+## 共享 capability 合同
+
+`monitor-v2/deploy/e3-rollback.sh` 与 `sbox-cm/deploy/install-sbox-cm.sh` 现在共用
+`lib/sbox-cm-capability.sh`：unit 名称与 libexec 文件清单只在该文件维护，R1/R3 的
+停止/删除顺序、失败计数、fail-closed 检查与 state 保留策略仍保留在各自脚本中。
+rollback 工具必须在包含仓库 `lib/` 的 checkout/source tree 内运行；缺少该文件时
+rollback 会显式 fail-closed 退出，不会猜测 capability 名称。
+
 ## 测试
 
 `tests/e3/test-m3-deploy.sh`（CI 三基线 live fixture，ubuntu-24.04 另有

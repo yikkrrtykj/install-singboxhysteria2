@@ -106,6 +106,8 @@ Monitor 的采集模型、Web 安全边界与当前已知限制见 [monitor-v2/R
 
 ## 4. Windows 客户端交付
 
+本节的 P6Setup 是**可选的监控客户端**交付方式，用于需要 P6 设备监控、上传确认和后台服务的受控电脑。若只需要把 Clash/Mihomo 配置导入终端、不使用 P6 监控服务，可仅导入菜单 10 生成的逐客户端 `<name>-mihomo.yaml`（或 Monitor 客户端管理下载的逐客户端 YAML）到 Clash Verge Rev/Mihomo，不必安装 P6Setup；第 5 节的双 VPS 合并输出同样只是 Clash 配置，是否叠加 P6 监控客户端由终端用途决定。
+
 当前流程基于 Monitor 的客户端管理（E3 管理面）：
 
 1. 在 Monitor 的客户端管理中为每台电脑单独登记设备；同一客户端账号的不同电脑仍各有独立上传身份。
@@ -116,7 +118,7 @@ Monitor 的采集模型、Web 安全边界与当前已知限制见 [monitor-v2/R
 
 客户端管理入口依赖已评审的 E3 特权执行面（`sbox-cm`）。该平面部署后默认关闭，启用 / 停用与生产 go-live 按 [sbox-cm/README.md](sbox-cm/README.md) 与 [E3 M3 部署 runbook](docs/e3-m3-deploy-runbook.md) 的独立步骤执行；`install.sh` 既不安装也不启用它。
 
-下载包包含该设备的代理凭据和上传密钥，只供所选设备使用，请私密保管；`server.pem` 只用于客户端按固定证书验证连接，不导入系统证书库。标注为受控测试的 `lab` 包不能用于正式发布。Windows 客户端面向公司受控设备内部发行，固定内部签名身份、首次受控信任与签名策略见 [Code signing policy](docs/p6b2-free-signing.md)；生产包的发布要求见第 8 节，完整交付说明见 [Windows 客户端包](docs/windows-client-package.md)。
+下载包包含该设备的代理凭据和上传密钥，只供所选设备使用，请私密保管；`server.pem` 只用于 Monitor 客户端按固定证书验证连接，不导入系统证书库；它是 Monitor 链路信任材料，不是 HY2 服务端身份证明。规范 HY2 导出仍使用 legacy `skip-cert-verify: true`，HY2 服务端身份验证（证书链/固定 pinning 等）属 HA-03 范围，当前不声称已验证。标注为受控测试的 `lab` 包不能用于正式发布。Windows 客户端面向公司受控设备内部发行，固定内部签名身份、首次受控信任与签名策略见 [Code signing policy](docs/p6b2-free-signing.md)；生产包的发布要求见第 8 节，完整交付说明见 [Windows 客户端包](docs/windows-client-package.md)。
 
 ## 5. 双 VPS 双活配置生成
 
@@ -136,7 +138,7 @@ python3 tools/mihomo-multi-vps-merge.py \
 
 该流程完全离线、operator-local：只打开两个输入和一个输出；VPS A 不连接 VPS B，不同步服务端配置，不共享 UUID/密码，也没有中心数据库。生成结果只是客户端拓扑，不证明两台 VPS 分属不同运营商、ASN 或机房，也不代表业务级 HA。
 
-详细规则与验证方式见 [PR-48A 文档](docs/mihomo-multi-vps-failover-p48a.md)。竞赛用双 VPS 双活 HA 仍处于评审草案（**NOT ACCEPTED、默认 OFF**），其合同与验收门见 [HA 合同](docs/mihomo-competition-ha-contract.md) 和 [HA 验收](docs/mihomo-competition-ha-acceptance.md)；当前边界见第 8 节。
+详细规则与验证方式见 [PR-48A 文档](docs/mihomo-multi-vps-failover-p48a.md)。竞赛用双 VPS 双活 HA 的 **HA-01 合同文档已合并入 main**（PR #95，merge `f69d9976609b`），但真实 HA 运行时/应用/机群验收仍为 **NOT ACCEPTED、默认 OFF**；其合同与验收门见 [HA 合同](docs/mihomo-competition-ha-contract.md) 和 [HA 验收](docs/mihomo-competition-ha-acceptance.md)，当前边界见第 8 节。
 
 ## 6. Linux Mihomo 网关
 
@@ -209,7 +211,14 @@ sudo resolvectl dns "$IFACE" "$MIHOMO_IP" &&
 sudo ip -4 route replace default via "$MIHOMO_IP" dev "$IFACE"
 ```
 
-三条命令依次保留 SSH 回程、设置接口 DNS、切换 IPv4 默认网关。执行后必须新开一个 SSH 会话确认仍可登录，并检查默认路由、管理回程、系统 DNS 和 HTTPS 出口：
+三条命令依次保留 SSH 回程、设置接口 DNS、切换 IPv4 默认网关。执行后必须新开一个 SSH 会话确认仍可登录，并检查默认路由、管理回程、系统 DNS 和**透明** HTTPS 出口。
+
+透明出口验证必须显式绕过继承的代理设置，并另用实际业务 URL 验证一次：
+
+```bash
+curl -q -4 -fsS --noproxy '*' --max-time 10 https://api.ipify.org
+echo
+```
 
 ```bash
 ip -4 route get "$SSH_CLIENT_IP"
@@ -217,7 +226,7 @@ ip -4 route get 1.1.1.1
 resolvectl dns "$IFACE"
 ```
 
-持久化以 Ubuntu Netplan + 静态 IPv4 为例：备份现有 Netplan 文件，只替换该接口原有的 IPv4 默认路由与 DNS，保留其他地址和业务路由；为确认过的管理端保留一条回程路由。用 `sudo netplan generate && sudo netplan try --timeout 120` 试应用，在试用窗口内新开 SSH 会话复核；试用失败时从控制台恢复备份。恢复网关安装前配置使用 `mihomo-gateway-installer --restore /var/backups/mihomo-gateway/<备份目录名>`。
+持久化以 Ubuntu Netplan + 静态 IPv4 为例：备份现有 Netplan 文件，只替换该接口原有的 IPv4 默认路由与 DNS，保留其他地址和业务路由；为确认过的管理端保留一条回程路由。用 `sudo netplan generate && sudo netplan try --timeout 120` 试应用；只有在试用窗口内**新开 SSH 会话确认仍可登录**、默认路由/管理回程/系统 DNS 正确，且透明 `curl` 与实际业务 URL 验证通过后才确认；试用失败时从控制台恢复备份。恢复网关安装前配置使用 `mihomo-gateway-installer --restore /var/backups/mihomo-gateway/<备份目录名>`。
 
 ```yaml
 network:
@@ -305,13 +314,13 @@ sudo mihomo-gateway-installer --restore /var/backups/mihomo-gateway/<备份目�
 | Windows P6 客户端包 | 正式包要求 production scope + 内部时间戳发布者；`lab` 包仅受控测试 | [内部发行流程](docs/p6b2-internal-release.md)、[p6_distribution.py](monitor-v2/p6_distribution.py) |
 | Linux Mihomo 网关 | 产品功能（独立网关主机）；竞赛 HA 验收中 deferred | `install-linux-gateway.sh`；[HA 合同](docs/mihomo-competition-ha-contract.md) |
 | Windows 质量切换 EXE | 独立、opt-in 试验，不是 P6 监控服务的一部分 | [质量切换说明](docs/mihomo-quality-windows.md) |
-| 竞赛双 VPS 双活 HA | 评审草案，**NOT ACCEPTED、默认 OFF** | [HA 合同](docs/mihomo-competition-ha-contract.md)、[HA 验收](docs/mihomo-competition-ha-acceptance.md) |
+| 竞赛双 VPS 双活 HA | HA-01 合同已合并；真实运行时/应用验收 **NOT ACCEPTED、默认 OFF** | [HA 合同](docs/mihomo-competition-ha-contract.md)、[HA 验收](docs/mihomo-competition-ha-acceptance.md) |
 
 正式 Windows 包：生产包必须由内部固定发布者签署并带时间戳，发布时由操作员显式提供 `scope=production`；[`monitor-v2/p6_distribution.py`](monitor-v2/p6_distribution.py) 校验 `p6-windows-distribution/1` 清单，生产 scope 要求 `timestamped=true`、`installation=P6RemoteProbe`，发布者指纹必须匹配。root 发布入口是 `tools/publish-p6-windows.py`（部署时安装到受控 libexec）。内部签名身份的创建/复用、首次受控信任与普通更新见 [内部发行流程](docs/p6b2-internal-release.md)，签名策略与数据边界见 [Code signing policy](docs/p6b2-free-signing.md)。`lab` 包会明确标注为受控测试，不能自动变成正式包（仅保留显式过渡流程）。
 
 Windows 质量切换 EXE：`docs/mihomo-quality-windows.md` 所述的 `质量切换.exe` 是独立便携程序，按接收方显式操作启用，不安装服务，不改 TUN、自启动、Clash 配置或系统证书信任；现有 9191 的 P6 Windows 下载不包含它。它属于 opt-in 试验，构建、签名和接收方工作流见 [质量切换说明](docs/mihomo-quality-windows.md)；多用户 rollout 仍需单独的并发容量验收，不能由打包本身推定。
 
-竞赛双 VPS 双活 HA：合同状态为 **HA-01 review draft; NOT ACCEPTED; all new competition features default OFF**，验收文档明确 **No competition runtime/application/fleet PASS claimed**。第 5 节的合并工具只生成客户端拓扑，不声称 10s 故障恢复、10s 业务恢复、应用验收或机群验收；文档合并、CI 绿灯、204 响应或绿色节点都不等于真实应用验收。Linux Mihomo 网关是产品功能，但在竞赛交付中 deferred、不纳入该验收；`srt-cam` 与 Haivision SRT Tools 超出范围。
+竞赛双 VPS 双活 HA：HA-01 合同文档已合并入 main（PR #95，merge `f69d9976609b`），但真实 HA 运行时/应用/机群验收仍为 **NOT ACCEPTED；all new competition features default OFF**，验收文档明确 **No competition runtime/application/fleet PASS claimed**，冻结验收要求未改变。第 5 节的合并工具只生成客户端拓扑，不声称 10s 故障恢复、10s 业务恢复、应用验收或机群验收；文档合并、CI 绿灯、204 响应或绿色节点都不等于真实应用验收。Linux Mihomo 网关是产品功能，但在竞赛交付中 deferred、不纳入该验收；`srt-cam` 与 Haivision SRT Tools 超出范围。
 
 ## License / Code signing policy
 

@@ -1,12 +1,12 @@
 """Bounded streaming private client ZIP; signed software bytes stay unchanged."""
 import hashlib
 import io
-import re
 import struct
 import zipfile
 import zlib
 
 from p6_distribution import DistributionError, MAX_FILES, MAX_MANIFEST, object_json, validate_manifest_record
+from web.canonical_names import YAML_NAME_FULL_RE
 from web.p6_bundle import MAX_BUNDLE_BYTES
 
 MAX_CLIENT_PACKAGE = 70 * 1024 * 1024
@@ -46,7 +46,7 @@ class WindowsClientPackage:
         self.manifest = validate_manifest_record(manifest)
         require_client_package(stream, self.manifest)
         if type(bundle) is not bytes or not 0 < len(bundle) <= MAX_BUNDLE_BYTES \
-                or type(yaml_name) is not str or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,31}-mihomo.yaml', yaml_name) \
+                or type(yaml_name) is not str or not YAML_NAME_FULL_RE.fullmatch(yaml_name) \
                 or type(yaml) is not bytes or not 0 < len(yaml) <= 32768:
             raise DistributionError()
         self.archive = zipfile.ZipFile(stream)

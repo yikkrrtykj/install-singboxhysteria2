@@ -9,6 +9,7 @@ import zipfile
 from urllib.parse import urlsplit
 
 from p6_artifact import ArtifactError, MAX_ARTIFACT_BYTES, validate_manifest
+from web.canonical_names import CLIENT_NAME_FULL_RE
 
 MAX_BUNDLE_BYTES = 5 * 1024 * 1024
 PARTS_KEYS = {'format', 'yaml', 'profile', 'secret', 'certificate', 'artifact'}
@@ -66,7 +67,7 @@ def assemble(name, device, parts, generic):
     """
     try:
         for value in (name, device):
-            if type(value) is not str or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,31}', value):
+            if type(value) is not str or not CLIENT_NAME_FULL_RE.fullmatch(value):
                 raise BundleError()
         if type(parts) is not dict or set(parts) not in (PARTS_KEYS, PARTS_KEYS | {'display'}) or parts['format'] != 'p6-client-bundle-parts/1':
             raise BundleError()
