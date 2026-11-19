@@ -116,7 +116,9 @@ class QualityDownloadTests(BundleLinuxTests):
         manifest, raw = windows_fixture()
         package = WindowsClientPackage(io.BytesIO(raw), manifest, b'generic-bundle',
                                        valid, b'canonical YAML\n')
-        self.assertIn(valid, package.archive.namelist())
+        # The exported combined package carries the YAML as its own entry; the
+        # source software archive does not, so check the assembled entry table.
+        self.assertIn(valid, {name for name, *_rest in package.entries})
         for bad in ('client-mihomoXyaml', 'client_mihomo.yaml'):
             with self.assertRaises(DistributionError):
                 WindowsClientPackage(io.BytesIO(raw), manifest, b'generic-bundle',
