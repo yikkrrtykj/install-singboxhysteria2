@@ -68,7 +68,7 @@ M3-C Phase 1 是首选自动化编排；完整 D1–D5 与 V01–V11 契约见
 
 ```bash
 sudo bash monitor-v2/deploy/e3-preflight.sh --baseline-out /root/e3-baseline.json
-sudo bash monitor-v2/deploy/install-monitor.sh   # 既有 release 安装/回滚工具
+sudo bash monitor-v2/deploy/install-monitor.sh install   # 既有 release 安装/回滚工具（install 子命令）
 sudo bash sbox-cm/deploy/install-sbox-cm.sh install
 sudo systemctl enable --now sbox-cm.socket       # 只 enable socket；service 由首次 RPC 拉起
 sudo bash monitor-v2/deploy/e3-deploy-verify.sh --baseline /root/e3-baseline.json
