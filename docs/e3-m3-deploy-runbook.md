@@ -60,26 +60,32 @@ systemctl 仅用 is-active/is-enabled/show 等只读查询。
 
 ## M3-B — deploy-disabled 部署与验收
 
-### 手工部署/验收入口（仍可用，但非首选）
+### 部署/验收的安全边界（不是可复制的命令清单）
 
-M3-C Phase 1 是首选自动化编排；完整 D1–D5 与 V01–V11 契约见
-`docs/e3-m3c-phase1-production-runbook.md` 与 `monitor-v2/deploy/e3-deploy-verify.sh`。
-手工诊断/独立恢复时仍执行同一组已评审脚本（均不打开管理面）：
+M3-C Phase 1 是首选且唯一推荐的部署编排。正式部署、baseline 验证、
+reviewed release 安装（`upgrade --repair`）与回滚版本保留要求以
+`docs/e3-m3c-phase1-production-runbook.md`、`monitor-v2/deploy/e3-m3c-phase1.sh`
+及已评审脚本为准；本文不提供可整段粘贴执行的部署命令序列，也不构成执行授权。
 
-```bash
-sudo bash monitor-v2/deploy/e3-preflight.sh --baseline-out /root/e3-baseline.json
-sudo bash monitor-v2/deploy/install-monitor.sh install   # 既有 release 安装/回滚工具（install 子命令）
-sudo bash sbox-cm/deploy/install-sbox-cm.sh install
-sudo systemctl enable --now sbox-cm.socket       # 只 enable socket；service 由首次 RPC 拉起
-sudo bash monitor-v2/deploy/e3-deploy-verify.sh --baseline /root/e3-baseline.json
-```
+- **preflight 失败立即 STOP**：任何 FAIL（包括 existing-helper 拒绝）都必须停止，
+  不得继续安装、启用 socket 或执行后续阶段。
+- **不得用失败或过期 baseline 部署或回滚**：baseline 必须是本次 PASS 的 preflight
+  原子产生并经 mode/JSON/字段校验；失败、过期或不属于本次部署的 baseline 一律拒绝使用。
+- **只读诊断保留**：preflight/verify/rollback 的只读检查、日志与只读系统查询可用于
+  人工诊断。
+- **独立应急恢复必须显式授权**：仅在已获授权的独立恢复流程中，按 first-deploy
+  baseline 约束和保留的 R1–R4 应急回滚说明执行；不得把本文当作自动执行入口。
 
+所有底层工具（`e3-preflight.sh`、`install-monitor.sh`、`install-sbox-cm.sh`、
+`e3-deploy-verify.sh`、`e3-rollback.sh`）均保留，不新增 shell wrapper。
 部署后必须保持 `management_state = inactive`；任何 Phase 2/3 动作仍需各自的
-独立批准、reviewed HEAD 与证据链，本文不构成执行授权。
+独立批准、reviewed HEAD 与证据链。
 
 ### 回滚（`monitor-v2/deploy/e3-rollback.sh --baseline /root/e3-baseline.json`）
 
 回滚是 **fail-closed** 的编排：installer 缺失或不可执行、目标 release 缺失、rollback 命令失败、disable 失败、daemon-reload 失败、恢复后 live release id 与 baseline 不一致——任何一步失败 ⇒ `E3_M3_ROLLBACK=FAIL`。**rollback target 唯一来源 = `baseline.monitor.release_id`，不提供任何 override。**
+
+任何 preflight 未 PASS、baseline 非本次 PASS 原子生成/已过期或未经 mode/JSON 校验时，**禁止用该 baseline 执行回滚**；只能保留现状并走已授权的独立应急恢复/人工诊断。
 
 rollback tooling 与 `install-monitor.sh` **必须来自同一个 checkout/source tree 的同一 deploy 目录**（脚本用 `BASH_SOURCE` 解析自身目录作为默认 installer 路径，不再假设 `/opt/...` 下存在该脚本；测试可用 `E3_INSTALL_MONITOR` override）。
 
