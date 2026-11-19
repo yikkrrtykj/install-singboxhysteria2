@@ -15,5 +15,9 @@ PATTERN = r"[A-Za-z0-9][A-Za-z0-9._-]{0,31}"
 CLIENT_NAME_RE = re.compile(r"^" + PATTERN + r"$")
 # `.fullmatch` callers require the whole string; no anchors/`$` involved.
 CLIENT_NAME_FULL_RE = re.compile(PATTERN)
-# The canonical export file name is <client>-mihomo.yaml.
+# The canonical export file name is <client>-mihomo.yaml. The dot before yaml
+# is escaped DELIBERATELY: the previous inline pattern's unescaped '.' also
+# accepted a wrong separator such as 'client-mihomoXyaml'. Rejecting that is an
+# intentional fail-closed tightening (behaviour change recorded/tested), not a
+# claim of byte-identical regex semantics.
 YAML_NAME_FULL_RE = re.compile(PATTERN + r"-mihomo\.yaml")

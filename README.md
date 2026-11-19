@@ -54,7 +54,7 @@ miaomiao
 
 **配置修改走同一把锁**：添加、删除、迁移和 Phase D 升级等所有写入 `/root/sbox/sbconfig_server.json` 的操作都经过 `/root/sbox/config.lock`；flock 缺失、锁文件打不开或等待超时（默认 15s，可用 `SB_LOCK_TIMEOUT` 调整）都会直接中止，绝不无锁修改配置。生成客户端配置只做只读派生，不修改服务端配置。
 
-**菜单 3 的共享账号只用于展示**：`3. 显示客户端配置和 Linux 安装命令` 展示并写出保留的共享 `legacy` 账号（两个入站的首个用户），用于查看 Reality/HY2 链接与二维码、复制 sing-box 客户端 JSON、获取 Linux 网关安装命令；`/root/sbox/mihomo_client.yaml` 不是某个独立客户端的逐设备导出。需要按设备隔离凭据时，使用菜单 10 的“生成客户端配置”，或在 Monitor 的客户端管理中下载逐客户端 `<name>-mihomo.yaml`。
+**菜单 3 的共享账号只用于展示**：`3. 显示客户端配置和 Linux 安装命令` 展示并写出保留的共享 `legacy` 账号（两个入站的首个用户），用于查看 Reality/HY2 链接与二维码、复制 sing-box 客户端 JSON、获取 Linux 网关安装命令；`/root/sbox/mihomo_client.yaml` 不是某个独立客户端的逐设备导出。需要按设备隔离凭据时，使用菜单 10 的“生成客户端配置”（写入 `/root/sbox/clients/<name>/mihomo.yaml`），或在 Monitor 的客户端管理中下载逐客户端 `<name>-mihomo.yaml`；两者内容对应，但菜单 10 的落盘路径与 Monitor 下载包的命名不同。
 
 ## 3. Monitor 安装与使用
 
@@ -106,7 +106,7 @@ Monitor 的采集模型、Web 安全边界与当前已知限制见 [monitor-v2/R
 
 ## 4. Windows 客户端交付
 
-本节的 P6Setup 是**可选的监控客户端**交付方式，用于需要 P6 设备监控、上传确认和后台服务的受控电脑。若只需要把 Clash/Mihomo 配置导入终端、不使用 P6 监控服务，可仅导入菜单 10 生成的逐客户端 `<name>-mihomo.yaml`（或 Monitor 客户端管理下载的逐客户端 YAML）到 Clash Verge Rev/Mihomo，不必安装 P6Setup；第 5 节的双 VPS 合并输出同样只是 Clash 配置，是否叠加 P6 监控客户端由终端用途决定。
+本节的 P6Setup 是**可选的监控客户端**交付方式，用于需要 P6 设备监控、上传确认和后台服务的受控电脑。若只需要把 Clash/Mihomo 配置导入终端、不使用 P6 监控服务，可仅导入菜单 10 写入的 `/root/sbox/clients/<name>/mihomo.yaml` 到 Clash Verge Rev/Mihomo（Monitor 客户端管理下载的逐客户端 YAML 命名为 `<name>-mihomo.yaml`；两者内容对应但路径/命名不同），不必安装 P6Setup；第 5 节的双 VPS 合并输出同样只是 Clash 配置，是否叠加 P6 监控客户端由终端用途决定。
 
 当前流程基于 Monitor 的客户端管理（E3 管理面）：
 

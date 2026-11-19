@@ -36,6 +36,9 @@ E3_SYSTEMCTL="${E3_SYSTEMCTL:-systemctl}"
 E3_CONFIG="${E3_CONFIG:-/root/sbox/sbconfig_server.json}"
 E3_SBXCM_STATE="${E3_SBXCM_STATE:-/var/lib/sbox-cm}"
 E3_SBXCM_LIBEXEC="${E3_SBXCM_LIBEXEC:-/usr/local/lib/sbox-cm}"
+# P1 review fix: mirror the preflight default so a direct rollback invocation
+# (tests/fixtures may override it) never aborts under `set -u` on an unset var.
+E3_SBXCM_SOCKET="${E3_SBXCM_SOCKET:-/run/sbox-cm/sbox-cm.sock}"
 E3_MONITOR_URL="${E3_MONITOR_URL:-http://127.0.0.1:9191}"
 E3_MONITOR_APP="${E3_MONITOR_APP:-/opt/singbox-monitor}"
 E3_MONITOR_UNIT="${E3_MONITOR_UNIT:-singbox-monitor.service}"
@@ -47,15 +50,19 @@ E3_INSTALL_MONITOR="${E3_INSTALL_MONITOR:-$DEPLOY_DIR/install-monitor.sh}"
 E3_RELEASES_DIR="${E3_RELEASES_DIR:-/opt/singbox-monitor-releases}"
 BASELINE=""
 
-# Shared capability contract: ONE source for the sbox-cm unit names and the
-# libexec file list. The rollback tooling runs from the repository checkout
-# (same source tree as the installer); a missing contract fails closed instead
-# of guessing names. Only names/paths are shared -- R1/R3 ordering, failure
-# accounting, fail-closed checks and the state-retention policy stay below.
+# Shared capability contract: ONE source for the sbox-cm unit names, the fixed
+# unit directory and the libexec file list. The rollback tooling runs from the
+# repository checkout (same source tree as the installer/preflight); a missing
+# contract fails closed instead of guessing names. Only names/paths are shared
+# -- R1/R3 ordering, failure accounting, fail-closed checks and the
+# state-retention policy stay below.
 # shellcheck source=../../lib/sbox-cm-capability.sh
 . "$(cd -- "$DEPLOY_DIR/../.." && pwd)/lib/sbox-cm-capability.sh" \
     || { printf 'missing shared sbox-cm capability contract under the checkout\n' >&2; exit 1; }
-E3_SBXCM_UNIT_DIR="${E3_SBXCM_UNIT_DIR:-$SBXCM_UNIT_DIR_DEFAULT}"
+# P1 review fix: no new environment override. The unit directory is the shared
+# fixed default, identical to preflight's and the installer's default, so a
+# destructive rollback can never be retargeted by an extra env var.
+SBXCM_UNIT_DIR="$SBXCM_UNIT_DIR_DEFAULT"
 SBXCM_SOCKET_UNIT="$SBXCM_SOCKET_UNIT_NAME"
 SBXCM_SERVICE_UNIT="$SBXCM_SERVICE_UNIT_NAME"
 
@@ -96,7 +103,7 @@ else
     fail "R1 privileged plane not fully closed (socket=[$SOCK_STATE] service=[$SVC_STATE])"
 fi
 for unit in "$SBXCM_SOCKET_UNIT" "$SBXCM_SERVICE_UNIT"; do
-    if [ -f "$E3_SBXCM_UNIT_DIR/$unit" ]; then
+    if [ -f "$SBXCM_UNIT_DIR/$unit" ]; then
         EN="$("$E3_SYSTEMCTL" is-enabled "$unit" 2>/dev/null || true)"
         if [ "$EN" = "disabled" ]; then
             pass "R1 $unit is disabled"
@@ -130,7 +137,7 @@ fi
 
 # R3: uninstall THIS round's sbox-cm capability (the preflight guaranteed it
 # did not exist before this deployment). The state/audit tree is KEPT.
-rm -f "$E3_SBXCM_UNIT_DIR/$SBXCM_SOCKET_UNIT" "$E3_SBXCM_UNIT_DIR/$SBXCM_SERVICE_UNIT"
+rm -f "$SBXCM_UNIT_DIR/$SBXCM_SOCKET_UNIT" "$SBXCM_UNIT_DIR/$SBXCM_SERVICE_UNIT"
 if ! "$E3_SYSTEMCTL" daemon-reload >/dev/null 2>&1; then
     fail "R3 systemctl daemon-reload FAILED after removing the units"
 fi
@@ -141,7 +148,7 @@ for rel in "${SBXCM_LIBEXEC_FILE_LIST[@]}"; do
     [ -e "$f" ] && { CAP_GONE="no"; fail "R3 capability path still present: $f"; }
 done
 for unit in "$SBXCM_SOCKET_UNIT" "$SBXCM_SERVICE_UNIT"; do
-    f="$E3_SBXCM_UNIT_DIR/$unit"
+    f="$SBXCM_UNIT_DIR/$unit"
     [ -e "$f" ] && { CAP_GONE="no"; fail "R3 capability path still present: $f"; }
 done
 [ -e "$E3_SBXCM_SOCKET" ] && { CAP_GONE="no"; fail "R3 capability path still present: $E3_SBXCM_SOCKET"; }

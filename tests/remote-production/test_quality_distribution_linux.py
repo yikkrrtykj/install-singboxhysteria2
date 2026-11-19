@@ -100,6 +100,28 @@ class QualityDownloadTests(BundleLinuxTests):
         self.assertTrue(result['ok'],result)
         self.assertNotEqual(self.download()[0],200)
 
+    def test_quality_windows_yaml_name_literal_separator_only(self):
+        # P3 review fix: the shared canonical pattern must accept the real
+        # literal <client>-mihomo.yaml name and reject a wrong separator. The
+        # Windows bundle builder consumes the same pattern, so exercise both.
+        from web.canonical_names import YAML_NAME_FULL_RE
+        from web.p6_windows_bundle import WindowsClientPackage, DistributionError
+        from test_distribution import fixture as windows_fixture
+        valid = 'client-mihomo.yaml'
+        self.assertTrue(YAML_NAME_FULL_RE.fullmatch(valid))
+        for bad in ('client-mihomoXyaml', 'client_mihomo.yaml',
+                    'client-mihomoyaml', 'client-mihomo.yamlx',
+                    'client.mihomo.yaml', 'client/mihomo.yaml'):
+            self.assertIsNone(YAML_NAME_FULL_RE.fullmatch(bad), bad)
+        manifest, raw = windows_fixture()
+        package = WindowsClientPackage(io.BytesIO(raw), manifest, b'generic-bundle',
+                                       valid, b'canonical YAML\n')
+        self.assertIn(valid, package.archive.namelist())
+        for bad in ('client-mihomoXyaml', 'client_mihomo.yaml'):
+            with self.assertRaises(DistributionError):
+                WindowsClientPackage(io.BytesIO(raw), manifest, b'generic-bundle',
+                                     bad, b'y')
+
     def test_quality_publication_retries_preserve_tokens_and_changed_device_refused(self):
         before=(self.receiver_state/'receiver.json').read_bytes()
         real_active=publisher.active_bindings

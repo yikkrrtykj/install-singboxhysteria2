@@ -185,6 +185,25 @@ else
     fail 'worker lock probe is not read-only (B7)'
 fi
 
+# CLEAN-02: the sbox-cm capability descriptor is consumed by ALL THREE deploy
+# tools, and the unit directory is the same fixed default everywhere (the
+# installer keeps only its pre-existing fixture override SBXCM_UNIT_DIR).
+for f in sbox-cm/deploy/install-sbox-cm.sh monitor-v2/deploy/e3-preflight.sh \
+         monitor-v2/deploy/e3-rollback.sh; do
+    grep -qF 'lib/sbox-cm-capability.sh' "$ROOT/$f" \
+        && pass "capability contract consumer: $f" \
+        || fail "capability contract missing from $f"
+    grep -qF 'SBXCM_UNIT_DIR_DEFAULT' "$ROOT/$f" \
+        && pass "fixed unit-dir default consumer: $f" \
+        || fail "fixed unit-dir default missing from $f"
+    grep -qF 'SBXCM_LIBEXEC_FILE_LIST' "$ROOT/$f" \
+        && pass "shared libexec capability list consumer: $f" \
+        || fail "shared libexec capability list missing from $f"
+done
+grep -qF 'E3_SBXCM_UNIT_DIR' "$ROOT/monitor-v2/deploy/e3-rollback.sh" \
+    && fail 'rollback must not expose a new unit-dir environment override' \
+    || pass 'rollback exposes no new unit-dir environment override'
+
 printf '\nPASS=%d FAIL=%d SKIP=%d\n' "$PASS" "$FAIL" "$SKIP"
 [ "$FAIL" -eq 0 ] || { printf 'E3_M1_STATIC=FAIL\n'; exit 1; }
 printf 'E3_M1_STATIC=PASS\n'
