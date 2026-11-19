@@ -43,6 +43,15 @@ E3_MONITOR_UNIT="${E3_MONITOR_UNIT:-singbox-monitor.service}"
 E3_DISK_MIN_MB="${E3_DISK_MIN_MB:-1024}"
 BASELINE_OUT=""
 
+# Shared capability contract: ONE source for the sbox-cm unit directory, unit
+# names and the libexec file list (installer + preflight + rollback). The
+# tooling runs from the repository checkout; a missing contract fails closed.
+# No new environment override exists for these values.
+# shellcheck source=../../lib/sbox-cm-capability.sh
+. "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)/lib/sbox-cm-capability.sh" \
+    || { printf 'missing shared sbox-cm capability contract under the checkout\n' >&2; exit 1; }
+SBXCM_UNIT_DIR="$SBXCM_UNIT_DIR_DEFAULT"
+
 while (($# > 0)); do
     case "$1" in
         --baseline-out) BASELINE_OUT="${2:-}"; shift 2 ;;
@@ -62,14 +71,11 @@ printf '===== E3 M3 PRODUCTION PREFLIGHT (read-only) =====\n'
 # lib scripts, unit files) means an upgrade path is needed and this
 # preflight refuses to green-light a fresh deploy.
 CAP_PRESENT=""
-[ -e "$E3_SBXCM_LIBEXEC/sbox-cm" ] && CAP_PRESENT="$CAP_PRESENT sbox-cm"
-[ -e "$E3_SBXCM_LIBEXEC/sbox-cm-ops" ] && CAP_PRESENT="$CAP_PRESENT sbox-cm-ops"
-[ -e "$E3_SBXCM_LIBEXEC/lib/client-management.sh" ] \
-    && CAP_PRESENT="$CAP_PRESENT lib/client-management.sh"
-[ -e "$E3_SBXCM_LIBEXEC/lib/sbox-cm-state.sh" ] \
-    && CAP_PRESENT="$CAP_PRESENT lib/sbox-cm-state.sh"
-[ -e /etc/systemd/system/sbox-cm.socket ] && CAP_PRESENT="$CAP_PRESENT socket-unit"
-[ -e /etc/systemd/system/sbox-cm.service ] && CAP_PRESENT="$CAP_PRESENT service-unit"
+for rel in "${SBXCM_LIBEXEC_FILE_LIST[@]}"; do
+    [ -e "$E3_SBXCM_LIBEXEC/$rel" ] && CAP_PRESENT="$CAP_PRESENT $rel"
+done
+[ -e "$SBXCM_UNIT_DIR/$SBXCM_SOCKET_UNIT_NAME" ] && CAP_PRESENT="$CAP_PRESENT socket-unit"
+[ -e "$SBXCM_UNIT_DIR/$SBXCM_SERVICE_UNIT_NAME" ] && CAP_PRESENT="$CAP_PRESENT service-unit"
 if [ -z "$CAP_PRESENT" ]; then
     pass "P00 no sbox-cm capability present (clean first-deploy precondition)"
 else
@@ -245,14 +251,14 @@ fi
 
 # P00 guarantees NO capability at this point, so the sbox-cm state for the
 # baseline is derived from the actual (absent) unit/binary state.
-SB_SOCKET_STATE="$("$E3_SYSTEMCTL" is-active sbox-cm.socket 2>/dev/null || true)"
-SB_SERVICE_STATE="$("$E3_SYSTEMCTL" is-active sbox-cm.service 2>/dev/null || true)"
-SB_SOCKET_ENABLED="$("$E3_SYSTEMCTL" is-enabled sbox-cm.socket 2>/dev/null || true)"
-SB_SERVICE_ENABLED="$("$E3_SYSTEMCTL" is-enabled sbox-cm.service 2>/dev/null || true)"
+SB_SOCKET_STATE="$("$E3_SYSTEMCTL" is-active "$SBXCM_SOCKET_UNIT_NAME" 2>/dev/null || true)"
+SB_SERVICE_STATE="$("$E3_SYSTEMCTL" is-active "$SBXCM_SERVICE_UNIT_NAME" 2>/dev/null || true)"
+SB_SOCKET_ENABLED="$("$E3_SYSTEMCTL" is-enabled "$SBXCM_SOCKET_UNIT_NAME" 2>/dev/null || true)"
+SB_SERVICE_ENABLED="$("$E3_SYSTEMCTL" is-enabled "$SBXCM_SERVICE_UNIT_NAME" 2>/dev/null || true)"
 SOCKET_UNIT_PRESENT="no"
 SERVICE_UNIT_PRESENT="no"
-[ -f /etc/systemd/system/sbox-cm.socket ] && SOCKET_UNIT_PRESENT="yes"
-[ -f /etc/systemd/system/sbox-cm.service ] && SERVICE_UNIT_PRESENT="yes"
+[ -f "$SBXCM_UNIT_DIR/$SBXCM_SOCKET_UNIT_NAME" ] && SOCKET_UNIT_PRESENT="yes"
+[ -f "$SBXCM_UNIT_DIR/$SBXCM_SERVICE_UNIT_NAME" ] && SERVICE_UNIT_PRESENT="yes"
 MON_ENABLED="$("$E3_SYSTEMCTL" is-enabled "$E3_MONITOR_UNIT" 2>/dev/null || true)"
 MON_ACTIVE="$("$E3_SYSTEMCTL" is-active "$E3_MONITOR_UNIT" 2>/dev/null || true)"
 SB_ACTIVE="$("$E3_SYSTEMCTL" is-active sing-box.service 2>/dev/null || true)"

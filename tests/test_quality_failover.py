@@ -715,5 +715,21 @@ class StickyPolicyTests(unittest.TestCase):
             runner.cycle()
             self.assertEqual(mutations,["Hysteria2"])
 
+class CanonicalFactsTests(unittest.TestCase):
+    """One internal source for the topology names; drift from the canonical tool fails."""
+
+    def test_topology_names_match_canonical_merge_tool(self):
+        from quality_failover import canonical as canonical_facts
+        self.assertEqual(canonical_facts.NODES, MERGE.DUAL_MEMBERS)
+        self.assertEqual(canonical_facts.AUTO, MERGE.AUTO_GROUP_NAME)
+        outer = MERGE.GROUPS_SINGLE_OUTER[0].split(": ", 1)[1]
+        self.assertEqual(canonical_facts.OUTER, outer)
+        self.assertEqual(NODES, canonical_facts.NODES)
+        self.assertEqual(AUTO, canonical_facts.AUTO)
+        self.assertEqual(OUTER, canonical_facts.OUTER)
+        loaded = canonical_facts.merge()
+        for symbol in ("parse_export", "check_provenance", "build_output", "CLIENT_NAME_RE"):
+            self.assertTrue(hasattr(loaded, symbol), symbol)
+
 if __name__=="__main__":
     unittest.main()

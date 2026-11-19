@@ -2,10 +2,9 @@
 from dataclasses import dataclass
 import math
 
-NODES = ("Reality", "Hysteria2", "Backup-Reality", "Backup-Hysteria2")
-AUTO = "自动选择"
+from .canonical import AUTO, NODES, OUTER
+
 GROUP = "质量自动选择"
-OUTER = "节点选择"
 
 
 def number(value, low, high):

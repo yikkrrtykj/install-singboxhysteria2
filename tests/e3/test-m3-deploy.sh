@@ -55,7 +55,7 @@ PASS=0; FAIL=0; SKIP=0
 # the suite instead of quietly shrinking it. The noexec simulation adds its
 # own environment-verification assertion, so the expected total is explicit
 # for both invocation modes.
-EXPECTED_TOTAL=85
+EXPECTED_TOTAL=88
 if [ "${SBOX_E3_EXPECT_FIX_NOEXEC:-0}" = "1" ]; then
     EXPECTED_TOTAL=$((EXPECTED_TOTAL + 1))
 fi
@@ -363,7 +363,10 @@ export E3_CONFIG=/root/sbox/sbconfig_server.json
 export E3_SING_BOX_BIN=/root/sbox/sing-box
 export E3_SBXCM_STATE=/var/lib/sbox-cm
 export E3_SBXCM_LIBEXEC=/usr/local/lib/sbox-cm
-export E3_SBXCM_SOCKET=/run/sbox-cm/sbox-cm.sock
+# E3_SBXCM_SOCKET is intentionally NOT exported: rollback must mirror the
+# preflight default (/run/sbox-cm/sbox-cm.sock) without an explicit override.
+# Fixture-only override semantics remain available to callers that set it.
+
 export E3_MONITOR_URL="$BASE"
 export E3_MONITOR_APP="$RELLINK"
 
@@ -548,12 +551,24 @@ if [ -z "$(find "$FIX" -type f -perm /111 -print -quit 2>/dev/null)" ]; then
 else
     fail 'an executable fixture file lives inside the /run state root (noexec-prone)'
 fi
-RBOUT="$(E3_INSTALL_MONITOR="$STUB_INSTALLER" E3_RELEASES_DIR="$RELDIR" \
-    bash "$ROLLBACK" --baseline "$BASELINE")"
+# P1 regression: the removed E3_SBXCM_UNIT_DIR override must never retarget a
+# destructive rollback. The decoy directory is passed via the old env name and
+# must remain untouched while the real /etc/systemd/system units are removed.
+DECOY_UNITS="$EVIDENCE_DIR/decoy-units"
+rm -rf "$DECOY_UNITS"; mkdir -p "$DECOY_UNITS"
+printf 'decoy\n' > "$DECOY_UNITS/sbox-cm.socket"
+printf 'decoy\n' > "$DECOY_UNITS/sbox-cm.service"
+RBOUT="$(E3_SBXCM_UNIT_DIR="$DECOY_UNITS" E3_INSTALL_MONITOR="$STUB_INSTALLER" \
+    E3_RELEASES_DIR="$RELDIR" bash "$ROLLBACK" --baseline "$BASELINE")"
 RC=$?
 printf '%s' "$RBOUT" | grep -q 'E3_M3_ROLLBACK=PASS' \
     && pass 'rollback reports PASS (first-deploy inverse)' \
     || { FAIL=$((FAIL+1)); printf '  FAIL rollback (rc=%s):\n%s\n' "$RC" "$RBOUT"; }
+if [ -f "$DECOY_UNITS/sbox-cm.socket" ] && [ -f "$DECOY_UNITS/sbox-cm.service" ]; then
+    pass 'B3: ignored unit-dir override cannot retarget the destructive rollback (decoy intact)'
+else
+    fail 'B3: rollback followed the removed unit-dir override (decoy touched)'
+fi
 grep -qF "rollback $EXPECT_REL" "$SBOX_E3_M3_STUB_LOG" \
     && pass 'rollback invoked the packaging rollback with the BASELINE release id' \
     || fail 'rollback did not use the baseline release id'
@@ -844,6 +859,13 @@ grep -qF '/opt/singbox-monitor-releases/install-monitor.sh' \
 grep -qF '[ ! -x "$E3_INSTALL_MONITOR" ]' "$ROOT/monitor-v2/deploy/e3-rollback.sh" \
     && pass 'B2: R2 requires the installer to be EXECUTABLE' \
     || fail 'B2: R2 does not check installer executability'
+grep -qF 'E3_SBXCM_SOCKET="${E3_SBXCM_SOCKET:-/run/sbox-cm/sbox-cm.sock}"' \
+    "$ROOT/monitor-v2/deploy/e3-rollback.sh" \
+    && pass 'B3: rollback mirrors the preflight default socket path' \
+    || fail 'B3: rollback does not mirror the preflight default socket path'
+grep -qF 'E3_SBXCM_UNIT_DIR' "$ROOT/monitor-v2/deploy/e3-rollback.sh" \
+    && fail 'B3: rollback still accepts a new unit-dir environment override' \
+    || pass 'B3: rollback exposes no new unit-dir environment override'
 
 TOTAL=$((PASS + FAIL + SKIP))
 printf '\nPASS=%d FAIL=%d SKIP=%d\n' "$PASS" "$FAIL" "$SKIP"

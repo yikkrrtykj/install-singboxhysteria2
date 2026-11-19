@@ -28,14 +28,23 @@ set -uo pipefail
 DEPLOY_DIR="${SBXCM_DEPLOY_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}"
 SRC_DIR="$(cd -- "$DEPLOY_DIR/.." && pwd)"
 
+# Shared capability contract: ONE source for the sbox-cm unit directory, unit
+# names and the libexec file list (also consumed by E3 preflight/rollback).
+# Names/paths only -- install/uninstall ordering, fail-closed behavior and
+# state policy stay here. The existing fixture override SBXCM_UNIT_DIR is
+# preserved; its default now comes from the shared contract.
+# shellcheck source=../../lib/sbox-cm-capability.sh
+. "$SRC_DIR/../lib/sbox-cm-capability.sh" \
+    || { printf '[sbox-cm-deploy] 缺少共享 capability 合同\n' >&2; exit 1; }
+
 PREFIX="${SBXCM_PREFIX:-}"
 LIBEXEC="${SBXCM_LIBEXEC:-/usr/local/lib/sbox-cm}"
-UNIT_DIR="${SBXCM_UNIT_DIR:-/etc/systemd/system}"
+UNIT_DIR="${SBXCM_UNIT_DIR:-$SBXCM_UNIT_DIR_DEFAULT}"
 STATE_DIR="${SB_CM_STATE_DIR:-/var/lib/sbox-cm}"
 SYSTEMCTL="${SBXCM_SYSTEMCTL:-systemctl}"
 GROUP="${SBXCM_GROUP:-sboxweb}"
-SOCKET_UNIT="sbox-cm.socket"
-SERVICE_UNIT="sbox-cm.service"
+SOCKET_UNIT="$SBXCM_SOCKET_UNIT_NAME"
+SERVICE_UNIT="$SBXCM_SERVICE_UNIT_NAME"
 
 tgt() { printf '%s%s' "${PREFIX%/}" "$1"; }
 
@@ -164,6 +173,12 @@ cmd_install() {
         "$dest_libexec/lib/client-management.sh" || die "安装共享库失败"
     install -m 0644 "$SRC_DIR/../lib/sbox-cm-state.sh" \
         "$dest_libexec/lib/sbox-cm-state.sh" || die "安装状态库失败"
+    # The shared descriptor is the authoritative capability set: fail closed if
+    # the installed tree and the shared list ever diverge.
+    local rel
+    for rel in "${SBXCM_LIBEXEC_FILE_LIST[@]}"; do
+        [ -f "$dest_libexec/$rel" ] || die "安装后 capability 文件缺失: $rel"
+    done
 
     render_unit "$DEPLOY_DIR/sbox-cm.socket.in" "$dest_units/$SOCKET_UNIT"
     render_unit "$DEPLOY_DIR/sbox-cm.service.in" "$dest_units/$SERVICE_UNIT"

@@ -11,10 +11,11 @@ import tempfile
 from urllib.parse import urlsplit
 import zipfile
 
+from web.canonical_names import CLIENT_NAME_FULL_RE as NAME
+
 ROOT = '/var/lib/singbox-quality-distribution'
 PUBLISHER = '92E0176599764946F7E5AB332A5CEF150355BE9B'
 HEX = re.compile(r'[0-9a-f]{64}\Z')
-NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,31}\Z')
 
 
 class QualityUnavailable(ValueError):
