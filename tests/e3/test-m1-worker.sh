@@ -346,7 +346,6 @@ rm -f "$SB/.fixture-on" "$SB/.fixturepw-on"
 assert_eq true "$(jqv "$o" '.ok')" 'add exp-01 with the export fixtures'
 
 LEDGER_N="$(count "$LEDGER" '"kind":"intent"')"
-AUDIT_N="$(count "$AUDIT" '"request_id"')"
 CONFIG_N="$(sum "$SB_SERVER_CONFIG")"
 export MOCK_RELOAD=fail-once
 rm -f "$MOCK_RELOAD_COUNTER"

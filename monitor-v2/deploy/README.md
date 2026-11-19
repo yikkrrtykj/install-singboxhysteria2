@@ -1,13 +1,7 @@
-# Monitor v2 — Packaging / Installer / Deployment Track（skeleton）
+# Monitor v2 — Packaging / Installer / Deployment Track
 
-状态：**runtime 已接线（Integration Round 1，Draft PR）**。E2 Web Dashboard 已由本部署骨架
-真实启动（`SBMON_MODE=web` 默认）；E3（特权 helper）在并行对话开发，
-本分支**不实现、不伪造**它们的任何路径；只提供可运行的部署骨架、幂等 helper、测试与设计文档，
-最终由 integration 对话接上。
-
-- 基线：`main @ 3c6120441ee99c74faeb41a8122897395b2d7c94`（PR #10 merge 后）
-- 分支：`feature/monitor-packaging`
-- 本文所有结论以 main 实际代码为准（逐项注明出处），不是凭记忆。
+状态：**现行部署路径**。`install-monitor.sh` + 共享部署库 + systemd 单元为 Monitor 的唯一部署入口；E2 Web Dashboard 默认 `SBMON_MODE=web`；E3 privileged helper 默认 disabled，只按独立评审的 runbook 启用。
+早期 Round 0/1 的“骨架/Draft”与 `main @ 3c61204` 基线描述已过时；§11–§23 保留为历次集成/评审证据，当前状态以代码与 CI 为准。
 
 ## 兼容性预检与环境诊断（三 Ubuntu LTS 基线）
 
@@ -431,7 +425,7 @@ Monitor 升级**默认不得重启 sing-box** —— deploy 代码根本没有 s
 systemctl 调用并断言无 `sing-box` 字样。若某次升级明确涉及 sing-box 配置（如 service.api secret
 供给），那是 Phase D 事务（`upgrade_singbox_1_14`）的职责，走既有流程，不属于本骨架。
 
-## 8. install.sh 菜单接入（deferred hook，本分支不接线）
+## 8. install.sh 菜单接入（设计与当前状态均为 deferred hook；install.sh 不调用 install-monitor.sh）
 
 顶层菜单未来新增（例如 `11. Monitor / Web Dashboard`）→ 调用
 `monitor-v2/deploy/install-monitor.sh`（离线本机路径，不走 curl）。**本分支不改 install.sh**：
@@ -1200,3 +1194,35 @@ pass 各红 **3** 条，全部落在 T30 的哨兵机制上（钩子上报插入
 jr-deploy 464 / P2B 132 / E4-Diag 457）——本轮没有为了让数字好看而放宽任何门。
 功能面零改动：不动端点、
 不动探测、不动 schema、不部署、不接触生产。
+
+## 24. PR-6B remote-probe operator notes（原 `remote-probes-README.md` 合并）
+
+Issue [#67](https://github.com/yikkrrtykj/install-singboxhysteria2/issues/67) 是权威合同；PR #69 已合并（`be7fbc04`，Monitor 0.10.0 线）。以下为现行运行约束，不是草稿审批文本。
+
+### Registry authority
+
+运维方提供 `/etc/singbox-monitor/remote-probes.json`（普通文件，root:sboxweb 0640）、真实的非符号链接目录 `remote-probes.d`（root:sboxweb 0750）以及每个身份的 key（普通/不跟随符号链接，root:sboxweb 0640）。key 恰为 64 个小写十六进制字符，允许两侧 ASCII 空白。installer 永不生成或覆盖这些 secret。二进制、不可读、超大或不安全 key 会禁用该身份并暴露 `remote_config_invalid`，其他有效身份仍可用；畸形元数据禁用整个 remote 平面。
+
+### Evidence and continuity storage
+
+remote store 仅为 `<state>/remote-probes/remote-probes.sqlite3`（真实 0700 目录内 0600），与 History v5 及其部署 prestate 备份分离。schema v1 恰有 `remote_probe_samples`、`remote_probe_runs`、`remote_probe_receipts` 三表；receipt hash 为原 SHA-256 body 摘要（32 字节 BLOB）。只有通过认证的规范 evidence body 进入 sample 表；receipt 不含 payload 或凭据。未合并的旧 two-table draft v1 不兼容：启动时拒绝且不修改，绝不重建或静默删除；生产不提供迁移/reset 端点。
+
+Evidence 保留 **最多 7 天**；sample 计费为 `length(canonical body) + 256`/行，软目标 16 MiB / 硬上限 24 MiB。启动、接受与 status/read 均执行 retention；sample 压力只修剪最旧 evidence，run/receipt 权威仍保留。Run 权威只有在 **30 天无 accepted/valid retry 活动**后过期，其全部 receipts 共享该过期；重复活动刷新 run，equivocation/invalid 流量不刷新。
+
+| Resource | Frozen limit / accounting |
+| --- | --- |
+| Unexpired runs | 64/probe，4096 全局；1024 bytes/run，4 MiB 全局 |
+| Unexpired receipts | 131,072/probe，1,048,576 全局；256 bytes/receipt，256 MiB 全局 |
+| Sample evidence | body bytes + 256/row；soft 16 MiB / hard 24 MiB；age 7 days |
+| Main DB live and allocated pages | 320 MiB each，含全部表/索引 |
+| Whole working footprint | 1 GiB，含 main DB、DELETE journal 与回收 scratch |
+
+新准入按三份 320 MiB DB 副本 + 8 MiB journal/取整开销保守预留，remote 目录其他文件也计入，要求至少 648 MiB 可用 scratch；容量不足返回可重试 503 `remote_run_capacity` / `remote_receipt_capacity` / `remote_storage_capacity`，I/O/schema 失败返回 `remote_store_unavailable`。不逐出 live receipt/run；失败准入不推进 seq、不产生部分 accepted 状态。
+
+### Status and internal reads
+
+Remote status 包含 sample/receipt/run 独立计数与字节计费、live/allocated DB 字节、capacity code、retained_since_epoch 与 per-probe status。已启用但 180 秒（三个默认周期）无 sample 的 probe 为 `source_unavailable/probe_not_reporting`；freshness 用原始 sample_epoch，绝不用 receipt 或 HTTP 到达时间。预算修剪的 evidence 报 `degraded/remote_budget_pruned`。内部 retained-sample 读取最多 7 天窗口、256 行；label 仅来自当前 operator mapping，移除/禁用的 mapping 返回 retired metadata，不虚构 label；receipt 绝不作为 retained evidence 展示。不新增 PR-6C incident route、P5 schema 变更或 classifier/core-health 输入。
+
+### Reverse proxy validation
+
+在 nginx 的 **http context** include `remote-probes-proxy.conf.example`。示例支持 nginx >= 1.18.0（TLS），HTTP/2 可选；两个 zone 指令属于 http context，不使用 1.25.1 才有的 `http2 on`。只把精确 ingest path 转发到 loopback，保留 body/header 字节并限制缓冲；验证前由运维方提供证书/DNS/端口并以 `nginx -t` 校验。示例永不自动安装/激活；CI 在全部受支持 Ubuntu 基线上用一次性证书验证真实模板，并确认 nginx 拒绝旧的 server-context zone 放置。仅 HTTP/1.1 + 显式 Content-Length 可达 upstream；HTTP/1.0、chunked、缺失 CL 在 nginx 缓冲前返回 400。

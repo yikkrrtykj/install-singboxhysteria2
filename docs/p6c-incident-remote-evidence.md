@@ -1,4 +1,6 @@
-# Monitor 0.8.0 candidate: event-time device evidence
+# Monitor 0.8.0: event-time device evidence
+
+Status: P6C merged in PR #71 on 2026-10-08 (`79b9aecda9cb7ee6706e339d443c28e8f2323474`); this record retains the implementation and closeout evidence.
 
 Open **事件**, select an incident, then read **设备监测 · 事件时段**. The existing event judgment stays unchanged. The panel separately shows current reporting status and retained samples inside the stored event analysis window. **刷新设备记录** reloads those records; it neither starts a probe nor changes a device, service, Clash or TUN.
 
@@ -26,3 +28,22 @@ The registry lifecycle fence keeps labels coherent during a request. Storage/con
 Only the server/UI release changes. VERSION and MONITOR_WEB_VERSION move together to candidate 0.8.0, and executable release pins are restated. The Windows Agent, signed installer, sample/HMAC schemas, ingest/store/registry implementations, History v5, classifier, presenter and runtime stay unchanged. No credential rotation, Windows signing or long native resource test is required by this presentation change.
 
 CI runs the new real SQLite/HTTP tests plus the existing P5 exact-key, DOM, P6A/P6B, packaging and isolation suites. Existing VPS deployment follows review/merge through the established update flow; it is not performed by opening the panel. P6D and any standalone live device dashboard require separate scope.
+
+## P6C closeout checklist（原 `p6c-todo.md` 合并）
+
+Operator 于 2026-10-08 在 PR #70 合并与 existing-test-VPS 更新后授权。Base：`7c20a8251392d61f7f954292d0fe1ff9e4dbe056`；Monitor 版本 0.8.0；P6C 经评审并于 2026-10-08 随 PR #71 合并（`79b9aecda9cb7ee6706e339d443c28e8f2323474`）。History 保持 v5，remote store 保持 v1。
+
+- [x] 独立 session-gated GET `/api/v1/incidents/<incident_id>/remote-probes`。
+- [x] 严格有界 positive canonical incident ID；缺失 incident 404，不可读 History 503。
+- [x] 服务端派生 `analysis_start_epoch` → `last_classified_end_epoch`；URL bounds/limits/filters 不能改变它。
+- [x] 有界 retained sample projection：255 条 + 一条 truncation witness；receipt 不作为 evidence，不含 run/sequence/test 标识、key、endpoint 或原始请求字节。
+- [x] 当前 reporting 状态与历史 incident 记录分离；不从静默推断 Windows 服务停止或路径故障。
+- [x] Operator position/path label、retired mapping 不确定性、egress 变化、stale/unavailable 与 retention/budget 限制可见。
+- [x] DOM-safe 中文事件呈现，显式刷新，技术标识置于 details，passive cache 标注非独立。
+- [x] P5 list/detail keys、History/classifier/runtime/presenter 与 collection/ingest/storage 实现不变。
+- [x] 本地 23 项 P6C SQLite/HTTP 测试、129 项 DOM 检查、148 项 P5 行为检查与 230 项 Agent 行为检查通过。
+- [x] exact-head CI 验收：`9c8e69a46d2cad80db88935fe903f3a13666f570` 上全部 15 项检查与三个 workflow 通过；覆盖 Linux route/framing 与完整 packaging 回归。首次运行暴露过时的 pre-P6C static reference allowlist，P6C session dispatch 与 closed module-set gates 已在不删除 History/classifier isolation 检查的前提下重述授权范围。
+- [x] PR 评审与合并决定：PR #71 已合并；scope、schema、session dispatch 与 protected-path isolation 已评审。
+- [ ] 用 P6C 与 retired-device display fix（PR #72）更新现有 VPS；该 server/UI-only 变更无需重装 Windows。
+
+既有 P6B route group 曾在 Windows 上尝试并在故意拒绝的 chunked 请求中因 WinError 10053 中止；其余 143 项 P6B 检查本地通过。保留该限制；Linux CI 仍是必需，不伪造本地全量 PASS。本阶段只做 incident supporting-fact presentation，不新增 standalone live device overview、任意时间窗浏览、classifier 消费、ISP lookup、failover 或 P6D。Position/path label 是当前 operator 断言，不是 incident-time routing 证明；不同 label 不构成独立 uplink。No source silence is reported as network down。History byte/schema/prune 与 classifier 合同不变。

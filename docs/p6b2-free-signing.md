@@ -23,6 +23,6 @@
 
 MIT 许可仍是用户已确认的独立授权决定，第三方组件保留原许可证。发布前仍核对随包通知和隐私说明。
 
-当前管理员工具与测试只操作隔离测试证书，不更改现有 Windows 服务/Clash/TUN/VPS。用户已授权剩余条件解决且最终复核通过后合并；PR #70 在条件完成前仍为 Draft，生产部署和 P6C/P6D 未获授权。
+当前管理员工具与测试只操作隔离测试证书，不更改现有 Windows 服务/Clash/TUN/VPS。用户已授权剩余条件解决且最终复核通过后合并；PR #70 已合并（`7c20a825`）；本记录保留合并前的策略演进，生产部署和 P6C/P6D 未获授权。
 
 依据：[微软：企业受控信任可用于内部自签发行](https://learn.microsoft.com/en-us/windows/apps/package-and-deploy/code-signing-options)。Issue #67 §22 中用户最新的内部发行修订优先于历史公众签名准备说明。

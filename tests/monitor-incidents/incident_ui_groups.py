@@ -96,9 +96,6 @@ WIRE_COLUMNS = {"samples": WIRE_SAMPLE_COLUMNS,
                 "journal_events": WIRE_JOURNAL_COLUMNS,
                 "audit": WIRE_AUDIT_COLUMNS}
 
-# Identity / reader material that must NEVER appear on the evidence wire.
-FORBIDDEN_ROW_KEYS = {"run_id", "cycle_id", "result_version", "fp"}
-
 
 # -- harness plumbing ---------------------------------------------------------
 

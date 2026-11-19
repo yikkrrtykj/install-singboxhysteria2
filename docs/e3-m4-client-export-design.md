@@ -50,10 +50,9 @@ daemon's module docstring is updated to say exactly that (§5.3).
 ## 2. Current-state evidence (why each change is where it is)
 
 * Canonical transaction library: `lib/client-management.sh`
-  (SHA-256-pinned at install.sh:708 and
-  tests/e3/test-m0-static-contract.sh:35 — both pins are recomputed in the
-  same commit that edits the lib; tests/e3/test-m0-shared-lib.sh recomputes
-  and compares dynamically).
+  (SHA-256-pinned in `install.sh`; `tests/e3/test-m0-shared-lib.sh`
+  recomputes and compares the pin dynamically, and the loader contract is
+  checked by `tests/e3/test-m0-static-contract.sh`).
 * Renderer today: `install.sh` `write_mihomo_template()` (install.sh:980) —
   heredoc expanding caller-scope vars; TWO consumers: the installer's
   shared-account display path (install.sh:310) and
@@ -122,9 +121,9 @@ cm_render_client_mihomo_yaml <name> [config-path]   # YAML on stdout ONLY
   only if the shim proves awkward; the deciding rule: `generate_client_configuration`
   MUST go through the lib copy, because that is the copy the worker uses.
 * After editing the lib: recompute `SB_CLIENT_MANAGEMENT_SHA256` in
-  install.sh:708 AND the hardcoded digest in
-  tests/e3/test-m0-static-contract.sh:35 in the same commit
-  (test-m0-shared-lib.sh validates dynamically and needs no edit).
+  `install.sh` in the same commit (`test-m0-shared-lib.sh` validates the pin
+  dynamically and needs no edit; the loader verifies the selected library
+  before sourcing).
 
 ## 4. Layer 1 — root helper op `client.export` (sbox-cm-ops)
 
@@ -342,9 +341,9 @@ executable leak-scan regressions.
 
 * **A. Renderer (lib)**: `test-client-export-lib.sh` (new, add to CI list):
   byte-identical vs legacy `write_mihomo_template` output; modes preserved
-  via `generate_client_configuration`; digest pins recomputed
-  (test-m0-shared-lib.sh / test-m0-static-contract.sh must pass with the
-  new pins).
+  via `generate_client_configuration`; the dynamic digest pin
+  (test-m0-shared-lib.sh) must pass with the new pin and the loader contract
+  is checked by test-m0-static-contract.sh).
 * **B. Worker/RPC**: test-m1-worker.sh gains `wout client.export` cases:
   success shape `{format, filename, content}`; legacy exportable;
   missing client → E_NOT_FOUND; degraded → E_MANUAL_INTERVENTION;

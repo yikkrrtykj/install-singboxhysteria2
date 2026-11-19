@@ -186,10 +186,6 @@ def delay_route(status=200, payload=None):
     return status, body
 
 
-def delay_path(node):
-    return None  # placeholder (paths are matched by prefix in tests)
-
-
 def _run_counter():
     """Deterministic but DISTINCT run ids: the run identity must change on
     every new run (restart, rollback), so the fake source increments."""

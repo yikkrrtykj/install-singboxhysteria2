@@ -6,14 +6,14 @@
 M0    shared transaction / lock / rollback        ✅
 M0.5  step-up / web privilege boundary            ✅
 M1    sbox-cm privileged backend                  本目录
-M2    Web → sbox-cm adapter                       后续
-M3    production activation / canary              后续
+M2    Web → sbox-cm adapter                       ✅ 实现（仓库内）
+M3    production activation / canary              实现（仓库内，默认 disabled）
 
 E3 MANAGEMENT ENABLED = NO
 PRODUCTION DEPLOYED   = NO
 ```
 
-M1 只交付**特权执行面**：Web 接入（M2）、激活（M3）、生产 canary 都不在本轮。
+M1 交付**特权执行面**；M2 Web 接入与 M3 激活/canary 已在仓库内实现，但生产部署与管理面默认 disabled。
 
 ---
 

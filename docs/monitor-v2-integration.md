@@ -1,6 +1,6 @@
 # Monitor v2 Integration — Round 0 Record
 
-Status: **DRAFT — Round 1 runtime wiring + Round 1.1 hardening implemented, awaiting review.**
+Status: **SUPERSEDED RECORD — Round 1 runtime wiring + Round 1.1 hardening were merged in PR #16 (`5ac39978`); this document preserves the Round 0/1 evidence.**
 This document records verified code facts of the integration tree. Round 0 /
 0.1 assembled the four frozen tracks and closed Linux CI; Round 1 wired the
 reviewed E2 web runtime into the reviewed Packaging runtime (I0-2/I0-3/I0-4

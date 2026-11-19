@@ -808,10 +808,9 @@ recovery rotate 只降权不踢人；`management_active` 是阶段性 provider�
 
 - 用户视角 upload/download 方向映射（需按 API 视角说明，E1 不虚构）；
 - 数据库 / 历史曲线（totals 为 "Since monitor start"，非 all-time）；
-- Client Manager（Phase E3，明确不在本阶段）；
-- **mutation 真执行**：`client.add/delete`、`management.activate/deactivate`
-  的 sbox-cm 特权后端（AF_UNIX RPC + 共享 config.lock + 提交引擎）属 M1/M2；
-  M0.5 只交付已评审的授权门（step-up）与 501 边界，`management_active` 恒 false；
+- Client Manager：P6 客户端管理 UI 已交付（设备登记/客户端包）；E3 privileged mutation 仍默认 disabled，见 `sbox-cm/README.md`；
+- **mutation 真执行**：`client.add/delete`、`management.activate/deactivate` 的 sbox-cm 特权后端（AF_UNIX RPC + 共享 config.lock + 提交引擎）已在仓库内实现（M1/M2），但部署面保持 disabled/未启用；
+  M0.5 的已评审授权门（step-up）与 501 边界仍保留；
 - Reality-only RTT/retrans 增强（ss，可选）；
 - expected source IP 机械比对（外部测试阶段）；
 - 可信反代（trusted proxy）场景下的白名单来源设计。
@@ -872,3 +871,15 @@ Mihomo API（仅补充展示）:  version / mode / selected proxy / delay /
 只更新服务器，无需重装 Windows 客户端；不会修改 Clash/TUN、自启动或代理服务配置。
 记录独立保存7天，数据库最多16 MiB；具体权限、限制和回滚说明见
 [服务器证据说明](../docs/monitor-v2-host-evidence.md)。
+
+## 0.8.1：事件阅读（原 `docs/incident-reading-ux.md` 合并）
+
+事件打开时先说明含义、信号范围、既有评估与影响范围，以及最多三条主要事实。已知 connection/error baseline facts 用平实语言显示；完整 summary、全部 evidence/unknown 与可复制 token 位于 disclosure 之下。信号范围明确是首末跨度，绝不声称连续停机。
+
+“证据不足”表示已记录异常但原因和影响范围未知，不证明服务器健康、不指认元凶、不推荐切换协议。未识别文案保持原样。device brief 区分缺失历史记录与不可用数据；当前 reporting 状态在设备面板内单独标注。
+
+record-category 按钮位于固定高度滚动区域上方；从长 sample 表切换到短 journal 表不改变页面整体高度。raw rows 使用该区域内的嵌套 disclosure；缺失数据、读取失败、截断和 retention 提示无需打开原始值即可见。request generation fence 丢弃上一 section 或已关闭/替换 subject 的响应。journal 显示 label 已翻译，精确分组与原始字段保留。
+
+验收：144 项 DOM 行为检查通过，含默认 disclosure 状态、完整证据保留、literal future text、不确定性、missing/read-failed 记录和 delayed-response isolation。浏览器 fixture（80 samples + 16 journal rows）：旧 UI 页面高度 7,267→3,091 px、section bar 345→-47 px；固定区域后高度保持 1,446 px、bar 保持 345 px；空分类高度不变。以上为合成记录，不是生产遥测；桌面视觉预览已验证，移动端视觉验证未声称。
+
+范围与发布：仅 presentation 与公开 release identity 变化；VERSION / MONITOR_WEB_VERSION 为 0.8.1，精确 release 检查随动。Classifier、presenter、History v5、core/remote storage、ingest、evidence response contract、enrollment 与 Windows Agent 不变；服务器更新无需重装 Windows 客户端、无需签名变更或 native resource test。

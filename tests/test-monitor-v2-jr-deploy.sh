@@ -1972,7 +1972,6 @@ health_run 0  && pass "B7-C: health proof accepts a proven consumer view (no fal
 # in either direction: the absence loop below is a negative control, and a
 # verdict that depends on how the pipe drains is not a control at all.
 JR_SEC="$(awk '/^SBOXJR_USER=/{f=1} f{print}' "$LIB")"
-sec_has() { case "$JR_SEC" in *"$1"*) return 0 ;; *) return 1 ;; esac; }
 # The widening scans read CODE, not prose: this section documents the very
 # forms it refuses (that is how the reader learns why 0751 is forbidden), so a
 # comment-blind scan would either fire on the explanation or force the

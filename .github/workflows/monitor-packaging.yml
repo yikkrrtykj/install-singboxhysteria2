@@ -3,7 +3,7 @@ name: monitor-packaging
 on:
   pull_request:
   push:
-    branches: [main, feature/monitor-packaging]
+    branches: [main]
 
 # Superseded PR commits stop consuming runners; a main push is NEVER
 # auto-cancelled (the merge-SHA run is the authoritative record).

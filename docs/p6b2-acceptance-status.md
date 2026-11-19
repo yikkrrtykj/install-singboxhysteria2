@@ -1,10 +1,7 @@
 # P6B2 closeout status
 
 Updated 2026-10-07. Issue #67 section22 and current amendments are authoritative.
-The human has authorized merge after remaining conditions and final review.
-P6B2 implementation, scoped acceptance and product risk-path review are complete
-after the changed-source native comparison below. PR70 remains Draft/unmerged
-only while the final documentation head's CI and authorized merge are completed.
+PR #70 was subsequently merged (`7c20a825`, 2026-10-07); the historical receipts below remain the record of that merge-time decision. This status note updates only the merge state, not the acceptance evidence.
 This supersedes historical pending/MERGE=NO statements without waiving acceptance
 or authorizing production rollout/P6C/P6D. Original failed reports/verdicts remain
 unchanged; sampled field evidence is not a population-level causal proof.
