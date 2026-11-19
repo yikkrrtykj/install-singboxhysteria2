@@ -32,6 +32,13 @@ jobs:
           subprocess.run([sys.executable, '-B', 'tests/test_quality_publication_startup.py'], check=True)
       - name: Python syntax
         run: python -m py_compile tools/quality-receiver-service.py tools/quality_failover/persistent.py tests/quality-receiver-systemd-lab.py
+      # HA-02 native Windows evidence in the existing Windows job: the batch
+      # suite's Windows-only ACL, reparse, owner and per-file permission cases
+      # run against real NTFS DACLs. No new workflow or required check.
+      - name: "Competition HA batch and native Windows ACL contract (issue #48 HA-02)"
+        if: runner.os == 'Windows'
+        shell: bash
+        run: bash tests/test-mihomo-competition-ha-batch.sh
   systemd-credentials:
     runs-on: ubuntu-22.04
     steps:
