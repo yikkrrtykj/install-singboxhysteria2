@@ -619,15 +619,6 @@ assert_diff "$B" "$TMP/vpsB/$NAME-mihomo.yaml" 'the backup input is never modifi
 # Each block below is the exact counterexample raised in review, not a restated
 # generic check.
 
-expect_exact() { # <label> -- run the last merge and compare rc/stdout/stderr
-    local label=$1 want_rc=$2 want_err=$3
-    if [ "$RC" = "$want_rc" ] && [ "$OUT" = "" ] && [ "$ERR" = "$want_err" ]; then
-        pass "$label"
-    else
-        fail "$label (rc=$RC stdout=[$OUT] stderr=[$ERR])"
-    fi
-}
-
 expect_usage() { # <label> <args...> : fixed E_USAGE line, nothing echoed back
     local label=$1; shift
     run_merge "$@"

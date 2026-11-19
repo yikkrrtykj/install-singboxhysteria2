@@ -1,6 +1,6 @@
 # Monitor 0.4.x —— PR-4A 确定性事件分类器（issue #33 Phase 4，DARK）
 
-状态：**DRAFT PR，未合并、未部署**。
+状态：**已合并（PR #61，`a180e7dc`）**；本记录保留实现前的设计/判别证据，生产启用仍按 #33 后续阶段独立评审。
 基线：`main @ 965751c`（PR-3B 事务预状态，`VERSION = 0.4.0`）。
 分支：`codex/incident-classifier-p4a-033`。
 交付物：`monitor-v2/web/incident_classifier.py`（纯 stdlib、1151 行）

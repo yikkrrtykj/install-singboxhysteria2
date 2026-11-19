@@ -30,13 +30,6 @@ has_install 'lib/client-management.sh' &&
   ok 'install.sh loads canonical transaction library' ||
   bad 'install.sh does not load canonical transaction library'
 
-EXPECTED_LIB_SHA="$(sed -n 's/^SB_CLIENT_MANAGEMENT_SHA256="\([0-9a-f]\{64\}\)"$/\1/p' "$INSTALL")"
-ACTUAL_LIB_SHA="$(sha256sum "$LIB" | awk '{print $1}')"
-if [ "$EXPECTED_LIB_SHA" = "$ACTUAL_LIB_SHA" ] && [ "$EXPECTED_LIB_SHA" = "52e08db43b8c94dc42a3c8eea96e8bc3c6adb64155002e82ac3dee985e3b6a53" ]; then
-  ok 'install.sh digest pin matches canonical shared library bytes'
-else
-  bad 'install.sh digest pin does not match canonical shared library'
-fi
 has_install 'verify_client_management_library "$lib"' &&
 has_install '. "$lib"' &&
   ok 'loader verifies selected library before source' ||

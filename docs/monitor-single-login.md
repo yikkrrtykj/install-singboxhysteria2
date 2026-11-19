@@ -1,6 +1,6 @@
 # Monitor 单次登录与闲置退出
 
-2026-10-03 经用户确认，[Issue #67](https://github.com/yikkrrtykj/install-singboxhysteria2/issues/67) 中的单次登录约定取代普通客户端操作和下载的独立 300 秒密码确认。PR #70 仍为 Draft；这不是合并或生产部署授权。
+2026-10-03 经用户确认，[Issue #67](https://github.com/yikkrrtykj/install-singboxhysteria2/issues/67) 中的单次登录约定取代普通客户端操作和下载的独立 300 秒密码确认。PR #70 已合并（`7c20a825`）；这不构成生产部署授权。
 
 管理员密码登录成功后，同一个会话可管理客户端、登记/撤销设备、下载 YAML、设备配置包和 Windows 程序，无需再次输入密码。删除和撤销仍确认目标，后端仍检查来源、CSRF、实时管理状态、登记证明和审计；未确认的操作不会自动重试。
 

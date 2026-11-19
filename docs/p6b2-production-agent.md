@@ -424,7 +424,7 @@ under a private umask with a 0700 helper, generic uninstall/state preservation,
 and root-validator refusal of a private ancestor. Native Bundle tests are now
 23; shipped UI checks are 108. Prior independent PASS applies to its reviewed
 head only; this repair awaits independent review and actual test-VPS readback.
-PR #70 stays Draft; no merge, production deployment or P6C/P6D.
+PR #70 was merged (`7c20a825`); this record preserves the pre-merge review history (no production deployment, P6C/P6D was not authorized at that time).
 
 ## Graphical Windows manager and scoped controller discovery
 
@@ -472,7 +472,7 @@ temporary fallback staging keeps SYSTEM/Administrators authority.
 Real GUI/operator acceptance, offline/reboot/TUN/multiple-profile/resource
 benchmarks, production signing/distribution and independent review remain
 pending. Existing running lab service is unchanged while this slice is built.
-PR #70 stays Draft; no merge, production deployment, P6C or P6D.
+PR #70 was merged (`7c20a825`); this record preserves the pre-merge review history (no production deployment, P6C/P6D was not authorized at that time).
 
 ## Signed Windows software distribution (separate from device Bundle)
 
@@ -549,8 +549,7 @@ scope is labeled in the filename, response and Chinese instructions. The public
 nginx ingress still exposes only the existing machine ingest route.
 
 Production signer and actual signed GUI delivery/test-VPS publication remain
-pending. A server code update does not manufacture a signed EXE. PR #70 remains
-Draft; no merge, production deployment, P6C/P6D or whole P6B2 PASS is claimed.
+pending. A server code update does not manufacture a signed EXE. PR #70 was merged (`7c20a825`); this record preserves the pre-merge review history (no production deployment, P6C/P6D or whole P6B2 PASS was claimed at that time).
 
 
 ### P6B2 field repair boundary — HTTPS target and local storage diagnostics (2026-10-03)
@@ -595,7 +594,7 @@ does not initiate sampling/upload. Keep snapshot mutation-free. No endpoint
 replacement/proxying to force egress green; exact field egress cause remains
 pending. No new enrollment/profile mutation/SCM change/signing trust or test
 deployment in this source repair. Batch a new signed lab build only after tests.
-PR #70 remains Draft; whole COMPLETE/final review/MERGE/production deploy/P6C/P6D
+PR #70 was merged (`7c20a825`); at that time whole COMPLETE/final review/production deploy/P6C/P6D
 remain NO. Reboot/TUN/multi-profile/resource/retirement acceptance still pending.
 
 
