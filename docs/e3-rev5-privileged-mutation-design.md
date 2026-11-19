@@ -20,7 +20,7 @@
 | 设计基线 commit（唯一代码事实来源） | `3ee9a162a3fb53d9fddc95cb6eba95b3bcc5702e`（Round 2 head，I0-7 CLOSED） |
 | 行号口径 | 本文所有 `install.sh:N` 均为 **`git grep -n` 于 `3ee9a162…` 该 commit** 的结果；本地旧工作树行号一律作废 |
 | 上游设计 | rev4 设计稿（`docs/monitor-v2-e3-design.md`）——**不在基线 `3ee9a162` 树内**，仅历史沿革参考；rev5 实现所依赖的全部规范性 rev4 契约已折入本文附录 A–E（rev5 自包含，rev4 不作为活跃设计合入） |
-| Round 2 集成记录 | `docs/monitor-v2-integration.md`（基线树内权威 Integration 记录；L5 = provisional activation marker，E3 被阻塞） |
+| Round 2 集成记录 | PR #16（merge `5ac39978`）历史记录；原 `docs/monitor-v2-integration.md` 已随 CLEAN-04 退役，Git/PR 历史可查 |
 | 模式 | DESIGN / READ-ONLY。不连 VPS、不碰生产、不合并 PR #16/#17、不暴露 9191、不动 TLS/防火墙/凭据 |
 
 ---
@@ -52,7 +52,7 @@ rev5 不推翻 rev4 的事务语义，只**更换特权通道并收敛初始操�
 | # | 修正 |
 | --- | --- |
 | F-1 | 服务化基线事实修正：Round 2 起既有的 `singbox-monitor.service` 已以 `User=sboxweb` 运行（基线 `monitor-v2/deploy/` unit 实证）。rev5 **不**设计/供给新的 `sboxweb.service`；E2 = 既有 `singbox-monitor.service` 原地扩展（§1.1/§1.2/§9.2 G4/§10 M0.5/§13 B-4 已相应改写）。 |
-| F-2 | rev5 自包含：基线 `3ee9a162` 树内**不含** rev4 设计稿与 Round 2 报告；全部被实现阶段引用的规范性 rev4 契约折入本文附录 A–E；Round 2 引用改为基线树内的 `docs/monitor-v2-integration.md`。 |
+| F-2 | rev5 自包含：基线 `3ee9a162` 树内**不含** rev4 设计稿与 Round 2 报告；全部被实现阶段引用的规范性 rev4 契约折入本文附录 A–E；Round 2 记录见 PR #16（`5ac39978`）。 |
 | F-3 | step-up API 名修正：既有 E2 auth API 为 `auth.verify_password()`（非 `verify_secret`），§5.1 已更正。 |
 
 rev4 中被 rev5 实现阶段引用的全部规范性契约（幂等账本与调和、Idempotency-Key schema、锁契约 L1–L6、失败矩阵 F1–F22、凭据卫生/审计/UX 等全部 MUST/SHALL 规则）已**折入本文附录 A–E**——rev5 自包含，不依赖基线树中不存在的文件；rev4 文档仅作历史沿革参考，**不**作为活跃设计合入。文中 `E3-Txx` 为 rev4 历史测试矩阵的既有编号，其规范效力以附录重述的契约为准，具体测试由 G6 脚手架重建。
@@ -913,7 +913,7 @@ client.delete          = { name:string, idempotency_key:string(16..128) } // dea
 | B-3 | E2 无 step-up 端点、无吊销语义 | 本分支 web 路由表实证 | G3 / M0.5 |
 | B-4 | ~~E2 未服务化（无 sboxweb 用户/unit）~~ **基线事实修正（F-1）**：Round 2 起既有 `singbox-monitor.service` 已以 `User=sboxweb` 服务化运行；剩余工作 = 该既有 unit 的 E3 原地扩展与硬化定案（不新建 `sboxweb.service`） | 基线 `monitor-v2/deploy/` unit 实证 | G4 / M0.5 |
 | B-5 | sbox-cm.service 硬化旗标未实测（D-Bus/sandbox 交互） | §1.4 注 | M1 验收 |
-| B-6 | rev4 的 E3-T/legacy 测试套件不在本分支（CI 计数出自 `docs/monitor-v2-integration.md` 记录） | 本分支 tests/ 实际清单 | G6（脚手架重建；断言集以附录 A–E 契约为准） |
+| B-6 | rev4 的 E3-T/legacy 测试套件不在本分支（CI 计数见 PR #16 / `5ac39978` 历史记录） | 本分支 tests/ 实际清单 | G6（脚手架重建；断言集以附录 A–E 契约为准） |
 
 ---
 

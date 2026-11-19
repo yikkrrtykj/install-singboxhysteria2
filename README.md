@@ -116,7 +116,7 @@ Monitor 的采集模型、Web 安全边界与当前已知限制见 [monitor-v2/R
 4. 运行 `P6Setup.exe`（程序显示名“客户端管理”），核对自动识别的客户端和设备，再点击“安装 / 更新”。仅识别配置不会安装或启动服务。
 5. 安装后可在程序中查看采样、上传确认、队列和后台服务状态；关闭窗口后后台服务继续运行。
 
-客户端管理入口依赖已评审的 E3 特权执行面（`sbox-cm`）。该平面部署后默认关闭，启用 / 停用与生产 go-live 按 [sbox-cm/README.md](sbox-cm/README.md) 与 [E3 M3 部署 runbook](docs/e3-m3-deploy-runbook.md) 的独立步骤执行；`install.sh` 既不安装也不启用它。
+客户端管理入口依赖已评审的 E3 特权执行面（`sbox-cm`）。该平面部署后默认关闭，启用 / 停用与生产 go-live 按 [sbox-cm/README.md](sbox-cm/README.md) 与 [E3 M3 部署 runbook](docs/e3-m3-deploy-runbook.md) 的独立步骤执行；编排优先使用 M3-C 自动化流程（Phase 1/3 runbook），M3-B 手工流程仅保留用于人工诊断与独立应急回滚。`install.sh` 既不安装也不启用它。
 
 下载包包含该设备的代理凭据和上传密钥，只供所选设备使用，请私密保管；`server.pem` 只用于 Monitor 客户端按固定证书验证连接，不导入系统证书库；它是 Monitor 链路信任材料，不是 HY2 服务端身份证明。规范 HY2 导出仍使用 legacy `skip-cert-verify: true`，HY2 服务端身份验证（证书链/固定 pinning 等）属 HA-03 范围，当前不声称已验证。标注为受控测试的 `lab` 包不能用于正式发布。Windows 客户端面向公司受控设备内部发行，固定内部签名身份、首次受控信任与签名策略见 [Code signing policy](docs/p6b2-free-signing.md)；生产包的发布要求见第 8 节，完整交付说明见 [Windows 客户端包](docs/windows-client-package.md)。
 

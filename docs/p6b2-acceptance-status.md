@@ -257,8 +257,8 @@ Production VPS is not deployed.
    the human's conditional merge authorization. Merge-commit CI follows merge;
    production rollout remains separately authorized.
 
-Use [p6b2-todo.md](p6b2-todo.md) as the current checklist. Earlier receipts retain
-their historical build scope. Completed upload/export/recovery is not reset by
+The former closeout checklist has been retired as completed; its history remains
+in PR #70 / Git. Earlier receipts retain their historical build scope. Completed upload/export/recovery is not reset by
 local observer repairs, licensing or checklist updates. A historical generic LAB
 launcher diagnostic does not undo independently verified subsequent exports.
 
