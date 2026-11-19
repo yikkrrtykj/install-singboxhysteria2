@@ -175,6 +175,7 @@ fi
 case "$EXECROOT" in
     /run|/run/*)
         fail "executable fixture root [$EXECROOT] must not be under the noexec-prone /run"
+        rm -rf -- "$EXECROOT" 2>/dev/null
         trap - EXIT INT TERM
         printf '\nPASS=%d FAIL=%d SKIP=%d\nE3_M3_DEPLOY=FAIL\n' "$PASS" "$FAIL" "$SKIP"
         exit 1
@@ -202,7 +203,11 @@ export SBOX_E3_M3_SYSTEMCTL_LOG="$FIX/stub-systemctl.log"
 if [ "${SBOX_E3_EXPECT_FIX_NOEXEC:-0}" = "1" ]; then
     printf '#!/usr/bin/env bash\nprintf ran\n' > "$FIX/.noexec-probe.sh"
     chmod 0755 "$FIX/.noexec-probe.sh"
-    if "$FIX/.noexec-probe.sh" >/dev/null 2>&1; then
+    if [ ! -f "$FIX/.noexec-probe.sh" ]; then
+        fail 'could not create the execution probe inside the simulated noexec state root: experiment invalid'
+    elif [ -z "$(find "$FIX/.noexec-probe.sh" -perm /111 -print -quit 2>/dev/null)" ]; then
+        fail 'the execution probe inside the simulated noexec state root lacks executable mode bits: experiment invalid'
+    elif "$FIX/.noexec-probe.sh" >/dev/null 2>&1; then
         fail 'simulated noexec state root is actually executable: the experiment does not prove the noexec contract'
     else
         pass 'simulated noexec state root rejects execution: executable/state separation is under test'
@@ -410,7 +415,7 @@ printf '%s' "$P00_OUT" | grep -qF 'existing sbox-cm deployment requires a separa
     || fail 'the freeze message wording is wrong'
 
 # partial libexec: remove one of the two binaries -> still FAIL, accurate list
-mv /usr/local/lib/sbox-cm/sbox-cm-ops "$FIX/sbox-cm-ops.saved"
+mv /usr/local/lib/sbox-cm/sbox-cm-ops "$EXECROOT/sbox-cm-ops.saved"
 P00_PARTIAL="$(bash "$PREFLIGHT" 2>&1 || true)"
 printf '%s' "$P00_PARTIAL" | grep -qF 'existing sbox-cm deployment requires a separately reviewed upgrade path' \
     && pass 'partial helper capability still FAILS (freeze holds)' \
@@ -418,7 +423,7 @@ printf '%s' "$P00_PARTIAL" | grep -qF 'existing sbox-cm deployment requires a se
 bash "$PREFLIGHT" 2>&1 | grep -qF 'sbox-cm-ops' \
     && fail 'partial helper capability wrongly reported sbox-cm-ops as present' \
     || pass 'partial enumeration is accurate (sbox-cm-ops reported absent)'
-mv "$FIX/sbox-cm-ops.saved" /usr/local/lib/sbox-cm/sbox-cm-ops
+mv "$EXECROOT/sbox-cm-ops.saved" /usr/local/lib/sbox-cm/sbox-cm-ops
 
 # D4: socket-only enablement -- the service must stay inactive
 systemctl enable --now sbox-cm.socket >/dev/null 2>&1 \
@@ -579,7 +584,7 @@ if [ "$FAILINST_RC" -ne 0 ]; then
 else
     fail 'rollback with an executable installer that fails must FAIL'
 fi
-if printf '%s' "$FAILINST_OUT" | grep -qF 'R2 install-monitor.sh rollback to [rel-0001] FAILED'; then
+if printf '%s' "$FAILINST_OUT" | grep -qF "R2 install-monitor.sh rollback to [$EXPECT_REL] FAILED"; then
     pass 'failing-installer refusal reports the rollback-command failure (not the executability gate)'
 else
     fail 'failing-installer refusal did not report the rollback-command failure'
