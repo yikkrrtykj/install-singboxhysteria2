@@ -47,3 +47,7 @@ Operator 于 2026-10-08 在 PR #70 合并与 existing-test-VPS 更新后授权�
 - [ ] 用 P6C 与 retired-device display fix（PR #72）更新现有 VPS；该 server/UI-only 变更无需重装 Windows。
 
 既有 P6B route group 曾在 Windows 上尝试并在故意拒绝的 chunked 请求中因 WinError 10053 中止；其余 143 项 P6B 检查本地通过。保留该限制；Linux CI 仍是必需，不伪造本地全量 PASS。本阶段只做 incident supporting-fact presentation，不新增 standalone live device overview、任意时间窗浏览、classifier 消费、ISP lookup、failover 或 P6D。Position/path label 是当前 operator 断言，不是 incident-time routing 证明；不同 label 不构成独立 uplink。No source silence is reported as network down。History byte/schema/prune 与 classifier 合同不变。
+
+### 历史回执补充（原 `p6c-todo.md`）
+
+PR #72 组合候选在集成 main 后保留两组 UI 测试：135 项 DOM checks 与全部 23 项 P6C SQLite/HTTP tests 本地通过；PR #72 的最终 CI 与合并单独跟踪，成功的代码合并不等于 VPS 部署回执。本地 operator helpers、机器记录、key、下载 ZIP 或临时预览文件不属于该 PR。

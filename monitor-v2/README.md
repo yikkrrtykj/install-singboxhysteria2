@@ -883,3 +883,7 @@ record-category 按钮位于固定高度滚动区域上方；从长 sample 表�
 验收：144 项 DOM 行为检查通过，含默认 disclosure 状态、完整证据保留、literal future text、不确定性、missing/read-failed 记录和 delayed-response isolation。浏览器 fixture（80 samples + 16 journal rows）：旧 UI 页面高度 7,267→3,091 px、section bar 345→-47 px；固定区域后高度保持 1,446 px、bar 保持 345 px；空分类高度不变。以上为合成记录，不是生产遥测；桌面视觉预览已验证，移动端视觉验证未声称。
 
 范围与发布：仅 presentation 与公开 release identity 变化；VERSION / MONITOR_WEB_VERSION 为 0.8.1，精确 release 检查随动。Classifier、presenter、History v5、core/remote storage、ingest、evidence response contract、enrollment 与 Windows Agent 不变；服务器更新无需重装 Windows 客户端、无需签名变更或 native resource test。
+
+### 0.8.1 历史发布清单（原 `docs/incident-reading-ux.md`）
+
+滚动位移已在真实浏览器复现并验证有界布局；完整判断、caveat、raw 字段和来源失败语义保留；UI 行为检查与变更路径已复核。CI exact candidate 与 merged main、existing-server 更新健康回执为发布时跟踪项；服务器侧 0.8.1 已于 2026-10-08 部署（见 `docs/monitor-v2-host-evidence.md`）。

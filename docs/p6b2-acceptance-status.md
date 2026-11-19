@@ -1,6 +1,6 @@
 # P6B2 closeout status
 
-Updated 2026-10-07. Issue #67 section22 and current amendments are authoritative.
+Updated 2026-10-07（merge-state note added 2026-11-19）. Issue #67 section22 and current amendments are authoritative.
 PR #70 was subsequently merged (`7c20a825`, 2026-10-07); the historical receipts below remain the record of that merge-time decision. This status note updates only the merge state, not the acceptance evidence.
 This supersedes historical pending/MERGE=NO statements without waiving acceptance
 or authorizing production rollout/P6C/P6D. Original failed reports/verdicts remain

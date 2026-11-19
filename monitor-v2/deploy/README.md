@@ -1226,3 +1226,7 @@ Remote status 包含 sample/receipt/run 独立计数与字节计费、live/alloc
 ### Reverse proxy validation
 
 在 nginx 的 **http context** include `remote-probes-proxy.conf.example`。示例支持 nginx >= 1.18.0（TLS），HTTP/2 可选；两个 zone 指令属于 http context，不使用 1.25.1 才有的 `http2 on`。只把精确 ingest path 转发到 loopback，保留 body/header 字节并限制缓冲；验证前由运维方提供证书/DNS/端口并以 `nginx -t` 校验。示例永不自动安装/激活；CI 在全部受支持 Ubuntu 基线上用一次性证书验证真实模板，并确认 nginx 拒绝旧的 server-context zone 放置。仅 HTTP/1.1 + 显式 Content-Length 可达 upstream；HTTP/1.0、chunked、缺失 CL 在 nginx 缓冲前返回 400。
+
+### Capacity expectation caveat
+
+上表不是“任意 64-probe 工作负载保留 30 天”的承诺：默认 60 秒 cadence 下，64 probes 在 30 天约产生 2,764,800 receipts，高于 1,048,576 的全局 receipt cap；长寿命 runs 也可能饱和。提高上限需要单独评审的合同变更。容量会在 prospective admission 重新合法时自动恢复；准入保守预留三份完整 320 MiB DB 副本 + 8 MiB journal/取整开销，并要求至少 648 MiB scratch，prospective 与 post-write page-ceiling 检查共同 gate commit。Receipt 比较在 HMAC、transport freshness、认证 limits 与 canonical 校验之后、new-sample age/progression 检查之前进行。High-water 只约束新 tuple，绝不证明缺失 receipt 曾存在；已知 duplicate/equivocation verdict 在容量满时仍可用（受实际 store 可用性与常规 auth/rate limits 约束）。SQLite freelist pages 在同一独立有界 main DB 内复用，不把总 DB pages 当作 sample bytes，也不在每次请求时 vacuum。
