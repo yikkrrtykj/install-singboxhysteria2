@@ -144,8 +144,14 @@ sing-box 未重启）与配置被改时 verify FAIL。rollback 覆盖 exact base
 helper absent、state/audit 保留、配置不变及 monitor 存活；missing/non-executable
 installer、目标 release 不存在、可执行但失败的 installer、disable 失败和
 daemon-reload 失败均必须 FAIL，且每个负向用例同时断言其具体失败原因，避免环境
-故障被误当成预期拒绝。可执行 fixture 放在独立的 `EXECROOT`（以真实执行探针
-选定），`/run` 状态根只保存数据，从而在 `/run` 为 noexec 的 runner 镜像上仍然
-有效；CI 另在 ubuntu-24.04 用 noexec tmpfs 复现该环境并先证明 noexec 生效。
-套件以 `EXPECTED_TOTAL=64` 冻结 PASS+FAIL+SKIP 总数（noexec 模拟为 65），
-防止断言静默消失。
+故障被误当成预期拒绝。RB2/RB3 注入用例在真实 first-deploy 能力上重新初始化，
+每次使用新写入的 stub 和 root 私有证据目录中的精确 argv 执行标记，并同时验证
+rollback 非零退出、R1/R3 对应分支、installer 正常执行/R2 成功以及其他分支
+无意外失败；failing installer 有执行标记，non-executable installer 有存在性/
+无执行位/未被执行证据。可执行 fixture 和证据目录位于根用户所有、不可被组/其他
+用户写入的受信父目录下（0700），`/run` 状态根只保存数据，从而在 `/run` 为
+noexec 的 runner 镜像上仍然有效；CI 另在 ubuntu-24.04 用 noexec tmpfs 复现该
+环境并先证明 noexec 生效。套件以 `EXPECTED_TOTAL=85` 冻结 PASS+FAIL+SKIP 总数
+（noexec 模拟为 86），防止断言静默消失。运行日志会打印 `/run`、状态根和
+`EXECROOT` 的实际挂载选项以及该 runner 上状态根的原生执行结果，用于区分真实
+noexec 环境与受控模拟。

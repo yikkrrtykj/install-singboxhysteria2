@@ -55,7 +55,7 @@ PASS=0; FAIL=0; SKIP=0
 # the suite instead of quietly shrinking it. The noexec simulation adds its
 # own environment-verification assertion, so the expected total is explicit
 # for both invocation modes.
-EXPECTED_TOTAL=64
+EXPECTED_TOTAL=85
 if [ "${SBOX_E3_EXPECT_FIX_NOEXEC:-0}" = "1" ]; then
     EXPECTED_TOTAL=$((EXPECTED_TOTAL + 1))
 fi
@@ -66,8 +66,23 @@ assert_eq(){ [ "$1" = "$2" ] && pass "$3" || fail "$3 (want=[$1] got=[$2])"; }
 assert_ne(){ [ "$1" != "$2" ] && pass "$3" || fail "$3 (both=[$1])"; }
 jqv(){ printf '%s' "$1" | jq -r "$2" 2>/dev/null; }
 
-# An exec-capable fixture root is discovered by REAL execution, never by mode
-# bits alone: a chmod 0755 file on a noexec mount must not qualify.
+# Fixture executables and their evidence markers live in a root-private scratch
+# tree whose ancestry is trusted. A world-writable or non-root parent would let
+# another local identity substitute a path; /run is data-only and is explicitly
+# not a candidate. The probe proves the filesystem really executes a file.
+trusted_parent() {
+    local parent=$1 owner mode
+    [ -d "$parent" ] || return 1
+    case "$parent" in
+        /run|/run/*) return 1 ;;
+    esac
+    owner="$(stat -c %u "$parent" 2>/dev/null)" || return 1
+    mode="$(stat -c %a "$parent" 2>/dev/null)" || return 1
+    [ "$owner" = "0" ] || return 1
+    [ $(( 0$mode & 022 )) -eq 0 ] || return 1
+    return 0
+}
+
 probe_exec_root() {
     local dir=$1
     local probe="$dir/.exec-probe.sh"
@@ -78,9 +93,11 @@ probe_exec_root() {
 
 make_exec_root() {
     local candidate created
-    for candidate in "${SBOX_E3_EXEC_ROOT:-}" "${RUNNER_TEMP:-}" /var/tmp /tmp /opt "$ROOT"; do
-        [ -n "$candidate" ] && [ -d "$candidate" ] && [ -w "$candidate" ] || continue
+    for candidate in "${SBOX_E3_EXEC_ROOT:-}" /opt /var/lib /usr/local /root; do
+        [ -n "$candidate" ] || continue
+        trusted_parent "$candidate" || continue
         created="$(mktemp -d "$candidate/.e3-m3-exec.XXXXXXXX" 2>/dev/null)" || continue
+        chmod 0700 "$created" 2>/dev/null || { rm -rf -- "$created"; continue; }
         if probe_exec_root "$created"; then
             EXECROOT="$created"
             return 0
@@ -183,11 +200,26 @@ case "$EXECROOT" in
 esac
 pass 'executable fixture root is outside /run and really executable'
 
+EVIDENCE_DIR="$EXECROOT/evidence"
+mkdir -p "$EVIDENCE_DIR" 2>/dev/null || true
+chmod 0700 "$EVIDENCE_DIR" 2>/dev/null || true
+assert_eq "0" "$(stat -c %u "$EXECROOT" 2>/dev/null)" \
+    'executable fixture root is root-owned'
+assert_eq "700" "$(stat -c %a "$EXECROOT" 2>/dev/null)" \
+    'executable fixture root is root-private (0700)'
+assert_eq "0" "$(stat -c %u "$EVIDENCE_DIR" 2>/dev/null)" \
+    'per-case evidence directory is root-owned'
+assert_eq "700" "$(stat -c %a "$EVIDENCE_DIR" 2>/dev/null)" \
+    'per-case evidence directory is root-private (0700)'
+if trusted_parent "$(dirname "$EXECROOT")"; then
+    pass 'executable fixture root has a trusted root-owned, non-writable parent'
+else
+    fail 'executable fixture root parent is not a trusted root-owned, non-writable directory'
+fi
+
 STUB_INSTALLER="$EXECROOT/stub-install-monitor.sh"
 FAIL_INSTALLER="$EXECROOT/stub-install-monitor-fail.sh"
 NONEXEC_INSTALLER="$EXECROOT/stub-install-monitor-nonexec.sh"
-SYSTEMCTL_STUB="$EXECROOT/stub-systemctl"
-RELOAD_STUB="$EXECROOT/stub-reload"
 
 # ------------------------------------------------------------------ fixture --
 getent passwd "$AXE_USER" >/dev/null 2>&1 || useradd --system --no-create-home "$AXE_USER"
@@ -196,6 +228,26 @@ mkdir -p "$FIX" "$MDATA" /root/sbox "$RELDIR/$REL_ID"
 chmod 0777 "$FIX"
 export SBOX_E3_M3_STUB_LOG="$FIX/stub-installer.log"
 export SBOX_E3_M3_SYSTEMCTL_LOG="$FIX/stub-systemctl.log"
+
+# Evidence-only diagnostics (never assertions): record the effective mount
+# options and the native exec behavior of the /run state root and EXECROOT, so
+# every CI log distinguishes a native noexec runner from the controlled
+# simulation. The probe file is removed immediately.
+diag_mount_opts() {
+    findmnt -T "$1" -no OPTIONS 2>/dev/null || printf 'unknown'
+}
+printf 'fixture-evidence run_opts=%s fix_opts=%s execroot_opts=%s\n' \
+    "$(diag_mount_opts /run)" "$(diag_mount_opts "$FIX")" "$(diag_mount_opts "$EXECROOT")"
+printf '#!/usr/bin/env bash\nprintf ran\n' > "$FIX/.native-exec-probe.sh"
+chmod 0755 "$FIX/.native-exec-probe.sh"
+if "$FIX/.native-exec-probe.sh" >/dev/null 2>&1; then
+    native_fix_exec=yes
+else
+    native_fix_exec=no
+fi
+rm -f "$FIX/.native-exec-probe.sh"
+printf 'fixture-evidence native_run_exec=%s controlled_noexec=%s\n' \
+    "$native_fix_exec" "${SBOX_E3_EXPECT_FIX_NOEXEC:-0}"
 
 # Negative environment experiment: with SBOX_E3_EXPECT_FIX_NOEXEC=1 the caller
 # has mounted the state root noexec, and the suite must PROVE that (execution
@@ -571,6 +623,9 @@ fi
 
 # rollback FAIL: the installer exists and is executable but refuses (exit 1).
 # That is distinct from missing/not-executable and must be reported as such.
+# The fresh protected marker proves the failing installer was really invoked.
+FAILINST_LOG="$EVIDENCE_DIR/failing-installer.log"
+rm -f "$FAILINST_LOG"
 cat > "$FAIL_INSTALLER" <<'STUBFAIL'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "${SBOX_E3_M3_STUB_LOG:-/dev/null}"
@@ -578,6 +633,7 @@ exit 1
 STUBFAIL
 chmod 0755 "$FAIL_INSTALLER"
 FAILINST_OUT="$(E3_INSTALL_MONITOR="$FAIL_INSTALLER" E3_RELEASES_DIR="$RELDIR" \
+    SBOX_E3_M3_STUB_LOG="$FAILINST_LOG" \
     bash "$ROLLBACK" --baseline "$BASELINE" 2>&1)"; FAILINST_RC=$?
 if [ "$FAILINST_RC" -ne 0 ]; then
     pass 'rollback with an executable installer that fails FAILS'
@@ -589,13 +645,31 @@ if printf '%s' "$FAILINST_OUT" | grep -qF "R2 install-monitor.sh rollback to [$E
 else
     fail 'failing-installer refusal did not report the rollback-command failure'
 fi
+if grep -qxF "rollback $EXPECT_REL" "$FAILINST_LOG" 2>/dev/null; then
+    pass 'failing installer really executed and received the R2 rollback argv'
+else
+    fail 'no independent marker proving the failing installer was executed'
+fi
 
 # rollback FAIL: an existing but NON-executable installer is refused by the
 # executability gate itself -- the branch that used to fire accidentally on a
 # noexec /run is now an intentional, deterministic discriminator.
+NONEXEC_LOG="$EVIDENCE_DIR/nonexec-installer.log"
+rm -f "$NONEXEC_LOG"
 cp "$STUB_INSTALLER" "$NONEXEC_INSTALLER"
 chmod 0644 "$NONEXEC_INSTALLER"
+if [ -f "$NONEXEC_INSTALLER" ]; then
+    pass 'non-executable installer case: the negative input file exists'
+else
+    fail 'non-executable installer case: the negative input file is missing'
+fi
+if [ -z "$(find "$NONEXEC_INSTALLER" -perm /111 -print -quit 2>/dev/null)" ]; then
+    pass 'non-executable installer case: the input really carries no execute bits'
+else
+    fail 'non-executable installer case: the input still has execute bits'
+fi
 NX_OUT="$(E3_INSTALL_MONITOR="$NONEXEC_INSTALLER" E3_RELEASES_DIR="$RELDIR" \
+    SBOX_E3_M3_STUB_LOG="$NONEXEC_LOG" \
     bash "$ROLLBACK" --baseline "$BASELINE" 2>&1)"; NX_RC=$?
 if [ "$NX_RC" -ne 0 ]; then
     pass 'rollback with a non-executable installer FAILS (fail-closed)'
@@ -607,19 +681,51 @@ if printf '%s' "$NX_OUT" | grep -qF 'R2 install-monitor.sh missing or not execut
 else
     fail 'non-executable installer was not refused by the executability gate'
 fi
+if [ ! -e "$NONEXEC_LOG" ]; then
+    pass 'non-executable installer was never executed (no marker created)'
+else
+    fail 'non-executable installer produced an execution marker'
+fi
+
+# A negative control is only valid when the injection stub really executed with
+# the intended argv. Re-establish the real first-deploy fixture so R1 has units
+# to manage (no unrelated "unit does not exist" failures), then give each case
+# its own freshly written stub and its own root-private exact-argv marker.
+reset_first_deploy_fixture() {
+    systemctl stop sbox-cm.socket sbox-cm.service 2>/dev/null
+    systemctl disable sbox-cm.socket sbox-cm.service 2>/dev/null
+    rm -f /etc/systemd/system/sbox-cm.socket /etc/systemd/system/sbox-cm.service
+    rm -rf -- /usr/local/lib/sbox-cm /var/lib/sbox-cm /run/sbox-cm
+    systemctl daemon-reload 2>/dev/null
+    "$ROOT/sbox-cm/deploy/install-sbox-cm.sh" install >/dev/null 2>&1
+}
 
 # rollback FAIL: a service-disable failure can never be a silent pass.
-cat > "$SYSTEMCTL_STUB" <<'STUBCTL'
-#!/usr/bin/env bash
-if [ "${1:-}" = "disable" ]; then
-    printf '%s\n' "$*" >> "${SBOX_E3_M3_SYSTEMCTL_LOG:-/dev/null}"
+if ! reset_first_deploy_fixture; then
+    fail 'RB2 setup: could not re-establish the real sbox-cm first-deploy fixture'
+    printf '\nPASS=%d FAIL=%d SKIP=%d\nE3_M3_DEPLOY=FAIL\n' "$PASS" "$FAIL" "$SKIP"
     exit 1
 fi
+RB2_CTL="$EXECROOT/rb2-systemctl"
+RB2_CTRL_LOG="$EVIDENCE_DIR/rb2-systemctl.log"
+RB2_INST_LOG="$EVIDENCE_DIR/rb2-installer.log"
+rm -f "$RB2_CTRL_LOG" "$RB2_INST_LOG"
+cat > "$RB2_CTL" <<'STUBCTL'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${SBOX_E3_M3_SYSTEMCTL_LOG:-/dev/null}"
+if [ "${1:-}" = "disable" ]; then exit 1; fi
 exec /usr/bin/systemctl "$@"
 STUBCTL
-chmod 0755 "$SYSTEMCTL_STUB"
-RB2="$(E3_SYSTEMCTL="$SYSTEMCTL_STUB" E3_INSTALL_MONITOR="$STUB_INSTALLER" \
-    E3_RELEASES_DIR="$RELDIR" bash "$ROLLBACK" --baseline "$BASELINE" 2>&1)"
+chmod 0755 "$RB2_CTL"
+RB2="$(E3_SYSTEMCTL="$RB2_CTL" E3_INSTALL_MONITOR="$STUB_INSTALLER" \
+    E3_RELEASES_DIR="$RELDIR" SBOX_E3_M3_STUB_LOG="$RB2_INST_LOG" \
+    SBOX_E3_M3_SYSTEMCTL_LOG="$RB2_CTRL_LOG" \
+    bash "$ROLLBACK" --baseline "$BASELINE" 2>&1)"; RB2_RC=$?
+if [ "$RB2_RC" -ne 0 ]; then
+    pass 'service-disable case: rollback exited non-zero'
+else
+    fail 'service-disable case: rollback must exit non-zero'
+fi
 if printf '%s' "$RB2" | grep -q 'E3_M3_ROLLBACK=FAIL'; then
     pass 'a service-disable failure FAILS the rollback (never a silent pass)'
 else
@@ -630,16 +736,58 @@ if printf '%s' "$RB2" | grep -qF 'R1 disabling sbox-cm.socket FAILED'; then
 else
     fail 'service-disable refusal did not name the failed disable'
 fi
+if grep -qxF 'disable sbox-cm.socket' "$RB2_CTRL_LOG" 2>/dev/null; then
+    pass 'service-disable case: the stub really received the disable argv'
+else
+    fail 'service-disable case: no independent marker for the disable argv (stub may not have executed)'
+fi
+if grep -qxF 'stop sbox-cm.socket' "$RB2_CTRL_LOG" 2>/dev/null; then
+    pass 'service-disable case: the stub really executed and delegated a non-injected argv'
+else
+    fail 'service-disable case: the stub did not execute/delegate a non-injected argv'
+fi
+if printf '%s' "$RB2" | grep -qF "PASS R2 monitor release flipped back to [$EXPECT_REL]"; then
+    pass 'service-disable case: R2 succeeded with the real installer invocation'
+else
+    fail 'service-disable case: R2 did not succeed'
+fi
+if grep -qF "rollback $EXPECT_REL" "$RB2_INST_LOG" 2>/dev/null; then
+    pass 'service-disable case: the installer marker proves the R2 invocation'
+else
+    fail 'service-disable case: no installer execution marker for R2'
+fi
+if printf '%s' "$RB2" | grep -Eq 'FAIL R2|FAIL R3|FAIL R4'; then
+    fail 'service-disable case: an unrelated R2/R3/R4 failure is present'
+else
+    pass 'service-disable case: only the injected R1 disable failure is present'
+fi
 
 # rollback FAIL: a daemon-reload failure can never be a silent pass.
-cat > "$RELOAD_STUB" <<'STUBRL'
+if ! reset_first_deploy_fixture; then
+    fail 'RB3 setup: could not re-establish the real sbox-cm first-deploy fixture'
+    printf '\nPASS=%d FAIL=%d SKIP=%d\nE3_M3_DEPLOY=FAIL\n' "$PASS" "$FAIL" "$SKIP"
+    exit 1
+fi
+RB3_CTL="$EXECROOT/rb3-systemctl"
+RB3_CTRL_LOG="$EVIDENCE_DIR/rb3-systemctl.log"
+RB3_INST_LOG="$EVIDENCE_DIR/rb3-installer.log"
+rm -f "$RB3_CTRL_LOG" "$RB3_INST_LOG"
+cat > "$RB3_CTL" <<'STUBRL'
 #!/usr/bin/env bash
+printf '%s\n' "$*" >> "${SBOX_E3_M3_SYSTEMCTL_LOG:-/dev/null}"
 if [ "${1:-}" = "daemon-reload" ]; then exit 1; fi
 exec /usr/bin/systemctl "$@"
 STUBRL
-chmod 0755 "$RELOAD_STUB"
-RB3="$(E3_SYSTEMCTL="$RELOAD_STUB" E3_INSTALL_MONITOR="$STUB_INSTALLER" \
-    E3_RELEASES_DIR="$RELDIR" bash "$ROLLBACK" --baseline "$BASELINE" 2>&1)"
+chmod 0755 "$RB3_CTL"
+RB3="$(E3_SYSTEMCTL="$RB3_CTL" E3_INSTALL_MONITOR="$STUB_INSTALLER" \
+    E3_RELEASES_DIR="$RELDIR" SBOX_E3_M3_STUB_LOG="$RB3_INST_LOG" \
+    SBOX_E3_M3_SYSTEMCTL_LOG="$RB3_CTRL_LOG" \
+    bash "$ROLLBACK" --baseline "$BASELINE" 2>&1)"; RB3_RC=$?
+if [ "$RB3_RC" -ne 0 ]; then
+    pass 'daemon-reload case: rollback exited non-zero'
+else
+    fail 'daemon-reload case: rollback must exit non-zero'
+fi
 if printf '%s' "$RB3" | grep -q 'E3_M3_ROLLBACK=FAIL'; then
     pass 'a daemon-reload failure FAILS the rollback (never a silent pass)'
 else
@@ -649,6 +797,31 @@ if printf '%s' "$RB3" | grep -qF 'R3 systemctl daemon-reload FAILED after removi
     pass 'daemon-reload refusal names the failed reload (not another fixture failure)'
 else
     fail 'daemon-reload refusal did not name the failed reload'
+fi
+if grep -qxF 'daemon-reload' "$RB3_CTRL_LOG" 2>/dev/null; then
+    pass 'daemon-reload case: the stub really received the daemon-reload argv'
+else
+    fail 'daemon-reload case: no independent marker for the daemon-reload argv (stub may not have executed)'
+fi
+if grep -qxF 'stop sbox-cm.socket' "$RB3_CTRL_LOG" 2>/dev/null; then
+    pass 'daemon-reload case: the stub really executed and delegated a non-injected argv'
+else
+    fail 'daemon-reload case: the stub did not execute/delegate a non-injected argv'
+fi
+if printf '%s' "$RB3" | grep -qF "PASS R2 monitor release flipped back to [$EXPECT_REL]"; then
+    pass 'daemon-reload case: R2 succeeded with the real installer invocation'
+else
+    fail 'daemon-reload case: R2 did not succeed'
+fi
+if grep -qF "rollback $EXPECT_REL" "$RB3_INST_LOG" 2>/dev/null; then
+    pass 'daemon-reload case: the installer marker proves the R2 invocation'
+else
+    fail 'daemon-reload case: no installer execution marker for R2'
+fi
+if printf '%s' "$RB3" | grep -Eq 'FAIL R1|FAIL R2|FAIL R4'; then
+    fail 'daemon-reload case: an unrelated R1/R2/R4 failure is present'
+else
+    pass 'daemon-reload case: only the injected R3 daemon-reload failure is present'
 fi
 
 # B2: the DEFAULT installer resolver must be the sibling install-monitor.sh
