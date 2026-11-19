@@ -132,22 +132,7 @@ mkdir -p "$FIX" "$APP" "$MDATA" /root/sbox
 chmod 0777 "$FIX"
 
 # mock sing-box: the production worker's built-in path, no SB_* injection.
-cat > /root/sbox/sing-box <<'MOCK'
-#!/usr/bin/env bash
-FIX="/run/sboxcm-m2-test"
-if [ -f "$FIX/check-sleep" ]; then sleep 3; fi
-case "${1:-}" in
-    check) exit 0 ;;
-    generate)
-        case "${2:-}" in
-            uuid) printf 'uuid-%s-%s-%s\n' "$$" "$RANDOM" "$RANDOM" ;;
-            rand) printf 'pw-%s-%s-%s\n' "$$" "$RANDOM" "$RANDOM" ;;
-            *) exit 2 ;;
-        esac ;;
-    *) exit 2 ;;
-esac
-MOCK
-chmod 0755 /root/sbox/sing-box
+install -m 0755 "$ROOT/tests/lib/mock-sing-box" /root/sbox/sing-box
 cat > /root/sbox/sbconfig_server.json <<'JSON'
 {"inbounds":[
  {"type":"vless","tag":"vless-in","users":[{"name":"legacy","uuid":"LEGACY-UUID","flow":"xtls-rprx-vision"}]},
@@ -322,7 +307,7 @@ rm -f "$FIX/fail-first"
 # A 1s caller budget against a helper whose check sleeps 3s: the caller must
 # time out post-send (uncertain), the helper must NOT be killed, and the
 # transaction must complete and become visible via last_transaction.
-touch "$FIX/check-sleep"
+touch /root/sbox/.mock-sleep
 TIMEOUT_DRIVER="$FIX/timeout_driver.py"
 cat > "$TIMEOUT_DRIVER" <<'DRIVER'
 import sys
@@ -364,7 +349,7 @@ assert_eq "ok" "$LAST_OUTCOME" 'the timed-out transaction landed on its terminal
 grep -qF 'timeout-live' /root/sbox/sbconfig_server.json \
     && pass 'the timed-out client is really in the live config' \
     || fail 'the timed-out client never reached the live config'
-rm -f "$FIX/check-sleep"
+rm -f /root/sbox/.mock-sleep
 
 # root over the socket is still rejected (SO_PEERCRED, from this host)
 ROOTOUT="$(python3 "$TIMEOUT_DRIVER" 2>/dev/null)"
