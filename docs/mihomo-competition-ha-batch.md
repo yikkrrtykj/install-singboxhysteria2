@@ -42,6 +42,15 @@ exports/B/<name>-mihomo.yaml ─┘              delivery/ha-delivery-<version>.
   inherited byte-for-byte. This tool never edits the probe policy.
 - Complete HY2 hopping is preserved: a source `ports: A-B` + `hop-interval: 30`
   pair survives in both the primary and the backup HY2 block.
+- Batch identity is compared by *identity*, not spelling: UUIDs are
+  case-insensitive, IPv4/IPv6 literals compare by value, hostnames compare
+  case-insensitively (the accepted canonical hostname form has no trailing
+  root dot). Nothing is rewritten in the delivered bytes; passwords remain
+  case-sensitive.
+- Credential-bearing directories and delivered files must satisfy a
+  conservative permission gate: POSIX mode **and** owner, or a Windows DACL
+  whose allow entries name only the operator, SYSTEM, Administrators or an
+  inherit-only owner pseudo-principal. Reparse points/junctions are refused.
 
 There is no daemon, GUI, web service, scheduled task, VPS-to-VPS channel,
 shared credential database or third-party runtime dependency. The tool opens
@@ -180,7 +189,7 @@ existing destination.
   "generator": {"tool": "tools/mihomo-competition-ha-batch.py",
                  "version": "1", "config_version": "ha-2026-11-24-r1"},
   "canonical_validator": "tools/mihomo-multi-vps-merge.py",
-  "permission_gate": "windows-acl",
+  "permission_gate": "windows-acl-allowlist",
   "created_utc": "2026-11-20T00:00:00Z",
   "inventory_sha256": "…",
   "terminal_count": 2,
@@ -233,7 +242,7 @@ all-or-nothing. A failed prevalidation writes nothing at all.
 | `E_SOURCE_MIXED` | one terminal's A-side (or B-side) export comes from a third physical VPS, so the batch is not one A plus one B |
 | `E_PATH_CONFLICT` | missing/!directory/linked source or output directory, output directory inside a source tree, or an output colliding with an input |
 | `E_OUTPUT_EXISTS` | any target profile or the manifest already exists (also matched case-insensitively) |
-| `E_INSECURE_PERMISSIONS` | a credential-bearing path is not private under POSIX mode or the real Windows ACL |
+| `E_INSECURE_PERMISSIONS` | a credential-bearing path fails POSIX mode/owner, the Windows ACL allowlist, the local/private boundary, or the temp-file inheritance probe |
 | `E_GENERATED_INVALID` | the tool's own structural self-check of a generated profile failed (not expected; it is a fail-closed internal gate) |
 | `E_TOOL_MISSING` | the canonical `tools/mihomo-multi-vps-merge.py` is not next to this tool |
 | `E_IO` | an output or the manifest could not be written/verified |
@@ -241,6 +250,14 @@ all-or-nothing. A failed prevalidation writes nothing at all.
 
 Batch-wide identity gates:
 
+- **Identity, not spelling.** UUIDs are case-insensitive (the canonical parser
+  accepts upper and lower hex, and a UUID has no case distinction), so
+  `A1B2…` and `a1b2…` are one credential for every same-terminal, cross-terminal
+  and cross-VPS comparison. IPv4/IPv6 literals compare by parsed value and
+  hostnames case-insensitively, so equivalent spellings cannot split one VPS's
+  fingerprint or disguise the same VPS as both sources. The delivered bytes are
+  never normalised: the source spelling is what the output carries. HY2
+  passwords remain case-sensitive.
 - **Distinct providers are not proven, only distinct sources.** Two addresses
   are not two providers; the tool never claims otherwise. The per-VPS source
   fingerprint proves the batch used one A endpoint and one B endpoint, not
@@ -250,44 +267,59 @@ Batch-wide identity gates:
   exports and the batch fails `E_SOURCE_MIXED` with the role. A batch of ten
   terminals where one A is a copy of the other VPS is exactly the operator
   mistake this gate exists for.
-- **Credential independence.** UUIDs and HY2 passwords must be unique across
-  the entire batch (2×N values), which covers same-terminal A/B reuse,
-  same-VPS cross-terminal reuse and cross-VPS reuse. The offending value is
-  never printed.
+- **Credential independence.** Normalised UUIDs and raw HY2 passwords must be
+  unique across the entire batch (2×N values), which covers same-terminal A/B
+  reuse, same-VPS cross-terminal reuse and cross-VPS reuse. The offending value
+  is never printed.
 - **Case-insensitive paths.** Terminal names, output names, the manifest name
   and input/output collisions are compared case-folded on every host, so a
   batch validated on Linux cannot overwrite on the Windows event PC.
 
 ## Windows ACL gate
 
-POSIX filesystems are judged on their real mode bits: every credential-bearing
-directory must have no group/other bits (0700) and every source/export/
-inventory file none either (0600); the same applies to the delivery directory.
-Mode bits on NTFS are cosmetic, so Windows is judged on the owner and DACL read
-from the kernel (`GetNamedSecurityInfoW` → SDDL), never on `chmod`.
+POSIX filesystems are judged on their real mode bits **and** owner: every
+credential-bearing directory must have no group/other bits (0700) and every
+source/export/inventory/delivered file none either (0600), and each path must
+be owned by the user running the tool. In addition, no ancestor above the
+private root may be group/other-writable without the sticky bit (a sticky
+directory such as `/tmp` cannot be used to replace the operator's entry). Mode
+bits on NTFS are cosmetic, so Windows is judged on the owner and DACL read from
+the kernel (`GetNamedSecurityInfoW` → SDDL), never on `chmod`.
 
-Refused on Windows:
+Windows is an **allowlist**, not a denylist. A DACL is accepted only when:
 
-- a NULL DACL (`NO_ACCESS_CONTROL`), which grants everyone;
-- any allow-ACE granted to `Everyone`, `LOCAL`, `CONSOLE LOGON`, `NETWORK`,
-  `INTERACTIVE`, `SERVICE`, `ANONYMOUS LOGON`, `Authenticated Users`,
-  `RESTRICTED`, `This Organization`, `LOCAL SERVICE`, `NETWORK SERVICE`,
-  `BUILTIN\Users`, `BUILTIN\Guests`, `BUILTIN\Remote Desktop Users`,
-  `LOCAL ACCOUNT`, `LOCAL ACCOUNT AND MEMBER OF ADMINISTRATORS GROUP`, or a
-  domain `Domain Users`/`Domain Guests`/`Domain Computers` RID (513/514/515);
-- an owner that is not the current user, `SYSTEM` or `Administrators` (that
-  owner could rewrite the DACL).
+- the DACL is present and not NULL (`NO_ACCESS_CONTROL` is refused);
+- every ACE is of a recognised type (`A`, `OA`, `D`, `OD`, `AU`, `AL`, `OU`,
+  `OL`, `ML`, `ID`, `RA`, `SP`); an unknown or unparsable ACE is refused;
+- every allow-ACE names the current operator, `NT AUTHORITY\SYSTEM`
+  (`S-1-5-18`) or `BUILTIN\Administrators` (`S-1-5-32-544`), or names
+  `CREATOR OWNER` (`S-1-3-0`) / `OWNER RIGHTS` (`S-1-3-4`) **with the
+  inherit-only flag**; any other principal is refused and reported by SID;
+- the owner is the current operator, `SYSTEM` or `Administrators` (an owner who
+  could rewrite the DACL is refused).
 
-The contract suite proves this on a real Windows host by reading the actual ACL
-of `C:\Users\Public` and requiring the refusal — no ACL is modified by the
-suite.
+The gate runs on the exports root, both source trees, the inventory, the
+delivery directory, and the delivered YAML and manifest files **themselves**.
+The tool also creates a private probe file in the delivery directory before any
+sensitive write and checks its inherited ACL/mode, so temp-file inheritance is
+proven rather than assumed; the canonical writer's own temp file is created the
+same way. Directory junctions, symlinks and other Windows reparse points are
+refused (a junction is `S_ISDIR` and not a symlink to `lstat`, so the reparse
+attribute is checked explicitly yet the path is still not followed).
 
-What this does **not** prove: the denylist cannot classify a site-specific
-local or domain group offline. A directory whose only non-operator ACE names
-such a group passes. The operator must still review `icacls <dir>` for the real
-event directories; that residual is stated here rather than hidden behind a
-green check. `permission_gate` in the manifest records which gate ran
-(`windows-acl` or `posix-mode`), not that the site is safe.
+The contract suite proves this against live DACLs on a real Windows host: a
+private tree is accepted, the delivered files pass the same check, a real
+`BUILTIN\Users` grant on the exports root or on one source file is refused, a
+real directory junction is refused, and `C:\Users\Public` is refused without
+modifying any ACL outside the suite's own fixtures.
+
+What this does **not** prove: the allowlist is enforced on the declared paths
+and their delivered files, not on every ancestor's DACL. A broad ACE on a
+distant ancestor, or a different owner of an ancestor that can rename the
+private root, is outside the check; the operator must place the exports and
+delivery inside a private, operator-owned directory and can confirm it with
+`icacls`. `permission_gate` in the manifest records which gate ran
+(`windows-acl-allowlist` or `posix-mode-owner`), not that the site is safe.
 
 ## Failure, rollback and no-clobber
 
@@ -307,12 +339,16 @@ green check. `permission_gate` in the manifest records which gate ran
 - **Rollback of this batch only.** On any failure after writing started, the
   files this batch created are deleted in reverse order (manifest first). A
   pre-existing file is never touched, because nothing pre-existing is ever
-  opened for writing. After a clean rollback the tool prints
-  `ha-batch: ROLLBACK removed=<n> complete=yes`.
-- **Incomplete rollback is visible.** If a created file cannot be removed, the
-  failure line is followed by `ha-batch: ROLLBACK removed=<n> complete=no` and
-  the operator must remove the remaining files by hand (the manifest lists
-  them when it exists).
+  opened for writing. Before each deletion the current bytes are re-hashed
+  against the bytes this batch wrote; a file that was replaced by another
+  process is **not** deleted. After a clean rollback the tool prints
+  `ha-batch: ROLLBACK removed=<n> skipped=<m> complete=yes`.
+- **Incomplete rollback is visible.** If a created file cannot be removed or no
+  longer matches the batch's bytes, the failure line is followed by
+  `ha-batch: ROLLBACK removed=<n> skipped=<m> complete=no` and the operator must
+  inspect/remove the residual (the manifest lists the intended files when it
+  exists). `skipped` counts files deliberately left because they are not this
+  batch's bytes any more.
 - **This is delivery rollback, not client rollback.** Deleting the delivery
   files does not restore a Clash Verge profile/settings/selection backup; that
   is HA-03's rollback contract and must be verified on the Windows PC.
@@ -357,17 +393,19 @@ green check. `permission_gate` in the manifest records which gate ran
 ## Verification
 
 Hermetic contract suite (no network, no core, no root; temporary fixtures with
-synthetic credentials only; POSIX mode/symlink gates execute on Linux CI and
-skip on Windows):
+synthetic credentials only; POSIX mode/owner/boundary gates execute on Linux CI
+and skip on Windows; Windows ACL/reparse gates execute on Windows):
 
 ```sh
 bash tests/test-mihomo-competition-ha-batch.sh
 ```
 
-Local Windows development host, HA-02 head: `pass=211 fail=0 skip=5`; the five
-skips are exactly the POSIX permission-bit, unreadable-source, symlink-source
-and symlinked-root gates that Linux CI runs for real. Linux CI totals are the
-authority and are recorded on the pull request.
+Local Windows development host, HA-02 review-revision head:
+`pass=250 fail=0 skip=5`; the five skips are exactly the POSIX
+permission-bit, unreadable-source, symlink-source and symlinked-root gates that
+Linux CI runs for real. Linux CI totals are the authority and are recorded on
+the pull request. The existing PR-48A merge suite stays at
+`pass=176 fail=0 skip=3` and the renderer contract at `PASS=61 FAIL=0 SKIP=0`.
 
 Pinned-core load gate (operator-local; the core and its hash are supplied, it
 downloads nothing):
@@ -381,15 +419,18 @@ python3 tests/mihomo-competition-ha-core-load.py \
   --expect-terminals 30
 ```
 
-It verifies the manifest and every output SHA-256 before loading, then asks
-that exact core to load every profile. Recorded HA-02 local run (Windows/amd64,
-synthetic 30-terminal batch, version `ha-2026-11-24-r1`):
+It restricts the manifest to its canonical filename inside the delivery
+directory, rejects case-insensitive duplicate terminal/output names, path
+separators or `..` escapes, verifies the manifest and every output SHA-256, then
+asks that exact core to load every profile. Recorded HA-02 local run
+(Windows/amd64, synthetic 30-terminal batch, version `ha-2026-11-24-r1`,
+delivery directory and files under a strict three-principal ACL):
 
 - core: `Mihomo Meta v1.19.31 windows amd64 with go1.26.8`
 - core SHA-256: `532ed88b3a37d72f6b5ee5d24a45ce5d8799f3ba34931d6a167d4345f7ebca50`
-- result: `core-load: OK`, `profiles: 30`, elapsed 94.1 s
-  (first attempt failed on a transient GeoIP-database fetch; the harness retries
-  a failed profile once, and the second attempt loaded all 30)
+- result: `core-load: OK`, `profiles: 30`, elapsed 17.0 s (warm GeoIP cache;
+  a failed profile is retried once, so a transient core-side fetch cannot fail
+  an otherwise loadable delivery)
 
 CI runs the same harness against the Linux release `mihomo-linux-amd64-v1.19.31`
 (`.gz` SHA-256 `d5e74bbddbdfff49a1aef7775bf5911da59f0d7196ed509a0ac914b3653dd5f1`,
@@ -398,9 +439,13 @@ The Linux core and the Windows core are different binaries; neither result
 certifies the other platform, and HA-03 still owns the exact
 Clash Verge Rev/Mihomo combination on the event PCs.
 
-CI placement (`shell-tests` only, no new workflow or job): `bash -n` and
-`py_compile` in the fast-checks lane, the contract suite plus the pinned-core
-load in `core-regression`.
+CI placement (five workflows / twenty required checks unchanged):
+`bash -n` and `py_compile` in the `shell-tests` fast-checks lane; the contract
+suite plus the pinned-core load in the `shell-tests` `core-regression` lane
+(Linux real permission gates included); and the same suite in the existing
+`quality-receiver` `contracts` Windows job, which supplies the native NTFS ACL,
+other-principal, junction and per-file permission evidence. No new workflow or
+required check is added.
 
 ## Non-goals
 
