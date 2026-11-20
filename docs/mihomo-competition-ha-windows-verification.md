@@ -45,40 +45,78 @@ combination and drop the candidate claim. Disable auto-update and never press
 "升级内核"; re-hash the core before/after each run (a changed hash reopens the
 gates).
 
-## 2. Stop in order, then back up a coherent private snapshot (required)
+## 2. Stop in order, keep remote control, then back up a coherent private snapshot (required)
 
-Do this **before** importing anything. Stop the running app/core first so the
-snapshot cannot mix profiles, cache and selection files from different states.
+Do this **before** importing anything. First open and confirm a second,
+out-of-band management path (SSH/RDP/WinRM or an out-of-band console) and keep it
+outside the proxied traffic; never route your own management channel through the
+profile you are about to test. Stop the running app/core before the snapshot so
+the backup cannot mix profiles, cache and selection files from different states,
+and **verify the processes are actually gone** before copying.
 
 ```powershell
-# 1. Quit Verge from the tray (or its UI "退出"), wait for processes to exit.
-#    If the core lingers, stop it explicitly and record that you did.
+# 1. Record the running processes, stop them, then prove they are gone.
 Get-Process 'Clash Verge', verge-mihomo -ErrorAction SilentlyContinue |
   Select-Object ProcessName, Id, Path
 Stop-Process -Name 'Clash Verge', verge-mihomo -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 3
-Get-Process 'Clash Verge', verge-mihomo -ErrorAction SilentlyContinue |
-  Select-Object ProcessName, Id
+$left = Get-Process 'Clash Verge', verge-mihomo -ErrorAction SilentlyContinue
+if ($left) {
+  $left | Select-Object ProcessName, Id, Path
+  throw 'Verge/core still running; coherent backup refused'
+}
 
-# 2. Private backup directory (operator + SYSTEM + Administrators only)
+# 2. Private backup directory. Use the current SID (locale-safe): the supported
+#    name form is "${me}:(OI)(CI)F"; "$me:(OI)(CI)F" is invalid PowerShell
+#    interpolation, so it must not be used.
 $cfg = "$env:APPDATA\io.github.clash-verge-rev.clash-verge-rev"
 $backup = "$env:USERPROFILE\ha03-backup-$(Get-Date -Format yyyyMMdd-HHmmss)"
 New-Item -ItemType Directory -Force $backup | Out-Null
-$me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-icacls $backup /inheritance:r /grant:r "$me:(OI)(CI)F" "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F"
+$sid = ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
+icacls $backup /inheritance:r /grant:r "*${sid}:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F"
+if ($LASTEXITCODE -ne 0) { throw 'icacls failed on the backup directory' }
 
-# 3. Copy profiles, settings, cache and selection state; record hashes
-Copy-Item "$cfg\*" $backup -Recurse -Force
+# 3. Re-read the real ACL and refuse any allow principal outside the allowlist.
+$allowed = @($sid, 'S-1-5-18', 'S-1-5-32-544')
+$badAcl = (Get-Acl $backup).Access |
+  Where-Object AccessControlType -eq 'Allow' |
+  ForEach-Object { $_.IdentityReference.Translate([SecurityIdentifier]).Value } |
+  Where-Object { $allowed -notcontains $_ }
+if ($badAcl) { throw "backup ACL outside allowlist: $($badAcl -join ',')" }
+
+# 4. Snapshot source hashes first, copy, then prove the backup is coherent
+#    (same relative path, same size, same SHA-256; nothing missing).
+$before = @{}
 Get-ChildItem $cfg -Recurse -File | ForEach-Object {
-  $_.FullName
-  (Get-FileHash $_.FullName -Algorithm SHA256).Hash
-} | Out-File "$backup\before-hashes.txt"
+  $before[$_.FullName.Substring($cfg.Length)] = [pscustomobject]@{
+    Hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash
+    Length = $_.Length
+  }
+}
+$before | ConvertTo-Json -Depth 3 | Set-Content "$backup\before-hashes.json"
+Copy-Item "$cfg\*" $backup -Recurse -Force
+if ($LASTEXITCODE -ne 0) { throw 'backup copy failed' }
+$bad = @(); $missing = @()
+foreach ($rel in $before.Keys) {
+  $dest = Join-Path $backup $rel
+  if (-not (Test-Path $dest)) { $missing += $rel; continue }
+  if ((Get-Item $dest).Length -ne $before[$rel].Length -or
+      (Get-FileHash $dest -Algorithm SHA256).Hash -ne $before[$rel].Hash) {
+    $bad += $rel
+  }
+}
+if ($bad -or $missing) {
+  throw "backup not coherent: bad=$($bad -join ',') missing=$($missing -join ',')"
+}
 Get-ChildItem $backup -Recurse -File | Measure-Object | Select-Object Count
 ```
 
-Keep the backup private and off the proxied path. Record the backup path,
-file count/hashes, and the current selection state (section 6) **before**
-importing.
+Keep the backup private and outside the proxied path; do not put it in the
+profile directory or on a network share. Record the backup path, the source file
+count/byte total, the `before-hashes.json` SHA-256, and the selection state
+(section 7) **before** importing. Only the Verge app and its core are stopped:
+do not stop SSH/RDP/WinRM, the network adapter or the TUN service you still need
+for remote management.
 
 ## 3. Import and effective configuration
 
@@ -162,33 +200,80 @@ curl.exe -6 https://api64.ipify.org        # IPv6 egress (only if in scope)
 - Cross-check for overrides: compare the effective YAML/Verge settings with the
   imported artifact (TUN stack/route/DNS/ports). Record every difference.
 
-## 6. TLS identity, expiry, rotation and application attribution
+## 6. TLS identity, expiry, rotation and rollback (TLS1–TLS5)
 
 This section needs the two authorized test VPSes and must not be run against
 production. The offline pin/date control is **not** TLS PASS.
 
-For each VPS (A and B), and for both the primary and backup HY2 role:
+Stage boundary (do not merge the claims): **HA-03** owns the TLS identity rows
+below and the per-node/connection **path attribution** (which application or
+connection used which node/VPS); **HA-04** owns the hard-failure switch timing
+and recovery ordering; **HA-05** owns the complete business-application
+recovery (vMix/TikTok LIVE Studio/Google Drive T3). A TLS row passing says the
+identity/validity policy behaved as recorded; it does not prove failover timing
+or application recovery.
 
-1. Re-run the trusted SSH certificate acquisition (profile doc) and confirm the
-   pin/dates match the pins file and both competition deliveries.
-2. With the pinned profile active, force a **fresh** HY2 connection to the
-   candidate; confirm success and attribute the connection (section 5).
-3. Serve a wrong certificate on the test VPS (or pin a wrong value): the affected
-   node must be rejected; the client must fail over **without** weakening
-   verification. Never enable `skip-cert-verify: true` as a fallback.
-4. Serve an expired or retired certificate: record the observed rejection and
-   failover. Confirm a retired fingerprint is no longer accepted.
-5. Rotation: renew the test cert, update pins/delivery, `--check`, re-import,
-   verify fresh accept with the new pin and reject with the old pin.
-6. Failed rotation: break the renewal (wrong path/missing cert) and confirm the
-   client rejects rather than silently continues; then restore the previous
-   valid pair and `--check` before re-import.
-7. Rollback: restore the original profile and verify the original behaviour;
-   a retired cert/pin must remain rejected unless the rollback target is
-   still-valid and explicitly approved.
-8. HA-03 owns **actual application path attribution** (which app/connection
-   used which node/VPS). HA-04 owns full failover/recovery timing; do not merge
-   the two claims. A pinned LAB loopback result is not VPS identity acceptance.
+For each VPS (A and B), and for both the primary and backup HY2 role, run and
+record the row IDs:
+
+### TLS1 — Expected peer accepted and attributed
+
+Re-run the trusted SSH certificate acquisition (profile doc) and confirm the
+pin/dates match the pins file and the competition delivery. With the pinned
+profile active, force a **fresh** HY2 connection to the candidate; confirm
+success and attribute the connection/process (section 5). Record the sanitized
+endpoint alias, role, config version/SHA-256 and the UTC time.
+
+### TLS2 — Wrong certificate / identity rejected
+
+Serve a wrong certificate on the test VPS (or pin a wrong value): the affected
+node must be rejected; the client must fail over **without** weakening
+verification. Never enable `skip-cert-verify: true` as a fallback. Record the
+affected node, whether another candidate recovered and the sanitized evidence.
+
+### TLS3 — Expired / retired certificate: actual peer behaviour vs validity control
+
+Mihomo leaf pinning compares the leaf DER SHA-256 and does **not** enforce the
+certificate validity window. Do **not** expect the pinned core to reject an
+expired certificate merely because a matching pin exists:
+
+1. Serve (or keep) an expired certificate whose DER pin still matches the pin in
+   the active competition profile. Record the **actual** observed behaviour
+   (accepted or rejected) with timestamps and attribution. Acceptance is the
+   documented residual exposure, not a pass; rejection is recorded as observed.
+2. Demonstrate the mandatory validity control: run the preflight
+   (`--check --source-delivery ...`) on the event PC before the run and show that
+   an expired/insufficient pin fails it, then deactivate or remove the affected
+   competition profile in Verge. Record the commands, sanitized output and the
+   deactivation action.
+3. Confirm a retired fingerprint is no longer accepted on a fresh connection.
+
+If part 2 (mandatory preflight + deactivation) cannot be executed, TLS3 stays
+**BLOCKED** and the competition profile must not be used.
+
+### TLS4 — Planned renewal / pin rotation and failed renewal
+
+Renew the test certificate, update pins/delivery, run `--check`, re-import, and
+verify a fresh accept with the new pin and rejection with the old pin. Then break
+the renewal (wrong path/missing certificate): confirm the client rejects rather
+than silently continuing; restore the previous valid pair, `--check`, and
+re-import.
+
+### TLS5 — Rollback within competition mode; legacy restore exits competition mode
+
+1. **TLS5 competition rollback**: restore a previous competition delivery that is
+   still pin-valid and `--check`-GREEN. Verify a fresh connection succeeds with
+   the restored pin and that a retired pin stays rejected. This is a rollback
+   within competition-safe mode.
+2. **Exiting competition mode is not a TLS5 rollback**: restoring the legacy
+   HA-02 profile (`skip-cert-verify: true`) deliberately leaves the
+   competition-safe mode. It requires an explicit operator decision, restores
+   the original profile/settings/selection, and must be recorded separately as
+   "exit competition mode", never counted as TLS recovery.
+
+Record for each row: expected vs observed outcome, node/role, fresh-connection
+proof, failover/attribution result, UTC time and verdict. A pinned LAB loopback
+result is not VPS identity acceptance.
 
 If the owner finds the date/pin control insufficient for the frozen contract,
 evaluate a trusted chain + name verification on a disposable test VPS with its
@@ -196,6 +281,13 @@ own approval. Never modify production certificates; an approved exception is
 not TLS PASS.
 
 ## 7. Selection cache and exit/restore
+
+Stage boundary: HA-03 records the cache/exit/restart/restore **behaviour and
+receipts** here, including the complete original profile/settings/selection
+restore required by #91; the complete business-application recovery verdict
+belongs to HA-05 and hard-failure timing to HA-04. A clean
+settings/selection restore does not substitute for an application recovery
+result.
 
 Use the authenticated controller; never print the secret.
 
@@ -216,8 +308,9 @@ Required checks:
 - if migration to automatic mode is needed, perform it explicitly and record
   the operator action and resulting `/proxies` state;
 - after removing the competition profile and re-importing the original, verify
-  profile/settings/selection/TUN/DNS/LAN/application behaviour and hashes
-  against the section 2 backup;
+  profile/settings/selection/TUN/DNS/LAN behaviour and hashes against the
+  section 2 backup; these are HA-03 restore rows, not an HA-05 application
+  recovery result;
 - record the full original snapshot restoration path and the private ACL on the
   backup/recovery material.
 
@@ -228,8 +321,11 @@ SHA-256, actual core path/banner/SHA-256 + provenance, profile version/output
 SHA-256, A/B role, mode, outer/inner cache state, actual TCP+UDP bind list,
 second-device results, effective-config deviations, command result, UTC time and
 verdict (`PASS` only for executed reproducible rows; `NOT RUN` / `BLOCKED` /
-`UNKNOWN` otherwise). No private YAML, certificate body, account, secret,
-session ID or endpoint tuples.
+`UNKNOWN` otherwise). TLS rows carry their `TLS1`–`TLS5` ID; a rollback row also
+states whether it stayed inside competition mode or exited it. Add a stage label
+(`HA-03` path/identity/restore, `HA-04` failover timing, `HA-05` business
+recovery) and never record an HA-04/HA-05 row as HA-03 PASS. No private YAML,
+certificate body, account, secret, session ID or endpoint tuples.
 
 This runbook itself is not evidence. HA-03 remains BLOCKED for every row that
 was not executed on the real PC/VPS. HA-03 code landing does not change issue

@@ -3,7 +3,9 @@
 Code: `tools/mihomo-competition-ha-profile.py`
 Contract suite: `tests/test-mihomo-competition-ha-profile.sh`
 Consumes: the HA-02 delivery (`ha-delivery-*.json` + `<name>-ha.yaml`) and a
-local pins file. Produces: `<name>-hac.yaml` + `ha-competition-<version>.json`
+local pins file; `--check` additionally consumes the same trusted HA-02 delivery
+as `--source-delivery` (to re-derive the expected bytes).
+Produces: `<name>-hac.yaml` + `ha-competition-<version>.json`
 in a **separate** output directory.
 Parents: [competition HA contract](mihomo-competition-ha-contract.md),
 [acceptance contract](mihomo-competition-ha-acceptance.md),
@@ -17,6 +19,9 @@ VPSes. Those rows are NOT RUN / BLOCKED, not PASS. Default OFF: this tool only
 writes files; importing and activating a competition profile in Clash Verge Rev
 is an explicit operator action. No daemon, GUI, web service or scheduled task is
 added; Quality Failover stays opt-in and disabled.
+Project deadline: the competition configuration delivery is due before
+2026-11-26; that is a delivery deadline, not the event end and not Go-Live
+approval. Certificate validity must cover the actual event end plus a margin.
 
 ## Why a second delivery instead of editing HA-02
 
@@ -51,9 +56,16 @@ default and may not be enabled by editing this artifact.
 
 The transformer refuses any input that does not match the expected shape
 (missing/extra HY2 block, existing `fingerprint`, missing security lines, CRLF,
-more or fewer than five edit points). `--check` re-derives these security
-invariants from the YAML itself, so a modified profile cannot pass merely by
-updating the manifest hashes.
+more or fewer than five edit points). `--check` does not trust the YAML's
+literal text: it requires the trusted HA-02 source delivery, verifies the
+source-manifest SHA-256 recorded at generation time, re-runs the identical
+five-edit transform from the source bytes and compares every competition file
+byte-for-byte. A file set with an extra profile, a re-cased suffix
+(`FOO-HAC.YAML`) or a casefold-duplicate name is refused before any comparison.
+A literal-invariant checker is kept as defense-in-depth, but it only matches
+exact lines: it cannot recognise equivalent YAML spellings or extra
+listeners/keys, so it is not a YAML semantic proof and the byte comparison is
+the authoritative preflight gate.
 
 ## Pins file (trusted input)
 
@@ -89,40 +101,63 @@ A local, access-controlled JSON v2 file:
 
 HY2 uses **UDP/QUIC**; ordinary `openssl s_client -connect` is TCP and cannot
 retrieve the QUIC peer certificate. Read the certificate file referenced by the
-actual server configuration over a known trusted SSH channel instead. This does
-not read the private key and does not modify the server:
+actual server configuration over a known trusted SSH channel instead. The block
+below keeps everything in shell variables (no fixed `/tmp` file), stops on the
+first failed command or pipeline, and derives the fingerprint and both dates
+from the **same public certificate snapshot**. The private key is never opened
+or copied, and the server is not modified:
 
 ```bash
-set -o pipefail
+set -euo pipefail
 CONFIG=/root/sbox/sbconfig_server.json
+refuse() { echo "REFUSE: $*" >&2; exit 1; }
 
-# 1. Resolve exactly one readable regular certificate path; fail otherwise.
-jq -er '.inbounds[] | select(.tag == "hy2-in") | .tls.certificate_path' \
-  "$CONFIG" > /tmp/hy2-cert-path || { echo "REFUSE: hy2-in cert path missing" >&2; exit 1; }
-[ "$(wc -l < /tmp/hy2-cert-path)" -eq 1 ] || { echo "REFUSE: cert path not unique" >&2; exit 1; }
-CERT=$(cat /tmp/hy2-cert-path)
-[ -n "$CERT" ] && [ -f "$CERT" ] && [ -r "$CERT" ] \
-  || { echo "REFUSE: cert file missing/unreadable" >&2; exit 1; }
+# 1. Resolve exactly one certificate path string in memory.
+CERT=$(jq -er '.inbounds[] | select(.tag == "hy2-in") | .tls.certificate_path' \
+  "$CONFIG") || refuse "hy2-in certificate path missing/ambiguous"
+case "$CERT" in
+  "") refuse "empty certificate path" ;;
+  *$'\n'*|*$'\r'*) refuse "certificate path is not a single string" ;;
+esac
+[ -f "$CERT" ] && [ -r "$CERT" ] \
+  || refuse "certificate file missing/unreadable"
 
-# 2. Validate the certificate, then derive pin + dates from the same file.
-openssl x509 -in "$CERT" -noout -checkend 0 \
-  || { echo "REFUSE: invalid/expired certificate" >&2; exit 1; }
-FP=$(openssl x509 -in "$CERT" -outform DER | sha256sum | awk '{print $1}')
+# 2. Read the public certificate once. The private key is never touched.
+CERT_PEM=$(cat -- "$CERT") || refuse "certificate read failed"
+printf '%s\n' "$CERT_PEM" | grep -q -- 'BEGIN CERTIFICATE' \
+  || refuse "not a PEM certificate"
+
+# 3. Validate and derive all three values from that same public snapshot.
+printf '%s\n' "$CERT_PEM" | openssl x509 -noout -checkend 0 \
+  || refuse "certificate invalid or already expired"
+FP=$(printf '%s\n' "$CERT_PEM" | openssl x509 -outform DER \
+  | sha256sum | awk '{print $1}') || refuse "DER SHA-256 failed"
 printf '%s' "$FP" | grep -Eq '^[0-9a-f]{64}$' \
-  || { echo "REFUSE: DER SHA-256 failed" >&2; exit 1; }
-NOT_BEFORE=$(openssl x509 -in "$CERT" -noout -startdate | cut -d= -f2)
-NOT_AFTER=$(openssl x509 -in "$CERT" -noout -enddate | cut -d= -f2)
+  || refuse "DER SHA-256 is not 64 lowercase hex"
+NOT_BEFORE=$(printf '%s\n' "$CERT_PEM" | openssl x509 -noout -startdate \
+  | cut -d= -f2) || refuse "notBefore extraction failed"
+NOT_AFTER=$(printf '%s\n' "$CERT_PEM" | openssl x509 -noout -enddate \
+  | cut -d= -f2) || refuse "notAfter extraction failed"
 ISO_BEFORE=$(date -u -d "$NOT_BEFORE" +%Y-%m-%dT%H:%M:%SZ) \
-  || { echo "REFUSE: notBefore parse failed" >&2; exit 1; }
+  || refuse "notBefore parse failed"
 ISO_AFTER=$(date -u -d "$NOT_AFTER" +%Y-%m-%dT%H:%M:%SZ) \
-  || { echo "REFUSE: notAfter parse failed" >&2; exit 1; }
-printf 'fingerprint=%s not_before=%s not_after=%s\n' "$FP" "$ISO_BEFORE" "$ISO_AFTER"
+  || refuse "notAfter parse failed"
+[ "$ISO_BEFORE" \< "$ISO_AFTER" ] \
+  || refuse "notBefore is not before notAfter"
+printf 'fingerprint=%s not_before=%s not_after=%s\n' \
+  "$FP" "$ISO_BEFORE" "$ISO_AFTER"
 ```
 
+Every assignment/pipeline has an explicit fail-stop (plain `pipefail` alone
+does not stop `set -e` scripts). If `jq`, `openssl`, GNU `date -d` or
+`sha256sum` is unavailable the block refuses; do not replace a derived value by
+hand. Never echo `$CERT_PEM`, never read `tls.key_path`, never copy private keys
+off the server, never change the live certificate for this step, and do not
+paste the certificate body or addresses into the task/PR.
+
 Run the same block on VPS A and VPS B through each trusted SSH channel and record
-the three values. Never copy private keys off the server, never change the live
-certificate for this step, and do not paste the certificate body or addresses
-into the task/PR.
+the three values in the private pins file (`source` can name the channel, host
+alias and UTC time; no secrets).
 
 **Reading the on-disk certificate is not live TLS acceptance.** It only supplies
 the pin and validity dates. The real acceptance still requires a fresh HY2
@@ -133,26 +168,33 @@ VPSes. LAB pin-semantics evidence is not a substitute.
 ## Validity control (because Mihomo leaf pinning does not check expiry)
 
 Mihomo's hysteria2 `fingerprint` compares the leaf DER SHA-256; it does not
-enforce the certificate's validity window. The tool therefore enforces the
-documented control itself; this is **not** a claim that TLS validity is proven:
+enforce the certificate's validity window. A matching-pin certificate that has
+expired may therefore still be accepted by the pinned core; the runbook records
+that as the actual residual behaviour, never as an expiry rejection. The tool
+therefore enforces the documented control itself; this is **not** a claim that
+TLS validity is proven:
 
 - generation refuses a pin whose `not_after` is not strictly later than
   `now + --min-validity-days` (default 7), whose `not_before` is in the future,
   or whose dates are inconsistent;
 - `--require-valid-through <UTC time>` additionally requires `not_after` to
-  cover the expected event end plus the safety margin; the requirement is
-  recorded in the delivery manifest;
+  cover the **actual competition end plus the safety margin**. It is not the
+  network build/delivery date: the delivery deadline (before 2026-11-26) does
+  not define the event end, so use the latest confirmed schedule and re-check
+  if the schedule moves. The requirement is recorded in the delivery manifest;
 - `--check` re-validates the pins against the **recorded floor**: it uses
   `max(--min-validity-days, manifest.validity.min_validity_days)` and enforces
   the recorded `required_valid_through`, so a later check cannot silently lower
-  the delivery-time validity requirement;
+  the delivery-time validity requirement; it also re-derives every output from
+  the trusted HA-02 source bytes;
 - a failed generation/check exits non-zero and prints a fixed code; the affected
   competition profile must not be used.
 
-Run `--check` before every event day and after any renewal. If it fails, stop
-using the affected competition profile (remove/deactivate it in Verge), fix the
-pin/certificate and regenerate; do not bypass the check or enable
-`skip-cert-verify: true`.
+Run `--check` **before every event day** and after any renewal; if a check
+fails, deactivate/remove the affected competition profile in Verge immediately,
+fix the pin/certificate and regenerate. That mandatory preflight plus
+deactivation is the validity control that covers the core's non-enforcement of
+expiry; do not bypass the check or enable `skip-cert-verify: true`.
 
 ### Rotation and expiry disposition
 
@@ -161,16 +203,20 @@ pin/certificate and regenerate; do not bypass the check or enable
 2. Re-run the trusted SSH acquisition block; update the pins file with the new
    fingerprint, `not_before`, `not_after` and a new `source`.
 3. Regenerate the competition delivery with the new version and the event-end
-   `--require-valid-through`, then run `--check` and load-test with the pinned
-   core.
+   `--require-valid-through`, then run `--check` (with `--source-delivery`) and
+   load-test with the pinned core.
 4. Re-import the new `<name>-hac.yaml` manually; verify a fresh HY2 connection
    succeeds with the new pin and fails with the retired pin.
 5. Test a failed rotation (wrong/missing new cert): the client must reject the
    affected node and fail over without weakening verification; record the
    observed behaviour, then restore the previous valid pair and re-check.
-6. Keep the previous delivery for rollback, but a retired certificate/pin must
-   be rejected after rollback unless the rollback target is a still-valid,
-   explicitly approved configuration.
+6. Keep the previous delivery for a rollback **within competition mode**: restore
+   a still-valid, explicitly approved competition delivery and verify a fresh
+   connection; a retired certificate/pin stays rejected unless the rollback
+   target itself is still valid. Restoring the legacy HA-02 profile
+   (`skip-cert-verify: true`) is **not** a competition rollback: it exits
+   competition mode and must be a separate explicit operator decision recorded
+   in the runbook (TLS5), never counted as TLS recovery.
 
 If the owner concludes this date/pin control cannot satisfy the frozen
 acceptance contract, the alternative to evaluate on a disposable test VPS is a
@@ -185,19 +231,27 @@ certificates, and an approved security exception is never counted as TLS PASS.
 $EDITOR ~/ha/pins.json
 chmod 600 ~/ha/pins.json
 
-# 1. generate the competition delivery next to (NOT inside) the HA-02 delivery;
-#    --require-valid-through covers the expected event end + safety margin
+# 1. generate the competition delivery next to (NOT inside) the HA-02 delivery.
+#    --config-version records the build revision, NOT the event end.
+#    --require-valid-through must be the ACTUAL competition end (UTC) plus the
+#    safety margin. The delivery deadline (before 2026-11-26) is not an event
+#    end; take the confirmed schedule and re-check if it moves. Replace the
+#    placeholder below - do not use the build date or an assumed Nov 25 value.
+REQUIRED_THROUGH='<actual-event-end-UTC-plus-margin>'
 python3 tools/mihomo-competition-ha-profile.py \
   --delivery ~/ha/delivery \
   --pins ~/ha/pins.json \
   --output-dir ~/ha/competition \
-  --config-version ha-2026-11-24-comp-r1 \
+  --config-version ha-2026-11-21-comp-r1 \
   --min-validity-days 7 \
-  --require-valid-through 2026-11-25T00:00:00Z
+  --require-valid-through "$REQUIRED_THROUGH"
 
-# 2. preflight before each event day and after renewal (repeat until GREEN)
+# 2. preflight before each event day and after renewal (repeat until GREEN).
+#    --source-delivery is the trusted HA-02 delivery the competition files were
+#    generated from; --check re-derives and compares every byte.
 python3 tools/mihomo-competition-ha-profile.py \
-  --delivery ~/ha/competition --pins ~/ha/pins.json --check
+  --delivery ~/ha/competition --source-delivery ~/ha/delivery \
+  --pins ~/ha/pins.json --check
 
 # 3. import one <name>-hac.yaml into Clash Verge Rev manually and verify it
 #    (see docs/mihomo-competition-ha-windows-verification.md). No automatic
@@ -209,17 +263,20 @@ Success prints:
 ```
 ha-profile: OK
 terminals: 30
-version: ha-2026-11-24-comp-r1
-manifest: ha-competition-ha-2026-11-24-comp-r1.json
+version: ha-2026-11-21-comp-r1
+manifest: ha-competition-ha-2026-11-21-comp-r1.json
 ```
 
 `--check` prints `ha-profile: OK`, `terminals`, `pins: valid` and
-`validity: A=<not_after> B=<not_after>`.
+`validity: A=<not_after> B=<not_after>`. It requires both the competition
+delivery and the trusted HA-02 source delivery; keep both private and available.
+If the source delivery changed (or was regenerated), `--check` refuses and the
+competition delivery must be regenerated rather than repaired in place.
 
 ## Output manifest
 
 `ha-competition-<version>.json` records: schema/tool/config version, the HA-02
-source manifest name + schema + config version, A/B pins with
+source manifest name, its **SHA-256**, schema and config version, A/B pins with
 `not_before`/`not_after`/`source`, `min_validity_days`,
 `required_valid_through`, `checked_utc`, the permission gate, and per terminal:
 name, group, `primary_vps`, `backup_vps`, input/output file names and SHA-256
@@ -228,9 +285,13 @@ the rollback file list (competition profiles + manifest). It contains no
 addresses, UUIDs, passwords or profile bodies. Protect it like the delivery.
 
 The manifest is a **local trusted record, not a cryptographic authenticity
-claim**: anyone who can write it can recompute hashes. That is why `--check`
-re-reads the actual YAML and enforces the security invariants and the recorded
-validity floor instead of trusting stored hashes alone.
+claim**: anyone who can write it can recompute hashes. `--check` therefore does
+not trust the stored hashes alone: it re-reads the actual YAML files, requires
+the recorded source-manifest SHA-256 to match the trusted HA-02 delivery you
+pass as `--source-delivery`, re-derives the expected bytes from that source and
+enforces the recorded validity floor. Rewriting the original HA-02 delivery,
+the competition output and every recorded hash consistently is inside the
+local-operator trust boundary and is not defended by this tool.
 
 ## Failure handling and rollback
 
@@ -238,16 +299,16 @@ Fixed codes on stderr, exit 1 (`E_USAGE` exits 2):
 
 | Code | Meaning |
 | --- | --- |
-| `E_DELIVERY` | HA-02/competition manifest missing/ambiguous/duplicate-key/invalid names, counts, roles or file set |
-| `E_DELIVERY_HASH` | an input or competition output no longer matches its recorded size/SHA-256 |
+| `E_DELIVERY` | HA-02/competition manifest missing/ambiguous/duplicate-key/invalid names, counts, roles or file set; a different source delivery/manifest name; an exact-name or casefold duplicate in the delivered file set |
+| `E_DELIVERY_HASH` | the HA-02 source manifest/profile or a competition output no longer matches its recorded size/SHA-256 (`role=source-manifest` for a different source manifest) |
 | `E_PINS` | pins file missing/symlink/reparse/duplicate-key/malformed/unknown keys/identical pins/future notBefore/invalid dates |
 | `E_PINS_EXPIRED` | a pin expires inside the effective validity floor or does not reach `--require-valid-through` |
-| `E_TRANSFORM` | input profile is not the expected HA-02 shape, or a competition YAML fails the security re-derivation (LAN/wildcard DNS/skip-cert/pin mismatch) |
+| `E_TRANSFORM` | input profile is not the expected HA-02 shape, the competition output is not the byte-exact deterministic transform of the trusted source (including a re-hashed extra listener/key or equivalent YAML spelling), or the literal defense-in-depth invariants fail |
 | `E_OUTPUT_EXISTS` | target profile or manifest already exists (case-insensitive) |
-| `E_PATH_CONFLICT` | missing/linked/junction input/output directory, output inside the HA-02 delivery, or unsafe local boundary |
+| `E_PATH_CONFLICT` | missing/linked/junction input/output directory, output inside the HA-02 delivery, unsafe local boundary, or a casefold-duplicate name in the output directory |
 | `E_INSECURE_PERMISSIONS` | POSIX mode/owner, Windows ACL allowlist, or private-boundary/temp-inheritance failure (per-file roles `input-manifest`, `input-profile`, `pins`, `manifest-file`, `output-file`, `delivery-input`, `output-dir`) |
 | `E_IO` | write/verify failure |
-| `E_USAGE` | bad arguments/version/required-valid-through |
+| `E_USAGE` | bad arguments/version/required-valid-through, `--check` without `--source-delivery`, or `--source-delivery` in generation mode |
 
 All targets are prevalidated before any write; writes are atomic no-clobber;
 every output and the manifest are read back, permission-checked and
@@ -267,8 +328,13 @@ Verified here (hermetic + pinned core + LAB):
 - input/manifest/pins/output real permission, owner, reparse, size, count,
   canonical-name, casefold-duplicate and role checks in both generation and
   `--check`;
-- security re-derivation from YAML: modified `allow-lan`/`bind-address`/DNS/
-  `skip-cert-verify`/pin with re-hashed manifest is still refused;
+- `--check` source binding: recorded HA-02 manifest SHA-256, terminal
+  name/role/input relationship, and byte-for-byte equality with the transform
+  re-derived from the trusted source; a tampered/wrong source delivery, an
+  injected extra listener/controller key, an equivalent YAML spelling, a role
+  swap and a swapped pin with a fully re-hashed manifest are all refused;
+- file set: extra profile, re-cased suffix (`FOO-HAC.YAML`) and (POSIX) actual
+  casefold-duplicate names are refused;
 - no-clobber, case collisions, path/permission failures, partial rollback;
 - real Linux CI with the pinned Mihomo v1.19.31 core loading all 30 generated
   `-hac.yaml` profiles (`-t`); the Windows core loads the same shape;
@@ -281,14 +347,16 @@ Verified here (hermetic + pinned core + LAB):
   (installed version, on-disk core banner + SHA-256, provenance, anti-upgrade);
 - real HY2 TLS accept/reject on VPS A and B, primary/backup roles,
   certificate renewal/rotation, failed-renewal recovery, expired/retired pin
-  rejection and rollback;
+  rejection and rollback; the runbook records the actual matching-pin expired
+  behaviour of the core rather than assuming rejection;
 - TUN/DNS/Fake-IP/IPv4/IPv6/UDP, Rule/Global/Direct effective paths, actual
   listener binds/auth, LAN/production/management access, effective-config
   cross-check against the imported YAML;
 - selection-cache behaviour, manual-override preservation, abnormal close/
-  restart, full profile/settings/selection/network restore;
+  restart, full profile/settings/selection/network restore (the business-app
+  recovery verdict belongs to HA-05);
 - actual application path attribution and real application UDP; HA-04 owns the
-  full failover/recovery measurements;
+  failover timing and HA-05 the complete business recovery;
 - real 10 s/application performance.
 
 These rows stay NOT RUN / BLOCKED until the Windows test PC and both authorized
