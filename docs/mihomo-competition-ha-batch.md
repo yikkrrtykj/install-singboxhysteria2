@@ -302,7 +302,10 @@ Windows is an **allowlist**, not a denylist. A DACL is accepted only when:
   `CREATOR OWNER` (`S-1-3-0`) / `OWNER RIGHTS` (`S-1-3-4`) **with the
   inherit-only flag**; any other principal is refused and reported by SID;
 - the owner is the current operator, `SYSTEM` or `Administrators` (an owner who
-  could rewrite the DACL is refused).
+  could rewrite the DACL is refused). The built-in local Administrator account
+  (RID 500) can appear in SDDL as the machine-relative alias `LA`; it counts as
+  the current operator only when the running token itself is that account, and
+  is refused otherwise.
 
 The gate runs on the exports root, both source trees, the inventory, the
 delivery directory, and the delivered YAML and manifest files **themselves**.

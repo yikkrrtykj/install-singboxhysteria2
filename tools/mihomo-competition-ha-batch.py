@@ -98,6 +98,7 @@ ALLOW_ACE_TYPES = frozenset({"A", "OA"})
 DENY_ACE_TYPES = frozenset({"D", "OD"})
 IGNORED_ACE_TYPES = frozenset({"AU", "AL", "OU", "OL", "ML", "ID", "RA", "SP"})
 KNOWN_ACE_TYPES = ALLOW_ACE_TYPES | DENY_ACE_TYPES | IGNORED_ACE_TYPES
+LOCAL_ADMIN_SID_RE = re.compile(r"\AS-1-5-21-\d+-\d+-\d+-500\Z")
 
 _CURRENT_USER_SID = []
 
@@ -340,6 +341,20 @@ def _canonical_sdd_sid(token):
     return SDD_ALIAS.get(token, token)
 
 
+def _principal_sid(token, current_user_sid):
+    """Canonical SID for an ACE/owner token, resolving the local-admin alias.
+
+    SDDL renders the built-in local Administrator account (RID 500) as `LA`,
+    which is a machine-relative alias rather than a fixed SID. It is equivalent
+    to the current operator only when the current token itself is that account;
+    otherwise it remains an unknown principal and is refused.
+    """
+    sid = _canonical_sdd_sid(token)
+    if sid == "LA" and LOCAL_ADMIN_SID_RE.match(current_user_sid or ""):
+        return current_user_sid
+    return sid
+
+
 def sddl_aces(sddl):
     """All DACL ACEs as (type, flags, sid-token) tuples, or None if unparsable.
 
@@ -397,13 +412,13 @@ def acl_problems(sddl, owner_token, current_user_sid):
         if ace_type not in ALLOW_ACE_TYPES:
             problems.append("ace-type=" + ace_type)
             continue
-        sid = _canonical_sdd_sid(token)
+        sid = _principal_sid(token, current_user_sid)
         if sid == current_user_sid or sid in ALLOWED_PRINCIPAL_SIDS:
             continue
         if sid in INHERIT_ONLY_SIDS and "IO" in flags:
             continue
         problems.append("principal=" + sid)
-    owner = _canonical_sdd_sid(owner_token)
+    owner = _principal_sid(owner_token, current_user_sid)
     if not owner:
         problems.append("missing-owner")
     elif owner != current_user_sid and owner not in ALLOWED_PRINCIPAL_SIDS:

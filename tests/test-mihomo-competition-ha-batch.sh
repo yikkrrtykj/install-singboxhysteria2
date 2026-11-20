@@ -1330,6 +1330,16 @@ for args, expected in component_cases:
     got = batch.posix_component_problem(*args)
     if got != expected:
         bad.append("component-%r:want=%r,got=%r" % (args, expected, got))
+# The built-in local Administrator is rendered as the machine-relative alias
+# `LA`; it may match only the current operator's own RID-500 SID.
+la_sddl = "O:S-1-5-21-1-2-3-500D:PAI(A;OICI;FA;;;LA)"
+if batch.acl_problems(la_sddl, "S-1-5-21-1-2-3-500",
+                      "S-1-5-21-1-2-3-500"):
+    bad.append("local-admin-self")
+other = batch.acl_problems(la_sddl, "S-1-5-21-1-2-3-1001",
+                           "S-1-5-21-1-2-3-1001")
+if not any(p.startswith("principal=LA") for p in other):
+    bad.append("local-admin-other:want=principal=LA,got=%r" % other)
 print("ok" if not bad else ";".join(bad))
 PY
 )
