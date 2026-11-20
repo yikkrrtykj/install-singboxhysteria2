@@ -76,6 +76,7 @@ jobs:
           bash -n tests/test-monitor-v2-p2b-integration.sh
           bash -n tests/test-mihomo-multi-vps-merge.sh
           bash -n tests/test-mihomo-competition-ha-batch.sh
+          bash -n tests/test-mihomo-competition-ha-profile.sh
           bash -n tests/test-monitor-v2-probes.sh
           bash -n tests/test-monitor-v2-probe-ingest.sh
           bash -n tests/test-monitor-v2-classify.sh
@@ -103,6 +104,7 @@ jobs:
           python3 -m py_compile tools/mihomo-multi-vps-merge.py
           python3 -m py_compile tests/mihomo-multi-vps-runtime-lab.py
           python3 -m py_compile tools/mihomo-competition-ha-batch.py
+          python3 -m py_compile tools/mihomo-competition-ha-profile.py
           python3 -m py_compile tests/mihomo-competition-ha-core-load.py
           python3 -m py_compile tools/mihomo-quality-failover.py tools/mihomo-quality-pilot.py tools/mihomo-quality-client.py tools/quality_failover/*.py
           python3 -m py_compile tests/test_quality_failover.py tests/test_quality_pilot.py tests/test_quality_daily.py tests/mihomo-quality-runtime-lab.py tests/mihomo-quality-pilot-lab.py tests/mihomo-quality-daily-lab.py
@@ -201,6 +203,8 @@ jobs:
           "$bin/mihomo" -v
           HA02_MIHOMO="$bin/mihomo" HA02_MIHOMO_SHA256="$actual" \
             bash tests/test-mihomo-competition-ha-batch.sh
+          HA02_MIHOMO="$bin/mihomo" HA02_MIHOMO_SHA256="$actual" \
+            bash tests/test-mihomo-competition-ha-profile.sh
 
       - name: "Protocol quality failover hermetic regression (issue #48 PR-48B)"
         run: |
