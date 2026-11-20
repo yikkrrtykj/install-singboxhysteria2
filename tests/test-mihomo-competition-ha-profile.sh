@@ -692,6 +692,7 @@ run_profile --delivery "$D/delivery" --pins "$D/pins.json" \
     && pass 'T7c output directory equal to the delivery refused' \
     || fail "T7c (rc=$RC stderr=[$ERR])"
 mkdir -p "$D/delivery/inside"; win_private_acl "$D/delivery/inside"
+[ "$POSIX_HOST" = "1" ] && chmod 700 "$D/delivery/inside"
 run_profile --delivery "$D/delivery" --pins "$D/pins.json" \
     --output-dir "$D/delivery/inside" --config-version comp-r1
 [ "$RC" -ne 0 ] && [ "$ERR1" = 'ha-profile: FAIL E_PATH_CONFLICT role=output-dir' ] \
