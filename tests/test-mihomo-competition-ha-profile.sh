@@ -8,6 +8,13 @@
 # physical VPS that the HA-02 manifest assigned to each HY2 node (A/B-first).
 # The HA-02 input files are never modified or overwritten.
 #
+# --check is bound to the trusted HA-02 source delivery (--source-delivery): it
+# verifies the recorded source-manifest SHA-256, re-runs the same deterministic
+# five-edit transform and compares every competition profile byte-for-byte.
+# The literal security checker is kept as defense-in-depth only. The file set
+# must contain the exact canonical names (no extra profile, no re-cased suffix,
+# no casefold-duplicate entry).
+#
 # Sandbox only: temporary files, no network, no real credentials (obvious
 # sentinels), no production. The pinned-core section runs only when the operator
 # supplies a hash-pinned Mihomo binary (Linux CI does; the Windows job skips it
@@ -437,7 +444,9 @@ for marker in 'BATCH_TOOL_NAME' 'load_batch_tool' 'load_merge_tool' \
               'def is_reparse' 'verify_temp_inheritance' 'batch.rollback' \
               'def verify_competition_profile' \
               'def check_regular_private_file' 'allow-lan: false' \
-              'bind-address: "127.0.0.1"' 'required_valid_through'; do
+              'bind-address: "127.0.0.1"' 'required_valid_through' \
+              '--source-delivery' 'delivery_manifest_sha256' 'def list_names' \
+              'not the deterministic transform of the source'; do
     grep -qF -- "$marker" "$TOOL" \
         && pass "HA-02 reuse/security contract present [$marker]" \
         || fail "missing [$marker]"
@@ -455,8 +464,8 @@ text = open(sys.argv[1], encoding="utf-8").read()
 print(" ".join(re.findall(r'add_argument\("(--[a-z-]+)"', text)))
 PY
 )"
-assert_eq '--delivery --pins --output-dir --config-version --min-validity-days --require-valid-through --check' \
-    "$cli_flags" 'CLI flags are exactly the documented seven'
+assert_eq '--delivery --pins --output-dir --config-version --min-validity-days --require-valid-through --source-delivery --check' \
+    "$cli_flags" 'CLI flags are exactly the documented eight'
 for forbidden in uuid password server pubkey force activate enable; do
     printf '%s\n' "$cli_flags" | grep -qiE -- "--$forbidden" \
         && fail "the CLI exposes a --$forbidden option" || true
@@ -500,6 +509,14 @@ assert_eq 'false' "$(block_skip "$OUT1" Backup-Hysteria2)" 'T1 backup HY2 skip-c
 assert_eq 0 "$(grep -c 'skip-cert-verify: true' "$OUT1")" 'T1 no skip-cert-verify true remains'
 assert_eq 2 "$(grep -c '    fingerprint: ' "$OUT1")" 'T1 exactly two certificate pins'
 assert_eq 'mihomo-competition-ha-profile/2' "$(jget "$MAN" schema)" 'T1 manifest schema'
+assert_eq 'ha-delivery-ha-r1.json' "$(jget "$MAN" canonical_source.delivery_manifest)" \
+    'T1 manifest records the source delivery manifest'
+assert_eq "$MAN1" "$(jget "$MAN" canonical_source.delivery_manifest_sha256)" \
+    'T1 manifest binds the source manifest SHA-256'
+assert_eq 'mihomo-competition-ha-batch/1' "$(jget "$MAN" canonical_source.delivery_schema)" \
+    'T1 manifest records the source schema'
+assert_eq 'ha-r1' "$(jget "$MAN" canonical_source.delivery_config_version)" \
+    'T1 manifest records the source config version'
 assert_eq 1 "$(jget "$MAN" terminal_count)" 'T1 manifest terminal count'
 assert_eq 'A-first' "$(jget "$MAN" terminals.0.group)" 'T1 manifest group'
 assert_eq 'A' "$(jget "$MAN" terminals.0.primary_vps)" 'T1 manifest primary role'
@@ -683,7 +700,8 @@ run_profile --delivery "$FL/delivery" --pins "$FL/pins.json" \
 [ "$RC" -eq 0 ] && pass 'T6c7 delivery recorded with a 30-day floor' \
     || fail "T6c7 (rc=$RC stderr=[$ERR])"
 mk_pins "$FL/short.json" "$PIN_A" "$PIN_B" "$NEAR" 2030-01-01T00:00:00Z
-run_profile --delivery "$FL/competition" --pins "$FL/short.json" --check \
+run_profile --delivery "$FL/competition" --source-delivery "$FL/delivery" \
+    --pins "$FL/short.json" --check \
     --min-validity-days 0
 [ "$RC" -ne 0 ] && [ "${ERR1#ha-profile: FAIL E_PINS_EXPIRED}" != "$ERR1" ] \
     && pass 'T6c8 --check cannot lower the recorded validity floor' \
@@ -875,7 +893,8 @@ PY
     [ "$POSIX_HOST" = "1" ] && chmod 600 "$CMAN"
     [ "$IS_WINDOWS" = "1" ] && win_private_file_acl "$CMAN"
 }
-run_check() { run_profile --delivery "$C/competition" --pins "$C/pins.json" --check; }
+run_check() { run_profile --delivery "$C/competition" \
+    --source-delivery "$C/delivery" --pins "$C/pins.json" --check; }
 run_check
 [ "$RC" -eq 0 ] && pass 'T7m baseline --check passes' \
     || fail "T7m baseline (rc=$RC stderr=[$ERR])"
@@ -931,7 +950,8 @@ open(dest, "w", encoding="utf-8", newline="").write(
 PY
 [ "$POSIX_HOST" = "1" ] && chmod 600 "$C/dup-pins.json"
 [ "$IS_WINDOWS" = "1" ] && win_private_file_acl "$C/dup-pins.json"
-run_profile --delivery "$C/competition" --pins "$C/dup-pins.json" --check
+run_profile --delivery "$C/competition" --source-delivery "$C/delivery" \
+    --pins "$C/dup-pins.json" --check
 [ "$RC" -ne 0 ] && [ "$ERR1" = 'ha-profile: FAIL E_PINS' ] \
     && pass 'T7r duplicate JSON keys in the pins file refused' \
     || fail "T7r (rc=$RC stderr=[$ERR])"
@@ -945,7 +965,7 @@ open(path, "w", encoding="utf-8", newline="").write(text)
 PY
 rehash_outputs
 run_check
-[ "$RC" -ne 0 ] && [ "$ERR1" = 'ha-profile: FAIL E_TRANSFORM' ] \
+[ "$RC" -ne 0 ] && [ "${ERR1#ha-profile: FAIL E_TRANSFORM}" != "$ERR1" ] \
     && pass 'T7s re-hashed manifest cannot mask a reopened LAN listener' \
     || fail "T7s (rc=$RC stderr=[$ERR])"
 restore_comp
@@ -960,7 +980,7 @@ open(path, "w", encoding="utf-8", newline="").write(text)
 PY
 rehash_outputs
 run_check
-[ "$RC" -ne 0 ] && [ "$ERR1" = 'ha-profile: FAIL E_TRANSFORM' ] \
+[ "$RC" -ne 0 ] && [ "${ERR1#ha-profile: FAIL E_TRANSFORM}" != "$ERR1" ] \
     && pass 'T7t re-hashed manifest cannot swap the HY2 pins' \
     || fail "T7t (rc=$RC stderr=[$ERR])"
 restore_comp
@@ -974,9 +994,48 @@ open(path, "w", encoding="utf-8", newline="").write(text)
 PY
 rehash_outputs
 run_check
-[ "$RC" -ne 0 ] && [ "$ERR1" = 'ha-profile: FAIL E_TRANSFORM' ] \
+[ "$RC" -ne 0 ] && [ "${ERR1#ha-profile: FAIL E_TRANSFORM}" != "$ERR1" ] \
     && pass 'T7u re-hashed manifest cannot reintroduce skip-cert-verify true' \
     || fail "T7u (rc=$RC stderr=[$ERR])"
+restore_comp
+"$PY" - "$C/competition/event-ob02-hac.yaml" <<'PY'
+import sys
+path = sys.argv[1]
+text = open(path, encoding="utf-8").read()
+needle = "mode: rule\n"
+if needle not in text:
+    raise SystemExit("fixture: mode line missing")
+text = text.replace(
+    needle, needle + 'external-controller: "0.0.0.0:9090"\n', 1)
+open(path, "w", encoding="utf-8", newline="").write(text)
+PY
+rehash_outputs
+run_check
+[ "$RC" -ne 0 ] && [ "$ERR1" = 'ha-profile: FAIL E_TRANSFORM terminal=event-ob02 detail=not the deterministic transform of the source' ] \
+    && pass 'T7s2 re-hashed extra controller/listener is refused by the byte comparison' \
+    || fail "T7s2 (rc=$RC stderr=[$ERR])"
+restore_comp
+"$PY" - "$C/competition/event-ob02-hac.yaml" <<'PY'
+import sys
+path = sys.argv[1]
+text = open(path, encoding="utf-8").read()
+text = text.replace("allow-lan: false", 'allow-lan: "false"', 1)
+open(path, "w", encoding="utf-8", newline="").write(text)
+PY
+rehash_outputs
+run_check
+[ "$RC" -ne 0 ] && [ "$ERR1" = 'ha-profile: FAIL E_TRANSFORM terminal=event-ob02 detail=not the deterministic transform of the source' ] \
+    && pass 'T7s3 re-hashed equivalent YAML spelling is refused by the byte comparison' \
+    || fail "T7s3 (rc=$RC stderr=[$ERR])"
+restore_comp
+manifest_edit 'e = doc["terminals"][0]
+e["primary_vps"], e["backup_vps"] = e["backup_vps"], e["primary_vps"]
+e["group"] = {"A": "A-first", "B": "B-first"}[e["primary_vps"]]
+e["pins"]["primary"], e["pins"]["backup"] = e["pins"]["backup"], e["pins"]["primary"]'
+run_check
+[ "$RC" -ne 0 ] && [ "$ERR1" = 'ha-profile: FAIL E_DELIVERY terminal=event-ob01' ] \
+    && pass 'T7s4 re-hashed manifest cannot swap the physical A/B role relationship' \
+    || fail "T7s4 (rc=$RC stderr=[$ERR])"
 restore_comp
 cp "$C/competition/event-ob01-hac.yaml" "$C/competition/extra-hac.yaml"
 [ "$POSIX_HOST" = "1" ] && chmod 600 "$C/competition/extra-hac.yaml"
@@ -1002,7 +1061,8 @@ if [ "$POSIX_HOST" = "1" ]; then
     rm -rf "$W"; mkdir -p "$W"; cp -R "$SNAP" "$W/competition"
     chmod 700 "$W/competition"; chmod 600 "$W/competition"/*
     chmod 777 "$W"
-    run_profile --delivery "$W/competition" --pins "$C/pins.json" --check
+    run_profile --delivery "$W/competition" --source-delivery "$C/delivery" \
+        --pins "$C/pins.json" --check
     [ "$RC" -ne 0 ] && [ "${ERR1#ha-profile: FAIL E_INSECURE_PERMISSIONS role=delivery-input}" != "$ERR1" ] \
         && pass 'T7y world-writable ancestor refused by --check' \
         || fail "T7y (rc=$RC stderr=[$ERR])"
@@ -1091,6 +1151,16 @@ run_profile --delivery "$T1/delivery" --pins "$T1/pins.json" \
 [ "$RC" -eq 2 ] && [ "$ERR1" = 'ha-profile: FAIL E_USAGE' ] \
     && pass 'T8f malformed require-valid-through refused' \
     || fail "T8f (rc=$RC stderr=[$ERR])"
+run_profile --delivery "$T1/competition" --pins "$T1/pins.json" --check
+[ "$RC" -eq 2 ] && [ "$ERR1" = 'ha-profile: FAIL E_USAGE' ] \
+    && pass 'T8g --check without --source-delivery refused' \
+    || fail "T8g (rc=$RC stderr=[$ERR])"
+run_profile --delivery "$T1/delivery" --pins "$T1/pins.json" \
+    --output-dir "$T1/competition" --config-version comp-r1 \
+    --source-delivery "$T1/delivery"
+[ "$RC" -eq 2 ] && [ "$ERR1" = 'ha-profile: FAIL E_USAGE' ] \
+    && pass 'T8h --source-delivery in generate mode refused' \
+    || fail "T8h (rc=$RC stderr=[$ERR])"
 
 # --------------------------------------------------------------- T9 check ----
 section 'T9 --check preflight'
@@ -1099,7 +1169,8 @@ mk_tree "$T9" 2 1
 mk_pins "$T9/pins.json"
 expect_ha_ok "$T9" ha-r1 'T9 HA-02 delivery generated'
 expect_gen_ok "$T9" comp-r1 'T9 competition profiles generated'
-run_profile --delivery "$T9/competition" --pins "$T9/pins.json" --check
+run_profile --delivery "$T9/competition" --source-delivery "$T9/delivery" \
+    --pins "$T9/pins.json" --check
 if [ "$RC" -eq 0 ] && [ "${OUT%%$'\n'*}" = 'ha-profile: OK' ]; then
     assert_contains "$OUT" 'terminals: 2' 'T9a preflight reports two terminals'
     assert_contains "$OUT" 'pins: valid' 'T9a preflight reports valid pins'
@@ -1108,20 +1179,74 @@ else
     fail "T9a (rc=$RC stdout=[$OUT] stderr=[$ERR])"
 fi
 mk_pins "$T9/expired.json" "$PIN_A" "$PIN_B" 2020-01-01T00:00:00Z 2030-01-01T00:00:00Z
-run_profile --delivery "$T9/competition" --pins "$T9/expired.json" --check
+run_profile --delivery "$T9/competition" --source-delivery "$T9/delivery" \
+    --pins "$T9/expired.json" --check
 [ "$RC" -ne 0 ] && [ "$ERR1" = 'ha-profile: FAIL E_PINS_EXPIRED vps=A detail=not_after=2020-01-01T00:00:00Z' ] \
     && pass 'T9b expired pin fails preflight' \
     || fail "T9b (rc=$RC stderr=[$ERR])"
 mk_pins "$T9/other.json" "$(printf 'c%.0s' $(seq 1 64))" "$PIN_B"
-run_profile --delivery "$T9/competition" --pins "$T9/other.json" --check
+run_profile --delivery "$T9/competition" --source-delivery "$T9/delivery" \
+    --pins "$T9/other.json" --check
 [ "$RC" -ne 0 ] && [ "$ERR1" = 'ha-profile: FAIL E_PINS vps=A detail=manifest mismatch' ] \
     && pass 'T9c changed pin fails preflight' \
     || fail "T9c (rc=$RC stderr=[$ERR])"
 printf '\n# tampered\n' >> "$T9/competition/event-ob01-hac.yaml"
-run_profile --delivery "$T9/competition" --pins "$T9/pins.json" --check
+run_profile --delivery "$T9/competition" --source-delivery "$T9/delivery" \
+    --pins "$T9/pins.json" --check
 [ "$RC" -ne 0 ] && [ "$ERR1" = 'ha-profile: FAIL E_DELIVERY_HASH terminal=event-ob01' ] \
     && pass 'T9d tampered competition output fails preflight' \
     || fail "T9d (rc=$RC stderr=[$ERR])"
+
+# ---------------------------------- T9 source binding / re-derived bytes ----
+section 'T9e/T9f source binding and re-derived bytes'
+T9S="$TMP/t9-source"
+mk_tree "$T9S" 2 1
+mk_pins "$T9S/pins.json"
+expect_ha_ok "$T9S" ha-r1 'T9e HA-02 delivery generated'
+expect_gen_ok "$T9S" comp-r1 'T9e competition delivery generated'
+run_profile --delivery "$T9S/competition" --source-delivery "$T9S/delivery" \
+    --pins "$T9S/pins.json" --check
+[ "$RC" -eq 0 ] && pass 'T9e baseline source-bound preflight passes' \
+    || fail "T9e baseline (rc=$RC stderr=[$ERR])"
+cp -R "$T9S/delivery" "$T9S/delivery-bad"
+printf '\n# tampered source\n' >> "$T9S/delivery-bad/event-ob02-ha.yaml"
+run_profile --delivery "$T9S/competition" \
+    --source-delivery "$T9S/delivery-bad" --pins "$T9S/pins.json" --check
+[ "$RC" -ne 0 ] && [ "$ERR1" = 'ha-profile: FAIL E_DELIVERY_HASH terminal=event-ob02' ] \
+    && pass 'T9e2 tampered HA-02 source refused by preflight' \
+    || fail "T9e2 (rc=$RC stderr=[$ERR])"
+cp -R "$T9S/delivery" "$T9S/delivery-other"
+mv "$T9S/delivery-other/ha-delivery-ha-r1.json" \
+    "$T9S/delivery-other/ha-delivery-other.json"
+run_profile --delivery "$T9S/competition" \
+    --source-delivery "$T9S/delivery-other" --pins "$T9S/pins.json" --check
+[ "$RC" -ne 0 ] && [ "$ERR1" = 'ha-profile: FAIL E_DELIVERY' ] \
+    && pass 'T9f a different source delivery manifest is refused' \
+    || fail "T9f (rc=$RC stderr=[$ERR])"
+run_profile --delivery "$T9S/competition" --source-delivery "$T9S/competition" \
+    --pins "$T9S/pins.json" --check
+[ "$RC" -ne 0 ] && [ "$ERR1" = 'ha-profile: FAIL E_DELIVERY' ] \
+    && pass 'T9f2 competition delivery is not accepted as its own source' \
+    || fail "T9f2 (rc=$RC stderr=[$ERR])"
+cp "$T9S/competition/event-ob01-hac.yaml" "$T9S/competition/EXTRA-HAC.YAML"
+run_profile --delivery "$T9S/competition" --source-delivery "$T9S/delivery" \
+    --pins "$T9S/pins.json" --check
+[ "$RC" -ne 0 ] && [ "$ERR1" = 'ha-profile: FAIL E_DELIVERY' ] \
+    && pass 'T9g uppercase-suffix extra profile refused' \
+    || fail "T9g (rc=$RC stderr=[$ERR])"
+rm -f "$T9S/competition/EXTRA-HAC.YAML"
+if [ "$POSIX_HOST" = "1" ]; then
+    cp "$T9S/competition/event-ob01-hac.yaml" \
+        "$T9S/competition/EVENT-OB01-HAC.YAML"
+    run_profile --delivery "$T9S/competition" --source-delivery "$T9S/delivery" \
+        --pins "$T9S/pins.json" --check
+    [ "$RC" -ne 0 ] && [ "$ERR1" = 'ha-profile: FAIL E_DELIVERY' ] \
+        && pass 'T9h actual casefold-duplicate output refused' \
+        || fail "T9h (rc=$RC stderr=[$ERR])"
+    rm -f "$T9S/competition/EVENT-OB01-HAC.YAML"
+else
+    skip 'T9h actual casefold-duplicate fixture (NTFS cannot hold two such names)'
+fi
 
 # ------------------------------------------------------------- T10 rollback ---
 section 'T10 rollback of a partial competition write'

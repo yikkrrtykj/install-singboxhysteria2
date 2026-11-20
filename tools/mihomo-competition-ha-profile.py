@@ -24,6 +24,12 @@ dates are enforced here (Mihomo leaf pinning does not validate certificate
 expiry). Generation and `--check` both refuse expired/soon-expiring pins, and
 `--check` cannot lower the validity floor recorded at delivery time.
 
+`--check` additionally requires the trusted HA-02 source delivery
+(`--source-delivery`), re-runs the same five deterministic edits from that
+source and its recorded source-manifest SHA-256, and compares every competition
+profile byte-for-byte. The literal invariant checker is kept only as
+defense-in-depth; the byte comparison is the authoritative preflight gate.
+
 Default OFF: this tool only writes files. Importing/activating the competition
 profile in Clash Verge Rev is an explicit operator action; no daemon, GUI, web
 service or scheduled task is added. Quality Failover remains opt-in and off.
@@ -49,7 +55,7 @@ PROFILE_SCHEMA = "mihomo-competition-ha-profile/2"
 OUTPUT_SUFFIX = "-hac.yaml"
 MANIFEST_PREFIX = "ha-competition-"
 MANIFEST_SUFFIX = ".json"
-TOOL_VERSION = "2"
+TOOL_VERSION = "3"
 MIN_VALIDITY_DEFAULT = 7
 MAX_VALIDITY_DAYS = 3650
 CLOCK_SKEW_SECONDS = 300
@@ -254,26 +260,47 @@ def parse_required_through(value):
         raise ProfileError(E_USAGE, exit_status=EXIT_USAGE) from None
 
 
-def find_delivery_manifest(delivery):
-    if (os.path.islink(delivery) or is_reparse(delivery)
-            or not os.path.isdir(delivery)):
-        raise ProfileError(E_DELIVERY)
-    names = sorted(name for name in os.listdir(delivery)
-                   if DELIVERY_MANIFEST_RE.match(name))
-    if len(names) != 1:
-        raise ProfileError(E_DELIVERY)
-    return os.path.join(delivery, names[0])
+def list_names(directory, code):
+    """Directory entries, failing closed on names that differ only by case.
+
+    Two files whose names collapse under casefold are one file on a
+    case-insensitive filesystem; accepting them on a case-sensitive one makes
+    the delivered file set ambiguous. Callers that need canonical spelling
+    (profile file set, manifest) compare exact names separately, which also
+    refuses a re-cased suffix such as FOO-HAC.YAML.
+    """
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        raise ProfileError(code) from None
+    seen = set()
+    for name in names:
+        folded = name.casefold()
+        if folded in seen:
+            raise ProfileError(code, detail="casefold-duplicate name")
+        seen.add(folded)
+    return names
 
 
 def load_delivery(delivery, merge, batch):
-    """Read and verify the HA-02 manifest and every delivered profile."""
+    """Read and verify the HA-02 manifest and every delivered profile.
+
+    Returns the manifest document, its terminal records, the manifest basename
+    and the exact manifest bytes read (hashed into the competition manifest so
+    a later --check can refuse a different source delivery).
+    """
     batch.check_directory(delivery, "delivery-input")
     batch.check_private_path(delivery, "delivery-input")
     batch.check_local_boundary(delivery, "delivery-input")
-    manifest_path = find_delivery_manifest(delivery)
+    names = list_names(delivery, E_DELIVERY)
+    manifest_names = sorted(name for name in names
+                            if DELIVERY_MANIFEST_RE.match(name))
+    if len(manifest_names) != 1:
+        raise ProfileError(E_DELIVERY)
+    manifest_path = os.path.join(delivery, manifest_names[0])
     check_regular_private_file(batch, manifest_path, "input-manifest",
                                E_DELIVERY)
-    doc, _raw = read_json(manifest_path, E_DELIVERY)
+    doc, manifest_raw = read_json(manifest_path, E_DELIVERY)
     if (not isinstance(doc, dict)
             or doc.get("schema") != "mihomo-competition-ha-batch/1"):
         raise ProfileError(E_DELIVERY)
@@ -323,11 +350,10 @@ def load_delivery(delivery, merge, batch):
             "input_sha256": entry["output_sha256"],
             "data": data,
         })
-    actual = {name.casefold() for name in os.listdir(delivery)
-              if name.endswith("-ha.yaml")}
-    if actual != {t["name"].casefold() + "-ha.yaml" for t in terminals}:
+    actual = [name for name in names if name.casefold().endswith("-ha.yaml")]
+    if set(actual) != {t["name"] + "-ha.yaml" for t in terminals}:
         raise ProfileError(E_DELIVERY)
-    return doc, terminals
+    return doc, terminals, manifest_names[0], manifest_raw
 
 
 def find_block(lines, name):
@@ -392,7 +418,13 @@ def transform(data, primary_pin, backup_pin):
 
 
 def verify_competition_profile(data, primary_pin, backup_pin):
-    """Independently prove the competition security invariants of a profile."""
+    """Literal security invariants; defense-in-depth only.
+
+    This compares exact YAML lines, so it cannot recognise equivalent YAML
+    spellings, extra listeners/keys or any semantic rewrite. It is not a
+    general YAML proof. --check's authoritative gate is the byte-for-byte
+    comparison with the deterministic transform of the trusted HA-02 source.
+    """
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
@@ -442,7 +474,8 @@ def prevalidate_outputs(terminals, delivery, output_dir, manifest, batch):
     if (output_real == delivery_real
             or output_real.startswith(delivery_real + os.sep)):
         raise ProfileError(E_PATH_CONFLICT, role="output-dir")
-    existing = {name.casefold() for name in os.listdir(output_dir)}
+    existing = {name.casefold() for name in
+                list_names(output_dir, E_PATH_CONFLICT)}
     seen = set()
     targets = []
     for terminal in terminals:
@@ -468,7 +501,8 @@ def generate(delivery, pins_path, output_dir, config_version, min_days,
     output_dir = os.path.abspath(output_dir)
     pins_path = os.path.abspath(pins_path)
     check_regular_private_file(batch, pins_path, "pins", E_PINS)
-    source_doc, terminals = load_delivery(delivery, merge, batch)
+    (source_doc, terminals, source_manifest_name,
+     source_manifest_raw) = load_delivery(delivery, merge, batch)
     pins = parse_pins(pins_path, min_days, required_through)
     pin_of = {alias: pins[alias]["fingerprint_sha256"] for alias in "AB"}
     manifest = manifest_name(config_version)
@@ -519,8 +553,9 @@ def generate(delivery, pins_path, output_dir, config_version, min_days,
                 "config_version": config_version,
             },
             "canonical_source": {
-                "delivery_manifest": os.path.basename(
-                    find_delivery_manifest(delivery)),
+                "delivery_manifest": source_manifest_name,
+                "delivery_manifest_sha256": hashlib.sha256(
+                    source_manifest_raw).hexdigest(),
                 "delivery_schema": source_doc.get("schema"),
                 "delivery_config_version": source_doc.get(
                     "generator", {}).get("config_version"),
@@ -575,17 +610,6 @@ def generate(delivery, pins_path, output_dir, config_version, min_days,
     }
 
 
-def find_competition_manifest(delivery):
-    if (os.path.islink(delivery) or is_reparse(delivery)
-            or not os.path.isdir(delivery)):
-        raise ProfileError(E_DELIVERY)
-    names = sorted(name for name in os.listdir(delivery)
-                   if MANIFEST_RE.match(name))
-    if len(names) != 1:
-        raise ProfileError(E_DELIVERY)
-    return os.path.join(delivery, names[0])
-
-
 def _validate_manifest_entries(doc, merge):
     if (not isinstance(doc, dict) or doc.get("schema") != PROFILE_SCHEMA):
         raise ProfileError(E_DELIVERY)
@@ -623,14 +647,20 @@ def _validate_manifest_entries(doc, merge):
     return entries
 
 
-def check(delivery, pins_path, min_days, required_through, batch, merge):
+def check(delivery, source_delivery, pins_path, min_days, required_through,
+          batch, merge):
     delivery = os.path.abspath(delivery)
+    source_delivery = os.path.abspath(source_delivery)
     pins_path = os.path.abspath(pins_path)
     batch.check_directory(delivery, "delivery-input")
     batch.check_private_path(delivery, "delivery-input")
     batch.check_local_boundary(delivery, "delivery-input")
     check_regular_private_file(batch, pins_path, "pins", E_PINS)
-    manifest_path = find_competition_manifest(delivery)
+    names = list_names(delivery, E_DELIVERY)
+    manifest_names = sorted(name for name in names if MANIFEST_RE.match(name))
+    if len(manifest_names) != 1:
+        raise ProfileError(E_DELIVERY)
+    manifest_path = os.path.join(delivery, manifest_names[0])
     check_regular_private_file(batch, manifest_path, "manifest-file",
                                E_DELIVERY)
     doc, _raw = read_json(manifest_path, E_DELIVERY)
@@ -668,12 +698,48 @@ def check(delivery, pins_path, min_days, required_through, batch, merge):
                                      "not_after", "source"}
                 or recorded != pins[alias]):
             raise ProfileError(E_PINS, vps=alias, detail="manifest mismatch")
-    files = {name.casefold() for name in os.listdir(delivery)
-             if name.endswith(OUTPUT_SUFFIX)}
-    expected = {entry["output"].casefold() for entry in entries}
-    if files != expected:
+    # File-set gate: exact canonical names only. list_names already refused
+    # actual casefold duplicates; comparing exact names also refuses a re-cased
+    # suffix (e.g. FOO-HAC.YAML) that a case-sensitive filter would miss.
+    profile_names = [name for name in names
+                     if name.casefold().endswith(OUTPUT_SUFFIX)]
+    if set(profile_names) != {entry["output"] for entry in entries}:
+        raise ProfileError(E_DELIVERY)
+    # Bind the check to the exact trusted HA-02 source delivery that was used
+    # at generation time, then re-derive every expected byte from it.
+    (source_doc, source_terminals, source_manifest_name,
+     source_manifest_raw) = load_delivery(source_delivery, merge, batch)
+    canonical = doc.get("canonical_source")
+    if (not isinstance(canonical, dict)
+            or set(canonical) != {"delivery_manifest",
+                                  "delivery_manifest_sha256",
+                                  "delivery_schema",
+                                  "delivery_config_version"}):
+        raise ProfileError(E_DELIVERY)
+    if canonical.get("delivery_manifest") != source_manifest_name:
+        raise ProfileError(E_DELIVERY)
+    if canonical.get("delivery_manifest_sha256") != hashlib.sha256(
+            source_manifest_raw).hexdigest():
+        raise ProfileError(E_DELIVERY_HASH, role="source-manifest")
+    if (canonical.get("delivery_schema") != source_doc.get("schema")
+            or canonical.get("delivery_config_version")
+            != source_doc.get("generator", {}).get("config_version")):
+        raise ProfileError(E_DELIVERY)
+    source_by_name = {terminal["name"]: terminal
+                      for terminal in source_terminals}
+    if len(source_by_name) != len(entries):
         raise ProfileError(E_DELIVERY)
     for entry in entries:
+        terminal = source_by_name.get(entry["name"])
+        if (terminal is None
+                or entry.get("group") != terminal["group"]
+                or entry.get("primary_vps") != terminal["primary_vps"]
+                or entry.get("backup_vps") != terminal["backup_vps"]
+                or entry.get("input") != terminal["input"]
+                or entry.get("input_sha256") != terminal["input_sha256"]):
+            raise ProfileError(E_DELIVERY, terminal=entry["name"])
+    for entry in entries:
+        terminal = source_by_name[entry["name"]]
         path = os.path.join(delivery, entry["output"])
         if os.path.dirname(os.path.realpath(path)) != os.path.realpath(delivery):
             raise ProfileError(E_DELIVERY)
@@ -694,8 +760,16 @@ def check(delivery, pins_path, min_days, required_through, batch, merge):
                 or declared.get("backup") != pins[entry["backup_vps"]]):
             raise ProfileError(E_PINS, terminal=entry["name"],
                                detail="manifest mismatch")
-        # Security semantics are re-derived from the YAML itself; a modified
-        # profile cannot pass merely by updating the manifest hashes.
+        # Authoritative preflight gate: the delivered bytes must be exactly the
+        # deterministic five-edit transform of the validated HA-02 source.
+        expected_bytes = transform(terminal["data"], primary_pin, backup_pin)
+        if data != expected_bytes:
+            raise ProfileError(
+                E_TRANSFORM, terminal=entry["name"],
+                detail="not the deterministic transform of the source")
+        # Defense-in-depth only: literal invariant checks have known limits and
+        # are not a general YAML semantic proof; byte comparison above is
+        # authoritative for this delivery.
         verify_competition_profile(data, primary_pin, backup_pin)
     return {
         "terminals": len(entries),
@@ -716,6 +790,7 @@ def build_parser(merge):
     parser.add_argument("--min-validity-days", type=int,
                         default=MIN_VALIDITY_DEFAULT)
     parser.add_argument("--require-valid-through")
+    parser.add_argument("--source-delivery")
     parser.add_argument("--check", action="store_true")
     return parser
 
@@ -752,7 +827,9 @@ def main(argv=None):
     try:
         required_through = parse_required_through(args.require_valid_through)
         if args.check:
-            result = check(args.delivery, args.pins,
+            if not args.source_delivery:
+                raise ProfileError(E_USAGE, exit_status=EXIT_USAGE)
+            result = check(args.delivery, args.source_delivery, args.pins,
                            args.min_validity_days, required_through, batch,
                            merge)
             print("ha-profile: OK")
@@ -761,6 +838,8 @@ def main(argv=None):
             print("validity: A=%s B=%s" % (result["validity"]["A"],
                                            result["validity"]["B"]))
             return EXIT_OK
+        if args.source_delivery is not None:
+            raise ProfileError(E_USAGE, exit_status=EXIT_USAGE)
         if not args.output_dir or not args.config_version:
             raise ProfileError(E_USAGE, exit_status=EXIT_USAGE)
         result = generate(args.delivery, args.pins, args.output_dir,
