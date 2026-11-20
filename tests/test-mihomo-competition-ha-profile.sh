@@ -938,7 +938,7 @@ run_check
     && pass 'T7q duplicate JSON keys in the manifest refused' \
     || fail "T7q (rc=$RC stderr=[$ERR])"
 restore_comp
-"$PY" - "$C/dup-pins.json" "$C/pins.json" <<'PY'
+"$PY" - "$C/pins.json" "$C/dup-pins.json" <<'PY'
 import sys
 src, dest = sys.argv[1:3]
 text = open(src, encoding="utf-8").read()
@@ -1240,9 +1240,11 @@ if [ "$POSIX_HOST" = "1" ]; then
         "$T9S/competition/EVENT-OB01-HAC.YAML"
     run_profile --delivery "$T9S/competition" --source-delivery "$T9S/delivery" \
         --pins "$T9S/pins.json" --check
-    [ "$RC" -ne 0 ] && [ "$ERR1" = 'ha-profile: FAIL E_DELIVERY' ] \
+    [ "$RC" -ne 0 ] && [ "${ERR1#ha-profile: FAIL E_DELIVERY}" != "$ERR1" ] \
         && pass 'T9h actual casefold-duplicate output refused' \
         || fail "T9h (rc=$RC stderr=[$ERR])"
+    assert_contains "$ERR1" 'detail=casefold-duplicate name' \
+        'T9h casefold duplicate is the reported reason'
     rm -f "$T9S/competition/EVENT-OB01-HAC.YAML"
 else
     skip 'T9h actual casefold-duplicate fixture (NTFS cannot hold two such names)'
