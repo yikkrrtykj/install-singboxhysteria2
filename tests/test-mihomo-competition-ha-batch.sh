@@ -260,24 +260,46 @@ mk_tree() { # <dir> <count> <a_first>
 
 # Real NTFS ACL helpers. The suite must build directories that satisfy the
 # product's conservative allowlist, and must be able to add an "other local
-# user" grant for the negative case. MSYS_NO_PATHCONV keeps icacls' own
-# `/inheritance:r` switches from being rewritten into POSIX paths.
+# user" grant for the negative case. Grants are SID-based so a localized
+# account name cannot make fixture setup silently fail; every icacls call is
+# checked, because a platform-specific fixture that cannot be built is a FAIL,
+# not a SKIP. MSYS_NO_PATHCONV keeps icacls' own `/inheritance:r` switches from
+# being rewritten into POSIX paths.
+WIN_USER_SID=""
+win_current_sid() {
+    if [ -z "$WIN_USER_SID" ]; then
+        WIN_USER_SID=$(MSYS_NO_PATHCONV=1 /c/WINDOWS/system32/whoami.exe \
+            /user /fo csv /nh 2>/dev/null | tr -d '\r' \
+            | awk -F'","' '{print $2}' | tr -d '"')
+    fi
+    printf '%s' "$WIN_USER_SID"
+}
+
 win_private_acl() { # <path...>
     [ "$IS_WINDOWS" = "1" ] || return 0
-    local path win
+    local sid path win
+    sid=$(win_current_sid)
+    if [ -z "$sid" ]; then
+        fail 'fixture: could not determine the Windows user SID'
+        return 1
+    fi
     for path in "$@"; do
         win=$(cygpath -w "$path" 2>/dev/null) || win=$path
-        MSYS_NO_PATHCONV=1 icacls "$win" /inheritance:r \
-            /grant:r "$(whoami):(OI)(CI)F" "SYSTEM:(OI)(CI)F" \
-            "Administrators:(OI)(CI)F" >/dev/null 2>&1 || true
+        if ! MSYS_NO_PATHCONV=1 icacls "$win" /inheritance:r \
+                /grant:r "*$sid:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" \
+                "*S-1-5-32-544:(OI)(CI)F" >/dev/null 2>&1; then
+            fail "fixture: icacls could not make a path private (rc=$?)"
+            return 1
+        fi
     done
+    return 0
 }
 
 win_grant() { # <path> <principal-spec>
     [ "$IS_WINDOWS" = "1" ] || return 0
     local win
     win=$(cygpath -w "$1" 2>/dev/null) || win=$1
-    MSYS_NO_PATHCONV=1 icacls "$win" /grant "$2" >/dev/null 2>&1 || true
+    MSYS_NO_PATHCONV=1 icacls "$win" /grant "$2" >/dev/null 2>&1
 }
 
 win_acl_has() { # <path> <substring> ; true when icacls reports it
@@ -410,7 +432,9 @@ grep -qE 'generate_204|gstatic|expected-status|interval: [0-9]|timeout: [0-9]|la
     || pass 'the batch tool never rewrites the #42 probe policy'
 for marker in 'def uuid_key' 'def normalize_server' 'ALLOWED_PRINCIPAL_SIDS' \
               'INHERIT_ONLY_SIDS' 'def verify_temp_inheritance' \
-              'def check_local_boundary' 'def is_reparse' 'skipped=%d'; do
+              'def check_local_boundary' 'def posix_component_problem' \
+              'def posix_boundary_problem' 'def file_identity' \
+              'def is_reparse' 'skipped=%d'; do
     grep -qF -- "$marker" "$TOOL" \
         && pass "identity/permission contract present [$marker]" \
         || fail "identity/permission contract missing [$marker]"
@@ -1120,6 +1144,17 @@ PY
     assert_contains "$ERR" 'detail=boundary-ancestor-writable' \
         'T10n boundary failure reports the ancestor, not a path'
     chmod 700 "$TMP/world"
+    # An ancestor symlink redirects the directory the tool just validated.
+    mkdir -p "$TMP/realroot"
+    ln -s "$TMP/realroot" "$TMP/linkroot"
+    T10S="$TMP/linkroot/tree"
+    mk_tree "$T10S" 1 1
+    read -r -a T10SARGS <<< "$(in_args "$T10S")"
+    expect_code E_INSECURE_PERMISSIONS \
+        'T10o an ancestor symlink is refused' "${T10SARGS[@]}"
+    assert_contains "$ERR" 'detail=boundary-ancestor-symlink' \
+        'T10o ancestor symlink is reported as a boundary failure'
+    rm -f "$TMP/linkroot"
 else
     skip 'T10a-T10f POSIX mode gates (NTFS carries no POSIX mode)'
 fi
@@ -1140,11 +1175,16 @@ if [ "$IS_WINDOWS" = "1" ]; then
     else
         fail "T10g (rc=$RC stderr=[$ERR])"
     fi
-    # A grant to another local user class must defeat the allowlist.
+    # A grant to another local user class must defeat the allowlist. This is a
+    # required platform case: if the fixture cannot be built, the suite fails.
     T10X="$TMP/t10x"
     mk_tree "$T10X" 1 1
-    win_grant "$T10X/exports" "Users:(OI)(CI)R"
-    if win_acl_has "$T10X/exports" 'BUILTIN\Users'; then
+    if ! win_grant "$T10X/exports" "*S-1-5-32-545:(OI)(CI)R"; then
+        fail 'T10j fixture: could not grant BUILTIN\\Users'
+    elif ! win_acl_has "$T10X/exports" 'S-1-5-32-545' \
+         && ! win_acl_has "$T10X/exports" 'BUILTIN\Users'; then
+        fail 'T10j fixture: BUILTIN\\Users grant is not observable'
+    else
         read -r -a T10XARGS <<< "$(in_args "$T10X")"
         expect_code E_INSECURE_PERMISSIONS \
             'T10j grant to another local user class is refused' "${T10XARGS[@]}"
@@ -1152,21 +1192,21 @@ if [ "$IS_WINDOWS" = "1" ]; then
             'T10j other-user grant is attributed to the exports root'
         assert_contains "$ERR" 'principal=S-1-5-32-545' \
             'T10j other-user grant is reported by SID'
-    else
-        skip 'T10j could not add a BUILTIN\\Users ACE to the fixture'
     fi
     # A single source file with a broad ACE is refused even in a private tree.
     T10F="$TMP/t10f"
     mk_tree "$T10F" 1 1
-    win_grant "$T10F/exports/A/event-ob01-mihomo.yaml" "Users:R"
-    if win_acl_has "$T10F/exports/A/event-ob01-mihomo.yaml" 'BUILTIN\Users'; then
+    if ! win_grant "$T10F/exports/A/event-ob01-mihomo.yaml" "*S-1-5-32-545:R"; then
+        fail 'T10k fixture: could not grant BUILTIN\\Users on the source file'
+    elif ! win_acl_has "$T10F/exports/A/event-ob01-mihomo.yaml" 'S-1-5-32-545' \
+         && ! win_acl_has "$T10F/exports/A/event-ob01-mihomo.yaml" 'BUILTIN\Users'; then
+        fail 'T10k fixture: source-file grant is not observable'
+    else
         read -r -a T10FARGS <<< "$(in_args "$T10F")"
         expect_code E_INSECURE_PERMISSIONS \
             'T10k broad ACE on an actual source file is refused' "${T10FARGS[@]}"
         assert_contains "$ERR" 'role=source-A' \
             'T10k file-level grant is attributed to the source role'
-    else
-        skip 'T10k could not add a BUILTIN\\Users ACE to the source file'
     fi
     # Native positive: the private tree succeeds, the delivered files
     # themselves pass the real ACL checker, and the manifest records the gate.
@@ -1195,19 +1235,37 @@ PY
     T10Z="$TMP/t10z"
     mk_tree "$T10Z" 1 1
     rm -rf "$T10Z/exports/A"
-    MSYS_NO_PATHCONV=1 cmd.exe /c mklink /J "$(cygpath -w "$T10Z/exports/A")" \
-        "$(cygpath -w "$T10Z/delivery")" >/dev/null 2>&1
-    if [ -d "$T10Z/exports/A" ]; then
+    if ! MSYS_NO_PATHCONV=1 cmd.exe /c mklink /J \
+            "$(cygpath -w "$T10Z/exports/A")" \
+            "$(cygpath -w "$T10Z/delivery")" >/dev/null 2>&1 \
+       || [ ! -d "$T10Z/exports/A" ]; then
+        fail 'T10m fixture: could not create a directory junction'
+    else
         read -r -a T10ZARGS <<< "$(in_args "$T10Z")"
         expect_code E_PATH_CONFLICT \
             'T10m a Windows junction in the source tree is refused' "${T10ZARGS[@]}"
         assert_contains "$ERR" 'role=exports-A' \
             'T10m junction is attributed to the redirected directory'
+    fi
+    # An ancestor junction redirects the whole private root; refuse it even
+    # though the leaf directories themselves are not reparse points.
+    T10J="$TMP/t10j"
+    mk_tree "$T10J" 1 1
+    mkdir -p "$T10J/real"
+    if ! MSYS_NO_PATHCONV=1 cmd.exe /c mklink /J "$(cygpath -w "$T10J/jlink")" \
+            "$(cygpath -w "$T10J/real")" >/dev/null 2>&1 \
+       || [ ! -d "$T10J/jlink" ]; then
+        fail 'T10n2 fixture: could not create an ancestor junction'
     else
-        skip 'T10m could not create a directory junction'
+        mk_tree "$T10J/jlink/tree" 1 1
+        read -r -a T10JARGS <<< "$(in_args "$T10J/jlink/tree")"
+        expect_code E_INSECURE_PERMISSIONS \
+            'T10n2 an ancestor junction is refused' "${T10JARGS[@]}"
+        assert_contains "$ERR" 'detail=boundary-ancestor-reparse' \
+            'T10n2 ancestor junction is reported as a reparse boundary'
     fi
 else
-    skip 'T10g/T10h/T10j-T10m real Windows ACL gates (not a Windows host)'
+    skip 'T10g/T10h/T10j-T10n2 real Windows ACL gates (not a Windows host)'
 fi
 # The SDDL/POSIX classifiers are platform-independent and unit-tested here.
 CLASSIFIER_VERDICT=$("$PY" - "$TOOL" <<'PY'
@@ -1233,6 +1291,11 @@ cases = [
     ("missing-dacl", "O:%s" % user, ["missing-dacl"]),
     ("null-dacl", "O:%sD:NO_ACCESS_CONTROL" % user, ["null-dacl"]),
     ("unparsable-ace", "O:%sD:(A;FA;;;SY)" % user, ["unparsable-ace"]),
+    ("trailing-garbage", base + "(A;OICI;FA;;;SY)GARBAGE",
+     ["unparsable-ace"]),
+    ("empty-sid", base + "(A;OICI;FA;;;)", ["unparsable-ace"]),
+    ("unbalanced-ace", "O:%sD:(A;OICI;FA;;;SY" % user, ["unparsable-ace"]),
+    ("empty-dacl", base, []),
     ("owner-elsewhere", "O:S-1-5-21-9-8-7-1001D:PAI(A;OICI;FA;;;SY)",
      ["owner="]),
     ("private", base + "(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
@@ -1255,6 +1318,18 @@ if batch.posix_problems(0o640, 7, 7) != ["mode=640"]:
     bad.append("posix-mode")
 if batch.posix_problems(0o600, 8, 7) != ["owner=8"]:
     bad.append("posix-owner")
+component_cases = [
+    ((True, True, 0o700, 7, 7), "ancestor-symlink"),
+    ((False, False, 0o755, 7, 7), "ancestor-not-directory"),
+    ((False, True, 0o755, 8, 7), "ancestor-owner=8"),
+    ((False, True, 0o777, 7, 7), "ancestor-writable"),
+    ((False, True, 0o1777, 7, 7), None),
+    ((False, True, 0o755, 0, 7), None),
+]
+for args, expected in component_cases:
+    got = batch.posix_component_problem(*args)
+    if got != expected:
+        bad.append("component-%r:want=%r,got=%r" % (args, expected, got))
 print("ok" if not bad else ";".join(bad))
 PY
 )
@@ -1313,6 +1388,7 @@ assert_eq 0 "$(count_outputs "$T11/delivery")" 'T11 usage failures wrote nothing
 section 'T12 rollback of this batch''s own files'
 ROLLBACK_DRIVER='
 import importlib.util
+import os
 import sys
 tool, inventory, exports, delivery, fail_at, mode = sys.argv[1:7]
 spec = importlib.util.spec_from_file_location("batch", tool)
@@ -1328,6 +1404,14 @@ def flaky(payload, path):
         if mode == "replace" and written:
             with open(written[0], "wb") as handle:
                 handle.write(b"substituted by another process\n")
+        if mode == "replace-same" and written:
+            # Same bytes, different file: os.replace installs a new file ID.
+            with open(written[0], "rb") as handle:
+                identical = handle.read()
+            swap = written[0] + ".swap"
+            with open(swap, "wb") as handle:
+                handle.write(identical)
+            os.replace(swap, written[0])
         if mode == "exists":
             raise merge.MergeError("E_OUTPUT_EXISTS")
         raise OSError("injected")
@@ -1335,7 +1419,6 @@ def flaky(payload, path):
     written.append(path)
 merge.write_output = flaky
 if mode == "unlink":
-    import os
     real_unlink = batch.os.unlink
     state = {"n": 0}
     def flaky_unlink(path):
@@ -1401,6 +1484,21 @@ assert_eq 1 "$(count_entries "$T12E/delivery")" \
     'T12e the substituted file is left as residual'
 assert_contains "$(cat "$T12E/delivery/event-ob01-ha.yaml")" 'substituted by another process' \
     'T12e the substituted content is preserved for the operator'
+T12F="$TMP/t12f"
+mk_tree "$T12F" 3 2
+"$PY" "$MERGE" --name event-ob01 \
+    --primary "$T12F/exports/A/event-ob01-mihomo.yaml" \
+    --backup "$T12F/exports/B/event-ob01-mihomo.yaml" \
+    --output "$TMP/t12f-expected.yaml" >/dev/null
+R12F="$(rollback_case "$T12F" 2 replace-same)"
+assert_contains "$R12F" 'code=E_IO removed=0 skipped=1 complete=no' \
+    'T12f an identical-content replacement is still not deleted'
+assert_eq 1 "$(count_entries "$T12F/delivery")" \
+    'T12f the same-content replacement is left as residual'
+assert_file "$T12F/delivery/event-ob01-ha.yaml" \
+    'T12f the replacement file is present'
+assert_diff "$TMP/t12f-expected.yaml" "$T12F/delivery/event-ob01-ha.yaml" \
+    'T12f the replacement content is unchanged (only the file identity differs)'
 
 # -------------------------------------------------------- T13 redaction -----
 section 'T13 redaction under failure'
@@ -1551,7 +1649,11 @@ if [ -n "${HA02_MIHOMO:-}" ] && [ -n "${HA02_MIHOMO_SHA256:-}" ]; then
     mkdir -p "$T15R"
     run_core_load --mihomo "$HA02_MIHOMO" --expect-sha256 "$HA02_MIHOMO_SHA256" \
         --delivery "$T5/delivery" --workdir "$T15R" --expect-terminals 30
-    if [ "$RC" -eq 0 ] && [ "${OUT%%$'\n'*}" = 'core-load: OK' ]; then
+    # Print the sanitized harness summary so the CI log itself carries the
+    # 30-profile evidence (version, core hash, profile count, elapsed time).
+    printf '%s\n' "$OUT" | sed 's/^/  core-load: /'
+    if [ "$RC" -eq 0 ] && [ "${OUT%%$'\n'*}" = 'core-load: OK' ] \
+       && [ "$(printf '%s\n' "$OUT" | grep -c '^profiles: 30$')" -eq 1 ]; then
         pass 'T15h pinned real core loads all thirty delivered profiles'
     else
         fail "T15h real core load (rc=$RC stderr=[$ERR])"

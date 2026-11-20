@@ -341,17 +341,30 @@ def _canonical_sdd_sid(token):
 
 
 def sddl_aces(sddl):
-    """All DACL ACEs as (type, flags, sid-token) tuples, or None if unparsable."""
+    """All DACL ACEs as (type, flags, sid-token) tuples, or None if unparsable.
+
+    The DACL section must be *completely* explained before any ACE is trusted:
+    an optional DACL flag prefix followed by a contiguous run of well-formed
+    ACEs. Trailing text, a broken ACE, an empty SID or an unexpected character
+    returns None, which the caller reports as `unparsable-ace` (fail closed).
+    """
     section = _sddl_dacl(sddl)
     if section is None:
         return None
+    text = section.strip()
+    if not text or "NO_ACCESS_CONTROL" in text:
+        return []
+    flags = re.match(r"[AIPR]*", text).group(0)
+    rest = text[len(flags):]
+    if rest and not re.fullmatch(r"(?:\([^()]*\))+", rest):
+        return None
     aces = []
-    for match in re.finditer(r"\(([^()]*)\)", section):
+    for match in re.finditer(r"\(([^()]*)\)", rest):
         fields = match.group(1).split(";")
-        if len(fields) != 6:
+        if len(fields) != 6 or not fields[5].strip():
             return None
-        ace_type, flags, _rights, _object, _inherit, sid = fields
-        aces.append((ace_type.strip(), flags.strip(), sid.strip()))
+        ace_type, ace_flags, _rights, _object, _inherit, sid = fields
+        aces.append((ace_type.strip(), ace_flags.strip(), sid.strip()))
     return aces
 
 
@@ -516,30 +529,50 @@ def posix_problems(mode, uid, euid):
     return problems
 
 
-def posix_ancestor_writable(path):
-    """True when another local user could replace an ancestor of `path`.
+def posix_component_problem(is_symlink, is_directory, mode, uid, euid):
+    """Classify one ancestor component of a POSIX private root."""
+    if is_symlink:
+        return "ancestor-symlink"
+    if not is_directory:
+        return "ancestor-not-directory"
+    if uid not in (euid, 0):
+        return "ancestor-owner=%d" % uid
+    if mode & 0o022 and not mode & stat.S_ISVTX:
+        return "ancestor-writable"
+    return None
+
+
+def posix_boundary_problem(path, euid=None):
+    """Problem with an ancestor of `path`, or None.
 
     A group/other-writable directory above the private root lets someone swap
-    the directory itself, so the private-mode check on the leaf alone is not a
-    boundary. Sticky directories (e.g. /tmp, 1777) are accepted: a sticky
-    directory does not let another user replace the operator's entry.
+    the directory entry; a symlinked or reparse ancestor redirects the path the
+    tool just validated; an ancestor owned by another unprivileged user can be
+    renamed or chmod-ed. Sticky directories (e.g. /tmp, 1777) are accepted
+    because a sticky directory does not let another user replace the entry.
+    Root-owned ancestors are trusted.
     """
+    euid = os.geteuid() if euid is None else euid
     current = os.path.dirname(os.path.abspath(path))
     while True:
         try:
-            mode = stat.S_IMODE(os.stat(current).st_mode)
+            info = os.lstat(current)
         except OSError:
-            return True
-        if mode & 0o022 and not mode & stat.S_ISVTX:
-            return True
+            return "ancestor-unreadable"
+        problem = posix_component_problem(
+            stat.S_ISLNK(info.st_mode) or is_reparse(info),
+            stat.S_ISDIR(info.st_mode), stat.S_IMODE(info.st_mode),
+            info.st_uid, euid)
+        if problem is not None:
+            return problem
         parent = os.path.dirname(current)
         if parent == current:
-            return False
+            return None
         current = parent
 
 
 def windows_local_problem(path):
-    """Reject UNC and non-fixed local drives for credential-bearing paths."""
+    """Reject UNC, non-fixed drives and reparse ancestors for a private path."""
     if path.startswith("\\\\") or path.startswith("//"):
         return "unc"
     drive = os.path.splitdrive(os.path.abspath(path))[0]
@@ -553,20 +586,36 @@ def windows_local_problem(path):
         return "drive-type-unreadable"
     if drive_type != drive_type_fixed:
         return "drive-type=%d" % drive_type
-    return None
+    current = os.path.dirname(os.path.abspath(path))
+    while True:
+        try:
+            info = os.lstat(current)
+        except OSError:
+            return "ancestor-unreadable"
+        if is_reparse(info) or os.path.islink(current):
+            return "ancestor-reparse"
+        if not stat.S_ISDIR(info.st_mode):
+            return "ancestor-not-directory"
+        parent = os.path.dirname(current)
+        if parent == current:
+            return None
+        current = parent
 
 
 def check_local_boundary(path, role):
-    """Keep credential-bearing paths on private local storage."""
+    """Keep credential-bearing paths on private local storage.
+
+    Windows ancestors are checked for reparse points and non-directories only:
+    the operator must still provide a private, operator-owned root (the
+    per-path ACL gate above is the authority for the declared paths).
+    """
     if os.name == "nt":
         problem = windows_local_problem(path)
-        if problem is not None:
-            raise BatchError(E_INSECURE_PERMISSIONS, role=role,
-                             detail="boundary-" + problem)
-        return
-    if posix_ancestor_writable(path):
+    else:
+        problem = posix_boundary_problem(path)
+    if problem is not None:
         raise BatchError(E_INSECURE_PERMISSIONS, role=role,
-                         detail="boundary-ancestor-writable")
+                         detail="boundary-" + problem)
 
 
 def verify_temp_inheritance(directory):
@@ -803,22 +852,45 @@ def manifest_document(config_version, inventory_sha, terminals, fingerprints,
     }
 
 
-def rollback(created):
-    """Delete only files that are still byte-identical to what this batch wrote.
+def file_identity(path):
+    """(device, inode/file-id) of a regular, non-reparse file, or None."""
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return None
+    if (stat.S_ISLNK(info.st_mode) or is_reparse(info)
+            or not stat.S_ISREG(info.st_mode)):
+        return None
+    return (info.st_dev, info.st_ino)
 
-    `created` holds (path, sha256-of-written-bytes, size). A file whose current
-    content no longer matches may have been replaced by another process; it is
-    reported as skipped/residual instead of being deleted.
+
+def rollback(created):
+    """Delete only files that are still this batch's own regular file.
+
+    `created` holds (path, sha256, size, device, file-id). Deletion requires
+    the exact same file identity *and* the same bytes; a substituted file is
+    left in place even when its content happens to be identical, and a reparse
+    point or non-regular object is never followed or removed.
     """
     removed = 0
     skipped = 0
     complete = True
-    for path, expected_hash, expected_size in reversed(created):
+    for path, expected_hash, expected_size, expected_dev, expected_ino \
+            in reversed(created):
         try:
-            if os.path.islink(path):
-                skipped += 1
-                complete = False
-                continue
+            info = os.lstat(path)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            complete = False
+            continue
+        if (stat.S_ISLNK(info.st_mode) or is_reparse(info)
+                or not stat.S_ISREG(info.st_mode)
+                or (info.st_dev, info.st_ino) != (expected_dev, expected_ino)):
+            skipped += 1
+            complete = False
+            continue
+        try:
             with open(path, "rb") as handle:
                 data = handle.read(expected_size + 1)
             if len(data) != expected_size or sha256_hex(data) != expected_hash:
@@ -939,7 +1011,11 @@ def generate(inventory_path, exports_root, output_dir, config_version,
             except merge.MergeError as exc:
                 raise BatchError(exc.code, terminal=terminal.name,
                                  role="output") from None
-            created.append((output_path, sha256_hex(payload), len(payload)))
+            identity = file_identity(output_path)
+            if identity is None:
+                raise BatchError(E_IO, terminal=terminal.name, role="output")
+            created.append((output_path, sha256_hex(payload), len(payload),
+                            identity[0], identity[1]))
             data = read_back(output_path, payload)
             check_private_path(output_path, "output-file")
             written.append((terminal, output_path, sha256_hex(data), len(data)))
@@ -953,8 +1029,11 @@ def generate(inventory_path, exports_root, output_dir, config_version,
             merge.write_output(manifest_payload, manifest_path)
         except merge.MergeError as exc:
             raise BatchError(exc.code, role="manifest") from None
+        identity = file_identity(manifest_path)
+        if identity is None:
+            raise BatchError(E_IO, role="manifest")
         created.append((manifest_path, sha256_hex(manifest_payload),
-                        len(manifest_payload)))
+                        len(manifest_payload), identity[0], identity[1]))
         read_back(manifest_path, manifest_payload)
         check_private_path(manifest_path, "manifest-file")
     except BaseException as exc:
