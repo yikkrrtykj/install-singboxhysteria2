@@ -267,14 +267,16 @@ mk_tree() { # <dir> <count> <a_first>
 mk_pins() { # <path> [a_pin] [b_pin] [a_not_after] [b_not_after] [schema]
     local path=$1 a=${2:-$PIN_A} b=${3:-$PIN_B}
     local an=${4:-2030-01-01T00:00:00Z} bn=${5:-2030-01-01T00:00:00Z}
-    local schema=${6:-mihomo-competition-ha-pins/1}
+    local schema=${6:-mihomo-competition-ha-pins/2}
     "$PY" - "$path" "$a" "$b" "$an" "$bn" "$schema" <<'PY'
 import json
 import sys
 path, a, b, an, bn, schema = sys.argv[1:7]
 doc = {"schema": schema, "vps": {
-    "A": {"fingerprint_sha256": a, "not_after": an, "source": "synthetic-test"},
-    "B": {"fingerprint_sha256": b, "not_after": bn, "source": "synthetic-test"},
+    "A": {"fingerprint_sha256": a, "not_before": "2019-01-01T00:00:00Z",
+           "not_after": an, "source": "synthetic-test"},
+    "B": {"fingerprint_sha256": b, "not_before": "2019-01-01T00:00:00Z",
+           "not_after": bn, "source": "synthetic-test"},
 }}
 with open(path, "w", encoding="utf-8", newline="") as handle:
     json.dump(doc, handle, sort_keys=True, indent=2)
@@ -363,7 +365,7 @@ block_skip() { # <file> <node-name>
         f && /^    skip-cert-verify: /{sub(/^    skip-cert-verify: /,"");print}' "$1"
 }
 
-assert_three_edits() { # <input> <output> <label>
+assert_five_edits() { # <input> <output> <label>
     "$PY" - "$1" "$2" "$3" <<'PY'
 import difflib
 import sys
@@ -373,7 +375,7 @@ ops = [op for op in difflib.SequenceMatcher(None, before, after).get_opcodes()
        if op[0] != "equal"]
 removed = sum(i2 - i1 for tag, i1, i2, j1, j2 in ops)
 added = sum(j2 - j1 for tag, i1, i2, j1, j2 in ops)
-ok = (len(ops) == 3 and removed == 3 and added == 5
+ok = (removed == 5 and added == 7
       and all(tag in ("replace", "insert") for tag, *_ in ops))
 print("ok" if ok else "bad ops=%r removed=%d added=%d" % (ops, removed, added))
 PY
@@ -432,9 +434,12 @@ done
 pass 'no network, subprocess, third-party YAML or duplicate CLI parser imported'
 for marker in 'BATCH_TOOL_NAME' 'load_batch_tool' 'load_merge_tool' \
               'CLIENT_NAME_RE' 'check_private_path' 'file_identity' \
-              'def is_reparse' 'verify_temp_inheritance' 'batch.rollback'; do
+              'def is_reparse' 'verify_temp_inheritance' 'batch.rollback' \
+              'def verify_competition_profile' \
+              'def check_regular_private_file' 'allow-lan: false' \
+              'bind-address: "127.0.0.1"' 'required_valid_through'; do
     grep -qF -- "$marker" "$TOOL" \
-        && pass "HA-02 reuse/permission contract present [$marker]" \
+        && pass "HA-02 reuse/security contract present [$marker]" \
         || fail "missing [$marker]"
 done
 for forbidden in 'def read_export' 'def parse_export' 'CANONICAL_PREFIX_LINES'; do
@@ -450,8 +455,8 @@ text = open(sys.argv[1], encoding="utf-8").read()
 print(" ".join(re.findall(r'add_argument\("(--[a-z-]+)"', text)))
 PY
 )"
-assert_eq '--delivery --pins --output-dir --config-version --min-validity-days --check' \
-    "$cli_flags" 'CLI flags are exactly the documented six'
+assert_eq '--delivery --pins --output-dir --config-version --min-validity-days --require-valid-through --check' \
+    "$cli_flags" 'CLI flags are exactly the documented seven'
 for forbidden in uuid password server pubkey force activate enable; do
     printf '%s\n' "$cli_flags" | grep -qiE -- "--$forbidden" \
         && fail "the CLI exposes a --$forbidden option" || true
@@ -478,8 +483,14 @@ assert_eq "$H1" "$(sha256 "$T1/delivery/event-ob01-ha.yaml")" \
     'T1 HA-02 profile is byte-unchanged'
 assert_eq "$MAN1" "$(sha256 "$T1/delivery/ha-delivery-ha-r1.json")" \
     'T1 HA-02 manifest is byte-unchanged'
-assert_eq 'ok' "$(assert_three_edits "$T1/delivery/event-ob01-ha.yaml" "$OUT1" 'T1')" \
-    'T1 exactly three deterministic edits'
+assert_eq 'ok' "$(assert_five_edits "$T1/delivery/event-ob01-ha.yaml" "$OUT1" 'T1')" \
+    'T1 exactly five deterministic edits'
+assert_eq 'false' "$(awk '/^allow-lan: /{sub(/^allow-lan: /,"");print}' "$OUT1")" \
+    'T1 allow-lan is false'
+assert_eq '127.0.0.1' "$(awk '/^bind-address: /{gsub(/"/,"");sub(/^bind-address: /,"");print}' "$OUT1")" \
+    'T1 bind-address is loopback'
+assert_eq 0 "$(grep -c 'allow-lan: true' "$OUT1")" 'T1 no allow-lan true remains'
+assert_eq 0 "$(grep -c 'bind-address: "\*"' "$OUT1")" 'T1 no wildcard bind remains'
 assert_eq '127.0.0.1:53' "$(awk '/^  listen: /{sub(/^  listen: /,"");gsub(/"/,"");print}' "$OUT1")" \
     'T1 DNS listener is loopback only'
 assert_eq "$PIN_A" "$(block_pin "$OUT1" Hysteria2)" 'T1 primary HY2 pins VPS A'
@@ -488,7 +499,7 @@ assert_eq 'false' "$(block_skip "$OUT1" Hysteria2)" 'T1 primary HY2 skip-cert-ve
 assert_eq 'false' "$(block_skip "$OUT1" Backup-Hysteria2)" 'T1 backup HY2 skip-cert-verify false'
 assert_eq 0 "$(grep -c 'skip-cert-verify: true' "$OUT1")" 'T1 no skip-cert-verify true remains'
 assert_eq 2 "$(grep -c '    fingerprint: ' "$OUT1")" 'T1 exactly two certificate pins'
-assert_eq 'mihomo-competition-ha-profile/1' "$(jget "$MAN" schema)" 'T1 manifest schema'
+assert_eq 'mihomo-competition-ha-profile/2' "$(jget "$MAN" schema)" 'T1 manifest schema'
 assert_eq 1 "$(jget "$MAN" terminal_count)" 'T1 manifest terminal count'
 assert_eq 'A-first' "$(jget "$MAN" terminals.0.group)" 'T1 manifest group'
 assert_eq 'A' "$(jget "$MAN" terminals.0.primary_vps)" 'T1 manifest primary role'
@@ -501,7 +512,11 @@ assert_eq "$H1" "$(jget "$MAN" terminals.0.input_sha256)" \
     'T1 manifest records the HA-02 input hash'
 assert_eq "$PIN_A" "$(jget "$MAN" pins.A.fingerprint_sha256)" 'T1 manifest records pin A'
 assert_eq "$PIN_B" "$(jget "$MAN" pins.B.fingerprint_sha256)" 'T1 manifest records pin B'
+assert_eq '2019-01-01T00:00:00Z' "$(jget "$MAN" pins.A.not_before)" \
+    'T1 manifest records certificate not_before'
 assert_eq '7' "$(jget "$MAN" validity.min_validity_days)" 'T1 manifest validity control'
+assert_eq 'None' "$(jget "$MAN" validity.required_valid_through)" \
+    'T1 manifest records no required-valid-through by default'
 assert_eq 2 "$("$PY" -c 'import json,sys;print(len(json.load(open(sys.argv[1]))["rollback"]["files"]))' "$MAN")" \
     'T1 rollback receipt lists profile and manifest'
 if [ "$POSIX_HOST" = "1" ]; then
@@ -627,6 +642,53 @@ run_profile --delivery "$P/delivery" --pins "$P/near.json" \
 [ "$RC" -eq 0 ] && pass 'T6c min-validity-days 0 accepts a near-expiry pin' \
     || fail "T6c (rc=$RC stderr=[$ERR])"
 rm -f "$P/competition/"*
+mk_pins "$P/through.json" "$PIN_A" "$PIN_B"
+read -r -a A <<< "$(profile_args "$P" comp-r1 "$P/through.json")"
+run_profile --delivery "$P/delivery" --pins "$P/through.json" \
+    --output-dir "$P/competition" --config-version comp-r1 \
+    --require-valid-through 2031-01-01T00:00:00Z
+[ "$RC" -ne 0 ] && [ "${ERR1#ha-profile: FAIL E_PINS_EXPIRED vps=A detail=require-valid-through}" = "" ] \
+    && pass 'T6c2 pin not covering the required event window refused' \
+    || fail "T6c2 (rc=$RC stderr=[$ERR])"
+run_profile --delivery "$P/delivery" --pins "$P/through.json" \
+    --output-dir "$P/competition" --config-version comp-r1 \
+    --require-valid-through 2029-01-01T00:00:00Z
+[ "$RC" -eq 0 ] && pass 'T6c3 required event window inside certificate validity accepted' \
+    || fail "T6c3 (rc=$RC stderr=[$ERR])"
+assert_eq '2029-01-01T00:00:00Z' \
+    "$(jget "$(ls "$P/competition"/ha-competition-*.json)" validity.required_valid_through)" \
+    'T6c3 manifest records the required valid-through date'
+rm -f "$P/competition/"*
+cp "$P/pins.json" "$P/future-nb.json"
+python_pins "$P/future-nb.json" 'doc["vps"]["A"]["not_before"] = "2030-01-01T00:00:00Z"; doc["vps"]["A"]["not_after"] = "2031-01-01T00:00:00Z"'
+read -r -a A <<< "$(profile_args "$P" comp-r1 "$P/future-nb.json")"
+expect_profile_code E_PINS 'T6c4 cert not_before in the future refused' "${A[@]}"
+assert_contains "$ERR" 'vps=A' 'T6c4 future not_before is attributed to VPS A'
+cp "$P/pins.json" "$P/order.json"
+python_pins "$P/order.json" 'doc["vps"]["A"]["not_before"] = "2031-01-01T00:00:00Z"; doc["vps"]["A"]["not_after"] = "2030-01-01T00:00:00Z"'
+read -r -a A <<< "$(profile_args "$P" comp-r1 "$P/order.json")"
+expect_profile_code E_PINS 'T6c5 not_after not later than not_before refused' "${A[@]}"
+cp "$P/pins.json" "$P/no-nb.json"
+python_pins "$P/no-nb.json" 'del doc["vps"]["A"]["not_before"]'
+read -r -a A <<< "$(profile_args "$P" comp-r1 "$P/no-nb.json")"
+expect_profile_code E_PINS 'T6c6 missing not_before refused' "${A[@]}"
+FL="$TMP/floor"
+mk_tree "$FL" 1 1
+mk_pins "$FL/pins.json"
+expect_ha_ok "$FL" ha-r1 'T6c7 floor HA-02 delivery generated'
+read -r -a A <<< "$(profile_args "$FL" comp-r1)"
+run_profile --delivery "$FL/delivery" --pins "$FL/pins.json" \
+    --output-dir "$FL/competition" --config-version comp-r1 \
+    --min-validity-days 30
+[ "$RC" -eq 0 ] && pass 'T6c7 delivery recorded with a 30-day floor' \
+    || fail "T6c7 (rc=$RC stderr=[$ERR])"
+mk_pins "$FL/short.json" "$PIN_A" "$PIN_B" "$NEAR" 2030-01-01T00:00:00Z
+run_profile --delivery "$FL/competition" --pins "$FL/short.json" --check \
+    --min-validity-days 0
+[ "$RC" -ne 0 ] && [ "${ERR1#ha-profile: FAIL E_PINS_EXPIRED}" != "$ERR1" ] \
+    && pass 'T6c8 --check cannot lower the recorded validity floor' \
+    || fail "T6c8 (rc=$RC stderr=[$ERR])"
+rm -f "$P/competition/"*
 mk_pins "$P/badpin.json" "$(printf 'a%.0s' $(seq 1 63))" "$PIN_B"
 read -r -a A <<< "$(profile_args "$P" comp-r1 "$P/badpin.json")"
 expect_profile_code E_PINS 'T6d 63-hex pin refused' "${A[@]}"
@@ -746,7 +808,7 @@ if [ "$IS_WINDOWS" = "1" ]; then
     else
         run_profile --delivery "$D/delivery-link" --pins "$D/pins.json" \
             --output-dir "$D/competition" --config-version comp-r1
-        [ "$RC" -ne 0 ] && [ "$ERR1" = 'ha-profile: FAIL E_DELIVERY' ] \
+        [ "$RC" -ne 0 ] && [ "${ERR1#ha-profile: FAIL E_PATH_CONFLICT role=delivery-input}" != "$ERR1" ] \
             && pass 'T7k junction delivery is refused' \
             || fail "T7k (rc=$RC stderr=[$ERR])"
     fi
@@ -766,6 +828,212 @@ else
     skip 'T7j/T7k/T7l native Windows ACL and junction gates (not a Windows host)'
 fi
 
+# ------------------------------------------- T7m check-mode security gates ---
+section 'T7m --check security, ACL and tamper gates'
+C="$TMP/check"
+mk_tree "$C" 2 1
+mk_pins "$C/pins.json"
+expect_ha_ok "$C" ha-r1 'T7m HA-02 delivery generated'
+expect_gen_ok "$C" comp-r1 'T7m competition delivery generated'
+CMAN="$(ls "$C/competition"/ha-competition-*.json)"
+SNAP="$TMP/check-snap"
+rm -rf "$SNAP"; cp -R "$C/competition" "$SNAP"
+restore_comp() {
+    rm -rf "$C/competition"; cp -R "$SNAP" "$C/competition"
+    if [ "$POSIX_HOST" = "1" ]; then
+        chmod 700 "$C/competition"; chmod 600 "$C/competition"/*
+    fi
+}
+manifest_edit() { # <python code operating on `doc`>
+    "$PY" - "$CMAN" "$1" <<'PY'
+import json
+import sys
+path, code = sys.argv[1], sys.argv[2]
+doc = json.load(open(path, encoding="utf-8"))
+exec(code)
+json.dump(doc, open(path, "w", encoding="utf-8", newline=""),
+          sort_keys=True, indent=2)
+PY
+    [ "$POSIX_HOST" = "1" ] && chmod 600 "$CMAN"
+    [ "$IS_WINDOWS" = "1" ] && win_private_file_acl "$CMAN"
+}
+rehash_outputs() {
+    "$PY" - "$C/competition" "$CMAN" <<'PY'
+import hashlib
+import json
+import os
+import sys
+comp, manifest = sys.argv[1:3]
+doc = json.load(open(manifest, encoding="utf-8"))
+for entry in doc["terminals"]:
+    data = open(os.path.join(comp, entry["output"]), "rb").read()
+    entry["output_sha256"] = hashlib.sha256(data).hexdigest()
+    entry["output_bytes"] = len(data)
+json.dump(doc, open(manifest, "w", encoding="utf-8", newline=""),
+          sort_keys=True, indent=2)
+PY
+    [ "$POSIX_HOST" = "1" ] && chmod 600 "$CMAN"
+    [ "$IS_WINDOWS" = "1" ] && win_private_file_acl "$CMAN"
+}
+run_check() { run_profile --delivery "$C/competition" --pins "$C/pins.json" --check; }
+run_check
+[ "$RC" -eq 0 ] && pass 'T7m baseline --check passes' \
+    || fail "T7m baseline (rc=$RC stderr=[$ERR])"
+if [ "$POSIX_HOST" = "1" ]; then
+    mkdir -p "$C/out2"; chmod 700 "$C/out2"
+    chmod 644 "$C/delivery/event-ob01-ha.yaml"
+    run_profile --delivery "$C/delivery" --pins "$C/pins.json" \
+        --output-dir "$C/out2" --config-version comp-r2
+    [ "$RC" -ne 0 ] && [ "${ERR1#ha-profile: FAIL E_INSECURE_PERMISSIONS role=input-profile}" != "$ERR1" ] \
+        && pass 'T7n 0644 HA-02 input profile refused with its role' \
+        || fail "T7n (rc=$RC stderr=[$ERR])"
+    chmod 600 "$C/delivery/event-ob01-ha.yaml"
+    chmod 644 "$C/competition/event-ob01-hac.yaml"
+    run_check
+    [ "$RC" -ne 0 ] && [ "${ERR1#ha-profile: FAIL E_INSECURE_PERMISSIONS role=output-file}" != "$ERR1" ] \
+        && pass 'T7o 0644 competition output refused by --check' \
+        || fail "T7o (rc=$RC stderr=[$ERR])"
+    restore_comp
+    chmod 644 "$CMAN"
+    run_check
+    [ "$RC" -ne 0 ] && [ "${ERR1#ha-profile: FAIL E_INSECURE_PERMISSIONS role=manifest-file}" != "$ERR1" ] \
+        && pass 'T7p 0644 competition manifest refused by --check' \
+        || fail "T7p (rc=$RC stderr=[$ERR])"
+    restore_comp
+else
+    skip 'T7n/T7o/T7p POSIX per-file mode gates (NTFS carries no POSIX mode)'
+fi
+restore_comp
+"$PY" - "$CMAN" <<'PY'
+import sys
+path = sys.argv[1]
+text = open(path, encoding="utf-8").read()
+needle = '  "schema": "mihomo-competition-ha-profile/2",'
+if needle not in text:
+    raise SystemExit("fixture: schema line missing")
+text = text.replace(needle, needle + "\n" + needle, 1)
+open(path, "w", encoding="utf-8", newline="").write(text)
+PY
+run_check
+[ "$RC" -ne 0 ] && [ "$ERR1" = 'ha-profile: FAIL E_DELIVERY' ] \
+    && pass 'T7q duplicate JSON keys in the manifest refused' \
+    || fail "T7q (rc=$RC stderr=[$ERR])"
+restore_comp
+"$PY" - "$C/dup-pins.json" "$C/pins.json" <<'PY'
+import sys
+src, dest = sys.argv[1:3]
+text = open(src, encoding="utf-8").read()
+needle = '  "schema": "mihomo-competition-ha-pins/2",'
+if needle not in text:
+    raise SystemExit("fixture: pins schema line missing")
+open(dest, "w", encoding="utf-8", newline="").write(
+    text.replace(needle, needle + "\n" + needle, 1))
+PY
+[ "$POSIX_HOST" = "1" ] && chmod 600 "$C/dup-pins.json"
+[ "$IS_WINDOWS" = "1" ] && win_private_file_acl "$C/dup-pins.json"
+run_profile --delivery "$C/competition" --pins "$C/dup-pins.json" --check
+[ "$RC" -ne 0 ] && [ "$ERR1" = 'ha-profile: FAIL E_PINS' ] \
+    && pass 'T7r duplicate JSON keys in the pins file refused' \
+    || fail "T7r (rc=$RC stderr=[$ERR])"
+restore_comp
+"$PY" - "$C/competition/event-ob01-hac.yaml" <<'PY'
+import sys
+path = sys.argv[1]
+text = open(path, encoding="utf-8").read()
+text = text.replace("allow-lan: false", "allow-lan: true", 1)
+open(path, "w", encoding="utf-8", newline="").write(text)
+PY
+rehash_outputs
+run_check
+[ "$RC" -ne 0 ] && [ "$ERR1" = 'ha-profile: FAIL E_TRANSFORM' ] \
+    && pass 'T7s re-hashed manifest cannot mask a reopened LAN listener' \
+    || fail "T7s (rc=$RC stderr=[$ERR])"
+restore_comp
+"$PY" - "$C/competition/event-ob01-hac.yaml" "$PIN_A" "$PIN_B" <<'PY'
+import sys
+path, pin_a, pin_b = sys.argv[1:4]
+text = open(path, encoding="utf-8").read()
+text = text.replace("    fingerprint: " + pin_a, "    fingerprint: TEMP", 1)
+text = text.replace("    fingerprint: " + pin_b, "    fingerprint: " + pin_a, 1)
+text = text.replace("    fingerprint: TEMP", "    fingerprint: " + pin_b, 1)
+open(path, "w", encoding="utf-8", newline="").write(text)
+PY
+rehash_outputs
+run_check
+[ "$RC" -ne 0 ] && [ "$ERR1" = 'ha-profile: FAIL E_TRANSFORM' ] \
+    && pass 'T7t re-hashed manifest cannot swap the HY2 pins' \
+    || fail "T7t (rc=$RC stderr=[$ERR])"
+restore_comp
+"$PY" - "$C/competition/event-ob01-hac.yaml" <<'PY'
+import sys
+path = sys.argv[1]
+text = open(path, encoding="utf-8").read()
+text = text.replace("    skip-cert-verify: false",
+                    "    skip-cert-verify: true", 1)
+open(path, "w", encoding="utf-8", newline="").write(text)
+PY
+rehash_outputs
+run_check
+[ "$RC" -ne 0 ] && [ "$ERR1" = 'ha-profile: FAIL E_TRANSFORM' ] \
+    && pass 'T7u re-hashed manifest cannot reintroduce skip-cert-verify true' \
+    || fail "T7u (rc=$RC stderr=[$ERR])"
+restore_comp
+cp "$C/competition/event-ob01-hac.yaml" "$C/competition/extra-hac.yaml"
+[ "$POSIX_HOST" = "1" ] && chmod 600 "$C/competition/extra-hac.yaml"
+run_check
+[ "$RC" -ne 0 ] && [ "$ERR1" = 'ha-profile: FAIL E_DELIVERY' ] \
+    && pass 'T7v extra competition profile refused' \
+    || fail "T7v (rc=$RC stderr=[$ERR])"
+restore_comp
+manifest_edit 'doc["terminals"][0]["primary_vps"] = None; doc["terminals"][0]["group"] = None'
+run_check
+[ "$RC" -ne 0 ] && [ "$ERR1" = 'ha-profile: FAIL E_DELIVERY' ] \
+    && pass 'T7w missing primary/null group cannot pass the shape gate' \
+    || fail "T7w (rc=$RC stderr=[$ERR])"
+restore_comp
+manifest_edit 'doc["terminals"][1]["name"] = "Event-OB01"; doc["terminals"][1]["output"] = "Event-OB01-hac.yaml"'
+run_check
+[ "$RC" -ne 0 ] && [ "$ERR1" = 'ha-profile: FAIL E_DELIVERY' ] \
+    && pass 'T7x casefold-duplicate terminal names refused' \
+    || fail "T7x (rc=$RC stderr=[$ERR])"
+restore_comp
+if [ "$POSIX_HOST" = "1" ]; then
+    W="$TMP/world-check"
+    rm -rf "$W"; mkdir -p "$W"; cp -R "$SNAP" "$W/competition"
+    chmod 700 "$W/competition"; chmod 600 "$W/competition"/*
+    chmod 777 "$W"
+    run_profile --delivery "$W/competition" --pins "$C/pins.json" --check
+    [ "$RC" -ne 0 ] && [ "${ERR1#ha-profile: FAIL E_INSECURE_PERMISSIONS role=delivery-input}" != "$ERR1" ] \
+        && pass 'T7y world-writable ancestor refused by --check' \
+        || fail "T7y (rc=$RC stderr=[$ERR])"
+    chmod 700 "$W"; rm -rf "$W"
+else
+    skip 'T7y POSIX ancestor-boundary gate (not a POSIX host)'
+fi
+if [ "$IS_WINDOWS" = "1" ]; then
+    restore_comp
+    if win_grant "$C/competition/event-ob01-hac.yaml" "*S-1-5-32-545:R"; then
+        run_check
+        [ "$RC" -ne 0 ] && [ "${ERR1#ha-profile: FAIL E_INSECURE_PERMISSIONS role=output-file}" != "$ERR1" ] \
+            && pass 'T7z other-user grant on an output refused by --check' \
+            || fail "T7z (rc=$RC stderr=[$ERR])"
+    else
+        fail 'T7z fixture: could not grant BUILTIN\\Users on an output'
+    fi
+    restore_comp
+    if win_grant "$C/delivery/event-ob01-ha.yaml" "*S-1-5-32-545:R"; then
+        run_profile --delivery "$C/delivery" --pins "$C/pins.json" \
+            --output-dir "$C/out-win" --config-version comp-r2
+        [ "$RC" -ne 0 ] && [ "${ERR1#ha-profile: FAIL E_INSECURE_PERMISSIONS role=input-profile}" != "$ERR1" ] \
+            && pass 'T7z2 other-user grant on an input profile refused' \
+            || fail "T7z2 (rc=$RC stderr=[$ERR])"
+    else
+        fail 'T7z2 fixture: could not grant BUILTIN\\Users on an input'
+    fi
+else
+    skip 'T7z/T7z2 native Windows ACL negatives (not a Windows host)'
+fi
+
 # ------------------------------------------------------------- T8 transform ---
 section 'T8 transform refuses unexpected input'
 UNIT=$("$PY" - "$TOOL" <<'PY'
@@ -783,6 +1051,7 @@ cases = {
     "no-skip": b'  listen: "0.0.0.0:53"\nproxy-groups:\n',
     "existing-pin": b'  listen: "0.0.0.0:53"\n  - name: Hysteria2\n    skip-cert-verify: true\n    fingerprint: ' + b"c" * 64 + b"\n\n",
     "crlf": b'  listen: "0.0.0.0:53"\r\n',
+    "missing-allow-lan": b'bind-address: "*"\n  listen: "0.0.0.0:53"\n  - name: Hysteria2\n    skip-cert-verify: true\n\n',
 }
 for label, data in cases.items():
     try:
@@ -816,6 +1085,12 @@ if [ "$RC" -eq 2 ] && [ "$ERR1" = 'ha-profile: FAIL E_USAGE' ]; then
 else
     fail "T8e (rc=$RC stderr=[$ERR])"
 fi
+run_profile --delivery "$T1/delivery" --pins "$T1/pins.json" \
+    --output-dir "$T1/competition" --config-version comp-r1 \
+    --require-valid-through 2031-13-99T99:99:99Z
+[ "$RC" -eq 2 ] && [ "$ERR1" = 'ha-profile: FAIL E_USAGE' ] \
+    && pass 'T8f malformed require-valid-through refused' \
+    || fail "T8f (rc=$RC stderr=[$ERR])"
 
 # --------------------------------------------------------------- T9 check ----
 section 'T9 --check preflight'
@@ -873,7 +1148,7 @@ def flaky(payload, path):
     real(payload, path)
 merge.write_output = flaky
 try:
-    profile.generate(delivery, pins, out, "comp-r1", 7, batch, merge)
+    profile.generate(delivery, pins, out, "comp-r1", 7, None, batch, merge)
     print("res code=NONE")
 except profile.ProfileError as exc:
     rb = exc.rollback or {"removed": 0, "skipped": 0, "complete": True}
@@ -896,16 +1171,20 @@ if [ -n "$CORE" ]; then
     WORK="$TMP/core-work"; mkdir -p "$WORK"
     LOADED=0
     CORE_RC=0
+    CORE_FAIL=''
     for profile_file in "$T5/competition"/*-hac.yaml; do
-        "$CORE" -t -d "$WORK" -f "$profile_file" >"$LOGS/core-$LOADED.out" 2>&1 \
-            || CORE_RC=1
+        if ! "$CORE" -t -d "$WORK" -f "$profile_file" \
+                >"$LOGS/core-$LOADED.out" 2>&1; then
+            CORE_RC=1
+            CORE_FAIL="$(basename "$profile_file"): $(tail -2 "$LOGS/core-$LOADED.out" | tr '\n' ' ')"
+        fi
         LOADED=$((LOADED + 1))
     done
     if [ "$CORE_RC" -eq 0 ]; then
         printf '  core-load: OK profiles=%d\n' "$LOADED"
         pass "T11 pinned core loaded $LOADED competition profiles"
     else
-        fail 'T11 pinned core rejected a competition profile'
+        fail "T11 pinned core rejected a competition profile ($CORE_FAIL)"
     fi
 else
     skip 'T11 pinned-core competition load (set HA03_MIHOMO or HA02_MIHOMO)'

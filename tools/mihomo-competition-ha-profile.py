@@ -8,19 +8,21 @@ independent competition delivery:
         -> competition/<name>-hac.yaml                    (per terminal)
         -> competition/ha-competition-<version>.json      (pins, hashes, rollback)
 
-The transform is intentionally tiny and deterministic (three edits per file):
+The transform is intentionally tiny and deterministic (five edits per file):
 
-- DNS listener 0.0.0.0:53 -> 127.0.0.1:53 (loopback management only);
+- allow-lan true -> false and bind-address "*" -> "127.0.0.1";
+- DNS listener 0.0.0.0:53 -> 127.0.0.1:53;
 - Hysteria2 (the terminal's primary VPS): skip-cert-verify true -> false and a
   SHA-256 DER certificate pin for that physical VPS;
 - Backup-Hysteria2 (the terminal's backup VPS): same, with that VPS's pin.
 
 It never re-serialises YAML and never touches the HA-02 input files. The pin
-mapping comes from the HA-02 manifest's `primary_vps`/`backup_vps` fields, so a
-B-first terminal pins B on `Hysteria2` and A on `Backup-Hysteria2`. Pins are
-loaded from a local, access-controlled pins file whose `not_after` dates are
-enforced here (Mihomo leaf pinning does not validate certificate expiry); the
-generation and `--check` modes both refuse expired or soon-expiring pins.
+mapping comes from the HA-02 manifest's `primary_vps`/`backup_vps`, so a B-first
+terminal pins B on `Hysteria2` and A on `Backup-Hysteria2`. Pins are loaded from
+a local, access-controlled pins file whose certificate `not_before`/`not_after`
+dates are enforced here (Mihomo leaf pinning does not validate certificate
+expiry). Generation and `--check` both refuse expired/soon-expiring pins, and
+`--check` cannot lower the validity floor recorded at delivery time.
 
 Default OFF: this tool only writes files. Importing/activating the competition
 profile in Clash Verge Rev is an explicit operator action; no daemon, GUI, web
@@ -40,15 +42,17 @@ import sys
 import time
 
 MAX_INPUT_BYTES = 256 * 1024
+MAX_TERMINALS = 256
 BATCH_TOOL_NAME = "mihomo-competition-ha-batch.py"
-PIN_SCHEMA = "mihomo-competition-ha-pins/1"
-PROFILE_SCHEMA = "mihomo-competition-ha-profile/1"
+PIN_SCHEMA = "mihomo-competition-ha-pins/2"
+PROFILE_SCHEMA = "mihomo-competition-ha-profile/2"
 OUTPUT_SUFFIX = "-hac.yaml"
 MANIFEST_PREFIX = "ha-competition-"
 MANIFEST_SUFFIX = ".json"
-TOOL_VERSION = "1"
+TOOL_VERSION = "2"
 MIN_VALIDITY_DEFAULT = 7
 MAX_VALIDITY_DAYS = 3650
+CLOCK_SKEW_SECONDS = 300
 
 PIN_RE = re.compile(r"\A[0-9a-fA-F]{64}\Z")
 TIME_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\Z")
@@ -74,6 +78,19 @@ EXIT_FAILED = 1
 EXIT_USAGE = 2
 
 
+class ProfileError(Exception):
+    def __init__(self, code, exit_status=EXIT_FAILED, terminal=None, vps=None,
+                 role=None, detail=None):
+        super().__init__(code)
+        self.code = code
+        self.exit_status = exit_status
+        self.terminal = terminal
+        self.vps = vps
+        self.role = role
+        self.detail = detail
+        self.rollback = None
+
+
 def load_batch_tool():
     """Load the HA-02 tool (which loads the canonical merge writer)."""
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -90,15 +107,26 @@ def load_batch_tool():
         raise SystemExit("ha-profile: FAIL %s" % E_TOOL_MISSING)
 
 
+def _no_duplicate_keys(pairs):
+    document = {}
+    for key, value in pairs:
+        if key in document:
+            raise ValueError("duplicate key")
+        document[key] = value
+    return document
+
+
 def read_json(path, code):
-    """Private, regular, bounded UTF-8 JSON file; no symlink/reparse."""
+    """Private, regular, bounded UTF-8 JSON file; no symlink/reparse.
+
+    Duplicate object keys are rejected so two readers cannot disagree about
+    which value a manifest/pins field has.
+    """
     try:
         info = os.lstat(path)
     except OSError:
         raise ProfileError(code) from None
-    if (stat.S_ISLNK(info.st_mode)
-            or bool(getattr(info, "st_file_attributes", 0)
-                    & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    if (stat.S_ISLNK(info.st_mode) or is_reparse(path)
             or not stat.S_ISREG(info.st_mode)
             or info.st_size > MAX_INPUT_BYTES):
         raise ProfileError(code)
@@ -121,9 +149,33 @@ def read_json(path, code):
     if text.startswith("\ufeff"):
         raise ProfileError(code)
     try:
-        return json.loads(text), raw
+        return json.loads(text, object_pairs_hook=_no_duplicate_keys), raw
     except ValueError:
         raise ProfileError(code) from None
+
+
+def is_reparse(path):
+    """True for a Windows junction/symlink or any other reparse point."""
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return True
+    return bool(getattr(info, "st_file_attributes", 0)
+                & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+
+
+def check_regular_private_file(batch, path, role, code):
+    """A regular, non-reparse, bounded, private, boundary-safe file."""
+    try:
+        info = os.lstat(path)
+    except OSError:
+        raise ProfileError(code) from None
+    if (stat.S_ISLNK(info.st_mode) or is_reparse(path)
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_size > MAX_INPUT_BYTES):
+        raise ProfileError(code)
+    batch.check_private_path(path, role)
+    batch.check_local_boundary(path, role)
 
 
 def parse_utc(value):
@@ -137,11 +189,10 @@ def parse_utc(value):
         raise ProfileError(E_PINS) from None
 
 
-def parse_pins(path, min_validity_days):
-    """Return {'A': {...}, 'B': {...}} or fail closed."""
+def validate_pins_document(doc, min_validity_days, required_through):
+    """Return normalised A/B pins or fail closed."""
     if min_validity_days < 0 or min_validity_days > MAX_VALIDITY_DAYS:
         raise ProfileError(E_USAGE, exit_status=EXIT_USAGE)
-    doc, _raw = read_json(path, E_PINS)
     if not isinstance(doc, dict) or set(doc) != {"schema", "vps"}:
         raise ProfileError(E_PINS)
     if doc.get("schema") != PIN_SCHEMA:
@@ -155,8 +206,8 @@ def parse_pins(path, min_validity_days):
     for alias in ("A", "B"):
         entry = vps.get(alias)
         if (not isinstance(entry, dict)
-                or set(entry) != {"fingerprint_sha256", "not_after",
-                                  "source"}):
+                or set(entry) != {"fingerprint_sha256", "not_before",
+                                  "not_after", "source"}):
             raise ProfileError(E_PINS)
         fingerprint = entry["fingerprint_sha256"]
         if not isinstance(fingerprint, str) or not PIN_RE.match(fingerprint):
@@ -165,12 +216,22 @@ def parse_pins(path, min_validity_days):
         if (not isinstance(source, str) or not 1 <= len(source) <= 200
                 or "\n" in source or "\r" in source):
             raise ProfileError(E_PINS)
+        not_before = parse_utc(entry["not_before"])
         not_after = parse_utc(entry["not_after"])
+        if not_after <= not_before:
+            raise ProfileError(E_PINS)
+        if not_before > now + datetime.timedelta(seconds=CLOCK_SKEW_SECONDS):
+            raise ProfileError(E_PINS, vps=alias,
+                               detail="not_before=in the future")
         if not_after <= threshold:
             raise ProfileError(E_PINS_EXPIRED, vps=alias,
                                detail="not_after=" + entry["not_after"])
+        if required_through is not None and not_after < required_through:
+            raise ProfileError(E_PINS_EXPIRED, vps=alias,
+                               detail="require-valid-through")
         pins[alias] = {
             "fingerprint_sha256": fingerprint.lower(),
+            "not_before": entry["not_before"],
             "not_after": entry["not_after"],
             "source": source,
         }
@@ -179,14 +240,18 @@ def parse_pins(path, min_validity_days):
     return pins
 
 
-def is_reparse(path):
-    """True for a Windows junction/symlink or any other reparse point."""
+def parse_pins(path, min_validity_days, required_through):
+    doc, _raw = read_json(path, E_PINS)
+    return validate_pins_document(doc, min_validity_days, required_through)
+
+
+def parse_required_through(value):
+    if value is None:
+        return None
     try:
-        info = os.lstat(path)
-    except OSError:
-        return True
-    return bool(getattr(info, "st_file_attributes", 0)
-                & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+        return parse_utc(value)
+    except ProfileError:
+        raise ProfileError(E_USAGE, exit_status=EXIT_USAGE) from None
 
 
 def find_delivery_manifest(delivery):
@@ -200,15 +265,20 @@ def find_delivery_manifest(delivery):
     return os.path.join(delivery, names[0])
 
 
-def load_delivery(delivery, merge):
+def load_delivery(delivery, merge, batch):
     """Read and verify the HA-02 manifest and every delivered profile."""
+    batch.check_directory(delivery, "delivery-input")
+    batch.check_private_path(delivery, "delivery-input")
+    batch.check_local_boundary(delivery, "delivery-input")
     manifest_path = find_delivery_manifest(delivery)
+    check_regular_private_file(batch, manifest_path, "input-manifest",
+                               E_DELIVERY)
     doc, _raw = read_json(manifest_path, E_DELIVERY)
     if (not isinstance(doc, dict)
             or doc.get("schema") != "mihomo-competition-ha-batch/1"):
         raise ProfileError(E_DELIVERY)
     entries = doc.get("terminals")
-    if not isinstance(entries, list) or not entries:
+    if (not isinstance(entries, list) or not 1 <= len(entries) <= MAX_TERMINALS):
         raise ProfileError(E_DELIVERY)
     if doc.get("terminal_count") != len(entries):
         raise ProfileError(E_DELIVERY)
@@ -227,15 +297,18 @@ def load_delivery(delivery, merge):
                 or not merge.CLIENT_NAME_RE.match(name)
                 or name.casefold() in seen
                 or group != expected_group
-                or backup not in ("A", "B") or primary == backup
+                or primary not in ("A", "B") or backup not in ("A", "B")
+                or primary == backup
                 or output != name + "-ha.yaml"):
             raise ProfileError(E_DELIVERY)
         seen.add(name.casefold())
         path = os.path.join(delivery, output)
         if (os.path.dirname(os.path.realpath(path))
-                != os.path.realpath(delivery)
-                or os.path.islink(path) or not os.path.isfile(path)):
+                != os.path.realpath(delivery)):
             raise ProfileError(E_DELIVERY)
+        check_regular_private_file(batch, path, "input-profile",
+                                   E_DELIVERY_HASH
+                                   if os.path.exists(path) else E_DELIVERY)
         data = open(path, "rb").read(MAX_INPUT_BYTES + 1)
         if len(data) > MAX_INPUT_BYTES:
             raise ProfileError(E_DELIVERY)
@@ -250,6 +323,10 @@ def load_delivery(delivery, merge):
             "input_sha256": entry["output_sha256"],
             "data": data,
         })
+    actual = {name.casefold() for name in os.listdir(delivery)
+              if name.endswith("-ha.yaml")}
+    if actual != {t["name"].casefold() + "-ha.yaml" for t in terminals}:
+        raise ProfileError(E_DELIVERY)
     return doc, terminals
 
 
@@ -272,7 +349,7 @@ def find_block(lines, name):
 
 
 def transform(data, primary_pin, backup_pin):
-    """Exactly three deterministic edits; everything else is byte-preserved."""
+    """Exactly five deterministic edits; everything else is byte-preserved."""
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
@@ -280,11 +357,18 @@ def transform(data, primary_pin, backup_pin):
     if "\r" in text:
         raise ProfileError(E_TRANSFORM)
     lines = text.split("\n")
-    listen_at = [index for index, line in enumerate(lines)
-                 if line == '  listen: "0.0.0.0:53"']
-    if len(listen_at) != 1:
-        raise ProfileError(E_TRANSFORM)
-    replacements = {listen_at[0]: ['  listen: "127.0.0.1:53"']}
+    replacements = {}
+    singles = (
+        ("allow-lan: true", ["allow-lan: false"]),
+        ('bind-address: "*"', ['bind-address: "127.0.0.1"']),
+        ('  listen: "0.0.0.0:53"', ['  listen: "127.0.0.1:53"']),
+    )
+    for original, replacement in singles:
+        positions = [index for index, line in enumerate(lines)
+                     if line == original]
+        if len(positions) != 1:
+            raise ProfileError(E_TRANSFORM)
+        replacements[positions[0]] = replacement
     for name, pin in (("Hysteria2", primary_pin),
                       ("Backup-Hysteria2", backup_pin)):
         start, end = find_block(lines, name)
@@ -296,42 +380,63 @@ def transform(data, primary_pin, backup_pin):
             raise ProfileError(E_TRANSFORM)
         replacements[skips[0]] = ["    skip-cert-verify: false",
                                   "    fingerprint: " + pin]
-    if len(replacements) != 3:
+    if len(replacements) != 5:
         raise ProfileError(E_TRANSFORM)
     output = []
     for index, line in enumerate(lines):
         output.extend(replacements.get(index, [line]))
     result = "\n".join(output)
-    verify_transform(result, primary_pin, backup_pin)
+    verify_competition_profile(result.encode("utf-8"), primary_pin,
+                               backup_pin)
     return result.encode("utf-8")
 
 
-def verify_transform(text, primary_pin, backup_pin):
+def verify_competition_profile(data, primary_pin, backup_pin):
+    """Independently prove the competition security invariants of a profile."""
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ProfileError(E_TRANSFORM) from None
+    if "\r" in text:
+        raise ProfileError(E_TRANSFORM)
     lines = text.split("\n")
-    if lines.count('  listen: "127.0.0.1:53"') != 1:
-        raise ProfileError(E_TRANSFORM)
-    if '  listen: "0.0.0.0:53"' in lines:
-        raise ProfileError(E_TRANSFORM)
-    if text.count("    skip-cert-verify: true") != 0:
-        raise ProfileError(E_TRANSFORM)
-    if text.count("    skip-cert-verify: false") != 2:
-        raise ProfileError(E_TRANSFORM)
-    if text.count("    fingerprint: " + primary_pin) != 1:
-        raise ProfileError(E_TRANSFORM)
-    if text.count("    fingerprint: " + backup_pin) != 1:
-        raise ProfileError(E_TRANSFORM)
+    required = {
+        "allow-lan: false": 1,
+        'bind-address: "127.0.0.1"': 1,
+        '  listen: "127.0.0.1:53"': 1,
+        "    skip-cert-verify: false": 2,
+    }
+    for line, count in required.items():
+        if lines.count(line) != count:
+            raise ProfileError(E_TRANSFORM)
+    for forbidden in ("allow-lan: true", 'bind-address: "*"',
+                      '  listen: "0.0.0.0:53"',
+                      "    skip-cert-verify: true"):
+        if forbidden in lines:
+            raise ProfileError(E_TRANSFORM)
     if text.count("    fingerprint: ") != 2:
         raise ProfileError(E_TRANSFORM)
+    for name, pin in (("Hysteria2", primary_pin),
+                      ("Backup-Hysteria2", backup_pin)):
+        start, end = find_block(lines, name)
+        block = lines[start:end]
+        pins = [line[len("    fingerprint: "):] for line in block
+                if line.startswith("    fingerprint: ")]
+        skips = [line for line in block
+                 if line == "    skip-cert-verify: false"]
+        if pins != [pin] or len(skips) != 1:
+            raise ProfileError(E_TRANSFORM)
 
 
 def manifest_name(version):
     return MANIFEST_PREFIX + version + MANIFEST_SUFFIX
 
 
-def prevalidate_outputs(terminals, delivery, output_dir, manifest):
-    if (os.path.islink(output_dir) or is_reparse(output_dir)
-            or not os.path.isdir(output_dir)):
-        raise ProfileError(E_PATH_CONFLICT, role="output-dir")
+def prevalidate_outputs(terminals, delivery, output_dir, manifest, batch):
+    batch.check_directory(output_dir, "output-dir")
+    batch.check_private_path(output_dir, "output-dir")
+    batch.check_local_boundary(output_dir, "output-dir")
+    batch.verify_temp_inheritance(output_dir)
     output_real = os.path.realpath(output_dir)
     delivery_real = os.path.realpath(delivery)
     if (output_real == delivery_real
@@ -356,31 +461,23 @@ def prevalidate_outputs(terminals, delivery, output_dir, manifest):
 
 
 def generate(delivery, pins_path, output_dir, config_version, min_days,
-             batch, merge):
+             required_through, batch, merge):
     if not batch.CONFIG_VERSION_RE.match(config_version or ""):
         raise ProfileError(E_USAGE, exit_status=EXIT_USAGE)
     delivery = os.path.abspath(delivery)
     output_dir = os.path.abspath(output_dir)
     pins_path = os.path.abspath(pins_path)
-    batch.check_private_path(delivery, "delivery-input")
-    batch.check_local_boundary(delivery, "delivery-input")
-    batch.check_private_path(pins_path, "pins")
-    batch.check_local_boundary(pins_path, "pins")
-    batch.check_directory(output_dir, "output-dir")
-    batch.check_private_path(output_dir, "output-dir")
-    batch.check_local_boundary(output_dir, "output-dir")
-    batch.verify_temp_inheritance(output_dir)
-    source_doc, terminals = load_delivery(delivery, merge)
-    pins = parse_pins(pins_path, min_days)
+    check_regular_private_file(batch, pins_path, "pins", E_PINS)
+    source_doc, terminals = load_delivery(delivery, merge, batch)
+    pins = parse_pins(pins_path, min_days, required_through)
     pin_of = {alias: pins[alias]["fingerprint_sha256"] for alias in "AB"}
     manifest = manifest_name(config_version)
     targets, manifest_path = prevalidate_outputs(
-        terminals, delivery, output_dir, manifest)
-    payloads = []
-    for terminal, target in zip(terminals, targets):
-        payload = transform(terminal["data"], pin_of[terminal["primary_vps"]],
-                            pin_of[terminal["backup_vps"]])
-        payloads.append(payload)
+        terminals, delivery, output_dir, manifest, batch)
+    payloads = [transform(terminal["data"],
+                          pin_of[terminal["primary_vps"]],
+                          pin_of[terminal["backup_vps"]])
+                for terminal in terminals]
     created = []
     entries = []
     try:
@@ -398,7 +495,7 @@ def generate(delivery, pins_path, output_dir, config_version, min_days,
             data = open(target, "rb").read(len(payload) + 1)
             if data != payload:
                 raise ProfileError(E_IO, terminal=terminal["name"])
-            batch.check_private_path(target, "output-file")
+            check_regular_private_file(batch, target, "output-file", E_IO)
             entries.append({
                 "name": terminal["name"],
                 "group": terminal["group"],
@@ -410,8 +507,8 @@ def generate(delivery, pins_path, output_dir, config_version, min_days,
                 "output_sha256": hashlib.sha256(payload).hexdigest(),
                 "output_bytes": len(payload),
                 "pins": {
-                    "primary": pin_of[terminal["primary_vps"]],
-                    "backup": pin_of[terminal["backup_vps"]],
+                    "primary": pins[terminal["primary_vps"]],
+                    "backup": pins[terminal["backup_vps"]],
                 },
             })
         document = {
@@ -428,9 +525,12 @@ def generate(delivery, pins_path, output_dir, config_version, min_days,
                 "delivery_config_version": source_doc.get(
                     "generator", {}).get("config_version"),
             },
-            "pins": {alias: pins[alias] for alias in "AB"},
+            "pins": pins,
             "validity": {
                 "min_validity_days": min_days,
+                "required_valid_through": (
+                    required_through.strftime("%Y-%m-%dT%H:%M:%SZ")
+                    if required_through is not None else None),
                 "checked_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ",
                                              time.gmtime()),
             },
@@ -459,7 +559,7 @@ def generate(delivery, pins_path, output_dir, config_version, min_days,
         data = open(manifest_path, "rb").read(len(manifest_payload) + 1)
         if data != manifest_payload:
             raise ProfileError(E_IO, role="manifest")
-        batch.check_private_path(manifest_path, "manifest-file")
+        check_regular_private_file(batch, manifest_path, "manifest-file", E_IO)
     except BaseException as exc:
         result = batch.rollback(created)
         if isinstance(exc, (ProfileError, batch.BatchError)):
@@ -486,57 +586,121 @@ def find_competition_manifest(delivery):
     return os.path.join(delivery, names[0])
 
 
-def check(delivery, pins_path, min_days, batch, merge):
-    delivery = os.path.abspath(delivery)
-    pins_path = os.path.abspath(pins_path)
-    batch.check_private_path(delivery, "delivery-input")
-    batch.check_private_path(pins_path, "pins")
-    manifest_path = find_competition_manifest(delivery)
-    doc, _raw = read_json(manifest_path, E_DELIVERY)
+def _validate_manifest_entries(doc, merge):
     if (not isinstance(doc, dict) or doc.get("schema") != PROFILE_SCHEMA):
         raise ProfileError(E_DELIVERY)
     entries = doc.get("terminals")
-    if not isinstance(entries, list) or not entries:
+    if (not isinstance(entries, list) or not 1 <= len(entries) <= MAX_TERMINALS):
         raise ProfileError(E_DELIVERY)
-    pins = parse_pins(pins_path, min_days)
+    if doc.get("terminal_count") != len(entries):
+        raise ProfileError(E_DELIVERY)
+    seen_names = set()
+    seen_outputs = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ProfileError(E_DELIVERY)
+        name = entry.get("name")
+        group = entry.get("group")
+        primary = entry.get("primary_vps")
+        backup = entry.get("backup_vps")
+        output = entry.get("output")
+        expected_group = {"A": "A-first", "B": "B-first"}.get(primary)
+        if (not isinstance(name, str) or not merge.CLIENT_NAME_RE.match(name)
+                or not isinstance(output, str)
+                or output != name + OUTPUT_SUFFIX
+                or os.path.basename(output) != output
+                or group != expected_group
+                or primary not in ("A", "B") or backup not in ("A", "B")
+                or primary == backup
+                or entry.get("input") != name + "-ha.yaml"
+                or not isinstance(entry.get("pins"), dict)):
+            raise ProfileError(E_DELIVERY)
+        if (name.casefold() in seen_names
+                or output.casefold() in seen_outputs):
+            raise ProfileError(E_DELIVERY)
+        seen_names.add(name.casefold())
+        seen_outputs.add(output.casefold())
+    return entries
+
+
+def check(delivery, pins_path, min_days, required_through, batch, merge):
+    delivery = os.path.abspath(delivery)
+    pins_path = os.path.abspath(pins_path)
+    batch.check_directory(delivery, "delivery-input")
+    batch.check_private_path(delivery, "delivery-input")
+    batch.check_local_boundary(delivery, "delivery-input")
+    check_regular_private_file(batch, pins_path, "pins", E_PINS)
+    manifest_path = find_competition_manifest(delivery)
+    check_regular_private_file(batch, manifest_path, "manifest-file",
+                               E_DELIVERY)
+    doc, _raw = read_json(manifest_path, E_DELIVERY)
+    entries = _validate_manifest_entries(doc, merge)
+    pins_doc, _pins_raw = read_json(pins_path, E_PINS)
+    validity = doc.get("validity")
+    if (not isinstance(validity, dict)
+            or set(validity) != {"min_validity_days",
+                                 "required_valid_through", "checked_utc"}
+            or not isinstance(validity.get("checked_utc"), str)
+            or not TIME_RE.match(validity.get("checked_utc", ""))):
+        raise ProfileError(E_DELIVERY)
+    recorded_days = validity.get("min_validity_days")
+    if (not isinstance(recorded_days, int)
+            or not 0 <= recorded_days <= MAX_VALIDITY_DAYS):
+        raise ProfileError(E_DELIVERY)
+    # The check may raise the recorded floor, never lower it.
+    effective_days = max(recorded_days, min_days)
+    recorded_through = validity.get("required_valid_through")
+    through = required_through
+    if recorded_through is not None:
+        try:
+            recorded_dt = parse_utc(recorded_through)
+        except ProfileError:
+            raise ProfileError(E_DELIVERY) from None
+        through = recorded_dt if through is None else max(through, recorded_dt)
+    pins = validate_pins_document(pins_doc, effective_days, through)
     recorded_pins = doc.get("pins")
-    if not isinstance(recorded_pins, dict):
+    if not isinstance(recorded_pins, dict) or set(recorded_pins) != {"A", "B"}:
         raise ProfileError(E_DELIVERY)
     for alias in "AB":
         recorded = recorded_pins.get(alias)
         if (not isinstance(recorded, dict)
-                or recorded.get("fingerprint_sha256")
-                != pins[alias]["fingerprint_sha256"]
-                or recorded.get("not_after") != pins[alias]["not_after"]):
+                or set(recorded) != {"fingerprint_sha256", "not_before",
+                                     "not_after", "source"}
+                or recorded != pins[alias]):
             raise ProfileError(E_PINS, vps=alias, detail="manifest mismatch")
+    files = {name.casefold() for name in os.listdir(delivery)
+             if name.endswith(OUTPUT_SUFFIX)}
+    expected = {entry["output"].casefold() for entry in entries}
+    if files != expected:
+        raise ProfileError(E_DELIVERY)
     for entry in entries:
-        path = os.path.join(delivery, entry.get("output", ""))
-        if (os.path.basename(entry.get("output", "")) != entry.get("output")
-                or not os.path.isfile(path) or os.path.islink(path)):
+        path = os.path.join(delivery, entry["output"])
+        if os.path.dirname(os.path.realpath(path)) != os.path.realpath(delivery):
             raise ProfileError(E_DELIVERY)
+        check_regular_private_file(batch, path, "output-file",
+                                   E_DELIVERY_HASH)
         data = open(path, "rb").read(MAX_INPUT_BYTES + 1)
+        if len(data) > MAX_INPUT_BYTES:
+            raise ProfileError(E_DELIVERY)
         if (len(data) != entry.get("output_bytes")
                 or hashlib.sha256(data).hexdigest()
                 != entry.get("output_sha256")):
-            raise ProfileError(E_DELIVERY_HASH,
-                               terminal=entry.get("name"))
+            raise ProfileError(E_DELIVERY_HASH, terminal=entry["name"])
+        primary_pin = pins[entry["primary_vps"]]["fingerprint_sha256"]
+        backup_pin = pins[entry["backup_vps"]]["fingerprint_sha256"]
+        declared = entry.get("pins")
+        if (not isinstance(declared, dict)
+                or declared.get("primary") != pins[entry["primary_vps"]]
+                or declared.get("backup") != pins[entry["backup_vps"]]):
+            raise ProfileError(E_PINS, terminal=entry["name"],
+                               detail="manifest mismatch")
+        # Security semantics are re-derived from the YAML itself; a modified
+        # profile cannot pass merely by updating the manifest hashes.
+        verify_competition_profile(data, primary_pin, backup_pin)
     return {
         "terminals": len(entries),
         "validity": {alias: pins[alias]["not_after"] for alias in "AB"},
     }
-
-
-class ProfileError(Exception):
-    def __init__(self, code, exit_status=EXIT_FAILED, terminal=None, vps=None,
-                 role=None, detail=None):
-        super().__init__(code)
-        self.code = code
-        self.exit_status = exit_status
-        self.terminal = terminal
-        self.vps = vps
-        self.role = role
-        self.detail = detail
-        self.rollback = None
 
 
 def build_parser(merge):
@@ -551,6 +715,7 @@ def build_parser(merge):
     parser.add_argument("--config-version")
     parser.add_argument("--min-validity-days", type=int,
                         default=MIN_VALIDITY_DEFAULT)
+    parser.add_argument("--require-valid-through")
     parser.add_argument("--check", action="store_true")
     return parser
 
@@ -585,9 +750,11 @@ def main(argv=None):
         report_failure(ProfileError(E_IO))
         return EXIT_FAILED
     try:
+        required_through = parse_required_through(args.require_valid_through)
         if args.check:
             result = check(args.delivery, args.pins,
-                           args.min_validity_days, batch, merge)
+                           args.min_validity_days, required_through, batch,
+                           merge)
             print("ha-profile: OK")
             print("terminals: %d" % result["terminals"])
             print("pins: valid")
@@ -597,8 +764,8 @@ def main(argv=None):
         if not args.output_dir or not args.config_version:
             raise ProfileError(E_USAGE, exit_status=EXIT_USAGE)
         result = generate(args.delivery, args.pins, args.output_dir,
-                          args.config_version, args.min_validity_days, batch,
-                          merge)
+                          args.config_version, args.min_validity_days,
+                          required_through, batch, merge)
     except (ProfileError, batch.BatchError) as exc:
         report_failure(exc)
         return exc.exit_status
