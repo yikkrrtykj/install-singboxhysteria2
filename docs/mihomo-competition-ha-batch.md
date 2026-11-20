@@ -280,15 +280,21 @@ Batch-wide identity gates:
 POSIX filesystems are judged on their real mode bits **and** owner: every
 credential-bearing directory must have no group/other bits (0700) and every
 source/export/inventory/delivered file none either (0600), and each path must
-be owned by the user running the tool. In addition, no ancestor above the
-private root may be group/other-writable without the sticky bit (a sticky
-directory such as `/tmp` cannot be used to replace the operator's entry). Mode
-bits on NTFS are cosmetic, so Windows is judged on the owner and DACL read from
-the kernel (`GetNamedSecurityInfoW` → SDDL), never on `chmod`.
+be owned by the user running the tool. The directory boundary above the private
+root is walked with `lstat`: a symlink/reparse component, a non-directory, an
+ancestor owned by another unprivileged user (root is trusted), or a
+group/other-writable non-sticky directory is refused; a sticky directory such
+as `/tmp` (1777) is accepted because another user cannot replace the entry.
+Mode bits on NTFS are cosmetic, so Windows is judged on the owner and DACL read
+from the kernel (`GetNamedSecurityInfoW` → SDDL), never on `chmod`.
 
 Windows is an **allowlist**, not a denylist. A DACL is accepted only when:
 
 - the DACL is present and not NULL (`NO_ACCESS_CONTROL` is refused);
+- the **whole** DACL section is parseable: an optional `A/I/P/R` flag prefix
+  followed by a contiguous run of six-field ACEs, each with a non-empty SID.
+  Trailing text, a truncated/unbalanced ACE or any other unrecognised syntax is
+  refused as `unparsable-ace` rather than skipped;
 - every ACE is of a recognised type (`A`, `OA`, `D`, `OD`, `AU`, `AL`, `OU`,
   `OL`, `ML`, `ID`, `RA`, `SP`); an unknown or unparsable ACE is refused;
 - every allow-ACE names the current operator, `NT AUTHORITY\SYSTEM`
@@ -305,20 +311,25 @@ sensitive write and checks its inherited ACL/mode, so temp-file inheritance is
 proven rather than assumed; the canonical writer's own temp file is created the
 same way. Directory junctions, symlinks and other Windows reparse points are
 refused (a junction is `S_ISDIR` and not a symlink to `lstat`, so the reparse
-attribute is checked explicitly yet the path is still not followed).
+attribute is checked explicitly yet the path is still not followed); every
+ancestor of a declared path is also refused if it is a reparse point or not a
+directory.
 
 The contract suite proves this against live DACLs on a real Windows host: a
 private tree is accepted, the delivered files pass the same check, a real
 `BUILTIN\Users` grant on the exports root or on one source file is refused, a
-real directory junction is refused, and `C:\Users\Public` is refused without
-modifying any ACL outside the suite's own fixtures.
+real directory junction in the source tree and a real ancestor junction are
+refused, and `C:\Users\Public` is refused without modifying any ACL outside the
+suite's own fixtures. The fixtures use SID-based `icacls` grants, and a fixture
+that cannot be created is a FAIL on Windows, never a SKIP.
 
-What this does **not** prove: the allowlist is enforced on the declared paths
-and their delivered files, not on every ancestor's DACL. A broad ACE on a
-distant ancestor, or a different owner of an ancestor that can rename the
-private root, is outside the check; the operator must place the exports and
-delivery inside a private, operator-owned directory and can confirm it with
-`icacls`. `permission_gate` in the manifest records which gate ran
+**Operator precondition (Windows):** the exports root and delivery directory
+must already live in a private, operator-owned directory. The tool proves the
+declared paths, their delivered files and reparse-free ancestors, but it does
+not audit every ancestor's DACL. Confirm the real directories with
+`icacls <dir>` before loading credentials; a broad ACE on a distant ancestor or
+a different unprivileged owner that can rename the private root is outside the
+check. `permission_gate` in the manifest records which gate ran
 (`windows-acl-allowlist` or `posix-mode-owner`), not that the site is safe.
 
 ## Failure, rollback and no-clobber
@@ -339,16 +350,20 @@ delivery inside a private, operator-owned directory and can confirm it with
 - **Rollback of this batch only.** On any failure after writing started, the
   files this batch created are deleted in reverse order (manifest first). A
   pre-existing file is never touched, because nothing pre-existing is ever
-  opened for writing. Before each deletion the current bytes are re-hashed
-  against the bytes this batch wrote; a file that was replaced by another
-  process is **not** deleted. After a clean rollback the tool prints
+  opened for writing. Before each deletion the tool re-reads the path with
+  `lstat`, requires a regular non-reparse file with the **exact file identity**
+  recorded when it published that file (device + file ID/inode), and then
+  re-hashes the bytes. A file that was replaced by another process is **not**
+  deleted even when its content happens to be byte-identical; a symlink,
+  junction, reparse point or non-regular object on a rollback path is never
+  followed or removed. After a clean rollback the tool prints
   `ha-batch: ROLLBACK removed=<n> skipped=<m> complete=yes`.
-- **Incomplete rollback is visible.** If a created file cannot be removed or no
-  longer matches the batch's bytes, the failure line is followed by
-  `ha-batch: ROLLBACK removed=<n> skipped=<m> complete=no` and the operator must
-  inspect/remove the residual (the manifest lists the intended files when it
-  exists). `skipped` counts files deliberately left because they are not this
-  batch's bytes any more.
+- **Incomplete rollback is visible.** If a created file cannot be removed, its
+  identity no longer matches, or it is no longer this batch's bytes, the failure
+  line is followed by `ha-batch: ROLLBACK removed=<n> skipped=<m> complete=no`
+  and the operator must inspect/remove the residual (the manifest lists the
+  intended files when it exists). `skipped` counts files deliberately left
+  because they are no longer provably this batch's own file.
 - **This is delivery rollback, not client rollback.** Deleting the delivery
   files does not restore a Clash Verge profile/settings/selection backup; that
   is HA-03's rollback contract and must be verified on the Windows PC.
@@ -401,7 +416,7 @@ bash tests/test-mihomo-competition-ha-batch.sh
 ```
 
 Local Windows development host, HA-02 review-revision head:
-`pass=250 fail=0 skip=5`; the five skips are exactly the POSIX
+`pass=259 fail=0 skip=5`; the five skips are exactly the POSIX
 permission-bit, unreadable-source, symlink-source and symlinked-root gates that
 Linux CI runs for real. Linux CI totals are the authority and are recorded on
 the pull request. The existing PR-48A merge suite stays at
