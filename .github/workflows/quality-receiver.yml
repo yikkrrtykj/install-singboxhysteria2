@@ -38,7 +38,9 @@ jobs:
       - name: "Competition HA batch and native Windows ACL contract (issue #48 HA-02)"
         if: runner.os == 'Windows'
         shell: bash
-        run: bash tests/test-mihomo-competition-ha-batch.sh
+        run: |
+          bash tests/test-mihomo-competition-ha-batch.sh
+          bash tests/test-mihomo-competition-ha-profile.sh
   systemd-credentials:
     runs-on: ubuntu-22.04
     steps:
