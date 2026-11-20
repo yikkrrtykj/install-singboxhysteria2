@@ -55,6 +55,8 @@ the backup cannot mix profiles, cache and selection files from different states,
 and **verify the processes are actually gone** before copying.
 
 ```powershell
+$ErrorActionPreference = 'Stop'   # cmdlet failures must stop the backup
+
 # 1. Record the running processes, stop them, then prove they are gone.
 Get-Process 'Clash Verge', verge-mihomo -ErrorAction SilentlyContinue |
   Select-Object ProcessName, Id, Path
@@ -70,6 +72,7 @@ if ($left) {
 #    name form is "${me}:(OI)(CI)F"; "$me:(OI)(CI)F" is invalid PowerShell
 #    interpolation, so it must not be used.
 $cfg = "$env:APPDATA\io.github.clash-verge-rev.clash-verge-rev"
+if (-not (Test-Path $cfg)) { throw 'Verge config directory not found; refusing backup' }
 $backup = "$env:USERPROFILE\ha03-backup-$(Get-Date -Format yyyyMMdd-HHmmss)"
 New-Item -ItemType Directory -Force $backup | Out-Null
 $sid = ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
@@ -80,7 +83,10 @@ if ($LASTEXITCODE -ne 0) { throw 'icacls failed on the backup directory' }
 $allowed = @($sid, 'S-1-5-18', 'S-1-5-32-544')
 $badAcl = (Get-Acl $backup).Access |
   Where-Object AccessControlType -eq 'Allow' |
-  ForEach-Object { $_.IdentityReference.Translate([SecurityIdentifier]).Value } |
+  ForEach-Object {
+    $_.IdentityReference.Translate(
+      [System.Security.Principal.SecurityIdentifier]).Value
+  } |
   Where-Object { $allowed -notcontains $_ }
 if ($badAcl) { throw "backup ACL outside allowlist: $($badAcl -join ',')" }
 
@@ -93,9 +99,9 @@ Get-ChildItem $cfg -Recurse -File | ForEach-Object {
     Length = $_.Length
   }
 }
+if ($before.Count -eq 0) { throw 'no config files found; refusing empty snapshot' }
 $before | ConvertTo-Json -Depth 3 | Set-Content "$backup\before-hashes.json"
 Copy-Item "$cfg\*" $backup -Recurse -Force
-if ($LASTEXITCODE -ne 0) { throw 'backup copy failed' }
 $bad = @(); $missing = @()
 foreach ($rel in $before.Keys) {
   $dest = Join-Path $backup $rel
