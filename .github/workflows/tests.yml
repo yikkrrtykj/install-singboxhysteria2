@@ -75,6 +75,7 @@ jobs:
           bash -n tests/test-monitor-v2-jr-deploy.sh
           bash -n tests/test-monitor-v2-p2b-integration.sh
           bash -n tests/test-mihomo-multi-vps-merge.sh
+          bash -n tests/test-mihomo-competition-ha-batch.sh
           bash -n tests/test-monitor-v2-probes.sh
           bash -n tests/test-monitor-v2-probe-ingest.sh
           bash -n tests/test-monitor-v2-classify.sh
@@ -101,6 +102,8 @@ jobs:
         run: |
           python3 -m py_compile tools/mihomo-multi-vps-merge.py
           python3 -m py_compile tests/mihomo-multi-vps-runtime-lab.py
+          python3 -m py_compile tools/mihomo-competition-ha-batch.py
+          python3 -m py_compile tests/mihomo-competition-ha-core-load.py
           python3 -m py_compile tools/mihomo-quality-failover.py tools/mihomo-quality-pilot.py tools/mihomo-quality-client.py tools/quality_failover/*.py
           python3 -m py_compile tests/test_quality_failover.py tests/test_quality_pilot.py tests/test_quality_daily.py tests/mihomo-quality-runtime-lab.py tests/mihomo-quality-pilot-lab.py tests/mihomo-quality-daily-lab.py
 
@@ -176,6 +179,28 @@ jobs:
 
       - name: "Multi-VPS Mihomo profile merge contract (issue #48 PR-48A)"
         run: bash tests/test-mihomo-multi-vps-merge.sh
+
+      # HA-02's pinned-core gate. The generated profiles are not only parsed as
+      # text: a real Mihomo binary with an exact SHA-256 fixed in this workflow
+      # must load every delivered profile. The download is the same pinned
+      # Linux release the HY2 BBR workflow already uses; the suite skips this
+      # gate locally when no core is supplied.
+      - name: "Competition HA batch delivery contract (issue #48 HA-02, pinned Mihomo core load)"
+        run: |
+          bin="$RUNNER_TEMP/ha02-core"
+          mkdir -p "$bin"
+          curl -fL --retry 3 --max-time 180 \
+            https://github.com/MetaCubeX/mihomo/releases/download/v1.19.31/mihomo-linux-amd64-v1.19.31.gz \
+            -o "$bin/mihomo.gz"
+          echo "d5e74bbddbdfff49a1aef7775bf5911da59f0d7196ed509a0ac914b3653dd5f1  $bin/mihomo.gz" | sha256sum -c -
+          gzip -dc "$bin/mihomo.gz" > "$bin/mihomo"
+          chmod +x "$bin/mihomo"
+          actual="$(sha256sum "$bin/mihomo" | cut -d' ' -f1)"
+          expected="08787faafea19c1ab0f83fa5a1b22363b7d03ea78da18091a4c883aecaaa5979"
+          [ "$actual" = "$expected" ] || { echo "unexpected Mihomo binary: $actual"; exit 1; }
+          "$bin/mihomo" -v
+          HA02_MIHOMO="$bin/mihomo" HA02_MIHOMO_SHA256="$actual" \
+            bash tests/test-mihomo-competition-ha-batch.sh
 
       - name: "Protocol quality failover hermetic regression (issue #48 PR-48B)"
         run: |
