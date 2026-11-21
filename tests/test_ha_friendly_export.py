@@ -21,6 +21,24 @@ friendly = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(friendly)
 
 
+class FakeMergeError(Exception):
+    def __init__(self, code):
+        super().__init__(code)
+        self.code = code
+
+
+class FakeMerge:
+    MergeError = FakeMergeError
+
+    @staticmethod
+    def write_output(data, path):
+        try:
+            with open(path, "xb") as handle:
+                handle.write(data)
+        except FileExistsError:
+            raise FakeMergeError("E_OUTPUT_EXISTS") from None
+
+
 class FakeBatch:
     def check_directory(self, _path, _role):
         return None
@@ -32,7 +50,7 @@ class FakeBatch:
         return None
 
     def load_merge_tool(self):
-        return object()
+        return FakeMerge()
 
 
 class FakeFast:
