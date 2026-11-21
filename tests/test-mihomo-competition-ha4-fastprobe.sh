@@ -1151,6 +1151,14 @@ PY
 )
 assert_eq 'ok' "$T9OUT" 'T9 LAB T2 classifier matches the acceptance contract'
 
+# ------------------------------------ T10 human-readable HA-UI delivery -----
+section 'T10 GUI-friendly A/B-first naming adapter'
+if "$PY" -B "$ROOT/tests/test_ha_friendly_export.py" > "$LOGS/t10.out" 2>&1; then
+    pass 'T10 A/B-first filenames, manifest role binding and no-clobber'
+else
+    fail "T10 friendly delivery adapter regression: $(tail -12 "$LOGS/t10.out" | tr '\n' ' ')"
+fi
+
 # ------------------------------------------------------------------ summary --
 section 'summary'
 printf '  pass=%d fail=%d skip=%d\n' "$PASS" "$FAIL" "$SKIP"
