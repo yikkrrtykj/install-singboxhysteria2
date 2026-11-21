@@ -6,3 +6,7 @@ __pycache__/
 .dbg-*.sh
 sc.zip
 sc-bin/
+
+# HA-UI Windows build/test artifacts (never committed; EXE via CI artifacts)
+/dist/
+/.scratch/
