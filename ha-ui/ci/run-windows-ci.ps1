@@ -121,20 +121,16 @@ try {
             & $Python (Join-Path $AppRoot 'scripts\build_windows.py')
             Assert-LastExit 'EXE build'
         }
-        Step 'verify receipt and EXE SHA-256' {
+        Step 'verify receipt, source/tool hashes and EXE SHA-256' {
+            & $Python (Join-Path $AppRoot 'ci\verify_receipt.py') --dist (Join-Path $RepoRoot 'dist')
+            Assert-LastExit 'receipt verification'
             $dist = Join-Path $RepoRoot 'dist'
             $receiptPath = Join-Path $dist 'receipt.json'
-            $exePath = Join-Path $dist 'ha-ui.exe'
             $receipt = Get-Content $receiptPath -Raw | ConvertFrom-Json
-            if (-not $receipt.selftest.ok) { throw 'receipt selftest not ok' }
-            if ($receipt.signed -ne $false) { throw 'unexpected signed claim' }
-            if ($receipt.configuration_embedded -ne $false) { throw 'configuration embedded' }
-            $sha = (Get-FileHash $exePath -Algorithm SHA256).Hash.ToLower()
-            if ($sha -ne $receipt.exe_sha256) { throw 'EXE hash does not match receipt' }
-            $Summary.exe = $exePath
-            $Summary.exe_sha256 = $sha
+            $Summary.exe = Join-Path $dist 'ha-ui.exe'
+            $Summary.exe_sha256 = $receipt.exe_sha256
             $Summary.receipt_sha256 = (Get-FileHash $receiptPath -Algorithm SHA256).Hash.ToLower()
-            Write-Host "EXE SHA-256: $sha"
+            Write-Host "EXE SHA-256: $($receipt.exe_sha256)"
         }
     }
 

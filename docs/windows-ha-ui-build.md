@@ -121,13 +121,28 @@ gh workflow list --repo yikkrrtykj/install-singboxhysteria2
 gh run list --workflow ha-ui.yml --repo yikkrrtykj/install-singboxhysteria2 --limit 5
 ```
 
-激活后的 job：
+### 4.3 独立 CI 激活 PR 方案（推荐；不混入功能 PR）
+
+当前自动化 token 只有 `repo` scope，**不得绕过权限**。推荐由具备 `workflow` scope 的
+维护者开一个**只做 CI 激活**的 PR：
+
+1. 从 `main` 建分支 `ci/ha-ui-workflow-activation`；
+2. 只把 `ha-ui/ci/ha-ui-workflow.yml` 复制为 `.github/workflows/ha-ui.yml`，**不改任何
+   应用代码**；保留 `ha-ui/ci/` 模板与 `check_pins.py --static-only` 作为审计锚点；
+3. PR 描述记录模板 SHA-256、`check_pins --static-only` 输出、与模板逐字节一致的
+   `sha256sum` 对比；要求独立 review；
+4. 合并后由维护者运行 `gh workflow list` + `gh run list`，确认 `windows-tests` 与
+   `windows-exe` 两次 run 成功、EXE artifact 的 receipt/selftest/hash 校验通过；
+5. 把 run 链接与 EXE SHA-256 回填到本 Issue/验收记录。**在该步骤完成前，不得把
+   现有 20/20 仓库 CI 描述为“HA-UI Windows 专项 CI 已通过”。**
+
+### 4.4 激活后的 job
 
 | job | 内容 |
 | --- | --- |
 | `static-gates`（ubuntu） | `py_compile`、`check_pins.py --static-only`、禁止监听/自动导入静态门 |
 | `windows-tests`（windows-2022） | 固定依赖 + `pip check` + 精确 pin gate + offscreen pytest（含 ACL 测试）+ `--self-test`，上传 JUnit |
-| `windows-exe`（windows-2022） | 构建 EXE + 冷启动 self-test + receipt（Python/PyInstaller/依赖/工具哈希/EXE 大小与 SHA-256）+ EXE SHA-256 校验 + step summary + artifact（`if-no-files-found: error`） |
+| `windows-exe`（windows-2022） | 构建 EXE + 冷启动 self-test + `verify_receipt.py`（Python/PyInstaller/依赖/tool/source-tree/EXE 大小与 SHA-256）+ step summary + artifact（`if-no-files-found: error`） |
 
 workflow 不连接 VPS、不读取真实凭据、不合并/部署；CI 通过不能替代真实 Windows +
 两台已授权 VPS 的验收。
@@ -135,6 +150,14 @@ workflow 不连接 VPS、不读取真实凭据、不合并/部署；CI 通过不
 ## 5. 下载/交付校验
 
 拿到 CI 或本地构建的产物后：
+
+```powershell
+# 一次校验 EXE 大小/SHA-256、receipt 版本/依赖、5 个 tool 哈希、source-tree 哈希、
+# self-test、signed=false、configuration_embedded=false：
+python ha-ui\ci\verify_receipt.py --dist dist
+```
+
+人工复核也可：
 
 ```powershell
 Get-FileHash dist\ha-ui.exe -Algorithm SHA256

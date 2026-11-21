@@ -64,9 +64,12 @@ def test_success_message_remote_waits_for_is_emitted_by_generation(
 
 def test_menu_run_and_fetch_limits_are_bounded():
     command = remote._menu_command(["event-ob01"])
-    assert "timeout -k 10 420 bash" in command
+    assert "timeout -k 10 420 env -i" in command
     assert "--connect-timeout 10" in command
     assert "PIPESTATUS" in command
+    assert remote.INSTALLER_REVIEWED_COMMIT in command
+    assert remote.INSTALLER_SHA256 in command
+    assert remote.CLIENT_MANAGEMENT_SHA256 in command
     # Credential-link redaction is applied server-side before the transcript
     # ever leaves the host.
     assert "[redacted-link]" in command

@@ -70,6 +70,10 @@ def static_checks() -> list[str]:
         problems.append("missing CI workflow template")
     if not (APP_ROOT / "ci" / "run-windows-ci.ps1").is_file():
         problems.append("missing local CI runner")
+    if not (APP_ROOT / "ci" / "verify_receipt.py").is_file():
+        problems.append("missing receipt verifier")
+    if not (APP_ROOT / "ci" / "activate-workflow.ps1").is_file():
+        problems.append("missing workflow activation helper")
     return problems
 
 

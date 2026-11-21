@@ -125,29 +125,22 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
         run: python ha-ui/scripts/build_windows.py
-      - name: Verify receipt, pinned versions and EXE SHA-256
+      - name: Verify receipt, EXE SHA-256, source-tree and tool hashes
+        run: python ha-ui/ci/verify_receipt.py --dist dist
+      - name: Publish build summary
         shell: pwsh
         run: |
           $receipt = Get-Content dist\receipt.json -Raw | ConvertFrom-Json
-          if (-not $receipt.selftest.ok) { throw "selftest not ok" }
-          if ($receipt.signed -ne $false) { throw "unexpected signing claim" }
-          if ($receipt.configuration_embedded -ne $false) { throw "config embedded" }
-          if ($receipt.python -notlike "3.13.*") { throw "unexpected Python: $($receipt.python)" }
-          if ($receipt.pyinstaller -ne "6.22.3") { throw "unexpected PyInstaller: $($receipt.pyinstaller)" }
-          foreach ($name in @("PySide6","paramiko","keyring")) {
-            $want = (Get-Content ha-ui\requirements.txt | Select-String "^$name==").ToString().Split("==")[1]
-            if ($receipt.dependencies.$name -ne $want) { throw "receipt dependency mismatch: $name" }
-          }
-          $sha = (Get-FileHash dist\ha-ui.exe -Algorithm SHA256).Hash.ToLower()
-          if ($sha -ne $receipt.exe_sha256) { throw "exe hash mismatch" }
-          $size = (Get-Item dist\ha-ui.exe).Length
-          if ($size -ne $receipt.exe_bytes) { throw "exe size mismatch" }
+          $sha = $receipt.exe_sha256
+          $size = $receipt.exe_bytes
           @(
             "### HA-UI Windows EXE",
             "- EXE: ha-ui.exe ($size bytes)",
             "- SHA-256: ``$sha``",
             "- receipt: signed=false, configuration_embedded=false, selftest ok",
-            "- source tree: ``$($receipt.source_tree_sha256)``"
+            "- source tree: ``$($receipt.source_tree_sha256)``",
+            "- pinned deps: PySide6 $($receipt.dependencies.PySide6), paramiko $($receipt.dependencies.paramiko), keyring $($receipt.dependencies.keyring)",
+            "- PyInstaller: $($receipt.pyinstaller), Python: $($receipt.python)"
           ) | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
           Write-Output "receipt OK: $sha"
       - name: Upload EXE artifact

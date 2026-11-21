@@ -42,12 +42,36 @@ STATE_PATH = "/root/sbox/config"
 CLIENTS_DIR = "/root/sbox/clients"
 MANAGEMENT_MARKER = "/var/lib/sbox-cm/management.active"
 
-# The installer entry point the operator's `miaomiao` wrapper also executes. The
-# client-export slice downloads it read-only, verifies its menu structure, and
-# executes exactly those verified bytes (see _run_cli_generation); it does not
-# rely on the wrapper's second, unverified download.
-INSTALLER_URL = ("https://raw.githubusercontent.com/yikkrrtykj/"
-                 "install-singboxhysteria2/main/install.sh")
+# ---------------------------------------------------------------------------
+# Installer trust anchor (reviewed, immutable).
+#
+# The GUI never executes `main` bytes. Both files it executes are fetched from
+# an exact reviewed commit and must match an independently embedded SHA-256
+# before execution; the installer's own embedded client-management pin must
+# also match the separately downloaded library. Updating these constants is a
+# security-review action: re-review the installer + library, recompute both
+# hashes, and update docs/windows-ha-ui-data-path.md and the tests together.
+# ---------------------------------------------------------------------------
+INSTALLER_REVIEWED_COMMIT = "2a810a995fcc05ec5a807140c6fdb21e9ec660ff"
+INSTALLER_SHA256 = (
+    "520aded03ccf3af6f09b8ba4ad34313a9ccad1ac80127b1600eb519d2dbea67f")
+CLIENT_MANAGEMENT_SHA256 = (
+    "52e08db43b8c94dc42a3c8eea96e8bc3c6adb64155002e82ac3dee985e3b6a53")
+_REPO_RAW_BASE = ("https://raw.githubusercontent.com/yikkrrtykj/"
+                  "install-singboxhysteria2/")
+INSTALLER_URL = _REPO_RAW_BASE + INSTALLER_REVIEWED_COMMIT + "/install.sh"
+CLIENT_MANAGEMENT_URL = (_REPO_RAW_BASE + INSTALLER_REVIEWED_COMMIT
+                         + "/lib/client-management.sh")
+
+# The installer's pre-menu `install_pkgs` would otherwise run `apt update/install`
+# for any missing HOST_DEP_SPECS entry. Preflight refuses auto generation when
+# any of these commands is absent, so the pinned execution path never mutates
+# host packages (and never executes unlocked distro-repository code).
+INSTALLER_HOST_DEPS = (
+    "qrencode", "jq", "iptables", "setfacl", "getfacl", "runuser",
+    # Commands the pinned execution/verification path itself requires.
+    "sha256sum", "date", "stat", "mktemp", "sed", "grep", "awk",
+)
 
 CANONICAL_CLIENT_NAME_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,31}\Z")
 MAX_EXPORT_BYTES = 64 * 1024
@@ -83,6 +107,11 @@ _MENU_FAIL_TOKENS = (
     ("permission", "权限"),
     ("reserved", "保留名称"),
 )
+# Pre-execution pin failures disable automatic menu generation explicitly; the
+# read-existing-exports path remains available. These are not retried.
+_INSTALLER_UNTRUSTED_TOKENS = frozenset({
+    "installer-hash", "lib-hash", "lib-pin", "installer-version",
+})
 
 # Fixed minimum remaining HY2 certificate validity for this MVP. The HA-03
 # tool keeps its own floor; this is an additional app-level stop so a
@@ -183,7 +212,17 @@ def _menu_client_name(path: str) -> str:
 
 
 def _menu_command(names: list[str]) -> str:
-    """Fixed remote script: fetch/verify installer, run menu, prove statuses.
+    """Fixed remote script: fetch/verify pinned bytes, run menu, prove statuses.
+
+    Trust chain: both the installer and the client-management library are
+    fetched from ``INSTALLER_REVIEWED_COMMIT`` (never ``main``) and must match
+    their independently embedded SHA-256 before any byte executes. The
+    installer's own embedded library pin must match the separately downloaded
+    library, proving the reviewed internal dependency chain. The installer is
+    then run with a sanitized environment and the pinned library path, so its
+    library loader does not fetch anything else. Host dependency commands were
+    already required by preflight, so the installer's ``install_pkgs`` path is
+    a no-op and cannot apt-install unlocked code.
 
     No operator-supplied text except strict canonical client names is
     interpolated. The credential link lines are redacted server-side, ANSI
@@ -193,21 +232,43 @@ def _menu_command(names: list[str]) -> str:
     sequence = "10\n1\n" + "".join(
         "3\n%s\n" % name for name in names) + "0\n"
     checks = " ".join(
-        "grep -qF -- " + shlex.quote(marker) + " \"$tmp\" "
+        "grep -qF -- " + shlex.quote(marker) + " \"$d/install.sh\" "
         "|| { echo HAUI_MENU_FAIL=menu-drift; exit 5; };"
         for marker in MENU_SCRIPT_MARKERS)
+    path_env = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    env_assignments = (
+        "env -i PATH=" + path_env + " HOME=/root LANG=C.UTF-8 TERM=dumb "
+        "SB_CLIENT_MANAGEMENT_REF=" + INSTALLER_REVIEWED_COMMIT + " "
+        "SB_CLIENT_MANAGEMENT_LIB=\"$d/client-management.sh\" ")
     script = (
         "set -o pipefail; umask 077; "
-        "tmp=$(mktemp /tmp/ha-ui-installer.XXXXXXXX) "
+        "d=$(mktemp -d /tmp/ha-ui-installer.XXXXXXXX) "
         "|| { echo HAUI_MENU_FAIL=temp; exit 3; }; "
-        "trap 'rm -f -- \"$tmp\"' EXIT HUP INT TERM; "
+        "trap 'rm -rf -- \"$d\"' EXIT HUP INT TERM; "
         "curl -fsSL --connect-timeout 10 --max-time "
         + str(MENU_FETCH_TIMEOUT) + " --retry 1 " + shlex.quote(INSTALLER_URL)
-        + " -o \"$tmp\" || { echo HAUI_MENU_FAIL=fetch; exit 4; }; "
+        + " -o \"$d/install.sh\" || { echo HAUI_MENU_FAIL=fetch; exit 4; }; "
+        "if [ \"$(sha256sum \"$d/install.sh\" | awk '{print $1}')\" != "
+        + shlex.quote(INSTALLER_SHA256)
+        + " ]; then echo HAUI_MENU_FAIL=installer-hash; exit 6; fi; "
+        "grep -qF " + shlex.quote(
+            'SB_CLIENT_MANAGEMENT_SHA256="' + CLIENT_MANAGEMENT_SHA256 + '"')
+        + " \"$d/install.sh\" "
+        "|| { echo HAUI_MENU_FAIL=lib-pin; exit 7; }; "
         + checks + " "
+        "curl -fsSL --connect-timeout 10 --max-time "
+        + str(MENU_FETCH_TIMEOUT) + " --retry 1 "
+        + shlex.quote(CLIENT_MANAGEMENT_URL)
+        + " -o \"$d/client-management.sh\" "
+        "|| { echo HAUI_MENU_FAIL=fetch-lib; exit 8; }; "
+        "if [ \"$(sha256sum \"$d/client-management.sh\" | awk '{print $1}')\" != "
+        + shlex.quote(CLIENT_MANAGEMENT_SHA256)
+        + " ]; then echo HAUI_MENU_FAIL=lib-hash; exit 9; fi; "
+        "chmod 600 \"$d/install.sh\" \"$d/client-management.sh\"; "
         "printf '%s' " + shlex.quote(sequence)
         + " | timeout -k " + str(MENU_KILL_GRACE) + " "
-        + str(MENU_RUN_TIMEOUT) + " bash \"$tmp\" 2>&1 "
+        + str(MENU_RUN_TIMEOUT) + " " + env_assignments
+        + "bash \"$d/install.sh\" 2>&1 "
         "| sed -E -e " + shlex.quote("s/" + _REDACT_ANSI + "//g")
         + " -e " + shlex.quote("s/" + _REDACT_LINK + "/[redacted-link]/g")
         + "; ha_ui_rc=(\"${PIPESTATUS[@]}\"); "
@@ -311,6 +372,10 @@ class RemoteProvider:
             "else echo curl=missing; fi; "
             "if command -v timeout >/dev/null 2>&1; then echo timeout=present; "
             "else echo timeout=missing; fi; "
+            "for dep in " + " ".join(INSTALLER_HOST_DEPS) + "; do "
+            "if command -v \"$dep\" >/dev/null 2>&1; then "
+            "echo \"hostdep_$dep=present\"; else "
+            "echo \"hostdep_$dep=missing\"; fi; done; "
             "if [ -e %s ] || [ -L %s ]; then echo management=active; "
             "else echo management=inactive; fi; "
             "if jq -e '.services[]? | select(.tag==\"monitor-api\") | has(\"secret\")' "
@@ -359,6 +424,14 @@ class RemoteProvider:
             raise HaUiError(errors.E_REMOTE_PREFLIGHT, detail="jq")
         if not facts.openssl_present:
             raise HaUiError(errors.E_REMOTE_PREFLIGHT, detail="openssl")
+        missing_deps = [
+            dep for dep in INSTALLER_HOST_DEPS
+            if values.get("hostdep_" + dep) != "present"]
+        if missing_deps:
+            # Refuse before the installer's install_pkgs/apt path could run:
+            # the pinned execution path must not install distro packages.
+            raise HaUiError(errors.E_REMOTE_PREFLIGHT,
+                            detail="host-deps:" + ",".join(missing_deps))
         if not facts.curl_present:
             raise HaUiError(errors.E_REMOTE_PREFLIGHT, detail="curl")
         if not facts.timeout_present:
@@ -479,8 +552,11 @@ class RemoteProvider:
         text = (output or "").replace("\r", "")
         fail = re.search(r"HAUI_MENU_FAIL=([a-z-]{1,32})", text)
         if fail:
+            token = fail.group(1)
+            if token in _INSTALLER_UNTRUSTED_TOKENS:
+                raise HaUiError(errors.E_INSTALLER_UNTRUSTED, detail=token)
             raise HaUiError(errors.E_REMOTE_MENU,
-                            detail="precheck-" + fail.group(1))
+                            detail="precheck-" + token)
         if "HAUI_MENU_END" not in text:
             raise HaUiError(errors.E_REMOTE_MENU, detail="no-end")
         match = re.search(r"HAUI_MENU_RC=(\d{1,3}),(\d{1,3}),(\d{1,3})", text)

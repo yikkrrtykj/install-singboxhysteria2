@@ -76,29 +76,82 @@ powershell -NoProfile -ExecutionPolicy Bypass -File ha-ui\ci\run-windows-ci.ps1 
 
 ## 3. Layer B — 两台 VPS 只读验证（不执行菜单、不生成、不改配置）
 
-> 仅在两台 VPS 的 owner 书面授权后执行。以下命令全部只读。先记录基线，结束时复核
-> 基线未变。
+> 仅在两台 VPS 的 owner 书面授权后执行。以下命令全部**只读**：不启动 installer、
+> 不调用 `miaomiao` 菜单、不 apt/yum 更新、不重启/重载服务、不写任何文件。
+> 先记录基线，结束时复核基线未变。**只允许输出脱敏元数据**：不输出客户端密码、
+> UUID、私钥、证书 PEM、完整 YAML 或完整配置；不要把 IP/主机名写入 Issue/PR/聊天。
 
-### 3.1 主机指纹与系统环境
+### 3.1 首次主机指纹信任（必须来自独立可信来源）
 
-在 Windows（或受控运维机）执行，**不把 IP 写入工单**：
+**不能**用 `ssh-keyscan` 或一次 SSH 连接本身来建立首次信任——那只是和“网络上自称是
+该主机的一方”自证。首次信任必须与 **VPS 控制台的独立视图**（云厂商 Web 控制台/
+串口/VNC/已签发的运维清单）核对：
+
+1. 在**云厂商控制台**（或既有独立可信的运维通道，不走本次待验证的 SSH）登录目标
+   VPS，执行只读命令，记录 GUI 实际显示算法对应的指纹：
+
+   ```bash
+   for f in /etc/ssh/ssh_host_*_key.pub; do ssh-keygen -lf "$f"; done
+   ```
+
+   若控制台不可用，则由 owner 提供已签字的 host-key 指纹清单作为独立来源；不得用
+   `ssh-keyscan` 结果替代。
+2. 与 GUI“获取并确认指纹”对话框显示的 `SHA256:...` **逐字符比对**（注意算法类型，
+   通常为 ED25519）。
+3. 只有比对一致后，才在 GUI 勾选“我已核对”保存指纹；不一致/无法取得独立来源时
+   **停止 Layer B**，不得继续。
+
+完成独立核对后，才可以用 `ssh-keyscan` 做传输层交叉检查（不是信任根）：
 
 ```powershell
-ssh-keyscan -p <PORT> <HOST> | ssh-keygen -lf -     # 与 GUI 显示的 SHA256 指纹逐字比对
-ssh -p <PORT> root@<HOST> "id -u; uname -a; . /etc/os-release; echo \"$PRETTY_NAME\"; \
-  systemctl is-active sing-box; \
-  ls -l /root/sbox/sbconfig_server.json /root/sbox/config /root/sbox/sing-box; \
-  command -v miaomiao jq openssl curl timeout sha256sum date; \
-  if [ -e /var/lib/sbox-cm/management.active ]; then echo management=active; else echo management=inactive; fi"
+ssh-keyscan -p <PORT> <HOST> | ssh-keygen -lf -
 ```
 
-通过条件：SSH 指纹与 GUI 已确认值一致；`id -u`=0；Linux；sing-box active；
-`sbconfig_server.json`/`config` 存在；`miaomiao`＋依赖命令存在；
+### 3.2 系统环境（只读；PowerShell → ssh stdin，避免引号/变量展开问题）
+
+Windows PowerShell 默认双引号会展开 `$变量`，且引号会被本地 shell 消费；下面统一用
+**单引号 here-string 经 stdin 交给远端 `bash -s`**，脚本内不做任何写操作：
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$HostName = '<VPS_HOST>'; $Port = 22
+$script = @'
+set -u
+id -u
+uname -a
+. /etc/os-release
+printf 'os=%s\n' "$PRETTY_NAME"
+printf 'singbox_state=%s\n' "$(systemctl is-active sing-box 2>/dev/null || true)"
+for f in /root/sbox/sbconfig_server.json /root/sbox/config /root/sbox/sing-box; do
+  if [ -e "$f" ]; then
+    stat -c 'file=%n mode=%a uid=%u size=%s' -- "$f"
+  else
+    printf 'missing=%s\n' "$f"
+  fi
+done
+for c in miaomiao jq openssl curl timeout sha256sum date stat qrencode iptables setfacl getfacl runuser; do
+  if command -v "$c" >/dev/null 2>&1; then printf 'dep_%s=present\n' "$c"; else printf 'dep_%s=missing\n' "$c"; fi
+done
+if [ -e /var/lib/sbox-cm/management.active ] || [ -L /var/lib/sbox-cm/management.active ]; then
+  echo management=active
+else
+  echo management=inactive
+fi
+'@
+$script | ssh -p $Port "root@$HostName" bash -s
+```
+
+通过条件：独立来源指纹与 GUI 一致；`id -u`=0；Linux；sing-box active；
+`sbconfig_server.json`/`config` 存在；`miaomiao` 与依赖命令 present；
 `management=inactive`（若 active 则**停止**，MVP 不在管理面激活状态生成）。
 
-### 3.2 客户端名单（只读，仅输出名称与协议布尔值）
+### 3.3 客户端名单（只读，仅名称 + 协议布尔值）
 
-```bash
+同样经 stdin 执行，**绝不 `jq .` 或 `cat` 配置**：
+
+```powershell
+$script = @'
+set -u
 jq -r '
   ([.inbounds[]?|select(.tag=="vless-in")]|length) as $rn |
   ([.inbounds[]?|select(.tag=="hy2-in")]|length) as $hn |
@@ -106,43 +159,69 @@ jq -r '
   ([.inbounds[]?|select(.tag=="vless-in")|.users[]?|{n:(.name//""),r:((.uuid//"")|length>0)}]),
   ([.inbounds[]?|select(.tag=="hy2-in")|.users[]?|{n:(.name//""),h:((.password//"")|length>0)}])
 ' /root/sbox/sbconfig_server.json
+'@
+$script | ssh -p $Port "root@$HostName" bash -s
 ```
 
-要求：A/B 各跑一次；只记录名称集合与 Reality/HY2 是否齐全（不得保存原始输出到工单）。
+要求：A/B 各跑一次；只记录名称集合与 Reality/HY2 是否齐全（输出脱敏，不保存原始
+凭据字段）。
 
-### 3.3 已有规范导出文件（只读元数据 + 哈希）
+### 3.4 已有规范导出文件（只读元数据 + 哈希）
 
-```bash
+```powershell
+$script = @'
+set -u
 for f in /root/sbox/clients/*/mihomo.yaml; do
   [ -e "$f" ] || continue
   stat -c '%n|%a|%u|%s|%y' -- "$f"
   sha256sum -- "$f"
 done
+'@
+$script | ssh -p $Port "root@$HostName" bash -s
 ```
 
 通过条件：与 GUI 客户端页“导出文件已就绪/需生成”判断一致；属主 root、0600；只记录
-文件名/哈希，不复制内容；若缺失/过期，**Layer B 不生成**，留待 Layer C。
+文件名/哈希，不复制/输出内容；若缺失/过期，**Layer B 不生成**，留待 Layer C。
 
-### 3.4 HY2 证书 PIN 与有效期（只读）
+### 3.5 HY2 证书 PIN 与有效期（只读）
 
 按 [`docs/mihomo-competition-ha-profile.md`](mihomo-competition-ha-profile.md)
 “Obtaining the pin over the trusted SSH management channel”整段执行（只读证书文件，
-不读私钥、不改配置），A/B 各一次，记录 `fingerprint= / not_before= / not_after=`。
+不读私钥、不输出证书 PEM、不改配置），A/B 各一次，只记录
+`fingerprint= / not_before= / not_after=`。
 
-通过条件：A/B PIN 不同；证书当前有效；剩余有效期满足 [mihomo-competition-ha-profile.md]
-的有效期要求（MVP 工具侧还要求 ≥24h，低于 30 天会警告）；与 GUI 读取值一致。
+通过条件：A/B PIN 不同；证书当前有效；剩余有效期满足
+[mihomo-competition-ha-profile.md] 的要求（MVP 工具侧还要求 ≥24h，低于 30 天会警告）；
+与 GUI 读取值一致。
 
-### 3.5 基线不变证明
+### 3.6 基线不变证明
 
-Layer B 开始/结束各执行一次：
+Layer B 开始/结束各执行一次（只读）：
 
-```bash
+```powershell
+$script = @'
+set -u
+date -u +%Y-%m-%dT%H:%M:%SZ
 sha256sum /root/sbox/sbconfig_server.json /root/sbox/config
 systemctl show sing-box -p NRestarts
+'@
+$script | ssh -p $Port "root@$HostName" bash -s
 ```
 
 通过条件：两个哈希与 NRestarts 均未变化；无客户端/证书/服务变更。**任何变化都视为
 Layer B 失败并停止**。
+
+### 3.7 Layer B 明确边界
+
+- **允许**：`id`/`uname`/`stat`/`jq` 只读字段投影/`sha256sum`/`systemctl is-active`/
+  `systemctl show`/只读 openssl 证书解析。
+- **禁止**：执行 `install.sh` 或 `miaomiao`、触发菜单生成/客户端增删、`apt/yum`、
+  `systemctl start|stop|restart|reload|enable`、写 `/root/sbox/**`、修改/删除凭据、
+  启动任何监听/隧道。
+- **Layer B 通过 ≠ Layer C 通过**：Layer B 只证明两台 VPS 的身份、环境、名单、证书 PIN
+  与已有导出元数据可读且基线未变；它**不证明**真实菜单生成、SFTP、SHA、A-first/B-first
+  交付或 Clash Verge Rev 导入可用。后者必须在 Layer C 隔离测试 VPS 完成。
+
 
 ## 4. Layer C — 隔离测试 VPS 生成验收（授权窗口，非生产）
 

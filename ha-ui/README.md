@@ -39,6 +39,8 @@ Issue #110 的 Windows 本地 MVP：读取两台 VPS（A/B）上已存在的同�
    [`docs/windows-ha-ui-data-path.md`](../docs/windows-ha-ui-data-path.md)；
    安全模型见 [`docs/windows-ha-ui-security.md`](../docs/windows-ha-ui-security.md)；
    构建与 CI 见 [`docs/windows-ha-ui-build.md`](../docs/windows-ha-ui-build.md)；
+   Windows CI 最终审计见
+   [`docs/windows-ha-ui-ci-audit.md`](../docs/windows-ha-ui-ci-audit.md)；
    三层真实验收见 [`docs/windows-ha-ui-acceptance.md`](../docs/windows-ha-ui-acceptance.md)；
    PR 审计见 [`docs/windows-ha-ui-preacceptance-audit.md`](../docs/windows-ha-ui-preacceptance-audit.md)。
 

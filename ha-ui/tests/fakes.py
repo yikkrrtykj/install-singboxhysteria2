@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator, Mapping, Sequence
 
-from ha_ui.core import errors, private_fs
+from ha_ui.core import errors, private_fs, remote
 from ha_ui.core.errors import HaUiError
 from ha_ui.core.models import (
     CertPin,
@@ -393,6 +393,7 @@ class VpsFacts:
     preflight_rc: int = 0
     curl_present: bool = True
     timeout_present: bool = True
+    missing_host_deps: tuple[str, ...] = ()
 
 
 @dataclass
@@ -522,6 +523,10 @@ class FakeSession:
             _presence("timeout", facts.timeout_present),
             "mtime=%d" % facts.config_mtime,
         ]
+        for dep in remote.INSTALLER_HOST_DEPS:
+            lines.append("hostdep_%s=%s" % (
+                dep, "missing" if dep in facts.missing_host_deps
+                else "present"))
         return 0, "\n".join(lines) + "\n", ""
 
     def _list(self) -> tuple[int, str, str]:

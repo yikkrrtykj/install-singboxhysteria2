@@ -73,19 +73,25 @@
 2. **CLI 生成不是事务**：`generate_client_configuration` 读配置时未持有 `config.lock`
    （既有 CLI 行为）。MVP 通过“管理面未激活”前置条件 + 下载后 HA-02 的一致性/凭据
    独立性校验降低风险；仍存在与并发人工操作的 TOCTOU 窗口，故激活管理面时拒绝生成。
-3. **菜单驱动仍执行既有 `install.sh`**：生成路径只读下载 main 脚本、先校验菜单结构、再
-   执行已校验字节（`timeout` + `PIPESTATUS` + 逐客户端成功文本 + 前后 stat/SHA-256
-   变化，见 `docs/windows-ha-ui-data-path.md` §6）。但安装脚本在菜单前仍会做幂等
-   `install_pkgs`/权限修复/`install_shortcut`/只读状态查询；菜单 3 不修改
-   `sbconfig_server.json`、不重启 sing-box。导出已新鲜时完全不执行脚本。更彻底的
-   只读 `--client-export` 模式与 Monitor `client.export` 路线均需服务器端单独审批。
-4. **菜单版本漂移**：下载后、执行前的结构标记校验会拒绝重编号/改名的菜单，避免管道
-   输入落到错误操作；若 main 改变了成功文案/菜单结构，工具 fail-closed 而不是猜测。
-5. **Windows 同用户威胁**：ACL 允许当前用户与管理员读取，无法防御同账户恶意软件或
+3. **自动菜单生成仍执行既有 `install.sh`（但已版本锚定）**：执行前从 reviewed commit
+   （非 `main`）下载 installer 与 `lib/client-management.sh`，分别校验独立嵌入的
+   SHA-256，并校验 installer 内嵌 lib pin；随后用清洗环境 + 已校验 lib 路径执行
+   installer（`timeout` + `PIPESTATUS` + 逐客户端成功文本 + 前后 stat/SHA-256 变化，
+   见 `docs/windows-ha-ui-data-path.md` §6）。前置检查要求 installer 的 host 依赖命令
+   全部存在，因此不会触发 `apt/yum` 安装未锁定仓库代码；菜单 3 不修改
+   `sbconfig_server.json`、不重启 sing-box。导出已新鲜时完全不执行脚本。更彻底的只读
+   `--client-export` 模式与 Monitor `client.export` 路线仍需服务器端单独审批。
+4. **版本/哈希不匹配的自动禁用**：installer 或 lib 哈希不匹配、内嵌 pin 漂移、菜单结构
+   变化都 fail-closed；哈希类错误为不可重试的 `E_INSTALLER_UNTRUSTED`，UI 明确提示
+   “自动菜单生成已禁用；已有规范导出仍可读取”。已有新鲜导出文件的读取模式不受影响。
+5. **菜单版本漂移**：结构标记校验拒绝重编号/改名的菜单，避免管道输入落到错误操作；
+   若 main 改变成功文案/菜单结构，工具 fail-closed 而不是猜测；升级需发新版本并重新
+   审查 pin。
+6. **Windows 同用户威胁**：ACL 允许当前用户与管理员读取，无法防御同账户恶意软件或
    已提权攻击者；请保持本机干净、开启磁盘加密、勿同步私有目录。
-6. **Manifest/交付文件非签名**：哈希与 manifest 提供完整性与角色绑定，不提供发布者
+7. **Manifest/交付文件非签名**：哈希与 manifest 提供完整性与角色绑定，不提供发布者
    身份签名；EXE 未代码签名，下载后请核对 `receipt.json` 中的 EXE SHA-256 与 CI 产物。
-7. **真实 VPS 验收未执行**：本仓库内验证为合成凭据 + 本机 Windows 环境；接入真实
+8. **真实 VPS 验收未执行**：本仓库内验证为合成凭据 + 本机 Windows 环境；接入真实
    A/B 前须按 `docs/windows-ha-ui-acceptance.md` 的三层验收执行（含两台 VPS 只读层与
    隔离测试 VPS 生成层）；CI/本机测试不能替代该验收。
 

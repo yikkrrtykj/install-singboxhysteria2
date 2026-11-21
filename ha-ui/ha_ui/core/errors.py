@@ -53,6 +53,7 @@ E_REMOTE_EXPORT: Final = "E_REMOTE_EXPORT"
 E_REMOTE_FILE: Final = "E_REMOTE_FILE"
 E_REMOTE_HASH: Final = "E_REMOTE_HASH"
 E_REMOTE_PIN: Final = "E_REMOTE_PIN"
+E_INSTALLER_UNTRUSTED: Final = "E_INSTALLER_UNTRUSTED"
 
 # --- local HA chain -----------------------------------------------------------
 E_TOOL_MISSING: Final = "E_TOOL_MISSING"
@@ -113,6 +114,9 @@ _MESSAGES = {
     E_REMOTE_FILE: "远端导出文件校验失败",
     E_REMOTE_HASH: "远端导出文件与远端 SHA-256 不一致",
     E_REMOTE_PIN: "无法读取 HY2 证书 PIN/有效期",
+    E_INSTALLER_UNTRUSTED: (
+        "安装脚本版本/字节哈希不在已审查范围，自动菜单生成已禁用；"
+        "已有规范导出仍可读取（手工生成后重试）"),
     E_TOOL_MISSING: "缺少本地 HA 工具文件（安装不完整）",
     E_TOOL_FAILED: "本地 HA 工具执行失败",
     E_CHAIN_STAGE: "HA 生成链某个阶段失败",

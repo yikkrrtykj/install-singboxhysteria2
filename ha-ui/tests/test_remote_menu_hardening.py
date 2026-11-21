@@ -50,18 +50,32 @@ def test_precheck_failure_aborts_before_download(reason):
     assert session.downloads == []
 
 
-def test_menu_command_verifies_installer_before_executing():
+def test_menu_command_verifies_pinned_installer_before_executing():
     provider, session = make_provider(clients=stale_clients("stale"),
                                       exports=exports_for("stale"))
     generate_stale(provider, ["stale"])
     menu_commands = [c for c in session.commands if "HAUI_MENU_END" in c]
     assert len(menu_commands) == 1
     command = menu_commands[0]
-    assert "install-singboxhysteria2/main/install.sh" in command
+    # Exact reviewed commit, not main.
+    assert remote.INSTALLER_REVIEWED_COMMIT in command
+    assert remote.INSTALLER_URL in command
+    assert remote.CLIENT_MANAGEMENT_URL in command
+    assert "/main/" not in command
+    # Both bytes must match the independently embedded hashes before execution.
+    assert remote.INSTALLER_SHA256 in command
+    assert remote.CLIENT_MANAGEMENT_SHA256 in command
+    assert "sha256sum" in command
+    # The installer's own embedded library pin must match the downloaded library.
+    assert "lib-pin" in command
+    # Verified bytes only: structure checks run on the downloaded installer.
     assert "10. 客户端管理" in command
     assert "client_management_menu" in command
     assert "3) generate_client_configuration_interactive" in command
-    assert "timeout -k 10 420 bash" in command
+    # Pinned execution environment, hard timeout and real exit statuses.
+    assert "timeout -k 10 420 env -i" in command
+    assert "SB_CLIENT_MANAGEMENT_LIB" in command
+    assert "SB_CLIENT_MANAGEMENT_REF=" + remote.INSTALLER_REVIEWED_COMMIT in command
     assert "PIPESTATUS" in command
     assert "HAUI_MENU_RC=" in command
     assert "| miaomiao" not in command

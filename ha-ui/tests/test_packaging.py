@@ -86,8 +86,10 @@ def test_ci_workflow_template_runs_pinned_windows_build_and_selftest():
     assert "persist-credentials: false" in text
     assert "python -m pip check" in text
     assert "ha-ui/ci/check_pins.py" in text
+    assert "ha-ui/ci/verify_receipt.py" in text
     assert "if-no-files-found: error" in text
     assert "GITHUB_STEP_SUMMARY" in text
+    assert "source_tree_sha256" in text
     assert "receipt.pyinstaller" in text
     assert "receipt.python" in text
     # No deployment / merge / Clash automation in the CI file.
@@ -105,17 +107,35 @@ def test_ci_support_scripts_exist_and_are_safe_text():
     check = APP_ROOT / "ci" / "check_pins.py"
     runner = APP_ROOT / "ci" / "run-windows-ci.ps1"
     activate = APP_ROOT / "ci" / "activate-workflow.ps1"
-    for path in (check, runner, activate):
+    verifier = APP_ROOT / "ci" / "verify_receipt.py"
+    for path in (check, runner, activate, verifier):
         assert path.is_file(), path
     runner_text = runner.read_text(encoding="utf-8")
     assert "pip check" in runner_text
     assert "check_pins.py" in runner_text
+    assert "verify_receipt.py" in runner_text
     assert "Get-FileHash" in runner_text
     assert "selftest" in runner_text
     activate_text = activate.read_text(encoding="utf-8")
     assert "does not push, activate, or claim CI is active" in activate_text
     assert "workflow scope" in activate_text
     assert "gh auth refresh" in activate_text
+
+
+def test_ci_workflow_has_no_vps_or_client_import_automation():
+    import re
+    lowered = WORKFLOW_TEMPLATE.read_text(encoding="utf-8").casefold()
+    forbidden_patterns = (
+        r"\bssh\s+-", r"\bscp\s", r"gh pr merge", r"apt-get",
+        r"\bsystemctl\b", r"sing-box", r"servers\.json",
+        r"management\.active",
+    )
+    for pattern in forbidden_patterns:
+        assert not re.search(pattern, lowered), (
+            "forbidden CI operation/pattern in HA-UI workflow: " + pattern)
+    # The workflow may only mention import/TUN terms inside the read-only
+    # static guard that forbids such code in the app.
+    assert "forbidden public listener / auto-import construct" in lowered
 
 
 def test_static_pin_gate_passes_without_runtime_dependencies():
