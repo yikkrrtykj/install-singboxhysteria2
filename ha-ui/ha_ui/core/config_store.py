@@ -196,10 +196,11 @@ class ServerConfigStore:
         # Imported lazily: private_fs imports ha_tools for real ACL checks, and
         # config loading must stay usable for diagnostics even if tools break.
         from . import private_fs
-        private_fs.ensure_private_dir(self.workspace)
+        private_fs.ensure_private_dir(self.workspace, workspace=self.workspace)
         data = (json.dumps(payload, ensure_ascii=False, indent=2,
                            sort_keys=True) + "\n").encode("utf-8")
-        private_fs.secure_write_replace(self.path, data)
+        private_fs.secure_write_replace(self.path, data,
+                                        workspace=self.workspace)
         private_fs.verify_private_file(self.path)
 
 
