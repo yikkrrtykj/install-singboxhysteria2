@@ -238,7 +238,7 @@ Run 4:
 
 | Row | Measured result |
 |---|---|
-| Whole VPS A outage (both A listeners) | A-first rows above: fresh route to `Backup-Reality` in 2.70-7.50 s with a dead-node selected window of 2.03-5.92 s and 1-2 switches; B-first rows: business traffic stayed on `Reality` (B, the live primary) with fresh successes at 235-390 ms and detection evidence at 3.69-8.73 s |
+| Whole VPS A outage (both A listeners) | A-first rows above: fresh route to `Backup-Reality` in 0.28-7.50 s (7/9 cells 2.70-7.50 s; two i3 in-dial cells at 282 ms and 406 ms with 0 ms dead-node window and 0 switches; the timeout-bound rows had a dead-node selected window of 2.03-5.92 s and 1-2 switches); B-first rows: business traffic stayed on `Reality` (B, the live primary) with fresh successes at 235-390 ms and detection evidence at 3.69-8.73 s |
 | Both VPSes unavailable simultaneously | 8 fresh attempts, 0 successes; observed selections included `Backup-Hysteria2`, `Backup-Reality`, `Reality` while all candidates were T0-dead; verdict `NO_USABLE_ROUTE_no_false_recovery` |
 
 No false recovery or invented success is reported for the common outage: a
@@ -286,10 +286,11 @@ and NOT MEASURED.
 - **Whole-VPS outage keeps a dead node selectable for a timeout-dependent
   window.** The measured dead-node selected window was ~2.03-2.11 s at
   `timeout=1000`, ~2.94 s at `2000` and ~5.88-5.92 s at `5000` for the rows that
-  selected the dead node; total T0→T2 was 0.28-7.50 s (one i3/t1000 cell moved
-  in-dial in 282 ms with a 0 ms dead-node window; 7/9 cells were 2.70-7.50 s) and
-  a typical row recorded 2 switches (transient selection of the also-dead
-  same-VPS HY2, then the live backup). Longer timeout trades a longer dead-node
+  selected the dead node; total T0→T2 was 0.28-7.50 s (two i3 in-dial cells
+  moved in 282 ms and 406 ms with a 0 ms dead-node window; 7/9 cells were
+  2.70-7.50 s) and a typical non-in-dial row recorded 2 switches (transient
+  selection of the also-dead same-VPS HY2, then the live backup). Longer timeout
+  trades a longer dead-node
   window for fewer premature failures; this single-repetition LAB does not
   quantify the real-WAN false-positive trade.
 - **Interval effect is not separable from these single repetitions.** Whole-VPS
