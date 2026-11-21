@@ -77,13 +77,16 @@ def test_tool_path_returns_existing_reviewed_module(name: str) -> None:
     assert path.name == TOOL_FILES[name]
 
 
-def test_tool_path_reports_friendly_export_missing_on_this_branch() -> None:
-    # The friendly-export tool is not part of this branch (PR112 not merged), so
-    # the loader must report it as missing instead of silently faking it.
-    assert not (ha_tools.tools_dir() / TOOL_FILES["friendly"]).is_file()
-    with pytest.raises(HaUiError) as excinfo:
-        ha_tools.tool_path("friendly")
-    _assert_error(excinfo, errors.E_TOOL_MISSING, "friendly")
+def test_friendly_export_availability_matches_branch() -> None:
+    # The PR-A branch has no friendly-export tool; the PR-B stack merges the
+    # reviewed #112 adapter. The loader must report whichever state is real.
+    path = ha_tools.tools_dir() / TOOL_FILES["friendly"]
+    if path.is_file():
+        assert ha_tools.tool_path("friendly").is_file()
+    else:
+        with pytest.raises(HaUiError) as excinfo:
+            ha_tools.tool_path("friendly")
+        _assert_error(excinfo, errors.E_TOOL_MISSING, "friendly")
 
 
 @pytest.mark.parametrize("name", ["nope", "", "BATCH", "batch ", "../batch",
@@ -105,13 +108,16 @@ def test_tool_sha256_matches_file_bytes(name: str) -> None:
 def test_toolset_fingerprint_covers_every_tool_slot() -> None:
     fingerprint = ha_tools.toolset_fingerprint()
     assert set(fingerprint) == set(TOOL_FILES)
-    for name in PRESENT_TOOLS:
+    friendly_present = (ha_tools.tools_dir()
+                        / TOOL_FILES["friendly"]).is_file()
+    for name in PRESENT_TOOLS + (("friendly",) if friendly_present else ()):
         digest = fingerprint[name]
         assert SHA256_HEX_RE.fullmatch(digest), (
             "%s fingerprint is not a 64-hex sha256: %r" % (name, digest))
         assert digest == ha_tools.tool_sha256(name)
-    assert fingerprint["friendly"] == "missing", (
-        "the absent friendly-export tool must be reported as 'missing'")
+    if not friendly_present:
+        assert fingerprint["friendly"] == "missing", (
+            "the absent friendly-export tool must be reported as 'missing'")
 
 
 # --------------------------------------------------------------------------- #

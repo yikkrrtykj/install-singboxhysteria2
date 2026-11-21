@@ -163,7 +163,7 @@ def ensure_private_dir(path: str | os.PathLike,
         return target
     target = target.absolute()
     root = root.absolute()
-    if not is_within(root, target) and target != root:
+    if target != root and not is_within(root, target):
         raise HaUiError(errors.E_PATH, detail="outside-workspace")
     # Create missing components one by one so every newly created directory gets
     # the private ACL immediately (no inherited-wide-open window).
@@ -303,8 +303,13 @@ def secure_write_replace(path: str | os.PathLike, payload: bytes,
 
 
 def read_private_file(path: str | os.PathLike,
-                      max_bytes: int = _MAX_LOCAL_FILE) -> bytes:
+                      max_bytes: int = _MAX_LOCAL_FILE, *,
+                      workspace: str | os.PathLike | None = None) -> bytes:
     target = Path(path)
+    root = Path(workspace) if workspace is not None else default_workspace_root()
+    if not is_within(root, target):
+        raise HaUiError(errors.E_PATH, detail="outside-workspace")
+    _ensure_ancestors_not_reparse(root, target)
     info = _check_regular_not_reparse(target)
     if not stat.S_ISREG(info.st_mode):
         raise HaUiError(errors.E_PATH, detail="not-file")
