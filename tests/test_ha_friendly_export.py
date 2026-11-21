@@ -39,18 +39,42 @@ class FakeMerge:
             raise FakeMergeError("E_OUTPUT_EXISTS") from None
 
 
+class FakeBatchError(Exception):
+    def __init__(self, code="E_INSECURE_PERMISSIONS"):
+        super().__init__(code)
+        self.code = code
+
+
 class FakeBatch:
+    BatchError = FakeBatchError
+
+    def __init__(self):
+        self.fail_check_after_write = False
+
     def check_directory(self, _path, _role):
         return None
 
-    def check_private_path(self, _path, _role):
+    def check_private_path(self, _path, role):
+        if self.fail_check_after_write and role == "output-file":
+            raise FakeBatchError("E_INSECURE_PERMISSIONS")
         return None
 
     def check_local_boundary(self, _path, _role):
         return None
 
+    def verify_temp_inheritance(self, _path):
+        return None
+
     def load_merge_tool(self):
         return FakeMerge()
+
+
+class FakeToolError(Exception):
+    """Models the reviewed tools' typed ``.code`` failure surface."""
+
+    def __init__(self, code):
+        super().__init__(code)
+        self.code = code
 
 
 class FakeFast:
@@ -58,6 +82,8 @@ class FakeFast:
         self.group = group
         self.checked = False
         self.fail_preflight = False
+        self.tool_error = None
+        self.batch = FakeBatch()
         self.entries = [{
             "name": "event-ob01",
             "group": group,
@@ -69,10 +95,12 @@ class FakeFast:
         }]
 
     def batch_tool(self):
-        return FakeBatch()
+        return self.batch
 
     def check(self, *_args):
         self.checked = True
+        if self.tool_error is not None:
+            raise self.tool_error
         if self.fail_preflight:
             raise friendly.ExportError("E_SOURCE_HASH")
 
@@ -148,6 +176,29 @@ class FriendlyExportTests(unittest.TestCase):
                 str(self.root / "ha02"), str(self.root / "pins.json"),
                 "event-ob01", "A-first", str(self.root / "ha04"),
                 fast=self.fast)
+
+    def test_underlying_tool_code_is_preserved_for_the_gui(self):
+        # The GUI needs the stage-specific code (hash / pin / role / delivery)
+        # rather than one flattened E_PREFLIGHT_OR_IO from the CLI wrapper.
+        self.fast.tool_error = FakeToolError("E_DELIVERY_HASH")
+        with self.assertRaisesRegex(friendly.ExportError, "E_DELIVERY_HASH"):
+            self.run_export()
+        self.fast.tool_error = FakeToolError("E_PINS_EXPIRED")
+        with self.assertRaisesRegex(friendly.ExportError, "E_PINS_EXPIRED"):
+            self.run_export()
+        self.assertEqual(list((self.root / "download").iterdir()), [])
+
+    def test_post_publish_gate_failure_removes_the_artifact(self):
+        self.fast.batch.fail_check_after_write = True
+        with self.assertRaisesRegex(friendly.ExportError,
+                                    "E_INSECURE_PERMISSIONS"):
+            self.run_export()
+        self.assertEqual(list((self.root / "download").iterdir()), [])
+        # The same name must be publishable after the failed attempt.
+        self.fast.batch.fail_check_after_write = False
+        name, _digest = self.run_export()
+        self.assertEqual((self.root / "download" / name).read_bytes(),
+                         self.payload)
 
 
 if __name__ == "__main__":

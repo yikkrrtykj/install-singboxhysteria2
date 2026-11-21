@@ -21,8 +21,12 @@ import sys
 
 
 NAME_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,31}\Z")
+ERROR_CODE_RE = re.compile(r"\AE_[A-Z0-9_]{1,40}\Z")
 GROUPS = {"A-first": "A", "B-first": "B"}
-MAX_PROFILE_BYTES = 128 * 1024
+# Mirrors the reviewed HA-04 input cap (mihomo-competition-ha4-fastprobe.py
+# MAX_INPUT_BYTES). Generated variants are ~3 KiB, so this only bounds a
+# pathological delivery.
+MAX_PROFILE_BYTES = 256 * 1024
 
 
 class ExportError(Exception):
@@ -58,24 +62,72 @@ def _inside(path: Path, ancestor: Path) -> bool:
         return False
 
 
+def _code_of(exc: BaseException) -> str | None:
+    """The fixed error code of a reviewed tool exception, or None.
+
+    The HA-02/03/04 and canonical-writer exceptions all expose a non-secret
+    ``code`` attribute (``E_DELIVERY_HASH``, ``E_OUTSIDE_PRIVATE``,
+    ``E_OUTPUT_EXISTS`` ...). Preserving it is what lets the GUI report a
+    stage-specific, safe diagnosis instead of one flattened IO code.
+    """
+    code = getattr(exc, "code", None)
+    if isinstance(code, str) and ERROR_CODE_RE.fullmatch(code):
+        return code
+    return None
+
+
 def _publish_no_clobber(path: Path, data: bytes, batch, merge) -> None:
     # Use the repository's canonical atomic (private-temp + hard-link)
     # publisher; a failed write must never expose a partial final YAML.
     try:
+        batch.verify_temp_inheritance(str(path.parent))
+    except batch.BatchError as error:
+        raise ExportError(_code_of(error) or "E_INSECURE_PERMISSIONS") from None
+    try:
         merge.write_output(data, str(path))
     except merge.MergeError as error:
         raise ExportError(error.code) from None
-    # The verified parent is private, but independently check the child.
-    batch.check_private_path(str(path), "output-file")
-    with open(path, "rb") as handle:
-        actual = handle.read(len(data) + 1)
-    if actual != data:
-        raise ExportError("E_IO")
+    try:
+        # The verified parent is private, but independently check the child.
+        batch.check_private_path(str(path), "output-file")
+        with open(path, "rb") as handle:
+            actual = handle.read(len(data) + 1)
+        if actual != data:
+            raise ExportError("E_IO")
+    except ExportError:
+        # Never leave a durable delivery that failed its own post-write gate:
+        # a retry must be able to publish the same name again.
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        raise
+    except batch.BatchError as error:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        raise ExportError(_code_of(error) or "E_INSECURE_PERMISSIONS") from None
 
 
 def export_one(ha04_dir: str, ha03_dir: str, ha02_dir: str,
                pins_file: str, terminal: str, group: str,
                output_dir: str, fast=None) -> tuple[str, str]:
+    try:
+        return _export_one(ha04_dir, ha03_dir, ha02_dir, pins_file, terminal,
+                           group, output_dir, fast=fast)
+    except ExportError:
+        raise
+    except Exception as error:
+        code = _code_of(error)
+        if code is not None:
+            raise ExportError(code) from None
+        raise
+
+
+def _export_one(ha04_dir: str, ha03_dir: str, ha02_dir: str,
+                pins_file: str, terminal: str, group: str,
+                output_dir: str, fast=None) -> tuple[str, str]:
     filename = output_name(terminal, group)
     fast = _fastprobe() if fast is None else fast
     # Preserve original path components for the existing private-boundary
