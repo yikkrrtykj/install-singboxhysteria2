@@ -10,7 +10,8 @@
 | --- | --- | --- |
 | 自动测试（合成凭据，Windows） | ✅ 已通过 | `pytest ha-ui/tests`：461 passed / 2 host skips；真实 HA 链集成、ACL、失败注入、UI |
 | Windows EXE 构建 + 冷启动 | ✅ 已通过 | `dist/ha-ui.exe`，EXE self-test OK，`receipt.json` 记录 SHA-256/selftest |
-| Windows GUI 实际操作 | ⚠️ 部分自动化 | pytest-qt offscreen + EXE `--self-test` + 本机渲染截图；**人工逐项操作仍待执行** |
+| Windows GUI 实际操作 | ✅ 自动化通过（A1–A10，真实 EXE + UIA） | 真实 `dist\ha-ui.exe`：窗口/三 tab/安全横幅、密码默认隐藏+显示/隐藏、配置保存不含密码、真实 Windows 凭据管理器保存读回/删除、未确认指纹时测试连接与读取客户端均 E_HOSTKEY 拒绝、生成页/取消/策略控件渲染；证据在本地 `.scratch/gui-acceptance-report.json` 与截图（不入库） |
+| 真实生成/Cancel（HA 链） | ❌ 未执行 | 需要 Layer C 隔离测试 VPS；本机只验证控件/拒绝路径，不能替代真实生成 |
 | 两台 VPS 只读验收（B） | ❌ 未执行 | 未获授权；本 Agent 未连接任何真实 VPS |
 | 隔离测试 VPS 生成（C） | ❌ 未执行 | 未获授权；不得在生产 VPS 上执行 |
 | 真实 Clash Verge Rev 导入 | ❌ 未执行 | 未授权；需 Layer C 后人工执行 |
@@ -50,6 +51,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File ha-ui\ci\run-windows-ci.ps1 
   SHA-256 与 receipt 一致**。
 
 ### 2.2 人工 GUI 验收清单（必须逐项记录）
+
+> 本轮已在真实 EXE 上自动化执行下表 A1–A10 的可自动部分（UIA；合成数据、真实 Windows
+> 凭据管理器、无 VPS 连接），结果见 PR 评论；A5 的“重启后读取”与 A10 的真实生成/Cancel
+> 仍需人工或 Layer C。自动化不能替代人工视觉/交互确认。
 
 用**构建出的 `dist\ha-ui.exe`**（非源码运行）在标准 Windows 桌面执行：
 
