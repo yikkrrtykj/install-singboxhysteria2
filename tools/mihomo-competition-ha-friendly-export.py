@@ -89,11 +89,13 @@ def export_one(ha04_dir: str, ha03_dir: str, ha02_dir: str,
                output_dir: str, fast=None) -> tuple[str, str]:
     filename = output_name(terminal, group)
     fast = _fastprobe() if fast is None else fast
-    variant = Path(ha04_dir).resolve()
-    competition = Path(ha03_dir).resolve()
-    delivery = Path(ha02_dir).resolve()
-    pins = Path(pins_file).resolve()
-    dest = Path(output_dir).resolve()
+    # Preserve original path components for the existing private-boundary
+    # checker: resolving here would hide symlinks/junctions before ACL checks.
+    variant = Path(os.path.abspath(ha04_dir))
+    competition = Path(os.path.abspath(ha03_dir))
+    delivery = Path(os.path.abspath(ha02_dir))
+    pins = Path(os.path.abspath(pins_file))
+    dest = Path(os.path.abspath(output_dir))
 
     for source in (variant, competition, delivery):
         if dest == source or _inside(dest, source) or _inside(source, dest):
@@ -107,7 +109,7 @@ def export_one(ha04_dir: str, ha03_dir: str, ha02_dir: str,
     # the HY2 pin validity floor before any output is created.
     fast.check(str(variant), str(competition), str(delivery), str(pins))
 
-    doc, _manifest, entries, _names = fast.load_variant_delivery(str(variant))
+    _doc, _manifest, entries, _names = fast.load_variant_delivery(str(variant))
     merge = batch.load_merge_tool()
     fast.validate_manifest_entries(entries, merge)
     matches = [e for e in entries if e["name"] == terminal]
