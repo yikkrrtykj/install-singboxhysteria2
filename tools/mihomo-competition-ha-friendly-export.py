@@ -58,30 +58,19 @@ def _inside(path: Path, ancestor: Path) -> bool:
         return False
 
 
-def _publish_no_clobber(path: Path, data: bytes, batch) -> None:
-    # Exclusive creation plus private-parent ACL prevents overwriting earlier
-    # deliveries. Both the output hash and permissions are checked after write.
-    fd = None
+def _publish_no_clobber(path: Path, data: bytes, batch, merge) -> None:
+    # Use the repository's canonical atomic (private-temp + hard-link)
+    # publisher; a failed write must never expose a partial final YAML.
     try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "wb") as handle:
-            fd = None
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        batch.check_private_path(str(path), "output-file")
-        with open(path, "rb") as handle:
-            actual = handle.read(len(data) + 1)
-        if actual != data:
-            raise ExportError("E_IO")
-    except FileExistsError as exc:
-        raise ExportError("E_OUTPUT_EXISTS") from exc
-    except Exception:
-        # Never delete a possibly replaced path: leave a failed file for
-        # operator inspection and refuse to report successful delivery.
-        if fd is not None:
-            os.close(fd)
-        raise
+        merge.write_output(data, str(path))
+    except merge.MergeError as error:
+        raise ExportError(error.code) from None
+    # The verified parent is private, but independently check the child.
+    batch.check_private_path(str(path), "output-file")
+    with open(path, "rb") as handle:
+        actual = handle.read(len(data) + 1)
+    if actual != data:
+        raise ExportError("E_IO")
 
 
 def export_one(ha04_dir: str, ha03_dir: str, ha02_dir: str,
@@ -132,7 +121,7 @@ def export_one(ha04_dir: str, ha03_dir: str, ha02_dir: str,
         raise ExportError("E_SOURCE_HASH")
 
     target = dest / filename
-    _publish_no_clobber(target, data, batch)
+    _publish_no_clobber(target, data, batch, merge)
     return filename, hashlib.sha256(data).hexdigest()
 
 
