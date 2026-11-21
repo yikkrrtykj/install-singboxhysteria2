@@ -1193,8 +1193,30 @@ add_client_interactive() {
 
 generate_client_configuration_interactive() {
     local name
-    audit_client_consistency "$SB_SERVER_CONFIG" || return 1
-    read -r -p "请输入要生成配置的客户端名称: " name
+    # Print the prompt even when stdin is not a TTY (read -p otherwise
+    # suppresses it). The listing is available separately from menu item 1.
+    # Keep all writes and credential generation in the existing canonical
+    # generate_client_configuration function.
+    while :; do
+        printf '请输入要生成配置的客户端名称（输入 :q 返回）: ' >&2
+        if ! IFS= read -r name; then
+            warning "输入已结束，取消生成客户端配置"
+            return 1
+        fi
+        if [ "$name" = ":q" ]; then
+            info "已取消生成客户端配置"
+            return 0
+        fi
+        if [ -z "$name" ]; then
+            warning "客户端名称不能为空，请重新输入"
+            continue
+        fi
+        if ! validate_client_name "$name"; then
+            warning "客户端名称格式不正确（字母/数字开头，仅字母数字._-，最长32），请重新输入"
+            continue
+        fi
+        break
+    done
     generate_client_configuration "$name"
 }
 
