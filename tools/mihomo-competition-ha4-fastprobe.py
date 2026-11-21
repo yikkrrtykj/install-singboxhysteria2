@@ -66,6 +66,9 @@ LAZY_OFF = "    lazy: false"
 VARIANT_RE = re.compile(
     r"\Aha4-fastprobe-[A-Za-z0-9][A-Za-z0-9._-]{0,63}-i(?:3|5|10)-"
     r"t(?:1000|2000|5000)\.json\Z")
+# Trailing policy suffix of the manifest name, used to bind the file name to the
+# interval/timeout recorded inside the manifest and to the generated profiles.
+MANIFEST_POLICY_RE = re.compile(r"-i([0-9]+)-t([0-9]+)\.json\Z")
 
 E_USAGE = "E_USAGE"
 E_DELIVERY = "E_DELIVERY"
@@ -445,6 +448,16 @@ def load_variant_delivery(delivery):
     doc, _raw = ha03.read_json(manifest_path, E_DELIVERY)
     if (not isinstance(doc, dict) or doc.get("schema") != SCHEMA):
         raise ProfileError(E_DELIVERY)
+    generator = doc.get("generator")
+    if (not isinstance(generator, dict)
+            or set(generator) != {"tool", "version", "config_version"}
+            or generator.get("tool")
+            != "tools/" + os.path.basename(__file__)
+            or generator.get("version") != TOOL_VERSION
+            or not isinstance(generator.get("config_version"), str)
+            or not batch.CONFIG_VERSION_RE.match(
+                generator.get("config_version") or "")):
+        raise ProfileError(E_DELIVERY, detail="ha-04 generator metadata")
     policy = doc.get("policy")
     if (not isinstance(policy, dict)
             or set(policy) != {"group", "interval", "timeout", "lazy",
@@ -458,6 +471,18 @@ def load_variant_delivery(delivery):
             or policy.get("generic_defaults_preserved") is not True
             or policy.get("nodes") != list(NODE_ORDER)):
         raise ProfileError(E_DELIVERY)
+    # Bind the audit metadata to the file name: the manifest is only valid for
+    # the config version and the interval/timeout encoded in its own name.
+    match = MANIFEST_POLICY_RE.search(manifests[0])
+    if (match is None
+            or int(match.group(1)) != policy["interval"]
+            or int(match.group(2)) != policy["timeout"]):
+        raise ProfileError(E_DELIVERY, detail="manifest policy mismatch")
+    expected_name = manifest_name(generator["config_version"],
+                                  policy["interval"], policy["timeout"])
+    if manifests[0] != expected_name:
+        raise ProfileError(E_DELIVERY,
+                           detail="manifest config-version mismatch")
     entries = doc.get("terminals")
     if (not isinstance(entries, list) or not 1 <= len(entries) <= MAX_TERMINALS):
         raise ProfileError(E_DELIVERY)

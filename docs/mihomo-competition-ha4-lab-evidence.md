@@ -60,9 +60,17 @@ Everything else — the four nodes and their order, the probe policy under test,
   per-node `alive:false` health evidence and/or the first selection change. A
   `null` T1 means no qualifying observation was captured in the window
   (UNKNOWN), not "no fault".
-- **T2**: first **fresh** end-to-end SOCKS probe (HTTP 204 from the loopback
-  origin) whose request was both started and completed after T0, with chain
-  attribution from `/connections`. An in-flight or reused attempt is not T2.
+- **T2**: a **verified** T2 requires ALL of: (a) a fresh end-to-end SOCKS probe
+  with a useful HTTP response (204 from the loopback origin) whose request was
+  both started and completed after T0; (b) an independent `/connections` chain
+  attribution; and (c) that attributed node is the expected surviving candidate
+  for the trial. A missing attribution is recorded separately as
+  `first_fresh_http` with `T2_status=UNKNOWN_PATH` and is **never counted as
+  T2**; an attribution to another node is `WRONG_CANDIDATE` and is **not a
+  switch success**; a fresh success when no surviving candidate is expected
+  (both VPSes down) is `UNEXPECTED_SUCCESS`, never a recovery. An in-flight or
+  reused attempt is not a T2 candidate. The earliest raw fresh HTTP success and
+  its time are kept for audit even when T2 stays UNKNOWN.
 - **Dead-node window**: time the selected `自动选择` member was a T0-dead node.
 - **Switch count**: distinct selection changes observed in the observation
   window.
@@ -70,6 +78,49 @@ Everything else — the four nodes and their order, the probe policy under test,
   real-Windows-PC HA-05 evidence; loopback has no application hook.
 - Each matrix cell below is one repetition unless stated; these are not
   p95/percentile measurements.
+
+### Measurement-integrity correction (independent review 6004372101)
+
+The first analysis pass selected the first post-T0 HTTP success as T2 even when
+the `/connections` chain was missing or pointed elsewhere. That was corrected
+after review with the classifier above and the raw evidence was re-examined
+rather than re-run: the matrix rows already recorded
+`T2_attribution_ok = true` (chain node = expected surviving candidate); the
+selected-HY2 / hopping / first-interruption rows recorded chain nodes equal to
+their expected surviving candidate. The only affected row is the failback
+**second interruption**, whose chain was unavailable; it is reclassified to
+T2 UNKNOWN below. No timing was shifted and no cell was re-measured; unavailable
+data stays UNKNOWN. The classifier now has hermetic regression tests in the
+HA-04 contract suite.
+
+### Post-fix confirmation run (classifier check, not a replacement)
+
+After the classifier change the same harness/fixture was run once more
+(`--scenario all`, lab dir `ha04-lab-review`, duration 555.2 s) to confirm the
+corrected measurement path on real recorded attempts. It is a **separate,
+supplementary run** and does not replace the original evidence above:
+
+- 19 client runs, **17 OK, 2 baseline setup flakes** (`matrix-a i10/t1000`,
+  `matrix-b i10/t5000`: client did not reach a healthy attributed baseline
+  before the fault; no fault trial measured), 30 trials. The run exited non-zero
+  because of those two harness flakes; it is not presented as a clean run.
+- Every T2 recorded in that run's tables was `T2_status=VERIFIED` (no
+  UNKNOWN_PATH/WRONG_CANDIDATE row); e.g. selected-HY2 failure T2 875.0 ms via
+  `Backup-Reality`, whole-HY2 T2 250.0 ms via `Backup-Reality`, and this time the
+  failback second interruption got a chain (`Hysteria2`) and measured a verified
+  T2 of 250.0 ms. The both-VPS-down row stayed 0/7 successes.
+- B-first rows were partially missing in this run because of the second flake;
+  the complete clean B-first matrix remains run b above.
+- The post-fix run left one local mixed-port socket (`24112`) reported busy at
+  cleanup after all listener/client processes were stopped: the harness printed
+  a cleanup warning and `processes_stopped=true`; it is a single-host
+  TIME_WAIT/cleanup artifact of the supplementary run, not a delivered listener.
+  The original evidence runs finished with `ports_free=true`.
+
+So the corrected classifier can attribute T2 when `/connections` evidence exists
+(confirmed on this run) and refuses to count it when it is missing (the original
+run's second-interruption row stays UNKNOWN). No ≤10 s recovery claim is made
+from any of these loopback runs.
 
 ## Matrix: T0→T1 / T0→T2 (ms), dead-node window, switches
 
@@ -86,9 +137,13 @@ lab directories named in the reproduction section):
   values across runs as if they were one sample.
 
 `—` in T0→T1 means no qualifying client-side detection evidence was captured in
-the observation window (**UNKNOWN**, not "no fault"); a `—` T2 means no fresh
-post-T0 success was measured (only the both-VPS-down row). Every T2 listed has a
-`/connections` chain unless noted.
+the observation window (**UNKNOWN**, not "no fault"); a `—` T2 means no
+verified T2 was measured. The `T0→T2` column is **verified-attribution only**:
+every listed matrix value had `chain_node = expected surviving candidate`
+(`T2_attribution_ok = true`), so no raw-HTTP-only value appears as T2 here. The
+separately recorded raw first fresh HTTP success is not shown in the matrix
+tables because in this run the matrix rows all had verified attribution; it is
+shown for the one failback row where attribution was unavailable.
 
 **A-first** (run 4, 9 policies × {Reality-TCP-only failure, whole-VPS-A outage}):
 
@@ -139,9 +194,9 @@ Policy i3/t1000, A-first terminal (run 4):
 | Row | Measured result |
 |---|---|
 | Idle-HY2 negative control (kill A-HY2 while Reality/selected is healthy) | first health evidence T1 = 2946.9 ms; **switches = 0**; final selection `Reality`; the dead HY2 was never selected/carried |
-| HY2 actually selected, then killed (first kill A-Reality, then A-HY2) | T1 = 922.0 ms; T2 = 1687.0 ms through `Backup-Reality`; switches = 1 |
+| HY2 actually selected, then killed (first kill A-Reality, then A-HY2) | T1 = 922.0 ms; verified T2 = 1687.0 ms through `Backup-Reality`; switches = 1 |
 | HY2 restart recovery (kill only A-HY2, restart it) | recovered = yes; **fault→recovered-candidate = 32453.0 ms**, **restart→usable = 22390.0 ms**, a second fault→fresh-route = 18890.0 ms |
-| Second fault injected during the HY2 recovery window | T1 = 586.4 ms; fresh route T2 = 328.0 ms through `Backup-Reality`; switches = 0; dead-node window 0 ms |
+| Second fault injected during the HY2 recovery window | T1 = 586.4 ms; verified T2 = 328.0 ms through `Backup-Reality`; switches = 0; dead-node window 0 ms |
 
 The ~32 s fault→usable window is the known stale-QUIC-session effect (client
 keeps the old Hysteria2 QUIC connection until its idle timeout), **not** a
@@ -157,7 +212,7 @@ range (run 4):
 | Row | Measured result |
 |---|---|
 | Kill one hop port (`A-HY2-hop-24018`) | 19 fresh successes / 2 failures; the client continued to reach the HY2 node over the remaining hop ports (`hop-continued`); no complete business interruption was needed to move away from the single blocked port |
-| Kill the whole A-HY2 listener set (11 processes: base + hop range) | T2 = 250.0 ms through `Backup-Reality`; switches = 0 (the fresh connection moved in-dial; no group-selection change was recorded in this single run) |
+| Kill the whole A-HY2 listener set (11 processes: base + hop range) | verified T2 = 250.0 ms through `Backup-Reality`; switches = 0 (the fresh connection moved in-dial; no group-selection change was recorded in this single run) |
 
 The single-port row is the intended "port hopping hides a single blocked port"
 negative control. The whole-HY2 row is the "global UDP impairment must not be
@@ -182,9 +237,9 @@ Run 4:
 
 | Row | Measured result |
 |---|---|
-| First interruption (whole VPS A) | T1 UNKNOWN (not captured); T2 = 250.0 ms through `Backup-Reality`; switches = 0 in the sampled window (in-dial move) |
+| First interruption (whole VPS A) | T1 UNKNOWN (not captured); verified T2 = 250.0 ms through `Backup-Reality`; switches = 0 in the sampled window (in-dial move) |
 | Failback after A restore | failback observed = yes in 515.0 ms; switches in the post-restore window = 0; fresh-probe failures in the window = 0 |
-| Second interruption (fail the actually-current path after failback) | T1 = 1235.0 ms; T2 = 1485.0 ms; **chain attribution for that T2 was unavailable (UNKNOWN)**; switches = 1; final selection `Hysteria2`; no T0-dead node was selected at the end |
+| Second interruption (fail the actually-current path after failback) | T1 = 1235.0 ms; earliest raw fresh HTTP success = **1485.0 ms but the `/connections` chain was unavailable, so T2 is UNKNOWN** and is not counted as a switch success; switches = 1; final selection `Hysteria2`; no T0-dead node was selected at the end |
 
 The second fault did not leave a dead node selected and did not create a
 recovery claim; the missing chain attribution on that one T2 is reported as
@@ -246,9 +301,10 @@ and NOT MEASURED.
 - **Common outage:** both VPSes down produced no false recovery (0/8 fresh
   attempts); stale selections were not accepted as success.
 - **Failback** took 515 ms with 0 switches and 0 probe failures in the sampled
-  window; the second interruption rerouted in ~1.5 s with no T0-dead node
-  selected at the end, but chain attribution for that one T2 was UNKNOWN. A
-  >=10 min stability window is not measured.
+  window. The second interruption produced a raw fresh HTTP success at 1.485 s
+  but no `/connections` chain, so its **T2 is UNKNOWN and it is not counted as
+  a switch success**; no T0-dead node was selected at the end. A >=10 min
+  stability window is not measured.
 - **N02 is invisible to native liveness** (18/18 health 204s, 0 switches while
   the upload stalled), which is the measured gap to hand to HA-06; it is not a
   quality verdict.
@@ -295,5 +351,7 @@ python3 tests/mihomo-competition-ha4-lab.py --scenario all \
 
 Raw evidence (`results.json`, JSONL event logs, runtime configs and logs, all
 loopback/synthetic) is written under the lab directory by the harness; the
-summary tables above are taken from that run. The harness refuses busy ports,
-missing/wrong binaries and non-loopback bindings.
+summary tables above are taken from that run. The corrected-classifier
+confirmation run is in `.scratch/ha04-lab-review/` and the separate clean B-first
+matrix in `.scratch/ha04-lab-b/`. The harness refuses busy ports, missing/wrong
+binaries and non-loopback bindings.

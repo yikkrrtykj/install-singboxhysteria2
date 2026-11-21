@@ -493,6 +493,8 @@ OUT1="$T1/variant/event-ob01-ha4f.yaml"
 MAN1="$(h4_manifest "$T1/variant")"
 assert_file "$OUT1" 'T1 variant profile exists'
 assert_file "$MAN1" 'T1 variant manifest exists'
+assert_eq 'ha4-fastprobe-ha-r1-i3-t1000.json' "$(basename "$MAN1")" \
+    'T1 manifest filename encodes config version and policy'
 assert_eq "$SRC1_HASH" "$(sha256 "$SRC1")" 'T1 HA-03 source profile byte-unchanged'
 assert_eq "$HA03_MAN_HASH" "$(sha256 "$HA03_MAN")" 'T1 HA-03 source manifest byte-unchanged'
 assert_eq "$HA02_MAN_HASH" "$(sha256 "$HA02_MAN")" 'T1 HA-02 manifest byte-unchanged'
@@ -778,8 +780,8 @@ run_check
 restore_variant
 manifest_edit 'doc["policy"]["interval"] = 5'
 run_check
-[ "$RC" -ne 0 ] && [ "${ERR1#ha4-fastprobe: FAIL E_TRANSFORM}" != "$ERR1" ] \
-    && pass 'T5f manifest policy change cannot pass preflight' \
+[ "$RC" -ne 0 ] && [ "${ERR1#ha4-fastprobe: FAIL E_DELIVERY}" != "$ERR1" ] \
+    && pass 'T5f manifest policy change is refused by the filename binding' \
     || fail "T5f (rc=$RC stderr=[$ERR])"
 restore_variant
 manifest_edit 'e = doc["terminals"][0]
@@ -795,6 +797,25 @@ run_check
 [ "$RC" -ne 0 ] && [ "$ERR1" = 'ha4-fastprobe: FAIL E_DELIVERY_HASH role=source-manifest' ] \
     && pass 'T5g2 manifest source-manifest hash tamper refused' \
     || fail "T5g2 (rc=$RC stderr=[$ERR])"
+restore_variant
+mv "$CMAN" "$C/variant/ha4-fastprobe-ha-r1-i5-t2000.json"
+[ "$POSIX_HOST" = "1" ] && chmod 600 "$C/variant/ha4-fastprobe-ha-r1-i5-t2000.json"
+run_check
+[ "$RC" -ne 0 ] && [ "${ERR1#ha4-fastprobe: FAIL E_DELIVERY}" != "$ERR1" ] \
+    && pass 'T5g3 manifest filename policy suffix mismatch refused' \
+    || fail "T5g3 (rc=$RC stderr=[$ERR])"
+restore_variant
+manifest_edit 'doc["generator"]["config_version"] = "other-version"'
+run_check
+[ "$RC" -ne 0 ] && [ "${ERR1#ha4-fastprobe: FAIL E_DELIVERY}" != "$ERR1" ] \
+    && pass 'T5g4 manifest config-version/filename mismatch refused' \
+    || fail "T5g4 (rc=$RC stderr=[$ERR])"
+restore_variant
+manifest_edit 'doc["generator"]["version"] = "99"'
+run_check
+[ "$RC" -ne 0 ] && [ "${ERR1#ha4-fastprobe: FAIL E_DELIVERY}" != "$ERR1" ] \
+    && pass 'T5g5 manifest generator version mismatch refused' \
+    || fail "T5g5 (rc=$RC stderr=[$ERR])"
 restore_variant
 cp "$COUT" "$C/variant/extra-ha4f.yaml"
 [ "$POSIX_HOST" = "1" ] && chmod 600 "$C/variant/extra-ha4f.yaml"
@@ -1021,6 +1042,114 @@ if [ -n "$CORE" ]; then
 else
     skip 'T8 pinned-core fast-probe load (set HA04_MIHOMO/HA03_MIHOMO/HA02_MIHOMO)'
 fi
+
+# ---------------------------------------- T9 LAB T2 classifier regression ---
+section 'T9 LAB T2 attribution classifier (contract N07 / T2)'
+T9OUT=$("$PY" - "$ROOT/tests/mihomo-competition-ha4-lab.py" <<'PY'
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("ha04lab", sys.argv[1])
+lab = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(lab)
+
+T0 = 100.0
+bad = []
+
+
+def attempt(t0, t1, ok=True, code=204, chain=None):
+    return {"t0": t0, "t1": t1, "ok": ok, "code": code, "chain": chain,
+            "chains_all": None, "elapsed_ms": (t1 - t0) * 1000.0}
+
+
+def check(label, condition, detail=""):
+    if not condition:
+        bad.append(label + ((":" + detail) if detail else ""))
+
+
+def chain(node):
+    return [node, "自动选择", "节点选择"]
+
+
+missing = lab.classify_t2([attempt(101, 101.3)], T0, "Reality")
+check("missing-status", missing["T2_status"] == "UNKNOWN_PATH",
+      missing["T2_status"])
+check("missing-T2-none", missing["T2"] is None)
+check("missing-http-recorded",
+      (missing["first_fresh_http"] or {}).get("t_ms") == 1300.0,
+      repr(missing["first_fresh_http"]))
+
+wrong = lab.classify_t2([attempt(101, 101.2, chain=chain("Hysteria2"))],
+                        T0, "Reality")
+check("wrong-status", wrong["T2_status"] == "WRONG_CANDIDATE",
+      wrong["T2_status"])
+check("wrong-T2-none", wrong["T2"] is None)
+
+right = lab.classify_t2([attempt(102, 102.4, chain=chain("Reality"))],
+                        T0, "Reality")
+check("verified-status", right["T2_status"] == "VERIFIED", right["T2_status"])
+check("verified-dt", (right["T2"] or {}).get("dt_ms") == 2400.0,
+      repr(right["T2"]))
+
+sequence = lab.classify_t2([
+    attempt(101, 101.2),
+    attempt(101.5, 101.7, chain=chain("Hysteria2")),
+    attempt(102, 102.4, chain=chain("Reality")),
+], T0, "Reality")
+check("later-verified",
+      sequence["T2_status"] == "VERIFIED"
+      and (sequence["T2"] or {}).get("dt_ms") == 2400.0,
+      repr(sequence["T2"]))
+check("later-candidates", len(sequence["T2_candidates"]) == 3)
+
+in_flight = lab.classify_t2([attempt(99, 101.5, chain=chain("Reality"))],
+                            T0, "Reality")
+check("in-flight-ignored", in_flight["T2_status"] == "NOT_MEASURED",
+      in_flight["T2_status"])
+
+unexpected = lab.classify_t2([attempt(101, 101.2, chain=chain("Hysteria2"))],
+                             T0, None)
+check("both-down-unexpected",
+      unexpected["T2_status"] == "UNEXPECTED_SUCCESS"
+      and unexpected["T2"] is None)
+
+check("verdict-map",
+      lab.trial_verdict_for("VERIFIED", "Reality") == "FRESH_SUCCESS"
+      and lab.trial_verdict_for("UNKNOWN_PATH", "Reality") == "T2_UNKNOWN_PATH"
+      and lab.trial_verdict_for("WRONG_CANDIDATE", "Reality") == "WRONG_CANDIDATE"
+      and lab.trial_verdict_for("UNEXPECTED_SUCCESS", None) == "UNEXPECTED_SUCCESS"
+      and lab.trial_verdict_for("NOT_MEASURED", None)
+      == "NO_FRESH_SUCCESS_EXPECTED_OUTAGE")
+
+
+class FakePoller(object):
+    samples = []
+
+
+class FakeSession(object):
+    def __init__(self, attempts):
+        self.poller = FakePoller()
+        self.prober = type("P", (object,), {"attempts": attempts})()
+
+    def health_checks(self):
+        return []
+
+
+analysis = lab.analyze_session(
+    FakeSession([attempt(101, 101.3)]), T0, T0 + 5.0,
+    baseline_selection="Reality", dead_nodes=["Reality"],
+    expected_node="Hysteria2", baseline_alive={"Reality": True},
+    terminal_group="A-first")
+check("analysis-missing-T2-none", analysis["T2"] is None)
+check("analysis-missing-status", analysis["T2_status"] == "UNKNOWN_PATH",
+      analysis["T2_status"])
+check("analysis-http-recorded",
+      (analysis["first_fresh_http"] or {}).get("t_ms") == 1300.0)
+
+print("ok" if not bad else ";".join(bad))
+PY
+)
+assert_eq 'ok' "$T9OUT" 'T9 LAB T2 classifier matches the acceptance contract'
 
 # ------------------------------------------------------------------ summary --
 section 'summary'

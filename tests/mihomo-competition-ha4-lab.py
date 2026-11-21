@@ -1757,6 +1757,97 @@ def _chain_node(attempt):
     return None
 
 
+# T2 contract statuses (HA acceptance contract: fresh useful response *via the
+# intended surviving candidate with path attribution*; N07: missing/mismatched
+# route data is UNKNOWN, never a success).
+T2_VERIFIED = "VERIFIED"
+T2_UNKNOWN_PATH = "UNKNOWN_PATH"
+T2_WRONG_CANDIDATE = "WRONG_CANDIDATE"
+T2_UNEXPECTED_SUCCESS = "UNEXPECTED_SUCCESS"
+T2_NOT_MEASURED = "NOT_MEASURED"
+
+
+def _fresh_useful_attempt(attempt, t0):
+    """A T2 candidate must be fresh (started AND finished after T0) and useful."""
+    return (attempt.get("t0") is not None and attempt["t0"] >= t0
+            and attempt.get("t1") is not None and attempt["t1"] >= t0
+            and attempt.get("ok") is True)
+
+
+def _attempt_audit(attempt, t0):
+    chain_node = _chain_node(attempt)
+    return {
+        "t": attempt["t1"],
+        "t_ms": round(ms(t0, attempt["t1"]), 1),
+        "code": attempt.get("code"),
+        "elapsed_ms": attempt.get("elapsed_ms"),
+        "chain": attempt.get("chain"),
+        "chains_all": attempt.get("chains_all"),
+        "chain_node": chain_node,
+        "attribution_present": chain_node is not None,
+    }
+
+
+def classify_t2(attempts, t0, expected_node):
+    """Contract-correct T2 classification.
+
+    A **verified T2** requires a fresh useful HTTP response (started and
+    completed after T0) AND an independent /connections attribution to the
+    expected surviving candidate. The earliest raw fresh HTTP success is kept
+    separately in ``first_fresh_http`` even when it cannot be attributed, but it
+    is NOT counted as T2. Missing attribution => UNKNOWN_PATH; attribution to a
+    different node => WRONG_CANDIDATE; a success when no surviving candidate was
+    expected => UNEXPECTED_SUCCESS (never a recovery claim).
+    """
+    fresh = [attempt for attempt in attempts
+             if _fresh_useful_attempt(attempt, t0)]
+    result = {
+        "first_fresh_http": None,
+        "T2": None,
+        "T2_status": (T2_NOT_MEASURED if not fresh else T2_UNKNOWN_PATH),
+        "T2_candidates": [],
+    }
+    if fresh:
+        result["first_fresh_http"] = _attempt_audit(fresh[0], t0)
+    for attempt in fresh:
+        audit = _attempt_audit(attempt, t0)
+        result["T2_candidates"].append(audit)
+        chain_node = audit["chain_node"]
+        if chain_node is None:
+            continue
+        if expected_node is None:
+            result["T2_status"] = T2_UNEXPECTED_SUCCESS
+            continue
+        if chain_node != expected_node:
+            if result["T2_status"] != T2_VERIFIED:
+                result["T2_status"] = T2_WRONG_CANDIDATE
+            continue
+        result["T2"] = dict(audit)
+        result["T2"].update({
+            "dt_ms": audit["t_ms"],
+            "attribution_matches_expected": True,
+            "expected_node": expected_node,
+        })
+        result["T2_status"] = T2_VERIFIED
+        break
+    return result
+
+
+def trial_verdict_for(t2_status, expected_node):
+    """Map the measured T2 status to the trial verdict (no invented success)."""
+    if t2_status == T2_VERIFIED:
+        return "FRESH_SUCCESS"
+    if t2_status == T2_UNKNOWN_PATH:
+        return "T2_UNKNOWN_PATH"
+    if t2_status == T2_WRONG_CANDIDATE:
+        return "WRONG_CANDIDATE"
+    if t2_status == T2_UNEXPECTED_SUCCESS:
+        return "UNEXPECTED_SUCCESS"
+    if expected_node is None:
+        return "NO_FRESH_SUCCESS_EXPECTED_OUTAGE"
+    return "NO_FRESH_SUCCESS"
+
+
 # --------------------------------------------------------------------------
 # measurement sessions: 50 ms selection poller + fresh end-to-end prober
 # --------------------------------------------------------------------------
@@ -1930,39 +2021,24 @@ def analyze_session(session: Session, t0: float, t1_window_end: float,
                        else ms(t0, first_false),
                        "still_alive_true_at_window_end": first_false is None}
     out["stale_alive"] = stale
-    # ---- T2: first fresh end-to-end success + real chain attribution ----
-    # A "fresh" connection must have been BOTH started and completed after T0;
-    # an attempt already in flight when the fault hit is not evidence.
-    t2 = None
-    for attempt in attempts:
-        if (attempt["t1"] is not None and attempt["t1"] >= t0
-                and attempt.get("t0") is not None and attempt["t0"] >= t0
-                and attempt["ok"]):
-            chain_node = _chain_node(attempt)
-            t2 = {"t": attempt["t1"], "dt_ms": ms(t0, attempt["t1"]),
-                  "code": attempt["code"],
-                  "elapsed_ms": attempt["elapsed_ms"],
-                  "chain": attempt["chain"],
-                  "chain_node": chain_node,
-                  "selection": attempt.get("selection"),
-                  "wrong_dead_node_carried": (chain_node in dead
-                                              if chain_node else None),
-                  "expected_node": expected_node}
-            if expected_node is not None:
-                if chain_node is None:
-                    t2["attribution_matches_expected"] = None
-                    t2["attribution_note"] = (
-                        "fresh success observed but /connections attribution "
-                        "was unavailable for that attempt")
-                else:
-                    t2["attribution_matches_expected"] = (
-                        chain_node == expected_node)
-                    if not t2["attribution_matches_expected"]:
-                        t2["attribution_note"] = (
-                            "first fresh success did not run through the "
-                            "expected surviving candidate")
-            break
+    # ---- T2: verified fresh success via the expected surviving node ------
+    # Contract: T2 requires a fresh useful response AND an independent
+    # /connections attribution to the expected surviving candidate. The earliest
+    # raw fresh HTTP success is recorded separately (first_fresh_http) even when
+    # it cannot be attributed; it never counts as T2 on its own.
+    classification = classify_t2(attempts, t0, expected_node)
+    t2 = classification["T2"]
+    if t2 is not None:
+        t2["wrong_dead_node_carried"] = (
+            t2.get("chain_node") in dead if t2.get("chain_node") else None)
+        t2["selection"] = None
     out["T2"] = t2
+    out["T2_status"] = classification["T2_status"]
+    out["first_fresh_http"] = classification["first_fresh_http"]
+    out["T2_candidates"] = classification["T2_candidates"]
+    if (out["first_fresh_http"] is not None
+            and out["first_fresh_http"].get("chain_node") in dead):
+        out["first_fresh_http"]["wrong_dead_node_carried"] = True
     # ---- dead-node selected window and switch count ---------------------
     runs = []
     active = None
@@ -2189,17 +2265,8 @@ def run_trial(lab: Lab, m: Mihomo, session: Session, group: str,
         dead_nodes=dead_nodes, expected_node=expected_node,
         baseline_alive=baseline_sample["alive"] or {},
         terminal_group=group)
-    if analysis["T2"] is not None:
-        matches = analysis["T2"].get("attribution_matches_expected")
-        if expected_node is None or matches is None:
-            verdict = "FRESH_SUCCESS"
-        elif matches:
-            verdict = "FRESH_SUCCESS"
-        else:
-            verdict = "FRESH_SUCCESS_WRONG_CANDIDATE"
-    else:
-        verdict = ("NO_FRESH_SUCCESS_EXPECTED_OUTAGE"
-                   if expected_node is None else "NO_FRESH_SUCCESS")
+    t2_status = analysis.get("T2_status", T2_NOT_MEASURED)
+    verdict = trial_verdict_for(t2_status, expected_node)
     trial = {
         "kind": kind, "target_logical_nodes": list(dead_nodes),
         "target_listeners": list(target_listeners),
@@ -2212,7 +2279,8 @@ def run_trial(lab: Lab, m: Mihomo, session: Session, group: str,
         "baseline_alive_at_fault": baseline_sample["alive"] or {},
         "observation_end_mono": obs_end,
         "trial_verdict": verdict,
-        "successes_after_T0": sum(
+        "T2_status": t2_status,
+        "raw_http_successes_after_T0": sum(
             1 for a in session.prober.attempts
             if a["ok"] and a["t1"] is not None and a["t1"] >= t0),
         "attempts_after_T0": sum(
@@ -2220,10 +2288,15 @@ def run_trial(lab: Lab, m: Mihomo, session: Session, group: str,
             if a["t1"] is not None and a["t1"] >= t0),
     }
     trial.update(analysis)
+    event_t2 = trial["T2"] or {}
+    first_http = trial.get("first_fresh_http") or {}
     lab.ev.event("trial_result", tag=tag, kind=kind, verdict=verdict,
                  T1_ms=(trial["T1"] or {}).get("dt_ms"),
-                 T2_ms=(trial["T2"] or {}).get("dt_ms"),
-                 chain=(trial["T2"] or {}).get("chain"),
+                 T2_status=t2_status,
+                 T2_ms=event_t2.get("dt_ms"),
+                 chain=event_t2.get("chain"),
+                 first_fresh_http_ms=first_http.get("t_ms"),
+                 first_fresh_http_chain_node=first_http.get("chain_node"),
                  switches=trial["switch_count"],
                  dead_window_ms=trial["dead_node_selected"]["total_ms"])
     return trial
@@ -2693,8 +2766,11 @@ def scenario_outage(lab: Lab):
             while now() < deadline:
                 time.sleep(0.1)
             obs_end = now()
+            # Only connections BOTH started and completed after T0 count; an
+            # in-flight attempt inherited from before the fault is not fresh.
             attempts = [a for a in session.prober.attempts
-                        if a["t1"] is not None and a["t1"] >= t0]
+                        if a.get("t0") is not None and a["t0"] >= t0
+                        and a["t1"] is not None and a["t1"] >= t0]
             successes = [a for a in attempts if a["ok"]]
             samples = [s for s in session.poller.samples
                        if "error" not in s and s["t"] >= t0]
@@ -2872,6 +2948,7 @@ SCENARIOS = {
 
 
 def _matrix_row(label: str, policy: dict, trial: dict) -> dict:
+    first_http = trial.get("first_fresh_http") or {}
     return {
         "label": label,
         "interval_s": policy.get("interval"),
@@ -2883,8 +2960,13 @@ def _matrix_row(label: str, policy: dict, trial: dict) -> dict:
         "T2_ms": (trial.get("T2") or {}).get("dt_ms"),
         "T2_node": (trial.get("T2") or {}).get("chain_node"),
         "T2_chain": (trial.get("T2") or {}).get("chain"),
+        "T2_status": trial.get("T2_status"),
         "T2_attribution_ok": (trial.get("T2") or {}).get(
             "attribution_matches_expected"),
+        "first_fresh_http_ms": first_http.get("t_ms"),
+        "first_fresh_http_node": first_http.get("chain_node"),
+        "raw_http_successes_after_T0": trial.get(
+            "raw_http_successes_after_T0"),
         "dead_node_window_ms": (trial.get("dead_node_selected") or {}).get(
             "total_ms"),
         "switch_count": trial.get("switch_count"),
@@ -2943,6 +3025,9 @@ def build_aggregate(lab: Lab) -> dict:
                 "T1_ms": (sel.get("T1") or {}).get("dt_ms"),
                 "T2_ms": (sel.get("T2") or {}).get("dt_ms"),
                 "T2_node": (sel.get("T2") or {}).get("chain_node"),
+                "T2_status": sel.get("T2_status"),
+                "first_fresh_http_ms": (sel.get("first_fresh_http")
+                                        or {}).get("t_ms"),
                 "switches": sel.get("switch_count"),
             })
         rec = row.get("hy2_recovery")
@@ -2961,6 +3046,9 @@ def build_aggregate(lab: Lab) -> dict:
                 "T1_ms": (second.get("T1") or {}).get("dt_ms"),
                 "T2_ms": (second.get("T2") or {}).get("dt_ms"),
                 "T2_node": (second.get("T2") or {}).get("chain_node"),
+                "T2_status": second.get("T2_status"),
+                "first_fresh_http_ms": (second.get("first_fresh_http")
+                                        or {}).get("t_ms"),
                 "switches": second.get("switch_count"),
                 "dead_window_ms": (second.get("dead_node_selected") or {}).get("total_ms"),
             })
@@ -2975,6 +3063,9 @@ def build_aggregate(lab: Lab) -> dict:
                        "T1_ms": (first.get("T1") or {}).get("dt_ms"),
                        "T2_ms": (first.get("T2") or {}).get("dt_ms"),
                        "T2_node": (first.get("T2") or {}).get("chain_node"),
+                       "T2_status": first.get("T2_status"),
+                       "first_fresh_http_ms": (first.get("first_fresh_http")
+                                               or {}).get("t_ms"),
                        "switches": first.get("switch_count")})
         fallback = row.get("failback") or {}
         win = row.get("post_failback_30s_window") or {}
@@ -2989,6 +3080,9 @@ def build_aggregate(lab: Lab) -> dict:
                        "T1_ms": (second.get("T1") or {}).get("dt_ms"),
                        "T2_ms": (second.get("T2") or {}).get("dt_ms"),
                        "T2_node": (second.get("T2") or {}).get("chain_node"),
+                       "T2_status": second.get("T2_status"),
+                       "first_fresh_http_ms": (second.get("first_fresh_http")
+                                               or {}).get("t_ms"),
                        "switches": second.get("switch_count"),
                        "final_selection": row.get("final_selection"),
                        "t0_dead_selected_at_end": row.get(
@@ -3020,6 +3114,9 @@ def build_aggregate(lab: Lab) -> dict:
             "single_port_verdict": single.get("verdict"),
             "whole_hy2_T2_ms": (whole.get("T2") or {}).get("dt_ms"),
             "whole_hy2_T2_node": (whole.get("T2") or {}).get("chain_node"),
+            "whole_hy2_T2_status": whole.get("T2_status"),
+            "whole_hy2_first_fresh_http_ms": (whole.get("first_fresh_http")
+                                              or {}).get("t_ms"),
             "whole_hy2_switches": whole.get("switch_count"),
         })
     agg["tables"]["hopping"] = hop
@@ -3084,14 +3181,17 @@ def print_summary(lab: Lab, agg: dict):
              agg["counts"]["runs_error"], agg["counts"]["trials"]))
     matrix = agg["tables"]["matrix"]
     if matrix:
-        print("\n-- MATRIX (T0 -> T1 / T0 -> T2, ms; dead-node window; switches) --")
-        print("%-32s %-5s %-6s %8s %8s %8s %10s %6s %s"
-              % ("row", "int", "tout", "T1", "T2", "T2node",
+        print("\n-- MATRIX (T0 -> T1 / verified T0 -> T2; raw first HTTP; "
+              "dead-node window; switches) --")
+        print("%-30s %-4s %-6s %8s %8s %8s %-17s %10s %5s %s"
+              % ("row", "int", "tout", "T1", "T2", "1stHTTP", "T2status",
                  "deadWin", "sw", "verdict"))
         for entry in matrix:
-            print("%-32s %-5s %-6s %8s %8s %8s %10s %6s %s"
+            print("%-30s %-4s %-6s %8s %8s %8s %-17s %10s %5s %s"
                   % (entry["label"], entry["interval_s"], entry["timeout_ms"],
-                     entry["T1_ms"], entry["T2_ms"], entry["T2_node"],
+                     entry["T1_ms"], entry["T2_ms"],
+                     entry.get("first_fresh_http_ms"),
+                     entry.get("T2_status"),
                      entry["dead_node_window_ms"], entry["switch_count"],
                      entry["verdict"]))
     if agg["tables"]["hy2"]:

@@ -118,6 +118,13 @@ and SHA-256, output file name/SHA-256/bytes, and the rollback file list. It
 contains no addresses, UUIDs, passwords or profile bodies. Protect it like the
 profile files.
 
+**Audit binding:** the file name itself must encode the same metadata as the
+manifest: `ha4-fastprobe-<generator.config_version>-i<policy.interval>-t<policy.timeout>.json`.
+`--check` rejects a manifest whose name does not match its recorded config
+version or whose `-iN-tM` suffix does not match the recorded policy, and it also
+requires the recorded generator tool name and version. This prevents a mislabeled
+interval/timeout delivery from being audited under the wrong policy.
+
 The manifest is a local trusted record, not a cryptographic authenticity claim.
 The authoritative preflight is the re-derivation chain above (HA-02 bytes →
 HA-03 bytes → HA-04 bytes); a local operator who rewrites every input and every
@@ -135,8 +142,13 @@ contract markers and matrix; in particular:
   button/command alone is not T0).
 - **T1** first client observation of the failure/degradation (timestamped
   health-check/selection evidence), absent detection is UNKNOWN, not invented.
-- **T2** first fresh connection through the intended surviving candidate, with
-  path/chain attribution; a reused keep-alive or a cached page is not T2.
+- **T2** a **verified** T2 requires a fresh connection (started and completed
+  after T0) with a useful response **and** an independent path/chain attribution
+  to the intended surviving candidate. Missing attribution is recorded
+  separately as a raw fresh-HTTP success and stays UNKNOWN, never T2; an
+  attribution to a different candidate is `WRONG_CANDIDATE` and is not a switch
+  success; a fresh success when no survivor is expected (both VPSes down) is
+  `UNEXPECTED_SUCCESS`. A reused keep-alive or cached page is not T2.
 - **T3** earliest verified usable application service — the three real apps are
   HA-05 evidence; loopback LAB has **no T3** and must never report one.
 - Report T0→T1, T0→T2 and T0→T3 separately; do not mix "fault→new surviving
@@ -225,7 +237,7 @@ Fixed codes on stderr, exit 1 (`E_USAGE` exits 2):
 
 | Code | Meaning |
 | --- | --- |
-| `E_DELIVERY` | HA-03/HA-04 manifest missing/ambiguous/duplicate-key/invalid names, counts, roles or file set; different source manifest |
+| `E_DELIVERY` | HA-03/HA-04 manifest missing/ambiguous/duplicate-key/invalid names, counts, roles or file set; different source manifest; manifest filename/config-version/policy binding mismatch |
 | `E_DELIVERY_HASH` | HA-02/HA-03 source profile or HA-04 output no longer matches its recorded size/SHA-256 (`role=source-manifest` for a different HA-03 manifest) |
 | `E_TRANSFORM` | source is not the expected generic shape, the variant is not the byte-exact deterministic overlay of the trusted HA-03 source, or a security invariant fails |
 | `E_OUTPUT_EXISTS` | target variant or manifest already exists (case-insensitive) |
@@ -244,10 +256,14 @@ identity and bytes. Nothing pre-existing is touched.
 
 Verified by the hermetic contract suite: exact two-line overlay and byte identity
 of every other line; A-first/B-first mapping preserved; 9-policy matrix; 1/2/30
-terminal batches; manifest source binding; HA-03 source tamper/new-source
-refusal; re-hashed extra listener/interval/LAN/skip-cert tamper refusal;
-casefold/uppercase file-set gates; permission and path gates; overlay shape
-refusals; partial-write rollback; pinned-core load of 39 generated variants.
+terminal batches; manifest source binding; manifest filename/config-version/
+policy binding and its tamper negative; HA-03 source tamper/new-source refusal;
+re-hashed extra listener/interval/LAN/skip-cert tamper refusal; casefold/
+uppercase file-set gates; permission and path gates; overlay shape refusals;
+partial-write rollback; the LAB T2 classifier contract (verified T2 only with
+expected-node attribution; missing attribution = UNKNOWN, wrong node =
+WRONG_CANDIDATE, both-down success = UNEXPECTED_SUCCESS, in-flight attempts
+ignored); pinned-core load of 39 generated variants.
 
 **Not verified here (BLOCKED on operator resources):** the real Windows
 PC + Clash Verge Rev + its bundled Mihomo version; real VPS/WAN RTT, ISP/GFW
