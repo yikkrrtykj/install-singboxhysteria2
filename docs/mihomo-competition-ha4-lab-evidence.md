@@ -23,9 +23,10 @@ time" is not a 10 s acceptance measurement.
 - sing-box: `1.14.3 windows amd64`, SHA-256
   `5c19bb3f8c12d4e85b3d47fe63123a7624b314b58dd7a8e32f51004f1c4d2faf`.
 - The harness verifies both hashes before running and refuses a mismatch.
-- Run metadata: primary run (`--scenario all`) started 2026-11-21T08:24:29Z,
-  duration 536.8 s, Python 3.12.14; the separate clean B-first matrix run took
-  234.3 s. Both runs finished with `ports_free: true`,
+- Run metadata: primary run (`--scenario all`) started 2026-11-21T08:23:46.064Z
+  (`started_utc` in its `results.json`; the fixture stack came up at
+  08:24:29.002Z), duration 536.8 s, Python 3.12.14; the separate clean B-first
+  matrix run took 234.3 s. Both runs finished with `ports_free: true`,
   `processes_stopped: true` and no leftover listeners.
 - Fixture: two logical VPSes (A=`127.0.0.1`, B=`127.0.0.2`), each with an
   independent REALITY TCP listener and Hysteria2 UDP listener, plus the A-side
@@ -61,11 +62,13 @@ Everything else — the four nodes and their order, the probe policy under test,
   `null` T1 means no qualifying observation was captured in the window
   (UNKNOWN), not "no fault".
 - **T2**: a **verified** T2 requires ALL of: (a) a fresh end-to-end SOCKS probe
-  with a useful HTTP response (204 from the loopback origin) whose request was
-  both started and completed after T0; (b) an independent `/connections` chain
-  attribution; and (c) that attributed node is the expected surviving candidate
-  for the trial. A missing attribution is recorded separately as
-  `first_fresh_http` with `T2_status=UNKNOWN_PATH` and is **never counted as
+  with a useful HTTP response whose request was both started and completed after
+  T0 (the LAB fresh probe is a `GET /hold` through the selected chain and the
+  loopback origin returns HTTP **200**; the probe treats 200/204 as useful — the
+  204 health URL is only the health-check target); (b) an independent
+  `/connections` chain attribution; and (c) that attributed node is the expected
+  surviving candidate for the trial. A missing attribution is recorded separately
+  as `first_fresh_http` with `T2_status=UNKNOWN_PATH` and is **never counted as
   T2**; an attribution to another node is `WRONG_CANDIDATE` and is **not a
   switch success**; a fresh success when no surviving candidate is expected
   (both VPSes down) is `UNEXPECTED_SUCCESS`, never a recovery. An in-flight or
@@ -86,12 +89,20 @@ the `/connections` chain was missing or pointed elsewhere. That was corrected
 after review with the classifier above and the raw evidence was re-examined
 rather than re-run: the matrix rows already recorded
 `T2_attribution_ok = true` (chain node = expected surviving candidate); the
-selected-HY2 / hopping / first-interruption rows recorded chain nodes equal to
-their expected surviving candidate. The only affected row is the failback
-**second interruption**, whose chain was unavailable; it is reclassified to
-T2 UNKNOWN below. No timing was shifted and no cell was re-measured; unavailable
-data stays UNKNOWN. The classifier now has hermetic regression tests in the
-HA-04 contract suite.
+selected-HY2 / hopping / first-interruption table rows recorded chain nodes
+equal to their expected surviving candidate. The only affected **tabulated**
+row is the failback **second interruption**, whose chain was unavailable; it is
+reclassified to T2 UNKNOWN below.
+
+An exhaustive re-scan of the original raw run also found one **untabulated**
+old-classifier `FRESH_SUCCESS` with no attribution: the hopping scenario's
+setup trial `runs[17].to_hy2` (A-Reality TCP failure, expected `Hysteria2`,
+T2 1266.0 ms, no chain). It never appeared in the report tables, and under the
+corrected classifier it is `UNKNOWN_PATH` with a raw fresh-HTTP time of
+1266.0 ms — it is disclosed here as UNKNOWN rather than presented as a measured
+T2. No timing was shifted and no cell was re-measured; unavailable data stays
+UNKNOWN. The classifier now has hermetic regression tests in the HA-04 contract
+suite.
 
 ### Post-fix confirmation run (classifier check, not a replacement)
 
@@ -143,7 +154,9 @@ every listed matrix value had `chain_node = expected surviving candidate`
 (`T2_attribution_ok = true`), so no raw-HTTP-only value appears as T2 here. The
 separately recorded raw first fresh HTTP success is not shown in the matrix
 tables because in this run the matrix rows all had verified attribution; it is
-shown for the one failback row where attribution was unavailable.
+shown for the one failback row where attribution was unavailable (plus the
+untabulated hopping setup trial disclosed in the correction note above, which
+stays UNKNOWN).
 
 **A-first** (run 4, 9 policies × {Reality-TCP-only failure, whole-VPS-A outage}):
 
@@ -272,11 +285,13 @@ and NOT MEASURED.
   connection-refused class. It must not be read as "detection in <400 ms".
 - **Whole-VPS outage keeps a dead node selectable for a timeout-dependent
   window.** The measured dead-node selected window was ~2.03-2.11 s at
-  `timeout=1000`, ~2.94 s at `2000` and ~5.88-5.92 s at `5000`; total T0→T2 was
-  2.70-7.50 s and a typical row recorded 2 switches (transient selection of the
-  also-dead same-VPS HY2, then the live backup). Longer timeout trades a longer
-  dead-node window for fewer premature failures; this single-repetition LAB does
-  not quantify the real-WAN false-positive trade.
+  `timeout=1000`, ~2.94 s at `2000` and ~5.88-5.92 s at `5000` for the rows that
+  selected the dead node; total T0→T2 was 0.28-7.50 s (one i3/t1000 cell moved
+  in-dial in 282 ms with a 0 ms dead-node window; 7/9 cells were 2.70-7.50 s) and
+  a typical row recorded 2 switches (transient selection of the also-dead
+  same-VPS HY2, then the live backup). Longer timeout trades a longer dead-node
+  window for fewer premature failures; this single-repetition LAB does not
+  quantify the real-WAN false-positive trade.
 - **Interval effect is not separable from these single repetitions.** Whole-VPS
   T1 was 0.9-2.0 s (A-first) and 3.7-8.7 s (B-first, detection of an idle
   backup death), dominated by in-flight check completion and timeout rather than
@@ -317,9 +332,10 @@ and NOT MEASURED.
   repetitions remain NOT MEASURED.
 - Timestamps use one monotonic clock plus a wall↔mono offset; T1/T2 resolution
   is bounded by the ~50 ms controller poller and ~250 ms fresh-probe cadence.
-  One B-first whole-backup row reported T1 ≈ -0.25 s relative to T0 (a
-  health-check completion during the injector's own effect verification) —
-  treated as pre-T0 fault evidence, not as negative recovery time.
+  The primary-run tables contain no negative T1. The supplementary post-fix run
+  recorded one T1 of about -130 ms relative to T0 (a health-check completion
+  during the injector's own effect verification); it is treated as pre-T0 fault
+  evidence, not as negative recovery time.
 - Loopback has ~1-7 ms RTT, no ISP/GFW/loss, one host and one client core:
   these numbers are host/CPU dependent and are **not** a 10 s acceptance
   measurement. The shipped 60 s/5000 ms reference was not re-measured; its
