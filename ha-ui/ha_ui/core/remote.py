@@ -198,7 +198,7 @@ class RemoteProvider:
     def list_clients(self) -> dict[str, ClientRecord]:
         preflight = self.preflight()
         command = (
-            "stat -c 'mtime=%Y' %s 2>/dev/null || echo mtime=0; "
+            "stat -c 'mtime=%%Y' %s 2>/dev/null || echo mtime=0; "
             "jq -c '([.inbounds[]? | select(.tag==\"vless-in\")] | length) as $rn | "
             "([.inbounds[]? | select(.tag==\"hy2-in\")] | length) as $hn | "
             "{rn:$rn, hn:$hn, "
@@ -426,6 +426,8 @@ def _build_records(doc: dict, raw_output: str,
         structural.append("hy2-inbound-count")
     rmap: dict[str, bool] = {}
     hmap: dict[str, bool] = {}
+    reality_names: list[str] = []
+    hy2_names: list[str] = []
     for entry in reality:
         if not isinstance(entry, dict):
             structural.append("reality-entry")
@@ -434,6 +436,7 @@ def _build_records(doc: dict, raw_output: str,
         if not isinstance(name, str) or not name:
             structural.append("unnamed-reality")
             continue
+        reality_names.append(name)
         rmap[name] = bool(entry.get("cred"))
     for entry in hy2:
         if not isinstance(entry, dict):
@@ -443,17 +446,24 @@ def _build_records(doc: dict, raw_output: str,
         if not isinstance(name, str) or not name:
             structural.append("unnamed-hy2")
             continue
+        hy2_names.append(name)
         hmap[name] = bool(entry.get("cred"))
-    structural.extend(_duplicates(rmap) + _duplicates(hmap))
+    # Duplicate detection must run on the raw entry lists: a dict would collapse
+    # a repeated same-spelling name before the check, silently accepting it.
+    structural.extend(_duplicates(reality_names) + _duplicates(hy2_names))
     if set(rmap) != set(hmap):
         structural.append("name-set-mismatch")
     derived = _parse_derived(raw_output, config_mtime)
     names = sorted(set(rmap) | set(hmap), key=str.casefold)
     records: dict[str, ClientRecord] = {}
     for name in names:
+        # Global structural anomalies (ambiguous inbound count, unnamed user,
+        # duplicate name, name-set mismatch) block every client: a partial list
+        # must never be presented as a generation-ready inventory.
         problems: list[str] = []
-        if "name-set-mismatch" in structural:
-            problems.append("name-set-mismatch")
+        for issue in structural:
+            if issue not in problems:
+                problems.append(issue)
         if name not in rmap:
             problems.append("missing-reality")
         elif not rmap[name]:
@@ -472,7 +482,7 @@ def _build_records(doc: dict, raw_output: str,
     return records
 
 
-def _duplicates(names: Mapping[str, object]) -> list[str]:
+def _duplicates(names) -> list[str]:  # Iterable[str], raw entry order
     seen: set[str] = set()
     duplicates: list[str] = []
     for name in names:

@@ -1,9 +1,13 @@
-"""Main window: safety banner, two server cards and the (disabled) future tabs.
+"""Main window: safety banner, two server cards and the client/generation tabs.
 
-The first slice of issue #110 only implements server management. The
-client-management and generation tabs are visible but disabled placeholders
-("下一阶段 PR"): nothing in this window exports configuration, starts a tunnel,
-imports Clash or changes the remote sing-box configuration.
+The window owns the shared :class:`~ha_ui.ui.workers.WorkerRunner` (stopped on
+close, so a late worker result can never touch a destroyed widget) and wraps the
+production :class:`~ha_ui.ui.session_service.SessionGenerationService`. The
+client-management tab reads both VPS inventories; the generation tab runs the
+local HA chain. Nothing in this window exports configuration by itself, starts
+a tunnel, imports Clash or changes the remote sing-box configuration: the only
+remote write is the existing ``miaomiao`` CLI's derived-file generation, and
+only after the operator ticks the explicit consent box.
 
 Every error that reaches the UI is a :class:`~ha_ui.core.errors.HaUiError` with
 a fixed code and a safe message; :meth:`MainWindow.show_error` renders it in a
@@ -13,6 +17,8 @@ collapsed to ``E_INTERNAL`` at the worker boundary.
 """
 
 from __future__ import annotations
+
+from typing import Callable
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
@@ -30,25 +36,46 @@ from .. import APP_NAME, APP_VERSION, SERVER_IDS
 from ..core import config_store
 from ..core.errors import HaUiError
 from ..core.models import HostKeyInfo
+from .clients_panel import ClientsPanel
 from .dialogs import HostKeyDialog
+from .generate_panel import GeneratePanel
 from .server_panel import ServerPanel
 from .services import ServerActions
+from .session_service import GenerationBackend, SessionGenerationService
 from .workers import WorkerRunner
 
 SAFETY_BANNER_TEXT = (
     "本地工具；不会开启 TUN、不会导入 Clash、不会修改服务器 sing-box 配置"
 )
-PLACEHOLDER_TAB_TEXT = "下一阶段 PR"
 
 
 class MainWindow(QMainWindow):
-    """Two-VPS server management window; takes an injected :class:`ServerActions`."""
+    """Two-VPS window; takes an injected :class:`ServerActions`.
 
-    def __init__(self, actions: ServerActions, parent: QWidget | None = None) -> None:
+    Tests may inject a fake core ``generation_service`` (the object with
+    ``preview``/``generate``) and a fake ``open_folder_fn``; production passes
+    neither and gets the reviewed core :class:`GenerationService` plus
+    :func:`ha_ui.core.private_fs.open_folder`.
+    """
+
+    def __init__(
+        self,
+        actions: ServerActions,
+        parent: QWidget | None = None,
+        *,
+        generation_service: GenerationBackend | None = None,
+        open_folder_fn: Callable[[str], None] | None = None,
+    ) -> None:
         super().__init__(parent)
         self._actions = actions
         self._runner = WorkerRunner(self)
         self._startup_error: HaUiError | None = None
+        self._session_service = SessionGenerationService(
+            self._actions.workspace,
+            self._actions,
+            generation_service=generation_service,
+            open_folder_fn=open_folder_fn,
+        )
 
         self.setWindowTitle("%s %s" % (APP_NAME, APP_VERSION))
         self.resize(1120, 780)
@@ -81,30 +108,20 @@ class MainWindow(QMainWindow):
             server_layout.addWidget(panel, 1)
         self.tabs.addTab(server_tab, "服务器管理")
 
-        self.client_tab, self.client_placeholder = self._placeholder_tab()
-        self.tabs.addTab(self.client_tab, "客户端管理")
-        self.tabs.setTabEnabled(1, False)
-        self.tabs.setTabToolTip(1, PLACEHOLDER_TAB_TEXT)
-        self.generate_tab, self.generate_placeholder = self._placeholder_tab()
-        self.tabs.addTab(self.generate_tab, "生成")
-        self.tabs.setTabEnabled(2, False)
-        self.tabs.setTabToolTip(2, PLACEHOLDER_TAB_TEXT)
+        self.client_panel = ClientsPanel(
+            self._session_service, self._runner, self,
+            self.password_overrides, self.tabs)
+        self.tabs.addTab(self.client_panel, "客户端管理")
+
+        self.generate_panel = GeneratePanel(
+            self._session_service, self._runner, self, self.client_panel,
+            self.password_overrides, self.tabs)
+        self.tabs.addTab(self.generate_panel, "生成")
 
         layout.addWidget(self.tabs, 1)
         self.setCentralWidget(central)
         self.statusBar().showMessage(
             "就绪（工作目录：%s）" % str(self._actions.workspace))
-
-    def _placeholder_tab(self) -> tuple[QWidget, QLabel]:
-        page = QWidget(self.tabs)
-        page_layout = QVBoxLayout(page)
-        page_layout.addStretch(1)
-        label = QLabel(PLACEHOLDER_TAB_TEXT, page)
-        label.setObjectName("placeholderLabel")
-        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        page_layout.addWidget(label)
-        page_layout.addStretch(1)
-        return page, label
 
     # ----------------------------------------------------------------- config --
     def _load_config(self) -> None:
@@ -124,6 +141,17 @@ class MainWindow(QMainWindow):
         self._startup_error = None
         if error is not None and self._runner.active:
             self.show_error(error)
+
+    # -------------------------------------------------------------- password ---
+    def password_overrides(self) -> dict[str, str]:
+        """Snapshot the two session password fields (GUI thread only).
+
+        The returned mapping is only kept for the duration of one worker call so
+        the operator can type a password without saving it to the vault. It is
+        never rendered or logged.
+        """
+        return {server_id: panel.password_edit.text()
+                for server_id, panel in self.panels.items()}
 
     # ----------------------------------------------------------------- errors --
     def show_error(self, error: HaUiError) -> None:

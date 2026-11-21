@@ -194,6 +194,10 @@ def _validate_staged_exports(paths: RunPaths,
 def _write_pins(paths: RunPaths, pins: Mapping[str, CertPin]) -> None:
     if set(pins) != {"A", "B"}:
         raise HaUiError(errors.E_PIN_FORMAT, detail="servers")
+    # Defense in depth for direct pipeline callers: the service already checks
+    # these before staging, and HA-03 checks the pins file again in the chain.
+    from .remote import validate_pins_pair
+    validate_pins_pair(pins)
     document = {
         "schema": "mihomo-competition-ha-pins/2",
         "vps": {

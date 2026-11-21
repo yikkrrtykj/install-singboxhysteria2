@@ -133,6 +133,23 @@ class ServerActions:
         clean_port = config_store.validate_port(port)
         return self._probe(clean_host, clean_port)
 
+    def open_session(self, server: ServerConfig, password: str):
+        """Open one pinned session for a client/generation operation.
+
+        Worker thread only; the caller owns the returned session and must close
+        it (``SessionGenerationService`` closes it in ``finally``). The same
+        pre-connect gates as :meth:`test_connection` apply, so a missing host,
+        unconfirmed fingerprint or missing password can never reach the network.
+        """
+        if not server.host:
+            raise HaUiError(errors.E_CONFIG, detail="host")
+        if not server.host_key_fingerprint:
+            raise HaUiError(errors.E_HOSTKEY_MISSING, detail="confirm-first")
+        if not isinstance(password, str) or not password:
+            raise HaUiError(errors.E_CREDENTIAL_MISSING, detail="password")
+        return self._connect(server, password,
+                             expected_fingerprint=server.host_key_fingerprint)
+
     def test_connection(self, server: ServerConfig,
                         password: str) -> RemoteFacts:
         """Read-only preflight: pinned connect + one fixed exec command.

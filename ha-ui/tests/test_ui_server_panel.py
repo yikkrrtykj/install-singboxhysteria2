@@ -168,7 +168,7 @@ def _fill_server(panel, *, host: str = "203.0.113.10", alias: str = "HK A",
 # --------------------------------------------------------------------------- #
 # Construction / layout / password widget
 # --------------------------------------------------------------------------- #
-def test_window_constructs_with_banner_and_placeholder_tabs(qtbot, ui_workspace):
+def test_window_constructs_with_banner_and_real_tabs(qtbot, ui_workspace):
     window, recorder, _store = _make_window(qtbot, ui_workspace)
 
     assert APP_NAME in window.windowTitle()
@@ -191,16 +191,19 @@ def test_window_constructs_with_banner_and_placeholder_tabs(qtbot, ui_workspace)
     assert "不会导入 Clash" in banners[0].text()
     assert "不会修改服务器 sing-box 配置" in banners[0].text()
 
+    # PR-B replaced the two "下一阶段 PR" placeholders with the real tabs.
     assert window.tabs.count() == 3
     assert window.tabs.tabText(0) == "服务器管理"
     assert window.tabs.isTabEnabled(0) is True
-    assert window.tabs.isTabEnabled(1) is False
-    assert window.tabs.isTabEnabled(2) is False
     assert window.tabs.tabText(1) == "客户端管理"
+    assert window.tabs.isTabEnabled(1) is True
     assert window.tabs.tabText(2) == "生成"
+    assert window.tabs.isTabEnabled(2) is True
+    assert window.client_panel is not None
+    assert window.generate_panel is not None
     placeholders = [label for label in window.findChildren(QLabel)
                     if label.text() == "下一阶段 PR"]
-    assert len(placeholders) == 2
+    assert placeholders == []
     assert recorder.errors == []
 
 
