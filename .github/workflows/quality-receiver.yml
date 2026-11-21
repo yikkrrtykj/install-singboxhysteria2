@@ -41,6 +41,7 @@ jobs:
         run: |
           bash tests/test-mihomo-competition-ha-batch.sh
           bash tests/test-mihomo-competition-ha-profile.sh
+          bash tests/test-mihomo-competition-ha4-fastprobe.sh
   systemd-credentials:
     runs-on: ubuntu-22.04
     steps:
