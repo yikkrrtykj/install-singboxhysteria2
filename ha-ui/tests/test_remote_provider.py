@@ -355,7 +355,7 @@ def test_menu_that_does_not_refresh_the_derived_file_is_refused():
     with pytest.raises(HaUiError) as excinfo:
         provider.generate_exports(["stale"], allow_cli=True)
     assert excinfo.value.code == errors.E_REMOTE_MENU
-    assert excinfo.value.detail == "not-generated"
+    assert excinfo.value.detail == "not-regenerated"
 
 
 def test_download_sha256_mismatch_is_refused():

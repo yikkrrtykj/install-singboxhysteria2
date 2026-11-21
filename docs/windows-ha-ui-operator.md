@@ -89,6 +89,7 @@ Monitor/E3 管理面。
 | `E_REMOTE_PIN` / `E_PIN_EXPIRED` / `E_PIN_REUSED` | HY2 证书 PIN/有效期问题 | 续签/换证书后重新读取；A/B 不可同 PIN |
 | `E_CLIENT_MISSING` / `E_CLIENT_INCOMPLETE` | 单端缺失或协议不完整 | 先在两端用 `miaomiao` 客户端管理补齐 |
 | `E_CHAIN_STAGE` / `E_CHAIN_CHECK` | HA-02/03/04 阶段或 `--check` 失败 | 查看 detail 中的阶段与工具码；修复输入后重试 |
+| `E_INSTALLER_UNTRUSTED` | installer/lib 版本或 SHA-256 不在已审查范围 | 自动菜单生成已禁用；不要重试；仅可读取已存在的规范导出，或人工生成后重试；升级需新版本重新审查 pin |
 | `E_FRIENDLY_EXPORT` | 交付发布失败（文件名/哈希/角色不符） | 检查 manifest 与目标目录；重试为新 run |
 | `E_ACL` | 本地私有目录 ACL 校验失败 | 停止；不要把该目录移到共享/同步目录 |
 

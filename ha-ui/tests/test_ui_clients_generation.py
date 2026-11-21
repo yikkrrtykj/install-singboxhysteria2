@@ -694,6 +694,29 @@ def test_stage_failure_shows_code_and_keeps_previous_output(
     assert generate.delete_failed_button.isEnabled() is False  # no run dir left
 
 
+def test_untrusted_installer_disables_generation_with_explicit_diagnostic(
+        qtbot, ui_workspace):
+    window, recorder, fake, _connect, _folders = _make_window(
+        qtbot, ui_workspace)
+    _load_preview(qtbot, window, fake, _standard_preview())
+    window.client_panel.select_all_button.click()
+    generate = window.generate_panel
+    generate.consent_checkbox.setChecked(True)
+    fake.generate_error = HaUiError(errors.E_INSTALLER_UNTRUSTED,
+                                    detail="installer-hash")
+    generate.generate_button.click()
+    qtbot.waitUntil(
+        lambda: errors.E_INSTALLER_UNTRUSTED in generate.failure_label.text(),
+        timeout=4000)
+    qtbot.waitUntil(lambda: not generate.busy, timeout=4000)
+    assert recorder.errors[-1].code == errors.E_INSTALLER_UNTRUSTED
+    message = recorder.errors[-1].message
+    assert "自动菜单生成已禁用" in message
+    assert "已有规范导出仍可读取" in message
+    # No fabricated success row was added.
+    assert generate.results_table.rowCount() == 0
+
+
 # --------------------------------------------------------------------------- #
 # 8. Cancel sets the cancel event and surfaces E_CANCELLED
 # --------------------------------------------------------------------------- #

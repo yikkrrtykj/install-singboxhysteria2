@@ -28,7 +28,8 @@ from __future__ import annotations
 
 import hashlib
 import re
-from dataclasses import dataclass
+import shlex
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Mapping, Protocol
 
@@ -41,10 +42,76 @@ STATE_PATH = "/root/sbox/config"
 CLIENTS_DIR = "/root/sbox/clients"
 MANAGEMENT_MARKER = "/var/lib/sbox-cm/management.active"
 
+# ---------------------------------------------------------------------------
+# Installer trust anchor (reviewed, immutable).
+#
+# The GUI never executes `main` bytes. Both files it executes are fetched from
+# an exact reviewed commit and must match an independently embedded SHA-256
+# before execution; the installer's own embedded client-management pin must
+# also match the separately downloaded library. Updating these constants is a
+# security-review action: re-review the installer + library, recompute both
+# hashes, and update docs/windows-ha-ui-data-path.md and the tests together.
+# ---------------------------------------------------------------------------
+INSTALLER_REVIEWED_COMMIT = "2a810a995fcc05ec5a807140c6fdb21e9ec660ff"
+INSTALLER_SHA256 = (
+    "520aded03ccf3af6f09b8ba4ad34313a9ccad1ac80127b1600eb519d2dbea67f")
+CLIENT_MANAGEMENT_SHA256 = (
+    "52e08db43b8c94dc42a3c8eea96e8bc3c6adb64155002e82ac3dee985e3b6a53")
+_REPO_RAW_BASE = ("https://raw.githubusercontent.com/yikkrrtykj/"
+                  "install-singboxhysteria2/")
+INSTALLER_URL = _REPO_RAW_BASE + INSTALLER_REVIEWED_COMMIT + "/install.sh"
+CLIENT_MANAGEMENT_URL = (_REPO_RAW_BASE + INSTALLER_REVIEWED_COMMIT
+                         + "/lib/client-management.sh")
+
+# The installer's pre-menu `install_pkgs` would otherwise run `apt update/install`
+# for any missing HOST_DEP_SPECS entry. Preflight refuses auto generation when
+# any of these commands is absent, so the pinned execution path never mutates
+# host packages (and never executes unlocked distro-repository code).
+INSTALLER_HOST_DEPS = (
+    "qrencode", "jq", "iptables", "setfacl", "getfacl", "runuser",
+    # Commands the pinned execution/verification path itself requires.
+    "sha256sum", "date", "stat", "mktemp", "sed", "grep", "awk",
+)
+
 CANONICAL_CLIENT_NAME_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,31}\Z")
 MAX_EXPORT_BYTES = 64 * 1024
 MAX_LIST_JSON = 256 * 1024
 MAX_MENU_OUTPUT = 1024 * 1024
+
+# Structure markers that must exist in the downloaded installer before any byte
+# of it is executed. A renumbered menu (the main catastrophic drift: "10" could
+# select an unrelated destructive action) or a renamed client option stops here.
+MENU_SCRIPT_MARKERS = (
+    "10. 客户端管理",
+    "client_management_menu",
+    "3) generate_client_configuration_interactive",
+    "的 Mihomo 配置已生成",
+)
+# Transcript markers proving the expected menu path actually ran: the menu
+# notice, and the option-1 client table header.
+MENU_TRANSCRIPT_MARKERS = ("客户端管理", "NAME", "REALITY")
+MENU_SUCCESS_TEMPLATE = "客户端 '%s' 的 Mihomo 配置已生成"
+
+MENU_FETCH_TIMEOUT = 60
+MENU_RUN_TIMEOUT = 420
+MENU_KILL_GRACE = 10
+MENU_EXEC_TIMEOUT = 540.0
+
+DERIVED_STAT_FORMAT = "%F|%n|%a|%u|%s|%Y|%y"
+DERIVED_IDENTITY_END = "HAUI_STAT_END"
+_MENU_FAIL_TOKENS = (
+    ("consistency", "一致性"),
+    ("incomplete", "不完整"),
+    ("missing-config", "服务端配置不存在"),
+    ("name-invalid", "客户端名称非法"),
+    ("permission", "权限"),
+    ("reserved", "保留名称"),
+)
+# Pre-execution pin failures disable automatic menu generation explicitly; the
+# read-existing-exports path remains available. These are not retried.
+_INSTALLER_UNTRUSTED_TOKENS = frozenset({
+    "installer-hash", "lib-hash", "lib-pin", "installer-version",
+})
 
 # Fixed minimum remaining HY2 certificate validity for this MVP. The HA-03
 # tool keeps its own floor; this is an additional app-level stop so a
@@ -79,12 +146,15 @@ class RemotePreflight:
     api_secret_present: bool
     management_active: bool
     config_mtime: int
+    curl_present: bool = False
+    timeout_present: bool = False
 
     @property
     def okay(self) -> bool:
         return (self.root and self.os_name == "Linux" and self.config_present
                 and self.state_present and self.manager_present
                 and self.jq_present and self.openssl_present
+                and self.curl_present and self.timeout_present
                 and self.api_secret_present and not self.management_active)
 
 
@@ -116,6 +186,166 @@ def _safe_code(output: str) -> str:
     return "E_REMOTE"
 
 
+@dataclass(frozen=True)
+class DerivedIdentity:
+    """One remote derived export's metadata + SHA-256 at a point in time."""
+
+    name: str
+    regular: bool
+    mode: int
+    uid: int
+    size: int
+    mtime_epoch: int
+    mtime_ns: str
+    sha256: str | None
+
+
+def _menu_client_name(path: str) -> str:
+    prefix = CLIENTS_DIR + "/"
+    if not path.startswith(prefix):
+        return ""
+    remainder = path[len(prefix):]
+    if "/" not in remainder:
+        return ""
+    name = remainder.split("/", 1)[0]
+    return name if CANONICAL_CLIENT_NAME_RE.fullmatch(name) else ""
+
+
+def _menu_command(names: list[str]) -> str:
+    """Fixed remote script: fetch/verify pinned bytes, run menu, prove statuses.
+
+    Trust chain: both the installer and the client-management library are
+    fetched from ``INSTALLER_REVIEWED_COMMIT`` (never ``main``) and must match
+    their independently embedded SHA-256 before any byte executes. The
+    installer's own embedded library pin must match the separately downloaded
+    library, proving the reviewed internal dependency chain. The installer is
+    then run with a sanitized environment and the pinned library path, so its
+    library loader does not fetch anything else. Host dependency commands were
+    already required by preflight, so the installer's ``install_pkgs`` path is
+    a no-op and cannot apt-install unlocked code.
+
+    No operator-supplied text except strict canonical client names is
+    interpolated. The credential link lines are redacted server-side, ANSI
+    colours are stripped, and ``PIPESTATUS`` is captured for printf, the menu
+    process and sed so a non-zero menu can never be hidden by a later marker.
+    """
+    sequence = "10\n1\n" + "".join(
+        "3\n%s\n" % name for name in names) + "0\n"
+    checks = " ".join(
+        "grep -qF -- " + shlex.quote(marker) + " \"$d/install.sh\" "
+        "|| { echo HAUI_MENU_FAIL=menu-drift; exit 5; };"
+        for marker in MENU_SCRIPT_MARKERS)
+    path_env = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    env_assignments = (
+        "env -i PATH=" + path_env + " HOME=/root LANG=C.UTF-8 TERM=dumb "
+        "SB_CLIENT_MANAGEMENT_REF=" + INSTALLER_REVIEWED_COMMIT + " "
+        "SB_CLIENT_MANAGEMENT_LIB=\"$d/client-management.sh\" ")
+    script = (
+        "set -o pipefail; umask 077; "
+        "d=$(mktemp -d /tmp/ha-ui-installer.XXXXXXXX) "
+        "|| { echo HAUI_MENU_FAIL=temp; exit 3; }; "
+        "trap 'rm -rf -- \"$d\"' EXIT HUP INT TERM; "
+        "curl -fsSL --connect-timeout 10 --max-time "
+        + str(MENU_FETCH_TIMEOUT) + " --retry 1 " + shlex.quote(INSTALLER_URL)
+        + " -o \"$d/install.sh\" || { echo HAUI_MENU_FAIL=fetch; exit 4; }; "
+        "if [ \"$(sha256sum \"$d/install.sh\" | awk '{print $1}')\" != "
+        + shlex.quote(INSTALLER_SHA256)
+        + " ]; then echo HAUI_MENU_FAIL=installer-hash; exit 6; fi; "
+        "grep -qF " + shlex.quote(
+            'SB_CLIENT_MANAGEMENT_SHA256="' + CLIENT_MANAGEMENT_SHA256 + '"')
+        + " \"$d/install.sh\" "
+        "|| { echo HAUI_MENU_FAIL=lib-pin; exit 7; }; "
+        + checks + " "
+        "curl -fsSL --connect-timeout 10 --max-time "
+        + str(MENU_FETCH_TIMEOUT) + " --retry 1 "
+        + shlex.quote(CLIENT_MANAGEMENT_URL)
+        + " -o \"$d/client-management.sh\" "
+        "|| { echo HAUI_MENU_FAIL=fetch-lib; exit 8; }; "
+        "if [ \"$(sha256sum \"$d/client-management.sh\" | awk '{print $1}')\" != "
+        + shlex.quote(CLIENT_MANAGEMENT_SHA256)
+        + " ]; then echo HAUI_MENU_FAIL=lib-hash; exit 9; fi; "
+        "chmod 600 \"$d/install.sh\" \"$d/client-management.sh\"; "
+        "printf '%s' " + shlex.quote(sequence)
+        + " | timeout -k " + str(MENU_KILL_GRACE) + " "
+        + str(MENU_RUN_TIMEOUT) + " " + env_assignments
+        + "bash \"$d/install.sh\" 2>&1 "
+        "| sed -E -e " + shlex.quote("s/" + _REDACT_ANSI + "//g")
+        + " -e " + shlex.quote("s/" + _REDACT_LINK + "/[redacted-link]/g")
+        + "; ha_ui_rc=(\"${PIPESTATUS[@]}\"); "
+        "printf '\\nHAUI_MENU_RC=%s,%s,%s\\n' "
+        "\"${ha_ui_rc[0]}\" \"${ha_ui_rc[1]}\" \"${ha_ui_rc[2]}\"; "
+        "printf 'HAUI_MENU_END\\n'"
+    )
+    return "bash -c " + shlex.quote(script)
+
+
+def _derived_identity_command(names: list[str]) -> str:
+    paths = " ".join(
+        shlex.quote("%s/%s/mihomo.yaml" % (CLIENTS_DIR, name))
+        for name in names)
+    return ("LC_ALL=C stat -c " + shlex.quote(DERIVED_STAT_FORMAT) + " "
+            + paths + " 2>/dev/null; echo " + DERIVED_IDENTITY_END
+            + "; sha256sum " + paths + " 2>/dev/null; true")
+
+
+def _parse_derived_identities(
+        output: str, names: list[str]) -> dict[str, DerivedIdentity | None]:
+    wanted = set(names)
+    result: dict[str, DerivedIdentity | None] = {name: None for name in names}
+    hashes: dict[str, str] = {}
+    section = "stat"
+    for raw_line in (output or "").replace("\r", "").splitlines():
+        line = raw_line.strip()
+        if line == DERIVED_IDENTITY_END:
+            section = "sha"
+            continue
+        if not line:
+            continue
+        if section == "stat":
+            parts = line.split("|", 6)
+            if len(parts) != 7:
+                continue
+            kind, path, mode_s, uid_s, size_s, epoch_s, mtime_ns = parts
+            name = _menu_client_name(path)
+            if name not in wanted:
+                continue
+            try:
+                mode = int(mode_s, 8)
+                uid = int(uid_s)
+                size = int(size_s)
+                mtime_epoch = int(epoch_s)
+            except ValueError:
+                continue
+            result[name] = DerivedIdentity(
+                name=name,
+                regular=kind.startswith("regular file"),
+                mode=mode,
+                uid=uid,
+                size=size,
+                mtime_epoch=mtime_epoch,
+                mtime_ns=mtime_ns,
+                sha256=None,
+            )
+        else:
+            parts = line.split()
+            if len(parts) != 2 or not re.fullmatch(r"[0-9a-f]{64}", parts[0]):
+                continue
+            name = _menu_client_name(parts[1])
+            if name in wanted:
+                hashes[name] = parts[0]
+    for name, identity in list(result.items()):
+        if identity is not None and name in hashes:
+            result[name] = replace(identity, sha256=hashes[name])
+    return result
+
+
+def _menu_failure_token(transcript: str) -> str:
+    for token, needle in _MENU_FAIL_TOKENS:
+        if needle in transcript:
+            return token
+    return "partial"
+
+
 class RemoteProvider:
     """One VPS; every method is a read-only observation or the documented CLI."""
 
@@ -138,6 +368,14 @@ class RemoteProvider:
             "else echo jq=missing; fi; "
             "if command -v openssl >/dev/null 2>&1; then echo openssl=present; "
             "else echo openssl=missing; fi; "
+            "if command -v curl >/dev/null 2>&1; then echo curl=present; "
+            "else echo curl=missing; fi; "
+            "if command -v timeout >/dev/null 2>&1; then echo timeout=present; "
+            "else echo timeout=missing; fi; "
+            "for dep in " + " ".join(INSTALLER_HOST_DEPS) + "; do "
+            "if command -v \"$dep\" >/dev/null 2>&1; then "
+            "echo \"hostdep_$dep=present\"; else "
+            "echo \"hostdep_$dep=missing\"; fi; done; "
             "if [ -e %s ] || [ -L %s ]; then echo management=active; "
             "else echo management=inactive; fi; "
             "if jq -e '.services[]? | select(.tag==\"monitor-api\") | has(\"secret\")' "
@@ -171,6 +409,8 @@ class RemoteProvider:
             api_secret_present=values.get("api") == "present",
             management_active=values.get("management") == "active",
             config_mtime=mtime,
+            curl_present=values.get("curl") == "present",
+            timeout_present=values.get("timeout") == "present",
         )
         if not facts.root:
             raise HaUiError(errors.E_REMOTE_NOT_ROOT)
@@ -184,6 +424,18 @@ class RemoteProvider:
             raise HaUiError(errors.E_REMOTE_PREFLIGHT, detail="jq")
         if not facts.openssl_present:
             raise HaUiError(errors.E_REMOTE_PREFLIGHT, detail="openssl")
+        missing_deps = [
+            dep for dep in INSTALLER_HOST_DEPS
+            if values.get("hostdep_" + dep) != "present"]
+        if missing_deps:
+            # Refuse before the installer's install_pkgs/apt path could run:
+            # the pinned execution path must not install distro packages.
+            raise HaUiError(errors.E_REMOTE_PREFLIGHT,
+                            detail="host-deps:" + ",".join(missing_deps))
+        if not facts.curl_present:
+            raise HaUiError(errors.E_REMOTE_PREFLIGHT, detail="curl")
+        if not facts.timeout_present:
+            raise HaUiError(errors.E_REMOTE_PREFLIGHT, detail="timeout")
         if facts.management_active:
             # The privileged E3 plane is a different transaction boundary; this
             # MVP must not read across it. Activation is a separate approval.
@@ -235,10 +487,13 @@ class RemoteProvider:
                          allow_cli: bool) -> dict[str, bytes]:
         """Generate the CLI's canonical derived files for *names*, then read them.
 
-        ``allow_cli`` must be an explicit operator consent: the command runs the
-        existing ``miaomiao`` management script, which performs its documented
-        idempotent host-dependency/permission repair before the menu. It never
-        edits the sing-box configuration for menu option 3.
+        ``allow_cli`` must be an explicit operator consent. The remote side
+        downloads the same ``main`` installer the ``miaomiao`` wrapper executes,
+        verifies its menu structure before executing those verified bytes, and
+        the existing installer then performs its documented idempotent
+        host-dependency/permission repair before the menu. Menu option 3 never
+        edits the sing-box configuration; all generation proofs are in
+        :meth:`_run_cli_generation`.
         """
         validated = [validate_client_name(name) for name in names]
         if not validated:
@@ -254,31 +509,99 @@ class RemoteProvider:
         return self.read_exports(validated)
 
     def _run_cli_generation(self, names: list[str]) -> None:
-        sequence = "10\n1\n" + "".join(
-            "3\n%s\n" % name for name in names) + "0\n"
-        # Fixed command: no operator string is interpolated except strict
-        # canonical client names; the credential link lines are redacted
-        # before they ever leave the server, and ANSI colours are stripped.
-        command = (
-            "printf '%s' | miaomiao 2>&1 "
-            "| sed -E 's/%s//g' "
-            "| sed -E 's/%s/[redacted-link]/g'; "
-            "printf '\\nHAUI_MENU_END\\n'"
-        ) % (sequence.replace("\\", "\\\\").replace("'", "'\\''"),
-             _REDACT_ANSI, _REDACT_LINK)
-        rc, out, err = self.session.exec(command, timeout=420.0,
-                                         max_output=MAX_MENU_OUTPUT)
-        if "HAUI_MENU_END" not in out:
-            raise HaUiError(errors.E_REMOTE_MENU, detail="no-end")
-        self._assert_derived_ready(names)
+        """Run the verified installer menu and prove every requested export.
 
-    def _assert_derived_ready(self, names: list[str]) -> None:
-        records = self.list_clients()
-        missing = [name for name in names
-                   if name not in records
-                   or not records[name].derived_export_present]
-        if missing:
-            raise HaUiError(errors.E_REMOTE_MENU, detail="not-generated")
+        Safety properties, in order:
+
+        1. the installer is fetched read-only to a root-only temp file and its
+           menu structure is checked BEFORE the file is executed (a renumbered
+           menu would otherwise receive "10" and could run an unrelated action);
+        2. the exact verified bytes are executed with piped menu input under a
+           hard ``timeout`` (own process group), never via a second unverified
+           wrapper download;
+        3. the pipeline exit statuses are captured with ``PIPESTATUS`` into the
+           response and must all be zero (menu 124 = timeout);
+        4. the transcript must show the menu/table and the per-client
+           "Mihomo 配置已生成" line for every requested name;
+        5. each target file's metadata/SHA-256 is compared before and after the
+           run; an unchanged pre-existing file cannot be mistaken for a new one.
+
+        A partial or failed run aborts before any download. Server-side derived
+        files that were already rewritten are canonical, root:0600 derived
+        artifacts (``/root/sbox/clients``), never the live config; a retry
+        safely regenerates them.
+        """
+        before = self._derived_identities(names)
+        command = _menu_command(names)
+        try:
+            rc, out, _err = self.session.exec(
+                command, timeout=MENU_EXEC_TIMEOUT, max_output=MAX_MENU_OUTPUT)
+        except HaUiError as exc:
+            if exc.code == errors.E_SSH_TIMEOUT:
+                raise HaUiError(errors.E_REMOTE_MENU, detail="timeout") from None
+            raise
+        if int(rc) == 124:
+            raise HaUiError(errors.E_REMOTE_MENU, detail="timeout")
+        self._verify_menu_output(out, names)
+        after = self._derived_identities(names)
+        self._verify_derived_written(names, before, after)
+
+    # ------------------------------------------------- menu proof primitives --
+    @staticmethod
+    def _verify_menu_output(output: str, names: list[str]) -> None:
+        text = (output or "").replace("\r", "")
+        fail = re.search(r"HAUI_MENU_FAIL=([a-z-]{1,32})", text)
+        if fail:
+            token = fail.group(1)
+            if token in _INSTALLER_UNTRUSTED_TOKENS:
+                raise HaUiError(errors.E_INSTALLER_UNTRUSTED, detail=token)
+            raise HaUiError(errors.E_REMOTE_MENU,
+                            detail="precheck-" + token)
+        if "HAUI_MENU_END" not in text:
+            raise HaUiError(errors.E_REMOTE_MENU, detail="no-end")
+        match = re.search(r"HAUI_MENU_RC=(\d{1,3}),(\d{1,3}),(\d{1,3})", text)
+        if not match:
+            raise HaUiError(errors.E_REMOTE_MENU, detail="no-exit-status")
+        printf_rc, menu_rc, sed_rc = (int(value) for value in match.groups())
+        if menu_rc == 124:
+            raise HaUiError(errors.E_REMOTE_MENU, detail="timeout")
+        if printf_rc != 0 or menu_rc != 0 or sed_rc != 0:
+            raise HaUiError(errors.E_REMOTE_MENU, detail="exit-status")
+        transcript = text[:match.start()]
+        for marker in MENU_TRANSCRIPT_MARKERS:
+            if marker not in transcript:
+                raise HaUiError(errors.E_REMOTE_MENU, detail="menu-drift")
+        for name in names:
+            if (MENU_SUCCESS_TEMPLATE % name) not in transcript:
+                raise HaUiError(errors.E_REMOTE_MENU,
+                                detail=_menu_failure_token(transcript))
+
+    def _derived_identities(self, names: list[str]) -> dict[str, object]:
+        rc, out, _err = self.session.exec(_derived_identity_command(names),
+                                          timeout=120.0,
+                                          max_output=MAX_LIST_JSON)
+        if rc != 0:
+            raise HaUiError(errors.E_REMOTE_MENU, detail="identity")
+        return _parse_derived_identities(out, names)
+
+    @staticmethod
+    def _verify_derived_written(names: list[str], before, after) -> None:
+        for name in names:
+            current = after.get(name)
+            previous = before.get(name)
+            if (current is None or not current.regular or current.uid != 0
+                    or current.mode & 0o077
+                    or not 0 < current.size <= MAX_EXPORT_BYTES
+                    or not current.sha256):
+                raise HaUiError(errors.E_REMOTE_MENU, detail="provenance")
+            if previous is not None:
+                # A successful re-render always rewrites the file (new mtime or
+                # new bytes). Unchanged bytes+timestamp means the CLI failed
+                # while a stale but "fresh-looking" file was already present.
+                if (current.mtime_ns == previous.mtime_ns
+                        and current.sha256 == previous.sha256):
+                    raise HaUiError(errors.E_REMOTE_MENU,
+                                    detail="not-regenerated")
 
     def read_exports(self, names: list[str]) -> dict[str, bytes]:
         """Download derived files and verify the remote and local SHA-256."""
