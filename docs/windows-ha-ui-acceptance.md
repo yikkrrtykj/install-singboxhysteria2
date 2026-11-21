@@ -8,7 +8,8 @@
 
 | 项目 | 状态 | 证据 |
 | --- | --- | --- |
-| 自动测试（合成凭据，Windows） | ✅ 已通过 | `pytest ha-ui/tests`：461 passed / 2 host skips；真实 HA 链集成、ACL、失败注入、UI |
+| 自动测试（合成凭据，Windows） | ✅ 已通过 | `pytest ha-ui/tests`：476 passed / 2 host skips；真实 HA 链集成、ACL、失败注入、UI |
+| installer 版本/哈希门禁 | ✅ 已通过 | reviewed commit + installer/lib 独立 SHA-256 + 内嵌 lib pin + host-deps 门禁；11 项 trust-anchor 测试 |
 | Windows EXE 构建 + 冷启动 | ✅ 已通过 | `dist/ha-ui.exe`，EXE self-test OK，`receipt.json` 记录 SHA-256/selftest |
 | Windows GUI 实际操作 | ✅ 自动化通过（A1–A10，真实 EXE + UIA） | 真实 `dist\ha-ui.exe`：窗口/三 tab/安全横幅、密码默认隐藏+显示/隐藏、配置保存不含密码、真实 Windows 凭据管理器保存读回/删除、未确认指纹时测试连接与读取客户端均 E_HOSTKEY 拒绝、生成页/取消/策略控件渲染；证据在本地 `.scratch/gui-acceptance-report.json` 与截图（不入库） |
 | 真实生成/Cancel（HA 链） | ❌ 未执行 | 需要 Layer C 隔离测试 VPS；本机只验证控件/拒绝路径，不能替代真实生成 |

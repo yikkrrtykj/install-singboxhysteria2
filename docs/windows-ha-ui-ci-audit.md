@@ -60,7 +60,7 @@ GitHub 因此拒绝推送 `.github/workflows/` 文件。本仓库：
 
 ## 5. 本机验证证据（2026-11-21）
 
-- `pytest ha-ui/tests -q` → **475 passed, 2 host skips**（当前分支）。
+- `pytest ha-ui/tests -q` → **476 passed, 2 host skips**（当前分支）。
 - `run-windows-ci.ps1` 全量通过；最终 EXE 构建 + 冷启动 self-test + `verify_receipt.py`
   通过（hash 见 PR #116 评论/本地 `.scratch/ci/summary.json`，git-ignored）。
 - GUI 真实 EXE UIA 验收 A1–A10 通过（详见 PR #116 评论与
