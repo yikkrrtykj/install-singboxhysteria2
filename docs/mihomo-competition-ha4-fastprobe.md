@@ -157,6 +157,32 @@ unavailable; probe-endpoint failure while the business path works; historical
 manual pins; and N02 (204 healthy while upload is degraded). A green node or a
 204 response is reachability only, never application acceptance.
 
+## Loopback LAB harness (operator tool, not CI)
+
+`tests/mihomo-competition-ha4-lab.py` reproduces the offline mechanics on one
+host: it builds a synthetic A/B loopback fixture **through the three repo tools**
+(HA-02 batch → HA-03 profile → HA-04 variant), starts four real sing-box
+listeners standing in for the two VPSes (REALITY TCP and Hysteria2 UDP per VPS,
+plus the A-side HY2 hopping range), a loopback 204/probe/hold origin and REALITY
+handshake target, and runs pinned Mihomo clients against the generated variants.
+It requires the operator to supply hash-pinned binaries:
+
+```sh
+export HA04_MIHOMO=/path/to/mihomo          # pinned Mihomo (v1.19.31)
+export HA04_SINGBOX=/path/to/sing-box       # pinned sing-box (v1.14.3)
+python3 tests/mihomo-competition-ha4-lab.py --scenario all \
+  --lab-dir .scratch/ha04-lab
+```
+
+`--scenario` supports `fixture`, `matrix-a`, `matrix-b`, `hy2`, `hopping`,
+`outage`, `failback`, `n02`, `all`; `--repeats 1..5` repeats matrix cells. It
+binds loopback only, refuses busy ports or a binary hash mismatch, and writes
+raw `results.json`/event logs under the lab dir. It is an operator LAB tool, not
+a CI test: it needs the real binaries, ~10 minutes and local ports
+24000-24293, and it has no application/T3 hook. See the
+[LAB evidence](mihomo-competition-ha4-lab-evidence.md) for the measured result
+and its explicit limits.
+
 ## HY2 recovery and the ~30 s QUIC effect
 
 Mihomo keeps one long-lived Hysteria2 QUIC connection per outbound. When the
@@ -206,6 +232,7 @@ Fixed codes on stderr, exit 1 (`E_USAGE` exits 2):
 | `E_PATH_CONFLICT` | missing/linked/junction directory, output inside an input directory, unsafe boundary, or casefold-duplicate output name |
 | `E_INSECURE_PERMISSIONS` | POSIX owner/mode, Windows ACL allowlist, boundary or temp-inheritance failure |
 | `E_IO` | write/verify failure |
+| `E_TOOL_MISSING` | the HA-03 tool/batch helper could not be loaded (install/clone is incomplete) |
 | `E_USAGE` | bad arguments/policy/version, `--check` without `--source-delivery`, or `--source-delivery` in generation mode |
 
 All targets are prevalidated before any write; writes are atomic no-clobber;
