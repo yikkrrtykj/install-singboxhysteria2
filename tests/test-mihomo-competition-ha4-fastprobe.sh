@@ -409,6 +409,10 @@ assert_absent_servers() { local text=$1 label=$2
 section 'static gates'
 "$PY" -m py_compile "$TOOL" && pass 'py_compile tools/mihomo-competition-ha4-fastprobe.py' \
     || fail 'py_compile failed'
+assert_file "$ROOT/tests/mihomo-competition-ha4-lab.py" 'operator LAB harness present'
+"$PY" -m py_compile "$ROOT/tests/mihomo-competition-ha4-lab.py" \
+    && pass 'py_compile tests/mihomo-competition-ha4-lab.py' \
+    || fail 'LAB harness py_compile failed'
 bash -n "$0" && pass 'bash -n this suite' || fail 'bash -n this suite'
 imports="$("$PY" - "$TOOL" <<'PY'
 import re
@@ -479,6 +483,9 @@ SRC1="$T1/competition/event-ob01-hac.yaml"
 SRC1_HASH=$(sha256 "$SRC1")
 HA03_MAN="$(ls "$T1/competition"/ha-competition-*.json)"
 HA03_MAN_HASH=$(sha256 "$HA03_MAN")
+HA02_MAN="$(ls "$T1/delivery"/ha-delivery-*.json)"
+HA02_MAN_HASH=$(sha256 "$HA02_MAN")
+HA02_P1_HASH=$(sha256 "$T1/delivery/event-ob01-ha.yaml")
 mkdir -p "$T1/variant"; win_private_acl "$T1/variant"
 [ "$POSIX_HOST" = "1" ] && chmod 700 "$T1/variant"
 expect_h4_gen_ok "$T1" "$T1/variant" 3 1000 'T1 HA-04 variant generated'
@@ -488,6 +495,9 @@ assert_file "$OUT1" 'T1 variant profile exists'
 assert_file "$MAN1" 'T1 variant manifest exists'
 assert_eq "$SRC1_HASH" "$(sha256 "$SRC1")" 'T1 HA-03 source profile byte-unchanged'
 assert_eq "$HA03_MAN_HASH" "$(sha256 "$HA03_MAN")" 'T1 HA-03 source manifest byte-unchanged'
+assert_eq "$HA02_MAN_HASH" "$(sha256 "$HA02_MAN")" 'T1 HA-02 manifest byte-unchanged'
+assert_eq "$HA02_P1_HASH" "$(sha256 "$T1/delivery/event-ob01-ha.yaml")" \
+    'T1 HA-02 profile byte-unchanged'
 assert_eq 'ok r=2 a=2' "$(line_edit "$SRC1" "$OUT1")" 'T1 exactly two deterministic edits'
 assert_eq 'ok' "$(security_invariant "$SRC1" "$OUT1")" \
     'T1 security lines, pins, groups and node names unchanged'
@@ -543,7 +553,11 @@ if [ "$RC" -eq 0 ] && [ -z "$ERR" ] \
 else
     fail "T1 check (rc=$RC stdout=[$OUT] stderr=[$ERR])"
 fi
-
+run_ha03 --delivery "$T1/competition" --source-delivery "$T1/delivery" \
+    --pins "$T1/pins.json" --check
+[ "$RC" -eq 0 ] && [ -z "$ERR" ] \
+    && pass 'T1 HA-03 preflight still green on the untouched generic template' \
+    || fail "T1 HA-03 preflight (rc=$RC stderr=[$ERR])"
 # -------------------------------------------------- T2 single B-first ---
 section 'T2 single B-first fast-probe variant'
 T2="$TMP/t2"
@@ -775,6 +789,12 @@ run_check
 [ "$RC" -ne 0 ] && [ "${ERR1#ha4-fastprobe: FAIL E_DELIVERY}" != "$ERR1" ] \
     && pass 'T5g manifest role swap refused' \
     || fail "T5g (rc=$RC stderr=[$ERR])"
+restore_variant
+manifest_edit 'doc["canonical_source"]["profile_manifest_sha256"] = "0" * 64'
+run_check
+[ "$RC" -ne 0 ] && [ "$ERR1" = 'ha4-fastprobe: FAIL E_DELIVERY_HASH role=source-manifest' ] \
+    && pass 'T5g2 manifest source-manifest hash tamper refused' \
+    || fail "T5g2 (rc=$RC stderr=[$ERR])"
 restore_variant
 cp "$COUT" "$C/variant/extra-ha4f.yaml"
 [ "$POSIX_HOST" = "1" ] && chmod 600 "$C/variant/extra-ha4f.yaml"
