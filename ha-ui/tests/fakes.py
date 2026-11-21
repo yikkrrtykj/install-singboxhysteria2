@@ -29,6 +29,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import uuid as uuidlib
 from contextlib import contextmanager
@@ -48,6 +49,7 @@ from ha_ui.core.models import (
 )
 from ha_ui.core.remote import (
     CLIENTS_DIR,
+    DERIVED_IDENTITY_END,
     MAX_EXPORT_BYTES,
     RemotePreflight,
 )
@@ -389,6 +391,8 @@ class VpsFacts:
     reality_inbounds: int = 1
     hy2_inbounds: int = 1
     preflight_rc: int = 0
+    curl_present: bool = True
+    timeout_present: bool = True
 
 
 @dataclass
@@ -413,7 +417,16 @@ class FakeSession:
                  hash_overrides: Mapping[str, str] | None = None,
                  missing_exports: Sequence[str] = (),
                  menu_side_effect: bool = True,
-                 menu_end_marker: bool = True) -> None:
+                 menu_end_marker: bool = True,
+                 menu_exit: int = 0,
+                 menu_pipe_exit: int = 0,
+                 menu_printf_exit: int = 0,
+                 menu_rc_marker: bool = True,
+                 menu_transcript_markers: bool = True,
+                 menu_success: str = "all",
+                 menu_fail: str | None = None,
+                 menu_corrupt: str | None = None,
+                 menu_extra: str = "") -> None:
         self.role = role
         self.facts = facts or VpsFacts()
         self.clients = list(clients)
@@ -424,13 +437,30 @@ class FakeSession:
         self.missing_exports = set(missing_exports)
         self.menu_side_effect = menu_side_effect
         self.menu_end_marker = menu_end_marker
+        # Failure-injection knobs for the menu generation contract.
+        self.menu_exit = menu_exit
+        self.menu_pipe_exit = menu_pipe_exit
+        self.menu_printf_exit = menu_printf_exit
+        self.menu_rc_marker = menu_rc_marker
+        self.menu_transcript_markers = menu_transcript_markers
+        self.menu_success = menu_success
+        self.menu_fail = menu_fail
+        self.menu_corrupt = menu_corrupt
+        self.menu_extra = menu_extra
         self.commands: list[str] = []
         self.downloads: list[str] = []
         self.menu_invoked = False
+        self.identity_calls = 0
         self.derived: dict[str, DerivedState] = {}
+        self._mtime_epoch: dict[str, int] = {}
+        self._mtime_ns: dict[str, int] = {}
         for spec in self.clients:
             if spec.name and spec.derived is not None:
                 self.derived[spec.name] = spec.derived
+                base = (self.facts.config_mtime if spec.derived.fresh
+                        else self.facts.config_mtime - 600)
+                self._mtime_epoch[spec.name] = base
+                self._mtime_ns[spec.name] = 1
 
     # ------------------------------------------------------------- protocol --
     def exec(self, command: str, *, stdin_data: bytes | None = None,
@@ -438,6 +468,10 @@ class FakeSession:
              max_output: int = 1024 * 1024) -> tuple[int, str, str]:
         del stdin_data, timeout, max_output
         self.commands.append(command)
+        if "HAUI_MENU_END" in command or "ha-ui-installer" in command:
+            return self._menu(command)
+        if "HAUI_STAT_END" in command:
+            return self._identity(command)
         if "id -u" in command:
             return self._preflight()
         if "jq -c" in command:
@@ -446,8 +480,6 @@ class FakeSession:
             return self._pins()
         if command.startswith("sha256sum "):
             return self._sha256sum(command)
-        if "HAUI_MENU_END" in command or "| miaomiao" in command:
-            return self._menu(command)
         # Fail closed: the provider must never send an unreviewed command.
         raise AssertionError(
             "FakeSession(%s): unexpected remote command" % self.role)
@@ -486,6 +518,8 @@ class FakeSession:
             "management=%s" % ("active" if facts.management_active
                                else "inactive"),
             _presence("api", facts.api_present),
+            _presence("curl", facts.curl_present),
+            _presence("timeout", facts.timeout_present),
             "mtime=%d" % facts.config_mtime,
         ]
         return 0, "\n".join(lines) + "\n", ""
@@ -542,18 +576,85 @@ class FakeSession:
             lines.append("%s  %s" % (digest, path))
         return 0, "\n".join(lines) + ("\n" if lines else ""), ""
 
+    def _write_derived(self, name: str) -> None:
+        state = DerivedState()
+        if self.menu_corrupt == "mode":
+            state.mode = 0o644
+        elif self.menu_corrupt == "uid":
+            state.uid = 1000
+        elif self.menu_corrupt == "size":
+            state.size = 0
+        self.derived[name] = state
+        self._mtime_epoch[name] = self.facts.config_mtime + 1
+        self._mtime_ns[name] = self._mtime_ns.get(name, 1) + 1
+
+    def _identity(self, command: str) -> tuple[int, str, str]:
+        """The pre/post identity command (stat + sha256sum)."""
+        self.identity_calls += 1
+        prefix = CLIENTS_DIR + "/"
+        paths = [token for token in command.split()
+                 if token.startswith(prefix) and token.endswith("/mihomo.yaml")]
+        stat_lines: list[str] = []
+        sha_lines: list[str] = []
+        for path in paths:
+            name = path[len(prefix):].split("/", 1)[0]
+            derived = self.derived.get(name)
+            if derived is None:
+                continue
+            epoch = self._mtime_epoch.get(name, self.facts.config_mtime)
+            ns = self._mtime_ns.get(name, 1)
+            stat_lines.append("%s|%s|%s|%d|%d|%d|2026-11-21 17:00:00.%09d +0000"
+                              % ("regular file", path,
+                                 format(int(derived.mode), "o"), derived.uid,
+                                 derived.size, epoch, ns))
+            payload = self.exports.get(name)
+            if payload is not None:
+                digest = self.hash_overrides.get(
+                    name, hashlib.sha256(payload).hexdigest())
+            else:
+                digest = self.hash_overrides.get(name, "00" * 32)
+            sha_lines.append("%s  %s" % (digest, path))
+        output = "\n".join(stat_lines + [DERIVED_IDENTITY_END] + sha_lines)
+        return 0, output + ("\n" if output else ""), ""
+
     def _menu(self, command: str) -> tuple[int, str, str]:
         self.menu_invoked = True
+        if self.menu_fail is not None:
+            return 0, "HAUI_MENU_FAIL=%s\n" % self.menu_fail, ""
+        requested = re.findall(
+            r"\n3\n([A-Za-z0-9][A-Za-z0-9._-]*)\n", command)
+        if not requested:
+            requested = list(self.derived)
+        written = []
         if self.menu_side_effect:
-            import re
-            requested = re.findall(
-                r"\n3\n([A-Za-z0-9][A-Za-z0-9._-]*)\n", command)
-            for name in requested or list(self.derived):
-                self.derived[name] = DerivedState()
-        output = "miaomiao menu 10 -> 3: generated derived exports\n"
+            written = requested
+            for name in written:
+                self._write_derived(name)
+        if self.menu_success == "none":
+            claimed = []
+        elif self.menu_success == "first":
+            claimed = requested[:1]
+        else:
+            claimed = requested
+        lines: list[str] = []
+        if self.menu_transcript_markers:
+            lines.append("***** 客户端管理 *****")
+            lines.append("NAME             REALITY      HY2")
+        for name in claimed:
+            lines.append(
+                "客户端 '%s' 的 Mihomo 配置已生成: %s/%s/mihomo.yaml"
+                "（使用 '%s' 自己的 UUID/password）"
+                % (name, CLIENTS_DIR, name, name))
+        if self.menu_extra:
+            lines.append(self.menu_extra)
+        output = "\n".join(lines)
+        if self.menu_rc_marker:
+            output += ("\nHAUI_MENU_RC=%d,%d,%d"
+                       % (self.menu_printf_exit, self.menu_exit,
+                          self.menu_pipe_exit))
         if self.menu_end_marker:
-            output += "HAUI_MENU_END\n"
-        return 0, output, ""
+            output += "\nHAUI_MENU_END"
+        return 0, output + "\n", ""
 
 
 # --------------------------------------------------------------------------- #
@@ -563,7 +664,8 @@ def preflight_facts(**overrides) -> RemotePreflight:
     base = dict(root=True, os_name="Linux", config_present=True,
                 state_present=True, manager_present=True, jq_present=True,
                 openssl_present=True, api_secret_present=True,
-                management_active=False, config_mtime=DEFAULT_CONFIG_MTIME)
+                management_active=False, config_mtime=DEFAULT_CONFIG_MTIME,
+                curl_present=True, timeout_present=True)
     base.update(overrides)
     return RemotePreflight(**base)
 

@@ -60,32 +60,77 @@ cd ha-ui
 - SSH：主机指纹匹配/缺失/变化、关闭端口连接失败、下载文件属性校验；
 - 远程数据层：fake SSH 会话覆盖 preflight 各拒绝分支、客户端列表 union/不完整/重复、
   PIN 解析与 A/B 重复/过期/有效期不足、菜单生成同意门、远端/本地 SHA 不一致；
+- 远程菜单生成加固：安装脚本下载后/执行前结构校验（菜单漂移拒绝）、`PIPESTATUS`
+  非零/超时/管道失败、缺少结束/退出码标记、转录缺失/部分生成、成功文案但文件未重写、
+  非私有/空派生文件、既有派生文件不被误认等失败注入；
 - HA 链：真实 HA-02→03→04→friendly 合成 exports 集成测试（Windows 本机），
   A-first/B-first、单客户端/批量、失败阶段清理、取消、旧产物不被覆盖、回执不含凭据；
 - UI：`pytest-qt` offscreen 冒烟（服务器/客户端/生成面板）、GUI 冷启动 `--self-test`；
-- 打包：版本 pin 一致、PyInstaller 参数、CI workflow 契约。
+- 打包/CI：版本 pin 一致、PyInstaller 参数、CI workflow 契约与本地 CI runner。
 
 ## 4. CI
 
-审查用 workflow 模板：`ha-ui/ci/ha-ui-workflow.yml`。GitHub 对 OAuth token 的
-workflow 文件更新要求 `workflow` scope，本仓库当前自动化 token 只有 `repo` scope，
-因此提交时保留了模板而不是直接放入 `.github/workflows/`；由具备该 scope 的维护者
-执行一次：
+审查用 workflow 模板：`ha-ui/ci/ha-ui-workflow.yml`。**当前未激活**：GitHub 对 OAuth
+token 的 workflow 文件更新要求 `workflow` scope，本仓库自动化 token 只有 `repo` scope
+（`gh auth status` 可复核），因此模板随 PR 提交、不会自动生效；本仓库不得声称 HA-UI
+Windows CI 已激活。已有仓库 CI 仍会跑其它 lane，但不能替代本文 Windows 矩阵。
+
+### 4.1 本机镜像（无需 workflow scope，验收必跑）
 
 ```powershell
-Copy-Item ha-ui\ci\ha-ui-workflow.yml .github\workflows\ha-ui.yml
+# 从仓库根目录；如未建 venv，先安装 pinned 依赖
+py -3.13 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r ha-ui\requirements-dev.txt
+powershell -NoProfile -ExecutionPolicy Bypass -File ha-ui\ci\run-windows-ci.ps1 `
+  -SkipInstall -Python .\.venv\Scripts\python.exe
 ```
 
-激活后（模板与激活文件必须逐字节一致，打包测试会校验）：
+该脚本与 CI 矩阵同源：Python 3.13 检查、`pip check`、精确 pin gate、offscreen pytest
+（含真实 NTFS ACL 测试）、GUI `--self-test`、PyInstaller EXE 构建 + EXE 冷启动
+self-test、receipt/EXE SHA-256 校验，并把结果写到 `.scratch/ci/summary.json`
+（git-ignored）。`-SkipBuild` 可只跑测试。
+
+专用 gate：
+
+```powershell
+python ha-ui\ci\check_pins.py --static-only   # 无依赖环境（CI static job）
+python ha-ui\ci\check_pins.py                # 已安装环境（Windows jobs）
+```
+
+### 4.2 激活步骤（需维护者人工执行；本仓库不自动做）
+
+模板与激活文件必须逐字节一致，`test_packaging.py` 会校验；助手默认 dry-run：
+
+```powershell
+# 1. 预演/检查（不写文件）
+powershell -NoProfile -ExecutionPolicy Bypass -File ha-ui\ci\activate-workflow.ps1
+
+# 2. 本地复制并校验字节一致
+powershell -NoProfile -ExecutionPolicy Bypass -File ha-ui\ci\activate-workflow.ps1 -Apply
+
+# 3. 提交（独立 review 后）
+git add .github/workflows/ha-ui.yml
+git commit -m "ci(ha-ui): activate reviewed Windows workflow"
+
+# 4. 推送：需要带 workflow scope 的凭据，或在 GitHub Web UI 创建该文件
+gh auth refresh -h github.com -s workflow   # 交互式，仅维护者
+git push
+
+# 5. 验证（必须看到 workflow 与两次成功 run 才能称为“已激活”）
+gh workflow list --repo yikkrrtykj/install-singboxhysteria2
+gh run list --workflow ha-ui.yml --repo yikkrrtykj/install-singboxhysteria2 --limit 5
+```
+
+激活后的 job：
 
 | job | 内容 |
 | --- | --- |
-| `static-gates`（ubuntu） | `py_compile`、requirements/构建脚本 pin 一致、禁止监听/自动导入的静态门 |
-| `windows-tests`（windows-2022） | 固定依赖 + offscreen pytest + `--self-test`，上传 JUnit |
-| `windows-exe`（windows-2022） | 构建 EXE + 冷启动 self-test + receipt 校验 + 上传 EXE/receipt/SHA256SUMS |
+| `static-gates`（ubuntu） | `py_compile`、`check_pins.py --static-only`、禁止监听/自动导入静态门 |
+| `windows-tests`（windows-2022） | 固定依赖 + `pip check` + 精确 pin gate + offscreen pytest（含 ACL 测试）+ `--self-test`，上传 JUnit |
+| `windows-exe`（windows-2022） | 构建 EXE + 冷启动 self-test + receipt（Python/PyInstaller/依赖/工具哈希/EXE 大小与 SHA-256）+ EXE SHA-256 校验 + step summary + artifact（`if-no-files-found: error`） |
 
-CI 不连接 VPS、不读取真实凭据、不合并/部署任何东西；CI 通过不能替代真实 Windows +
-两台已授权 VPS 的手工验收。
+workflow 不连接 VPS、不读取真实凭据、不合并/部署；CI 通过不能替代真实 Windows +
+两台已授权 VPS 的验收。
 
 ## 5. 下载/交付校验
 

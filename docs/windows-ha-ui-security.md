@@ -73,15 +73,21 @@
 2. **CLI 生成不是事务**：`generate_client_configuration` 读配置时未持有 `config.lock`
    （既有 CLI 行为）。MVP 通过“管理面未激活”前置条件 + 下载后 HA-02 的一致性/凭据
    独立性校验降低风险；仍存在与并发人工操作的 TOCTOU 窗口，故激活管理面时拒绝生成。
-3. **`miaomiao` 每次运行会从 GitHub `main` 拉取脚本**并做幂等基线修复——这是既有
-   运维路径，GUI 不额外新增执行面；若导出文件已新鲜则完全不执行脚本。
-4. **Windows 同用户威胁**：ACL 允许当前用户与管理员读取，无法防御同账户恶意软件或
+3. **菜单驱动仍执行既有 `install.sh`**：生成路径只读下载 main 脚本、先校验菜单结构、再
+   执行已校验字节（`timeout` + `PIPESTATUS` + 逐客户端成功文本 + 前后 stat/SHA-256
+   变化，见 `docs/windows-ha-ui-data-path.md` §6）。但安装脚本在菜单前仍会做幂等
+   `install_pkgs`/权限修复/`install_shortcut`/只读状态查询；菜单 3 不修改
+   `sbconfig_server.json`、不重启 sing-box。导出已新鲜时完全不执行脚本。更彻底的
+   只读 `--client-export` 模式与 Monitor `client.export` 路线均需服务器端单独审批。
+4. **菜单版本漂移**：下载后、执行前的结构标记校验会拒绝重编号/改名的菜单，避免管道
+   输入落到错误操作；若 main 改变了成功文案/菜单结构，工具 fail-closed 而不是猜测。
+5. **Windows 同用户威胁**：ACL 允许当前用户与管理员读取，无法防御同账户恶意软件或
    已提权攻击者；请保持本机干净、开启磁盘加密、勿同步私有目录。
-5. **Manifest/交付文件非签名**：哈希与 manifest 提供完整性与角色绑定，不提供发布者
+6. **Manifest/交付文件非签名**：哈希与 manifest 提供完整性与角色绑定，不提供发布者
    身份签名；EXE 未代码签名，下载后请核对 `receipt.json` 中的 EXE SHA-256 与 CI 产物。
-6. **真实 VPS 验收未执行**：本仓库内验证为合成凭据 + 本机 Windows 环境；接入真实
-   A/B 前需按操作说明在两台已授权 VPS 上做一轮手工验收（host-key、root、客户端完整、
-   证书 PIN、生成与 Clash 手动导入），CI 不能替代该验收。
+7. **真实 VPS 验收未执行**：本仓库内验证为合成凭据 + 本机 Windows 环境；接入真实
+   A/B 前须按 `docs/windows-ha-ui-acceptance.md` 的三层验收执行（含两台 VPS 只读层与
+   隔离测试 VPS 生成层）；CI/本机测试不能替代该验收。
 
 ## 7. 非目标
 
