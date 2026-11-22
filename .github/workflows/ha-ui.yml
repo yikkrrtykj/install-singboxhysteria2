@@ -1,0 +1,155 @@
+name: HA-UI (Windows local dual-VPS GUI)
+
+# Windows-only GUI slice for issue #110. Path-filtered so it does not duplicate
+# the existing bash/HA lanes. No secrets, no VPS access, no Clash/TUN actions.
+
+on:
+  push:
+    paths:
+      - "ha-ui/**"
+      - "tools/mihomo-competition-ha-batch.py"
+      - "tools/mihomo-competition-ha-profile.py"
+      - "tools/mihomo-competition-ha4-fastprobe.py"
+      - "tools/mihomo-competition-ha-friendly-export.py"
+      - "tools/mihomo-multi-vps-merge.py"
+      - "docs/windows-ha-ui*.md"
+      - ".github/workflows/ha-ui.yml"
+  pull_request:
+    paths:
+      - "ha-ui/**"
+      - "tools/mihomo-competition-ha-batch.py"
+      - "tools/mihomo-competition-ha-profile.py"
+      - "tools/mihomo-competition-ha4-fastprobe.py"
+      - "tools/mihomo-competition-ha-friendly-export.py"
+      - "tools/mihomo-multi-vps-merge.py"
+      - "docs/windows-ha-ui*.md"
+      - ".github/workflows/ha-ui.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ha-ui-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static:
+    name: static-gates
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Python syntax gate
+        run: |
+          set -euo pipefail
+          find ha-ui/ha_ui ha-ui/scripts ha-ui/ci ha-ui/tests -name '*.py' -print0 \
+            | xargs -0 -n1 python3 -m py_compile
+      - name: Exact pin and workflow-template gate (static)
+        run: python3 ha-ui/ci/check_pins.py --static-only
+      - name: No public listener / no auto-import static gate
+        run: |
+          set -euo pipefail
+          ! grep -RInE "(HTTPServer|socketserver|QTcpServer|subprocess.*clash|startfile.*verge|tun\.enable.*True)" ha-ui/ha_ui || {
+            echo "::error::forbidden public listener / auto-import construct"; exit 1; }
+
+  windows-tests:
+    name: windows-tests
+    runs-on: windows-2022
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: ha-ui/requirements-dev.txt
+      - name: Record interpreter
+        shell: pwsh
+        run: python -c "import sys; print(sys.version)" | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+      - name: Install pinned dependencies
+        run: python -m pip install --disable-pip-version-check -r ha-ui/requirements-dev.txt
+      - name: Dependency consistency
+        run: |
+          python -m pip check
+          python ha-ui/ci/check_pins.py
+      - name: Pytest (offscreen Qt, real NTFS ACL tests included)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        working-directory: ha-ui
+        run: python -m pytest tests -q --junitxml=pytest-ha-ui.xml
+      - name: GUI cold-start self-test
+        env:
+          QT_QPA_PLATFORM: offscreen
+          HA_UI_HOME: ${{ runner.temp }}\ha-ui-selftest
+          HA_UI_TOOLS_DIR: ${{ github.workspace }}\tools
+        working-directory: ha-ui
+        run: python -m ha_ui.app --self-test
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ha-ui-windows-tests
+          path: ha-ui/pytest-ha-ui.xml
+          if-no-files-found: error
+          retention-days: 7
+
+  windows-exe:
+    name: windows-exe
+    needs: windows-tests
+    runs-on: windows-2022
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: ha-ui/requirements-dev.txt
+      - name: Install pinned dependencies
+        run: python -m pip install --disable-pip-version-check -r ha-ui/requirements-dev.txt
+      - name: Dependency consistency
+        run: |
+          python -m pip check
+          python ha-ui/ci/check_pins.py
+      - name: Build unsigned EXE + cold-start smoke
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python ha-ui/scripts/build_windows.py
+      - name: Verify receipt, EXE SHA-256, source-tree and tool hashes
+        run: python ha-ui/ci/verify_receipt.py --dist dist
+      - name: Publish build summary
+        shell: pwsh
+        run: |
+          $receipt = Get-Content dist\receipt.json -Raw | ConvertFrom-Json
+          $sha = $receipt.exe_sha256
+          $size = $receipt.exe_bytes
+          @(
+            "### HA-UI Windows EXE",
+            "- EXE: ha-ui.exe ($size bytes)",
+            "- SHA-256: ``$sha``",
+            "- receipt: signed=false, configuration_embedded=false, selftest ok",
+            "- source tree: ``$($receipt.source_tree_sha256)``",
+            "- pinned deps: PySide6 $($receipt.dependencies.PySide6), paramiko $($receipt.dependencies.paramiko), keyring $($receipt.dependencies.keyring)",
+            "- PyInstaller: $($receipt.pyinstaller), Python: $($receipt.python)"
+          ) | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          Write-Output "receipt OK: $sha"
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ha-ui-windows-exe
+          path: |
+            dist/ha-ui.exe
+            dist/receipt.json
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 7
