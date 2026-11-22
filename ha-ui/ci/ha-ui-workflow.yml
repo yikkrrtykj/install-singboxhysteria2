@@ -127,6 +127,8 @@ jobs:
         run: python ha-ui/scripts/build_windows.py
       - name: Verify receipt, EXE SHA-256, source-tree and tool hashes
         run: python ha-ui/ci/verify_receipt.py --dist dist
+      - name: Verify SHA256SUMS hashes every built artifact
+        run: python ha-ui/ci/verify_artifact_sums.py --dist dist
       - name: Publish build summary
         shell: pwsh
         run: |

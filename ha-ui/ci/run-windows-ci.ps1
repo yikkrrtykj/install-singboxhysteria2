@@ -132,6 +132,10 @@ try {
             $Summary.receipt_sha256 = (Get-FileHash $receiptPath -Algorithm SHA256).Hash.ToLower()
             Write-Host "EXE SHA-256: $($receipt.exe_sha256)"
         }
+        Step 'verify SHA256SUMS hashes every built artifact' {
+            & $Python (Join-Path $AppRoot 'ci\verify_artifact_sums.py') --dist (Join-Path $RepoRoot 'dist')
+            Assert-LastExit 'artifact sums verification'
+        }
     }
 
     $Summary.ok = $true

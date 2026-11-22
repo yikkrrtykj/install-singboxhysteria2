@@ -46,6 +46,7 @@ TOOL_FILES = (
     "mihomo-multi-vps-merge.py",
 )
 EXE_NAME = "ha-ui.exe"
+SUM_FILE_NAME = "SHA256SUMS.txt"
 SELFTEST_MARKER = "HA-UI self-test: OK"
 
 
@@ -187,16 +188,31 @@ def run_selftest(exe: Path, build_root: Path) -> dict[str, object]:
     }
 
 
+def write_sha256sums(output_root: Path,
+                     names: tuple[str, ...]) -> Path:
+    """Write hashes of the files that are actually on disk (LF only).
+
+    Reading the files back is deliberate: it proves the receipt's bytes are
+    hashed as written on Windows (``write_text`` would translate LF to CRLF,
+    making an in-memory hash disagree with the delivered file).
+    """
+    lines = []
+    for name in names:
+        target = output_root / name
+        if not target.is_file():
+            raise BuildError("missing build artifact: " + name)
+        lines.append("%s  %s\n" % (sha256_file(target), name))
+    sums = output_root / SUM_FILE_NAME
+    sums.write_bytes("".join(lines).encode("utf-8"))
+    return sums
+
+
 def write_receipt(path: Path, receipt: dict[str, object]) -> None:
-    payload = json.dumps(receipt, ensure_ascii=False, indent=2,
-                         sort_keys=True) + "\n"
-    path.write_text(payload, encoding="utf-8")
-    (path.parent / "SHA256SUMS.txt").write_text(
-        "%s  %s\n%s  %s\n" % (
-            receipt["exe_sha256"], EXE_NAME,
-            hashlib.sha256(payload.encode("utf-8")).hexdigest(),
-            "receipt.json"),
-        encoding="utf-8")
+    payload = (json.dumps(receipt, ensure_ascii=False, indent=2,
+                          sort_keys=True) + "\n").encode("utf-8")
+    # Byte writes keep LF on every host; no newline translation.
+    path.write_bytes(payload)
+    write_sha256sums(path.parent, (EXE_NAME, path.name))
 
 
 def build(output_root: Path, *, run_self_test: bool = True) -> dict[str, object]:
