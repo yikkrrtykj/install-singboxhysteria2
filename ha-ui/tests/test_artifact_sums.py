@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -38,7 +40,7 @@ def verifier():
 
 def make_dist(tmp_path: Path, build) -> Path:
     dist = tmp_path / "dist"
-    dist.mkdir()
+    dist.mkdir(parents=True, exist_ok=True)
     exe = dist / "ha-ui.exe"
     exe.write_bytes(b"fake-exe-bytes-for-sums")
     receipt = {
@@ -105,7 +107,26 @@ def test_verifier_rejects_unlisted_extra_file(tmp_path, build, verifier):
     dist = make_dist(tmp_path, build)
     (dist / "unexpected.log").write_text("x", encoding="utf-8")
     problems = verifier.verify(dist)
-    assert "unlisted file: unexpected.log" in problems
+    assert any("unexpected entry in delivery directory" in p for p in problems)
+
+
+def test_verifier_rejects_extra_directory(tmp_path, build, verifier):
+    dist = make_dist(tmp_path, build)
+    (dist / "extra-dir").mkdir()
+    problems = verifier.verify(dist)
+    assert any("unexpected entry in delivery directory" in p for p in problems)
+
+
+def test_verifier_requires_manifest_exactly_exe_and_receipt(tmp_path, build, verifier):
+    dist = make_dist(tmp_path, build)
+    extra = dist / "extra.txt"
+    extra.write_bytes(b"extra")
+    sums = dist / "SHA256SUMS.txt"
+    digest = hashlib.sha256(extra.read_bytes()).hexdigest()
+    with sums.open("a", encoding="utf-8") as handle:
+        handle.write("%s  extra.txt\n" % digest)
+    problems = verifier.verify(dist)
+    assert any("unexpected entry in manifest: extra.txt" in p for p in problems)
 
 
 def test_verifier_rejects_duplicate_and_malformed_entries(tmp_path, build, verifier):
@@ -133,3 +154,98 @@ def test_old_crlf_receipt_hash_bug_is_rejected(tmp_path, build, verifier):
     receipt.write_bytes(payload.replace(b"\n", b"\r\n"))
     problems = verifier.verify(dist)
     assert "hash mismatch: receipt.json" in problems
+
+
+def test_verifier_rejects_symlinked_sums(tmp_path, build, verifier):
+    dist = make_dist(tmp_path, build)
+    sums = dist / "SHA256SUMS.txt"
+    outside = tmp_path / "outside-sums.txt"
+    outside.write_bytes(sums.read_bytes())
+    sums.unlink()
+    try:
+        sums.symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation not permitted on this host")
+    problems = verifier.verify(dist)
+    assert any("reparse point not allowed: SHA256SUMS.txt" in p for p in problems)
+
+
+def test_verifier_rejects_symlinked_required_file(tmp_path, build, verifier):
+    dist = make_dist(tmp_path, build)
+    receipt = dist / "receipt.json"
+    outside = tmp_path / "outside-receipt.json"
+    outside.write_bytes(receipt.read_bytes())
+    receipt.unlink()
+    try:
+        receipt.symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation not permitted on this host")
+    problems = verifier.verify(dist)
+    assert any("reparse point not allowed: receipt.json" in p for p in problems)
+
+
+@pytest.mark.skipif(os.name != "nt",
+                    reason="Windows junction/reparse-point coverage")
+def test_verifier_rejects_windows_junction_entry(tmp_path, build, verifier):
+    dist = make_dist(tmp_path, build)
+    target = tmp_path / "outside-dir"
+    target.mkdir()
+    junction = dist / "junction"
+    proc = subprocess.run(["cmd", "/c", "mklink", "/J", str(junction),
+                           str(target)], capture_output=True, text=True)
+    if proc.returncode != 0:
+        pytest.skip("junction creation not permitted on this host")
+    problems = verifier.verify(dist)
+    assert any("unexpected entry in delivery directory: junction" in p
+               for p in problems)
+
+
+@pytest.mark.skipif(os.name != "nt",
+                    reason="Windows junction/reparse-point coverage")
+def test_verifier_rejects_windows_junction_sums(tmp_path, build, verifier):
+    dist = make_dist(tmp_path, build)
+    sums = dist / "SHA256SUMS.txt"
+    sums.unlink()
+    target = tmp_path / "outside-sums-dir"
+    target.mkdir()
+    proc = subprocess.run(["cmd", "/c", "mklink", "/J", str(sums),
+                           str(target)], capture_output=True, text=True)
+    if proc.returncode != 0:
+        pytest.skip("junction creation not permitted on this host")
+    problems = verifier.verify(dist)
+    assert any("reparse point not allowed: SHA256SUMS.txt" in p
+               for p in problems)
+
+
+@pytest.mark.skipif(os.name != "nt",
+                    reason="Windows junction/reparse-point coverage")
+def test_verifier_rejects_windows_junction_receipt(tmp_path, build, verifier):
+    dist = make_dist(tmp_path, build)
+    receipt = dist / "receipt.json"
+    receipt.unlink()
+    target = tmp_path / "outside-receipt-dir"
+    target.mkdir()
+    proc = subprocess.run(["cmd", "/c", "mklink", "/J", str(receipt),
+                           str(target)], capture_output=True, text=True)
+    if proc.returncode != 0:
+        pytest.skip("junction creation not permitted on this host")
+    problems = verifier.verify(dist)
+    assert any("reparse point not allowed: receipt.json" in p
+               for p in problems)
+
+
+def test_cli_exit_codes(tmp_path, build, verifier):
+    good = make_dist(tmp_path / "good", build)
+    assert verifier.main(["--dist", str(good)]) == 0
+
+    tampered = make_dist(tmp_path / "tampered", build)
+    (tampered / "ha-ui.exe").write_bytes(b"tampered")
+    assert verifier.main(["--dist", str(tampered)]) != 0
+
+    missing = make_dist(tmp_path / "missing", build)
+    (missing / "receipt.json").unlink()
+    assert verifier.main(["--dist", str(missing)]) != 0
+
+    extra = make_dist(tmp_path / "extra", build)
+    (extra / "notes.txt").write_text("x", encoding="utf-8")
+    assert verifier.main(["--dist", str(extra)]) != 0

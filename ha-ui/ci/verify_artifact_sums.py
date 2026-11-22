@@ -3,10 +3,12 @@
 
 This is the CI/operator-side companion to ``build_windows.write_receipt``:
 hashes are recomputed from the bytes actually present in the artifact
-directory, never from in-memory payloads. It fails closed on a wrong hash, a
-missing or tampered file, a duplicate/malformed entry, a symlink, or an
-unlisted extra file. Both LF and CRLF ``SHA256SUMS.txt`` files are accepted
-(the verifier only cares about the delivered file bytes).
+directory, never from in-memory payloads. The delivery directory boundary is
+strict: it must contain exactly the three regular files
+``ha-ui.exe``, ``receipt.json`` and ``SHA256SUMS.txt``; the manifest must list
+exactly the EXE and the receipt. Symlinks, Windows reparse points, extra files,
+extra directories, malformed/duplicate entries and missing files all fail
+closed. Both LF and CRLF ``SHA256SUMS.txt`` files are accepted.
 
 Usage:
     python ha-ui/ci/verify_artifact_sums.py --dist dist
@@ -16,13 +18,20 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import re
+import stat
 import sys
 from pathlib import Path
 
 SUM_FILE = "SHA256SUMS.txt"
-REQUIRED_FILES = ("ha-ui.exe", "receipt.json")
+EXE_FILE = "ha-ui.exe"
+RECEIPT_FILE = "receipt.json"
+REQUIRED_FILES = (EXE_FILE, RECEIPT_FILE)
+ALLOWED_FILES = REQUIRED_FILES + (SUM_FILE,)
 HEX64 = re.compile(r"\A[0-9a-fA-F]{64}\Z")
+_FILE_ATTRIBUTE_REPARSE_POINT = getattr(
+    stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 
 
 def sha256_file(path: Path) -> str:
@@ -33,11 +42,27 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def is_reparse_point(path: Path) -> bool:
+    """True for symlinks and Windows reparse points (junctions, etc.)."""
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    if path.is_symlink():
+        return True
+    attributes = getattr(info, "st_file_attributes", 0)
+    return bool(attributes & _FILE_ATTRIBUTE_REPARSE_POINT)
+
+
 def parse_sums(path: Path) -> tuple[dict[str, str], list[str]]:
     problems: list[str] = []
     entries: dict[str, str] = {}
-    if not path.is_file():
+    if not path.exists():
         return entries, ["missing " + SUM_FILE]
+    if is_reparse_point(path):
+        return entries, ["reparse point not allowed: " + SUM_FILE]
+    if not path.is_file():
+        return entries, ["not a regular file: " + SUM_FILE]
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeError):
@@ -73,27 +98,69 @@ def parse_sums(path: Path) -> tuple[dict[str, str], list[str]]:
     return entries, problems
 
 
+def _plain_delivery_file(path: Path, name: str) -> list[str]:
+    problems: list[str] = []
+    if is_reparse_point(path):
+        problems.append("reparse point not allowed: " + name)
+        return problems
+    try:
+        info = path.lstat()
+    except OSError:
+        problems.append("missing file: " + name)
+        return problems
+    if not stat.S_ISREG(info.st_mode):
+        problems.append("not a regular file: " + name)
+    return problems
+
+
 def verify(dist: Path) -> list[str]:
     dist = Path(dist)
     problems: list[str] = []
+    if not dist.exists():
+        return ["delivery directory missing: " + str(dist)]
+    if is_reparse_point(dist):
+        return ["delivery directory is a reparse point: " + str(dist)]
+    if not dist.is_dir():
+        return ["delivery path is not a directory: " + str(dist)]
+
     entries, parse_problems = parse_sums(dist / SUM_FILE)
     problems.extend(parse_problems)
-    on_disk = {path.name for path in dist.iterdir() if path.is_file()}
+
+    # The manifest must cover exactly the EXE and the receipt.
+    entry_names = set(entries)
     for name in REQUIRED_FILES:
-        if name not in entries:
+        if name not in entry_names:
             problems.append("missing entry: " + name)
-    for name, digest in sorted(entries.items()):
-        target = dist / name
-        if target.is_symlink():
-            problems.append("symlink not allowed: " + name)
-            continue
-        if not target.is_file():
+    for name in sorted(entry_names - set(REQUIRED_FILES)):
+        problems.append("unexpected entry in manifest: " + name)
+    for name in REQUIRED_FILES:
+        if not (dist / name).exists():
             problems.append("missing file: " + name)
+
+    # The delivery directory itself must contain exactly the three allowed
+    # plain files. Extra files, directories, symlinks and reparse points are
+    # all rejected, so the uploaded artifact cannot silently grow.
+    try:
+        children = sorted(dist.iterdir(), key=lambda path: path.name)
+    except OSError:
+        return problems + ["unreadable delivery directory: " + str(dist)]
+    for child in children:
+        name = child.name
+        if name not in ALLOWED_FILES:
+            problems.append("unexpected entry in delivery directory: " + name)
             continue
+        problems.extend(_plain_delivery_file(child, name))
+
+    for name, digest in sorted(entries.items()):
+        if name not in REQUIRED_FILES:
+            continue
+        target = dist / name
+        if is_reparse_point(target):
+            continue  # already reported by the boundary walk
+        if not target.is_file():
+            continue  # already reported as missing/non-regular
         if sha256_file(target) != digest:
             problems.append("hash mismatch: " + name)
-    for name in sorted(on_disk - set(entries) - {SUM_FILE}):
-        problems.append("unlisted file: " + name)
     return problems
 
 

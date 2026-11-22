@@ -57,13 +57,17 @@ Issue #110 的 Windows 本地 MVP：读取两台 VPS（A/B）上已存在的同�
    - **完整性校验**（在解压后的 `dist` 目录执行，Windows PowerShell）：
 
      ```powershell
+     # 源代码必须与 artifact 的 receipt.git_head 对应：
+     git checkout <receipt.git_head>
      Get-FileHash .\dist\ha-ui.exe -Algorithm SHA256
      python ha-ui\ci\verify_receipt.py --dist dist
      python ha-ui\ci\verify_artifact_sums.py --dist dist
      ```
 
-     三条都必须通过；`receipt.json` 的 `signed=false` 表示未签名，Windows 可能
-     弹 SmartScreen。只能从本仓库 Actions artifact 或本仓库 CI 记录的哈希获取 EXE。
+     三条都必须通过；`verify_receipt.py` 会重算 source-tree 与 tool 哈希，若当前
+     checkout 不是 `receipt.git_head` 对应版本会失败。`receipt.json` 的
+     `signed=false` 表示未签名，Windows 可能弹 SmartScreen。只能从本仓库 Actions
+     artifact 或本仓库 CI 记录的哈希获取 EXE。
    - **本地重新构建**：按「快速开始」安装 pinned 依赖后执行
      `python ha-ui\scripts\build_windows.py`；要求 Python 3.13、PyInstaller 6.22.3
      与 `requirements.txt` 的 pinned 依赖；产物在 `dist\`。

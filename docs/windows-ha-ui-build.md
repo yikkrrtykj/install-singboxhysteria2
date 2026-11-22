@@ -168,7 +168,10 @@ gh run download <run-id> -n ha-ui-windows-exe -D dist
 
 先看 `receipt.json` 的 `app_version`、`git_head`（构建 commit）、`built_at`、
 `source_tree_sha256`、`exe_sha256`、`pyinstaller`、`python` 与 pinned 依赖版本，
-确认与预期一致；然后在解压后的 `dist` 目录执行：
+确认与预期一致；**源代码 checkout 必须与 artifact 的 `receipt.git_head` 对应**
+（`git checkout <receipt.git_head>` 或使用同一 commit 的源码目录），否则
+`verify_receipt.py` 的 source-tree/tool 哈希会按设计失败。然后在解压后的 `dist`
+目录执行：
 
 ```powershell
 # receipt/EXE/source-tree/tool 哈希 + selftest/signed/embedded 标志：
