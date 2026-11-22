@@ -821,8 +821,20 @@ def test_probe_policy_default_and_legacy_option(qtbot, ui_workspace):
     assert ProbePolicy() == ProbePolicy(5, 5000)
     assert combo.currentData() == ProbePolicy()
     assert combo.itemText(combo.currentIndex()).startswith("5s / 5000ms")
-    previous_default = combo.findData(ProbePolicy(5, 2000))
-    assert previous_default >= 0
-    combo.setCurrentIndex(previous_default)
-    assert combo.currentData() == ProbePolicy(5, 2000)
+    # Qt's findData cannot reliably compare the frozen dataclass payload, so
+    # exercise the operator-visible labels and the selected payload instead.
+    expected = (
+        ("5s / 2000ms", ProbePolicy(5, 2000)),
+        ("3s / 1000ms", ProbePolicy(3, 1000)),
+        ("10s / 5000ms", ProbePolicy(10, 5000)),
+    )
+    for text, policy in expected:
+        index = combo.findText(text)
+        assert index >= 0, text
+        combo.setCurrentIndex(index)
+        assert combo.currentData() == policy
+    # Restore the default and verify the previous default is still selectable
+    # without changing the product behavior.
+    combo.setCurrentIndex(combo.findText("5s / 5000ms（默认）"))
+    assert combo.currentData() == ProbePolicy(5, 5000)
     assert recorder.errors == []

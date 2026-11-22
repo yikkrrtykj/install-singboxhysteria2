@@ -298,8 +298,46 @@ def test_default_probe_policy_produces_verified_i5_t5000_yaml():
         manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
         assert manifest["policy"]["interval"] == 5
         assert manifest["policy"]["timeout"] == 5000
+        assert {entry.group for entry in result.files} == {"A-first", "B-first"}
+        assert {entry.client for entry in result.files} == {
+            item.name for item in batch.selected}
         for entry in result.files:
             yaml = Path(entry.path).read_text(encoding="utf-8")
             assert "    interval: 5\n    timeout: 5000\n" in yaml
             assert yaml.count("skip-cert-verify: false") == 2
             assert "skip-cert-verify: true" not in yaml
+            assert fakes.file_sha256(Path(entry.path)) == entry.sha256
+
+        # The policy change must be exactly the two HA-04 overlay fields. A
+        # second run with the previous 5s/2000ms policy must produce otherwise
+        # identical A-first and B-first YAML, and the HA-03 60s/5000ms control
+        # artifact must not change.
+        legacy = GenerationPipeline(workspace).generate(
+            run_id="legacy-probe-i5-t2000",
+            config_version="itest-legacy-i5-t2000",
+            policy=ProbePolicy(5, 2000),
+            selected=batch.selected,
+            exports=batch.exports,
+            pins=batch.run_pins(),
+        )
+        assert legacy.ok is True
+        legacy_root = workspace / "runs" / legacy.run_id
+        current_files = {(entry.client, entry.group): Path(entry.path)
+                         for entry in result.files}
+        legacy_files = {(entry.client, entry.group): Path(entry.path)
+                        for entry in legacy.files}
+        assert set(current_files) == set(legacy_files)
+        for key, current_path in current_files.items():
+            current_yaml = current_path.read_text(encoding="utf-8")
+            legacy_yaml = legacy_files[key].read_text(encoding="utf-8")
+            assert current_yaml == legacy_yaml.replace(
+                "    interval: 5\n    timeout: 2000\n",
+                "    interval: 5\n    timeout: 5000\n")
+            client = key[0]
+            current_ha03 = (root / "ha03" / (client + "-hac.yaml")).read_text(
+                encoding="utf-8")
+            legacy_ha03 = (legacy_root / "ha03" / (client + "-hac.yaml")).read_text(
+                encoding="utf-8")
+            assert current_ha03 == legacy_ha03
+            assert "    interval: 60\n    timeout: 5000\n" in current_ha03
+
