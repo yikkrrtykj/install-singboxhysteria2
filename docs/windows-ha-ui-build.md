@@ -70,10 +70,11 @@ cd ha-ui
 
 ## 4. CI
 
-审查用 workflow 模板：`ha-ui/ci/ha-ui-workflow.yml`。**当前未激活**：GitHub 对 OAuth
-token 的 workflow 文件更新要求 `workflow` scope，本仓库自动化 token 只有 `repo` scope
-（`gh auth status` 可复核），因此模板随 PR 提交、不会自动生效；本仓库不得声称 HA-UI
-Windows CI 已激活。已有仓库 CI 仍会跑其它 lane，但不能替代本文 Windows 矩阵。
+审查用 workflow 模板：`ha-ui/ci/ha-ui-workflow.yml`；**已激活**为
+`.github/workflows/ha-ui.yml`（PR #117，main 合并后启用）。GitHub 对 OAuth token
+的 workflow 文件更新要求 `workflow` scope；激活时已由维护者授权，模板与激活文件
+保持逐字节一致（`test_packaging.py` 会校验）。历史激活步骤保留在 §4.2，供审计；
+已有仓库 CI 仍会跑其它 lane，Windows 专项矩阵由 `ha-ui.yml` 独立运行。
 
 ### 4.1 本机镜像（无需 workflow scope，验收必跑）
 
@@ -87,8 +88,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File ha-ui\ci\run-windows-ci.ps1 
 
 该脚本与 CI 矩阵同源：Python 3.13 检查、`pip check`、精确 pin gate、offscreen pytest
 （含真实 NTFS ACL 测试）、GUI `--self-test`、PyInstaller EXE 构建 + EXE 冷启动
-self-test、receipt/EXE SHA-256 校验，并把结果写到 `.scratch/ci/summary.json`
-（git-ignored）。`-SkipBuild` 可只跑测试。
+self-test、receipt/EXE SHA-256 校验、`verify_artifact_sums.py` 全文件哈希校验，并把
+结果写到 `.scratch/ci/summary.json`（git-ignored）。`-SkipBuild` 可只跑测试。
 
 专用 gate：
 
@@ -142,31 +143,63 @@ gh run list --workflow ha-ui.yml --repo yikkrrtykj/install-singboxhysteria2 --li
 | --- | --- |
 | `static-gates`（ubuntu） | `py_compile`、`check_pins.py --static-only`、禁止监听/自动导入静态门 |
 | `windows-tests`（windows-2022） | 固定依赖 + `pip check` + 精确 pin gate + offscreen pytest（含 ACL 测试）+ `--self-test`，上传 JUnit |
-| `windows-exe`（windows-2022） | 构建 EXE + 冷启动 self-test + `verify_receipt.py`（Python/PyInstaller/依赖/tool/source-tree/EXE 大小与 SHA-256）+ step summary + artifact（`if-no-files-found: error`） |
+| `windows-exe`（windows-2022） | 构建 EXE + 冷启动 self-test + `verify_receipt.py`（Python/PyInstaller/依赖/tool/source-tree/EXE 大小与 SHA-256）+ `verify_artifact_sums.py`（SHA256SUMS 中每个文件的落盘哈希）+ step summary + artifact（`if-no-files-found: error`） |
 
 workflow 不连接 VPS、不读取真实凭据、不合并/部署；CI 通过不能替代真实 Windows +
 两台已授权 VPS 的验收。
 
 ## 5. 下载/交付校验
 
-拿到 CI 或本地构建的产物后：
+### 5.1 从 GitHub Actions 获取（推荐）
+
+- Workflow 页面：
+  <https://github.com/yikkrrtykj/install-singboxhysteria2/actions/workflows/ha-ui.yml>
+- 在 `main` 最近一次成功的 HA-UI run 下载 artifact **`ha-ui-windows-exe`**
+  （`ha-ui.exe`、`receipt.json`、`SHA256SUMS.txt`）。workflow 中
+  `retention-days: 7`，artifact 约 7 天后过期；过期后从新的 run 下载或按 §5.3
+  本地重建。本轮不引入 GitHub Release 自动发布。
 
 ```powershell
-# 一次校验 EXE 大小/SHA-256、receipt 版本/依赖、5 个 tool 哈希、source-tree 哈希、
-# self-test、signed=false、configuration_embedded=false：
+gh run list --workflow ha-ui.yml --branch main --limit 1
+gh run download <run-id> -n ha-ui-windows-exe -D dist
+```
+
+### 5.2 版本识别与完整性校验
+
+先看 `receipt.json` 的 `app_version`、`git_head`（构建 commit）、`built_at`、
+`source_tree_sha256`、`exe_sha256`、`pyinstaller`、`python` 与 pinned 依赖版本，
+确认与预期一致；**源代码 checkout 必须与 artifact 的 `receipt.git_head` 对应**
+（`git checkout <receipt.git_head>` 或使用同一 commit 的源码目录），否则
+`verify_receipt.py` 的 source-tree/tool 哈希会按设计失败。然后在解压后的 `dist`
+目录执行：
+
+```powershell
+# receipt/EXE/source-tree/tool 哈希 + selftest/signed/embedded 标志：
 python ha-ui\ci\verify_receipt.py --dist dist
+# SHA256SUMS 中每一个文件的落盘 SHA-256（错误哈希/文件缺失/篡改/未列出文件都失败）：
+python ha-ui\ci\verify_artifact_sums.py --dist dist
+# 人工复核：
+Get-FileHash dist\ha-ui.exe -Algorithm SHA256
+Get-Content dist\receipt.json -Raw | ConvertFrom-Json |
+  Select-Object app_version,git_head,built_at,source_tree_sha256,exe_sha256,signed,configuration_embedded,selftest
 ```
 
-人工复核也可：
+要求：`exe_sha256` 与 `Get-FileHash` 一致；`SHA256SUMS.txt` 中每一项都匹配实际
+文件；`signed=false`（未签名，Windows 可能提示 SmartScreen）；
+`configuration_embedded=false`；`selftest.ok=true`。只能从本仓库 Actions artifact
+或本仓库 CI 记录的哈希获取 EXE，不要使用来源不明的同名文件。
+
+### 5.3 本地重新构建
 
 ```powershell
-Get-FileHash dist\ha-ui.exe -Algorithm SHA256
-Get-Content dist\receipt.json -Raw | ConvertFrom-Json | Select-Object exe_sha256,signed,configuration_embedded,selftest
+py -3.13 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r ha-ui\requirements-dev.txt
+.\.venv\Scripts\python.exe ha-ui\scripts\build_windows.py
+# 构建后必须对 dist 再跑 §5.2 的两条校验
 ```
 
-要求：`exe_sha256` 与 `Get-FileHash` 一致；`signed=false`（未签名，Windows 可能提示
-SmartScreen）；`configuration_embedded=false`；`selftest.ok=true`。只能从本仓库
-Actions artifact 或本仓库 CI 记录的哈希获取 EXE，不要使用来源不明的同名文件。
+要求 Python 3.13、PyInstaller 6.22.3 与 `requirements.txt` 的 pinned 依赖；未签名
+EXE 仅作为本地/CI 构建产物，不替代真实环境验收。
 
 ## 6. 回滚/卸载
 

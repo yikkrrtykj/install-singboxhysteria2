@@ -72,6 +72,8 @@ def static_checks() -> list[str]:
         problems.append("missing local CI runner")
     if not (APP_ROOT / "ci" / "verify_receipt.py").is_file():
         problems.append("missing receipt verifier")
+    if not (APP_ROOT / "ci" / "verify_artifact_sums.py").is_file():
+        problems.append("missing artifact sums verifier")
     if not (APP_ROOT / "ci" / "activate-workflow.ps1").is_file():
         problems.append("missing workflow activation helper")
     return problems

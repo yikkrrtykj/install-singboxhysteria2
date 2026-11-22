@@ -21,6 +21,7 @@ BUILD_SCRIPT = APP_ROOT / "scripts" / "build_windows.py"
 # right scope (documented in docs/windows-ha-ui-build.md).
 WORKFLOW_TEMPLATE = APP_ROOT / "ci" / "ha-ui-workflow.yml"
 WORKFLOW_LIVE = REPO_ROOT / ".github" / "workflows" / "ha-ui.yml"
+SUM_VERIFIER = APP_ROOT / "ci" / "verify_artifact_sums.py"
 
 
 def load_build_module():
@@ -87,6 +88,8 @@ def test_ci_workflow_template_runs_pinned_windows_build_and_selftest():
     assert "python -m pip check" in text
     assert "ha-ui/ci/check_pins.py" in text
     assert "ha-ui/ci/verify_receipt.py" in text
+    assert "ha-ui/ci/verify_artifact_sums.py" in text
+    assert "Verify SHA256SUMS hashes every built artifact" in text
     assert "if-no-files-found: error" in text
     assert "GITHUB_STEP_SUMMARY" in text
     assert "source_tree_sha256" in text
@@ -108,12 +111,13 @@ def test_ci_support_scripts_exist_and_are_safe_text():
     runner = APP_ROOT / "ci" / "run-windows-ci.ps1"
     activate = APP_ROOT / "ci" / "activate-workflow.ps1"
     verifier = APP_ROOT / "ci" / "verify_receipt.py"
-    for path in (check, runner, activate, verifier):
+    for path in (check, runner, activate, verifier, SUM_VERIFIER):
         assert path.is_file(), path
     runner_text = runner.read_text(encoding="utf-8")
     assert "pip check" in runner_text
     assert "check_pins.py" in runner_text
     assert "verify_receipt.py" in runner_text
+    assert "verify_artifact_sums.py" in runner_text
     assert "Get-FileHash" in runner_text
     assert "selftest" in runner_text
     activate_text = activate.read_text(encoding="utf-8")
