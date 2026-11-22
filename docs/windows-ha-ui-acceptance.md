@@ -234,7 +234,7 @@ Layer B 失败并停止**。
 | --- | --- | --- |
 | C1 | GUI 连接 A/B，读取客户端 | 列表与两端只读查询一致；单端/不完整客户端被禁止选择 |
 | C2 | 选择 1 个客户端 + A-first，勾选菜单生成同意 | 生成完成；显示 `<client>-A-first.yaml` 与 SHA-256 |
-| C3 | 同客户端生成 B-first | 4 节点顺序/角色正确；`自动选择` 组为 5s/2000ms；`skip-cert-verify:false` + 正确 A/B pin；HA-03 `<name>-hac.yaml` 保留 60s/5000ms 对照 |
+| C3 | 同客户端生成 B-first | 4 节点顺序/角色正确；`自动选择` 组为 5s/5000ms（本轮默认；5s/2000ms 需手动选择）；`skip-cert-verify:false` + 正确 A/B pin；HA-03 `<name>-hac.yaml` 保留 60s/5000ms 对照 |
 | C4 | 批量 2+ 客户端 | 每客户端独立 A-first/B-first 文件；manifest/文件名/角色一致 |
 | C5 | 失败注入（仅在隔离 VPS，经批准）：临时改坏一个客户端/模拟菜单失败/中断网络 | 工具 fail-closed（`E_REMOTE_MENU`/`E_CLIENT_*`/`E_CHAIN_*` 等）；本地不产生交付；旧成功产物不变；无部分 YAML 被接受 |
 | C6 | 取消/关闭窗口 | 取消可中断到阶段边界；无残留临时交付；失败运行目录可删除 |
