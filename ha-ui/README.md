@@ -5,6 +5,10 @@ Issue #110 的 Windows 本地 MVP：读取两台 VPS（A/B）上已存在的同�
 （每个阶段执行已有 `--check`），生成可人工导入 Clash Verge Rev 的
 `<client>-A-first.yaml` / `<client>-B-first.yaml`。
 
+- HA-04 健康检查默认 **5s / 5000ms**；旧 5s / 2000ms 仍可手动选择。
+- 最终只交付 YAML，依赖 Mihomo 原生 fallback 自动接管；更高优先级节点恢复后可能自动回切，
+  不需要或包含 Sticky 控制器、额外客户端进程。
+
 - 本地工具：无公网/本地监听端口，不自动导入 Clash、不开启 TUN、不改系统代理。
 - 只读服务器：不修改 `sbconfig_server.json`，不重启 sing-box，不激活 Monitor/E3 管理面。
 - 凭据：SSH 密码可选保存到 Windows 凭据管理器；所有含凭据文件位于

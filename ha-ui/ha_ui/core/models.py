@@ -22,7 +22,7 @@ VPS_TO_GROUP = {"A": "A-first", "B": "B-first"}
 INTERVALS = (3, 5, 10)
 TIMEOUTS = (1000, 2000, 5000)
 DEFAULT_INTERVAL = 5
-DEFAULT_TIMEOUT = 2000
+DEFAULT_TIMEOUT = 5000
 
 
 @dataclass(frozen=True)

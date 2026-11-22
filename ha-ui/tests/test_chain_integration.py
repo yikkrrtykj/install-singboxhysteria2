@@ -266,3 +266,39 @@ def test_second_run_is_isolated_and_leaves_the_first_untouched(chain,
             "previous artifact was modified: %s" % path)
     for entry in chain.result.files:
         assert fakes.file_sha256(entry.path) == entry.sha256
+
+
+# The GUI's default must pass through the real reviewed HA chain, not only
+# update its dropdown label. Explicit legacy i5/t2000 runs above are preserved.
+def test_default_probe_policy_produces_verified_i5_t5000_yaml():
+    policy = ProbePolicy()
+    assert policy == ProbePolicy(5, 5000)
+    with fakes.workspace_environment("default-probe-policy") as workspace:
+        batch = fakes.synthetic_batch()
+        result = GenerationPipeline(workspace).generate(
+            run_id="default-probe-i5-t5000",
+            config_version="itest-default-i5-t5000",
+            policy=policy,
+            selected=batch.selected,
+            exports=batch.exports,
+            pins=batch.run_pins(),
+        )
+        assert result.ok is True
+        assert all(stage.ok for stage in result.stages)
+        assert [stage.stage for stage in result.stages] == (
+            EXPECTED_STAGES + ["friendly-%s" % item.name
+                               for item in batch.selected])
+        root = workspace / "runs" / result.run_id
+        receipt = json.loads((root / "run.json").read_text(encoding="utf-8"))
+        assert receipt["policy"] == {"interval": 5, "timeout": 5000}
+        variant_dir = root / "ha04-i5-t5000"
+        assert variant_dir.is_dir()
+        manifests = list(variant_dir.glob("ha4-fastprobe-*-i5-t5000.json"))
+        assert len(manifests) == 1
+        manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
+        assert manifest["policy"] == {"interval": 5, "timeout": 5000}
+        for entry in result.files:
+            yaml = Path(entry.path).read_text(encoding="utf-8")
+            assert "    interval: 5\n    timeout: 5000\n" in yaml
+            assert yaml.count("skip-cert-verify: false") == 2
+            assert "skip-cert-verify: true" not in yaml

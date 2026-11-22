@@ -512,7 +512,7 @@ def test_group_mapping_is_visible_and_passed_to_generation(qtbot, ui_workspace):
     call = fake.generate_calls[0]
     assert [(item.name, item.group) for item in call["selected"]] == [
         ("alpha", "B-first"), ("delta", "A-first")]
-    assert call["policy"] == ProbePolicy(5, 2000)  # default policy
+    assert call["policy"] == ProbePolicy(5, 5000)  # default policy
     assert call["allow_cli"] is True
     assert call["cleanup_failed"] is False
     assert fake.generate_sessions is not None
@@ -810,3 +810,19 @@ def test_app_self_test_exits_zero(qtbot, ui_workspace, capsys):
     captured = capsys.readouterr()
     assert "HA-UI self-test: OK" in captured.out
     assert captured.err == ""
+
+
+# Default probe policy comes from the shared model; the previous default remains
+# an explicit operator choice (not a silently changed historical artifact).
+def test_probe_policy_default_and_legacy_option(qtbot, ui_workspace):
+    window, recorder, _fake, _connect, _folders = _make_window(
+        qtbot, ui_workspace)
+    combo = window.generate_panel.policy_combo
+    assert ProbePolicy() == ProbePolicy(5, 5000)
+    assert combo.currentData() == ProbePolicy()
+    assert combo.itemText(combo.currentIndex()).startswith("5s / 5000ms")
+    previous_default = combo.findData(ProbePolicy(5, 2000))
+    assert previous_default >= 0
+    combo.setCurrentIndex(previous_default)
+    assert combo.currentData() == ProbePolicy(5, 2000)
+    assert recorder.errors == []

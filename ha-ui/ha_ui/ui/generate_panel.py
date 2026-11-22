@@ -53,7 +53,8 @@ from .session_service import SessionGenerationService, format_stage
 from .workers import WorkerRunner
 
 POLICY_OPTIONS: tuple[tuple[str, ProbePolicy], ...] = (
-    ("5s / 2000ms（默认）", ProbePolicy(5, 2000)),
+    ("5s / 5000ms（默认）", ProbePolicy()),
+    ("5s / 2000ms", ProbePolicy(5, 2000)),
     ("3s / 1000ms", ProbePolicy(3, 1000)),
     ("10s / 5000ms", ProbePolicy(10, 5000)),
 )
@@ -133,7 +134,7 @@ class GeneratePanel(QWidget):
             self.policy_combo.addItem(text, policy)
         self.policy_combo.setCurrentIndex(0)
         policy_hint = QLabel(
-            "HA-04 快速探测间隔/超时；默认 5s / 2000ms。", self)
+            "HA-04 快速探测间隔/超时；默认 5s / 5000ms。", self)
         policy_hint.setObjectName("hint")
         policy_row.addWidget(self.policy_label)
         policy_row.addWidget(self.policy_combo)
