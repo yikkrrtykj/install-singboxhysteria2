@@ -107,10 +107,15 @@ jobs:
           python3 -m py_compile tools/mihomo-competition-ha-batch.py
           python3 -m py_compile tools/mihomo-competition-ha-profile.py
           python3 -m py_compile tools/mihomo-competition-ha4-fastprobe.py
+          python3 -m py_compile tools/mihomo-competition-ha4-sticky.py
+          python3 -m py_compile tests/test-mihomo-competition-ha4-sticky.py
           python3 -m py_compile tests/mihomo-competition-ha4-lab.py
           python3 -m py_compile tests/mihomo-competition-ha-core-load.py
           python3 -m py_compile tools/mihomo-quality-failover.py tools/mihomo-quality-pilot.py tools/mihomo-quality-client.py tools/quality_failover/*.py
           python3 -m py_compile tests/test_quality_failover.py tests/test_quality_pilot.py tests/test_quality_daily.py tests/mihomo-quality-runtime-lab.py tests/mihomo-quality-pilot-lab.py tests/mihomo-quality-daily-lab.py
+
+      - name: "HA-04 sticky controller hermetic unit tests"
+        run: python3 tests/test-mihomo-competition-ha4-sticky.py
 
       # Scratch-directory hygiene, measured across every shell suite. A lane
       # that reads an inherited $TMP instead of creating its own is green on a
@@ -601,14 +606,33 @@ jobs:
         run: "echo 'journal-time + E3 M1/M2/M3/M3-C LIVE systemd + sbox-jr LIVE + sbox-cm/monitor unit validation: all green on ${{ matrix.os }}'"
 
   # ---------------------------------------------------------------------
+  # HA-04 sticky controller -- Windows hermetic unit lane. No Mihomo core,
+  # no Windows profile/TUN/proxy and no real endpoint is used. The real-core
+  # loopback LAB and the single-PC evidence remain separate/non-CI.
+  # ---------------------------------------------------------------------
+  ha04-sticky-windows-unit:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Static gate
+        run: |
+          python -m py_compile tools/mihomo-competition-ha4-sticky.py
+          python -m py_compile tests/test-mihomo-competition-ha4-sticky.py
+      - name: Hermetic controller unit tests
+        run: python tests/test-mihomo-competition-ha4-sticky.py
+
+  # ---------------------------------------------------------------------
   # Aggregator -- the single merge-gate verdict. It FAILS unless fast-checks,
-  # core-regression, monitor-regression and every bash-suites matrix cell
-  # all succeeded. (The monitor-packaging workflow owns the packaging
-  # contracts and is a separate required check.)
+  # core-regression, monitor-regression, every bash-suites matrix cell and the
+  # HA-04 Windows unit lane all succeeded. (The monitor-packaging workflow owns
+  # the packaging contracts and is a separate required check.)
   # ---------------------------------------------------------------------
   ci-gate:
     runs-on: ubuntu-24.04
-    needs: [fast-checks, core-regression, monitor-regression, bash-suites]
+    needs: [fast-checks, core-regression, monitor-regression, bash-suites, ha04-sticky-windows-unit]
     # `if: always()` so a matrix-cell failure still reaches the gate and is
     # reported as an explicit red verdict rather than a silent skip.
     if: always()
@@ -619,9 +643,10 @@ jobs:
           CORE: ${{ needs.core-regression.result }}
           MONITOR: ${{ needs.monitor-regression.result }}
           SUITES: ${{ needs.bash-suites.result }}
+          HA04: ${{ needs.ha04-sticky-windows-unit.result }}
         run: |
-          echo "fast-checks=$FAST core-regression=$CORE monitor-regression=$MONITOR bash-suites=$SUITES"
-          for lane in "$FAST" "$CORE" "$MONITOR" "$SUITES"; do
+          echo "fast-checks=$FAST core-regression=$CORE monitor-regression=$MONITOR bash-suites=$SUITES ha04-sticky-windows-unit=$HA04"
+          for lane in "$FAST" "$CORE" "$MONITOR" "$SUITES" "$HA04"; do
             if [ "$lane" != "success" ]; then
               echo "::error::ci-gate FAILED: a lane resolved to '$lane' (only 'success' passes)"
               exit 1
