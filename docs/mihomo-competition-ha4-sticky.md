@@ -19,11 +19,14 @@ The existing selector group (`节点选择`) is the outer traffic selector:
 - normal: outer selector = PREFERRED (`Reality` for A-first, `Backup-Reality`
   for a B-first profile after applying its physical mapping);
 - the existing `自动选择` fallback group remains the **health detector** only;
-- when the outer-selected node is observed unhealthy, the controller selects
-  the next healthy candidate in the configured sticky order by PUT on the
-  outer selector;
-- a higher-priority node recovering later changes only the fallback health
-  group's internal `now`; the outer selector remains on the takeover node;
+- when the outer-selected node is confirmed unhealthy, the controller selects
+  a confirmed-healthy candidate: first the candidates after the current one in
+  original order, then already-recovered higher-priority candidates if no lower
+  candidate is healthy. That is a new takeover caused by the current-path
+  failure, not a failback while the current path is healthy;
+- a higher-priority node recovering while the current outer node is healthy
+  changes only the fallback health group's internal `now`; the outer selector
+  remains on the current takeover node;
 - only an explicit admin `reset` returns the outer selector to PREFERRED.
 
 The selected outer node is persisted by Mihomo (`store-selected: true`) and by
@@ -38,23 +41,26 @@ existing connections and the controller never claims lossless migration.
 | `PREFERRED` | outer selector on preferred node, healthy | preferred becomes unhealthy -> `TAKEOVER_PENDING` |
 | `TAKEOVER_PENDING` | selected candidate, PUT in flight | verified PUT -> `TAKEOVER_LOCKED`; failure -> `UNKNOWN` |
 | `TAKEOVER_LOCKED` | outer selector manually locked to takeover node | higher-priority recovery: no action; locked node unhealthy -> `RECONFIRMING`; external change -> `MANUAL_RESET` |
-| `RECONFIRMING` | next lower healthy candidate selected | verified -> `TAKEOVER_LOCKED`; none -> `DUAL_DOWN` |
-| `UNKNOWN` | API/state/binding cannot be trusted | no writes; explicit admin reset required |
-| `DUAL_DOWN` | no lower healthy candidate | lower/locked recovery may re-lock; higher-priority recovery alone does not auto-restore |
+| `RECONFIRMING` | current node failed; lower-then-higher healthy candidate selection | verified -> `TAKEOVER_LOCKED`; none/unknown -> `DUAL_DOWN`/`UNKNOWN` |
+| `UNKNOWN` | API/health/state cannot be trusted | transient API loss and incomplete health may auto-reconcile after verified refresh; auth/binding/manual/mismatch require admin |
+| `DUAL_DOWN` | all four candidates are confirmed unhealthy | recovery of any confirmed-healthy candidate can take over; unknown health never becomes DOWN |
 | `MANUAL_RESET` | outer selection changed outside the controller | no write; explicit admin reset required |
 
-Sticky order is strictly **downward only** after the first takeover. If the
-current node and all lower-priority candidates are unavailable, state becomes
-`DUAL_DOWN`; a recovered higher-priority node is not automatically restored.
-This is deliberate: requirement 5 says only the administrator restores the
-preferred path. If a site wants a different policy, it requires explicit
-approval and a new state-machine change.
+Sticky ordering applies only to the choice of a takeover candidate while the
+current outer node is healthy: higher-priority recovery is ignored. Once the
+current node is **confirmed unhealthy**, candidates after it are preferred; if
+all of those are confirmed unhealthy, a confirmed-healthy higher-priority node
+is eligible. `DUAL_DOWN` is entered only when all four candidates are confirmed
+unhealthy; missing/null/stale/unknown health becomes `UNKNOWN`, not DOWN.
 
 ## Controller safety properties
 
 - Python standard library only; loopback controller HTTP API; no public listener.
 - Reads `/proxies` only; no extra health probes, no `/group/*/delay`, no fixed
   selection on the fallback group.
+- Requires all four candidate nodes, exact `Fallback`/`Selector` group types and
+  membership, boolean `alive`, and fresh parsed health history; missing, null,
+  stale or unknown health becomes `UNKNOWN`, never DOWN.
 - Does not modify Mihomo source/core, TUN, DNS, system proxy, VPS, HA-UI or
   existing profiles.
 - Does not restart/stop core, clear connections, or install a service.
@@ -63,8 +69,17 @@ approval and a new state-machine change.
   node order are part of the binding. Mismatch is refused.
 - Instance lock prevents two controllers writing the same state.
 - State writes are atomic (temporary file, fsync, JSON re-read, replace).
-- The controller requires an explicit admin reset after `UNKNOWN`,
-  `MANUAL_RESET` or `DUAL_DOWN`; it never guesses a recovery.
+- Temporary connection errors are classified separately from auth failures,
+  invalid responses, group/profile mismatch and manual selection conflicts.
+  Only transient connection errors and recoverable incomplete-health states are
+  reconciled automatically, and only after verifying outer selection, state
+  binding and complete fresh health; no blind PUT is performed.
+- Auth/invalid-response/binding/manual-selection conflicts stay fail-closed
+  until an explicit admin reset.
+- A reset request is kept until its outer-selection write and verification
+  succeed; an API failure does not consume the request.
+- The controller requires an explicit admin reset after a fatal `UNKNOWN` or
+  `MANUAL_RESET`; it never guesses a recovery.
 - Controller crash/API loss does not cause a fallback to the preferred node
   (the outer selector stays where it was), but the controller also cannot take
   over a newly failed node until restarted. That is recorded as a fail-closed
@@ -87,7 +102,8 @@ A private local JSON file, e.g. `%LOCALAPPDATA%\HAS04Sticky\config.json`:
   "state_path": "C:\\Users\\<user>\\AppData\\Local\\HAS04Sticky\\state.json",
   "poll_interval_ms": 50,
   "api_timeout_ms": 1000,
-  "error_threshold": 3
+  "error_threshold": 3,
+  "health_max_age_ms": 20000
 }
 ```
 
@@ -135,13 +151,28 @@ loopback synthetic four-node profile, `tun.enable=false`, `dns.enable=false`:
   failback observed.
 - Hysteria2 then failed: controller moved to Backup-Reality; actual new
   connections landed there. A further failure selected Backup-Hysteria2 in
-  unit tests; a later VPS-B failure with no lower candidate produced
+  unit tests; when all four candidates were confirmed dead, state became
   `DUAL_DOWN` and actual requests failed (502), not a false success.
+- Current node healthy while a higher-priority node recovered: no selector
+  change; the higher-priority recovery remained health-group-only.
 - Controller killed while locked: outer selection stayed on the dead node and
-  requests failed; after restart the controller reconciled to the next lower
-  healthy node.
+  requests failed; after restart the controller reconciled to the next healthy
+  candidate.
+- Current Hysteria2 failed while all lower candidates were down and Reality had
+  recovered: controller selected Reality as a **new failure-driven takeover**
+  and actual requests landed there.
 - Root-API loss: state became `UNKNOWN`, no writes; explicit reset restored
   PREFERRED.
+- Transient-only API failures (real core, wrapper): after threshold the state
+  went `UNKNOWN`; after API recovery it auto-reconciled the persisted outer
+  selection without a blind PUT. Auth/invalid responses are covered by unit
+  tests and remain fail-closed.
+- Health incomplete/stale/missing: unit tests require `UNKNOWN` and no switch;
+  a complete fresh refresh reconciles safely.
+- Reset request interrupted by a transient API failure: request was retained;
+  after recovery it was applied and only then removed.
+- Repeated initialize / double start: unit tests show no duplicate selector
+  writes; CLI initialization failure returns non-zero.
 - Core restart with `store-selected:true`: the outer manual selection survived
   and the controller reconciled.
 - External/manual outer selection change while locked: controller entered

@@ -31,7 +31,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +43,7 @@ STATES = (
     "PREFERRED", "TAKEOVER_PENDING", "TAKEOVER_LOCKED", "RECONFIRMING",
     "UNKNOWN", "DUAL_DOWN", "MANUAL_RESET",
 )
+HEALTH_REASONS = ("healthy", "unhealthy", "unknown")
 
 
 class StickyError(Exception):
@@ -54,6 +56,18 @@ class ConfigError(StickyError):
 
 class ApiError(StickyError):
     pass
+
+
+class ApiTransientError(ApiError):
+    """Connection reset/timeout/5xx: safe to retry and reconcile."""
+
+
+class ApiAuthError(ApiError):
+    """401/403: fail closed; never auto-reconcile."""
+
+
+class ApiResponseError(ApiError):
+    """Invalid response/shape: fail closed; never auto-reconcile."""
 
 
 class StateError(StickyError):
@@ -112,6 +126,7 @@ class Config:
     poll_interval: float = 0.05
     api_timeout: float = 1.0
     error_threshold: int = 3
+    health_max_age: float = 20.0
 
     @property
     def preferred(self) -> str:
@@ -153,14 +168,19 @@ class Config:
         poll = raw.get("poll_interval_ms", 50)
         timeout = raw.get("api_timeout_ms", 1000)
         threshold = raw.get("error_threshold", 3)
+        health_age = raw.get("health_max_age_ms", 20000)
         try:
             poll_s = max(0.005, min(float(poll) / 1000.0, 5.0))
             timeout_s = max(0.1, min(float(timeout) / 1000.0, 10.0))
             threshold_i = max(1, min(int(threshold), 20))
+            health_age_raw = float(health_age)
+            if health_age_raw <= 0:
+                raise ValueError("health_max_age_ms must be positive")
+            health_age_s = max(1.0, min(health_age_raw / 1000.0, 300.0))
         except (TypeError, ValueError) as exc:
-            raise ConfigError("bad interval/timeout/threshold") from exc
+            raise ConfigError("bad interval/timeout/threshold/health-age") from exc
         return cls(url, secret, outer, health, list(order), profile, version,
-                   state, poll_s, timeout_s, threshold_i)
+                   state, poll_s, timeout_s, threshold_i, health_age_s)
 
 
 class MihomoApi:
@@ -182,17 +202,23 @@ class MihomoApi:
                 payload = json.loads(raw) if raw else None
                 return response.status, payload
         except urllib.error.HTTPError as exc:
-            raise ApiError("HTTP %s" % exc.code) from exc
-        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
-            raise ApiError("controller unavailable") from exc
+            if exc.code in (401, 403):
+                raise ApiAuthError("controller authentication failed") from exc
+            if 500 <= exc.code < 600:
+                raise ApiTransientError("controller 5xx") from exc
+            raise ApiResponseError("controller rejected request") from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise ApiTransientError("controller unavailable") from exc
+        except ValueError as exc:
+            raise ApiResponseError("invalid JSON response") from exc
 
     def proxies(self) -> dict[str, Any]:
         status, payload = self._request("GET", "/proxies")
         if status != 200 or not isinstance(payload, dict):
-            raise ApiError("bad /proxies response")
+            raise ApiResponseError("bad /proxies response")
         proxies = payload.get("proxies")
         if not isinstance(proxies, dict):
-            raise ApiError("bad /proxies payload")
+            raise ApiResponseError("bad /proxies payload")
         return proxies
 
     def select(self, group: str, name: str) -> None:
@@ -200,16 +226,39 @@ class MihomoApi:
             "PUT", "/proxies/" + urllib.parse.quote(group, safe=""),
             {"name": name})
         if status not in (200, 204):
-            raise ApiError("selection rejected")
+            raise ApiResponseError("selection rejected")
+
+
+@dataclass
+class NodeHealth:
+    state: str  # healthy | unhealthy | unknown
+    reason: str
 
 
 @dataclass
 class Snapshot:
-    nodes_alive: dict[str, bool]
+    nodes: dict[str, NodeHealth]
     outer_now: str | None
     health_now: str | None
     outer_all: list[str]
     health_all: list[str]
+    outer_type: str
+    health_type: str
+    health_complete: bool
+
+    @property
+    def all_unhealthy(self) -> bool:
+        return (self.health_complete
+                and all(n.state == "unhealthy" for n in self.nodes.values()))
+
+    def healthy(self, name: str) -> bool:
+        return (name in self.nodes and self.nodes[name].state == "healthy")
+
+    def unhealthy(self, name: str) -> bool:
+        return (name in self.nodes and self.nodes[name].state == "unhealthy")
+
+    def unknown(self, name: str) -> bool:
+        return (name not in self.nodes or self.nodes[name].state == "unknown")
 
 
 class StickyController:
@@ -241,6 +290,9 @@ class StickyController:
             "state": "PREFERRED",
             "locked_node": self.config.preferred,
             "last_outer_now": None,
+            "unknown_reason": None,
+            "unknown_prior_state": None,
+            "unknown_prior_locked": None,
             "updated_utc": _utc(),
         }
 
@@ -283,9 +335,24 @@ class StickyController:
             raise StateError("state write verification failed")
         os.replace(temp, self.state_path)
 
-    def _set_state(self, state: str, node: str | None, reason: str) -> None:
+    def _set_state(self, state: str, node: str | None, reason: str,
+                   unknown_reason: str | None = None,
+                   prior_state: str | None = None,
+                   prior_locked: str | None = None) -> None:
         if state not in STATES:
             raise StateError("invalid state " + state)
+        previous_state = self.state.get("state")
+        previous_locked = self.state.get("locked_node")
+        if state == "UNKNOWN":
+            self.state["unknown_reason"] = unknown_reason or reason
+            self.state["unknown_prior_state"] = (
+                prior_state if prior_state is not None else previous_state)
+            self.state["unknown_prior_locked"] = (
+                prior_locked if prior_locked is not None else previous_locked)
+        else:
+            self.state["unknown_reason"] = None
+            self.state["unknown_prior_state"] = None
+            self.state["unknown_prior_locked"] = None
         self.state["state"] = state
         self.state["locked_node"] = node
         self.state["last_outer_now"] = self.last_outer_now
@@ -295,19 +362,88 @@ class StickyController:
         print(json.dumps({"event": "state", "state": state, "node": node,
                           "reason": reason}, ensure_ascii=False), flush=True)
 
+    def _enter_unknown(self, reason: str) -> None:
+        """Persist UNKNOWN while retaining the safe reconciliation target."""
+        if self.state.get("state") == "UNKNOWN":
+            # Keep the first fatal/transient classification until reconciliation
+            # or an explicit reset; do not overwrite unknowns with each poll.
+            if (self.state.get("unknown_reason") not in
+                    (None, "health-unknown", "api-transient")):
+                return
+        prior_state = self.state.get("state")
+        prior_locked = self.state.get("locked_node")
+        if prior_state == "UNKNOWN":
+            prior_state = self.state.get("unknown_prior_state")
+            prior_locked = self.state.get("unknown_prior_locked")
+        self._set_state("UNKNOWN", prior_locked, reason,
+                        unknown_reason=reason,
+                        prior_state=prior_state,
+                        prior_locked=prior_locked)
+
     # ---------- observation ----------
     def snapshot(self) -> Snapshot:
         proxies = self.api.proxies()
-        outer = proxies.get(self.config.outer_group) or {}
-        health = proxies.get(self.config.health_group) or {}
-        nodes = {name: bool((proxies.get(name) or {}).get("alive"))
-                 for name in self.config.order}
+        outer = proxies.get(self.config.outer_group)
+        health = proxies.get(self.config.health_group)
+        if not isinstance(outer, dict) or not isinstance(health, dict):
+            raise StateError("required group missing")
+        outer_all = outer.get("all")
+        health_all = health.get("all")
+        if not isinstance(outer_all, list) or not isinstance(health_all, list):
+            raise StateError("group membership missing")
+        now = time.time()
+        nodes: dict[str, NodeHealth] = {}
+        for name in self.config.order:
+            entry = proxies.get(name)
+            if not isinstance(entry, dict):
+                nodes[name] = NodeHealth("unknown", "node-missing")
+                continue
+            alive = entry.get("alive")
+            if type(alive) is not bool:
+                nodes[name] = NodeHealth("unknown", "alive-not-bool")
+                continue
+            history = entry.get("history")
+            if not isinstance(history, list) or not history:
+                nodes[name] = NodeHealth("unknown", "history-missing")
+                continue
+            timestamps = []
+            for item in history:
+                if not isinstance(item, dict):
+                    continue
+                parsed = _parse_time(item.get("time"))
+                if parsed is not None:
+                    timestamps.append(parsed)
+            if not timestamps:
+                nodes[name] = NodeHealth("unknown", "history-unparseable")
+                continue
+            age = now - max(timestamps)
+            if age < 0:
+                age = 0.0
+            if age > self.config.health_max_age:
+                nodes[name] = NodeHealth("unknown", "history-stale")
+                continue
+            nodes[name] = NodeHealth("healthy" if alive else "unhealthy",
+                                     "fresh-alive" if alive else "fresh-dead")
+        health_complete = all(n.state != "unknown" for n in nodes.values())
         return Snapshot(nodes, outer.get("now"), health.get("now"),
-                        list(outer.get("all") or []), list(health.get("all") or []))
+                        list(outer_all), list(health_all),
+                        str(outer.get("type") or ""),
+                        str(health.get("type") or ""),
+                        health_complete)
 
     def validate_snapshot(self, snap: Snapshot) -> None:
+        if snap.health_type != "Fallback":
+            raise StateError("health group is not Fallback")
+        if snap.outer_type != "Selector":
+            raise StateError("outer group is not Selector")
         if snap.health_all != self.config.order:
             raise StateError("health group order changed; refusing to control")
+        allowed_outer = set(self.config.order) | {
+            self.config.health_group, "DIRECT", "REJECT"}
+        unexpected = [name for name in snap.outer_all
+                      if name not in allowed_outer]
+        if unexpected:
+            raise StateError("outer group has unexpected members")
         if not _is_subsequence(self.config.order, snap.outer_all):
             raise StateError("outer group order changed; refusing to control")
 
@@ -318,12 +454,29 @@ class StickyController:
         return snap
 
     # ---------- state helpers ----------
-    def _next_after(self, node: str, alive: dict[str, bool]) -> str | None:
-        index = self.config.order.index(node)
+    def _candidate_after_before(self, current: str, snap: Snapshot) -> str | None:
+        """Next confirmed-healthy candidate, lower priority first.
+
+        Only called after the current node is confirmed unhealthy. Lower-index
+        candidates are preferred; already-recovered higher-priority candidates
+        are eligible when all lower candidates are confirmed unhealthy. This is
+        a new takeover caused by the current path failure, not a failback while
+        the current path is healthy.
+        """
+        index = self.config.order.index(current)
         for candidate in self.config.order[index + 1:]:
-            if alive.get(candidate):
+            if snap.healthy(candidate):
+                return candidate
+        for candidate in self.config.order[:index]:
+            if snap.healthy(candidate):
                 return candidate
         return None
+
+    def _health_gate(self, snap: Snapshot) -> bool:
+        if not snap.health_complete:
+            self._enter_unknown("health-unknown")
+            return False
+        return True
 
     def _write_lock(self, node: str, reason: str) -> bool:
         self._set_state("TAKEOVER_PENDING", node, reason)
@@ -331,11 +484,20 @@ class StickyController:
             self.api.select(self.config.outer_group, node)
             time.sleep(min(self.config.poll_interval, 0.05))
             snap = self.fetch()
-        except (ApiError, StateError):
-            self._set_state("UNKNOWN", self.state.get("locked_node"), "api-write-failed")
+        except ApiTransientError:
+            self._enter_unknown("api-transient")
+            return False
+        except ApiAuthError:
+            self._enter_unknown("api-auth")
+            return False
+        except ApiResponseError:
+            self._enter_unknown("api-invalid")
+            return False
+        except StateError:
+            self._enter_unknown("binding")
             return False
         if snap.outer_now != node:
-            self._set_state("UNKNOWN", node, "selection-not-verified")
+            self._enter_unknown("selection-not-verified")
             return False
         self._set_state("TAKEOVER_LOCKED", node, reason + ":verified")
         return True
@@ -349,27 +511,116 @@ class StickyController:
         except OSError:
             pass
 
-    def _admin_reset(self) -> None:
-        self._consume_reset()
+    def _admin_reset(self) -> bool:
+        if not self._reset_requested():
+            return True
         try:
+            self.fetch()
+        except ApiTransientError:
+            self._enter_unknown("reset-transient")
+            return False
+        except ApiAuthError:
+            self._enter_unknown("reset-fatal-auth")
+            return False
+        except ApiResponseError:
+            self._enter_unknown("reset-fatal-response")
+            return False
+        except StateError:
+            self._enter_unknown("reset-fatal-binding")
+            return False
+        try:
+            self.api.select(self.config.outer_group, self.config.preferred)
+            time.sleep(min(self.config.poll_interval, 0.05))
             snap = self.fetch()
-        except (ApiError, StateError):
-            self._set_state("UNKNOWN", self.state.get("locked_node"), "reset-api-unavailable")
-            return
-        self.api.select(self.config.outer_group, self.config.preferred)
-        time.sleep(min(self.config.poll_interval, 0.05))
-        snap = self.fetch()
-        if snap.outer_now == self.config.preferred:
-            self._set_state("PREFERRED", self.config.preferred, "admin-reset")
-        else:
-            self._set_state("UNKNOWN", self.config.preferred, "admin-reset-unverified")
+        except ApiTransientError:
+            self._enter_unknown("reset-transient")
+            return False
+        except ApiAuthError:
+            self._enter_unknown("reset-fatal-auth")
+            return False
+        except ApiResponseError:
+            self._enter_unknown("reset-fatal-response")
+            return False
+        except StateError:
+            self._enter_unknown("reset-fatal-binding")
+            return False
+        if snap.outer_now != self.config.preferred:
+            self._enter_unknown("reset-unverified")
+            return False
+        self._set_state("PREFERRED", self.config.preferred, "admin-reset")
+        self._consume_reset()
+        return True
 
     # ---------- lifecycle ----------
+    def _reconcile_unknown(self, snap: Snapshot) -> bool:
+        """Safe recovery from a transient UNKNOWN; never blindly PUTs.
+
+        Only transient API/health reasons are eligible. The actual outer
+        selection must still match the persisted locked target, health must be
+        complete and the state binding was already verified at load time.
+        """
+        if self.state.get("state") != "UNKNOWN":
+            return False
+        reason = self.state.get("unknown_reason")
+        if reason not in ("api-transient", "health-unknown"):
+            return False
+        if not snap.health_complete:
+            return False
+        prior_state = self.state.get("unknown_prior_state")
+        prior_locked = self.state.get("unknown_prior_locked")
+        if prior_locked not in self.config.order:
+            self._enter_unknown("unknown-prior-invalid")
+            return False
+        if snap.outer_now != prior_locked:
+            self._set_state("MANUAL_RESET", prior_locked,
+                            "unknown-outer-mismatch")
+            return False
+        if prior_state == "PREFERRED":
+            if prior_locked != self.config.preferred:
+                self._enter_unknown("unknown-prior-invalid")
+                return False
+            if snap.healthy(prior_locked):
+                self._set_state("PREFERRED", prior_locked,
+                                "reconciled-transient")
+            else:
+                self._set_state("RECONFIRMING", prior_locked,
+                                "reconciled-transient-failure")
+            return True
+        if prior_state in ("TAKEOVER_LOCKED", "RECONFIRMING"):
+            if snap.healthy(prior_locked):
+                self._set_state("TAKEOVER_LOCKED", prior_locked,
+                                "reconciled-transient")
+            else:
+                self._set_state("RECONFIRMING", prior_locked,
+                                "reconciled-transient-failure")
+            return True
+        if prior_state == "TAKEOVER_PENDING":
+            if snap.healthy(prior_locked):
+                self._set_state("TAKEOVER_LOCKED", prior_locked,
+                                "reconciled-pending")
+            else:
+                self._set_state("RECONFIRMING", prior_locked,
+                                "reconciled-pending-failure")
+            return True
+        if prior_state == "DUAL_DOWN":
+            self._set_state("DUAL_DOWN", prior_locked, "reconciled-dual-down")
+            return True
+        self._enter_unknown("unknown-prior-invalid")
+        return False
+
     def initialize(self) -> None:
+        if self.initialized:
+            return
         self.load_state()
         snap = self.fetch()
         state = self.state["state"]
         outer = snap.outer_now
+        if state == "UNKNOWN":
+            if self._reconcile_unknown(snap):
+                self.initialized = True
+            else:
+                self.initialized = True
+            return
         if state == "PREFERRED":
             if outer != self.config.preferred:
                 if self.state_exists:
@@ -378,6 +629,7 @@ class StickyController:
                     # controller. Never silently overwrite that choice.
                     self._set_state("UNKNOWN", None,
                                     "startup-outer-mismatch")
+                    self.initialized = True
                     return
                 # First explicit activation: set the preferred outer selector.
                 self.api.select(self.config.outer_group, self.config.preferred)
@@ -386,13 +638,20 @@ class StickyController:
                 outer = snap.outer_now
             if outer != self.config.preferred:
                 self._set_state("UNKNOWN", None, "initial-selection-not-preferred")
-            else:
+            elif not snap.health_complete:
+                self._enter_unknown("health-unknown")
+            elif snap.healthy(self.config.preferred):
                 self.state["locked_node"] = self.config.preferred
                 self._set_state("PREFERRED", self.config.preferred, "startup")
+            else:
+                self._set_state("RECONFIRMING", self.config.preferred,
+                                "startup-preferred-unhealthy")
         elif state in ("TAKEOVER_LOCKED", "RECONFIRMING"):
             locked = self.state.get("locked_node")
             if locked in self.config.order and outer == locked:
-                if snap.nodes_alive.get(locked):
+                if not snap.health_complete:
+                    self._enter_unknown("health-unknown")
+                elif snap.healthy(locked):
                     self._set_state("TAKEOVER_LOCKED", locked, "startup-resume")
                 else:
                     self._set_state("RECONFIRMING", locked, "startup-locked-dead")
@@ -401,7 +660,14 @@ class StickyController:
         elif state == "TAKEOVER_PENDING":
             target = self.state.get("locked_node")
             if target in self.config.order and outer == target:
-                self._set_state("TAKEOVER_LOCKED", target, "startup-finish-pending")
+                if not snap.health_complete:
+                    self._enter_unknown("health-unknown")
+                elif snap.healthy(target):
+                    self._set_state("TAKEOVER_LOCKED", target,
+                                    "startup-finish-pending")
+                else:
+                    self._set_state("RECONFIRMING", target,
+                                    "startup-pending-failed")
             else:
                 self._set_state("UNKNOWN", target, "startup-pending-mismatch")
         # UNKNOWN/MANUAL_RESET/DUAL_DOWN stay unavailable until admin reset or
@@ -415,29 +681,47 @@ class StickyController:
         try:
             snap = self.fetch()
             self.api_errors = 0
-        except (ApiError, StateError):
+        except ApiTransientError:
             self.api_errors += 1
-            if self.api_errors >= self.config.error_threshold and self.state.get("state") != "UNKNOWN":
-                self._set_state("UNKNOWN", self.state.get("locked_node"),
-                                "api-errors")
+            if self.api_errors >= self.config.error_threshold:
+                self._enter_unknown("api-transient")
+            return
+        except ApiAuthError:
+            self._enter_unknown("api-auth")
+            return
+        except ApiResponseError:
+            self._enter_unknown("api-invalid")
+            return
+        except StateError:
+            self._enter_unknown("binding")
             return
 
         state = self.state["state"]
-        alive = snap.nodes_alive
-        outer = snap.outer_now
+        if state == "UNKNOWN":
+            self._reconcile_unknown(snap)
+            return
+        if state == "MANUAL_RESET":
+            return
+        if not snap.health_complete:
+            self._enter_unknown("health-unknown")
+            return
 
+        outer = snap.outer_now
         if state == "PREFERRED":
             if outer != self.config.preferred:
                 self._set_state("MANUAL_RESET", self.config.preferred,
                                 "outer-selection-changed-externally")
                 return
-            if not alive.get(self.config.preferred):
-                nxt = self._next_after(self.config.preferred, alive)
-                if nxt:
-                    self._write_lock(nxt, "preferred-unhealthy")
-                else:
-                    self._set_state("DUAL_DOWN", self.config.preferred,
-                                    "no-lower-healthy-candidate")
+            if snap.healthy(self.config.preferred):
+                return
+            nxt = self._candidate_after_before(self.config.preferred, snap)
+            if nxt:
+                self._write_lock(nxt, "preferred-unhealthy")
+            elif snap.all_unhealthy:
+                self._set_state("DUAL_DOWN", self.config.preferred,
+                                "all-candidates-confirmed-dead")
+            else:
+                self._enter_unknown("health-unknown")
             return
 
         if state in ("TAKEOVER_LOCKED", "RECONFIRMING"):
@@ -449,49 +733,88 @@ class StickyController:
                 self._set_state("MANUAL_RESET", locked,
                                 "outer-selection-changed-externally")
                 return
-            if not alive.get(locked):
-                nxt = self._next_after(locked, alive)
-                if nxt:
-                    self._write_lock(nxt, "locked-unhealthy")
-                else:
-                    self._set_state("DUAL_DOWN", locked,
-                                    "no-lower-healthy-candidate")
+            if snap.healthy(locked):
+                return
+            nxt = self._candidate_after_before(locked, snap)
+            if nxt:
+                self._write_lock(nxt, "locked-unhealthy")
+            elif snap.all_unhealthy:
+                self._set_state("DUAL_DOWN", locked,
+                                "all-candidates-confirmed-dead")
+            else:
+                self._enter_unknown("health-unknown")
             return
 
         if state == "DUAL_DOWN":
             locked = self.state.get("locked_node")
+            if locked and locked in self.config.order and snap.healthy(locked):
+                self._write_lock(locked, "dual-down-locked-recovered")
+                return
             if locked and locked in self.config.order:
-                if alive.get(locked):
-                    self._write_lock(locked, "dual-down-locked-recovered")
-                    return
-                nxt = self._next_after(locked, alive)
+                nxt = self._candidate_after_before(locked, snap)
                 if nxt:
-                    self._write_lock(nxt, "dual-down-lower-recovered")
+                    self._write_lock(nxt, "dual-down-candidate-recovered")
             return
 
-        # UNKNOWN / MANUAL_RESET wait for an explicit admin reset request.
+        # MANUAL_RESET/UNKNOWN wait for an explicit admin reset or safe
+        # transient reconciliation; no automatic writes here.
         return
 
     def run_forever(self, stop: "threading.Event | None" = None) -> None:
         try:
             self.initialize()
             self.initialized = True
-        except (ApiError, StateError) as exc:
-            # A controller that cannot establish a verified state must not
-            # pretend to protect anything. Persist UNKNOWN and stop.
+        except StickyError as exc:
             try:
-                self._set_state("UNKNOWN", self.state.get("locked_node"),
-                                "initialize-failed")
+                reason = ("initialize-transient"
+                          if isinstance(exc, ApiTransientError)
+                          else "initialize-fatal")
+                self._enter_unknown(reason)
             except StickyError:
                 pass
-            print("sticky: FAIL initialize %s" % exc, file=sys.stderr, flush=True)
-            return
+            print("sticky: FAIL initialize %s" % exc, file=sys.stderr,
+                  flush=True)
+            raise StickyError("initialize failed") from exc
         while stop is None or not stop.is_set():
-            self.poll_once()
+            try:
+                self.poll_once()
+            except StickyError as exc:
+                try:
+                    self._enter_unknown("loop-fatal")
+                except StickyError:
+                    pass
+                print("sticky: FAIL loop %s" % exc, file=sys.stderr,
+                      flush=True)
+                raise
+            except Exception as exc:  # noqa: BLE001 - fail closed, non-zero exit
+                try:
+                    self._enter_unknown("loop-fatal")
+                except StickyError:
+                    pass
+                print("sticky: FAIL unexpected %s" % type(exc).__name__,
+                      file=sys.stderr, flush=True)
+                raise StickyError("unexpected controller failure") from exc
             if stop is not None:
                 stop.wait(self.config.poll_interval)
             else:
                 time.sleep(self.config.poll_interval)
+
+
+def _parse_time(value: Any) -> float | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    # Python only accepts up to microsecond precision; Mihomo may emit more.
+    text = re.sub(r"(\.\d{6})\d+", r"\1", text)
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
 
 
 def _is_subsequence(needle: list[str], haystack: list[str]) -> bool:
@@ -544,9 +867,12 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     controller = StickyController(config)
     try:
-        controller.initialize()
         if args.once:
+            controller.initialize()
             controller.poll_once()
+            if controller.state.get("state") == "UNKNOWN":
+                print("sticky: FAIL once ended in UNKNOWN", file=sys.stderr)
+                return 1
             return 0
         controller.run_forever()
     except KeyboardInterrupt:
