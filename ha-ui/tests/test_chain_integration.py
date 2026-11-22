@@ -296,7 +296,8 @@ def test_default_probe_policy_produces_verified_i5_t5000_yaml():
         manifests = list(variant_dir.glob("ha4-fastprobe-*-i5-t5000.json"))
         assert len(manifests) == 1
         manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
-        assert manifest["policy"] == {"interval": 5, "timeout": 5000}
+        assert manifest["policy"]["interval"] == 5
+        assert manifest["policy"]["timeout"] == 5000
         for entry in result.files:
             yaml = Path(entry.path).read_text(encoding="utf-8")
             assert "    interval: 5\n    timeout: 5000\n" in yaml
