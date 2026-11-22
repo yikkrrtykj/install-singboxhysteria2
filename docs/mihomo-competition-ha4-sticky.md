@@ -43,7 +43,7 @@ existing connections and the controller never claims lossless migration.
 | `TAKEOVER_LOCKED` | outer selector manually locked to takeover node | higher-priority recovery: no action; locked node unhealthy -> `RECONFIRMING`; external change -> `MANUAL_RESET` |
 | `RECONFIRMING` | current node failed; lower-then-higher healthy candidate selection | verified -> `TAKEOVER_LOCKED`; none/unknown -> `DUAL_DOWN`/`UNKNOWN` |
 | `UNKNOWN` | API/health/state cannot be trusted | transient API loss and incomplete health may auto-reconcile after verified refresh; auth/binding/manual/mismatch require admin |
-| `DUAL_DOWN` | all four candidates are confirmed unhealthy | recovery of any confirmed-healthy candidate can take over; unknown health never becomes DOWN |
+| `DUAL_DOWN` | all four candidates are confirmed unhealthy | only if outer selection still equals the persisted locked node: recovery of any confirmed-healthy candidate can take over; external selection change -> `MANUAL_RESET`; unknown health never becomes DOWN |
 | `MANUAL_RESET` | outer selection changed outside the controller | no write; explicit admin reset required |
 
 Sticky ordering applies only to the choice of a takeover candidate while the
@@ -78,6 +78,10 @@ unhealthy; missing/null/stale/unknown health becomes `UNKNOWN`, not DOWN.
   until an explicit admin reset.
 - A reset request is kept until its outer-selection write and verification
   succeed; an API failure does not consume the request.
+- In `DUAL_DOWN`, automatic recovery first verifies that outer selection still
+  equals the persisted locked node. If an operator or another program selected
+  DIRECT or another node, the controller moves to `MANUAL_RESET` and performs
+  no PUT; the manual selection is preserved.
 - The controller requires an explicit admin reset after a fatal `UNKNOWN` or
   `MANUAL_RESET`; it never guesses a recovery.
 - Controller crash/API loss does not cause a fallback to the preferred node
@@ -153,6 +157,11 @@ loopback synthetic four-node profile, `tun.enable=false`, `dns.enable=false`:
   connections landed there. A further failure selected Backup-Hysteria2 in
   unit tests; when all four candidates were confirmed dead, state became
   `DUAL_DOWN` and actual requests failed (502), not a false success.
+- `DUAL_DOWN` with unchanged outer selection: a recovered node was selected
+  automatically and actual new connections landed there.
+- `DUAL_DOWN` with operator-selected DIRECT or another node: controller entered
+  `MANUAL_RESET`, performed no PUT when a VPS recovered, and preserved the
+  operator selection. A-first and B-first group-order runs both verified this.
 - Current node healthy while a higher-priority node recovered: no selector
   change; the higher-priority recovery remained health-group-only.
 - Controller killed while locked: outer selection stayed on the dead node and

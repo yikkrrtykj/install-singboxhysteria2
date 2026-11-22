@@ -87,7 +87,8 @@ class FakeApi:
         self.outer = name
 
 
-def make(tmp: Path, poll=0.001, threshold=2, health_age=20.0):
+def make(tmp: Path, poll=0.001, threshold=2, health_age=20.0,
+         config_version="unit-r1"):
     cfg = SC.Config(
         controller_url="http://127.0.0.1:19097",
         secret="unit-secret",
@@ -95,7 +96,7 @@ def make(tmp: Path, poll=0.001, threshold=2, health_age=20.0):
         health_group="自动选择",
         order=list(ORDER),
         profile_sha256=PROFILE,
-        config_version="unit-r1",
+        config_version=config_version,
         state_path=tmp / "state.json",
         poll_interval=poll,
         api_timeout=0.2,
@@ -234,6 +235,89 @@ class StateTests(unittest.TestCase):
             ctrl.poll_once()
             self.assertEqual(ctrl.state["state"], "TAKEOVER_LOCKED")
             self.assertEqual(ctrl.state["locked_node"], "Backup-Hysteria2")
+
+    def test_dual_down_manual_direct_is_not_overwritten(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg, api, ctrl = make(Path(d))
+            ctrl.initialize()
+            for name in ORDER:
+                api.alive[name] = False
+            ctrl.poll_once()
+            self.assertEqual(ctrl.state["state"], "DUAL_DOWN")
+            api.outer = "DIRECT"
+            api.alive["Backup-Hysteria2"] = True
+            calls = list(api.calls)
+            ctrl.poll_once()
+            self.assertEqual(ctrl.state["state"], "MANUAL_RESET")
+            self.assertEqual(api.outer, "DIRECT")
+            self.assertEqual(api.calls, calls)
+
+    def test_dual_down_manual_other_node_is_not_overwritten(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg, api, ctrl = make(Path(d))
+            ctrl.initialize()
+            for name in ORDER:
+                api.alive[name] = False
+            ctrl.poll_once()
+            self.assertEqual(ctrl.state["state"], "DUAL_DOWN")
+            api.outer = "Hysteria2"
+            api.alive["Reality"] = True
+            calls = list(api.calls)
+            ctrl.poll_once()
+            self.assertEqual(ctrl.state["state"], "MANUAL_RESET")
+            self.assertEqual(api.outer, "Hysteria2")
+            self.assertEqual(api.calls, calls)
+
+    def test_dual_down_unchanged_outer_still_auto_recovers(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg, api, ctrl = make(Path(d))
+            ctrl.initialize()
+            for name in ORDER:
+                api.alive[name] = False
+            ctrl.poll_once()
+            self.assertEqual(ctrl.state["state"], "DUAL_DOWN")
+            api.alive["Backup-Reality"] = True
+            ctrl.poll_once()
+            self.assertEqual(ctrl.state["state"], "TAKEOVER_LOCKED")
+            self.assertEqual(ctrl.state["locked_node"], "Backup-Reality")
+            self.assertEqual(api.calls[-1], ("节点选择", "Backup-Reality"))
+
+    def test_dual_down_restart_with_manual_conflict_refuses_auto_takeover(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg, api, ctrl = make(Path(d))
+            ctrl.initialize()
+            for name in ORDER:
+                api.alive[name] = False
+            ctrl.poll_once()
+            self.assertEqual(ctrl.state["state"], "DUAL_DOWN")
+            api.outer = "DIRECT"
+            api.alive["Backup-Hysteria2"] = True
+            calls = list(api.calls)
+            # Simulate a controller restart with the same persisted DUAL_DOWN
+            # state, now observing an externally changed outer selection.
+            ctrl2 = SC.StickyController(cfg, api=api)
+            ctrl2.initialize()
+            ctrl2.poll_once()
+            self.assertEqual(ctrl2.state["state"], "MANUAL_RESET")
+            self.assertEqual(api.outer, "DIRECT")
+            self.assertEqual(api.calls, calls)
+
+    def test_dual_down_manual_preserved_for_both_a_and_b_profiles(self):
+        for version in ("A-first", "B-first"):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as d:
+                cfg, api, ctrl = make(Path(d), config_version=version)
+                ctrl.initialize()
+                for name in ORDER:
+                    api.alive[name] = False
+                ctrl.poll_once()
+                self.assertEqual(ctrl.state["state"], "DUAL_DOWN")
+                api.outer = "DIRECT"
+                api.alive["Backup-Hysteria2"] = True
+                calls = list(api.calls)
+                ctrl.poll_once()
+                self.assertEqual(ctrl.state["state"], "MANUAL_RESET")
+                self.assertEqual(api.calls, calls)
+                self.assertEqual(api.outer, "DIRECT")
 
     def test_health_incomplete_is_unknown_not_down(self):
         with tempfile.TemporaryDirectory() as d:

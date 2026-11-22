@@ -747,13 +747,22 @@ class StickyController:
 
         if state == "DUAL_DOWN":
             locked = self.state.get("locked_node")
-            if locked and locked in self.config.order and snap.healthy(locked):
+            if not locked or locked not in self.config.order:
+                self._set_state("UNKNOWN", None, "missing-locked-node")
+                return
+            if outer != locked:
+                # An operator or another program selected DIRECT/another node
+                # while all candidates were down. That manual choice wins over
+                # the automatic recovery path.
+                self._set_state("MANUAL_RESET", locked,
+                                "outer-selection-changed-externally")
+                return
+            if snap.healthy(locked):
                 self._write_lock(locked, "dual-down-locked-recovered")
                 return
-            if locked and locked in self.config.order:
-                nxt = self._candidate_after_before(locked, snap)
-                if nxt:
-                    self._write_lock(nxt, "dual-down-candidate-recovered")
+            nxt = self._candidate_after_before(locked, snap)
+            if nxt:
+                self._write_lock(nxt, "dual-down-candidate-recovered")
             return
 
         # MANUAL_RESET/UNKNOWN wait for an explicit admin reset or safe
