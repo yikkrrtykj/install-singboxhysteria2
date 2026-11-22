@@ -222,6 +222,7 @@ class StickyController:
         self.events: list[dict[str, Any]] = []
         self.api_errors = 0
         self.initialized = False
+        self.state_exists = False
         self.last_outer_now: str | None = None
         self.reset_request = self.state_path.with_suffix(".reset-request")
         self.binding = {
@@ -246,6 +247,7 @@ class StickyController:
     def load_state(self) -> None:
         if not self.state_path.exists():
             self.state = self._new_state()
+            self.state_exists = False
             return
         try:
             doc = json.loads(self.state_path.read_text(encoding="utf-8"))
@@ -261,6 +263,7 @@ class StickyController:
         if locked is not None and locked not in self.config.order:
             raise StateError("bad persisted locked_node")
         self.state = doc
+        self.state_exists = True
 
     def save_state(self) -> None:
         if self.state.get("state") not in STATES:
@@ -369,8 +372,14 @@ class StickyController:
         outer = snap.outer_now
         if state == "PREFERRED":
             if outer != self.config.preferred:
-                # First run/activation: explicit controller start is the only
-                # time the outer selector is moved to PREFERRED.
+                if self.state_exists:
+                    # A previous controller state existed and the operator (or
+                    # core restart) changed the outer selection outside this
+                    # controller. Never silently overwrite that choice.
+                    self._set_state("UNKNOWN", None,
+                                    "startup-outer-mismatch")
+                    return
+                # First explicit activation: set the preferred outer selector.
                 self.api.select(self.config.outer_group, self.config.preferred)
                 time.sleep(min(self.config.poll_interval, 0.05))
                 snap = self.fetch()

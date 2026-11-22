@@ -203,6 +203,19 @@ class StateTests(unittest.TestCase):
             self.assertEqual(ctrl.state["state"], "TAKEOVER_LOCKED")
             self.assertEqual(ctrl.state["locked_node"], "Backup-Hysteria2")
 
+    def test_existing_preferred_state_does_not_overwrite_manual_selection(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg, api, ctrl = make(Path(d))
+            ctrl.initialize()
+            ctrl.save_state()
+            api.outer = "自动选择"  # changed outside the controller, e.g. UI
+            api.calls.clear()
+            ctrl2 = SC.StickyController(cfg, api=api)
+            ctrl2.initialize()
+            self.assertEqual(ctrl2.state["state"], "UNKNOWN")
+            self.assertEqual(api.calls, [])
+            self.assertEqual(api.outer, "自动选择")
+
     def test_manual_conflict_and_admin_reset(self):
         with tempfile.TemporaryDirectory() as d:
             cfg, api, ctrl = make(Path(d))
