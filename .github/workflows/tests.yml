@@ -43,6 +43,7 @@ jobs:
           bash -n tests/test-phase-d.sh
           bash -n tests/test-security-baseline.sh
           bash -n tests/test-install-host-deps.sh
+          bash -n tests/test-network-tuning.sh
           bash -n tests/canary-api-auth.sh
           bash -n tests/test-monitor-v2-e1.sh
           bash -n tests/test-monitor-v2-e2.sh
@@ -164,6 +165,18 @@ jobs:
       # activation at all, so it is a core product contract.
       - name: "Host dependency bootstrap regression suite (install.sh package->command map, fail-closed verification)"
         run: bash tests/test-install-host-deps.sh
+
+      # Fresh-install TCP BBR/fq + UDP buffer default (issue #119). The first
+      # run is hermetic (mocked sysctl, throwaway paths). The second run is a
+      # REAL-kernel gate inside a throwaway network namespace: both net.ipv4
+      # and net.core sysctls are netns-scoped, so the runner host is untouched;
+      # it proves apply + read-back + rollback + boot-file replay. The suite
+      # fails closed when the netns isolation flag is missing.
+      - name: "Fresh-install kernel TCP BBR/fq + UDP buffer default suite (hermetic + isolated netns LIVE)"
+        run: |
+          bash tests/test-network-tuning.sh
+          sudo -n unshare -n env SB_NET_REQUIRE_LIVE=1 SB_NET_LIVE_ISOLATED=1 \
+            bash tests/test-network-tuning.sh
 
       - name: Legacy config transaction hardening regression suite (real flock on Linux)
         run: bash tests/test-legacy-config-transactions.sh
