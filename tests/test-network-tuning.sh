@@ -570,8 +570,13 @@ else
     unset -f sysctl modprobe
     export NETWORK_SYSCTL_FILE="$TMP/live/sysctl.d/99-sing-box-network.conf"
     export NETWORK_TUNING_RECORD_ROOT="$TMP/live-sbox"
+    SYSCTL_BIN="$(command -v sysctl || true)"
+    if [ -z "$SYSCTL_BIN" ]; then
+        for candidate in /usr/sbin/sysctl /sbin/sysctl /usr/bin/sysctl; do
+            if [ -x "$candidate" ]; then SYSCTL_BIN="$candidate"; break; fi
+        done
+    fi
     export SYSCTL_BIN
-    SYSCTL_BIN="$(command -v sysctl)"
     if command -v modprobe >/dev/null 2>&1; then
         MODPROBE_BIN="$(command -v modprobe)"
     else
@@ -583,13 +588,21 @@ else
     # shellcheck source=/dev/null
     . "$TMP/network.sh"
 
+    printf '  [live] sysctl=%q kernel=%q uid=%q\n' "$SYSCTL_BIN" "$(uname -r)" "$(id -u)"
+    printf '  [live] raw cc rc=%s out=%q\n' \
+        "$("$SYSCTL_BIN" -n net.ipv4.tcp_congestion_control >/dev/null 2>&1; echo $?)" \
+        "$("$SYSCTL_BIN" -n net.ipv4.tcp_congestion_control 2>&1)"
+    printf '  [live] raw qdisc rc=%s out=%q\n' \
+        "$("$SYSCTL_BIN" -n net.core.default_qdisc >/dev/null 2>&1; echo $?)" \
+        "$("$SYSCTL_BIN" -n net.core.default_qdisc 2>&1)"
+
     live_orig_cc="$(network_sysctl_read net.ipv4.tcp_congestion_control || true)"
     live_orig_qdisc="$(network_sysctl_read net.core.default_qdisc || true)"
     live_orig_rmem="$(network_sysctl_read net.core.rmem_max || true)"
     live_orig_wmem="$(network_sysctl_read net.core.wmem_max || true)"
     live_available="$(network_sysctl_read net.ipv4.tcp_available_congestion_control || true)"
     if [ -z "$live_orig_cc" ] || [ -z "$live_orig_qdisc" ]; then
-        fail "live gate could not read the real sysctl state"
+        fail "live gate could not read the real sysctl state (cc='$live_orig_cc' qdisc='$live_orig_qdisc' rmem='$live_orig_rmem' wmem='$live_orig_wmem')"
     else
         maybe_apply_fresh_install_network_defaults > "$TMP/live-apply.out" 2>&1
         assert_rc 0 $? "live apply returns success"
@@ -627,7 +640,9 @@ else
             "$SYSCTL_BIN" -p "$NETWORK_SYSCTL_FILE" >/dev/null 2>&1
             assert_rc 0 $? "live persistence replay succeeds"
             assert_eq bbr "$(network_sysctl_read net.ipv4.tcp_congestion_control)" "live replay restores bbr"
-            assert_eq 16777216 "$(network_sysctl_read net.core.rmem_max)" "live replay restores the UDP floor"
+            live_expected_rmem="$live_orig_rmem"
+            [ "${live_expected_rmem:-0}" -lt 16777216 ] && live_expected_rmem=16777216
+            assert_eq "$live_expected_rmem" "$(network_sysctl_read net.core.rmem_max)" "live replay restores the expected UDP floor"
         else
             pass "live kernel does not advertise BBR (unsupported-kernel live path)"
             assert_eq "$live_orig_cc" "$(network_sysctl_read net.ipv4.tcp_congestion_control)" "live unsupported path leaves cc unchanged"
