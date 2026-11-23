@@ -8,8 +8,8 @@
 # kernel setting and no real /etc/sysctl.d file is touched.
 #
 # OPTIONAL LIVE GATE (Linux, root, DISPOSABLE HOST ONLY):
-#   sudo env SB_NET_REQUIRE_LIVE=1 SB_NET_LIVE_DISPOSABLE=1 \
-#       bash tests/test-network-tuning.sh
+#   sudo env GITHUB_ACTIONS=true SB_NET_REQUIRE_LIVE=1 \
+#       SB_NET_LIVE_DISPOSABLE=1 bash tests/test-network-tuning.sh
 # The live gate applies/rolls back REAL net.ipv4/net.core values and replays
 # the persisted boot file. It refuses to run unless the caller explicitly
 # confirms a disposable host (SB_NET_LIVE_DISPOSABLE=1) AND the process is

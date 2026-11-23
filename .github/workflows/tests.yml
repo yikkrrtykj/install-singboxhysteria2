@@ -179,7 +179,10 @@ jobs:
       - name: "Fresh-install kernel TCP BBR/fq + UDP buffer default suite (hermetic + disposable-host LIVE)"
         run: |
           bash tests/test-network-tuning.sh
-          sudo -n env SB_NET_REQUIRE_LIVE=1 SB_NET_LIVE_DISPOSABLE=1 \
+          # sudo resets the environment; pass the CI identity through so the
+          # suite can prove it runs on a GitHub-hosted disposable runner.
+          sudo -n env GITHUB_ACTIONS="${GITHUB_ACTIONS:-false}" \
+            SB_NET_REQUIRE_LIVE=1 SB_NET_LIVE_DISPOSABLE=1 \
             bash tests/test-network-tuning.sh
 
       - name: Legacy config transaction hardening regression suite (real flock on Linux)
