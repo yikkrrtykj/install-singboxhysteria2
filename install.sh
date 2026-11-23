@@ -2513,7 +2513,13 @@ UDP_BUFFER_MIN_BYTES=16777216
 # fresh install.
 FRESH_INSTALL="${FRESH_INSTALL:-TRUE}"
 # Escape hatch for containers/automation that must not touch kernel settings.
+# Accepted values: 1/true/TRUE/yes/YES (documented value is 1).
 SB_SKIP_NETWORK_TUNING="${SB_SKIP_NETWORK_TUNING:-FALSE}"
+# Menu item 1 (reinstall) uninstalls and then falls through to the fresh-install
+# code below. It is NOT a fresh install, but the previous installer still
+# guaranteed the Hysteria2 UDP buffer floor on that path, so only the UDP floor
+# (never TCP/qdisc) may be applied.
+REINSTALL_FALLTHROUGH="${REINSTALL_FALLTHROUGH:-FALSE}"
 # Captured original state (populated by network_capture_state).
 NET_ORIG_CC=""
 NET_ORIG_QDISC=""
@@ -2537,6 +2543,13 @@ network_sysctl_read() { # <key> -> value on stdout
     printf '%s\n' "$value"
 }
 
+network_tuning_opt_out() {
+    case "${SB_SKIP_NETWORK_TUNING:-FALSE}" in
+        1|true|TRUE|yes|YES) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 read_sysctl_number() {
     network_sysctl_read "$1" 2>/dev/null | tr -cd '0-9'
 }
@@ -2558,6 +2571,51 @@ read_managed_sysctl_number() { # <key> [file] -> persisted number or rc!=0
         tail -n 1 | cut -d'=' -f2- | tr -cd '0-9')"
     [ -n "$value" ] || return 1
     printf '%s\n' "$value"
+}
+
+read_managed_sysctl_value() { # <key> [file] -> persisted value or rc!=0
+    local key="$1" file="${2:-$NETWORK_SYSCTL_FILE}" value
+    [ -f "$file" ] || return 1
+    value="$(grep -E "^[[:space:]]*${key}[[:space:]]*=" "$file" 2>/dev/null |
+        tail -n 1 | cut -d'=' -f2- | tr -d '[:space:]')"
+    [ -n "$value" ] || return 1
+    printf '%s\n' "$value"
+}
+
+network_unmanaged_file_keys() { # <file> -> keys this installer does not manage
+    local file="$1" line key
+    [ -f "$file" ] || return 0
+    while IFS= read -r line; do
+        case "$line" in
+            ""|\#*) continue ;;
+        esac
+        key="$(printf '%s' "$line" | cut -d'=' -f1 | tr -d '[:space:]')"
+        [ -n "$key" ] || continue
+        case "$key" in
+            net.core.rmem_max|net.core.wmem_max|net.core.default_qdisc|net.ipv4.tcp_congestion_control) ;;
+            *) printf '%s\n' "$key" ;;
+        esac
+    done < "$file" | sort -u
+}
+
+# The managed file is rewritten as a WHOLE. Warn when that would discard lines
+# this installer does not manage, instead of dropping them silently; the
+# captured-state record keeps the exact previous file for recovery.
+network_warn_if_rewriting_managed_file() { # <qdisc_mode fq|keep>
+    local qdisc_mode="${1:-keep}" unmanaged existing_qdisc
+    [ -f "$NETWORK_SYSCTL_FILE" ] || return 0
+    unmanaged="$(network_unmanaged_file_keys "$NETWORK_SYSCTL_FILE")"
+    if [ -n "$unmanaged" ]; then
+        warning "现有受管网络文件含本安装器不管理的配置行，将被重写（原文件已复制到 ${NET_TUNING_RECORD_DIR:-安装前记录目录}）："
+        warning "  $(printf '%s' "$unmanaged" | tr '\n' ' ')"
+    fi
+    if [ "$qdisc_mode" = "keep" ]; then
+        existing_qdisc="$(read_managed_sysctl_value net.core.default_qdisc || true)"
+        if [ -n "$existing_qdisc" ]; then
+            warning "现有受管文件中的 net.core.default_qdisc=$existing_qdisc 不再由本次写入保留（当前运行 qdisc=$NET_ORIG_QDISC 保持不变；原文件已备份，可手动恢复）"
+        fi
+    fi
+    return 0
 }
 
 network_qdisc_replaceable() { # <qdisc> -> rc 0 when fq may replace it
@@ -2635,6 +2693,18 @@ network_record_result() {
     NET_TUNING_RESULT="${1:-unknown}"
     if ! network_write_record_state "$NET_TUNING_RESULT"; then
         warning "网络参数记录更新失败: $NET_TUNING_RECORD_DIR/state（安装继续）"
+    fi
+    return 0
+}
+
+# Attempt the rollback and record the RESULT THAT ACTUALLY HAPPENED. Never
+# claim "rolled-back" when network_restore_state could not verify the original
+# runtime values/persistence file.
+network_finish_failed_apply() {
+    if network_restore_state; then
+        network_record_result "rolled-back"
+    else
+        network_record_result "rollback-incomplete"
     fi
     return 0
 }
@@ -2725,7 +2795,7 @@ network_restore_state() {
 apply_fresh_install_network_defaults() {
     local bbr_available="FALSE" qdisc_mode="keep"
 
-    if [ "$SB_SKIP_NETWORK_TUNING" = "TRUE" ]; then
+    if network_tuning_opt_out; then
         NET_TUNING_RESULT="skipped-opt-out"
         info "已按 SB_SKIP_NETWORK_TUNING 跳过 TCP BBR/fq 默认优化；未修改 TCP/qdisc/UDP 配置"
         return 0
@@ -2749,6 +2819,7 @@ apply_fresh_install_network_defaults() {
         else
             info "检测到自定义 qdisc=$NET_ORIG_QDISC，已保留，不覆盖为 fq"
         fi
+        network_warn_if_rewriting_managed_file "$qdisc_mode"
         if write_network_sysctl "TRUE" "$qdisc_mode"; then
             if [ "$NET_ORIG_CC" = "bbr" ]; then
                 network_record_result "already-enabled"
@@ -2762,29 +2833,58 @@ apply_fresh_install_network_defaults() {
             info "安装前网络参数已记录: $NET_TUNING_RECORD_DIR/state（手动恢复见 docs/hysteria2-bbr.md）"
             return 0
         fi
-        network_record_result "rolled-back"
-        network_restore_state || true
+        network_finish_failed_apply
         return 0
     fi
 
     warning "当前内核不支持 TCP BBR；不会下载第三方脚本或自动更换内核。"
+    network_warn_if_rewriting_managed_file "keep"
     if configure_udp_buffers; then
         network_record_result "skipped-unsupported-bbr"
         info "已保留原 TCP/qdisc 设置，仅应用 Hysteria2 UDP 缓冲下限"
         return 0
     fi
-    network_record_result "rolled-back"
-    network_restore_state || true
+    network_finish_failed_apply
+    return 0
+}
+
+apply_udp_buffer_floor_only() {
+    if network_tuning_opt_out; then
+        NET_TUNING_RESULT="skipped-opt-out"
+        info "已按 SB_SKIP_NETWORK_TUNING 跳过 UDP 缓冲下限；未修改任何网络配置"
+        return 0
+    fi
+    if ! network_capture_state; then
+        NET_TUNING_RESULT="skipped-capture-failed"
+        warning "无法读取当前网络参数，已跳过 UDP 缓冲下限（保留原设置）；安装继续"
+        return 0
+    fi
+    if ! network_create_record; then
+        NET_TUNING_RESULT="skipped-record-failed"
+        warning "无法记录安装前网络参数，已跳过 UDP 缓冲下限（避免不可恢复的修改）；安装继续"
+        return 0
+    fi
+    network_warn_if_rewriting_managed_file "keep"
+    if configure_udp_buffers; then
+        network_record_result "udp-floor-applied"
+        info "重新安装：仅应用 Hysteria2 UDP 缓冲下限；TCP/qdisc 保持原样（菜单 5 可手动启用 BBR）"
+        return 0
+    fi
+    network_finish_failed_apply
     return 0
 }
 
 maybe_apply_fresh_install_network_defaults() {
-    if [ "${FRESH_INSTALL:-FALSE}" != "TRUE" ]; then
-        NET_TUNING_RESULT="skipped-not-fresh"
-        info "非全新安装：保留现有 TCP/qdisc 配置，不自动启用 BBR/fq（菜单 5 可手动启用）"
+    if [ "${FRESH_INSTALL:-FALSE}" = "TRUE" ]; then
+        apply_fresh_install_network_defaults || true
         return 0
     fi
-    apply_fresh_install_network_defaults || true
+    if [ "${REINSTALL_FALLTHROUGH:-FALSE}" = "TRUE" ]; then
+        apply_udp_buffer_floor_only || true
+        return 0
+    fi
+    NET_TUNING_RESULT="skipped-not-fresh"
+    info "非全新安装：保留现有 TCP/qdisc 配置，不自动启用 BBR/fq（菜单 5 可手动启用）"
     return 0
 }
 
@@ -2798,9 +2898,11 @@ show_network_tuning_summary() {
         applied) result_text="全新安装默认优化已应用（Linux TCP BBR + qdisc 策略 + UDP 缓冲下限）" ;;
         already-enabled) result_text="已检测到 TCP BBR，保持并持久化（UDP 缓冲下限独立应用；现有 qdisc 按策略保留）" ;;
         skipped-unsupported-bbr) result_text="内核不支持 TCP BBR：TCP/qdisc 保持原样，仅应用 UDP 缓冲下限" ;;
+        udp-floor-applied) result_text="重新安装：仅应用 UDP 缓冲下限，TCP/qdisc 保持原样" ;;
         skipped-capture-failed|skipped-record-failed) result_text="无法安全读取/记录网络参数，已跳过优化并保留原设置" ;;
         skipped-opt-out) result_text="已按 SB_SKIP_NETWORK_TUNING 跳过优化" ;;
         rolled-back) result_text="应用失败，已自动恢复安装前 TCP/qdisc 与持久化文件" ;;
+        rollback-incomplete) result_text="应用失败且自动回滚未完成：请按上面的手动恢复命令使用安装前记录恢复" ;;
         skipped-not-fresh|"") result_text="非全新安装：未自动修改 TCP/qdisc 配置" ;;
         *) result_text="$NET_TUNING_RESULT" ;;
     esac
@@ -2833,12 +2935,12 @@ enable_bbr() {
     fi
     if [ "$bbr_available" != "TRUE" ]; then
         warning "当前内核不支持 TCP BBR；不会下载第三方脚本或自动更换内核。"
+        network_warn_if_rewriting_managed_file "keep"
         if configure_udp_buffers; then
             network_record_result "skipped-unsupported-bbr"
             info "已仅应用 Hysteria2 UDP 缓冲下限；TCP/qdisc 保持不变"
         else
-            network_record_result "rolled-back"
-            network_restore_state || true
+            network_finish_failed_apply
         fi
         return 1
     fi
@@ -2847,6 +2949,7 @@ enable_bbr() {
     else
         info "检测到自定义 qdisc=$NET_ORIG_QDISC，已保留，不覆盖为 fq"
     fi
+    network_warn_if_rewriting_managed_file "$qdisc_mode"
     if write_network_sysctl "TRUE" "$qdisc_mode"; then
         if [ "$NET_ORIG_CC" = "bbr" ]; then
             network_record_result "already-enabled"
@@ -2860,8 +2963,7 @@ enable_bbr() {
         info "安装前网络参数已记录: $NET_TUNING_RECORD_DIR/state（手动恢复见 docs/hysteria2-bbr.md）"
         return 0
     fi
-    network_record_result "rolled-back"
-    network_restore_state || true
+    network_finish_failed_apply
     return 1
 }
 # <<< network-tuning <<< ======================================================
@@ -4224,6 +4326,10 @@ if has_any_installation_marker; then
           if ! uninstall_singbox; then
               exit 1
           fi
+          # Falls through to the fresh-install code below. This is still NOT a
+          # fresh install for network tuning: only the UDP buffer floor may be
+          # applied, never TCP/qdisc.
+          REINSTALL_FALLTHROUGH="TRUE"
         ;;
       2)
           modify_singbox
