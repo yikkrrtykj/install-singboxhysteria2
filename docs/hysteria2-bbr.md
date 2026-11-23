@@ -34,9 +34,10 @@ GitHub 脚本更新不会自动修改旧服务器的 HY2 配置；安装入口�
 ### 安装前状态记录与失败回滚
 
 - 应用前先读取并记录原始值，并把**原受管文件字节**复制到 `root:root 0700` 的 `/root/sbox/network-tuning.before-install.<时间戳>/`：`state` 记录 `tcp_congestion_control` / `default_qdisc` / `rmem_max` / `wmem_max` / `file_present` / `result`，同目录保存原 `99-sing-box-network.conf`。
-- 内核不支持 BBR、`tcp_bbr` 加载失败、权限受限、`sysctl -p` 部分失败或持久化文件写入失败时：恢复安装前的运行时 sysctl 与持久化文件（原文件不存在则删除本次写入），输出原因与实际值，然后**继续正常安装**。BBR/fq 是可选优化，任何失败都不会中断安装，也不会把未生效写成成功。
+- 内核不支持 BBR、`tcp_bbr` 加载失败、权限受限、逐键 `sysctl -w` 部分失败或持久化文件写入失败时：恢复安装前的运行时 sysctl 与持久化文件（原文件不存在则删除本次写入），输出原因与实际值，然后**继续正常安装**。BBR/fq 是可选优化，任何失败都不会中断安装，也不会把未生效写成成功。
 - 自动恢复不完整时会打印安装前实际值的手动恢复命令与记录路径，安装摘要与 `state` 的 `result` 记为 `rollback-incomplete`（不会写成“已自动恢复”），不隐藏失败。
-- 受管文件采用**无损 merge**：只更新本安装器管理的键（`rmem_max` / `wmem_max`，以及本次要设置的 `tcp_congestion_control` / `default_qdisc`），其余行——注释、空行、重复键、不相关 sysctl、已有自定义 qdisc/cc 持久化行——按原顺序原样保留；缺失的受管键才追加到文件末尾。UDP-only 路径（菜单 1 重装、内核不支持 BBR 时）只改两个 UDP 键，并且只对运行时的这两个键执行 `sysctl -w`，不会用 `sysctl -p` 重新应用并改变 TCP/qdisc。
+- 受管文件采用**无损 merge**：只更新本安装器管理的键（`rmem_max` / `wmem_max`，以及本次要设置的 `tcp_congestion_control` / `default_qdisc`），其余行——注释、空行、重复键、不相关 sysctl、已有自定义 qdisc/cc 持久化行——按原顺序原样保留；缺失的受管键才追加到文件末尾。
+- **运行时应用只作用于本轮目标键**：全新安装、菜单 1 UDP-only、菜单 5 都逐键执行 `sysctl -w`（UDP 两键始终；实际请求 BBR 时才写 `tcp_congestion_control=bbr`；实际选择 fq 时才写 `default_qdisc=fq`），**不对整份文件执行 `sysctl -p`**，因此无关 TCP/qdisc/自定义参数保持原运行时值；持久化文件仍由系统 sysctl 服务在开机时重放。
 - 现有受管文件若无法安全解释/保留（软链接、非普通文件、或出现注释/空行/`key = value` 之外的语法），**fail-closed 跳过可选优化**并报告 `skipped-unsafe-managed-file`：文件字节与运行时设置都不修改，安装继续。
 - 安装结束的网络摘要会列出实际 `tcp_congestion_control`、`default_qdisc`、`rmem_max`、`wmem_max`，以及“已应用 / 已存在 / 内核不支持 / 已跳过 / 已回滚 / 回滚未完成”的原因。
 
