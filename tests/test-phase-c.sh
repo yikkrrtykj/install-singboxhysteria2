@@ -541,6 +541,87 @@ for b in "$SB_SANDBOX_CONFIG".bak.*; do
 done
 [ "$broken" -eq 0 ] && pass "all backup files exist and are non-empty"
 
+section "regression C25: interactive menu 10 export prompt, retry, cancel and EOF"
+write_old_config; write_state_file
+migrate_legacy_clients >/dev/null 2>&1
+add_client "event-ob01" >/dev/null 2>&1
+add_client "event-noeol" >/dev/null 2>&1
+add_client "event-menu" >/dev/null 2>&1
+before_interactive="$(sha256sum "$SB_SANDBOX_CONFIG" | awk '{print $1}')"
+
+# Non-TTY stdin used to hide the read -p prompt; empty input used to reach
+# generate_client_configuration as "客户端名称非法: ''". Both must now retry
+# in place, and the consistency table must stay on menu items 1/6 only.
+printf '\nevent-ob01\n' | generate_client_configuration_interactive > "$TMP/c25.retry" 2>&1
+assert_rc 0 "$?" "blank name followed by event-ob01 succeeds"
+assert_grep '请输入要生成配置的客户端名称' "$TMP/c25.retry" "prompt visible with piped stdin"
+assert_grep '客户端名称不能为空' "$TMP/c25.retry" "blank name requests retry"
+assert_grep 'event-ob01.*Mihomo 配置已生成' "$TMP/c25.retry" "correct named client exported"
+assert_no_grep "客户端名称非法: ''" "$TMP/c25.retry" "no empty-name error reaches generator"
+assert_no_grep '^NAME[[:space:]]+REALITY' "$TMP/c25.retry" "generator does not repeat client table"
+[ -s "$SB_SANDBOX_CLIENTS/event-ob01/mihomo.yaml" ] &&
+    pass "interactive export wrote canonical YAML" ||
+    fail "interactive export did not write canonical YAML"
+
+printf 'bad/name\nevent-ob01\n' | generate_client_configuration_interactive > "$TMP/c25.invalid" 2>&1
+assert_rc 0 "$?" "invalid name retries in place then valid name succeeds"
+assert_grep '客户端名称格式不正确' "$TMP/c25.invalid" "invalid name has clear feedback"
+[ ! -e "$SB_SANDBOX_CLIENTS/bad" ] &&
+    pass "invalid name created no derived directory" ||
+    fail "invalid name created a derived directory"
+
+printf ':q\n' | generate_client_configuration_interactive > "$TMP/c25.cancel" 2>&1
+assert_rc 0 "$?" "explicit :q cancels without error"
+assert_grep '已取消生成客户端配置' "$TMP/c25.cancel" "cancel is reported"
+
+# EOF must stop instead of looping, including an EOF that follows an invalid
+# partial line. Count derived directories around both runs so a cancelled or
+# EOF-terminated prompt can never be mistaken for a successful export.
+dirs_before_eof="$(find "$SB_SANDBOX_CLIENTS" -mindepth 1 -maxdepth 1 -type d | wc -l)"
+printf '' | generate_client_configuration_interactive > "$TMP/c25.eof" 2>&1
+assert_rc 1 "$?" "stdin EOF stops instead of looping"
+assert_grep '输入已结束' "$TMP/c25.eof" "EOF has clear feedback"
+printf 'bad/name' | generate_client_configuration_interactive > "$TMP/c25.eof-invalid" 2>&1
+assert_rc 1 "$?" "EOF after invalid partial line terminates cleanly"
+assert_grep '客户端名称格式不正确' "$TMP/c25.eof-invalid" "partial invalid line was processed first"
+assert_grep '输入已结束' "$TMP/c25.eof-invalid" "EOF after invalid input is still reported"
+dirs_after_eof="$(find "$SB_SANDBOX_CLIENTS" -mindepth 1 -maxdepth 1 -type d | wc -l)"
+assert_rc "$dirs_before_eof" "$dirs_after_eof" "cancelled/EOF prompts wrote no derived client directory"
+
+# bash `read` returns non-zero at EOF even when it read a COMPLETE final line
+# without a trailing newline. That reviewed name must not be dropped.
+printf 'event-noeol' | generate_client_configuration_interactive > "$TMP/c25.noeol" 2>&1
+assert_rc 0 "$?" "complete final line without trailing newline is accepted"
+assert_grep 'event-noeol.*Mihomo 配置已生成' "$TMP/c25.noeol" "EOF-terminated complete name was generated"
+[ -s "$SB_SANDBOX_CLIENTS/event-noeol/mihomo.yaml" ] &&
+    pass "non-newline-terminated input wrote canonical YAML" ||
+    fail "non-newline-terminated input produced no canonical YAML"
+
+# Menu-level regression: the real menu 10 -> option 3 path (not just the
+# function) must prompt, retry, export and return to the menu without ever
+# printing the consistency table.
+show_notice() { printf '== %s ==\n' "$1"; }
+printf '3\n\nevent-menu\n0\n' | client_management_menu > "$TMP/c25.menu" 2>&1
+assert_rc 0 "$?" "menu 10 option 3 handles blank retry and returns to the menu"
+assert_grep '请输入要生成配置的客户端名称' "$TMP/c25.menu" "menu option 3 prompt is visible"
+assert_grep '客户端名称不能为空' "$TMP/c25.menu" "menu option 3 retries the blank input"
+assert_grep 'event-menu.*Mihomo 配置已生成' "$TMP/c25.menu" "menu option 3 exported the named client"
+assert_no_grep '^NAME[[:space:]]+REALITY' "$TMP/c25.menu" "menu option 3 does not print the client table"
+[ -s "$SB_SANDBOX_CLIENTS/event-menu/mihomo.yaml" ] &&
+    pass "menu option 3 wrote canonical YAML" ||
+    fail "menu option 3 did not write canonical YAML"
+
+printf '3\n:q\n0\n' | client_management_menu > "$TMP/c25.menu-cancel" 2>&1
+assert_rc 0 "$?" "menu 10 option 3 explicit :q returns to the menu without error"
+assert_grep '已取消生成客户端配置' "$TMP/c25.menu-cancel" "menu option 3 cancel is reported"
+
+after_interactive="$(sha256sum "$SB_SANDBOX_CONFIG" | awk '{print $1}')"
+if [ "$before_interactive" = "$after_interactive" ]; then
+    pass "interactive export/retry/cancel/EOF never edits the live server config"
+else
+    fail "interactive export changed the live server config"
+fi
+
 printf '\n== summary ==\n'
 printf '  pass=%d fail=%d\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
