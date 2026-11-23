@@ -2564,57 +2564,147 @@ larger_number() {
     fi
 }
 
+network_key_regex() { # <dotted-key> -> regex matching dotted or slash form
+    printf '%s\n' "$1" | sed 's|\.|[./]|g'
+}
+
 read_managed_sysctl_number() { # <key> [file] -> persisted number or rc!=0
-    local key="$1" file="${2:-$NETWORK_SYSCTL_FILE}" value
+    local key="$1" file="${2:-$NETWORK_SYSCTL_FILE}" key_re value
     [ -f "$file" ] || return 1
-    value="$(grep -E "^[[:space:]]*${key}[[:space:]]*=" "$file" 2>/dev/null |
+    key_re="$(network_key_regex "$key")"
+    value="$(grep -E "^[[:space:]]*-?${key_re}[[:space:]]*=" "$file" 2>/dev/null |
         tail -n 1 | cut -d'=' -f2- | tr -cd '0-9')"
     [ -n "$value" ] || return 1
     printf '%s\n' "$value"
 }
 
 read_managed_sysctl_value() { # <key> [file] -> persisted value or rc!=0
-    local key="$1" file="${2:-$NETWORK_SYSCTL_FILE}" value
+    local key="$1" file="${2:-$NETWORK_SYSCTL_FILE}" key_re value
     [ -f "$file" ] || return 1
-    value="$(grep -E "^[[:space:]]*${key}[[:space:]]*=" "$file" 2>/dev/null |
+    key_re="$(network_key_regex "$key")"
+    value="$(grep -E "^[[:space:]]*-?${key_re}[[:space:]]*=" "$file" 2>/dev/null |
         tail -n 1 | cut -d'=' -f2- | tr -d '[:space:]')"
     [ -n "$value" ] || return 1
     printf '%s\n' "$value"
 }
 
-network_unmanaged_file_keys() { # <file> -> keys this installer does not manage
-    local file="$1" line key
-    [ -f "$file" ] || return 0
-    while IFS= read -r line; do
-        case "$line" in
-            ""|\#*) continue ;;
-        esac
-        key="$(printf '%s' "$line" | cut -d'=' -f1 | tr -d '[:space:]')"
-        [ -n "$key" ] || continue
-        case "$key" in
-            net.core.rmem_max|net.core.wmem_max|net.core.default_qdisc|net.ipv4.tcp_congestion_control) ;;
-            *) printf '%s\n' "$key" ;;
-        esac
-    done < "$file" | sort -u
+network_persisted_qdisc() { # -> last persisted default_qdisc value
+    read_managed_sysctl_value net.core.default_qdisc
 }
 
-# The managed file is rewritten as a WHOLE. Warn when that would discard lines
-# this installer does not manage, instead of dropping them silently; the
-# captured-state record keeps the exact previous file for recovery.
-network_warn_if_rewriting_managed_file() { # <qdisc_mode fq|keep>
-    local qdisc_mode="${1:-keep}" unmanaged existing_qdisc
-    [ -f "$NETWORK_SYSCTL_FILE" ] || return 0
-    unmanaged="$(network_unmanaged_file_keys "$NETWORK_SYSCTL_FILE")"
-    if [ -n "$unmanaged" ]; then
-        warning "现有受管网络文件含本安装器不管理的配置行，将被重写（原文件已复制到 ${NET_TUNING_RECORD_DIR:-安装前记录目录}）："
-        warning "  $(printf '%s' "$unmanaged" | tr '\n' ' ')"
+# A file this installer may safely merge. Anything that cannot be classified as
+# a blank line, a '#'/';' comment or a "key = value" assignment means a
+# lossless rewrite cannot be proven, so the optional optimization is skipped
+# instead of guessing.
+network_managed_file_safe() {
+    local file="$NETWORK_SYSCTL_FILE" line trimmed
+    if [ -L "$file" ]; then
+        return 1
     fi
-    if [ "$qdisc_mode" = "keep" ]; then
-        existing_qdisc="$(read_managed_sysctl_value net.core.default_qdisc || true)"
-        if [ -n "$existing_qdisc" ]; then
-            warning "现有受管文件中的 net.core.default_qdisc=$existing_qdisc 不再由本次写入保留（当前运行 qdisc=$NET_ORIG_QDISC 保持不变；原文件已备份，可手动恢复）"
+    if [ -e "$file" ] && [ ! -f "$file" ]; then
+        return 1
+    fi
+    [ -f "$file" ] || return 0
+    [ -r "$file" ] || return 1
+    while IFS= read -r line || [ -n "$line" ]; do
+        trimmed="${line#"${line%%[![:space:]]*}"}"
+        trimmed="${trimmed%$'\r'}"
+        case "$trimmed" in
+            ""|\#*|\;*) continue ;;
+        esac
+        if ! [[ "$trimmed" =~ ^-?[A-Za-z0-9_./-]+[[:space:]]*= ]]; then
+            return 1
         fi
+    done < "$file"
+    return 0
+}
+
+# Render a merged managed file. Every line this installer does not manage is
+# preserved exactly (order, comments, duplicate keys, unknown sysctls); only the
+# managed keys that are being changed are replaced, and missing managed keys are
+# appended. `keep` = preserve the existing cc/qdisc lines byte-for-byte, which is
+# what UDP-only and custom-qdisc paths require.
+network_render_merged_sysctl() { # <request_bbr TRUE|FALSE> <qdisc_mode fq|keep> <rmem> <wmem> <out>
+    local request_bbr="${1:-FALSE}" qdisc_mode="${2:-keep}"
+    local target_rmem="$3" target_wmem="$4" out="$5"
+    if [ -f "$NETWORK_SYSCTL_FILE" ]; then
+        awk -v want_bbr="$request_bbr" -v qdisc_mode="$qdisc_mode" \
+            -v rmem="$target_rmem" -v wmem="$target_wmem" '
+            function norm_key(k) { gsub("/", ".", k); return k }
+            {
+                raw = $0
+                probe = raw
+                sub(/^[[:space:]]+/, "", probe)
+                sub(/\r$/, "", probe)
+                if (probe == "" || substr(probe, 1, 1) == "#" ||
+                    substr(probe, 1, 1) == ";") { print raw; next }
+                eq = index(probe, "=")
+                key = substr(probe, 1, eq - 1)
+                sub(/[[:space:]]+$/, "", key)
+                prefix = ""
+                if (substr(key, 1, 1) == "-") { prefix = "-"; key = substr(key, 2) }
+                key = norm_key(key)
+                if (key == "net.core.rmem_max") {
+                    print prefix "net.core.rmem_max = " rmem; saw_rmem = 1; next
+                }
+                if (key == "net.core.wmem_max") {
+                    print prefix "net.core.wmem_max = " wmem; saw_wmem = 1; next
+                }
+                if (key == "net.core.default_qdisc") {
+                    if (qdisc_mode == "fq") { print prefix "net.core.default_qdisc = fq" }
+                    else { print raw }
+                    saw_qdisc = 1; next
+                }
+                if (key == "net.ipv4.tcp_congestion_control") {
+                    if (want_bbr == "TRUE") { print prefix "net.ipv4.tcp_congestion_control = bbr" }
+                    else { print raw }
+                    saw_cc = 1; next
+                }
+                print raw
+            }
+            END {
+                if (!saw_rmem) print "net.core.rmem_max = " rmem
+                if (!saw_wmem) print "net.core.wmem_max = " wmem
+                if (want_bbr == "TRUE" && qdisc_mode == "fq" && !saw_qdisc)
+                    print "net.core.default_qdisc = fq"
+                if (want_bbr == "TRUE" && !saw_cc)
+                    print "net.ipv4.tcp_congestion_control = bbr"
+            }
+        ' "$NETWORK_SYSCTL_FILE" > "$out" || return 1
+    else
+        {
+            echo "# Managed by install-singboxhysteria2"
+            echo "# Keep UDP socket buffer limits at least 16 MiB for Hysteria2/QUIC."
+            echo "net.core.rmem_max = $target_rmem"
+            echo "net.core.wmem_max = $target_wmem"
+            if [ "$request_bbr" = "TRUE" ]; then
+                echo "# TCP tuning for Reality and proxied TCP traffic."
+                if [ "$qdisc_mode" = "fq" ]; then
+                    echo "net.core.default_qdisc = fq"
+                fi
+                echo "net.ipv4.tcp_congestion_control = bbr"
+            fi
+        } > "$out" || return 1
     fi
+    return 0
+}
+
+network_compute_target_buffers() { # -> NET_TARGET_RMEM / NET_TARGET_WMEM
+    local current_rmem current_wmem persisted_rmem persisted_wmem
+    current_rmem="$(network_sysctl_read net.core.rmem_max)" || return 1
+    current_wmem="$(network_sysctl_read net.core.wmem_max)" || return 1
+    persisted_rmem="$(read_managed_sysctl_number net.core.rmem_max || true)"
+    persisted_wmem="$(read_managed_sysctl_number net.core.wmem_max || true)"
+    NET_TARGET_RMEM="$(larger_number "$(larger_number "${current_rmem:-0}" "${persisted_rmem:-0}")" "$UDP_BUFFER_MIN_BYTES")"
+    NET_TARGET_WMEM="$(larger_number "$(larger_number "${current_wmem:-0}" "${persisted_wmem:-0}")" "$UDP_BUFFER_MIN_BYTES")"
+    return 0
+}
+
+network_install_candidate() { # <candidate> -> atomically replace the managed file
+    local candidate="$1"
+    mkdir -p -- "$(dirname -- "$NETWORK_SYSCTL_FILE")" || return 1
+    chmod 0644 "$candidate" || return 1
+    mv -f -- "$candidate" "$NETWORK_SYSCTL_FILE" || return 1
     return 0
 }
 
@@ -2712,43 +2802,48 @@ network_finish_failed_apply() {
 write_network_sysctl() { # <request_bbr TRUE|FALSE> [qdisc_mode fq|keep]
     local request_bbr="${1:-FALSE}"
     local qdisc_mode="${2:-keep}"
-    local current_rmem current_wmem persisted_rmem persisted_wmem
-    local target_rmem target_wmem temp_file
+    local candidate
 
-    current_rmem="$(network_sysctl_read net.core.rmem_max)" || return 1
-    current_wmem="$(network_sysctl_read net.core.wmem_max)" || return 1
-    persisted_rmem="$(read_managed_sysctl_number net.core.rmem_max || true)"
-    persisted_wmem="$(read_managed_sysctl_number net.core.wmem_max || true)"
-    target_rmem="$(larger_number "$(larger_number "${current_rmem:-0}" "${persisted_rmem:-0}")" "$UDP_BUFFER_MIN_BYTES")"
-    target_wmem="$(larger_number "$(larger_number "${current_wmem:-0}" "${persisted_wmem:-0}")" "$UDP_BUFFER_MIN_BYTES")"
-
+    network_compute_target_buffers || return 1
     mkdir -p -- "$(dirname -- "$NETWORK_SYSCTL_FILE")" || return 1
-    temp_file="$(mktemp "${NETWORK_SYSCTL_FILE}.candidate.XXXXXX")" || return 1
-    {
-        echo "# Managed by install-singboxhysteria2"
-        echo "# Keep UDP socket buffer limits at least 16 MiB for Hysteria2/QUIC."
-        echo "net.core.rmem_max = $target_rmem"
-        echo "net.core.wmem_max = $target_wmem"
-        if [ "$request_bbr" = "TRUE" ]; then
-            echo "# TCP tuning for Reality and proxied TCP traffic."
-            if [ "$qdisc_mode" = "fq" ]; then
-                echo "net.core.default_qdisc = fq"
-            fi
-            echo "net.ipv4.tcp_congestion_control = bbr"
-        fi
-    } > "$temp_file" || { rm -f -- "$temp_file"; return 1; }
-    chmod 0644 "$temp_file" || { rm -f -- "$temp_file"; return 1; }
-    mv -f -- "$temp_file" "$NETWORK_SYSCTL_FILE" || { rm -f -- "$temp_file"; return 1; }
+    candidate="$(mktemp "${NETWORK_SYSCTL_FILE}.candidate.XXXXXX")" || return 1
+    network_render_merged_sysctl "$request_bbr" "$qdisc_mode" \
+        "$NET_TARGET_RMEM" "$NET_TARGET_WMEM" "$candidate" ||
+        { rm -f -- "$candidate"; return 1; }
+    network_install_candidate "$candidate" || { rm -f -- "$candidate"; return 1; }
     "$SYSCTL_BIN" -p "$NETWORK_SYSCTL_FILE" >/dev/null 2>&1 || return 1
 
-    [ "$(network_sysctl_read net.core.rmem_max || true)" = "$target_rmem" ] || return 1
-    [ "$(network_sysctl_read net.core.wmem_max || true)" = "$target_wmem" ] || return 1
+    [ "$(network_sysctl_read net.core.rmem_max || true)" = "$NET_TARGET_RMEM" ] || return 1
+    [ "$(network_sysctl_read net.core.wmem_max || true)" = "$NET_TARGET_WMEM" ] || return 1
     if [ "$request_bbr" = "TRUE" ]; then
         [ "$(network_sysctl_read net.ipv4.tcp_congestion_control || true)" = "bbr" ] || return 1
         if [ "$qdisc_mode" = "fq" ]; then
             [ "$(network_sysctl_read net.core.default_qdisc || true)" = "fq" ] || return 1
         fi
     fi
+    info "Hysteria2 UDP 接收缓冲上限: $(network_sysctl_read net.core.rmem_max || true)"
+    info "Hysteria2 UDP 发送缓冲上限: $(network_sysctl_read net.core.wmem_max || true)"
+    return 0
+}
+
+# Lossless UDP-only update: merge the file (preserving the existing TCP/qdisc
+# persistence lines and every unrelated key) and apply ONLY the two UDP keys to
+# the live kernel. A `sysctl -p` would also re-apply the preserved TCP/qdisc/
+# custom lines and could change the live policy, so it is intentionally not
+# used here.
+write_network_udp_only() {
+    local candidate
+    network_compute_target_buffers || return 1
+    mkdir -p -- "$(dirname -- "$NETWORK_SYSCTL_FILE")" || return 1
+    candidate="$(mktemp "${NETWORK_SYSCTL_FILE}.candidate.XXXXXX")" || return 1
+    network_render_merged_sysctl "FALSE" "keep" \
+        "$NET_TARGET_RMEM" "$NET_TARGET_WMEM" "$candidate" ||
+        { rm -f -- "$candidate"; return 1; }
+    network_install_candidate "$candidate" || { rm -f -- "$candidate"; return 1; }
+    "$SYSCTL_BIN" -w "net.core.rmem_max=$NET_TARGET_RMEM" >/dev/null 2>&1 || return 1
+    "$SYSCTL_BIN" -w "net.core.wmem_max=$NET_TARGET_WMEM" >/dev/null 2>&1 || return 1
+    [ "$(network_sysctl_read net.core.rmem_max || true)" = "$NET_TARGET_RMEM" ] || return 1
+    [ "$(network_sysctl_read net.core.wmem_max || true)" = "$NET_TARGET_WMEM" ] || return 1
     info "Hysteria2 UDP 接收缓冲上限: $(network_sysctl_read net.core.rmem_max || true)"
     info "Hysteria2 UDP 发送缓冲上限: $(network_sysctl_read net.core.wmem_max || true)"
     return 0
@@ -2810,16 +2905,25 @@ apply_fresh_install_network_defaults() {
         warning "无法记录安装前网络参数，已跳过 TCP BBR/fq 默认优化（避免不可恢复的修改）；安装继续"
         return 0
     fi
+    if ! network_managed_file_safe; then
+        network_record_result "skipped-unsafe-managed-file"
+        warning "现有受管网络文件无法安全无损解析，已跳过 TCP BBR/fq 与 UDP 缓冲优化（文件与运行时设置均未修改）；安装继续"
+        return 0
+    fi
     if network_bbr_available; then
         bbr_available="TRUE"
     fi
     if [ "$bbr_available" = "TRUE" ]; then
-        if network_qdisc_replaceable "$NET_ORIG_QDISC"; then
+        local persisted_qdisc
+        persisted_qdisc="$(network_persisted_qdisc || true)"
+        if network_qdisc_replaceable "$NET_ORIG_QDISC" &&
+           { [ -z "$persisted_qdisc" ] || network_qdisc_replaceable "$persisted_qdisc"; }; then
             qdisc_mode="fq"
+        elif [ -n "$persisted_qdisc" ] && ! network_qdisc_replaceable "$persisted_qdisc"; then
+            info "检测到持久化自定义 qdisc=$persisted_qdisc，已无损保留原持久化行，不覆盖为 fq"
         else
             info "检测到自定义 qdisc=$NET_ORIG_QDISC，已保留，不覆盖为 fq"
         fi
-        network_warn_if_rewriting_managed_file "$qdisc_mode"
         if write_network_sysctl "TRUE" "$qdisc_mode"; then
             if [ "$NET_ORIG_CC" = "bbr" ]; then
                 network_record_result "already-enabled"
@@ -2838,7 +2942,6 @@ apply_fresh_install_network_defaults() {
     fi
 
     warning "当前内核不支持 TCP BBR；不会下载第三方脚本或自动更换内核。"
-    network_warn_if_rewriting_managed_file "keep"
     if configure_udp_buffers; then
         network_record_result "skipped-unsupported-bbr"
         info "已保留原 TCP/qdisc 设置，仅应用 Hysteria2 UDP 缓冲下限"
@@ -2864,7 +2967,11 @@ apply_udp_buffer_floor_only() {
         warning "无法记录安装前网络参数，已跳过 UDP 缓冲下限（避免不可恢复的修改）；安装继续"
         return 0
     fi
-    network_warn_if_rewriting_managed_file "keep"
+    if ! network_managed_file_safe; then
+        network_record_result "skipped-unsafe-managed-file"
+        warning "现有受管网络文件无法安全无损解析，已跳过 UDP 缓冲优化（文件与运行时设置均未修改）；安装继续"
+        return 0
+    fi
     if configure_udp_buffers; then
         network_record_result "udp-floor-applied"
         info "重新安装：仅应用 Hysteria2 UDP 缓冲下限；TCP/qdisc 保持原样（菜单 5 可手动启用 BBR）"
@@ -2900,6 +3007,7 @@ show_network_tuning_summary() {
         skipped-unsupported-bbr) result_text="内核不支持 TCP BBR：TCP/qdisc 保持原样，仅应用 UDP 缓冲下限" ;;
         udp-floor-applied) result_text="重新安装：仅应用 UDP 缓冲下限，TCP/qdisc 保持原样" ;;
         skipped-capture-failed|skipped-record-failed) result_text="无法安全读取/记录网络参数，已跳过优化并保留原设置" ;;
+        skipped-unsafe-managed-file) result_text="受管网络文件无法安全无损解析，已跳过优化（文件与运行时均未修改）" ;;
         skipped-opt-out) result_text="已按 SB_SKIP_NETWORK_TUNING 跳过优化" ;;
         rolled-back) result_text="应用失败，已自动恢复安装前 TCP/qdisc 与持久化文件" ;;
         rollback-incomplete) result_text="应用失败且自动回滚未完成：请按上面的手动恢复命令使用安装前记录恢复" ;;
@@ -2916,7 +3024,7 @@ show_network_tuning_summary() {
 }
 
 configure_udp_buffers() {
-    write_network_sysctl "FALSE" "keep"
+    write_network_udp_only
 }
 
 enable_bbr() {
@@ -2930,12 +3038,15 @@ enable_bbr() {
         warning "无法记录安装前网络参数，已取消 BBR 操作（避免不可恢复的修改）"
         return 1
     fi
+    if ! network_managed_file_safe; then
+        warning "现有受管网络文件无法安全无损解析，已取消 BBR 操作（文件与运行时设置均未修改）"
+        return 1
+    fi
     if network_bbr_available; then
         bbr_available="TRUE"
     fi
     if [ "$bbr_available" != "TRUE" ]; then
         warning "当前内核不支持 TCP BBR；不会下载第三方脚本或自动更换内核。"
-        network_warn_if_rewriting_managed_file "keep"
         if configure_udp_buffers; then
             network_record_result "skipped-unsupported-bbr"
             info "已仅应用 Hysteria2 UDP 缓冲下限；TCP/qdisc 保持不变"
@@ -2944,12 +3055,16 @@ enable_bbr() {
         fi
         return 1
     fi
-    if network_qdisc_replaceable "$NET_ORIG_QDISC"; then
+    local persisted_qdisc
+    persisted_qdisc="$(network_persisted_qdisc || true)"
+    if network_qdisc_replaceable "$NET_ORIG_QDISC" &&
+       { [ -z "$persisted_qdisc" ] || network_qdisc_replaceable "$persisted_qdisc"; }; then
         qdisc_mode="fq"
+    elif [ -n "$persisted_qdisc" ] && ! network_qdisc_replaceable "$persisted_qdisc"; then
+        info "检测到持久化自定义 qdisc=$persisted_qdisc，已无损保留原持久化行，不覆盖为 fq"
     else
         info "检测到自定义 qdisc=$NET_ORIG_QDISC，已保留，不覆盖为 fq"
     fi
-    network_warn_if_rewriting_managed_file "$qdisc_mode"
     if write_network_sysctl "TRUE" "$qdisc_mode"; then
         if [ "$NET_ORIG_CC" = "bbr" ]; then
             network_record_result "already-enabled"
