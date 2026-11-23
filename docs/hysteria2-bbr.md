@@ -27,7 +27,7 @@ GitHub 脚本更新不会自动修改旧服务器的 HY2 配置；安装入口�
 
 ### 只对全新安装生效
 
-- 已有安装的更新、脚本重跑、`miaomiao` 菜单操作（包括菜单 1 重新安装）**不会**自动迁移 TCP/qdisc；`FRESH_INSTALL` 在识别到既有安装时即被标记为非全新，全新安装的网络默认整体跳过。菜单 1 重新安装只保留/应用 Hysteria2 UDP 缓冲下限（与旧安装器行为一致），不改变 TCP/qdisc。
+- 已有安装的更新、脚本重跑、`miaomiao` 菜单操作（包括菜单 1 重新安装）**不会**自动迁移 TCP/qdisc；`FRESH_INSTALL` 在识别到既有安装时即被标记为非全新，全新安装的网络默认整体跳过。菜单 1 重新安装只保留/应用 Hysteria2 UDP 缓冲下限（与旧安装器行为一致），不改变 TCP/qdisc，且**保留**原受管文件里已有的 BBR/FQ 持久化行、自定义 qdisc 行和其它自定义键。
 - 菜单 `5. 启用本地 BBR + 优化 Hysteria2 UDP 缓冲` 仍是显式手动入口：设置 TCP BBR、保留自定义 qdisc、应用 UDP 缓冲下限，并同样记录安装前参数。
 - 不需要该默认优化（例如容器/自动化环境）可在安装时显式退出：`SB_SKIP_NETWORK_TUNING=1 bash <(curl -fsSL .../install.sh)`；`1` / `true` / `TRUE` / `yes` 均被接受。退出时不会写入任何 TCP/qdisc/UDP 配置。
 
@@ -36,7 +36,8 @@ GitHub 脚本更新不会自动修改旧服务器的 HY2 配置；安装入口�
 - 应用前先读取并记录原始值，并把**原受管文件字节**复制到 `root:root 0700` 的 `/root/sbox/network-tuning.before-install.<时间戳>/`：`state` 记录 `tcp_congestion_control` / `default_qdisc` / `rmem_max` / `wmem_max` / `file_present` / `result`，同目录保存原 `99-sing-box-network.conf`。
 - 内核不支持 BBR、`tcp_bbr` 加载失败、权限受限、`sysctl -p` 部分失败或持久化文件写入失败时：恢复安装前的运行时 sysctl 与持久化文件（原文件不存在则删除本次写入），输出原因与实际值，然后**继续正常安装**。BBR/fq 是可选优化，任何失败都不会中断安装，也不会把未生效写成成功。
 - 自动恢复不完整时会打印安装前实际值的手动恢复命令与记录路径，安装摘要与 `state` 的 `result` 记为 `rollback-incomplete`（不会写成“已自动恢复”），不隐藏失败。
-- 重写受管文件前，如果文件里存在本安装器不管理的配置行，或存在不再保留的自定义 `net.core.default_qdisc` 行，会明确 warning 并列出受影响 key；原文件字节仍保存在安装前记录目录，可恢复。
+- 受管文件采用**无损 merge**：只更新本安装器管理的键（`rmem_max` / `wmem_max`，以及本次要设置的 `tcp_congestion_control` / `default_qdisc`），其余行——注释、空行、重复键、不相关 sysctl、已有自定义 qdisc/cc 持久化行——按原顺序原样保留；缺失的受管键才追加到文件末尾。UDP-only 路径（菜单 1 重装、内核不支持 BBR 时）只改两个 UDP 键，并且只对运行时的这两个键执行 `sysctl -w`，不会用 `sysctl -p` 重新应用并改变 TCP/qdisc。
+- 现有受管文件若无法安全解释/保留（软链接、非普通文件、或出现注释/空行/`key = value` 之外的语法），**fail-closed 跳过可选优化**并报告 `skipped-unsafe-managed-file`：文件字节与运行时设置都不修改，安装继续。
 - 安装结束的网络摘要会列出实际 `tcp_congestion_control`、`default_qdisc`、`rmem_max`、`wmem_max`，以及“已应用 / 已存在 / 内核不支持 / 已跳过 / 已回滚 / 回滚未完成”的原因。
 
 ```bash
