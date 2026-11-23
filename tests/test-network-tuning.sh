@@ -7,14 +7,17 @@
 # overridden via NETWORK_SYSCTL_FILE / NETWORK_TUNING_RECORD_ROOT. No real
 # kernel setting and no real /etc/sysctl.d file is touched.
 #
-# OPTIONAL LIVE GATE (Linux, root, throwaway network namespace required):
-#   sudo unshare -n env SB_NET_REQUIRE_LIVE=1 SB_NET_LIVE_ISOLATED=1 \
+# OPTIONAL LIVE GATE (Linux, root, DISPOSABLE HOST ONLY):
+#   sudo env SB_NET_REQUIRE_LIVE=1 SB_NET_LIVE_DISPOSABLE=1 \
 #       bash tests/test-network-tuning.sh
-# Inside that netns the real sysctl binary applies/rolls back the real
-# net.ipv4/net.core values (both are network-namespace scoped), and a
-# persistence replay ("reboot simulation") re-applies the managed file. The
-# live gate refuses to run unless SB_NET_LIVE_ISOLATED=1 so it can never modify
-# the invoking host's network settings. "Ubuntu kernel without BBR" cannot be
+# The live gate applies/rolls back REAL net.ipv4/net.core values and replays
+# the persisted boot file. It refuses to run unless the caller explicitly
+# confirms a disposable host (SB_NET_LIVE_DISPOSABLE=1), captures every
+# original value first, restores on success AND on abnormal exit (best effort),
+# and CI runs it only on a GitHub-hosted ephemeral runner that is destroyed
+# after the job. A network namespace cannot be used for the full gate because
+# net.core.default_qdisc is NOT netns-scoped and a fresh netns does not expose
+# /proc/sys/net/core/default_qdisc at all. "Ubuntu kernel without BBR" cannot be
 # produced on a BBR-capable runner, so that case is covered hermetically only;
 # the same is true for write/apply partial-failure injection.
 set -uo pipefail
@@ -28,7 +31,13 @@ PASS=0
 FAIL=0
 SKIP=0
 TMP="$(mktemp -d)"
-cleanup() { rm -rf -- "$TMP"; }
+LIVE_RESTORE_NEEDED=0
+cleanup() {
+    if [ "$LIVE_RESTORE_NEEDED" = "1" ] && [ -n "${NET_ORIG_CC:-}" ]; then
+        network_restore_state >/dev/null 2>&1 || true
+    fi
+    rm -rf -- "$TMP"
+}
 trap cleanup EXIT
 
 pass() { PASS=$((PASS + 1)); printf '  PASS %s\n' "$*"; }
@@ -564,8 +573,8 @@ elif [ "$(uname -s)" != "Linux" ]; then
     fail "live gate requested on a non-Linux host"
 elif [ "$(id -u)" != "0" ]; then
     fail "live gate requested without root"
-elif [ "${SB_NET_LIVE_ISOLATED:-0}" != "1" ]; then
-    fail "refusing live sysctl writes outside an isolated netns (SB_NET_LIVE_ISOLATED=1 required)"
+elif [ "${SB_NET_LIVE_DISPOSABLE:-0}" != "1" ]; then
+    fail "refusing live sysctl writes: only an explicitly disposable host may be modified (SB_NET_LIVE_DISPOSABLE=1 required)"
 else
     unset -f sysctl modprobe
     export NETWORK_SYSCTL_FILE="$TMP/live/sysctl.d/99-sing-box-network.conf"
@@ -604,6 +613,7 @@ else
     if [ -z "$live_orig_cc" ] || [ -z "$live_orig_qdisc" ]; then
         fail "live gate could not read the real sysctl state (cc='$live_orig_cc' qdisc='$live_orig_qdisc' rmem='$live_orig_rmem' wmem='$live_orig_wmem')"
     else
+        LIVE_RESTORE_NEEDED=1
         maybe_apply_fresh_install_network_defaults > "$TMP/live-apply.out" 2>&1
         assert_rc 0 $? "live apply returns success"
         if printf '%s\n' "$live_available" | grep -qw bbr; then
@@ -630,9 +640,11 @@ else
             assert_eq "$live_orig_rmem" "$(network_sysctl_read net.core.rmem_max)" "live rollback restores original rmem"
             assert_eq "$live_orig_wmem" "$(network_sysctl_read net.core.wmem_max)" "live rollback restores original wmem"
             assert_missing "$NETWORK_SYSCTL_FILE" "live rollback removes the file it created"
+            LIVE_RESTORE_NEEDED=0
             # Re-apply, then simulate a reboot and replay the persistence file.
             maybe_apply_fresh_install_network_defaults > "$TMP/live-reapply.out" 2>&1
             assert_rc 0 $? "live re-apply succeeds"
+            LIVE_RESTORE_NEEDED=1
             "$SYSCTL_BIN" -w "net.ipv4.tcp_congestion_control=$live_orig_cc" >/dev/null 2>&1
             "$SYSCTL_BIN" -w "net.core.default_qdisc=$live_orig_qdisc" >/dev/null 2>&1
             "$SYSCTL_BIN" -w "net.core.rmem_max=$live_orig_rmem" >/dev/null 2>&1
@@ -654,6 +666,10 @@ else
                 fail "live unsupported path did not apply the UDP floor"
             fi
         fi
+    fi
+    if [ "$LIVE_RESTORE_NEEDED" = "1" ]; then
+        network_restore_state > "$TMP/live-final-restore.out" 2>&1 || true
+        LIVE_RESTORE_NEEDED=0
     fi
     rm -rf -- "$TMP/live" "$TMP/live-sbox"
 fi

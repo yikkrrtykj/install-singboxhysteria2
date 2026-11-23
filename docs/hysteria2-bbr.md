@@ -55,7 +55,7 @@ ls -1d /root/sbox/network-tuning.before-install.*
 - CI 使用官方 sing-box 1.14.3 服务端，验证 sing-box 1.14.3、1.11.15 客户端及 Mihomo 1.19.31；语法测试另外使用固定摘要的 MaxMind 测试数据库，不以其验证真实分流结果。测试用发行包的版本和 SHA256 固定在 `.github/workflows/hy2-bbr.yml`。
 - 1.11.15 只验证最小客户端的 HY2 outbound 协商互通；完整导出的 sing-box 客户端仍遵循原脚本的 1.13+ 配置格式要求，不能据此把完整新 JSON 导入 1.11。
 - 真实内核验证完整生成配置、IPv4/IPv6 导出、端口跳跃字段、密码/TLS/SNI和 Reality 字段保留；回环测试验证 HY2 双向传输、旧 300 Mbps 声明客户端仍可连接、错误密码拒绝，以及 Reality 双向传输。回环不证明生产线路无丢包，也不代替生产端口跳跃 NAT 验收。
-- 内核 TCP BBR/fq 默认由独立回归套件覆盖：CI 在隔离 network namespace 内用真实内核做应用/回滚/持久化重放，并用可注入 mock 覆盖不支持 BBR、部分写入失败、重复安装、旧安装更新跳过等路径；不执行真实重启，也不证明公网线路性能。`/etc/sysctl.conf`、云厂商 drop-in、容器限制等平台差异可能改变开机结果，以实际 `sysctl` 输出为准；`tcp_bbr` 模块加载是主机级副作用，不会卸载。
+- 内核 TCP BBR/fq 默认由独立回归套件覆盖：CI 在一次性 GitHub-hosted runner 上用真实内核做应用/读回/回滚/持久化重放（套件先捕获原值、结束后恢复，且要求显式 disposable-host 标志；runner 用完即销毁），并用可注入 mock 覆盖不支持 BBR、部分写入失败、重复安装、旧安装更新跳过等路径；不执行真实重启，也不证明公网线路性能。`net.core.default_qdisc` 不是 network-namespace 隔离的 sysctl，因此真内核 qdisc 路径无法在 netns 内验证。`/etc/sysctl.conf`、云厂商 drop-in、容器限制等平台差异可能改变开机结果，以实际 `sysctl` 输出为准；`tcp_bbr` 模块加载是主机级副作用，不会卸载。
 - 服务端无带宽声明且 `ignore_client_bandwidth: true` 会要求合规客户端使用 BBR；客户端省略带宽也选择 BBR。旧版或修改过的第三方客户端、订阅转换器可能不支持或重新加入带宽参数，需查看最终生效配置并单独验证；本仓库不承诺全部历史客户端兼容。
 - 官方定义：[sing-box inbound](https://sing-box.sagernet.org/configuration/inbound/hysteria2/#ignore_client_bandwidth)、[sing-box outbound](https://sing-box.sagernet.org/configuration/outbound/hysteria2/#up_mbps-down_mbps)、[Mihomo HY2](https://wiki.metacubex.one/en/config/proxies/hysteria2/)。
 
