@@ -199,12 +199,13 @@ section "prepare hermetic sysctl/modprobe mocks"
 # ---------------------------------------------------------------------------
 MOCK_STATE="$TMP/mock-sysctl"
 MOCK_CALLS="$TMP/sysctl-calls.log"
+MOCK_ONCE="$TMP/mock-fail-once"
 mock_path() { printf '%s/%s' "$MOCK_STATE" "${1//./_}"; }
 mock_set() { printf '%s\n' "$2" > "$(mock_path "$1")"; }
 mock_get() { cat "$(mock_path "$1")" 2>/dev/null || true; }
 mock_reset() {
-    rm -rf -- "$MOCK_STATE"
-    mkdir -p -- "$MOCK_STATE"
+    rm -rf -- "$MOCK_STATE" "$MOCK_ONCE"
+    mkdir -p -- "$MOCK_STATE" "$MOCK_ONCE"
     : > "$MOCK_CALLS"
     mock_set net.ipv4.tcp_congestion_control "${1:-cubic}"
     mock_set net.core.default_qdisc "${2:-fq_codel}"
@@ -212,6 +213,7 @@ mock_reset() {
     mock_set net.core.wmem_max "${4:-212992}"
     mock_set net.ipv4.tcp_available_congestion_control "${5:-reno cubic}"
     SYSCTL_FAIL_KEYS=""
+    SYSCTL_FAIL_ONCE_KEYS=""
     SYSCTL_P_PARTIAL_KEYS=""
     SYSCTL_P_RC=0
     SYSCTL_READ_FAIL=0
@@ -232,12 +234,23 @@ sysctl() {
             printf '%s\n' "$value"
             ;;
         -w)
-            local pair="${2:-}" key value path
+            local pair="${2:-}" key value path marker
             key="${pair%%=*}"
             value="${pair#*=}"
             [ "$key" != "$pair" ] || return 1
             if [ -n "${SYSCTL_FAIL_KEYS:-}" ]; then
                 case " $SYSCTL_FAIL_KEYS " in *" $key "*) return 1 ;; esac
+            fi
+            if [ -n "${SYSCTL_FAIL_ONCE_KEYS:-}" ]; then
+                case " $SYSCTL_FAIL_ONCE_KEYS " in
+                    *" $key "*)
+                        marker="$MOCK_ONCE/$(printf '%s' "$key" | tr './' '__')"
+                        if [ ! -e "$marker" ]; then
+                            : > "$marker"
+                            return 1
+                        fi
+                        ;;
+                esac
             fi
             path="$(mock_path "$key")"
             [ -d "$MOCK_STATE" ] || return 1
@@ -424,12 +437,12 @@ record="$(latest_record_dir)"
 assert_file_grep '^result=already-enabled$' "$record/state" "pre-existing BBR+fq result=already-enabled"
 
 # ---------------------------------------------------------------------------
-section "F5 partial apply failure restores runtime and persistence"
+section "F5 partial per-key apply failure restores runtime and persistence"
 # ---------------------------------------------------------------------------
 reset_case cubic fq_codel 212992 212992 "reno cubic bbr"
-SYSCTL_P_PARTIAL_KEYS="net.ipv4.tcp_congestion_control"
+SYSCTL_FAIL_ONCE_KEYS="net.ipv4.tcp_congestion_control"
 maybe_apply_fresh_install_network_defaults > "$TMP/f5.out" 2>&1
-assert_rc 0 $? "partial sysctl apply is non-fatal (install continues)"
+assert_rc 0 $? "partial per-key sysctl apply is non-fatal (install continues)"
 assert_eq cubic "$(mock_get net.ipv4.tcp_congestion_control)" "partial failure restores original congestion control"
 assert_eq fq_codel "$(mock_get net.core.default_qdisc)" "partial failure restores original qdisc"
 assert_eq 212992 "$(mock_get net.core.rmem_max)" "partial failure restores original rmem"
@@ -438,14 +451,15 @@ assert_missing "$NETWORK_SYSCTL_FILE" "partial failure removes the managed file 
 assert_file_grep '已自动恢复安装前' "$TMP/f5.out" "partial failure reports the rollback"
 record="$(latest_record_dir)"
 assert_file_grep '^result=rolled-back$' "$record/state" "record result=rolled-back"
+assert_file_no_grep '^sysctl -p' "$MOCK_CALLS" "fresh apply never runs a whole-file sysctl -p"
 
-# sysctl -p hard failure (permission/denied) takes the same rollback path.
+# A hard per-key write failure (permission/denied) takes the same rollback path.
 reset_case cubic fq_codel 212992 212992 "reno cubic bbr"
-SYSCTL_P_RC=1
+SYSCTL_FAIL_ONCE_KEYS="net.core.rmem_max"
 maybe_apply_fresh_install_network_defaults > "$TMP/f5b.out" 2>&1
-assert_rc 0 $? "sysctl -p failure is non-fatal"
-assert_eq cubic "$(mock_get net.ipv4.tcp_congestion_control)" "sysctl -p failure restores original cc"
-assert_missing "$NETWORK_SYSCTL_FILE" "sysctl -p failure removes the managed file it created"
+assert_rc 0 $? "per-key write failure is non-fatal"
+assert_eq cubic "$(mock_get net.ipv4.tcp_congestion_control)" "per-key failure restores original cc"
+assert_missing "$NETWORK_SYSCTL_FILE" "per-key failure removes the managed file it created"
 
 # An EXISTING managed file must be restored byte-for-byte on failure.
 reset_case cubic fq_codel 212992 212992 "reno cubic bbr"
@@ -456,7 +470,7 @@ net.core.rmem_max = 33554432
 net.ipv4.tcp_congestion_control = cubic
 EOF
 cp -a "$NETWORK_SYSCTL_FILE" "$TMP/f5-original.conf"
-SYSCTL_P_RC=1
+SYSCTL_FAIL_ONCE_KEYS="net.ipv4.tcp_congestion_control"
 maybe_apply_fresh_install_network_defaults > "$TMP/f5c.out" 2>&1
 assert_rc 0 $? "rollback over an existing managed file is non-fatal"
 if cmp -s "$TMP/f5-original.conf" "$NETWORK_SYSCTL_FILE"; then
@@ -471,7 +485,6 @@ assert_file_grep '^net\.core\.rmem_max = 33554432$' "$NETWORK_SYSCTL_FILE" "rest
 section "F5d incomplete rollback is reported truthfully (never as success)"
 # ---------------------------------------------------------------------------
 reset_case cubic fq_codel 212992 212992 "reno cubic bbr"
-SYSCTL_P_RC=1
 SYSCTL_FAIL_KEYS="net.ipv4.tcp_congestion_control net.core.default_qdisc net.core.rmem_max net.core.wmem_max"
 maybe_apply_fresh_install_network_defaults > "$TMP/f5d.out" 2>&1
 assert_rc 0 $? "unrecoverable rollback is still non-fatal"
@@ -750,7 +763,7 @@ assert_eq 16777216 "$(mock_get net.core.rmem_max)" "unsupported menu 5 still app
 assert_file_grep '不支持 TCP BBR' "$TMP/f10b.out" "unsupported menu 5 is reported"
 
 reset_case cubic fq_codel 212992 212992 "reno cubic bbr"
-SYSCTL_P_RC=1
+SYSCTL_FAIL_ONCE_KEYS="net.ipv4.tcp_congestion_control"
 enable_bbr > "$TMP/f10c.out" 2>&1
 assert_rc 1 $? "menu 5 apply failure returns rc=1"
 assert_eq cubic "$(mock_get net.ipv4.tcp_congestion_control)" "menu 5 failure restores original cc"
@@ -775,6 +788,78 @@ assert_rc 0 $? "managed file replays successfully"
 assert_eq bbr "$(mock_get net.ipv4.tcp_congestion_control)" "replay restores bbr after simulated reboot"
 assert_eq fq "$(mock_get net.core.default_qdisc)" "replay restores fq after simulated reboot"
 assert_eq 16777216 "$(mock_get net.core.rmem_max)" "replay restores the UDP floor after simulated reboot"
+
+# ---------------------------------------------------------------------------
+section "F12 fresh apply leaves unrelated live sysctl values untouched"
+# ---------------------------------------------------------------------------
+reset_case cubic fq_codel 212992 212992 "reno cubic bbr"
+mkdir -p -- "$(dirname -- "$NETWORK_SYSCTL_FILE")"
+cat > "$NETWORK_SYSCTL_FILE" <<'EOF'
+# unrelated persisted settings whose live values differ
+kernel.sched_autogroup_enabled = 1
+kernel.sysrq = 1
+EOF
+maybe_apply_fresh_install_network_defaults > "$TMP/f12.out" 2>&1
+assert_rc 0 $? "fresh apply over unrelated persisted keys succeeds"
+assert_eq bbr "$(mock_get net.ipv4.tcp_congestion_control)" "fresh apply sets managed cc"
+assert_eq fq "$(mock_get net.core.default_qdisc)" "fresh apply sets managed qdisc"
+assert_eq 16777216 "$(mock_get net.core.rmem_max)" "fresh apply sets managed rmem"
+assert_eq 16777216 "$(mock_get net.core.wmem_max)" "fresh apply sets managed wmem"
+assert_eq "" "$(mock_get kernel.sched_autogroup_enabled)" "unrelated live key was not applied by the installer"
+assert_eq "" "$(mock_get kernel.sysrq)" "second unrelated live key was not applied by the installer"
+assert_file_grep '^kernel\.sched_autogroup_enabled = 1$' "$NETWORK_SYSCTL_FILE" "unrelated persisted key still in the file"
+assert_file_grep '^kernel\.sysrq = 1$' "$NETWORK_SYSCTL_FILE" "second unrelated persisted key still in the file"
+assert_file_no_grep '^sysctl -p' "$MOCK_CALLS" "fresh apply never runs a whole-file sysctl -p"
+# The allowed reboot simulation replays the whole file, as systemd-sysctl would.
+sysctl -p "$NETWORK_SYSCTL_FILE" >/dev/null 2>&1
+assert_eq 1 "$(mock_get kernel.sched_autogroup_enabled)" "persistence replay applies the unrelated persisted key"
+
+# ---------------------------------------------------------------------------
+section "F13 menu 5 BBR enable leaves unrelated live sysctl values untouched"
+# ---------------------------------------------------------------------------
+reset_case cubic fq_codel 212992 212992 "reno cubic bbr"
+mkdir -p -- "$(dirname -- "$NETWORK_SYSCTL_FILE")"
+cat > "$NETWORK_SYSCTL_FILE" <<'EOF'
+kernel.sched_autogroup_enabled = 1
+kernel.sysrq = 1
+EOF
+enable_bbr > "$TMP/f13.out" 2>&1
+assert_rc 0 $? "menu 5 BBR enable succeeds"
+assert_eq bbr "$(mock_get net.ipv4.tcp_congestion_control)" "menu 5 sets managed cc"
+assert_eq fq "$(mock_get net.core.default_qdisc)" "menu 5 sets managed qdisc"
+assert_eq 16777216 "$(mock_get net.core.rmem_max)" "menu 5 sets managed rmem"
+assert_eq "" "$(mock_get kernel.sched_autogroup_enabled)" "menu 5 did not apply unrelated live key"
+assert_eq "" "$(mock_get kernel.sysrq)" "menu 5 did not apply second unrelated live key"
+assert_file_grep '^kernel\.sched_autogroup_enabled = 1$' "$NETWORK_SYSCTL_FILE" "menu 5 keeps unrelated persisted key"
+assert_file_no_grep '^sysctl -p' "$MOCK_CALLS" "menu 5 never runs a whole-file sysctl -p"
+
+# ---------------------------------------------------------------------------
+section "F14 failure rollback leaves unrelated live sysctl values untouched"
+# ---------------------------------------------------------------------------
+reset_case cubic fq_codel 212992 212992 "reno cubic bbr"
+mkdir -p -- "$(dirname -- "$NETWORK_SYSCTL_FILE")"
+cat > "$NETWORK_SYSCTL_FILE" <<'EOF'
+kernel.sched_autogroup_enabled = 1
+kernel.sysrq = 1
+EOF
+cp -a "$NETWORK_SYSCTL_FILE" "$TMP/f14-original.conf"
+SYSCTL_FAIL_ONCE_KEYS="net.ipv4.tcp_congestion_control"
+maybe_apply_fresh_install_network_defaults > "$TMP/f14.out" 2>&1
+assert_rc 0 $? "failure rollback is non-fatal"
+assert_eq cubic "$(mock_get net.ipv4.tcp_congestion_control)" "rollback restores the managed cc"
+assert_eq fq_codel "$(mock_get net.core.default_qdisc)" "rollback restores the managed qdisc"
+assert_eq 212992 "$(mock_get net.core.rmem_max)" "rollback restores the managed rmem"
+assert_eq 212992 "$(mock_get net.core.wmem_max)" "rollback restores the managed wmem"
+assert_eq "" "$(mock_get kernel.sched_autogroup_enabled)" "rollback leaves unrelated live key untouched"
+assert_eq "" "$(mock_get kernel.sysrq)" "rollback leaves second unrelated live key untouched"
+if cmp -s "$TMP/f14-original.conf" "$NETWORK_SYSCTL_FILE"; then
+    pass "failure rollback restores the original persistence file byte-for-byte"
+else
+    fail "failure rollback did not restore the original persistence file"
+fi
+assert_file_no_grep '^sysctl -p' "$MOCK_CALLS" "rollback path never runs a whole-file sysctl -p"
+record="$(latest_record_dir)"
+assert_file_grep '^result=rolled-back$' "$record/state" "rollback result recorded truthfully"
 
 # ---------------------------------------------------------------------------
 section "LIVE gate: real kernel on an explicitly disposable host"
