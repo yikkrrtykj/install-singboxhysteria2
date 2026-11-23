@@ -12,14 +12,17 @@
 #       bash tests/test-network-tuning.sh
 # The live gate applies/rolls back REAL net.ipv4/net.core values and replays
 # the persisted boot file. It refuses to run unless the caller explicitly
-# confirms a disposable host (SB_NET_LIVE_DISPOSABLE=1), captures every
-# original value first, restores on success AND on abnormal exit (best effort),
-# and CI runs it only on a GitHub-hosted ephemeral runner that is destroyed
-# after the job. A network namespace cannot be used for the full gate because
-# net.core.default_qdisc is NOT netns-scoped and a fresh netns does not expose
-# /proc/sys/net/core/default_qdisc at all. "Ubuntu kernel without BBR" cannot be
-# produced on a BBR-capable runner, so that case is covered hermetically only;
-# the same is true for write/apply partial-failure injection.
+# confirms a disposable host (SB_NET_LIVE_DISPOSABLE=1) AND the process is
+# either a GitHub Actions runner (GITHUB_ACTIONS=true) or carries the explicit
+# SB_NET_LIVE_LOCAL_DISPOSABLE=1 confirmation for a throwaway local VM. It
+# captures every original value first, restores on success AND on abnormal exit
+# (best effort), and CI runs it only on a GitHub-hosted ephemeral runner that is
+# destroyed after the job. A network namespace cannot be used for the full gate
+# because net.core.default_qdisc is NOT netns-scoped and a fresh netns does not
+# expose /proc/sys/net/core/default_qdisc at all. "Ubuntu kernel without BBR"
+# cannot be produced on a BBR-capable runner, so that case is covered
+# hermetically only; the same is true for write/apply partial-failure
+# injection.
 set -uo pipefail
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -82,9 +85,12 @@ else
     fail "network-tuning block extraction"
 fi
 for fn in network_sysctl_read read_sysctl_number larger_number network_bbr_available \
-          network_capture_state network_restore_state write_network_sysctl \
+          network_tuning_opt_out network_capture_state network_restore_state \
+          read_managed_sysctl_value network_unmanaged_file_keys \
+          network_warn_if_rewriting_managed_file write_network_sysctl \
           configure_udp_buffers enable_bbr apply_fresh_install_network_defaults \
-          maybe_apply_fresh_install_network_defaults show_network_tuning_summary; do
+          apply_udp_buffer_floor_only maybe_apply_fresh_install_network_defaults \
+          show_network_tuning_summary; do
     if grep -qE "^${fn}\(\)" "$TMP/network.sh"; then
         pass "function present: $fn"
     else
@@ -159,11 +165,17 @@ if grep -qF 'network-tuning.before-install' "$ROOT/docs/hysteria2-bbr.md"; then
 else
     fail "docs/hysteria2-bbr.md does not document the captured-state record"
 fi
-if grep -qF 'SB_SKIP_NETWORK_TUNING' "$ROOT/docs/hysteria2-bbr.md" &&
-   grep -qF 'SB_SKIP_NETWORK_TUNING' "$ROOT/README.md"; then
-    pass "docs/README document the SB_SKIP_NETWORK_TUNING opt-out"
+if grep -qF 'SB_SKIP_NETWORK_TUNING=1' "$ROOT/docs/hysteria2-bbr.md" &&
+   grep -qF 'SB_SKIP_NETWORK_TUNING=1' "$ROOT/README.md"; then
+    pass "docs/README document the SB_SKIP_NETWORK_TUNING=1 opt-out value"
 else
-    fail "opt-out SB_SKIP_NETWORK_TUNING is not documented in docs+README"
+    fail "documented opt-out value SB_SKIP_NETWORK_TUNING=1 is missing from docs+README"
+fi
+if grep -qF 'REINSTALL_FALLTHROUGH="TRUE"' "$INSTALL_SH" &&
+   [ "$(grep -cF 'REINSTALL_FALLTHROUGH="TRUE"' "$INSTALL_SH")" -eq 1 ]; then
+    pass "menu-1 reinstall marks REINSTALL_FALLTHROUGH for UDP-only handling"
+else
+    fail "menu-1 reinstall does not mark REINSTALL_FALLTHROUGH exactly once"
 fi
 if grep -qF 'tests/test-network-tuning.sh' "$ROOT/.github/workflows/tests.yml" &&
    grep -qF 'bash -n tests/test-network-tuning.sh' "$ROOT/.github/workflows/tests.yml"; then
@@ -454,6 +466,45 @@ assert_eq 212992 "$(mock_get net.core.rmem_max)" "failed apply restores the orig
 assert_file_grep '^net\.core\.rmem_max = 33554432$' "$NETWORK_SYSCTL_FILE" "restored file keeps the previously persisted larger buffer"
 
 # ---------------------------------------------------------------------------
+section "F5d incomplete rollback is reported truthfully (never as success)"
+# ---------------------------------------------------------------------------
+reset_case cubic fq_codel 212992 212992 "reno cubic bbr"
+SYSCTL_P_RC=1
+SYSCTL_FAIL_KEYS="net.ipv4.tcp_congestion_control net.core.default_qdisc net.core.rmem_max net.core.wmem_max"
+maybe_apply_fresh_install_network_defaults > "$TMP/f5d.out" 2>&1
+assert_rc 0 $? "unrecoverable rollback is still non-fatal"
+assert_file_grep '回滚未完全成功' "$TMP/f5d.out" "manual-recovery warning is emitted"
+assert_file_grep 'sysctl -w net.ipv4.tcp_congestion_control=' "$TMP/f5d.out" "manual-recovery command is printed"
+record="$(latest_record_dir)"
+assert_file_grep '^result=rollback-incomplete$' "$record/state" "record result=rollback-incomplete"
+show_network_tuning_summary > "$TMP/f5d.summary" 2>&1
+assert_file_grep '回滚未完成' "$TMP/f5d.summary" "install summary reports incomplete rollback"
+assert_file_no_grep '已自动恢复安装前' "$TMP/f5d.summary" "install summary does not claim a successful rollback"
+
+# ---------------------------------------------------------------------------
+section "F5e rewriting the managed file never drops unrelated lines silently"
+# ---------------------------------------------------------------------------
+reset_case bbr cake 212992 212992 "reno cubic bbr"
+mkdir -p -- "$(dirname -- "$NETWORK_SYSCTL_FILE")"
+cat > "$NETWORK_SYSCTL_FILE" <<'EOF'
+kernel.sched_autogroup_enabled = 1
+net.core.default_qdisc = cake
+net.core.rmem_max = 33554432
+EOF
+cp -a "$NETWORK_SYSCTL_FILE" "$TMP/f5e-original.conf"
+maybe_apply_fresh_install_network_defaults > "$TMP/f5e.out" 2>&1
+assert_rc 0 $? "apply over a file with unmanaged lines succeeds"
+assert_file_grep '不管理的配置行' "$TMP/f5e.out" "unmanaged lines are reported before rewrite"
+assert_file_grep 'kernel.sched_autogroup_enabled' "$TMP/f5e.out" "discarded unmanaged key is named"
+assert_file_grep 'net.core.default_qdisc=cake 不再由本次写入保留' "$TMP/f5e.out" "dropped persisted custom qdisc is reported"
+record="$(latest_record_dir)"
+if cmp -s "$TMP/f5e-original.conf" "$record/99-sing-box-network.conf"; then
+    pass "exact previous managed file is recoverable from the record"
+else
+    fail "record does not preserve the exact previous managed file"
+fi
+
+# ---------------------------------------------------------------------------
 section "F6 unwritable persistence path still keeps the installer alive"
 # ---------------------------------------------------------------------------
 reset_case cubic fq_codel 212992 212992 "reno cubic bbr"
@@ -479,12 +530,20 @@ assert_file_grep '无法读取当前网络参数' "$TMP/f7.out" "capture failure
 assert_eq 0 "$(record_dir_count)" "capture failure records nothing (no state could be captured)"
 
 reset_case cubic fq_codel 212992 212992 "reno cubic bbr"
-SB_SKIP_NETWORK_TUNING="TRUE"
+SB_SKIP_NETWORK_TUNING="1"
 maybe_apply_fresh_install_network_defaults > "$TMP/f7b.out" 2>&1
-assert_rc 0 $? "opt-out is non-fatal"
-assert_missing "$NETWORK_SYSCTL_FILE" "opt-out writes no persistence file"
-assert_eq "" "$(cat "$MOCK_CALLS")" "opt-out makes no sysctl/modprobe call"
-assert_file_grep 'SB_SKIP_NETWORK_TUNING' "$TMP/f7b.out" "opt-out is reported"
+assert_rc 0 $? "documented opt-out value 1 is non-fatal"
+assert_missing "$NETWORK_SYSCTL_FILE" "opt-out=1 writes no persistence file"
+assert_eq "" "$(cat "$MOCK_CALLS")" "opt-out=1 makes no sysctl/modprobe call"
+assert_file_grep 'SB_SKIP_NETWORK_TUNING' "$TMP/f7b.out" "opt-out=1 is reported"
+SB_SKIP_NETWORK_TUNING="FALSE"
+
+reset_case cubic fq_codel 212992 212992 "reno cubic bbr"
+SB_SKIP_NETWORK_TUNING="TRUE"
+maybe_apply_fresh_install_network_defaults > "$TMP/f7c.out" 2>&1
+assert_rc 0 $? "legacy opt-out value TRUE is accepted"
+assert_missing "$NETWORK_SYSCTL_FILE" "opt-out=TRUE writes no persistence file"
+assert_eq "" "$(cat "$MOCK_CALLS")" "opt-out=TRUE makes no sysctl/modprobe call"
 SB_SKIP_NETWORK_TUNING="FALSE"
 
 # ---------------------------------------------------------------------------
@@ -499,6 +558,24 @@ assert_eq fq_codel "$(mock_get net.core.default_qdisc)" "non-fresh skip leaves q
 assert_missing "$NETWORK_SYSCTL_FILE" "non-fresh skip writes no persistence file"
 assert_eq "" "$(cat "$MOCK_CALLS")" "non-fresh skip makes no sysctl/modprobe call"
 assert_file_grep '非全新安装' "$TMP/f8.out" "non-fresh skip is reported"
+FRESH_INSTALL="TRUE"
+
+# Menu-1 reinstall falls through to the fresh-install code after uninstalling.
+# It must still guarantee the UDP floor, but must never touch TCP/qdisc.
+reset_case cubic fq_codel 212992 212992 "reno cubic bbr"
+FRESH_INSTALL="FALSE"
+export REINSTALL_FALLTHROUGH="TRUE"
+maybe_apply_fresh_install_network_defaults > "$TMP/f8b.out" 2>&1
+assert_rc 0 $? "menu-1 reinstall UDP-only path returns success"
+assert_eq cubic "$(mock_get net.ipv4.tcp_congestion_control)" "reinstall keeps congestion control unchanged"
+assert_eq fq_codel "$(mock_get net.core.default_qdisc)" "reinstall keeps qdisc unchanged"
+assert_eq 16777216 "$(mock_get net.core.rmem_max)" "reinstall still applies the UDP floor"
+assert_file_grep '重新安装' "$TMP/f8b.out" "reinstall path is reported"
+assert_file_no_grep 'tcp_congestion_control' "$NETWORK_SYSCTL_FILE" "reinstall writes no TCP persistence line"
+assert_file_no_grep 'default_qdisc' "$NETWORK_SYSCTL_FILE" "reinstall writes no qdisc persistence line"
+record="$(latest_record_dir)"
+assert_file_grep '^result=udp-floor-applied$' "$record/state" "reinstall record result=udp-floor-applied"
+export REINSTALL_FALLTHROUGH="FALSE"
 FRESH_INSTALL="TRUE"
 
 # ---------------------------------------------------------------------------
@@ -568,13 +645,15 @@ assert_eq 16777216 "$(mock_get net.core.rmem_max)" "replay restores the UDP floo
 section "LIVE gate: real kernel on an explicitly disposable host"
 # ---------------------------------------------------------------------------
 if [ "${SB_NET_REQUIRE_LIVE:-0}" != "1" ]; then
-    skip "live kernel gate not requested (set SB_NET_REQUIRE_LIVE=1 inside unshare -n)"
+    skip "live kernel gate not requested (set SB_NET_REQUIRE_LIVE=1 on an explicitly disposable host)"
 elif [ "$(uname -s)" != "Linux" ]; then
     fail "live gate requested on a non-Linux host"
 elif [ "$(id -u)" != "0" ]; then
     fail "live gate requested without root"
 elif [ "${SB_NET_LIVE_DISPOSABLE:-0}" != "1" ]; then
     fail "refusing live sysctl writes: only an explicitly disposable host may be modified (SB_NET_LIVE_DISPOSABLE=1 required)"
+elif [ "${GITHUB_ACTIONS:-}" != "true" ] && [ "${SB_NET_LIVE_LOCAL_DISPOSABLE:-0}" != "1" ]; then
+    fail "refusing live sysctl writes outside CI: set GITHUB_ACTIONS=true (CI runner) or SB_NET_LIVE_LOCAL_DISPOSABLE=1 (throwaway local VM only)"
 else
     unset -f sysctl modprobe
     export NETWORK_SYSCTL_FILE="$TMP/live/sysctl.d/99-sing-box-network.conf"
