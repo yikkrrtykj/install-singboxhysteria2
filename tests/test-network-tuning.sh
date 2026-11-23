@@ -86,8 +86,10 @@ else
 fi
 for fn in network_sysctl_read read_sysctl_number larger_number network_bbr_available \
           network_tuning_opt_out network_capture_state network_restore_state \
-          read_managed_sysctl_value network_unmanaged_file_keys \
-          network_warn_if_rewriting_managed_file write_network_sysctl \
+          network_key_regex read_managed_sysctl_value network_persisted_qdisc \
+          network_managed_file_safe network_render_merged_sysctl \
+          network_compute_target_buffers network_install_candidate \
+          write_network_sysctl write_network_udp_only \
           configure_udp_buffers enable_bbr apply_fresh_install_network_defaults \
           apply_udp_buffer_floor_only maybe_apply_fresh_install_network_defaults \
           show_network_tuning_summary; do
@@ -482,27 +484,112 @@ assert_file_grep '回滚未完成' "$TMP/f5d.summary" "install summary reports i
 assert_file_no_grep '已自动恢复安装前' "$TMP/f5d.summary" "install summary does not claim a successful rollback"
 
 # ---------------------------------------------------------------------------
-section "F5e rewriting the managed file never drops unrelated lines silently"
+section "F5e fresh install preserves unrelated keys and persisted custom qdisc"
 # ---------------------------------------------------------------------------
 reset_case bbr cake 212992 212992 "reno cubic bbr"
 mkdir -p -- "$(dirname -- "$NETWORK_SYSCTL_FILE")"
 cat > "$NETWORK_SYSCTL_FILE" <<'EOF'
+# operator-managed tuning
 kernel.sched_autogroup_enabled = 1
 net.core.default_qdisc = cake
 net.core.rmem_max = 33554432
 EOF
 cp -a "$NETWORK_SYSCTL_FILE" "$TMP/f5e-original.conf"
 maybe_apply_fresh_install_network_defaults > "$TMP/f5e.out" 2>&1
-assert_rc 0 $? "apply over a file with unmanaged lines succeeds"
-assert_file_grep '不管理的配置行' "$TMP/f5e.out" "unmanaged lines are reported before rewrite"
-assert_file_grep 'kernel.sched_autogroup_enabled' "$TMP/f5e.out" "discarded unmanaged key is named"
-assert_file_grep 'net.core.default_qdisc=cake 不再由本次写入保留' "$TMP/f5e.out" "dropped persisted custom qdisc is reported"
+assert_rc 0 $? "apply over a file with custom keys succeeds"
+assert_file_grep '^kernel\.sched_autogroup_enabled = 1$' "$NETWORK_SYSCTL_FILE" "unrelated sysctl key preserved verbatim"
+assert_file_grep '^net\.core\.default_qdisc = cake$' "$NETWORK_SYSCTL_FILE" "persisted custom qdisc preserved"
+assert_file_grep '^net\.core\.rmem_max = 33554432$' "$NETWORK_SYSCTL_FILE" "larger persisted rmem not lowered"
+assert_file_grep '^net\.core\.wmem_max = 16777216$' "$NETWORK_SYSCTL_FILE" "missing UDP key appended"
+assert_file_grep '^net\.ipv4\.tcp_congestion_control = bbr$' "$NETWORK_SYSCTL_FILE" "missing TCP default appended"
+assert_eq cake "$(mock_get net.core.default_qdisc)" "custom qdisc runtime setting unchanged"
+assert_eq bbr "$(mock_get net.ipv4.tcp_congestion_control)" "BBR default still applied on fresh path"
+assert_file_no_grep '不管理的配置行' "$TMP/f5e.out" "no destructive-rewrite warning on the lossless path"
 record="$(latest_record_dir)"
 if cmp -s "$TMP/f5e-original.conf" "$record/99-sing-box-network.conf"; then
     pass "exact previous managed file is recoverable from the record"
 else
     fail "record does not preserve the exact previous managed file"
 fi
+# Simulated boot: reset the runtime, then replay the persisted file.
+mock_set net.ipv4.tcp_congestion_control cubic
+mock_set net.core.default_qdisc fq_codel
+mock_set net.core.rmem_max 212992
+mock_set net.core.wmem_max 212992
+sysctl -p "$NETWORK_SYSCTL_FILE" >/dev/null 2>&1
+assert_rc 0 $? "replay of the merged persistence file succeeds"
+assert_eq bbr "$(mock_get net.ipv4.tcp_congestion_control)" "replay restores BBR"
+assert_eq cake "$(mock_get net.core.default_qdisc)" "replay restores the persisted custom qdisc"
+assert_eq 33554432 "$(mock_get net.core.rmem_max)" "replay restores the larger persisted rmem"
+assert_eq 16777216 "$(mock_get net.core.wmem_max)" "replay restores the UDP wmem floor"
+
+# ---------------------------------------------------------------------------
+section "F5f lossless merge keeps comments, order and duplicate managed keys"
+# ---------------------------------------------------------------------------
+reset_case cubic fq_codel 212992 212992 "reno cubic bbr"
+mkdir -p -- "$(dirname -- "$NETWORK_SYSCTL_FILE")"
+cat > "$NETWORK_SYSCTL_FILE" <<'EOF'
+# leading comment
+net.ipv4.tcp_congestion_control = cubic
+kernel.sched_autogroup_enabled = 1
+net.ipv4.tcp_congestion_control = cubic
+; semicolon comment
+
+net.core.default_qdisc = fq_codel
+EOF
+maybe_apply_fresh_install_network_defaults > "$TMP/f5f.out" 2>&1
+assert_rc 0 $? "apply over duplicate/comment file succeeds"
+assert_eq "# leading comment" "$(sed -n '1p' "$NETWORK_SYSCTL_FILE")" "leading comment preserved in place"
+assert_eq "kernel.sched_autogroup_enabled = 1" "$(sed -n '3p' "$NETWORK_SYSCTL_FILE")" "unrelated key keeps its position"
+assert_eq ";" "$(sed -n '5p' "$NETWORK_SYSCTL_FILE" | cut -c1)" "semicolon comment preserved"
+assert_eq 2 "$(grep -c '^net\.ipv4\.tcp_congestion_control = bbr$' "$NETWORK_SYSCTL_FILE")" "both duplicate managed lines updated, count preserved"
+assert_eq 9 "$(wc -l < "$NETWORK_SYSCTL_FILE")" "existing 7 lines kept; only the 2 missing UDP keys appended"
+assert_file_grep '^net\.core\.default_qdisc = fq$' "$NETWORK_SYSCTL_FILE" "replaceable persisted qdisc updated to fq"
+assert_eq bbr "$(mock_get net.ipv4.tcp_congestion_control)" "runtime cc updated to bbr"
+assert_eq fq "$(mock_get net.core.default_qdisc)" "runtime qdisc updated to fq"
+
+# ---------------------------------------------------------------------------
+section "F5g unparseable managed file fails closed without touching it"
+# ---------------------------------------------------------------------------
+reset_case cubic fq_codel 212992 212992 "reno cubic bbr"
+mkdir -p -- "$(dirname -- "$NETWORK_SYSCTL_FILE")"
+cat > "$NETWORK_SYSCTL_FILE" <<'EOF'
+this is not a sysctl assignment
+net.core.rmem_max = 33554432
+EOF
+cp -a "$NETWORK_SYSCTL_FILE" "$TMP/f5g-original.conf"
+maybe_apply_fresh_install_network_defaults > "$TMP/f5g.out" 2>&1
+assert_rc 0 $? "unsafe file is a non-fatal skip"
+if cmp -s "$TMP/f5g-original.conf" "$NETWORK_SYSCTL_FILE"; then
+    pass "unsafe managed file left byte-identical"
+else
+    fail "unsafe managed file was modified"
+fi
+assert_eq cubic "$(mock_get net.ipv4.tcp_congestion_control)" "unsafe file leaves cc unchanged"
+assert_eq fq_codel "$(mock_get net.core.default_qdisc)" "unsafe file leaves qdisc unchanged"
+assert_eq 212992 "$(mock_get net.core.rmem_max)" "unsafe file leaves UDP buffers unchanged"
+assert_file_grep '无法安全无损解析' "$TMP/f5g.out" "unsafe file skip is reported accurately"
+assert_file_no_grep 'sysctl -w|sysctl -p' "$MOCK_CALLS" "unsafe file causes no sysctl write/apply"
+record="$(latest_record_dir)"
+assert_file_grep '^result=skipped-unsafe-managed-file$' "$record/state" "unsafe file record result"
+# The menu-1 UDP-only path must fail closed on the same file too.
+reset_case cubic fq_codel 212992 212992 "reno cubic bbr"
+mkdir -p -- "$(dirname -- "$NETWORK_SYSCTL_FILE")"
+printf 'this is not a sysctl assignment\nnet.core.rmem_max = 33554432\n' > "$NETWORK_SYSCTL_FILE"
+cp -a "$NETWORK_SYSCTL_FILE" "$TMP/f5g2-original.conf"
+FRESH_INSTALL="FALSE"
+export REINSTALL_FALLTHROUGH="TRUE"
+maybe_apply_fresh_install_network_defaults > "$TMP/f5g2.out" 2>&1
+assert_rc 0 $? "unsafe file on reinstall UDP-only path is a non-fatal skip"
+if cmp -s "$TMP/f5g2-original.conf" "$NETWORK_SYSCTL_FILE"; then
+    pass "reinstall UDP-only path left the unsafe file byte-identical"
+else
+    fail "reinstall UDP-only path modified the unsafe file"
+fi
+assert_eq 212992 "$(mock_get net.core.rmem_max)" "reinstall unsafe path leaves UDP buffers unchanged"
+assert_file_no_grep 'sysctl -w|sysctl -p' "$MOCK_CALLS" "reinstall unsafe path causes no sysctl write/apply"
+export REINSTALL_FALLTHROUGH="FALSE"
+FRESH_INSTALL="TRUE"
 
 # ---------------------------------------------------------------------------
 section "F6 unwritable persistence path still keeps the installer alive"
@@ -561,20 +648,68 @@ assert_file_grep '非全新安装' "$TMP/f8.out" "non-fresh skip is reported"
 FRESH_INSTALL="TRUE"
 
 # Menu-1 reinstall falls through to the fresh-install code after uninstalling.
-# It must still guarantee the UDP floor, but must never touch TCP/qdisc.
-reset_case cubic fq_codel 212992 212992 "reno cubic bbr"
+# It must still guarantee the UDP floor, but must never touch TCP/qdisc or drop
+# the existing TCP/qdisc persistence.
+reset_case bbr fq 212992 212992 "reno cubic bbr"
+mkdir -p -- "$(dirname -- "$NETWORK_SYSCTL_FILE")"
+cat > "$NETWORK_SYSCTL_FILE" <<'EOF'
+# existing BBR/FQ policy from menu 5
+net.ipv4.tcp_congestion_control = bbr
+net.core.default_qdisc = fq
+kernel.sched_autogroup_enabled = 1
+EOF
+cp -a "$NETWORK_SYSCTL_FILE" "$TMP/f8b-original.conf"
 FRESH_INSTALL="FALSE"
 export REINSTALL_FALLTHROUGH="TRUE"
 maybe_apply_fresh_install_network_defaults > "$TMP/f8b.out" 2>&1
 assert_rc 0 $? "menu-1 reinstall UDP-only path returns success"
-assert_eq cubic "$(mock_get net.ipv4.tcp_congestion_control)" "reinstall keeps congestion control unchanged"
-assert_eq fq_codel "$(mock_get net.core.default_qdisc)" "reinstall keeps qdisc unchanged"
+assert_eq bbr "$(mock_get net.ipv4.tcp_congestion_control)" "reinstall keeps live congestion control unchanged"
+assert_eq fq "$(mock_get net.core.default_qdisc)" "reinstall keeps live qdisc unchanged"
 assert_eq 16777216 "$(mock_get net.core.rmem_max)" "reinstall still applies the UDP floor"
+assert_file_grep '^net\.ipv4\.tcp_congestion_control = bbr$' "$NETWORK_SYSCTL_FILE" "reinstall keeps persisted BBR "
+assert_file_grep '^net\.core\.default_qdisc = fq$' "$NETWORK_SYSCTL_FILE" "reinstall keeps persisted FQ"
+assert_file_grep '^kernel\.sched_autogroup_enabled = 1$' "$NETWORK_SYSCTL_FILE" "reinstall keeps unrelated persisted keys"
+assert_file_grep '^# existing BBR/FQ policy from menu 5$' "$NETWORK_SYSCTL_FILE" "reinstall keeps existing comments"
+assert_eq "" "$(mock_get kernel.sched_autogroup_enabled)" "UDP-only apply does not re-apply unrelated persisted keys"
 assert_file_grep '重新安装' "$TMP/f8b.out" "reinstall path is reported"
-assert_file_no_grep 'tcp_congestion_control' "$NETWORK_SYSCTL_FILE" "reinstall writes no TCP persistence line"
-assert_file_no_grep 'default_qdisc' "$NETWORK_SYSCTL_FILE" "reinstall writes no qdisc persistence line"
 record="$(latest_record_dir)"
 assert_file_grep '^result=udp-floor-applied$' "$record/state" "reinstall record result=udp-floor-applied"
+if cmp -s "$TMP/f8b-original.conf" "$record/99-sing-box-network.conf"; then
+    pass "reinstall record keeps the exact previous persistence file"
+else
+    fail "reinstall record lost the previous persistence file"
+fi
+# Simulated boot: the persisted BBR/FQ and unrelated key must replay as before,
+# with only the UDP floor changed.
+mock_set net.ipv4.tcp_congestion_control cubic
+mock_set net.core.default_qdisc fq_codel
+mock_set net.core.rmem_max 212992
+mock_set net.core.wmem_max 212992
+sysctl -p "$NETWORK_SYSCTL_FILE" >/dev/null 2>&1
+assert_rc 0 $? "replay of the reinstall-merged file succeeds"
+assert_eq bbr "$(mock_get net.ipv4.tcp_congestion_control)" "replay still restores BBR after reinstall"
+assert_eq fq "$(mock_get net.core.default_qdisc)" "replay still restores FQ after reinstall"
+assert_eq 16777216 "$(mock_get net.core.rmem_max)" "replay restores the reinstall UDP floor"
+assert_eq 1 "$(mock_get kernel.sched_autogroup_enabled)" "replay restores the unrelated persisted key"
+
+# A persisted custom qdisc must survive a reinstall untouched.
+reset_case bbr cake 212992 212992 "reno cubic bbr"
+mkdir -p -- "$(dirname -- "$NETWORK_SYSCTL_FILE")"
+cat > "$NETWORK_SYSCTL_FILE" <<'EOF'
+net.ipv4.tcp_congestion_control = bbr
+net.core.default_qdisc = cake
+kernel.sched_autogroup_enabled = 1
+EOF
+FRESH_INSTALL="FALSE"
+export REINSTALL_FALLTHROUGH="TRUE"
+maybe_apply_fresh_install_network_defaults > "$TMP/f8c.out" 2>&1
+assert_rc 0 $? "custom-qdisc reinstall path returns success"
+assert_file_grep '^net\.core\.default_qdisc = cake$' "$NETWORK_SYSCTL_FILE" "persisted custom qdisc survives reinstall"
+assert_file_no_grep '^net\.core\.default_qdisc = fq$' "$NETWORK_SYSCTL_FILE" "reinstall does not add fq over a custom qdisc"
+assert_eq cake "$(mock_get net.core.default_qdisc)" "live custom qdisc unchanged by reinstall"
+sysctl -p "$NETWORK_SYSCTL_FILE" >/dev/null 2>&1
+assert_eq cake "$(mock_get net.core.default_qdisc)" "replay still restores the custom qdisc"
+assert_eq bbr "$(mock_get net.ipv4.tcp_congestion_control)" "replay still restores BBR"
 export REINSTALL_FALLTHROUGH="FALSE"
 FRESH_INSTALL="TRUE"
 
