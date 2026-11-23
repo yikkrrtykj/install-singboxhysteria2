@@ -30,21 +30,45 @@ from .chain import (
 from .errors import HaUiError
 from .models import (
     CertPin,
+    ClientCreationResult,
     ClientRecord,
+    CreationSideResult,
     GenerationResult,
     ProbePolicy,
     SelectedClient,
 )
 from .remote import (
     MIN_PIN_VALIDITY_HOURS,
+    RESERVED_CLIENT_NAME,
     RemotePreflight,
     RemoteProvider,
     RemoteSession,
     pin_warning,
+    validate_client_name,
     validate_pins_pair,
 )
 
 MIN_PIN = MIN_PIN_VALIDITY_HOURS
+
+# Errors after which the remote write may have happened but cannot be proven
+# completed. They must be surfaced as "uncertain", never as a clean failure.
+_UNCERTAIN_CREATE_CODES = frozenset({
+    errors.E_CREATE_UNCERTAIN,
+    errors.E_REMOTE_VERIFY,
+    errors.E_SSH_TIMEOUT,
+    errors.E_SSH_CLOSED,
+})
+
+
+def _creation_is_uncertain(exc: HaUiError) -> bool:
+    if exc.code in _UNCERTAIN_CREATE_CODES:
+        return True
+    # The menu transcript had no canonical success line. A proven rollback or a
+    # pre-write lock/consistency refusal is a clean failure; an unconfirmed
+    # transcript could hide a committed-but-unreadable write.
+    if exc.code == errors.E_REMOTE_CREATE and exc.detail == "unconfirmed":
+        return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -123,6 +147,127 @@ class GenerationService:
             result.warnings.append(
                 "有 %d 个客户端仅单端存在或协议不完整，不能生成双活配置"
                 % len(incomplete))
+        return result
+
+    # ---------------------------------------------------------------- create --
+    def create_client(self, *,
+                      sessions: Mapping[str, RemoteSession],
+                      name: str,
+                      confirmed: bool,
+                      allow_partial_repair: bool = False,
+                      progress: Callable[[str], None] | None = None
+                      ) -> ClientCreationResult:
+        """Create one same-named client on both VPSes, sequentially.
+
+        The two writes are **not** a distributed transaction. Before any write,
+        both servers must pass preflight, the name must be absent on both (or
+        present-and-complete on exactly one side when the operator explicitly
+        authorised a repair), and the HY2 certificate identity must validate.
+        A is committed first; B is attempted only if A is confirmed. A failed or
+        uncertain B is reported as a partial result and A is never auto-deleted.
+
+        The method returns a per-side receipt rather than raising for a write
+        failure, because the UI must display "A 已创建；B 失败" accurately. It
+        raises only for a pre-write refusal (existing client, incomplete
+        existing client, pin/preflight failure) or an invalid request.
+        """
+        report = progress or (lambda _stage: None)
+        if confirmed is not True:
+            raise HaUiError(errors.E_USAGE, detail="create-consent")
+        validated = validate_client_name(name)
+        if validated.casefold() == RESERVED_CLIENT_NAME.casefold():
+            raise HaUiError(errors.E_USAGE, detail="reserved-name")
+
+        providers = self._providers(sessions)
+        report("stage:create-preflight")
+        for role in ("A", "B"):
+            providers[role].preflight()
+        records = {role: providers[role].list_clients()
+                   for role in ("A", "B")}
+
+        # Same identity gate as generation: the two HY2 certificates must be
+        # independently valid. Creation itself does not need the pin values,
+        # but this is the only shared trust anchor proving A/B role separation.
+        report("stage:create-pins")
+        pins: dict[str, CertPin] = {}
+        for role in ("A", "B"):
+            found = providers[role].read_pins()
+            if set(found) != {role}:
+                raise HaUiError(errors.E_REMOTE_PIN, detail=role)
+            pins[role] = found[role]
+        validate_pins_pair(pins)
+
+        existing = tuple(role for role in ("A", "B")
+                         if validated in records[role])
+        if len(existing) == 2:
+            raise HaUiError(errors.E_CLIENT_EXISTS, detail="AB")
+        if existing:
+            existing_role = existing[0]
+            if not records[existing_role][validated].complete:
+                raise HaUiError(errors.E_CLIENT_INCOMPLETE,
+                                detail=existing_role)
+            if not allow_partial_repair:
+                raise HaUiError(errors.E_CLIENT_PARTIAL_EXISTS,
+                                detail=existing_role)
+
+        result = ClientCreationResult(name=validated,
+                                      repaired_existing=existing)
+        for role in existing:
+            result.sides[role] = CreationSideResult(
+                role=role, status="existing")
+
+        stopped = False
+        for role in ("A", "B"):
+            if role in existing:
+                continue
+            if stopped:
+                result.sides[role] = CreationSideResult(
+                    role=role, status="skipped", detail="not-attempted")
+                continue
+            report("stage:create-" + role.lower())
+            try:
+                providers[role].create_client(validated, confirmed=True)
+            except HaUiError as exc:
+                if _creation_is_uncertain(exc):
+                    result.sides[role] = CreationSideResult(
+                        role=role, status="uncertain", code=exc.code,
+                        detail=exc.detail)
+                else:
+                    result.sides[role] = CreationSideResult(
+                        role=role, status="failed", code=exc.code,
+                        detail=exc.detail)
+                # Never attempt the next side after a failure/uncertain write:
+                # the operator must inspect the actual state first.
+                stopped = True
+            else:
+                result.sides[role] = CreationSideResult(
+                    role=role, status="created")
+
+        # A success claim is only returned after a fresh live read proves the
+        # name and both protocols on every side that should now hold it.
+        report("stage:create-verify")
+        for role in ("A", "B"):
+            side = result.sides.get(role)
+            if side is None or side.status not in ("created", "existing"):
+                continue
+            try:
+                live = providers[role].list_clients()
+            except HaUiError as exc:
+                result.sides[role] = CreationSideResult(
+                    role=role, status="uncertain", code=exc.code,
+                    detail="verify")
+                continue
+            record = live.get(validated)
+            if record is None or not record.complete:
+                if side.status == "created":
+                    result.sides[role] = CreationSideResult(
+                        role=role, status="failed",
+                        code=errors.E_REMOTE_VERIFY, detail="missing")
+                else:
+                    result.sides[role] = CreationSideResult(
+                        role=role, status="uncertain",
+                        code=errors.E_REMOTE_VERIFY,
+                        detail="existing-changed")
         return result
 
     # -------------------------------------------------------------- generate --

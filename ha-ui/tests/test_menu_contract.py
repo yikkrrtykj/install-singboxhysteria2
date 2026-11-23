@@ -44,13 +44,39 @@ def test_top_level_menu_still_maps_10_to_the_client_menu(installer_text):
         "piped sequence 10/1/3 would select an unrelated action")
 
 
-def test_client_menu_still_maps_1_list_3_generate_0_exit(installer_text):
+def test_client_menu_still_maps_1_list_2_add_3_generate_0_exit(installer_text):
     start = installer_text.index("client_management_menu()")
     end = installer_text.index("<<< phase-c client-management", start)
     menu = installer_text[start:end]
     assert "1) list_clients" in menu
+    assert "2) add_client_interactive" in menu
     assert "3) generate_client_configuration_interactive" in menu
     assert "0) break" in menu
+
+
+def test_add_path_contract_markers_are_present(installer_text):
+    for marker in remote.MENU_ADD_MARKERS:
+        assert marker in installer_text, (
+            "add-path automation marker no longer present: %r" % marker)
+    assert "add_client()" in installer_text
+    assert "with_client_lock _add_client_locked" in installer_text
+    assert "cm_add_client_candidate_planned" in installer_text
+    assert "commit_server_config" in installer_text
+
+
+def test_add_command_is_pinned_and_bounded():
+    command = remote._add_client_command("event-vmix01")
+    assert "10\n2\nevent-vmix01\n0\n" in command
+    assert remote.INSTALLER_URL in command
+    assert remote.CLIENT_MANAGEMENT_URL in command
+    assert remote.INSTALLER_SHA256 in command
+    assert remote.CLIENT_MANAGEMENT_SHA256 in command
+    assert "timeout -k 10 420 env -i" in command
+    assert "PIPESTATUS" in command
+    assert "[redacted-link]" in command
+    # No credential material is ever placed in the command.
+    assert "uuid" not in command.casefold()
+    assert "password" not in command.casefold()
 
 
 def test_success_message_remote_waits_for_is_emitted_by_generation(

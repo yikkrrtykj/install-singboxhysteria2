@@ -52,9 +52,9 @@ MANAGEMENT_MARKER = "/var/lib/sbox-cm/management.active"
 # security-review action: re-review the installer + library, recompute both
 # hashes, and update docs/windows-ha-ui-data-path.md and the tests together.
 # ---------------------------------------------------------------------------
-INSTALLER_REVIEWED_COMMIT = "2a810a995fcc05ec5a807140c6fdb21e9ec660ff"
+INSTALLER_REVIEWED_COMMIT = "9402be91284551210f2d455f1af42e3b97ccb81e"
 INSTALLER_SHA256 = (
-    "520aded03ccf3af6f09b8ba4ad34313a9ccad1ac80127b1600eb519d2dbea67f")
+    "1a9923eb31ee29b899ba87651c102e83dbde0d397db91387245a489f2e647f10")
 CLIENT_MANAGEMENT_SHA256 = (
     "52e08db43b8c94dc42a3c8eea96e8bc3c6adb64155002e82ac3dee985e3b6a53")
 _REPO_RAW_BASE = ("https://raw.githubusercontent.com/yikkrrtykj/"
@@ -74,6 +74,7 @@ INSTALLER_HOST_DEPS = (
 )
 
 CANONICAL_CLIENT_NAME_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,31}\Z")
+RESERVED_CLIENT_NAME = "legacy"
 MAX_EXPORT_BYTES = 64 * 1024
 MAX_LIST_JSON = 256 * 1024
 MAX_MENU_OUTPUT = 1024 * 1024
@@ -87,10 +88,20 @@ MENU_SCRIPT_MARKERS = (
     "3) generate_client_configuration_interactive",
     "的 Mihomo 配置已生成",
 )
+# Additional static markers required before the add path may execute. They bind
+# option 2 to the reviewed canonical add_client wrapper and its success line;
+# the per-name success string is checked in the transcript afterwards.
+MENU_ADD_MARKERS = (
+    "2) add_client_interactive",
+    "add_client()",
+    "_add_client_locked()",
+    "已同时添加到 Reality 与 HY2",
+)
 # Transcript markers proving the expected menu path actually ran: the menu
 # notice, and the option-1 client table header.
 MENU_TRANSCRIPT_MARKERS = ("客户端管理", "NAME", "REALITY")
 MENU_SUCCESS_TEMPLATE = "客户端 '%s' 的 Mihomo 配置已生成"
+MENU_ADD_SUCCESS_TEMPLATE = "客户端 '%s' 已同时添加到 Reality 与 HY2"
 
 MENU_FETCH_TIMEOUT = 60
 MENU_RUN_TIMEOUT = 420
@@ -106,6 +117,10 @@ _MENU_FAIL_TOKENS = (
     ("name-invalid", "客户端名称非法"),
     ("permission", "权限"),
     ("reserved", "保留名称"),
+    ("exists", "已存在"),
+    ("lock", "配置锁"),
+    ("create", "生成 add candidate 失败"),
+    ("rollback", "回滚"),
 )
 # Pre-execution pin failures disable automatic menu generation explicitly; the
 # read-existing-exports path remains available. These are not retried.
@@ -211,7 +226,7 @@ def _menu_client_name(path: str) -> str:
     return name if CANONICAL_CLIENT_NAME_RE.fullmatch(name) else ""
 
 
-def _menu_command(names: list[str]) -> str:
+def _pinned_menu_command(sequence: str, markers: tuple[str, ...]) -> str:
     """Fixed remote script: fetch/verify pinned bytes, run menu, prove statuses.
 
     Trust chain: both the installer and the client-management library are
@@ -229,12 +244,10 @@ def _menu_command(names: list[str]) -> str:
     colours are stripped, and ``PIPESTATUS`` is captured for printf, the menu
     process and sed so a non-zero menu can never be hidden by a later marker.
     """
-    sequence = "10\n1\n" + "".join(
-        "3\n%s\n" % name for name in names) + "0\n"
     checks = " ".join(
         "grep -qF -- " + shlex.quote(marker) + " \"$d/install.sh\" "
         "|| { echo HAUI_MENU_FAIL=menu-drift; exit 5; };"
-        for marker in MENU_SCRIPT_MARKERS)
+        for marker in markers)
     path_env = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
     env_assignments = (
         "env -i PATH=" + path_env + " HOME=/root LANG=C.UTF-8 TERM=dumb "
@@ -277,6 +290,26 @@ def _menu_command(names: list[str]) -> str:
         "printf 'HAUI_MENU_END\\n'"
     )
     return "bash -c " + shlex.quote(script)
+
+
+def _menu_command(names: list[str]) -> str:
+    """Pinned menu 10→1→3 command for one or more existing client exports."""
+    sequence = "10\n1\n" + "".join(
+        "3\n%s\n" % name for name in names) + "0\n"
+    return _pinned_menu_command(sequence, MENU_SCRIPT_MARKERS)
+
+
+def _add_client_command(name: str) -> str:
+    """Pinned menu 10→2 command creating one client on this VPS only.
+
+    The name has already passed the canonical regex, so the only interpolated
+    text is a fixed-shape token. Success is never inferred from the menu exit
+    code alone: ``_verify_add_output`` requires the canonical add success line,
+    and the caller re-reads the live client list afterwards.
+    """
+    sequence = "10\n2\n%s\n0\n" % name
+    return _pinned_menu_command(
+        sequence, MENU_SCRIPT_MARKERS + MENU_ADD_MARKERS)
 
 
 def _derived_identity_command(names: list[str]) -> str:
@@ -508,6 +541,70 @@ class RemoteProvider:
             self._run_cli_generation(stale)
         return self.read_exports(validated)
 
+    # ---------------------------------------------------------------- create --
+    def create_client(self, name: str, *, confirmed: bool) -> None:
+        """Create one logical client on THIS VPS through the canonical add path.
+
+        This is a write operation. It requires the UI's explicit confirmation
+        and only ever invokes the reviewed installer menu 10→2, which runs the
+        existing ``add_client`` → ``with_client_lock`` →
+        ``cm_add_client_candidate_planned`` → ``commit_server_config`` chain
+        (independent credentials, backup, sing-box check, reload/health and
+        rollback). It never edits ``sbconfig_server.json`` directly.
+
+        Success requires all of:
+        * the name was absent from the live inventory before the write;
+        * the pinned installer/lib pre-execution checks passed;
+        * the menu's canonical success line and a clean pipeline exit frame;
+        * a fresh live inventory re-read now contains the name with both a
+          Reality and a HY2 credential.
+
+        The method returns only ``None``; the caller records the per-side
+        result. It never returns or logs credentials or raw remote output.
+        """
+        if confirmed is not True:
+            raise HaUiError(errors.E_USAGE, detail="create-consent")
+        validated = validate_client_name(name)
+        if validated.casefold() == RESERVED_CLIENT_NAME.casefold():
+            raise HaUiError(errors.E_USAGE, detail="reserved-name")
+        before = self.list_clients()
+        if validated in before:
+            raise HaUiError(errors.E_CLIENT_EXISTS, detail="server")
+        command = _add_client_command(validated)
+        try:
+            rc, out, _err = self.session.exec(
+                command, timeout=MENU_EXEC_TIMEOUT, max_output=MAX_MENU_OUTPUT)
+        except HaUiError as exc:
+            if exc.code == errors.E_SSH_TIMEOUT:
+                raise HaUiError(errors.E_CREATE_UNCERTAIN,
+                                detail="timeout") from None
+            raise
+        if int(rc) == 124:
+            raise HaUiError(errors.E_CREATE_UNCERTAIN, detail="timeout")
+        try:
+            self._verify_add_output(out, validated)
+        except HaUiError as exc:
+            if exc.code == errors.E_REMOTE_MENU and exc.detail == "timeout":
+                # A timeout after the write boundary may have committed the
+                # config; the caller must re-read rather than retry blindly.
+                raise HaUiError(errors.E_CREATE_UNCERTAIN,
+                                detail="timeout") from None
+            raise
+        try:
+            after = self.list_clients()
+        except HaUiError as exc:
+            # The write boundary has already been crossed; a failure to read the
+            # new live state is unconfirmed, not a clean failure. The operator
+            # must refresh instead of blindly retrying the write.
+            if exc.code == errors.E_CREATE_UNCERTAIN:
+                raise
+            raise HaUiError(errors.E_REMOTE_VERIFY,
+                            detail="live-read") from None
+        record = after.get(validated)
+        if record is None or not record.complete:
+            raise HaUiError(errors.E_REMOTE_VERIFY, detail="missing")
+        return None
+
     def _run_cli_generation(self, names: list[str]) -> None:
         """Run the verified installer menu and prove every requested export.
 
@@ -548,8 +645,15 @@ class RemoteProvider:
 
     # ------------------------------------------------- menu proof primitives --
     @staticmethod
-    def _verify_menu_output(output: str, names: list[str]) -> None:
-        text = (output or "").replace("\r", "")
+    def _menu_completion(text: str) -> str:
+        """Validate the pinned-wrapper completion frame; return transcript.
+
+        Both the export and add paths share this frame: a completed pinned
+        fetch/verification, a real menu transcript, and the three pipeline exit
+        statuses. The returned transcript excludes the trailing markers so
+        callers can require their own operation-specific success line.
+        """
+        text = (text or "").replace("\r", "")
         fail = re.search(r"HAUI_MENU_FAIL=([a-z-]{1,32})", text)
         if fail:
             token = fail.group(1)
@@ -567,7 +671,11 @@ class RemoteProvider:
             raise HaUiError(errors.E_REMOTE_MENU, detail="timeout")
         if printf_rc != 0 or menu_rc != 0 or sed_rc != 0:
             raise HaUiError(errors.E_REMOTE_MENU, detail="exit-status")
-        transcript = text[:match.start()]
+        return text[:match.start()]
+
+    @staticmethod
+    def _verify_menu_output(output: str, names: list[str]) -> None:
+        transcript = RemoteProvider._menu_completion(output)
         for marker in MENU_TRANSCRIPT_MARKERS:
             if marker not in transcript:
                 raise HaUiError(errors.E_REMOTE_MENU, detail="menu-drift")
@@ -575,6 +683,30 @@ class RemoteProvider:
             if (MENU_SUCCESS_TEMPLATE % name) not in transcript:
                 raise HaUiError(errors.E_REMOTE_MENU,
                                 detail=_menu_failure_token(transcript))
+
+    @staticmethod
+    def _verify_add_output(output: str, name: str) -> None:
+        """Prove the reviewed add path ran and emitted its success line.
+
+        The menu loop itself exits 0 even when ``add_client`` returns non-zero,
+        so the exit frame is necessary but never sufficient. The canonical
+        success line is emitted only after ``commit_server_config`` returned
+        success (including reload/health, or a proven no-process state).
+        """
+        transcript = RemoteProvider._menu_completion(output)
+        if "客户端管理" not in transcript:
+            raise HaUiError(errors.E_REMOTE_MENU, detail="menu-drift")
+        if (MENU_ADD_SUCCESS_TEMPLATE % name) in transcript:
+            return
+        token = _menu_failure_token(transcript)
+        if token == "exists":
+            raise HaUiError(errors.E_CLIENT_EXISTS, detail="server")
+        if token == "rollback":
+            raise HaUiError(errors.E_REMOTE_CREATE, detail="rollback")
+        if token in ("lock", "consistency", "incomplete", "missing-config",
+                     "name-invalid", "permission", "reserved", "create"):
+            raise HaUiError(errors.E_REMOTE_CREATE, detail=token)
+        raise HaUiError(errors.E_REMOTE_CREATE, detail="unconfirmed")
 
     def _derived_identities(self, names: list[str]) -> dict[str, object]:
         rc, out, _err = self.session.exec(_derived_identity_command(names),

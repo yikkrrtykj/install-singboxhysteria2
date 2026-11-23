@@ -1,20 +1,22 @@
-"""Client-management tab: read both VPS, show the union and pick clients.
+"""Client management page for HA-UI 0.2.0.
 
-The panel never talks to SSH itself: it hands a plain "password field snapshot"
-to :class:`~ha_ui.ui.session_service.SessionGenerationService` inside a
-:class:`~ha_ui.ui.workers.WorkerRunner` worker, so the whole connect + preview
-operation runs off the GUI thread and both sessions are closed when it ends.
+The page is a deliberately plain operator surface:
 
-Safety rules enforced by the view:
+* top: A/B connection state, client counts and certificate health;
+* primary action: create the same logical client on both VPSes;
+* table: selection, name, two endpoint states, generation readiness and the
+  A-first/B-first choice;
+* bottom: the explicit "generate YAML" next step.
 
-* a row that exists on only one server, or whose Reality/HY2 protocol or
-  credential is incomplete on either side, is rendered as blocked: it has no
-  checkbox (so "全选可生成" can never select it) and the fixed reason token is
-  translated into visible diagnosis text - no fake dual-active row;
-* only the client name and fixed structural tokens are rendered; the preview
-  carries no YAML/UUID/password, and this panel never displays a path;
-* the certificate PIN *fingerprint* is intentionally not rendered; only the
-  ``not_after`` validity date and the safe ``pin_warning``/preview warnings are.
+Technical diagnosis stays out of the default view. A blocked row shows one short
+status, and its full fixed-token explanation is available from "查看原因" or the
+status tooltip. Nothing here renders a UUID, password, YAML, remote path or raw
+remote output.
+
+The panel never talks to SSH itself: the service opens both pinned sessions for
+one operation inside :class:`WorkerRunner`, and closes them again. A create click
+is only a request; the actual remote write happens after the modal
+:class:`~ha_ui.ui.dialogs.ClientCreateDialog` explicit confirmation.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
+    QDialog,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -37,30 +40,30 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..core import errors
 from ..core.errors import HaUiError
-from ..core.models import ClientRecord, SelectedClient
+from ..core.models import ClientCreationResult, ClientRecord, SelectedClient
 from ..core.service import PreviewResult
+from .dialogs import ClientCreateDialog
 from .session_service import SessionGenerationService
 from .workers import WorkerRunner
 
 COLUMNS = (
     "选择",
     "客户端",
-    "A 存在",
-    "B 存在",
-    "Reality",
-    "HY2",
-    "导出文件",
-    "分组",
-    "问题/诊断",
+    "A 端",
+    "B 端",
+    "状态",
+    "优先节点",
+    "详情",
 )
 COL_SELECT, COL_NAME, COL_A, COL_B = 0, 1, 2, 3
-COL_REALITY, COL_HY2, COL_EXPORT, COL_GROUP, COL_DIAGNOSIS = 4, 5, 6, 7, 8
+COL_STATUS, COL_GROUP, COL_DETAIL = 4, 5, 6
 
 GROUPS = ("A-first", "B-first")
 
 # Fixed structural tokens from core.remote._build_records -> fixed Chinese text.
-# Unknown tokens are mapped to a generic label so nothing raw is ever rendered.
+# Unknown tokens map to a generic label so nothing raw is ever rendered.
 PROBLEM_TEXT: dict[str, str] = {
     "missing-reality": "Reality 缺失",
     "no-reality-credential": "Reality 凭据缺失",
@@ -77,14 +80,28 @@ PROBLEM_TEXT: dict[str, str] = {
 }
 UNKNOWN_PROBLEM_TEXT = "结构异常"
 
-NO_PREVIEW_TEXT = "未读取：请先确认 A/B 服务器配置与主机指纹，再点击「读取两端客户端」。"
-UNREADABLE_NOTE = "不显示 YAML、UUID 或密码；仅显示客户端名称与完整性状态。"
+NO_PREVIEW_TEXT = "尚未读取客户端。点击「刷新客户端」连接 A/B 两端。"
+EMPTY_TEXT = "尚无客户端。点击「新建客户端」在两台 VPS 上创建同名客户端。"
+HINT_TEXT = "创建会修改两台 VPS 的 sing-box 配置，并可能触发 reload。"
+
+CREATE_OK_TEMPLATE = "客户端「%s」已创建"
+CREATE_REPAIR_TEMPLATE = "客户端「%s」已补齐"
+CREATE_PARTIAL_TEMPLATE = (
+    "已保留已创建的一端；失败端需要单独检查，软件不会自动删除或重试写入。"
+)
 
 
 class GenerationNotifier(Protocol):
-    """The parts of ``MainWindow`` these tabs are allowed to call."""
+    """The parts of ``MainWindow`` this page is allowed to call."""
 
     def show_error(self, error: HaUiError) -> None: ...
+
+    def show_info(self, title: str, text: str) -> None: ...
+
+    def show_warning(self, title: str, text: str) -> None: ...
+
+    def confirm_partial_creation(self, name: str,
+                                 existing_role: str) -> bool: ...
 
 
 @dataclass(frozen=True)
@@ -101,22 +118,47 @@ class RowState:
     def ready(self) -> bool:
         return not self.reasons
 
+    @property
+    def status(self) -> str:
+        if self.a is None:
+            return "缺少 A 端"
+        if self.b is None:
+            return "缺少 B 端"
+        if self.reasons:
+            return "配置异常"
+        if not self.a.derived_export_present or not self.b.derived_export_present:
+            return "待生成"
+        return "可生成"
+
+    @property
+    def detail_text(self) -> str:
+        if self.reasons:
+            parts = list(self.reasons)
+            if self.notes:
+                parts.extend(self.notes)
+            return "；".join(parts)
+        if self.notes:
+            return "可生成；" + "；".join(self.notes)
+        return "两端协议完整，规范导出已就绪。"
+
 
 def _problem_text(token: str) -> str:
     return PROBLEM_TEXT.get(token, UNKNOWN_PROBLEM_TEXT)
 
 
-def _present(value: bool | None) -> str:
-    if value is None:
-        return "—"
-    return "✓" if value else "✗"
+def _endpoint_text(record: ClientRecord | None) -> str:
+    if record is None:
+        return "缺失"
+    return "正常" if record.complete else "异常"
 
 
 class ClientsPanel(QWidget):
-    """Preview both VPS inventories; choose complete clients and their group."""
+    """Preview both VPS inventories; create clients; choose the next step."""
 
     selection_changed = Signal()
     preview_loaded = Signal()
+    generate_requested = Signal()
+    client_created = Signal(str)
 
     def __init__(
         self,
@@ -134,37 +176,59 @@ class ClientsPanel(QWidget):
         self._preview: PreviewResult | None = None
         self._busy = False
         self._populating = False
+        self._pending_select: str | None = None
+        self._pending_repair: tuple[str, bool] | None = None
+        self._creation_allow_partial = False
+        self._creation_needs_refresh = False
         self._build_ui()
 
     # ------------------------------------------------------------------ build --
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(8)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        summary = QHBoxLayout()
+        self.server_a_label = QLabel("A：未读取", self)
+        self.server_a_label.setObjectName("serverSummary")
+        self.server_b_label = QLabel("B：未读取", self)
+        self.server_b_label.setObjectName("serverSummary")
+        self.client_count_label = QLabel("客户端 0 个", self)
+        self.client_count_label.setObjectName("clientCount")
+        summary.addWidget(self.server_a_label)
+        summary.addSpacing(18)
+        summary.addWidget(self.server_b_label)
+        summary.addStretch(1)
+        summary.addWidget(self.client_count_label)
+        layout.addLayout(summary)
 
         toolbar = QHBoxLayout()
-        self.preview_button = QPushButton("读取两端客户端", self)
-        self.select_all_button = QPushButton("全选可生成", self)
-        self.select_all_button.setToolTip("只选择两端协议完整且一致的客户端")
-        self.clear_button = QPushButton("清除选择", self)
-        toolbar.addWidget(self.preview_button)
-        toolbar.addWidget(self.select_all_button)
-        toolbar.addWidget(self.clear_button)
+        self.create_button = QPushButton("＋ 新建客户端", self)
+        self.create_button.setObjectName("primaryButton")
+        self.create_button.setToolTip(
+            "在两台 VPS 上创建同一个逻辑客户端；每端各自生成 Reality UUID 和 HY2 密码")
+        self.refresh_button = QPushButton("刷新客户端", self)
+        self.refresh_button.setObjectName("secondaryButton")
+        toolbar.addWidget(self.create_button)
+        toolbar.addWidget(self.refresh_button)
         toolbar.addStretch(1)
-        self.count_label = QLabel("尚未选择客户端", self)
-        self.count_label.setObjectName("selectionCount")
-        toolbar.addWidget(self.count_label)
+
+        self.cert_label = QLabel("证书：未读取", self)
+        self.cert_label.setObjectName("certSummary")
+        self.cert_detail_button = QPushButton("详情", self)
+        self.cert_detail_button.setObjectName("linkButton")
+        self.cert_detail_button.setVisible(False)
+        toolbar.addWidget(self.cert_label)
+        toolbar.addWidget(self.cert_detail_button)
         layout.addLayout(toolbar)
 
-        self.pin_label = QLabel("证书 PIN 有效期：未读取", self)
-        self.pin_label.setObjectName("pinStatus")
-        self.pin_label.setWordWrap(True)
-        layout.addWidget(self.pin_label)
-
-        self.warning_label = QLabel("", self)
-        self.warning_label.setObjectName("previewWarnings")
-        self.warning_label.setWordWrap(True)
-        layout.addWidget(self.warning_label)
+        self.creation_result_label = QLabel("", self)
+        self.creation_result_label.setObjectName("creationResult")
+        self.creation_result_label.setWordWrap(True)
+        self.creation_result_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.creation_result_label.setVisible(False)
+        layout.addWidget(self.creation_result_label)
 
         self.table = QTableWidget(0, len(COLUMNS), self)
         self.table.setObjectName("clientsTable")
@@ -172,21 +236,45 @@ class ClientsPanel(QWidget):
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.table.setAlternatingRowColors(True)
+        self.table.setWordWrap(False)
+        self.table.setTextElideMode(Qt.TextElideMode.ElideRight)
         self.table.verticalHeader().setVisible(False)
         header = self.table.horizontalHeader()
-        header.setStretchLastSection(True)
-        for column in (COL_SELECT, COL_A, COL_B, COL_REALITY, COL_HY2,
-                       COL_EXPORT, COL_GROUP):
+        header.setStretchLastSection(False)
+        for column in (COL_SELECT, COL_A, COL_B, COL_STATUS):
             header.setSectionResizeMode(
                 column, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(COL_NAME, QHeaderView.ResizeMode.Interactive)
-        self.table.setColumnWidth(COL_NAME, 180)
+        header.setSectionResizeMode(COL_NAME, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(COL_GROUP, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(COL_DETAIL, QHeaderView.ResizeMode.Fixed)
+        self.table.setColumnWidth(COL_GROUP, 112)
+        self.table.setColumnWidth(COL_DETAIL, 86)
         layout.addWidget(self.table, 1)
 
-        note = QLabel(UNREADABLE_NOTE, self)
-        note.setObjectName("hint")
-        note.setWordWrap(True)
-        layout.addWidget(note)
+        self.empty_label = QLabel(NO_PREVIEW_TEXT, self)
+        self.empty_label.setObjectName("emptyState")
+        self.empty_label.setWordWrap(True)
+        self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.empty_label)
+
+        footer = QHBoxLayout()
+        self.select_all_button = QPushButton("全选可生成", self)
+        self.select_all_button.setObjectName("secondaryButton")
+        self.select_all_button.setToolTip("只选择两端协议完整且一致的客户端")
+        self.clear_button = QPushButton("清除选择", self)
+        self.clear_button.setObjectName("secondaryButton")
+        self.selection_label = QLabel("尚未选择", self)
+        self.selection_label.setObjectName("selectionCount")
+        self.generate_yaml_button = QPushButton("生成 YAML", self)
+        self.generate_yaml_button.setObjectName("primaryButton")
+        self.generate_yaml_button.setEnabled(False)
+        footer.addWidget(self.select_all_button)
+        footer.addWidget(self.clear_button)
+        footer.addSpacing(8)
+        footer.addWidget(self.selection_label)
+        footer.addStretch(1)
+        footer.addWidget(self.generate_yaml_button)
+        layout.addLayout(footer)
 
         self.status_label = QLabel(NO_PREVIEW_TEXT, self)
         self.status_label.setObjectName("previewStatus")
@@ -195,10 +283,22 @@ class ClientsPanel(QWidget):
             Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(self.status_label)
 
-        self.preview_button.clicked.connect(self._on_preview_clicked)
+        self.hint_label = QLabel(HINT_TEXT, self)
+        self.hint_label.setObjectName("hint")
+        self.hint_label.setWordWrap(True)
+        layout.addWidget(self.hint_label)
+
+        self.create_button.clicked.connect(self._on_create_clicked)
+        self.refresh_button.clicked.connect(self._on_refresh_clicked)
         self.select_all_button.clicked.connect(self.select_all_generatable)
         self.clear_button.clicked.connect(self.clear_selection)
+        self.generate_yaml_button.clicked.connect(
+            self.generate_requested.emit)
+        self.cert_detail_button.clicked.connect(self._show_certificate_details)
         self.table.itemChanged.connect(self._on_item_changed)
+
+        self.empty_label.setVisible(True)
+        self._apply_controls()
 
     # ----------------------------------------------------------------- state ---
     @property
@@ -214,8 +314,34 @@ class ClientsPanel(QWidget):
         return sum(1 for row in range(self.table.rowCount())
                    if self._row_state(row).ready)
 
+    def set_configured_servers(self, servers: Mapping[str, object]) -> None:
+        """Initial summary before any connection: configured or not."""
+        for role, label in (("A", self.server_a_label),
+                            ("B", self.server_b_label)):
+            server = servers.get(role)
+            host = getattr(server, "host", "")
+            if host:
+                label.setText("%s：已配置" % role)
+                label.setToolTip("%s 端已保存连接信息，尚未读取" % role)
+            else:
+                label.setText("%s：未配置" % role)
+                label.setToolTip("请先在「服务器」页填写并保存")
+
+    def _apply_controls(self) -> None:
+        enabled = not self._busy
+        self.create_button.setEnabled(enabled)
+        self.refresh_button.setEnabled(enabled)
+        self.select_all_button.setEnabled(enabled)
+        self.clear_button.setEnabled(enabled)
+        self.generate_yaml_button.setEnabled(
+            enabled and bool(self.selected_clients()))
+
     # --------------------------------------------------------------- preview ---
-    def _on_preview_clicked(self) -> None:
+    def _on_refresh_clicked(self) -> None:
+        self.refresh_clients()
+
+    def refresh_clients(self, on_loaded: Callable[[], None] | None = None) -> None:
+        """Read both inventories off the GUI thread; always close the sessions."""
         if self._busy:
             return
         try:
@@ -228,23 +354,27 @@ class ClientsPanel(QWidget):
         def job() -> PreviewResult:
             return self._service.preview(password_overrides=passwords)
 
-        self._runner.run(job, on_success=self._apply_preview,
+        def success(result: PreviewResult) -> None:
+            self._apply_preview(result)
+            if on_loaded is not None:
+                try:
+                    on_loaded()
+                except BaseException:  # noqa: BLE001 - GUI boundary
+                    pass
+
+        self._runner.run(job, on_success=success,
                          on_error=self._preview_failed,
                          on_done=self._end_preview)
 
     def _begin_preview(self) -> None:
         self._busy = True
-        self.preview_button.setEnabled(False)
-        self.select_all_button.setEnabled(False)
-        self.clear_button.setEnabled(False)
-        self.status_label.setText("正在连接两端并读取客户端清单…")
+        self._apply_controls()
+        self.status_label.setText("正在连接 A/B 两端并读取客户端清单…")
         self._clear_view()
 
     def _end_preview(self) -> None:
         self._busy = False
-        self.preview_button.setEnabled(True)
-        self.select_all_button.setEnabled(True)
-        self.clear_button.setEnabled(True)
+        self._apply_controls()
 
     def _clear_view(self) -> None:
         """Drop a previous preview before the new one is known to be valid."""
@@ -254,41 +384,77 @@ class ClientsPanel(QWidget):
             self.table.setRowCount(0)
         finally:
             self._populating = False
-        self.pin_label.setText("证书 PIN 有效期：未读取")
-        self.warning_label.setText("警告：未读取")
-        self.count_label.setText("尚未选择客户端")
+        self.empty_label.setVisible(True)
+        self.empty_label.setText(NO_PREVIEW_TEXT)
+        self.client_count_label.setText("客户端 0 个")
+        self.cert_label.setText("证书：未读取")
+        self.cert_label.setStyleSheet("")
+        self.cert_detail_button.setVisible(False)
+        self.selection_label.setText("尚未选择")
+        self.generate_yaml_button.setEnabled(False)
         self.selection_changed.emit()
 
     def _preview_failed(self, error: HaUiError) -> None:
         # A failed refresh must never leave a stale "ready" table behind.
         self._clear_view()
-        self.status_label.setText("读取失败：%s" % error.safe_text)
+        self.status_label.setText("刷新失败：%s" % error.safe_text)
         self._notifier.show_error(error)
 
     def _apply_preview(self, result: PreviewResult) -> None:
         self._preview = result
         self._populate_table(result)
-        self.pin_label.setText(self._pin_summary(result))
-        warnings = "；".join(result.warnings) if result.warnings else "无"
-        self.warning_label.setText("警告：%s" % warnings)
-        ready = self.ready_count
-        self.status_label.setText(
-            "读取完成：A 端 %d 个客户端，B 端 %d 个客户端，其中 %d 个可生成。"
-            % (len(result.clients_a), len(result.clients_b), ready))
+        self._update_certificate_summary(result)
+        for role, label in (("A", self.server_a_label),
+                            ("B", self.server_b_label)):
+            preview = result.servers.get(role)
+            count = len(preview.records) if preview is not None else 0
+            label.setText("%s：已连接 · %d 个" % (role, count))
+            label.setToolTip("%s 端客户端清单已读取" % role)
+        self.client_count_label.setText(
+            "客户端 %d 个 · 可生成 %d 个" % (len(result.names),
+                                            self.ready_count))
+        if result.names:
+            self.status_label.setText(
+                "读取完成：A 端 %d 个，B 端 %d 个。"
+                % (len(result.clients_a), len(result.clients_b)))
+        else:
+            self.status_label.setText("读取完成：两端都还没有客户端。")
+            self.empty_label.setText(EMPTY_TEXT)
+        self.empty_label.setVisible(not bool(result.names))
         self.preview_loaded.emit()
         self.selection_changed.emit()
 
-    @staticmethod
-    def _pin_summary(result: PreviewResult) -> str:
-        parts = []
+    def _update_certificate_summary(self, result: PreviewResult) -> None:
+        warnings = [text for text in result.warnings if "证书" in text]
+        if warnings:
+            self.cert_label.setText("证书提醒")
+            self.cert_label.setStyleSheet("color: #9a5b00; font-weight: 600;")
+            self.cert_detail_button.setVisible(True)
+            self.cert_label.setToolTip("；".join(warnings))
+            self._cert_warning_text = "；".join(warnings)
+            return
+        self.cert_label.setText("证书：A / B 正常")
+        self.cert_label.setStyleSheet("color: #1f6b3a; font-weight: 600;")
+        self.cert_detail_button.setVisible(False)
+        self._cert_warning_text = ""
+
+    def _show_certificate_details(self) -> None:
+        preview = self._preview
+        if preview is None:
+            return
+        lines = [getattr(self, "_cert_warning_text", "")
+                 or "A/B 两端 HY2 证书均在正常有效期。"]
+        lines.append("")
         for role in ("A", "B"):
-            preview = result.servers.get(role)
-            if preview is None:
+            server = preview.servers.get(role)
+            if server is None:
                 continue
-            # Deliberately no fingerprint: only the validity date is UI material.
-            parts.append("%s 端证书到期：%s" % (
-                role, preview.pins.not_after.strftime("%Y-%m-%d %H:%M UTC")))
-        return "；".join(parts) if parts else "证书 PIN 有效期：未读取"
+            local = server.pins.not_after.astimezone()
+            lines.append(
+                "%s 端到期：%s（本地）/ %s UTC"
+                % (role, local.strftime("%Y-%m-%d %H:%M"),
+                   server.pins.not_after.strftime("%Y-%m-%d %H:%M")))
+        self._notifier.show_info("HY2 证书", "\n".join(lines))
 
     # ---------------------------------------------------------------- table ----
     def _populate_table(self, result: PreviewResult) -> None:
@@ -298,8 +464,7 @@ class ClientsPanel(QWidget):
             for name in result.names:
                 row = self.table.rowCount()
                 self.table.insertRow(row)
-                state = self._union_state(name, result)
-                self._fill_row(row, state)
+                self._fill_row(row, self._union_state(name, result))
         finally:
             self._populating = False
         self._refresh_selection()
@@ -316,20 +481,25 @@ class ClientsPanel(QWidget):
         for role, record in (("A", a), ("B", b)):
             if record is None:
                 continue
-            for token in record.problems:
-                reasons.append("%s 端%s" % (role, _problem_text(token)))
-            if not record.reality_ok and not (
-                    "missing-reality" in record.problems
-                    or "no-reality-credential" in record.problems):
+            role_problems = [_problem_text(token)
+                             for token in record.problems]
+            # A structural token may appear globally more than once; keep the
+            # row short and deterministic.
+            for text in dict.fromkeys(role_problems):
+                value = "%s 端 %s" % (role, text)
+                if value not in reasons:
+                    reasons.append(value)
+            if not record.reality_ok and not any(
+                    "Reality" in text for text in role_problems):
                 reasons.append("%s 端 Reality 不完整" % role)
-            if not record.hy2_ok and not (
-                    "missing-hy2" in record.problems
-                    or "no-hy2-credential" in record.problems):
+            if not record.hy2_ok and not any(
+                    "HY2" in text for text in role_problems):
                 reasons.append("%s 端 HY2 不完整" % role)
             if not record.derived_export_present:
-                notes.append("%s 端导出需运行 miaomiao 菜单生成" % role)
+                notes.append("%s 端规范导出待生成" % role)
         return RowState(name=name, a=a, b=b,
-                        reasons=tuple(reasons), notes=tuple(notes))
+                        reasons=tuple(dict.fromkeys(reasons)),
+                        notes=tuple(notes))
 
     def _row_state(self, row: int) -> RowState:
         name_item = self.table.item(row, COL_NAME)
@@ -341,8 +511,9 @@ class ClientsPanel(QWidget):
 
     def _fill_row(self, row: int, state: RowState) -> None:
         blocked = not state.ready
-        grey = QBrush(QColor("#7a828e"))
+        grey = QBrush(QColor("#8a929e"))
         red = QBrush(QColor("#9a2a00"))
+        amber = QBrush(QColor("#9a5b00"))
 
         check = QTableWidgetItem()
         if blocked:
@@ -360,24 +531,20 @@ class ClientsPanel(QWidget):
             name_item.setForeground(red)
         self.table.setItem(row, COL_NAME, name_item)
 
-        values = {
-            COL_A: "是" if state.a is not None else "否",
-            COL_B: "是" if state.b is not None else "否",
-            COL_REALITY: "A %s / B %s" % (
-                _present(state.a.reality_ok if state.a else None),
-                _present(state.b.reality_ok if state.b else None)),
-            COL_HY2: "A %s / B %s" % (
-                _present(state.a.hy2_ok if state.a else None),
-                _present(state.b.hy2_ok if state.b else None)),
-            COL_EXPORT: self._export_text(state),
-            COL_DIAGNOSIS: self._diagnosis_text(state),
-        }
-        for column, text in values.items():
+        for column, text in (
+                (COL_A, _endpoint_text(state.a)),
+                (COL_B, _endpoint_text(state.b)),
+                (COL_STATUS, state.status)):
             item = QTableWidgetItem(text)
-            if blocked:
+            item.setToolTip(state.detail_text if column == COL_STATUS else text)
+            if blocked and column in (COL_A, COL_B) and text in ("缺失", "异常"):
+                item.setForeground(red)
+            elif blocked and column == COL_STATUS:
+                item.setForeground(red)
+            elif blocked:
                 item.setForeground(grey)
-            if column == COL_DIAGNOSIS:
-                item.setToolTip(text)
+            elif state.status == "待生成":
+                item.setForeground(amber)
             self.table.setItem(row, column, item)
 
         combo = QComboBox(self.table)
@@ -390,30 +557,24 @@ class ClientsPanel(QWidget):
             lambda _index, _combo=combo: self._on_group_changed())
         self.table.setCellWidget(row, COL_GROUP, combo)
 
-        self.table.setRowHeight(row, 26)
+        if blocked:
+            detail = QPushButton("查看原因", self.table)
+            detail.setObjectName("linkButton")
+            detail.setToolTip(state.detail_text)
+            detail.clicked.connect(
+                lambda _checked=False, name=state.name: self._show_reasons(name))
+            self.table.setCellWidget(row, COL_DETAIL, detail)
+        else:
+            item = QTableWidgetItem("")
+            self.table.setItem(row, COL_DETAIL, item)
+        self.table.setRowHeight(row, 30)
 
-    @staticmethod
-    def _export_text(state: RowState) -> str:
-        parts = []
-        for role, record in (("A", state.a), ("B", state.b)):
-            if record is None:
-                parts.append("%s —" % role)
-            elif record.derived_export_present:
-                parts.append("%s 已就绪" % role)
-            else:
-                parts.append("%s 需生成" % role)
-        return " / ".join(parts)
-
-    @staticmethod
-    def _diagnosis_text(state: RowState) -> str:
-        if state.reasons:
-            text = "不可生成：" + "；".join(state.reasons)
-            if state.notes:
-                text += "；" + "；".join(state.notes)
-            return text
-        if state.notes:
-            return "可生成（需同意运行 miaomiao 菜单）：" + "；".join(state.notes)
-        return "可生成"
+    def _show_reasons(self, name: str) -> None:
+        preview = self._preview
+        if preview is None:
+            return
+        state = self._union_state(name, preview)
+        self._notifier.show_info("客户端「%s」" % name, state.detail_text)
 
     # ------------------------------------------------------------ selection ---
     def _on_item_changed(self, item: QTableWidgetItem) -> None:
@@ -453,14 +614,39 @@ class ClientsPanel(QWidget):
             self._populating = False
         self._refresh_selection()
 
+    def select_client(self, name: str) -> bool:
+        """Check exactly one ready client; return whether it was selectable."""
+        found = False
+        self._populating = True
+        try:
+            for row in range(self.table.rowCount()):
+                item = self.table.item(row, COL_SELECT)
+                name_item = self.table.item(row, COL_NAME)
+                if item is None or name_item is None:
+                    continue
+                checkable = bool(
+                    item.flags() & Qt.ItemFlag.ItemIsUserCheckable)
+                is_target = name_item.text() == name and checkable
+                item.setCheckState(
+                    Qt.CheckState.Checked if is_target
+                    else Qt.CheckState.Unchecked)
+                found = found or is_target
+        finally:
+            self._populating = False
+        self._refresh_selection()
+        return found
+
     def _refresh_selection(self) -> None:
         selected = self.selected_clients()
         if selected:
-            self.count_label.setText(
-                "已选 %d 个：%s" % (len(selected), "、".join(
-                    "%s→%s" % (item.name, item.group) for item in selected)))
+            self.selection_label.setText("已选 %d 项" % len(selected))
+            self.selection_label.setToolTip(
+                "、".join(item.name for item in selected))
         else:
-            self.count_label.setText("尚未选择客户端")
+            self.selection_label.setText("尚未选择")
+            self.selection_label.setToolTip("")
+        self.generate_yaml_button.setEnabled(
+            not self._busy and bool(selected))
         self.selection_changed.emit()
 
     def selected_clients(self) -> list[SelectedClient]:
@@ -497,3 +683,142 @@ class ClientsPanel(QWidget):
                 if record is None or not record.derived_export_present:
                     return True
         return False
+
+    # ---------------------------------------------------------------- create ---
+    def _ask_create_name(self) -> str | None:
+        dialog = ClientCreateDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return dialog.client_name
+
+    def _on_create_clicked(self) -> None:
+        if self._busy:
+            return
+        try:
+            name = self._ask_create_name()
+        except BaseException:  # noqa: BLE001 - hard GUI boundary
+            self._notifier.show_error(HaUiError(errors.E_INTERNAL))
+            return
+        if not name:
+            return
+        self._start_creation(name, allow_partial_repair=False)
+
+    def _start_creation(self, name: str, *, allow_partial_repair: bool) -> None:
+        self._busy = True
+        self._creation_allow_partial = allow_partial_repair
+        self._pending_repair = None
+        self._pending_select = None
+        self._creation_needs_refresh = False
+        self.creation_result_label.setVisible(False)
+        self.creation_result_label.setText("")
+        self._apply_controls()
+        self.status_label.setText(
+            "正在创建「%s」：检查两端并顺序提交，可能需要几十秒…" % name)
+        self._pending_creation = (name, allow_partial_repair)
+
+        def job() -> ClientCreationResult:
+            return self._service.create_client(
+                name=name,
+                confirmed=True,
+                allow_partial_repair=allow_partial_repair,
+                password_overrides=self._password_provider(),
+            )
+
+        self._runner.run(
+            job,
+            on_success=self._creation_succeeded,
+            on_error=self._creation_failed,
+            on_done=self._creation_done,
+        )
+
+    def _creation_succeeded(self, result: ClientCreationResult) -> None:
+        if result.complete:
+            self.creation_result_label.setVisible(False)
+            self.creation_result_label.setText("")
+            if result.repaired_existing:
+                title = CREATE_REPAIR_TEMPLATE % result.name
+            else:
+                title = CREATE_OK_TEMPLATE % result.name
+            detail = self._creation_detail(result)
+            self._notifier.show_info(title, detail)
+            self.status_label.setText("创建成功；正在刷新两端状态…")
+            self._pending_select = result.name
+        else:
+            message = self._creation_detail(result)
+            self.creation_result_label.setText(
+                "上次创建「%s」未全部完成：\n%s" % (result.name, message))
+            self.creation_result_label.setVisible(True)
+            self._notifier.show_warning("创建未全部完成", message)
+            self.status_label.setText("创建未全部完成；正在刷新实际状态…")
+        self._creation_needs_refresh = True
+
+    def _creation_failed(self, error: HaUiError) -> None:
+        if (error.code == errors.E_CLIENT_PARTIAL_EXISTS
+                and not self._creation_allow_partial):
+            name = getattr(self, "_pending_creation", ("", False))[0]
+            role = error.detail or "一端"
+            try:
+                allowed = self._notifier.confirm_partial_creation(name, role)
+            except BaseException:  # noqa: BLE001 - GUI boundary
+                allowed = False
+            if allowed:
+                self._pending_repair = (name, True)
+                self.status_label.setText(
+                    "已确认仅补齐缺失端；准备重新连接…")
+                return
+        self.creation_result_label.setText(
+            "创建失败：%s\n未修改任何客户端（在预写检查/确认阶段停止）。"
+            % error.safe_text)
+        self.creation_result_label.setVisible(True)
+        self.status_label.setText("创建失败：%s" % error.safe_text)
+        self._notifier.show_error(error)
+        # Pre-write refusals never changed either VPS, so do not open another
+        # pair of sessions just to show the same failure again. Write outcomes
+        # (including partial/uncertain) are returned as a result and do refresh.
+
+    def _creation_done(self) -> None:
+        self._busy = False
+        self._apply_controls()
+        repair = self._pending_repair
+        if repair is not None:
+            self._pending_repair = None
+            self._start_creation(repair[0], allow_partial_repair=True)
+            return
+        if self._creation_needs_refresh:
+            self._creation_needs_refresh = False
+            self._refresh_after_create()
+
+    def _refresh_after_create(self) -> None:
+        pending_name = self._pending_select
+        if pending_name:
+            self._pending_select = None
+
+            def after() -> None:
+                if self.select_client(pending_name):
+                    self.client_created.emit(pending_name)
+
+            self.refresh_clients(on_loaded=after)
+            return
+        self.refresh_clients()
+
+    @staticmethod
+    def _creation_detail(result: ClientCreationResult) -> str:
+        lines = ["客户端：%s" % result.name]
+        for role in ("A", "B"):
+            side = result.side(role)
+            if side is None:
+                continue
+            if side.status == "created":
+                lines.append("%s 端：已创建" % role)
+            elif side.status == "existing":
+                lines.append("%s 端：原已存在（未改动）" % role)
+            elif side.status == "failed":
+                lines.append("%s 端：失败（%s）" % (role, side.code or "E_REMOTE"))
+            elif side.status == "uncertain":
+                lines.append("%s 端：待确认（%s）" % (role, side.code or "E_CREATE_UNCERTAIN"))
+            elif side.status == "skipped":
+                lines.append("%s 端：未执行" % role)
+        if result.partial:
+            lines.append("")
+            lines.append(CREATE_PARTIAL_TEMPLATE)
+        return "\n".join(lines)
