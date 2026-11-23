@@ -68,6 +68,18 @@ def test_urls_are_commit_pinned_and_never_main():
     assert remote.CLIENT_MANAGEMENT_URL in command
 
 
+def test_add_command_uses_the_same_pinned_trust_chain():
+    command = remote._add_client_command("event-vmix01")
+    assert "/main/" not in command
+    assert remote.INSTALLER_URL in command
+    assert remote.CLIENT_MANAGEMENT_URL in command
+    assert remote.INSTALLER_SHA256 in command
+    assert remote.CLIENT_MANAGEMENT_SHA256 in command
+    assert ('SB_CLIENT_MANAGEMENT_REF=' + remote.INSTALLER_REVIEWED_COMMIT
+            in command)
+    assert "2) add_client_interactive" in command
+
+
 @pytest.mark.parametrize("token", ["installer-hash", "lib-hash", "lib-pin"])
 def test_untrusted_installer_or_library_disables_auto_generation(token):
     provider, session = make_provider(clients=stale(), exports=exports(),

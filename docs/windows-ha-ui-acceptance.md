@@ -1,32 +1,34 @@
-# Windows HA-UI — 三层真实验收手册（预验收门禁）
+﻿# Windows HA-UI 0.2.0 — 三层真实验收手册（预验收门禁）
 
-本手册定义 HA-UI MVP 进入真实使用前的 **Windows 本机（A）→ 两台 VPS 只读（B）→
-隔离测试 VPS 生成（C）** 三层验收。任何一层失败都停止，不进入下一层；三层全部通过且
-人工审批完成后，才可讨论生产使用。**本轮代码审查不代表任何一层真实 VPS 验收已完成。**
+本手册定义 HA-UI 0.2.0 进入真实使用前的 **Windows 本机（A）→ 两台 VPS 只读（B）→
+隔离测试 VPS 创建/生成（C）** 三层验收。任何一层失败都停止，不进入下一层；三层全部
+通过且人工审批完成后，才可讨论生产使用。**本轮代码审查不代表任何一层真实 VPS 验收
+已完成。**
 
-## 0. 当前状态（2026-11-21）
+## 0. 当前状态（0.2.0 Draft）
 
 | 项目 | 状态 | 证据 |
 | --- | --- | --- |
-| 自动测试（合成凭据，Windows） | ✅ 已通过 | `pytest ha-ui/tests`：476 passed / 2 host skips；真实 HA 链集成、ACL、失败注入、UI |
-| installer 版本/哈希门禁 | ✅ 已通过 | reviewed commit + installer/lib 独立 SHA-256 + 内嵌 lib pin + host-deps 门禁；11 项 trust-anchor 测试 |
-| Windows EXE 构建 + 冷启动 | ✅ 已通过 | `dist/ha-ui.exe`，EXE self-test OK，`receipt.json` 记录 SHA-256/selftest |
-| Windows GUI 实际操作 | ✅ 自动化通过（A1–A10，真实 EXE + UIA） | 真实 `dist\ha-ui.exe`：窗口/三 tab/安全横幅、密码默认隐藏+显示/隐藏、配置保存不含密码、真实 Windows 凭据管理器保存读回/删除、未确认指纹时测试连接与读取客户端均 E_HOSTKEY 拒绝、生成页/取消/策略控件渲染；证据在本地 `.scratch/gui-acceptance-report.json` 与截图（不入库） |
-| 真实生成/Cancel（HA 链） | ❌ 未执行 | 需要 Layer C 隔离测试 VPS；本机只验证控件/拒绝路径，不能替代真实生成 |
-| 两台 VPS 只读验收（B） | ❌ 未执行 | 未获授权；本 Agent 未连接任何真实 VPS |
-| 隔离测试 VPS 生成（C） | ❌ 未执行 | 未获授权；不得在生产 VPS 上执行 |
+| 自动测试（合成凭据，Windows） | ✅ 已通过 | `pytest ha-ui/tests`：539 passed / 4 host skips（0.2.0 本地） |
+| installer 版本/哈希门禁 | ✅ 已通过 | reviewed commit `9402be91…` + installer/lib 独立 SHA-256 + 内嵌 lib pin + host-deps；创建/生成共用 |
+| Windows EXE 构建 + 冷启动 | ⏳ 待本轮构建 | 目标 `dist/ha-ui.exe` 0.2.0；receipt/selftest/SHA-256 见 PR 证据 |
+| Windows GUI 自动化 | ✅ 合成数据通过（本机 offscreen/Windows Qt） | 新三页、创建对话框、部分成功回执、生成页；截图见 [`docs/evidence/ha-ui-0.2.0`](evidence/ha-ui-0.2.0/README.md) |
+| 真实创建（A/B 两端） | ❌ 未执行 | 需要 Layer C 隔离测试 VPS + 书面授权；不得在生产 VPS 首次试跑 |
+| 真实生成/Cancel（HA 链） | ❌ 未执行 | 需要 Layer C 隔离测试 VPS；本机只验证控件/拒绝路径 |
+| 两台 VPS 只读验收（B） | ❌ 未执行 | 未获授权；未连接任何真实 VPS |
+| 隔离测试 VPS 创建/生成（C） | ❌ 未执行 | 未获授权；不得在生产 VPS 上执行 |
 | 真实 Clash Verge Rev 导入 | ❌ 未执行 | 未授权；需 Layer C 后人工执行 |
 | 已泄露凭据轮换 | ❌ 未完成 | 独立人工操作，工具不代替 |
 
-图例：✅ 自动/已做；⚠️ 部分；❌ 待人工/未授权。
+图例：✅ 自动/已做；⚠️ 部分；⏳ 待本轮；❌ 待人工/未授权。
 
 ## 1. 总则与人工批准
 
-1. **禁止**在任何未经书面授权的 VPS 上运行生成、故障注入、服务重启或配置修改。
-2. Layer B 只允许只读命令；**禁止**调用 `miaomiao` 菜单、禁止生成/删除/轮换客户端、
+1. **禁止**在任何未经书面授权的 VPS 上运行创建、生成、故障注入、服务重启或配置修改。
+2. Layer B 只允许只读命令；**禁止**调用 `miaomiao` 菜单、禁止创建/删除/轮换客户端、
    禁止触碰 `/var/lib/sbox-cm/management.active`、禁止启用 Monitor/E3。
 3. Layer C 必须使用隔离测试 VPS（非生产），授权窗口内执行，提前做快照/备份，并保留
-   第二条独立 SSH/控制台恢复通道。
+   第二条独立 SSH/控制台恢复通道。**创建验收不得在生产 VPS 首次执行。**
 4. 任何证据（截图/日志）不得含 SSH 密码、UUID、HY2 密码、完整 YAML、私钥、分享链接；
    服务器 IP 如需记录只放本地私有笔记，不进入 Issue/PR/聊天/CI。
 5. 通过/失败以本手册的“通过条件”为准，不以“看起来正常”代替。
@@ -61,7 +63,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File ha-ui\ci\run-windows-ci.ps1 
 
 | # | 操作 | 通过条件 |
 | --- | --- | --- |
-| A1 | 启动 EXE，切换三个 tab | 无崩溃；显示安全横幅；客户端/生成页可进入 |
+| A1 | 启动 EXE，切换三个页 | 无崩溃；默认进入「客户端」页；页签为「服务器 / 客户端 / 生成 YAML」；无旧安全横幅/底部调试状态 |
 | A2 | 服务器 A/B 填写名称/IP/端口/用户名；密码框输入 | 密码默认显示为圆点；“显示/隐藏”只切换可见性，不写日志/不弹明文 |
 | A3 | 不勾“记住密码”保存配置 | `%LOCALAPPDATA%\HASingbox\servers.json` 成功写入且**不含密码**；状态提示“未连接” |
 | A4 | 勾“记住密码”后保存；显示后端名 | 成功时明确提示保存到 Windows 凭据管理器；随后可在凭据管理器看到 `ha-ui-ssh` 条目 |
@@ -71,6 +73,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File ha-ui\ci\run-windows-ci.ps1 
 | A8 | 指纹核对对话框 | 显示算法 + `SHA256:...`；未勾“我已核对”无法确认；指纹变化时有明确警告 |
 | A9 | 客户端页/生成页按钮（无可用连接时） | 给出明确未配置/缺指纹/缺密码错误；不崩溃、不伪造数据 |
 | A10 | 生成取消/关闭窗口 | 取消按钮最终显示 `E_CANCELLED`；关闭窗口后无残留进程/无未处理异常 |
+| A11 | 新建客户端对话框（不连接 VPS） | 名称非法/`legacy` 无法提交；未勾写入确认无法提交；文案明确说明修改两台 VPS + reload + 部分成功不自动删除 |
+| A12 | 客户端表格正常/异常态（合成数据或隔离 VPS） | 6 列左右；正常时无“警告：无”/长 UTC/重复诊断；异常行有「查看原因」；证书正常显示简短状态 |
 
 记录：时间、EXE SHA-256、Windows 版本、逐项结果、截图（脱敏）。失败即停，不用
 “重启试一次”掩盖。
@@ -224,14 +228,20 @@ Layer B 失败并停止**。
   交付或 Clash Verge Rev 导入可用。后者必须在 Layer C 隔离测试 VPS 完成。
 
 
-## 4. Layer C — 隔离测试 VPS 生成验收（授权窗口，非生产）
+## 4. Layer C — 隔离测试 VPS 创建/生成验收（授权窗口，非生产）
 
-前置：隔离测试 VPS A/B（或与生产同版本快照实例）、`main` 安装、测试客户端已在 A/B
-两端同名创建且 Reality/HY2 齐全、测试机无生产业务；准备快照/回滚、第二条独立恢复
-通道、书面授权。
+前置：隔离测试 VPS A/B（或与生产同版本快照实例）、`main` 安装、测试机无生产业务；
+准备快照/回滚、第二条独立恢复通道、书面授权。创建验收会真实写入两台 VPS 的
+sing-box 客户端配置并可能 reload，必须单独批准。
 
 | # | 操作 | 通过条件 |
 | --- | --- | --- |
+| C0 | 在一个全新名称上点「新建客户端」并确认 | 预检两端在线/名称不存在；A 后 B 顺序创建；两端各自生成不同 UUID/HY2 密码；创建后 live 读取两端名称与协议完整；UI 显示成功、自动刷新并入选；无凭据进入 UI/日志 |
+| C0a | 注入“A 成功、B 失败”（隔离 VPS/受控网络） | UI 准确显示 A 已创建、B 失败；A 保留不自动删除；不显示“已全部完成”；可刷新看到实际状态 |
+| C0b | 名称仅 A 端已存在，首次确认后拒绝补齐 | 不写 B、不改 A；显示 `E_CLIENT_PARTIAL_EXISTS` |
+| C0c | 再次确认“仅补齐缺失端” | 只写 B；A 的 UUID/HY2 不变；完成后显示“A 原有、B 新建” |
+| C0d | 对同一名称重复点击/并发创建 | 最终只存在一份；已存在端不被覆盖；无静默凭据轮换 |
+| C0e | 模拟锁失败/一致性失败/reload 回滚 | 该端不出现成功回执；回滚后 live 清单与创建前一致；UI 显示固定 `E_*` |
 | C1 | GUI 连接 A/B，读取客户端 | 列表与两端只读查询一致；单端/不完整客户端被禁止选择 |
 | C2 | 选择 1 个客户端 + A-first，勾选菜单生成同意 | 生成完成；显示 `<client>-A-first.yaml` 与 SHA-256 |
 | C3 | 同客户端生成 B-first | 4 节点顺序/角色正确；`自动选择` 组为 5s/5000ms（本轮默认；5s/2000ms 需手动选择）；`skip-cert-verify:false` + 正确 A/B pin；HA-03 `<name>-hac.yaml` 保留 60s/5000ms 对照 |
@@ -242,7 +252,8 @@ Layer B 失败并停止**。
 | C8 | Clash Verge Rev 手动导入 | **人工**导入 A-first 与 B-first，确认 4 节点、fallback、探测策略；不自动导入/不开 TUN/不改系统代理；导入后按 [windows-verification](mihomo-competition-ha-windows-verification.md) 验证 |
 | C9 | 回滚 | 删除测试客户端/恢复快照；确认测试 VPS sing-box 与配置恢复；本地删除 run 目录与凭据；复核无残留 |
 
-通过条件：C1–C9 全通过 + 自动化测试全绿 + Layer A/B 通过。任何一项失败不得进入生产。
+通过条件：C0–C9 全通过 + 自动化测试全绿 + Layer A/B 通过。任何一项失败不得进入生产。
+创建相关行（C0–C0e）未完成时，**不得**声称 0.2.0 的 GUI 创建功能已通过真实环境验收。
 
 ## 5. 失败回滚
 
@@ -276,7 +287,8 @@ date/time (UTC+03):
 operator:
 exe_sha256 / commit:
 windows version:
-steps: <A1..A10 / B1..B5 / C1..C9 逐项 pass/fail>
+steps: <A1..A12 / B1..B5 / C0..C9 逐项 pass/fail>
+create receipt (C): per-side created/existing/failed/uncertain + fixed code; no credentials
 server fact baseline (B): config_sha256_changed=no/yes, state_sha256_changed=no/yes, nrestarts=...
 pin summary (B/C): A/B distinct=yes/no, earliest not_after=...
 failures: <code + 安全描述>

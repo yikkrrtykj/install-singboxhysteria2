@@ -427,7 +427,12 @@ class FakeSession:
                  menu_success: str = "all",
                  menu_fail: str | None = None,
                  menu_corrupt: str | None = None,
-                 menu_extra: str = "") -> None:
+                 menu_extra: str = "",
+                 add_side_effect: bool = True,
+                 add_fail: str | None = None,
+                 add_success_marker: bool = True,
+                 add_timeout: bool = False,
+                 add_raise_timeout: bool = False) -> None:
         self.role = role
         self.facts = facts or VpsFacts()
         self.clients = list(clients)
@@ -448,9 +453,17 @@ class FakeSession:
         self.menu_fail = menu_fail
         self.menu_corrupt = menu_corrupt
         self.menu_extra = menu_extra
+        self.add_side_effect = add_side_effect
+        self.add_fail = add_fail
+        self.add_success_marker = add_success_marker
+        self.add_timeout = add_timeout
+        self.add_raise_timeout = add_raise_timeout
         self.commands: list[str] = []
         self.downloads: list[str] = []
         self.menu_invoked = False
+        self.create_invoked = False
+        self.created_credentials: dict[str, tuple[str, str]] = {}
+        self._created_counter = 0
         self.identity_calls = 0
         self.derived: dict[str, DerivedState] = {}
         self._mtime_epoch: dict[str, int] = {}
@@ -470,6 +483,9 @@ class FakeSession:
         del stdin_data, timeout, max_output
         self.commands.append(command)
         if "HAUI_MENU_END" in command or "ha-ui-installer" in command:
+            if re.search(r"(?:^|\n)2\n([A-Za-z0-9][A-Za-z0-9._-]*)\n0\n",
+                         command):
+                return self._add_menu(command)
             return self._menu(command)
         if "HAUI_STAT_END" in command:
             return self._identity(command)
@@ -661,6 +677,59 @@ class FakeSession:
             output += "\nHAUI_MENU_END"
         return 0, output + "\n", ""
 
+    def _add_menu(self, command: str) -> tuple[int, str, str]:
+        """Scripted menu 10→2 canonical add path for one client."""
+        self.create_invoked = True
+        if self.menu_fail is not None:
+            return 0, "HAUI_MENU_FAIL=%s\n" % self.menu_fail, ""
+        match = re.search(r"(?:^|\n)2\n([A-Za-z0-9][A-Za-z0-9._-]*)\n0\n",
+                          command)
+        assert match is not None
+        name = match.group(1)
+        if self.add_raise_timeout:
+            raise HaUiError(errors.E_SSH_TIMEOUT, detail="channel")
+        if self.add_timeout:
+            return 0, ("***** 客户端管理 *****\n"
+                       "正在等待配置锁…\n"
+                       "HAUI_MENU_RC=0,124,0\nHAUI_MENU_END\n"), ""
+        existing = any(spec.name == name for spec in self.clients)
+        if existing or self.add_fail is not None:
+            if existing:
+                warning = "客户端 '%s' 已存在（Reality 或 HY2），拒绝重复添加" % name
+            elif self.add_fail == "exists":
+                warning = "客户端 '%s' 已存在（Reality 或 HY2），拒绝重复添加" % name
+            elif self.add_fail == "lock":
+                warning = "配置锁 /root/sbox/config.lock 获取失败或超时（15s），操作已中止（fail-closed）"
+            elif self.add_fail == "consistency":
+                warning = "当前 Reality/HY2 用户集合不一致，先修复后再添加客户端"
+            elif self.add_fail == "rollback":
+                warning = "reload 后健康检查失败，自动回滚...\n已回滚并重新加载上一份配置"
+            else:
+                warning = "生成 add candidate 失败"
+            output = ("***** 客户端管理 *****\n" + warning
+                      + "\nHAUI_MENU_RC=0,0,0\nHAUI_MENU_END\n")
+            return 0, output, ""
+        # Canonical add success: independent credential per physical side.
+        self._created_counter += 1
+        uuid = uuid_for(self.role, 100 + self._created_counter)
+        password = password_for(self.role, 100 + self._created_counter)
+        self.created_credentials[name] = (uuid, password)
+        if self.add_side_effect:
+            self.clients.append(ClientSpec(name))
+            self.facts.config_mtime += 1
+        lines = [
+            "***** 客户端管理 *****",
+            "2. 添加客户端",
+            "正在添加客户端…",
+            "配置已提交并重载成功: add client %s" % name,
+        ]
+        if self.add_success_marker:
+            lines.append("客户端 '%s' 已同时添加到 Reality 与 HY2"
+                         "（UUID/password 已生成）" % name)
+        lines.append("HAUI_MENU_RC=0,0,0")
+        lines.append("HAUI_MENU_END")
+        return 0, "\n".join(lines) + "\n", ""
+
 
 # --------------------------------------------------------------------------- #
 # Provider fake for GenerationService.
@@ -699,6 +768,8 @@ class FakeProvider:
     export_requests: list[list[str]] = field(default_factory=list)
     generate_requests: list[tuple[tuple[str, ...], bool]] = field(
         default_factory=list)
+    create_requests: list[tuple[str, bool]] = field(default_factory=list)
+    create_effect: bool = True
 
     def _enter(self, method: str) -> None:
         self.calls.append(method)
@@ -744,6 +815,15 @@ class FakeProvider:
             self.exports[name] = payload
             result[name] = payload
         return result
+
+    def create_client(self, name: str, *, confirmed: bool) -> None:
+        self.create_requests.append((name, confirmed))
+        self._enter("create_client")
+        if not confirmed:
+            raise HaUiError(errors.E_CLIENT_EXISTS, detail="consent")
+        if self.create_effect:
+            self.records[name] = client_record(name)
+        return None
 
 
 class FakeProviderFactory:

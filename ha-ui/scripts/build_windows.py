@@ -32,6 +32,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 BUILD_PYTHON = (3, 13)
+APP_VERSION = "0.2.0"
 PYINSTALLER_VERSION = "6.22.3"
 PINNED_DEPENDENCIES = {
     "PySide6": "6.12.0",
@@ -246,7 +247,7 @@ def build(output_root: Path, *, run_self_test: bool = True) -> dict[str, object]
                              % json.dumps(selftest, ensure_ascii=False))
         receipt = {
             "schema": "ha-ui/windows-exe-receipt/1",
-            "app_version": "0.1.0",
+            "app_version": APP_VERSION,
             "built_at": datetime.now(timezone.utc).strftime(
                 "%Y-%m-%dT%H:%M:%SZ"),
             "build_host": "windows",
