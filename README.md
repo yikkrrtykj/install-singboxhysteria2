@@ -16,6 +16,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/yikkrrtykj/install-singboxhy
 
 Hysteria2 新安装默认使用 BBR 拥塞控制：服务端启用 `ignore_client_bandwidth: true`，服务端和生成的 sing-box / Mihomo 客户端不再设置固定上下行带宽。BBR 不保证零丢包，也不是公网带宽限速或流量配额控制；需要硬限速或额度时应使用独立机制，不能把 HY2 带宽声明当作硬限速。GitHub 脚本更新不会自动修改旧服务器配置；兼容性、测试范围与手动备份/迁移/回滚步骤见 [HY2 BBR 说明](docs/hysteria2-bbr.md)。需要重新启用本机 BBR 与 Hysteria2 UDP 缓冲优化时，进入 `miaomiao` → `5. 启用本地 BBR + 优化 Hysteria2 UDP 缓冲`。
 
+**全新安装**还会默认尝试启用 Linux 内核 TCP BBR（`net.ipv4.tcp_congestion_control=bbr`）与 `fq` 默认队列算法，并把 UDP 收发缓冲保持在至少 16 MiB（不下调更大的已有值），持久化到 `/etc/sysctl.d/99-sing-box-network.conf`。这只对真正全新的安装生效：旧 VPS 的更新、脚本重跑和菜单操作都不会自动迁移 TCP/qdisc；内核不支持 BBR、权限受限或应用失败时会恢复安装前的 sysctl 与持久化文件并继续安装，不会因此中断。安装前参数记录在 `/root/sbox/network-tuning.before-install.<时间戳>/`，手动恢复与边界见 [HY2 BBR 说明](docs/hysteria2-bbr.md#全新安装的内核-tcp-bbr--fq-与-udp-缓冲默认)。容器/自动化环境可用 `SB_SKIP_NETWORK_TUNING=1` 显式退出该默认优化。
+
 服务端生成的客户端文件：
 
 ```text
@@ -263,6 +265,10 @@ network:
 systemctl status sing-box --no-pager
 journalctl -u sing-box -n 100 --no-pager
 jq '.inbounds[] | {tag, listen_port}' /root/sbox/sbconfig_server.json
+# 全新安装的内核网络默认（只读核对；持久化文件内容见 HY2 BBR 说明）
+sysctl -n net.ipv4.tcp_congestion_control net.core.default_qdisc \
+    net.core.rmem_max net.core.wmem_max
+cat /etc/sysctl.d/99-sing-box-network.conf
 ```
 
 作用：检查服务端配置、查看 systemd 状态、最近 100 行日志和 Reality/HY2 监听端口。配置检查通过后再执行 `systemctl restart sing-box`。`miaomiao` → `4. sing-box基础操作` 也提供“检查现有配置，成功后重启”、服务状态、实时日志和完整配置查看（完整配置包含 UUID、密码和私钥，不要公开）。`service.api` 只监听 `127.0.0.1:9091`，不向公网开放。
@@ -283,7 +289,7 @@ bash tests/canary-api-auth.sh --with-collector
 
 `miaomiao` → `4. sing-box基础操作` → `2. 升级 sing-box 内核（Phase D: 1.14.x + 本机 service.api）`。升级在配置锁内依次执行身份/API/配置审计、candidate `sing-box check`、binary + config 成对 `0600` 备份、原子替换、重启、Reality/HY2/localhost `service.api` 健康检查；替换后的任一步失败会自动双回滚（binary + config）并再次验证，替换前的候选检查失败不会修改正式环境。升级输出会打印两份备份路径（形如 `/root/sbox/sing-box.bak.<时间戳>.*` 与 `/root/sbox/sbconfig_server.json.bak.<时间戳>.*`），请保留到确认稳定之后。
 
-需要人工回滚时必须同时恢复 binary 与 config、重启并验证；只替换 config 会造成 binary/config 混搭。旧服务器若仍有无名的共享账号，先 `10. 客户端管理` → `5. 迁移旧客户端为 legacy` 再升级。BBR 相关的备份、迁移与手动回滚步骤见 [HY2 BBR 说明](docs/hysteria2-bbr.md)。
+需要人工回滚时必须同时恢复 binary 与 config、重启并验证；只替换 config 会造成 binary/config 混搭。旧服务器若仍有无名的共享账号，先 `10. 客户端管理` → `5. 迁移旧客户端为 legacy` 再升级。BBR 相关的备份、迁移与手动回滚步骤见 [HY2 BBR 说明](docs/hysteria2-bbr.md)；全新安装的内核 TCP/qdisc 默认的手动恢复步骤见该文“手动恢复内核 TCP/qdisc 配置”一节。
 
 ### 7.4 Monitor 与 Linux 网关回滚
 
