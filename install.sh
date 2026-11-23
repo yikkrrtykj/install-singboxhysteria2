@@ -2799,6 +2799,10 @@ network_finish_failed_apply() {
     return 0
 }
 
+# Write the merged persistence file and then apply ONLY this round's target keys
+# to the live kernel, one `sysctl -w` per key. A whole-file `sysctl -p` would
+# also re-apply unrelated/custom lines and could change runtime parameters that
+# are outside the BBR/UDP optimization scope, so it is intentionally not used.
 write_network_sysctl() { # <request_bbr TRUE|FALSE> [qdisc_mode fq|keep]
     local request_bbr="${1:-FALSE}"
     local qdisc_mode="${2:-keep}"
@@ -2811,7 +2815,15 @@ write_network_sysctl() { # <request_bbr TRUE|FALSE> [qdisc_mode fq|keep]
         "$NET_TARGET_RMEM" "$NET_TARGET_WMEM" "$candidate" ||
         { rm -f -- "$candidate"; return 1; }
     network_install_candidate "$candidate" || { rm -f -- "$candidate"; return 1; }
-    "$SYSCTL_BIN" -p "$NETWORK_SYSCTL_FILE" >/dev/null 2>&1 || return 1
+
+    "$SYSCTL_BIN" -w "net.core.rmem_max=$NET_TARGET_RMEM" >/dev/null 2>&1 || return 1
+    "$SYSCTL_BIN" -w "net.core.wmem_max=$NET_TARGET_WMEM" >/dev/null 2>&1 || return 1
+    if [ "$request_bbr" = "TRUE" ]; then
+        "$SYSCTL_BIN" -w "net.ipv4.tcp_congestion_control=bbr" >/dev/null 2>&1 || return 1
+        if [ "$qdisc_mode" = "fq" ]; then
+            "$SYSCTL_BIN" -w "net.core.default_qdisc=fq" >/dev/null 2>&1 || return 1
+        fi
+    fi
 
     [ "$(network_sysctl_read net.core.rmem_max || true)" = "$NET_TARGET_RMEM" ] || return 1
     [ "$(network_sysctl_read net.core.wmem_max || true)" = "$NET_TARGET_WMEM" ] || return 1
@@ -2830,7 +2842,7 @@ write_network_sysctl() { # <request_bbr TRUE|FALSE> [qdisc_mode fq|keep]
 # persistence lines and every unrelated key) and apply ONLY the two UDP keys to
 # the live kernel. A `sysctl -p` would also re-apply the preserved TCP/qdisc/
 # custom lines and could change the live policy, so it is intentionally not
-# used here.
+# used here either.
 write_network_udp_only() {
     local candidate
     network_compute_target_buffers || return 1
