@@ -565,7 +565,7 @@ assert_eq fq "$(mock_get net.core.default_qdisc)" "replay restores fq after simu
 assert_eq 16777216 "$(mock_get net.core.rmem_max)" "replay restores the UDP floor after simulated reboot"
 
 # ---------------------------------------------------------------------------
-section "LIVE gate: real kernel in an isolated network namespace"
+section "LIVE gate: real kernel on an explicitly disposable host"
 # ---------------------------------------------------------------------------
 if [ "${SB_NET_REQUIRE_LIVE:-0}" != "1" ]; then
     skip "live kernel gate not requested (set SB_NET_REQUIRE_LIVE=1 inside unshare -n)"
@@ -609,15 +609,18 @@ else
     live_orig_qdisc="$(network_sysctl_read net.core.default_qdisc || true)"
     live_orig_rmem="$(network_sysctl_read net.core.rmem_max || true)"
     live_orig_wmem="$(network_sysctl_read net.core.wmem_max || true)"
-    live_available="$(network_sysctl_read net.ipv4.tcp_available_congestion_control || true)"
     if [ -z "$live_orig_cc" ] || [ -z "$live_orig_qdisc" ]; then
         fail "live gate could not read the real sysctl state (cc='$live_orig_cc' qdisc='$live_orig_qdisc' rmem='$live_orig_rmem' wmem='$live_orig_wmem')"
     else
         LIVE_RESTORE_NEEDED=1
         maybe_apply_fresh_install_network_defaults > "$TMP/live-apply.out" 2>&1
         assert_rc 0 $? "live apply returns success"
-        if printf '%s\n' "$live_available" | grep -qw bbr; then
-            pass "live kernel advertises TCP BBR"
+        # The apply itself loads tcp_bbr, so the capability list must be
+        # re-read AFTER the apply; the pre-apply list does not include a
+        # not-yet-loaded module.
+        live_available_after="$(network_sysctl_read net.ipv4.tcp_available_congestion_control || true)"
+        if printf '%s\n' "$live_available_after" | grep -qw bbr; then
+            pass "live kernel advertises TCP BBR after the module load"
             assert_eq bbr "$(network_sysctl_read net.ipv4.tcp_congestion_control)" "live runtime cc is bbr"
             if network_qdisc_replaceable "$live_orig_qdisc"; then
                 assert_eq fq "$(network_sysctl_read net.core.default_qdisc)" "live runtime default qdisc is fq"
@@ -656,7 +659,7 @@ else
             [ "${live_expected_rmem:-0}" -lt 16777216 ] && live_expected_rmem=16777216
             assert_eq "$live_expected_rmem" "$(network_sysctl_read net.core.rmem_max)" "live replay restores the expected UDP floor"
         else
-            pass "live kernel does not advertise BBR (unsupported-kernel live path)"
+            pass "live kernel does not advertise BBR even after the module load (unsupported-kernel live path)"
             assert_eq "$live_orig_cc" "$(network_sysctl_read net.ipv4.tcp_congestion_control)" "live unsupported path leaves cc unchanged"
             assert_eq "$live_orig_qdisc" "$(network_sysctl_read net.core.default_qdisc)" "live unsupported path leaves qdisc unchanged"
             live_rmem="$(network_sysctl_read net.core.rmem_max)"
