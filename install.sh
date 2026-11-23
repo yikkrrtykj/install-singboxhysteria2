@@ -2485,11 +2485,73 @@ _upgrade_singbox_1_14_locked() {
 }
 # <<< phase-d singbox-1.14-api <<< ============================================
 
-NETWORK_SYSCTL_FILE="/etc/sysctl.d/99-sing-box-network.conf"
+# >>> network-tuning >>> ======================================================
+# Fresh-install Linux TCP/qdisc default + UDP buffer floor.
+#
+# Truth model:
+#   * $NETWORK_SYSCTL_FILE is the ONLY networking persistence file this
+#     installer manages. It carries both the UDP buffer floor and the optional
+#     TCP lines, so a rollback restores it as a WHOLE (exact original bytes).
+#   * Runtime values are captured before ANY mutation. The captured values and
+#     a copy of the previous file are recorded under
+#     $NETWORK_TUNING_RECORD_ROOT/network-tuning.before-install.<ts>/ so the
+#     documented manual-restore path never has to guess.
+#   * BBR/fq is an OPTIONAL optimization: nothing below may abort a fresh
+#     install. A failed apply restores the original state, reports accurately
+#     and lets the installer continue.
+#   * The default applies to a GENUINELY fresh install only. Existing installs,
+#     updates, reruns and menu actions never migrate TCP/qdisc; menu item 5 is
+#     the explicit manual entry point.
+NETWORK_SYSCTL_FILE="${NETWORK_SYSCTL_FILE:-/etc/sysctl.d/99-sing-box-network.conf}"
+NETWORK_TUNING_RECORD_ROOT="${NETWORK_TUNING_RECORD_ROOT:-/root/sbox}"
+SYSCTL_BIN="${SYSCTL_BIN:-sysctl}"
+MODPROBE_BIN="${MODPROBE_BIN:-modprobe}"
 UDP_BUFFER_MIN_BYTES=16777216
+# Startup gate (see the has_any_installation_marker branch at the bottom of
+# this file): TRUE only when this process takes the automatic fresh-install
+# path. The default keeps a directly sourced/tested fresh path behaving like a
+# fresh install.
+FRESH_INSTALL="${FRESH_INSTALL:-TRUE}"
+# Escape hatch for containers/automation that must not touch kernel settings.
+# Accepted values: 1/true/TRUE/yes/YES (documented value is 1).
+SB_SKIP_NETWORK_TUNING="${SB_SKIP_NETWORK_TUNING:-FALSE}"
+# Menu item 1 (reinstall) uninstalls and then falls through to the fresh-install
+# code below. It is NOT a fresh install, but the previous installer still
+# guaranteed the Hysteria2 UDP buffer floor on that path, so only the UDP floor
+# (never TCP/qdisc) may be applied.
+REINSTALL_FALLTHROUGH="${REINSTALL_FALLTHROUGH:-FALSE}"
+# Captured original state (populated by network_capture_state).
+NET_ORIG_CC=""
+NET_ORIG_QDISC=""
+NET_ORIG_RMEM=""
+NET_ORIG_WMEM=""
+NET_ORIG_FILE_PRESENT="FALSE"
+NET_TUNING_RECORD_DIR=""
+NET_TUNING_CAPTURED_AT=""
+# Outcome reported by show_network_tuning_summary().
+NET_TUNING_RESULT=""
+
+# Print one live sysctl value; rc!=0 when the key cannot be read. Unlike
+# read_sysctl_number this exposes failure so callers can fail closed instead of
+# treating "unreadable" as "zero".
+network_sysctl_read() { # <key> -> value on stdout
+    local value
+    value="$("$SYSCTL_BIN" -n "$1" 2>/dev/null)" || return 1
+    value="${value//$'\r'/}"
+    value="${value//$'\n'/}"
+    [ -n "$value" ] || return 1
+    printf '%s\n' "$value"
+}
+
+network_tuning_opt_out() {
+    case "${SB_SKIP_NETWORK_TUNING:-FALSE}" in
+        1|true|TRUE|yes|YES) return 0 ;;
+        *) return 1 ;;
+    esac
+}
 
 read_sysctl_number() {
-    sysctl -n "$1" 2>/dev/null | tr -cd '0-9'
+    network_sysctl_read "$1" 2>/dev/null | tr -cd '0-9'
 }
 
 larger_number() {
@@ -2502,66 +2564,536 @@ larger_number() {
     fi
 }
 
-write_network_sysctl() {
-    local request_bbr="${1:-FALSE}"
-    local current_rmem current_wmem target_rmem target_wmem current_cc temp_file
+network_key_regex() { # <dotted-key> -> regex matching dotted or slash form
+    printf '%s\n' "$1" | sed 's|\.|[./]|g'
+}
 
-    current_rmem=$(read_sysctl_number net.core.rmem_max)
-    current_wmem=$(read_sysctl_number net.core.wmem_max)
-    target_rmem=$(larger_number "${current_rmem:-0}" "$UDP_BUFFER_MIN_BYTES")
-    target_wmem=$(larger_number "${current_wmem:-0}" "$UDP_BUFFER_MIN_BYTES")
-    current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)
-    if [ "$current_cc" = "bbr" ]; then
-        request_bbr="TRUE"
+read_managed_sysctl_number() { # <key> [file] -> persisted number or rc!=0
+    local key="$1" file="${2:-$NETWORK_SYSCTL_FILE}" key_re value
+    [ -f "$file" ] || return 1
+    key_re="$(network_key_regex "$key")"
+    value="$(grep -E "^[[:space:]]*-?${key_re}[[:space:]]*=" "$file" 2>/dev/null |
+        tail -n 1 | cut -d'=' -f2- | tr -cd '0-9')"
+    [ -n "$value" ] || return 1
+    printf '%s\n' "$value"
+}
+
+read_managed_sysctl_value() { # <key> [file] -> persisted value or rc!=0
+    local key="$1" file="${2:-$NETWORK_SYSCTL_FILE}" key_re value
+    [ -f "$file" ] || return 1
+    key_re="$(network_key_regex "$key")"
+    value="$(grep -E "^[[:space:]]*-?${key_re}[[:space:]]*=" "$file" 2>/dev/null |
+        tail -n 1 | cut -d'=' -f2- | tr -d '[:space:]')"
+    [ -n "$value" ] || return 1
+    printf '%s\n' "$value"
+}
+
+network_persisted_qdisc() { # -> last persisted default_qdisc value
+    read_managed_sysctl_value net.core.default_qdisc
+}
+
+# A file this installer may safely merge. Anything that cannot be classified as
+# a blank line, a '#'/';' comment or a "key = value" assignment means a
+# lossless rewrite cannot be proven, so the optional optimization is skipped
+# instead of guessing.
+network_managed_file_safe() {
+    local file="$NETWORK_SYSCTL_FILE" line trimmed
+    if [ -L "$file" ]; then
+        return 1
+    fi
+    if [ -e "$file" ] && [ ! -f "$file" ]; then
+        return 1
+    fi
+    [ -f "$file" ] || return 0
+    [ -r "$file" ] || return 1
+    while IFS= read -r line || [ -n "$line" ]; do
+        trimmed="${line#"${line%%[![:space:]]*}"}"
+        trimmed="${trimmed%$'\r'}"
+        case "$trimmed" in
+            ""|\#*|\;*) continue ;;
+        esac
+        if ! [[ "$trimmed" =~ ^-?[A-Za-z0-9_./-]+[[:space:]]*= ]]; then
+            return 1
+        fi
+    done < "$file"
+    return 0
+}
+
+# Render a merged managed file. Every line this installer does not manage is
+# preserved exactly (order, comments, duplicate keys, unknown sysctls); only the
+# managed keys that are being changed are replaced, and missing managed keys are
+# appended. `keep` = preserve the existing cc/qdisc lines byte-for-byte, which is
+# what UDP-only and custom-qdisc paths require.
+network_render_merged_sysctl() { # <request_bbr TRUE|FALSE> <qdisc_mode fq|keep> <rmem> <wmem> <out>
+    local request_bbr="${1:-FALSE}" qdisc_mode="${2:-keep}"
+    local target_rmem="$3" target_wmem="$4" out="$5"
+    if [ -f "$NETWORK_SYSCTL_FILE" ]; then
+        awk -v want_bbr="$request_bbr" -v qdisc_mode="$qdisc_mode" \
+            -v rmem="$target_rmem" -v wmem="$target_wmem" '
+            function norm_key(k) { gsub("/", ".", k); return k }
+            {
+                raw = $0
+                probe = raw
+                sub(/^[[:space:]]+/, "", probe)
+                sub(/\r$/, "", probe)
+                if (probe == "" || substr(probe, 1, 1) == "#" ||
+                    substr(probe, 1, 1) == ";") { print raw; next }
+                eq = index(probe, "=")
+                key = substr(probe, 1, eq - 1)
+                sub(/[[:space:]]+$/, "", key)
+                prefix = ""
+                if (substr(key, 1, 1) == "-") { prefix = "-"; key = substr(key, 2) }
+                key = norm_key(key)
+                if (key == "net.core.rmem_max") {
+                    print prefix "net.core.rmem_max = " rmem; saw_rmem = 1; next
+                }
+                if (key == "net.core.wmem_max") {
+                    print prefix "net.core.wmem_max = " wmem; saw_wmem = 1; next
+                }
+                if (key == "net.core.default_qdisc") {
+                    if (qdisc_mode == "fq") { print prefix "net.core.default_qdisc = fq" }
+                    else { print raw }
+                    saw_qdisc = 1; next
+                }
+                if (key == "net.ipv4.tcp_congestion_control") {
+                    if (want_bbr == "TRUE") { print prefix "net.ipv4.tcp_congestion_control = bbr" }
+                    else { print raw }
+                    saw_cc = 1; next
+                }
+                print raw
+            }
+            END {
+                if (!saw_rmem) print "net.core.rmem_max = " rmem
+                if (!saw_wmem) print "net.core.wmem_max = " wmem
+                if (want_bbr == "TRUE" && qdisc_mode == "fq" && !saw_qdisc)
+                    print "net.core.default_qdisc = fq"
+                if (want_bbr == "TRUE" && !saw_cc)
+                    print "net.ipv4.tcp_congestion_control = bbr"
+            }
+        ' "$NETWORK_SYSCTL_FILE" > "$out" || return 1
+    else
+        {
+            echo "# Managed by install-singboxhysteria2"
+            echo "# Keep UDP socket buffer limits at least 16 MiB for Hysteria2/QUIC."
+            echo "net.core.rmem_max = $target_rmem"
+            echo "net.core.wmem_max = $target_wmem"
+            if [ "$request_bbr" = "TRUE" ]; then
+                echo "# TCP tuning for Reality and proxied TCP traffic."
+                if [ "$qdisc_mode" = "fq" ]; then
+                    echo "net.core.default_qdisc = fq"
+                fi
+                echo "net.ipv4.tcp_congestion_control = bbr"
+            fi
+        } > "$out" || return 1
+    fi
+    return 0
+}
+
+network_compute_target_buffers() { # -> NET_TARGET_RMEM / NET_TARGET_WMEM
+    local current_rmem current_wmem persisted_rmem persisted_wmem
+    current_rmem="$(network_sysctl_read net.core.rmem_max)" || return 1
+    current_wmem="$(network_sysctl_read net.core.wmem_max)" || return 1
+    persisted_rmem="$(read_managed_sysctl_number net.core.rmem_max || true)"
+    persisted_wmem="$(read_managed_sysctl_number net.core.wmem_max || true)"
+    NET_TARGET_RMEM="$(larger_number "$(larger_number "${current_rmem:-0}" "${persisted_rmem:-0}")" "$UDP_BUFFER_MIN_BYTES")"
+    NET_TARGET_WMEM="$(larger_number "$(larger_number "${current_wmem:-0}" "${persisted_wmem:-0}")" "$UDP_BUFFER_MIN_BYTES")"
+    return 0
+}
+
+network_install_candidate() { # <candidate> -> atomically replace the managed file
+    local candidate="$1"
+    mkdir -p -- "$(dirname -- "$NETWORK_SYSCTL_FILE")" || return 1
+    chmod 0644 "$candidate" || return 1
+    mv -f -- "$candidate" "$NETWORK_SYSCTL_FILE" || return 1
+    return 0
+}
+
+network_qdisc_replaceable() { # <qdisc> -> rc 0 when fq may replace it
+    case "${1:-}" in
+        ""|fq|fq_codel|pfifo_fast|pfifo|noqueue|none) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+network_bbr_available() {
+    local available live_cc
+    if command -v "$MODPROBE_BIN" >/dev/null 2>&1; then
+        "$MODPROBE_BIN" tcp_bbr >/dev/null 2>&1 || true
+    fi
+    available="$(network_sysctl_read net.ipv4.tcp_available_congestion_control || true)"
+    if [ -z "$available" ]; then
+        # The capability list is unreadable: BBR can only be the LIVE algorithm
+        # when it is available, so use that as a conservative fallback instead
+        # of misclassifying an existing BBR host as "unsupported" (which would
+        # drop its persisted BBR line).
+        live_cc="$(network_sysctl_read net.ipv4.tcp_congestion_control || true)"
+        [ "$live_cc" = "bbr" ] && return 0
+        return 1
+    fi
+    printf '%s\n' "$available" | grep -qw bbr
+}
+
+network_capture_state() {
+    NET_ORIG_CC="$(network_sysctl_read net.ipv4.tcp_congestion_control)" || return 1
+    NET_ORIG_QDISC="$(network_sysctl_read net.core.default_qdisc)" || return 1
+    NET_ORIG_RMEM="$(network_sysctl_read net.core.rmem_max)" || return 1
+    NET_ORIG_WMEM="$(network_sysctl_read net.core.wmem_max)" || return 1
+    if [ -e "$NETWORK_SYSCTL_FILE" ] || [ -L "$NETWORK_SYSCTL_FILE" ]; then
+        NET_ORIG_FILE_PRESENT="TRUE"
+    else
+        NET_ORIG_FILE_PRESENT="FALSE"
+    fi
+    return 0
+}
+
+network_write_record_state() { # <result> -> rewrite the non-secret state file
+    local result="$1"
+    [ -n "$NET_TUNING_RECORD_DIR" ] || return 1
+    {
+        printf 'captured_at=%s\n' "$NET_TUNING_CAPTURED_AT"
+        printf 'fresh_install=%s\n' "${FRESH_INSTALL:-FALSE}"
+        printf 'network_sysctl_file=%s\n' "$NETWORK_SYSCTL_FILE"
+        printf 'file_present=%s\n' "$NET_ORIG_FILE_PRESENT"
+        printf 'tcp_congestion_control=%s\n' "$NET_ORIG_CC"
+        printf 'default_qdisc=%s\n' "$NET_ORIG_QDISC"
+        printf 'rmem_max=%s\n' "$NET_ORIG_RMEM"
+        printf 'wmem_max=%s\n' "$NET_ORIG_WMEM"
+        printf 'result=%s\n' "$result"
+    } > "$NET_TUNING_RECORD_DIR/state" || return 1
+    chmod 0600 "$NET_TUNING_RECORD_DIR/state" 2>/dev/null || return 1
+    return 0
+}
+
+network_create_record() {
+    local base
+    [ -n "$NETWORK_TUNING_RECORD_ROOT" ] || return 1
+    mkdir -p -- "$NETWORK_TUNING_RECORD_ROOT" || return 1
+    NET_TUNING_CAPTURED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    base="$NETWORK_TUNING_RECORD_ROOT/network-tuning.before-install.$(date -u +%Y%m%dT%H%M%SZ)"
+    NET_TUNING_RECORD_DIR="$(mktemp -d "${base}.XXXXXX")" || return 1
+    chmod 0700 "$NET_TUNING_RECORD_DIR" || return 1
+    if [ "$NET_ORIG_FILE_PRESENT" = "TRUE" ]; then
+        cp -a -- "$NETWORK_SYSCTL_FILE" "$NET_TUNING_RECORD_DIR/99-sing-box-network.conf" || return 1
+    fi
+    network_write_record_state "pending" || return 1
+    return 0
+}
+
+network_record_result() {
+    NET_TUNING_RESULT="${1:-unknown}"
+    if ! network_write_record_state "$NET_TUNING_RESULT"; then
+        warning "网络参数记录更新失败: $NET_TUNING_RECORD_DIR/state（安装继续）"
+    fi
+    return 0
+}
+
+# Attempt the rollback and record the RESULT THAT ACTUALLY HAPPENED. Never
+# claim "rolled-back" when network_restore_state could not verify the original
+# runtime values/persistence file.
+network_finish_failed_apply() {
+    if network_restore_state; then
+        network_record_result "rolled-back"
+    else
+        network_record_result "rollback-incomplete"
+    fi
+    return 0
+}
+
+# Write the merged persistence file and then apply ONLY this round's target keys
+# to the live kernel, one `sysctl -w` per key. A whole-file `sysctl -p` would
+# also re-apply unrelated/custom lines and could change runtime parameters that
+# are outside the BBR/UDP optimization scope, so it is intentionally not used.
+write_network_sysctl() { # <request_bbr TRUE|FALSE> [qdisc_mode fq|keep]
+    local request_bbr="${1:-FALSE}"
+    local qdisc_mode="${2:-keep}"
+    local candidate
+
+    network_compute_target_buffers || return 1
+    mkdir -p -- "$(dirname -- "$NETWORK_SYSCTL_FILE")" || return 1
+    candidate="$(mktemp "${NETWORK_SYSCTL_FILE}.candidate.XXXXXX")" || return 1
+    network_render_merged_sysctl "$request_bbr" "$qdisc_mode" \
+        "$NET_TARGET_RMEM" "$NET_TARGET_WMEM" "$candidate" ||
+        { rm -f -- "$candidate"; return 1; }
+    network_install_candidate "$candidate" || { rm -f -- "$candidate"; return 1; }
+
+    "$SYSCTL_BIN" -w "net.core.rmem_max=$NET_TARGET_RMEM" >/dev/null 2>&1 || return 1
+    "$SYSCTL_BIN" -w "net.core.wmem_max=$NET_TARGET_WMEM" >/dev/null 2>&1 || return 1
+    if [ "$request_bbr" = "TRUE" ]; then
+        "$SYSCTL_BIN" -w "net.ipv4.tcp_congestion_control=bbr" >/dev/null 2>&1 || return 1
+        if [ "$qdisc_mode" = "fq" ]; then
+            "$SYSCTL_BIN" -w "net.core.default_qdisc=fq" >/dev/null 2>&1 || return 1
+        fi
     fi
 
-    mkdir -p /etc/sysctl.d
-    temp_file=$(mktemp) || error "无法创建网络优化临时文件"
-    {
-        echo "# Managed by install-singboxhysteria2"
-        echo "# Keep UDP socket buffer limits at least 16 MiB for Hysteria2/QUIC."
-        echo "net.core.rmem_max = $target_rmem"
-        echo "net.core.wmem_max = $target_wmem"
-        if [ "$request_bbr" = "TRUE" ]; then
-            echo "# TCP tuning for Reality and proxied TCP traffic."
-            echo "net.core.default_qdisc = fq"
-            echo "net.ipv4.tcp_congestion_control = bbr"
+    [ "$(network_sysctl_read net.core.rmem_max || true)" = "$NET_TARGET_RMEM" ] || return 1
+    [ "$(network_sysctl_read net.core.wmem_max || true)" = "$NET_TARGET_WMEM" ] || return 1
+    if [ "$request_bbr" = "TRUE" ]; then
+        [ "$(network_sysctl_read net.ipv4.tcp_congestion_control || true)" = "bbr" ] || return 1
+        if [ "$qdisc_mode" = "fq" ]; then
+            [ "$(network_sysctl_read net.core.default_qdisc || true)" = "fq" ] || return 1
         fi
-    } > "$temp_file"
+    fi
+    info "Hysteria2 UDP 接收缓冲上限: $(network_sysctl_read net.core.rmem_max || true)"
+    info "Hysteria2 UDP 发送缓冲上限: $(network_sysctl_read net.core.wmem_max || true)"
+    return 0
+}
 
-    install -m 0644 "$temp_file" "$NETWORK_SYSCTL_FILE" || {
-        rm -f "$temp_file"
-        error "写入网络优化配置失败"
-    }
-    rm -f "$temp_file"
-    sysctl -p "$NETWORK_SYSCTL_FILE" || error "应用网络优化配置失败"
+# Lossless UDP-only update: merge the file (preserving the existing TCP/qdisc
+# persistence lines and every unrelated key) and apply ONLY the two UDP keys to
+# the live kernel. A `sysctl -p` would also re-apply the preserved TCP/qdisc/
+# custom lines and could change the live policy, so it is intentionally not
+# used here either.
+write_network_udp_only() {
+    local candidate
+    network_compute_target_buffers || return 1
+    mkdir -p -- "$(dirname -- "$NETWORK_SYSCTL_FILE")" || return 1
+    candidate="$(mktemp "${NETWORK_SYSCTL_FILE}.candidate.XXXXXX")" || return 1
+    network_render_merged_sysctl "FALSE" "keep" \
+        "$NET_TARGET_RMEM" "$NET_TARGET_WMEM" "$candidate" ||
+        { rm -f -- "$candidate"; return 1; }
+    network_install_candidate "$candidate" || { rm -f -- "$candidate"; return 1; }
+    "$SYSCTL_BIN" -w "net.core.rmem_max=$NET_TARGET_RMEM" >/dev/null 2>&1 || return 1
+    "$SYSCTL_BIN" -w "net.core.wmem_max=$NET_TARGET_WMEM" >/dev/null 2>&1 || return 1
+    [ "$(network_sysctl_read net.core.rmem_max || true)" = "$NET_TARGET_RMEM" ] || return 1
+    [ "$(network_sysctl_read net.core.wmem_max || true)" = "$NET_TARGET_WMEM" ] || return 1
+    info "Hysteria2 UDP 接收缓冲上限: $(network_sysctl_read net.core.rmem_max || true)"
+    info "Hysteria2 UDP 发送缓冲上限: $(network_sysctl_read net.core.wmem_max || true)"
+    return 0
+}
 
-    info "Hysteria2 UDP 接收缓冲上限: $(sysctl -n net.core.rmem_max)"
-    info "Hysteria2 UDP 发送缓冲上限: $(sysctl -n net.core.wmem_max)"
+network_restore_state() {
+    local failed=0
+    "$SYSCTL_BIN" -w "net.ipv4.tcp_congestion_control=$NET_ORIG_CC" >/dev/null 2>&1 || failed=1
+    "$SYSCTL_BIN" -w "net.core.default_qdisc=$NET_ORIG_QDISC" >/dev/null 2>&1 || failed=1
+    "$SYSCTL_BIN" -w "net.core.rmem_max=$NET_ORIG_RMEM" >/dev/null 2>&1 || failed=1
+    "$SYSCTL_BIN" -w "net.core.wmem_max=$NET_ORIG_WMEM" >/dev/null 2>&1 || failed=1
+    if [ "$NET_ORIG_FILE_PRESENT" = "TRUE" ]; then
+        if [ -n "$NET_TUNING_RECORD_DIR" ] &&
+           [ -f "$NET_TUNING_RECORD_DIR/99-sing-box-network.conf" ]; then
+            mkdir -p -- "$(dirname -- "$NETWORK_SYSCTL_FILE")" 2>/dev/null || failed=1
+            cp -a -- "$NET_TUNING_RECORD_DIR/99-sing-box-network.conf" \
+                "$NETWORK_SYSCTL_FILE" 2>/dev/null || failed=1
+        else
+            failed=1
+        fi
+    else
+        rm -f -- "$NETWORK_SYSCTL_FILE" 2>/dev/null || failed=1
+    fi
+    [ "$(network_sysctl_read net.ipv4.tcp_congestion_control || true)" = "$NET_ORIG_CC" ] || failed=1
+    [ "$(network_sysctl_read net.core.default_qdisc || true)" = "$NET_ORIG_QDISC" ] || failed=1
+    [ "$(network_sysctl_read net.core.rmem_max || true)" = "$NET_ORIG_RMEM" ] || failed=1
+    [ "$(network_sysctl_read net.core.wmem_max || true)" = "$NET_ORIG_WMEM" ] || failed=1
+    if [ "$failed" -ne 0 ]; then
+        warning "网络优化回滚未完全成功；安装继续，但请按以下安装前值手动恢复："
+        warning "  sysctl -w net.ipv4.tcp_congestion_control=$NET_ORIG_CC"
+        warning "  sysctl -w net.core.default_qdisc=$NET_ORIG_QDISC"
+        warning "  sysctl -w net.core.rmem_max=$NET_ORIG_RMEM net.core.wmem_max=$NET_ORIG_WMEM"
+        if [ "$NET_ORIG_FILE_PRESENT" = "TRUE" ]; then
+            warning "  恢复持久化文件: $NET_TUNING_RECORD_DIR/99-sing-box-network.conf -> $NETWORK_SYSCTL_FILE"
+        else
+            warning "  删除安装器写入的持久化文件: $NETWORK_SYSCTL_FILE"
+        fi
+        return 1
+    fi
+    warning "网络优化未生效，已自动恢复安装前的 TCP/qdisc 与持久化文件；安装继续"
+    return 0
+}
+
+apply_fresh_install_network_defaults() {
+    local bbr_available="FALSE" qdisc_mode="keep"
+
+    if network_tuning_opt_out; then
+        NET_TUNING_RESULT="skipped-opt-out"
+        info "已按 SB_SKIP_NETWORK_TUNING 跳过 TCP BBR/fq 默认优化；未修改 TCP/qdisc/UDP 配置"
+        return 0
+    fi
+    if ! network_capture_state; then
+        NET_TUNING_RESULT="skipped-capture-failed"
+        warning "无法读取当前网络参数，已跳过 TCP BBR/fq 默认优化（保留原 TCP/qdisc/UDP 设置）；安装继续"
+        return 0
+    fi
+    if ! network_create_record; then
+        NET_TUNING_RESULT="skipped-record-failed"
+        warning "无法记录安装前网络参数，已跳过 TCP BBR/fq 默认优化（避免不可恢复的修改）；安装继续"
+        return 0
+    fi
+    if ! network_managed_file_safe; then
+        network_record_result "skipped-unsafe-managed-file"
+        warning "现有受管网络文件无法安全无损解析，已跳过 TCP BBR/fq 与 UDP 缓冲优化（文件与运行时设置均未修改）；安装继续"
+        return 0
+    fi
+    if network_bbr_available; then
+        bbr_available="TRUE"
+    fi
+    if [ "$bbr_available" = "TRUE" ]; then
+        local persisted_qdisc
+        persisted_qdisc="$(network_persisted_qdisc || true)"
+        if network_qdisc_replaceable "$NET_ORIG_QDISC" &&
+           { [ -z "$persisted_qdisc" ] || network_qdisc_replaceable "$persisted_qdisc"; }; then
+            qdisc_mode="fq"
+        elif [ -n "$persisted_qdisc" ] && ! network_qdisc_replaceable "$persisted_qdisc"; then
+            info "检测到持久化自定义 qdisc=$persisted_qdisc，已无损保留原持久化行，不覆盖为 fq"
+        else
+            info "检测到自定义 qdisc=$NET_ORIG_QDISC，已保留，不覆盖为 fq"
+        fi
+        if write_network_sysctl "TRUE" "$qdisc_mode"; then
+            if [ "$NET_ORIG_CC" = "bbr" ]; then
+                network_record_result "already-enabled"
+            else
+                network_record_result "applied"
+            fi
+            info "Linux TCP BBR 已启用并持久化: $(network_sysctl_read net.ipv4.tcp_congestion_control || true)"
+            info "默认队列算法: $(network_sysctl_read net.core.default_qdisc || true)"
+            info "Hysteria2 UDP 接收缓冲上限: $(network_sysctl_read net.core.rmem_max || true)"
+            info "Hysteria2 UDP 发送缓冲上限: $(network_sysctl_read net.core.wmem_max || true)"
+            info "安装前网络参数已记录: $NET_TUNING_RECORD_DIR/state（手动恢复见 docs/hysteria2-bbr.md）"
+            return 0
+        fi
+        network_finish_failed_apply
+        return 0
+    fi
+
+    warning "当前内核不支持 TCP BBR；不会下载第三方脚本或自动更换内核。"
+    if configure_udp_buffers; then
+        network_record_result "skipped-unsupported-bbr"
+        info "已保留原 TCP/qdisc 设置，仅应用 Hysteria2 UDP 缓冲下限"
+        return 0
+    fi
+    network_finish_failed_apply
+    return 0
+}
+
+apply_udp_buffer_floor_only() {
+    if network_tuning_opt_out; then
+        NET_TUNING_RESULT="skipped-opt-out"
+        info "已按 SB_SKIP_NETWORK_TUNING 跳过 UDP 缓冲下限；未修改任何网络配置"
+        return 0
+    fi
+    if ! network_capture_state; then
+        NET_TUNING_RESULT="skipped-capture-failed"
+        warning "无法读取当前网络参数，已跳过 UDP 缓冲下限（保留原设置）；安装继续"
+        return 0
+    fi
+    if ! network_create_record; then
+        NET_TUNING_RESULT="skipped-record-failed"
+        warning "无法记录安装前网络参数，已跳过 UDP 缓冲下限（避免不可恢复的修改）；安装继续"
+        return 0
+    fi
+    if ! network_managed_file_safe; then
+        network_record_result "skipped-unsafe-managed-file"
+        warning "现有受管网络文件无法安全无损解析，已跳过 UDP 缓冲优化（文件与运行时设置均未修改）；安装继续"
+        return 0
+    fi
+    if configure_udp_buffers; then
+        network_record_result "udp-floor-applied"
+        info "重新安装：仅应用 Hysteria2 UDP 缓冲下限；TCP/qdisc 保持原样（菜单 5 可手动启用 BBR）"
+        return 0
+    fi
+    network_finish_failed_apply
+    return 0
+}
+
+maybe_apply_fresh_install_network_defaults() {
+    if [ "${FRESH_INSTALL:-FALSE}" = "TRUE" ]; then
+        apply_fresh_install_network_defaults || true
+        return 0
+    fi
+    if [ "${REINSTALL_FALLTHROUGH:-FALSE}" = "TRUE" ]; then
+        apply_udp_buffer_floor_only || true
+        return 0
+    fi
+    NET_TUNING_RESULT="skipped-not-fresh"
+    info "非全新安装：保留现有 TCP/qdisc 配置，不自动启用 BBR/fq（菜单 5 可手动启用）"
+    return 0
+}
+
+show_network_tuning_summary() {
+    local cc qdisc rmem wmem result_text
+    cc="$(network_sysctl_read net.ipv4.tcp_congestion_control || true)"
+    qdisc="$(network_sysctl_read net.core.default_qdisc || true)"
+    rmem="$(network_sysctl_read net.core.rmem_max || true)"
+    wmem="$(network_sysctl_read net.core.wmem_max || true)"
+    case "$NET_TUNING_RESULT" in
+        applied) result_text="全新安装默认优化已应用（Linux TCP BBR + qdisc 策略 + UDP 缓冲下限）" ;;
+        already-enabled) result_text="已检测到 TCP BBR，保持并持久化（UDP 缓冲下限独立应用；现有 qdisc 按策略保留）" ;;
+        skipped-unsupported-bbr) result_text="内核不支持 TCP BBR：TCP/qdisc 保持原样，仅应用 UDP 缓冲下限" ;;
+        udp-floor-applied) result_text="重新安装：仅应用 UDP 缓冲下限，TCP/qdisc 保持原样" ;;
+        skipped-capture-failed|skipped-record-failed) result_text="无法安全读取/记录网络参数，已跳过优化并保留原设置" ;;
+        skipped-unsafe-managed-file) result_text="受管网络文件无法安全无损解析，已跳过优化（文件与运行时均未修改）" ;;
+        skipped-opt-out) result_text="已按 SB_SKIP_NETWORK_TUNING 跳过优化" ;;
+        rolled-back) result_text="应用失败，已自动恢复安装前 TCP/qdisc 与持久化文件" ;;
+        rollback-incomplete) result_text="应用失败且自动回滚未完成：请按上面的手动恢复命令使用安装前记录恢复" ;;
+        skipped-not-fresh|"") result_text="非全新安装：未自动修改 TCP/qdisc 配置" ;;
+        *) result_text="$NET_TUNING_RESULT" ;;
+    esac
+    hint "网络优化: $result_text"
+    info "  TCP 拥塞控制: ${cc:-unknown}"
+    info "  默认 qdisc: ${qdisc:-unknown}"
+    info "  UDP 缓冲上限: rmem_max=${rmem:-unknown}, wmem_max=${wmem:-unknown}"
+    if [ -n "$NET_TUNING_RECORD_DIR" ] && [ -f "$NET_TUNING_RECORD_DIR/state" ]; then
+        info "  安装前网络参数记录: $NET_TUNING_RECORD_DIR/state"
+    fi
 }
 
 configure_udp_buffers() {
-    write_network_sysctl "FALSE"
+    write_network_udp_only
 }
 
 enable_bbr() {
-    local available_cc
+    local bbr_available="FALSE" qdisc_mode="keep"
 
-    if command -v modprobe >/dev/null 2>&1; then
-        modprobe tcp_bbr >/dev/null 2>&1 || true
-    fi
-    available_cc=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
-
-    if grep -qw bbr <<< "$available_cc"; then
-        write_network_sysctl "TRUE"
-        info "TCP BBR 已启用: $(sysctl -n net.ipv4.tcp_congestion_control)"
-        info "默认队列算法: $(sysctl -n net.core.default_qdisc)"
-    else
-        warning "当前内核不支持 TCP BBR；不会下载第三方脚本或自动更换内核。"
-        configure_udp_buffers
+    if ! network_capture_state; then
+        warning "无法读取当前网络参数，已取消 BBR 操作；未修改任何设置"
         return 1
     fi
+    if ! network_create_record; then
+        warning "无法记录安装前网络参数，已取消 BBR 操作（避免不可恢复的修改）"
+        return 1
+    fi
+    if ! network_managed_file_safe; then
+        warning "现有受管网络文件无法安全无损解析，已取消 BBR 操作（文件与运行时设置均未修改）"
+        return 1
+    fi
+    if network_bbr_available; then
+        bbr_available="TRUE"
+    fi
+    if [ "$bbr_available" != "TRUE" ]; then
+        warning "当前内核不支持 TCP BBR；不会下载第三方脚本或自动更换内核。"
+        if configure_udp_buffers; then
+            network_record_result "skipped-unsupported-bbr"
+            info "已仅应用 Hysteria2 UDP 缓冲下限；TCP/qdisc 保持不变"
+        else
+            network_finish_failed_apply
+        fi
+        return 1
+    fi
+    local persisted_qdisc
+    persisted_qdisc="$(network_persisted_qdisc || true)"
+    if network_qdisc_replaceable "$NET_ORIG_QDISC" &&
+       { [ -z "$persisted_qdisc" ] || network_qdisc_replaceable "$persisted_qdisc"; }; then
+        qdisc_mode="fq"
+    elif [ -n "$persisted_qdisc" ] && ! network_qdisc_replaceable "$persisted_qdisc"; then
+        info "检测到持久化自定义 qdisc=$persisted_qdisc，已无损保留原持久化行，不覆盖为 fq"
+    else
+        info "检测到自定义 qdisc=$NET_ORIG_QDISC，已保留，不覆盖为 fq"
+    fi
+    if write_network_sysctl "TRUE" "$qdisc_mode"; then
+        if [ "$NET_ORIG_CC" = "bbr" ]; then
+            network_record_result "already-enabled"
+        else
+            network_record_result "applied"
+        fi
+        info "TCP BBR 已启用: $(network_sysctl_read net.ipv4.tcp_congestion_control || true)"
+        info "默认队列算法: $(network_sysctl_read net.core.default_qdisc || true)"
+        info "Hysteria2 UDP 接收缓冲上限: $(network_sysctl_read net.core.rmem_max || true)"
+        info "Hysteria2 UDP 发送缓冲上限: $(network_sysctl_read net.core.wmem_max || true)"
+        info "安装前网络参数已记录: $NET_TUNING_RECORD_DIR/state（手动恢复见 docs/hysteria2-bbr.md）"
+        return 0
+    fi
+    network_finish_failed_apply
+    return 1
 }
+# <<< network-tuning <<< ======================================================
 
 # >>> legacy-config-transaction-hardening >>> ==================================
 # L1..L5: serialize EVERY durable sing-box management mutation under the SAME
@@ -3848,6 +4380,11 @@ echo ""
 # Any existing marker blocks the automatic fresh-install path. This prevents a
 # missing shortcut or service file from causing silent key/config regeneration.
 if has_any_installation_marker; then
+    # This process is NOT a genuinely fresh install: an update, rerun or menu
+    # session must never apply the fresh-install TCP/qdisc default. Captured
+    # BEFORE the menu because menu item 1 (reinstall) falls through to the
+    # fresh-install code below after uninstalling.
+    FRESH_INSTALL="FALSE"
     if [ ! -f /root/sbox/sbconfig_server.json ] ||
        [ ! -f /root/sbox/config ] ||
        [ ! -x /root/sbox/sing-box ]; then
@@ -3916,6 +4453,10 @@ if has_any_installation_marker; then
           if ! uninstall_singbox; then
               exit 1
           fi
+          # Falls through to the fresh-install code below. This is still NOT a
+          # fresh install for network tuning: only the UDP buffer floor may be
+          # applied, never TCP/qdisc.
+          REINSTALL_FALLTHROUGH="TRUE"
         ;;
       2)
           modify_singbox
@@ -4143,7 +4684,9 @@ EOF
 write_api_secret_file "$monitor_api_secret" || error "无法写入 monitor-api.secret（root:root 0600）"
 harden_sensitive_permissions || error "敏感文件权限加固失败，安装已停止"
 
-configure_udp_buffers
+# Fresh-install-only Linux TCP/qdisc default + UDP buffer floor. Never fatal:
+# a failed optional optimization is rolled back and the install continues.
+maybe_apply_fresh_install_network_defaults
 
 cat > /etc/systemd/system/sing-box.service <<EOF
 [Unit]
@@ -4167,6 +4710,9 @@ if /root/sbox/sing-box check -c /root/sbox/sbconfig_server.json; then
     systemctl daemon-reload
     systemctl enable sing-box > /dev/null 2>&1
     systemctl start sing-box
+    # Install summary: actual TCP/qdisc/UDP values plus applied/skipped/failed
+    # reason (see the network-tuning block at the top of this file).
+    show_network_tuning_summary
     install_shortcut || error "写入 miaomiao 管理入口失败。"
     show_client_configuration
     warning "输入miaomiao,即可打开菜单"

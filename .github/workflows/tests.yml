@@ -43,6 +43,7 @@ jobs:
           bash -n tests/test-phase-d.sh
           bash -n tests/test-security-baseline.sh
           bash -n tests/test-install-host-deps.sh
+          bash -n tests/test-network-tuning.sh
           bash -n tests/canary-api-auth.sh
           bash -n tests/test-monitor-v2-e1.sh
           bash -n tests/test-monitor-v2-e2.sh
@@ -164,6 +165,25 @@ jobs:
       # activation at all, so it is a core product contract.
       - name: "Host dependency bootstrap regression suite (install.sh package->command map, fail-closed verification)"
         run: bash tests/test-install-host-deps.sh
+
+      # Fresh-install TCP BBR/fq + UDP buffer default (issue #119). The first
+      # run is hermetic (mocked sysctl, throwaway paths). The second run is a
+      # REAL-kernel gate on this disposable GitHub-hosted runner: it captures
+      # every original sysctl value, applies the real BBR/fq/UDP default,
+      # reads it back, rolls back, re-applies and replays the persisted boot
+      # file. net.core.default_qdisc is NOT netns-scoped, so a network
+      # namespace cannot exercise the real qdisc path; the suite therefore
+      # refuses to run without the explicit disposable-host flag and restores
+      # state on success and on abnormal exit (the runner is destroyed after
+      # the job regardless).
+      - name: "Fresh-install kernel TCP BBR/fq + UDP buffer default suite (hermetic + disposable-host LIVE)"
+        run: |
+          bash tests/test-network-tuning.sh
+          # sudo resets the environment; pass the CI identity through so the
+          # suite can prove it runs on a GitHub-hosted disposable runner.
+          sudo -n env GITHUB_ACTIONS="${GITHUB_ACTIONS:-false}" \
+            SB_NET_REQUIRE_LIVE=1 SB_NET_LIVE_DISPOSABLE=1 \
+            bash tests/test-network-tuning.sh
 
       - name: Legacy config transaction hardening regression suite (real flock on Linux)
         run: bash tests/test-legacy-config-transactions.sh
