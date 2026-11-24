@@ -154,13 +154,17 @@ def commit_scenario(work: Path, live_text: str, candidate_text: str,
                               text=True, env=env, timeout=120)
         return proc.returncode, proc.stdout + proc.stderr, live
     proc = subprocess.Popen(["bash", str(runner)], stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True, env=env)
+                            stderr=subprocess.STDOUT, text=True, env=env,
+                            start_new_session=True)
     journal = work / "phases"
     deadline = time.time() + 30
     while time.time() < deadline:
         if journal.exists() and kill_on_phase in journal.read_text():
             time.sleep(0.1)
-            os.kill(proc.pid, signal.SIGKILL)
+            # Kill the whole transaction process group: children inherit the
+            # canonical lock fd, so a bare parent kill would leave the lock
+            # held by a surviving child (bounded only by its own timeout).
+            os.killpg(proc.pid, signal.SIGKILL)
             break
         if proc.poll() is not None:
             break
