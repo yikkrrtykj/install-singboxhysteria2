@@ -63,6 +63,10 @@ set -u
 . "@@LIB@@"
 info() { :; }
 warning() { printf 'WARN %s\n' "$*" >&2; }
+ha_ui_lab_journal() {
+  printf '%s\t%s\t%s\n' "$1" "$(date +%s)" "${2:-}" >> "$HA_UI_LAB_JOURNAL"
+}
+export CM_TX_JOURNAL_HOOK=ha_ui_lab_journal
 export SB_SERVER_CONFIG="@@LIVE@@"
 export SB_LOCK_FILE="@@LOCK@@"
 export SB_SING_BOX_BIN="@@STUBDIR@@/sing-box"
