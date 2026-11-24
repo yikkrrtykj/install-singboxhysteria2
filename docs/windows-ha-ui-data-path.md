@@ -271,3 +271,30 @@ terminal: result 存在 = worker 已结束；否则 running(pid) 或 tx-unfinish
   并验证锁最终释放。
 - 结论：P0 的交付目标是“正常 GUI 超时/SSH 断开不会中断关键提交；异常终止可识别、
   不可误报成功”，不包含“物理故障绝不丢事务”。最终 PASS 仍需方案 AI 独立复审。
+
+
+### 7.6 第四轮复审修复（HEAD 05d02767）
+
+- **只读查询的 glob**：`pending_transactions` 用固定 `TX_ROOT` + 已校验 canonical
+  名称 + 未加引号的 `*` 组成检索（`root='...'; name=...; for d in "$root"/"$name"-*/`），
+  不再把整段路径放进单引号。Linux lab 用**真实创建的目录**执行 production
+  `_pending_tx_command`，断言 running/terminal/damaged/absent 四种结果。
+- **terminal ≠ 可解除**：新增 `TxStatus.outcome/release_safe`。只有
+  `created`（rc=0 + COMMIT + SUCCESS + 无 live worker）、`rolled-back`（证明恢复）或
+  `refused`（预写拒绝）才可解除；`damaged`（resume 缺失/部分写/未 fsync）、
+  `worker-alive`（result 已写但 worker 未退出）、`rollback-manual`、
+  `unfinished`/`running`、以及 claim 无对应记录一律 `blocked`。service 还要求 live
+  记录与该结局一致（created 需 `exportable`，rolled-back/refused 需名称不存在）。
+- **watchdog 竞态**：worker **不再向菜单发送任何信号**（检查与 kill 无法与 canonical
+  `replace` 边界原子化）。超预算只写 `precommit-stall` 记录，由 canonical 子命令
+  超时保证有界；写入后不可能被 watchdog 误杀。lab 分别覆盖 replace 之后与之前两个
+  窗口。
+- **跨请求同名阻断**：launcher 在创建前扫描**所有**同名目录，任何未完成的
+  `result` 缺失 → `tx-in-flight`；并用原子 `mkdir` 的 per-name claim 目录防止两个
+  GUI/重启后的实例并发启动。claim 记录 txid；只有引用的 worker 已死且 claim 超过
+  1 天才允许接管。**未完成记录永不自动删除**，只有已有 `result` 且超过 7 天的记录
+  才清理。
+- **fsync fail-closed**：journal hook 对文件与目录分别检查 `sync -f`，失败回退
+  `sync` 且失败返回非 0（事务在 replace 前中止）；result 发布的每一步
+  （tmp 写入 → mv → 文件/目录 fsync）都有检查，失败写 `publish-failed`，
+  解析器将其标记为 `damaged`，绝不当作可信终局。
