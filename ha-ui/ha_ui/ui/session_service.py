@@ -26,7 +26,7 @@ never stored on the service instance, logged or rendered.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Callable, Mapping, Protocol
+from typing import Callable, Mapping, Protocol, Sequence
 
 from ..core import chain, errors, private_fs
 from ..core.errors import HaUiError
@@ -71,7 +71,9 @@ def format_stage(token: str) -> str:
 class GenerationBackend(Protocol):
     """The core service methods the UI needs (kept small for test fakes)."""
 
-    def preview(self, sessions: Mapping[str, RemoteSession]) -> PreviewResult: ...
+    def preview(self, sessions: Mapping[str, RemoteSession], *,
+                pending_names: Sequence[str] = ...
+                ) -> PreviewResult: ...
 
     def create_client(self, *, sessions: Mapping[str, RemoteSession],
                       name: str, confirmed: bool,
@@ -182,10 +184,12 @@ class SessionGenerationService:
 
     # ---------------------------------------------------------------- preview --
     def preview(self, *, password_overrides: Mapping[str, str] | None = None,
-                cancel: Callable[[], bool] | None = None) -> PreviewResult:
+                cancel: Callable[[], bool] | None = None,
+                pending_names: Sequence[str] = ()) -> PreviewResult:
         sessions = self._open_sessions(password_overrides, cancel)
         try:
-            return self._service.preview(sessions)
+            return self._service.preview(
+                sessions, pending_names=tuple(pending_names))
         finally:
             self._close_sessions(sessions)
 

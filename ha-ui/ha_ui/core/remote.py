@@ -29,6 +29,7 @@ from __future__ import annotations
 import hashlib
 import re
 import shlex
+import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Mapping, Protocol
@@ -78,6 +79,7 @@ RESERVED_CLIENT_NAME = "legacy"
 MAX_EXPORT_BYTES = 64 * 1024
 MAX_LIST_JSON = 256 * 1024
 MAX_MENU_OUTPUT = 1024 * 1024
+MAX_TX_OUTPUT = 256 * 1024
 
 # Structure markers that must exist in the downloaded installer before any byte
 # of it is executed. A renumbered menu (the main catastrophic drift: "10" could
@@ -108,6 +110,14 @@ MENU_RUN_TIMEOUT = 420
 MENU_KILL_GRACE = 10
 MENU_EXEC_TIMEOUT = 540.0
 
+# Managed create transaction. The worker is a detached one-shot server process
+# that keeps a durable phase journal; the client only reads that state.
+TX_ROOT = "/root/sbox/.ha-ui-tx"
+TX_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,31}-[0-9a-f]{32}\Z")
+TX_WAIT_TIMEOUT = 1800.0      # stop waiting here; never kill the worker
+TX_PRECOMMIT_SECONDS = 120    # watchdog may stop the menu only pre-replace
+PATH_ENV = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
 DERIVED_STAT_FORMAT = "%F|%n|%a|%u|%s|%Y|%y"
 DERIVED_IDENTITY_END = "HAUI_STAT_END"
 # Exact, mutually exclusive server outcomes. A generic "回滚" needle is NOT
@@ -133,13 +143,19 @@ _MENU_FAIL_TOKENS = (
     ("rolled-back", "已回滚并重新加载上一份配置"),
 )
 
-# Refusals the canonical add path raises before it replaces the config file.
-# They are only reported as a clean "nothing was written" when the live
-# reconciliation agrees (same config bytes, name still absent).
-PRE_WRITE_ADD_REFUSALS = frozenset({
-    "consistency", "incomplete", "missing-config", "name-invalid",
-    "permission", "reserved", "exists", "lock", "create",
-})
+# Refusals the canonical add path raises before it replaces the config file,
+# paired with the read-only transcript counter that proves the sentence
+# appeared. Order matters: the first matching token wins.
+_TX_REFUSALS = (
+    ("exists", "EXISTS"),
+    ("lock", "LOCK"),
+    ("consistency", "CONSISTENCY"),
+    ("incomplete", "INCOMPLETE"),
+    ("create", "CREATE"),
+    ("missing-config", "MISSING_CONFIG"),
+    ("name-invalid", "NAME_INVALID"),
+    ("reserved", "RESERVED"),
+)
 
 # The commit line the canonical installer prints only after the candidate was
 # written; the reload wording varies (reload vs "no running process"), so this
@@ -325,17 +341,200 @@ def _menu_command(names: list[str]) -> str:
     return _pinned_menu_command(sequence, MENU_SCRIPT_MARKERS)
 
 
-def _add_client_command(name: str) -> str:
-    """Pinned menu 10→2 command creating one client on this VPS only.
+def _tx_id(name: str) -> str:
+    return "%s-%s" % (name, uuid.uuid4().hex)
 
-    The name has already passed the canonical regex, so the only interpolated
-    text is a fixed-shape token. Success is never inferred from the menu exit
-    code alone: ``RemoteProvider.create_client`` requires the canonical success
-    line and the commit line, and then proves the live record is exportable.
+
+def _tx_env_text(txid: str) -> str:
+    """Reviewed BASH_ENV text for one attempt.
+
+    The hook stays a *function* (the library contract). The variable is set
+    without ``export`` so no child process sees a name that has no function,
+    and ``BASH_ENV`` is unset right after loading so child shells do not re-run
+    the file. ``hook-loaded`` is the load-time sentinel: bash silently ignores a
+    missing BASH_ENV file, so an exit status proves nothing.
+    """
+    tx = TX_ROOT + "/" + txid
+    return (
+        "#!/bin/bash\n"
+        "# ha-ui managed transaction hook (reviewed source: ha-ui/ha_ui/core/remote.py)\n"
+        "ha_ui_tx_journal() {\n"
+        "    local phase=${1:-unknown} backup=${2:-}\n"
+        "    umask 077\n"
+        "    printf '%s\\t%s\\t%s\\n' \"$phase\" \"$(date +%s)\" \"$backup\" "
+        ">> " + shlex.quote(tx) + "/phases || return 1\n"
+        "    sync -f " + shlex.quote(tx) + "/phases 2>/dev/null || sync\n"
+        "    sync -f " + shlex.quote(tx) + " 2>/dev/null || sync\n"
+        "    return 0\n"
+        "}\n"
+        "CM_TX_JOURNAL_HOOK=ha_ui_tx_journal\n"
+        "printf 'loaded\\n' > " + shlex.quote(tx) + "/hook-loaded\n"
+        "unset BASH_ENV\n"
+    )
+
+
+def _tx_env_sha(txid: str) -> str:
+    return hashlib.sha256(_tx_env_text(txid).encode("utf-8")).hexdigest()
+
+
+def _tx_worker_script(precommit: int | None = None) -> str:
+    """Exact detached worker text (the Linux lab runs this same text)."""
+    seconds = TX_PRECOMMIT_SECONDS if precommit is None else int(precommit)
+    ansi = shlex.quote("s/" + _REDACT_ANSI + "//g")
+    link = shlex.quote("s/" + _REDACT_LINK + "/[redacted-link]/g")
+    return (
+        "set -u\n"
+        "tx=$1; d=$2; started=$3\n"
+        "env -i PATH=" + PATH_ENV + " HOME=/root LANG=C.UTF-8 TERM=dumb "
+        "BASH_ENV=\"$tx/env.sh\" SB_CLIENT_MANAGEMENT_REF="
+        + INSTALLER_REVIEWED_COMMIT + " "
+        "SB_CLIENT_MANAGEMENT_LIB=\"$d/client-management.sh\" "
+        "bash \"$d/install.sh\" < \"$tx/in\" > \"$tx/raw\" 2>&1 &\n"
+        "menu=$!\n"
+        "( while kill -0 \"$menu\" 2>/dev/null; do\n"
+        "    if grep -q '^replace' \"$tx/phases\" 2>/dev/null; then exit 0; fi\n"
+        "    now=$(date +%s)\n"
+        "    if [ $((now - started)) -gt " + str(seconds) + " ]; then\n"
+        "      printf 'watchdog=precommit-timeout\\n' >> \"$tx/notes\"\n"
+        "      kill -TERM \"$menu\" 2>/dev/null\n"
+        "      exit 0\n"
+        "    fi\n"
+        "    sleep 1\n"
+        "  done ) &\n"
+        "watchdog=$!\n"
+        "wait \"$menu\"; rc=$?\n"
+        "kill \"$watchdog\" 2>/dev/null || true\n"
+        "sed -E -e " + ansi + " -e " + link
+        + " \"$tx/raw\" > \"$tx/out\" 2>/dev/null || true\n"
+        "rm -f \"$tx/raw\"\n"
+        "printf 'rc=%s\\nfinished=%s\\n' \"$rc\" \"$(date +%s)\" "
+        "> \"$tx/result.tmp\" && mv -- \"$tx/result.tmp\" \"$tx/result\"\n"
+        "sync -f \"$tx/result\" 2>/dev/null || sync\n"
+        "sync -f \"$tx\" 2>/dev/null || sync\n"
+        "rm -rf -- \"$d\"\n"
+    )
+
+
+# Read-only evidence block. Every value is a fixed token or a count over the
+# redacted transcript; transcript text itself never leaves the server.
+_TX_STATUS_TEMPLATE = r"""echo HAUI_TX_PHASES_BEGIN; sed -n '1,80p' "$tx/phases" 2>/dev/null || true; echo HAUI_TX_PHASES_END; echo HAUI_TX_RESULT_BEGIN; sed -n '1,8p' "$tx/result" 2>/dev/null || true; echo HAUI_TX_RESULT_END; echo "HAUI_TX_NOTES=$(sed -n '1,4p' "$tx/notes" 2>/dev/null | tr '\n' ',')"; pid=$(cat -- "$tx/pid" 2>/dev/null || true); if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then echo HAUI_TX_RUNNING=1; else echo HAUI_TX_RUNNING=0; fi; for pair in "配置已提交:COMMIT" "已回滚并重新加载上一份配置:ROLLED_BACK" "回滚恢复失败:ROLLBACK_FAILED" "服务未能确认恢复:ROLLBACK_UNCONFIRMED" "自动回滚:ROLLBACK_INTENT" "客户端 __NAME__:SUCCESS" "已存在:EXISTS" "配置锁:LOCK" "一致性:CONSISTENCY" "不完整:INCOMPLETE" "add candidate:CREATE" "服务端配置不存在:MISSING_CONFIG" "客户端名称非法:NAME_INVALID" "保留名称:RESERVED"; do needle=${pair%%:*}; key=${pair##*:}; n=$(grep -c -F -- "$needle" "$tx/out" 2>/dev/null || true); echo "HAUI_TX_${key}=${n:-0}"; done; echo "HAUI_TX_ID=${tx##*/}"
+"""
+
+
+def _tx_status_body(name: str) -> str:
+    return _TX_STATUS_TEMPLATE.replace("__NAME__", "'" + name + "'")
+
+
+def _add_client_command(name: str, txid: str) -> str:
+    """Managed create transaction: verified launcher + detached durable worker.
+
+    Order of operations on the server:
+
+    1. fetch/verify the pinned installer and library, and the menu markers
+       (nothing executes before this, and no byte of the live config changes);
+    2. create the root-only transaction directory and the reviewed ``env.sh``,
+       then verify its digest against the client-computed value;
+    3. prove the hook is really loaded in the transaction shell (sentinel +
+       ``declare -F`` + "not exported" probe) — BASH_ENV failures are silent, so
+       this is the only fail-closed gate; any failure aborts before a write;
+    4. start the detached worker (own session, file-backed stdin/stdout) and
+       wait for it; the wait is the client's patience, not a kill switch.
+
+    The worker may stop the menu only before the ``replace`` phase is journaled.
+    Once the commit boundary is recorded, nothing in this path kills it.
     """
     sequence = "10\n2\n%s\n0\n" % name
-    return _pinned_menu_command(
-        sequence, MENU_SCRIPT_MARKERS + MENU_ADD_MARKERS)
+    tx = TX_ROOT + "/" + txid
+    env_text = _tx_env_text(txid)
+    env_sha = _tx_env_sha(txid)
+    checks = " ".join(
+        "grep -qF -- " + shlex.quote(marker) + " \"$d/install.sh\" "
+        "|| { echo HAUI_MENU_FAIL=menu-drift; exit 5; };"
+        for marker in MENU_SCRIPT_MARKERS + MENU_ADD_MARKERS)
+    script = (
+        "set -o pipefail; umask 077; "
+        "d=$(mktemp -d /tmp/ha-ui-installer.XXXXXXXX) "
+        "|| { echo HAUI_MENU_FAIL=temp; exit 3; }; "
+        "cleanup=1; "
+        "trap 'if [ \"${cleanup:-1}\" = 1 ]; then rm -rf -- \"$d\"; fi' "
+        "EXIT HUP INT TERM; "
+        "curl -fsSL --connect-timeout 10 --max-time "
+        + str(MENU_FETCH_TIMEOUT) + " --retry 1 " + shlex.quote(INSTALLER_URL)
+        + " -o \"$d/install.sh\" || { echo HAUI_MENU_FAIL=fetch; exit 4; }; "
+        "if [ \"$(sha256sum \"$d/install.sh\" | awk '{print $1}')\" != "
+        + shlex.quote(INSTALLER_SHA256)
+        + " ]; then echo HAUI_MENU_FAIL=installer-hash; exit 6; fi; "
+        "grep -qF " + shlex.quote(
+            'SB_CLIENT_MANAGEMENT_SHA256="' + CLIENT_MANAGEMENT_SHA256 + '"')
+        + " \"$d/install.sh\" "
+        "|| { echo HAUI_MENU_FAIL=lib-pin; exit 7; }; "
+        + checks + " "
+        "curl -fsSL --connect-timeout 10 --max-time "
+        + str(MENU_FETCH_TIMEOUT) + " --retry 1 "
+        + shlex.quote(CLIENT_MANAGEMENT_URL)
+        + " -o \"$d/client-management.sh\" "
+        "|| { echo HAUI_MENU_FAIL=fetch-lib; exit 8; }; "
+        "if [ \"$(sha256sum \"$d/client-management.sh\" | awk '{print $1}')\" != "
+        + shlex.quote(CLIENT_MANAGEMENT_SHA256)
+        + " ]; then echo HAUI_MENU_FAIL=lib-hash; exit 9; fi; "
+        "chmod 600 \"$d/install.sh\" \"$d/client-management.sh\"; "
+        "tx=" + shlex.quote(tx) + "; root=" + shlex.quote(TX_ROOT) + "; "
+        "mkdir -p -- \"$root\" && chmod 700 -- \"$root\"; "
+        "if [ -e \"$tx\" ]; then echo HAUI_MENU_FAIL=tx-exists; exit 11; fi; "
+        "mkdir -p -- \"$tx\" || { echo HAUI_MENU_FAIL=txdir; exit 10; }; "
+        "chmod 700 -- \"$tx\"; "
+        # Expiry: keep finished requests for 7 days, unfinished for 30, and
+        # never delete a directory whose worker is still alive.
+        "for old in \"$root\"/*/; do "
+        "  [ -d \"$old\" ] || continue; "
+        "  [ \"${old%/}\" = \"$tx\" ] && continue; "
+        "  opid=$(cat -- \"$old/pid\" 2>/dev/null || true); "
+        "  if [ -n \"$opid\" ] && kill -0 \"$opid\" 2>/dev/null; then continue; fi; "
+        "  if [ -f \"$old/result\" ]; then "
+        "    find \"$old\" -maxdepth 0 -mtime +7 -exec rm -rf -- {} + 2>/dev/null; "
+        "  else "
+        "    find \"$old\" -maxdepth 0 -mtime +30 -exec rm -rf -- {} + 2>/dev/null; "
+        "  fi; "
+        "done; "
+        "printf '%s' " + shlex.quote(sequence) + " > \"$tx/in\"; "
+        "chmod 600 -- \"$tx/in\"; "
+        "printf '%s' " + shlex.quote(env_text) + " > \"$tx/env.sh\"; "
+        "chmod 600 -- \"$tx/env.sh\"; "
+        "if [ \"$(sha256sum -- \"$tx/env.sh\" | awk '{print $1}')\" != "
+        + shlex.quote(env_sha) + " ]; then "
+        "echo HAUI_MENU_FAIL=env-hash; exit 12; fi; "
+        "probe=$(env -i PATH=" + PATH_ENV + " HOME=/root BASH_ENV=\"$tx/env.sh\" "
+        "bash -c 'declare -F ha_ui_tx_journal >/dev/null && echo OK' "
+        "2>/dev/null); "
+        "if [ \"$probe\" != OK ] || [ ! -f \"$tx/hook-loaded\" ]; then "
+        "echo HAUI_MENU_FAIL=hook-unproven; exit 13; fi; "
+        "exported=$(env -i PATH=" + PATH_ENV + " HOME=/root BASH_ENV=\"$tx/env.sh\" "
+        "bash -c 'env | grep -c \"^CM_TX_JOURNAL_HOOK=\" || true' 2>/dev/null); "
+        "if [ \"$exported\" != 0 ]; then "
+        "echo HAUI_MENU_FAIL=hook-exported; exit 14; fi; "
+        "started=$(date +%s); printf '%s\\n' \"$started\" > \"$tx/started\"; "
+        "cleanup=0; "
+        "setsid bash -c " + shlex.quote(_tx_worker_script())
+        + " haui_tx \"$tx\" \"$d\" \"$started\" >/dev/null 2>&1 < /dev/null & "
+        "child=$!; printf '%s\\n' \"$child\" > \"$tx/pid\"; "
+        "wait \"$child\" 2>/dev/null || true; "
+        "echo HAUI_TX_STARTED=1; "
+        + _tx_status_body(name)
+    )
+    return "bash -c " + shlex.quote(script)
+
+
+def _pending_tx_command(name: str) -> str:
+    """Read-only: newest transaction state for *name*. Writes nothing."""
+    script = (
+        "tx=$(ls -1dt " + shlex.quote(TX_ROOT + "/" + name + "-*")
+        + " 2>/dev/null | head -n 1); "
+        "if [ -z \"$tx\" ] || [ ! -d \"$tx\" ]; then "
+        "echo HAUI_TX_ABSENT=1; exit 0; fi; "
+        "echo HAUI_TX_ABSENT=0; "
+        + _tx_status_body(name)
+    )
+    return "bash -c " + shlex.quote(script)
 
 
 def _derived_identity_command(names: list[str]) -> str:
@@ -467,6 +666,102 @@ class _ReconcileEvidence:
         return (self.readable
                 and self.config_changed is False
                 and self.present is False)
+
+
+@dataclass(frozen=True)
+class TxStatus:
+    """Durable state of one managed create transaction.
+
+    ``terminal`` is only true when the worker published its ``result`` file;
+    ``running`` is a live PID check. Neither is ever inferred from the client
+    list or from a single snapshot.
+    """
+
+    tx_id: str
+    absent: bool
+    phases: tuple[str, ...]
+    notes: tuple[str, ...]
+    rc: int | None
+    finished: int | None
+    running: bool
+    counts: Mapping[str, int]
+
+    @property
+    def terminal(self) -> bool:
+        return self.finished is not None
+
+    @property
+    def last_phase(self) -> str:
+        return self.phases[-1] if self.phases else ""
+
+    @property
+    def committed(self) -> bool:
+        return self.counts.get("COMMIT", 0) > 0
+
+    @property
+    def success(self) -> bool:
+        return self.counts.get("SUCCESS", 0) > 0
+
+    @property
+    def precommit_timeout(self) -> bool:
+        return any("precommit-timeout" in note for note in self.notes)
+
+
+_TX_PHASES_RE = re.compile(
+    r"HAUI_TX_PHASES_BEGIN\n(.*?)HAUI_TX_PHASES_END", re.S)
+_TX_RESULT_RE = re.compile(
+    r"HAUI_TX_RESULT_BEGIN\n(.*?)HAUI_TX_RESULT_END", re.S)
+_TX_PHASE_RE = re.compile(r"\A[a-z_]{1,32}\Z")
+_TX_COUNT_KEYS = (
+    "COMMIT", "SUCCESS", "ROLLED_BACK", "ROLLBACK_FAILED",
+    "ROLLBACK_UNCONFIRMED", "ROLLBACK_INTENT", "EXISTS", "LOCK",
+    "CONSISTENCY", "INCOMPLETE", "CREATE", "MISSING_CONFIG",
+    "NAME_INVALID", "RESERVED",
+)
+
+
+def _tx_int(value: str | None) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except ValueError:
+        return None
+
+
+def _parse_tx_status(output: str) -> TxStatus:
+    """Parse the fixed read-only evidence block; never guesses."""
+    text = (output or "").replace("\r", "")
+    values = _parse_key_values(text)
+    phases: list[str] = []
+    match = _TX_PHASES_RE.search(text)
+    if match:
+        for line in match.group(1).splitlines():
+            phase = line.split("\t", 1)[0].strip()
+            if _TX_PHASE_RE.match(phase):
+                phases.append(phase)
+    notes: list[str] = []
+    raw_notes = values.get("HAUI_TX_NOTES", "")
+    for note in raw_notes.split(","):
+        note = note.strip()
+        if note and re.fullmatch(r"[a-z-]{1,32}", note):
+            notes.append(note)
+    rc = finished = None
+    match = _TX_RESULT_RE.search(text)
+    if match:
+        result_values = _parse_key_values(match.group(1))
+        rc = _tx_int(result_values.get("rc"))
+        finished = _tx_int(result_values.get("finished"))
+    counts = {key: _tx_int(values.get("HAUI_TX_" + key)) or 0
+              for key in _TX_COUNT_KEYS}
+    return TxStatus(
+        tx_id=values.get("HAUI_TX_ID", ""),
+        absent=values.get("HAUI_TX_ABSENT") == "1",
+        phases=tuple(phases),
+        notes=tuple(notes),
+        rc=rc,
+        finished=finished,
+        running=values.get("HAUI_TX_RUNNING") == "1",
+        counts=counts,
+    )
 
 
 class RemoteProvider:
@@ -661,29 +956,25 @@ class RemoteProvider:
         (independent credentials, backup, sing-box check, reload/health and
         rollback). It never edits ``sbconfig_server.json`` directly.
 
-        Success requires all of:
-        * the name was absent from the live inventory before the write;
-        * the pinned installer/lib pre-execution checks passed;
-        * the menu's canonical success line AND its commit line, with a clean
-          pipeline exit frame;
-        * a fresh live read now shows the name exportable (both protocols and
-          no structural anomaly).
+        The transaction itself runs in a detached one-shot server worker with a
+        durable phase journal (see ``_add_client_command``), so a GUI timeout, an
+        SSH abort or a closed stdout consumer cannot terminate the write,
+        reload or rollback. The client only stops *waiting*; the durable state is
+        what decides the outcome:
 
-        Failure is classified, never guessed:
+        * success requires the worker's terminal ``rc=0``, the commit marker and
+          the canonical success line in its redacted transcript, plus a fresh
+          live read proving the record exportable;
+        * a proven rollback requires the exact restore sentence AND a live read
+          showing the pre-write bytes with the name absent;
+        * everything else — still running, crashed without a terminal record,
+          failed/unconfirmed rollback, unreadable reconciliation — is
+          ``E_CREATE_UNCERTAIN``. Only ``pending_transaction`` may later clear
+          that state, and only when the request has actually ended.
 
-        * ``E_REMOTE_CREATE`` with a pre-write token (``lock``/``exists``/…)
-          only when a live re-read proves the config bytes and name set are
-          unchanged;
-        * ``E_REMOTE_CREATE`` detail ``rolled-back`` only when the transcript
-          carries the exact proven-rollback sentence AND the re-read proves the
-          config bytes are back to the pre-write value with the name absent;
-        * ``E_CREATE_UNCERTAIN`` for everything else (transport loss, menu
-          timeout, failed/unconfirmed rollback, unreadable reconciliation).
-
-        The read-only reconciliation above is *evidence*, not transaction
-        atomicity: this client can never guarantee that an outer timeout has
-        not interrupted the server-side commit. ``docs/windows-ha-ui-data-path.md``
-        records that residual risk; do not claim otherwise here.
+        Power loss or a kernel crash are not covered by this promise: they are
+        detected by the missing terminal record and must stay UNCERTAIN. No
+        credential, UUID, YAML or raw remote text is returned.
         """
         if confirmed is not True:
             raise HaUiError(errors.E_USAGE, detail="create-consent")
@@ -693,85 +984,101 @@ class RemoteProvider:
         before = self.snapshot()
         if before.record(validated) is not None:
             raise HaUiError(errors.E_CLIENT_EXISTS, detail="server")
-        command = _add_client_command(validated)
+        txid = _tx_id(validated)
+        if TX_ID_RE.match(txid) is None:  # defensive: never interpolate junk
+            raise HaUiError(errors.E_INTERNAL)
+        command = _add_client_command(validated, txid)
         try:
-            rc, out, _err = self.session.exec(
-                command, timeout=MENU_EXEC_TIMEOUT, max_output=MAX_MENU_OUTPUT)
+            _rc, out, _err = self.session.exec(
+                command, timeout=TX_WAIT_TIMEOUT, max_output=MAX_TX_OUTPUT)
         except HaUiError as exc:
             if exc.code in (errors.E_SSH_TIMEOUT, errors.E_SSH_CLOSED):
-                # The transport failed while the write may have been running.
-                # The remote process cannot be inspected through this session,
-                # so the only honest verdict is UNCERTAIN.
+                # We stopped waiting; the detached worker may still be running.
+                # Only a later read-only query may resolve it.
                 raise HaUiError(errors.E_CREATE_UNCERTAIN,
-                                detail="timeout-transport") from None
+                                detail="tx-transport") from None
             raise
-        if int(rc) == 124:
-            raise self._timeout_outcome(before, validated)
-        try:
-            transcript = self._menu_completion(out)
-        except HaUiError as exc:
-            if exc.code == errors.E_REMOTE_MENU and exc.detail == "timeout":
-                raise self._timeout_outcome(before, validated) from None
-            if exc.code == errors.E_INSTALLER_UNTRUSTED:
-                # Refused before execution: no write was attempted.
-                raise
-            # The menu process ran but produced no trustworthy result frame
-            # (truncated / non-zero pipeline / drifted transcript). Such an
-            # outcome can hide a committed write, so it is never "clean".
-            raise HaUiError(errors.E_CREATE_UNCERTAIN,
-                            detail="menu-unproven") from None
-        self._judge_add_transcript(transcript, validated, before)
+        if "HAUI_TX_STARTED=1" not in out:
+            self._raise_launch_failure(out)
+        self._judge_tx(_parse_tx_status(out), validated, before)
         return None
 
-    def _judge_add_transcript(self, transcript: str, name: str,
-                              before: RemoteSnapshot) -> None:
-        """Turn one finished add transcript into a proven outcome or UNCERTAIN."""
-        if "客户端管理" not in transcript:
-            raise HaUiError(errors.E_REMOTE_MENU, detail="menu-drift")
-        if (MENU_ADD_SUCCESS_TEMPLATE % name) in transcript:
-            if COMMIT_PROVEN_MARKER not in transcript:
-                # The per-name success line without the commit line is not a
-                # commit; never upgrade it to success.
-                raise HaUiError(errors.E_CREATE_UNCERTAIN,
-                                detail="commit-unproven")
+    def pending_transaction(self, name: str) -> "TxStatus":
+        """Read-only query of the newest managed transaction for *name*.
+
+        Never writes, never kills, never retries. ``absent`` means no
+        transaction directory exists for the name; ``terminal`` distinguishes a
+        finished request from one that may still be running.
+        """
+        validated = validate_client_name(name)
+        self.preflight()
+        rc, out, _err = self.session.exec(_pending_tx_command(validated),
+                                          timeout=45.0)
+        if rc != 0:
+            raise HaUiError(errors.E_REMOTE_LIST, detail="tx-status")
+        return _parse_tx_status(out)
+
+    @staticmethod
+    def _raise_launch_failure(output: str) -> None:
+        match = re.search(r"HAUI_MENU_FAIL=([a-z-]{1,32})", output)
+        token = match.group(1) if match else ""
+        if token in _INSTALLER_UNTRUSTED_TOKENS:
+            raise HaUiError(errors.E_INSTALLER_UNTRUSTED, detail=token)
+        if token in ("fetch", "fetch-lib", "menu-drift", "txdir", "temp"):
+            # Nothing ran against the live config.
+            raise HaUiError(errors.E_REMOTE_MENU, detail=token)
+        if token in ("hook-unproven", "hook-exported", "env-hash"):
+            # The transaction shell is not proven: fail closed before a write.
+            raise HaUiError(errors.E_CREATE_UNCERTAIN, detail=token)
+        if token == "tx-exists":
+            raise HaUiError(errors.E_CREATE_UNCERTAIN, detail="tx-exists")
+        raise HaUiError(errors.E_CREATE_UNCERTAIN, detail="launch-unproven")
+
+    def _judge_tx(self, status: "TxStatus", name: str,
+                  before: RemoteSnapshot) -> None:
+        """Turn one managed transaction's durable state into a verdict."""
+        if status.absent:
+            raise HaUiError(errors.E_CREATE_UNCERTAIN, detail="tx-absent")
+        if not status.terminal:
+            # Still running, or the worker vanished without publishing a
+            # terminal record: never decide anything from this.
+            raise HaUiError(errors.E_CREATE_UNCERTAIN,
+                            detail="running" if status.running
+                            else "tx-unfinished")
+        evidence = self._reconcile(before, name)
+        counts = status.counts
+        if status.success and status.committed and status.rc == 0:
             self._prove_created(name, before)
             return
-        token = _menu_failure_token(transcript)
-        evidence = self._reconcile(before, name)
-        if token in PRE_WRITE_ADD_REFUSALS:
+        if status.success and not status.committed:
+            raise HaUiError(errors.E_CREATE_UNCERTAIN,
+                            detail="commit-unproven")
+        if counts.get("ROLLED_BACK", 0) and evidence.rolled_back_proven:
+            raise HaUiError(errors.E_REMOTE_CREATE, detail="rolled-back")
+        if counts.get("ROLLBACK_FAILED", 0):
+            raise HaUiError(errors.E_CREATE_UNCERTAIN,
+                            detail="rollback-failed")
+        if (counts.get("ROLLBACK_UNCONFIRMED", 0)
+                or "rollback_manual" in status.phases):
+            raise HaUiError(errors.E_CREATE_UNCERTAIN,
+                            detail="rollback-unconfirmed")
+        if counts.get("ROLLBACK_INTENT", 0):
+            raise HaUiError(errors.E_CREATE_UNCERTAIN,
+                            detail="rollback-unconfirmed")
+        for token, key in _TX_REFUSALS:
+            if not counts.get(key, 0):
+                continue
             if evidence.write_observed:
-                # The server refused, yet the config bytes or the name set
-                # changed: a racing/concurrent write is possible, so this is
-                # not a clean refusal.
+                # A refusal sentence is not trustworthy if the bytes or the
+                # name set changed anyway.
                 raise HaUiError(errors.E_CREATE_UNCERTAIN,
                                 detail="refusal-after-write")
             if token == "exists":
                 raise HaUiError(errors.E_CLIENT_EXISTS, detail="server")
             raise HaUiError(errors.E_REMOTE_CREATE, detail=token)
-        if token == "rolled-back":
-            if evidence.rolled_back_proven:
-                raise HaUiError(errors.E_REMOTE_CREATE, detail="rolled-back")
-            # The server printed the proven-rollback sentence but the live state
-            # does not corroborate it (bytes differ, name present, or the
-            # re-read failed): keep it uncertain.
-            raise HaUiError(errors.E_CREATE_UNCERTAIN,
-                            detail="rollback-unconfirmed")
-        if token in ("rollback-failed", "rollback-unconfirmed"):
-            raise HaUiError(errors.E_CREATE_UNCERTAIN, detail=token)
-        raise HaUiError(errors.E_CREATE_UNCERTAIN, detail="unconfirmed")
-
-    def _timeout_outcome(self, before: RemoteSnapshot, name: str) -> HaUiError:
-        """Classify a menu timeout from read-only evidence only.
-
-        Identical bytes + an absent name do NOT prove a rollback here: they are
-        equally consistent with a write that never started. Only the server's
-        explicit proven-restore sentence may downgrade an add to a clean
-        failure, and a timeout never carries one.
-        """
-        evidence = self._reconcile(before, name)
         if evidence.write_observed:
-            return HaUiError(errors.E_CREATE_UNCERTAIN, detail="timeout-write")
-        return HaUiError(errors.E_CREATE_UNCERTAIN, detail="timeout")
+            raise HaUiError(errors.E_CREATE_UNCERTAIN, detail="write-unproven")
+        raise HaUiError(errors.E_CREATE_UNCERTAIN, detail="unconfirmed")
 
     def _prove_created(self, name: str, before: RemoteSnapshot) -> None:
         """Post-write proof: the live record must be exportable."""

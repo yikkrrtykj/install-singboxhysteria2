@@ -65,14 +65,21 @@ def test_add_path_contract_markers_are_present(installer_text):
 
 
 def test_add_command_is_pinned_and_bounded():
-    command = remote._add_client_command("event-vmix01")
+    command = remote._add_client_command(
+        "event-vmix01", "event-vmix01-" + "a" * 32)
     assert "10\n2\nevent-vmix01\n0\n" in command
     assert remote.INSTALLER_URL in command
     assert remote.CLIENT_MANAGEMENT_URL in command
     assert remote.INSTALLER_SHA256 in command
     assert remote.CLIENT_MANAGEMENT_SHA256 in command
-    assert "timeout -k 10 420 env -i" in command
-    assert "PIPESTATUS" in command
+    # The managed transaction no longer wraps the whole menu in a hard kill;
+    # it runs detached with a file-backed stdin/stdout and a durable journal.
+    assert "timeout -k" not in command
+    assert "setsid" in command
+    assert "BASH_ENV=" in command
+    assert "CM_TX_JOURNAL_HOOK=ha_ui_tx_journal" in command
+    assert "HAUI_MENU_FAIL=hook-unproven" in command
+    assert "PIPESTATUS" not in command
     assert "[redacted-link]" in command
     # No credential material is ever placed in the command.
     assert "uuid" not in command.casefold()
