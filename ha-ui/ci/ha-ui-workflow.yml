@@ -58,6 +58,17 @@ jobs:
           ! grep -RInE "(HTTPServer|socketserver|QTcpServer|subprocess.*clash|startfile.*verge|tun\.enable.*True)" ha-ui/ha_ui || {
             echo "::error::forbidden public listener / auto-import construct"; exit 1; }
 
+  linux-tx-lab:
+    name: linux-tx-lab
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Stage A transaction-hook mechanism gate (BASH_ENV)
+        run: bash ha-ui/ci/linux/tx_mechanism.sh
+
   windows-tests:
     name: windows-tests
     runs-on: windows-2022
