@@ -46,7 +46,6 @@ case "$1" in
   is-active)
     n=$(cat "$STUB_COUNTER" 2>/dev/null || echo 0); n=$((n + 1))
     echo "$n" > "$STUB_COUNTER"
-    echo "is-active n=$n a1=${STUB_ACTIVE1_RC:-unset} a3=${STUB_ACTIVE3_RC:-unset}" >> "${STUB_LOG:-/dev/null}"
     if [ "$n" -eq 3 ]; then exit "${STUB_ACTIVE3_RC:-0}"; fi
     exit "${STUB_ACTIVE1_RC:-0}" ;;
   reload)
@@ -148,7 +147,6 @@ def commit_scenario(work: Path, live_text: str, candidate_text: str,
     env.update(env_overrides)
     env["STUB_COUNTER"] = str(work / "counter")
     env["HA_UI_LAB_JOURNAL"] = str(work / "phases")
-    env["STUB_LOG"] = str(work / "stub.log")
     if kill_on_phase is None:
         proc = subprocess.run(["bash", str(runner)], capture_output=True,
                               text=True, env=env, timeout=120)

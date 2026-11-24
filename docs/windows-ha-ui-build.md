@@ -255,3 +255,25 @@ py -3.13 ha-ui\ci\check_no_console_popup.py --source
 并退出 0；检测到窗口/自检失败退出 1；检测器不可用（正向对照未检测到）输出
 `"detector": "unavailable"` 并退出 2。对应 pytest 回归测试为
 `ha-ui/tests/test_windows_console_isolation.py`。
+
+## 8. Linux 事务 lab（P0 证据，CI 必跑）
+
+`linux-tx-lab`（ubuntu-22.04）执行两个脚本，全部无 root、无网络、无真实 VPS：
+
+```bash
+bash ha-ui/ci/linux/tx_mechanism.sh   # Stage A：BASH_ENV 同进程 hook + fail-closed
+python3 ha-ui/ci/linux/tx_lab.py      # Stage B：真实 lib 事务 + 进程级故障注入
+```
+
+`tx_mechanism.sh` 断言 7 项：env.sh 摘要、函数只在事务 shell、非导出、加载后
+`unset BASH_ENV`、加载哨兵、缺失 BASH_ENV 被 bash 静默忽略（必须靠哨兵/declare -F
+识别）、篡改检测、真实 `cm_tx_journal_phase` 调用、hook 失败 fail-closed。
+
+`tx_lab.py` 用真实 `lib/client-management.sh` 的 `commit_server_config`（stub
+`systemctl`/`sing-box`）与 production worker 文本，覆盖：committed、health 失败回滚、
+回滚未确认、`reload` 阶段 SIGKILL（新字节 + journal 停在 reload + 锁最终释放）、
+并发写者被 canonical 锁拒绝、launcher 被杀后 worker 继续、stdout 消费者退出、
+pre-commit watchdog、只读状态查询。失败时打印 out/journal 摘要，便于定位。
+
+本 lab 只证明本机/CI 的 Bash 事务与进程边界；真实 A/B VPS 仍按
+`docs/windows-ha-ui-acceptance.md` 执行。
