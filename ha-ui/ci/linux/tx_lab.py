@@ -62,8 +62,8 @@ SINGBOX_STUB = '#!/bin/bash\nexit "${STUB_CHECK_RC:-0}"\n'
 COMMIT_SCENARIO = r'''#!/bin/bash
 set -u
 . "@@LIB@@"
-info() { :; }
-warning() { printf 'WARN %s\n' "$*" >&2; }
+info() { printf 'INFO %s\n' "$*"; }
+warning() { printf 'WARN %s\n' "$*"; }
 ha_ui_lab_journal() {
   printf '%s\t%s\t%s\n' "$1" "$(date +%s)" "${2:-}" >> "$HA_UI_LAB_JOURNAL"
 }
