@@ -663,7 +663,8 @@ def scenario_claim_guard(work: Path) -> None:
     # An aged claim with a dead worker is STILL never taken over.
     write(unfinished / "out", "配置锁 获取失败，操作已中止\n")
     (unfinished / "result").write_text("rc=1\nfinished=2\n")
-    old_claim = root / "alpha.claim.off"
+    old_claim = root / "alpha.claim"
+    (root / "alpha.claim.off").rename(old_claim)
     write(old_claim / "txid", "alpha-" + "9" * 32)
     os.utime(old_claim, (time.time() - 3 * 24 * 3600,) * 2)
     stale_guard = remote._tx_guard_script("alpha", "alpha-" + "c" * 32,
