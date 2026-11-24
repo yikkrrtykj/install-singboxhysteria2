@@ -46,6 +46,7 @@ case "$1" in
   is-active)
     n=$(cat "$STUB_COUNTER" 2>/dev/null || echo 0); n=$((n + 1))
     echo "$n" > "$STUB_COUNTER"
+    echo "is-active n=$n a1=${STUB_ACTIVE1_RC:-unset} a2=${STUB_ACTIVE2_RC:-unset}" >> "${STUB_LOG:-/dev/null}"
     if [ "$n" -eq 2 ]; then exit "${STUB_ACTIVE2_RC:-0}"; fi
     exit "${STUB_ACTIVE1_RC:-0}" ;;
   reload)
@@ -147,6 +148,7 @@ def commit_scenario(work: Path, live_text: str, candidate_text: str,
     env.update(env_overrides)
     env["STUB_COUNTER"] = str(work / "counter")
     env["HA_UI_LAB_JOURNAL"] = str(work / "phases")
+    env["STUB_LOG"] = str(work / "stub.log")
     if kill_on_phase is None:
         proc = subprocess.run(["bash", str(runner)], capture_output=True,
                               text=True, env=env, timeout=120)
@@ -197,8 +199,9 @@ def scenario_health_rollback(work: Path) -> None:
     if rc == 0:
         journal = (work / "phases").read_text() if (work / "phases").exists() else "-"
         counter = (work / "counter").read_text() if (work / "counter").exists() else "-"
-        fail("health failure reported success: out=%r journal=%r counter=%r"
-             % (out[-600:], journal, counter))
+        stub_log = (work / "stub.log").read_text() if (work / "stub.log").exists() else "-"
+        fail("health failure reported success: out=%r journal=%r counter=%r log=%r"
+             % (out[-600:], journal, counter, stub_log))
     if '"alpha"' in live.read_text():
         fail("health failure did not restore the pre-write bytes")
     if "rollback" not in (work / "phases").read_text():
