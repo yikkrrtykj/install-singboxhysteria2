@@ -285,7 +285,12 @@ def scenario_concurrent_writer(work: Path) -> None:
                              stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL)
     time.sleep(0.5)
-    second = subprocess.run(["bash", str(runner)], env=env, timeout=60,
+    # The second writer must *time out on the lock* while the first still holds
+    # it; otherwise it would simply wait and then fail on the consumed
+    # candidate file, which is a different (weaker) property.
+    env_second = dict(env)
+    env_second["SB_LOCK_TIMEOUT"] = "1"
+    second = subprocess.run(["bash", str(runner)], env=env_second, timeout=60,
                             capture_output=True, text=True)
     first.wait(timeout=60)
     if second.returncode == 0:
