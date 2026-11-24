@@ -207,7 +207,9 @@ def scenario_health_rollback(work: Path) -> None:
     if "rollback" not in (work / "phases").read_text():
         fail("health failure did not journal the rollback")
     if "已回滚并重新加载上一份配置" not in out:
-        fail("proven-rollback sentence missing")
+        j = (work / "phases").read_text() if (work / "phases").exists() else "-"
+        g = (work / "stub.log").read_text() if (work / "stub.log").exists() else "-"
+        fail("proven-rollback sentence missing: out=%r journal=%r log=%r" % (out[-800:], j, g))
     ok("health failure restores bytes and journals a proven rollback")
 
 
