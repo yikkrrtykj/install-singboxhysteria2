@@ -8,6 +8,8 @@ server itself). A changed fingerprint gets an extra warning before this dialog.
 
 from __future__ import annotations
 
+import re
+
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -15,10 +17,14 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFormLayout,
     QLabel,
+    QLineEdit,
     QVBoxLayout,
 )
 
 from ..core.models import HostKeyInfo
+
+CLIENT_NAME_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,31}\Z")
+RESERVED_CLIENT_NAME = "legacy"
 
 
 class HostKeyDialog(QDialog):
@@ -87,3 +93,89 @@ class HostKeyDialog(QDialog):
     @property
     def info(self) -> HostKeyInfo:
         return self._info
+
+
+class ClientCreateDialog(QDialog):
+    """Name + explicit write confirmation for a dual-VPS client creation.
+
+    The dialog only validates shape and consent; it never contacts a VPS. The
+    remote preflight and duplicate checks happen in the worker after this dialog
+    is accepted, so the dialog must not promise that the name is unused.
+    """
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("新建客户端")
+        self.setModal(True)
+        self.setMinimumWidth(520)
+
+        layout = QVBoxLayout(self)
+        intro = QLabel(
+            "将在 A、B 两台 VPS 上创建同一个逻辑客户端。两端各自生成独立的 "
+            "Reality UUID 和 HY2 密码，不会在服务器之间同步凭据。")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        form = QFormLayout()
+        self.name_edit = QLineEdit(self)
+        self.name_edit.setObjectName("newClientName")
+        self.name_edit.setMaxLength(32)
+        self.name_edit.setPlaceholderText("例如 event-vmix01")
+        form.addRow("客户端名称", self.name_edit)
+        self.target_label = QLabel("A + B 两端（同名）", self)
+        form.addRow("创建目标", self.target_label)
+        layout.addLayout(form)
+
+        self.error_label = QLabel("", self)
+        self.error_label.setObjectName("validationError")
+        self.error_label.setWordWrap(True)
+        layout.addWidget(self.error_label)
+
+        warning = QLabel(
+            "此操作会修改两台 VPS 的 sing-box 客户端配置，并可能执行 reload，"
+            "当前连接可能短暂受影响。若名称已在一端存在，操作会停止；"
+            "软件不会覆盖已有凭据，也不会自动删除已创建的一端。")
+        warning.setObjectName("createWarning")
+        warning.setWordWrap(True)
+        layout.addWidget(warning)
+
+        self.confirm_checkbox = QCheckBox(
+            "我已了解并确认修改两台 VPS 的客户端配置", self)
+        self.confirm_checkbox.setObjectName("createConfirm")
+        layout.addWidget(self.confirm_checkbox)
+
+        self.buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel,
+            parent=self)
+        self.ok_button = self.buttons.button(QDialogButtonBox.StandardButton.Ok)
+        self.ok_button.setText("创建")
+        self.ok_button.setObjectName("primaryButton")
+        self.ok_button.setEnabled(False)
+        self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+
+        self.name_edit.textChanged.connect(self._validate)
+        self.confirm_checkbox.toggled.connect(self._validate)
+        self._validate()
+        self.name_edit.setFocus()
+
+    @property
+    def client_name(self) -> str:
+        return self.name_edit.text().strip()
+
+    def _validate(self) -> None:
+        name = self.client_name
+        problem = ""
+        if name:
+            if not CLIENT_NAME_RE.fullmatch(name):
+                problem = (
+                    "名称需以字母或数字开头，只允许字母、数字、点、下划线和横线，"
+                    "长度 1–32。")
+            elif name.casefold() == RESERVED_CLIENT_NAME.casefold():
+                problem = "legacy 是保留名称，不能新建。"
+        self.error_label.setText(problem)
+        self.ok_button.setEnabled(
+            bool(name) and not problem and self.confirm_checkbox.isChecked())

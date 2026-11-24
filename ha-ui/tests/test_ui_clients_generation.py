@@ -1,23 +1,18 @@
-"""pytest-qt tests for the issue #110 client-management + generation UI slice.
+"""pytest-qt tests for the HA-UI 0.2.0 client / creation / generation pages.
 
-Everything runs offscreen and hermetic:
+Everything runs offscreen and hermetic: the SSH ``connect`` callable and the
+core generation service are injected fakes, so no test touches a network, a VPS,
+the Windows Credential Manager or the reviewed HA tools. The tests pin the new
+operator contract:
 
-* the real :class:`~ha_ui.ui.session_service.SessionGenerationService` wiring is
-  exercised (identity validation, password resolution, pinned connect, session
-  close), but both the SSH ``connect`` callable and the core
-  ``GenerationService`` (``preview``/``generate``) are injected fakes, so no
-  test touches a network, a real VPS, the Windows Credential Manager or the
-  reviewed HA tools;
-* a fake generation service is injected into ``MainWindow`` and is the only
-  object that produces previews/results/cancellation;
-* each test workspace is a per-test directory below the worktree's ignored
-  ``.scratch/`` tree with ``HA_UI_HOME`` redirected to it.
-
-The tests assert the security/UX contract of the slice: blocked rows for a
-one-side-only or incomplete client, select-all excluding them, explicit group
-mapping, pre-connect E_HOSTKEY_MISSING/E_CREDENTIAL_MISSING/E_CONFIG gates,
-consent only when an export is stale, safe stage labels and E_ code failures,
-cancellation, and that no password/YAML sentinel can reach any widget text.
+* the default page is the client list, with A/B state, counts and a primary
+  "新建客户端" action; technical diagnosis is collapsed;
+* creation is impossible without the explicit confirmation checkbox, is
+  double-click safe, and never claims completion when the other side failed;
+* a one-sided existing client stops by default and can only be repaired after a
+  second explicit confirmation;
+* generation consent is shown only when a fresh export is missing;
+* no password, UUID, YAML or remote output reaches any widget.
 """
 
 from __future__ import annotations
@@ -31,7 +26,6 @@ from pathlib import Path
 
 import pytest
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QFontDatabase
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -47,7 +41,9 @@ from ha_ui.core.config_store import ServerConfigStore, default_servers
 from ha_ui.core.errors import HaUiError
 from ha_ui.core.models import (
     CertPin,
+    ClientCreationResult,
     ClientRecord,
+    CreationSideResult,
     DeliveredFile,
     GenerationResult,
     ProbePolicy,
@@ -60,18 +56,14 @@ from ha_ui.core.service import PreviewResult, ServerPreview
 from ha_ui.ui.clients_panel import (
     COL_A,
     COL_B,
-    COL_DIAGNOSIS,
+    COL_DETAIL,
     COL_GROUP,
     COL_NAME,
-    COL_REALITY,
     COL_SELECT,
+    COL_STATUS,
 )
-from ha_ui.ui.generate_panel import (
-    COL_FILE,
-    COL_FOLDER,
-    COL_SHA,
-    CONSENT_TEXT,
-)
+from ha_ui.ui.dialogs import ClientCreateDialog
+from ha_ui.ui.generate_panel import CONSENT_TEXT
 from ha_ui.ui.main_window import MainWindow
 from ha_ui.ui.services import ServerActions
 
@@ -97,7 +89,6 @@ PIN_WARNING = "HY2 证书剩余 24 天，低于 30 天提醒线"
 # --------------------------------------------------------------------------- #
 @pytest.fixture()
 def ui_workspace(monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Per-test workspace below the worktree, never the real LOCALAPPDATA."""
     SCRATCH_BASE.mkdir(parents=True, exist_ok=True)
     workspace = SCRATCH_BASE / uuid.uuid4().hex
     workspace.mkdir()
@@ -128,8 +119,6 @@ def _seed_config(
 
 
 class FakeSession:
-    """Pinned-session stand-in owned by the session service (closed in finally)."""
-
     def __init__(self, role: str) -> None:
         self.role = role
         self.closed = False
@@ -145,8 +134,6 @@ class FakeSession:
 
 
 class RecordingConnect:
-    """Fake ``ssh_client.connect``-style callable injected into ServerActions."""
-
     def __init__(self, fail_role: str | None = None) -> None:
         self.fail_role = fail_role
         self.calls: list[dict[str, object]] = []
@@ -170,7 +157,7 @@ def _unexpected_probe(host: str, port: int):
 
 
 class FakeGenerationService:
-    """Duck-typed core ``GenerationService``: preview/generate only."""
+    """Duck-typed core service: preview / create_client / generate."""
 
     def __init__(self) -> None:
         self.preview_result: PreviewResult | None = None
@@ -184,14 +171,37 @@ class FakeGenerationService:
         self.preview_sessions: dict[str, FakeSession] | None = None
         self.generate_sessions: dict[str, FakeSession] | None = None
         self.generate_calls: list[dict[str, object]] = []
+        self.create_result: ClientCreationResult | None = None
+        self.create_error: HaUiError | None = None
+        self.create_gate = None
+        self.create_calls: list[dict[str, object]] = []
+        self.create_sessions: list[dict[str, FakeSession]] = []
 
-    def preview(self, sessions):
+    def preview(self, sessions, *, pending_names=()):
         self.preview_calls += 1
         self.preview_sessions = dict(sessions)
+        self.preview_pending = tuple(pending_names)
         if self.preview_error is not None:
             raise self.preview_error
         assert self.preview_result is not None, "test forgot preview_result"
         return self.preview_result
+
+    def create_client(self, *, sessions, name, confirmed,
+                      allow_partial_repair=False, progress=None):
+        self.create_sessions.append(dict(sessions))
+        self.create_calls.append({
+            "name": name,
+            "confirmed": confirmed,
+            "allow_partial_repair": allow_partial_repair,
+        })
+        if self.create_gate is not None:
+            self.create_gate()
+        if self.create_error is not None:
+            error = self.create_error
+            self.create_error = None
+            raise error
+        assert self.create_result is not None, "test forgot create_result"
+        return self.create_result
 
     def generate(self, *, sessions, selected, policy, allow_cli,
                  run_id=None, progress=None, cancel=None,
@@ -221,12 +231,23 @@ class UiRecorder:
     def __init__(self) -> None:
         self.errors: list[HaUiError] = []
         self.infos: list[tuple[str, str]] = []
+        self.warnings: list[tuple[str, str]] = []
+        self.partial_confirms: list[tuple[str, str]] = []
+        self.partial_reply = False
 
     def install(self, window: MainWindow) -> None:
         window.show_error = self.errors.append  # type: ignore[method-assign]
         window.show_info = lambda title, text: self.infos.append(  # type: ignore[method-assign]
             (title, text))
+        window.show_warning = lambda title, text: self.warnings.append(  # type: ignore[method-assign]
+            (title, text))
         window.ask_host_key = lambda info, existing=None: None  # type: ignore[method-assign]
+
+        def confirm(name: str, role: str) -> bool:
+            self.partial_confirms.append((name, role))
+            return self.partial_reply
+
+        window.confirm_partial_creation = confirm  # type: ignore[method-assign]
 
 
 def _make_window(
@@ -319,6 +340,21 @@ def _fresh_preview() -> PreviewResult:
     return _preview(records_a, records_b, warnings=[])
 
 
+def _created(name: str = "alpha") -> ClientCreationResult:
+    return ClientCreationResult(name=name, sides={
+        "A": CreationSideResult("A", "created"),
+        "B": CreationSideResult("B", "created"),
+    })
+
+
+def _partial(name: str = "alpha") -> ClientCreationResult:
+    return ClientCreationResult(name=name, sides={
+        "A": CreationSideResult("A", "created"),
+        "B": CreationSideResult("B", "failed", errors.E_REMOTE_CREATE,
+                                "reload"),
+    })
+
+
 def _delivered(workspace: Path, client: str = "alpha",
                group: str = "A-first") -> DeliveredFile:
     filename = "%s-%s.yaml" % (client, group)
@@ -365,14 +401,13 @@ def _checked_names(table: QTableWidget) -> list[str]:
 def _load_preview(qtbot, window: MainWindow, fake: FakeGenerationService,
                   preview: PreviewResult) -> None:
     fake.preview_result = preview
-    window.client_panel.preview_button.click()
+    window.client_panel.refresh_button.click()
     qtbot.waitUntil(lambda: window.client_panel.preview_result is not None,
                     timeout=4000)
     qtbot.waitUntil(lambda: not window.client_panel.busy, timeout=4000)
 
 
 def _select_only(window: MainWindow, *names: str) -> None:
-    """Check exactly *names* (bypassing the button, still ready rows only)."""
     table = window.client_panel.table
     window.client_panel.clear_selection()
     for name in names:
@@ -380,10 +415,10 @@ def _select_only(window: MainWindow, *names: str) -> None:
 
 
 def _widget_texts(window: MainWindow) -> str:
-    """All rendered text of the window except the (masked) password QLineEdits."""
     chunks: list[str] = []
     for label in window.findChildren(QLabel):
         chunks.append(label.text())
+        chunks.append(label.toolTip())
     for log in window.findChildren(QPlainTextEdit):
         chunks.append(log.toPlainText())
     for table in window.findChildren(QTableWidget):
@@ -392,19 +427,21 @@ def _widget_texts(window: MainWindow) -> str:
                 item = table.item(row, column)
                 if item is not None:
                     chunks.append(item.text())
+                    chunks.append(item.toolTip())
     for combo in window.findChildren(QComboBox):
         chunks.append(combo.currentText())
         for index in range(combo.count()):
             chunks.append(combo.itemText(index))
     for button in window.findChildren(QPushButton):
         chunks.append(button.text())
+        chunks.append(button.toolTip())
     for box in window.findChildren(QCheckBox):
         chunks.append(box.text())
     return "\n".join(chunks)
 
 
 # --------------------------------------------------------------------------- #
-# 1. Preview: union rows, blocked rows, PIN validity, warnings
+# 1. Preview: compact status, blocked rows, certificate detail
 # --------------------------------------------------------------------------- #
 def test_preview_union_blocks_one_sided_and_incomplete_clients(
         qtbot, ui_workspace):
@@ -417,33 +454,39 @@ def test_preview_union_blocks_one_sided_and_incomplete_clients(
     assert [table.item(row, COL_NAME).text() for row in range(4)] == [
         "alpha", "beta", "delta", "gamma"]
 
-    # beta exists on A only -> visibly blocked, reason visible, not checkable.
     beta = _row_index(table, "beta")
-    assert table.item(beta, COL_A).text() == "是"
-    assert table.item(beta, COL_B).text() == "否"
-    assert "不可生成" in table.item(beta, COL_DIAGNOSIS).text()
-    assert "仅 A 端存在" in table.item(beta, COL_DIAGNOSIS).text()
+    assert table.item(beta, COL_A).text() == "正常"
+    assert table.item(beta, COL_B).text() == "缺失"
+    assert table.item(beta, COL_STATUS).text() == "缺少 B 端"
     assert _is_checkable(table, "beta") is False
+    assert table.cellWidget(beta, COL_DETAIL).text() == "查看原因"
 
-    # gamma is complete on both sides but lacks the HY2 credential on A.
     gamma = _row_index(table, "gamma")
-    assert "HY2" in table.item(gamma, COL_DIAGNOSIS).text()
+    assert table.item(gamma, COL_A).text() == "异常"
+    assert table.item(gamma, COL_STATUS).text() == "配置异常"
+    assert "HY2" in table.item(gamma, COL_STATUS).toolTip()
     assert _is_checkable(table, "gamma") is False
 
-    # alpha is complete on both sides and export-fresh on both sides.
-    assert table.item(_row_index(table, "alpha"), COL_REALITY).text() == (
-        "A ✓ / B ✓")
+    alpha = _row_index(table, "alpha")
+    assert table.item(alpha, COL_A).text() == "正常"
+    assert table.item(alpha, COL_B).text() == "正常"
+    assert table.item(alpha, COL_STATUS).text() == "可生成"
     assert _is_checkable(table, "alpha") is True
-    assert table.item(_row_index(table, "alpha"), COL_DIAGNOSIS).text() == "可生成"
+    assert table.cellWidget(alpha, COL_DETAIL) is None
 
-    # PIN validity summary shows not_after (never the fingerprint) + warning.
-    pin_text = panel.pin_label.text()
-    assert "A 端证书到期" in pin_text and "B 端证书到期" in pin_text
-    assert PIN_NOT_AFTER.strftime("%Y-%m-%d") in pin_text
-    assert "SHA256:" not in pin_text
-    assert PIN_WARNING in panel.warning_label.text()
+    delta = _row_index(table, "delta")
+    assert table.item(delta, COL_STATUS).text() == "待生成"
+    assert _is_checkable(table, "delta") is True
 
-    # Both pinned sessions were opened with the vault password and closed again.
+    # Certificate warning is compact; full dates only in the details dialog.
+    assert "证书提醒" in panel.cert_label.text()
+    assert panel.cert_detail_button.isVisible() is True
+    assert "UTC" not in panel.cert_label.text()
+    assert "SHA256:" not in panel.cert_label.text()
+    assert "客户端 4 个" in panel.client_count_label.text()
+    assert "A：已连接" in panel.server_a_label.text()
+    assert "B：已连接" in panel.server_b_label.text()
+
     assert [call["server_id"] for call in connect.calls] == ["A", "B"]
     assert connect.calls[0]["password"] == PASSWORD_A
     assert connect.calls[1]["password"] == PASSWORD_B
@@ -453,37 +496,54 @@ def test_preview_union_blocks_one_sided_and_incomplete_clients(
     assert all(session.closed for session in fake.preview_sessions.values())
     assert recorder.errors == []
 
+    # The details action is a safe fixed-token explanation, no raw output.
+    panel._show_reasons("gamma")
+    assert recorder.infos[-1][0] == "客户端「gamma」"
+    assert "HY2" in recorder.infos[-1][1]
+
+
+def test_certificate_normal_state_is_short_and_no_details_button(
+        qtbot, ui_workspace):
+    window, _recorder, fake, _connect, _folders = _make_window(
+        qtbot, ui_workspace)
+    _load_preview(qtbot, window, fake, _fresh_preview())
+    panel = window.client_panel
+    assert panel.cert_label.text() == "证书：A / B 正常"
+    assert panel.cert_detail_button.isVisible() is False
+
 
 def test_preview_uses_typed_session_password_before_vault(qtbot, ui_workspace):
     window, recorder, fake, connect, _folders = _make_window(qtbot, ui_workspace)
     window.panels["A"].password_edit.setText("typed-only-pw")
     _load_preview(qtbot, window, fake, _fresh_preview())
-
     assert connect.calls[0]["password"] == "typed-only-pw"
-    # B kept empty -> the Windows vault fallback is used for that role only.
     assert connect.calls[1]["password"] == PASSWORD_B
     assert recorder.errors == []
 
 
 # --------------------------------------------------------------------------- #
-# 2. Select-all excludes every blocked row
+# 2. Selection + navigation to the generate page
 # --------------------------------------------------------------------------- #
-def test_select_all_generatable_excludes_blocked_rows(qtbot, ui_workspace):
+def test_select_all_switches_to_generate_page_with_compact_selection(
+        qtbot, ui_workspace):
     window, recorder, fake, _connect, _folders = _make_window(qtbot, ui_workspace)
     _load_preview(qtbot, window, fake, _standard_preview())
     panel = window.client_panel
 
     panel.select_all_button.click()
-
     assert _checked_names(panel.table) == ["alpha", "delta"]
-    assert window.generate_panel.selection_label.text().startswith("已选 2 个客户端")
-    assert "alpha → A-first" in window.generate_panel.selection_label.text()
+    assert panel.selection_label.text() == "已选 2 项"
+    assert panel.generate_yaml_button.isEnabled() is True
+
+    panel.generate_yaml_button.click()
+    assert window.tabs.currentIndex() == 2
+    label = window.generate_panel.selection_label.text()
+    assert label == "已选 2 项：alpha、delta"
+    assert "A-first" not in label  # long client→group strings moved out of top bar
+    assert window.generate_panel.consent_widget.isVisible() is True
     assert recorder.errors == []
 
 
-# --------------------------------------------------------------------------- #
-# 3. Group mapping is visible before generation and reaches the service
-# --------------------------------------------------------------------------- #
 def test_group_mapping_is_visible_and_passed_to_generation(qtbot, ui_workspace):
     window, recorder, fake, _connect, _folders = _make_window(qtbot, ui_workspace)
     _load_preview(qtbot, window, fake, _standard_preview())
@@ -492,19 +552,14 @@ def test_group_mapping_is_visible_and_passed_to_generation(qtbot, ui_workspace):
     alpha_row = _row_index(panel.table, "alpha")
     combo = panel.table.cellWidget(alpha_row, COL_GROUP)
     assert isinstance(combo, QComboBox)
-    assert combo.currentData() == "A-first"  # default
-
+    assert combo.currentData() == "A-first"
     combo.setCurrentIndex(combo.findData("B-first"))
 
-    label = window.generate_panel.selection_label.text()
-    assert "alpha → B-first" in label
-    assert "delta → A-first" in label
-
+    # delta's export is stale on A, so the explicit CLI consent is required.
+    window.generate_panel.consent_checkbox.setChecked(True)
     fake.generate_result = _success_result(
         ui_workspace, [_delivered(ui_workspace, "alpha", "B-first"),
                        _delivered(ui_workspace, "delta", "A-first")])
-    # delta's export is stale on A, so the explicit CLI consent is required.
-    window.generate_panel.consent_checkbox.setChecked(True)
     window.generate_panel.generate_button.click()
 
     qtbot.waitUntil(lambda: bool(fake.generate_calls), timeout=4000)
@@ -512,7 +567,7 @@ def test_group_mapping_is_visible_and_passed_to_generation(qtbot, ui_workspace):
     call = fake.generate_calls[0]
     assert [(item.name, item.group) for item in call["selected"]] == [
         ("alpha", "B-first"), ("delta", "A-first")]
-    assert call["policy"] == ProbePolicy(5, 5000)  # default policy
+    assert call["policy"] == ProbePolicy(5, 5000)
     assert call["allow_cli"] is True
     assert call["cleanup_failed"] is False
     assert fake.generate_sessions is not None
@@ -521,12 +576,12 @@ def test_group_mapping_is_visible_and_passed_to_generation(qtbot, ui_workspace):
 
 
 # --------------------------------------------------------------------------- #
-# 4. Pre-connect identity gates: no SSH call on missing config/hostkey/password
+# 3. Pre-connect identity gates
 # --------------------------------------------------------------------------- #
 def test_missing_fingerprint_blocks_before_any_connect(qtbot, ui_workspace):
     window, recorder, fake, connect, _folders = _make_window(
         qtbot, ui_workspace, fingerprint_b=None)
-    window.client_panel.preview_button.click()
+    window.client_panel.refresh_button.click()
 
     qtbot.waitUntil(lambda: bool(recorder.errors), timeout=4000)
     qtbot.waitUntil(lambda: not window.client_panel.busy, timeout=4000)
@@ -540,14 +595,14 @@ def test_missing_password_and_missing_config_block_before_connect(
         qtbot, ui_workspace):
     window, recorder, _fake, connect, _folders = _make_window(
         qtbot, ui_workspace, vault_passwords=False)
-    window.client_panel.preview_button.click()
+    window.client_panel.refresh_button.click()
     qtbot.waitUntil(lambda: bool(recorder.errors), timeout=4000)
     assert recorder.errors[0].code == errors.E_CREDENTIAL_MISSING
     assert connect.calls == []
 
     window2, recorder2, _fake2, connect2, _folders2 = _make_window(
         qtbot, ui_workspace, host_a="")
-    window2.client_panel.preview_button.click()
+    window2.client_panel.refresh_button.click()
     qtbot.waitUntil(lambda: bool(recorder2.errors), timeout=4000)
     assert recorder2.errors[0].code == errors.E_CONFIG
     assert connect2.calls == []
@@ -557,7 +612,7 @@ def test_failed_second_connect_closes_the_first_session(qtbot, ui_workspace):
     connect = RecordingConnect(fail_role="B")
     window, recorder, _fake, _connect, _folders = _make_window(
         qtbot, ui_workspace, connect=connect)
-    window.client_panel.preview_button.click()
+    window.client_panel.refresh_button.click()
 
     qtbot.waitUntil(lambda: bool(recorder.errors), timeout=4000)
     assert recorder.errors[0].code == errors.E_SSH_CONNECT
@@ -567,17 +622,19 @@ def test_failed_second_connect_closes_the_first_session(qtbot, ui_workspace):
 
 
 # --------------------------------------------------------------------------- #
-# 5. Consent: required for a stale derived export, not for fresh exports
+# 4. Consent only when needed
 # --------------------------------------------------------------------------- #
-def test_consent_required_for_stale_export_and_granted_by_checkbox(
+def test_consent_is_shown_and_required_for_a_stale_export(
         qtbot, ui_workspace):
     window, recorder, fake, _connect, _folders = _make_window(qtbot, ui_workspace)
     _load_preview(qtbot, window, fake, _standard_preview())
     panel = window.client_panel
     generate = window.generate_panel
-    panel.select_all_button.click()  # alpha + delta (delta is stale on A)
+    panel.select_all_button.click()
+    panel.generate_yaml_button.click()
 
-    assert "必须勾选" in generate.consent_hint_label.text()
+    assert generate.consent_widget.isVisible() is True
+    assert "缺少最新导出" in generate.consent_hint_label.text()
     generate.generate_button.click()
     qtbot.waitUntil(lambda: bool(recorder.errors), timeout=4000)
     assert recorder.errors[0].code == errors.E_USAGE
@@ -596,31 +653,31 @@ def test_consent_required_for_stale_export_and_granted_by_checkbox(
     qtbot.waitUntil(lambda: bool(fake.generate_calls), timeout=4000)
     qtbot.waitUntil(lambda: not generate.busy, timeout=4000)
     assert fake.generate_calls[0]["allow_cli"] is True
-    assert len(recorder.errors) == 1  # only the initial consent block
+    assert len(recorder.errors) == 1
 
 
-def test_consent_not_required_when_exports_are_fresh(qtbot, ui_workspace):
+def test_consent_widget_is_hidden_when_exports_are_fresh(qtbot, ui_workspace):
     window, recorder, fake, _connect, _folders = _make_window(qtbot, ui_workspace)
     _load_preview(qtbot, window, fake, _fresh_preview())
     panel = window.client_panel
     panel.select_all_button.click()
-    assert "无需勾选同意" in window.generate_panel.consent_hint_label.text()
+    panel.generate_yaml_button.click()
+    generate = window.generate_panel
+    assert generate.consent_widget.isVisible() is False
 
     fake.generate_result = _success_result(
         ui_workspace, [_delivered(ui_workspace, "alpha")])
-    window.generate_panel.consent_checkbox.setChecked(False)
-    window.generate_panel.generate_button.click()
-
+    generate.generate_button.click()
     qtbot.waitUntil(lambda: bool(fake.generate_calls), timeout=4000)
-    qtbot.waitUntil(lambda: not window.generate_panel.busy, timeout=4000)
+    qtbot.waitUntil(lambda: not generate.busy, timeout=4000)
     assert fake.generate_calls[0]["allow_cli"] is False
     assert recorder.errors == []
 
 
 # --------------------------------------------------------------------------- #
-# 6. Successful generation: files + SHA + open-folder
+# 5. Successful generation: compact result + open folder
 # --------------------------------------------------------------------------- #
-def test_successful_generation_populates_files_sha_and_open_folder(
+def test_successful_generation_shows_count_and_open_folder(
         qtbot, ui_workspace):
     opened: list[str] = []
     window, recorder, fake, _connect, _folders = _make_window(
@@ -631,6 +688,7 @@ def test_successful_generation_populates_files_sha_and_open_folder(
     fake.generate_result = _success_result(ui_workspace, [delivered])
 
     generate = window.generate_panel
+    window.client_panel.generate_yaml_button.click()
     generate.generate_button.click()
     qtbot.waitUntil(lambda: generate.results_table.rowCount() == 1,
                     timeout=4000)
@@ -638,17 +696,14 @@ def test_successful_generation_populates_files_sha_and_open_folder(
 
     table = generate.results_table
     assert table.item(0, 0).text() == "alpha"
-    assert table.item(0, COL_FILE).text() == "alpha-A-first.yaml"
-    sha_item = table.item(0, COL_SHA)
-    assert sha_item.text() == "c" * 64
-    fixed_family = QFontDatabase.systemFont(
-        QFontDatabase.SystemFont.FixedFont).family()
-    assert sha_item.font().family() == fixed_family  # monospace SHA column
-    folder_button = table.cellWidget(0, COL_FOLDER)
+    assert table.item(0, 1).text() == "alpha-A-first.yaml"
+    assert "SHA-256" in table.item(0, 1).toolTip()
+    folder_button = table.cellWidget(0, 2)
     assert isinstance(folder_button, QPushButton)
     assert folder_button.text() == "打开目录"
 
-    assert "1 个文件" in generate.output_note.text()
+    assert generate.success_label.text() == "已生成 1 个文件"
+    assert generate.open_output_button.text() == "打开文件夹"
     assert generate.open_output_button.isEnabled() is True
     generate.open_output_button.click()
     expected_folder = str(Path(delivered.path).parent)
@@ -659,7 +714,7 @@ def test_successful_generation_populates_files_sha_and_open_folder(
 
 
 # --------------------------------------------------------------------------- #
-# 7. Stage failure: E_ code shown, previous output kept, new run id on retry
+# 6. Failure: safe code, previous output kept, advanced log opened
 # --------------------------------------------------------------------------- #
 def test_stage_failure_shows_code_and_keeps_previous_output(
         qtbot, ui_workspace):
@@ -669,11 +724,12 @@ def test_stage_failure_shows_code_and_keeps_previous_output(
     generate = window.generate_panel
     fake.generate_result = _success_result(
         ui_workspace, [_delivered(ui_workspace)])
+    window.client_panel.generate_yaml_button.click()
     generate.generate_button.click()
     qtbot.waitUntil(lambda: generate.results_table.rowCount() == 1,
                     timeout=4000)
     qtbot.waitUntil(lambda: not generate.busy, timeout=4000)
-    previous_note = generate.output_note.text()
+    previous_success = generate.success_label.text()
 
     fake.generate_error = HaUiError(errors.E_CHAIN_STAGE,
                                     detail="ha03:E_PIN_EXPIRED")
@@ -683,42 +739,19 @@ def test_stage_failure_shows_code_and_keeps_previous_output(
         timeout=4000)
     qtbot.waitUntil(lambda: not generate.busy, timeout=4000)
 
+    assert generate.failure_label.isVisible() is True
     assert "E_CHAIN_STAGE" in generate.failure_label.text()
     assert recorder.errors[-1].code == errors.E_CHAIN_STAGE
-    # The previous successful output note and delivered-file row are kept.
     assert generate.results_table.rowCount() == 1
-    assert generate.output_note.text() == previous_note
-    # Retry was a new attempt with a fresh run id.
+    assert generate.success_label.text() == previous_success
+    assert generate.advanced_widget.isVisible() is True
     assert len(fake.generate_calls) == 2
     assert fake.generate_calls[0]["run_id"] != fake.generate_calls[1]["run_id"]
-    assert generate.delete_failed_button.isEnabled() is False  # no run dir left
-
-
-def test_untrusted_installer_disables_generation_with_explicit_diagnostic(
-        qtbot, ui_workspace):
-    window, recorder, fake, _connect, _folders = _make_window(
-        qtbot, ui_workspace)
-    _load_preview(qtbot, window, fake, _standard_preview())
-    window.client_panel.select_all_button.click()
-    generate = window.generate_panel
-    generate.consent_checkbox.setChecked(True)
-    fake.generate_error = HaUiError(errors.E_INSTALLER_UNTRUSTED,
-                                    detail="installer-hash")
-    generate.generate_button.click()
-    qtbot.waitUntil(
-        lambda: errors.E_INSTALLER_UNTRUSTED in generate.failure_label.text(),
-        timeout=4000)
-    qtbot.waitUntil(lambda: not generate.busy, timeout=4000)
-    assert recorder.errors[-1].code == errors.E_INSTALLER_UNTRUSTED
-    message = recorder.errors[-1].message
-    assert "自动菜单生成已禁用" in message
-    assert "已有规范导出仍可读取" in message
-    # No fabricated success row was added.
-    assert generate.results_table.rowCount() == 0
+    assert generate.delete_failed_button.isEnabled() is False
 
 
 # --------------------------------------------------------------------------- #
-# 8. Cancel sets the cancel event and surfaces E_CANCELLED
+# 7. Cancel
 # --------------------------------------------------------------------------- #
 def test_cancel_sets_event_and_surfaces_e_cancelled(qtbot, ui_workspace):
     window, recorder, fake, _connect, _folders = _make_window(qtbot, ui_workspace)
@@ -737,10 +770,11 @@ def test_cancel_sets_event_and_surfaces_e_cancelled(qtbot, ui_workspace):
 
     fake.generate_gate = gate
     generate = window.generate_panel
+    window.client_panel.generate_yaml_button.click()
     generate.generate_button.click()
     qtbot.waitUntil(entered.is_set, timeout=4000)
+    generate.advanced_toggle.setChecked(True)
     assert generate.cancel_button.isEnabled() is True
-
     generate.cancel_button.click()
 
     qtbot.waitUntil(
@@ -751,7 +785,7 @@ def test_cancel_sets_event_and_surfaces_e_cancelled(qtbot, ui_workspace):
 
 
 # --------------------------------------------------------------------------- #
-# 9. No password/YAML sentinel can reach any rendered widget text
+# 8. No secrets in any rendered text
 # --------------------------------------------------------------------------- #
 def test_no_password_or_yaml_sentinel_in_rendered_widgets(qtbot, ui_workspace):
     window, recorder, fake, _connect, _folders = _make_window(qtbot, ui_workspace)
@@ -761,6 +795,7 @@ def test_no_password_or_yaml_sentinel_in_rendered_widgets(qtbot, ui_workspace):
     window.client_panel.select_all_button.click()
     fake.generate_result = _success_result(
         ui_workspace, [_delivered(ui_workspace)])
+    window.client_panel.generate_yaml_button.click()
     window.generate_panel.generate_button.click()
     qtbot.waitUntil(
         lambda: window.generate_panel.results_table.rowCount() == 1,
@@ -776,7 +811,7 @@ def test_no_password_or_yaml_sentinel_in_rendered_widgets(qtbot, ui_workspace):
 
 
 # --------------------------------------------------------------------------- #
-# 10. Late generation result after window close is ignored
+# 9. Late generation result after window close is ignored
 # --------------------------------------------------------------------------- #
 def test_generation_result_after_window_close_is_ignored(qtbot, ui_workspace):
     window, recorder, fake, _connect, _folders = _make_window(qtbot, ui_workspace)
@@ -792,6 +827,7 @@ def test_generation_result_after_window_close_is_ignored(qtbot, ui_workspace):
     fake.generate_gate = gate
     fake.generate_result = _success_result(
         ui_workspace, [_delivered(ui_workspace)])
+    window.client_panel.generate_yaml_button.click()
     window.generate_panel.generate_button.click()
     qtbot.waitUntil(entered.is_set, timeout=4000)
     window.close()
@@ -801,7 +837,293 @@ def test_generation_result_after_window_close_is_ignored(qtbot, ui_workspace):
 
 
 # --------------------------------------------------------------------------- #
-# 11. --self-test still exits 0 with no network/vault
+# 10. Client creation dialog and flow
+# --------------------------------------------------------------------------- #
+def test_create_dialog_requires_valid_name_and_explicit_write_consent(qtbot):
+    dialog = ClientCreateDialog()
+    qtbot.addWidget(dialog)
+    assert dialog.ok_button.isEnabled() is False
+
+    dialog.name_edit.setText("bad name")
+    assert "只允许" in dialog.error_label.text()
+    assert dialog.ok_button.isEnabled() is False
+
+    dialog.name_edit.setText("legacy")
+    assert "保留" in dialog.error_label.text()
+    assert dialog.ok_button.isEnabled() is False
+
+    dialog.name_edit.setText("event-vmix01")
+    assert dialog.error_label.text() == ""
+    assert dialog.ok_button.isEnabled() is False
+    dialog.confirm_checkbox.setChecked(True)
+    assert dialog.ok_button.isEnabled() is True
+    assert dialog.client_name == "event-vmix01"
+    assert "reload" in dialog.findChild(QLabel, "createWarning").text()
+
+
+def test_create_success_refreshes_selects_and_guides_to_generate(
+        qtbot, ui_workspace, monkeypatch):
+    window, recorder, fake, connect, _folders = _make_window(qtbot, ui_workspace)
+    fake.preview_result = _fresh_preview()
+    fake.create_result = _created("alpha")
+    monkeypatch.setattr(window.client_panel, "_ask_create_name",
+                        lambda: "alpha")
+
+    window.client_panel.create_button.click()
+    qtbot.waitUntil(lambda: bool(fake.create_calls), timeout=4000)
+    qtbot.waitUntil(lambda: not window.client_panel.busy, timeout=4000)
+    qtbot.waitUntil(lambda: window.tabs.currentIndex() == 2, timeout=4000)
+
+    call = fake.create_calls[0]
+    assert call["name"] == "alpha"
+    assert call["confirmed"] is True
+    assert call["allow_partial_repair"] is False
+    assert fake.create_sessions and all(
+        session.closed for session in fake.create_sessions[0].values())
+    # One pair for the create operation and one pair for the automatic refresh.
+    assert [c["server_id"] for c in connect.calls] == ["A", "B", "A", "B"]
+    assert all(session.closed for session in connect.sessions)
+    assert recorder.errors == []
+    assert recorder.infos[-1][0] == "客户端「alpha」已创建"
+    assert "A 端：已创建" in recorder.infos[-1][1]
+    assert _checked_names(window.client_panel.table) == ["alpha"]
+    assert window.client_panel.creation_result_label.isVisible() is False
+
+
+def test_create_partial_result_is_visible_and_never_claims_completion(
+        qtbot, ui_workspace, monkeypatch):
+    window, recorder, fake, _connect, _folders = _make_window(qtbot, ui_workspace)
+    fake.preview_result = _fresh_preview()
+    fake.create_result = _partial("alpha")
+    monkeypatch.setattr(window.client_panel, "_ask_create_name",
+                        lambda: "alpha")
+
+    window.client_panel.create_button.click()
+    qtbot.waitUntil(lambda: bool(fake.create_calls), timeout=4000)
+    qtbot.waitUntil(lambda: not window.client_panel.busy, timeout=4000)
+    qtbot.waitUntil(lambda: bool(recorder.warnings), timeout=4000)
+
+    title, text = recorder.warnings[-1]
+    assert "未全部完成" in title
+    assert "A 端：已创建" in text
+    assert "B 端：失败" in text
+    assert "不会自动删除" in text
+    # Partial success must not switch the operator to the generation page.
+    assert window.tabs.currentIndex() == 1
+    assert recorder.errors == []
+    banner = window.client_panel.creation_result_label
+    assert banner.isVisible() is True
+    assert "A 端：已创建" in banner.text()
+    assert "B 端：失败" in banner.text()
+    assert "未全部完成" in banner.text()
+
+
+def test_one_sided_existing_client_requires_second_confirmation_to_repair(
+        qtbot, ui_workspace, monkeypatch):
+    window, recorder, fake, _connect, _folders = _make_window(qtbot, ui_workspace)
+    fake.preview_result = _fresh_preview()
+    fake.create_error = HaUiError(errors.E_CLIENT_PARTIAL_EXISTS, detail="A")
+    fake.create_result = _created("alpha")
+    recorder.partial_reply = True
+    monkeypatch.setattr(window.client_panel, "_ask_create_name",
+                        lambda: "alpha")
+
+    window.client_panel.create_button.click()
+    qtbot.waitUntil(lambda: len(fake.create_calls) == 2, timeout=4000)
+    qtbot.waitUntil(lambda: not window.client_panel.busy, timeout=4000)
+
+    assert recorder.partial_confirms == [("alpha", "A")]
+    assert fake.create_calls[0]["allow_partial_repair"] is False
+    assert fake.create_calls[1]["allow_partial_repair"] is True
+    assert recorder.errors == []
+
+
+def test_create_refused_when_operator_declines_repair(
+        qtbot, ui_workspace, monkeypatch):
+    window, recorder, fake, _connect, _folders = _make_window(qtbot, ui_workspace)
+    fake.create_error = HaUiError(errors.E_CLIENT_PARTIAL_EXISTS, detail="B")
+    recorder.partial_reply = False
+    monkeypatch.setattr(window.client_panel, "_ask_create_name",
+                        lambda: "alpha")
+
+    window.client_panel.create_button.click()
+    qtbot.waitUntil(lambda: bool(recorder.partial_confirms), timeout=4000)
+    qtbot.waitUntil(lambda: not window.client_panel.busy, timeout=4000)
+    assert len(fake.create_calls) == 1
+    assert recorder.errors[-1].code == errors.E_CLIENT_PARTIAL_EXISTS
+    assert "创建失败" in window.client_panel.status_label.text()
+    assert "未修改任何客户端" in (
+        window.client_panel.creation_result_label.text())
+
+
+def test_password_snapshot_runs_on_the_gui_thread(qtbot, ui_workspace,
+                                                  monkeypatch):
+    window, _recorder, fake, _connect, _folders = _make_window(
+        qtbot, ui_workspace)
+    fake.preview_result = _fresh_preview()
+    fake.create_result = _created("alpha")
+    monkeypatch.setattr(window.client_panel, "_ask_create_name",
+                        lambda: "alpha")
+
+    original = window.password_overrides
+    seen: list[int] = []
+
+    def snapshot():
+        seen.append(threading.get_ident())
+        return original()
+
+    # The panel captured the bound method at construction; replace that seam.
+    window.client_panel._password_provider = snapshot
+
+    window.client_panel.create_button.click()
+    qtbot.waitUntil(lambda: bool(fake.create_calls), timeout=4000)
+    qtbot.waitUntil(lambda: not window.client_panel.busy, timeout=4000)
+
+    # Called for the create snapshot and again by the post-create refresh, but
+    # always on the GUI thread and never inside a worker.
+    assert seen
+    assert set(seen) == {threading.get_ident()}
+
+
+def test_password_provider_refuses_an_off_thread_read(qtbot, ui_workspace):
+    window, _recorder, _fake, _connect, _folders = _make_window(
+        qtbot, ui_workspace)
+    outcome: dict[str, str] = {}
+
+    def read() -> None:
+        try:
+            window.password_overrides()
+        except HaUiError as exc:
+            outcome["code"] = exc.code
+
+    worker = threading.Thread(target=read)
+    worker.start()
+    worker.join(5.0)
+    assert outcome.get("code") == errors.E_USAGE
+
+
+def test_uncertain_create_says_maybe_written_and_refreshes(
+        qtbot, ui_workspace, monkeypatch):
+    window, recorder, fake, connect, _folders = _make_window(
+        qtbot, ui_workspace)
+    fake.preview_result = _fresh_preview()
+    fake.create_error = HaUiError(errors.E_CREATE_UNCERTAIN, detail="timeout")
+    monkeypatch.setattr(window.client_panel, "_ask_create_name",
+                        lambda: "alpha")
+
+    window.client_panel.create_button.click()
+    qtbot.waitUntil(lambda: bool(recorder.errors), timeout=4000)
+    qtbot.waitUntil(lambda: not window.client_panel.busy, timeout=4000)
+    qtbot.waitUntil(lambda: len(connect.calls) == 4, timeout=4000)
+
+    label = window.client_panel.creation_result_label
+    assert label.isVisible() is True
+    assert "可能已写入" in label.text()
+    assert "不要重复创建同名客户端" in label.text()
+    # The old blanket "nothing was modified" claim must be gone for this case.
+    assert "未修改任何客户端" not in label.text()
+    # A second session pair was opened just to re-read the real state.
+    assert [call["server_id"] for call in connect.calls] == ["A", "B", "A", "B"]
+
+
+def test_unconfirmed_create_blocks_retry_and_shows_stale_on_refresh_failure(
+        qtbot, ui_workspace, monkeypatch):
+    window, recorder, fake, _connect, _folders = _make_window(
+        qtbot, ui_workspace)
+    fake.create_error = HaUiError(errors.E_CREATE_UNCERTAIN, detail="timeout")
+    fake.preview_error = HaUiError(errors.E_SSH_TIMEOUT)
+    monkeypatch.setattr(window.client_panel, "_ask_create_name",
+                        lambda: "alpha")
+
+    window.client_panel.create_button.click()
+    qtbot.waitUntil(lambda: bool(recorder.errors), timeout=4000)
+    qtbot.waitUntil(lambda: not window.client_panel.busy, timeout=4000)
+    qtbot.waitUntil(
+        lambda: "STALE" in window.client_panel.creation_result_label.text(),
+        timeout=4000)
+
+    assert "STALE" in window.client_panel.creation_result_label.text()
+    assert "不能据此判断服务器未被修改" in (
+        window.client_panel.creation_result_label.text())
+
+    # A blind retry of the same name is refused while the state is unconfirmed.
+    window.client_panel.create_button.click()
+    qtbot.waitUntil(lambda: bool(recorder.warnings), timeout=4000)
+    assert len(fake.create_calls) == 1
+    assert "未确认" in recorder.warnings[-1][0]
+
+
+def test_prewrite_refusal_still_says_nothing_was_modified(
+        qtbot, ui_workspace, monkeypatch):
+    window, recorder, fake, connect, _folders = _make_window(
+        qtbot, ui_workspace)
+    fake.create_error = HaUiError(errors.E_CLIENT_INCOMPLETE, detail="A")
+    monkeypatch.setattr(window.client_panel, "_ask_create_name",
+                        lambda: "alpha")
+
+    window.client_panel.create_button.click()
+    qtbot.waitUntil(lambda: bool(recorder.errors), timeout=4000)
+    qtbot.waitUntil(lambda: not window.client_panel.busy, timeout=4000)
+
+    label = window.client_panel.creation_result_label
+    assert "未修改任何客户端" in label.text()
+    assert "可能已写入" not in label.text()
+    # Only the create attempt touched SSH: a pre-write refusal needs no refresh.
+    assert [call["server_id"] for call in connect.calls] == ["A", "B"]
+
+
+def test_create_is_double_click_safe(qtbot, ui_workspace, monkeypatch):
+    window, recorder, fake, _connect, _folders = _make_window(qtbot, ui_workspace)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def gate():
+        entered.set()
+        release.wait(5.0)
+
+    fake.create_gate = gate
+    fake.create_result = _created("alpha")
+    fake.preview_result = _fresh_preview()
+    monkeypatch.setattr(window.client_panel, "_ask_create_name",
+                        lambda: "alpha")
+
+    window.client_panel.create_button.click()
+    qtbot.waitUntil(entered.is_set, timeout=4000)
+    window.client_panel.create_button.click()  # ignored while busy
+    release.set()
+    qtbot.waitUntil(lambda: not window.client_panel.busy, timeout=4000)
+    assert len(fake.create_calls) == 1
+    assert recorder.errors == []
+
+
+def test_create_blocks_before_connect_when_fingerprint_missing(
+        qtbot, ui_workspace, monkeypatch):
+    window, recorder, fake, connect, _folders = _make_window(
+        qtbot, ui_workspace, fingerprint_b=None)
+    monkeypatch.setattr(window.client_panel, "_ask_create_name",
+                        lambda: "alpha")
+    window.client_panel.create_button.click()
+    qtbot.waitUntil(lambda: bool(recorder.errors), timeout=4000)
+    qtbot.waitUntil(lambda: not window.client_panel.busy, timeout=4000)
+    assert recorder.errors[0].code == errors.E_HOSTKEY_MISSING
+    assert fake.create_calls == []
+    assert connect.calls == []
+
+
+def test_unconfirmed_creation_is_refused_before_any_ssh_session(
+        qtbot, ui_workspace):
+    window, _recorder, fake, connect, _folders = _make_window(
+        qtbot, ui_workspace)
+    with pytest.raises(HaUiError) as excinfo:
+        window._session_service.create_client(name="alpha", confirmed=False)
+    assert excinfo.value.code == errors.E_USAGE
+    assert excinfo.value.detail == "create-consent"
+    assert connect.calls == []
+    assert fake.create_calls == []
+
+
+# --------------------------------------------------------------------------- #
+# 11. Self-test / policy defaults
 # --------------------------------------------------------------------------- #
 def test_app_self_test_exits_zero(qtbot, ui_workspace, capsys):
     from ha_ui import app as app_module
@@ -812,8 +1134,6 @@ def test_app_self_test_exits_zero(qtbot, ui_workspace, capsys):
     assert captured.err == ""
 
 
-# Default probe policy comes from the shared model; the previous default remains
-# an explicit operator choice (not a silently changed historical artifact).
 def test_probe_policy_default_and_legacy_option(qtbot, ui_workspace):
     window, recorder, _fake, _connect, _folders = _make_window(
         qtbot, ui_workspace)
@@ -821,8 +1141,6 @@ def test_probe_policy_default_and_legacy_option(qtbot, ui_workspace):
     assert ProbePolicy() == ProbePolicy(5, 5000)
     assert combo.currentData() == ProbePolicy()
     assert combo.itemText(combo.currentIndex()).startswith("5s / 5000ms")
-    # Qt's findData cannot reliably compare the frozen dataclass payload, so
-    # exercise the operator-visible labels and the selected payload instead.
     expected = (
         ("5s / 2000ms", ProbePolicy(5, 2000)),
         ("3s / 1000ms", ProbePolicy(3, 1000)),
@@ -833,8 +1151,85 @@ def test_probe_policy_default_and_legacy_option(qtbot, ui_workspace):
         assert index >= 0, text
         combo.setCurrentIndex(index)
         assert combo.currentData() == policy
-    # Restore the default and verify the previous default is still selectable
-    # without changing the product behavior.
     combo.setCurrentIndex(combo.findText("5s / 5000ms（默认）"))
     assert combo.currentData() == ProbePolicy(5, 5000)
     assert recorder.errors == []
+
+
+@pytest.mark.parametrize("size", [(1120, 780), (1366, 768)])
+def test_common_window_sizes_keep_the_primary_actions_visible(
+        qtbot, ui_workspace, size):
+    window, _recorder, fake, _connect, _folders = _make_window(
+        qtbot, ui_workspace)
+    _load_preview(qtbot, window, fake, _standard_preview())
+    window.resize(*size)
+    qtbot.wait(50)
+    panel = window.client_panel
+    assert panel.create_button.isVisible() is True
+    assert panel.generate_yaml_button.isVisible() is True
+    assert panel.table.isVisible() is True
+    assert panel.table.width() > 600
+    assert panel.create_button.width() > 0
+
+
+# --------------------------------------------------------------------------- #
+# Pending release gate (Stage C): a snapshot alone never clears UNCERTAIN
+# --------------------------------------------------------------------------- #
+def test_preview_running_transaction_keeps_the_name_blocked(
+        qtbot, ui_workspace, monkeypatch):
+    window, recorder, fake, _connect, _folders = _make_window(
+        qtbot, ui_workspace)
+    fake.create_error = HaUiError(errors.E_CREATE_UNCERTAIN, detail="running")
+    fake.preview_result = _fresh_preview()
+    fake.preview_result.pending = {"alpha": "running"}
+    monkeypatch.setattr(window.client_panel, "_ask_create_name",
+                        lambda: "alpha")
+
+    window.client_panel.create_button.click()
+    qtbot.waitUntil(lambda: bool(recorder.errors), timeout=4000)
+    qtbot.waitUntil(lambda: not window.client_panel.busy, timeout=4000)
+    qtbot.waitUntil(lambda: fake.preview_calls >= 1, timeout=4000)
+
+    assert "alpha" in window.client_panel._unconfirmed
+    assert "仍有未确认" in window.client_panel.status_label.text()
+
+
+def test_preview_terminal_transaction_releases_the_name(qtbot, ui_workspace,
+                                                        monkeypatch):
+    window, recorder, fake, _connect, _folders = _make_window(
+        qtbot, ui_workspace)
+    fake.create_error = HaUiError(errors.E_CREATE_UNCERTAIN, detail="running")
+    fake.preview_result = _fresh_preview()
+    fake.preview_result.pending = {"alpha": "running"}
+    monkeypatch.setattr(window.client_panel, "_ask_create_name",
+                        lambda: "alpha")
+
+    window.client_panel.create_button.click()
+    qtbot.waitUntil(lambda: not window.client_panel.busy, timeout=4000)
+    assert "alpha" in window.client_panel._unconfirmed
+
+    fake.preview_result.pending = {"alpha": "terminal-safe"}
+    window.client_panel.refresh_button.click()
+    qtbot.waitUntil(lambda: "alpha" not in window.client_panel._unconfirmed,
+                    timeout=4000)
+    assert "alpha" not in window.client_panel._unconfirmed
+
+
+def test_preview_failure_never_releases_a_pending_name(qtbot, ui_workspace,
+                                                       monkeypatch):
+    window, recorder, fake, _connect, _folders = _make_window(
+        qtbot, ui_workspace)
+    fake.create_error = HaUiError(errors.E_CREATE_UNCERTAIN, detail="running")
+    fake.preview_result = _fresh_preview()
+    fake.preview_result.pending = {"alpha": "running"}
+    monkeypatch.setattr(window.client_panel, "_ask_create_name",
+                        lambda: "alpha")
+
+    window.client_panel.create_button.click()
+    qtbot.waitUntil(lambda: not window.client_panel.busy, timeout=4000)
+    assert "alpha" in window.client_panel._unconfirmed
+
+    fake.preview_error = HaUiError(errors.E_SSH_TIMEOUT)
+    window.client_panel.refresh_button.click()
+    qtbot.waitUntil(lambda: not window.client_panel.busy, timeout=4000)
+    assert "alpha" in window.client_panel._unconfirmed

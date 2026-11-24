@@ -26,7 +26,7 @@ from ha_ui.core.errors import HaUiError
 from ha_ui.core.models import HostKeyInfo, ServerConfig
 from ha_ui.core.secrets_store import InMemoryCredentialStore
 from ha_ui.ui.dialogs import HostKeyDialog
-from ha_ui.ui.main_window import SAFETY_BANNER_TEXT, MainWindow
+from ha_ui.ui.main_window import HEADER_TITLE, HELP_TEXT, MainWindow
 from ha_ui.ui.services import (
     PREFLIGHT_COMMAND,
     ServerActions,
@@ -168,10 +168,12 @@ def _fill_server(panel, *, host: str = "203.0.113.10", alias: str = "HK A",
 # --------------------------------------------------------------------------- #
 # Construction / layout / password widget
 # --------------------------------------------------------------------------- #
-def test_window_constructs_with_banner_and_real_tabs(qtbot, ui_workspace):
+def test_window_constructs_with_clear_pages_and_default_client_view(
+        qtbot, ui_workspace):
     window, recorder, _store = _make_window(qtbot, ui_workspace)
 
     assert APP_NAME in window.windowTitle()
+    assert APP_VERSION == "0.2.0"
     assert APP_VERSION in window.windowTitle()
     assert set(window.panels) == {"A", "B"}
     for server_id, panel in window.panels.items():
@@ -183,27 +185,34 @@ def test_window_constructs_with_banner_and_real_tabs(qtbot, ui_workspace):
         assert panel.delete_button.text() == "删除已保存密码"
         assert panel.remember_checkbox.text() == "记住密码（Windows 凭据管理器）"
 
+    # The 0.1.0 always-on banner was removed; help text is on demand.
     banners = [label for label in window.findChildren(QLabel)
                if label.objectName() == "safetyBanner"]
-    assert len(banners) == 1
-    assert banners[0].text() == SAFETY_BANNER_TEXT
-    assert "不会开启 TUN" in banners[0].text()
-    assert "不会导入 Clash" in banners[0].text()
-    assert "不会修改服务器 sing-box 配置" in banners[0].text()
+    assert banners == []
+    assert window.help_button.text() == "使用说明"
+    assert "两端写入不是原子事务" in HELP_TEXT
+    assert "不开启 TUN" in HELP_TEXT
 
-    # PR-B replaced the two "下一阶段 PR" placeholders with the real tabs.
+    titles = [label.text() for label in window.findChildren(QLabel)
+              if label.objectName() == "appTitle"]
+    assert titles == [HEADER_TITLE]
+
     assert window.tabs.count() == 3
-    assert window.tabs.tabText(0) == "服务器管理"
+    assert window.tabs.tabText(0) == "服务器"
+    assert window.tabs.tabText(1) == "客户端"
+    assert window.tabs.tabText(2) == "生成 YAML"
     assert window.tabs.isTabEnabled(0) is True
-    assert window.tabs.tabText(1) == "客户端管理"
     assert window.tabs.isTabEnabled(1) is True
-    assert window.tabs.tabText(2) == "生成"
     assert window.tabs.isTabEnabled(2) is True
+    # Daily flow starts on the client page.
+    assert window.tabs.currentIndex() == 1
     assert window.client_panel is not None
     assert window.generate_panel is not None
-    placeholders = [label for label in window.findChildren(QLabel)
-                    if label.text() == "下一阶段 PR"]
-    assert placeholders == []
+    assert window.client_panel.create_button.text() == "＋ 新建客户端"
+    assert window.client_panel.refresh_button.text() == "刷新客户端"
+    assert window.client_panel.generate_yaml_button.text() == "生成 YAML"
+    assert window.generate_panel.generate_button.text() == "生成 YAML"
+    assert window.generate_panel.advanced_widget.isVisible() is False
     assert recorder.errors == []
 
 
@@ -628,17 +637,33 @@ def test_preflight_command_is_fixed_text_and_parser_reports_facts():
         "test -f /root/sbox/sbconfig_server.json && echo config=present "
         "|| echo config=missing; "
         "command -v miaomiao >/dev/null 2>&1 && echo manager=present "
-        "|| echo manager=missing"
+        "|| echo manager=missing; "
+        "if [ -f /root/sbox/sbconfig_server.json ]; then "
+        "echo cfgsha=$(sha256sum /root/sbox/sbconfig_server.json "
+        "| awk '{print $1}'); "
+        "else echo cfgsha=none; fi"
     )
     assert PREFLIGHT_COMMAND == expected
-    assert "{" not in PREFLIGHT_COMMAND
+    # Fixed text: the only brace pair is awk's own program, and nothing here is
+    # an interpolation slot for operator data.
+    assert PREFLIGHT_COMMAND.replace("{print $1}", "").count("{") == 0
     assert "%s" not in PREFLIGHT_COMMAND
+    assert "{0}" not in PREFLIGHT_COMMAND
 
     facts = parse_preflight_output(PREFLIGHT_OK_NO_MANAGER)
     assert facts.root is True
     assert facts.os_release == "Linux"
     assert facts.config_present is True
     assert facts.miaomiao_present is False
+    # The config identity is real data now, not a permanently-None placeholder.
+    assert facts.root_config_sha256 is None
+
+    hashed = parse_preflight_output(
+        PREFLIGHT_OK_NO_MANAGER + "cfgsha=" + "a" * 64 + "\n")
+    assert hashed.root_config_sha256 == "a" * 64
+    unproven = parse_preflight_output(
+        PREFLIGHT_OK_NO_MANAGER + "cfgsha=NOT-A-HASH\n")
+    assert unproven.root_config_sha256 is None
 
     non_root = parse_preflight_output("1000\nLinux\nconfig=missing\nmanager=present\n")
     assert non_root.root is False

@@ -62,6 +62,10 @@ SCRATCH_ROOT = WORKTREE / ".scratch" / "tests"
 
 # Synthetic but canonical metric: every status/derived read compares against it.
 DEFAULT_CONFIG_MTIME = 1_763_600_000
+# Identity of the scripted live config file. A successful add rewrites it; a
+# proven rollback restores the exact pre-write value, exactly like the real
+# ``restore_file_atomically`` path.
+DEFAULT_CONFIG_SHA = hashlib.sha256(b"scripted-config").hexdigest()
 
 # Synthetic two-VPS fixture (RFC 5737 documentation addresses).
 SERVER_A = "203.0.113.7"
@@ -388,6 +392,7 @@ class VpsFacts:
     api_present: bool = True
     management_active: bool = False
     config_mtime: int = DEFAULT_CONFIG_MTIME
+    config_sha: str = DEFAULT_CONFIG_SHA
     reality_inbounds: int = 1
     hy2_inbounds: int = 1
     preflight_rc: int = 0
@@ -427,7 +432,19 @@ class FakeSession:
                  menu_success: str = "all",
                  menu_fail: str | None = None,
                  menu_corrupt: str | None = None,
-                 menu_extra: str = "") -> None:
+                 menu_extra: str = "",
+                 add_side_effect: bool = True,
+                 add_fail: str | None = None,
+                 add_success_marker: bool = True,
+                 add_commit_marker: bool = True,
+                 add_no_process: bool = False,
+                 add_menu_rc: tuple[int, int, int] = (0, 0, 0),
+                 add_end_marker: bool = True,
+                 add_timeout: bool = False,
+                 add_timeout_write: bool = False,
+                 add_timeout_stage: str | None = None,
+                 add_duplicate: bool = False,
+                 add_raise_timeout: bool = False) -> None:
         self.role = role
         self.facts = facts or VpsFacts()
         self.clients = list(clients)
@@ -448,9 +465,30 @@ class FakeSession:
         self.menu_fail = menu_fail
         self.menu_corrupt = menu_corrupt
         self.menu_extra = menu_extra
+        self.add_side_effect = add_side_effect
+        self.add_fail = add_fail
+        self.add_success_marker = add_success_marker
+        self.add_commit_marker = add_commit_marker
+        self.add_no_process = add_no_process
+        self.add_menu_rc = add_menu_rc
+        self.add_end_marker = add_end_marker
+        self.add_timeout = add_timeout
+        self.add_timeout_write = add_timeout_write
+        self.add_timeout_stage = add_timeout_stage
+        self.add_duplicate = add_duplicate
+        self.add_raise_timeout = add_raise_timeout
         self.commands: list[str] = []
+        self.last_tx = None
+        self.pending_state: str | None = None
+        # Explicit same-name records for pending queries:
+        # [(terminal, running, rc, counts, phases), ...] newest first.
+        self.pending_records = None
+        self.pending_claim: str | None = None
         self.downloads: list[str] = []
         self.menu_invoked = False
+        self.create_invoked = False
+        self.created_credentials: dict[str, tuple[str, str]] = {}
+        self._created_counter = 0
         self.identity_calls = 0
         self.derived: dict[str, DerivedState] = {}
         self._mtime_epoch: dict[str, int] = {}
@@ -469,7 +507,12 @@ class FakeSession:
              max_output: int = 1024 * 1024) -> tuple[int, str, str]:
         del stdin_data, timeout, max_output
         self.commands.append(command)
+        if "HAUI_TX_RECORDS_BEGIN" in command:
+            return self._tx_pending(command)
         if "HAUI_MENU_END" in command or "ha-ui-installer" in command:
+            if re.search(r"(?:^|\n)2\n([A-Za-z0-9][A-Za-z0-9._-]*)\n0\n",
+                         command):
+                return self._add_menu(command)
             return self._menu(command)
         if "HAUI_STAT_END" in command:
             return self._identity(command)
@@ -521,6 +564,8 @@ class FakeSession:
             _presence("api", facts.api_present),
             _presence("curl", facts.curl_present),
             _presence("timeout", facts.timeout_present),
+            "cfgsha=%s" % (facts.config_sha if facts.config_present
+                           else "none"),
             "mtime=%d" % facts.config_mtime,
         ]
         for dep in remote.INSTALLER_HOST_DEPS:
@@ -543,6 +588,8 @@ class FakeSession:
         }
         lines = [
             "mtime=%d" % facts.config_mtime,
+            "cfgsha=%s" % (facts.config_sha if facts.config_present
+                           else "none"),
             json.dumps(document, separators=(",", ":"), ensure_ascii=True),
             "DERIVED",
         ]
@@ -661,6 +708,185 @@ class FakeSession:
             output += "\nHAUI_MENU_END"
         return 0, output + "\n", ""
 
+    def _tx_outcome(self) -> str:
+        """Derive the scripted transaction outcome from the legacy knobs."""
+        if self.add_raise_timeout:
+            return "transport"
+        if self.add_timeout_stage is not None or self.add_timeout:
+            return "running"
+        if self.add_fail is not None:
+            return "fail:" + self.add_fail
+        if self.add_duplicate:
+            return "created-duplicate"
+        if not self.add_commit_marker:
+            return "success-no-commit"
+        if not self.add_end_marker:
+            return "no-frame"
+        return "created"
+
+    def _add_menu(self, command: str) -> tuple[int, str, str]:
+        """Scripted managed transaction: the launch returns durable status."""
+        self.create_invoked = True
+        if self.menu_fail is not None:
+            return 0, "HAUI_MENU_FAIL=%s\n" % self.menu_fail, ""
+        match = re.search(r"10\n2\n([A-Za-z0-9][A-Za-z0-9._-]*)\n0\n", command)
+        assert match is not None
+        name = match.group(1)
+        outcome = self._tx_outcome()
+        if outcome == "transport":
+            raise HaUiError(errors.E_SSH_TIMEOUT, detail="channel")
+        before_sha = self.facts.config_sha
+        counts: dict[str, int] = {}
+        phases: list[str] = ["check", "backup"]
+        terminal, running, rc = True, False, 0
+        if outcome in ("created", "created-duplicate"):
+            self._created_counter += 1
+            self.created_credentials[name] = (
+                uuid_for(self.role, 100 + self._created_counter),
+                password_for(self.role, 100 + self._created_counter))
+            if self.add_side_effect:
+                self._scripted_replace(name)
+                if outcome == "created-duplicate":
+                    self.clients.append(ClientSpec(name))
+            phases += ["replace", "reload", "health"]
+            counts = {"COMMIT": 1, "SUCCESS": 1}
+        elif outcome == "success-no-commit":
+            self._scripted_replace(name)
+            phases += ["replace", "reload", "health"]
+            counts = {"SUCCESS": 1}
+        elif outcome == "no-frame":
+            self._scripted_replace(name)
+            phases += ["replace", "reload", "health"]
+        elif outcome == "running":
+            stage = self.add_timeout_stage
+            if self.add_timeout_write or stage in ("reload", "health", "rollback"):
+                self._scripted_replace(name)
+            if stage is None:
+                phases += ["replace", "reload"]
+            elif stage == "replace":
+                phases = ["check", "backup"]
+            elif stage == "reload":
+                phases += ["replace"]
+            elif stage == "health":
+                phases += ["replace", "reload"]
+            elif stage == "rollback":
+                phases += ["replace", "reload", "health", "rollback"]
+            else:
+                raise AssertionError("unknown stage %r" % stage)
+            terminal, running = False, True
+        else:
+            token = outcome.split(":", 1)[1]
+            phases += ["replace", "reload", "health"]
+            if token == "lock":
+                phases = ["check", "backup"]
+                counts = {"LOCK": 1}
+            elif token == "consistency":
+                phases = ["check", "backup"]
+                counts = {"CONSISTENCY": 1}
+            elif token == "exists":
+                phases = []
+                counts = {"EXISTS": 1}
+            elif token == "lock-after-write":
+                self._scripted_replace(name)
+                counts = {"LOCK": 1}
+            elif token == "rollback":
+                phases = ["check", "backup", "replace", "reload", "health",
+                          "rollback"]
+                counts = {"ROLLED_BACK": 1, "ROLLBACK_INTENT": 1}
+            elif token == "rolled-back-stale":
+                self._scripted_replace(name)
+                phases = ["check", "backup", "replace", "reload", "health",
+                          "rollback"]
+                counts = {"ROLLED_BACK": 1, "ROLLBACK_INTENT": 1}
+            elif token == "rollback-failed":
+                self._scripted_replace(name)
+                phases = ["check", "backup", "replace", "reload", "health",
+                          "rollback"]
+                counts = {"ROLLBACK_FAILED": 1, "ROLLBACK_INTENT": 1}
+            elif token == "rollback-unconfirmed":
+                self._scripted_replace(name)
+                self.facts.config_sha = before_sha
+                self.clients = [s for s in self.clients if s.name != name]
+                phases = ["check", "backup", "replace", "reload", "health",
+                          "rollback"]
+                counts = {"ROLLBACK_UNCONFIRMED": 1, "ROLLBACK_INTENT": 1}
+            else:
+                raise AssertionError("unknown add failure %r" % token)
+        self.last_tx = (name, terminal, running, counts, list(phases))
+        return 0, self._tx_block(name, terminal, running, rc, counts, phases), ""
+
+    def _tx_block(self, name: str, terminal: bool, running: bool, rc: int,
+                  counts: dict[str, int], phases: list[str],
+                  absent: bool = False) -> str:
+        txid = "%s-%s" % (name, "a" * 32)
+        lines = ["HAUI_TX_STARTED=1", "HAUI_TX_ABSENT=%d" % (1 if absent else 0),
+                 "HAUI_TX_PHASES_BEGIN"]
+        lines += ["%s\t1700000000\t/root/sbox/x.bak" % phase for phase in phases]
+        lines += ["HAUI_TX_PHASES_END", "HAUI_TX_RESULT_BEGIN"]
+        if terminal:
+            lines += ["rc=%d" % rc, "finished=1700000001"]
+        lines += ["HAUI_TX_RESULT_END", "HAUI_TX_NOTES=",
+                  "HAUI_TX_RUNNING=%d" % (1 if running else 0)]
+        for key in ("COMMIT", "SUCCESS", "ROLLED_BACK", "ROLLBACK_FAILED",
+                    "ROLLBACK_UNCONFIRMED", "ROLLBACK_INTENT", "EXISTS",
+                    "LOCK", "CONSISTENCY", "INCOMPLETE", "CREATE",
+                    "MISSING_CONFIG", "NAME_INVALID", "RESERVED"):
+            lines.append("HAUI_TX_%s=%d" % (key, counts.get(key, 0)))
+        lines.append("HAUI_TX_ID=%s" % txid)
+        return "\n".join(lines) + "\n"
+
+    def _tx_pending(self, command: str) -> tuple[int, str, str]:
+        match = re.search(r"name=([A-Za-z0-9][A-Za-z0-9._-]*)", command)
+        assert match is not None
+        name = match.group(1)
+        last = getattr(self, "last_tx", None)
+        records = self.pending_records
+        if records is None:
+            if self.pending_state == "absent" or last is None:
+                return 0, self._tx_records(name, []), ""
+            records = [(last[1], last[2], 0, last[3], last[4])]
+        lines = self._tx_records(name, records)
+        return 0, lines, ""
+
+    def _tx_records(self, name: str, records) -> str:
+        lines = ["HAUI_TX_RECORDS_BEGIN"]
+        for terminal, running, rc, counts, phases in records:
+            lines.append("HAUI_TX_RECORD_BEGIN")
+            block = self._tx_block(name, terminal, running, rc, counts, phases)
+            lines.extend(block.splitlines()[1:])  # drop the STARTED marker
+            lines.append("HAUI_TX_RECORD_END")
+        lines.append("HAUI_TX_RECORDS_END")
+        lines.append("HAUI_TX_RECORD_COUNT=%d" % len(records))
+        claim = getattr(self, "pending_claim", None)
+        if claim:
+            lines.append("HAUI_TX_CLAIM=1")
+            lines.append("HAUI_TX_CLAIM_TXID=%s" % claim)
+        else:
+            lines.append("HAUI_TX_CLAIM=0")
+        return "\n".join(lines) + "\n"
+
+    def _add_frame(self, lines: list[str]) -> tuple[int, str, str]:
+        output = "\n".join(lines)
+        output += "\nHAUI_MENU_RC=%d,%d,%d" % self.add_menu_rc
+        if self.add_end_marker:
+            output += "\nHAUI_MENU_END"
+        return 0, output + "\n", ""
+
+        return 0, output + "\n", ""
+
+    def _scripted_replace(self, name: str) -> None:
+        """Simulate one committed config replace (new bytes, new client)."""
+        if not any(spec.name == name for spec in self.clients):
+            self.clients.append(ClientSpec(name))
+        if self.add_duplicate:
+            # A duplicate name invalidates the whole inventory (structural
+            # ``duplicate-name``): the client is present but not exportable.
+            self.clients.append(ClientSpec(name))
+        self.facts.config_mtime += 1
+        self.facts.config_sha = hashlib.sha256(
+            ("config:%s:%d" % (name, self.facts.config_mtime)).encode()
+        ).hexdigest()
+
 
 # --------------------------------------------------------------------------- #
 # Provider fake for GenerationService.
@@ -694,17 +920,61 @@ class FakeProvider:
     exports: dict[str, bytes] = field(default_factory=dict)
     generated: dict[str, bytes] = field(default_factory=dict)
     pins_reply: dict[str, CertPin] | None = None
-    errors_by_method: dict[str, str] = field(default_factory=dict)
+    errors_by_method: dict[str, str | tuple[str, str]] = field(
+        default_factory=dict)
     calls: list[str] = field(default_factory=list)
     export_requests: list[list[str]] = field(default_factory=list)
     generate_requests: list[tuple[tuple[str, ...], bool]] = field(
         default_factory=list)
+    create_requests: list[tuple[str, bool]] = field(default_factory=list)
+    create_effect: bool = True
+    # name -> absent / terminal / running / unknown (pending_transaction fake)
+    pending_states: dict[str, str] = field(default_factory=dict)
+
+    def pending_transactions(self, name: str):
+        self._enter("pending_transactions")
+        state = self.pending_states.get(name, "absent")
+        if state == "unknown":
+            raise HaUiError(errors.E_REMOTE_LIST, detail="tx-status")
+        if state == "absent":
+            return remote.TxOverview(records=(), claim=None)
+        txid = "%s-%s" % (name, "a" * 32)
+        if state == "running":
+            record = remote.TxStatus(
+                tx_id=txid, absent=False, phases=("replace",), notes=(),
+                rc=None, finished=None, running=True, counts={})
+        elif state == "blocked":
+            record = remote.TxStatus(
+                tx_id=txid, absent=False,
+                phases=("check", "backup", "replace", "reload", "rollback"),
+                notes=(), rc=1, finished=1, running=False,
+                counts={"ROLLBACK_FAILED": 1, "ROLLBACK_INTENT": 1})
+        elif state == "created":
+            record = remote.TxStatus(
+                tx_id=txid, absent=False,
+                phases=("check", "backup", "replace", "reload", "health"),
+                notes=(), rc=0, finished=1, running=False,
+                counts={"COMMIT": 1, "SUCCESS": 1})
+        elif state == "rolled-back":
+            record = remote.TxStatus(
+                tx_id=txid, absent=False,
+                phases=("check", "backup", "replace", "reload", "health",
+                        "rollback"),
+                notes=(), rc=1, finished=1, running=False,
+                counts={"ROLLED_BACK": 1, "ROLLBACK_INTENT": 1})
+        else:
+            raise AssertionError("unknown pending state %r" % state)
+        return remote.TxOverview(records=(record,), claim=None)
 
     def _enter(self, method: str) -> None:
         self.calls.append(method)
-        code = self.errors_by_method.get(method)
-        if code:
-            raise HaUiError(code, detail=method)
+        failure = self.errors_by_method.get(method)
+        if failure:
+            if isinstance(failure, tuple):
+                code, detail = failure
+            else:
+                code, detail = failure, method
+            raise HaUiError(code, detail=detail)
 
     def preflight(self) -> RemotePreflight:
         self._enter("preflight")
@@ -744,6 +1014,15 @@ class FakeProvider:
             self.exports[name] = payload
             result[name] = payload
         return result
+
+    def create_client(self, name: str, *, confirmed: bool) -> None:
+        self.create_requests.append((name, confirmed))
+        self._enter("create_client")
+        if not confirmed:
+            raise HaUiError(errors.E_CLIENT_EXISTS, detail="consent")
+        if self.create_effect:
+            self.records[name] = client_record(name)
+        return None
 
 
 class FakeProviderFactory:

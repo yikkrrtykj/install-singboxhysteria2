@@ -8,9 +8,12 @@ from __future__ import annotations
 
 import importlib.util
 import re
+import tomllib
 from pathlib import Path
 
 import pytest
+
+from ha_ui import APP_VERSION
 
 APP_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = APP_ROOT.parent
@@ -45,6 +48,15 @@ def test_requirements_and_build_pins_match():
     assert build.PINNED_DEPENDENCIES == requirements
     assert build.PYINSTALLER_VERSION == "6.22.3"
     assert build.BUILD_PYTHON == (3, 13)
+
+
+def test_release_version_is_single_sourced_across_app_build_and_pyproject():
+    build = load_build_module()
+    project = tomllib.loads((APP_ROOT / "pyproject.toml").read_text(
+        encoding="utf-8"))
+    assert APP_VERSION == "0.2.0"
+    assert build.APP_VERSION == APP_VERSION
+    assert project["project"]["version"] == APP_VERSION
 
 
 def test_source_set_covers_app_and_reviewed_tools():

@@ -83,10 +83,18 @@ class ClientRecord:
 
     @property
     def complete(self) -> bool:
+        """Both protocols carry a credential — protocol completeness only.
+
+        This is NOT "safe to generate": ``problems`` (duplicate/name-set
+        mismatch/unnamed entries/inbound-count anomalies) can invalidate the
+        whole inventory. Every success or readiness decision must use
+        :attr:`exportable`; ``complete`` is for display of one endpoint.
+        """
         return self.reality_ok and self.hy2_ok
 
     @property
     def exportable(self) -> bool:
+        """True only when the client is complete AND structurally sound."""
         return self.complete and not self.problems
 
 
@@ -143,6 +151,77 @@ class GenerationResult:
     @property
     def ok(self) -> bool:
         return self.failed_stage is None and bool(self.files)
+
+
+CREATION_SIDE_STATUSES = ("created", "existing", "failed", "uncertain", "skipped")
+
+
+@dataclass(frozen=True)
+class CreationSideResult:
+    """One VPS's fixed, non-secret creation outcome.
+
+    ``code`` is a reviewed ``E_...`` token or an empty string. No credential,
+    UUID, password, YAML or raw remote output may be stored here.
+    """
+
+    role: str
+    status: str
+    code: str = ""
+    detail: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.role not in SERVER_IDS:
+            raise ValueError("role")
+        if self.status not in CREATION_SIDE_STATUSES:
+            raise ValueError("status")
+
+    @property
+    def succeeded(self) -> bool:
+        return self.status in ("created", "existing")
+
+
+@dataclass
+class ClientCreationResult:
+    """The two independent per-side outcomes of one creation attempt.
+
+    The two VPS writes are deliberately not a distributed transaction. A side
+    that was created is never deleted because the other side failed; the UI must
+    show ``partial`` instead of claiming completion.
+    """
+
+    name: str
+    sides: dict[str, CreationSideResult] = field(default_factory=dict)
+    repaired_existing: tuple[str, ...] = ()
+
+    def side(self, role: str) -> CreationSideResult | None:
+        return self.sides.get(role)
+
+    @property
+    def created_roles(self) -> tuple[str, ...]:
+        return tuple(role for role in SERVER_IDS
+                     if self.sides.get(role) is not None
+                     and self.sides[role].status == "created")
+
+    @property
+    def failed_roles(self) -> tuple[str, ...]:
+        return tuple(role for role in SERVER_IDS
+                     if self.sides.get(role) is not None
+                     and self.sides[role].status in ("failed", "uncertain"))
+
+    @property
+    def complete(self) -> bool:
+        """True only when both sides are confirmed present after the attempt."""
+        return all(self.sides.get(role) is not None
+                   and self.sides[role].succeeded for role in SERVER_IDS)
+
+    @property
+    def partial(self) -> bool:
+        """A write happened on one side while the other side is not confirmed."""
+        return bool(self.created_roles) and not self.complete
+
+    @property
+    def ok(self) -> bool:
+        return self.complete and not self.failed_roles
 
 
 @dataclass(frozen=True)

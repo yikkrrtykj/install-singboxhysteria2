@@ -1,4 +1,4 @@
-# HA-UI Windows CI 最终审计（2026-11-21，PR #116）
+﻿# HA-UI Windows CI 最终审计（2026-11-21，PR #116）
 
 本文件记录发布前对 `ha-ui/ci/ha-ui-workflow.yml`、激活助手与本地 CI 镜像的最终检查。
 **结论：CI 模板已加固且未激活；现有仓库 20/20 checks 不是新 HA-UI Windows 专项 CI。**
@@ -60,8 +60,12 @@ GitHub 因此拒绝推送 `.github/workflows/` 文件。本仓库：
 
 ## 5. 本机验证证据（2026-11-21）
 
-- `pytest ha-ui/tests -q` → **476 passed, 2 host skips**（当前分支）。
+- `pytest ha-ui/tests -q` → **476 passed, 2 host skips**（0.1.0 分支）。
 - `run-windows-ci.ps1` 全量通过；最终 EXE 构建 + 冷启动 self-test + `verify_receipt.py`
   通过（hash 见 PR #116 评论/本地 `.scratch/ci/summary.json`，git-ignored）。
 - GUI 真实 EXE UIA 验收 A1–A10 通过（详见 PR #116 评论与
   `docs/windows-ha-ui-acceptance.md`）。
+
+> 0.2.0 更新（2026-11-23）：Windows 本机 `pytest` 为 **539 passed / 4 host skips**，
+> 新增创建、部分成功、补齐、双 VPS 非原子、UI 简化回归；0.1.0 的 UIA 结论不自动
+> 覆盖 0.2.0 新创建流程，后者仍待 Windows EXE 与真实隔离 VPS 验收。

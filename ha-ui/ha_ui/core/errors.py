@@ -65,6 +65,11 @@ E_PIN_EXPIRED: Final = "E_PIN_EXPIRED"
 E_PIN_REUSED: Final = "E_PIN_REUSED"
 E_CLIENT_MISSING: Final = "E_CLIENT_MISSING"
 E_CLIENT_INCOMPLETE: Final = "E_CLIENT_INCOMPLETE"
+E_CLIENT_EXISTS: Final = "E_CLIENT_EXISTS"
+E_CLIENT_PARTIAL_EXISTS: Final = "E_CLIENT_PARTIAL_EXISTS"
+E_REMOTE_CREATE: Final = "E_REMOTE_CREATE"
+E_REMOTE_VERIFY: Final = "E_REMOTE_VERIFY"
+E_CREATE_UNCERTAIN: Final = "E_CREATE_UNCERTAIN"
 E_CREDENTIAL_REUSE: Final = "E_CREDENTIAL_REUSE"
 E_FRIENDLY_EXPORT: Final = "E_FRIENDLY_EXPORT"
 
@@ -79,6 +84,7 @@ _RETRIABLE: Final = frozenset({
     E_REMOTE_MENU,
     E_REMOTE_FILE,
     E_REMOTE_HASH,
+    E_REMOTE_CREATE,
     E_STORE_IO,
 })
 
@@ -126,6 +132,11 @@ _MESSAGES = {
     E_PIN_REUSED: "A/B 两端 HY2 证书 PIN 重复，角色独立性不成立",
     E_CLIENT_MISSING: "客户端在某一端不存在",
     E_CLIENT_INCOMPLETE: "客户端 Reality/HY2 协议不完整",
+    E_CLIENT_EXISTS: "客户端已存在，未执行创建",
+    E_CLIENT_PARTIAL_EXISTS: "客户端仅一端已存在，默认不自动补齐",
+    E_REMOTE_CREATE: "服务器端创建客户端失败或已回滚",
+    E_REMOTE_VERIFY: "创建后无法在服务器上确认客户端状态",
+    E_CREATE_UNCERTAIN: "创建结果待确认（连接中断），请刷新两端实际状态",
     E_CREDENTIAL_REUSE: "A/B 两端使用了相同凭据，已停止",
     E_FRIENDLY_EXPORT: "A-first/B-first 交付文件发布失败",
     E_INTERNAL: "内部错误（已隐藏细节）",

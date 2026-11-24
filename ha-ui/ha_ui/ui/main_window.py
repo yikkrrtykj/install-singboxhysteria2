@@ -1,39 +1,38 @@
-"""Main window: safety banner, two server cards and the client/generation tabs.
+"""Main window: page navigation, shared workers and safe operator dialogs.
 
-The window owns the shared :class:`~ha_ui.ui.workers.WorkerRunner` (stopped on
-close, so a late worker result can never touch a destroyed widget) and wraps the
-production :class:`~ha_ui.ui.session_service.SessionGenerationService`. The
-client-management tab reads both VPS inventories; the generation tab runs the
-local HA chain. Nothing in this window exports configuration by itself, starts
-a tunnel, imports Clash or changes the remote sing-box configuration: the only
-remote write is the existing ``miaomiao`` CLI's derived-file generation, and
-only after the operator ticks the explicit consent box.
+The 0.2.0 layout follows the actual job instead of the internal architecture:
 
-Every error that reaches the UI is a :class:`~ha_ui.core.errors.HaUiError` with
-a fixed code and a safe message; :meth:`MainWindow.show_error` renders it in a
-``QMessageBox``. Expected failures from workers are routed here by
-:class:`~ha_ui.ui.workers.WorkerRunner`; unexpected exceptions were already
-collapsed to ``E_INTERNAL`` at the worker boundary.
+   服务器  →  客户端  →  生成 YAML
+
+The default page is 客户端 because that is the daily flow; the page itself
+shows the A/B connection state and the primary "新建客户端" action. The old
+always-on safety banner and debug status bar are gone: the accurate write
+boundary is stated in the create dialog and in the help dialog.
+
+Every error reaching the UI is a :class:`~ha_ui.core.errors.HaUiError` with a
+fixed code and safe message. Raw exception text is never rendered.
 """
 
 from __future__ import annotations
 
+import threading
 from typing import Callable
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
     QDialog,
     QHBoxLayout,
     QLabel,
     QMainWindow,
     QMessageBox,
+    QPushButton,
     QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
 from .. import APP_NAME, APP_VERSION, SERVER_IDS
-from ..core import config_store
+from ..core import config_store, errors
 from ..core.errors import HaUiError
 from ..core.models import HostKeyInfo
 from .clients_panel import ClientsPanel
@@ -44,19 +43,23 @@ from .services import ServerActions
 from .session_service import GenerationBackend, SessionGenerationService
 from .workers import WorkerRunner
 
-SAFETY_BANNER_TEXT = (
-    "本地工具；不会开启 TUN、不会导入 Clash、不会修改服务器 sing-box 配置"
+HEADER_TITLE = "双 VPS 主备配置"
+HEADER_SUBTITLE = "连接 A / B   →   创建或选择客户端   →   生成 YAML"
+HELP_TEXT = (
+    "使用顺序：\n"
+    "1. 在「服务器」页填写两台 VPS 的连接信息，核对 SSH 主机指纹并保存。\n"
+    "2. 在「客户端」页刷新两端清单，或直接新建同名客户端。\n"
+    "3. 勾选客户端、选择 A-first / B-first，然后生成 YAML。\n\n"
+    "边界：\n"
+    "• 生成 YAML 完全在本地进行，不导入 Clash、不开启 TUN、不改系统代理。\n"
+    "• 新建客户端会修改两台 VPS 的 sing-box 客户端配置，并可能执行 reload；"
+    "两端写入不是原子事务，若一端失败，另一端不会被自动删除。\n"
+    "• 软件不显示 UUID、HY2 密码或 YAML 内容。"
 )
 
 
 class MainWindow(QMainWindow):
-    """Two-VPS window; takes an injected :class:`ServerActions`.
-
-    Tests may inject a fake core ``generation_service`` (the object with
-    ``preview``/``generate``) and a fake ``open_folder_fn``; production passes
-    neither and gets the reviewed core :class:`GenerationService` plus
-    :func:`ha_ui.core.private_fs.open_folder`.
-    """
+    """Two-VPS window; takes an injected :class:`ServerActions`."""
 
     def __init__(
         self,
@@ -67,6 +70,10 @@ class MainWindow(QMainWindow):
         open_folder_fn: Callable[[str], None] | None = None,
     ) -> None:
         super().__init__(parent)
+        # The thread that constructed the widgets owns every widget read. The
+        # password snapshot below is the only shared mutable UI input, so it is
+        # guarded rather than trusted.
+        self._gui_thread = threading.get_ident()
         self._actions = actions
         self._runner = WorkerRunner(self)
         self._startup_error: HaUiError | None = None
@@ -81,24 +88,36 @@ class MainWindow(QMainWindow):
         self.resize(1120, 780)
         self._build_ui()
         self._load_config()
+        self.tabs.setCurrentIndex(1)
 
     # ------------------------------------------------------------------ build --
     def _build_ui(self) -> None:
         central = QWidget(self)
         layout = QVBoxLayout(central)
-        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setContentsMargins(16, 14, 16, 12)
         layout.setSpacing(10)
 
-        banner = QLabel(SAFETY_BANNER_TEXT, central)
-        banner.setObjectName("safetyBanner")
-        banner.setWordWrap(True)
-        banner.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(banner)
+        header = QHBoxLayout()
+        title = QLabel(HEADER_TITLE, central)
+        title.setObjectName("appTitle")
+        subtitle = QLabel(HEADER_SUBTITLE, central)
+        subtitle.setObjectName("appSubtitle")
+        heading = QVBoxLayout()
+        heading.setSpacing(0)
+        heading.addWidget(title)
+        heading.addWidget(subtitle)
+        header.addLayout(heading)
+        header.addStretch(1)
+        self.help_button = QPushButton("使用说明", central)
+        self.help_button.setObjectName("linkButton")
+        self.help_button.clicked.connect(self.show_help)
+        header.addWidget(self.help_button)
+        layout.addLayout(header)
 
         self.tabs = QTabWidget(central)
         server_tab = QWidget(self.tabs)
         server_layout = QHBoxLayout(server_tab)
-        server_layout.setContentsMargins(6, 6, 6, 6)
+        server_layout.setContentsMargins(8, 8, 8, 8)
         server_layout.setSpacing(10)
         self.panels: dict[str, ServerPanel] = {}
         for server_id in SERVER_IDS:
@@ -106,22 +125,24 @@ class MainWindow(QMainWindow):
                                 server_tab)
             self.panels[server_id] = panel
             server_layout.addWidget(panel, 1)
-        self.tabs.addTab(server_tab, "服务器管理")
+        self.tabs.addTab(server_tab, "服务器")
 
         self.client_panel = ClientsPanel(
             self._session_service, self._runner, self,
             self.password_overrides, self.tabs)
-        self.tabs.addTab(self.client_panel, "客户端管理")
+        self.tabs.addTab(self.client_panel, "客户端")
 
         self.generate_panel = GeneratePanel(
             self._session_service, self._runner, self, self.client_panel,
             self.password_overrides, self.tabs)
-        self.tabs.addTab(self.generate_panel, "生成")
+        self.tabs.addTab(self.generate_panel, "生成 YAML")
 
         layout.addWidget(self.tabs, 1)
         self.setCentralWidget(central)
-        self.statusBar().showMessage(
-            "就绪（工作目录：%s）" % str(self._actions.workspace))
+
+        self.client_panel.generate_requested.connect(self.show_generate_page)
+        self.client_panel.client_created.connect(self._on_client_created)
+        self.statusBar().showMessage("就绪", 4000)
 
     # ----------------------------------------------------------------- config --
     def _load_config(self) -> None:
@@ -130,11 +151,10 @@ class MainWindow(QMainWindow):
         except HaUiError as exc:
             servers = config_store.default_servers()
             self._startup_error = exc
-            # Report after the window is constructed so a corrupt local config
-            # can never block startup inside __init__.
             QTimer.singleShot(0, self._report_startup_error)
         for server_id in SERVER_IDS:
             self.panels[server_id].load_from(servers[server_id])
+        self.client_panel.set_configured_servers(servers)
 
     def _report_startup_error(self) -> None:
         error = self._startup_error
@@ -146,12 +166,24 @@ class MainWindow(QMainWindow):
     def password_overrides(self) -> dict[str, str]:
         """Snapshot the two session password fields (GUI thread only).
 
-        The returned mapping is only kept for the duration of one worker call so
-        the operator can type a password without saving it to the vault. It is
-        never rendered or logged.
+        Reading a QWidget from a worker thread is undefined behaviour, so this
+        method refuses loudly instead of returning a half-read value. Callers
+        snapshot on the GUI thread and hand the immutable dict to the worker.
         """
+        if threading.get_ident() != self._gui_thread:
+            raise HaUiError(errors.E_USAGE, detail="gui-thread")
         return {server_id: panel.password_edit.text()
                 for server_id, panel in self.panels.items()}
+
+    # -------------------------------------------------------------- navigation --
+    def show_generate_page(self) -> None:
+        self.tabs.setCurrentWidget(self.generate_panel)
+        self.generate_panel.focus_generate()
+
+    def _on_client_created(self, name: str) -> None:
+        self.show_generate_page()
+        self.statusBar().showMessage("客户端「%s」已创建，可以生成 YAML" % name,
+                                     8000)
 
     # ----------------------------------------------------------------- errors --
     def show_error(self, error: HaUiError) -> None:
@@ -160,6 +192,28 @@ class MainWindow(QMainWindow):
 
     def show_info(self, title: str, text: str) -> None:
         QMessageBox.information(self, title, text)
+
+    def show_warning(self, title: str, text: str) -> None:
+        QMessageBox.warning(self, title, text)
+
+    def show_help(self) -> None:
+        QMessageBox.information(self, "使用说明", HELP_TEXT)
+
+    def confirm_partial_creation(self, name: str,
+                                 existing_role: str) -> bool:
+        """Second, explicit confirmation before creating only the missing side."""
+        existing = existing_role if existing_role in ("A", "B") else "一端"
+        missing = "B" if existing == "A" else "A"
+        answer = QMessageBox.warning(
+            self,
+            "仅补齐缺失端",
+            "客户端「%s」在 %s 端已存在。为避免误改已有凭据，软件默认不会补齐。\n\n"
+            "是否只在 %s 端创建同名客户端？%s 端已有凭据不会被修改、覆盖或删除。"
+            % (name, existing, missing, existing),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
 
     def ask_host_key(self, info: HostKeyInfo,
                      existing_fingerprint: str | None) -> str | None:

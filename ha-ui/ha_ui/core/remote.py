@@ -29,6 +29,7 @@ from __future__ import annotations
 import hashlib
 import re
 import shlex
+import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Mapping, Protocol
@@ -52,9 +53,9 @@ MANAGEMENT_MARKER = "/var/lib/sbox-cm/management.active"
 # security-review action: re-review the installer + library, recompute both
 # hashes, and update docs/windows-ha-ui-data-path.md and the tests together.
 # ---------------------------------------------------------------------------
-INSTALLER_REVIEWED_COMMIT = "2a810a995fcc05ec5a807140c6fdb21e9ec660ff"
+INSTALLER_REVIEWED_COMMIT = "9402be91284551210f2d455f1af42e3b97ccb81e"
 INSTALLER_SHA256 = (
-    "520aded03ccf3af6f09b8ba4ad34313a9ccad1ac80127b1600eb519d2dbea67f")
+    "1a9923eb31ee29b899ba87651c102e83dbde0d397db91387245a489f2e647f10")
 CLIENT_MANAGEMENT_SHA256 = (
     "52e08db43b8c94dc42a3c8eea96e8bc3c6adb64155002e82ac3dee985e3b6a53")
 _REPO_RAW_BASE = ("https://raw.githubusercontent.com/yikkrrtykj/"
@@ -74,9 +75,11 @@ INSTALLER_HOST_DEPS = (
 )
 
 CANONICAL_CLIENT_NAME_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,31}\Z")
+RESERVED_CLIENT_NAME = "legacy"
 MAX_EXPORT_BYTES = 64 * 1024
 MAX_LIST_JSON = 256 * 1024
 MAX_MENU_OUTPUT = 1024 * 1024
+MAX_TX_OUTPUT = 256 * 1024
 
 # Structure markers that must exist in the downloaded installer before any byte
 # of it is executed. A renumbered menu (the main catastrophic drift: "10" could
@@ -87,18 +90,44 @@ MENU_SCRIPT_MARKERS = (
     "3) generate_client_configuration_interactive",
     "的 Mihomo 配置已生成",
 )
+# Additional static markers required before the add path may execute. They bind
+# option 2 to the reviewed canonical add_client wrapper and its success line;
+# the per-name success string is checked in the transcript afterwards.
+MENU_ADD_MARKERS = (
+    "2) add_client_interactive",
+    "add_client()",
+    "_add_client_locked()",
+    "已同时添加到 Reality 与 HY2",
+)
 # Transcript markers proving the expected menu path actually ran: the menu
 # notice, and the option-1 client table header.
 MENU_TRANSCRIPT_MARKERS = ("客户端管理", "NAME", "REALITY")
 MENU_SUCCESS_TEMPLATE = "客户端 '%s' 的 Mihomo 配置已生成"
+MENU_ADD_SUCCESS_TEMPLATE = "客户端 '%s' 已同时添加到 Reality 与 HY2"
 
 MENU_FETCH_TIMEOUT = 60
 MENU_RUN_TIMEOUT = 420
 MENU_KILL_GRACE = 10
 MENU_EXEC_TIMEOUT = 540.0
 
+# Managed create transaction. The worker is a detached one-shot server process
+# that keeps a durable phase journal; the client only reads that state.
+TX_ROOT = "/root/sbox/.ha-ui-tx"
+TX_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,31}-[0-9a-f]{32}\Z")
+TX_WAIT_TIMEOUT = 1800.0      # stop waiting here; never kill the worker
+TX_PRECOMMIT_SECONDS = 120    # watchdog may stop the menu only pre-replace
+PATH_ENV = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
 DERIVED_STAT_FORMAT = "%F|%n|%a|%u|%s|%Y|%y"
 DERIVED_IDENTITY_END = "HAUI_STAT_END"
+# Exact, mutually exclusive server outcomes. A generic "回滚" needle is NOT
+# usable: lib/client-management.sh prints it for three different results
+# (restore failed / restored+reloaded / restored-but-service-unconfirmed) and
+# only the middle one proves the write was undone. The three needles below are
+# the exact sentences:
+#   :330  "回滚恢复失败，请立即人工介入"
+#   :338  "已回滚并重新加载上一份配置"        (proven restore)
+#   :344  "已回滚配置文件，但服务未能确认恢复"
 _MENU_FAIL_TOKENS = (
     ("consistency", "一致性"),
     ("incomplete", "不完整"),
@@ -106,7 +135,32 @@ _MENU_FAIL_TOKENS = (
     ("name-invalid", "客户端名称非法"),
     ("permission", "权限"),
     ("reserved", "保留名称"),
+    ("exists", "已存在"),
+    ("lock", "配置锁"),
+    ("create", "生成 add candidate 失败"),
+    ("rollback-failed", "回滚恢复失败"),
+    ("rollback-unconfirmed", "服务未能确认恢复"),
+    ("rolled-back", "已回滚并重新加载上一份配置"),
 )
+
+# Refusals the canonical add path raises before it replaces the config file,
+# paired with the read-only transcript counter that proves the sentence
+# appeared. Order matters: the first matching token wins.
+_TX_REFUSALS = (
+    ("exists", "EXISTS"),
+    ("lock", "LOCK"),
+    ("consistency", "CONSISTENCY"),
+    ("incomplete", "INCOMPLETE"),
+    ("create", "CREATE"),
+    ("missing-config", "MISSING_CONFIG"),
+    ("name-invalid", "NAME_INVALID"),
+    ("reserved", "RESERVED"),
+)
+
+# The commit line the canonical installer prints only after the candidate was
+# written; the reload wording varies (reload vs "no running process"), so this
+# prefix is the shared proof that the write boundary was crossed.
+COMMIT_PROVEN_MARKER = "配置已提交"
 # Pre-execution pin failures disable automatic menu generation explicitly; the
 # read-existing-exports path remains available. These are not retried.
 _INSTALLER_UNTRUSTED_TOKENS = frozenset({
@@ -148,6 +202,9 @@ class RemotePreflight:
     config_mtime: int
     curl_present: bool = False
     timeout_present: bool = False
+    # Identity of the live config file, read read-only. It is the only evidence
+    # a client can hold that a write boundary was (or was not) crossed.
+    config_sha256: str | None = None
 
     @property
     def okay(self) -> bool:
@@ -211,7 +268,7 @@ def _menu_client_name(path: str) -> str:
     return name if CANONICAL_CLIENT_NAME_RE.fullmatch(name) else ""
 
 
-def _menu_command(names: list[str]) -> str:
+def _pinned_menu_command(sequence: str, markers: tuple[str, ...]) -> str:
     """Fixed remote script: fetch/verify pinned bytes, run menu, prove statuses.
 
     Trust chain: both the installer and the client-management library are
@@ -229,12 +286,10 @@ def _menu_command(names: list[str]) -> str:
     colours are stripped, and ``PIPESTATUS`` is captured for printf, the menu
     process and sed so a non-zero menu can never be hidden by a later marker.
     """
-    sequence = "10\n1\n" + "".join(
-        "3\n%s\n" % name for name in names) + "0\n"
     checks = " ".join(
         "grep -qF -- " + shlex.quote(marker) + " \"$d/install.sh\" "
         "|| { echo HAUI_MENU_FAIL=menu-drift; exit 5; };"
-        for marker in MENU_SCRIPT_MARKERS)
+        for marker in markers)
     path_env = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
     env_assignments = (
         "env -i PATH=" + path_env + " HOME=/root LANG=C.UTF-8 TERM=dumb "
@@ -275,6 +330,364 @@ def _menu_command(names: list[str]) -> str:
         "printf '\\nHAUI_MENU_RC=%s,%s,%s\\n' "
         "\"${ha_ui_rc[0]}\" \"${ha_ui_rc[1]}\" \"${ha_ui_rc[2]}\"; "
         "printf 'HAUI_MENU_END\\n'"
+    )
+    return "bash -c " + shlex.quote(script)
+
+
+def _menu_command(names: list[str]) -> str:
+    """Pinned menu 10→1→3 command for one or more existing client exports."""
+    sequence = "10\n1\n" + "".join(
+        "3\n%s\n" % name for name in names) + "0\n"
+    return _pinned_menu_command(sequence, MENU_SCRIPT_MARKERS)
+
+
+def _tx_id(name: str) -> str:
+    return "%s-%s" % (name, uuid.uuid4().hex)
+
+
+def _tx_env_text(txid: str) -> str:
+    """Reviewed BASH_ENV text for one attempt.
+
+    The hook stays a *function* (the library contract). The variable is set
+    without ``export`` so no child process sees a name that has no function,
+    and ``BASH_ENV`` is unset right after loading so child shells do not re-run
+    the file. ``hook-loaded`` is the load-time sentinel: bash silently ignores a
+    missing BASH_ENV file, so an exit status proves nothing.
+    """
+    tx = TX_ROOT + "/" + txid
+    q = shlex.quote(tx)
+    return (
+        "#!/bin/bash\n"
+        "# ha-ui managed transaction hook (reviewed source: ha-ui/ha_ui/core/remote.py)\n"
+        "ha_ui_tx_journal() {\n"
+        "    local phase=${1:-unknown} backup=${2:-}\n"
+        "    umask 077\n"
+        "    printf '%s\\t%s\\t%s\\n' \"$phase\" \"$(date +%s)\" \"$backup\" "
+        ">> " + q + "/phases || return 1\n"
+        "    if ! sync -f " + q + "/phases 2>/dev/null; then sync || return 1; fi\n"
+        "    if ! sync -f " + q + " 2>/dev/null; then sync || return 1; fi\n"
+        "    return 0\n"
+        "}\n"
+        "CM_TX_JOURNAL_HOOK=ha_ui_tx_journal\n"
+        "printf 'loaded\\n' > " + q + "/hook-loaded || exit 1\n"
+        "unset BASH_ENV\n"
+    )
+
+
+def _tx_env_sha(txid: str) -> str:
+    return hashlib.sha256(_tx_env_text(txid).encode("utf-8")).hexdigest()
+
+
+def _tx_worker_script(precommit: int | None = None) -> str:
+    """Exact detached worker text (the Linux lab runs this same text).
+
+    The worker never signals the menu: a pre-commit watchdog cannot be made
+    race-free with the canonical ``replace`` boundary from outside (the check
+    and the kill are not atomic), so a stall is only *reported* and the
+    transaction is never killed. Transaction cancellation is therefore left to
+    the canonical per-subcommand timeouts, and anything unfinished stays
+    ``UNSAFE`` for the operator.
+    """
+    seconds = TX_PRECOMMIT_SECONDS if precommit is None else int(precommit)
+    ansi = shlex.quote("s/" + _REDACT_ANSI + "//g")
+    link = shlex.quote("s/" + _REDACT_LINK + "/[redacted-link]/g")
+    return (
+        "set -u\n"
+        "tx=$1; d=$2; started=$3; claim=$4\n"
+        "env -i PATH=" + PATH_ENV + " HOME=/root LANG=C.UTF-8 TERM=dumb "
+        "BASH_ENV=\"$tx/env.sh\" SB_CLIENT_MANAGEMENT_REF="
+        + INSTALLER_REVIEWED_COMMIT + " "
+        "SB_CLIENT_MANAGEMENT_LIB=\"$d/client-management.sh\" "
+        "bash \"$d/install.sh\" < \"$tx/in\" > \"$tx/raw\" 2>&1 &\n"
+        "menu=$!\n"
+        "( while kill -0 \"$menu\" 2>/dev/null; do\n"
+        "    if grep -q '^replace' \"$tx/phases\" 2>/dev/null; then exit 0; fi\n"
+        "    now=$(date +%s)\n"
+        "    if [ $((now - started)) -gt " + str(seconds) + " ] "
+        "&& [ ! -f \"$tx/stall-noted\" ]; then\n"
+        "      printf 'precommit-stall\\n' > \"$tx/stall-noted\"\n"
+        "      printf 'watchdog=precommit-stall\\n' >> \"$tx/notes\"\n"
+        "    fi\n"
+        "    sleep 1\n"
+        "  done ) &\n"
+        "monitor=$!\n"
+        "wait \"$menu\"; rc=$?\n"
+        "kill \"$monitor\" 2>/dev/null || true\n"
+        "sed -E -e " + ansi + " -e " + link
+        + " \"$tx/raw\" > \"$tx/out\" 2>/dev/null || true\n"
+        "rm -f \"$tx/raw\"\n"
+        "if ! printf 'rc=%s\\nfinished=%s\\n' \"$rc\" \"$(date +%s)\" "
+        "> \"$tx/result.tmp\"; then\n"
+        "  printf 'publish-failed\\n' > \"$tx/publish-failed\"\n"
+        "  rm -f \"$tx/result.tmp\"; rm -rf -- \"$d\"; exit 1\n"
+        "fi\n"
+        "if ! mv -- \"$tx/result.tmp\" \"$tx/result\"; then\n"
+        "  printf 'publish-failed\\n' > \"$tx/publish-failed\"\n"
+        "  rm -rf -- \"$d\"; exit 1\n"
+        "fi\n"
+        "if ! sync -f \"$tx/result\" 2>/dev/null; then\n"
+        "  sync || printf 'publish-unsynced\\n' > \"$tx/publish-failed\"\n"
+        "fi\n"
+        "if ! sync -f \"$tx\" 2>/dev/null; then\n"
+        "  sync || printf 'publish-unsynced\\n' > \"$tx/publish-failed\"\n"
+        "fi\n"
+        "if [ -f \"$tx/publish-failed\" ]; then\n"
+        "  rm -rf -- \"$d\"; exit 1\n"
+        "fi\n"
+        "if [ \"$(cat -- \"$claim/txid\" 2>/dev/null || true)\" = "
+        "\"${tx##*/}\" ]; then rm -rf -- \"$claim\"; fi\n"
+        "rm -rf -- \"$d\"\n"
+    )
+
+
+# Read-only evidence block. Every value is a fixed token or a count over the
+# redacted transcript; transcript text itself never leaves the server.
+_TX_STATUS_TEMPLATE = r"""echo HAUI_TX_PHASES_BEGIN; sed -n '1,80p' "$tx/phases" 2>/dev/null || true; echo HAUI_TX_PHASES_END; echo HAUI_TX_RESULT_BEGIN; sed -n '1,8p' "$tx/result" 2>/dev/null || true; echo HAUI_TX_RESULT_END; echo "HAUI_TX_NOTES=$(sed -n '1,4p' "$tx/notes" 2>/dev/null | tr '\n' ',')"; pid=$(cat -- "$tx/pid" 2>/dev/null || true); if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then echo HAUI_TX_RUNNING=1; else echo HAUI_TX_RUNNING=0; fi; for pair in "配置已提交:COMMIT" "已回滚并重新加载上一份配置:ROLLED_BACK" "回滚恢复失败:ROLLBACK_FAILED" "服务未能确认恢复:ROLLBACK_UNCONFIRMED" "自动回滚:ROLLBACK_INTENT" "客户端 __NAME__:SUCCESS" "已存在:EXISTS" "配置锁:LOCK" "一致性:CONSISTENCY" "不完整:INCOMPLETE" "add candidate:CREATE" "服务端配置不存在:MISSING_CONFIG" "客户端名称非法:NAME_INVALID" "保留名称:RESERVED"; do needle=${pair%%:*}; key=${pair##*:}; n=$(grep -c -F -- "$needle" "$tx/out" 2>/dev/null || true); echo "HAUI_TX_${key}=${n:-0}"; done; echo "HAUI_TX_DAMAGED=$( if [ -f "$tx/publish-failed" ] || [ -f "$tx/publish-unsynced" ]; then echo 1; else echo 0; fi )"; echo "HAUI_TX_ID=${tx##*/}"
+"""
+
+
+def _tx_status_body(name: str) -> str:
+    return _TX_STATUS_TEMPLATE.replace("__NAME__", "'" + name + "'")
+
+
+def _add_client_command(name: str, txid: str) -> str:
+    """Managed create transaction: verified launcher + detached durable worker.
+
+    Order of operations on the server:
+
+    1. fetch/verify the pinned installer and library, and the menu markers
+       (nothing executes before this, and no byte of the live config changes);
+    2. refuse when any same-name request is still unfinished (durable, works
+       across GUI restarts), then take an atomic per-name claim directory;
+    3. create the root-only transaction directory and the reviewed ``env.sh``,
+       then verify its digest against the client-computed value;
+    4. prove the hook is really loaded in the transaction shell (sentinel +
+       ``declare -F`` + "not exported" probe) -- BASH_ENV failures are silent, so
+       this is the only fail-closed gate; any failure aborts before a write;
+    5. start the detached worker (own session, file-backed stdin/stdout) and wait
+       for it; the wait is the client's patience, not a kill switch.
+
+    The worker never signals the menu: an external watchdog cannot be made
+    race-free with the canonical ``replace`` boundary. A stalled pre-commit
+    transaction is reported and stays UNSAFE, never silently killed.
+    """
+    sequence = "10\n2\n%s\n0\n" % name
+    tx = TX_ROOT + "/" + txid
+    claim = TX_ROOT + "/" + name + ".claim"
+    env_text = _tx_env_text(txid)
+    env_sha = _tx_env_sha(txid)
+    checks = " ".join(
+        "grep -qF -- " + shlex.quote(marker) + " \"$d/install.sh\" "
+        "|| { echo HAUI_MENU_FAIL=menu-drift; exit 5; };"
+        for marker in MENU_SCRIPT_MARKERS + MENU_ADD_MARKERS)
+    script = (
+        "set -o pipefail; umask 077; "
+        "d=$(mktemp -d /tmp/ha-ui-installer.XXXXXXXX) "
+        "|| { echo HAUI_MENU_FAIL=temp; exit 3; }; "
+        "cleanup=1; "
+        "trap 'if [ \"${cleanup:-1}\" = 1 ]; then rm -rf -- \"$d\"; fi' "
+        "EXIT HUP INT TERM; "
+        "curl -fsSL --connect-timeout 10 --max-time "
+        + str(MENU_FETCH_TIMEOUT) + " --retry 1 " + shlex.quote(INSTALLER_URL)
+        + " -o \"$d/install.sh\" || { echo HAUI_MENU_FAIL=fetch; exit 4; }; "
+        "if [ \"$(sha256sum \"$d/install.sh\" | awk '{print $1}')\" != "
+        + shlex.quote(INSTALLER_SHA256)
+        + " ]; then echo HAUI_MENU_FAIL=installer-hash; exit 6; fi; "
+        "grep -qF " + shlex.quote(
+            'SB_CLIENT_MANAGEMENT_SHA256="' + CLIENT_MANAGEMENT_SHA256 + '"')
+        + " \"$d/install.sh\" "
+        "|| { echo HAUI_MENU_FAIL=lib-pin; exit 7; }; "
+        + checks + " "
+        "curl -fsSL --connect-timeout 10 --max-time "
+        + str(MENU_FETCH_TIMEOUT) + " --retry 1 "
+        + shlex.quote(CLIENT_MANAGEMENT_URL)
+        + " -o \"$d/client-management.sh\" "
+        "|| { echo HAUI_MENU_FAIL=fetch-lib; exit 8; }; "
+        "if [ \"$(sha256sum \"$d/client-management.sh\" | awk '{print $1}')\" != "
+        + shlex.quote(CLIENT_MANAGEMENT_SHA256)
+        + " ]; then echo HAUI_MENU_FAIL=lib-hash; exit 9; fi; "
+        "chmod 600 \"$d/install.sh\" \"$d/client-management.sh\"; "
+        "tx=" + shlex.quote(tx) + "; "
+        # Retention before the claim: cleanup must never run while a claim
+        # (ours or a leftover) exists.
+        + _tx_cleanup_script(name) + "; "
+        + _tx_guard_script(name, txid) + " "
+        "if [ -e \"$tx\" ]; then " + _tx_release_claim(txid) + " "
+        "  echo HAUI_MENU_FAIL=tx-exists; exit 11; fi; "
+        "mkdir -p -- \"$tx\" || { " + _tx_release_claim(txid) + " "
+        "  echo HAUI_MENU_FAIL=txdir; exit 10; }; "
+        "chmod 700 -- \"$tx\"; "
+        "printf '%s' " + shlex.quote(sequence) + " > \"$tx/in\"; "
+        "chmod 600 -- \"$tx/in\"; "
+        "printf '%s' " + shlex.quote(env_text) + " > \"$tx/env.sh\"; "
+        "chmod 600 -- \"$tx/env.sh\"; "
+        "if [ \"$(sha256sum -- \"$tx/env.sh\" | awk '{print $1}')\" != "
+        + shlex.quote(env_sha) + " ]; then " + _tx_release_claim(txid) + " "
+        "echo HAUI_MENU_FAIL=env-hash; exit 12; fi; "
+        "probe=$(env -i PATH=" + PATH_ENV + " HOME=/root BASH_ENV=\"$tx/env.sh\" "
+        "bash -c 'declare -F ha_ui_tx_journal >/dev/null && echo OK' "
+        "2>/dev/null); "
+        "if [ \"$probe\" != OK ] || [ ! -f \"$tx/hook-loaded\" ]; then "
+        + _tx_release_claim(txid) + " "
+        "echo HAUI_MENU_FAIL=hook-unproven; exit 13; fi; "
+        "exported=$(env -i PATH=" + PATH_ENV + " HOME=/root BASH_ENV=\"$tx/env.sh\" "
+        "bash -c 'env | grep -c \"^CM_TX_JOURNAL_HOOK=\" || true' 2>/dev/null); "
+        "if [ \"$exported\" != 0 ]; then "
+        + _tx_release_claim(txid) + " "
+        "echo HAUI_MENU_FAIL=hook-exported; exit 14; fi; "
+        "started=$(date +%s); printf '%s\\n' \"$started\" > \"$tx/started\"; "
+        "cleanup=0; "
+        "setsid bash -c " + shlex.quote(_tx_worker_script())
+        + " haui_tx \"$tx\" \"$d\" \"$started\" \"$claim\" "
+        ">/dev/null 2>&1 < /dev/null & "
+        "child=$!; printf '%s\\n' \"$child\" > \"$tx/pid\"; "
+        "wait \"$child\" 2>/dev/null || true; "
+        "echo HAUI_TX_STARTED=1; "
+        + _tx_status_body(name)
+    )
+    return "bash -c " + shlex.quote(script)
+
+
+def _tx_release_claim(txid: str) -> str:
+    """Release a claim only when it still records THIS attempt's txid."""
+    return ("if [ \"$(cat -- \"$claim/txid\" 2>/dev/null || true)\" = "
+            + shlex.quote(txid) + " ]; then rm -rf -- \"$claim\"; fi;")
+
+
+def _tx_safe_terminal_bash(name: str) -> str:
+    """Bash predicate mirroring ``TxStatus.release_safe`` (server authority).
+
+    A record may only be treated as "safe terminal" when its receipt is
+    complete and fsynced, no worker is alive, and the outcome is a proven
+    created / rolled-back / refused. Anything else (failed or unconfirmed
+    rollback, damaged/truncated receipt, live worker, unknown transcript) is
+    unsafe and must block a new same-name request.
+    """
+    success = "客户端 '%s' 已同时添加到 Reality 与 HY2" % name
+    return (
+        "ha_ui_tx_safe_terminal() { # <dir>\n"
+        "  local d=$1 rc finished pid commit success rolled failed unconf "
+        "intent refusal\n"
+        "  [ -f \"$d/result\" ] || return 1\n"
+        "  [ -f \"$d/publish-failed\" ] && return 1\n"
+        "  rc=$(sed -n 's/^rc=//p' \"$d/result\" 2>/dev/null | head -n 1)\n"
+        "  finished=$(sed -n 's/^finished=//p' \"$d/result\" 2>/dev/null "
+        "| head -n 1)\n"
+        "  case \"$rc\" in ''|*[!0-9]*) return 1;; esac\n"
+        "  case \"$finished\" in ''|*[!0-9]*) return 1;; esac\n"
+        "  pid=$(cat -- \"$d/pid\" 2>/dev/null || true)\n"
+        "  if [ -n \"$pid\" ] && kill -0 \"$pid\" 2>/dev/null; then "
+        "return 1; fi\n"
+        "  commit=$(grep -c -F -- '配置已提交' \"$d/out\" 2>/dev/null || true)\n"
+        "  success=$(grep -c -F -- " + shlex.quote(success) + " \"$d/out\" "
+        "2>/dev/null || true)\n"
+        "  rolled=$(grep -c -F -- '已回滚并重新加载上一份配置' \"$d/out\" "
+        "2>/dev/null || true)\n"
+        "  failed=$(grep -c -F -- '回滚恢复失败' \"$d/out\" 2>/dev/null || true)\n"
+        "  unconf=$(grep -c -F -- '服务未能确认恢复' \"$d/out\" 2>/dev/null "
+        "|| true)\n"
+        "  intent=$(grep -c -F -- '自动回滚' \"$d/out\" 2>/dev/null || true)\n"
+        "  refusal=$(grep -E -c -- '配置锁|一致性|不完整|已存在|add candidate|"
+        "服务端配置不存在|客户端名称非法|保留名称' \"$d/out\" 2>/dev/null "
+        "|| true)\n"
+        "  for n in commit success rolled failed unconf intent refusal; do\n"
+        "    eval \"v=\\$$n\"; case \"$v\" in ''|*[!0-9]*) "
+        "eval \"$n=0\";; esac\n"
+        "  done\n"
+        "  if [ \"$rc\" -eq 0 ] && [ \"$commit\" -gt 0 ] "
+        "&& [ \"$success\" -gt 0 ]; then return 0; fi\n"
+        "  if [ \"$rc\" -ne 0 ] && [ \"$rolled\" -gt 0 ] "
+        "&& [ \"$failed\" -eq 0 ] && [ \"$unconf\" -eq 0 ] "
+        "&& grep -q '^rollback' \"$d/phases\" 2>/dev/null; then return 0; fi\n"
+        "  if [ \"$rc\" -ne 0 ] && [ \"$commit\" -eq 0 ] "
+        "&& [ \"$intent\" -eq 0 ] && [ \"$refusal\" -gt 0 ]; then return 0; fi\n"
+        "  return 1\n"
+        "}\n"
+    )
+
+
+def _tx_guard_script(name: str, txid: str, root: str | None = None) -> str:
+    """Durable per-name guard + atomic claim (shared with the Linux lab).
+
+    Any unfinished same-name request blocks a new write (works across GUI
+    restarts); unfinished records are never expired. The claim directory is an
+    atomic ``mkdir`` so two GUIs cannot both start the same name. A claim is
+    **never taken over automatically** (no mtime/pid based ``rm -rf``): an
+    abnormal leftover blocks the name until an operator verifies and removes it.
+    """
+    base = TX_ROOT if root is None else root
+    claim = base + "/" + name + ".claim"
+    return (
+        "root=" + shlex.quote(base) + "; name=" + shlex.quote(name) + "; "
+        "claim=" + shlex.quote(claim) + "; "
+        "mkdir -p -- \"$root\" && chmod 700 -- \"$root\"; "
+        + _tx_safe_terminal_bash(name) + " "
+        "for old in \"$root\"/\"$name\"-*/; do "
+        "  [ -d \"$old\" ] || continue; "
+        "  if ! ha_ui_tx_safe_terminal \"$old\"; then "
+        "    echo HAUI_MENU_FAIL=tx-in-flight; exit 15; "
+        "  fi; "
+        "done; "
+        # A claim is never taken over automatically: an abnormal leftover can
+        # only be removed by an operator after checking live state/evidence.
+        "if ! mkdir -- \"$claim\" 2>/dev/null; then "
+        "  echo HAUI_MENU_FAIL=tx-in-flight; exit 15; "
+        "fi; "
+        "printf '%s' " + shlex.quote(txid) + " > \"$claim/txid\"; "
+        "chmod 600 -- \"$claim/txid\";"
+    )
+
+
+def _tx_cleanup_script(name: str, root: str | None = None) -> str:
+    """Retention: delete only *provably safe* terminal records older than 7 days.
+
+    Unsafe / unfinished / damaged evidence is never expired, so a restart can
+    never silently unblock a name by waiting.
+    """
+    base = TX_ROOT if root is None else root
+    return (
+        "root=" + shlex.quote(base) + "; name=" + shlex.quote(name) + "; "
+        # While a claim exists the name is blocked; keep every record as
+        # evidence until an operator resolves it.
+        "if [ -d \"$root/$name.claim\" ]; then :; else "
+        + _tx_safe_terminal_bash(name) + " "
+        "for old in \"$root\"/\"$name\"-*/; do "
+        "  [ -d \"$old\" ] || continue; "
+        "  ha_ui_tx_safe_terminal \"$old\" || continue; "
+        "  opid=$(cat -- \"$old/pid\" 2>/dev/null || true); "
+        "  if [ -n \"$opid\" ] && kill -0 \"$opid\" 2>/dev/null; then "
+        "continue; fi; "
+        "  find \"$old\" -maxdepth 0 -mtime +7 -exec rm -rf -- {} + "
+        "2>/dev/null; "
+        "done; fi"
+    )
+
+
+def _pending_tx_command(name: str) -> str:
+    """Read-only: every durable request for *name*, plus the claim state.
+
+    The base path is a fixed trusted constant; the validated canonical name is
+    appended unquoted so ``*`` really globs, and the rest of each path is quoted.
+    Nothing from operator input can introduce a path or a second glob.
+    """
+    script = (
+        "root=" + shlex.quote(TX_ROOT) + "; name=" + shlex.quote(name) + "; "
+        "claim=\"$root/$name.claim\"; "
+        "count=0; echo HAUI_TX_RECORDS_BEGIN; "
+        "for d in \"$root\"/\"$name\"-*/; do "
+        "  [ -d \"$d\" ] || continue; "
+        "  count=$((count + 1)); "
+        "  echo HAUI_TX_RECORD_BEGIN; "
+        "  tx=${d%/}; "
+        + _tx_status_body(name) + " "
+        "  echo HAUI_TX_RECORD_END; "
+        "done; "
+        "echo HAUI_TX_RECORDS_END; "
+        "echo \"HAUI_TX_RECORD_COUNT=$count\"; "
+        "if [ -d \"$claim\" ]; then "
+        "  echo HAUI_TX_CLAIM=1; "
+        "  echo \"HAUI_TX_CLAIM_TXID=$(cat -- \"$claim/txid\" 2>/dev/null || true)\"; "
+        "else echo HAUI_TX_CLAIM=0; fi"
     )
     return "bash -c " + shlex.quote(script)
 
@@ -346,6 +759,247 @@ def _menu_failure_token(transcript: str) -> str:
     return "partial"
 
 
+_SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+
+
+def _config_sha(value: str | None) -> str | None:
+    """Return a strict lowercase SHA-256, or ``None`` for "unknown".
+
+    A missing/unreadable/garbage hash must never be compared as if it were an
+    identity: callers treat ``None`` as "no evidence", never as "unchanged".
+    """
+    if isinstance(value, str) and _SHA256_RE.match(value):
+        return value
+    return None
+
+
+@dataclass(frozen=True)
+class RemoteSnapshot:
+    """One read-only observation of the live config identity + inventory.
+
+    ``config_sha256`` is ``None`` when the server could not prove the hash; it
+    must then never be treated as "unchanged".
+    """
+
+    config_sha256: str | None
+    config_mtime: int
+    records: Mapping[str, ClientRecord]
+
+    def record(self, name: str) -> ClientRecord | None:
+        return self.records.get(name)
+
+
+@dataclass(frozen=True)
+class _ReconcileEvidence:
+    """What a read-only re-read could prove after a failed add.
+
+    Every field is evidence, never a transaction status:
+
+    * ``readable`` — the re-read succeeded at all;
+    * ``config_changed`` — ``True``/``False`` only when both hashes are known;
+    * ``present`` — the name is in the live inventory;
+    * ``exportable`` — that record is complete and structurally trustworthy.
+    """
+
+    readable: bool
+    config_sha256: str | None = None
+    config_changed: bool | None = None
+    present: bool | None = None
+    exportable: bool | None = None
+
+    @property
+    def write_observed(self) -> bool:
+        return self.config_changed is True or self.present is True
+
+    @property
+    def rolled_back_proven(self) -> bool:
+        """Config bytes identical to the pre-write value AND name absent.
+
+        Both halves are required: identical bytes alone could also be a
+        not-yet-started write, and an absent name alone could be a lost update.
+        """
+        return (self.readable
+                and self.config_changed is False
+                and self.present is False)
+
+
+@dataclass(frozen=True)
+class TxStatus:
+    """Durable state of one managed create transaction.
+
+    ``terminal`` is only true when the worker published its ``result`` file;
+    ``running`` is a live PID check. Neither is ever inferred from the client
+    list or from a single snapshot.
+    """
+
+    tx_id: str
+    absent: bool
+    phases: tuple[str, ...]
+    notes: tuple[str, ...]
+    rc: int | None
+    finished: int | None
+    running: bool
+    counts: Mapping[str, int]
+    damaged: bool = False
+
+    @property
+    def terminal(self) -> bool:
+        return self.finished is not None
+
+    @property
+    def outcome(self) -> str:
+        """Fixed, non-secret outcome token for this request.
+
+        ``terminal`` alone is NOT "safe to release": a damaged receipt, a live
+        worker, ``rollback_manual`` or an incomplete result must stay blocked.
+        """
+        if self.damaged:
+            return "damaged"
+        if not self.terminal:
+            # A receipt value without its terminal marker is a partial write.
+            if self.rc is not None:
+                return "damaged"
+            return "running" if self.running else "unfinished"
+        if self.rc is None:
+            return "damaged"
+        if self.running:
+            return "worker-alive"
+        if self.rc == 0 and self.success and self.committed:
+            return "created"
+        if (self.counts.get("ROLLED_BACK", 0)
+                and not self.counts.get("ROLLBACK_FAILED", 0)
+                and not self.counts.get("ROLLBACK_UNCONFIRMED", 0)
+                and "rollback" in self.phases):
+            return "rolled-back"
+        if (self.rc != 0
+                and not self.committed
+                and not self.counts.get("ROLLBACK_INTENT", 0)
+                and not self.counts.get("ROLLBACK_FAILED", 0)
+                and not self.counts.get("ROLLBACK_UNCONFIRMED", 0)
+                and any(self.counts.get(key, 0) for _token, key in _TX_REFUSALS)):
+            return "refused"
+        if ("rollback_manual" in self.phases
+                or self.counts.get("ROLLBACK_FAILED", 0)
+                or self.counts.get("ROLLBACK_UNCONFIRMED", 0)):
+            return "rollback-manual"
+        return "unknown"
+
+    @property
+    def release_safe(self) -> bool:
+        """Only a proven success or a proven clean refusal/rollback releases."""
+        return self.outcome in ("created", "rolled-back", "refused")
+
+    @property
+    def last_phase(self) -> str:
+        return self.phases[-1] if self.phases else ""
+
+    @property
+    def committed(self) -> bool:
+        return self.counts.get("COMMIT", 0) > 0
+
+    @property
+    def success(self) -> bool:
+        return self.counts.get("SUCCESS", 0) > 0
+
+    @property
+    def precommit_timeout(self) -> bool:
+        return any("precommit-timeout" in note for note in self.notes)
+
+
+_TX_PHASES_RE = re.compile(
+    r"HAUI_TX_PHASES_BEGIN\n(.*?)HAUI_TX_PHASES_END", re.S)
+_TX_RESULT_RE = re.compile(
+    r"HAUI_TX_RESULT_BEGIN\n(.*?)HAUI_TX_RESULT_END", re.S)
+_TX_PHASE_RE = re.compile(r"\A[a-z_]{1,32}\Z")
+_TX_COUNT_KEYS = (
+    "COMMIT", "SUCCESS", "ROLLED_BACK", "ROLLBACK_FAILED",
+    "ROLLBACK_UNCONFIRMED", "ROLLBACK_INTENT", "EXISTS", "LOCK",
+    "CONSISTENCY", "INCOMPLETE", "CREATE", "MISSING_CONFIG",
+    "NAME_INVALID", "RESERVED",
+)
+
+
+def _tx_int(value: str | None) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except ValueError:
+        return None
+
+
+def _parse_tx_status(output: str) -> TxStatus:
+    """Parse the fixed read-only evidence block; never guesses."""
+    text = (output or "").replace("\r", "")
+    values = _parse_key_values(text)
+    phases: list[str] = []
+    match = _TX_PHASES_RE.search(text)
+    if match:
+        for line in match.group(1).splitlines():
+            phase = line.split("\t", 1)[0].strip()
+            if _TX_PHASE_RE.match(phase):
+                phases.append(phase)
+    notes: list[str] = []
+    raw_notes = values.get("HAUI_TX_NOTES", "")
+    for note in raw_notes.split(","):
+        note = note.strip()
+        if note and re.fullmatch(r"[a-z-]{1,32}", note):
+            notes.append(note)
+    rc = finished = None
+    match = _TX_RESULT_RE.search(text)
+    if match:
+        result_values = _parse_key_values(match.group(1))
+        rc = _tx_int(result_values.get("rc"))
+        finished = _tx_int(result_values.get("finished"))
+    counts = {key: _tx_int(values.get("HAUI_TX_" + key)) or 0
+              for key in _TX_COUNT_KEYS}
+    damaged = (values.get("HAUI_TX_DAMAGED") == "1"
+               or "publish-failed" in notes or "publish-unsynced" in notes
+               or (finished is not None and rc is None))
+    return TxStatus(
+        tx_id=values.get("HAUI_TX_ID", ""),
+        absent=values.get("HAUI_TX_ABSENT") == "1",
+        phases=tuple(phases),
+        notes=tuple(notes),
+        rc=rc,
+        finished=finished,
+        running=values.get("HAUI_TX_RUNNING") == "1",
+        counts=counts,
+        damaged=damaged,
+    )
+
+
+@dataclass(frozen=True)
+class TxOverview:
+    """Every durable request for one client name plus the per-name claim.
+
+    ``records`` is newest-first. A claim without a matching record means a
+    launcher died between claiming and creating the directory: that is unknown
+    state and must stay blocked, never "absent".
+    """
+
+    records: tuple[TxStatus, ...]
+    claim: str | None
+
+    @property
+    def unfinished(self) -> bool:
+        return self.claim is not None and not any(
+            record.tx_id == self.claim for record in self.records)
+
+
+_TX_RECORD_RE = re.compile(
+    r"HAUI_TX_RECORD_BEGIN\n(.*?)HAUI_TX_RECORD_END", re.S)
+
+
+def _parse_tx_overview(output: str) -> TxOverview:
+    text = (output or "").replace("\r", "")
+    values = _parse_key_values(text)
+    records = tuple(_parse_tx_status(block)
+                    for block in _TX_RECORD_RE.findall(text))
+    claim = None
+    if values.get("HAUI_TX_CLAIM") == "1":
+        claim = values.get("HAUI_TX_CLAIM_TXID") or ""
+    return TxOverview(records=records, claim=claim)
+
+
 class RemoteProvider:
     """One VPS; every method is a read-only observation or the documented CLI."""
 
@@ -380,9 +1034,12 @@ class RemoteProvider:
             "else echo management=inactive; fi; "
             "if jq -e '.services[]? | select(.tag==\"monitor-api\") | has(\"secret\")' "
             "%s >/dev/null 2>&1; then echo api=present; else echo api=missing; fi; "
+            "if [ -f %s ]; then "
+            "echo cfgsha=$(sha256sum %s | awk '{print $1}'); "
+            "else echo cfgsha=none; fi; "
             "stat -c 'mtime=%%Y' %s 2>/dev/null || echo mtime=0"
         ) % (CONFIG_PATH, STATE_PATH, MANAGEMENT_MARKER, MANAGEMENT_MARKER,
-             CONFIG_PATH, CONFIG_PATH)
+             CONFIG_PATH, CONFIG_PATH, CONFIG_PATH, CONFIG_PATH)
         rc, out, err = self.session.exec(command, timeout=60.0)
         if rc != 0:
             raise HaUiError(errors.E_REMOTE_COMMAND, detail="preflight")
@@ -411,6 +1068,7 @@ class RemoteProvider:
             config_mtime=mtime,
             curl_present=values.get("curl") == "present",
             timeout_present=values.get("timeout") == "present",
+            config_sha256=_config_sha(values.get("cfgsha")),
         )
         if not facts.root:
             raise HaUiError(errors.E_REMOTE_NOT_ROOT)
@@ -447,10 +1105,19 @@ class RemoteProvider:
         return facts
 
     # ------------------------------------------------------------------ list --
-    def list_clients(self) -> dict[str, ClientRecord]:
+    def snapshot(self) -> "RemoteSnapshot":
+        """Read the live config identity and the client inventory together.
+
+        Both are emitted by ONE read-only command so they describe the same
+        moment. ``preflight`` still runs first: the snapshot is only meaningful
+        on a host that passed the canonical gates.
+        """
         preflight = self.preflight()
         command = (
             "stat -c 'mtime=%%Y' %s 2>/dev/null || echo mtime=0; "
+            "if [ -f %s ]; then "
+            "echo cfgsha=$(sha256sum %s | awk '{print $1}'); "
+            "else echo cfgsha=none; fi; "
             "jq -c '([.inbounds[]? | select(.tag==\"vless-in\")] | length) as $rn | "
             "([.inbounds[]? | select(.tag==\"hy2-in\")] | length) as $hn | "
             "{rn:$rn, hn:$hn, "
@@ -461,7 +1128,7 @@ class RemoteProvider:
             "%s 2>/dev/null; "
             "echo DERIVED; "
             "stat -c '%%n|%%a|%%u|%%s|%%Y' %s/*/mihomo.yaml 2>/dev/null || true"
-        ) % (CONFIG_PATH, CONFIG_PATH, CLIENTS_DIR)
+        ) % (CONFIG_PATH, CONFIG_PATH, CONFIG_PATH, CONFIG_PATH, CLIENTS_DIR)
         rc, out, err = self.session.exec(command, timeout=60.0,
                                          max_output=MAX_LIST_JSON)
         if rc != 0:
@@ -480,7 +1147,13 @@ class RemoteProvider:
             config_mtime = int(values.get("mtime", preflight.config_mtime))
         except ValueError:
             config_mtime = preflight.config_mtime
-        return _build_records(doc, out, config_mtime)
+        return RemoteSnapshot(
+            config_sha256=_config_sha(values.get("cfgsha")),
+            config_mtime=config_mtime,
+            records=_build_records(doc, out, config_mtime))
+
+    def list_clients(self) -> dict[str, ClientRecord]:
+        return dict(self.snapshot().records)
 
     # ---------------------------------------------------------------- export --
     def generate_exports(self, names: list[str], *,
@@ -507,6 +1180,179 @@ class RemoteProvider:
         if stale:
             self._run_cli_generation(stale)
         return self.read_exports(validated)
+
+    # ---------------------------------------------------------------- create --
+    def create_client(self, name: str, *, confirmed: bool) -> None:
+        """Create one logical client on THIS VPS through the canonical add path.
+
+        This is a write operation. It requires the UI's explicit confirmation
+        and only ever invokes the reviewed installer menu 10→2, which runs the
+        existing ``add_client`` → ``with_client_lock`` →
+        ``cm_add_client_candidate_planned`` → ``commit_server_config`` chain
+        (independent credentials, backup, sing-box check, reload/health and
+        rollback). It never edits ``sbconfig_server.json`` directly.
+
+        The transaction itself runs in a detached one-shot server worker with a
+        durable phase journal (see ``_add_client_command``), so a GUI timeout, an
+        SSH abort or a closed stdout consumer cannot terminate the write,
+        reload or rollback. The client only stops *waiting*; the durable state is
+        what decides the outcome:
+
+        * success requires the worker's terminal ``rc=0``, the commit marker and
+          the canonical success line in its redacted transcript, plus a fresh
+          live read proving the record exportable;
+        * a proven rollback requires the exact restore sentence AND a live read
+          showing the pre-write bytes with the name absent;
+        * everything else — still running, crashed without a terminal record,
+          failed/unconfirmed rollback, unreadable reconciliation — is
+          ``E_CREATE_UNCERTAIN``. Only ``pending_transaction`` may later clear
+          that state, and only when the request has actually ended.
+
+        Power loss or a kernel crash are not covered by this promise: they are
+        detected by the missing terminal record and must stay UNCERTAIN. No
+        credential, UUID, YAML or raw remote text is returned.
+        """
+        if confirmed is not True:
+            raise HaUiError(errors.E_USAGE, detail="create-consent")
+        validated = validate_client_name(name)
+        if validated.casefold() == RESERVED_CLIENT_NAME.casefold():
+            raise HaUiError(errors.E_USAGE, detail="reserved-name")
+        before = self.snapshot()
+        if before.record(validated) is not None:
+            raise HaUiError(errors.E_CLIENT_EXISTS, detail="server")
+        txid = _tx_id(validated)
+        if TX_ID_RE.match(txid) is None:  # defensive: never interpolate junk
+            raise HaUiError(errors.E_INTERNAL)
+        command = _add_client_command(validated, txid)
+        try:
+            _rc, out, _err = self.session.exec(
+                command, timeout=TX_WAIT_TIMEOUT, max_output=MAX_TX_OUTPUT)
+        except HaUiError as exc:
+            if exc.code in (errors.E_SSH_TIMEOUT, errors.E_SSH_CLOSED):
+                # We stopped waiting; the detached worker may still be running.
+                # Only a later read-only query may resolve it.
+                raise HaUiError(errors.E_CREATE_UNCERTAIN,
+                                detail="tx-transport") from None
+            raise
+        if "HAUI_TX_STARTED=1" not in out:
+            self._raise_launch_failure(out)
+        self._judge_tx(_parse_tx_status(out), validated, before)
+        return None
+
+    def pending_transactions(self, name: str) -> "TxOverview":
+        """Read-only query of every durable request for *name*.
+
+        Never writes, never kills, never retries. Reports the per-name claim and
+        all same-name records (newest first), so a stale or unfinished request
+        cannot be mistaken for "absent".
+        """
+        validated = validate_client_name(name)
+        self.preflight()
+        rc, out, _err = self.session.exec(_pending_tx_command(validated),
+                                          timeout=45.0)
+        if rc != 0:
+            raise HaUiError(errors.E_REMOTE_LIST, detail="tx-status")
+        return _parse_tx_overview(out)
+
+    @staticmethod
+    def _raise_launch_failure(output: str) -> None:
+        match = re.search(r"HAUI_MENU_FAIL=([a-z-]{1,32})", output)
+        token = match.group(1) if match else ""
+        if token in _INSTALLER_UNTRUSTED_TOKENS:
+            raise HaUiError(errors.E_INSTALLER_UNTRUSTED, detail=token)
+        if token in ("fetch", "fetch-lib", "menu-drift", "txdir", "temp"):
+            # Nothing ran against the live config.
+            raise HaUiError(errors.E_REMOTE_MENU, detail=token)
+        if token in ("hook-unproven", "hook-exported", "env-hash"):
+            # The transaction shell is not proven: fail closed before a write.
+            raise HaUiError(errors.E_CREATE_UNCERTAIN, detail=token)
+        if token == "tx-exists":
+            raise HaUiError(errors.E_CREATE_UNCERTAIN, detail="tx-exists")
+        raise HaUiError(errors.E_CREATE_UNCERTAIN, detail="launch-unproven")
+
+    def _judge_tx(self, status: "TxStatus", name: str,
+                  before: RemoteSnapshot) -> None:
+        """Turn one managed transaction's durable state into a verdict."""
+        if status.absent:
+            raise HaUiError(errors.E_CREATE_UNCERTAIN, detail="tx-absent")
+        if status.damaged:
+            # A partial/unfsynced result is not a terminal record.
+            raise HaUiError(errors.E_CREATE_UNCERTAIN, detail="tx-damaged")
+        if not status.terminal:
+            # Still running, or the worker vanished without publishing a
+            # terminal record: never decide anything from this.
+            raise HaUiError(errors.E_CREATE_UNCERTAIN,
+                            detail="running" if status.running
+                            else "tx-unfinished")
+        evidence = self._reconcile(before, name)
+        counts = status.counts
+        if status.success and status.committed and status.rc == 0:
+            self._prove_created(name, before)
+            return
+        if status.success and not status.committed:
+            raise HaUiError(errors.E_CREATE_UNCERTAIN,
+                            detail="commit-unproven")
+        if counts.get("ROLLED_BACK", 0) and evidence.rolled_back_proven:
+            raise HaUiError(errors.E_REMOTE_CREATE, detail="rolled-back")
+        if counts.get("ROLLBACK_FAILED", 0):
+            raise HaUiError(errors.E_CREATE_UNCERTAIN,
+                            detail="rollback-failed")
+        if (counts.get("ROLLBACK_UNCONFIRMED", 0)
+                or "rollback_manual" in status.phases):
+            raise HaUiError(errors.E_CREATE_UNCERTAIN,
+                            detail="rollback-unconfirmed")
+        if counts.get("ROLLBACK_INTENT", 0):
+            raise HaUiError(errors.E_CREATE_UNCERTAIN,
+                            detail="rollback-unconfirmed")
+        for token, key in _TX_REFUSALS:
+            if not counts.get(key, 0):
+                continue
+            if evidence.write_observed:
+                # A refusal sentence is not trustworthy if the bytes or the
+                # name set changed anyway.
+                raise HaUiError(errors.E_CREATE_UNCERTAIN,
+                                detail="refusal-after-write")
+            if token == "exists":
+                raise HaUiError(errors.E_CLIENT_EXISTS, detail="server")
+            raise HaUiError(errors.E_REMOTE_CREATE, detail=token)
+        if evidence.write_observed:
+            raise HaUiError(errors.E_CREATE_UNCERTAIN, detail="write-unproven")
+        raise HaUiError(errors.E_CREATE_UNCERTAIN, detail="unconfirmed")
+
+    def _prove_created(self, name: str, before: RemoteSnapshot) -> None:
+        """Post-write proof: the live record must be exportable."""
+        del before  # kept for symmetry/extensibility; evidence is the live read
+        try:
+            after = self.snapshot()
+        except HaUiError:
+            raise HaUiError(errors.E_CREATE_UNCERTAIN,
+                            detail="verify-unreadable") from None
+        record = after.record(name)
+        if record is None:
+            raise HaUiError(errors.E_REMOTE_VERIFY, detail="missing")
+        if not record.exportable:
+            # Both credentials present but a structural anomaly exists: the
+            # client must not be reported as a completed, generatable client.
+            raise HaUiError(errors.E_REMOTE_VERIFY, detail="incomplete")
+
+    def _reconcile(self, before: RemoteSnapshot,
+                   name: str) -> "_ReconcileEvidence":
+        """Read-only evidence after a failed/timed-out add; never raises."""
+        try:
+            after = self.snapshot()
+        except HaUiError:
+            return _ReconcileEvidence(readable=False)
+        changed: bool | None = None
+        if (before.config_sha256 is not None
+                and after.config_sha256 is not None):
+            changed = before.config_sha256 != after.config_sha256
+        record = after.record(name)
+        return _ReconcileEvidence(
+            readable=True,
+            config_sha256=after.config_sha256,
+            config_changed=changed,
+            present=record is not None,
+            exportable=None if record is None else record.exportable)
 
     def _run_cli_generation(self, names: list[str]) -> None:
         """Run the verified installer menu and prove every requested export.
@@ -548,8 +1394,15 @@ class RemoteProvider:
 
     # ------------------------------------------------- menu proof primitives --
     @staticmethod
-    def _verify_menu_output(output: str, names: list[str]) -> None:
-        text = (output or "").replace("\r", "")
+    def _menu_completion(text: str) -> str:
+        """Validate the pinned-wrapper completion frame; return transcript.
+
+        Both the export and add paths share this frame: a completed pinned
+        fetch/verification, a real menu transcript, and the three pipeline exit
+        statuses. The returned transcript excludes the trailing markers so
+        callers can require their own operation-specific success line.
+        """
+        text = (text or "").replace("\r", "")
         fail = re.search(r"HAUI_MENU_FAIL=([a-z-]{1,32})", text)
         if fail:
             token = fail.group(1)
@@ -567,7 +1420,11 @@ class RemoteProvider:
             raise HaUiError(errors.E_REMOTE_MENU, detail="timeout")
         if printf_rc != 0 or menu_rc != 0 or sed_rc != 0:
             raise HaUiError(errors.E_REMOTE_MENU, detail="exit-status")
-        transcript = text[:match.start()]
+        return text[:match.start()]
+
+    @staticmethod
+    def _verify_menu_output(output: str, names: list[str]) -> None:
+        transcript = RemoteProvider._menu_completion(output)
         for marker in MENU_TRANSCRIPT_MARKERS:
             if marker not in transcript:
                 raise HaUiError(errors.E_REMOTE_MENU, detail="menu-drift")

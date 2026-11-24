@@ -206,5 +206,98 @@ EXE 仅作为本地/CI 构建产物，不替代真实环境验收。
 - 删除 EXE 即移除程序；
 - 删除 `%LOCALAPPDATA%\HASingbox` 即移除所有本地私有配置、运行目录与交付文件；
 - 在 Windows 凭据管理器删除 `ha-ui-ssh` 下的 `server-A` / `server-B` 条目；
-- 本工具不修改服务器，因此无需服务器回滚；HA 交付本身按运行目录内原始
-  manifest/文件手工回退。
+- **生成 YAML** 不修改服务器，无需服务器回滚；HA 交付按运行目录内原始 manifest/文件
+  手工回退。
+- **新建客户端**会修改服务器配置：服务端 canonical add 自带失败回滚与备份；若需移除
+  已成功创建的测试客户端，应按既有 `miaomiao` 客户端管理流程人工删除（删除可能触发
+  凭据吊销），不要用旧版 HA-UI 或手工编辑 JSON 代替。0.2.0 GUI 不提供客户端删除。
+
+## 7. 窗口控制台弹窗（CMD 闪现）回归门
+
+### 7.1 根因
+
+打包后的 `ha-ui.exe` 是 `--windowed`（GUI 子系统、无控制台）。私有工作区
+（`ha_ui/core/private_fs.py`）对每个目录/文件调用 `icacls.exe` 建立并校验 NTFS
+DACL；`icacls.exe` 是控制台子系统程序，GUI 父进程没有可继承的控制台时，Windows
+会为每次调用分配一个新的 CMD 控制台窗口。`ensure_private_dir` /
+`secure_write_replace` 每次生成会调用多次 `icacls`，因此正常使用时会连续闪出多个
+CMD 窗口。
+
+### 7.2 修复
+
+`private_fs._icacls` 现在通过 `console_isolation_kwargs()` 传入
+`creationflags=CREATE_NO_WINDOW (0x08000000)`；该 helper 在 POSIX 上返回空参数，
+后续任何控制台子进程可复用。`capture_output`、30s 超时、返回码处理与
+`E_ACL` 错误映射保持不变。`--self-test` 额外在自检工作区下创建并删除一个私有临时
+目录/文件（`ensure_private_dir` + `secure_write_replace` + `verify_private_file`），
+因此 EXE 冷启动自检会真正执行 `icacls`。
+
+注意：`CREATE_NO_WINDOW` 仍会创建**无窗口**的 `conhost.exe`（Windows 的正常行为），
+它不会显示任何窗口；回归判据是**可见的 `ConsoleWindowClass` 窗口**，无窗口
+conhost 只作为诊断信息输出。
+
+### 7.3 验收
+
+```powershell
+# 已构建 EXE（正式验收门；集成构建后运行）
+py -3.13 ha-ui\ci\check_no_console_popup.py --exe dist\ha-ui.exe
+
+# 构建前源码级预检（用 pythonw.exe 模拟无控制台的 GUI 进程）
+py -3.13 ha-ui\ci\check_no_console_popup.py --source
+```
+
+脚本使用 `EnumWindows` + `GetClassNameW` 与 Toolhelp32 快照（仅 ctypes/标准库，
+无需管理员权限），在 `.scratch/` 下的隔离 `HA_UI_HOME`/`TEMP` 中运行 `--self-test`；
+先以 `CREATE_NEW_CONSOLE` 的 `cmd /c ping` 正向对照证明检测器有效，再断言 EXE
+运行期间没有新的**可见** `ConsoleWindowClass` 窗口（无窗口的 headless conhost 只按
+诊断输出，不判失败）。成功输出
+`{"checked": true, "positive_control": true, "console_events": 0, "ok": true}`
+并退出 0；检测到窗口/自检失败退出 1；检测器不可用（正向对照未检测到）输出
+`"detector": "unavailable"` 并退出 2。对应 pytest 回归测试为
+`ha-ui/tests/test_windows_console_isolation.py`。
+
+## 8. Linux 事务 lab（P0 证据，CI 必跑）
+
+`linux-tx-lab`（ubuntu-22.04）执行两个脚本，全部无 root、无网络、无真实 VPS：
+
+```bash
+bash ha-ui/ci/linux/tx_mechanism.sh   # Stage A：BASH_ENV 同进程 hook + fail-closed
+python3 ha-ui/ci/linux/tx_lab.py      # Stage B：真实 lib 事务 + 进程级故障注入
+```
+
+`tx_mechanism.sh` 断言 7 项：env.sh 摘要、函数只在事务 shell、非导出、加载后
+`unset BASH_ENV`、加载哨兵、缺失 BASH_ENV 被 bash 静默忽略（必须靠哨兵/declare -F
+识别）、篡改检测、真实 `cm_tx_journal_phase` 调用、hook 失败 fail-closed。
+
+`tx_lab.py` 用真实 `lib/client-management.sh` 的 `commit_server_config`（stub
+`systemctl`/`sing-box`）与 production worker 文本，覆盖：committed、health 失败回滚、
+回滚未确认、`reload` 阶段 SIGKILL（新字节 + journal 停在 reload + 锁最终释放）、
+并发写者被 canonical 锁拒绝、launcher 被杀后 worker 继续、stdout 消费者退出、
+pre-commit watchdog、只读状态查询。失败时打印 out/journal 摘要，便于定位。
+
+本 lab 只证明本机/CI 的 Bash 事务与进程边界；真实 A/B VPS 仍按
+`docs/windows-ha-ui-acceptance.md` 执行。
+
+
+### 8.1 第四轮复审新增场景（Linux lab，14 项 Stage B）
+
+`tx_lab.py` 新增：真实目录上的 production pending 查询（glob 回归）、per-name claim
+并发/重启阻断与过期接管、release 判定矩阵（rollback_manual / worker-alive / damaged
+不得解除）、watchdog 在 replace 前后均只报告不杀、以及注入失败 `sync` 时 journal
+必须 fail-closed。
+
+
+### 8.2 第五轮复审新增场景（Stage B 共 17 项）
+
+服务端安全准则：`guard-safe-terminal`（rollback-failed / rollback_manual /
+publish-failed / truncated / worker-alive 阻断，created / rolled-back / refused 放行）、
+`cleanup-retention`（只删除安全且过期的记录）、`publish-failure-keeps-claim`
+（失败 sync 下 claim 保留且 guard 阻断）。
+
+
+### 8.3 第六轮复审补充（claim 生命周期）
+
+`claim-guard` 增加：aged claim（dead pid + 3 天）不被自动接管、并发首次请求恰好一个
+成功、aged claim 下并发请求全部 `tx-in-flight`、人工删除后才允许重试；
+`publish-failure-keeps-claim` 增加"失败 marker 缺失 + aged claim"仍阻断、且 retention
+不删除证据。

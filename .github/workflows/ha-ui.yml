@@ -58,6 +58,19 @@ jobs:
           ! grep -RInE "(HTTPServer|socketserver|QTcpServer|subprocess.*clash|startfile.*verge|tun\.enable.*True)" ha-ui/ha_ui || {
             echo "::error::forbidden public listener / auto-import construct"; exit 1; }
 
+  linux-tx-lab:
+    name: linux-tx-lab
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Stage A transaction-hook mechanism gate (BASH_ENV)
+        run: bash ha-ui/ci/linux/tx_mechanism.sh
+      - name: Stage B transaction lab (real bash, injected failures)
+        run: python3 ha-ui/ci/linux/tx_lab.py
+
   windows-tests:
     name: windows-tests
     runs-on: windows-2022
@@ -129,6 +142,15 @@ jobs:
         run: python ha-ui/ci/verify_receipt.py --dist dist
       - name: Verify SHA256SUMS hashes every built artifact
         run: python ha-ui/ci/verify_artifact_sums.py --dist dist
+      - name: No-console-window acceptance (packaged EXE)
+        shell: pwsh
+        run: |
+          python ha-ui/ci/check_no_console_popup.py --exe dist/ha-ui.exe
+          if ($LASTEXITCODE -eq 2) {
+            Write-Warning "console detector unavailable on this agent; the CREATE_NO_WINDOW assertion in pytest is still enforced"
+            exit 0
+          }
+          exit $LASTEXITCODE
       - name: Publish build summary
         shell: pwsh
         run: |

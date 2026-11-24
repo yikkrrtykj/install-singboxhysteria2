@@ -33,23 +33,97 @@ from .ui.main_window import MainWindow
 from .ui.services import ServerActions
 
 SIMPLE_QSS = """
-QMainWindow { background: #f3f5f8; }
-QLabel#safetyBanner {
-    background: #fff4ce; border: 1px solid #e2c56b; border-radius: 6px;
-    color: #5a4300; padding: 8px 12px; font-weight: 600;
+QMainWindow { background: #f4f6fa; }
+QWidget { font-family: "Microsoft YaHei UI", "Segoe UI"; font-size: 13px; }
+QLabel#appTitle { font-size: 21px; font-weight: 700; color: #172033; }
+QLabel#appSubtitle { color: #667085; padding-top: 2px; }
+QTabWidget::pane {
+    border: 2px solid #e4e7ec; background: #ffffff; border-radius: 10px;
+    top: -1px;
 }
+QTabBar::tab {
+    background: transparent; color: #475467; padding: 9px 22px;
+    margin-right: 4px; border: none; font-weight: 600;
+}
+QTabBar::tab:selected { color: #1a56db; border-bottom: 2px solid #1a56db; }
+QTabBar::tab:hover { color: #1a56db; }
 QGroupBox {
-    background: #ffffff; border: 1px solid #d6dae1; border-radius: 8px;
-    margin-top: 14px; padding: 10px 10px 8px 10px;
+    background: #ffffff; border: 1px solid #e4e7ec; border-radius: 8px;
+    margin-top: 14px; padding: 12px 12px 10px 12px;
 }
 QGroupBox::title {
     subcontrol-origin: margin; left: 12px; padding: 0 4px;
     color: #1f2a37; font-weight: 600;
 }
 QLabel#connectionStatus { color: #1f2a37; font-weight: 600; }
-QLabel#fingerprintStatus, QLabel#credentialHint, QLabel#hint { color: #5b6472; }
+QLabel#fingerprintStatus, QLabel#credentialHint, QLabel#hint { color: #667085; }
 QLabel#hostKeyWarning { color: #9a2a00; font-weight: 600; }
-QPushButton { padding: 5px 10px; }
+QLabel#serverSummary {
+    background: #eef4ff; color: #1f2a37; border-radius: 11px;
+    padding: 4px 11px; font-weight: 600;
+}
+QLabel#clientCount { color: #475467; }
+QLabel#certSummary { padding: 4px 8px; }
+QLabel#emptyState {
+    color: #667085; padding: 28px 12px; border: 1px dashed #d0d5dd;
+    border-radius: 8px; background: #fcfcfd;
+}
+QLabel#selectionCount { color: #344054; font-weight: 600; }
+QLabel#generationSelection { color: #1f2a37; font-size: 14px; }
+QLabel#generationSuccess { color: #1f6b3a; font-size: 15px; font-weight: 600; }
+QLabel#generationFailure {
+    background: #fef3f2; border: 1px solid #fda29b; border-radius: 6px;
+    color: #912018; padding: 8px 10px;
+}
+QLabel#consentHint { color: #7a4b00; }
+QLabel#creationResult {
+    background: #fffaeb; border: 1px solid #fec84b; border-radius: 6px;
+    color: #7a4b00; padding: 8px 10px;
+}
+QLabel#validationError { color: #b42318; }
+QLabel#createWarning {
+    background: #fffaeb; border: 1px solid #fec84b; border-radius: 6px;
+    color: #7a4b00; padding: 9px 10px;
+}
+QPushButton {
+    padding: 6px 12px; border: 1px solid #d0d5dd; border-radius: 6px;
+    background: #ffffff; color: #344054;
+}
+QPushButton:hover { background: #f9fafb; }
+QPushButton:disabled { color: #98a2b3; background: #f2f4f7; }
+QPushButton#primaryButton {
+    background: #1a56db; color: #ffffff; border: 1px solid #1a56db;
+    font-weight: 600; padding: 8px 16px;
+}
+QPushButton#primaryButton:hover { background: #1546b8; }
+QPushButton#primaryButton:disabled {
+    background: #b2c7f7; border-color: #b2c7f7; color: #ffffff;
+}
+QPushButton#secondaryButton { background: #ffffff; }
+QPushButton#linkButton {
+    background: transparent; border: none; color: #1a56db; padding: 2px 6px;
+}
+QPushButton#linkButton:hover { text-decoration: underline; }
+QToolButton#advancedToggle {
+    border: none; background: transparent; color: #475467; font-weight: 600;
+    padding: 4px 2px;
+}
+QToolButton#advancedToggle:hover { color: #1a56db; }
+QTableWidget {
+    background: #ffffff; alternate-background-color: #f9fafb;
+    border: 1px solid #e4e7ec; border-radius: 8px; gridline-color: transparent;
+}
+QTableWidget::item { padding: 4px 8px; }
+QHeaderView::section {
+    background: #f9fafb; color: #475467; border: none;
+    border-bottom: 1px solid #e4e7ec; padding: 7px 8px; font-weight: 600;
+}
+QComboBox { padding: 4px 8px; border: 1px solid #d0d5dd; border-radius: 5px; }
+QPlainTextEdit#generationLog {
+    background: #fcfcfd; border: 1px solid #e4e7ec; border-radius: 6px;
+    font-family: Consolas, "Cascadia Mono", monospace; color: #475467;
+}
+QStatusBar { color: #667085; }
 """
 
 
@@ -88,6 +162,34 @@ def _pump_events(app: QApplication, milliseconds: int = 100) -> None:
     app.processEvents()
 
 
+def _exercise_private_storage(workspace: Path) -> None:
+    """Exercise the real private-storage path (ACL + atomic write) once.
+
+    The packaged EXE is windowed (no console); without this step the cold-start
+    smoke test never spawns the ``icacls`` console child that the private ACL
+    needs, so a console-window regression would go unnoticed. Only a fixed
+    ``HaUiError`` code reaches the caller; no file content or path is printed.
+    """
+    from .core import private_fs
+
+    root = workspace / "selftest-private"
+    payload = b'{"selftest": 1}\n'
+    try:
+        private_fs.ensure_private_dir(root, workspace=workspace)
+        private_fs.verify_private_dir(root)
+        target = root / "selftest.bin"
+        private_fs.secure_write_replace(target, payload, workspace=workspace)
+        private_fs.verify_private_file(target)
+        if private_fs.read_private_file(target, workspace=workspace) != payload:
+            raise HaUiError(errors.E_STORE_IO, detail="selftest-readback")
+    finally:
+        # Best-effort: a failed self-test must not leave a private test tree.
+        try:
+            private_fs.delete_tree_under(workspace, root)
+        except HaUiError:
+            pass
+
+
 def run_self_test() -> int:
     """Cold-start smoke: real window, in-memory vault, temporary workspace."""
     app = ensure_application()
@@ -110,6 +212,8 @@ def run_self_test() -> int:
         _pump_events(app)
         if window.windowTitle() != "%s %s" % (APP_NAME, APP_VERSION):
             status = 1
+        if status == 0:
+            _exercise_private_storage(workspace)
     except HaUiError as exc:
         print("HA-UI self-test: FAILED %s" % exc.code, file=sys.stderr)
         status = 1

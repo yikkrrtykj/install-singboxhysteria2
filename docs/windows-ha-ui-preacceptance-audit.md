@@ -1,5 +1,11 @@
 # HA-UI 预验收 PR 审计（2026-11-21）
 
+> 历史文档：本文记录 0.1.0 预验收（#111–#115）。0.2.0 已新增 GUI 双端创建、
+> 信任锚刷新与页面重构；创建相关的安全/验收边界以
+> `docs/windows-ha-ui-data-path.md` §7、`docs/windows-ha-ui-operator.md` §3 与
+> `docs/windows-ha-ui-acceptance.md` C0–C0e 为准。本文的“只读”描述仅适用于
+> 0.1.0 生成链，不适用于 0.2.0 新建客户端。
+
 范围：#111–#115 的 exact HEAD、base、merge-base、变更范围、测试证据、CI，以及
 #111 ↔ #114 菜单自动化兼容性、#112 → #114 代码依赖。所有 PR 保持 Draft；本审计**不
 合并、不部署**。

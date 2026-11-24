@@ -26,11 +26,12 @@ never stored on the service instance, logged or rendered.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Callable, Mapping, Protocol
+from typing import Callable, Mapping, Protocol, Sequence
 
 from ..core import chain, errors, private_fs
 from ..core.errors import HaUiError
 from ..core.models import (
+    ClientCreationResult,
     GenerationResult,
     ProbePolicy,
     SelectedClient,
@@ -53,6 +54,11 @@ STAGE_LABELS: dict[str, str] = {
     "stage:ha03": "HA-03 证书校验与配置生成",
     "stage:ha04": "HA-04 快速探测策略生成",
     "stage:friendly": "发布 A-first / B-first 文件",
+    "stage:create-preflight": "创建前检查两台 VPS",
+    "stage:create-pins": "校验两端证书身份",
+    "stage:create-a": "正在 A 端创建客户端",
+    "stage:create-b": "正在 B 端创建客户端",
+    "stage:create-verify": "重新读取两端确认结果",
 }
 UNKNOWN_STAGE_LABEL = "处理中"
 
@@ -65,7 +71,15 @@ def format_stage(token: str) -> str:
 class GenerationBackend(Protocol):
     """The core service methods the UI needs (kept small for test fakes)."""
 
-    def preview(self, sessions: Mapping[str, RemoteSession]) -> PreviewResult: ...
+    def preview(self, sessions: Mapping[str, RemoteSession], *,
+                pending_names: Sequence[str] = ...
+                ) -> PreviewResult: ...
+
+    def create_client(self, *, sessions: Mapping[str, RemoteSession],
+                      name: str, confirmed: bool,
+                      allow_partial_repair: bool = ...,
+                      progress: Callable[[str], None] | None = ...
+                      ) -> ClientCreationResult: ...
 
     def generate(self, *, sessions: Mapping[str, RemoteSession],
                  selected: list[SelectedClient], policy: ProbePolicy,
@@ -170,14 +184,46 @@ class SessionGenerationService:
 
     # ---------------------------------------------------------------- preview --
     def preview(self, *, password_overrides: Mapping[str, str] | None = None,
-                cancel: Callable[[], bool] | None = None) -> PreviewResult:
+                cancel: Callable[[], bool] | None = None,
+                pending_names: Sequence[str] = ()) -> PreviewResult:
         sessions = self._open_sessions(password_overrides, cancel)
         try:
-            return self._service.preview(sessions)
+            return self._service.preview(
+                sessions, pending_names=tuple(pending_names))
         finally:
             self._close_sessions(sessions)
 
     # --------------------------------------------------------------- generate --
+    def create_client(
+        self,
+        *,
+        name: str,
+        confirmed: bool,
+        allow_partial_repair: bool = False,
+        password_overrides: Mapping[str, str] | None = None,
+        progress: Callable[[str], None] | None = None,
+    ) -> ClientCreationResult:
+        """Run one dual-VPS creation attempt through the pinned sessions.
+
+        The remote write is confirmed in the UI before this method is called;
+        ``confirmed`` is passed through so the core path can refuse a caller
+        that skipped the explicit consent. An unconfirmed call is rejected
+        before opening either SSH session.
+        """
+        if confirmed is not True:
+            raise HaUiError(errors.E_USAGE, detail="create-consent")
+        sessions = self._open_sessions(password_overrides, None)
+        try:
+            return self._service.create_client(
+                sessions=sessions,
+                name=name,
+                confirmed=confirmed,
+                allow_partial_repair=allow_partial_repair,
+                progress=progress,
+            )
+        finally:
+            self._close_sessions(sessions)
+
     def generate(
         self,
         *,
