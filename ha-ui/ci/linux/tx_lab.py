@@ -214,9 +214,14 @@ def scenario_health_rollback(work: Path) -> None:
 
 
 def scenario_rollback_unconfirmed(work: Path) -> None:
+    # A reload failure before health (and again after the restore) is the
+    # canonical "service recovery not confirmed" case. Note the reviewed
+    # reload_running_singbox() returns 0 when neither systemd nor pgrep sees a
+    # service, so the failure must come from a running service whose reload
+    # fails, not from a failing liveness probe.
     rc, out, live = commit_scenario(
         work, config([]), config(["alpha"]),
-        {"STUB_ACTIVE1_RC": "0", "STUB_ACTIVE3_RC": "1",
+        {"STUB_ACTIVE1_RC": "0", "STUB_ACTIVE3_RC": "0",
          "STUB_RELOAD_RC": "1"})
     if rc == 0:
         fail("unconfirmed rollback reported success")
