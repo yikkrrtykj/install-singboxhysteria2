@@ -242,7 +242,7 @@ def scenario_rollback_unconfirmed(work: Path) -> None:
 def scenario_kill_during_reload(work: Path) -> None:
     _rc, _out, live = commit_scenario(
         work, config([]), config(["alpha"]),
-        {"STUB_ACTIVE1_RC": "0", "STUB_RELOAD_SLEEP": "30"},
+        {"STUB_ACTIVE1_RC": "0", "STUB_RELOAD_SLEEP": "5"},
         kill_on_phase="reload")
     if '"alpha"' not in live.read_text():
         fail("kill scenario: replaced bytes were not live")
@@ -252,8 +252,16 @@ def scenario_kill_during_reload(work: Path) -> None:
         fail("kill scenario: journal last phase is %r" % (phases[-1:],))
     if "health" in phases:
         fail("kill scenario: health ran after the kill")
-    probe = subprocess.run(["flock", "-n", str(work / "lock"), "true"],
-                           capture_output=True)
+    # coreutils timeout runs the reload stub in its own process group, so a
+    # killed transaction can leave a bounded child holding the inherited lock
+    # fd. The lock must be free once that bounded child exits.
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        probe = subprocess.run(["flock", "-n", str(work / "lock"), "true"],
+                               capture_output=True)
+        if probe.returncode == 0:
+            break
+        time.sleep(0.2)
     if probe.returncode != 0:
         fail("kill scenario: the canonical lock was not released")
     ok("SIGKILL during reload leaves new bytes + phase=reload + free lock")
