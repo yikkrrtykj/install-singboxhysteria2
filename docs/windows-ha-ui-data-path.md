@@ -323,3 +323,24 @@ guard 与保留策略共用 `ha_ui_tx_safe_terminal()`：
   `cleanup-retention`（旧 safe 删除 / 旧 unsafe 与未完成保留）、
   `publish-failure-keeps-claim`（注入失败 sync → claim 保留 + guard 阻断），
   均使用生产 `_tx_guard_script` / `_tx_cleanup_script` / worker 文本。
+
+
+### 7.8 第六轮复审：claim 生命周期不再自动接管
+
+第六轮指出 `mtime + 1 天 + pid 已死 → rm -rf claim` 会重新打开两个缺口：两个
+launcher 同时遇到过期 claim 时的 TOCTOU；以及"发布失败但 marker 也写不进去"时，
+唯一可靠的阻断证据（claim）会在一天后被自动删除。
+
+现行规则：
+
+- **claim 只增不接管**：`mkdir` 失败即 `tx-in-flight`，guard 中不存在任何基于
+  mtime/pid 的 `rm -rf claim` 路径；异常残留的 claim 只能由操作员核对 live 状态、
+  备份目录后人工清理。
+- **释放必须证明所有权**：launcher 的失败路径与 worker 的成功路径都先比较
+  `claim/txid` 与本次 txid，只有相等才删除；不相等/缺失则保持原样（fail-closed）。
+- **保留策略遇 claim 即停**：只要同名 claim 存在，cleanup 不删除该名称的任何记录，
+  避免证据被"等过期"清掉；cleanup 在 launcher 中先于 claim 创建执行。
+- **Linux 证据**：`claim-guard` 覆盖 aged claim（dead pid + 3 天）不被接管、
+  并发首次请求只有一个成功、aged claim 下并发请求全部 15、人工删除后才可重试；
+  `publish-failure-keeps-claim` 额外覆盖"marker 缺失 + aged claim"仍 blocked 且
+  证据不被 retention 删除。
