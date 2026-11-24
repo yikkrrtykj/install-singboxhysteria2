@@ -225,6 +225,10 @@ privileged `client.export`（锁内渲染 + 审计），而不是 shell 菜单�
   `RemotePreflight.config_sha256`（不再是永远为 `None` 的占位字段）。
 - 哈希只接受严格的小写 64 位十六进制；取不到 = 没有证据，**绝不**当成“未变化”。
 - 核对只在失败/超时后执行一次；核对本身失败（连接已断、jq 失败） → `uncertain`。
+- 超时可能落在 `replace` / `reload` / `health` / `rollback` 任一阶段；四个阶段的模拟
+  故障测试都断言 `uncertain`（有写入证据时 `timeout-write`，否则 `timeout`），并断言
+  客户端**不会发出第二次写入**——远端进程可能仍在运行，客户端只停止等待，不尝试杀进程
+  或重试。
 - **核对只提供可观测性，不提供原子性。** 客户端无法阻止外层 `timeout -k 10 420`
   在 `replace` 与 `reload`/`health`/回滚之间打断服务端事务；也无法阻止 SSH 通道
   断开导致管道 SIGPIPE。`MENU_RUN_TIMEOUT` 没有被调大（复审明确禁止用调大超时当修复）。

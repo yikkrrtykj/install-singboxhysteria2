@@ -1,4 +1,4 @@
-# HA-UI 0.2.0 — 合成数据 UI 截图
+﻿# HA-UI 0.2.0 — 合成数据 UI 截图
 
 这些截图由 0.2.0 开发树的真实 PySide6 窗口在 Windows 本机渲染生成，**全部使用合成
 数据**：
@@ -24,7 +24,7 @@
 
 | 项 | 结果 |
 | --- | --- |
-| offscreen pytest（本机 Windows，Python 3.13.15，pinned deps） | `576 passed, 4 skipped`（skip 均为宿主限制：3×symlink、1×真实凭据库） |
+| offscreen pytest（本机 Windows，Python 3.13.15，pinned deps） | `580 passed, 4 skipped`（skip 均为宿主限制：3×symlink、1×真实凭据库） |
 | 新增测试 | `tests/test_record_completeness.py`、`tests/test_windows_console_isolation.py` |
 | 创建结果分类 | `created` / `failed(pre-write)` / `failed(rolled-back)` / `uncertain(...)`；规则见 `docs/windows-ha-ui-data-path.md` §7 |
 | P0 事务安全 | **BLOCKED**：客户端只能检出与不误报，无法提供写入原子性；解除条件见 data-path §8 |

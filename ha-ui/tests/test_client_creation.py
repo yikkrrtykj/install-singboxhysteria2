@@ -171,6 +171,27 @@ def test_transport_timeout_is_uncertain_and_distinguished():
     assert excinfo.value.detail == "timeout-transport"
 
 
+@pytest.mark.parametrize("stage,expect_detail", [
+    ("replace", "timeout"),
+    ("reload", "timeout-write"),
+    ("health", "timeout-write"),
+    ("rollback", "timeout-write"),
+])
+def test_timeout_at_each_commit_stage_is_uncertain_and_never_retried(
+        stage, expect_detail):
+    # The outer timeout can hit replace / reload / health / rollback; the remote
+    # process may still be running and its final state is unknown. None of the
+    # four may be reported as success or as a clean failure, and the client must
+    # never send a second write.
+    provider, session = provider_for(add_timeout_stage=stage,
+                                     add_menu_rc=(0, 124, 0))
+    with pytest.raises(HaUiError) as excinfo:
+        provider.create_client("event-vmix01", confirmed=True)
+    assert excinfo.value.code == errors.E_CREATE_UNCERTAIN
+    assert excinfo.value.detail == expect_detail
+    assert sum(1 for command in session.commands if "10\n2\n" in command) == 1
+
+
 def test_timeout_with_an_observed_write_is_flagged_as_such():
     provider, _session = provider_for(add_timeout=True, add_timeout_write=True)
     with pytest.raises(HaUiError) as excinfo:
