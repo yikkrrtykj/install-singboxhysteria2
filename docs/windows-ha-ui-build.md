@@ -293,3 +293,11 @@ pre-commit watchdog、只读状态查询。失败时打印 out/journal 摘要，
 publish-failed / truncated / worker-alive 阻断，created / rolled-back / refused 放行）、
 `cleanup-retention`（只删除安全且过期的记录）、`publish-failure-keeps-claim`
 （失败 sync 下 claim 保留且 guard 阻断）。
+
+
+### 8.3 第六轮复审补充（claim 生命周期）
+
+`claim-guard` 增加：aged claim（dead pid + 3 天）不被自动接管、并发首次请求恰好一个
+成功、aged claim 下并发请求全部 `tx-in-flight`、人工删除后才允许重试；
+`publish-failure-keeps-claim` 增加"失败 marker 缺失 + aged claim"仍阻断、且 retention
+不删除证据。
