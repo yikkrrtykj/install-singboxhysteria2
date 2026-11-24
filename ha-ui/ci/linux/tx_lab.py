@@ -146,6 +146,7 @@ def commit_scenario(work: Path, live_text: str, candidate_text: str,
     env = dict(os.environ)
     env.update(env_overrides)
     env["STUB_COUNTER"] = str(work / "counter")
+    env["HA_UI_LAB_JOURNAL"] = str(work / "phases")
     if kill_on_phase is None:
         proc = subprocess.run(["bash", str(runner)], capture_output=True,
                               text=True, env=env, timeout=120)
@@ -249,6 +250,7 @@ def scenario_concurrent_writer(work: Path) -> None:
     runner = write(work / "run.sh", script, 0o755)
     env = dict(os.environ)
     env.update({"STUB_COUNTER": str(work / "counter"),
+                "HA_UI_LAB_JOURNAL": str(work / "phases"),
                 "STUB_RELOAD_SLEEP": "5"})
     first = subprocess.Popen(["bash", str(runner)], env=env,
                              stdout=subprocess.DEVNULL,
