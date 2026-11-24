@@ -46,8 +46,8 @@ case "$1" in
   is-active)
     n=$(cat "$STUB_COUNTER" 2>/dev/null || echo 0); n=$((n + 1))
     echo "$n" > "$STUB_COUNTER"
-    echo "is-active n=$n a1=${STUB_ACTIVE1_RC:-unset} a2=${STUB_ACTIVE2_RC:-unset}" >> "${STUB_LOG:-/dev/null}"
-    if [ "$n" -eq 2 ]; then exit "${STUB_ACTIVE2_RC:-0}"; fi
+    echo "is-active n=$n a1=${STUB_ACTIVE1_RC:-unset} a3=${STUB_ACTIVE3_RC:-unset}" >> "${STUB_LOG:-/dev/null}"
+    if [ "$n" -eq 3 ]; then exit "${STUB_ACTIVE3_RC:-0}"; fi
     exit "${STUB_ACTIVE1_RC:-0}" ;;
   reload)
     sleep "${STUB_RELOAD_SLEEP:-0}"
@@ -176,7 +176,7 @@ def commit_scenario(work: Path, live_text: str, candidate_text: str,
 def scenario_success(work: Path) -> None:
     rc, out, live = commit_scenario(
         work, config([]), config(["alpha"]),
-        {"STUB_ACTIVE1_RC": "0", "STUB_ACTIVE2_RC": "0",
+        {"STUB_ACTIVE1_RC": "0", "STUB_ACTIVE3_RC": "0",
          "STUB_RELOAD_RC": "0", "STUB_CHECK_RC": "0"})
     if rc != 0:
         fail("success rc=%s out=%s" % (rc, out[-400:]))
@@ -194,7 +194,7 @@ def scenario_success(work: Path) -> None:
 def scenario_health_rollback(work: Path) -> None:
     rc, out, live = commit_scenario(
         work, config([]), config(["alpha"]),
-        {"STUB_ACTIVE1_RC": "0", "STUB_ACTIVE2_RC": "1",
+        {"STUB_ACTIVE1_RC": "0", "STUB_ACTIVE3_RC": "1",
          "STUB_RELOAD_RC": "0"})
     if rc == 0:
         journal = (work / "phases").read_text() if (work / "phases").exists() else "-"
@@ -214,7 +214,8 @@ def scenario_health_rollback(work: Path) -> None:
 def scenario_rollback_unconfirmed(work: Path) -> None:
     rc, out, live = commit_scenario(
         work, config([]), config(["alpha"]),
-        {"STUB_ACTIVE1_RC": "0", "STUB_RELOAD_RC": "1"})
+        {"STUB_ACTIVE1_RC": "0", "STUB_ACTIVE3_RC": "1",
+         "STUB_RELOAD_RC": "1"})
     if rc == 0:
         fail("unconfirmed rollback reported success")
     if '"alpha"' in live.read_text():
