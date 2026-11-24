@@ -109,13 +109,12 @@ GUI 明确确认
 7. **真实 VPS 验收未执行**：仓库内验证为合成凭据 + 本机 Windows 环境；接入真实 A/B
    前须按 `docs/windows-ha-ui-acceptance.md` 执行，尤其创建/补齐/部分成功路径必须在
    隔离测试 VPS 验证。CI/本机测试不能替代真实环境验收。
-8. **单端写入的事务原子性无法由客户端保证（P0 BLOCKED）**：外层 `timeout -k 10 420`
-   包住 `replace → reload → health → rollback`，SSH 断连还可能通过 SIGPIPE 终止远端
-   管道；GUI 菜单路径没有 `CM_TX_JOURNAL_HOOK`，因此没有可用于恢复判断的 journal。
-   本版本能做的是“检出且不误报”（超时后只读核对 config SHA-256 + live 清单，分类并
-   保留 `UNCERTAIN`/`STALE`），**不是**原子性。解除该项需要服务端改动（提交阶段独立
-   进程组 + 持久 phase/result 文件 + 安装器哈希链重新 pin），见
-   `docs/windows-ha-ui-data-path.md` 第 8 节。
+8. **单端写入已被受管事务隔离（P0 实现完成，待独立复审）**：创建通过 detached
+   worker 执行，stdin/stdout 为文件，GUI 超时/SSH 断开不再直接终止 `replace` 后的
+   reload/health/rollback；每个阶段经 `CM_TX_JOURNAL_HOOK`（函数名合同，由 BASH_ENV
+   在事务 shell 内定义）fsync 到 root-only journal，终局以原子 `result` 发布。
+   **不覆盖**机器断电/内核崩溃/人工 kill -9 整个进程组；这些只能被检出为
+   `UNCERTAIN` 并阻断重试。细节见 `docs/windows-ha-ui-data-path.md` §7–§8。
 
 ## 8. 非目标
 

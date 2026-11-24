@@ -1,4 +1,4 @@
-# Windows HA-UI — 数据获取/创建路径与边界（0.2.0）
+﻿# Windows HA-UI — 数据获取/创建路径与边界（0.2.0）
 
 适用代码基线：`main@9402be91284551210f2d455f1af42e3b97ccb81e`（0.2.0 Draft PR）。
 本文只陈述仓库与运行手册中已有的事实，不包含任何凭据、IP、YAML 或服务器私钥。
@@ -177,86 +177,97 @@ installer；会出现 `repair_existing_install_security_baseline` 的幂等权�
 privileged `client.export`（锁内渲染 + 审计），而不是 shell 菜单。两条路线都必须
 单独 review/审批，本轮不修改服务器端代码。
 
-## 7. 创建路径的证明、分类与超时后核对（0.2.0，PR #124 复审修复）
 
-创建使用同一个 pinned installer，但输入序列固定为 `10 → 2 → <name> → 0`，并在执行前
-额外校验 `2) add_client_interactive` / `add_client()` / `_add_client_locked()` /
-成功文案这些静态标记。执行后按以下顺序证明：
+## 7. 创建路径：受管一次性事务 + 持久 journal（0.2.0，PR #124 P0）
 
-1. 捕获 `PIPESTATUS`，menu 124 = 超时，任一非零 = 失败；
-2. 转录必须出现提交行 `配置已提交`（reload 成功时是 `配置已提交并重载成功`，无进程时
-   是 `配置已提交（当前无运行中的 sing-box 进程，跳过 reload）`）**和**
-   `客户端 '<name>' 已同时添加到 Reality 与 HY2`；只有成功行、没有提交行不算提交；
-   菜单循环本身即使 `add_client` 失败也返回 0，因此退出码 0 不能单独作为成功依据；
-3. 重新执行一次只读 `snapshot`（同一条命令同时返回 `sbconfig_server.json` 的 SHA-256 与
-   客户端清单），确认名称存在且该记录 `exportable`（= `complete` 且 `problems` 为空）；
-4. 只有 2 + 3 都通过才报告该端 `created`。
+创建仍然只走 reviewed 的 `install.sh` 菜单 10→2（`add_client` → `with_client_lock` →
+`cm_add_client_candidate_planned` → `commit_server_config`），但执行方式改为
+**受管一次性服务端事务**，不再被 GUI 的 420s `timeout -k`、SSH 断开或 stdout 管道
+SIGPIPE 直接打断。
 
-创建前同样先 `snapshot` 一次：名称已在两端 → `E_CLIENT_EXISTS`；仅一端存在且
-`exportable` → 默认 `E_CLIENT_PARTIAL_EXISTS`，只有 UI 第二次确认“仅补齐缺失端”才创建
-缺失端；已存在端不 `exportable` → `E_CLIENT_INCOMPLETE`。任一端预检/证书身份失败时，
-不写入任何一端。两端不是原子事务：A 成功、B 失败时 A 保留，B 状态准确显示，不自动删除 A。
+### 7.1 生命周期
 
-### 7.1 失败分类（禁止猜测）
+1. launcher（一次 SSH 命令）先完成 pin/host 预检：拉取并校验 pinned `install.sh` /
+   `client-management.sh` 的 SHA-256 与菜单结构标记。此阶段不触碰线上配置。
+2. 生成 root-only 事务目录 `/root/sbox/.ha-ui-tx/<name>-<uuid>/`（0700，文件 0600），
+   写入菜单输入 `in`、`env.sh`（见 7.2）、`pid`、`started`。
+3. 校验 `env.sh` 的 SHA-256 == 客户端计算值；执行同进程探针（见 7.2）；任一失败
+   `HAUI_MENU_FAIL=hook-unproven|env-hash`，**写前 fail-closed**。
+4. `setsid` 启动 detached worker：菜单的 stdin/stdout 都是普通文件，worker 与 SSH
+   通道无管道依赖。launcher 随后 `wait` 它——这只是客户端的等待预算，不是 kill 开关。
+5. worker 内 watchdog 只在 journal 尚未出现 `replace` 时允许 TERM 菜单（默认 120s）；
+   `replace` 之后不再有任何 hard kill。
+6. worker 结束时以 `tmp + mv + fsync` 原子发布 `result`（`rc`/`finished`），删除 `raw`。
 
-`E_REMOTE_CREATE` 的 `detail` 是固定的服务端结果 token，而不是“看起来像失败”。判定
-同时使用转录与只读核对，只有满足括号内条件才允许降级为干净失败：
+### 7.2 BASH_ENV 合同（保持函数名合同，不改 lib）
 
-| 服务端结果 | 判定 | 依据 |
+- 每次尝试生成的 `env.sh` 只做三件事：定义 `ha_ui_tx_journal()`（append + 文件 fsync +
+  目录 fsync，失败返回非 0）、设置**非导出**变量 `CM_TX_JOURNAL_HOOK=ha_ui_tx_journal`、
+  写加载哨兵 `hook-loaded` 后 `unset BASH_ENV`。
+- worker 以 `env -i PATH=... HOME=/root LANG=C.UTF-8 TERM=dumb BASH_ENV="$tx/env.sh"
+  SB_CLIENT_MANAGEMENT_LIB=... bash "$d/install.sh"` 启动菜单。非交互 bash 在运行
+  installer 前 source `BASH_ENV`，因此 hook 函数定义在**真正执行事务的同一个 shell**。
+- fail-closed 证据链（任一失败即写前中止）：`sha256(env.sh)` 匹配 → 哨兵存在 →
+  `declare -F ha_ui_tx_journal` 命中 → `env | grep -c '^CM_TX_JOURNAL_HOOK='` 为 0
+  （未导出）→ 子 shell 看不到该函数。
+- 已实测陷阱：**BASH_ENV 不存在时 bash 退出 0 且不报错**，所以退出码不能作为加载
+  成功的证明；必须依赖哨兵 + `declare -F`。
+- 不修改 `install.sh` / `lib/client-management.sh`，因此安装器/lib 的既有哈希不变。
+
+### 7.3 持久状态与权限
+
+| 文件 | 权限 | 内容 / 写入协议 |
 |---|---|---|
-| `lock` / `consistency` / `incomplete` / `missing-config` / `name-invalid` / `permission` / `reserved` / `create` | `failed`（干净拒绝） | 转录 token **且** 核对显示 config SHA-256 未变、名称仍不存在 |
-| 同上，但核对发现 SHA 变化或名称已存在 | `uncertain`（`refusal-after-write`） | 与拒绝矛盾，说明存在并发/竞争写入 |
-| `exists` | `E_CLIENT_EXISTS` / `failed` | 同上核对通过才降级；否则 `refusal-after-write` |
-| `已回滚并重新加载上一份配置`（`lib/client-management.sh:338`） | `failed`（`rolled-back`） | 精确句 **且** SHA 回到写入前值 **且** 名称不存在 |
-| `回滚恢复失败，请立即人工介入`（`:330`） | `uncertain`（`rollback-failed`） | 恢复本身失败 |
-| `已回滚配置文件，但服务未能确认恢复`（`:344`） | `uncertain`（`rollback-unconfirmed`） | 字节可能已恢复，但服务状态未确认 |
-| 菜单 124（外层 `timeout` 命中） | `uncertain`（`timeout` / `timeout-write`） | 只把“是否观察到写入”作为证据附加，不作为事务状态 |
-| SSH 超时/断连 | `uncertain`（`timeout-transport`） | 无法通过该会话核对 |
-| 无成功行且无已知 token | `uncertain`（`unconfirmed`）/（`commit-unproven`） | fail-safe |
+| `env.sh` | 0600 | hook 函数 + 非导出变量；生成后按客户端 SHA-256 校验 |
+| `phases` | 0600 | `phase<TAB>epoch<TAB>backup` 追加；每次 append 后文件 fsync + 目录 fsync；解析器拒绝非法 phase |
+| `in` | 0600 | 菜单输入（一次性） |
+| `pid`/`started` | 0600 | worker pid / 开始时间 |
+| `raw`→`out` | 0600 | 转录：去 ANSI、脱敏凭据链接；raw 删除 |
+| `result` | 0600 | `rc=` + `finished=`；tmp+mv+fsync |
+| `hook-loaded` | 0600 | BASH_ENV 加载哨兵 |
 
-关键点：`_MENU_FAIL_TOKENS` 不再使用泛化的 `回滚` 子串。服务端三种回滚结局都包含这个
-词，只有 `:338` 那一句能证明“写入已撤销”，`:330` / `:344` 必须保持 `uncertain` 并提示
-人工介入。
+- 唯一性：canonical 名称 + uuid4；同名且未终局的目录存在时拒绝新请求（`tx-exists`）。
+- 清理：有 `result` 且目录 mtime > 7 天删除；无 `result` 且 > 30 天删除；pid 存活的
+  目录永不删除。
+- 目录/文件均由 `umask 077` + 显式 chmod 创建；解析器拒绝非 `[a-z_]` phase。
 
-### 7.2 超时后核对（post-timeout reconciliation）
+### 7.4 终局判定（只读证据，不猜测）
 
-- `RemoteProvider.snapshot()` 用**一条**只读命令返回 `cfgsha=` + `mtime=` + inventory
-  JSON，保证两个事实来自同一时刻；`preflight` 也填充 `RemoteFacts.config_sha256` / 
-  `RemotePreflight.config_sha256`（不再是永远为 `None` 的占位字段）。
-- 哈希只接受严格的小写 64 位十六进制；取不到 = 没有证据，**绝不**当成“未变化”。
-- 核对只在失败/超时后执行一次；核对本身失败（连接已断、jq 失败） → `uncertain`。
-- 超时可能落在 `replace` / `reload` / `health` / `rollback` 任一阶段；四个阶段的模拟
-  故障测试都断言 `uncertain`（有写入证据时 `timeout-write`，否则 `timeout`），并断言
-  客户端**不会发出第二次写入**——远端进程可能仍在运行，客户端只停止等待，不尝试杀进程
-  或重试。
-- **核对只提供可观测性，不提供原子性。** 客户端无法阻止外层 `timeout -k 10 420`
-  在 `replace` 与 `reload`/`health`/回滚之间打断服务端事务；也无法阻止 SSH 通道
-  断开导致管道 SIGPIPE。`MENU_RUN_TIMEOUT` 没有被调大（复审明确禁止用调大超时当修复）。
-- 真正的原子性要求服务端把 commit 放进**独立进程组**并写**持久 phase/结果文件**，且
-  UI 路径需要 `CM_TX_JOURNAL_HOOK`（当前 GUI 菜单路径没有 hook，因此不存在可用 journal；
-  不得据此编造事务状态）。这需要修改 pinned `install.sh` / `lib/client-management.sh`
-  并重算安装器哈希链（`INSTALLER_SHA256` / `CLIENT_MANAGEMENT_SHA256` / 安装器内嵌 pin），
-  属于安全评审动作，超出本 PR 允许范围 → **P0 保持 BLOCKED**，见第 8 节。
-- `UNCERTAIN` 不自动重试写入；UI 会刷新两端实际状态，刷新失败显示 `STALE / UNKNOWN`，
-  并禁止在核对完成前重建同名客户端。
+```
+phases: check → backup → replace → reload → health
+        replace 前失败 = 零变更；replace 后失败 = rollback / rollback_manual
+terminal: result 存在 = worker 已结束；否则 running(pid) 或 tx-unfinished
+```
 
-## 8. P0 事务安全：现状与残余风险（BLOCKED，需服务端改动）
+- `created`：terminal + rc=0 + 提交行 + canonical 成功行 + live 记录 `exportable`。
+- `failed(rolled-back)`：精确句「已回滚并重新加载上一份配置」+ live 字节回到写入前 +
+  名称不存在。
+- `rollback-failed` / `rollback-unconfirmed` / `rollback_manual`：`UNCERTAIN`。
+- 运行中 / 无终局 / 有写入证据但无终局：`UNCERTAIN`，且**不解锁重试**。
+- 普通列表刷新不能清除 UNCERTAIN；只有 `pending_transaction(name)` 读到 `absent` 或
+  `terminal`（再配合 live 校验）才允许解除（见 `clients_panel` 的 pending gate）。
 
-已确认的机制（不是猜测）：
+### 7.5 Linux 进程级证据（CI，ubuntu-22.04）
 
-1. 服务端执行串是 `printf … | timeout -k 10 420 env -i … bash install.sh 2>&1 | sed …`，
-   `timeout` 包住整条菜单，包括 `replace → reload → health → rollback`；
-2. 客户端 `exec(timeout=540)` 是另一层，且只关闭通道，不保证终止远端进程；
-3. 写入阶段没有对外的原子标记：没有 journal hook，也没有可轮询的 phase 文件；
-4. 客户端断开时远端管道的 `sed` 消失，后续 `printf` 会收到 SIGPIPE，同样可能停在
-   `replace` 与 `reload` 之间。
+`ha-ui/ci/linux/` 下两个脚本构成 `linux-tx-lab` job：
 
-因此本 PR 能交付的是**检出与不误报**（分类 + 核对 + `STALE`），不是事务原子性。
-解除 BLOCKED 的最小服务端改动（需单独评审）：
+- `tx_mechanism.sh`（Stage A）：真实 bash 上验证 BASH_ENV 注入、非导出、加载后清理、
+  哨兵、缺失 env 的静默行为、篡改检测、真实 `cm_tx_journal_phase` 调用、hook 失败
+  fail-closed。
+- `tx_lab.py`（Stage B）：用真实 `lib/client-management.sh` 的 `commit_server_config`
+  + stub `systemctl`/`sing-box` 验证 committed、health 失败回滚、回滚未确认、
+  `reload` 阶段 SIGKILL（新字节 + journal 停在 reload + 锁释放）、并发写者被
+  canonical 锁拒绝；用 production worker 文本验证 launcher 被杀、stdout 消费者退出、
+  pre-commit watchdog 与只读状态查询。
 
-- 菜单提交阶段在独立 session/进程组中执行，外层 `timeout` 只覆盖非写入阶段；
-- 提交前写入持久 phase 文件（`parse/candidate/check/backup/replace/reload/health/rollback*`），
-  并在同一目录原子发布 `result`；
-- UI 侧在超时/断连后通过只读命令读取 phase/result 对账，而不是推断。
+## 8. P0 残余风险（不承诺“绝不被杀”）
 
-在这三项落地之前，`PR124-P0-TRANSACTION-SAFETY` 只能记为 `BLOCKED`。
+- **已覆盖**：GUI 超时只停止等待；SSH 断开不再通过管道 SIGPIPE/SIGHUP 终止事务；
+  stdout 消费者退出不影响事务；`replace` 后不再有 hard kill。
+- **不覆盖**：机器断电、内核崩溃、运维人员手工 `kill -9` 整个进程组。这些情况
+  没有终局记录，只能被检出为 `UNCERTAIN` 并阻断重试，不能自动恢复。
+- `with_client_lock` 的锁 fd 会被子命令继承；父进程被强杀后，锁会由有界子命令
+  （`cm_bounded` 的 `timeout`）持有到它退出——CI lab 用进程组 kill 模拟硬故障，
+  并验证锁最终释放。
+- 结论：P0 的交付目标是“正常 GUI 超时/SSH 断开不会中断关键提交；异常终止可识别、
+  不可误报成功”，不包含“物理故障绝不丢事务”。最终 PASS 仍需方案 AI 独立复审。

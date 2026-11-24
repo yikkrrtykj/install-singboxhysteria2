@@ -33,3 +33,13 @@
 | EXE 验收 | `ha-ui.exe` SHA-256 `1931d6b5eb31c5d8d8b8794ff7c1088473e73ea2a4553b4dbbf1f64d0c43bf9f`；`--self-test` OK；`check_no_console_popup.py --exe` → `{"checked":true,"positive_control":true,"console_events":0,"ok":true}`；`verify_receipt.py` / `verify_artifact_sums.py` 通过 |
 
 以上数字来自本机 Windows 环境（合成数据、无真实 VPS）；CI 的实测结果见 PR #124 检查列表。
+
+## PR #124 P0 收口（2026-11-24，Stage A/B）
+
+| 项 | 结果 |
+| --- | --- |
+| Stage A（BASH_ENV 机制，Linux CI） | `tx_mechanism.sh` 7 项全 PASS |
+| Stage B（真实 lib 事务 + 故障注入，Linux CI） | `tx_lab.py` 9 个场景全 PASS（committed / health 回滚 / 回滚未确认 / reload 阶段 SIGKILL / 并发写者 / launcher 被杀 / stdout 退出 / watchdog / 状态查询） |
+| 创建路径 | launcher 预检 pin → root-only tx 目录 + env.sh（摘要校验）→ 同进程 hook 探针 → `setsid` detached worker（文件 stdin/stdout）→ 原子 `result`；`replace` 后无 hard kill |
+| 恢复门禁 | 普通刷新不再清除 pending；只有 `pending_transaction` 读到 absent/terminal 并配合 live 校验才解除 |
+| 残余风险 | 断电/内核崩溃/人工 kill -9 进程组不可覆盖，只能检出为 `uncertain` |

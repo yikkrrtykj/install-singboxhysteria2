@@ -92,10 +92,20 @@ powershell -NoProfile -ExecutionPolicy Bypass -File ha-ui\ci\run-windows-ci.ps1 
 | `created` / `existing` | 提交行 + 成功行 + live 复核 `exportable` | 成功提示；“可生成” | 继续生成 YAML |
 | `failed`（预写拒绝） | `lock`/`consistency`/`exists` 等，且核对 SHA 未变、名称仍不存在 | “创建失败 … 未修改任何客户端” | 按错误码修复后重试 |
 | `failed`（`rolled-back`） | 精确句 `已回滚并重新加载上一份配置` **且** SHA 回到写入前 **且** 名称不存在 | “已回滚，配置已恢复（未提交）” | 修复原因后重试 |
-| `uncertain` | 超时/断连/回滚失败/回滚未确认/复核不完整/无成功行 | “创建结果待确认：可能已写入服务器”，自动刷新；刷新失败显示 `STALE / UNKNOWN` 并禁止重建同名客户端 | 先刷新核实，再决定补齐/人工处理 |
+| `uncertain` | 超时/断连/回滚失败/回滚未确认/复核不完整/无成功行 | “创建结果待确认：可能已写入服务器”或“远端创建事务尚未结束”，自动刷新；刷新失败显示 `STALE / UNKNOWN` 并禁止重建同名客户端 | 先刷新核实，再决定补齐/人工处理 |
+| 待确认的解除条件 | 只读 `pending_transaction` 读到该名称的持久事务为 `absent` 或 `terminal`，并再次校验 live 状态 | 普通列表刷新**不能**解除；界面会显示“仍有未确认的远端创建事务” | 继续刷新/恢复连接，直到出现终局或确认无事务记录 |
 
 验收时必须实际制造至少一次 `uncertain`（隔离环境断网/超时）并确认：文案没有出现
-“未修改任何客户端”；自动刷新确实连接了两端；刷新失败后重建按钮会被拒绝。
+“未修改任何客户端”；自动刷新确实连接了两端；刷新失败后重建按钮会被拒绝；刷新手动
+点“刷新客户端”也不会解除，直到出现终局/无事务记录。
+
+### 2.4 Linux 事务 lab（CI 必跑，不替代真实 VPS 验收）
+
+`ha-ui/ci/linux/tx_mechanism.sh` 与 `ha-ui/ci/linux/tx_lab.py` 由 `linux-tx-lab`
+job（ubuntu-22.04）执行，覆盖：BASH_ENV 同进程 hook、加载失败 fail-closed、committed
+事务、health 失败回滚、回滚未确认、`reload` 阶段 SIGKILL、并发写者、launcher 被杀、
+stdout 消费者退出、pre-commit watchdog、只读状态查询。该 lab 是本机/CI 证据，**不能**
+替代真实 A/B VPS 的创建验收。
 
 ### 2.4 无控制台窗口（CMD 黑框）验收
 
