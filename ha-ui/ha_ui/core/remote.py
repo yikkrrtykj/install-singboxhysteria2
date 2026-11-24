@@ -419,11 +419,11 @@ def _tx_worker_script(precommit: int | None = None) -> str:
         "if ! printf 'rc=%s\\nfinished=%s\\n' \"$rc\" \"$(date +%s)\" "
         "> \"$tx/result.tmp\"; then\n"
         "  printf 'publish-failed\\n' > \"$tx/publish-failed\"\n"
-        "  rm -f \"$tx/result.tmp\"; rm -rf -- \"$claim\" \"$d\"; exit 1\n"
+        "  rm -f \"$tx/result.tmp\"; rm -rf -- \"$d\"; exit 1\n"
         "fi\n"
         "if ! mv -- \"$tx/result.tmp\" \"$tx/result\"; then\n"
         "  printf 'publish-failed\\n' > \"$tx/publish-failed\"\n"
-        "  rm -rf -- \"$claim\" \"$d\"; exit 1\n"
+        "  rm -rf -- \"$d\"; exit 1\n"
         "fi\n"
         "if ! sync -f \"$tx/result\" 2>/dev/null; then\n"
         "  sync || printf 'publish-unsynced\\n' > \"$tx/publish-failed\"\n"
@@ -509,17 +509,8 @@ def _add_client_command(name: str, txid: str) -> str:
         "mkdir -p -- \"$tx\" || { rm -rf -- \"$claim\"; "
         "  echo HAUI_MENU_FAIL=txdir; exit 10; }; "
         "chmod 700 -- \"$tx\"; "
-        # Retention: only *finished* requests may expire. Unfinished / unknown
-        # evidence is kept until an operator resolves it.
-        "for old in \"$root\"/*/; do "
-        "  [ -d \"$old\" ] || continue; "
-        "  [ \"${old%/}\" = \"$tx\" ] && continue; "
-        "  opid=$(cat -- \"$old/pid\" 2>/dev/null || true); "
-        "  if [ -n \"$opid\" ] && kill -0 \"$opid\" 2>/dev/null; then continue; fi; "
-        "  if [ -f \"$old/result\" ]; then "
-        "    find \"$old\" -maxdepth 0 -mtime +7 -exec rm -rf -- {} + 2>/dev/null; "
-        "  fi; "
-        "done; "
+        # Retention: only provably safe terminal records may expire.
+        + _tx_cleanup_script(name) + "; "
         "printf '%s' " + shlex.quote(sequence) + " > \"$tx/in\"; "
         "chmod 600 -- \"$tx/in\"; "
         "printf '%s' " + shlex.quote(env_text) + " > \"$tx/env.sh\"; "
@@ -549,6 +540,58 @@ def _add_client_command(name: str, txid: str) -> str:
     return "bash -c " + shlex.quote(script)
 
 
+def _tx_safe_terminal_bash(name: str) -> str:
+    """Bash predicate mirroring ``TxStatus.release_safe`` (server authority).
+
+    A record may only be treated as "safe terminal" when its receipt is
+    complete and fsynced, no worker is alive, and the outcome is a proven
+    created / rolled-back / refused. Anything else (failed or unconfirmed
+    rollback, damaged/truncated receipt, live worker, unknown transcript) is
+    unsafe and must block a new same-name request.
+    """
+    success = "客户端 '%s' 已同时添加到 Reality 与 HY2" % name
+    return (
+        "ha_ui_tx_safe_terminal() { # <dir>\n"
+        "  local d=$1 rc finished pid commit success rolled failed unconf "
+        "intent refusal\n"
+        "  [ -f \"$d/result\" ] || return 1\n"
+        "  [ -f \"$d/publish-failed\" ] && return 1\n"
+        "  rc=$(sed -n 's/^rc=//p' \"$d/result\" 2>/dev/null | head -n 1)\n"
+        "  finished=$(sed -n 's/^finished=//p' \"$d/result\" 2>/dev/null "
+        "| head -n 1)\n"
+        "  case \"$rc\" in ''|*[!0-9]*) return 1;; esac\n"
+        "  case \"$finished\" in ''|*[!0-9]*) return 1;; esac\n"
+        "  pid=$(cat -- \"$d/pid\" 2>/dev/null || true)\n"
+        "  if [ -n \"$pid\" ] && kill -0 \"$pid\" 2>/dev/null; then "
+        "return 1; fi\n"
+        "  commit=$(grep -c -F -- '配置已提交' \"$d/out\" 2>/dev/null || true)\n"
+        "  success=$(grep -c -F -- " + shlex.quote(success) + " \"$d/out\" "
+        "2>/dev/null || true)\n"
+        "  rolled=$(grep -c -F -- '已回滚并重新加载上一份配置' \"$d/out\" "
+        "2>/dev/null || true)\n"
+        "  failed=$(grep -c -F -- '回滚恢复失败' \"$d/out\" 2>/dev/null || true)\n"
+        "  unconf=$(grep -c -F -- '服务未能确认恢复' \"$d/out\" 2>/dev/null "
+        "|| true)\n"
+        "  intent=$(grep -c -F -- '自动回滚' \"$d/out\" 2>/dev/null || true)\n"
+        "  refusal=$(grep -E -c -- '配置锁|一致性|不完整|已存在|add candidate|"
+        "服务端配置不存在|客户端名称非法|保留名称' \"$d/out\" 2>/dev/null "
+        "|| true)\n"
+        "  for n in commit success rolled failed unconf intent refusal; do\n"
+        "    eval \"v=\\$$n\"; case \"$v\" in ''|*[!0-9]*) "
+        "eval \"$n=0\";; esac\n"
+        "  done\n"
+        "  if [ \"$rc\" -eq 0 ] && [ \"$commit\" -gt 0 ] "
+        "&& [ \"$success\" -gt 0 ]; then return 0; fi\n"
+        "  if [ \"$rc\" -ne 0 ] && [ \"$rolled\" -gt 0 ] "
+        "&& [ \"$failed\" -eq 0 ] && [ \"$unconf\" -eq 0 ] "
+        "&& grep -q '^rollback' \"$d/phases\" 2>/dev/null; then return 0; fi\n"
+        "  if [ \"$rc\" -ne 0 ] && [ \"$commit\" -eq 0 ] "
+        "&& [ \"$intent\" -eq 0 ] && [ \"$refusal\" -gt 0 ]; then return 0; fi\n"
+        "  return 1\n"
+        "}\n"
+    )
+
+
 def _tx_guard_script(name: str, txid: str, root: str | None = None) -> str:
     """Durable per-name guard + atomic claim (shared with the Linux lab).
 
@@ -564,9 +607,10 @@ def _tx_guard_script(name: str, txid: str, root: str | None = None) -> str:
         "root=" + shlex.quote(base) + "; name=" + shlex.quote(name) + "; "
         "claim=" + shlex.quote(claim) + "; "
         "mkdir -p -- \"$root\" && chmod 700 -- \"$root\"; "
+        + _tx_safe_terminal_bash(name) + " "
         "for old in \"$root\"/\"$name\"-*/; do "
         "  [ -d \"$old\" ] || continue; "
-        "  if [ ! -f \"$old/result\" ]; then "
+        "  if ! ha_ui_tx_safe_terminal \"$old\"; then "
         "    echo HAUI_MENU_FAIL=tx-in-flight; exit 15; "
         "  fi; "
         "done; "
@@ -587,6 +631,28 @@ def _tx_guard_script(name: str, txid: str, root: str | None = None) -> str:
         "fi; "
         "printf '%s' " + shlex.quote(txid) + " > \"$claim/txid\"; "
         "chmod 600 -- \"$claim/txid\";"
+    )
+
+
+def _tx_cleanup_script(name: str, root: str | None = None) -> str:
+    """Retention: delete only *provably safe* terminal records older than 7 days.
+
+    Unsafe / unfinished / damaged evidence is never expired, so a restart can
+    never silently unblock a name by waiting.
+    """
+    base = TX_ROOT if root is None else root
+    return (
+        "root=" + shlex.quote(base) + "; name=" + shlex.quote(name) + "; "
+        + _tx_safe_terminal_bash(name) + " "
+        "for old in \"$root\"/\"$name\"-*/; do "
+        "  [ -d \"$old\" ] || continue; "
+        "  ha_ui_tx_safe_terminal \"$old\" || continue; "
+        "  opid=$(cat -- \"$old/pid\" 2>/dev/null || true); "
+        "  if [ -n \"$opid\" ] && kill -0 \"$opid\" 2>/dev/null; then "
+        "continue; fi; "
+        "  find \"$old\" -maxdepth 0 -mtime +7 -exec rm -rf -- {} + "
+        "2>/dev/null; "
+        "done"
     )
 
 

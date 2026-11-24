@@ -158,7 +158,8 @@ def test_guard_blocks_unfinished_records_and_claims_atomically():
     guard = remote._tx_guard_script("alpha", "alpha-" + "a" * 32)
     assert "tx-in-flight" in guard
     assert 'mkdir -- "$claim"' in guard
-    assert '! -f "$old/result"' in guard
+    # Fifth review: safety, not mere result existence, blocks the name.
+    assert 'ha_ui_tx_safe_terminal "$old"' in guard
     assert "find" in guard and "-mtime +1" in guard
 
 
@@ -170,3 +171,40 @@ def test_damaged_receipt_is_uncertain_in_the_create_path():
         provider._judge_tx(damaged, "alpha", before)
     assert excinfo.value.code == errors.E_CREATE_UNCERTAIN
     assert excinfo.value.detail == "tx-damaged"
+
+# --------------------------------------------------------------------------- #
+# Fifth review: the server must enforce the same rules as the GUI release gate
+# --------------------------------------------------------------------------- #
+def test_server_guard_uses_the_safe_terminal_predicate():
+    guard = remote._tx_guard_script("alpha", "alpha-" + "a" * 32)
+    assert "ha_ui_tx_safe_terminal()" in guard
+    assert 'ha_ui_tx_safe_terminal "$old"' in guard
+    # The weaker "a result file exists" rule may never come back.
+    assert 'if [ ! -f "$old/result" ]' not in guard
+
+
+def test_safe_terminal_requires_complete_receipt_and_no_live_worker():
+    predicate = remote._tx_safe_terminal_bash("alpha")
+    assert "publish-failed" in predicate
+    assert "kill -0" in predicate
+    assert "s/^rc=//p" in predicate
+    assert "s/^finished=//p" in predicate
+    assert "回滚恢复失败" in predicate
+    assert "服务未能确认恢复" in predicate
+    assert "自动回滚" in predicate
+    assert "已同时添加到 Reality 与 HY2" in predicate
+
+
+def test_retention_only_deletes_safe_terminal_records():
+    cleanup = remote._tx_cleanup_script("alpha")
+    assert 'ha_ui_tx_safe_terminal "$old" || continue' in cleanup
+    assert "-mtime +7" in cleanup
+
+
+def test_failed_publication_keeps_the_claim():
+    worker = remote._tx_worker_script()
+    # Failure branches release the temp dir but never the per-name claim.
+    assert 'rm -f "$tx/result.tmp"; rm -rf -- "$d"; exit 1' in worker
+    assert 'rm -rf -- "$claim" "$d"; exit 1' not in worker
+    # The successful completion releases both.
+    assert 'rm -rf -- "$claim" "$d"' in worker

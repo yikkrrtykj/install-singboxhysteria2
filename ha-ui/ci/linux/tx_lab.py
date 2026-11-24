@@ -422,6 +422,138 @@ def scenario_watchdog_no_kill(work: Path) -> None:
     ok("pre-replace stall is reported and still never killed")
 
 
+def scenario_guard_safe_terminal(work: Path) -> None:
+    """The server guard must apply the same rules as the GUI release gate."""
+    cases = [
+        ("rollback-failed", True, dict(
+            result="rc=1\nfinished=2\n",
+            out="reload 后健康检查失败，自动回滚...\n回滚恢复失败，请立即人工介入\n",
+            phases="check\t1\t/x\nreplace\t2\t/x\nrollback\t3\t/x\n")),
+        ("rollback-manual-phase", True, dict(
+            result="rc=1\nfinished=2\n",
+            out="已回滚配置文件，但服务未能确认恢复\n",
+            phases="check\t1\t/x\nreplace\t2\t/x\nrollback_manual\t3\t/x\n")),
+        ("publish-failed", True, dict(
+            result="rc=0\nfinished=2\n",
+            out="配置已提交并重载成功\n客户端 'alpha' 已同时添加到 Reality 与 HY2\n",
+            phases="check\t1\t/x\nreplace\t2\t/x\n",
+            damaged=True)),
+        ("truncated-result", True, dict(
+            result="rc=1\n", out="配置锁\n", phases="check\t1\t/x\n")),
+        ("worker-alive", True, dict(
+            result="rc=0\nfinished=2\n",
+            out="配置已提交并重载成功\n客户端 'alpha' 已同时添加到 Reality 与 HY2\n",
+            phases="check\t1\t/x\nreplace\t2\t/x\n", pid=str(os.getpid()))),
+        ("created", False, dict(
+            result="rc=0\nfinished=2\n",
+            out="配置已提交并重载成功\n客户端 'alpha' 已同时添加到 Reality 与 HY2\n",
+            phases="check\t1\t/x\nreplace\t2\t/x\nreload\nhealth\n")),
+        ("rolled-back", False, dict(
+            result="rc=1\nfinished=2\n",
+            out="已回滚并重新加载上一份配置\n",
+            phases="check\t1\t/x\nreplace\t2\t/x\nrollback\t3\t/x\n")),
+        ("refused", False, dict(
+            result="rc=1\nfinished=2\n",
+            out="配置锁 获取失败或超时，操作已中止\n",
+            phases="check\t1\t/x\n")),
+    ]
+    for label, should_block, fields in cases:
+        root = work / ("root-" + label)
+        root.mkdir(mode=0o700)
+        tx = root / ("alpha-" + "a" * 32)
+        tx.mkdir(mode=0o700)
+        write(tx / "result", fields["result"])
+        write(tx / "out", fields["out"])
+        write(tx / "phases", fields["phases"])
+        write(tx / "pid", fields.get("pid", "999999") + "\n")
+        if fields.get("damaged"):
+            write(tx / "publish-failed", "1\n")
+        guard = remote._tx_guard_script("alpha", "alpha-" + "b" * 32,
+                                        root=str(root))
+        proc = subprocess.run(["bash", "-c", guard], capture_output=True,
+                              text=True)
+        blocked = proc.returncode == 15 and "tx-in-flight" in proc.stdout
+        if blocked != should_block:
+            fail("guard case %s: blocked=%r expected %r (%r)"
+                 % (label, blocked, should_block,
+                    (proc.stdout + proc.stderr)[-300:]))
+    ok("server guard blocks only unsafe records, mirroring the GUI gate")
+
+
+def scenario_cleanup_retention(work: Path) -> None:
+    root = work / "retention"
+    root.mkdir(mode=0o700)
+    old = time.time() - 10 * 24 * 3600
+
+    safe = root / ("alpha-" + "1" * 32)
+    safe.mkdir(mode=0o700)
+    write(safe / "result", "rc=0\nfinished=2\n")
+    write(safe / "out",
+          "配置已提交并重载成功\n客户端 'alpha' 已同时添加到 Reality 与 HY2\n")
+    write(safe / "phases", "check\nreplace\nreload\nhealth\n")
+    write(safe / "pid", "999999\n")
+
+    unsafe = root / ("alpha-" + "2" * 32)
+    unsafe.mkdir(mode=0o700)
+    write(unsafe / "result", "rc=1\nfinished=2\n")
+    write(unsafe / "out", "回滚恢复失败，请立即人工介入\n")
+    write(unsafe / "phases", "check\nreplace\nrollback\n")
+    write(unsafe / "pid", "999999\n")
+
+    unfinished = root / ("alpha-" + "3" * 32)
+    unfinished.mkdir(mode=0o700)
+    write(unfinished / "phases", "check\n")
+    write(unfinished / "pid", "999999\n")
+
+    for path in (safe, unsafe, unfinished, safe / "result",
+                 unsafe / "result", unfinished / "phases"):
+        os.utime(path, (old, old))
+
+    cleanup = remote._tx_cleanup_script("alpha", root=str(root))
+    proc = subprocess.run(["bash", "-c", cleanup], capture_output=True,
+                          text=True, check=True)
+    if proc.returncode != 0:
+        fail("cleanup script failed")
+    if safe.exists():
+        fail("safe terminal record older than 7 days was not cleaned")
+    if not unsafe.exists():
+        fail("unsafe rollback record was deleted by retention")
+    if not unfinished.exists():
+        fail("unfinished record was deleted by retention")
+    ok("retention deletes only provably safe records; unsafe evidence kept")
+
+
+def scenario_publish_failure_keeps_claim(work: Path) -> None:
+    """A post-result sync failure must keep the claim and stay blocked."""
+    bin_dir = work / "failing-sync"
+    bin_dir.mkdir()
+    write(bin_dir / "sync", "#!/bin/bash\nexit 1\n", 0o755)
+    tx = make_tx(work, "eeee", "epsilon")
+    installer_dir = work / "inst5"
+    write(installer_dir / "install.sh",
+          INSTALLER.replace("@@LIB@@", str(LIB))
+          .replace("@@SLEEP@@", "0").replace("@@NAME@@", "epsilon"), 0o755)
+    worker = write(work / "worker5.sh",
+                   remote._tx_worker_script(precommit=10), 0o600)
+    claim = work / "claim5"
+    claim.mkdir(mode=0o700)
+    env = dict(os.environ)
+    env["PATH"] = str(bin_dir) + ":" + env.get("PATH", "/usr/bin:/bin")
+    subprocess.run(["bash", str(worker), str(tx), str(installer_dir),
+                    str(int(time.time())), str(claim)], env=env, timeout=60)
+    if not claim.exists():
+        fail("claim was released after a failed result publication")
+    if not (tx / "publish-failed").exists():
+        fail("publish failure marker missing")
+    guard = remote._tx_guard_script("epsilon", "epsilon-" + "f" * 32,
+                                    root=str(tx.parent))
+    probe = subprocess.run(["bash", "-c", guard], capture_output=True,
+                           text=True)
+    if probe.returncode == 0 or "tx-in-flight" not in probe.stdout:
+        fail("unsafe published receipt did not block a new request")
+    ok("failed result publication keeps the claim and blocks the name")
+
+
 def scenario_pending_glob(work: Path) -> None:
     """The real read-only query must find real directories (glob regression)."""
     root = work / "txroot"
@@ -496,7 +628,9 @@ def scenario_claim_guard(work: Path) -> None:
     if blocked.returncode == 0 or "tx-in-flight" not in blocked.stdout:
         fail("unfinished same-name record did not block a new request")
 
-    # A stale claim whose worker is dead may be taken over after one day.
+    # A stale claim whose worker is dead may be taken over after one day, but
+    # only when the old record is a proven clean refusal.
+    write(unfinished / "out", "配置锁 获取失败，操作已中止\n")
     (unfinished / "result").write_text("rc=1\nfinished=2\n")
     claim = root / "alpha.claim.off"
     write(claim / "txid", txid + "\n")
@@ -608,6 +742,10 @@ def main() -> int:
                  scenario_worker_survives_closed_stdout),
                 ("watchdog-no-kill", scenario_watchdog_no_kill),
                 ("pending-glob", scenario_pending_glob),
+                ("guard-safe-terminal", scenario_guard_safe_terminal),
+                ("cleanup-retention", scenario_cleanup_retention),
+                ("publish-failure-keeps-claim",
+                 scenario_publish_failure_keeps_claim),
                 ("claim-guard", scenario_claim_guard),
                 ("release-semantics", scenario_release_semantics),
                 ("fsync-fail", scenario_fsync_fail),
