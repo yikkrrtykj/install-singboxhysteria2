@@ -319,7 +319,7 @@ def scenario_worker_survives_launcher(work: Path) -> None:
           .replace("@@SLEEP@@", "1.5").replace("@@NAME@@", "alpha"), 0o755)
     worker = write(work / "worker1.sh",
                    remote._tx_worker_script(precommit=10), 0o600)
-    launcher = ("setsid bash %s haui_tx %s %s %s & echo $! > %s" % (
+    launcher = ("setsid bash %s %s %s %s & echo $! > %s" % (
         worker, tx, installer_dir, int(time.time()), work / "pid1"))
     outer = subprocess.Popen(["bash", "-c", launcher], start_new_session=True)
     time.sleep(0.3)
@@ -350,7 +350,7 @@ def scenario_worker_survives_closed_stdout(work: Path) -> None:
                    remote._tx_worker_script(precommit=10), 0o600)
     reader, writer = os.pipe()
     proc = subprocess.Popen(
-        ["bash", str(worker), "haui_tx", str(tx), str(installer_dir),
+        ["bash", str(worker), str(tx), str(installer_dir),
          str(int(time.time()))],
         stdout=writer, stderr=writer, stdin=subprocess.DEVNULL,
         start_new_session=True)
@@ -368,7 +368,7 @@ def scenario_watchdog(work: Path) -> None:
     write(installer_dir / "install.sh", INSTALLER_HANG, 0o755)
     worker = write(work / "worker3.sh",
                    remote._tx_worker_script(precommit=1), 0o600)
-    subprocess.run(["bash", str(worker), "haui_tx", str(tx),
+    subprocess.run(["bash", str(worker), str(tx),
                     str(installer_dir), str(int(time.time()))],
                    timeout=40)
     if not (tx / "result").exists():
