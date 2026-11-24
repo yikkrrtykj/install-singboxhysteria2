@@ -317,8 +317,10 @@ def scenario_worker_survives_launcher(work: Path) -> None:
           .replace("@@SLEEP@@", "1.5").replace("@@NAME@@", "alpha"), 0o755)
     worker = write(work / "worker1.sh",
                    remote._tx_worker_script(precommit=10), 0o600)
-    launcher = ("setsid bash %s %s %s %s & echo $! > %s" % (
-        worker, tx, installer_dir, int(time.time()), work / "pid1"))
+    claim = work / "claim1"
+    claim.mkdir(mode=0o700)
+    launcher = ("setsid bash %s %s %s %s %s & echo $! > %s" % (
+        worker, tx, installer_dir, int(time.time()), claim, work / "pid1"))
     outer = subprocess.Popen(["bash", "-c", launcher], start_new_session=True)
     time.sleep(0.3)
     outer.kill()
@@ -349,7 +351,7 @@ def scenario_worker_survives_closed_stdout(work: Path) -> None:
     reader, writer = os.pipe()
     proc = subprocess.Popen(
         ["bash", str(worker), str(tx), str(installer_dir),
-         str(int(time.time()))],
+         str(int(time.time())), str(work / "claim2")],
         stdout=writer, stderr=writer, stdin=subprocess.DEVNULL,
         start_new_session=True)
     os.close(writer)
