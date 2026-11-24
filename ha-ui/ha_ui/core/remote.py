@@ -431,6 +431,9 @@ def _tx_worker_script(precommit: int | None = None) -> str:
         "if ! sync -f \"$tx\" 2>/dev/null; then\n"
         "  sync || printf 'publish-unsynced\\n' > \"$tx/publish-failed\"\n"
         "fi\n"
+        "if [ -f \"$tx/publish-failed\" ]; then\n"
+        "  rm -rf -- \"$d\"; exit 1\n"
+        "fi\n"
         "rm -rf -- \"$claim\" \"$d\"\n"
     )
 
