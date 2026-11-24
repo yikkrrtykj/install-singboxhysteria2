@@ -560,6 +560,26 @@ def scenario_publish_failure_keeps_claim(work: Path) -> None:
                            text=True)
     if probe.returncode == 0 or "tx-in-flight" not in probe.stdout:
         fail("unsafe published receipt did not block a new request")
+
+    # Worst case from the review: the failure marker itself could not be
+    # written, and the claim is aged. The claim alone must still block, it must
+    # not be taken over, and retention must keep the evidence.
+    (tx / "publish-failed").unlink()
+    aged = time.time() - 10 * 24 * 3600
+    for path in (claim, tx, tx / "result", tx / "out"):
+        if path.exists():
+            os.utime(path, (aged, aged))
+    aged_probe = subprocess.run(["bash", "-c", guard], capture_output=True,
+                                text=True)
+    if aged_probe.returncode == 0 or "tx-in-flight" not in aged_probe.stdout:
+        fail("aged claim without a failure marker was taken over")
+    if not claim.exists() or not tx.exists():
+        fail("claim or evidence disappeared")
+    cleanup = remote._tx_cleanup_script("epsilon", root=str(root))
+    subprocess.run(["bash", "-c", cleanup], capture_output=True, text=True,
+                   check=True)
+    if not tx.exists() or not claim.exists():
+        fail("retention deleted a blocked name's evidence")
     ok("failed result publication keeps the claim and blocks the name")
 
 
@@ -612,6 +632,8 @@ def scenario_pending_glob(work: Path) -> None:
 
 
 def scenario_claim_guard(work: Path) -> None:
+    """A claim is atomic, never taken over automatically, and released only
+    by the worker that owns it (or by an operator)."""
     root = work / "claimroot"
     root.mkdir(mode=0o700)
     txid = "alpha-" + "a" * 32
@@ -621,15 +643,16 @@ def scenario_claim_guard(work: Path) -> None:
                            text=True)
     if first.returncode != 0:
         fail("first claim failed: %r" % (first.stdout + first.stderr))
-    if not (root / "alpha.claim").is_dir():
-        fail("claim directory missing")
+    claim = root / "alpha.claim"
+    if not claim.is_dir() or (claim / "txid").read_text().strip() != txid:
+        fail("claim directory/txid missing")
     second = subprocess.run(["bash", "-c", guard], capture_output=True,
                             text=True)
     if second.returncode == 0 or "tx-in-flight" not in second.stdout:
         fail("second concurrent claim was not refused")
 
     # An unfinished same-name record blocks even without a claim.
-    (root / "alpha.claim").rename(root / "alpha.claim.off")
+    claim.rename(root / "alpha.claim.off")
     unfinished = root / ("alpha-" + "b" * 32)
     unfinished.mkdir(mode=0o700)
     blocked = subprocess.run(["bash", "-c", guard], capture_output=True,
@@ -637,22 +660,62 @@ def scenario_claim_guard(work: Path) -> None:
     if blocked.returncode == 0 or "tx-in-flight" not in blocked.stdout:
         fail("unfinished same-name record did not block a new request")
 
-    # A stale claim whose worker is dead may be taken over after one day, but
-    # only when the old record is a proven clean refusal.
+    # An aged claim with a dead worker is STILL never taken over.
     write(unfinished / "out", "配置锁 获取失败，操作已中止\n")
     (unfinished / "result").write_text("rc=1\nfinished=2\n")
-    claim = root / "alpha.claim.off"
-    write(claim / "txid", txid + "\n")
-    old = time.time() - 2 * 24 * 3600
-    os.utime(claim, (old, old))
+    old_claim = root / "alpha.claim.off"
+    write(old_claim / "txid", "alpha-" + "9" * 32)
+    os.utime(old_claim, (time.time() - 3 * 24 * 3600,) * 2)
     stale_guard = remote._tx_guard_script("alpha", "alpha-" + "c" * 32,
                                           root=str(root))
-    taken = subprocess.run(["bash", "-c", stale_guard], capture_output=True,
+    aged = subprocess.run(["bash", "-c", stale_guard], capture_output=True,
+                          text=True)
+    if aged.returncode == 0 or "tx-in-flight" not in aged.stdout:
+        fail("aged claim was taken over automatically")
+    if not old_claim.is_dir() or (old_claim / "txid").read_text().strip() != (
+            "alpha-" + "9" * 32):
+        fail("aged claim was deleted or replaced")
+
+    # Manual cleanup (operator) is the only way forward.
+    shutil.rmtree(old_claim)
+    retry = subprocess.run(["bash", "-c", stale_guard], capture_output=True,
                            text=True)
-    if taken.returncode != 0:
-        fail("stale dead claim was not taken over: %r"
-             % (taken.stdout + taken.stderr))
-    ok("per-name claim blocks concurrent/restarted requests and expires safely")
+    if retry.returncode != 0:
+        fail("guard refused after the operator removed the stale claim")
+
+    # Two simultaneous first-ever requests: exactly one owns the claim.
+    fresh = work / "concurrent"
+    fresh.mkdir(mode=0o700)
+    guards = [remote._tx_guard_script(
+        "beta", "beta-" + "1" * 32, root=str(fresh)),
+        remote._tx_guard_script(
+            "beta", "beta-" + "2" * 32, root=str(fresh))]
+    procs = [subprocess.Popen(["bash", "-c", item], stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True)
+             for item in guards]
+    codes = [proc.wait(timeout=30) for proc in procs]
+    if sorted(codes) != [0, 15]:
+        fail("concurrent first claims: codes=%r expected one 0 and one 15"
+             % (codes,))
+    owner = (fresh / "beta.claim" / "txid").read_text().strip()
+    if owner not in ("beta-" + "1" * 32, "beta-" + "2" * 32):
+        fail("claim owner txid is invalid: %r" % owner)
+
+    # Two simultaneous requests against an existing aged claim both stay out.
+    owner_file = fresh / "beta.claim" / "txid"
+    os.utime(fresh / "beta.claim", (time.time() - 3 * 24 * 3600,) * 2)
+    owner_before = owner_file.read_text()
+    aged_procs = [subprocess.Popen(["bash", "-c", item],
+                                   stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, text=True)
+                  for item in guards]
+    aged_codes = [proc.wait(timeout=30) for proc in aged_procs]
+    if aged_codes != [15, 15]:
+        fail("aged claim was taken over concurrently: codes=%r"
+             % (aged_codes,))
+    if owner_file.read_text() != owner_before:
+        fail("aged claim txid changed after concurrent attempts")
+    ok("claims are atomic, never auto-taken-over, and only owner/operator release")
 
 
 def scenario_release_semantics(work: Path) -> None:

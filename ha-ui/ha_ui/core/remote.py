@@ -434,7 +434,9 @@ def _tx_worker_script(precommit: int | None = None) -> str:
         "if [ -f \"$tx/publish-failed\" ]; then\n"
         "  rm -rf -- \"$d\"; exit 1\n"
         "fi\n"
-        "rm -rf -- \"$claim\" \"$d\"\n"
+        "if [ \"$(cat -- \"$claim/txid\" 2>/dev/null || true)\" = "
+        "\"${tx##*/}\" ]; then rm -rf -- \"$claim\"; fi\n"
+        "rm -rf -- \"$d\"\n"
     )
 
 
@@ -506,30 +508,33 @@ def _add_client_command(name: str, txid: str) -> str:
         + " ]; then echo HAUI_MENU_FAIL=lib-hash; exit 9; fi; "
         "chmod 600 \"$d/install.sh\" \"$d/client-management.sh\"; "
         "tx=" + shlex.quote(tx) + "; "
+        # Retention before the claim: cleanup must never run while a claim
+        # (ours or a leftover) exists.
+        + _tx_cleanup_script(name) + "; "
         + _tx_guard_script(name, txid) + " "
-        "if [ -e \"$tx\" ]; then rm -rf -- \"$claim\"; "
+        "if [ -e \"$tx\" ]; then " + _tx_release_claim(txid) + " "
         "  echo HAUI_MENU_FAIL=tx-exists; exit 11; fi; "
-        "mkdir -p -- \"$tx\" || { rm -rf -- \"$claim\"; "
+        "mkdir -p -- \"$tx\" || { " + _tx_release_claim(txid) + " "
         "  echo HAUI_MENU_FAIL=txdir; exit 10; }; "
         "chmod 700 -- \"$tx\"; "
-        # Retention: only provably safe terminal records may expire.
-        + _tx_cleanup_script(name) + "; "
         "printf '%s' " + shlex.quote(sequence) + " > \"$tx/in\"; "
         "chmod 600 -- \"$tx/in\"; "
         "printf '%s' " + shlex.quote(env_text) + " > \"$tx/env.sh\"; "
         "chmod 600 -- \"$tx/env.sh\"; "
         "if [ \"$(sha256sum -- \"$tx/env.sh\" | awk '{print $1}')\" != "
-        + shlex.quote(env_sha) + " ]; then rm -rf -- \"$claim\"; "
+        + shlex.quote(env_sha) + " ]; then " + _tx_release_claim(txid) + " "
         "echo HAUI_MENU_FAIL=env-hash; exit 12; fi; "
         "probe=$(env -i PATH=" + PATH_ENV + " HOME=/root BASH_ENV=\"$tx/env.sh\" "
         "bash -c 'declare -F ha_ui_tx_journal >/dev/null && echo OK' "
         "2>/dev/null); "
         "if [ \"$probe\" != OK ] || [ ! -f \"$tx/hook-loaded\" ]; then "
-        "rm -rf -- \"$claim\"; echo HAUI_MENU_FAIL=hook-unproven; exit 13; fi; "
+        + _tx_release_claim(txid) + " "
+        "echo HAUI_MENU_FAIL=hook-unproven; exit 13; fi; "
         "exported=$(env -i PATH=" + PATH_ENV + " HOME=/root BASH_ENV=\"$tx/env.sh\" "
         "bash -c 'env | grep -c \"^CM_TX_JOURNAL_HOOK=\" || true' 2>/dev/null); "
         "if [ \"$exported\" != 0 ]; then "
-        "rm -rf -- \"$claim\"; echo HAUI_MENU_FAIL=hook-exported; exit 14; fi; "
+        + _tx_release_claim(txid) + " "
+        "echo HAUI_MENU_FAIL=hook-exported; exit 14; fi; "
         "started=$(date +%s); printf '%s\\n' \"$started\" > \"$tx/started\"; "
         "cleanup=0; "
         "setsid bash -c " + shlex.quote(_tx_worker_script())
@@ -541,6 +546,12 @@ def _add_client_command(name: str, txid: str) -> str:
         + _tx_status_body(name)
     )
     return "bash -c " + shlex.quote(script)
+
+
+def _tx_release_claim(txid: str) -> str:
+    """Release a claim only when it still records THIS attempt's txid."""
+    return ("if [ \"$(cat -- \"$claim/txid\" 2>/dev/null || true)\" = "
+            + shlex.quote(txid) + " ]; then rm -rf -- \"$claim\"; fi;")
 
 
 def _tx_safe_terminal_bash(name: str) -> str:
@@ -600,9 +611,9 @@ def _tx_guard_script(name: str, txid: str, root: str | None = None) -> str:
 
     Any unfinished same-name request blocks a new write (works across GUI
     restarts); unfinished records are never expired. The claim directory is an
-    atomic ``mkdir`` so two GUIs cannot both start the same name. A claim whose
-    referenced worker is dead may be taken over only after it is older than one
-    day; a claim with no live pid and no age stays blocked for a human.
+    atomic ``mkdir`` so two GUIs cannot both start the same name. A claim is
+    **never taken over automatically** (no mtime/pid based ``rm -rf``): an
+    abnormal leftover blocks the name until an operator verifies and removes it.
     """
     base = TX_ROOT if root is None else root
     claim = base + "/" + name + ".claim"
@@ -617,20 +628,10 @@ def _tx_guard_script(name: str, txid: str, root: str | None = None) -> str:
         "    echo HAUI_MENU_FAIL=tx-in-flight; exit 15; "
         "  fi; "
         "done; "
+        # A claim is never taken over automatically: an abnormal leftover can
+        # only be removed by an operator after checking live state/evidence.
         "if ! mkdir -- \"$claim\" 2>/dev/null; then "
-        "  existing=$(cat -- \"$claim/txid\" 2>/dev/null || true); "
-        "  alive=0; "
-        "  if [ -n \"$existing\" ] && [ -f \"$root/$existing/pid\" ]; then "
-        "    oldpid=$(cat -- \"$root/$existing/pid\" 2>/dev/null || true); "
-        "    if [ -n \"$oldpid\" ] && kill -0 \"$oldpid\" 2>/dev/null; then alive=1; fi; "
-        "  fi; "
-        "  stale=$(find \"$claim\" -maxdepth 0 -mtime +1 2>/dev/null || true); "
-        "  if [ \"$alive\" = 1 ] || [ -z \"$stale\" ]; then "
-        "    echo HAUI_MENU_FAIL=tx-in-flight; exit 15; "
-        "  fi; "
-        "  rm -rf -- \"$claim\"; "
-        "  mkdir -- \"$claim\" 2>/dev/null "
-        "    || { echo HAUI_MENU_FAIL=tx-in-flight; exit 15; }; "
+        "  echo HAUI_MENU_FAIL=tx-in-flight; exit 15; "
         "fi; "
         "printf '%s' " + shlex.quote(txid) + " > \"$claim/txid\"; "
         "chmod 600 -- \"$claim/txid\";"
@@ -646,6 +647,9 @@ def _tx_cleanup_script(name: str, root: str | None = None) -> str:
     base = TX_ROOT if root is None else root
     return (
         "root=" + shlex.quote(base) + "; name=" + shlex.quote(name) + "; "
+        # While a claim exists the name is blocked; keep every record as
+        # evidence until an operator resolves it.
+        "if [ -d \"$root/$name.claim\" ]; then :; else "
         + _tx_safe_terminal_bash(name) + " "
         "for old in \"$root\"/\"$name\"-*/; do "
         "  [ -d \"$old\" ] || continue; "
@@ -655,7 +659,7 @@ def _tx_cleanup_script(name: str, root: str | None = None) -> str:
         "continue; fi; "
         "  find \"$old\" -maxdepth 0 -mtime +7 -exec rm -rf -- {} + "
         "2>/dev/null; "
-        "done"
+        "done; fi"
     )
 
 
