@@ -298,3 +298,28 @@ terminal: result 存在 = worker 已结束；否则 running(pid) 或 tx-unfinish
   `sync` 且失败返回非 0（事务在 replace 前中止）；result 发布的每一步
   （tmp 写入 → mv → 文件/目录 fsync）都有检查，失败写 `publish-failed`，
   解析器将其标记为 `damaged`，绝不当作可信终局。
+
+
+### 7.7 第五轮复审：服务端执行与 GUI 相同的安全准则（HEAD `0a9fe37f`）
+
+第五轮指出的根因是"GUI 会阻断 ≠ 服务器真的阻断"。现已把同一套判定移到服务端，
+guard 与保留策略共用 `ha_ui_tx_safe_terminal()`：
+
+- **safe terminal 的定义**（与 `TxStatus.release_safe` 等价）：`result` 存在且含
+  `rc=`/`finished=` 数字字段、无 `publish-failed` 标记、worker pid 已死、且结局是
+  ①rc=0 + 提交行 + 成功行（created）；②rc≠0 + 精确回滚句 + 无失败/未确认 +
+  `rollback` phase（rolled-back）；③rc≠0 + 无提交 + 无回滚意图 + 拒绝句（refused）。
+- **同名 guard**：对**每一个**同名记录执行上述判定；任何 rollback-failed /
+  rollback_manual / unconfirmed / damaged / truncated / worker-alive / 未知记录都会
+  `tx-in-flight`，且判定在原子 `mkdir` claim 之前完成，claim 本身也是排他资源，
+  不存在"检查后被抢跑"的窗口。
+- **保留策略**：只有同时满足 safe terminal 且目录 mtime > 7 天的记录才会删除；
+  不安全/未完成/待人工恢复的证据**永不自动过期**。用时间让记录消失从而解除阻断是
+  被明确禁止的。
+- **结果发布失败**：`result.tmp` 写入、`mv`、两级 fsync 任一步失败都会写
+  `publish-failed` 并**保留 per-name claim**；即使 marker 本身写失败，claim 仍在，
+  下一次请求仍被阻断。claim 与受损记录只能由操作员人工核实/移除。
+- **Linux 证据**：`guard-safe-terminal`（8 种记录 × 是否放行）、
+  `cleanup-retention`（旧 safe 删除 / 旧 unsafe 与未完成保留）、
+  `publish-failure-keeps-claim`（注入失败 sync → claim 保留 + guard 阻断），
+  均使用生产 `_tx_guard_script` / `_tx_cleanup_script` / worker 文本。

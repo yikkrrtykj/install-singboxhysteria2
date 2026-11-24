@@ -285,3 +285,11 @@ pre-commit watchdog、只读状态查询。失败时打印 out/journal 摘要，
 并发/重启阻断与过期接管、release 判定矩阵（rollback_manual / worker-alive / damaged
 不得解除）、watchdog 在 replace 前后均只报告不杀、以及注入失败 `sync` 时 journal
 必须 fail-closed。
+
+
+### 8.2 第五轮复审新增场景（Stage B 共 17 项）
+
+服务端安全准则：`guard-safe-terminal`（rollback-failed / rollback_manual /
+publish-failed / truncated / worker-alive 阻断，created / rolled-back / refused 放行）、
+`cleanup-retention`（只删除安全且过期的记录）、`publish-failure-keeps-claim`
+（失败 sync 下 claim 保留且 guard 阻断）。
