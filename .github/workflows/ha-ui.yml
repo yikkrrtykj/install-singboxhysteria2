@@ -68,6 +68,8 @@ jobs:
           persist-credentials: false
       - name: Stage A transaction-hook mechanism gate (BASH_ENV)
         run: bash ha-ui/ci/linux/tx_mechanism.sh
+      - name: Stage B transaction lab (real bash, injected failures)
+        run: python3 ha-ui/ci/linux/tx_lab.py
 
   windows-tests:
     name: windows-tests

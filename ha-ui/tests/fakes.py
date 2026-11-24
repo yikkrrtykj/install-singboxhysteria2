@@ -478,6 +478,8 @@ class FakeSession:
         self.add_duplicate = add_duplicate
         self.add_raise_timeout = add_raise_timeout
         self.commands: list[str] = []
+        self.last_tx = None
+        self.pending_state: str | None = None
         self.downloads: list[str] = []
         self.menu_invoked = False
         self.create_invoked = False
@@ -501,6 +503,8 @@ class FakeSession:
              max_output: int = 1024 * 1024) -> tuple[int, str, str]:
         del stdin_data, timeout, max_output
         self.commands.append(command)
+        if "HAUI_TX_ABSENT=1" in command:
+            return self._tx_pending(command)
         if "HAUI_MENU_END" in command or "ha-ui-installer" in command:
             if re.search(r"(?:^|\n)2\n([A-Za-z0-9][A-Za-z0-9._-]*)\n0\n",
                          command):
@@ -700,120 +704,150 @@ class FakeSession:
             output += "\nHAUI_MENU_END"
         return 0, output + "\n", ""
 
+    def _tx_outcome(self) -> str:
+        """Derive the scripted transaction outcome from the legacy knobs."""
+        if self.add_raise_timeout:
+            return "transport"
+        if self.add_timeout_stage is not None or self.add_timeout:
+            return "running"
+        if self.add_fail is not None:
+            return "fail:" + self.add_fail
+        if self.add_duplicate:
+            return "created-duplicate"
+        if not self.add_commit_marker:
+            return "success-no-commit"
+        if not self.add_end_marker:
+            return "no-frame"
+        return "created"
+
     def _add_menu(self, command: str) -> tuple[int, str, str]:
-        """Scripted menu 10→2 canonical add path for one client."""
+        """Scripted managed transaction: the launch returns durable status."""
         self.create_invoked = True
         if self.menu_fail is not None:
             return 0, "HAUI_MENU_FAIL=%s\n" % self.menu_fail, ""
-        match = re.search(r"(?:^|\n)2\n([A-Za-z0-9][A-Za-z0-9._-]*)\n0\n",
-                          command)
+        match = re.search(r"10\n2\n([A-Za-z0-9][A-Za-z0-9._-]*)\n0\n", command)
         assert match is not None
         name = match.group(1)
-        before_sha = self.facts.config_sha
-        if self.add_raise_timeout:
+        outcome = self._tx_outcome()
+        if outcome == "transport":
             raise HaUiError(errors.E_SSH_TIMEOUT, detail="channel")
-        if self.add_timeout:
-            if self.add_timeout_write:
-                # The write landed, then the menu was killed before printing
-                # anything: no transcript evidence at all.
+        before_sha = self.facts.config_sha
+        counts: dict[str, int] = {}
+        phases: list[str] = ["check", "backup"]
+        terminal, running, rc = True, False, 0
+        if outcome in ("created", "created-duplicate"):
+            self._created_counter += 1
+            self.created_credentials[name] = (
+                uuid_for(self.role, 100 + self._created_counter),
+                password_for(self.role, 100 + self._created_counter))
+            if self.add_side_effect:
                 self._scripted_replace(name)
-            return 0, ("***** 客户端管理 *****\n"
-                       "正在添加客户端…\n"
-                       "HAUI_MENU_RC=0,124,0\nHAUI_MENU_END\n"), ""
-        if self.add_timeout_stage is not None:
-            # A timeout at a named commit stage: the transcript stops there and
-            # the remote process state is unknown (it may still be running).
+                if outcome == "created-duplicate":
+                    self.clients.append(ClientSpec(name))
+            phases += ["replace", "reload", "health"]
+            counts = {"COMMIT": 1, "SUCCESS": 1}
+        elif outcome == "success-no-commit":
+            self._scripted_replace(name)
+            phases += ["replace", "reload", "health"]
+            counts = {"SUCCESS": 1}
+        elif outcome == "no-frame":
+            self._scripted_replace(name)
+            phases += ["replace", "reload", "health"]
+        elif outcome == "running":
             stage = self.add_timeout_stage
-            if stage in ("reload", "health", "rollback"):
+            if self.add_timeout_write or stage in ("reload", "health", "rollback"):
                 self._scripted_replace(name)
-            lines = ["***** 客户端管理 *****", "2. 添加客户端"]
-            if stage == "replace":
-                lines.append("正在写入 add candidate…")
+            if stage is None:
+                phases += ["replace", "reload"]
+            elif stage == "replace":
+                phases = ["check", "backup"]
             elif stage == "reload":
-                lines.append("正在重载 sing-box…")
+                phases += ["replace"]
             elif stage == "health":
-                lines.append("reload 后健康检查失败（add client %s），自动回滚..." % name)
+                phases += ["replace", "reload"]
             elif stage == "rollback":
-                lines.append("正在从备份恢复上一份配置…")
+                phases += ["replace", "reload", "health", "rollback"]
             else:
-                raise AssertionError("unknown add timeout stage: %r" % stage)
-            return self._add_frame(lines)
-        existing = any(spec.name == name for spec in self.clients)
-        if existing or self.add_fail is not None:
-            if existing:
-                warning = "客户端 '%s' 已存在（Reality 或 HY2），拒绝重复添加" % name
-            elif self.add_fail == "exists":
-                warning = "客户端 '%s' 已存在（Reality 或 HY2），拒绝重复添加" % name
-            elif self.add_fail == "lock":
-                warning = "配置锁 /root/sbox/config.lock 获取失败或超时（15s），操作已中止（fail-closed）"
-            elif self.add_fail == "lock-after-write":
-                # The refusal token is a pre-write code, but the live bytes and
-                # the client set changed: reconciliation must not call this a
-                # clean refusal.
+                raise AssertionError("unknown stage %r" % stage)
+            terminal, running = False, True
+        else:
+            token = outcome.split(":", 1)[1]
+            phases += ["replace", "reload", "health"]
+            if token == "lock":
+                phases = ["check", "backup"]
+                counts = {"LOCK": 1}
+            elif token == "consistency":
+                phases = ["check", "backup"]
+                counts = {"CONSISTENCY": 1}
+            elif token == "exists":
+                phases = []
+                counts = {"EXISTS": 1}
+            elif token == "lock-after-write":
                 self._scripted_replace(name)
-                warning = "配置锁 /root/sbox/config.lock 获取失败或超时（15s），操作已中止（fail-closed）"
-            elif self.add_fail == "consistency":
-                warning = "当前 Reality/HY2 用户集合不一致，先修复后再添加客户端"
-            elif self.add_fail == "rollback":
-                # lib/client-management.sh:338 — the ONLY proven restore.
-                warning = ("reload 后健康检查失败（add client %s），自动回滚...\n"
-                           "已回滚并重新加载上一份配置" % name)
-            elif self.add_fail == "rolled-back-stale":
-                # The sentence claims a restore, but the bytes did not go back:
-                # reconciliation must refuse to treat this as a clean failure.
+                counts = {"LOCK": 1}
+            elif token == "rollback":
+                phases = ["check", "backup", "replace", "reload", "health",
+                          "rollback"]
+                counts = {"ROLLED_BACK": 1, "ROLLBACK_INTENT": 1}
+            elif token == "rolled-back-stale":
                 self._scripted_replace(name)
-                warning = ("reload 后健康检查失败（add client %s），自动回滚...\n"
-                           "已回滚并重新加载上一份配置" % name)
-            elif self.add_fail == "rollback-failed":
-                # lib/client-management.sh:330 — restore itself failed.
+                phases = ["check", "backup", "replace", "reload", "health",
+                          "rollback"]
+                counts = {"ROLLED_BACK": 1, "ROLLBACK_INTENT": 1}
+            elif token == "rollback-failed":
                 self._scripted_replace(name)
-                warning = ("reload 后健康检查失败（add client %s），自动回滚...\n"
-                           "回滚恢复失败，请立即人工介入！备份: /root/sbox/singbox.json.bak"
-                           % name)
-            elif self.add_fail == "rollback-unconfirmed":
-                # lib/client-management.sh:344 — bytes restored, service not
-                # confirmed: the file hash equals the pre-write value but the
-                # server explicitly did NOT prove recovery.
+                phases = ["check", "backup", "replace", "reload", "health",
+                          "rollback"]
+                counts = {"ROLLBACK_FAILED": 1, "ROLLBACK_INTENT": 1}
+            elif token == "rollback-unconfirmed":
                 self._scripted_replace(name)
                 self.facts.config_sha = before_sha
-                self.clients = [spec for spec in self.clients
-                                if spec.name != name]
-                warning = ("reload 后健康检查失败（add client %s），自动回滚...\n"
-                           "已回滚配置文件，但服务未能确认恢复，请立即人工检查！"
-                           "备份: /root/sbox/singbox.json.bak" % name)
+                self.clients = [s for s in self.clients if s.name != name]
+                phases = ["check", "backup", "replace", "reload", "health",
+                          "rollback"]
+                counts = {"ROLLBACK_UNCONFIRMED": 1, "ROLLBACK_INTENT": 1}
             else:
-                warning = "生成 add candidate 失败"
-            output = ("***** 客户端管理 *****\n" + warning)
-            return self._add_frame(output.splitlines())
-        # Canonical add success: independent credential per physical side.
-        self._created_counter += 1
-        uuid = uuid_for(self.role, 100 + self._created_counter)
-        password = password_for(self.role, 100 + self._created_counter)
-        self.created_credentials[name] = (uuid, password)
-        if self.add_side_effect:
-            self._scripted_replace(name)
-        lines = [
-            "***** 客户端管理 *****",
-            "2. 添加客户端",
-            "正在添加客户端…",
-        ]
-        if self.add_commit_marker:
-            if self.add_no_process:
-                lines.append(
-                    "配置已提交（当前无运行中的 sing-box 进程，跳过 reload）: "
-                    "add client %s" % name)
-            else:
-                lines.append("配置已提交并重载成功: add client %s" % name)
-        if self.add_success_marker:
-            lines.append("客户端 '%s' 已同时添加到 Reality 与 HY2"
-                         "（UUID/password 已生成）" % name)
-        return self._add_frame(lines)
+                raise AssertionError("unknown add failure %r" % token)
+        self.last_tx = (name, terminal, running, counts, list(phases))
+        return 0, self._tx_block(name, terminal, running, rc, counts, phases), ""
+
+    def _tx_block(self, name: str, terminal: bool, running: bool, rc: int,
+                  counts: dict[str, int], phases: list[str],
+                  absent: bool = False) -> str:
+        txid = "%s-%s" % (name, "a" * 32)
+        lines = ["HAUI_TX_STARTED=1", "HAUI_TX_ABSENT=%d" % (1 if absent else 0),
+                 "HAUI_TX_PHASES_BEGIN"]
+        lines += ["%s\t1700000000\t/root/sbox/x.bak" % phase for phase in phases]
+        lines += ["HAUI_TX_PHASES_END", "HAUI_TX_RESULT_BEGIN"]
+        if terminal:
+            lines += ["rc=%d" % rc, "finished=1700000001"]
+        lines += ["HAUI_TX_RESULT_END", "HAUI_TX_NOTES=",
+                  "HAUI_TX_RUNNING=%d" % (1 if running else 0)]
+        for key in ("COMMIT", "SUCCESS", "ROLLED_BACK", "ROLLBACK_FAILED",
+                    "ROLLBACK_UNCONFIRMED", "ROLLBACK_INTENT", "EXISTS",
+                    "LOCK", "CONSISTENCY", "INCOMPLETE", "CREATE",
+                    "MISSING_CONFIG", "NAME_INVALID", "RESERVED"):
+            lines.append("HAUI_TX_%s=%d" % (key, counts.get(key, 0)))
+        lines.append("HAUI_TX_ID=%s" % txid)
+        return "\n".join(lines) + "\n"
+
+    def _tx_pending(self, command: str) -> tuple[int, str, str]:
+        match = re.search(r"/\.ha-ui-tx/([A-Za-z0-9][A-Za-z0-9._-]*)-\*", command)
+        assert match is not None
+        name = match.group(1)
+        last = getattr(self, "last_tx", None)
+        if self.pending_state == "absent" or last is None:
+            return 0, "HAUI_TX_ABSENT=1\n", ""
+        _, terminal, running, counts, phases = last
+        return 0, self._tx_block(name, terminal, running, 0, counts, phases), ""
 
     def _add_frame(self, lines: list[str]) -> tuple[int, str, str]:
-        """Close an add transcript with the pinned rc frame / end marker."""
-        output = "\n".join(lines) + "\nHAUI_MENU_RC=%d,%d,%d" % self.add_menu_rc
+        output = "\n".join(lines)
+        output += "\nHAUI_MENU_RC=%d,%d,%d" % self.add_menu_rc
         if self.add_end_marker:
             output += "\nHAUI_MENU_END"
+        return 0, output + "\n", ""
+
         return 0, output + "\n", ""
 
     def _scripted_replace(self, name: str) -> None:
@@ -870,6 +904,24 @@ class FakeProvider:
         default_factory=list)
     create_requests: list[tuple[str, bool]] = field(default_factory=list)
     create_effect: bool = True
+    # name -> absent / terminal / running / unknown (pending_transaction fake)
+    pending_states: dict[str, str] = field(default_factory=dict)
+
+    def pending_transaction(self, name: str):
+        self._enter("pending_transaction")
+        state = self.pending_states.get(name, "absent")
+        if state == "unknown":
+            raise HaUiError(errors.E_REMOTE_LIST, detail="tx-status")
+        return remote.TxStatus(
+            tx_id="%s-%s" % (name, "a" * 32),
+            absent=state == "absent",
+            phases=(),
+            notes=(),
+            rc=None if state == "running" else 0,
+            finished=None if state == "running" else 1,
+            running=state == "running",
+            counts={},
+        )
 
     def _enter(self, method: str) -> None:
         self.calls.append(method)

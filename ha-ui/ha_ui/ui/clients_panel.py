@@ -102,6 +102,10 @@ STALE_TEXT = (
     "两端状态未能刷新（STALE / UNKNOWN）。本地显示可能已过期；"
     "请恢复连接后重新读取，不能据此判断服务器未被修改。"
 )
+TX_RUNNING_TEXT = (
+    "远端创建事务尚未结束（%s）。软件已停止等待，但没有终止远端事务；"
+    "请稍后刷新，确认终局前不要重复创建同名客户端。"
+)
 UNCONFIRMED_RETRY_TEXT = (
     "客户端「%s」上次创建结果未确认。请先刷新两端并确认实际状态，再决定是否重建。"
 )
@@ -213,6 +217,7 @@ class ClientsPanel(QWidget):
         self._creation_allow_partial = False
         self._creation_needs_refresh = False
         self._unconfirmed: set[str] = set()
+        self._pending_running: list[str] = []
         self._build_ui()
 
     # ------------------------------------------------------------------ build --
@@ -385,7 +390,9 @@ class ClientsPanel(QWidget):
             return
 
         def job() -> PreviewResult:
-            return self._service.preview(password_overrides=passwords)
+            return self._service.preview(
+                password_overrides=passwords,
+                pending_names=tuple(sorted(self._unconfirmed)))
 
         def success(result: PreviewResult) -> None:
             self._apply_preview(result)
@@ -440,9 +447,14 @@ class ClientsPanel(QWidget):
 
     def _apply_preview(self, result: PreviewResult) -> None:
         self._preview = result
-        # A successful re-read is the operator's confirmation step: the write
-        # state is now observed, so a retry no longer has to be blocked.
-        self._unconfirmed.clear()
+        # A successful snapshot is NOT proof that the remote transaction ended.
+        # Only a durable "absent" or "terminal" state may release a blocked name.
+        for name, state in result.pending.items():
+            if state in ("absent", "terminal"):
+                self._unconfirmed.discard(name)
+        self._pending_running = sorted(
+            name for name, state in result.pending.items()
+            if name in self._unconfirmed)
         self._populate_table(result)
         self._update_certificate_summary(result)
         for role, label in (("A", self.server_a_label),
@@ -461,6 +473,11 @@ class ClientsPanel(QWidget):
         else:
             self.status_label.setText("读取完成：两端都还没有客户端。")
             self.empty_label.setText(EMPTY_TEXT)
+        if self._unconfirmed:
+            self.status_label.setText(
+                self.status_label.text()
+                + "\n⚠ 仍有未确认的远端创建事务（%s）；确认前不要重建同名客户端。"
+                % "、".join(sorted(self._unconfirmed)))
         self.empty_label.setVisible(not bool(result.names))
         self.preview_loaded.emit()
         self.selection_changed.emit()
@@ -805,6 +822,12 @@ class ClientsPanel(QWidget):
             self.creation_result_label.setVisible(True)
             self._notifier.show_warning("创建未全部完成", message)
             self.status_label.setText("创建未全部完成；正在刷新实际状态…")
+            # A side that is not proven terminal keeps the name blocked until a
+            # durable terminal state (or absence) is observed.
+            for role in ("A", "B"):
+                side = result.side(role)
+                if side is not None and side.status == "uncertain":
+                    self._unconfirmed.add(result.name)
         self._creation_needs_refresh = True
 
     def _creation_failed(self, error: HaUiError) -> None:
@@ -825,8 +848,13 @@ class ClientsPanel(QWidget):
             name = getattr(self, "_pending_creation", ("", False))[0]
             if name:
                 self._unconfirmed.add(name)
-            self.creation_result_label.setText(
-                CREATE_UNCONFIRMED_TEXT % error.safe_text)
+            if error.detail in ("running", "tx-transport", "tx-unfinished",
+                                "tx-absent"):
+                self.creation_result_label.setText(
+                    TX_RUNNING_TEXT % (error.detail or "unknown"))
+            else:
+                self.creation_result_label.setText(
+                    CREATE_UNCONFIRMED_TEXT % error.safe_text)
             self.creation_result_label.setVisible(True)
             self.status_label.setText(
                 "创建结果待确认；正在刷新两端实际状态…")

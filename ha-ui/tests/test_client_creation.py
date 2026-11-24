@@ -77,8 +77,11 @@ def test_create_client_runs_the_pinned_add_menu_and_proves_live_state():
     provider.create_client("event-vmix01", confirmed=True)
 
     assert session.create_invoked is True
-    assert any("HAUI_MENU_END" in command for command in session.commands)
-    command = [c for c in session.commands if "HAUI_MENU_END" in c][0]
+    assert any("HAUI_TX_STARTED=1" in command for command in session.commands)
+    command = [c for c in session.commands if "HAUI_TX_STARTED=1" in c][0]
+    assert "CM_TX_JOURNAL_HOOK=ha_ui_tx_journal" in command
+    assert "BASH_ENV=" in command
+    assert "HAUI_MENU_FAIL=hook-unproven" in command
     assert remote.INSTALLER_REVIEWED_COMMIT in command
     assert remote.INSTALLER_SHA256 in command
     assert remote.CLIENT_MANAGEMENT_SHA256 in command
@@ -86,6 +89,8 @@ def test_create_client_runs_the_pinned_add_menu_and_proves_live_state():
     assert "10\n2\nevent-vmix01\n0\n" in command
     assert "2) add_client_interactive" in command
     assert "FAIL=menu-drift" in command
+    # The create path no longer wraps the menu in a global hard kill.
+    assert "timeout -k" not in command
     # The command never carries generated credentials, only the validated name.
     assert "uuid" not in command.casefold()
     assert "password" not in command.casefold()
@@ -158,7 +163,8 @@ def test_timeout_without_write_evidence_stays_uncertain():
     with pytest.raises(HaUiError) as excinfo:
         provider.create_client("event-vmix01", confirmed=True)
     assert excinfo.value.code == errors.E_CREATE_UNCERTAIN
-    assert excinfo.value.detail == "timeout"
+    # Still running is not proof of anything: it must stay UNCERTAIN.
+    assert excinfo.value.detail == "running"
     # A read-only reconciliation was attempted after the timeout.
     assert any("cfgsha" in command for command in session.commands)
 
@@ -168,27 +174,20 @@ def test_transport_timeout_is_uncertain_and_distinguished():
     with pytest.raises(HaUiError) as excinfo:
         provider.create_client("event-vmix01", confirmed=True)
     assert excinfo.value.code == errors.E_CREATE_UNCERTAIN
-    assert excinfo.value.detail == "timeout-transport"
+    assert excinfo.value.detail == "tx-transport"
 
 
-@pytest.mark.parametrize("stage,expect_detail", [
-    ("replace", "timeout"),
-    ("reload", "timeout-write"),
-    ("health", "timeout-write"),
-    ("rollback", "timeout-write"),
-])
-def test_timeout_at_each_commit_stage_is_uncertain_and_never_retried(
-        stage, expect_detail):
+@pytest.mark.parametrize("stage", ["replace", "reload", "health", "rollback"])
+def test_timeout_at_each_commit_stage_is_uncertain_and_never_retried(stage):
     # The outer timeout can hit replace / reload / health / rollback; the remote
     # process may still be running and its final state is unknown. None of the
     # four may be reported as success or as a clean failure, and the client must
     # never send a second write.
-    provider, session = provider_for(add_timeout_stage=stage,
-                                     add_menu_rc=(0, 124, 0))
+    provider, session = provider_for(add_timeout_stage=stage)
     with pytest.raises(HaUiError) as excinfo:
         provider.create_client("event-vmix01", confirmed=True)
     assert excinfo.value.code == errors.E_CREATE_UNCERTAIN
-    assert excinfo.value.detail == expect_detail
+    assert excinfo.value.detail == "running"
     assert sum(1 for command in session.commands if "10\n2\n" in command) == 1
 
 
@@ -197,7 +196,7 @@ def test_timeout_with_an_observed_write_is_flagged_as_such():
     with pytest.raises(HaUiError) as excinfo:
         provider.create_client("event-vmix01", confirmed=True)
     assert excinfo.value.code == errors.E_CREATE_UNCERTAIN
-    assert excinfo.value.detail == "timeout-write"
+    assert excinfo.value.detail == "running"
 
 
 def test_proven_rollback_sentence_with_matching_live_state_is_a_clean_failure():
@@ -253,22 +252,24 @@ def test_lock_failure_is_a_clean_write_refusal():
     assert excinfo.value.detail == "lock"
 
 
-def test_untrustworthy_result_frame_is_uncertain_never_clean():
-    # A non-zero pipeline exit means the transcript may be truncated: a
-    # committed write could be invisible, so this must not be "failed".
-    provider, _session = provider_for(add_menu_rc=(0, 1, 0))
+def test_unproven_hook_is_fail_closed_before_any_write():
+    # The launcher refuses to start the transaction when the hook cannot be
+    # proven in the transaction shell.
+    provider, _session = provider_for(menu_fail="hook-unproven")
     with pytest.raises(HaUiError) as excinfo:
         provider.create_client("event-vmix01", confirmed=True)
     assert excinfo.value.code == errors.E_CREATE_UNCERTAIN
-    assert excinfo.value.detail == "menu-unproven"
+    assert excinfo.value.detail == "hook-unproven"
 
 
-def test_missing_end_marker_is_uncertain_never_clean():
+def test_finished_worker_without_success_or_refusal_is_write_unproven():
+    # A terminal rc=0 with no success/commit/refusal line still means bytes may
+    # have changed: never a clean failure.
     provider, _session = provider_for(add_end_marker=False)
     with pytest.raises(HaUiError) as excinfo:
         provider.create_client("event-vmix01", confirmed=True)
     assert excinfo.value.code == errors.E_CREATE_UNCERTAIN
-    assert excinfo.value.detail == "menu-unproven"
+    assert excinfo.value.detail == "write-unproven"
 
 
 def test_commit_line_without_a_running_process_still_proves_the_write():
@@ -335,12 +336,16 @@ def test_live_read_failure_after_write_is_uncertain_not_success(monkeypatch):
 
 
 def test_add_command_requires_the_add_menu_markers_before_execution():
-    command = remote._add_client_command("event-vmix01")
+    txid = "event-vmix01-" + "a" * 32
+    command = remote._add_client_command("event-vmix01", txid)
     for marker in remote.MENU_ADD_MARKERS:
         assert marker in command
     # The generate markers remain part of the same reviewed installer contract.
     for marker in remote.MENU_SCRIPT_MARKERS:
         assert marker in command
+    # The durable transaction id is the only new interpolated token.
+    assert txid in command
+    assert remote.TX_ROOT in command
 
 
 # --------------------------------------------------------------------------- #
@@ -600,3 +605,59 @@ def test_end_to_end_creation_generates_independent_credentials(workspace_tmp):
     rendered = repr(result)
     for sentinel in (*creds_a, *creds_b):
         assert sentinel not in rendered
+
+
+# --------------------------------------------------------------------------- #
+# Durable pending-transaction queries (Stage C gate)
+# --------------------------------------------------------------------------- #
+def test_pending_transaction_is_absent_before_any_attempt():
+    provider, _session = provider_for()
+    status = provider.pending_transaction("event-vmix01")
+    assert status.absent is True
+    assert status.terminal is False
+    assert status.running is False
+
+
+def test_pending_transaction_distinguishes_running_from_terminal():
+    running, _ = provider_for(add_timeout=True)
+    with pytest.raises(HaUiError):
+        running.create_client("event-vmix01", confirmed=True)
+    status = running.pending_transaction("event-vmix01")
+    assert status.absent is False
+    assert status.terminal is False
+    assert status.running is True
+
+    done, _ = provider_for()
+    done.create_client("event-vmix01", confirmed=True)
+    finished = done.pending_transaction("event-vmix01")
+    assert finished.terminal is True
+    assert finished.running is False
+
+
+def test_pending_query_is_read_only():
+    provider, session = provider_for()
+    provider.create_client("event-vmix01", confirmed=True)
+    before = list(session.commands)
+    provider.pending_transaction("event-vmix01")
+    extra = session.commands[len(before):]
+    tx_commands = [c for c in extra if "ha-ui-tx" in c]
+    assert tx_commands
+    for command in extra:
+        # No writes, no menu input, no kill in the reconciliation path.
+        assert "10\n2\n" not in command
+        assert "setsid" not in command
+    for command in tx_commands:
+        assert "HAUI_TX_ABSENT=1" in command
+
+
+def test_preview_reports_pending_states_and_never_guesses(workspace_tmp):
+    providers = ready_providers()
+    providers["A"].pending_states["alpha"] = "running"
+    providers["B"].pending_states["alpha"] = "terminal"
+    providers["A"].pending_states["beta"] = "unknown"
+    service, _ = make_service(workspace_tmp, providers)
+    view = service.preview({"A": object(), "B": object()},
+                           pending_names=["alpha", "beta", "gamma"])
+    assert view.pending["alpha"] == "running"
+    assert view.pending["beta"] == "unknown"
+    assert view.pending["gamma"] == "absent"

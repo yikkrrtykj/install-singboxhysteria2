@@ -69,7 +69,8 @@ def test_urls_are_commit_pinned_and_never_main():
 
 
 def test_add_command_uses_the_same_pinned_trust_chain():
-    command = remote._add_client_command("event-vmix01")
+    command = remote._add_client_command(
+        "event-vmix01", "event-vmix01-" + "a" * 32)
     assert "/main/" not in command
     assert remote.INSTALLER_URL in command
     assert remote.CLIENT_MANAGEMENT_URL in command

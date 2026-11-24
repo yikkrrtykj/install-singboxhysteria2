@@ -177,9 +177,10 @@ class FakeGenerationService:
         self.create_calls: list[dict[str, object]] = []
         self.create_sessions: list[dict[str, FakeSession]] = []
 
-    def preview(self, sessions):
+    def preview(self, sessions, *, pending_names=()):
         self.preview_calls += 1
         self.preview_sessions = dict(sessions)
+        self.preview_pending = tuple(pending_names)
         if self.preview_error is not None:
             raise self.preview_error
         assert self.preview_result is not None, "test forgot preview_result"
@@ -1169,3 +1170,66 @@ def test_common_window_sizes_keep_the_primary_actions_visible(
     assert panel.table.isVisible() is True
     assert panel.table.width() > 600
     assert panel.create_button.width() > 0
+
+
+# --------------------------------------------------------------------------- #
+# Pending release gate (Stage C): a snapshot alone never clears UNCERTAIN
+# --------------------------------------------------------------------------- #
+def test_preview_running_transaction_keeps_the_name_blocked(
+        qtbot, ui_workspace, monkeypatch):
+    window, recorder, fake, _connect, _folders = _make_window(
+        qtbot, ui_workspace)
+    fake.create_error = HaUiError(errors.E_CREATE_UNCERTAIN, detail="running")
+    fake.preview_result = _fresh_preview()
+    fake.preview_result.pending = {"alpha": "running"}
+    monkeypatch.setattr(window.client_panel, "_ask_create_name",
+                        lambda: "alpha")
+
+    window.client_panel.create_button.click()
+    qtbot.waitUntil(lambda: bool(recorder.errors), timeout=4000)
+    qtbot.waitUntil(lambda: not window.client_panel.busy, timeout=4000)
+    qtbot.waitUntil(lambda: fake.preview_calls >= 1, timeout=4000)
+
+    assert "alpha" in window.client_panel._unconfirmed
+    assert "仍有未确认" in window.client_panel.status_label.text()
+
+
+def test_preview_terminal_transaction_releases_the_name(qtbot, ui_workspace,
+                                                        monkeypatch):
+    window, recorder, fake, _connect, _folders = _make_window(
+        qtbot, ui_workspace)
+    fake.create_error = HaUiError(errors.E_CREATE_UNCERTAIN, detail="running")
+    fake.preview_result = _fresh_preview()
+    fake.preview_result.pending = {"alpha": "running"}
+    monkeypatch.setattr(window.client_panel, "_ask_create_name",
+                        lambda: "alpha")
+
+    window.client_panel.create_button.click()
+    qtbot.waitUntil(lambda: not window.client_panel.busy, timeout=4000)
+    assert "alpha" in window.client_panel._unconfirmed
+
+    fake.preview_result.pending = {"alpha": "terminal"}
+    window.client_panel.refresh_button.click()
+    qtbot.waitUntil(lambda: "alpha" not in window.client_panel._unconfirmed,
+                    timeout=4000)
+    assert "alpha" not in window.client_panel._unconfirmed
+
+
+def test_preview_failure_never_releases_a_pending_name(qtbot, ui_workspace,
+                                                       monkeypatch):
+    window, recorder, fake, _connect, _folders = _make_window(
+        qtbot, ui_workspace)
+    fake.create_error = HaUiError(errors.E_CREATE_UNCERTAIN, detail="running")
+    fake.preview_result = _fresh_preview()
+    fake.preview_result.pending = {"alpha": "running"}
+    monkeypatch.setattr(window.client_panel, "_ask_create_name",
+                        lambda: "alpha")
+
+    window.client_panel.create_button.click()
+    qtbot.waitUntil(lambda: not window.client_panel.busy, timeout=4000)
+    assert "alpha" in window.client_panel._unconfirmed
+
+    fake.preview_error = HaUiError(errors.E_SSH_TIMEOUT)
+    window.client_panel.refresh_button.click()
+    qtbot.waitUntil(lambda: not window.client_panel.busy, timeout=4000)
+    assert "alpha" in window.client_panel._unconfirmed

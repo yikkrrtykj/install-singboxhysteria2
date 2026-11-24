@@ -18,7 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Callable, Mapping, Sequence
 
 from . import errors
 from .chain import (
@@ -89,6 +89,10 @@ class ServerPreview:
 class PreviewResult:
     servers: dict[str, ServerPreview] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+    # Per client name, the durable managed-transaction state observed on both
+    # sides: absent / terminal / running / unknown. Used by the UI to decide
+    # whether an UNCERTAIN creation may be released.
+    pending: dict[str, str] = field(default_factory=dict)
 
     @property
     def clients_a(self) -> dict[str, ClientRecord]:
@@ -126,7 +130,8 @@ class GenerationService:
                 for role in ("A", "B")}
 
     # --------------------------------------------------------------- preview --
-    def preview(self, sessions: Mapping[str, RemoteSession]) -> PreviewResult:
+    def preview(self, sessions: Mapping[str, RemoteSession], *,
+                pending_names: Sequence[str] = ()) -> PreviewResult:
         providers = self._providers(sessions)
         result = PreviewResult()
         for role in ("A", "B"):
@@ -154,6 +159,31 @@ class GenerationService:
             result.warnings.append(
                 "有 %d 个客户端仅单端存在或协议不完整，不能生成双活配置"
                 % len(incomplete))
+        # Durable transaction state for names the UI still treats as pending.
+        # Read-only: it never decides that a write happened, only whether the
+        # request is still running / finished / absent.
+        for name in pending_names:
+            states: list[str] = []
+            for role in ("A", "B"):
+                try:
+                    status = providers[role].pending_transaction(name)
+                except HaUiError:
+                    states.append("unknown")
+                    continue
+                if status.absent:
+                    states.append("absent")
+                elif status.terminal:
+                    states.append("terminal")
+                else:
+                    states.append("running")
+            if "running" in states:
+                result.pending[name] = "running"
+            elif "unknown" in states:
+                result.pending[name] = "unknown"
+            elif all(state == "absent" for state in states):
+                result.pending[name] = "absent"
+            else:
+                result.pending[name] = "terminal"
         return result
 
     # ---------------------------------------------------------------- create --
