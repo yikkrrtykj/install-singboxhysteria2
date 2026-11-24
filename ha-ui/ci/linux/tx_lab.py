@@ -88,6 +88,19 @@ printf '配置已提交并重载成功\n'
 printf "客户端 '@@NAME@@' 已同时添加到 Reality 与 HY2\n"
 '''
 
+INSTALLER_STALL = r'''#!/bin/bash
+set -u
+. "@@LIB@@"
+sleep "@@SLEEP@@"
+cm_tx_journal_phase check
+cm_tx_journal_phase backup
+cm_tx_journal_phase replace
+cm_tx_journal_phase reload
+cm_tx_journal_phase health
+printf '配置已提交并重载成功\n'
+printf "客户端 '@@NAME@@' 已同时添加到 Reality 与 HY2\n"
+'''
+
 INSTALLER_HANG = "#!/bin/bash\nsleep 30\n"
 
 
@@ -363,33 +376,50 @@ def scenario_worker_survives_closed_stdout(work: Path) -> None:
 
 
 def scenario_watchdog_no_kill(work: Path) -> None:
-    """A stalled pre-commit transaction is reported, never killed.
+    """A stalled transaction is reported, never killed (both windows).
 
-    The installer journals replace and then sleeps past the watchdog budget: a
-    kill here would be exactly the reviewed TOCTOU (replace may already be
-    live), so the worker must wait for the canonical transaction instead.
+    (a) after `replace`: a kill here would be exactly the reviewed TOCTOU
+        (replace may already be live), so the worker must wait;
+    (b) before `replace`: the stall is reported, and the worker still waits for
+        the canonical transaction instead of signalling it.
     """
     tx = make_tx(work, "cccc", "gamma")
     installer_dir = work / "inst3"
     write(installer_dir / "install.sh",
           INSTALLER.replace("@@LIB@@", str(LIB))
-          .replace("@@SLEEP@@", "3").replace("@@NAME@@", "gamma"), 0o755)
+          .replace("@@SLEEP@@", "2").replace("@@NAME@@", "gamma"), 0o755)
     worker = write(work / "worker3.sh",
                    remote._tx_worker_script(precommit=1), 0o600)
+    claim_a = work / "claim3a"
+    claim_a.mkdir(mode=0o700)
     subprocess.run(["bash", str(worker), str(tx), str(installer_dir),
-                    str(int(time.time())), str(work / "claim3")],
-                   timeout=40)
+                    str(int(time.time())), str(claim_a)], timeout=40)
     if not (tx / "result").exists():
         fail("worker published no result")
     if "rc=0" not in (tx / "result").read_text():
-        fail("worker was killed instead of waiting for the transaction")
+        fail("post-replace stall was killed instead of waiting")
     phases = (tx / "phases").read_text() if (tx / "phases").exists() else ""
     if "replace" not in phases or "health" not in phases:
         fail("transaction did not complete after the report-only watchdog")
-    notes = (tx / "notes").read_text() if (tx / "notes").exists() else ""
-    if "precommit-stall" not in notes:
-        fail("stall was not reported")
     ok("report-only watchdog never kills a post-replace transaction")
+
+    tx2 = make_tx(work, "dddd", "delta")
+    installer_dir2 = work / "inst4"
+    write(installer_dir2 / "install.sh",
+          INSTALLER_STALL.replace("@@LIB@@", str(LIB))
+          .replace("@@SLEEP@@", "3").replace("@@NAME@@", "delta"), 0o755)
+    claim_b = work / "claim3b"
+    claim_b.mkdir(mode=0o700)
+    subprocess.run(["bash", str(worker), str(tx2), str(installer_dir2),
+                    str(int(time.time())), str(claim_b)], timeout=40)
+    if not (tx2 / "result").exists():
+        fail("pre-replace stall published no result")
+    if "rc=0" not in (tx2 / "result").read_text():
+        fail("pre-replace stall was killed instead of waiting")
+    notes = (tx2 / "notes").read_text() if (tx2 / "notes").exists() else ""
+    if "precommit-stall" not in notes:
+        fail("pre-replace stall was not reported")
+    ok("pre-replace stall is reported and still never killed")
 
 
 def scenario_pending_glob(work: Path) -> None:
