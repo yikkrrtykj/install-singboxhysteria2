@@ -612,33 +612,35 @@ def test_end_to_end_creation_generates_independent_credentials(workspace_tmp):
 # --------------------------------------------------------------------------- #
 def test_pending_transaction_is_absent_before_any_attempt():
     provider, _session = provider_for()
-    status = provider.pending_transaction("event-vmix01")
-    assert status.absent is True
-    assert status.terminal is False
-    assert status.running is False
+    overview = provider.pending_transactions("event-vmix01")
+    assert overview.records == ()
+    assert overview.claim is None
 
 
 def test_pending_transaction_distinguishes_running_from_terminal():
     running, _ = provider_for(add_timeout=True)
     with pytest.raises(HaUiError):
         running.create_client("event-vmix01", confirmed=True)
-    status = running.pending_transaction("event-vmix01")
-    assert status.absent is False
-    assert status.terminal is False
-    assert status.running is True
+    overview = running.pending_transactions("event-vmix01")
+    assert len(overview.records) == 1
+    assert overview.records[0].terminal is False
+    assert overview.records[0].running is True
+    assert overview.records[0].release_safe is False
 
     done, _ = provider_for()
     done.create_client("event-vmix01", confirmed=True)
-    finished = done.pending_transaction("event-vmix01")
+    finished = done.pending_transactions("event-vmix01").records[0]
     assert finished.terminal is True
     assert finished.running is False
+    assert finished.outcome == "created"
+    assert finished.release_safe is True
 
 
 def test_pending_query_is_read_only():
     provider, session = provider_for()
     provider.create_client("event-vmix01", confirmed=True)
     before = list(session.commands)
-    provider.pending_transaction("event-vmix01")
+    provider.pending_transactions("event-vmix01")
     extra = session.commands[len(before):]
     tx_commands = [c for c in extra if "ha-ui-tx" in c]
     assert tx_commands
@@ -647,17 +649,24 @@ def test_pending_query_is_read_only():
         assert "10\n2\n" not in command
         assert "setsid" not in command
     for command in tx_commands:
-        assert "HAUI_TX_ABSENT=1" in command
+        assert "HAUI_TX_RECORDS_BEGIN" in command
+        # The name is validated and appended unquoted so the glob expands.
+        assert "'/root/sbox/.ha-ui-tx/event-vmix01-*'" not in command
 
 
 def test_preview_reports_pending_states_and_never_guesses(workspace_tmp):
     providers = ready_providers()
     providers["A"].pending_states["alpha"] = "running"
-    providers["B"].pending_states["alpha"] = "terminal"
+    providers["B"].pending_states["alpha"] = "created"
     providers["A"].pending_states["beta"] = "unknown"
+    providers["A"].pending_states["delta"] = "created"
+    providers["B"].pending_states["delta"] = "created"
+    providers["A"].records["delta"] = fakes.client_record("delta")
+    providers["B"].records["delta"] = fakes.client_record("delta")
     service, _ = make_service(workspace_tmp, providers)
     view = service.preview({"A": object(), "B": object()},
-                           pending_names=["alpha", "beta", "gamma"])
-    assert view.pending["alpha"] == "running"
-    assert view.pending["beta"] == "unknown"
+                           pending_names=["alpha", "beta", "gamma", "delta"])
+    assert view.pending["alpha"] == "blocked"
+    assert view.pending["beta"] == "blocked"
     assert view.pending["gamma"] == "absent"
+    assert view.pending["delta"] == "terminal-safe"

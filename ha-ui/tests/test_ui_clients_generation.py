@@ -1208,7 +1208,7 @@ def test_preview_terminal_transaction_releases_the_name(qtbot, ui_workspace,
     qtbot.waitUntil(lambda: not window.client_panel.busy, timeout=4000)
     assert "alpha" in window.client_panel._unconfirmed
 
-    fake.preview_result.pending = {"alpha": "terminal"}
+    fake.preview_result.pending = {"alpha": "terminal-safe"}
     window.client_panel.refresh_button.click()
     qtbot.waitUntil(lambda: "alpha" not in window.client_panel._unconfirmed,
                     timeout=4000)

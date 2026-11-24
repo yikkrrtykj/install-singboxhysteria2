@@ -70,6 +70,32 @@ _CLEAN_WRITE_REFUSALS = frozenset({
 })
 
 
+def _pending_role_state(overview, record) -> str:
+    """Per-side release decision from durable evidence + the live record.
+
+    ``absent``       no claim and no request: nothing known is in flight.
+    ``terminal-safe`` every same-name request ended in a proven outcome and the
+                      live record agrees with it.
+    ``blocked``      anything else: claim without record, unfinished/damaged
+                      request, live worker, rollback_manual, or a live record
+                      that contradicts the transaction outcome.
+    """
+    if overview.claim and not any(
+            status.tx_id == overview.claim for status in overview.records):
+        return "blocked"
+    if not overview.records:
+        return "blocked" if overview.claim else "absent"
+    if any(not status.release_safe for status in overview.records):
+        return "blocked"
+    newest = overview.records[0]
+    if newest.outcome == "created":
+        return ("terminal-safe"
+                if record is not None and record.exportable else "blocked")
+    if newest.outcome in ("rolled-back", "refused"):
+        return "terminal-safe" if record is None else "blocked"
+    return "blocked"
+
+
 def _creation_is_uncertain(exc: HaUiError) -> bool:
     if exc.code in _UNCERTAIN_CREATE_CODES:
         return True
@@ -160,30 +186,24 @@ class GenerationService:
                 "有 %d 个客户端仅单端存在或协议不完整，不能生成双活配置"
                 % len(incomplete))
         # Durable transaction state for names the UI still treats as pending.
-        # Read-only: it never decides that a write happened, only whether the
-        # request is still running / finished / absent.
+        # Release requires a *proven* terminal outcome on every side plus a live
+        # state that agrees; anything else stays blocked.
         for name in pending_names:
             states: list[str] = []
             for role in ("A", "B"):
                 try:
-                    status = providers[role].pending_transaction(name)
+                    overview = providers[role].pending_transactions(name)
                 except HaUiError:
-                    states.append("unknown")
+                    states.append("blocked")
                     continue
-                if status.absent:
-                    states.append("absent")
-                elif status.terminal:
-                    states.append("terminal")
-                else:
-                    states.append("running")
-            if "running" in states:
-                result.pending[name] = "running"
-            elif "unknown" in states:
-                result.pending[name] = "unknown"
+                states.append(_pending_role_state(
+                    overview, result.servers[role].records.get(name)))
+            if "blocked" in states:
+                result.pending[name] = "blocked"
             elif all(state == "absent" for state in states):
                 result.pending[name] = "absent"
             else:
-                result.pending[name] = "terminal"
+                result.pending[name] = "terminal-safe"
         return result
 
     # ---------------------------------------------------------------- create --

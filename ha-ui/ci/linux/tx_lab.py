@@ -360,28 +360,177 @@ def scenario_worker_survives_closed_stdout(work: Path) -> None:
     ok("detached worker survives a closed stdout consumer")
 
 
-def scenario_watchdog(work: Path) -> None:
+def scenario_watchdog_no_kill(work: Path) -> None:
+    """A stalled pre-commit transaction is reported, never killed.
+
+    The installer journals replace and then sleeps past the watchdog budget: a
+    kill here would be exactly the reviewed TOCTOU (replace may already be
+    live), so the worker must wait for the canonical transaction instead.
+    """
     tx = make_tx(work, "cccc", "gamma")
     installer_dir = work / "inst3"
-    write(installer_dir / "install.sh", INSTALLER_HANG, 0o755)
+    write(installer_dir / "install.sh",
+          INSTALLER.replace("@@LIB@@", str(LIB))
+          .replace("@@SLEEP@@", "3").replace("@@NAME@@", "gamma"), 0o755)
     worker = write(work / "worker3.sh",
                    remote._tx_worker_script(precommit=1), 0o600)
-    subprocess.run(["bash", str(worker), str(tx),
-                    str(installer_dir), str(int(time.time()))],
+    subprocess.run(["bash", str(worker), str(tx), str(installer_dir),
+                    str(int(time.time())), str(work / "claim3")],
                    timeout=40)
     if not (tx / "result").exists():
-        fail("watchdog published no result")
-    notes = (tx / "notes").read_text() if (tx / "notes").exists() else ""
-    if "watchdog=precommit-timeout" not in notes:
-        fail("watchdog note missing")
+        fail("worker published no result")
+    if "rc=0" not in (tx / "result").read_text():
+        fail("worker was killed instead of waiting for the transaction")
     phases = (tx / "phases").read_text() if (tx / "phases").exists() else ""
-    if "replace" in phases:
-        fail("watchdog killed after the replace boundary")
-    out = status_text(tx, "gamma")
-    status = remote._parse_tx_status(out)
-    if status.success or status.committed:
-        fail("watchdog outcome was reported as success")
-    ok("pre-commit watchdog stops a hung menu and never claims success")
+    if "replace" not in phases or "health" not in phases:
+        fail("transaction did not complete after the report-only watchdog")
+    notes = (tx / "notes").read_text() if (tx / "notes").exists() else ""
+    if "precommit-stall" not in notes:
+        fail("stall was not reported")
+    ok("report-only watchdog never kills a post-replace transaction")
+
+
+def scenario_pending_glob(work: Path) -> None:
+    """The real read-only query must find real directories (glob regression)."""
+    root = work / "txroot"
+    root.mkdir(mode=0o700)
+    created = root / ("alpha-" + "1" * 32)
+    created.mkdir(mode=0o700)
+    write(created / "phases", "check\t1\t/x\nreplace\t2\t/x\n")
+    write(created / "result", "rc=0\nfinished=3\n")
+    write(created / "pid", "999999\n")
+    write(created / "out",
+          "配置已提交并重载成功\n客户端 'alpha' 已同时添加到 Reality 与 HY2\n")
+    running = root / ("alpha-" + "2" * 32)
+    running.mkdir(mode=0o700)
+    write(running / "phases", "check\t1\t/x\n")
+    write(running / "pid", str(os.getpid()) + "\n")
+    damaged = root / ("alpha-" + "3" * 32)
+    damaged.mkdir(mode=0o700)
+    write(damaged / "result", "rc=0\nfinished=4\n")
+    write(damaged / "publish-failed", "1\n")
+    write(damaged / "pid", "999999\n")
+
+    command = remote._pending_tx_command("alpha").replace(
+        remote.TX_ROOT, str(root))
+    out = subprocess.run(["bash", "-c", command], capture_output=True,
+                         text=True).stdout
+    overview = remote._parse_tx_overview(out)
+    if len(overview.records) != 3:
+        fail("pending query found %d records, expected 3: %r"
+             % (len(overview.records), out[-500:]))
+    outcomes = {record.outcome for record in overview.records}
+    if "created" not in outcomes or "running" not in outcomes:
+        fail("pending query outcomes wrong: %r" % (outcomes,))
+    if "damaged" not in outcomes:
+        fail("damaged receipt was not detected: %r" % (outcomes,))
+    if any(record.release_safe for record in overview.records
+           if record.outcome in ("running", "damaged")):
+        fail("unsafe record was marked release-safe")
+
+    absent_cmd = remote._pending_tx_command("beta").replace(
+        remote.TX_ROOT, str(root))
+    absent_out = subprocess.run(["bash", "-c", absent_cmd],
+                                capture_output=True, text=True).stdout
+    absent = remote._parse_tx_overview(absent_out)
+    if absent.records:
+        fail("absent name returned records")
+    ok("pending query globs real same-name directories and reports all states")
+
+
+def scenario_claim_guard(work: Path) -> None:
+    root = work / "claimroot"
+    root.mkdir(mode=0o700)
+    txid = "alpha-" + "a" * 32
+    guard = remote._tx_guard_script("alpha", txid, root=str(root))
+
+    first = subprocess.run(["bash", "-c", guard], capture_output=True,
+                           text=True)
+    if first.returncode != 0:
+        fail("first claim failed: %r" % (first.stdout + first.stderr))
+    if not (root / "alpha.claim").is_dir():
+        fail("claim directory missing")
+    second = subprocess.run(["bash", "-c", guard], capture_output=True,
+                            text=True)
+    if second.returncode == 0 or "tx-in-flight" not in second.stdout:
+        fail("second concurrent claim was not refused")
+
+    # An unfinished same-name record blocks even without a claim.
+    (root / "alpha.claim").rename(root / "alpha.claim.off")
+    unfinished = root / ("alpha-" + "b" * 32)
+    unfinished.mkdir(mode=0o700)
+    blocked = subprocess.run(["bash", "-c", guard], capture_output=True,
+                             text=True)
+    if blocked.returncode == 0 or "tx-in-flight" not in blocked.stdout:
+        fail("unfinished same-name record did not block a new request")
+
+    # A stale claim whose worker is dead may be taken over after one day.
+    (unfinished / "result").write_text("rc=1\nfinished=2\n")
+    claim = root / "alpha.claim.off"
+    write(claim / "txid", txid + "\n")
+    old = time.time() - 2 * 24 * 3600
+    os.utime(claim, (old, old))
+    stale_guard = remote._tx_guard_script("alpha", "alpha-" + "c" * 32,
+                                          root=str(root))
+    taken = subprocess.run(["bash", "-c", stale_guard], capture_output=True,
+                           text=True)
+    if taken.returncode != 0:
+        fail("stale dead claim was not taken over: %r"
+             % (taken.stdout + taken.stderr))
+    ok("per-name claim blocks concurrent/restarted requests and expires safely")
+
+
+def scenario_release_semantics(work: Path) -> None:
+    del work
+    base = dict(absent=False, phases=("check", "backup", "replace"),
+                notes=(), rc=1, finished=2, running=False, counts={})
+    cases = [
+        ("rollback_manual", dict(base, phases=("check", "replace", "rollback"),
+                                 counts={"ROLLBACK_FAILED": 1}), "rollback-manual", False),
+        ("worker alive", dict(base, rc=0, running=True,
+                              counts={"COMMIT": 1, "SUCCESS": 1}), "worker-alive", False),
+        ("damaged", dict(base, damaged=True, rc=0,
+                         counts={"COMMIT": 1, "SUCCESS": 1}), "damaged", False),
+        ("rc0 no success", dict(base, rc=0, counts={}), "unknown", False),
+        ("created", dict(base, rc=0, counts={"COMMIT": 1, "SUCCESS": 1}),
+         "created", True),
+        ("rolled back", dict(base, phases=("check", "replace", "rollback"),
+                             counts={"ROLLED_BACK": 1}), "rolled-back", True),
+        ("refused", dict(base, phases=("check",), counts={"LOCK": 1}),
+         "refused", True),
+    ]
+    for label, kwargs, outcome, safe in cases:
+        status = remote.TxStatus(tx_id="x-" + "a" * 32, **kwargs)
+        if status.outcome != outcome:
+            fail("%s outcome=%r expected %r" % (label, status.outcome, outcome))
+        if status.release_safe is not safe:
+            fail("%s release_safe=%r expected %r"
+                 % (label, status.release_safe, safe))
+    ok("terminal outcomes gate release: only proven success/refusal/rollback")
+
+
+def scenario_fsync_fail(work: Path) -> None:
+    """A failing sync must abort the phase instead of pretending durability."""
+    bin_dir = work / "failing-sync"
+    bin_dir.mkdir()
+    write(bin_dir / "sync", "#!/bin/bash\nexit 1\n", 0o755)
+    root = work / "fsroot"
+    root.mkdir(mode=0o700)
+    txid = "delta-" + "d" * 32
+    tx = root / txid
+    tx.mkdir(mode=0o700)
+    env_text = remote._tx_env_text(txid).replace(
+        remote.TX_ROOT + "/" + txid, str(tx))
+    write(tx / "env.sh", env_text)
+    script = ". '%s'; cm_tx_journal_phase check" % LIB
+    probe = subprocess.run(
+        ["bash", "-c", script],
+        env={"PATH": str(bin_dir) + ":/usr/bin:/bin", "BASH_ENV": str(tx / "env.sh"),
+             "HOME": os.environ.get("HOME", "/root")},
+        capture_output=True, text=True)
+    if probe.returncode == 0:
+        fail("hook returned success although every sync failed")
+    ok("journal fsync failure is fail-closed")
 
 
 def status_text(tx: Path, name: str) -> str:
@@ -425,7 +574,11 @@ def main() -> int:
                 ("worker-survives-launcher", scenario_worker_survives_launcher),
                 ("worker-survives-closed-stdout",
                  scenario_worker_survives_closed_stdout),
-                ("watchdog", scenario_watchdog),
+                ("watchdog-no-kill", scenario_watchdog_no_kill),
+                ("pending-glob", scenario_pending_glob),
+                ("claim-guard", scenario_claim_guard),
+                ("release-semantics", scenario_release_semantics),
+                ("fsync-fail", scenario_fsync_fail),
                 ("status-query", scenario_status_query)):
             work = work_root / name
             work.mkdir()
