@@ -277,3 +277,11 @@ pre-commit watchdog、只读状态查询。失败时打印 out/journal 摘要，
 
 本 lab 只证明本机/CI 的 Bash 事务与进程边界；真实 A/B VPS 仍按
 `docs/windows-ha-ui-acceptance.md` 执行。
+
+
+### 8.1 第四轮复审新增场景（Linux lab，14 项 Stage B）
+
+`tx_lab.py` 新增：真实目录上的 production pending 查询（glob 回归）、per-name claim
+并发/重启阻断与过期接管、release 判定矩阵（rollback_manual / worker-alive / damaged
+不得解除）、watchdog 在 replace 前后均只报告不杀、以及注入失败 `sync` 时 journal
+必须 fail-closed。
