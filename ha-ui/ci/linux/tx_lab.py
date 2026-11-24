@@ -195,7 +195,10 @@ def scenario_health_rollback(work: Path) -> None:
         {"STUB_ACTIVE1_RC": "0", "STUB_ACTIVE2_RC": "1",
          "STUB_RELOAD_RC": "0"})
     if rc == 0:
-        fail("health failure reported success")
+        journal = (work / "phases").read_text() if (work / "phases").exists() else "-"
+        counter = (work / "counter").read_text() if (work / "counter").exists() else "-"
+        fail("health failure reported success: out=%r journal=%r counter=%r"
+             % (out[-600:], journal, counter))
     if '"alpha"' in live.read_text():
         fail("health failure did not restore the pre-write bytes")
     if "rollback" not in (work / "phases").read_text():
