@@ -160,7 +160,30 @@ def test_guard_blocks_unfinished_records_and_claims_atomically():
     assert 'mkdir -- "$claim"' in guard
     # Fifth review: safety, not mere result existence, blocks the name.
     assert 'ha_ui_tx_safe_terminal "$old"' in guard
-    assert "find" in guard and "-mtime +1" in guard
+
+
+def test_claim_is_never_taken_over_automatically():
+    guard = remote._tx_guard_script("alpha", "alpha-" + "a" * 32)
+    # Sixth review: no mtime/pid based takeover may exist at all.
+    assert "-mtime +1" not in guard
+    assert 'rm -rf -- "$claim"' not in guard
+    assert 'if ! mkdir -- "$claim" 2>/dev/null; then' in guard
+    assert 'echo HAUI_MENU_FAIL=tx-in-flight; exit 15;' in guard
+
+
+def test_cleanup_keeps_evidence_while_a_claim_exists():
+    cleanup = remote._tx_cleanup_script("alpha")
+    assert 'if [ -d "$root/$name.claim" ]' in cleanup
+    assert cleanup.index('$root/$name.claim') < cleanup.index("-mtime +7")
+
+
+def test_worker_releases_only_its_own_claim():
+    worker = remote._tx_worker_script()
+    assert '= "${tx##*/}"' in worker
+    # Every claim removal is guarded by that ownership comparison.
+    for line in worker.splitlines():
+        if 'rm -rf -- "$claim"' in line:
+            assert '= "${tx##*/}"' in line, line
 
 
 def test_damaged_receipt_is_uncertain_in_the_create_path():
@@ -206,5 +229,7 @@ def test_failed_publication_keeps_the_claim():
     # Failure branches release the temp dir but never the per-name claim.
     assert 'rm -f "$tx/result.tmp"; rm -rf -- "$d"; exit 1' in worker
     assert 'rm -rf -- "$claim" "$d"; exit 1' not in worker
-    # The successful completion releases both.
-    assert 'rm -rf -- "$claim" "$d"' in worker
+    # The successful completion releases the claim under an ownership check
+    # and then the temp dir.
+    assert 'then rm -rf -- "$claim"; fi' in worker
+    assert 'fi\nrm -rf -- "$d"' in worker
