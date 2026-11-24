@@ -480,6 +480,10 @@ class FakeSession:
         self.commands: list[str] = []
         self.last_tx = None
         self.pending_state: str | None = None
+        # Explicit same-name records for pending queries:
+        # [(terminal, running, rc, counts, phases), ...] newest first.
+        self.pending_records = None
+        self.pending_claim: str | None = None
         self.downloads: list[str] = []
         self.menu_invoked = False
         self.create_invoked = False
@@ -503,7 +507,7 @@ class FakeSession:
              max_output: int = 1024 * 1024) -> tuple[int, str, str]:
         del stdin_data, timeout, max_output
         self.commands.append(command)
-        if "HAUI_TX_ABSENT=1" in command:
+        if "HAUI_TX_RECORDS_BEGIN" in command:
             return self._tx_pending(command)
         if "HAUI_MENU_END" in command or "ha-ui-installer" in command:
             if re.search(r"(?:^|\n)2\n([A-Za-z0-9][A-Za-z0-9._-]*)\n0\n",
@@ -832,14 +836,34 @@ class FakeSession:
         return "\n".join(lines) + "\n"
 
     def _tx_pending(self, command: str) -> tuple[int, str, str]:
-        match = re.search(r"/\.ha-ui-tx/([A-Za-z0-9][A-Za-z0-9._-]*)-\*", command)
+        match = re.search(r"name=([A-Za-z0-9][A-Za-z0-9._-]*)", command)
         assert match is not None
         name = match.group(1)
         last = getattr(self, "last_tx", None)
-        if self.pending_state == "absent" or last is None:
-            return 0, "HAUI_TX_ABSENT=1\n", ""
-        _, terminal, running, counts, phases = last
-        return 0, self._tx_block(name, terminal, running, 0, counts, phases), ""
+        records = self.pending_records
+        if records is None:
+            if self.pending_state == "absent" or last is None:
+                return 0, self._tx_records(name, []), ""
+            records = [(last[1], last[2], 0, last[3], last[4])]
+        lines = self._tx_records(name, records)
+        return 0, lines, ""
+
+    def _tx_records(self, name: str, records) -> str:
+        lines = ["HAUI_TX_RECORDS_BEGIN"]
+        for terminal, running, rc, counts, phases in records:
+            lines.append("HAUI_TX_RECORD_BEGIN")
+            block = self._tx_block(name, terminal, running, rc, counts, phases)
+            lines.extend(block.splitlines()[1:])  # drop the STARTED marker
+            lines.append("HAUI_TX_RECORD_END")
+        lines.append("HAUI_TX_RECORDS_END")
+        lines.append("HAUI_TX_RECORD_COUNT=%d" % len(records))
+        claim = getattr(self, "pending_claim", None)
+        if claim:
+            lines.append("HAUI_TX_CLAIM=1")
+            lines.append("HAUI_TX_CLAIM_TXID=%s" % claim)
+        else:
+            lines.append("HAUI_TX_CLAIM=0")
+        return "\n".join(lines) + "\n"
 
     def _add_frame(self, lines: list[str]) -> tuple[int, str, str]:
         output = "\n".join(lines)
@@ -907,21 +931,40 @@ class FakeProvider:
     # name -> absent / terminal / running / unknown (pending_transaction fake)
     pending_states: dict[str, str] = field(default_factory=dict)
 
-    def pending_transaction(self, name: str):
-        self._enter("pending_transaction")
+    def pending_transactions(self, name: str):
+        self._enter("pending_transactions")
         state = self.pending_states.get(name, "absent")
         if state == "unknown":
             raise HaUiError(errors.E_REMOTE_LIST, detail="tx-status")
-        return remote.TxStatus(
-            tx_id="%s-%s" % (name, "a" * 32),
-            absent=state == "absent",
-            phases=(),
-            notes=(),
-            rc=None if state == "running" else 0,
-            finished=None if state == "running" else 1,
-            running=state == "running",
-            counts={},
-        )
+        if state == "absent":
+            return remote.TxOverview(records=(), claim=None)
+        txid = "%s-%s" % (name, "a" * 32)
+        if state == "running":
+            record = remote.TxStatus(
+                tx_id=txid, absent=False, phases=("replace",), notes=(),
+                rc=None, finished=None, running=True, counts={})
+        elif state == "blocked":
+            record = remote.TxStatus(
+                tx_id=txid, absent=False,
+                phases=("check", "backup", "replace", "reload", "rollback"),
+                notes=(), rc=1, finished=1, running=False,
+                counts={"ROLLBACK_FAILED": 1, "ROLLBACK_INTENT": 1})
+        elif state == "created":
+            record = remote.TxStatus(
+                tx_id=txid, absent=False,
+                phases=("check", "backup", "replace", "reload", "health"),
+                notes=(), rc=0, finished=1, running=False,
+                counts={"COMMIT": 1, "SUCCESS": 1})
+        elif state == "rolled-back":
+            record = remote.TxStatus(
+                tx_id=txid, absent=False,
+                phases=("check", "backup", "replace", "reload", "health",
+                        "rollback"),
+                notes=(), rc=1, finished=1, running=False,
+                counts={"ROLLED_BACK": 1, "ROLLBACK_INTENT": 1})
+        else:
+            raise AssertionError("unknown pending state %r" % state)
+        return remote.TxOverview(records=(record,), claim=None)
 
     def _enter(self, method: str) -> None:
         self.calls.append(method)

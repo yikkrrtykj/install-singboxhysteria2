@@ -355,6 +355,7 @@ def _tx_env_text(txid: str) -> str:
     missing BASH_ENV file, so an exit status proves nothing.
     """
     tx = TX_ROOT + "/" + txid
+    q = shlex.quote(tx)
     return (
         "#!/bin/bash\n"
         "# ha-ui managed transaction hook (reviewed source: ha-ui/ha_ui/core/remote.py)\n"
@@ -362,13 +363,13 @@ def _tx_env_text(txid: str) -> str:
         "    local phase=${1:-unknown} backup=${2:-}\n"
         "    umask 077\n"
         "    printf '%s\\t%s\\t%s\\n' \"$phase\" \"$(date +%s)\" \"$backup\" "
-        ">> " + shlex.quote(tx) + "/phases || return 1\n"
-        "    sync -f " + shlex.quote(tx) + "/phases 2>/dev/null || sync\n"
-        "    sync -f " + shlex.quote(tx) + " 2>/dev/null || sync\n"
+        ">> " + q + "/phases || return 1\n"
+        "    if ! sync -f " + q + "/phases 2>/dev/null; then sync || return 1; fi\n"
+        "    if ! sync -f " + q + " 2>/dev/null; then sync || return 1; fi\n"
         "    return 0\n"
         "}\n"
         "CM_TX_JOURNAL_HOOK=ha_ui_tx_journal\n"
-        "printf 'loaded\\n' > " + shlex.quote(tx) + "/hook-loaded\n"
+        "printf 'loaded\\n' > " + q + "/hook-loaded || exit 1\n"
         "unset BASH_ENV\n"
     )
 
@@ -378,13 +379,21 @@ def _tx_env_sha(txid: str) -> str:
 
 
 def _tx_worker_script(precommit: int | None = None) -> str:
-    """Exact detached worker text (the Linux lab runs this same text)."""
+    """Exact detached worker text (the Linux lab runs this same text).
+
+    The worker never signals the menu: a pre-commit watchdog cannot be made
+    race-free with the canonical ``replace`` boundary from outside (the check
+    and the kill are not atomic), so a stall is only *reported* and the
+    transaction is never killed. Transaction cancellation is therefore left to
+    the canonical per-subcommand timeouts, and anything unfinished stays
+    ``UNSAFE`` for the operator.
+    """
     seconds = TX_PRECOMMIT_SECONDS if precommit is None else int(precommit)
     ansi = shlex.quote("s/" + _REDACT_ANSI + "//g")
     link = shlex.quote("s/" + _REDACT_LINK + "/[redacted-link]/g")
     return (
         "set -u\n"
-        "tx=$1; d=$2; started=$3\n"
+        "tx=$1; d=$2; started=$3; claim=$4\n"
         "env -i PATH=" + PATH_ENV + " HOME=/root LANG=C.UTF-8 TERM=dumb "
         "BASH_ENV=\"$tx/env.sh\" SB_CLIENT_MANAGEMENT_REF="
         + INSTALLER_REVIEWED_COMMIT + " "
@@ -394,30 +403,41 @@ def _tx_worker_script(precommit: int | None = None) -> str:
         "( while kill -0 \"$menu\" 2>/dev/null; do\n"
         "    if grep -q '^replace' \"$tx/phases\" 2>/dev/null; then exit 0; fi\n"
         "    now=$(date +%s)\n"
-        "    if [ $((now - started)) -gt " + str(seconds) + " ]; then\n"
-        "      printf 'watchdog=precommit-timeout\\n' >> \"$tx/notes\"\n"
-        "      kill -TERM \"$menu\" 2>/dev/null\n"
-        "      exit 0\n"
+        "    if [ $((now - started)) -gt " + str(seconds) + " ] "
+        "&& [ ! -f \"$tx/stall-noted\" ]; then\n"
+        "      printf 'precommit-stall\\n' > \"$tx/stall-noted\"\n"
+        "      printf 'watchdog=precommit-stall\\n' >> \"$tx/notes\"\n"
         "    fi\n"
         "    sleep 1\n"
         "  done ) &\n"
-        "watchdog=$!\n"
+        "monitor=$!\n"
         "wait \"$menu\"; rc=$?\n"
-        "kill \"$watchdog\" 2>/dev/null || true\n"
+        "kill \"$monitor\" 2>/dev/null || true\n"
         "sed -E -e " + ansi + " -e " + link
         + " \"$tx/raw\" > \"$tx/out\" 2>/dev/null || true\n"
         "rm -f \"$tx/raw\"\n"
-        "printf 'rc=%s\\nfinished=%s\\n' \"$rc\" \"$(date +%s)\" "
-        "> \"$tx/result.tmp\" && mv -- \"$tx/result.tmp\" \"$tx/result\"\n"
-        "sync -f \"$tx/result\" 2>/dev/null || sync\n"
-        "sync -f \"$tx\" 2>/dev/null || sync\n"
-        "rm -rf -- \"$d\"\n"
+        "if ! printf 'rc=%s\\nfinished=%s\\n' \"$rc\" \"$(date +%s)\" "
+        "> \"$tx/result.tmp\"; then\n"
+        "  printf 'publish-failed\\n' > \"$tx/publish-failed\"\n"
+        "  rm -f \"$tx/result.tmp\"; rm -rf -- \"$claim\" \"$d\"; exit 1\n"
+        "fi\n"
+        "if ! mv -- \"$tx/result.tmp\" \"$tx/result\"; then\n"
+        "  printf 'publish-failed\\n' > \"$tx/publish-failed\"\n"
+        "  rm -rf -- \"$claim\" \"$d\"; exit 1\n"
+        "fi\n"
+        "if ! sync -f \"$tx/result\" 2>/dev/null; then\n"
+        "  sync || printf 'publish-unsynced\\n' > \"$tx/publish-failed\"\n"
+        "fi\n"
+        "if ! sync -f \"$tx\" 2>/dev/null; then\n"
+        "  sync || printf 'publish-unsynced\\n' > \"$tx/publish-failed\"\n"
+        "fi\n"
+        "rm -rf -- \"$claim\" \"$d\"\n"
     )
 
 
 # Read-only evidence block. Every value is a fixed token or a count over the
 # redacted transcript; transcript text itself never leaves the server.
-_TX_STATUS_TEMPLATE = r"""echo HAUI_TX_PHASES_BEGIN; sed -n '1,80p' "$tx/phases" 2>/dev/null || true; echo HAUI_TX_PHASES_END; echo HAUI_TX_RESULT_BEGIN; sed -n '1,8p' "$tx/result" 2>/dev/null || true; echo HAUI_TX_RESULT_END; echo "HAUI_TX_NOTES=$(sed -n '1,4p' "$tx/notes" 2>/dev/null | tr '\n' ',')"; pid=$(cat -- "$tx/pid" 2>/dev/null || true); if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then echo HAUI_TX_RUNNING=1; else echo HAUI_TX_RUNNING=0; fi; for pair in "配置已提交:COMMIT" "已回滚并重新加载上一份配置:ROLLED_BACK" "回滚恢复失败:ROLLBACK_FAILED" "服务未能确认恢复:ROLLBACK_UNCONFIRMED" "自动回滚:ROLLBACK_INTENT" "客户端 __NAME__:SUCCESS" "已存在:EXISTS" "配置锁:LOCK" "一致性:CONSISTENCY" "不完整:INCOMPLETE" "add candidate:CREATE" "服务端配置不存在:MISSING_CONFIG" "客户端名称非法:NAME_INVALID" "保留名称:RESERVED"; do needle=${pair%%:*}; key=${pair##*:}; n=$(grep -c -F -- "$needle" "$tx/out" 2>/dev/null || true); echo "HAUI_TX_${key}=${n:-0}"; done; echo "HAUI_TX_ID=${tx##*/}"
+_TX_STATUS_TEMPLATE = r"""echo HAUI_TX_PHASES_BEGIN; sed -n '1,80p' "$tx/phases" 2>/dev/null || true; echo HAUI_TX_PHASES_END; echo HAUI_TX_RESULT_BEGIN; sed -n '1,8p' "$tx/result" 2>/dev/null || true; echo HAUI_TX_RESULT_END; echo "HAUI_TX_NOTES=$(sed -n '1,4p' "$tx/notes" 2>/dev/null | tr '\n' ',')"; pid=$(cat -- "$tx/pid" 2>/dev/null || true); if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then echo HAUI_TX_RUNNING=1; else echo HAUI_TX_RUNNING=0; fi; for pair in "配置已提交:COMMIT" "已回滚并重新加载上一份配置:ROLLED_BACK" "回滚恢复失败:ROLLBACK_FAILED" "服务未能确认恢复:ROLLBACK_UNCONFIRMED" "自动回滚:ROLLBACK_INTENT" "客户端 __NAME__:SUCCESS" "已存在:EXISTS" "配置锁:LOCK" "一致性:CONSISTENCY" "不完整:INCOMPLETE" "add candidate:CREATE" "服务端配置不存在:MISSING_CONFIG" "客户端名称非法:NAME_INVALID" "保留名称:RESERVED"; do needle=${pair%%:*}; key=${pair##*:}; n=$(grep -c -F -- "$needle" "$tx/out" 2>/dev/null || true); echo "HAUI_TX_${key}=${n:-0}"; done; echo "HAUI_TX_DAMAGED=$( if [ -f "$tx/publish-failed" ] || [ -f "$tx/publish-unsynced" ]; then echo 1; else echo 0; fi )"; echo "HAUI_TX_ID=${tx##*/}"
 """
 
 
@@ -432,19 +452,23 @@ def _add_client_command(name: str, txid: str) -> str:
 
     1. fetch/verify the pinned installer and library, and the menu markers
        (nothing executes before this, and no byte of the live config changes);
-    2. create the root-only transaction directory and the reviewed ``env.sh``,
+    2. refuse when any same-name request is still unfinished (durable, works
+       across GUI restarts), then take an atomic per-name claim directory;
+    3. create the root-only transaction directory and the reviewed ``env.sh``,
        then verify its digest against the client-computed value;
-    3. prove the hook is really loaded in the transaction shell (sentinel +
-       ``declare -F`` + "not exported" probe) — BASH_ENV failures are silent, so
+    4. prove the hook is really loaded in the transaction shell (sentinel +
+       ``declare -F`` + "not exported" probe) -- BASH_ENV failures are silent, so
        this is the only fail-closed gate; any failure aborts before a write;
-    4. start the detached worker (own session, file-backed stdin/stdout) and
-       wait for it; the wait is the client's patience, not a kill switch.
+    5. start the detached worker (own session, file-backed stdin/stdout) and wait
+       for it; the wait is the client's patience, not a kill switch.
 
-    The worker may stop the menu only before the ``replace`` phase is journaled.
-    Once the commit boundary is recorded, nothing in this path kills it.
+    The worker never signals the menu: an external watchdog cannot be made
+    race-free with the canonical ``replace`` boundary. A stalled pre-commit
+    transaction is reported and stays UNSAFE, never silently killed.
     """
     sequence = "10\n2\n%s\n0\n" % name
     tx = TX_ROOT + "/" + txid
+    claim = TX_ROOT + "/" + name + ".claim"
     env_text = _tx_env_text(txid)
     env_sha = _tx_env_sha(txid)
     checks = " ".join(
@@ -478,13 +502,15 @@ def _add_client_command(name: str, txid: str) -> str:
         + shlex.quote(CLIENT_MANAGEMENT_SHA256)
         + " ]; then echo HAUI_MENU_FAIL=lib-hash; exit 9; fi; "
         "chmod 600 \"$d/install.sh\" \"$d/client-management.sh\"; "
-        "tx=" + shlex.quote(tx) + "; root=" + shlex.quote(TX_ROOT) + "; "
-        "mkdir -p -- \"$root\" && chmod 700 -- \"$root\"; "
-        "if [ -e \"$tx\" ]; then echo HAUI_MENU_FAIL=tx-exists; exit 11; fi; "
-        "mkdir -p -- \"$tx\" || { echo HAUI_MENU_FAIL=txdir; exit 10; }; "
+        "tx=" + shlex.quote(tx) + "; "
+        + _tx_guard_script(name, txid) + " "
+        "if [ -e \"$tx\" ]; then rm -rf -- \"$claim\"; "
+        "  echo HAUI_MENU_FAIL=tx-exists; exit 11; fi; "
+        "mkdir -p -- \"$tx\" || { rm -rf -- \"$claim\"; "
+        "  echo HAUI_MENU_FAIL=txdir; exit 10; }; "
         "chmod 700 -- \"$tx\"; "
-        # Expiry: keep finished requests for 7 days, unfinished for 30, and
-        # never delete a directory whose worker is still alive.
+        # Retention: only *finished* requests may expire. Unfinished / unknown
+        # evidence is kept until an operator resolves it.
         "for old in \"$root\"/*/; do "
         "  [ -d \"$old\" ] || continue; "
         "  [ \"${old%/}\" = \"$tx\" ] && continue; "
@@ -492,8 +518,6 @@ def _add_client_command(name: str, txid: str) -> str:
         "  if [ -n \"$opid\" ] && kill -0 \"$opid\" 2>/dev/null; then continue; fi; "
         "  if [ -f \"$old/result\" ]; then "
         "    find \"$old\" -maxdepth 0 -mtime +7 -exec rm -rf -- {} + 2>/dev/null; "
-        "  else "
-        "    find \"$old\" -maxdepth 0 -mtime +30 -exec rm -rf -- {} + 2>/dev/null; "
         "  fi; "
         "done; "
         "printf '%s' " + shlex.quote(sequence) + " > \"$tx/in\"; "
@@ -501,21 +525,22 @@ def _add_client_command(name: str, txid: str) -> str:
         "printf '%s' " + shlex.quote(env_text) + " > \"$tx/env.sh\"; "
         "chmod 600 -- \"$tx/env.sh\"; "
         "if [ \"$(sha256sum -- \"$tx/env.sh\" | awk '{print $1}')\" != "
-        + shlex.quote(env_sha) + " ]; then "
+        + shlex.quote(env_sha) + " ]; then rm -rf -- \"$claim\"; "
         "echo HAUI_MENU_FAIL=env-hash; exit 12; fi; "
         "probe=$(env -i PATH=" + PATH_ENV + " HOME=/root BASH_ENV=\"$tx/env.sh\" "
         "bash -c 'declare -F ha_ui_tx_journal >/dev/null && echo OK' "
         "2>/dev/null); "
         "if [ \"$probe\" != OK ] || [ ! -f \"$tx/hook-loaded\" ]; then "
-        "echo HAUI_MENU_FAIL=hook-unproven; exit 13; fi; "
+        "rm -rf -- \"$claim\"; echo HAUI_MENU_FAIL=hook-unproven; exit 13; fi; "
         "exported=$(env -i PATH=" + PATH_ENV + " HOME=/root BASH_ENV=\"$tx/env.sh\" "
         "bash -c 'env | grep -c \"^CM_TX_JOURNAL_HOOK=\" || true' 2>/dev/null); "
         "if [ \"$exported\" != 0 ]; then "
-        "echo HAUI_MENU_FAIL=hook-exported; exit 14; fi; "
+        "rm -rf -- \"$claim\"; echo HAUI_MENU_FAIL=hook-exported; exit 14; fi; "
         "started=$(date +%s); printf '%s\\n' \"$started\" > \"$tx/started\"; "
         "cleanup=0; "
         "setsid bash -c " + shlex.quote(_tx_worker_script())
-        + " haui_tx \"$tx\" \"$d\" \"$started\" >/dev/null 2>&1 < /dev/null & "
+        + " haui_tx \"$tx\" \"$d\" \"$started\" \"$claim\" "
+        ">/dev/null 2>&1 < /dev/null & "
         "child=$!; printf '%s\\n' \"$child\" > \"$tx/pid\"; "
         "wait \"$child\" 2>/dev/null || true; "
         "echo HAUI_TX_STARTED=1; "
@@ -524,15 +549,72 @@ def _add_client_command(name: str, txid: str) -> str:
     return "bash -c " + shlex.quote(script)
 
 
+def _tx_guard_script(name: str, txid: str, root: str | None = None) -> str:
+    """Durable per-name guard + atomic claim (shared with the Linux lab).
+
+    Any unfinished same-name request blocks a new write (works across GUI
+    restarts); unfinished records are never expired. The claim directory is an
+    atomic ``mkdir`` so two GUIs cannot both start the same name. A claim whose
+    referenced worker is dead may be taken over only after it is older than one
+    day; a claim with no live pid and no age stays blocked for a human.
+    """
+    base = TX_ROOT if root is None else root
+    claim = base + "/" + name + ".claim"
+    return (
+        "root=" + shlex.quote(base) + "; name=" + shlex.quote(name) + "; "
+        "claim=" + shlex.quote(claim) + "; "
+        "mkdir -p -- \"$root\" && chmod 700 -- \"$root\"; "
+        "for old in \"$root\"/\"$name\"-*/; do "
+        "  [ -d \"$old\" ] || continue; "
+        "  if [ ! -f \"$old/result\" ]; then "
+        "    echo HAUI_MENU_FAIL=tx-in-flight; exit 15; "
+        "  fi; "
+        "done; "
+        "if ! mkdir -- \"$claim\" 2>/dev/null; then "
+        "  existing=$(cat -- \"$claim/txid\" 2>/dev/null || true); "
+        "  alive=0; "
+        "  if [ -n \"$existing\" ] && [ -f \"$root/$existing/pid\" ]; then "
+        "    oldpid=$(cat -- \"$root/$existing/pid\" 2>/dev/null || true); "
+        "    if [ -n \"$oldpid\" ] && kill -0 \"$oldpid\" 2>/dev/null; then alive=1; fi; "
+        "  fi; "
+        "  stale=$(find \"$claim\" -maxdepth 0 -mtime +1 2>/dev/null || true); "
+        "  if [ \"$alive\" = 1 ] || [ -z \"$stale\" ]; then "
+        "    echo HAUI_MENU_FAIL=tx-in-flight; exit 15; "
+        "  fi; "
+        "  rm -rf -- \"$claim\"; "
+        "  mkdir -- \"$claim\" 2>/dev/null "
+        "    || { echo HAUI_MENU_FAIL=tx-in-flight; exit 15; }; "
+        "fi; "
+        "printf '%s' " + shlex.quote(txid) + " > \"$claim/txid\"; "
+        "chmod 600 -- \"$claim/txid\";"
+    )
+
+
 def _pending_tx_command(name: str) -> str:
-    """Read-only: newest transaction state for *name*. Writes nothing."""
+    """Read-only: every durable request for *name*, plus the claim state.
+
+    The base path is a fixed trusted constant; the validated canonical name is
+    appended unquoted so ``*`` really globs, and the rest of each path is quoted.
+    Nothing from operator input can introduce a path or a second glob.
+    """
     script = (
-        "tx=$(ls -1dt " + shlex.quote(TX_ROOT + "/" + name + "-*")
-        + " 2>/dev/null | head -n 1); "
-        "if [ -z \"$tx\" ] || [ ! -d \"$tx\" ]; then "
-        "echo HAUI_TX_ABSENT=1; exit 0; fi; "
-        "echo HAUI_TX_ABSENT=0; "
-        + _tx_status_body(name)
+        "root=" + shlex.quote(TX_ROOT) + "; name=" + shlex.quote(name) + "; "
+        "claim=\"$root/$name.claim\"; "
+        "count=0; echo HAUI_TX_RECORDS_BEGIN; "
+        "for d in \"$root\"/\"$name\"-*/; do "
+        "  [ -d \"$d\" ] || continue; "
+        "  count=$((count + 1)); "
+        "  echo HAUI_TX_RECORD_BEGIN; "
+        "  tx=${d%/}; "
+        + _tx_status_body(name) + " "
+        "  echo HAUI_TX_RECORD_END; "
+        "done; "
+        "echo HAUI_TX_RECORDS_END; "
+        "echo \"HAUI_TX_RECORD_COUNT=$count\"; "
+        "if [ -d \"$claim\" ]; then "
+        "  echo HAUI_TX_CLAIM=1; "
+        "  echo \"HAUI_TX_CLAIM_TXID=$(cat -- \"$claim/txid\" 2>/dev/null || true)\"; "
+        "else echo HAUI_TX_CLAIM=0; fi"
     )
     return "bash -c " + shlex.quote(script)
 
@@ -685,10 +767,54 @@ class TxStatus:
     finished: int | None
     running: bool
     counts: Mapping[str, int]
+    damaged: bool = False
 
     @property
     def terminal(self) -> bool:
         return self.finished is not None
+
+    @property
+    def outcome(self) -> str:
+        """Fixed, non-secret outcome token for this request.
+
+        ``terminal`` alone is NOT "safe to release": a damaged receipt, a live
+        worker, ``rollback_manual`` or an incomplete result must stay blocked.
+        """
+        if self.damaged:
+            return "damaged"
+        if not self.terminal:
+            # A receipt value without its terminal marker is a partial write.
+            if self.rc is not None:
+                return "damaged"
+            return "running" if self.running else "unfinished"
+        if self.rc is None:
+            return "damaged"
+        if self.running:
+            return "worker-alive"
+        if self.rc == 0 and self.success and self.committed:
+            return "created"
+        if (self.counts.get("ROLLED_BACK", 0)
+                and not self.counts.get("ROLLBACK_FAILED", 0)
+                and not self.counts.get("ROLLBACK_UNCONFIRMED", 0)
+                and "rollback" in self.phases):
+            return "rolled-back"
+        if (self.rc != 0
+                and not self.committed
+                and not self.counts.get("ROLLBACK_INTENT", 0)
+                and not self.counts.get("ROLLBACK_FAILED", 0)
+                and not self.counts.get("ROLLBACK_UNCONFIRMED", 0)
+                and any(self.counts.get(key, 0) for _token, key in _TX_REFUSALS)):
+            return "refused"
+        if ("rollback_manual" in self.phases
+                or self.counts.get("ROLLBACK_FAILED", 0)
+                or self.counts.get("ROLLBACK_UNCONFIRMED", 0)):
+            return "rollback-manual"
+        return "unknown"
+
+    @property
+    def release_safe(self) -> bool:
+        """Only a proven success or a proven clean refusal/rollback releases."""
+        return self.outcome in ("created", "rolled-back", "refused")
 
     @property
     def last_phase(self) -> str:
@@ -752,6 +878,9 @@ def _parse_tx_status(output: str) -> TxStatus:
         finished = _tx_int(result_values.get("finished"))
     counts = {key: _tx_int(values.get("HAUI_TX_" + key)) or 0
               for key in _TX_COUNT_KEYS}
+    damaged = (values.get("HAUI_TX_DAMAGED") == "1"
+               or "publish-failed" in notes or "publish-unsynced" in notes
+               or (finished is not None and rc is None))
     return TxStatus(
         tx_id=values.get("HAUI_TX_ID", ""),
         absent=values.get("HAUI_TX_ABSENT") == "1",
@@ -761,7 +890,41 @@ def _parse_tx_status(output: str) -> TxStatus:
         finished=finished,
         running=values.get("HAUI_TX_RUNNING") == "1",
         counts=counts,
+        damaged=damaged,
     )
+
+
+@dataclass(frozen=True)
+class TxOverview:
+    """Every durable request for one client name plus the per-name claim.
+
+    ``records`` is newest-first. A claim without a matching record means a
+    launcher died between claiming and creating the directory: that is unknown
+    state and must stay blocked, never "absent".
+    """
+
+    records: tuple[TxStatus, ...]
+    claim: str | None
+
+    @property
+    def unfinished(self) -> bool:
+        return self.claim is not None and not any(
+            record.tx_id == self.claim for record in self.records)
+
+
+_TX_RECORD_RE = re.compile(
+    r"HAUI_TX_RECORD_BEGIN\n(.*?)HAUI_TX_RECORD_END", re.S)
+
+
+def _parse_tx_overview(output: str) -> TxOverview:
+    text = (output or "").replace("\r", "")
+    values = _parse_key_values(text)
+    records = tuple(_parse_tx_status(block)
+                    for block in _TX_RECORD_RE.findall(text))
+    claim = None
+    if values.get("HAUI_TX_CLAIM") == "1":
+        claim = values.get("HAUI_TX_CLAIM_TXID") or ""
+    return TxOverview(records=records, claim=claim)
 
 
 class RemoteProvider:
@@ -1003,12 +1166,12 @@ class RemoteProvider:
         self._judge_tx(_parse_tx_status(out), validated, before)
         return None
 
-    def pending_transaction(self, name: str) -> "TxStatus":
-        """Read-only query of the newest managed transaction for *name*.
+    def pending_transactions(self, name: str) -> "TxOverview":
+        """Read-only query of every durable request for *name*.
 
-        Never writes, never kills, never retries. ``absent`` means no
-        transaction directory exists for the name; ``terminal`` distinguishes a
-        finished request from one that may still be running.
+        Never writes, never kills, never retries. Reports the per-name claim and
+        all same-name records (newest first), so a stale or unfinished request
+        cannot be mistaken for "absent".
         """
         validated = validate_client_name(name)
         self.preflight()
@@ -1016,7 +1179,7 @@ class RemoteProvider:
                                           timeout=45.0)
         if rc != 0:
             raise HaUiError(errors.E_REMOTE_LIST, detail="tx-status")
-        return _parse_tx_status(out)
+        return _parse_tx_overview(out)
 
     @staticmethod
     def _raise_launch_failure(output: str) -> None:
@@ -1039,6 +1202,9 @@ class RemoteProvider:
         """Turn one managed transaction's durable state into a verdict."""
         if status.absent:
             raise HaUiError(errors.E_CREATE_UNCERTAIN, detail="tx-absent")
+        if status.damaged:
+            # A partial/unfsynced result is not a terminal record.
+            raise HaUiError(errors.E_CREATE_UNCERTAIN, detail="tx-damaged")
         if not status.terminal:
             # Still running, or the worker vanished without publishing a
             # terminal record: never decide anything from this.

@@ -448,9 +448,9 @@ class ClientsPanel(QWidget):
     def _apply_preview(self, result: PreviewResult) -> None:
         self._preview = result
         # A successful snapshot is NOT proof that the remote transaction ended.
-        # Only a durable "absent" or "terminal" state may release a blocked name.
+        # Only "absent" or a *proven safe* terminal state may release a name.
         for name, state in result.pending.items():
-            if state in ("absent", "terminal"):
+            if state in ("absent", "terminal-safe"):
                 self._unconfirmed.discard(name)
         self._pending_running = sorted(
             name for name, state in result.pending.items()
@@ -849,7 +849,7 @@ class ClientsPanel(QWidget):
             if name:
                 self._unconfirmed.add(name)
             if error.detail in ("running", "tx-transport", "tx-unfinished",
-                                "tx-absent"):
+                                "tx-absent", "tx-in-flight", "tx-damaged"):
                 self.creation_result_label.setText(
                     TX_RUNNING_TEXT % (error.detail or "unknown"))
             else:
