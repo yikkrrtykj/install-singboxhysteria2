@@ -89,6 +89,38 @@ CREATE_REPAIR_TEMPLATE = "客户端「%s」已补齐"
 CREATE_PARTIAL_TEMPLATE = (
     "已保留已创建的一端；失败端需要单独检查，软件不会自动删除或重试写入。"
 )
+# A failure that may have crossed the write boundary must never claim that the
+# servers were untouched.
+CREATE_UNCONFIRMED_TEXT = (
+    "创建结果待确认：%s\n可能已写入服务器。请刷新两端状态核实；"
+    "确认之前不要重复创建同名客户端。"
+)
+CREATE_PREWRITE_FAILED_TEXT = (
+    "创建失败：%s\n未修改任何客户端（在预写检查/确认阶段停止）。"
+)
+STALE_TEXT = (
+    "两端状态未能刷新（STALE / UNKNOWN）。本地显示可能已过期；"
+    "请恢复连接后重新读取，不能据此判断服务器未被修改。"
+)
+UNCONFIRMED_RETRY_TEXT = (
+    "客户端「%s」上次创建结果未确认。请先刷新两端并确认实际状态，再决定是否重建。"
+)
+
+# Errors raised strictly before the canonical add path could replace the config
+# file. Everything else may have written, so the panel must refresh instead of
+# claiming "nothing changed".
+_PREWRITE_ONLY_CODES = frozenset({
+    errors.E_USAGE, errors.E_CONFIG, errors.E_CONFIG_SCHEMA,
+    errors.E_HOSTKEY_MISSING, errors.E_HOSTKEY_MISMATCH,
+    errors.E_HOSTKEY_FORMAT, errors.E_SSH_CONNECT, errors.E_SSH_AUTH,
+    errors.E_CREDENTIAL_MISSING, errors.E_CREDENTIAL_STORE,
+    errors.E_CREDENTIAL_UNAVAILABLE, errors.E_REMOTE_PREFLIGHT,
+    errors.E_REMOTE_PIN, errors.E_REMOTE_COMMAND, errors.E_REMOTE_LIST,
+    errors.E_REMOTE_NOT_ROOT, errors.E_REMOTE_PLATFORM,
+    errors.E_INSTALLER_UNTRUSTED, errors.E_CLIENT_EXISTS,
+    errors.E_CLIENT_INCOMPLETE, errors.E_CLIENT_PARTIAL_EXISTS,
+    errors.E_CANCELLED,
+})
 
 
 class GenerationNotifier(Protocol):
@@ -180,6 +212,7 @@ class ClientsPanel(QWidget):
         self._pending_repair: tuple[str, bool] | None = None
         self._creation_allow_partial = False
         self._creation_needs_refresh = False
+        self._unconfirmed: set[str] = set()
         self._build_ui()
 
     # ------------------------------------------------------------------ build --
@@ -398,10 +431,18 @@ class ClientsPanel(QWidget):
         # A failed refresh must never leave a stale "ready" table behind.
         self._clear_view()
         self.status_label.setText("刷新失败：%s" % error.safe_text)
+        if self._unconfirmed:
+            # The unconfirmed write and the refresh failure compose: the local
+            # view is unknown, and that says nothing about the servers.
+            self.creation_result_label.setText(STALE_TEXT)
+            self.creation_result_label.setVisible(True)
         self._notifier.show_error(error)
 
     def _apply_preview(self, result: PreviewResult) -> None:
         self._preview = result
+        # A successful re-read is the operator's confirmation step: the write
+        # state is now observed, so a retry no longer has to be blocked.
+        self._unconfirmed.clear()
         self._populate_table(result)
         self._update_certificate_summary(result)
         for role, label in (("A", self.server_a_label),
@@ -701,9 +742,23 @@ class ClientsPanel(QWidget):
             return
         if not name:
             return
+        if name in self._unconfirmed:
+            # A previous attempt may have written this name; the operator must
+            # look at the live state before writing again.
+            self._notifier.show_warning(
+                "创建结果尚未确认", UNCONFIRMED_RETRY_TEXT % name)
+            self.status_label.setText(UNCONFIRMED_RETRY_TEXT % name)
+            return
         self._start_creation(name, allow_partial_repair=False)
 
     def _start_creation(self, name: str, *, allow_partial_repair: bool) -> None:
+        # Passwords are snapshotted HERE, on the GUI thread: the worker closure
+        # must never touch a QWidget or the session password provider.
+        try:
+            passwords = dict(self._password_provider())
+        except BaseException:  # noqa: BLE001 - hard GUI boundary
+            self._notifier.show_error(HaUiError(errors.E_INTERNAL))
+            return
         self._busy = True
         self._creation_allow_partial = allow_partial_repair
         self._pending_repair = None
@@ -721,7 +776,7 @@ class ClientsPanel(QWidget):
                 name=name,
                 confirmed=True,
                 allow_partial_repair=allow_partial_repair,
-                password_overrides=self._password_provider(),
+                password_overrides=passwords,
             )
 
         self._runner.run(
@@ -766,15 +821,35 @@ class ClientsPanel(QWidget):
                 self.status_label.setText(
                     "已确认仅补齐缺失端；准备重新连接…")
                 return
+        if self._may_have_written(error):
+            name = getattr(self, "_pending_creation", ("", False))[0]
+            if name:
+                self._unconfirmed.add(name)
+            self.creation_result_label.setText(
+                CREATE_UNCONFIRMED_TEXT % error.safe_text)
+            self.creation_result_label.setVisible(True)
+            self.status_label.setText(
+                "创建结果待确认；正在刷新两端实际状态…")
+            self._creation_needs_refresh = True
+            self._notifier.show_error(error)
+            return
         self.creation_result_label.setText(
-            "创建失败：%s\n未修改任何客户端（在预写检查/确认阶段停止）。"
-            % error.safe_text)
+            CREATE_PREWRITE_FAILED_TEXT % error.safe_text)
         self.creation_result_label.setVisible(True)
         self.status_label.setText("创建失败：%s" % error.safe_text)
         self._notifier.show_error(error)
         # Pre-write refusals never changed either VPS, so do not open another
         # pair of sessions just to show the same failure again. Write outcomes
         # (including partial/uncertain) are returned as a result and do refresh.
+
+    @staticmethod
+    def _may_have_written(error: HaUiError) -> bool:
+        """True unless the error is a fixed pre-write refusal.
+
+        Fail-safe: an unknown code counts as "may have written" so the operator
+        is asked to re-read instead of being told nothing changed.
+        """
+        return error.code not in _PREWRITE_ONLY_CODES
 
     def _creation_done(self) -> None:
         self._busy = False
@@ -813,7 +888,10 @@ class ClientsPanel(QWidget):
             elif side.status == "existing":
                 lines.append("%s 端：原已存在（未改动）" % role)
             elif side.status == "failed":
-                lines.append("%s 端：失败（%s）" % (role, side.code or "E_REMOTE"))
+                if side.detail == "rolled-back":
+                    lines.append("%s 端：已回滚，配置已恢复（未提交）" % role)
+                else:
+                    lines.append("%s 端：失败（%s）" % (role, side.code or "E_REMOTE"))
             elif side.status == "uncertain":
                 lines.append("%s 端：待确认（%s）" % (role, side.code or "E_CREATE_UNCERTAIN"))
             elif side.status == "skipped":

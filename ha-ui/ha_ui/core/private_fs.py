@@ -38,9 +38,28 @@ from .errors import HaUiError
 _RUN_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 _MAX_LOCAL_FILE = 2 * 1024 * 1024
 
+# Windows process-creation flag: give a console-subsystem child (``icacls.exe``
+# below) a hidden console instead of allocating a new console window.  The
+# packaged ``--windowed`` EXE has no console to inherit, so without this flag
+# Windows opens a visible CMD window for every spawned console program.
+CREATE_NO_WINDOW = 0x08000000
+
 
 def is_windows() -> bool:
     return os.name == "nt"
+
+
+def console_isolation_kwargs() -> dict[str, int]:
+    """``subprocess`` kwargs that keep a console child from opening a window.
+
+    Shared by every console-subsystem child this app may spawn: on Windows the
+    child gets ``CREATE_NO_WINDOW``; on POSIX no extra flag exists and the
+    mapping is empty.  Callers splat the result into ``subprocess.run``/
+    ``Popen`` rather than hard-coding the flag at each call site.
+    """
+    if is_windows():
+        return {"creationflags": CREATE_NO_WINDOW}
+    return {}
 
 
 def _is_reparse(info: os.stat_result) -> bool:
@@ -60,8 +79,11 @@ def _current_user_sid() -> str:
 
 def _icacls(args: list[str]) -> int:
     try:
+        # icacls.exe is a console-subsystem program: without CREATE_NO_WINDOW a
+        # console-less (windowed) parent gets a flashing CMD window per call.
         proc = subprocess.run(["icacls"] + args, capture_output=True,
-                              timeout=30, check=False)
+                              timeout=30, check=False,
+                              **console_isolation_kwargs())
     except (OSError, subprocess.SubprocessError):
         raise HaUiError(errors.E_ACL, detail="icacls-run") from None
     return int(proc.returncode)

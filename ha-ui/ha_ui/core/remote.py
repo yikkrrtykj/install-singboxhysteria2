@@ -110,6 +110,14 @@ MENU_EXEC_TIMEOUT = 540.0
 
 DERIVED_STAT_FORMAT = "%F|%n|%a|%u|%s|%Y|%y"
 DERIVED_IDENTITY_END = "HAUI_STAT_END"
+# Exact, mutually exclusive server outcomes. A generic "回滚" needle is NOT
+# usable: lib/client-management.sh prints it for three different results
+# (restore failed / restored+reloaded / restored-but-service-unconfirmed) and
+# only the middle one proves the write was undone. The three needles below are
+# the exact sentences:
+#   :330  "回滚恢复失败，请立即人工介入"
+#   :338  "已回滚并重新加载上一份配置"        (proven restore)
+#   :344  "已回滚配置文件，但服务未能确认恢复"
 _MENU_FAIL_TOKENS = (
     ("consistency", "一致性"),
     ("incomplete", "不完整"),
@@ -120,8 +128,23 @@ _MENU_FAIL_TOKENS = (
     ("exists", "已存在"),
     ("lock", "配置锁"),
     ("create", "生成 add candidate 失败"),
-    ("rollback", "回滚"),
+    ("rollback-failed", "回滚恢复失败"),
+    ("rollback-unconfirmed", "服务未能确认恢复"),
+    ("rolled-back", "已回滚并重新加载上一份配置"),
 )
+
+# Refusals the canonical add path raises before it replaces the config file.
+# They are only reported as a clean "nothing was written" when the live
+# reconciliation agrees (same config bytes, name still absent).
+PRE_WRITE_ADD_REFUSALS = frozenset({
+    "consistency", "incomplete", "missing-config", "name-invalid",
+    "permission", "reserved", "exists", "lock", "create",
+})
+
+# The commit line the canonical installer prints only after the candidate was
+# written; the reload wording varies (reload vs "no running process"), so this
+# prefix is the shared proof that the write boundary was crossed.
+COMMIT_PROVEN_MARKER = "配置已提交"
 # Pre-execution pin failures disable automatic menu generation explicitly; the
 # read-existing-exports path remains available. These are not retried.
 _INSTALLER_UNTRUSTED_TOKENS = frozenset({
@@ -163,6 +186,9 @@ class RemotePreflight:
     config_mtime: int
     curl_present: bool = False
     timeout_present: bool = False
+    # Identity of the live config file, read read-only. It is the only evidence
+    # a client can hold that a write boundary was (or was not) crossed.
+    config_sha256: str | None = None
 
     @property
     def okay(self) -> bool:
@@ -304,8 +330,8 @@ def _add_client_command(name: str) -> str:
 
     The name has already passed the canonical regex, so the only interpolated
     text is a fixed-shape token. Success is never inferred from the menu exit
-    code alone: ``_verify_add_output`` requires the canonical add success line,
-    and the caller re-reads the live client list afterwards.
+    code alone: ``RemoteProvider.create_client`` requires the canonical success
+    line and the commit line, and then proves the live record is exportable.
     """
     sequence = "10\n2\n%s\n0\n" % name
     return _pinned_menu_command(
@@ -379,6 +405,70 @@ def _menu_failure_token(transcript: str) -> str:
     return "partial"
 
 
+_SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+
+
+def _config_sha(value: str | None) -> str | None:
+    """Return a strict lowercase SHA-256, or ``None`` for "unknown".
+
+    A missing/unreadable/garbage hash must never be compared as if it were an
+    identity: callers treat ``None`` as "no evidence", never as "unchanged".
+    """
+    if isinstance(value, str) and _SHA256_RE.match(value):
+        return value
+    return None
+
+
+@dataclass(frozen=True)
+class RemoteSnapshot:
+    """One read-only observation of the live config identity + inventory.
+
+    ``config_sha256`` is ``None`` when the server could not prove the hash; it
+    must then never be treated as "unchanged".
+    """
+
+    config_sha256: str | None
+    config_mtime: int
+    records: Mapping[str, ClientRecord]
+
+    def record(self, name: str) -> ClientRecord | None:
+        return self.records.get(name)
+
+
+@dataclass(frozen=True)
+class _ReconcileEvidence:
+    """What a read-only re-read could prove after a failed add.
+
+    Every field is evidence, never a transaction status:
+
+    * ``readable`` — the re-read succeeded at all;
+    * ``config_changed`` — ``True``/``False`` only when both hashes are known;
+    * ``present`` — the name is in the live inventory;
+    * ``exportable`` — that record is complete and structurally trustworthy.
+    """
+
+    readable: bool
+    config_sha256: str | None = None
+    config_changed: bool | None = None
+    present: bool | None = None
+    exportable: bool | None = None
+
+    @property
+    def write_observed(self) -> bool:
+        return self.config_changed is True or self.present is True
+
+    @property
+    def rolled_back_proven(self) -> bool:
+        """Config bytes identical to the pre-write value AND name absent.
+
+        Both halves are required: identical bytes alone could also be a
+        not-yet-started write, and an absent name alone could be a lost update.
+        """
+        return (self.readable
+                and self.config_changed is False
+                and self.present is False)
+
+
 class RemoteProvider:
     """One VPS; every method is a read-only observation or the documented CLI."""
 
@@ -413,9 +503,12 @@ class RemoteProvider:
             "else echo management=inactive; fi; "
             "if jq -e '.services[]? | select(.tag==\"monitor-api\") | has(\"secret\")' "
             "%s >/dev/null 2>&1; then echo api=present; else echo api=missing; fi; "
+            "if [ -f %s ]; then "
+            "echo cfgsha=$(sha256sum %s | awk '{print $1}'); "
+            "else echo cfgsha=none; fi; "
             "stat -c 'mtime=%%Y' %s 2>/dev/null || echo mtime=0"
         ) % (CONFIG_PATH, STATE_PATH, MANAGEMENT_MARKER, MANAGEMENT_MARKER,
-             CONFIG_PATH, CONFIG_PATH)
+             CONFIG_PATH, CONFIG_PATH, CONFIG_PATH, CONFIG_PATH)
         rc, out, err = self.session.exec(command, timeout=60.0)
         if rc != 0:
             raise HaUiError(errors.E_REMOTE_COMMAND, detail="preflight")
@@ -444,6 +537,7 @@ class RemoteProvider:
             config_mtime=mtime,
             curl_present=values.get("curl") == "present",
             timeout_present=values.get("timeout") == "present",
+            config_sha256=_config_sha(values.get("cfgsha")),
         )
         if not facts.root:
             raise HaUiError(errors.E_REMOTE_NOT_ROOT)
@@ -480,10 +574,19 @@ class RemoteProvider:
         return facts
 
     # ------------------------------------------------------------------ list --
-    def list_clients(self) -> dict[str, ClientRecord]:
+    def snapshot(self) -> "RemoteSnapshot":
+        """Read the live config identity and the client inventory together.
+
+        Both are emitted by ONE read-only command so they describe the same
+        moment. ``preflight`` still runs first: the snapshot is only meaningful
+        on a host that passed the canonical gates.
+        """
         preflight = self.preflight()
         command = (
             "stat -c 'mtime=%%Y' %s 2>/dev/null || echo mtime=0; "
+            "if [ -f %s ]; then "
+            "echo cfgsha=$(sha256sum %s | awk '{print $1}'); "
+            "else echo cfgsha=none; fi; "
             "jq -c '([.inbounds[]? | select(.tag==\"vless-in\")] | length) as $rn | "
             "([.inbounds[]? | select(.tag==\"hy2-in\")] | length) as $hn | "
             "{rn:$rn, hn:$hn, "
@@ -494,7 +597,7 @@ class RemoteProvider:
             "%s 2>/dev/null; "
             "echo DERIVED; "
             "stat -c '%%n|%%a|%%u|%%s|%%Y' %s/*/mihomo.yaml 2>/dev/null || true"
-        ) % (CONFIG_PATH, CONFIG_PATH, CLIENTS_DIR)
+        ) % (CONFIG_PATH, CONFIG_PATH, CONFIG_PATH, CONFIG_PATH, CLIENTS_DIR)
         rc, out, err = self.session.exec(command, timeout=60.0,
                                          max_output=MAX_LIST_JSON)
         if rc != 0:
@@ -513,7 +616,13 @@ class RemoteProvider:
             config_mtime = int(values.get("mtime", preflight.config_mtime))
         except ValueError:
             config_mtime = preflight.config_mtime
-        return _build_records(doc, out, config_mtime)
+        return RemoteSnapshot(
+            config_sha256=_config_sha(values.get("cfgsha")),
+            config_mtime=config_mtime,
+            records=_build_records(doc, out, config_mtime))
+
+    def list_clients(self) -> dict[str, ClientRecord]:
+        return dict(self.snapshot().records)
 
     # ---------------------------------------------------------------- export --
     def generate_exports(self, names: list[str], *,
@@ -555,55 +664,149 @@ class RemoteProvider:
         Success requires all of:
         * the name was absent from the live inventory before the write;
         * the pinned installer/lib pre-execution checks passed;
-        * the menu's canonical success line and a clean pipeline exit frame;
-        * a fresh live inventory re-read now contains the name with both a
-          Reality and a HY2 credential.
+        * the menu's canonical success line AND its commit line, with a clean
+          pipeline exit frame;
+        * a fresh live read now shows the name exportable (both protocols and
+          no structural anomaly).
 
-        The method returns only ``None``; the caller records the per-side
-        result. It never returns or logs credentials or raw remote output.
+        Failure is classified, never guessed:
+
+        * ``E_REMOTE_CREATE`` with a pre-write token (``lock``/``exists``/…)
+          only when a live re-read proves the config bytes and name set are
+          unchanged;
+        * ``E_REMOTE_CREATE`` detail ``rolled-back`` only when the transcript
+          carries the exact proven-rollback sentence AND the re-read proves the
+          config bytes are back to the pre-write value with the name absent;
+        * ``E_CREATE_UNCERTAIN`` for everything else (transport loss, menu
+          timeout, failed/unconfirmed rollback, unreadable reconciliation).
+
+        The read-only reconciliation above is *evidence*, not transaction
+        atomicity: this client can never guarantee that an outer timeout has
+        not interrupted the server-side commit. ``docs/windows-ha-ui-data-path.md``
+        records that residual risk; do not claim otherwise here.
         """
         if confirmed is not True:
             raise HaUiError(errors.E_USAGE, detail="create-consent")
         validated = validate_client_name(name)
         if validated.casefold() == RESERVED_CLIENT_NAME.casefold():
             raise HaUiError(errors.E_USAGE, detail="reserved-name")
-        before = self.list_clients()
-        if validated in before:
+        before = self.snapshot()
+        if before.record(validated) is not None:
             raise HaUiError(errors.E_CLIENT_EXISTS, detail="server")
         command = _add_client_command(validated)
         try:
             rc, out, _err = self.session.exec(
                 command, timeout=MENU_EXEC_TIMEOUT, max_output=MAX_MENU_OUTPUT)
         except HaUiError as exc:
-            if exc.code == errors.E_SSH_TIMEOUT:
+            if exc.code in (errors.E_SSH_TIMEOUT, errors.E_SSH_CLOSED):
+                # The transport failed while the write may have been running.
+                # The remote process cannot be inspected through this session,
+                # so the only honest verdict is UNCERTAIN.
                 raise HaUiError(errors.E_CREATE_UNCERTAIN,
-                                detail="timeout") from None
+                                detail="timeout-transport") from None
             raise
         if int(rc) == 124:
-            raise HaUiError(errors.E_CREATE_UNCERTAIN, detail="timeout")
+            raise self._timeout_outcome(before, validated)
         try:
-            self._verify_add_output(out, validated)
+            transcript = self._menu_completion(out)
         except HaUiError as exc:
             if exc.code == errors.E_REMOTE_MENU and exc.detail == "timeout":
-                # A timeout after the write boundary may have committed the
-                # config; the caller must re-read rather than retry blindly.
-                raise HaUiError(errors.E_CREATE_UNCERTAIN,
-                                detail="timeout") from None
-            raise
-        try:
-            after = self.list_clients()
-        except HaUiError as exc:
-            # The write boundary has already been crossed; a failure to read the
-            # new live state is unconfirmed, not a clean failure. The operator
-            # must refresh instead of blindly retrying the write.
-            if exc.code == errors.E_CREATE_UNCERTAIN:
+                raise self._timeout_outcome(before, validated) from None
+            if exc.code == errors.E_INSTALLER_UNTRUSTED:
+                # Refused before execution: no write was attempted.
                 raise
-            raise HaUiError(errors.E_REMOTE_VERIFY,
-                            detail="live-read") from None
-        record = after.get(validated)
-        if record is None or not record.complete:
-            raise HaUiError(errors.E_REMOTE_VERIFY, detail="missing")
+            # The menu process ran but produced no trustworthy result frame
+            # (truncated / non-zero pipeline / drifted transcript). Such an
+            # outcome can hide a committed write, so it is never "clean".
+            raise HaUiError(errors.E_CREATE_UNCERTAIN,
+                            detail="menu-unproven") from None
+        self._judge_add_transcript(transcript, validated, before)
         return None
+
+    def _judge_add_transcript(self, transcript: str, name: str,
+                              before: RemoteSnapshot) -> None:
+        """Turn one finished add transcript into a proven outcome or UNCERTAIN."""
+        if "客户端管理" not in transcript:
+            raise HaUiError(errors.E_REMOTE_MENU, detail="menu-drift")
+        if (MENU_ADD_SUCCESS_TEMPLATE % name) in transcript:
+            if COMMIT_PROVEN_MARKER not in transcript:
+                # The per-name success line without the commit line is not a
+                # commit; never upgrade it to success.
+                raise HaUiError(errors.E_CREATE_UNCERTAIN,
+                                detail="commit-unproven")
+            self._prove_created(name, before)
+            return
+        token = _menu_failure_token(transcript)
+        evidence = self._reconcile(before, name)
+        if token in PRE_WRITE_ADD_REFUSALS:
+            if evidence.write_observed:
+                # The server refused, yet the config bytes or the name set
+                # changed: a racing/concurrent write is possible, so this is
+                # not a clean refusal.
+                raise HaUiError(errors.E_CREATE_UNCERTAIN,
+                                detail="refusal-after-write")
+            if token == "exists":
+                raise HaUiError(errors.E_CLIENT_EXISTS, detail="server")
+            raise HaUiError(errors.E_REMOTE_CREATE, detail=token)
+        if token == "rolled-back":
+            if evidence.rolled_back_proven:
+                raise HaUiError(errors.E_REMOTE_CREATE, detail="rolled-back")
+            # The server printed the proven-rollback sentence but the live state
+            # does not corroborate it (bytes differ, name present, or the
+            # re-read failed): keep it uncertain.
+            raise HaUiError(errors.E_CREATE_UNCERTAIN,
+                            detail="rollback-unconfirmed")
+        if token in ("rollback-failed", "rollback-unconfirmed"):
+            raise HaUiError(errors.E_CREATE_UNCERTAIN, detail=token)
+        raise HaUiError(errors.E_CREATE_UNCERTAIN, detail="unconfirmed")
+
+    def _timeout_outcome(self, before: RemoteSnapshot, name: str) -> HaUiError:
+        """Classify a menu timeout from read-only evidence only.
+
+        Identical bytes + an absent name do NOT prove a rollback here: they are
+        equally consistent with a write that never started. Only the server's
+        explicit proven-restore sentence may downgrade an add to a clean
+        failure, and a timeout never carries one.
+        """
+        evidence = self._reconcile(before, name)
+        if evidence.write_observed:
+            return HaUiError(errors.E_CREATE_UNCERTAIN, detail="timeout-write")
+        return HaUiError(errors.E_CREATE_UNCERTAIN, detail="timeout")
+
+    def _prove_created(self, name: str, before: RemoteSnapshot) -> None:
+        """Post-write proof: the live record must be exportable."""
+        del before  # kept for symmetry/extensibility; evidence is the live read
+        try:
+            after = self.snapshot()
+        except HaUiError:
+            raise HaUiError(errors.E_CREATE_UNCERTAIN,
+                            detail="verify-unreadable") from None
+        record = after.record(name)
+        if record is None:
+            raise HaUiError(errors.E_REMOTE_VERIFY, detail="missing")
+        if not record.exportable:
+            # Both credentials present but a structural anomaly exists: the
+            # client must not be reported as a completed, generatable client.
+            raise HaUiError(errors.E_REMOTE_VERIFY, detail="incomplete")
+
+    def _reconcile(self, before: RemoteSnapshot,
+                   name: str) -> "_ReconcileEvidence":
+        """Read-only evidence after a failed/timed-out add; never raises."""
+        try:
+            after = self.snapshot()
+        except HaUiError:
+            return _ReconcileEvidence(readable=False)
+        changed: bool | None = None
+        if (before.config_sha256 is not None
+                and after.config_sha256 is not None):
+            changed = before.config_sha256 != after.config_sha256
+        record = after.record(name)
+        return _ReconcileEvidence(
+            readable=True,
+            config_sha256=after.config_sha256,
+            config_changed=changed,
+            present=record is not None,
+            exportable=None if record is None else record.exportable)
 
     def _run_cli_generation(self, names: list[str]) -> None:
         """Run the verified installer menu and prove every requested export.
@@ -683,30 +886,6 @@ class RemoteProvider:
             if (MENU_SUCCESS_TEMPLATE % name) not in transcript:
                 raise HaUiError(errors.E_REMOTE_MENU,
                                 detail=_menu_failure_token(transcript))
-
-    @staticmethod
-    def _verify_add_output(output: str, name: str) -> None:
-        """Prove the reviewed add path ran and emitted its success line.
-
-        The menu loop itself exits 0 even when ``add_client`` returns non-zero,
-        so the exit frame is necessary but never sufficient. The canonical
-        success line is emitted only after ``commit_server_config`` returned
-        success (including reload/health, or a proven no-process state).
-        """
-        transcript = RemoteProvider._menu_completion(output)
-        if "客户端管理" not in transcript:
-            raise HaUiError(errors.E_REMOTE_MENU, detail="menu-drift")
-        if (MENU_ADD_SUCCESS_TEMPLATE % name) in transcript:
-            return
-        token = _menu_failure_token(transcript)
-        if token == "exists":
-            raise HaUiError(errors.E_CLIENT_EXISTS, detail="server")
-        if token == "rollback":
-            raise HaUiError(errors.E_REMOTE_CREATE, detail="rollback")
-        if token in ("lock", "consistency", "incomplete", "missing-config",
-                     "name-invalid", "permission", "reserved", "create"):
-            raise HaUiError(errors.E_REMOTE_CREATE, detail=token)
-        raise HaUiError(errors.E_REMOTE_CREATE, detail="unconfirmed")
 
     def _derived_identities(self, names: list[str]) -> dict[str, object]:
         rc, out, _err = self.session.exec(_derived_identity_command(names),

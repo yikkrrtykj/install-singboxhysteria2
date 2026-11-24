@@ -1,4 +1,4 @@
-﻿# Windows HA-UI 0.2.0 — 三层真实验收手册（预验收门禁）
+# Windows HA-UI 0.2.0 — 三层真实验收手册（预验收门禁）
 
 本手册定义 HA-UI 0.2.0 进入真实使用前的 **Windows 本机（A）→ 两台 VPS 只读（B）→
 隔离测试 VPS 创建/生成（C）** 三层验收。任何一层失败都停止，不进入下一层；三层全部
@@ -51,7 +51,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File ha-ui\ci\run-windows-ci.ps1 
 - GUI `--self-test` 退出码 0；
 - EXE 构建成功，EXE 冷启动 self-test `ok=true`；
 - `dist/receipt.json`：`signed=false`、`configuration_embedded=false`、**EXE 实际
-  SHA-256 与 receipt 一致**。
+  SHA-256 与 receipt 一致**；
+- 无控制台窗口：`python ha-ui\ci\check_no_console_popup.py --exe dist\ha-ui.exe`。
+  该脚本先跑正向对照（`CREATE_NEW_CONSOLE` 的 cmd 必须被探测到），再跑目标 EXE；
+  detector 可用时必须 `ok=true` 且 `console_events=0`；detector 不可用时输出
+  `detector=unavailable`（退出码 2），此时以 `test_windows_console_isolation.py` 的
+  creationflags 断言为准，并在证据里写明“detector 不可用”，不得写成已验证。
 
 ### 2.2 人工 GUI 验收清单（必须逐项记录）
 
@@ -75,9 +80,29 @@ powershell -NoProfile -ExecutionPolicy Bypass -File ha-ui\ci\run-windows-ci.ps1 
 | A10 | 生成取消/关闭窗口 | 取消按钮最终显示 `E_CANCELLED`；关闭窗口后无残留进程/无未处理异常 |
 | A11 | 新建客户端对话框（不连接 VPS） | 名称非法/`legacy` 无法提交；未勾写入确认无法提交；文案明确说明修改两台 VPS + reload + 部分成功不自动删除 |
 | A12 | 客户端表格正常/异常态（合成数据或隔离 VPS） | 6 列左右；正常时无“警告：无”/长 UTC/重复诊断；异常行有「查看原因」；证书正常显示简短状态 |
+| A13 | 正常使用全程：双击启动、连接、刷新 A/B、新建客户端、生成 YAML、打开输出目录 | **不出现任何 CMD / 控制台黑窗口**；出错时仍有 GUI 错误提示与固定错误码，无被吞掉的诊断 |
 
 记录：时间、EXE SHA-256、Windows 版本、逐项结果、截图（脱敏）。失败即停，不用
 “重启试一次”掩盖。
+
+### 2.3 创建结果的四种状态（PR #124 复审新增）
+
+| 状态 | 触发条件（代码事实） | 界面必须显示 | 操作员动作 |
+|---|---|---|---|
+| `created` / `existing` | 提交行 + 成功行 + live 复核 `exportable` | 成功提示；“可生成” | 继续生成 YAML |
+| `failed`（预写拒绝） | `lock`/`consistency`/`exists` 等，且核对 SHA 未变、名称仍不存在 | “创建失败 … 未修改任何客户端” | 按错误码修复后重试 |
+| `failed`（`rolled-back`） | 精确句 `已回滚并重新加载上一份配置` **且** SHA 回到写入前 **且** 名称不存在 | “已回滚，配置已恢复（未提交）” | 修复原因后重试 |
+| `uncertain` | 超时/断连/回滚失败/回滚未确认/复核不完整/无成功行 | “创建结果待确认：可能已写入服务器”，自动刷新；刷新失败显示 `STALE / UNKNOWN` 并禁止重建同名客户端 | 先刷新核实，再决定补齐/人工处理 |
+
+验收时必须实际制造至少一次 `uncertain`（隔离环境断网/超时）并确认：文案没有出现
+“未修改任何客户端”；自动刷新确实连接了两端；刷新失败后重建按钮会被拒绝。
+
+### 2.4 无控制台窗口（CMD 黑框）验收
+
+1. 双击 `dist\ha-ui.exe`，观察 10 秒：不应出现任何控制台窗口；
+2. 依次执行 A1–A13 中的交互，全程无黑框；
+3. 运行 `python ha-ui\ci\check_no_console_popup.py --exe dist\ha-ui.exe`；
+4. 记录该脚本 JSON（`checked/positive_control/console_events/ok`）与 detector 可用性。
 
 ## 3. Layer B — 两台 VPS 只读验证（不执行菜单、不生成、不改配置）
 

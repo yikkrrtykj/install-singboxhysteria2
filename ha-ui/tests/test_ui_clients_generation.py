@@ -955,6 +955,122 @@ def test_create_refused_when_operator_declines_repair(
         window.client_panel.creation_result_label.text())
 
 
+def test_password_snapshot_runs_on_the_gui_thread(qtbot, ui_workspace,
+                                                  monkeypatch):
+    window, _recorder, fake, _connect, _folders = _make_window(
+        qtbot, ui_workspace)
+    fake.preview_result = _fresh_preview()
+    fake.create_result = _created("alpha")
+    monkeypatch.setattr(window.client_panel, "_ask_create_name",
+                        lambda: "alpha")
+
+    original = window.password_overrides
+    seen: list[int] = []
+
+    def snapshot():
+        seen.append(threading.get_ident())
+        return original()
+
+    # The panel captured the bound method at construction; replace that seam.
+    window.client_panel._password_provider = snapshot
+
+    window.client_panel.create_button.click()
+    qtbot.waitUntil(lambda: bool(fake.create_calls), timeout=4000)
+    qtbot.waitUntil(lambda: not window.client_panel.busy, timeout=4000)
+
+    # Called for the create snapshot and again by the post-create refresh, but
+    # always on the GUI thread and never inside a worker.
+    assert seen
+    assert set(seen) == {threading.get_ident()}
+
+
+def test_password_provider_refuses_an_off_thread_read(qtbot, ui_workspace):
+    window, _recorder, _fake, _connect, _folders = _make_window(
+        qtbot, ui_workspace)
+    outcome: dict[str, str] = {}
+
+    def read() -> None:
+        try:
+            window.password_overrides()
+        except HaUiError as exc:
+            outcome["code"] = exc.code
+
+    worker = threading.Thread(target=read)
+    worker.start()
+    worker.join(5.0)
+    assert outcome.get("code") == errors.E_USAGE
+
+
+def test_uncertain_create_says_maybe_written_and_refreshes(
+        qtbot, ui_workspace, monkeypatch):
+    window, recorder, fake, connect, _folders = _make_window(
+        qtbot, ui_workspace)
+    fake.preview_result = _fresh_preview()
+    fake.create_error = HaUiError(errors.E_CREATE_UNCERTAIN, detail="timeout")
+    monkeypatch.setattr(window.client_panel, "_ask_create_name",
+                        lambda: "alpha")
+
+    window.client_panel.create_button.click()
+    qtbot.waitUntil(lambda: bool(recorder.errors), timeout=4000)
+    qtbot.waitUntil(lambda: not window.client_panel.busy, timeout=4000)
+    qtbot.waitUntil(lambda: len(connect.calls) == 4, timeout=4000)
+
+    label = window.client_panel.creation_result_label
+    assert label.isVisible() is True
+    assert "可能已写入" in label.text()
+    assert "不要重复创建同名客户端" in label.text()
+    # The old blanket "nothing was modified" claim must be gone for this case.
+    assert "未修改任何客户端" not in label.text()
+    # A second session pair was opened just to re-read the real state.
+    assert [call["server_id"] for call in connect.calls] == ["A", "B", "A", "B"]
+
+
+def test_unconfirmed_create_blocks_retry_and_shows_stale_on_refresh_failure(
+        qtbot, ui_workspace, monkeypatch):
+    window, recorder, fake, _connect, _folders = _make_window(
+        qtbot, ui_workspace)
+    fake.create_error = HaUiError(errors.E_CREATE_UNCERTAIN, detail="timeout")
+    fake.preview_error = HaUiError(errors.E_SSH_TIMEOUT)
+    monkeypatch.setattr(window.client_panel, "_ask_create_name",
+                        lambda: "alpha")
+
+    window.client_panel.create_button.click()
+    qtbot.waitUntil(lambda: bool(recorder.errors), timeout=4000)
+    qtbot.waitUntil(lambda: not window.client_panel.busy, timeout=4000)
+    qtbot.waitUntil(
+        lambda: "STALE" in window.client_panel.creation_result_label.text(),
+        timeout=4000)
+
+    assert "STALE" in window.client_panel.creation_result_label.text()
+    assert "不能据此判断服务器未被修改" in (
+        window.client_panel.creation_result_label.text())
+
+    # A blind retry of the same name is refused while the state is unconfirmed.
+    window.client_panel.create_button.click()
+    qtbot.waitUntil(lambda: bool(recorder.warnings), timeout=4000)
+    assert len(fake.create_calls) == 1
+    assert "未确认" in recorder.warnings[-1][0]
+
+
+def test_prewrite_refusal_still_says_nothing_was_modified(
+        qtbot, ui_workspace, monkeypatch):
+    window, recorder, fake, connect, _folders = _make_window(
+        qtbot, ui_workspace)
+    fake.create_error = HaUiError(errors.E_CLIENT_INCOMPLETE, detail="A")
+    monkeypatch.setattr(window.client_panel, "_ask_create_name",
+                        lambda: "alpha")
+
+    window.client_panel.create_button.click()
+    qtbot.waitUntil(lambda: bool(recorder.errors), timeout=4000)
+    qtbot.waitUntil(lambda: not window.client_panel.busy, timeout=4000)
+
+    label = window.client_panel.creation_result_label
+    assert "未修改任何客户端" in label.text()
+    assert "可能已写入" not in label.text()
+    # Only the create attempt touched SSH: a pre-write refusal needs no refresh.
+    assert [call["server_id"] for call in connect.calls] == ["A", "B"]
+
+
 def test_create_is_double_click_safe(qtbot, ui_workspace, monkeypatch):
     window, recorder, fake, _connect, _folders = _make_window(qtbot, ui_workspace)
     entered = threading.Event()

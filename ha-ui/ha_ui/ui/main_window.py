@@ -15,6 +15,7 @@ fixed code and safe message. Raw exception text is never rendered.
 
 from __future__ import annotations
 
+import threading
 from typing import Callable
 
 from PySide6.QtCore import QTimer
@@ -31,7 +32,7 @@ from PySide6.QtWidgets import (
 )
 
 from .. import APP_NAME, APP_VERSION, SERVER_IDS
-from ..core import config_store
+from ..core import config_store, errors
 from ..core.errors import HaUiError
 from ..core.models import HostKeyInfo
 from .clients_panel import ClientsPanel
@@ -69,6 +70,10 @@ class MainWindow(QMainWindow):
         open_folder_fn: Callable[[str], None] | None = None,
     ) -> None:
         super().__init__(parent)
+        # The thread that constructed the widgets owns every widget read. The
+        # password snapshot below is the only shared mutable UI input, so it is
+        # guarded rather than trusted.
+        self._gui_thread = threading.get_ident()
         self._actions = actions
         self._runner = WorkerRunner(self)
         self._startup_error: HaUiError | None = None
@@ -159,7 +164,14 @@ class MainWindow(QMainWindow):
 
     # -------------------------------------------------------------- password ---
     def password_overrides(self) -> dict[str, str]:
-        """Snapshot the two session password fields (GUI thread only)."""
+        """Snapshot the two session password fields (GUI thread only).
+
+        Reading a QWidget from a worker thread is undefined behaviour, so this
+        method refuses loudly instead of returning a half-read value. Callers
+        snapshot on the GUI thread and hand the immutable dict to the worker.
+        """
+        if threading.get_ident() != self._gui_thread:
+            raise HaUiError(errors.E_USAGE, detail="gui-thread")
         return {server_id: panel.password_edit.text()
                 for server_id, panel in self.panels.items()}
 

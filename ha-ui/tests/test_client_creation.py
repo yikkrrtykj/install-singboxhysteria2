@@ -35,6 +35,41 @@ def provider_for(role: str = "A", **kwargs):
 
 
 # --------------------------------------------------------------------------- #
+# Read-only reconciliation primitives (config identity + inventory)
+# --------------------------------------------------------------------------- #
+def test_snapshot_reports_the_live_config_identity_and_inventory():
+    provider, session = provider_for()
+    snapshot = provider.snapshot()
+    assert snapshot.config_sha256 == fakes.DEFAULT_CONFIG_SHA
+    assert snapshot.records == {}
+    # One read-only command carries both facts.
+    assert any("cfgsha" in command for command in session.commands)
+
+
+def test_preflight_populates_the_config_sha_instead_of_leaving_it_none():
+    provider, _session = provider_for()
+    facts = provider.preflight()
+    assert facts.config_sha256 == fakes.DEFAULT_CONFIG_SHA
+
+
+def test_config_sha_rejects_unproven_values():
+    assert remote._config_sha(None) is None
+    assert remote._config_sha("none") is None
+    assert remote._config_sha("A" * 64) is None      # uppercase
+    assert remote._config_sha("a" * 63) is None      # short
+    assert remote._config_sha("a" * 64) == "a" * 64
+
+
+def test_a_write_is_visible_as_a_new_config_sha():
+    provider, _session = provider_for()
+    before = provider.snapshot()
+    provider.create_client("event-vmix01", confirmed=True)
+    after = provider.snapshot()
+    assert after.config_sha256 != before.config_sha256
+    assert after.record("event-vmix01") is not None
+
+
+# --------------------------------------------------------------------------- #
 # Remote provider: canonical pinned add path + live proof
 # --------------------------------------------------------------------------- #
 def test_create_client_runs_the_pinned_add_menu_and_proves_live_state():
@@ -116,16 +151,77 @@ def test_incomplete_live_client_after_create_is_not_accepted(monkeypatch):
     assert excinfo.value.code == errors.E_REMOTE_VERIFY
 
 
-@pytest.mark.parametrize("kwargs", [
-    {"add_timeout": True},
-    {"add_raise_timeout": True},
-])
-def test_timeout_after_the_write_boundary_is_uncertain(kwargs):
-    provider, _session = provider_for(**kwargs)
+def test_timeout_without_write_evidence_stays_uncertain():
+    # No transcript evidence is NOT proof that nothing was written: the verdict
+    # must stay UNCERTAIN, never a clean failure.
+    provider, session = provider_for(add_timeout=True)
     with pytest.raises(HaUiError) as excinfo:
         provider.create_client("event-vmix01", confirmed=True)
     assert excinfo.value.code == errors.E_CREATE_UNCERTAIN
     assert excinfo.value.detail == "timeout"
+    # A read-only reconciliation was attempted after the timeout.
+    assert any("cfgsha" in command for command in session.commands)
+
+
+def test_transport_timeout_is_uncertain_and_distinguished():
+    provider, _session = provider_for(add_raise_timeout=True)
+    with pytest.raises(HaUiError) as excinfo:
+        provider.create_client("event-vmix01", confirmed=True)
+    assert excinfo.value.code == errors.E_CREATE_UNCERTAIN
+    assert excinfo.value.detail == "timeout-transport"
+
+
+def test_timeout_with_an_observed_write_is_flagged_as_such():
+    provider, _session = provider_for(add_timeout=True, add_timeout_write=True)
+    with pytest.raises(HaUiError) as excinfo:
+        provider.create_client("event-vmix01", confirmed=True)
+    assert excinfo.value.code == errors.E_CREATE_UNCERTAIN
+    assert excinfo.value.detail == "timeout-write"
+
+
+def test_proven_rollback_sentence_with_matching_live_state_is_a_clean_failure():
+    # Exact proven-restore sentence (lib/client-management.sh:338) AND the live
+    # re-read agrees (bytes unchanged, name absent). Only this combination may
+    # be reported as a clean, non-writing failure.
+    provider, _session = provider_for(add_fail="rollback")
+    with pytest.raises(HaUiError) as excinfo:
+        provider.create_client("event-vmix01", confirmed=True)
+    assert excinfo.value.code == errors.E_REMOTE_CREATE
+    assert excinfo.value.detail == "rolled-back"
+
+
+def test_rollback_restore_failure_is_uncertain_not_clean():
+    provider, _session = provider_for(add_fail="rollback-failed")
+    with pytest.raises(HaUiError) as excinfo:
+        provider.create_client("event-vmix01", confirmed=True)
+    assert excinfo.value.code == errors.E_CREATE_UNCERTAIN
+    assert excinfo.value.detail == "rollback-failed"
+
+
+def test_rollback_without_service_recovery_is_uncertain_even_when_bytes_restored():
+    provider, _session = provider_for(add_fail="rollback-unconfirmed")
+    with pytest.raises(HaUiError) as excinfo:
+        provider.create_client("event-vmix01", confirmed=True)
+    assert excinfo.value.code == errors.E_CREATE_UNCERTAIN
+    assert excinfo.value.detail == "rollback-unconfirmed"
+
+
+def test_proven_rollback_sentence_without_matching_live_bytes_is_uncertain():
+    # The server printed the proven-restore sentence but the config bytes did
+    # not go back: reconciliation wins, the verdict stays UNCERTAIN.
+    provider, _session = provider_for(add_fail="rolled-back-stale")
+    with pytest.raises(HaUiError) as excinfo:
+        provider.create_client("event-vmix01", confirmed=True)
+    assert excinfo.value.code == errors.E_CREATE_UNCERTAIN
+    assert excinfo.value.detail == "rollback-unconfirmed"
+
+
+def test_pre_write_refusal_with_an_observed_write_is_uncertain():
+    provider, _session = provider_for(add_fail="lock-after-write")
+    with pytest.raises(HaUiError) as excinfo:
+        provider.create_client("event-vmix01", confirmed=True)
+    assert excinfo.value.code == errors.E_CREATE_UNCERTAIN
+    assert excinfo.value.detail == "refusal-after-write"
 
 
 def test_lock_failure_is_a_clean_write_refusal():
@@ -136,12 +232,48 @@ def test_lock_failure_is_a_clean_write_refusal():
     assert excinfo.value.detail == "lock"
 
 
-def test_reload_failure_and_rollback_is_a_clean_write_refusal():
-    provider, _session = provider_for(add_fail="rollback")
+def test_untrustworthy_result_frame_is_uncertain_never_clean():
+    # A non-zero pipeline exit means the transcript may be truncated: a
+    # committed write could be invisible, so this must not be "failed".
+    provider, _session = provider_for(add_menu_rc=(0, 1, 0))
     with pytest.raises(HaUiError) as excinfo:
         provider.create_client("event-vmix01", confirmed=True)
-    assert excinfo.value.code == errors.E_REMOTE_CREATE
-    assert excinfo.value.detail == "rollback"
+    assert excinfo.value.code == errors.E_CREATE_UNCERTAIN
+    assert excinfo.value.detail == "menu-unproven"
+
+
+def test_missing_end_marker_is_uncertain_never_clean():
+    provider, _session = provider_for(add_end_marker=False)
+    with pytest.raises(HaUiError) as excinfo:
+        provider.create_client("event-vmix01", confirmed=True)
+    assert excinfo.value.code == errors.E_CREATE_UNCERTAIN
+    assert excinfo.value.detail == "menu-unproven"
+
+
+def test_commit_line_without_a_running_process_still_proves_the_write():
+    # The installer prints "配置已提交（当前无运行中的 sing-box 进程…）" when
+    # there is nothing to reload; that is still a committed write.
+    provider, _session = provider_for(add_no_process=True)
+    provider.create_client("event-vmix01", confirmed=True)
+    assert provider.list_clients()["event-vmix01"].exportable is True
+
+
+def test_success_line_without_the_commit_line_is_not_a_commit():
+    provider, _session = provider_for(add_commit_marker=False)
+    with pytest.raises(HaUiError) as excinfo:
+        provider.create_client("event-vmix01", confirmed=True)
+    assert excinfo.value.code == errors.E_CREATE_UNCERTAIN
+    assert excinfo.value.detail == "commit-unproven"
+
+
+def test_created_client_with_a_structural_problem_is_not_a_success():
+    # Both credentials exist, but a duplicate name invalidates the inventory:
+    # the record is not exportable, so creation may not report success.
+    provider, _session = provider_for(add_duplicate=True)
+    with pytest.raises(HaUiError) as excinfo:
+        provider.create_client("event-vmix01", confirmed=True)
+    assert excinfo.value.code == errors.E_REMOTE_VERIFY
+    assert excinfo.value.detail == "incomplete"
 
 
 def test_a_racing_existing_client_is_not_overwritten():
@@ -165,20 +297,20 @@ def test_tampered_installer_is_untrusted_and_never_executed():
 def test_live_read_failure_after_write_is_uncertain_not_success(monkeypatch):
     provider, _session = provider_for()
 
-    original = provider.list_clients
+    original = provider.snapshot
     calls = {"count": 0}
 
     def flaky():
         calls["count"] += 1
         if calls["count"] >= 2:
-            raise HaUiError(errors.E_REMOTE_PREFLIGHT, detail="management-active")
+            raise HaUiError(errors.E_REMOTE_LIST, detail="jq")
         return original()
 
-    monkeypatch.setattr(provider, "list_clients", flaky)
+    monkeypatch.setattr(provider, "snapshot", flaky)
     with pytest.raises(HaUiError) as excinfo:
         provider.create_client("event-vmix01", confirmed=True)
-    assert excinfo.value.code == errors.E_REMOTE_VERIFY
-    assert excinfo.value.detail == "live-read"
+    assert excinfo.value.code == errors.E_CREATE_UNCERTAIN
+    assert excinfo.value.detail == "verify-unreadable"
 
 
 def test_add_command_requires_the_add_menu_markers_before_execution():
@@ -225,21 +357,38 @@ def test_service_creates_both_sides_and_reports_complete(workspace_tmp):
 
 def test_service_a_failure_does_not_attempt_b(workspace_tmp):
     providers = ready_providers()
-    providers["A"].errors_by_method = {"create_client": errors.E_REMOTE_CREATE}
+    # A proven pre-write refusal is a clean "failed" side.
+    providers["A"].errors_by_method = {
+        "create_client": (errors.E_REMOTE_CREATE, "lock")}
     service, _ = make_service(workspace_tmp, providers)
     result = service.create_client(sessions={"A": object(), "B": object()},
                                    name="event-vmix01", confirmed=True)
     assert result.complete is False
     assert result.partial is False
     assert result.side("A").status == "failed"
+    assert result.side("A").code == errors.E_REMOTE_CREATE
     assert result.side("B").status == "skipped"
     assert providers["B"].create_requests == []
+
+
+def test_service_unknown_create_detail_is_uncertain_not_failed(workspace_tmp):
+    # An E_REMOTE_CREATE with no recognised pre-write token must never be
+    # reported as "nothing was written".
+    providers = ready_providers()
+    providers["A"].errors_by_method = {
+        "create_client": (errors.E_REMOTE_CREATE, "something-new")}
+    service, _ = make_service(workspace_tmp, providers)
+    result = service.create_client(sessions={"A": object(), "B": object()},
+                                   name="event-vmix01", confirmed=True)
+    assert result.side("A").status == "uncertain"
+    assert result.side("B").status == "skipped"
 
 
 def test_service_a_success_b_failure_is_partial_and_never_rolls_back_a(
         workspace_tmp):
     providers = ready_providers()
-    providers["B"].errors_by_method = {"create_client": errors.E_REMOTE_CREATE}
+    providers["B"].errors_by_method = {
+        "create_client": (errors.E_REMOTE_CREATE, "lock")}
     service, _ = make_service(workspace_tmp, providers)
     result = service.create_client(sessions={"A": object(), "B": object()},
                                    name="event-vmix01", confirmed=True)
@@ -250,6 +399,44 @@ def test_service_a_success_b_failure_is_partial_and_never_rolls_back_a(
     # A remains present: no compensating delete call exists in the interface.
     assert "event-vmix01" in providers["A"].records
     assert providers["B"].create_requests == [("event-vmix01", True)]
+
+
+def test_service_a_non_exportable_create_stops_before_b(workspace_tmp):
+    # The provider already proves its own live record before returning success;
+    # a non-exportable result therefore arrives as E_REMOTE_VERIFY/incomplete
+    # and must stop the second write.
+    providers = ready_providers()
+    providers["A"].errors_by_method = {
+        "create_client": (errors.E_REMOTE_VERIFY, "incomplete")}
+    service, _ = make_service(workspace_tmp, providers)
+    result = service.create_client(sessions={"A": object(), "B": object()},
+                                   name="event-vmix01", confirmed=True)
+    assert result.side("A").status == "uncertain"
+    assert result.side("A").detail == "incomplete"
+    assert result.side("B").status == "skipped"
+    assert providers["B"].create_requests == []
+
+
+def test_service_verify_stage_rejects_a_non_exportable_record(workspace_tmp):
+    # Both writes report success, but the post-write re-read finds a structural
+    # anomaly on A: A was written, yet it must not be reported as generatable.
+    providers = ready_providers()
+    original_create = providers["A"].create_client
+
+    def create_with_problem(name: str, *, confirmed: bool) -> None:
+        original_create(name, confirmed=confirmed)
+        providers["A"].records[name] = fakes.client_record(
+            name, problems=("duplicate-name",))
+
+    providers["A"].create_client = create_with_problem  # type: ignore[method-assign]
+    service, _ = make_service(workspace_tmp, providers)
+    result = service.create_client(sessions={"A": object(), "B": object()},
+                                   name="event-vmix01", confirmed=True)
+    assert result.side("A").status == "uncertain"
+    assert result.side("A").detail == "incomplete"
+    assert result.side("B").status == "created"
+    assert result.ok is False
+    assert result.complete is False
 
 
 def test_service_a_success_b_uncertain_is_partial(workspace_tmp):

@@ -59,15 +59,22 @@ _UNCERTAIN_CREATE_CODES = frozenset({
     errors.E_SSH_CLOSED,
 })
 
+# ``E_REMOTE_CREATE`` detail tokens that prove the write was refused before the
+# config file was replaced (or that the server itself proved the restore). Any
+# other token — including a missing one — is uncertain: a clean "nothing was
+# written" claim must never be the default.
+_CLEAN_WRITE_REFUSALS = frozenset({
+    "consistency", "incomplete", "missing-config", "name-invalid",
+    "permission", "reserved", "exists", "lock", "create",
+    "rolled-back",
+})
+
 
 def _creation_is_uncertain(exc: HaUiError) -> bool:
     if exc.code in _UNCERTAIN_CREATE_CODES:
         return True
-    # The menu transcript had no canonical success line. A proven rollback or a
-    # pre-write lock/consistency refusal is a clean failure; an unconfirmed
-    # transcript could hide a committed-but-unreadable write.
-    if exc.code == errors.E_REMOTE_CREATE and exc.detail == "unconfirmed":
-        return True
+    if exc.code == errors.E_REMOTE_CREATE:
+        return exc.detail not in _CLEAN_WRITE_REFUSALS
     return False
 
 
@@ -203,7 +210,9 @@ class GenerationService:
             raise HaUiError(errors.E_CLIENT_EXISTS, detail="AB")
         if existing:
             existing_role = existing[0]
-            if not records[existing_role][validated].complete:
+            if not records[existing_role][validated].exportable:
+                # complete() only proves both credentials exist; a structurally
+                # anomalous record must not be treated as a valid repair base.
                 raise HaUiError(errors.E_CLIENT_INCOMPLETE,
                                 detail=existing_role)
             if not allow_partial_repair:
@@ -244,7 +253,9 @@ class GenerationService:
                     role=role, status="created")
 
         # A success claim is only returned after a fresh live read proves the
-        # name and both protocols on every side that should now hold it.
+        # name is EXPORTABLE (both protocols and no structural anomaly) on every
+        # side that should now hold it. Merely "both credentials exist" is not
+        # enough: a duplicate/name-set-mismatch inventory cannot be generated.
         report("stage:create-verify")
         for role in ("A", "B"):
             side = result.sides.get(role)
@@ -258,11 +269,23 @@ class GenerationService:
                     detail="verify")
                 continue
             record = live.get(validated)
-            if record is None or not record.complete:
+            if record is None:
                 if side.status == "created":
                     result.sides[role] = CreationSideResult(
                         role=role, status="failed",
                         code=errors.E_REMOTE_VERIFY, detail="missing")
+                else:
+                    result.sides[role] = CreationSideResult(
+                        role=role, status="uncertain",
+                        code=errors.E_REMOTE_VERIFY,
+                        detail="existing-changed")
+            elif not record.exportable:
+                # The write is visible, but the client is not safely usable.
+                # Never report it as created+generatable; the operator must look.
+                if side.status == "created":
+                    result.sides[role] = CreationSideResult(
+                        role=role, status="uncertain",
+                        code=errors.E_REMOTE_VERIFY, detail="incomplete")
                 else:
                     result.sides[role] = CreationSideResult(
                         role=role, status="uncertain",

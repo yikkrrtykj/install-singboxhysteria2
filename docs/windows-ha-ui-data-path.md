@@ -177,24 +177,82 @@ installer；会出现 `repair_existing_install_security_baseline` 的幂等权�
 privileged `client.export`（锁内渲染 + 审计），而不是 shell 菜单。两条路线都必须
 单独 review/审批，本轮不修改服务器端代码。
 
-## 7. 创建路径的证明与失败语义（0.2.0）
+## 7. 创建路径的证明、分类与超时后核对（0.2.0，PR #124 复审修复）
 
 创建使用同一个 pinned installer，但输入序列固定为 `10 → 2 → <name> → 0`，并在执行前
 额外校验 `2) add_client_interactive` / `add_client()` / `_add_client_locked()` /
 成功文案这些静态标记。执行后按以下顺序证明：
 
 1. 捕获 `PIPESTATUS`，menu 124 = 超时，任一非零 = 失败；
-2. 转录必须出现 `客户端 '<name>' 已同时添加到 Reality 与 HY2`（只在
-   `commit_server_config` 成功后打印）；菜单循环本身即使 `add_client` 失败也返回 0，
-   因此退出码 0 不能单独作为成功依据；
-3. 重新执行只读 inventory（`list_clients`），确认名称存在且 Reality/HY2 凭据都非空；
-4. 只有 2 + 3 都通过才报告该端 `created`。超时/断连/无法复核标记为 `uncertain`，
-   不自动重发；`reload` 失败且回滚成功、锁失败、一致性拒绝等标记为 `failed`。
+2. 转录必须出现提交行 `配置已提交`（reload 成功时是 `配置已提交并重载成功`，无进程时
+   是 `配置已提交（当前无运行中的 sing-box 进程，跳过 reload）`）**和**
+   `客户端 '<name>' 已同时添加到 Reality 与 HY2`；只有成功行、没有提交行不算提交；
+   菜单循环本身即使 `add_client` 失败也返回 0，因此退出码 0 不能单独作为成功依据；
+3. 重新执行一次只读 `snapshot`（同一条命令同时返回 `sbconfig_server.json` 的 SHA-256 与
+   客户端清单），确认名称存在且该记录 `exportable`（= `complete` 且 `problems` 为空）；
+4. 只有 2 + 3 都通过才报告该端 `created`。
 
-创建前先读取两端：名称在两端都不存在 → 顺序创建 A/B；仅一端存在且完整 → 默认
-`E_CLIENT_PARTIAL_EXISTS`，只有 UI 第二次确认“仅补齐缺失端”才创建缺失端；两端都存在
-→ `E_CLIENT_EXISTS`；已存在端协议不完整 → `E_CLIENT_INCOMPLETE`。任一端预检/证书
-身份失败时，不写入任何一端。
+创建前同样先 `snapshot` 一次：名称已在两端 → `E_CLIENT_EXISTS`；仅一端存在且
+`exportable` → 默认 `E_CLIENT_PARTIAL_EXISTS`，只有 UI 第二次确认“仅补齐缺失端”才创建
+缺失端；已存在端不 `exportable` → `E_CLIENT_INCOMPLETE`。任一端预检/证书身份失败时，
+不写入任何一端。两端不是原子事务：A 成功、B 失败时 A 保留，B 状态准确显示，不自动删除 A。
 
-两端不是原子事务：A 成功、B 失败时 A 保留，B 状态准确显示，不自动删除 A。创建结果
-只包含 role/status/固定错误码，不包含 UUID、密码或原始远端输出。
+### 7.1 失败分类（禁止猜测）
+
+`E_REMOTE_CREATE` 的 `detail` 是固定的服务端结果 token，而不是“看起来像失败”。判定
+同时使用转录与只读核对，只有满足括号内条件才允许降级为干净失败：
+
+| 服务端结果 | 判定 | 依据 |
+|---|---|---|
+| `lock` / `consistency` / `incomplete` / `missing-config` / `name-invalid` / `permission` / `reserved` / `create` | `failed`（干净拒绝） | 转录 token **且** 核对显示 config SHA-256 未变、名称仍不存在 |
+| 同上，但核对发现 SHA 变化或名称已存在 | `uncertain`（`refusal-after-write`） | 与拒绝矛盾，说明存在并发/竞争写入 |
+| `exists` | `E_CLIENT_EXISTS` / `failed` | 同上核对通过才降级；否则 `refusal-after-write` |
+| `已回滚并重新加载上一份配置`（`lib/client-management.sh:338`） | `failed`（`rolled-back`） | 精确句 **且** SHA 回到写入前值 **且** 名称不存在 |
+| `回滚恢复失败，请立即人工介入`（`:330`） | `uncertain`（`rollback-failed`） | 恢复本身失败 |
+| `已回滚配置文件，但服务未能确认恢复`（`:344`） | `uncertain`（`rollback-unconfirmed`） | 字节可能已恢复，但服务状态未确认 |
+| 菜单 124（外层 `timeout` 命中） | `uncertain`（`timeout` / `timeout-write`） | 只把“是否观察到写入”作为证据附加，不作为事务状态 |
+| SSH 超时/断连 | `uncertain`（`timeout-transport`） | 无法通过该会话核对 |
+| 无成功行且无已知 token | `uncertain`（`unconfirmed`）/（`commit-unproven`） | fail-safe |
+
+关键点：`_MENU_FAIL_TOKENS` 不再使用泛化的 `回滚` 子串。服务端三种回滚结局都包含这个
+词，只有 `:338` 那一句能证明“写入已撤销”，`:330` / `:344` 必须保持 `uncertain` 并提示
+人工介入。
+
+### 7.2 超时后核对（post-timeout reconciliation）
+
+- `RemoteProvider.snapshot()` 用**一条**只读命令返回 `cfgsha=` + `mtime=` + inventory
+  JSON，保证两个事实来自同一时刻；`preflight` 也填充 `RemoteFacts.config_sha256` / 
+  `RemotePreflight.config_sha256`（不再是永远为 `None` 的占位字段）。
+- 哈希只接受严格的小写 64 位十六进制；取不到 = 没有证据，**绝不**当成“未变化”。
+- 核对只在失败/超时后执行一次；核对本身失败（连接已断、jq 失败） → `uncertain`。
+- **核对只提供可观测性，不提供原子性。** 客户端无法阻止外层 `timeout -k 10 420`
+  在 `replace` 与 `reload`/`health`/回滚之间打断服务端事务；也无法阻止 SSH 通道
+  断开导致管道 SIGPIPE。`MENU_RUN_TIMEOUT` 没有被调大（复审明确禁止用调大超时当修复）。
+- 真正的原子性要求服务端把 commit 放进**独立进程组**并写**持久 phase/结果文件**，且
+  UI 路径需要 `CM_TX_JOURNAL_HOOK`（当前 GUI 菜单路径没有 hook，因此不存在可用 journal；
+  不得据此编造事务状态）。这需要修改 pinned `install.sh` / `lib/client-management.sh`
+  并重算安装器哈希链（`INSTALLER_SHA256` / `CLIENT_MANAGEMENT_SHA256` / 安装器内嵌 pin），
+  属于安全评审动作，超出本 PR 允许范围 → **P0 保持 BLOCKED**，见第 8 节。
+- `UNCERTAIN` 不自动重试写入；UI 会刷新两端实际状态，刷新失败显示 `STALE / UNKNOWN`，
+  并禁止在核对完成前重建同名客户端。
+
+## 8. P0 事务安全：现状与残余风险（BLOCKED，需服务端改动）
+
+已确认的机制（不是猜测）：
+
+1. 服务端执行串是 `printf … | timeout -k 10 420 env -i … bash install.sh 2>&1 | sed …`，
+   `timeout` 包住整条菜单，包括 `replace → reload → health → rollback`；
+2. 客户端 `exec(timeout=540)` 是另一层，且只关闭通道，不保证终止远端进程；
+3. 写入阶段没有对外的原子标记：没有 journal hook，也没有可轮询的 phase 文件；
+4. 客户端断开时远端管道的 `sed` 消失，后续 `printf` 会收到 SIGPIPE，同样可能停在
+   `replace` 与 `reload` 之间。
+
+因此本 PR 能交付的是**检出与不误报**（分类 + 核对 + `STALE`），不是事务原子性。
+解除 BLOCKED 的最小服务端改动（需单独评审）：
+
+- 菜单提交阶段在独立 session/进程组中执行，外层 `timeout` 只覆盖非写入阶段；
+- 提交前写入持久 phase 文件（`parse/candidate/check/backup/replace/reload/health/rollback*`），
+  并在同一目录原子发布 `result`；
+- UI 侧在超时/断连后通过只读命令读取 phase/result 对账，而不是推断。
+
+在这三项落地之前，`PR124-P0-TRANSACTION-SAFETY` 只能记为 `BLOCKED`。
