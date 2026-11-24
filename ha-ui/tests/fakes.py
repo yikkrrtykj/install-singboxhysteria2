@@ -442,6 +442,7 @@ class FakeSession:
                  add_end_marker: bool = True,
                  add_timeout: bool = False,
                  add_timeout_write: bool = False,
+                 add_timeout_stage: str | None = None,
                  add_duplicate: bool = False,
                  add_raise_timeout: bool = False) -> None:
         self.role = role
@@ -473,6 +474,7 @@ class FakeSession:
         self.add_end_marker = add_end_marker
         self.add_timeout = add_timeout
         self.add_timeout_write = add_timeout_write
+        self.add_timeout_stage = add_timeout_stage
         self.add_duplicate = add_duplicate
         self.add_raise_timeout = add_raise_timeout
         self.commands: list[str] = []
@@ -718,6 +720,24 @@ class FakeSession:
             return 0, ("***** 客户端管理 *****\n"
                        "正在添加客户端…\n"
                        "HAUI_MENU_RC=0,124,0\nHAUI_MENU_END\n"), ""
+        if self.add_timeout_stage is not None:
+            # A timeout at a named commit stage: the transcript stops there and
+            # the remote process state is unknown (it may still be running).
+            stage = self.add_timeout_stage
+            if stage in ("reload", "health", "rollback"):
+                self._scripted_replace(name)
+            lines = ["***** 客户端管理 *****", "2. 添加客户端"]
+            if stage == "replace":
+                lines.append("正在写入 add candidate…")
+            elif stage == "reload":
+                lines.append("正在重载 sing-box…")
+            elif stage == "health":
+                lines.append("reload 后健康检查失败（add client %s），自动回滚..." % name)
+            elif stage == "rollback":
+                lines.append("正在从备份恢复上一份配置…")
+            else:
+                raise AssertionError("unknown add timeout stage: %r" % stage)
+            return self._add_frame(lines)
         existing = any(spec.name == name for spec in self.clients)
         if existing or self.add_fail is not None:
             if existing:
