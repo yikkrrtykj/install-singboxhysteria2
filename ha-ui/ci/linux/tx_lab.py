@@ -528,15 +528,24 @@ def scenario_publish_failure_keeps_claim(work: Path) -> None:
     bin_dir = work / "failing-sync"
     bin_dir.mkdir()
     write(bin_dir / "sync", "#!/bin/bash\nexit 1\n", 0o755)
-    tx = make_tx(work, "eeee", "epsilon")
+    root = work / "proot"
+    root.mkdir(mode=0o700)
+    txid = "epsilon-" + "e" * 32
+    tx = root / txid
+    tx.mkdir(mode=0o700)
+    env_text = remote._tx_env_text(txid).replace(
+        remote.TX_ROOT + "/" + txid, str(tx))
+    write(tx / "env.sh", env_text)
+    write(tx / "in", "")
+    claim = root / "epsilon.claim"
+    claim.mkdir(mode=0o700)
+    write(claim / "txid", txid + "\n")
     installer_dir = work / "inst5"
     write(installer_dir / "install.sh",
           INSTALLER.replace("@@LIB@@", str(LIB))
           .replace("@@SLEEP@@", "0").replace("@@NAME@@", "epsilon"), 0o755)
     worker = write(work / "worker5.sh",
                    remote._tx_worker_script(precommit=10), 0o600)
-    claim = work / "claim5"
-    claim.mkdir(mode=0o700)
     env = dict(os.environ)
     env["PATH"] = str(bin_dir) + ":" + env.get("PATH", "/usr/bin:/bin")
     subprocess.run(["bash", str(worker), str(tx), str(installer_dir),
@@ -546,7 +555,7 @@ def scenario_publish_failure_keeps_claim(work: Path) -> None:
     if not (tx / "publish-failed").exists():
         fail("publish failure marker missing")
     guard = remote._tx_guard_script("epsilon", "epsilon-" + "f" * 32,
-                                    root=str(tx.parent))
+                                    root=str(root))
     probe = subprocess.run(["bash", "-c", guard], capture_output=True,
                            text=True)
     if probe.returncode == 0 or "tx-in-flight" not in probe.stdout:
