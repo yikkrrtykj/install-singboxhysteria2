@@ -223,7 +223,10 @@ def scenario_rollback_unconfirmed(work: Path) -> None:
     if '"alpha"' in live.read_text():
         fail("unconfirmed rollback did not restore the bytes")
     if "服务未能确认恢复" not in out:
-        fail("unconfirmed-rollback sentence missing")
+        j = (work / "phases").read_text() if (work / "phases").exists() else "-"
+        g = (work / "stub.log").read_text() if (work / "stub.log").exists() else "-"
+        fail("unconfirmed-rollback sentence missing: out=%r journal=%r log=%r"
+             % (out[-800:], j, g))
     ok("rollback with an unconfirmed service is reported as such")
 
 
