@@ -637,17 +637,33 @@ def test_preflight_command_is_fixed_text_and_parser_reports_facts():
         "test -f /root/sbox/sbconfig_server.json && echo config=present "
         "|| echo config=missing; "
         "command -v miaomiao >/dev/null 2>&1 && echo manager=present "
-        "|| echo manager=missing"
+        "|| echo manager=missing; "
+        "if [ -f /root/sbox/sbconfig_server.json ]; then "
+        "echo cfgsha=$(sha256sum /root/sbox/sbconfig_server.json "
+        "| awk '{print $1}'); "
+        "else echo cfgsha=none; fi"
     )
     assert PREFLIGHT_COMMAND == expected
-    assert "{" not in PREFLIGHT_COMMAND
+    # Fixed text: the only brace pair is awk's own program, and nothing here is
+    # an interpolation slot for operator data.
+    assert PREFLIGHT_COMMAND.replace("{print $1}", "").count("{") == 0
     assert "%s" not in PREFLIGHT_COMMAND
+    assert "{0}" not in PREFLIGHT_COMMAND
 
     facts = parse_preflight_output(PREFLIGHT_OK_NO_MANAGER)
     assert facts.root is True
     assert facts.os_release == "Linux"
     assert facts.config_present is True
     assert facts.miaomiao_present is False
+    # The config identity is real data now, not a permanently-None placeholder.
+    assert facts.root_config_sha256 is None
+
+    hashed = parse_preflight_output(
+        PREFLIGHT_OK_NO_MANAGER + "cfgsha=" + "a" * 64 + "\n")
+    assert hashed.root_config_sha256 == "a" * 64
+    unproven = parse_preflight_output(
+        PREFLIGHT_OK_NO_MANAGER + "cfgsha=NOT-A-HASH\n")
+    assert unproven.root_config_sha256 is None
 
     non_root = parse_preflight_output("1000\nLinux\nconfig=missing\nmanager=present\n")
     assert non_root.root is False

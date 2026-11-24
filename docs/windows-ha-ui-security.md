@@ -71,14 +71,19 @@ GUI 明确确认
 - 不直接编辑 `sbconfig_server.json`，不调用 `sbox-cm` worker 绕过 Session/step-up/激活门禁；
 - 不把 GitHub `main` 的可变脚本作为执行目标；host 依赖缺失时 preflight 直接拒绝，
   不会触发 apt/yum；
-- 菜单退出码 0 不等于创建成功：必须同时看到 canonical add 成功行，并完成创建后的
-  live 清单复核；
+- 菜单退出码 0 不等于创建成功：必须同时看到 canonical add 成功行与提交行
+  （`配置已提交`），并在创建后完成 live 复核且该记录 `exportable`（双协议 + 无结构异常）；
+- **回滚分类必须精确**：`lib/client-management.sh` 有三种回滚结局都含“回滚”字样，只有
+  `已回滚并重新加载上一份配置` 能证明写入已撤销，且还要通过只读核对（config SHA-256
+  回到写入前、名称不存在）；`回滚恢复失败` / `服务未能确认恢复` 一律 `uncertain`；
 - **A/B 不是分布式事务**：先 A 后 B，每端独立回执。A 成功、B 失败时保留 A，不自动
   删除（删除可能触发凭据吊销），不把部分成功显示为完成；
 - 一端已存在时默认 STOP；只有 UI 第二次明确确认“仅补齐缺失端”才允许创建缺失端，
   绝不覆盖已有凭据；
 - 任一端创建结果不确定（超时/断连/无法复核）时，状态为“待确认”；操作员必须先刷新
-  实际状态，不能盲目重发。
+  实际状态，不能盲目重发。刷新失败显示 `STALE / UNKNOWN`，绝不推断服务器未被修改；
+- 后台 worker 不读取任何 QWidget：密码在 GUI 线程快照后以不可变 dict 传入，
+  `MainWindow.password_overrides()` 对非 GUI 线程调用直接失败（fail-closed）。
 
 ## 6. HA 链复用
 
@@ -104,6 +109,13 @@ GUI 明确确认
 7. **真实 VPS 验收未执行**：仓库内验证为合成凭据 + 本机 Windows 环境；接入真实 A/B
    前须按 `docs/windows-ha-ui-acceptance.md` 执行，尤其创建/补齐/部分成功路径必须在
    隔离测试 VPS 验证。CI/本机测试不能替代真实环境验收。
+8. **单端写入的事务原子性无法由客户端保证（P0 BLOCKED）**：外层 `timeout -k 10 420`
+   包住 `replace → reload → health → rollback`，SSH 断连还可能通过 SIGPIPE 终止远端
+   管道；GUI 菜单路径没有 `CM_TX_JOURNAL_HOOK`，因此没有可用于恢复判断的 journal。
+   本版本能做的是“检出且不误报”（超时后只读核对 config SHA-256 + live 清单，分类并
+   保留 `UNCERTAIN`/`STALE`），**不是**原子性。解除该项需要服务端改动（提交阶段独立
+   进程组 + 持久 phase/result 文件 + 安装器哈希链重新 pin），见
+   `docs/windows-ha-ui-data-path.md` 第 8 节。
 
 ## 8. 非目标
 

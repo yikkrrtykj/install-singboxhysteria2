@@ -15,6 +15,7 @@ sync with the future client-management slice.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Callable
 
@@ -28,7 +29,10 @@ from ..core.secrets_store import CredentialStore
 PREFLIGHT_COMMAND = (
     "id -u; uname -s; "
     "test -f /root/sbox/sbconfig_server.json && echo config=present || echo config=missing; "
-    "command -v miaomiao >/dev/null 2>&1 && echo manager=present || echo manager=missing"
+    "command -v miaomiao >/dev/null 2>&1 && echo manager=present || echo manager=missing; "
+    "if [ -f /root/sbox/sbconfig_server.json ]; then "
+    "echo cfgsha=$(sha256sum /root/sbox/sbconfig_server.json | awk '{print $1}'); "
+    "else echo cfgsha=none; fi"
 )
 
 ConnectFn = Callable[..., object]
@@ -54,6 +58,7 @@ def parse_preflight_output(stdout: str) -> RemoteFacts:
     platform = ""
     config_present: bool | None = None
     manager_present: bool | None = None
+    config_sha: str | None = None
     for line in non_empty:
         if line == "config=present":
             config_present = True
@@ -63,13 +68,18 @@ def parse_preflight_output(stdout: str) -> RemoteFacts:
             manager_present = True
         elif line == "manager=missing":
             manager_present = False
+        elif line.startswith("cfgsha="):
+            value = line[len("cfgsha="):]
+            if re.fullmatch(r"[0-9a-f]{64}", value):
+                config_sha = value
         elif platform == "" and not line.isdigit():
             platform = line[:128]
     if config_present is None or manager_present is None:
         raise HaUiError(errors.E_SSH_PROTOCOL, detail="output")
     return RemoteFacts(root=root, os_release=platform,
                        config_present=config_present,
-                       miaomiao_present=manager_present)
+                       miaomiao_present=manager_present,
+                       root_config_sha256=config_sha)
 
 
 class ServerActions:

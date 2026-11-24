@@ -211,3 +211,47 @@ EXE 仅作为本地/CI 构建产物，不替代真实环境验收。
 - **新建客户端**会修改服务器配置：服务端 canonical add 自带失败回滚与备份；若需移除
   已成功创建的测试客户端，应按既有 `miaomiao` 客户端管理流程人工删除（删除可能触发
   凭据吊销），不要用旧版 HA-UI 或手工编辑 JSON 代替。0.2.0 GUI 不提供客户端删除。
+
+## 7. 窗口控制台弹窗（CMD 闪现）回归门
+
+### 7.1 根因
+
+打包后的 `ha-ui.exe` 是 `--windowed`（GUI 子系统、无控制台）。私有工作区
+（`ha_ui/core/private_fs.py`）对每个目录/文件调用 `icacls.exe` 建立并校验 NTFS
+DACL；`icacls.exe` 是控制台子系统程序，GUI 父进程没有可继承的控制台时，Windows
+会为每次调用分配一个新的 CMD 控制台窗口。`ensure_private_dir` /
+`secure_write_replace` 每次生成会调用多次 `icacls`，因此正常使用时会连续闪出多个
+CMD 窗口。
+
+### 7.2 修复
+
+`private_fs._icacls` 现在通过 `console_isolation_kwargs()` 传入
+`creationflags=CREATE_NO_WINDOW (0x08000000)`；该 helper 在 POSIX 上返回空参数，
+后续任何控制台子进程可复用。`capture_output`、30s 超时、返回码处理与
+`E_ACL` 错误映射保持不变。`--self-test` 额外在自检工作区下创建并删除一个私有临时
+目录/文件（`ensure_private_dir` + `secure_write_replace` + `verify_private_file`），
+因此 EXE 冷启动自检会真正执行 `icacls`。
+
+注意：`CREATE_NO_WINDOW` 仍会创建**无窗口**的 `conhost.exe`（Windows 的正常行为），
+它不会显示任何窗口；回归判据是**可见的 `ConsoleWindowClass` 窗口**，无窗口
+conhost 只作为诊断信息输出。
+
+### 7.3 验收
+
+```powershell
+# 已构建 EXE（正式验收门；集成构建后运行）
+py -3.13 ha-ui\ci\check_no_console_popup.py --exe dist\ha-ui.exe
+
+# 构建前源码级预检（用 pythonw.exe 模拟无控制台的 GUI 进程）
+py -3.13 ha-ui\ci\check_no_console_popup.py --source
+```
+
+脚本使用 `EnumWindows` + `GetClassNameW` 与 Toolhelp32 快照（仅 ctypes/标准库，
+无需管理员权限），在 `.scratch/` 下的隔离 `HA_UI_HOME`/`TEMP` 中运行 `--self-test`；
+先以 `CREATE_NEW_CONSOLE` 的 `cmd /c ping` 正向对照证明检测器有效，再断言 EXE
+运行期间没有新的**可见** `ConsoleWindowClass` 窗口（无窗口的 headless conhost 只按
+诊断输出，不判失败）。成功输出
+`{"checked": true, "positive_control": true, "console_events": 0, "ok": true}`
+并退出 0；检测到窗口/自检失败退出 1；检测器不可用（正向对照未检测到）输出
+`"detector": "unavailable"` 并退出 2。对应 pytest 回归测试为
+`ha-ui/tests/test_windows_console_isolation.py`。

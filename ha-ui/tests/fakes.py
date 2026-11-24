@@ -62,6 +62,10 @@ SCRATCH_ROOT = WORKTREE / ".scratch" / "tests"
 
 # Synthetic but canonical metric: every status/derived read compares against it.
 DEFAULT_CONFIG_MTIME = 1_763_600_000
+# Identity of the scripted live config file. A successful add rewrites it; a
+# proven rollback restores the exact pre-write value, exactly like the real
+# ``restore_file_atomically`` path.
+DEFAULT_CONFIG_SHA = hashlib.sha256(b"scripted-config").hexdigest()
 
 # Synthetic two-VPS fixture (RFC 5737 documentation addresses).
 SERVER_A = "203.0.113.7"
@@ -388,6 +392,7 @@ class VpsFacts:
     api_present: bool = True
     management_active: bool = False
     config_mtime: int = DEFAULT_CONFIG_MTIME
+    config_sha: str = DEFAULT_CONFIG_SHA
     reality_inbounds: int = 1
     hy2_inbounds: int = 1
     preflight_rc: int = 0
@@ -431,7 +436,13 @@ class FakeSession:
                  add_side_effect: bool = True,
                  add_fail: str | None = None,
                  add_success_marker: bool = True,
+                 add_commit_marker: bool = True,
+                 add_no_process: bool = False,
+                 add_menu_rc: tuple[int, int, int] = (0, 0, 0),
+                 add_end_marker: bool = True,
                  add_timeout: bool = False,
+                 add_timeout_write: bool = False,
+                 add_duplicate: bool = False,
                  add_raise_timeout: bool = False) -> None:
         self.role = role
         self.facts = facts or VpsFacts()
@@ -456,7 +467,13 @@ class FakeSession:
         self.add_side_effect = add_side_effect
         self.add_fail = add_fail
         self.add_success_marker = add_success_marker
+        self.add_commit_marker = add_commit_marker
+        self.add_no_process = add_no_process
+        self.add_menu_rc = add_menu_rc
+        self.add_end_marker = add_end_marker
         self.add_timeout = add_timeout
+        self.add_timeout_write = add_timeout_write
+        self.add_duplicate = add_duplicate
         self.add_raise_timeout = add_raise_timeout
         self.commands: list[str] = []
         self.downloads: list[str] = []
@@ -537,6 +554,8 @@ class FakeSession:
             _presence("api", facts.api_present),
             _presence("curl", facts.curl_present),
             _presence("timeout", facts.timeout_present),
+            "cfgsha=%s" % (facts.config_sha if facts.config_present
+                           else "none"),
             "mtime=%d" % facts.config_mtime,
         ]
         for dep in remote.INSTALLER_HOST_DEPS:
@@ -559,6 +578,8 @@ class FakeSession:
         }
         lines = [
             "mtime=%d" % facts.config_mtime,
+            "cfgsha=%s" % (facts.config_sha if facts.config_present
+                           else "none"),
             json.dumps(document, separators=(",", ":"), ensure_ascii=True),
             "DERIVED",
         ]
@@ -686,11 +707,16 @@ class FakeSession:
                           command)
         assert match is not None
         name = match.group(1)
+        before_sha = self.facts.config_sha
         if self.add_raise_timeout:
             raise HaUiError(errors.E_SSH_TIMEOUT, detail="channel")
         if self.add_timeout:
+            if self.add_timeout_write:
+                # The write landed, then the menu was killed before printing
+                # anything: no transcript evidence at all.
+                self._scripted_replace(name)
             return 0, ("***** 客户端管理 *****\n"
-                       "正在等待配置锁…\n"
+                       "正在添加客户端…\n"
                        "HAUI_MENU_RC=0,124,0\nHAUI_MENU_END\n"), ""
         existing = any(spec.name == name for spec in self.clients)
         if existing or self.add_fail is not None:
@@ -700,35 +726,88 @@ class FakeSession:
                 warning = "客户端 '%s' 已存在（Reality 或 HY2），拒绝重复添加" % name
             elif self.add_fail == "lock":
                 warning = "配置锁 /root/sbox/config.lock 获取失败或超时（15s），操作已中止（fail-closed）"
+            elif self.add_fail == "lock-after-write":
+                # The refusal token is a pre-write code, but the live bytes and
+                # the client set changed: reconciliation must not call this a
+                # clean refusal.
+                self._scripted_replace(name)
+                warning = "配置锁 /root/sbox/config.lock 获取失败或超时（15s），操作已中止（fail-closed）"
             elif self.add_fail == "consistency":
                 warning = "当前 Reality/HY2 用户集合不一致，先修复后再添加客户端"
             elif self.add_fail == "rollback":
-                warning = "reload 后健康检查失败，自动回滚...\n已回滚并重新加载上一份配置"
+                # lib/client-management.sh:338 — the ONLY proven restore.
+                warning = ("reload 后健康检查失败（add client %s），自动回滚...\n"
+                           "已回滚并重新加载上一份配置" % name)
+            elif self.add_fail == "rolled-back-stale":
+                # The sentence claims a restore, but the bytes did not go back:
+                # reconciliation must refuse to treat this as a clean failure.
+                self._scripted_replace(name)
+                warning = ("reload 后健康检查失败（add client %s），自动回滚...\n"
+                           "已回滚并重新加载上一份配置" % name)
+            elif self.add_fail == "rollback-failed":
+                # lib/client-management.sh:330 — restore itself failed.
+                self._scripted_replace(name)
+                warning = ("reload 后健康检查失败（add client %s），自动回滚...\n"
+                           "回滚恢复失败，请立即人工介入！备份: /root/sbox/singbox.json.bak"
+                           % name)
+            elif self.add_fail == "rollback-unconfirmed":
+                # lib/client-management.sh:344 — bytes restored, service not
+                # confirmed: the file hash equals the pre-write value but the
+                # server explicitly did NOT prove recovery.
+                self._scripted_replace(name)
+                self.facts.config_sha = before_sha
+                self.clients = [spec for spec in self.clients
+                                if spec.name != name]
+                warning = ("reload 后健康检查失败（add client %s），自动回滚...\n"
+                           "已回滚配置文件，但服务未能确认恢复，请立即人工检查！"
+                           "备份: /root/sbox/singbox.json.bak" % name)
             else:
                 warning = "生成 add candidate 失败"
-            output = ("***** 客户端管理 *****\n" + warning
-                      + "\nHAUI_MENU_RC=0,0,0\nHAUI_MENU_END\n")
-            return 0, output, ""
+            output = ("***** 客户端管理 *****\n" + warning)
+            return self._add_frame(output.splitlines())
         # Canonical add success: independent credential per physical side.
         self._created_counter += 1
         uuid = uuid_for(self.role, 100 + self._created_counter)
         password = password_for(self.role, 100 + self._created_counter)
         self.created_credentials[name] = (uuid, password)
         if self.add_side_effect:
-            self.clients.append(ClientSpec(name))
-            self.facts.config_mtime += 1
+            self._scripted_replace(name)
         lines = [
             "***** 客户端管理 *****",
             "2. 添加客户端",
             "正在添加客户端…",
-            "配置已提交并重载成功: add client %s" % name,
         ]
+        if self.add_commit_marker:
+            if self.add_no_process:
+                lines.append(
+                    "配置已提交（当前无运行中的 sing-box 进程，跳过 reload）: "
+                    "add client %s" % name)
+            else:
+                lines.append("配置已提交并重载成功: add client %s" % name)
         if self.add_success_marker:
             lines.append("客户端 '%s' 已同时添加到 Reality 与 HY2"
                          "（UUID/password 已生成）" % name)
-        lines.append("HAUI_MENU_RC=0,0,0")
-        lines.append("HAUI_MENU_END")
-        return 0, "\n".join(lines) + "\n", ""
+        return self._add_frame(lines)
+
+    def _add_frame(self, lines: list[str]) -> tuple[int, str, str]:
+        """Close an add transcript with the pinned rc frame / end marker."""
+        output = "\n".join(lines) + "\nHAUI_MENU_RC=%d,%d,%d" % self.add_menu_rc
+        if self.add_end_marker:
+            output += "\nHAUI_MENU_END"
+        return 0, output + "\n", ""
+
+    def _scripted_replace(self, name: str) -> None:
+        """Simulate one committed config replace (new bytes, new client)."""
+        if not any(spec.name == name for spec in self.clients):
+            self.clients.append(ClientSpec(name))
+        if self.add_duplicate:
+            # A duplicate name invalidates the whole inventory (structural
+            # ``duplicate-name``): the client is present but not exportable.
+            self.clients.append(ClientSpec(name))
+        self.facts.config_mtime += 1
+        self.facts.config_sha = hashlib.sha256(
+            ("config:%s:%d" % (name, self.facts.config_mtime)).encode()
+        ).hexdigest()
 
 
 # --------------------------------------------------------------------------- #
@@ -763,7 +842,8 @@ class FakeProvider:
     exports: dict[str, bytes] = field(default_factory=dict)
     generated: dict[str, bytes] = field(default_factory=dict)
     pins_reply: dict[str, CertPin] | None = None
-    errors_by_method: dict[str, str] = field(default_factory=dict)
+    errors_by_method: dict[str, str | tuple[str, str]] = field(
+        default_factory=dict)
     calls: list[str] = field(default_factory=list)
     export_requests: list[list[str]] = field(default_factory=list)
     generate_requests: list[tuple[tuple[str, ...], bool]] = field(
@@ -773,9 +853,13 @@ class FakeProvider:
 
     def _enter(self, method: str) -> None:
         self.calls.append(method)
-        code = self.errors_by_method.get(method)
-        if code:
-            raise HaUiError(code, detail=method)
+        failure = self.errors_by_method.get(method)
+        if failure:
+            if isinstance(failure, tuple):
+                code, detail = failure
+            else:
+                code, detail = failure, method
+            raise HaUiError(code, detail=detail)
 
     def preflight(self) -> RemotePreflight:
         self._enter("preflight")

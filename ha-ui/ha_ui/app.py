@@ -162,6 +162,34 @@ def _pump_events(app: QApplication, milliseconds: int = 100) -> None:
     app.processEvents()
 
 
+def _exercise_private_storage(workspace: Path) -> None:
+    """Exercise the real private-storage path (ACL + atomic write) once.
+
+    The packaged EXE is windowed (no console); without this step the cold-start
+    smoke test never spawns the ``icacls`` console child that the private ACL
+    needs, so a console-window regression would go unnoticed. Only a fixed
+    ``HaUiError`` code reaches the caller; no file content or path is printed.
+    """
+    from .core import private_fs
+
+    root = workspace / "selftest-private"
+    payload = b'{"selftest": 1}\n'
+    try:
+        private_fs.ensure_private_dir(root, workspace=workspace)
+        private_fs.verify_private_dir(root)
+        target = root / "selftest.bin"
+        private_fs.secure_write_replace(target, payload, workspace=workspace)
+        private_fs.verify_private_file(target)
+        if private_fs.read_private_file(target, workspace=workspace) != payload:
+            raise HaUiError(errors.E_STORE_IO, detail="selftest-readback")
+    finally:
+        # Best-effort: a failed self-test must not leave a private test tree.
+        try:
+            private_fs.delete_tree_under(workspace, root)
+        except HaUiError:
+            pass
+
+
 def run_self_test() -> int:
     """Cold-start smoke: real window, in-memory vault, temporary workspace."""
     app = ensure_application()
@@ -184,6 +212,8 @@ def run_self_test() -> int:
         _pump_events(app)
         if window.windowTitle() != "%s %s" % (APP_NAME, APP_VERSION):
             status = 1
+        if status == 0:
+            _exercise_private_storage(workspace)
     except HaUiError as exc:
         print("HA-UI self-test: FAILED %s" % exc.code, file=sys.stderr)
         status = 1

@@ -83,10 +83,18 @@ class ClientRecord:
 
     @property
     def complete(self) -> bool:
+        """Both protocols carry a credential — protocol completeness only.
+
+        This is NOT "safe to generate": ``problems`` (duplicate/name-set
+        mismatch/unnamed entries/inbound-count anomalies) can invalidate the
+        whole inventory. Every success or readiness decision must use
+        :attr:`exportable`; ``complete`` is for display of one endpoint.
+        """
         return self.reality_ok and self.hy2_ok
 
     @property
     def exportable(self) -> bool:
+        """True only when the client is complete AND structurally sound."""
         return self.complete and not self.problems
 
 

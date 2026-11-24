@@ -96,6 +96,12 @@ VPS（A/B）。
   可单独删除。历史成功目录不会被覆盖。
 - **创建失败**：按界面显示的安全错误码处理；不要直接编辑服务器 JSON，也不要重复
   发送创建请求来“碰运气”。
+- **创建结果待确认（`E_CREATE_UNCERTAIN`）**：界面会显式写“可能已写入服务器”，并
+  自动刷新两端真实状态。刷新完成前不要重建同名客户端；刷新失败会显示
+  `STALE / UNKNOWN`，此时本地显示可能已过期，不能据此判断服务器没有被修改。
+- **已回滚 ≠ 可能已写入**：只有服务端明确打印“已回滚并重新加载上一份配置”，且软件
+  核对到配置字节回到写入前、名称不存在时，才显示“已回滚，配置已恢复（未提交）”。
+  “回滚恢复失败”或“服务未能确认恢复”一律按待确认处理，需要人工检查。
 - **部分创建**：不要删除已成功的一端来“重来”，因为删除可能触发凭据吊销；先确认
   缺失端状态，再决定补齐或人工处理。
 - **服务端回滚**：canonical add 在 `sing-box check` 或 reload/health 失败时按既有
@@ -114,8 +120,8 @@ VPS（A/B）。
 | `E_CLIENT_EXISTS` | 名称已存在 | 不覆盖；确认是否要改用补齐流程 |
 | `E_CLIENT_PARTIAL_EXISTS` | 仅一端已存在 | 默认停止；确认后只补齐缺失端 |
 | `E_CLIENT_INCOMPLETE` | 已存在端的协议不完整 | 先按服务端流程修复一致性，不覆盖凭据 |
-| `E_REMOTE_CREATE` | 创建被拒绝或已回滚 | 按 detail（`lock`/`consistency`/`rollback` 等）处理 |
-| `E_CREATE_UNCERTAIN` / `E_REMOTE_VERIFY` | 写入结果待确认 / 创建后无法确认 | 先刷新读取 live 状态，不要盲目重发 |
+| `E_REMOTE_CREATE` | 创建被拒绝或已回滚 | 按 detail 处理：`lock`/`consistency`/`create` 等为预写拒绝；`rolled-back` 为已证明回滚；`rollback-failed`/`rollback-unconfirmed`/`refusal-after-write` 需人工核实 |
+| `E_CREATE_UNCERTAIN` / `E_REMOTE_VERIFY` | 写入结果待确认 / 创建后无法确认 | 先刷新读取 live 状态；`STALE` 时恢复连接再读，不要盲目重发 |
 | `E_REMOTE_PIN` / `E_PIN_EXPIRED` / `E_PIN_REUSED` | HY2 证书问题 | 续签/换证书；A/B 不可同 PIN |
 | `E_REMOTE_MENU` | 现有菜单执行失败或不可识别 | 查看固定 detail；不要手工改菜单输入 |
 | `E_INSTALLER_UNTRUSTED` | installer/lib 不在已审查范围 | 不重试；升级需新版本重新审查 pin |

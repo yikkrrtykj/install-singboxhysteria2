@@ -129,6 +129,15 @@ jobs:
         run: python ha-ui/ci/verify_receipt.py --dist dist
       - name: Verify SHA256SUMS hashes every built artifact
         run: python ha-ui/ci/verify_artifact_sums.py --dist dist
+      - name: No-console-window acceptance (packaged EXE)
+        shell: pwsh
+        run: |
+          python ha-ui/ci/check_no_console_popup.py --exe dist/ha-ui.exe
+          if ($LASTEXITCODE -eq 2) {
+            Write-Warning "console detector unavailable on this agent; the CREATE_NO_WINDOW assertion in pytest is still enforced"
+            exit 0
+          }
+          exit $LASTEXITCODE
       - name: Publish build summary
         shell: pwsh
         run: |
