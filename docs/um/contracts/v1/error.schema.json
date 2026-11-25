@@ -31,7 +31,6 @@
         "replay",
         "nonce_reuse",
         "sequence_conflict",
-        "stale_boot",
         "identity_mismatch",
         "report_conflict",
         "token_invalid",
@@ -43,7 +42,9 @@
         "upgrade_required",
         "storage_unavailable",
         "rotation_in_progress",
-        "rotation_expired"
+        "rotation_expired",
+        "stale_boot_generation",
+        "boot_identity_conflict"
       ]
     },
     "retryable": {

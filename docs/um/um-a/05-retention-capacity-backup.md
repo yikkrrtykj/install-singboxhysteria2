@@ -1,4 +1,4 @@
-# UM-A 05 — Retention, capacity, database gate and backup/restore (revision 2)
+# UM-A 05 — Retention, capacity, database gate and backup/restore (revision 3 final)
 
 Status: design freeze for UM-A review; values marked "owner decision" are **not**
 approved yet. Revision after PR #126 review (P1-02 durability, P1-05 retention /
@@ -41,7 +41,7 @@ Frozen rules for policy B (if approved):
 | `events_history`, `incidents` | same 30 d / T+30 | open incidents never pruned |
 | `report_dedupe` | 8 d | needed to dedupe spool replay (7 d spool + margin) |
 | `nonce_dedupe` | 24 h | transport replay window |
-| `boot_registry` | with node identity; bounded last 8 boots | retired boots rejected as `stale_boot` |
+| `boot_registry` | with node identity; bounded last 8 generations | diagnostics only; retired generations are rejected by the persistent generation high-water (`stale_boot_generation`), never by registry presence |
 | `node_seq` | current only | persisted for center-restart recovery |
 | `node_keys` | with node identity; revocation record 30 d after purge | audit/forensics |
 | `key_rotations` | with node/key identity | rotation state machine recovery (doc 04 §7) |
@@ -201,6 +201,15 @@ owner daily pull); it must not store center/VPS credentials.
 A restore is a point-in-time rollback and can resurrect identities/data revoked
 or purged after the backup was taken. The ledger is the authority for
 revocation/purge facts across restores.
+
+**A verifiable copy is not the latest copy.** A backup/ledger whose chain and
+signature verify only proves internal consistency and a known prefix; it does not
+prove that it is the newest security state. After a whole-machine loss, if the
+operator cannot prove ledger completeness/latestness (e.g. only an older verifiable
+backup exists and the newest off-host copy/checkpoint cannot be authenticated),
+the restore MUST stay in quarantine and no node permissions are restored merely
+because an old backup is signature-valid. Actual off-host storage selection and
+restore drills are scheduled in UM-E.
 
 Ledger properties (frozen):
 

@@ -12,6 +12,7 @@
       "X-UM-Protocol": "1",
       "X-UM-Node-Id": "0f3d7c2a-8b41-4a6e-9c55-2d7e1b9a4c60",
       "X-UM-Key-Id": "key-4f2a9c1b",
+      "X-UM-Boot-Gen": "1",
       "X-UM-Boot-Id": "9c1f5a7e2b6d48c3a0e4f812d36b7c95",
       "X-UM-Seq": "7",
       "X-UM-Sent-At": "1795622410",
@@ -22,13 +23,13 @@
     "body_file": "examples/report-snapshot.v1.json",
     "decoded_body_bytes": 1031,
     "decoded_body_sha256_hex": "d8647394f0cc4543e292a75063b501413645f62e89f303743878ec2d280d3774",
-    "signing_string": "um-v1\nreport\nPOST\n/v1/agent/report\n1\n0f3d7c2a-8b41-4a6e-9c55-2d7e1b9a4c60\nkey-4f2a9c1b\n9c1f5a7e2b6d48c3a0e4f812d36b7c95\n7\n1795622410\nAAECAwQFBgcICQoLDA0ODw\nidentity\nd8647394f0cc4543e292a75063b501413645f62e89f303743878ec2d280d3774",
-    "signing_string_b64url": "dW0tdjEKcmVwb3J0ClBPU1QKL3YxL2FnZW50L3JlcG9ydAoxCjBmM2Q3YzJhLThiNDEtNGE2ZS05YzU1LTJkN2UxYjlhNGM2MAprZXktNGYyYTljMWIKOWMxZjVhN2UyYjZkNDhjM2EwZTRmODEyZDM2YjdjOTUKNwoxNzk1NjIyNDEwCkFBRUNBd1FGQmdjSUNRb0xEQTBPRHcKaWRlbnRpdHkKZDg2NDczOTRmMGNjNDU0M2UyOTJhNzUwNjNiNTAxNDEzNjQ1ZjYyZTg5ZjMwMzc0Mzg3OGVjMmQyODBkMzc3NA",
-    "signing_string_sha256_hex": "e001742a4a6b11dd9e8e5761651a9139b161bd8cef833c41b594845cbc1bbf25",
+    "signing_string": "um-v1\nreport\nPOST\n/v1/agent/report\n1\n0f3d7c2a-8b41-4a6e-9c55-2d7e1b9a4c60\nkey-4f2a9c1b\n1\n9c1f5a7e2b6d48c3a0e4f812d36b7c95\n7\n1795622410\nAAECAwQFBgcICQoLDA0ODw\nidentity\nd8647394f0cc4543e292a75063b501413645f62e89f303743878ec2d280d3774",
+    "signing_string_b64url": "dW0tdjEKcmVwb3J0ClBPU1QKL3YxL2FnZW50L3JlcG9ydAoxCjBmM2Q3YzJhLThiNDEtNGE2ZS05YzU1LTJkN2UxYjlhNGM2MAprZXktNGYyYTljMWIKMQo5YzFmNWE3ZTJiNmQ0OGMzYTBlNGY4MTJkMzZiN2M5NQo3CjE3OTU2MjI0MTAKQUFFQ0F3UUZCZ2NJQ1FvTERBME9EdwppZGVudGl0eQpkODY0NzM5NGYwY2M0NTQzZTI5MmE3NTA2M2I1MDE0MTM2NDVmNjJlODlmMzAzNzQzODc4ZWMyZDI4MGQzNzc0",
+    "signing_string_sha256_hex": "44774004887bac2122639817f09686f37ca80a1cd43ef8007d6469b76258068a",
     "signature": {
       "alg": "Ed25519",
       "public_key_b64url": "92mDHJhfw1zFNk2wFB7LNY9EPcgwNJrjWSF9wByHu3E",
-      "signature_b64url": "PuOTPc5KaPbNp6MGSa7lk4v6_VjZ4D2xZpJMtCLozQEduCQZU1rWD0LCqlYVn8iT_4QYKkSZZLitXfKpzfm2AQ"
+      "signature_b64url": "jnlllXdY-N8AIv97HRpHshu3LcBKrJsEbkScN5sb7Y3_O8zIPpOv12Xnmt2D2Gmh1a9TEGRNhl23XtCn8sg5Dw"
     },
     "expected": {
       "http": 200,
@@ -68,6 +69,16 @@
   },
   "negative_crypto_vectors": [
     {
+      "id": "report-boot-gen-tamper",
+      "signing_string": "um-v1\nreport\nPOST\n/v1/agent/report\n2\n0f3d7c2a-8b41-4a6e-9c55-2d7e1b9a4c60\nkey-4f2a9c1b\n1\n9c1f5a7e2b6d48c3a0e4f812d36b7c95\n7\n1795622410\nAAECAwQFBgcICQoLDA0ODw\nidentity\nd8647394f0cc4543e292a75063b501413645f62e89f303743878ec2d280d3774",
+      "signature_from": "report-positive",
+      "expected": {
+        "http": 401,
+        "error": "bad_signature",
+        "verify_against_report_key": false
+      }
+    },
+    {
       "id": "report-tampered-body",
       "body_file": "examples/negative/report-snapshot-tampered.v1.json",
       "decoded_body_bytes": 1031,
@@ -83,7 +94,7 @@
       "id": "report-wrong-key",
       "signing_string_from": "report-positive",
       "signer_public_key_b64url": "UbDevY-XJGziMrObtDffB1M9JynjK7OQnTlrZqkl55k",
-      "signature_b64url": "e_CyXbKJILaFOR-CIc66tk7ZxiMU5pCyddt_QBgiHRVK-_cnURuuxqMfMHPuv1xD-FekmPZteoTGO6PvAGkTAw",
+      "signature_b64url": "8GwgJZZc7QlKcwd6yfszIWjllT7dh9nZocnzuC4ZHlPQozhAEpzn-l4oE37lphAuTZTi95q54-UN7lvJmRK7BQ",
       "expected": {
         "http": 401,
         "error": "bad_signature",
@@ -92,7 +103,7 @@
     },
     {
       "id": "report-signature-reused-on-rotate",
-      "signing_string": "um-v1\nrotate\nPOST\n/v1/agent/rotate\n1\n0f3d7c2a-8b41-4a6e-9c55-2d7e1b9a4c60\nkey-4f2a9c1b\n9c1f5a7e2b6d48c3a0e4f812d36b7c95\n7\n1795622410\nAAECAwQFBgcICQoLDA0ODw\nidentity\nd8647394f0cc4543e292a75063b501413645f62e89f303743878ec2d280d3774",
+      "signing_string": "um-v1\nrotate\nPOST\n/v1/agent/rotate\n1\n0f3d7c2a-8b41-4a6e-9c55-2d7e1b9a4c60\nkey-4f2a9c1b\n1\n9c1f5a7e2b6d48c3a0e4f812d36b7c95\n7\n1795622410\nAAECAwQFBgcICQoLDA0ODw\nidentity\nd8647394f0cc4543e292a75063b501413645f62e89f303743878ec2d280d3774",
       "signature_from": "report-positive",
       "expected": {
         "http": 401,

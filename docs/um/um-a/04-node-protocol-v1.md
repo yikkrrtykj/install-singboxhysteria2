@@ -1,4 +1,4 @@
-# UM-A 04 — Node protocol v1 (FROZEN contract, revision 2)
+# UM-A 04 — Node protocol v1 (FROZEN contract, revision 3 final)
 
 Status: **FROZEN for UM-B implementation**, revision after the PR #126 architecture
 review (P0-01, P1-01, P1-02, P1-03, P1-04, P1-06). The machine-readable schemas
@@ -25,6 +25,8 @@ and retention [05](05-retention-capacity-backup.md), threat/tests
 | P1-09 replay closure (rev 3) | Unique `(node_id, nonce)` + full request fingerprint; seq-equal exact-retry vs conflict rules; bounded boot registry is not an authorization source (only current boot accepted); single-transaction ordering of report dedupe + boot/seq high-water + data; recovery cases added. |
 | P1-10 read-only authority (rev 3) | Source switches default **false**; sing-box `service.api` requires a server-side authorization audit before enabling; Mihomo controller disabled in v1; unproven authorization disables the source with `unavailable`/`source_authorization_unproven`, never fake data; no permission changes, no root collector. |
 | P1-11 capacity/ledger (rev 3) | Global active/archived/overlap quotas; capacity includes dedupe/audit/ledger/backup/WAL/VACUUM temp; security ledger durability/order/latest-version/offsite rules; incomplete ledger ⇒ quarantine, no automatic ingest restore. |
+| Final A — boot lifecycle | Signed monotonic `X-UM-Boot-Gen` generation: lower generation never re-activates (`stale_boot_generation`), same generation with different boot id rejected (`boot_identity_conflict`), new-generation first report (even duplicate) commits transport high-water, local boot-state loss is fail-closed operator recovery (no reset). |
+| Final B/C — rotation retry & ledger | Rotate nonce is a persisted intent (fresh transport fields allowed within 300 s, idempotent replay), confirmed/aborted/admin-revoked states and ACK-loss recovery defined, unprovable state → operator recovery; a verifiable ledger/backup is not assumed latest — incomplete proof keeps restore quarantined (drills in UM-E). |
 
 ## 1. Transport, endpoints and machine-ingress options
 
@@ -85,7 +87,8 @@ center inspects the raw header list, not a joined value.
 | `X-UM-Pubkey` | enroll only | base64url raw 32 B (43 chars) | new node key being enrolled |
 | `X-UM-Node-Id` | report/rotate/config | lowercase UUIDv4 | node identity |
 | `X-UM-Key-Id` | report/rotate/config | `key-[0-9a-f]{8}` | signing key id (`rotate` uses the old key) |
-| `X-UM-Boot-Id` | report/rotate/config | 32 lowercase hex | agent process generation |
+| `X-UM-Boot-Gen` | report/rotate/config | decimal uint64 ≥1 | **persistent boot generation**, monotonically increased by exactly 1 per normal agent restart |
+| `X-UM-Boot-Id` | report/rotate/config | 32 lowercase hex | random id of this boot **within the generation** |
 | `X-UM-Seq` | report/rotate/config | decimal uint64 ≥1 | monotonic per boot, per request attempt |
 | `X-UM-Sent-At` | all | decimal Unix seconds | **authentication time** (not payload age) |
 | `X-UM-Nonce` | all | base64url exactly 16 B (22 chars) | unique per request attempt |
@@ -133,6 +136,7 @@ um-v1
 1
 <node-id>
 <key-id>
+<boot-gen>
 <boot-id>
 <seq>
 <sent-at>
@@ -142,11 +146,12 @@ um-v1
 ```
 
 Binding: protocol major + endpoint + HTTP method + path + identity + key id +
-boot id + sequence + authentication time + nonce + content encoding + exact
-decoded body hash. A signature for one endpoint/identity/encoding/body cannot be
-reused for another (cross-endpoint replay is `bad_signature`); the body hash
-prevents body substitution; the time window and nonce prevent network replay;
-the boot/sequence prevent reordering after a restart.
+boot **generation** + boot id + sequence + authentication time + nonce + content
+encoding + exact decoded body hash. A signature for one endpoint/identity/
+generation/encoding/body cannot be reused for another (cross-endpoint replay is
+`bad_signature`); the body hash prevents body substitution; the time window and
+nonce prevent network replay; the generation/boot/sequence prevent reordering or
+re-activation after a restart.
 
 ## 4. Enrollment (P0-01)
 
@@ -198,61 +203,87 @@ Accepted payload age is bounded by the agent spool contract (≤7 days) and by
 `collected_at ≤ sent_at + 60 s`; older-than-retention data is rejected/accepted as
 stale-ignored per §6.
 
-Center processing (single transaction, `synchronous=FULL`):
+Center processing (single durable transaction, `synchronous=FULL`):
 
-1. Verify headers/encoding/size/grammar; 2. node + event binding; 3. key state;
+1. headers/encoding/size/grammar; 2. node + event binding; 3. key state;
 4. `|server_time − sent_at| ≤ 300 s`; 5. signature over decoded bytes;
-6. nonce dedupe; 7. report_id dedupe/conflict; 8. boot/sequence rules;
-9. schema + privacy allowlist; 10. apply data; 11. persist dedupe + sequence +
-data; 12. ACK. Nothing is acknowledged before step 11 commits; a failed commit is
-`503 storage_unavailable` (retryable) with no partial state.
+6. nonce dedupe; 7. **boot generation / boot id**; 8. sequence;
+9. report_id dedupe/conflict; 10. schema + privacy allowlist; 11. data apply or
+duplicate/stale-ignore decision; 12. persist transport state + report dedupe +
+data; 13. commit; 14. ACK. Nothing is acknowledged before the commit; a failed
+commit is `503 storage_unavailable` (retryable) with no partial state.
 
 Dedupe/durability tables (persistent, bounded):
 
 | Table | Key | Purpose | Retention |
 | --- | --- | --- | --- |
 | `report_dedupe` | `(node_id, report_id)` → body SHA-256, first/last received | idempotency across retries/restarts; same report_id different hash → `409 report_conflict` | 8 days (spool 7 d + margin) |
-| `nonce_dedupe` | **unique `(node_id, nonce)`** → `fingerprint_hash` + received_at | network replay and cross-endpoint nonce reuse; a nonce has exactly one request fingerprint | 24 h |
-| `seq_dedupe` | `(node_id, boot_id, seq)` → `fingerprint_hash` | exact-retry classification when `seq <= last_seq` (ack loss/duplicate) | current boot, bounded last 256 seq entries |
-| `boot_registry` | `(node_id, boot_id)` → first/last seen, last seq, state | diagnostics/history only; **acceptance is decided by `node_seq.current_boot_id`, never by registry presence** | with node identity, bounded last 8 boots |
-| `node_seq` | node_id → current boot_id, last_seq, last fingerprint | monotonic ordering per boot; gaps allowed and counted | current |
+| `nonce_dedupe` | **unique `(node_id, nonce)`** → `request_fingerprint` + received_at | network replay and cross-endpoint nonce reuse; a nonce maps to exactly one request fingerprint | 24 h |
+| `seq_dedupe` | `(node_id, boot_gen, boot_id, seq)` → `request_fingerprint` | exact-retry classification when `seq <= last_seq` (ack loss/duplicate) | current generation, bounded last 256 seq entries |
+| `node_boot` | `node_id` → `highest_gen`, `boot_id`, `last_seq`, `last_fingerprint`, `updated_at` | **authoritative boot-generation high-water**; acceptance consults this row only | current only (persistent) |
+| `boot_registry` | `(node_id, boot_gen, boot_id)` → first/last seen, last seq, state | diagnostics/history only; **not an authorization source** | with node identity, bounded last 8 generations |
 
-`fingerprint_hash = SHA-256(endpoint | method | path | key_id | boot_id | seq |
-sent_at | content-encoding | decoded-body-sha256)` with LF separators and no
-trailing newline. A request is "exactly the same attempt" only when its nonce
-matches and the fingerprint matches; any change with a reused nonce is
-`nonce_reuse`, even across endpoints.
+`request_fingerprint = SHA-256(endpoint | method | path | key_id | boot_gen |
+boot_id | seq | sent_at | content-encoding | decoded-body-sha256)` with LF
+separators, no trailing newline. For **report/config**, a nonce retry is "exactly
+the same attempt" only when the fingerprint is identical; any change with a
+reused nonce is `nonce_reuse` (even across endpoints). For **rotate** the nonce
+identifies the persisted rotation intent: the agent may retry with the same nonce
+and body but a refreshed `sent_at`/`seq`/`boot_gen` (freshness), and the center
+matches `(node_id, nonce, old_key_id, body_sha256)`; changed body/key/endpoint →
+`nonce_reuse` (see §7).
 
 `seq` semantics (P1-09):
 
-- `seq == last_seq` **and** the fingerprint equals `node_seq.last_fingerprint` →
+- The first request of a new generation must have `seq == 1`; later requests are
+  strictly increasing per generation.
+- `seq == last_seq` **and** the fingerprint equals `node_boot.last_fingerprint` →
   `200 duplicate` (the previous attempt committed but its ACK was lost).
 - `seq == last_seq` and fingerprint differs → `409 sequence_conflict`.
 - `seq < last_seq`: if `seq_dedupe` holds the exact fingerprint for that
-  `(boot_id, seq)` → `200 duplicate`; otherwise `409 sequence_conflict`.
-- `seq > last_seq`: accepted (gap counted), current boot continues.
+  `(boot_gen, boot_id, seq)` → `200 duplicate`; otherwise `409 sequence_conflict`.
+- `seq > last_seq`: accepted (gap counted), current generation continues.
 
-Boot rule and bounded registry proof: a report is accepted only if its `boot_id`
-equals `node_seq.current_boot_id` at transaction time. Any other boot id is
-`409 stale_boot` regardless of whether it is still in `boot_registry`. Bounded
-registry retention (last 8 boots) therefore can never re-accept an evicted old
-boot within any signature window: acceptance does not consult the registry list at
-all; the registry exists only for diagnostics and is not an authorization source.
-A new boot becomes current only in the same transaction that persists its first
-accepted report; before that the old boot remains current. This also closes the
-race between a new-boot first report and a retried old-boot request: whichever
-commits first becomes current; the other is classified duplicate/stale
-deterministically.
+Boot generation rule (A: persistent, signature-bound monotonic generation):
+
+- `node_boot.highest_gen` is the authoritative high-water. `X-UM-Boot-Gen` and
+  `X-UM-Boot-Id` are signed transport fields, so neither can be altered without
+  invalidating the signature.
+- `gen == highest_gen`: accepted only if `boot_id == node_boot.boot_id`; a
+  different boot_id with the same generation is `409 boot_identity_conflict`.
+- `gen == highest_gen + 1`: a normal restart; accepted if this is its first
+  request (`seq == 1`), then the same transaction sets `highest_gen = gen`,
+  `boot_id`, `last_seq = 1`. Skipping (`gen > highest_gen + 1`) is
+  `409 boot_identity_conflict`.
+- `gen < highest_gen`: a retired generation is `409 stale_boot_generation`; it is
+  never re-activated, even if an old `report_id` looks known. `boot_registry`
+  retention cannot weaken this: acceptance consults `node_boot`, not the bounded
+  registry.
+- If the **first report of a new generation is a duplicate** (its `report_id` was
+  already stored by the previous generation, e.g. after a restart mid-spool), the
+  generation/boot/seq transport state is still updated in the same transaction
+  while no data is written and the ACK remains `duplicate`. This keeps the
+  high-water correct even when spool replay makes the first new-generation request
+  a duplicate.
+- Agent persistence: the agent stores `{generation, boot_id}` durably (fsync)
+  before incrementing/using it; a normal restart increments generation by exactly
+  1 and generates a new random boot_id. If the agent's boot-state file is missing
+  or corrupt while the rest of its state exists, it must **not** reset the
+  generation and must not reuse the old boot_id: it refuses to report
+  (fail-closed, local `boot_state_corrupt` condition) and enters operator
+  recovery. A full state loss leads to a new enrollment (new `node_id`); an
+  in-place generation reset is never accepted (`stale_boot_generation`), so it
+  cannot bypass the center high-water. Operator recovery = admin revokes the old
+  identity and issues a new enrollment; there is no in-place reset endpoint.
 
 Transaction order (single SQLite transaction, `synchronous=FULL`):
 
-1. nonce fingerprint check/insert; 2. boot/seq validation; 3. report_id lookup;
-4. data apply (or duplicate/stale-ignore decision); 5. persist transport high-water
-(`node_seq`/`seq_dedupe`) **and** report dedupe **and** data; 6. commit; 7. ACK.
-A duplicate report arriving under a **new boot/seq** still updates the transport
-high-water in the same transaction (the new boot is genuine transport evidence),
-but performs no data write and returns `duplicate`; if the transaction aborts,
-none of the three state changes persist and the agent retries.
+1. nonce check/insert; 2. boot generation/id validation; 3. sequence validation;
+4. report_id lookup; 5. data apply or duplicate/stale-ignore decision;
+6. persist transport high-water (`node_boot` + `seq_dedupe`) **and** report dedupe
+**and** data in one transaction; 7. commit; 8. ACK. A duplicate/new-generation
+first report follows the same order and updates transport state before commit;
+if the transaction aborts, no state changes persist and the agent retries.
 
 - Snapshot: applied to `node_latest` only when `collected_at` is newer than the
   currently applied snapshot; an authenticated but older snapshot is acknowledged
@@ -281,19 +312,27 @@ be confused with another report.
 - `nonce`: first use executes; exact replay (same endpoint + same body hash)
   inside 24 h is idempotent (`duplicate`/replay-safe); same nonce with different
   body/endpoint is `409 nonce_reuse` (permanent; security event).
-- `seq`: per current boot strictly increasing; `seq < last` → `409
-  sequence_conflict`; `seq > last` accepted (gap recorded); a report with a new
-  `boot_id` is accepted and retires the previous boot; a report from a retired
-  boot is `409 stale_boot` (permanent), because the agent's new boot resends the
-  same spooled `report_id`s under the new boot.
-- Agent restart: a **new** `boot_id` is generated; the spool contains payload
-  records only (report_id + collected_at + type + body). The agent replays the
-  oldest spool record first under the new boot/seq with fresh nonce/sent_at; the
-  center dedupes by `report_id`, so records already stored before the crash are
-  `duplicate` and are dropped from the spool. A late request from the previous
-  boot after the new boot is `stale_boot`.
-- Center restart: all dedupe/sequence/boot state is in SQLite and survives
-  restarts; agents retry and receive `duplicate` for already-committed reports.
+- `seq`: per current generation strictly increasing; first request of a new
+  generation must be `seq == 1`; `seq < last` → `409 sequence_conflict`; `seq >
+  last` accepted (gap recorded). Sequence is bound to the generation in the signed
+  headers and in `seq_dedupe`.
+- Boot generation: `gen == highest_gen` requires the exact `boot_id` (else
+  `boot_identity_conflict`); a normal restart sends `gen == highest_gen + 1` with
+  its first request; `gen < highest_gen` → `stale_boot_generation`; skipping
+  generations → `boot_identity_conflict`. The **first new-generation report may
+  itself be a duplicate** (`report_id` already stored from the previous
+  generation): transport state is still advanced/committed, no data is written,
+  and the ACK is `duplicate`.
+- Agent restart: the persisted generation is incremented by exactly 1 and a new
+  random `boot_id` is generated. The spool contains payload records only
+  (report_id + collected_at + type + body); the agent replays oldest-first under
+  the new generation/seq with fresh nonce/sent_at. The center dedupes by
+  `report_id`; the first new-generation record may be `duplicate` but the new
+  generation high-water is still persisted. Agent boot-state loss/corruption is
+  fail-closed local recovery (no generation reset, no old boot_id reuse); a fully
+  re-enrolled agent gets a new node id, and an in-place reset is rejected.
+- Center restart: boot-generation/dedupe/sequence state is in SQLite and survives;
+  agents retry and receive `duplicate`/accepted without reordering.
 - Single-agent rule: the agent holds a single-writer spool lock so two agent
   instances cannot produce an ambiguous boot history for one node.
 - Rotation: a spool record is not tied to a key. After rotation the agent signs
@@ -327,15 +366,17 @@ be confused with another report.
 | Scenario | Expected |
 | --- | --- |
 | 1 h network outage | records spool durably; after reconnection oldest-first replay with fresh sent_at/nonce/seq; center ACKs accepted; no duplicates stored |
-| Agent restart mid-spool | new boot_id; old spool replayed; already-stored report_ids → `duplicate`; data loss only for records that were never fsynced (none by contract) |
+| Agent restart mid-spool | persisted generation +1 and new boot_id; old spool replayed; already-stored report_ids → `duplicate` (first new-generation duplicate still advances transport state); no unsynced loss |
+| Boot generation re-activation | `gen < highest_gen` → `stale_boot_generation`; `gen == highest_gen` with different boot_id → `boot_identity_conflict`; generation skip → `boot_identity_conflict`; none re-activated |
+| Agent boot-state loss | local fail-closed; no generation reset; re-enrollment → new node_id; center rejects any in-place reset as stale generation |
 | Center restart | dedupe/seq/boot survive; in-flight/spooled retries → `duplicate`/accepted; no reordering errors |
 | Lost ACK (commit succeeded) | resend with new nonce/seq → `duplicate`; spool dropped |
 | Lost ACK (commit failed/503) | resend → accepted; no duplicate |
-| Power loss on agent | fsynced records survive; older boot → center rejects late old-boot request as `stale_boot`, new-boot resend wins; unsynced tail may be lost and is reported via spool_retention diagnostics |
+| Power loss on agent | fsynced records survive; persisted generation increments on restart; a late old-generation request → `stale_boot_generation`; unsynced tail may be lost and is reported via spool_retention diagnostics |
 | Power loss on center | committed reports survive (FULL); uncommitted → agent retries; dedupe prevents double apply |
 | Revocation during backlog | backlog stays bounded/spooled; reports rejected `revoked_key`; operator re-enroll creates new node; old spool must be discarded (documented) |
 | Rotation during backlog | backlog retransmits under new key after rotation; same node identity; accepted |
-| Historical boot replay | old boot_id after new boot accepted → `stale_boot`; same report_id under new boot is idempotent |
+| Historical boot replay | old generation after a newer one accepted → `stale_boot_generation`; same report_id under the new generation is idempotent; bounded registry cannot re-accept it |
 | Old snapshot after newer live snapshot | authenticated, `stale_ignored`, never applied to latest |
 
 ## 7. Rotation, configuration and revocation (P1-08 state machine)
@@ -381,6 +422,36 @@ Response-loss and retry semantics:
   continues under the old key; a confirmed rotation requires replay under the new
   key (the agent uses the new key after confirmation).
 
+- Retry vs request fingerprint and 300 s freshness: a rotate retry keeps the
+  **same nonce and same body** (the rotation intent key) but may refresh
+  `sent_at`, `seq` and `boot_gen` so the 300 s transport-freshness window is
+  satisfied; the center matches `(node_id, nonce, old_key_id, body_sha256)` and
+  replays the persisted response. The nonce fingerprint for rotate therefore
+  excludes those volatile transport fields; a changed body/key or a nonce used on
+  another endpoint is `nonce_reuse`. (Report/config retries keep the exact
+  attempt fingerprint and use a new nonce for a new attempt.)
+- Agent recovery of a persisted rotation intent: state stores node_id, old/new
+  key material, rotation nonce, attempt count and last known state. After a
+  restart the agent rebuilds the rotate request with the persisted nonce/body and
+  fresh transport headers; idempotent replay returns the same response, or
+  `rotation_expired` moves it to the aborted path.
+- New-key proof committed but ACK lost: the agent retries the report signed with
+  the new key; the center (new key already active) answers `duplicate` (or
+  accepted for a later record). Any 2xx response to a request signed by the new
+  key proves confirmation, so the agent marks the rotation `confirmed`, deletes
+  the old private key and keeps reporting with the new key.
+- State distinction: **confirmed** = new active/old revoked (agent learns via a
+  2xx new-key request; no auto re-activation of the old key); **aborted** =
+  provisional new key revoked/old active (agent learns via `rotation_expired` or
+  `401 revoked_key` on the new key, then falls back to the old key); **admin
+  revoked** = all keys revoked (old-key fallback also gets `revoked_key`), agent
+  stops reporting, keeps the bounded spool and awaits operator recovery. The agent
+  must not guess between aborted and admin-revoked without probing both keys, and
+  must never bypass a revocation.
+- Unprovable safe recovery (e.g. both keys rejected, corrupt rotation state) =
+  stop reporting and operator recovery (admin revoke + re-enroll); no automatic
+  key adoption/reset.
+
 Config pull: `POST /v1/agent/config`, signed with the current active key, body
 exactly `{}` (2 bytes, §1); response
 [`agent-config.schema.json`](../contracts/v1/agent-config.schema.json) with
@@ -408,7 +479,8 @@ HTTP status + [`error.schema.json`](../contracts/v1/error.schema.json).
 | 404 | `endpoint_not_found` | no | wrong listener plane/wrong path |
 | 405 | `method_not_allowed` | no | non-POST on agent paths |
 | 409 | `replay` | yes | duplicate transport attempt; treat as duplicate |
-| 409 | `nonce_reuse` / `sequence_conflict` / `stale_boot` / `report_conflict` / `identity_mismatch` | no | replay/ordering conflicts |
+| 409 | `nonce_reuse` / `sequence_conflict` / `report_conflict` / `identity_mismatch` | no | replay/ordering conflicts |
+| 409 | `stale_boot_generation` / `boot_identity_conflict` | no | retired/mismatched boot generation; operator recovery if local state lost |
 | 409 | `rotation_in_progress` / `rotation_expired` | no | rotation recovery states (doc 04 §7) |
 | 413 | `payload_too_large` | no | decoded/compressed caps |
 | 426 | `unsupported_version` / `upgrade_required` | no | protocol major/agent policy |
@@ -551,7 +623,7 @@ Committed under [`../contracts/v1/`](../contracts/v1/):
   files, decoded-body hashes, signing strings, Ed25519 public keys/signatures,
   expected result) plus cryptographic negatives (tampered body, wrong key,
   cross-endpoint reuse) with expected verification failure.
-- `negative-vectors.v1.json`: behavioural HTTP/recovery contracts (35 cases):
+- `negative-vectors.v1.json`: behavioural HTTP/recovery contracts (45 cases):
   enrollment token/expired/used/recovery, header duplication/missing/encoding/
   config-body, tampered body, cross-endpoint replay, nonce/report/boot/sequence
   conflicts, size caps, rotation in-progress/expired/confirmed/revocation, source

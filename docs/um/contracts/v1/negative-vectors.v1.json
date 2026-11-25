@@ -136,10 +136,10 @@
     {
       "id": "NEG-REPORT-04",
       "endpoint": "/v1/agent/report",
-      "mutation": "report from a retired boot_id after a newer boot was accepted",
+      "mutation": "report from a retired boot generation after a newer generation was accepted",
       "expected": {
         "http": 409,
-        "error": "stale_boot",
+        "error": "stale_boot_generation",
         "retryable": false
       }
     },
@@ -339,10 +339,10 @@
     {
       "id": "NEG-REPORT-14",
       "endpoint": "/v1/agent/report",
-      "mutation": "boot_id is not the persisted current boot (even if absent from bounded boot_registry history)",
+      "mutation": "boot generation is not the persisted highest/current generation (even if absent from bounded boot_registry history)",
       "expected": {
         "http": 409,
-        "error": "stale_boot",
+        "error": "stale_boot_generation",
         "retryable": false
       }
     },
@@ -355,6 +355,105 @@
         "error": "invalid_request",
         "retryable": false,
         "recovery": "source remains disabled; availability unavailable; no fabricated data"
+      }
+    },
+    {
+      "id": "NEG-BOOT-01",
+      "endpoint": "/v1/agent/report",
+      "mutation": "boot generation lower than persisted highest generation",
+      "expected": {
+        "http": 409,
+        "error": "stale_boot_generation",
+        "retryable": false,
+        "recovery": "operator revokes and re-enrolls; no in-place reset"
+      }
+    },
+    {
+      "id": "NEG-BOOT-02",
+      "endpoint": "/v1/agent/report",
+      "mutation": "same generation but different boot_id",
+      "expected": {
+        "http": 409,
+        "error": "boot_identity_conflict",
+        "retryable": false
+      }
+    },
+    {
+      "id": "NEG-BOOT-03",
+      "endpoint": "/v1/agent/report",
+      "mutation": "boot generation skips more than highest+1, or new generation first seq != 1",
+      "expected": {
+        "http": 409,
+        "error": "boot_identity_conflict",
+        "retryable": false
+      }
+    },
+    {
+      "id": "NEG-BOOT-04",
+      "endpoint": "/v1/agent/report",
+      "mutation": "first report of new generation is a duplicate report_id (spool replay)",
+      "expected": {
+        "http": 200,
+        "ack": "duplicate",
+        "recovery": "transport generation/seq high-water still advanced in the same transaction"
+      }
+    },
+    {
+      "id": "NEG-BOOT-05",
+      "endpoint": "local",
+      "mutation": "agent boot-state file missing/corrupt while other state exists",
+      "expected": {
+        "http": null,
+        "local": "fail-closed; no generation reset or old boot_id reuse; operator recovery required"
+      }
+    },
+    {
+      "id": "NEG-ROT-07",
+      "endpoint": "/v1/agent/rotate",
+      "mutation": "same nonce+body retried with refreshed sent_at/seq/boot_gen within 300 s freshness",
+      "expected": {
+        "http": 200,
+        "recovery": "identical persisted rotate-response; volatile transport fields are excluded from the rotate nonce fingerprint"
+      }
+    },
+    {
+      "id": "NEG-ROT-08",
+      "endpoint": "/v1/agent/rotate",
+      "mutation": "same rotation nonce with changed body/key or wrong endpoint",
+      "expected": {
+        "http": 409,
+        "error": "nonce_reuse",
+        "retryable": false
+      }
+    },
+    {
+      "id": "NEG-ROT-09",
+      "endpoint": "/v1/agent/report",
+      "mutation": "new-key proof report committed but ACK lost; retried under the new key",
+      "expected": {
+        "http": 200,
+        "ack": "duplicate",
+        "recovery": "any 2xx new-key response marks rotation confirmed; old key deleted"
+      }
+    },
+    {
+      "id": "NEG-ROT-10",
+      "endpoint": "/v1/agent/report",
+      "mutation": "rotation aborted (provisional key revoked, old active); new-key report then old-key fallback",
+      "expected": {
+        "http": 401,
+        "error": "revoked_key",
+        "recovery": "delete provisional key, resume old-key reporting"
+      }
+    },
+    {
+      "id": "NEG-ROT-11",
+      "endpoint": "/v1/agent/report",
+      "mutation": "both keys rejected after admin revocation",
+      "expected": {
+        "http": 401,
+        "error": "revoked_key",
+        "recovery": "stop reporting, keep spool, operator recovery"
       }
     }
   ]

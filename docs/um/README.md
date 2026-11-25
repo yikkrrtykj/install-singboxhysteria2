@@ -84,6 +84,7 @@ sequence/nonce/body hash; enrollment is active-on-commit (no pending activation)
 rotation is a persistent state machine where the old key is revoked only after
 new-key proof; replay is closed by `(node_id, nonce)` + full request fingerprint,
 current-boot acceptance and `report_id` dedupe with `synchronous=FULL`; data
-sources are fail-closed and authorization-gated (default off); quotas and
-security-ledger rules are frozen. Owner decisions remain pending. Any incompatible
+sources are fail-closed and authorization-gated (default off); signed monotonic
+boot generations, quotas and security-ledger rules are frozen (restore through an
+unverifiable ledger stays quarantined). Owner decisions remain pending. Any incompatible
 change requires an explicit UM-A design revision review before UM-B implementation.

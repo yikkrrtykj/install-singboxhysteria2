@@ -4,7 +4,7 @@ Status: hand-off gate between UM-A (investigation/design) and UM-B. Revision aft
 PR #126 rev-3 review. Owner decisions below are **NOT approved** by this revision;
 the review's recommendations are recorded as recommendations only.
 
-## 1. UM-A review checklist (revision 2)
+## 1. UM-A review checklist (revision 3 final)
 
 | # | Requirement | Evidence |
 | --- | --- | --- |
@@ -48,9 +48,9 @@ for UM-B, not provisioning actions; the design uses placeholders.
 
 ## 3. UM-B entry criteria
 
-- [ ] Independent UM-A review PASS for revision 2 (all P0/P1 issues closed).
+- [ ] Independent UM-A review PASS for revision 3 final (all P0/P1 and final-correction items closed).
 - [ ] Owner answers §2 (or explicitly accepts recommendations).
-- [ ] Contract v1 revision 2 frozen; committed positive/negative vectors reproduced
+- [ ] Contract v1 revision 3 final frozen; committed positive/negative vectors reproduced
       by the first UM-B conformance tests before any feature merge.
 - [ ] Tech selections accepted; dependency register/review plan agreed.
 - [ ] UM-B split into reviewable Draft PRs with write scopes, tests and evidence.
@@ -72,7 +72,7 @@ authorized only in UM-E.
 
 ## 5. Change control
 
-- Contract v1 revision 2 (`04` + `contracts/v1/`) is frozen. Any change requires a
+- Contract v1 revision 3 final (`04` + `contracts/v1/`) is frozen. Any change requires a
   written proposal, threat-model impact, compatibility statement, updated vectors
   (positive and negative) and independent review before implementation.
 - Retention policy A/B, RPO/RTO, backup/off-host handling and machine-ingress
@@ -86,7 +86,7 @@ authorized only in UM-E.
 
 | Item | State |
 | --- | --- |
-| Current authorization | UM-A investigation/design only (revision 2) |
+| Current authorization | UM-A investigation/design only (revision 3 final) |
 | Implementation (UM-B..UM-E) | **HOLD** |
 | UM-F remote write | **DEFERRED** |
 | Production deployment/release | **HOLD** |

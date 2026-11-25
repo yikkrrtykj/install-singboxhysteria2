@@ -1,4 +1,4 @@
-# UM-A 06 — Threat model, security test plan and performance budget (revision 2)
+# UM-A 06 — Threat model, security test plan and performance budget (revision 3 final)
 
 Status: design freeze for UM-A review. Revision after PR #126 review (P1-02,
 P1-03, P1-04, P1-06). No implementation exists; this defines what UM-B..UM-E must
@@ -87,6 +87,8 @@ agent sending replayed/historical/forged reports.
 | 41 | Read-only claim rests on client method allowlist while the credential is server-side write-capable | source switches default false; server-side authorization audit required before enable; unproven source disabled with `unavailable`/`source_authorization_unproven`; Mihomo disabled in v1 | SEC-39 |
 | 42 | Restore/ledger incompleteness revives revoked nodes or purged data | security ledger fsynced before commit; latest-version chain/checkpoint; incomplete ledger ⇒ quarantine, no auto ingest | SEC-34 (extended) |
 | 43 | Runtime semantics (service name/inbound tag/timestamps/availability) pass schema but are forged/misleading | runtime closed allowlists, tag/kind match against center config, temporal bounds, availability coherence, sentinel scan; reject/quarantine, never render | SEC-39 |
+| 44 | Boot generation reset/reuse to bypass the center high-water | persisted signed monotonic generation; lower generation `stale_boot_generation`; same-generation different boot_id `boot_identity_conflict`; local boot-state loss fail-closed + operator recovery | SEC-40 |
+| 45 | Rotation retry/freshness confusion, lost new-key proof ACK, aborted vs confirmed vs admin-revoked states | rotate nonce intent with refreshed transport freshness; idempotent replay; 2xx new-key proof marks confirmed; `rotation_expired`/`revoked_key` fallback; unprovable state → operator recovery | SEC-38/41 |
 
 ## 5. Security invariants (never regress)
 
@@ -126,8 +128,10 @@ agent sending replayed/historical/forged reports.
 SEC-21, SEC-23, SEC-24, SEC-25, SEC-27, SEC-28, SEC-29 (protocol half), SEC-30,
 SEC-31, SEC-32 (agent), SEC-33, SEC-36, SEC-37 (enrollment orphan lifecycle),
 SEC-38 (rotation state machine incl. response loss/restart/expiry/revocation),
-SEC-39 (source authorization gating + runtime semantic validation), SEC-34
-(ledger half); contract conformance: both positive signed vectors verify,
+SEC-39 (source authorization gating + runtime semantic validation), SEC-40 (boot
+generation lifecycle), SEC-41 (rotation retry/freshness/ACK-loss state
+distinctions), SEC-34 (ledger half); contract conformance: both positive signed
+vectors verify,
 tampered/wrong-key/cross-endpoint negatives fail, schema negative examples are
 rejected, duplicate-header/encoding/config-body/size/boot/nonce/seq-retry cases,
 rotation recovery cases and source-disabled data honesty behave.

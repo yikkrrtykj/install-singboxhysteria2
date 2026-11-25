@@ -1,4 +1,4 @@
-# UM contracts v1 (revision 2)
+# UM contracts v1 (revision 3 final)
 
 Frozen machine-readable contracts for Unified Monitor node protocol v1.
 Normative prose: [`../../um-a/04-node-protocol-v1.md`](../../um-a/04-node-protocol-v1.md).
@@ -20,7 +20,11 @@ one) with `rotation_in_progress`/`rotation_expired`; replay is closed by unique
 is exactly **two bytes `{}`** and the HTTP `Content-Encoding` must match the signed
 `X-UM-Content-Encoding`; agent source switches default `false` and unproven source
 authorization disables the source (Mihomo disabled in v1); `agent-config` carries
-`expected_inbound_tags` for runtime tag/kind validation.
+`expected_inbound_tags` for runtime tag/kind validation. Final corrections add the
+signed monotonic `X-UM-Boot-Gen` boot generation with `stale_boot_generation` /
+`boot_identity_conflict`, closed rotation-retry/boot recovery cases, and expand
+the behavioural contract to 45 cases; the report test vector was re-signed with
+the boot-generation field and a boot-generation-tamper negative was added.
 
 ## Files
 

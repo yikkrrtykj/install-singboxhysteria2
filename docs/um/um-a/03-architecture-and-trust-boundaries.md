@@ -232,13 +232,23 @@ IPs or free text are stored (see doc 04 §privacy and doc 05 deletion rules).
 stateDiagram-v2
   [*] --> unenrolled
   unenrolled --> enrolling: operator places one-time token, agent starts
-  enrolling --> active: POST /v1/agent/enroll accepted
+  enrolling --> active: POST /v1/agent/enroll accepted (active on commit)
   enrolling --> unenrolled: token expired/used/invalid (fail closed)
-  active --> rotating: agent generates new key, signs with old key
-  rotating --> active: rotation accepted; old key grace ≤ 5 min then revoked
-  active --> revoked: admin revokes key/node
-  revoked --> [*]: reports rejected; node retired after 30 d
+  active --> rotating: agent persisted new key + intent; rotate signed by old key
+  rotating --> active: new-key proof accepted => new active, old revoked
+  rotating --> active: deadline expired => rotation aborted, old stays active
+  active --> revoked: admin revokes node (wins over any rotation)
+  revoked --> [*]: reports rejected; node retired after retention
 ```
+
+Boot lifecycle (frozen in doc 04 §5–§6): the agent persists a monotonic boot
+generation and increments it by exactly 1 per normal restart, with a new random
+boot id; the center persists the highest accepted generation. A generation lower
+than the high-water is never re-activated (`stale_boot_generation`), the same
+generation with a different boot id is rejected (`boot_identity_conflict`), and
+the first report of a new generation (even a duplicate `report_id`) still commits
+the new transport high-water. Agent boot-state loss is fail-closed local recovery
+(no reset); operator recovery = admin revoke + re-enroll as a new node id.
 
 Center node states: `active` immediately after the enrollment transaction commits
 (no `pending_activation` state; a lost enrollment response leaves a normal active
