@@ -41,7 +41,8 @@ inputs needed to start UM-B:
 - [05 — Retention, capacity and backup](05-retention-capacity-backup.md)
 - [06 — Threat model, security tests and performance](06-threat-model-security-tests-performance.md)
 - [07 — UM-B entry criteria and review](07-um-b-entry-and-review.md)
-- [../contracts/v1/](../contracts/v1/) — schemas, examples, signed test vector
+- [08 — PR #126 review response matrix (revision 2)](08-review-response-matrix.md)
+- [../contracts/v1/](../contracts/v1/) — schemas, positive/negative examples, signed report+enrollment vectors, behavioural negative contract
 
 ## How this phase was investigated
 
@@ -82,14 +83,17 @@ The independent reviewer must confirm all of:
 
 ## Local validation performed for this deliverable
 
-- Every JSON schema/example under `docs/um/contracts/v1/` parses as JSON; the
-  schemas declare JSON Schema 2020-12 and the frozen key sets.
-- The committed example report payload is signed with an ephemeral Ed25519 key;
-  the committed signature/pubkey test vector is verified with OpenSSL
-  (verification command recorded in the contracts README).
+- Every JSON schema/example under `docs/um/contracts/v1/` parses as JSON, the
+  schemas are valid JSON Schema 2020-12, positive examples validate and committed
+  negative examples are rejected.
+- Positive report **and** enrollment signed vectors verify with OpenSSL
+  (Ed25519); tampered-body, wrong-key and cross-endpoint-reuse vectors fail as
+  required; the behavioural negative contract freezes token/header/encoding/
+  replay/sequence/size/cross-plane expectations.
 - Markdown/Mermaid was reviewed manually; no repository test or CI job reads
   `docs/um/`, so CI for this PR is regression-only (existing suites must stay
   green).
 
-Exact evidence (commands, hashes, CI run) is recorded in the PR body, not in
-this directory, so the committed design stays stable.
+Exact evidence (commands, hashes, CI run and the recorded same-HEAD rerun) is
+recorded in the PR body, not in this directory, so the committed design stays
+stable.

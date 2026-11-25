@@ -1,48 +1,103 @@
 {
   "v": 1,
-  "description": "Unified Monitor node protocol v1 signing test vector. Ephemeral test key: the private key is NOT committed. Synthetic data only.",
-  "protocol": "um-report-v1",
-  "vector_id": "um-report-signing-v1-demo",
-  "request": {
-    "method": "POST",
-    "path": "/v1/agent/report",
+  "contract": "um-v1",
+  "description": "Signed vectors for Unified Monitor node protocol v1. Ephemeral test keys; private keys are NOT committed. Synthetic data only.",
+  "report_vector": {
+    "id": "report-positive",
+    "operation": {
+      "method": "POST",
+      "path": "/v1/agent/report"
+    },
     "headers": {
       "X-UM-Protocol": "1",
       "X-UM-Node-Id": "0f3d7c2a-8b41-4a6e-9c55-2d7e1b9a4c60",
       "X-UM-Key-Id": "key-4f2a9c1b",
       "X-UM-Boot-Id": "9c1f5a7e2b6d48c3a0e4f812d36b7c95",
-      "X-UM-Seq": "1",
-      "X-UM-Sent-At": "1795622400",
+      "X-UM-Seq": "7",
+      "X-UM-Sent-At": "1795622410",
       "X-UM-Nonce": "AAECAwQFBgcICQoLDA0ODw",
+      "X-UM-Content-Encoding": "identity",
       "Content-Type": "application/json"
     },
     "body_file": "examples/report-snapshot.v1.json",
-    "body_bytes": 1153,
-    "body_sha256_hex": "bb1a03ca37d4943bae48bc73ac028085b77a0198a1fb53d0e2e61c9afcc9d8b8"
+    "decoded_body_bytes": 1031,
+    "decoded_body_sha256_hex": "d8647394f0cc4543e292a75063b501413645f62e89f303743878ec2d280d3774",
+    "signing_string": "um-v1\nreport\nPOST\n/v1/agent/report\n1\n0f3d7c2a-8b41-4a6e-9c55-2d7e1b9a4c60\nkey-4f2a9c1b\n9c1f5a7e2b6d48c3a0e4f812d36b7c95\n7\n1795622410\nAAECAwQFBgcICQoLDA0ODw\nidentity\nd8647394f0cc4543e292a75063b501413645f62e89f303743878ec2d280d3774",
+    "signing_string_b64url": "dW0tdjEKcmVwb3J0ClBPU1QKL3YxL2FnZW50L3JlcG9ydAoxCjBmM2Q3YzJhLThiNDEtNGE2ZS05YzU1LTJkN2UxYjlhNGM2MAprZXktNGYyYTljMWIKOWMxZjVhN2UyYjZkNDhjM2EwZTRmODEyZDM2YjdjOTUKNwoxNzk1NjIyNDEwCkFBRUNBd1FGQmdjSUNRb0xEQTBPRHcKaWRlbnRpdHkKZDg2NDczOTRmMGNjNDU0M2UyOTJhNzUwNjNiNTAxNDEzNjQ1ZjYyZTg5ZjMwMzc0Mzg3OGVjMmQyODBkMzc3NA",
+    "signing_string_sha256_hex": "e001742a4a6b11dd9e8e5761651a9139b161bd8cef833c41b594845cbc1bbf25",
+    "signature": {
+      "alg": "Ed25519",
+      "public_key_b64url": "92mDHJhfw1zFNk2wFB7LNY9EPcgwNJrjWSF9wByHu3E",
+      "signature_b64url": "PuOTPc5KaPbNp6MGSa7lk4v6_VjZ4D2xZpJMtCLozQEduCQZU1rWD0LCqlYVn8iT_4QYKkSZZLitXfKpzfm2AQ"
+    },
+    "expected": {
+      "http": 200,
+      "ack_result": "accepted",
+      "verify": true
+    }
   },
-  "signing_string": "um-report-v1\n0f3d7c2a-8b41-4a6e-9c55-2d7e1b9a4c60\nkey-4f2a9c1b\n9c1f5a7e2b6d48c3a0e4f812d36b7c95\n1\n1795622400\nAAECAwQFBgcICQoLDA0ODw\nbb1a03ca37d4943bae48bc73ac028085b77a0198a1fb53d0e2e61c9afcc9d8b8",
-  "signing_string_note": "Exact UTF-8 bytes, LF separators, no trailing newline. body_sha256_hex covers the exact received body bytes, not a re-serialized JSON document.",
-  "signing_string_bytes": 196,
-  "signing_string_sha256_hex": "ca29649968a77bd81b1679b5ce8171de2591b9d60f547b9fe5e9b80aa97ca567",
-  "signature": {
-    "alg": "Ed25519",
-    "public_key_b64url": "2u7kE1ruK0uc4gO6yllkVGBkjFff8CGUUGE5HdC3s-k",
-    "signature_b64url": "TTF7FIzGQwmVdfHVP7Q1KrEBcAbwd_hUKHRkhgPrBsEW4yb8Djxy7uLpXQeRQVJheHpsz6XinsVIYaVb6vsBDw"
+  "enroll_vector": {
+    "id": "enroll-positive",
+    "operation": {
+      "method": "POST",
+      "path": "/v1/agent/enroll"
+    },
+    "headers": {
+      "X-UM-Protocol": "1",
+      "X-UM-Pubkey": "7qUoFX76CdhDin_iV74MAQZldoXDFFyYkV9cQqY60iw",
+      "X-UM-Sent-At": "1795622400",
+      "X-UM-Nonce": "EBESExQVFhcYGRobHB0eHw",
+      "X-UM-Content-Encoding": "identity",
+      "Content-Type": "application/json"
+    },
+    "body_file": "examples/enroll-request.v1.json",
+    "decoded_body_bytes": 163,
+    "decoded_body_sha256_hex": "504a7035ffd21ffd2e7318548505fbf99f785948682d8d9bf5409ce746099cf0",
+    "signing_string": "um-enroll-v1\nPOST\n/v1/agent/enroll\n1\nidentity\n7qUoFX76CdhDin_iV74MAQZldoXDFFyYkV9cQqY60iw\n1795622400\nEBESExQVFhcYGRobHB0eHw\n504a7035ffd21ffd2e7318548505fbf99f785948682d8d9bf5409ce746099cf0",
+    "signing_string_b64url": "dW0tZW5yb2xsLXYxClBPU1QKL3YxL2FnZW50L2Vucm9sbAoxCmlkZW50aXR5CjdxVW9GWDc2Q2RoRGluX2lWNzRNQVFabGRvWERGRnlZa1Y5Y1FxWTYwaXcKMTc5NTYyMjQwMApFQkVTRXhRVkZoY1lHUm9iSEIwZUh3CjUwNGE3MDM1ZmZkMjFmZmQyZTczMTg1NDg1MDVmYmY5OWY3ODU5NDg2ODJkOGQ5YmY1NDA5Y2U3NDYwOTljZjA",
+    "signing_string_sha256_hex": "2cb9d1a29a77dd78da56ba866c14b7a1139a5f37a6be9be2ddc339f081a8daca",
+    "signature": {
+      "alg": "Ed25519",
+      "public_key_b64url": "7qUoFX76CdhDin_iV74MAQZldoXDFFyYkV9cQqY60iw",
+      "signature_b64url": "HEcGH3wbN9A1ndo8OghRFID0eZRWPEB1n-7m7XPf6lI3nZv_axqFjYocmhDFtUuiZWLPhyyXdpwELQMOsu9XBg"
+    },
+    "expected": {
+      "http": 200,
+      "verify": true
+    }
   },
-  "expected": {
-    "verify": true,
-    "tampered_body_verify": false
-  },
-  "verification": {
-    "openssl": [
-      "sha256sum examples/report-snapshot.v1.json",
-      "printf '%s' \"<signing_string with LF separators, no trailing newline>\" > signing.txt",
-      "openssl pkeyutl -verify -rawin -pubin -inkey pub.pem -in signing.txt -sigfile sig.bin"
-    ],
-    "note": "Any Ed25519 implementation may be used. The signing string itself is authoritative and is also committed verbatim in this file; reproduce the same bytes and verify against public_key_b64url."
-  },
-  "enrollment": {
-    "signing_string_template": "um-enroll-v1\\n<nonce>\\n<signed_at>\\n<sha256-hex(body-bytes)>",
-    "note": "Enrollment uses the same exact-body-bytes rule; no additional vector is committed because the enrollment body schema and this template fully determine the input."
-  }
+  "negative_crypto_vectors": [
+    {
+      "id": "report-tampered-body",
+      "body_file": "examples/negative/report-snapshot-tampered.v1.json",
+      "decoded_body_bytes": 1031,
+      "decoded_body_sha256_hex": "bd9748181588889f58650d9a7f0464448cdd9b1c445f57432288f90e3d65d8d9",
+      "signature_from": "report-positive",
+      "expected": {
+        "http": 401,
+        "error": "bad_signature",
+        "verify_against_report_key": false
+      }
+    },
+    {
+      "id": "report-wrong-key",
+      "signing_string_from": "report-positive",
+      "signer_public_key_b64url": "UbDevY-XJGziMrObtDffB1M9JynjK7OQnTlrZqkl55k",
+      "signature_b64url": "e_CyXbKJILaFOR-CIc66tk7ZxiMU5pCyddt_QBgiHRVK-_cnURuuxqMfMHPuv1xD-FekmPZteoTGO6PvAGkTAw",
+      "expected": {
+        "http": 401,
+        "error": "bad_signature",
+        "verify_against_report_key": false
+      }
+    },
+    {
+      "id": "report-signature-reused-on-rotate",
+      "signing_string": "um-v1\nrotate\nPOST\n/v1/agent/rotate\n1\n0f3d7c2a-8b41-4a6e-9c55-2d7e1b9a4c60\nkey-4f2a9c1b\n9c1f5a7e2b6d48c3a0e4f812d36b7c95\n7\n1795622410\nAAECAwQFBgcICQoLDA0ODw\nidentity\nd8647394f0cc4543e292a75063b501413645f62e89f303743878ec2d280d3774",
+      "signature_from": "report-positive",
+      "expected": {
+        "http": 401,
+        "error": "bad_signature"
+      }
+    }
+  ]
 }

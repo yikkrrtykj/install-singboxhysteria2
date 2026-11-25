@@ -60,8 +60,9 @@ implementation or deployment authorization.
 | [um-a/04-node-protocol-v1.md](um-a/04-node-protocol-v1.md) | **Frozen** node registration/auth/report/rotation/revocation and protocol-version compatibility contract |
 | [um-a/05-retention-capacity-backup.md](um-a/05-retention-capacity-backup.md) | 30-day history retention, deletion rules, capacity model/limits, SQLite→PostgreSQL gate, backup/restore (RPO/RTO) |
 | [um-a/06-threat-model-security-tests-performance.md](um-a/06-threat-model-security-tests-performance.md) | Threat model, abuse cases, security test plan, performance budgets and UM-E measurement plan |
-| [um-a/07-um-b-entry-and-review.md](um-a/07-um-b-entry-and-review.md) | UM-A review checklist, open questions for the owner, UM-B entry criteria, authorization record |
-| [contracts/v1/](contracts/v1/) | Machine-readable v1 JSON schemas, example payloads and a signed test vector |
+| [um-a/07-um-b-entry-and-review.md](um-a/07-um-b-entry-and-review.md) | UM-A review checklist, owner decisions (pending), UM-B entry criteria, authorization record |
+| [um-a/08-review-response-matrix.md](um-a/08-review-response-matrix.md) | PR #126 review response matrix (P0-01, P1-01..P1-06) and revision-2 validation summary |
+| [contracts/v1/](contracts/v1/) | Machine-readable v1 JSON schemas, positive/negative examples, signed test vectors (report + enrollment), behavioural negative contract |
 
 ## Authorization record
 
@@ -75,6 +76,11 @@ implementation or deployment authorization.
 ## Versioning
 
 UM-A design baseline: main `885171c08210ad0f4e91f0fed0243460d294b15e`
-(merge commit of PR #125). Contract v1 is frozen by
-[04-node-protocol-v1.md](um-a/04-node-protocol-v1.md); any incompatible change
-requires an explicit UM-A design revision review before UM-B implementation.
+(merge commit of PR #125). Contract v1 **revision 2** is frozen by
+[04-node-protocol-v1.md](um-a/04-node-protocol-v1.md) after the PR #126 review
+(response matrix: [08](um-a/08-review-response-matrix.md)): signatures are
+transport headers only and bind endpoint/method/path/encoding/identity/time/
+sequence/nonce/body hash; replay/dedupe is `report_id`-based with persistent
+center state and `synchronous=FULL`; owner decisions remain pending. Any
+incompatible change requires an explicit UM-A design revision review before UM-B
+implementation.

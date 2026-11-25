@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://um.invalid/contracts/v1/rotate-response.schema.json",
+  "title": "UM v1 node key rotation response",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["v", "node_id", "previous_key_id", "new_key_id", "config_version", "server_time"],
+  "properties": {
+    "v": {"const": 1},
+    "node_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "previous_key_id": {"type": "string", "pattern": "^key-[0-9a-f]{8}$"},
+    "new_key_id": {"type": "string", "pattern": "^key-[0-9a-f]{8}$"},
+    "config_version": {"type": "integer", "minimum": 1},
+    "server_time": {"type": "integer", "minimum": 0}
+  }
+}

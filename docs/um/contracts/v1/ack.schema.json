@@ -4,10 +4,15 @@
   "title": "UM v1 report acknowledgement",
   "type": "object",
   "additionalProperties": false,
-  "required": ["v", "result", "server_time", "next_seq", "config_version", "retry_after_s"],
+  "required": ["v", "report_id", "result", "server_time", "next_seq",
+               "config_version", "retry_after_s"],
   "properties": {
     "v": {"const": 1},
-    "result": {"enum": ["accepted", "duplicate"]},
+    "report_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "result": {"enum": ["accepted", "duplicate", "stale_ignored"]},
     "server_time": {"type": "integer", "minimum": 0},
     "next_seq": {"type": "integer", "minimum": 1, "maximum": 9007199254740991},
     "config_version": {"type": "integer", "minimum": 1},

@@ -1,24 +1,27 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://um.invalid/contracts/v1/report-snapshot.schema.json",
-  "title": "UM v1 report body: snapshot (latest state, idempotent upsert)",
+  "title": "UM v1 report body: snapshot (latest state, idempotent upsert, nullable unknown data)",
   "type": "object",
   "additionalProperties": false,
-  "required": ["v", "type", "generated_at", "config_version", "agent", "host",
-               "counter_epoch", "system", "services", "protocols", "traffic", "clients"],
+  "required": ["v", "type", "report_id", "collected_at", "agent", "host",
+               "availability", "counter_epoch", "system", "services", "protocols",
+               "traffic", "clients"],
   "properties": {
     "v": {"const": 1},
     "type": {"const": "snapshot"},
-    "generated_at": {"type": "integer", "minimum": 0, "maximum": 1000000000000},
-    "config_version": {"type": "integer", "minimum": 1},
+    "report_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "collected_at": {"type": "integer", "minimum": 0, "maximum": 1000000000000},
     "agent": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["version", "boot_id", "uptime_s"],
+      "required": ["version", "uptime_s"],
       "properties": {
         "version": {"type": "string", "maxLength": 32,
                     "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$"},
-        "boot_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
         "uptime_s": {"type": "integer", "minimum": 0, "maximum": 1000000000000}
       }
     },
@@ -32,6 +35,18 @@
         "arch": {"enum": ["amd64", "arm64"]}
       }
     },
+    "availability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["system", "services", "protocols", "traffic", "clients"],
+      "properties": {
+        "system": {"enum": ["ok", "partial", "unavailable"]},
+        "services": {"enum": ["ok", "partial", "unavailable"]},
+        "protocols": {"enum": ["ok", "partial", "unavailable"]},
+        "traffic": {"enum": ["ok", "partial", "unavailable"]},
+        "clients": {"enum": ["ok", "partial", "unavailable"]}
+      }
+    },
     "counter_epoch": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
     "system": {
       "type": "object",
@@ -39,14 +54,14 @@
       "required": ["cpu_pct", "load1", "mem_total_bytes", "mem_used_bytes",
                    "disk_total_bytes", "disk_used_bytes", "net_rx_bytes", "net_tx_bytes"],
       "properties": {
-        "cpu_pct": {"type": "number", "minimum": 0, "maximum": 10000},
-        "load1": {"type": "number", "minimum": 0, "maximum": 100000},
-        "mem_total_bytes": {"type": "integer", "minimum": 1, "maximum": 1099511627776},
-        "mem_used_bytes": {"type": "integer", "minimum": 0, "maximum": 1099511627776},
-        "disk_total_bytes": {"type": "integer", "minimum": 1, "maximum": 1099511627776},
-        "disk_used_bytes": {"type": "integer", "minimum": 0, "maximum": 1099511627776},
-        "net_rx_bytes": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
-        "net_tx_bytes": {"type": "integer", "minimum": 0, "maximum": 9007199254740991}
+        "cpu_pct": {"oneOf": [{"type": "number", "minimum": 0, "exclusiveMaximum": 10000}, {"type": "null"}]},
+        "load1": {"oneOf": [{"type": "number", "minimum": 0, "exclusiveMaximum": 100000}, {"type": "null"}]},
+        "mem_total_bytes": {"oneOf": [{"type": "integer", "minimum": 1, "maximum": 1099511627776}, {"type": "null"}]},
+        "mem_used_bytes": {"oneOf": [{"type": "integer", "minimum": 0, "maximum": 1099511627776}, {"type": "null"}]},
+        "disk_total_bytes": {"oneOf": [{"type": "integer", "minimum": 1, "maximum": 1099511627776}, {"type": "null"}]},
+        "disk_used_bytes": {"oneOf": [{"type": "integer", "minimum": 0, "maximum": 1099511627776}, {"type": "null"}]},
+        "net_rx_bytes": {"oneOf": [{"type": "integer", "minimum": 0, "maximum": 9007199254740991}, {"type": "null"}]},
+        "net_tx_bytes": {"oneOf": [{"type": "integer", "minimum": 0, "maximum": 9007199254740991}, {"type": "null"}]}
       }
     },
     "services": {
@@ -90,8 +105,8 @@
           "scope": {"const": "protocol"},
           "inbound_tag": {"type": "string", "maxLength": 64,
                           "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"},
-          "uplink_total_bytes": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
-          "downlink_total_bytes": {"type": "integer", "minimum": 0, "maximum": 9007199254740991}
+          "uplink_total_bytes": {"oneOf": [{"type": "integer", "minimum": 0, "maximum": 9007199254740991}, {"type": "null"}]},
+          "downlink_total_bytes": {"oneOf": [{"type": "integer", "minimum": 0, "maximum": 9007199254740991}, {"type": "null"}]}
         }
       }
     },
@@ -100,8 +115,8 @@
       "additionalProperties": false,
       "required": ["active", "tracked", "summaries"],
       "properties": {
-        "active": {"type": "integer", "minimum": 0, "maximum": 1000000},
-        "tracked": {"type": "integer", "minimum": 0, "maximum": 1000000},
+        "active": {"oneOf": [{"type": "integer", "minimum": 0, "maximum": 1000000}, {"type": "null"}]},
+        "tracked": {"oneOf": [{"type": "integer", "minimum": 0, "maximum": 1000000}, {"type": "null"}]},
         "summaries": {
           "type": "array", "minItems": 0, "maxItems": 50,
           "items": {

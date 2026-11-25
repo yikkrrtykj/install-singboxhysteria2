@@ -1,70 +1,76 @@
-# UM contracts v1
+# UM contracts v1 (revision 2)
 
 Frozen machine-readable contracts for Unified Monitor node protocol v1.
 Normative prose: [`../../um-a/04-node-protocol-v1.md`](../../um-a/04-node-protocol-v1.md).
+Review response: [`../../um-a/08-review-response-matrix.md`](../../um-a/08-review-response-matrix.md).
+
+Revision 2 changes: signatures are **transport headers only** (no signed body
+contains a signature field, removing the enrollment circular dependency); signing
+strings bind endpoint/method/path/content-encoding/identity/time/sequence/nonce/
+body hash; every report body carries `report_id` + `collected_at`; snapshot/metric
+fields can be `null`/unknown with explicit availability; event `detail` is closed
+per kind; ACK/error/rotation schemas and the negative contract were added.
 
 ## Files
 
 | File | Direction | Content |
 | --- | --- | --- |
-| `enroll-request.schema.json` | agent → center | signed enrollment body |
+| `enroll-request.schema.json` | agent → center | signed-header enrollment body |
 | `enroll-response.schema.json` | center → agent | identity/config assignment |
-| `report-snapshot.schema.json` | agent → center | latest state (upsert) |
-| `report-metrics.schema.json` | agent → center | bounded minute samples |
-| `report-events.schema.json` | agent → center | bounded fault/agent events |
-| `rotate-request.schema.json` | agent → center | key rotation body |
+| `report-snapshot.schema.json` | agent → center | latest state (upsert, newer `collected_at` only) |
+| `report-metrics.schema.json` | agent → center | bounded minute samples (nullable unknowns) |
+| `report-events.schema.json` | agent → center | bounded events with closed per-kind details |
+| `rotate-request.schema.json` / `rotate-response.schema.json` | agent ↔ center | key rotation |
 | `agent-config.schema.json` | center → agent | pulled agent configuration |
-| `ack.schema.json` | center → agent | report acknowledgement |
-| `error.schema.json` | center → agent | closed error body |
-| `examples/report-snapshot.v1.json` | — | exact bytes used by the signed test vector |
-| `test-vectors.v1.json` | — | signing string, public key, signature, hashes |
+| `ack.schema.json` / `error.schema.json` | center → agent | acknowledgement / closed error |
+| `negative-vectors.v1.json` | — | behavioural HTTP negative contract |
+| `test-vectors.v1.json` | — | signed positive/negative vectors (report + enrollment) |
+| `examples/` | — | positive bodies + schema-negative examples |
 
-HTTP headers (identity, sequence, nonce, signature) are part of the protocol but
-are not represented in JSON Schema; doc 04 §3 is normative.
+HTTP headers (identity, sequence, nonce, signature, content encoding, token) are
+part of the protocol, not JSON Schema fields; doc 04 §2–§3 is normative.
 
 ## Conventions
 
-- JSON Schema draft 2020-12; objects are `additionalProperties: false` except
-  `detail` maps explicitly marked as extensible.
-- All byte fields are base64url without padding; hex fields are lowercase hex.
-- Timestamps are integer Unix seconds (UTC).
-- Byte counters are cumulative non-negative integers; center derives deltas and
-  handles counter-epoch changes.
-- Closed enums reject unknown values; agents must not send them.
-- Limits are enforced by the center before parsing (HTTP body caps) and again by
-  schema/bounds validation.
+- JSON Schema draft 2020-12; `additionalProperties: false` everywhere except none
+  in v1 (details are per-kind closed schemas).
+- Base64url without padding; lowercase hex; epoch seconds UTC.
+- Missing metrics are `null`, not `0`; availability status is explicit; service/
+  protocol state may be `unknown`; no fabricated healthy state.
+- Closed enums reject unknown values; `agent_error.detail.code` is a closed enum,
+  never free text.
+- Size caps: compressed ≤256 KiB, decoded ≤128 KiB, enroll ≤8 KiB; center rejects
+  before parsing.
 
-## Signed test vector verification
+## Signed vectors
 
-The committed example body is signed with an ephemeral test key; the private key
-is **not** committed. Verification (from the repository root, OpenSSL ≥3):
+- `report_vector`: body `examples/report-snapshot.v1.json`; signing string
+  `um-v1\nreport\nPOST\n/v1/agent/report\n1\n<node>\n<key>\n<boot>\n<seq>\n<sent>\n<nonce>\n<encoding>\n<sha256(body)>`;
+  Ed25519 signature over its exact UTF-8 bytes.
+- `enroll_vector`: body `examples/enroll-request.v1.json`; signing string
+  `um-enroll-v1\nPOST\n/v1/agent/enroll\n1\n<encoding>\n<pubkey>\n<sent>\n<nonce>\n<sha256(body)>`.
+- `negative_crypto_vectors`: tampered body, wrong key, cross-endpoint reuse — each
+  must fail verification/return the frozen error.
+- `negative-vectors.v1.json`: token expiry/reuse, duplicate/missing headers,
+  encoding ambiguity, nonce/report/boot/sequence conflicts, size caps, rotation
+  grace, listener-plane separation.
+
+Verification (from the repository root; OpenSSL ≥3, synthetic keys only):
 
 ```bash
 cd docs/um/contracts/v1
-# 1. body hash must match test-vectors.v1.json
-sha256sum examples/report-snapshot.v1.json
-# 2. reconstruct the signing string from the vector fields, byte-exact with LF
-#    separators and no trailing newline, then verify with the committed pubkey.
-#    (Any Ed25519 library/CLI may be used; the vector also fixes the signing
-#     string itself, so implementations can compare strings directly.)
+sha256sum examples/report-snapshot.v1.json examples/enroll-request.v1.json
+# rebuild each signing string from the vector fields (LF, no trailing newline),
+# verify Ed25519 with the committed public key, and confirm negative vectors fail.
+# Private keys are not committed; the vectors contain public key + signature only.
 ```
 
-The vector records: body file + byte length + SHA-256, signing string, Ed25519
-public key (base64url raw 32 bytes) and signature. A conforming implementation
-must reproduce the same signature input and verify successfully; a tampered body
-must fail.
+Any change to headers, signing strings, endpoint semantics, dedupe/sequence rules,
+enums or vectors is a frozen-contract revision requiring independent review
+**before** implementation.
 
-## Change control
+## Privacy rule
 
-Any change to a schema, the signing string, header grammar, body `type` names or
-closed enum tokens is a frozen-contract change: it requires a UM-A revision,
-threat-model impact, compatibility statement, updated vector and independent
-review **before** implementation. Additive optional fields are allowed only for
-objects documented as extensible and require the same review before UM-B ships
-them.
-
-## Privacy rule for all committed material
-
-Examples and vectors contain synthetic values only. Real UUIDs, passwords,
-private keys, tokens, full private YAML, client identifiers or source IPs must
-never be committed here or in CI.
+Examples contain synthetic values only. Real UUIDs, passwords, private keys,
+tokens, full private YAML, client identifiers or source IPs must never be
+committed here or in CI.

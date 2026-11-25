@@ -1,10 +1,10 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://um.invalid/contracts/v1/enroll-request.schema.json",
-  "title": "UM v1 enrollment request body (signed by the new node key)",
+  "title": "UM v1 enrollment request body (signature is a transport header, not a body field)",
   "type": "object",
   "additionalProperties": false,
-  "required": ["v", "agent_version", "host", "pubkey", "nonce", "signed_at", "signature"],
+  "required": ["v", "agent_version", "host", "capabilities"],
   "properties": {
     "v": {"const": 1},
     "agent_version": {
@@ -22,9 +22,12 @@
         "arch": {"enum": ["amd64", "arm64"]}
       }
     },
-    "pubkey": {"type": "string", "pattern": "^[A-Za-z0-9_-]{43}$"},
-    "nonce": {"type": "string", "pattern": "^[A-Za-z0-9_-]{22}$"},
-    "signed_at": {"type": "integer", "minimum": 0, "maximum": 1000000000000},
-    "signature": {"type": "string", "pattern": "^[A-Za-z0-9_-]{86}$"}
+    "capabilities": {
+      "type": "array",
+      "minItems": 0,
+      "maxItems": 8,
+      "uniqueItems": true,
+      "items": {"enum": ["metrics_v1", "events_v1", "rotate_v1", "config_v1"]}
+    }
   }
 }

@@ -62,8 +62,13 @@ tested (UM-B/C security tests), not by comments.
    `exp`/`nbf`, algorithm allowlist, bounded key cache). Invalid → 403 before any
    login form. The tunnel is the only path to the web listener.
 3. Local login: username + password (Argon2id) + TOTP (RFC 6238, single-use
-   counter). Rate limited; failures audited. Success → server-side session +
-   per-session CSRF token.
+   counter). Rate limited; failures audited. Success → server-side session bound
+   to the verified Cloudflare Access subject (`sub`/email hash stored in the
+   session) + per-session CSRF token. Every subsequent web request must present
+   a valid Access JWT whose subject matches the session binding; JWT
+   expiry/subject change invalidates that request (403), and no request is
+   authorized by the header alone. Session revocation on password/TOTP/recovery
+   changes or admin action is immediate.
 4. Dashboard/history GETs are read-only and event-scoped. Mutations (events,
    nodes, enroll tokens, revocation, retention, user administration) require the
    session's CSRF token and are role-checked and audited.
@@ -80,18 +85,24 @@ tested (UM-B/C security tests), not by comments.
 2. Agent generates its Ed25519 keypair locally, calls `POST /v1/agent/enroll`
    over TLS (token in `Authorization`, key proof in body), receives `node_id`,
    `event_id`, `key_id`, `config_version`, per-event `device_salt`, sync state.
-3. Agent gathers only allowlisted facts, signs the exact report body and POSTs
-   to `https://ingest.132431.xyz:8443/v1/agent/report` with identity/signature
-   headers. Reports are idempotent and replay-checked.
+3. Agent gathers only allowlisted facts, creates a durable record with a stable
+   `report_id` + `collected_at`, and signs each transmission attempt with fresh
+   `sent_at`/`nonce`/`seq` headers. It POSTs to
+   `https://ingest.132431.xyz/v1/agent/report` (transport Option A or B per the
+   deployment decision). Historical spooled data is re-authenticated at send
+   time; payload age (≤7 days) is independent of transport freshness (±300 s).
 4. Center accepts a report only after: TLS, node lookup, key not revoked,
-   signature verify, freshness (±300 s), sequence/nonce rules, rate limit,
-   schema/allowlist validation. Accepted → transactional store + ack
-   (`server_time`, `next_seq`, `config_version`).
-5. Agent keeps a durable bounded spool (32 MiB / 7 days): report is durable
-   before send; acknowledged reports are removed; queued reports replay in order.
+   signature over headers+decoded body, transport freshness, nonce/report/boot/
+   sequence rules, schema/allowlist validation. Accepted → one durable SQLite
+   transaction (data + dedupe + sequence) with `synchronous=FULL`, then an ACK
+   (`server_time`, `next_seq`, `config_version`, result). No ACK before commit.
+5. Agent keeps a durable bounded spool (32 MiB / 7 days): record is fsynced
+   before the first send; acknowledged reports are removed; queued reports replay
+   oldest-first under the current boot/key; duplicates are ACKed as
+   `duplicate`/`stale_ignored` by `report_id`.
 6. No center→agent command channel exists in UM-A..UM-E. The only agent
-   configuration change is pulled by the agent in a normal report response
-   (config version). Centre cannot execute anything on the node.
+   configuration change is pulled by the agent in a normal signed config request
+   (config version). The center cannot execute anything on the node.
 
 ## 5. Deployment, network and DNS
 
@@ -99,16 +110,16 @@ tested (UM-B/C security tests), not by comments.
 | --- | --- |
 | Center host | new independent VPS, planning size 2C4G/40 GB SSD, Linux x86_64, systemd; final size by UM-E load test |
 | OS baseline | Debian 12 or Ubuntu 24.04 LTS (owner chooses; UM-B documents both install paths) |
-| Web hostname | `monitor.132431.xyz` — proxied through Cloudflare, Tunnel + Access |
+| Web hostname | `monitor.132431.xyz` — proxy path: Cloudflare Tunnel + Access → loopback web listener |
 | Web listener | `127.0.0.1:8080` HTTP; **no public web port**; cloudflared is the only client |
-| Machine hostname | `ingest.132431.xyz` — DNS-only (no Cloudflare proxy), direct TLS |
-| Ingest listener | `0.0.0.0:8443` TLS 1.3, public certificate for the ingest name; firewall allows only 8443/tcp |
+| Machine hostname | `ingest.132431.xyz` — DNS-only or tunnel hostname, owner decision (ADR-UM-005) |
+| Machine listener | Option A: `127.0.0.1:8443`, second tunnel hostname without Access; Option B: `0.0.0.0:8443` TLS 1.3 direct, DNS-only. Same frozen protocol either way |
 | Admin network path | Cloudflare Tunnel outbound from center only (no inbound web port) |
-| Data directory | `/var/lib/um-center/` 0700 (`umcenter:umcenter`), SQLite 0600 |
+| Data directory | `/var/lib/um-center/` 0700 (`umcenter:umcenter`), SQLite 0600, `synchronous=FULL` |
 | Config | `/etc/um-center/config.toml` 0600, master key `/etc/um-center/master.key` 0600 |
-| Backups | local nightly + owner-initiated off-host pull (encrypted); see doc 05 |
-| Firewall | inbound: 8443/tcp only; SSH admin path restricted/owner-managed; no DB/other ports |
-| TLS | cert pinning on agent (CA + DNS name + SPKI pin from enrollment); HSTS at Cloudflare for web |
+| Backups | daily encrypted local snapshot + owner-decided off-host handling; see doc 05 |
+| Firewall | Option A: no public app ports; Option B: 8443/tcp only; no DB/other ports |
+| TLS | Option A: Cloudflare edge TLS + app-layer node signature; Option B: TLS 1.3 end-to-end + optional SPKI pin; web HSTS at Cloudflare |
 
 ## 6. Trust boundaries
 
@@ -127,6 +138,18 @@ tested (UM-B/C security tests), not by comments.
 Explicit prohibitions: localhost is not an admin credential; `CF-Connecting-IP`,
 `X-Forwarded-For`, `X-Real-IP` and any Cloudflare identity header alone are never
 authorization inputs; the tunnel's loopback origin is not a trust shortcut.
+
+**Process isolation is NOT claimed.** UM-B..UM-E run web and ingest as two
+listeners/handler stacks **inside one center process** for SQLite single-writer
+simplicity. Route/network isolation and separate authentication stacks are real;
+process-memory and DB permissions are shared. A compromise of the ingest handler
+inside that process is therefore equivalent to a center-process compromise for
+data exposure purposes (it cannot write any VPS/business state because no such
+capability exists). Security acceptance targets in doc 06 §7 SEC-18/19/20 are
+written for this honest architecture. If the owner later requires "machine-entry
+compromise cannot read admin account data", the center must be split into
+separate processes/units with an internal RPC boundary and separate OS users —
+that is a new design decision, not something a pair of HTTP handlers provides.
 
 ## 7. Permission matrix (web plane)
 
@@ -147,8 +170,10 @@ target, result and bounded detail.
 | Revoke node key / retire node | ✓ | ✓ (scope) | — | — |
 | Rotate node key (agent-initiated) | — | — | — | own key (with old-key proof) |
 | Manage admin users/roles | ✓ | — | — | — |
+| Manage device display aliases | ✓ | ✓ (scope) | — | — |
 | Change retention/backup settings | ✓ | — | — | — |
 | View audit log | ✓ | scope | — | — |
+| Restore backup / reconcile revocations | ✓ | — | — | — |
 | Report telemetry | — | — | — | ✓ |
 | Any remote write / command | — | — | — | — (UM-F deferred, separate authorization) |
 
@@ -181,14 +206,17 @@ widen a role. Every event-scoped query includes the resolved event set in SQL
 | `nodes` | node identity, event binding, state, last seen, config version | event | with event; retired row 30 d after last report |
 | `node_keys` | public keys, activation/revocation, rotation link | event | audit-linked; removed with event purge (+30 d revocation record) |
 | `enroll_tokens` | one-time token hashes, TTL, creator, used-by | event | deleted after use/expiry (hash only) |
-| `node_latest` | last authenticated snapshot projection (structured columns) | event | current only |
+| `node_latest` | last authenticated snapshot projection (structured columns; only newer `collected_at` may overwrite) | event | current only |
 | `node_services`, `node_protocols`, `node_traffic` | latest per-service/protocol state and cumulative counters | event | current only |
-| `metric_minute` | per-node minute rollups (CPU/mem/disk/net/active) | event | 30 d |
+| `metric_minute` | per-node minute rollups (nullable/unknown-aware) | event | 30 d (policy B: archived event keeps remaining history another 30 d) |
 | `protocol_minute` | per-node per-protocol minute state/traffic deltas | event | 30 d |
-| `client_hourly` | top-N pseudonymous client summaries (device_ref, aggregates) | event | 30 d |
-| `events_history` | fault/incident/agent events timeline | event | 30 d |
-| `incidents` | derived incident open/close grouping (UM-D rules) | event | 30 d |
-| `reports_dedupe` | replay/sequence dedupe keys + body hash | event | 10 min |
+| `client_hourly` | top-N pseudonymous client summaries (device_ref, aggregates, admin alias lookup) | event | 30 d |
+| `events_history` | fault/incident/agent events timeline (closed per-kind details) | event | 30 d |
+| `incidents` | derived incident open/close grouping (UM-D rules) | event | 30 d; open rows never pruned |
+| `report_dedupe` | `(node_id, report_id)` → body hash, first/last received | event | 8 d |
+| `nonce_dedupe` | `(node_id, endpoint, nonce)` → body hash, received_at | event | 24 h |
+| `boot_registry` | per-node boot generations, last seq, active/retired | event | with node identity (bounded last 8) |
+| `node_seq` | current boot id and last seq per node | event | current only |
 | `admin_users`, `user_event_scopes`, `sessions`, `recovery_codes` | auth/RBAC/session state | root/user | sessions expire; users until deleted |
 | `audit_log` | security/administrative audit, closed actions | root/event | 180 d (configurable, size-bounded) |
 | `retention_runs`, `schema_migrations` | maintenance state | root | current |
@@ -210,9 +238,11 @@ stateDiagram-v2
   revoked --> [*]: reports rejected; node retired after 30 d
 ```
 
-Center node states: `active` → `revoked` → `retired` (admin action), with audit
-records. Re-enrollment always creates a new node identity; old history remains
-queryable until its retention expiry.
+Center node states: `pending_activation` (enrolled but response lost / not yet
+usable) → `active` → `revoked` → `retired` (admin action), with audit records.
+Re-enrollment always creates a new node identity; old history remains queryable
+until its retention expiry. Rotation keeps the same `node_id`; a lost rotate
+response is retried idempotently within the old-key grace window (doc 04 §7).
 
 ## 11. Runtime and OS profiles
 
@@ -226,9 +256,14 @@ a separate service with its own tunnel token (no other privileges).
 **Agent service**: systemd `um-agent.service`, user `umagent` (no login, no
 sudo), `NoNewPrivileges=yes`, `ProtectSystem=strict`, `ProtectHome=yes`,
 `PrivateTmp=yes`, no listening sockets, `ReadWritePaths=/var/lib/um-agent`,
-files 0700/0600; only required read paths: loopback sing-box API secret file
-(0600 root:umagent), `/proc` (standard), `systemctl is-active` for the two unit
-names (read-only). No `sbox-cm` socket, no journald, no root.
+files 0700/0600; **no fork/exec** (seccomp denies `execve/execveat`,
+`NoExecPaths=/` where supported); only required read paths: sing-box loopback API
+credential delivered by systemd `LoadCredential=` (source file permissions are
+not changed), `/proc`, systemd D-Bus read-only unit properties, optional Mihomo
+credential via `LoadCredential=`. No `sbox-cm` socket, no journald, no root, no
+`systemctl` execution. Provisioning is a one-time root installer orchestration:
+token file root:root 0600, fed to `um-agent enroll --token-stdin` as `umagent`
+through a pipe; the agent owns its key/state; root deletes the token afterwards.
 
 ## 12. Secrets inventory and logging rules
 
@@ -240,8 +275,10 @@ names (read-only). No `sbox-cm` socket, no journald, no root.
 | Admin password hash | DB (Argon2id) | logged/returned |
 | TOTP secret | DB encrypted with master key | logged/returned/backed up unencrypted |
 | Master key | `/etc/um-center/master.key` 0600 | DB, logs, off-host plaintext |
-| Session/CSRF tokens | memory/server-side session store | logs, URLs, error text |
+| Session/CSRF tokens | memory/server-side session store bound to Access subject | logs, URLs, error text |
 | Cloudflare tunnel token | cloudflared service env/file 0600 | repo/logs |
+| sing-box / Mihomo API credential (agent) | systemd `LoadCredential=` private credential dir; agent never root; source permissions unchanged | repo/logs/history |
+| Agent bootstrap token | root-only provisioning file 0600, fed to the unprivileged enrollment process over a pipe, deleted by root after success | agent-readable file, logs, history |
 
 Logging: request line (method, path, status, peer), closed error codes, counts;
 never headers, bodies, tokens, passwords, signatures, keys, raw node payloads.
@@ -251,9 +288,12 @@ Audit log has actor/target/action/result only.
 
 - Center down / unreachable: agents spool up to 32 MiB/7 days, then fail-closed
   and stop advancing (bounded), and keep retrying; no effect on sing-box,
-  Mihomo, HA-UI or existing per-VPS Monitor.
+  Mihomo, HA-UI or existing per-VPS Monitor. After recovery, the spool replays
+  oldest-first with fresh transport authentication; `report_id` dedupe prevents
+  double storage and `collected_at` orders historical data (doc 04 §6).
 - Center storage failure: ingest returns `retry`/503; web returns closed 5xx;
-  no partial writes (transaction per report); agents spool.
+  no partial writes (one transaction per report, `synchronous=FULL`); agents
+  spool and retry; an ACK is never sent for an uncommitted report.
 - Agent failure: only its own node's data is stale; center marks freshness
   `STALE`/`UNKNOWN` from last-seen age and never infers health from silence.
 - Cloudflare outage: admin plane unavailable; machine plane is independent

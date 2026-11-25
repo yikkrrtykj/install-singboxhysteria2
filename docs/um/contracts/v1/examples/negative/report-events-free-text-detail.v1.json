@@ -1,0 +1,1 @@
+{"v":1,"type":"events","report_id":"5b0c4e6d-2a3f-4b5c-9d6e-4f6a8b0c2d14","collected_at":1795622400,"events":[{"event_id":"1f2a3b4c-5d6e-4f70-8a9b-0c1d2e3f4a5b","at":1795622300,"kind":"agent_error","severity":"warning","detail":{"message":"disk full while writing spool"}}]}

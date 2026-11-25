@@ -8,10 +8,14 @@
   "properties": {
     "v": {"const": 1},
     "error": {
-      "enum": ["invalid_request", "unauthorized", "unknown_node", "revoked_key",
-               "bad_signature", "stale_timestamp", "replay", "sequence_conflict",
-               "identity_mismatch", "rate_limited", "payload_too_large",
-               "unsupported_version", "upgrade_required", "storage_unavailable"]
+      "enum": ["invalid_request", "method_not_allowed", "endpoint_not_found",
+               "missing_header", "duplicate_header", "invalid_header",
+               "unsupported_encoding", "unauthorized", "unknown_node", "revoked_key",
+               "pending_activation", "bad_signature", "stale_timestamp", "replay",
+               "nonce_reuse", "sequence_conflict", "stale_boot", "identity_mismatch",
+               "report_conflict", "token_invalid", "token_expired", "token_used",
+               "rate_limited", "payload_too_large", "unsupported_version",
+               "upgrade_required", "storage_unavailable"]
     },
     "retryable": {"type": "boolean"},
     "server_time": {"type": "integer", "minimum": 0}

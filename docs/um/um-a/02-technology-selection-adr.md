@@ -31,13 +31,31 @@ Decision: one statically linked Go binary (`um-agent`) for Linux (amd64 + arm64)
 systemd service, dedicated non-login user, no listening socket, no root/sudo, no
 `sbox-cm` socket access. It reads only the reviewed local read-only surfaces
 (sing-box `service.api` on loopback, optional Mihomo controller loopback GET,
-`/proc`, `systemctl is-active` for the two monitored units) and writes only its
-own private state/spool directory.
+`/proc`, read-only systemd D-Bus unit properties) and writes only its own private
+state/spool directory.
+
+Provisioning is a **one-time root orchestration, never a resident root agent**:
+the reviewed installer runs `um-agent enroll --token-stdin` as `umagent` via
+`runuser`, feeding the root-only token over a pipe; the agent generates its own
+key and owns its state directory; the root installer deletes the token afterwards.
+Existing Monitor/sing-box/`sbox-cm` file permissions are never loosened; the
+sing-box API credential is delivered by systemd `LoadCredential=` (the agent
+process never runs as root and never executes a shell).
+
+The agent is **no-exec by construction**: `SystemCallFilter` denies
+`execve`/`execveat` (plus `NoExecPaths=/` where supported). It therefore does not
+call `systemctl`; unit state comes from restricted read-only D-Bus property reads
+(`ActiveState`), and is `unknown` when unavailable. The sing-box client implements
+only the audited read-only started-service subscription methods; there is no
+generic RPC surface and no config-mutation call. UM-B must record the audited
+sing-box version, method allowlist and a negative test.
 
 Alternatives rejected: running the existing Python collector on every VPS
 (duplicates runtime/venv, needs per-VPS Python management); root-side journal
 reader (privilege and #33 ownership; forbidden in doc 01 §7); a central SSH
-polling model (requires centralized credentials — explicitly out of bounds).
+polling model (requires centralized credentials — explicitly out of bounds);
+running a resident collector/agent as root or executing `systemctl` from a
+non-root agent (violates least privilege/no-exec).
 
 ## ADR-UM-003 — Frontend: **Vue 3 + TypeScript + Vite + uPlot, embedded static assets**
 
@@ -63,8 +81,9 @@ with `modernc.org/sqlite` (pure Go, no CGO) so the center stays a static binary.
 All SQL lives behind a small storage interface so a future PostgreSQL backend
 does not change handlers/contracts.
 
-Configuration: `journal_mode=WAL`, `synchronous=NORMAL` (durability target RPO
-24 h for backups; per-report durability is not required), `foreign_keys=ON`,
+Configuration: `journal_mode=WAL`, `synchronous=FULL` (fsync on every commit —
+the prior `NORMAL` consideration is rejected because an `accepted` ACK must
+survive OS/power loss; see protocol doc 04 §6.2), `foreign_keys=ON`,
 `busy_timeout` bounded, `wal_autocheckpoint` tuned, periodic checkpoint,
 `VACUUM`/incremental-vacuum policy for retention. Files 0600 in a 0700 data
 directory; DB on the local SSD only.
@@ -81,32 +100,45 @@ transaction > 50 ms; need for concurrent writers (separate web/ingest processes)
 or a true HA/read-replica requirement. A migration plan must be reviewed as its
 own phase before any switch.
 
-## ADR-UM-005 — Deployment: **systemd on the center VPS + Cloudflare Tunnel for web only**
+## ADR-UM-005 — Deployment: **systemd on the center VPS; public entries are a deployment choice**
 
 Decision: Debian/Ubuntu LTS center host; center and cloudflared run as systemd
 services; no containers, no Kubernetes, no reverse proxy fleet, no message
-queue. Web admin listener is bound to loopback and published only through
-cloudflared (`monitor.132431.xyz`, Cloudflare Tunnel + Access). Machine ingress
-is a separate TLS listener published directly on `ingest.132431.xyz:8443`
-(DNS-only, no Cloudflare proxy), so node telemetry is not decrypted by the
-Cloudflare edge and the two entries never share routing or auth code.
+queue. The center binary has two independent HTTP listeners/handler stacks; the
+public exposure of each is a **deployment choice** (owner decision, doc 07):
 
-Rejected: Docker/Compose (no isolation need that systemd sandbox does not cover;
-extra attack surface and ops); nginx as a public reverse proxy (unnecessary —
-cloudflared terminates the public path); exposing the web port directly.
-Cloudflare's Tunnel/Access is chosen for the single public admin entry; it is a
-gateway, never the sole authentication (see ADR-UM-006).
+- **Option A (preferred evaluation): both entries via Cloudflare Tunnel.**
+  `monitor.132431.xyz` uses Tunnel + Access; `ingest.132431.xyz` uses a second
+  tunnel hostname **without** Access and forwards to a loopback ingest listener.
+  No public inbound port; Cloudflare terminates TLS, so the monitoring payload is
+  readable by the Cloudflare edge while the node signature still provides
+  end-to-end authenticity/integrity. The ingest listener keeps no cookies/HTML/
+  session semantics.
+- **Option B: direct TLS for the machine entry.** `ingest.132431.xyz` is DNS-only
+  and the center exposes `8443/tcp` with TLS 1.3; the payload stays end-to-end
+  encrypted to the center, at the cost of a publicly reachable listener that must
+  absorb unauthenticated traffic.
+
+Both options use the identical frozen protocol (doc 04); the design does not
+depend on which transport is selected. Rejected: Docker/Compose (no isolation need
+that systemd sandbox does not cover; extra attack surface and ops); a public
+nginx reverse proxy (unnecessary); exposing the web listener on a public port.
+Cloudflare's Tunnel/Access is a gateway for the **web** entry, never the sole
+authentication.
 
 ## ADR-UM-006 — Identity and cryptography
 
 - **Node identity:** Ed25519 keypair generated on the node; private key never
-  leaves the node; each report carries an Ed25519 signature over a frozen
-  signing string that includes the SHA-256 of the exact body bytes. The center
-  stores only public keys. Keys are per node, rotatable and revocable.
-- **Transport:** TLS 1.3 for machine ingress with a public-CA-validated server
-  certificate for the ingest hostname (hostname checked; no plaintext fallback).
-  An optional SPKI pin is recorded at enrollment for strict deployments; it is
-  not required by default so certificate renewal does not lock out agents.
+  leaves the node; every request's signature is a **transport header** over a
+  frozen signing string that binds protocol version, endpoint, method, path,
+  identity fields, time, sequence, nonce, content encoding and the SHA-256 of the
+  exact decoded body bytes. No signed body contains a signature field (the
+  enrollment circular dependency is removed). The center stores only public keys;
+  keys are per node, rotatable and revocable.
+- **Transport:** HTTPS over TLS 1.3 with a server certificate for the ingest
+  hostname, public-CA validation and hostname checking (no plaintext fallback; the
+  chosen public path is Option A or B from ADR-UM-005). An optional SPKI pin is
+  recorded at enrollment for strict deployments.
 - **Admin credentials:** Argon2id password hashes (Go `x/crypto`), TOTP
   RFC 6238 (6 digits/30 s, one-window skew, single-use counter tracking),
   one-time recovery codes stored hashed, TOTP secrets encrypted at rest with a

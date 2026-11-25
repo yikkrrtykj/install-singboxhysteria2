@@ -1,42 +1,412 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://um.invalid/contracts/v1/report-events.schema.json",
-  "title": "UM v1 report body: bounded fault/agent event timeline",
+  "title": "UM v1 report body: bounded fault/agent events with closed per-kind detail",
   "type": "object",
   "additionalProperties": false,
-  "required": ["v", "type", "generated_at", "events"],
+  "required": [
+    "v",
+    "type",
+    "report_id",
+    "collected_at",
+    "events"
+  ],
   "properties": {
-    "v": {"const": 1},
-    "type": {"const": "events"},
-    "generated_at": {"type": "integer", "minimum": 0, "maximum": 1000000000000},
+    "v": {
+      "const": 1
+    },
+    "type": {
+      "const": "events"
+    },
+    "report_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "collected_at": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 1000000000000
+    },
     "events": {
-      "type": "array", "minItems": 1, "maxItems": 50,
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 50,
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["event_id", "at", "kind", "severity", "detail"],
+        "required": [
+          "event_id",
+          "at",
+          "kind",
+          "severity",
+          "detail"
+        ],
         "properties": {
           "event_id": {
             "type": "string",
             "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
           },
-          "at": {"type": "integer", "minimum": 0, "maximum": 1000000000000},
-          "kind": {"enum": ["service_restart", "service_failure", "protocol_outage",
-                            "protocol_recovery", "agent_started", "agent_error",
-                            "config_update", "clock_skew", "spool_overflow"]},
-          "severity": {"enum": ["info", "warning", "critical"]},
-          "detail": {
-            "type": "object",
-            "maxProperties": 8,
-            "additionalProperties": {
-              "oneOf": [
-                {"type": "boolean"},
-                {"type": "integer", "minimum": -9007199254740991, "maximum": 9007199254740991},
-                {"type": "number"},
-                {"type": "string", "maxLength": 64}
-              ]
+          "at": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 1000000000000
+          },
+          "kind": {
+            "enum": [
+              "service_restart",
+              "service_failure",
+              "protocol_outage",
+              "protocol_recovery",
+              "agent_started",
+              "agent_error",
+              "config_update",
+              "clock_skew",
+              "spool_overflow"
+            ]
+          },
+          "severity": {
+            "enum": [
+              "info",
+              "warning",
+              "critical"
+            ]
+          },
+          "detail": true
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "kind": {
+                  "const": "service_restart"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "detail": {
+                  "$ref": "#/$defs/detail_service_restart"
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "kind": {
+                  "const": "service_failure"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "detail": {
+                  "$ref": "#/$defs/detail_service_failure"
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "kind": {
+                  "const": "protocol_outage"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "detail": {
+                  "$ref": "#/$defs/detail_protocol"
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "kind": {
+                  "const": "protocol_recovery"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "detail": {
+                  "$ref": "#/$defs/detail_protocol_recovery"
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "kind": {
+                  "const": "agent_started"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "detail": {
+                  "$ref": "#/$defs/detail_agent_started"
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "kind": {
+                  "const": "agent_error"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "detail": {
+                  "$ref": "#/$defs/detail_agent_error"
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "kind": {
+                  "const": "config_update"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "detail": {
+                  "$ref": "#/$defs/detail_config_update"
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "kind": {
+                  "const": "clock_skew"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "detail": {
+                  "$ref": "#/$defs/detail_clock_skew"
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "kind": {
+                  "const": "spool_overflow"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "detail": {
+                  "$ref": "#/$defs/detail_spool_overflow"
+                }
+              }
             }
           }
+        ]
+      }
+    }
+  },
+  "$defs": {
+    "service_name": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^[a-z0-9][a-z0-9._-]*$"
+    },
+    "inbound_tag": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "protocol_kind": {
+      "enum": [
+        "reality",
+        "hysteria2",
+        "other"
+      ]
+    },
+    "protocol_reason": {
+      "enum": [
+        "timeout",
+        "tls_failed",
+        "auth_failed",
+        "service_inactive",
+        "source_unavailable",
+        "unavailable",
+        "unknown"
+      ]
+    },
+    "detail_service_restart": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "service"
+      ],
+      "properties": {
+        "service": {
+          "$ref": "#/$defs/service_name"
+        },
+        "duration_s": {
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000000000
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "detail_service_failure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "service",
+        "reason"
+      ],
+      "properties": {
+        "service": {
+          "$ref": "#/$defs/service_name"
+        },
+        "reason": {
+          "enum": [
+            "exit_nonzero",
+            "start_timeout",
+            "source_unavailable",
+            "unknown"
+          ]
+        }
+      }
+    },
+    "detail_protocol": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "inbound_tag",
+        "reason"
+      ],
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/protocol_kind"
+        },
+        "inbound_tag": {
+          "$ref": "#/$defs/inbound_tag"
+        },
+        "reason": {
+          "$ref": "#/$defs/protocol_reason"
+        }
+      }
+    },
+    "detail_protocol_recovery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "inbound_tag"
+      ],
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/protocol_kind"
+        },
+        "inbound_tag": {
+          "$ref": "#/$defs/inbound_tag"
+        }
+      }
+    },
+    "detail_agent_started": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "agent_version"
+      ],
+      "properties": {
+        "agent_version": {
+          "type": "string",
+          "maxLength": 32,
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$"
+        }
+      }
+    },
+    "detail_agent_error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code"
+      ],
+      "properties": {
+        "code": {
+          "enum": [
+            "spool_retention_failed",
+            "config_fetch_failed",
+            "source_unavailable",
+            "clock_untrusted",
+            "spool_write_failed"
+          ]
+        }
+      }
+    },
+    "detail_config_update": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "from_version",
+        "to_version"
+      ],
+      "properties": {
+        "from_version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "to_version": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "detail_clock_skew": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "skew_s"
+      ],
+      "properties": {
+        "skew_s": {
+          "type": "integer",
+          "minimum": -86400,
+          "maximum": 86400
+        }
+      }
+    },
+    "detail_spool_overflow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "dropped_records"
+      ],
+      "properties": {
+        "dropped_records": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000000
         }
       }
     }

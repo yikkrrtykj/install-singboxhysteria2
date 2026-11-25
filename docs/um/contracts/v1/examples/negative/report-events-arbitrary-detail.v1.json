@@ -1,0 +1,1 @@
+{"v":1,"type":"events","report_id":"4d9a6e8c-1f3b-4c5d-8e7a-2b4f6c8d0e13","collected_at":1795622400,"events":[{"event_id":"8f3c1d5a-9e4b-4a6c-8d0e-2f4a6b8c1d97","at":1795622200,"kind":"protocol_outage","severity":"warning","detail":{"kind":"reality","inbound_tag":"vless-in","reason":"timeout","error_text":"dial tcp 10.0.0.1:443: i/o timeout"}}]}

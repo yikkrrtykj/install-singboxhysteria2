@@ -1,173 +1,192 @@
-# UM-A 05 — Retention, capacity, database decision gate and backup/restore
+# UM-A 05 — Retention, capacity, database gate and backup/restore (revision 2)
 
-Status: design freeze for UM-A review. Numbers are **planning estimates** with
-stated assumptions; UM-B must validate them with real measurements and UM-E
-must prove the performance/capacity budget ([06](06-threat-model-security-tests-performance.md)).
+Status: design freeze for UM-A review; values marked "owner decision" are **not**
+approved yet. Revision after PR #126 review (P1-02 durability, P1-05 retention /
+capacity / backup / restore). Numbers are planning estimates to be measured by
+UM-B/UM-E.
 
-## 1. Data classes and retention (frozen)
+## 1. Retention policy: A vs B (owner decision, recommendation B)
 
-| Data class | Content | Retention | Notes |
+| Policy | Definition | Advantages | Costs |
 | --- | --- | --- | --- |
-| `node_latest` + `node_services` + `node_protocols` + `node_traffic` | last authenticated snapshot projection | current only; row removed 30 d after last accepted report / node retire | upsert idempotent; no history |
-| `metric_minute` | per-node minute rollups | **30 days** | 1 row/node/collection minute |
-| `protocol_minute` | per-node per-protocol minute state + traffic deltas | **30 days** | ≤4 protocols/node |
-| `client_hourly` | top-N pseudonymous client summaries (aggregates only) | **30 days** | per node per hour; old hours may be compacted first under disk pressure |
-| `events_history` | fault/incident/agent events timeline | **30 days** | fault timeline source for UM-D |
-| `incidents` | derived incident open/close groups | **30 days** | rules owned by UM-D; never delete open incidents |
-| `reports_dedupe` | replay/sequence dedupe keys + body hashes | **10 minutes** | bounded; may be memory-backed |
-| `enroll_tokens` | token hashes | deleted on use or TTL expiry | single-use |
-| `node_keys` | node public keys + revocation/rotation metadata | with node identity; revocation record 30 d after event purge | needed for audit/forensics |
-| `audit_log` | administrative/security audit | **180 days** (size-bounded, configurable down, never below 30) | actor/target/action/result only |
-| `sessions` | server-side sessions | expire (15 min idle / 8 h absolute) | in DB or memory; deletion on expiry |
-| `events` | event catalog | until purge | archived events keep history aging out |
-| `retention_runs`, `schema_migrations` | maintenance state | current | — |
+| **A** | All telemetry rows are retained 30 days by `collected_at`, independent of event state. | Simple, bounded, predictable. | An archived event gets no extra history beyond its 30-day rolling window; almost half of an archived event's last month may already be expired at archive time. |
+| **B (recommended)** | Active event: rolling 30 days by `collected_at`. On archive at T, the remaining history is kept until **T + 30 days** (no new ingest); then it is deleted until the event is purged. | Fulfils "history remains queryable after the event ends / nodes destroyed" without indefinite storage. | Worst case doubles storage when many events archive near each other; needs a clear overlap cap. |
 
-Hard rule: **every data row that belongs to an event is deleted by the 30-day
-retention boundary except an explicitly archived/preserved event catalog row.**
-"Node destroyed"/"event ended" does not shorten history: history remains
-queryable until its own 30-day age-out (owner requirement).
+**Recommendation: B with an explicit overlap cap.** A single event can occupy at
+most 60 days of its own history (30 rolling + ≤30 archive tail). Total storage in
+the worst case is therefore ≤2× the active-only estimate. The owner must confirm
+B and the overlap rule (doc 07 Q-RET). Until confirmed, UM-B must not implement
+either deletion policy beyond the class table below.
 
-## 2. Deletion rules (frozen)
+Frozen rules for policy B (if approved):
 
-1. **Age-out**: an hourly (configurable to 15 min) retention job deletes rows of
-   each class whose timestamp is older than the class cutoff. Deletion is
-   per-class and bounded per run (e.g. ≤50 000 rows/transaction) so a large purge
-   never blocks ingest for long; the job resumes until caught up. It is
-   idempotent and restart-safe.
-2. **Open incidents are never age-pruned**; closed incident rows age out by
-   `closed_at`.
-3. **Event archive**: stops ingestion and admin listing defaults to hidden;
-   history remains queryable to the 30-day boundary. Archiving is reversible by
-   platform_admin (audited).
-4. **Event purge**: only for an archived event; requires platform_admin and an
-   explicit type-to-confirm name. One transaction deletes event-scoped data
-   (nodes, keys, reports, state, rollups, events, incidents); a bounded purge
-   audit record (event id, actor, counts, timestamps — no content) is retained
-   for 180 days. Backups already written are not rewritten; they age out under
-   backup retention (restore of a purged event must be an explicit owner
-   operation, documented).
-5. **Node retire**: sets node state `retired`, rejects reports, keeps history
-   until its age-out; latest-state rows removed after 30 d.
-6. **Key revocation**: key row and audit record retained with the node identity;
-   reports rejected immediately.
-7. **No "cleanup newest-first"** and no per-table independent cutoff that can
-   leave newer rows deleted while older rows survive: within a class, deletion is
-   strictly oldest-first; cross-class ordering is irrelevant because classes
-   have different cutoffs.
-8. **Retention failure is soft and visible**: a failed run records a closed
-   error code, increments a failure counter, raises a degraded flag, and retries
-   next schedule. It never crashes the center and never silently skips forever.
-9. **Disk-pressure override**: if the disk is critically low, the center drops
-   *client-summary granularity* first, then *metric granularity* (see §4), and
-   alerts; it never deletes data inside the last 24 hours and never deletes
-   `events_history` before its 30-day boundary.
+- Event archive stops ingest and starts the archive tail: no row older than
+  `archive_time + 30 d` survives; rows newer than the archive time do not exist.
+- A node destroyed while its event is active keeps its history under the active
+  event's rolling/archive rules — destroy does not shorten retention.
+- Open incidents are never pruned; once closed they age out by `closed_at`
+  (active) or by the archive-tail boundary.
+- Purge (explicit, type-to-confirm) deletes immediately regardless of age and
+  records a purge tombstone (event id, actor, time, counts; no content) retained
+  180 days.
+- The event catalog row survives its data until purge (so an archived event can
+  still be listed).
 
-## 3. Capacity model (planning, to be measured)
+## 2. Data classes and exceptions (single source of truth)
 
-### 3.1 Assumptions
-
-| Input | Assumption | Source/status |
+| Data class | Retention (policy B) | Exceptions / notes |
 | --- | --- | --- |
-| Events | up to 10 | planning ceiling |
-| Nodes | up to 200 (planning); 500-node stress in UM-E | planning ceiling |
-| Protocols monitored per node | 2 typical (Reality + HY2), max 4 | campaign architecture #48 |
-| Agent cadence | 60 s snapshot + 60 s minute metric + events as they happen | doc 04 (agent-controlled, center-configurable 30–300 s) |
-| Client summaries | top 50 `device_ref` refs/node/hour + aggregate counts | privacy design (doc 04) |
-| Retention | 30 d metric/protocol/client/events | owner requirement |
-| Average node DB row | ~120 B including index overhead (to be measured) | estimate |
-| Report ingress body | ≤32 KiB snapshot, ~2 KiB typical | doc 04 |
-| Per-node network | ≤20 MB/day (assumption, to be measured) | estimate |
+| latest state (`node_latest`, services/protocols/traffic) | current; removed 30 d after last accepted report or node retire | replaced only by newer `collected_at`; stale snapshots are `stale_ignored` |
+| `metric_minute`, `protocol_minute`, `client_hourly` | active: 30 d rolling; archived: until T+30 | disk-pressure degradation may reduce granularity, never below the last 24 h |
+| `events_history`, `incidents` | same 30 d / T+30 | open incidents never pruned |
+| `report_dedupe` | 8 d | needed to dedupe spool replay (7 d spool + margin) |
+| `nonce_dedupe` | 24 h | transport replay window |
+| `boot_registry` | with node identity; bounded last 8 boots | retired boots rejected as `stale_boot` |
+| `node_seq` | current only | persisted for center-restart recovery |
+| `node_keys` | with node identity; revocation record 30 d after purge | audit/forensics |
+| `audit_log` | 180 d (owner decision Q-AUD; configurable down, never below 30) | security audit, size-bounded |
+| `enroll_tokens` | deleted on use/expiry | hash only |
+| `sessions`, `recovery_codes` | expire / one-time | not archived |
+| backups | see §6 | not a second history store |
 
-### 3.2 Steady-state sizing (200 nodes)
+No document may define a different retention for these classes; this table is
+normative for UM-B..UM-E and is duplicated only by reference.
+
+## 3. Deletion rules (normative)
+
+1. Hourly retention job (configurable to 15 min): per class, delete rows older
+   than the class cutoff; bounded batches (≤50 000 rows/transaction) so ingest is
+   never blocked; resumable and idempotent; strictly oldest-first within a class.
+2. Open incidents and unexpired audit rows are excluded; purge is the only way to
+   delete event data earlier.
+3. Event archive/purge/retire and key revocation are written to the audit log and
+   to a separate **security ledger** (see §6.4) that is included in backups and
+   in the owner's off-host copies.
+4. Retention failure is soft and visible: closed error code, failure counter,
+   degraded flag, retry next schedule; never crash and never silently skip.
+5. Disk pressure order: (a) client summaries older than 7 d → daily aggregates;
+   (b) metric rollups older than 7 d → 5-minute granularity; (c) stop accepting
+   client summaries; (d) write only latest snapshots + events. Never delete data
+   <24 h old; never delete `events_history` before its policy boundary; always
+   raise an alert.
+6. After a large purge, full `VACUUM` is scheduled (SQLite cannot otherwise
+   return pages from the middle/oldest end to the OS); `auto_vacuum` incremental
+   is enabled but full VACUUM is the guaranteed shrink step.
+
+## 4. Capacity model (planning; measure in UM-B/UM-E)
+
+Assumptions: 10 events, 200 nodes planning ceiling (500-node stress in UM-E),
+2 protocols/node typical (max 4), 60 s cadence, client summaries top-50
+`device_ref`/node/hour, average DB row ~120 B incl. index (to be measured).
 
 Rows/day/node: metrics 1 440 + protocol 2 880 + client 1 200 + events ~50 ≈
-**5 570**. At 200 nodes: ~1.11 M rows/day → **33.4 M rows / 30 d**.
-At ~120 B average (incl. indexes): ≈4.0 GB raw + SQLite overhead/WAL ≈
-**5.0–6.0 GB DB at 30 days**. At 500 nodes: ≈12.5 GB (still below the
-PostgreSQL gate, but the 40 GB disk budget must be re-checked with backups).
+**5 570**. At 200 nodes: 1.11 M/day → **33.4 M rows / 30 d ≈ 5–6 GB**.
 
-Ingest load: 200 nodes × ~2 requests/min ≈ **6.7 req/s** steady, with bursts
-≤50 req/s; a single small center handles this comfortably. Ingress bandwidth
-≈ 200 × (32 KiB + 2 KiB + events) per minute ≈ **0.3 MB/s** worst case.
+Policy A: ~5–6 GB. Policy B worst case: ≤2× ≈ **10–12 GB** plus indexes/overhead
+(~12–14 GB). At the 500-node UM-E stress with policy B: ~30 GB — **above the
+40 GB budget when backups are included**, so either the stress target is smaller,
+the disk is enlarged, or PostgreSQL/retention tuning is decided by the owner. This
+is explicitly a design gate, not an assumption that 500 nodes fit on 40 GB.
 
-### 3.3 40 GB disk budget (200 nodes)
+40 GB disk budget (200 nodes, policy B worst case):
 
 | Item | Budget |
 | --- | --- |
-| OS + packages + Go binary + logs | ≤8 GB |
-| SQLite DB (30-day data) | ≤6 GB |
-| WAL + temp | ≤1 GB |
-| Backups (2 compressed local) | ≤4 GB |
-| Headroom / growth | remaining ≥20 GB |
+| OS + packages + binary + logs | ≤8 GB |
+| SQLite DB (policy B worst case) | ≤14 GB |
+| WAL + temp (bounded checkpoint) | ≤1 GB |
+| Backups (2 local, compressed) | ≤6 GB |
+| Headroom / growth | remaining ≈11 GB |
 
-Alarm thresholds: warn at 70 % used; reduce client granularity at 80 %; reduce
-metric granularity at 90 %; emergency write-only-latest at 95 % (see §4); never
-reclaim below the last-24 h or the 30-day events contract.
+Alarm thresholds: warn at 70 % used; granularity degradation at 80 %; stop
+client summaries at 90 %; emergency latest-only at 95 %. No backup may fill the
+disk below the emergency floor; a failed backup is reported, not silently
+overwritten.
 
-### 3.4 Capacity limits enforced by the center
+Ingest load: 200 nodes × ~2 requests/min ≈ 6.7 req/s steady; a single small center
+is sufficient. `synchronous=FULL` adds one fsync per report; at this rate it is
+well within the performance budget (doc 06); UM-B must measure p95 commit latency
+and, if needed, use SQLite group commit **only** if every ACK still follows a
+durable commit.
 
-- Per-node report rate limit (doc 04 §9); global ingest concurrency and body
-  caps; per-event node quota (default 100, configurable by platform_admin).
-- Client summaries: bounded top-N (50) per node per hour; overflow becomes
-  aggregate counts only, never raw identifiers.
-- `detail` maps in events bounded (≤8 scalars, ≤64 chars each).
-- Purge/retention batch bounds; backup concurrency 1.
-- No unbounded JSON blobs, no per-connection raw storage.
+## 5. Database gate (SQLite → PostgreSQL)
 
-## 4. Database decision gate (SQLite → PostgreSQL)
-
-v1 uses SQLite WAL with a single writer process
-([ADR-UM-004](02-technology-selection-adr.md)). The storage interface keeps SQL
-portable. A PostgreSQL migration (its own reviewed phase) is triggered when any
-of the following is measured/decided:
+v1: SQLite WAL, single writer process, `synchronous=FULL`. PostgreSQL migration
+(its own reviewed phase) when any is measured/decided:
 
 | Trigger | Threshold |
 | --- | --- |
 | Sustained write rate | >50 writes/s for 1 h at the planning ceiling |
-| Database size | >24 GB with the 30-day contract intact and backups on the same disk budget |
-| Write latency | p95 write transaction >50 ms for 1 h |
-| Concurrency need | separate web/ingest/worker *processes* must write concurrently |
-| Availability need | multi-instance / read replica / HA required by owner |
-| Operational incident | SQLite corruption/lock incident that cannot be prevented structurally |
+| DB size | >24 GB with the retention contract intact (policy B on 40 GB disk requires owner sizing first) |
+| Write latency | p95 durable commit >50 ms for 1 h |
+| Concurrency | separate processes must write concurrently |
+| Availability | multi-instance/replica/HA required |
+| Operational | SQLite corruption/lock incident not structurally preventable |
 
-Before the gate, the center must remain a single-writer process; if a second
-writer is proposed, PostgreSQL (or a redesign) is required first.
+## 6. Backup and restore
 
-## 5. Backup and restore (frozen targets)
+### 6.1 RPO/RTO (split by failure class; owner decision Q-BACKUP)
 
-| Property | Value |
-| --- | --- |
-| Method | SQLite online consistent backup (`VACUUM INTO` or backup API) from the live DB; no file copy of a hot WAL DB |
-| Schedule | nightly 03:00 center-local time (configurable), plus an immediate backup before every schema migration |
-| Verification | `PRAGMA integrity_check` (or `quick_check`) + table/schema shape check + SHA-256 manifest per backup |
-| Encryption | backup encrypted **before** leaving the center host; owner-held key (age or equivalent AEAD tooling chosen in UM-E), never plaintext off-host |
-| Local retention | 2 most recent verified backups (compressed target ≤4 GB total at 200 nodes) |
-| Off-host | owner-initiated pull (no center-held off-host credentials), weekly, retained by owner |
-| RPO | ≤24 h |
-| RTO | ≤2 h for a single-host restore to the same release |
-| Restore drill | at least once per phase UM-E, plus after any schema migration; restore must be proven, not assumed |
-| Restore secrets | DB contains encrypted TOTP secrets; the master key lives outside the backup and is required to restore admin TOTP (owner-secured, documented) |
-| Rollback | binary rollback within the same DB schema is supported; DB schema downgrade is refused (pre-migration backup is the only downgrade path, mirroring the audited `monitor-v2` discipline) |
+| Failure | Data loss target (RPO) | Recovery time (RTO) |
+| --- | --- | --- |
+| Center process crash / bad deploy | 0 (committed data survives via WAL FULL + pre-migration snapshot) | <30 min |
+| Center host disk/host failure (same VPS restorable) | ≤24 h if the latest **verified backup can be restored from the local/off-host copy** | ≤2 h |
+| **Whole VPS permanently lost** | **must be agreed by the owner.** If the owner requires ≤24 h, the center must push a daily encrypted backup to owner-controlled storage (or the owner pulls daily); a weekly manual pull implies **RPO = 7 d** for whole-VPS loss and must be stated that way, not as 24 h. | ≤1 business day with owner-provided host |
 
-Backup content excludes: node private keys (never at center), Cloudflare tunnel
-token, master key, session/CSRF tokens. Backups include the full monitoring DB
-with audit and (encrypted) TOTP secrets.
+Frozen minimum without new credentials: local/failure RPO 24 h; whole-VPS RPO =
+last owner off-host copy. A daily off-host copy is the recommended owner decision
+(push to owner-controlled storage with a restricted write-only credential, or
+owner daily pull); it must not store center/VPS credentials.
 
-## 6. Center self-monitoring and alerts
+### 6.2 Backup mechanics
 
-- Internal health (`/internal/health`, loopback-only): DB open/WAL, retention
-  last success, backup last success, disk free, ingest queue depth, auth failures
-  rate, clock offset — closed codes only, no secrets.
-- Owner-facing alerts (out of band, UM-E decides: email/webhook) for: disk ≥70 %,
-  retention failure ≥2 runs, backup failure, node stale >15 min (per node),
-  ingest 5xx rate, repeated signature failures, event purge executed.
-- UM-E must run a 30-day simulated/accelerated retention cycle and a restore
-  drill before production authorization.
+- Nightly (and pre-migration) SQLite consistent backup (`VACUUM INTO`/backup API),
+  `integrity_check`/`quick_check` + schema/table-shape check, SHA-256 manifest,
+  compressed, then encrypted before leaving the center host (owner-held key; age
+  or AEAD tooling chosen in UM-E).
+- Local retention: 2 verified compressed backups (≤6 GB total at 200 nodes).
+- Off-host: owner-decided (see §6.1); owner verifies and retains. If a daily push
+  is selected, the center holds only a write-only/duplicate-preventing
+  destination credential — never a VPS/root credential.
+- Backups exclude node private keys (never at center), tunnel token, master key
+  and session/CSRF tokens. TOTP secrets are inside the DB encrypted with the
+  master key; restore therefore requires the separately stored master key.
+- Restore drill: at least once per phase UM-E, after every schema migration, and
+  before production authorization; measure actual RTO and record it.
 
-## 7. Explicit non-goals
+### 6.3 Restore must not revive revoked nodes or purged data
 
-- No indefinite raw telemetry, no connection-level history, no raw packet/log
-  storage, no per-client credentials or full YAML in history.
-- No switching to PostgreSQL, no HA/clustering, no remote object storage in
-  UM-A..UM-E without a separate owner-approved design.
-- No backup of VPS root credentials (none exist centrally).
+A restore is a point-in-time rollback and can resurrect identities/data revoked
+or purged after the backup was taken. Frozen procedure:
+
+1. Maintain an append-only **security ledger** (`security-ledger.jsonl`, closed
+   events: node revoke/retire, key revoke, event archive/purge/restore, admin
+   account changes) that is included in every backup and every off-host copy,
+   with a monotonic sequence and checksum.
+2. A restore starts in **quarantine**: ingest disabled, web in maintenance, no
+   agent traffic, and the restored DB is compared against the latest available
+   security ledger (prefer the off-host copy).
+3. Replay ledger events newer than the backup (or, at minimum, re-apply the
+   listed revocations/purges) before ingest is re-enabled; if the operator cannot
+   prove the ledger is complete, the restore remains quarantined and the owner
+   decides (default: do not re-enable).
+4. Restoring a backup that predates a purge requires explicit owner confirmation
+   and is audited; the purged data may only reappear with that approval.
+5. Any restored identity that is not in the ledger but whose revocation is
+   suspected must be treated as revoked until proven otherwise (fail-closed).
+
+### 6.4 Center self-monitoring
+
+Loopback-only health: DB open/WAL, last retention success, last backup success +
+integrity, disk free, ingest queue depth, auth failure rate, clock offset —
+closed codes only. Owner alerts for disk ≥70 %, 2 consecutive retention failures,
+backup failure, node stale >15 min, ingest 5xx rate, repeated signature failures,
+purge/restore events. UM-E must run an accelerated 30-day retention cycle and a
+restore+ledger drill before production authorization.
+
+## 7. Non-goals
+
+No indefinite raw telemetry, no connection-level history, no raw packet/log
+storage, no per-client credentials or YAML; no PostgreSQL/HA/object storage switch
+without a new owner-approved design; no backup of VPS root credentials (none
+exist centrally).

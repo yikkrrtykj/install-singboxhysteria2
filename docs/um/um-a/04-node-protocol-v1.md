@@ -1,315 +1,439 @@
-# UM-A 04 — Node protocol v1 (FROZEN contract)
+# UM-A 04 — Node protocol v1 (FROZEN contract, revision 2)
 
-Status: **FROZEN for UM-B implementation**, subject to the UM-A independent
-review. An incompatible change requires an explicit design revision review; the
-machine-readable schemas and test vector in
-[../contracts/v1/](../contracts/v1/) are part of this contract, not illustrative
-examples.
+Status: **FROZEN for UM-B implementation**, revision after the PR #126 architecture
+review (P0-01, P1-01, P1-02, P1-03, P1-04, P1-06). The machine-readable schemas
+and vectors in [`../contracts/v1/`](../contracts/v1/) are normative parts of this
+contract. An incompatible change requires an explicit design-revision review.
 
-Related threat analysis: [06](06-threat-model-security-tests-performance.md).
-Storage/retention consequences: [05](05-retention-capacity-backup.md).
+Related: trust boundaries [03](03-architecture-and-trust-boundaries.md), privacy
+and retention [05](05-retention-capacity-backup.md), threat/tests
+[06](06-threat-model-security-tests-performance.md), review response matrix
+[08](08-review-response-matrix.md).
 
-## 1. Transport and endpoints
+## 0. Fixed design decisions for this revision
 
-- Agent → center: HTTPS over TLS 1.3, HTTP/1.1 with keep-alive, JSON UTF-8.
-- Base URL from provisioning config: `https://ingest.132431.xyz:8443` (owner may
-  change host/port at deployment; the contract is origin-independent).
-- TLS: public-CA-validated certificate for the ingest hostname (agent MUST NOT
-  disable verification, MUST NOT allow a plaintext fallback or redirect). An
-  optional `center_spki_sha256` pin may be configured for strict deployments;
-  the pin is recorded at enrollment.
-- The machine plane is **not** behind Cloudflare Access and has no cookies,
-  sessions, CSRF, HTML or browser semantics.
+| Review item | Resolution in this contract |
+| --- | --- |
+| P0-01 enrollment signature circular dependency | Signature is a **transport header**; no signed body contains a signature field. Enrollment has its own signing string. Full positive and negative vectors are committed. |
+| P1-01 HTTP operation binding | Signing input binds endpoint, method, path, protocol version, identity, key, boot, sequence, sent time, nonce, content encoding and SHA-256 of the decoded body. Per-endpoint request/response semantics and error vocabulary are frozen. |
+| P1-02 offline replay/durability | Payload identity (`report_id`, `collected_at`) is separated from per-attempt authentication (`sent_at`, `nonce`, `seq`, key); dedupe/sequence/boot state is persistent in SQLite with `synchronous=FULL`; ACK only after a durable commit; historical snapshot cannot overwrite newer latest state; state-transition and test tables included. |
+| P1-03 agent least privilege | One-shot root installer orchestrates enrollment without running agent logic as root; token crosses a pipe, never a non-root-readable file; agent runs unprivileged with `LoadCredential`, D-Bus read-only queries and no exec; data-source availability is explicit; unknown data is never faked. |
+| P1-04 center trust boundary | Single-process center is stated honestly: route/network isolation, **not** process isolation; DB and admin memory are shared. Security acceptance targets are revised accordingly; process-level split is an optional later decision. |
+| P1-06 privacy/schema | Closed per-kind event details, no arbitrary keys/text, nullable/unknown values, explicit availability, fixed integer/number overlap, sentinel negative contract, admin-side device aliases. |
 
-| Method | Path | Auth | Purpose |
+## 1. Transport, endpoints and machine-ingress options
+
+- Application protocol: HTTPS, HTTP/1.1 with keep-alive, JSON UTF-8, Ed25519
+  signatures over transport headers + decoded body bytes.
+- **Machine-ingress transport is a deployment choice, not a protocol change**:
+  - Option A (preferred evaluation): a second Cloudflare Tunnel hostname
+    (`ingest.132431.xyz`) without Access, forwarded to a loopback ingest listener.
+    No public inbound port; Cloudflare terminates TLS, so monitoring payload is
+    readable by the Cloudflare edge (privacy trade-off) while the node signature
+    still provides end-to-end authenticity/integrity.
+  - Option B: direct TLS 1.3 listener on `ingest.132431.xyz:8443` (DNS-only, no
+    proxy; public inbound port). Payload stays end-to-end encrypted to the center;
+    exposed listener must absorb unauthenticated traffic.
+  - The protocol below is identical for both; the center must bind the listener
+    to loopback for Option A and to the public interface for Option B. Owner
+    decides ([07](07-um-b-entry-and-review.md)); the security test plan covers
+    both.
+
+| Method | Path | Auth | Request body | Success response |
+| --- | --- | --- | --- | --- |
+| POST | `/v1/agent/enroll` | one-time bootstrap token + new-key signature headers | `enroll-request.schema.json` | `enroll-response.schema.json` (200) |
+| POST | `/v1/agent/report` | current node key signature headers | snapshot / metrics / events schema (by `type`) | `ack.schema.json` (200) |
+| POST | `/v1/agent/rotate` | **old** node key signature headers | `rotate-request.schema.json` | `rotate-response.schema.json` (200) |
+| POST | `/v1/agent/config` | current node key signature headers | empty body `{}` (0 bytes decoded) | `agent-config.schema.json` (200) |
+| — | anything else | — | — | `error.schema.json` with `endpoint_not_found`/`method_not_allowed` |
+
+No `/v1/agent/revoke` endpoint exists (admin-only web action). The ingest
+listener has no `/api/*` routes and no cookie/session/CSRF/HTML semantics; the web
+listener has no `/v1/agent/*` routes.
+
+TLS: server certificate validated against the system CA store with hostname
+checking; no plaintext fallback, no redirects. Optional strict-mode SPKI pin
+recorded at enrollment. Body limits: compressed ≤256 KiB, decoded ≤128 KiB,
+enroll ≤8 KiB, config response ≤16 KiB; header timeouts 5 s, body 10 s, handler
+10 s.
+
+## 2. Headers, duplicate-header rules and content encoding
+
+Every request must send exactly one of each listed header. Any duplicated
+`X-UM-*`, `Content-Encoding` or `Authorization` header, or an unknown `X-UM-*`
+header, is rejected with `400 duplicate_header` / `400 invalid_header`; the
+center inspects the raw header list, not a joined value.
+
+| Header | Endpoints | Grammar | Meaning |
 | --- | --- | --- | --- |
-| POST | `/v1/agent/enroll` | one-time bootstrap token (Bearer) + new-key signature | bind a new node identity to an event |
-| POST | `/v1/agent/report` | node signature headers | idempotent telemetry report |
-| POST | `/v1/agent/rotate` | old-key signature headers | rotate the node key |
-| POST | `/v1/agent/config` | node signature headers | fetch current agent config |
-| — | `/v1/agent/revoke` | **does not exist** | revocation is admin-only on the web plane |
+| `X-UM-Protocol` | all | `1` | wire protocol major |
+| `X-UM-Pubkey` | enroll only | base64url raw 32 B (43 chars) | new node key being enrolled |
+| `X-UM-Node-Id` | report/rotate/config | lowercase UUIDv4 | node identity |
+| `X-UM-Key-Id` | report/rotate/config | `key-[0-9a-f]{8}` | signing key id (`rotate` uses the old key) |
+| `X-UM-Boot-Id` | report/rotate/config | 32 lowercase hex | agent process generation |
+| `X-UM-Seq` | report/rotate/config | decimal uint64 ≥1 | monotonic per boot, per request attempt |
+| `X-UM-Sent-At` | all | decimal Unix seconds | **authentication time** (not payload age) |
+| `X-UM-Nonce` | all | base64url exactly 16 B (22 chars) | unique per request attempt |
+| `X-UM-Content-Encoding` | all | `identity` or `gzip` | **must be explicit**, even for identity |
+| `X-UM-Signature` | all | base64url 64 B (86 chars) | Ed25519 over the signing string |
+| `Content-Type` | all | `application/json` | required |
+| `Authorization` | enroll only | `Bearer <bootstrap-token>` | one-time enrollment token |
 
-Anything else on the ingest listener → 404. The ingest listener exposes no
-`/api/*` route; the web listener exposes no `/v1/agent/*` route (doc 03 §2).
+Content-encoding rules: exactly one coding token, `identity` or `gzip`; no
+stacked/`x-gzip`/`deflate`/transfer-encoding ambiguity; gzip must be a single
+member with no trailing data; decoding failure or a cap violation is
+`400 unsupported_encoding` / `413 payload_too_large` **before** parsing. The
+signature covers the **decoded body bytes**; the declared coding is bound in the
+signing string so a downgrade or label mismatch is rejected.
 
-## 2. Identities and enrollment
+## 3. Signing strings (normative)
 
-- `node_id`: lowercase UUIDv4, assigned by the center at enrollment.
-- `event_id`: assigned by the center from the bootstrap token's event; the agent
-  cannot choose or change it.
-- Node key: Ed25519. The agent generates the keypair locally; the private key
-  never leaves the node (0600). Public wire form is the raw 32-byte public key
-  encoded base64url without padding.
-- `key_id`: `key-` + 8 lowercase hex chars assigned by the center; a node has one
-  active key plus a rotation grace entry.
-- Bootstrap token: 256-bit random, base64url, event-scoped, **single use**,
-  TTL ≤ 15 minutes, stored at the center only as SHA-256 hash; delivered to the
-  VPS by the operator through a 0600 provisioning file and deleted by the agent
-  after successful enrollment.
+All strings are UTF-8 with LF separators and **no trailing newline**; each field
+is the exact header value. `sha256(body)` is the lowercase hex SHA-256 of the
+decoded body bytes.
 
-### Enrollment request
-
-`POST /v1/agent/enroll`, `Authorization: Bearer <bootstrap-token>`, body schema
-[`enroll-request.schema.json`](../contracts/v1/enroll-request.schema.json):
-
-```json
-{"v":1,"agent_version":"1.0.0","host":{"os":"linux","kernel":"6.8.0-45-generic","arch":"amd64"},
- "pubkey":"<base64url-32>","nonce":"<base64url-16>","signed_at":1795622400,
- "signature":"<base64url-ed25519>"}
-```
-
-Signature input (UTF-8): `um-enroll-v1\n<nonce>\n<signed_at>\n<sha256-hex(body-bytes)>`.
-The signature is over that exact string; the body bytes are the exact received
-body (no canonicalization, no re-serialization).
-
-Center checks, in order: token hash exists/unused/unexpired → token event active
-→ body size → grammar → timestamp ±300 s → signature with `pubkey` → event node
-capacity → store node/key/token-used atomically → respond.
-
-### Enrollment response
-
-Schema [`enroll-response.schema.json`](../contracts/v1/enroll-response.schema.json):
-
-```json
-{"v":1,"node_id":"<uuid>","event_id":"<uuid>","key_id":"key-1a2b3c4d",
- "config_version":1,"device_salt":"<base64url-32>","server_time":1795622402,
- "cadence_seconds":60,"center_spki_sha256":"<base64url-32-or-null>"}
-```
-
-The agent persists `node_id`, `key_id`, `event_id`, `device_salt` (0600),
-`center_spki_sha256` (if present), then deletes the bootstrap token. If the
-response is lost after the center committed, the token is already consumed: the
-agent retries enrollment → 401 `token_used`; the operator must issue a new token
-and the agent starts a new identity (no half-enrolled agent is accepted).
-
-## 3. Report envelope and signing (normative)
-
-Headers on `/v1/agent/report`, `/v1/agent/rotate`, `/v1/agent/config`:
-
-| Header | Grammar | Meaning |
-| --- | --- | --- |
-| `X-UM-Protocol` | `1` | protocol major |
-| `X-UM-Node-Id` | lowercase UUIDv4 | node identity |
-| `X-UM-Key-Id` | `key-[0-9a-f]{8}` | signing key id |
-| `X-UM-Boot-Id` | 32 lowercase hex | random per agent process start |
-| `X-UM-Seq` | decimal uint64 ≥ 1 | strictly increasing per boot |
-| `X-UM-Sent-At` | decimal Unix seconds | signed timestamp |
-| `X-UM-Nonce` | base64url, exactly 16 bytes | unique per request |
-| `X-UM-Signature` | base64url Ed25519 (64 bytes) | signature over the string below |
-| `Content-Type` | `application/json` | required |
-| `Content-Encoding` | `gzip` (optional) | compressed body transport |
-
-Signing string (exact bytes, UTF-8, LF `\n` separators, no trailing newline):
+Enrollment (signed with the key whose public part is in `X-UM-Pubkey`):
 
 ```text
-um-report-v1
-<node_id>
-<key_id>
-<boot_id>
-<seq>
-<sent_at>
+um-enroll-v1
+POST
+/v1/agent/enroll
+1
+<content-encoding>
+<pubkey-b64url>
+<sent-at>
 <nonce>
-<sha256-hex of the raw body bytes>
+<sha256-hex(body)>
 ```
 
-`X-UM-Signature = Ed25519_sign(node_private_key, signing_string_bytes)`.
-The body is signed as received: the center MUST verify over the exact bytes and
-only then parse JSON (it never re-serializes before verification). The bootstrap
-token and all secrets never appear in the signing string, headers or body except
-the one-time `Authorization` header at enrollment.
+Node-authenticated endpoints (signed with the key named by `X-UM-Key-Id`;
+`endpoint` is exactly `report`, `rotate` or `config`):
 
-Why this shape: it binds protocol/version, node identity, key, boot generation,
-sequence, time, anti-replay nonce and exact payload bytes. No JSON
-canonicalization is needed, so implementations cannot disagree about number or
-key formatting. This follows the audited #67 principle "sign the exact body
-bytes" without reusing its code or contract.
-
-## 4. Replay, sequence and idempotency rules
-
-Accepted time window: `|server_time - sent_at| ≤ 300 s`. Outside → `stale_timestamp`
-with `server_time` in the error body so the agent can recalibrate once.
-
-Dedupe keys (center memory or `reports_dedupe`, both bounded):
-`(node_id, nonce)` for ≥10 min and `(node_id, boot_id, seq)`.
-
-| Condition | Result | Store? |
-| --- | --- | --- |
-| nonce already seen | `200 duplicate` | no |
-| seq == last seq, same body sha256 | `200 duplicate` | no |
-| seq == last seq, different body sha256 | `409 sequence_conflict` (permanent) | no |
-| seq < last seq for current boot | `409 sequence_conflict` (permanent) | no |
-| seq > last seq (gap allowed, counted) | `200 accepted` | yes |
-| new boot_id, any seq | `200 accepted`; previous boot reports then rejected | yes |
-| old boot_id after a new boot was accepted | `409 sequence_conflict` | no |
-
-The center stores `last_boot_id`, `last_seq`, `last_body_sha256` per node. A gap
-is recorded as `sequence_gap_count` (diagnostic only; loss is possible on a
-network and must not block later data). A duplicate must be acknowledged (200)
-because the agent may have lost the original ack.
-
-## 5. Report bodies
-
-All bodies are versioned `v:1` with a closed `type`. Exact field sets, types,
-units and bounds are in the JSON schemas; the center validates the schema **and**
-the allowlist before any write.
-
-### 5.1 `snapshot` — latest state (upsert, idempotent)
-
-[`report-snapshot.schema.json`](../contracts/v1/report-snapshot.schema.json),
-example [`examples/report-snapshot.v1.json`](../contracts/v1/examples/report-snapshot.v1.json),
-max 32 KiB (raw).
-
-Contents: `generated_at`, `config_version`, `agent{version,boot_id,uptime_s}`,
-`host{os,kernel,arch}`, `system{cpu_pct,load1,mem_total_bytes,mem_used_bytes,
-disk_total_bytes,disk_used_bytes,net_rx_bytes,net_tx_bytes}`,
-`services[{name,state}]`, `protocols[{kind,inbound_tag,state,reason,observed_at}]`,
-`traffic[{scope,inbound_tag,uplink_total_bytes,downlink_total_bytes}]`,
-`clients{active,tracked,summaries[{device_ref,active,uplink_bytes,downlink_bytes,last_seen}]}`.
-`net_*_bytes`, `uplink_total_bytes`, `downlink_total_bytes` are cumulative
-counters; the center derives deltas and detects counter resets from the
-`counter_epoch` change (agent reports a new `counter_epoch` whenever the
-underlying counter source restarts).
-
-### 5.2 `metrics` — bounded minute samples
-
-[`report-metrics.schema.json`](../contracts/v1/report-metrics.schema.json), max
-32 KiB. `samples` is an array of 1..5 objects, each aligned to a UTC minute:
-`at` (epoch seconds at minute start), `cpu_pct`, `load1`, `mem_used_bytes`,
-`disk_used_bytes`, `net_rx_bytes_total`, `net_tx_bytes_total`,
-`active_connections`. At most one sample per `at`; duplicates are rejected.
-
-### 5.3 `events` — bounded fault/agent timeline
-
-[`report-events.schema.json`](../contracts/v1/report-events.schema.json), max
-32 KiB, 1..50 entries: `{event_id (uuidv4), at, kind, severity, detail{≤8 scalar
-entries, each ≤64 chars}}`. `kind` ∈ `service_restart`, `service_failure`,
-`protocol_outage`, `protocol_recovery`, `agent_started`, `agent_error`,
-`config_update`, `clock_skew`, `spool_overflow`; `severity` ∈ `info`, `warning`,
-`critical`. `event_id` is globally unique; duplicate event ids are ignored.
-
-### 5.4 Response / ack
-
-[`ack.schema.json`](../contracts/v1/ack.schema.json):
-
-```json
-{"v":1,"result":"accepted","server_time":1795622402,"next_seq":42,
- "config_version":1,"retry_after_s":null}
+```text
+um-v1
+<endpoint>
+<method>
+<path>
+1
+<node-id>
+<key-id>
+<boot-id>
+<seq>
+<sent-at>
+<nonce>
+<content-encoding>
+<sha256-hex(body)>
 ```
 
-`result` ∈ `accepted`, `duplicate`; `server_time` is authoritative for clock
-recalibration; `config_version` greater than the agent's value requires
-`POST /v1/agent/config`; `next_seq` is diagnostic only (the agent keeps its own
-monotonic counter; a resend uses the same seq+nonce to obtain `duplicate`).
+Binding: protocol major + endpoint + HTTP method + path + identity + key id +
+boot id + sequence + authentication time + nonce + content encoding + exact
+decoded body hash. A signature for one endpoint/identity/encoding/body cannot be
+reused for another (cross-endpoint replay is `bad_signature`); the body hash
+prevents body substitution; the time window and nonce prevent network replay;
+the boot/sequence prevent reordering after a restart.
 
-## 6. Rotation, configuration and revocation
+## 4. Enrollment (P0-01)
 
-### 6.1 Rotation
+### Request
 
-`POST /v1/agent/rotate` is authenticated by the **old key** (same envelope and
-signing string) with body
-[`rotate-request.schema.json`](../contracts/v1/rotate-request.schema.json):
-`{v, new_pubkey, nonce, signed_at}`. Center verifies the old-key signature and
-timestamps, stores the new key with the same node/key generation, returns the new
-`key_id`. Both keys are accepted for a grace window of ≤5 minutes; the old key is
-automatically revoked on the first accepted report signed by the new key or when
-the grace window expires. Rotation never changes `node_id`/`event_id`.
+Headers: `X-UM-Protocol`, `X-UM-Pubkey`, `X-UM-Sent-At`, `X-UM-Nonce`,
+`X-UM-Content-Encoding`, `X-UM-Signature`, `Authorization`, `Content-Type`.
+Body: [`enroll-request.schema.json`](../contracts/v1/enroll-request.schema.json) —
+`{v, agent_version, host{os,kernel,arch}, capabilities[]}`. **No signature,
+nonce, key, time or token fields exist in the body**; duplicate representations
+are rejected (`invalid_request`).
 
-### 6.2 Configuration pull
+Signed vector: [`test-vectors.v1.json`](../contracts/v1/test-vectors.v1.json)
+`enroll_vector` (exact body `examples/enroll-request.v1.json`, signing string,
+Ed25519 public key and signature). Cryptographic negatives: wrong key, tampered
+body, cross-endpoint reuse. Behavioural negatives: unknown/expired/reused token,
+missing/duplicate headers, unsupported encoding, stale timestamp, body containing
+a signature field (`negative-vectors.v1.json` NEG-ENROLL-*).
 
-`POST /v1/agent/config` (node signature) returns the current agent config:
-`{v, node_id, event_id, config_version, cadence_seconds (30..300),
-collect{...allowlisted booleans...}, device_salt, server_time}`. The center has
-**no push channel**: agents pull only. Configuration changes are limited to
-cadence, collection enable flags and device-salt rotation; they can never add a
-command, URL, host or write capability.
+### Response and response-loss recovery
 
-### 6.3 Revocation and retirement
+Body: [`enroll-response.schema.json`](../contracts/v1/enroll-response.schema.json)
+(`node_id`, `event_id`, `key_id`, `config_version`, `device_salt`,
+`cadence_seconds`, `server_time`, optional `center_spki_sha256`).
 
-Admin-only web action. After revocation: reports signed by any node key are
-rejected with `401 revoked_key`; the agent stops sending, records a local
-`agent_error` state and requires operator action. The node row becomes
-`revoked`; history remains queryable. `retired` is a later admin state (after
-revocation) with 30-day retention for the identity row. Re-enrollment requires a
-new bootstrap token and creates a new `node_id`.
+Enrollment commits node + key + token-consumption atomically. If the response is
+lost, the token is already consumed: the agent retries and receives
+`401 token_used`; the node is left in `pending_activation` (visible to admins,
+reports rejected with `401 pending_activation`). Recovery is explicit: admin
+revokes the pending identity (or deletes it) and issues a new one-time token; the
+agent generates a new key and node id. There is no automatic completion or
+silent key adoption.
 
-## 7. Errors
+## 5. Report semantics: payload identity vs transport authentication (P1-02)
 
-HTTP status plus body [`error.schema.json`](../contracts/v1/error.schema.json):
-`{"v":1,"error":"closed_code","retryable":false,"server_time":...}`.
-No stack traces, paths, exception text, request bodies or secrets.
+Every report body carries `report_id` (uuidv4, generated once when the record is
+created/spooled) and `collected_at` (epoch seconds when the data was collected).
+Transport authentication fields are per attempt (fresh `sent_at`, `nonce`,
+increasing `seq`), and the **payload age does not gate transport acceptance**:
+spooled data collected hours or days earlier is re-authenticated at send time.
+Accepted payload age is bounded by the agent spool contract (≤7 days) and by
+`collected_at ≤ sent_at + 60 s`; older-than-retention data is rejected/accepted as
+stale-ignored per §6.
 
-| HTTP | code | Retryable | Agent behavior |
+Center processing (single transaction, `synchronous=FULL`):
+
+1. Verify headers/encoding/size/grammar; 2. node + event binding; 3. key state;
+4. `|server_time − sent_at| ≤ 300 s`; 5. signature over decoded bytes;
+6. nonce dedupe; 7. report_id dedupe/conflict; 8. boot/sequence rules;
+9. schema + privacy allowlist; 10. apply data; 11. persist dedupe + sequence +
+data; 12. ACK. Nothing is acknowledged before step 11 commits; a failed commit is
+`503 storage_unavailable` (retryable) with no partial state.
+
+Dedupe/durability tables (persistent, bounded):
+
+| Table | Key | Purpose | Retention |
 | --- | --- | --- | --- |
-| 400 | `invalid_request` | no | quarantine report (bounded), continue |
-| 401 | `unauthorized` | no | stop; re-enrollment required |
-| 401 | `unknown_node` / `revoked_key` | no | stop; mark revoked; operator action |
-| 401 | `bad_signature` | no | stop; record security event |
-| 401 | `stale_timestamp` | yes (once) | recalibrate from `server_time`, retry once |
-| 409 | `replay` | yes | treat as duplicate (ack may have been lost) |
-| 409 | `sequence_conflict` | no | stop; requires config/enrollment action |
-| 409 | `identity_mismatch` | no | stop; operator action |
-| 413 | `payload_too_large` | no | drop/quarantine; reduce batching |
-| 426 | `upgrade_required` | no | stop; agent upgrade required |
+| `report_dedupe` | `(node_id, report_id)` → body SHA-256, first/last received | idempotency across retries/restarts; same report_id different hash → `409 report_conflict` | 8 days (spool 7 d + margin) |
+| `nonce_dedupe` | `(node_id, endpoint, nonce)` → body hash, received_at | network replay; same nonce different body/endpoint → `409 nonce_reuse` | 24 h |
+| `boot_registry` | `(node_id, boot_id)` → first/last seen, last seq, state active/retired | reject reports from retired boots; bound boot history per node (last 8) | with node identity |
+| `node_seq` | node_id → current boot_id, last_seq, updated_at | monotonic ordering per boot; gaps allowed and counted | current |
+
+Apply rules:
+
+- Snapshot: applied to `node_latest` only when `collected_at` is newer than the
+  currently applied snapshot; an authenticated but older snapshot is acknowledged
+  as `stale_ignored` (authenticated, deduped, **not applied**, never overwrites
+  newer state).
+- Metrics/events: inserted idempotently by `(node_id, report_id)`; historical
+  data is written under its `collected_at` buckets (within the allowed payload
+  age) and remains visible as a late-arrival gap; no overwriting of newer rows.
+- Duplicate: `result: duplicate` (same report_id + same hash) or `stale_ignored`
+  (older snapshot); in both cases the agent removes the spool record on receipt.
+- A lost ACK causes a resend with a **new nonce/sent_at/seq**: the center finds
+  the existing `report_id` and answers `duplicate` (or `stale_ignored`), so the
+  agent can drop the spool record safely.
+
+### ACK
+
+[`ack.schema.json`](../contracts/v1/ack.schema.json): `report_id`, `result`
+(`accepted|duplicate|stale_ignored`), `server_time`, `next_seq`, `config_version`,
+`retry_after_s`. The ACK echoes the report_id so a late/duplicated response cannot
+be confused with another report.
+
+## 6. Replay, sequence, boot and recovery state tables
+
+### 6.1 Rules
+
+- `nonce`: first use executes; exact replay (same endpoint + same body hash)
+  inside 24 h is idempotent (`duplicate`/replay-safe); same nonce with different
+  body/endpoint is `409 nonce_reuse` (permanent; security event).
+- `seq`: per current boot strictly increasing; `seq < last` → `409
+  sequence_conflict`; `seq > last` accepted (gap recorded); a report with a new
+  `boot_id` is accepted and retires the previous boot; a report from a retired
+  boot is `409 stale_boot` (permanent), because the agent's new boot resends the
+  same spooled `report_id`s under the new boot.
+- Agent restart: a **new** `boot_id` is generated; the spool contains payload
+  records only (report_id + collected_at + type + body). The agent replays the
+  oldest spool record first under the new boot/seq with fresh nonce/sent_at; the
+  center dedupes by `report_id`, so records already stored before the crash are
+  `duplicate` and are dropped from the spool. A late request from the previous
+  boot after the new boot is `stale_boot`.
+- Center restart: all dedupe/sequence/boot state is in SQLite and survives
+  restarts; agents retry and receive `duplicate` for already-committed reports.
+- Single-agent rule: the agent holds a single-writer spool lock so two agent
+  instances cannot produce an ambiguous boot history for one node.
+- Rotation: a spool record is not tied to a key. After rotation the agent signs
+  retransmissions with the new key; the center accepts them under the same node
+  identity (grace rules in §7). Revocation: reports are rejected with
+  `401 revoked_key`; the agent stops sending and keeps the bounded spool intact
+  for operator decision (no silent deletion, no auto re-enrollment).
+- Snapshot ordering is by `collected_at`, never by arrival time; an old spooled
+  snapshot cannot overwrite the current live snapshot (`stale_ignored`).
+- Payload age: allowed while within the 7-day spool bound; `collected_at` in the
+  future (> sent_at + 60 s) is `invalid_request`; `sent_at` outside ±300 s is
+  `stale_timestamp` (retryable after clock calibration from `server_time`).
+
+### 6.2 Durability and acknowledgement semantics
+
+- Center: `PRAGMA journal_mode=WAL`, `synchronous=FULL` (fsync on commit) — the
+  previously considered `synchronous=NORMAL` is **rejected** because it does not
+  guarantee the durability implied by `accepted` across OS/power loss. A report
+  is acknowledged only after the transaction (data + dedupe + sequence/boot)
+  has committed durably. Commit failure → 503, no ACK, agent retries.
+- Agent: the spool record is fsynced (file + directory) **before** the first
+  send attempt; it is removed only after a terminal success/semantic disposition.
+  A crash between commit and ACK therefore resends the same `report_id` and
+  receives `duplicate`.
+- A terminal non-retryable payload error (`invalid_request`, `report_conflict`)
+  quarantines that record (bounded) and continues with later records; auth/sequence
+  errors stop the queue and require operator action. No silent drops.
+
+### 6.3 Required state-transition tests (UM-B)
+
+| Scenario | Expected |
+| --- | --- |
+| 1 h network outage | records spool durably; after reconnection oldest-first replay with fresh sent_at/nonce/seq; center ACKs accepted; no duplicates stored |
+| Agent restart mid-spool | new boot_id; old spool replayed; already-stored report_ids → `duplicate`; data loss only for records that were never fsynced (none by contract) |
+| Center restart | dedupe/seq/boot survive; in-flight/spooled retries → `duplicate`/accepted; no reordering errors |
+| Lost ACK (commit succeeded) | resend with new nonce/seq → `duplicate`; spool dropped |
+| Lost ACK (commit failed/503) | resend → accepted; no duplicate |
+| Power loss on agent | fsynced records survive; older boot → center rejects late old-boot request as `stale_boot`, new-boot resend wins; unsynced tail may be lost and is reported via spool_retention diagnostics |
+| Power loss on center | committed reports survive (FULL); uncommitted → agent retries; dedupe prevents double apply |
+| Revocation during backlog | backlog stays bounded/spooled; reports rejected `revoked_key`; operator re-enroll creates new node; old spool must be discarded (documented) |
+| Rotation during backlog | backlog retransmits under new key after rotation; same node identity; accepted |
+| Historical boot replay | old boot_id after new boot accepted → `stale_boot`; same report_id under new boot is idempotent |
+| Old snapshot after newer live snapshot | authenticated, `stale_ignored`, never applied to latest |
+
+## 7. Rotation, configuration and revocation
+
+- Rotate: headers signed by the **old** key; body
+  [`rotate-request.schema.json`](../contracts/v1/rotate-request.schema.json)
+  `{v, new_pubkey}`; response
+  [`rotate-response.schema.json`](../contracts/v1/rotate-response.schema.json)
+  `{node_id, previous_key_id, new_key_id, config_version, server_time}`. Old key
+  is accepted for ≤5 min grace and revoked on the first accepted report under the
+  new key or at grace expiry.
+- Rotate response loss/retry: the agent persists a pending rotation intent (new
+  key + old key) and retries with the **same nonce/body**; the center returns the
+  same recorded rotate-response (idempotent) while the old key is in grace. If the
+  grace expires first, the rotation is failed; the agent discards the pending key
+  and continues with the old key (no node-id change, no data loss). It may start a
+  new rotate attempt with a new nonce later. A retry after the old key was revoked
+  is `401 revoked_key`.
+- Config: signed pull only, body `{}`; response
+  [`agent-config.schema.json`](../contracts/v1/agent-config.schema.json) with
+  `cadence_seconds` 30–300, boolean collect switches, `device_salt`,
+  `config_version`. No center→agent push channel and no command/URL/host fields.
+- Revocation/retirement: admin-only web action; reports rejected immediately;
+  node identity row retained for audit/history until its retention boundary.
+
+## 8. Errors (closed vocabulary)
+
+HTTP status + [`error.schema.json`](../contracts/v1/error.schema.json).
+
+| HTTP | error | Retryable | Notes |
+| --- | --- | --- | --- |
+| 400 | `invalid_request` | no | schema/body/duplicate representation |
+| 400 | `missing_header` / `invalid_header` | no | header grammar |
+| 400 | `duplicate_header` | no | repeated/unknown `X-UM-*` header |
+| 400 | `unsupported_encoding` | no | encoding token/gzip malformed/stacked |
+| 401 | `unauthorized` | no | generic auth failure |
+| 401 | `unknown_node` / `revoked_key` / `pending_activation` | no | identity state |
+| 401 | `bad_signature` | no | signature/endpoint/body binding failed |
+| 401 | `stale_timestamp` | yes (once) | recalibrate from `server_time` |
+| 401 | `token_invalid` / `token_expired` / `token_used` | no | enrollment only |
+| 404 | `endpoint_not_found` | no | wrong listener plane/wrong path |
+| 405 | `method_not_allowed` | no | non-POST on agent paths |
+| 409 | `replay` | yes | duplicate transport attempt; treat as duplicate |
+| 409 | `nonce_reuse` / `sequence_conflict` / `stale_boot` / `report_conflict` / `identity_mismatch` | no | replay/ordering conflicts |
+| 413 | `payload_too_large` | no | decoded/compressed caps |
+| 426 | `unsupported_version` / `upgrade_required` | no | protocol major/agent policy |
 | 429 | `rate_limited` | yes | honor `Retry-After` |
-| 503 | `storage_unavailable` | yes | exponential backoff, keep spool |
+| 503 | `storage_unavailable` | yes | retry; no state changed |
 
-## 8. Versioning and compatibility
+Every error response carries `server_time` for clock recalibration and never
+contains exception text, paths, bodies or secrets.
 
-- Major version is in the URL namespace (`/v1/`) and `X-UM-Protocol`/`v`; the
-  center accepts only supported majors (initially `1`). A leaf with an unknown
-  major gets `426 upgrade_required` (never a silent downgrade).
-- Within v1, changes must be additive/optional: unknown fields are ignored only
-  in objects documented as extensible (`detail` maps, future ack fields); closed
-  enums reject unknown values with `invalid_request`.
-- Removing/renaming a field, changing a unit/meaning/enum token or tightening a
-  bound in a way old agents violate is a major change.
-- Deprecation policy: a deprecated major/field is announced for ≥90 days and at
-  least one agent minor release before removal.
-- Agent `agent_version` is recorded for fleet visibility; the center may require
-  a minimum version via `426 upgrade_required` only with owner-approved policy.
-- Capability announcement (`metrics_v1`, `events_v1`, `rotate_v1`, `config_v1`)
-  is optional in enrollment and required only when a future feature needs it;
-  the v1 baseline center accepts agents implementing the mandatory set.
+## 9. Payload schemas, availability honesty and privacy
 
-## 9. Agent runtime behavior (contract, not implementation)
+Bodies: snapshot, metrics, events ([schemas](../contracts/v1/)). All report bodies
+carry `v`, `type`, `report_id`, `collected_at`; timestamps are epoch seconds UTC.
 
-- Spool-before-ack: persist durably (fsync) before first send; remove only on
-  `accepted`/`duplicate`; ordered replay; one in-flight request; backoff with
-  full jitter 1 s → 60 s cap; honor `Retry-After`.
-- Bounded spool: ≤32 MiB and ≤7 days (both enforced; evict oldest with a counted
-  `spool_overflow` event, never unbounded growth); startup retention failure is
-  fail-closed (no half-open agent); single-writer lock.
-- Cadence default 60 s (snapshot + metrics), events immediately (batched ≤50);
-  minimum 30 s, maximum 300 s, center-controlled.
-- No listening socket; no outbound connection other than the configured center
-  origin; no exec; no root; no `sbox-cm`/journald access; no shell.
-- Clock: agent uses local monotonic time for scheduling and the ack
-  `server_time` to maintain a bounded offset; it MUST NOT trust local wall clock
-  for ordering (the nonce/seq are authoritative).
-- Local quota: one process, bounded queue, bounded CPU (doc 06 performance
-  budget), no writes outside its private directories.
+- **Availability**: `availability{system,services,protocols,traffic,clients}` ∈
+  `ok|partial|unavailable`. Missing metrics are `null`, protocol/service state may
+  be `unknown`, arrays may be empty when a source is unavailable. The center
+  stores NULL and never converts missing data into zero/healthy state; the UI
+  (UM-D) must render UNKNOWN/STALE. No fake zeros, no "up" without evidence.
+- **Closed event details**: per-kind closed detail schemas are enforced
+  (`report-events.schema.json` if/then + `additionalProperties:false`). No
+  arbitrary keys, no free-text error messages, no paths/exception text.
+- **Privacy allowlist** (center MUST reject/strip before storage): no UUIDs,
+  passwords, private keys, tokens, full YAML, client names, raw source/destination
+  IPs or hostnames, URLs, command lines, journal text, free text, or connection
+  records. Allowed: aggregate counters, protocol state tokens, `device_ref`
+  (HMAC-SHA256 with per-event salt of the local client identity, truncated to 32
+  bytes), bounded counters, node-provided agent version/host class.
+- **Admin-side aliases**: display labels are center-owned metadata attached to
+  `node_id` or `device_ref` by an authorized admin (bounded, free-text UI label,
+  never sent to agents, never containing credentials). Aliases do not change the
+  machine identity and are audited.
+- **Sentinel negative contract**: UM-B must include tests that plant
+  UUID/password/private-key/YAML/source-IP sentinel values in agent payloads and
+  assert they are rejected at the boundary, absent from stored rows, logs, HTTP
+  responses and backups (SEC-14 extension).
 
-## 10. Center validation order (normative)
+## 10. Versioning and compatibility
 
-1. TLS and route; 2. body size/encoding limits; 3. identity header grammar;
-4. node lookup and event binding; 5. key existence/status; 6. clock window;
-7. signature over exact bytes; 8. nonce replay; 9. sequence rules;
-10. JSON schema + privacy allowlist; 11. store in one transaction;
-12. ack. Any failure before step 11 writes nothing; failures are logged as closed
-codes only (no payload content).
+- Wire major is in the path namespace (`/v1/`), `X-UM-Protocol` and body `v`.
+  Body `v` is the payload-schema version (currently 1); the header is the wire
+  major. They are intentionally separate and both validated.
+- Unknown fields are ignored only in objects documented as extensible (none in
+  v1 except the future ack/error additive fields noted below); closed enums reject
+  unknown tokens (`invalid_request`).
+- Adding an optional response field is compatible; adding a required request
+  field, changing units/enums/signing strings or tightening a bound that old
+  agents violate is a major revision.
+- Deprecation ≥90 days and one agent minor release before removal; unknown major
+  → `426 unsupported_version`.
+- Agent capabilities in enrollment are advisory for optional features; v1
+  mandatory set is snapshot+metrics+events.
 
-## 11. Frozen test vector
+## 11. Agent runtime, provisioning and least privilege (P1-03)
 
-Committed under [`../contracts/v1/test-vectors.v1.json`](../contracts/v1/test-vectors.v1.json):
+- **Install/provision (one-time root orchestration, reviewed installer)**:
+  - root-owned token file `/etc/um-agent/bootstrap.token` (root:root 0600) is
+    never readable by the agent user; it is **not** moved into the agent's
+    directory.
+  - the reviewed installer runs enrollment as the unprivileged `umagent` via
+    `runuser`/equivalent with the token fed on **stdin from a root-opened pipe**
+    (`um-agent enroll --token-stdin`); the agent process generates its own
+    Ed25519 key and writes its state (`/var/lib/um-agent/` 0700 umagent, key
+    0600 umagent).
+  - after successful enrollment the root installer deletes the token file; on
+    failure it leaves it in place (0600 root) only for operator retry and records
+    a closed error code. No resident process runs as root.
+  - no file permission is loosened on sing-box, Mihomo, Monitor or `sbox-cm`.
+- **Runtime identity**: `umagent` non-login user; `um-agent.service` has
+  `NoNewPrivileges=yes`, `ProtectSystem=strict`, `ProtectHome=yes`,
+  `PrivateTmp=yes`, `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`,
+  `ReadWritePaths=/var/lib/um-agent`, `UMask=0077`, memory/task caps, and **no
+  fork/exec** (`SystemCallFilter` denies `execve/execveat`, `NoExecPaths=/` where
+  supported; enforced by a runtime/static test).
+- **Read-only data sources** (no exec, no root, no journald):
+  - sing-box `service.api` over loopback using systemd `LoadCredential=` for the
+    operator-provided API secret (copied into the service's private credential
+    directory by systemd; existing file ownership/permissions are not changed).
+    The agent's client implements only the audited read-only started-service
+    subscription methods; there is no generic/dynamic RPC surface and no config
+    mutation call in the client. UM-B must record the audited sing-box version,
+    method allowlist and a negative test (no other RPC path strings).
+  - `/proc`/syscalls for CPU, memory, disk, network counters (no subprocess).
+  - systemd unit state via **read-only D-Bus property reads** on
+    `org.freedesktop.systemd1` (`ActiveState` only); no start/stop/enable/exec
+    calls. If D-Bus is unavailable the state is `unknown`/`unavailable`; the
+    agent does **not** fall back to executing `systemctl`.
+  - optional Mihomo controller GET via loopback with a credential the same way
+    (`LoadCredential`), no mutation methods.
+  - protocol state: derived only from available evidence (service state + API
+    activity/optional loopback dial); absence of traffic is never reported as
+    down or up — it is `unknown`.
+- **Spool**: durable, ordered, bounded 32 MiB/7 days, single-writer lock,
+  fsync-before-send, bounded retry/backoff (1 s→60 s with jitter), bounded
+  quarantine, fail-closed retention at startup.
+- No listening socket; only the configured center origin is contacted; no shell,
+  no package management, no remote command channel.
 
-- the exact body bytes are
-  [`../contracts/v1/examples/report-snapshot.v1.json`](../contracts/v1/examples/report-snapshot.v1.json);
-- the signed string and Ed25519 signature were produced and independently
-  verified with OpenSSL (commands in
-  [`../contracts/v1/README.md`](../contracts/v1/README.md));
-- the vector fixes body sha256, signing string, public key, signature and
-  expected verification result, so any implementation can prove wire
-  compatibility before UM-B integration.
+## 12. Frozen vectors and validation
 
-Any change to the signing string, header names/grammar, body type names, closed
-enums or the test vector requires a frozen-contract revision review.
+Committed under [`../contracts/v1/`](../contracts/v1/):
+
+- `test-vectors.v1.json`: positive report and enrollment vectors (exact body
+  files, decoded-body hashes, signing strings, Ed25519 public keys/signatures,
+  expected result) plus cryptographic negatives (tampered body, wrong key,
+  cross-endpoint reuse) with expected verification failure.
+- `negative-vectors.v1.json`: behavioural HTTP negative contracts
+  (enrollment token/expired/used, header duplication/missing/encoding, tampered
+  body, cross-endpoint replay, nonce/report/boot/sequence conflicts, size caps,
+  rotation grace/revocation, listener-plane separation).
+- `examples/`: positive snapshot/metrics/events/enroll bodies and negative
+  examples used by schema negative tests (extra body signature field, arbitrary
+  detail, free-text detail, impossible units, unknown error code).
+
+Any change to headers, signing strings, endpoint semantics, dedupe/sequence
+rules, enums or vectors is a frozen-contract revision requiring independent
+review before implementation.
