@@ -18,7 +18,7 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 from quality_failover.pilot import receiver_init
-from quality_windows_lab import ChildWindow, LoopbackController, SocksServer, TrackedReceiver, serve, until
+from quality_windows_lab import ChildWindow, LoopbackController, SocksServer, TrackedReceiver, serve, until, wait_for_gui
 
 spec = importlib.util.spec_from_file_location("exe_export_fixture", ROOT / "tests/test_quality_failover.py")
 fixture = importlib.util.module_from_spec(spec)
@@ -120,11 +120,14 @@ def gui(app, root, environment, controller, sink, hopping, full_recovery, record
     source_digest = digest(app.parent / "synthetic-mihomo.yaml")
     process = subprocess.Popen([str(app)], env=environment, cwd=root, creationflags=0x08000000)
     controller.event("process_started")
-    window = ChildWindow(process)
-    bundle, failed = None, False
+    window = None
+    bundle, failed, diagnostic = None, False, None
     with ExitStack() as stack:
         try:
-            until(lambda: len(window.children()) > 10, label="actual GUI opens")
+            # A test-environment query failure (PROCESS_ENUMERATION_FAILED) must
+            # never be reported as "the GUI opened" nor as a GUI timeout.
+            window = ChildWindow(process)
+            wait_for_gui(window, process, seconds=30, minimum=10)
             work = Path(environment["LOCALAPPDATA"]) / "ClashQualitySwitch"
             assert not list(work.glob("*/bundle-*/bundle.json"))
             assert controller.writes == []
@@ -234,15 +237,31 @@ def gui(app, root, environment, controller, sink, hopping, full_recovery, record
             failed = True
             # Do not poll state.json: a Windows observer can block its writer.
             # Observe actual API mutations/authenticated receipts, never credentials.
-            diagnostic = {"lab_failure": True, "process_exit_before_cleanup": process.poll(),
+            diagnostic = {"lab_failure": True,
+                "failure_classification": getattr(error, "classification", type(error).__name__),
+                "failure_error": type(error).__name__, "failure_message": str(error)[:500],
+                "process_exit_before_cleanup": process.poll(),
                 "observations": controller.observations,
                 "confirmed_receipts": {node: len(sink.uploads(node, controller.started)) for node in ("Reality", "Hysteria2")},
                 "mock_fixed": controller.fixed, "mock_writes": controller.writes,
                 "mock_reachable": controller.reachable, "unexpected_requests": controller.unexpected,
                 "timeline": controller.timeline}
+            if window is not None:
+                try:
+                    diagnostic["child_window"] = window.diagnostics()
+                except Exception as diagnostic_error:
+                    diagnostic["child_window_error"] = type(diagnostic_error).__name__
             error.lab_diagnostics = diagnostic
             raise
         finally:
+            if window is not None:
+                try:
+                    window.cleanup()
+                except Exception as cleanup_error:  # never mask the original failure
+                    if failed:
+                        diagnostic["window_cleanup_error"] = type(cleanup_error).__name__
+                    else:
+                        raise
             if process.poll() is None:
                 controller.event("test_cleanup_forced_kill")
                 subprocess.run(["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
@@ -387,6 +406,7 @@ if __name__ == "__main__":
         if args.report:
             with Path(args.report).open("x", encoding="utf-8") as stream:
                 json.dump({"v": 1, "acceptance_passed": False, "failure_class": type(error).__name__,
+                           "failure_classification": getattr(error, "classification", None),
                            "diagnostic": getattr(error, "lab_diagnostics", None), "production_contacted": False}, stream, indent=2)
         raise
     if args.report:

@@ -8,6 +8,7 @@ from ctypes import wintypes
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import ntpath
 import os
 import select
 import socket
@@ -15,6 +16,7 @@ import socketserver
 import struct
 import threading
 import time
+from typing import NamedTuple
 from urllib.parse import quote
 
 from quality_failover.policy import GROUP, NODES
@@ -197,15 +199,302 @@ def serve(server):
     return server
 
 
+class LabFailure(AssertionError):
+    """Native acceptance failure with a stable, reportable classification."""
+    classification = "LAB_FAILURE"
+
+
+class ProcessEnumerationError(LabFailure):
+    """The test could not ask the OS which processes/windows exist."""
+    classification = "PROCESS_ENUMERATION_FAILED"
+
+
+class ProcessIdentityMismatch(LabFailure):
+    """A PID is not, or is no longer, the process this test started."""
+    classification = "PROCESS_IDENTITY_MISMATCH"
+
+
+class GuiProcessExited(LabFailure):
+    """The started EXE/GUI process terminated before the test finished."""
+    classification = "GUI_PROCESS_EXITED"
+
+
+class GuiWindowNotFound(LabFailure):
+    """The process is alive but never created a visible window."""
+    classification = "GUI_WINDOW_NOT_FOUND"
+
+
+class GuiStartTimeout(GuiWindowNotFound):
+    """A window exists but its widget tree never reached the expected layout."""
+    classification = "GUI_START_TIMEOUT"
+
+
+# Acceptance must learn "which processes did I start and which windows belong to
+# them" from the kernel, not from an out-of-process management query. Toolhelp32
+# and the per-process image queries below are bounded kernel calls; a slow or
+# failing query is classified and fails closed instead of being read as "no GUI".
+TH32CS_SNAPPROCESS = 0x00000002
+ERROR_NOT_ENOUGH_MEMORY = 8
+ERROR_NO_MORE_FILES = 18
+ERROR_BAD_LENGTH = 24
+ERROR_INVALID_PARAMETER = 87
+PROCESS_QUERY_LIMITED_INFORMATION = 0x001000
+PROCESS_TERMINATE = 0x0001
+INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+MAX_PROCESS_TREE_DEPTH = 4
+MAX_PROCESS_TREE_SIZE = 64
+MAX_ENUMERATION_ATTEMPTS = 3
+ENUMERATION_RETRY_DELAY = 0.05
+TRANSIENT_ENUMERATION_ERRORS = frozenset((ERROR_NOT_ENOUGH_MEMORY, ERROR_BAD_LENGTH))
+
+
+class PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", wintypes.DWORD),
+        ("cntUsage", wintypes.DWORD),
+        ("th32ProcessID", wintypes.DWORD),
+        ("th32DefaultHeapID", ctypes.c_size_t),
+        ("th32ModuleID", wintypes.DWORD),
+        ("cntThreads", wintypes.DWORD),
+        ("th32ParentProcessID", wintypes.DWORD),
+        ("pcPriClassBase", wintypes.LONG),
+        ("dwFlags", wintypes.DWORD),
+        ("szExeFile", wintypes.WCHAR * 260),
+    ]
+
+
+class ProcessIdentity(NamedTuple):
+    pid: int
+    creation_time: int
+    image_path: str
+
+
+def _winerror(error):
+    return getattr(error, "winerror", None) or getattr(error, "errno", None)
+
+
+def normalize_image_path(path):
+    """Canonical comparison form for a Windows image path (never a title)."""
+    value = str(path)
+    if value.startswith("\\\\?\\UNC\\"):
+        value = "\\\\" + value[8:]
+    elif value.startswith("\\\\?\\"):
+        value = value[4:]
+    return ntpath.normcase(ntpath.normpath(value))
+
+
+class _Win32ProcessApi:
+    """Minimal kernel32 wrapper; every handle opened here is closed here."""
+
+    def __init__(self):
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        kernel32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+        kernel32.Process32FirstW.argtypes = [ctypes.c_void_p, ctypes.POINTER(PROCESSENTRY32W)]
+        kernel32.Process32FirstW.restype = wintypes.BOOL
+        kernel32.Process32NextW.argtypes = [ctypes.c_void_p, ctypes.POINTER(PROCESSENTRY32W)]
+        kernel32.Process32NextW.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.QueryFullProcessImageNameW.argtypes = [
+            ctypes.c_void_p, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+        kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+        kernel32.GetProcessTimes.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(wintypes.FILETIME), ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME), ctypes.POINTER(wintypes.FILETIME)]
+        kernel32.GetProcessTimes.restype = wintypes.BOOL
+        kernel32.TerminateProcess.argtypes = [ctypes.c_void_p, wintypes.UINT]
+        kernel32.TerminateProcess.restype = wintypes.BOOL
+        self.kernel32 = kernel32
+
+    def snapshot_table(self):
+        snapshot = self.kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if not snapshot or snapshot == INVALID_HANDLE_VALUE:
+            raise OSError(ctypes.get_last_error(), "CreateToolhelp32Snapshot failed")
+        try:
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            if not self.kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
+                error = ctypes.get_last_error()
+                if error == ERROR_NO_MORE_FILES:
+                    return {}
+                raise OSError(error, "Process32FirstW failed")
+            table = {}
+            while True:
+                table[entry.th32ProcessID] = entry.th32ParentProcessID
+                if not self.kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
+                    error = ctypes.get_last_error()
+                    if error == ERROR_NO_MORE_FILES:
+                        return table
+                    raise OSError(error, "Process32NextW failed")
+        finally:
+            self.kernel32.CloseHandle(snapshot)
+
+    def open_process(self, pid, access):
+        handle = self.kernel32.OpenProcess(access, False, pid)
+        if not handle:
+            raise OSError(ctypes.get_last_error(), "OpenProcess failed for PID %d" % pid)
+        return handle
+
+    def close_handle(self, handle):
+        if handle:
+            self.kernel32.CloseHandle(handle)
+
+    def identity_from_handle(self, handle, pid):
+        creation, exited, kernel, user = (wintypes.FILETIME() for _ in range(4))
+        if not self.kernel32.GetProcessTimes(handle, ctypes.byref(creation), ctypes.byref(exited),
+                                             ctypes.byref(kernel), ctypes.byref(user)):
+            raise OSError(ctypes.get_last_error(), "GetProcessTimes failed for PID %d" % pid)
+        size = wintypes.DWORD(32768)
+        buffer = ctypes.create_unicode_buffer(size.value)
+        if not self.kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+            raise OSError(ctypes.get_last_error(), "QueryFullProcessImageNameW failed for PID %d" % pid)
+        ticks = (creation.dwHighDateTime << 32) | creation.dwLowDateTime
+        return ProcessIdentity(pid, ticks, normalize_image_path(buffer.value))
+
+    def process_identity(self, pid):
+        handle = self.open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION)
+        try:
+            return self.identity_from_handle(handle, pid)
+        finally:
+            self.close_handle(handle)
+
+    def terminate(self, pid, expected):
+        """Terminate only the still-identical process; a recycled PID is refused."""
+        try:
+            handle = self.open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE)
+        except OSError:
+            return False
+        try:
+            if self.identity_from_handle(handle, pid) != expected:
+                return False
+            return bool(self.kernel32.TerminateProcess(handle, 1))
+        except OSError:
+            return False
+        finally:
+            self.close_handle(handle)
+
+
+_PROCESS_API = None
+
+
+def process_api():
+    global _PROCESS_API
+    if _PROCESS_API is None:
+        if os.name != "nt":
+            raise RuntimeError("native Windows process enumeration is Windows-only")
+        _PROCESS_API = _Win32ProcessApi()
+    return _PROCESS_API
+
+
+def process_table(api=None):
+    """Return {pid: parent_pid} with bounded retries; never loops forever."""
+    api = api if api is not None else process_api()
+    last_error = None
+    for attempt in range(1, MAX_ENUMERATION_ATTEMPTS + 1):
+        try:
+            return api.snapshot_table()
+        except OSError as error:
+            last_error = error
+            winerror = _winerror(error)
+            if winerror not in TRANSIENT_ENUMERATION_ERRORS:
+                raise ProcessEnumerationError(
+                    "process enumeration failed: winerror=%s" % (winerror,)) from error
+            if attempt < MAX_ENUMERATION_ATTEMPTS:
+                time.sleep(ENUMERATION_RETRY_DELAY * attempt)
+    raise ProcessEnumerationError(
+        "process enumeration failed after %d attempts: winerror=%s"
+        % (MAX_ENUMERATION_ATTEMPTS, _winerror(last_error))) from last_error
+
+
+def descendants(table, root_pid, max_depth=MAX_PROCESS_TREE_DEPTH):
+    """Return {pid: depth} for the real descendants of root_pid, cycle safe."""
+    children = {}
+    for pid, parent in table.items():
+        children.setdefault(parent, []).append(pid)
+    found = {}
+    frontier = [root_pid]
+    for depth in range(1, max_depth + 1):
+        following = []
+        for parent in frontier:
+            for pid in sorted(children.get(parent, ())):
+                if pid == root_pid or pid in found:
+                    continue
+                found[pid] = depth
+                following.append(pid)
+                if len(found) > MAX_PROCESS_TREE_SIZE:
+                    raise ProcessEnumerationError(
+                        "process tree exceeds the %d-process acceptance bound" % MAX_PROCESS_TREE_SIZE)
+        frontier = following
+        if not frontier:
+            break
+    return found
+
+
+def validate_identity(identity, depth, parent, expected_image):
+    """Accept a descendant only with verified ancestry, image and creation time."""
+    if depth == 1 and identity.image_path != expected_image:
+        raise ProcessIdentityMismatch(
+            "direct child %d runs %r, not the started test EXE %r"
+            % (identity.pid, identity.image_path, expected_image))
+    if identity.creation_time < parent.creation_time:
+        raise ProcessIdentityMismatch(
+            "process %d was created before its verified parent %d"
+            % (identity.pid, parent.pid))
+    return identity
+
+
+def validate_known_identity(cached, identity):
+    """Reject PID reuse: a previously verified PID must keep its creation time."""
+    if cached != identity:
+        raise ProcessIdentityMismatch(
+            "PID %d was recycled or replaced after it was verified" % identity.pid)
+    return identity
+
+
+def wait_for_gui(window, process, seconds=30, minimum=10):
+    """Wait for a real, verified Tk window tree; classify every failure cause.
+
+    A process-management failure is re-raised as PROCESS_ENUMERATION_FAILED and
+    never counted as a GUI success or as a GUI timeout.
+    """
+    deadline = time.monotonic() + seconds
+    observed = 0
+    while True:
+        if process.poll() is not None:
+            raise GuiProcessExited(
+                "GUI process exited with code %r before its window was usable"
+                % (process.returncode,))
+        observed = len(window.children())
+        if observed > minimum:
+            return observed
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(.1)
+    if observed == 0:
+        raise GuiWindowNotFound(
+            "GUI process created no visible window within %s seconds" % seconds)
+    raise GuiStartTimeout(
+        "GUI window had %d visible widgets (need >%d) after %s seconds; layout never completed"
+        % (observed, minimum, seconds))
+
+
 class ChildWindow:
     """Address only visible Tk children owned by this exact test process.
 
-    Tk does not expose ttk button text through Win32. Identify the known four
-    button layout, then post Tab/Space to its own Tk HWND. Fail
-    closed if that layout changes; never send input to the foreground window.
+    Identity comes from the kernel: the Popen process is pinned with an open
+    handle (its PID cannot be recycled while that handle lives) and the
+    PyInstaller onefile GUI child must be a direct child with the same image and
+    a later creation time. Tk does not expose ttk button text through Win32, so
+    identify the known four-button layout and post Tab/Space to this process's
+    own Tk HWND; fail closed if the layout changes and never send input to the
+    foreground window or match windows by title.
     """
-    def __init__(self, process):
+    def __init__(self, process, api=None):
         self.process = process
+        self.api = api if api is not None else process_api()
         self.user = ctypes.WinDLL("user32", use_last_error=True)
         self.callback = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
         self.user.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
@@ -214,41 +503,126 @@ class ChildWindow:
         self.user.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
         self.user.EnumWindows.argtypes = [self.callback, wintypes.LPARAM]
         self.user.EnumChildWindows.argtypes = [wintypes.HWND, self.callback, wintypes.LPARAM]
-        # PyInstaller onefile's parent waits for its GUI child. Both are scoped
-        # to the copied executable, checked by process ancestry below.
-        self.pids = {process.pid}
+        arguments = process.args
+        executable = arguments[0] if isinstance(arguments, (list, tuple)) else arguments
+        self.expected_image = normalize_image_path(os.path.abspath(os.fspath(executable)))
         self.focus = -1  # Initial toplevel, then Treeview/start/stop/folder/close.
+        self.pids = {process.pid}
+        self._root_handle = None
+        self._root = None
+        self._identities = {}
+        self._gui_children = {}
+        self._depths = {}
+        self._visible_windows = 0
+        self._child_widgets = 0
+        self._cleanup_errors = []
+        self._closed = False
+        self._pin_root()
+
+    def _pin_root(self):
+        if self.process.poll() is not None:
+            raise GuiProcessExited("GUI process exited before its identity could be verified")
+        try:
+            handle = self.api.open_process(self.process.pid, PROCESS_QUERY_LIMITED_INFORMATION)
+        except OSError as error:
+            if self.process.poll() is not None:
+                raise GuiProcessExited("GUI process exited before its identity could be verified") from error
+            raise ProcessEnumerationError(
+                "cannot open the started EXE process: winerror=%s" % _winerror(error)) from error
+        try:
+            identity = self.api.identity_from_handle(handle, self.process.pid)
+        except OSError as error:
+            self.api.close_handle(handle)
+            raise ProcessEnumerationError(
+                "cannot read the started EXE identity: winerror=%s" % _winerror(error)) from error
+        if identity.image_path != self.expected_image:
+            self.api.close_handle(handle)
+            raise ProcessIdentityMismatch(
+                "started process image %r is not the test EXE %r"
+                % (identity.image_path, self.expected_image))
+        self._root_handle = handle
+        self._root = identity
+        self._identities[identity.pid] = identity
+
+    def _verified_table(self, table):
+        if self.process.pid not in table and self.process.poll() is None:
+            raise ProcessEnumerationError(
+                "started EXE process %d is missing from the kernel process table"
+                % self.process.pid)
+        depths = descendants(table, self.process.pid)
+        verified = {self.process.pid: self._root}
+        by_depth = {}
+        for pid, depth in depths.items():
+            by_depth.setdefault(depth, []).append(pid)
+        for depth in sorted(by_depth):
+            for pid in sorted(by_depth[depth]):
+                parent = verified.get(table.get(pid))
+                if parent is None:
+                    continue  # ancestor chain unverified: never trust its windows
+                try:
+                    identity = self.api.process_identity(pid)
+                except OSError as error:
+                    winerror = _winerror(error)
+                    if winerror == ERROR_INVALID_PARAMETER:
+                        if depth == 1:
+                            if self.process.poll() is not None:
+                                raise GuiProcessExited(
+                                    "started EXE process exited before its GUI child was verified") from error
+                            raise GuiProcessExited(
+                                "PyInstaller GUI child exited before its window was verified") from error
+                        continue  # transient helper process already exited
+                    raise ProcessEnumerationError(
+                        "cannot read process %d identity: winerror=%s" % (pid, winerror)) from error
+                cached = self._identities.get(pid)
+                if cached is not None:
+                    validate_known_identity(cached, identity)
+                else:
+                    validate_identity(identity, depth, parent, self.expected_image)
+                    self._identities[pid] = identity
+                verified[pid] = identity
+        direct = {pid for pid, depth in depths.items() if depth == 1 and pid in verified}
+        if self._gui_children and not (direct & set(self._gui_children)):
+            raise GuiProcessExited(
+                "the PyInstaller GUI child exited while the test still needed its window")
+        for pid in direct:
+            self._gui_children[pid] = verified[pid]
+        self._depths = {pid: 0 if pid == self.process.pid else depths[pid] for pid in verified}
+        return verified
 
     def children(self):
-        # Query only descendants of the Popen PID; do not match window titles.
-        import subprocess
-        query = ("$p=Get-CimInstance Win32_Process; $ids=@(" + str(self.process.pid) + "); "
-                 "1..3 | ForEach-Object {$ids+=@($p | Where-Object {$_.ParentProcessId -in $ids} | "
-                 "ForEach-Object ProcessId)}; $ids | Sort-Object -Unique")
-        output = subprocess.check_output(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", query],
-                                         creationflags=0x08000000, timeout=15, text=True,
-                                         env={k: v for k, v in os.environ.items() if k.upper() != "PSMODULEPATH"})
-        self.pids = {int(line) for line in output.splitlines() if line.strip().isdigit()}
+        table = process_table(self.api)
+        verified = self._verified_table(table)
+        self.pids = set(verified)
         windows = []
+
         def top(hwnd, _):
             pid = wintypes.DWORD()
             self.user.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
             if pid.value in self.pids and self.user.IsWindowVisible(hwnd):
                 windows.append(hwnd)
             return True
+
         self.user.EnumWindows(self.callback(top), 0)
         items = []
+
         def child(hwnd, _):
-            if self.user.IsWindowVisible(hwnd):
+            pid = wintypes.DWORD()
+            self.user.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value in self.pids and self.user.IsWindowVisible(hwnd):
                 rect = wintypes.RECT()
                 self.user.GetWindowRect(hwnd, ctypes.byref(rect))
                 items.append((hwnd, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top))
             return True
+
         for window in windows:
             self.user.EnumChildWindows(window, self.callback(child), 0)
+        self._visible_windows = len(windows)
+        self._child_widgets = len(items)
         return items
 
     def click(self, name):
+        if self.process.poll() is not None:
+            raise GuiProcessExited("GUI process exited before button click %r" % name)
         items = self.children()
         # Actual ttk buttons are the only short rectangular leaves in the
         # bottom action area; labels there are narrower in height.
@@ -260,12 +634,85 @@ class ChildWindow:
             raise AssertionError("unexpected child button layout: " + repr(buttons))
         hwnd = max(items, key=lambda item: item[3] * item[4])[0]
         target = {"start": 1, "stop": 2, "close": 4}[name]
+
         def key(value):
             assert self.user.PostMessageW(hwnd, 0x0100, value, 1)
             time.sleep(.08)
             assert self.user.PostMessageW(hwnd, 0x0101, value, 1)
             time.sleep(.08)
+
         for _ in range((target - self.focus) % 5):
             key(9)
         key(32)
         self.focus = target
+
+    def diagnostics(self):
+        return {
+            "root_pid": self.process.pid,
+            "root_image": self._root.image_path if self._root else None,
+            "root_creation_time": self._root.creation_time if self._root else None,
+            "tracked_processes": [
+                {"pid": pid, "depth": self._depths.get(pid),
+                 "image": identity.image_path, "creation_time": identity.creation_time}
+                for pid, identity in sorted(self._identities.items())],
+            "gui_children": sorted(self._gui_children),
+            "visible_windows": self._visible_windows,
+            "visible_child_widgets": self._child_widgets,
+            "pinned_handle_open": self._root_handle is not None,
+            "closed": self._closed,
+            "cleanup_errors": list(self._cleanup_errors),
+        }
+
+    def close(self):
+        """Release the pinned root handle; safe to call more than once."""
+        handle, self._root_handle = self._root_handle, None
+        if handle is not None:
+            self.api.close_handle(handle)
+
+    def cleanup(self):
+        """Stop this test's verified GUI descendants and release handles.
+
+        Only processes whose identity was verified, or a direct child proven to
+        run the same image, are terminated; a recycled PID is never killed.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            try:
+                table = process_table(self.api)
+            except ProcessEnumerationError as error:
+                table = {}
+                self._cleanup_errors.append("enumeration during cleanup: %s" % error)
+            candidates = {pid for pid in self._identities if pid != self.process.pid}
+            try:
+                candidates.update(descendants(table, self.process.pid))
+            except ProcessEnumerationError as error:
+                self._cleanup_errors.append("tree during cleanup: %s" % error)
+            candidates.discard(self.process.pid)
+            for pid in sorted(candidates):
+                try:
+                    identity = self.api.process_identity(pid)
+                except OSError:
+                    continue  # already gone
+                cached = self._identities.get(pid)
+                if cached is not None:
+                    if identity != cached:
+                        self._cleanup_errors.append(
+                            "refused to signal recycled PID %d" % pid)
+                        continue
+                elif table.get(pid) == self.process.pid:
+                    if identity.image_path != self.expected_image:
+                        continue
+                    if self._root is None or identity.creation_time < self._root.creation_time:
+                        continue
+                else:
+                    continue
+                if not self.api.terminate(pid, identity):
+                    try:
+                        self.api.process_identity(pid)
+                    except OSError:
+                        continue  # exited on its own between the checks
+                    self._cleanup_errors.append("could not terminate verified PID %d" % pid)
+        finally:
+            self.close()
