@@ -2,25 +2,26 @@
 
 本手册定义 HA-UI 0.2.0 进入真实使用前的 **Windows 本机（A）→ 两台 VPS 只读（B）→
 隔离测试 VPS 创建/生成（C）** 三层验收。任何一层失败都停止，不进入下一层；三层全部
-通过且人工审批完成后，才可讨论生产使用。**本轮代码审查不代表任何一层真实 VPS 验收
-已完成。**
+通过且人工审批完成后，才可讨论生产使用。**0.2.0 已完成 Layer A/B/C 验收并发布；
+后续版本仍须重新执行本清单。**
 
-## 0. 当前状态（0.2.0 Draft）
+## 0. 当前状态（0.2.0 已发布）
 
 | 项目 | 状态 | 证据 |
 | --- | --- | --- |
-| 自动测试（合成凭据，Windows） | ✅ 已通过 | `pytest ha-ui/tests`：539 passed / 4 host skips（0.2.0 本地） |
+| 自动测试（合成凭据，Windows） | ✅ 已通过 | CI `pytest ha-ui/tests`：620 passed / 1 host skip；本机 617 passed / 4 host skip（0.2.0） |
 | installer 版本/哈希门禁 | ✅ 已通过 | reviewed commit `9402be91…` + installer/lib 独立 SHA-256 + 内嵌 lib pin + host-deps；创建/生成共用 |
-| Windows EXE 构建 + 冷启动 | ⏳ 待本轮构建 | 目标 `dist/ha-ui.exe` 0.2.0；receipt/selftest/SHA-256 见 PR 证据 |
+| Windows EXE 构建 + 冷启动 | ✅ 已发布 | [`ha-ui-v0.2.0`](https://github.com/yikkrrtykj/install-singboxhysteria2/releases/tag/ha-ui-v0.2.0)：tag 指向 `b79d7d45`；EXE SHA-256 `291d3eca…c06444e54`；附件 EXE/receipt/SHA256SUMS |
 | Windows GUI 自动化 | ✅ 合成数据通过（本机 offscreen/Windows Qt） | 新三页、创建对话框、部分成功回执、生成页；截图见 [`docs/evidence/ha-ui-0.2.0`](evidence/ha-ui-0.2.0/README.md) |
-| 真实创建（A/B 两端） | ❌ 未执行 | 需要 Layer C 隔离测试 VPS + 书面授权；不得在生产 VPS 首次试跑 |
-| 真实生成/Cancel（HA 链） | ❌ 未执行 | 需要 Layer C 隔离测试 VPS；本机只验证控件/拒绝路径 |
-| 两台 VPS 只读验收（B） | ❌ 未执行 | 未获授权；未连接任何真实 VPS |
-| 隔离测试 VPS 创建/生成（C） | ❌ 未执行 | 未获授权；不得在生产 VPS 上执行 |
-| 真实 Clash Verge Rev 导入 | ❌ 未执行 | 未授权；需 Layer C 后人工执行 |
-| 已泄露凭据轮换 | ❌ 未完成 | 独立人工操作，工具不代替 |
+| 真实创建（A/B 两端） | ✅ 已通过（隔离测试 VPS） | Layer C C0–C0e：创建/补齐/并发/回滚/异常阻断；证据见 `.scratch/layer-c/`（本地） |
+| 真实生成/Cancel（HA 链） | ✅ 已通过（隔离测试 VPS） | C2–C4/C7 + C6：A-first/B-first 生成、哈希一致；取消与关闭窗口行为符合预期 |
+| 两台 VPS 只读验收（B） | ✅ 已通过 | Layer C 前置只读预检：系统/服务/配置哈希/客户端清单/证书 pin 核对；未修改 |
+| 隔离测试 VPS 创建/生成（C） | ✅ 已通过 | C0–C9（C8 人工导入已验证）；测试客户端已删除、两端配置哈希回到基线 |
+| 真实 Clash Verge Rev 导入 | ✅ 已通过 | A-first/B-first：4 节点、fallback 5s/5000ms、连通性正常；测试订阅已删除、原 profile 已恢复 |
+| 测试环境收尾 | ⚠️ 待完成 | 两台测试机 root 密码轮换 + 桌面明文密码文件清理（人工，发布不依赖） |
+| 发布 | ✅ 已发布 | `ha-ui-v0.2.0`，源码基线 `b79d7d45`，EXE `291d3eca…` |
 
-图例：✅ 自动/已做；⚠️ 部分；⏳ 待本轮；❌ 待人工/未授权。
+图例：✅ 已通过/已做；⚠️ 待收尾；⏳ 待本轮；❌ 待人工/未授权。
 
 ## 1. 总则与人工批准
 

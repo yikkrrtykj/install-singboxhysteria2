@@ -43,3 +43,17 @@
 | 创建路径 | launcher 预检 pin → root-only tx 目录 + env.sh（摘要校验）→ 同进程 hook 探针 → `setsid` detached worker（文件 stdin/stdout）→ 原子 `result`；`replace` 后无 hard kill |
 | 恢复门禁 | 普通刷新不再清除 pending；只有 `pending_transaction` 读到 absent/terminal 并配合 live 校验才解除 |
 | 残余风险 | 断电/内核崩溃/人工 kill -9 进程组不可覆盖，只能检出为 `uncertain` |
+
+
+## 0.2.0 正式发布（2026-11-25）
+
+| 项目 | 值 |
+| --- | --- |
+| Release | [`ha-ui-v0.2.0`](https://github.com/yikkrrtykj/install-singboxhysteria2/releases/tag/ha-ui-v0.2.0) |
+| Tag / 源码基线 | `ha-ui-v0.2.0` → `b79d7d45f5c1eeeaacb5b560301179428ce12c43` |
+| EXE SHA-256 | `291d3ecaa582364823315bb1d51d90770b60c9b4e421b299a365629c06444e54` |
+| 附件 | `ha-ui.exe`、`receipt.json`、`SHA256SUMS.txt`（GitHub 服务端 digest 与本机一致） |
+| CI | 28/28：Windows 620 passed/1 skipped、Linux 事务 lab Stage A 7 + Stage B 17、EXE/no-console |
+| Layer C | C0–C0e、C1–C7、C9 通过；C8 在 Clash Verge Rev 导入验证后删除测试订阅并恢复原 profile |
+
+`.scratch/layer-c/` 下的 JSON 证据仅保存在本机，不进入仓库；仓库只保留脱敏结论。
