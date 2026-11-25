@@ -18,7 +18,9 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 from quality_failover.pilot import receiver_init
-from quality_windows_lab import ChildWindow, LoopbackController, SocksServer, TrackedReceiver, serve, until
+from quality_windows_lab import (
+    ChildWindow, CleanupIncomplete, LoopbackController, ProcessEnumerationError, SocksServer,
+    TrackedReceiver, descendants, process_table, serve, until, wait_for_gui)
 
 spec = importlib.util.spec_from_file_location("exe_export_fixture", ROOT / "tests/test_quality_failover.py")
 fixture = importlib.util.module_from_spec(spec)
@@ -110,6 +112,56 @@ def lifecycle_failure(timeline, process_exit_before_cleanup):
     return None
 
 
+def stop_started_process(process, window, timeout=15):
+    """Stop only the exact Popen process through Popen's retained handle.
+
+    ChildWindow.cleanup() has already terminated the verified descendants. The
+    root is stopped through the Popen handle (never re-resolved from a PID), and
+    there is deliberately no identity-free process-tree kill: unverified
+    descendants are only reported, never signalled. A non-empty result means the
+    cleanup is incomplete and must be surfaced as such, not hidden behind a
+    broader kill.
+    """
+    problems = []
+    if window is not None:
+        try:
+            window.cleanup()
+        except Exception as error:  # cleanup must never hide the original failure
+            problems.append("window cleanup: " + type(error).__name__)
+        try:
+            problems.extend("descendant: " + str(item) for item in window.cleanup_problems())
+        except AttributeError:
+            problems.append("window cleanup: missing cleanup_problems()")
+    killed_root = False
+    if process.poll() is None:
+        try:
+            process.kill()  # TerminateProcess on the handle owned by this Popen
+            process.wait(timeout=timeout)
+            killed_root = True
+        except (OSError, subprocess.TimeoutExpired) as error:
+            problems.append("started process: " + type(error).__name__)
+    if process.poll() is None:
+        problems.append("started process still running after termination")
+    elif killed_root and os.name == "nt":
+        # Read-only residual scan: report children the verified cleanup could not
+        # cover (e.g. ChildWindow construction failed before any descent). No
+        # process is signalled here.
+        try:
+            table = process_table()
+        except (ProcessEnumerationError, RuntimeError) as error:
+            problems.append("residual scan unavailable: " + type(error).__name__)
+        else:
+            if process.pid not in table:
+                try:
+                    residual = descendants(table, process.pid)
+                except ProcessEnumerationError as error:
+                    problems.append("residual scan unavailable: " + type(error).__name__)
+                else:
+                    problems.extend("unverified descendant still running: PID %d" % pid
+                                   for pid in sorted(residual))
+    return problems
+
+
 def gui(app, root, environment, controller, sink, hopping, full_recovery, record_fault=False):
     home = Path(environment["APPDATA"]) / "io.github.clash-verge-rev.clash-verge-rev"
     home.mkdir()
@@ -120,11 +172,14 @@ def gui(app, root, environment, controller, sink, hopping, full_recovery, record
     source_digest = digest(app.parent / "synthetic-mihomo.yaml")
     process = subprocess.Popen([str(app)], env=environment, cwd=root, creationflags=0x08000000)
     controller.event("process_started")
-    window = ChildWindow(process)
-    bundle, failed = None, False
+    window = None
+    bundle, failed, diagnostic = None, False, None
     with ExitStack() as stack:
         try:
-            until(lambda: len(window.children()) > 10, label="actual GUI opens")
+            # A test-environment query failure (PROCESS_ENUMERATION_FAILED) must
+            # never be reported as "the GUI opened" nor as a GUI timeout.
+            window = ChildWindow(process)
+            wait_for_gui(window, process, seconds=30, minimum=10)
             work = Path(environment["LOCALAPPDATA"]) / "ClashQualitySwitch"
             assert not list(work.glob("*/bundle-*/bundle.json"))
             assert controller.writes == []
@@ -234,20 +289,37 @@ def gui(app, root, environment, controller, sink, hopping, full_recovery, record
             failed = True
             # Do not poll state.json: a Windows observer can block its writer.
             # Observe actual API mutations/authenticated receipts, never credentials.
-            diagnostic = {"lab_failure": True, "process_exit_before_cleanup": process.poll(),
+            diagnostic = {"lab_failure": True,
+                "failure_classification": getattr(error, "classification", type(error).__name__),
+                "failure_error": type(error).__name__, "failure_message": str(error)[:500],
+                "process_exit_before_cleanup": process.poll(),
                 "observations": controller.observations,
                 "confirmed_receipts": {node: len(sink.uploads(node, controller.started)) for node in ("Reality", "Hysteria2")},
                 "mock_fixed": controller.fixed, "mock_writes": controller.writes,
                 "mock_reachable": controller.reachable, "unexpected_requests": controller.unexpected,
                 "timeline": controller.timeline}
+            if window is not None:
+                try:
+                    diagnostic["child_window"] = window.diagnostics()
+                except Exception as diagnostic_error:
+                    diagnostic["child_window_error"] = type(diagnostic_error).__name__
             error.lab_diagnostics = diagnostic
             raise
         finally:
             if process.poll() is None:
                 controller.event("test_cleanup_forced_kill")
-                subprocess.run(["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=0x08000000)
-                process.wait(timeout=15)
+            # Identity-checked cleanup plus a handle-bound root termination only.
+            # There is deliberately no fallback to an identity-free process-tree
+            # kill: an unverified descendant must never be signalled, and an
+            # incomplete cleanup is reported instead of being masked by a
+            # broader kill.
+            cleanup_problems = stop_started_process(process, window)
+            if cleanup_problems:
+                if failed:
+                    if diagnostic is not None:
+                        diagnostic["cleanup_incomplete"] = cleanup_problems
+                else:
+                    raise CleanupIncomplete("test cleanup incomplete: " + "; ".join(cleanup_problems))
             if failed and bundle is not None:
                 # Post-exit only. Never dump inputs, connection files or tokens.
                 try:
@@ -387,6 +459,7 @@ if __name__ == "__main__":
         if args.report:
             with Path(args.report).open("x", encoding="utf-8") as stream:
                 json.dump({"v": 1, "acceptance_passed": False, "failure_class": type(error).__name__,
+                           "failure_classification": getattr(error, "classification", None),
                            "diagnostic": getattr(error, "lab_diagnostics", None), "production_contacted": False}, stream, indent=2)
         raise
     if args.report:
