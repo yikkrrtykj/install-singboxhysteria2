@@ -18,7 +18,9 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 from quality_failover.pilot import receiver_init
-from quality_windows_lab import ChildWindow, LoopbackController, SocksServer, TrackedReceiver, serve, until, wait_for_gui
+from quality_windows_lab import (
+    ChildWindow, CleanupIncomplete, LoopbackController, ProcessEnumerationError, SocksServer,
+    TrackedReceiver, descendants, process_table, serve, until, wait_for_gui)
 
 spec = importlib.util.spec_from_file_location("exe_export_fixture", ROOT / "tests/test_quality_failover.py")
 fixture = importlib.util.module_from_spec(spec)
@@ -108,6 +110,56 @@ def lifecycle_failure(timeline, process_exit_before_cleanup):
     if process_exit_before_cleanup is not None and not close_requested:
         return "gui_exited_before_close"
     return None
+
+
+def stop_started_process(process, window, timeout=15):
+    """Stop only the exact Popen process through Popen's retained handle.
+
+    ChildWindow.cleanup() has already terminated the verified descendants. The
+    root is stopped through the Popen handle (never re-resolved from a PID), and
+    there is deliberately no identity-free process-tree kill: unverified
+    descendants are only reported, never signalled. A non-empty result means the
+    cleanup is incomplete and must be surfaced as such, not hidden behind a
+    broader kill.
+    """
+    problems = []
+    if window is not None:
+        try:
+            window.cleanup()
+        except Exception as error:  # cleanup must never hide the original failure
+            problems.append("window cleanup: " + type(error).__name__)
+        try:
+            problems.extend("descendant: " + str(item) for item in window.cleanup_problems())
+        except AttributeError:
+            problems.append("window cleanup: missing cleanup_problems()")
+    killed_root = False
+    if process.poll() is None:
+        try:
+            process.kill()  # TerminateProcess on the handle owned by this Popen
+            process.wait(timeout=timeout)
+            killed_root = True
+        except (OSError, subprocess.TimeoutExpired) as error:
+            problems.append("started process: " + type(error).__name__)
+    if process.poll() is None:
+        problems.append("started process still running after termination")
+    elif killed_root and os.name == "nt":
+        # Read-only residual scan: report children the verified cleanup could not
+        # cover (e.g. ChildWindow construction failed before any descent). No
+        # process is signalled here.
+        try:
+            table = process_table()
+        except (ProcessEnumerationError, RuntimeError) as error:
+            problems.append("residual scan unavailable: " + type(error).__name__)
+        else:
+            if process.pid not in table:
+                try:
+                    residual = descendants(table, process.pid)
+                except ProcessEnumerationError as error:
+                    problems.append("residual scan unavailable: " + type(error).__name__)
+                else:
+                    problems.extend("unverified descendant still running: PID %d" % pid
+                                   for pid in sorted(residual))
+    return problems
 
 
 def gui(app, root, environment, controller, sink, hopping, full_recovery, record_fault=False):
@@ -254,19 +306,20 @@ def gui(app, root, environment, controller, sink, hopping, full_recovery, record
             error.lab_diagnostics = diagnostic
             raise
         finally:
-            if window is not None:
-                try:
-                    window.cleanup()
-                except Exception as cleanup_error:  # never mask the original failure
-                    if failed:
-                        diagnostic["window_cleanup_error"] = type(cleanup_error).__name__
-                    else:
-                        raise
             if process.poll() is None:
                 controller.event("test_cleanup_forced_kill")
-                subprocess.run(["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=0x08000000)
-                process.wait(timeout=15)
+            # Identity-checked cleanup plus a handle-bound root termination only.
+            # There is deliberately no fallback to an identity-free process-tree
+            # kill: an unverified descendant must never be signalled, and an
+            # incomplete cleanup is reported instead of being masked by a
+            # broader kill.
+            cleanup_problems = stop_started_process(process, window)
+            if cleanup_problems:
+                if failed:
+                    if diagnostic is not None:
+                        diagnostic["cleanup_incomplete"] = cleanup_problems
+                else:
+                    raise CleanupIncomplete("test cleanup incomplete: " + "; ".join(cleanup_problems))
             if failed and bundle is not None:
                 # Post-exit only. Never dump inputs, connection files or tokens.
                 try:

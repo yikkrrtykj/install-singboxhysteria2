@@ -4,6 +4,7 @@ Windows process-identity contracts for the EXE acceptance harness.
 import ctypes
 import importlib.util
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -19,7 +20,7 @@ import quality_windows_lab as winlab
 from quality_windows_lab import (
     GuiProcessExited, GuiStartTimeout, GuiWindowNotFound, ProcessEnumerationError,
     ProcessIdentity, ProcessIdentityMismatch, TrackedReceiver, descendants, normalize_image_path,
-    process_table, validate_identity, validate_known_identity, wait_for_gui)
+    process_table, stale_parent_attribution, validate_identity, validate_known_identity, wait_for_gui)
 
 spec = importlib.util.spec_from_file_location("frozen_acceptance_contract", ROOT / "tests/quality-windows-exe-lab.py")
 lab = importlib.util.module_from_spec(spec)
@@ -192,6 +193,14 @@ class ProcessTreeTests(unittest.TestCase):
         with self.assertRaises(ProcessIdentityMismatch):
             validate_known_identity(cached, ProcessIdentity(11, 201, cached.image_path))
 
+    def test_recycled_parent_pid_is_excluded_not_trusted(self):
+        image = normalize_image_path(r"c:\lab\app.exe")
+        parent = ProcessIdentity(11, 500, image)
+        stale = ProcessIdentity(12, 400, normalize_image_path(r"c:\windows\system32\conhost.exe"))
+        real_child = ProcessIdentity(13, 600, image)
+        self.assertTrue(stale_parent_attribution(stale, parent))
+        self.assertFalse(stale_parent_attribution(real_child, parent))
+
     def test_image_path_comparison_strips_nt_prefixes(self):
         self.assertEqual(normalize_image_path(r"\\?\C:\Lab\APP.EXE"), normalize_image_path(r"c:/lab/app.exe"))
         self.assertEqual(normalize_image_path(r"\\?\UNC\server\share\app.exe"),
@@ -251,11 +260,85 @@ class GuiWaitClassificationTests(unittest.TestCase):
             wait_for_gui(_ScriptedWindow(error=ProcessIdentityMismatch("recycled")), _AliveProcess(), seconds=1)
 
 
+class _ScriptedRootProcess:
+    """Popen-like object that never owns a real process."""
+
+    def __init__(self, kill_error=None, wait_error=None):
+        self.pid = 4294967295
+        self.alive = True
+        self.returncode = None
+        self.kill_error = kill_error
+        self.wait_error = wait_error
+
+    def poll(self):
+        return None if self.alive else self.returncode
+
+    def kill(self):
+        if self.kill_error is not None:
+            raise self.kill_error
+        self.alive = False
+        self.returncode = 1
+
+    def wait(self, timeout=None):
+        if self.wait_error is not None:
+            raise self.wait_error
+        self.alive = False
+        return self.returncode or 0
+
+
+class _ScriptedCleanupWindow:
+    def __init__(self, problems=()):
+        self.problems = list(problems)
+        self.cleaned = False
+
+    def cleanup(self):
+        self.cleaned = True
+
+    def cleanup_problems(self):
+        return list(self.problems)
+
+
+class CleanupContractTests(unittest.TestCase):
+    def test_root_stop_uses_only_the_popen_handle(self):
+        process, window = _ScriptedRootProcess(), _ScriptedCleanupWindow()
+        self.assertEqual(lab.stop_started_process(process, window), [])
+        self.assertTrue(window.cleaned)
+        self.assertFalse(process.alive)
+
+    def test_unresponsive_root_is_reported_not_tree_killed(self):
+        process = _ScriptedRootProcess(kill_error=OSError(5, "access denied"))
+        window = _ScriptedCleanupWindow(["could not terminate verified PID 7"])
+        problems = lab.stop_started_process(process, window)
+        self.assertTrue(any("started process" in problem for problem in problems), problems)
+        self.assertTrue(any("still running" in problem for problem in problems), problems)
+        self.assertTrue(any("PID 7" in problem for problem in problems), problems)
+
+    def test_verified_cleanup_problems_are_reported(self):
+        window = _ScriptedCleanupWindow(["could not terminate verified PID 9"])
+        problems = lab.stop_started_process(_ScriptedRootProcess(), window)
+        self.assertTrue(any("PID 9" in problem for problem in problems), problems)
+
+    def test_missing_cleanup_contract_is_reported(self):
+        class WindowWithoutProblems:
+            def cleanup(self):
+                pass
+
+        problems = lab.stop_started_process(_ScriptedRootProcess(), WindowWithoutProblems())
+        self.assertTrue(any("missing cleanup_problems" in problem for problem in problems), problems)
+
+    def test_incomplete_cleanup_has_a_stable_classification(self):
+        self.assertEqual(winlab.CleanupIncomplete.classification, "CLEANUP_INCOMPLETE")
+
+
 class HarnessSourceGuardTests(unittest.TestCase):
     def test_acceptance_harness_has_no_external_process_management_query(self):
         source = (ROOT / "tests/quality_windows_lab.py").read_text(encoding="utf-8")
         for forbidden in ("Get-CimInstance", "Win32_Process", "powershell"):
             self.assertNotIn(forbidden, source)
+
+    def test_acceptance_lab_has_no_identity_free_tree_kill(self):
+        source = (ROOT / "tests/quality-windows-exe-lab.py").read_text(encoding="utf-8")
+        self.assertNotIn("taskkill", source.lower())
 
 
 _NATIVE_SLEEP_CODE = "import time; time.sleep(60)"
@@ -313,6 +396,38 @@ class NativeProcessIdentityTests(unittest.TestCase):
 
     def _wait_gone(self, pid, seconds=10):
         return self._wait(lambda: self._is_gone(pid), seconds)
+
+    def _start_foreign_child_tree(self):
+        """Start a real process whose direct child intentionally runs another image.
+
+        The foreign child is a GUI-subsystem script host (no console), so no OS
+        console host is created that could outlive the test and be attributed to
+        a recycled root PID by a later test.
+        """
+        pidfile = Path(self.directory) / "foreign.pid"
+        script = Path(self.directory) / "sleep.vbs"
+        script.write_text("WScript.Sleep 60000\n", encoding="ascii")
+        wscript = str(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "wscript.exe")
+        if not Path(wscript).is_file():
+            self.skipTest("wscript.exe is required for the foreign direct-child fixture")
+        root = self._start("-c", (
+            "import os,subprocess,sys,time; "
+            "p=subprocess.Popen([sys.argv[1],sys.argv[2]]); "
+            "open(sys.argv[3],'w').write(str(p.pid)); time.sleep(60)"),
+            wscript, str(script), str(pidfile))
+        self.assertTrue(self._wait(
+            lambda: pidfile.is_file() and pidfile.read_text(encoding="utf-8").strip(), seconds=15),
+            "the foreign child process was not started")
+        return root, int(pidfile.read_text(encoding="utf-8"))
+
+    def _kill_verified(self, pid):
+        api = winlab.process_api()
+        try:
+            identity = api.process_identity(pid)
+        except OSError:
+            return
+        api.terminate(pid, identity)
+        self._wait_gone(pid)
 
     def test_native_tree_finds_the_real_parent_child_processes(self):
         root = self._start("-c", "import subprocess,sys,time; "
@@ -401,6 +516,33 @@ class NativeProcessIdentityTests(unittest.TestCase):
         finally:
             if window is not None:
                 window.cleanup()
+
+    def test_native_unverified_child_is_not_killed_by_verified_cleanup(self):
+        root, foreign_pid = self._start_foreign_child_tree()
+        window = winlab.ChildWindow(root)
+        try:
+            with self.assertRaises(ProcessIdentityMismatch):
+                window.children()
+        finally:
+            window.cleanup()
+        try:
+            self.assertFalse(self._is_gone(foreign_pid),
+                             "verified cleanup killed a descendant whose identity was never verified")
+        finally:
+            self._kill_verified(foreign_pid)
+
+    def test_native_started_process_stop_never_tree_kills_unverified_child(self):
+        root, foreign_pid = self._start_foreign_child_tree()
+        window = winlab.ChildWindow(root)
+        problems = lab.stop_started_process(root, window)
+        try:
+            self.assertIsNotNone(root.poll())
+            self.assertFalse(self._is_gone(foreign_pid),
+                             "stop_started_process killed an unverified descendant")
+            self.assertTrue(any("unverified descendant" in problem for problem in problems), problems)
+            self.assertTrue(any("PID %d" % foreign_pid in problem for problem in problems), problems)
+        finally:
+            self._kill_verified(foreign_pid)
 
     def test_native_snapshot_does_not_leak_process_handles(self):
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)

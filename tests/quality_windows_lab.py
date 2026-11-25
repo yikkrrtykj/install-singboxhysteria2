@@ -229,6 +229,11 @@ class GuiStartTimeout(GuiWindowNotFound):
     classification = "GUI_START_TIMEOUT"
 
 
+class CleanupIncomplete(LabFailure):
+    """The test could not prove that every process it started was stopped."""
+    classification = "CLEANUP_INCOMPLETE"
+
+
 # Acceptance must learn "which processes did I start and which windows belong to
 # them" from the kernel, not from an out-of-process management query. Toolhelp32
 # and the per-process image queries below are bounded kernel calls; a slow or
@@ -446,6 +451,16 @@ def validate_identity(identity, depth, parent, expected_image):
     return identity
 
 
+def stale_parent_attribution(identity, parent):
+    """True when the recorded parent relation is impossible (parent PID reuse).
+
+    A process created before the verified parent cannot be its child: the PID
+    recorded as its parent was recycled. Such a process must never be trusted as
+    part of the test's window scope and must never be signalled by cleanup.
+    """
+    return identity.creation_time < parent.creation_time
+
+
 def validate_known_identity(cached, identity):
     """Reject PID reuse: a previously verified PID must keep its creation time."""
     if cached != identity:
@@ -512,6 +527,7 @@ class ChildWindow:
         self._root = None
         self._identities = {}
         self._gui_children = {}
+        self._stale_attributions = []
         self._depths = {}
         self._visible_windows = 0
         self._child_widgets = 0
@@ -576,6 +592,12 @@ class ChildWindow:
                 cached = self._identities.get(pid)
                 if cached is not None:
                     validate_known_identity(cached, identity)
+                elif stale_parent_attribution(identity, parent):
+                    # Recycled parent PID: this process predates the started
+                    # process, so it cannot be its child. Exclude it from the
+                    # trusted window scope and never signal it.
+                    self._stale_attributions.append(pid)
+                    continue
                 else:
                     validate_identity(identity, depth, parent, self.expected_image)
                     self._identities[pid] = identity
@@ -656,6 +678,7 @@ class ChildWindow:
                  "image": identity.image_path, "creation_time": identity.creation_time}
                 for pid, identity in sorted(self._identities.items())],
             "gui_children": sorted(self._gui_children),
+            "stale_parent_attributions": sorted(self._stale_attributions),
             "visible_windows": self._visible_windows,
             "visible_child_widgets": self._child_widgets,
             "pinned_handle_open": self._root_handle is not None,
@@ -716,3 +739,7 @@ class ChildWindow:
                     self._cleanup_errors.append("could not terminate verified PID %d" % pid)
         finally:
             self.close()
+
+    def cleanup_problems(self):
+        """Problems observed by cleanup(); empty when verified cleanup was clean."""
+        return list(self._cleanup_errors)
