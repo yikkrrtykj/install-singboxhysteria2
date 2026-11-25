@@ -61,7 +61,7 @@ implementation or deployment authorization.
 | [um-a/05-retention-capacity-backup.md](um-a/05-retention-capacity-backup.md) | 30-day history retention, deletion rules, capacity model/limits, SQLite→PostgreSQL gate, backup/restore (RPO/RTO) |
 | [um-a/06-threat-model-security-tests-performance.md](um-a/06-threat-model-security-tests-performance.md) | Threat model, abuse cases, security test plan, performance budgets and UM-E measurement plan |
 | [um-a/07-um-b-entry-and-review.md](um-a/07-um-b-entry-and-review.md) | UM-A review checklist, owner decisions (pending), UM-B entry criteria, authorization record |
-| [um-a/08-review-response-matrix.md](um-a/08-review-response-matrix.md) | PR #126 review response matrix (P0-01, P1-01..P1-06) and revision-2 validation summary |
+| [um-a/08-review-response-matrix.md](um-a/08-review-response-matrix.md) | PR #126 review response matrix (P0-01, P1-01..P1-06; rev-3 P1-07..P1-11 and consistency items) and validation summary |
 | [contracts/v1/](contracts/v1/) | Machine-readable v1 JSON schemas, positive/negative examples, signed test vectors (report + enrollment), behavioural negative contract |
 
 ## Authorization record
@@ -76,11 +76,14 @@ implementation or deployment authorization.
 ## Versioning
 
 UM-A design baseline: main `885171c08210ad0f4e91f0fed0243460d294b15e`
-(merge commit of PR #125). Contract v1 **revision 2** is frozen by
-[04-node-protocol-v1.md](um-a/04-node-protocol-v1.md) after the PR #126 review
+(merge commit of PR #125). Contract v1 **revision 3** is frozen by
+[04-node-protocol-v1.md](um-a/04-node-protocol-v1.md) after the PR #126 reviews
 (response matrix: [08](um-a/08-review-response-matrix.md)): signatures are
 transport headers only and bind endpoint/method/path/encoding/identity/time/
-sequence/nonce/body hash; replay/dedupe is `report_id`-based with persistent
-center state and `synchronous=FULL`; owner decisions remain pending. Any
-incompatible change requires an explicit UM-A design revision review before UM-B
-implementation.
+sequence/nonce/body hash; enrollment is active-on-commit (no pending activation);
+rotation is a persistent state machine where the old key is revoked only after
+new-key proof; replay is closed by `(node_id, nonce)` + full request fingerprint,
+current-boot acceptance and `report_id` dedupe with `synchronous=FULL`; data
+sources are fail-closed and authorization-gated (default off); quotas and
+security-ledger rules are frozen. Owner decisions remain pending. Any incompatible
+change requires an explicit UM-A design revision review before UM-B implementation.

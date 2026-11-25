@@ -1,13 +1,24 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://um.invalid/contracts/v1/agent-config.schema.json",
-  "title": "UM v1 pulled agent configuration response",
+  "title": "UM v1 pulled agent configuration response (source switches are fail-closed)",
   "type": "object",
   "additionalProperties": false,
-  "required": ["v", "node_id", "event_id", "config_version", "cadence_seconds",
-               "collect", "device_salt", "server_time"],
+  "required": [
+    "v",
+    "node_id",
+    "event_id",
+    "config_version",
+    "cadence_seconds",
+    "collect",
+    "device_salt",
+    "server_time",
+    "expected_inbound_tags"
+  ],
   "properties": {
-    "v": {"const": 1},
+    "v": {
+      "const": 1
+    },
     "node_id": {
       "type": "string",
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
@@ -16,22 +27,77 @@
       "type": "string",
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
     },
-    "config_version": {"type": "integer", "minimum": 1},
-    "cadence_seconds": {"type": "integer", "minimum": 30, "maximum": 300},
+    "config_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "cadence_seconds": {
+      "type": "integer",
+      "minimum": 30,
+      "maximum": 300
+    },
     "collect": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["system", "services", "protocols", "traffic", "clients", "events"],
+      "required": [
+        "system",
+        "services",
+        "singbox_api",
+        "mihomo_api",
+        "events"
+      ],
       "properties": {
-        "system": {"type": "boolean"},
-        "services": {"type": "boolean"},
-        "protocols": {"type": "boolean"},
-        "traffic": {"type": "boolean"},
-        "clients": {"type": "boolean"},
-        "events": {"type": "boolean"}
+        "system": {
+          "type": "boolean"
+        },
+        "services": {
+          "type": "boolean"
+        },
+        "singbox_api": {
+          "type": "boolean"
+        },
+        "mihomo_api": {
+          "type": "boolean"
+        },
+        "events": {
+          "type": "boolean"
+        }
       }
     },
-    "device_salt": {"type": "string", "pattern": "^[A-Za-z0-9_-]{43}$"},
-    "server_time": {"type": "integer", "minimum": 0}
+    "device_salt": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{43}$"
+    },
+    "server_time": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "expected_inbound_tags": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "inbound_tag",
+          "kind"
+        ],
+        "properties": {
+          "inbound_tag": {
+            "type": "string",
+            "maxLength": 64,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+          },
+          "kind": {
+            "enum": [
+              "reality",
+              "hysteria2",
+              "other"
+            ]
+          }
+        }
+      }
+    }
   }
 }

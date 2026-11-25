@@ -1,7 +1,7 @@
-# UM-A 07 — UM-B entry criteria, owner decisions and authorization record (revision 2)
+# UM-A 07 — UM-B entry criteria, owner decisions and authorization record (revision 3)
 
 Status: hand-off gate between UM-A (investigation/design) and UM-B. Revision after
-PR #126 review. The owner decisions below are **NOT approved** by this revision;
+PR #126 rev-3 review. Owner decisions below are **NOT approved** by this revision;
 the review's recommendations are recorded as recommendations only.
 
 ## 1. UM-A review checklist (revision 2)
@@ -25,6 +25,7 @@ the review's recommendations are recorded as recommendations only.
 | --- | --- | --- | --- |
 | Q-TRACK | Single long-term UM tracking issue? | Create one owner-authorized UM tracking Issue; coding AI must not create it | PENDING |
 | Q-HOST | Center host/spec/OS | Independent 2C4G/40 GB Ubuntu 24.04 LTS, new VPS; final size by UM-E load test | PENDING |
+| Q-SIZE | Disk/policy-B quota | 40 GB + policy B supports ~150 active nodes with VACUUM/backup scheduling; 200 active nodes with policy B needs a larger disk (or policy A). Quotas in doc 05 §4.1 | PENDING |
 | Q-INGRESS | Machine-entry transport | Evaluate dual-entry Cloudflare Tunnel (web+Access; ingest tunnel hostname without Access) **and** compare with direct TLS 8443; choose after comparison; protocol identical | PENDING (Option A/B in ADR-UM-005) |
 | Q-DNS | Domain/Cloudflare/Access | `monitor.132431.xyz` tunnel+Access; `ingest.132431.xyz` according to Q-INGRESS; owner owns zone, Access IdP, `aud`, tunnel tokens | PENDING |
 | Q-AGENT-OS | Agent OS matrix/install | Debian/Ubuntu systemd; static binary + reviewed installer; one-time root orchestration, unprivileged runtime | PENDING |
@@ -33,12 +34,13 @@ the review's recommendations are recorded as recommendations only.
 | Q-RET | Retention policy | Policy **B** (active rolling 30 d; archived keeps remaining history until T+30 d) with overlap cap; owner must confirm | PENDING |
 | Q-AUD | Audit retention | 180 d, size-bounded, configurable down but never below 30 d | PENDING |
 | Q-BACKUP | Backup / RPO / RTO | Local failure RPO ≤24 h; whole-VPS-loss RPO requires a **daily encrypted off-host copy** if ≤24 h is promised (owner daily pull or write-only push credential); otherwise state whole-VPS RPO = last off-host copy. RTO ≤2 h local, ≤1 business day whole-VPS | PENDING |
+| Q-LEDGER | Security ledger off-host handling | Include the hash-chained ledger + signed checkpoint in every backup/offsite copy; restore starts quarantined and requires ledger reconciliation; incomplete/unverifiable ledger stays quarantined (no auto ingest) | PENDING |
 | Q-HA | Availability | Single center, no HA; admin plane best-effort; business unaffected | PENDING |
 | Q-ADMIN | Admin policy | Mandatory TOTP for every admin; first phase single platform admin; one-time recovery codes; offline reset via OS access | PENDING |
 | Q-TECH | Tech stack | Go center+agent, Vue 3+TS+Vite+uPlot, SQLite WAL first (synchronous=FULL) | PENDING (review PASS on direction) |
 | Q-ALIAS | Client summary presentation | Pseudonymous `device_ref` + center-side admin display alias; no raw proxy credentials/connection data | PENDING |
 | Q-UMF | UM-F boundary | Read-only platform only; UM-F needs separate approval/design with operation-level authorization | PENDING |
-| Q-ISSUE | Existing issues | #33/#48/#67 untouched; verdicts preserved; no new issues/PRs without owner approval | PENDING |
+| Q-ISSUE | Existing issues | #33/#67 untouched; **#48 is Closed/Completed** with its fault-injection evidence retained and unfinished event-level acceptance limits preserved; no new issues/PRs without owner approval | PENDING |
 
 **No real token, password, private key, VPS purchase or Cloudflare application may
 be requested from the owner at this stage.** These questions are decision inputs
@@ -60,7 +62,7 @@ for UM-B, not provisioning actions; the design uses placeholders.
 | Slice | Scope | Must prove |
 | --- | --- | --- |
 | UM-B1 | Go module skeleton; storage interface + SQLite schema/migrations; retention engine; contract conformance tests (schemas, positive/negative vectors) | schema/retention/durability tests, 30 d accelerated retention, signed vectors |
-| UM-B2 | Ingest listener; enrollment/rotation/revocation; header/signing binding; replay/boot/seq/report_id dedupe; storage transactions; synthetic agent harness | SEC-11..15, SEC-29..31, SEC-36 protocol half, contract negatives, load smoke |
+| UM-B2 | Ingest listener; enrollment (active-on-commit) / rotation state machine / revocation; header/signing binding; replay/boot/seq/report_id dedupe; storage transactions; synthetic agent harness | SEC-11..15, SEC-29..31, SEC-36..38, contract negatives, load smoke |
 | UM-B3 | `um-agent`; provisioning orchestration (root one-shot → unprivileged enroll); read-only collectors; D-Bus/no-exec; durable spool; install/runbook | SEC-21/31/32/33, agent budgets, offline replay/restart/revocation transitions, no-exec proof |
 | UM-B4 | Admin API/CLI for events, nodes, tokens, revocation, retention, aliases (web UI is UM-C) | RBAC foundations, audit, cross-event isolation, data-honesty APIs |
 
@@ -89,7 +91,7 @@ authorized only in UM-E.
 | UM-F remote write | **DEFERRED** |
 | Production deployment/release | **HOLD** |
 | Merge of the UM-A PR | Requires independent review PASS and owner merge authorization; coding AI does not merge |
-| Existing systems (#33/#48/#67/Monitor/HA-UI) | Unchanged; verdicts/deployment states preserved |
+| Existing systems (#33/#67/Monitor/HA-UI) | Unchanged; verdicts/deployment states preserved. #48 is Closed/Completed and its record is preserved (not reopened or reset) |
 | Center/agent/VPS/Cloudflare resources | Not created, not deployed; no credentials, configs or production state touched |
 | Related existing CI flake | Recorded; a separate owner-authorized hotfix is suggested; no test/workflow change in this PR |
 

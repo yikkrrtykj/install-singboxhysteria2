@@ -205,6 +205,7 @@ widen a role. Every event-scoped query includes the resolved event set in SQL
 | `events` | competition/event catalog, state active/archived, purge_after | root | until purge/30 d after archive |
 | `nodes` | node identity, event binding, state, last seen, config version | event | with event; retired row 30 d after last report |
 | `node_keys` | public keys, activation/revocation, rotation link | event | audit-linked; removed with event purge (+30 d revocation record) |
+| `key_rotations` | rotation state machine (awaiting_proof/confirmed/aborted), old/new key ids, nonce, expiry | event | with key identity |
 | `enroll_tokens` | one-time token hashes, TTL, creator, used-by | event | deleted after use/expiry (hash only) |
 | `node_latest` | last authenticated snapshot projection (structured columns; only newer `collected_at` may overwrite) | event | current only |
 | `node_services`, `node_protocols`, `node_traffic` | latest per-service/protocol state and cumulative counters | event | current only |
@@ -220,6 +221,7 @@ widen a role. Every event-scoped query includes the resolved event set in SQL
 | `admin_users`, `user_event_scopes`, `sessions`, `recovery_codes` | auth/RBAC/session state | root/user | sessions expire; users until deleted |
 | `audit_log` | security/administrative audit, closed actions | root/event | 180 d (configurable, size-bounded) |
 | `retention_runs`, `schema_migrations` | maintenance state | root | current |
+| security ledger (file) | hash-chained append-only revocations/purges/restores/account changes, fsynced before DB commit | root | 180 d; included in every backup and offsite copy |
 
 No raw report JSON, YAML, UUIDs, passwords, private keys, API secrets, source
 IPs or free text are stored (see doc 04 §privacy and doc 05 deletion rules).
@@ -238,11 +240,13 @@ stateDiagram-v2
   revoked --> [*]: reports rejected; node retired after 30 d
 ```
 
-Center node states: `pending_activation` (enrolled but response lost / not yet
-usable) → `active` → `revoked` → `retired` (admin action), with audit records.
-Re-enrollment always creates a new node identity; old history remains queryable
-until its retention expiry. Rotation keeps the same `node_id`; a lost rotate
-response is retried idempotently within the old-key grace window (doc 04 §7).
+Center node states: `active` immediately after the enrollment transaction commits
+(no `pending_activation` state; a lost enrollment response leaves a normal active
+orphan identity for the admin to revoke) → `revoked` → `retired` (admin action),
+with audit records. Re-enrollment always creates a new node identity; old history
+remains queryable until its retention expiry. Rotation keeps the same `node_id`;
+the old key is revoked only after proof of new-key use (doc 04 §7), never on a
+timer.
 
 ## 11. Runtime and OS profiles
 
@@ -257,13 +261,20 @@ a separate service with its own tunnel token (no other privileges).
 sudo), `NoNewPrivileges=yes`, `ProtectSystem=strict`, `ProtectHome=yes`,
 `PrivateTmp=yes`, no listening sockets, `ReadWritePaths=/var/lib/um-agent`,
 files 0700/0600; **no fork/exec** (seccomp denies `execve/execveat`,
-`NoExecPaths=/` where supported); only required read paths: sing-box loopback API
-credential delivered by systemd `LoadCredential=` (source file permissions are
-not changed), `/proc`, systemd D-Bus read-only unit properties, optional Mihomo
-credential via `LoadCredential=`. No `sbox-cm` socket, no journald, no root, no
-`systemctl` execution. Provisioning is a one-time root installer orchestration:
-token file root:root 0600, fed to `um-agent enroll --token-stdin` as `umagent`
-through a pipe; the agent owns its key/state; root deletes the token afterwards.
+`NoExecPaths=/` where supported); only required read paths: `/proc` and a private
+credential directory; systemd D-Bus read-only unit properties. No `sbox-cm`
+socket, no journald, no root, no `systemctl` execution.
+**Data sources are fail-closed and authorization-gated**: `singbox_api` and
+`mihomo_api` default to `false`; the center enables `singbox_api` only after
+UM-B3 records a server-side authorization audit proving the credential cannot
+mutate configuration, and `mihomo_api` is disabled in v1 (no proven read-only
+access mode). An unproven/version-mismatched source stays disabled, reports
+`availability=unavailable` and `agent_error code=source_authorization_unproven`,
+and never produces fabricated values. No sing-box/Mihomo/Monitor/`sbox-cm` file
+permission is changed; credentials are delivered by systemd `LoadCredential=`.
+Provisioning is a one-time root installer orchestration: token file root:root
+0600, fed to `um-agent enroll --token-stdin` as `umagent` through a pipe; the
+agent owns its key/state; root deletes the token afterwards.
 
 ## 12. Secrets inventory and logging rules
 
@@ -285,6 +296,20 @@ never headers, bodies, tokens, passwords, signatures, keys, raw node payloads.
 Audit log has actor/target/action/result only.
 
 ## 13. Failure isolation
+
+**Unified ingress failure model (Option A tunnel vs Option B direct TLS).** Both
+options share the same agent behavior: retry with bounded backoff, durable spool,
+no data loss beyond the spool bound, no effect on business services. The
+differences are only the failure domain and observability:
+
+| Failure | Option A (both entries via Cloudflare Tunnel) | Option B (machine entry direct TLS) |
+| --- | --- | --- |
+| Cloudflare outage / tunnel down | web **and** machine ingress unavailable; agents spool, retry after recovery | web unavailable; machine ingress still ingests (independent) |
+| center listener/process down | both entries fail; agents retry; no data loss beyond spool | same (both entries on the center) |
+| center host down | both fail; agents spool; no business impact | same |
+| machine ingress flood/attack | Cloudflare edge absorbs/limits before the center | center must absorb it on the public TLS listener; rate limits/crypto apply |
+| monitoring payload confidentiality | Cloudflare edge terminates TLS (payload readable by CF) | end-to-end TLS to center |
+| admin Access dependency | required for web entry | required for web entry only |
 
 - Center down / unreachable: agents spool up to 32 MiB/7 days, then fail-closed
   and stop advancing (bounded), and keep retrying; no effect on sing-box,

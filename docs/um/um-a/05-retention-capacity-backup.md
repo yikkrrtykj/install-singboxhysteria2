@@ -44,7 +44,9 @@ Frozen rules for policy B (if approved):
 | `boot_registry` | with node identity; bounded last 8 boots | retired boots rejected as `stale_boot` |
 | `node_seq` | current only | persisted for center-restart recovery |
 | `node_keys` | with node identity; revocation record 30 d after purge | audit/forensics |
+| `key_rotations` | with node/key identity | rotation state machine recovery (doc 04 §7) |
 | `audit_log` | 180 d (owner decision Q-AUD; configurable down, never below 30) | security audit, size-bounded |
+| security ledger (`security-ledger.jsonl`) | 180 d, append-only, hash-chained; included in every backup/offsite copy | revocations/purges/restores/account changes; must never be silently truncated |
 | `enroll_tokens` | deleted on use/expiry | hash only |
 | `sessions`, `recovery_codes` | expire / one-time | not archived |
 | backups | see §6 | not a second history store |
@@ -81,6 +83,46 @@ Assumptions: 10 events, 200 nodes planning ceiling (500-node stress in UM-E),
 
 Rows/day/node: metrics 1 440 + protocol 2 880 + client 1 200 + events ~50 ≈
 **5 570**. At 200 nodes: 1.11 M/day → **33.4 M rows / 30 d ≈ 5–6 GB**.
+
+Additional mandatory capacity terms (previously omitted, P1-11):
+
+| Term | Estimate at 200 nodes | Notes |
+| --- | --- | --- |
+| `report_dedupe` | ~2.3 M rows (8 d × 288k reports/day) ≈ 0.5–0.8 GB | one row per report; prune by 8 d |
+| `nonce_dedupe` | 288k rows/day × 24 h ≈ 0.1 GB | nonce + fingerprint |
+| `seq_dedupe` + `boot_registry` | ≤200 × (256 + 8) rows ≈ 0.05 GB | bounded |
+| `audit_log` | ≤0.1 GB | 180 d closed records |
+| security ledger | <0.05 GB | append-only JSONL |
+| WAL | ≤1 GB | checkpoint bounded |
+| VACUUM temp | up to ~1× the DB size transiently | full VACUUM needs free space ≥ DB size |
+| backups (2 local, compressed) | ~35–45 % of DB size each | independent copies |
+
+Policy A: DB ~5–6 GB (+dedupe ≈0.8) → total working set ~7–8 GB.
+Policy B worst case: ≤2× data ≈ 10–12 GB (+dedupe) → ~12–14 GB DB.
+40 GB budget with policy B and *simultaneous* VACUUM + backup: DB 14 + VACUUM
+temp 14 + backups 6 + WAL 1 + OS 8 = **43 GB > 40 GB**. Therefore the frozen
+consequence is:
+
+- 40 GB with policy B supports a **planning ceiling of ~150 active nodes** when
+  full VACUUM and backup can overlap; the center MUST schedule VACUUM only when
+  free space ≥ (DB size + 10 %) and no backup is running, and MUST defer it
+  otherwise (incremental `auto_vacuum` still runs; fragmentation is reported).
+- **200 active nodes with policy B requires either a larger disk (owner Q-SIZE) or
+  policy A**; without that, the center refuses new enrollment at the hard quota
+  (below) rather than running out of disk.
+- A 500-node stress is a PostgreSQL/disk decision gate, not assumed.
+
+### 4.1 Global quotas (frozen defaults; owner-adjustable only upward with capacity evidence)
+
+| Quota | Default | Behavior at limit |
+| --- | --- | --- |
+| Active nodes (all events) | 200 planning; hard 250 on ≥60 GB, 150 hard on 40 GB policy B | soft alarm at 80 %; at hard limit new enrollment tokens are refused (`quota_exceeded`), existing nodes unaffected |
+| Active nodes per event | 100 | token creation refused for that event |
+| Archived events with retained data | 10 | archive refused unless older archived data is purged |
+| Archived + active retention storage | DB budget in the table above; hard alarm when DB > 80 % of its allocated budget | degraded mode per §3; archive/purge required before further retention growth |
+| Events (total catalog) | 50 | create/rename refused until purge |
+| Total retention overlap | ≤2× active-only DB estimate (policy B cap) | archive refused when adding the tail would exceed the cap |
+
 
 Policy A: ~5–6 GB. Policy B worst case: ≤2× ≈ **10–12 GB** plus indexes/overhead
 (~12–14 GB). At the 500-node UM-E stress with policy B: ~30 GB — **above the
@@ -154,26 +196,44 @@ owner daily pull); it must not store center/VPS credentials.
 - Restore drill: at least once per phase UM-E, after every schema migration, and
   before production authorization; measure actual RTO and record it.
 
-### 6.3 Restore must not revive revoked nodes or purged data
+### 6.3 Security ledger and restore quarantine (P1-11)
 
 A restore is a point-in-time rollback and can resurrect identities/data revoked
-or purged after the backup was taken. Frozen procedure:
+or purged after the backup was taken. The ledger is the authority for
+revocation/purge facts across restores.
 
-1. Maintain an append-only **security ledger** (`security-ledger.jsonl`, closed
-   events: node revoke/retire, key revoke, event archive/purge/restore, admin
-   account changes) that is included in every backup and every off-host copy,
-   with a monotonic sequence and checksum.
-2. A restore starts in **quarantine**: ingest disabled, web in maintenance, no
-   agent traffic, and the restored DB is compared against the latest available
-   security ledger (prefer the off-host copy).
-3. Replay ledger events newer than the backup (or, at minimum, re-apply the
-   listed revocations/purges) before ingest is re-enabled; if the operator cannot
-   prove the ledger is complete, the restore remains quarantined and the owner
-   decides (default: do not re-enable).
-4. Restoring a backup that predates a purge requires explicit owner confirmation
-   and is audited; the purged data may only reappear with that approval.
-5. Any restored identity that is not in the ledger but whose revocation is
-   suspected must be treated as revoked until proven otherwise (fail-closed).
+Ledger properties (frozen):
+
+- Append-only `security-ledger.jsonl`, one canonical JSON record per line with
+  fields `{seq (monotonic 1..), at, actor_type, actor_id, action closed enum,
+  target closed fields, result, prev_hash, record_hash}`; `prev_hash` chains the
+  previous record and `record_hash = SHA-256(canonical record without
+  record_hash)`. The file ends with a signed checkpoint (center master key) over
+  the last `seq`/`record_hash`; checkpoints are periodic and at every backup.
+- **Durability/order**: a security mutation (node/key revoke, event archive/purge,
+  admin credential/role change) appends the ledger record and fsyncs the file
+  **before** the corresponding DB transaction commits and before the admin
+  response is returned. The DB transaction later records the same operation in
+  `audit_log`; if the process dies between ledger fsync and DB commit, the
+  operation is retried idempotently from the persisted ledger seq (no duplicate
+  effect; ledger append is idempotent by `(seq, record_hash)`).
+- Every backup and every off-host copy includes the ledger file plus the latest
+  signed checkpoint; the backup manifest records ledger last `seq`/`record_hash`.
+- **Latest-version determination**: compare `(seq, record_hash)` plus the signed
+  checkpoint; a ledger whose chain/checkpoint does not verify is invalid. The
+  newest valid ledger (prefer off-host) is authoritative.
+- **Offsite restore**: restore starts in **quarantine** (ingest disabled, web
+  maintenance, no agent traffic). The restored DB backup's ledger suffix is
+  compared with the newest valid ledger; missing/unverifiable ledger ⇒ remain
+  quarantined and require owner decision — never auto-enable ingest.
+- Replay ledger events newer than the backup (or at minimum re-apply listed
+  revocations/purges) before ingest is re-enabled. If the operator cannot prove
+  ledger completeness, the restore remains quarantined (fail-closed).
+- Restoring a backup that predates a purge requires explicit owner confirmation
+  and is audited; purged data may only reappear with that approval.
+- Restored identities whose revocation cannot be disproven are treated as revoked
+  until proven otherwise; a restored node must re-prove its key (report) and any
+  ledger revocation of that key still applies.
 
 ### 6.4 Center self-monitoring
 

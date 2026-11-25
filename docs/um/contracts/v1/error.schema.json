@@ -4,20 +4,54 @@
   "title": "UM v1 closed error body",
   "type": "object",
   "additionalProperties": false,
-  "required": ["v", "error", "retryable", "server_time"],
+  "required": [
+    "v",
+    "error",
+    "retryable",
+    "server_time"
+  ],
   "properties": {
-    "v": {"const": 1},
-    "error": {
-      "enum": ["invalid_request", "method_not_allowed", "endpoint_not_found",
-               "missing_header", "duplicate_header", "invalid_header",
-               "unsupported_encoding", "unauthorized", "unknown_node", "revoked_key",
-               "pending_activation", "bad_signature", "stale_timestamp", "replay",
-               "nonce_reuse", "sequence_conflict", "stale_boot", "identity_mismatch",
-               "report_conflict", "token_invalid", "token_expired", "token_used",
-               "rate_limited", "payload_too_large", "unsupported_version",
-               "upgrade_required", "storage_unavailable"]
+    "v": {
+      "const": 1
     },
-    "retryable": {"type": "boolean"},
-    "server_time": {"type": "integer", "minimum": 0}
+    "error": {
+      "enum": [
+        "invalid_request",
+        "method_not_allowed",
+        "endpoint_not_found",
+        "missing_header",
+        "duplicate_header",
+        "invalid_header",
+        "unsupported_encoding",
+        "unauthorized",
+        "unknown_node",
+        "revoked_key",
+        "bad_signature",
+        "stale_timestamp",
+        "replay",
+        "nonce_reuse",
+        "sequence_conflict",
+        "stale_boot",
+        "identity_mismatch",
+        "report_conflict",
+        "token_invalid",
+        "token_expired",
+        "token_used",
+        "rate_limited",
+        "payload_too_large",
+        "unsupported_version",
+        "upgrade_required",
+        "storage_unavailable",
+        "rotation_in_progress",
+        "rotation_expired"
+      ]
+    },
+    "retryable": {
+      "type": "boolean"
+    },
+    "server_time": {
+      "type": "integer",
+      "minimum": 0
+    }
   }
 }

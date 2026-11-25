@@ -8,7 +8,7 @@ was changed outside `docs/um/`.
 | Item | Value |
 | --- | --- |
 | Main / UM-A base | `885171c08210ad0f4e91f0fed0243460d294b15e` (merge commit of PR #125) |
-| Open issues (all) | #33 Incident Diagnostics, #48 Multi-VPS client-side failover, #67 P6 FROZEN Remote Probe |
+| Open issues (all) | #33 Incident Diagnostics, #67 P6 FROZEN Remote Probe; **#48 Closed/Completed** (2026-11-25) with its fault-injection evidence retained and unfinished event-level acceptance limits preserved |
 | Open PRs | none |
 | Recently merged, relevant | PR #125 quality-receiver Windows EXE CI hotfix (`9f770f9a`, `8986cbf1`); PR #124 HA-UI 0.2.0; PR #70 P6B2 Agent/provisioning; PR #69 P6B remote-probe ingest |
 | Existing deployed systems | per-VPS `monitor-v2` Monitor (transactional deploy, loopback/SSH-tunnel only); `sbox-cm` privileged plane present in repo but management disabled / not deployed; optional office Remote Probe (#67) FROZEN; Windows HA-UI 0.2.0 local tool |
@@ -22,8 +22,10 @@ Deployment/rollout boundaries preserved by UM-A:
   `PRODUCTION DEPLOYED = NO`). UM-A does not enable it or call it.
 - Issue #67 Remote Probe stays FROZEN; UM does not reactivate its contract or
   server route.
-- Issue #33 (Incident Diagnostics) and #48 (client-side HA) keep their recorded
-  scope and verdicts; UM does not rewrite either.
+- Issue #33 (Incident Diagnostics) and #67 stay unchanged. Issue #48 is now
+  **Closed/Completed**; its already-passed fault-injection evidence stays valid
+  and its unfinished event-level acceptance limits remain recorded — UM does not
+  reinterpret or reset them.
 - HA-UI 0.2.0 remains a Windows-local tool; UM does not copy its root SSH
   operation path.
 - Production rollout for every existing system remains manual/separate; UM-A
@@ -213,7 +215,8 @@ human confirmation patterns.
 
 ## 9. Open questions raised by this audit
 
-1. No UM tracking issue exists in the repository (only #33/#48/#67 are open).
+1. No UM tracking issue exists in the repository (only #33 and #67 remain open;
+   #48 is Closed/Completed).
    The design assumes the owner-provided brief is the source of truth; an
    owner-created UM tracking issue is recommended, not created by coding AI.
 2. The existing per-VPS Monitor and the future UM agent both read the same

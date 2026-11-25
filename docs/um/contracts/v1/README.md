@@ -11,6 +11,17 @@ body hash; every report body carries `report_id` + `collected_at`; snapshot/metr
 fields can be `null`/unknown with explicit availability; event `detail` is closed
 per kind; ACK/error/rotation schemas and the negative contract were added.
 
+Revision 3 changes (targeted): enrollment is **active on commit** (no
+`pending_activation`); rotation is a persistent state machine where the old key is
+owned only until new-key proof (expiry aborts the provisional key, never the old
+one) with `rotation_in_progress`/`rotation_expired`; replay is closed by unique
+`(node_id, nonce)` + full request fingerprint and current-boot acceptance with
+`seq` exact-retry rules and defined transaction ordering; the config request body
+is exactly **two bytes `{}`** and the HTTP `Content-Encoding` must match the signed
+`X-UM-Content-Encoding`; agent source switches default `false` and unproven source
+authorization disables the source (Mihomo disabled in v1); `agent-config` carries
+`expected_inbound_tags` for runtime tag/kind validation.
+
 ## Files
 
 | File | Direction | Content |

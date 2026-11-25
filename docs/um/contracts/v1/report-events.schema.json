@@ -358,6 +358,8 @@
             "spool_retention_failed",
             "config_fetch_failed",
             "source_unavailable",
+            "source_authorization_unproven",
+            "rotation_recovery_required",
             "clock_untrusted",
             "spool_write_failed"
           ]

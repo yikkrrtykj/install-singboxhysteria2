@@ -82,6 +82,11 @@ agent sending replayed/historical/forged reports.
 | 36 | CF Access identity changes but local session survives / JWT/session mismatch | session bound to Access subject; JWT revalidated per request; mismatch = 403 | SEC-35 |
 | 37 | Duplicate header smuggling / key id confusion | raw header-list inspection; single occurrence of each header; mismatch = 400 | SEC-29 |
 | 38 | Rotation/enrollment response loss causes duplicate identity or lost rotation | persisted rotate intent, idempotent retry/transition table, pending_activation handling | SEC-36 |
+| 39 | Enrollment response loss leaves an unreachable-but-active orphan identity | node is active on commit; admin identifies/revokes orphan; no activation inference from unobservable response | SEC-37 |
+| 40 | Rotation grace timer revokes the old key while the agent only has the old key (or bypasses a revoked key) | old key revoked only after new-key proof; expiry aborts only the provisional new key; unprovable state stops reporting for operator recovery; no auto-bypass | SEC-38 |
+| 41 | Read-only claim rests on client method allowlist while the credential is server-side write-capable | source switches default false; server-side authorization audit required before enable; unproven source disabled with `unavailable`/`source_authorization_unproven`; Mihomo disabled in v1 | SEC-39 |
+| 42 | Restore/ledger incompleteness revives revoked nodes or purged data | security ledger fsynced before commit; latest-version chain/checkpoint; incomplete ledger ⇒ quarantine, no auto ingest | SEC-34 (extended) |
+| 43 | Runtime semantics (service name/inbound tag/timestamps/availability) pass schema but are forged/misleading | runtime closed allowlists, tag/kind match against center config, temporal bounds, availability coherence, sentinel scan; reject/quarantine, never render | SEC-39 |
 
 ## 5. Security invariants (never regress)
 
@@ -119,9 +124,13 @@ agent sending replayed/historical/forged reports.
 
 **UM-B**: SEC-11..SEC-15, SEC-16 (storage), SEC-19 (storage/handler boundary),
 SEC-21, SEC-23, SEC-24, SEC-25, SEC-27, SEC-28, SEC-29 (protocol half), SEC-30,
-SEC-31, SEC-32 (agent), SEC-33, SEC-36; contract conformance: both positive signed
-vectors verify, tampered/wrong-key/cross-endpoint negatives fail, schema negative
-examples are rejected, duplicate-header/encoding/size/boot/nonce cases behave.
+SEC-31, SEC-32 (agent), SEC-33, SEC-36, SEC-37 (enrollment orphan lifecycle),
+SEC-38 (rotation state machine incl. response loss/restart/expiry/revocation),
+SEC-39 (source authorization gating + runtime semantic validation), SEC-34
+(ledger half); contract conformance: both positive signed vectors verify,
+tampered/wrong-key/cross-endpoint negatives fail, schema negative examples are
+rejected, duplicate-header/encoding/config-body/size/boot/nonce/seq-retry cases,
+rotation recovery cases and source-disabled data honesty behave.
 
 **UM-C**: SEC-01..SEC-10, SEC-15 (web), SEC-18 (web half, honest same-process
 targets), SEC-26, SEC-35; CSP/cookie/header tests, session rebinding, Access
@@ -133,10 +142,13 @@ alias handling.
 
 **UM-E**: SEC-20, SEC-22 route-inventory, SEC-25 no-touch, SEC-29 both transport
 options where applicable, SEC-31/32 agent install/runtime proof, SEC-34
-restore/ledger drill, backup theft/restore, disk pressure, center restart,
-Cloudflare outage, center-offline business-independence, 1 h disconnection + agent
-restart + center restart + lost ACK + revocation + historical boot replay
-(doc 04 §6.3), install/upgrade/rollback/uninstall, load/soak, independent review.
+restore/ledger drill (incomplete-ledger quarantine), SEC-37/38 recovery
+transitions, SEC-39 source authorization evidence, backup theft/restore, disk
+pressure + quota enforcement, center restart, Cloudflare outage vs direct-TLS
+ingress failure matrix, center-offline business-independence,
+1 h disconnection + agent restart + center restart + lost ACK + revocation +
+historical boot replay (doc 04 §6.3), install/upgrade/rollback/uninstall,
+load/soak, independent review.
 
 ## 7. Performance budget (UM-E acceptance gates)
 

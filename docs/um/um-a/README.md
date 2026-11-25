@@ -41,7 +41,7 @@ inputs needed to start UM-B:
 - [05 — Retention, capacity and backup](05-retention-capacity-backup.md)
 - [06 — Threat model, security tests and performance](06-threat-model-security-tests-performance.md)
 - [07 — UM-B entry criteria and review](07-um-b-entry-and-review.md)
-- [08 — PR #126 review response matrix (revision 2)](08-review-response-matrix.md)
+- [08 — PR #126 review response matrix (rev 2 and targeted rev 3)](08-review-response-matrix.md)
 - [../contracts/v1/](../contracts/v1/) — schemas, positive/negative examples, signed report+enrollment vectors, behavioural negative contract
 
 ## How this phase was investigated
@@ -88,8 +88,8 @@ The independent reviewer must confirm all of:
   negative examples are rejected.
 - Positive report **and** enrollment signed vectors verify with OpenSSL
   (Ed25519); tampered-body, wrong-key and cross-endpoint-reuse vectors fail as
-  required; the behavioural negative contract freezes token/header/encoding/
-  replay/sequence/size/cross-plane expectations.
+  required; the behavioural negative contract freezes token/header/encoding/config-body/
+  replay/sequence/rotation/source-gating/size/cross-plane expectations.
 - Markdown/Mermaid was reviewed manually; no repository test or CI job reads
   `docs/um/`, so CI for this PR is regression-only (existing suites must stay
   green).
