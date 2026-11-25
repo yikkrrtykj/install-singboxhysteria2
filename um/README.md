@@ -45,6 +45,14 @@ roles to approved VPS identities. An outage or stale sample should remain
 visible in that contract. The Windows telemetry will be read-only and run
 independently of the existing HA-UI, P6 Remote Probe and Mihomo policy.
 
+## Shared wire signing
+
+The Go signing package is exercised against the frozen enrollment, report and
+negative vectors in [the UM v1 contracts](../docs/um/contracts/v1/README.md).
+It prepares the canonical signed bytes and verifies Ed25519. HTTP ingestion
+will own transport checks, identity registration, revocation and replay state.
+Run both the observer and wire tests from this directory with `go test ./...`.
+
 ## Migration order
 
 Build the unified center and Linux and Windows agents in Go. Continue to use
