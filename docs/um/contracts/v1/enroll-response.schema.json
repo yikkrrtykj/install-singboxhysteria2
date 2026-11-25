@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://um.invalid/contracts/v1/enroll-response.schema.json",
+  "title": "UM v1 enrollment response",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["v", "node_id", "event_id", "key_id", "config_version", "device_salt",
+               "cadence_seconds", "server_time", "center_spki_sha256"],
+  "properties": {
+    "v": {"const": 1},
+    "node_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "event_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "key_id": {"type": "string", "pattern": "^key-[0-9a-f]{8}$"},
+    "config_version": {"type": "integer", "minimum": 1},
+    "device_salt": {"type": "string", "pattern": "^[A-Za-z0-9_-]{43}$"},
+    "cadence_seconds": {"type": "integer", "minimum": 30, "maximum": 300},
+    "server_time": {"type": "integer", "minimum": 0},
+    "center_spki_sha256": {
+      "oneOf": [
+        {"type": "null"},
+        {"type": "string", "pattern": "^[A-Za-z0-9_-]{43}$"}
+      ]
+    }
+  }
+}

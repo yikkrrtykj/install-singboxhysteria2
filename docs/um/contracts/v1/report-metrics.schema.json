@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://um.invalid/contracts/v1/report-metrics.schema.json",
+  "title": "UM v1 report body: bounded minute metric samples",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["v", "type", "generated_at", "samples"],
+  "properties": {
+    "v": {"const": 1},
+    "type": {"const": "metrics"},
+    "generated_at": {"type": "integer", "minimum": 0, "maximum": 1000000000000},
+    "samples": {
+      "type": "array", "minItems": 1, "maxItems": 5,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["at", "cpu_pct", "load1", "mem_used_bytes", "disk_used_bytes",
+                     "net_rx_bytes_total", "net_tx_bytes_total", "active_connections"],
+        "properties": {
+          "at": {"type": "integer", "minimum": 0, "maximum": 1000000000000},
+          "cpu_pct": {"type": "number", "minimum": 0, "maximum": 10000},
+          "load1": {"type": "number", "minimum": 0, "maximum": 100000},
+          "mem_used_bytes": {"type": "integer", "minimum": 0, "maximum": 1099511627776},
+          "disk_used_bytes": {"type": "integer", "minimum": 0, "maximum": 1099511627776},
+          "net_rx_bytes_total": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+          "net_tx_bytes_total": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+          "active_connections": {"type": "integer", "minimum": 0, "maximum": 1000000}
+        }
+      }
+    }
+  }
+}

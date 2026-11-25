@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://um.invalid/contracts/v1/error.schema.json",
+  "title": "UM v1 closed error body",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["v", "error", "retryable", "server_time"],
+  "properties": {
+    "v": {"const": 1},
+    "error": {
+      "enum": ["invalid_request", "unauthorized", "unknown_node", "revoked_key",
+               "bad_signature", "stale_timestamp", "replay", "sequence_conflict",
+               "identity_mismatch", "rate_limited", "payload_too_large",
+               "unsupported_version", "upgrade_required", "storage_unavailable"]
+    },
+    "retryable": {"type": "boolean"},
+    "server_time": {"type": "integer", "minimum": 0}
+  }
+}

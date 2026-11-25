@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://um.invalid/contracts/v1/enroll-request.schema.json",
+  "title": "UM v1 enrollment request body (signed by the new node key)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["v", "agent_version", "host", "pubkey", "nonce", "signed_at", "signature"],
+  "properties": {
+    "v": {"const": 1},
+    "agent_version": {
+      "type": "string",
+      "maxLength": 32,
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$"
+    },
+    "host": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["os", "kernel", "arch"],
+      "properties": {
+        "os": {"const": "linux"},
+        "kernel": {"type": "string", "maxLength": 64, "pattern": "^[0-9A-Za-z.+-]+$"},
+        "arch": {"enum": ["amd64", "arm64"]}
+      }
+    },
+    "pubkey": {"type": "string", "pattern": "^[A-Za-z0-9_-]{43}$"},
+    "nonce": {"type": "string", "pattern": "^[A-Za-z0-9_-]{22}$"},
+    "signed_at": {"type": "integer", "minimum": 0, "maximum": 1000000000000},
+    "signature": {"type": "string", "pattern": "^[A-Za-z0-9_-]{86}$"}
+  }
+}

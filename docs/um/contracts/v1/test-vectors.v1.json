@@ -1,0 +1,48 @@
+{
+  "v": 1,
+  "description": "Unified Monitor node protocol v1 signing test vector. Ephemeral test key: the private key is NOT committed. Synthetic data only.",
+  "protocol": "um-report-v1",
+  "vector_id": "um-report-signing-v1-demo",
+  "request": {
+    "method": "POST",
+    "path": "/v1/agent/report",
+    "headers": {
+      "X-UM-Protocol": "1",
+      "X-UM-Node-Id": "0f3d7c2a-8b41-4a6e-9c55-2d7e1b9a4c60",
+      "X-UM-Key-Id": "key-4f2a9c1b",
+      "X-UM-Boot-Id": "9c1f5a7e2b6d48c3a0e4f812d36b7c95",
+      "X-UM-Seq": "1",
+      "X-UM-Sent-At": "1795622400",
+      "X-UM-Nonce": "AAECAwQFBgcICQoLDA0ODw",
+      "Content-Type": "application/json"
+    },
+    "body_file": "examples/report-snapshot.v1.json",
+    "body_bytes": 1153,
+    "body_sha256_hex": "bb1a03ca37d4943bae48bc73ac028085b77a0198a1fb53d0e2e61c9afcc9d8b8"
+  },
+  "signing_string": "um-report-v1\n0f3d7c2a-8b41-4a6e-9c55-2d7e1b9a4c60\nkey-4f2a9c1b\n9c1f5a7e2b6d48c3a0e4f812d36b7c95\n1\n1795622400\nAAECAwQFBgcICQoLDA0ODw\nbb1a03ca37d4943bae48bc73ac028085b77a0198a1fb53d0e2e61c9afcc9d8b8",
+  "signing_string_note": "Exact UTF-8 bytes, LF separators, no trailing newline. body_sha256_hex covers the exact received body bytes, not a re-serialized JSON document.",
+  "signing_string_bytes": 196,
+  "signing_string_sha256_hex": "ca29649968a77bd81b1679b5ce8171de2591b9d60f547b9fe5e9b80aa97ca567",
+  "signature": {
+    "alg": "Ed25519",
+    "public_key_b64url": "2u7kE1ruK0uc4gO6yllkVGBkjFff8CGUUGE5HdC3s-k",
+    "signature_b64url": "TTF7FIzGQwmVdfHVP7Q1KrEBcAbwd_hUKHRkhgPrBsEW4yb8Djxy7uLpXQeRQVJheHpsz6XinsVIYaVb6vsBDw"
+  },
+  "expected": {
+    "verify": true,
+    "tampered_body_verify": false
+  },
+  "verification": {
+    "openssl": [
+      "sha256sum examples/report-snapshot.v1.json",
+      "printf '%s' \"<signing_string with LF separators, no trailing newline>\" > signing.txt",
+      "openssl pkeyutl -verify -rawin -pubin -inkey pub.pem -in signing.txt -sigfile sig.bin"
+    ],
+    "note": "Any Ed25519 implementation may be used. The signing string itself is authoritative and is also committed verbatim in this file; reproduce the same bytes and verify against public_key_b64url."
+  },
+  "enrollment": {
+    "signing_string_template": "um-enroll-v1\\n<nonce>\\n<signed_at>\\n<sha256-hex(body-bytes)>",
+    "note": "Enrollment uses the same exact-body-bytes rule; no additional vector is committed because the enrollment body schema and this template fully determine the input."
+  }
+}

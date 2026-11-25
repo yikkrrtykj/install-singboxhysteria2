@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://um.invalid/contracts/v1/rotate-request.schema.json",
+  "title": "UM v1 node key rotation body (signed by the current/old key)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["v", "new_pubkey", "nonce", "signed_at"],
+  "properties": {
+    "v": {"const": 1},
+    "new_pubkey": {"type": "string", "pattern": "^[A-Za-z0-9_-]{43}$"},
+    "nonce": {"type": "string", "pattern": "^[A-Za-z0-9_-]{22}$"},
+    "signed_at": {"type": "integer", "minimum": 0, "maximum": 1000000000000}
+  }
+}
