@@ -8,7 +8,10 @@ package schema
 
 import (
 	"bytes"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -94,10 +97,19 @@ func (s *Set) Has(name string) bool {
 // name, for example "report-snapshot.schema.json". The body is decoded with
 // json.Number precision and then validated by the compiled draft 2020-12
 // schema; this is real JSON Schema validation, not JSON parsing only.
+//
+// Before schema validation the body must pass CheckStrictJSON: exactly one
+// top-level JSON value, no duplicate object member names, trailing whitespace
+// allowed. The frozen contract forbids duplicate members because encoding/json
+// silently overlays them (last value wins), so two consumers of the same bytes
+// could otherwise disagree.
 func (s *Set) Validate(name string, body []byte) error {
 	compiled, ok := s.schemas[name]
 	if !ok {
 		return fmt.Errorf("schema: %q is not loaded (loaded: %s)", name, strings.Join(s.names, ", "))
+	}
+	if err := CheckStrictJSON(body); err != nil {
+		return fmt.Errorf("schema %s: %w", name, err)
 	}
 	doc, err := jsonschema.UnmarshalJSON(bytes.NewReader(body))
 	if err != nil {
@@ -116,6 +128,111 @@ func (s *Set) ValidateFile(name, path string) error {
 		return fmt.Errorf("schema %s: read %q: %w", name, path, err)
 	}
 	return s.Validate(name, body)
+}
+
+// Strict-JSON grammar errors. They are deliberately generic and never echo a
+// member name or value: a duplicated credential-like key must not leak through
+// an error message.
+var (
+	errStrictMalformed    = errors.New("strict JSON: malformed JSON")
+	errStrictDuplicateKey = errors.New("strict JSON: duplicate object member name")
+	errStrictTrailingData = errors.New("strict JSON: trailing data after the top-level JSON value")
+)
+
+// CheckStrictJSON enforces the wire grammar that encoding/json accepts but the
+// frozen UM v1 contract forbids: duplicate object member names at any depth and
+// more than one top-level JSON value. Whitespace around the single value,
+// including after it, is allowed.
+//
+// The scan is streaming and O(n); object nesting is tracked with a decoder so
+// nested duplicate members are found without materialising the document.
+func CheckStrictJSON(body []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	token, err := decoder.Token()
+	if err != nil {
+		return errStrictMalformed
+	}
+	if err := scanStrictValue(decoder, token); err != nil {
+		return err
+	}
+	// Token skips whitespace, so only trailing whitespace can yield io.EOF.
+	_, err = decoder.Token()
+	if err == nil {
+		return errStrictTrailingData
+	}
+	if !errors.Is(err, io.EOF) {
+		return errStrictTrailingData
+	}
+	return nil
+}
+
+// scanStrictValue consumes the remainder of token (which has already been read
+// by the decoder) and recurses into containers.
+func scanStrictValue(decoder *json.Decoder, token json.Token) error {
+	delimiter, isDelimiter := token.(json.Delim)
+	if !isDelimiter {
+		// A scalar token; the tokenizer already validated its syntax.
+		return nil
+	}
+	switch delimiter {
+	case '{':
+		return scanStrictObject(decoder)
+	case '[':
+		return scanStrictArray(decoder)
+	default:
+		return errStrictMalformed
+	}
+}
+
+func scanStrictObject(decoder *json.Decoder) error {
+	seen := make(map[string]struct{})
+	for {
+		token, err := decoder.Token()
+		if err != nil {
+			return errStrictMalformed
+		}
+		if delimiter, isDelimiter := token.(json.Delim); isDelimiter {
+			if delimiter == '}' {
+				return nil
+			}
+			return errStrictMalformed
+		}
+		// Decoder.Token returns decoded strings, so escaped spellings of the
+		// same member name ("a" vs "\u0061") are detected as duplicates.
+		key, ok := token.(string)
+		if !ok {
+			return errStrictMalformed
+		}
+		if _, duplicate := seen[key]; duplicate {
+			return errStrictDuplicateKey
+		}
+		seen[key] = struct{}{}
+		valueToken, err := decoder.Token()
+		if err != nil {
+			return errStrictMalformed
+		}
+		if err := scanStrictValue(decoder, valueToken); err != nil {
+			return err
+		}
+	}
+}
+
+func scanStrictArray(decoder *json.Decoder) error {
+	for {
+		token, err := decoder.Token()
+		if err != nil {
+			return errStrictMalformed
+		}
+		if delimiter, isDelimiter := token.(json.Delim); isDelimiter && delimiter == ']' {
+			return nil
+		}
+		// A scalar element, or a nested container that scanStrictValue consumes
+		// to its matching close delimiter.
+		if err := scanStrictValue(decoder, token); err != nil {
+			return err
+		}
+	}
 }
 
 // fileURL converts an absolute filesystem path to a file:// URL the

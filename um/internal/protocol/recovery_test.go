@@ -356,6 +356,18 @@ func confirmedIntent(expiresAtUnix int64) RotateIntent {
 	return intent
 }
 
+func abortedIntent(expiresAtUnix int64) RotateIntent {
+	intent := awaitingProofIntent(expiresAtUnix)
+	intent.State = RotationAborted
+	return intent
+}
+
+func adminRevokedIntent(expiresAtUnix int64) RotateIntent {
+	intent := awaitingProofIntent(expiresAtUnix)
+	intent.State = RotationAdminRevoked
+	return intent
+}
+
 func TestEvaluateRotateRetry(t *testing.T) {
 	// A matched awaiting_proof rotation that is not yet expired.
 	matchingIntent := awaitingProofIntent(2000)
@@ -409,7 +421,7 @@ func TestEvaluateRotateRetry(t *testing.T) {
 			},
 		},
 		{
-			name:    "confirmed intent replays even after its expiry timestamp",
+			name:    "matched confirmed intent denies replay after its expiry timestamp",
 			cur:     Boot{HighestGen: 3, BootID: bootB, LastSeq: 4, LastFingerprint: fp4},
 			attempt: Attempt{Gen: 3, BootID: bootB, Seq: 5, Fingerprint: fp5},
 			intent:  confirmedIntent(900),
@@ -423,7 +435,43 @@ func TestEvaluateRotateRetry(t *testing.T) {
 					HighWaterCommitted: true,
 				},
 				IntentMatched: true,
-				ReplayAllowed: true,
+				Confirmed:     true,
+			},
+		},
+		{
+			name:    "matched confirmed intent denies replay before its expiry timestamp",
+			cur:     Boot{HighestGen: 3, BootID: bootB, LastSeq: 4, LastFingerprint: fp4},
+			attempt: Attempt{Gen: 3, BootID: bootB, Seq: 5, Fingerprint: fp5},
+			intent:  confirmedIntent(2000),
+			args:    matchedRotateArgs(),
+			nowUnix: 1000,
+			want: RotateVerdict{
+				Transport: Result{
+					Outcome:            Accepted,
+					NextBoot:           Boot{HighestGen: 3, BootID: bootB, LastSeq: 5, LastFingerprint: fp5},
+					NextSeq:            seqPtr(6),
+					HighWaterCommitted: true,
+				},
+				IntentMatched: true,
+				Confirmed:     true,
+			},
+		},
+		{
+			name:    "matched admin revoked intent denies replay",
+			cur:     Boot{HighestGen: 3, BootID: bootB, LastSeq: 4, LastFingerprint: fp4},
+			attempt: Attempt{Gen: 3, BootID: bootB, Seq: 5, Fingerprint: fp5},
+			intent:  adminRevokedIntent(2000),
+			args:    matchedRotateArgs(),
+			nowUnix: 1000,
+			want: RotateVerdict{
+				Transport: Result{
+					Outcome:            Accepted,
+					NextBoot:           Boot{HighestGen: 3, BootID: bootB, LastSeq: 5, LastFingerprint: fp5},
+					NextSeq:            seqPtr(6),
+					HighWaterCommitted: true,
+				},
+				IntentMatched: true,
+				AdminRevoked:  true,
 			},
 		},
 		{
@@ -552,14 +600,10 @@ func TestEvaluateRotateRetry(t *testing.T) {
 			},
 		},
 		{
-			name:    "aborted intent is nonce reuse",
+			name:    "matched aborted intent maps to rotation_expired and is never nonce reuse",
 			cur:     Boot{HighestGen: 3, BootID: bootB, LastSeq: 4, LastFingerprint: fp4},
 			attempt: Attempt{Gen: 3, BootID: bootB, Seq: 5, Fingerprint: fp5},
-			intent: func() RotateIntent {
-				intent := awaitingProofIntent(2000)
-				intent.State = RotationAborted
-				return intent
-			}(),
+			intent:  abortedIntent(2000),
 			args:    matchedRotateArgs(),
 			nowUnix: 1000,
 			want: RotateVerdict{
@@ -569,7 +613,9 @@ func TestEvaluateRotateRetry(t *testing.T) {
 					NextSeq:            seqPtr(6),
 					HighWaterCommitted: true,
 				},
-				NonceReuse: true,
+				IntentMatched: true,
+				Aborted:       true,
+				Expired:       true,
 			},
 		},
 		{
@@ -607,6 +653,19 @@ func TestEvaluateRotateRetry(t *testing.T) {
 				IntentMatched: true,
 				ReplayAllowed: true,
 			},
+		},
+		{
+			name:    "unknown rotation state is a validation error",
+			cur:     Boot{HighestGen: 3, BootID: bootB, LastSeq: 4, LastFingerprint: fp4},
+			attempt: Attempt{Gen: 3, BootID: bootB, Seq: 5, Fingerprint: fp5},
+			intent: func() RotateIntent {
+				intent := awaitingProofIntent(2000)
+				intent.State = RotationState("corrupted_state")
+				return intent
+			}(),
+			args:         matchedRotateArgs(),
+			nowUnix:      1000,
+			wantErrField: "rotation_state",
 		},
 		{
 			name:         "invalid attempt propagates validation error",
@@ -672,6 +731,15 @@ func checkRotateVerdict(t *testing.T, got, want RotateVerdict) {
 	checkResult(t, got.Transport, want.Transport)
 	if got.IntentMatched != want.IntentMatched {
 		t.Errorf("IntentMatched = %t, want %t", got.IntentMatched, want.IntentMatched)
+	}
+	if got.Confirmed != want.Confirmed {
+		t.Errorf("Confirmed = %t, want %t", got.Confirmed, want.Confirmed)
+	}
+	if got.Aborted != want.Aborted {
+		t.Errorf("Aborted = %t, want %t", got.Aborted, want.Aborted)
+	}
+	if got.AdminRevoked != want.AdminRevoked {
+		t.Errorf("AdminRevoked = %t, want %t", got.AdminRevoked, want.AdminRevoked)
 	}
 	if got.ReplayAllowed != want.ReplayAllowed {
 		t.Errorf("ReplayAllowed = %t, want %t", got.ReplayAllowed, want.ReplayAllowed)

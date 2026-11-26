@@ -1,11 +1,20 @@
 // Package contract enforces the runtime semantics of the frozen Unified
 // Monitor v1 node protocol (revision 5) that JSON Schema cannot express:
-// platform isolation between linux_vps and windows_terminal nodes, the Windows
-// terminal route/connection coherence and sampling-window rules, the report-body
-// allowlists per node class, and the privacy sentinel boundary.
+// platform isolation between linux_vps and windows_terminal nodes, the
+// availability ↔ null/empty coherence rules for Linux VPS reports, the Windows
+// terminal source/route/connection coherence and sampling-window rules, the
+// metrics/events temporal bounds and event-id uniqueness, the report-body
+// allowlists per node class, strict JSON grammar (no duplicate object members,
+// no trailing data) and the path-aware privacy sentinel boundary.
 //
 // Structural validation is delegated to internal/schema, which compiles the
 // committed docs/um/contracts/v1/*.schema.json files from disk at runtime.
+//
+// Pure runtime validation has no access to center state. Decisions that need
+// center or agent-config data are explicit options or are documented as
+// UM-B2-owned: terminal-source configuration (ValidateOptions.
+// TerminalConfigured), expected inbound tags/kind matching, center node state,
+// and payload freshness against server time / sent_at are not decidable here.
 package contract
 
 import (
@@ -103,6 +112,17 @@ func validateSchema(name string, raw []byte) error {
 	}
 	if err := set.Validate(name, raw); err != nil {
 		return invalid("body", "body does not conform to "+name)
+	}
+	return nil
+}
+
+// validateStrictJSON rejects duplicate JSON object member names and data after
+// the single top-level JSON value before any schema or semantic rule runs. The
+// detail is generic on purpose: neither the duplicated member name nor any
+// value is echoed, so a credential-like duplicate cannot leak through an error.
+func validateStrictJSON(raw []byte) error {
+	if err := schema.CheckStrictJSON(raw); err != nil {
+		return invalid("body", "body is not strict JSON (duplicate object member names or trailing data)")
 	}
 	return nil
 }

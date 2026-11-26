@@ -5,11 +5,13 @@ on:
     paths:
       - 'um/**'
       - 'docs/um/contracts/v1/**'
+      - 'docs/um/um-127/conformance/**'
       - '.github/workflows/um-go.yml'
   pull_request:
     paths:
       - 'um/**'
       - 'docs/um/contracts/v1/**'
+      - 'docs/um/um-127/conformance/**'
       - '.github/workflows/um-go.yml'
 
 permissions:
@@ -37,7 +39,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.27.x'
+          go-version: '1.27.4'
           cache: true
           cache-dependency-path: um/go.sum
       - run: go version
@@ -63,7 +65,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.27.x'
+          go-version: '1.27.4'
           cache: true
           cache-dependency-path: um/go.sum
       - run: go test -race -count=1 ./...
@@ -85,7 +87,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.27.x'
+          go-version: '1.27.4'
           cache: true
           cache-dependency-path: um/go.sum
       - run: go test -count=1 -coverprofile=coverage.out ./...
@@ -113,7 +115,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.27.x'
+          go-version: '1.27.4'
           cache: true
           cache-dependency-path: um/go.sum
       - run: go install golang.org/x/vuln/cmd/govulncheck@v1.10.0

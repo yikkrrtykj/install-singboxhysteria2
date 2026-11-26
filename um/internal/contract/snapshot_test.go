@@ -112,89 +112,168 @@ func TestValidateSnapshotPlatformIsolation(t *testing.T) {
 }
 
 func TestValidateSnapshotWindowsBaseHonesty(t *testing.T) {
-	cases := []struct {
-		name   string
-		mutate func(doc map[string]any)
-		field  string
-	}{
-		{
-			name: "availability not unavailable",
-			mutate: func(doc map[string]any) {
-				objectAt(t, doc, "availability")["system"] = "ok"
+	// Windows terminal base data must stay honest. services/protocols/traffic/
+	// clients are platform-forbidden sources -> platform_mismatch. Revision 5
+	// makes system an optional terminal-side source (ok|partial|unavailable), so
+	// system violations are availability-coherence failures -> invalid_request.
+	t.Run("platform-restricted base sources", func(t *testing.T) {
+		cases := []struct {
+			name   string
+			mutate func(doc map[string]any)
+			field  string
+		}{
+			{
+				name: "services availability not unavailable",
+				mutate: func(doc map[string]any) {
+					objectAt(t, doc, "availability")["services"] = "ok"
+				},
+				field: "availability.services",
 			},
-			field: "availability.system",
-		},
-		{
-			name: "system field not null",
-			mutate: func(doc map[string]any) {
-				objectAt(t, doc, "system")["cpu_pct"] = json.Number("12.5")
+			{
+				name: "protocols availability not unavailable",
+				mutate: func(doc map[string]any) {
+					objectAt(t, doc, "availability")["protocols"] = "ok"
+				},
+				field: "availability.protocols",
 			},
-			field: "system.cpu_pct",
-		},
-		{
-			name: "services not empty",
-			mutate: func(doc map[string]any) {
-				doc["services"] = []any{map[string]any{"name": "sing-box", "state": "active"}}
+			{
+				name: "traffic availability not unavailable",
+				mutate: func(doc map[string]any) {
+					objectAt(t, doc, "availability")["traffic"] = "ok"
+				},
+				field: "availability.traffic",
 			},
-			field: "services",
-		},
-		{
-			name: "protocols not empty",
-			mutate: func(doc map[string]any) {
-				doc["protocols"] = []any{map[string]any{
-					"kind": "reality", "inbound_tag": "vless-in", "state": "up",
-					"reason": "ok", "observed_at": json.Number("1795622398"),
-				}}
+			{
+				name: "clients availability not unavailable",
+				mutate: func(doc map[string]any) {
+					objectAt(t, doc, "availability")["clients"] = "ok"
+				},
+				field: "availability.clients",
 			},
-			field: "protocols",
-		},
-		{
-			name: "traffic not empty",
-			mutate: func(doc map[string]any) {
-				doc["traffic"] = []any{map[string]any{
-					"scope": "protocol", "inbound_tag": "vless-in",
-					"uplink_total_bytes": json.Number("1"), "downlink_total_bytes": json.Number("2"),
-				}}
+			{
+				name: "services not empty",
+				mutate: func(doc map[string]any) {
+					doc["services"] = []any{map[string]any{"name": "sing-box", "state": "active"}}
+				},
+				field: "services",
 			},
-			field: "traffic",
-		},
-		{
-			name: "clients active not null",
-			mutate: func(doc map[string]any) {
-				objectAt(t, doc, "clients")["active"] = json.Number("0")
+			{
+				name: "protocols not empty",
+				mutate: func(doc map[string]any) {
+					doc["protocols"] = []any{map[string]any{
+						"kind": "reality", "inbound_tag": "vless-in", "state": "up",
+						"reason": "ok", "observed_at": json.Number("1795622398"),
+					}}
+				},
+				field: "protocols",
 			},
-			field: "clients.active",
-		},
-		{
-			name: "clients tracked not null",
-			mutate: func(doc map[string]any) {
-				objectAt(t, doc, "clients")["tracked"] = json.Number("3")
+			{
+				name: "traffic not empty",
+				mutate: func(doc map[string]any) {
+					doc["traffic"] = []any{map[string]any{
+						"scope": "protocol", "inbound_tag": "vless-in",
+						"uplink_total_bytes": json.Number("1"), "downlink_total_bytes": json.Number("2"),
+					}}
+				},
+				field: "traffic",
 			},
-			field: "clients.tracked",
-		},
-		{
-			name: "clients summaries not empty",
-			mutate: func(doc map[string]any) {
-				objectAt(t, doc, "clients")["summaries"] = []any{map[string]any{
-					"device_ref":     strings.Repeat("A", 43),
-					"active":         json.Number("1"),
-					"uplink_bytes":   json.Number("10"),
-					"downlink_bytes": json.Number("20"),
-					"last_seen":      json.Number("1795622390"),
-				}}
+			{
+				name: "clients active not null",
+				mutate: func(doc map[string]any) {
+					objectAt(t, doc, "clients")["active"] = json.Number("0")
+				},
+				field: "clients.active",
 			},
-			field: "clients.summaries",
-		},
-	}
-	for _, tc := range cases {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			raw := mutateExample(t, terminalSnapshotExample, tc.mutate)
-			err := ValidateSnapshot(NodeClassWindowsTerminal, raw)
-			requirePlatformMismatch(t, err)
-			requireField(t, err, tc.field)
+			{
+				name: "clients tracked not null",
+				mutate: func(doc map[string]any) {
+					objectAt(t, doc, "clients")["tracked"] = json.Number("3")
+				},
+				field: "clients.tracked",
+			},
+			{
+				name: "clients summaries not empty",
+				mutate: func(doc map[string]any) {
+					objectAt(t, doc, "clients")["summaries"] = []any{map[string]any{
+						"device_ref":     strings.Repeat("A", 43),
+						"active":         json.Number("1"),
+						"uplink_bytes":   json.Number("10"),
+						"downlink_bytes": json.Number("20"),
+						"last_seen":      json.Number("1795622390"),
+					}}
+				},
+				field: "clients.summaries",
+			},
+		}
+		for _, tc := range cases {
+			tc := tc
+			t.Run(tc.name, func(t *testing.T) {
+				raw := mutateExample(t, terminalSnapshotExample, tc.mutate)
+				err := ValidateSnapshot(NodeClassWindowsTerminal, raw)
+				requirePlatformMismatch(t, err)
+				requireField(t, err, tc.field)
+			})
+		}
+	})
+
+	t.Run("optional system coherence", func(t *testing.T) {
+		systemValues := func(system map[string]any) {
+			system["cpu_pct"] = 12.5
+			system["load1"] = 0.42
+			system["mem_total_bytes"] = json.Number("4294967296")
+			system["mem_used_bytes"] = json.Number("1610612736")
+			system["disk_total_bytes"] = json.Number("42949672960")
+			system["disk_used_bytes"] = json.Number("10737418240")
+			system["net_rx_bytes"] = json.Number("123456789")
+			system["net_tx_bytes"] = json.Number("987654321")
+		}
+		cases := []struct {
+			name   string
+			mutate func(doc map[string]any)
+			field  string
+		}{
+			{
+				name: "system unavailable with non-null field",
+				mutate: func(doc map[string]any) {
+					objectAt(t, doc, "system")["cpu_pct"] = json.Number("12.5")
+				},
+				field: "system.cpu_pct",
+			},
+			{
+				name: "system ok with null fields",
+				mutate: func(doc map[string]any) {
+					objectAt(t, doc, "availability")["system"] = "ok"
+				},
+				field: "system.cpu_pct",
+			},
+			{
+				name: "system partial with no null field",
+				mutate: func(doc map[string]any) {
+					objectAt(t, doc, "availability")["system"] = "partial"
+					systemValues(objectAt(t, doc, "system"))
+				},
+				field: "system",
+			},
+		}
+		for _, tc := range cases {
+			tc := tc
+			t.Run(tc.name, func(t *testing.T) {
+				raw := mutateExample(t, terminalSnapshotExample, tc.mutate)
+				err := ValidateSnapshot(NodeClassWindowsTerminal, raw)
+				requireInvalidRequest(t, err)
+				requireField(t, err, tc.field)
+			})
+		}
+
+		// The optional system source is legal when its values are coherent.
+		raw := mutateExample(t, terminalSnapshotExample, func(doc map[string]any) {
+			objectAt(t, doc, "availability")["system"] = "ok"
+			systemValues(objectAt(t, doc, "system"))
 		})
-	}
+		if err := ValidateSnapshot(NodeClassWindowsTerminal, raw); err != nil {
+			t.Fatalf("coherent windows system telemetry rejected: %v", err)
+		}
+	})
 }
 
 func TestValidateSnapshotTerminalSemantics(t *testing.T) {

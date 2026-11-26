@@ -3,7 +3,6 @@ package store
 import (
 	"context"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/hex"
 	"errors"
 	"maps"
@@ -59,7 +58,7 @@ func mustCreateNode(t *testing.T, s *Store, nodeID, eventID, class string) {
 
 func mustPutBoot(t *testing.T, s *Store, nodeID string, gen uint64, bootID string, seq uint64, fingerprint string) {
 	t.Helper()
-	if err := s.PutBoot(testContext(), nodeID, gen, bootID, seq, fingerprint); err != nil {
+	if err := s.putBoot(testContext(), nodeID, gen, bootID, seq, fingerprint); err != nil {
 		t.Fatalf("PutBoot(%q, gen=%d): %v", nodeID, gen, err)
 	}
 }
@@ -199,7 +198,7 @@ func TestNodeAndBootRoundTrip(t *testing.T) {
 		t.Fatalf("duplicate CreateNode error = %v, want ErrAlreadyExists", err)
 	}
 	// node_boot is keyed by an existing node identity.
-	if err := s.PutBoot(ctx, "node-missing", 1, testBootA, 1, "fp"); err == nil {
+	if err := s.putBoot(ctx, "node-missing", 1, testBootA, 1, "fp"); err == nil {
 		t.Fatal("PutBoot for an unknown node must fail the nodes foreign key")
 	}
 
@@ -264,13 +263,13 @@ func TestNumericBoundRoundTrip(t *testing.T) {
 	}
 
 	// Out-of-range values are rejected before conversion and never touch state.
-	if err := s.PutBoot(ctx, "node-a", wire.MaxNumeric+1, testBootA, 1, "fp"); !errors.Is(err, ErrInvalidArgument) {
+	if err := s.putBoot(ctx, "node-a", wire.MaxNumeric+1, testBootA, 1, "fp"); !errors.Is(err, ErrInvalidArgument) {
 		t.Fatalf("PutBoot(gen=MaxNumeric+1) error = %v, want ErrInvalidArgument", err)
 	}
-	if err := s.PutBoot(ctx, "node-a", 1, testBootA, wire.MaxNumeric+1, "fp"); !errors.Is(err, ErrInvalidArgument) {
+	if err := s.putBoot(ctx, "node-a", 1, testBootA, wire.MaxNumeric+1, "fp"); !errors.Is(err, ErrInvalidArgument) {
 		t.Fatalf("PutBoot(seq=MaxNumeric+1) error = %v, want ErrInvalidArgument", err)
 	}
-	if err := s.PutBoot(ctx, "node-a", 0, testBootA, 1, "fp"); !errors.Is(err, ErrInvalidArgument) {
+	if err := s.putBoot(ctx, "node-a", 0, testBootA, 1, "fp"); !errors.Is(err, ErrInvalidArgument) {
 		t.Fatalf("PutBoot(gen=0) error = %v, want ErrInvalidArgument", err)
 	}
 	boot, err = s.GetBoot(ctx, "node-a")
@@ -347,7 +346,7 @@ func TestApplyTransportStaleGeneration(t *testing.T) {
 	applied := false
 	res, err := s.ApplyTransport(ctx, "node-a",
 		protocol.Attempt{Gen: 4, BootID: testBootC, Seq: 11, Fingerprint: "fp-4-11"}, "fp-4-11",
-		func(tx *sql.Tx) error {
+		func(tx *Tx) error {
 			applied = true
 			return nil
 		})
@@ -463,9 +462,9 @@ func TestApplyTransportAcceptedDuplicateAndSequence(t *testing.T) {
 	mustPutBoot(t, s, "node-a", 3, testBootA, 5, "fp-3-5")
 
 	applied := 0
-	apply := func(tx *sql.Tx) error {
+	apply := func(tx *Tx) error {
 		applied++
-		_, err := tx.ExecContext(ctx,
+		_, err := tx.tx.ExecContext(ctx,
 			`INSERT INTO report_activity(node_id, report_id, collected_at, received_at) VALUES(?, ?, ?, ?)`,
 			"node-a", "report-9", 100, 101)
 		return err
@@ -613,8 +612,8 @@ func TestApplyTransportRollbackOnApplyError(t *testing.T) {
 
 	attempt := protocol.Attempt{Gen: 3, BootID: testBootB, Seq: 1, Fingerprint: "fp-3-1"}
 	applyErr := errors.New("downstream payload validation rejected the report")
-	res, err := s.ApplyTransport(ctx, "node-a", attempt, "fp-3-1", func(tx *sql.Tx) error {
-		if _, err := tx.ExecContext(ctx,
+	res, err := s.ApplyTransport(ctx, "node-a", attempt, "fp-3-1", func(tx *Tx) error {
+		if _, err := tx.tx.ExecContext(ctx,
 			`INSERT INTO report_activity(node_id, report_id, collected_at, received_at) VALUES(?, ?, ?, ?)`,
 			"node-a", "rollback-report", 1, 2); err != nil {
 			return err
@@ -627,8 +626,8 @@ func TestApplyTransportRollbackOnApplyError(t *testing.T) {
 	if IsTransportConflict(err) {
 		t.Fatalf("apply failure must not be reported as a transport conflict: %v", err)
 	}
-	if res.Outcome != protocol.Accepted {
-		t.Fatalf("decision outcome = %q, want accepted (transaction must still roll back)", res.Outcome)
+	if res != (protocol.Result{}) {
+		t.Fatalf("apply failure returned a non-zero decision/result %+v; callers could mistake it for a committed success", res)
 	}
 	after, err := s.GetBoot(ctx, "node-a")
 	if err != nil {
@@ -667,13 +666,17 @@ func TestDedupeNonceAndReport(t *testing.T) {
 	ctx := testContext()
 	mustCreateNode(t, s, "node-a", "event-a", NodeClassLinuxVPS)
 
-	existing, err := s.InsertNonce(ctx, "node-a", "nonce-1", "fp-nonce-1", 100)
-	if err != nil || existing {
-		t.Fatalf("first InsertNonce = (%v, %v), want (false, nil)", existing, err)
+	status, err := s.CheckOrInsertNonce(ctx, "node-a", "nonce-1", "fp-nonce-1", 100)
+	if err != nil || status != NonceNew {
+		t.Fatalf("first nonce = (%q, %v), want new", status, err)
 	}
-	existing, err = s.InsertNonce(ctx, "node-a", "nonce-1", "fp-nonce-1", 200)
-	if err != nil || !existing {
-		t.Fatalf("duplicate InsertNonce = (%v, %v), want (true, nil)", existing, err)
+	status, err = s.CheckOrInsertNonce(ctx, "node-a", "nonce-1", "fp-nonce-1", 200)
+	if err != nil || status != NonceExactRetry {
+		t.Fatalf("exact nonce retry = (%q, %v), want exact_retry", status, err)
+	}
+	status, err = s.CheckOrInsertNonce(ctx, "node-a", "nonce-1", "fp-nonce-1-other", 300)
+	if err != nil || status != NonceReuse {
+		t.Fatalf("nonce reuse = (%q, %v), want nonce_reuse", status, err)
 	}
 	seen, err := s.NonceSeen(ctx, "node-a", "nonce-1")
 	if err != nil || !seen {
@@ -691,29 +694,33 @@ func TestDedupeNonceAndReport(t *testing.T) {
 	if _, ok, err := s.ReportSeen(ctx, "node-a", "report-1"); err != nil || ok {
 		t.Fatalf("ReportSeen before insert = (ok=%v, err=%v), want false", ok, err)
 	}
-	existing, err = s.InsertReport(ctx, "node-a", "report-1", "sha-report-1", 300)
-	if err != nil || existing {
-		t.Fatalf("first InsertReport = (%v, %v), want (false, nil)", existing, err)
+	reportStatus, err := s.CheckOrInsertReport(ctx, "node-a", "report-1", "sha-report-1", 300)
+	if err != nil || reportStatus != ReportNew {
+		t.Fatalf("first report = (%q, %v), want new", reportStatus, err)
 	}
-	existing, err = s.InsertReport(ctx, "node-a", "report-1", "sha-report-1", 400)
-	if err != nil || !existing {
-		t.Fatalf("duplicate InsertReport = (%v, %v), want (true, nil)", existing, err)
+	reportStatus, err = s.CheckOrInsertReport(ctx, "node-a", "report-1", "sha-report-1", 400)
+	if err != nil || reportStatus != ReportDuplicate {
+		t.Fatalf("duplicate report = (%q, %v), want duplicate", reportStatus, err)
 	}
 	stored, ok, err := s.ReportSeen(ctx, "node-a", "report-1")
 	if err != nil || !ok || stored != "sha-report-1" {
 		t.Fatalf("ReportSeen = (%q, %v, %v), want sha-report-1", stored, ok, err)
 	}
 	// A reused report_id with different content is a report_conflict; the
-	// original hash is never overwritten.
-	existing, err = s.InsertReport(ctx, "node-a", "report-1", "sha-report-1-other", 500)
-	if !existing || !errors.Is(err, ErrConflict) {
-		t.Fatalf("conflicting InsertReport = (%v, %v), want (true, ErrConflict)", existing, err)
+	// original hash and the last_received_at of the previous accepted retry are
+	// never overwritten by the conflicting request.
+	beforeLast := queryInt(t, s, `SELECT last_received_at FROM report_dedupe WHERE node_id = ? AND report_id = ?`, "node-a", "report-1")
+	reportStatus, err = s.CheckOrInsertReport(ctx, "node-a", "report-1", "sha-report-1-other", 500)
+	if err != nil || reportStatus != ReportConflict {
+		t.Fatalf("conflicting report = (%q, %v), want conflict", reportStatus, err)
 	}
 	stored, ok, err = s.ReportSeen(ctx, "node-a", "report-1")
 	if err != nil || !ok || stored != "sha-report-1" {
 		t.Fatalf("ReportSeen after conflict = (%q, %v, %v), want the original hash", stored, ok, err)
 	}
-	// The conflict must not create a second dedupe row.
+	if afterLast := queryInt(t, s, `SELECT last_received_at FROM report_dedupe WHERE node_id = ? AND report_id = ?`, "node-a", "report-1"); afterLast != beforeLast {
+		t.Fatalf("report_conflict changed last_received_at: before=%d after=%d", beforeLast, afterLast)
+	}
 	if got := queryInt(t, s, `SELECT COUNT(*) FROM report_dedupe WHERE node_id = ? AND report_id = ?`, "node-a", "report-1"); got != 1 {
 		t.Fatalf("report_dedupe rows = %d, want 1", got)
 	}
@@ -728,11 +735,11 @@ func TestRestartPersistence(t *testing.T) {
 	}
 	mustCreateNode(t, s, "node-a", "event-a", NodeClassLinuxVPS)
 	mustPutBoot(t, s, "node-a", 3, testBootA, 7, "fp-3-7")
-	if _, err := s.InsertNonce(ctx, "node-a", "nonce-1", "fp-nonce-1", 100); err != nil {
-		t.Fatalf("InsertNonce: %v", err)
+	if _, err := s.CheckOrInsertNonce(ctx, "node-a", "nonce-1", "fp-nonce-1", 100); err != nil {
+		t.Fatalf("CheckOrInsertNonce: %v", err)
 	}
-	if _, err := s.InsertReport(ctx, "node-a", "report-1", "sha-report-1", 200); err != nil {
-		t.Fatalf("InsertReport: %v", err)
+	if _, err := s.CheckOrInsertReport(ctx, "node-a", "report-1", "sha-report-1", 200); err != nil {
+		t.Fatalf("CheckOrInsertReport: %v", err)
 	}
 	if _, err := s.AppendLedger(ctx, 300, "node_enrolled", "node-a", "detail-1"); err != nil {
 		t.Fatalf("AppendLedger: %v", err)
@@ -773,115 +780,12 @@ func TestRestartPersistence(t *testing.T) {
 	// The persisted seq_dedupe state still classifies the retry as a duplicate.
 	res, err := reopened.ApplyTransport(ctx, "node-a",
 		protocol.Attempt{Gen: 3, BootID: testBootA, Seq: 7, Fingerprint: "fp-3-7"}, "fp-3-7",
-		func(tx *sql.Tx) error {
+		func(tx *Tx) error {
 			t.Fatal("duplicate after restart must not apply payload")
 			return nil
 		})
 	if err != nil || res.Outcome != protocol.Duplicate {
 		t.Fatalf("post-restart retry = (%q, %v), want duplicate", res.Outcome, err)
-	}
-}
-
-func TestMappingVersionHistoryAndValidation(t *testing.T) {
-	s := openTestStore(t, tempStorePath(t))
-	ctx := testContext()
-	const (
-		eventID = "event-a"
-		winID   = "node-win"
-	)
-	mustCreateNode(t, s, winID, eventID, NodeClassWindowsTerminal)
-	mustCreateNode(t, s, "node-a", eventID, NodeClassLinuxVPS)
-	mustCreateNode(t, s, "node-b", eventID, NodeClassLinuxVPS)
-	mustCreateNode(t, s, "node-c", eventID, NodeClassLinuxVPS)
-	mustCreateNode(t, s, "node-other-event", "event-b", NodeClassLinuxVPS)
-
-	v1 := map[string]string{
-		RouteTokenAReality: "node-a",
-		RouteTokenBReality: "node-b",
-	}
-	if err := s.CreateMappingVersion(ctx, eventID, winID, 1, 100, "admin", v1); err != nil {
-		t.Fatalf("CreateMappingVersion v1: %v", err)
-	}
-	got, version, err := s.ResolveMapping(ctx, eventID, winID, 150)
-	if err != nil {
-		t.Fatalf("ResolveMapping at 150: %v", err)
-	}
-	if version != 1 || !maps.Equal(got, v1) {
-		t.Fatalf("resolve at 150 = (v%d, %v), want (v1, %v)", version, got, v1)
-	}
-
-	v2 := map[string]string{
-		RouteTokenAReality: "node-c",
-		RouteTokenDirect:   "node-a",
-	}
-	if err := s.CreateMappingVersion(ctx, eventID, winID, 2, 200, "admin", v2); err != nil {
-		t.Fatalf("CreateMappingVersion v2: %v", err)
-	}
-	// Historical resolution is stable after appending a newer version.
-	got, version, err = s.ResolveMapping(ctx, eventID, winID, 150)
-	if err != nil {
-		t.Fatalf("ResolveMapping at 150 after v2: %v", err)
-	}
-	if version != 1 || !maps.Equal(got, v1) {
-		t.Fatalf("historical resolve = (v%d, %v), want v1 unchanged", version, got)
-	}
-	got, version, err = s.ResolveMapping(ctx, eventID, winID, 250)
-	if err != nil {
-		t.Fatalf("ResolveMapping at 250: %v", err)
-	}
-	if version != 2 || !maps.Equal(got, v2) {
-		t.Fatalf("resolve at 250 = (v%d, %v), want (v2, %v)", version, got, v2)
-	}
-	if _, _, err := s.ResolveMapping(ctx, eventID, winID, 99); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("ResolveMapping before first effective_from error = %v, want ErrNotFound", err)
-	}
-
-	// Append-only: the same version can never be replaced or edited.
-	err = s.CreateMappingVersion(ctx, eventID, winID, 1, 300, "attacker", map[string]string{RouteTokenAReality: "node-c"})
-	if !errors.Is(err, ErrAlreadyExists) {
-		t.Fatalf("duplicate version error = %v, want ErrAlreadyExists", err)
-	}
-	got, version, err = s.ResolveMapping(ctx, eventID, winID, 150)
-	if err != nil || version != 1 || !maps.Equal(got, v1) {
-		t.Fatalf("duplicate insert changed history: (v%d, %v, %v)", version, got, err)
-	}
-
-	// Validation failures must not create versions or entries.
-	invalidCases := []struct {
-		name    string
-		version int
-		entries map[string]string
-	}{
-		{"unknown target", 3, map[string]string{RouteTokenAReality: "node-missing"}},
-		{"windows target", 3, map[string]string{RouteTokenAReality: winID}},
-		{"other event target", 3, map[string]string{RouteTokenAReality: "node-other-event"}},
-		{"unknown token", 3, map[string]string{"c_reality": "node-a"}},
-		{"empty entries", 3, map[string]string{}},
-		{"zero version", 0, map[string]string{RouteTokenAReality: "node-a"}},
-	}
-	for _, tc := range invalidCases {
-		if err := s.CreateMappingVersion(ctx, eventID, winID, tc.version, 300, "admin", tc.entries); !errors.Is(err, ErrInvalidArgument) {
-			t.Errorf("%s: error = %v, want ErrInvalidArgument", tc.name, err)
-		}
-	}
-	if got := queryInt(t, s, `SELECT COUNT(*) FROM route_mapping_versions WHERE event_id = ? AND windows_node_id = ?`, eventID, winID); got != 2 {
-		t.Fatalf("mapping versions = %d, want 2 after rejected inserts", got)
-	}
-
-	// Deterministic tie-break: with equal effective_from the higher version wins.
-	if err := s.CreateMappingVersion(ctx, eventID, winID, 3, 200, "admin", map[string]string{RouteTokenBHy2: "node-c"}); err != nil {
-		t.Fatalf("CreateMappingVersion v3: %v", err)
-	}
-	got, version, err = s.ResolveMapping(ctx, eventID, winID, 250)
-	if err != nil {
-		t.Fatalf("ResolveMapping at 250 after tie: %v", err)
-	}
-	if version != 3 || !maps.Equal(got, map[string]string{RouteTokenBHy2: "node-c"}) {
-		t.Fatalf("tie-break resolve = (v%d, %v), want v3", version, got)
-	}
-	got, version, err = s.ResolveMapping(ctx, eventID, winID, 150)
-	if err != nil || version != 1 || !maps.Equal(got, v1) {
-		t.Fatalf("resolve at 150 after tie = (v%d, %v, %v), want v1", version, got, err)
 	}
 }
 
@@ -960,8 +864,8 @@ func TestRetentionSweep(t *testing.T) {
 		{"new-nonce", now - 1*60*60},
 	}
 	for _, tc := range nonces {
-		if _, err := s.InsertNonce(ctx, "node-a", tc.nonce, "fp", tc.at); err != nil {
-			t.Fatalf("InsertNonce(%q): %v", tc.nonce, err)
+		if _, err := s.CheckOrInsertNonce(ctx, "node-a", tc.nonce, "fp", tc.at); err != nil {
+			t.Fatalf("CheckOrInsertNonce(%q): %v", tc.nonce, err)
 		}
 	}
 	type reportCase struct {
@@ -973,8 +877,8 @@ func TestRetentionSweep(t *testing.T) {
 		{"new-report", now - 1*24*60*60},
 	}
 	for _, tc := range reports {
-		if _, err := s.InsertReport(ctx, "node-a", tc.reportID, "sha", tc.at); err != nil {
-			t.Fatalf("InsertReport(%q): %v", tc.reportID, err)
+		if _, err := s.CheckOrInsertReport(ctx, "node-a", tc.reportID, "sha", tc.at); err != nil {
+			t.Fatalf("CheckOrInsertReport(%q): %v", tc.reportID, err)
 		}
 	}
 	for _, tc := range []struct {

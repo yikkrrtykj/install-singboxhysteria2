@@ -114,7 +114,6 @@ var allowedRouteTokens = map[string]struct{}{
 	RouteTokenAHy2:     {},
 	RouteTokenBReality: {},
 	RouteTokenBHy2:     {},
-	RouteTokenDirect:   {},
 }
 
 // SeqFingerprintHistoryLimit is the bounded seq_dedupe history used for
@@ -212,6 +211,71 @@ type rowQuerier interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
+// execQuerier is the read/write subset shared by *sql.DB and *sql.Tx.
+type execQuerier interface {
+	rowQuerier
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+// Tx exposes the B2-safe operations that must run inside an existing SQLite
+// transaction. It deliberately wraps *sql.Tx and does not expose the raw handle:
+// callers cannot open a nested transaction, issue arbitrary SQL or bypass the
+// bounded/validated operations. Methods never start their own transaction and
+// must only be used with the transaction from WithTx/ApplyTransport.
+type Tx struct {
+	tx *sql.Tx
+}
+
+// WithTx runs fn inside one SQLite transaction. On any error the transaction is
+// rolled back; on success it is committed only after fn returns nil. This is the
+// B2 entry point for combining nonce/report/seq/boot decisions with payload
+// writes atomically.
+func (s *Store) WithTx(ctx context.Context, fn func(*Tx) error) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("store: begin transaction: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	if err := fn(&Tx{tx: tx}); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("store: commit transaction: %w", err)
+	}
+	committed = true
+	return nil
+}
+
+// CheckOrInsertNonce classifies a nonce inside the caller's transaction.
+func (t *Tx) CheckOrInsertNonce(ctx context.Context, nodeID, nonce, fingerprint string, at int64) (NonceStatus, error) {
+	return checkOrInsertNonce(ctx, t.tx, nodeID, nonce, fingerprint, at)
+}
+
+// CheckOrInsertReport classifies a report_id inside the caller's transaction.
+func (t *Tx) CheckOrInsertReport(ctx context.Context, nodeID, reportID, bodySHA256 string, at int64) (ReportStatus, error) {
+	return checkOrInsertReport(ctx, t.tx, nodeID, reportID, bodySHA256, at)
+}
+
+// SeqLookup reads the exact-retry fingerprint inside the caller's transaction.
+func (t *Tx) SeqLookup(ctx context.Context, nodeID string, gen uint64, bootID string, seq uint64) (string, bool, error) {
+	return seqLookup(ctx, t.tx, nodeID, gen, bootID, seq)
+}
+
+// RecordSeq records one exact-retry fingerprint inside the caller's transaction.
+func (t *Tx) RecordSeq(ctx context.Context, nodeID string, gen uint64, bootID string, seq uint64, fingerprint string, at int64) error {
+	return recordSeq(ctx, t.tx, nodeID, gen, bootID, seq, fingerprint, at)
+}
+
+// LoadBoot reads the authoritative high-water inside the caller's transaction.
+func (t *Tx) LoadBoot(ctx context.Context, nodeID string) (protocol.Boot, bool, error) {
+	return loadBoot(ctx, t.tx, nodeID)
+}
+
 // loadBoot reads the authoritative high-water row. ok is false when the node
 // has not yet had an accepted transport request (enrollment state).
 func loadBoot(ctx context.Context, q rowQuerier, nodeID string) (protocol.Boot, bool, error) {
@@ -249,10 +313,11 @@ func (s *Store) GetBoot(ctx context.Context, nodeID string) (protocol.Boot, erro
 	return boot, nil
 }
 
-// PutBoot overwrites the authoritative high-water of one node. It exists for
-// operator tooling and tests; normal ingestion must go through ApplyTransport so
-// the high-water is only advanced inside the request transaction.
-func (s *Store) PutBoot(ctx context.Context, nodeID string, gen uint64, bootID string, seq uint64, fingerprint string) error {
+// putBoot is a test/development seeding helper. It is intentionally unexported:
+// B2 ingest and operator code must not be able to lower or arbitrarily rewrite
+// the authoritative high-water through a public Store method. Production code
+// advances state only inside ApplyTransport.
+func (s *Store) putBoot(ctx context.Context, nodeID string, gen uint64, bootID string, seq uint64, fingerprint string) error {
 	if strings.TrimSpace(nodeID) == "" {
 		return invalidArgument("node_id", "must not be empty")
 	}
@@ -278,53 +343,84 @@ func (s *Store) PutBoot(ctx context.Context, nodeID string, gen uint64, bootID s
 		   updated_at = excluded.updated_at`,
 		nodeID, genValue, bootID, seqValue, nullString(fingerprint), nowUnix())
 	if err != nil {
-		return fmt.Errorf("store: put boot state: %w", err)
+		return fmt.Errorf("store: seed boot state: %w", err)
 	}
 	return nil
 }
 
-// InsertNonce records first use of a (node, nonce) pair. The returned bool is
-// true when the nonce was already present (an idempotent replay); no write
-// happens in that case.
-func (s *Store) InsertNonce(ctx context.Context, nodeID, nonce, fingerprint string, at int64) (bool, error) {
+// NonceStatus is the replay classification for one (node, nonce) pair.
+type NonceStatus string
+
+const (
+	// NonceNew means the nonce was absent and has now been recorded.
+	NonceNew NonceStatus = "new"
+	// NonceExactRetry means the nonce exists with the exact same request
+	// fingerprint; the caller may answer as an idempotent duplicate.
+	NonceExactRetry NonceStatus = "exact_retry"
+	// NonceReuse means the nonce exists with a different fingerprint; the
+	// caller must answer 409 nonce_reuse and must not process the request.
+	NonceReuse NonceStatus = "nonce_reuse"
+)
+
+// checkOrInsertNonce classifies and, when new, records a nonce inside the given
+// transaction/connection. It never overwrites an existing fingerprint.
+func checkOrInsertNonce(ctx context.Context, q execQuerier, nodeID, nonce, fingerprint string, at int64) (NonceStatus, error) {
 	if strings.TrimSpace(nodeID) == "" {
-		return false, invalidArgument("node_id", "must not be empty")
+		return "", invalidArgument("node_id", "must not be empty")
 	}
 	if strings.TrimSpace(nonce) == "" {
-		return false, invalidArgument("nonce", "must not be empty")
+		return "", invalidArgument("nonce", "must not be empty")
 	}
-	result, err := s.db.ExecContext(ctx,
+	if strings.TrimSpace(fingerprint) == "" {
+		return "", invalidArgument("fingerprint", "must not be empty")
+	}
+	result, err := q.ExecContext(ctx,
 		`INSERT INTO nonce_dedupe(node_id, nonce, fingerprint, received_at)
 		 VALUES(?, ?, ?, ?)
 		 ON CONFLICT(node_id, nonce) DO NOTHING`,
 		nodeID, nonce, fingerprint, at)
 	if err != nil {
-		return false, fmt.Errorf("store: insert nonce: %w", err)
+		return "", fmt.Errorf("store: insert nonce: %w", err)
 	}
 	affected, err := result.RowsAffected()
 	if err != nil {
-		return false, fmt.Errorf("store: insert nonce: %w", err)
+		return "", fmt.Errorf("store: insert nonce: %w", err)
 	}
-	return affected == 0, nil
+	if affected == 1 {
+		return NonceNew, nil
+	}
+	var stored string
+	if err := q.QueryRowContext(ctx,
+		`SELECT fingerprint FROM nonce_dedupe WHERE node_id = ? AND nonce = ?`,
+		nodeID, nonce).Scan(&stored); err != nil {
+		return "", fmt.Errorf("store: read existing nonce: %w", err)
+	}
+	if stored == fingerprint {
+		return NonceExactRetry, nil
+	}
+	return NonceReuse, nil
+}
+
+// CheckOrInsertNonce classifies a nonce outside an explicit transaction. It is
+// suitable for single-purpose callers; B2 must use Tx.CheckOrInsertNonce so the
+// nonce, report and high-water state commit atomically.
+func (s *Store) CheckOrInsertNonce(ctx context.Context, nodeID, nonce, fingerprint string, at int64) (NonceStatus, error) {
+	return checkOrInsertNonce(ctx, s.db, nodeID, nonce, fingerprint, at)
 }
 
 // NonceSeen reports whether a (node, nonce) pair is present.
 func (s *Store) NonceSeen(ctx context.Context, nodeID, nonce string) (bool, error) {
-	var one int
-	err := s.db.QueryRowContext(ctx,
-		`SELECT 1 FROM nonce_dedupe WHERE node_id = ? AND nonce = ?`, nodeID, nonce).Scan(&one)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
+	fingerprint, ok, err := s.NonceFingerprint(ctx, nodeID, nonce)
 	if err != nil {
-		return false, fmt.Errorf("store: read nonce: %w", err)
+		return false, err
 	}
-	return true, nil
+	_ = fingerprint
+	return ok, nil
 }
 
 // NonceFingerprint returns the request fingerprint stored with a nonce, if the
-// pair is present. Callers use it to distinguish an exact retry from a
-// nonce_reuse (same nonce, different fingerprint).
+// pair is present. Callers use it for diagnostics; replay classification must
+// use CheckOrInsertNonce/Tx.CheckOrInsertNonce so insert+classify is atomic.
 func (s *Store) NonceFingerprint(ctx context.Context, nodeID, nonce string) (string, bool, error) {
 	var fingerprint string
 	err := s.db.QueryRowContext(ctx,
@@ -339,57 +435,56 @@ func (s *Store) NonceFingerprint(ctx context.Context, nodeID, nonce string) (str
 	return fingerprint, true, nil
 }
 
-// InsertReport records a report_id receipt. The returned bool is true when the
-// report_id was already stored. A reused report_id with a different body hash is
-// reported as (true, ErrConflict) after refreshing last_received_at; the caller
-// maps that onto the frozen 409 report_conflict.
-func (s *Store) InsertReport(ctx context.Context, nodeID, reportID, bodySHA256 string, at int64) (bool, error) {
+// ReportStatus is the report_id idempotency classification.
+type ReportStatus string
+
+const (
+	ReportNew       ReportStatus = "new"
+	ReportDuplicate ReportStatus = "duplicate"
+	ReportConflict  ReportStatus = "conflict"
+)
+
+// checkOrInsertReport classifies and records a report_id. A same-body retry may
+// refresh last_received_at and is a duplicate; a different-body reuse is a
+// conflict and MUST NOT update any stored timestamp.
+func checkOrInsertReport(ctx context.Context, q execQuerier, nodeID, reportID, bodySHA256 string, at int64) (ReportStatus, error) {
 	if strings.TrimSpace(nodeID) == "" {
-		return false, invalidArgument("node_id", "must not be empty")
+		return "", invalidArgument("node_id", "must not be empty")
 	}
 	if strings.TrimSpace(reportID) == "" {
-		return false, invalidArgument("report_id", "must not be empty")
+		return "", invalidArgument("report_id", "must not be empty")
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return false, fmt.Errorf("store: begin report dedupe: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
 	var stored string
-	err = tx.QueryRowContext(ctx,
+	err := q.QueryRowContext(ctx,
 		`SELECT body_sha256 FROM report_dedupe WHERE node_id = ? AND report_id = ?`,
 		nodeID, reportID).Scan(&stored)
 	if errors.Is(err, sql.ErrNoRows) {
-		if _, err := tx.ExecContext(ctx,
+		if _, err := q.ExecContext(ctx,
 			`INSERT INTO report_dedupe(node_id, report_id, body_sha256, first_received_at, last_received_at)
 			 VALUES(?, ?, ?, ?, ?)`,
 			nodeID, reportID, bodySHA256, at, at); err != nil {
-			return false, fmt.Errorf("store: insert report dedupe: %w", err)
+			return "", fmt.Errorf("store: insert report dedupe: %w", err)
 		}
-		if err := tx.Commit(); err != nil {
-			return false, fmt.Errorf("store: commit report dedupe: %w", err)
-		}
-		return false, nil
+		return ReportNew, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("store: read report dedupe: %w", err)
+		return "", fmt.Errorf("store: read report dedupe: %w", err)
 	}
-	// Existing report_id: only refresh the observation window and never rewrite
-	// the stored hash, so a conflicting body cannot overwrite history.
-	if _, err := tx.ExecContext(ctx,
+	if stored != bodySHA256 {
+		return ReportConflict, nil
+	}
+	if _, err := q.ExecContext(ctx,
 		`UPDATE report_dedupe SET last_received_at = ?
 		 WHERE node_id = ? AND report_id = ? AND (last_received_at IS NULL OR last_received_at < ?)`,
 		at, nodeID, reportID, at); err != nil {
-		return true, fmt.Errorf("store: refresh report dedupe: %w", err)
+		return "", fmt.Errorf("store: refresh report dedupe: %w", err)
 	}
-	if err := tx.Commit(); err != nil {
-		return true, fmt.Errorf("store: commit report dedupe: %w", err)
-	}
-	if stored != bodySHA256 {
-		return true, fmt.Errorf("%w: report_id %q was already stored with a different body hash", ErrConflict, reportID)
-	}
-	return true, nil
+	return ReportDuplicate, nil
+}
+
+// CheckOrInsertReport classifies a report_id outside an explicit transaction.
+func (s *Store) CheckOrInsertReport(ctx context.Context, nodeID, reportID, bodySHA256 string, at int64) (ReportStatus, error) {
+	return checkOrInsertReport(ctx, s.db, nodeID, reportID, bodySHA256, at)
 }
 
 // ReportSeen returns the stored body hash of a report_id, if present.
@@ -410,6 +505,10 @@ func (s *Store) ReportSeen(ctx context.Context, nodeID, reportID string) (string
 // SeqLookup returns the exact-retry fingerprint recorded for one
 // (node, boot generation, boot id, seq) attempt.
 func (s *Store) SeqLookup(ctx context.Context, nodeID string, gen uint64, bootID string, seq uint64) (string, bool, error) {
+	return seqLookup(ctx, s.db, nodeID, gen, bootID, seq)
+}
+
+func seqLookup(ctx context.Context, q rowQuerier, nodeID string, gen uint64, bootID string, seq uint64) (string, bool, error) {
 	genValue, err := numericToInt64("gen", gen)
 	if err != nil {
 		return "", false, err
@@ -419,7 +518,7 @@ func (s *Store) SeqLookup(ctx context.Context, nodeID string, gen uint64, bootID
 		return "", false, err
 	}
 	var fingerprint string
-	err = s.db.QueryRowContext(ctx,
+	err = q.QueryRowContext(ctx,
 		`SELECT fingerprint FROM seq_dedupe
 		 WHERE node_id = ? AND boot_gen = ? AND boot_id = ? AND seq = ?`,
 		nodeID, genValue, bootID, seqValue).Scan(&fingerprint)
@@ -432,15 +531,18 @@ func (s *Store) SeqLookup(ctx context.Context, nodeID string, gen uint64, bootID
 	return fingerprint, true, nil
 }
 
-// RecordSeq upserts the exact-retry fingerprint of one accepted attempt. Normal
-// ingestion records seq state inside ApplyTransport; this helper is for
-// operator/tooling paths and tests.
-func (s *Store) RecordSeq(ctx context.Context, nodeID string, gen uint64, bootID string, seq uint64, fingerprint string, at int64) error {
+// recordSeq records the exact-retry fingerprint for one accepted attempt. It is
+// insert-only: an existing row is never overwritten; a conflicting fingerprint
+// is ErrConflict (the caller's transport decision must have rejected it first).
+func recordSeq(ctx context.Context, q execQuerier, nodeID string, gen uint64, bootID string, seq uint64, fingerprint string, at int64) error {
 	if strings.TrimSpace(nodeID) == "" {
 		return invalidArgument("node_id", "must not be empty")
 	}
 	if strings.TrimSpace(bootID) == "" {
 		return invalidArgument("boot_id", "must not be empty")
+	}
+	if strings.TrimSpace(fingerprint) == "" {
+		return invalidArgument("fingerprint", "must not be empty")
 	}
 	genValue, err := numericToInt64("gen", gen)
 	if err != nil {
@@ -450,17 +552,39 @@ func (s *Store) RecordSeq(ctx context.Context, nodeID string, gen uint64, bootID
 	if err != nil {
 		return err
 	}
-	_, err = s.db.ExecContext(ctx,
+	result, err := q.ExecContext(ctx,
 		`INSERT INTO seq_dedupe(node_id, boot_gen, boot_id, seq, fingerprint, received_at)
 		 VALUES(?, ?, ?, ?, ?, ?)
-		 ON CONFLICT(node_id, boot_gen, boot_id, seq) DO UPDATE SET
-		   fingerprint = excluded.fingerprint,
-		   received_at = excluded.received_at`,
+		 ON CONFLICT(node_id, boot_gen, boot_id, seq) DO NOTHING`,
 		nodeID, genValue, bootID, seqValue, fingerprint, at)
 	if err != nil {
 		return fmt.Errorf("store: record seq dedupe: %w", err)
 	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: record seq dedupe: %w", err)
+	}
+	if affected == 1 {
+		return nil
+	}
+	stored, ok, err := seqLookup(ctx, q, nodeID, gen, bootID, seq)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("store: seq dedupe row vanished during insert")
+	}
+	if stored != fingerprint {
+		return fmt.Errorf("%w: seq %d for node %q already has a different fingerprint", ErrConflict, seq, nodeID)
+	}
 	return nil
+}
+
+// RecordSeq records one exact-retry fingerprint outside an explicit
+// transaction. Normal ingestion uses ApplyTransport, which does this inside the
+// request transaction.
+func (s *Store) RecordSeq(ctx context.Context, nodeID string, gen uint64, bootID string, seq uint64, fingerprint string, at int64) error {
+	return recordSeq(ctx, s.db, nodeID, gen, bootID, seq, fingerprint, at)
 }
 
 // loadSeqFingerprints reads the bounded exact-retry history for the current
@@ -504,22 +628,28 @@ func loadSeqFingerprints(ctx context.Context, q rowQuerier, nodeID string, gen u
 //   - The authoritative node_boot high-water and the exact-retry history are
 //     read inside the transaction, then protocol.Evaluate classifies the
 //     attempt.
-//   - Accepted: node_boot, boot_registry and seq_dedupe are updated and only
-//     then is apply(tx) invoked. If apply returns an error the transaction is
-//     rolled back, so a failed payload can never advance the high-water. The
-//     Result is returned together with the apply error: it still describes the
-//     decision, but nothing was committed, so the caller must not acknowledge
-//     the request and must retry it.
+//   - Accepted: node_boot, boot_registry and seq_dedupe are updated (insert-only
+//     for seq dedupe) and only then is apply(*Tx) invoked. The callback receives
+//     the B2-safe transaction wrapper; it must perform all reads/writes through
+//     that wrapper and must NOT call public Store methods (they would open a new
+//     transaction and contend with the single SQLite writer). If the callback
+//     returns an error the transaction is rolled back, so a failed payload can
+//     never advance the high-water.
 //   - Duplicate: the attempt was already committed by the winning request. No
-//     write is performed here (the caller's report dedupe handles payload
-//     idempotency) and the Result carries the ACK next_seq.
+//     high-water change and no apply callback is invoked in B1; the Result
+//     carries the ACK next_seq. B2 may extend duplicate-payload handling inside
+//     the same transaction when it implements ingest.
 //   - Any other outcome: rejected with a typed *TransportConflictError and no
 //     write.
+//
+// On every error path the returned Result is the zero value. Callers must not
+// treat a non-nil error as a committed success and must not emit an ACK unless
+// the error is nil and the outcome is Accepted/Duplicate.
 //
 // attempt.Fingerprint is the canonical request fingerprint; the fingerprint
 // parameter is a fallback so callers may pass it separately without duplicating
 // it in Attempt.
-func (s *Store) ApplyTransport(ctx context.Context, nodeID string, attempt protocol.Attempt, fingerprint string, apply func(*sql.Tx) error) (protocol.Result, error) {
+func (s *Store) ApplyTransport(ctx context.Context, nodeID string, attempt protocol.Attempt, fingerprint string, apply func(*Tx) error) (protocol.Result, error) {
 	if strings.TrimSpace(nodeID) == "" {
 		return protocol.Result{}, invalidArgument("node_id", "must not be empty")
 	}
@@ -599,7 +729,7 @@ func (s *Store) ApplyTransport(ctx context.Context, nodeID string, attempt proto
 			   last_fingerprint = excluded.last_fingerprint,
 			   updated_at = excluded.updated_at`,
 			nodeID, highestGen, next.BootID, lastSeq, nullString(next.LastFingerprint), now); err != nil {
-			return result, fmt.Errorf("store: advance boot high-water: %w", err)
+			return protocol.Result{}, fmt.Errorf("store: advance boot high-water: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO boot_registry(node_id, boot_gen, boot_id, first_seen_at, last_seen_at, last_seq, state)
@@ -609,29 +739,25 @@ func (s *Store) ApplyTransport(ctx context.Context, nodeID string, attempt proto
 			   last_seq = excluded.last_seq,
 			   state = 'active'`,
 			nodeID, genValue, a.BootID, now, now, seqValue); err != nil {
-			return result, fmt.Errorf("store: record boot registry: %w", err)
+			return protocol.Result{}, fmt.Errorf("store: record boot registry: %w", err)
 		}
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO seq_dedupe(node_id, boot_gen, boot_id, seq, fingerprint, received_at)
-			 VALUES(?, ?, ?, ?, ?, ?)
-			 ON CONFLICT(node_id, boot_gen, boot_id, seq) DO UPDATE SET
-			   fingerprint = excluded.fingerprint,
-			   received_at = excluded.received_at`,
-			nodeID, genValue, a.BootID, seqValue, a.Fingerprint, now); err != nil {
-			return result, fmt.Errorf("store: record seq dedupe: %w", err)
+		if err := recordSeq(ctx, tx, nodeID, a.Gen, a.BootID, a.Seq, a.Fingerprint, now); err != nil {
+			return protocol.Result{}, err
 		}
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE nodes SET last_seen_at = ? WHERE node_id = ?`, now, nodeID); err != nil {
-			return result, fmt.Errorf("store: update node last seen: %w", err)
+			return protocol.Result{}, fmt.Errorf("store: update node last seen: %w", err)
 		}
 		if apply != nil {
-			if err := apply(tx); err != nil {
-				// Deferred rollback reverts the high-water writes above.
-				return result, fmt.Errorf("store: apply transport payload: %w", err)
+			if err := apply(&Tx{tx: tx}); err != nil {
+				// Deferred rollback reverts the high-water writes above. Return
+				// a zero Result: no caller may mistake this for a committed
+				// success or emit an ACK.
+				return protocol.Result{}, fmt.Errorf("store: apply transport payload: %w", err)
 			}
 		}
 		if err := tx.Commit(); err != nil {
-			return result, fmt.Errorf("store: commit transport transaction: %w", err)
+			return protocol.Result{}, fmt.Errorf("store: commit transport transaction: %w", err)
 		}
 		committed = true
 		return result, nil
@@ -646,10 +772,27 @@ func (s *Store) ApplyTransport(ctx context.Context, nodeID string, attempt proto
 	}
 }
 
-// CreateMappingVersion appends one immutable version of the Windows-terminal
-// route mapping for an event. Target nodes must exist as linux_vps nodes of the
-// same event; route tokens are the frozen five-token set. A version can never
-// be overwritten: re-inserting an existing version returns ErrAlreadyExists.
+// CreateMappingVersion appends one immutable, effective-dated version of the
+// Windows-terminal route mapping for an event.
+//
+// Validation (all inside one transaction, before any write):
+//   - windows_node_id exists, has node_class=windows_terminal and belongs to
+//     event_id;
+//   - every target exists, has node_class=linux_vps and belongs to event_id;
+//   - route tokens are exactly the four A/B protocol tokens
+//     (a_reality/a_hy2/b_reality/b_hy2). direct/unknown are reserved display
+//     tokens and can never be mapped to a VPS;
+//   - version is strictly the next version (first version must be 1) and
+//     effective_from is strictly later than the latest version's effective_from.
+//     A backdated or same-time insert is rejected, preserving all previously
+//     attributed history;
+//   - future-effective versions are allowed; they become effective only when
+//     ResolveMapping is asked for a time at/after effective_from.
+//
+// An empty entries map is valid and means "all four tokens are unmapped" from
+// effective_from (the UI renders them as unmapped/UNKNOWN; the previous version
+// remains the historical attribution before that time). Versions and entries are
+// immutable: SQL triggers reject UPDATE/DELETE.
 func (s *Store) CreateMappingVersion(ctx context.Context, eventID, windowsNodeID string, version int, effectiveFrom int64, createdBy string, entries map[string]string) error {
 	if strings.TrimSpace(eventID) == "" {
 		return invalidArgument("event_id", "must not be empty")
@@ -660,20 +803,14 @@ func (s *Store) CreateMappingVersion(ctx context.Context, eventID, windowsNodeID
 	if version < 1 {
 		return invalidArgument("version", "must be a positive integer")
 	}
-	if len(entries) == 0 {
-		return invalidArgument("entries", "must contain at least one route token")
-	}
-	tokens := make([]string, 0, len(entries))
 	for token, target := range entries {
 		if _, ok := allowedRouteTokens[token]; !ok {
-			return invalidArgument("route_token", "must be one of the five frozen route tokens")
+			return invalidArgument("route_token", "must be one of the four A/B protocol tokens; direct/unknown are reserved")
 		}
 		if strings.TrimSpace(target) == "" {
 			return invalidArgument("target_node_id", "must not be empty")
 		}
-		tokens = append(tokens, token)
 	}
-	sort.Strings(tokens)
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -681,36 +818,64 @@ func (s *Store) CreateMappingVersion(ctx context.Context, eventID, windowsNodeID
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	var exists int
+	// The window node must be a real windows_terminal node of this event.
+	var winClass, winEvent string
 	err = tx.QueryRowContext(ctx,
-		`SELECT 1 FROM route_mapping_versions
-		 WHERE event_id = ? AND windows_node_id = ? AND version = ?`,
-		eventID, windowsNodeID, version).Scan(&exists)
-	if err == nil {
-		return fmt.Errorf("%w: route mapping version %d for event %q / windows node %q is append-only",
-			ErrAlreadyExists, version, eventID, windowsNodeID)
+		`SELECT node_class, event_id FROM nodes WHERE node_id = ?`, windowsNodeID).
+		Scan(&winClass, &winEvent)
+	if errors.Is(err, sql.ErrNoRows) {
+		return invalidArgument("windows_node_id", "windows node does not exist")
 	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("store: read mapping version: %w", err)
+	if err != nil {
+		return fmt.Errorf("store: read windows node: %w", err)
+	}
+	if winClass != NodeClassWindowsTerminal {
+		return invalidArgument("windows_node_id", "node class must be windows_terminal")
+	}
+	if winEvent != eventID {
+		return invalidArgument("windows_node_id", "windows node belongs to a different event")
 	}
 
-	// Validate target nodes before writing anything.
-	for _, token := range tokens {
-		target := entries[token]
-		var nodeClass, nodeEvent string
+	// Enforce the append-only version/effective-time ordering.
+	var latestVersion int
+	var latestEffective int64
+	err = tx.QueryRowContext(ctx,
+		`SELECT version, effective_from FROM route_mapping_versions
+		 WHERE event_id = ? AND windows_node_id = ?
+		 ORDER BY version DESC LIMIT 1`,
+		eventID, windowsNodeID).Scan(&latestVersion, &latestEffective)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		if version != 1 {
+			return invalidArgument("version", "first mapping version must be 1")
+		}
+	case err != nil:
+		return fmt.Errorf("store: read latest mapping version: %w", err)
+	default:
+		if version != latestVersion+1 {
+			return invalidArgument("version", fmt.Sprintf("next mapping version must be %d", latestVersion+1))
+		}
+		if effectiveFrom <= latestEffective {
+			return invalidArgument("effective_from", "must be strictly later than the latest version; backdated or same-time versions are rejected")
+		}
+	}
+
+	// Validate every target inside the same transaction.
+	for token, target := range entries {
+		var targetClass, targetEvent string
 		err := tx.QueryRowContext(ctx,
 			`SELECT node_class, event_id FROM nodes WHERE node_id = ?`, target).
-			Scan(&nodeClass, &nodeEvent)
+			Scan(&targetClass, &targetEvent)
 		if errors.Is(err, sql.ErrNoRows) {
 			return invalidArgument("target_node_id", fmt.Sprintf("target for route %q does not exist", token))
 		}
 		if err != nil {
 			return fmt.Errorf("store: read mapping target: %w", err)
 		}
-		if nodeClass != NodeClassLinuxVPS {
+		if targetClass != NodeClassLinuxVPS {
 			return invalidArgument("target_node_id", fmt.Sprintf("target for route %q must be a linux_vps node", token))
 		}
-		if nodeEvent != eventID {
+		if targetEvent != eventID {
 			return invalidArgument("target_node_id", fmt.Sprintf("target for route %q belongs to a different event", token))
 		}
 	}
@@ -720,10 +885,17 @@ func (s *Store) CreateMappingVersion(ctx context.Context, eventID, windowsNodeID
 		 VALUES(?, ?, ?, ?, ?, ?)`,
 		eventID, windowsNodeID, version, effectiveFrom, createdBy, nowUnix()); err != nil {
 		if isUniqueViolation(err) {
-			return fmt.Errorf("%w: route mapping version %d", ErrAlreadyExists, version)
+			return fmt.Errorf("%w: route mapping version %d or effective time already exists", ErrAlreadyExists, version)
 		}
 		return fmt.Errorf("store: insert mapping version: %w", err)
 	}
+	// Deterministic insertion order keeps concurrent writers' error handling
+	// simple; the primary key makes duplicate tokens impossible.
+	tokens := make([]string, 0, len(entries))
+	for token := range entries {
+		tokens = append(tokens, token)
+	}
+	sort.Strings(tokens)
 	for _, token := range tokens {
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO route_mapping_entries(event_id, windows_node_id, version, route_token, target_node_id)
@@ -800,6 +972,11 @@ func ledgerEntryHash(prevHash string, at int64, kind, subject, detailSHA256 stri
 // entry hash. The entry is committed durably before the call returns; the
 // genesis prev_hash is 64 zeros. Callers append in a well-defined causal order
 // so the chain links each event to its predecessor.
+//
+// This is a BASIC tamper-evident structure only. It is not a signed checkpoint,
+// has no offsite/recovery guarantee and cannot detect or prevent truncation of
+// the chain tail. The ledger must not be represented as having those properties
+// until a separate reviewed design adds them.
 func (s *Store) AppendLedger(ctx context.Context, at int64, kind, subject, detailSHA256 string) (string, error) {
 	if strings.TrimSpace(kind) == "" {
 		return "", invalidArgument("kind", "must not be empty")
@@ -834,7 +1011,9 @@ func (s *Store) AppendLedger(ctx context.Context, at int64, kind, subject, detai
 
 // VerifyChain recomputes the complete security-ledger hash chain and returns a
 // typed *LedgerVerificationError (wrapping ErrLedgerTampered) at the first
-// broken link.
+// broken link. It is a diagnostic/integrity check ONLY; it must never be used
+// as authorization to recover, restore or re-enable a node. A chain that is
+// internally consistent can still have been truncated at the tail.
 func (s *Store) VerifyChain(ctx context.Context) error {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT seq, at, kind, subject, detail_sha256, prev_hash, entry_hash
@@ -889,7 +1068,9 @@ func (s *Store) VerifyChain(ctx context.Context) error {
 // (SeqFingerprintHistoryLimit) rather than by deletion, so exact-retry
 // classification cannot be lost by an age sweep. The bounded boot_registry
 // compaction is likewise left to a later policy migration. Both are the
-// documented B1 skeleton simplification.
+// documented B1 skeleton simplification; physical pruning and the full policy-B
+// archive engine are UM-B2 responsibilities and must include a capacity
+// upper-bound validation before the center is put into operation.
 func (s *Store) RunRetention(ctx context.Context, now int64) (map[string]int64, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

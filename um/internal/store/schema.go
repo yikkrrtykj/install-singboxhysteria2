@@ -23,6 +23,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -32,8 +33,9 @@ import (
 )
 
 // SchemaVersion is the highest migration version this build knows. Open always
-// migrates a database to exactly this version.
-const SchemaVersion = 1
+// migrates a database to exactly this version; a database with a newer version
+// is rejected fail-closed instead of being silently used by older code.
+const SchemaVersion = 2
 
 // Node classes accepted by the rev-5 platform isolation contract.
 const (
@@ -41,19 +43,15 @@ const (
 	NodeClassWindowsTerminal = "windows_terminal"
 )
 
-// Store owns one SQLite database handle. It is safe for concurrent use; Open
-// pins the connection pool to a single connection so that the
-// connection-scoped PRAGMAs (synchronous, foreign_keys, busy_timeout) apply to
-// every statement and to transactions.
+// Store owns one SQLite database handle. It is safe for concurrent use. The
+// per-connection PRAGMAs are applied through the driver DSN (see Open) rather
+// than by assuming a single physical connection lives forever; Open verifies the
+// actual PRAGMA values and every new pooled connection is initialised by the
+// driver with the same DSN pragmas.
 type Store struct {
 	db   *sql.DB
 	path string
 }
-
-// DB returns the underlying database handle. It is intended for integration
-// code that needs raw read-only SQL; mutating shortcuts bypass the typed API
-// and the transaction rules documented on the methods.
-func (s *Store) DB() *sql.DB { return s.db }
 
 // Path returns the filesystem path of the database.
 func (s *Store) Path() string { return s.path }
@@ -211,11 +209,110 @@ var migrations = []migration{
 		`CREATE INDEX IF NOT EXISTS idx_route_mapping_versions_lookup
 			ON route_mapping_versions(event_id, windows_node_id, effective_from DESC, version DESC)`,
 	}},
+	{version: 2, statements: []string{
+		// P1-01: rebuild the three protocol high-water tables with STRICT
+		// typing and explicit typeof/range checks. Version 1 stays untouched
+		// (append-only migrations); a v1 development database is upgraded by
+		// copying its rows into the strict tables. If legacy rows violate the
+		// strict bounds the migration fails closed rather than losing or
+		// silently reinterpreting data.
+		`CREATE TABLE node_boot_v2 (
+			node_id          TEXT PRIMARY KEY REFERENCES nodes(node_id),
+			highest_gen      INTEGER NOT NULL CHECK (typeof(highest_gen) = 'integer' AND highest_gen BETWEEN 1 AND 9223372036854775806),
+			boot_id          TEXT NOT NULL,
+			last_seq         INTEGER NOT NULL CHECK (typeof(last_seq) = 'integer' AND last_seq BETWEEN 1 AND 9223372036854775806),
+			last_fingerprint TEXT,
+			updated_at       INTEGER NOT NULL CHECK (typeof(updated_at) = 'integer')
+		) STRICT`,
+		`INSERT INTO node_boot_v2(node_id, highest_gen, boot_id, last_seq, last_fingerprint, updated_at)
+		 SELECT node_id, highest_gen, boot_id, last_seq, last_fingerprint, updated_at FROM node_boot`,
+		`DROP TABLE node_boot`,
+		`ALTER TABLE node_boot_v2 RENAME TO node_boot`,
+
+		`CREATE TABLE seq_dedupe_v2 (
+			node_id     TEXT NOT NULL,
+			boot_gen    INTEGER NOT NULL CHECK (typeof(boot_gen) = 'integer' AND boot_gen BETWEEN 1 AND 9223372036854775806),
+			boot_id     TEXT NOT NULL,
+			seq         INTEGER NOT NULL CHECK (typeof(seq) = 'integer' AND seq BETWEEN 1 AND 9223372036854775806),
+			fingerprint TEXT NOT NULL,
+			received_at INTEGER NOT NULL CHECK (typeof(received_at) = 'integer'),
+			PRIMARY KEY (node_id, boot_gen, boot_id, seq)
+		) STRICT`,
+		`INSERT INTO seq_dedupe_v2(node_id, boot_gen, boot_id, seq, fingerprint, received_at)
+		 SELECT node_id, boot_gen, boot_id, seq, fingerprint, received_at FROM seq_dedupe`,
+		`DROP TABLE seq_dedupe`,
+		`ALTER TABLE seq_dedupe_v2 RENAME TO seq_dedupe`,
+
+		`CREATE TABLE boot_registry_v2 (
+			node_id       TEXT NOT NULL,
+			boot_gen      INTEGER NOT NULL CHECK (typeof(boot_gen) = 'integer' AND boot_gen BETWEEN 1 AND 9223372036854775806),
+			boot_id       TEXT NOT NULL,
+			first_seen_at INTEGER CHECK (first_seen_at IS NULL OR typeof(first_seen_at) = 'integer'),
+			last_seen_at  INTEGER CHECK (last_seen_at IS NULL OR typeof(last_seen_at) = 'integer'),
+			last_seq      INTEGER CHECK (last_seq IS NULL OR (typeof(last_seq) = 'integer' AND last_seq BETWEEN 1 AND 9223372036854775806)),
+			state         TEXT,
+			PRIMARY KEY (node_id, boot_gen, boot_id)
+		) STRICT`,
+		`INSERT INTO boot_registry_v2(node_id, boot_gen, boot_id, first_seen_at, last_seen_at, last_seq, state)
+		 SELECT node_id, boot_gen, boot_id, first_seen_at, last_seen_at, last_seq, state FROM boot_registry`,
+		`DROP TABLE boot_registry`,
+		`ALTER TABLE boot_registry_v2 RENAME TO boot_registry`,
+
+		// P1-02: strict mapping tables; only the four A/B protocol tokens may be
+		// mapped. direct/unknown are reserved and never point at a VPS.
+		`CREATE TABLE route_mapping_versions_v2 (
+			event_id        TEXT NOT NULL,
+			windows_node_id TEXT NOT NULL,
+			version         INTEGER NOT NULL CHECK (typeof(version) = 'integer' AND version >= 1),
+			effective_from  INTEGER NOT NULL CHECK (typeof(effective_from) = 'integer'),
+			created_by      TEXT,
+			created_at      INTEGER CHECK (created_at IS NULL OR typeof(created_at) = 'integer'),
+			PRIMARY KEY (event_id, windows_node_id, version)
+		) STRICT`,
+		`INSERT INTO route_mapping_versions_v2(event_id, windows_node_id, version, effective_from, created_by, created_at)
+		 SELECT event_id, windows_node_id, version, effective_from, created_by, created_at FROM route_mapping_versions`,
+		`CREATE UNIQUE INDEX route_mapping_versions_effective_unique
+			ON route_mapping_versions_v2(event_id, windows_node_id, effective_from)`,
+		`DROP TABLE route_mapping_versions`,
+		`ALTER TABLE route_mapping_versions_v2 RENAME TO route_mapping_versions`,
+
+		`CREATE TABLE route_mapping_entries_v2 (
+			event_id        TEXT NOT NULL,
+			windows_node_id TEXT NOT NULL,
+			version         INTEGER NOT NULL CHECK (typeof(version) = 'integer' AND version >= 1),
+			route_token     TEXT NOT NULL CHECK (route_token IN ('a_reality','a_hy2','b_reality','b_hy2')),
+			target_node_id  TEXT NOT NULL REFERENCES nodes(node_id),
+			PRIMARY KEY (event_id, windows_node_id, version, route_token)
+		) STRICT`,
+		`INSERT INTO route_mapping_entries_v2(event_id, windows_node_id, version, route_token, target_node_id)
+		 SELECT event_id, windows_node_id, version, route_token, target_node_id FROM route_mapping_entries`,
+		`DROP TABLE route_mapping_entries`,
+		`ALTER TABLE route_mapping_entries_v2 RENAME TO route_mapping_entries`,
+
+		// Append-only history: reject UPDATE/DELETE through raw SQL as well as
+		// through the typed API.
+		`CREATE TRIGGER route_mapping_versions_no_update
+			BEFORE UPDATE ON route_mapping_versions
+			BEGIN SELECT RAISE(ABORT, 'route_mapping_versions are immutable'); END`,
+		`CREATE TRIGGER route_mapping_versions_no_delete
+			BEFORE DELETE ON route_mapping_versions
+			BEGIN SELECT RAISE(ABORT, 'route_mapping_versions are immutable'); END`,
+		`CREATE TRIGGER route_mapping_entries_no_update
+			BEFORE UPDATE ON route_mapping_entries
+			BEGIN SELECT RAISE(ABORT, 'route_mapping_entries are immutable'); END`,
+		`CREATE TRIGGER route_mapping_entries_no_delete
+			BEFORE DELETE ON route_mapping_entries
+			BEGIN SELECT RAISE(ABORT, 'route_mapping_entries are immutable'); END`,
+
+		`CREATE INDEX idx_route_mapping_versions_lookup
+			ON route_mapping_versions(event_id, windows_node_id, effective_from DESC, version DESC)`,
+	}},
 }
 
 // Open creates the parent directory if needed, opens the SQLite database,
-// applies the durability PRAGMAs and migrates the schema to SchemaVersion.
-// Calling Open again on the same path is idempotent.
+// applies the durability/isolation PRAGMAs through the driver's per-connection
+// DSN initialisation, verifies the actual PRAGMA values and migrates the schema
+// to SchemaVersion. Calling Open again on the same path is idempotent.
 func Open(path string) (*Store, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, &InvalidArgumentError{Field: "path", Detail: "must not be empty"}
@@ -225,12 +322,22 @@ func Open(path string) (*Store, error) {
 			return nil, fmt.Errorf("store: create database directory: %w", err)
 		}
 	}
-	db, err := sql.Open("sqlite", path)
+	// Apply PRAGMAs through the driver DSN. This is the per-connection
+	// initialisation guarantee: every pooled physical connection, including a
+	// replacement after the original connection dies, is configured by the
+	// driver before it is handed to database/sql. MaxOpenConns(1) below only
+	// serializes writers; correctness must not depend on a single physical
+	// connection living forever.
+	query := url.Values{}
+	query.Add("_pragma", "busy_timeout(5000)")
+	query.Add("_pragma", "foreign_keys(ON)")
+	query.Add("_pragma", "journal_mode(WAL)")
+	query.Add("_pragma", "synchronous(FULL)")
+	dsn := "file:" + filepath.ToSlash(path) + "?" + query.Encode()
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("store: open sqlite database: %w", err)
 	}
-	// PRAGMAs other than journal_mode are connection-scoped, so the pool is
-	// pinned to one connection. This also serializes writers on a single Store.
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(0)
@@ -238,7 +345,7 @@ func Open(path string) (*Store, error) {
 	s := &Store{db: db, path: path}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if err := s.configureConnection(ctx); err != nil {
+	if err := s.verifyPragmas(ctx); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -249,24 +356,44 @@ func Open(path string) (*Store, error) {
 	return s, nil
 }
 
-// configureConnection applies the frozen durability/isolation PRAGMAs. The
-// journal mode is persistent in the database file; the other settings are
-// connection-scoped, which is why the pool holds a single connection.
-func (s *Store) configureConnection(ctx context.Context) error {
-	pragmas := []string{
-		// busy_timeout first so later pragmas can wait for a lock.
-		`PRAGMA busy_timeout=5000`,
-		`PRAGMA foreign_keys=ON`,
-		`PRAGMA synchronous=FULL`,
-		`PRAGMA journal_mode=WAL`,
+// verifyPragmas verifies the actual returned values, not merely that Exec
+// succeeded. A mismatch is fail-closed: running with an unverified durability
+// or isolation setting is worse than refusing to start.
+func (s *Store) verifyPragmas(ctx context.Context) error {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("store: get verification connection: %w", err)
 	}
-	for _, stmt := range pragmas {
-		// database/sql's Exec handles the row-returning forms (journal_mode)
-		// and the plain assignment forms (foreign_keys) uniformly: the driver
-		// steps every statement exactly once.
-		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
-			return fmt.Errorf("store: apply %q: %w", stmt, err)
-		}
+	defer conn.Close()
+
+	var journalMode string
+	if err := conn.QueryRowContext(ctx, `PRAGMA journal_mode`).Scan(&journalMode); err != nil {
+		return fmt.Errorf("store: read journal_mode: %w", err)
+	}
+	if !strings.EqualFold(journalMode, "wal") {
+		return fmt.Errorf("store: journal_mode=%q, want wal", journalMode)
+	}
+	var synchronous int
+	if err := conn.QueryRowContext(ctx, `PRAGMA synchronous`).Scan(&synchronous); err != nil {
+		return fmt.Errorf("store: read synchronous: %w", err)
+	}
+	// SQLite: 0=OFF, 1=NORMAL, 2=FULL, 3=EXTRA.
+	if synchronous != 2 {
+		return fmt.Errorf("store: synchronous=%d, want 2 (FULL)", synchronous)
+	}
+	var foreignKeys int
+	if err := conn.QueryRowContext(ctx, `PRAGMA foreign_keys`).Scan(&foreignKeys); err != nil {
+		return fmt.Errorf("store: read foreign_keys: %w", err)
+	}
+	if foreignKeys != 1 {
+		return fmt.Errorf("store: foreign_keys=%d, want 1", foreignKeys)
+	}
+	var busyTimeout int
+	if err := conn.QueryRowContext(ctx, `PRAGMA busy_timeout`).Scan(&busyTimeout); err != nil {
+		return fmt.Errorf("store: read busy_timeout: %w", err)
+	}
+	if busyTimeout != 5000 {
+		return fmt.Errorf("store: busy_timeout=%d, want 5000", busyTimeout)
 	}
 	return nil
 }
@@ -310,6 +437,11 @@ func (s *Store) applyMigrations(ctx context.Context) error {
 	current, err := s.SchemaVersion(ctx)
 	if err != nil {
 		return err
+	}
+	if current > SchemaVersion {
+		// Fail-closed: a newer database may have semantics this build does not
+		// know. Never silently use or downgrade it.
+		return fmt.Errorf("store: database schema version %d is newer than supported version %d", current, SchemaVersion)
 	}
 	for _, m := range migrations {
 		if m.version <= current {

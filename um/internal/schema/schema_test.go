@@ -247,3 +247,53 @@ func TestValidateFile(t *testing.T) {
 		t.Fatal("ValidateFile(missing) returned nil error")
 	}
 }
+
+// TestValidateRejectsDuplicateJSONObjectKeys pins the strict-JSON grammar the
+// wire contract requires. Duplicate member names are textually valid RFC 8259
+// JSON that encoding/json silently overlays (last value wins), so two consumers
+// could disagree about the same body; the frozen UM v1 contract forbids them.
+func TestValidateRejectsDuplicateJSONObjectKeys(t *testing.T) {
+	set := loadSet(t)
+
+	t.Run("top-level duplicate", func(t *testing.T) {
+		body := []byte(`{"v":1,"v":1,"error":"invalid_request","retryable":false,"server_time":1795622400}`)
+		if err := set.Validate("error.schema.json", body); err == nil {
+			t.Fatal("top-level duplicate member name was accepted")
+		}
+	})
+
+	t.Run("nested duplicate", func(t *testing.T) {
+		valid := string(readFile(t, filepath.Join(contractsDir, "examples", "report-snapshot.v1.json")))
+		const anchor = `"host":{"os":"linux",`
+		mutated := strings.Replace(valid, anchor, `"host":{"os":"linux","os":"windows",`, 1)
+		if mutated == valid {
+			t.Fatalf("test setup: nested anchor %q not found", anchor)
+		}
+		if err := set.Validate("report-snapshot.schema.json", []byte(mutated)); err == nil {
+			t.Fatal("nested duplicate member name was accepted")
+		}
+	})
+}
+
+// TestValidateRejectsTrailingDataButAllowsTrailingWhitespace pins the
+// single-top-level-value rule: whitespace around the value is fine, any further
+// bytes are not.
+func TestValidateRejectsTrailingDataButAllowsTrailingWhitespace(t *testing.T) {
+	set := loadSet(t)
+	valid := []byte(`{"v":1,"error":"invalid_request","retryable":false,"server_time":1795622400}`)
+	if err := set.Validate("error.schema.json", valid); err != nil {
+		t.Fatalf("baseline valid error body rejected: %v", err)
+	}
+
+	withWhitespace := append(append([]byte{}, valid...), []byte("\n\t  \r\n")...)
+	if err := set.Validate("error.schema.json", withWhitespace); err != nil {
+		t.Fatalf("trailing whitespace was rejected: %v", err)
+	}
+
+	for _, trailing := range []string{" {}", "{}", "x", " 0", "null"} {
+		body := append(append([]byte{}, valid...), []byte(trailing)...)
+		if err := set.Validate("error.schema.json", body); err == nil {
+			t.Fatalf("trailing data %q was accepted", trailing)
+		}
+	}
+}

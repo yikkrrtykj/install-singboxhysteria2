@@ -16,9 +16,9 @@ experimental and are not wired into a service or deployment.
 | --- | --- |
 | `internal/wire` | Rev-5 canonical signing strings, Ed25519 sign/verify, canonical numeric bounds, request fingerprint, typed field errors. Reads the frozen vectors from `docs/um/contracts/v1`. |
 | `internal/protocol` | Pure A-1..A-5 recovery/ordering state machine (generation gaps, first-contact `seq>1`, ACK exhaustion, rotation retry ordering). No I/O. |
-| `internal/store` | SQLite (WAL, `synchronous=FULL`) schema/migrations, transactional boot/seq high-water, nonce/report/seq dedupe, versioned route mappings, security-ledger chain and retention basics. |
-| `internal/schema` | Real JSON Schema 2020-12 validation of the frozen `docs/um/contracts/v1` files (not JSON parsing only). |
-| `internal/contract` | Platform isolation and Windows terminal runtime semantics that JSON Schema cannot express (node_class, six tokens, sum/availability/sampling, privacy sentinels). |
+| `internal/store` | SQLite (WAL, `synchronous=FULL`, per-connection DSN PRAGMAs) schema/migrations; STRICT bounded protocol numerics; transactional boot/seq high-water; B2-safe `Tx` nonce/report/seq API; immutable effective-dated route mappings; basic security-ledger chain and retention basics. |
+| `internal/schema` | Real JSON Schema 2020-12 validation of the frozen `docs/um/contracts/v1` files (not JSON parsing only), plus strict duplicate-key/trailing-data rejection. |
+| `internal/contract` | Platform isolation, Linux/Windows availability semantics (Windows `system` optional), terminal-config presence, temporal metric/event checks, and path-aware privacy scanning. |
 | `internal/windowsobs` | Experimental read-only Windows Mihomo route observer (prototype; not a service, not in the B1 acceptance path). |
 | `cmd/um-windows-observe` | One-shot experimental observer CLI. |
 | `docs/adr` | UM-B1 dependency/toolchain ADR. |
@@ -34,12 +34,18 @@ go test -race -count=1 ./...   # Linux only; race detector needs cgo
 go build -trimpath ./...
 ```
 
-Tests read the frozen contract files at `../docs/um/contracts/v1/**`
-(repository path), including the rev-5 positive/negative vectors and
-`docs/um/um-127/conformance/transport-recovery.cases.json` when available.
-Contract changes must trigger Go CI. The dependency/toolchain policy is
-`docs/adr/ADR-UM-B1-001-go-toolchain-and-dependencies.md`; dependencies are
-pinned and checksum-locked, and CI runs `govulncheck`.
+Tests read the frozen contract files at `../docs/um/contracts/v1/**` and the
+normative REC fixture `../docs/um/um-127/conformance/transport-recovery.cases.json`
+(repository path; not copied). Contract/REC changes must trigger Go CI. The
+dependency/toolchain policy is
+`docs/adr/ADR-UM-B1-001-go-toolchain-and-dependencies.md`: Go `1.27.4` is pinned
+exactly, dependencies are pinned and checksum-locked, and CI runs
+`govulncheck@v1.10.0` distinguishing called from module-only advisories.
+
+The B1 execution count is **11 REC cases executed**; REC-29 is deferred in whole
+to UM-B2 and is not claimed as a partial PASS. See
+`docs/um-b1-conformance-map.md` for the full REC mapping, the mapping/clarification
+notes and deferred retention/ledger ownership.
 
 ## Windows snapshot (experimental)
 
@@ -95,7 +101,12 @@ The signing package is exercised against the frozen rev-5 vectors in
 - typed field errors and a sign/verify round-trip.
 
 HTTP ingestion, identity registration, revocation and replay state belong to
-UM-B2; this module does not expose a listener.
+UM-B2; this module does not expose a listener. The store exposes a `WithTx` /
+`ApplyTransport(*Tx)` transaction boundary for B2; callbacks must use the safe
+`Tx` methods and never call public Store methods that open a second transaction.
+The hash-chain ledger is basic tamper evidence only: it is not a signed
+checkpoint, has no offsite recovery/tail-truncation protection, and `VerifyChain`
+must not be used as recovery authorization.
 
 ## Migration order
 

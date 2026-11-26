@@ -257,13 +257,27 @@ func invalidRange(field string) error {
 	}
 }
 
-// RotationState is the persisted state of one rotation intent.
+// RotationState is the persisted state of one rotation intent. The set is
+// closed: any other persisted value is corruption and is reported as a
+// ValidationError, never silently folded into another outcome.
 type RotationState string
 
 const (
+	// RotationAwaitingProof is an intent whose rotate response was persisted
+	// but whose proof has not been confirmed yet; it is replayable until
+	// ExpiresAtUnix.
 	RotationAwaitingProof RotationState = "awaiting_proof"
-	RotationConfirmed     RotationState = "confirmed"
-	RotationAborted       RotationState = "aborted"
+	// RotationConfirmed is an intent whose proof was confirmed (the new key is
+	// active and the old key is revoked). An old-key retry must never be
+	// re-authorized from this pure state machine; the caller must run
+	// authentication and key/revocation state checks first.
+	RotationConfirmed RotationState = "confirmed"
+	// RotationAborted is an intent that was aborted before confirmation; a
+	// retry maps to the rotation_expired cause and is never nonce_reuse.
+	RotationAborted RotationState = "aborted"
+	// RotationAdminRevoked is an intent whose new key was revoked by an
+	// administrator; a retry maps to the revoked/rotation_expired cause.
+	RotationAdminRevoked RotationState = "admin_revoked"
 )
 
 // RotateIntent is the persisted rotation record that a rotate retry replays.
@@ -280,14 +294,19 @@ type RotateIntent struct {
 }
 
 // RotateVerdict is the rotate-retry decision. Transport carries the always-run
-// Evaluate result; IntentMatched reports that the persisted intent matched the
-// request identity and is in a replayable state; ReplayAllowed is the single
-// gate for replaying the persisted rotate-response and committing Transport;
-// NonceReuse and Expired expose the frozen 409 nonce_reuse / rotation_expired
-// causes.
+// Evaluate result. IntentMatched reports that the persisted intent matched the
+// request identity; Confirmed, Aborted and AdminRevoked report the matched
+// intent's non-replayable state-class for the caller's mapping; Expired and
+// NonceReuse expose the frozen 409 rotation_expired / nonce_reuse causes.
+// ReplayAllowed is the single gate for replaying the persisted rotate response
+// and committing Transport: it is true only for a matched, unexpired
+// awaiting_proof intent.
 type RotateVerdict struct {
 	Transport     Result
 	IntentMatched bool
+	Confirmed     bool
+	Aborted       bool
+	AdminRevoked  bool
 	ReplayAllowed bool
 	Expired       bool
 	NonceReuse    bool
@@ -297,26 +316,43 @@ type RotateVerdict struct {
 // response, applying the rev-5 rule that a rotation-intent replay never bypasses
 // transport validation.
 //
+// This is a pure ordering/decision helper for use AFTER the caller has
+// authenticated the request. It is NOT a complete identity or authentication
+// API: request signatures, the node's key history, old-key state and
+// revocation state are all caller-owned and are not verified here. A caller
+// must never use a successful verdict to skip any signature, key-state or
+// revocation check.
+//
 // The transport decision is computed first and is never skipped: a stale
 // generation, a same-generation boot id mismatch, a gap above wire.MaxBootGap or
 // a sequence conflict denies the replay regardless of how well the intent
 // matches. Only when the transport outcome is Accepted or Duplicate is the
 // persisted rotation intent consulted:
 //
-//   - the intent must match all of (node_id, nonce, old_key_id, body_sha256)
-//     and its state must be awaiting_proof or confirmed; any mismatch is
-//     NonceReuse (a nonce is bound to exactly one rotation intent) and denies
-//     the replay;
+//   - the intent identity (node_id, nonce, old_key_id, body_sha256) must match
+//     the request exactly; any mismatch is NonceReuse (a nonce is bound to
+//     exactly one rotation intent), IntentMatched is false and the replay is
+//     denied;
 //   - a matched awaiting_proof intent whose ExpiresAtUnix is strictly before
 //     nowUnix is Expired and denies the replay (the rotation_expired path); the
-//     expiry timestamp is a second-level bound, so equality is not expired;
-//   - a confirmed intent replays even after its expiry timestamp, and a matched
-//     awaiting_proof intent that has not expired allows the replay.
+//     expiry timestamp is a second-level bound, so equality is not expired,
+//     and a matched, unexpired awaiting_proof intent is the only state that
+//     allows the replay;
+//   - a matched aborted intent denies the replay with Aborted and Expired set
+//     (the caller maps it to rotation_expired); it is never NonceReuse;
+//   - a matched confirmed intent denies the replay with Confirmed set, before
+//     and after its expiry timestamp: the old key is revoked and this pure
+//     state machine did not verify key/revocation state, so it must not
+//     re-authorize an old-key request;
+//   - a matched admin_revoked intent denies the replay with AdminRevoked set;
+//     the caller maps it to the revoked/rotation_expired cause;
+//   - any other persisted state is corrupt: a typed ValidationError with field
+//     "rotation_state" is returned instead of silently classifying it.
 //
-// The transport high-water is represented only by Transport; the caller commits
-// it, the replayed response and the nonce/dedupe state in one transaction, and
-// only when ReplayAllowed is true. When ReplayAllowed is false nothing may be
-// committed, even if Transport.HighWaterCommitted is set.
+// The transport high-water is represented only by Transport. The caller commits
+// it, the replayed rotate response and the nonce/dedupe state in one
+// transaction, and only when ReplayAllowed is true. When ReplayAllowed is false
+// nothing may be committed, even if Transport.HighWaterCommitted is set.
 func EvaluateRotateRetry(cur Boot, a Attempt, intent RotateIntent, nodeID, nonce, oldKeyID, bodySHA256 string, nowUnix int64, opts Options) (RotateVerdict, error) {
 	transport, err := Evaluate(cur, a, opts)
 	if err != nil {
@@ -330,16 +366,31 @@ func EvaluateRotateRetry(cur Boot, a Attempt, intent RotateIntent, nodeID, nonce
 	if intent.NodeID != nodeID ||
 		intent.Nonce != nonce ||
 		intent.OldKeyID != oldKeyID ||
-		intent.BodySHA256 != bodySHA256 ||
-		(intent.State != RotationAwaitingProof && intent.State != RotationConfirmed) {
+		intent.BodySHA256 != bodySHA256 {
 		verdict.NonceReuse = true
 		return verdict, nil
 	}
 	verdict.IntentMatched = true
-	if intent.State == RotationAwaitingProof && intent.ExpiresAtUnix < nowUnix {
+
+	switch intent.State {
+	case RotationAwaitingProof:
+		if intent.ExpiresAtUnix < nowUnix {
+			verdict.Expired = true
+			return verdict, nil
+		}
+		verdict.ReplayAllowed = true
+	case RotationConfirmed:
+		verdict.Confirmed = true
+	case RotationAborted:
+		verdict.Aborted = true
 		verdict.Expired = true
-		return verdict, nil
+	case RotationAdminRevoked:
+		verdict.AdminRevoked = true
+	default:
+		return RotateVerdict{}, &ValidationError{
+			Field:  "rotation_state",
+			Detail: "must be one of awaiting_proof, confirmed, aborted or admin_revoked",
+		}
 	}
-	verdict.ReplayAllowed = true
 	return verdict, nil
 }

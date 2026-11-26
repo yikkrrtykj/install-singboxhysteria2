@@ -9,12 +9,11 @@
 
 ### Toolchain
 
-- Minimum/locked language version: `go 1.27.0` in `um/go.mod`.
-- CI pins Go `1.27.x` with `actions/setup-go@v5` and uses
+- Minimum/locked language version: `go 1.27.4` in `um/go.mod`.
+- CI pins the exact toolchain patch `1.27.4` with `actions/setup-go@v5` and uses
   `GOTOOLCHAIN=local` so the CI cannot silently download another toolchain.
-- Local development may use a newer Go (the repository workspace currently has
-  Go 1.27.x) but must keep the module go directive and CI-pinned version
-  compatible. Any bump is a separate reviewed change.
+- Local development may use the same `go 1.27.4` toolchain. Any patch/minor bump is
+  a separate reviewed change; go.mod, CI and this ADR must move together.
 - `-trimpath` is required for builds; CI records the Go version in the job log.
 
 ### Dependencies (pinned, checksum-locked)
@@ -27,8 +26,19 @@
 
 Transitive modules are pinned by `um/go.sum`; `go mod verify` and
 `go list -m all` are part of CI. No unpinned/latest installs are allowed except
-the explicitly pinned `govulncheck@v1.1.4` tool. Any new direct dependency needs
+the explicitly pinned `govulncheck@v1.10.0` tool. Any new direct dependency needs
 a new ADR, license review, `go.sum` update and independent review.
+
+### Vulnerability audit policy
+
+CI runs pinned `govulncheck@v1.10.0` (older v1.1.4 panicked under the Go 1.27 SSA
+builder). The report MUST distinguish **called** vulnerabilities (blocking) from
+module/package-only advisories not reachable from this code (recorded, not
+silently treated as clean). At review time the result is 0 called
+vulnerabilities and 3 module/package advisories not reachable from UM-B1 code.
+The initial red logs (Go 1.23.12/1.24.13/1.25.14 stdlib advisories, then the tool
+panic) are retained as evidence; the fix was a toolchain/tool pin, never a
+skipped check.
 
 ### GOPROXY policy
 
@@ -54,8 +64,9 @@ owner in a separate change.
 - Tests read the frozen contract files from the repository path
   `docs/um/contracts/v1/**`; schemas and vectors are **not copied** into `um/`
   (a copy would drift and is forbidden by the UM-G/UM-B reuse rules).
-- CI must trigger when `docs/um/contracts/v1/**` changes; otherwise a contract
-  update could break protocol tests without any Go CI signal.
+- CI must trigger when `docs/um/contracts/v1/**` or the normative REC fixture
+  `docs/um/um-127/conformance/**` changes; otherwise a contract/REC update could
+  break protocol tests without any Go CI signal.
 - The rev-5 vectors are the single source of truth; rev-4 history is read only
   through the explicit `historical_rev4_*`/`superseded_rev4_expectations`
   entries.
@@ -78,3 +89,25 @@ owner in a separate change.
   or production path in UM-B1.
 - Any dependency or toolchain change after merge needs this ADR to be revised
   and reviewed.
+
+
+## SQLite / schema decisions (P1-01)
+
+- Migrations are append-only. Version 1 is the original B1 schema; version 2
+  rebuilds `node_boot`, `seq_dedupe` and `boot_registry` as STRICT tables with
+  explicit `typeof(...)='integer'` and range CHECKs, preserves legacy v1 rows,
+  and fails closed if a legacy row violates the frozen bounds. A database whose
+  `schema_migrations` version is newer than this build is rejected before any
+  migration runs.
+- SQLite's legal lossless TEXT→INTEGER conversion is accepted, but the stored
+  `typeof` value is asserted to be `integer`. Fractional REAL, non-numeric TEXT,
+  negative, BLOB and out-of-range values are rejected by raw-SQL negative tests.
+  `MAX_NUMERIC` remains 2^63−2.
+
+## Contract-clarification proposals
+
+`um/docs/um-b1-conformance-map.md` records the conservative mapping semantics
+(no backdating/duplicate effective time, future versions allowed, empty/subset
+version = unmapped, direct/unknown never mapped) and the ledger/retention
+ownership statements. These are implementation clarifications for review; the
+frozen rev-5 contract files are not edited.
