@@ -1231,22 +1231,26 @@ func TestB2PurgeBatchProgressSurvivesRestart(t *testing.T) {
 }
 
 func TestB2OverlapBudgetFormula(t *testing.T) {
-	// Explicit byte budget: plan 1000 => limit 2000.
-	if b := ComputeOverlapBudget(1000, 0, 2000); b.Exceeds() || b.BudgetBytes != 2000 || b.Unit != "bytes" {
-		t.Fatalf("equal boundary = %+v, want below/equal allowed", b)
+	// Explicit byte budget: plan 1000 => total active+archived limit 2000.
+	// Last active event: candidate 2000 moves from active to archived; total 2000.
+	if b := ComputeOverlapBudget(1000, 2000, 0, 2000); b.Exceeds() || b.BudgetBytes != 2000 ||
+		b.Unit != "bytes" || b.ProjectedTotalBytes != 2000 {
+		t.Fatalf("equal total boundary = %+v, want allowed", b)
 	}
-	if b := ComputeOverlapBudget(1000, 0, 2001); !b.Exceeds() {
-		t.Fatalf("above boundary = %+v, want exceeded", b)
+	if b := ComputeOverlapBudget(1000, 2000, 0, 2001); !b.Exceeds() {
+		t.Fatalf("above total boundary = %+v, want exceeded", b)
 	}
-	if b := ComputeOverlapBudget(1000, 500, 1500); b.Exceeds() {
-		t.Fatalf("archived+candidate equal limit = %+v", b)
+	// Candidate is moved, not double-counted: active 1000, archived 500,
+	// candidate 100 => active-after 900 + archived-after 600 = 1500.
+	if b := ComputeOverlapBudget(1000, 1000, 500, 100); b.ProjectedTotalBytes != 1500 ||
+		b.ProjectedActiveBytes != 900 || b.ProjectedArchivedBytes != 600 || b.Exceeds() {
+		t.Fatalf("candidate attribution = %+v", b)
 	}
-	if b := ComputeOverlapBudget(1000, 500, 1501); !b.Exceeds() {
-		t.Fatalf("archived+candidate above limit = %+v", b)
+	if b := ComputeOverlapBudget(1000, 1200, 800, 200); b.ProjectedTotalBytes != 2000 || b.Exceeds() {
+		t.Fatalf("equal mixed total = %+v", b)
 	}
-	// Last active event: archived=0, candidate can use the whole 2x plan cap.
-	if b := ComputeOverlapBudget(1000, 0, 2000); b.Exceeds() || b.ArchivedStoredBytes != 0 || b.CandidateBytes != 2000 {
-		t.Fatalf("last active event formula = %+v", b)
+	if b := ComputeOverlapBudget(1000, 1200, 801, 200); !b.Exceeds() {
+		t.Fatalf("above mixed total = %+v, want exceeded", b)
 	}
 }
 
@@ -1427,5 +1431,126 @@ func TestB2PurgeSingleIncompleteOperation(t *testing.T) {
 	}
 	if got := queryInt(t, s, `SELECT COUNT(*) FROM purge_ops WHERE event_id=?`, ev); got != 1 {
 		t.Fatalf("total purge operations=%d, want 1", got)
+	}
+}
+
+func TestB2PurgeProgressAndSingleExecutor(t *testing.T) {
+	s := openTestStore(t, tempStorePath(t))
+	ctx := testContext()
+	now := int64(1_700_000_000)
+	ev := "00000000-0000-4000-8000-0000000000d3"
+	id := testEnrollEvent(t, s, ev, NodeClassLinuxVPS, now)
+	if _, err := s.db.ExecContext(ctx,
+		`WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n < 50005)
+		 INSERT INTO report_events(node_id,event_id,report_id,collected_at,received_at,event_id_json,event_at,kind,severity,details_json)
+		 SELECT ?,?,printf('r-%06d',n),?,?,printf('e-%06d',n),?,'agent_started','info','{}' FROM seq`,
+		id.NodeID, ev, now, now, now); err != nil {
+		t.Fatalf("seed 50k: %v", err)
+	}
+	// Stale-executor state updates must not overwrite committed progress or
+	// regress the persisted phase.
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO purge_ops(op_id,event_id,actor,started_at,updated_at,state,phase,deleted_rows,error)
+		 VALUES('op-progress',?,?,?,?,?,?,?,NULL)`, ev, "admin", now, now, "mapping", "mapping", int64(10)); err != nil {
+		t.Fatalf("seed op: %v", err)
+	}
+	op, ok, err := s.loadPurgeOp(ctx, ev)
+	if err != nil || !ok {
+		t.Fatalf("load op: %v ok=%v", err, ok)
+	}
+	op.DeletedRows = 0
+	op.State = "purging"
+	op.Phase = "telemetry"
+	if err := s.updatePurgeOp(ctx, op); err != nil {
+		t.Fatalf("stale update: %v", err)
+	}
+	var progress int64
+	var state string
+	if err := s.db.QueryRowContext(ctx, `SELECT deleted_rows,state FROM purge_ops WHERE op_id='op-progress'`).Scan(&progress, &state); err != nil {
+		t.Fatalf("read op: %v", err)
+	}
+	if progress != 10 || state != "mapping" {
+		t.Fatalf("stale executor changed progress/state: progress=%d state=%s", progress, state)
+	}
+	// Remove the synthetic op so the real purge starts from a clean operation.
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM purge_ops WHERE op_id='op-progress'`); err != nil {
+		t.Fatalf("clean op: %v", err)
+	}
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); errs <- s.PurgeEvent(ctx, ev, "admin", true, now+1) }()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent purge: %v", err)
+		}
+	}
+	if got := queryInt(t, s, `SELECT deleted_rows FROM purge_ops WHERE event_id=? AND state='completed'`, ev); got != 50005 {
+		t.Fatalf("completed deleted_rows=%d, want 50005", got)
+	}
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM purge_ops WHERE event_id=? AND state<>'completed'`, ev); got != 0 {
+		t.Fatalf("incomplete purge ops=%d, want 0", got)
+	}
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM purge_ops WHERE event_id=?`, ev); got != 1 {
+		t.Fatalf("purge ops=%d, want 1", got)
+	}
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM event_graveyard WHERE event_id=?`, ev); got != 1 {
+		t.Fatalf("graveyard=%d, want 1", got)
+	}
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM purge_tombstones WHERE event_id=?`, ev); got != 1 {
+		t.Fatalf("tombstone=%d, want 1", got)
+	}
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM security_ledger WHERE kind='event_purged' AND subject=?`, ev); got != 1 {
+		t.Fatalf("event_purged audit=%d, want 1", got)
+	}
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM report_events WHERE event_id=?`, ev); got != 0 {
+		t.Fatalf("remaining event rows=%d", got)
+	}
+	// Repeated call is idempotent and does not duplicate final artifacts.
+	if err := s.PurgeEvent(ctx, ev, "admin", true, now+2); err != nil {
+		t.Fatalf("repeat purge: %v", err)
+	}
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM security_ledger WHERE kind='event_purged' AND subject=?`, ev); got != 1 {
+		t.Fatalf("repeat audit=%d", got)
+	}
+}
+
+func TestB2OverlapBudgetCountsPostArchiveActiveData(t *testing.T) {
+	s := openTestStore(t, tempStorePath(t))
+	ctx := testContext()
+	now := int64(1_700_000_000)
+	seedEvent := func(ev string, payloadLen int) {
+		t.Helper()
+		id := testEnrollEvent(t, s, ev, NodeClassLinuxVPS, now)
+		if err := s.WithTx(ctx, func(tx *Tx) error {
+			_, err := tx.StoreSnapshotTx(ctx, SnapshotRecord{NodeID: id.NodeID, EventID: ev, NodeClass: id.NodeClass,
+				ReportID: "r-" + ev, CollectedAt: now - 10, ReceivedAt: now,
+				BodySHA256: "hash-" + ev, Payload: []byte(strings.Repeat("x", payloadLen))})
+			return err
+		}); err != nil {
+			t.Fatalf("seed %s: %v", ev, err)
+		}
+	}
+	s.SetOverlapBudgetForTest(100) // total limit 200 bytes
+	a := "00000000-0000-4000-8000-0000000000ea"
+	seedEvent(a, 100)
+	if err := s.ArchiveEvent(ctx, a, now); err != nil {
+		t.Fatalf("archive A: %v", err)
+	}
+	b := "00000000-0000-4000-8000-0000000000eb"
+	seedEvent(b, 100)
+	if err := s.ArchiveEvent(ctx, b, now); err != nil {
+		t.Fatalf("archive B at equal total: %v", err)
+	}
+	// New active data after the archives is included in the total and makes the
+	// next archive exceed the 200-byte planning budget.
+	c := "00000000-0000-4000-8000-0000000000ec"
+	seedEvent(c, 300)
+	if err := s.ArchiveEvent(ctx, c, now); !errors.Is(err, ErrQuotaExceeded) {
+		t.Fatalf("post-archive active overflow = %v, want ErrQuotaExceeded", err)
 	}
 }

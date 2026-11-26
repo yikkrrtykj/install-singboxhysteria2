@@ -179,12 +179,20 @@ the store commit; generated node/key/salt fields have contract-valid forms.
 
 - active-only planning basis: `ActiveOnlyPlanningPayloadBytes` = 5 GiB of
   telemetry **payload** (a planning unit, not a SQLite file/disk hard limit);
-- budget: 2× that basis (10 GiB projected archived payload);
-- inputs distinguished: actual archived stored payload, candidate event payload,
-  projected archived history, budget;
-- archive is refused when projected archived payload exceeds the budget; an
-  equal projection is allowed, and the last active event can archive within the
-  explicit cap.
+- total planning budget: 2× that basis (10 GiB) applies to **active + archived
+  projected history**, not only archived payload;
+- candidate is currently part of active storage: it is moved from active to
+  archived, never added on top of active+archived (no double count);
+- inputs distinguished: active stored payload, archived stored payload,
+  candidate payload, projected active-after-archive, projected archived, projected
+  total, budget;
+- archive is refused when the projected active+archived total exceeds the budget;
+  equality is allowed; the last active event can archive within the explicit cap;
+- new active data collected after an archive is included in the next archive
+  decision, so the gate does not become meaningless; capacity insufficiency
+  refuses the new archive (existing data/ingest is not silently deleted) and the
+  operator must purge/retain under B4/UM-E. This is a planning payload budget, not
+  a SQLite disk hard limit.
 
 This does not replace UM-E real disk-pressure, VACUUM/free-space, or 200/500-node
 performance acceptance.

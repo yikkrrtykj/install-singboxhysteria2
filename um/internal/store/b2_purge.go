@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 )
 
 // PurgeOp is the durable progress record for one event purge.
@@ -37,6 +38,36 @@ func randomOpID() (string, error) {
 		return "", fmt.Errorf("store: purge op id: %w", err)
 	}
 	return "purge-" + hex.EncodeToString(b), nil
+}
+
+func (s *Store) lockPurgeEvent(eventID string) func() {
+	s.purgeMu.Lock()
+	if s.purgeLocks == nil {
+		s.purgeLocks = make(map[string]*sync.Mutex)
+	}
+	mu := s.purgeLocks[eventID]
+	if mu == nil {
+		mu = &sync.Mutex{}
+		s.purgeLocks[eventID] = mu
+	}
+	s.purgeMu.Unlock()
+	mu.Lock()
+	return mu.Unlock
+}
+
+func purgeStateRank(state string) int {
+	switch state {
+	case "purging":
+		return 1
+	case "mapping":
+		return 2
+	case "finalizing":
+		return 3
+	case "completed":
+		return 4
+	default:
+		return 0
+	}
 }
 
 // eventBlockedTx reports the permanent/durable reasons an event ID may not be
@@ -107,10 +138,23 @@ func loadPurgeOpTx(ctx context.Context, tx *sql.Tx, eventID string) (PurgeOp, bo
 }
 
 func (s *Store) updatePurgeOp(ctx context.Context, op PurgeOp) error {
-	_, err := s.db.ExecContext(ctx,
-		`UPDATE purge_ops SET updated_at=?,state=?,phase=?,deleted_rows=?,error=? WHERE op_id=?`,
-		op.UpdatedAt, op.State, op.Phase, op.DeletedRows, nullString(op.Error), op.OpID)
-	if err != nil {
+	var curState, curPhase string
+	if err := s.db.QueryRowContext(ctx, `SELECT state,phase FROM purge_ops WHERE op_id=?`, op.OpID).Scan(&curState, &curPhase); err != nil {
+		return fmt.Errorf("store: read purge op state: %w", err)
+	}
+	// deleted_rows is intentionally never written here: it is only incremented
+	// atomically with the DELETE batch that produced it.
+	if purgeStateRank(op.State) > purgeStateRank(curState) {
+		if _, err := s.db.ExecContext(ctx,
+			`UPDATE purge_ops SET state=?,phase=?,updated_at=?,error=? WHERE op_id=?`,
+			op.State, op.Phase, op.UpdatedAt, nullString(op.Error), op.OpID); err != nil {
+			return fmt.Errorf("store: update purge op: %w", err)
+		}
+		return nil
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE purge_ops SET updated_at=?,error=? WHERE op_id=?`,
+		op.UpdatedAt, nullString(op.Error), op.OpID); err != nil {
 		return fmt.Errorf("store: update purge op: %w", err)
 	}
 	return nil
@@ -137,6 +181,8 @@ func (s *Store) PurgeEvent(ctx context.Context, eventID, actor string, confirm b
 	if strings.TrimSpace(eventID) == "" {
 		return invalidArgument("event_id", "must not be empty")
 	}
+	unlock := s.lockPurgeEvent(eventID)
+	defer unlock()
 	// Already fully purged: idempotent success only if the permanent graveyard
 	// exists; otherwise a completed op without graveyard is inconsistent.
 	var one int
@@ -154,7 +200,10 @@ func (s *Store) PurgeEvent(ctx context.Context, eventID, actor string, confirm b
 	if err != nil {
 		return err
 	}
-	if !ok || op.State == "completed" {
+	if ok && op.State == "completed" {
+		return fmt.Errorf("store: purge op %s is completed but no graveyard exists", op.OpID)
+	}
+	if !ok {
 		// Persist the authorized operation BEFORE any destructive step.
 		opID, err := randomOpID()
 		if err != nil {
@@ -384,7 +433,11 @@ func (s *Store) PurgeEvent(ctx context.Context, eventID, actor string, confirm b
 			eventID, now, op.OpID); err != nil {
 			return fmt.Errorf("store: write event graveyard: %w", err)
 		}
-		counts := fmt.Sprintf(`{"deleted_rows":%d,"phase":"completed"}`, op.DeletedRows)
+		var actualDeleted int64
+		if err := tx.QueryRowContext(ctx, `SELECT deleted_rows FROM purge_ops WHERE op_id=?`, op.OpID).Scan(&actualDeleted); err != nil {
+			return fmt.Errorf("store: read actual purge progress: %w", err)
+		}
+		counts := fmt.Sprintf(`{"deleted_rows":%d,"phase":"completed"}`, actualDeleted)
 		if _, err := tx.ExecContext(ctx,
 			`INSERT OR REPLACE INTO purge_tombstones(event_id,actor,purged_at,counts_json,retain_until)
 			 VALUES(?,?,?,?,?)`, eventID, actor, now, counts, now+PurgeTombstoneSeconds); err != nil {

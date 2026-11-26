@@ -27,6 +27,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite" // registers the pure-Go "sqlite" database/sql driver
@@ -58,6 +59,9 @@ type Store struct {
 	ingestHook func(string) error
 	// overlapBudgetOverride is a test-only active-only planning basis override.
 	overlapBudgetOverride int64
+	// purgeMu guards purgeLocks; purgeLocks serializes PurgeEvent per event.
+	purgeMu    sync.Mutex
+	purgeLocks map[string]*sync.Mutex
 }
 
 // Path returns the filesystem path of the database.

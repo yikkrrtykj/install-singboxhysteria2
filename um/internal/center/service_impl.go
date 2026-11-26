@@ -825,7 +825,7 @@ func validateReportSources(nodeClass, reportType string, body []byte, sources ma
 		}
 		if nodeClass == store.NodeClassWindowsTerminal {
 			var term struct {
-				Terminal struct {
+				Terminal *struct {
 					Selection struct {
 						Availability string `json:"availability"`
 					} `json:"selection"`
@@ -835,6 +835,17 @@ func validateReportSources(nodeClass, reportType string, body []byte, sources ma
 				} `json:"terminal"`
 			}
 			if err := json.Unmarshal(body, &term); err != nil {
+				return apiErr(400, "invalid_request", false)
+			}
+			if term.Terminal == nil {
+				// No terminal observation object: legal (the frozen snapshot
+				// schema allows honest absence). This is the default Windows
+				// config case with all terminal sources disabled.
+				return nil
+			}
+			if !sources["terminal"] && !sources["mihomo_api"] {
+				// Any real terminal/controller observation requires at least one
+				// corresponding source authorization.
 				return apiErr(400, "invalid_request", false)
 			}
 			// selection and active_connections are independently authorized:

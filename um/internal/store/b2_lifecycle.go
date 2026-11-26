@@ -228,24 +228,38 @@ func ensureEventActiveTx(ctx context.Context, tx *sql.Tx, eventID string, now in
 type OverlapBudget struct {
 	Unit                   string
 	ActiveOnlyPlanBytes    int64
-	BudgetBytes            int64
+	BudgetBytes            int64 // 2x active-only plan, applied to active+archived total
+	ActiveStoredBytes      int64
 	ArchivedStoredBytes    int64
 	CandidateBytes         int64
+	ProjectedActiveBytes   int64
 	ProjectedArchivedBytes int64
+	ProjectedTotalBytes    int64
 }
 
-func ComputeOverlapBudget(activeOnlyPlanBytes, archivedStoredBytes, candidateBytes int64) OverlapBudget {
+// ComputeOverlapBudget applies the 2x active-only planning budget to the
+// combined active+archived projected history. The candidate is currently part of
+// active storage, so it is moved from active to archived, never counted twice.
+func ComputeOverlapBudget(activeOnlyPlanBytes, activeStoredBytes, archivedStoredBytes, candidateBytes int64) OverlapBudget {
+	projectedActive := activeStoredBytes - candidateBytes
+	if projectedActive < 0 {
+		projectedActive = 0
+	}
+	projectedArchived := archivedStoredBytes + candidateBytes
 	return OverlapBudget{
 		Unit:                   "bytes",
 		ActiveOnlyPlanBytes:    activeOnlyPlanBytes,
 		BudgetBytes:            OverlapBudgetMultiplier * activeOnlyPlanBytes,
+		ActiveStoredBytes:      activeStoredBytes,
 		ArchivedStoredBytes:    archivedStoredBytes,
 		CandidateBytes:         candidateBytes,
-		ProjectedArchivedBytes: archivedStoredBytes + candidateBytes,
+		ProjectedActiveBytes:   projectedActive,
+		ProjectedArchivedBytes: projectedArchived,
+		ProjectedTotalBytes:    projectedActive + projectedArchived,
 	}
 }
 
-func (b OverlapBudget) Exceeds() bool { return b.ProjectedArchivedBytes > b.BudgetBytes }
+func (b OverlapBudget) Exceeds() bool { return b.ProjectedTotalBytes > b.BudgetBytes }
 
 func (s *Store) overlapBudgetBasisBytes() int64 {
 	if s.overlapBudgetOverride > 0 {
@@ -354,11 +368,11 @@ func (s *Store) ArchiveEvent(ctx context.Context, eventID string, now int64) err
 	if err != nil {
 		return err
 	}
-	_, archivedBytes, err := activeArchivedPayloadBytesTx(ctx, tx)
+	activeBytes, archivedBytes, err := activeArchivedPayloadBytesTx(ctx, tx)
 	if err != nil {
 		return err
 	}
-	budget := ComputeOverlapBudget(s.overlapBudgetBasisBytes(), archivedBytes, eventBytes)
+	budget := ComputeOverlapBudget(s.overlapBudgetBasisBytes(), activeBytes, archivedBytes, eventBytes)
 	if budget.Exceeds() {
 		return &QuotaError{Kind: "retention_overlap", Limit: budget.BudgetBytes, Current: budget.ProjectedArchivedBytes}
 	}

@@ -195,7 +195,7 @@ ingress, UM-E full disk-pressure/200-500 node performance/backup/restore.
 | --- | --- | --- |
 | C1 mapping gate/durable purge | `createMappingVersion` now runs `EventActiveTx` inside its transaction; the false-positive purge test was replaced with public `CreateMappingVersion` future `effective_from`, asserting active success and purging/purged lifecycle rejection; one incomplete `purge_ops` per event via partial unique index under capacity lock; DELETE batch + `deleted_rows` committed atomically; resume preserves progress; final completion guarded against duplicate tombstone/audit | `TestB2PurgeBlocksIngestAndEnrollmentConcurrently`, `TestB2PurgeSingleIncompleteOperation`, `TestB2PurgeBatchProgressSurvivesRestart`, ordinary UPDATE/DELETE mapping tests |
 | C2 enrollment response legality | production token creation enforces canonical UUIDv4 event id; Enroll defensively checks pre-existing token event id before consumption; invalid token test proves no consumption/partial node/key/config; SPKI static form checked before store commit | `TestB2EnrollmentEventIDUUIDv4`, red C2 log |
-| C3 overlap budget | explicit `OverlapBudget`/`ComputeOverlapBudget` in bytes: 5 GiB active-only planning basis, 10 GiB 2× projected-archived budget; separates archived actual/candidate/projected/budget; below/equal/above and last-active tests | `TestB2OverlapBudgetFormula`, `TestB2OverlapBudgetArchiveBoundary`, red C3 compile log |
+| C3 overlap budget | explicit `OverlapBudget`/`ComputeOverlapBudget` in bytes: 5 GiB active-only planning basis, 10 GiB 2× **active+archived total** budget; candidate moved from active to archived without double count; below/equal/above, last-active and post-archive-active tests | `TestB2OverlapBudgetFormula`, `TestB2OverlapBudgetArchiveBoundary`, red C3 compile log |
 | C4 config authorization closure | effective-dated history fail-closed when no valid row; v8 migration re-anchors v7 backfill to fail-closed initial config at registration; UpdateNodeConfig rejects effective time before registration/latest history, same-second deterministic version rule; Windows selection vs active_connections independent terminal/mihomo checks; service vs singbox event kinds independent; Report uses historical config for validation and current in-transaction config version for ACK; nonce audits consistent across Report/Config/Rotate; no epoch backfill HTTP fixtures | `TestB2ConfigHistoryBoundsAndFailClosed`, `TestC4WindowsTerminalAndControllerSourcesIndependent`, `TestC4HistoricalConfigAndCurrentACKVersion`, `TestC4LinuxServicesAndSingboxApprovalIndependent` |
 
 Round-9 red evidence: `um127-round9-evidence/b2-round9-red-store.log`,
@@ -206,3 +206,12 @@ absent). Green: `full-v-green.log`.
 Still deferred: B4 management UI/type-to-confirm purge, B3 REC-17/18/27 and
 agent-local behavior, UM-C ingress, UM-E disk-pressure/200–500-node performance
 and backup/restore.
+
+
+## Final hotfix H1–H3
+
+| Finding | Fix/evidence |
+| --- | --- |
+| H1 Windows default snapshot | terminal source validation now checks object existence: absent terminal object is legal (default false/false); present object with both sources false is rejected; selection/active_connections remain independently authorized. Real HTTP matrix test uses a true default enrollment (no auto-enable helper): false/false no terminal accepted, false/false with terminal rejected, true/false selection ok + controller honest unavailable, false/true inverse, true/true legal |
+| H2 purge executor/progress | per-event in-process purge lock serializes execution; `updatePurgeOp` never writes `deleted_rows` and only advances state/phase forward (otherwise error/update only); final audit reads persisted deleted_rows inside final tx; completed op without graveyard is refused rather than recreated; 50,005-row two-concurrent-call test asserts exact progress, one completed op/graveyard/tombstone/event_purged audit, no incomplete ops and idempotent repeat |
+| H3 overlap total | 5 GiB active-only planning basis, 2× = 10 GiB applied to projected **active+archived total**; candidate moved from active to archived (no double count); post-archive active data included in later decisions; below/equal/above, last-active and post-archive tests; planning budget not disk limit |

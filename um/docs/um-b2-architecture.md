@@ -180,7 +180,9 @@ and backup/restore acceptance.
   at consumption; malformed pre-existing tokens cannot consume or create partial
   identity.
 - Overlap budget is explicit in bytes with a 5 GiB active-only planning basis and
-  2× projected-archived cap; this is not a disk-capacity promise.
+  a 2× **active+archived total** planning cap; the candidate is moved, not double
+  counted, and post-archive active data is included in later decisions. This is
+  not a disk-capacity promise.
 - Configuration history is the sole authorization source for reports, fail-closed
   without a valid effective row; v8 re-anchors v7 backfill to registration-time
   fail-closed config; effective bounds/same-second rules are enforced; ACK
