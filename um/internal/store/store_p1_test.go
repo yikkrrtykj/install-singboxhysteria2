@@ -309,9 +309,15 @@ func TestNoExportedHighWaterRewriteAPI(t *testing.T) {
 			t.Fatalf("Store exposes forbidden raw high-water/DB API %q", forbidden)
 		}
 	}
-	for _, required := range []string{"WithTx", "CheckOrInsertNonce", "CheckOrInsertReport", "RecordSeq", "ApplyTransport"} {
+	for _, required := range []string{"WithTx", "ApplyTransport", "GetBoot", "GetNode"} {
 		if _, ok := typ.MethodByName(required); !ok {
-			t.Fatalf("Store missing required B2-safe API %q", required)
+			t.Fatalf("Store missing required transactional API %q", required)
+		}
+	}
+	txType := reflect.TypeOf(&Tx{})
+	for _, required := range []string{"CheckOrInsertNonce", "CheckOrInsertReport", "RecordSeq", "LoadBoot"} {
+		if _, ok := txType.MethodByName(required); !ok {
+			t.Fatalf("Tx missing required in-transaction security API %q", required)
 		}
 	}
 }
@@ -320,13 +326,13 @@ func TestRecordSeqNeverOverwritesFingerprint(t *testing.T) {
 	s := openTestStore(t, tempStorePath(t))
 	ctx := testContext()
 	mustCreateNode(t, s, "node-a", "event-a", NodeClassLinuxVPS)
-	if err := s.RecordSeq(ctx, "node-a", 1, testBootA, 1, "fp-1", 100); err != nil {
+	if err := recordSeq(ctx, s.db, "node-a", 1, testBootA, 1, "fp-1", 100); err != nil {
 		t.Fatalf("first RecordSeq: %v", err)
 	}
-	if err := s.RecordSeq(ctx, "node-a", 1, testBootA, 1, "fp-1", 200); err != nil {
+	if err := recordSeq(ctx, s.db, "node-a", 1, testBootA, 1, "fp-1", 200); err != nil {
 		t.Fatalf("idempotent RecordSeq: %v", err)
 	}
-	err := s.RecordSeq(ctx, "node-a", 1, testBootA, 1, "fp-other", 300)
+	err := recordSeq(ctx, s.db, "node-a", 1, testBootA, 1, "fp-other", 300)
 	if !errors.Is(err, ErrConflict) {
 		t.Fatalf("conflicting RecordSeq error = %v, want ErrConflict", err)
 	}

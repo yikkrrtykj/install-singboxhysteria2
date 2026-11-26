@@ -44,6 +44,10 @@ func openTestStore(t *testing.T, path string) *Store {
 
 func mustCreateNode(t *testing.T, s *Store, nodeID, eventID, class string) {
 	t.Helper()
+	if _, err := s.db.Exec(`INSERT OR IGNORE INTO event_catalog(event_id,state,created_at,archived_at,purge_after,data_purged_at,updated_at)
+		VALUES(?,?,?,NULL,NULL,NULL,?)`, eventID, EventActive, int64(1000), int64(1000)); err != nil {
+		t.Fatalf("seed event catalog(%q): %v", eventID, err)
+	}
 	err := s.CreateNode(testContext(), Node{
 		NodeID:    nodeID,
 		EventID:   eventID,
@@ -537,7 +541,7 @@ func TestApplyTransportAcceptedDuplicateAndSequence(t *testing.T) {
 
 	// A delayed exact retry of an already superseded seq is a Duplicate only if
 	// the bounded history holds the matching fingerprint.
-	if err := s.RecordSeq(ctx, "node-a", 4, testBootB, 2, "fp-4-2", 500); err != nil {
+	if err := recordSeq(ctx, s.db, "node-a", 4, testBootB, 2, "fp-4-2", 500); err != nil {
 		t.Fatalf("RecordSeq: %v", err)
 	}
 	res, err = s.ApplyTransport(ctx, "node-a",
@@ -666,15 +670,15 @@ func TestDedupeNonceAndReport(t *testing.T) {
 	ctx := testContext()
 	mustCreateNode(t, s, "node-a", "event-a", NodeClassLinuxVPS)
 
-	status, err := s.CheckOrInsertNonce(ctx, "node-a", "nonce-1", "fp-nonce-1", 100)
+	status, err := checkOrInsertNonce(ctx, s.db, "node-a", "nonce-1", "fp-nonce-1", 100)
 	if err != nil || status != NonceNew {
 		t.Fatalf("first nonce = (%q, %v), want new", status, err)
 	}
-	status, err = s.CheckOrInsertNonce(ctx, "node-a", "nonce-1", "fp-nonce-1", 200)
+	status, err = checkOrInsertNonce(ctx, s.db, "node-a", "nonce-1", "fp-nonce-1", 200)
 	if err != nil || status != NonceExactRetry {
 		t.Fatalf("exact nonce retry = (%q, %v), want exact_retry", status, err)
 	}
-	status, err = s.CheckOrInsertNonce(ctx, "node-a", "nonce-1", "fp-nonce-1-other", 300)
+	status, err = checkOrInsertNonce(ctx, s.db, "node-a", "nonce-1", "fp-nonce-1-other", 300)
 	if err != nil || status != NonceReuse {
 		t.Fatalf("nonce reuse = (%q, %v), want nonce_reuse", status, err)
 	}
@@ -694,11 +698,11 @@ func TestDedupeNonceAndReport(t *testing.T) {
 	if _, ok, err := s.ReportSeen(ctx, "node-a", "report-1"); err != nil || ok {
 		t.Fatalf("ReportSeen before insert = (ok=%v, err=%v), want false", ok, err)
 	}
-	reportStatus, err := s.CheckOrInsertReport(ctx, "node-a", "report-1", "sha-report-1", 300)
+	reportStatus, err := checkOrInsertReport(ctx, s.db, "node-a", "report-1", "sha-report-1", 300)
 	if err != nil || reportStatus != ReportNew {
 		t.Fatalf("first report = (%q, %v), want new", reportStatus, err)
 	}
-	reportStatus, err = s.CheckOrInsertReport(ctx, "node-a", "report-1", "sha-report-1", 400)
+	reportStatus, err = checkOrInsertReport(ctx, s.db, "node-a", "report-1", "sha-report-1", 400)
 	if err != nil || reportStatus != ReportDuplicate {
 		t.Fatalf("duplicate report = (%q, %v), want duplicate", reportStatus, err)
 	}
@@ -710,7 +714,7 @@ func TestDedupeNonceAndReport(t *testing.T) {
 	// original hash and the last_received_at of the previous accepted retry are
 	// never overwritten by the conflicting request.
 	beforeLast := queryInt(t, s, `SELECT last_received_at FROM report_dedupe WHERE node_id = ? AND report_id = ?`, "node-a", "report-1")
-	reportStatus, err = s.CheckOrInsertReport(ctx, "node-a", "report-1", "sha-report-1-other", 500)
+	reportStatus, err = checkOrInsertReport(ctx, s.db, "node-a", "report-1", "sha-report-1-other", 500)
 	if err != nil || reportStatus != ReportConflict {
 		t.Fatalf("conflicting report = (%q, %v), want conflict", reportStatus, err)
 	}
@@ -735,10 +739,10 @@ func TestRestartPersistence(t *testing.T) {
 	}
 	mustCreateNode(t, s, "node-a", "event-a", NodeClassLinuxVPS)
 	mustPutBoot(t, s, "node-a", 3, testBootA, 7, "fp-3-7")
-	if _, err := s.CheckOrInsertNonce(ctx, "node-a", "nonce-1", "fp-nonce-1", 100); err != nil {
+	if _, err := checkOrInsertNonce(ctx, s.db, "node-a", "nonce-1", "fp-nonce-1", 100); err != nil {
 		t.Fatalf("CheckOrInsertNonce: %v", err)
 	}
-	if _, err := s.CheckOrInsertReport(ctx, "node-a", "report-1", "sha-report-1", 200); err != nil {
+	if _, err := checkOrInsertReport(ctx, s.db, "node-a", "report-1", "sha-report-1", 200); err != nil {
 		t.Fatalf("CheckOrInsertReport: %v", err)
 	}
 	if _, err := s.AppendLedger(ctx, 300, "node_enrolled", "node-a", "detail-1"); err != nil {
@@ -864,7 +868,7 @@ func TestRetentionSweep(t *testing.T) {
 		{"new-nonce", now - 1*60*60},
 	}
 	for _, tc := range nonces {
-		if _, err := s.CheckOrInsertNonce(ctx, "node-a", tc.nonce, "fp", tc.at); err != nil {
+		if _, err := checkOrInsertNonce(ctx, s.db, "node-a", tc.nonce, "fp", tc.at); err != nil {
 			t.Fatalf("CheckOrInsertNonce(%q): %v", tc.nonce, err)
 		}
 	}
@@ -877,7 +881,7 @@ func TestRetentionSweep(t *testing.T) {
 		{"new-report", now - 1*24*60*60},
 	}
 	for _, tc := range reports {
-		if _, err := s.CheckOrInsertReport(ctx, "node-a", tc.reportID, "sha", tc.at); err != nil {
+		if _, err := checkOrInsertReport(ctx, s.db, "node-a", tc.reportID, "sha", tc.at); err != nil {
 			t.Fatalf("CheckOrInsertReport(%q): %v", tc.reportID, err)
 		}
 	}
@@ -895,7 +899,7 @@ func TestRetentionSweep(t *testing.T) {
 		}
 	}
 	// seq_dedupe is intentionally outside the age sweep (bounded by read limit).
-	if err := s.RecordSeq(ctx, "node-a", 1, testBootA, 1, "fp-old-seq", now-100*24*60*60); err != nil {
+	if err := recordSeq(ctx, s.db, "node-a", 1, testBootA, 1, "fp-old-seq", now-100*24*60*60); err != nil {
 		t.Fatalf("RecordSeq: %v", err)
 	}
 

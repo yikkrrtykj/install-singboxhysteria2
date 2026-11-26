@@ -401,13 +401,6 @@ func checkOrInsertNonce(ctx context.Context, q execQuerier, nodeID, nonce, finge
 	return NonceReuse, nil
 }
 
-// CheckOrInsertNonce classifies a nonce outside an explicit transaction. It is
-// suitable for single-purpose callers; B2 must use Tx.CheckOrInsertNonce so the
-// nonce, report and high-water state commit atomically.
-func (s *Store) CheckOrInsertNonce(ctx context.Context, nodeID, nonce, fingerprint string, at int64) (NonceStatus, error) {
-	return checkOrInsertNonce(ctx, s.db, nodeID, nonce, fingerprint, at)
-}
-
 // NonceSeen reports whether a (node, nonce) pair is present.
 func (s *Store) NonceSeen(ctx context.Context, nodeID, nonce string) (bool, error) {
 	fingerprint, ok, err := s.NonceFingerprint(ctx, nodeID, nonce)
@@ -480,11 +473,6 @@ func checkOrInsertReport(ctx context.Context, q execQuerier, nodeID, reportID, b
 		return "", fmt.Errorf("store: refresh report dedupe: %w", err)
 	}
 	return ReportDuplicate, nil
-}
-
-// CheckOrInsertReport classifies a report_id outside an explicit transaction.
-func (s *Store) CheckOrInsertReport(ctx context.Context, nodeID, reportID, bodySHA256 string, at int64) (ReportStatus, error) {
-	return checkOrInsertReport(ctx, s.db, nodeID, reportID, bodySHA256, at)
 }
 
 // ReportSeen returns the stored body hash of a report_id, if present.
@@ -578,13 +566,6 @@ func recordSeq(ctx context.Context, q execQuerier, nodeID string, gen uint64, bo
 		return fmt.Errorf("%w: seq %d for node %q already has a different fingerprint", ErrConflict, seq, nodeID)
 	}
 	return nil
-}
-
-// RecordSeq records one exact-retry fingerprint outside an explicit
-// transaction. Normal ingestion uses ApplyTransport, which does this inside the
-// request transaction.
-func (s *Store) RecordSeq(ctx context.Context, nodeID string, gen uint64, bootID string, seq uint64, fingerprint string, at int64) error {
-	return recordSeq(ctx, s.db, nodeID, gen, bootID, seq, fingerprint, at)
 }
 
 // loadSeqFingerprints reads the bounded exact-retry history for the current
@@ -833,6 +814,11 @@ func (s *Store) createMappingVersion(ctx context.Context, eventID, windowsNodeID
 		return fmt.Errorf("store: begin mapping version: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	// A mapping write is a normal event mutation: it must obey the same durable
+	// purge/graveyard/archive lifecycle gate as ingest/enrollment/config writes.
+	if _, err := (&Tx{tx: tx}).EventActiveTx(ctx, eventID); err != nil {
+		return err
+	}
 
 	// The window node must be a real windows_terminal node of this event.
 	var winClass, winEvent string

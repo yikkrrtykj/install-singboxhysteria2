@@ -27,6 +27,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite" // registers the pure-Go "sqlite" database/sql driver
@@ -35,7 +36,7 @@ import (
 // SchemaVersion is the highest migration version this build knows. Open always
 // migrates a database to exactly this version; a database with a newer version
 // is rejected fail-closed instead of being silently used by older code.
-const SchemaVersion = 2
+const SchemaVersion = 8
 
 // Node classes accepted by the rev-5 platform isolation contract.
 const (
@@ -51,6 +52,16 @@ const (
 type Store struct {
 	db   *sql.DB
 	path string
+	// retentionHook is a test-only fault injection point for bounded retention.
+	retentionHook func(string) error
+	// ingestHook is a test-only fault injection point inside the authenticated
+	// ingest transaction (after high-water/dedupe writes, before commit).
+	ingestHook func(string) error
+	// overlapBudgetOverride is a test-only active-only planning basis override.
+	overlapBudgetOverride int64
+	// purgeMu guards purgeLocks; purgeLocks serializes PurgeEvent per event.
+	purgeMu    sync.Mutex
+	purgeLocks map[string]*sync.Mutex
 }
 
 // Path returns the filesystem path of the database.
@@ -306,6 +317,246 @@ var migrations = []migration{
 
 		`CREATE INDEX idx_route_mapping_versions_lookup
 			ON route_mapping_versions(event_id, windows_node_id, effective_from DESC, version DESC)`,
+	}},
+	{version: 3, statements: []string{
+		// P1-08 rotation persistence additions (B1 schema was minimal).
+		`ALTER TABLE key_rotations ADD COLUMN new_public_key TEXT`,
+		`ALTER TABLE key_rotations ADD COLUMN response_json TEXT`,
+		`ALTER TABLE key_rotations ADD COLUMN confirmed_at INTEGER`,
+		`ALTER TABLE enroll_tokens ADD COLUMN created_at INTEGER`,
+
+		// Per-node center configuration. Defaults are fail-closed: no collection
+		// source is enabled until an authorized admin/config path enables it.
+		`CREATE TABLE IF NOT EXISTS node_configs (
+			node_id       TEXT PRIMARY KEY REFERENCES nodes(node_id),
+			event_id      TEXT NOT NULL,
+			config_version INTEGER NOT NULL CHECK (typeof(config_version) = 'integer' AND config_version >= 1),
+			cadence_seconds INTEGER NOT NULL CHECK (typeof(cadence_seconds) = 'integer' AND cadence_seconds BETWEEN 30 AND 300),
+			sources_json  TEXT NOT NULL,
+			expected_inbound_tags_json TEXT NOT NULL,
+			device_salt   TEXT NOT NULL,
+			updated_at    INTEGER NOT NULL CHECK (typeof(updated_at) = 'integer')
+		) STRICT`,
+
+		// Validated snapshot history. The payload is the exact decoded body after
+		// schema/platform/privacy validation; it is never raw unvalidated input.
+		`CREATE TABLE IF NOT EXISTS snapshots (
+			id          INTEGER PRIMARY KEY AUTOINCREMENT,
+			node_id     TEXT NOT NULL REFERENCES nodes(node_id),
+			event_id    TEXT NOT NULL,
+			node_class  TEXT NOT NULL CHECK (node_class IN ('linux_vps','windows_terminal')),
+			report_id   TEXT NOT NULL,
+			collected_at INTEGER NOT NULL CHECK (typeof(collected_at) = 'integer'),
+			received_at INTEGER NOT NULL CHECK (typeof(received_at) = 'integer'),
+			body_sha256 TEXT NOT NULL,
+			payload_json BLOB NOT NULL,
+			UNIQUE(node_id, report_id)
+		) STRICT`,
+		`CREATE TABLE IF NOT EXISTS node_latest (
+			node_id     TEXT PRIMARY KEY REFERENCES nodes(node_id),
+			snapshot_id INTEGER NOT NULL REFERENCES snapshots(id),
+			report_id   TEXT NOT NULL,
+			event_id    TEXT NOT NULL,
+			node_class  TEXT NOT NULL CHECK (node_class IN ('linux_vps','windows_terminal')),
+			collected_at INTEGER NOT NULL CHECK (typeof(collected_at) = 'integer'),
+			updated_at  INTEGER NOT NULL CHECK (typeof(updated_at) = 'integer')
+		) STRICT`,
+
+		`CREATE TABLE IF NOT EXISTS report_metrics (
+			node_id     TEXT NOT NULL REFERENCES nodes(node_id),
+			event_id    TEXT NOT NULL,
+			report_id   TEXT NOT NULL,
+			collected_at INTEGER NOT NULL CHECK (typeof(collected_at) = 'integer'),
+			received_at INTEGER NOT NULL CHECK (typeof(received_at) = 'integer'),
+			body_sha256 TEXT NOT NULL,
+			payload_json BLOB NOT NULL,
+			PRIMARY KEY (node_id, report_id)
+		) STRICT`,
+		`CREATE TABLE IF NOT EXISTS report_events (
+			report_row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+			node_id     TEXT NOT NULL REFERENCES nodes(node_id),
+			event_id    TEXT NOT NULL,
+			report_id   TEXT NOT NULL,
+			collected_at INTEGER NOT NULL CHECK (typeof(collected_at) = 'integer'),
+			received_at INTEGER NOT NULL CHECK (typeof(received_at) = 'integer'),
+			event_id_json TEXT NOT NULL,
+			event_at    INTEGER NOT NULL CHECK (typeof(event_at) = 'integer'),
+			kind        TEXT NOT NULL,
+			details_json TEXT NOT NULL,
+			body_sha256 TEXT NOT NULL,
+			payload_json BLOB NOT NULL,
+			UNIQUE(node_id, report_id, event_id_json)
+		) STRICT`,
+		`CREATE INDEX IF NOT EXISTS idx_report_events_node_collected ON report_events(node_id, collected_at)`,
+
+		// Policy-B archive records (active 30d + archive 30d) and retention runs.
+		`CREATE TABLE IF NOT EXISTS archive_records (
+			id          INTEGER PRIMARY KEY AUTOINCREMENT,
+			record_type TEXT NOT NULL CHECK (record_type IN ('snapshot','metrics','events')),
+			node_id     TEXT NOT NULL,
+			event_id    TEXT NOT NULL,
+			report_id   TEXT NOT NULL,
+			collected_at INTEGER NOT NULL CHECK (typeof(collected_at) = 'integer'),
+			archived_at INTEGER NOT NULL CHECK (typeof(archived_at) = 'integer'),
+			payload_json BLOB NOT NULL,
+			UNIQUE(record_type, node_id, report_id)
+		) STRICT`,
+		`CREATE TABLE IF NOT EXISTS retention_runs (
+			id          INTEGER PRIMARY KEY AUTOINCREMENT,
+			ran_at      INTEGER NOT NULL,
+			result_json TEXT NOT NULL
+		) STRICT`,
+	}},
+	{version: 4, statements: []string{
+		// Policy-B event lifecycle. The archived event's own telemetry rows stay
+		// in their normal tables for the archive tail; there is no second copy and
+		// no per-table LIMIT-1 archive bug. A catalog row survives data deletion
+		// until an explicit purge tombstone is written.
+		`ALTER TABLE nodes ADD COLUMN retired_at INTEGER`,
+		`CREATE TABLE IF NOT EXISTS event_catalog (
+			event_id       TEXT PRIMARY KEY,
+			state          TEXT NOT NULL CHECK (state IN ('active','archived')),
+			created_at     INTEGER NOT NULL CHECK (typeof(created_at) = 'integer'),
+			archived_at    INTEGER CHECK (archived_at IS NULL OR typeof(archived_at) = 'integer'),
+			purge_after    INTEGER CHECK (purge_after IS NULL OR typeof(purge_after) = 'integer'),
+			data_purged_at INTEGER CHECK (data_purged_at IS NULL OR typeof(data_purged_at) = 'integer'),
+			updated_at     INTEGER NOT NULL CHECK (typeof(updated_at) = 'integer')
+		) STRICT`,
+		`INSERT OR IGNORE INTO event_catalog(event_id,state,created_at,archived_at,purge_after,data_purged_at,updated_at)
+		 SELECT event_id,'active',MIN(created_at),NULL,NULL,NULL,MAX(created_at) FROM nodes GROUP BY event_id`,
+		`CREATE TABLE IF NOT EXISTS purge_tombstones (
+			event_id    TEXT PRIMARY KEY,
+			actor       TEXT NOT NULL,
+			purged_at   INTEGER NOT NULL,
+			counts_json TEXT NOT NULL,
+			retain_until INTEGER NOT NULL
+		) STRICT`,
+		`CREATE TABLE IF NOT EXISTS retention_state (
+			id            INTEGER PRIMARY KEY CHECK (id = 1),
+			degraded      INTEGER NOT NULL DEFAULT 0,
+			failure_count INTEGER NOT NULL DEFAULT 0,
+			last_run_at   INTEGER,
+			last_error    TEXT
+		) STRICT`,
+		`INSERT OR IGNORE INTO retention_state(id,degraded,failure_count,last_run_at,last_error) VALUES(1,0,0,NULL,NULL)`,
+		`CREATE TABLE IF NOT EXISTS capacity_state (
+			id      INTEGER PRIMARY KEY CHECK (id = 1),
+			version INTEGER NOT NULL DEFAULT 0
+		) STRICT`,
+		`INSERT OR IGNORE INTO capacity_state(id,version) VALUES(1,0)`,
+		// B2 no longer uses the old per-table archive copy; live event tables plus
+		// event lifecycle are the single source of truth.
+		`DROP TABLE IF EXISTS archive_records`,
+	}},
+	{version: 5, statements: []string{
+		// P1 review: events must not duplicate the complete report body on every
+		// event row. Store the validated events report once, and normalized event
+		// rows with severity/details only.
+		`CREATE TABLE IF NOT EXISTS report_event_reports (
+			node_id     TEXT NOT NULL REFERENCES nodes(node_id),
+			event_id    TEXT NOT NULL,
+			report_id   TEXT NOT NULL,
+			collected_at INTEGER NOT NULL CHECK (typeof(collected_at) = 'integer'),
+			received_at INTEGER NOT NULL CHECK (typeof(received_at) = 'integer'),
+			body_sha256 TEXT NOT NULL,
+			payload_json BLOB NOT NULL,
+			PRIMARY KEY (node_id, report_id)
+		) STRICT`,
+		`CREATE TABLE IF NOT EXISTS report_events_new (
+			report_row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+			node_id     TEXT NOT NULL REFERENCES nodes(node_id),
+			event_id    TEXT NOT NULL,
+			report_id   TEXT NOT NULL,
+			collected_at INTEGER NOT NULL CHECK (typeof(collected_at) = 'integer'),
+			received_at INTEGER NOT NULL CHECK (typeof(received_at) = 'integer'),
+			event_id_json TEXT NOT NULL,
+			event_at    INTEGER NOT NULL CHECK (typeof(event_at) = 'integer'),
+			kind        TEXT NOT NULL,
+			severity    TEXT NOT NULL CHECK (severity IN ('info','warning','critical')),
+			details_json TEXT NOT NULL,
+			UNIQUE(node_id, report_id, event_id_json)
+		) STRICT`,
+		`INSERT OR IGNORE INTO report_event_reports(node_id,event_id,report_id,collected_at,received_at,body_sha256,payload_json)
+		 SELECT node_id,event_id,report_id,MIN(collected_at),MAX(received_at),body_sha256,payload_json
+		 FROM report_events GROUP BY node_id,event_id,report_id,body_sha256`,
+		`INSERT OR IGNORE INTO report_events_new(node_id,event_id,report_id,collected_at,received_at,event_id_json,event_at,kind,severity,details_json)
+		 SELECT node_id,event_id,report_id,collected_at,received_at,event_id_json,event_at,kind,'info',details_json
+		 FROM report_events`,
+		`DROP TABLE report_events`,
+		`ALTER TABLE report_events_new RENAME TO report_events`,
+		`CREATE INDEX IF NOT EXISTS idx_report_events_node_collected ON report_events(node_id, collected_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_report_event_reports_event ON report_event_reports(event_id, collected_at)`,
+	}},
+	{version: 6, statements: []string{
+		// F1: durable purge operation before any destructive step. The row is the
+		// authorization context for mapping deletion; B1 immutability triggers stay
+		// in force for every non-purge path.
+		`CREATE TABLE IF NOT EXISTS purge_ops (
+			op_id       TEXT PRIMARY KEY,
+			event_id    TEXT NOT NULL,
+			actor       TEXT NOT NULL,
+			started_at  INTEGER NOT NULL,
+			updated_at  INTEGER NOT NULL,
+			state       TEXT NOT NULL CHECK (state IN ('purging','mapping','finalizing','completed')),
+			phase       TEXT NOT NULL,
+			deleted_rows INTEGER NOT NULL DEFAULT 0,
+			error       TEXT
+		) STRICT`,
+		`CREATE INDEX IF NOT EXISTS idx_purge_ops_event ON purge_ops(event_id, state)`,
+		// Permanent event-id identity isolation; distinct from the 180-day audit
+		// tombstone (purge_tombstones) and retained after the latter expires.
+		`CREATE TABLE IF NOT EXISTS event_graveyard (
+			event_id   TEXT PRIMARY KEY,
+			purged_at  INTEGER NOT NULL,
+			op_id      TEXT NOT NULL
+		) STRICT`,
+		`DROP TRIGGER IF EXISTS route_mapping_versions_no_delete`,
+		`DROP TRIGGER IF EXISTS route_mapping_entries_no_delete`,
+		`CREATE TRIGGER route_mapping_versions_no_delete
+			BEFORE DELETE ON route_mapping_versions
+			WHEN NOT EXISTS (SELECT 1 FROM purge_ops p WHERE p.event_id = OLD.event_id AND p.state IN ('mapping','finalizing'))
+			BEGIN SELECT RAISE(ABORT, 'route_mapping_versions are immutable'); END`,
+		`CREATE TRIGGER route_mapping_entries_no_delete
+			BEFORE DELETE ON route_mapping_entries
+			WHEN NOT EXISTS (SELECT 1 FROM purge_ops p WHERE p.event_id = OLD.event_id AND p.state IN ('mapping','finalizing'))
+			BEGIN SELECT RAISE(ABORT, 'route_mapping_entries are immutable'); END`,
+	}},
+	{version: 7, statements: []string{
+		// F4: effective-dated config history. Reports are validated against the
+		// configuration that was effective at collected_at, not a mutable current
+		// row or an "updated_at" bypass.
+		`CREATE TABLE IF NOT EXISTS node_config_history (
+			id             INTEGER PRIMARY KEY AUTOINCREMENT,
+			node_id        TEXT NOT NULL REFERENCES nodes(node_id),
+			event_id       TEXT NOT NULL,
+			config_version INTEGER NOT NULL CHECK (config_version >= 1),
+			effective_from INTEGER NOT NULL CHECK (typeof(effective_from) = 'integer'),
+			sources_json   TEXT NOT NULL,
+			expected_inbound_tags_json TEXT NOT NULL,
+			cadence_seconds INTEGER NOT NULL,
+			device_salt    TEXT NOT NULL,
+			UNIQUE(node_id, config_version)
+		) STRICT`,
+		`INSERT OR IGNORE INTO node_config_history(node_id,event_id,config_version,effective_from,sources_json,expected_inbound_tags_json,cadence_seconds,device_salt)
+		 SELECT node_id,event_id,config_version,updated_at,sources_json,expected_inbound_tags_json,cadence_seconds,device_salt FROM node_configs`,
+		`CREATE INDEX IF NOT EXISTS idx_node_config_history_lookup ON node_config_history(node_id, effective_from DESC, config_version DESC)`,
+	}},
+	{version: 8, statements: []string{
+		// C4: the v7 backfill copied a mutable current config as if it were
+		// historical evidence. Re-anchor version 1 at registration time with the
+		// fail-closed initial switches, and create that row when it is missing.
+		`UPDATE node_config_history
+		 SET effective_from=(SELECT created_at FROM nodes n WHERE n.node_id=node_config_history.node_id),
+		     sources_json='{"system":false,"services":false,"singbox_api":false,"mihomo_api":false,"terminal":false,"events":false}',
+		     expected_inbound_tags_json='[]'
+		 WHERE config_version=1`,
+		`INSERT OR IGNORE INTO node_config_history(node_id,event_id,config_version,effective_from,sources_json,expected_inbound_tags_json,cadence_seconds,device_salt)
+		 SELECT n.node_id,n.event_id,1,n.created_at,
+		        '{"system":false,"services":false,"singbox_api":false,"mihomo_api":false,"terminal":false,"events":false}',
+		        '[]',COALESCE(c.cadence_seconds,60),COALESCE(c.device_salt,'')
+		 FROM nodes n LEFT JOIN node_configs c ON c.node_id=n.node_id`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_purge_ops_single_incomplete
+		 ON purge_ops(event_id) WHERE state <> 'completed'`,
 	}},
 }
 

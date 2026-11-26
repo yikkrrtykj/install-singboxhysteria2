@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+
+	"github.com/yikkrrtykj/install-singboxhysteria2/um/internal/schema"
 )
 
 // Frozen temporal bounds for snapshot sub-samples, in seconds relative to
@@ -112,10 +114,27 @@ func ValidateSnapshot(nodeClass string, raw []byte) error {
 // ValidateSnapshotWithOptions is ValidateSnapshot with explicit center-state
 // options. See ValidateOptions.
 func ValidateSnapshotWithOptions(nodeClass string, raw []byte, opts ValidateOptions) error {
+	return validateSnapshotWithSchemaSet(nil, nodeClass, raw, opts)
+}
+
+// ValidateSnapshotWithSchemaSet is ValidateSnapshotWithOptions using an explicit
+// startup-loaded contract schema set. The center must use this variant: a
+// deployed binary cannot rely on the source checkout path being present.
+func ValidateSnapshotWithSchemaSet(set *schema.Set, nodeClass string, raw []byte, opts ValidateOptions) error {
+	return validateSnapshotWithSchemaSet(set, nodeClass, raw, opts)
+}
+
+func validateSnapshotWithSchemaSet(set *schema.Set, nodeClass string, raw []byte, opts ValidateOptions) error {
 	// 1–2. Real JSON Schema validation of the frozen contract (which itself
 	// enforces strict JSON before schema work).
-	if err := validateSchema(snapshotSchemaFile, raw); err != nil {
-		return err
+	var schemaErr error
+	if set != nil {
+		schemaErr = set.Validate(snapshotSchemaFile, raw)
+	} else {
+		schemaErr = validateSchema(snapshotSchemaFile, raw)
+	}
+	if schemaErr != nil {
+		return schemaErr
 	}
 
 	// 3. Privacy boundary: scan every string reachable from the body, by path.

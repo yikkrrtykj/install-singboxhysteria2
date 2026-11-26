@@ -357,7 +357,10 @@ func newCenter(t *testing.T, setup recSetup) *store.Store {
 		}
 	}
 	for reportID, hash := range setup.Center.ReportDedupe {
-		if _, err := st.CheckOrInsertReport(t.Context(), testNodeID, reportID, hash, 1); err != nil {
+		if err := st.WithTx(t.Context(), func(tx *store.Tx) error {
+			_, err := tx.CheckOrInsertReport(t.Context(), testNodeID, reportID, hash, 1)
+			return err
+		}); err != nil {
 			t.Fatalf("seed report %s: %v", reportID, err)
 		}
 	}
