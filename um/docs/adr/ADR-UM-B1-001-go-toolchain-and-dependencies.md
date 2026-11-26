@@ -23,7 +23,7 @@
 | --- | --- | --- | --- |
 | `modernc.org/sqlite` | `v1.38.2` | Pure-Go SQLite, no cgo, works on Linux + Windows runners; supports WAL and `synchronous=FULL`; the contract requires SQLite. | `mattn/go-sqlite3` needs cgo/C toolchain on Windows; other bindings add a larger binary/ABI surface; no pure-Go stdlib SQLite exists. |
 | `github.com/santhosh-tekuri/jsonschema/v6` | `v6.0.3` | Real JSON Schema 2020-12 validation of the frozen schemas; small dependency tree. | A hand-written partial validator would masquerade as conformance (forbidden by the UM-B1 acceptance criteria); JSON-parse-only validation is not schema validation. |
-| `golang.org/x/vuln` (`govulncheck`) | tool `v1.1.4` (CI only, not a runtime dependency) | Dependency vulnerability audit. | Trusting `go.sum` without a vulnerability scan. |
+| `golang.org/x/vuln` (`govulncheck`) | tool `v1.10.0` (CI only, not a runtime dependency) | Dependency vulnerability audit. | Trusting `go.sum` without a vulnerability scan. |
 
 Transitive modules are pinned by `um/go.sum`; `go mod verify` and
 `go list -m all` are part of CI. No unpinned/latest installs are allowed except
