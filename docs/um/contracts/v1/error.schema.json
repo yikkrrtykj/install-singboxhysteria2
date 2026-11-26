@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://um.invalid/contracts/v1/error.schema.json",
-  "title": "UM v1 closed error body",
+  "title": "UM v1 closed error body (revision 5)",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -31,19 +31,22 @@
         "replay",
         "nonce_reuse",
         "sequence_conflict",
-        "stale_boot",
         "identity_mismatch",
         "report_conflict",
         "token_invalid",
         "token_expired",
         "token_used",
+        "token_scope_mismatch",
         "rate_limited",
         "payload_too_large",
         "unsupported_version",
         "upgrade_required",
         "storage_unavailable",
         "rotation_in_progress",
-        "rotation_expired"
+        "rotation_expired",
+        "stale_boot_generation",
+        "boot_identity_conflict",
+        "platform_mismatch"
       ]
     },
     "retryable": {
