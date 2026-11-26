@@ -1,0 +1,279 @@
+{
+  "v": 1,
+  "revision": 5,
+  "contract": "um-v1",
+  "description": "Signed vectors for Unified Monitor node protocol v1 revision 5. Ephemeral synthetic test keys; private keys are NOT committed. Synthetic data only. The rev-4 report vector remains valid and is kept unchanged for traceability; rev-5 adds a node_class enrollment vector, a Windows terminal report vector and rotate/config positive vectors.",
+  "revision_history": [
+    {
+      "revision": 4,
+      "commit": "5089cdebc18e98bc8e37446a2404f59d1f5544ef",
+      "changes": "Boot-generation header and tamper negative; report vector re-signed with X-UM-Boot-Gen. Snapshot body had no node_class and no terminal object."
+    },
+    {
+      "revision": 5,
+      "changes": "Enrollment body adds node_class (linux_vps/windows_terminal); Windows terminal snapshot/report vector added; rotate and config positive vectors added; report vector unchanged."
+    }
+  ],
+  "report_vector": {
+    "id": "report-positive",
+    "revision": "rev-4 retained (still valid rev-5)",
+    "operation": {
+      "method": "POST",
+      "path": "/v1/agent/report"
+    },
+    "headers": {
+      "X-UM-Protocol": "1",
+      "X-UM-Node-Id": "0f3d7c2a-8b41-4a6e-9c55-2d7e1b9a4c60",
+      "X-UM-Key-Id": "key-4f2a9c1b",
+      "X-UM-Boot-Gen": "1",
+      "X-UM-Boot-Id": "9c1f5a7e2b6d48c3a0e4f812d36b7c95",
+      "X-UM-Seq": "7",
+      "X-UM-Sent-At": "1795622410",
+      "X-UM-Nonce": "AAECAwQFBgcICQoLDA0ODw",
+      "X-UM-Content-Encoding": "identity",
+      "Content-Type": "application/json"
+    },
+    "body_file": "examples/report-snapshot.v1.json",
+    "decoded_body_bytes": 1031,
+    "decoded_body_sha256_hex": "d8647394f0cc4543e292a75063b501413645f62e89f303743878ec2d280d3774",
+    "signing_string": "um-v1\nreport\nPOST\n/v1/agent/report\n1\n0f3d7c2a-8b41-4a6e-9c55-2d7e1b9a4c60\nkey-4f2a9c1b\n1\n9c1f5a7e2b6d48c3a0e4f812d36b7c95\n7\n1795622410\nAAECAwQFBgcICQoLDA0ODw\nidentity\nd8647394f0cc4543e292a75063b501413645f62e89f303743878ec2d280d3774",
+    "signing_string_b64url": "dW0tdjEKcmVwb3J0ClBPU1QKL3YxL2FnZW50L3JlcG9ydAoxCjBmM2Q3YzJhLThiNDEtNGE2ZS05YzU1LTJkN2UxYjlhNGM2MAprZXktNGYyYTljMWIKMQo5YzFmNWE3ZTJiNmQ0OGMzYTBlNGY4MTJkMzZiN2M5NQo3CjE3OTU2MjI0MTAKQUFFQ0F3UUZCZ2NJQ1FvTERBME9EdwppZGVudGl0eQpkODY0NzM5NGYwY2M0NTQzZTI5MmE3NTA2M2I1MDE0MTM2NDVmNjJlODlmMzAzNzQzODc4ZWMyZDI4MGQzNzc0",
+    "signing_string_sha256_hex": "44774004887bac2122639817f09686f37ca80a1cd43ef8007d6469b76258068a",
+    "signature": {
+      "alg": "Ed25519",
+      "public_key_b64url": "92mDHJhfw1zFNk2wFB7LNY9EPcgwNJrjWSF9wByHu3E",
+      "signature_b64url": "jnlllXdY-N8AIv97HRpHshu3LcBKrJsEbkScN5sb7Y3_O8zIPpOv12Xnmt2D2Gmh1a9TEGRNhl23XtCn8sg5Dw"
+    },
+    "expected": {
+      "http": 200,
+      "ack_result": "accepted",
+      "verify": true
+    }
+  },
+  "windows_terminal_report_vector": {
+    "id": "windows-terminal-report-positive",
+    "revision": 5,
+    "operation": {
+      "method": "POST",
+      "path": "/v1/agent/report"
+    },
+    "headers": {
+      "X-UM-Protocol": "1",
+      "X-UM-Node-Id": "c1a2b3c4-5d6e-4f70-8a91-b2c3d4e5f607",
+      "X-UM-Key-Id": "key-8d3e5f21",
+      "X-UM-Boot-Gen": "5",
+      "X-UM-Boot-Id": "3f2a7c9e1b4d8065a2e4f71c3b9d5e08",
+      "X-UM-Seq": "12",
+      "X-UM-Sent-At": "1795622401",
+      "X-UM-Nonce": "ICEiIyQlJicoKSorLC0uLw",
+      "X-UM-Content-Encoding": "identity",
+      "Content-Type": "application/json"
+    },
+    "body_file": "examples/terminal-snapshot.v1.json",
+    "decoded_body_bytes": 941,
+    "decoded_body_sha256_hex": "b5faae0b4b1b7689b0aa4bf11ffd8c56d2e4695730075763f00b469797ffa70c",
+    "signing_string": "um-v1\nreport\nPOST\n/v1/agent/report\n1\nc1a2b3c4-5d6e-4f70-8a91-b2c3d4e5f607\nkey-8d3e5f21\n5\n3f2a7c9e1b4d8065a2e4f71c3b9d5e08\n12\n1795622401\nICEiIyQlJicoKSorLC0uLw\nidentity\nb5faae0b4b1b7689b0aa4bf11ffd8c56d2e4695730075763f00b469797ffa70c",
+    "signing_string_b64url": "dW0tdjEKcmVwb3J0ClBPU1QKL3YxL2FnZW50L3JlcG9ydAoxCmMxYTJiM2M0LTVkNmUtNGY3MC04YTkxLWIyYzNkNGU1ZjYwNwprZXktOGQzZTVmMjEKNQozZjJhN2M5ZTFiNGQ4MDY1YTJlNGY3MWMzYjlkNWUwOAoxMgoxNzk1NjIyNDAxCklDRWlJeVFsSmljb0tTb3JMQzB1THcKaWRlbnRpdHkKYjVmYWFlMGI0YjFiNzY4OWIwYWE0YmYxMWZmZDhjNTZkMmU0Njk1NzMwMDc1NzYzZjAwYjQ2OTc5N2ZmYTcwYw",
+    "signing_string_sha256_hex": "688bc768089d4e4672cc7099875101e094a53a56ae81962f7ed715b4ac4ce776",
+    "signature": {
+      "alg": "Ed25519",
+      "public_key_b64url": "cYRMk8Vs-7E2npDGlCap9P37oiZqhmEVnUgT7NxovLM",
+      "signature_b64url": "nM4moFxm8xMHkrt-BWXUQCDeNmPi13uhBzT1LaQTFW4DRV-8hxk0KHqMUSaSl1n2nPFvZZz2wHtEk3hua_OjAQ"
+    },
+    "expected": {
+      "http": 200,
+      "ack_result": "accepted",
+      "verify": true,
+      "platform": "windows_terminal"
+    }
+  },
+  "enroll_vector": {
+    "id": "enroll-positive-rev5",
+    "revision": 5,
+    "operation": {
+      "method": "POST",
+      "path": "/v1/agent/enroll"
+    },
+    "headers": {
+      "X-UM-Protocol": "1",
+      "X-UM-Pubkey": "xtwDB2duzGhQUdGqZRDNAJsZ4CPEGJSYXFBDP8JtoNc",
+      "X-UM-Sent-At": "1795622400",
+      "X-UM-Nonce": "EBESExQVFhcYGRobHB0eHw",
+      "X-UM-Content-Encoding": "identity",
+      "Content-Type": "application/json"
+    },
+    "body_file": "examples/enroll-request.v1.json",
+    "decoded_body_bytes": 188,
+    "decoded_body_sha256_hex": "6abc9e62b1ed9c180f7ecbe1da4f4e649733d437ccd1210b69cadb1b73047831",
+    "signing_string": "um-enroll-v1\nPOST\n/v1/agent/enroll\n1\nidentity\nxtwDB2duzGhQUdGqZRDNAJsZ4CPEGJSYXFBDP8JtoNc\n1795622400\nEBESExQVFhcYGRobHB0eHw\n6abc9e62b1ed9c180f7ecbe1da4f4e649733d437ccd1210b69cadb1b73047831",
+    "signing_string_b64url": "dW0tZW5yb2xsLXYxClBPU1QKL3YxL2FnZW50L2Vucm9sbAoxCmlkZW50aXR5Cnh0d0RCMmR1ekdoUVVkR3FaUkROQUpzWjRDUEVHSlNZWEZCRFA4SnRvTmMKMTc5NTYyMjQwMApFQkVTRXhRVkZoY1lHUm9iSEIwZUh3CjZhYmM5ZTYyYjFlZDljMTgwZjdlY2JlMWRhNGY0ZTY0OTczM2Q0MzdjY2QxMjEwYjY5Y2FkYjFiNzMwNDc4MzE",
+    "signing_string_sha256_hex": "ce7374fe27ec6570f326aeb9c4c0595fdeab9279f1791ce4d812e01fee51bf85",
+    "signature": {
+      "alg": "Ed25519",
+      "public_key_b64url": "xtwDB2duzGhQUdGqZRDNAJsZ4CPEGJSYXFBDP8JtoNc",
+      "signature_b64url": "BAWVdFU9llEMiS6J2KSHB5O8arw9S0A5IZsMqesO-WSw30pn1mpN6GNsFIf57er27X_dM4mXa1XOBVOgBzpyAg"
+    },
+    "expected": {
+      "http": 200,
+      "verify": true
+    }
+  },
+  "rotate_vector": {
+    "id": "rotate-positive",
+    "revision": 5,
+    "operation": {
+      "method": "POST",
+      "path": "/v1/agent/rotate"
+    },
+    "headers": {
+      "X-UM-Protocol": "1",
+      "X-UM-Node-Id": "0f3d7c2a-8b41-4a6e-9c55-2d7e1b9a4c60",
+      "X-UM-Key-Id": "key-4f2a9c1b",
+      "X-UM-Boot-Gen": "1",
+      "X-UM-Boot-Id": "9c1f5a7e2b6d48c3a0e4f812d36b7c95",
+      "X-UM-Seq": "8",
+      "X-UM-Sent-At": "1795622405",
+      "X-UM-Nonce": "MDEyMzQ1Njc4OWFiY2RlZg",
+      "X-UM-Content-Encoding": "identity",
+      "Content-Type": "application/json"
+    },
+    "body_file": "examples/rotate-request.v1.json",
+    "decoded_body_bytes": 67,
+    "decoded_body_sha256_hex": "1152851b3821c6ce4ffab56b983ebd01ed6354d3f00be0bcfd3df2f65f604e9e",
+    "signing_string": "um-v1\nrotate\nPOST\n/v1/agent/rotate\n1\n0f3d7c2a-8b41-4a6e-9c55-2d7e1b9a4c60\nkey-4f2a9c1b\n1\n9c1f5a7e2b6d48c3a0e4f812d36b7c95\n8\n1795622405\nMDEyMzQ1Njc4OWFiY2RlZg\nidentity\n1152851b3821c6ce4ffab56b983ebd01ed6354d3f00be0bcfd3df2f65f604e9e",
+    "signing_string_b64url": "dW0tdjEKcm90YXRlClBPU1QKL3YxL2FnZW50L3JvdGF0ZQoxCjBmM2Q3YzJhLThiNDEtNGE2ZS05YzU1LTJkN2UxYjlhNGM2MAprZXktNGYyYTljMWIKMQo5YzFmNWE3ZTJiNmQ0OGMzYTBlNGY4MTJkMzZiN2M5NQo4CjE3OTU2MjI0MDUKTURFeU16UTFOamM0T1dGaVkyUmxaZwppZGVudGl0eQoxMTUyODUxYjM4MjFjNmNlNGZmYWI1NmI5ODNlYmQwMWVkNjM1NGQzZjAwYmUwYmNmZDNkZjJmNjVmNjA0ZTll",
+    "signing_string_sha256_hex": "f285fad3c0a5aee7e332dfc2cc1a91d3136295476403413735a7bdf8f5e2fbc8",
+    "signature": {
+      "alg": "Ed25519",
+      "public_key_b64url": "nw9e8JMkDHg16e0sRLjJZ9lSXI6U8ESudqku3oIuNgc",
+      "signature_b64url": "NjwUsLOzLyRKPe5KIv2wgXJ3l9yTeERQ65nVlZhWzNwUjhvi0Nbi9DlCdRuVPwvVpCX6hLW5_rOYNVNpMX4vAQ"
+    },
+    "expected": {
+      "http": 200,
+      "verify": true
+    }
+  },
+  "config_vector": {
+    "id": "config-positive",
+    "revision": 5,
+    "operation": {
+      "method": "POST",
+      "path": "/v1/agent/config"
+    },
+    "headers": {
+      "X-UM-Protocol": "1",
+      "X-UM-Node-Id": "0f3d7c2a-8b41-4a6e-9c55-2d7e1b9a4c60",
+      "X-UM-Key-Id": "key-4f2a9c1b",
+      "X-UM-Boot-Gen": "1",
+      "X-UM-Boot-Id": "9c1f5a7e2b6d48c3a0e4f812d36b7c95",
+      "X-UM-Seq": "9",
+      "X-UM-Sent-At": "1795622406",
+      "X-UM-Nonce": "QEFCQ0RFRkdISUpLTE1OTw",
+      "X-UM-Content-Encoding": "identity",
+      "Content-Type": "application/json"
+    },
+    "body": "{}",
+    "decoded_body_bytes": 2,
+    "decoded_body_sha256_hex": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+    "signing_string": "um-v1\nconfig\nPOST\n/v1/agent/config\n1\n0f3d7c2a-8b41-4a6e-9c55-2d7e1b9a4c60\nkey-4f2a9c1b\n1\n9c1f5a7e2b6d48c3a0e4f812d36b7c95\n9\n1795622406\nQEFCQ0RFRkdISUpLTE1OTw\nidentity\n44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+    "signing_string_b64url": "dW0tdjEKY29uZmlnClBPU1QKL3YxL2FnZW50L2NvbmZpZwoxCjBmM2Q3YzJhLThiNDEtNGE2ZS05YzU1LTJkN2UxYjlhNGM2MAprZXktNGYyYTljMWIKMQo5YzFmNWE3ZTJiNmQ0OGMzYTBlNGY4MTJkMzZiN2M5NQo5CjE3OTU2MjI0MDYKUUVGQ1EwUkZSa2RJU1VwTFRFMU9UdwppZGVudGl0eQo0NDEzNmZhMzU1YjM2NzhhMTE0NmFkMTZmN2U4NjQ5ZTk0ZmI0ZmMyMWZlNzdlODMxMGMwNjBmNjFjYWFmZjhh",
+    "signing_string_sha256_hex": "b3e41acf9b92f0b37bc4a63e8e8e9e75c64159b6c851ae1d6d659aecc2e60658",
+    "signature": {
+      "alg": "Ed25519",
+      "public_key_b64url": "nw9e8JMkDHg16e0sRLjJZ9lSXI6U8ESudqku3oIuNgc",
+      "signature_b64url": "OMrEPnAj8LMfN0v0lj2CWOaPXdmuyWatiPBJJa2F8JFfKPlO-uDUawYRmPWnjgeMtUPgGLvx0lPOibtWJQNaAQ"
+    },
+    "expected": {
+      "http": 200,
+      "verify": true
+    }
+  },
+  "historical_rev4_enroll_vector": {
+    "id": "enroll-positive-rev4-history",
+    "note": "Kept for traceability only. Under rev-5 this body is schema-invalid because node_class is absent; it must not be used as a current positive vector.",
+    "body_inline": "{\"v\":1,\"agent_version\":\"1.0.0\",\"host\":{\"os\":\"linux\",\"kernel\":\"6.8.0-45-generic\",\"arch\":\"amd64\"},\"capabilities\":[\"metrics_v1\",\"events_v1\",\"rotate_v1\",\"config_v1\"]}\n",
+    "decoded_body_bytes": 163,
+    "decoded_body_sha256_hex": "504a7035ffd21ffd2e7318548505fbf99f785948682d8d9bf5409ce746099cf0",
+    "signing_string": "um-enroll-v1\nPOST\n/v1/agent/enroll\n1\nidentity\n7qUoFX76CdhDin_iV74MAQZldoXDFFyYkV9cQqY60iw\n1795622400\nEBESExQVFhcYGRobHB0eHw\n504a7035ffd21ffd2e7318548505fbf99f785948682d8d9bf5409ce746099cf0",
+    "public_key_b64url": "7qUoFX76CdhDin_iV74MAQZldoXDFFyYkV9cQqY60iw",
+    "signature_b64url": "HEcGH3wbN9A1ndo8OghRFID0eZRWPEB1n-7m7XPf6lI3nZv_axqFjYocmhDFtUuiZWLPhyyXdpwELQMOsu9XBg",
+    "historical_expected": {
+      "http": 200,
+      "verify": true
+    }
+  },
+  "negative_crypto_vectors": [
+    {
+      "id": "report-boot-gen-tamper",
+      "signing_string": "um-v1\nreport\nPOST\n/v1/agent/report\n2\n0f3d7c2a-8b41-4a6e-9c55-2d7e1b9a4c60\nkey-4f2a9c1b\n1\n9c1f5a7e2b6d48c3a0e4f812d36b7c95\n7\n1795622410\nAAECAwQFBgcICQoLDA0ODw\nidentity\nd8647394f0cc4543e292a75063b501413645f62e89f303743878ec2d280d3774",
+      "signature_from": "report-positive",
+      "expected": {
+        "http": 401,
+        "error": "bad_signature",
+        "verify_against_report_key": false
+      }
+    },
+    {
+      "id": "report-tampered-body",
+      "body_file": "examples/negative/report-snapshot-tampered.v1.json",
+      "decoded_body_bytes": 1031,
+      "decoded_body_sha256_hex": "bd9748181588889f58650d9a7f0464448cdd9b1c445f57432288f90e3d65d8d9",
+      "signature_from": "report-positive",
+      "expected": {
+        "http": 401,
+        "error": "bad_signature",
+        "verify_against_report_key": false
+      }
+    },
+    {
+      "id": "report-wrong-key",
+      "signing_string_from": "report-positive",
+      "signer_public_key_b64url": "UbDevY-XJGziMrObtDffB1M9JynjK7OQnTlrZqkl55k",
+      "signature_b64url": "8GwgJZZc7QlKcwd6yfszIWjllT7dh9nZocnzuC4ZHlPQozhAEpzn-l4oE37lphAuTZTi95q54-UN7lvJmRK7BQ",
+      "expected": {
+        "http": 401,
+        "error": "bad_signature",
+        "verify_against_report_key": false
+      }
+    },
+    {
+      "id": "report-signature-reused-on-rotate",
+      "signing_string": "um-v1\nrotate\nPOST\n/v1/agent/rotate\n1\n0f3d7c2a-8b41-4a6e-9c55-2d7e1b9a4c60\nkey-4f2a9c1b\n1\n9c1f5a7e2b6d48c3a0e4f812d36b7c95\n7\n1795622410\nAAECAwQFBgcICQoLDA0ODw\nidentity\nd8647394f0cc4543e292a75063b501413645f62e89f303743878ec2d280d3774",
+      "signature_from": "report-positive",
+      "expected": {
+        "http": 401,
+        "error": "bad_signature"
+      }
+    },
+    {
+      "id": "windows-terminal-tampered-body",
+      "body_file": "examples/negative/terminal-by-route-sum-mismatch.v1.json",
+      "signature_from": "windows-terminal-report-positive",
+      "expected": {
+        "http": 401,
+        "error": "bad_signature",
+        "verify_against_windows_key": false
+      }
+    },
+    {
+      "id": "windows-terminal-boot-gen-tamper",
+      "signing_string": "um-v1\nreport\nPOST\n/v1/agent/report\n1\nc1a2b3c4-5d6e-4f70-8a91-b2c3d4e5f607\nkey-8d3e5f21\n6\n3f2a7c9e1b4d8065a2e4f71c3b9d5e08\n12\n1795622401\nICEiIyQlJicoKSorLC0uLw\nidentity\nb5faae0b4b1b7689b0aa4bf11ffd8c56d2e4695730075763f00b469797ffa70c",
+      "signature_from": "windows-terminal-report-positive",
+      "expected": {
+        "http": 401,
+        "error": "bad_signature",
+        "verify_against_windows_key": false
+      }
+    },
+    {
+      "id": "rotate-new-pubkey-tampered",
+      "body_file": "examples/negative/rotate-request-tampered.v1.json",
+      "signature_from": "rotate-positive",
+      "expected": {
+        "http": 401,
+        "error": "bad_signature",
+        "verify": false
+      }
+    }
+  ]
+}

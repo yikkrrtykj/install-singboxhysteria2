@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://um.invalid/contracts/v1/ack.schema.json",
+  "title": "UM v1 report acknowledgement (rev-5: next_seq is the next usable sequence or null on generation exhaustion)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["v", "report_id", "result", "server_time", "next_seq",
+               "config_version", "retry_after_s"],
+  "properties": {
+    "v": {"const": 1},
+    "report_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "result": {"enum": ["accepted", "duplicate", "stale_ignored"]},
+    "server_time": {"type": "integer", "minimum": 0},
+    "next_seq": {
+      "description": "Last accepted seq + 1; null iff last_seq == 9223372036854775806 (generation exhausted). The agent MUST NOT reuse a seq and MUST start a new generation or enter operator recovery after null.",
+      "oneOf": [
+        {"type": "null"},
+        {"type": "integer", "minimum": 1, "maximum": 9223372036854775806}
+      ]
+    },
+    "config_version": {"type": "integer", "minimum": 1},
+    "retry_after_s": {
+      "oneOf": [
+        {"type": "null"},
+        {"type": "integer", "minimum": 1, "maximum": 3600}
+      ]
+    }
+  }
+}
