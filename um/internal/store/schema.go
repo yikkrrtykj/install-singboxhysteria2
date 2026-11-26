@@ -35,7 +35,7 @@ import (
 // SchemaVersion is the highest migration version this build knows. Open always
 // migrates a database to exactly this version; a database with a newer version
 // is rejected fail-closed instead of being silently used by older code.
-const SchemaVersion = 2
+const SchemaVersion = 3
 
 // Node classes accepted by the rev-5 platform isolation contract.
 const (
@@ -306,6 +306,95 @@ var migrations = []migration{
 
 		`CREATE INDEX idx_route_mapping_versions_lookup
 			ON route_mapping_versions(event_id, windows_node_id, effective_from DESC, version DESC)`,
+	}},
+	{version: 3, statements: []string{
+		// P1-08 rotation persistence additions (B1 schema was minimal).
+		`ALTER TABLE key_rotations ADD COLUMN new_public_key TEXT`,
+		`ALTER TABLE key_rotations ADD COLUMN response_json TEXT`,
+		`ALTER TABLE key_rotations ADD COLUMN confirmed_at INTEGER`,
+		`ALTER TABLE enroll_tokens ADD COLUMN created_at INTEGER`,
+
+		// Per-node center configuration. Defaults are fail-closed: no collection
+		// source is enabled until an authorized admin/config path enables it.
+		`CREATE TABLE IF NOT EXISTS node_configs (
+			node_id       TEXT PRIMARY KEY REFERENCES nodes(node_id),
+			event_id      TEXT NOT NULL,
+			config_version INTEGER NOT NULL CHECK (typeof(config_version) = 'integer' AND config_version >= 1),
+			cadence_seconds INTEGER NOT NULL CHECK (typeof(cadence_seconds) = 'integer' AND cadence_seconds BETWEEN 30 AND 300),
+			sources_json  TEXT NOT NULL,
+			expected_inbound_tags_json TEXT NOT NULL,
+			device_salt   TEXT NOT NULL,
+			updated_at    INTEGER NOT NULL CHECK (typeof(updated_at) = 'integer')
+		) STRICT`,
+
+		// Validated snapshot history. The payload is the exact decoded body after
+		// schema/platform/privacy validation; it is never raw unvalidated input.
+		`CREATE TABLE IF NOT EXISTS snapshots (
+			id          INTEGER PRIMARY KEY AUTOINCREMENT,
+			node_id     TEXT NOT NULL REFERENCES nodes(node_id),
+			event_id    TEXT NOT NULL,
+			node_class  TEXT NOT NULL CHECK (node_class IN ('linux_vps','windows_terminal')),
+			report_id   TEXT NOT NULL,
+			collected_at INTEGER NOT NULL CHECK (typeof(collected_at) = 'integer'),
+			received_at INTEGER NOT NULL CHECK (typeof(received_at) = 'integer'),
+			body_sha256 TEXT NOT NULL,
+			payload_json BLOB NOT NULL,
+			UNIQUE(node_id, report_id)
+		) STRICT`,
+		`CREATE TABLE IF NOT EXISTS node_latest (
+			node_id     TEXT PRIMARY KEY REFERENCES nodes(node_id),
+			snapshot_id INTEGER NOT NULL REFERENCES snapshots(id),
+			report_id   TEXT NOT NULL,
+			event_id    TEXT NOT NULL,
+			node_class  TEXT NOT NULL CHECK (node_class IN ('linux_vps','windows_terminal')),
+			collected_at INTEGER NOT NULL CHECK (typeof(collected_at) = 'integer'),
+			updated_at  INTEGER NOT NULL CHECK (typeof(updated_at) = 'integer')
+		) STRICT`,
+
+		`CREATE TABLE IF NOT EXISTS report_metrics (
+			node_id     TEXT NOT NULL REFERENCES nodes(node_id),
+			event_id    TEXT NOT NULL,
+			report_id   TEXT NOT NULL,
+			collected_at INTEGER NOT NULL CHECK (typeof(collected_at) = 'integer'),
+			received_at INTEGER NOT NULL CHECK (typeof(received_at) = 'integer'),
+			body_sha256 TEXT NOT NULL,
+			payload_json BLOB NOT NULL,
+			PRIMARY KEY (node_id, report_id)
+		) STRICT`,
+		`CREATE TABLE IF NOT EXISTS report_events (
+			report_row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+			node_id     TEXT NOT NULL REFERENCES nodes(node_id),
+			event_id    TEXT NOT NULL,
+			report_id   TEXT NOT NULL,
+			collected_at INTEGER NOT NULL CHECK (typeof(collected_at) = 'integer'),
+			received_at INTEGER NOT NULL CHECK (typeof(received_at) = 'integer'),
+			event_id_json TEXT NOT NULL,
+			event_at    INTEGER NOT NULL CHECK (typeof(event_at) = 'integer'),
+			kind        TEXT NOT NULL,
+			details_json TEXT NOT NULL,
+			body_sha256 TEXT NOT NULL,
+			payload_json BLOB NOT NULL,
+			UNIQUE(node_id, report_id, event_id_json)
+		) STRICT`,
+		`CREATE INDEX IF NOT EXISTS idx_report_events_node_collected ON report_events(node_id, collected_at)`,
+
+		// Policy-B archive records (active 30d + archive 30d) and retention runs.
+		`CREATE TABLE IF NOT EXISTS archive_records (
+			id          INTEGER PRIMARY KEY AUTOINCREMENT,
+			record_type TEXT NOT NULL CHECK (record_type IN ('snapshot','metrics','events')),
+			node_id     TEXT NOT NULL,
+			event_id    TEXT NOT NULL,
+			report_id   TEXT NOT NULL,
+			collected_at INTEGER NOT NULL CHECK (typeof(collected_at) = 'integer'),
+			archived_at INTEGER NOT NULL CHECK (typeof(archived_at) = 'integer'),
+			payload_json BLOB NOT NULL,
+			UNIQUE(record_type, node_id, report_id)
+		) STRICT`,
+		`CREATE TABLE IF NOT EXISTS retention_runs (
+			id          INTEGER PRIMARY KEY AUTOINCREMENT,
+			ran_at      INTEGER NOT NULL,
+			result_json TEXT NOT NULL
+		) STRICT`,
 	}},
 }
 

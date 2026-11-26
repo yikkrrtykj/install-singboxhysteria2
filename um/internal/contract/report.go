@@ -3,6 +3,8 @@ package contract
 import (
 	"encoding/json"
 	"fmt"
+
+	"github.com/yikkrrtykj/install-singboxhysteria2/um/internal/schema"
 )
 
 // Frozen temporal bounds for report sub-samples, in seconds relative to
@@ -99,6 +101,17 @@ func ValidateReportBody(nodeClass, reportType string, raw []byte) error {
 // ValidateReportBodyWithOptions is ValidateReportBody with explicit center-state
 // options. See ValidateOptions.
 func ValidateReportBodyWithOptions(nodeClass, reportType string, raw []byte, opts ValidateOptions) error {
+	return validateReportBodyWithSchemaSet(nil, nodeClass, reportType, raw, opts)
+}
+
+// ValidateReportBodyWithSchemaSet is the center deployment path: it uses an
+// explicit startup-loaded schema set and never reads schemas relative to the
+// current working directory or source checkout.
+func ValidateReportBodyWithSchemaSet(set *schema.Set, nodeClass, reportType string, raw []byte, opts ValidateOptions) error {
+	return validateReportBodyWithSchemaSet(set, nodeClass, reportType, raw, opts)
+}
+
+func validateReportBodyWithSchemaSet(set *schema.Set, nodeClass, reportType string, raw []byte, opts ValidateOptions) error {
 	// Grammar before schema: duplicate members and trailing data are rejected for
 	// every report type so no two consumers can disagree about the same bytes.
 	if err := validateStrictJSON(raw); err != nil {
@@ -107,6 +120,9 @@ func ValidateReportBodyWithOptions(nodeClass, reportType string, raw []byte, opt
 
 	switch reportType {
 	case ReportTypeSnapshot:
+		if set != nil {
+			return ValidateSnapshotWithSchemaSet(set, nodeClass, raw, opts)
+		}
 		return ValidateSnapshotWithOptions(nodeClass, raw, opts)
 	case ReportTypeMetrics:
 		if err := validateNodeClass(nodeClass); err != nil {
@@ -115,7 +131,11 @@ func ValidateReportBodyWithOptions(nodeClass, reportType string, raw []byte, opt
 		if nodeClass == NodeClassWindowsTerminal {
 			return mismatch("report_type", "windows_terminal report-metrics is deferred in v1")
 		}
-		if err := validateSchema(metricsSchemaFile, raw); err != nil {
+		if set != nil {
+			if err := set.Validate(metricsSchemaFile, raw); err != nil {
+				return err
+			}
+		} else if err := validateSchema(metricsSchemaFile, raw); err != nil {
 			return err
 		}
 		if err := scanReportPrivacy(ReportTypeMetrics, raw); err != nil {
@@ -126,7 +146,11 @@ func ValidateReportBodyWithOptions(nodeClass, reportType string, raw []byte, opt
 		if err := validateNodeClass(nodeClass); err != nil {
 			return err
 		}
-		if err := validateSchema(eventsSchemaFile, raw); err != nil {
+		if set != nil {
+			if err := set.Validate(eventsSchemaFile, raw); err != nil {
+				return err
+			}
+		} else if err := validateSchema(eventsSchemaFile, raw); err != nil {
 			return err
 		}
 		if err := scanReportPrivacy(ReportTypeEvents, raw); err != nil {
