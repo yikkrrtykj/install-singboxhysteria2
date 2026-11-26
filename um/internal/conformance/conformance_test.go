@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/yikkrrtykj/install-singboxhysteria2/um/internal/protocol"
@@ -475,27 +476,32 @@ const (
 	testEventID = "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d"
 )
 
-// TestNegativeVectorB1Subset reads the rev-5 negative-vector cases by ID and
-// executes the pure B1 transport/grammar subset. Behavioural cases owned by
-// B2/B3 are listed as deferred, not PASS.
+// TestNegativeVectorB1Subset reads each B1 behavioural negative case from the
+// normative JSON file and executes it through an explicit, documented
+// fixture-to-test parameter mapping. The fixture has prose "mutation" fields
+// rather than machine-readable setup, so the inputs live in negInputs; the
+// expected http/ack/error/next_seq/audit values are read from the fixture and a
+// fixture edit changes the assertion.
 func TestNegativeVectorB1Subset(t *testing.T) {
+	type negCase struct {
+		ID       string `json:"id"`
+		Endpoint string `json:"endpoint"`
+		Expected struct {
+			HTTP      int     `json:"http"`
+			ACK       string  `json:"ack"`
+			Error     string  `json:"error"`
+			NextSeq   *uint64 `json:"next_seq"`
+			Audit     string  `json:"audit"`
+			HighWater string  `json:"high_water"`
+		} `json:"expected"`
+	}
+	var doc struct {
+		Revision int       `json:"revision"`
+		Cases    []negCase `json:"cases"`
+	}
 	raw, err := os.ReadFile(negPath)
 	if err != nil {
 		t.Fatalf("read negative vectors: %v", err)
-	}
-	var doc struct {
-		Revision int `json:"revision"`
-		Cases    []struct {
-			ID      string `json:"id"`
-			Request struct {
-				Endpoint string `json:"endpoint"`
-				Gen      uint64 `json:"gen"`
-				Seq      uint64 `json:"seq"`
-			} `json:"request"`
-			Expected struct {
-				Error string `json:"error"`
-			} `json:"expected"`
-		} `json:"cases"`
 	}
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		t.Fatalf("parse negative vectors: %v", err)
@@ -503,86 +509,180 @@ func TestNegativeVectorB1Subset(t *testing.T) {
 	if doc.Revision != 5 {
 		t.Fatalf("negative vectors revision=%d, want 5", doc.Revision)
 	}
-	// Re-decode with a concrete map type to keep field access simple.
-	type negativeCase struct {
-		ID      string `json:"id"`
-		Request struct {
-			Endpoint string `json:"endpoint"`
-			Gen      uint64 `json:"gen"`
-			Seq      uint64 `json:"seq"`
-		} `json:"request"`
-		Expected struct {
-			Error string `json:"error"`
-		} `json:"expected"`
+	byID := map[string]negCase{}
+	for _, c := range doc.Cases {
+		byID[c.ID] = c
 	}
-	var typed struct {
-		Cases []negativeCase `json:"cases"`
+
+	b1 := []string{
+		"NEG-BOOT-06", "NEG-BOOT-07", "NEG-BOOT-08", "NEG-BOOT-09", "NEG-BOOT-10",
+		"NEG-ROT-12", "NEG-ROT-13", "NEG-ROT-14", "NEG-ROT-15",
 	}
-	if err := json.Unmarshal(raw, &typed); err != nil {
-		t.Fatalf("parse negative cases: %v", err)
-	}
-	ids := map[string]negativeCase{}
-	for _, c := range typed.Cases {
-		ids[c.ID] = c
-	}
-	for _, id := range []string{"NEG-BOOT-06", "NEG-BOOT-07", "NEG-BOOT-08", "NEG-BOOT-09", "NEG-BOOT-10", "NEG-ROT-12", "NEG-ROT-13", "NEG-ROT-14", "NEG-ROT-15"} {
-		if _, ok := ids[id]; !ok {
+	for _, id := range b1 {
+		if _, ok := byID[id]; !ok {
 			t.Fatalf("missing B1 negative case %s", id)
 		}
 	}
-
-	boot := protocol.Boot{HighestGen: 4, BootID: "b4", LastSeq: 7, LastFingerprint: "f7"}
-	genGap, err := protocol.Evaluate(boot, protocol.Attempt{Gen: 6, BootID: "b6", Seq: 1, Fingerprint: "f"}, protocol.Options{})
-	mustAccepted(t, genGap, err)
-	if genGap.Gap != 2 {
-		t.Fatalf("NEG-BOOT-06 gap=%d", genGap.Gap)
-	}
-	seqTwo, err := protocol.Evaluate(boot, protocol.Attempt{Gen: 5, BootID: "b5", Seq: 2, Fingerprint: "f2"}, protocol.Options{})
-	mustAccepted(t, seqTwo, err)
-	if seqTwo.NextBoot.LastSeq != 2 {
-		t.Fatalf("NEG-BOOT-07 last_seq=%d", seqTwo.NextBoot.LastSeq)
-	}
-	gapBoundary, err := protocol.Evaluate(protocol.Boot{HighestGen: 1, BootID: "b1", LastSeq: 1, LastFingerprint: "f"},
-		protocol.Attempt{Gen: 65536, BootID: "b", Seq: 1, Fingerprint: "f"}, protocol.Options{})
-	mustAccepted(t, gapBoundary, err)
-	if gapBoundary.Gap != wire.MaxBootGap {
-		t.Fatalf("NEG-BOOT-08 gap=%d", gapBoundary.Gap)
-	}
-	if _, err := wire.ParseCanonicalDecimal("X-UM-Seq", "9223372036854775807", 1, wire.MaxNumeric); err == nil {
-		t.Fatal("NEG-BOOT-09 accepted a value above MAX_NUMERIC")
-	}
-	if _, err := wire.ParseCanonicalDecimal("X-UM-Seq", "07", 1, wire.MaxNumeric); err == nil {
-		t.Fatal("NEG-BOOT-09 accepted a non-canonical decimal")
-	}
-	exhaust, err := protocol.Evaluate(protocol.Boot{HighestGen: wire.MaxNumeric - 1, BootID: "b", LastSeq: 1, LastFingerprint: "f"},
-		protocol.Attempt{Gen: wire.MaxNumeric, BootID: "bmax", Seq: wire.MaxNumeric, Fingerprint: "fmax"}, protocol.Options{})
-	mustAccepted(t, exhaust, err)
-	if exhaust.NextSeq != nil {
-		t.Fatal("NEG-BOOT-10 must ACK next_seq=null")
+	// Strict fixture-to-test mapping: exactly these B1 cases have an executable
+	// input; the mapping is checked against the fixture ID set below.
+	if len(b1) != 9 {
+		t.Fatalf("B1 negative mapping size=%d, want 9", len(b1))
 	}
 
-	intent := protocol.RotateIntent{NodeID: testNodeID, Nonce: "n-rot", OldKeyID: "key-old", BodySHA256: "h-rot",
-		State: protocol.RotationAwaitingProof, ExpiresAtUnix: 2000}
-	cur := protocol.Boot{HighestGen: 5, BootID: "b5", LastSeq: 1, LastFingerprint: "f"}
-	verdict, err := protocol.EvaluateRotateRetry(cur, protocol.Attempt{Gen: 8, BootID: "b8", Seq: 3, Fingerprint: "f3"},
-		intent, testNodeID, "n-rot", "key-old", "h-rot", 1000, protocol.Options{})
-	if err != nil || !verdict.ReplayAllowed || verdict.Transport.Outcome != protocol.Accepted {
-		t.Fatalf("NEG-ROT-12: %+v err=%v", verdict, err)
+	for _, id := range b1 {
+		c := byID[id]
+		t.Run(id, func(t *testing.T) {
+			switch id {
+			case "NEG-BOOT-06":
+				r, err := protocol.Evaluate(protocol.Boot{HighestGen: 4, BootID: "b4", LastSeq: 7, LastFingerprint: "f7"},
+					protocol.Attempt{Gen: 6, BootID: "b6", Seq: 1, Fingerprint: "f"}, protocol.Options{})
+				mustNegativeAccepted(t, c, r, err)
+				if r.Gap != 2 {
+					t.Fatalf("gap=%d, want 2", r.Gap)
+				}
+			case "NEG-BOOT-07":
+				r, err := protocol.Evaluate(protocol.Boot{HighestGen: 4, BootID: "b4", LastSeq: 7, LastFingerprint: "f7"},
+					protocol.Attempt{Gen: 5, BootID: "b5", Seq: 2, Fingerprint: "f2"}, protocol.Options{})
+				mustNegativeAccepted(t, c, r, err)
+				if r.NextBoot.LastSeq != 2 {
+					t.Fatalf("last_seq=%d, want 2", r.NextBoot.LastSeq)
+				}
+			case "NEG-BOOT-08":
+				r, err := protocol.Evaluate(protocol.Boot{HighestGen: 1, BootID: "b1", LastSeq: 1, LastFingerprint: "f"},
+					protocol.Attempt{Gen: 65536, BootID: "b", Seq: 1, Fingerprint: "f"}, protocol.Options{})
+				mustNegativeAccepted(t, c, r, err)
+				if r.Gap != wire.MaxBootGap || !r.AuditGap {
+					t.Fatalf("gap=%d audit=%v, want %d true", r.Gap, r.AuditGap, wire.MaxBootGap)
+				}
+				if !strings.Contains(c.Expected.Audit, "gap=65535") {
+					t.Fatalf("fixture audit expectation changed: %q", c.Expected.Audit)
+				}
+			case "NEG-BOOT-09":
+				rejected := 0
+				if _, err := wire.ParseCanonicalDecimal("X-UM-Seq", "9223372036854775807", 1, wire.MaxNumeric); err != nil {
+					rejected++
+				}
+				if _, err := wire.ParseCanonicalDecimal("X-UM-Seq", "07", 1, wire.MaxNumeric); err != nil {
+					rejected++
+				}
+				if rejected != 2 {
+					t.Fatalf("invalid header cases rejected=%d, want both 2", rejected)
+				}
+				if c.Expected.Error != "invalid_header" || c.Expected.HTTP != 400 {
+					t.Fatalf("fixture expected http/error = %d/%q, want 400/invalid_header", c.Expected.HTTP, c.Expected.Error)
+				}
+			case "NEG-BOOT-10":
+				r, err := protocol.Evaluate(protocol.Boot{HighestGen: wire.MaxNumeric - 1, BootID: "b", LastSeq: 1, LastFingerprint: "f"},
+					protocol.Attempt{Gen: wire.MaxNumeric, BootID: "bmax", Seq: wire.MaxNumeric, Fingerprint: "fmax"}, protocol.Options{})
+				mustNegativeAccepted(t, c, r, err)
+				if r.NextSeq != nil {
+					t.Fatalf("next_seq=%d, want null exhaustion", *r.NextSeq)
+				}
+				if c.Expected.NextSeq != nil {
+					t.Fatalf("fixture expected next_seq=%d, want explicit null", *c.Expected.NextSeq)
+				}
+			case "NEG-ROT-12", "NEG-ROT-13", "NEG-ROT-14", "NEG-ROT-15":
+				intent := protocol.RotateIntent{NodeID: testNodeID, Nonce: "n-rot", OldKeyID: "key-old", BodySHA256: "h-rot",
+					State: protocol.RotationAwaitingProof, ExpiresAtUnix: 2000}
+				cur := protocol.Boot{HighestGen: 5, BootID: "b5", LastSeq: 1, LastFingerprint: "f"}
+				var attempt protocol.Attempt
+				switch id {
+				case "NEG-ROT-12":
+					attempt = protocol.Attempt{Gen: 8, BootID: "b8", Seq: 3, Fingerprint: "f3"}
+				case "NEG-ROT-13":
+					cur = protocol.Boot{HighestGen: 9, BootID: "b9", LastSeq: 1, LastFingerprint: "f"}
+					attempt = protocol.Attempt{Gen: 8, BootID: "b8", Seq: 2, Fingerprint: "f2"}
+				case "NEG-ROT-14":
+					attempt = protocol.Attempt{Gen: 5, BootID: "b5", Seq: 1, Fingerprint: "other"}
+				case "NEG-ROT-15":
+					attempt = protocol.Attempt{Gen: 5, BootID: "b5-other", Seq: 2, Fingerprint: "f2"}
+				}
+				verdict, err := protocol.EvaluateRotateRetry(cur, attempt, intent, testNodeID, "n-rot", "key-old", "h-rot", 1000, protocol.Options{})
+				if err != nil {
+					t.Fatalf("EvaluateRotateRetry: %v", err)
+				}
+				if id == "NEG-ROT-12" {
+					if !verdict.ReplayAllowed || verdict.Transport.Outcome != protocol.Accepted || c.Expected.HTTP != 200 {
+						t.Fatalf("fixture=%d/%q verdict=%+v", c.Expected.HTTP, c.Expected.Error, verdict)
+					}
+					return
+				}
+				want, ok := protocolOutcomeFromError(c.Expected.Error)
+				if !ok {
+					t.Fatalf("fixture error %q is not a B1 protocol outcome", c.Expected.Error)
+				}
+				if verdict.ReplayAllowed || verdict.Transport.Outcome != want {
+					t.Fatalf("fixture expected %q, got replay=%v transport=%q", c.Expected.Error, verdict.ReplayAllowed, verdict.Transport.Outcome)
+				}
+			}
+		})
 	}
-	stale, err := protocol.EvaluateRotateRetry(protocol.Boot{HighestGen: 9, BootID: "b9", LastSeq: 1, LastFingerprint: "f"},
-		protocol.Attempt{Gen: 8, BootID: "b8", Seq: 2, Fingerprint: "f2"}, intent, testNodeID, "n-rot", "key-old", "h-rot", 1000, protocol.Options{})
-	if err != nil || stale.ReplayAllowed || stale.Transport.Outcome != protocol.StaleBootGeneration {
-		t.Fatalf("NEG-ROT-13: %+v err=%v", stale, err)
+
+	// Fixture mutation check: the expected fields are authoritative.
+	mutated := byID["NEG-BOOT-07"]
+	mutated.Expected.ACK = "rejected"
+	r, err := protocol.Evaluate(protocol.Boot{HighestGen: 4, BootID: "b4", LastSeq: 7, LastFingerprint: "f7"},
+		protocol.Attempt{Gen: 5, BootID: "b5", Seq: 2, Fingerprint: "f2"}, protocol.Options{})
+	if err != nil {
+		t.Fatalf("evaluate: %v", err)
 	}
-	seqConflict, err := protocol.EvaluateRotateRetry(cur, protocol.Attempt{Gen: 5, BootID: "b5", Seq: 1, Fingerprint: "other"},
-		intent, testNodeID, "n-rot", "key-old", "h-rot", 1000, protocol.Options{})
-	if err != nil || seqConflict.ReplayAllowed || seqConflict.Transport.Outcome != protocol.SequenceConflict {
-		t.Fatalf("NEG-ROT-14: %+v err=%v", seqConflict, err)
+	if negativeAcceptedMatches(mutated, r) == nil {
+		t.Fatal("negative harness ignored mutated fixture expected ack")
 	}
-	bootMismatch, err := protocol.EvaluateRotateRetry(cur, protocol.Attempt{Gen: 5, BootID: "b5-other", Seq: 2, Fingerprint: "f2"},
-		intent, testNodeID, "n-rot", "key-old", "h-rot", 1000, protocol.Options{})
-	if err != nil || bootMismatch.ReplayAllowed || bootMismatch.Transport.Outcome != protocol.BootIdentityConflict {
-		t.Fatalf("NEG-ROT-15: %+v err=%v", bootMismatch, err)
+}
+
+func protocolOutcomeFromError(errorName string) (protocol.Outcome, bool) {
+	switch errorName {
+	case "stale_boot_generation":
+		return protocol.StaleBootGeneration, true
+	case "sequence_conflict":
+		return protocol.SequenceConflict, true
+	case "boot_identity_conflict":
+		return protocol.BootIdentityConflict, true
+	default:
+		return "", false
+	}
+}
+
+func negativeAcceptedMatches(c struct {
+	ID       string `json:"id"`
+	Endpoint string `json:"endpoint"`
+	Expected struct {
+		HTTP      int     `json:"http"`
+		ACK       string  `json:"ack"`
+		Error     string  `json:"error"`
+		NextSeq   *uint64 `json:"next_seq"`
+		Audit     string  `json:"audit"`
+		HighWater string  `json:"high_water"`
+	} `json:"expected"`
+}, r protocol.Result) error {
+	if c.Expected.HTTP != 200 || c.Expected.ACK != "accepted" {
+		return fmt.Errorf("fixture expected http=%d ack=%q", c.Expected.HTTP, c.Expected.ACK)
+	}
+	if r.Outcome != protocol.Accepted {
+		return fmt.Errorf("outcome=%q, want accepted", r.Outcome)
+	}
+	return nil
+}
+
+func mustNegativeAccepted(t *testing.T, c struct {
+	ID       string `json:"id"`
+	Endpoint string `json:"endpoint"`
+	Expected struct {
+		HTTP      int     `json:"http"`
+		ACK       string  `json:"ack"`
+		Error     string  `json:"error"`
+		NextSeq   *uint64 `json:"next_seq"`
+		Audit     string  `json:"audit"`
+		HighWater string  `json:"high_water"`
+	} `json:"expected"`
+}, r protocol.Result, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatalf("unexpected evaluation error: %v", err)
+	}
+	if matchErr := negativeAcceptedMatches(c, r); matchErr != nil {
+		t.Fatalf("%v (fixture id %s)", matchErr, c.ID)
 	}
 }
 

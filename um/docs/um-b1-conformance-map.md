@@ -74,7 +74,11 @@ reason in `TestB1RECCases/REC-29` and listed as B2-deferred below.
 ## Rev-5 behavioural negative cases
 
 B1 executes these pure transport/grammar cases through
-`internal/conformance.TestNegativeVectorB1Subset`:
+`internal/conformance.TestNegativeVectorB1Subset`. The fixture has prose
+`mutation` fields rather than a machine-readable setup, so the inputs are kept in
+an explicit, documented fixture-to-test mapping; the expected HTTP/ACK/error/
+next_seq/audit values are read from the normative JSON and a changed fixture
+expectation makes the test fail (`TestNegativeVectorB1Subset` mutation check).
 
 `NEG-BOOT-06`, `NEG-BOOT-07`, `NEG-BOOT-08`, `NEG-BOOT-09`, `NEG-BOOT-10`,
 `NEG-ROT-12`, `NEG-ROT-13`, `NEG-ROT-14`, `NEG-ROT-15`.
