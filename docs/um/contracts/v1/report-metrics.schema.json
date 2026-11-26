@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://um.invalid/contracts/v1/report-metrics.schema.json",
+  "title": "UM v1 report body: bounded minute metric samples (nullable unknown values)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["v", "type", "report_id", "collected_at", "availability", "samples"],
+  "properties": {
+    "v": {"const": 1},
+    "type": {"const": "metrics"},
+    "report_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "collected_at": {"type": "integer", "minimum": 0, "maximum": 1000000000000},
+    "availability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["system", "services", "protocols", "traffic", "clients"],
+      "properties": {
+        "system": {"enum": ["ok", "partial", "unavailable"]},
+        "services": {"enum": ["ok", "partial", "unavailable"]},
+        "protocols": {"enum": ["ok", "partial", "unavailable"]},
+        "traffic": {"enum": ["ok", "partial", "unavailable"]},
+        "clients": {"enum": ["ok", "partial", "unavailable"]}
+      }
+    },
+    "samples": {
+      "type": "array", "minItems": 1, "maxItems": 5,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["at", "cpu_pct", "load1", "mem_used_bytes", "disk_used_bytes",
+                     "net_rx_bytes_total", "net_tx_bytes_total", "active_connections"],
+        "properties": {
+          "at": {"type": "integer", "minimum": 0, "maximum": 1000000000000},
+          "cpu_pct": {"oneOf": [{"type": "number", "minimum": 0, "exclusiveMaximum": 10000}, {"type": "null"}]},
+          "load1": {"oneOf": [{"type": "number", "minimum": 0, "exclusiveMaximum": 100000}, {"type": "null"}]},
+          "mem_used_bytes": {"oneOf": [{"type": "integer", "minimum": 0, "maximum": 1099511627776}, {"type": "null"}]},
+          "disk_used_bytes": {"oneOf": [{"type": "integer", "minimum": 0, "maximum": 1099511627776}, {"type": "null"}]},
+          "net_rx_bytes_total": {"oneOf": [{"type": "integer", "minimum": 0, "maximum": 9007199254740991}, {"type": "null"}]},
+          "net_tx_bytes_total": {"oneOf": [{"type": "integer", "minimum": 0, "maximum": 9007199254740991}, {"type": "null"}]},
+          "active_connections": {"oneOf": [{"type": "integer", "minimum": 0, "maximum": 1000000}, {"type": "null"}]}
+        }
+      }
+    }
+  }
+}

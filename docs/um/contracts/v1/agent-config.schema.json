@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://um.invalid/contracts/v1/agent-config.schema.json",
+  "title": "UM v1 pulled agent configuration response (source switches are fail-closed; revision 5 adds class-specific terminal configuration)",
+  "description": "The center derives node_class from the authenticated node identity and enrollment token scope. A linux_vps config MUST leave collect.terminal false, use singbox_api/services, and carry >=1 expected_inbound_tags. A windows_terminal config MUST leave collect.services/singbox_api false, carry no expected_inbound_tags, and may enable collect.terminal stage by stage. Local route bindings (group/member -> six route tokens) are operator-local on the Windows host and are NOT sent by the center and NOT uploaded in reports; the center only needs the six-token aggregate and the versioned A/B->VPS-ID mapping. The center never sends VPS IDs, hostnames, URLs, proxy names or credentials to the agent.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "v",
+    "node_id",
+    "event_id",
+    "node_class",
+    "config_version",
+    "cadence_seconds",
+    "collect",
+    "device_salt",
+    "server_time",
+    "expected_inbound_tags"
+  ],
+  "properties": {
+    "v": {
+      "const": 1
+    },
+    "node_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "event_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "node_class": {
+      "enum": ["linux_vps", "windows_terminal"]
+    },
+    "config_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "cadence_seconds": {
+      "type": "integer",
+      "minimum": 30,
+      "maximum": 300
+    },
+    "collect": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "system",
+        "services",
+        "singbox_api",
+        "mihomo_api",
+        "terminal",
+        "events"
+      ],
+      "properties": {
+        "system": {
+          "type": "boolean"
+        },
+        "services": {
+          "type": "boolean"
+        },
+        "singbox_api": {
+          "type": "boolean"
+        },
+        "mihomo_api": {
+          "type": "boolean"
+        },
+        "terminal": {
+          "type": "boolean"
+        },
+        "events": {
+          "type": "boolean"
+        }
+      }
+    },
+    "device_salt": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{43}$"
+    },
+    "server_time": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "expected_inbound_tags": {
+      "type": "array",
+      "minItems": 0,
+      "maxItems": 8,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "inbound_tag",
+          "kind"
+        ],
+        "properties": {
+          "inbound_tag": {
+            "type": "string",
+            "maxLength": 64,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+          },
+          "kind": {
+            "enum": [
+              "reality",
+              "hysteria2",
+              "other"
+            ]
+          }
+        }
+      }
+    }
+  }
+}

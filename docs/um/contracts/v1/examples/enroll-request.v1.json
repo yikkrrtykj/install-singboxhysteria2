@@ -1,0 +1,1 @@
+{"v":1,"node_class":"linux_vps","agent_version":"1.0.0","host":{"os":"linux","kernel":"6.8.0-45-generic","arch":"amd64"},"capabilities":["metrics_v1","events_v1","rotate_v1","config_v1"]}
