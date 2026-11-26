@@ -1,10 +1,8 @@
 {
   "schema": "um-127-recovery-conformance-cases/v1",
-  "status": "PROPOSED",
-  "normative_doc": "docs/um/um-127/03-recovery-semantics.md",
-  "contract_base": "UM-A rev-4 final (PR #126 HEAD 5089cdeb)",
-  "amendment": "UM-127 A-1..A-5 (PENDING; requires UM-A rev-5 amendment and independent review)",
-  "note": "These cases pin the recovery semantics proposed in UM-127 03. UM-B1/B2/B3 must implement them after the amendment is approved. Cases marked rev4_expected_failure=true are expected to fail against the unamended rev-4 rules and are the red-first cases proving the gap.",
+  "status": "NORMATIVE — final rev-5 (UM-A revision 5, PR #126 HEAD 048fc170)",
+  "normative_doc": "PR #126 docs/um/um-a/04-node-protocol-v1.md rev-5 (commit 048fc170685da5b7140bebd9e3347616cb3ec656) + docs/um/um-a/§6.4",
+  "note": "Normative rev-5 recovery conformance cases for UM-B1/B2/B3. Cases marked rev4_expected_failure=true are historical red-first evidence: under rev-5 their expectation is the accepted/defined behavior shown here. Implemented in UM-B1/B2/B3 with automated tests; schema/vector checks must be real, not JSON-parse-only.",
   "slices": {
     "UM-B1": "protocol library + SQLite store + migrations + frozen vector regression",
     "UM-B2": "ingest listener, identity/auth, dedupe/replay transaction, synthetic agent harness",
@@ -18,11 +16,37 @@
       "title": "在线正常重启：generation+1 首次接触 seq=1",
       "rev4_expected_failure": false,
       "setup": {
-        "center": {"highest_gen": 4, "boot_id": "b4", "last_seq": 9},
-        "agent": {"generation": 5, "boot_id": "b5", "next_seq": 1, "spool": ["r-new"]}
+        "center": {
+          "highest_gen": 4,
+          "boot_id": "b4",
+          "last_seq": 9
+        },
+        "agent": {
+          "generation": 5,
+          "boot_id": "b5",
+          "next_seq": 1,
+          "spool": [
+            "r-new"
+          ]
+        }
       },
-      "attempt": {"endpoint": "report", "gen": 5, "boot_id": "b5", "seq": 1, "report_id": "r-new"},
-      "expected": {"http_status": 200, "result": "accepted", "center_state": {"highest_gen": 5, "boot_id": "b5", "last_seq": 1}}
+      "attempt": {
+        "endpoint": "report",
+        "gen": 5,
+        "boot_id": "b5",
+        "seq": 1,
+        "report_id": "r-new"
+      },
+      "expected": {
+        "http_status": 200,
+        "result": "accepted",
+        "center_state": {
+          "highest_gen": 5,
+          "boot_id": "b5",
+          "last_seq": 1
+        }
+      },
+      "rev5_status": "accepted_or_defined_by_rev-5"
     },
     {
       "id": "REC-02",
@@ -30,12 +54,40 @@
       "title": "新 generation 首次请求丢失后以 seq=2 重试",
       "rev4_expected_failure": true,
       "setup": {
-        "center": {"highest_gen": 4, "boot_id": "b4", "last_seq": 7},
-        "agent": {"generation": 5, "boot_id": "b5", "next_seq": 2, "spool": ["r-new"]},
-        "history": ["attempt seq=1 for r-new was sent but never reached the center"]
+        "center": {
+          "highest_gen": 4,
+          "boot_id": "b4",
+          "last_seq": 7
+        },
+        "agent": {
+          "generation": 5,
+          "boot_id": "b5",
+          "next_seq": 2,
+          "spool": [
+            "r-new"
+          ]
+        },
+        "history": [
+          "attempt seq=1 for r-new was sent but never reached the center"
+        ]
       },
-      "attempt": {"endpoint": "report", "gen": 5, "boot_id": "b5", "seq": 2, "report_id": "r-new"},
-      "expected": {"http_status": 200, "result": "accepted", "center_state": {"highest_gen": 5, "boot_id": "b5", "last_seq": 2}}
+      "attempt": {
+        "endpoint": "report",
+        "gen": 5,
+        "boot_id": "b5",
+        "seq": 2,
+        "report_id": "r-new"
+      },
+      "expected": {
+        "http_status": 200,
+        "result": "accepted",
+        "center_state": {
+          "highest_gen": 5,
+          "boot_id": "b5",
+          "last_seq": 2
+        }
+      },
+      "rev5_status": "accepted_or_defined_by_rev-5"
     },
     {
       "id": "REC-03",
@@ -43,11 +95,39 @@
       "title": "首次请求已提交但 ACK 丢失，重试 seq=2 同 report_id",
       "rev4_expected_failure": false,
       "setup": {
-        "center": {"highest_gen": 5, "boot_id": "b5", "last_seq": 1, "report_dedupe": {"r-new": "hash-new"}},
-        "agent": {"generation": 5, "boot_id": "b5", "next_seq": 2, "spool": ["r-new"]}
+        "center": {
+          "highest_gen": 5,
+          "boot_id": "b5",
+          "last_seq": 1,
+          "report_dedupe": {
+            "r-new": "hash-new"
+          }
+        },
+        "agent": {
+          "generation": 5,
+          "boot_id": "b5",
+          "next_seq": 2,
+          "spool": [
+            "r-new"
+          ]
+        }
       },
-      "attempt": {"endpoint": "report", "gen": 5, "boot_id": "b5", "seq": 2, "report_id": "r-new"},
-      "expected": {"http_status": 200, "result": "duplicate", "center_state": {"last_seq": 2}, "agent_action": "drop spool record r-new"}
+      "attempt": {
+        "endpoint": "report",
+        "gen": 5,
+        "boot_id": "b5",
+        "seq": 2,
+        "report_id": "r-new"
+      },
+      "expected": {
+        "http_status": 200,
+        "result": "duplicate",
+        "center_state": {
+          "last_seq": 2
+        },
+        "agent_action": "drop spool record r-new"
+      },
+      "rev5_status": "accepted_or_defined_by_rev-5"
     },
     {
       "id": "REC-04",
@@ -55,11 +135,42 @@
       "title": "ACK 丢失后 Agent 重启，首个报告为重复 report_id",
       "rev4_expected_failure": false,
       "setup": {
-        "center": {"highest_gen": 5, "boot_id": "b5", "last_seq": 3, "report_dedupe": {"r-old": "hash-old"}},
-        "agent": {"generation": 6, "boot_id": "b6", "next_seq": 1, "spool": ["r-old", "r-new"]}
+        "center": {
+          "highest_gen": 5,
+          "boot_id": "b5",
+          "last_seq": 3,
+          "report_dedupe": {
+            "r-old": "hash-old"
+          }
+        },
+        "agent": {
+          "generation": 6,
+          "boot_id": "b6",
+          "next_seq": 1,
+          "spool": [
+            "r-old",
+            "r-new"
+          ]
+        }
       },
-      "attempt": {"endpoint": "report", "gen": 6, "boot_id": "b6", "seq": 1, "report_id": "r-old"},
-      "expected": {"http_status": 200, "result": "duplicate", "center_state": {"highest_gen": 6, "boot_id": "b6", "last_seq": 1}, "note": "duplicate first report of a new generation still commits transport high-water"}
+      "attempt": {
+        "endpoint": "report",
+        "gen": 6,
+        "boot_id": "b6",
+        "seq": 1,
+        "report_id": "r-old"
+      },
+      "expected": {
+        "http_status": 200,
+        "result": "duplicate",
+        "center_state": {
+          "highest_gen": 6,
+          "boot_id": "b6",
+          "last_seq": 1
+        },
+        "note": "duplicate first report of a new generation still commits transport high-water"
+      },
+      "rev5_status": "accepted_or_defined_by_rev-5"
     },
     {
       "id": "REC-05",
@@ -67,11 +178,36 @@
       "title": "连续离线重启 2 次后重连（generation 跳 2）",
       "rev4_expected_failure": true,
       "setup": {
-        "center": {"highest_gen": 4},
-        "agent": {"generation": 6, "boot_id": "b6", "next_seq": 1, "spool": ["r-a"]}
+        "center": {
+          "highest_gen": 4
+        },
+        "agent": {
+          "generation": 6,
+          "boot_id": "b6",
+          "next_seq": 1,
+          "spool": [
+            "r-a"
+          ]
+        }
       },
-      "attempt": {"endpoint": "report", "gen": 6, "boot_id": "b6", "seq": 1, "report_id": "r-a"},
-      "expected": {"http_status": 200, "result": "accepted", "center_state": {"highest_gen": 6, "boot_id": "b6", "last_seq": 1, "boot_generation_gap": 2}}
+      "attempt": {
+        "endpoint": "report",
+        "gen": 6,
+        "boot_id": "b6",
+        "seq": 1,
+        "report_id": "r-a"
+      },
+      "expected": {
+        "http_status": 200,
+        "result": "accepted",
+        "center_state": {
+          "highest_gen": 6,
+          "boot_id": "b6",
+          "last_seq": 1,
+          "boot_generation_gap": 2
+        }
+      },
+      "rev5_status": "accepted_or_defined_by_rev-5"
     },
     {
       "id": "REC-06",
@@ -79,42 +215,160 @@
       "title": "连续离线重启 N 次后 spool 按 oldest-first 回放",
       "rev4_expected_failure": true,
       "setup": {
-        "center": {"highest_gen": 2, "report_dedupe": {"r-1": "h1"}},
-        "agent": {"generation": 6, "boot_id": "b6", "next_seq": 1, "spool": ["r-1", "r-2", "r-3"]}
+        "center": {
+          "highest_gen": 2,
+          "report_dedupe": {
+            "r-1": "h1"
+          }
+        },
+        "agent": {
+          "generation": 6,
+          "boot_id": "b6",
+          "next_seq": 1,
+          "spool": [
+            "r-1",
+            "r-2",
+            "r-3"
+          ]
+        }
       },
       "attempts": [
-        {"gen": 6, "boot_id": "b6", "seq": 1, "report_id": "r-1", "expect": {"result": "duplicate"}},
-        {"gen": 6, "boot_id": "b6", "seq": 2, "report_id": "r-2", "expect": {"result": "accepted"}},
-        {"gen": 6, "boot_id": "b6", "seq": 3, "report_id": "r-3", "expect": {"result": "accepted"}}
+        {
+          "gen": 6,
+          "boot_id": "b6",
+          "seq": 1,
+          "report_id": "r-1",
+          "expect": {
+            "result": "duplicate"
+          }
+        },
+        {
+          "gen": 6,
+          "boot_id": "b6",
+          "seq": 2,
+          "report_id": "r-2",
+          "expect": {
+            "result": "accepted"
+          }
+        },
+        {
+          "gen": 6,
+          "boot_id": "b6",
+          "seq": 3,
+          "report_id": "r-3",
+          "expect": {
+            "result": "accepted"
+          }
+        }
       ],
-      "expected": {"center_state": {"highest_gen": 6, "last_seq": 3}, "note": "first contact may be seq=1 duplicate; high-water committed at seq=1 then advances"}
+      "expected": {
+        "center_state": {
+          "highest_gen": 6,
+          "last_seq": 3
+        },
+        "note": "first contact may be seq=1 duplicate; high-water committed at seq=1 then advances"
+      },
+      "rev5_status": "accepted_or_defined_by_rev-5"
     },
     {
       "id": "REC-07",
       "slice": "UM-B1",
       "title": "generation 跳号超过 MAX_BOOT_GAP",
       "rev4_expected_failure": false,
-      "setup": {"center": {"highest_gen": 1}, "agent": {"generation": 65537, "boot_id": "bx", "next_seq": 1}},
-      "attempt": {"endpoint": "report", "gen": 65537, "boot_id": "bx", "seq": 1},
-      "expected": {"http_status": 409, "error": "boot_identity_conflict", "center_state": {"highest_gen": 1}, "security_event": true}
+      "setup": {
+        "center": {
+          "highest_gen": 1
+        },
+        "agent": {
+          "generation": 65537,
+          "boot_id": "bx",
+          "next_seq": 1
+        }
+      },
+      "attempt": {
+        "endpoint": "report",
+        "gen": 65537,
+        "boot_id": "bx",
+        "seq": 1
+      },
+      "expected": {
+        "http_status": 409,
+        "error": "boot_identity_conflict",
+        "center_state": {
+          "highest_gen": 1
+        },
+        "security_event": true
+      },
+      "rev5_status": "accepted_or_defined_by_rev-5"
     },
     {
       "id": "REC-08",
       "slice": "UM-B1",
       "title": "同 generation、不同 boot_id（重放/旧 boot）",
       "rev4_expected_failure": false,
-      "setup": {"center": {"highest_gen": 5, "boot_id": "b5", "last_seq": 4}, "agent": {"generation": 5, "boot_id": "b5-old", "next_seq": 5}},
-      "attempt": {"endpoint": "report", "gen": 5, "boot_id": "b5-old", "seq": 5},
-      "expected": {"http_status": 409, "error": "boot_identity_conflict", "center_state": {"highest_gen": 5, "boot_id": "b5", "last_seq": 4}}
+      "setup": {
+        "center": {
+          "highest_gen": 5,
+          "boot_id": "b5",
+          "last_seq": 4
+        },
+        "agent": {
+          "generation": 5,
+          "boot_id": "b5-old",
+          "next_seq": 5
+        }
+      },
+      "attempt": {
+        "endpoint": "report",
+        "gen": 5,
+        "boot_id": "b5-old",
+        "seq": 5
+      },
+      "expected": {
+        "http_status": 409,
+        "error": "boot_identity_conflict",
+        "center_state": {
+          "highest_gen": 5,
+          "boot_id": "b5",
+          "last_seq": 4
+        }
+      },
+      "rev5_status": "accepted_or_defined_by_rev-5"
     },
     {
       "id": "REC-09",
       "slice": "UM-B1",
       "title": "已退役 generation 重放（含已知 report_id）",
       "rev4_expected_failure": false,
-      "setup": {"center": {"highest_gen": 9, "boot_id": "b9", "report_dedupe": {"r-old": "h"}}, "agent": {"generation": 8, "boot_id": "b8", "next_seq": 2}},
-      "attempt": {"endpoint": "report", "gen": 8, "boot_id": "b8", "seq": 2, "report_id": "r-old"},
-      "expected": {"http_status": 409, "error": "stale_boot_generation", "center_state": {"highest_gen": 9}}
+      "setup": {
+        "center": {
+          "highest_gen": 9,
+          "boot_id": "b9",
+          "report_dedupe": {
+            "r-old": "h"
+          }
+        },
+        "agent": {
+          "generation": 8,
+          "boot_id": "b8",
+          "next_seq": 2
+        }
+      },
+      "attempt": {
+        "endpoint": "report",
+        "gen": 8,
+        "boot_id": "b8",
+        "seq": 2,
+        "report_id": "r-old"
+      },
+      "expected": {
+        "http_status": 409,
+        "error": "stale_boot_generation",
+        "center_state": {
+          "highest_gen": 9
+        }
+      },
+      "rev5_status": "accepted_or_defined_by_rev-5"
     },
     {
       "id": "REC-10",
@@ -122,89 +376,319 @@
       "title": "跳号首接触后迟到的低 seq attempt",
       "rev4_expected_failure": false,
       "setup": {
-        "center": {"highest_gen": 7, "boot_id": "b7", "last_seq": 2, "seq_dedupe": {}},
-        "agent": {"generation": 7, "boot_id": "b7", "next_seq": 3, "spool": ["r-a"], "note": "attempt seq=1 and seq=2 both lost; seq=3 accepted; seq=1 arrives late"},
-        "history": ["attempt seq=1 delayed in network and arrives after seq=3 committed"]
+        "center": {
+          "highest_gen": 7,
+          "boot_id": "b7",
+          "last_seq": 2,
+          "seq_dedupe": {}
+        },
+        "agent": {
+          "generation": 7,
+          "boot_id": "b7",
+          "next_seq": 3,
+          "spool": [
+            "r-a"
+          ],
+          "note": "attempt seq=1 and seq=2 both lost; seq=3 accepted; seq=1 arrives late"
+        },
+        "history": [
+          "attempt seq=1 delayed in network and arrives after seq=3 committed"
+        ]
       },
-      "attempt": {"endpoint": "report", "gen": 7, "boot_id": "b7", "seq": 1, "report_id": "r-a"},
-      "expected": {"http_status": 409, "error": "sequence_conflict", "center_state": {}, "agent_action": "ignore response for superseded attempt; continue queue; rate-limited diagnostic"}
+      "attempt": {
+        "endpoint": "report",
+        "gen": 7,
+        "boot_id": "b7",
+        "seq": 1,
+        "report_id": "r-a"
+      },
+      "expected": {
+        "http_status": 409,
+        "error": "sequence_conflict",
+        "center_state": {},
+        "agent_action": "ignore response for superseded attempt; continue queue; rate-limited diagnostic"
+      },
+      "rev5_status": "accepted_or_defined_by_rev-5"
     },
     {
       "id": "REC-11",
       "slice": "UM-B1",
       "title": "seq==last_seq 且 fingerprint 相同（同一 attempt 重放）",
       "rev4_expected_failure": false,
-      "setup": {"center": {"highest_gen": 3, "boot_id": "b3", "last_seq": 5, "last_fingerprint": "fp5"}, "agent": {"generation": 3, "boot_id": "b3", "next_seq": 5}},
-      "attempt": {"endpoint": "report", "gen": 3, "boot_id": "b3", "seq": 5, "fingerprint": "fp5"},
-      "expected": {"http_status": 200, "result": "duplicate", "center_state": {"last_seq": 5}}
+      "setup": {
+        "center": {
+          "highest_gen": 3,
+          "boot_id": "b3",
+          "last_seq": 5,
+          "last_fingerprint": "fp5"
+        },
+        "agent": {
+          "generation": 3,
+          "boot_id": "b3",
+          "next_seq": 5
+        }
+      },
+      "attempt": {
+        "endpoint": "report",
+        "gen": 3,
+        "boot_id": "b3",
+        "seq": 5,
+        "fingerprint": "fp5"
+      },
+      "expected": {
+        "http_status": 200,
+        "result": "duplicate",
+        "center_state": {
+          "last_seq": 5
+        }
+      },
+      "rev5_status": "accepted_or_defined_by_rev-5"
     },
     {
       "id": "REC-12",
       "slice": "UM-B1",
       "title": "seq==last_seq 且 fingerprint 不同",
       "rev4_expected_failure": false,
-      "setup": {"center": {"highest_gen": 3, "boot_id": "b3", "last_seq": 5, "last_fingerprint": "fp5"}, "agent": {"generation": 3, "boot_id": "b3", "next_seq": 5}},
-      "attempt": {"endpoint": "report", "gen": 3, "boot_id": "b3", "seq": 5, "fingerprint": "fp-other"},
-      "expected": {"http_status": 409, "error": "sequence_conflict", "center_state": {"last_seq": 5}}
+      "setup": {
+        "center": {
+          "highest_gen": 3,
+          "boot_id": "b3",
+          "last_seq": 5,
+          "last_fingerprint": "fp5"
+        },
+        "agent": {
+          "generation": 3,
+          "boot_id": "b3",
+          "next_seq": 5
+        }
+      },
+      "attempt": {
+        "endpoint": "report",
+        "gen": 3,
+        "boot_id": "b3",
+        "seq": 5,
+        "fingerprint": "fp-other"
+      },
+      "expected": {
+        "http_status": 409,
+        "error": "sequence_conflict",
+        "center_state": {
+          "last_seq": 5
+        }
+      },
+      "rev5_status": "accepted_or_defined_by_rev-5"
     },
     {
       "id": "REC-13",
       "slice": "UM-B2",
       "title": "多次 ACK 丢失后采纳 ACK next_seq",
       "rev4_expected_failure": false,
-      "setup": {"center": {"highest_gen": 2, "boot_id": "b2", "last_seq": 7}, "agent": {"generation": 2, "boot_id": "b2", "next_seq": 9}},
-      "attempt": {"endpoint": "report", "gen": 2, "boot_id": "b2", "seq": 9, "note": "agent already advanced past seq 7,8 locally after lost ACKs"},
-      "expected": {"http_status": 200, "result": "accepted", "center_state": {"last_seq": 9}, "agent_action": "persist next_seq=max(local, ack.next_seq)"}
+      "setup": {
+        "center": {
+          "highest_gen": 2,
+          "boot_id": "b2",
+          "last_seq": 7
+        },
+        "agent": {
+          "generation": 2,
+          "boot_id": "b2",
+          "next_seq": 9
+        }
+      },
+      "attempt": {
+        "endpoint": "report",
+        "gen": 2,
+        "boot_id": "b2",
+        "seq": 9,
+        "note": "agent already advanced past seq 7,8 locally after lost ACKs"
+      },
+      "expected": {
+        "http_status": 200,
+        "result": "accepted",
+        "center_state": {
+          "last_seq": 9
+        },
+        "agent_action": "persist next_seq=max(local, ack.next_seq)"
+      },
+      "rev5_status": "accepted_or_defined_by_rev-5"
     },
     {
       "id": "REC-14",
       "slice": "UM-B1",
       "title": "center 重启后重试：持久去重与 high-water 存活",
       "rev4_expected_failure": false,
-      "setup": {"center_restart": true, "center": {"highest_gen": 4, "boot_id": "b4", "last_seq": 6, "report_dedupe": {"r-x": "hx"}}, "agent": {"generation": 4, "boot_id": "b4", "next_seq": 7}},
-      "attempt": {"endpoint": "report", "gen": 4, "boot_id": "b4", "seq": 7, "report_id": "r-x"},
-      "expected": {"http_status": 200, "result": "duplicate", "note": "no reordering/duplicate data apply after center restart"}
+      "setup": {
+        "center_restart": true,
+        "center": {
+          "highest_gen": 4,
+          "boot_id": "b4",
+          "last_seq": 6,
+          "report_dedupe": {
+            "r-x": "hx"
+          }
+        },
+        "agent": {
+          "generation": 4,
+          "boot_id": "b4",
+          "next_seq": 7
+        }
+      },
+      "attempt": {
+        "endpoint": "report",
+        "gen": 4,
+        "boot_id": "b4",
+        "seq": 7,
+        "report_id": "r-x"
+      },
+      "expected": {
+        "http_status": 200,
+        "result": "duplicate",
+        "note": "no reordering/duplicate data apply after center restart"
+      },
+      "rev5_status": "accepted_or_defined_by_rev-5"
     },
     {
       "id": "REC-15",
       "slice": "UM-B2",
       "title": "首个请求 503 storage_unavailable 后重试",
       "rev4_expected_failure": false,
-      "setup": {"center": {"highest_gen": 2}, "agent": {"generation": 3, "boot_id": "b3", "next_seq": 1}},
+      "setup": {
+        "center": {
+          "highest_gen": 2
+        },
+        "agent": {
+          "generation": 3,
+          "boot_id": "b3",
+          "next_seq": 1
+        }
+      },
       "attempts": [
-        {"gen": 3, "boot_id": "b3", "seq": 1, "expect": {"http_status": 503, "error": "storage_unavailable"}},
-        {"gen": 3, "boot_id": "b3", "seq": 2, "expect": {"http_status": 200, "result": "accepted"}}
+        {
+          "gen": 3,
+          "boot_id": "b3",
+          "seq": 1,
+          "expect": {
+            "http_status": 503,
+            "error": "storage_unavailable"
+          }
+        },
+        {
+          "gen": 3,
+          "boot_id": "b3",
+          "seq": 2,
+          "expect": {
+            "http_status": 200,
+            "result": "accepted"
+          }
+        }
       ],
-      "expected": {"center_state": {"highest_gen": 3, "last_seq": 2}, "note": "aborted transaction must not advance high-water"}
+      "expected": {
+        "center_state": {
+          "highest_gen": 3,
+          "last_seq": 2
+        },
+        "note": "aborted transaction must not advance high-water"
+      },
+      "rev5_status": "accepted_or_defined_by_rev-5"
     },
     {
       "id": "REC-16",
       "slice": "UM-B2",
       "title": "首个请求为不可重试 payload 错误时隔离记录并继续",
       "rev4_expected_failure": false,
-      "setup": {"center": {"highest_gen": 2}, "agent": {"generation": 3, "boot_id": "b3", "next_seq": 1, "spool": ["r-bad", "r-good"]}},
+      "setup": {
+        "center": {
+          "highest_gen": 2
+        },
+        "agent": {
+          "generation": 3,
+          "boot_id": "b3",
+          "next_seq": 1,
+          "spool": [
+            "r-bad",
+            "r-good"
+          ]
+        }
+      },
       "attempts": [
-        {"gen": 3, "boot_id": "b3", "seq": 1, "report_id": "r-bad", "expect": {"http_status": 400, "error": "invalid_request"}},
-        {"gen": 3, "boot_id": "b3", "seq": 2, "report_id": "r-good", "expect": {"http_status": 200, "result": "accepted"}}
+        {
+          "gen": 3,
+          "boot_id": "b3",
+          "seq": 1,
+          "report_id": "r-bad",
+          "expect": {
+            "http_status": 400,
+            "error": "invalid_request"
+          }
+        },
+        {
+          "gen": 3,
+          "boot_id": "b3",
+          "seq": 2,
+          "report_id": "r-good",
+          "expect": {
+            "http_status": 200,
+            "result": "accepted"
+          }
+        }
       ],
-      "expected": {"center_state": {"highest_gen": 3, "last_seq": 2}, "agent_action": "quarantine r-bad (bounded), continue with r-good; no high-water from 400"}
+      "expected": {
+        "center_state": {
+          "highest_gen": 3,
+          "last_seq": 2
+        },
+        "agent_action": "quarantine r-bad (bounded), continue with r-good; no high-water from 400"
+      },
+      "rev5_status": "accepted_or_defined_by_rev-5"
     },
     {
       "id": "REC-17",
       "slice": "UM-B3",
       "title": "Agent boot_state 缺失/损坏",
       "rev4_expected_failure": false,
-      "setup": {"agent": {"boot_state": "missing", "spool": ["r-a", "r-b"]}},
-      "expected": {"agent_action": "do not send; fail-closed local boot_state_corrupt; retain spool; require operator revoke + re-enroll", "center_requests": 0}
+      "setup": {
+        "agent": {
+          "boot_state": "missing",
+          "spool": [
+            "r-a",
+            "r-b"
+          ]
+        }
+      },
+      "expected": {
+        "agent_action": "do not send; fail-closed local boot_state_corrupt; retain spool; require operator revoke + re-enroll",
+        "center_requests": 0
+      },
+      "rev5_status": "accepted_or_defined_by_rev-5"
     },
     {
       "id": "REC-18",
       "slice": "UM-B3",
       "title": "Agent 从旧快照恢复（generation 低于 center）",
       "rev4_expected_failure": false,
-      "setup": {"center": {"highest_gen": 12, "boot_id": "b12"}, "agent": {"generation": 9, "boot_id": "b9", "next_seq": 1}},
-      "attempt": {"endpoint": "report", "gen": 9, "boot_id": "b9", "seq": 1},
-      "expected": {"http_status": 409, "error": "stale_boot_generation", "agent_action": "stop reporting; operator recovery; no in-place reset"}
+      "setup": {
+        "center": {
+          "highest_gen": 12,
+          "boot_id": "b12"
+        },
+        "agent": {
+          "generation": 9,
+          "boot_id": "b9",
+          "next_seq": 1
+        }
+      },
+      "attempt": {
+        "endpoint": "report",
+        "gen": 9,
+        "boot_id": "b9",
+        "seq": 1
+      },
+      "expected": {
+        "http_status": 409,
+        "error": "stale_boot_generation",
+        "agent_action": "stop reporting; operator recovery; no in-place reset"
+      },
+      "rev5_status": "accepted_or_defined_by_rev-5"
     },
     {
       "id": "REC-19",
@@ -212,11 +696,45 @@
       "title": "rotation intent 跨 2 次离线重启后重试",
       "rev4_expected_failure": true,
       "setup": {
-        "center": {"highest_gen": 5, "rotation": {"nonce": "n-rot", "old_key_id": "key-old", "body_sha256": "h-rot", "state": "awaiting_proof", "response": "rotate-response-1"}},
-        "agent": {"generation": 8, "boot_id": "b8", "next_seq": 3, "rotation_intent": {"nonce": "n-rot", "body_sha256": "h-rot", "state": "pending"}}
+        "center": {
+          "highest_gen": 5,
+          "rotation": {
+            "nonce": "n-rot",
+            "old_key_id": "key-old",
+            "body_sha256": "h-rot",
+            "state": "awaiting_proof",
+            "response": "rotate-response-1"
+          }
+        },
+        "agent": {
+          "generation": 8,
+          "boot_id": "b8",
+          "next_seq": 3,
+          "rotation_intent": {
+            "nonce": "n-rot",
+            "body_sha256": "h-rot",
+            "state": "pending"
+          }
+        }
       },
-      "attempt": {"endpoint": "rotate", "gen": 8, "boot_id": "b8", "seq": 3, "note": "same nonce/body; refreshed sent_at/seq/boot_gen"},
-      "expected": {"http_status": 200, "body": "identical rotate-response-1", "center_state": {"highest_gen": 8, "boot_id": "b8", "last_seq": 3}, "agent_action": "persist new key id; send proof report with new key"}
+      "attempt": {
+        "endpoint": "rotate",
+        "gen": 8,
+        "boot_id": "b8",
+        "seq": 3,
+        "note": "same nonce/body; refreshed sent_at/seq/boot_gen"
+      },
+      "expected": {
+        "http_status": 200,
+        "body": "identical rotate-response-1",
+        "center_state": {
+          "highest_gen": 8,
+          "boot_id": "b8",
+          "last_seq": 3
+        },
+        "agent_action": "persist new key id; send proof report with new key"
+      },
+      "rev5_status": "accepted_or_defined_by_rev-5"
     },
     {
       "id": "REC-20",
@@ -224,95 +742,351 @@
       "title": "rotation intent 过期后跨重启重试",
       "rev4_expected_failure": false,
       "setup": {
-        "center": {"highest_gen": 5, "rotation": {"nonce": "n-rot", "state": "aborted", "expires_at": "past"}},
-        "agent": {"generation": 8, "boot_id": "b8", "next_seq": 2, "rotation_intent": {"nonce": "n-rot", "state": "pending"}}
+        "center": {
+          "highest_gen": 5,
+          "rotation": {
+            "nonce": "n-rot",
+            "state": "aborted",
+            "expires_at": "past"
+          }
+        },
+        "agent": {
+          "generation": 8,
+          "boot_id": "b8",
+          "next_seq": 2,
+          "rotation_intent": {
+            "nonce": "n-rot",
+            "state": "pending"
+          }
+        }
       },
-      "attempt": {"endpoint": "rotate", "gen": 8, "boot_id": "b8", "seq": 2},
-      "expected": {"http_status": 409, "error": "rotation_expired", "center_state": {}, "agent_action": "delete provisional key; resume old-key reporting; old key stays active"}
+      "attempt": {
+        "endpoint": "rotate",
+        "gen": 8,
+        "boot_id": "b8",
+        "seq": 2
+      },
+      "expected": {
+        "http_status": 409,
+        "error": "rotation_expired",
+        "center_state": {},
+        "agent_action": "delete provisional key; resume old-key reporting; old key stays active"
+      },
+      "rev5_status": "accepted_or_defined_by_rev-5"
     },
     {
       "id": "REC-21",
       "slice": "UM-B2",
       "title": "撤销期间 spool 积压",
       "rev4_expected_failure": false,
-      "setup": {"center": {"node_state": "revoked"}, "agent": {"generation": 4, "boot_id": "b4", "next_seq": 1, "spool": ["r-a", "r-b"]}},
-      "attempt": {"endpoint": "report", "gen": 4, "boot_id": "b4", "seq": 1, "report_id": "r-a"},
-      "expected": {"http_status": 401, "error": "revoked_key", "agent_action": "stop sending; retain bounded spool; operator recovery; no auto re-enroll"}
+      "setup": {
+        "center": {
+          "node_state": "revoked"
+        },
+        "agent": {
+          "generation": 4,
+          "boot_id": "b4",
+          "next_seq": 1,
+          "spool": [
+            "r-a",
+            "r-b"
+          ]
+        }
+      },
+      "attempt": {
+        "endpoint": "report",
+        "gen": 4,
+        "boot_id": "b4",
+        "seq": 1,
+        "report_id": "r-a"
+      },
+      "expected": {
+        "http_status": 401,
+        "error": "revoked_key",
+        "agent_action": "stop sending; retain bounded spool; operator recovery; no auto re-enroll"
+      },
+      "rev5_status": "accepted_or_defined_by_rev-5"
     },
     {
       "id": "REC-22",
       "slice": "UM-B2",
       "title": "首个接触为 config 拉取（body 固定 {}）",
       "rev4_expected_failure": true,
-      "setup": {"center": {"highest_gen": 2}, "agent": {"generation": 5, "boot_id": "b5", "next_seq": 2}},
-      "attempt": {"endpoint": "config", "gen": 5, "boot_id": "b5", "seq": 2, "body": "{}"},
-      "expected": {"http_status": 200, "body": "agent-config", "center_state": {"highest_gen": 5, "last_seq": 2}, "note": "same first-contact rules as report"}
+      "setup": {
+        "center": {
+          "highest_gen": 2
+        },
+        "agent": {
+          "generation": 5,
+          "boot_id": "b5",
+          "next_seq": 2
+        }
+      },
+      "attempt": {
+        "endpoint": "config",
+        "gen": 5,
+        "boot_id": "b5",
+        "seq": 2,
+        "body": "{}"
+      },
+      "expected": {
+        "http_status": 200,
+        "body": "agent-config",
+        "center_state": {
+          "highest_gen": 5,
+          "last_seq": 2
+        },
+        "note": "same first-contact rules as report"
+      },
+      "rev5_status": "accepted_or_defined_by_rev-5"
     },
     {
       "id": "REC-23",
       "slice": "UM-B2",
       "title": "首个接触为 rotate（无既有 intent）",
       "rev4_expected_failure": true,
-      "setup": {"center": {"highest_gen": 2}, "agent": {"generation": 6, "boot_id": "b6", "next_seq": 2}},
-      "attempt": {"endpoint": "rotate", "gen": 6, "boot_id": "b6", "seq": 2, "rotation_nonce": "n-new"},
-      "expected": {"http_status": 200, "body": "rotate-response", "center_state": {"highest_gen": 6, "last_seq": 2, "rotation": "awaiting_proof"}, "agent_action": "persist new key id; proof report with new key"}
+      "setup": {
+        "center": {
+          "highest_gen": 2
+        },
+        "agent": {
+          "generation": 6,
+          "boot_id": "b6",
+          "next_seq": 2
+        }
+      },
+      "attempt": {
+        "endpoint": "rotate",
+        "gen": 6,
+        "boot_id": "b6",
+        "seq": 2,
+        "rotation_nonce": "n-new"
+      },
+      "expected": {
+        "http_status": 200,
+        "body": "rotate-response",
+        "center_state": {
+          "highest_gen": 6,
+          "last_seq": 2,
+          "rotation": "awaiting_proof"
+        },
+        "agent_action": "persist new key id; proof report with new key"
+      },
+      "rev5_status": "accepted_or_defined_by_rev-5"
     },
     {
       "id": "REC-24",
       "slice": "UM-B2",
       "title": "注册响应丢失后的 token 复用",
       "rev4_expected_failure": false,
-      "setup": {"center": {"enrollment": {"token": "used", "orphan_node": "created"}}, "agent": {"state": "new key generated"}},
-      "attempt": {"endpoint": "enroll", "token": "t-1"},
-      "expected": {"http_status": 401, "error": "token_used", "agent_action": "operator revokes orphan (audited) and issues a new token; agent generates a new key and enrolls as a new node_id; no automatic retry with the same token"}
+      "setup": {
+        "center": {
+          "enrollment": {
+            "token": "used",
+            "orphan_node": "created"
+          }
+        },
+        "agent": {
+          "state": "new key generated"
+        }
+      },
+      "attempt": {
+        "endpoint": "enroll",
+        "token": "t-1"
+      },
+      "expected": {
+        "http_status": 401,
+        "error": "token_used",
+        "agent_action": "operator revokes orphan (audited) and issues a new token; agent generates a new key and enrolls as a new node_id; no automatic retry with the same token"
+      },
+      "rev5_status": "accepted_or_defined_by_rev-5"
     },
     {
       "id": "REC-25",
       "slice": "UM-B1",
       "title": "MAX_BOOT_GAP 边界：正好 65535 接受",
       "rev4_expected_failure": false,
-      "setup": {"center": {"highest_gen": 1}, "agent": {"generation": 65536, "boot_id": "b-edge", "next_seq": 1}},
-      "attempt": {"endpoint": "report", "gen": 65536, "boot_id": "b-edge", "seq": 1},
-      "expected": {"http_status": 200, "result": "accepted", "center_state": {"highest_gen": 65536}, "audit": "boot_generation_gap with gap=65535"}
+      "setup": {
+        "center": {
+          "highest_gen": 1
+        },
+        "agent": {
+          "generation": 65536,
+          "boot_id": "b-edge",
+          "next_seq": 1
+        }
+      },
+      "attempt": {
+        "endpoint": "report",
+        "gen": 65536,
+        "boot_id": "b-edge",
+        "seq": 1
+      },
+      "expected": {
+        "http_status": 200,
+        "result": "accepted",
+        "center_state": {
+          "highest_gen": 65536
+        },
+        "audit": "boot_generation_gap with gap=65535"
+      },
+      "rev5_status": "accepted_or_defined_by_rev-5"
     },
     {
       "id": "REC-26",
       "slice": "UM-B1",
-      "title": "generation/seq uint64 极值与溢出",
+      "title": "数值上界 MAX_NUMERIC 与 ACK next_seq 耗尽",
       "rev4_expected_failure": false,
-      "setup": {"center": {"highest_gen": 18446744073709551614}, "agent": {"generation": 18446744073709551615, "next_seq": 18446744073709551615}},
-      "attempt": {"endpoint": "report", "gen": 18446744073709551615, "seq": 18446744073709551615},
-      "expected": {"http_status": 200, "result": "accepted", "center_state": {"highest_gen": 18446744073709551615}, "note": "next_seq must not overflow; ACK next_seq omitted or clamped with explicit semantics"}
+      "setup": {
+        "center": {
+          "highest_gen": 9223372036854775805,
+          "boot_id": "b-prev",
+          "last_seq": 1
+        },
+        "agent": {
+          "generation": 9223372036854775806,
+          "boot_id": "b-max",
+          "next_seq": 9223372036854775806
+        }
+      },
+      "attempt": {
+        "endpoint": "report",
+        "gen": 9223372036854775806,
+        "boot_id": "b-max",
+        "seq": 9223372036854775806
+      },
+      "expected": {
+        "http_status": 200,
+        "result": "accepted",
+        "center_state": {
+          "highest_gen": 9223372036854775806,
+          "boot_id": "b-max",
+          "last_seq": 9223372036854775806
+        },
+        "ack": {
+          "next_seq": null
+        },
+        "note": "MAX_NUMERIC=2^63-2 accepted; ACK next_seq=null means generation exhausted; agent must start a new generation on a clean restart or enter operator recovery; no seq reuse/wrap"
+      },
+      "rev5_status": "accepted_or_defined_by_rev-5"
     },
     {
       "id": "REC-27",
       "slice": "UM-B3",
       "title": "Agent 掉电后 seq 持久化边界",
       "rev4_expected_failure": false,
-      "setup": {"center": {"highest_gen": 3, "boot_id": "b3", "last_seq": 4, "last_fingerprint": "fp4"}, "agent": {"generation": 3, "boot_id": "b3", "next_seq_persisted": 4, "next_seq_volatile": 6}},
-      "attempt": {"endpoint": "report", "gen": 3, "boot_id": "b3", "seq": 4, "fingerprint": "fp4"},
-      "expected": {"http_status": 200, "result": "duplicate", "agent_action": "resume from persisted seq; unsynced tail may be lost; spool_retention diagnostic; no data loss of fsynced records"}
+      "setup": {
+        "center": {
+          "highest_gen": 3,
+          "boot_id": "b3",
+          "last_seq": 4,
+          "last_fingerprint": "fp4"
+        },
+        "agent": {
+          "generation": 3,
+          "boot_id": "b3",
+          "next_seq_persisted": 4,
+          "next_seq_volatile": 6
+        }
+      },
+      "attempt": {
+        "endpoint": "report",
+        "gen": 3,
+        "boot_id": "b3",
+        "seq": 4,
+        "fingerprint": "fp4"
+      },
+      "expected": {
+        "http_status": 200,
+        "result": "duplicate",
+        "agent_action": "resume from persisted seq; unsynced tail may be lost; spool_retention diagnostic; no data loss of fsynced records"
+      },
+      "rev5_status": "accepted_or_defined_by_rev-5"
     },
     {
       "id": "REC-28",
       "slice": "UM-B1",
       "title": "center 掉电：已提交与未提交边界",
       "rev4_expected_failure": false,
-      "setup": {"center_restart": true, "center": {"highest_gen": 2, "boot_id": "b2", "last_seq": 5, "report_dedupe": {"r-x": "hx"}}, "agent": {"generation": 2, "boot_id": "b2", "next_seq": 6}},
+      "setup": {
+        "center_restart": true,
+        "center": {
+          "highest_gen": 2,
+          "boot_id": "b2",
+          "last_seq": 5,
+          "report_dedupe": {
+            "r-x": "hx"
+          }
+        },
+        "agent": {
+          "generation": 2,
+          "boot_id": "b2",
+          "next_seq": 6
+        }
+      },
       "attempts": [
-        {"gen": 2, "boot_id": "b2", "seq": 6, "report_id": "r-x", "expect": {"result": "duplicate"}},
-        {"gen": 2, "boot_id": "b2", "seq": 7, "report_id": "r-y", "expect": {"result": "accepted"}}
+        {
+          "gen": 2,
+          "boot_id": "b2",
+          "seq": 6,
+          "report_id": "r-x",
+          "expect": {
+            "result": "duplicate"
+          }
+        },
+        {
+          "gen": 2,
+          "boot_id": "b2",
+          "seq": 7,
+          "report_id": "r-y",
+          "expect": {
+            "result": "accepted"
+          }
+        }
       ],
-      "expected": {"center_state": {"last_seq": 7}, "note": "synchronous=FULL: committed survive; uncommitted are retried once"}
+      "expected": {
+        "center_state": {
+          "last_seq": 7
+        },
+        "note": "synchronous=FULL: committed survive; uncommitted are retried once"
+      },
+      "rev5_status": "accepted_or_defined_by_rev-5"
     },
     {
       "id": "REC-29",
       "slice": "UM-B1",
       "title": "旧快照晚于新快照到达",
       "rev4_expected_failure": false,
-      "setup": {"center": {"node_latest": {"collected_at": 200}}, "agent": {"generation": 4, "boot_id": "b4", "next_seq": 9}},
-      "attempt": {"endpoint": "report", "type": "snapshot", "gen": 4, "boot_id": "b4", "seq": 9, "report_id": "r-old-snap", "collected_at": 100},
-      "expected": {"http_status": 200, "result": "stale_ignored", "center_state": {"node_latest.collected_at": 200}, "agent_action": "drop spool record"}
+      "setup": {
+        "center": {
+          "node_latest": {
+            "collected_at": 200
+          }
+        },
+        "agent": {
+          "generation": 4,
+          "boot_id": "b4",
+          "next_seq": 9
+        }
+      },
+      "attempt": {
+        "endpoint": "report",
+        "type": "snapshot",
+        "gen": 4,
+        "boot_id": "b4",
+        "seq": 9,
+        "report_id": "r-old-snap",
+        "collected_at": 100
+      },
+      "expected": {
+        "http_status": 200,
+        "result": "stale_ignored",
+        "center_state": {
+          "node_latest.collected_at": 200
+        },
+        "agent_action": "drop spool record"
+      },
+      "rev5_status": "accepted_or_defined_by_rev-5"
     },
     {
       "id": "REC-30",
@@ -320,16 +1094,83 @@
       "title": "两个 generation 的 spool 交错回放",
       "rev4_expected_failure": false,
       "setup": {
-        "center": {"highest_gen": 1, "report_dedupe": {"r-1": "h1"}},
-        "agent": {"generation": 2, "boot_id": "b2", "next_seq": 1, "spool": ["r-1", "r-2", "r-3", "r-4"]}
+        "center": {
+          "highest_gen": 1,
+          "report_dedupe": {
+            "r-1": "h1"
+          }
+        },
+        "agent": {
+          "generation": 2,
+          "boot_id": "b2",
+          "next_seq": 1,
+          "spool": [
+            "r-1",
+            "r-2",
+            "r-3",
+            "r-4"
+          ]
+        }
       },
       "attempts": [
-        {"gen": 2, "boot_id": "b2", "seq": 1, "report_id": "r-1", "expect": {"result": "duplicate"}},
-        {"gen": 2, "boot_id": "b2", "seq": 2, "report_id": "r-2", "expect": {"result": "accepted"}},
-        {"gen": 2, "boot_id": "b2", "seq": 3, "report_id": "r-3", "expect": {"result": "accepted"}},
-        {"gen": 2, "boot_id": "b2", "seq": 4, "report_id": "r-4", "expect": {"result": "accepted"}}
+        {
+          "gen": 2,
+          "boot_id": "b2",
+          "seq": 1,
+          "report_id": "r-1",
+          "expect": {
+            "result": "duplicate"
+          }
+        },
+        {
+          "gen": 2,
+          "boot_id": "b2",
+          "seq": 2,
+          "report_id": "r-2",
+          "expect": {
+            "result": "accepted"
+          }
+        },
+        {
+          "gen": 2,
+          "boot_id": "b2",
+          "seq": 3,
+          "report_id": "r-3",
+          "expect": {
+            "result": "accepted"
+          }
+        },
+        {
+          "gen": 2,
+          "boot_id": "b2",
+          "seq": 4,
+          "report_id": "r-4",
+          "expect": {
+            "result": "accepted"
+          }
+        }
       ],
-      "expected": {"center_state": {"highest_gen": 2, "last_seq": 4}, "note": "payload identity (report_id/collected_at) is generation-independent; transport re-authenticated under current boot"}
+      "expected": {
+        "center_state": {
+          "highest_gen": 2,
+          "last_seq": 4
+        },
+        "note": "payload identity (report_id/collected_at) is generation-independent; transport re-authenticated under current boot"
+      },
+      "rev5_status": "accepted_or_defined_by_rev-5"
     }
-  ]
+  ],
+  "contract_revision": 5,
+  "contract_commit": "048fc170685da5b7140bebd9e3347616cb3ec656",
+  "contract_tree": "1b726de92d57dfc9cf61c10b8f7d8a063bc97875",
+  "integration": "Folded into PR #126 rev-5 on 2026-11-26 by owner direction; no separate PR-A2 exists. Any change now requires a new UM-A amendment.",
+  "max_numeric": 9223372036854775806,
+  "contract_anchors": {
+    "agent_restart_ack": "UM-A 04 §5 (seq semantics) + §6.3",
+    "generation_gap": "UM-A 04 §5 (boot generation) + §6.4 REC-05..09",
+    "recovery_matrix": "UM-A 04 §6.3/§6.4",
+    "rotation_retry": "UM-A 04 §7 full-validation rule",
+    "numeric_sqlite": "UM-A 04 §13",
+    "windows_terminal": "UM-A 04 §9.2 (six tokens; separate from these transport cases)"
+  }
 }
