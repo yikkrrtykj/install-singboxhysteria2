@@ -1,0 +1,123 @@
+﻿name: Unified Monitor Go
+
+on:
+  push:
+    paths:
+      - 'um/**'
+      - 'docs/um/contracts/v1/**'
+      - 'docs/um/um-127/conformance/**'
+      - '.github/workflows/um-go.yml'
+  pull_request:
+    paths:
+      - 'um/**'
+      - 'docs/um/contracts/v1/**'
+      - 'docs/um/um-127/conformance/**'
+      - '.github/workflows/um-go.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: native (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      GOTOOLCHAIN: local
+      GOPROXY: 'https://proxy.golang.org,direct'
+      GOSUMDB: 'sum.golang.org'
+    defaults:
+      run:
+        working-directory: um
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.4'
+          cache: true
+          cache-dependency-path: um/go.sum
+      - run: go version
+      - run: go mod verify
+      - run: go vet ./...
+      - run: go test -count=1 ./...
+      - run: go build -trimpath ./...
+
+  race:
+    name: linux-race
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GOTOOLCHAIN: local
+      GOPROXY: 'https://proxy.golang.org,direct'
+      GOSUMDB: 'sum.golang.org'
+    defaults:
+      run:
+        working-directory: um
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.4'
+          cache: true
+          cache-dependency-path: um/go.sum
+      - run: go test -race -count=1 ./...
+
+  coverage:
+    name: coverage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GOTOOLCHAIN: local
+      GOPROXY: 'https://proxy.golang.org,direct'
+      GOSUMDB: 'sum.golang.org'
+    defaults:
+      run:
+        working-directory: um
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.4'
+          cache: true
+          cache-dependency-path: um/go.sum
+      - run: go test -count=1 -coverprofile=coverage.out ./...
+      - run: go tool cover -func=coverage.out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: um-coverage
+          path: um/coverage.out
+          if-no-files-found: error
+
+  vulncheck:
+    name: govulncheck
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GOTOOLCHAIN: local
+      GOPROXY: 'https://proxy.golang.org,direct'
+      GOSUMDB: 'sum.golang.org'
+    defaults:
+      run:
+        working-directory: um
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.4'
+          cache: true
+          cache-dependency-path: um/go.sum
+      - run: go install golang.org/x/vuln/cmd/govulncheck@v1.10.0
+      - run: $(go env GOPATH)/bin/govulncheck ./...
+        shell: bash
