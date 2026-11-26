@@ -188,8 +188,8 @@ Agent 侧行为不变：每次启动仍 `generation + 1`、新 `boot_id`、`seq`
 | REC-23 | 首次接触是 rotate | 见 A-5 | 200 rotate-response | high-water 提交 |
 | REC-24 | 注册响应丢失 | 收到 `401 token_used` | — | 运营方吊销 orphan + 新 token；新 key 重注册 |
 | REC-25 | `MAX_BOOT_GAP` 边界（正好 65535） | — | 200 accepted | 审计 gap |
-| REC-26 | generation/seq uint64 极值/溢出 | — | 409 invalid/conflict | 无状态变化 |
-| REC-27 | Agent 掉电后 seq 未持久化 | — | 允许 seq 回退到已提交 last+1 或报 sequence_conflict | 记录诊断 |
+| REC-26 | generation/seq uint64 极值/溢出 | — | 200 accepted；ACK `next_seq` 溢出必须明确定义（省略/钳制，不得回绕） | 无状态丢失 |
+| REC-27 | Agent 掉电后 seq 持久化边界 | 从已持久化 seq 继续；未 fsync 的 seq 不得复用 | 重发已提交 seq → duplicate；未提交 → accepted | 记录诊断，不丢已 fsync 记录 |
 | REC-28 | center 掉电后 Agent 重试 | — | 已提交 → duplicate；未提交 → accepted | 无重复应用 |
 | REC-29 | 旧快照 report 晚于新快照到达 | — | 200 stale_ignored | 不覆盖 latest |
 | REC-30 | 两 generation 的 spool 交错回放 | oldest-first | duplicate/accepted | report_id 去重，无乱序覆盖 |

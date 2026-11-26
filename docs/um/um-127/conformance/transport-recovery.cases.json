@@ -68,10 +68,10 @@
       "rev4_expected_failure": true,
       "setup": {
         "center": {"highest_gen": 4},
-        "agent": {"generation": 7, "boot_id": "b7", "next_seq": 1, "spool": ["r-a"]}
+        "agent": {"generation": 6, "boot_id": "b6", "next_seq": 1, "spool": ["r-a"]}
       },
-      "attempt": {"endpoint": "report", "gen": 7, "boot_id": "b7", "seq": 1, "report_id": "r-a"},
-      "expected": {"http_status": 200, "result": "accepted", "center_state": {"highest_gen": 7, "boot_id": "b7", "last_seq": 1, "boot_generation_gap": 3}}
+      "attempt": {"endpoint": "report", "gen": 6, "boot_id": "b6", "seq": 1, "report_id": "r-a"},
+      "expected": {"http_status": 200, "result": "accepted", "center_state": {"highest_gen": 6, "boot_id": "b6", "last_seq": 1, "boot_generation_gap": 2}}
     },
     {
       "id": "REC-06",
@@ -289,7 +289,7 @@
       "slice": "UM-B3",
       "title": "Agent 掉电后 seq 持久化边界",
       "rev4_expected_failure": false,
-      "setup": {"center": {"highest_gen": 3, "boot_id": "b3", "last_seq": 4}, "agent": {"generation": 3, "boot_id": "b3", "next_seq_persisted": 4, "next_seq_volatile": 6}},
+      "setup": {"center": {"highest_gen": 3, "boot_id": "b3", "last_seq": 4, "last_fingerprint": "fp4"}, "agent": {"generation": 3, "boot_id": "b3", "next_seq_persisted": 4, "next_seq_volatile": 6}},
       "attempt": {"endpoint": "report", "gen": 3, "boot_id": "b3", "seq": 4, "fingerprint": "fp4"},
       "expected": {"http_status": 200, "result": "duplicate", "agent_action": "resume from persisted seq; unsynced tail may be lost; spool_retention diagnostic; no data loss of fsynced records"}
     },
