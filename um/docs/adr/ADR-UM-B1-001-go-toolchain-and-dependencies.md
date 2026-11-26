@@ -1,4 +1,4 @@
-# ADR-UM-B1-001 — Go toolchain and dependency policy for UM-B1
+﻿# ADR-UM-B1-001 — Go toolchain and dependency policy for UM-B1
 
 - Status: **Accepted for the UM-B1 Draft PR** (implementation-stage ADR); does
   not authorize deployment or production use.
@@ -9,8 +9,8 @@
 
 ### Toolchain
 
-- Minimum/locked language version: `go 1.23.0` in `um/go.mod`.
-- CI pins Go `1.23.x` with `actions/setup-go@v5` and uses
+- Minimum/locked language version: `go 1.24.0` in `um/go.mod`.
+- CI pins Go `1.24.x` with `actions/setup-go@v5` and uses
   `GOTOOLCHAIN=local` so the CI cannot silently download another toolchain.
 - Local development may use a newer Go (the repository workspace currently has
   Go 1.27.x) but must keep the module go directive and CI-pinned version
