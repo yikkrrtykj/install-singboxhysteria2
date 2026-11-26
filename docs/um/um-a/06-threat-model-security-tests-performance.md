@@ -1,9 +1,13 @@
-# UM-A 06 — Threat model, security test plan and performance budget (revision 3 final)
+# UM-A 06 — Threat model, security test plan and performance budget (revision 5)
 
-Status: design freeze for UM-A review. Revision after PR #126 review (P1-02,
-P1-03, P1-04, P1-06). No implementation exists; this defines what UM-B..UM-E must
-prove. The CI harness flake of run 45688706441 is an existing Windows-acceptance
-test-infrastructure issue outside UM-A and is not fixed here (review contract §4).
+Status: final targeted amendment for UM-A rev-5. Revision 5 adds `node_class`/
+platform isolation, Windows terminal six-token telemetry/privacy, versioned
+route-mapping history and the R2/R1 Windows data-source decision to the threat
+model and security test plan. No implementation exists; this defines what
+UM-B..UM-E must prove. The known Windows acceptance-harness flake (CI
+`QueryFullProcessImageNameW winerror=5`) is an existing test-infrastructure issue
+outside this contract and is not fixed here; it is handled separately and was not
+hidden by any test change.
 
 ## 1. Method and honesty note
 
@@ -15,25 +19,27 @@ acceptance targets for SEC-18/19/20 below are written for that architecture; no
 
 ## 2. Assets and actors
 
-Assets: node authenticity (Ed25519 keys, bootstrap tokens, event binding), admin
-identity (password/TOTP/recovery/session, Cloudflare Access gateway), monitoring
-data (event/node inventory, protocol/traffic/client summaries, fault history,
-audit), platform integrity (center binary/config, SQLite DB/backups, master key,
-tunnel token), business availability (sing-box/Mihomo/HA must never be affected),
-existing systems' contracts/verdicts.
+Assets: node authenticity (Ed25519 keys, bootstrap tokens, event binding),
+admin identity (password/TOTP/recovery/session, Cloudflare Access gateway),
+monitoring data (event/node inventory, protocol/traffic/client summaries,
+terminal route/connection aggregates, fault history, audit, versioned route
+mappings), platform integrity (center binary/config, SQLite DB/backups, master
+key, tunnel token), business availability (sing-box/Mihomo/HA must never be
+affected), existing systems' contracts/verdicts.
 
 Actors: internet scanner/opportunist; holder of a stolen node key; compromised
 event VPS; malicious agent; malicious/compromised event_admin/viewer; stolen
 browser session; compromised Cloudflare edge/account/tunnel token; center-host
 compromise; backup thief; operator error; flood/resource exhaustion; a hostile
-agent sending replayed/historical/forged reports.
+agent sending replayed/historical/forged reports; a compromised Windows terminal
+or write-capable Mihomo controller credential.
 
 ## 3. STRIDE summary (revised boundaries)
 
 | Boundary | Spoofing | Tampering | Repudiation | Disclosure | DoS | Elevation |
 | --- | --- | --- | --- | --- | --- | --- |
 | B1/B2 CF→web | invalid/`alg:none`/wrong-aud JWT; header-only login | request smuggling; header duplication | missing auth-failure audit | verbose errors/caching | CF/Access outage; bot flood | header/JWT treated as login; session not bound to CF subject |
-| B3 node→ingest (tunnel option A or direct TLS option B) | forged/stolen key; replayed historical request; enrollment token replay | body substitution; encoding mismatch; endpoint swap; duplicate headers | accept without audit/dedupe | payload privacy; error oracle | flood; gzip/body bombs; slowloris | revoked/pending key accepted; cross-event report; boot replay |
+| B3 node→ingest (tunnel option A or direct TLS option B) | forged/stolen key; replayed historical request; enrollment token replay; node_class/payload spoofing | body substitution; encoding mismatch; endpoint swap; duplicate headers; terminal count/mapping forgery | accept without audit/dedupe | payload privacy (proxy names/targets/route maps); error oracle | flood; gzip/body bombs; slowloris | revoked/pending key accepted; cross-event report; boot replay; cross-class payload accepted |
 | B4 process→DB | local file access | SQL injection; unsafe migration; restore of stale DB | missing audit | plaintext secrets at rest | DB lock/size exhaustion | DB file writable by another uid |
 | B5 backup/ledger | wrong version; forged ledger | backup/ledger tampering | restore without audit | plaintext off-host theft | backup fills disk | restore revives revoked nodes/purged data |
 | B6 browser↔admin | session hijack; XSS | CSRF; cookie flags | missing mutation audit | UI leaks | login flood/lockout DoS | scope bypass/IDOR across events |
@@ -84,11 +90,16 @@ agent sending replayed/historical/forged reports.
 | 38 | Rotation/enrollment response loss causes duplicate identity or lost rotation | persisted rotate intent, idempotent retry/transition table, pending_activation handling | SEC-36 |
 | 39 | Enrollment response loss leaves an unreachable-but-active orphan identity | node is active on commit; admin identifies/revokes orphan; no activation inference from unobservable response | SEC-37 |
 | 40 | Rotation grace timer revokes the old key while the agent only has the old key (or bypasses a revoked key) | old key revoked only after new-key proof; expiry aborts only the provisional new key; unprovable state stops reporting for operator recovery; no auto-bypass | SEC-38 |
-| 41 | Read-only claim rests on client method allowlist while the credential is server-side write-capable | source switches default false; server-side authorization audit required before enable; unproven source disabled with `unavailable`/`source_authorization_unproven`; Mihomo disabled in v1 | SEC-39 |
+| 41 | Read-only claim rests on client method allowlist while the credential is server-side write-capable | source switches default false; server-side authorization audit required before enable; unproven source disabled with `unavailable`/`source_authorization_unproven`; Windows terminal source is class-specific, R2 truly-read-only source preferred, R1 only after separate owner risk acceptance | SEC-39, SEC-47 |
 | 42 | Restore/ledger incompleteness revives revoked nodes or purged data | security ledger fsynced before commit; latest-version chain/checkpoint; incomplete ledger ⇒ quarantine, no auto ingest | SEC-34 (extended) |
 | 43 | Runtime semantics (service name/inbound tag/timestamps/availability) pass schema but are forged/misleading | runtime closed allowlists, tag/kind match against center config, temporal bounds, availability coherence, sentinel scan; reject/quarantine, never render | SEC-39 |
-| 44 | Boot generation reset/reuse to bypass the center high-water | persisted signed monotonic generation; lower generation `stale_boot_generation`; same-generation different boot_id `boot_identity_conflict`; local boot-state loss fail-closed + operator recovery | SEC-40 |
-| 45 | Rotation retry/freshness confusion, lost new-key proof ACK, aborted vs confirmed vs admin-revoked states | rotate nonce intent with refreshed transport freshness; idempotent replay; 2xx new-key proof marks confirmed; `rotation_expired`/`revoked_key` fallback; unprovable state → operator recovery | SEC-38/41 |
+| 44 | Boot generation reset/reuse to bypass the center high-water | persisted signed monotonic generation; lower generation `stale_boot_generation`; same-generation different boot_id `boot_identity_conflict`; bounded forward gaps accepted with audit; local boot-state loss fail-closed + operator recovery; numeric bound/ACK exhaustion defined | SEC-40, SEC-46 |
+| 45 | Rotation retry/freshness confusion, lost new-key proof ACK, aborted vs confirmed vs admin-revoked states | rotate nonce intent with refreshed transport freshness; **full boot/seq/nonce/identity validation on every retry, no high-water bypass**; idempotent replay after validation; 2xx new-key proof marks confirmed; `rotation_expired`/`revoked_key` fallback; unprovable state → operator recovery | SEC-38/41 |
+| 46 | Cross-class payload/kind spoofing or node_class self-assertion | signed enrollment with immutable `node_class`; bootstrap-token scope binds event+class; OS consistency check; per-class payload/event-kind/source allowlist; `platform_mismatch` before storage | SEC-42 |
+| 47 | Windows terminal privacy leak (proxy names, private YAML, controller secret, destination IP, connection id) | closed six-token schema, no free-form fields, local route bindings never uploaded, privacy sentinel scan; reject/audit without logging value | SEC-43 |
+| 48 | Route-mapping version change rewrites historical attribution | append-only versioned mapping with `effective_from`; reports carry tokens only; historical queries resolve the version effective at sample time; no update/delete of prior versions; audited admin API | SEC-44 |
+| 49 | Windows terminal count/sampling forgery (sum mismatch, ok-with-null, unbounded skew, unmapped→DIRECT) | runtime sum/availability/temporal checks; agent emits `direct` only with an explicit operator-local binding and otherwise `unknown`; center validates the six-token form/coherence, never local names; invalid → `invalid_request`/`platform_mismatch` before storage | SEC-45 |
+| 50 | Windows controller credential silently enables write-capable source | R2-first authorization design; R1 residual risk needs separate owner acceptance and is never auto-enabled; default false; unavailable + `source_authorization_unproven`; documented capability truth (controller secret is write-capable) | SEC-39, SEC-47 |
 
 ## 5. Security invariants (never regress)
 
@@ -121,6 +132,18 @@ agent sending replayed/historical/forged reports.
 12. Every administrative mutation, auth failure, revoke/retire, purge and restore
     is audited (closed action/result, no secret content); a restore cannot
     silently re-enable ingest before ledger reconciliation.
+13. `node_class` is bound by the admin token scope and immutable; class
+    isolation is enforced before storage (`platform_mismatch`), and no report can
+    mix Linux server fields and Windows terminal fields.
+14. Windows terminal telemetry uses exactly six bounded tokens; no local proxy
+    names/private YAML/credentials/targets/connection ids leave the host, and
+    unmapped/ambiguous paths are `unknown`, never `direct`.
+15. Route mappings are append-only and versioned with `effective_from`;
+    historical attribution is never rewritten by a new mapping, and reports carry
+    no VPS IDs.
+16. Protocol numeric fields are canonical and bounded to `[1, MAX_NUMERIC]`,
+    parsed/range-checked before signed-int conversion, stored as SQLite INTEGER,
+    and ACK `next_seq` exhaustion is explicit (`null`) rather than wrapping.
 
 ## 6. Security test plan by phase
 
@@ -129,12 +152,16 @@ SEC-21, SEC-23, SEC-24, SEC-25, SEC-27, SEC-28, SEC-29 (protocol half), SEC-30,
 SEC-31, SEC-32 (agent), SEC-33, SEC-36, SEC-37 (enrollment orphan lifecycle),
 SEC-38 (rotation state machine incl. response loss/restart/expiry/revocation),
 SEC-39 (source authorization gating + runtime semantic validation), SEC-40 (boot
-generation lifecycle), SEC-41 (rotation retry/freshness/ACK-loss state
-distinctions), SEC-34 (ledger half); contract conformance: both positive signed
-vectors verify,
-tampered/wrong-key/cross-endpoint negatives fail, schema negative examples are
-rejected, duplicate-header/encoding/config-body/size/boot/nonce/seq-retry cases,
-rotation recovery cases and source-disabled data honesty behave.
+generation lifecycle incl. bounded gaps/first-contact seq>1/numeric exhaustion),
+SEC-41 (rotation retry/freshness/ACK-loss state distinctions + no high-water
+bypass), SEC-34 (ledger half), **SEC-42..SEC-47 (rev-5 platform isolation,
+Windows privacy, mapping history, six-token/sampling integrity, R2/R1 source
+gate)**; contract conformance: all positive signed vectors verify (report,
+Windows terminal, enrollment, rotate, config), tampered/wrong-key/cross-endpoint
+and boot-gen-tamper negatives fail, schema negative examples are rejected,
+duplicate-header/encoding/config-body/size/boot/nonce/seq-retry cases, all
+REC-01..REC-30 recovery cases, platform/isolation negatives and source-disabled
+data honesty behave.
 
 **UM-C**: SEC-01..SEC-10, SEC-15 (web), SEC-18 (web half, honest same-process
 targets), SEC-26, SEC-35; CSP/cookie/header tests, session rebinding, Access
@@ -142,17 +169,19 @@ misconfig, login DoS, audit completeness.
 
 **UM-D**: SEC-10 endpoint matrix, XSS/encoding, pagination/authz bounds, retention
 visibility, data-honesty tests (UNKNOWN/STALE, nullable metrics, closed details),
-alias handling.
+Windows route/connection aggregation + protocol drill-down, mapping-version
+historical attribution display, alias handling.
 
 **UM-E**: SEC-20, SEC-22 route-inventory, SEC-25 no-touch, SEC-29 both transport
 options where applicable, SEC-31/32 agent install/runtime proof, SEC-34
 restore/ledger drill (incomplete-ledger quarantine), SEC-37/38 recovery
-transitions, SEC-39 source authorization evidence, backup theft/restore, disk
-pressure + quota enforcement, center restart, Cloudflare outage vs direct-TLS
-ingress failure matrix, center-offline business-independence,
-1 h disconnection + agent restart + center restart + lost ACK + revocation +
-historical boot replay (doc 04 §6.3), install/upgrade/rollback/uninstall,
-load/soak, independent review.
+transitions, SEC-39 source authorization evidence, **SEC-42..SEC-47 rev-5
+platform/Windows/mapping/numeric evidence**, backup theft/restore, disk pressure
++ quota enforcement, center restart, Cloudflare outage vs direct-TLS ingress
+failure matrix, center-offline business-independence, 1 h disconnection + agent
+restart + center restart + lost ACK + revocation + historical boot replay (doc 04
+§6.3), Windows real-build read-only/HA assertions (no config/selection/connection
+change), install/upgrade/rollback/uninstall, load/soak, independent review.
 
 ## 7. Performance budget (UM-E acceptance gates)
 
@@ -209,9 +238,20 @@ Targets are gates: a miss is reported, not averaged away.
    frozen; UM-E must prove it).
 7. Human error (wrong purge/role grant) reduced by type-to-confirm/audit, not
    eliminated.
-8. Existing Windows acceptance-harness flake (PR #126 CI attempt 1) is a test
+8. Existing Windows acceptance-harness flake (PR #126/#128 CI attempt 1) is a test
    infrastructure risk for a separate owner-authorized hotfix; it is not part of
    the UM design and no test/workflow was modified here.
+9. Windows terminal: if R2 cannot prove a truly read-only source, R1 (a
+   write-capable Mihomo controller credential used by a GET-only client) requires
+   a separate later owner risk acceptance; until then the source stays
+   unavailable. The center never claims that credential is read-only.
+10. Versioned route mappings are center-owned; an incorrect admin mapping change
+    is confined to future attribution and audited; historical attribution cannot
+    be rewritten by design, but UM-E must test the query/display path.
+11. Windows agent runs on a user desktop where local users/processes can tamper
+    with the agent or the controller credential; mitigations are unprivileged
+    runtime, DPAPI/private ACL, no exec and loopback-only transport; physical/local
+    admin compromise is out of scope.
 
 ## 9. Out of scope / deferred
 

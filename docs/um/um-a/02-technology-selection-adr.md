@@ -25,37 +25,54 @@ Consequences: UM-B adds a Go module, pinned dependency list and a CI lane. The
 center binary must build reproducibly (`-trimpath`, pinned Go version) and ship
 with a source/build receipt. The Python `monitor-v2` is **not migrated**.
 
-## ADR-UM-002 — Linux node agent: **Go, static, unprivileged, read-only**
+## ADR-UM-002 — Node agents: **Go, static, unprivileged, read-only** (`linux_vps` + `windows_terminal`)
 
-Decision: one statically linked Go binary (`um-agent`) for Linux (amd64 + arm64),
-systemd service, dedicated non-login user, no listening socket, no root/sudo, no
-`sbox-cm` socket access. It reads only the reviewed local read-only surfaces
-(sing-box `service.api` on loopback, optional Mihomo controller loopback GET,
-`/proc`, read-only systemd D-Bus unit properties) and writes only its own private
-state/spool directory.
+Decision: one Go codebase with class-specific builds/services for the two
+`node_class` values. Both classes are unprivileged, read-only observers; neither
+has a listening socket, root/admin capability, `sbox-cm` socket access or a
+remote command channel. They write only their own private state/spool directory.
 
-Provisioning is a **one-time root orchestration, never a resident root agent**:
-the reviewed installer runs `um-agent enroll --token-stdin` as `umagent` via
-`runuser`, feeding the root-only token over a pipe; the agent generates its own
-key and owns its state directory; the root installer deletes the token afterwards.
-Existing Monitor/sing-box/`sbox-cm` file permissions are never loosened; the
-sing-box API credential is delivered by systemd `LoadCredential=` (the agent
-process never runs as root and never executes a shell).
+- `linux_vps`: one statically linked binary (`um-agent`) for Linux (amd64 + arm64),
+  systemd service, dedicated non-login user. It reads only the reviewed local
+  read-only surfaces (sing-box `service.api` on loopback, `/proc`, read-only
+  systemd D-Bus unit properties).
+- `windows_terminal`: a Windows service/process for a dedicated user; it reads
+  only a local loopback Mihomo/Clash Verge Rev data source and emits the six
+  route tokens plus aggregate selection/connection samples. It never edits
+  Mihomo/Clash Verge Rev configuration, switches nodes, closes connections or
+  changes HA-UI/P6/#67 behavior. The R2 truly-read-only source is preferred; R1
+  (a write-capable controller credential used by a GET-only client) requires a
+  separate later owner risk acceptance and is never auto-enabled.
 
-The agent is **no-exec by construction**: `SystemCallFilter` denies
+Provisioning is a **one-time orchestration, never a resident privileged agent**:
+the reviewed Linux installer runs `um-agent enroll --token-stdin` as `umagent`
+via `runuser`, feeding the root-only token over a pipe; the agent generates its
+own key and owns its state directory; the installer deletes the token afterwards.
+The Windows installer/service runs the collector unprivileged and stores only its
+own protected state/credential material. The admin-issued bootstrap token carries
+`{event_id, node_class}`; the agent cannot choose event or class. Existing
+Monitor/sing-box/`sbox-cm` file permissions are never loosened; Linux sing-box API
+credentials are delivered by systemd `LoadCredential=`, and the Windows source
+credential (if R1 is ever accepted) uses DPAPI/private ACL only.
+
+The Linux agent is **no-exec by construction**: `SystemCallFilter` denies
 `execve`/`execveat` (plus `NoExecPaths=/` where supported). It therefore does not
 call `systemctl`; unit state comes from restricted read-only D-Bus property reads
 (`ActiveState`), and is `unknown` when unavailable. The sing-box client implements
 only the audited read-only started-service subscription methods; there is no
 generic RPC surface and no config-mutation call. UM-B must record the audited
-sing-box version, method allowlist and a negative test.
+sing-box version, method allowlist and a negative test. The Windows client is
+likewise restricted to fixed loopback GET paths and closed token mapping; a
+static/runtime test must prove no write method/path exists in the binary.
 
 Alternatives rejected: running the existing Python collector on every VPS
 (duplicates runtime/venv, needs per-VPS Python management); root-side journal
 reader (privilege and #33 ownership; forbidden in doc 01 §7); a central SSH
 polling model (requires centralized credentials — explicitly out of bounds);
 running a resident collector/agent as root or executing `systemctl` from a
-non-root agent (violates least privilege/no-exec).
+non-root agent (violates least privilege/no-exec); reusing a write-capable Mihomo
+controller as an automatically enabled source or claiming the GET client
+allowlist proves read-only authorization.
 
 ## ADR-UM-003 — Frontend: **Vue 3 + TypeScript + Vite + uPlot, embedded static assets**
 

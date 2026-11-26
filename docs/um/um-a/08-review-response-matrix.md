@@ -86,3 +86,49 @@ Final validation: schemas/examples/negative examples revalidated; both signed
 vectors verify (report vector now includes `X-UM-Boot-Gen`); boot-generation tamper
 negative fails verification; 45 behavioural/recovery cases with all error codes in
 the frozen enum; cross-document consistency and link/secret checks pass.
+
+# Revision 5 targeted amendment (owner Round-2)
+
+Input: owner Round-2 review (2026-11-26) of the #128 planning package. Owner
+conclusions recorded: #128 implementation plan PASS; recovery design A-1..A-5
+**ACCEPTED DIRECTION**; dual-platform architecture PASS; Go migration roadmap
+PASS; final contract **TARGETED UPDATE REQUIRED**; CI PASS with recorded rerun;
+merge/deployment require separate owner authorization. This section records our
+response; it is not an independent review and does not approve the pending owner
+decisions or authorize a merge.
+
+| ID | Owner direction | Resolution in revision 5 | Files |
+| --- | --- | --- | --- |
+| **R5-A** Recovery A-1..A-5 | Integrate bounded generation forward jumps and first-contact `seq>1`; keep stale generation/identity conflict/revocation/unsafe recovery fail-closed; ACK `next_seq` reconciliation; superseded-attempt handling; no special rotation retry path around high-water | `04` §5, §6 (rules + 13 state-transition tests), §6.4 REC-01..REC-30 mapping; `03` §10; `test-vectors.v1.json` rev-5; `negative-vectors.v1.json` NEG-BOOT-06..10, NEG-ROT-12..15, NEG-REPORT history | `04`; `03`; `contracts/v1` |
+| **R5-B** Numeric/storage | Bounded generation jump; uint64 boundary; ACK `next_seq` exhaustion; SQLite storage semantics | `MAX_NUMERIC=2^63−2`, canonical decimals, `MAX_BOOT_GAP=65535`; ACK `next_seq` nullable on exhaustion; all protocol numbers stored as SQLite signed INTEGER with CHECK constraints; no TEXT/BLOB/REAL/wrap | `04` §2, §5, §13; `ack.schema.json`; `negative-vectors.v1.json` NEG-BOOT-09/10 |
+| **R5-C** Rotation retry | Must execute full boot/seq/nonce/identity validation; no retry path bypassing high-water | Explicit 6-step validation order; intent match only replaces identical-fingerprint matching; replay + high-water in one transaction; stale/seq failure returns error without replay | `04` §7; `negative-vectors.v1.json` NEG-ROT-12..15 |
+| **R5-D** Node classes/platform isolation | Add Linux/Windows `node_class`; center registration binds event+class; platform isolation rules | Enrollment body `node_class`, token scope `{event_id,node_class}`, OS consistency, immutable class; per-class payload/kind/source allowlists with `platform_mismatch`; `enroll-response` includes class | `04` §4, §9.1; `enroll-request`/`enroll-response` schemas; `agent-config`; `negative-vectors.v1.json` NEG-PLAT-* |
+| **R5-E** Windows telemetry | Six route tokens aligned with windowsobs; independent selection/connection sampling; unmapped never DIRECT; center-managed versioned A/B mapping without rewriting history; no proxy names/profile upload; R2 first, R1 later owner acceptance only | Six-token `terminal` object/events; independent `sampled_at`; six-token by_route sum; direct only with explicit operator-local binding; append-only `route_mapping_versions` with `effective_from`; privacy negatives; `terminal_v1`; R2/R1 policy; read-only/no-HA rules | `04` §9.2, §11; `report-snapshot`/`report-events`/`agent-config` schemas; `terminal-snapshot` + negative examples; `06` SEC-42..47; `05` retention |
+| **R5-F** History/vector traceability | Update conflicting old behavioural vectors; retain history | Rev-4 report vector retained valid; rev-4 enrollment retained as `historical_rev4_enroll_vector`; `superseded_rev4_expectations` in negative vectors; revision history in `test-vectors.v1.json`; no deletion of old expectations | `test-vectors.v1.json`; `negative-vectors.v1.json`; `contracts/v1/README.md` |
+| **R5-G** #128 plan closure | No independent PR-A2; keep #128, sync its baseline after #126 stabilizes; keep REC cases/register/roadmap/reuse/migration gates | #128 branch receives a docs-only sync to rev-5 (no PR-A2); gates now #126 independent review → owner merge auth → normal Merge Commit → main CI → #128 review/merge gate → latest main CI → owner-authorized Go branch sync (preserve 3 commits, no rebase/force, docs/um must match main) → UM-B1 | #128 `docs/um/um-127/**` (separate PR) |
+
+Validation performed for revision 5 (docs-only; owner-independent checks):
+
+- All 10 JSON schemas parse and are valid JSON Schema 2020-12.
+- 10 positive example bodies validate (including `terminal-snapshot.v1.json`); 7
+  schema-negative examples are rejected; 2 runtime-only negatives are schema-valid
+  as intended (`report-snapshot-tampered`, `terminal-by-route-sum-mismatch`).
+- Targeted rules: node_class/host consistency, missing/extra class rejected,
+  six-token completeness, extra-field/raw-proxy-name rejection, reason_code
+  requirement, ACK `next_seq` null/max/over-max, platform-isolation schema shape.
+- Signed vectors: report (retained rev-4), Windows terminal, enrollment (rev-5),
+  rotate, config verify Ed25519; body lengths/hashes match; historical rev-4
+  enrollment signature verifies. Crypto negatives (tampered Linux/Windows body,
+  wrong key, cross-endpoint reuse, boot-gen tamper, rotate-body tamper) all fail
+  as required.
+- Behavioural contract: 67 unique cases, all error codes in the closed enum,
+  `superseded_rev4_expectations` retained, REC-01..REC-30 mapped in `04` §6.4.
+- Doc checks: no normative `seq == 1`/generation-skip/`uint64`/`Mihomo disabled
+  in v1` contradictions remain; no `node_seq` in normative docs; relative links
+  resolve; no private keys/tokens found.
+- CI: existing suites are regression-only (no job reads `docs/um`); the known
+  Windows harness flake is recorded separately and was not hidden by any test
+  change. Full PR CI is reported in the PR body.
+
+**No independent review or owner approval is claimed here.** Owner decisions
+remain PENDING; merge and deployment require separate owner authorization.

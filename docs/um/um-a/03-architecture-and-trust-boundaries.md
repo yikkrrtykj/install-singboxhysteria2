@@ -192,6 +192,12 @@ widen a role. Every event-scoped query includes the resolved event set in SQL
   reports carrying a different event are rejected (`identity_mismatch`); agents
   cannot request an event change. Moving a VPS between events requires retire +
   new enrollment (new node id).
+- `node_class` (`linux_vps`/`windows_terminal`) is bound at enrollment by the
+  admin-issued token scope, verified against the signed enrollment body and
+  `host.os`, and immutable thereafter. The center rejects class-incompatible
+  payloads/kinds/sources (`platform_mismatch`) before storage; cross-class data
+  never silently degrades. A class change = admin revoke + re-enroll (new node
+  id).
 - device salts are per event; `device_ref` values are not correlatable across
   events by design (center stores the event salt encrypted for re-provisioning,
   see doc 04).
@@ -203,21 +209,24 @@ widen a role. Every event-scoped query includes the resolved event set in SQL
 | Table | Purpose | Scoping | Retention class |
 | --- | --- | --- | --- |
 | `events` | competition/event catalog, state active/archived, purge_after | root | until purge/30 d after archive |
-| `nodes` | node identity, event binding, state, last seen, config version | event | with event; retired row 30 d after last report |
+| `nodes` | node identity, event binding, `node_class` (linux_vps/windows_terminal, immutable), state, last seen, config version | event | with event; retired row 30 d after last report |
 | `node_keys` | public keys, activation/revocation, rotation link | event | audit-linked; removed with event purge (+30 d revocation record) |
 | `key_rotations` | rotation state machine (awaiting_proof/confirmed/aborted), old/new key ids, nonce, expiry | event | with key identity |
-| `enroll_tokens` | one-time token hashes, TTL, creator, used-by | event | deleted after use/expiry (hash only) |
+| `enroll_tokens` | one-time token hashes, TTL, creator, used-by, **scope{event_id,node_class}** | event | deleted after use/expiry (hash only) |
 | `node_latest` | last authenticated snapshot projection (structured columns; only newer `collected_at` may overwrite) | event | current only |
+| `terminal_latest` | Windows terminal latest projection: selection token/sampled_at + six by-route counts/availability (tokens only, no proxy names) | event | current only |
 | `node_services`, `node_protocols`, `node_traffic` | latest per-service/protocol state and cumulative counters | event | current only |
 | `metric_minute` | per-node minute rollups (nullable/unknown-aware) | event | 30 d (policy B: archived event keeps remaining history another 30 d) |
 | `protocol_minute` | per-node per-protocol minute state/traffic deltas | event | 30 d |
 | `client_hourly` | top-N pseudonymous client summaries (device_ref, aggregates, admin alias lookup) | event | 30 d |
-| `events_history` | fault/incident/agent events timeline (closed per-kind details) | event | 30 d |
+| `events_history` | fault/incident/agent events timeline (closed per-kind details, including Windows terminal route/source events) | event | 30 d |
 | `incidents` | derived incident open/close grouping (UM-D rules) | event | 30 d; open rows never pruned |
 | `report_dedupe` | `(node_id, report_id)` → body hash, first/last received | event | 8 d |
-| `nonce_dedupe` | `(node_id, endpoint, nonce)` → body hash, received_at | event | 24 h |
-| `boot_registry` | per-node boot generations, last seq, active/retired | event | with node identity (bounded last 8) |
-| `node_seq` | current boot id and last seq per node | event | current only |
+| `nonce_dedupe` | **unique `(node_id, nonce)`** → full request fingerprint, received_at | event | 24 h |
+| `seq_dedupe` | `(node_id, boot_gen, boot_id, seq)` → fingerprint (bounded last 256) | event | current generation |
+| `boot_registry` | per-node boot generations, first/last seen, last seq, state (diagnostics only) | event | with node identity (bounded last 8) |
+| `node_boot` | authoritative `{highest_gen, boot_id, last_seq, last_fingerprint}` high-water per node | event | current only, persistent |
+| `route_mapping_versions` | immutable append-only `event_id`/`windows_node_id`/`version`/`effective_from`/six-token→linux_vps node ids/created_by/created_at; historical attribution resolved by effective time | event | with event history; never rewritten or deleted before event purge |
 | `admin_users`, `user_event_scopes`, `sessions`, `recovery_codes` | auth/RBAC/session state | root/user | sessions expire; users until deleted |
 | `audit_log` | security/administrative audit, closed actions | root/event | 180 d (configurable, size-bounded) |
 | `retention_runs`, `schema_migrations` | maintenance state | root | current |
@@ -241,14 +250,19 @@ stateDiagram-v2
   revoked --> [*]: reports rejected; node retired after retention
 ```
 
-Boot lifecycle (frozen in doc 04 §5–§6): the agent persists a monotonic boot
-generation and increments it by exactly 1 per normal restart, with a new random
-boot id; the center persists the highest accepted generation. A generation lower
-than the high-water is never re-activated (`stale_boot_generation`), the same
-generation with a different boot id is rejected (`boot_identity_conflict`), and
-the first report of a new generation (even a duplicate `report_id`) still commits
-the new transport high-water. Agent boot-state loss is fail-closed local recovery
-(no reset); operator recovery = admin revoke + re-enroll as a new node id.
+Boot lifecycle (frozen in doc 04 §5–§6, revision 5 A-1..A-5): the agent persists a
+monotonic boot generation and increments it by exactly 1 per normal restart, with
+a new random boot id; the center persists the highest accepted generation. A
+generation lower than the high-water is never re-activated
+(`stale_boot_generation`); the same generation with a different boot id or a gap
+above `MAX_BOOT_GAP` (65535) is rejected (`boot_identity_conflict`); a bounded
+forward gap (2..65535, expected after consecutive offline restarts) is accepted as
+the new generation's first contact, whose first accepted `seq` may be >1, and the
+first report of a new generation (even a duplicate `report_id`) still commits the
+new transport high-water. Numeric fields are bounded to `MAX_NUMERIC` (2^63−2) and
+stored as SQLite signed INTEGER; ACK `next_seq` is null only on generation
+exhaustion. Agent boot-state loss is fail-closed local recovery (no reset);
+operator recovery = admin revoke + re-enroll as a new node id.
 
 Center node states: `active` immediately after the enrollment transaction commits
 (no `pending_activation` state; a lost enrollment response leaves a normal active
@@ -274,17 +288,32 @@ files 0700/0600; **no fork/exec** (seccomp denies `execve/execveat`,
 `NoExecPaths=/` where supported); only required read paths: `/proc` and a private
 credential directory; systemd D-Bus read-only unit properties. No `sbox-cm`
 socket, no journald, no root, no `systemctl` execution.
-**Data sources are fail-closed and authorization-gated**: `singbox_api` and
-`mihomo_api` default to `false`; the center enables `singbox_api` only after
-UM-B3 records a server-side authorization audit proving the credential cannot
-mutate configuration, and `mihomo_api` is disabled in v1 (no proven read-only
-access mode). An unproven/version-mismatched source stays disabled, reports
-`availability=unavailable` and `agent_error code=source_authorization_unproven`,
-and never produces fabricated values. No sing-box/Mihomo/Monitor/`sbox-cm` file
-permission is changed; credentials are delivered by systemd `LoadCredential=`.
-Provisioning is a one-time root installer orchestration: token file root:root
-0600, fed to `um-agent enroll --token-stdin` as `umagent` through a pipe; the
-agent owns its key/state; root deletes the token afterwards.
+**Windows terminal agent (windows_terminal class, revision 5)**: runs as a
+non-admin Windows service/process for a dedicated user; it reads only a local
+loopback Mihomo/Clash Verge Rev data source and never writes configuration,
+switches nodes, closes connections or changes HA-UI/P6/#67 behavior. Only six
+route tokens (`a_reality`, `a_hy2`, `b_reality`, `b_hy2`, `direct`, `unknown`),
+aggregate connection counts, availability and independent selection/connection
+sampling timestamps leave the host; local proxy names, private YAML, controller
+secrets, connection ids and raw destinations never do. `mihomo_api`/
+`collect.terminal` default to false; R2 (truly read-only source) is preferred and
+R1 (write-capable controller credential used by a GET-only client) requires a
+separate later owner risk acceptance. The credential lives in DPAPI/private ACL;
+no center access to it; no server-side class switching.
+**Data sources are fail-closed and authorization-gated**: `singbox_api`,
+`mihomo_api` and `terminal` default to `false`; the center enables
+`singbox_api` only after UM-B3 records a server-side authorization audit proving
+the credential cannot mutate configuration. The Windows terminal source is
+enabled only after the class-specific authorization design (R2 preferred, R1
+separately owner-accepted) is recorded. An unproven/version-mismatched source
+stays disabled, reports `availability=unavailable` and
+`reason_code/code=source_authorization_unproven`, and never produces fabricated
+values. No sing-box/Mihomo/Monitor/`sbox-cm` file permission is changed;
+credentials are delivered by systemd `LoadCredential=` or the platform
+equivalent private store. Provisioning is a one-time root installer
+orchestration: token file root:root 0600, fed to `um-agent enroll
+--token-stdin` as the unprivileged user through a pipe; the agent owns its
+key/state; root deletes the token afterwards.
 
 ## 12. Secrets inventory and logging rules
 
