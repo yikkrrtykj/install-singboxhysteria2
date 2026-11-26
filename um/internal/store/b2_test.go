@@ -300,7 +300,7 @@ func TestB2RetentionPhysicalPruningAndArchive(t *testing.T) {
 	id := testEnroll(t, s, NodeClassLinuxVPS, now)
 	// 300 seq rows in the current generation; retention keeps 256.
 	for seq := uint64(1); seq <= 300; seq++ {
-		if err := s.RecordSeq(ctx, id.NodeID, 1, "boot-b2", seq, fmt.Sprintf("fp-%d", seq), now); err != nil {
+		if err := recordSeq(ctx, s.db, id.NodeID, 1, "boot-b2", seq, fmt.Sprintf("fp-%d", seq), now); err != nil {
 			t.Fatalf("RecordSeq(%d): %v", seq, err)
 		}
 	}
