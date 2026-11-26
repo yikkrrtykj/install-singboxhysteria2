@@ -6,6 +6,7 @@
 package conformance_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -82,7 +83,9 @@ type recExpected struct {
 	Error       string    `json:"error"`
 	CenterState recCenter `json:"center_state"`
 	ACK         struct {
-		NextSeq *uint64 `json:"next_seq"`
+		// RawMessage distinguishes an absent next_seq key (nil) from an explicit
+		// JSON null (bytes "null"); both would decode to a nil *uint64.
+		NextSeq json.RawMessage `json:"next_seq"`
 	} `json:"ack"`
 	Audit string `json:"audit"`
 }
@@ -173,6 +176,19 @@ func expectedOutcome(exp recExpected) (protocol.Outcome, error) {
 	}
 }
 
+// ackExpectationKind distinguishes an absent ACK field from an explicit JSON
+// null. It is used by REC-26 so a missing next_seq cannot masquerade as the
+// frozen "next_seq: null" exhaustion signal.
+func ackExpectationKind(raw json.RawMessage) string {
+	if raw == nil {
+		return "absent"
+	}
+	if string(bytes.TrimSpace(raw)) == "null" {
+		return "null"
+	}
+	return "value"
+}
+
 // checkProtocolExpected compares a protocol decision against the expected fields
 // read from the normative fixture. It returns an error instead of calling t.Fatal
 // so the harness itself can be mutation-tested.
@@ -200,11 +216,23 @@ func checkProtocolExpected(r protocol.Result, err error, exp recExpected) error 
 	if exp.CenterState.LastSeq != nil && r.NextBoot.LastSeq != *exp.CenterState.LastSeq {
 		return fmt.Errorf("last_seq=%d, want %d", r.NextBoot.LastSeq, *exp.CenterState.LastSeq)
 	}
-	if exp.ACK.NextSeq == nil && exp.Result == "accepted" && r.NextSeq != nil {
-		// Only REC-26 pins an explicit null ACK; absence of the ack object is
-		// not itself a null expectation.
-		if r.NextBoot.LastSeq == wire.MaxNumeric {
-			return fmt.Errorf("MAX_NUMERIC accepted with next_seq=%d, want null exhaustion", *r.NextSeq)
+	if exp.ACK.NextSeq != nil {
+		kind := ackExpectationKind(exp.ACK.NextSeq)
+		switch kind {
+		case "null":
+			if r.NextSeq != nil {
+				return fmt.Errorf("fixture requires explicit next_seq=null exhaustion, got %d", *r.NextSeq)
+			}
+		case "value":
+			var want uint64
+			if err := json.Unmarshal(exp.ACK.NextSeq, &want); err != nil {
+				return fmt.Errorf("fixture next_seq is not a uint64: %w", err)
+			}
+			if r.NextSeq == nil || *r.NextSeq != want {
+				return fmt.Errorf("next_seq mismatch: got %v, want %d", r.NextSeq, want)
+			}
+		default:
+			return fmt.Errorf("fixture next_seq neither null nor a value")
 		}
 	}
 	if exp.Audit != "" && !r.AuditGap {
@@ -231,6 +259,39 @@ func TestRECFixtureCountsAndOwnership(t *testing.T) {
 	}
 	// Explicit B1 deferral override; documented in um/docs/um-b1-conformance-map.md.
 	t.Logf("B1 executable=11, B1 deferred in whole=1 (REC-29), B2 deferred=15, B3 deferred=3")
+}
+
+// TestREC26ExplicitNullIsFixtureBound ensures the numeric-exhaustion case pins
+// an explicit JSON null (not an absent field) and that the result carries a nil
+// next_seq only for that explicit fixture signal.
+func TestREC26ExplicitNullIsFixtureBound(t *testing.T) {
+	c := loadCase(t, "REC-26")
+	if ackExpectationKind(c.Expected.ACK.NextSeq) != "null" {
+		t.Fatalf("REC-26 fixture next_seq = %q, want explicit null", string(c.Expected.ACK.NextSeq))
+	}
+	r, err := protocol.Evaluate(bootForFixture(c.Setup), attemptForFixture(c.Attempt), protocol.Options{})
+	if err := checkProtocolExpected(r, err, c.Expected); err != nil {
+		t.Fatalf("REC-26: %v", err)
+	}
+	if r.NextSeq != nil {
+		t.Fatalf("REC-26 next_seq=%d, want nil exhaustion", *r.NextSeq)
+	}
+	// An absent ACK is a different expectation from an explicit null: changing
+	// the fixture field must change the harness classification.
+	absent := c
+	absent.Expected.ACK.NextSeq = nil
+	if ackExpectationKind(absent.Expected.ACK.NextSeq) == "null" {
+		t.Fatal("absent ACK next_seq misclassified as explicit null")
+	}
+	mutated := c
+	mutated.Expected.ACK.NextSeq = json.RawMessage("1")
+	r2, err2 := protocol.Evaluate(bootForFixture(c.Setup), attemptForFixture(c.Attempt), protocol.Options{})
+	if err2 != nil {
+		t.Fatalf("evaluate: %v", err2)
+	}
+	if checkProtocolExpected(r2, nil, mutated.Expected) == nil {
+		t.Fatal("mutated non-null next_seq expectation was not detected")
+	}
 }
 
 // TestB1RECCases executes every B1-owned case from the normative fixture.
@@ -303,6 +364,20 @@ func newCenter(t *testing.T, setup recSetup) *store.Store {
 	return st
 }
 
+// reportStatusForFixture binds the normative fixture result to the B1 report
+// dedupe classification. "accepted" requires a genuinely new report; a duplicate
+// may never stand in for the first write.
+func reportStatusForFixture(result string) (store.ReportStatus, error) {
+	switch result {
+	case "accepted":
+		return store.ReportNew, nil
+	case "duplicate":
+		return store.ReportDuplicate, nil
+	default:
+		return "", fmt.Errorf("fixture result %q has no B1 report-dedupe mapping", result)
+	}
+}
+
 func runREC14(t *testing.T, c recCase) {
 	t.Helper()
 	st := newCenter(t, c.Setup)
@@ -324,13 +399,17 @@ func runREC14(t *testing.T, c recCase) {
 		t.Fatalf("high-water not persistent: %+v want %+v", cur, seed)
 	}
 	a := attemptForFixture(c.Attempt)
+	wantReportStatus, err := reportStatusForFixture(c.Expected.Result)
+	if err != nil {
+		t.Fatalf("REC-14 fixture: %v", err)
+	}
 	res, err := st.ApplyTransport(t.Context(), testNodeID, a, a.Fingerprint, func(tx *store.Tx) error {
 		status, err := tx.CheckOrInsertReport(t.Context(), testNodeID, c.Attempt.ReportID, c.Setup.Center.ReportDedupe[c.Attempt.ReportID], 100)
 		if err != nil {
 			return err
 		}
-		if status != store.ReportDuplicate {
-			return fmt.Errorf("post-restart report status=%q, want duplicate (fixture expected result=duplicate)", status)
+		if status != wantReportStatus {
+			return fmt.Errorf("post-restart report status=%q, fixture expected result=%q requires %q", status, c.Expected.Result, wantReportStatus)
 		}
 		return nil
 	})
@@ -371,15 +450,12 @@ func runREC28(t *testing.T, c recCase) {
 			if err != nil {
 				return err
 			}
-			switch a.Expect.Result {
-			case "duplicate":
-				if status != store.ReportDuplicate {
-					return fmt.Errorf("%s: report status=%q, want duplicate", a.ReportID, status)
-				}
-			case "accepted":
-				if status != store.ReportNew && status != store.ReportDuplicate {
-					return fmt.Errorf("%s: report status=%q", a.ReportID, status)
-				}
+			want, err := reportStatusForFixture(a.Expect.Result)
+			if err != nil {
+				return err
+			}
+			if status != want {
+				return fmt.Errorf("%s: report status=%q, fixture expects %q requiring %q", a.ReportID, status, a.Expect.Result, want)
 			}
 			return nil
 		})

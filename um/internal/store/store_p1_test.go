@@ -32,60 +32,121 @@ func TestStrictNumericTablesRejectNonIntegerStorage(t *testing.T) {
 		}
 	}
 
-	// Every protocol generation/seq column must reject REAL, TEXT, negative and
-	// out-of-range values inserted through raw SQL, not just through Go uint64.
-	directNegatives := []struct {
-		name string
-		stmt string
-		args []any
-	}{
-		{"node_boot real gen", `INSERT INTO node_boot(node_id,highest_gen,boot_id,last_seq,last_fingerprint,updated_at) VALUES('node-a',1.5,'b',1,NULL,1)`, nil},
-		{"node_boot negative gen", `INSERT INTO node_boot(node_id,highest_gen,boot_id,last_seq,last_fingerprint,updated_at) VALUES('node-a',-1,'b',1,NULL,1)`, nil},
-		{"node_boot over max seq", `INSERT INTO node_boot(node_id,highest_gen,boot_id,last_seq,last_fingerprint,updated_at) VALUES('node-a',1,'b',9223372036854775807,NULL,1)`, nil},
-		{"seq_dedupe real gen", `INSERT INTO seq_dedupe(node_id,boot_gen,boot_id,seq,fingerprint,received_at) VALUES('node-a',1.5,'b',1,'fp',1)`, nil},
-		{"seq_dedupe negative seq", `INSERT INTO seq_dedupe(node_id,boot_gen,boot_id,seq,fingerprint,received_at) VALUES('node-a',1,'b',-1,'fp',1)`, nil},
-		{"boot_registry real gen", `INSERT INTO boot_registry(node_id,boot_gen,boot_id,first_seen_at,last_seen_at,last_seq,state) VALUES('node-a',1.5,'b',1,1,1,'active')`, nil},
-		{"boot_registry text last_seq", `INSERT INTO boot_registry(node_id,boot_gen,boot_id,first_seen_at,last_seen_at,last_seq,state) VALUES('node-a',1,'b',1,1,'x','active')`, nil},
-		{"boot_registry negative last_seq", `INSERT INTO boot_registry(node_id,boot_gen,boot_id,first_seen_at,last_seen_at,last_seq,state) VALUES('node-a',1,'b',1,1,-1,'active')`, nil},
+	// Every protocol generation/seq column must reject REAL, non-numeric TEXT,
+	// BLOB, negative and out-of-range values inserted through raw SQL. Each case
+	// uses an independent primary key/node so the test cannot pass merely because
+	// an existing row caused a UNIQUE/PK conflict. The error category is checked:
+	// STRICT rejects wrong types; CHECK rejects numeric range violations.
+	type negativeCase struct {
+		name      string
+		nodeID    string
+		stmt      string
+		args      []any
+		wantError string
 	}
-	for _, tc := range directNegatives {
+	cases := []negativeCase{
+		{
+			name: "node_boot real gen", nodeID: "neg-boot-real",
+			stmt:      `INSERT INTO node_boot(node_id,highest_gen,boot_id,last_seq,last_fingerprint,updated_at) VALUES(?,1.5,'b',1,NULL,1)`,
+			wantError: "cannot store",
+		},
+		{
+			name: "node_boot nonnumeric text gen", nodeID: "neg-boot-text",
+			stmt:      `INSERT INTO node_boot(node_id,highest_gen,boot_id,last_seq,last_fingerprint,updated_at) VALUES(?,'not-an-int','b',1,NULL,1)`,
+			wantError: "cannot store",
+		},
+		{
+			name: "node_boot blob gen", nodeID: "neg-boot-blob",
+			stmt:      `INSERT INTO node_boot(node_id,highest_gen,boot_id,last_seq,last_fingerprint,updated_at) VALUES(?,?, 'b',1,NULL,1)`,
+			args:      []any{[]byte{0x01, 0x02}},
+			wantError: "cannot store",
+		},
+		{
+			name: "node_boot negative gen", nodeID: "neg-boot-negative",
+			stmt:      `INSERT INTO node_boot(node_id,highest_gen,boot_id,last_seq,last_fingerprint,updated_at) VALUES(?,-1,'b',1,NULL,1)`,
+			wantError: "CHECK constraint",
+		},
+		{
+			name: "node_boot over max seq", nodeID: "neg-boot-over",
+			stmt:      `INSERT INTO node_boot(node_id,highest_gen,boot_id,last_seq,last_fingerprint,updated_at) VALUES(?,1,'b',9223372036854775807,NULL,1)`,
+			wantError: "CHECK constraint",
+		},
+		{
+			name: "seq_dedupe real gen", nodeID: "",
+			stmt:      `INSERT INTO seq_dedupe(node_id,boot_gen,boot_id,seq,fingerprint,received_at) VALUES('node-a',1.5,'neg-seq-real',1,'fp',1)`,
+			wantError: "cannot store",
+		},
+		{
+			name: "seq_dedupe nonnumeric text seq", nodeID: "",
+			stmt:      `INSERT INTO seq_dedupe(node_id,boot_gen,boot_id,seq,fingerprint,received_at) VALUES('node-a',1,'neg-seq-text','bad','fp',1)`,
+			wantError: "cannot store",
+		},
+		{
+			name: "seq_dedupe negative seq", nodeID: "",
+			stmt:      `INSERT INTO seq_dedupe(node_id,boot_gen,boot_id,seq,fingerprint,received_at) VALUES('node-a',1,'neg-seq-negative',-1,'fp',1)`,
+			wantError: "CHECK constraint",
+		},
+		{
+			name: "seq_dedupe over max", nodeID: "",
+			stmt:      `INSERT INTO seq_dedupe(node_id,boot_gen,boot_id,seq,fingerprint,received_at) VALUES('node-a',1,'neg-seq-over',9223372036854775807,'fp',1)`,
+			wantError: "CHECK constraint",
+		},
+		{
+			name: "boot_registry real gen", nodeID: "",
+			stmt:      `INSERT INTO boot_registry(node_id,boot_gen,boot_id,first_seen_at,last_seen_at,last_seq,state) VALUES('node-a',1.5,'neg-reg-real',1,1,1,'active')`,
+			wantError: "cannot store",
+		},
+		{
+			name: "boot_registry nonnumeric text last_seq", nodeID: "",
+			stmt:      `INSERT INTO boot_registry(node_id,boot_gen,boot_id,first_seen_at,last_seen_at,last_seq,state) VALUES('node-a',1,'neg-reg-text',1,1,'x','active')`,
+			wantError: "cannot store",
+		},
+		{
+			name: "boot_registry negative last_seq", nodeID: "",
+			stmt:      `INSERT INTO boot_registry(node_id,boot_gen,boot_id,first_seen_at,last_seen_at,last_seq,state) VALUES('node-a',1,'neg-reg-negative',1,1,-1,'active')`,
+			wantError: "CHECK constraint",
+		},
+	}
+	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			// Clear the row a previous subtest might have touched; each negative
-			// must fail before replacing valid state.
-			if _, err := s.db.ExecContext(ctx, `DELETE FROM boot_registry WHERE node_id='node-a'`); err != nil {
-				t.Fatalf("cleanup: %v", err)
+			if tc.nodeID != "" {
+				mustCreateNode(t, s, tc.nodeID, "event-a", NodeClassLinuxVPS)
+				tc.args = append([]any{tc.nodeID}, tc.args...)
 			}
-			if _, err := s.db.ExecContext(ctx, tc.stmt, tc.args...); err == nil {
-				t.Fatalf("raw SQL accepted non-strict/invalid value")
+			args := tc.args
+			if tc.nodeID == "" {
+				args = nil
+			}
+			if _, err := s.db.ExecContext(ctx, tc.stmt, args...); err == nil {
+				t.Fatalf("raw SQL accepted non-strict/invalid value; want error containing %q", tc.wantError)
+			} else if !strings.Contains(err.Error(), tc.wantError) {
+				t.Fatalf("error = %v, want category %q", err, tc.wantError)
 			}
 		})
 	}
 
-	// Legal lossless conversions are allowed but MUST be stored as INTEGER,
-	// never as TEXT/REAL/BLOB.
+	// Legal lossless TEXT->INTEGER conversion is allowed, but the stored value
+	// must be INTEGER, never TEXT/REAL/BLOB.
 	for _, tc := range []struct {
 		name  string
+		node  string
 		stmt  string
 		table string
 		col   string
 	}{
-		{"node_boot numeric text", `INSERT INTO node_boot(node_id,highest_gen,boot_id,last_seq,last_fingerprint,updated_at) VALUES('node-a','9','b','10',NULL,'1')`, "node_boot", "highest_gen"},
-		{"seq_dedupe numeric text", `INSERT INTO seq_dedupe(node_id,boot_gen,boot_id,seq,fingerprint,received_at) VALUES('node-a','9','b-text','10','fp','1')`, "seq_dedupe", "seq"},
-		{"boot_registry numeric text", `INSERT INTO boot_registry(node_id,boot_gen,boot_id,first_seen_at,last_seen_at,last_seq,state) VALUES('node-a','9','b-text',1,1,'10','active')`, "boot_registry", "last_seq"},
+		{"node_boot numeric text", "lossless-boot", `INSERT INTO node_boot(node_id,highest_gen,boot_id,last_seq,last_fingerprint,updated_at) VALUES(?, '9','b','10',NULL,'1')`, "node_boot", "highest_gen"},
+		{"seq_dedupe numeric text", "", `INSERT INTO seq_dedupe(node_id,boot_gen,boot_id,seq,fingerprint,received_at) VALUES('node-a','9','lossless-seq','10','fp','1')`, "seq_dedupe", "seq"},
+		{"boot_registry numeric text", "", `INSERT INTO boot_registry(node_id,boot_gen,boot_id,first_seen_at,last_seen_at,last_seq,state) VALUES('node-a',9,'lossless-reg',1,1,'10','active')`, "boot_registry", "last_seq"},
 	} {
-		for _, stmt := range []string{
-			`DELETE FROM node_boot WHERE node_id='node-a'`,
-			`DELETE FROM seq_dedupe WHERE node_id='node-a'`,
-			`DELETE FROM boot_registry WHERE node_id='node-a'`,
-		} {
-			if _, err := s.db.ExecContext(ctx, stmt); err != nil {
-				t.Fatalf("cleanup: %v", err)
-			}
+		args := []any(nil)
+		if tc.node != "" {
+			mustCreateNode(t, s, tc.node, "event-a", NodeClassLinuxVPS)
+			args = []any{tc.node}
 		}
-		if _, err := s.db.ExecContext(ctx, tc.stmt); err != nil {
+		if _, err := s.db.ExecContext(ctx, tc.stmt, args...); err != nil {
 			t.Fatalf("%s: legal lossless conversion rejected: %v", tc.name, err)
 		}
-		if got := queryString(t, s, `SELECT typeof(`+tc.col+`) FROM `+tc.table+` LIMIT 1`); got != "integer" {
+		if got := queryString(t, s, `SELECT typeof(`+tc.col+`) FROM `+tc.table+` WHERE rowid = (SELECT MAX(rowid) FROM `+tc.table+`)`); got != "integer" {
 			t.Fatalf("%s stored as %q, want integer", tc.name, got)
 		}
 	}
@@ -368,39 +429,52 @@ func TestMappingVersionHistoryAndValidation(t *testing.T) {
 	mustCreateNode(t, s, "linux-b", eventA, NodeClassLinuxVPS)
 	mustCreateNode(t, s, "linux-c", eventA, NodeClassLinuxVPS)
 	mustCreateNode(t, s, "linux-other", eventB, NodeClassLinuxVPS)
+	const mappingNow int64 = 1_000_000
 
 	v1 := map[string]string{RouteTokenAReality: "linux-a", RouteTokenBReality: "linux-b"}
-	if err := s.CreateMappingVersion(ctx, eventA, "win-a", 1, 100, "admin", v1); err != nil {
-		t.Fatalf("v1: %v", err)
+	if err := s.createMappingVersion(ctx, eventA, "win-a", 1, mappingNow, "admin", v1, mappingNow); err != nil {
+		t.Fatalf("v1 immediate: %v", err)
 	}
-	got, version, err := s.ResolveMapping(ctx, eventA, "win-a", 150)
+	got, version, err := s.ResolveMapping(ctx, eventA, "win-a", mappingNow)
 	if err != nil || version != 1 || !mapsEqual(got, v1) {
-		t.Fatalf("resolve@150 = (v%d,%v,%v), want v1", version, got, err)
+		t.Fatalf("resolve@now = (v%d,%v,%v), want v1", version, got, err)
 	}
-	if _, _, err := s.ResolveMapping(ctx, eventA, "win-a", 99); !errors.Is(err, ErrNotFound) {
+	if _, _, err := s.ResolveMapping(ctx, eventA, "win-a", mappingNow-1); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("resolve before first effective_from error=%v, want ErrNotFound", err)
 	}
 
 	v2 := map[string]string{RouteTokenAReality: "linux-c", RouteTokenBHy2: "linux-b"}
-	if err := s.CreateMappingVersion(ctx, eventA, "win-a", 2, 200, "admin", v2); err != nil {
-		t.Fatalf("v2: %v", err)
+	if err := s.createMappingVersion(ctx, eventA, "win-a", 2, mappingNow+1_000, "admin", v2, mappingNow); err != nil {
+		t.Fatalf("v2 future: %v", err)
 	}
-	if got, version, err = s.ResolveMapping(ctx, eventA, "win-a", 150); err != nil || version != 1 || !mapsEqual(got, v1) {
-		t.Fatalf("historical attribution changed after v2: (v%d,%v,%v)", version, got, err)
+	if got, version, err = s.ResolveMapping(ctx, eventA, "win-a", mappingNow+500); err != nil || version != 1 || !mapsEqual(got, v1) {
+		t.Fatalf("future version applied early / history changed: (v%d,%v,%v)", version, got, err)
 	}
-	if got, version, err = s.ResolveMapping(ctx, eventA, "win-a", 250); err != nil || version != 2 || !mapsEqual(got, v2) {
-		t.Fatalf("resolve@250 = (v%d,%v,%v), want v2", version, got, err)
+	if got, version, err = s.ResolveMapping(ctx, eventA, "win-a", mappingNow+1_500); err != nil || version != 2 || !mapsEqual(got, v2) {
+		t.Fatalf("resolve@future = (v%d,%v,%v), want v2", version, got, err)
 	}
 
-	// Future-effective version; empty entries = all four tokens unmapped.
-	if err := s.CreateMappingVersion(ctx, eventA, "win-a", 3, 500, "admin", map[string]string{}); err != nil {
-		t.Fatalf("future v3: %v", err)
+	// Future-effective unmapping: empty entries means all four tokens unmapped
+	// from this version onward; earlier attribution is unchanged.
+	if err := s.createMappingVersion(ctx, eventA, "win-a", 3, mappingNow+2_000, "admin", map[string]string{}, mappingNow); err != nil {
+		t.Fatalf("future unmapping v3: %v", err)
 	}
-	if got, version, err = s.ResolveMapping(ctx, eventA, "win-a", 400); err != nil || version != 2 || !mapsEqual(got, v2) {
-		t.Fatalf("future version applied early: (v%d,%v,%v)", version, got, err)
+	if got, version, err = s.ResolveMapping(ctx, eventA, "win-a", mappingNow+1_500); err != nil || version != 2 || !mapsEqual(got, v2) {
+		t.Fatalf("unmapping applied before effective time: (v%d,%v,%v)", version, got, err)
 	}
-	if got, version, err = s.ResolveMapping(ctx, eventA, "win-a", 600); err != nil || version != 3 || len(got) != 0 {
+	if got, version, err = s.ResolveMapping(ctx, eventA, "win-a", mappingNow+2_500); err != nil || version != 3 || len(got) != 0 {
 		t.Fatalf("unmapped v3 resolve = (v%d,%v,%v), want v3 empty", version, got, err)
+	}
+
+	// Backdating relative to the write clock is rejected even when the new
+	// effective time is later than the previous version's effective time. This is
+	// the final-review correction: normal mapping must not rewrite attribution of
+	// data already collected before "now".
+	if err := s.createMappingVersion(ctx, eventA, "win-a", 4, mappingNow+3_000, "admin", map[string]string{RouteTokenAReality: "linux-a"}, mappingNow+4_000); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("later-than-previous but past effective time error = %v, want ErrInvalidArgument", err)
+	}
+	if got, version, err = s.ResolveMapping(ctx, eventA, "win-a", mappingNow+2_500); err != nil || version != 3 {
+		t.Fatalf("rejected backdated version changed history: (v%d,%v,%v)", version, got, err)
 	}
 
 	// Immutability at the SQL layer.
@@ -411,7 +485,8 @@ func TestMappingVersionHistoryAndValidation(t *testing.T) {
 		t.Fatal("raw DELETE of mapping entries was allowed")
 	}
 
-	// Validation failures must not create versions.
+	// Validation failures must not create versions. Valid future effective times
+	// keep these cases exercising the intended validation, not the clock rule.
 	invalid := []struct {
 		name          string
 		event, win    string
@@ -419,22 +494,22 @@ func TestMappingVersionHistoryAndValidation(t *testing.T) {
 		effectiveFrom int64
 		entries       map[string]string
 	}{
-		{"missing windows node", eventA, "win-missing", 4, 700, map[string]string{RouteTokenAReality: "linux-a"}},
-		{"windows node other event", eventA, "win-b", 4, 700, map[string]string{RouteTokenAReality: "linux-a"}},
-		{"linux node as windows", eventA, "linux-a", 4, 700, map[string]string{RouteTokenAReality: "linux-a"}},
-		{"cross-event target", eventA, "win-a", 4, 700, map[string]string{RouteTokenAReality: "linux-other"}},
-		{"missing target", eventA, "win-a", 4, 700, map[string]string{RouteTokenAReality: "linux-missing"}},
-		{"windows target", eventA, "win-a", 4, 700, map[string]string{RouteTokenAReality: "win-a"}},
-		{"direct mapping", eventA, "win-a", 4, 700, map[string]string{RouteTokenDirect: "linux-a"}},
-		{"unknown mapping", eventA, "win-a", 4, 700, map[string]string{"unknown": "linux-a"}},
-		{"zero version", eventA, "win-a", 0, 700, map[string]string{RouteTokenAReality: "linux-a"}},
-		{"skipped version", eventA, "win-a", 5, 700, map[string]string{RouteTokenAReality: "linux-a"}},
-		{"backdated effective", eventA, "win-a", 4, 450, map[string]string{RouteTokenAReality: "linux-a"}},
-		{"same-time effective", eventA, "win-a", 4, 500, map[string]string{RouteTokenAReality: "linux-a"}},
+		{"missing windows node", eventA, "win-missing", 4, mappingNow + 3_000, map[string]string{RouteTokenAReality: "linux-a"}},
+		{"windows node other event", eventA, "win-b", 4, mappingNow + 3_000, map[string]string{RouteTokenAReality: "linux-a"}},
+		{"linux node as windows", eventA, "linux-a", 4, mappingNow + 3_000, map[string]string{RouteTokenAReality: "linux-a"}},
+		{"cross-event target", eventA, "win-a", 4, mappingNow + 3_000, map[string]string{RouteTokenAReality: "linux-other"}},
+		{"missing target", eventA, "win-a", 4, mappingNow + 3_000, map[string]string{RouteTokenAReality: "linux-missing"}},
+		{"windows target", eventA, "win-a", 4, mappingNow + 3_000, map[string]string{RouteTokenAReality: "win-a"}},
+		{"direct mapping", eventA, "win-a", 4, mappingNow + 3_000, map[string]string{RouteTokenDirect: "linux-a"}},
+		{"unknown mapping", eventA, "win-a", 4, mappingNow + 3_000, map[string]string{"unknown": "linux-a"}},
+		{"zero version", eventA, "win-a", 0, mappingNow + 3_000, map[string]string{RouteTokenAReality: "linux-a"}},
+		{"skipped version", eventA, "win-a", 5, mappingNow + 3_000, map[string]string{RouteTokenAReality: "linux-a"}},
+		{"past effective_from", eventA, "win-a", 4, mappingNow - 1, map[string]string{RouteTokenAReality: "linux-a"}},
+		{"same-time effective", eventA, "win-a", 4, mappingNow + 2_000, map[string]string{RouteTokenAReality: "linux-a"}},
 	}
 	for _, tc := range invalid {
 		t.Run(tc.name, func(t *testing.T) {
-			err := s.CreateMappingVersion(ctx, tc.event, tc.win, tc.version, tc.effectiveFrom, "admin", tc.entries)
+			err := s.createMappingVersion(ctx, tc.event, tc.win, tc.version, tc.effectiveFrom, "admin", tc.entries, mappingNow+3_000)
 			if !errors.Is(err, ErrInvalidArgument) && !errors.Is(err, ErrAlreadyExists) {
 				t.Fatalf("error = %v, want invalid/append-only conflict", err)
 			}
@@ -451,7 +526,7 @@ func TestMappingVersionHistoryAndValidation(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			results <- s.CreateMappingVersion(ctx, eventA, "win-a", 4, 800, "admin", map[string]string{RouteTokenAReality: "linux-a"})
+			results <- s.createMappingVersion(ctx, eventA, "win-a", 4, mappingNow+3_000, "admin", map[string]string{RouteTokenAReality: "linux-a"}, mappingNow)
 		}()
 	}
 	wg.Wait()
@@ -465,11 +540,47 @@ func TestMappingVersionHistoryAndValidation(t *testing.T) {
 	if successes != 1 {
 		t.Fatalf("concurrent insert successes = %d, want exactly 1", successes)
 	}
-	if got, version, err = s.ResolveMapping(ctx, eventA, "win-a", 850); err != nil || version != 4 || got[RouteTokenAReality] != "linux-a" {
+	if got, version, err = s.ResolveMapping(ctx, eventA, "win-a", mappingNow+3_500); err != nil || version != 4 || got[RouteTokenAReality] != "linux-a" {
 		t.Fatalf("post-concurrency resolve = (v%d,%v,%v)", version, got, err)
 	}
-	if got, version, err = s.ResolveMapping(ctx, eventA, "win-a", 600); err != nil || version != 3 {
+	if got, version, err = s.ResolveMapping(ctx, eventA, "win-a", mappingNow+2_500); err != nil || version != 3 {
 		t.Fatalf("history after concurrency = (v%d,%v,%v), want v3", version, got, err)
+	}
+}
+
+// TestMappingEffectiveNowOrLaterRule pins the immediate/future/backdated rules
+// independently from the history test above.
+func TestMappingEffectiveNowOrLaterRule(t *testing.T) {
+	s := openTestStore(t, tempStorePath(t))
+	ctx := testContext()
+	mustCreateNode(t, s, "win-a", "event-a", NodeClassWindowsTerminal)
+	mustCreateNode(t, s, "linux-a", "event-a", NodeClassLinuxVPS)
+	const now int64 = 10_000
+	entries := map[string]string{RouteTokenAReality: "linux-a"}
+	if err := s.createMappingVersion(ctx, "event-a", "win-a", 1, now, "admin", entries, now); err != nil {
+		t.Fatalf("immediate version: %v", err)
+	}
+	if err := s.createMappingVersion(ctx, "event-a", "win-a", 2, now+1, "admin", entries, now); err != nil {
+		t.Fatalf("future version: %v", err)
+	}
+	if got, version, err := s.ResolveMapping(ctx, "event-a", "win-a", now); err != nil || version != 1 || !mapsEqual(got, entries) {
+		t.Fatalf("immediate version not effective at now: (v%d,%v,%v)", version, got, err)
+	}
+	if got, version, err := s.ResolveMapping(ctx, "event-a", "win-a", now+1); err != nil || version != 2 {
+		t.Fatalf("future version not effective at its effective time: (v%d,%v,%v)", version, got, err)
+	}
+	// Same write clock, a new version whose effective_from is in the past but
+	// later than the previous effective time must be rejected.
+	if err := s.createMappingVersion(ctx, "event-a", "win-a", 3, now-1, "admin", entries, now); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("past effective_from error = %v, want ErrInvalidArgument", err)
+	}
+	// Exported API uses the real clock: past is rejected, future is accepted.
+	realNow := nowUnix()
+	if err := s.CreateMappingVersion(ctx, "event-a", "win-a", 3, realNow-10, "admin", entries); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("exported past effective_from error = %v, want ErrInvalidArgument", err)
+	}
+	if err := s.CreateMappingVersion(ctx, "event-a", "win-a", 3, realNow+3600, "admin", entries); err != nil {
+		t.Fatalf("exported future effective_from: %v", err)
 	}
 }
 

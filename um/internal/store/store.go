@@ -786,14 +786,26 @@ func (s *Store) ApplyTransport(ctx context.Context, nodeID string, attempt proto
 //     effective_from is strictly later than the latest version's effective_from.
 //     A backdated or same-time insert is rejected, preserving all previously
 //     attributed history;
-//   - future-effective versions are allowed; they become effective only when
-//     ResolveMapping is asked for a time at/after effective_from.
+//   - a new version may be effective immediately (effective_from == write-time
+//     now) or in the future; effective_from must never be in the past. This is
+//     the normal mapping API rule: otherwise a later-than-previous but still
+//     past effective time could retroactively change the attribution of data
+//     already collected. A historical-import/admin path, if ever needed, is a
+//     separate B2/B4 feature with its own audit.
+//   - future-effective versions become effective only when ResolveMapping is
+//     asked for a time at/after effective_from.
 //
 // An empty entries map is valid and means "all four tokens are unmapped" from
 // effective_from (the UI renders them as unmapped/UNKNOWN; the previous version
 // remains the historical attribution before that time). Versions and entries are
 // immutable: SQL triggers reject UPDATE/DELETE.
 func (s *Store) CreateMappingVersion(ctx context.Context, eventID, windowsNodeID string, version int, effectiveFrom int64, createdBy string, entries map[string]string) error {
+	return s.createMappingVersion(ctx, eventID, windowsNodeID, version, effectiveFrom, createdBy, entries, nowUnix())
+}
+
+// createMappingVersion is CreateMappingVersion with an explicit write-time clock,
+// used by deterministic tests.
+func (s *Store) createMappingVersion(ctx context.Context, eventID, windowsNodeID string, version int, effectiveFrom int64, createdBy string, entries map[string]string, now int64) error {
 	if strings.TrimSpace(eventID) == "" {
 		return invalidArgument("event_id", "must not be empty")
 	}
@@ -810,6 +822,10 @@ func (s *Store) CreateMappingVersion(ctx context.Context, eventID, windowsNodeID
 		if strings.TrimSpace(target) == "" {
 			return invalidArgument("target_node_id", "must not be empty")
 		}
+	}
+
+	if effectiveFrom < now {
+		return invalidArgument("effective_from", "must be now or later; a past effective time would retroactively change already-attributed history")
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)

@@ -53,7 +53,7 @@ reason in `TestB1RECCases/REC-29` and listed as B2-deferred below.
 | REC-11 | UM-B1 | executed (exact retry duplicate) |
 | REC-12 | UM-B1 | executed (seq conflict) |
 | REC-13 | UM-B2 | deferred (HTTP ACK next_seq reconciliation) |
-| REC-14 | UM-B1 | executed: fixture state seeded through `ApplyTransport`, DB closed/reopened, persisted `node_boot` asserted, **real post-reopen retry** accepted + report duplicate asserted, then exact transport retry duplicate |
+| REC-14 | UM-B1 | executed: fixture state seeded through `ApplyTransport`, DB closed/reopened, persisted `node_boot` asserted, **real post-reopen retry** accepted; the report dedupe status expected is read from the fixture result (`duplicate` → `ReportDuplicate`), then exact transport retry duplicate |
 | REC-15 | UM-B2 | deferred (503/failure injection at ingest) |
 | REC-16 | UM-B2 | deferred (quarantine policy at ingest) |
 | REC-17 | UM-B3 | deferred (agent boot-state fail-closed) |
@@ -65,9 +65,9 @@ reason in `TestB1RECCases/REC-29` and listed as B2-deferred below.
 | REC-23 | UM-B2 | deferred (rotate as first contact) |
 | REC-24 | UM-B2 | deferred (enrollment response loss) |
 | REC-25 | UM-B1 | executed (65535 gap boundary accepted) |
-| REC-26 | UM-B1 | executed (MAX_NUMERIC + ACK next_seq null) |
+| REC-26 | UM-B1 | executed (MAX_NUMERIC + **explicit** ACK `next_seq: null`, distinguished from an absent field; `TestREC26ExplicitNullIsFixtureBound`) |
 | REC-27 | UM-B3 | deferred (agent power-loss seq persistence) |
-| REC-28 | UM-B1 | executed: committed/uncommitted/reopen boundary — committed state survives restart, failed payload transaction leaves high-water unchanged, retry applies once, exact retry is duplicate, report survives final reopen |
+| REC-28 | UM-B1 | executed: committed/uncommitted/reopen boundary — committed state survives restart, failed payload transaction leaves high-water unchanged, retry applies once, exact retry is duplicate, report survives final reopen. Fixture `accepted` requires **ReportNew** exactly (a duplicate cannot stand in for the first write); fixture `duplicate` requires `ReportDuplicate` |
 | REC-29 | UM-B1 (fixture) → **entire case deferred to UM-B2** | **not executed, not PASS**: no snapshot data-apply/ordering in B1 |
 | REC-30 | UM-B2 | deferred (interleaved spool replay) |
 
@@ -106,8 +106,12 @@ frozen contract files are unchanged; this is a minimal clarification proposal.
   integer and `effective_from` must be strictly later than the latest version's
   effective time. Duplicate effective times and backdated inserts are rejected
   so already-attributed history cannot change.
-- Future-effective versions are allowed and become visible to `ResolveMapping`
-  only when `at >= effective_from`.
+- A new version may be effective immediately (`effective_from == write-time now`)
+  or in the future, but never in the past. This final-review rule prevents a
+  later-than-previous-but-still-past effective time from retroactively changing
+  data already collected; a historical import/admin path is not part of B1 and
+  would require a separate B2/B4 design with audit. Future-effective versions
+  become visible to `ResolveMapping` only when `at >= effective_from`.
 - An empty/subset entry map is the unmapping representation: omitted tokens are
   unmapped from that version onward (UI renders UNKNOWN); the previous version
   remains the historical attribution before the new effective time.
@@ -132,3 +136,21 @@ frozen contract files are unchanged; this is a minimal clarification proposal.
 
 These limitations are tracked in the Draft PR body and must be closed by the
 owning later slices, not silently marked as verified.
+
+
+## Final-review corrections (B1)
+
+- Mapping writes now enforce `effective_from >= write-time now` in addition to
+  version monotonicity; a version whose effective time is later than the previous
+  version but still in the past is rejected (`TestMappingBackdateRelativeToNowRejected`,
+  `TestMappingEffectiveNowOrLaterRule`). Immediate and future versions are tested;
+  empty/subset versions remain the unmapping representation; historical
+  attribution is asserted unchanged.
+- Strict numeric tests use independent primary keys and UPDATE-based cases with a
+  category check (`cannot store` vs `CHECK constraint`) and verify the stored
+  type/value is unchanged after a rejected write
+  (`TestStrictNumericTablesRejectNonIntegerStorage`, `TestStrictUpdateConstraints`).
+- REC-14/26/28 expectations are bound to the normative fixture fields; REC-29
+  remains deferred in whole to B2. No frozen contract edit.
+- Full telemetry-to-historical-mapping association, mapping audit and management
+  API remain UM-B2/B4 work and are not claimed here.
