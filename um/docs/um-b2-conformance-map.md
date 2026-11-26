@@ -215,3 +215,16 @@ and backup/restore.
 | H1 Windows default snapshot | terminal source validation now checks object existence: absent terminal object is legal (default false/false); present object with both sources false is rejected; selection/active_connections remain independently authorized. Real HTTP matrix test uses a true default enrollment (no auto-enable helper): false/false no terminal accepted, false/false with terminal rejected, true/false selection ok + controller honest unavailable, false/true inverse, true/true legal |
 | H2 purge executor/progress | per-event in-process purge lock serializes execution; `updatePurgeOp` never writes `deleted_rows` and only advances state/phase forward (otherwise error/update only); final audit reads persisted deleted_rows inside final tx; completed op without graveyard is refused rather than recreated; 50,005-row two-concurrent-call test asserts exact progress, one completed op/graveyard/tombstone/event_purged audit, no incomplete ops and idempotent repeat |
 | H3 overlap total | 5 GiB active-only planning basis, 2× = 10 GiB applied to projected **active+archived total**; candidate moved from active to archived (no double count); post-archive active data included in later decisions; below/equal/above, last-active and post-archive tests; planning budget not disk limit |
+
+
+## Round-12 H3 quota-diagnostic closure
+
+`ArchiveEvent` overlap rejection now reports `QuotaError.Current` as the same
+projected active+archived total evaluated by the gate (`ProjectedTotalBytes`),
+not the archived-only component. Limit/decision logic, 5 GiB basis, 10 GiB cap,
+candidate move, retention/purge lifecycle, SQLite transactions and frozen
+contract/REC/workflow are unchanged.
+
+Test: `TestB2OverlapQuotaCurrentMatchesProjectedTotal` (red: 500 vs expected 650;
+green after one-line fix), plus all existing H3 boundary/last-active/post-archive
+tests.

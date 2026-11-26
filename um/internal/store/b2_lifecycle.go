@@ -374,7 +374,7 @@ func (s *Store) ArchiveEvent(ctx context.Context, eventID string, now int64) err
 	}
 	budget := ComputeOverlapBudget(s.overlapBudgetBasisBytes(), activeBytes, archivedBytes, eventBytes)
 	if budget.Exceeds() {
-		return &QuotaError{Kind: "retention_overlap", Limit: budget.BudgetBytes, Current: budget.ProjectedArchivedBytes}
+		return &QuotaError{Kind: "retention_overlap", Limit: budget.BudgetBytes, Current: budget.ProjectedTotalBytes}
 	}
 	purgeAfter := now + PolicyBArchiveTailSeconds
 	if _, err := tx.ExecContext(ctx,

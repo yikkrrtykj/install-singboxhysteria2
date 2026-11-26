@@ -1554,3 +1554,65 @@ func TestB2OverlapBudgetCountsPostArchiveActiveData(t *testing.T) {
 		t.Fatalf("post-archive active overflow = %v, want ErrQuotaExceeded", err)
 	}
 }
+
+func TestB2OverlapQuotaCurrentMatchesProjectedTotal(t *testing.T) {
+	s := openTestStore(t, tempStorePath(t))
+	ctx := testContext()
+	now := int64(1_700_000_000)
+	seedEvent := func(ev string, payloadLen int) {
+		t.Helper()
+		id := testEnrollEvent(t, s, ev, NodeClassLinuxVPS, now)
+		if err := s.WithTx(ctx, func(tx *Tx) error {
+			_, err := tx.StoreSnapshotTx(ctx, SnapshotRecord{NodeID: id.NodeID, EventID: ev, NodeClass: id.NodeClass,
+				ReportID: "r-" + ev, CollectedAt: now - 10, ReceivedAt: now,
+				BodySHA256: "hash-" + ev, Payload: []byte(strings.Repeat("x", payloadLen))})
+			return err
+		}); err != nil {
+			t.Fatalf("seed %s: %v", ev, err)
+		}
+	}
+
+	archived := "00000000-0000-4000-8000-0000000000fa"
+	candidate := "00000000-0000-4000-8000-0000000000fb"
+	otherActive := "00000000-0000-4000-8000-0000000000fc"
+	seedEvent(archived, 200)
+	if err := s.ArchiveEvent(ctx, archived, now); err != nil {
+		t.Fatalf("archive baseline event: %v", err)
+	}
+	s.SetOverlapBudgetForTest(100) // 10 GiB analogue: limit 200 bytes
+	seedEvent(candidate, 300)
+	seedEvent(otherActive, 150)
+
+	err := s.ArchiveEvent(ctx, candidate, now)
+	if !errors.Is(err, ErrQuotaExceeded) {
+		t.Fatalf("archive over-budget = %v, want ErrQuotaExceeded", err)
+	}
+	var quota *QuotaError
+	if !errors.As(err, &quota) {
+		t.Fatalf("archive error type = %T, want *QuotaError", err)
+	}
+	if quota.Limit != 200 {
+		t.Fatalf("quota limit = %d, want 200", quota.Limit)
+	}
+	// active (candidate 300 + other 150) + archived 200 = 650.
+	if quota.Current != 650 {
+		t.Fatalf("quota current = %d, want projected active+archived total 650", quota.Current)
+	}
+	// The refused archive must leave lifecycle state and data untouched.
+	state, err := s.EventState(ctx, candidate)
+	if err != nil || state.State != EventActive {
+		t.Fatalf("candidate lifecycle after refusal = %+v err=%v, want active", state, err)
+	}
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM snapshots WHERE event_id=?`, candidate); got != 1 {
+		t.Fatalf("candidate snapshot rows after refusal = %d, want 1", got)
+	}
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM snapshots WHERE event_id=?`, otherActive); got != 1 {
+		t.Fatalf("other active snapshot rows after refusal = %d, want 1", got)
+	}
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM event_graveyard WHERE event_id=?`, candidate); got != 0 {
+		t.Fatalf("refused archive created graveyard rows = %d", got)
+	}
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM purge_tombstones WHERE event_id=?`, candidate); got != 0 {
+		t.Fatalf("refused archive created tombstone rows = %d", got)
+	}
+}
