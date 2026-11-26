@@ -1,15 +1,53 @@
 # Unified Monitor Go development
 
-This branch starts Windows terminal observation in a separate Go module. The
-command takes one local snapshot for an explicitly configured Mihomo group.
+This directory is the Unified Monitor Go module (`github.com/yikkrrtykj/install-singboxhysteria2/um`).
+It currently contains the **UM-B1 Draft PR** foundation: the shared rev-5 wire
+signing primitives, the pure recovery state machine, the SQLite data layer,
+contract conformance tests and the experimental Windows observer prototype.
 
-## Windows snapshot
+**Status: Draft PR / design-and-code review only.** Not production code, not a
+service, not connected to any center or production system. UM-B2..UM-E are not
+started; UM-F is deferred; production is HOLD. The Windows observer/CLI remain
+experimental and are not wired into a service or deployment.
+
+## Layout
+
+| Path | Purpose |
+| --- | --- |
+| `internal/wire` | Rev-5 canonical signing strings, Ed25519 sign/verify, canonical numeric bounds, request fingerprint, typed field errors. Reads the frozen vectors from `docs/um/contracts/v1`. |
+| `internal/protocol` | Pure A-1..A-5 recovery/ordering state machine (generation gaps, first-contact `seq>1`, ACK exhaustion, rotation retry ordering). No I/O. |
+| `internal/store` | SQLite (WAL, `synchronous=FULL`) schema/migrations, transactional boot/seq high-water, nonce/report/seq dedupe, versioned route mappings, security-ledger chain and retention basics. |
+| `internal/schema` | Real JSON Schema 2020-12 validation of the frozen `docs/um/contracts/v1` files (not JSON parsing only). |
+| `internal/contract` | Platform isolation and Windows terminal runtime semantics that JSON Schema cannot express (node_class, six tokens, sum/availability/sampling, privacy sentinels). |
+| `internal/windowsobs` | Experimental read-only Windows Mihomo route observer (prototype; not a service, not in the B1 acceptance path). |
+| `cmd/um-windows-observe` | One-shot experimental observer CLI. |
+| `docs/adr` | UM-B1 dependency/toolchain ADR. |
+
+## Testing
+
+From this directory:
+
+```bash
+go test -count=1 ./...
+go vet ./...
+go test -race -count=1 ./...   # Linux only; race detector needs cgo
+go build -trimpath ./...
+```
+
+Tests read the frozen contract files at `../docs/um/contracts/v1/**`
+(repository path), including the rev-5 positive/negative vectors and
+`docs/um/um-127/conformance/transport-recovery.cases.json` when available.
+Contract changes must trigger Go CI. The dependency/toolchain policy is
+`docs/adr/ADR-UM-B1-001-go-toolchain-and-dependencies.md`; dependencies are
+pinned and checksum-locked, and CI runs `govulncheck`.
+
+## Windows snapshot (experimental)
 
 Build from this directory with `go build ./cmd/um-windows-observe`. Run the EXE
 as the current user with `-profile <json>` and, if the loopback controller
-requires authentication, `-secret-file <local-file>`. Store both files in
-the current user's private directory. Put only the controller secret on the
-first line of the secret file.
+requires authentication, `-secret-file <local-file>`. Store both files in a
+private directory. Put only the controller secret on the first line of the
+secret file.
 
 Example local profile with synthetic node names:
 
@@ -39,19 +77,25 @@ Example local profile with synthetic node names:
   Local proxy names, destinations, connection IDs and the controller secret
   are excluded from the JSON output.
 
-The local JSON is for development. A later Windows enrollment and reporting
-slice will bind a pseudonymous terminal to an event and map its local route
-roles to approved VPS identities. An outage or stale sample should remain
-visible in that contract. The Windows telemetry will be read-only and run
-independently of the existing HA-UI, P6 Remote Probe and Mihomo policy.
+The rev-5 contract adds `direct`/`unknown` to the existing four role tokens and
+defines the terminal snapshot/event bodies. The observer remains an
+experimental component; UM-B3 owns any service integration, R2/R1 source
+decision and real Mihomo/Clash Verge Rev validation. The controller credential
+is write-capable in general; a GET-only client is not an authorization proof.
 
-## Shared wire signing
+## Shared wire signing (rev-5)
 
-The Go signing package is exercised against the frozen enrollment, report and
-negative vectors in [the UM v1 contracts](../docs/um/contracts/v1/README.md).
-It prepares the canonical signed bytes and verifies Ed25519. HTTP ingestion
-will own transport checks, identity registration, revocation and replay state.
-Run both the observer and wire tests from this directory with `go test ./...`.
+The signing package is exercised against the frozen rev-5 vectors in
+[`docs/um/contracts/v1`](../docs/um/contracts/v1). It covers:
+
+- enrollment signing string (unchanged) and node-auth 15-line signing string
+  with `X-UM-Boot-Gen`;
+- canonical decimal bounds (`1..2^63-2`), refusal of leading zeros/overflows;
+- request fingerprint (endpoint/method/path/key/boot/seq/sent-at/encoding/body hash);
+- typed field errors and a sign/verify round-trip.
+
+HTTP ingestion, identity registration, revocation and replay state belong to
+UM-B2; this module does not expose a listener.
 
 ## Migration order
 
