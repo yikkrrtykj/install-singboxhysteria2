@@ -112,6 +112,7 @@ func (f *faultOnceService) Report(ctx context.Context, req center.ReportRequest)
 func TestB2REC03LostACKDuplicate(t *testing.T) {
 	tc := startTestCenter(t)
 	a := enrollAgent(t, tc, store.NodeClassLinuxVPS, "linux")
+	a.gen = 5 // fixture setup: generation 5 high-water
 	base := b2BaseCollected(t)
 	doc := b2SnapshotDoc(t, base)
 	nonce := b2Nonce(t)
@@ -129,6 +130,7 @@ func TestB2REC03LostACKDuplicate(t *testing.T) {
 		t.Fatalf("REC-03 high-water=%d want %d", boot.LastSeq, a.seq)
 	}
 	b2AssertREC(t, "REC-03", status, resp)
+	b2AssertRECCenter(t, "REC-03", tc, a.nodeID)
 }
 
 func TestB2REC04NewGenerationFirstReportDuplicate(t *testing.T) {
@@ -137,13 +139,15 @@ func TestB2REC04NewGenerationFirstReportDuplicate(t *testing.T) {
 	a := enrollAgent(t, tc, store.NodeClassLinuxVPS, "linux")
 	base := b2BaseCollected(t)
 	doc := b2SnapshotDoc(t, base)
+	a.gen = 5
+	a.seq = 2 // fixture setup: gen5/last_seq3
 	if status, resp := b2SendReport(t, tc, a, doc, b2Nonce(t)); status != 200 || resp["result"] != "accepted" {
 		t.Fatalf("REC-04 seed: %d %v", status, resp)
 	}
 	b2CloseCenter(t, tc)
-	// New center/restart; agent generation+1, new boot id, replay duplicate report.
+	// New center/restart; agent generation 6, new boot id, replay duplicate report.
 	tc = startTestCenterAt(t, path)
-	a.gen++
+	a.gen = 6
 	a.bootID = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	a.seq = 0
 	status, resp := b2SendReport(t, tc, a, doc, b2Nonce(t))
@@ -155,6 +159,7 @@ func TestB2REC04NewGenerationFirstReportDuplicate(t *testing.T) {
 		t.Fatalf("REC-04 high-water=%+v want gen=%d seq=%d", boot, a.gen, a.seq)
 	}
 	b2AssertREC(t, "REC-04", status, resp)
+	b2AssertRECCenter(t, "REC-04", tc, a.nodeID)
 }
 
 func TestB2REC05GenerationGap(t *testing.T) {
@@ -170,12 +175,14 @@ func TestB2REC05GenerationGap(t *testing.T) {
 		t.Fatalf("REC-05 seed high-water: %d %v", status, resp)
 	}
 	a.gen = 6
+	a.seq = 0
 	a.bootID = "abababababababababababababababab"
 	status, resp := b2SendReport(t, tc, a, b2SnapshotDoc(t, base+1), b2Nonce(t))
 	if status != 200 || resp["result"] != "accepted" {
 		t.Fatalf("REC-05 gap: %d %v", status, resp)
 	}
 	b2AssertREC(t, "REC-05", status, resp)
+	b2AssertRECCenter(t, "REC-05", tc, a.nodeID)
 	boot, err := tc.store.GetBoot(context.Background(), a.nodeID)
 	if err != nil || boot.HighestGen != 6 {
 		t.Fatalf("REC-05 high-water = %+v err=%v", boot, err)
@@ -188,6 +195,7 @@ func TestB2REC05GenerationGap(t *testing.T) {
 func TestB2REC06SpoolReplayOldestFirst(t *testing.T) {
 	tc := startTestCenter(t)
 	a := enrollAgent(t, tc, store.NodeClassLinuxVPS, "linux")
+	a.gen = 6 // fixture setup: agent generation 6, center highest_gen 2
 	base := b2BaseCollected(t)
 	first := b2SnapshotDoc(t, base)
 	second := b2SnapshotDoc(t, base+10)
@@ -208,6 +216,7 @@ func TestB2REC06SpoolReplayOldestFirst(t *testing.T) {
 		t.Fatalf("REC-06 latest=%+v err=%v", latest, err)
 	}
 	b2AssertREC(t, "REC-06", status, resp)
+	b2AssertRECCenter(t, "REC-06", tc, a.nodeID)
 }
 
 func TestB2REC10DelayedLowerSequenceConflict(t *testing.T) {
@@ -227,27 +236,27 @@ func TestB2REC10DelayedLowerSequenceConflict(t *testing.T) {
 func TestB2REC13ACKNextSeqReconciliation(t *testing.T) {
 	tc := startTestCenter(t)
 	a := enrollAgent(t, tc, store.NodeClassLinuxVPS, "linux")
-	seen := map[float64]bool{}
-	for i := 0; i < 5; i++ {
-		status, resp := b2SendReport(t, tc, a, b2SnapshotDoc(t, b2BaseCollected(t)+int64(i)), b2Nonce(t))
+	a.gen = 2 // fixture setup: center high-water last_seq 7, agent next_seq 9
+	for _, attempt := range []struct {
+		seq  uint64
+		next float64
+	}{{7, 8}, {9, 10}} {
+		status, resp := b2ReportWithSeq(t, tc, a, b2SnapshotDoc(t, b2BaseCollected(t)+int64(attempt.seq)), b2Nonce(t), attempt.seq)
 		if status != 200 || resp["result"] != "accepted" {
-			t.Fatalf("REC-13 report %d: %d %v", i, status, resp)
+			t.Fatalf("REC-13 report seq%d: %d %v", attempt.seq, status, resp)
 		}
-		next, ok := resp["next_seq"].(float64)
-		if !ok || next != float64(a.seq+1) {
-			t.Fatalf("REC-13 next_seq=%v seq=%d", resp["next_seq"], a.seq)
+		if next, _ := resp["next_seq"].(float64); next != attempt.next {
+			t.Fatalf("REC-13 seq%d next_seq=%v want %.0f", attempt.seq, resp["next_seq"], attempt.next)
 		}
-		if seen[next] {
-			t.Fatalf("REC-13 repeated next_seq=%v", next)
-		}
-		seen[next] = true
 		b2AssertREC(t, "REC-13", status, resp)
 	}
+	b2AssertRECCenter(t, "REC-13", tc, a.nodeID)
 }
 
 func TestB2REC15AbortedTransactionThenRetry(t *testing.T) {
 	tc := startTestCenter(t)
 	a := enrollAgent(t, tc, store.NodeClassLinuxVPS, "linux")
+	a.gen = 3
 	doc := b2SnapshotDoc(t, b2BaseCollected(t))
 	tc.store.SetIngestHookForTest(func(stage string) error {
 		if stage == "after_highwater" {
@@ -275,11 +284,13 @@ func TestB2REC15AbortedTransactionThenRetry(t *testing.T) {
 		t.Fatalf("REC-15 retry: %d %v", status, resp)
 	}
 	b2AssertREC(t, "REC-15", status, resp)
+	b2AssertRECCenter(t, "REC-15", tc, a.nodeID)
 }
 
 func TestB2REC16NonRetryablePayloadThenNextRecord(t *testing.T) {
 	tc := startTestCenter(t)
 	a := enrollAgent(t, tc, store.NodeClassLinuxVPS, "linux")
+	a.gen = 3
 	bad := map[string]any{"v": 1, "type": "snapshot", "report_id": b2UUID(t), "collected_at": b2BaseCollected(t)}
 	a.seq++
 	h, _ := a.headers(wire.Report, time.Now().Unix(), b2Nonce(t), b2JSON(t, bad))
@@ -292,6 +303,7 @@ func TestB2REC16NonRetryablePayloadThenNextRecord(t *testing.T) {
 		t.Fatalf("REC-16 next record: %d %v", status, resp)
 	}
 	b2AssertREC(t, "REC-16", status, resp)
+	b2AssertRECCenter(t, "REC-16", tc, a.nodeID)
 }
 
 func b2RotateBody(t *testing.T) []byte {
@@ -381,23 +393,26 @@ func TestB2REC22FirstContactConfig(t *testing.T) {
 	tc := startTestCenter(t)
 	a := enrollAgent(t, tc, store.NodeClassLinuxVPS, "linux")
 	body := []byte("{}")
-	a.seq = 2 // first accepted request may be >1
+	a.gen = 5
+	a.seq = 2 // fixture setup: gen5/last_seq2
 	h, _ := a.headers(wire.Config, time.Now().Unix(), b2Nonce(t), body)
 	status, resp := doPost(t, tc, "/v1/agent/config", h, body)
 	if status != 200 || resp["v"].(float64) != 1 {
 		t.Fatalf("REC-22: %d %v", status, resp)
 	}
 	b2AssertREC(t, "REC-22", status, resp)
+	b2AssertRECCenter(t, "REC-22", tc, a.nodeID)
 }
 
 func TestB2REC23FirstContactRotate(t *testing.T) {
 	tc := startTestCenter(t)
 	a := enrollAgent(t, tc, store.NodeClassLinuxVPS, "linux")
-	status, resp := b2RotateSigned(t, tc, a, b2RotateBody(t), b2Nonce(t), 2, 1, a.bootID)
+	status, resp := b2RotateSigned(t, tc, a, b2RotateBody(t), b2Nonce(t), 2, 6, a.bootID)
 	if status != 200 || resp["new_key_id"] == nil {
 		t.Fatalf("REC-23: %d %v", status, resp)
 	}
 	b2AssertREC(t, "REC-23", status, resp)
+	b2AssertRECCenter(t, "REC-23", tc, a.nodeID)
 }
 
 func TestB2REC24EnrollmentResponseLoss(t *testing.T) {
@@ -460,11 +475,13 @@ func TestB2REC30InterleavedGenerations(t *testing.T) {
 	if status, resp := b2ReportWithSeq(t, tc, a, b2SnapshotDoc(t, base), b2Nonce(t), 1); status != 200 || resp["result"] != "accepted" {
 		t.Fatalf("REC-30 gen1: %d %v", status, resp)
 	}
-	// New generation first contact.
+	// New generation first contact, then queued spool records 2..4.
 	a.gen = 2
 	a.bootID = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-	if status, resp := b2ReportWithSeq(t, tc, a, b2SnapshotDoc(t, base+10), b2Nonce(t), 1); status != 200 || resp["result"] != "accepted" {
-		t.Fatalf("REC-30 gen2: %d %v", status, resp)
+	for seq := 1; seq <= 4; seq++ {
+		if status, resp := b2ReportWithSeq(t, tc, a, b2SnapshotDoc(t, base+int64(seq)*10), b2Nonce(t), uint64(seq)); status != 200 || resp["result"] != "accepted" {
+			t.Fatalf("REC-30 gen2 seq%d: %d %v", seq, status, resp)
+		}
 	}
 	// Delayed old-generation attempt is stale, never re-activated.
 	a.gen = 1
@@ -474,6 +491,7 @@ func TestB2REC30InterleavedGenerations(t *testing.T) {
 		t.Fatalf("REC-30 stale: %d %v", status, resp)
 	}
 	b2AssertREC(t, "REC-30", status, resp)
+	b2AssertRECCenter(t, "REC-30", tc, a.nodeID)
 }
 
 func base64URL(b []byte) string { return base64.RawURLEncoding.EncodeToString(b) }

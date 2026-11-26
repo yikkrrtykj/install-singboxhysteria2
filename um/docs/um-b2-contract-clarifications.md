@@ -84,3 +84,55 @@ secret content.
 `report_id` for a different body/type is a `report_conflict`; this is a safe
 conservative reading of the frozen idempotency rule. If a future revision wants
 `report_id` unique per type only, it must be an explicit contract change.
+
+
+## 7. Purge authorization vs B1 immutable mappings (F1)
+
+B1 route-mapping versions/entries remain immutable: ordinary UPDATE/DELETE is
+still rejected by triggers. A purge is the only authorized deletion path and is
+recorded durably in `purge_ops` before any destructive step. The trigger allows
+mapping deletion only while that event's purge operation is in the
+`mapping`/`finalizing` state produced by the store's explicit `PurgeEvent` call;
+there is no generic "delete history" switch or trigger removal.
+
+An incomplete purge blocks ingest, enrollment/token issuance, config/rotation
+updates and ordinary mapping writes, and survives process/database restart. It
+is resumable/idempotent and stays fail-closed until the final tombstone commit.
+
+## 8. Permanent event identity isolation vs 180-day audit tombstone (F2)
+
+`purge_tombstones` is the 180-day **audit** record and may expire. Event-id
+non-reuse is enforced separately by the permanent `event_graveyard` row written
+in the same final purge transaction. Expiry of the audit tombstone therefore
+does not re-authorize the old event id, old nodes or old keys; the old boot
+high-water remains fail-closed and old identities are revoked at purge.
+
+## 9. Effective-dated configuration history (F4)
+
+Reports are validated against `node_config_history` by `collected_at`, not
+against a mutable current row and not by an `updated_at` bypass. A source that
+was never enabled cannot authorize a historical report; an enable→collect→disable
+sequence preserves the historical authorization; unrelated later config changes
+do not widen the old window. The effective boundary uses the config update's
+effective timestamp (collected_at <= effective_from uses the new config). The
+initial enrollment config is fail-closed.
+
+## 10. Endpoint-specific key permission and rotate ordering (F5)
+
+Only Report is the rotation proof path for a provisional key. Config and Rotate
+require an active old key; a provisional key cannot borrow the shared auth path.
+Rotate follows frozen §7 order: transport/auth, boot generation, sequence, then
+nonce-intent match; a failed nonce step rolls back high-water. Rotate replay uses
+the persisted response bytes and does not reread config after commit. Expiry at
+exactly `expires_at` remains valid; after that it is aborted/rotation_expired.
+
+## 11. Report identity beyond the dedupe window (F6)
+
+`report_dedupe` is an 8-day retry cache, while telemetry lives up to 30 days. As
+long as any stored snapshot/metrics/events body for `(node_id, report_id)`
+exists, the report id may not change type or body. Expired dedupe rows therefore
+cannot be used to turn an old snapshot into metrics/events or a different body.
+
+Rejection audit is not best-effort: if the security ledger write for
+nonce_reuse/report_conflict/validation rejection fails, the request returns a
+retryable storage error instead of silently claiming the audit was recorded.

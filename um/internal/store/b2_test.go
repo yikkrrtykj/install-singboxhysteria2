@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/yikkrrtykj/install-singboxhysteria2/um/internal/protocol"
@@ -866,4 +867,290 @@ func TestB2QuotaPerEventAndCatalog(t *testing.T) {
 	if err := s2.CreateEnrollToken(ctx, hash3, "catalog-new", NodeClassLinuxVPS, now+3600, now); !errors.Is(err, ErrQuotaExceeded) {
 		t.Fatalf("event catalog quota = %v, want ErrQuotaExceeded", err)
 	}
+}
+
+func seedEventWithMapping(t *testing.T, s *Store, eventID string, now int64) (EnrolledIdentity, EnrolledIdentity) {
+	t.Helper()
+	ctx := testContext()
+	win := testEnrollEvent(t, s, eventID, NodeClassWindowsTerminal, now)
+	linux := testEnrollEvent(t, s, eventID, NodeClassLinuxVPS, now)
+	if err := s.createMappingVersion(ctx, eventID, win.NodeID, 1, now, "admin",
+		map[string]string{RouteTokenAReality: linux.NodeID}, now); err != nil {
+		t.Fatalf("seed mapping: %v", err)
+	}
+	return win, linux
+}
+
+func TestB2PurgeWithMappingsAndPermanentGraveyard(t *testing.T) {
+	s := openTestStore(t, tempStorePath(t))
+	ctx := testContext()
+	now := int64(1_700_000_000)
+	eventID := "event-purge"
+	_, linux := seedEventWithMapping(t, s, eventID, now)
+	seedTelemetry(t, s, linux, "purge-snap", now-10, now)
+	mustPutBoot(t, s, linux.NodeID, 1, "boot-purge", 1, "fp-purge")
+	// Ordinary mapping delete remains forbidden outside the purge authorization.
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM route_mapping_entries WHERE event_id=?`, eventID); err == nil {
+		t.Fatal("ordinary mapping DELETE was allowed")
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE route_mapping_versions SET effective_to=? WHERE event_id=?`, now+5, eventID); err == nil {
+		t.Fatal("ordinary mapping UPDATE was allowed")
+	}
+	if err := s.PurgeEvent(ctx, eventID, "admin", true, now+1); err != nil {
+		t.Fatalf("purge with mapping: %v", err)
+	}
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM route_mapping_versions WHERE event_id=?`, eventID); got != 0 {
+		t.Fatalf("mapping versions remain after purge: %d", got)
+	}
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM route_mapping_entries WHERE event_id=?`, eventID); got != 0 {
+		t.Fatalf("mapping entries remain after purge: %d", got)
+	}
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM snapshots WHERE event_id=?`, eventID); got != 0 {
+		t.Fatalf("telemetry remains after purge: %d", got)
+	}
+	if exists, err := s.EventGraveyardExists(ctx, eventID); err != nil || !exists {
+		t.Fatalf("graveyard exists=%v err=%v", exists, err)
+	}
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM purge_ops WHERE event_id=? AND state='completed' AND deleted_rows>0`, eventID); got != 1 {
+		t.Fatalf("completed purge operation/progress rows=%d, want 1", got)
+	}
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM security_ledger WHERE kind='event_purged'`); got != 1 {
+		t.Fatalf("event_purged audit rows=%d, want 1", got)
+	}
+	// While the audit tombstone is valid, the event ID is already refused.
+	_, hashLive, _ := NewEnrollToken()
+	if err := s.CreateEnrollToken(ctx, hashLive, eventID, NodeClassLinuxVPS, now+3600, now); !errors.Is(err, ErrEventPurged) {
+		t.Fatalf("token while tombstone valid = %v, want ErrEventPurged", err)
+	}
+	// Tombstone expiry must not re-authorize the event ID.
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM purge_tombstones WHERE event_id=?`, eventID); err != nil {
+		t.Fatalf("expire tombstone: %v", err)
+	}
+	_, hash, _ := NewEnrollToken()
+	if err := s.CreateEnrollToken(ctx, hash, eventID, NodeClassLinuxVPS, now+3600, now); !errors.Is(err, ErrEventPurged) {
+		t.Fatalf("reissued token for purged event = %v, want ErrEventPurged", err)
+	}
+	// Old nodes/keys stay revoked and cannot regain eligibility.
+	node, err := s.GetNode(ctx, linux.NodeID)
+	if err != nil || node.State != NodeRevoked {
+		t.Fatalf("purged node state=%+v err=%v", node, err)
+	}
+	key, err := s.GetKey(ctx, linux.NodeID, linux.KeyID)
+	if err != nil || key.State != KeyRevoked {
+		t.Fatalf("purged key state=%+v err=%v", key, err)
+	}
+	// A fresh event with the same ID cannot be created by token issuance.
+	if _, err := s.EventState(ctx, eventID); !errors.Is(err, ErrEventUnknown) {
+		t.Fatalf("event catalog after purge = %v, want unknown", err)
+	}
+	// The old high-water remains persisted/fail-closed, and the old identity is
+	// blocked before any transport state can advance it.
+	if _, err := s.GetBoot(ctx, linux.NodeID); err != nil {
+		t.Fatalf("purge deleted authoritative old boot high-water: %v", err)
+	}
+	if err := s.WithTx(ctx, func(tx *Tx) error {
+		_, err := tx.EventActiveTx(ctx, eventID)
+		return err
+	}); !errors.Is(err, ErrEventPurged) {
+		t.Fatalf("old identity event gate = %v, want ErrEventPurged", err)
+	}
+}
+
+func TestB2PurgeRecoveryAndFaults(t *testing.T) {
+	path := tempStorePath(t)
+	s := openTestStore(t, path)
+	ctx := testContext()
+	now := int64(1_700_000_000)
+	eventID := "event-purge-fault"
+	_, linux := seedEventWithMapping(t, s, eventID, now)
+	seedTelemetry(t, s, linux, "fault-snap", now-10, now)
+	// Failure after a committed telemetry batch leaves a persisted op; data that
+	// was not yet processed is still there and ingest stays blocked.
+	s.SetRetentionHookForTest(func(stage string) error {
+		if stage == "purge:after_batch" {
+			return errors.New("injected after batch")
+		}
+		return nil
+	})
+	if err := s.PurgeEvent(ctx, eventID, "admin", true, now+1); err == nil {
+		t.Fatal("injected purge failure was not reported")
+	}
+	if err := s.WithTx(ctx, func(tx *Tx) error {
+		_, err := tx.EventActiveTx(ctx, eventID)
+		return err
+	}); !errors.Is(err, ErrEventPurged) {
+		t.Fatalf("ingest gate after failed purge = %v, want ErrEventPurged", err)
+	}
+	s.SetRetentionHookForTest(nil)
+	// Restart the database; retry resumes and completes the purge.
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	s = openTestStore(t, path)
+	defer s.Close()
+	if err := s.PurgeEvent(ctx, eventID, "admin", true, now+2); err != nil {
+		t.Fatalf("resume purge after restart: %v", err)
+	}
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM route_mapping_versions WHERE event_id=?`, eventID); got != 0 {
+		t.Fatalf("mapping versions after resumed purge=%d", got)
+	}
+	if exists, err := s.EventGraveyardExists(ctx, eventID); err != nil || !exists {
+		t.Fatalf("graveyard after resume=%v err=%v", exists, err)
+	}
+	// Mapping/tombstone-stage faults are also resumable.
+	for _, stage := range []string{"purge:mapping", "purge:tombstone"} {
+		p := tempStorePath(t)
+		s2 := openTestStore(t, p)
+		ev := "event-fault-" + stage
+		_, l2 := seedEventWithMapping(t, s2, ev, now)
+		seedTelemetry(t, s2, l2, "f-"+stage, now-10, now)
+		s2.SetRetentionHookForTest(func(got string) error {
+			if got == stage {
+				return errors.New("injected " + stage)
+			}
+			return nil
+		})
+		if err := s2.PurgeEvent(ctx, ev, "admin", true, now+1); err == nil {
+			t.Fatalf("%s fault not reported", stage)
+		}
+		s2.SetRetentionHookForTest(nil)
+		if err := s2.PurgeEvent(ctx, ev, "admin", true, now+2); err != nil {
+			t.Fatalf("resume %s: %v", stage, err)
+		}
+		if exists, err := s2.EventGraveyardExists(ctx, ev); err != nil || !exists {
+			t.Fatalf("%s graveyard=%v err=%v", stage, exists, err)
+		}
+		_ = s2.Close()
+	}
+}
+
+func TestB2PurgeBlocksIngestAndEnrollmentConcurrently(t *testing.T) {
+	s := openTestStore(t, tempStorePath(t))
+	ctx := testContext()
+	now := int64(1_700_000_000)
+	eventID := "event-purge-concurrent"
+	win, linux := seedEventWithMapping(t, s, eventID, now)
+	seedTelemetry(t, s, linux, "conc-snap", now-10, now)
+	// Start a purge that fails after persisting the operation, so the event stays
+	// blocked while ingest attempts race it.
+	s.SetRetentionHookForTest(func(stage string) error {
+		if stage == "purge:persisted" {
+			return errors.New("hold purge after persisted")
+		}
+		return nil
+	})
+	if err := s.PurgeEvent(ctx, eventID, "admin", true, now+1); err == nil {
+		t.Fatal("purge hold not reported")
+	}
+	s.SetRetentionHookForTest(nil)
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, _, err := s.ApplyIngest(ctx, linux.NodeID, protocol.Attempt{Gen: 1, BootID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Seq: 1, Fingerprint: "fp"}, "fp",
+			func(tx *Tx) error {
+				_, err := tx.EventActiveTx(ctx, eventID)
+				return err
+			}, nil)
+		errs <- err
+	}()
+	go func() {
+		defer wg.Done()
+		_, hash, _ := NewEnrollToken()
+		errs <- s.CreateEnrollToken(ctx, hash, eventID, NodeClassWindowsTerminal, now+3600, now)
+	}()
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err == nil {
+			t.Fatal("ingest/enrollment succeeded during purging")
+		}
+		if !errors.Is(err, ErrEventPurged) && !errors.Is(err, ErrEventUnknown) {
+			t.Fatalf("unexpected concurrent purge error: %v", err)
+		}
+	}
+	// Ordinary mapping/config writes are also blocked by the purging state.
+	if err := s.CreateMappingVersion(ctx, eventID, win.NodeID, 2, now+100, "admin",
+		map[string]string{RouteTokenAReality: linux.NodeID}); err == nil {
+		t.Fatal("mapping write succeeded during purging")
+	}
+	if _, err := s.UpdateNodeConfig(ctx, linux.NodeID, nil, nil, 60, now+100); err == nil {
+		t.Fatal("config update succeeded during purging")
+	}
+	_ = win
+}
+
+func TestB2RetentionRunsBoundedAndLatestFK(t *testing.T) {
+	s := openTestStore(t, tempStorePath(t))
+	ctx := testContext()
+	now := int64(1_700_000_000)
+	id := testEnrollEvent(t, s, "event-runs", NodeClassLinuxVPS, now)
+	// Latest state old enough to be removed; it references a snapshot row that is
+	// also deleted, so FK ordering must be correct.
+	if err := s.WithTx(ctx, func(tx *Tx) error {
+		_, err := tx.StoreSnapshotTx(ctx, SnapshotRecord{NodeID: id.NodeID, EventID: id.EventID, NodeClass: id.NodeClass,
+			ReportID: "old-latest", CollectedAt: now - 40*24*60*60, ReceivedAt: now - 40*24*60*60,
+			BodySHA256: "old-hash", Payload: []byte(`{"v":1}`)})
+		return err
+	}); err != nil {
+		t.Fatalf("seed latest: %v", err)
+	}
+	// Seed more retention_runs than the bound; one run must cap them.
+	for i := 0; i < 105; i++ {
+		if _, err := s.db.ExecContext(ctx, `INSERT INTO retention_runs(ran_at,result_json) VALUES(?,?)`, now+int64(i), `{}`); err != nil {
+			t.Fatalf("seed retention run: %v", err)
+		}
+	}
+	if _, err := s.RunRetentionB2(ctx, now); err != nil {
+		t.Fatalf("retention: %v", err)
+	}
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM retention_runs`); got != RetentionRunsKeep {
+		t.Fatalf("retention_runs=%d, want %d", got, RetentionRunsKeep)
+	}
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM node_latest WHERE node_id=?`, id.NodeID); got != 0 {
+		t.Fatalf("expired latest pointer survived: %d", got)
+	}
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM snapshots WHERE report_id='old-latest'`); got != 0 {
+		t.Fatalf("expired snapshot survived: %d", got)
+	}
+}
+
+func TestB2RotationExpiryEqualityBoundary(t *testing.T) {
+	s := openTestStore(t, tempStorePath(t))
+	ctx := testContext()
+	now := int64(1_700_000_000)
+	id := testEnroll(t, s, NodeClassLinuxVPS, now)
+	var keyID string
+	if err := s.WithTx(ctx, func(tx *Tx) error {
+		if err := tx.CreateRotationTx(ctx, RotationRecord{NodeID: id.NodeID, OldKeyID: id.KeyID, Nonce: "eq", BodySHA256: "h", ExpiresAt: now, CreatedAt: now}, testPublicKey(t)); err != nil {
+			return err
+		}
+		rec, _, err := tx.RotationTx(ctx, id.NodeID, "eq")
+		keyID = rec.NewKeyID
+		return err
+	}); err != nil {
+		t.Fatalf("create rotation: %v", err)
+	}
+	// At exactly expires_at the intent is still valid for confirmation.
+	if err := s.WithTx(ctx, func(tx *Tx) error {
+		_, err := tx.ConfirmRotationTx(ctx, id.NodeID, "eq", now)
+		return err
+	}); err != nil {
+		t.Fatalf("confirm at expiry equality: %v", err)
+	}
+	// A second rotation with expiry now must not be aborted at equality.
+	id2 := testEnroll(t, s, NodeClassLinuxVPS, now+1)
+	if err := s.WithTx(ctx, func(tx *Tx) error {
+		return tx.CreateRotationTx(ctx, RotationRecord{NodeID: id2.NodeID, OldKeyID: id2.KeyID, Nonce: "eq2", BodySHA256: "h", ExpiresAt: now + 10, CreatedAt: now + 1}, testPublicKey(t))
+	}); err != nil {
+		t.Fatalf("create second: %v", err)
+	}
+	if n, err := s.AbortExpiredRotations(ctx, now+10); err != nil || n != 0 {
+		t.Fatalf("abort at equality = %d err=%v, want 0", n, err)
+	}
+	if n, err := s.AbortExpiredRotations(ctx, now+11); err != nil || n != 1 {
+		t.Fatalf("abort after expiry = %d err=%v, want 1", n, err)
+	}
+	_ = keyID
 }

@@ -5,6 +5,7 @@ package center_test
 // from the frozen REC JSON rather than copied into the test.
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"testing"
@@ -81,5 +82,24 @@ func b2AssertREC(t *testing.T, id string, status int, resp map[string]any) {
 		if got, _ := resp["result"].(string); got != c.Expected.Result {
 			t.Fatalf("%s fixture result=%q, got %q", id, c.Expected.Result, got)
 		}
+	}
+}
+
+// b2AssertRECCenter compares the persistent center high-water with fixture
+// center_state fields that are machine-readable (highest_gen/last_seq). The
+// fixture's shorthand boot_id values are not protocol-formatted 32-hex ids and
+// are not invented into the synthetic driver.
+func b2AssertRECCenter(t *testing.T, id string, tc *testCenter, nodeID string) {
+	t.Helper()
+	c := b2REC(t, id)
+	boot, err := tc.store.GetBoot(context.Background(), nodeID)
+	if err != nil {
+		t.Fatalf("%s center boot read: %v", id, err)
+	}
+	if c.Expected.CenterState.HighestGen != nil && boot.HighestGen != *c.Expected.CenterState.HighestGen {
+		t.Fatalf("%s highest_gen=%d, fixture want %d", id, boot.HighestGen, *c.Expected.CenterState.HighestGen)
+	}
+	if c.Expected.CenterState.LastSeq != nil && boot.LastSeq != *c.Expected.CenterState.LastSeq {
+		t.Fatalf("%s last_seq=%d, fixture want %d", id, boot.LastSeq, *c.Expected.CenterState.LastSeq)
 	}
 }

@@ -151,3 +151,21 @@ and backup/restore acceptance.
 - Security ledger entries are written for token/config/rotation/revocation,
   boot_generation_gap and privacy rejections; ledger retention/capacity and
   checkpoints remain UM-E.
+
+
+## Round-8 targeted lifecycle additions
+
+- Purge is a durable operation (`purge_ops`): persisted authorization/progress,
+  resumable across restart, blocks all normal event writes while incomplete,
+  deletes mappings only inside the explicit mapping/finalizing state while B1
+  triggers remain in force, then writes audit tombstone + permanent event
+  graveyard in one final transaction.
+- Event-id non-reuse is permanent (`event_graveyard`), independent of the 180-day
+  audit tombstone; purge revokes old nodes/keys and leaves old high-water intact.
+- Configuration is effective-dated (`node_config_history`); Report uses the
+  configuration effective at `collected_at`, closing the old updated_at bypass.
+- Report is the only provisional-key proof endpoint; Config/Rotate require active
+  old keys; Rotate follows frozen §7 boot/seq-before-nonce ordering and does not
+  reread config after commit.
+- Report identity is checked across the 8-day dedupe cache and 30-day telemetry,
+  so an expired dedupe row cannot change report type/body.

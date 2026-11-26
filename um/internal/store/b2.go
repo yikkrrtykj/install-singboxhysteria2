@@ -616,7 +616,7 @@ func (s *Store) AbortExpiredRotations(ctx context.Context, now int64) (int, erro
 	}
 	defer func() { _ = tx.Rollback() }()
 	rows, err := tx.QueryContext(ctx,
-		`SELECT node_id,new_key_id,nonce FROM key_rotations WHERE state=? AND expires_at<=?`,
+		`SELECT node_id,new_key_id,nonce FROM key_rotations WHERE state=? AND expires_at < ?`,
 		RotationAwaitingProof, now)
 	if err != nil {
 		return 0, fmt.Errorf("store: list expired rotations: %w", err)
@@ -778,6 +778,12 @@ func insertNodeConfig(ctx context.Context, q execQuerier, cfg NodeConfig) error 
 		cfg.NodeID, cfg.EventID, cfg.ConfigVersion, cfg.CadenceSeconds, string(src), string(tags), cfg.DeviceSalt, cfg.UpdatedAt); err != nil {
 		return fmt.Errorf("store: insert node config: %w", err)
 	}
+	if _, err := q.ExecContext(ctx,
+		`INSERT INTO node_config_history(node_id,event_id,config_version,effective_from,sources_json,expected_inbound_tags_json,cadence_seconds,device_salt)
+		 VALUES(?,?,?,?,?,?,?,?)`,
+		cfg.NodeID, cfg.EventID, cfg.ConfigVersion, cfg.UpdatedAt, string(src), string(tags), cfg.CadenceSeconds, cfg.DeviceSalt); err != nil {
+		return fmt.Errorf("store: insert node config history: %w", err)
+	}
 	return nil
 }
 
@@ -800,6 +806,39 @@ func (t *Tx) ConfigTx(ctx context.Context, nodeID string) (NodeConfig, error) {
 	}
 	if err := json.Unmarshal([]byte(tags), &cfg.ExpectedInboundTags); err != nil {
 		return NodeConfig{}, fmt.Errorf("store: decode expected tags: %w", err)
+	}
+	return cfg, nil
+}
+
+// ConfigAtTx returns the configuration effective at collectedAt from the
+// append-only history. If no history is old enough, the earliest (initial,
+// fail-closed) config is returned, so a report collected before the first
+// admin enable cannot borrow a later source authorization.
+func (t *Tx) ConfigAtTx(ctx context.Context, nodeID string, collectedAt int64) (NodeConfig, error) {
+	var cfg NodeConfig
+	var src, tags string
+	err := t.tx.QueryRowContext(ctx,
+		`SELECT node_id,event_id,config_version,cadence_seconds,sources_json,expected_inbound_tags_json,device_salt,effective_from
+		 FROM node_config_history WHERE node_id=? AND effective_from <= ?
+		 ORDER BY effective_from DESC, config_version DESC LIMIT 1`, nodeID, collectedAt).
+		Scan(&cfg.NodeID, &cfg.EventID, &cfg.ConfigVersion, &cfg.CadenceSeconds, &src, &tags, &cfg.DeviceSalt, &cfg.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		err = t.tx.QueryRowContext(ctx,
+			`SELECT node_id,event_id,config_version,cadence_seconds,sources_json,expected_inbound_tags_json,device_salt,effective_from
+			 FROM node_config_history WHERE node_id=? ORDER BY effective_from ASC, config_version ASC LIMIT 1`, nodeID).
+			Scan(&cfg.NodeID, &cfg.EventID, &cfg.ConfigVersion, &cfg.CadenceSeconds, &src, &tags, &cfg.DeviceSalt, &cfg.UpdatedAt)
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return NodeConfig{}, ErrNotFound
+	}
+	if err != nil {
+		return NodeConfig{}, fmt.Errorf("store: read node config history: %w", err)
+	}
+	if err := json.Unmarshal([]byte(src), &cfg.Sources); err != nil {
+		return NodeConfig{}, fmt.Errorf("store: decode historical config sources: %w", err)
+	}
+	if err := json.Unmarshal([]byte(tags), &cfg.ExpectedInboundTags); err != nil {
+		return NodeConfig{}, fmt.Errorf("store: decode historical expected tags: %w", err)
 	}
 	return cfg, nil
 }
@@ -831,6 +870,9 @@ func (s *Store) UpdateNodeConfig(ctx context.Context, nodeID string, sources map
 	if err != nil {
 		return NodeConfig{}, err
 	}
+	if err := eventBlockedTx(ctx, tx, node.EventID); err != nil {
+		return NodeConfig{}, err
+	}
 	cfg, err := t.ConfigTx(ctx, nodeID)
 	if err != nil {
 		return NodeConfig{}, err
@@ -855,6 +897,12 @@ func (s *Store) UpdateNodeConfig(ctx context.Context, nodeID string, sources map
 		`UPDATE node_configs SET config_version=?,cadence_seconds=?,sources_json=?,expected_inbound_tags_json=?,updated_at=? WHERE node_id=?`,
 		cfg.ConfigVersion, cfg.CadenceSeconds, string(src), string(tagsJSON), now, nodeID); err != nil {
 		return NodeConfig{}, fmt.Errorf("store: update node config: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO node_config_history(node_id,event_id,config_version,effective_from,sources_json,expected_inbound_tags_json,cadence_seconds,device_salt)
+		 VALUES(?,?,?,?,?,?,?,?)`,
+		nodeID, node.EventID, cfg.ConfigVersion, now, string(src), string(tagsJSON), cfg.CadenceSeconds, cfg.DeviceSalt); err != nil {
+		return NodeConfig{}, fmt.Errorf("store: insert config history: %w", err)
 	}
 	if _, err := appendLedgerTx(ctx, tx, now, "config_update", nodeID, ledgerDetailHash(fmt.Sprintf("v%d", cfg.ConfigVersion))); err != nil {
 		return NodeConfig{}, err
@@ -1211,6 +1259,37 @@ func (t *Tx) StoreMetricsTx(ctx context.Context, rec ReportRecord) (ReportDispos
 		return "", fmt.Errorf("store: insert metrics report: %w", err)
 	}
 	return DispositionAccepted, nil
+}
+
+// ExistingReportKindHash checks the report id across report_dedupe and the
+// persistent telemetry tables, so an expired 8-day dedupe row cannot make a
+// 30-day-old snapshot/metrics/events report change type or body.
+func (t *Tx) ExistingReportKindHash(ctx context.Context, nodeID, reportID string) (kind, hash string, exists bool, err error) {
+	var h string
+	err = t.tx.QueryRowContext(ctx, `SELECT body_sha256 FROM report_dedupe WHERE node_id=? AND report_id=?`, nodeID, reportID).Scan(&h)
+	if err == nil {
+		return "dedupe", h, true, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return "", "", false, fmt.Errorf("store: read report dedupe: %w", err)
+	}
+	for _, q := range []struct {
+		kind string
+		sql  string
+	}{
+		{"snapshot", `SELECT body_sha256 FROM snapshots WHERE node_id=? AND report_id=?`},
+		{"metrics", `SELECT body_sha256 FROM report_metrics WHERE node_id=? AND report_id=?`},
+		{"events", `SELECT body_sha256 FROM report_event_reports WHERE node_id=? AND report_id=?`},
+	} {
+		err := t.tx.QueryRowContext(ctx, q.sql, nodeID, reportID).Scan(&h)
+		if err == nil {
+			return q.kind, h, true, nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return "", "", false, fmt.Errorf("store: read stored report: %w", err)
+		}
+	}
+	return "", "", false, nil
 }
 
 // StoreEventsTx persists a validated events report. The caller supplies the

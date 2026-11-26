@@ -35,7 +35,7 @@ import (
 // SchemaVersion is the highest migration version this build knows. Open always
 // migrates a database to exactly this version; a database with a newer version
 // is rejected fail-closed instead of being silently used by older code.
-const SchemaVersion = 5
+const SchemaVersion = 7
 
 // Node classes accepted by the rev-5 platform isolation contract.
 const (
@@ -480,6 +480,60 @@ var migrations = []migration{
 		`ALTER TABLE report_events_new RENAME TO report_events`,
 		`CREATE INDEX IF NOT EXISTS idx_report_events_node_collected ON report_events(node_id, collected_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_report_event_reports_event ON report_event_reports(event_id, collected_at)`,
+	}},
+	{version: 6, statements: []string{
+		// F1: durable purge operation before any destructive step. The row is the
+		// authorization context for mapping deletion; B1 immutability triggers stay
+		// in force for every non-purge path.
+		`CREATE TABLE IF NOT EXISTS purge_ops (
+			op_id       TEXT PRIMARY KEY,
+			event_id    TEXT NOT NULL,
+			actor       TEXT NOT NULL,
+			started_at  INTEGER NOT NULL,
+			updated_at  INTEGER NOT NULL,
+			state       TEXT NOT NULL CHECK (state IN ('purging','mapping','finalizing','completed')),
+			phase       TEXT NOT NULL,
+			deleted_rows INTEGER NOT NULL DEFAULT 0,
+			error       TEXT
+		) STRICT`,
+		`CREATE INDEX IF NOT EXISTS idx_purge_ops_event ON purge_ops(event_id, state)`,
+		// Permanent event-id identity isolation; distinct from the 180-day audit
+		// tombstone (purge_tombstones) and retained after the latter expires.
+		`CREATE TABLE IF NOT EXISTS event_graveyard (
+			event_id   TEXT PRIMARY KEY,
+			purged_at  INTEGER NOT NULL,
+			op_id      TEXT NOT NULL
+		) STRICT`,
+		`DROP TRIGGER IF EXISTS route_mapping_versions_no_delete`,
+		`DROP TRIGGER IF EXISTS route_mapping_entries_no_delete`,
+		`CREATE TRIGGER route_mapping_versions_no_delete
+			BEFORE DELETE ON route_mapping_versions
+			WHEN NOT EXISTS (SELECT 1 FROM purge_ops p WHERE p.event_id = OLD.event_id AND p.state IN ('mapping','finalizing'))
+			BEGIN SELECT RAISE(ABORT, 'route_mapping_versions are immutable'); END`,
+		`CREATE TRIGGER route_mapping_entries_no_delete
+			BEFORE DELETE ON route_mapping_entries
+			WHEN NOT EXISTS (SELECT 1 FROM purge_ops p WHERE p.event_id = OLD.event_id AND p.state IN ('mapping','finalizing'))
+			BEGIN SELECT RAISE(ABORT, 'route_mapping_entries are immutable'); END`,
+	}},
+	{version: 7, statements: []string{
+		// F4: effective-dated config history. Reports are validated against the
+		// configuration that was effective at collected_at, not a mutable current
+		// row or an "updated_at" bypass.
+		`CREATE TABLE IF NOT EXISTS node_config_history (
+			id             INTEGER PRIMARY KEY AUTOINCREMENT,
+			node_id        TEXT NOT NULL REFERENCES nodes(node_id),
+			event_id       TEXT NOT NULL,
+			config_version INTEGER NOT NULL CHECK (config_version >= 1),
+			effective_from INTEGER NOT NULL CHECK (typeof(effective_from) = 'integer'),
+			sources_json   TEXT NOT NULL,
+			expected_inbound_tags_json TEXT NOT NULL,
+			cadence_seconds INTEGER NOT NULL,
+			device_salt    TEXT NOT NULL,
+			UNIQUE(node_id, config_version)
+		) STRICT`,
+		`INSERT OR IGNORE INTO node_config_history(node_id,event_id,config_version,effective_from,sources_json,expected_inbound_tags_json,cadence_seconds,device_salt)
+		 SELECT node_id,event_id,config_version,updated_at,sources_json,expected_inbound_tags_json,cadence_seconds,device_salt FROM node_configs`,
+		`CREATE INDEX IF NOT EXISTS idx_node_config_history_lookup ON node_config_history(node_id, effective_from DESC, config_version DESC)`,
 	}},
 }
 

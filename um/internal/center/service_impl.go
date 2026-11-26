@@ -163,7 +163,7 @@ func (s *ServiceImpl) checkFreshness(now int64, sentAtValue string) (int64, erro
 // authzKeyTx re-checks node/key state inside the authenticated ingest
 // transaction. A provisional key can be accepted only as a rotation proof; the
 // confirmation revokes the old key atomically in the same transaction.
-func (s *ServiceImpl) authzKeyTx(ctx context.Context, tx *store.Tx, nodeID, keyID string, now int64) error {
+func (s *ServiceImpl) authzKeyTx(ctx context.Context, tx *store.Tx, nodeID, keyID string, now int64, allowProvisional bool) error {
 	node, err := tx.NodeTx(ctx, nodeID)
 	if err != nil {
 		return mapServiceError(err)
@@ -171,13 +171,11 @@ func (s *ServiceImpl) authzKeyTx(ctx context.Context, tx *store.Tx, nodeID, keyI
 	if node.State != store.NodeActive {
 		return apiErr(401, "revoked_key", false)
 	}
-	event, err := tx.EventStateTx(ctx, node.EventID)
+	event, err := tx.EventActiveTx(ctx, node.EventID)
 	if err != nil {
 		return mapServiceError(err)
 	}
-	if event.State != store.EventActive {
-		return apiErr(409, "identity_mismatch", false)
-	}
+	_ = event
 	key, err := tx.KeyTx(ctx, nodeID, keyID)
 	if err != nil {
 		return mapServiceError(err)
@@ -186,6 +184,9 @@ func (s *ServiceImpl) authzKeyTx(ctx context.Context, tx *store.Tx, nodeID, keyI
 	case store.KeyActive:
 		return nil
 	case store.KeyProvisional:
+		if !allowProvisional {
+			return apiErr(401, "revoked_key", false)
+		}
 		rec, ok, err := tx.RotationByNewKeyTx(ctx, nodeID, keyID)
 		if err != nil {
 			return mapServiceError(err)
@@ -323,18 +324,19 @@ func (s *ServiceImpl) Report(ctx context.Context, req ReportRequest) (ReportResu
 	var disposition store.ReportDisposition
 	var cfg store.NodeConfig
 	validationRejected := false
+	auditKind := ""
 	attempt := protocol.Attempt{
 		Gen: req.FieldsBootGen(), BootID: req.Fields.BootID, Seq: req.FieldsSeq(),
 		Fingerprint: req.Fingerprint,
 	}
 	result, _, err := s.store.ApplyIngest(ctx, node.NodeID, attempt, req.Fingerprint,
 		func(tx *store.Tx) error {
-			if err := s.authzKeyTx(ctx, tx, node.NodeID, req.Fields.KeyID, now); err != nil {
+			if err := s.authzKeyTx(ctx, tx, node.NodeID, req.Fields.KeyID, now, true); err != nil {
 				return err
 			}
 			// The configuration used for payload/source validation must be the one
 			// read in this same transaction, not an earlier snapshot.
-			c, err := tx.ConfigTx(ctx, node.NodeID)
+			c, err := tx.ConfigAtTx(ctx, node.NodeID, env.CollectedAt)
 			if err != nil {
 				return mapServiceError(err)
 			}
@@ -346,7 +348,7 @@ func (s *ServiceImpl) Report(ctx context.Context, req ReportRequest) (ReportResu
 				validationRejected = true
 				return mapServiceError(err)
 			}
-			if err := validateReportSources(node.NodeClass, req.ReportType, req.Body, c.Sources, c.UpdatedAt, env.CollectedAt); err != nil {
+			if err := validateReportSources(node.NodeClass, req.ReportType, req.Body, c.Sources); err != nil {
 				validationRejected = true
 				return err
 			}
@@ -365,17 +367,27 @@ func (s *ServiceImpl) Report(ctx context.Context, req ReportRequest) (ReportResu
 				return mapServiceError(err)
 			}
 			if nonceStatus == store.NonceReuse {
+				auditKind = "nonce_reuse"
 				return apiErr(409, "nonce_reuse", false)
 			}
 			cfg = c
 			return nil
 		},
 		func(tx *store.Tx) (store.ReportDisposition, error) {
+			if existingKind, existingHash, exists, err := tx.ExistingReportKindHash(ctx, node.NodeID, env.ReportID); err != nil {
+				return "", mapServiceError(err)
+			} else if exists && (existingKind != "dedupe" && existingKind != env.Type || existingHash != bodyHash) {
+				// The 8-day dedupe row may have expired while the 30-day telemetry
+				// still exists; report type/body identity must remain immutable.
+				auditKind = "report_conflict"
+				return "", apiErr(409, "report_conflict", false)
+			}
 			reportStatus, err := tx.CheckOrInsertReport(ctx, node.NodeID, env.ReportID, bodyHash, now)
 			if err != nil {
 				return "", mapServiceError(err)
 			}
 			if reportStatus == store.ReportConflict {
+				auditKind = "report_conflict"
 				return "", apiErr(409, "report_conflict", false)
 			}
 			if reportStatus == store.ReportDuplicate {
@@ -433,10 +445,16 @@ func (s *ServiceImpl) Report(ctx context.Context, req ReportRequest) (ReportResu
 			return disposition, nil
 		})
 	if err != nil {
-		if validationRejected {
+		if validationRejected && auditKind == "" {
+			auditKind = "report_rejected"
+		}
+		if auditKind != "" {
 			// The rejection rolled back the ingest transaction; record the audit in
-			// its own transaction so it survives, without payload/secret content.
-			_, _ = s.store.AppendLedger(ctx, now, "report_rejected", node.NodeID, bodyHash)
+			// its own transaction. An audit failure is not silently ignored: the
+			// caller gets a retryable storage error instead of a claimed audit.
+			if _, aerr := s.store.AppendLedger(ctx, now, auditKind, node.NodeID, bodyHash); aerr != nil {
+				return ReportResult{}, apiErr(503, "storage_unavailable", true)
+			}
 		}
 		return ReportResult{}, mapServiceError(err)
 	}
@@ -513,21 +531,18 @@ func (s *ServiceImpl) Rotate(ctx context.Context, req RotateRequest) (RotateResu
 	var previousKeyID, newKeyID string
 	_, _, err = s.store.ApplyIngest(ctx, node.NodeID, attempt, req.FieldsFingerprint(),
 		func(tx *store.Tx) error {
-			if err := s.authzKeyTx(ctx, tx, node.NodeID, req.Fields.KeyID, now); err != nil {
-				return err
-			}
-			// Rotation nonce/intent replay is still behind full auth; nonce reuse
-			// is checked before boot/seq conflict classification.
-			nonceStatus, err := tx.CheckOrInsertNonce(ctx, node.NodeID, req.Fields.Nonce, rotateFP, now)
-			if err != nil {
-				return mapServiceError(err)
-			}
-			if nonceStatus == store.NonceReuse {
-				return apiErr(409, "nonce_reuse", false)
-			}
-			return nil
+			return s.authzKeyTx(ctx, tx, node.NodeID, req.Fields.KeyID, now, false)
 		},
 		func(tx *store.Tx) (store.ReportDisposition, error) {
+			// Frozen §7 order: boot/sequence validation happened in Evaluate;
+			// nonce intent match is step 6. A nonce failure rolls back high-water.
+			nonceStatus, err := tx.CheckOrInsertNonce(ctx, node.NodeID, req.Fields.Nonce, rotateFP, now)
+			if err != nil {
+				return "", mapServiceError(err)
+			}
+			if nonceStatus == store.NonceReuse {
+				return "", apiErr(409, "nonce_reuse", false)
+			}
 			if existing, ok, err := tx.RotationTx(ctx, node.NodeID, req.Fields.Nonce); err != nil {
 				return "", mapServiceError(err)
 			} else if ok {
@@ -579,12 +594,10 @@ func (s *ServiceImpl) Rotate(ctx context.Context, req RotateRequest) (RotateResu
 	if err != nil {
 		return RotateResult{}, mapServiceError(err)
 	}
-	cfg, err := s.nodeConfig(ctx, node.NodeID)
-	if err != nil {
-		return RotateResult{}, err
-	}
+	// No post-commit config reread: the boundary writes the persisted rotate
+	// response bytes verbatim when Response is non-empty.
 	return RotateResult{Response: responseBody, PreviousKeyID: previousKeyID, NewKeyID: newKeyID,
-		ConfigVersion: cfg.ConfigVersion, ServerTime: now}, nil
+		ConfigVersion: 0, ServerTime: now}, nil
 }
 
 // Config pulls the complete center-managed agent config after full auth.
@@ -624,7 +637,7 @@ func (s *ServiceImpl) Config(ctx context.Context, req ConfigRequest) (ConfigResu
 	attempt := protocol.Attempt{Gen: req.FieldsBootGen(), BootID: req.Fields.BootID, Seq: req.FieldsSeq(), Fingerprint: fp}
 	_, _, err = s.store.ApplyIngest(ctx, node.NodeID, attempt, fp,
 		func(tx *store.Tx) error {
-			if err := s.authzKeyTx(ctx, tx, node.NodeID, req.Fields.KeyID, now); err != nil {
+			if err := s.authzKeyTx(ctx, tx, node.NodeID, req.Fields.KeyID, now, false); err != nil {
 				return err
 			}
 			// Nonce ordering is before transport/high-water evaluation.
@@ -729,10 +742,7 @@ func validateClassConfigForClass(nodeClass string, cfg store.NodeConfig) error {
 // validateReportSources enforces the center-managed source switches while keeping
 // legal old spool data (collected at/before the config update) and honest
 // unavailable/null/empty states acceptable after a switch is disabled.
-func validateReportSources(nodeClass, reportType string, body []byte, sources map[string]bool, configUpdatedAt, collectedAt int64) error {
-	if collectedAt <= configUpdatedAt {
-		return nil // historical spool created before the current config
-	}
+func validateReportSources(nodeClass, reportType string, body []byte, sources map[string]bool) error {
 	var availability map[string]string
 	switch reportType {
 	case "snapshot":

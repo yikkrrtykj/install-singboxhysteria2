@@ -76,6 +76,7 @@ func TestB2ConcurrentDuplicateReport(t *testing.T) {
 
 func TestB2SyntheticLoadSmoke(t *testing.T) {
 	tc := startTestCenter(t)
+	started := time.Now()
 	const linuxNodes = 4
 	const windowsNodes = 30
 	base := b2BaseCollected(t)
@@ -115,6 +116,15 @@ func TestB2SyntheticLoadSmoke(t *testing.T) {
 	if got := queryRawInt(t, tc, `SELECT COUNT(DISTINCT event_id) FROM snapshots`); got != 2 {
 		t.Fatalf("smoke stored snapshots across %d events, want 2-event isolation", got)
 	}
+	ext, err := tc.store.CapacityStatsExtended(context.Background())
+	if err != nil {
+		t.Fatalf("extended capacity: %v", err)
+	}
+	elapsed := time.Since(started)
+	reports := linuxNodes + windowsNodes
+	t.Logf("capacity smoke: db=%dB wal=%dB nodes=%dB snapshots=%dB metrics=%dB events=%dB active_events=%d archived_events=%d catalog=%d; reports=%d elapsed=%s avg_tx=%s",
+		ext.DBSizeBytes, ext.WALSizeBytes, ext.NodesBytes, ext.SnapshotsBytes, ext.MetricsBytes, ext.EventsBytes,
+		ext.ActiveEvents, ext.ArchivedEvents, ext.EventsCatalog, reports, elapsed, elapsed/time.Duration(reports))
 }
 
 func queryRawInt(t *testing.T, tc *testCenter, query string, args ...any) int {

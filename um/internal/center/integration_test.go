@@ -266,6 +266,17 @@ func enrollAgentA(t *testing.T, tc *testCenter, class, host, eventID string) *sy
 	if resp["center_spki_sha256"] != nil {
 		t.Fatalf("test center SPKI should be null: %v", resp["center_spki_sha256"])
 	}
+	// Synthetic tests configure an explicit source policy effective from epoch so
+	// the frozen contract examples (whose collected_at is older than test
+	// enrollment) exercise the intended platform/source rules. F4-specific tests
+	// create their own histories with realistic boundaries.
+	sources := map[string]bool{"system": true, "services": true, "singbox_api": true, "mihomo_api": false, "terminal": false, "events": true}
+	if class == store.NodeClassWindowsTerminal {
+		sources = map[string]bool{"system": false, "services": false, "singbox_api": false, "mihomo_api": true, "terminal": true, "events": true}
+	}
+	if _, cfgErr := tc.store.UpdateNodeConfig(contextBackground(), a.nodeID, sources, nil, 60, 0); cfgErr != nil {
+		t.Fatalf("synthetic source config: %v", cfgErr)
+	}
 	return a
 }
 

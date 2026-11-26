@@ -144,12 +144,18 @@ func lockCapacity(ctx context.Context, tx *sql.Tx) error {
 
 func countActiveNodesTx(ctx context.Context, tx *sql.Tx, eventID string) (int64, int64, error) {
 	var total int64
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM nodes WHERE state=?`, NodeActive).Scan(&total); err != nil {
+	// Only nodes whose event is active count against the active-node quota; an
+	// archived event's identities no longer consume the active budget.
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM nodes n JOIN event_catalog e ON e.event_id=n.event_id
+		 WHERE n.state=? AND e.state=?`, NodeActive, EventActive).Scan(&total); err != nil {
 		return 0, 0, err
 	}
 	var perEvent int64
 	if eventID != "" {
-		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM nodes WHERE state=? AND event_id=?`, NodeActive, eventID).Scan(&perEvent); err != nil {
+		if err := tx.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM nodes n JOIN event_catalog e ON e.event_id=n.event_id
+			 WHERE n.state=? AND n.event_id=? AND e.state=?`, NodeActive, eventID, EventActive).Scan(&perEvent); err != nil {
 			return 0, 0, err
 		}
 	}
@@ -175,6 +181,9 @@ func checkNodeQuotaTx(ctx context.Context, tx *sql.Tx, eventID string) error {
 func ensureEventActiveTx(ctx context.Context, tx *sql.Tx, eventID string, now int64) (EventInfo, error) {
 	if strings.TrimSpace(eventID) == "" {
 		return EventInfo{}, invalidArgument("event_id", "must not be empty")
+	}
+	if err := eventBlockedTx(ctx, tx, eventID); err != nil {
+		return EventInfo{}, err
 	}
 	var e EventInfo
 	var archived, purgeAfter, purged sql.NullInt64
@@ -204,6 +213,60 @@ func ensureEventActiveTx(ctx context.Context, tx *sql.Tx, eventID string, now in
 		return EventInfo{}, fmt.Errorf("store: create event catalog: %w", err)
 	}
 	return EventInfo{EventID: eventID, State: EventActive, CreatedAt: now, UpdatedAt: now}, nil
+}
+
+// eventPayloadBytesTx estimates the stored telemetry bytes of one event without
+// using row counts as a disk-capacity proof.
+func eventPayloadBytesTx(ctx context.Context, tx *sql.Tx, eventID string) (int64, error) {
+	var n int64
+	queries := []string{
+		`SELECT COALESCE(SUM(LENGTH(payload_json)),0) FROM snapshots WHERE event_id=?`,
+		`SELECT COALESCE(SUM(LENGTH(payload_json)),0) FROM report_metrics WHERE event_id=?`,
+		`SELECT COALESCE(SUM(LENGTH(details_json)),0) FROM report_events WHERE event_id=?`,
+		`SELECT COALESCE(SUM(LENGTH(payload_json)),0) FROM report_event_reports WHERE event_id=?`,
+	}
+	for _, q := range queries {
+		var v int64
+		if err := tx.QueryRowContext(ctx, q, eventID).Scan(&v); err != nil {
+			return 0, err
+		}
+		n += v
+	}
+	return n, nil
+}
+
+func activeArchivedPayloadBytesTx(ctx context.Context, tx *sql.Tx) (active, archived int64, err error) {
+	rows, err := tx.QueryContext(ctx, `SELECT event_id,state FROM event_catalog`)
+	if err != nil {
+		return 0, 0, err
+	}
+	type ev struct{ id, state string }
+	var evs []ev
+	for rows.Next() {
+		var e ev
+		if err := rows.Scan(&e.id, &e.state); err != nil {
+			rows.Close()
+			return 0, 0, err
+		}
+		evs = append(evs, e)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, 0, err
+	}
+	rows.Close()
+	for _, e := range evs {
+		b, err := eventPayloadBytesTx(ctx, tx, e.id)
+		if err != nil {
+			return 0, 0, err
+		}
+		if e.state == EventActive {
+			active += b
+		} else {
+			archived += b
+		}
+	}
+	return active, archived, nil
 }
 
 // ArchiveEvent implements policy-B archive at T: active event becomes archived,
@@ -241,6 +304,19 @@ func (s *Store) ArchiveEvent(ctx context.Context, eventID string, now int64) err
 	if retained >= MaxArchivedEventsWithData {
 		return &QuotaError{Kind: "archived_events_with_data", Limit: MaxArchivedEventsWithData, Current: retained}
 	}
+	// Conservative policy-B overlap gate: active+archive payload must stay within
+	// 2x the active-only estimate, i.e. archived bytes may not exceed active bytes.
+	eventBytes, err := eventPayloadBytesTx(ctx, tx, eventID)
+	if err != nil {
+		return err
+	}
+	activeBytes, archivedBytes, err := activeArchivedPayloadBytesTx(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if archivedBytes+eventBytes > 2*activeBytes {
+		return &QuotaError{Kind: "retention_overlap", Limit: 2 * activeBytes, Current: archivedBytes + eventBytes}
+	}
 	purgeAfter := now + PolicyBArchiveTailSeconds
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE event_catalog SET state=?, archived_at=?, purge_after=?, updated_at=? WHERE event_id=?`,
@@ -261,70 +337,6 @@ func (s *Store) ArchiveEvent(ctx context.Context, eventID string, now int64) err
 	return nil
 }
 
-// PurgeEvent is the B2 store primitive for the explicit (B4 type-to-confirm) event
-// purge: it deletes event telemetry in bounded batches, then removes event
-// metadata/mappings/configs/tokens and writes a content-free tombstone. Nodes/keys
-// remain auditable; the event itself no longer accepts ingest.
-func (s *Store) PurgeEvent(ctx context.Context, eventID, actor string, confirm bool, now int64) error {
-	if !confirm {
-		return invalidArgument("confirm", "explicit confirmation is required")
-	}
-	if strings.TrimSpace(actor) == "" {
-		return invalidArgument("actor", "must not be empty")
-	}
-	if _, err := s.EventState(ctx, eventID); err != nil {
-		return err
-	}
-	total := int64(0)
-	// node_latest references snapshots; remove pointers before deleting snapshots.
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM node_latest WHERE event_id=?`, eventID); err != nil {
-		return fmt.Errorf("store: purge latest pointers: %w", err)
-	}
-	for _, table := range []string{"snapshots", "report_metrics", "report_events", "report_event_reports"} {
-		n, err := deleteBatched(ctx, s.db, s.retentionHook, table, "event_id = ?", eventID)
-		if err != nil {
-			return fmt.Errorf("store: purge %s: %w", table, err)
-		}
-		total += n
-	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("store: begin purge finalize: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-	if err := lockCapacity(ctx, tx); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM route_mapping_entries WHERE event_id=?`, eventID); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM route_mapping_versions WHERE event_id=?`, eventID); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM node_configs WHERE event_id=?`, eventID); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM enroll_tokens WHERE event_id=?`, eventID); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM event_catalog WHERE event_id=?`, eventID); err != nil {
-		return err
-	}
-	counts := fmt.Sprintf(`{"telemetry_rows":%d}`, total)
-	if _, err := tx.ExecContext(ctx,
-		`INSERT OR REPLACE INTO purge_tombstones(event_id,actor,purged_at,counts_json,retain_until)
-		 VALUES(?,?,?,?,?)`, eventID, actor, now, counts, now+PurgeTombstoneSeconds); err != nil {
-		return fmt.Errorf("store: write purge tombstone: %w", err)
-	}
-	if _, err := appendLedgerTx(ctx, tx, now, "event_purged", eventID, ledgerDetailHash(actor+"|"+counts)); err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("store: commit event purge: %w", err)
-	}
-	return nil
-}
-
 // deleteBatched deletes at most RetentionBatchRows per transaction. The helper is
 // resumable and idempotent; the optional hook is a test-only fault injection point.
 func deleteBatched(ctx context.Context, db *sql.DB, hook func(string) error, table, where string, args ...any) (int64, error) {
@@ -340,7 +352,7 @@ func deleteBatched(ctx context.Context, db *sql.DB, hook func(string) error, tab
 				return total, err
 			}
 		}
-		query := fmt.Sprintf(`DELETE FROM %s WHERE rowid IN (SELECT rowid FROM %s WHERE %s LIMIT %d)`,
+		query := fmt.Sprintf(`DELETE FROM %s WHERE rowid IN (SELECT rowid FROM %s WHERE %s ORDER BY rowid LIMIT %d)`,
 			table, table, where, RetentionBatchRows)
 		res, err := tx.ExecContext(ctx, query, args...)
 		if err != nil {
@@ -565,8 +577,33 @@ func (s *Store) RunRetentionB2PolicyB(ctx context.Context, now int64) (map[strin
 		}
 		events = append(events, e)
 	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fail("event_scan", err)
+	}
 	rows.Close()
 	for _, e := range events {
+		// Re-read lifecycle state inside the per-event step so a concurrent
+		// archive/purge cannot make this loop act on a stale state.
+		fresh, err := s.EventState(ctx, e.id)
+		if err != nil {
+			if errors.Is(err, ErrEventUnknown) {
+				continue
+			}
+			return fail("event_refresh", err)
+		}
+		e.state = fresh.State
+		e.archived = nullInt(fresh.ArchivedAt)
+		e.purgeAfter = nullInt(fresh.PurgeAfter)
+		e.purged = nullInt(fresh.DataPurgedAt)
+		var purgeActive int
+		if err := s.db.QueryRowContext(ctx, `SELECT 1 FROM purge_ops WHERE event_id=? AND state<>'completed' LIMIT 1`, e.id).Scan(&purgeActive); err == nil {
+			// An in-progress purge owns this event's deletion; retention must not
+			// race it with a stale lifecycle decision.
+			continue
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return fail("event_purge_state", err)
+		}
 		if e.state == EventActive {
 			cutoff := now - PolicyBActiveRetentionSeconds
 			if _, err := s.db.ExecContext(ctx,
@@ -628,7 +665,7 @@ func (s *Store) RunRetentionB2PolicyB(ctx context.Context, now int64) (map[strin
 		deleted["node_latest"] = n
 	}
 	// Retention runs and purge tombstones are themselves bounded.
-	if n, err := deleteBatched(ctx, s.db, hook, "retention_runs", `id NOT IN (SELECT id FROM retention_runs ORDER BY id DESC LIMIT ?)`, RetentionRunsKeep); err != nil {
+	if n, err := deleteBatched(ctx, s.db, hook, "retention_runs", `id NOT IN (SELECT id FROM retention_runs ORDER BY id DESC LIMIT ?)`, RetentionRunsKeep-1); err != nil {
 		return fail("retention_runs", err)
 	} else {
 		deleted["retention_runs"] = n
@@ -652,4 +689,11 @@ func (s *Store) RunRetentionB2PolicyB(ctx context.Context, now int64) (map[strin
 func jsonMarshal(v any) (string, error) {
 	b, err := json.Marshal(v)
 	return string(b), err
+}
+
+func nullInt(p *int64) sql.NullInt64 {
+	if p == nil {
+		return sql.NullInt64{}
+	}
+	return sql.NullInt64{Int64: *p, Valid: true}
 }

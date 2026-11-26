@@ -161,23 +161,24 @@ func TestB2NodeRetireKeepsHistory(t *testing.T) {
 
 func TestB2SourceSwitchHistoricalSpoolAndCurrentData(t *testing.T) {
 	tc := startTestCenter(t)
-	a := enrollAgent(t, tc, store.NodeClassLinuxVPS, "linux")
-	disabled := map[string]bool{"system": false, "services": false, "singbox_api": false, "mihomo_api": false, "terminal": false, "events": false}
 	base := b2BaseCollected(t)
-	// Current data is rejected while sources are disabled (config update precedes
-	// the sample's collected_at).
-	if _, err := tc.store.UpdateNodeConfig(context.Background(), a.nodeID, disabled, nil, 60, base-1); err != nil {
-		t.Fatalf("disable sources: %v", err)
+	disabled := map[string]bool{"system": false, "services": false, "singbox_api": false, "mihomo_api": false, "terminal": false, "events": false}
+	// Current node: disable before the sample's collected_at, so current data is
+	// rejected.
+	cur := enrollAgent(t, tc, store.NodeClassLinuxVPS, "linux")
+	if _, err := tc.store.UpdateNodeConfig(context.Background(), cur.nodeID, disabled, nil, 60, base-1); err != nil {
+		t.Fatalf("disable current node: %v", err)
 	}
-	if status, resp := b2SendReport(t, tc, a, b2SnapshotDoc(t, base), b2Nonce(t)); status != 400 {
+	if status, resp := b2SendReport(t, tc, cur, b2SnapshotDoc(t, base), b2Nonce(t)); status != 400 {
 		t.Fatalf("current data with disabled sources: %d %v, want 400", status, resp)
 	}
-	// Historical spool collected before the config update remains legal even
-	// though the switches are now off (no fabricated current data).
-	if _, err := tc.store.UpdateNodeConfig(context.Background(), a.nodeID, disabled, nil, 60, base+1000); err != nil {
-		t.Fatalf("set config clock: %v", err)
+	// Historical node: data was collected while the enabled config was effective;
+	// the later disable must not erase that historical authorization.
+	hist := enrollAgent(t, tc, store.NodeClassLinuxVPS, "linux")
+	if _, err := tc.store.UpdateNodeConfig(context.Background(), hist.nodeID, disabled, nil, 60, base+1000); err != nil {
+		t.Fatalf("disable historical node: %v", err)
 	}
-	if status, resp := b2SendReport(t, tc, a, b2SnapshotDoc(t, base), b2Nonce(t)); status != 200 || resp["result"] != "accepted" {
+	if status, resp := b2SendReport(t, tc, hist, b2SnapshotDoc(t, base), b2Nonce(t)); status != 200 || resp["result"] != "accepted" {
 		t.Fatalf("historical spool: %d %v, want accepted", status, resp)
 	}
 }

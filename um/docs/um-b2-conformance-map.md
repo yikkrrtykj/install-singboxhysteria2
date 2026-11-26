@@ -167,3 +167,23 @@ B3 REC-17/18/27; complete management API/UI and type-to-confirm purge (B4);
 Cloudflare/UM-C public ingress; signed checkpoints, offsite backup, restore
 drills and 200/500-node capacity/performance acceptance (UM-E). UM-F DEFERRED,
 production HOLD.
+
+
+## Round-8 targeted fixes (F1–F7)
+
+| Finding | Implementation | Evidence |
+| --- | --- | --- |
+| F1 purge lifecycle/immutable mappings | durable `purge_ops` persisted before deletion; triggers allow only mapping/finalizing purge state; purging blocks ingest/enrollment/token/config/rotation/mapping; resumable/idempotent; progress/actor/counts; final tombstone+audit; failure stays fail-closed | `TestB2PurgeWithMappingsAndPermanentGraveyard`, `TestB2PurgeRecoveryAndFaults`, `TestB2PurgeBlocksIngestAndEnrollmentConcurrently` (real SQLite, faults after batch, mapping, tombstone, restart) |
+| F2 permanent identity isolation | permanent `event_graveyard` separate from 180-day audit tombstone; event gate checks graveyard/incomplete purge; purge revokes old nodes/keys and keeps old high-water; token issuance cannot recreate | same tests + `EventGraveyardExists`, tombstone-expiry token rejection, old node/key revoked |
+| F3 capacity/retention boundaries | active quota joins active event lifecycle; archived events stop consuming active quota; conservative 2x active-only payload overlap gate; deterministic rowid batches; `rows.Err`; retention_runs off-by-one fixed (keeps 100); per-event lifecycle re-read; latest/FK tests; DB/WAL/payload/tx growth log | `TestB2RetentionRunsBoundedAndLatestFK`, `TestB2Quota*`, capacity smoke t.Log |
+| F4 config authorization history | append-only `node_config_history`; Report validates against config effective at collected_at; never-enabled source cannot borrow later authorization; tag/source boundaries; synthetic legacy tests explicitly configure effective epoch policy | `TestB2F4NeverEnabledSourceCannotBorrowLaterAuthorization`, `TestB2F4TagChangeBoundaryAndHistoricalSpool`, existing source-switch/Windows tests |
+| F5 endpoint permissions/rotate | endpoint-specific auth: Report allows provisional proof; Config/Rotate require active old key; frozen §7 boot/seq before nonce; no post-commit config reread; expiry equality consistent | `TestB2F5ConfigRejectsProvisionalKey`, `TestB2F5RotateBootSequenceBeforeNonce`, `TestB2RotationExpiryEqualityBoundary` |
+| F6 report identity/audit | cross-check report id across dedupe + all 30-day telemetry tables; expired dedupe cannot change type/body; rejection audit for nonce_reuse/report_conflict/validation; audit write failure returns retryable storage error | `TestB2F6ReportIdentityAcrossDedupeWindow`, red logs |
+| F7 REC evidence | existing 16 real HTTP/SQLite tests retained; B2 tests load normative REC JSON expected HTTP/result/error and high-water (`highest_gen`/`last_seq`) assertions, multi-attempt REC-06/30, transaction-fault REC-15, byte-identical restart replay REC-19; B3 local-agent behavior explicitly not claimed | `b2_rec_fixture_test.go`, `b2_conformance_test.go` |
+
+Windows harness: attempt 1 of run 45837003465 failed with the known
+`PROCESS_ENUMERATION_FAILED`/winerror=5 flake; same-HEAD attempt 2 passed. Harness
+unchanged; deferred as a separate issue.
+
+Still deferred: B3 REC-17/18/27, B4 management UI/type-to-confirm purge, UM-C
+ingress, UM-E full disk-pressure/200-500 node performance/backup/restore.
