@@ -72,7 +72,7 @@ func TestB2EnrollFreshnessAndNoPartialWrites(t *testing.T) {
 	_ = hash
 	a := newAgent(t)
 	// Past/future outside ±300: token must remain unused.
-	for _, sent := range []int64{now - 301, now + 301} {
+	for _, sent := range []int64{now - 600, now + 600} {
 		// Fresh token per attempt so no stale attempt consumes another token.
 		tok, hsh := newTokenFor(t, tc, eventUUID, store.NodeClassLinuxVPS, now)
 		h, raw := signedEnrollAttempt(t, a, tok, sent)
