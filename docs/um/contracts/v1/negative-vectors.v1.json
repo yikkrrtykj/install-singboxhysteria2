@@ -136,10 +136,10 @@
     {
       "id": "NEG-REPORT-04",
       "endpoint": "/v1/agent/report",
-      "mutation": "report from a retired boot_id after a newer boot was accepted",
+      "mutation": "report from a retired boot generation after a newer generation was accepted",
       "expected": {
         "http": 409,
-        "error": "stale_boot",
+        "error": "stale_boot_generation",
         "retryable": false
       }
     },
@@ -206,7 +206,7 @@
     {
       "id": "NEG-ROT-01",
       "endpoint": "/v1/agent/rotate",
-      "mutation": "rotate retried after the old key grace expired",
+      "mutation": "rotate request signed by a key already revoked by an admin (no old-key grace timer exists in rev-5)",
       "expected": {
         "http": 401,
         "error": "revoked_key",
@@ -339,10 +339,10 @@
     {
       "id": "NEG-REPORT-14",
       "endpoint": "/v1/agent/report",
-      "mutation": "boot_id is not the persisted current boot (even if absent from bounded boot_registry history)",
+      "mutation": "boot generation lower than the persisted highest_gen (even if absent from the bounded boot_registry history)",
       "expected": {
         "http": 409,
-        "error": "stale_boot",
+        "error": "stale_boot_generation",
         "retryable": false
       }
     },
@@ -356,6 +356,357 @@
         "retryable": false,
         "recovery": "source remains disabled; availability unavailable; no fabricated data"
       }
+    },
+    {
+      "id": "NEG-BOOT-01",
+      "endpoint": "/v1/agent/report",
+      "mutation": "boot generation lower than persisted highest generation",
+      "expected": {
+        "http": 409,
+        "error": "stale_boot_generation",
+        "retryable": false,
+        "recovery": "operator revokes and re-enrolls; no in-place reset"
+      }
+    },
+    {
+      "id": "NEG-BOOT-02",
+      "endpoint": "/v1/agent/report",
+      "mutation": "same generation but different boot_id",
+      "expected": {
+        "http": 409,
+        "error": "boot_identity_conflict",
+        "retryable": false
+      }
+    },
+    {
+      "id": "NEG-BOOT-03",
+      "endpoint": "/v1/agent/report",
+      "mutation": "generation gap above MAX_BOOT_GAP (gen - highest_gen > 65535)",
+      "expected": {
+        "http": 409,
+        "error": "boot_identity_conflict",
+        "retryable": false
+      }
+    },
+    {
+      "id": "NEG-BOOT-04",
+      "endpoint": "/v1/agent/report",
+      "mutation": "first report of new generation is a duplicate report_id (spool replay)",
+      "expected": {
+        "http": 200,
+        "ack": "duplicate",
+        "recovery": "transport generation/seq high-water still advanced in the same transaction"
+      }
+    },
+    {
+      "id": "NEG-BOOT-05",
+      "endpoint": "local",
+      "mutation": "agent boot-state file missing/corrupt while other state exists",
+      "expected": {
+        "http": null,
+        "local": "fail-closed; no generation reset or old boot_id reuse; operator recovery required"
+      }
+    },
+    {
+      "id": "NEG-ROT-07",
+      "endpoint": "/v1/agent/rotate",
+      "mutation": "same nonce+body retried with refreshed sent_at/seq/boot_gen within 300 s freshness",
+      "expected": {
+        "http": 200,
+        "recovery": "identical persisted rotate-response; volatile transport fields are excluded from the rotate nonce fingerprint"
+      },
+      "recovery": "same persisted rotate-response after full boot/seq/nonce/identity/signature validation and a high-water commit; intent matching never bypasses transport validation or node_boot"
+    },
+    {
+      "id": "NEG-ROT-08",
+      "endpoint": "/v1/agent/rotate",
+      "mutation": "same rotation nonce with changed body/key or wrong endpoint",
+      "expected": {
+        "http": 409,
+        "error": "nonce_reuse",
+        "retryable": false
+      }
+    },
+    {
+      "id": "NEG-ROT-09",
+      "endpoint": "/v1/agent/report",
+      "mutation": "new-key proof report committed but ACK lost; retried under the new key",
+      "expected": {
+        "http": 200,
+        "ack": "duplicate",
+        "recovery": "any 2xx new-key response marks rotation confirmed; old key deleted"
+      }
+    },
+    {
+      "id": "NEG-ROT-10",
+      "endpoint": "/v1/agent/report",
+      "mutation": "rotation aborted (provisional key revoked, old active); new-key report then old-key fallback",
+      "expected": {
+        "http": 401,
+        "error": "revoked_key",
+        "recovery": "delete provisional key, resume old-key reporting"
+      }
+    },
+    {
+      "id": "NEG-ROT-11",
+      "endpoint": "/v1/agent/report",
+      "mutation": "both keys rejected after admin revocation",
+      "expected": {
+        "http": 401,
+        "error": "revoked_key",
+        "recovery": "stop reporting, keep spool, operator recovery"
+      }
+    },
+    {
+      "id": "NEG-BOOT-06",
+      "endpoint": "/v1/agent/report",
+      "mutation": "generation forward jump of 2..65535 after consecutive offline restarts (first accepted request seq may be >1)",
+      "expected": {
+        "http": 200,
+        "ack": "accepted",
+        "high_water": "highest_gen/current boot/last_seq set from the accepted request; boot_generation_gap audit entry written"
+      }
+    },
+    {
+      "id": "NEG-BOOT-07",
+      "endpoint": "/v1/agent/report",
+      "mutation": "first attempt of a new generation was lost; retry reaches the center with seq=2",
+      "expected": {
+        "http": 200,
+        "ack": "accepted",
+        "high_water": "last_seq=2 (the accepted request's seq, not forced to 1)"
+      }
+    },
+    {
+      "id": "NEG-BOOT-08",
+      "endpoint": "/v1/agent/report",
+      "mutation": "generation gap exactly 65535 (MAX_BOOT_GAP boundary)",
+      "expected": {
+        "http": 200,
+        "ack": "accepted",
+        "audit": "boot_generation_gap with gap=65535"
+      }
+    },
+    {
+      "id": "NEG-BOOT-09",
+      "endpoint": "/v1/agent/report",
+      "mutation": "X-UM-Boot-Gen or X-UM-Seq above MAX_NUMERIC (9223372036854775806) or non-canonical decimal",
+      "expected": {
+        "http": 400,
+        "error": "invalid_header",
+        "retryable": false
+      }
+    },
+    {
+      "id": "NEG-BOOT-10",
+      "endpoint": "/v1/agent/report",
+      "mutation": "report accepted with seq == MAX_NUMERIC (9223372036854775806), exhausting next_seq",
+      "expected": {
+        "http": 200,
+        "ack": "accepted",
+        "next_seq": null,
+        "recovery": "agent MUST NOT reuse seq; start a new generation on a clean restart or enter operator recovery; center rejects further same-generation requests"
+      }
+    },
+    {
+      "id": "NEG-ROT-12",
+      "endpoint": "/v1/agent/rotate",
+      "mutation": "same rotate nonce/body retried after a generation forward jump (refreshed boot_gen within MAX_BOOT_GAP, refreshed seq/sent_at) while awaiting proof",
+      "expected": {
+        "http": 200,
+        "recovery": "identical persisted rotate-response after full signature/identity/boot/seq/nonce validation; node_boot high-water committed; no special retry path"
+      }
+    },
+    {
+      "id": "NEG-ROT-13",
+      "endpoint": "/v1/agent/rotate",
+      "mutation": "rotate intent retried with a generation lower than the persisted highest generation",
+      "expected": {
+        "http": 409,
+        "error": "stale_boot_generation",
+        "retryable": false,
+        "recovery": "no rotate-response replay; agent stops for operator recovery if boot state is inconsistent"
+      }
+    },
+    {
+      "id": "NEG-ROT-14",
+      "endpoint": "/v1/agent/rotate",
+      "mutation": "rotate intent retried with a sequence that conflicts with the persisted high-water",
+      "expected": {
+        "http": 409,
+        "error": "sequence_conflict",
+        "retryable": false,
+        "recovery": "no rotate-response replay; validate boot/seq before intent replay"
+      }
+    },
+    {
+      "id": "NEG-ROT-15",
+      "endpoint": "/v1/agent/rotate",
+      "mutation": "rotate intent match with same generation but a different boot_id",
+      "expected": {
+        "http": 409,
+        "error": "boot_identity_conflict",
+        "retryable": false,
+        "recovery": "no rotate-response replay"
+      }
+    },
+    {
+      "id": "NEG-PLAT-01",
+      "endpoint": "/v1/agent/report",
+      "mutation": "windows_terminal snapshot is missing the terminal object",
+      "expected": {
+        "http": 400,
+        "error": "platform_mismatch",
+        "retryable": false
+      }
+    },
+    {
+      "id": "NEG-PLAT-02",
+      "endpoint": "/v1/agent/report",
+      "mutation": "linux_vps node sends a snapshot with a terminal object",
+      "expected": {
+        "http": 400,
+        "error": "platform_mismatch",
+        "retryable": false
+      }
+    },
+    {
+      "id": "NEG-PLAT-03",
+      "endpoint": "/v1/agent/report",
+      "mutation": "windows_terminal sends server fields (services/protocols/traffic/clients) outside their honest unavailable/null/empty state",
+      "expected": {
+        "http": 400,
+        "error": "platform_mismatch",
+        "retryable": false
+      }
+    },
+    {
+      "id": "NEG-PLAT-04",
+      "endpoint": "/v1/agent/report",
+      "mutation": "terminal route token is not one of a_reality/a_hy2/b_reality/b_hy2/direct/unknown",
+      "expected": {
+        "http": 400,
+        "error": "invalid_request",
+        "retryable": false
+      }
+    },
+    {
+      "id": "NEG-PLAT-05",
+      "endpoint": "/v1/agent/report",
+      "mutation": "active_connections.total does not equal the sum of by_route while availability is ok",
+      "expected": {
+        "http": 400,
+        "error": "invalid_request",
+        "retryable": false
+      }
+    },
+    {
+      "id": "NEG-PLAT-06",
+      "endpoint": "/v1/agent/report",
+      "mutation": "availability=ok with a null route or null count fields, or unavailable with non-null fields",
+      "expected": {
+        "http": 400,
+        "error": "invalid_request",
+        "retryable": false
+      }
+    },
+    {
+      "id": "NEG-PLAT-07",
+      "endpoint": "/v1/agent/report",
+      "mutation": "selection.sampled_at or active_connections.sampled_at outside [collected_at-300 s, collected_at+60 s] (independent sampling is allowed, unbounded skew is not)",
+      "expected": {
+        "http": 400,
+        "error": "invalid_request",
+        "retryable": false
+      }
+    },
+    {
+      "id": "NEG-PLAT-08",
+      "endpoint": "local",
+      "mutation": "operator-local route binding absent/ambiguous but the path would be classified as direct",
+      "expected": {
+        "local": "agent must classify unknown/null and must never emit direct without an explicit local binding; center accepts only the closed token form and cannot resolve local names"
+      }
+    },
+    {
+      "id": "NEG-PLAT-09",
+      "endpoint": "/v1/agent/report",
+      "mutation": "privacy sentinel: raw proxy name, destination IP/URL, private YAML, controller secret or connection id placed in any terminal string field or as an extra field",
+      "expected": {
+        "http": 400,
+        "error": "invalid_request",
+        "retryable": false,
+        "recovery": "reject and audit; never store/log/echo the sentinel value"
+      }
+    },
+    {
+      "id": "NEG-PLAT-10",
+      "endpoint": "center-query",
+      "mutation": "route mapping version is changed after historical samples were recorded",
+      "expected": {
+        "behavior": "historical attribution is resolved with the mapping version effective at the sample/event time; the new version applies only from its effective_from; prior versions are never rewritten or deleted"
+      }
+    },
+    {
+      "id": "NEG-PLAT-11",
+      "endpoint": "/v1/agent/enroll",
+      "mutation": "enroll request node_class does not match the admin-issued bootstrap-token scope",
+      "expected": {
+        "http": 401,
+        "error": "token_scope_mismatch",
+        "retryable": false
+      }
+    },
+    {
+      "id": "NEG-PLAT-12",
+      "endpoint": "/v1/agent/enroll",
+      "mutation": "node_class and host.os disagree (linux_vps/windows or windows_terminal/linux)",
+      "expected": {
+        "http": 400,
+        "error": "invalid_request",
+        "retryable": false
+      }
+    },
+    {
+      "id": "NEG-PLAT-13",
+      "endpoint": "/v1/agent/report",
+      "mutation": "windows_terminal sends a report-metrics body (not a v1 Windows payload)",
+      "expected": {
+        "http": 400,
+        "error": "platform_mismatch",
+        "retryable": false
+      }
+    }
+  ],
+  "revision": 5,
+  "contract_revision_note": "Revision 5 changes: bounded generation forward jumps (MAX_BOOT_GAP=65535) are accepted; the first accepted request of a new generation may have seq>1; ACK next_seq is nullable on uint64-safe numeric exhaustion; rotate intent replay runs full boot/seq/nonce/identity validation without bypassing high-water; node_class/platform isolation and Windows six-token telemetry cases added. The superseded rev-4 expectations are retained below for traceability.",
+  "superseded_rev4_expectations": [
+    {
+      "case": "NEG-BOOT-03",
+      "rev4_mutation": "boot generation skips more than highest+1, or new generation first seq != 1",
+      "rev4_expected": {
+        "http": 409,
+        "error": "boot_identity_conflict"
+      },
+      "rev5_resolution": "Only a gap > MAX_BOOT_GAP (65535) is rejected (NEG-BOOT-03). Gaps 1..65535 and first-contact seq>1 are accepted (NEG-BOOT-06/07/08)."
+    },
+    {
+      "case": "NEG-ROT-01",
+      "rev4_mutation": "rotate retried after the old key grace expired",
+      "rev4_expected": {
+        "http": 401,
+        "error": "revoked_key"
+      },
+      "rev5_resolution": "No old-key grace timer exists; expiry aborts only the provisional key and the old key stays active (NEG-ROT-05). NEG-ROT-01 is reworded as a revoked-key rotate attempt."
+    },
+    {
+      "case": "NEG-BOOT-05",
+      "rev4_mutation": "agent boot-state file missing/corrupt while other state exists",
+      "rev4_expected": {
+        "http": null,
+        "local": "fail-closed; no generation reset or old boot_id reuse; operator recovery required"
+      },
+      "rev5_resolution": "Unchanged fail-closed behavior; still no in-place reset and no old boot_id reuse."
     }
   ]
 }

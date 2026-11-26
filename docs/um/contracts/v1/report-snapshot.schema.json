@@ -1,7 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://um.invalid/contracts/v1/report-snapshot.schema.json",
-  "title": "UM v1 report body: snapshot (latest state, idempotent upsert, nullable unknown data)",
+  "title": "UM v1 report body: snapshot (latest state, idempotent upsert, nullable unknown data; revision 5 adds Windows terminal telemetry)",
+  "description": "The optional `terminal` object is valid only for a windows_terminal node. A windows_terminal node MUST send it when the terminal source is configured; the base system/services/protocols/traffic/clients fields stay in their honest unavailable/null/empty state. A linux_vps node MUST NOT send `terminal` (platform_mismatch).",
   "type": "object",
   "additionalProperties": false,
   "required": ["v", "type", "report_id", "collected_at", "agent", "host",
@@ -30,7 +31,7 @@
       "additionalProperties": false,
       "required": ["os", "kernel", "arch"],
       "properties": {
-        "os": {"const": "linux"},
+        "os": {"enum": ["linux", "windows"]},
         "kernel": {"type": "string", "maxLength": 64, "pattern": "^[0-9A-Za-z.+-]+$"},
         "arch": {"enum": ["amd64", "arm64"]}
       }
@@ -133,6 +134,78 @@
           }
         }
       }
+    },
+    "terminal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["selection", "active_connections"],
+      "properties": {
+        "selection": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["availability", "sampled_at", "route", "reason_code"],
+          "properties": {
+            "availability": {"enum": ["ok", "partial", "unavailable"]},
+            "sampled_at": {"type": "integer", "minimum": 0, "maximum": 1000000000000},
+            "route": {
+              "description": "Current selected leaf mapped to exactly one local route token; null means not resolvable. Unmapped/ambiguous paths are never reported as DIRECT.",
+              "oneOf": [
+                {"$ref": "#/$defs/route_token"},
+                {"type": "null"}
+              ]
+            },
+            "reason_code": {
+              "oneOf": [
+                {"$ref": "#/$defs/terminal_reason_code"},
+                {"type": "null"}
+              ]
+            }
+          }
+        },
+        "active_connections": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["availability", "sampled_at", "total", "by_route"],
+          "properties": {
+            "availability": {"enum": ["ok", "partial", "unavailable"]},
+            "sampled_at": {"type": "integer", "minimum": 0, "maximum": 1000000000000},
+            "total": {
+              "oneOf": [
+                {"type": "integer", "minimum": 0, "maximum": 1000000},
+                {"type": "null"}
+              ]
+            },
+            "by_route": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["a_reality", "a_hy2", "b_reality", "b_hy2", "direct", "unknown"],
+              "properties": {
+                "a_reality": {"oneOf": [{"type": "integer", "minimum": 0, "maximum": 1000000}, {"type": "null"}]},
+                "a_hy2": {"oneOf": [{"type": "integer", "minimum": 0, "maximum": 1000000}, {"type": "null"}]},
+                "b_reality": {"oneOf": [{"type": "integer", "minimum": 0, "maximum": 1000000}, {"type": "null"}]},
+                "b_hy2": {"oneOf": [{"type": "integer", "minimum": 0, "maximum": 1000000}, {"type": "null"}]},
+                "direct": {"oneOf": [{"type": "integer", "minimum": 0, "maximum": 1000000}, {"type": "null"}]},
+                "unknown": {"oneOf": [{"type": "integer", "minimum": 0, "maximum": 1000000}, {"type": "null"}]}
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "route_token": {
+      "description": "Exactly six tokens, aligned with the existing windowsobs role enum; center aggregates A={a_reality,a_hy2}, B={b_reality,b_hy2} and keeps protocol drill-down.",
+      "enum": ["a_reality", "a_hy2", "b_reality", "b_hy2", "direct", "unknown"]
+    },
+    "terminal_reason_code": {
+      "enum": [
+        "controller_unreachable",
+        "controller_auth",
+        "malformed_response",
+        "route_unbound",
+        "source_authorization_unproven"
+      ]
     }
   }
 }

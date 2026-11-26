@@ -1,12 +1,16 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://um.invalid/contracts/v1/enroll-request.schema.json",
-  "title": "UM v1 enrollment request body (signature is a transport header, not a body field)",
+  "title": "UM v1 enrollment request body (signature is a transport header, not a body field; revision 5 adds node_class)",
   "type": "object",
   "additionalProperties": false,
-  "required": ["v", "agent_version", "host", "capabilities"],
+  "required": ["v", "node_class", "agent_version", "host", "capabilities"],
   "properties": {
     "v": {"const": 1},
+    "node_class": {
+      "enum": ["linux_vps", "windows_terminal"],
+      "description": "Immutable node class; must match the admin-issued bootstrap-token scope and host.os."
+    },
     "agent_version": {
       "type": "string",
       "maxLength": 32,
@@ -17,7 +21,7 @@
       "additionalProperties": false,
       "required": ["os", "kernel", "arch"],
       "properties": {
-        "os": {"const": "linux"},
+        "os": {"enum": ["linux", "windows"]},
         "kernel": {"type": "string", "maxLength": 64, "pattern": "^[0-9A-Za-z.+-]+$"},
         "arch": {"enum": ["amd64", "arm64"]}
       }
@@ -27,7 +31,17 @@
       "minItems": 0,
       "maxItems": 8,
       "uniqueItems": true,
-      "items": {"enum": ["metrics_v1", "events_v1", "rotate_v1", "config_v1"]}
+      "items": {"enum": ["metrics_v1", "events_v1", "rotate_v1", "config_v1", "terminal_v1"]}
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"node_class": {"const": "linux_vps"}}, "required": ["node_class"]},
+      "then": {"properties": {"host": {"properties": {"os": {"const": "linux"}}}}}
+    },
+    {
+      "if": {"properties": {"node_class": {"const": "windows_terminal"}}, "required": ["node_class"]},
+      "then": {"properties": {"host": {"properties": {"os": {"const": "windows"}}}}}
+    }
+  ]
 }

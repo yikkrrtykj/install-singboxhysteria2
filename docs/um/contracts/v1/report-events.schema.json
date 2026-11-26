@@ -61,7 +61,9 @@
               "agent_error",
               "config_update",
               "clock_skew",
-              "spool_overflow"
+              "spool_overflow",
+              "terminal_route_changed",
+              "terminal_source_unavailable"
             ]
           },
           "severity": {
@@ -214,6 +216,38 @@
               "properties": {
                 "detail": {
                   "$ref": "#/$defs/detail_spool_overflow"
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "kind": {
+                  "const": "terminal_route_changed"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "detail": {
+                  "$ref": "#/$defs/detail_terminal_route_changed"
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "kind": {
+                  "const": "terminal_source_unavailable"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "detail": {
+                  "$ref": "#/$defs/detail_terminal_source_unavailable"
                 }
               }
             }
@@ -409,6 +443,67 @@
           "type": "integer",
           "minimum": 1,
           "maximum": 1000000
+        }
+      }
+    },
+    "route_token": {
+      "description": "Windows terminal route tokens, aligned with the existing windowsobs role enum; no free-form proxy names are allowed.",
+      "enum": [
+        "a_reality",
+        "a_hy2",
+        "b_reality",
+        "b_hy2",
+        "direct",
+        "unknown"
+      ]
+    },
+    "terminal_reason_code": {
+      "enum": [
+        "controller_unreachable",
+        "controller_auth",
+        "malformed_response",
+        "route_unbound",
+        "source_authorization_unproven"
+      ]
+    },
+    "detail_terminal_route_changed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "previous_route",
+        "current_route",
+        "sampled_at"
+      ],
+      "properties": {
+        "previous_route": {
+          "oneOf": [
+            {"$ref": "#/$defs/route_token"},
+            {"type": "null"}
+          ]
+        },
+        "current_route": {
+          "$ref": "#/$defs/route_token"
+        },
+        "sampled_at": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000000000
+        }
+      }
+    },
+    "detail_terminal_source_unavailable": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "reason_code"
+      ],
+      "properties": {
+        "source": {
+          "enum": ["mihomo_api", "local_readonly"]
+        },
+        "reason_code": {
+          "$ref": "#/$defs/terminal_reason_code"
         }
       }
     }

@@ -1,10 +1,10 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://um.invalid/contracts/v1/enroll-response.schema.json",
-  "title": "UM v1 enrollment response",
+  "title": "UM v1 enrollment response (revision 5 confirms the token-scoped node_class)",
   "type": "object",
   "additionalProperties": false,
-  "required": ["v", "node_id", "event_id", "key_id", "config_version", "device_salt",
+  "required": ["v", "node_id", "event_id", "node_class", "key_id", "config_version", "device_salt",
                "cadence_seconds", "server_time", "center_spki_sha256"],
   "properties": {
     "v": {"const": 1},
@@ -16,6 +16,7 @@
       "type": "string",
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
     },
+    "node_class": {"enum": ["linux_vps", "windows_terminal"]},
     "key_id": {"type": "string", "pattern": "^key-[0-9a-f]{8}$"},
     "config_version": {"type": "integer", "minimum": 1},
     "device_salt": {"type": "string", "pattern": "^[A-Za-z0-9_-]{43}$"},

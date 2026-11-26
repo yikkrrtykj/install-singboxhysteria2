@@ -182,7 +182,7 @@ human confirmation patterns.
 | Remote Probe #67 agent/spool/#67 server | bounded spool/signature/replay patterns | UM v1 contract (own identity envelope) | modify/reactivate #67 | frozen contract; reuse patterns, never fork code |
 | `sbox-cm` privileged plane | documentation reference for UM-F future | no | any access from center/agent | center must stay read-only; UID/session is not op authorization |
 | HA-UI 0.2.0 root SSH path | human-confirmation/credential-hygiene patterns | no | any use in center | root SSH must not be centralized; UM-F separate design |
-| Windows client/EXE signing and distribution | no | no | no | not needed for UM read-only platform |
+| Windows client/EXE signing and distribution | no | no | no | not needed for the read-only center; Windows **node-agent** packaging/signing is new UM-B3 work, not reuse of this release path |
 | Komari | not in repository | no | no | remains independent product, no code/dependency coupling |
 
 ## 7. Forbidden duplication (binding on UM-B..UM-E designs)

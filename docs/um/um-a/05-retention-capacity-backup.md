@@ -1,9 +1,9 @@
-# UM-A 05 — Retention, capacity, database gate and backup/restore (revision 2)
+# UM-A 05 — Retention, capacity, database gate and backup/restore (revision 5)
 
-Status: design freeze for UM-A review; values marked "owner decision" are **not**
-approved yet. Revision after PR #126 review (P1-02 durability, P1-05 retention /
-capacity / backup / restore). Numbers are planning estimates to be measured by
-UM-B/UM-E.
+Status: final targeted amendment for UM-A rev-5; values marked "owner decision"
+are **not** approved yet. Revision 5 adds `node_class`/Windows terminal data and
+versioned route-mapping retention; numbers remain planning estimates to be
+measured by UM-B/UM-E.
 
 ## 1. Retention policy: A vs B (owner decision, recommendation B)
 
@@ -37,17 +37,20 @@ Frozen rules for policy B (if approved):
 | Data class | Retention (policy B) | Exceptions / notes |
 | --- | --- | --- |
 | latest state (`node_latest`, services/protocols/traffic) | current; removed 30 d after last accepted report or node retire | replaced only by newer `collected_at`; stale snapshots are `stale_ignored` |
+| Windows terminal latest (`terminal_latest`: six-token selection/connection aggregates) | current; same remove rule as latest state | tokens/counts/timestamps only; no proxy names/targets/credentials |
 | `metric_minute`, `protocol_minute`, `client_hourly` | active: 30 d rolling; archived: until T+30 | disk-pressure degradation may reduce granularity, never below the last 24 h |
-| `events_history`, `incidents` | same 30 d / T+30 | open incidents never pruned |
+| `events_history`, `incidents` | same 30 d / T+30 | open incidents never pruned; includes Windows terminal route/source events |
 | `report_dedupe` | 8 d | needed to dedupe spool replay (7 d spool + margin) |
-| `nonce_dedupe` | 24 h | transport replay window |
-| `boot_registry` | with node identity; bounded last 8 boots | retired boots rejected as `stale_boot` |
-| `node_seq` | current only | persisted for center-restart recovery |
+| `nonce_dedupe` | 24 h | transport replay window, unique `(node_id, nonce)` |
+| `seq_dedupe` | current generation, bounded last 256 per node | exact-retry classification; not an authorization source |
+| `boot_registry` | with node identity; bounded last 8 generations | diagnostics only; retired generations are rejected by the persistent generation high-water (`stale_boot_generation`), never by registry presence |
+| `node_boot` (authoritative high-water) | current only, persistent | highest generation/boot id/last seq/last fingerprint; survives center restart |
+| `route_mapping_versions` | with event history; never rewritten or deleted before event purge | append-only version/effective_from; historical attribution is resolved by effective time; mapping changes audited 180 d |
 | `node_keys` | with node identity; revocation record 30 d after purge | audit/forensics |
 | `key_rotations` | with node/key identity | rotation state machine recovery (doc 04 §7) |
 | `audit_log` | 180 d (owner decision Q-AUD; configurable down, never below 30) | security audit, size-bounded |
 | security ledger (`security-ledger.jsonl`) | 180 d, append-only, hash-chained; included in every backup/offsite copy | revocations/purges/restores/account changes; must never be silently truncated |
-| `enroll_tokens` | deleted on use/expiry | hash only |
+| `enroll_tokens` | deleted on use/expiry | hash only; scope{event_id,node_class} stored with the token record |
 | `sessions`, `recovery_codes` | expire / one-time | not archived |
 | backups | see §6 | not a second history store |
 
@@ -201,6 +204,15 @@ owner daily pull); it must not store center/VPS credentials.
 A restore is a point-in-time rollback and can resurrect identities/data revoked
 or purged after the backup was taken. The ledger is the authority for
 revocation/purge facts across restores.
+
+**A verifiable copy is not the latest copy.** A backup/ledger whose chain and
+signature verify only proves internal consistency and a known prefix; it does not
+prove that it is the newest security state. After a whole-machine loss, if the
+operator cannot prove ledger completeness/latestness (e.g. only an older verifiable
+backup exists and the newest off-host copy/checkpoint cannot be authenticated),
+the restore MUST stay in quarantine and no node permissions are restored merely
+because an old backup is signature-valid. Actual off-host storage selection and
+restore drills are scheduled in UM-E.
 
 Ledger properties (frozen):
 

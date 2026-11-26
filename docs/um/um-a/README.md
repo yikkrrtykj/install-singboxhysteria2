@@ -1,8 +1,11 @@
 # UM-A — Investigation, selection and frozen design
 
-Status: **deliverable for independent review**. UM-B and later phases remain
-HOLD until this phase receives an independent review PASS (see
-[07-um-b-entry-and-review.md](07-um-b-entry-and-review.md)).
+Status: **revision 5 final targeted amendment — deliverable for independent
+review**. UM-B and later phases remain HOLD until this phase receives an
+independent review PASS and the owner merge authorization (see
+[07-um-b-entry-and-review.md](07-um-b-entry-and-review.md)). The owner's Round-2
+review conclusions are recorded in 07 §3 / 08; they do not replace the independent
+review or authorize a merge.
 
 ## Scope
 
@@ -14,10 +17,12 @@ inputs needed to start UM-B:
 2. Technology selection for center, agent, web frontend, database and
    deployment, with rejected alternatives and dependency constraints.
 3. Architecture, data flow, trust boundaries, threat surface, permission
-   matrix and event-isolation rules.
+   matrix, `node_class` isolation and event-isolation rules.
 4. Frozen node registration / authentication / reporting / rotation /
    revocation / protocol-version / compatibility contract (v1) with
-   machine-readable schemas and a signed test vector.
+   machine-readable schemas and signed test vectors, including the owner-accepted
+   A-1..A-5 recovery semantics, numeric/SQLite bounds and the Windows terminal
+   six-token telemetry.
 5. Frozen 30-day history retention, capacity limits, deletion rules and
    backup/restore targets.
 6. Threat model, security test plan and performance budget that later phases
@@ -41,8 +46,8 @@ inputs needed to start UM-B:
 - [05 — Retention, capacity and backup](05-retention-capacity-backup.md)
 - [06 — Threat model, security tests and performance](06-threat-model-security-tests-performance.md)
 - [07 — UM-B entry criteria and review](07-um-b-entry-and-review.md)
-- [08 — PR #126 review response matrix (rev 2 and targeted rev 3)](08-review-response-matrix.md)
-- [../contracts/v1/](../contracts/v1/) — schemas, positive/negative examples, signed report+enrollment vectors, behavioural negative contract
+- [08 — PR #126 review response matrix (rev 2, rev 3 and rev-5 targeted amendment; owner Round-2 record)](08-review-response-matrix.md)
+- [../contracts/v1/](../contracts/v1/) — schemas, positive/negative examples, signed report/Windows-terminal/enrollment/rotate/config vectors, behavioural negative contract (revision 5)
 
 ## How this phase was investigated
 
@@ -71,7 +76,8 @@ The independent reviewer must confirm all of:
       ingress, read-only agent, center not in business path).
 - [ ] Node protocol v1 is unambiguous, replay-resistant, rotation/revocation
       capable, version-compatible, and testable from the committed schemas and
-      signed vector.
+      signed vectors; the rev-5 recovery/numeric/node-class/Windows-terminal
+      additions and revoked-vector history are coherent.
 - [ ] Retention/capacity/backup rules are implementable within the 2C4G/40GB
       assumption and the 30-day history requirement, including the database
       decision gate.
@@ -81,19 +87,28 @@ The independent reviewer must confirm all of:
 - [ ] No implementation was started and no merge/deployment authorization is
       implied.
 
-## Local validation performed for this deliverable
+## Local validation performed for this deliverable (revision 5)
 
-- Every JSON schema/example under `docs/um/contracts/v1/` parses as JSON, the
-  schemas are valid JSON Schema 2020-12, positive examples validate and committed
-  negative examples are rejected.
-- Positive report **and** enrollment signed vectors verify with OpenSSL
-  (Ed25519); tampered-body, wrong-key and cross-endpoint-reuse vectors fail as
-  required; the behavioural negative contract freezes token/header/encoding/config-body/
-  replay/sequence/rotation/source-gating/size/cross-plane expectations.
+- Every JSON schema/example under `docs/um/contracts/v1/` parses as JSON; all 10
+  schemas are valid JSON Schema 2020-12; 10 positive examples validate; the 7
+  schema-negative examples are rejected and the 2 runtime-only negatives are
+  schema-valid as intended.
+- Signed vectors verify with Ed25519: retained rev-4 report, rev-5 Windows
+  terminal report, rev-5 enrollment, rotate and config; body bytes/hashes match
+  the committed examples; the historical rev-4 enrollment vector remains
+  verifiable and is explicitly not a current positive. Tampered-body (Linux and
+  Windows), wrong-key, cross-endpoint, boot-generation and rotate-body negatives
+  fail as required.
+- The behavioural contract is revision 5 with 67 unique cases, all error codes in
+  the closed enum, retained `superseded_rev4_expectations`, and the REC-01..REC-30
+  mapping in `04` §6.4.
+- Cross-document checks: no normative leftover `seq == 1`/generation-skip/
+  `uint64`/"Mihomo disabled in v1" contradiction, no stale node-table naming, relative
+  links resolve, and no private keys/tokens are committed.
 - Markdown/Mermaid was reviewed manually; no repository test or CI job reads
   `docs/um/`, so CI for this PR is regression-only (existing suites must stay
-  green).
+  green). The known Windows acceptance-harness flake is recorded separately and
+  was not hidden by any test change.
 
-Exact evidence (commands, hashes, CI run and the recorded same-HEAD rerun) is
-recorded in the PR body, not in this directory, so the committed design stays
-stable.
+Exact commands/results are recorded in the PR body and in `08` (rev-5 section),
+not in this directory, so the committed design stays stable.
