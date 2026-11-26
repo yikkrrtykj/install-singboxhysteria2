@@ -41,8 +41,8 @@ func TestB2PrivacySentinelRejectedBeforeStorage(t *testing.T) {
 	base := b2BaseCollected(t)
 	doc := b2Example(t, "report-snapshot.v1.json")
 	doc["report_id"] = b2UUID(t)
-	doc["collected_at"] = base
 	b2ShiftReportTimes(doc, base)
+	doc["collected_at"] = base
 	// Plant a credential-shaped sentinel in a non-identifier field.
 	doc["agent"].(map[string]any)["version"] = "password=supersecret"
 	body := b2JSON(t, doc)
@@ -67,8 +67,8 @@ func TestB2EventTagBindingAndPrivacyAudit(t *testing.T) {
 	base := b2BaseCollected(t)
 	events := b2Example(t, "report-events.v1.json")
 	events["report_id"] = b2UUID(t)
-	events["collected_at"] = base
 	b2ShiftReportTimes(events, base)
+	events["collected_at"] = base
 	// The event example's detail uses the configured allowlisted inbound tag, so
 	// the first event report is accepted.
 	if status, resp := b2SendReport(t, tc, a, events, b2Nonce(t)); status != 200 || resp["result"] != "accepted" {
@@ -90,8 +90,8 @@ func TestB2EventTagBindingAndPrivacyAudit(t *testing.T) {
 	// storing payload or secret text.
 	privacy := b2Example(t, "report-snapshot.v1.json")
 	privacy["report_id"] = b2UUID(t)
-	privacy["collected_at"] = base
 	b2ShiftReportTimes(privacy, base)
+	privacy["collected_at"] = base
 	privacy["agent"].(map[string]any)["version"] = "password=anothersecret"
 	if status, _ := b2SendReport(t, tc, a, privacy, b2Nonce(t)); status != 400 {
 		t.Fatalf("privacy sentinel status=%d, want 400", status)

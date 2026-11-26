@@ -144,8 +144,8 @@ func TestB2F6ReportIdentityAcrossDedupeWindow(t *testing.T) {
 	// Same report_id as metrics => cross-type conflict.
 	metrics := b2Example(t, "report-metrics.v1.json")
 	metrics["report_id"] = reportID
-	metrics["collected_at"] = base
 	b2ShiftReportTimes(metrics, base)
+	metrics["collected_at"] = base
 	if status, resp := b2SendReport(t, tc, a, metrics, b2Nonce(t)); status != 409 || resp["error"] != "report_conflict" {
 		t.Fatalf("cross-type dedupe expiry: %d %v, want report_conflict", status, resp)
 	}

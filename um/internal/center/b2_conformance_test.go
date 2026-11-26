@@ -27,7 +27,7 @@ func b2BaseCollected(t *testing.T) int64 {
 	// Synthetic reports are collected after the enrollment-time config update.
 	// The future offset keeps newer/stale comparisons inside the frozen ±60s
 	// collected_at window without backdating config history.
-	return ((time.Now().Unix() / 60) + 1) * 60
+	return ((time.Now().Unix() / 60) + 2) * 60
 }
 
 // b2ShiftReportTimes shifts every contract timestamp field in a report document
@@ -83,8 +83,8 @@ func b2SnapshotDoc(t *testing.T, collectedAt int64) map[string]any {
 	t.Helper()
 	doc := b2Example(t, "report-snapshot.v1.json")
 	doc["report_id"] = b2UUID(t)
-	doc["collected_at"] = collectedAt
 	b2ShiftReportTimes(doc, collectedAt)
+	doc["collected_at"] = collectedAt
 	return doc
 }
 

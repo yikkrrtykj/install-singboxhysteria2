@@ -29,8 +29,8 @@ func TestC4WindowsTerminalAndControllerSourcesIndependent(t *testing.T) {
 	}
 	doc := b2Example(t, "terminal-snapshot.v1.json")
 	doc["report_id"] = b2UUID(t)
-	doc["collected_at"] = base
 	b2ShiftReportTimes(doc, base)
+	doc["collected_at"] = base
 	status, resp := b2SendReport(t, tc, win, doc, b2Nonce(t))
 	if status != 400 || resp["error"] != "invalid_request" {
 		t.Fatalf("terminal=true/mihomo=false with ok active_connections: %d %v", status, resp)
@@ -58,8 +58,8 @@ func TestC4WindowsTerminalAndControllerSourcesIndependent(t *testing.T) {
 	}
 	doc3 := b2Example(t, "terminal-snapshot.v1.json")
 	doc3["report_id"] = b2UUID(t)
-	doc3["collected_at"] = base
 	b2ShiftReportTimes(doc3, base)
+	doc3["collected_at"] = base
 	if status, resp := b2SendReport(t, tc, win, doc3, b2Nonce(t)); status != 400 || resp["error"] != "invalid_request" {
 		t.Fatalf("terminal=false with ok selection: %d %v", status, resp)
 	}
@@ -110,8 +110,8 @@ func TestC4LinuxServicesAndSingboxApprovalIndependent(t *testing.T) {
 	}
 	events := b2Example(t, "report-events.v1.json")
 	events["report_id"] = b2UUID(t)
-	events["collected_at"] = base
 	b2ShiftReportTimes(events, base)
+	events["collected_at"] = base
 	status, resp := b2SendReport(t, tc, a, events, b2Nonce(t))
 	if status != 400 || resp["error"] != "invalid_request" {
 		t.Fatalf("protocol event without singbox_api: %d %v", status, resp)
@@ -119,8 +119,8 @@ func TestC4LinuxServicesAndSingboxApprovalIndependent(t *testing.T) {
 	// Generic diagnostic remains legal without the protocol source.
 	generic := b2Example(t, "report-events.v1.json")
 	generic["report_id"] = b2UUID(t)
-	generic["collected_at"] = base
 	b2ShiftReportTimes(generic, base)
+	generic["collected_at"] = base
 	evs := generic["events"].([]any)
 	evs[0].(map[string]any)["kind"] = "agent_started"
 	evs[0].(map[string]any)["detail"] = map[string]any{"agent_version": "1.0.0"}

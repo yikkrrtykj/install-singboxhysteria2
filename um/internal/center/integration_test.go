@@ -344,8 +344,8 @@ func TestB2CenterEnrollmentTelemetryRotation(t *testing.T) {
 	snap := b2Example(t, "report-snapshot.v1.json")
 	base := int64(snap["collected_at"].(float64))
 	snap["report_id"] = b2UUID(t)
-	snap["collected_at"] = base
 	b2ShiftReportTimes(snap, base)
+	snap["collected_at"] = base
 	status, resp, _ := reportAttempt(t, tc, linux, snap)
 	if status != http.StatusOK || resp["result"] != "accepted" {
 		t.Fatalf("snapshot status=%d resp=%v", status, resp)
@@ -511,8 +511,8 @@ func TestB2CenterRestartPersistence(t *testing.T) {
 	snap := b2Example(t, "report-snapshot.v1.json")
 	snap["report_id"] = b2UUID(t)
 	base := int64(snap["collected_at"].(float64))
-	snap["collected_at"] = base
 	b2ShiftReportTimes(snap, base)
+	snap["collected_at"] = base
 	status, resp, _ := reportAttempt(t, tc, linux, snap)
 	if status != http.StatusOK || resp["result"] != "accepted" {
 		t.Fatalf("initial snapshot status=%d resp=%v", status, resp)
@@ -525,7 +525,7 @@ func TestB2CenterRestartPersistence(t *testing.T) {
 	seq := linux.seq
 	nonce := b2Nonce(t)
 	body := b2JSON(t, attempt)
-	sentAt := time.Now().Unix()
+	sentAt := b2SentAt(t, body)
 	h1, _ := linux.headers(wire.Report, sentAt, nonce, body)
 	status, resp2 := doPost(t, tc, "/v1/agent/report", h1, body)
 	if status != http.StatusOK || resp2["result"] != "duplicate" {

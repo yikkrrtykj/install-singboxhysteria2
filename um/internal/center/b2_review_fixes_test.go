@@ -90,7 +90,7 @@ func TestB2EnrollFreshnessAndNoPartialWrites(t *testing.T) {
 	}
 	// Exact boundary accepted.
 	tok, _ := newTokenFor(t, tc, eventUUID, store.NodeClassLinuxVPS, now)
-	h, raw := signedEnrollAttempt(t, a, tok, now-300)
+	h, raw := signedEnrollAttempt(t, a, tok, now+300)
 	status, resp := doPost(t, tc, "/v1/agent/enroll", h, raw)
 	if status != 200 || resp["node_id"] == nil {
 		t.Fatalf("boundary enrollment: %d %v", status, resp)
@@ -203,7 +203,7 @@ func TestB2ACKUsesTransactionNextSeqAndExhaustion(t *testing.T) {
 	body := b2JSON(t, doc)
 	// Rebuild headers with seq=MAX_NUMERIC.
 	a.seq = wire.MaxNumeric
-	h, err := a.headers(wire.Report, now, b2Nonce(t), body)
+	h, err := a.headers(wire.Report, b2SentAt(t, body), b2Nonce(t), body)
 	if err != nil {
 		t.Fatalf("headers: %v", err)
 	}
