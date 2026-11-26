@@ -90,7 +90,9 @@ Migration v3 adds:
   tags, device salt);
 - `snapshots` + `node_latest` (history by collected_at; stale_ignored never
   replaces newer; latest pointer FK protected during retention);
-- `report_metrics` and `report_events` (validated payloads + per-event rows);
+- `report_metrics`; `report_event_reports` (validated events report payload
+  once) plus normalized `report_events` rows (event id/at/kind/severity/detail)
+  so a multi-event report does not duplicate the full body per event;
 - `archive_records` and `retention_runs` for policy-B archive/retention;
 - rotation persistence columns (`new_public_key`, `response_json`,
   `confirmed_at`).
@@ -99,14 +101,31 @@ Migration v3 adds:
 deleted by retention. `VerifyChain` remains diagnostic only and is not recovery
 authorization.
 
-## Retention and capacity
+## Event lifecycle, retention and capacity (review correction)
 
-`RunRetentionB2` physically prunes seq_dedupe to the current generation's latest
-256 entries, boot_registry to the latest 8 generations, applies nonce 24 h /
-report 8 days / activity 30 days, archives active telemetry older than 30 days
-for a further 30 days, keeps latest pointers valid, preserves node_boot and
-records a repeatable run. Synthetic capacity tests only; real capacity/performance
-gating remains UM-E.
+Policy B is implemented with a persistent `event_catalog` instead of a second
+archive copy:
+
+- active events keep a rolling 30-day window by `collected_at`;
+- archive at T stops ingest and keeps remaining event data until T+30d;
+- after T+30d event telemetry is deleted, the catalog survives until explicit
+  purge (B4 UI), and purge writes a content-free 180-day tombstone;
+- node retire never shortens event history; latest pointers are removed by the
+  frozen 30-day/retire rule and before snapshot deletion (FK integrity);
+- seq_dedupe keeps the current generation's latest 256 rows and deletes old
+  generations (retired generations are rejected by the persistent high-water);
+  boot_registry keeps 8 generations; node_boot is never deleted;
+- deletions are bounded to 50,000 rows per transaction and are resumable;
+  retention_runs is bounded to 100; soft failures set degraded/failure state and
+  leave unprocessed data intact;
+- quotas: 150 active nodes total, 100/event, 10 archived events with retained
+  data, 50 event-catalog rows, checked under a capacity lock before token/
+  enrollment/archive writes; DB/WAL/row-growth statistics are exposed.
+
+Historical spool semantics and quota/error mapping are recorded in
+`docs/um-b2-contract-clarifications.md`; the frozen wire contract is unchanged.
+Synthetic capacity data is not a 200-node SLA; UM-E owns full capacity/performance
+and backup/restore acceptance.
 
 ## Known limitations
 
@@ -118,3 +137,17 @@ gating remains UM-E.
   mapping basis only.
 - No signed checkpoint/offsite backup/full restore validation (UM-E).
 - Synthetic load is not a production performance or security acceptance.
+
+
+## Review-correction notes
+
+- Event lifecycle/purge: `ArchiveEvent`/`PurgeEvent` are the minimal store
+  primitives; no public B4 management endpoints or type-to-confirm UI.
+- Enroll enforces the same ±300 s freshness as report/config/rotate; token
+  consumption happens only after validation and commits atomically with node/
+  key/config.
+- Rotate aborts expired awaiting intents immediately (provisional key only; old
+  key stays active), and nonce reuse is classified before boot/seq conflicts.
+- Security ledger entries are written for token/config/rotation/revocation,
+  boot_generation_gap and privacy rejections; ledger retention/capacity and
+  checkpoints remain UM-E.

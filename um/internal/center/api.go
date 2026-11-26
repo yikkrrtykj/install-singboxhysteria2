@@ -44,10 +44,11 @@ const (
 // unauthenticated floods; the boundary applies a bounded token bucket before any
 // expensive parsing. Config.RateLimitPerSecond / RateLimitBurst override them.
 const (
-	DefaultRateLimitPerSecond = 100
-	DefaultRateLimitBurst     = 200
-	maxRateLimitBuckets       = 4096
-	minRetryAfterSeconds      = 1
+	DefaultRateLimitPerSecond    = 100
+	DefaultRateLimitBurst        = 200
+	maxRateLimitBuckets          = 4096
+	minRetryAfterSeconds         = 1
+	DefaultMaxConcurrentRequests = 256
 )
 
 // ContractSchemaNames is the frozen rev-5 schema set the center insists on at
@@ -104,6 +105,10 @@ type Config struct {
 	// RateLimitBurst is the per-IP token bucket depth. Zero uses
 	// DefaultRateLimitBurst.
 	RateLimitBurst int
+
+	// MaxConcurrentRequests bounds in-flight ingest handlers. Zero uses
+	// DefaultMaxConcurrentRequests; a negative value disables the bound for tests.
+	MaxConcurrentRequests int
 }
 
 // withDefaults returns a copy with every unset optional field filled in. It does
@@ -126,6 +131,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.RateLimitBurst == 0 {
 		c.RateLimitBurst = DefaultRateLimitBurst
+	}
+	if c.MaxConcurrentRequests == 0 {
+		c.MaxConcurrentRequests = DefaultMaxConcurrentRequests
 	}
 	return c
 }

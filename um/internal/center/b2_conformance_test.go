@@ -10,6 +10,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/base64"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -127,6 +128,7 @@ func TestB2REC03LostACKDuplicate(t *testing.T) {
 	if boot.LastSeq != a.seq {
 		t.Fatalf("REC-03 high-water=%d want %d", boot.LastSeq, a.seq)
 	}
+	b2AssertREC(t, "REC-03", status, resp)
 }
 
 func TestB2REC04NewGenerationFirstReportDuplicate(t *testing.T) {
@@ -152,15 +154,34 @@ func TestB2REC04NewGenerationFirstReportDuplicate(t *testing.T) {
 	if boot.HighestGen != a.gen || boot.LastSeq != a.seq {
 		t.Fatalf("REC-04 high-water=%+v want gen=%d seq=%d", boot, a.gen, a.seq)
 	}
+	b2AssertREC(t, "REC-04", status, resp)
 }
 
 func TestB2REC05GenerationGap(t *testing.T) {
 	tc := startTestCenter(t)
 	a := enrollAgent(t, tc, store.NodeClassLinuxVPS, "linux")
-	a.gen = 3 // two consecutive offline restarts: gap 2 from first contact (no boot yet)
-	status, resp := b2SendReport(t, tc, a, b2SnapshotDoc(t, b2BaseCollected(t)), b2Nonce(t))
+	base := b2BaseCollected(t)
+	// Fixture setup: existing high-water at generation 4, then two offline
+	// restarts (generation 6, forward gap 2).
+	db := rawDB(t, tc)
+	before := rawCount(t, db, `SELECT COUNT(*) FROM security_ledger WHERE kind='boot_generation_gap'`)
+	a.gen = 4
+	if status, resp := b2SendReport(t, tc, a, b2SnapshotDoc(t, base), b2Nonce(t)); status != 200 || resp["result"] != "accepted" {
+		t.Fatalf("REC-05 seed high-water: %d %v", status, resp)
+	}
+	a.gen = 6
+	a.bootID = "abababababababababababababababab"
+	status, resp := b2SendReport(t, tc, a, b2SnapshotDoc(t, base+1), b2Nonce(t))
 	if status != 200 || resp["result"] != "accepted" {
-		t.Fatalf("REC-05: %d %v", status, resp)
+		t.Fatalf("REC-05 gap: %d %v", status, resp)
+	}
+	b2AssertREC(t, "REC-05", status, resp)
+	boot, err := tc.store.GetBoot(context.Background(), a.nodeID)
+	if err != nil || boot.HighestGen != 6 {
+		t.Fatalf("REC-05 high-water = %+v err=%v", boot, err)
+	}
+	if n := rawCount(t, db, `SELECT COUNT(*) FROM security_ledger WHERE kind='boot_generation_gap'`); n-before != 1 {
+		t.Fatalf("REC-05 boot_generation_gap audit delta=%d, want 1", n-before)
 	}
 }
 
@@ -178,13 +199,15 @@ func TestB2REC06SpoolReplayOldestFirst(t *testing.T) {
 	}
 	// Duplicate replay of the first report after the second is acknowledged as
 	// duplicate without overwriting newest data.
-	if status, resp := b2SendReport(t, tc, a, first, b2Nonce(t)); status != 200 || resp["result"] != "duplicate" {
+	status, resp := b2SendReport(t, tc, a, first, b2Nonce(t))
+	if status != 200 || resp["result"] != "duplicate" {
 		t.Fatalf("REC-06 duplicate: %d %v", status, resp)
 	}
 	latest, err := tc.store.GetLatestSnapshot(context.Background(), a.nodeID)
 	if err != nil || latest.ReportID != second["report_id"] {
 		t.Fatalf("REC-06 latest=%+v err=%v", latest, err)
 	}
+	b2AssertREC(t, "REC-06", status, resp)
 }
 
 func TestB2REC10DelayedLowerSequenceConflict(t *testing.T) {
@@ -198,6 +221,7 @@ func TestB2REC10DelayedLowerSequenceConflict(t *testing.T) {
 	if status != 409 || resp["error"] != "sequence_conflict" {
 		t.Fatalf("REC-10 delayed: %d %v, want 409 sequence_conflict", status, resp)
 	}
+	b2AssertREC(t, "REC-10", status, resp)
 }
 
 func TestB2REC13ACKNextSeqReconciliation(t *testing.T) {
@@ -217,22 +241,40 @@ func TestB2REC13ACKNextSeqReconciliation(t *testing.T) {
 			t.Fatalf("REC-13 repeated next_seq=%v", next)
 		}
 		seen[next] = true
+		b2AssertREC(t, "REC-13", status, resp)
 	}
 }
 
 func TestB2REC15AbortedTransactionThenRetry(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "center.db")
-	tc, _ := b2FaultService(t, path, true)
+	tc := startTestCenter(t)
 	a := enrollAgent(t, tc, store.NodeClassLinuxVPS, "linux")
 	doc := b2SnapshotDoc(t, b2BaseCollected(t))
+	tc.store.SetIngestHookForTest(func(stage string) error {
+		if stage == "after_highwater" {
+			return errors.New("injected SQLite transaction failure")
+		}
+		return nil
+	})
 	status, resp := b2SendReport(t, tc, a, doc, b2Nonce(t))
 	if status != 503 || resp["error"] != "storage_unavailable" {
-		t.Fatalf("REC-15 injected failure: %d %v", status, resp)
+		t.Fatalf("REC-15 injected transaction failure: %d %v", status, resp)
 	}
+	db := rawDB(t, tc)
+	for _, q := range []string{
+		`SELECT COUNT(*) FROM node_boot`, `SELECT COUNT(*) FROM seq_dedupe`,
+		`SELECT COUNT(*) FROM nonce_dedupe`, `SELECT COUNT(*) FROM report_dedupe`,
+		`SELECT COUNT(*) FROM snapshots`,
+	} {
+		if n := rawCount(t, db, q); n != 0 {
+			t.Fatalf("REC-15 failed transaction left rows: %s=%d", q, n)
+		}
+	}
+	tc.store.SetIngestHookForTest(nil)
 	status, resp = b2SendReport(t, tc, a, doc, b2Nonce(t))
 	if status != 200 || resp["result"] != "accepted" {
 		t.Fatalf("REC-15 retry: %d %v", status, resp)
 	}
+	b2AssertREC(t, "REC-15", status, resp)
 }
 
 func TestB2REC16NonRetryablePayloadThenNextRecord(t *testing.T) {
@@ -249,6 +291,7 @@ func TestB2REC16NonRetryablePayloadThenNextRecord(t *testing.T) {
 	if status != 200 || resp["result"] != "accepted" {
 		t.Fatalf("REC-16 next record: %d %v", status, resp)
 	}
+	b2AssertREC(t, "REC-16", status, resp)
 }
 
 func b2RotateBody(t *testing.T) []byte {
@@ -290,6 +333,7 @@ func TestB2REC19RotateIntentAcrossRestarts(t *testing.T) {
 	if boot.HighestGen != 3 {
 		t.Fatalf("REC-19 high-water gen=%d want 3", boot.HighestGen)
 	}
+	b2AssertREC(t, "REC-19", status, replay)
 }
 
 func TestB2REC20RotateExpired(t *testing.T) {
@@ -314,6 +358,7 @@ func TestB2REC20RotateExpired(t *testing.T) {
 	if status != 409 || resp["error"] != "rotation_expired" {
 		t.Fatalf("REC-20 replay: %d %v, want 409 rotation_expired", status, resp)
 	}
+	b2AssertREC(t, "REC-20", status, resp)
 }
 
 func TestB2REC21RevokedDuringBacklog(t *testing.T) {
@@ -329,6 +374,7 @@ func TestB2REC21RevokedDuringBacklog(t *testing.T) {
 	if status != 401 || resp["error"] != "revoked_key" {
 		t.Fatalf("REC-21 after revoke: %d %v", status, resp)
 	}
+	b2AssertREC(t, "REC-21", status, resp)
 }
 
 func TestB2REC22FirstContactConfig(t *testing.T) {
@@ -341,6 +387,7 @@ func TestB2REC22FirstContactConfig(t *testing.T) {
 	if status != 200 || resp["v"].(float64) != 1 {
 		t.Fatalf("REC-22: %d %v", status, resp)
 	}
+	b2AssertREC(t, "REC-22", status, resp)
 }
 
 func TestB2REC23FirstContactRotate(t *testing.T) {
@@ -350,6 +397,7 @@ func TestB2REC23FirstContactRotate(t *testing.T) {
 	if status != 200 || resp["new_key_id"] == nil {
 		t.Fatalf("REC-23: %d %v", status, resp)
 	}
+	b2AssertREC(t, "REC-23", status, resp)
 }
 
 func TestB2REC24EnrollmentResponseLoss(t *testing.T) {
@@ -381,6 +429,7 @@ func TestB2REC24EnrollmentResponseLoss(t *testing.T) {
 	if err := tc.store.RevokeNode(context.Background(), orphan, now); err != nil {
 		t.Fatalf("revoke orphan: %v", err)
 	}
+	b2AssertREC(t, "REC-24", status, resp)
 }
 
 func TestB2REC29StaleSnapshot(t *testing.T) {
@@ -388,17 +437,20 @@ func TestB2REC29StaleSnapshot(t *testing.T) {
 	a := enrollAgent(t, tc, store.NodeClassLinuxVPS, "linux")
 	base := b2BaseCollected(t)
 	newer := b2SnapshotDoc(t, base+100)
-	if status, resp := b2SendReport(t, tc, a, newer, b2Nonce(t)); status != 200 || resp["result"] != "accepted" {
+	status, resp := b2SendReport(t, tc, a, newer, b2Nonce(t))
+	if status != 200 || resp["result"] != "accepted" {
 		t.Fatalf("REC-29 newer: %d %v", status, resp)
 	}
 	older := b2SnapshotDoc(t, base)
-	if status, resp := b2SendReport(t, tc, a, older, b2Nonce(t)); status != 200 || resp["result"] != "stale_ignored" {
+	status, resp = b2SendReport(t, tc, a, older, b2Nonce(t))
+	if status != 200 || resp["result"] != "stale_ignored" {
 		t.Fatalf("REC-29 older: %d %v", status, resp)
 	}
 	latest, _ := tc.store.GetLatestSnapshot(context.Background(), a.nodeID)
 	if latest.ReportID != newer["report_id"] {
 		t.Fatalf("REC-29 stale overwrote latest: %s", latest.ReportID)
 	}
+	b2AssertREC(t, "REC-29", status, resp)
 }
 
 func TestB2REC30InterleavedGenerations(t *testing.T) {
@@ -421,6 +473,7 @@ func TestB2REC30InterleavedGenerations(t *testing.T) {
 	if status != 409 || resp["error"] != "stale_boot_generation" {
 		t.Fatalf("REC-30 stale: %d %v", status, resp)
 	}
+	b2AssertREC(t, "REC-30", status, resp)
 }
 
 func base64URL(b []byte) string { return base64.RawURLEncoding.EncodeToString(b) }

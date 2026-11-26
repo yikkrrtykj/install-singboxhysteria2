@@ -59,3 +59,46 @@ func TestB2PrivacySentinelRejectedBeforeStorage(t *testing.T) {
 		t.Fatalf("privacy sentinel stored %d snapshots", stats.Snapshots)
 	}
 }
+
+func TestB2EventTagBindingAndPrivacyAudit(t *testing.T) {
+	tc := startTestCenter(t)
+	a := enrollAgent(t, tc, store.NodeClassLinuxVPS, "linux")
+	base := b2BaseCollected(t)
+	events := b2Example(t, "report-events.v1.json")
+	events["report_id"] = b2UUID(t)
+	events["collected_at"] = base
+	// The event example's detail uses the configured allowlisted inbound tag, so
+	// the first event report is accepted.
+	if status, resp := b2SendReport(t, tc, a, events, b2Nonce(t)); status != 200 || resp["result"] != "accepted" {
+		t.Fatalf("tag-bound events: %d %v", status, resp)
+	}
+	// Mutate an event detail inbound_tag to an unknown value: reject at the
+	// center tag binding, not at storage.
+	bad := b2Example(t, "report-events.v1.json")
+	bad["report_id"] = b2UUID(t)
+	bad["collected_at"] = base + 1
+	evs := bad["events"].([]any)
+	detail := evs[0].(map[string]any)["detail"].(map[string]any)
+	detail["inbound_tag"] = "not-configured"
+	if status, resp := b2SendReport(t, tc, a, bad, b2Nonce(t)); status != 400 || resp["error"] != "invalid_request" {
+		t.Fatalf("unknown tag: %d %v, want 400 invalid_request", status, resp)
+	}
+	// Privacy sentinel rejection is recorded in the security ledger without
+	// storing payload or secret text.
+	privacy := b2Example(t, "report-snapshot.v1.json")
+	privacy["report_id"] = b2UUID(t)
+	privacy["collected_at"] = base
+	privacy["agent"].(map[string]any)["version"] = "password=anothersecret"
+	if status, _ := b2SendReport(t, tc, a, privacy, b2Nonce(t)); status != 400 {
+		t.Fatalf("privacy sentinel status=%d, want 400", status)
+	}
+	if n := rawCount(t, rawDB(t, tc), `SELECT COUNT(*) FROM security_ledger WHERE kind='report_rejected'`); n != 1 {
+		t.Fatalf("privacy audit entries=%d, want 1", n)
+	}
+	if n := rawCount(t, rawDB(t, tc), `SELECT COUNT(*) FROM report_event_reports WHERE node_id=?`, a.nodeID); n != 1 {
+		t.Fatalf("privacy/tag test expected only the first accepted events report, got %d", n)
+	}
+	if n := rawCount(t, rawDB(t, tc), `SELECT COUNT(*) FROM snapshots WHERE node_id=?`, a.nodeID); n != 0 {
+		t.Fatalf("rejected tag/privacy reports wrote snapshots: %d", n)
+	}
+}

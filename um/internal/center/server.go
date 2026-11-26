@@ -24,6 +24,7 @@ type Server struct {
 
 	ingest http.Handler
 	admin  http.Handler
+	sem    chan struct{}
 
 	mu           sync.Mutex
 	started      bool
@@ -59,7 +60,13 @@ func NewServer(cfg Config, svc Service) (*Server, error) {
 		schemas: schemas,
 		limiter: newRateLimiter(cfg.RateLimitPerSecond, cfg.RateLimitBurst, cfg.Now),
 	}
+	if cfg.MaxConcurrentRequests > 0 {
+		s.sem = make(chan struct{}, cfg.MaxConcurrentRequests)
+	}
 	s.ingest = http.HandlerFunc(s.serveIngest)
+	if s.sem != nil {
+		s.ingest = s.limitConcurrency(s.ingest)
+	}
 	s.admin = http.HandlerFunc(s.serveAdmin)
 	return s, nil
 }
@@ -207,6 +214,21 @@ func newHTTPServer(handler http.Handler) *http.Server {
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
+}
+
+// limitConcurrency bounds total in-flight ingest handlers independently of the
+// per-IP rate limit, so parallel connections cannot create unbounded memory.
+func (s *Server) limitConcurrency(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case s.sem <- struct{}{}:
+			defer func() { <-s.sem }()
+			next.ServeHTTP(w, r)
+		default:
+			w.Header().Set("Retry-After", "1")
+			s.writeError(w, NewAPIError(http.StatusTooManyRequests, "rate_limited", true), 1)
+		}
+	})
 }
 
 // serveAdmin is the whole admin plane. It shares no route or handler state

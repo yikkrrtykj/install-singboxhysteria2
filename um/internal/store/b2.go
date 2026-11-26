@@ -125,6 +125,15 @@ func (s *Store) CreateEnrollToken(ctx context.Context, tokenHash, eventID, nodeC
 		return fmt.Errorf("store: begin enrollment token: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := lockCapacity(ctx, tx); err != nil {
+		return err
+	}
+	if _, err := ensureEventActiveTx(ctx, tx, eventID, now); err != nil {
+		return err
+	}
+	if err := checkNodeQuotaTx(ctx, tx, eventID); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO enroll_tokens(token_hash,event_id,node_class,expires_at,used_at,created_at)
 		 VALUES(?,?,?,?,NULL,?)`,
@@ -177,6 +186,9 @@ func (s *Store) Enroll(ctx context.Context, tokenHash, nodeClass, hostOS, public
 		return EnrolledIdentity{}, fmt.Errorf("store: begin enrollment: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := lockCapacity(ctx, tx); err != nil {
+		return EnrolledIdentity{}, err
+	}
 
 	var tokenEvent, tokenClass string
 	var expiresAt int64
@@ -198,6 +210,12 @@ func (s *Store) Enroll(ctx context.Context, tokenHash, nodeClass, hostOS, public
 	}
 	if tokenClass != nodeClass || tokenEvent == "" {
 		return EnrolledIdentity{}, ErrTokenScopeMismatch
+	}
+	if _, err := ensureEventActiveTx(ctx, tx, tokenEvent, now); err != nil {
+		return EnrolledIdentity{}, err
+	}
+	if err := checkNodeQuotaTx(ctx, tx, tokenEvent); err != nil {
+		return EnrolledIdentity{}, err
 	}
 	result, err := tx.ExecContext(ctx,
 		`UPDATE enroll_tokens SET used_at=? WHERE token_hash=? AND used_at IS NULL AND expires_at>?`,
@@ -344,6 +362,10 @@ type RotationRecord struct {
 	ResponseJSON string
 }
 
+// SetIngestHookForTest installs a test-only fault hook; production code must not
+// call it.
+func (s *Store) SetIngestHookForTest(hook func(string) error) { s.ingestHook = hook }
+
 // GetKey loads one key outside an explicit transaction (used by the center to
 // verify a signature before opening the authenticated ingest transaction; the
 // key state is re-checked inside that transaction).
@@ -437,6 +459,44 @@ func (t *Tx) PendingRotationTx(ctx context.Context, nodeID string) (RotationReco
 	return r, true, nil
 }
 
+// AbortRotationTx immediately aborts one awaiting_proof rotation: only the
+// provisional key is revoked; the old key remains active. Used for expired
+// intents that must not block a new legal rotation until the hourly job.
+func (t *Tx) AbortRotationTx(ctx context.Context, nodeID, nonce string, now int64) error {
+	r, ok, err := t.RotationTx(ctx, nodeID, nonce)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+	if r.State != RotationAwaitingProof {
+		return fmt.Errorf("%w: %s", ErrRotationState, r.State)
+	}
+	if _, err := t.tx.ExecContext(ctx,
+		`UPDATE node_keys SET state=?, revoked_at=? WHERE node_id=? AND key_id=? AND state=?`,
+		KeyRevoked, now, nodeID, r.NewKeyID, KeyProvisional); err != nil {
+		return fmt.Errorf("store: abort provisional key: %w", err)
+	}
+	if _, err := t.tx.ExecContext(ctx,
+		`UPDATE key_rotations SET state=? WHERE node_id=? AND nonce=?`,
+		RotationAborted, nodeID, nonce); err != nil {
+		return fmt.Errorf("store: abort rotation: %w", err)
+	}
+	if _, err := appendLedgerTx(ctx, t.tx, now, "rotation_aborted", nodeID, ledgerDetailHash(nonce+"|"+r.NewKeyID)); err != nil {
+		return err
+	}
+	return nil
+}
+
+// AppendLedger appends a security-ledger entry inside the caller's transaction.
+// It must be used instead of Store.AppendLedger while a transaction is open (the
+// store has one SQLite writer connection).
+func (t *Tx) AppendLedger(ctx context.Context, at int64, kind, subject, detailSHA string) error {
+	_, err := appendLedgerTx(ctx, t.tx, at, kind, subject, detailSHA)
+	return err
+}
+
 // RotationTx loads a rotation by (node, nonce).
 func (t *Tx) RotationTx(ctx context.Context, nodeID, nonce string) (RotationRecord, bool, error) {
 	var r RotationRecord
@@ -517,10 +577,12 @@ func (t *Tx) ConfirmRotationTx(ctx context.Context, nodeID, nonce string, now in
 		return RotationRecord{}, ErrKeyUnknown
 	}
 	if r.State != RotationAwaitingProof {
-		return r, nil
+		// Never return a record that a caller could mistake for a successful
+		// confirmation. Confirmed/aborted/unknown states are typed errors.
+		return RotationRecord{}, fmt.Errorf("%w: %s", ErrRotationState, r.State)
 	}
 	if r.ExpiresAt > 0 && now > r.ExpiresAt {
-		return r, ErrRotationExpired
+		return RotationRecord{}, ErrRotationExpired
 	}
 	if _, err := t.tx.ExecContext(ctx,
 		`UPDATE node_keys SET state=?, activated_at=? WHERE key_id=? AND node_id=?`,
@@ -600,7 +662,7 @@ func (s *Store) RevokeNode(ctx context.Context, nodeID string, now int64) error 
 	}
 	defer func() { _ = tx.Rollback() }()
 	res, err := tx.ExecContext(ctx,
-		`UPDATE nodes SET state=? WHERE node_id=?`, NodeRevoked, nodeID)
+		`UPDATE nodes SET state=?, retired_at=? WHERE node_id=?`, NodeRevoked, now, nodeID)
 	if err != nil {
 		return fmt.Errorf("store: revoke node: %w", err)
 	}
@@ -640,6 +702,16 @@ func (s *Store) RevokeKey(ctx context.Context, nodeID, keyID string, now int64) 
 	affected, _ := res.RowsAffected()
 	if affected != 1 {
 		return ErrKeyUnknown
+	}
+	// Revoke the other provisional key of any rotation involving this key: both
+	// directions are invalid once either side is revoked.
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE node_keys SET state=?, revoked_at=?
+		 WHERE node_id=? AND state=? AND key_id IN (
+		   SELECT new_key_id FROM key_rotations WHERE node_id=? AND old_key_id=?
+		   UNION SELECT old_key_id FROM key_rotations WHERE node_id=? AND new_key_id=?
+		 )`, KeyRevoked, now, nodeID, KeyProvisional, nodeID, keyID, nodeID, keyID); err != nil {
+		return fmt.Errorf("store: revoke related provisional keys: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE key_rotations SET state=? WHERE node_id=? AND (old_key_id=? OR new_key_id=?) AND state=?`,
@@ -755,6 +827,10 @@ func (s *Store) UpdateNodeConfig(ctx context.Context, nodeID string, sources map
 	}
 	defer func() { _ = tx.Rollback() }()
 	t := &Tx{tx: tx}
+	node, err := t.NodeTx(ctx, nodeID)
+	if err != nil {
+		return NodeConfig{}, err
+	}
 	cfg, err := t.ConfigTx(ctx, nodeID)
 	if err != nil {
 		return NodeConfig{}, err
@@ -764,6 +840,9 @@ func (s *Store) UpdateNodeConfig(ctx context.Context, nodeID string, sources map
 	}
 	if tags == nil {
 		tags = cfg.ExpectedInboundTags
+	}
+	if err := validateConfigForClass(node.NodeClass, sources, tags, cadence, cfg.ConfigVersion+1); err != nil {
+		return NodeConfig{}, err
 	}
 	cfg.Sources = sources
 	cfg.ExpectedInboundTags = tags
@@ -784,6 +863,48 @@ func (s *Store) UpdateNodeConfig(ctx context.Context, nodeID string, sources map
 		return NodeConfig{}, err
 	}
 	return cfg, nil
+}
+
+// validateConfigForClass enforces the frozen class/source/tag/cadence rules before
+// persistence, so a config that cannot produce a valid agent-config document is
+// never stored.
+func validateConfigForClass(nodeClass string, sources map[string]bool, tags []InboundTag, cadence, version int) error {
+	if cadence < 30 || cadence > 300 {
+		return invalidArgument("cadence_seconds", "must be in [30,300]")
+	}
+	if version < 1 {
+		return invalidArgument("config_version", "must be positive")
+	}
+	if sources == nil {
+		return invalidArgument("collect", "must not be nil")
+	}
+	allowed := map[string]bool{"system": true, "services": true, "singbox_api": true, "mihomo_api": true, "terminal": true, "events": true}
+	if len(sources) != len(allowed) {
+		return invalidArgument("collect", "must contain exactly the frozen source switches")
+	}
+	for k := range sources {
+		if !allowed[k] {
+			return invalidArgument("collect", "unknown source switch")
+		}
+	}
+	switch nodeClass {
+	case NodeClassLinuxVPS:
+		if sources["terminal"] || len(tags) == 0 {
+			return invalidArgument("collect", "linux_vps requires terminal=false and at least one expected inbound tag")
+		}
+	case NodeClassWindowsTerminal:
+		if sources["services"] || sources["singbox_api"] || len(tags) != 0 {
+			return invalidArgument("collect", "windows_terminal requires services/singbox_api=false and no expected inbound tags")
+		}
+	default:
+		return invalidArgument("node_class", "unknown class")
+	}
+	for _, t := range tags {
+		if t.InboundTag == "" || (t.Kind != "reality" && t.Kind != "hysteria2" && t.Kind != "other") {
+			return invalidArgument("expected_inbound_tags", "invalid tag/kind")
+		}
+	}
+	return nil
 }
 
 func hostMatchesClass(nodeClass, hostOS string) bool {
@@ -965,10 +1086,21 @@ func (s *Store) ApplyIngest(
 			`UPDATE nodes SET last_seen_at=? WHERE node_id=?`, now, nodeID); err != nil {
 			return protocol.Result{}, "", fmt.Errorf("store: update node last seen: %w", err)
 		}
+		if result.AuditGap && current.HighestGen > 0 {
+			if _, err := appendLedgerTx(ctx, tx, now, "boot_generation_gap", nodeID,
+				ledgerDetailHash(fmt.Sprintf("%d->%d", current.HighestGen, a.Gen))); err != nil {
+				return protocol.Result{}, "", err
+			}
+		}
 	case protocol.Duplicate:
 		// Already committed by the winning attempt; no high-water write.
 	default:
 		return protocol.Result{}, "", &TransportConflictError{Outcome: result.Outcome}
+	}
+	if s.ingestHook != nil {
+		if err := s.ingestHook("after_highwater"); err != nil {
+			return protocol.Result{}, "", fmt.Errorf("store: ingest fault injection: %w", err)
+		}
 	}
 	var disposition ReportDisposition
 	if apply != nil {
@@ -1085,7 +1217,7 @@ func (t *Tx) StoreMetricsTx(ctx context.Context, rec ReportRecord) (ReportDispos
 // per-event rows (already validated against the closed event schema).
 func (t *Tx) StoreEventsTx(ctx context.Context, rec ReportRecord, events []EventRecord) (ReportDisposition, error) {
 	var existing string
-	err := t.tx.QueryRowContext(ctx, `SELECT body_sha256 FROM report_events WHERE node_id=? AND report_id=? LIMIT 1`, rec.NodeID, rec.ReportID).Scan(&existing)
+	err := t.tx.QueryRowContext(ctx, `SELECT body_sha256 FROM report_event_reports WHERE node_id=? AND report_id=?`, rec.NodeID, rec.ReportID).Scan(&existing)
 	if err == nil {
 		if existing == rec.BodySHA256 {
 			return DispositionDuplicate, nil
@@ -1093,14 +1225,23 @@ func (t *Tx) StoreEventsTx(ctx context.Context, rec ReportRecord, events []Event
 		return "", fmt.Errorf("%w: report_id already stored with different events hash", ErrConflict)
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
-		return "", err
+		return "", fmt.Errorf("store: read events report dedupe: %w", err)
+	}
+	if _, err := t.tx.ExecContext(ctx,
+		`INSERT INTO report_event_reports(node_id,event_id,report_id,collected_at,received_at,body_sha256,payload_json)
+		 VALUES(?,?,?,?,?,?,?)`, rec.NodeID, rec.EventID, rec.ReportID, rec.CollectedAt, rec.ReceivedAt, rec.BodySHA256, rec.Payload); err != nil {
+		return "", fmt.Errorf("store: insert events report: %w", err)
 	}
 	for _, e := range events {
+		severity := e.Severity
+		if severity == "" {
+			severity = "info"
+		}
 		if _, err := t.tx.ExecContext(ctx,
-			`INSERT INTO report_events(node_id,event_id,report_id,collected_at,received_at,event_id_json,event_at,kind,details_json,body_sha256,payload_json)
-			 VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
-			rec.NodeID, rec.EventID, rec.ReportID, rec.CollectedAt, rec.ReceivedAt, e.EventID, e.At, e.Kind, e.DetailsJSON, rec.BodySHA256, rec.Payload); err != nil {
-			return "", fmt.Errorf("store: insert event report: %w", err)
+			`INSERT INTO report_events(node_id,event_id,report_id,collected_at,received_at,event_id_json,event_at,kind,severity,details_json)
+			 VALUES(?,?,?,?,?,?,?,?,?,?)`,
+			rec.NodeID, rec.EventID, rec.ReportID, rec.CollectedAt, rec.ReceivedAt, e.EventID, e.At, e.Kind, severity, e.DetailsJSON); err != nil {
+			return "", fmt.Errorf("store: insert event row: %w", err)
 		}
 	}
 	return DispositionAccepted, nil
@@ -1119,6 +1260,7 @@ type EventRecord struct {
 	EventID     string
 	At          int64
 	Kind        string
+	Severity    string
 	DetailsJSON string
 }
 
@@ -1126,109 +1268,7 @@ type EventRecord struct {
 // nonce/report windows, 30-day active data + 30-day archive, and a recorded run.
 // node_boot is never deleted by retention.
 func (s *Store) RunRetentionB2(ctx context.Context, now int64) (map[string]int64, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, fmt.Errorf("store: begin retention: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-	deleted := map[string]int64{}
-	exec := func(name, stmt string, args ...any) error {
-		res, err := tx.ExecContext(ctx, stmt, args...)
-		if err != nil {
-			return fmt.Errorf("store: retention %s: %w", name, err)
-		}
-		n, _ := res.RowsAffected()
-		deleted[name] += n
-		return nil
-	}
-	// seq_dedupe: keep the latest 256 seq rows for each current (node,gen,boot).
-	if err := exec("seq_dedupe", `
-		DELETE FROM seq_dedupe WHERE rowid IN (
-			SELECT d.rowid FROM seq_dedupe d
-			JOIN node_boot b ON b.node_id=d.node_id AND b.highest_gen=d.boot_gen AND b.boot_id=d.boot_id
-			WHERE (SELECT COUNT(*) FROM seq_dedupe d2
-			       WHERE d2.node_id=d.node_id AND d2.boot_gen=d.boot_gen AND d2.boot_id=d.boot_id AND d2.seq>=d.seq) > 256
-		)`); err != nil {
-		return nil, err
-	}
-	// boot_registry: keep the latest 8 generations per node.
-	if err := exec("boot_registry", `
-		DELETE FROM boot_registry WHERE rowid IN (
-			SELECT r.rowid FROM boot_registry r
-			WHERE (SELECT COUNT(*) FROM boot_registry r2
-			       WHERE r2.node_id=r.node_id AND r2.boot_gen>=r.boot_gen) > 8
-		)`); err != nil {
-		return nil, err
-	}
-	if err := exec("nonce_dedupe", `DELETE FROM nonce_dedupe WHERE received_at < ?`, now-24*60*60); err != nil {
-		return nil, err
-	}
-	if err := exec("report_dedupe", `DELETE FROM report_dedupe WHERE COALESCE(last_received_at,first_received_at,0) < ?`, now-8*24*60*60); err != nil {
-		return nil, err
-	}
-	if err := exec("report_activity", `DELETE FROM report_activity WHERE received_at < ?`, now-30*24*60*60); err != nil {
-		return nil, err
-	}
-	// Move active snapshots/metrics/events older than 30 days into the archive.
-	archiveCutoff := now - 30*24*60*60
-	// Clear latest pointers to snapshots that are about to leave the active
-	// window before deleting those snapshots (node_latest has an FK to snapshots).
-	if err := exec("node_latest", `DELETE FROM node_latest WHERE collected_at < ?`, archiveCutoff); err != nil {
-		return nil, err
-	}
-	for _, spec := range []struct {
-		typ    string
-		table  string
-		query  string
-		insert string
-	}{
-		{"snapshot", "snapshots", `SELECT node_id,event_id,report_id,collected_at,payload_json FROM snapshots WHERE collected_at < ?`,
-			`INSERT OR IGNORE INTO archive_records(record_type,node_id,event_id,report_id,collected_at,archived_at,payload_json) VALUES('snapshot',?,?,?,?,?,?)`},
-		{"metrics", "report_metrics", `SELECT node_id,event_id,report_id,collected_at,payload_json FROM report_metrics WHERE collected_at < ?`,
-			`INSERT OR IGNORE INTO archive_records(record_type,node_id,event_id,report_id,collected_at,archived_at,payload_json) VALUES('metrics',?,?,?,?,?,?)`},
-		{"events", "report_events", `SELECT node_id,event_id,report_id,collected_at,payload_json FROM report_events WHERE collected_at < ? LIMIT 1`,
-			`INSERT OR IGNORE INTO archive_records(record_type,node_id,event_id,report_id,collected_at,archived_at,payload_json) VALUES('events',?,?,?,?,?,?)`},
-	} {
-		rows, err := tx.QueryContext(ctx, spec.query, archiveCutoff)
-		if err != nil {
-			return nil, err
-		}
-		type row struct {
-			node, event, report string
-			collected           int64
-			payload             []byte
-		}
-		var pending []row
-		for rows.Next() {
-			var r row
-			if err := rows.Scan(&r.node, &r.event, &r.report, &r.collected, &r.payload); err != nil {
-				rows.Close()
-				return nil, err
-			}
-			pending = append(pending, r)
-		}
-		rows.Close()
-		for _, r := range pending {
-			if _, err := tx.ExecContext(ctx, spec.insert, r.node, r.event, r.report, r.collected, now, r.payload); err != nil {
-				return nil, err
-			}
-		}
-		if err := exec(spec.table, `DELETE FROM `+spec.table+` WHERE collected_at < ?`, archiveCutoff); err != nil {
-			return nil, err
-		}
-	}
-	// Archive retained for a further 30 days.
-	if err := exec("archive_records", `DELETE FROM archive_records WHERE archived_at < ?`, now-60*24*60*60); err != nil {
-		return nil, err
-	}
-	resultJSON, _ := json.Marshal(deleted)
-	if _, err := tx.ExecContext(ctx, `INSERT INTO retention_runs(ran_at,result_json) VALUES(?,?)`, now, string(resultJSON)); err != nil {
-		return nil, err
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("store: commit retention: %w", err)
-	}
-	return deleted, nil
+	return s.RunRetentionB2PolicyB(ctx, now)
 }
 
 // CapacityStats reports bounded row counts/size used by B2 capacity tests.
@@ -1246,7 +1286,7 @@ func (s *Store) CapacityStats(ctx context.Context) (CapacityStats, error) {
 		{&c.Snapshots, `SELECT COUNT(*) FROM snapshots`},
 		{&c.Metrics, `SELECT COUNT(*) FROM report_metrics`},
 		{&c.Events, `SELECT COUNT(*) FROM report_events`},
-		{&c.Archive, `SELECT COUNT(*) FROM archive_records`},
+		{&c.Archive, `SELECT COUNT(*) FROM event_catalog WHERE state='archived' AND data_purged_at IS NULL`},
 		{&c.SeqDedupe, `SELECT COUNT(*) FROM seq_dedupe`},
 		{&c.BootRegistry, `SELECT COUNT(*) FROM boot_registry`},
 		{&c.ReportDedupe, `SELECT COUNT(*) FROM report_dedupe`},

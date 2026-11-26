@@ -205,6 +205,29 @@ func doPost(t *testing.T, tc *testCenter, path string, headers http.Header, body
 	return resp.StatusCode, doc
 }
 
+func doPostRaw(t *testing.T, tc *testCenter, path string, headers http.Header, body []byte) (int, []byte) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, tc.url+path, bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	for k, values := range headers {
+		for _, v := range values {
+			req.Header.Add(k, v)
+		}
+	}
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	if err != nil {
+		t.Fatalf("POST %s: %v", path, err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	return resp.StatusCode, raw
+}
+
 func enrollAgent(t *testing.T, tc *testCenter, class, host string) *syntheticAgent {
 	t.Helper()
 	return enrollAgentA(t, tc, class, host, eventUUID)

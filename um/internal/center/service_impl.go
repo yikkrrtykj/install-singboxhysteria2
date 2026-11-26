@@ -96,6 +96,16 @@ func mapServiceError(err error) error {
 		return apiErr(409, "rotation_in_progress", false)
 	case errors.Is(err, store.ErrRotationExpired):
 		return apiErr(409, "rotation_expired", false)
+	case errors.Is(err, store.ErrRotationState):
+		return apiErr(409, "nonce_reuse", false)
+	case errors.Is(err, store.ErrEventArchived), errors.Is(err, store.ErrEventPurged), errors.Is(err, store.ErrEventUnknown):
+		return apiErr(409, "identity_mismatch", false)
+	case errors.Is(err, store.ErrQuotaExceeded), errors.Is(err, store.ErrArchiveQuota):
+		// The frozen v1 error vocabulary has no quota_exceeded token; B2 maps this
+		// capacity failure onto storage_unavailable and documents the clarification
+		// proposal in um/docs/um-b2-contract-clarifications.md. No new wire code is
+		// invented.
+		return apiErr(503, "storage_unavailable", true)
 	case errors.Is(err, store.ErrNotFound):
 		return apiErr(404, "endpoint_not_found", false)
 	case contract.IsPlatformMismatch(err):
@@ -161,6 +171,13 @@ func (s *ServiceImpl) authzKeyTx(ctx context.Context, tx *store.Tx, nodeID, keyI
 	if node.State != store.NodeActive {
 		return apiErr(401, "revoked_key", false)
 	}
+	event, err := tx.EventStateTx(ctx, node.EventID)
+	if err != nil {
+		return mapServiceError(err)
+	}
+	if event.State != store.EventActive {
+		return apiErr(409, "identity_mismatch", false)
+	}
 	key, err := tx.KeyTx(ctx, nodeID, keyID)
 	if err != nil {
 		return mapServiceError(err)
@@ -203,6 +220,9 @@ func (s *ServiceImpl) Enroll(ctx context.Context, req EnrollRequest) (EnrollResu
 	}
 	if err := req.Fields.Validate(); err != nil {
 		return EnrollResult{}, apiErr(400, "invalid_header", false)
+	}
+	if _, err := s.checkFreshness(now, req.Fields.SentAt); err != nil {
+		return EnrollResult{}, err
 	}
 	var body struct {
 		NodeClass string `json:"node_class"`
@@ -282,10 +302,7 @@ func (s *ServiceImpl) Report(ctx context.Context, req ReportRequest) (ReportResu
 	if env.Type != req.ReportType || env.ReportID != req.ReportID || env.CollectedAt != req.CollectedAt {
 		return ReportResult{}, apiErr(400, "invalid_request", false)
 	}
-	if env.CollectedAt > sentAt+60 {
-		return ReportResult{}, apiErr(400, "invalid_request", false)
-	}
-	if env.CollectedAt < now-maxPayloadAgeSeconds {
+	if env.CollectedAt > sentAt+60 || env.CollectedAt < now-maxPayloadAgeSeconds {
 		return ReportResult{}, apiErr(400, "invalid_request", false)
 	}
 	node, key, err := s.loadNodeAndKey(ctx, req.Fields.NodeID, req.Fields.KeyID)
@@ -294,19 +311,6 @@ func (s *ServiceImpl) Report(ctx context.Context, req ReportRequest) (ReportResu
 	}
 	if err := s.verifySignature(req.Fields, req.Body, req.Signature, key.PublicKey); err != nil {
 		return ReportResult{}, err
-	}
-	cfg, err := s.nodeConfig(ctx, node.NodeID)
-	if err != nil {
-		return ReportResult{}, err
-	}
-	opts := contract.ValidateOptions{TerminalConfigured: cfg.Sources["terminal"] || cfg.Sources["mihomo_api"]}
-	if err := contract.ValidateReportBodyWithSchemaSet(s.schemas, node.NodeClass, req.ReportType, req.Body, opts); err != nil {
-		return ReportResult{}, mapServiceError(err)
-	}
-	if req.ReportType == "snapshot" {
-		if err := enforceExpectedInboundTags(node.NodeClass, req.Body, cfg.ExpectedInboundTags); err != nil {
-			return ReportResult{}, err
-		}
 	}
 	if req.Fingerprint == "" {
 		fp, ferr := wire.Fingerprint(req.Fields, req.Body)
@@ -317,20 +321,56 @@ func (s *ServiceImpl) Report(ctx context.Context, req ReportRequest) (ReportResu
 	}
 	bodyHash := bodySHA(req.Body)
 	var disposition store.ReportDisposition
+	var cfg store.NodeConfig
+	validationRejected := false
 	attempt := protocol.Attempt{
 		Gen: req.FieldsBootGen(), BootID: req.Fields.BootID, Seq: req.FieldsSeq(),
 		Fingerprint: req.Fingerprint,
 	}
 	result, _, err := s.store.ApplyIngest(ctx, node.NodeID, attempt, req.Fingerprint,
-		func(tx *store.Tx) error { return s.authzKeyTx(ctx, tx, node.NodeID, req.Fields.KeyID, now) },
-		func(tx *store.Tx) (store.ReportDisposition, error) {
+		func(tx *store.Tx) error {
+			if err := s.authzKeyTx(ctx, tx, node.NodeID, req.Fields.KeyID, now); err != nil {
+				return err
+			}
+			// The configuration used for payload/source validation must be the one
+			// read in this same transaction, not an earlier snapshot.
+			c, err := tx.ConfigTx(ctx, node.NodeID)
+			if err != nil {
+				return mapServiceError(err)
+			}
+			if err := validateClassConfigForClass(node.NodeClass, c); err != nil {
+				return err
+			}
+			opts := contract.ValidateOptions{TerminalConfigured: c.Sources["terminal"] || c.Sources["mihomo_api"]}
+			if err := contract.ValidateReportBodyWithSchemaSet(s.schemas, node.NodeClass, req.ReportType, req.Body, opts); err != nil {
+				validationRejected = true
+				return mapServiceError(err)
+			}
+			if err := validateReportSources(node.NodeClass, req.ReportType, req.Body, c.Sources, c.UpdatedAt, env.CollectedAt); err != nil {
+				validationRejected = true
+				return err
+			}
+			if req.ReportType == "snapshot" {
+				if err := enforceExpectedInboundTags(node.NodeClass, req.Body, c.ExpectedInboundTags); err != nil {
+					validationRejected = true
+					return err
+				}
+			}
+			if err := validateMetricEventTagBindings(node.NodeClass, req.ReportType, req.Body, c.ExpectedInboundTags); err != nil {
+				validationRejected = true
+				return err
+			}
 			nonceStatus, err := tx.CheckOrInsertNonce(ctx, node.NodeID, req.Fields.Nonce, req.Fingerprint, now)
 			if err != nil {
-				return "", mapServiceError(err)
+				return mapServiceError(err)
 			}
 			if nonceStatus == store.NonceReuse {
-				return "", apiErr(409, "nonce_reuse", false)
+				return apiErr(409, "nonce_reuse", false)
 			}
+			cfg = c
+			return nil
+		},
+		func(tx *store.Tx) (store.ReportDisposition, error) {
 			reportStatus, err := tx.CheckOrInsertReport(ctx, node.NodeID, env.ReportID, bodyHash, now)
 			if err != nil {
 				return "", mapServiceError(err)
@@ -365,10 +405,11 @@ func (s *ServiceImpl) Report(ctx context.Context, req ReportRequest) (ReportResu
 			case "events":
 				var eventsEnv struct {
 					Events []struct {
-						EventID string          `json:"event_id"`
-						At      int64           `json:"at"`
-						Kind    string          `json:"kind"`
-						Detail  json.RawMessage `json:"detail"`
+						EventID  string          `json:"event_id"`
+						At       int64           `json:"at"`
+						Kind     string          `json:"kind"`
+						Severity string          `json:"severity"`
+						Detail   json.RawMessage `json:"detail"`
 					} `json:"events"`
 				}
 				if err := json.Unmarshal(req.Body, &eventsEnv); err != nil {
@@ -376,7 +417,7 @@ func (s *ServiceImpl) Report(ctx context.Context, req ReportRequest) (ReportResu
 				}
 				records := make([]store.EventRecord, 0, len(eventsEnv.Events))
 				for _, e := range eventsEnv.Events {
-					records = append(records, store.EventRecord{EventID: e.EventID, At: e.At, Kind: e.Kind, DetailsJSON: string(e.Detail)})
+					records = append(records, store.EventRecord{EventID: e.EventID, At: e.At, Kind: e.Kind, Severity: e.Severity, DetailsJSON: string(e.Detail)})
 				}
 				d, err := tx.StoreEventsTx(ctx, store.ReportRecord{
 					NodeID: node.NodeID, EventID: node.EventID, ReportID: env.ReportID,
@@ -392,9 +433,13 @@ func (s *ServiceImpl) Report(ctx context.Context, req ReportRequest) (ReportResu
 			return disposition, nil
 		})
 	if err != nil {
+		if validationRejected {
+			// The rejection rolled back the ingest transaction; record the audit in
+			// its own transaction so it survives, without payload/secret content.
+			_, _ = s.store.AppendLedger(ctx, now, "report_rejected", node.NodeID, bodyHash)
+		}
 		return ReportResult{}, mapServiceError(err)
 	}
-	_ = result
 	ackResult := "accepted"
 	switch disposition {
 	case store.DispositionDuplicate:
@@ -403,11 +448,9 @@ func (s *ServiceImpl) Report(ctx context.Context, req ReportRequest) (ReportResu
 		ackResult = "stale_ignored"
 	}
 	var nextSeq *uint64
-	if boot, berr := s.store.GetBoot(ctx, node.NodeID); berr == nil {
-		if boot.LastSeq < wire.MaxNumeric {
-			v := boot.LastSeq + 1
-			nextSeq = &v
-		}
+	if result.NextSeq != nil {
+		v := *result.NextSeq
+		nextSeq = &v
 	}
 	return ReportResult{
 		ReportID: env.ReportID, Result: ackResult, NextSeq: nextSeq,
@@ -456,6 +499,12 @@ func (s *ServiceImpl) Rotate(ctx context.Context, req RotateRequest) (RotateResu
 	}
 	bodyHash := bodySHA(req.Body)
 	rotateFP := rotateFingerprint(node.NodeID, req.Fields.Nonce, req.Fields.KeyID, bodyHash)
+	// Expired awaiting_proof intents are aborted immediately (only the
+	// provisional key is revoked; the old key remains active). They must not block
+	// a new legal rotation until the hourly maintenance job.
+	if _, err := s.store.AbortExpiredRotations(ctx, now); err != nil {
+		return RotateResult{}, apiErr(503, "storage_unavailable", true)
+	}
 	if req.Fingerprint == "" {
 		req.Fingerprint = rotateFP
 	}
@@ -464,16 +513,21 @@ func (s *ServiceImpl) Rotate(ctx context.Context, req RotateRequest) (RotateResu
 	var previousKeyID, newKeyID string
 	_, _, err = s.store.ApplyIngest(ctx, node.NodeID, attempt, req.FieldsFingerprint(),
 		func(tx *store.Tx) error {
-			return s.authzKeyTx(ctx, tx, node.NodeID, req.Fields.KeyID, now)
-		},
-		func(tx *store.Tx) (store.ReportDisposition, error) {
+			if err := s.authzKeyTx(ctx, tx, node.NodeID, req.Fields.KeyID, now); err != nil {
+				return err
+			}
+			// Rotation nonce/intent replay is still behind full auth; nonce reuse
+			// is checked before boot/seq conflict classification.
 			nonceStatus, err := tx.CheckOrInsertNonce(ctx, node.NodeID, req.Fields.Nonce, rotateFP, now)
 			if err != nil {
-				return "", mapServiceError(err)
+				return mapServiceError(err)
 			}
 			if nonceStatus == store.NonceReuse {
-				return "", apiErr(409, "nonce_reuse", false)
+				return apiErr(409, "nonce_reuse", false)
 			}
+			return nil
+		},
+		func(tx *store.Tx) (store.ReportDisposition, error) {
 			if existing, ok, err := tx.RotationTx(ctx, node.NodeID, req.Fields.Nonce); err != nil {
 				return "", mapServiceError(err)
 			} else if ok {
@@ -493,6 +547,9 @@ func (s *ServiceImpl) Rotate(ctx context.Context, req RotateRequest) (RotateResu
 					return "", apiErr(401, "unauthorized", false)
 				}
 				responseBody = []byte(existing.ResponseJSON)
+				if err := s.schemas.Validate("rotate-response.schema.json", responseBody); err != nil {
+					return "", apiErr(503, "storage_unavailable", true)
+				}
 				previousKeyID, newKeyID = existing.OldKeyID, existing.NewKeyID
 				return store.DispositionDuplicate, nil
 			}
@@ -513,6 +570,9 @@ func (s *ServiceImpl) Rotate(ctx context.Context, req RotateRequest) (RotateResu
 				return "", apiErr(503, "storage_unavailable", true)
 			}
 			responseBody = []byte(created.ResponseJSON)
+			if err := s.schemas.Validate("rotate-response.schema.json", responseBody); err != nil {
+				return "", apiErr(503, "storage_unavailable", true)
+			}
 			previousKeyID, newKeyID = created.OldKeyID, created.NewKeyID
 			return store.DispositionAccepted, nil
 		})
@@ -559,46 +619,52 @@ func (s *ServiceImpl) Config(ctx context.Context, req ConfigRequest) (ConfigResu
 			return ConfigResult{}, apiErr(400, "invalid_header", false)
 		}
 	}
-	var cfg store.NodeConfig
+	var responseBody []byte
+	var configVersion int
 	attempt := protocol.Attempt{Gen: req.FieldsBootGen(), BootID: req.Fields.BootID, Seq: req.FieldsSeq(), Fingerprint: fp}
 	_, _, err = s.store.ApplyIngest(ctx, node.NodeID, attempt, fp,
-		func(tx *store.Tx) error { return s.authzKeyTx(ctx, tx, node.NodeID, req.Fields.KeyID, now) },
-		func(tx *store.Tx) (store.ReportDisposition, error) {
+		func(tx *store.Tx) error {
+			if err := s.authzKeyTx(ctx, tx, node.NodeID, req.Fields.KeyID, now); err != nil {
+				return err
+			}
+			// Nonce ordering is before transport/high-water evaluation.
 			status, err := tx.CheckOrInsertNonce(ctx, node.NodeID, req.Fields.Nonce, fp, now)
 			if err != nil {
-				return "", mapServiceError(err)
+				return mapServiceError(err)
 			}
 			if status == store.NonceReuse {
-				return "", apiErr(409, "nonce_reuse", false)
+				return apiErr(409, "nonce_reuse", false)
 			}
-			c, err := tx.ConfigTx(ctx, node.NodeID)
+			cfg, err := tx.ConfigTx(ctx, node.NodeID)
 			if err != nil {
-				return "", mapServiceError(err)
+				return mapServiceError(err)
 			}
-			cfg = c
-			return store.DispositionAccepted, nil
-		})
+			if err := validateClassConfigForClass(node.NodeClass, cfg); err != nil {
+				return err
+			}
+			doc := map[string]any{
+				"v": 1, "node_id": node.NodeID, "event_id": node.EventID, "node_class": node.NodeClass,
+				"config_version": cfg.ConfigVersion, "cadence_seconds": cfg.CadenceSeconds,
+				"collect": cfg.Sources, "device_salt": cfg.DeviceSalt, "server_time": now,
+				"expected_inbound_tags": cfg.ExpectedInboundTags,
+			}
+			body, err := json.Marshal(doc)
+			if err != nil {
+				return apiErr(503, "storage_unavailable", true)
+			}
+			if err := s.schemas.Validate("agent-config.schema.json", body); err != nil {
+				// Validate the complete response BEFORE the high-water commit.
+				return apiErr(503, "storage_unavailable", true)
+			}
+			responseBody = body
+			configVersion = cfg.ConfigVersion
+			return nil
+		},
+		func(tx *store.Tx) (store.ReportDisposition, error) { return store.DispositionAccepted, nil })
 	if err != nil {
 		return ConfigResult{}, mapServiceError(err)
 	}
-	if err := validateClassConfigForClass(node.NodeClass, cfg); err != nil {
-		return ConfigResult{}, err
-	}
-	doc := map[string]any{
-		"v": 1, "node_id": node.NodeID, "event_id": node.EventID, "node_class": node.NodeClass,
-		"config_version": cfg.ConfigVersion, "cadence_seconds": cfg.CadenceSeconds,
-		"collect": cfg.Sources, "device_salt": cfg.DeviceSalt, "server_time": now,
-		"expected_inbound_tags": cfg.ExpectedInboundTags,
-	}
-	body, err := json.Marshal(doc)
-	if err != nil {
-		return ConfigResult{}, apiErr(503, "storage_unavailable", true)
-	}
-	if err := s.schemas.Validate("agent-config.schema.json", body); err != nil {
-		// A config-generation bug must fail closed, not emit an invalid config.
-		return ConfigResult{}, apiErr(503, "storage_unavailable", true)
-	}
-	return ConfigResult{Body: body, ConfigVersion: cfg.ConfigVersion, ServerTime: now}, nil
+	return ConfigResult{Body: responseBody, ConfigVersion: configVersion, ServerTime: now}, nil
 }
 
 // enforceExpectedInboundTags binds a Linux snapshot's protocol/traffic inbound
@@ -639,22 +705,154 @@ func enforceExpectedInboundTags(nodeClass string, body []byte, expected []store.
 }
 
 func validateClassConfigForClass(nodeClass string, cfg store.NodeConfig) error {
-	if cfg.Sources == nil {
+	if cfg.Sources == nil || len(cfg.Sources) != 6 {
 		return apiErr(503, "storage_unavailable", true)
 	}
-	if nodeClass == store.NodeClassLinuxVPS {
-		if cfg.Sources["terminal"] || len(cfg.ExpectedInboundTags) == 0 {
+	if cfg.CadenceSeconds < 30 || cfg.CadenceSeconds > 300 || cfg.ConfigVersion < 1 {
+		return apiErr(503, "storage_unavailable", true)
+	}
+	switch nodeClass {
+	case store.NodeClassLinuxVPS:
+		if cfg.Sources["terminal"] || cfg.Sources["mihomo_api"] || len(cfg.ExpectedInboundTags) == 0 {
 			return apiErr(503, "storage_unavailable", true)
 		}
-		return nil
-	}
-	if nodeClass == store.NodeClassWindowsTerminal {
+	case store.NodeClassWindowsTerminal:
 		if cfg.Sources["services"] || cfg.Sources["singbox_api"] || len(cfg.ExpectedInboundTags) != 0 {
 			return apiErr(503, "storage_unavailable", true)
 		}
+	default:
+		return apiErr(503, "storage_unavailable", true)
+	}
+	return nil
+}
+
+// validateReportSources enforces the center-managed source switches while keeping
+// legal old spool data (collected at/before the config update) and honest
+// unavailable/null/empty states acceptable after a switch is disabled.
+func validateReportSources(nodeClass, reportType string, body []byte, sources map[string]bool, configUpdatedAt, collectedAt int64) error {
+	if collectedAt <= configUpdatedAt {
+		return nil // historical spool created before the current config
+	}
+	var availability map[string]string
+	switch reportType {
+	case "snapshot":
+		var doc struct {
+			Availability map[string]string          `json:"availability"`
+			System       map[string]json.RawMessage `json:"system"`
+			Services     []json.RawMessage          `json:"services"`
+			Protocols    []json.RawMessage          `json:"protocols"`
+			Traffic      []json.RawMessage          `json:"traffic"`
+			Clients      json.RawMessage            `json:"clients"`
+		}
+		if err := json.Unmarshal(body, &doc); err != nil {
+			return apiErr(400, "invalid_request", false)
+		}
+		availability = doc.Availability
+		check := func(source, key string) error {
+			if sources[source] {
+				return nil
+			}
+			if availability[key] != "unavailable" {
+				return apiErr(400, "invalid_request", false)
+			}
+			return nil
+		}
+		if err := check("system", "system"); err != nil {
+			return err
+		}
+		if err := check("services", "services"); err != nil {
+			return err
+		}
+		if err := check("singbox_api", "protocols"); err != nil {
+			return err
+		}
+		if err := check("singbox_api", "traffic"); err != nil {
+			return err
+		}
+		if err := check("singbox_api", "clients"); err != nil {
+			return err
+		}
+	case "metrics":
+		var doc struct {
+			Availability map[string]string `json:"availability"`
+		}
+		if err := json.Unmarshal(body, &doc); err != nil {
+			return apiErr(400, "invalid_request", false)
+		}
+		// Metrics do not carry per-source tags; historical samples are accepted when
+		// collected before the config update. For current samples, disabling a source
+		// requires the documented unavailable state rather than fabricated data.
+		for source, key := range map[string]string{"system": "system", "services": "services", "singbox_api": "protocols"} {
+			if !sources[source] && doc.Availability[key] != "unavailable" {
+				return apiErr(400, "invalid_request", false)
+			}
+		}
+	case "events":
+		// Generic agent/diagnostic events remain legal when event collection is
+		// disabled; service/protocol/terminal-specific events need their source.
+		var doc struct {
+			Events []struct {
+				Kind string `json:"kind"`
+			} `json:"events"`
+		}
+		if err := json.Unmarshal(body, &doc); err != nil {
+			return apiErr(400, "invalid_request", false)
+		}
+		for _, e := range doc.Events {
+			switch e.Kind {
+			case "service_restart", "service_failure", "protocol_outage", "protocol_recovery":
+				if !sources["services"] && !sources["singbox_api"] {
+					return apiErr(400, "invalid_request", false)
+				}
+			case "terminal_route_changed", "terminal_source_unavailable":
+				if !sources["terminal"] && !sources["mihomo_api"] {
+					return apiErr(400, "invalid_request", false)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// validateMetricEventTagBindings enforces center expected_inbound_tags on event
+// detail objects that carry an inbound_tag (metrics have no inbound fields).
+func validateMetricEventTagBindings(nodeClass, reportType string, body []byte, tags []store.InboundTag) error {
+	if reportType != "events" || nodeClass != store.NodeClassLinuxVPS {
 		return nil
 	}
-	return apiErr(503, "storage_unavailable", true)
+	allowed := make(map[string]string, len(tags))
+	for _, t := range tags {
+		allowed[t.InboundTag] = t.Kind
+	}
+	var doc struct {
+		Events []struct {
+			Detail map[string]json.RawMessage `json:"detail"`
+		} `json:"events"`
+	}
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return apiErr(400, "invalid_request", false)
+	}
+	for _, e := range doc.Events {
+		rawTag, ok := e.Detail["inbound_tag"]
+		if !ok {
+			continue
+		}
+		var tag string
+		if err := json.Unmarshal(rawTag, &tag); err != nil {
+			return apiErr(400, "invalid_request", false)
+		}
+		kind, ok := allowed[tag]
+		if !ok {
+			return apiErr(400, "invalid_request", false)
+		}
+		if rawKind, ok := e.Detail["kind"]; ok {
+			var k string
+			if err := json.Unmarshal(rawKind, &k); err != nil || k != kind {
+				return apiErr(400, "invalid_request", false)
+			}
+		}
+	}
+	return nil
 }
 
 // rotateFingerprint binds a rotation intent to (node, nonce, old key, body hash)

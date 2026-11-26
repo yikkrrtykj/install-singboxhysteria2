@@ -87,25 +87,51 @@ REC-29 deferred in the B1 map, 18 B2/B3 deferred) remains green in the same
 - `TestB2SustainedSyntheticAgent`: 10 sequential reports, high-water and
   snapshots advance.
 - `internal/store/b2_test.go`: enrollment single-use/scope/expiry/concurrency,
-  rotation lifecycle/abort/admin revoke, authenticated ingest transaction
-  rollback, snapshot latest ordering, retention physical pruning (seq 256,
-  boot 8), 30-day archive, node_boot preserved, repeatable retention, capacity
-  stats, and security-ledger entries for token/config/rotation state changes.
+  rotation lifecycle/abort/admin revoke/state integrity, authenticated ingest
+  transaction rollback, snapshot latest ordering, policy-B event lifecycle with
+  exact T+30d boundaries and multi-event archive times, bounded seq/boot pruning,
+  node_boot preservation, fault injection without source-data loss, degraded
+  retention state, quotas, event normalization (one report payload + normalized
+  event rows with severity), capacity/WAL statistics and security-ledger entries.
 
-## Retention / capacity
+## Retention / capacity — policy B (review correction)
 
-Implemented in `RunRetentionB2`:
+`RunRetentionB2` now implements the frozen policy B with an event lifecycle
+instead of a per-table archive copy:
 
-- seq_dedupe: physically keep latest 256 entries of the current generation;
-- boot_registry: keep latest 8 generations;
-- nonce 24 h, report_dedupe 8 days, report_activity 30 days;
-- active snapshots/metrics/events archived after 30 days, archive retained a
-  further 30 days, latest pointers never point at deleted snapshots;
-- **node_boot is never deleted**;
-- each run recorded in `retention_runs`; the sweep is repeatable.
+- **Active event**: rolling 30 days by `collected_at`; older rows are deleted;
+- **Archive at T**: `event_catalog` becomes archived, ingest is closed, and the
+  remaining data stays in its own tables until T+30d (no second copy, no
+  LIMIT-1 data-loss path);
+- **T+30d**: all event telemetry is deleted; the catalog row survives until an
+  explicit purge (B4 UI), which writes a content-free 180-day tombstone;
+- **node retire** never shortens event history; latest state is removed 30 days
+  after its last update or 30 days after node retire;
+- seq_dedupe: current generation latest 256 rows, **old-generation rows are
+  deleted** (retired generations are rejected by the persistent generation
+  high-water, not by registry presence); boot_registry keeps the last 8
+  generations; node_boot is never deleted;
+- nonce 24h, report_dedupe 8d, report_activity 30d;
+- deletion is bounded to **50,000 rows per transaction**, resumable/idempotent;
+  `retention_runs` itself is bounded to the latest 100 runs; soft failures set
+  `retention_state.degraded`/`failure_count` without deleting unprocessed data;
+- latest pointers are removed before their snapshots to preserve FK integrity.
 
-This is a bounded smoke/capacity test, **not** a 200-node performance SLA and
-not real-event acceptance. Full capacity/performance gating remains UM-E.
+Tests: `TestB2RetentionPhysicalPruning`,
+`TestB2PolicyBEventLifecycle`,
+`TestB2PolicyBMultipleArchiveTimesAndExactBoundary`,
+`TestB2ArchiveMultipleReportsNoLoss`,
+`TestB2ArchiveAndRetentionFaultLeavesDataIntact`,
+`TestB2RetentionFailureDegradedAndIdempotent`,
+`TestB2QuotaRefusesNewEnrollment`, `TestB2QuotaPerEventAndCatalog`,
+`TestB2ArchivedEventQuota`, `TestB2EventStorageNormalizationAndCrossTypeConflict`.
+
+Capacity gates (frozen planning defaults): 150 active nodes total, 100 active
+nodes per event, 10 archived events with retained data, 50 event-catalog rows.
+New token/enrollment/archive operations check these under the SQLite capacity
+lock; quota failures are typed and do not write partial state. The DB/WAL/row
+growth snapshot is exposed by `CapacityStatsExtended`; this is a bounded smoke,
+not a 200-node performance SLA or real-event acceptance (UM-E).
 
 ## Deferred / not claimed as PASS
 
@@ -119,3 +145,25 @@ not real-event acceptance. Full capacity/performance gating remains UM-E.
   UM-E; `VerifyChain` is not recovery authorization.
 - The B2 smoke load is synthetic; it is not a production performance/security
   acceptance.
+
+
+## B2 review correction matrix (P0/P1)
+
+| Finding | Fix/evidence |
+| --- | --- |
+| P0-01 events archive LIMIT-1 data loss | no archive copy; live event rows governed by catalog lifecycle; multi-report/metrics/events + multi-event archive tests; fault injection before writes/scan/delete leaves source intact |
+| P1-02 real policy B | `event_catalog`, archive at T, T+30d tail deletion, catalog survives until purge, tombstone; two events with different archive times, exact boundary, restart/idempotent runs, ingest/enrollment rejected after archive, node retire keeps history |
+| P1-03 physical capacity | old-generation seq rows deleted; current 256; boot 8; 50k per-transaction batches; degraded/failure counters; retention_runs bounded; 150/100/10/50 quotas under capacity lock; DB/WAL/row growth stats |
+| P1-04 key/rotation integrity | ConfirmRotationTx invalid states are typed errors; revoking either side revokes provisional counterpart and aborts intent; node vs key revoke separated; provisional key proof only via in-transaction auth; tests |
+| P1-05 ACK/transaction | Report uses the committed transaction's `result.NextSeq` (no post-commit GetBoot); exhaustion only when protocol says null; success/config/rotate response construction validated before commit where applicable; real transaction fault test confirms nonce/report/boot/seq/telemetry rollback |
+| P1-06 config/telemetry auth | config class/source/tag/cadence validation before persistence; report reads config inside transaction; current disabled-source data rejected, historical spool accepted; snapshot/metric/event tag bindings; no new report fields |
+| P1-07 enrollment freshness | enroll now enforces ±300s; stale/future/boundary/bad-signature tests; token not consumed on pre-commit failures; concurrent token single-use |
+| P1-08 rotation/audit | expired awaiting intents aborted before new rotation; same-nonce retry rotation_expired; nonce check before boot/seq conflict; boot_generation_gap ledger; privacy rejection audit; no secret/payload logging |
+| P1-11 telemetry/resource | events report payload stored once + normalized event rows with severity; report-id cross-type conflict; capacity/WAL growth stats; global in-flight concurrency bound; machine/admin listener isolation |
+
+## Deferred confirmation
+
+B3 REC-17/18/27; complete management API/UI and type-to-confirm purge (B4);
+Cloudflare/UM-C public ingress; signed checkpoints, offsite backup, restore
+drills and 200/500-node capacity/performance acceptance (UM-E). UM-F DEFERRED,
+production HOLD.

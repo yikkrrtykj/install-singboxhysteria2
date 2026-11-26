@@ -35,7 +35,7 @@ import (
 // SchemaVersion is the highest migration version this build knows. Open always
 // migrates a database to exactly this version; a database with a newer version
 // is rejected fail-closed instead of being silently used by older code.
-const SchemaVersion = 3
+const SchemaVersion = 5
 
 // Node classes accepted by the rev-5 platform isolation contract.
 const (
@@ -51,6 +51,11 @@ const (
 type Store struct {
 	db   *sql.DB
 	path string
+	// retentionHook is a test-only fault injection point for bounded retention.
+	retentionHook func(string) error
+	// ingestHook is a test-only fault injection point inside the authenticated
+	// ingest transaction (after high-water/dedupe writes, before commit).
+	ingestHook func(string) error
 }
 
 // Path returns the filesystem path of the database.
@@ -395,6 +400,86 @@ var migrations = []migration{
 			ran_at      INTEGER NOT NULL,
 			result_json TEXT NOT NULL
 		) STRICT`,
+	}},
+	{version: 4, statements: []string{
+		// Policy-B event lifecycle. The archived event's own telemetry rows stay
+		// in their normal tables for the archive tail; there is no second copy and
+		// no per-table LIMIT-1 archive bug. A catalog row survives data deletion
+		// until an explicit purge tombstone is written.
+		`ALTER TABLE nodes ADD COLUMN retired_at INTEGER`,
+		`CREATE TABLE IF NOT EXISTS event_catalog (
+			event_id       TEXT PRIMARY KEY,
+			state          TEXT NOT NULL CHECK (state IN ('active','archived')),
+			created_at     INTEGER NOT NULL CHECK (typeof(created_at) = 'integer'),
+			archived_at    INTEGER CHECK (archived_at IS NULL OR typeof(archived_at) = 'integer'),
+			purge_after    INTEGER CHECK (purge_after IS NULL OR typeof(purge_after) = 'integer'),
+			data_purged_at INTEGER CHECK (data_purged_at IS NULL OR typeof(data_purged_at) = 'integer'),
+			updated_at     INTEGER NOT NULL CHECK (typeof(updated_at) = 'integer')
+		) STRICT`,
+		`INSERT OR IGNORE INTO event_catalog(event_id,state,created_at,archived_at,purge_after,data_purged_at,updated_at)
+		 SELECT event_id,'active',MIN(created_at),NULL,NULL,NULL,MAX(created_at) FROM nodes GROUP BY event_id`,
+		`CREATE TABLE IF NOT EXISTS purge_tombstones (
+			event_id    TEXT PRIMARY KEY,
+			actor       TEXT NOT NULL,
+			purged_at   INTEGER NOT NULL,
+			counts_json TEXT NOT NULL,
+			retain_until INTEGER NOT NULL
+		) STRICT`,
+		`CREATE TABLE IF NOT EXISTS retention_state (
+			id            INTEGER PRIMARY KEY CHECK (id = 1),
+			degraded      INTEGER NOT NULL DEFAULT 0,
+			failure_count INTEGER NOT NULL DEFAULT 0,
+			last_run_at   INTEGER,
+			last_error    TEXT
+		) STRICT`,
+		`INSERT OR IGNORE INTO retention_state(id,degraded,failure_count,last_run_at,last_error) VALUES(1,0,0,NULL,NULL)`,
+		`CREATE TABLE IF NOT EXISTS capacity_state (
+			id      INTEGER PRIMARY KEY CHECK (id = 1),
+			version INTEGER NOT NULL DEFAULT 0
+		) STRICT`,
+		`INSERT OR IGNORE INTO capacity_state(id,version) VALUES(1,0)`,
+		// B2 no longer uses the old per-table archive copy; live event tables plus
+		// event lifecycle are the single source of truth.
+		`DROP TABLE IF EXISTS archive_records`,
+	}},
+	{version: 5, statements: []string{
+		// P1 review: events must not duplicate the complete report body on every
+		// event row. Store the validated events report once, and normalized event
+		// rows with severity/details only.
+		`CREATE TABLE IF NOT EXISTS report_event_reports (
+			node_id     TEXT NOT NULL REFERENCES nodes(node_id),
+			event_id    TEXT NOT NULL,
+			report_id   TEXT NOT NULL,
+			collected_at INTEGER NOT NULL CHECK (typeof(collected_at) = 'integer'),
+			received_at INTEGER NOT NULL CHECK (typeof(received_at) = 'integer'),
+			body_sha256 TEXT NOT NULL,
+			payload_json BLOB NOT NULL,
+			PRIMARY KEY (node_id, report_id)
+		) STRICT`,
+		`CREATE TABLE IF NOT EXISTS report_events_new (
+			report_row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+			node_id     TEXT NOT NULL REFERENCES nodes(node_id),
+			event_id    TEXT NOT NULL,
+			report_id   TEXT NOT NULL,
+			collected_at INTEGER NOT NULL CHECK (typeof(collected_at) = 'integer'),
+			received_at INTEGER NOT NULL CHECK (typeof(received_at) = 'integer'),
+			event_id_json TEXT NOT NULL,
+			event_at    INTEGER NOT NULL CHECK (typeof(event_at) = 'integer'),
+			kind        TEXT NOT NULL,
+			severity    TEXT NOT NULL CHECK (severity IN ('info','warning','critical')),
+			details_json TEXT NOT NULL,
+			UNIQUE(node_id, report_id, event_id_json)
+		) STRICT`,
+		`INSERT OR IGNORE INTO report_event_reports(node_id,event_id,report_id,collected_at,received_at,body_sha256,payload_json)
+		 SELECT node_id,event_id,report_id,MIN(collected_at),MAX(received_at),body_sha256,payload_json
+		 FROM report_events GROUP BY node_id,event_id,report_id,body_sha256`,
+		`INSERT OR IGNORE INTO report_events_new(node_id,event_id,report_id,collected_at,received_at,event_id_json,event_at,kind,severity,details_json)
+		 SELECT node_id,event_id,report_id,collected_at,received_at,event_id_json,event_at,kind,'info',details_json
+		 FROM report_events`,
+		`DROP TABLE report_events`,
+		`ALTER TABLE report_events_new RENAME TO report_events`,
+		`CREATE INDEX IF NOT EXISTS idx_report_events_node_collected ON report_events(node_id, collected_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_report_event_reports_event ON report_event_reports(event_id, collected_at)`,
 	}},
 }
 

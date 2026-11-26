@@ -2,6 +2,7 @@ package store
 
 import (
 	"crypto/rand"
+	"database/sql"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -293,19 +294,68 @@ func TestB2ApplyIngestTransactionAndSnapshotOrdering(t *testing.T) {
 	}
 }
 
-func TestB2RetentionPhysicalPruningAndArchive(t *testing.T) {
+func testEnrollEvent(t *testing.T, s *Store, event, class string, now int64) EnrolledIdentity {
+	t.Helper()
+	ctx := testContext()
+	_, hash, _ := NewEnrollToken()
+	if err := s.CreateEnrollToken(ctx, hash, event, class, now+3600, now); err != nil {
+		t.Fatalf("CreateEnrollToken: %v", err)
+	}
+	host := "linux"
+	if class == NodeClassWindowsTerminal {
+		host = "windows"
+	}
+	id, err := s.Enroll(ctx, hash, class, host, testPublicKey(t), now)
+	if err != nil {
+		t.Fatalf("Enroll: %v", err)
+	}
+	return id
+}
+
+func seedTelemetry(t *testing.T, s *Store, id EnrolledIdentity, reportID string, collectedAt, now int64) {
+	t.Helper()
+	ctx := testContext()
+	if err := s.WithTx(ctx, func(tx *Tx) error {
+		_, err := tx.StoreSnapshotTx(ctx, SnapshotRecord{NodeID: id.NodeID, EventID: id.EventID, NodeClass: id.NodeClass,
+			ReportID: reportID, CollectedAt: collectedAt, ReceivedAt: now, BodySHA256: "sha-" + reportID, Payload: []byte(`{"v":1}`)})
+		return err
+	}); err != nil {
+		t.Fatalf("seed snapshot %s: %v", reportID, err)
+	}
+	if err := s.WithTx(ctx, func(tx *Tx) error {
+		_, err := tx.StoreMetricsTx(ctx, ReportRecord{NodeID: id.NodeID, EventID: id.EventID, ReportID: "m-" + reportID,
+			CollectedAt: collectedAt, ReceivedAt: now, BodySHA256: "m-" + reportID, Payload: []byte(`{"v":1}`)})
+		return err
+	}); err != nil {
+		t.Fatalf("seed metrics %s: %v", reportID, err)
+	}
+	if err := s.WithTx(ctx, func(tx *Tx) error {
+		_, err := tx.StoreEventsTx(ctx, ReportRecord{NodeID: id.NodeID, EventID: id.EventID, ReportID: "e-" + reportID,
+			CollectedAt: collectedAt, ReceivedAt: now, BodySHA256: "e-" + reportID, Payload: []byte(`{"v":1}`)},
+			[]EventRecord{{EventID: "ev-" + reportID, At: collectedAt, Kind: "agent_started", DetailsJSON: `{}`}})
+		return err
+	}); err != nil {
+		t.Fatalf("seed events %s: %v", reportID, err)
+	}
+}
+
+func TestB2RetentionPhysicalPruning(t *testing.T) {
 	s := openTestStore(t, tempStorePath(t))
 	ctx := testContext()
 	now := int64(1_700_000_000)
 	id := testEnroll(t, s, NodeClassLinuxVPS, now)
-	// 300 seq rows in the current generation; retention keeps 256.
 	for seq := uint64(1); seq <= 300; seq++ {
 		if err := recordSeq(ctx, s.db, id.NodeID, 1, "boot-b2", seq, fmt.Sprintf("fp-%d", seq), now); err != nil {
 			t.Fatalf("RecordSeq(%d): %v", seq, err)
 		}
 	}
 	mustPutBoot(t, s, id.NodeID, 1, "boot-b2", 300, "fp-300")
-	// 10 boot generations; retention keeps 8.
+	// Old-generation exact-retry fingerprints must be removed as well.
+	for seq := uint64(1); seq <= 10; seq++ {
+		if err := recordSeq(ctx, s.db, id.NodeID, 2, "old-boot", seq, fmt.Sprintf("old-%d", seq), now); err != nil {
+			t.Fatalf("old RecordSeq(%d): %v", seq, err)
+		}
+	}
 	for gen := uint64(1); gen <= 10; gen++ {
 		if _, err := s.db.ExecContext(ctx,
 			`INSERT INTO boot_registry(node_id,boot_gen,boot_id,first_seen_at,last_seen_at,last_seq,state)
@@ -313,44 +363,211 @@ func TestB2RetentionPhysicalPruningAndArchive(t *testing.T) {
 			t.Fatalf("seed boot_registry gen %d: %v", gen, err)
 		}
 	}
-	if err := s.WithTx(ctx, func(tx *Tx) error {
-		_, err := tx.StoreSnapshotTx(ctx, SnapshotRecord{NodeID: id.NodeID, EventID: id.EventID, NodeClass: id.NodeClass,
-			ReportID: "old-snapshot", CollectedAt: now - 40*24*60*60, ReceivedAt: now - 40*24*60*60,
-			BodySHA256: "old-hash", Payload: []byte(`{"v":1}`)})
-		return err
-	}); err != nil {
-		t.Fatalf("seed old snapshot: %v", err)
-	}
-	deleted, err := s.RunRetentionB2(ctx, now)
-	if err != nil {
+	if _, err := s.RunRetentionB2(ctx, now); err != nil {
 		t.Fatalf("RunRetentionB2: %v", err)
 	}
-	if deleted["seq_dedupe"] != 44 {
-		t.Fatalf("seq prune = %d, want 44", deleted["seq_dedupe"])
-	}
 	if got := queryInt(t, s, `SELECT COUNT(*) FROM seq_dedupe WHERE node_id=? AND boot_gen=1`, id.NodeID); got != 256 {
-		t.Fatalf("seq rows = %d, want 256", got)
+		t.Fatalf("current seq rows = %d, want 256", got)
+	}
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM seq_dedupe WHERE node_id=? AND boot_gen=2`, id.NodeID); got != 0 {
+		t.Fatalf("old-generation seq rows = %d, want 0", got)
 	}
 	if got := queryInt(t, s, `SELECT COUNT(*) FROM boot_registry WHERE node_id=?`, id.NodeID); got != 8 {
 		t.Fatalf("boot_registry rows = %d, want 8", got)
 	}
-	// node_boot is authoritative and not deleted by retention.
-	if _, err := s.GetBoot(ctx, id.NodeID); err != nil && !errors.Is(err, ErrNotFound) {
-		t.Fatalf("node_boot read: %v", err)
+	if _, err := s.GetBoot(ctx, id.NodeID); err != nil {
+		t.Fatalf("node_boot must survive retention: %v", err)
 	}
-	if got := queryInt(t, s, `SELECT COUNT(*) FROM archive_records WHERE record_type='snapshot'`); got != 1 {
-		t.Fatalf("archived snapshots = %d, want 1", got)
+	// Old generation remains rejected by the persistent high-water.
+	if _, err := protocol.Evaluate(protocol.Boot{HighestGen: 1, BootID: "boot-b2", LastSeq: 1}, protocol.Attempt{Gen: 0, BootID: "old-boot", Seq: 2, Fingerprint: "x"}, protocol.Options{}); err == nil {
+		t.Fatal("retired generation did not produce a protocol rejection")
 	}
-	if got := queryInt(t, s, `SELECT COUNT(*) FROM snapshots WHERE report_id='old-snapshot'`); got != 0 {
-		t.Fatalf("old snapshot still active = %d", got)
-	}
-	// Retention is repeatable/idempotent.
+}
+
+func TestB2PolicyBEventLifecycle(t *testing.T) {
+	s := openTestStore(t, tempStorePath(t))
+	ctx := testContext()
+	now := int64(1_700_000_000)
+	eventA := testEnrollEvent(t, s, "event-a", NodeClassLinuxVPS, now)
+	eventB := testEnrollEvent(t, s, "event-b", NodeClassLinuxVPS, now+1)
+	seedTelemetry(t, s, eventA, "a-old", now-31*24*60*60, now)
+	seedTelemetry(t, s, eventA, "a-new", now-10*24*60*60, now)
+	seedTelemetry(t, s, eventB, "b-new", now-10*24*60*60, now+1)
+
+	// Active event rolling 30d.
 	if _, err := s.RunRetentionB2(ctx, now); err != nil {
-		t.Fatalf("second retention run: %v", err)
+		t.Fatalf("retention active: %v", err)
 	}
-	stats, err := s.CapacityStats(ctx)
-	if err != nil || stats.Snapshots != 0 || stats.Archive != 1 {
-		t.Fatalf("capacity = %+v err=%v", stats, err)
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM snapshots WHERE event_id='event-a'`); got != 1 {
+		t.Fatalf("active event A rows=%d, want 1", got)
+	}
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM snapshots WHERE report_id='a-old'`); got != 0 {
+		t.Fatalf("old active row survived")
+	}
+	// Archive A at T: ingest closed, tail kept until T+30d; B unaffected.
+	if err := s.ArchiveEvent(ctx, "event-a", now); err != nil {
+		t.Fatalf("ArchiveEvent A: %v", err)
+	}
+	ea, err := s.EventState(ctx, "event-a")
+	if err != nil || ea.State != EventArchived || ea.ArchivedAt == nil || ea.PurgeAfter == nil {
+		t.Fatalf("event A state = %+v err=%v", ea, err)
+	}
+	if err := s.ArchiveEvent(ctx, "event-a", now+1); !errors.Is(err, ErrEventArchived) {
+		t.Fatalf("double archive = %v, want ErrEventArchived", err)
+	}
+	if _, err := s.RunRetentionB2(ctx, now+29*24*60*60); err != nil {
+		t.Fatalf("archive tail retention: %v", err)
+	}
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM snapshots WHERE event_id='event-a'`); got != 1 {
+		t.Fatalf("archive tail A rows=%d, want 1", got)
+	}
+	// At T+30d the event data disappears; catalog survives; B aged out too.
+	if _, err := s.RunRetentionB2(ctx, now+31*24*60*60); err != nil {
+		t.Fatalf("archive expiry retention: %v", err)
+	}
+	for _, table := range []string{"snapshots", "report_metrics", "report_events"} {
+		if got := queryInt(t, s, `SELECT COUNT(*) FROM `+table+` WHERE event_id='event-a'`); got != 0 {
+			t.Fatalf("%s event A rows=%d after T+30d, want 0", table, got)
+		}
+		if got := queryInt(t, s, `SELECT COUNT(*) FROM `+table+` WHERE event_id='event-b'`); got != 0 {
+			// B is still active but its only row is >30d old at this simulated time.
+			t.Fatalf("%s event B active rolling rows=%d, want 0", table, got)
+		}
+	}
+	ea, _ = s.EventState(ctx, "event-a")
+	if ea.DataPurgedAt == nil {
+		t.Fatal("archive tail expiry did not record data_purged_at")
+	}
+	// Purge deletes the catalog and writes a content-free tombstone.
+	if err := s.PurgeEvent(ctx, "event-a", "admin", false, now+32*24*60*60); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("purge without confirmation = %v, want ErrInvalidArgument", err)
+	}
+	if err := s.PurgeEvent(ctx, "event-a", "admin", true, now+32*24*60*60); err != nil {
+		t.Fatalf("PurgeEvent: %v", err)
+	}
+	if _, err := s.EventState(ctx, "event-a"); !errors.Is(err, ErrEventUnknown) {
+		t.Fatalf("event catalog survived purge: %v", err)
+	}
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM purge_tombstones WHERE event_id='event-a'`); got != 1 {
+		t.Fatalf("purge tombstones=%d, want 1", got)
+	}
+}
+
+func TestB2ArchiveMultipleReportsNoLoss(t *testing.T) {
+	s := openTestStore(t, tempStorePath(t))
+	ctx := testContext()
+	now := int64(1_700_000_000)
+	a := testEnrollEvent(t, s, "event-a", NodeClassLinuxVPS, now)
+	b := testEnrollEvent(t, s, "event-b", NodeClassLinuxVPS, now)
+	for i, id := range []EnrolledIdentity{a, a, b, b} {
+		seedTelemetry(t, s, id, fmt.Sprintf("r%d", i), now-60, now+int64(i))
+	}
+	if err := s.ArchiveEvent(ctx, "event-a", now+10); err != nil {
+		t.Fatalf("archive: %v", err)
+	}
+	if _, err := s.RunRetentionB2(ctx, now+10+PolicyBArchiveTailSeconds+1); err != nil {
+		t.Fatalf("retention after tail: %v", err)
+	}
+	for _, table := range []string{"snapshots", "report_metrics", "report_events"} {
+		if got := queryInt(t, s, `SELECT COUNT(*) FROM `+table+` WHERE event_id='event-a'`); got != 0 {
+			t.Fatalf("%s lost/retained archive rows=%d, want 0 at tail expiry", table, got)
+		}
+	}
+	// B's rows were also past active rolling 30d at that simulated time.
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM snapshots WHERE event_id='event-b'`); got != 0 {
+		t.Fatalf("event B rows=%d, want 0 after rolling window", got)
+	}
+	// No legacy archive copy table exists/needs to exist.
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='archive_records'`); got != 0 {
+		t.Fatal("legacy archive_records table still exists")
+	}
+}
+
+func TestB2RetentionFailureDegradedAndIdempotent(t *testing.T) {
+	s := openTestStore(t, tempStorePath(t))
+	ctx := testContext()
+	now := int64(1_700_000_000)
+	id := testEnroll(t, s, NodeClassLinuxVPS, now)
+	if err := s.WithTx(ctx, func(tx *Tx) error {
+		_, err := tx.StoreSnapshotTx(ctx, SnapshotRecord{NodeID: id.NodeID, EventID: id.EventID, NodeClass: id.NodeClass,
+			ReportID: "old", CollectedAt: now - 40*24*60*60, ReceivedAt: now - 40*24*60*60,
+			BodySHA256: "old", Payload: []byte(`{"v":1}`)})
+		return err
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	s.SetRetentionHookForTest(func(stage string) error {
+		if strings.HasPrefix(stage, "delete:snapshots") {
+			return errors.New("injected disk failure")
+		}
+		return nil
+	})
+	if _, err := s.RunRetentionB2(ctx, now); !errors.Is(err, ErrRetentionDegraded) {
+		t.Fatalf("faulted retention = %v, want ErrRetentionDegraded", err)
+	}
+	st, err := s.GetRetentionState(ctx)
+	if err != nil || !st.Degraded || st.FailureCount == 0 {
+		t.Fatalf("retention state = %+v err=%v", st, err)
+	}
+	// Hook fires before the first batch delete, so the source data is intact.
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM snapshots WHERE report_id='old'`); got != 1 {
+		t.Fatalf("faulted retention deleted source data: %d", got)
+	}
+	s.SetRetentionHookForTest(nil)
+	if _, err := s.RunRetentionB2(ctx, now); err != nil {
+		t.Fatalf("recovered retention: %v", err)
+	}
+	st, _ = s.GetRetentionState(ctx)
+	if st.Degraded {
+		t.Fatal("retention state still degraded after successful run")
+	}
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM snapshots WHERE report_id='old'`); got != 0 {
+		t.Fatal("recovered retention did not delete expired row")
+	}
+}
+
+func TestB2QuotaRefusesNewEnrollment(t *testing.T) {
+	s := openTestStore(t, tempStorePath(t))
+	ctx := testContext()
+	now := int64(1_700_000_000)
+	// Event catalog exists, then fill the global hard quota directly.
+	_, hash, _ := NewEnrollToken()
+	if err := s.CreateEnrollToken(ctx, hash, "event-quota", NodeClassLinuxVPS, now+3600, now); err != nil {
+		t.Fatalf("token: %v", err)
+	}
+	for i := 0; i < MaxActiveNodesAllEvents; i++ {
+		if _, err := s.db.ExecContext(ctx,
+			`INSERT INTO nodes(node_id,event_id,node_class,state,created_at) VALUES(?,?,?,?,?)`,
+			fmt.Sprintf("quota-node-%03d", i), "event-quota", NodeClassLinuxVPS, NodeActive, now); err != nil {
+			t.Fatalf("seed node %d: %v", i, err)
+		}
+	}
+	_, hash2, _ := NewEnrollToken()
+	err := s.CreateEnrollToken(ctx, hash2, "event-quota", NodeClassLinuxVPS, now+7200, now)
+	if !errors.Is(err, ErrQuotaExceeded) {
+		t.Fatalf("quota token creation = %v, want ErrQuotaExceeded", err)
+	}
+}
+
+func TestB2ArchivedEventQuota(t *testing.T) {
+	s := openTestStore(t, tempStorePath(t))
+	ctx := testContext()
+	now := int64(1_700_000_000)
+	for i := 0; i < MaxArchivedEventsWithData; i++ {
+		ev := fmt.Sprintf("archived-event-%02d", i)
+		if _, err := s.db.ExecContext(ctx,
+			`INSERT INTO event_catalog(event_id,state,created_at,archived_at,purge_after,data_purged_at,updated_at)
+			 VALUES(?,?,?,?,?,NULL,?)`, ev, EventArchived, now, now, now+PolicyBArchiveTailSeconds, now); err != nil {
+			t.Fatalf("seed archived event %d: %v", i, err)
+		}
+	}
+	_, hash, _ := NewEnrollToken()
+	if err := s.CreateEnrollToken(ctx, hash, "event-new", NodeClassLinuxVPS, now+3600, now); err != nil {
+		t.Fatalf("token: %v", err)
+	}
+	err := s.ArchiveEvent(ctx, "event-new", now)
+	if !errors.Is(err, ErrQuotaExceeded) {
+		t.Fatalf("archived event quota = %v, want ErrQuotaExceeded", err)
 	}
 }
 
@@ -390,5 +607,263 @@ func TestB2EnrollmentTokenConcurrentSingleUse(t *testing.T) {
 	}
 	if got := queryInt(t, s, `SELECT COUNT(*) FROM nodes`); got != 1 {
 		t.Fatalf("concurrent enrollment created %d nodes, want 1", got)
+	}
+}
+
+func TestB2RotationStateIntegrityAndRevocation(t *testing.T) {
+	s := openTestStore(t, tempStorePath(t))
+	ctx := testContext()
+	now := int64(1_700_000_000)
+	id := testEnroll(t, s, NodeClassLinuxVPS, now)
+	// Create and confirm one rotation.
+	var newKeyID string
+	if err := s.WithTx(ctx, func(tx *Tx) error {
+		if err := tx.CreateRotationTx(ctx, RotationRecord{NodeID: id.NodeID, OldKeyID: id.KeyID, Nonce: "n1", BodySHA256: "h1", ExpiresAt: now + 300, CreatedAt: now}, testPublicKey(t)); err != nil {
+			return err
+		}
+		rec, _, err := tx.RotationTx(ctx, id.NodeID, "n1")
+		newKeyID = rec.NewKeyID
+		if err != nil {
+			return err
+		}
+		_, err = tx.ConfirmRotationTx(ctx, id.NodeID, "n1", now)
+		return err
+	}); err != nil {
+		t.Fatalf("confirm: %v", err)
+	}
+	// A second confirmation must not look successful.
+	if err := s.WithTx(ctx, func(tx *Tx) error {
+		_, err := tx.ConfirmRotationTx(ctx, id.NodeID, "n1", now+1)
+		return err
+	}); !errors.Is(err, ErrRotationState) {
+		t.Fatalf("second confirm error = %v, want ErrRotationState", err)
+	}
+	// Start a second rotation from the active new key, then revoke the old key's
+	// related provisional key; it must not survive confirmation.
+	var provisionalID string
+	if err := s.WithTx(ctx, func(tx *Tx) error {
+		if err := tx.CreateRotationTx(ctx, RotationRecord{NodeID: id.NodeID, OldKeyID: newKeyID, Nonce: "n2", BodySHA256: "h2", ExpiresAt: now + 300, CreatedAt: now}, testPublicKey(t)); err != nil {
+			return err
+		}
+		rec, _, err := tx.RotationTx(ctx, id.NodeID, "n2")
+		provisionalID = rec.NewKeyID
+		return err
+	}); err != nil {
+		t.Fatalf("create n2: %v", err)
+	}
+	if err := s.RevokeKey(ctx, id.NodeID, newKeyID, now+2); err != nil {
+		t.Fatalf("revoke active key: %v", err)
+	}
+	if err := s.WithTx(ctx, func(tx *Tx) error {
+		prov, err := tx.KeyTx(ctx, id.NodeID, provisionalID)
+		if err != nil || prov.State != KeyRevoked {
+			return fmt.Errorf("provisional key state=%+v err=%v", prov, err)
+		}
+		rec, ok, err := tx.RotationTx(ctx, id.NodeID, "n2")
+		if err != nil || !ok || rec.State != RotationAborted {
+			return fmt.Errorf("rotation n2 = %+v ok=%v err=%v", rec, ok, err)
+		}
+		if _, err := tx.ConfirmRotationTx(ctx, id.NodeID, "n2", now+3); !errors.Is(err, ErrRotationState) {
+			return fmt.Errorf("confirm aborted rotation error = %v, want ErrRotationState", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("revoke state: %v", err)
+	}
+	// Node revoke differs from single-key revoke: node retired, history untouched.
+	if err := s.RevokeNode(ctx, id.NodeID, now+4); err != nil {
+		t.Fatalf("revoke node: %v", err)
+	}
+	node, err := s.GetNode(ctx, id.NodeID)
+	if err != nil || node.State != NodeRevoked {
+		t.Fatalf("node state=%+v err=%v", node, err)
+	}
+	if err := s.WithTx(ctx, func(tx *Tx) error {
+		n, err := tx.NodeTx(ctx, id.NodeID)
+		if err != nil {
+			return err
+		}
+		var retired sql.NullInt64
+		if err := tx.tx.QueryRowContext(ctx, `SELECT retired_at FROM nodes WHERE node_id=?`, id.NodeID).Scan(&retired); err != nil {
+			return err
+		}
+		if !retired.Valid {
+			t.Fatal("node retire did not set retired_at")
+		}
+		_ = n
+		return nil
+	}); err != nil {
+		t.Fatalf("retired_at: %v", err)
+	}
+	if _, err := s.GetLatestSnapshot(ctx, id.NodeID); !errors.Is(err, ErrNotFound) {
+		// No snapshot was seeded; this is only a sanity read.
+	}
+}
+
+func TestB2ArchiveAndRetentionFaultLeavesDataIntact(t *testing.T) {
+	s := openTestStore(t, tempStorePath(t))
+	ctx := testContext()
+	now := int64(1_700_000_000)
+	id := testEnrollEvent(t, s, "event-fault", NodeClassLinuxVPS, now)
+	seedTelemetry(t, s, id, "fault-row", now-10, now)
+	for _, stage := range []string{"archive:begin", "archive:write"} {
+		s.SetRetentionHookForTest(func(got string) error {
+			if got == stage {
+				return errors.New("injected archive failure " + stage)
+			}
+			return nil
+		})
+		if err := s.ArchiveEvent(ctx, "event-fault", now); err == nil {
+			t.Fatalf("archive fault %s was not reported", stage)
+		}
+		ev, err := s.EventState(ctx, "event-fault")
+		if err != nil || ev.State != EventActive {
+			t.Fatalf("archive fault %s changed state: %+v err=%v", stage, ev, err)
+		}
+		if got := queryInt(t, s, `SELECT COUNT(*) FROM snapshots WHERE report_id='fault-row'`); got != 1 {
+			t.Fatalf("archive fault %s lost data: %d", stage, got)
+		}
+	}
+	// Archive scan failure must not delete telemetry.
+	s.SetRetentionHookForTest(func(got string) error {
+		if got == "retention:scan_events" {
+			return errors.New("injected scan failure")
+		}
+		return nil
+	})
+	if _, err := s.RunRetentionB2(ctx, now); !errors.Is(err, ErrRetentionDegraded) {
+		t.Fatalf("scan fault = %v, want degraded", err)
+	}
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM snapshots WHERE report_id='fault-row'`); got != 1 {
+		t.Fatalf("scan fault lost data: %d", got)
+	}
+	s.SetRetentionHookForTest(nil)
+	if err := s.ArchiveEvent(ctx, "event-fault", now); err != nil {
+		t.Fatalf("clean archive: %v", err)
+	}
+}
+
+func TestB2EventStorageNormalizationAndCrossTypeConflict(t *testing.T) {
+	s := openTestStore(t, tempStorePath(t))
+	ctx := testContext()
+	now := int64(1_700_000_000)
+	id := testEnrollEvent(t, s, "event-events", NodeClassLinuxVPS, now)
+	payload := []byte(`{"v":1,"type":"events","events":[]}`)
+	if err := s.WithTx(ctx, func(tx *Tx) error {
+		if status, err := tx.CheckOrInsertReport(ctx, id.NodeID, "events-1", "h-events", now); err != nil || status != ReportNew {
+			return fmt.Errorf("report dedupe status=%q err=%v", status, err)
+		}
+		_, err := tx.StoreEventsTx(ctx, ReportRecord{NodeID: id.NodeID, EventID: id.EventID, ReportID: "events-1",
+			CollectedAt: now, ReceivedAt: now, BodySHA256: "h-events", Payload: payload}, []EventRecord{
+			{EventID: "ev-1", At: now, Kind: "agent_started", Severity: "warning", DetailsJSON: `{"a":1}`},
+			{EventID: "ev-2", At: now + 1, Kind: "agent_error", Severity: "critical", DetailsJSON: `{"b":2}`},
+		})
+		return err
+	}); err != nil {
+		t.Fatalf("StoreEventsTx: %v", err)
+	}
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM report_event_reports WHERE report_id='events-1'`); got != 1 {
+		t.Fatalf("event report rows=%d, want one shared payload row", got)
+	}
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM report_events WHERE report_id='events-1'`); got != 2 {
+		t.Fatalf("event rows=%d, want 2", got)
+	}
+	if got := queryString(t, s, `SELECT severity FROM report_events WHERE event_id_json='ev-1'`); got != "warning" {
+		t.Fatalf("severity=%q, want warning", got)
+	}
+	// The same report_id cannot be reused for a different report type/body.
+	if err := s.WithTx(ctx, func(tx *Tx) error {
+		status, err := tx.CheckOrInsertReport(ctx, id.NodeID, "events-1", "different-body", now)
+		if err != nil {
+			return err
+		}
+		if status != ReportConflict {
+			t.Fatalf("cross-type report_id status=%q, want conflict", status)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("cross-type conflict: %v", err)
+	}
+	stats, err := s.CapacityStatsExtended(ctx)
+	if err != nil || stats.EventsBytes <= 0 || stats.DBSizeBytes <= 0 {
+		t.Fatalf("capacity extended = %+v err=%v", stats, err)
+	}
+}
+
+func TestB2PolicyBMultipleArchiveTimesAndExactBoundary(t *testing.T) {
+	s := openTestStore(t, tempStorePath(t))
+	ctx := testContext()
+	now := int64(1_700_000_000)
+	a := testEnrollEvent(t, s, "event-aa", NodeClassLinuxVPS, now)
+	b := testEnrollEvent(t, s, "event-bb", NodeClassLinuxVPS, now+1)
+	seedTelemetry(t, s, a, "aa-row", now-10, now)
+	seedTelemetry(t, s, b, "bb-row", now-10, now+1)
+	if err := s.ArchiveEvent(ctx, "event-aa", now); err != nil {
+		t.Fatalf("archive A: %v", err)
+	}
+	if err := s.ArchiveEvent(ctx, "event-bb", now+5*24*60*60); err != nil {
+		t.Fatalf("archive B: %v", err)
+	}
+	// At exactly T_A+30d, A's data is deleted; B's tail is still alive.
+	if _, err := s.RunRetentionB2(ctx, now+PolicyBArchiveTailSeconds); err != nil {
+		t.Fatalf("retention at A boundary: %v", err)
+	}
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM snapshots WHERE event_id='event-aa'`); got != 0 {
+		t.Fatalf("event A data at exact T+30d = %d, want 0", got)
+	}
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM snapshots WHERE event_id='event-bb'`); got != 1 {
+		t.Fatalf("event B data before its boundary = %d, want 1", got)
+	}
+	// At exactly T_B+30d, B's data is deleted as well; catalogs remain.
+	if _, err := s.RunRetentionB2(ctx, now+5*24*60*60+PolicyBArchiveTailSeconds); err != nil {
+		t.Fatalf("retention at B boundary: %v", err)
+	}
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM snapshots WHERE event_id='event-bb'`); got != 0 {
+		t.Fatalf("event B data at exact T+30d = %d, want 0", got)
+	}
+	for _, ev := range []string{"event-aa", "event-bb"} {
+		info, err := s.EventState(ctx, ev)
+		if err != nil || info.DataPurgedAt == nil {
+			t.Fatalf("catalog %s after tail: %+v err=%v", ev, info, err)
+		}
+	}
+	// Idempotent restart-equivalent runs.
+	if _, err := s.RunRetentionB2(ctx, now+40*24*60*60); err != nil {
+		t.Fatalf("repeat retention: %v", err)
+	}
+}
+
+func TestB2QuotaPerEventAndCatalog(t *testing.T) {
+	s := openTestStore(t, tempStorePath(t))
+	ctx := testContext()
+	now := int64(1_700_000_000)
+	// Per-event node quota.
+	_, hash, _ := NewEnrollToken()
+	if err := s.CreateEnrollToken(ctx, hash, "event-per", NodeClassLinuxVPS, now+3600, now); err != nil {
+		t.Fatalf("token: %v", err)
+	}
+	for i := 0; i < MaxActiveNodesPerEvent; i++ {
+		if _, err := s.db.ExecContext(ctx,
+			`INSERT INTO nodes(node_id,event_id,node_class,state,created_at) VALUES(?,?,?,?,?)`,
+			fmt.Sprintf("per-node-%03d", i), "event-per", NodeClassLinuxVPS, NodeActive, now); err != nil {
+			t.Fatalf("seed per-event node: %v", err)
+		}
+	}
+	_, hash2, _ := NewEnrollToken()
+	if err := s.CreateEnrollToken(ctx, hash2, "event-per", NodeClassLinuxVPS, now+3600, now); !errors.Is(err, ErrQuotaExceeded) {
+		t.Fatalf("per-event quota = %v, want ErrQuotaExceeded", err)
+	}
+	// Event catalog quota.
+	s2 := openTestStore(t, tempStorePath(t))
+	for i := 0; i < MaxEventsCatalog; i++ {
+		if _, err := s2.db.ExecContext(ctx,
+			`INSERT INTO event_catalog(event_id,state,created_at,archived_at,purge_after,data_purged_at,updated_at)
+			 VALUES(?,?,?,NULL,NULL,NULL,?)`, fmt.Sprintf("catalog-%02d", i), EventActive, now, now); err != nil {
+			t.Fatalf("seed catalog: %v", err)
+		}
+	}
+	_, hash3, _ := NewEnrollToken()
+	if err := s2.CreateEnrollToken(ctx, hash3, "catalog-new", NodeClassLinuxVPS, now+3600, now); !errors.Is(err, ErrQuotaExceeded) {
+		t.Fatalf("event catalog quota = %v, want ErrQuotaExceeded", err)
 	}
 }
