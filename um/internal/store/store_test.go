@@ -44,6 +44,10 @@ func openTestStore(t *testing.T, path string) *Store {
 
 func mustCreateNode(t *testing.T, s *Store, nodeID, eventID, class string) {
 	t.Helper()
+	if _, err := s.db.Exec(`INSERT OR IGNORE INTO event_catalog(event_id,state,created_at,archived_at,purge_after,data_purged_at,updated_at)
+		VALUES(?,?,?,NULL,NULL,NULL,?)`, eventID, EventActive, int64(1000), int64(1000)); err != nil {
+		t.Fatalf("seed event catalog(%q): %v", eventID, err)
+	}
 	err := s.CreateNode(testContext(), Node{
 		NodeID:    nodeID,
 		EventID:   eventID,

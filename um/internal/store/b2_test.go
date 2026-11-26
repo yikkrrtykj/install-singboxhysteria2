@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/yikkrrtykj/install-singboxhysteria2/um/internal/protocol"
 )
@@ -29,7 +30,7 @@ func testEnroll(t *testing.T, s *Store, class string, now int64) EnrolledIdentit
 	if err != nil {
 		t.Fatalf("NewEnrollToken: %v", err)
 	}
-	if err := s.CreateEnrollToken(ctx, hash, "event-b2", class, now+3600, now); err != nil {
+	if err := s.CreateEnrollToken(ctx, hash, "00000000-0000-4000-8000-0000000000b2", class, now+3600, now); err != nil {
 		t.Fatalf("CreateEnrollToken: %v", err)
 	}
 	host := "linux"
@@ -50,7 +51,7 @@ func TestB2EnrollmentSingleUseAndScope(t *testing.T) {
 
 	// Scope mismatch is rejected without consuming the token.
 	_, hash, _ := NewEnrollToken()
-	if err := s.CreateEnrollToken(ctx, hash, "event-b2", NodeClassLinuxVPS, now+3600, now); err != nil {
+	if err := s.CreateEnrollToken(ctx, hash, "00000000-0000-4000-8000-0000000000b2", NodeClassLinuxVPS, now+3600, now); err != nil {
 		t.Fatalf("create token: %v", err)
 	}
 	if _, err := s.Enroll(ctx, hash, NodeClassWindowsTerminal, "windows", testPublicKey(t), now); !errors.Is(err, ErrTokenScopeMismatch) {
@@ -65,7 +66,7 @@ func TestB2EnrollmentSingleUseAndScope(t *testing.T) {
 	if err != nil {
 		t.Fatalf("enroll: %v", err)
 	}
-	if id.EventID != "event-b2" || id.NodeClass != NodeClassLinuxVPS || id.KeyID == "" || id.DeviceSalt == "" {
+	if id.EventID != "00000000-0000-4000-8000-0000000000b2" || id.NodeClass != NodeClassLinuxVPS || id.KeyID == "" || id.DeviceSalt == "" {
 		t.Fatalf("identity = %+v", id)
 	}
 	cfg, err := s.GetNodeConfig(ctx, id.NodeID)
@@ -89,7 +90,7 @@ func TestB2EnrollmentSingleUseAndScope(t *testing.T) {
 	}
 	// Expired token.
 	_, hash2, _ := NewEnrollToken()
-	if err := s.CreateEnrollToken(ctx, hash2, "event-b2", NodeClassLinuxVPS, now+10, now); err != nil {
+	if err := s.CreateEnrollToken(ctx, hash2, "00000000-0000-4000-8000-0000000000b2", NodeClassLinuxVPS, now+10, now); err != nil {
 		t.Fatalf("create expiring token: %v", err)
 	}
 	if _, err := s.Enroll(ctx, hash2, NodeClassLinuxVPS, "linux", testPublicKey(t), now+11); !errors.Is(err, ErrTokenExpired) {
@@ -389,8 +390,8 @@ func TestB2PolicyBEventLifecycle(t *testing.T) {
 	s := openTestStore(t, tempStorePath(t))
 	ctx := testContext()
 	now := int64(1_700_000_000)
-	eventA := testEnrollEvent(t, s, "event-a", NodeClassLinuxVPS, now)
-	eventB := testEnrollEvent(t, s, "event-b", NodeClassLinuxVPS, now+1)
+	eventA := testEnrollEvent(t, s, "00000000-0000-4000-8000-00000000000a", NodeClassLinuxVPS, now)
+	eventB := testEnrollEvent(t, s, "00000000-0000-4000-8000-00000000000b", NodeClassLinuxVPS, now+1)
 	seedTelemetry(t, s, eventA, "a-old", now-31*24*60*60, now)
 	seedTelemetry(t, s, eventA, "a-new", now-10*24*60*60, now)
 	seedTelemetry(t, s, eventB, "b-new", now-10*24*60*60, now+1)
@@ -399,27 +400,27 @@ func TestB2PolicyBEventLifecycle(t *testing.T) {
 	if _, err := s.RunRetentionB2(ctx, now); err != nil {
 		t.Fatalf("retention active: %v", err)
 	}
-	if got := queryInt(t, s, `SELECT COUNT(*) FROM snapshots WHERE event_id='event-a'`); got != 1 {
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM snapshots WHERE event_id='00000000-0000-4000-8000-00000000000a'`); got != 1 {
 		t.Fatalf("active event A rows=%d, want 1", got)
 	}
 	if got := queryInt(t, s, `SELECT COUNT(*) FROM snapshots WHERE report_id='a-old'`); got != 0 {
 		t.Fatalf("old active row survived")
 	}
 	// Archive A at T: ingest closed, tail kept until T+30d; B unaffected.
-	if err := s.ArchiveEvent(ctx, "event-a", now); err != nil {
+	if err := s.ArchiveEvent(ctx, "00000000-0000-4000-8000-00000000000a", now); err != nil {
 		t.Fatalf("ArchiveEvent A: %v", err)
 	}
-	ea, err := s.EventState(ctx, "event-a")
+	ea, err := s.EventState(ctx, "00000000-0000-4000-8000-00000000000a")
 	if err != nil || ea.State != EventArchived || ea.ArchivedAt == nil || ea.PurgeAfter == nil {
 		t.Fatalf("event A state = %+v err=%v", ea, err)
 	}
-	if err := s.ArchiveEvent(ctx, "event-a", now+1); !errors.Is(err, ErrEventArchived) {
+	if err := s.ArchiveEvent(ctx, "00000000-0000-4000-8000-00000000000a", now+1); !errors.Is(err, ErrEventArchived) {
 		t.Fatalf("double archive = %v, want ErrEventArchived", err)
 	}
 	if _, err := s.RunRetentionB2(ctx, now+29*24*60*60); err != nil {
 		t.Fatalf("archive tail retention: %v", err)
 	}
-	if got := queryInt(t, s, `SELECT COUNT(*) FROM snapshots WHERE event_id='event-a'`); got != 1 {
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM snapshots WHERE event_id='00000000-0000-4000-8000-00000000000a'`); got != 1 {
 		t.Fatalf("archive tail A rows=%d, want 1", got)
 	}
 	// At T+30d the event data disappears; catalog survives; B aged out too.
@@ -427,29 +428,29 @@ func TestB2PolicyBEventLifecycle(t *testing.T) {
 		t.Fatalf("archive expiry retention: %v", err)
 	}
 	for _, table := range []string{"snapshots", "report_metrics", "report_events"} {
-		if got := queryInt(t, s, `SELECT COUNT(*) FROM `+table+` WHERE event_id='event-a'`); got != 0 {
+		if got := queryInt(t, s, `SELECT COUNT(*) FROM `+table+` WHERE event_id='00000000-0000-4000-8000-00000000000a'`); got != 0 {
 			t.Fatalf("%s event A rows=%d after T+30d, want 0", table, got)
 		}
-		if got := queryInt(t, s, `SELECT COUNT(*) FROM `+table+` WHERE event_id='event-b'`); got != 0 {
+		if got := queryInt(t, s, `SELECT COUNT(*) FROM `+table+` WHERE event_id='00000000-0000-4000-8000-00000000000b'`); got != 0 {
 			// B is still active but its only row is >30d old at this simulated time.
 			t.Fatalf("%s event B active rolling rows=%d, want 0", table, got)
 		}
 	}
-	ea, _ = s.EventState(ctx, "event-a")
+	ea, _ = s.EventState(ctx, "00000000-0000-4000-8000-00000000000a")
 	if ea.DataPurgedAt == nil {
 		t.Fatal("archive tail expiry did not record data_purged_at")
 	}
 	// Purge deletes the catalog and writes a content-free tombstone.
-	if err := s.PurgeEvent(ctx, "event-a", "admin", false, now+32*24*60*60); !errors.Is(err, ErrInvalidArgument) {
+	if err := s.PurgeEvent(ctx, "00000000-0000-4000-8000-00000000000a", "admin", false, now+32*24*60*60); !errors.Is(err, ErrInvalidArgument) {
 		t.Fatalf("purge without confirmation = %v, want ErrInvalidArgument", err)
 	}
-	if err := s.PurgeEvent(ctx, "event-a", "admin", true, now+32*24*60*60); err != nil {
+	if err := s.PurgeEvent(ctx, "00000000-0000-4000-8000-00000000000a", "admin", true, now+32*24*60*60); err != nil {
 		t.Fatalf("PurgeEvent: %v", err)
 	}
-	if _, err := s.EventState(ctx, "event-a"); !errors.Is(err, ErrEventUnknown) {
+	if _, err := s.EventState(ctx, "00000000-0000-4000-8000-00000000000a"); !errors.Is(err, ErrEventUnknown) {
 		t.Fatalf("event catalog survived purge: %v", err)
 	}
-	if got := queryInt(t, s, `SELECT COUNT(*) FROM purge_tombstones WHERE event_id='event-a'`); got != 1 {
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM purge_tombstones WHERE event_id='00000000-0000-4000-8000-00000000000a'`); got != 1 {
 		t.Fatalf("purge tombstones=%d, want 1", got)
 	}
 }
@@ -458,24 +459,24 @@ func TestB2ArchiveMultipleReportsNoLoss(t *testing.T) {
 	s := openTestStore(t, tempStorePath(t))
 	ctx := testContext()
 	now := int64(1_700_000_000)
-	a := testEnrollEvent(t, s, "event-a", NodeClassLinuxVPS, now)
-	b := testEnrollEvent(t, s, "event-b", NodeClassLinuxVPS, now)
+	a := testEnrollEvent(t, s, "00000000-0000-4000-8000-00000000000a", NodeClassLinuxVPS, now)
+	b := testEnrollEvent(t, s, "00000000-0000-4000-8000-00000000000b", NodeClassLinuxVPS, now)
 	for i, id := range []EnrolledIdentity{a, a, b, b} {
 		seedTelemetry(t, s, id, fmt.Sprintf("r%d", i), now-60, now+int64(i))
 	}
-	if err := s.ArchiveEvent(ctx, "event-a", now+10); err != nil {
+	if err := s.ArchiveEvent(ctx, "00000000-0000-4000-8000-00000000000a", now+10); err != nil {
 		t.Fatalf("archive: %v", err)
 	}
 	if _, err := s.RunRetentionB2(ctx, now+10+PolicyBArchiveTailSeconds+1); err != nil {
 		t.Fatalf("retention after tail: %v", err)
 	}
 	for _, table := range []string{"snapshots", "report_metrics", "report_events"} {
-		if got := queryInt(t, s, `SELECT COUNT(*) FROM `+table+` WHERE event_id='event-a'`); got != 0 {
+		if got := queryInt(t, s, `SELECT COUNT(*) FROM `+table+` WHERE event_id='00000000-0000-4000-8000-00000000000a'`); got != 0 {
 			t.Fatalf("%s lost/retained archive rows=%d, want 0 at tail expiry", table, got)
 		}
 	}
 	// B's rows were also past active rolling 30d at that simulated time.
-	if got := queryInt(t, s, `SELECT COUNT(*) FROM snapshots WHERE event_id='event-b'`); got != 0 {
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM snapshots WHERE event_id='00000000-0000-4000-8000-00000000000b'`); got != 0 {
 		t.Fatalf("event B rows=%d, want 0 after rolling window", got)
 	}
 	// No legacy archive copy table exists/needs to exist.
@@ -533,18 +534,18 @@ func TestB2QuotaRefusesNewEnrollment(t *testing.T) {
 	now := int64(1_700_000_000)
 	// Event catalog exists, then fill the global hard quota directly.
 	_, hash, _ := NewEnrollToken()
-	if err := s.CreateEnrollToken(ctx, hash, "event-quota", NodeClassLinuxVPS, now+3600, now); err != nil {
+	if err := s.CreateEnrollToken(ctx, hash, "00000000-0000-4000-8000-0000000000c1", NodeClassLinuxVPS, now+3600, now); err != nil {
 		t.Fatalf("token: %v", err)
 	}
 	for i := 0; i < MaxActiveNodesAllEvents; i++ {
 		if _, err := s.db.ExecContext(ctx,
 			`INSERT INTO nodes(node_id,event_id,node_class,state,created_at) VALUES(?,?,?,?,?)`,
-			fmt.Sprintf("quota-node-%03d", i), "event-quota", NodeClassLinuxVPS, NodeActive, now); err != nil {
+			fmt.Sprintf("quota-node-%03d", i), "00000000-0000-4000-8000-0000000000c1", NodeClassLinuxVPS, NodeActive, now); err != nil {
 			t.Fatalf("seed node %d: %v", i, err)
 		}
 	}
 	_, hash2, _ := NewEnrollToken()
-	err := s.CreateEnrollToken(ctx, hash2, "event-quota", NodeClassLinuxVPS, now+7200, now)
+	err := s.CreateEnrollToken(ctx, hash2, "00000000-0000-4000-8000-0000000000c1", NodeClassLinuxVPS, now+7200, now)
 	if !errors.Is(err, ErrQuotaExceeded) {
 		t.Fatalf("quota token creation = %v, want ErrQuotaExceeded", err)
 	}
@@ -563,10 +564,10 @@ func TestB2ArchivedEventQuota(t *testing.T) {
 		}
 	}
 	_, hash, _ := NewEnrollToken()
-	if err := s.CreateEnrollToken(ctx, hash, "event-new", NodeClassLinuxVPS, now+3600, now); err != nil {
+	if err := s.CreateEnrollToken(ctx, hash, "00000000-0000-4000-8000-0000000000c2", NodeClassLinuxVPS, now+3600, now); err != nil {
 		t.Fatalf("token: %v", err)
 	}
-	err := s.ArchiveEvent(ctx, "event-new", now)
+	err := s.ArchiveEvent(ctx, "00000000-0000-4000-8000-0000000000c2", now)
 	if !errors.Is(err, ErrQuotaExceeded) {
 		t.Fatalf("archived event quota = %v, want ErrQuotaExceeded", err)
 	}
@@ -577,7 +578,7 @@ func TestB2EnrollmentTokenConcurrentSingleUse(t *testing.T) {
 	ctx := testContext()
 	now := int64(1_700_000_000)
 	_, hash, _ := NewEnrollToken()
-	if err := s.CreateEnrollToken(ctx, hash, "event-b2", NodeClassLinuxVPS, now+3600, now); err != nil {
+	if err := s.CreateEnrollToken(ctx, hash, "00000000-0000-4000-8000-0000000000b2", NodeClassLinuxVPS, now+3600, now); err != nil {
 		t.Fatalf("token: %v", err)
 	}
 	type result struct {
@@ -705,7 +706,7 @@ func TestB2ArchiveAndRetentionFaultLeavesDataIntact(t *testing.T) {
 	s := openTestStore(t, tempStorePath(t))
 	ctx := testContext()
 	now := int64(1_700_000_000)
-	id := testEnrollEvent(t, s, "event-fault", NodeClassLinuxVPS, now)
+	id := testEnrollEvent(t, s, "00000000-0000-4000-8000-0000000000c3", NodeClassLinuxVPS, now)
 	seedTelemetry(t, s, id, "fault-row", now-10, now)
 	for _, stage := range []string{"archive:begin", "archive:write"} {
 		s.SetRetentionHookForTest(func(got string) error {
@@ -714,10 +715,10 @@ func TestB2ArchiveAndRetentionFaultLeavesDataIntact(t *testing.T) {
 			}
 			return nil
 		})
-		if err := s.ArchiveEvent(ctx, "event-fault", now); err == nil {
+		if err := s.ArchiveEvent(ctx, "00000000-0000-4000-8000-0000000000c3", now); err == nil {
 			t.Fatalf("archive fault %s was not reported", stage)
 		}
-		ev, err := s.EventState(ctx, "event-fault")
+		ev, err := s.EventState(ctx, "00000000-0000-4000-8000-0000000000c3")
 		if err != nil || ev.State != EventActive {
 			t.Fatalf("archive fault %s changed state: %+v err=%v", stage, ev, err)
 		}
@@ -739,7 +740,7 @@ func TestB2ArchiveAndRetentionFaultLeavesDataIntact(t *testing.T) {
 		t.Fatalf("scan fault lost data: %d", got)
 	}
 	s.SetRetentionHookForTest(nil)
-	if err := s.ArchiveEvent(ctx, "event-fault", now); err != nil {
+	if err := s.ArchiveEvent(ctx, "00000000-0000-4000-8000-0000000000c3", now); err != nil {
 		t.Fatalf("clean archive: %v", err)
 	}
 }
@@ -748,7 +749,7 @@ func TestB2EventStorageNormalizationAndCrossTypeConflict(t *testing.T) {
 	s := openTestStore(t, tempStorePath(t))
 	ctx := testContext()
 	now := int64(1_700_000_000)
-	id := testEnrollEvent(t, s, "event-events", NodeClassLinuxVPS, now)
+	id := testEnrollEvent(t, s, "00000000-0000-4000-8000-0000000000c4", NodeClassLinuxVPS, now)
 	payload := []byte(`{"v":1,"type":"events","events":[]}`)
 	if err := s.WithTx(ctx, func(tx *Tx) error {
 		if status, err := tx.CheckOrInsertReport(ctx, id.NodeID, "events-1", "h-events", now); err != nil || status != ReportNew {
@@ -795,34 +796,34 @@ func TestB2PolicyBMultipleArchiveTimesAndExactBoundary(t *testing.T) {
 	s := openTestStore(t, tempStorePath(t))
 	ctx := testContext()
 	now := int64(1_700_000_000)
-	a := testEnrollEvent(t, s, "event-aa", NodeClassLinuxVPS, now)
-	b := testEnrollEvent(t, s, "event-bb", NodeClassLinuxVPS, now+1)
+	a := testEnrollEvent(t, s, "00000000-0000-4000-8000-0000000000aa", NodeClassLinuxVPS, now)
+	b := testEnrollEvent(t, s, "00000000-0000-4000-8000-0000000000bb", NodeClassLinuxVPS, now+1)
 	seedTelemetry(t, s, a, "aa-row", now-10, now)
 	seedTelemetry(t, s, b, "bb-row", now-10, now+1)
-	if err := s.ArchiveEvent(ctx, "event-aa", now); err != nil {
+	if err := s.ArchiveEvent(ctx, "00000000-0000-4000-8000-0000000000aa", now); err != nil {
 		t.Fatalf("archive A: %v", err)
 	}
-	if err := s.ArchiveEvent(ctx, "event-bb", now+5*24*60*60); err != nil {
+	if err := s.ArchiveEvent(ctx, "00000000-0000-4000-8000-0000000000bb", now+5*24*60*60); err != nil {
 		t.Fatalf("archive B: %v", err)
 	}
 	// At exactly T_A+30d, A's data is deleted; B's tail is still alive.
 	if _, err := s.RunRetentionB2(ctx, now+PolicyBArchiveTailSeconds); err != nil {
 		t.Fatalf("retention at A boundary: %v", err)
 	}
-	if got := queryInt(t, s, `SELECT COUNT(*) FROM snapshots WHERE event_id='event-aa'`); got != 0 {
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM snapshots WHERE event_id='00000000-0000-4000-8000-0000000000aa'`); got != 0 {
 		t.Fatalf("event A data at exact T+30d = %d, want 0", got)
 	}
-	if got := queryInt(t, s, `SELECT COUNT(*) FROM snapshots WHERE event_id='event-bb'`); got != 1 {
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM snapshots WHERE event_id='00000000-0000-4000-8000-0000000000bb'`); got != 1 {
 		t.Fatalf("event B data before its boundary = %d, want 1", got)
 	}
 	// At exactly T_B+30d, B's data is deleted as well; catalogs remain.
 	if _, err := s.RunRetentionB2(ctx, now+5*24*60*60+PolicyBArchiveTailSeconds); err != nil {
 		t.Fatalf("retention at B boundary: %v", err)
 	}
-	if got := queryInt(t, s, `SELECT COUNT(*) FROM snapshots WHERE event_id='event-bb'`); got != 0 {
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM snapshots WHERE event_id='00000000-0000-4000-8000-0000000000bb'`); got != 0 {
 		t.Fatalf("event B data at exact T+30d = %d, want 0", got)
 	}
-	for _, ev := range []string{"event-aa", "event-bb"} {
+	for _, ev := range []string{"00000000-0000-4000-8000-0000000000aa", "00000000-0000-4000-8000-0000000000bb"} {
 		info, err := s.EventState(ctx, ev)
 		if err != nil || info.DataPurgedAt == nil {
 			t.Fatalf("catalog %s after tail: %+v err=%v", ev, info, err)
@@ -840,18 +841,18 @@ func TestB2QuotaPerEventAndCatalog(t *testing.T) {
 	now := int64(1_700_000_000)
 	// Per-event node quota.
 	_, hash, _ := NewEnrollToken()
-	if err := s.CreateEnrollToken(ctx, hash, "event-per", NodeClassLinuxVPS, now+3600, now); err != nil {
+	if err := s.CreateEnrollToken(ctx, hash, "00000000-0000-4000-8000-0000000000c5", NodeClassLinuxVPS, now+3600, now); err != nil {
 		t.Fatalf("token: %v", err)
 	}
 	for i := 0; i < MaxActiveNodesPerEvent; i++ {
 		if _, err := s.db.ExecContext(ctx,
 			`INSERT INTO nodes(node_id,event_id,node_class,state,created_at) VALUES(?,?,?,?,?)`,
-			fmt.Sprintf("per-node-%03d", i), "event-per", NodeClassLinuxVPS, NodeActive, now); err != nil {
+			fmt.Sprintf("per-node-%03d", i), "00000000-0000-4000-8000-0000000000c5", NodeClassLinuxVPS, NodeActive, now); err != nil {
 			t.Fatalf("seed per-event node: %v", err)
 		}
 	}
 	_, hash2, _ := NewEnrollToken()
-	if err := s.CreateEnrollToken(ctx, hash2, "event-per", NodeClassLinuxVPS, now+3600, now); !errors.Is(err, ErrQuotaExceeded) {
+	if err := s.CreateEnrollToken(ctx, hash2, "00000000-0000-4000-8000-0000000000c5", NodeClassLinuxVPS, now+3600, now); !errors.Is(err, ErrQuotaExceeded) {
 		t.Fatalf("per-event quota = %v, want ErrQuotaExceeded", err)
 	}
 	// Event catalog quota.
@@ -864,7 +865,7 @@ func TestB2QuotaPerEventAndCatalog(t *testing.T) {
 		}
 	}
 	_, hash3, _ := NewEnrollToken()
-	if err := s2.CreateEnrollToken(ctx, hash3, "catalog-new", NodeClassLinuxVPS, now+3600, now); !errors.Is(err, ErrQuotaExceeded) {
+	if err := s2.CreateEnrollToken(ctx, hash3, "00000000-0000-4000-8000-0000000000ca", NodeClassLinuxVPS, now+3600, now); !errors.Is(err, ErrQuotaExceeded) {
 		t.Fatalf("event catalog quota = %v, want ErrQuotaExceeded", err)
 	}
 }
@@ -885,7 +886,7 @@ func TestB2PurgeWithMappingsAndPermanentGraveyard(t *testing.T) {
 	s := openTestStore(t, tempStorePath(t))
 	ctx := testContext()
 	now := int64(1_700_000_000)
-	eventID := "event-purge"
+	eventID := "00000000-0000-4000-8000-0000000000c6"
 	_, linux := seedEventWithMapping(t, s, eventID, now)
 	seedTelemetry(t, s, linux, "purge-snap", now-10, now)
 	mustPutBoot(t, s, linux.NodeID, 1, "boot-purge", 1, "fp-purge")
@@ -961,7 +962,7 @@ func TestB2PurgeRecoveryAndFaults(t *testing.T) {
 	s := openTestStore(t, path)
 	ctx := testContext()
 	now := int64(1_700_000_000)
-	eventID := "event-purge-fault"
+	eventID := "00000000-0000-4000-8000-0000000000c7"
 	_, linux := seedEventWithMapping(t, s, eventID, now)
 	seedTelemetry(t, s, linux, "fault-snap", now-10, now)
 	// Failure after a committed telemetry batch leaves a persisted op; data that
@@ -998,10 +999,10 @@ func TestB2PurgeRecoveryAndFaults(t *testing.T) {
 		t.Fatalf("graveyard after resume=%v err=%v", exists, err)
 	}
 	// Mapping/tombstone-stage faults are also resumable.
-	for _, stage := range []string{"purge:mapping", "purge:tombstone"} {
+	for i, stage := range []string{"purge:mapping", "purge:tombstone"} {
 		p := tempStorePath(t)
 		s2 := openTestStore(t, p)
-		ev := "event-fault-" + stage
+		ev := fmt.Sprintf("00000000-0000-4000-8000-%012d", 900+i)
 		_, l2 := seedEventWithMapping(t, s2, ev, now)
 		seedTelemetry(t, s2, l2, "f-"+stage, now-10, now)
 		s2.SetRetentionHookForTest(func(got string) error {
@@ -1028,9 +1029,15 @@ func TestB2PurgeBlocksIngestAndEnrollmentConcurrently(t *testing.T) {
 	s := openTestStore(t, tempStorePath(t))
 	ctx := testContext()
 	now := int64(1_700_000_000)
-	eventID := "event-purge-concurrent"
+	eventID := "00000000-0000-4000-8000-0000000000c8"
 	win, linux := seedEventWithMapping(t, s, eventID, now)
 	seedTelemetry(t, s, linux, "conc-snap", now-10, now)
+	// Same public mapping parameters used below must succeed on the active event.
+	activeEffective := time.Now().Unix() + 3600
+	if err := s.CreateMappingVersion(ctx, eventID, win.NodeID, 2, activeEffective, "admin",
+		map[string]string{RouteTokenAReality: linux.NodeID}); err != nil {
+		t.Fatalf("active mapping with future effective_from: %v", err)
+	}
 	// Start a purge that fails after persisting the operation, so the event stays
 	// blocked while ingest attempts race it.
 	s.SetRetentionHookForTest(func(stage string) error {
@@ -1071,12 +1078,13 @@ func TestB2PurgeBlocksIngestAndEnrollmentConcurrently(t *testing.T) {
 		}
 	}
 	// Ordinary mapping/config writes are also blocked by the purging state.
-	if err := s.CreateMappingVersion(ctx, eventID, win.NodeID, 2, now+100, "admin",
-		map[string]string{RouteTokenAReality: linux.NodeID}); err == nil {
-		t.Fatal("mapping write succeeded during purging")
+	purgingEffective := time.Now().Unix() + 7200
+	if err := s.CreateMappingVersion(ctx, eventID, win.NodeID, 3, purgingEffective, "admin",
+		map[string]string{RouteTokenAReality: linux.NodeID}); !errors.Is(err, ErrEventPurged) {
+		t.Fatalf("mapping write during purging = %v, want ErrEventPurged", err)
 	}
-	if _, err := s.UpdateNodeConfig(ctx, linux.NodeID, nil, nil, 60, now+100); err == nil {
-		t.Fatal("config update succeeded during purging")
+	if _, err := s.UpdateNodeConfig(ctx, linux.NodeID, nil, nil, 60, purgingEffective); !errors.Is(err, ErrEventPurged) {
+		t.Fatalf("config update during purging = %v, want ErrEventPurged", err)
 	}
 	_ = win
 }
@@ -1085,7 +1093,7 @@ func TestB2RetentionRunsBoundedAndLatestFK(t *testing.T) {
 	s := openTestStore(t, tempStorePath(t))
 	ctx := testContext()
 	now := int64(1_700_000_000)
-	id := testEnrollEvent(t, s, "event-runs", NodeClassLinuxVPS, now)
+	id := testEnrollEvent(t, s, "00000000-0000-4000-8000-0000000000c9", NodeClassLinuxVPS, now)
 	// Latest state old enough to be removed; it references a snapshot row that is
 	// also deleted, so FK ordering must be correct.
 	if err := s.WithTx(ctx, func(tx *Tx) error {
@@ -1153,4 +1161,271 @@ func TestB2RotationExpiryEqualityBoundary(t *testing.T) {
 		t.Fatalf("abort after expiry = %d err=%v, want 1", n, err)
 	}
 	_ = keyID
+}
+
+func TestB2PurgeBatchProgressSurvivesRestart(t *testing.T) {
+	path := tempStorePath(t)
+	s := openTestStore(t, path)
+	ctx := testContext()
+	now := int64(1_700_000_000)
+	eventID := "00000000-0000-4000-8000-0000000000d1"
+	id := testEnrollEvent(t, s, eventID, NodeClassLinuxVPS, now)
+	// 50,005 normalized event rows force one full 50k batch plus a remainder.
+	if _, err := s.db.ExecContext(ctx,
+		`WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n < 50005)
+		 INSERT INTO report_events(node_id,event_id,report_id,collected_at,received_at,event_id_json,event_at,kind,severity,details_json)
+		 SELECT ?,?,printf('r-%06d',n),?,?,printf('e-%06d',n),?,'agent_started','info','{}' FROM seq`,
+		id.NodeID, eventID, now, now, now); err != nil {
+		t.Fatalf("seed 50k event rows: %v", err)
+	}
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM report_events WHERE event_id=?`, eventID); got != 50005 {
+		t.Fatalf("seeded rows=%d", got)
+	}
+	s.SetRetentionHookForTest(func(stage string) error {
+		if stage == "purge:after_batch" {
+			return errors.New("interrupt after committed batch")
+		}
+		return nil
+	})
+	if err := s.PurgeEvent(ctx, eventID, "admin", true, now+1); err == nil {
+		t.Fatal("batch-boundary interruption not reported")
+	}
+	// The first 50k batch and its progress committed together.
+	var op PurgeOp
+	if _, ok, err := s.loadPurgeOp(ctx, eventID); err != nil || !ok {
+		t.Fatalf("load op: ok=%v err=%v", ok, err)
+	} else if ok {
+		op, _, _ = s.loadPurgeOp(ctx, eventID)
+	}
+	if op.DeletedRows != RetentionBatchRows {
+		t.Fatalf("persisted progress=%d, want %d", op.DeletedRows, RetentionBatchRows)
+	}
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM report_events WHERE event_id=?`, eventID); got != 5 {
+		t.Fatalf("remaining rows after first batch=%d, want 5", got)
+	}
+	s.SetRetentionHookForTest(nil)
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	s = openTestStore(t, path)
+	defer s.Close()
+	if err := s.PurgeEvent(ctx, eventID, "admin", true, now+2); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if got := queryInt(t, s, `SELECT deleted_rows FROM purge_ops WHERE event_id=? AND state='completed'`, eventID); got != 50005 {
+		t.Fatalf("completed deleted_rows=%d, want 50005", got)
+	}
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM report_events WHERE event_id=?`, eventID); got != 0 {
+		t.Fatalf("remaining rows after resume=%d", got)
+	}
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM security_ledger WHERE kind='event_purged'`); got != 1 {
+		t.Fatalf("event_purged audit rows=%d, want exactly 1", got)
+	}
+	// A duplicate completion call is idempotent and writes no second audit.
+	if err := s.PurgeEvent(ctx, eventID, "admin", true, now+3); err != nil {
+		t.Fatalf("idempotent purge: %v", err)
+	}
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM security_ledger WHERE kind='event_purged'`); got != 1 {
+		t.Fatalf("duplicate audit rows=%d", got)
+	}
+}
+
+func TestB2OverlapBudgetFormula(t *testing.T) {
+	// Explicit byte budget: plan 1000 => limit 2000.
+	if b := ComputeOverlapBudget(1000, 0, 2000); b.Exceeds() || b.BudgetBytes != 2000 || b.Unit != "bytes" {
+		t.Fatalf("equal boundary = %+v, want below/equal allowed", b)
+	}
+	if b := ComputeOverlapBudget(1000, 0, 2001); !b.Exceeds() {
+		t.Fatalf("above boundary = %+v, want exceeded", b)
+	}
+	if b := ComputeOverlapBudget(1000, 500, 1500); b.Exceeds() {
+		t.Fatalf("archived+candidate equal limit = %+v", b)
+	}
+	if b := ComputeOverlapBudget(1000, 500, 1501); !b.Exceeds() {
+		t.Fatalf("archived+candidate above limit = %+v", b)
+	}
+	// Last active event: archived=0, candidate can use the whole 2x plan cap.
+	if b := ComputeOverlapBudget(1000, 0, 2000); b.Exceeds() || b.ArchivedStoredBytes != 0 || b.CandidateBytes != 2000 {
+		t.Fatalf("last active event formula = %+v", b)
+	}
+}
+
+func TestB2OverlapBudgetArchiveBoundary(t *testing.T) {
+	s := openTestStore(t, tempStorePath(t))
+	ctx := testContext()
+	now := int64(1_700_000_000)
+	seedEvent := func(ev string, payloadLen int, collected int64) {
+		t.Helper()
+		id := testEnrollEvent(t, s, ev, NodeClassLinuxVPS, now)
+		if err := s.WithTx(ctx, func(tx *Tx) error {
+			_, err := tx.StoreSnapshotTx(ctx, SnapshotRecord{NodeID: id.NodeID, EventID: ev, NodeClass: id.NodeClass,
+				ReportID: "r-" + ev, CollectedAt: collected, ReceivedAt: now,
+				BodySHA256: "hash-" + ev, Payload: []byte(strings.Repeat("x", payloadLen))})
+			return err
+		}); err != nil {
+			t.Fatalf("seed %s: %v", ev, err)
+		}
+	}
+	// Archive A under the normal budget; then use a 100-byte planning basis.
+	a := "00000000-0000-4000-8000-0000000000e1"
+	seedEvent(a, 100, now-10)
+	if err := s.ArchiveEvent(ctx, a, now); err != nil {
+		t.Fatalf("archive A: %v", err)
+	}
+	s.SetOverlapBudgetForTest(100) // limit 200 bytes
+	b := "00000000-0000-4000-8000-0000000000e2"
+	seedEvent(b, 100, now-10)
+	if err := s.ArchiveEvent(ctx, b, now); err != nil {
+		t.Fatalf("equal overlap boundary: %v", err)
+	}
+	c := "00000000-0000-4000-8000-0000000000e3"
+	seedEvent(c, 101, now-10)
+	if err := s.ArchiveEvent(ctx, c, now); !errors.Is(err, ErrQuotaExceeded) {
+		t.Fatalf("above overlap boundary = %v, want ErrQuotaExceeded", err)
+	}
+	// A last active event can still archive within the explicit cap.
+	s.SetOverlapBudgetForTest(0)
+	d := "00000000-0000-4000-8000-0000000000e4"
+	seedEvent(d, 10, now-10)
+	if err := s.ArchiveEvent(ctx, d, now); err != nil {
+		t.Fatalf("last active event archive: %v", err)
+	}
+}
+
+func TestB2ConfigHistoryBoundsAndFailClosed(t *testing.T) {
+	s := openTestStore(t, tempStorePath(t))
+	ctx := testContext()
+	now := int64(1_700_000_000)
+	id := testEnroll(t, s, NodeClassLinuxVPS, now)
+	// A collection time before the only (later) history must fail closed rather
+	// than borrowing that later enable through an "earliest history" fallback.
+	if err := s.WithTx(ctx, func(tx *Tx) error {
+		_, err := tx.ConfigAtTx(ctx, id.NodeID, now-100)
+		return err
+	}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("pre-history ConfigAtTx = %v, want ErrNotFound", err)
+	}
+	// No valid history at collected_at: fail closed, never borrow a later enable.
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM node_config_history WHERE node_id=?`, id.NodeID); err != nil {
+		t.Fatalf("delete history: %v", err)
+	}
+	if err := s.WithTx(ctx, func(tx *Tx) error {
+		_, err := tx.ConfigAtTx(ctx, id.NodeID, now+100)
+		return err
+	}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing history ConfigAtTx = %v, want ErrNotFound", err)
+	}
+	// Recreate the fail-closed initial row at registration time.
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO node_config_history(node_id,event_id,config_version,effective_from,sources_json,expected_inbound_tags_json,cadence_seconds,device_salt)
+		 SELECT n.node_id,n.event_id,1,n.created_at,'{"system":false,"services":false,"singbox_api":false,"mihomo_api":false,"terminal":false,"events":false}','[]',c.cadence_seconds,c.device_salt FROM nodes n JOIN node_configs c ON c.node_id=n.node_id WHERE n.node_id=?`, id.NodeID); err != nil {
+		t.Fatalf("seed initial history: %v", err)
+	}
+	node, err := s.GetNode(ctx, id.NodeID)
+	if err != nil {
+		t.Fatalf("get node: %v", err)
+	}
+	// Earlier than registration / earlier than latest history is rejected.
+	if _, err := s.UpdateNodeConfig(ctx, id.NodeID, nil, nil, 60, node.CreatedAt-1); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("pre-registration config update = %v, want ErrInvalidArgument", err)
+	}
+	if _, err := s.UpdateNodeConfig(ctx, id.NodeID, nil, nil, 60, node.CreatedAt+10); err != nil {
+		t.Fatalf("future config update: %v", err)
+	}
+	if _, err := s.UpdateNodeConfig(ctx, id.NodeID, nil, nil, 60, node.CreatedAt+9); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("backdated-to-history update = %v, want ErrInvalidArgument", err)
+	}
+	// Same-second rule: equal effective_from is accepted and the higher version
+	// is the deterministic winner at that instant.
+	cfg3, err := s.UpdateNodeConfig(ctx, id.NodeID, nil, nil, 90, node.CreatedAt+10)
+	if err != nil {
+		t.Fatalf("same-second update: %v", err)
+	}
+	if cfg3.ConfigVersion != 3 {
+		t.Fatalf("same-second config version=%d, want 3", cfg3.ConfigVersion)
+	}
+	if err := s.WithTx(ctx, func(tx *Tx) error {
+		got, err := tx.ConfigAtTx(ctx, id.NodeID, node.CreatedAt+10)
+		if err != nil {
+			return err
+		}
+		if got.ConfigVersion != 3 || got.CadenceSeconds != 90 {
+			t.Fatalf("same-second ConfigAtTx=%+v, want v3 cadence90", got)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("same-second ConfigAtTx: %v", err)
+	}
+}
+
+func TestB2EnrollmentEventIDUUIDv4(t *testing.T) {
+	s := openTestStore(t, tempStorePath(t))
+	ctx := testContext()
+	now := int64(1_700_000_000)
+	_, hash, _ := NewEnrollToken()
+	if err := s.CreateEnrollToken(ctx, hash, "not-a-uuid", NodeClassLinuxVPS, now+3600, now); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("invalid event id token = %v, want ErrInvalidArgument", err)
+	}
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM enroll_tokens`); got != 0 {
+		t.Fatalf("invalid token rows=%d", got)
+	}
+	// Defensive case: a malformed token row already in the DB must not be
+	// consumed and must not create a partial identity/response.
+	badHash := TokenHash("bad-pre-existing-token")
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO enroll_tokens(token_hash,event_id,node_class,expires_at,used_at,created_at)
+		 VALUES(?,?,?,?,NULL,?)`, badHash, "not-a-uuid", NodeClassLinuxVPS, now+3600, now); err != nil {
+		t.Fatalf("seed malformed token: %v", err)
+	}
+	_, err := s.Enroll(ctx, badHash, NodeClassLinuxVPS, "linux", testPublicKey(t), now)
+	if !errors.Is(err, ErrTokenInvalid) {
+		t.Fatalf("malformed token enroll = %v, want ErrTokenInvalid", err)
+	}
+	var used sql.NullInt64
+	if err := s.db.QueryRowContext(ctx, `SELECT used_at FROM enroll_tokens WHERE token_hash=?`, badHash).Scan(&used); err != nil || used.Valid {
+		t.Fatalf("malformed token consumed: used=%v err=%v", used, err)
+	}
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM nodes`); got != 0 {
+		t.Fatalf("malformed token wrote nodes=%d", got)
+	}
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM node_keys`); got != 0 {
+		t.Fatalf("malformed token wrote keys=%d", got)
+	}
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM node_configs`); got != 0 {
+		t.Fatalf("malformed token wrote configs=%d", got)
+	}
+}
+
+func TestB2PurgeSingleIncompleteOperation(t *testing.T) {
+	s := openTestStore(t, tempStorePath(t))
+	ctx := testContext()
+	now := int64(1_700_000_000)
+	ev := "00000000-0000-4000-8000-0000000000d2"
+	_, linux := seedEventWithMapping(t, s, ev, now)
+	seedTelemetry(t, s, linux, "single-op", now-10, now)
+	s.SetRetentionHookForTest(func(stage string) error {
+		if stage == "purge:persisted" {
+			return errors.New("hold after persisted")
+		}
+		return nil
+	})
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = s.PurgeEvent(ctx, ev, "admin", true, now+1)
+		}()
+	}
+	wg.Wait()
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM purge_ops WHERE event_id=? AND state<>'completed'`, ev); got != 1 {
+		t.Fatalf("incomplete purge operations=%d, want exactly 1", got)
+	}
+	s.SetRetentionHookForTest(nil)
+	if err := s.PurgeEvent(ctx, ev, "admin", true, now+2); err != nil {
+		t.Fatalf("resume single op: %v", err)
+	}
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM purge_ops WHERE event_id=?`, ev); got != 1 {
+		t.Fatalf("total purge operations=%d, want 1", got)
+	}
 }

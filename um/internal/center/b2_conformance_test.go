@@ -10,6 +10,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -23,8 +24,59 @@ import (
 
 func b2BaseCollected(t *testing.T) int64 {
 	t.Helper()
-	doc := b2Example(t, "report-snapshot.v1.json")
-	return int64(doc["collected_at"].(float64))
+	// Synthetic reports are collected after the enrollment-time config update.
+	// The future offset keeps newer/stale comparisons inside the frozen ±60s
+	// collected_at window without backdating config history.
+	return ((time.Now().Unix() / 60) + 1) * 60
+}
+
+// b2ShiftReportTimes shifts every contract timestamp field in a report document
+// by the same delta as its collected_at, preserving the frozen relative bounds
+// (observed_at/sampled_at/event at) without backdating config history.
+// b2SentAt keeps the synthetic envelope inside the frozen freshness/collected
+// window when a report's collected_at is intentionally future minute-aligned.
+func b2SentAt(t *testing.T, body []byte) int64 {
+	t.Helper()
+	var env struct {
+		CollectedAt int64 `json:"collected_at"`
+	}
+	_ = json.Unmarshal(body, &env)
+	now := time.Now().Unix()
+	if env.CollectedAt > now {
+		return env.CollectedAt
+	}
+	return now
+}
+
+func b2ShiftReportTimes(doc map[string]any, collectedAt int64) {
+	old, ok := doc["collected_at"].(float64)
+	if !ok {
+		return
+	}
+	delta := collectedAt - int64(old)
+	var walk func(any)
+	walk = func(v any) {
+		switch x := v.(type) {
+		case map[string]any:
+			for k, child := range x {
+				switch k {
+				case "collected_at", "observed_at", "sampled_at", "at":
+					if n, ok := child.(float64); ok {
+						x[k] = float64(int64(n) + delta)
+					} else if n, ok := child.(int64); ok {
+						x[k] = n + delta
+					}
+				default:
+					walk(child)
+				}
+			}
+		case []any:
+			for _, child := range x {
+				walk(child)
+			}
+		}
+	}
+	walk(doc)
 }
 
 func b2SnapshotDoc(t *testing.T, collectedAt int64) map[string]any {
@@ -32,15 +84,15 @@ func b2SnapshotDoc(t *testing.T, collectedAt int64) map[string]any {
 	doc := b2Example(t, "report-snapshot.v1.json")
 	doc["report_id"] = b2UUID(t)
 	doc["collected_at"] = collectedAt
+	b2ShiftReportTimes(doc, collectedAt)
 	return doc
 }
 
 func b2SendReport(t *testing.T, tc *testCenter, a *syntheticAgent, doc map[string]any, nonce string) (int, map[string]any) {
 	t.Helper()
 	body := b2JSON(t, doc)
-	now := time.Now().Unix()
 	a.seq++
-	h, err := a.headers(wire.Report, now, nonce, body)
+	h, err := a.headers(wire.Report, b2SentAt(t, body), nonce, body)
 	if err != nil {
 		t.Fatalf("headers: %v", err)
 	}
@@ -51,7 +103,7 @@ func b2ReportWithSeq(t *testing.T, tc *testCenter, a *syntheticAgent, doc map[st
 	t.Helper()
 	body := b2JSON(t, doc)
 	a.seq = seq
-	h, err := a.headers(wire.Report, time.Now().Unix(), nonce, body)
+	h, err := a.headers(wire.Report, b2SentAt(t, body), nonce, body)
 	if err != nil {
 		t.Fatalf("headers: %v", err)
 	}
@@ -293,7 +345,7 @@ func TestB2REC16NonRetryablePayloadThenNextRecord(t *testing.T) {
 	a.gen = 3
 	bad := map[string]any{"v": 1, "type": "snapshot", "report_id": b2UUID(t), "collected_at": b2BaseCollected(t)}
 	a.seq++
-	h, _ := a.headers(wire.Report, time.Now().Unix(), b2Nonce(t), b2JSON(t, bad))
+	h, _ := a.headers(wire.Report, b2SentAt(t, b2JSON(t, bad)), b2Nonce(t), b2JSON(t, bad))
 	status, resp := doPost(t, tc, "/v1/agent/report", h, b2JSON(t, bad))
 	if status != 400 || resp["error"] != "invalid_request" {
 		t.Fatalf("REC-16 bad payload: %d %v", status, resp)
@@ -451,7 +503,7 @@ func TestB2REC29StaleSnapshot(t *testing.T) {
 	tc := startTestCenter(t)
 	a := enrollAgent(t, tc, store.NodeClassLinuxVPS, "linux")
 	base := b2BaseCollected(t)
-	newer := b2SnapshotDoc(t, base+100)
+	newer := b2SnapshotDoc(t, base+40)
 	status, resp := b2SendReport(t, tc, a, newer, b2Nonce(t))
 	if status != 200 || resp["result"] != "accepted" {
 		t.Fatalf("REC-29 newer: %d %v", status, resp)

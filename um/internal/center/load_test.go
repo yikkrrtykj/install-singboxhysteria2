@@ -24,7 +24,6 @@ func TestB2ConcurrentDuplicateReport(t *testing.T) {
 	a := enrollAgentA(t, tc, store.NodeClassLinuxVPS, "linux", b2EventUUID(1))
 	doc := b2SnapshotDoc(t, b2BaseCollected(t))
 	body := b2JSON(t, doc)
-	now := time.Now().Unix()
 	type outcome struct {
 		status int
 		result string
@@ -37,7 +36,7 @@ func TestB2ConcurrentDuplicateReport(t *testing.T) {
 			defer wg.Done()
 			aa := *a
 			aa.seq = 1
-			h, err := aa.headers(wire.Report, now, b2Nonce(t), body)
+			h, err := aa.headers(wire.Report, b2SentAt(t, body), b2Nonce(t), body)
 			if err != nil {
 				outcomes <- outcome{status: 0}
 				return
@@ -102,6 +101,7 @@ func TestB2SyntheticLoadSmoke(t *testing.T) {
 		doc := b2Example(t, "terminal-snapshot.v1.json")
 		doc["report_id"] = b2UUID(t)
 		doc["collected_at"] = base + int64(i)
+		b2ShiftReportTimes(doc, base+int64(i))
 		if status, resp := b2SendReport(t, tc, a, doc, b2Nonce(t)); status != 200 || resp["result"] != "accepted" {
 			t.Fatalf("windows smoke node %d: %d %v", i, status, resp)
 		}

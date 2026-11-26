@@ -58,6 +58,9 @@ func b2Example(t *testing.T, name string) map[string]any {
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		t.Fatalf("parse %s: %v", name, err)
 	}
+	if typ, _ := doc["type"].(string); typ == "snapshot" || typ == "metrics" || typ == "events" {
+		b2ShiftReportTimes(doc, b2BaseCollected(t))
+	}
 	return doc
 }
 
@@ -266,15 +269,13 @@ func enrollAgentA(t *testing.T, tc *testCenter, class, host, eventID string) *sy
 	if resp["center_spki_sha256"] != nil {
 		t.Fatalf("test center SPKI should be null: %v", resp["center_spki_sha256"])
 	}
-	// Synthetic tests configure an explicit source policy effective from epoch so
-	// the frozen contract examples (whose collected_at is older than test
-	// enrollment) exercise the intended platform/source rules. F4-specific tests
-	// create their own histories with realistic boundaries.
+	// Configure the source policy at enrollment time (never backdated); report
+	// timestamps are generated at/after this boundary.
 	sources := map[string]bool{"system": true, "services": true, "singbox_api": true, "mihomo_api": false, "terminal": false, "events": true}
 	if class == store.NodeClassWindowsTerminal {
 		sources = map[string]bool{"system": false, "services": false, "singbox_api": false, "mihomo_api": true, "terminal": true, "events": true}
 	}
-	if _, cfgErr := tc.store.UpdateNodeConfig(contextBackground(), a.nodeID, sources, nil, 60, 0); cfgErr != nil {
+	if _, cfgErr := tc.store.UpdateNodeConfig(contextBackground(), a.nodeID, sources, nil, 60, time.Now().Unix()); cfgErr != nil {
 		t.Fatalf("synthetic source config: %v", cfgErr)
 	}
 	return a
@@ -286,10 +287,9 @@ func contextBackground() context.Context { return context.Background() }
 func reportAttempt(t *testing.T, tc *testCenter, a *syntheticAgent, doc map[string]any) (int, map[string]any, map[string]any) {
 	t.Helper()
 	body := b2JSON(t, doc)
-	now := time.Now().Unix()
 	a.seq++
 	nonce := b2Nonce(t)
-	h, err := a.headers(wire.Report, now, nonce, body)
+	h, err := a.headers(wire.Report, b2SentAt(t, body), nonce, body)
 	if err != nil {
 		t.Fatalf("report headers: %v", err)
 	}
@@ -345,6 +345,7 @@ func TestB2CenterEnrollmentTelemetryRotation(t *testing.T) {
 	base := int64(snap["collected_at"].(float64))
 	snap["report_id"] = b2UUID(t)
 	snap["collected_at"] = base
+	b2ShiftReportTimes(snap, base)
 	status, resp, _ := reportAttempt(t, tc, linux, snap)
 	if status != http.StatusOK || resp["result"] != "accepted" {
 		t.Fatalf("snapshot status=%d resp=%v", status, resp)
@@ -362,6 +363,7 @@ func TestB2CenterEnrollmentTelemetryRotation(t *testing.T) {
 	newer := b2Example(t, "report-snapshot.v1.json")
 	newer["report_id"] = b2UUID(t)
 	newer["collected_at"] = base + 10
+	b2ShiftReportTimes(newer, base+10)
 	status, resp, _ = reportAttempt(t, tc, linux, newer)
 	if status != http.StatusOK || resp["result"] != "accepted" {
 		t.Fatalf("newer snapshot status=%d resp=%v", status, resp)
@@ -369,6 +371,7 @@ func TestB2CenterEnrollmentTelemetryRotation(t *testing.T) {
 	older := b2Example(t, "report-snapshot.v1.json")
 	older["report_id"] = b2UUID(t)
 	older["collected_at"] = base - 10
+	b2ShiftReportTimes(older, base-10)
 	status, resp, _ = reportAttempt(t, tc, linux, older)
 	if status != http.StatusOK || resp["result"] != "stale_ignored" {
 		t.Fatalf("stale snapshot status=%d resp=%v", status, resp)
@@ -401,9 +404,10 @@ func TestB2CenterEnrollmentTelemetryRotation(t *testing.T) {
 	badDoc := b2Example(t, "report-snapshot.v1.json")
 	badDoc["report_id"] = b2UUID(t)
 	badDoc["collected_at"] = base + 5
+	b2ShiftReportTimes(badDoc, base+5)
 	badBody := b2JSON(t, badDoc)
 	linux.seq++
-	badH, _ := linux.headers(wire.Report, time.Now().Unix(), b2Nonce(t), badBody)
+	badH, _ := linux.headers(wire.Report, b2SentAt(t, badBody), b2Nonce(t), badBody)
 	badH.Set(wire.HeaderSignature, base64.RawURLEncoding.EncodeToString(make([]byte, 64)))
 	if status, resp := doPost(t, tc, "/v1/agent/report", badH, badBody); status != http.StatusUnauthorized || resp["error"] != "bad_signature" {
 		t.Fatalf("bad signature status=%d resp=%v", status, resp)
@@ -446,6 +450,7 @@ func TestB2CenterEnrollmentTelemetryRotation(t *testing.T) {
 	proof := b2Example(t, "report-snapshot.v1.json")
 	proof["report_id"] = b2UUID(t)
 	proof["collected_at"] = base + 20
+	b2ShiftReportTimes(proof, base+20)
 	status, resp, _ = reportAttempt(t, tc, proofAgent, proof)
 	if status != http.StatusOK || resp["result"] != "accepted" {
 		t.Fatalf("proof report status=%d resp=%v", status, resp)
@@ -463,6 +468,7 @@ func TestB2CenterEnrollmentTelemetryRotation(t *testing.T) {
 	terminal := b2Example(t, "terminal-snapshot.v1.json")
 	terminal["report_id"] = b2UUID(t)
 	terminal["collected_at"] = base + 30
+	b2ShiftReportTimes(terminal, base+30)
 	status, resp, _ = reportAttempt(t, tc, proofAgent, terminal)
 	if status != http.StatusBadRequest || resp["error"] != "platform_mismatch" {
 		t.Fatalf("linux terminal status=%d resp=%v", status, resp)
@@ -506,6 +512,7 @@ func TestB2CenterRestartPersistence(t *testing.T) {
 	snap["report_id"] = b2UUID(t)
 	base := int64(snap["collected_at"].(float64))
 	snap["collected_at"] = base
+	b2ShiftReportTimes(snap, base)
 	status, resp, _ := reportAttempt(t, tc, linux, snap)
 	if status != http.StatusOK || resp["result"] != "accepted" {
 		t.Fatalf("initial snapshot status=%d resp=%v", status, resp)

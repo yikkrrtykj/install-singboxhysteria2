@@ -35,7 +35,7 @@ import (
 // SchemaVersion is the highest migration version this build knows. Open always
 // migrates a database to exactly this version; a database with a newer version
 // is rejected fail-closed instead of being silently used by older code.
-const SchemaVersion = 7
+const SchemaVersion = 8
 
 // Node classes accepted by the rev-5 platform isolation contract.
 const (
@@ -56,6 +56,8 @@ type Store struct {
 	// ingestHook is a test-only fault injection point inside the authenticated
 	// ingest transaction (after high-water/dedupe writes, before commit).
 	ingestHook func(string) error
+	// overlapBudgetOverride is a test-only active-only planning basis override.
+	overlapBudgetOverride int64
 }
 
 // Path returns the filesystem path of the database.
@@ -534,6 +536,23 @@ var migrations = []migration{
 		`INSERT OR IGNORE INTO node_config_history(node_id,event_id,config_version,effective_from,sources_json,expected_inbound_tags_json,cadence_seconds,device_salt)
 		 SELECT node_id,event_id,config_version,updated_at,sources_json,expected_inbound_tags_json,cadence_seconds,device_salt FROM node_configs`,
 		`CREATE INDEX IF NOT EXISTS idx_node_config_history_lookup ON node_config_history(node_id, effective_from DESC, config_version DESC)`,
+	}},
+	{version: 8, statements: []string{
+		// C4: the v7 backfill copied a mutable current config as if it were
+		// historical evidence. Re-anchor version 1 at registration time with the
+		// fail-closed initial switches, and create that row when it is missing.
+		`UPDATE node_config_history
+		 SET effective_from=(SELECT created_at FROM nodes n WHERE n.node_id=node_config_history.node_id),
+		     sources_json='{"system":false,"services":false,"singbox_api":false,"mihomo_api":false,"terminal":false,"events":false}',
+		     expected_inbound_tags_json='[]'
+		 WHERE config_version=1`,
+		`INSERT OR IGNORE INTO node_config_history(node_id,event_id,config_version,effective_from,sources_json,expected_inbound_tags_json,cadence_seconds,device_salt)
+		 SELECT n.node_id,n.event_id,1,n.created_at,
+		        '{"system":false,"services":false,"singbox_api":false,"mihomo_api":false,"terminal":false,"events":false}',
+		        '[]',COALESCE(c.cadence_seconds,60),COALESCE(c.device_salt,'')
+		 FROM nodes n LEFT JOIN node_configs c ON c.node_id=n.node_id`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_purge_ops_single_incomplete
+		 ON purge_ops(event_id) WHERE state <> 'completed'`,
 	}},
 }
 

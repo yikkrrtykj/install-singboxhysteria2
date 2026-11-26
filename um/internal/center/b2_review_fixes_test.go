@@ -237,7 +237,7 @@ func TestB2NonceReuseHasPriorityOverBootConflict(t *testing.T) {
 	a.gen = 1
 	a.bootID = "99999999999999999999999999999999" // same generation, different boot
 	body := b2JSON(t, b2SnapshotDoc(t, b2BaseCollected(t)))
-	h2, _ := a.headers(wire.Report, time.Now().Unix(), nonce, body)
+	h2, _ := a.headers(wire.Report, b2SentAt(t, body), nonce, body)
 	status, resp := doPost(t, tc, "/v1/agent/report", h2, body)
 	if status != 409 || resp["error"] != "nonce_reuse" {
 		t.Fatalf("nonce priority: %d %v, want nonce_reuse", status, resp)

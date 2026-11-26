@@ -28,7 +28,7 @@ func TestB2CrossEndpointNonceReuseRejected(t *testing.T) {
 	doc := b2SnapshotDoc(t, b2BaseCollected(t))
 	body := b2JSON(t, doc)
 	a.seq = 2
-	h2, _ := a.headers(wire.Report, time.Now().Unix(), nonce, body)
+	h2, _ := a.headers(wire.Report, b2SentAt(t, body), nonce, body)
 	status, resp := doPost(t, tc, "/v1/agent/report", h2, body)
 	if status != 409 || resp["error"] != "nonce_reuse" {
 		t.Fatalf("cross-endpoint nonce: %d %v, want 409 nonce_reuse", status, resp)
@@ -42,11 +42,12 @@ func TestB2PrivacySentinelRejectedBeforeStorage(t *testing.T) {
 	doc := b2Example(t, "report-snapshot.v1.json")
 	doc["report_id"] = b2UUID(t)
 	doc["collected_at"] = base
+	b2ShiftReportTimes(doc, base)
 	// Plant a credential-shaped sentinel in a non-identifier field.
 	doc["agent"].(map[string]any)["version"] = "password=supersecret"
 	body := b2JSON(t, doc)
 	a.seq = 1
-	h, _ := a.headers(wire.Report, time.Now().Unix(), b2Nonce(t), body)
+	h, _ := a.headers(wire.Report, b2SentAt(t, body), b2Nonce(t), body)
 	status, resp := doPost(t, tc, "/v1/agent/report", h, body)
 	if status != 400 || (resp["error"] != "invalid_request" && resp["error"] != "platform_mismatch") {
 		t.Fatalf("privacy sentinel: %d %v, want boundary rejection", status, resp)
@@ -67,6 +68,7 @@ func TestB2EventTagBindingAndPrivacyAudit(t *testing.T) {
 	events := b2Example(t, "report-events.v1.json")
 	events["report_id"] = b2UUID(t)
 	events["collected_at"] = base
+	b2ShiftReportTimes(events, base)
 	// The event example's detail uses the configured allowlisted inbound tag, so
 	// the first event report is accepted.
 	if status, resp := b2SendReport(t, tc, a, events, b2Nonce(t)); status != 200 || resp["result"] != "accepted" {
@@ -77,6 +79,7 @@ func TestB2EventTagBindingAndPrivacyAudit(t *testing.T) {
 	bad := b2Example(t, "report-events.v1.json")
 	bad["report_id"] = b2UUID(t)
 	bad["collected_at"] = base + 1
+	b2ShiftReportTimes(bad, base+1)
 	evs := bad["events"].([]any)
 	detail := evs[0].(map[string]any)["detail"].(map[string]any)
 	detail["inbound_tag"] = "not-configured"
@@ -88,6 +91,7 @@ func TestB2EventTagBindingAndPrivacyAudit(t *testing.T) {
 	privacy := b2Example(t, "report-snapshot.v1.json")
 	privacy["report_id"] = b2UUID(t)
 	privacy["collected_at"] = base
+	b2ShiftReportTimes(privacy, base)
 	privacy["agent"].(map[string]any)["version"] = "password=anothersecret"
 	if status, _ := b2SendReport(t, tc, a, privacy, b2Nonce(t)); status != 400 {
 		t.Fatalf("privacy sentinel status=%d, want 400", status)

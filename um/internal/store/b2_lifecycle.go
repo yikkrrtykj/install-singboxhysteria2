@@ -35,6 +35,12 @@ const (
 	MaxActiveNodesPerEvent    = 100
 	MaxArchivedEventsWithData = 10
 	MaxEventsCatalog          = 50
+
+	// Overlap planning constants (explicit bytes, not a promise about SQLite disk
+	// size). Active-only planning payload basis is 5 GiB; policy-B worst case is
+	// capped at 2x, i.e. 10 GiB of projected telemetry payload.
+	ActiveOnlyPlanningPayloadBytes int64 = 5 * 1024 * 1024 * 1024
+	OverlapBudgetMultiplier        int64 = 2
 )
 
 // Event lifecycle states.
@@ -215,6 +221,44 @@ func ensureEventActiveTx(ctx context.Context, tx *sql.Tx, eventID string, now in
 	return EventInfo{EventID: eventID, State: EventActive, CreatedAt: now, UpdatedAt: now}, nil
 }
 
+// OverlapBudget makes the policy-B cap explicit: unit-bearing actual archived
+// payload, the candidate event payload, the projected archived history and the
+// stable active-only planning limit. It is a payload-budget decision, NOT a
+// claim that it equals the SQLite file/disk hard limit.
+type OverlapBudget struct {
+	Unit                   string
+	ActiveOnlyPlanBytes    int64
+	BudgetBytes            int64
+	ArchivedStoredBytes    int64
+	CandidateBytes         int64
+	ProjectedArchivedBytes int64
+}
+
+func ComputeOverlapBudget(activeOnlyPlanBytes, archivedStoredBytes, candidateBytes int64) OverlapBudget {
+	return OverlapBudget{
+		Unit:                   "bytes",
+		ActiveOnlyPlanBytes:    activeOnlyPlanBytes,
+		BudgetBytes:            OverlapBudgetMultiplier * activeOnlyPlanBytes,
+		ArchivedStoredBytes:    archivedStoredBytes,
+		CandidateBytes:         candidateBytes,
+		ProjectedArchivedBytes: archivedStoredBytes + candidateBytes,
+	}
+}
+
+func (b OverlapBudget) Exceeds() bool { return b.ProjectedArchivedBytes > b.BudgetBytes }
+
+func (s *Store) overlapBudgetBasisBytes() int64 {
+	if s.overlapBudgetOverride > 0 {
+		return s.overlapBudgetOverride
+	}
+	return ActiveOnlyPlanningPayloadBytes
+}
+
+// SetOverlapBudgetForTest overrides only the planning basis for boundary tests.
+func (s *Store) SetOverlapBudgetForTest(activeOnlyPlanBytes int64) {
+	s.overlapBudgetOverride = activeOnlyPlanBytes
+}
+
 // eventPayloadBytesTx estimates the stored telemetry bytes of one event without
 // using row counts as a disk-capacity proof.
 func eventPayloadBytesTx(ctx context.Context, tx *sql.Tx, eventID string) (int64, error) {
@@ -310,12 +354,13 @@ func (s *Store) ArchiveEvent(ctx context.Context, eventID string, now int64) err
 	if err != nil {
 		return err
 	}
-	activeBytes, archivedBytes, err := activeArchivedPayloadBytesTx(ctx, tx)
+	_, archivedBytes, err := activeArchivedPayloadBytesTx(ctx, tx)
 	if err != nil {
 		return err
 	}
-	if archivedBytes+eventBytes > 2*activeBytes {
-		return &QuotaError{Kind: "retention_overlap", Limit: 2 * activeBytes, Current: archivedBytes + eventBytes}
+	budget := ComputeOverlapBudget(s.overlapBudgetBasisBytes(), archivedBytes, eventBytes)
+	if budget.Exceeds() {
+		return &QuotaError{Kind: "retention_overlap", Limit: budget.BudgetBytes, Current: budget.ProjectedArchivedBytes}
 	}
 	purgeAfter := now + PolicyBArchiveTailSeconds
 	if _, err := tx.ExecContext(ctx,

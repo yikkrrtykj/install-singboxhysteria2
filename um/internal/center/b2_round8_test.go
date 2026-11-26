@@ -46,9 +46,9 @@ func TestB2F4TagChangeBoundaryAndHistoricalSpool(t *testing.T) {
 	tc := startTestCenter(t)
 	a := enrollAgent(t, tc, store.NodeClassLinuxVPS, "linux")
 	base := b2BaseCollected(t)
-	// New tags effective at base+100: historical report at base uses old tags.
+	// New tags effective at base+20: historical report at base uses old tags.
 	if _, err := tc.store.UpdateNodeConfig(context.Background(), a.nodeID, nil,
-		[]store.InboundTag{{InboundTag: "other-in", Kind: "other"}}, 60, base+100); err != nil {
+		[]store.InboundTag{{InboundTag: "other-in", Kind: "other"}}, 60, base+20); err != nil {
 		t.Fatalf("tag update: %v", err)
 	}
 	// A report collected before the boundary uses the old allowlist (vless-in).
@@ -57,7 +57,7 @@ func TestB2F4TagChangeBoundaryAndHistoricalSpool(t *testing.T) {
 	}
 	// A report collected at the exact boundary uses the new tags and must reject
 	// the old inbound tag.
-	if status, resp := b2SendReport(t, tc, a, b2SnapshotDoc(t, base+100), b2Nonce(t)); status != 400 {
+	if status, resp := b2SendReport(t, tc, a, b2SnapshotDoc(t, base+20), b2Nonce(t)); status != 400 {
 		t.Fatalf("boundary tag report: %d %v, want 400", status, resp)
 	}
 }
@@ -145,6 +145,7 @@ func TestB2F6ReportIdentityAcrossDedupeWindow(t *testing.T) {
 	metrics := b2Example(t, "report-metrics.v1.json")
 	metrics["report_id"] = reportID
 	metrics["collected_at"] = base
+	b2ShiftReportTimes(metrics, base)
 	if status, resp := b2SendReport(t, tc, a, metrics, b2Nonce(t)); status != 409 || resp["error"] != "report_conflict" {
 		t.Fatalf("cross-type dedupe expiry: %d %v, want report_conflict", status, resp)
 	}

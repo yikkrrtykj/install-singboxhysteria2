@@ -814,6 +814,11 @@ func (s *Store) createMappingVersion(ctx context.Context, eventID, windowsNodeID
 		return fmt.Errorf("store: begin mapping version: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	// A mapping write is a normal event mutation: it must obey the same durable
+	// purge/graveyard/archive lifecycle gate as ingest/enrollment/config writes.
+	if _, err := (&Tx{tx: tx}).EventActiveTx(ctx, eventID); err != nil {
+		return err
+	}
 
 	// The window node must be a real windows_terminal node of this event.
 	var winClass, winEvent string

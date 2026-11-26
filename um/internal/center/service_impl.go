@@ -240,6 +240,14 @@ func (s *ServiceImpl) Enroll(ctx context.Context, req EnrollRequest) (EnrollResu
 	if err := s.verifySignature(req.Fields, req.Body, req.Signature, req.Fields.PublicKey); err != nil {
 		return EnrollResult{}, err
 	}
+	// Predictable enrollment-response schema violations are refused before the
+	// store commits node/key/config; the boundary still byte-validates the result.
+	if s.spki != "" {
+		raw, err := base64.RawURLEncoding.DecodeString(s.spki)
+		if err != nil || len(raw) != 32 {
+			return EnrollResult{}, apiErr(503, "storage_unavailable", true)
+		}
+	}
 	id, err := s.store.Enroll(ctx, store.TokenHash(req.Token), body.NodeClass, body.Host.OS, req.Fields.PublicKey, now)
 	if err != nil {
 		return EnrollResult{}, mapServiceError(err)
@@ -272,6 +280,21 @@ func (s *ServiceImpl) nodeConfig(ctx context.Context, nodeID string) (store.Node
 		return store.NodeConfig{}, mapServiceError(err)
 	}
 	return cfg, nil
+}
+
+// rejectionAuditKind maps a rolled-back API rejection to the security-ledger
+// kind used consistently by Report/Config/Rotate.
+func rejectionAuditKind(err error) string {
+	var ae *APIError
+	if errors.As(err, &ae) {
+		switch ae.Code {
+		case "nonce_reuse":
+			return "nonce_reuse"
+		case "report_conflict":
+			return "report_conflict"
+		}
+	}
+	return ""
 }
 
 // Report authenticates one report attempt and commits high-water, nonce/report
@@ -322,7 +345,7 @@ func (s *ServiceImpl) Report(ctx context.Context, req ReportRequest) (ReportResu
 	}
 	bodyHash := bodySHA(req.Body)
 	var disposition store.ReportDisposition
-	var cfg store.NodeConfig
+	var currentCfg store.NodeConfig
 	validationRejected := false
 	auditKind := ""
 	attempt := protocol.Attempt{
@@ -343,6 +366,14 @@ func (s *ServiceImpl) Report(ctx context.Context, req ReportRequest) (ReportResu
 			if err := validateClassConfigForClass(node.NodeClass, c); err != nil {
 				return err
 			}
+			cur, err := tx.ConfigTx(ctx, node.NodeID)
+			if err != nil {
+				return mapServiceError(err)
+			}
+			if err := validateClassConfigForClass(node.NodeClass, cur); err != nil {
+				return err
+			}
+			currentCfg = cur
 			opts := contract.ValidateOptions{TerminalConfigured: c.Sources["terminal"] || c.Sources["mihomo_api"]}
 			if err := contract.ValidateReportBodyWithSchemaSet(s.schemas, node.NodeClass, req.ReportType, req.Body, opts); err != nil {
 				validationRejected = true
@@ -370,7 +401,6 @@ func (s *ServiceImpl) Report(ctx context.Context, req ReportRequest) (ReportResu
 				auditKind = "nonce_reuse"
 				return apiErr(409, "nonce_reuse", false)
 			}
-			cfg = c
 			return nil
 		},
 		func(tx *store.Tx) (store.ReportDisposition, error) {
@@ -472,7 +502,7 @@ func (s *ServiceImpl) Report(ctx context.Context, req ReportRequest) (ReportResu
 	}
 	return ReportResult{
 		ReportID: env.ReportID, Result: ackResult, NextSeq: nextSeq,
-		ConfigVersion: cfg.ConfigVersion, ServerTime: now,
+		ConfigVersion: currentCfg.ConfigVersion, ServerTime: now,
 	}, nil
 }
 
@@ -592,6 +622,11 @@ func (s *ServiceImpl) Rotate(ctx context.Context, req RotateRequest) (RotateResu
 			return store.DispositionAccepted, nil
 		})
 	if err != nil {
+		if kind := rejectionAuditKind(err); kind != "" {
+			if _, aerr := s.store.AppendLedger(ctx, now, kind, node.NodeID, bodyHash); aerr != nil {
+				return RotateResult{}, apiErr(503, "storage_unavailable", true)
+			}
+		}
 		return RotateResult{}, mapServiceError(err)
 	}
 	// No post-commit config reread: the boundary writes the persisted rotate
@@ -634,6 +669,7 @@ func (s *ServiceImpl) Config(ctx context.Context, req ConfigRequest) (ConfigResu
 	}
 	var responseBody []byte
 	var configVersion int
+	bodyHash := bodySHA(req.Body)
 	attempt := protocol.Attempt{Gen: req.FieldsBootGen(), BootID: req.Fields.BootID, Seq: req.FieldsSeq(), Fingerprint: fp}
 	_, _, err = s.store.ApplyIngest(ctx, node.NodeID, attempt, fp,
 		func(tx *store.Tx) error {
@@ -675,6 +711,11 @@ func (s *ServiceImpl) Config(ctx context.Context, req ConfigRequest) (ConfigResu
 		},
 		func(tx *store.Tx) (store.ReportDisposition, error) { return store.DispositionAccepted, nil })
 	if err != nil {
+		if kind := rejectionAuditKind(err); kind != "" {
+			if _, aerr := s.store.AppendLedger(ctx, now, kind, node.NodeID, bodyHash); aerr != nil {
+				return ConfigResult{}, apiErr(503, "storage_unavailable", true)
+			}
+		}
 		return ConfigResult{}, mapServiceError(err)
 	}
 	return ConfigResult{Body: responseBody, ConfigVersion: configVersion, ServerTime: now}, nil
@@ -782,6 +823,31 @@ func validateReportSources(nodeClass, reportType string, body []byte, sources ma
 		if err := check("singbox_api", "clients"); err != nil {
 			return err
 		}
+		if nodeClass == store.NodeClassWindowsTerminal {
+			var term struct {
+				Terminal struct {
+					Selection struct {
+						Availability string `json:"availability"`
+					} `json:"selection"`
+					ActiveConnections struct {
+						Availability string `json:"availability"`
+					} `json:"active_connections"`
+				} `json:"terminal"`
+			}
+			if err := json.Unmarshal(body, &term); err != nil {
+				return apiErr(400, "invalid_request", false)
+			}
+			// selection and active_connections are independently authorized:
+			// selection is a terminal-source observation; active_connections is
+			// real Controller data and requires mihomo_api. A disabled source must
+			// report honest unavailable/null, never "ok" observation data.
+			if !sources["terminal"] && term.Terminal.Selection.Availability != "unavailable" {
+				return apiErr(400, "invalid_request", false)
+			}
+			if !sources["mihomo_api"] && term.Terminal.ActiveConnections.Availability != "unavailable" {
+				return apiErr(400, "invalid_request", false)
+			}
+		}
 	case "metrics":
 		var doc struct {
 			Availability map[string]string `json:"availability"`
@@ -810,12 +876,16 @@ func validateReportSources(nodeClass, reportType string, body []byte, sources ma
 		}
 		for _, e := range doc.Events {
 			switch e.Kind {
-			case "service_restart", "service_failure", "protocol_outage", "protocol_recovery":
-				if !sources["services"] && !sources["singbox_api"] {
+			case "service_restart", "service_failure":
+				if !sources["services"] {
+					return apiErr(400, "invalid_request", false)
+				}
+			case "protocol_outage", "protocol_recovery":
+				if !sources["singbox_api"] {
 					return apiErr(400, "invalid_request", false)
 				}
 			case "terminal_route_changed", "terminal_source_unavailable":
-				if !sources["terminal"] && !sources["mihomo_api"] {
+				if !sources["terminal"] {
 					return apiErr(400, "invalid_request", false)
 				}
 			}

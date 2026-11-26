@@ -89,6 +89,23 @@ func (s *Store) loadPurgeOp(ctx context.Context, eventID string) (PurgeOp, bool,
 	return op, true, nil
 }
 
+func loadPurgeOpTx(ctx context.Context, tx *sql.Tx, eventID string) (PurgeOp, bool, error) {
+	var op PurgeOp
+	var errText sql.NullString
+	err := tx.QueryRowContext(ctx,
+		`SELECT op_id,event_id,actor,started_at,updated_at,state,phase,deleted_rows,error
+		 FROM purge_ops WHERE event_id=? ORDER BY started_at DESC LIMIT 1`, eventID).
+		Scan(&op.OpID, &op.EventID, &op.Actor, &op.StartedAt, &op.UpdatedAt, &op.State, &op.Phase, &op.DeletedRows, &errText)
+	if errors.Is(err, sql.ErrNoRows) {
+		return PurgeOp{}, false, nil
+	}
+	if err != nil {
+		return PurgeOp{}, false, err
+	}
+	op.Error = errText.String
+	return op, true, nil
+}
+
 func (s *Store) updatePurgeOp(ctx context.Context, op PurgeOp) error {
 	_, err := s.db.ExecContext(ctx,
 		`UPDATE purge_ops SET updated_at=?,state=?,phase=?,deleted_rows=?,error=? WHERE op_id=?`,
@@ -153,19 +170,31 @@ func (s *Store) PurgeEvent(ctx context.Context, eventID, actor string, confirm b
 			_ = tx.Rollback()
 			return err
 		}
-		if err := eventBlockedTx(ctx, tx, eventID); err != nil && !errors.Is(err, ErrEventPurged) {
+		if existing, ok, err := loadPurgeOpTx(ctx, tx, eventID); err != nil {
 			_ = tx.Rollback()
 			return err
-		}
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO purge_ops(op_id,event_id,actor,started_at,updated_at,state,phase,deleted_rows,error)
-			 VALUES(?,?,?,?,?,?,?,0,NULL)`,
-			op.OpID, op.EventID, op.Actor, op.StartedAt, op.UpdatedAt, op.State, op.Phase); err != nil {
-			_ = tx.Rollback()
-			return fmt.Errorf("store: persist purge op: %w", err)
-		}
-		if err := tx.Commit(); err != nil {
-			return err
+		} else if ok && existing.State != "completed" {
+			// Another request won the race under the capacity lock; resume it
+			// instead of creating a duplicate incomplete operation.
+			op = existing
+			if err := tx.Commit(); err != nil {
+				return err
+			}
+		} else {
+			if err := eventBlockedTx(ctx, tx, eventID); err != nil && !errors.Is(err, ErrEventPurged) {
+				_ = tx.Rollback()
+				return err
+			}
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO purge_ops(op_id,event_id,actor,started_at,updated_at,state,phase,deleted_rows,error)
+				 VALUES(?,?,?,?,?,?,?,0,NULL)`,
+				op.OpID, op.EventID, op.Actor, op.StartedAt, op.UpdatedAt, op.State, op.Phase); err != nil {
+				_ = tx.Rollback()
+				return fmt.Errorf("store: persist purge op: %w", err)
+			}
+			if err := tx.Commit(); err != nil {
+				return err
+			}
 		}
 	}
 	if s.retentionHook != nil {
@@ -177,8 +206,8 @@ func (s *Store) PurgeEvent(ctx context.Context, eventID, actor string, confirm b
 		}
 	}
 
-	// Phase 1: telemetry batches. node_latest references snapshots, so clear
-	// pointers before deleting snapshot rows.
+	// Phase 1: telemetry batches. Each DELETE batch and its deleted_rows progress
+	// commit in one transaction; a crash therefore leaves exact on-disk progress.
 	if op.State == "purging" {
 		if _, err := s.db.ExecContext(ctx, `DELETE FROM node_latest WHERE event_id=?`, eventID); err != nil {
 			op.Error = "clear latest pointers: " + err.Error()
@@ -186,30 +215,60 @@ func (s *Store) PurgeEvent(ctx context.Context, eventID, actor string, confirm b
 			_ = s.updatePurgeOp(ctx, op)
 			return fmt.Errorf("store: purge latest pointers: %w", err)
 		}
-		for i, table := range []string{"snapshots", "report_metrics", "report_events", "report_event_reports"} {
-			where := "event_id = ?"
-			n, err := purgeDeleteBatched(ctx, s.db, s.retentionHook, table, where, op.EventID)
-			if err != nil {
-				op.Error = "telemetry batch failed: " + err.Error()
-				op.UpdatedAt = now
-				_ = s.updatePurgeOp(ctx, op)
-				return fmt.Errorf("store: purge telemetry %s: %w", table, err)
-			}
-			if n > 0 {
-				op.DeletedRows += n
-				if err := s.addPurgeProgress(ctx, op.OpID, n, fmt.Sprintf("telemetry:%s", table), now); err != nil {
+		for _, table := range []string{"snapshots", "report_metrics", "report_events", "report_event_reports"} {
+			for {
+				tx, err := s.db.BeginTx(ctx, nil)
+				if err != nil {
 					return err
 				}
 				if s.retentionHook != nil {
-					if err := s.retentionHook("purge:after_batch"); err != nil {
-						op.Error = "injected failure after telemetry batch"
+					if err := s.retentionHook("delete:" + table); err != nil {
+						_ = tx.Rollback()
+						op.Error = "injected failure before telemetry batch"
 						op.UpdatedAt = now
 						_ = s.updatePurgeOp(ctx, op)
 						return err
 					}
 				}
+				res, err := tx.ExecContext(ctx,
+					fmt.Sprintf(`DELETE FROM %s WHERE rowid IN (SELECT rowid FROM %s WHERE event_id=? ORDER BY rowid LIMIT %d)`, table, table, RetentionBatchRows),
+					eventID)
+				if err != nil {
+					_ = tx.Rollback()
+					op.Error = "telemetry batch failed: " + err.Error()
+					op.UpdatedAt = now
+					_ = s.updatePurgeOp(ctx, op)
+					return fmt.Errorf("store: purge telemetry %s: %w", table, err)
+				}
+				n, err := res.RowsAffected()
+				if err != nil {
+					_ = tx.Rollback()
+					return err
+				}
+				if n > 0 {
+					if _, err := tx.ExecContext(ctx,
+						`UPDATE purge_ops SET deleted_rows=deleted_rows+?,updated_at=?,phase=? WHERE op_id=?`,
+						n, now, "telemetry:"+table, op.OpID); err != nil {
+						_ = tx.Rollback()
+						return err
+					}
+				}
+				if err := tx.Commit(); err != nil {
+					return err
+				}
+				op.DeletedRows += n
+				if n > 0 && s.retentionHook != nil {
+					if err := s.retentionHook("purge:after_batch"); err != nil {
+						op.Error = "injected failure after committed telemetry batch"
+						op.UpdatedAt = now
+						_ = s.updatePurgeOp(ctx, op)
+						return err
+					}
+				}
+				if n < RetentionBatchRows {
+					break
+				}
 			}
-			_ = i
 		}
 		op.State = "mapping"
 		op.Phase = "mapping"
@@ -278,6 +337,18 @@ func (s *Store) PurgeEvent(ctx context.Context, eventID, actor string, confirm b
 			return err
 		}
 		defer func() { _ = tx.Rollback() }()
+		if err := lockCapacity(ctx, tx); err != nil {
+			return err
+		}
+		var already int
+		if err := tx.QueryRowContext(ctx, `SELECT 1 FROM event_graveyard WHERE event_id=?`, eventID).Scan(&already); err == nil {
+			// A prior attempt already completed the final transaction; do not
+			// duplicate tombstone/audit writes.
+			_ = tx.Rollback()
+			return nil
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE nodes SET state=?, retired_at=? WHERE event_id=?`, NodeRevoked, now, eventID); err != nil {
 			return fmt.Errorf("store: purge revoke nodes: %w", err)
@@ -320,7 +391,7 @@ func (s *Store) PurgeEvent(ctx context.Context, eventID, actor string, confirm b
 			return fmt.Errorf("store: purge tombstone: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx,
-			`UPDATE purge_ops SET state='completed',phase='completed',updated_at=?,error=NULL WHERE op_id=?`,
+			`UPDATE purge_ops SET state='completed',phase='completed',updated_at=?,error=NULL WHERE op_id=? AND state='finalizing'`,
 			now, op.OpID); err != nil {
 			return err
 		}

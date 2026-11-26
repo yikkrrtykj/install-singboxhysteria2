@@ -187,3 +187,22 @@ unchanged; deferred as a separate issue.
 
 Still deferred: B3 REC-17/18/27, B4 management UI/type-to-confirm purge, UM-C
 ingress, UM-E full disk-pressure/200-500 node performance/backup/restore.
+
+
+## Round-9 correction gate (C1–C4)
+
+| Finding | Implementation | Evidence |
+| --- | --- | --- |
+| C1 mapping gate/durable purge | `createMappingVersion` now runs `EventActiveTx` inside its transaction; the false-positive purge test was replaced with public `CreateMappingVersion` future `effective_from`, asserting active success and purging/purged lifecycle rejection; one incomplete `purge_ops` per event via partial unique index under capacity lock; DELETE batch + `deleted_rows` committed atomically; resume preserves progress; final completion guarded against duplicate tombstone/audit | `TestB2PurgeBlocksIngestAndEnrollmentConcurrently`, `TestB2PurgeSingleIncompleteOperation`, `TestB2PurgeBatchProgressSurvivesRestart`, ordinary UPDATE/DELETE mapping tests |
+| C2 enrollment response legality | production token creation enforces canonical UUIDv4 event id; Enroll defensively checks pre-existing token event id before consumption; invalid token test proves no consumption/partial node/key/config; SPKI static form checked before store commit | `TestB2EnrollmentEventIDUUIDv4`, red C2 log |
+| C3 overlap budget | explicit `OverlapBudget`/`ComputeOverlapBudget` in bytes: 5 GiB active-only planning basis, 10 GiB 2× projected-archived budget; separates archived actual/candidate/projected/budget; below/equal/above and last-active tests | `TestB2OverlapBudgetFormula`, `TestB2OverlapBudgetArchiveBoundary`, red C3 compile log |
+| C4 config authorization closure | effective-dated history fail-closed when no valid row; v8 migration re-anchors v7 backfill to fail-closed initial config at registration; UpdateNodeConfig rejects effective time before registration/latest history, same-second deterministic version rule; Windows selection vs active_connections independent terminal/mihomo checks; service vs singbox event kinds independent; Report uses historical config for validation and current in-transaction config version for ACK; nonce audits consistent across Report/Config/Rotate; no epoch backfill HTTP fixtures | `TestB2ConfigHistoryBoundsAndFailClosed`, `TestC4WindowsTerminalAndControllerSourcesIndependent`, `TestC4HistoricalConfigAndCurrentACKVersion`, `TestC4LinuxServicesAndSingboxApprovalIndependent` |
+
+Round-9 red evidence: `um127-round9-evidence/b2-round9-red-store.log`,
+`b2-round9-red-c3.log` (pre-fix `bc892591`: mapping during purging succeeded,
+invalid event id token accepted, backdated config accepted, explicit budget
+absent). Green: `full-v-green.log`.
+
+Still deferred: B4 management UI/type-to-confirm purge, B3 REC-17/18/27 and
+agent-local behavior, UM-C ingress, UM-E disk-pressure/200–500-node performance
+and backup/restore.

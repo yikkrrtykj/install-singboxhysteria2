@@ -39,23 +39,35 @@ The frozen wire contract permits honest `unavailable`/null/empty states and does
 not define what to do when a center config switch is turned off after an agent
 has spooled data.
 
-B2 behavior:
+B2 behavior (effective-dated model, replacing the old `updated_at` bypass):
 
-- a report whose `collected_at` is at or before the current config `updated_at`
-  is treated as **historical spool** and is not rejected merely because the
-  source switch is now disabled;
-- current data (collected after the config update) for a disabled source must be
-  honest `unavailable`/null/empty; fabricated `ok`/data is rejected as
-  `invalid_request`;
-- metrics follow the same historical rule; events keep generic agent/diagnostic
-  kinds legal, while service/protocol/terminal-specific kinds require their
-  source;
+- `node_config_history` is append-only and Report validates against the
+  configuration whose `effective_from` is at or before `collected_at`; enabling a
+  source later cannot retroactively authorize an earlier sample;
+- an enable→collect→disable sequence preserves authorization for the collection
+  interval, while current data from a disabled source must be honest
+  `unavailable`/null/empty; fabricated `ok`/data is `invalid_request`;
+- unrelated later updates (cadence/tags) do not widen an old authorization
+  window; if no history is effective at `collected_at`, Report fails closed
+  instead of borrowing a later config;
+- initial enrollment config is fail-closed at registration time; v7 databases
+  without historical evidence are re-anchored to that fail-closed initial row by
+  migration v8 (no fabricated old enable);
+- `effective_from` must not be earlier than node registration or the latest
+  history row; same-second updates are accepted and the higher config version is
+  the deterministic winner at that instant;
+- metrics/events/tag policy use the same effective-dated lookup; generic
+  diagnostics remain legal; events service/protocol/terminal kinds require their
+  specific switch; Windows terminal `selection` and `active_connections` are
+  authorized independently (`terminal` vs `mihomo_api`), with honest
+  `unavailable` required when the respective source is disabled;
 - `mihomo_api` remains false by default on Linux; Windows cannot enable
   Linux-only service/protocol collection; the center never authorizes a real
   Mihomo Controller in B2.
 
-**Proposal:** the contract should state the spool/config-update boundary
-explicitly in a future revision. B2's boundary is the config `updated_at`.
+The synthetic HTTP fixtures create a legitimate enrollment-time config history
+and future-offset report timestamps; they do not call
+`UpdateNodeConfig(now=0)` or otherwise backdate authorization.
 
 ## 4. Event lifecycle ownership
 
@@ -136,3 +148,43 @@ cannot be used to turn an old snapshot into metrics/events or a different body.
 Rejection audit is not best-effort: if the security ledger write for
 nonce_reuse/report_conflict/validation rejection fails, the request returns a
 retryable storage error instead of silently claiming the audit was recorded.
+
+
+## 12. C1 mapping lifecycle and durable purge operation details
+
+`store.go/createMappingVersion` now calls the full event lifecycle gate inside
+the mapping transaction; the same future `effective_from` succeeds for an active
+event and is rejected with the lifecycle error while purging/purged. B1
+immutability triggers remain active for all non-purge paths.
+
+`purge_ops` has a unique partial index for at most one incomplete operation per
+event, and the create/resume decision is made under the capacity lock. Each
+telemetry DELETE batch and its `deleted_rows` increment commit in the same
+transaction; resume never overwrites committed progress; final completion is
+guarded by the permanent graveyard row and `state='finalizing'`, so a repeated
+call cannot duplicate tombstone/audit writes.
+
+## 13. C2 enrollment UUIDv4 and response legality
+
+Production `CreateEnrollToken` requires a canonical lowercase UUIDv4 event id.
+`Enroll` defensively re-checks the token's event id before consuming the token or
+creating any node/key/config. A malformed pre-existing token row therefore
+returns an error with no token consumption and no partial identity. Static
+enrollment-response fields (including optional SPKI pin form) are checked before
+the store commit; generated node/key/salt fields have contract-valid forms.
+
+## 14. C3 overlap budget units
+
+`ComputeOverlapBudget` makes the policy-B cap explicit and unit-bearing:
+
+- active-only planning basis: `ActiveOnlyPlanningPayloadBytes` = 5 GiB of
+  telemetry **payload** (a planning unit, not a SQLite file/disk hard limit);
+- budget: 2× that basis (10 GiB projected archived payload);
+- inputs distinguished: actual archived stored payload, candidate event payload,
+  projected archived history, budget;
+- archive is refused when projected archived payload exceeds the budget; an
+  equal projection is allowed, and the last active event can archive within the
+  explicit cap.
+
+This does not replace UM-E real disk-pressure, VACUUM/free-space, or 200/500-node
+performance acceptance.

@@ -169,3 +169,21 @@ and backup/restore acceptance.
   reread config after commit.
 - Report identity is checked across the 8-day dedupe cache and 30-day telemetry,
   so an expired dedupe row cannot change report type/body.
+
+
+## Round-9 hardening
+
+- Mapping writes participate in the durable purge/archive/event lifecycle gate;
+  purge operations are unique/incomplete-guarded and batch progress commits with
+  the DELETE batch.
+- Enrollment event ids are validated as UUIDv4 at token issuance and defensively
+  at consumption; malformed pre-existing tokens cannot consume or create partial
+  identity.
+- Overlap budget is explicit in bytes with a 5 GiB active-only planning basis and
+  2× projected-archived cap; this is not a disk-capacity promise.
+- Configuration history is the sole authorization source for reports, fail-closed
+  without a valid effective row; v8 re-anchors v7 backfill to registration-time
+  fail-closed config; effective bounds/same-second rules are enforced; ACK
+  config_version is the current in-transaction version; Windows terminal
+  selection/active_connections and Linux service/protocol switches are
+  independently authorized.

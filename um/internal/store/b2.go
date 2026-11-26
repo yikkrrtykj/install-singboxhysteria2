@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -111,8 +112,8 @@ func (s *Store) CreateEnrollToken(ctx context.Context, tokenHash, eventID, nodeC
 	if strings.TrimSpace(tokenHash) == "" {
 		return invalidArgument("token_hash", "must not be empty")
 	}
-	if strings.TrimSpace(eventID) == "" {
-		return invalidArgument("event_id", "must not be empty")
+	if !IsUUIDv4(eventID) {
+		return invalidArgument("event_id", "must be a canonical lowercase UUIDv4")
 	}
 	if nodeClass != NodeClassLinuxVPS && nodeClass != NodeClassWindowsTerminal {
 		return invalidArgument("node_class", "must be linux_vps or windows_terminal")
@@ -210,6 +211,11 @@ func (s *Store) Enroll(ctx context.Context, tokenHash, nodeClass, hostOS, public
 	}
 	if tokenClass != nodeClass || tokenEvent == "" {
 		return EnrolledIdentity{}, ErrTokenScopeMismatch
+	}
+	if !IsUUIDv4(tokenEvent) {
+		// Defensive: a pre-existing malformed token row (e.g. from an old/manual
+		// insert) must not be consumed or create a node with an invalid response.
+		return EnrolledIdentity{}, ErrTokenInvalid
 	}
 	if _, err := ensureEventActiveTx(ctx, tx, tokenEvent, now); err != nil {
 		return EnrolledIdentity{}, err
@@ -823,12 +829,8 @@ func (t *Tx) ConfigAtTx(ctx context.Context, nodeID string, collectedAt int64) (
 		 ORDER BY effective_from DESC, config_version DESC LIMIT 1`, nodeID, collectedAt).
 		Scan(&cfg.NodeID, &cfg.EventID, &cfg.ConfigVersion, &cfg.CadenceSeconds, &src, &tags, &cfg.DeviceSalt, &cfg.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
-		err = t.tx.QueryRowContext(ctx,
-			`SELECT node_id,event_id,config_version,cadence_seconds,sources_json,expected_inbound_tags_json,device_salt,effective_from
-			 FROM node_config_history WHERE node_id=? ORDER BY effective_from ASC, config_version ASC LIMIT 1`, nodeID).
-			Scan(&cfg.NodeID, &cfg.EventID, &cfg.ConfigVersion, &cfg.CadenceSeconds, &src, &tags, &cfg.DeviceSalt, &cfg.UpdatedAt)
-	}
-	if errors.Is(err, sql.ErrNoRows) {
+		// No valid historical evidence: fail closed instead of borrowing a later
+		// authorization (or treating a backfilled current config as history).
 		return NodeConfig{}, ErrNotFound
 	}
 	if err != nil {
@@ -872,6 +874,16 @@ func (s *Store) UpdateNodeConfig(ctx context.Context, nodeID string, sources map
 	}
 	if err := eventBlockedTx(ctx, tx, node.EventID); err != nil {
 		return NodeConfig{}, err
+	}
+	if now < node.CreatedAt {
+		return NodeConfig{}, invalidArgument("effective_from", "must not be earlier than node registration")
+	}
+	var latestEffective sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `SELECT MAX(effective_from) FROM node_config_history WHERE node_id=?`, nodeID).Scan(&latestEffective); err != nil {
+		return NodeConfig{}, fmt.Errorf("store: read latest config effective time: %w", err)
+	}
+	if latestEffective.Valid && now < latestEffective.Int64 {
+		return NodeConfig{}, invalidArgument("effective_from", "must not be earlier than the latest config history")
 	}
 	cfg, err := t.ConfigTx(ctx, nodeID)
 	if err != nil {
@@ -973,6 +985,12 @@ func randomBytes(n int) ([]byte, error) {
 	}
 	return b, nil
 }
+
+var uuidV4Pattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+
+// IsUUIDv4 reports whether s is a canonical lowercase UUIDv4, the frozen
+// enrollment event_id/node_id form.
+func IsUUIDv4(s string) bool { return uuidV4Pattern.MatchString(s) }
 
 func randomUUIDv4() (string, error) {
 	b, err := randomBytes(16)
