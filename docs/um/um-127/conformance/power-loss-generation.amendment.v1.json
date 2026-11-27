@@ -5,7 +5,8 @@
   "base_contract": "docs/um/um-a/04-node-protocol-v1.md revision 5",
   "tracking": {
     "issue": 127,
-    "implementation_pr": 131
+    "implementation_pr": 131,
+    "amendment_pr": 132
   },
   "rules": [
     "A successful start of an enrolled runtime is a restart and increments generation by exactly one with a new 32-hex boot id, fsynced before network activity, including after an unclean exit or power loss.",
@@ -14,18 +15,27 @@
     "Restart replay preserves report_id/collected_at/type/body identity but uses the new generation and a fresh valid attempt; the center dedupes by report_id.",
     "The first new-generation replay may be duplicate but must atomically advance the new generation high-water with dedupe; no data is written for an already-stored report.",
     "A retired-generation request is stale_boot_generation; a same-generation different boot id is boot_identity_conflict; no fsynced payload may be lost.",
-    "No weakening of signature, nonce, fingerprint, dedupe, boot high-water, gap bounds, revocation, rotation-proof or fsync guarantees is permitted."
+    "No weakening of signature, nonce, fingerprint, dedupe, boot high-water, gap bounds, revocation, rotation-proof or fsync guarantees is permitted.",
+    "An unsynced/retired sequence is never reused; restart replay allocates a fresh attempt under the new generation."
   ],
   "cases": [
     {
       "id": "AMEND-REC-27-A",
+      "old_rev5_case": "REC-27 center exact-duplicate expectation",
       "scenario": "same_runtime_ack_loss_exact_retry",
       "restart": false,
+      "setup": {
+        "agent_generation": 3,
+        "boot_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "seq": 4,
+        "center_highest_gen": 3,
+        "center_last_seq": 4
+      },
       "expected": {
         "result": "duplicate",
-        "generation": "unchanged",
-        "boot_id": "unchanged",
-        "attempt": "same seq and fingerprint",
+        "generation": 3,
+        "boot_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "attempt": "same seq/sent_at/nonce/fingerprint",
         "high_water": "unchanged by the duplicate retry"
       }
     },
@@ -41,8 +51,10 @@
         "attempt": "fresh valid new-generation attempt",
         "payload_identity": "same report_id/collected_at/type/body",
         "high_water": "new generation and first accepted seq committed",
-        "data": "no second stored copy"
-      }
+        "data": "no second stored copy",
+        "retired_seq_reuse": false
+      },
+      "old_rev5_mapping": "Supersedes old REC-27 agent-side power-loss same-generation resume action; center duplicate expectation retained."
     },
     {
       "id": "AMEND-REC-27-C",
@@ -85,7 +97,12 @@
   ],
   "compatibility": {
     "old_rev5_vectors_unchanged": true,
-    "old_REC27_same_runtime_case_retained": true,
-    "new_records_required_for_restart_case": true
-  }
+    "old_REC27_center_exact_duplicate_retained": true,
+    "old_REC27_agent_power_loss_same_generation_superseded": true,
+    "new_case_required_for_restart_duplicate": true
+  },
+  "contract_revision": 5,
+  "contract_commit": "048fc170",
+  "destination_proposed_revision": "rev-6",
+  "illustrative_not_frozen": true
 }

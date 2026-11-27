@@ -50,8 +50,11 @@
 | [04-implementation-plan.md](04-implementation-plan.md) | 实施门禁与顺序、Go 复用/差距、UM-B1..UM-G、Go 分支同步、CI 要求（无 PR-A2） |
 | [05-owner-decisions.md](05-owner-decisions.md) | 18 项既有 + rev-5 方向/运行参数 + 门禁登记；全部非 APPROVED |
 | [conformance/transport-recovery.cases.json](conformance/transport-recovery.cases.json) | UM-B1/B2/B3 规范性恢复用例（REC-01..REC-30，rev-5 绑定） |
+| [09-power-loss-generation-amendment-draft.md](09-power-loss-generation-amendment-draft.md) | **DRAFT / NOT NORMATIVE** power-loss/process-restart generation amendment, REC-27 supersession/remap and approval/merge-hold path; companion JSON under `conformance/` |
 
 ## 5. 下一步（需 Owner 授权）
+
+0. 若 Owner 接受 power-loss generation 修订方向：先完成 #132 独立审查与 Owner 决策记录，再按 amendment 更新契约修订；在完成前 #131/#132 保持 Draft/MERGE HOLD/PRODUCTION HOLD。
 
 1. 独立审查 #126 rev-5（独立于 owner Round-2 方向），Owner 给合并授权 → 普通 Merge Commit 合并 #126 → 确认 main CI。
 2. #128 完成独立审查/合并门禁 → 合并 #128（保留原 PR，不建 PR-A2）。
