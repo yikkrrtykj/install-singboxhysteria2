@@ -25,21 +25,52 @@ jobs:
           Write-Host "whoami: $(whoami)"
           whoami /groups | Out-String | Write-Host
           sc.exe query | Out-String | Write-Host
-          & sc.exe create um-lab-env binPath= "cmd.exe /c ping -n 30 127.0.0.1 >nul" start= demand obj= "NT SERVICE\um-lab-env" password= "" | Out-Null
-          if ($LASTEXITCODE -ne 0) { throw "sc create virtual account failed: $LASTEXITCODE" }
-          try {
-            & sc.exe sidtype um-lab-env unrestricted | Out-Null
-            & sc.exe qc um-lab-env | Out-String | Write-Host
-            Start-Service um-lab-env
-            Start-Sleep -Seconds 2
-            Get-Service um-lab-env | Format-List Name,Status,StartType | Out-String | Write-Host
-            Get-CimInstance Win32_Service -Filter "Name='um-lab-env'" | Select-Object Name,StartName,State,ProcessId | Format-List | Out-String | Write-Host
-            & sc.exe showsid um-lab-env | Out-String | Write-Host
-            Stop-Service um-lab-env -Force
-          } finally {
-            & sc.exe delete um-lab-env | Out-Null
+          foreach ($name in @('um-lab-local','um-lab-virtual','um-lab-user','um-lab-virt2')) {
+            & sc.exe delete $name | Out-Null
           }
-
+          $bin = 'cmd.exe /c ping -n 30 127.0.0.1 >nul'
+          foreach ($variant in @(
+            @{ Name='um-lab-local'; Account='NT AUTHORITY\LocalService'; Password=$null },
+            @{ Name='um-lab-virtual'; Account='NT SERVICE\um-lab-virtual'; Password=$null },
+            @{ Name='um-lab-virt2'; Account='NT SERVICE\um-lab-virt2'; Password='' }
+          )) {
+            Write-Host "=== attempting $($variant.Name) as $($variant.Account) ==="
+            $args = @('create', $variant.Name, 'binPath=', $bin, 'start=', 'demand', 'obj=', $variant.Account)
+            if ($null -ne $variant.Password) { $args += @('password=', $variant.Password) }
+            & sc.exe @args 2>&1 | Write-Host
+            Write-Host "sc create exit=$LASTEXITCODE"
+            if ($LASTEXITCODE -eq 0) {
+              & sc.exe sidtype $variant.Name unrestricted 2>&1 | Write-Host
+              & sc.exe qc $variant.Name | Out-String | Write-Host
+              Start-Service $variant.Name -ErrorAction SilentlyContinue
+              Start-Sleep -Seconds 1
+              Get-CimInstance Win32_Service -Filter "Name='$($variant.Name)'" | Select-Object Name,StartName,State,ProcessId | Format-List | Out-String | Write-Host
+              & sc.exe showsid $variant.Name | Out-String | Write-Host
+              Stop-Service $variant.Name -Force -ErrorAction SilentlyContinue
+              & sc.exe delete $variant.Name | Out-Null
+            }
+          }
+          # Dedicated local non-admin user fallback probe.
+          $user = 'um-lab-agent'
+          $pass = 'Lab-' + [guid]::NewGuid().ToString('N') + '!aA1'
+          try {
+            $secure = ConvertTo-SecureString $pass -AsPlainText -Force
+            if (Get-LocalUser -Name $user -ErrorAction SilentlyContinue) { Remove-LocalUser -Name $user }
+            New-LocalUser -Name $user -Password $secure -AccountNeverExpires -PasswordNeverExpires -UserMayNotChangePassword | Out-Null
+            Add-LocalGroupMember -Group 'Users' -Member $user
+            & sc.exe create um-lab-user binPath= $bin start= demand obj= ".\$user" password= $pass 2>&1 | Write-Host
+            Write-Host "dedicated user sc create exit=$LASTEXITCODE"
+            if ($LASTEXITCODE -eq 0) {
+              & sc.exe sidtype um-lab-user unrestricted | Out-Null
+              Start-Service um-lab-user
+              Start-Sleep -Seconds 1
+              Get-CimInstance Win32_Service -Filter "Name='um-lab-user'" | Select-Object Name,StartName,State,ProcessId | Format-List | Out-String | Write-Host
+              Stop-Service um-lab-user -Force
+            }
+          } finally {
+            & sc.exe delete um-lab-user | Out-Null
+            Remove-LocalUser -Name $user -ErrorAction SilentlyContinue
+          }
   linux-systemd-environment:
     name: linux-systemd-environment
     runs-on: ubuntu-24.04
