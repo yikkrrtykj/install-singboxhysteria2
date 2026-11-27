@@ -21,6 +21,7 @@ $agent = Join-Path $lab 'um-agent.exe'
 $center = Join-Path $lab 'um-center.exe'
 $labtool = Join-Path $lab 'um-lab.exe'
 $labSvc = Join-Path $lab 'um-lab-service.exe'
+$serviceLog = Join-Path $lab 'service.log'
 $tokenFile = Join-Path $lab 'bootstrap.token'
 $profilePath = Join-Path $lab 'mihomo-profile.json'
 $secretPath = Join-Path $lab 'mihomo.secret'
@@ -108,7 +109,7 @@ if (-not $healthy) { Fail 'center did not become healthy' }
 # ---------------------------------------------------------------------------
 # Service account + enrollment under that account (DPAPI CurrentUser).
 # ---------------------------------------------------------------------------
-$enrollPath = '"' + $labSvc + '" "' + $agent + '" enroll --state-dir "' + $state + '" --center "http://127.0.0.1:18080" --node-class windows_terminal --token-file "' + $tokenFile + '"'
+$enrollPath = '"' + $labSvc + '" --log "' + $serviceLog + '" "' + $agent + '" enroll --state-dir "' + $state + '" --center "http://127.0.0.1:18080" --node-class windows_terminal --token-file "' + $tokenFile + '"'
 Invoke-Native 'sc.exe' @('create', $svc, 'binPath=', $enrollPath, 'start=', 'demand', 'obj=', "NT SERVICE\$svc")
 Invoke-Native 'sc.exe' @('sidtype', $svc, 'unrestricted')
 $sid = Get-ServiceSid $svc
@@ -118,6 +119,7 @@ Invoke-Native 'icacls' @($tokenFile, '/grant', "*${sid}:R")
 try { Start-Service -Name $svc } catch {
   & sc.exe qc $svc | Out-String | Write-Host
   & sc.exe query $svc | Out-String | Write-Host
+  if (Test-Path -LiteralPath $serviceLog) { Get-Content -LiteralPath $serviceLog | Out-String | Write-Host }
   Get-WinEvent -FilterHashtable @{LogName='System'; StartTime=(Get-Date).AddMinutes(-5)} -ErrorAction SilentlyContinue | Select-Object -First 20 | Format-List TimeCreated,Id,ProviderName,Message | Out-String | Write-Host
   Get-WinEvent -FilterHashtable @{LogName='Application'; StartTime=(Get-Date).AddMinutes(-5)} -ErrorAction SilentlyContinue | Select-Object -First 20 | Format-List TimeCreated,Id,ProviderName,Message | Out-String | Write-Host
   throw
@@ -137,7 +139,7 @@ if ($qc -notmatch [regex]::Escape("NT SERVICE\$svc")) { Fail 'SCM start account 
 # Rotation provisional key must also be DPAPI protected. Run rotate through the
 # same temporary service; the actual service later recovers the proof.
 # ---------------------------------------------------------------------------
-$rotatePath = '"' + $labSvc + '" "' + $agent + '" rotate --state-dir "' + $state + '" --center "http://127.0.0.1:18080" --node-class windows_terminal'
+$rotatePath = '"' + $labSvc + '" --log "' + $serviceLog + '" "' + $agent + '" rotate --state-dir "' + $state + '" --center "http://127.0.0.1:18080" --node-class windows_terminal'
 Set-AgentService $rotatePath
 Start-Service -Name $svc
 Wait-ServiceStatus $svc 'Stopped'
@@ -197,7 +199,7 @@ Invoke-Native 'icacls' @($profilePath, '/grant', "*${sid}:R")
 Invoke-Native 'icacls' @($secretPath, '/grant', "*${sid}:R")
 
 # Provision the protected R1 bundle through the same service account.
-$provisionPath = '"' + $labSvc + '" "' + $agent + '" r1-provision --state-dir "' + $state + '" --profile "' + $profilePath + '" --secret-file "' + $secretPath + '" --owner-reference "OD-P3-R1/isolated-lab/windows-github-actions"'
+$provisionPath = '"' + $labSvc + '" --log "' + $serviceLog + '" "' + $agent + '" r1-provision --state-dir "' + $state + '" --profile "' + $profilePath + '" --secret-file "' + $secretPath + '" --owner-reference "OD-P3-R1/isolated-lab/windows-github-actions"'
 Set-AgentService $provisionPath
 Start-Service -Name $svc
 Wait-ServiceStatus $svc 'Stopped'

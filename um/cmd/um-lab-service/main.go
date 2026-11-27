@@ -14,6 +14,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"time"
@@ -22,16 +23,23 @@ import (
 )
 
 type labService struct {
-	target string
-	args   []string
+	target  string
+	args    []string
+	logPath string
 }
 
 func main() {
-	if len(os.Args) < 2 {
+	args := os.Args[1:]
+	logPath := ""
+	if len(args) >= 2 && args[0] == "--log" {
+		logPath = args[1]
+		args = args[2:]
+	}
+	if len(args) < 1 {
 		os.Exit(2)
 	}
-	target := os.Args[1]
-	if err := svc.Run("um-agent", &labService{target: target, args: os.Args[2:]}); err != nil {
+	target := args[0]
+	if err := svc.Run("um-agent", &labService{target: target, args: args[1:], logPath: logPath}); err != nil {
 		os.Exit(1)
 	}
 }
@@ -42,11 +50,31 @@ func (s *labService) Execute(_ []string, requests <-chan svc.ChangeRequest, stat
 	defer cancel()
 	child := exec.CommandContext(ctx, s.target, s.args...)
 	child.Env = os.Environ()
+	var logFile *os.File
+	if s.logPath != "" {
+		logFile, _ = os.OpenFile(s.logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+		if logFile != nil {
+			defer logFile.Close()
+			fmt.Fprintf(logFile, "um-lab-service: start %s %v\n", s.target, s.args)
+			child.Stdout = logFile
+			child.Stderr = logFile
+		}
+	}
 	if err := child.Start(); err != nil {
+		if logFile != nil {
+			fmt.Fprintf(logFile, "start error: %v\n", err)
+		}
 		return false, 1
 	}
 	done := make(chan error, 1)
-	go func() { done <- child.Wait() }()
+	go func() {
+		err := child.Wait()
+		if logFile != nil {
+			fmt.Fprintf(logFile, "child exit: %v\n", err)
+			_ = logFile.Sync()
+		}
+		done <- err
+	}()
 	status <- svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown}
 	for {
 		select {
