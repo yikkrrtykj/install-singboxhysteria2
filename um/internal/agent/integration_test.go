@@ -591,6 +591,60 @@ func TestAgentRunRecoversCommittedProofBeforeConfig(t *testing.T) {
 	}
 }
 
+func TestAgentOnceFlushRecoversProofBeforeConfig(t *testing.T) {
+	tc := startAgentCenter(t)
+	var dropProof atomic.Bool
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		resp, err := http.DefaultTransport.RoundTrip(req)
+		if err != nil {
+			return nil, err
+		}
+		if dropProof.Load() && strings.HasSuffix(req.URL.Path, "/report") {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			return nil, errors.New("simulated proof ACK loss")
+		}
+		return resp, nil
+	})}
+	dir := t.TempDir()
+	r := newTestRuntime(t, tc, dir, unavailableCollector{}, client)
+	ctx := context.Background()
+	if err := r.Enroll(ctx, tc.token); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.PullConfig(ctx); err != nil {
+		t.Fatal(err)
+	}
+	old, _ := r.Identity()
+	if err := r.Rotate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	dropProof.Store(true)
+	_ = r.Flush(ctx) // center commits the proof, ACK lost
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(dir, cleanShutdownFile)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatal(err)
+	}
+	r2 := newTestRuntime(t, tc, dir, unavailableCollector{}, nil)
+	defer r2.Close()
+	// This is exactly the `um-agent run --once` ordering.
+	if err := r2.Flush(ctx); err != nil {
+		t.Fatalf("once proof recovery: %v", err)
+	}
+	if err := r2.PullConfig(ctx); err != nil {
+		t.Fatalf("once config after proof recovery: %v", err)
+	}
+	got, _ := r2.Identity()
+	if got.KeyID == old.KeyID {
+		t.Fatal("once path did not persist the recovered identity")
+	}
+	if _, err := os.Stat(filepath.Join(dir, failClosedFile)); err == nil {
+		t.Fatal("once path wrote fail-closed marker")
+	}
+}
+
 func TestAgentProofRotationExpiredClearsIntent(t *testing.T) {
 	tc := startAgentCenter(t)
 	var expire atomic.Bool
