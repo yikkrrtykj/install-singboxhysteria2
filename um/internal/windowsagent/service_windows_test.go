@@ -52,7 +52,7 @@ func TestDPAPIRejectsImpossibleInput(t *testing.T) {
 			t.Fatalf("scope %d was accepted", scope)
 		}
 	}
-	if _, err := NewDPAPIProtector(DPAPIUserScope, make([]byte, maxEntropyBytes+1)); err == nil {
+	if _, err := NewDPAPIProtector(DPAPIUserScope, make([]byte, 1025)); err == nil {
 		t.Fatal("oversized DPAPI entropy was accepted")
 	}
 	if _, err := NewDPAPIProtector(DPAPIMachineScope, nil); err != nil {

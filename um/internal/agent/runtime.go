@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -58,7 +59,11 @@ type Runtime struct {
 	terminal         error
 	revoked          bool
 	lastCollect      int64
+	lastMetrics      int64
 	lastConfigCheck  int64
+	lastAckedGen     uint64
+	lastAckedBootID  string
+	lastAckedSeq     uint64
 	clockOffset      int64
 	sentStartupEvent bool
 	lastResult       string
@@ -421,9 +426,74 @@ func ReportFields(identity Identity, attempt Attempt) wire.Fields {
 	}
 }
 
+var (
+	collectSourceKeys = []string{"system", "services", "singbox_api", "mihomo_api", "terminal", "events"}
+	inboundTagPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+	deviceSaltPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{43}$`)
+)
+
+func validInboundKind(kind string) bool {
+	return kind == "reality" || kind == "hysteria2" || kind == "other"
+}
+
+// validateConfigForClass enforces the frozen class/source/tag rules on the
+// agent side before a config can be applied. The center also enforces these
+// rules; this second check prevents a malformed config response, a corrupted
+// local config, or a cross-class value from widening collection permission.
+func validateConfigForClass(class string, c Config) error {
+	if class != "linux_vps" && class != "windows_terminal" {
+		return errors.New("agent: invalid node class")
+	}
+	if c.V != 1 || c.NodeClass != class || c.ConfigVersion < 1 ||
+		c.Cadence < 30 || c.Cadence > 300 ||
+		!deviceSaltPattern.MatchString(c.DeviceSalt) || len(c.Collect) != len(collectSourceKeys) {
+		return errors.New("agent: invalid config fields")
+	}
+	for _, key := range collectSourceKeys {
+		if _, ok := c.Collect[key]; !ok {
+			return errors.New("agent: invalid config source set")
+		}
+	}
+	// Reject keys outside the frozen six. len(Collect)==6 plus all six known keys
+	// already implies this, but keep the explicit check for clarity.
+	for key := range c.Collect {
+		found := false
+		for _, known := range collectSourceKeys {
+			if key == known {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return errors.New("agent: unknown config source")
+		}
+	}
+	switch class {
+	case "linux_vps":
+		if c.Collect["terminal"] || c.Collect["mihomo_api"] {
+			return errors.New("agent: linux_vps config enables a windows-only source")
+		}
+		if len(c.Tags) == 0 || len(c.Tags) > 8 {
+			return errors.New("agent: linux_vps config requires 1..8 expected inbound tags")
+		}
+		seen := make(map[string]bool, len(c.Tags))
+		for _, tag := range c.Tags {
+			if !inboundTagPattern.MatchString(tag.InboundTag) || !validInboundKind(tag.Kind) || seen[tag.InboundTag] {
+				return errors.New("agent: invalid/duplicate expected inbound tag")
+			}
+			seen[tag.InboundTag] = true
+		}
+	case "windows_terminal":
+		if c.Collect["services"] || c.Collect["singbox_api"] || len(c.Tags) != 0 {
+			return errors.New("agent: windows_terminal config enables a linux-only source or carries tags")
+		}
+	}
+	return nil
+}
+
 func (r *Runtime) configFromResponse(c Config) (AgentConfig, error) {
-	if c.ConfigVersion < 1 || c.Cadence < 30 || c.Cadence > 300 || len(c.Collect) != 6 {
-		return AgentConfig{}, errors.New("agent: invalid config")
+	if err := validateConfigForClass(r.opts.NodeClass, c); err != nil {
+		return AgentConfig{}, err
 	}
 	return AgentConfig{Version: stateVersion, ConfigVersion: c.ConfigVersion, Cadence: c.Cadence,
 		Collect: cloneBoolMap(c.Collect), DeviceSalt: c.DeviceSalt, ServerTime: c.ServerTime,
@@ -495,6 +565,7 @@ func (r *Runtime) pullConfigLocked(ctx context.Context) error {
 	if err := r.state.saveConfig(ac); err != nil {
 		return err
 	}
+	r.recordAckedAttempt(ctl.Attempt)
 	if err := r.state.clearControl(); err != nil {
 		return err
 	}
@@ -606,14 +677,45 @@ func (r *Runtime) flushLocked(ctx context.Context) error {
 	}
 	for _, rec := range recs {
 		if err := r.sendRecordLocked(ctx, ident, rec); err != nil {
+			if errors.Is(err, ErrPayloadRejected) {
+				// The terminal payload was moved to quarantine. Continue with the
+				// next record instead of stopping the queue (contract §6.2).
+				continue
+			}
 			return err
 		}
 	}
 	return nil
 }
 
+// recordAckedAttempt tracks the last transport sequence actually accepted by
+// the center so a later pending attempt is refreshed rather than sent out of
+// order (the center's sequence high-water is per boot generation).
+func (r *Runtime) recordAckedAttempt(a Attempt) {
+	if a.Generation != r.lastAckedGen || a.BootID != r.lastAckedBootID {
+		r.lastAckedGen = a.Generation
+		r.lastAckedBootID = a.BootID
+		r.lastAckedSeq = a.Seq
+		return
+	}
+	if a.Seq > r.lastAckedSeq {
+		r.lastAckedSeq = a.Seq
+	}
+}
+
+func (r *Runtime) attemptNeedsRefresh(a Attempt) bool {
+	boot, ok := r.state.Boot()
+	if !ok {
+		return true
+	}
+	if a.Generation != boot.Generation || a.BootID != boot.BootID {
+		return true
+	}
+	return a.Generation == r.lastAckedGen && a.BootID == r.lastAckedBootID && a.Seq <= r.lastAckedSeq
+}
+
 func (r *Runtime) sendRecordLocked(ctx context.Context, ident Identity, rec SpoolRecord) error {
-	if r.nowUnix()-rec.Attempt.SentAt > 240 {
+	if r.attemptNeedsRefresh(rec.Attempt) || r.nowUnix()-rec.Attempt.SentAt > 240 {
 		a, err := r.nextAttempt()
 		if err != nil {
 			return err
@@ -655,7 +757,7 @@ func (r *Runtime) sendRecordLocked(ctx context.Context, ident Identity, rec Spoo
 		return r.fail(errors.New("agent: ACK report id mismatch"))
 	}
 	exhausted := ack.NextSeq == nil
-	if err := r.applyAck(ack); err != nil && !exhausted {
+	if err := r.applyAck(ack, rec.Attempt); err != nil && !exhausted {
 		return err
 	}
 	if ack.Result == "accepted" || ack.Result == "duplicate" || ack.Result == "stale_ignored" {
@@ -674,7 +776,7 @@ func (r *Runtime) sendRecordLocked(ctx context.Context, ident Identity, rec Spoo
 // LastResult reports the last ACK result for diagnostics.
 func (r *Runtime) LastResult() string { r.mu.Lock(); defer r.mu.Unlock(); return r.lastResult }
 
-func (r *Runtime) applyAck(ack Ack) error {
+func (r *Runtime) applyAck(ack Ack, attempt Attempt) error {
 	boot, ok := r.state.Boot()
 	if !ok {
 		return ErrBootStateCorrupt
@@ -697,6 +799,7 @@ func (r *Runtime) applyAck(ack Ack) error {
 			return err
 		}
 	}
+	r.recordAckedAttempt(attempt)
 	return nil
 }
 
@@ -714,13 +817,14 @@ func (r *Runtime) handleReportError(err error, rec SpoolRecord) error {
 		return r.fail(ErrSequenceConflict)
 	case "generation_exhausted", "sequence_exhausted":
 		return r.fail(ErrGenerationExhausted)
-	case "invalid_request", "platform_mismatch":
+	case "invalid_request", "platform_mismatch", "report_conflict":
 		// Preserve the record for operator inspection; never silently delete a
-		// payload the center did not accept.
+		// payload the center did not accept. The record is out of the send path,
+		// so the queue can continue with later records.
 		if qerr := r.state.spool.Quarantine(rec.ID, ce.Code); qerr != nil && !errors.Is(qerr, os.ErrNotExist) {
 			return qerr
 		}
-		return &CenterError{Status: ce.Status, Code: ce.Code, Retryable: false, ServerTime: ce.ServerTime}
+		return fmt.Errorf("%w: %s", ErrPayloadRejected, ce.Code)
 	default:
 		return ce
 	}
@@ -752,6 +856,12 @@ func (r *Runtime) Drive(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		// Enforce the 7-day spool retention even while a long outage keeps the
+		// sender inside this loop. Retention policy removal is the only deletion
+		// here; ACKed records are removed separately.
+		if err := r.state.spool.Prune(r.nowUnix()); err != nil {
+			return err
+		}
 		err := r.Flush(ctx)
 		if err == nil {
 			return nil
@@ -759,7 +869,7 @@ func (r *Runtime) Drive(ctx context.Context) error {
 		if !IsRetryable(err) {
 			return err
 		}
-		if err := r.opts.Sleep(ctx, r.backoff); err != nil {
+		if err := r.opts.Sleep(ctx, r.retryDelay(err)); err != nil {
 			return err
 		}
 		if r.backoff < r.opts.MaxBackoff {
@@ -769,6 +879,48 @@ func (r *Runtime) Drive(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+// retryDelay applies a bounded Retry-After hint and a small jitter so many
+// agents recovering from the same outage do not synchronize their retries.
+func (r *Runtime) retryDelay(err error) time.Duration {
+	delay := r.backoff
+	var ce *CenterError
+	if errors.As(err, &ce) && ce.RetryAfterS != nil {
+		hint := time.Duration(*ce.RetryAfterS) * time.Second
+		if hint > delay {
+			delay = hint
+		}
+	}
+	if delay > r.opts.MaxBackoff {
+		delay = r.opts.MaxBackoff
+	}
+	if delay < time.Second {
+		return delay
+	}
+	// +/-20% jitter, never below one second or above the configured cap.
+	maxAdd := int64(delay / 5)
+	if maxAdd > 0 {
+		b, err := randomBytes(8)
+		if err == nil {
+			var n int64
+			for _, v := range b {
+				n = (n << 8) | int64(v)
+			}
+			if n < 0 {
+				n = -n
+			}
+			offset := n%(2*maxAdd+1) - maxAdd
+			delay += time.Duration(offset)
+		}
+	}
+	if delay < time.Second {
+		delay = time.Second
+	}
+	if delay > r.opts.MaxBackoff {
+		delay = r.opts.MaxBackoff
+	}
+	return delay
 }
 
 // Run performs the periodic collection/report loop. Transient network failures
@@ -797,6 +949,12 @@ func (r *Runtime) Run(ctx context.Context) error {
 			}
 			r.lastConfigCheck = now
 		}
+		// Drain any existing backlog before creating new work. This keeps a full
+		// spool from permanently blocking already-fsynced records: recovery can
+		// make progress even if the next report cannot be queued yet.
+		if err := r.Drive(ctx); err != nil {
+			return err
+		}
 		if !r.sentStartupEvent {
 			if _, err := r.QueueReport(ctx, "events"); err == nil {
 				r.sentStartupEvent = true
@@ -821,6 +979,17 @@ func (r *Runtime) Run(ctx context.Context) error {
 			r.mu.Lock()
 			r.lastCollect = now
 			r.mu.Unlock()
+		}
+		if now-r.lastMetrics >= 60 {
+			if _, err := r.QueueReport(ctx, "metrics"); err == nil {
+				r.lastMetrics = now
+			} else if !errors.Is(err, ErrUnsupported) {
+				return err
+			} else {
+				// Windows terminal metrics are contract-deferred; do not retry it
+				// every cadence or synthesize a report.
+				r.lastMetrics = now
+			}
 		}
 		if err := r.Drive(ctx); err != nil {
 			return err
@@ -863,7 +1032,7 @@ func (r *Runtime) Rotate(ctx context.Context) error {
 			}
 			a.Nonce = rot.Nonce
 			ctl = ControlState{Version: stateVersion, Kind: "rotate", Attempt: a,
-				NewPublicKey: rot.NewPublicKey, NewPrivateKey: rot.NewPrivateKey}
+				NewPublicKey: rot.NewPublicKey}
 			if err := r.state.saveControl(ctl); err != nil {
 				return err
 			}
@@ -881,7 +1050,7 @@ func (r *Runtime) Rotate(ctx context.Context) error {
 	rot := RotationState{Version: stateVersion, Nonce: a.Nonce, NewPublicKey: base64.RawURLEncoding.EncodeToString(pub),
 		NewPrivateKey: base64.RawURLEncoding.EncodeToString(priv), State: "awaiting_proof"}
 	ctl := ControlState{Version: stateVersion, Kind: "rotate", Attempt: a, Body: []byte(`{}`),
-		NewPublicKey: rot.NewPublicKey, NewPrivateKey: rot.NewPrivateKey}
+		NewPublicKey: rot.NewPublicKey}
 	if err := r.state.saveRotation(rot); err != nil {
 		return err
 	}
@@ -939,6 +1108,7 @@ func (r *Runtime) driveRotationLocked(ctx context.Context, ident Identity, ctl C
 	if !ok {
 		return ErrRotationMismatch
 	}
+	r.recordAckedAttempt(ctl.Attempt)
 	rot.NewKeyID = resp.NewKeyID
 	rot.Response = nil
 	rot.State = "awaiting_proof"
@@ -982,6 +1152,21 @@ func (r *Runtime) driveProofLocked(ctx context.Context, ident Identity, rot Rota
 	ack, err := r.client.Report(ctx, proofIdentity, a, "snapshot", body)
 	if err != nil {
 		var ce *CenterError
+		if errors.As(err, &ce) && ce.Code == "stale_timestamp" {
+			r.learnClock(ce)
+			a, err = r.nextAttempt()
+			if err != nil {
+				return err
+			}
+			a.Fingerprint, err = wire.Fingerprint(ReportFields(proofIdentity, a), body)
+			if err != nil {
+				return err
+			}
+			ack, err = r.client.Report(ctx, proofIdentity, a, "snapshot", body)
+		}
+	}
+	if err != nil {
+		var ce *CenterError
 		if errors.As(err, &ce) && ce.Code == "revoked_key" {
 			// Provisional key was rejected/expired: discard the local intent and
 			// continue with the still-active old key.
@@ -994,7 +1179,7 @@ func (r *Runtime) driveProofLocked(ctx context.Context, ident Identity, rot Rota
 	if ack.ReportID != id {
 		return r.fail(errors.New("agent: proof ACK id mismatch"))
 	}
-	if err := r.applyAck(ack); err != nil {
+	if err := r.applyAck(ack, a); err != nil {
 		return err
 	}
 	ident.KeyID = rot.NewKeyID
@@ -1017,5 +1202,16 @@ func (r *Runtime) Close() error {
 		return nil
 	}
 	r.closed = true
-	return r.state.Close()
+	var first error
+	if err := r.state.Close(); err != nil {
+		first = err
+	}
+	if r.collector != nil {
+		if closer, ok := r.collector.(interface{ Close() error }); ok {
+			if err := closer.Close(); err != nil && first == nil {
+				first = err
+			}
+		}
+	}
+	return first
 }

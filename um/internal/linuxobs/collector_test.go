@@ -192,7 +192,7 @@ func TestEventsContractValidAgentStarted(t *testing.T) {
 	if event.Kind != "agent_started" || event.Severity != "info" || event.At != testCollectedAt {
 		t.Fatalf("event = %+v", event)
 	}
-	if event.Detail.AgentVersion != "1.2.3" {
+	if detail, ok := event.Detail.(map[string]any); !ok || detail["agent_version"] != "1.2.3" {
 		t.Fatalf("event detail = %+v", event.Detail)
 	}
 	if !reportIDPattern.MatchString(event.EventID) {
@@ -833,8 +833,56 @@ func TestMalformedProcDataIsUnavailable(t *testing.T) {
 	}
 }
 
-// TestEventsWithoutEventsSourceStaysLegal covers the frozen center rule that
-// generic agent events remain legal when the events switch is disabled.
+// TestEventsG7SourceAuthorizationUnproven verifies the frozen diagnostic event
+// is emitted when singbox_api is enabled without the versioned P1-10 proof, and
+// is absent once the proof is explicitly recorded locally.
+func TestEventsG7SourceAuthorizationUnproven(t *testing.T) {
+	collector, _, _, _ := newFakeCollector(t)
+	rc := reportContext([]string{"system", "singbox_api", "events"}, testExpectedTags())
+	raw, err := collector.Events(context.Background(), rc)
+	if err != nil {
+		t.Fatalf("Events: %v", err)
+	}
+	validateEventsBody(t, raw)
+	body := unmarshalEvents(t, raw)
+	if len(body.Events) != 2 {
+		t.Fatalf("events=%d, want agent_started + agent_error", len(body.Events))
+	}
+	errEvent := body.Events[1]
+	if errEvent.Kind != "agent_error" || errEvent.Severity != "warning" ||
+		errEvent.EventID == body.Events[0].EventID || !reportIDPattern.MatchString(errEvent.EventID) {
+		t.Fatalf("agent_error event = %+v", errEvent)
+	}
+	detail, ok := errEvent.Detail.(map[string]any)
+	if !ok || detail["code"] != "source_authorization_unproven" {
+		t.Fatalf("agent_error detail = %+v", errEvent.Detail)
+	}
+	// Retrying the same payload keeps the same event id (spool idempotency).
+	retryRaw, err := collector.Events(context.Background(), rc)
+	if err != nil {
+		t.Fatalf("Events retry: %v", err)
+	}
+	if retry := unmarshalEvents(t, retryRaw); retry.Events[1].EventID != errEvent.EventID {
+		t.Fatalf("agent_error event id is not retry-stable")
+	}
+	collector.SingBoxSourceAuthorized = true
+	provenRaw, err := collector.Events(context.Background(), rc)
+	if err != nil {
+		t.Fatalf("Events proven: %v", err)
+	}
+	if proven := unmarshalEvents(t, provenRaw); len(proven.Events) != 1 {
+		t.Fatalf("proven events=%d, want only agent_started", len(proven.Events))
+	}
+	// A disabled source never emits the source-specific diagnostic.
+	disabledRaw, err := collector.Events(context.Background(), reportContext([]string{"system"}, testExpectedTags()))
+	if err != nil {
+		t.Fatalf("Events disabled: %v", err)
+	}
+	if disabled := unmarshalEvents(t, disabledRaw); len(disabled.Events) != 1 {
+		t.Fatalf("disabled events=%d, want only agent_started", len(disabled.Events))
+	}
+}
+
 func TestEventsWithoutEventsSourceStaysLegal(t *testing.T) {
 	collector, _, _, _ := newFakeCollector(t)
 	raw, err := collector.Events(context.Background(), reportContext([]string{"system"}, nil))

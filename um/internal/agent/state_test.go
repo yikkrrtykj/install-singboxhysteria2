@@ -6,10 +6,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -188,7 +188,7 @@ func TestControlStateJSONRoundTrip(t *testing.T) {
 	s, _ := OpenState(dir)
 	defer s.Close()
 	ctl := ControlState{Version: stateVersion, Kind: "rotate", Attempt: Attempt{Generation: 1, BootID: strings.Repeat("a", 32), Seq: 1, SentAt: 1, Nonce: "n"},
-		NewPublicKey: "pub", NewPrivateKey: "priv"}
+		NewPublicKey: "pub"}
 	if err := s.saveControl(ctl); err != nil {
 		t.Fatalf("save control: %v", err)
 	}
@@ -197,28 +197,64 @@ func TestControlStateJSONRoundTrip(t *testing.T) {
 		t.Fatalf("control file invalid: %v", err)
 	}
 	got, ok := s.Control()
-	if !ok || got.Kind != "rotate" || got.NewPrivateKey != "priv" {
+	if !ok || got.Kind != "rotate" || got.NewPublicKey != "pub" {
 		t.Fatalf("control roundtrip: %+v", got)
 	}
 }
 
 func TestStateStaleLockRecoveredOnlyWhenOwnerDead(t *testing.T) {
 	dir := t.TempDir()
+	// A leftover lock file is not evidence of a live writer: the OS lock is the
+	// authority, so a file left by a crashed process must not block recovery.
 	if err := os.WriteFile(filepath.Join(dir, lockFile), []byte("deadbeef 999999\n"), 0o600); err != nil {
 		t.Fatalf("seed stale lock: %v", err)
 	}
 	s, err := OpenState(dir)
 	if err != nil {
-		t.Fatalf("OpenState with provably-dead lock owner: %v", err)
+		t.Fatalf("OpenState with leftover lock file: %v", err)
 	}
 	if err := s.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
-	// A lock owned by this live process must never be stolen.
-	if err := os.WriteFile(filepath.Join(dir, lockFile), []byte("livetoken "+strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
-		t.Fatalf("seed live lock: %v", err)
+	// A process that actually holds the OS lock must never be joined.
+	held, err := OpenState(dir)
+	if err != nil {
+		t.Fatalf("OpenState for held lock: %v", err)
 	}
 	if _, err := OpenState(dir); !errors.Is(err, ErrLocked) {
+		_ = held.Close()
 		t.Fatalf("live lock open = %v, want ErrLocked", err)
+	}
+	if err := held.Close(); err != nil {
+		t.Fatalf("close held: %v", err)
+	}
+}
+
+func TestSpoolSameSecondUsesSequenceOrder(t *testing.T) {
+	dir := t.TempDir()
+	sp, err := openSpool(filepath.Join(dir, "spool"), filepath.Join(dir, "quarantine"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().Unix()
+	for _, seq := range []uint64{3, 1, 2} {
+		rec := testRecord(fmt.Sprintf("same-%d", seq), now)
+		rec.Attempt.Seq = seq
+		rec.Body = []byte(fmt.Sprintf(`{"seq":%d}`, seq))
+		if err := sp.Enqueue(rec); err != nil {
+			t.Fatalf("enqueue seq %d: %v", seq, err)
+		}
+	}
+	recs, err := sp.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recs) != 3 {
+		t.Fatalf("records=%d", len(recs))
+	}
+	for i, want := range []uint64{1, 2, 3} {
+		if recs[i].Attempt.Seq != want {
+			t.Fatalf("record %d seq=%d, want %d (same-second order must follow allocation order)", i, recs[i].Attempt.Seq, want)
+		}
 	}
 }

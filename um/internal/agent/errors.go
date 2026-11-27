@@ -28,10 +28,11 @@ var (
 // CenterError is a frozen-vocabulary error returned by the center. The exact
 // body is not retained; only the stable code/status/retryability are exposed.
 type CenterError struct {
-	Status     int
-	Code       string
-	Retryable  bool
-	ServerTime int64
+	Status      int
+	Code        string
+	Retryable   bool
+	ServerTime  int64
+	RetryAfterS *int
 }
 
 func (e *CenterError) Error() string {

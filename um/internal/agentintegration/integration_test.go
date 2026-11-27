@@ -124,3 +124,47 @@ func TestWindowsCollectorToRealCenter(t *testing.T) {
 		t.Fatalf("real center did not persist Windows snapshot: %v", err)
 	}
 }
+
+func TestAgentRunSchedulesSnapshotMetricsAndEvents(t *testing.T) {
+	const eventID = "aa1b2c3d-4e5f-4a6b-8c9d-0e1f2a3b4c5d"
+	tc := startRealCenter(t, store.NodeClassLinuxVPS, eventID)
+	r, err := agent.NewRuntime(agent.Options{
+		StateDir: t.TempDir(), CenterURL: tc.url, NodeClass: store.NodeClassLinuxVPS,
+		HostOS: "linux", AgentVersion: "1.0.0", Collector: &linuxobs.Collector{AgentVersion: "1.0.0"},
+		Sleep: func(ctx context.Context, _ time.Duration) error {
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewRuntime: %v", err)
+	}
+	ctx := context.Background()
+	if err := r.Enroll(ctx, tc.token); err != nil {
+		t.Fatalf("Enroll: %v", err)
+	}
+	if err := r.PullConfig(ctx); err != nil {
+		t.Fatalf("PullConfig: %v", err)
+	}
+	runCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if err := r.Run(runCtx); err == nil {
+		t.Fatal("Run unexpectedly returned without context cancellation")
+	}
+	if err := r.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	stats, err := tc.store.CapacityStats(ctx)
+	if err != nil {
+		t.Fatalf("CapacityStats: %v", err)
+	}
+	st := r.Status()
+	t.Logf("run status after cancellation: %+v", st)
+	ident, _ := r.Identity()
+	if _, err := tc.store.GetLatestSnapshot(ctx, ident.NodeID); err != nil {
+		t.Logf("latest snapshot: %v", err)
+	}
+	if stats.Snapshots == 0 || stats.Metrics == 0 || stats.Events == 0 {
+		t.Fatalf("Run did not persist snapshot/metrics/events: %+v", stats)
+	}
+}

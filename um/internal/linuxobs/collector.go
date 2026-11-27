@@ -135,10 +135,17 @@ type Collector struct {
 	// ServiceProbe overrides the read-only systemd unit observer. When nil,
 	// services are reported unavailable: no D-Bus client, no systemctl exec.
 	ServiceProbe ServiceProbe
-	// SingBoxProbe overrides the sing-box API observer. When nil, protocols
-	// and traffic are reported unavailable. NewSingBoxClient provides the
-	// bounded read-only HTTP client; see the package limitations.
+	// SingBoxProbe overrides the legacy Clash-compatible observer. When nil,
+	// protocols/traffic use ServiceAPIProbe if present, otherwise unavailable.
 	SingBoxProbe SingBoxProbe
+	// ServiceAPIProbe is the official sing-box 1.14 service.api observer. It
+	// carries probe-observed cumulative totals and is preferred over the legacy
+	// active-connection-only SingBoxProbe.
+	ServiceAPIProbe ServiceAPIObserver
+	// SingBoxSourceAuthorized is the versioned server-side authorization-proof
+	// gate (P1-10). It defaults to false: an enabled but unproven source emits
+	// agent_error code=source_authorization_unproven and stays unavailable.
+	SingBoxSourceAuthorized bool
 	// AgentVersion is the semantic version embedded in agent.version and in
 	// the agent_started event. Empty uses BuildVersion. A value that does not
 	// match the frozen version grammar is a configuration error.
@@ -285,6 +292,21 @@ func (c *Collector) Events(ctx context.Context, rc agent.ReportContext) ([]byte,
 			Detail:   agentStartedDetail{AgentVersion: version},
 		}},
 	}
+	// P1-10/G7: an enabled source without a versioned server-side authorization
+	// proof is still unavailable and MUST emit the closed diagnostic event. The
+	// event is stable across retries of the same report.
+	if sourceEnabled(rc, sourceSingBoxAPI) && !c.SingBoxSourceAuthorized {
+		body.Events = append(body.Events, eventEntry{
+			EventID:  agentErrorEventID(rc.ReportID, "source_authorization_unproven"),
+			At:       rc.CollectedAt,
+			Kind:     "agent_error",
+			Severity: "warning",
+			Detail:   agentErrorDetail{Code: "source_authorization_unproven"},
+		})
+	}
+	// The events source switch is intentionally not required for the generic
+	// agent_started lifecycle event; source-specific diagnostics above are only
+	// emitted when their source is configured.
 	return marshalReport("events", body)
 }
 
@@ -376,6 +398,16 @@ func (c *Collector) observeSingBox(ctx context.Context, rc agent.ReportContext) 
 		return protocols, traffic, nil, protocolsAvailability, trafficAvailability
 	}
 
+	// Prefer the official service.api observer: it carries probe-observed
+	// cumulative per-inbound totals rather than only active-connection bytes.
+	if c.ServiceAPIProbe != nil {
+		rich, err := c.ServiceAPIProbe.ObserveServiceAPI(ctx)
+		if err == nil {
+			return projectServiceAPIObservation(expected, rich, rc.CollectedAt)
+		}
+		return protocols, traffic, nil, protocolsAvailability, trafficAvailability
+	}
+
 	observation, err := c.singBoxProbe().ObserveSingBox(ctx)
 	if err != nil {
 		return protocols, traffic, nil, protocolsAvailability, trafficAvailability
@@ -436,6 +468,115 @@ func (c *Collector) observeSingBox(ctx context.Context, rc agent.ReportContext) 
 		activeConnections = &activeTotal
 	}
 	return protocols, traffic, activeConnections, protocolsAvailability, trafficAvailability
+}
+
+// projectServiceAPIObservation maps the richer service.api accumulator to the
+// frozen snapshot traffic/protocol shapes. Totals are probe-observed cumulative
+// lower bounds (active authoritative counters plus finalized closed lifecycles
+// banked once); if the accumulator could not attribute any event, traffic is
+// rendered unavailable instead of presenting a potentially incomplete total as
+// exact. Active-connection bytes are never used as lifetime totals. When a tag
+// is absent, its counters stay null and traffic is partial.
+func projectServiceAPIObservation(expected []authorizedTag, obs ServiceAPIObservation,
+	collectedAt int64) (
+	protocols []protocolEntry,
+	traffic []trafficEntry,
+	activeConnections *int64,
+	protocolsAvailability string,
+	trafficAvailability string,
+) {
+	protocols = make([]protocolEntry, 0, len(expected))
+	traffic = make([]trafficEntry, 0, len(expected))
+	protocolsAvailability = availabilityUnavailable
+	trafficAvailability = availabilityUnavailable
+	if !obs.Connected || obs.SkippedEvents > 0 || obs.IdentityConflicts > 0 {
+		return protocols, traffic, nil, protocolsAvailability, trafficAvailability
+	}
+
+	observed := 0
+	var activeTotal int64
+	activeValid := true
+	allTotals := true
+	for _, tag := range expected {
+		evidence, seen := obs.Inbounds[tag.tag]
+		state := "unknown"
+		reason := "unknown"
+		var uplink, downlink *int64
+		if seen {
+			observed++
+			state, reason = "up", "ok"
+			if evidence.TotalsAvailable {
+				if value, ok := contractCounter(evidence.UplinkTotalBytes); ok {
+					uplink = &value
+				}
+				if value, ok := contractCounter(evidence.DownlinkTotalBytes); ok {
+					downlink = &value
+				}
+			}
+			if uplink == nil || downlink == nil {
+				allTotals = false
+			}
+			if evidence.ActiveConnections < 0 ||
+				evidence.ActiveConnections > maxContractActiveConns-activeTotal {
+				activeValid = false
+			} else {
+				activeTotal += evidence.ActiveConnections
+			}
+		}
+		protocols = append(protocols, protocolEntry{
+			Kind:       tag.kind,
+			InboundTag: tag.tag,
+			State:      state,
+			Reason:     reason,
+			ObservedAt: collectedAt,
+		})
+		traffic = append(traffic, trafficEntry{
+			Scope:              trafficScopeProtocol,
+			InboundTag:         tag.tag,
+			UplinkTotalBytes:   uplink,
+			DownlinkTotalBytes: downlink,
+		})
+	}
+	if observed == len(expected) {
+		protocolsAvailability = availabilityOK
+	} else {
+		protocolsAvailability = availabilityPartial
+	}
+	if allTotals {
+		// Probe-observed cumulative lower bound. The schema has no distinct
+		// "lower bound" state; the service.api limitation is documented and the
+		// value is never the active-connection-only sum. Any skipped/conflicting
+		// event makes the whole traffic projection unavailable above.
+		trafficAvailability = availabilityOK
+	} else {
+		trafficAvailability = availabilityPartial
+	}
+	if activeValid && activeTotal <= maxContractActiveConns {
+		activeConnections = &activeTotal
+	}
+	return protocols, traffic, activeConnections, protocolsAvailability, trafficAvailability
+}
+
+// Close releases optional persistent probes. The agent runtime calls this at
+// shutdown so a service.api reader goroutine and its loopback connection do not
+// survive the process lifetime.
+func (c *Collector) Close() error {
+	var first error
+	if c.ServiceAPIProbe != nil {
+		if closer, ok := c.ServiceAPIProbe.(interface{ Close() error }); ok {
+			if err := closer.Close(); err != nil && first == nil {
+				first = err
+			}
+		}
+	}
+	if c.ServiceProbe != nil {
+		if closer, ok := c.ServiceProbe.(interface{ Close() error }); ok {
+			if err := closer.Close(); err != nil && first == nil {
+				first = err
+			}
+		}
+	}
+	return first
 }
 
 // authorizedTag is one validated center-expected inbound tag.

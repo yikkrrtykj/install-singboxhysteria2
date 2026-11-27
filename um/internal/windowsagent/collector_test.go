@@ -494,16 +494,29 @@ func TestEventsContract(t *testing.T) {
 		requireNoPrivacySentinels(t, raw, []string{rc.Config.DeviceSalt})
 	})
 
-	t.Run("terminal source not authorized", func(t *testing.T) {
+	t.Run("no source authorized", func(t *testing.T) {
 		mock := &mockObserver{selection: observedSelection(windowsobs.AReality, 0)}
 		collector := newCollector(t, mock)
-		raw, err := collector.Events(context.Background(), testReportContext(t, testSources(false, true)))
+		raw, err := collector.Events(context.Background(), testReportContext(t, testSources(false, false)))
 		if err != nil {
 			t.Fatal(err)
 		}
 		requireContractEvents(t, raw)
 		body := decodeEvents(t, raw)
 		if len(body.Events) != 1 || body.Events[0].Kind != "agent_started" {
+			t.Fatalf("events = %+v", body.Events)
+		}
+	})
+
+	t.Run("active-connections source only without observer", func(t *testing.T) {
+		collector := newCollector(t, nil)
+		raw, err := collector.Events(context.Background(), testReportContext(t, testSources(false, true)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		requireContractEvents(t, raw)
+		body := decodeEvents(t, raw)
+		if len(body.Events) != 2 || body.Events[1].Kind != "terminal_source_unavailable" {
 			t.Fatalf("events = %+v", body.Events)
 		}
 	})

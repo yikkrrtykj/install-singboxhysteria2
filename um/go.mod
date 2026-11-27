@@ -3,6 +3,7 @@ module github.com/yikkrrtykj/install-singboxhysteria2/um
 go 1.27.4
 
 require (
+	github.com/godbus/dbus/v5 v5.2.4
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3
 	golang.org/x/sys v0.34.0
 	modernc.org/sqlite v1.38.2

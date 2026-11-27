@@ -69,6 +69,9 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $PlanOnly = [bool]$WhatIfPreference
+if ($ServiceName -ne 'um-agent') {
+  Fail 'the um-agent SCM wrapper uses the fixed service name ''um-agent''; a different -ServiceName is not supported by this build'
+}
 
 function Fail([string]$msg) {
   Write-Error "install-agent-service: $msg"
@@ -188,6 +191,15 @@ $aclArgs = @(
 )
 if ($serviceSid) { $aclArgs += @('/grant:r', "*$($serviceSid):(OI)(CI)M") }
 Invoke-Step "apply restrictive ACL to $StateDir" { & icacls @aclArgs | Out-Null }
+
+# The SCM wrapper writes closed-code failures to the Application log. Create the
+# event source only for a real apply; this requires elevation and creates no
+# secret/credential.
+Invoke-Step "create Application log source 'um-agent'" {
+  if (-not [System.Diagnostics.EventLog]::SourceExists('um-agent')) {
+    New-EventLog -LogName Application -Source 'um-agent'
+  }
+}
 
 # ---------------------------------------------------------------------------
 # Service creation (Manual start; no automatic start/enable)

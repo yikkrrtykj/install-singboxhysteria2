@@ -154,7 +154,7 @@ if command -v systemctl >/dev/null 2>&1; then
   SYSTEMD_MAJOR="${SYSTEMD_MAJOR:-0}"
 fi
 log "target: user=$AGENT_USER group=$AGENT_GROUP state=$STATE_DIR center=$CENTER_URL"
-log "systemd major detected: $SYSTEMD_MAJOR (noexec drop-in installed only on >=254)"
+log "systemd major detected: $SYSTEMD_MAJOR (noexec drop-in installed only on >=248)"
 
 if [ -e "$UNIT_PATH" ] && [ "$UPGRADE" -eq 0 ]; then
   die "$UNIT_PATH already exists; rerun with --upgrade only after reviewing the change"
@@ -231,7 +231,9 @@ else
   warn "runbook source not found next to this checkout ($RUNBOOK_SRC); unit Documentation= will be a dangling local path"
 fi
 
-if [ "$SYSTEMD_MAJOR" -ge 254 ] 2>/dev/null; then
+# ExecPaths=/NoExecPaths= were introduced in systemd 248 (official NEWS).
+# Install the noexec drop-in only where the running systemd supports it.
+if [ "$SYSTEMD_MAJOR" -ge 248 ] 2>/dev/null; then
   act install -d -m 0755 -o root -g root "$DROPIN_DIR"
   act install -m 0644 -o root -g root "$SCRIPT_DIR/um-agent-noexec.conf" "$DROPIN_PATH"
 else
@@ -244,8 +246,8 @@ if command -v systemd-analyze >/dev/null 2>&1; then
     if systemd-analyze verify "$UNIT_PATH" >/dev/null 2>&1; then
       log "systemd-analyze verify: OK"
     else
-      warn "systemd-analyze verify reported issues; inspect before starting the service"
       systemd-analyze verify "$UNIT_PATH" 2>&1 | sed 's/^/[systemd-analyze] /' >&2 || true
+      die "systemd-analyze verify failed; the unit is not installed as a working service"
     fi
   else
     log "DRY   systemd-analyze verify $UNIT_PATH"

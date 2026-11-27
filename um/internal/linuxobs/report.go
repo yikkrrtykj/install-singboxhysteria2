@@ -128,13 +128,19 @@ type agentStartedDetail struct {
 	AgentVersion string `json:"agent_version"`
 }
 
-// eventEntry is one frozen events[] element.
+// agentErrorDetail is the closed detail object of an agent_error event.
+type agentErrorDetail struct {
+	Code string `json:"code"`
+}
+
+// eventEntry is one frozen events[] element. Detail is one of the closed
+// per-kind detail objects; the JSON shape is selected by Kind.
 type eventEntry struct {
-	EventID  string             `json:"event_id"`
-	At       int64              `json:"at"`
-	Kind     string             `json:"kind"`
-	Severity string             `json:"severity"`
-	Detail   agentStartedDetail `json:"detail"`
+	EventID  string `json:"event_id"`
+	At       int64  `json:"at"`
+	Kind     string `json:"kind"`
+	Severity string `json:"severity"`
+	Detail   any    `json:"detail"`
 }
 
 // eventsBody is a report-events.v1 body.
@@ -164,7 +170,18 @@ func validateReportContext(rc agent.ReportContext) error {
 // frozen event_id grammar requires that shape even though the value is not
 // random, because it is an idempotency key rather than a secret).
 func agentStartedEventID(reportID string) string {
-	sum := sha256.Sum256([]byte(agentStartedEventIDSalt + "\n" + reportID))
+	return derivedEventID(agentStartedEventIDSalt, reportID)
+}
+
+// agentErrorEventID derives a stable idempotency key from the report identity
+// and the closed error code. A retry of the same spooled report keeps the same
+// event id.
+func agentErrorEventID(reportID, code string) string {
+	return derivedEventID(agentStartedEventIDSalt+"|error|"+code, reportID)
+}
+
+func derivedEventID(salt, reportID string) string {
+	sum := sha256.Sum256([]byte(salt + "\n" + reportID))
 	var bytes [16]byte
 	copy(bytes[:], sum[:16])
 	bytes[6] = (bytes[6] & 0x0f) | 0x40

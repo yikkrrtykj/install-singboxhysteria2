@@ -16,6 +16,10 @@ const (
 	SpoolMaxBytes int64 = 32 << 20
 	// SpoolMaxAge is the frozen B3 spool retention.
 	SpoolMaxAge = 7 * 24 * time.Hour
+	// QuarantineMaxBytes bounds terminal-rejected/corrupt records kept for
+	// operator inspection. Quarantine is deliberately smaller than the spool and
+	// is pruned oldest-first; it is never part of the send path.
+	QuarantineMaxBytes int64 = 8 << 20
 )
 
 // Attempt is the immutable transport attempt persisted with a spool record.
@@ -45,14 +49,21 @@ type SpoolRecord struct {
 // Spool is a single-writer durable queue. All writes are fsync'ed before the
 // caller may send the record.
 type Spool struct {
-	dir        string
-	quarantine string
-	maxBytes   int64
-	maxAge     time.Duration
-	prepared   int64
+	dir             string
+	quarantine      string
+	maxBytes        int64
+	maxAge          time.Duration
+	quarantineBytes int64
+	prepared        int64
 }
 
 func openSpool(dir, quarantine string) (*Spool, error) {
+	if err := rejectLinksInPath(dir); err != nil {
+		return nil, err
+	}
+	if err := rejectLinksInPath(quarantine); err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
@@ -65,7 +76,8 @@ func openSpool(dir, quarantine string) (*Spool, error) {
 	if err := os.Chmod(quarantine, 0o700); err != nil {
 		return nil, err
 	}
-	return &Spool{dir: dir, quarantine: quarantine, maxBytes: SpoolMaxBytes, maxAge: SpoolMaxAge}, nil
+	return &Spool{dir: dir, quarantine: quarantine, maxBytes: SpoolMaxBytes,
+		maxAge: SpoolMaxAge, quarantineBytes: QuarantineMaxBytes}, nil
 }
 
 // Close is a no-op: the State lock owns single-writer exclusion.
@@ -81,13 +93,21 @@ func (s *Spool) SetLimits(maxBytes int64, maxAge time.Duration) {
 	}
 }
 
+// SetQuarantineLimit overrides the quarantine byte budget for tests only.
+func (s *Spool) SetQuarantineLimit(maxBytes int64) {
+	if maxBytes > 0 {
+		s.quarantineBytes = maxBytes
+	}
+}
+
 func (s *Spool) filename(rec SpoolRecord) string {
 	return filepath.Join(s.dir, fmt.Sprintf("%020d-%s.json", rec.CreatedAt, rec.ID))
 }
 
-// Enqueue fsyncs a record before returning. If the spool exceeds its age/byte
-// budget, the oldest records (never the just-written record unless it alone
-// exceeds the hard cap) are removed by the same policy pass.
+// Enqueue fsyncs a record before returning. Capacity is fail-closed: a record
+// that would exceed the hard byte cap is rejected and every already-fsynced
+// record is left untouched. Expired records are removed by the age policy
+// before the capacity check.
 func (s *Spool) Enqueue(rec SpoolRecord) error {
 	if rec.Version == 0 {
 		rec.Version = stateVersion
@@ -156,6 +176,9 @@ func (s *Spool) List() ([]SpoolRecord, error) {
 	out := make([]SpoolRecord, 0, len(names))
 	for _, name := range names {
 		path := filepath.Join(s.dir, name)
+		if err := rejectLink(path); err != nil {
+			return nil, err
+		}
 		data, err := os.ReadFile(path)
 		if err != nil {
 			return nil, err
@@ -170,6 +193,25 @@ func (s *Spool) List() ([]SpoolRecord, error) {
 		rec.path = path
 		out = append(out, rec)
 	}
+	// A spool record's attempt is allocated before the record is enqueued, so
+	// records created in the same epoch second must be sent in sequence order.
+	// Keep the oldest collection time first, but use the persisted enqueue
+	// sequence as the tie-breaker instead of the random report UUID.
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].CreatedAt != out[j].CreatedAt {
+			return out[i].CreatedAt < out[j].CreatedAt
+		}
+		if out[i].Attempt.Generation != out[j].Attempt.Generation {
+			return out[i].Attempt.Generation < out[j].Attempt.Generation
+		}
+		if out[i].Attempt.BootID != out[j].Attempt.BootID {
+			return out[i].Attempt.BootID < out[j].Attempt.BootID
+		}
+		if out[i].Attempt.Seq != out[j].Attempt.Seq {
+			return out[i].Attempt.Seq < out[j].Attempt.Seq
+		}
+		return out[i].ID < out[j].ID
+	})
 	return out, nil
 }
 
@@ -237,7 +279,63 @@ func (s *Spool) quarantineFile(path, reason string) error {
 	if err := os.Rename(path, target); err != nil {
 		return err
 	}
-	return syncDir(s.dir)
+	if err := syncDir(s.dir); err != nil {
+		return err
+	}
+	if err := s.pruneQuarantine(); err != nil {
+		return err
+	}
+	return syncDir(s.quarantine)
+}
+
+// pruneQuarantine enforces the bounded operator-inspection budget. Only files
+// already moved out of the send path are eligible; unsent spool records are
+// never touched here.
+func (s *Spool) pruneQuarantine() error {
+	entries, err := os.ReadDir(s.quarantine)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	type qfile struct {
+		path    string
+		size    int64
+		modTime int64
+	}
+	files := make([]qfile, 0, len(entries))
+	var total int64
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			return err
+		}
+		files = append(files, qfile{path: filepath.Join(s.quarantine, e.Name()), size: info.Size(), modTime: info.ModTime().UnixNano()})
+		total += info.Size()
+	}
+	if total <= s.quarantineBytes {
+		return nil
+	}
+	sort.Slice(files, func(i, j int) bool {
+		if files[i].modTime == files[j].modTime {
+			return files[i].path < files[j].path
+		}
+		return files[i].modTime < files[j].modTime
+	})
+	for _, f := range files {
+		if total <= s.quarantineBytes {
+			break
+		}
+		if err := os.Remove(f.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		total -= f.size
+	}
+	return nil
 }
 
 func sanitizeReason(v string) string {
@@ -253,27 +351,28 @@ func sanitizeReason(v string) string {
 	return v
 }
 
-// Prune removes expired records and oldest records exceeding the byte budget.
-// It returns the number removed. ACKed records are normally removed separately;
-// capacity eviction is a documented spool policy, not a recovery shortcut.
+// Prune removes records older than the frozen 7-day retention. It never evicts
+// records for byte pressure: over-capacity enqueue is fail-closed in Enqueue.
+// Removal failures are returned so a retention failure is not silently ignored.
 func (s *Spool) Prune(now int64) error {
 	recs, err := s.List()
 	if err != nil {
 		return err
 	}
 	cutoff := now - int64(s.maxAge/time.Second)
-	var total int64
-	kept := make([]SpoolRecord, 0, len(recs))
+	removed := false
 	for _, rec := range recs {
-		if rec.CreatedAt < cutoff {
-			_ = os.Remove(rec.path)
+		if rec.CreatedAt >= cutoff {
 			continue
 		}
-		total += int64(len(rec.Body)) + 512
-		kept = append(kept, rec)
+		if err := os.Remove(rec.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		removed = true
 	}
-	_ = kept
-	_ = total
+	if !removed {
+		return nil
+	}
 	return syncDir(s.dir)
 }
 

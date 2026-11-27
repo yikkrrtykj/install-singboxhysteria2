@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 
 	"github.com/yikkrrtykj/install-singboxhysteria2/um/internal/wire"
@@ -41,14 +40,15 @@ var (
 // directory with owner-only permissions; platform secret wrapping is an ADR
 // boundary (OD-P7) and must not be confused with production approval.
 type Identity struct {
-	Version    int    `json:"version"`
-	CenterURL  string `json:"center_url"`
-	NodeID     string `json:"node_id"`
-	EventID    string `json:"event_id"`
-	NodeClass  string `json:"node_class"`
-	KeyID      string `json:"key_id"`
-	PublicKey  string `json:"public_key"`
-	PrivateKey string `json:"private_key"`
+	Version             int    `json:"version"`
+	CenterURL           string `json:"center_url"`
+	NodeID              string `json:"node_id"`
+	EventID             string `json:"event_id"`
+	NodeClass           string `json:"node_class"`
+	KeyID               string `json:"key_id"`
+	PublicKey           string `json:"public_key"`
+	PrivateKey          string `json:"private_key,omitempty"`
+	PrivateKeyProtected string `json:"private_key_dpapi,omitempty"`
 }
 
 // BootState is the atomic generation/sequence high-water basis. NextSeq is the
@@ -64,25 +64,25 @@ type BootState struct {
 // RotationState is a persisted pending rotation intent. It survives restart and
 // never contains a plaintext token.
 type RotationState struct {
-	Version       int    `json:"version"`
-	Nonce         string `json:"nonce"`
-	NewKeyID      string `json:"new_key_id,omitempty"`
-	NewPublicKey  string `json:"new_public_key"`
-	NewPrivateKey string `json:"new_private_key"`
-	Response      []byte `json:"response,omitempty"`
-	State         string `json:"state"` // awaiting_proof
+	Version                int    `json:"version"`
+	Nonce                  string `json:"nonce"`
+	NewKeyID               string `json:"new_key_id,omitempty"`
+	NewPublicKey           string `json:"new_public_key"`
+	NewPrivateKey          string `json:"new_private_key,omitempty"`
+	NewPrivateKeyProtected string `json:"new_private_key_dpapi,omitempty"`
+	Response               []byte `json:"response,omitempty"`
+	State                  string `json:"state"` // awaiting_proof
 }
 
 // ControlState is a persisted config/rotate/pre-proof control attempt. It is
 // replayed with refreshed transport fields under rev-5 full validation.
 type ControlState struct {
-	Version       int     `json:"version"`
-	Kind          string  `json:"kind"` // config|rotate
-	Attempt       Attempt `json:"attempt"`
-	Body          []byte  `json:"body"`
-	NewKeyID      string  `json:"new_key_id,omitempty"`
-	NewPublicKey  string  `json:"new_public_key,omitempty"`
-	NewPrivateKey string  `json:"new_private_key,omitempty"`
+	Version      int     `json:"version"`
+	Kind         string  `json:"kind"` // config|rotate
+	Attempt      Attempt `json:"attempt"`
+	Body         []byte  `json:"body"`
+	NewKeyID     string  `json:"new_key_id,omitempty"`
+	NewPublicKey string  `json:"new_public_key,omitempty"`
 }
 
 // AgentConfig is the validated center config plus its raw bytes.
@@ -101,6 +101,7 @@ type AgentConfig struct {
 type State struct {
 	dir       string
 	lockPath  string
+	lockFile  *os.File
 	lockToken string
 	identity  *Identity
 	boot      *BootState
@@ -147,6 +148,9 @@ func newUUIDv4() (string, error) {
 
 func writeAtomic(path string, data []byte) error {
 	dir := filepath.Dir(path)
+	if err := rejectLinksInPath(dir); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
@@ -194,6 +198,9 @@ func randString() string {
 }
 
 func readJSON(path string, out any) (bool, error) {
+	if err := rejectLink(path); err != nil {
+		return false, err
+	}
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
@@ -207,13 +214,58 @@ func readJSON(path string, out any) (bool, error) {
 	return true, nil
 }
 
+// rejectLink refuses a symlink or Windows reparse point at path. A missing path
+// is allowed (the caller may be about to create it).
+func rejectLink(path string) error {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || isReparsePoint(path) {
+		return errors.New("agent: state path must not be a symlink or reparse point")
+	}
+	return nil
+}
+
+// rejectLinksInPath walks every existing component of path and refuses
+// symlinks/reparse points. It is deliberately conservative: a state directory
+// or any parent that redirects storage is a fail-closed configuration error.
+func rejectLinksInPath(path string) error {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	volume := filepath.VolumeName(abs)
+	rest := strings.TrimPrefix(abs, volume)
+	current := volume + string(os.PathSeparator)
+	for _, part := range strings.Split(rest, string(os.PathSeparator)) {
+		if part == "" || part == "." {
+			continue
+		}
+		current = filepath.Join(current, part)
+		if err := rejectLink(current); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // OpenState acquires the single-instance lock and loads durable state. A missing
 // boot_state with an existing identity is corruption and must not auto-recover.
 func OpenState(dir string) (*State, error) {
 	if strings.TrimSpace(dir) == "" {
 		return nil, fmt.Errorf("agent: state directory is required")
 	}
+	if err := rejectLinksInPath(dir); err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, err
+	}
+	if err := rejectLinksInPath(dir); err != nil {
 		return nil, err
 	}
 	if err := os.Chmod(dir, 0o700); err != nil {
@@ -231,11 +283,32 @@ func OpenState(dir string) (*State, error) {
 		return nil, errors.Join(ErrIdentityCorrupt, err)
 	}
 	if hasIdent {
+		wasProtected := ident.PrivateKeyProtected != ""
+		if ident.PrivateKeyProtected != "" {
+			if ident.PrivateKey != "" {
+				cleanup()
+				return nil, errors.Join(ErrIdentityCorrupt, errors.New("identity has both plaintext and protected key"))
+			}
+			plaintext, err := unsealPrivateKey(ident.PrivateKeyProtected)
+			if err != nil {
+				cleanup()
+				return nil, errors.Join(ErrIdentityCorrupt, err)
+			}
+			ident.PrivateKey = plaintext
+			ident.PrivateKeyProtected = ""
+		}
 		if err := validateIdentity(&ident); err != nil {
 			cleanup()
 			return nil, errors.Join(ErrIdentityCorrupt, err)
 		}
 		s.identity = &ident
+		// Migrate a legacy plaintext identity to DPAPI at first open on Windows.
+		if !wasProtected && privateKeyProtectionAvailable() {
+			if err := s.saveIdentity(ident); err != nil {
+				cleanup()
+				return nil, err
+			}
+		}
 	}
 	var boot BootState
 	hasBoot, err := readJSON(filepath.Join(dir, bootStateFile), &boot)
@@ -274,11 +347,31 @@ func OpenState(dir string) (*State, error) {
 		cleanup()
 		return nil, errors.Join(ErrRotationMismatch, err)
 	} else if ok {
+		wasProtected := rot.NewPrivateKeyProtected != ""
+		if wasProtected {
+			if rot.NewPrivateKey != "" {
+				cleanup()
+				return nil, errors.Join(ErrRotationMismatch, errors.New("rotation has both plaintext and protected key"))
+			}
+			plaintext, err := unsealPrivateKey(rot.NewPrivateKeyProtected)
+			if err != nil {
+				cleanup()
+				return nil, errors.Join(ErrRotationMismatch, err)
+			}
+			rot.NewPrivateKey = plaintext
+			rot.NewPrivateKeyProtected = ""
+		}
 		if rot.Version != stateVersion || rot.Nonce == "" || rot.NewPrivateKey == "" {
 			cleanup()
 			return nil, ErrRotationMismatch
 		}
 		s.rotation = &rot
+		if !wasProtected && privateKeyProtectionAvailable() {
+			if err := s.saveRotation(rot); err != nil {
+				cleanup()
+				return nil, err
+			}
+		}
 	}
 	var ctl ControlState
 	if ok, err := readJSON(filepath.Join(dir, controlFile), &ctl); err != nil {
@@ -301,80 +394,73 @@ func OpenState(dir string) (*State, error) {
 }
 
 func (s *State) acquireLock() error {
+	if err := rejectLink(s.lockPath); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(s.lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := lockFileExclusive(f); err != nil {
+		_ = f.Close()
+		return err
+	}
 	b, err := randomBytes(16)
 	if err != nil {
+		_ = unlockFile(f)
+		_ = f.Close()
 		return err
 	}
 	token := hex.EncodeToString(b)
 	content := token + " " + fmt.Sprint(os.Getpid()) + "\n"
-	for attempt := 0; attempt < 2; attempt++ {
-		f, err := os.OpenFile(s.lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-		if errors.Is(err, os.ErrExist) {
-			alive, _ := lockOwner(s.lockPath)
-			if !alive {
-				// Abrupt crash leaves no clean marker and a stale lock. Only a
-				// provably-dead owner is broken; a live process always wins.
-				_ = os.Remove(s.lockPath)
-				continue
-			}
-			return ErrLocked
-		}
-		if err != nil {
-			return err
-		}
-		if _, err := f.WriteString(content); err != nil {
-			_ = f.Close()
-			_ = os.Remove(s.lockPath)
-			return err
-		}
-		if err := f.Sync(); err != nil {
-			_ = f.Close()
-			_ = os.Remove(s.lockPath)
-			return err
-		}
-		if err := f.Close(); err != nil {
-			return err
-		}
-		s.lockToken = token
-		return nil
+	if err := f.Truncate(0); err != nil {
+		_ = unlockFile(f)
+		_ = f.Close()
+		return err
 	}
-	return ErrLocked
+	if _, err := f.Seek(0, 0); err != nil {
+		_ = unlockFile(f)
+		_ = f.Close()
+		return err
+	}
+	if _, err := f.WriteString(content); err != nil {
+		_ = unlockFile(f)
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = unlockFile(f)
+		_ = f.Close()
+		return err
+	}
+	s.lockFile = f
+	s.lockToken = token
+	return nil
 }
 
-func lockOwner(path string) (bool, int) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return false, 0
-	}
-	parts := strings.Fields(strings.TrimSpace(string(data)))
-	if len(parts) < 2 {
-		// Legacy/truncated lock: no proof of a live owner.
-		return false, 0
-	}
-	pid, err := strconv.Atoi(parts[1])
-	if err != nil || pid <= 0 {
-		return false, 0
-	}
-	return processAlive(pid), pid
-}
-
-// Close removes the owned lock; it never deletes identity/boot/spool data. A
-// clean-shutdown marker distinguishes a normal restart (generation +1) from an
-// abrupt power loss (same generation and persisted attempt replay).
+// Close releases the OS advisory lock and closes the lock file; it never
+// deletes identity/boot/spool data. A clean-shutdown marker distinguishes a
+// normal restart (generation +1) from an abrupt power loss (same generation and
+// persisted attempt replay). The lock file may remain on disk; the OS lock, not
+// file existence, is the single-writer authority.
 func (s *State) Close() error {
 	var first error
 	if s.identity != nil {
-		_ = os.WriteFile(filepath.Join(s.dir, cleanShutdownFile), []byte("clean\n"), 0o600)
+		first = writeAtomic(filepath.Join(s.dir, cleanShutdownFile), []byte("clean\n"))
 	}
 	if s.spool != nil {
-		first = s.spool.Close()
-	}
-	if s.lockToken != "" {
-		if data, err := os.ReadFile(s.lockPath); err == nil && strings.HasPrefix(string(data), s.lockToken+" ") {
-			if err := os.Remove(s.lockPath); err != nil && !errors.Is(err, os.ErrNotExist) && first == nil {
-				first = err
-			}
+		if err := s.spool.Close(); err != nil && first == nil {
+			first = err
 		}
+	}
+	if s.lockFile != nil {
+		if err := unlockFile(s.lockFile); err != nil && first == nil {
+			first = err
+		}
+		if err := s.lockFile.Close(); err != nil && first == nil {
+			first = err
+		}
+		s.lockFile = nil
 	}
 	return first
 }
@@ -486,7 +572,16 @@ func (s *State) saveIdentity(id Identity) error {
 	if err := validateIdentity(&id); err != nil {
 		return err
 	}
-	data, err := json.Marshal(id)
+	toWrite := id
+	if privateKeyProtectionAvailable() {
+		protected, err := sealPrivateKey(id.PrivateKey)
+		if err != nil {
+			return err
+		}
+		toWrite.PrivateKey = ""
+		toWrite.PrivateKeyProtected = protected
+	}
+	data, err := json.Marshal(toWrite)
 	if err != nil {
 		return err
 	}
@@ -525,7 +620,16 @@ func (s *State) saveConfig(c AgentConfig) error {
 }
 
 func (s *State) saveRotation(r RotationState) error {
-	data, err := json.Marshal(r)
+	toWrite := r
+	if r.NewPrivateKey != "" && privateKeyProtectionAvailable() {
+		protected, err := sealPrivateKey(r.NewPrivateKey)
+		if err != nil {
+			return err
+		}
+		toWrite.NewPrivateKey = ""
+		toWrite.NewPrivateKeyProtected = protected
+	}
+	data, err := json.Marshal(toWrite)
 	if err != nil {
 		return err
 	}

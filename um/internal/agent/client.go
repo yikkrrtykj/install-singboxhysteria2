@@ -50,13 +50,13 @@ type EnrollResponse struct {
 }
 
 type ackResponse struct {
-	V             int     `json:"v"`
-	ReportID      string  `json:"report_id"`
-	Result        string  `json:"result"`
-	ServerTime    int64   `json:"server_time"`
-	NextSeq       *uint64 `json:"next_seq"`
-	ConfigVersion int     `json:"config_version"`
-	RetryAfterS   *int    `json:"retry_after_s"`
+	V             int             `json:"v"`
+	ReportID      string          `json:"report_id"`
+	Result        string          `json:"result"`
+	ServerTime    int64           `json:"server_time"`
+	NextSeq       json.RawMessage `json:"next_seq"`
+	ConfigVersion int             `json:"config_version"`
+	RetryAfterS   json.RawMessage `json:"retry_after_s"`
 }
 
 type configResponse struct {
@@ -153,6 +153,14 @@ func NewClient(rawURL string, httpClient *http.Client, now func() time.Time) (*C
 				return http.ErrUseLastResponse
 			},
 		}
+	} else {
+		// Callers may inject a test/transport client, but they must not be able
+		// to weaken the frozen redirect-free transport invariant.
+		copied := *httpClient
+		copied.CheckRedirect = func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+		httpClient = &copied
 	}
 	if now == nil {
 		now = time.Now
@@ -178,7 +186,7 @@ func decodeStrict(raw []byte, out any) error {
 	return nil
 }
 
-func decodeCenterError(status int, raw []byte) error {
+func decodeCenterError(status int, raw []byte, retryAfterHeader string) error {
 	var body struct {
 		V          int    `json:"v"`
 		Error      string `json:"error"`
@@ -188,7 +196,20 @@ func decodeCenterError(status int, raw []byte) error {
 	if err := json.Unmarshal(raw, &body); err != nil || body.V != 1 || body.Error == "" {
 		return &TransportError{Cause: fmt.Sprintf("invalid center error status=%d", status)}
 	}
-	return &CenterError{Status: status, Code: body.Error, Retryable: body.Retryable || status >= 500, ServerTime: body.ServerTime}
+	return &CenterError{Status: status, Code: body.Error, Retryable: body.Retryable || status >= 500,
+		ServerTime: body.ServerTime, RetryAfterS: parseRetryAfterHeader(retryAfterHeader)}
+}
+
+func parseRetryAfterHeader(value string) *int {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	n, err := strconv.Atoi(value)
+	if err != nil || n < 1 || n > 3600 {
+		return nil
+	}
+	return &n
 }
 
 func (c *Client) send(ctx context.Context, fields wire.Fields, body []byte, token string, priv ed25519.PrivateKey) ([]byte, error) {
@@ -232,7 +253,7 @@ func (c *Client) send(ctx context.Context, fields wire.Fields, body []byte, toke
 		return nil, &TransportError{Cause: "response read/limit"}
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, decodeCenterError(resp.StatusCode, raw)
+		return nil, decodeCenterError(resp.StatusCode, raw, resp.Header.Get("Retry-After"))
 	}
 	return raw, nil
 }
@@ -280,6 +301,42 @@ func (c *Client) Enroll(ctx context.Context, token string, req EnrollRequest, pr
 	return resp, nil
 }
 
+// requiredNullableUint64 decodes a required JSON property that may be null. A
+// missing property is invalid; only an explicit null means exhaustion.
+func requiredNullableUint64(raw json.RawMessage, field string) (*uint64, error) {
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("agent: ACK missing required %s", field)
+	}
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "null" {
+		return nil, nil
+	}
+	value, err := strconv.ParseUint(trimmed, 10, 64)
+	if err != nil || value < 1 || value > wire.MaxNumeric {
+		return nil, fmt.Errorf("agent: ACK invalid %s", field)
+	}
+	v := value
+	return &v, nil
+}
+
+// requiredNullableRetryAfter decodes the required nullable retry_after_s
+// property. The frozen schema permits null or an integer in [1, 3600].
+func requiredNullableRetryAfter(raw json.RawMessage) (*int, error) {
+	if len(raw) == 0 {
+		return nil, errors.New("agent: ACK missing required retry_after_s")
+	}
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "null" {
+		return nil, nil
+	}
+	value, err := strconv.Atoi(trimmed)
+	if err != nil || value < 1 || value > 3600 {
+		return nil, errors.New("agent: ACK invalid retry_after_s")
+	}
+	v := value
+	return &v, nil
+}
+
 // Report sends one exact persisted attempt.
 func (c *Client) Report(ctx context.Context, identity Identity, attempt Attempt, kind string, body []byte) (Ack, error) {
 	priv, err := decodeSignatureKey(identity.PrivateKey)
@@ -299,13 +356,24 @@ func (c *Client) Report(ctx context.Context, identity Identity, attempt Attempt,
 		return Ack{}, err
 	}
 	var resp ackResponse
-	if err := decodeStrict(raw, &resp); err != nil || resp.V != 1 ||
+	if err := decodeStrict(raw, &resp); err != nil {
+		return Ack{}, &TransportError{Cause: "invalid ack response"}
+	}
+	if resp.V != 1 || !nodeIDRe.MatchString(resp.ReportID) ||
 		resp.Result != "accepted" && resp.Result != "duplicate" && resp.Result != "stale_ignored" ||
 		resp.ConfigVersion < 1 || resp.ServerTime < 0 {
 		return Ack{}, &TransportError{Cause: "invalid ack response"}
 	}
-	return Ack{ReportID: resp.ReportID, Result: resp.Result, NextSeq: resp.NextSeq,
-		ConfigVersion: resp.ConfigVersion, ServerTime: resp.ServerTime, RetryAfterS: resp.RetryAfterS}, nil
+	nextSeq, err := requiredNullableUint64(resp.NextSeq, "next_seq")
+	if err != nil {
+		return Ack{}, &TransportError{Cause: "invalid ack response"}
+	}
+	retryAfter, err := requiredNullableRetryAfter(resp.RetryAfterS)
+	if err != nil {
+		return Ack{}, &TransportError{Cause: "invalid ack response"}
+	}
+	return Ack{ReportID: resp.ReportID, Result: resp.Result, NextSeq: nextSeq,
+		ConfigVersion: resp.ConfigVersion, ServerTime: resp.ServerTime, RetryAfterS: retryAfter}, nil
 }
 
 // Config sends an authenticated config pull.
@@ -367,7 +435,7 @@ func (c *Client) Rotate(ctx context.Context, identity Identity, attempt Attempt,
 	}
 	var resp rotateResponse
 	if err := decodeStrict(raw, &resp); err != nil || resp.V != 1 ||
-		resp.NodeID != identity.NodeID || !keyIDRe.MatchString(resp.PreviousKeyID) ||
+		resp.NodeID != identity.NodeID || resp.PreviousKeyID != identity.KeyID ||
 		!keyIDRe.MatchString(resp.NewKeyID) || resp.ConfigVersion < 1 {
 		return Rotation{}, &TransportError{Cause: "invalid rotate response"}
 	}

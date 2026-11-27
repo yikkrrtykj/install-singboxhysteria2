@@ -21,7 +21,8 @@
 
 [Unit]
 Description=UM agent (unified monitor node agent, linux_vps class)
-Documentation=file:/usr/local/share/doc/um-agent/um-b3-runbook.mdWants=network-online.target
+Documentation=file:/usr/local/share/doc/um-agent/um-b3-runbook.md
+Wants=network-online.target
 After=network-online.target
 StartLimitIntervalSec=300
 StartLimitBurst=5

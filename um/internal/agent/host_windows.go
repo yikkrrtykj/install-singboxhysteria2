@@ -2,10 +2,15 @@
 
 package agent
 
-import "runtime"
+import (
+	"fmt"
+	"runtime"
+
+	"golang.org/x/sys/windows"
+)
 
 func platformHost() HostInfo {
-	// The exact Windows version is obtained by the service/installer ADR; the
-	// frozen snapshot schema requires a non-empty kernel-form string.
-	return HostInfo{OS: "windows", Kernel: "10.0.0", Arch: runtime.GOARCH}
+	version := windows.RtlGetVersion()
+	return HostInfo{OS: "windows", Kernel: fmt.Sprintf("%d.%d.%d",
+		version.MajorVersion, version.MinorVersion, version.BuildNumber), Arch: runtime.GOARCH}
 }

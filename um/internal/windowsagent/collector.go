@@ -221,11 +221,10 @@ func (c *Collector) Events(_ context.Context, rc agent.ReportContext) ([]byte, e
 		Severity: "info",
 		Detail:   agentStartedDetail{AgentVersion: c.version},
 	}}
-	// terminal_source_unavailable is a Windows-terminal-only event kind and the
-	// centre requires the `terminal` source switch before accepting it. Emit it
-	// only when the authorized source is not configured locally, which is the
-	// honest reason code available without a live probe.
-	if rc.Config.Sources["terminal"] && c.observer == nil {
+	// terminal_source_unavailable is a Windows-terminal-only event kind. It is
+	// relevant when either independently authorized component (selection or
+	// active connections) is enabled but no local observer was injected.
+	if (rc.Config.Sources["terminal"] || rc.Config.Sources["mihomo_api"]) && c.observer == nil {
 		events = append(events, eventBody{
 			Kind:     "terminal_source_unavailable",
 			Severity: "warning",

@@ -96,6 +96,15 @@ func (probe DBusServiceProbe) ObserveServices(ctx context.Context) (ServiceObser
 	return ServiceObservation{SingBox: normalizeServiceState(ServiceState(strings.TrimSpace(state)))}, nil
 }
 
+// Close releases the underlying read-only D-Bus probe when it owns a
+// persistent connection.
+func (probe DBusServiceProbe) Close() error {
+	if closer, ok := probe.DBus.(interface{ Close() error }); ok {
+		return closer.Close()
+	}
+	return nil
+}
+
 // normalizeServiceState maps a systemd ActiveState value onto the frozen enum.
 // States the contract cannot express (activating, deactivating, reloading,
 // maintenance, empty, ...) become "unknown" rather than a guess.
