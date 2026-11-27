@@ -108,7 +108,17 @@ fi
 FOUND=0
 for _ in $(seq 1 30); do
   SUMMARY="$("$ROOT/um-lab" summary --db "$DB" --node-id "$NODE_ID" --print-payload)"
-  if printf '%s' "$SUMMARY" | grep -q '"services":\[{"name":"sing-box","state":"active"}\]'; then
+  if printf '%s' "$SUMMARY" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+p=d.get("latest_snapshot",{}).get("payload")
+if not p: sys.exit(1)
+body=json.loads(p)
+services=body.get("services") or []
+if len(services)==1 and services[0].get("name")=="sing-box" and services[0].get("state")=="active":
+    sys.exit(0)
+sys.exit(1)
+'; then
     FOUND=1
     break
   fi
