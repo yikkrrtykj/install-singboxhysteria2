@@ -25,7 +25,7 @@ jobs:
           Write-Host "whoami: $(whoami)"
           whoami /groups | Out-String | Write-Host
           sc.exe query | Out-String | Write-Host
-          New-Service -Name 'um-lab-env' -BinaryPathName 'cmd.exe /c ping -n 30 127.0.0.1 >nul' -StartupType Demand | Out-Null
+          New-Service -Name 'um-lab-env' -BinaryPathName 'cmd.exe /c ping -n 30 127.0.0.1 >nul' -StartupType Manual | Out-Null
           try {
             & sc.exe config um-lab-env obj= "NT SERVICE\um-lab-env" password= "" | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "sc config virtual account failed: $LASTEXITCODE" }
@@ -55,6 +55,9 @@ jobs:
           systemctl is-system-running || true
           systemctl --version | head -n 2
           systemd-analyze --version | head -n 2
+          sudo mkdir -p /usr/local/libexec
+          printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/libexec/um-agent >/dev/null
+          sudo chmod 0755 /usr/local/libexec/um-agent
           systemd-analyze verify um/deploy/linux/um-agent.service
           sudo systemctl status --no-pager || true
-          busctl --system list | head -n 20
+          (busctl --system list || dbus-send --system --dest=org.freedesktop.DBus --type=method_call --print-reply / org.freedesktop.DBus.ListNames) | head -n 20
