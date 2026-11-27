@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/yikkrrtykj/install-singboxhysteria2/um/internal/store"
+	"github.com/yikkrrtykj/install-singboxhysteria2/um/internal/windowsobs"
 )
 
 func main() {
@@ -29,6 +30,8 @@ func main() {
 		err = configure(os.Args[2:])
 	case "summary":
 		err = summary(os.Args[2:])
+	case "r1-project":
+		err = r1Project(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -40,7 +43,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: um-lab <issue-token|configure|summary> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: um-lab <issue-token|configure|summary|r1-project> [flags]")
 }
 
 func openDB(path string) (*store.Store, error) {
@@ -160,4 +163,34 @@ func summary(args []string) error {
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	return enc.Encode(out)
+}
+
+func r1Project(args []string) error {
+	fs := flag.NewFlagSet("r1-project", flag.ExitOnError)
+	profilePath := fs.String("profile", "", "windowsobs profile JSON")
+	secretPath := fs.String("secret", "", "controller secret file")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	rawProfile, err := os.ReadFile(*profilePath)
+	if err != nil {
+		return err
+	}
+	var profile windowsobs.Profile
+	if err := json.Unmarshal(rawProfile, &profile); err != nil {
+		return err
+	}
+	rawSecret, err := os.ReadFile(*secretPath)
+	if err != nil {
+		return err
+	}
+	secret := strings.TrimSpace(string(rawSecret))
+	observer, err := windowsobs.New(profile, secret)
+	if err != nil {
+		return err
+	}
+	snapshot := observer.Collect(context.Background())
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(snapshot)
 }

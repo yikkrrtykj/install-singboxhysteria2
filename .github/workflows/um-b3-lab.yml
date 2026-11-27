@@ -92,3 +92,21 @@ jobs:
         shell: bash
         run: |
           sudo -E bash um/deploy/lab/linux-systemd-lab.sh
+
+  windows-service-r1-lab:
+    name: windows-service-r1-lab
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.4'
+          cache: true
+          cache-dependency-path: um/go.sum
+      - name: Run isolated Windows SCM/DPAPI/R1 lab
+        shell: pwsh
+        run: |
+          ./um/deploy/lab/windows-service-r1-lab.ps1
