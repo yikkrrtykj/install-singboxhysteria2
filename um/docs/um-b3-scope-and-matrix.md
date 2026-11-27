@@ -135,7 +135,7 @@ whose real-environment verification is the substance of the claim.
 | 10 | Agent-side privacy: no local names/IPs/URLs/process names/connection ids/credentials/YAML in bodies, logs or state diagnostics; closed error logging | B3.1 | `04` §9.3; `06` SEC-14 extension | collector contract + runtime status (no payload logging); negative tests | IMPLEMENTED + MOCK-UNIT PASS (see §5) |
 | 11 | Linux `/proc` read-only system counters (CPU/mem/disk/net), no subprocess, no root; honest UNKNOWN/UNAVAILABLE | B3.2 | `04` §11 | `um/internal/linuxobs/{collector,procfs,system,disk}.go` + synthetic-fixture tests | MOCK-UNIT PASS (synthetic procfs; not a real-host proof) |
 | 12 | Linux systemd unit state via read-only D-Bus `ActiveState`; unavailable → UNKNOWN; no `systemctl` exec fallback | B3.2 | `04` §11; P1-03 | `linuxobs.SystemdDBusProbe` (godbus v5.2.4, fixed GetUnit+Properties.Get, FlagNoAutoStart, no write/exec/root) + exact-call/security tests; isolated Ubuntu 24.04 workflow read a real synthetic `sing-box.service` and persisted `services:[{state:"active"}]` | **REAL LAB-REAL PASS on systemd 255 / Ubuntu 24.04 (isolated workflow)**; target VPS matrix broader |
-| 13 | Linux `singbox_api` disabled by default; server-side authorization audit required before enable; unproven source → honest `unavailable`, no fallback credential | B3.2 | `04` §11 (P1-10); SEC-39 | Official service.api gRPC-Web client/accumulator (`serviceapi*.go`), synthetic fixtures + isolated sing-box 1.14.5 lab; legacy Clash client compatibility only; G7 `agent_error code=source_authorization_unproven` implemented/tested; source stays off | IMPLEMENTED + MOCK-UNIT/LAB-REAL (isolated synthetic sing-box); P1-10 audit + source enablement HOLD |
+| 13 | Linux `singbox_api` disabled by default; server-side authorization audit required before enable; unproven source → honest `unavailable`, no fallback credential; no lower bounds as lifetime totals | B3.2 | `04` §11 (P1-10); SEC-39 | Official service.api gRPC-Web client/accumulator (`serviceapi*.go`), synthetic fixtures + reproducible real sing-box 1.14.5 lab; v1.14.5 proto audit shows the single service secret authorizes write/control RPCs, so P1-10 fails; legacy Clash compatibility only; G7 event implemented; traffic is unavailable/empty (no lower-bound claim) | IMPLEMENTED + LAB-REAL isolated; **P1-10 AUTHORIZATION AUDIT FAIL; source stays disabled/unavailable; no production enablement** |
 | 14 | Linux no-exec/least-privilege runtime: non-root `umagent`, no listener, no exec/root/sudo/shell/systemctl, only own state dir writable; `LoadCredential` for API secrets; source permissions unchanged | B3.2/B3.4 | `04` §11; `03` §11; SEC-31/32/33 | installer + unit + noexec whitelist; isolated systemd workflow verified non-root, no listener, state 0700, NoExecPaths present and restart-safe | **REAL LAB PASS on systemd 255 (isolated)**; target-version matrix broader |
 | 15 | Windows six-token projection of `windowsobs` data; exactly one role enum; independent `selection`/`active_connections` sampling; `direct` only with explicit operator-local binding, otherwise `unknown`/null | B3.3 | `04` §9.2; `02` §2 | `windowsobs` six-token `Role`/`Tokens()` + `windowsagent` collector unit tests | MOCK-UNIT PASS |
 | 16 | Windows honesty: availability coherence, sum equality when `ok`, empty list = observed zero, missing/malformed = unknown/unavailable, no fabricated data | B3.3 | `04` §9.2; SEC-33/45 | `windowsagent/collector_test.go` synthetic observer cases | MOCK-UNIT PASS |
@@ -261,9 +261,13 @@ report its own CI result.
    installer, non-root service, real D-Bus ActiveState, no listener, state mode,
    restart-safe noexec whitelist and restart generation advance. Broader target
    version matrix remains lab/UM-E scope.
-5. **Real sing-box `service.api` authorization audit** — absent; the Linux
-   source remains disabled by design. The client itself now has synthetic
-   fixtures and an isolated sing-box 1.14.5 lab; this is not the P1-10 audit.
+5. **Real sing-box `service.api` authorization audit** — executed for v1.14.5:
+   the single service secret authorizes write/control RPCs (ClearLogs,
+   SetClashMode, SelectOutbound, CloseConnection, etc.), so the credential is not
+   read-only and P1-10 authorization cannot be proven. The source remains
+   disabled; a reproducible opt-in lab exercises only the connection stream.
+   Per-inbound daemon-lifetime totals do not exist; traffic is reported
+   unavailable/empty, never as an active-byte lower bound.
 6. **Real Windows R1/HA proof**, real agent-to-center over public TLS,
    production account, target Clash builds, real clock skew and hardware
    power-loss durability — lab/production HOLD.

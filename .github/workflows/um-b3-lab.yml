@@ -110,3 +110,20 @@ jobs:
         shell: pwsh
         run: |
           ./um/deploy/lab/windows-service-r1-lab.ps1
+
+  linux-singbox-serviceapi-lab:
+    name: linux-singbox-serviceapi-lab
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.4'
+          cache: true
+          cache-dependency-path: um/go.sum
+      - name: Run isolated real sing-box service.api lab
+        shell: bash
+        run: bash um/deploy/lab/singbox-serviceapi-lab.sh

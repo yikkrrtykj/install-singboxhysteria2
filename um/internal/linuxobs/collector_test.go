@@ -64,7 +64,7 @@ func TestSnapshotContractValidAndHonestProjection(t *testing.T) {
 		System:    availabilityOK,
 		Services:  availabilityOK,
 		Protocols: availabilityPartial,
-		Traffic:   availabilityPartial,
+		Traffic:   availabilityUnavailable,
 		Clients:   availabilityUnavailable,
 	}
 	if body.Availability != wantAvailability {
@@ -95,10 +95,7 @@ func TestSnapshotContractValidAndHonestProjection(t *testing.T) {
 	if !reflect.DeepEqual(body.Protocols, wantProtocols) {
 		t.Fatalf("protocols = %+v, want %+v", body.Protocols, wantProtocols)
 	}
-	wantTraffic := []trafficEntry{
-		{Scope: "protocol", InboundTag: "vless-in", UplinkTotalBytes: int64Ptr(1000), DownlinkTotalBytes: int64Ptr(2000)},
-		{Scope: "protocol", InboundTag: "hy2-in", UplinkTotalBytes: nil, DownlinkTotalBytes: nil},
-	}
+	wantTraffic := []trafficEntry{}
 	if !reflect.DeepEqual(body.Traffic, wantTraffic) {
 		t.Fatalf("traffic = %+v, want %+v", body.Traffic, wantTraffic)
 	}
@@ -274,7 +271,7 @@ func TestSourceSwitchesFailClosed(t *testing.T) {
 			enabled: []string{"singbox_api"},
 			want: availabilityInfo{
 				System: availabilityUnavailable, Services: availabilityUnavailable,
-				Protocols: availabilityPartial, Traffic: availabilityPartial,
+				Protocols: availabilityPartial, Traffic: availabilityUnavailable,
 				Clients: availabilityUnavailable,
 			},
 			wantSingBoxCalls: 1,
@@ -282,7 +279,7 @@ func TestSourceSwitchesFailClosed(t *testing.T) {
 		{
 			name:             "all linux sources",
 			enabled:          []string{"system", "services", "singbox_api"},
-			want:             availabilityInfo{System: availabilityOK, Services: availabilityOK, Protocols: availabilityPartial, Traffic: availabilityPartial, Clients: availabilityUnavailable},
+			want:             availabilityInfo{System: availabilityOK, Services: availabilityOK, Protocols: availabilityPartial, Traffic: availabilityUnavailable, Clients: availabilityUnavailable},
 			wantServiceCalls: 1,
 			wantSingBoxCalls: 1,
 		},
@@ -626,10 +623,7 @@ func TestInboundTagAuthorization(t *testing.T) {
 	if !reflect.DeepEqual(body.Protocols, wantProtocols) {
 		t.Fatalf("protocols = %+v, want %+v", body.Protocols, wantProtocols)
 	}
-	wantTraffic := []trafficEntry{
-		{Scope: "protocol", InboundTag: "vless-in", UplinkTotalBytes: int64Ptr(1000), DownlinkTotalBytes: int64Ptr(2000)},
-		{Scope: "protocol", InboundTag: "unobserved-in", UplinkTotalBytes: nil, DownlinkTotalBytes: nil},
-	}
+	wantTraffic := []trafficEntry{}
 	if !reflect.DeepEqual(body.Traffic, wantTraffic) {
 		t.Fatalf("traffic = %+v, want %+v", body.Traffic, wantTraffic)
 	}

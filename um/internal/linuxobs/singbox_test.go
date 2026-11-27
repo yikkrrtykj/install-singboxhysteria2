@@ -440,10 +440,9 @@ func TestCollectorSingBoxFixtureDoesNotLeakMetadata(t *testing.T) {
 	if !reflect.DeepEqual(body.Protocols, wantProtocols) {
 		t.Fatalf("protocols = %+v, want %+v", body.Protocols, wantProtocols)
 	}
-	requireInt64Ptr(t, "traffic[0].uplink", body.Traffic[0].UplinkTotalBytes, 100)
-	requireInt64Ptr(t, "traffic[0].downlink", body.Traffic[0].DownlinkTotalBytes, 200)
-	requireInt64Ptr(t, "traffic[1].uplink", body.Traffic[1].UplinkTotalBytes, 50)
-	requireInt64Ptr(t, "traffic[1].downlink", body.Traffic[1].DownlinkTotalBytes, 60)
+	if len(body.Traffic) != 0 {
+		t.Fatalf("legacy active byte counters must not be reported as totals: %+v", body.Traffic)
+	}
 }
 
 // TestParseConnectionsDocumentCornerCases covers the document grammar directly.

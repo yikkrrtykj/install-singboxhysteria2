@@ -156,6 +156,24 @@ isolated lab only, no production enablement, credential is write-capable, no
 named pipe/bridge, protected local provisioning with DPAPI CurrentUser, and no
 real controller secret.
 
+## 4e. sing-box service.api v1.14.5 reproducible lab and authorization audit
+
+`um/deploy/lab/singbox-serviceapi-lab.sh` downloads the official sing-box
+1.14.5 Linux amd64 binary, starts a synthetic loopback mixed inbound and
+`service.api`, opens a real HTTP CONNECT connection, and runs the opt-in
+`TestServiceAPIOptInLab`. The lab verifies the real connection stream and
+records that the accumulator exposes only a non-exact lower bound. The frozen
+schema has no lower-bound representation, so B3's traffic projection is
+`unavailable` with an empty traffic array for both service.api and legacy Clash
+paths.
+
+`docs/um-b3-singbox-serviceapi-audit.md` records the v1.14.5 proto audit: the
+single service secret authorizes write/control RPCs (`ClearLogs`,
+`SetClashMode`, `SelectOutbound`, `CloseConnection`, etc.), so it is not a
+read-only credential and P1-10 cannot be proven. The source stays disabled.
+The lab uses a synthetic mixed inbound, not real Reality/Hysteria2 inbounds;
+those protocol-specific experiments remain unverified and are not claimed.
+
 ## 5. Not executed
 
 - Real Linux systemd/D-Bus evidence is now available from the isolated Ubuntu

@@ -429,16 +429,9 @@ func (c *Collector) observeSingBox(ctx context.Context, rc agent.ReportContext) 
 		evidence, seen := observation.Inbounds[tag.tag]
 		state := "unknown"
 		reason := "unknown"
-		var uplink, downlink *int64
 		if seen {
 			observed++
 			state, reason = "up", "ok"
-			if value, ok := contractCounter(evidence.UplinkBytes); ok {
-				uplink = &value
-			}
-			if value, ok := contractCounter(evidence.DownlinkBytes); ok {
-				downlink = &value
-			}
 			if evidence.ActiveConnections < 0 ||
 				evidence.ActiveConnections > maxContractActiveConns-activeTotal {
 				activeValid = false
@@ -453,12 +446,10 @@ func (c *Collector) observeSingBox(ctx context.Context, rc agent.ReportContext) 
 			Reason:     reason,
 			ObservedAt: rc.CollectedAt,
 		})
-		traffic = append(traffic, trafficEntry{
-			Scope:              trafficScopeProtocol,
-			InboundTag:         tag.tag,
-			UplinkTotalBytes:   uplink,
-			DownlinkTotalBytes: downlink,
-		})
+		// The legacy Clash API exposes active-connection byte counters, not
+		// lifetime per-inbound totals. The frozen traffic fields are totals and
+		// an unavailable projection requires an empty array, so no traffic
+		// entry is emitted for this observation.
 	}
 
 	if observed == len(expected) {
@@ -466,13 +457,7 @@ func (c *Collector) observeSingBox(ctx context.Context, rc agent.ReportContext) 
 	} else {
 		protocolsAvailability = availabilityPartial
 	}
-	trafficAvailability = availabilityOK
-	for _, entry := range traffic {
-		if entry.UplinkTotalBytes == nil || entry.DownlinkTotalBytes == nil {
-			trafficAvailability = availabilityPartial
-			break
-		}
-	}
+	trafficAvailability = availabilityUnavailable
 	if activeValid && activeTotal <= maxContractActiveConns {
 		activeConnections = &activeTotal
 	}
@@ -505,26 +490,13 @@ func projectServiceAPIObservation(expected []authorizedTag, obs ServiceAPIObserv
 	observed := 0
 	var activeTotal int64
 	activeValid := true
-	allTotals := true
 	for _, tag := range expected {
 		evidence, seen := obs.Inbounds[tag.tag]
 		state := "unknown"
 		reason := "unknown"
-		var uplink, downlink *int64
 		if seen {
 			observed++
 			state, reason = "up", "ok"
-			if evidence.TotalsAvailable {
-				if value, ok := contractCounter(evidence.UplinkTotalBytes); ok {
-					uplink = &value
-				}
-				if value, ok := contractCounter(evidence.DownlinkTotalBytes); ok {
-					downlink = &value
-				}
-			}
-			if uplink == nil || downlink == nil {
-				allTotals = false
-			}
 			if evidence.ActiveConnections < 0 ||
 				evidence.ActiveConnections > maxContractActiveConns-activeTotal {
 				activeValid = false
@@ -539,27 +511,18 @@ func projectServiceAPIObservation(expected []authorizedTag, obs ServiceAPIObserv
 			Reason:     reason,
 			ObservedAt: collectedAt,
 		})
-		traffic = append(traffic, trafficEntry{
-			Scope:              trafficScopeProtocol,
-			InboundTag:         tag.tag,
-			UplinkTotalBytes:   uplink,
-			DownlinkTotalBytes: downlink,
-		})
+		// service.api exposes no daemon-lifetime per-inbound counter. Its
+		// probe-observed cumulative value is a lower bound, and the frozen
+		// traffic fields have no lower-bound representation. Do not present the
+		// estimate as a total: traffic is unavailable and its array must be
+		// empty under the frozen coherence rules.
 	}
 	if observed == len(expected) {
 		protocolsAvailability = availabilityOK
 	} else {
 		protocolsAvailability = availabilityPartial
 	}
-	if allTotals {
-		// Probe-observed cumulative lower bound. The schema has no distinct
-		// "lower bound" state; the service.api limitation is documented and the
-		// value is never the active-connection-only sum. Any skipped/conflicting
-		// event makes the whole traffic projection unavailable above.
-		trafficAvailability = availabilityOK
-	} else {
-		trafficAvailability = availabilityPartial
-	}
+	trafficAvailability = availabilityUnavailable
 	if activeValid && activeTotal <= maxContractActiveConns {
 		activeConnections = &activeTotal
 	}

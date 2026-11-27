@@ -16,7 +16,7 @@ func (f fakeServiceAPIObserver) ObserveServiceAPI(context.Context) (ServiceAPIOb
 	return f.obs, f.err
 }
 
-func TestServiceAPIProjectionUsesCumulativeTotals(t *testing.T) {
+func TestServiceAPIProjectionReportsTrafficUnavailable(t *testing.T) {
 	collector, _, _, _ := newFakeCollector(t)
 	collector.ServiceAPIProbe = fakeServiceAPIObserver{obs: ServiceAPIObservation{
 		Connected: true,
@@ -34,22 +34,11 @@ func TestServiceAPIProjectionUsesCumulativeTotals(t *testing.T) {
 	}
 	validateSnapshotBody(t, raw)
 	body := unmarshalSnapshot(t, raw)
-	if body.Availability.Traffic != availabilityOK || body.Availability.Protocols != availabilityOK {
-		t.Fatalf("availability = %+v, want traffic/protocols ok", body.Availability)
+	if body.Availability.Traffic != availabilityUnavailable || body.Availability.Protocols != availabilityOK {
+		t.Fatalf("availability = %+v, want protocols ok/traffic unavailable", body.Availability)
 	}
-	wantTraffic := []trafficEntry{
-		{Scope: "protocol", InboundTag: "vless-in", UplinkTotalBytes: int64Ptr(4000), DownlinkTotalBytes: int64Ptr(8000)},
-		{Scope: "protocol", InboundTag: "hy2-in", UplinkTotalBytes: int64Ptr(1000), DownlinkTotalBytes: int64Ptr(2000)},
-	}
-	if len(body.Traffic) != len(wantTraffic) {
-		t.Fatalf("traffic = %+v", body.Traffic)
-	}
-	for i := range wantTraffic {
-		if body.Traffic[i].InboundTag != wantTraffic[i].InboundTag ||
-			body.Traffic[i].UplinkTotalBytes == nil || *body.Traffic[i].UplinkTotalBytes != *wantTraffic[i].UplinkTotalBytes ||
-			body.Traffic[i].DownlinkTotalBytes == nil || *body.Traffic[i].DownlinkTotalBytes != *wantTraffic[i].DownlinkTotalBytes {
-			t.Fatalf("traffic[%d] = %+v, want %+v", i, body.Traffic[i], wantTraffic[i])
-		}
+	if len(body.Traffic) != 0 {
+		t.Fatalf("traffic lower bounds must not be reported as totals: %+v", body.Traffic)
 	}
 	// The active-connection aggregate comes from the same observation, never
 	// from the cumulative totals.
