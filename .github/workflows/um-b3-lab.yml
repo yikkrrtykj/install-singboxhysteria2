@@ -2,6 +2,9 @@ name: UM-B3 isolated service labs
 
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/um-b3-lab.yml'
 
 permissions:
   contents: read
