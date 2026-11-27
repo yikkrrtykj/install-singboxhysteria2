@@ -194,11 +194,12 @@ func newFakeCollector(t *testing.T) (*Collector, *fakeDiskProbe, *fakeServicePro
 		"vless-in": {ActiveConnections: 2, UplinkBytes: 1000, DownlinkBytes: 2000},
 	}}}
 	collector := &Collector{
-		ProcRoot:     writeTree(t, fakeProcFiles()),
-		AgentVersion: "1.2.3",
-		DiskProbe:    disk,
-		ServiceProbe: service,
-		SingBoxProbe: singbox,
+		ProcRoot:                writeTree(t, fakeProcFiles()),
+		AgentVersion:            "1.2.3",
+		DiskProbe:               disk,
+		ServiceProbe:            service,
+		SingBoxProbe:            singbox,
+		SingBoxSourceAuthorized: true,
 	}
 	return collector, disk, service, singbox
 }

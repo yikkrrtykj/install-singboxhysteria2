@@ -86,11 +86,12 @@ func TestPrivacySentinelsNeverLeak(t *testing.T) {
 		ipSentinel: {ActiveConnections: 1, UplinkBytes: 1, DownlinkBytes: 1},
 	}}}
 	collector := &Collector{
-		ProcRoot:     writeTree(t, files),
-		AgentVersion: "1.2.3",
-		DiskProbe:    &fakeDiskProbe{total: 42949672960, used: 10737418240},
-		ServiceProbe: service,
-		SingBoxProbe: singbox,
+		ProcRoot:                writeTree(t, files),
+		AgentVersion:            "1.2.3",
+		DiskProbe:               &fakeDiskProbe{total: 42949672960, used: 10737418240},
+		ServiceProbe:            service,
+		SingBoxProbe:            singbox,
+		SingBoxSourceAuthorized: true,
 	}
 	rc := reportContext([]string{"system", "services", "singbox_api", "events"}, testExpectedTags())
 	rc.Config.DeviceSalt = saltSentinel

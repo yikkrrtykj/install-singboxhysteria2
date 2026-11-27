@@ -411,10 +411,11 @@ func TestCollectorSingBoxFixtureDoesNotLeakMetadata(t *testing.T) {
 		t.Fatalf("NewSingBoxClient: %v", err)
 	}
 	collector := &Collector{
-		ProcRoot:     writeTree(t, fakeProcFiles()),
-		AgentVersion: "1.2.3",
-		DiskProbe:    &fakeDiskProbe{total: 42949672960, used: 10737418240},
-		SingBoxProbe: client,
+		ProcRoot:                writeTree(t, fakeProcFiles()),
+		AgentVersion:            "1.2.3",
+		DiskProbe:               &fakeDiskProbe{total: 42949672960, used: 10737418240},
+		SingBoxProbe:            client,
+		SingBoxSourceAuthorized: true,
 	}
 	raw, err := collector.Snapshot(context.Background(),
 		reportContext([]string{"singbox_api"}, testExpectedTags()))

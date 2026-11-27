@@ -179,8 +179,9 @@ report its own CI result.
   projection and safety tests including availability honesty, source-switch
   gating, G7 event schema, service.api projection, D-Bus exact-call/security
   tests and the honest `ErrProbeUnavailable` default. The service.api client has
-  synthetic gRPC-Web fixtures and an **isolated real sing-box 1.14.5 lab** with
-  an active connection (LAB-REAL for the tested instance only).
+  synthetic gRPC-Web fixtures, source-authorization gating tests and an
+  **isolated real sing-box 1.14.5 lab** with an active connection (LAB-REAL for
+  the tested instance only).
 - `um/internal/windowsagent` (synthetic observer, never a real controller):
   `TestNewDefaultsAndInvalidOptions`, `TestSnapshotH1DefaultAbsence`,
   `TestSnapshotSelectionOnlyAuthorization`, `TestSnapshotActiveOnlyAuthorization`,
@@ -267,8 +268,9 @@ report its own CI result.
    power-loss/power-fail durability on target hardware — all DEFERRED.
 7. **Production, UM-E acceptance, load/capacity, backup/restore, offsite
    ledger, independent security review** — not started (UM-E/HOLD).
-8. **CI on the Draft PR** — local build/tests only; the GitHub lane has not
-   been reported for this Draft at the time of writing.
+8. **CI on the Draft PR** — the exact final HEAD CI evidence is recorded after
+   the last push; intermediate commits had green GitHub lanes, but no claim is
+   made for a later HEAD until its run completes.
 
 ## 8. Known gaps and follow-ups
 
@@ -291,8 +293,10 @@ report its own CI result.
   only the isolated systemd lab/`systemd-analyze verify` remains.
 - G5: operator recovery (boot-state loss, revoked key, rotation mismatch) is
   documented but not drilled on a real node (UM-E drill).
-- G6: R2 research and the OD-P3/OD-P7 Owner answers are prerequisites for any
-  Windows source enablement; no agent code path may be enabled before them.
+- G6: R2 investigation is complete (INFEASIBLE on the tested builds); the
+  OD-P3/OD-P7 Owner answers are still prerequisites for any Windows source
+  enablement. The R1 CLI path exists but is disabled by default; no agent code
+  path may be enabled before the Owner records the decision.
 - G7: the Linux `singbox_api` unproven-source path now emits the contract
   `agent_error code=source_authorization_unproven` event (with stable event id
   and schema-validation test) while keeping availability unavailable. The

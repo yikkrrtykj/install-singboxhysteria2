@@ -65,6 +65,44 @@ func TestServiceAPIProjectionUsesCumulativeTotals(t *testing.T) {
 	requireInt64Ptr(t, "metrics.active_connections", metrics.Samples[0].ActiveConnections, 3)
 }
 
+func TestServiceAPIProjectionRequiresAuthorization(t *testing.T) {
+	collector, _, _, _ := newFakeCollector(t)
+	collector.SingBoxSourceAuthorized = false
+	probe := &countingServiceAPIProbe{obs: ServiceAPIObservation{
+		Connected: true,
+		Inbounds: map[string]ServiceAPIInboundEvidence{
+			"vless-in": {ActiveConnections: 1, UplinkTotalBytes: 10, DownlinkTotalBytes: 20, TotalsAvailable: true},
+		},
+	}}
+	collector.ServiceAPIProbe = probe
+	raw, err := collector.Snapshot(context.Background(),
+		reportContext([]string{"singbox_api"}, testExpectedTags()))
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	validateSnapshotBody(t, raw)
+	body := unmarshalSnapshot(t, raw)
+	if body.Availability.Protocols != availabilityUnavailable || body.Availability.Traffic != availabilityUnavailable {
+		t.Fatalf("unauthorized source collected data: %+v", body.Availability)
+	}
+	if len(body.Protocols) != 0 || len(body.Traffic) != 0 {
+		t.Fatalf("unauthorized source produced protocols/traffic: %+v %+v", body.Protocols, body.Traffic)
+	}
+	if probe.calls != 0 {
+		t.Fatalf("unauthorized probe was queried %d times", probe.calls)
+	}
+}
+
+type countingServiceAPIProbe struct {
+	obs   ServiceAPIObservation
+	calls int
+}
+
+func (probe *countingServiceAPIProbe) ObserveServiceAPI(context.Context) (ServiceAPIObservation, error) {
+	probe.calls++
+	return probe.obs, nil
+}
+
 func TestServiceAPIProjectionDoesNotFabricateOnSkippedEvents(t *testing.T) {
 	collector, _, _, _ := newFakeCollector(t)
 	collector.ServiceAPIProbe = fakeServiceAPIObserver{obs: ServiceAPIObservation{

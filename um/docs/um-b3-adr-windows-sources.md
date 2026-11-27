@@ -146,7 +146,7 @@ capability proof (no write operations in the surface's contract/client), a
 dynamic proof attempt (show that a mutation is impossible/absent, not merely
 that the agent does not call it), and the mapping coverage for the six tokens.
 
-## 5. R2 research plan (lab, no production)
+## 5. R2 lab method (executed; no production)
 
 Preconditions: Owner permission to use a **test** Windows terminal/lab machine;
 no production hosts; no real user credentials; no changes to Clash Verge Rev or

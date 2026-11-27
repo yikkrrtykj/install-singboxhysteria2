@@ -838,6 +838,7 @@ func TestMalformedProcDataIsUnavailable(t *testing.T) {
 // is absent once the proof is explicitly recorded locally.
 func TestEventsG7SourceAuthorizationUnproven(t *testing.T) {
 	collector, _, _, _ := newFakeCollector(t)
+	collector.SingBoxSourceAuthorized = false
 	rc := reportContext([]string{"system", "singbox_api", "events"}, testExpectedTags())
 	raw, err := collector.Events(context.Background(), rc)
 	if err != nil {

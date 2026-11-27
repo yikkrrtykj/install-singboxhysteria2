@@ -106,7 +106,7 @@ credential; R2 is defined by *not* needing a controller secret). Options:
 | **DPAPI CurrentUser** under the agent service account | other local users, other services, offline file theft without the account profile/master keys | a local administrator who can log on as/serve as that account, process memory after compromise | **proposed preferred if a secret is unavoidable** |
 | DPAPI LocalMachine | casual file copying | **any local administrator** can decrypt with machine scope | only with explicit Owner risk acceptance; not proposed |
 | Plain ACL-protected file (0600-equivalent, no DPAPI) | other non-admin users (with correct ACL) | admin, backup/disk theft, profile-less service context | reject for R1 |
-| **No secret at all (R2 truly read-only source)** | the whole credential-write-path risk | — | **preferred by OD-P3; requires real R2 evidence (DEFERRED)** |
+| **No secret at all (R2 truly read-only source)** | the whole credential-write-path risk | — | **preferred by OD-P3; R2 investigated and INFEASIBLE on tested builds; no approved secretless source** |
 
 DPAPI user scope requires the secret to be encrypted **by the account that runs
 the agent**; a user-session secret cannot be decrypted by a session-0 service

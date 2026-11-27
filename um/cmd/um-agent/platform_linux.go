@@ -4,6 +4,7 @@ package main
 
 import (
 	"errors"
+	"io"
 	"os"
 	"strings"
 
@@ -30,11 +31,10 @@ func platformCollector(commonFlags) (agent.Collector, error) {
 	// source is enabled by this wiring; the center source switch remains false
 	// until the versioned P1-10 authorization audit and Owner enablement.
 	if secretFile != "" {
-		raw, err := os.ReadFile(secretFile)
+		secret, err := readCredentialFile(secretFile)
 		if err != nil {
 			return nil, errors.New("um-agent: cannot read configured sing-box API secret")
 		}
-		secret := strings.TrimSpace(string(raw))
 		if secret == "" {
 			return nil, errors.New("um-agent: configured sing-box API secret is empty")
 		}
@@ -54,6 +54,43 @@ func platformCollector(commonFlags) (agent.Collector, error) {
 		col.SingBoxSourceAuthorized = true
 	}
 	return col, nil
+}
+
+// readCredentialFile reads a root/systemd-provided service.api secret. It
+// rejects symlinks, non-regular files, oversized input and group/world-readable
+// modes so a misconfigured credential path fails closed instead of following an
+// attacker-controlled link.
+func readCredentialFile(path string) (string, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return "", err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return "", errors.New("credential is not a regular non-symlink file")
+	}
+	if info.Size() > 4096 {
+		return "", errors.New("credential exceeds size limit")
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		return "", errors.New("credential is group/world accessible")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	raw, err := io.ReadAll(io.LimitReader(file, 4097))
+	if err != nil {
+		return "", err
+	}
+	if len(raw) > 4096 {
+		return "", errors.New("credential exceeds size limit")
+	}
+	secret := strings.TrimSpace(string(raw))
+	if secret == "" {
+		return "", errors.New("credential is empty")
+	}
+	return secret, nil
 }
 
 func platformService([]string) error {

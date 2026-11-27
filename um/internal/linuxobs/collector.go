@@ -31,11 +31,12 @@
 //   - CPU percent is the kernel's aggregate user/system/irq busy ratio since
 //     boot (a single /proc/stat read), not a cadence-window rate. It is honest
 //     observed data but it is not an instantaneous sample.
-//   - The sing-box Clash-compatible API exposes per-connection cumulative
-//     counters only; there is no per-inbound lifetime counter. The traffic
-//     projection therefore sums the counters of connections currently
-//     attributed to an authorized inbound. Those values are a lower bound on
-//     the true inbound totals and are documented as such.
+//   - The official service.api exposes no per-inbound daemon-lifetime counter.
+//     The traffic projection uses probe-observed cumulative totals (active
+//     authoritative counters plus finalized closed/abandoned lifecycles banked
+//     once, and recently closed replay where available); they are lower bounds,
+//     never active-connection-only sums presented as lifetime totals. The
+//     legacy Clash compatibility probe exposes active lower bounds only.
 //   - The D-Bus client is fixed-call and read-only; failures degrade to
 //     unavailable. It is not a live-systemd-lab claim until the isolated lab is
 //     executed.
@@ -397,6 +398,12 @@ func (c *Collector) observeSingBox(ctx context.Context, rc agent.ReportContext) 
 
 	expected := authorizedInboundTags(rc.Config.ExpectedTags)
 	if len(expected) == 0 {
+		return protocols, traffic, nil, protocolsAvailability, trafficAvailability
+	}
+	if !c.SingBoxSourceAuthorized {
+		// The probe may be constructed by an operator, but collection remains
+		// off until the versioned P1-10 authorization proof exists. Events()
+		// emits the stable source_authorization_unproven diagnostic.
 		return protocols, traffic, nil, protocolsAvailability, trafficAvailability
 	}
 

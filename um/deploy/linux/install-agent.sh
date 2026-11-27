@@ -147,7 +147,7 @@ act() {
   fi
 }
 
-# Detect systemd major version (noexec directives require >= 254).
+# Detect systemd major version (NoExecPaths/ExecPaths require >= 248).
 SYSTEMD_MAJOR=0
 if command -v systemctl >/dev/null 2>&1; then
   SYSTEMD_MAJOR="$(systemctl --version 2>/dev/null | awk 'NR==1 {print $2}' | tr -dc '0-9' || true)"
