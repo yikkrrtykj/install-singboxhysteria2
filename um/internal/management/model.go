@@ -173,6 +173,9 @@ type RetentionTimelineView struct {
 
 type CapacityView struct {
 	Counts map[string]int64 `json:"counts"`
+	// Quotas are the frozen policy-B limits in force for this database. They are
+	// displayed, never raised here.
+	Quotas map[string]int64 `json:"quotas"`
 	// PlanningBasis documents that the byte figures are a planning estimate, not
 	// a SQLite disk hard limit.
 	PlanningBasis string `json:"planning_basis"`

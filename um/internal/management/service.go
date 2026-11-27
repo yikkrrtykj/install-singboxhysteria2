@@ -367,7 +367,7 @@ func deriveNodeStatus(n store.NodeSummary, now int64) string {
 		return "never_reported"
 	}
 	if n.LatestSnapshotAt == nil {
-		return "missing_snapshot"
+		return "unavailable"
 	}
 	stale := defaultStaleSecs
 	if n.CadenceSeconds != nil && *n.CadenceSeconds*3 > stale {
@@ -810,7 +810,19 @@ func (s *Service) Capacity(ctx context.Context, p Principal) (CapacityView, erro
 		"archived_events": ext.ArchivedEvents, "archived_retained": ext.ArchivedRetained,
 		"events_catalog": ext.EventsCatalog,
 	}
-	return CapacityView{Counts: counts, PlanningBasis: "planning payload estimate; not a SQLite disk hard limit"}, nil
+	quotas := map[string]int64{
+		"max_active_nodes_all_events":   store.MaxActiveNodesAllEvents,
+		"max_active_nodes_per_event":    store.MaxActiveNodesPerEvent,
+		"max_archived_events_with_data": store.MaxArchivedEventsWithData,
+		"max_events_catalog":            store.MaxEventsCatalog,
+		"active_retention_seconds":      store.PolicyBActiveRetentionSeconds,
+		"archive_tail_seconds":          store.PolicyBArchiveTailSeconds,
+		"retention_batch_rows":          store.RetentionBatchRows,
+		"active_only_planning_bytes":    store.ActiveOnlyPlanningPayloadBytes,
+		"overlap_budget_multiplier":     store.OverlapBudgetMultiplier,
+	}
+	return CapacityView{Counts: counts, Quotas: quotas,
+		PlanningBasis: "planning payload estimate; not a SQLite disk hard limit"}, nil
 }
 
 func (s *Service) RunRetention(ctx context.Context, p Principal) (map[string]int64, error) {
