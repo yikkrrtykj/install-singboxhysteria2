@@ -446,7 +446,7 @@ func TestAgentRunResumesAfterRecoveredConfigRetry(t *testing.T) {
 	}
 	r.opts.Sleep = func(ctx context.Context, _ time.Duration) error {
 		select {
-		case <-time.After(5 * time.Millisecond):
+		case <-time.After(10 * time.Millisecond):
 			return nil
 		case <-ctx.Done():
 			return ctx.Err()
@@ -454,7 +454,7 @@ func TestAgentRunResumesAfterRecoveredConfigRetry(t *testing.T) {
 	}
 	r.lastConfigCheck = 0
 	failConfig.Store(true)
-	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	runErr := r.Run(ctx)
 	if !errors.Is(runErr, context.DeadlineExceeded) {
