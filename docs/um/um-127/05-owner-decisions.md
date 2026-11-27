@@ -1,6 +1,6 @@
 # UM-127 05 — Owner 决策、方向接受与门禁登记（rev-5）
 
-- 状态：**登记 / 未批准**。本文件只记录问题、Owner 已给的方向与建议，不构成 APPROVED；任何一项都不得由 Coding AI 自行标记为 APPROVED。
+- 状态：**rev-5 历史登记 + 2026-11-27 rev-6 有限 Owner 决策**。本文件记录问题、Owner 已给的方向与建议；除 [10-owner-decisions-rev6.md](10-owner-decisions-rev6.md) 明确记录的 rev-6 有限批准外，不得由 Coding AI 自行标记为 APPROVED。
 - 依据：PR #126 UM-A rev-5、Owner Round-2 审查结论（2026-11-26）、#128 规划同步。
 - 状态词汇：
   - `PENDING`：未收到 Owner 明确决定；
@@ -8,7 +8,7 @@
   - `SUPERSEDED`：Owner 已明确不再采用（如 PR-A2）；
   - `HOLD`：等待前置门禁。
 
-## A. UM-A 既有 18 项 Owner 决策（全部非 APPROVED）
+## A. UM-A 既有 18 项 Owner 决策（rev-5 历史状态；2026-11-27 有限更新已标注）
 
 | ID | 问题 | 建议 | 状态 |
 | --- | --- | --- | --- |
@@ -19,7 +19,7 @@
 | Q-DNS | 域名/CF/Access | monitor/ingest 域名、zone、IdP、aud、tunnel token 由 Owner 持有 | PENDING |
 | Q-AGENT-OS | Agent OS 矩阵/安装 | Linux Debian/Ubuntu systemd；rev-5 增加 windows_terminal class，但 Windows OS/安装矩阵仍需明确决定 | PENDING |
 | Q-COEXIST | 与每 VPS Monitor 共存 | 只读共存，不改既有部署 | PENDING |
-| Q-DATA | 授权本地数据源 | sing-box service.api/`/proc`/只读 D-Bus；Windows **R2 优先**、R1 需单独 Owner 风险接受 | PENDING |
+| Q-DATA | 授权本地数据源 | sing-box service.api/`/proc`/只读 D-Bus；Windows **R2 优先**、R1 需单独 Owner 风险接受 | **PARTIAL (2026-11-27)**：Windows R1 隔离架构批准；Linux `singbox_api` 仍 disabled；见 [10-owner-decisions-rev6.md](10-owner-decisions-rev6.md) |
 | Q-RET | 保留策略 | 策略 B + overlap cap | PENDING |
 | Q-AUD | 审计保留 | 180d，可下调不低于 30d | PENDING |
 | Q-BACKUP | 备份/RPO/RTO | 局部 RPO≤24h；整机需每日加密异地；RTO 见方案 | PENDING |
@@ -42,20 +42,20 @@
 | OD-R5 | 是否先做独立 PR-A2 | **SUPERSEDED**（Owner 明确不再创建 PR-A2；直接进 #126） |
 | OD-R6 | `MAX_NUMERIC=2^63−2`、ACK `next_seq:null` exhaustion、SQLite INTEGER/CHECK | **DIRECTION-ACCEPTED**（由 Owner “明确 uint64 边界/ACK/SQLite”要求纳入 rev-5）；已冻结 |
 
-## C. 双平台/Windows 契约决策
+## C. 双平台/Windows 契约决策（rev-5 方向；rev-6 有限批准见 OD-P3/OD-P7）
 
 | ID | 内容 | 状态 |
 | --- | --- | --- |
 | OD-P1 | `node_class`（linux_vps/windows_terminal）必填、token scope 绑定 event+class、不可自选 | **DIRECTION-ACCEPTED**；已冻结进 rev-5 schema/enrollment；实现受门禁 |
 | OD-P2 | Windows 选路/连接聚合纳入首版；六路径而非仅 A/B | **DIRECTION-ACCEPTED**；已冻结（六 token/schema） |
-| OD-P3 | R2 真只读源优先；R1 写能力 controller 凭据需单独 Owner 风险接受、不自动启用 | **PENDING（设计/运行期）**：UM-B3 先做 R2 调研；R1 另行 Owner 接受 |
+| OD-P3 | R2 真只读源优先；R1 写能力 controller 凭据需单独 Owner 风险接受、不自动启用 | **APPROVED (limited, 2026-11-27)**：R1 架构/隔离 lab 批准，生产启用 HOLD；见 [10-owner-decisions-rev6.md](10-owner-decisions-rev6.md) |
 | OD-P4 | A/B→VPS ID 映射由 center 版本+effective_from 管理，历史不改写；agent 只报 token | **DIRECTION-ACCEPTED**；已冻结契约；UM-B4 实现 |
 | OD-P5 | `stale_after_s` 默认值、cadence、metrics 是否首版 | **PENDING（运行期参数）**：默认 `max(180,3×cadence)` 建议；metrics v1 不纳入（已冻结为 deferred） |
 | OD-P6 | 隐私 allowlist 增补（token/计数/时间戳；版本号默认不报） | **DIRECTION-ACCEPTED**（rev-5 privacy）；运行期细节 PENDING |
-| OD-P7 | Windows Agent 运行账户与 secret 存储（DPAPI/服务账户/用户会话） | **PENDING（运行期/ADR）**：UM-B3 出 ADR 后 Owner 确认 |
+| OD-P7 | Windows Agent 运行账户与 secret 存储（DPAPI/服务账户/用户会话） | **APPROVED (limited, 2026-11-27)**：`NT SERVICE\um-agent`/Session 0/DPAPI CurrentUser；不授权实际操作赛事电脑；见 [10-owner-decisions-rev6.md](10-owner-decisions-rev6.md) |
 | OD-P8 | `terminal` 放 report-snapshot 可选对象（非新 report type） | **DIRECTION-ACCEPTED**；已冻结 schema |
 
-**DIRECTION-ACCEPTED 的含义**：Owner 在 Round-2 明确要求按该方向形成 rev-5 最终契约；它不是 APPROVED，也不授权合并、实现或生产。所有 18 项 Q-* 仍为 PENDING。
+**DIRECTION-ACCEPTED 的含义**：Owner 在 Round-2 明确要求按该方向形成 rev-5 最终契约；它不是 APPROVED，也不授权合并、实现或生产。18 项 Q-* 中仅 Q-DATA 的 Windows R1 部分按 2026-11-27 rev-6 记录获批；其余仍 PENDING。
 
 ## D. Owner Round-2 审查记录（2026-11-26）
 
@@ -75,13 +75,13 @@
 
 | ID | 门禁 | 当前状态 |
 | --- | --- | --- |
-| OD-G1 | #126 rev-5 独立审查 PASS | **未满足**（GitHub 无 review 记录） |
-| OD-G2 | Owner 合并授权 → 普通 Merge Commit 合并 #126 → main CI 全绿 | HOLD |
-| OD-G3 | #128 独立审查/合并门禁 → 合并 #128（保留原 PR） | HOLD |
-| OD-G4 | 最新 main CI + Owner 授权 → 同步 Go 分支（保留 17b2f3e2/758e75be/24cfd2ff；不 rebase/force；docs/um 与 main 一致） | HOLD |
+| OD-G1 | UM-A rev-5 / #128 基线已合并 | **COMPLETE（历史）**：#126 merge `8f1b9ac1`；#128 merge `e889a191`；当前 base `54efc81c` |
+| OD-G2 | rev-6 发布：Owner 决策 + 独立审查 PASS + exact-HEAD CI 全绿 + 无阻塞线程 | #132 Draft；条件式 merge 授权已记录在 [10-owner-decisions-rev6.md](10-owner-decisions-rev6.md)，待审查/CI 门禁 |
+| OD-G3 | rev-6 普通 Merge Commit 合并并验证 main | HOLD（等待 OD-G2） |
+| OD-G4 | B3 #131 同步 rev-6、重新审查/CI；**不授权合并** | HOLD，Owner 单独授权才可合并 #131 |
 | OD-G5 | Owner 按切片批准 UM-B1..UM-G 独立 Draft PR | HOLD |
 | OD-G6 | 生产部署/发布/凭据/VPS/Cloudflare | HOLD |
-| OD-G7 | 已知 Windows harness flake 的独立 hotfix | 未授权；不混入设计 PR |
+| OD-G7 | 已知 Windows harness flake 的独立 hotfix | 保留记录；不混入设计 PR |
 | OD-G8 | 恢复/账本/异地备份演练 | UM-E 范围，未开始 |
 
 ## F. 设计决策 vs 运行期参数（本轮要求区分）
@@ -89,12 +89,15 @@
 | 类别 | 内容 | 决策归属 |
 | --- | --- | --- |
 | **已冻结设计决策**（rev-5） | A-1..A-5 语义；`MAX_BOOT_GAP=65535`；`MAX_NUMERIC=2^63−2`；ACK next_seq exhaustion；SQLite INTEGER/CHECK；node_class/token scope/平台隔离；六 token；独立采样；映射版本+effective_from；rotation 全量校验；R2 优先/R1 不自动启用 | #126 rev-5 冻结；变更需新 amendment + 独立审查 |
-| **未来阶段运行参数** | stale_after/cadence 具体值；R1 是否被接受（Owner 风险决定）；Windows 服务账户/secret 存储 ADR；保留容量/磁盘规格；ingress 选型；通知阈值 | UM-B3/UM-B4/UM-E 给出方案后 Owner 确认；不是当前契约前置 |
-| **未批准的 Owner 决策** | 18 项 Q-*；OD-P3/P5/P7；OD-R4 | PENDING，不得默认接受 |
+| **未来阶段运行参数/剩余生产策略** | stale_after/cadence 具体值；R1 **生产启用**最终决定；OD-P7 **生产账户/凭据策略**；保留容量/磁盘规格；ingress 选型；通知阈值 | OD-P3/OD-P7 架构已按 10 号记录有限批准；上述生产/运行期参数仍 PENDING，不是当前 rev-6 契约前置 |
+| **仍 PENDING 的 Owner 决策** | 18 项 Q-* 中除 Q-DATA 的 Windows R1 有限部分；OD-P5；OD-R4；其他运行期参数 | PENDING，不得默认接受 |
+| **2026-11-27 rev-6 有限批准** | OD-P3 R1 架构（生产 HOLD）；OD-P7 虚拟账户架构（不授权实际操作）；Q-DATA Windows R1；rev-6 契约方向与 #132 条件式合并授权 | 见 [10-owner-decisions-rev6.md](10-owner-decisions-rev6.md)；不授权 #131/生产 |
 
 ## G. 审批纪律
 
 1. 任何一行在 Owner 明确答复前保持 PENDING；DIRECTION-ACCEPTED 也不得写成 APPROVED。
 2. 批准记录必须可追溯（#127 或 PR 明确文字 → 本表更新 + 链接/时间）。
 3. 单个决策批准 ≠ 合并/同步/部署授权；D/E 节门禁独立。
-4. 若 Owner 修改建议，先更新 #126 契约（amendment）与 #128 文档，再进入实现。
+4. 若 Owner 修改建议，先更新契约（amendment/rev-6 overlay）与规划文档，再进入实现。
+5. 2026-11-27 rev-6 决策仅按 [10-owner-decisions-rev6.md](10-owner-decisions-rev6.md) 的有限范围生效；本文件其余 PENDING 项不因该记录自动批准。
+6. rev-6 的发布状态只能由合并后的 main 与 exact merge commit CI 证明，不能由 PR Draft 状态声称。

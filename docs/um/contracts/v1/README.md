@@ -1,7 +1,11 @@
-# UM contracts v1 (revision 5)
+# UM contracts v1 (revision 5 base + revision 6 power-loss overlay)
 
-Frozen machine-readable contracts for Unified Monitor node protocol v1 revision 5.
-Normative prose: [`../../um-a/04-node-protocol-v1.md`](../../um-a/04-node-protocol-v1.md).
+Frozen machine-readable contracts for Unified Monitor node protocol v1 revision 5,
+plus the approved additive revision-6 power-loss overlay (effective only on the
+rev-6 contract-release merge).
+Normative prose: [`../../um-a/04-node-protocol-v1.md`](../../um-a/04-node-protocol-v1.md) revision 5, plus the
+revision-6 normative overlay [`../../um-a/04-node-protocol-v1.rev6.md`](../../um-a/04-node-protocol-v1.rev6.md)
+for power-loss/process-restart generation semantics.
 Review response: [`../../um-a/08-review-response-matrix.md`](../../um-a/08-review-response-matrix.md).
 
 Revision 2 changes: signatures are **transport headers only** (no signed body
@@ -55,6 +59,7 @@ retained as `historical_rev4_enroll_vector` only (the body lacks the now-require
 | `ack.schema.json` / `error.schema.json` | center → agent | acknowledgement (nullable `next_seq`) / closed error |
 | `negative-vectors.v1.json` | — | behavioural HTTP/recovery/isolation negative contract (67 cases; rev-4 superseded expectations retained) |
 | `test-vectors.v1.json` | — | signed positive/negative vectors (rev-5) |
+| `power-loss-generation.rev6.json` | — | **normative rev-6 power-loss/restart generation cases** (AMEND-REC-27-A..F), executable by B1/B2/B3 tests |
 | `examples/` | — | positive bodies (incl. `terminal-snapshot.v1.json`) and negative examples |
 
 HTTP headers (identity, sequence, nonce, signature, content encoding, token) are
@@ -84,7 +89,18 @@ part of the protocol, not JSON Schema fields; doc 04 §2–§3 is normative.
   before parsing.
 - Historical vectors and expectations are retained for traceability; they are not
   current positives (see `historical_rev4_enroll_vector`,
-  `superseded_rev4_expectations`).
+  `superseded_rev4_expectations`). The rev-5 files are not replaced by rev-6:
+  `power-loss-generation.rev6.json` is an additive normative overlay fixture.
+
+## Revision 6 (power-loss generation)
+
+`power-loss-generation.rev6.json` is the approved normative machine-readable
+fixture for restart/power-loss generation semantics, effective on the rev-6
+contract-release merge. It is additive; revision-5 schemas,
+vectors and historical expectations remain unchanged. Normative prose is the
+rev-6 overlay above. Cases AMEND-REC-27-A..F must be executed by real
+HTTP/SQLite/agent/process tests, including the agent `status` non-mutation case;
+JSON parsing alone is not conformance.
 
 ## Signed vectors
 

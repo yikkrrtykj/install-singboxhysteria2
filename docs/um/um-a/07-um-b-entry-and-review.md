@@ -1,5 +1,13 @@
 # UM-A 07 — UM-B entry criteria, owner decisions and authorization record (revision 5)
 
+> **Historical rev-5 gate record.** This file records the rev-5 review/authorization
+> state. Owner decisions made on 2026-11-27 for rev-6 are recorded in
+> [`../um-127/10-owner-decisions-rev6.md`](../um-127/10-owner-decisions-rev6.md)
+> and do not retroactively change this historical table. Where this file says a
+> decision is pending/not approved, read it as the rev-5 state; the rev-6 record
+> controls the limited, scoped approvals. No production or B3 merge authorization
+> is implied.
+
 Status: hand-off gate between UM-A (investigation/design) and UM-B. This is the
 **revision 5 final targeted amendment**, incorporating the owner-accepted
 A-1..A-5 recovery semantics, numeric/storage rules, node classes/platform
