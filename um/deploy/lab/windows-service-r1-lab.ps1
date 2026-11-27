@@ -274,10 +274,19 @@ if ($projection.active_connections.state -ne 'observed' -or
     ($projection.active_connections.counts.direct + 0) -lt 1) {
   Fail "active direct connection not projected: $($projection.active_connections | ConvertTo-Json -Compress)"
 }
-$payloadAfterActive = Get-LatestPayload
-if ($null -eq $payloadAfterActive -or $null -eq $payloadAfterActive.terminal -or
-    $payloadAfterActive.terminal.active_connections.availability -ne 'ok' -or
-    ($payloadAfterActive.terminal.active_connections.by_route.direct + 0) -lt 1) {
+$deadline = (Get-Date).AddSeconds(45)
+$persistedActive = $false
+while ((Get-Date) -lt $deadline) {
+  $payloadAfterActive = Get-LatestPayload
+  if ($null -ne $payloadAfterActive -and $null -ne $payloadAfterActive.terminal -and
+      $payloadAfterActive.terminal.active_connections.availability -eq 'ok' -and
+      ($payloadAfterActive.terminal.active_connections.by_route.direct + 0) -ge 1) {
+    $persistedActive = $true
+    break
+  }
+  Start-Sleep -Milliseconds 500
+}
+if (-not $persistedActive) {
   Fail "persisted terminal active connection not observed: $($payloadAfterActive.terminal | ConvertTo-Json -Compress -Depth 10)"
 }
 $activeProxy.Close(); $activeProxy = $null
