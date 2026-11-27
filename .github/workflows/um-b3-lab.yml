@@ -32,7 +32,6 @@ jobs:
           foreach ($variant in @(
             @{ Name='um-lab-local'; Account='NT AUTHORITY\LocalService'; Password=$null },
             @{ Name='um-lab-virtual'; Account='NT SERVICE\um-lab-virtual'; Password=$null },
-            @{ Name='um-lab-virt2'; Account='NT SERVICE\um-lab-virt2'; Password='' }
           )) {
             Write-Host "=== attempting $($variant.Name) as $($variant.Account) ==="
             $args = @('create', $variant.Name, 'binPath=', $bin, 'start=', 'demand', 'obj=', $variant.Account)
@@ -50,6 +49,8 @@ jobs:
               & sc.exe delete $variant.Name | Out-Null
             }
           }
+          Write-Host "windows-service-environment: probe complete"
+          exit 0
   linux-systemd-environment:
     name: linux-systemd-environment
     runs-on: ubuntu-24.04

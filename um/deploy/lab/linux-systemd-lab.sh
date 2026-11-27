@@ -5,7 +5,7 @@
 # install/start/stop/restart/D-Bus/no-exec/state checks.
 #
 # Required env: RUNNER_TEMP (or LAB_TMP) and a sudo-capable runner.
-set -euo pipefail
+set -euxo pipefail
 
 ROOT="${LAB_TMP:-${RUNNER_TEMP:-/tmp}/um-b3-linux-lab}"
 REPO="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)"
