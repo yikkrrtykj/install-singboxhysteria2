@@ -3,8 +3,10 @@
 - Status: **UM-B3 Draft PR only.** Not merged, not accepted, not deployed, not
   production. This document maps the B3 Draft to the frozen rev-5 contract; it
   does not define a new contract and does not grant any Owner decision.
-- Base: `main` **54efc81c** (B2 merged). Frozen contract:
-  `docs/um/um-a/04-node-protocol-v1.md` revision 5 + `docs/um/contracts/v1/**`.
+- Base: `main` **54efc81c** (B2 merged), then rev-6 contract release merge
+  **a5ee4d8b** (2026-11-27). Frozen contract:
+  `docs/um/um-a/04-node-protocol-v1.md` revision 5 + the approved
+  `04-node-protocol-v1.rev6.md` overlay + `docs/um/contracts/v1/**`.
 - Sources consulted: `docs/um/um-127/02-dual-platform-contract.md`,
   `03-recovery-semantics.md`, `04-implementation-plan.md`,
   `05-owner-decisions.md`; `docs/um/um-a/03-architecture-and-trust-boundaries.md`,
@@ -105,9 +107,9 @@ state path; agents reject state files that fail validation instead of
    type/body identity. The clean-shutdown marker is diagnostic only. Exact
    same-generation replay remains available for a retry within the same
    process; a restart never reuses the retired generation's attempt as an
-   authorization token. This implements the proposed
-   `um-127/09-power-loss-generation-amendment-draft.md` (separate docs-only
-   Draft PR #132, not yet frozen).
+   authorization token. This implements the published rev-6 overlay
+   (`um-a/04-node-protocol-v1.rev6.md`), effective at merge commit
+   `a5ee4d8b`; the rev-5 file remains historical and unchanged.
 5. If the process is starting for the first time with no identity, enrollment
    is required (no anonymous reporting).
 
@@ -432,8 +434,8 @@ B2-owned REC real-HTTP halves stay B2 evidence; B3 does not re-count them.
   start advances generation and uses a fresh attempt, so a post-crash replay is
   a new-generation `duplicate` and advances the new high-water. The exact
   same-generation sequence duplicate remains the same-runtime ACK-loss case.
-  This implements the proposed power-loss-generation amendment (docs-only Draft
-  PR #132, pending Owner/contract approval). Windows directory-entry durability
+  This implements published rev-6 (`a5ee4d8b`); the rev-6 normative fixture is
+  `docs/um/contracts/v1/power-loss-generation.rev6.json`. Windows directory-entry durability
   is a documented
   platform limitation (write-through replacement, no POSIX dir fsync).
 - Center storage failure: `503 storage_unavailable` is retried; no ACK before

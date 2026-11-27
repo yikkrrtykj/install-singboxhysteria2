@@ -125,7 +125,7 @@ whose real-environment verification is the substance of the claim.
 | --- | --- | --- | --- | --- | --- |
 | 1 | Ed25519 identity generated on node; private key local only; enrollment signed, `node_class` from build; response class verified | B3.1 | `04` §3–§4, §11 | `um/internal/agent/{state,client,runtime}.go` | IMPLEMENTED |
 | 2 | Enrollment token over stdin/pipe as `umagent`; root token file not agent-readable; token deleted by installer after success; no resident root process | B3.1/B3.4 | `04` §4, §11; P1-03 | installer template `um/deploy/linux/install-agent.sh`; runbook | IMPLEMENTED (template; not executed) |
-| 3 | Atomic fsync boot state: generation +1 on every enrolled runtime start (clean or unclean), new random boot id, seq persist-before-send; corrupt/missing boot state = fail-closed `boot_state_corrupt` (never reset) | B3.1 | `04` §5, §6.1; REC-17/18/27; proposed power-loss amendment | `state.go` (`writeAtomic`, boot validation), `runtime.go` recovery; live center tests for same-runtime vs restart duplicate | IMPLEMENTED; acceptance DEPENDS ON DRAFT AMENDMENT PR #132 (not frozen) |
+| 3 | Atomic fsync boot state: generation +1 on every enrolled runtime start (clean or unclean), new random boot id, seq persist-before-send; corrupt/missing boot state = fail-closed `boot_state_corrupt` (never reset) | B3.1 | `04` §5, §6.1; rev-6 overlay; REC-17/18/27; AMEND-REC-27-A..F | `state.go` (`writeAtomic`, boot validation), `runtime.go` recovery; executable rev-6 fixture tests (real HTTP/SQLite/agent), same-runtime vs restart duplicate | **IMPLEMENTED + REV-6 BOUND (published merge a5ee4d8b); fixture A-F PASS** |
 | 4 | Single-agent/single-writer rule (OS advisory lock, no PID stale-lock removal, no two instances per node); symlink/reparse state-path rejection | B3.1 | `04` §6.1 | `state.go` lock + `lock_{unix,windows}.go`, path checks | IMPLEMENTED |
 | 5 | Durable report spool: 32 MiB / 7 d, fsync-before-send, same-second seq ordering, oldest-first, ack-only removal, hash-bound quarantine, age retention during outage, **over-capacity fail-closed** | B3.1 | `04` §11, §6.2 | `spool.go` + same-second/quarantine tests | IMPLEMENTED |
 | 6 | ACK adoption: `max(local_next_seq, ack.next_seq)`, `next_seq:null` exhaustion → new generation or operator recovery; no seq reuse/wrap | B3.1 | `04` §5, §13; REC-26 | `runtime.go` `applyAck`/`nextAttempt` | IMPLEMENTED |
@@ -332,6 +332,6 @@ report its own CI result.
 **This is a B3 Draft PR.** It is not a merge request approval, not a release,
 not a production installation. R1 is authorized only for isolated lab and
 remains production-disabled; the frozen contract is unchanged in this PR and
-the power-loss amendment is a separate docs-only Draft PR. UM-B4/C/D/E/F/G are
-not started; Owner decisions in `docs/um/um-127/05-owner-decisions.md` remain
-the governing record.
+the power-loss overlay is published/frozen in rev-6 (merge `a5ee4d8b`), with
+rev-5 retained as history. UM-B4/C/D/E/F/G are not started; the 2026-11-27
+limited Owner decisions are in `docs/um/um-127/10-owner-decisions-rev6.md`.

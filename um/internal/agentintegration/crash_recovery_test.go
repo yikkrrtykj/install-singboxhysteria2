@@ -166,7 +166,52 @@ func runCrashChild(t *testing.T, scenario, centerURL, stateDir, token string) {
 	}
 }
 
+type rev6ProcessFixture struct {
+	ContractRevision int `json:"contract_revision"`
+	Cases            []struct {
+		ID       string `json:"id"`
+		Restart  bool   `json:"restart"`
+		Expected struct {
+			Result      string `json:"result"`
+			CenterState struct {
+				HighestGen uint64 `json:"highest_gen"`
+				LastSeq    uint64 `json:"last_seq"`
+			} `json:"center_state"`
+			Data string `json:"data"`
+		} `json:"expected"`
+	} `json:"cases"`
+}
+
+func loadRev6ProcessB(t *testing.T) rev6ProcessFixture {
+	t.Helper()
+	raw, err := os.ReadFile("../../../docs/um/contracts/v1/power-loss-generation.rev6.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc rev6ProcessFixture
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if doc.ContractRevision != 6 {
+		t.Fatalf("rev-6 fixture revision=%d", doc.ContractRevision)
+	}
+	for _, c := range doc.Cases {
+		if c.ID != "AMEND-REC-27-B" {
+			continue
+		}
+		if !c.Restart || c.Expected.Result != "duplicate" ||
+			c.Expected.Data != "no_second_copy" ||
+			c.Expected.CenterState.HighestGen == 0 || c.Expected.CenterState.LastSeq != 1 {
+			t.Fatalf("rev-6 B fixture drift: %+v", c)
+		}
+		return doc
+	}
+	t.Fatal("rev-6 AMEND-REC-27-B missing")
+	return doc
+}
+
 func TestB3RecoveryProcessCrashREC27(t *testing.T) {
+	loadRev6ProcessB(t) // fixture binding: real process restart must be duplicate/no-second-copy
 	const eventID = "cc1b2c3d-4e5f-4a6b-8c9d-0e1f2a3b4c5e"
 	tc := startRealCenter(t, store.NodeClassLinuxVPS, eventID)
 	stateDir := t.TempDir()
@@ -248,8 +293,11 @@ func TestB3RecoveryProcessCrashREC27(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if centerBoot.HighestGen != 2 || centerBoot.LastSeq != 1 {
-		t.Fatalf("new-generation duplicate did not advance high-water: %+v", centerBoot)
+	if centerBoot.HighestGen != newBoot.Generation || centerBoot.LastSeq != 1 {
+		t.Fatalf("new-generation duplicate did not advance high-water: boot=%+v center=%+v", newBoot, centerBoot)
+	}
+	if _, seen, err := tc.store.ReportSeen(context.Background(), ident.NodeID, rec.ID); err != nil || !seen {
+		t.Fatalf("restart replay report_id was not deduped as the same payload: seen=%v err=%v", seen, err)
 	}
 }
 

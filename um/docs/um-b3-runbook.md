@@ -128,9 +128,9 @@ already passed by this Draft):
 - Boot generation increments by exactly 1 on **every** enrolled runtime start,
   including `systemctl restart` and an unclean/power-loss restart; a new boot
   id and fresh transport attempts are used, while report_id/body identity is
-  preserved for dedupe. This implements the proposed power-loss-generation
-  amendment (separate docs-only Draft PR #132, pending approval). Same-process
-  transport retry is the only exact same-generation duplicate path.
+  preserved for dedupe. This implements published/frozen rev-6 (merge
+  `a5ee4d8b`, fixture `power-loss-generation.rev6.json`). Same-process transport
+  retry is the only exact same-generation duplicate path.
 - Data sources are **fail-closed and off by default**: `/proc`-based system
   metrics may be collected per center config; systemd unit state is read through
   the shipped read-only D-Bus probe and is UNKNOWN on unavailable/denied.

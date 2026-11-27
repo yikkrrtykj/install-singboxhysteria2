@@ -138,16 +138,23 @@ The R1 credential is still treated as **write-capable**; only the agent's
 GET-only request surface is tested. No real controller secret was used and R1
 production enablement remains HOLD.
 
-## 4c. Power-loss generation amendment
+## 4c. Rev-6 power-loss generation contract (published)
 
-The proposed amendment is a separate docs/fixture-only Draft PR #132
-(`docs/um/um-127/09-power-loss-generation-amendment-draft.md` plus
-`power-loss-generation.amendment.v1.json`). It is **not frozen**; B3 tests label
-the new restart behavior as dependent on that approval. Same-runtime ACK-loss
-exact duplicate remains the old REC-27 consistency case; process crash/restart
-replay uses a new generation/boot/fresh attempt and is duplicate-by-report_id
-while advancing the new generation high-water. Reconciliation tests are in
-`internal/agent` and the real-center process crash harness.
+The rev-6 contract-release PR #132 was independently reviewed (ACCEPT) and
+merged with a normal Merge Commit `a5ee4d8b` (parents `54efc81c` + `1fc7b052`,
+tree `1057b027`); its exact merge-commit main CI completed **25/25 PASS** after
+recording the known external `windows-exe` process-tree flake and a rerun. The
+normative files are `docs/um/um-a/04-node-protocol-v1.rev6.md` and
+`docs/um/contracts/v1/power-loss-generation.rev6.json`; rev-5 remains historical
+and byte-unchanged.
+
+B3 binds the formal fixture AMEND-REC-27-A..F: same-runtime exact retry
+(duplicate), process restart new generation/boot with same payload duplicate and
+high-water advance/no second copy, late retired generation rejection,
+status/read-only non-mutation, same-generation/different-boot conflict, and
+bounded gap acceptance. Executable tests use real center HTTP/SQLite, real agent
+persistence, and the process-level crash harness; parsing the JSON alone is not
+counted as conformance.
 
 ## 4d. R1 isolated-lab acceptance
 
