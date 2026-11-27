@@ -90,7 +90,13 @@ sudo systemctl restart um-agent.service
 sleep 2
 
 MAINPID="$(systemctl show -p MainPID --value um-agent.service)"
-[ -n "$MAINPID" ] && [ "$MAINPID" != "0" ]
+if [ -z "$MAINPID" ] || [ "$MAINPID" = "0" ]; then
+  sudo systemctl --no-pager --full status um-agent.service || true
+  sudo journalctl -u um-agent.service --no-pager -n 80 || true
+  sudo systemctl show -p Result,ExecMainStatus,NRestarts um-agent.service || true
+  echo "um-agent service did not stay running after config+restart" >&2
+  exit 1
+fi
 [ "$(ps -o user= -p "$MAINPID" | tr -d ' ')" = "umagent" ]
 [ "$(systemctl show -p StateDirectory --value um-agent.service)" = "/var/lib/um-agent" ]
 [ "$(stat -c '%a %U' /var/lib/um-agent)" = "700 umagent" ]
