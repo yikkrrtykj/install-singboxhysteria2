@@ -64,7 +64,7 @@
           "report_id": "r-rev6-ack-loss",
           "collected_at": 1795622400,
           "type": "snapshot",
-          "body_sha256": "body-rev6-a"
+          "body_sha256": "sha256:body-rev6-a"
         }
       },
       "expected": {
@@ -117,7 +117,7 @@
           "report_id": "r-rev6-restart",
           "collected_at": 1795622400,
           "type": "snapshot",
-          "body_sha256": "body-rev6-b"
+          "body_sha256": "sha256:body-rev6-b"
         }
       },
       "expected": {
@@ -137,7 +137,7 @@
           "report_id": "r-rev6-restart",
           "collected_at": 1795622400,
           "type": "snapshot",
-          "body_sha256": "body-rev6-b"
+          "body_sha256": "sha256:body-rev6-b"
         }
       },
       "owner_slice": "UM-B1/UM-B2",
@@ -155,7 +155,7 @@
           "boot_id": "cccccccccccccccccccccccccccccccc",
           "last_seq": 1,
           "report_dedupe": {
-            "r-rev6-restart": "fp-rev6-b-new"
+            "r-rev6-restart": "sha256:body-rev6-b"
           },
           "last_fingerprint": "fp-rev6-b-new"
         }
@@ -301,6 +301,7 @@
   "effective_on": "normal merge commit of release PR #132",
   "slice_ownership": {
     "UM-B1": [
+      "AMEND-REC-27-A",
       "AMEND-REC-27-C",
       "AMEND-REC-27-E",
       "AMEND-REC-27-F"
@@ -322,5 +323,6 @@
     ]
   },
   "publication_state": "PENDING_RELEASE_MERGE",
-  "normative_effective_on": "merge of release PR #132"
+  "normative_effective_on": "merge of release PR #132",
+  "report_dedupe_normalization": "report_dedupe values are sha256:<body_sha256> body hashes; last_fingerprint is the request fingerprint."
 }

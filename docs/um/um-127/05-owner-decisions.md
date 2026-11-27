@@ -89,7 +89,7 @@
 | 类别 | 内容 | 决策归属 |
 | --- | --- | --- |
 | **已冻结设计决策**（rev-5） | A-1..A-5 语义；`MAX_BOOT_GAP=65535`；`MAX_NUMERIC=2^63−2`；ACK next_seq exhaustion；SQLite INTEGER/CHECK；node_class/token scope/平台隔离；六 token；独立采样；映射版本+effective_from；rotation 全量校验；R2 优先/R1 不自动启用 | #126 rev-5 冻结；变更需新 amendment + 独立审查 |
-| **未来阶段运行参数** | stale_after/cadence 具体值；R1 是否被接受（Owner 风险决定）；Windows 服务账户/secret 存储 ADR；保留容量/磁盘规格；ingress 选型；通知阈值 | UM-B3/UM-B4/UM-E 给出方案后 Owner 确认；不是当前契约前置 |
+| **未来阶段运行参数/剩余生产策略** | stale_after/cadence 具体值；R1 **生产启用**最终决定；OD-P7 **生产账户/凭据策略**；保留容量/磁盘规格；ingress 选型；通知阈值 | OD-P3/OD-P7 架构已按 10 号记录有限批准；上述生产/运行期参数仍 PENDING，不是当前 rev-6 契约前置 |
 | **仍 PENDING 的 Owner 决策** | 18 项 Q-* 中除 Q-DATA 的 Windows R1 有限部分；OD-P5；OD-R4；其他运行期参数 | PENDING，不得默认接受 |
 | **2026-11-27 rev-6 有限批准** | OD-P3 R1 架构（生产 HOLD）；OD-P7 虚拟账户架构（不授权实际操作）；Q-DATA Windows R1；rev-6 契约方向与 #132 条件式合并授权 | 见 [10-owner-decisions-rev6.md](10-owner-decisions-rev6.md)；不授权 #131/生产 |
 

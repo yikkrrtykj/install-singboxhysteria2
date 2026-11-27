@@ -14,7 +14,7 @@ reconfigures them.
 
 | Phase | Scope | State |
 | --- | --- | --- |
-| **UM-A** | Existing-capability review, technology selection, architecture/trust boundaries, frozen contracts, retention/capacity/backup rules, threat model/security tests/performance budget | **REVISION 5 FINAL TARGETED AMENDMENT — pending independent review and owner merge authorization** |
+| **UM-A** | Existing-capability review, technology selection, architecture/trust boundaries, frozen contracts, retention/capacity/backup rules, threat model/security tests/performance budget | **REVISION 5 PUBLISHED + REVISION 6 POWER-LOSS OVERLAY PENDING RELEASE MERGE** (PR #132) |
 | UM-B | Center service + node infrastructure (enrollment, identity, reporting, revocation, storage, retention) | **HOLD** (preparation may start only after the merge gates) |
 | UM-C | Public web entry + authentication (Cloudflare Tunnel/Access, password, TOTP, sessions) | **HOLD** |
 | UM-D | Dashboard + history features | **HOLD** |
@@ -67,29 +67,32 @@ merge authorization and independent review remain separate.
 | [um-a/02-technology-selection-adr.md](um-a/02-technology-selection-adr.md) | Center/agent/frontend/database/deployment/crypto selections, rejected options, dependency policy |
 | [um-a/03-architecture-and-trust-boundaries.md](um-a/03-architecture-and-trust-boundaries.md) | Context/component/data-flow/deployment diagrams, trust boundaries, permission matrix, isolation rules, data model overview (including `node_class`/terminal/mapping versions) |
 | [um-a/04-node-protocol-v1.md](um-a/04-node-protocol-v1.md) | **Frozen** node registration/auth/report/rotation/revocation, recovery semantics A-1..A-5, numeric/SQLite rules, node classes/platform isolation, Windows terminal telemetry and protocol-version compatibility contract (revision 5) |
+| [um-a/04-node-protocol-v1.rev6.md](um-a/04-node-protocol-v1.rev6.md) | **Revision 6 normative overlay** for power-loss/process-restart generation, REC-27 remap and executable conformance requirements (effective on PR #132 release merge) |
 | [um-a/05-retention-capacity-backup.md](um-a/05-retention-capacity-backup.md) | 30-day history retention, deletion rules, capacity model/limits, SQLite→PostgreSQL gate, backup/restore (RPO/RTO) |
 | [um-a/06-threat-model-security-tests-performance.md](um-a/06-threat-model-security-tests-performance.md) | Threat model, abuse cases, security test plan, performance budgets and UM-E measurement plan (rev-5 platform/mapping/privacy cases added) |
 | [um-a/07-um-b-entry-and-review.md](um-a/07-um-b-entry-and-review.md) | UM-A review checklist, owner decisions (pending; Round-2 review record), UM-B entry criteria, authorization record |
 | [um-a/08-review-response-matrix.md](um-a/08-review-response-matrix.md) | PR #126 review response matrix (P0-01, P1-01..P1-11, rev-5 targeted amendment, owner Round-2 review record) and validation summary |
-| [contracts/v1/](contracts/v1/) | Machine-readable v1 JSON schemas, positive/negative examples, signed test vectors (report, Windows terminal, enrollment, rotate, config), behavioural negative contract (revision 5) |
+| [contracts/v1/](contracts/v1/) | Machine-readable v1 JSON schemas, positive/negative examples, signed test vectors (report, Windows terminal, enrollment, rotate, config), behavioural negative contract (revision 5) and revision-6 power-loss fixture |
 
 ## Authorization record
 
-- Authorized now: UM-A investigation and design only (revision 5 final targeted
-  amendment).
-- Not authorized: UM-B/C/D/E/F implementation, any production deployment,
-  remote writes, merging this PR without independent review approval and owner
-  merge authorization.
-- This PR is a **Draft**; merging, release and production remain explicitly
-  withheld. The owner supplied Round-2 review conclusions (recorded in
-  [um-a/08](um-a/08-review-response-matrix.md)); merge and deployment still
-  require separate owner authorization.
+- Authorized now: UM-A investigation/design (revision 5 published) and the
+  rev-6 contract-release package under its conditional Owner merge authorization.
+- Not authorized by the rev-6 release: B3 PR #131 merge, production deployment,
+  real R1 enablement, or an unauthorized `singbox_api`.
+- UM-B1/B2/B3 implementation work is a separate Draft candidate (#131); it does
+  not become released by the rev-6 contract merge.
+- The rev-6 PR is a **Draft** until independent review PASS, exact-head CI green
+  and the normal Merge Commit gate complete. Merge/release/production remain
+  explicitly withheld until then.
 
 ## Versioning
 
-UM-A design baseline: main `885171c08210ad0f4e91f0fed0243460d294b15e`
-(merge commit of PR #125). Contract v1 **revision 5** is the final targeted
-amendment after the PR #126 reviews and the #128 recovery/dual-platform plan:
+UM-A design baseline: rev-5 was based on main `885171c08210ad0f4e91f0fed0243460d294b15e`
+(merge commit of PR #125); the rev-6 release base is `54efc81c`. Contract v1
+**revision 5** is the published base. The approved rev-6 overlay resolves only
+the power-loss/restart generation semantics; it becomes effective on its release
+merge. Revision-5 content includes:
 signatures are transport headers only and bind endpoint/method/path/encoding/
 identity/time/sequence/nonce/body hash; enrollment is active-on-commit and binds
 `node_class` through the admin token scope; rotation is a persistent state
@@ -104,6 +107,7 @@ with independent selection/connection sampling; center-managed versioned
 mapping keeps historical attribution; source switches are fail-closed and
 authorization-gated (R2-preferred, R1 later owner risk acceptance only); signed
 monotonic boot generations, quotas and security-ledger rules are frozen (restore
-through an unverifiable ledger stays quarantined). Owner decisions remain
-pending. Any incompatible change requires an explicit UM-A design revision
-review before further implementation.
+through an unverifiable ledger stays quarantined). The 2026-11-27 limited Owner
+decisions are recorded in [um-127/10](um-127/10-owner-decisions-rev6.md); other
+Owner decisions/run-time parameters remain pending. Any incompatible change
+requires an explicit UM-A design revision review before further implementation.

@@ -19,7 +19,7 @@
 | Windows 六路径遥测（a_reality/a_hy2/b_reality/b_hy2/direct/unknown）、独立采样、UNKNOWN/UNAVAILABLE、版本化 A/B 映射、隐私负例、签名向量 | 已冻结进 `report-snapshot`/`report-events`/`enroll`/agent 规则与 `examples/` |
 | 更新旧行为向量中与 rev-5 冲突的期望，保留历史追溯 | `superseded_rev4_expectations` + `historical_rev4_enroll_vector` |
 | #128 保留 30 个 REC 用例、Owner 决策登记、UM-B1..UM-G 路线、Go 复用资产、迁移阶段/验收门禁 | **本 PR 同步**；移除独立 PR-A2 前置 |
-| 独立审查 / Owner 合并授权 / 合并 #126 / 合并 #128 / 同步 Go 分支 / UM-B1 实现 / 部署 | **未做，等待授权** |
+| 独立审查 / Owner 合并授权 / 合并 #126 / 合并 #128 / 同步 Go 分支 / UM-B1 实现 / 部署 | **历史行（2026-11-26 rev-5 状态）**；#126/#128 已合并；rev-6 见 §5，B3 #131/生产仍等待授权 |
 
 ## 2. 基线与审查记录
 

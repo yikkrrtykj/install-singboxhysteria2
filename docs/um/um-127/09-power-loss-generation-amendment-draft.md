@@ -139,7 +139,7 @@ edited by this PR; the amendment records precedence):
 | --- | --- | --- |
 | §2 `X-UM-Boot-Gen` / §6.1 "normal restart" | only clean restart increments | every enrolled runtime start, clean or unclean, increments once; **clarified** |
 | §6.3 power-loss row "persisted generation increments on restart" | conflicts with clean-only rule | confirmed for all restarts; **clarified** |
-| §6.3 and the other "clean restart" exhaustion clauses (§301, §378–379, §452, §977) | clean-only | next runtime start, including after power loss; **clarified** |
+| §6.3 and the other "clean restart" exhaustion occurrences (§6.3 ACK exhaustion and §13) | clean-only | next runtime start, including after power loss; **clarified** |
 | REC-27 setup gen3/b3/seq4, agent action "resume from persisted seq" | same-generation agent replay after power loss | **agent action superseded** by REC-27-B; old same-generation center duplicate expectation maps to REC-27-A, the new-generation duplicate is REC-27-B |
 | REC-04 lost-ACK + restart | already new-generation duplicate | unchanged and consistent |
 | `status`/read-only inspection | not explicitly a restart | does not advance generation; **companion clarification** |

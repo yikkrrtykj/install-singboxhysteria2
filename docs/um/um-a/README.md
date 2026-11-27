@@ -54,7 +54,7 @@ inputs needed to start UM-B:
 
 ## How this phase was investigated
 
-Read-only review of main `885171c0…`:
+Read-only review of main `885171c0…` (historical rev-5 investigation basis):
 
 - repository modules and documentation for `monitor-v2`, `sbox-cm`, Remote
   Probe (#67), HA-UI, Windows client, deployment tooling and CI workflows;
