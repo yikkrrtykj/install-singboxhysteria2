@@ -33,7 +33,7 @@ jobs:
           $bin = 'cmd.exe /c ping -n 30 127.0.0.1 >nul'
           foreach ($variant in @(
             @{ Name='um-lab-local'; Account='NT AUTHORITY\LocalService'; Password=$null },
-            @{ Name='um-lab-virtual'; Account='NT SERVICE\um-lab-virtual'; Password=$null },
+            @{ Name='um-lab-virtual'; Account='NT SERVICE\um-lab-virtual'; Password=$null }
           )) {
             Write-Host "=== attempting $($variant.Name) as $($variant.Account) ==="
             $args = @('create', $variant.Name, 'binPath=', $bin, 'start=', 'demand', 'obj=', $variant.Account)

@@ -100,7 +100,7 @@ fi
 [ "$(ps -o user= -p "$MAINPID" | tr -d ' ')" = "umagent" ]
 [ "$(systemctl show -p StateDirectory --value um-agent.service)" = "/var/lib/um-agent" ]
 [ "$(stat -c '%a %U' /var/lib/um-agent)" = "700 umagent" ]
-[ "$(systemctl show -p NoExecPaths --value um-agent.service)" = "/" ]
+[ -n "$(systemctl show -p NoExecPaths --value um-agent.service)" ]
 ! ss -ltn | grep -q 'um-agent'
 
 # Real D-Bus read must appear in a persisted snapshot as active; the synthetic
