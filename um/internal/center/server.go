@@ -75,8 +75,9 @@ func NewServer(cfg Config, svc Service) (*Server, error) {
 // /v1/agent/* POST endpoints and nothing else.
 func (s *Server) Handler() http.Handler { return s.ingest }
 
-// AdminHandler returns the admin-plane handler. It serves only GET
-// /api/health; it deliberately has no /v1/agent/* routes.
+// AdminHandler returns the admin-plane handler. It serves the anonymous
+// GET /api/health probe and, when configured, the authenticated B4
+// /api/v1/* management API. It deliberately has no /v1/agent/* routes.
 func (s *Server) AdminHandler() http.Handler { return s.admin }
 
 // Start binds both listeners and starts serving. Addresses of the form
@@ -234,17 +235,21 @@ func (s *Server) limitConcurrency(next http.Handler) http.Handler {
 // serveAdmin is the whole admin plane. It shares no route or handler state
 // with the ingest plane: node paths are simply unknown here.
 func (s *Server) serveAdmin(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/api/health" {
-		s.writeError(w, NewAPIError(http.StatusNotFound, "endpoint_not_found", false), 0)
+	if r.URL.Path == "/api/health" {
+		if r.Method != http.MethodGet {
+			s.writeError(w, NewAPIError(http.StatusMethodNotAllowed, "method_not_allowed", false), 0)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true,"service":"um-center"}`))
 		return
 	}
-	if r.Method != http.MethodGet {
-		s.writeError(w, NewAPIError(http.StatusMethodNotAllowed, "method_not_allowed", false), 0)
+	if s.cfg.AdminAPI != nil {
+		s.cfg.AdminAPI.ServeHTTP(w, r)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(`{"ok":true,"service":"um-center"}`))
+	s.writeError(w, NewAPIError(http.StatusNotFound, "endpoint_not_found", false), 0)
 }
 
 // nowUnix is the boundary clock used for server_time in boundary-generated

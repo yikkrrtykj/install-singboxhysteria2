@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"sort"
 	"strings"
 	"time"
@@ -109,6 +110,12 @@ type Config struct {
 	// MaxConcurrentRequests bounds in-flight ingest handlers. Zero uses
 	// DefaultMaxConcurrentRequests; a negative value disables the bound for tests.
 	MaxConcurrentRequests int
+
+	// AdminAPI is the optional B4 management handler mounted on the isolated
+	// admin listener under /api/v1/*. It is nil for the B2 health-only center;
+	// when non-nil it owns authentication and RBAC. The ingest handler never
+	// receives this field and the admin listener never serves /v1/agent/*.
+	AdminAPI http.Handler
 }
 
 // withDefaults returns a copy with every unset optional field filled in. It does

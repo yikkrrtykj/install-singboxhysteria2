@@ -74,6 +74,7 @@ type EnrollTokenInfo struct {
 	NodeClass string
 	ExpiresAt int64
 	UsedAt    *int64
+	RevokedAt *int64
 	CreatedAt int64
 }
 
@@ -147,6 +148,9 @@ func (s *Store) CreateEnrollToken(ctx context.Context, tokenHash, eventID, nodeC
 	if _, err := appendLedgerTx(ctx, tx, now, "enroll_token_created", eventID, ledgerDetailHash(tokenHash+"|"+nodeClass)); err != nil {
 		return err
 	}
+	if err := appendAuditFromContextTxFields(ctx, tx, "ok", "enroll_token", eventID); err != nil {
+		return err
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("store: commit enrollment token: %w", err)
 	}
@@ -193,10 +197,10 @@ func (s *Store) Enroll(ctx context.Context, tokenHash, nodeClass, hostOS, public
 
 	var tokenEvent, tokenClass string
 	var expiresAt int64
-	var usedAt sql.NullInt64
+	var usedAt, revokedAt sql.NullInt64
 	err = tx.QueryRowContext(ctx,
-		`SELECT event_id,node_class,expires_at,used_at FROM enroll_tokens WHERE token_hash=?`, tokenHash).
-		Scan(&tokenEvent, &tokenClass, &expiresAt, &usedAt)
+		`SELECT event_id,node_class,expires_at,used_at,revoked_at FROM enroll_tokens WHERE token_hash=?`, tokenHash).
+		Scan(&tokenEvent, &tokenClass, &expiresAt, &usedAt, &revokedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return EnrolledIdentity{}, ErrTokenInvalid
 	}
@@ -205,6 +209,12 @@ func (s *Store) Enroll(ctx context.Context, tokenHash, nodeClass, hostOS, public
 	}
 	if usedAt.Valid {
 		return EnrolledIdentity{}, ErrTokenUsed
+	}
+	if revokedAt.Valid {
+		// A revoked token is unusable even if it was never consumed. The
+		// distinct error lets the boundary map token_revoked without leaking
+		// any token detail.
+		return EnrolledIdentity{}, ErrTokenRevoked
 	}
 	if expiresAt <= now {
 		return EnrolledIdentity{}, ErrTokenExpired
@@ -272,11 +282,11 @@ func (s *Store) Enroll(ctx context.Context, tokenHash, nodeClass, hostOS, public
 // are ErrTokenInvalid.
 func (s *Store) TokenInfo(ctx context.Context, tokenHash string) (EnrollTokenInfo, error) {
 	var info EnrollTokenInfo
-	var used sql.NullInt64
+	var used, revoked sql.NullInt64
 	var created sql.NullInt64
 	err := s.db.QueryRowContext(ctx,
-		`SELECT token_hash,event_id,node_class,expires_at,used_at,created_at FROM enroll_tokens WHERE token_hash=?`, tokenHash).
-		Scan(&info.TokenHash, &info.EventID, &info.NodeClass, &info.ExpiresAt, &used, &created)
+		`SELECT token_hash,event_id,node_class,expires_at,used_at,revoked_at,created_at FROM enroll_tokens WHERE token_hash=?`, tokenHash).
+		Scan(&info.TokenHash, &info.EventID, &info.NodeClass, &info.ExpiresAt, &used, &revoked, &created)
 	if errors.Is(err, sql.ErrNoRows) {
 		return EnrollTokenInfo{}, ErrTokenInvalid
 	}
@@ -286,6 +296,10 @@ func (s *Store) TokenInfo(ctx context.Context, tokenHash string) (EnrollTokenInf
 	if used.Valid {
 		v := used.Int64
 		info.UsedAt = &v
+	}
+	if revoked.Valid {
+		v := revoked.Int64
+		info.RevokedAt = &v
 	}
 	if created.Valid {
 		info.CreatedAt = created.Int64
@@ -660,7 +674,9 @@ func (s *Store) AbortExpiredRotations(ctx context.Context, now int64) (int, erro
 }
 
 // RevokeNode revokes a node and all its keys in one transaction; pending
-// rotations are aborted. This is the admin action (management API is B4).
+// rotations are aborted. This is the admin action (management API is B4): when
+// the request context carries AuditMeta the authenticated actor is recorded both
+// in the hash-chained ledger detail and in admin_audit.
 func (s *Store) RevokeNode(ctx context.Context, nodeID string, now int64) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -676,6 +692,10 @@ func (s *Store) RevokeNode(ctx context.Context, nodeID string, now int64) error 
 	if affected != 1 {
 		return ErrNodeUnknown
 	}
+	var eventID string
+	if err := tx.QueryRowContext(ctx, `SELECT event_id FROM nodes WHERE node_id=?`, nodeID).Scan(&eventID); err != nil {
+		return fmt.Errorf("store: read revoked node event: %w", err)
+	}
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE node_keys SET state=?, revoked_at=? WHERE node_id=? AND state<>?`,
 		KeyRevoked, now, nodeID, KeyRevoked); err != nil {
@@ -686,7 +706,11 @@ func (s *Store) RevokeNode(ctx context.Context, nodeID string, now int64) error 
 		RotationAborted, nodeID, RotationAwaitingProof); err != nil {
 		return fmt.Errorf("store: abort node rotations: %w", err)
 	}
-	if _, err := appendLedgerTx(ctx, tx, now, "node_revoked", nodeID, ledgerDetailHash("admin")); err != nil {
+	actor := auditActorFromContext(ctx, "admin")
+	if _, err := appendLedgerTx(ctx, tx, now, "node_revoked", nodeID, ledgerDetailHash(actor)); err != nil {
+		return err
+	}
+	if err := appendAuditFromContextTxFields(ctx, tx, "ok", "node", eventID); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -917,6 +941,9 @@ func (s *Store) UpdateNodeConfig(ctx context.Context, nodeID string, sources map
 		return NodeConfig{}, fmt.Errorf("store: insert config history: %w", err)
 	}
 	if _, err := appendLedgerTx(ctx, tx, now, "config_update", nodeID, ledgerDetailHash(fmt.Sprintf("v%d", cfg.ConfigVersion))); err != nil {
+		return NodeConfig{}, err
+	}
+	if err := appendAuditFromContextTxFields(ctx, tx, "ok", "node_config", node.EventID); err != nil {
 		return NodeConfig{}, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -1312,7 +1339,7 @@ func (t *Tx) ExistingReportKindHash(ctx context.Context, nodeID, reportID string
 
 // StoreEventsTx persists a validated events report. The caller supplies the
 // per-event rows (already validated against the closed event schema).
-func (t *Tx) StoreEventsTx(ctx context.Context, rec ReportRecord, events []EventRecord) (ReportDisposition, error) {
+func (t *Tx) StoreEventsTx(ctx context.Context, rec ReportRecord, events []ReportEventRecord) (ReportDisposition, error) {
 	var existing string
 	err := t.tx.QueryRowContext(ctx, `SELECT body_sha256 FROM report_event_reports WHERE node_id=? AND report_id=?`, rec.NodeID, rec.ReportID).Scan(&existing)
 	if err == nil {
@@ -1352,8 +1379,9 @@ type ReportRecord struct {
 	Payload                   []byte
 }
 
-// EventRecord is one validated event row.
-type EventRecord struct {
+// ReportEventRecord is one validated event row inside an events report. The
+// catalog-facing event type is EventRecord (UM-B4).
+type ReportEventRecord struct {
 	EventID     string
 	At          int64
 	Kind        string

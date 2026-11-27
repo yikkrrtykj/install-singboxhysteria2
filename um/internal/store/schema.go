@@ -36,7 +36,7 @@ import (
 // SchemaVersion is the highest migration version this build knows. Open always
 // migrates a database to exactly this version; a database with a newer version
 // is rejected fail-closed instead of being silently used by older code.
-const SchemaVersion = 8
+const SchemaVersion = 9
 
 // Node classes accepted by the rev-5 platform isolation contract.
 const (
@@ -557,6 +557,40 @@ var migrations = []migration{
 		 FROM nodes n LEFT JOIN node_configs c ON c.node_id=n.node_id`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_purge_ops_single_incomplete
 		 ON purge_ops(event_id) WHERE state <> 'completed'`,
+	}},
+	{version: 9, statements: []string{
+		// UM-B4 management metadata. All additions are forward-only; no B1/B2/B3
+		// protocol or high-water semantics are changed.
+		`ALTER TABLE event_catalog ADD COLUMN display_name TEXT`,
+		`ALTER TABLE enroll_tokens ADD COLUMN revoked_at INTEGER`,
+		`CREATE TABLE IF NOT EXISTS admin_audit (
+			id          INTEGER PRIMARY KEY AUTOINCREMENT,
+			at          INTEGER NOT NULL CHECK (typeof(at) = 'integer'),
+			actor       TEXT NOT NULL,
+			role        TEXT NOT NULL,
+			action      TEXT NOT NULL,
+			target      TEXT NOT NULL,
+			event_id    TEXT,
+			result      TEXT NOT NULL CHECK (result IN ('ok','denied','error')),
+			detail      TEXT,
+			request_id  TEXT
+		) STRICT`,
+		`CREATE INDEX IF NOT EXISTS idx_admin_audit_at ON admin_audit(at DESC, id DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_admin_audit_event ON admin_audit(event_id, at DESC)`,
+		`CREATE TABLE IF NOT EXISTS aliases (
+			event_id    TEXT NOT NULL,
+			target_type TEXT NOT NULL CHECK (target_type IN ('node','device_ref','route')),
+			target_key  TEXT NOT NULL,
+			display_name TEXT NOT NULL,
+			version     INTEGER NOT NULL DEFAULT 1 CHECK (version >= 1),
+			updated_at  INTEGER NOT NULL CHECK (typeof(updated_at) = 'integer'),
+			updated_by  TEXT NOT NULL,
+			PRIMARY KEY (event_id, target_type, target_key)
+		) STRICT`,
+		`CREATE INDEX IF NOT EXISTS idx_aliases_event ON aliases(event_id, target_type)`,
+		`CREATE INDEX IF NOT EXISTS idx_nodes_event_class_state ON nodes(event_id, node_class, state)`,
+		`CREATE INDEX IF NOT EXISTS idx_nodes_event_last_seen ON nodes(event_id, last_seen_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_enroll_tokens_event_expiry ON enroll_tokens(event_id, expires_at)`,
 	}},
 }
 

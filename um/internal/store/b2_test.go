@@ -334,7 +334,7 @@ func seedTelemetry(t *testing.T, s *Store, id EnrolledIdentity, reportID string,
 	if err := s.WithTx(ctx, func(tx *Tx) error {
 		_, err := tx.StoreEventsTx(ctx, ReportRecord{NodeID: id.NodeID, EventID: id.EventID, ReportID: "e-" + reportID,
 			CollectedAt: collectedAt, ReceivedAt: now, BodySHA256: "e-" + reportID, Payload: []byte(`{"v":1}`)},
-			[]EventRecord{{EventID: "ev-" + reportID, At: collectedAt, Kind: "agent_started", DetailsJSON: `{}`}})
+			[]ReportEventRecord{{EventID: "ev-" + reportID, At: collectedAt, Kind: "agent_started", DetailsJSON: `{}`}})
 		return err
 	}); err != nil {
 		t.Fatalf("seed events %s: %v", reportID, err)
@@ -756,7 +756,7 @@ func TestB2EventStorageNormalizationAndCrossTypeConflict(t *testing.T) {
 			return fmt.Errorf("report dedupe status=%q err=%v", status, err)
 		}
 		_, err := tx.StoreEventsTx(ctx, ReportRecord{NodeID: id.NodeID, EventID: id.EventID, ReportID: "events-1",
-			CollectedAt: now, ReceivedAt: now, BodySHA256: "h-events", Payload: payload}, []EventRecord{
+			CollectedAt: now, ReceivedAt: now, BodySHA256: "h-events", Payload: payload}, []ReportEventRecord{
 			{EventID: "ev-1", At: now, Kind: "agent_started", Severity: "warning", DetailsJSON: `{"a":1}`},
 			{EventID: "ev-2", At: now + 1, Kind: "agent_error", Severity: "critical", DetailsJSON: `{"b":2}`},
 		})

@@ -457,9 +457,9 @@ func (s *ServiceImpl) Report(ctx context.Context, req ReportRequest) (ReportResu
 				if err := json.Unmarshal(req.Body, &eventsEnv); err != nil {
 					return "", apiErr(400, "invalid_request", false)
 				}
-				records := make([]store.EventRecord, 0, len(eventsEnv.Events))
+				records := make([]store.ReportEventRecord, 0, len(eventsEnv.Events))
 				for _, e := range eventsEnv.Events {
-					records = append(records, store.EventRecord{EventID: e.EventID, At: e.At, Kind: e.Kind, Severity: e.Severity, DetailsJSON: string(e.Detail)})
+					records = append(records, store.ReportEventRecord{EventID: e.EventID, At: e.At, Kind: e.Kind, Severity: e.Severity, DetailsJSON: string(e.Detail)})
 				}
 				d, err := tx.StoreEventsTx(ctx, store.ReportRecord{
 					NodeID: node.NodeID, EventID: node.EventID, ReportID: env.ReportID,

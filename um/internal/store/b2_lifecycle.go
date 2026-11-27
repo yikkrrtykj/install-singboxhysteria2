@@ -385,6 +385,9 @@ func (s *Store) ArchiveEvent(ctx context.Context, eventID string, now int64) err
 	if _, err := appendLedgerTx(ctx, tx, now, "event_archived", eventID, ledgerDetailHash(fmt.Sprintf("T=%d", now))); err != nil {
 		return err
 	}
+	if err := appendAuditFromContextTxFields(ctx, tx, "ok", "event", eventID); err != nil {
+		return err
+	}
 	if s.retentionHook != nil {
 		if err := s.retentionHook("archive:write"); err != nil {
 			return fmt.Errorf("store: archive fault injection: %w", err)

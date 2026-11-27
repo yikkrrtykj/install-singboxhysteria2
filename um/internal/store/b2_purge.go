@@ -424,6 +424,11 @@ func (s *Store) PurgeEvent(ctx context.Context, eventID, actor string, confirm b
 		if _, err := tx.ExecContext(ctx, `DELETE FROM enroll_tokens WHERE event_id=?`, eventID); err != nil {
 			return err
 		}
+		// UM-B4 event-scoped aliases are administrative metadata for the event's
+		// nodes/routes; they must not outlive the event whose nodes they name.
+		if _, err := tx.ExecContext(ctx, `DELETE FROM aliases WHERE event_id=?`, eventID); err != nil {
+			return err
+		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM event_catalog WHERE event_id=?`, eventID); err != nil {
 			return err
 		}
@@ -450,6 +455,9 @@ func (s *Store) PurgeEvent(ctx context.Context, eventID, actor string, confirm b
 		}
 		if _, err := appendLedgerTx(ctx, tx, now, "event_purged", eventID,
 			ledgerDetailHash(actor+"|"+counts)); err != nil {
+			return err
+		}
+		if err := appendAuditFromContextTxFields(ctx, tx, "ok", "event_purge", eventID); err != nil {
 			return err
 		}
 		if err := tx.Commit(); err != nil {
