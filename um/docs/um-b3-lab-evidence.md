@@ -3,8 +3,9 @@
 This file records the non-production lab runs referenced by the B3 matrix. All
 tests used isolated temporary directories, synthetic configuration and synthetic
 credentials. No production host, VPS, Cloudflare account, real Mihomo config or
-real credential was used. The lab environment was a Windows review host; the
-Linux D-Bus/systemd and Windows SCM/service-account labs are not claimed here.
+real credential was used. The lab environment included the Windows review host
+and disposable GitHub-hosted Ubuntu 24.04 / Windows 2022 runners; the isolated
+systemd/D-Bus and SCM/DPAPI/R1 labs were executed and are recorded below.
 
 ## 1. Real sing-box 1.14.5 service.api
 
@@ -58,10 +59,10 @@ See `um-b3-adr-windows-sources.md` §6. Isolated Mihomo/Clash Verge Rev lab:
 - The test asserts `identity.json` and `rotation.json` do not contain the
   Ed25519/rotation private-key plaintext and can be reopened by the same
   Windows user.
-- This is **current-user only**. Virtual service account
-  `NT SERVICE\um-agent`, session-0, service-SID ACL, service-account DPAPI and
-  enrollment-under-service-account were not testable on the non-admin host;
-  OD-P7 remains PENDING.
+- This was originally current-user only on the non-admin review host. The
+  isolated Windows 2022 SCM lab later executed the same DPAPI identity/rotation
+  checks under `NT SERVICE\um-agent` with session-0/service-SID ACL (run
+  46039366384 PASS). The final production account remains OD-P7 PENDING.
 
 ## 4. Process-level crash/recovery harness
 
@@ -177,7 +178,7 @@ The lab uses a synthetic mixed inbound, not real Reality/Hysteria2 inbounds;
 those protocol-specific experiments remain unverified and are not claimed
 (the source itself is disabled because the P1-10 authorization audit fails).
 
-## 5. Not executed
+## 5. Remaining not executed / external HOLD
 
 - Real Linux systemd/D-Bus evidence is now available from the isolated Ubuntu
   runner (above); the broader target-version matrix and noexec on other systemd

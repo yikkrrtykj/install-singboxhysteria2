@@ -24,9 +24,10 @@
       DPAPI CurrentUser, so enrollment must run under this same service account;
       this installer does not perform enrollment.
     * The Windows agent's optional R1 observer path is disabled by default and
-      requires an explicit UM_AGENT_WINDOWS_SOURCE_AUTHORIZED gate plus
-      Owner-approved profile/secret provisioning; this installer does not
-      create or enable it.
+      activates only from a protected local bundle provisioned by
+      `um-agent r1-provision` under the service account after Owner approval;
+      there is no environment-variable authorization/secret switch. This
+      installer does not create or enable R1.
     * Service command line uses the Draft CLI (subject to code slice):
       `um-agent.exe service --state-dir <dir> --center <url> `
       `--node-class windows_terminal` (the SCM wrapper parses flags; there is
