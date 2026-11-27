@@ -469,10 +469,18 @@ func TestAgentRunRecoversCommittedProofBeforeConfig(t *testing.T) {
 	tc := startAgentCenter(t)
 	var dropProof atomic.Bool
 	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		resp, err := http.DefaultTransport.RoundTrip(req)
+		if err != nil {
+			return nil, err
+		}
 		if dropProof.Load() && strings.HasSuffix(req.URL.Path, "/report") {
+			// The center has committed the proof (and revoked the old key), but
+			// the agent never sees the ACK.
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
 			return nil, errors.New("simulated proof ACK loss")
 		}
-		return http.DefaultTransport.RoundTrip(req)
+		return resp, nil
 	})}
 	dir := t.TempDir()
 	r := newTestRuntime(t, tc, dir, unavailableCollector{}, client)
