@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -461,6 +462,107 @@ func TestAgentRunResumesAfterRecoveredConfigRetry(t *testing.T) {
 	}
 	if stats, err := tc.st.CapacityStats(context.Background()); err != nil || stats.Snapshots == 0 {
 		t.Fatalf("collection did not resume after recovery: stats=%+v err=%v", stats, err)
+	}
+}
+
+func TestAgentRunRecoversCommittedProofBeforeConfig(t *testing.T) {
+	tc := startAgentCenter(t)
+	var dropProof atomic.Bool
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if dropProof.Load() && strings.HasSuffix(req.URL.Path, "/report") {
+			return nil, errors.New("simulated proof ACK loss")
+		}
+		return http.DefaultTransport.RoundTrip(req)
+	})}
+	dir := t.TempDir()
+	r := newTestRuntime(t, tc, dir, unavailableCollector{}, client)
+	ctx := context.Background()
+	if err := r.Enroll(ctx, tc.token); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.PullConfig(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Rotate(ctx); err != nil {
+		t.Fatalf("Rotate: %v", err)
+	}
+	if rot, ok := r.state.Rotation(); !ok || rot.NewKeyID == "" {
+		t.Fatalf("rotation intent missing: %+v", rot)
+	}
+	dropProof.Store(true)
+	_ = r.Flush(ctx) // center commits proof; ACK lost; local identity stays old
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Abrupt restart: no clean-shutdown marker.
+	if err := os.Remove(filepath.Join(dir, cleanShutdownFile)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatal(err)
+	}
+	r2 := newTestRuntime(t, tc, dir, unavailableCollector{}, nil)
+	defer r2.Close()
+	r2.opts.Sleep = func(ctx context.Context, _ time.Duration) error {
+		select {
+		case <-time.After(5 * time.Millisecond):
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	runCtx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	err := r2.Run(runCtx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Run after proof ACK loss = %v, want continued loop until deadline", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, failClosedFile)); err == nil {
+		t.Fatal("agent wrote fail-closed marker instead of recovering provisional identity")
+	}
+	ident, ok := r2.Identity()
+	if !ok || ident.KeyID == "" {
+		t.Fatal("identity missing after recovery")
+	}
+}
+
+func TestAgentProofRotationExpiredClearsIntent(t *testing.T) {
+	tc := startAgentCenter(t)
+	var expire atomic.Bool
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if expire.Load() && strings.HasSuffix(req.URL.Path, "/report") {
+			return &http.Response{StatusCode: http.StatusBadRequest,
+				Header: http.Header{"Content-Type": []string{"application/json"}},
+				Body: io.NopCloser(strings.NewReader(
+					`{"v":1,"error":"rotation_expired","retryable":false,"server_time":1795622400}`)),
+				Request: req}, nil
+		}
+		return http.DefaultTransport.RoundTrip(req)
+	})}
+	dir := t.TempDir()
+	r := newTestRuntime(t, tc, dir, unavailableCollector{}, client)
+	defer r.Close()
+	ctx := context.Background()
+	if err := r.Enroll(ctx, tc.token); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.PullConfig(ctx); err != nil {
+		t.Fatal(err)
+	}
+	old, _ := r.Identity()
+	if err := r.Rotate(ctx); err != nil {
+		t.Fatalf("Rotate: %v", err)
+	}
+	expire.Store(true)
+	if err := r.Flush(ctx); err != nil {
+		t.Fatalf("rotation_expired proof became fatal: %v", err)
+	}
+	if rot, ok := r.state.Rotation(); ok {
+		t.Fatalf("expired rotation intent retained: %+v", rot)
+	}
+	got, ok := r.Identity()
+	if !ok || got.KeyID != old.KeyID {
+		t.Fatalf("identity changed on rotation_expired: %+v", got)
+	}
+	if _, err := os.Stat(filepath.Join(dir, failClosedFile)); err == nil {
+		t.Fatal("rotation_expired wrote fail-closed marker")
 	}
 }
 

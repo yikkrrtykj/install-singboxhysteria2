@@ -945,6 +945,20 @@ func (r *Runtime) Run(ctx context.Context) error {
 		return ErrNotEnrolled
 	}
 	_ = ident
+	// If a rotation proof was committed by the center but the process died
+	// before persisting the new identity (or its ACK was lost), recover it
+	// first. The center has already revoked the old key; a config request under
+	// that key would fail closed before the provisional identity can recover.
+	if rot, ok := r.state.Rotation(); ok && rot.NewKeyID != "" {
+		if err := r.Flush(ctx); err != nil {
+			if !IsRetryable(err) {
+				return err
+			}
+			if err := r.Drive(ctx); err != nil {
+				return err
+			}
+		}
+	}
 	if _, ok := r.state.Config(); !ok {
 		if err := r.PullConfig(ctx); err != nil {
 			if !IsRetryable(err) {
@@ -1192,9 +1206,10 @@ func (r *Runtime) driveProofLocked(ctx context.Context, ident Identity, rot Rota
 	}
 	if err != nil {
 		var ce *CenterError
-		if errors.As(err, &ce) && ce.Code == "revoked_key" {
+		if errors.As(err, &ce) && (ce.Code == "revoked_key" || ce.Code == "rotation_expired") {
 			// Provisional key was rejected/expired: discard the local intent and
-			// continue with the still-active old key.
+			// continue with the still-active old key, matching the rotation
+			// request path for rotation_expired.
 			_ = r.state.clearRotation()
 			_ = r.state.clearControl()
 			return nil
