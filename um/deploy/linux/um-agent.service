@@ -87,20 +87,13 @@ MemoryMax=96M
 TasksMax=32
 CPUQuota=20%
 
-# ---- data sources (DISABLED until the versioned P1-10 audit/Owner enablement)
+# ---- data sources (DISABLED; no supported service.api enablement)
 # The systemd D-Bus ActiveState probe is read-only and may be left available;
 # center `collect.services` remains false by default. The sing-box service.api
-# credential must be delivered by LoadCredential and the source remains off
-# until the authorization audit is recorded:
-# LoadCredential=singbox_api:/root/sbox/monitor-api.secret
-# Environment=UM_AGENT_SINGBOX_API_URL=http://127.0.0.1:9091
-# Environment=UM_AGENT_SINGBOX_API_SECRET_FILE=/run/credentials/um-agent.service/singbox_api
-# Environment=UM_AGENT_SINGBOX_SOURCE_AUTHORIZED=1
-# The last flag is an operator assertion that the versioned audit exists; it
-# must not be set before Owner authorization.
-
-# The credential source stays root-owned (0400 root:root); the agent receives
-# it through $CREDENTIALS_DIRECTORY and never persists it in state or logs.
+# source is unavailable in this release: the v1.14.5 P1-10 authorization audit
+# failed because the credential is write-capable. No environment variable,
+# LoadCredential path or center switch authorizes it until a separately approved
+# versioned mechanism exists.
 
 [Install]
 WantedBy=multi-user.target

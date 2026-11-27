@@ -11,6 +11,9 @@ package agent
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,6 +22,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
 
 const rev6FixturePath = "../../../docs/um/contracts/v1/power-loss-generation.rev6.json"
@@ -261,8 +266,8 @@ func TestRev6AMENDREC27BC(t *testing.T) {
 	if err := r2.Flush(ctx); err != nil {
 		t.Fatalf("B replay: %v", err)
 	}
-	if got := r2.LastResult(); got != "duplicate" {
-		t.Fatalf("B result=%q, want duplicate", got)
+	if got := r2.LastResult(); got != b.Expected.Result {
+		t.Fatalf("B result=%q, want fixture %q", got, b.Expected.Result)
 	}
 	assertRev6Center(t, tc, r2, b.Expected.CenterState.HighestGen, b.Expected.CenterState.LastSeq)
 	if stats, err := tc.st.CapacityStats(ctx); err != nil || stats.Snapshots != int64(b.Setup.Center.LastSeq) {
@@ -288,8 +293,19 @@ func TestRev6AMENDREC27D(t *testing.T) {
 	if err := s.saveIdentity(testIdentity(t)); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.saveBoot(BootState{Version: stateVersion, Generation: 4,
-		BootID: "cccccccccccccccccccccccccccccccc", NextSeq: 2}); err != nil {
+	if err := s.saveBoot(BootState{Version: stateVersion,
+		Generation: c.Setup.Agent.Generation, BootID: c.Setup.Agent.BootID,
+		NextSeq: c.Setup.Agent.NextSeq}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Spool().Enqueue(SpoolRecord{
+		Version: stateVersion, ID: "11111111-1111-4111-8111-111111111111",
+		Kind: "snapshot", CreatedAt: 1795622400,
+		Attempt: Attempt{Generation: c.Setup.Agent.Generation, BootID: c.Setup.Agent.BootID,
+			Seq: c.Setup.Agent.NextSeq, SentAt: 1795622400, Nonce: "AAAAAAAAAAAAAAAAAAAAAA"},
+		Body: unavailableSnapshot(ReportContext{ReportID: "11111111-1111-4111-8111-111111111111",
+			CollectedAt: 1795622400, Host: HostInfo{OS: "linux"}}),
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Close(); err != nil {
@@ -300,8 +316,12 @@ func TestRev6AMENDREC27D(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read-only inspection: %v", err)
 	}
-	if inspection.Generation != c.Expected.Generation {
-		t.Fatalf("inspection generation=%d, want %d", inspection.Generation, c.Expected.Generation)
+	if inspection.Generation != c.Setup.Agent.Generation || inspection.NextSeq != c.Setup.Agent.NextSeq {
+		t.Fatalf("inspection generation/seq=%d/%d, want %d/%d", inspection.Generation, inspection.NextSeq,
+			c.Setup.Agent.Generation, c.Setup.Agent.NextSeq)
+	}
+	if inspection.Pending != 1 {
+		t.Fatalf("inspection pending=%d, want fixture spool record", inspection.Pending)
 	}
 	if after := treeDigest(t, dir); after != before {
 		t.Fatalf("read-only inspection mutated state tree: %s != %s", after, before)
@@ -389,12 +409,24 @@ func TestRev6AMENDREC27F(t *testing.T) {
 	if err := r.Flush(ctx); err != nil {
 		t.Fatalf("F accepted gap report: %v", err)
 	}
-	if got := r.LastResult(); got != "accepted" {
-		t.Fatalf("F result=%q, want accepted", got)
+	if got := r.LastResult(); got != c.Expected.Result {
+		t.Fatalf("F result=%q, want fixture %q", got, c.Expected.Result)
 	}
 	assertRev6Center(t, tc, r, c.Expected.CenterState.HighestGen, c.Expected.CenterState.LastSeq)
 	if err := tc.st.VerifyChain(ctx); err != nil {
 		t.Fatalf("F gap audit ledger: %v", err)
+	}
+	db, err := sql.Open("sqlite", tc.st.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var gapAudits int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM security_ledger WHERE kind = ?`, c.Expected.GapAudit).Scan(&gapAudits); err != nil {
+		t.Fatalf("F gap audit query: %v", err)
+	}
+	if gapAudits < 1 {
+		t.Fatalf("F gap audit %q rows=%d, want >=1", c.Expected.GapAudit, gapAudits)
 	}
 }
 
@@ -415,8 +447,9 @@ func treeDigest(t *testing.T, dir string) string {
 		if err != nil {
 			return err
 		}
+		sum := sha256.Sum256(data)
 		b.WriteString(":")
-		b.WriteString(fmt.Sprint(len(data)))
+		b.WriteString(hex.EncodeToString(sum[:]))
 		b.WriteString(":")
 		b.WriteString(fmt.Sprint(info.Mode()))
 		b.WriteString("\n")

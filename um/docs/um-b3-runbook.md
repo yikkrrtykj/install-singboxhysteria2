@@ -134,15 +134,13 @@ already passed by this Draft):
 - Data sources are **fail-closed and off by default**: `/proc`-based system
   metrics may be collected per center config; systemd unit state is read through
   the shipped read-only D-Bus probe and is UNKNOWN on unavailable/denied.
-  `singbox_api` stays disabled until the P1-10 server-side authorization audit is
-  recorded and the Owner authorizes the source. The official service.api
-  credential path uses `UM_AGENT_SINGBOX_API_SECRET_FILE` (normally a systemd
-  `LoadCredential` path) and `UM_AGENT_SINGBOX_API_URL` (default
-  `http://127.0.0.1:9091`); `UM_AGENT_SINGBOX_SOURCE_AUTHORIZED=1` is an operator
-  assertion that the P1-10 audit exists and must not be set early. Without a
-  configured probe the source stays unavailable and the required G7 diagnostic
-  event is emitted. A source that is not authorized reports
-  `unavailable`/`unknown` + closed reason code — never fabricated data.
+  `singbox_api` stays **disabled/unavailable** and has **no supported
+  enablement path in this release**: the v1.14.5 P1-10 server-side
+  authorization audit failed (the single service.api secret is write-capable),
+  and no environment variable, LoadCredential path, center switch or local
+  credential path authorizes it. Lab tests construct a probe in-process only.
+  The required G7 diagnostic event is emitted and the projection stays
+  `unavailable`/`unknown` with closed reason codes — never fabricated data.
 - Availability honesty: missing data is null/UNKNOWN; no fake zeroes, no "up"
   without evidence, no traffic absence reported as down.
 - Clock: if the center returns `stale_timestamp`, the agent recalibrates from

@@ -78,7 +78,9 @@ official release binary, a synthetic loopback API, and a local echo target.
 - **P1-10 authorization audit: FAIL / cannot be proven** for the tested
   release: the one credential is write-capable.
 - `collect.singbox_api` stays **disabled/unavailable by default** and no
-  credential is accepted in any production path.
+  credential is accepted or wired from environment variables, a center switch
+  or a local credential path in this release. The legacy environment variables
+  are inert and covered by a regression test.
 - The implemented client is retained for isolated lab and future contract work
   only; it is not enabled by center config or environment.
 - No production sing-box configuration, permission or credential was changed.

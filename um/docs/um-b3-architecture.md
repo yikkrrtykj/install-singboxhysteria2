@@ -365,7 +365,7 @@ are **not frozen** until review; deploy assets document the intended shape:
 | `um-agent run` | `--state-dir DIR`, `--center URL`, `--node-class ...`, `--once` (one snapshot then exit; lab use) | same env vars |
 | `um-agent rotate` | `--state-dir ...`, `--center ...`, `--node-class ...` | same env vars |
 | `um-agent status` | `--state-dir ...` (diagnostics only: enrolled/terminal/config version/generation/sequencing/pending/quarantined; no secrets) | `UM_AGENT_STATE_DIR` |
-| Linux source env | no flags; D-Bus probe automatic; service.api only when configured | `UM_AGENT_SINGBOX_API_URL` (default `http://127.0.0.1:9091`), `UM_AGENT_SINGBOX_API_SECRET_FILE`, `UM_AGENT_SINGBOX_SOURCE_AUTHORIZED` (operator P1-10 assertion) |
+| Linux source env | no flags; D-Bus probe automatic; **no supported service.api enablement path in this release** | none; the P1-10 authorization audit failed, so the collector remains unavailable/disabled even if env variables are present. Lab tests construct a probe in-process only. |
 | Windows R1 provisioning | `um-agent r1-provision --state-dir ... --profile ... --secret-file ... --owner-reference ...` under the service account; no env/center bypass | fixed `<state>/r1/{acceptance.json,profile.json,controller.secret.dpapi}`; production scope rejected |
 | Windows source env | no authorization/secret environment variables; R1 activates solely from the protected local bundle | none |
 | `um-agent service` (Windows SCM lifecycle wrapper) | `--state-dir`, `--center`, `--node-class` (flags passed through to the run loop); account, ACL, DPAPI scope, credential rotation and installation remain **OD-P7-gated** | same env vars |

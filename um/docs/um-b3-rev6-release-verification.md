@@ -79,9 +79,11 @@ are recorded on PR #131/Issue #127 after the final verification cycle.
 
 Tests: `um/internal/agent/rev6_conformance_test.go` (A-F; real center/agent
 HTTP/SQLite state), `um/cmd/um-agent/status_test.go` (real status CLI and
-state-tree hash), `um/internal/agentintegration/crash_recovery_test.go`
-(process-level crash/restart B fixture binding and payload dedupe). These tests
-read the normative fixture fields; it is not a JSON-parse-only check.
+state-tree content hash), `um/internal/agentintegration/crash_recovery_test.go`
+(process-level crash/restart B fixture binding and payload dedupe). The tests
+read the fixture's setup/expected result, high-water, gap and error fields and
+assert the real derived state; synthetic fixture hashes/names are metadata, not
+literal server-computed values. It is not a JSON-parse-only check.
 
 ## Remaining limits
 
