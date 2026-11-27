@@ -57,10 +57,11 @@ func (unavailableServiceProbe) ObserveServices(context.Context) (ServiceObservat
 // generic call, no method invocation and no write method in the interface, so
 // no D-Bus client built on it can start/stop/enable a unit.
 //
-// This repository intentionally does NOT ship a raw D-Bus wire client: the
-// implementation would be large, and the honest default (unavailable) is
-// preferred over an unverified one. A reviewed UM-B3 implementation may inject
-// a real DBusProbe through DBusServiceProbe.
+// The Linux build ships SystemdDBusProbe (see dbus_linux.go), a real
+// unprivileged system-bus client with exactly the two fixed read calls above.
+// Non-Linux builds return the honest unavailable default. The seam remains
+// injectable for tests and for an operator that wants to supply a reviewed
+// alternative.
 type DBusProbe interface {
 	// ActiveState reads the systemd unit ActiveState property. It must not
 	// mutate state, must not require root and must honour ctx.

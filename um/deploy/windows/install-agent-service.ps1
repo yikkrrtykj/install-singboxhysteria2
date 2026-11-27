@@ -19,12 +19,21 @@
       no write path and no listening socket.
     * The Windows runtime account and DPAPI/ACL scope are OD-P7 PENDING
       (see um/docs/um-b3-adr-credentials.md). Choosing LocalService here is a
-      placeholder minimum, not an approved final decision.
-    * Service command line uses the Draft CLI (subject to the code slice):
+      placeholder minimum, not an approved final decision. The agent protects
+      its own Ed25519 identity and rotation provisional private keys with
+      DPAPI CurrentUser, so enrollment must run under this same service account;
+      this installer does not perform enrollment.
+    * The Windows agent's optional R1 observer path is disabled by default and
+      requires an explicit UM_AGENT_WINDOWS_SOURCE_AUTHORIZED gate plus
+      Owner-approved profile/secret provisioning; this installer does not
+      create or enable it.
+    * Service command line uses the Draft CLI (subject to code slice):
       `um-agent.exe service --state-dir <dir> --center <url> `
       `--node-class windows_terminal` (the SCM wrapper parses flags; there is
-      no literal `run` word). Service account/ACL/DPAPI installation remains
-      OD-P7-gated.
+      no literal `run` word). The service name must remain the fixed
+      `um-agent` because the SCM wrapper uses that name. Account/ACL/DPAPI
+      enrollment remains OD-P7-gated; the installer creates an Application
+      event-log source and no controller secret.
 
 .PARAMETER ServiceAccount
   Session-0 service account. Built-in `NT AUTHORITY\LocalService` needs no

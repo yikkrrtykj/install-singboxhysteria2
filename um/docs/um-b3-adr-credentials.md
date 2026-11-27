@@ -22,13 +22,35 @@
 | --- | --- | --- | --- |
 | D-1 | Linux agent runtime identity and file permissions | non-login `umagent`; `/var/lib/um-agent` 0700 `umagent`; key/state files 0600; root-only bootstrap token; no root resident process | **PROPOSED** (already congruent with frozen contract; no extra Owner decision requested) |
 | D-2 | Linux data-source credential delivery | systemd `LoadCredential=` from a root-owned file into the `umagent` process; source permissions unchanged; no plaintext copy in agent state; source off by default | **PROPOSED** |
-| D-3 | Windows agent runtime account | session-0 Windows service under a **dedicated non-admin** account (virtual service account or dedicated local user); `LocalSystem` rejected; `LocalService` acceptable minimum only with Owner acceptance | **PENDING OWNER** |
-| D-4 | Windows secret storage scope | DPAPI **CurrentUser** scope of the service account (preferred) or machine scope only with explicit Owner risk acceptance; R2 (no secret) preferred over both | **PENDING OWNER** |
+| D-3 | Windows agent runtime account | session-0 Windows service under a **dedicated non-admin** account (virtual service account `NT SERVICE\um-agent` preferred or dedicated local user); `LocalSystem` rejected; `LocalService` acceptable minimum only with Owner acceptance | **PENDING OWNER** |
+| D-4 | Windows secret storage scope | DPAPI **CurrentUser** scope of the service account (preferred, implemented for agent state); machine scope only with explicit Owner risk acceptance; R2 (no secret) preferred over both | **PENDING OWNER; CurrentUser node-key protection IMPLEMENTED, account/enrollment validation pending** |
 | D-5 | R1 controller credential (write-capable) | **NOT authorized**; if ever accepted, only as a separate OD-P3 Owner risk acceptance with the mitigations in `04` §11 | **PENDING OWNER / BLOCKED** |
 | D-6 | Install/upgrade/uninstall and rotation procedure | account and storage scope fixed before install; no secret in scripts/repo/logs; upgrade preserves state; uninstall requires explicit data-purge confirmation | **PROPOSED** |
 
 No real credential, token, password, private key or DPAPI blob may be created,
 requested or stored by UM-B3 work. This ADR contains none.
+
+## 1a. Implementation status at this Draft (not an OD-P7 approval)
+
+- The shared `internal/secretstore` package implements DPAPI CurrentUser with
+  synthetic round-trip tests on the Windows host. The agent runtime protects
+  `identity.json` private-key material and `rotation.json` provisional private
+  key material at rest with DPAPI CurrentUser, and migrates legacy plaintext
+  state on first open under the same Windows account. Machine scope is not used
+  by default.
+- This is **current-user** protection, not a service-account validation. The
+  Windows SCM/account/ACL provisioning, virtual-service-account profile
+  behavior, session-0 source access and enrollment-under-service-account flow
+  remain **OD-P7 PENDING**. Enrollment must run under the same Windows account
+  that later decrypts the state; changing the account without a rewrap/re-enroll
+  plan makes the state fail closed (documented, not silently reset).
+- The Windows installer template still defaults to `LocalService` for a safe
+  placeholder; it is not the proposed virtual service account and must not be
+  treated as final. The installer does not run enrollment, create a DPAPI
+  secret, or approve an account.
+- The node private key must be protected even if R2 is proven and no controller
+  secret exists. `LocalSystem` remains forbidden; `LocalMachine` DPAPI scope is
+  not a default.
 
 ## 2. Linux file-permission baseline (proposed; aligns with frozen contract)
 
@@ -134,9 +156,11 @@ objects; no new public listener; outbound HTTPS to the center only.
    the approved provisioning step as the service account, restart service,
    verify an authenticated response; no center-side change; secret never in
    logs/repo/issues/scripts.
-5. **Windows node key** — same frozen rotation as Linux; DPAPI protection of the
-   node key is an **optional hardening question for the Owner** (the key file
-   can be ACL-only or DPAPI-wrapped); either way it never leaves the host.
+5. **Windows node key** — same frozen rotation as Linux. Node identity and
+   rotation provisional private keys are now **DPAPI CurrentUser-protected at
+   rest** (implemented in `internal/agent` via `internal/secretstore`); this is
+   required even if R2 needs no controller secret. The final service-account
+   context/enrollment flow and machine-scope use remain Owner decisions.
 
 ## 7. Install / upgrade / uninstall (proposed)
 

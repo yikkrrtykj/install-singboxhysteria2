@@ -179,7 +179,7 @@ func writeAtomic(path string, data []byte) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	if err := replaceFile(tmp, path); err != nil {
 		return err
 	}
 	if err := syncDir(dir); err != nil {
@@ -275,7 +275,7 @@ func OpenState(dir string) (*State, error) {
 	if err := s.acquireLock(); err != nil {
 		return nil, err
 	}
-	cleanup := func() { _ = s.Close() }
+	cleanup := func() { _ = s.release() }
 	var ident Identity
 	hasIdent, err := readJSON(filepath.Join(dir, identityFile), &ident)
 	if err != nil {
@@ -438,16 +438,25 @@ func (s *State) acquireLock() error {
 	return nil
 }
 
-// Close releases the OS advisory lock and closes the lock file; it never
-// deletes identity/boot/spool data. A clean-shutdown marker distinguishes a
-// normal restart (generation +1) from an abrupt power loss (same generation and
-// persisted attempt replay). The lock file may remain on disk; the OS lock, not
-// file existence, is the single-writer authority.
+// Close writes the clean-shutdown marker (only for a fully opened state) and
+// releases the single-writer resources. It never deletes identity/boot/spool
+// data. The lock file may remain on disk; the OS lock, not file existence, is
+// the single-writer authority.
 func (s *State) Close() error {
 	var first error
 	if s.identity != nil {
 		first = writeAtomic(filepath.Join(s.dir, cleanShutdownFile), []byte("clean\n"))
 	}
+	if err := s.release(); err != nil && first == nil {
+		first = err
+	}
+	return first
+}
+
+// release closes the lock/spool without claiming a clean shutdown. It is used
+// for failed OpenState cleanup so a corrupt state is not mislabeled clean.
+func (s *State) release() error {
+	var first error
 	if s.spool != nil {
 		if err := s.spool.Close(); err != nil && first == nil {
 			first = err

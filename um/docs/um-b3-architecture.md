@@ -57,7 +57,7 @@ Hard rules:
 | Platform host info | `um/internal/agent/host_{linux,windows}.go` | OS/kernel/arch for the enrollment/report `host` object |
 | Wire primitives | `um/internal/wire` | signing strings, headers, canonical numeric parsing, fingerprint, Ed25519 |
 | Linux collectors | `um/internal/linuxobs` (`collector.go`, `procfs.go`, `system.go`, `disk.go`, `disk_linux.go`/`disk_other.go`, `service.go`, `singbox.go`) | Linux snapshot/metrics/events from `/proc`/`/sys`; optional gated sing-box client; service probe interface |
-| Windows collector | `um/internal/windowsagent` (`windowsagent.New(Options{...})` implementing `agent.Collector`) | Windows terminal snapshot/events; metrics `ErrUnsupported` (v1 deferred); injected `RouteObserver`; Windows-only DPAPI protection helper belongs to the code slice and is not wired to installation (OD-P7 pending) |
+| Windows collector | `um/internal/windowsagent` (`windowsagent.New(Options{...})` implementing `agent.Collector`) | Windows terminal snapshot/events; metrics `ErrUnsupported` (v1 deferred); injected `RouteObserver`; DPAPI CurrentUser key protection via `internal/secretstore`; R1 source path gated/off by default (OD-P7 pending) |
 | Windows route observation | `um/internal/windowsobs` | the only six-token enum (`Role`, `Tokens()`); loopback-only `GET /proxies`/`/connections`; independent selection/active sampling; closed reason codes |
 | CLI/service | `um/cmd/um-agent` (`main.go`, `platform_linux.go`, `service_windows.go`) | `enroll`/`run`/`rotate`/`status`/`service`/`version`; platform collector selection; Windows SCM lifecycle wrapper (account/ACL/DPAPI installation remains OD-P7-gated) |
 | Deploy assets | `um/deploy/linux/**`, `um/deploy/windows/**` | isolated systemd unit, noexec drop-in, one-shot installer, Windows service installer template |
@@ -71,7 +71,7 @@ owner-only mode → write → **file fsync** → `rename` → **directory fsync*
 
 | File/dir | Purpose | Notes |
 | --- | --- | --- |
-| `.lock` | single-instance lock (O_EXCL, random token, fsync) | removed on clean close; stale lock from a crash is operator-visible, never auto-broken silently |
+| `.lock` | single-instance OS advisory lock (flock / LockFileEx), random diagnostic token | held for the process lifetime; a leftover file is harmless because the OS lock, not file existence, is the authority; no PID-based stale-lock removal and no two-writer window |
 | `identity.json` | node id, event id, node class, key id, public/private Ed25519 key, center URL | private key local only, never sent/logged; identity+class/center URL mismatch is fail-closed |
 | `boot_state.json` | `generation`, `boot_id`, `next_seq`, `exhausted` | **authoritative local high-water basis**; missing/corrupt with identity ⇒ `boot_state_corrupt` (REC-17) |
 | `config.json` | last validated center config (config version, cadence, six collect switches, device salt, expected tags) | absent/invalid ⇒ fail-closed defaults; never fabricated |
@@ -86,11 +86,10 @@ state path; agents reject state files that fail validation instead of
 
 ## 4. Startup and single-instance sequence
 
-1. Open state dir 0700, acquire `.lock` containing a random token + PID. A
-   live owner is never stolen (second instance fails `state directory is
-   already in use`); an abrupt crash leaves a stale lock that is removed only
-   when the recorded process is provably dead. One node cannot produce two
-   boot histories.
+1. Open state dir 0700 and acquire an OS advisory lock on `.lock`. A second
+   process fails with `state directory is already in use`; the kernel releases
+   the lock on process death, so a crashed process cannot leave two writers.
+   Symlink/reparse state paths are rejected before use.
 2. Load identity/boot/config/rotation/control; validate grammar/key
    consistency. Identity present without boot state, or boot state without
    identity, is **corruption** (`boot_state_corrupt` / `identity_corrupt`), not
@@ -155,29 +154,35 @@ state path; agents reject state files that fail validation instead of
 
 - Capacity **32 MiB / 7 days**, single writer (the state lock), one JSON record
   per report (`report_id`, kind, `collected_at`, body, persisted attempt).
-- The record (file + directory) is **fsynced before the first send**. It is
+  Same-second records are ordered by their persisted sequence, not random UUID.
+- The record is **fsynced before the first send**. Unix fsyncs the file and
+  directory; Windows flushes file contents and uses
+  `MoveFileEx(MOVEFILE_WRITE_THROUGH)` for replacement (the remaining Windows
+  directory-entry limitation is documented, not claimed as POSIX fsync). It is
   removed only after a terminal ACK (`accepted`, `duplicate`, `stale_ignored`)
-  or after being moved to quarantine for a terminal payload rejection.
+  or moved to bounded quarantine for a terminal payload rejection.
 - Replay is **oldest-first** under the current generation/key with fresh
   transport fields when the persisted attempt is stale. A new-generation first
   report that is already stored (duplicate) still returns `duplicate`; the
   center commits the new-generation high-water (REC-04).
-- Corrupt records are quarantined (not deleted, not sent). Capacity is
-  fail-closed: adding a record that would exceed the 32 MiB hard cap returns
-  `ErrSpoolFull` and leaves all already-fsynced records untouched; it never
-  silently evicts them. The runtime surfaces the error and the documented
-  operator procedure (restore connectivity/ACK the backlog, process quarantine;
-  never raise the cap or drop data silently) applies. At startup only records
-  older than the 7-day retention are expired; the cap is not used to discard
-  unexpired payloads.
+- Corrupt records are quarantined (not deleted, not sent) under an 8 MiB
+  oldest-first inspection budget. Capacity is fail-closed: adding a record that
+  would exceed the 32 MiB hard cap returns `ErrSpoolFull` and leaves all
+  already-fsynced records untouched; it never silently evicts them. The runtime
+  drains existing backlog before queueing new work, enforces 7-day retention
+  during a long outage, and continues after a terminal payload is quarantined.
+  At startup only records older than the 7-day retention are expired; the cap is
+  not used to discard unexpired payloads.
 - Spool contents are already contract-valid report bodies (privacy allowlist
   enforced by the collector/center); the spool never stores tokens,
   credentials or local proxy names.
 
 ## 8. Retry, backoff and error classification
 
-- `1 s → 2× → … → 60 s` bounded backoff with context cancellation; reset to 1 s
-  after a successful flush. No unbounded busy loop, no infinite tight retry.
+- `1 s → 2× → … → 60 s` bounded backoff with context cancellation and
+  ±20% jitter; `Retry-After`/ACK `retry_after_s` is honored up to the 60 s cap;
+  reset to 1 s after a successful flush. No unbounded busy loop, no infinite
+  tight retry.
 - Retryable: transport/timeouts, malformed/over-limit responses, `5xx`,
   `429` (honor `Retry-After`), `401 stale_timestamp` (recalibrate clock from
   `server_time` and retry once).
@@ -235,33 +240,40 @@ optional probes and roots for tests (`ProcRoot`, `SysRoot`, `DiskMountPath`,
 
 - **System**: `/proc`/`/sys` read-only counters (CPU aggregate, memory, disk
   space/usage, network counters, load/uptime) — no subprocess, no shell, no
-  root, no permissions changed. CPU is a since-boot aggregate; traffic
-  counters are active-connection lower bounds where the underlying API has no
-  lifetime totals (documented, never presented as exact).
-- **Services**: `ServiceProbe` interface; the shipped default returns
-  `ErrProbeUnavailable` (honest UNKNOWN). The intended implementation is a
-  read-only systemd D-Bus probe (`org.freedesktop.systemd1` `ActiveState` only,
-  through the minimal `DBusProbe` interface). **No raw D-Bus client is shipped
-  in this Draft** — the honest unavailable default is preferred over an
-  unverified implementation — so it must not be claimed as a live D-Bus PASS
-  until a real lab proof exists. No `systemctl` exec fallback: if D-Bus is
-  unavailable, state is UNKNOWN.
-- **Protocol state** is derived only from available evidence; absence of
-  traffic is never reported as up/down — it is unknown.
-- **sing-box `service.api`** (`singbox_api` switch): **disabled by default**.
-  The client is fixed to a reviewed read-only surface (the frozen
-  Clash-compatible `GET /proxies`/`GET /connections` only, bounded local client,
-  no generic RPC/exec) and enabling any environment requires the versioned
-  **server-side authorization audit** (P1-10) proving the credential cannot
-  mutate configuration. Until then the source reports `unavailable` and never
-  fabricates values; the contract's explicit
-  `agent_error code=source_authorization_unproven` event must be emitted when
-  the gated source is configured but unproven (the Draft does not yet
-  demonstrate that event for Linux — recorded as a gap, not a PASS); no
-  fallback credential, no permission change. The Draft client is validated
-  only against synthetic `httptest` fixtures, not a live sing-box; its traffic
-  counters are active-connection lower bounds (the API has no per-inbound
-  lifetime totals).
+  root, no permissions changed. CPU is a since-boot aggregate; service.api
+  traffic counters are probe-observed cumulative lower bounds, never
+  active-only bytes presented as lifetime totals.
+- **Services**: the Linux build ships a real read-only `SystemdDBusProbe`
+  backed by pinned `godbus/dbus/v5`. It opens a private unprivileged system-bus
+  connection and issues exactly `Manager.GetUnit("sing-box.service")` on
+  `/org/freedesktop/systemd1`, then
+  `org.freedesktop.DBus.Properties.Get` for
+  `org.freedesktop.systemd1.Unit.ActiveState` on the validated unit path, both
+  with `FlagNoAutoStart`. There is no generic call, no write/lifecycle method,
+  no exec, no root, no file write and no `systemctl` fallback. Failures map to
+  the closed `ErrProbeUnavailable` and render UNKNOWN, never fabricated
+  `active`. The Linux wire path still awaits an isolated systemd-lab run.
+- **sing-box data sources**: `singbox_api` is disabled by default.
+  - The official sing-box 1.14 `service.api` client
+    (`internal/linuxobs/serviceapi*.go`) uses a fixed loopback origin and one
+    gRPC-Web stream
+    `daemon.StartedService/SubscribeConnections`; the hand-rolled protobuf codec
+    pins the v1.14 field numbers. It never calls the Clash REST API, and the
+    source remains disabled until the versioned P1-10 server-side authorization
+    audit. It has synthetic gRPC-Web fixtures plus isolated sing-box 1.14.5 lab
+    evidence; probe-observed cumulative totals are lower bounds (active
+    authoritative lifecycle totals plus finalized closed/abandoned lifecycles
+    banked once), not daemon-lifetime totals. The accumulator exposes
+    `TotalsExact=false`; the collector never uses active-connection bytes as a
+    lifetime total and reports traffic unavailable when events were skipped or
+    identity-conflicting.
+  - The legacy Clash-compatible `SingBoxProbe` remains only as a compatibility
+    path for tests; it exposes active-connection lower bounds and is not the
+    contract source for production enablement.
+  - When the source is configured but the versioned authorization proof is
+    absent, the collector emits the frozen
+    `agent_error code=source_authorization_unproven` event and still reports the
+    source unavailable. The event is stable across retries of the same report.
 - Class isolation: Linux must not emit `terminal`; `expected_inbound_tags` and
   the `linux_vps` source allowlist are enforced by `internal/contract`/center.
 
@@ -300,24 +312,28 @@ Metrics is `agent.ErrUnsupported` (Windows metrics v1 deferred).
   `controller_auth`, `malformed_response`, `route_unbound`,
   `source_authorization_unproven`); a valid empty connection list is observed
   zero; a missing/malformed answer is UNKNOWN/UNAVAILABLE, never zero.
-- **Source authorization (OD-P3)**: R2 truly-read-only source (no controller
-  secret) is the preferred enabler and is research-only in this Draft; the
-  loopback controller is the R1 residual-risk shape (**write-capable
-  credential**, strictly GET-only client), disabled by default, never described
-  as read-only, and requiring a separate later Owner risk acceptance. Until a
-  source is proven/authorized, terminal availability is `unavailable` with
-  `source_authorization_unproven`. See `um-b3-adr-windows-sources.md`.
+- **Source authorization (OD-P3)**: R2 was investigated on Clash Verge Rev
+  2.5.10 / Mihomo 1.19.33. It is **INFEASIBLE on the tested surfaces**: the TCP
+  controller requires a write-capable secret and the named pipe is
+  unauthenticated yet exposes write methods. The loopback TCP controller is the
+  R1 residual-risk shape (**write-capable credential**, strictly GET-only
+  client); the CLI has an explicit R1 path gated by
+  `UM_AGENT_WINDOWS_SOURCE_AUTHORIZED=1` + operator profile/secret files, and is
+  disabled by default. It is never described as read-only and requires a
+  separate Owner risk acceptance. Until a source is proven/authorized, terminal
+  availability is `unavailable` with `source_authorization_unproven`. See
+  `um-b3-adr-windows-sources.md`.
 - **No HA/config writes**: the agent never modifies Mihomo/Clash Verge Rev
   configuration, never switches nodes, never closes connections and never
   changes HA-UI/P6/#67 behavior; a static/runtime no-write proof is required
   before any enablement (UM-E real-build assertion).
-- `um/internal/windowsagent/service_windows.go` (Windows-only build tag) contains
-  an isolated, dependency-free DPAPI `SecretProtector`/`DPAPIProtector`
-  (user scope default; machine scope OD-P7-gated) plus the `ServiceHost` seam,
-  and is exercised only by Windows unit tests. It installs/configures/queries
-  no service, reads no secret store and is **not wired** into `cmd/um-agent`;
-  the service account, ACL and whether a secret is ever needed remain
-  **OD-P7 PENDING**, and R1 is not provisioned anywhere.
+- Agent identity and rotation provisional private keys are protected at rest
+  with DPAPI CurrentUser through the shared `internal/secretstore` package
+  (machine scope is not the default and remains OD-P7-gated). The Windows
+  `cmd/um-agent` SCM wrapper and event-log source are wired; the installer
+  template still does not install a service account, run enrollment or approve
+  an ACL. Service-account/ACL/enrollment/SCM lab validation and the final
+  account decision remain **OD-P7 PENDING**.
 
 ## 13. Service and CLI model
 
@@ -334,13 +350,15 @@ are **not frozen** until review; deploy assets document the intended shape:
 | `um-agent run` | `--state-dir DIR`, `--center URL`, `--node-class ...`, `--once` (one snapshot then exit; lab use) | same env vars |
 | `um-agent rotate` | `--state-dir ...`, `--center ...`, `--node-class ...` | same env vars |
 | `um-agent status` | `--state-dir ...` (diagnostics only: enrolled/terminal/config version/generation/sequencing/pending/quarantined; no secrets) | `UM_AGENT_STATE_DIR` |
+| Linux source env | no flags; D-Bus probe automatic; service.api only when configured | `UM_AGENT_SINGBOX_API_URL` (default `http://127.0.0.1:9091`), `UM_AGENT_SINGBOX_API_SECRET_FILE`, `UM_AGENT_SINGBOX_SOURCE_AUTHORIZED` (operator P1-10 assertion) |
+| Windows source env | no flags; R1 observer only when both files/gate set | `UM_AGENT_WINDOWS_OBSERVE_PROFILE`, `UM_AGENT_WINDOWS_OBSERVE_SECRET_FILE`, `UM_AGENT_WINDOWS_SOURCE_AUTHORIZED` (OD-P3 Owner gate; off by default) |
 | `um-agent service` (Windows SCM lifecycle wrapper) | `--state-dir`, `--center`, `--node-class` (flags passed through to the run loop); account, ACL, DPAPI scope, credential rotation and installation remain **OD-P7-gated** | same env vars |
 
 The Windows `service` wrapper only hosts the SCM lifecycle (start/stop/shutdown)
 around the shared runtime; it does not choose or install a service account, ACL
 or DPAPI scope, and **no SCM lab was executed in this Draft** — Windows Service
 integration is unverified. Account/ACL/DPAPI and any secret decision remain
-**OD-P7 PENDING**; R1 is not provisioned anywhere.
+**OD-P7 PENDING**; R1 is not provisioned or enabled by default.
 
 Deployment assets in this Draft are templates: Linux `um-agent.service` +
 `um-agent-noexec.conf` + `install-agent.sh` (uses the contract `--token-stdin`
@@ -395,20 +413,29 @@ B2-owned REC real-HTTP halves stay B2 evidence; B3 does not re-count them.
   sing-box API; this is read-only coexistence with duplicate local load. The UM
   install changes no Monitor file/service/credential and opens no port; the
   operator chooses which systems run per VPS (Q-COEXIST direction).
-- Agent crash/power loss: fsynced state survives; boot generation increments on
-  restart; late old-generation requests are stale; unsynced tail may be lost
-  and is reported via spool diagnostics (REC-27).
+- Agent crash/power loss: fsynced state survives; a clean restart increments
+  generation and an abrupt loss preserves the exact persisted attempt for
+  REC-27 duplicate recovery. The frozen-contract power-loss/generation wording
+  still needs Owner/contract-owner clarification; it is not claimed as a fully
+  resolved durability proof. Windows directory-entry durability is a documented
+  platform limitation (write-through replacement, no POSIX dir fsync).
 - Center storage failure: `503 storage_unavailable` is retried; no ACK before
   commit (center side, B2 evidence).
 
 ## 17. Known limitations (do not read as PASS)
 
-- Real R2 source unresolved (DEFERRED); R1 not authorized (BLOCKED).
-- Windows final service account/DPAPI/ACL is OD-P7 PENDING; the install script
-  is a template and creates no secret.
-- Linux systemd D-Bus state read is a probe interface with an honest-unavailable
-  default; no live D-Bus/systemd lab proof exists in this Draft.
-- No live sing-box `service.api` authorization audit; source disabled.
+- R2 is INFEASIBLE on the tested Clash Verge Rev 2.5.10/Mihomo 1.19.33
+  surfaces; full target matrix UNVERIFIED. R1 remains not authorized/BLOCKED.
+- Windows final service account/ACL/enrollment is OD-P7 PENDING. Node-key
+  DPAPI CurrentUser is implemented and tested at current-user scope; virtual
+  service-account/session-0 and SCM lab validation remain pending.
+- Linux D-Bus client is implemented with exact-call/security tests; a live
+  systemd/D-Bus lab proof is still pending. The installer noexec gate is
+  corrected to systemd >=248, but a target-version lab is pending.
+- The sing-box service.api client is implemented/tested against fixtures and an
+  isolated 1.14.5 instance; the P1-10 server-side authorization audit is absent
+  and the source remains disabled.
+- No live **production** sing-box `service.api` authorization audit; source disabled. The isolated synthetic 1.14.5 lab and synthetic gRPC-Web fixtures are not the P1-10 audit.
 - No real systemd service install/start, no real Windows service, no real
   Clash Verge Rev/Mihomo read-only/HA proof, no production deployment, no UM-E
   load/backup/security acceptance.
@@ -417,9 +444,8 @@ B2-owned REC real-HTTP halves stay B2 evidence; B3 does not re-count them.
 
 ## 13. Dependencies
 
-B3 adds no new module version. `golang.org/x/sys v0.34.0` was already an
-indirect dependency of the B2 module and is promoted to direct only for
-`golang.org/x/sys/windows/svc` (Windows SCM lifecycle wrapper); no `go.sum`
-entry or version changed. The DPAPI helper uses only stdlib `syscall` against
-`crypt32.dll`. No R1/Mihomo SDK, cloud SDK, secret-store SDK or scheduler
-dependency was added.
+B3 adds the pinned `github.com/godbus/dbus/v5 v5.2.4` direct dependency
+(BSD-2-Clause, pure Go on Linux, no new transitive module; OSV clean) for the
+read-only systemd probe. `golang.org/x/sys v0.34.0` was already present and is
+direct for Windows SCM/DPAPI primitives. The DPAPI path uses stdlib syscall +
+`crypt32.dll`; no R1/Mihomo SDK, cloud SDK or scheduler dependency was added.

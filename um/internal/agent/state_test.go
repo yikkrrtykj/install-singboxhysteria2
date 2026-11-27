@@ -76,6 +76,23 @@ func TestStateAtomicLockAndBootCorruption(t *testing.T) {
 	if _, err := OpenState(dir); !errors.Is(err, ErrBootStateCorrupt) {
 		t.Fatalf("corrupt boot open = %v, want ErrBootStateCorrupt", err)
 	}
+	// A failed open must not write a clean-shutdown marker: after repairing the
+	// file the preserved boot state must be treated as an abrupt restart, not
+	// silently bumped to the next generation.
+	if err := os.WriteFile(filepath.Join(dir, bootStateFile),
+		[]byte(`{"version":1,"generation":1,"boot_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","next_seq":1}`), 0o600); err != nil {
+		t.Fatalf("repair boot: %v", err)
+	}
+	s3, err := OpenState(dir)
+	if err != nil {
+		t.Fatalf("reopen repaired boot: %v", err)
+	}
+	if got, ok := s3.Boot(); !ok || got.Generation != 1 {
+		t.Fatalf("failed open wrote a clean marker / bumped generation: %+v", got)
+	}
+	if err := s3.Close(); err != nil {
+		t.Fatalf("close repaired: %v", err)
+	}
 }
 
 func TestSpoolCorruptionQuarantineAndLimits(t *testing.T) {

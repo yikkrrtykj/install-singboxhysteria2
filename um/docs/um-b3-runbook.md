@@ -74,7 +74,7 @@ Review the PLAN lines. The script creates: `umagent` system user, state dir
 `/var/lib/um-agent` 0700, `/etc/um-agent` 0700 root, binary
 `/usr/local/libexec/um-agent` root 0755, unit `/etc/systemd/system/um-agent.service`
 0644, `agent.env` 0640 root:root (center URL only, no secrets), and on
-systemd ≥254 the `10-noexec.conf` drop-in. It does **not** enable/start the
+systemd ≥248 the `10-noexec.conf` drop-in. It does **not** enable/start the
 service unless `--start-service` is given.
 
 ### 2.3 Install + one-time enrollment
@@ -110,7 +110,7 @@ already passed by this Draft):
 - [ ] `/var/lib/um-agent` 0700 `umagent:umagent`; key/state files 0600.
 - [ ] `systemctl show um-agent.service -p NoNewPrivileges,ProtectSystem,PrivateTmp,...`
       reflects the unit; `systemd-analyze verify` clean.
-- [ ] on systemd ≥254 the noexec drop-in is loaded (check
+- [ ] on systemd ≥248 the noexec drop-in is loaded (check
       `systemctl show um-agent.service -p NoExecPaths`); on older systemd it is
       absent and the gap is recorded (no fake no-exec claim).
 - [ ] agent has no listening socket (`ss -lntp`), no child processes.
@@ -129,10 +129,16 @@ already passed by this Draft):
   `systemctl restart` is REC-01 behavior and must not be confused with a
   recovery condition.
 - Data sources are **fail-closed and off by default**: `/proc`-based system
-  metrics may be collected per center config; systemd unit state is UNKNOWN
-  until the read-only D-Bus probe is implemented/proven; `singbox_api` stays
-  disabled until the P1-10 server-side authorization audit is recorded and the
-  Owner authorizes the source. A source that is not authorized reports
+  metrics may be collected per center config; systemd unit state is read through
+  the shipped read-only D-Bus probe and is UNKNOWN on unavailable/denied.
+  `singbox_api` stays disabled until the P1-10 server-side authorization audit is
+  recorded and the Owner authorizes the source. The official service.api
+  credential path uses `UM_AGENT_SINGBOX_API_SECRET_FILE` (normally a systemd
+  `LoadCredential` path) and `UM_AGENT_SINGBOX_API_URL` (default
+  `http://127.0.0.1:9091`); `UM_AGENT_SINGBOX_SOURCE_AUTHORIZED=1` is an operator
+  assertion that the P1-10 audit exists and must not be set early. Without a
+  configured probe the source stays unavailable and the required G7 diagnostic
+  event is emitted. A source that is not authorized reports
   `unavailable`/`unknown` + closed reason code — never fabricated data.
 - Availability honesty: missing data is null/UNKNOWN; no fake zeroes, no "up"
   without evidence, no traffic absence reported as down.
@@ -199,10 +205,14 @@ already passed by this Draft):
 
 ## 6. Windows install — `windows_terminal`
 
-> OD-P7 (account/secret) and OD-P3 (R2/R1 source) are **PENDING**. Until the
-> Owner decisions are recorded: do not install a terminal source, do not
-> provision a controller secret, and treat this section as lab-only. R1 is not
-> authorized; R2 is research-only (see the Windows sources ADR).
+> OD-P7 (account/secret) and OD-P3 (R2/R1 source) are **PENDING**. R2 was
+> investigated on Clash Verge Rev 2.5.10 / Mihomo 1.19.33 and is **INFEASIBLE**
+> on the tested surfaces (TCP needs a write-capable secret; the named pipe is
+> unauthenticated yet write-capable). R1 remains not authorized. Do not install
+> a terminal source, do not provision a controller secret, and treat this
+> section as lab-only. The binary has a gated R1 path requiring
+> `UM_AGENT_WINDOWS_SOURCE_AUTHORIZED=1` plus operator profile/secret files; it
+> is disabled by default and must not be used before the Owner record exists.
 
 ### 6.1 Prepare
 
@@ -246,7 +256,12 @@ Start-Service um-agent
 
 For a dedicated local user account pass `-ServiceCredential (Get-Credential)`
 at install time (the password is never written to disk or logs by the script).
-The script does not create a DPAPI secret, does not create a schedule task and
+The script creates no controller credential and no scheduled task. The agent
+itself protects its Ed25519 identity and rotation provisional private keys with
+DPAPI CurrentUser; enrollment must therefore run under the same Windows account
+as the service. The script does not run enrollment and does not create an
+account/ACL/DPAPI decision; that remains OD-P7 PENDING. It does not create a
+schedule task and
 does not change Clash Verge Rev/Mihomo/HA-UI configuration.
 
 **Windows SCM lifecycle wrapper exists in this Draft** (`um-agent service
@@ -261,19 +276,35 @@ before that, run the collector manually (no service):
 and expect honest `unavailable` terminal data + acceptance/rejection evidence
 from the center; this is not a Windows-service proof.
 
+**Optional R1 lab-only source path (disabled by default, not authorized by
+this Draft):** the binary can load an operator-local `windowsobs.Profile` and
+controller secret from `UM_AGENT_WINDOWS_OBSERVE_PROFILE` and
+`UM_AGENT_WINDOWS_OBSERVE_SECRET_FILE`, but only when
+`UM_AGENT_WINDOWS_SOURCE_AUTHORIZED=1` is also set. That flag is an operator
+assertion that a separate OD-P3 Owner risk-acceptance record exists. The
+installer does not provision these files or enable the path. The source is the
+R1 write-capable controller shape, not R2; never call it read-only. The current
+Clash Verge Rev default may expose only the pipe (the `windowsobs` client uses
+TCP loopback), so lab setup must be isolated and owner-approved.
+
 Enrollment: the Windows agent also needs a one-time admin token. Use the
 authorized process for the target environment; never store the token in the
 repo, script, service command line or logs. The Windows CLI enrollment path
 uses the same token contract as Linux (`--token-stdin` root-opened pipe or a
-reviewed `--token-file`) but the final Windows installation flow remains
-OD-P7-gated: do not invent a production path from this template.
+reviewed `--token-file`). Because identity private keys are DPAPI CurrentUser,
+enrollment must execute under the final service account; enrolling as an
+interactive/admin user and then switching the service account would make the
+state unreadable (fail closed, not auto-recover). The final account/enrollment
+flow remains OD-P7 PENDING; do not invent a production path from this template.
 
 ### 6.4 Verify (lab)
 
 - [ ] service exists, Manual start, runs in session 0 under the approved
       non-admin account.
 - [ ] state dir ACL: SYSTEM/Administrators/service account only; no `Users`.
-- [ ] no credential/DPAPI secret was created; R1 remains disabled.
+- [ ] no controller credential was created; R1 remains disabled. (The agent's
+      own identity/rotation private keys are DPAPI-protected at rest; this is
+      not a controller secret.)
 - [ ] terminal telemetry is honestly `unavailable` with
       `source_authorization_unproven` unless an authorized R2 source is proven.
 - [ ] no write to Clash Verge Rev/Mihomo config, no node switch, no connection
@@ -317,10 +348,10 @@ in-place generation reset is always rejected by the center
 | `nonce_reuse` / `report_conflict` | replay/fingerprint anomaly (should be handled/ignored per contract) | Stop, collect closed-code diagnostics and timestamps; do not edit state; escalate to the center admin/reviewer. |
 | `503 storage_unavailable` / `429 rate_limited` | center transient/backpressure | Retryable; let bounded backoff/spool work; check center health (admin plane) rather than changing the agent. |
 | `stale_timestamp` | host clock skew | Recalibrate NTP from `server_time`; the agent retries once; persistent skew is an NTP/operator issue, not a reason to loosen validation. |
-| spool quarantine grows | terminal payload rejections or corrupt records | Quarantined files are never silently deleted; inspect only closed reasons/metadata (not payload content in logs). Fix the collector/config cause; decide disposition with the admin. |
-| spool full | bounded 32 MiB/7 d reached | Fail-closed/observable; restore center connectivity or process quarantine; do not raise the cap or drop records silently. |
+| spool quarantine grows | terminal payload rejections or corrupt records | Quarantine is bounded (8 MiB, oldest-first) for operator inspection; inspect only closed reasons/metadata (not payload content in logs). Fix the collector/config cause; decide disposition with the admin. |
+| spool full | bounded 32 MiB/7 d reached | Fail-closed/observable; the runtime drains existing backlog before queueing new work, so restore center connectivity and let it ACK; do not raise the cap or drop records silently. |
 | enrollment returns `401 token_used` (REC-24) | the enrollment response was lost after commit; the node may be an active orphan | Admin identifies the unused orphan (recent creation, no reports), revokes it and issues a new token; agent enrolls as a new node. Do not revoke a node that has already reported. |
-| agent cannot start: `state directory is already in use` | another agent instance/leftover lock | Confirm no other process uses the state dir; a crash may leave `.lock` — verify ownership and remove only after confirming no running instance. |
+| agent cannot start: `state directory is already in use` | another agent instance holds the OS advisory lock | Confirm no other process uses the state dir. A leftover `.lock` **file** after a crash is harmless; the OS lock is released on process death. Do not delete it while a process may be running. |
 
 Center outage / long offline: the spool is durable/bounded (32 MiB / 7 d) and
 retries 1→60 s; business services are unaffected. Do not delete the spool to
@@ -341,9 +372,11 @@ double storage.
 - Never log or paste: tokens, private keys, request headers/bodies, DPAPI
   blobs, controller secrets, local proxy names/YAML, raw IPs/URLs, connection
   ids. Closed error codes/counts only.
-- Windows: protect the state dir by ACL (and DPAPI only if a secret is ever
-  approved); Linux: 0700/0600 as in §2; no permission loosening of existing
-  systems.
+- Windows: protect the state dir by ACL. The agent's identity and rotation
+  private keys are DPAPI CurrentUser-protected at rest; enrollment must run
+  under the same service account. Controller/R1 secrets (if ever approved) are
+  separate and remain disabled. Linux: 0700/0600 as in §2; no permission
+  loosening of existing systems.
 
 ## 10. Rollback / production gate
 

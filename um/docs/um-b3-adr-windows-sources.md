@@ -1,7 +1,8 @@
 # UM-B3 ADR — Windows terminal data sources: R2-first research and gating (OD-P3)
 
-- Status: **PROPOSED / PENDING OWNER.** This is the B3 research plan and results
-  template for Owner decision **OD-P3** (R2 truly-read-only source preferred;
+- Status: **PROPOSED / PENDING OWNER — R2 investigation completed; R2 is
+  INFEASIBLE on the tested surfaces.** This is the B3 research record and R1
+  proposal for Owner decision **OD-P3** (R2 truly-read-only source preferred;
   R1 write-capable controller credential needs a separate later Owner risk
   acceptance and is never auto-enabled). It is **not** an approval, not an
   authorization to enable any source, and not production evidence.
@@ -9,8 +10,13 @@
   `docs/um/um-127/02-dual-platform-contract.md` §4,
   `docs/um/um-a/06-threat-model-security-tests-performance.md` SEC-39/47/50,
   `docs/um/um-127/05-owner-decisions.md` OD-P3/P7.
-- R1 status: **not authorized, not enabled, no R1 code path is active in this
-  Draft.** R2 status: **research plan only; no real R2 result exists yet.**
+- R1 status: **not authorized, not enabled by default.** The Windows binary has
+  an explicitly gated R1 source path (`UM_AGENT_WINDOWS_SOURCE_AUTHORIZED=1` plus
+  operator-local profile/secret files) that remains disabled unless an operator
+  performs an Owner-approved setup; no source is enabled by this Draft.
+- R2 status: **INFEASIBLE on the tested Clash Verge Rev 2.5.10 / Mihomo Meta
+  1.19.33 surfaces (isolated synthetic lab); full target build matrix remains
+  UNVERIFIED.** See §6.
 
 ## 1. Decision requested
 
@@ -41,7 +47,8 @@ No source is enabled by this Draft and no real controller was contacted.
    controller secret (for example a verified local read-only surface/export).
    If proven, it is the preferred source and is reported as
    `source=local_readonly`. Whether such a surface exists on the target Clash
-   Verge Rev/Mihomo builds is **unknown and must be researched**.
+   Verge Rev/Mihomo builds was investigated; no conforming surface was found on
+   the tested builds (see §6).
 4. **R1** means the write-capable controller credential, used only via fixed
    loopback GET paths. It is a documented residual risk requiring a separate,
    later Owner acceptance and is **never auto-enabled**.
@@ -166,22 +173,55 @@ after.
    separate R1 risk-acceptance proposal. Do not enable R1 by default and do not
    weaken G1–G10.
 
-## 6. R2 results template (intentionally empty in this Draft)
+## 6. R2 investigation results (completed, isolated synthetic lab)
 
-> Status: **no results recorded.** Filling this table requires a real lab run
-> with evidence artifacts (hashes/logs/test ids). A filled row is still not a
-> production authorization; UM-E revalidates on the real tournament builds.
+Status: **investigation executed; R2 INFEASIBLE on the tested surfaces; full
+target build matrix UNVERIFIED.** This is LAB-REAL evidence for the tested
+Mihomo/Clash Verge Rev builds, not a production or tournament-build claim.
 
-| ID | Candidate surface | Product/build | Secret? | Read-only proof (static + dynamic) | Six-token/selection/active coverage | Independent sampling | Privacy | Verdict (PASS/FAIL/INCONCLUSIVE) | Evidence refs |
+Test object and method (no production config/credentials):
+
+- Windows host lab; installed Clash Verge Rev **2.5.10**, Mihomo Meta
+  **v1.19.33 windows amd64** (`with_gvisor`); isolated temporary Mihomo config
+  and a synthetic controller secret. The installed user configuration was not
+  modified; the lab process/temp files were removed after the test.
+- TCP controller test (synthetic loopback): no secret -> HTTP 401, wrong secret
+  -> 401, correct secret -> 200. The controller API exposes write operations.
+- Windows named-pipe test: the official Mihomo docs state named-pipe access
+  does not validate the secret. In the isolated lab, `/version`, `/connections`
+  and `/proxies` returned 200 with no secret and with a wrong secret;
+  `PUT /proxies/<synthetic-group>` returned 204 and `PATCH /configs` returned
+  204. The observed pipe DACL was
+  `D:P(A;OICI;0x12019f;;;BU)(A;OICI;0x12019f;;;SY)` (BUILTIN\Users + SYSTEM).
+  The named pipe is therefore an unauthenticated write-capable controller
+  surface, not a read-only source.
+- Local config/state files: `clash-verge.yaml`, `config.yaml`, `profiles.yaml`
+  and `verge.yaml` contain profile/selection metadata but no authoritative live
+  active-connection/route distribution; they are user-owned/writable and
+  session-0 service access is not guaranteed. They are not a sufficient R2
+  source.
+- A separate local read-only bridge that holds the named-pipe/controller
+  capability and exposes GET-only would introduce a new process holding a
+  write-capable capability and a new trust boundary. It must not be classified
+  as R2; it would need a separate R1-style Owner risk acceptance and independent
+  security review. It is not implemented in this Draft.
+
+| ID | Candidate surface | Product/build | Secret? | Read-only proof | Six-token/selection/active coverage | Independent sampling | Privacy | Verdict | Evidence refs |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| R2-01 | _empty_ | | | | | | | | |
-| R2-02 | _empty_ | | | | | | | | |
-| R2-03 | _empty_ | | | | | | | | |
+| R2-01 | TCP external controller (`127.0.0.1:9090`) | Clash Verge Rev 2.5.10 / Mihomo 1.19.33 | Yes (required) | **FAIL**: controller is write-capable; no read-only server-side proof | `/proxies` gives group `now`; `/connections` gives chains; no server truth or inbound tag guarantee | caller-controlled | requires secret; no local names in UM body | **INFEASIBLE (R1 only)** | isolated TCP auth test; official API docs |
+| R2-02 | Windows named pipe (`external-controller-pipe`) | Clash Verge Rev 2.5.10 / Mihomo 1.19.33 | **No** (official: pipe does not validate secret) | **FAIL**: no auth, full write-capable controller API; `PUT`/`PATCH` returned 204 | same controller data as TCP | caller-controlled | pipe DACL BUILTIN\Users + SYSTEM | **INFEASIBLE (not R2)** | isolated pipe GET/PUT/PATCH test; official Mihomo docs |
+| R2-03 | local config/state files | Clash Verge Rev 2.5.10 / Mihomo 1.19.33 | No | **FAIL/INSUFFICIENT**: no authoritative live active-connection/route distribution; user-writable/session access | insufficient | N/A | files contain private config; must not be read broadly | **INFEASIBLE/INSUFFICIENT** | file/schema inspection; no live connection data |
+| R2-04 | separate local read-only bridge | proposed only | likely holds pipe/controller capability | not a read-only product surface; new trust boundary | could expose GET-only | N/A | new process/secret risk | **NOT R2 (separate risk acceptance)** | design analysis |
 
-Run metadata to record: date, operator, lab host id (no personal data), Windows
-build, Clash Verge Rev version, Mihomo version/hash, controller configuration
-(loopback only, no secret value), test IDs, artifact filenames (outside the
-repo; evidence may be linked in the PR but no secrets/real IPs).
+**R2 verdict: INFEASIBLE on the tested current product surfaces.** A fully
+qualified R2 result would require a new upstream/product read-only API or a
+separately reviewed bridge with an explicit Owner risk decision; neither exists
+in this Draft. Because the target Clash Verge Rev/Mihomo build matrix (Q-AGENT-OS)
+is not frozen, a different future build with a proven read-only surface must be
+re-evaluated, not assumed.
+
+Status of the R2 gate: **INVESTIGATION COMPLETE / R2 INFEASIBLE / OD-P3 PENDING;
+no R2 source enabled.**
 
 ## 7. R1 write-capability record and exact mitigation list (not approved)
 
@@ -203,7 +243,9 @@ R1 status in this Draft:
 
 - **not enabled**; `mihomo_api`/`collect.terminal` remain `false` by default and
   no center config enables them;
-- no R1 credential is created, requested, stored or logged anywhere;
+- no R1 credential is created, requested, stored or logged by default; the
+  optional R1 observer path requires an explicit operator environment gate and
+  owner-approved profile/secret provisioning;
 - the Windows install template refuses R1/controller-secret provisioning;
 - the agent is never described as having a "read-only credential";
 - `terminal.availability` stays `unavailable` with
@@ -221,16 +263,19 @@ levels; higher levels are not implied by lower ones.
 | **FIELD** | real event terminal under operator supervision, center-authoritative source config, no write/HA regression | only after Owner authorization + UM-E acceptance |
 | **PRODUCTION** | actual event production | requires separate production release authorization (HOLD) |
 
-Current state: only MOCK/UNIT evidence exists for the Windows collector logic
-(where tests are present); **LAB-REAL/FIELD/PRODUCTION R2 or R1 evidence does
-not exist in this Draft**. Test names and docs must use `mock`/`synthetic`
+Current state: MOCK/UNIT evidence exists for the Windows collector logic and
+LAB-REAL evidence exists for the isolated R2 investigation above (tested builds
+only). FIELD/PRODUCTION evidence does not exist in this Draft, and R1 remains
+disabled/unaccepted. The gated R1 CLI path is code-complete but not enabled. Test names and docs must use `mock`/`synthetic`
 wording where applicable so a green unit test can never be mistaken for a real
 source result.
 
 ## 9. Gating sequence to close OD-P3
 
-1. R2 research with evidence (§5/§6) — **DEFERRED (not started)**.
-2. Independent review of the R2 evidence and privacy/read-only arguments.
+1. R2 research with evidence (§5/§6) — **COMPLETED for the tested builds;
+   R2 INFEASIBLE; full target build matrix UNVERIFIED.**
+2. Independent review of the R2 evidence and privacy/read-only arguments —
+   **PENDING** (this Code/Draft slice is not an approval).
 3. Owner decision: either enable the proven R2 source, or accept the R1
    residual risk in a separate written record, or keep the source unavailable.
 4. Only then may the center set the source switch for the class and the agent
@@ -248,7 +293,7 @@ snapshot-with-terminal surface remains honest `unavailable`/null.
 
 | Item | Value |
 | --- | --- |
-| OD-P3 R2 decision | **PENDING** |
+| OD-P3 R2 decision | **PENDING — evidence says INFEASIBLE on tested builds; owner must decide R1 risk acceptance vs no Windows source** |
 | OD-P3 R1 decision | **NOT AUTHORIZED (PENDING separate risk acceptance)** |
 | Owner answer/reference/date | **PENDING** |
 | Enablement authorization | **PENDING** |

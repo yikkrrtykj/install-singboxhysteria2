@@ -8,12 +8,14 @@
 //     process start time and the boot id;
 //   - one configured mount point measured with syscall.Statfs (DiskMountPath,
 //     default "/");
-//   - an optional ServiceProbe for systemd unit state. This package ships no
-//     D-Bus wire client: the default probe reports unavailable and the agent
-//     never execs systemctl or requires root;
-//   - an optional SingBoxProbe for the local sing-box Clash-compatible API
-//     (fixed read-only GET allowlist, loopback-only, no redirects, bounded
-//     response size).
+//   - a read-only systemd ServiceProbe using the system D-Bus
+//     (SystemdDBusProbe: exactly Manager.GetUnit and Properties.Get for
+//     ActiveState; no root/exec/systemctl fallback);
+//   - an optional ServiceAPIProbe for the official sing-box 1.14 service.api
+//     gRPC-Web StartedService/SubscribeConnections stream (fixed loopback
+//     origin, optional credential, no write RPCs);
+//   - a legacy SingBoxProbe for the old Clash-compatible API (kept only for
+//     compatibility/tests; it cannot provide daemon-lifetime totals).
 //
 // It never starts a process, never writes a file, never listens on a socket
 // and never needs a privileged uid. Report bodies are frozen-contract
@@ -34,13 +36,13 @@
 //     projection therefore sums the counters of connections currently
 //     attributed to an authorized inbound. Those values are a lower bound on
 //     the true inbound totals and are documented as such.
-//   - The D-Bus / systemd probe is an interface plus an unavailable default.
-//     No raw D-Bus client, no systemctl exec and no root path exists.
-//   - The sing-box API client is validated only against synthetic httptest
-//     fixtures in this package's tests. It is not validated against a live
-//     sing-box and is not a production claim: the center's singbox_api source
-//     stays disabled until the UM-B3 server-side authorization audit exists
-//     (UM-A 04 §11 P1-10).
+//   - The D-Bus client is fixed-call and read-only; failures degrade to
+//     unavailable. It is not a live-systemd-lab claim until the isolated lab is
+//     executed.
+//   - The service.api client is validated against synthetic gRPC-Web fixtures
+//     and an isolated sing-box 1.14.5 service.api instance; it is not a
+//     production claim. The center's singbox_api source stays disabled until
+//     the UM-B3 server-side authorization audit exists (UM-A 04 §11 P1-10).
 //   - Services/protocols/traffic are only rendered from their center source
 //     switches; a disabled source yields an honest unavailable/empty/null
 //     projection.
