@@ -129,7 +129,7 @@ URL event is insufficient.
 - Node list/detail joins `nodes`, `node_configs`, `node_latest`, aliases and
   key/rotation metadata. Public keys may be exposed only as metadata; private
   keys never leave the node.
-- Derived status is explicit: `online`, `stale`, `missing_snapshot`,
+- Derived status is explicit: `online`, `stale`, `unavailable`,
   `never_reported`, `revoked`; no fabricated healthy state.
 - Node class, event and node identity are immutable. Cross-event moves/class
   changes require revoke + new enrollment (new node id); no in-place migration.
@@ -223,6 +223,10 @@ URL event is insufficient.
   initiation by admin.
 - No production deployment, no production credentials, no real R1 enablement,
   no `singbox_api` enablement.
+- The separate `um-lab` developer/CI helper is explicitly lab-only and may seed
+  isolated test databases directly; it is not the production/admin management
+  CLI and is not installed as an admin surface. The `um-center admin` CLI uses
+  only the authenticated management HTTP API.
 - No backup/restore trigger; no full capacity/disk-pressure/VACUUM/offsite
   ledger acceptance (UM-E).
 - Linux Reality/Hysteria2 traffic collection remains a pre-production

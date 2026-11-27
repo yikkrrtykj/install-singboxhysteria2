@@ -86,7 +86,7 @@ curl -fsS "http://$ADMIN/api/health" >/dev/null
 python3 - "$ROOT/created.json" > "$TOKEN" <<'PY'
 import json, sys
 with open(sys.argv[1]) as f:
-    print(json.load(f)["data"]["token"], end="")
+    print(json.load(f)["token"], end="")
 PY
 
 sudo mkdir -p /etc/um-agent

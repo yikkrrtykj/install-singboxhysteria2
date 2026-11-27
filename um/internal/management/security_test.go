@@ -68,6 +68,11 @@ func TestTokenLifecycleAndRevocation(t *testing.T) {
 	defer r.Close()
 	if err := r.Enroll(context.Background(), created.Token); err == nil {
 		t.Fatal("revoked enrollment token accepted by real agent")
+	} else {
+		var ce *agent.CenterError
+		if !errors.As(err, &ce) || ce.Status != http.StatusUnauthorized || ce.Code != "token_invalid" || ce.Retryable {
+			t.Fatalf("revoked token error=%v, want closed 401 token_invalid non-retryable", err)
+		}
 	}
 }
 

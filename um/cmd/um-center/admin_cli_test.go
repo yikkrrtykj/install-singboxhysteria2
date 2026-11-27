@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -81,6 +82,34 @@ func TestAdminCLIUsesManagementAPI(t *testing.T) {
 	if rc != 0 {
 		t.Fatalf("CLI event create exit=%d", rc)
 	}
+	// --json emits the unwrapped data object, not the full `{v,data}` envelope.
+	oldOut := os.Stdout
+	readPipe, writePipe, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = writePipe
+	rc = runAdminCLI([]string{"--url", "http://" + srv.AdminAddr(),
+		"--token-file", tokenPath, "--json", "token", "create", eventID,
+		"--class", "linux_vps", "--ttl-seconds", "120"})
+	_ = writePipe.Close()
+	os.Stdout = oldOut
+	captured, _ := io.ReadAll(readPipe)
+	_ = readPipe.Close()
+	if rc != 0 {
+		t.Fatalf("CLI token create exit=%d", rc)
+	}
+	var created map[string]any
+	if err := json.Unmarshal(captured, &created); err != nil {
+		t.Fatalf("CLI token JSON: %v raw=%q", err, captured)
+	}
+	if _, hasEnvelope := created["data"]; hasEnvelope {
+		t.Fatalf("CLI --json emitted envelope: %v", created)
+	}
+	if created["token"] == nil || created["token"] == "" {
+		t.Fatalf("CLI --json token missing: %v", created)
+	}
+
 	// Verify through the same service/API, not by reading SQLite.
 	client, err := management.NewClient("http://"+srv.AdminAddr(), tokenPath)
 	if err != nil {

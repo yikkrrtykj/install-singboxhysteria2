@@ -130,7 +130,7 @@ if ($LASTEXITCODE -ne 0) { Fail 'management event create failed' }
 $createdRaw = (& $center @adminArgs token create $event --class windows_terminal --ttl-seconds 600 | Out-String)
 if ($LASTEXITCODE -ne 0) { Fail 'management token create failed' }
 $created = $createdRaw | ConvertFrom-Json
-$token = $created.data.token
+$token = $created.token
 if ([string]::IsNullOrWhiteSpace($token)) { Fail 'center token issue failed' }
 Set-Content -LiteralPath $tokenFile -Value $token -NoNewline -Encoding ascii
 

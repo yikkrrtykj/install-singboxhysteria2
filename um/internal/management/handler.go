@@ -109,7 +109,11 @@ func (h *Handler) routeEvents(ctx context.Context, w http.ResponseWriter, r *htt
 				EventID     string `json:"event_id"`
 				DisplayName string `json:"display_name"`
 			}
-			if err := h.decode(r, &req); err != nil {
+			if err := h.decode(w, r, &req); err != nil {
+				if errors.Is(err, errAdminBodyTooLarge) {
+					h.writeError(w, http.StatusRequestEntityTooLarge, "invalid_request", "request body too large", false, requestID)
+					return
+				}
 				h.writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), false, requestID)
 				return
 			}
@@ -129,7 +133,11 @@ func (h *Handler) routeEvents(ctx context.Context, w http.ResponseWriter, r *htt
 			var req struct {
 				DisplayName string `json:"display_name"`
 			}
-			if err := h.decode(r, &req); err != nil {
+			if err := h.decode(w, r, &req); err != nil {
+				if errors.Is(err, errAdminBodyTooLarge) {
+					h.writeError(w, http.StatusRequestEntityTooLarge, "invalid_request", "request body too large", false, requestID)
+					return
+				}
 				h.writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), false, requestID)
 				return
 			}
@@ -170,7 +178,11 @@ func (h *Handler) routeEvents(ctx context.Context, w http.ResponseWriter, r *htt
 			var req struct {
 				Confirmation string `json:"confirmation"`
 			}
-			if err := h.decode(r, &req); err != nil {
+			if err := h.decode(w, r, &req); err != nil {
+				if errors.Is(err, errAdminBodyTooLarge) {
+					h.writeError(w, http.StatusRequestEntityTooLarge, "invalid_request", "request body too large", false, requestID)
+					return
+				}
 				h.writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), false, requestID)
 				return
 			}
@@ -245,7 +257,11 @@ func (h *Handler) routeNodes(ctx context.Context, w http.ResponseWriter, r *http
 				Sources             map[string]bool  `json:"sources"`
 				ExpectedInboundTags []InboundTagView `json:"expected_inbound_tags"`
 			}
-			if err := h.decode(r, &req); err != nil {
+			if err := h.decode(w, r, &req); err != nil {
+				if errors.Is(err, errAdminBodyTooLarge) {
+					h.writeError(w, http.StatusRequestEntityTooLarge, "invalid_request", "request body too large", false, requestID)
+					return
+				}
 				h.writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), false, requestID)
 				return
 			}
@@ -292,7 +308,11 @@ func (h *Handler) routeTokens(ctx context.Context, w http.ResponseWriter, r *htt
 				NodeClass  string `json:"node_class"`
 				TTLSeconds int    `json:"ttl_seconds"`
 			}
-			if err := h.decode(r, &req); err != nil {
+			if err := h.decode(w, r, &req); err != nil {
+				if errors.Is(err, errAdminBodyTooLarge) {
+					h.writeError(w, http.StatusRequestEntityTooLarge, "invalid_request", "request body too large", false, requestID)
+					return
+				}
 				h.writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), false, requestID)
 				return
 			}
@@ -338,7 +358,11 @@ func (h *Handler) routeAliases(ctx context.Context, w http.ResponseWriter, r *ht
 				DisplayName     string `json:"display_name"`
 				ExpectedVersion *int64 `json:"expected_version"`
 			}
-			if err := h.decode(r, &req); err != nil {
+			if err := h.decode(w, r, &req); err != nil {
+				if errors.Is(err, errAdminBodyTooLarge) {
+					h.writeError(w, http.StatusRequestEntityTooLarge, "invalid_request", "request body too large", false, requestID)
+					return
+				}
 				h.writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), false, requestID)
 				return
 			}
@@ -367,7 +391,11 @@ func (h *Handler) routeMapping(ctx context.Context, w http.ResponseWriter, r *ht
 				EffectiveFrom int64              `json:"effective_from"`
 				Entries       []MappingEntryView `json:"entries"`
 			}
-			if err := h.decode(r, &req); err != nil {
+			if err := h.decode(w, r, &req); err != nil {
+				if errors.Is(err, errAdminBodyTooLarge) {
+					h.writeError(w, http.StatusRequestEntityTooLarge, "invalid_request", "request body too large", false, requestID)
+					return
+				}
 				h.writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), false, requestID)
 				return
 			}
@@ -504,19 +532,29 @@ func page(r *http.Request) (int, int, error) {
 	return limit, offset, nil
 }
 
-func (h *Handler) decode(r *http.Request, dst any) error {
-	ct := r.Header.Get("Content-Type")
-	if !strings.HasPrefix(strings.ToLower(ct), "application/json") {
+var errAdminBodyTooLarge = errors.New("admin request body exceeds 1 MiB")
+
+func (h *Handler) decode(w http.ResponseWriter, r *http.Request, dst any) error {
+	ct := strings.ToLower(strings.TrimSpace(strings.Split(r.Header.Get("Content-Type"), ";")[0]))
+	if ct != "application/json" {
 		return errors.New("Content-Type must be application/json")
 	}
-	r.Body = io.NopCloser(io.LimitReader(r.Body, maxAdminBody+1))
+	r.Body = http.MaxBytesReader(w, r.Body, maxAdminBody)
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(dst); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			return errAdminBodyTooLarge
+		}
 		return errors.New("invalid JSON body")
 	}
 	var extra any
-	if err := dec.Decode(&extra); err != io.EOF {
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			return errAdminBodyTooLarge
+		}
 		return errors.New("invalid JSON body")
 	}
 	return nil

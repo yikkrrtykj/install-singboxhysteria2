@@ -83,7 +83,7 @@ to claim API acceptance. Real CLI test is in `cmd/um-center/admin_cli_test.go`.
 - Config rejects `singbox_api:true` and `mihomo_api:true`; class rules enforced.
 - Mapping rejects reserved tokens, cross-event/class targets, duplicate versions,
   backdating and rewrites; append-only triggers unchanged.
-- Purge requires platform_admin + exact type-to-confirm; invalid/stale/cross-event
+- Purge requires platform_admin + exact type-to-confirm; invalid/cross-event
   confirmation rejected; durable op/graveyard/tombstone/ledger; repeated request
   safe; event A untouched.
 - No admin path reads arbitrary files, executes commands, fetches URLs or pushes

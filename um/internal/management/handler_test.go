@@ -56,10 +56,23 @@ func TestAdminRequestValidationAndTokenPrivacy(t *testing.T) {
 	if status != http.StatusBadRequest {
 		t.Fatalf("offset too large status=%d", status)
 	}
+	// A body above the documented 1 MiB cap is rejected, not silently truncated.
+	oversized := append([]byte(`{"display_name":"x"}`), bytes.Repeat([]byte(" "), 1<<20)...)
+	status, _ = rawRequest(t, http.MethodPost, bc.adminURL+"/api/v1/events", rawToken, oversized)
+	if status != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized body status=%d, want 413", status)
+	}
 	// Wrong method is 405, not a silent fallback.
 	status, _ = rawRequest(t, http.MethodDelete, bc.adminURL+"/api/v1/events", rawToken, nil)
 	if status != http.StatusMethodNotAllowed {
 		t.Fatalf("delete events status=%d", status)
+	}
+
+	// A duplicate event id is an expected conflict, not a storage 500.
+	status, _ = rawRequest(t, http.MethodPost, bc.adminURL+"/api/v1/events", rawToken,
+		[]byte(`{"event_id":"`+eventA+`","display_name":"duplicate"}`))
+	if status != http.StatusConflict {
+		t.Fatalf("duplicate event status=%d, want 409", status)
 	}
 
 	// Token plaintext exists only in the creation response.

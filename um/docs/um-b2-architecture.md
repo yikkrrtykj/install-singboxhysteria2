@@ -21,21 +21,16 @@ Environment equivalents: `UM_CENTER_INGEST_ADDR`, `UM_CENTER_ADMIN_ADDR`,
 contract fallback: startup loads and prevalidates all ten frozen schemas before
 opening listeners.
 
-Admin token issuance (test/operator bootstrap, not a B4 management UI):
-
-```text
-um-center -db ... -contracts ... -issue-enroll-token \
-  -token-event <event-uuid> -token-class linux_vps|windows_terminal -token-ttl 30m
-```
-
-The token plaintext is printed once; only its SHA-256 hash is stored. Node/key/
-rotation admin mutation methods exist in the store, but the full audited admin
-API/UI is UM-B4.
+Admin token issuance is owned by UM-B4: use the authenticated management API
+(`POST /api/v1/events/{event_id}/tokens`) or `um-center admin token create`.
+The plaintext is returned once; only its SHA-256 hash is stored. The B3/B4 labs
+seed through that same API. `um-lab issue-token` remains a lab-only helper and
+is not a production admin surface; B2 has no direct operator token CLI.
 
 ## Listeners and routes
 
 - Ingest plane: only `POST /v1/agent/{enroll,report,rotate,config}`.
-- Admin plane: only `GET /api/health`; it has no `/v1/agent/*` routes.
+- Admin plane: `GET /api/health`; when UM-B4 local admin auth is configured it also serves `/api/v1/*` management routes. It has no `/v1/agent/*` routes.
 - Unknown path → `404 endpoint_not_found`; non-POST agent route → `405
   method_not_allowed`. Both planes use the frozen header/body timeouts.
 - Per-IP bounded token-bucket rate limiting returns `429 rate_limited` with

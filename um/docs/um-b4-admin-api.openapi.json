@@ -3,7 +3,7 @@
   "info": {
     "title": "UM-B4 Center Management API",
     "version": "1.0.0",
-    "description": "Same-process isolated admin-plane API. It is served on the admin listener only (/api/v1/*), never on the agent ingest listener. Authentication is a local, operator-owned bearer token file; roles/event scopes are resolved server-side. UM-C login/TOTP/session/Cloudflare is not implemented here."
+    "description": "Isolated, loopback-only B4 admin-plane API on the admin listener. Ingest /v1/agent/* is never served here. Authentication is a local operator-owned bearer-token file; roles and event scopes are resolved server-side. UM-C Web UI/login/TOTP/session/Cloudflare and public ingress are not implemented."
   },
   "servers": [
     {
@@ -20,14 +20,27 @@
     "/api/v1/health": {
       "get": {
         "summary": "Authenticated management health",
-        "operationId": "get_api_v1_health",
+        "operationId": "get__api_v1_health",
         "responses": {
           "200": {
             "description": "OK",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Envelope"
+                  "type": "object",
+                  "required": [
+                    "v",
+                    "data"
+                  ],
+                  "properties": {
+                    "v": {
+                      "type": "integer",
+                      "enum": [
+                        1
+                      ]
+                    },
+                    "data": {}
+                  }
                 }
               }
             }
@@ -72,7 +85,47 @@
               }
             }
           },
+          "409": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "500": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
             "description": "Closed admin error",
             "content": {
               "application/json": {
@@ -93,14 +146,29 @@
     "/api/v1/events": {
       "get": {
         "summary": "List events in the principal scope",
-        "operationId": "get_api_v1_events",
+        "operationId": "get__api_v1_events",
         "responses": {
           "200": {
             "description": "OK",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/EventList"
+                  "type": "object",
+                  "required": [
+                    "v",
+                    "data"
+                  ],
+                  "properties": {
+                    "v": {
+                      "type": "integer",
+                      "enum": [
+                        1
+                      ]
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/EventList"
+                    }
+                  }
                 }
               }
             }
@@ -134,8 +202,73 @@
                 }
               }
             }
+          },
+          "404": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
         "parameters": [
           {
             "name": "state",
@@ -161,23 +294,33 @@
               "type": "integer"
             }
           }
-        ],
-        "security": [
-          {
-            "bearerAuth": []
-          }
         ]
       },
       "post": {
         "summary": "Create an event (platform_admin)",
-        "operationId": "post_api_v1_events",
+        "operationId": "post__api_v1_events",
         "responses": {
           "201": {
             "description": "OK",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/EventView"
+                  "type": "object",
+                  "required": [
+                    "v",
+                    "data"
+                  ],
+                  "properties": {
+                    "v": {
+                      "type": "integer",
+                      "enum": [
+                        1
+                      ]
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/EventView"
+                    }
+                  }
                 }
               }
             }
@@ -211,8 +354,73 @@
                 }
               }
             }
+          },
+          "404": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -222,25 +430,35 @@
               }
             }
           }
-        },
-        "security": [
-          {
-            "bearerAuth": []
-          }
-        ]
+        }
       }
     },
     "/api/v1/events/{event_id}": {
       "get": {
         "summary": "Get event detail in scope",
-        "operationId": "get_api_v1_events_event_id",
+        "operationId": "get__api_v1_events_event_id",
         "responses": {
           "200": {
             "description": "OK",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Envelope"
+                  "type": "object",
+                  "required": [
+                    "v",
+                    "data"
+                  ],
+                  "properties": {
+                    "v": {
+                      "type": "integer",
+                      "enum": [
+                        1
+                      ]
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/EventView"
+                    }
+                  }
                 }
               }
             }
@@ -285,7 +503,47 @@
               }
             }
           },
+          "409": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "500": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
             "description": "Closed admin error",
             "content": {
               "application/json": {
@@ -300,18 +558,44 @@
           {
             "bearerAuth": []
           }
+        ],
+        "parameters": [
+          {
+            "name": "event_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
         ]
       },
       "patch": {
         "summary": "Rename an event (platform_admin)",
-        "operationId": "patch_api_v1_events_event_id",
+        "operationId": "patch__api_v1_events_event_id",
         "responses": {
           "200": {
             "description": "OK",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Envelope"
+                  "type": "object",
+                  "required": [
+                    "v",
+                    "data"
+                  ],
+                  "properties": {
+                    "v": {
+                      "type": "integer",
+                      "enum": [
+                        1
+                      ]
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/EventView"
+                    }
+                  }
                 }
               }
             }
@@ -356,7 +640,47 @@
               }
             }
           },
+          "409": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "500": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
             "description": "Closed admin error",
             "content": {
               "application/json": {
@@ -367,6 +691,11 @@
             }
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -377,9 +706,15 @@
             }
           }
         },
-        "security": [
+        "parameters": [
           {
-            "bearerAuth": []
+            "name": "event_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
           }
         ]
       }
@@ -387,14 +722,27 @@
     "/api/v1/events/{event_id}/archive": {
       "post": {
         "summary": "Archive an event (platform_admin)",
-        "operationId": "post_api_v1_events_event_id_archive",
+        "operationId": "post__api_v1_events_event_id_archive",
         "responses": {
           "200": {
             "description": "OK",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Envelope"
+                  "type": "object",
+                  "required": [
+                    "v",
+                    "data"
+                  ],
+                  "properties": {
+                    "v": {
+                      "type": "integer",
+                      "enum": [
+                        1
+                      ]
+                    },
+                    "data": {}
+                  }
                 }
               }
             }
@@ -439,7 +787,47 @@
               }
             }
           },
+          "409": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "500": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
             "description": "Closed admin error",
             "content": {
               "application/json": {
@@ -453,6 +841,17 @@
         "security": [
           {
             "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "event_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
           }
         ]
       }
@@ -460,14 +859,29 @@
     "/api/v1/events/{event_id}/purge/preview": {
       "get": {
         "summary": "Preview irreversible purge (platform_admin)",
-        "operationId": "get_api_v1_events_event_id_purge_preview",
+        "operationId": "get__api_v1_events_event_id_purge_preview",
         "responses": {
           "200": {
             "description": "OK",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Envelope"
+                  "type": "object",
+                  "required": [
+                    "v",
+                    "data"
+                  ],
+                  "properties": {
+                    "v": {
+                      "type": "integer",
+                      "enum": [
+                        1
+                      ]
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/PurgePreviewView"
+                    }
+                  }
                 }
               }
             }
@@ -512,7 +926,47 @@
               }
             }
           },
+          "409": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "500": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
             "description": "Closed admin error",
             "content": {
               "application/json": {
@@ -527,20 +981,46 @@
           {
             "bearerAuth": []
           }
+        ],
+        "parameters": [
+          {
+            "name": "event_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
         ]
       }
     },
     "/api/v1/events/{event_id}/purge/confirm": {
       "post": {
         "summary": "Execute purge with exact type-to-confirm (platform_admin)",
-        "operationId": "post_api_v1_events_event_id_purge_confirm",
+        "operationId": "post__api_v1_events_event_id_purge_confirm",
         "responses": {
           "200": {
             "description": "OK",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Envelope"
+                  "type": "object",
+                  "required": [
+                    "v",
+                    "data"
+                  ],
+                  "properties": {
+                    "v": {
+                      "type": "integer",
+                      "enum": [
+                        1
+                      ]
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/PurgeStatusView"
+                    }
+                  }
                 }
               }
             }
@@ -585,7 +1065,47 @@
               }
             }
           },
+          "409": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "500": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
             "description": "Closed admin error",
             "content": {
               "application/json": {
@@ -596,6 +1116,11 @@
             }
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -606,9 +1131,15 @@
             }
           }
         },
-        "security": [
+        "parameters": [
           {
-            "bearerAuth": []
+            "name": "event_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
           }
         ]
       }
@@ -616,14 +1147,29 @@
     "/api/v1/events/{event_id}/purge/status": {
       "get": {
         "summary": "Purge progress/status (platform_admin)",
-        "operationId": "get_api_v1_events_event_id_purge_status",
+        "operationId": "get__api_v1_events_event_id_purge_status",
         "responses": {
           "200": {
             "description": "OK",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Envelope"
+                  "type": "object",
+                  "required": [
+                    "v",
+                    "data"
+                  ],
+                  "properties": {
+                    "v": {
+                      "type": "integer",
+                      "enum": [
+                        1
+                      ]
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/PurgeStatusView"
+                    }
+                  }
                 }
               }
             }
@@ -668,7 +1214,47 @@
               }
             }
           },
+          "409": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "500": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
             "description": "Closed admin error",
             "content": {
               "application/json": {
@@ -683,20 +1269,46 @@
           {
             "bearerAuth": []
           }
+        ],
+        "parameters": [
+          {
+            "name": "event_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
         ]
       }
     },
     "/api/v1/events/{event_id}/nodes": {
       "get": {
         "summary": "List nodes in scope",
-        "operationId": "get_api_v1_events_event_id_nodes",
+        "operationId": "get__api_v1_events_event_id_nodes",
         "responses": {
           "200": {
             "description": "OK",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Envelope"
+                  "type": "object",
+                  "required": [
+                    "v",
+                    "data"
+                  ],
+                  "properties": {
+                    "v": {
+                      "type": "integer",
+                      "enum": [
+                        1
+                      ]
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/NodeList"
+                    }
+                  }
                 }
               }
             }
@@ -741,7 +1353,47 @@
               }
             }
           },
+          "409": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "500": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
             "description": "Closed admin error",
             "content": {
               "application/json": {
@@ -752,7 +1404,21 @@
             }
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
         "parameters": [
+          {
+            "name": "event_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
           {
             "name": "class",
             "in": "query",
@@ -785,25 +1451,35 @@
               "type": "integer"
             }
           }
-        ],
-        "security": [
-          {
-            "bearerAuth": []
-          }
         ]
       }
     },
     "/api/v1/events/{event_id}/nodes/{node_id}": {
       "get": {
         "summary": "Get node detail in scope",
-        "operationId": "get_api_v1_events_event_id_nodes_node_id",
+        "operationId": "get__api_v1_events_event_id_nodes_node_id",
         "responses": {
           "200": {
             "description": "OK",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Envelope"
+                  "type": "object",
+                  "required": [
+                    "v",
+                    "data"
+                  ],
+                  "properties": {
+                    "v": {
+                      "type": "integer",
+                      "enum": [
+                        1
+                      ]
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/NodeView"
+                    }
+                  }
                 }
               }
             }
@@ -848,7 +1524,47 @@
               }
             }
           },
+          "409": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "500": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
             "description": "Closed admin error",
             "content": {
               "application/json": {
@@ -862,6 +1578,26 @@
         "security": [
           {
             "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "event_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "node_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
           }
         ]
       }
@@ -869,14 +1605,27 @@
     "/api/v1/events/{event_id}/nodes/{node_id}/revoke": {
       "post": {
         "summary": "Revoke a node (platform_admin/event_admin in scope)",
-        "operationId": "post_api_v1_events_event_id_nodes_node_id_revoke",
+        "operationId": "post__api_v1_events_event_id_nodes_node_id_revoke",
         "responses": {
           "200": {
             "description": "OK",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Envelope"
+                  "type": "object",
+                  "required": [
+                    "v",
+                    "data"
+                  ],
+                  "properties": {
+                    "v": {
+                      "type": "integer",
+                      "enum": [
+                        1
+                      ]
+                    },
+                    "data": {}
+                  }
                 }
               }
             }
@@ -921,7 +1670,47 @@
               }
             }
           },
+          "409": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "500": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
             "description": "Closed admin error",
             "content": {
               "application/json": {
@@ -935,6 +1724,26 @@
         "security": [
           {
             "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "event_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "node_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
           }
         ]
       }
@@ -942,14 +1751,29 @@
     "/api/v1/events/{event_id}/nodes/{node_id}/config": {
       "get": {
         "summary": "Show effective agent config in scope",
-        "operationId": "get_api_v1_events_event_id_nodes_node_id_config",
+        "operationId": "get__api_v1_events_event_id_nodes_node_id_config",
         "responses": {
           "200": {
             "description": "OK",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Envelope"
+                  "type": "object",
+                  "required": [
+                    "v",
+                    "data"
+                  ],
+                  "properties": {
+                    "v": {
+                      "type": "integer",
+                      "enum": [
+                        1
+                      ]
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/ConfigView"
+                    }
+                  }
                 }
               }
             }
@@ -994,7 +1818,47 @@
               }
             }
           },
+          "409": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "500": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
             "description": "Closed admin error",
             "content": {
               "application/json": {
@@ -1009,18 +1873,53 @@
           {
             "bearerAuth": []
           }
+        ],
+        "parameters": [
+          {
+            "name": "event_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "node_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
         ]
       },
       "put": {
         "summary": "Update effective-dated agent config (platform_admin)",
-        "operationId": "put_api_v1_events_event_id_nodes_node_id_config",
+        "operationId": "put__api_v1_events_event_id_nodes_node_id_config",
         "responses": {
           "200": {
             "description": "OK",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Envelope"
+                  "type": "object",
+                  "required": [
+                    "v",
+                    "data"
+                  ],
+                  "properties": {
+                    "v": {
+                      "type": "integer",
+                      "enum": [
+                        1
+                      ]
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/ConfigView"
+                    }
+                  }
                 }
               }
             }
@@ -1065,7 +1964,47 @@
               }
             }
           },
+          "409": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "500": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
             "description": "Closed admin error",
             "content": {
               "application/json": {
@@ -1076,6 +2015,11 @@
             }
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -1086,9 +2030,24 @@
             }
           }
         },
-        "security": [
+        "parameters": [
           {
-            "bearerAuth": []
+            "name": "event_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "node_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
           }
         ]
       }
@@ -1096,14 +2055,29 @@
     "/api/v1/events/{event_id}/nodes/{node_id}/config/history": {
       "get": {
         "summary": "Show effective-dated config history in scope",
-        "operationId": "get_api_v1_events_event_id_nodes_node_id_config_history",
+        "operationId": "get__api_v1_events_event_id_nodes_node_id_config_history",
         "responses": {
           "200": {
             "description": "OK",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Envelope"
+                  "type": "object",
+                  "required": [
+                    "v",
+                    "data"
+                  ],
+                  "properties": {
+                    "v": {
+                      "type": "integer",
+                      "enum": [
+                        1
+                      ]
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/ConfigHistoryView"
+                    }
+                  }
                 }
               }
             }
@@ -1148,7 +2122,47 @@
               }
             }
           },
+          "409": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "500": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
             "description": "Closed admin error",
             "content": {
               "application/json": {
@@ -1163,20 +2177,55 @@
           {
             "bearerAuth": []
           }
+        ],
+        "parameters": [
+          {
+            "name": "event_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "node_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
         ]
       }
     },
     "/api/v1/events/{event_id}/tokens": {
       "get": {
         "summary": "List one-time enrollment token metadata (admin only)",
-        "operationId": "get_api_v1_events_event_id_tokens",
+        "operationId": "get__api_v1_events_event_id_tokens",
         "responses": {
           "200": {
             "description": "OK",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Envelope"
+                  "type": "object",
+                  "required": [
+                    "v",
+                    "data"
+                  ],
+                  "properties": {
+                    "v": {
+                      "type": "integer",
+                      "enum": [
+                        1
+                      ]
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/EnrollmentTokenList"
+                    }
+                  }
                 }
               }
             }
@@ -1221,7 +2270,47 @@
               }
             }
           },
+          "409": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "500": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
             "description": "Closed admin error",
             "content": {
               "application/json": {
@@ -1232,7 +2321,21 @@
             }
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
         "parameters": [
+          {
+            "name": "event_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
           {
             "name": "limit",
             "in": "query",
@@ -1249,23 +2352,33 @@
               "type": "integer"
             }
           }
-        ],
-        "security": [
-          {
-            "bearerAuth": []
-          }
         ]
       },
       "post": {
         "summary": "Create a one-time scoped enrollment token",
-        "operationId": "post_api_v1_events_event_id_tokens",
+        "operationId": "post__api_v1_events_event_id_tokens",
         "responses": {
-          "200": {
+          "201": {
             "description": "OK",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Envelope"
+                  "type": "object",
+                  "required": [
+                    "v",
+                    "data"
+                  ],
+                  "properties": {
+                    "v": {
+                      "type": "integer",
+                      "enum": [
+                        1
+                      ]
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/EnrollmentTokenCreated"
+                    }
+                  }
                 }
               }
             }
@@ -1310,7 +2423,47 @@
               }
             }
           },
+          "409": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "500": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
             "description": "Closed admin error",
             "content": {
               "application/json": {
@@ -1321,6 +2474,11 @@
             }
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -1331,9 +2489,15 @@
             }
           }
         },
-        "security": [
+        "parameters": [
           {
-            "bearerAuth": []
+            "name": "event_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
           }
         ]
       }
@@ -1341,14 +2505,29 @@
     "/api/v1/events/{event_id}/tokens/{token_id}": {
       "get": {
         "summary": "Get enrollment token status (admin)",
-        "operationId": "get_api_v1_events_event_id_tokens_token_id",
+        "operationId": "get__api_v1_events_event_id_tokens_token_id",
         "responses": {
           "200": {
             "description": "OK",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Envelope"
+                  "type": "object",
+                  "required": [
+                    "v",
+                    "data"
+                  ],
+                  "properties": {
+                    "v": {
+                      "type": "integer",
+                      "enum": [
+                        1
+                      ]
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/EnrollmentTokenView"
+                    }
+                  }
                 }
               }
             }
@@ -1393,7 +2572,47 @@
               }
             }
           },
+          "409": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "500": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
             "description": "Closed admin error",
             "content": {
               "application/json": {
@@ -1407,6 +2626,26 @@
         "security": [
           {
             "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "event_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "token_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
           }
         ]
       }
@@ -1414,14 +2653,27 @@
     "/api/v1/events/{event_id}/tokens/{token_id}/revoke": {
       "post": {
         "summary": "Revoke an unconsumed enrollment token (admin)",
-        "operationId": "post_api_v1_events_event_id_tokens_token_id_revoke",
+        "operationId": "post__api_v1_events_event_id_tokens_token_id_revoke",
         "responses": {
           "200": {
             "description": "OK",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Envelope"
+                  "type": "object",
+                  "required": [
+                    "v",
+                    "data"
+                  ],
+                  "properties": {
+                    "v": {
+                      "type": "integer",
+                      "enum": [
+                        1
+                      ]
+                    },
+                    "data": {}
+                  }
                 }
               }
             }
@@ -1466,7 +2718,47 @@
               }
             }
           },
+          "409": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "500": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
             "description": "Closed admin error",
             "content": {
               "application/json": {
@@ -1481,20 +2773,55 @@
           {
             "bearerAuth": []
           }
+        ],
+        "parameters": [
+          {
+            "name": "event_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "token_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
         ]
       }
     },
     "/api/v1/events/{event_id}/aliases": {
       "get": {
         "summary": "List event-scoped display aliases",
-        "operationId": "get_api_v1_events_event_id_aliases",
+        "operationId": "get__api_v1_events_event_id_aliases",
         "responses": {
           "200": {
             "description": "OK",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Envelope"
+                  "type": "object",
+                  "required": [
+                    "v",
+                    "data"
+                  ],
+                  "properties": {
+                    "v": {
+                      "type": "integer",
+                      "enum": [
+                        1
+                      ]
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/AliasList"
+                    }
+                  }
                 }
               }
             }
@@ -1539,7 +2866,47 @@
               }
             }
           },
+          "409": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "500": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
             "description": "Closed admin error",
             "content": {
               "application/json": {
@@ -1550,7 +2917,21 @@
             }
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
         "parameters": [
+          {
+            "name": "event_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
           {
             "name": "target_type",
             "in": "query",
@@ -1559,25 +2940,35 @@
               "type": "string"
             }
           }
-        ],
-        "security": [
-          {
-            "bearerAuth": []
-          }
         ]
       }
     },
     "/api/v1/events/{event_id}/aliases/{target_type}/{target_key}": {
       "put": {
         "summary": "Set an alias with optimistic version",
-        "operationId": "put_api_v1_events_event_id_aliases_target_type_target_key",
+        "operationId": "put__api_v1_events_event_id_aliases_target_type_target_key",
         "responses": {
           "200": {
             "description": "OK",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Envelope"
+                  "type": "object",
+                  "required": [
+                    "v",
+                    "data"
+                  ],
+                  "properties": {
+                    "v": {
+                      "type": "integer",
+                      "enum": [
+                        1
+                      ]
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/AliasView"
+                    }
+                  }
                 }
               }
             }
@@ -1622,7 +3013,47 @@
               }
             }
           },
+          "409": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "500": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
             "description": "Closed admin error",
             "content": {
               "application/json": {
@@ -1633,6 +3064,11 @@
             }
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -1643,22 +3079,59 @@
             }
           }
         },
-        "security": [
+        "parameters": [
           {
-            "bearerAuth": []
+            "name": "event_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "target_type",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "string"
+            }
+          },
+          {
+            "name": "target_key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "string"
+            }
           }
         ]
       },
       "delete": {
         "summary": "Delete an alias",
-        "operationId": "delete_api_v1_events_event_id_aliases_target_type_target_key",
+        "operationId": "delete__api_v1_events_event_id_aliases_target_type_target_key",
         "responses": {
           "200": {
             "description": "OK",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Envelope"
+                  "type": "object",
+                  "required": [
+                    "v",
+                    "data"
+                  ],
+                  "properties": {
+                    "v": {
+                      "type": "integer",
+                      "enum": [
+                        1
+                      ]
+                    },
+                    "data": {}
+                  }
                 }
               }
             }
@@ -1703,7 +3176,47 @@
               }
             }
           },
+          "409": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "500": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
             "description": "Closed admin error",
             "content": {
               "application/json": {
@@ -1717,6 +3230,35 @@
         "security": [
           {
             "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "event_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "target_type",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "string"
+            }
+          },
+          {
+            "name": "target_key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "string"
+            }
           }
         ]
       }
@@ -1724,14 +3266,29 @@
     "/api/v1/events/{event_id}/mapping/{windows_node_id}": {
       "get": {
         "summary": "List append-only route-mapping versions",
-        "operationId": "get_api_v1_events_event_id_mapping_windows_node_id",
+        "operationId": "get__api_v1_events_event_id_mapping_windows_node_id",
         "responses": {
           "200": {
             "description": "OK",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Envelope"
+                  "type": "object",
+                  "required": [
+                    "v",
+                    "data"
+                  ],
+                  "properties": {
+                    "v": {
+                      "type": "integer",
+                      "enum": [
+                        1
+                      ]
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/MappingVersionList"
+                    }
+                  }
                 }
               }
             }
@@ -1776,7 +3333,47 @@
               }
             }
           },
+          "409": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "500": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
             "description": "Closed admin error",
             "content": {
               "application/json": {
@@ -1791,18 +3388,53 @@
           {
             "bearerAuth": []
           }
+        ],
+        "parameters": [
+          {
+            "name": "event_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "windows_node_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
         ]
       },
       "post": {
         "summary": "Create the next immutable mapping version (platform_admin)",
-        "operationId": "post_api_v1_events_event_id_mapping_windows_node_id",
+        "operationId": "post__api_v1_events_event_id_mapping_windows_node_id",
         "responses": {
-          "200": {
+          "201": {
             "description": "OK",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Envelope"
+                  "type": "object",
+                  "required": [
+                    "v",
+                    "data"
+                  ],
+                  "properties": {
+                    "v": {
+                      "type": "integer",
+                      "enum": [
+                        1
+                      ]
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/MappingVersionView"
+                    }
+                  }
                 }
               }
             }
@@ -1847,7 +3479,47 @@
               }
             }
           },
+          "409": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "500": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
             "description": "Closed admin error",
             "content": {
               "application/json": {
@@ -1858,6 +3530,11 @@
             }
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -1868,9 +3545,24 @@
             }
           }
         },
-        "security": [
+        "parameters": [
           {
-            "bearerAuth": []
+            "name": "event_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "windows_node_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
           }
         ]
       }
@@ -1878,14 +3570,29 @@
     "/api/v1/events/{event_id}/mapping/{windows_node_id}/resolve": {
       "get": {
         "summary": "Resolve the mapping in effect at a timestamp",
-        "operationId": "get_api_v1_events_event_id_mapping_windows_node_id_resolve",
+        "operationId": "get__api_v1_events_event_id_mapping_windows_node_id_resolve",
         "responses": {
           "200": {
             "description": "OK",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Envelope"
+                  "type": "object",
+                  "required": [
+                    "v",
+                    "data"
+                  ],
+                  "properties": {
+                    "v": {
+                      "type": "integer",
+                      "enum": [
+                        1
+                      ]
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/MappingResolutionView"
+                    }
+                  }
                 }
               }
             }
@@ -1930,7 +3637,47 @@
               }
             }
           },
+          "409": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "500": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
             "description": "Closed admin error",
             "content": {
               "application/json": {
@@ -1941,7 +3688,30 @@
             }
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
         "parameters": [
+          {
+            "name": "event_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "windows_node_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
           {
             "name": "at",
             "in": "query",
@@ -1950,25 +3720,35 @@
               "type": "integer"
             }
           }
-        ],
-        "security": [
-          {
-            "bearerAuth": []
-          }
         ]
       }
     },
     "/api/v1/retention/state": {
       "get": {
         "summary": "Retention degraded/last-run state (platform_admin)",
-        "operationId": "get_api_v1_retention_state",
+        "operationId": "get__api_v1_retention_state",
         "responses": {
           "200": {
             "description": "OK",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Envelope"
+                  "type": "object",
+                  "required": [
+                    "v",
+                    "data"
+                  ],
+                  "properties": {
+                    "v": {
+                      "type": "integer",
+                      "enum": [
+                        1
+                      ]
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/RetentionStateView"
+                    }
+                  }
                 }
               }
             }
@@ -2013,7 +3793,47 @@
               }
             }
           },
+          "409": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "500": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
             "description": "Closed admin error",
             "content": {
               "application/json": {
@@ -2034,14 +3854,29 @@
     "/api/v1/retention/timeline": {
       "get": {
         "summary": "Retention timeline counters (platform_admin)",
-        "operationId": "get_api_v1_retention_timeline",
+        "operationId": "get__api_v1_retention_timeline",
         "responses": {
           "200": {
             "description": "OK",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Envelope"
+                  "type": "object",
+                  "required": [
+                    "v",
+                    "data"
+                  ],
+                  "properties": {
+                    "v": {
+                      "type": "integer",
+                      "enum": [
+                        1
+                      ]
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/RetentionTimelineView"
+                    }
+                  }
                 }
               }
             }
@@ -2086,7 +3921,47 @@
               }
             }
           },
+          "409": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "500": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
             "description": "Closed admin error",
             "content": {
               "application/json": {
@@ -2107,14 +3982,29 @@
     "/api/v1/retention/runs": {
       "get": {
         "summary": "Recent bounded retention runs (platform_admin)",
-        "operationId": "get_api_v1_retention_runs",
+        "operationId": "get__api_v1_retention_runs",
         "responses": {
           "200": {
             "description": "OK",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Envelope"
+                  "type": "object",
+                  "required": [
+                    "v",
+                    "data"
+                  ],
+                  "properties": {
+                    "v": {
+                      "type": "integer",
+                      "enum": [
+                        1
+                      ]
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/RetentionRunList"
+                    }
+                  }
                 }
               }
             }
@@ -2159,7 +4049,47 @@
               }
             }
           },
+          "409": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "500": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
             "description": "Closed admin error",
             "content": {
               "application/json": {
@@ -2170,6 +4100,11 @@
             }
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
         "parameters": [
           {
             "name": "limit",
@@ -2179,25 +4114,33 @@
               "type": "integer"
             }
           }
-        ],
-        "security": [
-          {
-            "bearerAuth": []
-          }
         ]
       }
     },
     "/api/v1/retention/run": {
       "post": {
         "summary": "Run the existing bounded maintenance sweep (platform_admin)",
-        "operationId": "post_api_v1_retention_run",
+        "operationId": "post__api_v1_retention_run",
         "responses": {
           "200": {
             "description": "OK",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Envelope"
+                  "type": "object",
+                  "required": [
+                    "v",
+                    "data"
+                  ],
+                  "properties": {
+                    "v": {
+                      "type": "integer",
+                      "enum": [
+                        1
+                      ]
+                    },
+                    "data": {}
+                  }
                 }
               }
             }
@@ -2242,7 +4185,47 @@
               }
             }
           },
+          "409": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "500": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
             "description": "Closed admin error",
             "content": {
               "application/json": {
@@ -2263,14 +4246,29 @@
     "/api/v1/capacity": {
       "get": {
         "summary": "Capacity/quota planning counters (platform_admin)",
-        "operationId": "get_api_v1_capacity",
+        "operationId": "get__api_v1_capacity",
         "responses": {
           "200": {
             "description": "OK",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Envelope"
+                  "type": "object",
+                  "required": [
+                    "v",
+                    "data"
+                  ],
+                  "properties": {
+                    "v": {
+                      "type": "integer",
+                      "enum": [
+                        1
+                      ]
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/CapacityView"
+                    }
+                  }
                 }
               }
             }
@@ -2315,7 +4313,47 @@
               }
             }
           },
+          "409": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "500": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
             "description": "Closed admin error",
             "content": {
               "application/json": {
@@ -2336,14 +4374,29 @@
     "/api/v1/audit": {
       "get": {
         "summary": "Scoped administrative audit query",
-        "operationId": "get_api_v1_audit",
+        "operationId": "get__api_v1_audit",
         "responses": {
           "200": {
             "description": "OK",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/AuditList"
+                  "type": "object",
+                  "required": [
+                    "v",
+                    "data"
+                  ],
+                  "properties": {
+                    "v": {
+                      "type": "integer",
+                      "enum": [
+                        1
+                      ]
+                    },
+                    "data": {
+                      "$ref": "#/components/schemas/AuditList"
+                    }
+                  }
                 }
               }
             }
@@ -2377,8 +4430,73 @@
                 }
               }
             }
+          },
+          "404": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
           }
         },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
         "parameters": [
           {
             "name": "event_id",
@@ -2428,25 +4546,33 @@
               "type": "integer"
             }
           }
-        ],
-        "security": [
-          {
-            "bearerAuth": []
-          }
         ]
       }
     },
     "/api/v1/audit/verify": {
       "get": {
         "summary": "Verify the security ledger hash chain (platform_admin)",
-        "operationId": "get_api_v1_audit_verify",
+        "operationId": "get__api_v1_audit_verify",
         "responses": {
           "200": {
             "description": "OK",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Envelope"
+                  "type": "object",
+                  "required": [
+                    "v",
+                    "data"
+                  ],
+                  "properties": {
+                    "v": {
+                      "type": "integer",
+                      "enum": [
+                        1
+                      ]
+                    },
+                    "data": {}
+                  }
                 }
               }
             }
@@ -2491,7 +4617,47 @@
               }
             }
           },
+          "409": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
           "500": {
+            "description": "Closed admin error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
             "description": "Closed admin error",
             "content": {
               "application/json": {
@@ -2515,32 +4681,12 @@
       "bearerAuth": {
         "type": "http",
         "scheme": "bearer",
-        "description": "Local admin bearer token from a protected 0600 file; never an agent identity, enrollment token, or client-supplied role header."
+        "description": "Local admin bearer token from a protected operator file. Agent identities/enrollment tokens/client headers are not admin credentials."
       }
     },
     "schemas": {
-      "Envelope": {
-        "type": "object",
-        "required": [
-          "v",
-          "data"
-        ],
-        "properties": {
-          "v": {
-            "type": "integer",
-            "enum": [
-              1
-            ]
-          },
-          "data": {}
-        }
-      },
       "ErrorBody": {
         "type": "object",
-        "required": [
-          "v",
-          "error"
-        ],
         "properties": {
           "v": {
             "type": "integer",
@@ -2550,11 +4696,6 @@
           },
           "error": {
             "type": "object",
-            "required": [
-              "code",
-              "message",
-              "retryable"
-            ],
             "properties": {
               "code": {
                 "type": "string"
@@ -2565,56 +4706,55 @@
               "retryable": {
                 "type": "boolean"
               }
-            }
+            },
+            "required": [
+              "code",
+              "message",
+              "retryable"
+            ]
           },
           "request_id": {
             "type": "string"
           }
-        }
+        },
+        "required": [
+          "v",
+          "error"
+        ]
       },
       "EventView": {
         "type": "object",
-        "required": [
-          "event_id",
-          "display_name",
-          "state"
-        ],
         "properties": {
           "event_id": {
             "type": "string",
             "format": "uuid"
           },
           "display_name": {
-            "type": "string",
-            "maxLength": 128
+            "type": "string"
           },
           "state": {
-            "type": "string",
-            "enum": [
-              "active",
-              "archived"
-            ]
+            "type": "string"
           },
           "node_count": {
-            "type": "integer"
+            "type": "integer",
+            "format": "int64"
           },
           "active_nodes": {
-            "type": "integer"
+            "type": "integer",
+            "format": "int64"
           },
           "linux_nodes": {
-            "type": "integer"
+            "type": "integer",
+            "format": "int64"
           },
           "windows_nodes": {
-            "type": "integer"
+            "type": "integer",
+            "format": "int64"
           }
         }
       },
       "EventList": {
         "type": "object",
-        "required": [
-          "events",
-          "total"
-        ],
         "properties": {
           "events": {
             "type": "array",
@@ -2623,87 +4763,219 @@
             }
           },
           "total": {
-            "type": "integer"
+            "type": "integer",
+            "format": "int64"
           },
           "limit": {
-            "type": "integer"
+            "type": "integer",
+            "format": "int64"
           },
           "offset": {
-            "type": "integer"
+            "type": "integer",
+            "format": "int64"
           }
         }
       },
       "CreateEventRequest": {
         "type": "object",
-        "required": [
-          "display_name"
-        ],
-        "additionalProperties": false,
         "properties": {
           "event_id": {
             "type": "string",
             "format": "uuid"
           },
           "display_name": {
-            "type": "string",
-            "maxLength": 128
+            "type": "string"
           }
-        }
+        },
+        "required": [
+          "display_name"
+        ]
       },
       "RenameEventRequest": {
         "type": "object",
-        "required": [
-          "display_name"
-        ],
-        "additionalProperties": false,
         "properties": {
           "display_name": {
-            "type": "string",
-            "maxLength": 128
+            "type": "string"
           }
-        }
+        },
+        "required": [
+          "display_name"
+        ]
       },
       "PurgeConfirmRequest": {
         "type": "object",
-        "required": [
-          "confirmation"
-        ],
-        "additionalProperties": false,
         "properties": {
           "confirmation": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "confirmation"
+        ]
+      },
+      "PurgePreviewView": {
+        "type": "object",
+        "properties": {
+          "event_id": {
             "type": "string",
-            "description": "Exactly purge:<event_id>"
+            "format": "uuid"
+          },
+          "state": {
+            "type": "string"
+          },
+          "table_counts": {
+            "type": "object"
+          },
+          "total_rows": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "data_purged": {
+            "type": "boolean"
+          },
+          "incomplete": {
+            "type": "boolean"
+          },
+          "irreversible": {
+            "type": "boolean"
+          },
+          "confirm_phrase": {
+            "type": "string"
+          }
+        }
+      },
+      "PurgeStatusView": {
+        "type": "object",
+        "properties": {
+          "event_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "phase": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string"
+          },
+          "deleted_rows": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "error": {
+            "type": "string"
+          },
+          "graveyard": {
+            "type": "boolean"
+          },
+          "data_purged": {
+            "type": "boolean"
+          },
+          "tombstone_until": {
+            "type": "integer",
+            "format": "int64"
           }
         }
       },
       "CreateTokenRequest": {
         "type": "object",
-        "required": [
-          "node_class"
-        ],
-        "additionalProperties": false,
         "properties": {
           "node_class": {
-            "type": "string",
-            "enum": [
-              "linux_vps",
-              "windows_terminal"
-            ]
+            "type": "string"
           },
           "ttl_seconds": {
             "type": "integer",
             "minimum": 60,
             "maximum": 900
           }
+        },
+        "required": [
+          "node_class"
+        ]
+      },
+      "EnrollmentTokenCreated": {
+        "type": "object",
+        "properties": {
+          "event_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "token_id": {
+            "type": "string"
+          },
+          "token": {
+            "type": "string"
+          },
+          "node_class": {
+            "type": "string"
+          },
+          "expires_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "status": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "token_id",
+          "token"
+        ]
+      },
+      "EnrollmentTokenView": {
+        "type": "object",
+        "properties": {
+          "token_id": {
+            "type": "string"
+          },
+          "node_class": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "expires_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "used_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "revoked_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "status": {
+            "type": "string"
+          }
+        }
+      },
+      "EnrollmentTokenList": {
+        "type": "object",
+        "properties": {
+          "tokens": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EnrollmentTokenView"
+            }
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "limit": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "offset": {
+            "type": "integer",
+            "format": "int64"
+          }
         }
       },
       "ConfigUpdateRequest": {
         "type": "object",
-        "required": [
-          "cadence_seconds",
-          "sources"
-        ],
-        "additionalProperties": false,
         "properties": {
           "cadence_seconds": {
             "type": "integer",
@@ -2712,15 +4984,6 @@
           },
           "sources": {
             "type": "object",
-            "additionalProperties": false,
-            "required": [
-              "system",
-              "services",
-              "singbox_api",
-              "mihomo_api",
-              "terminal",
-              "events"
-            ],
             "properties": {
               "system": {
                 "type": "boolean"
@@ -2732,15 +4995,13 @@
                 "type": "boolean",
                 "enum": [
                   false
-                ],
-                "description": "Unavailable until the P1-10 audit/Owner enablement; true is rejected."
+                ]
               },
               "mihomo_api": {
                 "type": "boolean",
                 "enum": [
                   false
-                ],
-                "description": "Windows R1 is local-bundle-only; true is rejected by center config."
+                ]
               },
               "terminal": {
                 "type": "boolean"
@@ -2748,61 +5009,189 @@
               "events": {
                 "type": "boolean"
               }
-            }
+            },
+            "required": [
+              "system",
+              "services",
+              "singbox_api",
+              "mihomo_api",
+              "terminal",
+              "events"
+            ]
           },
           "expected_inbound_tags": {
             "type": "array",
             "maxItems": 8,
             "items": {
-              "type": "object",
-              "additionalProperties": false,
-              "required": [
-                "inbound_tag",
-                "kind"
-              ],
-              "properties": {
-                "inbound_tag": {
-                  "type": "string",
-                  "maxLength": 64
-                },
-                "kind": {
-                  "type": "string",
-                  "enum": [
-                    "reality",
-                    "hysteria2",
-                    "other"
-                  ]
-                }
-              }
+              "type": "object"
             }
+          }
+        },
+        "required": [
+          "cadence_seconds",
+          "sources"
+        ]
+      },
+      "ConfigView": {
+        "type": "object",
+        "properties": {
+          "node_class": {
+            "type": "string"
+          },
+          "config_version": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "effective_from": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "cadence_seconds": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "sources": {
+            "type": "object"
+          },
+          "expected_inbound_tags": {
+            "type": "array"
+          }
+        }
+      },
+      "ConfigHistoryView": {
+        "type": "array",
+        "items": {
+          "type": "object"
+        }
+      },
+      "NodeView": {
+        "type": "object",
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "event_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "node_class": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string"
+          },
+          "derived_status": {
+            "type": "string"
+          },
+          "display_alias": {
+            "type": "string"
+          },
+          "last_seen_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "config_version": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "cadence_seconds": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "latest_report_id": {
+            "type": "string"
+          },
+          "latest_snapshot_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "latest_snapshot": {
+            "type": "object"
+          },
+          "keys": {
+            "type": "array"
+          },
+          "rotation": {
+            "type": "object"
+          }
+        }
+      },
+      "NodeList": {
+        "type": "object",
+        "properties": {
+          "nodes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NodeView"
+            }
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "limit": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "offset": {
+            "type": "integer",
+            "format": "int64"
           }
         }
       },
       "AliasRequest": {
         "type": "object",
-        "required": [
-          "display_name"
-        ],
-        "additionalProperties": false,
         "properties": {
           "display_name": {
-            "type": "string",
-            "maxLength": 128
+            "type": "string"
           },
           "expected_version": {
             "type": "integer",
-            "minimum": 1
+            "format": "int64"
           }
+        },
+        "required": [
+          "display_name"
+        ]
+      },
+      "AliasView": {
+        "type": "object",
+        "properties": {
+          "event_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "target_type": {
+            "type": "string"
+          },
+          "target_key": {
+            "type": "string"
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "updated_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "updated_by": {
+            "type": "string"
+          }
+        }
+      },
+      "AliasList": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/AliasView"
         }
       },
       "MappingCreateRequest": {
         "type": "object",
-        "required": [
-          "version",
-          "effective_from",
-          "entries"
-        ],
-        "additionalProperties": false,
         "properties": {
           "version": {
             "type": "integer",
@@ -2810,34 +5199,128 @@
           },
           "effective_from": {
             "type": "integer",
-            "minimum": 0
+            "format": "int64"
           },
           "entries": {
             "type": "array",
             "maxItems": 4,
             "items": {
-              "type": "object",
-              "additionalProperties": false,
-              "required": [
-                "route_token",
-                "target_node_id"
-              ],
-              "properties": {
-                "route_token": {
-                  "type": "string",
-                  "enum": [
-                    "a_reality",
-                    "a_hy2",
-                    "b_reality",
-                    "b_hy2"
-                  ]
-                },
-                "target_node_id": {
-                  "type": "string",
-                  "format": "uuid"
-                }
-              }
+              "type": "object"
             }
+          }
+        },
+        "required": [
+          "version",
+          "effective_from",
+          "entries"
+        ]
+      },
+      "MappingVersionView": {
+        "type": "object",
+        "properties": {
+          "version": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "effective_from": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "created_by": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "entries": {
+            "type": "object"
+          }
+        }
+      },
+      "MappingVersionList": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/MappingVersionView"
+        }
+      },
+      "MappingResolutionView": {
+        "type": "object",
+        "properties": {
+          "windows_node_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "entries": {
+            "type": "object"
+          }
+        }
+      },
+      "RetentionStateView": {
+        "type": "object",
+        "properties": {
+          "degraded": {
+            "type": "boolean"
+          },
+          "failure_count": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "last_run_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "last_error": {
+            "type": "string"
+          }
+        }
+      },
+      "RetentionTimelineView": {
+        "type": "object",
+        "properties": {
+          "active_events": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "archived_events": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "archived_retained": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "events_catalog": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "RetentionRunList": {
+        "type": "array",
+        "items": {
+          "type": "object"
+        }
+      },
+      "CapacityView": {
+        "type": "object",
+        "properties": {
+          "counts": {
+            "type": "object"
+          },
+          "quotas": {
+            "type": "object"
+          },
+          "planning_basis": {
+            "type": "string"
           }
         }
       },
@@ -2845,19 +5328,19 @@
         "type": "object",
         "properties": {
           "entries": {
-            "type": "array",
-            "items": {
-              "type": "object"
-            }
+            "type": "array"
           },
           "total": {
-            "type": "integer"
+            "type": "integer",
+            "format": "int64"
           },
           "limit": {
-            "type": "integer"
+            "type": "integer",
+            "format": "int64"
           },
           "offset": {
-            "type": "integer"
+            "type": "integer",
+            "format": "int64"
           }
         }
       }

@@ -70,13 +70,40 @@ func auditContext(ctx context.Context, p Principal, action Action, eventID, targ
 	})
 }
 
+func hasControlOrNewline(value string) bool {
+	for _, r := range value {
+		if r < 0x20 || r == 0x7f {
+			return true
+		}
+	}
+	return false
+}
+
+func boundedAuditValue(value string) string {
+	if len(value) > 128 || hasControlOrNewline(value) {
+		return "invalid"
+	}
+	return value
+}
+
+func boundedAuditEventID(eventID string) string {
+	if eventID == "" || validUUID(eventID) {
+		return eventID
+	}
+	return "invalid_event_id"
+}
+
 func (s *Service) auditDenied(ctx context.Context, p Principal, action Action, eventID, target string) {
 	if p.ID == "" {
 		p = Principal{ID: "anonymous", Role: ""}
 	}
+	if strings.TrimSpace(target) == "" {
+		target = "denied"
+	}
 	_ = s.st.RecordAdminAudit(ctx, store.AuditMeta{
-		Actor: p.ID, Role: string(p.Role), Action: string(action), Target: target,
-		EventID: eventID, RequestID: requestIDFromContext(ctx),
+		Actor: boundedAuditValue(p.ID), Role: string(p.Role), Action: string(action),
+		Target: boundedAuditValue(target), EventID: boundedAuditEventID(eventID),
+		RequestID: requestIDFromContext(ctx),
 	}, "denied")
 }
 
@@ -145,7 +172,8 @@ func mapStoreError(err error) error {
 		return ErrNotFound
 	case errors.Is(err, store.ErrNodeUnknown), errors.Is(err, store.ErrKeyUnknown):
 		return ErrNotFound
-	case errors.Is(err, store.ErrAliasConflict):
+	case errors.Is(err, store.ErrAliasConflict), errors.Is(err, store.ErrAlreadyExists),
+		errors.Is(err, store.ErrConflict):
 		return ErrConflict
 	default:
 		return err
@@ -780,6 +808,7 @@ func (s *Service) RetentionState(ctx context.Context, p Principal) (RetentionSta
 
 func (s *Service) RetentionTimeline(ctx context.Context, p Principal) (RetentionTimelineView, error) {
 	if err := Authorize(p, ActionRetentionRead, ""); err != nil {
+		s.auditDenied(ctx, p, ActionRetentionRead, "", "retention")
 		return RetentionTimelineView{}, err
 	}
 	t, err := s.st.RetentionTimeline(ctx)
@@ -792,6 +821,7 @@ func (s *Service) RetentionTimeline(ctx context.Context, p Principal) (Retention
 
 func (s *Service) Capacity(ctx context.Context, p Principal) (CapacityView, error) {
 	if err := Authorize(p, ActionRetentionRead, ""); err != nil {
+		s.auditDenied(ctx, p, ActionRetentionRead, "", "capacity")
 		return CapacityView{}, err
 	}
 	base, err := s.st.CapacityStats(ctx)
@@ -844,6 +874,7 @@ func (s *Service) RunRetention(ctx context.Context, p Principal) (map[string]int
 
 func (s *Service) RetentionRuns(ctx context.Context, p Principal, limit int) ([]map[string]any, error) {
 	if err := Authorize(p, ActionRetentionRead, ""); err != nil {
+		s.auditDenied(ctx, p, ActionRetentionRead, "", "retention")
 		return nil, err
 	}
 	limit, _ = clampPage(limit, 0)
@@ -875,6 +906,7 @@ func (s *Service) ListAudit(ctx context.Context, p Principal, eventID, action, r
 		}
 	} else if eventID != "" {
 		if !p.HasEvent(eventID) {
+			s.auditDenied(ctx, p, ActionAuditRead, eventID, "audit")
 			return AuditList{}, ErrNotFound
 		}
 		scope = []string{eventID}

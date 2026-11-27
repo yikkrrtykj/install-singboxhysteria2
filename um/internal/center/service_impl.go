@@ -80,7 +80,7 @@ func mapServiceError(err error) error {
 		return api
 	}
 	switch {
-	case errors.Is(err, store.ErrTokenInvalid):
+	case errors.Is(err, store.ErrTokenInvalid), errors.Is(err, store.ErrTokenRevoked):
 		return apiErr(401, "token_invalid", false)
 	case errors.Is(err, store.ErrTokenExpired):
 		return apiErr(401, "token_expired", false)
