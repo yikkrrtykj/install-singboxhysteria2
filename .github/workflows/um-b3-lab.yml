@@ -5,6 +5,8 @@ on:
   push:
     paths:
       - '.github/workflows/um-b3-lab.yml'
+      - 'um/deploy/lab/**'
+      - 'um/cmd/um-lab/**'
 
 permissions:
   contents: read
