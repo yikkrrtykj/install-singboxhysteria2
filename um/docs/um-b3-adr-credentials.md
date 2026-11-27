@@ -54,6 +54,28 @@ requested or stored by UM-B3 work. This ADR contains none.
   secret exists. `LocalSystem` remains forbidden; `LocalMachine` DPAPI scope is
   not a default.
 
+## 1b. OD-P7 isolated Windows lab result and recommendation
+
+The dedicated isolated `um-b3-lab.yml` workflow ran on the GitHub-hosted
+**windows-2022** runner (run `46039366384`, PASS). It created the service
+directly under `NT SERVICE\um-agent` with a per-service SID and no password,
+enrolled under that account, verified DPAPI CurrentUser protection of the
+Ed25519 identity and provisional rotation key, provisioned the R1 bundle under
+the same account, ran the real `um-agent service` wrapper in session 0, and
+verified stop/start identity recovery. The SCM service account, session and
+state ACL were checked; no LocalSystem or machine-scope DPAPI path was used.
+
+**Recommendation:** use `NT SERVICE\um-agent` as the primary OD-P7 account
+(virtual service account, per-service SID, DPAPI CurrentUser, private state/R1
+ACL). A dedicated non-admin local user remains the fallback if a target build
+cannot support the virtual account's DPAPI/profile behavior. `LocalSystem` is
+forbidden. This is a **LAB result and recommendation only**; final production
+account and production credential policy require a separate Owner record.
+
+Enrollment and R1 provisioning must run under that same account. The lab uses a
+SCM helper because a console `enroll`/`r1-provision` process cannot itself be an
+SCM service; the production installer does not silently enroll or provision.
+
 ## 2. Linux file-permission baseline (proposed; aligns with frozen contract)
 
 The Linux runtime follows `04` §11 and is **not** an OD-P7 policy question; the
@@ -71,7 +93,7 @@ table is recorded here so the Windows decision is made against the same baseline
 | sing-box API credential (if ever authorized) | root-owned credential source (not the sing-box config) | `root` 0400 + `LoadCredential=` | agent sees content only in `$CREDENTIALS_DIRECTORY` in its private mount namespace; no permission change to sing-box/Monitor/`sbox-cm` files |
 
 Additional rules: `umagent` is a non-login system user (no home, no shell, no
-sudo); no resident root collector; no fork/exec (`NoExecPaths=/` where
+sudo); no resident root collector; no fork/exec (`NoExecPaths=` standard-tool whitelist where
 supported, see `um-b3-scope-and-matrix.md` G2); only outbound HTTPS to the
 center; no listening socket. **No DPAPI on Linux** — there is no OS keyring
 dependency; "DPAPI scope" below is Windows-only.

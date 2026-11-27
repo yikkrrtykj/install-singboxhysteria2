@@ -245,9 +245,10 @@ optional probes and roots for tests (`ProcRoot`, `SysRoot`, `DiskMountPath`,
 
 - **System**: `/proc`/`/sys` read-only counters (CPU aggregate, memory, disk
   space/usage, network counters, load/uptime) — no subprocess, no shell, no
-  root, no permissions changed. CPU is a since-boot aggregate; service.api
-  traffic counters are probe-observed cumulative lower bounds, never
-  active-only bytes presented as lifetime totals.
+  root, no permissions changed. CPU is a since-boot aggregate. The service.api
+  accumulator exposes probe-observed lower bounds, but the frozen traffic
+  schema has no lower-bound representation; B3 therefore reports traffic
+  unavailable/empty rather than putting an estimate into a total field.
 - **Services**: the Linux build ships a real read-only `SystemdDBusProbe`
   backed by pinned `godbus/dbus/v5`. It opens a private unprivileged system-bus
   connection and issues exactly `Manager.GetUnit("sing-box.service")` on

@@ -135,7 +135,7 @@ whose real-environment verification is the substance of the claim.
 | 10 | Agent-side privacy: no local names/IPs/URLs/process names/connection ids/credentials/YAML in bodies, logs or state diagnostics; closed error logging | B3.1 | `04` §9.3; `06` SEC-14 extension | collector contract + runtime status (no payload logging); negative tests | IMPLEMENTED + MOCK-UNIT PASS (see §5) |
 | 11 | Linux `/proc` read-only system counters (CPU/mem/disk/net), no subprocess, no root; honest UNKNOWN/UNAVAILABLE | B3.2 | `04` §11 | `um/internal/linuxobs/{collector,procfs,system,disk}.go` + synthetic-fixture tests | MOCK-UNIT PASS (synthetic procfs; not a real-host proof) |
 | 12 | Linux systemd unit state via read-only D-Bus `ActiveState`; unavailable → UNKNOWN; no `systemctl` exec fallback | B3.2 | `04` §11; P1-03 | `linuxobs.SystemdDBusProbe` (godbus v5.2.4, fixed GetUnit+Properties.Get, FlagNoAutoStart, no write/exec/root) + exact-call/security tests; isolated Ubuntu 24.04 workflow read a real synthetic `sing-box.service` and persisted `services:[{state:"active"}]` | **REAL LAB-REAL PASS on systemd 255 / Ubuntu 24.04 (isolated workflow)**; target VPS matrix broader |
-| 13 | Linux `singbox_api` disabled by default; server-side authorization audit required before enable; unproven source → honest `unavailable`, no fallback credential; no lower bounds as lifetime totals | B3.2 | `04` §11 (P1-10); SEC-39 | Official service.api gRPC-Web client/accumulator (`serviceapi*.go`), synthetic fixtures + reproducible real sing-box 1.14.5 lab; v1.14.5 proto audit shows the single service secret authorizes write/control RPCs, so P1-10 fails; legacy Clash compatibility only; G7 event implemented; traffic is unavailable/empty (no lower-bound claim) | IMPLEMENTED + LAB-REAL isolated; **P1-10 AUTHORIZATION AUDIT FAIL; source stays disabled/unavailable; no production enablement** |
+| 13 | Linux `singbox_api` disabled by default; server-side authorization audit required before enable; unproven source → honest `unavailable`, no fallback credential; no lower bounds as lifetime totals | B3.2 | `04` §11 (P1-10); SEC-39 | Official service.api gRPC-Web client/accumulator (`serviceapi*.go`), synthetic fixtures + reproducible real sing-box 1.14.5 lab (run 46039366384 PASS); v1.14.5 proto audit shows the single service secret authorizes write/control RPCs, so P1-10 fails; legacy Clash compatibility only; G7 event implemented; traffic unavailable/empty | IMPLEMENTED + LAB-REAL isolated; **P1-10 AUTHORIZATION AUDIT FAIL; source disabled/unavailable; no production enablement** |
 | 14 | Linux no-exec/least-privilege runtime: non-root `umagent`, no listener, no exec/root/sudo/shell/systemctl, only own state dir writable; `LoadCredential` for API secrets; source permissions unchanged | B3.2/B3.4 | `04` §11; `03` §11; SEC-31/32/33 | installer + unit + noexec whitelist; isolated systemd workflow verified non-root, no listener, state 0700, NoExecPaths present and restart-safe | **REAL LAB PASS on systemd 255 (isolated)**; target-version matrix broader |
 | 15 | Windows six-token projection of `windowsobs` data; exactly one role enum; independent `selection`/`active_connections` sampling; `direct` only with explicit operator-local binding, otherwise `unknown`/null | B3.3 | `04` §9.2; `02` §2 | `windowsobs` six-token `Role`/`Tokens()` + `windowsagent` collector unit tests | MOCK-UNIT PASS |
 | 16 | Windows honesty: availability coherence, sum equality when `ok`, empty list = observed zero, missing/malformed = unknown/unavailable, no fabricated data | B3.3 | `04` §9.2; SEC-33/45 | `windowsagent/collector_test.go` synthetic observer cases | MOCK-UNIT PASS |
@@ -151,7 +151,7 @@ whose real-environment verification is the substance of the claim.
 | 26 | ADR proposals: OD-P7 credentials and OD-P3 Windows sources, status PROPOSED/PENDING OWNER, never APPROVED | B3.4 | 05 §C/F | two ADR files | IMPLEMENTED (proposals only) |
 | 27 | Dual-platform CI plus isolated service labs: existing CI unchanged; UM-specific lab workflow builds/executes real systemd and SCM/DPAPI/R1 environments | B3.4 | plan §7 | `um-b3-lab.yml`; local full suite; exact-HEAD CI evidence on Draft PR | LOCAL INTEGRATION PASS; final exact-HEAD CI + lab results to be recorded |
 | 28 | Frozen contract untouched, no second signing/transport state machine, no center/B2 changes | B3.1–B3.4 | plan §2/§6 | diff/write boundaries in §2 | IMPLEMENTED (boundary rule) |
-| 29 | CLI entrypoint/platform wiring: `enroll/run/rotate/status/service/r1-provision/version`, D-Bus/service.api wiring, protected R1 bundle, Windows SCM wrapper | B3.1/B3.4 | `04` §11; P1-03 | `um/cmd/um-agent/*`; Windows provisioning tests; builds/vet clean | IMPLEMENTED; SCM service account lab pending; R1 production HOLD |
+| 29 | CLI entrypoint/platform wiring: `enroll/run/rotate/status/service/r1-provision/version`, D-Bus/service.api wiring, protected R1 bundle, Windows SCM wrapper | B3.1/B3.4 | `04` §11; P1-03 | `um/cmd/um-agent/*`; Windows provisioning tests; builds/vet clean | IMPLEMENTED; SCM service account lab PASS (run 46039366384); R1 production HOLD |
 | 30 | Linux installer syntax/template review; dry-run default; no service start/enable by default; contract-conformant stdin token pipe | B3.4 | P1-03; `04` §11 | `install-agent.sh` (`bash -n` clean); no execution | IMPLEMENTED (template only; not executed) |
 | 31 | Windows installer template: explicit Owner confirmation, LocalSystem refused, built-in/virtual account created with correct no-password SCM syntax, account verified with `sc qc`, no R1 provisioning, no start by default | B3.4 | OD-P7/P3; `04` §11 | `install-agent-service.ps1`; PowerShell parser clean; isolated SCM lab probe verified virtual-account creation | IMPLEMENTED; full installer execution pending in lab |
 | 32 | Agent ↔ real center end-to-end: real HTTP/SQLite + real systemd Linux agent with real D-Bus, plus isolated Windows SCM/R1 service path | B3.1/B3.2/B3.3 | `04` §1–§6; B2 center | integration tests; Linux systemd lab on real Ubuntu runner (installer, service, D-Bus, restart, cleanup); Windows SCM/R1 lab harness | **Linux and Windows isolated service labs PASS (run 46038057860); not public-TLS/production** |
@@ -174,7 +174,10 @@ report its own CI result.
   `TestSpoolCorruptionQuarantineAndLimits`, `TestUUIDAndNonceShapes`,
   `TestClientURLRules`, `TestControlStateJSONRoundTrip`,
   `TestReportRejectsMissingRequiredACKFields`, `TestConfigClassAllowlist`,
-  `TestSpoolSameSecondUsesSequenceOrder`, plus OS-lock/DPAPI tests.
+  `TestSpoolSameSecondUsesSequenceOrder`, `TestAgentRestartAfterLostACKNewGeneration`,
+  `TestAgentRunRecoversCommittedProofBeforeConfig`, `TestAgentRunResumesAfterRecoveredConfigRetry`,
+  `TestAgentRotationWithPendingSpoolUsesNewIdentity`, `TestAgentProofRotationExpiredClearsIntent`,
+  plus OS-lock/DPAPI tests.
 - `um/internal/linuxobs`: collector/procfs/system/disk/service/singbox
   projection and safety tests including availability honesty, source-switch
   gating, G7 event schema, service.api projection, D-Bus exact-call/security
@@ -316,9 +319,10 @@ report its own CI result.
   runbook must be re-checked against the final code slice at review (the frozen
   contract command `enroll --token-stdin` is implemented and used by the
   installer).
-- G10: local `go test ./...`, exact-HEAD CI, and the UM-specific isolated
-  service-lab workflow results are recorded on the Draft PR. The lab workflow
-  is the real systemd/SCM/DPAPI evidence lane; it is not a production gate.
+- G10: local `go test ./...`, exact-HEAD CI, and UM-specific isolated lab
+  workflow run `46039366384` (Linux systemd/D-Bus, Windows SCM/DPAPI/R1, real
+  sing-box service.api) are recorded. The lab workflow is evidence, not a
+  production gate.
 
 ## 9. Required statement
 

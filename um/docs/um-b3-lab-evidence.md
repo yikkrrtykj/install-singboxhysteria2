@@ -161,8 +161,10 @@ real controller secret.
 `um/deploy/lab/singbox-serviceapi-lab.sh` downloads the official sing-box
 1.14.5 Linux amd64 binary, starts a synthetic loopback mixed inbound and
 `service.api`, opens a real HTTP CONNECT connection, and runs the opt-in
-`TestServiceAPIOptInLab`. The lab verifies the real connection stream and
-records that the accumulator exposes only a non-exact lower bound. The frozen
+`TestServiceAPIOptInLab`. The isolated lab workflow run `46039366384` passed all
+five jobs including this real service.api job. The lab verifies the real
+connection stream and records that the accumulator exposes only a non-exact
+lower bound. The frozen
 schema has no lower-bound representation, so B3's traffic projection is
 `unavailable` with an empty traffic array for both service.api and legacy Clash
 paths.
@@ -172,7 +174,8 @@ single service secret authorizes write/control RPCs (`ClearLogs`,
 `SetClashMode`, `SelectOutbound`, `CloseConnection`, etc.), so it is not a
 read-only credential and P1-10 cannot be proven. The source stays disabled.
 The lab uses a synthetic mixed inbound, not real Reality/Hysteria2 inbounds;
-those protocol-specific experiments remain unverified and are not claimed.
+those protocol-specific experiments remain unverified and are not claimed
+(the source itself is disabled because the P1-10 authorization audit fails).
 
 ## 5. Not executed
 

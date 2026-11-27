@@ -424,8 +424,8 @@ func TestAgentRotationIntentSurvivesRestart(t *testing.T) {
 	if err := r.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
-	// Power-loss semantics: no clean-shutdown marker, so generation/boot/seq are
-	// preserved and the persisted attempt is retried exactly.
+	// Unclean restart: the next runtime start advances generation/boot and
+	// refreshes the pending control/proof attempt; payload identity is preserved.
 	if err := os.Remove(filepath.Join(dir, cleanShutdownFile)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("remove clean marker: %v", err)
 	}
