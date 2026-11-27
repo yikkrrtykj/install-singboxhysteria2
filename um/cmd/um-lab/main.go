@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/yikkrrtykj/install-singboxhysteria2/um/internal/agent"
 	"github.com/yikkrrtykj/install-singboxhysteria2/um/internal/store"
 	"github.com/yikkrrtykj/install-singboxhysteria2/um/internal/windowsobs"
 )
@@ -32,6 +33,8 @@ func main() {
 		err = summary(os.Args[2:])
 	case "r1-project":
 		err = r1Project(os.Args[2:])
+	case "rotate-intent":
+		err = rotateIntent(os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -43,7 +46,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: um-lab <issue-token|configure|summary|r1-project> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: um-lab <issue-token|configure|summary|r1-project|rotate-intent> [flags]")
 }
 
 func openDB(path string) (*store.Store, error) {
@@ -193,4 +196,24 @@ func r1Project(args []string) error {
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	return enc.Encode(snapshot)
+}
+
+func rotateIntent(args []string) error {
+	fs := flag.NewFlagSet("rotate-intent", flag.ExitOnError)
+	stateDir := fs.String("state-dir", "", "agent state directory")
+	centerURL := fs.String("center", "", "center ingest URL")
+	nodeClass := fs.String("node-class", "windows_terminal", "node class")
+	hostOS := fs.String("host-os", "windows", "host OS for the body context")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	r, err := agent.NewRuntime(agent.Options{
+		StateDir: *stateDir, CenterURL: *centerURL, NodeClass: *nodeClass,
+		HostOS: *hostOS, AgentVersion: "lab", Collector: nil,
+	})
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	return r.Rotate(context.Background())
 }

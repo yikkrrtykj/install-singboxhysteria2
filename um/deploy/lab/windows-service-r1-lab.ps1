@@ -138,16 +138,17 @@ if ($qc -notmatch [regex]::Escape("NT SERVICE\$svc")) { Fail 'SCM start account 
 # Rotation provisional key must also be DPAPI protected. Run rotate through the
 # same temporary service; the actual service later recovers the proof.
 # ---------------------------------------------------------------------------
-$rotatePath = '"' + $labSvc + '" --log "' + $serviceLog + '" "' + $agent + '" rotate --state-dir "' + $state + '" --center "http://127.0.0.1:18080" --node-class windows_terminal'
+$rotatePath = '"' + $labSvc + '" --log "' + $serviceLog + '" "' + $labtool + '" rotate-intent --state-dir "' + $state + '" --center "http://127.0.0.1:18080" --node-class windows_terminal'
 Set-AgentService $rotatePath
 Start-OneShotService
 $rotationFile = Join-Path $state 'rotation.json'
-if (Test-Path -LiteralPath $rotationFile) {
-  $rotation = Get-Content -LiteralPath $rotationFile -Raw | ConvertFrom-Json
-  if (-not ($rotation.PSObject.Properties.Name -contains 'new_private_key_dpapi') -or
-      ($rotation.PSObject.Properties.Name -contains 'new_private_key')) {
-    Fail 'rotation provisional key is not DPAPI-protected'
-  }
+if (-not (Test-Path -LiteralPath $rotationFile)) {
+  Fail 'rotation intent was not persisted for the provisional-key lab check'
+}
+$rotation = Get-Content -LiteralPath $rotationFile -Raw | ConvertFrom-Json
+if (-not ($rotation.PSObject.Properties.Name -contains 'new_private_key_dpapi') -or
+    ($rotation.PSObject.Properties.Name -contains 'new_private_key')) {
+  Fail 'rotation provisional key is not DPAPI-protected'
 }
 
 # ---------------------------------------------------------------------------

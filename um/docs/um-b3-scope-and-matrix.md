@@ -214,24 +214,27 @@ report its own CI result.
   connected real sing-box 1.14.5 service.api → Linux collector → real center +
   SQLite and persisted `test-in` traffic. This is INTEGRATION/LAB-REAL for the
   tested boundary, not public-TLS or a real VPS/terminal proof.
-- `um/cmd/um-agent`: Windows source authorization-file gate tests and builds;
-  Windows SCM/service/account integration still not lab-executed.
-- Local syntax checks for deploy templates: `bash -n` on
-  `um/deploy/linux/install-agent.sh` PASS; PowerShell parser on
-  `um/deploy/windows/install-agent-service.ps1` PASS. Neither script was
-  executed; no service was installed/started and no credential was created.
+- `um/cmd/um-agent`: Windows protected R1 provisioning tests and builds; the
+  isolated Windows 2022 SCM lab executed real virtual-service-account
+  enrollment, DPAPI/R1 provisioning and session-0 service execution.
+- Deploy templates: `bash -n` and PowerShell parser PASS. The isolated Linux
+  lab executed the actual installer (non-root enrollment/service/noexec/D-Bus);
+  the isolated Windows lab exercised virtual-account SCM syntax and the real
+  service wrapper. No production credential was created.
 - B2 regression: the same local `go test ./...` run keeps
   `internal/center`, `internal/store`, `internal/conformance`,
   `internal/protocol`, `internal/schema`, `internal/contract` and
   `internal/wire` green; this is not re-claimed as new B3 evidence.
-- Executed locally: isolated real sing-box 1.14.5 service.api with an active
-  connection and a real center/SQLite round trip; named-pipe/TCP R2 lab on the
-  installed Clash Verge Rev/Mihomo versions; Windows current-user DPAPI tests;
-  process-level REC-17/18/27 crash harness.
-- Not executed: Linux `-race` local, systemd/D-Bus real lab, Windows SCM/
-  service-account/ACL lab, real center over public TLS, real tournament
-  Clash Verge/Mihomo read-only/HA proof, R2/R1 enablement, production. These
-  stay DEFERRED/BLOCKED.
+- Executed locally: isolated real sing-box 1.14.5 service.api reproducible lab;
+  named-pipe/TCP R2 lab on installed Clash Verge Rev/Mihomo versions; Windows
+  current-user DPAPI tests; process-level REC-17/18/27 crash harness.
+- Executed on disposable GitHub runners (run 46039366384, all jobs PASS):
+  real Ubuntu 24.04 systemd installer/D-Bus/noexec/service lab; real Windows
+  2022 SCM virtual-account/DPAPI/R1/session-0 lab; reproducible real sing-box
+  service.api lab.
+- Not executed: local Linux `-race` (no gcc); real center over public TLS; real
+  tournament Clash Verge/Mihomo read-only/HA proof; R1 production enablement;
+  R2 full target matrix; production. These stay HOLD.
 
 ## 6. Review/merge gates (unchanged; this Draft does not grant them)
 
@@ -254,12 +257,12 @@ report its own CI result.
 2. **R1** — Owner-authorized for isolated lab only, not production; the
    protected local bundle is implemented and no environment/center switch can
    enable it. R1 remains described as a write-capable credential used by a
-   GET-only client, never as read-only. Real Windows lab result is pending.
+   GET-only client, never as read-only. Real Windows lab PASS (run 46039366384);
+   production remain HOLD.
 3. **Windows final service account / DPAPI / ACL** — OD-P7 final account is
-   PENDING. Virtual account creation was probed in a real runner; a full
-   SCM/DPAPI/enrollment/session-0 lab harness is present and its result is
-   pending. Node/R1 keys are DPAPI CurrentUser-protected; LocalSystem and
-   machine-scope fallback are forbidden.
+   PENDING. The real isolated Windows lab PASS (run 46039366384) verified
+   virtual-account SCM/enrollment, DPAPI identity/rotation, R1 provisioning,
+   session 0 and private ACLs. LocalSystem/machine-scope fallback forbidden.
 4. **Linux systemd/D-Bus lab** — real isolated Ubuntu 24.04 workflow PASS:
    installer, non-root service, real D-Bus ActiveState, no listener, state mode,
    restart-safe noexec whitelist and restart generation advance. Broader target

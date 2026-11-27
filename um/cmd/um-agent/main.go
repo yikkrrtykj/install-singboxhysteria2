@@ -179,6 +179,13 @@ func runAgentContext(ctx context.Context, args []string) error {
 	}
 	defer r.Close()
 	if once {
+		// A committed rotation proof may have lost its ACK; recover it before
+		// pulling config, otherwise the center has already revoked the old key
+		// and this one-shot path would write fail_closed. Flush also drains any
+		// fsynced spool records, which is safe before the single snapshot.
+		if err := r.Flush(ctx); err != nil {
+			return err
+		}
 		if err := r.PullConfig(ctx); err != nil {
 			return err
 		}

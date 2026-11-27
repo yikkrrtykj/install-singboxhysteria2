@@ -101,7 +101,11 @@ fi
 [ "$(systemctl show -p StateDirectory --value um-agent.service)" = "um-agent" ]
 [ "$(stat -c '%a %U' /var/lib/um-agent)" = "700 umagent" ]
 [ -n "$(systemctl show -p NoExecPaths --value um-agent.service)" ]
-! ss -ltn | grep -q 'um-agent'
+command -v ss >/dev/null
+if ss -ltnp | grep -q 'um-agent'; then
+  echo "um-agent unexpectedly has a listening TCP socket" >&2
+  exit 1
+fi
 
 # Real D-Bus read must appear in a persisted snapshot as active; the synthetic
 # unit is active. Poll the center's last snapshot payload.
