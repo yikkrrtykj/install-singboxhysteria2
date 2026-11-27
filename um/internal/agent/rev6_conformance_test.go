@@ -55,9 +55,10 @@ type rev6Case struct {
 			ReportDedupe    map[string]string `json:"report_dedupe"`
 		} `json:"center"`
 		Agent struct {
-			Generation uint64 `json:"generation"`
-			BootID     string `json:"boot_id"`
-			NextSeq    uint64 `json:"next_seq"`
+			Generation   uint64 `json:"generation"`
+			BootID       string `json:"boot_id"`
+			NextSeq      uint64 `json:"next_seq"`
+			SpoolRecords int    `json:"spool_records"`
 		} `json:"agent"`
 	} `json:"setup"`
 	Attempt struct {
@@ -82,9 +83,12 @@ type rev6Case struct {
 		ACK struct {
 			NextSeq uint64 `json:"next_seq"`
 		} `json:"ack"`
-		Gap      uint64 `json:"gap"`
-		GapAudit string `json:"gap_audit"`
-		Data     string `json:"data"`
+		Gap             uint64 `json:"gap"`
+		GapAudit        string `json:"gap_audit"`
+		Data            string `json:"data"`
+		StateChange     string `json:"state_change"`
+		SpoolChange     string `json:"spool_change"`
+		NetworkRequired bool   `json:"network_required"`
 	} `json:"expected"`
 }
 
@@ -155,7 +159,7 @@ func advanceRev6ClockAt(r *Runtime, base int64) {
 	}
 }
 
-func assertRev6Center(t *testing.T, tc *agentCenter, r *Runtime, wantGen, wantSeq uint64) {
+func assertRev6Center(t *testing.T, tc *agentCenter, r *Runtime, wantGen, wantSeq uint64, wantBootID string) {
 	t.Helper()
 	ident, ok := r.Identity()
 	if !ok {
@@ -165,8 +169,9 @@ func assertRev6Center(t *testing.T, tc *agentCenter, r *Runtime, wantGen, wantSe
 	if err != nil {
 		t.Fatalf("center GetBoot: %v", err)
 	}
-	if boot.HighestGen != wantGen || boot.LastSeq != wantSeq {
-		t.Fatalf("center high-water = gen %d seq %d, want gen %d seq %d", boot.HighestGen, boot.LastSeq, wantGen, wantSeq)
+	if boot.HighestGen != wantGen || boot.LastSeq != wantSeq || (wantBootID != "" && boot.BootID != wantBootID) {
+		t.Fatalf("center state = gen %d seq %d boot %q, want gen %d seq %d boot %q",
+			boot.HighestGen, boot.LastSeq, boot.BootID, wantGen, wantSeq, wantBootID)
 	}
 }
 
@@ -203,14 +208,14 @@ func TestRev6AMENDREC27A(t *testing.T) {
 	if err := r.Flush(ctx); err != nil {
 		t.Fatalf("exact retry: %v", err)
 	}
-	if got := r.LastResult(); got != "duplicate" {
-		t.Fatalf("result=%q, want duplicate", got)
+	if got := r.LastResult(); got != c.Expected.Result {
+		t.Fatalf("A result=%q, want fixture %q", got, c.Expected.Result)
 	}
 	boot, _ := r.Boot()
 	if boot.Generation != c.Setup.Agent.Generation || boot.NextSeq != c.Expected.ACK.NextSeq {
 		t.Fatalf("agent boot after A = %+v", boot)
 	}
-	assertRev6Center(t, tc, r, c.Setup.Center.HighestGen, c.Setup.Center.LastSeq)
+	assertRev6Center(t, tc, r, c.Expected.CenterState.HighestGen, c.Expected.CenterState.LastSeq, c.Expected.CenterState.BootID)
 	if stats, err := tc.st.CapacityStats(ctx); err != nil || stats.Snapshots != int64(c.Setup.Center.LastSeq) {
 		t.Fatalf("A stored snapshots=%+v err=%v, want %d", stats, err, c.Setup.Center.LastSeq)
 	}
@@ -269,7 +274,19 @@ func TestRev6AMENDREC27BC(t *testing.T) {
 	if got := r2.LastResult(); got != b.Expected.Result {
 		t.Fatalf("B result=%q, want fixture %q", got, b.Expected.Result)
 	}
-	assertRev6Center(t, tc, r2, b.Expected.CenterState.HighestGen, b.Expected.CenterState.LastSeq)
+	assertRev6Center(t, tc, r2, b.Expected.CenterState.HighestGen, b.Expected.CenterState.LastSeq, "")
+	b2, _ := r2.Boot()
+	if b2.BootID == "" {
+		t.Fatal("B agent boot id missing")
+	}
+	identB, _ := r2.Identity()
+	centerB, _ := tc.st.GetBoot(ctx, identB.NodeID)
+	if centerB.BootID != b2.BootID {
+		t.Fatalf("B center boot id=%q, want agent new-generation boot %q", centerB.BootID, b2.BootID)
+	}
+	if b2.NextSeq != b.Expected.ACK.NextSeq {
+		t.Fatalf("B next_seq=%d, want fixture %d", b2.NextSeq, b.Expected.ACK.NextSeq)
+	}
 	if stats, err := tc.st.CapacityStats(ctx); err != nil || stats.Snapshots != int64(b.Setup.Center.LastSeq) {
 		t.Fatalf("B stored snapshots=%+v err=%v, want %d (no second data copy)", stats, err, b.Setup.Center.LastSeq)
 	}
@@ -277,10 +294,11 @@ func TestRev6AMENDREC27BC(t *testing.T) {
 	ident2, _ := r2.Identity()
 	_, err = r2.client.Report(ctx, ident2, old.Attempt, old.Kind, old.Body)
 	var ce *CenterError
-	if !errors.As(err, &ce) || ce.Status != c.Expected.HTTPStatus || ce.Code != c.Expected.Error {
-		t.Fatalf("C stale request err=%v, want status %d %s", err, c.Expected.HTTPStatus, c.Expected.Error)
+	if !errors.As(err, &ce) || c.Expected.Result != "rejected" ||
+		ce.Status != c.Expected.HTTPStatus || ce.Code != c.Expected.Error {
+		t.Fatalf("C stale request err=%v, want fixture rejected status %d %s", err, c.Expected.HTTPStatus, c.Expected.Error)
 	}
-	assertRev6Center(t, tc, r2, c.Setup.Center.HighestGen, c.Setup.Center.LastSeq)
+	assertRev6Center(t, tc, r2, c.Setup.Center.HighestGen, c.Setup.Center.LastSeq, "")
 }
 
 func TestRev6AMENDREC27D(t *testing.T) {
@@ -320,8 +338,25 @@ func TestRev6AMENDREC27D(t *testing.T) {
 		t.Fatalf("inspection generation/seq=%d/%d, want %d/%d", inspection.Generation, inspection.NextSeq,
 			c.Setup.Agent.Generation, c.Setup.Agent.NextSeq)
 	}
-	if inspection.Pending != 1 {
-		t.Fatalf("inspection pending=%d, want fixture spool record", inspection.Pending)
+	if inspection.Pending != c.Setup.Agent.SpoolRecords {
+		t.Fatalf("inspection pending=%d, want fixture %d", inspection.Pending, c.Setup.Agent.SpoolRecords)
+	}
+	if c.Expected.StateChange != "none" || c.Expected.SpoolChange != "none" ||
+		c.Expected.NetworkRequired || c.Expected.Generation != c.Setup.Agent.Generation ||
+		c.Expected.BootID != c.Setup.Agent.BootID {
+		t.Fatalf("D fixture expectations are not non-mutating: %+v", c.Expected)
+	}
+	rawBoot, err := os.ReadFile(filepath.Join(dir, bootStateFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted BootState
+	if err := json.Unmarshal(rawBoot, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Generation != c.Expected.Generation || persisted.BootID != c.Expected.BootID {
+		t.Fatalf("D persisted generation/boot=%d/%q, want %d/%q",
+			persisted.Generation, persisted.BootID, c.Expected.Generation, c.Expected.BootID)
 	}
 	if after := treeDigest(t, dir); after != before {
 		t.Fatalf("read-only inspection mutated state tree: %s != %s", after, before)
@@ -351,10 +386,11 @@ func TestRev6AMENDREC27E(t *testing.T) {
 		SentAt: time.Now().Unix(), Nonce: "AAAAAAAAAAAAAAAAAAAAAA",
 	}, "snapshot", body)
 	var ce *CenterError
-	if !errors.As(err, &ce) || ce.Status != c.Expected.HTTPStatus || ce.Code != c.Expected.Error {
-		t.Fatalf("E request err=%v, want status %d %s", err, c.Expected.HTTPStatus, c.Expected.Error)
+	if !errors.As(err, &ce) || c.Expected.Result != "rejected" ||
+		ce.Status != c.Expected.HTTPStatus || ce.Code != c.Expected.Error {
+		t.Fatalf("E request err=%v, want fixture rejected status %d %s", err, c.Expected.HTTPStatus, c.Expected.Error)
 	}
-	assertRev6Center(t, tc, r, c.Setup.Center.HighestGen, c.Setup.Center.LastSeq)
+	assertRev6Center(t, tc, r, c.Setup.Center.HighestGen, c.Setup.Center.LastSeq, c.Setup.Center.BootID)
 }
 
 func TestRev6AMENDREC27F(t *testing.T) {
@@ -412,7 +448,13 @@ func TestRev6AMENDREC27F(t *testing.T) {
 	if got := r.LastResult(); got != c.Expected.Result {
 		t.Fatalf("F result=%q, want fixture %q", got, c.Expected.Result)
 	}
-	assertRev6Center(t, tc, r, c.Expected.CenterState.HighestGen, c.Expected.CenterState.LastSeq)
+	assertRev6Center(t, tc, r, c.Expected.CenterState.HighestGen, c.Expected.CenterState.LastSeq, "")
+	bootF, _ := r.Boot()
+	identF2, _ := r.Identity()
+	centerF, _ := tc.st.GetBoot(ctx, identF2.NodeID)
+	if centerF.BootID != bootF.BootID {
+		t.Fatalf("F center boot id=%q, want agent new-generation boot %q", centerF.BootID, bootF.BootID)
+	}
 	if err := tc.st.VerifyChain(ctx); err != nil {
 		t.Fatalf("F gap audit ledger: %v", err)
 	}

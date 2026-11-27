@@ -15,9 +15,9 @@
 #    systemd >= 248). Blocking execve/execveat in SystemCallFilter= is NOT used:
 #    systemd applies the filter before the service binary exec, so that would
 #    prevent the unit from starting and would be a fake proof.
-#  - a sing-box service.api credential, if the P1-10 audit ever authorizes it,
-#    is delivered with LoadCredential= (commented example below); source file
-#    permissions are not changed by the agent.
+#  - no sing-box service.api credential is loaded in this release: the P1-10
+#    audit failed and there is no environment/LoadCredential/center enablement
+#    path until a separately approved versioned mechanism exists.
 
 [Unit]
 Description=UM agent (unified monitor node agent, linux_vps class)

@@ -246,9 +246,10 @@ R1 status in this Draft:
 
 - **not enabled**; `mihomo_api`/`collect.terminal` remain `false` by default and
   no center config enables them;
-- no R1 credential is created, requested, stored or logged by default; the
-  optional R1 observer path requires an explicit operator environment gate and
-  owner-approved profile/secret provisioning;
+- no R1 credential is created, requested, stored or logged by default; R1
+  activates only from the protected `<state>/r1` bundle (versioned isolated-lab
+  acceptance, profile, DPAPI-sealed controller secret; private ACL) provisioned
+  under the service account; no environment-variable/center bypass exists;
 - the Windows install template refuses R1/controller-secret provisioning;
 - the agent is never described as having a "read-only credential";
 - `terminal.availability` stays `unavailable` with
