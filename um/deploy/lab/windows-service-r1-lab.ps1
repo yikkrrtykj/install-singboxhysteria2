@@ -237,7 +237,7 @@ while ((Get-Date) -lt $deadline) {
 if ($null -eq $payload -or $null -eq $payload.terminal) { Fail 'real center did not receive a terminal snapshot' }
 if ($payload.terminal.selection.availability -ne 'ok') { Fail "R1 selection availability=$($payload.terminal.selection.availability)" }
 if ($null -eq $payload.terminal.selection.route) { Fail 'R1 selection route is null' }
-if (($payload | ConvertTo-Json -Depth 20) -match 'A_REALITY|A_HY2|B_REALITY|B_HY2|synthetic-r1-controller-secret|127\.0\.0\.1:19090') {
+if (($payload | ConvertTo-Json -Depth 20) -cmatch 'A_REALITY|A_HY2|B_REALITY|B_HY2|synthetic-r1-controller-secret|127\.0\.0\.1:19090') {
   Fail 'R1 snapshot leaked local profile/controller metadata'
 }
 
