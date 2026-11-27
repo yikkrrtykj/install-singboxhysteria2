@@ -92,3 +92,21 @@ jobs:
           systemd-analyze verify um/deploy/linux/um-agent.service
           sudo systemctl status --no-pager || true
           (busctl --system list || dbus-send --system --dest=org.freedesktop.DBus --type=method_call --print-reply / org.freedesktop.DBus.ListNames) | head -n 20
+
+  linux-systemd-agent-lab:
+    name: linux-systemd-agent-lab
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.4'
+          cache: true
+          cache-dependency-path: um/go.sum
+      - name: Run isolated systemd/D-Bus agent lab
+        shell: bash
+        run: |
+          sudo -E bash um/deploy/lab/linux-systemd-lab.sh

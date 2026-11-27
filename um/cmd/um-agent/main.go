@@ -81,6 +81,8 @@ func main() {
 		os.Exit(runStatus(os.Args[2:]))
 	case "service":
 		os.Exit(runService(os.Args[2:]))
+	case "r1-provision":
+		os.Exit(runR1Provision(os.Args[2:]))
 	case "version":
 		fmt.Println(version)
 	default:
@@ -90,7 +92,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: um-agent <enroll|run|rotate|status|service|version> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: um-agent <enroll|run|rotate|status|service|r1-provision|version> [flags]")
 }
 
 func runEnroll(args []string) int {

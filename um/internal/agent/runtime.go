@@ -129,7 +129,7 @@ func NewRuntime(opts Options) (*Runtime, error) {
 			_ = st.Close()
 			return nil, errors.New("agent: persisted identity center/class mismatch")
 		}
-		if err := r.advanceCleanRestart(); err != nil {
+		if err := r.advanceRestart(); err != nil {
 			_ = st.Close()
 			return nil, err
 		}
@@ -154,16 +154,14 @@ func sleepContext(ctx context.Context, d time.Duration) error {
 	}
 }
 
-// advanceCleanRestart implements the rev-5 normal-restart rule: a clean
-// shutdown increments generation by exactly 1, replaces the boot id and replays
-// pending payload records under the new generation with fresh transport fields.
-// An abrupt power loss leaves no marker and preserves the generation/boot/seq
-// persisted attempt for exact duplicate recovery (REC-27).
-func (r *Runtime) advanceCleanRestart() error {
-	clean, err := r.state.cleanShutdownRequested()
-	if err != nil || !clean {
-		return err
-	}
+// advanceRestart implements the stricter restart rule (pending the normative
+// power-loss generation amendment): every successful opening of an enrolled
+// runtime is a new generation, including an unclean/power-loss restart. The
+// persisted generation is incremented by exactly one, a new boot id is chosen,
+// and fsynced payload identity is preserved while transport attempts are
+// refreshed under the new generation. Same-runtime transport retries remain
+// the only exact-sequence replay path.
+func (r *Runtime) advanceRestart() error {
 	ident, ok := r.state.Identity()
 	if !ok {
 		return nil

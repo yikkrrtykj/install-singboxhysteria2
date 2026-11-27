@@ -4,6 +4,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"strings"
@@ -101,4 +102,9 @@ func readCredentialFile(path string) (string, error) {
 
 func platformService([]string) error {
 	return errors.New("Windows Service is not supported on this platform; use the Linux systemd unit")
+}
+
+func runR1Provision([]string) int {
+	fmt.Fprintln(os.Stderr, "um-agent: R1 provisioning is Windows-terminal-only")
+	return 1
 }

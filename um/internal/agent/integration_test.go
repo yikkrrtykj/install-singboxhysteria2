@@ -263,8 +263,8 @@ func TestAgentStaleGenerationREC18(t *testing.T) {
 		t.Fatalf("stale report = %v, want ErrStaleGeneration", err)
 	}
 	b, _ := r2.Boot()
-	if b.Generation != 9 {
-		t.Fatalf("stale generation was reset to %d", b.Generation)
+	if b.Generation != 10 {
+		t.Fatalf("old snapshot was not advanced to the next restart generation: %d", b.Generation)
 	}
 	if n := r2.Status().Pending; n != 1 {
 		t.Fatalf("spool retained=%d, want 1", n)
@@ -275,6 +275,7 @@ func TestAgentACKLossDuplicateREC27(t *testing.T) {
 	tc := startAgentCenter(t)
 	dir := t.TempDir()
 	r := newTestRuntime(t, tc, dir, unavailableCollector{}, nil)
+	defer r.Close()
 	ctx := context.Background()
 	if err := r.Enroll(ctx, tc.token); err != nil {
 		t.Fatalf("Enroll: %v", err)
@@ -309,36 +310,95 @@ func TestAgentACKLossDuplicateREC27(t *testing.T) {
 	if err != nil || (ack.Result != "accepted" && ack.Result != "stale_ignored") {
 		t.Fatalf("direct accepted report: ack=%+v err=%v", ack, err)
 	}
-	// Persisted seq points at the same attempt; the in-memory higher seq is
-	// volatile and must not survive restart.
-	var boot BootState
-	boot, _ = r.Boot()
-	boot.NextSeq = 4
-	boot.Exhausted = false
-	if err := r.state.saveBoot(boot); err != nil {
-		t.Fatalf("save persisted seq: %v", err)
+	// Same-runtime ACK loss: the persisted attempt is retried exactly, within the
+	// same generation/boot/seq. This preserves the frozen REC-27 exact-duplicate
+	// consistency case even under the stricter restart rule.
+	if err := r.Flush(ctx); err != nil {
+		t.Fatalf("retry duplicate: %v", err)
 	}
+	if got := r.LastResult(); got != "duplicate" {
+		t.Fatalf("retry result=%q, want duplicate", got)
+	}
+	if n := r.Status().Pending; n != 0 {
+		t.Fatalf("spool after duplicate=%d, want 0", n)
+	}
+	if b, _ := r.Boot(); b.Generation != 3 || b.NextSeq != 5 {
+		t.Fatalf("same-runtime duplicate boot=%+v, want gen3/seq5", b)
+	}
+}
+
+// TestAgentRestartAfterLostACKNewGeneration covers the proposed power-loss
+// amendment: a process restart always enters a new generation, preserves the
+// fsynced report_id/body, and the first new-generation report is a duplicate
+// that advances the new generation high-water.
+func TestAgentRestartAfterLostACKNewGeneration(t *testing.T) {
+	tc := startAgentCenter(t)
+	dir := t.TempDir()
+	r := newTestRuntime(t, tc, dir, unavailableCollector{}, nil)
+	ctx := context.Background()
+	if err := r.Enroll(ctx, tc.token); err != nil {
+		t.Fatalf("Enroll: %v", err)
+	}
+	if err := r.PullConfig(ctx); err != nil {
+		t.Fatalf("PullConfig: %v", err)
+	}
+	if err := r.state.saveBoot(BootState{Version: stateVersion, Generation: 3,
+		BootID: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", NextSeq: 1}); err != nil {
+		t.Fatalf("save boot: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := r.QueueReport(ctx, "snapshot"); err != nil {
+			t.Fatalf("seed queue %d: %v", i, err)
+		}
+		if err := r.Flush(ctx); err != nil {
+			t.Fatalf("seed flush %d: %v", i, err)
+		}
+	}
+	if _, err := r.QueueReport(ctx, "snapshot"); err != nil {
+		t.Fatalf("queue fourth: %v", err)
+	}
+	recs, err := r.state.spool.List()
+	if err != nil || len(recs) != 1 {
+		t.Fatalf("fourth spool: %v %+v", err, recs)
+	}
+	ident, _ := r.Identity()
+	ack, err := r.client.Report(ctx, ident, recs[0].Attempt, recs[0].Kind, recs[0].Body)
+	if err != nil || (ack.Result != "accepted" && ack.Result != "stale_ignored") {
+		t.Fatalf("direct accepted report: ack=%+v err=%v", ack, err)
+	}
+	oldBoot, _ := r.Boot()
 	if err := r.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
-	// Power-loss semantics: no clean-shutdown marker, so generation/boot/seq are
-	// preserved and the persisted attempt is retried exactly.
+	// Abrupt restart: no clean marker.
 	if err := os.Remove(filepath.Join(dir, cleanShutdownFile)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("remove clean marker: %v", err)
 	}
 	r2 := newTestRuntime(t, tc, dir, unavailableCollector{}, nil)
 	defer r2.Close()
+	newBoot, _ := r2.Boot()
+	if newBoot.Generation != oldBoot.Generation+1 || newBoot.BootID == oldBoot.BootID {
+		t.Fatalf("restart boot=%+v, old=%+v, want gen+1/new boot", newBoot, oldBoot)
+	}
 	if err := r2.Flush(ctx); err != nil {
-		t.Fatalf("retry duplicate: %v", err)
+		t.Fatalf("restart duplicate: %v", err)
 	}
 	if got := r2.LastResult(); got != "duplicate" {
-		t.Fatalf("retry result=%q, want duplicate", got)
+		t.Fatalf("restart result=%q, want duplicate", got)
 	}
 	if n := r2.Status().Pending; n != 0 {
-		t.Fatalf("spool after duplicate=%d, want 0", n)
+		t.Fatalf("spool after restart duplicate=%d, want 0", n)
 	}
-	if b, _ := r2.Boot(); b.NextSeq != 5 {
-		t.Fatalf("next_seq after duplicate=%d, want 5", b.NextSeq)
+	gotBoot, _ := r2.Boot()
+	if gotBoot.Generation != newBoot.Generation || gotBoot.NextSeq != 2 {
+		t.Fatalf("new-generation boot after duplicate=%+v, want gen %d/seq2", gotBoot, newBoot.Generation)
+	}
+	stats, err := tc.st.CapacityStats(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Snapshots != 4 {
+		t.Fatalf("restart duplicate stored extra snapshot: %+v", stats)
 	}
 }
 

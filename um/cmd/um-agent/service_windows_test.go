@@ -5,6 +5,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -34,33 +35,66 @@ func TestMergeServiceArgsKeepsImagePathFlags(t *testing.T) {
 	}
 }
 
-func TestWindowsSourceAuthorizationGate(t *testing.T) {
-	dir := t.TempDir()
-	profile := writeTestFile(t, dir, "profile.json",
+func TestWindowsR1ProvisioningAndActivation(t *testing.T) {
+	inputDir := t.TempDir()
+	stateDir := t.TempDir()
+	profile := writeTestFile(t, inputDir, "profile.json",
 		`{"controller":"http://127.0.0.1:1","group":"G","routes":{"a_reality":"A"}}`)
-	secret := writeTestFile(t, dir, "secret", "synthetic-secret\n")
+	secret := writeTestFile(t, inputDir, "secret", "synthetic-secret\n")
 
-	t.Setenv("UM_AGENT_WINDOWS_OBSERVE_PROFILE", "")
-	t.Setenv("UM_AGENT_WINDOWS_OBSERVE_SECRET_FILE", "")
-	t.Setenv("UM_AGENT_WINDOWS_SOURCE_AUTHORIZED", "")
-	if _, err := platformCollector(commonFlags{}); err != nil {
-		t.Fatalf("default collector should be available: %v", err)
+	if _, enabled, err := loadWindowsR1Observer(stateDir); err != nil || enabled {
+		t.Fatalf("default R1 state = enabled=%v err=%v, want disabled", enabled, err)
 	}
-
+	// Legacy environment switches cannot enable R1 without the protected bundle.
 	t.Setenv("UM_AGENT_WINDOWS_OBSERVE_PROFILE", profile)
 	t.Setenv("UM_AGENT_WINDOWS_OBSERVE_SECRET_FILE", secret)
-	t.Setenv("UM_AGENT_WINDOWS_SOURCE_AUTHORIZED", "")
-	if _, err := platformCollector(commonFlags{}); err == nil {
-		t.Fatal("R1 source was accepted without an authorization gate")
+	t.Setenv("UM_AGENT_WINDOWS_SOURCE_AUTHORIZED", "1")
+	if _, enabled, err := loadWindowsR1Observer(stateDir); err != nil || enabled {
+		t.Fatalf("environment-only R1 state = enabled=%v err=%v, want disabled", enabled, err)
 	}
 
-	t.Setenv("UM_AGENT_WINDOWS_SOURCE_AUTHORIZED", "true")
-	col, err := platformCollector(commonFlags{})
-	if err != nil {
-		t.Fatalf("authorized synthetic observer rejected: %v", err)
+	if err := provisionWindowsR1(stateDir, profile, secret, "OD-P3-R1/isolated-lab/2026-11-27"); err != nil {
+		t.Fatalf("provisionWindowsR1: %v", err)
 	}
-	if col == nil {
-		t.Fatal("nil collector")
+	observer, enabled, err := loadWindowsR1Observer(stateDir)
+	if err != nil || !enabled || observer == nil {
+		t.Fatalf("provisioned R1 = observer=%v enabled=%v err=%v", observer, enabled, err)
+	}
+	col, err := platformCollector(commonFlags{stateDir: stateDir})
+	if err != nil || col == nil {
+		t.Fatalf("platformCollector with R1: %v", err)
+	}
+
+	// Any accepted file mutation is a hash mismatch and must fail closed.
+	profilePath := filepath.Join(r1Dir(stateDir), r1ProfileFile)
+	if err := os.WriteFile(profilePath, []byte(`{"controller":"http://127.0.0.1:1","group":"G","routes":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := loadWindowsR1Observer(stateDir); err == nil {
+		t.Fatal("tampered R1 profile accepted")
+	}
+}
+
+func TestWindowsR1ScopeMustBeIsolatedLab(t *testing.T) {
+	inputDir := t.TempDir()
+	stateDir := t.TempDir()
+	profile := writeTestFile(t, inputDir, "profile.json",
+		`{"controller":"http://127.0.0.1:1","group":"G","routes":{"a_reality":"A"}}`)
+	secret := writeTestFile(t, inputDir, "secret", "synthetic-secret\n")
+	if err := provisionWindowsR1(stateDir, profile, secret, "OD-P3-R1/test"); err != nil {
+		t.Fatal(err)
+	}
+	acceptPath := filepath.Join(r1Dir(stateDir), r1AcceptanceFile)
+	raw, err := os.ReadFile(acceptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw = []byte(strings.Replace(string(raw), `"scope": "isolated_lab"`, `"scope": "production"`, 1))
+	if err := os.WriteFile(acceptPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := loadWindowsR1Observer(stateDir); err == nil {
+		t.Fatal("production-scope R1 bundle accepted without separate authorization")
 	}
 }
 

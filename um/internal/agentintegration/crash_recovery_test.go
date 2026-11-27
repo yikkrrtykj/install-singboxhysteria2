@@ -61,9 +61,14 @@ func TestB3CrashHelper(t *testing.T) {
 	stateDir := os.Getenv(crashStateEnv)
 	token := os.Getenv(crashTokenEnv)
 	col := &linuxobs.Collector{AgentVersion: "1.0.0"}
+	var httpClient *http.Client
+	if scenario == "rec27" {
+		// The fourth report commits at the center and only its ACK is lost.
+		httpClient = &http.Client{Transport: &dropACKTransport{base: http.DefaultTransport, dropAt: 4}}
+	}
 	r, err := agent.NewRuntime(agent.Options{
 		StateDir: stateDir, CenterURL: tcURL, NodeClass: store.NodeClassLinuxVPS,
-		HostOS: "linux", AgentVersion: "1.0.0", Collector: col,
+		HostOS: "linux", AgentVersion: "1.0.0", Collector: col, HTTPClient: httpClient,
 	})
 	if err != nil {
 		t.Fatalf("helper runtime: %v", err)
@@ -77,42 +82,25 @@ func TestB3CrashHelper(t *testing.T) {
 	}
 	switch scenario {
 	case "rec18":
-		// Persist a newer generation, reopen the exact state (removing the clean
-		// marker so it is treated as an abrupt restart), let the real center
-		// accept gen12, then exit abruptly. The parent restores gen9.
-		if err := r.Close(); err != nil {
-			t.Fatalf("helper rec18 close: %v", err)
+		// Reach generation 12 through real runtime restarts, commit a report,
+		// then exit abruptly. The parent restores gen9; the next restart advances
+		// it to gen10, still below the center high-water 12, so the report is stale.
+		for i := 0; i < 11; i++ {
+			if err := r.Close(); err != nil {
+				t.Fatalf("helper rec18 close %d: %v", i, err)
+			}
+			r, err = agent.NewRuntime(agent.Options{
+				StateDir: stateDir, CenterURL: tcURL, NodeClass: store.NodeClassLinuxVPS,
+				HostOS: "linux", AgentVersion: "1.0.0", Collector: col,
+			})
+			if err != nil {
+				t.Fatalf("helper rec18 reopen %d: %v", i, err)
+			}
 		}
-		raw, err := os.ReadFile(filepath.Join(stateDir, "boot_state.json"))
-		if err != nil {
-			t.Fatalf("helper read boot: %v", err)
-		}
-		var boot agent.BootState
-		if err := json.Unmarshal(raw, &boot); err != nil {
-			t.Fatalf("helper parse boot: %v", err)
-		}
-		boot.Generation = 12
-		boot.BootID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-		boot.NextSeq = 1
-		boot.Exhausted = false
-		raw, _ = json.Marshal(boot)
-		if err := os.WriteFile(filepath.Join(stateDir, "boot_state.json"), raw, 0o600); err != nil {
-			t.Fatalf("helper write boot: %v", err)
-		}
-		if err := os.Remove(filepath.Join(stateDir, "clean_shutdown")); err != nil && !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("helper remove clean marker: %v", err)
-		}
-		r2, err := agent.NewRuntime(agent.Options{
-			StateDir: stateDir, CenterURL: tcURL, NodeClass: store.NodeClassLinuxVPS,
-			HostOS: "linux", AgentVersion: "1.0.0", Collector: col,
-		})
-		if err != nil {
-			t.Fatalf("helper rec18 reopen: %v", err)
-		}
-		if _, err := r2.QueueReport(ctx, "snapshot"); err != nil {
+		if _, err := r.QueueReport(ctx, "snapshot"); err != nil {
 			t.Fatalf("helper rec18 queue: %v", err)
 		}
-		if err := r2.Flush(ctx); err != nil {
+		if err := r.Flush(ctx); err != nil {
 			t.Fatalf("helper rec18 flush: %v", err)
 		}
 	case "rec17":
@@ -125,14 +113,23 @@ func TestB3CrashHelper(t *testing.T) {
 			t.Fatalf("helper remove boot: %v", err)
 		}
 	case "rec27":
-		// Fixture setup: center generation 3/boot b3, last_seq 4. Reopen the
-		// persisted state as generation 3, send three ACKed reports, then drop
-		// only the fourth report's ACK and rewrite the persisted next_seq to the
-		// REC-27 boundary before the abrupt exit.
-		if err := r.Close(); err != nil {
-			t.Fatalf("helper rec27 initial close: %v", err)
+		// Natural generation 1: three ACKed reports, then the fourth report commits
+		// at the center and only its ACK is lost. Rewrite the persisted next_seq to
+		// the boundary before exiting (no clean marker).
+		for i := 0; i < 3; i++ {
+			if _, err := r.QueueReport(ctx, "snapshot"); err != nil {
+				t.Fatalf("helper rec27 seed queue %d: %v", i, err)
+			}
+			if err := r.Flush(ctx); err != nil {
+				t.Fatalf("helper rec27 seed flush %d: %v", i, err)
+			}
 		}
-		raw, err := os.ReadFile(filepath.Join(stateDir, "boot_state.json"))
+		if _, err := r.QueueReport(ctx, "snapshot"); err != nil {
+			t.Fatalf("helper rec27 fourth queue: %v", err)
+		}
+		_ = r.Flush(ctx) // center commits; fourth ACK is dropped
+		path := filepath.Join(stateDir, "boot_state.json")
+		raw, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatalf("helper rec27 read boot: %v", err)
 		}
@@ -140,48 +137,10 @@ func TestB3CrashHelper(t *testing.T) {
 		if err := json.Unmarshal(raw, &boot); err != nil {
 			t.Fatalf("helper rec27 parse boot: %v", err)
 		}
-		boot.Generation = 3
-		boot.BootID = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-		boot.NextSeq = 1
+		boot.NextSeq = 5
 		boot.Exhausted = false
 		raw, _ = json.Marshal(boot)
-		if err := os.WriteFile(filepath.Join(stateDir, "boot_state.json"), raw, 0o600); err != nil {
-			t.Fatalf("helper rec27 write boot: %v", err)
-		}
-		if err := os.Remove(filepath.Join(stateDir, "clean_shutdown")); err != nil && !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("helper rec27 remove clean: %v", err)
-		}
-		rec27Drop := &dropACKTransport{base: http.DefaultTransport, dropAt: 4}
-		r2, err := agent.NewRuntime(agent.Options{
-			StateDir: stateDir, CenterURL: tcURL, NodeClass: store.NodeClassLinuxVPS,
-			HostOS: "linux", AgentVersion: "1.0.0", Collector: col,
-			HTTPClient: &http.Client{Transport: rec27Drop},
-		})
-		if err != nil {
-			t.Fatalf("helper rec27 reopen: %v", err)
-		}
-		for i := 0; i < 3; i++ {
-			if _, err := r2.QueueReport(ctx, "snapshot"); err != nil {
-				t.Fatalf("helper rec27 seed queue %d: %v", i, err)
-			}
-			if err := r2.Flush(ctx); err != nil {
-				t.Fatalf("helper rec27 seed flush %d: %v", i, err)
-			}
-		}
-		if _, err := r2.QueueReport(ctx, "snapshot"); err != nil {
-			t.Fatalf("helper rec27 fourth queue: %v", err)
-		}
-		_ = r2.Flush(ctx) // center commits; fourth ACK is dropped
-		raw, err = os.ReadFile(filepath.Join(stateDir, "boot_state.json"))
-		if err != nil {
-			t.Fatalf("helper rec27 reread boot: %v", err)
-		}
-		if err := json.Unmarshal(raw, &boot); err != nil {
-			t.Fatalf("helper rec27 reparse boot: %v", err)
-		}
-		boot.NextSeq = 4
-		raw, _ = json.Marshal(boot)
-		if err := os.WriteFile(filepath.Join(stateDir, "boot_state.json"), raw, 0o600); err != nil {
+		if err := os.WriteFile(path, raw, 0o600); err != nil {
 			t.Fatalf("helper rec27 persisted boundary: %v", err)
 		}
 	default:
@@ -227,8 +186,8 @@ func TestB3RecoveryProcessCrashREC27(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if boot.HighestGen != 3 || boot.LastSeq != 4 {
-		t.Fatalf("center high-water = %+v, want gen3/seq4", boot)
+	if boot.HighestGen != 1 || boot.LastSeq != 5 {
+		t.Fatalf("center high-water = %+v, want gen1/seq5", boot)
 	}
 	entries, err := os.ReadDir(filepath.Join(stateDir, "spool"))
 	if err != nil {
@@ -253,9 +212,9 @@ func TestB3RecoveryProcessCrashREC27(t *testing.T) {
 		t.Fatalf("persisted spool after ACK loss=%d, want exactly the fourth record", len(persisted))
 	}
 	rec := persisted[0]
-	if rec.Attempt.Generation != 3 || rec.Attempt.Seq != 4 ||
-		rec.Attempt.BootID != "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" || rec.Attempt.Fingerprint == "" {
-		t.Fatalf("persisted attempt = %+v, want gen3/seq4/b3 with fingerprint", rec.Attempt)
+	if rec.Attempt.Generation != 1 || rec.Attempt.Seq != 5 ||
+		rec.Attempt.BootID == "" || rec.Attempt.Fingerprint == "" {
+		t.Fatalf("persisted attempt = %+v, want gen1/seq5 with fingerprint", rec.Attempt)
 	}
 	r, err := agent.NewRuntime(agent.Options{
 		StateDir: stateDir, CenterURL: tc.url, NodeClass: store.NodeClassLinuxVPS,
@@ -281,6 +240,17 @@ func TestB3RecoveryProcessCrashREC27(t *testing.T) {
 	if after.Snapshots != 4 || after.ReportDedupe != before.ReportDedupe {
 		t.Fatalf("duplicate reinserted data: before=%+v after=%+v", before, after)
 	}
+	newBoot, _ := r.Boot()
+	if newBoot.Generation != 2 || newBoot.BootID == rec.Attempt.BootID {
+		t.Fatalf("restart did not advance to a new generation/boot id: %+v", newBoot)
+	}
+	centerBoot, err := tc.store.GetBoot(context.Background(), ident.NodeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if centerBoot.HighestGen != 2 || centerBoot.LastSeq != 1 {
+		t.Fatalf("new-generation duplicate did not advance high-water: %+v", centerBoot)
+	}
 }
 
 func TestB3RecoveryProcessCrashREC18(t *testing.T) {
@@ -298,12 +268,14 @@ func TestB3RecoveryProcessCrashREC18(t *testing.T) {
 	identRaw, _ := os.ReadFile(filepath.Join(stateDir, "identity.json"))
 	var ident agent.Identity
 	_ = json.Unmarshal(identRaw, &ident)
-	if b, berr := tc.store.GetBoot(context.Background(), ident.NodeID); berr == nil {
-		t.Logf("center boot after child=%+v", b)
-	} else {
-		t.Logf("center GetBoot: %v", berr)
+	centerBefore, berr := tc.store.GetBoot(context.Background(), ident.NodeID)
+	if berr != nil {
+		t.Fatal(berr)
 	}
-	// Restore an old boot snapshot after the crash: generation 9 < center 12.
+	if centerBefore.HighestGen != 12 {
+		t.Fatalf("child did not reach generation 12: %+v", centerBefore)
+	}
+	// Restore an old boot snapshot after the crash: restart advances gen9 -> gen10, still < center 12.
 	path := filepath.Join(stateDir, "boot_state.json")
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -339,8 +311,8 @@ func TestB3RecoveryProcessCrashREC18(t *testing.T) {
 		t.Fatalf("stale report = %v, want ErrStaleGeneration", errFlush)
 	}
 	b, _ := r.Boot()
-	if b.Generation != 9 {
-		t.Fatalf("agent reset old snapshot generation to %d", b.Generation)
+	if b.Generation != 10 {
+		t.Fatalf("old snapshot was not advanced to the next restart generation: %d", b.Generation)
 	}
 	if n := r.Status().Pending; n != 1 {
 		t.Fatalf("spool retained=%d, want 1", n)
