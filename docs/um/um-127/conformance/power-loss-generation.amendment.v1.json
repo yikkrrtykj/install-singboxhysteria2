@@ -1,0 +1,91 @@
+{
+  "amendment": "power-loss-generation-v1",
+  "status": "DRAFT_NOT_FROZEN",
+  "normative": false,
+  "base_contract": "docs/um/um-a/04-node-protocol-v1.md revision 5",
+  "tracking": {
+    "issue": 127,
+    "implementation_pr": 131
+  },
+  "rules": [
+    "A successful start of an enrolled runtime is a restart and increments generation by exactly one with a new 32-hex boot id, fsynced before network activity, including after an unclean exit or power loss.",
+    "status/inspection and other read-only local CLI operations are not restarts and must not mutate generation or boot state.",
+    "Same-runtime transport retry may replay the exact persisted generation/boot/seq/fingerprint attempt and be classified duplicate by the center.",
+    "Restart replay preserves report_id/collected_at/type/body identity but uses the new generation and a fresh valid attempt; the center dedupes by report_id.",
+    "The first new-generation replay may be duplicate but must atomically advance the new generation high-water with dedupe; no data is written for an already-stored report.",
+    "A retired-generation request is stale_boot_generation; a same-generation different boot id is boot_identity_conflict; no fsynced payload may be lost.",
+    "No weakening of signature, nonce, fingerprint, dedupe, boot high-water, gap bounds, revocation, rotation-proof or fsync guarantees is permitted."
+  ],
+  "cases": [
+    {
+      "id": "AMEND-REC-27-A",
+      "scenario": "same_runtime_ack_loss_exact_retry",
+      "restart": false,
+      "expected": {
+        "result": "duplicate",
+        "generation": "unchanged",
+        "boot_id": "unchanged",
+        "attempt": "same seq and fingerprint",
+        "high_water": "unchanged by the duplicate retry"
+      }
+    },
+    {
+      "id": "AMEND-REC-27-B",
+      "scenario": "process_restart_after_committed_report_with_lost_ack",
+      "restart": true,
+      "setup": "Report R is durably committed at the center; its ACK is lost; the agent exits without a clean marker after fsyncing R, report_id and body.",
+      "expected": {
+        "result": "duplicate",
+        "generation": "old+1 exactly",
+        "boot_id": "new random 32-hex, different from old",
+        "attempt": "fresh valid new-generation attempt",
+        "payload_identity": "same report_id/collected_at/type/body",
+        "high_water": "new generation and first accepted seq committed",
+        "data": "no second stored copy"
+      }
+    },
+    {
+      "id": "AMEND-REC-27-C",
+      "scenario": "late_retired_generation_after_new_high_water",
+      "restart": true,
+      "expected": {
+        "result": "stale_boot_generation",
+        "state_change": "none"
+      }
+    },
+    {
+      "id": "AMEND-REC-27-D",
+      "scenario": "status_or_read_only_inspection",
+      "restart": false,
+      "expected": {
+        "generation": "unchanged",
+        "boot_id": "unchanged",
+        "filesystem": "no spool/quarantine creation or mutation, no corrupt-record move"
+      }
+    },
+    {
+      "id": "AMEND-REC-27-E",
+      "scenario": "same_generation_different_boot_id",
+      "restart": false,
+      "expected": {
+        "result": "boot_identity_conflict",
+        "state_change": "none"
+      }
+    },
+    {
+      "id": "AMEND-REC-27-F",
+      "scenario": "bounded_forward_gap_after_multiple_offline_restarts",
+      "restart": true,
+      "expected": {
+        "result": "accepted_or_duplicate",
+        "high_water": "new generation committed",
+        "gap_audit": "present when gap > 1"
+      }
+    }
+  ],
+  "compatibility": {
+    "old_rev5_vectors_unchanged": true,
+    "old_REC27_same_runtime_case_retained": true,
+    "new_records_required_for_restart_case": true
+  }
+}
