@@ -31,6 +31,7 @@ type Attempt struct {
 	Seq         uint64 `json:"seq"`
 	SentAt      int64  `json:"sent_at"`
 	Nonce       string `json:"nonce"`
+	KeyID       string `json:"key_id,omitempty"`
 	Fingerprint string `json:"fingerprint,omitempty"`
 }
 

@@ -401,8 +401,12 @@ func (r *Runtime) nextAttempt() (Attempt, error) {
 	if err != nil {
 		return Attempt{}, err
 	}
+	ident, ok := r.state.Identity()
+	if !ok {
+		return Attempt{}, ErrNotEnrolled
+	}
 	a := Attempt{Generation: boot.Generation, BootID: boot.BootID, Seq: boot.NextSeq,
-		SentAt: r.nowUnix(), Nonce: nonce}
+		SentAt: r.nowUnix(), Nonce: nonce, KeyID: ident.KeyID}
 	if boot.NextSeq == wire.MaxNumeric {
 		boot.Exhausted = true
 	} else {
@@ -670,6 +674,13 @@ func (r *Runtime) flushLocked(ctx context.Context) error {
 		if err := r.driveProofLocked(ctx, ident, rot); err != nil {
 			return err
 		}
+		// Proof success persists and activates the new identity. Reload it
+		// before draining the spool so pending reports are signed by the active
+		// key (the center atomically revokes the old key with the proof).
+		ident, ok = r.state.Identity()
+		if !ok {
+			return ErrNotEnrolled
+		}
 	}
 	recs, err := r.state.spool.List()
 	if err != nil {
@@ -715,7 +726,8 @@ func (r *Runtime) attemptNeedsRefresh(a Attempt) bool {
 }
 
 func (r *Runtime) sendRecordLocked(ctx context.Context, ident Identity, rec SpoolRecord) error {
-	if r.attemptNeedsRefresh(rec.Attempt) || r.nowUnix()-rec.Attempt.SentAt > 240 {
+	if r.attemptNeedsRefresh(rec.Attempt) || r.nowUnix()-rec.Attempt.SentAt > 240 ||
+		(rec.Attempt.KeyID != "" && rec.Attempt.KeyID != ident.KeyID) {
 		a, err := r.nextAttempt()
 		if err != nil {
 			return err
@@ -935,7 +947,12 @@ func (r *Runtime) Run(ctx context.Context) error {
 	_ = ident
 	if _, ok := r.state.Config(); !ok {
 		if err := r.PullConfig(ctx); err != nil {
-			return err
+			if !IsRetryable(err) {
+				return err
+			}
+			if err := r.Drive(ctx); err != nil {
+				return err
+			}
 		}
 	}
 	for {
@@ -945,7 +962,16 @@ func (r *Runtime) Run(ctx context.Context) error {
 		// Refresh center-managed collection authorization on a bounded cadence.
 		if now := r.nowUnix(); now-r.lastConfigCheck >= 300 {
 			if err := r.PullConfig(ctx); err != nil {
-				return r.retryOrFail(ctx, err)
+				if !IsRetryable(err) {
+					return err
+				}
+				// Drive replays the persisted config control with backoff. A
+				// successful recovery must resume the collection loop rather
+				// than returning nil and terminating Run.
+				if err := r.Drive(ctx); err != nil {
+					return err
+				}
+				continue
 			}
 			r.lastConfigCheck = now
 		}
@@ -967,7 +993,13 @@ func (r *Runtime) Run(ctx context.Context) error {
 		cfg, ok := r.state.Config()
 		if !ok {
 			if err := r.PullConfig(ctx); err != nil {
-				return r.retryOrFail(ctx, err)
+				if !IsRetryable(err) {
+					return err
+				}
+				if err := r.Drive(ctx); err != nil {
+					return err
+				}
+				continue
 			}
 			continue
 		}
@@ -1002,13 +1034,6 @@ func (r *Runtime) Run(ctx context.Context) error {
 			return err
 		}
 	}
-}
-
-func (r *Runtime) retryOrFail(ctx context.Context, err error) error {
-	if !IsRetryable(err) {
-		return err
-	}
-	return r.Drive(ctx)
 }
 
 // Rotate begins a persisted key rotation intent. The provisional key is not

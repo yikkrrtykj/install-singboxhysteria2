@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -378,6 +379,88 @@ func TestAgentRotationIntentSurvivesRestart(t *testing.T) {
 	}
 	if _, ok := r2.state.Rotation(); ok {
 		t.Fatal("rotation state not cleared after accepted proof")
+	}
+}
+
+func TestAgentRotationWithPendingSpoolUsesNewIdentity(t *testing.T) {
+	tc := startAgentCenter(t)
+	r := newTestRuntime(t, tc, t.TempDir(), unavailableCollector{}, nil)
+	defer r.Close()
+	ctx := context.Background()
+	if err := r.Enroll(ctx, tc.token); err != nil {
+		t.Fatalf("Enroll: %v", err)
+	}
+	if err := r.PullConfig(ctx); err != nil {
+		t.Fatalf("PullConfig: %v", err)
+	}
+	oldIdent, ok := r.Identity()
+	if !ok {
+		t.Fatal("identity missing")
+	}
+	if _, err := r.QueueReport(ctx, "snapshot"); err != nil {
+		t.Fatalf("QueueReport: %v", err)
+	}
+	if n := r.Status().Pending; n != 1 {
+		t.Fatalf("pending before rotation=%d, want 1", n)
+	}
+	if err := r.Rotate(ctx); err != nil {
+		t.Fatalf("Rotate: %v", err)
+	}
+	if n := r.Status().Pending; n != 1 {
+		t.Fatalf("pending before proof=%d, want 1", n)
+	}
+	// Flush first completes the persisted proof (activating the new key), then
+	// must drain the pending report with the reloaded identity.
+	if err := r.Flush(ctx); err != nil {
+		t.Fatalf("flush after rotation proof: %v", err)
+	}
+	newIdent, ok := r.Identity()
+	if !ok || newIdent.KeyID == oldIdent.KeyID {
+		t.Fatalf("rotation did not activate new identity: %+v", newIdent)
+	}
+	if n := r.Status().Pending; n != 0 {
+		t.Fatalf("pending after new-key flush=%d, want 0", n)
+	}
+	if got := r.LastResult(); got != "accepted" && got != "duplicate" && got != "stale_ignored" {
+		t.Fatalf("new-key report result=%q", got)
+	}
+}
+
+func TestAgentRunResumesAfterRecoveredConfigRetry(t *testing.T) {
+	tc := startAgentCenter(t)
+	var failConfig atomic.Bool
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if strings.HasSuffix(req.URL.Path, "/config") && failConfig.CompareAndSwap(true, false) {
+			return nil, errors.New("transient config failure")
+		}
+		return http.DefaultTransport.RoundTrip(req)
+	})}
+	r := newTestRuntime(t, tc, t.TempDir(), unavailableCollector{}, client)
+	defer r.Close()
+	if err := r.Enroll(context.Background(), tc.token); err != nil {
+		t.Fatalf("Enroll: %v", err)
+	}
+	if err := r.PullConfig(context.Background()); err != nil {
+		t.Fatalf("initial PullConfig: %v", err)
+	}
+	r.opts.Sleep = func(ctx context.Context, _ time.Duration) error {
+		select {
+		case <-time.After(5 * time.Millisecond):
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	r.lastConfigCheck = 0
+	failConfig.Store(true)
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+	runErr := r.Run(ctx)
+	if !errors.Is(runErr, context.DeadlineExceeded) {
+		t.Fatalf("Run returned %v after a recovered config retry; want context deadline (loop must continue)", runErr)
+	}
+	if stats, err := tc.st.CapacityStats(context.Background()); err != nil || stats.Snapshots == 0 {
+		t.Fatalf("collection did not resume after recovery: stats=%+v err=%v", stats, err)
 	}
 }
 
