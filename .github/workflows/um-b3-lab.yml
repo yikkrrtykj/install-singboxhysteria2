@@ -50,27 +50,6 @@ jobs:
               & sc.exe delete $variant.Name | Out-Null
             }
           }
-          # Dedicated local non-admin user fallback probe.
-          $user = 'um-lab-agent'
-          $pass = 'Lab-' + [guid]::NewGuid().ToString('N') + '!aA1'
-          try {
-            $secure = ConvertTo-SecureString $pass -AsPlainText -Force
-            if (Get-LocalUser -Name $user -ErrorAction SilentlyContinue) { Remove-LocalUser -Name $user }
-            New-LocalUser -Name $user -Password $secure -AccountNeverExpires -PasswordNeverExpires -UserMayNotChangePassword | Out-Null
-            Add-LocalGroupMember -Group 'Users' -Member $user
-            & sc.exe create um-lab-user binPath= $bin start= demand obj= ".\$user" password= $pass 2>&1 | Write-Host
-            Write-Host "dedicated user sc create exit=$LASTEXITCODE"
-            if ($LASTEXITCODE -eq 0) {
-              & sc.exe sidtype um-lab-user unrestricted | Out-Null
-              Start-Service um-lab-user
-              Start-Sleep -Seconds 1
-              Get-CimInstance Win32_Service -Filter "Name='um-lab-user'" | Select-Object Name,StartName,State,ProcessId | Format-List | Out-String | Write-Host
-              Stop-Service um-lab-user -Force
-            }
-          } finally {
-            & sc.exe delete um-lab-user | Out-Null
-            Remove-LocalUser -Name $user -ErrorAction SilentlyContinue
-          }
   linux-systemd-environment:
     name: linux-systemd-environment
     runs-on: ubuntu-24.04

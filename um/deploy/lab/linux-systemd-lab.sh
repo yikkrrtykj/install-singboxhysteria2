@@ -8,7 +8,7 @@
 set -euo pipefail
 
 ROOT="${LAB_TMP:-${RUNNER_TEMP:-/tmp}/um-b3-linux-lab}"
-REPO="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+REPO="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)"
 EVENT="$(python3 - <<'PY'
 import uuid
 print(uuid.uuid4())

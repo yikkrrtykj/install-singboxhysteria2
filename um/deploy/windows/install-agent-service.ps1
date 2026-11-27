@@ -222,23 +222,29 @@ $quotedBinary = '"' + $BinaryPath + '"'
 # subcommand). Account/ACL/DPAPI provisioning remains OD-P7-gated.
 $binPath = $quotedBinary + ' service --state-dir "' + $StateDir + '" --center "' + $CenterUrl + '" --node-class windows_terminal'
 Invoke-Step "create service $ServiceName (Manual start, session 0)" {
-  $newServiceArgs = @{
-    Name           = $ServiceName
-    BinaryPathName = $binPath
-    DisplayName    = $DisplayName
-    Description    = 'Unified Monitor terminal telemetry agent (read-only; six route tokens; no remote write).'
-    StartupType    = 'Manual'
-  }
-  if ($ServiceCredential) { $newServiceArgs.Credential = $ServiceCredential }
-  New-Service @newServiceArgs | Out-Null
-  # New-Service without -Credential creates a LocalSystem service. Set the
-  # explicit non-admin account via SCM; this is required for LocalService and
-  # the virtual service account (and is independently verified below).
   if ($builtInAccount -or $virtualAccount) {
-    & sc.exe config $ServiceName obj= $ServiceAccount password= "" | Out-Null
+    # Create directly with the built-in/virtual account. Virtual service
+    # accounts must NOT be given a password: `password= ""` is rejected with
+    # Win32 1057 on the lab Windows builds; omitting the password is correct.
+    # New-Service without -Credential would create LocalSystem first, which the
+    # OD-P7 guard explicitly forbids.
+    $scArgs = @('create', $ServiceName, 'binPath=', $binPath,
+      'DisplayName=', $DisplayName, 'start=', 'demand', 'obj=', $ServiceAccount)
+    & sc.exe @scArgs | Out-Null
     if ($LASTEXITCODE -ne 0) {
-      Fail "failed to configure service account '$ServiceAccount'"
+      Fail "failed to create service with account '$ServiceAccount' (sc.exe exit $LASTEXITCODE)"
     }
+    & sc.exe description $ServiceName 'Unified Monitor terminal telemetry agent (read-only; six route tokens; no remote write).' | Out-Null
+  } else {
+    $newServiceArgs = @{
+      Name           = $ServiceName
+      BinaryPathName = $binPath
+      DisplayName    = $DisplayName
+      Description    = 'Unified Monitor terminal telemetry agent (read-only; six route tokens; no remote write).'
+      StartupType    = 'Manual'
+      Credential     = $ServiceCredential
+    }
+    New-Service @newServiceArgs | Out-Null
   }
   if ($virtualAccount) {
     # Request a per-service SID for ACLs (no password/credential involved).
