@@ -57,6 +57,13 @@ function Get-ServiceSid([string]$name) {
 function Set-AgentService([string]$binPath) {
   Invoke-Native 'sc.exe' @('config', $svc, 'binPath=', $binPath)
 }
+function Start-OneShotService {
+  # A one-shot console action legitimately exits quickly; Start-Service may
+  # report "failed to start" even though the child completed. Treat the durable
+  # state checks below as the authority for one-shot actions.
+  Start-Service -Name $svc -ErrorAction SilentlyContinue
+  Wait-ServiceStatus $svc 'Stopped'
+}
 function Stop-DeleteService {
   $s = Get-Service -Name $svc -ErrorAction SilentlyContinue
   if ($null -ne $s) {
@@ -116,15 +123,7 @@ $sid = Get-ServiceSid $svc
 Invoke-Native 'icacls' @($lab, '/grant', "*${sid}:(OI)(CI)M", '/T')
 Invoke-Native 'icacls' @($state, '/inheritance:r', '/grant:r', '*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F', "*${sid}:(OI)(CI)F", '/T')
 Invoke-Native 'icacls' @($tokenFile, '/grant', "*${sid}:R")
-try { Start-Service -Name $svc } catch {
-  & sc.exe qc $svc | Out-String | Write-Host
-  & sc.exe query $svc | Out-String | Write-Host
-  if (Test-Path -LiteralPath $serviceLog) { Get-Content -LiteralPath $serviceLog | Out-String | Write-Host }
-  Get-WinEvent -FilterHashtable @{LogName='System'; StartTime=(Get-Date).AddMinutes(-5)} -ErrorAction SilentlyContinue | Select-Object -First 20 | Format-List TimeCreated,Id,ProviderName,Message | Out-String | Write-Host
-  Get-WinEvent -FilterHashtable @{LogName='Application'; StartTime=(Get-Date).AddMinutes(-5)} -ErrorAction SilentlyContinue | Select-Object -First 20 | Format-List TimeCreated,Id,ProviderName,Message | Out-String | Write-Host
-  throw
-}
-Wait-ServiceStatus $svc 'Stopped'
+Start-OneShotService
 $identity = Get-Content -LiteralPath (Join-Path $state 'identity.json') -Raw | ConvertFrom-Json
 $nodeID = $identity.node_id
 if ([string]::IsNullOrWhiteSpace($nodeID)) { Fail 'enrollment did not persist identity' }
@@ -141,8 +140,7 @@ if ($qc -notmatch [regex]::Escape("NT SERVICE\$svc")) { Fail 'SCM start account 
 # ---------------------------------------------------------------------------
 $rotatePath = '"' + $labSvc + '" --log "' + $serviceLog + '" "' + $agent + '" rotate --state-dir "' + $state + '" --center "http://127.0.0.1:18080" --node-class windows_terminal'
 Set-AgentService $rotatePath
-Start-Service -Name $svc
-Wait-ServiceStatus $svc 'Stopped'
+Start-OneShotService
 $rotationFile = Join-Path $state 'rotation.json'
 if (Test-Path -LiteralPath $rotationFile) {
   $rotation = Get-Content -LiteralPath $rotationFile -Raw | ConvertFrom-Json
@@ -201,8 +199,7 @@ Invoke-Native 'icacls' @($secretPath, '/grant', "*${sid}:R")
 # Provision the protected R1 bundle through the same service account.
 $provisionPath = '"' + $labSvc + '" --log "' + $serviceLog + '" "' + $agent + '" r1-provision --state-dir "' + $state + '" --profile "' + $profilePath + '" --secret-file "' + $secretPath + '" --owner-reference "OD-P3-R1/isolated-lab/windows-github-actions"'
 Set-AgentService $provisionPath
-Start-Service -Name $svc
-Wait-ServiceStatus $svc 'Stopped'
+Start-OneShotService
 if (-not (Test-Path -LiteralPath (Join-Path $state 'r1\acceptance.json'))) { Fail 'R1 authorization record was not provisioned' }
 if (-not (Test-Path -LiteralPath (Join-Path $state 'r1\controller.secret.dpapi'))) { Fail 'R1 sealed credential was not provisioned' }
 $aclState = (& icacls $state | Out-String)
