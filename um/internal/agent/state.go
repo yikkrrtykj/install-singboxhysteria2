@@ -739,12 +739,12 @@ func InspectState(dir string) (StateInspection, error) {
 	// Inspection must be read-only: do not MkdirAll/Chmod or let List move a
 	// corrupt record to quarantine. The service account must not create a
 	// root-owned state tree merely by running `status`.
-	pending, err := countRegularFiles(filepath.Join(dir, spoolDir))
+	pending, err := countRegularFiles(filepath.Join(dir, spoolDir), ".json")
 	if err != nil {
 		return out, err
 	}
 	out.Pending = pending
-	quarantined, err := countRegularFiles(filepath.Join(dir, quarantineDir))
+	quarantined, err := countRegularFiles(filepath.Join(dir, quarantineDir), ".json")
 	if err != nil {
 		return out, err
 	}
@@ -754,7 +754,7 @@ func InspectState(dir string) (StateInspection, error) {
 
 // countRegularFiles counts non-directory entries in dir without following
 // symlinks. A missing directory is observed as zero and is not created.
-func countRegularFiles(dir string) (int, error) {
+func countRegularFiles(dir, suffix string) (int, error) {
 	entries, err := os.ReadDir(dir)
 	if errors.Is(err, os.ErrNotExist) {
 		return 0, nil
@@ -765,6 +765,9 @@ func countRegularFiles(dir string) (int, error) {
 	count := 0
 	for _, entry := range entries {
 		if entry.IsDir() || entry.Type()&os.ModeSymlink != 0 {
+			continue
+		}
+		if suffix != "" && !strings.HasSuffix(entry.Name(), suffix) {
 			continue
 		}
 		count++
