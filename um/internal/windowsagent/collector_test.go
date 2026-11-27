@@ -516,8 +516,12 @@ func TestEventsContract(t *testing.T) {
 		}
 		requireContractEvents(t, raw)
 		body := decodeEvents(t, raw)
-		if len(body.Events) != 2 || body.Events[1].Kind != "terminal_source_unavailable" {
+		if len(body.Events) != 2 || body.Events[1].Kind != "agent_error" {
 			t.Fatalf("events = %+v", body.Events)
+		}
+		detail, ok := body.Events[1].Detail.(map[string]any)
+		if !ok || detail["code"] != reasonSourceAuthorizationUnproven {
+			t.Fatalf("active-only agent_error detail = %#v", body.Events[1].Detail)
 		}
 	})
 

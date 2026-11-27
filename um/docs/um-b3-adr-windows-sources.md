@@ -22,11 +22,11 @@
 
 | Item | Requested decision | Status |
 | --- | --- | --- |
-| OD-P3-R2 | Accept/reject a specific **truly read-only** Windows terminal data source (no controller secret) as the `windows_terminal` telemetry source | **PENDING OWNER** (research not yet performed) |
+| OD-P3-R2 | Accept/reject a specific **truly read-only** Windows terminal data source (no controller secret) as the `windows_terminal` telemetry source | **PENDING OWNER** (research completed; R2 INFEASIBLE on tested surfaces; see §6) |
 | OD-P3-R1 | Accept/reject the **R1 residual risk**: a write-capable Mihomo/Clash Verge Rev controller credential used by a strictly GET-only client | **NOT AUTHORIZED / BLOCKED** — only after R2 is shown infeasible and a separate risk acceptance is recorded |
 | Enablement | Whether the center may set `collect.terminal`/`mihomo_api=true` for a node | **PENDING OWNER**; defaults remain `false` |
 
-No source is enabled by this Draft and no real controller was contacted.
+No source is enabled by this Draft. The R2 lab used an isolated synthetic Mihomo/Clash Verge Rev instance; no production controller or production configuration was contacted or changed.
 
 ## 2. Facts that constrain the decision
 
@@ -132,7 +132,7 @@ connections into the six tokens; (e) it works without admin/exec/root and
 without changing product configuration; (f) it does not require uploading local
 names or raw connection data.
 
-Candidate surfaces to investigate (none is verified yet):
+Candidate surfaces tested in the isolated lab (results in §6; none conforms to R2):
 
 | Candidate | What would make it R2 | Main risk |
 | --- | --- | --- |

@@ -123,6 +123,10 @@ type agentStartedDetail struct {
 	AgentVersion string `json:"agent_version"`
 }
 
+type agentErrorDetail struct {
+	Code string `json:"code"`
+}
+
 type terminalSourceUnavailableDetail struct {
 	Source     string `json:"source"`
 	ReasonCode string `json:"reason_code"`

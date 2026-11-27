@@ -115,7 +115,7 @@ ENV_FILE="$ETC_DIR/agent.env"
 
 case "$CENTER_URL" in
   https://*) : ;;
-  http://127.0.0.1:*|http://localhost:*) : ;; # test-only loopback, never production
+  http://127.0.0.1:*) : ;; # test-only literal loopback IP, never production
   *) die "--center must be https:// (plain HTTP is allowed only for loopback tests)" ;;
 esac
 

@@ -71,8 +71,14 @@ func readCredentialFile(path string) (string, error) {
 	if info.Size() > 4096 {
 		return "", errors.New("credential exceeds size limit")
 	}
-	if info.Mode().Perm()&0o077 != 0 {
-		return "", errors.New("credential is group/world accessible")
+	// systemd >=254 provisions LoadCredential files with POSIX ACLs. The ACL
+	// mask is reflected in st_mode's group bits, so a stat that reports 0440
+	// can still be a correctly scoped 0400 credential. Reject world access and
+	// group write/execute, but allow the ACL-mask group read bit; the source
+	// path itself is root-controlled and the credential is delivered in the
+	// unit's private credentials mount.
+	if info.Mode().Perm()&0o007 != 0 || info.Mode().Perm()&0o030 != 0 {
+		return "", errors.New("credential grants world access or group write/execute")
 	}
 	file, err := os.Open(path)
 	if err != nil {

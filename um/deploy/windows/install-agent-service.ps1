@@ -78,10 +78,6 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $PlanOnly = [bool]$WhatIfPreference
-if ($ServiceName -ne 'um-agent') {
-  Fail 'the um-agent SCM wrapper uses the fixed service name ''um-agent''; a different -ServiceName is not supported by this build'
-}
-
 function Fail([string]$msg) {
   Write-Error "install-agent-service: $msg"
   exit 1
@@ -99,6 +95,11 @@ function Invoke-Step([string]$description, [scriptblock]$action) {
     }
   }
 }
+
+if ($ServiceName -ne 'um-agent') {
+  Fail 'the um-agent SCM wrapper uses the fixed service name ''um-agent''; a different -ServiceName is not supported by this build'
+}
+
 
 # ---------------------------------------------------------------------------
 # Guard rails (checked even in a plan so the plan is meaningful)
@@ -146,7 +147,9 @@ elseif ($ServiceAccount -match ('(?i)^NT SERVICE\\' + [regex]::Escape($ServiceNa
 elseif (-not $ServiceCredential) {
   Fail "account '$ServiceAccount' requires -ServiceCredential (use Get-Credential at install time; the script never stores the password)"
 }
-if ($virtualAccount -and $ServiceCredential) { Fail 'virtual service accounts do not take a password; omit -ServiceCredential' }
+if (($builtInAccount -or $virtualAccount) -and $ServiceCredential) {
+  Fail 'built-in/virtual service accounts do not take -ServiceCredential; omit it'
+}
 
 Write-Host "target service : $ServiceName"
 Write-Host "binary        : $BinaryPath (sha256 $actualHash)"
@@ -228,11 +231,24 @@ Invoke-Step "create service $ServiceName (Manual start, session 0)" {
   }
   if ($ServiceCredential) { $newServiceArgs.Credential = $ServiceCredential }
   New-Service @newServiceArgs | Out-Null
+  # New-Service without -Credential creates a LocalSystem service. Set the
+  # explicit non-admin account via SCM; this is required for LocalService and
+  # the virtual service account (and is independently verified below).
+  if ($builtInAccount -or $virtualAccount) {
+    & sc.exe config $ServiceName obj= $ServiceAccount password= "" | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      Fail "failed to configure service account '$ServiceAccount'"
+    }
+  }
   if ($virtualAccount) {
     # Request a per-service SID for ACLs (no password/credential involved).
     & sc.exe sidtype $ServiceName unrestricted | Out-Null
   }
   & sc.exe failure $ServiceName reset= 86400 actions= restart/5000/restart/30000/""/0 | Out-Null
+  $qc = (& sc.exe qc $ServiceName | Out-String)
+  if ($qc -notmatch [regex]::Escape($ServiceAccount)) {
+    Fail "SCM service account verification failed for '$ServiceAccount'"
+  }
 }
 
 if ($virtualAccount -and -not $PlanOnly) {

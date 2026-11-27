@@ -1,0 +1,109 @@
+# UM-B3 isolated lab evidence (2026-11-27)
+
+This file records the non-production lab runs referenced by the B3 matrix. All
+tests used isolated temporary directories, synthetic configuration and synthetic
+credentials. No production host, VPS, Cloudflare account, real Mihomo config or
+real credential was used. The lab environment was a Windows review host; the
+Linux D-Bus/systemd and Windows SCM/service-account labs are not claimed here.
+
+## 1. Real sing-box 1.14.5 service.api
+
+- Official release asset:
+  `https://github.com/SagerNet/sing-box/releases/download/v1.14.5/sing-box-1.14.5-windows-amd64.zip`
+  (download returned 32,638,892 bytes; the extracted executable reported
+  `sing-box version 1.14.5`, `go1.27.4 windows/amd64`,
+  `Revision: a6844a780ba173e189a018d0ac62df67cd50b8e9`).
+- Isolated config (no production settings): mixed inbound tag `test-in` on
+  `127.0.0.1:19092`; top-level `services` entry of type `api`, tag
+  `monitor-api`, listen `127.0.0.1:19091`, synthetic secret.
+- The lab opened an HTTP CONNECT through the mixed inbound and kept it active.
+  The new client was called directly:
+  - first `ObserveServiceAPI`: `connected=true`, one inbound;
+  - second: `test-in` `ActiveConnections=1`, active
+    `UplinkBytes=0`/`DownlinkBytes=2`, `UplinkTotalBytes=0`,
+    `DownlinkTotalBytes=2`, `TotalsAvailable=true`, `TotalsExact=false`.
+  - temporary `TestZZRealServiceAPI` PASS; harness removed.
+- End-to-end temporary lab with the same live service.api, `linuxobs.Collector`,
+  `agent.Runtime` and the real `um-center` HTTP + SQLite boundary: center config
+  `singbox_api=true`, expected tag `test-in/other`; snapshot accepted with
+  `"test-in"` and `"traffic":"ok"` in the persisted payload. Temporary
+  `TestZZRealSingletonToCenter` PASS; harness removed.
+- Limitations: one isolated synthetic instance; not the P1-10 production
+  authorization audit and not a production claim. The in-repo serviceapi tests
+  are synthetic gRPC-Web fixtures (`internal/linuxobs/serviceapi_test.go`).
+
+## 2. R2 Windows source investigation
+
+See `um-b3-adr-windows-sources.md` §6. Isolated Mihomo/Clash Verge Rev lab:
+
+- Clash Verge Rev **2.5.10**, Mihomo Meta **v1.19.33 windows/amd64**
+  (`with_gvisor`), temporary config and synthetic secret.
+- TCP controller: no/wrong secret → 401; correct secret → 200; controller API
+  is write-capable.
+- Windows named pipe: official docs say the pipe does not validate the secret;
+  isolated `/version`, `/connections`, `/proxies` returned 200 without/with a
+  wrong secret; `PUT /proxies/UM-TEST-GROUP` → 204 and `PATCH /configs` → 204.
+  Observed pipe DACL:
+  `D:P(A;OICI;0x12019f;;;BU)(A;OICI;0x12019f;;;SY)` (BUILTIN\Users + SYSTEM).
+- Local config/state files contained profile/selection metadata but no
+  authoritative live active-connection/route distribution.
+- Verdict: **R2 INFEASIBLE on the tested surfaces; full target build matrix
+  UNVERIFIED.** A GET-only local bridge would introduce a separate
+  write-capable-capability process and is not classified as R2.
+
+## 3. Current-user DPAPI lab
+
+- Windows host current-user DPAPI round-trip tests pass for
+  `internal/secretstore` and `internal/agent/state_windows_test.go`.
+- The test asserts `identity.json` and `rotation.json` do not contain the
+  Ed25519/rotation private-key plaintext and can be reopened by the same
+  Windows user.
+- This is **current-user only**. Virtual service account
+  `NT SERVICE\um-agent`, session-0, service-SID ACL, service-account DPAPI and
+  enrollment-under-service-account were not testable on the non-admin host;
+  OD-P7 remains PENDING.
+
+## 4. Process-level crash/recovery harness
+
+`internal/agentintegration/crash_recovery_test.go` starts the Go test binary as
+a child process, uses the real center/HTTP/SQLite and real filesystem spool, and
+exits with `os.Exit(99)` (no clean-shutdown marker).
+
+- REC-17: child queues a fsynced record, removes boot state, exits; parent
+  returns `boot_state_corrupt`, center snapshot count 0, spool retained.
+- REC-18: child commits generation 12, exits; parent restores generation 9;
+  real center returns 409 `stale_boot_generation`; no reset, spool retained.
+- REC-27: center generation 3/boot b3; child commits three seed reports, then a
+  fourth whose ACK is dropped after commit; persisted attempt is asserted as
+  gen3/seq4/boot b3 with a non-empty fingerprint; parent resends → duplicate,
+  spool drains, center snapshot count remains 4, no reinsertion.
+- Hardware power-loss durability on target hardware remains UM-E/hardware lab
+  scope; software process crashes are covered.
+
+## 5. Not executed
+
+- Real Linux systemd/D-Bus start/stop, no-exec `NoExecPaths`, non-root file
+  access and `systemd-analyze verify`: no Linux host/VM available; HOLD.
+- Windows SCM service install, virtual/dedicated service account, service-SID
+  ACL, session-0 and DPAPI service-account round-trip: host is non-admin; HOLD.
+- Public-TLS center deployment, real VPS/terminal production, real tournament
+  Clash Verge/Mihomo builds, R1/R2 enablement: HOLD.
+
+## 6. Verification commands
+
+Local (Windows) commands and results used for the final evidence are recorded in
+the PR/Issue archive; representative commands:
+
+```text
+go test -count=1 ./...
+go build ./...
+go vet ./...
+go mod verify
+GOOS=linux GOARCH=amd64 go build ./...
+GOOS=windows GOARCH=amd64 go build ./...
+bash -n um/deploy/linux/install-agent.sh
+PowerShell parser: install-agent-service.ps1 (0 parse errors)
+```
+
+The exact-HEAD GitHub CI result is linked from PR #131; this file does not
+replace CI.

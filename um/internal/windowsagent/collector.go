@@ -221,18 +221,29 @@ func (c *Collector) Events(_ context.Context, rc agent.ReportContext) ([]byte, e
 		Severity: "info",
 		Detail:   agentStartedDetail{AgentVersion: c.version},
 	}}
-	// terminal_source_unavailable is a Windows-terminal-only event kind. It is
-	// relevant when either independently authorized component (selection or
-	// active connections) is enabled but no local observer was injected.
-	if (rc.Config.Sources["terminal"] || rc.Config.Sources["mihomo_api"]) && c.observer == nil {
-		events = append(events, eventBody{
-			Kind:     "terminal_source_unavailable",
-			Severity: "warning",
-			Detail: terminalSourceUnavailableDetail{
-				Source:     sourceMihomoAPI,
-				ReasonCode: reasonSourceAuthorizationUnproven,
-			},
-		})
+	// terminal_source_unavailable is a Windows-terminal-only event kind: the
+	// center rejects it unless the selection source (`terminal`) is enabled.
+	// When only active-connection authorization (`mihomo_api`) is on, emit the
+	// generic agent_error diagnostic instead so a legal center config is
+	// accepted rather than quarantining the whole events body.
+	if c.observer == nil {
+		switch {
+		case rc.Config.Sources["terminal"]:
+			events = append(events, eventBody{
+				Kind:     "terminal_source_unavailable",
+				Severity: "warning",
+				Detail: terminalSourceUnavailableDetail{
+					Source:     sourceMihomoAPI,
+					ReasonCode: reasonSourceAuthorizationUnproven,
+				},
+			})
+		case rc.Config.Sources["mihomo_api"]:
+			events = append(events, eventBody{
+				Kind:     "agent_error",
+				Severity: "warning",
+				Detail:   agentErrorDetail{Code: reasonSourceAuthorizationUnproven},
+			})
+		}
 	}
 	for index := range events {
 		id, err := newUUIDv4()

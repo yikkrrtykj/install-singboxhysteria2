@@ -17,6 +17,23 @@ func writeTestFile(t *testing.T, dir, name, content string) string {
 	return path
 }
 
+func TestMergeServiceArgsKeepsImagePathFlags(t *testing.T) {
+	configured := []string{"--state-dir", `C:\ProgramData\UM Agent`, "--center", "https://center.example", "--node-class", "windows_terminal"}
+	got := mergeServiceArgs([]string{"um-agent"}, configured)
+	if len(got) != len(configured) {
+		t.Fatalf("mergeServiceArgs = %#v, want configured flags %#v", got, configured)
+	}
+	for i := range configured {
+		if got[i] != configured[i] {
+			t.Fatalf("arg[%d]=%q, want %q", i, got[i], configured[i])
+		}
+	}
+	withExtra := mergeServiceArgs([]string{"um-agent", "--extra"}, configured)
+	if len(withExtra) != len(configured)+1 || withExtra[len(withExtra)-1] != "--extra" {
+		t.Fatalf("extra SCM args = %#v", withExtra)
+	}
+}
+
 func TestWindowsSourceAuthorizationGate(t *testing.T) {
 	dir := t.TempDir()
 	profile := writeTestFile(t, dir, "profile.json",

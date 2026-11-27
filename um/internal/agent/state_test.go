@@ -95,6 +95,56 @@ func TestStateAtomicLockAndBootCorruption(t *testing.T) {
 	}
 }
 
+func TestInspectStateIsReadOnly(t *testing.T) {
+	dir := t.TempDir()
+	s, err := OpenState(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.saveIdentity(testIdentity(t)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.saveBoot(BootState{Version: stateVersion, Generation: 1, BootID: strings.Repeat("a", 32), NextSeq: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(dir, spoolDir)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(dir, quarantineDir)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := InspectState(dir); err != nil {
+		t.Fatalf("InspectState: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, spoolDir)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("status created spool dir: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, quarantineDir)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("status created quarantine dir: %v", err)
+	}
+	// A corrupt spool file is counted by inspection, not moved.
+	if err := os.MkdirAll(filepath.Join(dir, spoolDir), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	corrupt := filepath.Join(dir, spoolDir, "corrupt.json")
+	if err := os.WriteFile(corrupt, []byte("{bad"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	inspection, err := InspectState(dir)
+	if err != nil {
+		t.Fatalf("inspect corrupt spool: %v", err)
+	}
+	if inspection.Pending != 1 {
+		t.Fatalf("pending=%d, want 1", inspection.Pending)
+	}
+	if _, err := os.Stat(corrupt); err != nil {
+		t.Fatalf("inspection moved corrupt spool file: %v", err)
+	}
+}
+
 func TestSpoolCorruptionQuarantineAndLimits(t *testing.T) {
 	dir := t.TempDir()
 	sp, err := openSpool(filepath.Join(dir, "spool"), filepath.Join(dir, "quarantine"))

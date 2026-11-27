@@ -139,14 +139,23 @@ func logServiceEvent(id uint32, message string) {
 	_ = log.Error(id, message)
 }
 
+// mergeServiceArgs combines the ImagePath flags captured from os.Args with any
+// extra arguments the SCM passes. The svc package always includes the service
+// name as args[0], and the ImagePath flags are not repeated there. Keeping this
+// pure makes the argument contract testable without an SCM.
+func mergeServiceArgs(scmArgs, configured []string) []string {
+	out := append([]string{}, configured...)
+	if len(scmArgs) > 1 {
+		out = append(out, scmArgs[1:]...)
+	}
+	return out
+}
+
 type agentService struct{ args []string }
 
 func (s *agentService) Execute(args []string, r <-chan svc.ChangeRequest, changes chan<- svc.Status) (bool, uint32) {
 	changes <- svc.Status{State: svc.StartPending}
-	runArgs := args
-	if len(runArgs) == 0 {
-		runArgs = s.args
-	}
+	runArgs := mergeServiceArgs(args, s.args)
 	if len(runArgs) > 0 && runArgs[0] == "service" {
 		runArgs = runArgs[1:]
 	}
