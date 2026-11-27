@@ -98,8 +98,8 @@ func LoadFileAuthenticator(path string) (*FileAuthenticator, error) {
 
 func ensureEOF(dec *json.Decoder) error {
 	var extra any
-	if err := dec.Decode(&extra); err == nil {
-		return errors.New("management: admin auth file has trailing JSON")
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		return errors.New("management: admin auth file has trailing or invalid JSON")
 	}
 	return nil
 }

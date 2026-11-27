@@ -48,10 +48,6 @@ func run() error {
 		adminAddr     = flag.String("admin", envOr("UM_CENTER_ADMIN_ADDR", ""), "isolated admin listen address (required)")
 		dbPath        = flag.String("db", envOr("UM_CENTER_DB", ""), "SQLite database path (required)")
 		contractDir   = flag.String("contracts", envOr("UM_CENTER_CONTRACTS", ""), "explicit trusted path to docs/um/contracts/v1 (required)")
-		issueToken    = flag.Bool("issue-enroll-token", false, "create one enrollment token and exit (admin action)")
-		tokenEvent    = flag.String("token-event", "", "event_id scope for -issue-enroll-token")
-		tokenClass    = flag.String("token-class", "", "node_class scope for -issue-enroll-token (linux_vps|windows_terminal)")
-		tokenTTL      = flag.Duration("token-ttl", 30*time.Minute, "enrollment token lifetime")
 		adminAuthFile = flag.String("admin-auth-file", envOr("UM_CENTER_ADMIN_AUTH_FILE", ""), "protected 0600 local admin auth JSON; enables /api/v1 management API")
 	)
 	flag.Parse()
@@ -64,23 +60,6 @@ func run() error {
 		return fmt.Errorf("open store: %w", err)
 	}
 	defer st.Close()
-	now := time.Now().Unix()
-
-	if *issueToken {
-		if *tokenEvent == "" || *tokenClass == "" {
-			return errors.New("-issue-enroll-token requires -token-event and -token-class")
-		}
-		token, hash, err := store.NewEnrollToken()
-		if err != nil {
-			return err
-		}
-		if err := st.CreateEnrollToken(context.Background(), hash, *tokenEvent, *tokenClass, now+int64(tokenTTL.Seconds()), now); err != nil {
-			return fmt.Errorf("create enrollment token: %w", err)
-		}
-		fmt.Println(token)
-		return nil
-	}
-
 	if *ingestAddr == "" || *adminAddr == "" {
 		return errors.New("-ingest and -admin are required (or UM_CENTER_INGEST_ADDR / UM_CENTER_ADMIN_ADDR)")
 	}

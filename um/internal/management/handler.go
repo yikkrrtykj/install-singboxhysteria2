@@ -66,6 +66,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	switch parts[0] {
 	case "health":
+		if len(parts) != 1 {
+			h.writeError(w, http.StatusNotFound, "endpoint_not_found", "unknown endpoint", false, requestID)
+			return
+		}
 		h.requireMethod(w, r, requestID, http.MethodGet)
 		if r.Method == http.MethodGet {
 			h.writeJSON(w, http.StatusOK, h.svc.Health(ctx, principal))

@@ -104,12 +104,45 @@ func adminError(err error) string {
 }
 
 func printAdminHuman(data any) int {
+	if m, ok := data.(map[string]any); ok {
+		if events, ok := m["events"].([]any); ok {
+			for _, item := range events {
+				if e, ok := item.(map[string]any); ok {
+					fmt.Printf("%s  %-10s  %-24s  nodes=%v\n", str(e["event_id"]), str(e["state"]), str(e["display_name"]), e["node_count"])
+				}
+			}
+			return 0
+		}
+		if nodes, ok := m["nodes"].([]any); ok {
+			for _, item := range nodes {
+				if n, ok := item.(map[string]any); ok {
+					fmt.Printf("%s  %-16s  %-14s  last_seen=%v\n", str(n["node_id"]), str(n["node_class"]), str(n["derived_status"]), n["last_seen_at"])
+				}
+			}
+			return 0
+		}
+		if tokens, ok := m["tokens"].([]any); ok {
+			for _, item := range tokens {
+				if t, ok := item.(map[string]any); ok {
+					fmt.Printf("%s  %-8s  %-16s  expires=%v\n", str(t["token_id"]), str(t["status"]), str(t["node_class"]), t["expires_at"])
+				}
+			}
+			return 0
+		}
+	}
 	raw, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
 		return 1
 	}
 	fmt.Println(string(raw))
 	return 0
+}
+
+func str(v any) string {
+	if v == nil {
+		return ""
+	}
+	return fmt.Sprint(v)
 }
 
 // subFlags isolates each subcommand's flag set while sharing the global flags
