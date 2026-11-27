@@ -7,6 +7,10 @@ on:
       - '.github/workflows/um-b3-lab.yml'
       - 'um/deploy/lab/**'
       - 'um/cmd/um-lab/**'
+      - 'um/cmd/um-center/**'
+      - 'um/internal/management/**'
+      - 'um/internal/store/b4*.go'
+      - 'um/internal/center/**'
 
 permissions:
   contents: read
@@ -127,3 +131,20 @@ jobs:
       - name: Run isolated real sing-box service.api lab
         shell: bash
         run: bash um/deploy/lab/singbox-serviceapi-lab.sh
+
+  b4-management-e2e:
+    name: b4-management-e2e
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.4'
+          cache: true
+          cache-dependency-path: um/go.sum
+      - name: Real two-event management API/CLI/agent E2E
+        working-directory: um
+        run: go test ./internal/management ./cmd/um-center -count=1 -v
