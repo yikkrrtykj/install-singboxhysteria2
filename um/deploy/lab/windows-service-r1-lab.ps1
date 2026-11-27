@@ -73,7 +73,7 @@ function Cleanup {
   if ($null -ne $centerProc -and -not $centerProc.HasExited) { Stop-Process -Id $centerProc.Id -Force }
   Remove-Item -LiteralPath $lab -Recurse -Force
 }
-trap { Cleanup; throw }
+trap { Write-Host "LAB ERROR: $_"; Cleanup; throw }
 
 Remove-Item -LiteralPath $lab -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Path $lab -Force | Out-Null
