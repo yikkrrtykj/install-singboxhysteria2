@@ -14,8 +14,10 @@
   acceptance as **dependent on this amendment being approved**. Until then the
   amendment is not normative and no test may be changed merely to make the
   current contract look green.
-- Merge hold: both this amendment PR and B3 PR #131 remain Draft until the
-  approval path in §5 is completed. Neither merge is authorized by this file.
+- Merge hold: **#132** remains Draft until §5 items 1–2 are recorded, then may
+  be merged only as item 3 with the explicit Owner merge authorization in item
+  1. **#131** remains Draft until item 4 and a separate Owner merge
+  authorization. Neither merge is authorized by this file alone.
 
 ## 1. Problem statement
 
@@ -68,11 +70,12 @@ happened. It may remain as a diagnostic/attribution aid only.
 
 A retry inside the same process generation can be classified by the center as
 an exact duplicate only when it replays the **exact persisted attempt** (same
-`generation`, `boot_id`, `seq`, `sent_at`, nonce and therefore the same
-fingerprint). `sent_at` is part of the fingerprint; changing it while claiming
-an exact retry is invalid. A new `sent_at`/nonce means a new attempt, which is a
-different duplicate path (same report_id, possibly new generation after a
-restart).
+`generation`, `boot_id`, `seq`, `sent_at` and nonce). The request fingerprint
+includes `sent_at` (and the identity/boot/seq/nonce rules of the frozen wire
+contract), so changing `sent_at` while claiming an exact fingerprint is
+invalid; the nonce is separately covered by the frozen nonce-dedupe rule. A new
+`sent_at`/nonce means a new attempt, which is a different duplicate path (same
+report_id, possibly new generation after a restart).
 
 ### 2.4 Restart replay
 
@@ -132,8 +135,8 @@ edited by this PR; the amendment records precedence):
 | --- | --- | --- |
 | §2 `X-UM-Boot-Gen` / §6.1 "normal restart" | only clean restart increments | every enrolled runtime start, clean or unclean, increments once; **clarified** |
 | §6.4 power-loss row "persisted generation increments on restart" | conflicts with clean-only rule | confirmed for all restarts; **clarified** |
-| §6.3 seq exhaustion "new generation on a clean restart" | clean-only | next runtime start, including after power loss; **clarified** |
-| REC-27 setup gen3/b3/seq4, agent action "resume from persisted seq" | same-generation agent replay after power loss | **agent action superseded** by REC-27-B; center duplicate expectation retained as REC-27-A/B |
+| §6.3 and the other "clean restart" exhaustion clauses (§301, §378–379, §452, §977) | clean-only | next runtime start, including after power loss; **clarified** |
+| REC-27 setup gen3/b3/seq4, agent action "resume from persisted seq" | same-generation agent replay after power loss | **agent action superseded** by REC-27-B; old same-generation center duplicate expectation maps to REC-27-A, the new-generation duplicate is REC-27-B |
 | REC-04 lost-ACK + restart | already new-generation duplicate | unchanged and consistent |
 | `status`/read-only inspection | not explicitly a restart | does not advance generation; **companion clarification** |
 
@@ -158,21 +161,27 @@ silently convert this table into a PASS.
 
 ## 5. Approval, review and merge path (normative gate)
 
-This file is a proposal only. It becomes normative only after **all** of:
+This file is a proposal only. The executable gate is:
 
-1. an Owner-authored/approved decision record in
-   `docs/um/um-127/05-owner-decisions.md` (or a linked Owner record) explicitly
-   accepts this amendment, its destination revision and its merge;
-2. an **independent review PASS** of this docs/fixture amendment, recorded on
-   PR #132, covering the security no-weakening table and REC supersession;
-3. the amendment PR itself is merged through the normal contract-update path and
-   the destination contract revision is published;
-4. B3 PR #131 is then re-run/re-reviewed against the approved revision, with
-   exact-HEAD CI and no unresolved review threads.
+1. **Owner decision record**: an Owner-authored/approved record in
+   `docs/um/um-127/05-owner-decisions.md` (or linked Owner record) explicitly
+   accepts the amendment, names destination rev-6, and explicitly authorizes
+   merging **this amendment PR #132**. This item does not authorize merging
+   #131 or any production use.
+2. **Independent review PASS on PR #132**: review of this docs/fixture
+   amendment, including the security no-weakening table and REC supersession,
+   recorded as PASS. #132 stays Draft until items 1–2 are both recorded.
+3. **Merge #132** through the normal contract-update path, then publish the
+   destination contract revision (rev-6). This is the only merge authorized by
+   the item-1 decision.
+4. **B3 re-review**: PR #131 is then re-run/re-reviewed against the approved
+   revision, with exact-HEAD CI and no unresolved review threads. #131 stays
+   Draft until this item and a separate Owner merge authorization.
 
-Until all four are done:
+Until the applicable item is complete:
 
-- **PR #132 and PR #131 remain Draft; MERGE HOLD and PRODUCTION HOLD apply.**
+- **#132:** Draft, no merge; **#131:** Draft, no merge; MERGE HOLD and
+  PRODUCTION HOLD apply to both.
 - B3 may implement/test the proposed behavior, but tests/docs must name the
   amendment dependency and must not call the behavior frozen.
 - old rev-5 vectors remain untouched; the old exact-duplicate center case stays

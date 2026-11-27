@@ -54,7 +54,7 @@
 
 ## 5. 下一步（需 Owner 授权）
 
-0. 若 Owner 接受 power-loss generation 修订方向：先完成 #132 独立审查与 Owner 决策记录，再按 amendment 更新契约修订；在完成前 #131/#132 保持 Draft/MERGE HOLD/PRODUCTION HOLD。
+0. 若 Owner 接受 power-loss generation 修订方向：#132 在 Owner 决策记录（含合并授权）与独立审查 PASS 前保持 Draft；两项完成后才合并 #132 并发布 rev-6；#131 在 rev-6 下重新审查/CI 并由 Owner 单独授权前保持 Draft。两者均保持 MERGE HOLD/PRODUCTION HOLD。
 
 1. 独立审查 #126 rev-5（独立于 owner Round-2 方向），Owner 给合并授权 → 普通 Merge Commit 合并 #126 → 确认 main CI。
 2. #128 完成独立审查/合并门禁 → 合并 #128（保留原 PR，不建 PR-A2）。
