@@ -70,7 +70,7 @@ merge authorization and independent review remain separate.
 | [um-a/04-node-protocol-v1.rev6.md](um-a/04-node-protocol-v1.rev6.md) | **Revision 6 normative overlay** for power-loss/process-restart generation, REC-27 remap and executable conformance requirements (effective on PR #132 release merge) |
 | [um-a/05-retention-capacity-backup.md](um-a/05-retention-capacity-backup.md) | 30-day history retention, deletion rules, capacity model/limits, SQLite→PostgreSQL gate, backup/restore (RPO/RTO) |
 | [um-a/06-threat-model-security-tests-performance.md](um-a/06-threat-model-security-tests-performance.md) | Threat model, abuse cases, security test plan, performance budgets and UM-E measurement plan (rev-5 platform/mapping/privacy cases added) |
-| [um-a/07-um-b-entry-and-review.md](um-a/07-um-b-entry-and-review.md) | UM-A review checklist, owner decisions (pending; Round-2 review record), UM-B entry criteria, authorization record |
+| [um-a/07-um-b-entry-and-review.md](um-a/07-um-b-entry-and-review.md) | UM-A rev-5 review checklist, historical owner-decision record (superseded for rev-6 by um-127/10), UM-B entry criteria, authorization record |
 | [um-a/08-review-response-matrix.md](um-a/08-review-response-matrix.md) | PR #126 review response matrix (P0-01, P1-01..P1-11, rev-5 targeted amendment, owner Round-2 review record) and validation summary |
 | [contracts/v1/](contracts/v1/) | Machine-readable v1 JSON schemas, positive/negative examples, signed test vectors (report, Windows terminal, enrollment, rotate, config), behavioural negative contract (revision 5) and revision-6 power-loss fixture |
 
@@ -80,8 +80,8 @@ merge authorization and independent review remain separate.
   rev-6 contract-release package under its conditional Owner merge authorization.
 - Not authorized by the rev-6 release: B3 PR #131 merge, production deployment,
   real R1 enablement, or an unauthorized `singbox_api`.
-- UM-B1/B2/B3 implementation work is a separate Draft candidate (#131); it does
-  not become released by the rev-6 contract merge.
+- B1/B2 are already merged; the B3 implementation (#131) remains a separate
+  Draft candidate and does not become released by the rev-6 contract merge.
 - The rev-6 PR is a **Draft** until independent review PASS, exact-head CI green
   and the normal Merge Commit gate complete. Merge/release/production remain
   explicitly withheld until then.
