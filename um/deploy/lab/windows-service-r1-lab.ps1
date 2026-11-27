@@ -115,7 +115,13 @@ $sid = Get-ServiceSid $svc
 Invoke-Native 'icacls' @($lab, '/grant', "*${sid}:(OI)(CI)M", '/T')
 Invoke-Native 'icacls' @($state, '/inheritance:r', '/grant:r', '*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F', "*${sid}:(OI)(CI)F", '/T')
 Invoke-Native 'icacls' @($tokenFile, '/grant', "*${sid}:R")
-Start-Service -Name $svc
+try { Start-Service -Name $svc } catch {
+  & sc.exe qc $svc | Out-String | Write-Host
+  & sc.exe query $svc | Out-String | Write-Host
+  Get-WinEvent -FilterHashtable @{LogName='System'; StartTime=(Get-Date).AddMinutes(-5)} -ErrorAction SilentlyContinue | Select-Object -First 20 | Format-List TimeCreated,Id,ProviderName,Message | Out-String | Write-Host
+  Get-WinEvent -FilterHashtable @{LogName='Application'; StartTime=(Get-Date).AddMinutes(-5)} -ErrorAction SilentlyContinue | Select-Object -First 20 | Format-List TimeCreated,Id,ProviderName,Message | Out-String | Write-Host
+  throw
+}
 Wait-ServiceStatus $svc 'Stopped'
 $identity = Get-Content -LiteralPath (Join-Path $state 'identity.json') -Raw | ConvertFrom-Json
 $nodeID = $identity.node_id
