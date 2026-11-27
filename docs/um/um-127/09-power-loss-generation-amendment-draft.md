@@ -1,6 +1,7 @@
 # UM-127 amendment draft — power-loss / process-restart generation semantics
 
-- Status: **DRAFT AMENDMENT, NOT FROZEN, NOT APPROVED.**
+- Status: **DRAFT / HISTORICAL PROPOSAL — direction approved for rev-6; normative
+  release is the rev-6 overlay, effective only after the contract-release merge.**
 - Base: `docs/um/um-a/04-node-protocol-v1.md` revision 5 (frozen), especially
   §5, §6.1, §6.4, the recovery-case table, and REC-27.
 - Scope: only the ambiguity between "normal restart increments generation" and
@@ -8,8 +9,11 @@
 - Tracking: issue #127, B3 implementation Draft PR #131, and this amendment
   Draft PR #132. This amendment is intentionally a separate docs/fixture-only
   Draft PR and does not modify any frozen rev-5 file, schema or existing vector.
-- Destination if approved: a new contract revision (proposed **rev-6**) on the
-  normal contract-update path; no rev-5 file is edited in this PR.
+- Destination: a new contract revision (**rev-6**) on the normal contract-update
+  path. The normative release artifact is
+  [`../um-a/04-node-protocol-v1.rev6.md`](../um-a/04-node-protocol-v1.rev6.md);
+  this file is retained for proposal/history and REC-27 remap rationale. No rev-5
+  file is edited.
 - The B3 code may implement and test the proposed rule, but must label the
   acceptance as **dependent on this amendment being approved**. Until then the
   amendment is not normative and no test may be changed merely to make the

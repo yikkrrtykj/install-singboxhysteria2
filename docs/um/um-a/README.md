@@ -1,7 +1,9 @@
 # UM-A — Investigation, selection and frozen design
 
-Status: **revision 5 final targeted amendment — deliverable for independent
-review**. UM-B and later phases remain HOLD until this phase receives an
+Status: **revision 5 final targeted amendment + revision 6 approved normative
+overlay (power-loss/restart generation)**. The overlay becomes frozen only when
+the rev-6 contract-release PR is merged; see
+[04-node-protocol-v1.rev6.md](04-node-protocol-v1.rev6.md). UM-B and later phases remain HOLD until this phase receives an
 independent review PASS and the owner merge authorization (see
 [07-um-b-entry-and-review.md](07-um-b-entry-and-review.md)). The owner's Round-2
 review conclusions are recorded in 07 §3 / 08; they do not replace the independent
@@ -42,12 +44,13 @@ inputs needed to start UM-B:
 - [01 — Existing-capability review](01-existing-capability-review.md)
 - [02 — Technology selection ADRs](02-technology-selection-adr.md)
 - [03 — Architecture and trust boundaries](03-architecture-and-trust-boundaries.md)
-- [04 — Node protocol v1 (frozen)](04-node-protocol-v1.md)
+- [04 — Node protocol v1 (frozen, revision 5)](04-node-protocol-v1.md)
+- [04 rev-6 normative overlay — power-loss/restart generation](04-node-protocol-v1.rev6.md)
 - [05 — Retention, capacity and backup](05-retention-capacity-backup.md)
 - [06 — Threat model, security tests and performance](06-threat-model-security-tests-performance.md)
 - [07 — UM-B entry criteria and review](07-um-b-entry-and-review.md)
 - [08 — PR #126 review response matrix (rev 2, rev 3 and rev-5 targeted amendment; owner Round-2 record)](08-review-response-matrix.md)
-- [../contracts/v1/](../contracts/v1/) — schemas, positive/negative examples, signed report/Windows-terminal/enrollment/rotate/config vectors, behavioural negative contract (revision 5)
+- [../contracts/v1/](../contracts/v1/) — schemas, positive/negative examples, signed report/Windows-terminal/enrollment/rotate/config vectors, behavioural negative contract (revision 5), plus the revision-6 normative power-loss/restart fixture
 
 ## How this phase was investigated
 

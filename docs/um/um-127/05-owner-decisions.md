@@ -19,7 +19,7 @@
 | Q-DNS | 域名/CF/Access | monitor/ingest 域名、zone、IdP、aud、tunnel token 由 Owner 持有 | PENDING |
 | Q-AGENT-OS | Agent OS 矩阵/安装 | Linux Debian/Ubuntu systemd；rev-5 增加 windows_terminal class，但 Windows OS/安装矩阵仍需明确决定 | PENDING |
 | Q-COEXIST | 与每 VPS Monitor 共存 | 只读共存，不改既有部署 | PENDING |
-| Q-DATA | 授权本地数据源 | sing-box service.api/`/proc`/只读 D-Bus；Windows **R2 优先**、R1 需单独 Owner 风险接受 | PENDING |
+| Q-DATA | 授权本地数据源 | sing-box service.api/`/proc`/只读 D-Bus；Windows **R2 优先**、R1 需单独 Owner 风险接受 | **PARTIAL (2026-11-27)**：Windows R1 隔离架构批准；Linux `singbox_api` 仍 disabled；见 [10-owner-decisions-rev6.md](10-owner-decisions-rev6.md) |
 | Q-RET | 保留策略 | 策略 B + overlap cap | PENDING |
 | Q-AUD | 审计保留 | 180d，可下调不低于 30d | PENDING |
 | Q-BACKUP | 备份/RPO/RTO | 局部 RPO≤24h；整机需每日加密异地；RTO 见方案 | PENDING |
@@ -48,14 +48,14 @@
 | --- | --- | --- |
 | OD-P1 | `node_class`（linux_vps/windows_terminal）必填、token scope 绑定 event+class、不可自选 | **DIRECTION-ACCEPTED**；已冻结进 rev-5 schema/enrollment；实现受门禁 |
 | OD-P2 | Windows 选路/连接聚合纳入首版；六路径而非仅 A/B | **DIRECTION-ACCEPTED**；已冻结（六 token/schema） |
-| OD-P3 | R2 真只读源优先；R1 写能力 controller 凭据需单独 Owner 风险接受、不自动启用 | **PENDING（设计/运行期）**：UM-B3 先做 R2 调研；R1 另行 Owner 接受 |
+| OD-P3 | R2 真只读源优先；R1 写能力 controller 凭据需单独 Owner 风险接受、不自动启用 | **APPROVED (limited, 2026-11-27)**：R1 架构/隔离 lab 批准，生产启用 HOLD；见 [10-owner-decisions-rev6.md](10-owner-decisions-rev6.md) |
 | OD-P4 | A/B→VPS ID 映射由 center 版本+effective_from 管理，历史不改写；agent 只报 token | **DIRECTION-ACCEPTED**；已冻结契约；UM-B4 实现 |
 | OD-P5 | `stale_after_s` 默认值、cadence、metrics 是否首版 | **PENDING（运行期参数）**：默认 `max(180,3×cadence)` 建议；metrics v1 不纳入（已冻结为 deferred） |
 | OD-P6 | 隐私 allowlist 增补（token/计数/时间戳；版本号默认不报） | **DIRECTION-ACCEPTED**（rev-5 privacy）；运行期细节 PENDING |
-| OD-P7 | Windows Agent 运行账户与 secret 存储（DPAPI/服务账户/用户会话） | **PENDING（运行期/ADR）**：UM-B3 出 ADR 后 Owner 确认 |
+| OD-P7 | Windows Agent 运行账户与 secret 存储（DPAPI/服务账户/用户会话） | **APPROVED (limited, 2026-11-27)**：`NT SERVICE\um-agent`/Session 0/DPAPI CurrentUser；不授权实际操作赛事电脑；见 [10-owner-decisions-rev6.md](10-owner-decisions-rev6.md) |
 | OD-P8 | `terminal` 放 report-snapshot 可选对象（非新 report type） | **DIRECTION-ACCEPTED**；已冻结 schema |
 
-**DIRECTION-ACCEPTED 的含义**：Owner 在 Round-2 明确要求按该方向形成 rev-5 最终契约；它不是 APPROVED，也不授权合并、实现或生产。所有 18 项 Q-* 仍为 PENDING。
+**DIRECTION-ACCEPTED 的含义**：Owner 在 Round-2 明确要求按该方向形成 rev-5 最终契约；它不是 APPROVED，也不授权合并、实现或生产。18 项 Q-* 中仅 Q-DATA 的 Windows R1 部分按 2026-11-27 rev-6 记录获批；其余仍 PENDING。
 
 ## D. Owner Round-2 审查记录（2026-11-26）
 

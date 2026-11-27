@@ -1,6 +1,6 @@
 # UM-127 — 统一监控开发基线与 Go 迁移计划（Round 2 同步）
 
-- 状态：**PROPOSED（规划文档，Draft PR）· 已按最终契约 rev-5 同步**。不构成实现、合并、部署或生产操作授权。
+- 状态：**rev-6 契约发布材料（Draft PR #132）· rev-5 历史保留**。Owner 已批准 rev-6 方向；在独立审查/精确 CI/合并且 main 验证前，rev-6 不得标记 PUBLISHED/FROZEN。不构成 B3 合并、部署或生产授权。
 - 唯一跟踪 Issue：[#127 Unified Monitor｜统一监控与 Go 迁移](https://github.com/yikkrrtykj/install-singboxhysteria2/issues/127)
 - 最终契约：[PR #126](https://github.com/yikkrrtykj/install-singboxhysteria2/pull/126)（UM-A revision 5，HEAD `048fc170`，tree `1b726de9…`）
 - 设计基线与计划修订：[PR #128](https://github.com/yikkrrtykj/install-singboxhysteria2/pull/128)（本 PR，保留原 PR，不做 PR-A2）
@@ -50,11 +50,13 @@
 | [04-implementation-plan.md](04-implementation-plan.md) | 实施门禁与顺序、Go 复用/差距、UM-B1..UM-G、Go 分支同步、CI 要求（无 PR-A2） |
 | [05-owner-decisions.md](05-owner-decisions.md) | 18 项既有 + rev-5 方向/运行参数 + 门禁登记；全部非 APPROVED |
 | [conformance/transport-recovery.cases.json](conformance/transport-recovery.cases.json) | UM-B1/B2/B3 规范性恢复用例（REC-01..REC-30，rev-5 绑定） |
-| [09-power-loss-generation-amendment-draft.md](09-power-loss-generation-amendment-draft.md) | **DRAFT / NOT NORMATIVE** power-loss/process-restart generation amendment, REC-27 supersession/remap and approval/merge-hold path; companion JSON under `conformance/` |
+| [09-power-loss-generation-amendment-draft.md](09-power-loss-generation-amendment-draft.md) | proposal/history for the power-loss/process-restart amendment and old REC-27 remap; superseded normatively by the rev-6 overlay once merged |
+| [10-owner-decisions-rev6.md](10-owner-decisions-rev6.md) | **Owner decision record (2026-11-27)**: OD-P3 R1 architecture, OD-P7 virtual account, Linux sing-box limitation, power-loss/rev-6 approval, merge scope/limits |
+| [power-loss-generation.rev6.json](../contracts/v1/power-loss-generation.rev6.json) | **normative rev-6 fixture** AMEND-REC-27-A..F with executable requirements |
 
 ## 5. 下一步（需 Owner 授权）
 
-0. 若 Owner 接受 power-loss generation 修订方向：#132 在 Owner 决策记录（含合并授权）与独立审查 PASS 前保持 Draft；两项完成后才合并 #132 并发布 rev-6；#131 在 rev-6 下重新审查/CI 并由 Owner 单独授权前保持 Draft。两者均保持 MERGE HOLD/PRODUCTION HOLD。
+0. rev-6: Owner 决策已记录；#132 需独立审查 PASS、required checks 全绿、无阻塞线程和精确基线，随后按普通 Merge Commit 合并并验证 main；只有合并后的 main 状态才可标记 `REV-6 PUBLISHED / FROZEN / VERIFIED`。#131 不获合并授权，需在 rev-6 基线下重新审查/CI 并等待 Owner 单独授权。
 
 1. 独立审查 #126 rev-5（独立于 owner Round-2 方向），Owner 给合并授权 → 普通 Merge Commit 合并 #126 → 确认 main CI。
 2. #128 完成独立审查/合并门禁 → 合并 #128（保留原 PR，不建 PR-A2）。

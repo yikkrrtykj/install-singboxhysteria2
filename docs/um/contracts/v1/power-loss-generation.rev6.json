@@ -1,0 +1,264 @@
+{
+  "schema": "um-node-protocol-power-loss-generation/v6",
+  "status": "NORMATIVE_REV6",
+  "normative": true,
+  "contract_revision": 6,
+  "base_contract_revision": 5,
+  "base_contract": "docs/um/um-a/04-node-protocol-v1.md revision 5",
+  "base_contract_commit": "048fc170685da5b7140bebd9e3347616cb3ec656",
+  "normative_doc": "docs/um/um-a/04-node-protocol-v1.rev6.md",
+  "approval_record": "docs/um/um-127/10-owner-decisions-rev6.md",
+  "release_pr": 132,
+  "tracking": {
+    "issue": 127,
+    "b3_candidate_pr": 131
+  },
+  "max_boot_gap": 65535,
+  "rules": [
+    "Every successful start of an enrolled runtime, including unclean exit or power-loss recovery, increments generation by exactly one and generates a new 32-hex boot id, fsynced before network activity.",
+    "status/inspection/read-only local CLI operations are not restarts and must not mutate generation, boot state, spool or quarantine.",
+    "Same-runtime transport retry may replay the exact persisted generation/boot/seq/sent_at/nonce/fingerprint attempt; the center may return duplicate.",
+    "Restart replay preserves report_id/collected_at/type/body identity but uses the new generation/boot and a fresh valid attempt; no retired sequence is reused.",
+    "The first new-generation replay may be duplicate, but it must atomically advance the new generation/boot/seq high-water with report_id dedupe and write no second data copy.",
+    "A late retired-generation request is stale_boot_generation; same-generation different boot id is boot_identity_conflict; gap > MAX_BOOT_GAP is boot_identity_conflict.",
+    "No weakening of signature, nonce, request fingerprint, report_id dedupe, boot high-water, generation gap bounds, revocation, rotation proof or fsync-before-send is permitted.",
+    "next_seq exhaustion on a duplicate first contact is still bound by the frozen exhaustion rules; no seq wrap or reuse."
+  ],
+  "old_rec27_mapping": {
+    "old_center_exact_duplicate": "AMEND-REC-27-A",
+    "old_agent_side_same_generation_power_loss_resume": "SUPERSEDED by AMEND-REC-27-B",
+    "old_center_rule_status": "retained"
+  },
+  "cases": [
+    {
+      "id": "AMEND-REC-27-A",
+      "slice": "UM-B3",
+      "title": "Same-runtime ACK loss: exact persisted attempt retry",
+      "kind": "same_runtime_exact_retry",
+      "restart": false,
+      "setup": {
+        "center": {
+          "highest_gen": 3,
+          "boot_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "last_seq": 4,
+          "report_dedupe": {
+            "r-rev6-ack-loss": "fp-rev6-a"
+          }
+        },
+        "agent": {
+          "generation": 3,
+          "boot_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "next_seq": 5
+        }
+      },
+      "attempt": {
+        "endpoint": "report",
+        "gen": 3,
+        "boot_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "seq": 4,
+        "fingerprint": "fp-rev6-a",
+        "report_id": "r-rev6-ack-loss",
+        "payload_identity_preserved": true
+      },
+      "expected": {
+        "http_status": 200,
+        "result": "duplicate",
+        "center_state": {
+          "highest_gen": 3,
+          "boot_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "last_seq": 4
+        },
+        "ack": {
+          "next_seq": 5
+        },
+        "data": "no_second_copy"
+      }
+    },
+    {
+      "id": "AMEND-REC-27-B",
+      "slice": "UM-B3",
+      "title": "Power-loss restart: new generation, same payload, duplicate advances high-water",
+      "kind": "process_restart_replay",
+      "restart": true,
+      "setup": {
+        "center": {
+          "highest_gen": 3,
+          "boot_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "last_seq": 4,
+          "report_dedupe": {
+            "r-rev6-restart": "fp-rev6-b-old"
+          }
+        },
+        "agent": {
+          "generation": 4,
+          "boot_id": "cccccccccccccccccccccccccccccccc",
+          "next_seq": 1
+        }
+      },
+      "attempt": {
+        "endpoint": "report",
+        "gen": 4,
+        "boot_id": "cccccccccccccccccccccccccccccccc",
+        "seq": 1,
+        "fingerprint": "fp-rev6-b-new",
+        "report_id": "r-rev6-restart",
+        "payload_identity_preserved": true
+      },
+      "expected": {
+        "http_status": 200,
+        "result": "duplicate",
+        "center_state": {
+          "highest_gen": 4,
+          "boot_id": "cccccccccccccccccccccccccccccccc",
+          "last_seq": 1
+        },
+        "ack": {
+          "next_seq": 2
+        },
+        "data": "no_second_copy",
+        "reported_payload_unchanged": true
+      }
+    },
+    {
+      "id": "AMEND-REC-27-C",
+      "slice": "UM-B3",
+      "title": "Late retired-generation request after the new high-water",
+      "kind": "stale_generation_rejection",
+      "restart": true,
+      "setup": {
+        "center": {
+          "highest_gen": 4,
+          "boot_id": "cccccccccccccccccccccccccccccccc",
+          "last_seq": 1,
+          "report_dedupe": {
+            "r-rev6-restart": "fp-rev6-b-new"
+          }
+        }
+      },
+      "attempt": {
+        "endpoint": "report",
+        "gen": 3,
+        "boot_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "seq": 4,
+        "fingerprint": "fp-rev6-a",
+        "report_id": "r-rev6-ack-loss"
+      },
+      "expected": {
+        "http_status": 409,
+        "result": "rejected",
+        "error": "stale_boot_generation",
+        "center_state_change": "none"
+      }
+    },
+    {
+      "id": "AMEND-REC-27-D",
+      "slice": "UM-B3",
+      "title": "status/read-only inspection is non-mutating",
+      "kind": "read_only_inspection",
+      "restart": false,
+      "setup": {
+        "agent": {
+          "generation": 4,
+          "boot_id": "cccccccccccccccccccccccccccccccc",
+          "next_seq": 2,
+          "spool_records": 1
+        }
+      },
+      "expected": {
+        "generation": 4,
+        "boot_id": "cccccccccccccccccccccccccccccccc",
+        "state_change": "none",
+        "spool_change": "none",
+        "network_required": false
+      }
+    },
+    {
+      "id": "AMEND-REC-27-E",
+      "slice": "UM-B3",
+      "title": "Same generation with a different boot id",
+      "kind": "boot_identity_conflict",
+      "restart": false,
+      "setup": {
+        "center": {
+          "highest_gen": 3,
+          "boot_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "last_seq": 4
+        }
+      },
+      "attempt": {
+        "endpoint": "report",
+        "gen": 3,
+        "boot_id": "dddddddddddddddddddddddddddddddd",
+        "seq": 5,
+        "fingerprint": "fp-rev6-e",
+        "report_id": "r-rev6-boot-conflict"
+      },
+      "expected": {
+        "http_status": 409,
+        "result": "rejected",
+        "error": "boot_identity_conflict",
+        "center_state_change": "none"
+      }
+    },
+    {
+      "id": "AMEND-REC-27-F",
+      "slice": "UM-B3",
+      "title": "Consecutive offline restarts within MAX_BOOT_GAP",
+      "kind": "bounded_gap_acceptance",
+      "restart": true,
+      "setup": {
+        "center": {
+          "highest_gen": 3,
+          "boot_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "last_seq": 4
+        },
+        "agent": {
+          "generation": 6,
+          "boot_id": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "next_seq": 1
+        }
+      },
+      "attempt": {
+        "endpoint": "report",
+        "gen": 6,
+        "boot_id": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "seq": 1,
+        "fingerprint": "fp-rev6-f",
+        "report_id": "r-rev6-gap"
+      },
+      "expected": {
+        "http_status": 200,
+        "result": "accepted",
+        "center_state": {
+          "highest_gen": 6,
+          "boot_id": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "last_seq": 1
+        },
+        "ack": {
+          "next_seq": 2
+        },
+        "gap": 3,
+        "gap_audit": "boot_generation_gap"
+      }
+    }
+  ],
+  "executable_requirements": [
+    "AMEND-REC-27-A executes through real center HTTP/SQLite and a real agent runtime same-process retry; not a JSON parse only.",
+    "AMEND-REC-27-B executes through the process-level crash harness and real agent persistence; the new generation/boot is observed in persisted state and at the center, the report_id is unchanged, duplicate advances high-water, and only one stored report copy exists.",
+    "AMEND-REC-27-C executes a real HTTP request from the retired generation and asserts no center state change.",
+    "AMEND-REC-27-D executes the real status/read-only CLI against a persisted state and compares state/tree/mtime or equivalent bytes; no mutation or network request is allowed.",
+    "AMEND-REC-27-E executes a real HTTP request with the same generation and different boot id.",
+    "AMEND-REC-27-F executes real bounded forward-gap requests after consecutive offline restarts and checks the gap audit.",
+    "The fixture's setup/expected fields are the assertion source; a changed fixture value changes the test outcome.",
+    "Revision-5 REC-17/18/04/30, rotation, generation exhaustion and repeated unclean-restart tests remain mandatory."
+  ],
+  "compatibility": {
+    "rev5_files_unchanged": true,
+    "old_rev5_vectors_unchanged": true,
+    "old_REC27_center_exact_duplicate_retained": true,
+    "old_REC27_agent_power_loss_same_generation_superseded": true,
+    "rec04_new_generation_first_duplicate_compatible": true,
+    "rec30_oldest_first_replay_compatible": true,
+    "new_case_required_for_restart_duplicate": true
+  }
+}
