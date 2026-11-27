@@ -25,10 +25,10 @@ jobs:
           Write-Host "whoami: $(whoami)"
           whoami /groups | Out-String | Write-Host
           sc.exe query | Out-String | Write-Host
-          New-Service -Name 'um-lab-env' -BinaryPathName 'cmd.exe /c ping -n 30 127.0.0.1 >nul' -StartupType Manual | Out-Null
+          & sc.exe create um-lab-env binPath= "cmd.exe /c ping -n 30 127.0.0.1 >nul" start= demand obj= "NT SERVICE\um-lab-env" password= "" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "sc create virtual account failed: $LASTEXITCODE" }
           try {
-            & sc.exe config um-lab-env obj= "NT SERVICE\um-lab-env" password= "" | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "sc config virtual account failed: $LASTEXITCODE" }
+            & sc.exe sidtype um-lab-env unrestricted | Out-Null
             & sc.exe qc um-lab-env | Out-String | Write-Host
             Start-Service um-lab-env
             Start-Sleep -Seconds 2
