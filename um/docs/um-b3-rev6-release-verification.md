@@ -42,8 +42,23 @@ PR #131 was synchronized by a normal merge of `origin/main` into
 `codex/um-b3-agents` (no rebase/force-push), creating merge commit
 `3259b51d719bde059f40cc2b7dd01f5f1175bb0f` (tree
 `c3dacc31d0a3f9f61f305993d2f2aa3bd52baa0a`). The rev-6 overlay/fixture are now
-the normative basis for B3 restart/power-loss acceptance. The final B3 HEAD,
-exact CI and lab run are appended below when verified.
+the normative basis for B3 restart/power-loss acceptance.
+
+The first synced candidate (`da45979bacd14e7fb37d260e5e3a9671832c63d0`) passed
+the exact-HEAD PR checks **30/30** and the isolated lab workflow run
+`46070490891` (**5/5 jobs**). This evidence document is itself a docs-only
+commit on top of that candidate; the final HEAD, exact CI run and exact lab run
+are recorded on PR #131/Issue #127 after the final verification cycle.
+
+## Local validation (synced rev-6 branch)
+
+- `go test ./...` PASS; `go vet ./...` clean; `go mod verify` PASS.
+- Linux/Windows amd64 cross-builds of `./...` PASS.
+- `govulncheck ./...`: no vulnerabilities found in called code.
+- `go test ./...` includes real center HTTP/SQLite, contract/conformance,
+  process-level crash harness and the new rev-6 tests.
+- Local Linux `-race` is not available on the Windows host; the exact-HEAD
+  GitHub `linux-race` check is the race evidence.
 
 ## Executable rev-6 REC results
 
@@ -61,6 +76,12 @@ exact CI and lab run are appended below when verified.
   `boot_identity_conflict`, no state change.
 - AMEND-REC-27-F: real consecutive offline restarts within `MAX_BOOT_GAP` →
   accepted new-generation contact, high-water committed, gap audit chain valid.
+
+Tests: `um/internal/agent/rev6_conformance_test.go` (A-F; real center/agent
+HTTP/SQLite state), `um/cmd/um-agent/status_test.go` (real status CLI and
+state-tree hash), `um/internal/agentintegration/crash_recovery_test.go`
+(process-level crash/restart B fixture binding and payload dedupe). These tests
+read the normative fixture fields; it is not a JSON-parse-only check.
 
 ## Remaining limits
 
