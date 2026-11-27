@@ -142,7 +142,7 @@ Where this table conflicts with revision-5 text, this overlay controls.
 | §2 `X-UM-Boot-Gen`; §6.1 | "normal restart" | every enrolled runtime start, clean or unclean |
 | §6.3 restart row | "persisted generation +1 and new boot id" | unchanged and confirmed |
 | §6.3 ACK-exhaustion row | "new generation on clean restart" | new generation on the next runtime start, including after power loss |
-| §6.4 power-loss row | "persisted generation increments on restart" | confirmed; same-generation agent resend is not the restart rule |
+| §6.3 power-loss row | "persisted generation increments on restart" | confirmed; same-generation agent resend is not the restart rule |
 | REC-27 setup gen 3/boot b3/seq 4, agent action "resume from persisted seq" | same-generation power-loss replay | **agent action superseded**; AMEND-REC-27-A covers the retained center exact-duplicate rule, AMEND-REC-27-B covers restart |
 | §13 ACK exhaustion "clean restart" | clean-only | next runtime start, including unclean |
 | `status`/read-only local inspection | not explicitly a restart | non-mutating; never advances generation |

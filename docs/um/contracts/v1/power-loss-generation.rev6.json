@@ -42,8 +42,9 @@
           "boot_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
           "last_seq": 4,
           "report_dedupe": {
-            "r-rev6-ack-loss": "fp-rev6-a"
-          }
+            "r-rev6-ack-loss": "sha256:body-rev6-a"
+          },
+          "last_fingerprint": "fp-rev6-a"
         },
         "agent": {
           "generation": 3,
@@ -58,7 +59,13 @@
         "seq": 4,
         "fingerprint": "fp-rev6-a",
         "report_id": "r-rev6-ack-loss",
-        "payload_identity_preserved": true
+        "payload_identity_preserved": true,
+        "payload_identity": {
+          "report_id": "r-rev6-ack-loss",
+          "collected_at": 1795622400,
+          "type": "snapshot",
+          "body_sha256": "body-rev6-a"
+        }
       },
       "expected": {
         "http_status": 200,
@@ -72,7 +79,9 @@
           "next_seq": 5
         },
         "data": "no_second_copy"
-      }
+      },
+      "owner_slice": "UM-B1/UM-B2",
+      "executed_by": "UM-B3"
     },
     {
       "id": "AMEND-REC-27-B",
@@ -86,8 +95,9 @@
           "boot_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
           "last_seq": 4,
           "report_dedupe": {
-            "r-rev6-restart": "fp-rev6-b-old"
-          }
+            "r-rev6-restart": "sha256:body-rev6-b"
+          },
+          "last_fingerprint": "fp-rev6-b-old"
         },
         "agent": {
           "generation": 4,
@@ -102,7 +112,13 @@
         "seq": 1,
         "fingerprint": "fp-rev6-b-new",
         "report_id": "r-rev6-restart",
-        "payload_identity_preserved": true
+        "payload_identity_preserved": true,
+        "payload_identity": {
+          "report_id": "r-rev6-restart",
+          "collected_at": 1795622400,
+          "type": "snapshot",
+          "body_sha256": "body-rev6-b"
+        }
       },
       "expected": {
         "http_status": 200,
@@ -116,8 +132,16 @@
           "next_seq": 2
         },
         "data": "no_second_copy",
-        "reported_payload_unchanged": true
-      }
+        "reported_payload_unchanged": true,
+        "payload_identity": {
+          "report_id": "r-rev6-restart",
+          "collected_at": 1795622400,
+          "type": "snapshot",
+          "body_sha256": "body-rev6-b"
+        }
+      },
+      "owner_slice": "UM-B1/UM-B2",
+      "executed_by": "UM-B3"
     },
     {
       "id": "AMEND-REC-27-C",
@@ -132,7 +156,8 @@
           "last_seq": 1,
           "report_dedupe": {
             "r-rev6-restart": "fp-rev6-b-new"
-          }
+          },
+          "last_fingerprint": "fp-rev6-b-new"
         }
       },
       "attempt": {
@@ -148,7 +173,9 @@
         "result": "rejected",
         "error": "stale_boot_generation",
         "center_state_change": "none"
-      }
+      },
+      "owner_slice": "UM-B1/UM-B2",
+      "executed_by": "UM-B3"
     },
     {
       "id": "AMEND-REC-27-D",
@@ -170,7 +197,9 @@
         "state_change": "none",
         "spool_change": "none",
         "network_required": false
-      }
+      },
+      "owner_slice": "UM-B3",
+      "executed_by": "UM-B3"
     },
     {
       "id": "AMEND-REC-27-E",
@@ -182,7 +211,8 @@
         "center": {
           "highest_gen": 3,
           "boot_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-          "last_seq": 4
+          "last_seq": 4,
+          "last_fingerprint": "fp-rev6-a"
         }
       },
       "attempt": {
@@ -198,7 +228,9 @@
         "result": "rejected",
         "error": "boot_identity_conflict",
         "center_state_change": "none"
-      }
+      },
+      "owner_slice": "UM-B1/UM-B2",
+      "executed_by": "UM-B3"
     },
     {
       "id": "AMEND-REC-27-F",
@@ -210,7 +242,8 @@
         "center": {
           "highest_gen": 3,
           "boot_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-          "last_seq": 4
+          "last_seq": 4,
+          "last_fingerprint": "fp-rev6-a"
         },
         "agent": {
           "generation": 6,
@@ -239,7 +272,9 @@
         },
         "gap": 3,
         "gap_audit": "boot_generation_gap"
-      }
+      },
+      "owner_slice": "UM-B1/UM-B2",
+      "executed_by": "UM-B3"
     }
   ],
   "executable_requirements": [
@@ -260,5 +295,32 @@
     "rec04_new_generation_first_duplicate_compatible": true,
     "rec30_oldest_first_replay_compatible": true,
     "new_case_required_for_restart_duplicate": true
-  }
+  },
+  "release_base_commit": "54efc81c0f2b72f61e4b70e7aaad1e0d4e41e411",
+  "release_base_tree": "8991f684b9974dd2336e747b57a7c4115229418d",
+  "effective_on": "normal merge commit of release PR #132",
+  "slice_ownership": {
+    "UM-B1": [
+      "AMEND-REC-27-C",
+      "AMEND-REC-27-E",
+      "AMEND-REC-27-F"
+    ],
+    "UM-B2": [
+      "AMEND-REC-27-A",
+      "AMEND-REC-27-B",
+      "AMEND-REC-27-C",
+      "AMEND-REC-27-E",
+      "AMEND-REC-27-F"
+    ],
+    "UM-B3": [
+      "AMEND-REC-27-A",
+      "AMEND-REC-27-B",
+      "AMEND-REC-27-C",
+      "AMEND-REC-27-D",
+      "AMEND-REC-27-E",
+      "AMEND-REC-27-F"
+    ]
+  },
+  "publication_state": "PENDING_RELEASE_MERGE",
+  "normative_effective_on": "merge of release PR #132"
 }

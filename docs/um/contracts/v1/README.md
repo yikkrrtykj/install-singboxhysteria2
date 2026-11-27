@@ -1,6 +1,8 @@
 # UM contracts v1 (revision 5 base + revision 6 power-loss overlay)
 
-Frozen machine-readable contracts for Unified Monitor node protocol v1 revision 5.
+Frozen machine-readable contracts for Unified Monitor node protocol v1 revision 5,
+plus the approved additive revision-6 power-loss overlay (effective only on the
+rev-6 contract-release merge).
 Normative prose: [`../../um-a/04-node-protocol-v1.md`](../../um-a/04-node-protocol-v1.md) revision 5, plus the
 revision-6 normative overlay [`../../um-a/04-node-protocol-v1.rev6.md`](../../um-a/04-node-protocol-v1.rev6.md)
 for power-loss/process-restart generation semantics.
@@ -92,8 +94,9 @@ part of the protocol, not JSON Schema fields; doc 04 §2–§3 is normative.
 
 ## Revision 6 (power-loss generation)
 
-`power-loss-generation.rev6.json` is the normative machine-readable fixture for
-restart/power-loss generation semantics. It is additive; revision-5 schemas,
+`power-loss-generation.rev6.json` is the approved normative machine-readable
+fixture for restart/power-loss generation semantics, effective on the rev-6
+contract-release merge. It is additive; revision-5 schemas,
 vectors and historical expectations remain unchanged. Normative prose is the
 rev-6 overlay above. Cases AMEND-REC-27-A..F must be executed by real
 HTTP/SQLite/agent/process tests, including the agent `status` non-mutation case;

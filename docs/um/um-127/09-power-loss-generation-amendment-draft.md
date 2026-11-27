@@ -3,7 +3,7 @@
 - Status: **DRAFT / HISTORICAL PROPOSAL — direction approved for rev-6; normative
   release is the rev-6 overlay, effective only after the contract-release merge.**
 - Base: `docs/um/um-a/04-node-protocol-v1.md` revision 5 (frozen), especially
-  §5, §6.1, §6.4, the recovery-case table, and REC-27.
+  §5, §6.1, §6.3, the recovery-case table, and REC-27.
 - Scope: only the ambiguity between "normal restart increments generation" and
   the power-loss row / REC-27 exact-duplicate wording.
 - Tracking: issue #127, B3 implementation Draft PR #131, and this amendment
@@ -31,7 +31,7 @@ time for an unclean restart:
 1. `X-UM-Boot-Gen` is "monotonically increased by exactly 1 per normal agent
    restart" (§2 headers).
 2. The recovery table says "Power loss on agent: ... persisted generation
-   increments on restart" (§6.4).
+   increments on restart" (§6.3).
 3. REC-27 says "Agent power loss, seq persistence edge: resend committed seq ->
    duplicate; unsynced seq never reused". Its normative setup is a power-loss
    after agent generation 3/boot b3/seq 4 and its agent action says "resume from
@@ -138,7 +138,7 @@ edited by this PR; the amendment records precedence):
 | Rev-5 location | Current ambiguous read | Proposed read / status |
 | --- | --- | --- |
 | §2 `X-UM-Boot-Gen` / §6.1 "normal restart" | only clean restart increments | every enrolled runtime start, clean or unclean, increments once; **clarified** |
-| §6.4 power-loss row "persisted generation increments on restart" | conflicts with clean-only rule | confirmed for all restarts; **clarified** |
+| §6.3 power-loss row "persisted generation increments on restart" | conflicts with clean-only rule | confirmed for all restarts; **clarified** |
 | §6.3 and the other "clean restart" exhaustion clauses (§301, §378–379, §452, §977) | clean-only | next runtime start, including after power loss; **clarified** |
 | REC-27 setup gen3/b3/seq4, agent action "resume from persisted seq" | same-generation agent replay after power loss | **agent action superseded** by REC-27-B; old same-generation center duplicate expectation maps to REC-27-A, the new-generation duplicate is REC-27-B |
 | REC-04 lost-ACK + restart | already new-generation duplicate | unchanged and consistent |

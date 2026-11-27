@@ -25,9 +25,11 @@
 
 | 对象 | 状态（2026-11-26 核对） |
 | --- | --- |
-| `main` | `885171c0`（PR #125 merge），CI 绿；无分支保护（流程风险） |
-| PR #126 | OPEN + Draft；**rev-5 HEAD `048fc170`**，tree `1b726de9…`；相对 Round-1 新增 `docs(um): freeze rev-5 final contract`；独立 review 仍无 GitHub 记录；CI 以 PR 检查为准（含已知 Windows harness flake 的 recorded rerun） |
-| PR #128 | OPEN + Draft；本 PR 保留，不做 PR-A2；本轮把规划基线同步到 rev-5；仍需独立 review 与 Owner merge 授权 |
+| `main` | `54efc81c`（PR #130 merge），rev-5 已发布；CI 绿 |
+| PR #126 | **MERGED**（merge `8f1b9ac1`，2026-11-26）——rev-5 publication |
+| PR #128 | **MERGED**（merge `e889a191`，2026-11-26）——规划同步 |
+| PR #132 | OPEN + Draft；rev-6 overlay/fixture/Owner 决策；条件式 Owner merge 授权；待独立审查/CI/merge |
+| PR #131 | OPEN + Draft；B3 候选 HEAD `564f658d`；rev-6 合并后同步并重审；**无合并授权** |
 | Go 分支 | `codex/um-windows-foundation` @ `24cfd2ff`；3 个开发提交（`17b2f3e2`/`758e75be`/`24cfd2ff`）；CI run `45706557111` 双平台绿；基于 rev-3，不含 rev-5；**分支与提交保持不动** |
 | #48 | **CLOSED / completed**（2026-11-25T20:49:12Z，已实时核实）；#33/#67 OPEN 且未变 |
 | Owner Round-2 结论 | #128 计划 PASS；恢复设计方向 ACCEPTED；双平台架构 PASS；Go 路线 PASS；最终契约需 targeted update（已在 #126 rev-5 完成）；CI PASS with recorded rerun；**merge/deployment 仍需单独 Owner 授权** |
@@ -48,7 +50,7 @@
 | [02-dual-platform-contract.md](02-dual-platform-contract.md) | node_class、六路径 Windows 遥测、版本化映射、R2/R1、平台隔离与隐私（最终契约版） |
 | [03-recovery-semantics.md](03-recovery-semantics.md) | A-1..A-5 在 rev-5 中的规范性结果、REC-01..REC-30 关联、数值/存储与旋转规则、决策状态 |
 | [04-implementation-plan.md](04-implementation-plan.md) | 实施门禁与顺序、Go 复用/差距、UM-B1..UM-G、Go 分支同步、CI 要求（无 PR-A2） |
-| [05-owner-decisions.md](05-owner-decisions.md) | 18 项既有 + rev-5 方向/运行参数 + 门禁登记；全部非 APPROVED |
+| [05-owner-decisions.md](05-owner-decisions.md) | 18 项既有 + rev-5 方向/运行参数 + rev-6 有限批准/门禁；其余 PENDING |
 | [conformance/transport-recovery.cases.json](conformance/transport-recovery.cases.json) | UM-B1/B2/B3 规范性恢复用例（REC-01..REC-30，rev-5 绑定） |
 | [09-power-loss-generation-amendment-draft.md](09-power-loss-generation-amendment-draft.md) | proposal/history for the power-loss/process-restart amendment and old REC-27 remap; superseded normatively by the rev-6 overlay once merged |
 | [10-owner-decisions-rev6.md](10-owner-decisions-rev6.md) | **Owner decision record (2026-11-27)**: OD-P3 R1 architecture, OD-P7 virtual account, Linux sing-box limitation, power-loss/rev-6 approval, merge scope/limits |
@@ -58,10 +60,10 @@
 
 0. rev-6: Owner 决策已记录；#132 需独立审查 PASS、required checks 全绿、无阻塞线程和精确基线，随后按普通 Merge Commit 合并并验证 main；只有合并后的 main 状态才可标记 `REV-6 PUBLISHED / FROZEN / VERIFIED`。#131 不获合并授权，需在 rev-6 基线下重新审查/CI 并等待 Owner 单独授权。
 
-1. 独立审查 #126 rev-5（独立于 owner Round-2 方向），Owner 给合并授权 → 普通 Merge Commit 合并 #126 → 确认 main CI。
-2. #128 完成独立审查/合并门禁 → 合并 #128（保留原 PR，不建 PR-A2）。
-3. 最新 main CI 通过后，Owner 授权同步 Go 分支：保留 `17b2f3e2`/`758e75be`/`24cfd2ff`，不 rebase、不 force-push，`docs/um` 与 main 完全一致，不因旧 Go 签名测试失败回退新契约。
-4. 进入 UM-B1：复用 `um/internal/wire`、`windowsobs`、`cmd/um-windows-observe`、`um-go.yml`；交付最终契约向量、SQLite 数据层、恢复状态机与自动化一致性测试；Windows 观察器保持实验组件、不服务化、不接入生产。
+1. rev-6：在独立审查 PASS、exact HEAD CI 全绿、无阻塞线程、精确 base 一致后，按普通 Merge Commit 合并 PR #132，并验证 merge parents/tree/main CI；只有该状态可标记 `REV-6 PUBLISHED / FROZEN / VERIFIED`。
+2. rev-6 合并后，普通 merge main 到 B3 分支 `codex/um-b3-agents`（不 rebase/force）；更新 amendment-pending 文档并接入正式 REC-27-A..F。
+3. B3 最终回归/真实 lab/独立 review；#131 仍保持 Draft，等待 Owner 单独合并授权。
+4. 不创建 PR-A2/重复 B3 PR；UM-B4+ 与生产部署继续 HOLD。
 
 ## 6. 开发边界（本轮再次确认）
 
@@ -76,4 +78,4 @@
 
 - 本 PR 为 docs-only；#126 rev-5 的 schema/向量验证结果为：10 个 schema 有效、10 个正例通过、7 个 schema 负例被拒绝、2 个 runtime-only 负例 schema 有效；report/Windows-terminal/enroll/rotate/config 签名向量全部验证通过；45→67 个 behavioural cases（22 个 rev-5 新增）；历史向量可追溯。
 - 本 PR 的 JSON 用例、链接、编码与敏感值检查在本地完成；CI 只运行仓库既有回归检查（现有 workflow 不读取 `docs/um/`）。
-- 所有 owner 决策仍未批准；本 PR 与 #126 均需独立 review 和 Owner 授权才可合并。
+- rev-6 有限 Owner 决策已记录；其余 owner 决策仍 PENDING。rev-6 需独立 review/CI/merge；B3 #131 仍需 Owner 单独合并授权。
