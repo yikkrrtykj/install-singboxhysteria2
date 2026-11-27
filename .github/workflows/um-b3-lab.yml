@@ -1,0 +1,57 @@
+name: UM-B3 isolated service labs
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-service-environment:
+    name: windows-service-environment
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Probe Windows service/virtual-account capability
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Host "whoami: $(whoami)"
+          whoami /groups | Out-String | Write-Host
+          sc.exe query | Out-String | Write-Host
+          New-Service -Name 'um-lab-env' -BinaryPathName 'cmd.exe /c ping -n 30 127.0.0.1 >nul' -StartupType Demand | Out-Null
+          try {
+            & sc.exe config um-lab-env obj= "NT SERVICE\um-lab-env" password= "" | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "sc config virtual account failed: $LASTEXITCODE" }
+            & sc.exe qc um-lab-env | Out-String | Write-Host
+            Start-Service um-lab-env
+            Start-Sleep -Seconds 2
+            Get-Service um-lab-env | Format-List Name,Status,StartType | Out-String | Write-Host
+            Get-CimInstance Win32_Service -Filter "Name='um-lab-env'" | Select-Object Name,StartName,State,ProcessId | Format-List | Out-String | Write-Host
+            & sc.exe showsid um-lab-env | Out-String | Write-Host
+            Stop-Service um-lab-env -Force
+          } finally {
+            & sc.exe delete um-lab-env | Out-Null
+          }
+
+  linux-systemd-environment:
+    name: linux-systemd-environment
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Probe systemd/D-Bus capability
+        shell: bash
+        run: |
+          set -euxo pipefail
+          systemctl is-system-running || true
+          systemctl --version | head -n 2
+          systemd-analyze --version | head -n 2
+          systemd-analyze verify um/deploy/linux/um-agent.service
+          sudo systemctl status --no-pager || true
+          busctl --system list | head -n 20
