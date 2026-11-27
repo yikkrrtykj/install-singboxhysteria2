@@ -20,6 +20,7 @@ $contracts = Join-Path $repo 'docs\um\contracts\v1'
 $agent = Join-Path $lab 'um-agent.exe'
 $center = Join-Path $lab 'um-center.exe'
 $labtool = Join-Path $lab 'um-lab.exe'
+$labSvc = Join-Path $lab 'um-lab-service.exe'
 $tokenFile = Join-Path $lab 'bootstrap.token'
 $profilePath = Join-Path $lab 'mihomo-profile.json'
 $secretPath = Join-Path $lab 'mihomo.secret'
@@ -86,6 +87,7 @@ try {
   Invoke-Native 'go' @('build', '-trimpath', '-o', $agent, './cmd/um-agent')
   Invoke-Native 'go' @('build', '-trimpath', '-o', $center, './cmd/um-center')
   Invoke-Native 'go' @('build', '-trimpath', '-o', $labtool, './cmd/um-lab')
+  Invoke-Native 'go' @('build', '-trimpath', '-o', $labSvc, './cmd/um-lab-service')
 } finally { Pop-Location }
 
 # ---------------------------------------------------------------------------
@@ -106,7 +108,7 @@ if (-not $healthy) { Fail 'center did not become healthy' }
 # ---------------------------------------------------------------------------
 # Service account + enrollment under that account (DPAPI CurrentUser).
 # ---------------------------------------------------------------------------
-$enrollPath = '"' + $agent + '" enroll --state-dir "' + $state + '" --center "http://127.0.0.1:18080" --node-class windows_terminal --token-file "' + $tokenFile + '"'
+$enrollPath = '"' + $labSvc + '" "' + $agent + '" enroll --state-dir "' + $state + '" --center "http://127.0.0.1:18080" --node-class windows_terminal --token-file "' + $tokenFile + '"'
 Invoke-Native 'sc.exe' @('create', $svc, 'binPath=', $enrollPath, 'start=', 'demand', 'obj=', "NT SERVICE\$svc")
 Invoke-Native 'sc.exe' @('sidtype', $svc, 'unrestricted')
 $sid = Get-ServiceSid $svc
@@ -129,7 +131,7 @@ if ($qc -notmatch [regex]::Escape("NT SERVICE\$svc")) { Fail 'SCM start account 
 # Rotation provisional key must also be DPAPI protected. Run rotate through the
 # same temporary service; the actual service later recovers the proof.
 # ---------------------------------------------------------------------------
-$rotatePath = '"' + $agent + '" rotate --state-dir "' + $state + '" --center "http://127.0.0.1:18080" --node-class windows_terminal'
+$rotatePath = '"' + $labSvc + '" "' + $agent + '" rotate --state-dir "' + $state + '" --center "http://127.0.0.1:18080" --node-class windows_terminal'
 Set-AgentService $rotatePath
 Start-Service -Name $svc
 Wait-ServiceStatus $svc 'Stopped'
@@ -189,7 +191,7 @@ Invoke-Native 'icacls' @($profilePath, '/grant', "*${sid}:R")
 Invoke-Native 'icacls' @($secretPath, '/grant', "*${sid}:R")
 
 # Provision the protected R1 bundle through the same service account.
-$provisionPath = '"' + $agent + '" r1-provision --state-dir "' + $state + '" --profile "' + $profilePath + '" --secret-file "' + $secretPath + '" --owner-reference "OD-P3-R1/isolated-lab/windows-github-actions"'
+$provisionPath = '"' + $labSvc + '" "' + $agent + '" r1-provision --state-dir "' + $state + '" --profile "' + $profilePath + '" --secret-file "' + $secretPath + '" --owner-reference "OD-P3-R1/isolated-lab/windows-github-actions"'
 Set-AgentService $provisionPath
 Start-Service -Name $svc
 Wait-ServiceStatus $svc 'Stopped'
