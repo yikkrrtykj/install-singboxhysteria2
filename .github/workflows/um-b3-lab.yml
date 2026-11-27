@@ -1,0 +1,129 @@
+name: UM-B3 isolated service labs
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/um-b3-lab.yml'
+      - 'um/deploy/lab/**'
+      - 'um/cmd/um-lab/**'
+
+permissions:
+  contents: read
+
+jobs:
+  windows-service-environment:
+    name: windows-service-environment
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Probe Windows service/virtual-account capability
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Host "whoami: $(whoami)"
+          whoami /groups | Out-String | Write-Host
+          sc.exe query | Out-String | Write-Host
+          foreach ($name in @('um-lab-local','um-lab-virtual','um-lab-user','um-lab-virt2')) {
+            & sc.exe delete $name | Out-Null
+          }
+          $bin = 'cmd.exe /c ping -n 30 127.0.0.1 >nul'
+          foreach ($variant in @(
+            @{ Name='um-lab-local'; Account='NT AUTHORITY\LocalService'; Password=$null },
+            @{ Name='um-lab-virtual'; Account='NT SERVICE\um-lab-virtual'; Password=$null }
+          )) {
+            Write-Host "=== attempting $($variant.Name) as $($variant.Account) ==="
+            $args = @('create', $variant.Name, 'binPath=', $bin, 'start=', 'demand', 'obj=', $variant.Account)
+            if ($null -ne $variant.Password) { $args += @('password=', $variant.Password) }
+            & sc.exe @args 2>&1 | Write-Host
+            Write-Host "sc create exit=$LASTEXITCODE"
+            if ($LASTEXITCODE -eq 0) {
+              & sc.exe sidtype $variant.Name unrestricted 2>&1 | Write-Host
+              & sc.exe qc $variant.Name | Out-String | Write-Host
+              Start-Service $variant.Name -ErrorAction SilentlyContinue
+              Start-Sleep -Seconds 1
+              Get-CimInstance Win32_Service -Filter "Name='$($variant.Name)'" | Select-Object Name,StartName,State,ProcessId | Format-List | Out-String | Write-Host
+              & sc.exe showsid $variant.Name | Out-String | Write-Host
+              Stop-Service $variant.Name -Force -ErrorAction SilentlyContinue
+              & sc.exe delete $variant.Name | Out-Null
+            }
+          }
+          Write-Host "windows-service-environment: probe complete"
+          exit 0
+  linux-systemd-environment:
+    name: linux-systemd-environment
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Probe systemd/D-Bus capability
+        shell: bash
+        run: |
+          set -euxo pipefail
+          systemctl is-system-running || true
+          systemctl --version | head -n 2
+          systemd-analyze --version | head -n 2
+          sudo mkdir -p /usr/local/libexec
+          printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/libexec/um-agent >/dev/null
+          sudo chmod 0755 /usr/local/libexec/um-agent
+          systemd-analyze verify um/deploy/linux/um-agent.service
+          sudo systemctl status --no-pager || true
+          (busctl --system list || dbus-send --system --dest=org.freedesktop.DBus --type=method_call --print-reply / org.freedesktop.DBus.ListNames) | head -n 20
+
+  linux-systemd-agent-lab:
+    name: linux-systemd-agent-lab
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.4'
+          cache: true
+          cache-dependency-path: um/go.sum
+      - name: Run isolated systemd/D-Bus agent lab
+        shell: bash
+        run: |
+          sudo -E bash um/deploy/lab/linux-systemd-lab.sh
+
+  windows-service-r1-lab:
+    name: windows-service-r1-lab
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.4'
+          cache: true
+          cache-dependency-path: um/go.sum
+      - name: Run isolated Windows SCM/DPAPI/R1 lab
+        shell: pwsh
+        run: |
+          ./um/deploy/lab/windows-service-r1-lab.ps1
+
+  linux-singbox-serviceapi-lab:
+    name: linux-singbox-serviceapi-lab
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.4'
+          cache: true
+          cache-dependency-path: um/go.sum
+      - name: Run isolated real sing-box service.api lab
+        shell: bash
+        run: bash um/deploy/lab/singbox-serviceapi-lab.sh

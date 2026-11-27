@@ -1,0 +1,44 @@
+{
+  "record": "UM-B3-R1-ISOLATED-LAB-ACCEPTANCE",
+  "version": 1,
+  "date": "2026-11-27",
+  "decision_source": "Owner B3 Final Closure instruction (issue #127 / Draft PR #131)",
+  "scope": "isolated_development_lab_only",
+  "status": "R1_LAB_AUTHORIZED",
+  "production_status": "R1_PRODUCTION_ENABLEMENT_HOLD",
+  "r2_status": "INFEASIBLE_TESTED_SURFACES_FULL_MATRIX_UNVERIFIED",
+  "accepted_risks": [
+    "The Mihomo controller credential is write-capable even when the agent only performs GET.",
+    "A GET-only client is not a server-side read-only authorization.",
+    "The credential must not be shared with a production application or rotated by the agent."
+  ],
+  "required_controls": [
+    "literal loopback TCP only",
+    "fixed GET /proxies and GET /connections only",
+    "no arbitrary URL/path/method or generic RPC",
+    "no redirects, proxy environment or DNS indirection",
+    "bounded response, timeout and resource controls",
+    "non-admin service account",
+    "DPAPI CurrentUser sealed controller secret with private DACL",
+    "no secret in logs, CLI arguments, environment values, center config or telemetry",
+    "operator-local route bindings",
+    "independent selection and active_connections sampling with six frozen tokens",
+    "no changes to Mihomo/Clash Verge Rev/HA configuration, selection, or connections"
+  ],
+  "forbidden": [
+    "production enablement without separate Owner authorization",
+    "unauthenticated write-capable named pipe",
+    "new write-capable bridge process without a new trust-boundary decision",
+    "LocalSystem service account",
+    "automatic DPAPI LocalMachine fallback",
+    "real business controller secret use"
+  ],
+  "activation_bundle": {
+    "directory": "<state>/r1",
+    "acceptance": "acceptance.json",
+    "profile": "profile.json",
+    "protected_secret": "controller.secret.dpapi",
+    "provisioner": "um-agent r1-provision (same service account)",
+    "environment_bypass": false
+  }
+}

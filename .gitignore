@@ -10,3 +10,16 @@ sc-bin/
 # HA-UI Windows build/test artifacts (never committed; EXE via CI artifacts)
 /dist/
 /.scratch/
+
+# UM Go build/test artifacts (never committed; CI builds them)
+/um/um-agent
+/um/um-agent.exe
+/um/um-lab
+/um/um-lab.exe
+/um/um-lab-service
+/um/um-lab-service.exe
+/um/um-center
+/um/um-center.exe
+/um/coverage.out
+/um/cover
+/um/$cov

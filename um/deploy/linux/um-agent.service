@@ -1,0 +1,99 @@
+# UM-B3 Draft systemd unit template — not installed by this repository itself.
+#
+# See um/docs/um-b3-runbook.md and um/docs/um-b3-architecture.md.
+# The reviewed one-shot installer (install-agent.sh) installs this unit after the
+# operator chooses --apply. It starts/enables the service only with the explicit
+# --start-service flag.
+#
+# Contract notes (docs/um/um-a/04-node-protocol-v1.md §11):
+#  - runtime user is the non-login `umagent`; no root resident process;
+#  - the agent is read-only, has no listening socket and no fork/exec capability;
+#  - it writes only /var/lib/um-agent (0700) and contacts only the center origin;
+#  - unit-state reads use the read-only systemd D-Bus client
+#    (`ActiveState` only) — never `systemctl` execution;
+#  - "no exec" is enforced by the noexec drop-in (um-agent-noexec.conf,
+#    systemd >= 248). Blocking execve/execveat in SystemCallFilter= is NOT used:
+#    systemd applies the filter before the service binary exec, so that would
+#    prevent the unit from starting and would be a fake proof.
+#  - no sing-box service.api credential is loaded in this release: the P1-10
+#    audit failed and there is no environment/LoadCredential/center enablement
+#    path until a separately approved versioned mechanism exists.
+
+[Unit]
+Description=UM agent (unified monitor node agent, linux_vps class)
+Documentation=file:/usr/local/share/doc/um-agent/um-b3-runbook.md
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=umagent
+Group=umagent
+# Created/chowned by systemd and writable despite ProtectSystem=strict; the
+# installer also pre-creates it 0700 umagent:umagent.
+StateDirectory=um-agent
+StateDirectoryMode=0700
+EnvironmentFile=/etc/um-agent/agent.env
+ExecStart=/usr/local/libexec/um-agent run
+# The planned CLI (subject to the B3 code slice) reads:
+#   UM_AGENT_STATE_DIR, UM_AGENT_CENTER_URL, UM_AGENT_NODE_CLASS
+# from the environment file written by install-agent.sh. If the final code slice
+# changes the flags, update /etc/um-agent/agent.env / this ExecStart together.
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+UMask=0077
+
+# ---- privilege/sandbox hardening -------------------------------------------
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+# /proc global files (stat, meminfo, net/dev, diskstats, loadavg, uptime) are
+# still visible with ProcSubset=all; per-PID visibility is restricted above.
+ProcSubset=all
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+KeyringMode=private
+SystemCallArchitectures=native
+# Allow-list for a normal system service. execve/execveat are implicitly
+# allowed by systemd for the initial service-binary exec; the real no-exec
+# boundary is the mount-based NoExecPaths= drop-in, not this filter.
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @mount @obsolete @debug @cpu-emulation @swap @reboot @module @raw-io
+
+# Writable state only (defense in depth with StateDirectory=).
+ReadWritePaths=/var/lib/um-agent
+
+# ---- resource bounds (contract budgets: RSS < 64 MiB, CPU < 1%) --------------
+MemoryMax=96M
+TasksMax=32
+CPUQuota=20%
+
+# ---- data sources (DISABLED; no supported service.api enablement)
+# The systemd D-Bus ActiveState probe is read-only and may be left available;
+# center `collect.services` remains false by default. The sing-box service.api
+# source is unavailable in this release: the v1.14.5 P1-10 authorization audit
+# failed because the credential is write-capable. No environment variable,
+# LoadCredential path or center switch authorizes it until a separately approved
+# versioned mechanism exists.
+
+[Install]
+WantedBy=multi-user.target
