@@ -125,36 +125,36 @@ whose real-environment verification is the substance of the claim.
 | --- | --- | --- | --- | --- | --- |
 | 1 | Ed25519 identity generated on node; private key local only; enrollment signed, `node_class` from build; response class verified | B3.1 | `04` §3–§4, §11 | `um/internal/agent/{state,client,runtime}.go` | IMPLEMENTED |
 | 2 | Enrollment token over stdin/pipe as `umagent`; root token file not agent-readable; token deleted by installer after success; no resident root process | B3.1/B3.4 | `04` §4, §11; P1-03 | installer template `um/deploy/linux/install-agent.sh`; runbook | IMPLEMENTED (template; not executed) |
-| 3 | Atomic fsync boot state: generation +1 per normal restart, new random boot id, seq persist-before-send; corrupt/missing boot state = fail-closed `boot_state_corrupt` (never reset) | B3.1 | `04` §5, §6.1; REC-17/18/27 | `state.go` (`writeAtomic`, boot validation), `runtime.go` recovery | IMPLEMENTED |
-| 4 | Single-agent/single-writer rule (state-directory lock, no two instances per node) | B3.1 | `04` §6.1 | `state.go` lock | IMPLEMENTED |
-| 5 | Durable report spool: 32 MiB / 7 d, file+dir fsync before first send, oldest-first, ack-only removal, corrupt/terminal quarantine, age retention at startup and during a long outage, **over-capacity fail-closed (no silent eviction of fsynced records)** | B3.1 | `04` §11, §6.2 | `spool.go` | IMPLEMENTED |
+| 3 | Atomic fsync boot state: generation +1 on every enrolled runtime start (clean or unclean), new random boot id, seq persist-before-send; corrupt/missing boot state = fail-closed `boot_state_corrupt` (never reset) | B3.1 | `04` §5, §6.1; REC-17/18/27; proposed power-loss amendment | `state.go` (`writeAtomic`, boot validation), `runtime.go` recovery; live center tests for same-runtime vs restart duplicate | IMPLEMENTED; acceptance DEPENDS ON DRAFT AMENDMENT PR #132 (not frozen) |
+| 4 | Single-agent/single-writer rule (OS advisory lock, no PID stale-lock removal, no two instances per node); symlink/reparse state-path rejection | B3.1 | `04` §6.1 | `state.go` lock + `lock_{unix,windows}.go`, path checks | IMPLEMENTED |
+| 5 | Durable report spool: 32 MiB / 7 d, fsync-before-send, same-second seq ordering, oldest-first, ack-only removal, hash-bound quarantine, age retention during outage, **over-capacity fail-closed** | B3.1 | `04` §11, §6.2 | `spool.go` + same-second/quarantine tests | IMPLEMENTED |
 | 6 | ACK adoption: `max(local_next_seq, ack.next_seq)`, `next_seq:null` exhaustion → new generation or operator recovery; no seq reuse/wrap | B3.1 | `04` §5, §13; REC-26 | `runtime.go` `applyAck`/`nextAttempt` | IMPLEMENTED |
 | 7 | Retry policy: 1→60 s bounded backoff; 5xx/429/transport retryable; stale_timestamp clock recalibration; non-retryable payload quarantine; auth/sequence/boot/revocation stop the queue | B3.1 | `04` §6.2, §8; REC-10/15/16/21 | `runtime.go` `Drive`, `errors.go` | IMPLEMENTED |
 | 8 | Rotation intent recovery: persist nonce/new key before send, restart replay, `rotation_expired` abort path, new-key proof confirmation, revocation wins, no bypass of high-water | B3.1 | `04` §7; REC-19/20/21 | `runtime.go` `Rotate`, state rotation file | IMPLEMENTED |
 | 9 | Config pull exactly `{}` on the wire, response validated, class/source allowlist, fail-closed defaults (`collect` switches false), no center push | B3.1 | `04` §7, §9.1 | `client.go`, `runtime.go`; center enforces | IMPLEMENTED |
 | 10 | Agent-side privacy: no local names/IPs/URLs/process names/connection ids/credentials/YAML in bodies, logs or state diagnostics; closed error logging | B3.1 | `04` §9.3; `06` SEC-14 extension | collector contract + runtime status (no payload logging); negative tests | IMPLEMENTED + MOCK-UNIT PASS (see §5) |
 | 11 | Linux `/proc` read-only system counters (CPU/mem/disk/net), no subprocess, no root; honest UNKNOWN/UNAVAILABLE | B3.2 | `04` §11 | `um/internal/linuxobs/{collector,procfs,system,disk}.go` + synthetic-fixture tests | MOCK-UNIT PASS (synthetic procfs; not a real-host proof) |
-| 12 | Linux systemd unit state via read-only D-Bus `ActiveState`; unavailable → UNKNOWN; no `systemctl` exec fallback | B3.2 | `04` §11; P1-03 | `linuxobs.SystemdDBusProbe` (godbus v5.2.4, fixed GetUnit+Properties.Get, FlagNoAutoStart, no write/exec/root) + exact-call/security tests; CLI injection; honest unavailable fallback | IMPLEMENTED + MOCK-UNIT PASS; real systemd lab HOLD (no Linux host) |
+| 12 | Linux systemd unit state via read-only D-Bus `ActiveState`; unavailable → UNKNOWN; no `systemctl` exec fallback | B3.2 | `04` §11; P1-03 | `linuxobs.SystemdDBusProbe` (godbus v5.2.4, fixed GetUnit+Properties.Get, FlagNoAutoStart, no write/exec/root) + exact-call/security tests; isolated Ubuntu 24.04 workflow read a real synthetic `sing-box.service` and persisted `services:[{state:"active"}]` | **REAL LAB-REAL PASS on systemd 255 / Ubuntu 24.04 (isolated workflow)**; target VPS matrix broader |
 | 13 | Linux `singbox_api` disabled by default; server-side authorization audit required before enable; unproven source → honest `unavailable`, no fallback credential | B3.2 | `04` §11 (P1-10); SEC-39 | Official service.api gRPC-Web client/accumulator (`serviceapi*.go`), synthetic fixtures + isolated sing-box 1.14.5 lab; legacy Clash client compatibility only; G7 `agent_error code=source_authorization_unproven` implemented/tested; source stays off | IMPLEMENTED + MOCK-UNIT/LAB-REAL (isolated synthetic sing-box); P1-10 audit + source enablement HOLD |
-| 14 | Linux no-exec/least-privilege runtime: non-root `umagent`, no listener, no exec/root/sudo/shell/systemctl, only own state dir writable; `LoadCredential` for API secrets; source permissions unchanged | B3.2/B3.4 | `04` §11; `03` §11; SEC-31/32/33 | `um-agent.service` + noexec drop-in + runbook | IMPLEMENTED (template); INTEGRATION DEFERRED (systemd lab) |
+| 14 | Linux no-exec/least-privilege runtime: non-root `umagent`, no listener, no exec/root/sudo/shell/systemctl, only own state dir writable; `LoadCredential` for API secrets; source permissions unchanged | B3.2/B3.4 | `04` §11; `03` §11; SEC-31/32/33 | installer + unit + noexec whitelist; isolated systemd workflow verified non-root, no listener, state 0700, NoExecPaths present and restart-safe | **REAL LAB PASS on systemd 255 (isolated)**; target-version matrix broader |
 | 15 | Windows six-token projection of `windowsobs` data; exactly one role enum; independent `selection`/`active_connections` sampling; `direct` only with explicit operator-local binding, otherwise `unknown`/null | B3.3 | `04` §9.2; `02` §2 | `windowsobs` six-token `Role`/`Tokens()` + `windowsagent` collector unit tests | MOCK-UNIT PASS |
 | 16 | Windows honesty: availability coherence, sum equality when `ok`, empty list = observed zero, missing/malformed = unknown/unavailable, no fabricated data | B3.3 | `04` §9.2; SEC-33/45 | `windowsagent/collector_test.go` synthetic observer cases | MOCK-UNIT PASS |
 | 17 | Windows read-only/HA: no config write, no node switch, no connection close, no HA-UI/P6/#67 change; local proxy names never leave host | B3.3 | `04` §9.2; `02` §4 | loopback-GET-only observer + no-write/HA design tests (synthetic) | MOCK-UNIT PASS; real-build read-only/HA proof DEFERRED (UM-E) |
 | 18 | R2 truly read-only Windows source (no controller secret) researched/evaluated; result recorded with build/version evidence | B3.3 | OD-P3; `02` §4; ADR | `um-b3-adr-windows-sources.md` with isolated Clash Verge Rev 2.5.10/Mihomo 1.19.33 TCP and named-pipe evidence (unauthenticated pipe exposes write methods) | **R2 INFEASIBLE on tested surfaces; full target matrix UNVERIFIED; OWNER DECISION PENDING** |
-| 19 | R1 (write-capable controller credential used by GET-only client) **not enabled**, not called read-only, separate Owner risk acceptance required | B3.3 | OD-P3; `02` §4 | ADR records risk; gated CLI path requires explicit env + owner-approved profile/secret and is disabled by default; installer refuses R1 provisioning | BLOCKED (Owner risk acceptance absent) |
-| 20 | Windows service install: Owner-approved account, ACL/DPAPI plan, session isolation, no secrets in repo/script/logs, no R1 provisioning | B3.3/B3.4 | OD-P7; ADR | SCM wrapper + event-log source; shared `internal/secretstore` DPAPI CurrentUser protects identity/rotation private keys; Windows source R1 path gated/off by default; installer template | IMPLEMENTED (SCM wrapper + DPAPI at-rest + template); real SCM/account/ACL/enrollment lab DEFERRED (OD-P7 PENDING) |
+| 19 | R1 (write-capable controller credential used by GET-only client) isolated-lab authorized; not called read-only; no env/center bypass; production disabled | B3.3 | Owner R1 isolated-lab acceptance; OD-P3; `02` §4 | `um-b3-r1-isolated-lab-acceptance.md` + versioned JSON; fixed protected `<state>/r1` bundle, DPAPI CurrentUser, private DACL, `r1-provision`; no env secret/authorization path; real Windows lab harness under `um/deploy/lab` | **R1 LAB AUTHORIZED / IMPLEMENTED / REAL LAB PASS (isolated Windows 2022, run 46038057860); R1 PRODUCTION ENABLEMENT HOLD** |
+| 20 | Windows service install: virtual non-admin account priority, service SID/ACL, DPAPI CurrentUser, session 0, enrollment-under-service-account, no LocalSystem, no machine-scope fallback | B3.3/B3.4 | OD-P7; ADR; Owner direction | SCM wrapper + event-log source; DPAPI CurrentUser identity/rotation; protected R1 bundle; `sc create obj=`/`qc` installer; UM-specific Windows SCM/DPAPI/R1 lab workflow | **IMPLEMENTED; REAL SCM/DPAPI/R1/SESSION-0 LAB PASS (isolated Windows 2022, run 46038057860); final production account still Owner PENDING** |
 | 21 | Windows service/agent real run on target Clash Verge Rev/Mihomo builds with read-only/HA assertions | B3.3 | `06` SEC-42..47; UM-E | — | DEFERRED (UM-E/real lab) |
 | 22 | Linux one-shot installer: root-only install orchestration, non-root runtime user, `/var/lib/um-agent` 0700, unit install, enrollment over pipe, token cleanup, dry-run default, no service start by default, no changes to existing Monitor/sing-box/sbox-cm | B3.4 | `04` §11; P1-03 | `install-agent.sh` | IMPLEMENTED (template; not executed) |
 | 23 | Coexistence with existing per-VPS Monitor: no shared unit/port/socket; only read-only duplicate load on loopback sing-box API; existing config/secret/permissions unchanged | B3.4 | Q-COEXIST; `01` §9 | runbook §5 | IMPLEMENTED (documented); real coexistence test DEFERRED |
-| 24 | Linux systemd lab proof: `systemd-analyze verify`, unit hardening, no-exec `NoExecPaths=/` on supporting systemd, D-Bus read proof, non-root file access proof | B3.4 | SEC-31/32; `06` §6 | unit + drop-in template; Documentation/Wants fixed; noexec gate corrected to systemd >=248; verify now fails closed in installer | DEFERRED — real systemd/D-Bus lab not run; noexec not claimed PASS |
+| 24 | Linux systemd lab proof: `systemd-analyze verify`, unit hardening, no-exec whitelist, D-Bus read proof, non-root file access, restart | B3.4 | SEC-31/32; `06` §6 | `um/deploy/lab/linux-systemd-lab.sh` + UM workflow on Ubuntu 24.04; verifies real D-Bus active state, non-root, no listener, state 0700, restart-safe NoExecPaths whitelist, restart generation advance | **REAL LAB PASS on systemd 255 / Ubuntu 24.04 (isolated)**; target matrix broader |
 | 25 | Runbook: install/run/upgrade/uninstall/recovery/rollback for both platforms, REC-17/18/27 operator steps, backup/no-secret logging | B3.4 | `07` §5 | `um-b3-runbook.md` | IMPLEMENTED (documentation) |
 | 26 | ADR proposals: OD-P7 credentials and OD-P3 Windows sources, status PROPOSED/PENDING OWNER, never APPROVED | B3.4 | 05 §C/F | two ADR files | IMPLEMENTED (proposals only) |
-| 27 | Dual-platform CI: existing `um-go.yml` covers `um/**`; agent tests run under the existing lane without weakening; local build/vet/test executed | B3.4 | plan §7 | local build/vet/test and exact-HEAD GitHub CI evidence recorded on Draft PR; existing CI file unchanged | LOCAL INTEGRATION PASS; exact final HEAD CI to be re-recorded after this fix commit |
+| 27 | Dual-platform CI plus isolated service labs: existing CI unchanged; UM-specific lab workflow builds/executes real systemd and SCM/DPAPI/R1 environments | B3.4 | plan §7 | `um-b3-lab.yml`; local full suite; exact-HEAD CI evidence on Draft PR | LOCAL INTEGRATION PASS; final exact-HEAD CI + lab results to be recorded |
 | 28 | Frozen contract untouched, no second signing/transport state machine, no center/B2 changes | B3.1–B3.4 | plan §2/§6 | diff/write boundaries in §2 | IMPLEMENTED (boundary rule) |
-| 29 | CLI entrypoint and platform wiring: `um-agent enroll/run/rotate/status/service/version`, platform collector selection, D-Bus/service.api wiring, gated Windows R1 observer, Windows SCM lifecycle wrapper | B3.1/B3.4 | `04` §11; P1-03 | `um/cmd/um-agent/{main,platform_linux,service_windows}.go`; Windows gate tests; builds/vet clean | IMPLEMENTED; Windows SCM/account/service integration unverified (OD-P7); R1 off by default |
+| 29 | CLI entrypoint/platform wiring: `enroll/run/rotate/status/service/r1-provision/version`, D-Bus/service.api wiring, protected R1 bundle, Windows SCM wrapper | B3.1/B3.4 | `04` §11; P1-03 | `um/cmd/um-agent/*`; Windows provisioning tests; builds/vet clean | IMPLEMENTED; SCM service account lab pending; R1 production HOLD |
 | 30 | Linux installer syntax/template review; dry-run default; no service start/enable by default; contract-conformant stdin token pipe | B3.4 | P1-03; `04` §11 | `install-agent.sh` (`bash -n` clean); no execution | IMPLEMENTED (template only; not executed) |
-| 31 | Windows installer template syntax and safety guards: explicit Owner confirmation, LocalSystem refused, R1/secret provisioning refused, no start by default | B3.4 | OD-P7/P3; `04` §11 | `install-agent-service.ps1` (PowerShell parser clean); no execution | IMPLEMENTED (template only; not executed) |
-| 32 | Agent ↔ real center end-to-end: real `um-center` HTTP listeners + real SQLite + real collectors, enrollment → config → snapshot/metrics/events/report accepted | B3.1/B3.3/B3.2 | `04` §1–§6; B2 center | `TestLinuxCollectorToRealCenter`, `TestWindowsCollectorToRealCenter`, `TestAgentRunSchedulesSnapshotMetricsAndEvents`; plus isolated real sing-box 1.14.5 service.api → Linux collector → real center lab | INTEGRATION PASS (in-process real center/SQLite); isolated real-source LAB-REAL evidence archived in `um/docs/um-b3-lab-evidence.md`; not public-TLS/production |
+| 31 | Windows installer template: explicit Owner confirmation, LocalSystem refused, built-in/virtual account created with correct no-password SCM syntax, account verified with `sc qc`, no R1 provisioning, no start by default | B3.4 | OD-P7/P3; `04` §11 | `install-agent-service.ps1`; PowerShell parser clean; isolated SCM lab probe verified virtual-account creation | IMPLEMENTED; full installer execution pending in lab |
+| 32 | Agent ↔ real center end-to-end: real HTTP/SQLite + real systemd Linux agent with real D-Bus, plus isolated Windows SCM/R1 service path | B3.1/B3.2/B3.3 | `04` §1–§6; B2 center | integration tests; Linux systemd lab on real Ubuntu runner (installer, service, D-Bus, restart, cleanup); Windows SCM/R1 lab harness | **Linux and Windows isolated service labs PASS (run 46038057860); not public-TLS/production** |
 
 ## 5. Test/evidence inventory in this Draft
 
@@ -248,24 +248,25 @@ report its own CI result.
    no conforming R2 surface was found (TCP needs write-capable secret; named
    pipe is unauthenticated yet write-capable). R2 is INFEASIBLE on tested
    surfaces; full target build matrix remains UNVERIFIED.
-2. **R1** — not authorized and disabled by default; no R1 credential is
-   created by the build/installer. The optional observer path requires an
-   explicit operator environment gate and owner-approved profile/secret; it is
-   never described as read-only.
-3. **Windows final service account / DPAPI / ACL** — OD-P7 is PENDING. Node
-   identity and rotation private keys are DPAPI CurrentUser-protected at rest
-   and tested on the current Windows user; service-account/session-0/ACL/SCM and
-   enrollment-under-service-account validation remain unverified. The installer
-   is a template that creates no controller secret.
-4. **Real systemd/D-Bus lab** — no host service was installed or started; the
-   unit, no-exec drop-in, non-root file-access and D-Bus read behavior were not
-   executed in a lab.
+2. **R1** — Owner-authorized for isolated lab only, not production; the
+   protected local bundle is implemented and no environment/center switch can
+   enable it. R1 remains described as a write-capable credential used by a
+   GET-only client, never as read-only. Real Windows lab result is pending.
+3. **Windows final service account / DPAPI / ACL** — OD-P7 final account is
+   PENDING. Virtual account creation was probed in a real runner; a full
+   SCM/DPAPI/enrollment/session-0 lab harness is present and its result is
+   pending. Node/R1 keys are DPAPI CurrentUser-protected; LocalSystem and
+   machine-scope fallback are forbidden.
+4. **Linux systemd/D-Bus lab** — real isolated Ubuntu 24.04 workflow PASS:
+   installer, non-root service, real D-Bus ActiveState, no listener, state mode,
+   restart-safe noexec whitelist and restart generation advance. Broader target
+   version matrix remains lab/UM-E scope.
 5. **Real sing-box `service.api` authorization audit** — absent; the Linux
    source remains disabled by design. The client itself now has synthetic
    fixtures and an isolated sing-box 1.14.5 lab; this is not the P1-10 audit.
-6. **Real Windows read-only/HA proof**, real agent-to-center over public TLS,
-   real enrollment with a center token, real service account, real clock skew,
-   power-loss/power-fail durability on target hardware — all DEFERRED.
+6. **Real Windows R1/HA proof**, real agent-to-center over public TLS,
+   production account, target Clash builds, real clock skew and hardware
+   power-loss durability — lab/production HOLD.
 7. **Production, UM-E acceptance, load/capacity, backup/restore, offsite
    ledger, independent security review** — not started (UM-E/HOLD).
 8. **CI on the Draft PR** — the exact final HEAD CI evidence is recorded after
@@ -274,56 +275,52 @@ report its own CI result.
 
 ## 8. Known gaps and follow-ups
 
-- G1: Windows collector must prove the six-token projection against the real
-  `windowsobs` contract (single enum, no A/B collapse); only mock evidence
-  exists now.
-- G2: `NoExecPaths=/`/`ExecPaths=` were introduced in systemd v248 (official
-  NEWS). The installer now gates on >=248, so Ubuntu 22.04/Debian 12 are
-  eligible; a real start/no-exec lab and `systemd-analyze verify` on those
-  target versions are still pending (UM-E/lab), not a PASS. Blocking
-  `execve`/`execveat` directly in `SystemCallFilter=`
+- G1: Windows six-token/selection/active projection has mock tests and a real
+  isolated Mihomo R1 lab PASS (all five selections plus active direct); no A/B
+  collapse or second enum exists.
+- G2: `NoExecPaths=` was introduced in systemd v248. The real systemd 255 lab
+  found that `NoExecPaths=/` + a single `ExecPaths=` re-allow denied the service
+  binary on restart (203/EXEC); the drop-in now hides standard tool directories
+  instead, and the lab verifies the service restarts successfully with the
+  whitelist. Broader Ubuntu/Debian target versions remain UM-E/lab scope.
+  Blocking `execve`/`execveat` directly in `SystemCallFilter=`
   would prevent the unit's own startup (systemd applies the filter before the
   service-binary exec) and is **not** used as a fake proof.
-- G3: Windows service account, state ACL, EventLog/SCM and DPAPI CurrentUser
-  service-account behavior need the OD-P7 decision/lab. DPAPI CurrentUser is
-  implemented and tested at the current-user scope; template defaults must not
-  be read as the final account decision.
-- G4: Linux real D-Bus/systemd state read and `/proc` sampling were not run on
-  a target VPS. The D-Bus client and exact-call/security tests are implemented;
-  only the isolated systemd lab/`systemd-analyze verify` remains.
+- G3: the isolated Windows 2022 lab created the virtual account, enrolled under
+  it, verified DPAPI identity/rotation, provisioned R1 under the same account
+  and ran the real service in session 0 (run 46038057860 PASS). Final production
+  account remains Owner PENDING.
+- G4: Linux real D-Bus/systemd state read was executed on the isolated Ubuntu
+  24.04 runner and persisted `active`; `/proc` system data was observed in the
+  same snapshot. Target VPS/version matrix remains UM-E.
 - G5: operator recovery (boot-state loss, revoked key, rotation mismatch) is
   documented but not drilled on a real node (UM-E drill).
-- G6: R2 investigation is complete (INFEASIBLE on the tested builds); the
-  OD-P3/OD-P7 Owner answers are still prerequisites for any Windows source
-  enablement. The R1 CLI path exists but is disabled by default; no agent code
-  path may be enabled before the Owner records the decision.
+- G6: R2 investigation is complete (INFEASIBLE on tested builds); Owner has
+  authorized R1 for isolated lab only. R1 enables only through the protected
+  local bundle (no env/center bypass), and production enablement remains HOLD.
 - G7: the Linux `singbox_api` unproven-source path now emits the contract
   `agent_error code=source_authorization_unproven` event (with stable event id
   and schema-validation test) while keeping availability unavailable. The
   versioned P1-10 server-side authorization audit and Owner enablement are
   still absent; this is an implementation-complete diagnostic, not enablement.
-- G8: Windows SCM lifecycle wrapper exists (`um-agent service --state-dir ...
-  --center ... --node-class windows_terminal`), but service-account/ACL/DPAPI
-  installation and whether a secret is ever needed remain OD-P7 PENDING; the
-  installer template registers a Manual-start service and must not be started
-  before the Owner decision + code-slice installation path are reviewed. The
-  shared DPAPI CurrentUser implementation now protects agent identity/rotation
-  private keys at rest and has current-user tests; virtual service account,
-  ACL/enrollment, EventLog/service SCM and machine-scope validation remain
-  pending, so it is not an OD-P7 PASS.
+- G8: Windows SCM lifecycle wrapper and virtual-account creation are in place;
+  the isolated lab performed enrollment under the virtual account, DPAPI
+  identity/rotation checks, R1 provisioning and session-0 service run.
+  **Lab PASS on run 46038057860.** Final account/ACL decision remains Owner
+  PENDING; LocalSystem and machine-scope fallback remain forbidden.
 - G9: the CLI flag names are Draft names (not frozen); deploy assets and the
   runbook must be re-checked against the final code slice at review (the frozen
   contract command `enroll --token-stdin` is implemented and used by the
   installer).
-- G10: local `go test ./...` and the exact-HEAD GitHub CI result are recorded
-  on the Draft PR; the final HEAD after fixes must be re-run and re-recorded.
-  The existing CI lane does not execute systemd/SCM/DPAPI/service-account labs.
+- G10: local `go test ./...`, exact-HEAD CI, and the UM-specific isolated
+  service-lab workflow results are recorded on the Draft PR. The lab workflow
+  is the real systemd/SCM/DPAPI evidence lane; it is not a production gate.
 
 ## 9. Required statement
 
 **This is a B3 Draft PR.** It is not a merge request approval, not a release,
-not a production installation, and it does not enable R1, install services,
-create credentials or touch production. UM-B4/C/D/E/F/G are not started, the
-frozen contract is unchanged, and all Owner decisions in
-`docs/um/um-127/05-owner-decisions.md` remain PENDING unless the Owner records
-otherwise.
+not a production installation. R1 is authorized only for isolated lab and
+remains production-disabled; the frozen contract is unchanged in this PR and
+the power-loss amendment is a separate docs-only Draft PR. UM-B4/C/D/E/F/G are
+not started; Owner decisions in `docs/um/um-127/05-owner-decisions.md` remain
+the governing record.

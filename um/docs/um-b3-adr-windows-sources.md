@@ -10,10 +10,13 @@
   `docs/um/um-127/02-dual-platform-contract.md` §4,
   `docs/um/um-a/06-threat-model-security-tests-performance.md` SEC-39/47/50,
   `docs/um/um-127/05-owner-decisions.md` OD-P3/P7.
-- R1 status: **not authorized, not enabled by default.** The Windows binary has
-  an explicitly gated R1 source path (`UM_AGENT_WINDOWS_SOURCE_AUTHORIZED=1` plus
-  operator-local profile/secret files) that remains disabled unless an operator
-  performs an Owner-approved setup; no source is enabled by this Draft.
+- R1 status: **Owner-authorized for isolated lab only; production HOLD.** See
+  the versioned `um-b3-r1-isolated-lab-acceptance.md` and
+  `r1-acceptance-record.v1.json`. The environment-variable activation path was
+  removed: R1 activates only from a protected `<state>/r1` bundle written by
+  `um-agent r1-provision` under the service account, using DPAPI CurrentUser and
+  a private DACL. The real Windows R1/SCM lab harness is in the UM lab workflow
+  and its result is recorded on the PR; production enablement remains HOLD.
 - R2 status: **INFEASIBLE on the tested Clash Verge Rev 2.5.10 / Mihomo Meta
   1.19.33 surfaces (isolated synthetic lab); full target build matrix remains
   UNVERIFIED.** See §6.
@@ -23,10 +26,10 @@
 | Item | Requested decision | Status |
 | --- | --- | --- |
 | OD-P3-R2 | Accept/reject a specific **truly read-only** Windows terminal data source (no controller secret) as the `windows_terminal` telemetry source | **PENDING OWNER** (research completed; R2 INFEASIBLE on tested surfaces; see §6) |
-| OD-P3-R1 | Accept/reject the **R1 residual risk**: a write-capable Mihomo/Clash Verge Rev controller credential used by a strictly GET-only client | **NOT AUTHORIZED / BLOCKED** — only after R2 is shown infeasible and a separate risk acceptance is recorded |
+| OD-P3-R1 | Accept/reject the **R1 residual risk**: a write-capable Mihomo/Clash Verge Rev controller credential used by a strictly GET-only client | **ISOLATED-LAB AUTHORIZED (2026-11-27); PRODUCTION HOLD.** R1 is not called read-only; protected local provisioning and lab evidence are required before any production decision. |
 | Enablement | Whether the center may set `collect.terminal`/`mihomo_api=true` for a node | **PENDING OWNER**; defaults remain `false` |
 
-No source is enabled by this Draft. The R2 lab used an isolated synthetic Mihomo/Clash Verge Rev instance; no production controller or production configuration was contacted or changed.
+R1 is enabled only for the isolated lab through the protected local bundle; no source is enabled in production. The R1/R2 labs use isolated synthetic Mihomo/Clash Verge Rev instances; no production controller or configuration is contacted or changed.
 
 ## 2. Facts that constrain the decision
 
@@ -294,7 +297,7 @@ snapshot-with-terminal surface remains honest `unavailable`/null.
 | Item | Value |
 | --- | --- |
 | OD-P3 R2 decision | **PENDING — evidence says INFEASIBLE on tested builds; owner must decide R1 risk acceptance vs no Windows source** |
-| OD-P3 R1 decision | **NOT AUTHORIZED (PENDING separate risk acceptance)** |
+| OD-P3 R1 decision | **ISOLATED-LAB AUTHORIZED (2026-11-27); PRODUCTION DECISION PENDING** |
 | Owner answer/reference/date | **PENDING** |
 | Enablement authorization | **PENDING** |
 | Resulting center/agent change | none until approval |

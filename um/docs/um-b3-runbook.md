@@ -6,7 +6,7 @@
 - Audience: the Owner/operator who will install a `linux_vps` or
   `windows_terminal` agent for a Draft/lab review.
 - Related: `um-b3-architecture.md` (design), `um-b3-adr-credentials.md`
-  (OD-P7 PENDING), `um-b3-adr-windows-sources.md` (OD-P3, R1 disabled),
+  (OD-P7 PENDING), `um-b3-adr-windows-sources.md` (OD-P3; R1 isolated-lab authorized, production HOLD),
   frozen contract `docs/um/um-a/04-node-protocol-v1.md` rev-5.
 - Assumption: the planned CLI/service names below are **subject to the B3 code
   slice** (not frozen): `um-agent enroll|run|rotate|status` with
@@ -125,9 +125,12 @@ already passed by this Draft):
 - The service is single-writer: a second `um-agent` on the same state dir
   fails (`state directory is already in use`) — do not "fix" it by deleting
   `.lock` or state files; check for a stray process first.
-- Boot generation increments by exactly 1 on each normal restart; a normal
-  `systemctl restart` is REC-01 behavior and must not be confused with a
-  recovery condition.
+- Boot generation increments by exactly 1 on **every** enrolled runtime start,
+  including `systemctl restart` and an unclean/power-loss restart; a new boot
+  id and fresh transport attempts are used, while report_id/body identity is
+  preserved for dedupe. This implements the proposed power-loss-generation
+  amendment (separate docs-only Draft PR #132, pending approval). Same-process
+  transport retry is the only exact same-generation duplicate path.
 - Data sources are **fail-closed and off by default**: `/proc`-based system
   metrics may be collected per center config; systemd unit state is read through
   the shipped read-only D-Bus probe and is UNKNOWN on unavailable/denied.
@@ -205,14 +208,18 @@ already passed by this Draft):
 
 ## 6. Windows install — `windows_terminal`
 
-> OD-P7 (account/secret) and OD-P3 (R2/R1 source) are **PENDING**. R2 was
+> OD-P7 final account/secret decisions are **PENDING**; R1 is Owner-authorized
+> for isolated lab only (production HOLD). R2 was
 > investigated on Clash Verge Rev 2.5.10 / Mihomo 1.19.33 and is **INFEASIBLE**
 > on the tested surfaces (TCP needs a write-capable secret; the named pipe is
-> unauthenticated yet write-capable). R1 remains not authorized. Do not install
-> a terminal source, do not provision a controller secret, and treat this
-> section as lab-only. The binary has a gated R1 path requiring
-> `UM_AGENT_WINDOWS_SOURCE_AUTHORIZED=1` plus operator profile/secret files; it
-> is disabled by default and must not be used before the Owner record exists.
+> unauthenticated yet write-capable). The Owner has authorized R1 **only for
+> isolated lab verification** (see `um-b3-r1-isolated-lab-acceptance.md`);
+> production enablement remains HOLD. Do not install a production terminal
+> source or use a real controller secret. R1 activation requires a protected
+> local bundle under `<state>/r1` written by `um-agent r1-provision` under the
+> service account; there is no environment-variable authorization/secret path.
+> The bundle is disabled unless present and valid, and production scope is
+> rejected.
 
 ### 6.1 Prepare
 
@@ -223,8 +230,10 @@ already passed by this Draft):
    default `NT AUTHORITY\LocalService` is a minimum placeholder; `LocalSystem`
    is refused by the script; a dedicated non-admin account or a virtual service
    account is the proposed direction (PENDING).
-4. No secret is needed for R2-style sources. R1 (controller credential) must
-   not be provisioned; the script fails if R1/secret parameters are supplied.
+4. No secret is needed for R2-style sources. R1 is isolated-lab-only and is
+   not provisioned by the Windows service installer; an Owner-approved lab may
+   run `um-agent r1-provision` under the service account after enrollment.
+   Production enablement is HOLD.
 
 ### 6.2 Preview / plan
 
@@ -266,9 +275,12 @@ does not change Clash Verge Rev/Mihomo/HA-UI configuration.
 
 **Windows SCM lifecycle wrapper exists in this Draft** (`um-agent service
 --state-dir ... --center ... --node-class windows_terminal`; it runs the shared
-runtime under SCM stop/shutdown), but the service account, ACL, DPAPI scope and
-installation decision remain **OD-P7 PENDING**, and **no SCM lab was executed**:
-Windows Service integration is unverified. The installer registers the service
+runtime under SCM stop/shutdown). The service account, ACL, DPAPI scope and
+installation decision remain **OD-P7 PENDING**. A dedicated isolated SCM lab
+workflow (`um-b3-lab.yml`) exercises virtual-service-account creation,
+enrollment, DPAPI, R1 provisioning and session-0 service execution on a
+disposable GitHub Windows runner; its exact result is recorded on the PR. The
+installer registers the service
 as Manual-start and does not start it; do not start/enable it until the Owner
 decision and the code-slice installation path are reviewed. For a lab smoke test
 before that, run the collector manually (no service):
@@ -276,16 +288,17 @@ before that, run the collector manually (no service):
 and expect honest `unavailable` terminal data + acceptance/rejection evidence
 from the center; this is not a Windows-service proof.
 
-**Optional R1 lab-only source path (disabled by default, not authorized by
-this Draft):** the binary can load an operator-local `windowsobs.Profile` and
-controller secret from `UM_AGENT_WINDOWS_OBSERVE_PROFILE` and
-`UM_AGENT_WINDOWS_OBSERVE_SECRET_FILE`, but only when
-`UM_AGENT_WINDOWS_SOURCE_AUTHORIZED=1` is also set. That flag is an operator
-assertion that a separate OD-P3 Owner risk-acceptance record exists. The
-installer does not provision these files or enable the path. The source is the
-R1 write-capable controller shape, not R2; never call it read-only. The current
-Clash Verge Rev default may expose only the pipe (the `windowsobs` client uses
-TCP loopback), so lab setup must be isolated and owner-approved.
+**R1 isolated-lab source path (disabled by default; production HOLD):** the
+binary loads a protected bundle from `<state>/r1/acceptance.json`,
+`profile.json` and `controller.secret.dpapi`. The bundle must be created by
+`um-agent r1-provision` under the same service account; the secret is sealed
+with DPAPI CurrentUser and the directory/files receive a private DACL. A
+missing bundle means disabled; a malformed, hash-mismatched, non-isolated-lab
+or unsealable bundle fails closed. There is no environment-variable secret or
+authorization switch. R1 is the write-capable controller shape, not R2; never
+call it read-only. The current Clash Verge Rev default may expose only the
+unauthenticated named pipe (not used); the `windowsobs` client uses literal
+loopback TCP only. Do not use a real controller secret.
 
 Enrollment: the Windows agent also needs a one-time admin token. Use the
 authorized process for the target environment; never store the token in the

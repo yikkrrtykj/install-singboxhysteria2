@@ -22,9 +22,9 @@
 | --- | --- | --- | --- |
 | D-1 | Linux agent runtime identity and file permissions | non-login `umagent`; `/var/lib/um-agent` 0700 `umagent`; key/state files 0600; root-only bootstrap token; no root resident process | **PROPOSED** (already congruent with frozen contract; no extra Owner decision requested) |
 | D-2 | Linux data-source credential delivery | systemd `LoadCredential=` from a root-owned file into the `umagent` process; source permissions unchanged; no plaintext copy in agent state; source off by default | **PROPOSED** |
-| D-3 | Windows agent runtime account | session-0 Windows service under a **dedicated non-admin** account (virtual service account `NT SERVICE\um-agent` preferred or dedicated local user); `LocalSystem` rejected; `LocalService` acceptable minimum only with Owner acceptance | **PENDING OWNER** |
-| D-4 | Windows secret storage scope | DPAPI **CurrentUser** scope of the service account (preferred, implemented for agent state); machine scope only with explicit Owner risk acceptance; R2 (no secret) preferred over both | **PENDING OWNER; CurrentUser node-key protection IMPLEMENTED, account/enrollment validation pending** |
-| D-5 | R1 controller credential (write-capable) | **NOT authorized**; if ever accepted, only as a separate OD-P3 Owner risk acceptance with the mitigations in `04` §11 | **PENDING OWNER / BLOCKED** |
+| D-3 | Windows agent runtime account | session-0 Windows service under a **dedicated non-admin** account: virtual service account `NT SERVICE\um-agent` preferred, dedicated local user fallback; `LocalSystem` rejected; `LocalService` only as legacy placeholder | **PENDING OWNER; virtual-account SCM/DPAPI/R1/session-0 lab PASS (isolated Windows 2022, run 46038057860); production account still PENDING** |
+| D-4 | Windows secret storage scope | DPAPI **CurrentUser** scope of the service account (preferred, implemented for agent state); machine scope only with explicit Owner risk acceptance; R2 (no secret) preferred over both | **PENDING OWNER; CurrentUser node-key protection IMPLEMENTED and service-account lab PASS; final account/ACL and machine-scope decision PENDING** |
+| D-5 | R1 controller credential (write-capable) | **Owner-authorized for isolated lab only**; protected local bundle + DPAPI CurrentUser + private ACL; production HOLD with the mitigations in `04` §11 | **R1 LAB AUTHORIZED / PRODUCTION HOLD** |
 | D-6 | Install/upgrade/uninstall and rotation procedure | account and storage scope fixed before install; no secret in scripts/repo/logs; upgrade preserves state; uninstall requires explicit data-purge confirmation | **PROPOSED** |
 
 No real credential, token, password, private key or DPAPI blob may be created,
@@ -33,11 +33,13 @@ requested or stored by UM-B3 work. This ADR contains none.
 ## 1a. Implementation status at this Draft (not an OD-P7 approval)
 
 - The shared `internal/secretstore` package implements DPAPI CurrentUser with
-  synthetic round-trip tests on the Windows host. The agent runtime protects
-  `identity.json` private-key material and `rotation.json` provisional private
-  key material at rest with DPAPI CurrentUser, and migrates legacy plaintext
-  state on first open under the same Windows account. Machine scope is not used
-  by default.
+  synthetic round-trip tests. The agent runtime protects `identity.json` and
+  `rotation.json` private-key material at rest with DPAPI CurrentUser, migrates
+  legacy plaintext state, and seals the R1 controller secret in the protected
+  `<state>/r1` bundle. Machine scope is not used by default and must not be
+  selected automatically. The installer creates built-in/virtual accounts with
+  correct SCM syntax and verifies them with `sc qc`; the UM lab workflow runs
+  enrollment/R1 provisioning under the virtual account.
 - This is **current-user** protection, not a service-account validation. The
   Windows SCM/account/ACL provisioning, virtual-service-account profile
   behavior, session-0 source access and enrollment-under-service-account flow

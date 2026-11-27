@@ -80,12 +80,90 @@ exits with `os.Exit(99)` (no clean-shutdown marker).
 - Hardware power-loss durability on target hardware remains UM-E/hardware lab
   scope; software process crashes are covered.
 
+## 4a. Linux systemd/D-Bus real lab (isolated GitHub runner; PASS)
+
+`um/deploy/lab/linux-systemd-lab.sh` and the UM lab workflow execute on a
+disposable Ubuntu 24.04 runner with systemd 255:
+
+- built the real agent/center/lab binaries and issued a synthetic enrollment
+  token from the real local center/SQLite;
+- executed the repository installer as root, which created the non-login
+  `umagent` user, installed the binary/unit/noexec drop-in, ran
+  `systemd-analyze verify`, enrolled over the frozen stdin token path, and
+  started the service;
+- verified the service main process ran as `umagent`, `StateDirectory`/state
+  mode was 0700, no listening socket existed, and the unit's root-owned
+  hardened binary executed successfully;
+- enabled a synthetic `sing-box.service` and enabled the `services`/`system`
+  center sources; the real D-Bus probe returned `ActiveState=active` and the
+  persisted snapshot contained `services:[{name:"sing-box",state:"active"}]`
+  plus real `/proc` system values;
+- restarted the service and verified the new generation advanced and identity
+  state survived;
+- stopped/started the service, then disabled/removed the unit/user/state in
+  cleanup.
+- **Result: PASS on Ubuntu 24.04 / systemd 255 (workflow run 46038057860).**
+  This is a disposable isolated runner, not a production VPS or the broader
+  target-version matrix.
+
+## 4b. Windows SCM/virtual-account/DPAPI/R1 lab harness
+
+`um/deploy/lab/windows-service-r1-lab.ps1` and the UM lab workflow ran on a
+disposable administrator Windows 2022 runner (workflow run
+`46038057860`, **PASS**). The run:
+
+- created the real `um-agent` SCM service under `NT SERVICE\um-agent` with the
+  no-password virtual-account syntax and obtained its per-service SID;
+- ran enrollment through the lab SCM helper under that service account, proving
+  DPAPI CurrentUser private-key protection (`private_key_dpapi`, no plaintext
+  field) and rotation provisional-key protection
+  (`new_private_key_dpapi`);
+- provisioned the R1 bundle through `um-agent r1-provision` under the same
+  service account (DPAPI-sealed controller secret, versioned isolated-lab
+  acceptance, hash binding, private ACL);
+- started the real `um-agent service` wrapper in **session 0** under
+  `NT SERVICE\um-agent` while the lab runner stayed in its interactive session;
+- observed all five selection bindings (`a_reality`, `a_hy2`, `b_reality`,
+  `b_hy2`, `direct`) through the real isolated Mihomo controller and a real
+  loopback CONNECT/active-connection projection; the persisted terminal
+  snapshot reported the active direct connection;
+- stopped the controller and verified the persisted terminal selection degraded
+  to unavailable/partial, with no fabricated healthy data;
+- verified the Mihomo config file hash was unchanged, the snapshot contained no
+  local profile/controller sentinel, the state ACL did not include broad users,
+  and identity/DPAPI state survived a service stop/start.
+
+The R1 credential is still treated as **write-capable**; only the agent's
+GET-only request surface is tested. No real controller secret was used and R1
+production enablement remains HOLD.
+
+## 4c. Power-loss generation amendment
+
+The proposed amendment is a separate docs/fixture-only Draft PR #132
+(`docs/um/um-127/09-power-loss-generation-amendment-draft.md` plus
+`power-loss-generation.amendment.v1.json`). It is **not frozen**; B3 tests label
+the new restart behavior as dependent on that approval. Same-runtime ACK-loss
+exact duplicate remains the old REC-27 consistency case; process crash/restart
+replay uses a new generation/boot/fresh attempt and is duplicate-by-report_id
+while advancing the new generation high-water. Reconciliation tests are in
+`internal/agent` and the real-center process crash harness.
+
+## 4d. R1 isolated-lab acceptance
+
+The Owner's limited R1 authorization is recorded in
+`um-b3-r1-isolated-lab-acceptance.md` and `r1-acceptance-record.v1.json`:
+isolated lab only, no production enablement, credential is write-capable, no
+named pipe/bridge, protected local provisioning with DPAPI CurrentUser, and no
+real controller secret.
+
 ## 5. Not executed
 
-- Real Linux systemd/D-Bus start/stop, no-exec `NoExecPaths`, non-root file
-  access and `systemd-analyze verify`: no Linux host/VM available; HOLD.
-- Windows SCM service install, virtual/dedicated service account, service-SID
-  ACL, session-0 and DPAPI service-account round-trip: host is non-admin; HOLD.
+- Real Linux systemd/D-Bus evidence is now available from the isolated Ubuntu
+  runner (above); the broader target-version matrix and noexec on other systemd
+  versions remain HOLD/UM-E.
+- Windows full SCM/virtual-account/DPAPI/R1 service lab is now PASS on the
+  disposable Windows 2022 runner (run 46038057860); target tournament builds and
+  production account/credentials remain HOLD.
 - Public-TLS center deployment, real VPS/terminal production, real tournament
   Clash Verge/Mihomo builds, R1/R2 enablement: HOLD.
 

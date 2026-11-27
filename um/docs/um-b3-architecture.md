@@ -98,12 +98,16 @@ state path; agents reject state files that fail validation instead of
 3. Reconcile local high-water: if spooled/control attempts contain a seq above
    `next_seq`, persist the higher value **before** any send; never lower it
    (REC-27 crash window).
-4. A **clean** process restart (same identity, clean-shutdown marker written by
-   `Close`) increments `generation` by exactly 1, generates a new random 32-hex
-   `boot_id`, starts `next_seq=1`, and replays pending payload records under the
-   new generation with fresh transport fields. An abrupt power loss has no
-   clean marker: generation/boot/persisted seq and the exact spooled attempt are
-   preserved for duplicate/sequence recovery (REC-27).
+4. Any successful start of an enrolled runtime — clean or unclean — increments
+   `generation` by exactly 1, generates a new random 32-hex `boot_id`, starts
+   `next_seq=1`, and replays pending payload records under the new generation
+   with fresh transport attempts while preserving `report_id`/`collected_at`/
+   type/body identity. The clean-shutdown marker is diagnostic only. Exact
+   same-generation replay remains available for a retry within the same
+   process; a restart never reuses the retired generation's attempt as an
+   authorization token. This implements the proposed
+   `um-127/09-power-loss-generation-amendment-draft.md` (separate docs-only
+   Draft PR #132, not yet frozen).
 5. If the process is starting for the first time with no identity, enrollment
    is required (no anonymous reporting).
 
@@ -129,8 +133,9 @@ state path; agents reject state files that fail validation instead of
 
 ## 6. Boot generation, sequence, nonce and report identity
 
-- `generation` is persistent and monotonic; each normal restart is exactly
-  `+1`. Local state never "coalesces" gaps and never reuses a `boot_id`.
+- `generation` is persistent and monotonic; every enrolled runtime start
+  (clean or unclean) is exactly `+1`, with a new `boot_id`. Local state never
+  "coalesces" gaps and never reuses a `boot_id`.
 - Each request attempt gets a fresh `sent_at` (Unix seconds), a fresh 16-byte
   base64url nonce, and a `seq` from `pending_control.json`/`boot_state.json`.
   The attempt is **persisted before send** (seq high-water and, for reports,
@@ -144,7 +149,7 @@ state path; agents reject state files that fail validation instead of
   seq is `duplicate` when already committed.
 - `seq == MAX_NUMERIC`: ACK `next_seq:null` marks the generation numerically
   exhausted. The agent never wraps/reuses seq; it starts a new generation only
-  on a clean restart (boot state available) or enters operator recovery
+  on the next runtime start (boot state available) or enters operator recovery
   (generation `MAX_NUMERIC` is terminal).
 - Boot-state loss/restore behavior (REC-17/18): never reset in place; restored
   old state yields a lower generation and the center answers
@@ -252,7 +257,10 @@ optional probes and roots for tests (`ProcRoot`, `SysRoot`, `DiskMountPath`,
   with `FlagNoAutoStart`. There is no generic call, no write/lifecycle method,
   no exec, no root, no file write and no `systemctl` fallback. Failures map to
   the closed `ErrProbeUnavailable` and render UNKNOWN, never fabricated
-  `active`. The Linux wire path still awaits an isolated systemd-lab run.
+  `active`. The isolated Ubuntu 24.04 lab workflow exercised the real system
+  bus, installed the unit/installer as `umagent`, read a synthetic
+  `sing-box.service` ActiveState as `active`, and verified non-root/no-listener/
+  noexec/restart behavior.
 - **sing-box data sources**: `singbox_api` is disabled by default.
   - The official sing-box 1.14 `service.api` client
     (`internal/linuxobs/serviceapi*.go`) uses a fixed loopback origin and one
@@ -317,11 +325,13 @@ Metrics is `agent.ErrUnsupported` (Windows metrics v1 deferred).
   controller requires a write-capable secret and the named pipe is
   unauthenticated yet exposes write methods. The loopback TCP controller is the
   R1 residual-risk shape (**write-capable credential**, strictly GET-only
-  client); the CLI has an explicit R1 path gated by
-  `UM_AGENT_WINDOWS_SOURCE_AUTHORIZED=1` + operator profile/secret files, and is
-  disabled by default. It is never described as read-only and requires a
-  separate Owner risk acceptance. Until a source is proven/authorized, terminal
-  availability is `unavailable` with `source_authorization_unproven`. See
+  client). The Owner authorized R1 for **isolated lab only** (versioned
+  `um-b3-r1-isolated-lab-acceptance.md`); production remains HOLD. The only
+  activation path is a protected `<state>/r1` bundle written by
+  `um-agent r1-provision` under the service account: versioned isolated-lab
+  acceptance, operator profile, and DPAPI-CurrentUser-sealed controller secret
+  hash-bound together, with a private DACL. There is no environment-variable or
+  center-config bypass. R1 is never described as read-only. See
   `um-b3-adr-windows-sources.md`.
 - **No HA/config writes**: the agent never modifies Mihomo/Clash Verge Rev
   configuration, never switches nodes, never closes connections and never
@@ -329,11 +339,13 @@ Metrics is `agent.ErrUnsupported` (Windows metrics v1 deferred).
   before any enablement (UM-E real-build assertion).
 - Agent identity and rotation provisional private keys are protected at rest
   with DPAPI CurrentUser through the shared `internal/secretstore` package
-  (machine scope is not the default and remains OD-P7-gated). The Windows
-  `cmd/um-agent` SCM wrapper and event-log source are wired; the installer
-  template still does not install a service account, run enrollment or approve
-  an ACL. Service-account/ACL/enrollment/SCM lab validation and the final
-  account decision remain **OD-P7 PENDING**.
+  (machine scope is not the default and remains forbidden without a new Owner
+  decision). The Windows `cmd/um-agent` SCM wrapper and event-log source are
+  wired; the installer creates built-in/virtual accounts with correct SCM
+  syntax and verifies them with `sc qc`. The UM-specific lab workflow enrolls
+  under the virtual service account, checks DPAPI state/R1 provisioning and
+  session-0 execution. The final account/ACL decision remains **OD-P7 PENDING**;
+  LocalSystem is forbidden.
 
 ## 13. Service and CLI model
 
@@ -351,14 +363,16 @@ are **not frozen** until review; deploy assets document the intended shape:
 | `um-agent rotate` | `--state-dir ...`, `--center ...`, `--node-class ...` | same env vars |
 | `um-agent status` | `--state-dir ...` (diagnostics only: enrolled/terminal/config version/generation/sequencing/pending/quarantined; no secrets) | `UM_AGENT_STATE_DIR` |
 | Linux source env | no flags; D-Bus probe automatic; service.api only when configured | `UM_AGENT_SINGBOX_API_URL` (default `http://127.0.0.1:9091`), `UM_AGENT_SINGBOX_API_SECRET_FILE`, `UM_AGENT_SINGBOX_SOURCE_AUTHORIZED` (operator P1-10 assertion) |
-| Windows source env | no flags; R1 observer only when both files/gate set | `UM_AGENT_WINDOWS_OBSERVE_PROFILE`, `UM_AGENT_WINDOWS_OBSERVE_SECRET_FILE`, `UM_AGENT_WINDOWS_SOURCE_AUTHORIZED` (OD-P3 Owner gate; off by default) |
+| Windows R1 provisioning | `um-agent r1-provision --state-dir ... --profile ... --secret-file ... --owner-reference ...` under the service account; no env/center bypass | fixed `<state>/r1/{acceptance.json,profile.json,controller.secret.dpapi}`; production scope rejected |
+| Windows source env | no authorization/secret environment variables; R1 activates solely from the protected local bundle | none |
 | `um-agent service` (Windows SCM lifecycle wrapper) | `--state-dir`, `--center`, `--node-class` (flags passed through to the run loop); account, ACL, DPAPI scope, credential rotation and installation remain **OD-P7-gated** | same env vars |
 
-The Windows `service` wrapper only hosts the SCM lifecycle (start/stop/shutdown)
-around the shared runtime; it does not choose or install a service account, ACL
-or DPAPI scope, and **no SCM lab was executed in this Draft** — Windows Service
-integration is unverified. Account/ACL/DPAPI and any secret decision remain
-**OD-P7 PENDING**; R1 is not provisioned or enabled by default.
+The Windows `service` wrapper hosts the SCM lifecycle (start/stop/shutdown)
+around the shared runtime; account/ACL/DPAPI installation remains explicit and
+lab-only until OD-P7. The isolated Windows lab workflow exercises virtual-account
+creation, enrollment-under-service-account, DPAPI at-rest state, R1 provisioning
+and session-0 service execution. Final account/ACL decision remains **OD-P7
+PENDING**; R1 production enablement remains HOLD.
 
 Deployment assets in this Draft are templates: Linux `um-agent.service` +
 `um-agent-noexec.conf` + `install-agent.sh` (uses the contract `--token-stdin`
@@ -371,12 +385,12 @@ See `um-b3-runbook.md`.
 | Case | Agent behavior / evidence in Draft |
 | --- | --- |
 | REC-01/02 | normal restart = generation+1, new boot id; first-contact `seq>1` allowed; seq persisted before send |
-| REC-03/04/06/27 | lost ACK → exact/new attempt resend with same `report_id` → `duplicate`; committed seq resent; unsynced seq never reused; oldest-first spool replay; first new-generation duplicate still advances high-water |
+| REC-03/04/06/27 | same-runtime lost ACK → exact attempt resend with same `report_id`/generation → `duplicate`; process-restart lost ACK → new generation/new boot/fresh attempt with same payload identity → `duplicate`, first new-generation duplicate still advances high-water; unsynced seq never reused; oldest-first spool replay |
 | REC-10/13 | superseded delayed responses ignored; ACK `next_seq` adopted as `max(local, ack)` |
 | REC-17 | boot state missing/corrupt → local fail-closed, no request, operator recovery (unit test) |
 | REC-18 | restored old snapshot → `409 stale_boot_generation`; revoke + re-enroll, no in-place reset (unit + mocked center) |
 | REC-19/20/21 | persisted rotation intent replay across restart; expired path aborts provisional key; revoked key stops queue and keeps bounded spool |
-| REC-26 | `MAX_NUMERIC` exhaustion/`next_seq:null` → new generation on clean restart or operator recovery; never wrap |
+| REC-26 | `MAX_NUMERIC` exhaustion/`next_seq:null` → new generation on the next runtime start or operator recovery; never wrap |
 | REC-30 | interleaved spool replay across generations remains oldest-first with no overwrite |
 
 B2-owned REC real-HTTP halves stay B2 evidence; B3 does not re-count them.
@@ -413,11 +427,13 @@ B2-owned REC real-HTTP halves stay B2 evidence; B3 does not re-count them.
   sing-box API; this is read-only coexistence with duplicate local load. The UM
   install changes no Monitor file/service/credential and opens no port; the
   operator chooses which systems run per VPS (Q-COEXIST direction).
-- Agent crash/power loss: fsynced state survives; a clean restart increments
-  generation and an abrupt loss preserves the exact persisted attempt for
-  REC-27 duplicate recovery. The frozen-contract power-loss/generation wording
-  still needs Owner/contract-owner clarification; it is not claimed as a fully
-  resolved durability proof. Windows directory-entry durability is a documented
+- Agent crash/power loss: fsynced payload identity survives; every runtime
+  start advances generation and uses a fresh attempt, so a post-crash replay is
+  a new-generation `duplicate` and advances the new high-water. The exact
+  same-generation sequence duplicate remains the same-runtime ACK-loss case.
+  This implements the proposed power-loss-generation amendment (docs-only Draft
+  PR #132, pending Owner/contract approval). Windows directory-entry durability
+  is a documented
   platform limitation (write-through replacement, no POSIX dir fsync).
 - Center storage failure: `503 storage_unavailable` is retried; no ACK before
   commit (center side, B2 evidence).
@@ -425,13 +441,19 @@ B2-owned REC real-HTTP halves stay B2 evidence; B3 does not re-count them.
 ## 17. Known limitations (do not read as PASS)
 
 - R2 is INFEASIBLE on the tested Clash Verge Rev 2.5.10/Mihomo 1.19.33
-  surfaces; full target matrix UNVERIFIED. R1 remains not authorized/BLOCKED.
-- Windows final service account/ACL/enrollment is OD-P7 PENDING. Node-key
-  DPAPI CurrentUser is implemented and tested at current-user scope; virtual
-  service-account/session-0 and SCM lab validation remain pending.
-- Linux D-Bus client is implemented with exact-call/security tests; a live
-  systemd/D-Bus lab proof is still pending. The installer noexec gate is
-  corrected to systemd >=248, but a target-version lab is pending.
+  surfaces; full target matrix UNVERIFIED. R1 is Owner-authorized for isolated
+  lab only and production-disabled; the isolated Windows 2022 SCM/DPAPI/R1
+  service lab passed (run 46038057860).
+- Windows final service account/ACL/enrollment is OD-P7 PENDING. Node/R1 keys
+  are DPAPI CurrentUser-protected; virtual account and full SCM/DPAPI lab
+  execution are being verified by the UM lab workflow; LocalSystem/machine-scope
+  fallback remain forbidden.
+- Linux D-Bus client is implemented; the isolated Ubuntu 24.04 systemd lab
+  passed real installer/D-Bus/non-root/no-listener/restart checks. Broader
+  target-version matrix remains UM-E.
+- The real `NoExecPaths=/` + `ExecPaths=` combination was found to deny the
+  service binary on restart on systemd 255; the shipped whitelist avoids this
+  and the lab verifies restart-safe operation.
 - The sing-box service.api client is implemented/tested against fixtures and an
   isolated 1.14.5 instance; the P1-10 server-side authorization audit is absent
   and the source remains disabled.
