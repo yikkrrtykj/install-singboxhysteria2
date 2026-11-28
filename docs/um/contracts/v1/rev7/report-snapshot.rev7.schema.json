@@ -1,0 +1,260 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://um.invalid/contracts/v1/report-snapshot.rev7.schema.json",
+  "title": "UM v1 report body: snapshot rev-7 (Linux read-only lower-bound traffic observation; additive to the frozen rev-5 snapshot)",
+  "description": "Candidate rev-7 additive overlay on the frozen rev-5 report-snapshot contract. The rev-5 snapshot shape (v/type/report_id/collected_at/agent/host/availability/counter_epoch/system/services/protocols/traffic/clients and the optional Windows terminal object) is preserved with identical constraints. Revision-7 Linux bodies additionally carry a required top-level contract_revision=7 and a required traffic_observation object describing a per-inbound observed lower bound from the local monitor-v2 read-only export (the export file is schema-pinned in rev7/traffic-export.schema.json); the base traffic array stays [] and availability.traffic MUST NOT be ok. Coherence rules that JSON Schema cannot express (duplicate inbound tags, exact/lower-bound ambiguity, base-traffic/availability coupling, freshness/age coupling, effective-dated-cadence freshness, numeric lexical integer enforcement, expected-tag authorization, the no-observation sentinel and the distinct status-only real-epoch unavailable form) are normative in docs/um/um-a/04-node-protocol-v1.rev7.md and enforced by the center/agent implementation, not by this schema. Bytes are observed lower bounds on observed lifecycles, never daemon-lifetime exact totals and never a pure observation-epoch byte delta; a lower bound MUST NOT be presented as a lifetime total.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["v", "type", "report_id", "collected_at", "agent", "host",
+               "availability", "counter_epoch", "system", "services", "protocols",
+               "traffic", "clients", "contract_revision", "traffic_observation"],
+  "properties": {
+    "v": {"const": 1},
+    "type": {"const": "snapshot"},
+    "report_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "collected_at": {"type": "integer", "minimum": 0, "maximum": 1000000000000},
+    "agent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "uptime_s"],
+      "properties": {
+        "version": {"type": "string", "maxLength": 32,
+                    "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$"},
+        "uptime_s": {"type": "integer", "minimum": 0, "maximum": 1000000000000}
+      }
+    },
+    "host": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["os", "kernel", "arch"],
+      "properties": {
+        "os": {"enum": ["linux", "windows"]},
+        "kernel": {"type": "string", "maxLength": 64, "pattern": "^[0-9A-Za-z.+-]+$"},
+        "arch": {"enum": ["amd64", "arm64"]}
+      }
+    },
+    "availability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["system", "services", "protocols", "traffic", "clients"],
+      "properties": {
+        "system": {"enum": ["ok", "partial", "unavailable"]},
+        "services": {"enum": ["ok", "partial", "unavailable"]},
+        "protocols": {"enum": ["ok", "partial", "unavailable"]},
+        "traffic": {"enum": ["ok", "partial", "unavailable"]},
+        "clients": {"enum": ["ok", "partial", "unavailable"]}
+      }
+    },
+    "counter_epoch": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+    "system": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cpu_pct", "load1", "mem_total_bytes", "mem_used_bytes",
+                   "disk_total_bytes", "disk_used_bytes", "net_rx_bytes", "net_tx_bytes"],
+      "properties": {
+        "cpu_pct": {"oneOf": [{"type": "number", "minimum": 0, "exclusiveMaximum": 10000}, {"type": "null"}]},
+        "load1": {"oneOf": [{"type": "number", "minimum": 0, "exclusiveMaximum": 100000}, {"type": "null"}]},
+        "mem_total_bytes": {"oneOf": [{"type": "integer", "minimum": 1, "maximum": 1099511627776}, {"type": "null"}]},
+        "mem_used_bytes": {"oneOf": [{"type": "integer", "minimum": 0, "maximum": 1099511627776}, {"type": "null"}]},
+        "disk_total_bytes": {"oneOf": [{"type": "integer", "minimum": 1, "maximum": 1099511627776}, {"type": "null"}]},
+        "disk_used_bytes": {"oneOf": [{"type": "integer", "minimum": 0, "maximum": 1099511627776}, {"type": "null"}]},
+        "net_rx_bytes": {"oneOf": [{"type": "integer", "minimum": 0, "maximum": 9007199254740991}, {"type": "null"}]},
+        "net_tx_bytes": {"oneOf": [{"type": "integer", "minimum": 0, "maximum": 9007199254740991}, {"type": "null"}]}
+      }
+    },
+    "services": {
+      "type": "array", "minItems": 0, "maxItems": 16,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "state"],
+        "properties": {
+          "name": {"type": "string", "maxLength": 64,
+                   "pattern": "^[a-z0-9][a-z0-9._-]*$"},
+          "state": {"enum": ["active", "inactive", "failed", "unknown"]}
+        }
+      }
+    },
+    "protocols": {
+      "type": "array", "minItems": 0, "maxItems": 16,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "inbound_tag", "state", "reason", "observed_at"],
+        "properties": {
+          "kind": {"enum": ["reality", "hysteria2", "other"]},
+          "inbound_tag": {"type": "string", "maxLength": 64,
+                          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"},
+          "state": {"enum": ["up", "down", "unknown"]},
+          "reason": {"enum": ["ok", "timeout", "tls_failed", "auth_failed",
+                              "service_inactive", "source_unavailable", "unavailable",
+                              "unknown"]},
+          "observed_at": {"type": "integer", "minimum": 0, "maximum": 1000000000000}
+        }
+      }
+    },
+    "traffic": {
+      "type": "array", "minItems": 0, "maxItems": 16,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["scope", "inbound_tag", "uplink_total_bytes", "downlink_total_bytes"],
+        "properties": {
+          "scope": {"const": "protocol"},
+          "inbound_tag": {"type": "string", "maxLength": 64,
+                          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"},
+          "uplink_total_bytes": {"oneOf": [{"type": "integer", "minimum": 0, "maximum": 9007199254740991}, {"type": "null"}]},
+          "downlink_total_bytes": {"oneOf": [{"type": "integer", "minimum": 0, "maximum": 9007199254740991}, {"type": "null"}]}
+        }
+      }
+    },
+    "clients": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["active", "tracked", "summaries"],
+      "properties": {
+        "active": {"oneOf": [{"type": "integer", "minimum": 0, "maximum": 1000000}, {"type": "null"}]},
+        "tracked": {"oneOf": [{"type": "integer", "minimum": 0, "maximum": 1000000}, {"type": "null"}]},
+        "summaries": {
+          "type": "array", "minItems": 0, "maxItems": 50,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["device_ref", "active", "uplink_bytes", "downlink_bytes", "last_seen"],
+            "properties": {
+              "device_ref": {"type": "string", "pattern": "^[A-Za-z0-9_-]{43}$"},
+              "active": {"type": "integer", "minimum": 0, "maximum": 1000},
+              "uplink_bytes": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+              "downlink_bytes": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+              "last_seen": {"type": "integer", "minimum": 0, "maximum": 1000000000000}
+            }
+          }
+        }
+      }
+    },
+    "terminal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["selection", "active_connections"],
+      "properties": {
+        "selection": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["availability", "sampled_at", "route", "reason_code"],
+          "properties": {
+            "availability": {"enum": ["ok", "partial", "unavailable"]},
+            "sampled_at": {"type": "integer", "minimum": 0, "maximum": 1000000000000},
+            "route": {
+              "description": "Current selected leaf mapped to exactly one local route token; null means not resolvable. Unmapped/ambiguous paths are never reported as DIRECT.",
+              "oneOf": [
+                {"$ref": "#/$defs/route_token"},
+                {"type": "null"}
+              ]
+            },
+            "reason_code": {
+              "oneOf": [
+                {"$ref": "#/$defs/terminal_reason_code"},
+                {"type": "null"}
+              ]
+            }
+          }
+        },
+        "active_connections": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["availability", "sampled_at", "total", "by_route"],
+          "properties": {
+            "availability": {"enum": ["ok", "partial", "unavailable"]},
+            "sampled_at": {"type": "integer", "minimum": 0, "maximum": 1000000000000},
+            "total": {
+              "oneOf": [
+                {"type": "integer", "minimum": 0, "maximum": 1000000},
+                {"type": "null"}
+              ]
+            },
+            "by_route": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["a_reality", "a_hy2", "b_reality", "b_hy2", "direct", "unknown"],
+              "properties": {
+                "a_reality": {"oneOf": [{"type": "integer", "minimum": 0, "maximum": 1000000}, {"type": "null"}]},
+                "a_hy2": {"oneOf": [{"type": "integer", "minimum": 0, "maximum": 1000000}, {"type": "null"}]},
+                "b_reality": {"oneOf": [{"type": "integer", "minimum": 0, "maximum": 1000000}, {"type": "null"}]},
+                "b_hy2": {"oneOf": [{"type": "integer", "minimum": 0, "maximum": 1000000}, {"type": "null"}]},
+                "direct": {"oneOf": [{"type": "integer", "minimum": 0, "maximum": 1000000}, {"type": "null"}]},
+                "unknown": {"oneOf": [{"type": "integer", "minimum": 0, "maximum": 1000000}, {"type": "null"}]}
+              }
+            }
+          }
+        }
+      }
+    },
+    "contract_revision": {
+      "const": 7,
+      "description": "Rev-7 discriminator. A rev-7 snapshot is a Linux linux_vps body carrying traffic_observation; the frozen rev-5 body (no contract_revision, no traffic_observation) remains valid and is the only form an agent may emit when the center does not advertise collect.monitor_export."
+    },
+    "traffic_observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Per-inbound observed LOWER BOUND for one monitor-v2 observation epoch (counter_scope=observation_epoch, exactness=lower_bound). Required in every rev-7 snapshot, including the documented all-zero no-observation sentinel (source_epoch=32 zero hex, sequence=0, observed_at=0, age_seconds=86400, freshness=unavailable, availability=unavailable, active_connections=null, rate_window_seconds=null, inbounds=[]) and the distinct status-only real-epoch unavailable form (valid export with no observed values: real source_epoch/sequence/observed_at kept, no byte/rate/active values, availability=freshness=unavailable). Epoch semantics: the monitor's in-memory counters restart at zero for a new source_epoch, BUT the first subscription reset batch may include active/recent-lifecycle authoritative totals that include bytes transferred before the epoch began; the value is therefore an observed lower bound on the lifecycles the monitor observed, never a daemon-lifetime exact total and never a pure observation-epoch byte delta. JSON Schema cannot express: unique inbound_tag values (duplicate tags are invalid), coherence between freshness and age_seconds, coherence between availability and quality/values, rate/window coupling, the base traffic=[] rule, the expected-tag allowlist, effective-dated-cadence freshness, or lexical integer enforcement (a JSON number such as 1.0 is an integer to JSON Schema but is not a canonical integer byte field). Those rules are normative in the rev-7 overlay and enforced by the implementation.",
+      "required": ["source", "source_epoch", "sequence", "observed_at", "age_seconds",
+                   "freshness", "availability", "counter_scope", "exactness",
+                   "active_connections", "rate_window_seconds", "inbounds"],
+      "properties": {
+        "source": {"const": "monitor_readonly_export"},
+        "source_epoch": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+        "sequence": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        "observed_at": {"type": "integer", "minimum": 0, "maximum": 1000000000000},
+        "age_seconds": {"type": "integer", "minimum": 0, "maximum": 86400},
+        "freshness": {"enum": ["fresh", "stale", "unavailable"]},
+        "availability": {"enum": ["ok", "partial", "unavailable"]},
+        "counter_scope": {"const": "observation_epoch"},
+        "exactness": {"const": "lower_bound"},
+        "active_connections": {"oneOf": [{"type": "integer", "minimum": 0, "maximum": 1000000}, {"type": "null"}]},
+        "rate_window_seconds": {"oneOf": [{"type": "number", "exclusiveMinimum": 0, "maximum": 3600}, {"type": "null"}]},
+        "inbounds": {
+          "type": "array", "minItems": 0, "maxItems": 8,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["inbound_tag", "kind", "observed_at", "availability", "quality",
+                         "uplink_observed_lower_bound_bytes", "downlink_observed_lower_bound_bytes",
+                         "uplink_observed_rate_bps", "downlink_observed_rate_bps",
+                         "active_connections"],
+            "properties": {
+              "inbound_tag": {"type": "string", "maxLength": 64,
+                              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"},
+              "kind": {"enum": ["reality", "hysteria2", "other"]},
+              "observed_at": {"type": "integer", "minimum": 0, "maximum": 1000000000000},
+              "availability": {"enum": ["ok", "partial", "unavailable"]},
+              "quality": {"enum": ["lower_bound", "partial", "unavailable"]},
+              "uplink_observed_lower_bound_bytes": {"oneOf": [{"type": "integer", "minimum": 0, "maximum": 9007199254740991}, {"type": "null"}]},
+              "downlink_observed_lower_bound_bytes": {"oneOf": [{"type": "integer", "minimum": 0, "maximum": 9007199254740991}, {"type": "null"}]},
+              "uplink_observed_rate_bps": {"oneOf": [{"type": "number", "minimum": 0, "maximum": 1000000000000}, {"type": "null"}]},
+              "downlink_observed_rate_bps": {"oneOf": [{"type": "number", "minimum": 0, "maximum": 1000000000000}, {"type": "null"}]},
+              "active_connections": {"oneOf": [{"type": "integer", "minimum": 0, "maximum": 1000000}, {"type": "null"}]}
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "route_token": {
+      "description": "Exactly six tokens, aligned with the existing windowsobs role enum; center aggregates A={a_reality,a_hy2}, B={b_reality,b_hy2} and keeps protocol drill-down.",
+      "enum": ["a_reality", "a_hy2", "b_reality", "b_hy2", "direct", "unknown"]
+    },
+    "terminal_reason_code": {
+      "enum": [
+        "controller_unreachable",
+        "controller_auth",
+        "malformed_response",
+        "route_unbound",
+        "source_authorization_unproven"
+      ]
+    }
+  }
+}

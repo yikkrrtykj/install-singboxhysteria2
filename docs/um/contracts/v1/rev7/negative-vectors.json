@@ -1,0 +1,1270 @@
+{
+  "v": 1,
+  "contract": "um-v1",
+  "revision": 7,
+  "status": "candidate formal overlay pending independent review/CI/owner merge; NOT published or frozen. Schema-stage vectors (including the traffic-export schema and raw-body lexical cases) are executed by um/internal/schema/rev7_negative_vectors_test.go; semantic/platform/config-generation vectors require the implementation PR.",
+  "description": "Negative and gating contract vectors for the rev-7 additive Linux read-only traffic observation. Each vector names its rejection stage: json_schema (executed by the contract conformance test), implementation_semantic (schema-valid but rejected by normative coherence/privacy/lexical rules), platform_isolation (rejected by authenticated node class), or config_generation (center emits/omits the key exactly as specified and the agent fails closed on invalid config). Most vectors use RFC 6901 JSON Pointers against a committed base body. Lexical rules cannot be represented by JSON Patch because JSON parsing normalizes numbers, so a vector may instead carry raw_body: the exact JSON bytes the implementation must feed. For raw_body vectors, json_schema stage means the schema must reject those bytes; implementation_semantic means the schema accepts them (documenting the schema limitation) and the implementation must reject the lexical form. The four CFG-REV7 cases encode the explicit agent-version gate (minimum agent.version 1.1.0); CFG-REV7-05 is the Windows/unknown-class case.",
+  "runner": "um/internal/schema/rev7_schema_test.go (overlay compile + positive fixtures, including traffic-export.schema.json) and um/internal/schema/rev7_negative_vectors_test.go (json_schema stage, including raw_body lexical cases)",
+  "gating_rules": {
+    "rule": "CFG-REV7",
+    "min_rev7_agent_version": "1.1.0",
+    "center_behaviour": "The center tracks the latest agent.version received in a successfully authenticated signed snapshot. It MUST omit the collect.monitor_export key entirely (not emit false) while that version is unknown, missing or <1.1.0, even if the stored source-enable flag is set. Once a signed snapshot reports >=1.1.0, the stored source-enable flag becomes effective at the next config pull; no manual re-enable or extra handshake is needed. If a later signed snapshot reports an older version (agent rollback), the center MUST omit the key again on the next pull.",
+    "comparison": "Compare the numeric major.minor.patch components of the frozen agent.version grammar: rev-7-capable iff major > 1 or (major == 1 and minor >= 1). Suffixes do not make an otherwise older build eligible. This is a compatibility gate, not an authorization or security boundary.",
+    "not_authorization": "The version gate grants no privilege: the source still requires the versioned source audit, the operator/rollout gate, the linux_vps class and the applied config switch. An old agent cannot gain anything by misreporting a version; it would receive a config it rejects fail-closed."
+  },
+  "bases": {
+    "report": "docs/um/contracts/v1/rev7/examples/report-snapshot.json",
+    "config": "docs/um/contracts/v1/rev7/examples/agent-config.json",
+    "export": "docs/um/contracts/v1/rev7/examples/traffic-export.json"
+  },
+  "vectors": [
+    {
+      "id": "NEG7-SNAP-01",
+      "target": "report-snapshot.rev7",
+      "stage": "json_schema",
+      "base": "report",
+      "mutation": "exactness claims exact instead of lower_bound (exact/lower-bound ambiguity is forbidden)",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/traffic_observation/exactness",
+          "value": "exact"
+        }
+      ],
+      "expected": {
+        "stage": "json_schema",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "exactness is const lower_bound; a lower bound must never be represented as an exact total"
+      }
+    },
+    {
+      "id": "NEG7-SNAP-02",
+      "target": "report-snapshot.rev7",
+      "stage": "json_schema",
+      "base": "report",
+      "mutation": "per-inbound lower-bound bytes are a fractional number (1234.5)",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/traffic_observation/inbounds/0/uplink_observed_lower_bound_bytes",
+          "value": 1234.5
+        }
+      ],
+      "expected": {
+        "stage": "json_schema",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "byte counters are integers; fractional observed bytes are rejected"
+      }
+    },
+    {
+      "id": "NEG7-SNAP-03",
+      "target": "report-snapshot.rev7",
+      "stage": "implementation_semantic",
+      "base": "report",
+      "mutation": "byte counter is lexically a JSON float (1048576.0) even though its mathematical value is integral",
+      "expected": {
+        "stage": "implementation_semantic",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "JSON Schema treats 1048576.0 as an integer, so the center MUST additionally enforce canonical integer lexical form for byte/sequence/time fields (no '.', 'e' or 'E' token)"
+      },
+      "raw_body": "{\"v\":1,\"type\":\"snapshot\",\"report_id\":\"7c1e4b9a-2d3f-4e5a-8b6c-9d0e1f2a3b4c\",\"collected_at\":1795622400,\"agent\":{\"version\":\"1.1.0\",\"uptime_s\":86400},\"host\":{\"os\":\"linux\",\"kernel\":\"6.8.0-45-generic\",\"arch\":\"amd64\"},\"availability\":{\"system\":\"ok\",\"services\":\"ok\",\"protocols\":\"ok\",\"traffic\":\"partial\",\"clients\":\"unavailable\"},\"counter_epoch\":\"5f0c2d7a91b4e6c8a3d1f9052b7e4c6a\",\"system\":{\"cpu_pct\":12.5,\"load1\":0.42,\"mem_total_bytes\":4294967296,\"mem_used_bytes\":1610612736,\"disk_total_bytes\":42949672960,\"disk_used_bytes\":10737418240,\"net_rx_bytes\":123456789,\"net_tx_bytes\":987654321},\"services\":[{\"name\":\"sing-box\",\"state\":\"active\"}],\"protocols\":[{\"kind\":\"reality\",\"inbound_tag\":\"vless-in\",\"state\":\"up\",\"reason\":\"ok\",\"observed_at\":1795622399},{\"kind\":\"hysteria2\",\"inbound_tag\":\"hy2-in\",\"state\":\"up\",\"reason\":\"ok\",\"observed_at\":1795622399}],\"traffic\":[],\"clients\":{\"active\":null,\"tracked\":null,\"summaries\":[]},\"contract_revision\":7,\"traffic_observation\":{\"source\":\"monitor_readonly_export\",\"source_epoch\":\"3f9c2d7a91b4e6c8a3d1f9052b7e4c6a\",\"sequence\":8421,\"observed_at\":1795622399,\"age_seconds\":1,\"freshness\":\"fresh\",\"availability\":\"ok\",\"counter_scope\":\"observation_epoch\",\"exactness\":\"lower_bound\",\"active_connections\":4,\"rate_window_seconds\":5,\"inbounds\":[{\"inbound_tag\":\"vless-in\",\"kind\":\"reality\",\"observed_at\":1795622399,\"availability\":\"ok\",\"quality\":\"lower_bound\",\"uplink_observed_lower_bound_bytes\":1048576.0,\"downlink_observed_lower_bound_bytes\":20971520,\"uplink_observed_rate_bps\":125000.5,\"downlink_observed_rate_bps\":480000.25,\"active_connections\":2},{\"inbound_tag\":\"hy2-in\",\"kind\":\"hysteria2\",\"observed_at\":1795622399,\"availability\":\"ok\",\"quality\":\"lower_bound\",\"uplink_observed_lower_bound_bytes\":524288,\"downlink_observed_lower_bound_bytes\":8388608,\"uplink_observed_rate_bps\":48000,\"downlink_observed_rate_bps\":160000,\"active_connections\":2}]}}",
+      "raw_note": "JSON Patch cannot carry the lexical token 1048576.0 because a JSON parser normalizes it to the integer 1048576; the implementation must feed these exact raw bytes (this committed string) and reject the non-canonical integer token."
+    },
+    {
+      "id": "NEG7-SNAP-04",
+      "target": "report-snapshot.rev7",
+      "stage": "json_schema",
+      "base": "report",
+      "mutation": "per-inbound lower-bound bytes are negative",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/traffic_observation/inbounds/1/downlink_observed_lower_bound_bytes",
+          "value": -1
+        }
+      ],
+      "expected": {
+        "stage": "json_schema",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "observed counters are unsigned and cannot decrease below zero in one observation epoch"
+      }
+    },
+    {
+      "id": "NEG7-SNAP-05",
+      "target": "report-snapshot.rev7",
+      "stage": "json_schema",
+      "base": "report",
+      "mutation": "byte counter exceeds the 2^53-1 safe-integer bound",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/traffic_observation/inbounds/0/downlink_observed_lower_bound_bytes",
+          "value": 9007199254740992
+        }
+      ],
+      "expected": {
+        "stage": "json_schema",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "rev-7 byte counters are bounded to 9007199254740991 so every JSON consumer (including a JavaScript/front-end) sees the exact value; overflow must never wrap or be rounded by the implementation"
+      }
+    },
+    {
+      "id": "NEG7-SNAP-06",
+      "target": "report-snapshot.rev7",
+      "stage": "json_schema",
+      "base": "report",
+      "mutation": "source_epoch is uppercase hex instead of 32 lowercase hex characters",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/traffic_observation/source_epoch",
+          "value": "5F0C2D7A91B4E6C8A3D1F9052B7E4C6A"
+        }
+      ],
+      "expected": {
+        "stage": "json_schema",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "source_epoch grammar is exactly ^[0-9a-f]{32}$ and is independent of the base counter_epoch"
+      }
+    },
+    {
+      "id": "NEG7-SNAP-07",
+      "target": "report-snapshot.rev7",
+      "stage": "json_schema",
+      "base": "report",
+      "mutation": "observation sequence is negative",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/traffic_observation/sequence",
+          "value": -1
+        }
+      ],
+      "expected": {
+        "stage": "json_schema",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "sequence is a non-negative safe integer that increases inside one source_epoch and never authorizes anything"
+      }
+    },
+    {
+      "id": "NEG7-SNAP-08",
+      "target": "report-snapshot.rev7",
+      "stage": "json_schema",
+      "base": "report",
+      "mutation": "contract_revision is 6 (a rev-6 body cannot carry the rev-7 observation object)",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/contract_revision",
+          "value": 6
+        }
+      ],
+      "expected": {
+        "stage": "json_schema",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "rev-7 bodies are discriminated by the required const contract_revision=7; rev-5 bodies have no contract_revision at all"
+      }
+    },
+    {
+      "id": "NEG7-SNAP-09",
+      "target": "report-snapshot.rev7",
+      "stage": "json_schema",
+      "base": "report",
+      "mutation": "freshness token is not in the closed enum (current)",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/traffic_observation/freshness",
+          "value": "current"
+        }
+      ],
+      "expected": {
+        "stage": "json_schema",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "freshness is exactly fresh|stale|unavailable; unknown tokens are rejected, never rendered"
+      }
+    },
+    {
+      "id": "NEG7-SNAP-10",
+      "target": "report-snapshot.rev7",
+      "stage": "json_schema",
+      "base": "report",
+      "mutation": "per-inbound quality token is not in the closed enum (exact)",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/traffic_observation/inbounds/1/quality",
+          "value": "exact"
+        }
+      ],
+      "expected": {
+        "stage": "json_schema",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "quality is exactly lower_bound|partial|unavailable; no observation from the monitor export is exact"
+      }
+    },
+    {
+      "id": "NEG7-SNAP-11",
+      "target": "report-snapshot.rev7",
+      "stage": "json_schema",
+      "base": "report",
+      "mutation": "unknown field inside traffic_observation (exact_total_bytes)",
+      "patch": [
+        {
+          "op": "add",
+          "path": "/traffic_observation/exact_total_bytes",
+          "value": 22020096
+        }
+      ],
+      "expected": {
+        "stage": "json_schema",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "traffic_observation and every nested object are closed (additionalProperties=false); no side channel may smuggle a total or arbitrary text"
+      }
+    },
+    {
+      "id": "NEG7-SNAP-12",
+      "target": "report-snapshot.rev7",
+      "stage": "json_schema",
+      "base": "report",
+      "mutation": "inbounds array exceeds the maximum of 8 entries",
+      "patch": [
+        {
+          "op": "add",
+          "path": "/traffic_observation/inbounds/-",
+          "value": {
+            "inbound_tag": "in3",
+            "kind": "other",
+            "observed_at": 1795622399,
+            "availability": "ok",
+            "quality": "lower_bound",
+            "uplink_observed_lower_bound_bytes": 0,
+            "downlink_observed_lower_bound_bytes": 0,
+            "uplink_observed_rate_bps": 0,
+            "downlink_observed_rate_bps": 0,
+            "active_connections": 0
+          }
+        },
+        {
+          "op": "add",
+          "path": "/traffic_observation/inbounds/-",
+          "value": {
+            "inbound_tag": "in4",
+            "kind": "other",
+            "observed_at": 1795622399,
+            "availability": "ok",
+            "quality": "lower_bound",
+            "uplink_observed_lower_bound_bytes": 0,
+            "downlink_observed_lower_bound_bytes": 0,
+            "uplink_observed_rate_bps": 0,
+            "downlink_observed_rate_bps": 0,
+            "active_connections": 0
+          }
+        },
+        {
+          "op": "add",
+          "path": "/traffic_observation/inbounds/-",
+          "value": {
+            "inbound_tag": "in5",
+            "kind": "other",
+            "observed_at": 1795622399,
+            "availability": "ok",
+            "quality": "lower_bound",
+            "uplink_observed_lower_bound_bytes": 0,
+            "downlink_observed_lower_bound_bytes": 0,
+            "uplink_observed_rate_bps": 0,
+            "downlink_observed_rate_bps": 0,
+            "active_connections": 0
+          }
+        },
+        {
+          "op": "add",
+          "path": "/traffic_observation/inbounds/-",
+          "value": {
+            "inbound_tag": "in6",
+            "kind": "other",
+            "observed_at": 1795622399,
+            "availability": "ok",
+            "quality": "lower_bound",
+            "uplink_observed_lower_bound_bytes": 0,
+            "downlink_observed_lower_bound_bytes": 0,
+            "uplink_observed_rate_bps": 0,
+            "downlink_observed_rate_bps": 0,
+            "active_connections": 0
+          }
+        },
+        {
+          "op": "add",
+          "path": "/traffic_observation/inbounds/-",
+          "value": {
+            "inbound_tag": "in7",
+            "kind": "other",
+            "observed_at": 1795622399,
+            "availability": "ok",
+            "quality": "lower_bound",
+            "uplink_observed_lower_bound_bytes": 0,
+            "downlink_observed_lower_bound_bytes": 0,
+            "uplink_observed_rate_bps": 0,
+            "downlink_observed_rate_bps": 0,
+            "active_connections": 0
+          }
+        },
+        {
+          "op": "add",
+          "path": "/traffic_observation/inbounds/-",
+          "value": {
+            "inbound_tag": "in8",
+            "kind": "other",
+            "observed_at": 1795622399,
+            "availability": "ok",
+            "quality": "lower_bound",
+            "uplink_observed_lower_bound_bytes": 0,
+            "downlink_observed_lower_bound_bytes": 0,
+            "uplink_observed_rate_bps": 0,
+            "downlink_observed_rate_bps": 0,
+            "active_connections": 0
+          }
+        },
+        {
+          "op": "add",
+          "path": "/traffic_observation/inbounds/-",
+          "value": {
+            "inbound_tag": "in9",
+            "kind": "other",
+            "observed_at": 1795622399,
+            "availability": "ok",
+            "quality": "lower_bound",
+            "uplink_observed_lower_bound_bytes": 0,
+            "downlink_observed_lower_bound_bytes": 0,
+            "uplink_observed_rate_bps": 0,
+            "downlink_observed_rate_bps": 0,
+            "active_connections": 0
+          }
+        }
+      ],
+      "expected": {
+        "stage": "json_schema",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "inbounds is capped at 8, matching expected_inbound_tags maxItems 8; larger arrays are rejected before storage"
+      }
+    },
+    {
+      "id": "NEG7-SNAP-13",
+      "target": "report-snapshot.rev7",
+      "stage": "json_schema",
+      "base": "report",
+      "mutation": "required freshness field removed",
+      "patch": [
+        {
+          "op": "remove",
+          "path": "/traffic_observation/freshness"
+        }
+      ],
+      "expected": {
+        "stage": "json_schema",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "all twelve traffic_observation fields are required, including freshness and availability; there is no implicit default"
+      }
+    },
+    {
+      "id": "NEG7-SNAP-14",
+      "target": "report-snapshot.rev7",
+      "stage": "json_schema",
+      "base": "report",
+      "mutation": "per-inbound observed rate is negative",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/traffic_observation/inbounds/0/uplink_observed_rate_bps",
+          "value": -0.5
+        }
+      ],
+      "expected": {
+        "stage": "json_schema",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "observed rates are non-negative numbers bounded to 10^12 bps"
+      }
+    },
+    {
+      "id": "NEG7-SNAP-15",
+      "target": "report-snapshot.rev7",
+      "stage": "json_schema",
+      "base": "report",
+      "mutation": "source is monitor_export instead of the frozen monitor_readonly_export token",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/traffic_observation/source",
+          "value": "monitor_export"
+        }
+      ],
+      "expected": {
+        "stage": "json_schema",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "the report source token is const monitor_readonly_export; monitor_export is the agent-config switch name, not the observation source"
+      }
+    },
+    {
+      "id": "NEG7-SNAP-16",
+      "target": "report-snapshot.rev7",
+      "stage": "json_schema",
+      "base": "report",
+      "mutation": "age_seconds is fractional",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/traffic_observation/age_seconds",
+          "value": 1.5
+        }
+      ],
+      "expected": {
+        "stage": "json_schema",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "age_seconds is an integer in [0,86400] computed by the agent as collected_at - observed_at"
+      }
+    },
+    {
+      "id": "NEG7-SNAP-17",
+      "target": "report-snapshot.rev7",
+      "stage": "json_schema",
+      "base": "report",
+      "mutation": "observed_at exceeds the contract timestamp bound",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/traffic_observation/observed_at",
+          "value": 1000000000001
+        }
+      ],
+      "expected": {
+        "stage": "json_schema",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "every rev-5/rev-7 timestamp is bounded to 10^12 epoch seconds"
+      }
+    },
+    {
+      "id": "NEG7-SNAP-18",
+      "target": "report-snapshot.rev7",
+      "stage": "implementation_semantic",
+      "base": "report",
+      "mutation": "freshness is stale while top-level availability is ok (stale observation presented as fully available)",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/traffic_observation/freshness",
+          "value": "stale"
+        },
+        {
+          "op": "replace",
+          "path": "/traffic_observation/age_seconds",
+          "value": 3600
+        }
+      ],
+      "expected": {
+        "stage": "implementation_semantic",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "availability=ok requires freshness=fresh; a stale observation can only be partial or unavailable"
+      }
+    },
+    {
+      "id": "NEG7-SNAP-19",
+      "target": "report-snapshot.rev7",
+      "stage": "implementation_semantic",
+      "base": "report",
+      "mutation": "freshness is stale although age_seconds is inside the fresh bound",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/traffic_observation/freshness",
+          "value": "stale"
+        },
+        {
+          "op": "replace",
+          "path": "/traffic_observation/availability",
+          "value": "partial"
+        }
+      ],
+      "expected": {
+        "stage": "implementation_semantic",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "freshness is derived from age_seconds and the applied cadence: fresh iff age <= max(2*cadence,120)s (capped at 600s); a label contradicting its own age is rejected"
+      }
+    },
+    {
+      "id": "NEG7-SNAP-20",
+      "target": "report-snapshot.rev7",
+      "stage": "implementation_semantic",
+      "base": "report",
+      "mutation": "inbound tag is not one of the center-configured expected_inbound_tags (rogue-in)",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/traffic_observation/inbounds/0/inbound_tag",
+          "value": "rogue-in"
+        }
+      ],
+      "expected": {
+        "stage": "implementation_semantic",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "the agent must only report tags from its applied expected_inbound_tags allowlist; the center independently rejects a body containing an unauthorized tag or kind rather than storing it"
+      }
+    },
+    {
+      "id": "NEG7-SNAP-21",
+      "target": "report-snapshot.rev7",
+      "stage": "implementation_semantic",
+      "base": "report",
+      "mutation": "kind is a valid enum value but contradicts the configured kind for vless-in (marked hysteria2)",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/traffic_observation/inbounds/0/kind",
+          "value": "hysteria2"
+        }
+      ],
+      "expected": {
+        "stage": "implementation_semantic",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "tag and kind must match the applied expected_inbound_tags exactly; attribution is never guessed or rewritten"
+      }
+    },
+    {
+      "id": "NEG7-SNAP-22",
+      "target": "report-snapshot.rev7",
+      "stage": "implementation_semantic",
+      "base": "report",
+      "mutation": "two inbounds entries carry the same inbound_tag",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/traffic_observation/inbounds/1/inbound_tag",
+          "value": "vless-in"
+        }
+      ],
+      "expected": {
+        "stage": "implementation_semantic",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "duplicate inbound tags cannot be expressed in JSON Schema and MUST be rejected by the implementation; per-tag counters are never summed twice"
+      }
+    },
+    {
+      "id": "NEG7-SNAP-23",
+      "target": "report-snapshot.rev7",
+      "stage": "implementation_semantic",
+      "base": "report",
+      "mutation": "observed rates are present while rate_window_seconds is null",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/traffic_observation/rate_window_seconds",
+          "value": null
+        }
+      ],
+      "expected": {
+        "stage": "implementation_semantic",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "a rate without a declared window is uninterpretable; null window requires null rates (and vice versa when the observation is available)"
+      }
+    },
+    {
+      "id": "NEG7-SNAP-24",
+      "target": "report-snapshot.rev7",
+      "stage": "implementation_semantic",
+      "base": "report",
+      "mutation": "base traffic array is non-empty and availability.traffic is ok, presenting observed lower bounds as total bytes",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/availability/traffic",
+          "value": "ok"
+        },
+        {
+          "op": "replace",
+          "path": "/traffic",
+          "value": [
+            {
+              "scope": "protocol",
+              "inbound_tag": "vless-in",
+              "uplink_total_bytes": 1048576,
+              "downlink_total_bytes": 20971520
+            }
+          ]
+        }
+      ],
+      "expected": {
+        "stage": "implementation_semantic",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "for a rev-7 Linux body the base traffic array MUST stay [] and availability.traffic MUST NOT be ok; observed lower bounds live only in traffic_observation and are never relabelled as totals"
+      }
+    },
+    {
+      "id": "NEG7-SNAP-25",
+      "target": "report-snapshot.rev7",
+      "stage": "implementation_semantic",
+      "base": "report",
+      "mutation": "per-inbound quality is lower_bound while both byte counters are null",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/traffic_observation/inbounds/1/quality",
+          "value": "lower_bound"
+        },
+        {
+          "op": "replace",
+          "path": "/traffic_observation/inbounds/1/uplink_observed_lower_bound_bytes",
+          "value": null
+        },
+        {
+          "op": "replace",
+          "path": "/traffic_observation/inbounds/1/downlink_observed_lower_bound_bytes",
+          "value": null
+        }
+      ],
+      "expected": {
+        "stage": "implementation_semantic",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "quality=lower_bound requires both integer lower-bound counters; missing data is quality=unavailable/null, never a fabricated zero or a lower_bound label with no value"
+      }
+    },
+    {
+      "id": "NEG7-SNAP-26",
+      "target": "report-snapshot.rev7",
+      "stage": "implementation_semantic",
+      "base": "report",
+      "mutation": "observed_at is in the future relative to collected_at (collected_at + 120s) while age_seconds claims 0",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/traffic_observation/observed_at",
+          "value": 1795622520
+        },
+        {
+          "op": "replace",
+          "path": "/traffic_observation/age_seconds",
+          "value": 0
+        }
+      ],
+      "expected": {
+        "stage": "implementation_semantic",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "age_seconds must equal collected_at - observed_at, and observed_at must not exceed collected_at + 60s; a future observation is rejected as untrusted clock data"
+      }
+    },
+    {
+      "id": "NEG7-SNAP-27",
+      "target": "report-snapshot.rev7",
+      "stage": "implementation_semantic",
+      "base": "report",
+      "mutation": "single-inbound active connection counts do not add up to the top-level active_connections when observation availability is ok",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/traffic_observation/inbounds/0/active_connections",
+          "value": 3
+        }
+      ],
+      "expected": {
+        "stage": "implementation_semantic",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "when availability=ok, top-level active_connections equals the sum of per-inbound counts; an incoherent count is rejected, never silently corrected"
+      }
+    },
+    {
+      "id": "NEG7-SNAP-28",
+      "target": "report-snapshot.rev7",
+      "stage": "platform_isolation",
+      "base": "report",
+      "mutation": "a windows_terminal node submits this rev-7 body unchanged (contract_revision/traffic_observation present)",
+      "patch": [],
+      "expected": {
+        "stage": "platform_isolation",
+        "http": 400,
+        "error": "platform_mismatch",
+        "reason": "rev-7 observation is Linux-only; node_class is bound by the enrollment token and the center rejects the payload before storage"
+      }
+    },
+    {
+      "id": "NEG7-SNAP-29",
+      "target": "report-snapshot.rev7",
+      "stage": "implementation_semantic",
+      "base": "report",
+      "mutation": "a linux_vps rev-7 body also carries the Windows terminal object",
+      "patch": [
+        {
+          "op": "add",
+          "path": "/terminal",
+          "value": {
+            "selection": {
+              "availability": "unavailable",
+              "sampled_at": 1795622399,
+              "route": null,
+              "reason_code": "source_authorization_unproven"
+            },
+            "active_connections": {
+              "availability": "unavailable",
+              "sampled_at": 1795622399,
+              "total": null,
+              "by_route": {
+                "a_reality": null,
+                "a_hy2": null,
+                "b_reality": null,
+                "b_hy2": null,
+                "direct": null,
+                "unknown": null
+              }
+            }
+          }
+        }
+      ],
+      "expected": {
+        "stage": "implementation_semantic",
+        "http": 400,
+        "error": "platform_mismatch",
+        "reason": "the base rev-5 platform isolation remains in force: a linux_vps node MUST NOT send terminal, with or without rev-7 observation"
+      }
+    },
+    {
+      "id": "NEG7-SNAP-30",
+      "target": "report-snapshot.rev7",
+      "stage": "implementation_semantic",
+      "base": "report",
+      "mutation": "no-observation sentinel is incomplete (all-zero epoch but nonzero sequence/observed_at)",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/traffic_observation/source_epoch",
+          "value": "00000000000000000000000000000000"
+        },
+        {
+          "op": "replace",
+          "path": "/traffic_observation/availability",
+          "value": "unavailable"
+        },
+        {
+          "op": "replace",
+          "path": "/traffic_observation/freshness",
+          "value": "unavailable"
+        },
+        {
+          "op": "replace",
+          "path": "/traffic_observation/age_seconds",
+          "value": 86400
+        },
+        {
+          "op": "replace",
+          "path": "/traffic_observation/active_connections",
+          "value": null
+        },
+        {
+          "op": "replace",
+          "path": "/traffic_observation/rate_window_seconds",
+          "value": null
+        },
+        {
+          "op": "replace",
+          "path": "/traffic_observation/inbounds",
+          "value": []
+        }
+      ],
+      "expected": {
+        "stage": "implementation_semantic",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "the documented no-observation sentinel requires sequence=0 and observed_at=0 as well; a zero epoch is only legal in the exact sentinel form and is never treated as an observation"
+      }
+    },
+    {
+      "id": "NEG7-CFG-01",
+      "target": "agent-config.rev7",
+      "stage": "config_generation",
+      "base": "config",
+      "mutation": "collect.monitor_export=true on a windows_terminal config",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/node_class",
+          "value": "windows_terminal"
+        }
+      ],
+      "expected": {
+        "stage": "config_generation",
+        "center": "MUST NOT EMIT",
+        "agent": "reject_config_fail_closed",
+        "reason": "the rev-7 source is linux_vps-only; a Windows node can never receive it and a Windows agent rejects a config that enables a class-forbidden source (platform_mismatch) while keeping its previous config",
+        "rule": "CFG-REV7-05"
+      }
+    },
+    {
+      "id": "NEG7-CFG-02",
+      "target": "agent-config.rev7",
+      "stage": "json_schema",
+      "base": "config",
+      "mutation": "collect.monitor_export is the string \"true\" instead of a JSON boolean",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/collect/monitor_export",
+          "value": "true"
+        }
+      ],
+      "expected": {
+        "stage": "json_schema",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "the switch is a boolean; a string or numeric truthy value is rejected rather than coerced"
+      }
+    },
+    {
+      "id": "NEG7-CFG-03",
+      "target": "agent-config.rev7",
+      "stage": "json_schema",
+      "base": "config",
+      "mutation": "collect contains an unknown source key besides monitor_export (traffic_probe=true)",
+      "patch": [
+        {
+          "op": "add",
+          "path": "/collect/traffic_probe",
+          "value": true
+        }
+      ],
+      "expected": {
+        "stage": "json_schema",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "collect stays closed to the six frozen rev-5 switches plus the single optional monitor_export; no new source can appear by config"
+      }
+    },
+    {
+      "id": "NEG7-CFG-04",
+      "target": "agent-config.rev7",
+      "stage": "config_generation",
+      "base": "config",
+      "scenario": "CFG-REV7-01: the stored source-enable flag is set, but the node has no authenticated snapshot yet (agent.version unknown)",
+      "patch": [],
+      "expected": {
+        "stage": "config_generation",
+        "rule": "CFG-REV7-01",
+        "center": "MUST OMIT the collect.monitor_export key entirely (not false)",
+        "reason": "an unknown agent version is not rev-7 eligible; emitting the key to a rev-5 agent would be rejected by its strict config validator"
+      }
+    },
+    {
+      "id": "NEG7-CFG-05",
+      "target": "agent-config.rev7",
+      "stage": "config_generation",
+      "base": "config",
+      "scenario": "CFG-REV7-02: the stored source-enable flag is set and the latest signed snapshot reports agent.version 1.0.0",
+      "patch": [],
+      "expected": {
+        "stage": "config_generation",
+        "rule": "CFG-REV7-02",
+        "center": "MUST OMIT the collect.monitor_export key entirely (not false)",
+        "reason": "1.0.0 is below the rev-7 minimum agent.version 1.1.0; the key is withheld until an upgrade is reported"
+      }
+    },
+    {
+      "id": "NEG7-CFG-06",
+      "target": "agent-config.rev7",
+      "stage": "config_generation",
+      "base": "config",
+      "scenario": "CFG-REV7-03: the stored source-enable flag is set and a signed snapshot has reported agent.version 1.1.0",
+      "patch": [],
+      "expected": {
+        "stage": "config_generation",
+        "rule": "CFG-REV7-03",
+        "center": "MUST INCLUDE collect.monitor_export=true in the next config pull (failure if absent)",
+        "reason": "the stored source flag becomes effective after the signed snapshot reports the minimum version; no manual re-enable or extra handshake is required"
+      }
+    },
+    {
+      "id": "NEG7-CFG-07",
+      "target": "agent-config.rev7",
+      "stage": "config_generation",
+      "base": "config",
+      "scenario": "CFG-REV7-04: the latest signed snapshot reports agent.version 1.0.0 after a previous 1.1.0 snapshot (agent binary rollback)",
+      "patch": [],
+      "expected": {
+        "stage": "config_generation",
+        "rule": "CFG-REV7-04",
+        "center": "MUST OMIT the collect.monitor_export key again on the next pull",
+        "reason": "a downgraded/rolled-back agent must not receive rev-7 config; the center re-evaluates the latest signed version each pull"
+      }
+    },
+    {
+      "id": "NEG7-EXP-01",
+      "target": "traffic-export.rev7",
+      "stage": "json_schema",
+      "base": "export",
+      "mutation": "unknown top-level field debug=true in the export document",
+      "patch": [
+        {
+          "op": "add",
+          "path": "/debug",
+          "value": true
+        }
+      ],
+      "expected": {
+        "stage": "json_schema",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "the export document is a closed 14-member allow-list; unknown fields are rejected"
+      }
+    },
+    {
+      "id": "NEG7-EXP-02",
+      "target": "traffic-export.rev7",
+      "stage": "json_schema",
+      "base": "export",
+      "mutation": "required source_epoch field removed",
+      "patch": [
+        {
+          "op": "remove",
+          "path": "/source_epoch"
+        }
+      ],
+      "expected": {
+        "stage": "json_schema",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "all 14 top-level members are required; the consumer rejects a partial document"
+      }
+    },
+    {
+      "id": "NEG7-EXP-03",
+      "target": "traffic-export.rev7",
+      "stage": "json_schema",
+      "base": "export",
+      "mutation": "per-inbound observed_uplink_bytes exceeds the 2^53-1 safe integer bound",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/inbounds/0/observed_uplink_bytes",
+          "value": 9007199254740992
+        }
+      ],
+      "expected": {
+        "stage": "json_schema",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "counters are bounded to 9007199254740991; over-range values are published null with partial quality instead"
+      }
+    },
+    {
+      "id": "NEG7-EXP-04",
+      "target": "traffic-export.rev7",
+      "stage": "json_schema",
+      "base": "export",
+      "mutation": "per-inbound observed_downlink_bytes is negative",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/inbounds/0/observed_downlink_bytes",
+          "value": -1
+        }
+      ],
+      "expected": {
+        "stage": "json_schema",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "observed lower-bound counters are unsigned safe integers or null"
+      }
+    },
+    {
+      "id": "NEG7-EXP-05",
+      "target": "traffic-export.rev7",
+      "stage": "json_schema",
+      "base": "export",
+      "mutation": "per-inbound observed_uplink_bytes is fractional (1234.5)",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/inbounds/0/observed_uplink_bytes",
+          "value": 1234.5
+        }
+      ],
+      "expected": {
+        "stage": "json_schema",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "byte counters are integers; fractional bytes are rejected"
+      }
+    },
+    {
+      "id": "NEG7-EXP-06",
+      "target": "traffic-export.rev7",
+      "stage": "json_schema",
+      "base": "export",
+      "mutation": "source_epoch is uppercase or not 32 lowercase hex characters",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/source_epoch",
+          "value": "5F0C2D7A91B4E6C8A3D1F9052B7E4C6A"
+        }
+      ],
+      "expected": {
+        "stage": "json_schema",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "source_epoch is exactly 32 lowercase hex characters"
+      }
+    },
+    {
+      "id": "NEG7-EXP-07",
+      "target": "traffic-export.rev7",
+      "stage": "json_schema",
+      "base": "export",
+      "mutation": "observed rates are present while rate_window_seconds is null",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/rate_window_seconds",
+          "value": null
+        }
+      ],
+      "expected": {
+        "stage": "json_schema",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "a non-null rate requires a positive rate_window_seconds (schema-expressible coherence)"
+      }
+    },
+    {
+      "id": "NEG7-EXP-08",
+      "target": "traffic-export.rev7",
+      "stage": "json_schema",
+      "base": "export",
+      "mutation": "quality is lower_bound while observed_uplink_bytes is null",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/inbounds/0/observed_uplink_bytes",
+          "value": null
+        }
+      ],
+      "expected": {
+        "stage": "json_schema",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "lower_bound quality requires both non-null integer counters"
+      }
+    },
+    {
+      "id": "NEG7-EXP-09",
+      "target": "traffic-export.rev7",
+      "stage": "json_schema",
+      "base": "export",
+      "mutation": "quality is unavailable while observed bytes are non-null",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/inbounds/0/quality",
+          "value": "unavailable"
+        }
+      ],
+      "expected": {
+        "stage": "json_schema",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "unavailable quality requires null counters and null rates"
+      }
+    },
+    {
+      "id": "NEG7-EXP-10",
+      "target": "traffic-export.rev7",
+      "stage": "json_schema",
+      "base": "export",
+      "mutation": "monitor_stale is false while monitor_last_success_at is null",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/monitor_last_success_at",
+          "value": null
+        }
+      ],
+      "expected": {
+        "stage": "json_schema",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "a non-stale monitor must carry the last successful observation timestamp"
+      }
+    },
+    {
+      "id": "NEG7-EXP-11",
+      "target": "traffic-export.rev7",
+      "stage": "json_schema",
+      "base": "export",
+      "mutation": "monitor_stale is true while an inbound row still claims lower_bound quality",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/monitor_stale",
+          "value": true
+        }
+      ],
+      "expected": {
+        "stage": "json_schema",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "a stale monitor may only publish partial rows; unobserved tags are omitted instead"
+      }
+    },
+    {
+      "id": "NEG7-EXP-12",
+      "target": "traffic-export.rev7",
+      "stage": "json_schema",
+      "base": "export",
+      "mutation": "rate_window_seconds is 0 (outside the open interval (0,3600])",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/rate_window_seconds",
+          "value": 0
+        }
+      ],
+      "expected": {
+        "stage": "json_schema",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "the rate window must be >0 and <=3600 seconds"
+      }
+    },
+    {
+      "id": "NEG7-EXP-13",
+      "target": "traffic-export.rev7",
+      "stage": "json_schema",
+      "base": "export",
+      "mutation": "sequence exceeds the safe integer bound",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/sequence",
+          "value": 9007199254740992
+        }
+      ],
+      "expected": {
+        "stage": "json_schema",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "sequence is a non-negative safe integer and a local ordering token only"
+      }
+    },
+    {
+      "id": "NEG7-EXP-14",
+      "target": "traffic-export.rev7",
+      "stage": "implementation_semantic",
+      "base": "export",
+      "mutation": "two inbound rows carry the same inbound_tag",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/inbounds/1/inbound_tag",
+          "value": "vless-in"
+        }
+      ],
+      "expected": {
+        "stage": "implementation_semantic",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "JSON Schema cannot express unique tags; the producer allow-list and the consumer reject duplicates"
+      }
+    },
+    {
+      "id": "NEG7-EXP-15",
+      "target": "traffic-export.rev7",
+      "stage": "implementation_semantic",
+      "base": "export",
+      "mutation": "document has trailing bytes after the JSON value or exceeds 64 KiB serialized",
+      "patch": [],
+      "expected": {
+        "stage": "implementation_semantic",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "size and trailing-data rejection are implementation parser rules outside JSON Schema; the raw base fixture itself is valid"
+      }
+    },
+    {
+      "id": "NEG7-EXP-16",
+      "target": "traffic-export.rev7",
+      "stage": "implementation_semantic",
+      "base": "export",
+      "mutation": "per-inbound observed_uplink_bytes is the lexical float token 1048576.0",
+      "patch": [],
+      "expected": {
+        "stage": "implementation_semantic",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "JSON Schema accepts 1048576.0 as an integer, so the implementation must feed the exact raw bytes and reject the non-canonical integer token"
+      },
+      "raw_body": "{\"schema\":\"singbox-monitor-traffic-export\",\"schema_version\":1,\"source\":\"monitor-v2\",\"source_epoch\":\"3f9c2d7a91b4e6c8a3d1f9052b7e4c6a\",\"sequence\":8421,\"generated_at\":1795622400,\"observed_at\":1795622399,\"monitor_stale\":false,\"monitor_last_success_at\":1795622399,\"counter_scope\":\"observation_epoch\",\"exactness\":\"lower_bound\",\"active_connections\":4,\"rate_window_seconds\":5,\"inbounds\":[{\"inbound_tag\":\"vless-in\",\"kind\":\"reality\",\"observed_uplink_bytes\":1048576.0,\"observed_downlink_bytes\":20971520,\"uplink_observed_rate_bps\":125000.5,\"downlink_observed_rate_bps\":480000.25,\"active_connections\":2,\"observed_at\":1795622399,\"quality\":\"lower_bound\"},{\"inbound_tag\":\"hy2-in\",\"kind\":\"hysteria2\",\"observed_uplink_bytes\":524288,\"observed_downlink_bytes\":8388608,\"uplink_observed_rate_bps\":48000,\"downlink_observed_rate_bps\":160000,\"active_connections\":2,\"observed_at\":1795622399,\"quality\":\"lower_bound\"}]}",
+      "raw_note": "JSON Patch cannot preserve the lexical token 1048576.0; this committed raw_body string is the exact bytes the implementation must feed. The schema intentionally accepts it (JSON Schema sees an integral number), so this implementation_semantic vector must not be executed as a schema-stage rejection."
+    },
+    {
+      "id": "NEG7-EXP-17",
+      "target": "traffic-export.rev7",
+      "stage": "implementation_semantic",
+      "base": "export",
+      "mutation": "total active_connections (1) does not cover the per-inbound sum (4)",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/active_connections",
+          "value": 1
+        }
+      ],
+      "expected": {
+        "stage": "implementation_semantic",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "the total, when present, must cover the per-inbound active sum; JSON Schema cannot express the relation"
+      }
+    },
+    {
+      "id": "NEG7-EXP-18",
+      "target": "traffic-export.rev7",
+      "stage": "implementation_semantic",
+      "base": "export",
+      "mutation": "observed_at is after generated_at",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/observed_at",
+          "value": 1795622401
+        }
+      ],
+      "expected": {
+        "stage": "implementation_semantic",
+        "http": 400,
+        "error": "invalid_request",
+        "reason": "observed_at <= generated_at is a value comparison JSON Schema cannot express; the consumer rejects the document"
+      }
+    }
+  ]
+}

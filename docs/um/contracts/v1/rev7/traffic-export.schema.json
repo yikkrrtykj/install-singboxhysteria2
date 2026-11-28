@@ -1,0 +1,226 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://um.invalid/contracts/v1/rev7/traffic-export.schema.json",
+  "title": "UM-LT monitor-v2 traffic export file, revision 7 (schema_version 1, closed, aggregate-only)",
+  "description": "Candidate machine-readable schema for the restricted local file written by the non-root monitor-v2 process (schema 'singbox-monitor-traffic-export', schema_version 1) and read by the unprivileged Linux agent. It has exactly 14 closed top-level members and exactly 9 closed per-inbound members; no unknown member is allowed anywhere. Per-inbound `kind` MUST come from the operator-local allow-list pair `TAG:KIND` supplied to the monitor (repeated --traffic-export-inbound arguments), NEVER from a heuristic over sing-box inbound_type or any raw daemon data. Counters are exact safe integers 0..9007199254740991 or null (null means unavailable, never zero); rate/window and monitor-stale/quality coherence that JSON Schema can express is encoded with if/then/contains. JSON Schema cannot express: observed_at <= generated_at value comparison, per-row observed_at <= generated_at, unique inbound_tag values, the total active_connections covering the per-row sum, the <=64 KiB document cap, trailing-data rejection, lexical-integer enforcement (1048576.0 is an 'integer' to JSON Schema), duplicate-tag rejection, or the agent's clock-derived freshness; those are normative implementation rules in docs/um/um-a/04-node-protocol-v1.rev7.md and are executed by the agent/center implementation. The consumer rejects this file when schema/schema_version/constants do not match, when any member is missing/unknown, or when a coherence rule fails; it then degrades to the documented no-observation/unavailable representation and never fabricates zero.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "source",
+    "source_epoch",
+    "sequence",
+    "generated_at",
+    "observed_at",
+    "monitor_stale",
+    "monitor_last_success_at",
+    "counter_scope",
+    "exactness",
+    "active_connections",
+    "rate_window_seconds",
+    "inbounds"
+  ],
+  "properties": {
+    "schema": {"const": "singbox-monitor-traffic-export"},
+    "schema_version": {"const": 1},
+    "source": {"const": "monitor-v2"},
+    "source_epoch": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$",
+      "description": "New random observation-epoch token per monitor process. A change means the in-memory counters restarted; never difference across epochs."
+    },
+    "sequence": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+    "generated_at": {"type": "integer", "minimum": 0, "maximum": 1000000000000},
+    "observed_at": {"type": "integer", "minimum": 0, "maximum": 1000000000000},
+    "monitor_stale": {"type": "boolean"},
+    "monitor_last_success_at": {
+      "oneOf": [
+        {"type": "integer", "minimum": 0, "maximum": 1000000000000},
+        {"type": "null"}
+      ]
+    },
+    "counter_scope": {"const": "observation_epoch"},
+    "exactness": {"const": "lower_bound"},
+    "active_connections": {
+      "oneOf": [
+        {"type": "integer", "minimum": 0, "maximum": 1000000},
+        {"type": "null"}
+      ]
+    },
+    "rate_window_seconds": {
+      "oneOf": [
+        {"type": "number", "exclusiveMinimum": 0, "maximum": 3600},
+        {"type": "null"}
+      ]
+    },
+    "inbounds": {
+      "type": "array",
+      "minItems": 0,
+      "maxItems": 8,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "inbound_tag",
+          "kind",
+          "observed_uplink_bytes",
+          "observed_downlink_bytes",
+          "uplink_observed_rate_bps",
+          "downlink_observed_rate_bps",
+          "active_connections",
+          "observed_at",
+          "quality"
+        ],
+        "properties": {
+          "inbound_tag": {
+            "type": "string",
+            "maxLength": 64,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+          },
+          "kind": {"enum": ["reality", "hysteria2", "other"]},
+          "observed_uplink_bytes": {
+            "oneOf": [
+              {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+              {"type": "null"}
+            ]
+          },
+          "observed_downlink_bytes": {
+            "oneOf": [
+              {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+              {"type": "null"}
+            ]
+          },
+          "uplink_observed_rate_bps": {
+            "oneOf": [
+              {"type": "number", "minimum": 0, "maximum": 1000000000000},
+              {"type": "null"}
+            ]
+          },
+          "downlink_observed_rate_bps": {
+            "oneOf": [
+              {"type": "number", "minimum": 0, "maximum": 1000000000000},
+              {"type": "null"}
+            ]
+          },
+          "active_connections": {"type": "integer", "minimum": 0, "maximum": 1000000},
+          "observed_at": {"type": "integer", "minimum": 0, "maximum": 1000000000000},
+          "quality": {"enum": ["lower_bound", "partial", "unavailable"]}
+        },
+        "allOf": [
+          {
+            "if": {"properties": {"quality": {"const": "lower_bound"}}, "required": ["quality"]},
+            "then": {
+              "properties": {
+                "observed_uplink_bytes": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+                "observed_downlink_bytes": {"type": "integer", "minimum": 0, "maximum": 9007199254740991}
+              }
+            }
+          },
+          {
+            "if": {"properties": {"quality": {"const": "unavailable"}}, "required": ["quality"]},
+            "then": {
+              "properties": {
+                "observed_uplink_bytes": {"type": "null"},
+                "observed_downlink_bytes": {"type": "null"},
+                "uplink_observed_rate_bps": {"type": "null"},
+                "downlink_observed_rate_bps": {"type": "null"}
+              }
+            }
+          },
+          {
+            "if": {"properties": {"quality": {"const": "partial"}}, "required": ["quality"]},
+            "then": {
+              "anyOf": [
+                {"properties": {"observed_uplink_bytes": {"not": {"type": "null"}}}, "required": ["observed_uplink_bytes"]},
+                {"properties": {"observed_downlink_bytes": {"not": {"type": "null"}}}, "required": ["observed_downlink_bytes"]},
+                {"properties": {"uplink_observed_rate_bps": {"not": {"type": "null"}}}, "required": ["uplink_observed_rate_bps"]},
+                {"properties": {"downlink_observed_rate_bps": {"not": {"type": "null"}}}, "required": ["downlink_observed_rate_bps"]}
+              ]
+            }
+          }
+        ]
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"monitor_stale": {"const": false}}, "required": ["monitor_stale"]},
+      "then": {
+        "properties": {
+          "monitor_last_success_at": {"type": "integer", "minimum": 0, "maximum": 1000000000000}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"monitor_stale": {"const": true}}, "required": ["monitor_stale"]},
+      "then": {
+        "properties": {
+          "inbounds": {
+            "items": {
+              "properties": {
+                "quality": {"const": "partial"},
+                "uplink_observed_rate_bps": {"type": "null"},
+                "downlink_observed_rate_bps": {"type": "null"}
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["inbounds"],
+        "properties": {
+          "inbounds": {
+            "contains": {
+              "properties": {
+                "uplink_observed_rate_bps": {"not": {"type": "null"}}
+              },
+              "required": ["uplink_observed_rate_bps"]
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "rate_window_seconds": {"type": "number", "exclusiveMinimum": 0, "maximum": 3600}
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["inbounds"],
+        "properties": {
+          "inbounds": {
+            "contains": {
+              "properties": {
+                "downlink_observed_rate_bps": {"not": {"type": "null"}}
+              },
+              "required": ["downlink_observed_rate_bps"]
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "rate_window_seconds": {"type": "number", "exclusiveMinimum": 0, "maximum": 3600}
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["inbounds"],
+        "properties": {
+          "inbounds": {
+            "contains": {
+              "properties": {"quality": {"const": "lower_bound"}},
+              "required": ["quality"]
+            }
+          }
+        }
+      },
+      "then": {"properties": {"monitor_stale": {"const": false}}}
+    }
+  ]
+}
