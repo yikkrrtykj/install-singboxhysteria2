@@ -113,6 +113,11 @@ Exact-HEAD evidence:
 - Linux Reality/Hysteria2 real traffic collection remains a pre-production
   functional blocker on #127 (see `um-b4-data-source-investigation.md`).
 - Backup/restore, VACUUM/disk-pressure and offsite ledger acceptance remain UM-E.
-- Formal Codex review may be quota-blocked; independent review/quota record is
-  required and must not be represented as Codex completion. A non-Codex
-  independent review was run and its findings were fixed as above.
+- Formal Codex review was attempted on final HEAD. The first attempts hit local
+  CLI account/model incompatibility (`gpt-6.1-sol`/`gpt-5.1-codex` not in the
+  ChatGPT-account catalog); the Codex auto-review model ran successfully and
+  found one P1: archived-event alias **deletion** bypassed the event lifecycle
+  gate. Fixed by applying the existing active-event transaction gate to both
+  alias writes; an archived-event alias-delete regression test was added. A
+  non-Codex independent review was also run and cleared the runtime HEAD with no
+  P0/P1; its findings were fixed as above.

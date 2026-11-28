@@ -1020,16 +1020,8 @@ func (s *Store) SetAlias(ctx context.Context, eventID, targetType, targetKey, di
 		return Alias{}, fmt.Errorf("store: begin alias write: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	if err := eventBlockedTx(ctx, tx, eventID); err != nil {
+	if _, err := (&Tx{tx: tx}).EventActiveTx(ctx, eventID); err != nil {
 		return Alias{}, err
-	}
-	var eventExists int
-	err = tx.QueryRowContext(ctx, `SELECT 1 FROM event_catalog WHERE event_id=?`, eventID).Scan(&eventExists)
-	if errors.Is(err, sql.ErrNoRows) {
-		return Alias{}, ErrEventUnknown
-	}
-	if err != nil {
-		return Alias{}, fmt.Errorf("store: read alias event: %w", err)
 	}
 	if targetType == AliasTargetNode {
 		var nodeExists int
@@ -1150,6 +1142,9 @@ func (s *Store) DeleteAlias(ctx context.Context, eventID, targetType, targetKey,
 		return fmt.Errorf("store: begin alias delete: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	if _, err := (&Tx{tx: tx}).EventActiveTx(ctx, eventID); err != nil {
+		return err
+	}
 	result, err := tx.ExecContext(ctx,
 		`DELETE FROM aliases WHERE event_id=? AND target_type=? AND target_key=?`,
 		eventID, targetType, key)

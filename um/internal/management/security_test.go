@@ -167,6 +167,15 @@ func TestAliasOptimisticConcurrency(t *testing.T) {
 	if a.Version != 2 || a.DisplayName != "vps-one-renamed" {
 		t.Fatalf("alias update=%+v", a)
 	}
+	// Archived events reject alias mutation, matching every other admin write.
+	if err := platform.Call(context.Background(), http.MethodPost,
+		"/api/v1/events/"+eventA+"/archive", nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := adminA.Call(context.Background(), http.MethodDelete,
+		"/api/v1/events/"+eventA+"/aliases/node/"+id.NodeID, nil, nil, nil); err == nil {
+		t.Fatal("alias delete accepted on archived event")
+	}
 }
 
 func TestMappingRejectsInvalidTargetsAndPreservesHistory(t *testing.T) {
