@@ -17,6 +17,7 @@ deployment, merge or permission authorization.**
 | OD-LT-06 | Rev-7 is an **additive, default-disabled** overlay: no new endpoint/header/signing string/error code; base `v` stays 1; `contract_revision: 7` is the discriminator | goal brief; overlay §0 |
 | OD-LT-07 | The contract PR is **conditionally mergeable but not merged by its author**; independent review PASS + exact-head CI + Owner conditional authorization + normal Merge Commit only | goal brief; §4 below |
 | OD-LT-08 | The implementation PR is a separate deliverable and is **not merged/authorized** by this contract PR; real labs and production remain unauthorized | goal brief; [`um-lt-scope-and-acceptance.md`](um-lt-scope-and-acceptance.md) |
+| OD-LT-18 | Explicit rev-7 agent-version gate (`CFG-REV7`): the rev-7 Linux agent build advertises signed `agent.version >= 1.1.0` (`MIN_REV7_AGENT_VERSION`; current rev-5 agent is `1.0.0`). The center tracks the latest version from a successfully authenticated signed snapshot and MUST omit `collect.monitor_export` entirely—not emit `false`—while the version is unknown, missing or older; once a signed snapshot reports `>=1.1.0`, a stored source-enable flag becomes effective at the next config pull, and a later older reported version (agent rollback) makes the center omit the key again. This is a compatibility gate, not an authorization; comparison is numeric `major.minor.patch` (eligible iff `major > 1` or `major == 1 and minor >= 1`) | lead review correction 2026-11-28; normative in overlay §11.1, config schema description, `negative-vectors.rev7.json` `gating_rules`/`NEG7-CFG-04..07`, compatibility §2–§3 and runbook §0/§3/§8 |
 
 ## 2. Decisions requested (review/owner confirmation)
 
@@ -52,6 +53,12 @@ deployment, merge or permission authorization.**
    rotation, revocation, RBAC/session/TOTP/CSRF and UM-C behavior are unchanged.
 7. `monitor_stale`/`monitor_last_success_at` are monitor-side observability only
    and are never forwarded; the agent derives freshness from its own clock.
+8. The rev-7 implementation bumps the Linux agent's `agent.version` from the
+   current `1.0.0` to at least `1.1.0`; the center uses the version in the latest
+   **signed snapshot** only as the `CFG-REV7` compatibility gate (OD-LT-18), and
+   the exact comparator/omission behavior is testable in the implementation PR.
+   If the implementation chooses a different minimum version, that is a contract
+   change requiring the same review, not a silent divergence.
 
 ## 4. Conditional contract merge authorization (as understood; not exercised)
 

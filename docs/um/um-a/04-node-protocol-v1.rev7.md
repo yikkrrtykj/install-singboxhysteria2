@@ -245,6 +245,9 @@ The agent never logs the raw export.
   [`report-snapshot.rev7.schema.json`](../contracts/v1/report-snapshot.rev7.schema.json).
 - Only a `linux_vps` node may send a rev-7 body. A `windows_terminal` node
   sending one is `400 platform_mismatch`; Windows stays on revision-5 bodies.
+- A rev-7 body is expected only when the applied config contained
+  `collect.monitor_export=true`, which the center emits only under the
+  agent-version gate in §11.1 (minimum `agent.version` `1.1.0`).
 - `terminal` remains forbidden for `linux_vps`; rev-7 does not change platform
   isolation or event isolation.
 
@@ -468,8 +471,8 @@ The following are normative and MUST be executed by the implementation
 8. the no-observation sentinel is exact (§7.6);
 9. rev-7 bodies are accepted only from `linux_vps` nodes whose effective-dated
    config at `collected_at` enabled `collect.monitor_export`, and only by a
-   rev-7-capable center; otherwise `platform_mismatch`/`invalid_request` with no
-   state change;
+   rev-7-capable center that has seen the §11.1 agent-version gate satisfied;
+   otherwise `platform_mismatch`/`invalid_request` with no state change;
 10. the center extracts and stores only bounded structured observation fields
     (never a second raw copy of the observation per report) and never presents a
     lower bound as a total;
@@ -527,10 +530,15 @@ fixtures contain synthetic values only.
 ## 11. Center behavior
 
 - Config: a rev-7-capable center MAY include `collect.monitor_export` (boolean)
-  only for a `linux_vps` node that is enabled under the center rollout gate and
-  whose last authenticated agent version is at least the rev-7 minimum. It MUST
-  NOT include it for `windows_terminal`, for an old/unknown agent, or while the
-  source audit version does not match. Absent means false.
+  only for a `linux_vps` node that is enabled under the center rollout gate, has
+  the matching source-authorization audit version recorded, and has a latest
+  signed snapshot reporting `agent.version >= MIN_REV7_AGENT_VERSION` (§11.1).
+  It MUST NOT include it for `windows_terminal`, for an unknown/older agent, or
+  while the source audit version does not match. While the version gate is not
+  satisfied the key MUST be **absent entirely** (not emitted as `false`). Absent
+  means false. The stored source-enable flag becomes effective at the next config
+  pull after the gate is satisfied; no manual re-enable or extra handshake is
+  required, and no path/URL/token field is added.
 - Ingest: the center dispatches by `contract_revision`/node capability. A rev-7
   body from a node without an effective-dated config enabling the source is
   rejected (`invalid_request`); a rev-7 body from a `windows_terminal` node is
@@ -549,13 +557,50 @@ fixtures contain synthetic values only.
   `unavailable`/`partial` states with no fake zero and no security-gate
   weakening.
 
+### 11.1 Rev-7 agent-version gate (normative, rule `CFG-REV7`)
+
+- `MIN_REV7_AGENT_VERSION = "1.1.0"`: the rev-7 Linux agent build (implementation
+  PR) advertises `agent.version >= 1.1.0` in its signed snapshot; the current
+  rev-5 agent is `1.0.0`. The frozen `agent.version` grammar and snapshot field
+  are unchanged; this is only a new minimum for rev-7 eligibility.
+- Comparison: compare the numeric `major.minor.patch` components of the latest
+  `agent.version` received in a successfully authenticated snapshot. A node is
+  rev-7-eligible iff `major > 1` or (`major == 1` and `minor >= 1`). Suffixes
+  (pre-release/build metadata) do not make an otherwise older build eligible.
+  The comparator is a testable implementation rule, not a security boundary.
+- The center MUST track the latest signed-snapshot `agent.version` per node and
+  MUST **omit the `collect.monitor_export` key entirely** (not emit `false`)
+  while that version is unknown, missing or `< 1.1.0`, even if the
+  operator/stored source-enable flag is set.
+- Once a signed snapshot reports `>= 1.1.0`, the stored source-enable flag
+  becomes effective at the **next config pull**: the center then includes
+  `monitor_export=true` in the node's config. No manual re-enable action and no
+  extra capability handshake, URL, token or banner is introduced.
+- If a later signed snapshot reports an older version (for example an agent
+  binary rollback), the center MUST omit the key again on the next pull.
+- A version report grants no privilege: the versioned source audit, the
+  operator/rollout gate, the `linux_vps` class and the applied config switch
+  still apply. An old agent cannot gain anything by misreporting a version — it
+  would receive a config its strict validator rejects fail-closed.
+- Testable cases (encoded in [`negative-vectors.rev7.json`](../contracts/v1/negative-vectors.rev7.json)
+  `NEG7-CFG-04..07` and required in the implementation PR): `CFG-REV7-01`
+  unknown version ⇒ key absent; `CFG-REV7-02` reported `< 1.1.0` ⇒ key absent
+  even with the stored flag set; `CFG-REV7-03` reported `>= 1.1.0` ⇒ the next
+  config pull includes `monitor_export=true`; `CFG-REV7-04` later reported older
+  version ⇒ key absent again on the next pull. `CFG-REV7-05`: the key is never
+  emitted for `windows_terminal` or an unknown class (covered by
+  `NEG7-CFG-01` and the class rules).
+
 ## 12. Compatibility and failure modes
 
 The full matrix is in [`../um-lt-compatibility.md`](../um-lt-compatibility.md).
 Key rules: rev-5 centers reject rev-7 bodies, so new agents emit rev-7 only under
 a rev-7-capable center config (`collect.monitor_export` present/true); rev-5
 agents reject a seventh `collect` key (fail closed, previous config kept), so a
-new center must not send the key to a non-rev-7 agent; queued rev-7 reports on
+new center must not send the key to a non-rev-7 agent; the center withholds the
+key until the `CFG-REV7` agent-version gate is satisfied by the latest signed
+snapshot (§11.1), and makes a stored enable flag effective on the next config
+pull after that; queued rev-7 reports on
 downgrade are quarantined/dropped by the agent without rewriting fsynced
 `report_id`/body, and rev-5 spool records are preserved and drained first.
 
@@ -584,11 +629,13 @@ Closed failure → representation mapping (no new wire error codes):
   [`examples/agent-config.rev7.json`](../contracts/v1/examples/agent-config.rev7.json):
   synthetic positive fixtures.
 - [`negative-vectors.rev7.json`](../contracts/v1/negative-vectors.rev7.json):
-  33 machine-readable negative vectors (schema, implementation-semantic and
-  platform/config stages) covering exact/lower-bound ambiguity, float/negative/
-  over-bound bytes, bad epoch/sequence, stale-with-ok-availability, unknown tag,
-  wrong kind, duplicate tag, rate-without-window, unknown fields, Windows class,
-  `contract_revision: 6` and bad freshness/quality tokens.
+  37 machine-readable negative/gating vectors (schema, implementation-semantic
+  and platform/config stages) covering exact/lower-bound ambiguity, float/
+  negative/over-bound bytes, bad epoch/sequence, stale-with-ok-availability,
+  unknown tag, wrong kind, duplicate tag, rate-without-window, unknown fields,
+  Windows class, `contract_revision: 6`, bad freshness/quality tokens, and the
+  four `CFG-REV7` agent-version gate cases (unknown/`<1.1.0` ⇒ key absent;
+  `>=1.1.0` ⇒ included on the next pull; later older version ⇒ absent again).
 
 This contract PR proves only that the schemas/fixtures/vectors are internally
 consistent and JSON-valid; **no runner exists yet and no conformance claim is

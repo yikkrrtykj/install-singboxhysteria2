@@ -228,14 +228,22 @@ fields are rejected, so the writer cannot grow the schema sideways.
 
 ## 7. Center validate/store/query
 
-### 7.1 Config emission gate
+### 7.1 Config emission gate (`CFG-REV7`)
 
 A rev-7-capable center includes `collect.monitor_export` only when: the build
 supports rev-7; the node is `linux_vps`; the source authorization audit version
 matches the implementation; the operator/rollout gate has enabled the source for
-that node; and the node's last authenticated agent version is at least the rev-7
-minimum. Otherwise the key is absent (= false). The key is a compatibility/source
-switch, not a credential and not an authorization proof.
+that node; and the node's latest **signed-snapshot** `agent.version >= 1.1.0`
+(`MIN_REV7_AGENT_VERSION`; the rev-5 agent is `1.0.0`). The center tracks the
+latest signed version and **omits the key entirely** (not `false`) while the
+version is unknown/missing/older; a stored enable flag becomes effective at the
+next config pull after a signed `>=1.1.0` snapshot, and a later older reported
+version (agent rollback) makes the center omit the key again. Comparison uses
+the numeric `major.minor.patch` (eligible iff `major > 1` or `major == 1 and
+minor >= 1`); suffixes do not make an older build eligible. Otherwise the key is
+absent (= false). The key is a compatibility/source switch, not a credential and
+not an authorization proof; the version gate is also not an authorization.
+Normative detail and testable cases: overlay §11.1 / `CFG-REV7-01..05`.
 
 ### 7.2 Ingest validation
 
@@ -295,7 +303,7 @@ Exact row sizes and the measured ratio belong to the implementation PR and UM-E.
 
 | Gate | Default | Enable condition | Failure mode |
 | --- | --- | --- | --- |
-| `collect.monitor_export` | absent/false | rev-7 center + recorded source audit version + linux_vps node/rollout gate + rev-7-capable agent | no rev-7 data; rev-5 body with traffic unavailable |
+| `collect.monitor_export` | absent/false | rev-7 center + recorded source audit version + linux_vps node/rollout gate + latest signed-snapshot `agent.version >= 1.1.0` (`CFG-REV7`) | key omitted entirely while unknown/older; no rev-7 data; rev-5 body with traffic unavailable |
 | `collect.singbox_api` | false | **never for rev-7**: P1-10 FAIL stands; a future separate owner decision/audit only | stays disabled/unavailable; no credential path |
 | center rev-7 ingest | off until deployed | rev-7-capable build and schema set; old center rejects rev-7 | old center: invalid_request; agent sends rev-5 only |
 | export writer | off until monitor release | monitor version with the audited export writer + explicit deployment | no/missing export; agent unavailable |

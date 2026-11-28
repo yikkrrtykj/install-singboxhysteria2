@@ -20,6 +20,12 @@ PR fixes the exact names; the installer must assert them.
   audit version matches `UM-LT-SOURCE-AUDIT-v1`.
 - The monitor package includes the audited export writer; the agent package
   includes rev-7 support (A7).
+- `CFG-REV7` version gate: the center emits `collect.monitor_export` only after
+  the node's latest signed snapshot reports `agent.version >= 1.1.0`
+  (`MIN_REV7_AGENT_VERSION`; the rev-5 agent is `1.0.0`). Until then the center
+  tracks the version and omits the key entirely; a stored source-enable flag is
+  not effective yet. The implementation PR must provide the exact read-only way
+  to inspect the latest signed `agent.version` and config emission state.
 - A pre-change backup/rollback point exists for the center database and the
   affected node state (frozen rev-5 backup rules).
 - Operator has read the compatibility matrix
@@ -34,8 +40,8 @@ PR fixes the exact names; the installer must assert them.
 | --- | --- | --- |
 | 1 | Upgrade the center to the rev-7-capable build with the source disabled (no node has `monitor_export`) | C7 must be able to receive/validate rev-5/6 bodies first; no behavior change for old agents |
 | 2 | Install the monitor package with the export writer and the `um-lt-export` group/directory | the file may exist before any center enables the source; nothing consumes it |
-| 3 | Upgrade agents to the rev-7 build (source disabled) | A7 emits only rev-5 bodies until a config advertises the switch |
-| 4 | Enable the source for one canary `linux_vps` node in the center | validates config/gating per node |
+| 3 | Upgrade agents to the rev-7 build (source disabled) | A7 emits only rev-5 bodies until a config advertises the switch; its signed snapshots must report `agent.version >= 1.1.0` before the center can emit the key |
+| 4 | Enable the source for one canary `linux_vps` node in the center | validates config/gating per node; if the stored flag is enabled before the version gate is satisfied, the center withholds the key and applies it on the next pull after a signed `>=1.1.0` snapshot |
 | 5 | Verify export file, agent report, ingest, storage and query (see §5) | catches ACL/schema/semantics issues before fleet |
 | 6 | Expand node by node / event by event; keep an explicit disable path | bounded blast radius |
 | 7 | Record evidence (versions, audit version, queries, rollback point) | required before any production approval |
@@ -110,14 +116,19 @@ rev-5 snapshot/metrics/events flow must remain healthy.
 
 ## 3. Enable the source (per node)
 
-1. Confirm the node is `linux_vps`, the agent is rev-7 capable, and the
+1. Confirm the node is `linux_vps`, the agent is rev-7 capable, the latest
+   signed snapshot reports `agent.version >= 1.1.0` (`CFG-REV7`), and the
    source-authorization audit version is recorded in the center rollout gate.
+   If the version is unknown/older, upgrade the agent first; enabling the stored
+   flag early is safe but the center MUST keep the key absent until a signed
+   `>=1.1.0` snapshot arrives.
 2. Enable `monitor_export` for the node in the center (management action per the
    implementation UI/CLI; the value is a boolean, never a path/URL/token).
 3. Wait for the agent config refresh (bound: 300 s in the frozen runtime) and a
    config version bump; confirm the applied config has
    `collect.monitor_export=true` via `um-agent status` (the existing read-only
-   status output).
+   status output). If the key never appears, re-check the latest signed
+   `agent.version`; a stored flag alone is not enough (`CFG-REV7-02`).
 4. Confirm the node's next snapshot contains `contract_revision: 7` and a
    `traffic_observation` with `source=monitor_readonly_export`,
    `exactness=lower_bound`, `counter_scope=observation_epoch` (center diagnostics
@@ -147,6 +158,7 @@ rev-5 snapshot/metrics/events flow must remain healthy.
 | export epoch/sequence | 32-hex epoch; sequence increases; change of epoch only on monitor restart |
 | export privacy scan | no IP/hostname/user/device/connection-id/UUID/proxy/URL/YAML/secret tokens |
 | agent reads only export | no monitor data-root/secret access; no new listener; no export write |
+| `CFG-REV7` version gate | center tracks the latest signed `agent.version`; key absent entirely for unknown/older; present only after a signed `>=1.1.0` snapshot + next pull; absent again if a later older version is reported |
 | signed report | rev-5 transport unchanged; body has `contract_revision=7`; signature verifies at center |
 | center validation | accepted once, deduped on retry; invalid/unknown tag rejected; Windows rev-7 rejected |
 | query | lower-bound label + freshness/availability/age + epoch boundary; no totals, no fabricated zero |
@@ -187,7 +199,9 @@ Follow [`um-lt-compatibility.md`](um-lt-compatibility.md) §5–§6.
 
 | Symptom | First checks | Likely action |
 | --- | --- | --- |
-| node shows no rev-7 data | center rollout gate, audit version, node class, applied config switch, agent version | enable/upgrade only through the documented gate; never bypass |
+| node shows no rev-7 data | center rollout gate, audit version, node class, latest signed `agent.version` (`>=1.1.0`), applied config switch | enable/upgrade only through the documented gate; never bypass |
+| source flag enabled in center but key absent from agent config | `CFG-REV7` gate not satisfied: version unknown/older, no signed snapshot yet, or class/audit mismatch | upgrade agent and wait for a signed `>=1.1.0` snapshot + next config pull; center MUST omit the key, not emit `false` (`CFG-REV7-01/02/04`) |
+| key appears then disappears without a config disable | later signed snapshot reported an older version (agent rollback) or class/audit state changed | treat as compatibility downgrade; drain per §6; do not force-enable |
 | `traffic_observation.availability=unavailable` | monitor running, export file exists/fresh, owner/group/mode, `monitor_stale`, symlink/FIFO, size | fix monitor/ACL; do not fake data |
 | `freshness=stale` | export age vs `max(2×cadence,120)`; monitor stopped? stream gap? | restore monitor/stream; stale is honest |
 | missing inbound tags | `expected_inbound_tags` vs export tags/kinds; monitor sees a different inbound set | correct center config; the agent drops unknown tags by design |

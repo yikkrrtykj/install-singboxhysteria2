@@ -27,7 +27,7 @@ for a NOT RUN item.
 | `docs/um/contracts/v1/agent-config.rev7.schema.json` | rev-5 config + optional `collect.monitor_export` |
 | `docs/um/contracts/v1/examples/report-snapshot.rev7.json` | synthetic rev-7 Linux positive fixture |
 | `docs/um/contracts/v1/examples/agent-config.rev7.json` | synthetic rev-7 config positive fixture |
-| `docs/um/contracts/v1/negative-vectors.rev7.json` | 33 machine-readable negative vectors (schema/semantic/platform/config stages) |
+| `docs/um/contracts/v1/negative-vectors.rev7.json` | 37 machine-readable negative/gating vectors (schema/semantic/platform/config stages, incl. four `CFG-REV7` agent-version gate cases) |
 | `docs/um/um-a/04-node-protocol-v1.rev7.md` | candidate normative overlay (source, export transport, report semantics, bounds, epoch/freshness, compatibility, no-weakening, conformance, provenance) |
 | `docs/um/um-lt-*.md` (architecture, data semantics, source audit, compatibility, capacity, runbook, scope/acceptance, owner decisions, this file) | design/audit/operations/acceptance/decision records |
 
@@ -47,11 +47,12 @@ of internal consistency, **not** a conformance runner.
 | V-03 | `$id` uniqueness across all `docs/um/contracts/v1/*.schema.json` | **PASS** — 12 unique ids |
 | V-04 | Frozen rev-5 base shape preserved: every rev-5 report/config property (except the documented additions) deep-equal to rev-5; required base fields still required; only `contract_revision`+`traffic_observation` added to report required; only optional `monitor_export` added to collect | **PASS** |
 | V-05 | Positive fixtures validate against the rev-7 schemas | **PASS** |
-| V-06 | Negative vectors: 33 ids unique, ≥15 total, 18 schema-stage vectors invalid after their patch, 13 implementation-semantic + 1 platform + 1 config-generation vectors schema-valid (as declared) | **PASS** |
+| V-06 | Negative/gating vectors: 37 ids unique, ≥15 total, 18 schema-stage vectors invalid after their patch, 13 implementation-semantic + 1 platform + 5 config-generation vectors schema-valid (as declared) | **PASS** |
 | V-07 | Required negative categories present: exact/lower-bound ambiguity, float bytes, negative bytes, >2^53−1, bad epoch, negative sequence, stale-with-ok availability, unknown tag, wrong kind, duplicate tag, rate-without-window, unknown field, Windows class, `contract_revision:6`, bad freshness/quality | **PASS** |
-| V-08 | Export-file shape cross-check: lead-reconciled `singbox-monitor-traffic-export` v1 field set/consts/observability fields/mapping; report body keeps `monitor_readonly_export` and never forwards file-only fields; old `export_version` draft shape absent from all rev-7 docs | **PASS** (4 342 consistency checks total) |
-| V-09 | Git boundary: only new `docs/um/**` files; no modifications to existing rev-5/rev-6 artifacts or code; no merge/push/force-push | **PASS** (see the final report/PR for the exact commit/tree; verified after committing the single docs commit) |
-| V-10 | rev-5/rev-6 files byte-unchanged: compare `docs/um/contracts/v1/{report-snapshot.schema.json,agent-config.schema.json,negative-vectors.v1.json,test-vectors.v1.json,power-loss-generation.rev6.json}`, `docs/um/um-a/04-node-protocol-v1.md`, `docs/um/um-a/04-node-protocol-v1.rev6.md` against `3bf1fadf` | **PASS** (not in the changed-file list; no content edit) |
+| V-08 | Export-file shape cross-check: lead-reconciled `singbox-monitor-traffic-export` v1 field set/consts/observability fields/mapping; report body keeps `monitor_readonly_export` and never forwards file-only fields; old `export_version` draft shape absent from all rev-7 docs | **PASS** (4 462 consistency checks total incl. V-09) |
+| V-09 | `CFG-REV7` agent-version gate consistency: minimum `agent.version` `1.1.0` defined once and referenced by overlay §11.1, config schema description, `gating_rules`/`NEG7-CFG-04..07`, compatibility §2/§3/§8 and runbook §0/§3/§5/§8; unknown/older ⇒ key omitted entirely; `>=1.1.0` ⇒ effective next pull; later older ⇒ omitted again | **PASS** (documented rule + vectors; real center config-generation test remains **NOT RUN**, see E-16) |
+| V-10 | Git boundary: only new `docs/um/**` files; no modifications to existing rev-5/rev-6 artifacts or code; no merge/push/force-push | **PASS** (see the final report/PR for the exact commit/tree; verified after committing the single docs commit) |
+| V-11 | rev-5/rev-6 files byte-unchanged: compare `docs/um/contracts/v1/{report-snapshot.schema.json,agent-config.schema.json,negative-vectors.v1.json,test-vectors.v1.json,power-loss-generation.rev6.json}`, `docs/um/um-a/04-node-protocol-v1.md`, `docs/um/um-a/04-node-protocol-v1.rev6.md` against `3bf1fadf` | **PASS** (not in the changed-file list; no content edit) |
 
 Not claimed: this is not a JSON-Schema-conformance harness, does not execute the
 negative vectors at HTTP/agent/center level, and does not prove any runtime
@@ -80,6 +81,7 @@ exact-command evidence before any production claim.
 | E-13 | Independent review of the rev-7 contract and of the implementation security/semantics | **PENDING** (contract PR) / NOT RUN (implementation) |
 | E-14 | Exact-head CI for this contract PR (all required checks) | **PENDING** — recorded in the PR/final report, not claimed here |
 | E-15 | Owner conditional merge authorization exercised by the normal Merge Commit | **PENDING** — author does not merge; pre-merge is not publication |
+| E-16 | `CFG-REV7` real center config-generation test: unknown/`<1.1.0` ⇒ `monitor_export` key absent entirely; signed `>=1.1.0` ⇒ included on the next pull; later older version ⇒ absent again; key never emitted for Windows/unknown class; comparator boundary cases (`1.0.999`, `1.1.0`, `2.0.0`, suffix handling) | **NOT RUN** (contract-PR documents/vectors only) |
 
 ## 4. Evidence rules
 

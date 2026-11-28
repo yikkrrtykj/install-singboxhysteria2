@@ -3,8 +3,15 @@
   "contract": "um-v1",
   "revision": 7,
   "status": "candidate formal overlay pending independent review/CI/owner merge; NOT published or frozen, and no implementation or runner exists in this contract PR",
-  "description": "Negative contract vectors for the rev-7 additive Linux read-only traffic observation. They are normative expectations for the rev-7 implementation PR; JSON parsing alone is not conformance and no runner is claimed here. Each vector names its rejection stage: json_schema (the rev-7 JSON Schema or strict size/parse stage rejects before semantic checks), implementation_semantic (schema-valid but rejected by the normative coherence/privacy/lexical rules in docs/um/um-a/04-node-protocol-v1.rev7.md), platform_isolation (rejected because of the authenticated node class), or config_generation (a center must never emit the config, and an agent must fail closed if it receives it). Base bodies are examples/report-snapshot.rev7.json and examples/agent-config.rev7.json; patch paths are RFC 6901 JSON Pointers.",
+  "description": "Negative and gating contract vectors for the rev-7 additive Linux read-only traffic observation. They are normative expectations for the rev-7 implementation PR; JSON parsing alone is not conformance and no runner is claimed here. Each vector names its rejection stage: json_schema (the rev-7 JSON Schema or strict size/parse stage rejects before semantic checks), implementation_semantic (schema-valid but rejected by the normative coherence/privacy/lexical rules in docs/um/um-a/04-node-protocol-v1.rev7.md), platform_isolation (rejected because of the authenticated node class), or config_generation (the center must emit/omit the config key exactly as specified and an agent must fail closed on an invalid config). Base bodies are examples/report-snapshot.rev7.json and examples/agent-config.rev7.json; patch paths are RFC 6901 JSON Pointers. The four CFG-REV7 cases encode the explicit rev-7 agent-version gate (minimum agent.version 1.1.0).",
   "runner": null,
+  "gating_rules": {
+    "rule": "CFG-REV7",
+    "min_rev7_agent_version": "1.1.0",
+    "center_behaviour": "The center tracks the latest agent.version received in a successfully authenticated signed snapshot. It MUST omit the collect.monitor_export key entirely (not emit false) while that version is unknown, missing or <1.1.0, even if the stored source-enable flag is set. Once a signed snapshot reports >=1.1.0, the stored source-enable flag becomes effective at the next config pull; no manual re-enable or extra handshake is needed. If a later signed snapshot reports an older version (agent rollback), the center MUST omit the key again on the next pull.",
+    "comparison": "Compare the numeric major.minor.patch components of the frozen agent.version grammar: rev-7-capable iff major > 1 or (major == 1 and minor >= 1). Suffixes do not make an otherwise older build eligible. This is a compatibility gate, not an authorization or security boundary.",
+    "not_authorization": "The version gate grants no privilege: the source still requires the versioned source audit, the operator/rollout gate, the linux_vps class and the applied config switch. An old agent cannot gain anything by misreporting a version; it would receive a config it rejects fail-closed."
+  },
   "bases": {
     "report": "docs/um/contracts/v1/examples/report-snapshot.rev7.json",
     "config": "docs/um/contracts/v1/examples/agent-config.rev7.json"
@@ -344,6 +351,42 @@
       "mutation": "collect contains an unknown source key besides monitor_export (traffic_probe=true)",
       "patch": [{"op": "add", "path": "/collect/traffic_probe", "value": true}],
       "expected": {"stage": "json_schema", "http": 400, "error": "invalid_request", "reason": "collect stays closed to the six frozen rev-5 switches plus the single optional monitor_export; no new source can appear by config"}
+    },
+    {
+      "id": "NEG7-CFG-04",
+      "target": "agent-config.rev7",
+      "stage": "config_generation",
+      "base": "config",
+      "scenario": "CFG-REV7-01: the stored source-enable flag is set, but the node has no authenticated snapshot yet (agent.version unknown)",
+      "patch": [],
+      "expected": {"stage": "config_generation", "rule": "CFG-REV7-01", "center": "MUST OMIT the collect.monitor_export key entirely (not false)", "reason": "an unknown agent version is not rev-7 eligible; emitting the key to a rev-5 agent would be rejected by its strict config validator"}
+    },
+    {
+      "id": "NEG7-CFG-05",
+      "target": "agent-config.rev7",
+      "stage": "config_generation",
+      "base": "config",
+      "scenario": "CFG-REV7-02: the stored source-enable flag is set and the latest signed snapshot reports agent.version 1.0.0",
+      "patch": [],
+      "expected": {"stage": "config_generation", "rule": "CFG-REV7-02", "center": "MUST OMIT the collect.monitor_export key entirely (not false)", "reason": "1.0.0 is below the rev-7 minimum agent.version 1.1.0; the key is withheld until an upgrade is reported"}
+    },
+    {
+      "id": "NEG7-CFG-06",
+      "target": "agent-config.rev7",
+      "stage": "config_generation",
+      "base": "config",
+      "scenario": "CFG-REV7-03: the stored source-enable flag is set and a signed snapshot has reported agent.version 1.1.0",
+      "patch": [],
+      "expected": {"stage": "config_generation", "rule": "CFG-REV7-03", "center": "MUST INCLUDE collect.monitor_export=true in the next config pull (failure if absent)", "reason": "the stored source flag becomes effective after the signed snapshot reports the minimum version; no manual re-enable or extra handshake is required"}
+    },
+    {
+      "id": "NEG7-CFG-07",
+      "target": "agent-config.rev7",
+      "stage": "config_generation",
+      "base": "config",
+      "scenario": "CFG-REV7-04: the latest signed snapshot reports agent.version 1.0.0 after a previous 1.1.0 snapshot (agent binary rollback)",
+      "patch": [],
+      "expected": {"stage": "config_generation", "rule": "CFG-REV7-04", "center": "MUST OMIT the collect.monitor_export key again on the next pull", "reason": "a downgraded/rolled-back agent must not receive rev-7 config; the center re-evaluates the latest signed version each pull"}
     }
   ]
 }

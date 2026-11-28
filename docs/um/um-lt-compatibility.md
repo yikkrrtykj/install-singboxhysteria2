@@ -33,15 +33,24 @@ rotation/revocation rules, node classes and Windows behavior are unchanged.
   `linux_vps`). Absence/false means A7 behavior: only rev-5 bodies, no export
   read. The agent MUST NOT infer capability from a server banner, a version
   header, an ACK field, the presence of the export file, or a center URL.
-- **Center rule:** a C7 center includes `monitor_export` only for a `linux_vps`
-  node that (a) is enabled by the operator/rollout gate, (b) has the matching
-  source-authorization audit version recorded, and (c) has last authenticated
-  agent evidence compatible with rev-7 (for example a rev-7-or-later
-  `agent.version` in the signed snapshot). The last bullet is a compatibility
-  hint from an authenticated report, **not** a privilege grant: the source
-  authorization is the versioned audit + operator gate; a node lying about its
-  version can at most make itself unable to receive the key or receive a key its
-  old agent will reject fail-closed.
+- **Center rule (`CFG-REV7` agent-version gate):** a C7 center emits
+  `monitor_export` only for a `linux_vps` node that (a) is enabled by the
+  operator/rollout gate, (b) has the matching source-authorization audit version
+  recorded, and (c) has a latest signed-snapshot `agent.version >= 1.1.0`
+  (`MIN_REV7_AGENT_VERSION`; the rev-5 agent is `1.0.0`). The center tracks the
+  latest version from a successfully authenticated snapshot and **MUST omit the
+  key entirely** (not emit `false`) while the version is unknown, missing or
+  older. Once a signed snapshot reports `>= 1.1.0`, the stored source-enable flag
+  becomes effective at the **next config pull** (no manual re-enable or extra
+  handshake); if a later signed snapshot reports an older version (agent
+  rollback), the center omits the key again on the next pull. Comparison uses
+  the numeric `major.minor.patch` components (eligible iff `major > 1` or
+  `major == 1 and minor >= 1`); suffixes do not make an older build eligible.
+  The version is a compatibility hint from an authenticated report, **not** a
+  privilege grant: the source authorization is the versioned audit + operator
+  gate; a node lying about its version can at most make itself unable to receive
+  the key or receive a key its old agent rejects fail-closed. Normative detail:
+  overlay §11.1; testable cases `CFG-REV7-01..05`.
 - Config is validated per node class: `monitor_export=true` is invalid for
   `windows_terminal`; a Windows agent rejects such a config and keeps its
   previous applied config. There is no cross-class downgrade.
@@ -56,6 +65,7 @@ rotation/revocation rules, node classes and Windows behavior are unchanged.
 | --- | --- | --- | --- | --- |
 | A5 | C5 | rev-5 | rev-5 | current behavior, unchanged |
 | A5 | C7 | rev-5 (no `monitor_export`) | rev-5 | C7 treats as rev-5; rev-7 tables stay empty for this node; no error |
+| A5 (reports `agent.version 1.0.0`) | C7 with the stored source flag enabled | rev-5; **`monitor_export` key omitted entirely** until the latest signed snapshot reports `>=1.1.0` | rev-5 | `CFG-REV7-02`: enabling early is safe but not effective; the key appears only after the upgrade is reported and the next config pull, then behaves like A7+ |
 | A7 | C5 | rev-5 (no `monitor_export`) | rev-5 only | A7 falls back to rev-5 behavior; source never read; traffic `unavailable` |
 | A7 | C7 | rev-5 or rev-7 with false/absent | rev-5 | source disabled; node shows rev-5 `traffic: unavailable`; no fake zero |
 | A7+ | C7 | rev-7 `monitor_export=true` | rev-7 bodies per cadence | validated/stored; lower bounds displayed with freshness/exactness labels |
@@ -172,3 +182,14 @@ Real tests, not only JSON parsing (mapping to the acceptance matrix):
    `report_id`/body bytes; rev-5 spool records drain and are acknowledged.
 8. Center DB downgrade attempt: old binary fails closed on newer schema version.
 9. Windows class: never receives/emits rev-7; violation is `platform_mismatch`.
+10. `CFG-REV7` version gate (real center config generation, not only schema
+    parsing): `CFG-REV7-01` no signed snapshot yet ⇒ key absent entirely;
+    `CFG-REV7-02` latest signed snapshot `1.0.0` + stored flag set ⇒ key absent
+    entirely (and not `false`); `CFG-REV7-03` signed snapshot `1.1.0` after an
+    earlier `1.0.0` ⇒ the next config pull includes `monitor_export=true`
+    without a manual re-enable; `CFG-REV7-04` later older reported version ⇒ key
+    absent again; `CFG-REV7-05` `windows_terminal`/unknown class ⇒ never emitted.
+    The test must observe the actual JSON response (presence/absence), not a
+    stored flag.
+11. Full negative-vector runner for `negative-vectors.rev7.json`
+    (schema + implementation-semantic + `CFG-REV7` config-generation cases).
