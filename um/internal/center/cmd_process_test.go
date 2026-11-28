@@ -29,7 +29,7 @@ func TestCenterCommandProcessStartStop(t *testing.T) {
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build cmd/um-center: %v\n%s", err, out)
 	}
-	db := filepath.Join(t.TempDir(), "center.db")
+	db := filepath.Join(t.TempDir(), "private", "center.db")
 	contracts, err := filepath.Abs(contractsDir)
 	if err != nil {
 		t.Fatalf("contracts abs: %v", err)

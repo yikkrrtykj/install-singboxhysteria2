@@ -356,7 +356,7 @@ func newTestServer(t *testing.T, service Service, options ...serverOption) *Serv
 	cfg := Config{
 		IngestAddr:         "127.0.0.1:0",
 		AdminAddr:          "127.0.0.1:0",
-		DBPath:             filepath.Join(t.TempDir(), "center.db"),
+		DBPath:             filepath.Join(t.TempDir(), "private", "center.db"),
 		ContractDir:        testContractDir,
 		Now:                func() time.Time { return testNow },
 		RateLimitPerSecond: -1, // disabled unless a test opts in

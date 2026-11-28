@@ -116,7 +116,7 @@ func startTestCenterAt(t *testing.T, dbPath string) *testCenter {
 
 func startTestCenter(t *testing.T) *testCenter {
 	t.Helper()
-	return startTestCenterAt(t, filepath.Join(t.TempDir(), "center.db"))
+	return startTestCenterAt(t, filepath.Join(t.TempDir(), "private", "center.db"))
 }
 
 type syntheticAgent struct {
@@ -505,7 +505,7 @@ func TestB2CenterWindowsTerminalFlow(t *testing.T) {
 }
 
 func TestB2CenterRestartPersistence(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "center.db")
+	path := filepath.Join(t.TempDir(), "private", "center.db")
 	tc := startTestCenterAt(t, path)
 	linux := enrollAgent(t, tc, store.NodeClassLinuxVPS, "linux")
 	snap := b2Example(t, "report-snapshot.v1.json")

@@ -1,0 +1,43 @@
+# Cloudflare Tunnel ingress template — UM-C Web only (Draft, HOLD)
+
+This is a placeholder configuration for an **isolated, Owner-approved** lab. It
+does not authorize a real Cloudflare account, tunnel, DNS record, Access
+application, IdP, certificate or production deployment. Do not commit real
+credentials/tunnel UUIDs.
+
+```yaml
+# um/deploy/um-c/cloudflared.example.yml
+tunnel: 00000000-0000-0000-0000-000000000000
+credentials-file: /etc/cloudflared/um-c-tunnel.json
+
+ingress:
+  # Only the Web listener is exposed. Its Access application enforces the
+  # operator IdP policy; the center independently verifies the Access JWT.
+  - hostname: um-console.example.invalid
+    service: http://127.0.0.1:8092
+    originRequest:
+      connectTimeout: 10s
+      noTLSVerify: false
+  # Never route the local admin listener or its bearer plane through Tunnel:
+  #   - service: http://127.0.0.1:8090   # DO NOT USE
+  # Never route machine ingest through the Web/Access hostname:
+  #   machine plane uses -machine-tls hostname:port directly (separate cert).
+  - service: http_status:404
+```
+
+Checklist:
+
+- Access application hostname = the Web hostname above; policy restricted to the
+  intended operator group/IdP; no bypass policy, no service token that skips local
+  password/TOTP.
+- Origin `-web` must stay `127.0.0.1`/loopback; `-web-origin` must exactly match
+  `https://<Web hostname>`.
+- `-admin` is loopback-only and never in Tunnel ingress. Local admin operations
+  use the local bearer CLI path; browser sessions are a separate plane.
+- Machine TLS listener uses a different hostname/certificate and must not share
+  the Access/browser route. Real machine DNS/cert/public port is **HOLD**.
+- The center's master key, admin auth file/token and tunnel credentials are kept
+  outside the repository, with protected OS permissions.
+- `PRODUCTION HOLD`: do not apply this template against real Cloudflare resources
+  without separate Owner authorization. All evidence from this repo uses
+  synthetic JWKS/JWT/TLS only.

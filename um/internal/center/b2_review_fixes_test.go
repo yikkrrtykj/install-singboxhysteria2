@@ -353,7 +353,7 @@ func TestB2REC15RealTransactionFaultRollsBackEverything(t *testing.T) {
 }
 
 func TestB2REC19RotateResponseBytesAcrossRestart(t *testing.T) {
-	path := t.TempDir() + "/center.db"
+	path := t.TempDir() + "/private/center.db"
 	tc := startTestCenterAt(t, path)
 	a := enrollAgent(t, tc, store.NodeClassLinuxVPS, "linux")
 	rotateBody := b2RotateBody(t)

@@ -335,7 +335,7 @@ func runRECProtocol(t *testing.T, c recCase) {
 
 func newCenter(t *testing.T, setup recSetup) *store.Store {
 	t.Helper()
-	st, err := store.Open(filepath.Join(t.TempDir(), "center.db"))
+	st, err := store.Open(filepath.Join(t.TempDir(), "private", "center.db"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}

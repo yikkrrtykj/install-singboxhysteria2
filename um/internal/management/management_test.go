@@ -52,7 +52,7 @@ func writeProtected(t *testing.T, path string, data []byte) {
 func startB4Center(t *testing.T) *b4Center {
 	t.Helper()
 	dir := t.TempDir()
-	db := filepath.Join(dir, "center.db")
+	db := filepath.Join(dir, "private", "center.db")
 	st, err := store.Open(db)
 	if err != nil {
 		t.Fatal(err)

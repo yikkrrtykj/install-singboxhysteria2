@@ -78,7 +78,7 @@ func statusTreeDigest(t *testing.T, dir string) string {
 
 func TestStatusCommandIsNonMutating(t *testing.T) {
 	centerDir := t.TempDir()
-	dbPath := filepath.Join(centerDir, "center.db")
+	dbPath := filepath.Join(centerDir, "private", "center.db")
 	st, err := store.Open(dbPath)
 	if err != nil {
 		t.Fatal(err)

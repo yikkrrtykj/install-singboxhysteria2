@@ -11,6 +11,7 @@ on:
       - 'um/internal/management/**'
       - 'um/internal/store/b4*.go'
       - 'um/internal/center/**'
+      - 'um/docs/**'
 
 permissions:
   contents: read

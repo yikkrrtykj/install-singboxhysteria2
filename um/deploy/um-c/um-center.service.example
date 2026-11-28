@@ -1,0 +1,41 @@
+# UM-C center systemd template (Draft, PRODUCTION HOLD). Install as a unit after
+# reviewing paths/user/ACLs. No secrets in this file or EnvironmentFile:
+# - master key is read from a protected file by -master-key
+# - optional B4 local bearer auth is a protected file by -admin-auth-file
+# - passwords are never environment variables or argv.
+[Unit]
+Description=UM center (Web + admin + optional machine TLS planes, isolated lab)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=um-center
+Group=um-center
+WorkingDirectory=/opt/um-center
+StateDirectory=um-center
+StateDirectoryMode=0700
+ExecStart=/opt/um-center/bin/um-center \
+  -ingest 127.0.0.1:8443 \
+  -admin 127.0.0.1:8090 \
+  -admin-auth-file /etc/um-center/admin-auth.json \
+  -db /var/lib/um-center/center.db \
+  -contracts /etc/um-center/contracts/v1 \
+  -web 127.0.0.1:8092 \
+  -web-static /opt/um-center/web/dist \
+  -web-origin https://um-console.example.invalid \
+  -master-key /etc/um-center/master.key \
+  -access-issuer https://team.cloudflareaccess.invalid \
+  -access-audience replace-with-application-aud \
+  -access-jwks https://team.cloudflareaccess.invalid/cdn-cgi/access/certs
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/um-center
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
