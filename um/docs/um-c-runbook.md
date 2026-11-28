@@ -148,9 +148,12 @@ um-center auth recover \
   weakened authentication path. Rate-limit identity uses the verified Access
   subject/session where available, not the tunnel loopback `RemoteAddr`.
 - Five failed TOTP attempts temporarily lock TOTP for 15 minutes and revoke the
-  pending session; the lock is persisted across restart. Pending TOTP challenge/
-  setup sessions expire after 10 minutes. If locked or the authenticator is lost,
-  wait for expiry, use a one-time recovery code, or use controlled local recovery.
+  account's sessions; the lock/failure window is persisted across restart and
+  resets after expiry or a successful password reset/TOTP/recovery/enable.
+  Pending TOTP challenge/setup sessions expire after 10 minutes. If locked or the
+  authenticator is lost, wait for expiry, use a one-time recovery code, reset the
+  account from the platform-admin console (which clears the lock), or use
+  controlled local recovery.
 - Audit/ledger entries contain actor/role/action/result/target IDs and hashed
   ledger context only; never submit secrets in support requests.
 

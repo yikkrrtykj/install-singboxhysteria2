@@ -459,6 +459,10 @@ func (h *Handler) verifyTOTP(w http.ResponseWriter, r *http.Request) {
 				h.writeError(w, http.StatusUnauthorized, "totp_replayed", "TOTP code already used")
 				return
 			}
+			if errors.Is(err, store.ErrAuthSessionUnknown) {
+				h.writeError(w, http.StatusUnauthorized, "session_invalid", "pending setup session is no longer valid")
+				return
+			}
 			h.writeError(w, http.StatusInternalServerError, "internal", "TOTP setup failed")
 			return
 		}
@@ -537,16 +541,19 @@ func (h *Handler) recover(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, http.StatusForbidden, "login_csrf_failed", "recovery session invalid or expired")
 		return
 	}
+	// Apply the same pre-lookup bucket for existing and unknown usernames so a
+	// 429 response cannot become a deterministic account-enumeration oracle.
+	recoveryKey := strings.ToLower(strings.TrimSpace(req.Username))
+	if !h.limiter.allow("recovery-lookup:"+claims.Claims.Subject+"|"+recoveryKey, 0.1, 3) {
+		h.writeError(w, http.StatusTooManyRequests, "rate_limited", "recovery rate limit exceeded")
+		return
+	}
 	user, getErr := h.store.GetAuthUserByUsername(r.Context(), req.Username)
 	// Use a constant dummy hash for unknown/disabled accounts so the response
 	// time does not become an account-existence oracle.
 	passwordHash := h.dummyHash
 	if getErr == nil {
 		passwordHash = user.PasswordHash
-	}
-	if getErr == nil && !h.limiter.allow("recovery:"+user.UserID, 0.1, 3) {
-		h.writeError(w, http.StatusTooManyRequests, "rate_limited", "recovery rate limit exceeded")
-		return
 	}
 	var ok bool
 	if err := h.withKDF(func() error {

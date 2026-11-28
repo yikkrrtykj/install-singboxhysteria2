@@ -66,10 +66,11 @@ Access JWT cannot be bypassed with an old session.
   sessions and issues the active session in one transaction; no cookie is sent
   before commit.
 - Per-account TOTP failures are persisted; five failures temporarily lock TOTP
-  (15 minutes) and revoke pending sessions. Login/TOTP/recovery rate limits are
-  keyed to the verified Access subject/session, never solely to the loopback
-  `RemoteAddr`, so a Tunnel origin does not collapse every browser into one
-  bucket.
+  (15 minutes) and revoke the account's sessions. The failure window resets after
+  lock expiry or a successful TOTP/recovery/password-reset/enable so the lock is
+  genuinely temporary. Login/TOTP/recovery rate limits are keyed to the verified
+  Access subject/session, never solely to the loopback `RemoteAddr`, so a Tunnel
+  origin does not collapse every browser into one bucket.
 - TOTP: RFC 6238 SHA1, 6 digits, 30 s, ±1 step; persistent consumed-counter
   table makes replay/restart/clock-rollback fail; atomic login/setup completion
   means one concurrent code succeeds at most once.

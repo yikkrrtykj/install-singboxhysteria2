@@ -79,6 +79,9 @@
           },
           "401": {
             "$ref": "#/components/responses/AccessError"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimitError"
           }
         }
       }
@@ -164,6 +167,9 @@
           },
           "403": {
             "$ref": "#/components/responses/CsrfError"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimitError"
           }
         }
       }
@@ -202,6 +208,9 @@
           },
           "401": {
             "$ref": "#/components/responses/CredentialError"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimitError"
           }
         }
       }

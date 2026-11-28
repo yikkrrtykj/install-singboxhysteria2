@@ -368,7 +368,11 @@ func (s *Store) SetAuthUserEnabled(ctx context.Context, userID string, enabled b
 	if !enabled {
 		disabled = now
 	}
-	res, err := tx.ExecContext(ctx, `UPDATE umc_users SET enabled=?,disabled_at=?,updated_at=? WHERE user_id=?`,
+	lockClear := ""
+	if enabled {
+		lockClear = ",totp_failed_attempts=0,totp_locked_until=NULL"
+	}
+	res, err := tx.ExecContext(ctx, `UPDATE umc_users SET enabled=?,disabled_at=?`+lockClear+`,updated_at=? WHERE user_id=?`,
 		boolInt(enabled), disabled, now, userID)
 	if err != nil {
 		return err
@@ -458,7 +462,7 @@ func (s *Store) SetAuthUserPassword(ctx context.Context, userID, passwordHash st
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	res, err := tx.ExecContext(ctx, `UPDATE umc_users SET password_hash=?,updated_at=? WHERE user_id=?`, passwordHash, now, userID)
+	res, err := tx.ExecContext(ctx, `UPDATE umc_users SET password_hash=?,totp_failed_attempts=0,totp_locked_until=NULL,updated_at=? WHERE user_id=?`, passwordHash, now, userID)
 	if err != nil {
 		return err
 	}
@@ -1014,6 +1018,12 @@ func (s *Store) RecordTOTPFailure(ctx context.Context, userID string, now, thres
 			return 0, ErrAuthUserUnknown
 		}
 		return 0, err
+	}
+	if locked.Valid && locked.Int64 <= now {
+		// A previous lock has expired: start a fresh failure window so the next
+		// typo cannot immediately re-lock the account forever.
+		attempts = 0
+		locked = sql.NullInt64{}
 	}
 	attempts++
 	var until any

@@ -86,10 +86,10 @@ disposition:
 
 | Finding | Disposition |
 | --- | --- |
-| P1 online TOTP guessing / no lockout | Fixed: persistent per-account failure count + 15-minute lockout after 5 failures, pending session revocation on lock, 10-minute pending/setup TTL, TOTP mutation rate bounded; lockout test added. |
+| P1 online TOTP guessing / no lockout | Fixed: persistent per-account failure count + 15-minute lockout after 5 failures, account-session revocation on lock, failure-window reset after expiry/success/password reset/enable, 10-minute pending/setup TTL, TOTP mutation rate bounded; lockout test added. |
 | P2 TOTP setup non-atomic | Fixed: new `CompleteTOTPSetup` transaction consumes counter, stores sealed secret + recovery generation, revokes old sessions, inserts active session and audit/ledger; cookie written only after commit; concurrency test added. |
 | P2 rate limits keyed by loopback Tunnel address | Fixed: login/TOTP/recovery buckets use verified Access subject/session/user where available; account budget checked after preauth/CSRF. |
-| P2 recovery timing account enumeration | Fixed: dummy Argon2 hash path for unknown/disabled accounts. |
+| P2 recovery timing account enumeration | Fixed: dummy Argon2 hash path plus an identical pre-lookup rate bucket keyed by Access subject + username, so known/unknown names get the same 401/429 behavior. |
 | P2 unbounded preauth rows | Mitigated: per-Access-subject preauth creation rate limit + bounded maintenance cleanup; documented. |
 | P2 audit/ledger non-atomic login/recovery/CLI | Fixed: mutation metadata attached to TOTP login completion, recovery-code regeneration and local CLI recovery. |
 | P2 CSRF cookie not HttpOnly | Fixed (working tree/commit): both `__Host-um_session` and `__Host-um_csrf` are Secure HttpOnly SameSite=Strict; cookie-attribute test added; CSRF token obtained via `/auth/context`, never `document.cookie`. |
@@ -97,6 +97,10 @@ disposition:
 | P2 frontend README contract mismatch claims | Fixed: stale claims removed/corrected. |
 | P3 recovery generation invalidation | Fixed: successful recovery deletes remaining codes and old TOTP counters. |
 | P3 `SetAuthUserTOTP` comment/DB permissions/TLS key ACLs/startup wrong-key wording | Partially addressed by docs/comment; DB/TLS key permission hardening and startup key validation remain operational HOLD hardening, not claimed complete. |
+
+### Follow-up independent review
+
+A second read-only pass on `395583e1` confirmed the original P1/P2 fixes but found two residual P2s: the persistent TOTP failure counter did not reset after an expired lock (possible indefinite lockout DoS), and `/auth/recovery` still had a deterministic 429-vs-401 pre-lookup oracle for known vs unknown usernames. Both are fixed in the next review-fix commit: lock expiry resets the failure window; password reset/enable clears lock state; all-session revocation is documented; recovery uses one subject+username pre-lookup bucket for both cases. The follow-up also committed the setup-session conflict 401 mapping. Remaining items are P3 doc/test gaps and exact-HEAD CI/evidence refresh.
 
 ## Claims NOT made
 

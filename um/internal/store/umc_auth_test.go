@@ -276,3 +276,34 @@ func TestUMCAuthCleanupBoundedExpiredState(t *testing.T) {
 		t.Fatalf("expired session survived cleanup: %v", err)
 	}
 }
+
+func TestUMCAuthMutationAuditFailureRollsBack(t *testing.T) {
+	s := openTestStore(t, tempStorePath(t))
+	ctx := context.Background()
+	now := int64(1_900_400_000)
+	oldHash := "$argon2id$v=19$m=65536,t=3,p=2$c2FsdHNhbHRzYWx0c2FsdA$aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	newHash := "$argon2id$v=19$m=65536,t=3,p=2$c2FsdHNhbHRzYWx0c2FsdA$bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	if _, err := s.BootstrapAuthUser(ctx, "audit-atomic", oldHash, now); err != nil {
+		t.Fatal(err)
+	}
+	user, err := s.GetAuthUserByUsername(ctx, "audit-atomic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// An incomplete ledger mutation metadata makes the audit/ledger append fail;
+	// the password update must roll back atomically instead of committing unaudited.
+	badCtx := WithAuthMutation(ctx, AuthMutationMeta{
+		Audit:      AuditMeta{Actor: "test", Role: AuthRolePlatformAdmin, Action: "test", Target: "user:" + user.UserID},
+		LedgerKind: "test_mutation",
+	})
+	if err := s.SetAuthUserPassword(badCtx, user.UserID, newHash, now+1); err == nil {
+		t.Fatal("SetAuthUserPassword with incomplete ledger metadata unexpectedly succeeded")
+	}
+	got, err := s.GetAuthUserByID(ctx, user.UserID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.PasswordHash != oldHash {
+		t.Fatal("password change was not rolled back on audit/ledger failure")
+	}
+}

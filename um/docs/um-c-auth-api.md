@@ -95,7 +95,8 @@ bearer listener remains separate and is not tunnel-routed.
   sessions have a 10-minute TTL. Login/TOTP/recovery/user mutations are
   rate-limited by verified Access subject/session/user, not loopback IP;
   Argon2id concurrency is capped at 4. Five TOTP failures temporarily lock the
-  account's TOTP for 15 minutes and revoke pending sessions.
+  account's TOTP for 15 minutes and revoke the account's sessions; the failure
+  window resets after expiry or a successful password/TOTP/recovery/enable.
 - TOTP: RFC 6238 SHA-1/6 digits/30 s, ±1 step; persistent counter and atomic
   login/setup completion prevent replay. Recovery codes: 10 generated, single
   use, hashes only; successful recovery invalidates the remaining generation.

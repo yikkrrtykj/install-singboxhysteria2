@@ -330,6 +330,12 @@ func TestUMCTOTPFailureLockout(t *testing.T) {
 		t.Fatalf("post-lock login status=%d body=%s", status, raw)
 	}
 	pending, _ = decodeMap(t, raw)["csrf_token"].(string)
+	// After expiry the failure window resets: one typo is 401, not an immediate
+	// re-lock, and the pending session remains usable for a correct code.
+	status, _ = tw.request(t, http.MethodPost, "/auth/totp", pending, map[string]any{"code": "000000"}, tw.jwt)
+	if status != http.StatusUnauthorized {
+		t.Fatalf("post-expiry typo status=%d, want 401", status)
+	}
 	code, _ := umcauth.TOTPCode(secret, *tw.clock)
 	status, raw = tw.request(t, http.MethodPost, "/auth/totp", pending, map[string]any{"code": code}, tw.jwt)
 	if status != http.StatusOK {
