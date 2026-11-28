@@ -2449,6 +2449,10 @@ class Lab:
                 % (tag, lab.format_bytes(delta),
                    lab.format_bytes(expected_bytes)))
         # Concurrent uploads in both directions.
+        upload_before = self.export_current()
+        upload_baseline = {
+            tag: (lab.export_observed(upload_before, tag, "uplink") or 0)
+            for tag in (lab.REALITY_TAG, lab.HYSTERIA2_TAG)}
         upload_threads = [
             self.produce_async_upload("reality", "concurrent-upload",
                                       b"U" * (512 * 1024)),
@@ -2457,6 +2461,15 @@ class Lab:
         ]
         for thread in upload_threads:
             thread.join(timeout=120)
+        # Wait for the monitor to observe and bank the concurrent uploads
+        # before asking the agent for a signed snapshot.
+        lab.wait_until(
+            lambda: all(
+                (lab.export_observed(self.export_current(), tag, "uplink") or 0)
+                - upload_baseline[tag] >= 512 * 1024
+                for tag in (lab.REALITY_TAG, lab.HYSTERIA2_TAG)),
+            timeout=45, interval=0.2,
+            description="concurrent upload lower bounds to be observed")
         self.run_agent_once("concurrent-protocols")
         rows = self.traffic_tables_present()
         epoch = self.current_monitor_epoch
@@ -2498,8 +2511,8 @@ class Lab:
 
         def _run():
             result = lab.run_curl_socks(
-                socks, http_base + "/upload/echo", method="POST",
-                upload_bytes=payload, max_time=120.0)
+                socks, http_base + "/upload/%d" % len(payload),
+                method="POST", upload_bytes=payload, max_time=120.0)
             captured["result"] = result
             if result.ok:
                 self.ledger.record(tag, "uplink", result.size_upload,
