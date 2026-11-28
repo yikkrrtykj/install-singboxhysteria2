@@ -3,8 +3,9 @@
 PR: #133 (Draft, Refs #127)
 Branch: `codex/um-b4-management`
 Base: `da8173317aa6b6395a5e002ea4a89dac3fe4fd5e` (rev-6 main)
-Reviewed HEAD: `04480ef6d6d93d2b79d975d9eb1b45a9f1d6da0d`; final independent
-review found no P0/P1 and approved for Draft PR status.
+Reviewed HEAD: the final PR head on `codex/um-b4-management`; exact CI/lab
+runs and review records are on PR #133. Independent review found no P0/P1 and
+approved the runtime change set for Draft PR status.
 
 ## 1. Implementation evidence
 
@@ -113,11 +114,14 @@ Exact-HEAD evidence:
 - Linux Reality/Hysteria2 real traffic collection remains a pre-production
   functional blocker on #127 (see `um-b4-data-source-investigation.md`).
 - Backup/restore, VACUUM/disk-pressure and offsite ledger acceptance remain UM-E.
-- Formal Codex review was attempted on final HEAD. The first attempts hit local
-  CLI account/model incompatibility (`gpt-6.1-sol`/`gpt-5.1-codex` not in the
-  ChatGPT-account catalog); the Codex auto-review model ran successfully and
-  found one P1: archived-event alias **deletion** bypassed the event lifecycle
-  gate. Fixed by applying the existing active-event transaction gate to both
-  alias writes; an archived-event alias-delete regression test was added. A
-  non-Codex independent review was also run and cleared the runtime HEAD with no
-  P0/P1; its findings were fixed as above.
+- Formal Codex review ran successfully through the Codex auto-review model
+  after local CLI account/model incompatibility was worked around. It found two
+  P1s: archived-event alias **deletion** bypassed the event lifecycle gate, and
+  the central `Authorize` matrix still let viewers through the audit-read action
+  before the service's explicit denial. Fixed by applying the active-event
+  transaction gate to both alias writes and restricting `audit_read` to
+  platform/event admins in the central matrix, with archived-alias-delete and
+  viewer-audit regression coverage. Final Codex re-review at the fixed HEAD found
+  **no discrete actionable regressions** (full Go suite ok). A non-Codex
+  independent review was also run; its P1/P2 findings were fixed and it cleared
+  the runtime change set for Draft PR status.
