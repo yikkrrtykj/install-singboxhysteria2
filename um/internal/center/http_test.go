@@ -556,8 +556,8 @@ func TestLoadContracts(t *testing.T) {
 	}
 	expected := len(ContractSchemaNames)
 	if info, statErr := os.Stat(filepath.Join(testContractDir, "rev7")); statErr == nil && info.IsDir() {
-		expected += 2
-		for _, name := range []string{"report-snapshot.rev7.schema.json", "agent-config.rev7.schema.json"} {
+		expected += 3
+		for _, name := range []string{"report-snapshot.rev7.schema.json", "agent-config.rev7.schema.json", "traffic-export.schema.json"} {
 			if !set.Has(name) {
 				t.Fatalf("contract set is missing rev-7 overlay %q", name)
 			}

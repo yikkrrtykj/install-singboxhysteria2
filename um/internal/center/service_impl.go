@@ -393,6 +393,26 @@ func (s *ServiceImpl) Report(ctx context.Context, req ReportRequest) (ReportResu
 				validationRejected = true
 				return err
 			}
+			var revisionProbe struct {
+				ContractRevision *int `json:"contract_revision"`
+			}
+			_ = json.Unmarshal(req.Body, &revisionProbe)
+			if revisionProbe.ContractRevision != nil && *revisionProbe.ContractRevision == contract.ContractRevision7 {
+				// CFG-REV7 defense in depth: only a rev-7-capable signed agent may
+				// submit a rev-7 body, even if an operator/bug enabled the source for
+				// an older node. The config gate is the primary control; this check
+				// keeps a misconfigured/rollback race from storing rev-7 data that the
+				// center never advertised to that agent build.
+				var agentDoc struct {
+					Agent struct {
+						Version string `json:"version"`
+					} `json:"agent"`
+				}
+				if json.Unmarshal(req.Body, &agentDoc) != nil || !agentVersionAtLeast(agentDoc.Agent.Version, MinMonitorExportAgentVersion) {
+					validationRejected = true
+					return apiErr(400, "invalid_request", false)
+				}
+			}
 			if req.ReportType == "snapshot" {
 				if err := enforceExpectedInboundTags(node.NodeClass, req.Body, c.ExpectedInboundTags); err != nil {
 					validationRejected = true
