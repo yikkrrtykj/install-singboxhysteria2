@@ -133,7 +133,7 @@ func Authorize(p Principal, action Action, eventID string) error {
 		return eventRead()
 	}
 	switch action {
-	case ActionEventList, ActionAuditRead, ActionAdminHealth:
+	case ActionEventList, ActionAdminHealth:
 		return nil
 	case ActionEventRead, ActionNodeList, ActionNodeRead, ActionTokenRead,
 		ActionConfigRead, ActionAliasRead, ActionMappingRead, ActionEventPurgeRead:
@@ -142,7 +142,8 @@ func Authorize(p Principal, action Action, eventID string) error {
 		ActionConfigWrite, ActionMappingWrite, ActionRetentionRead, ActionRetentionRun,
 		ActionLedgerVerify:
 		return platformOnly()
-	case ActionNodeRevoke, ActionTokenCreate, ActionTokenList, ActionTokenRevoke, ActionAliasWrite:
+	case ActionNodeRevoke, ActionTokenCreate, ActionTokenList, ActionTokenRevoke, ActionAliasWrite,
+		ActionAuditRead:
 		return eventWrite()
 	default:
 		return ErrForbidden
