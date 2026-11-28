@@ -1281,8 +1281,9 @@ class Lab:
                             "ok": result.ok})
         if upload_bytes:
             result = lab.run_curl_socks(
-                socks, http_base + "/upload/echo", method="POST",
-                upload_bytes=b"U" * upload_bytes, max_time=timeout)
+                socks, http_base + "/upload/%d" % upload_bytes,
+                method="POST", upload_bytes=b"U" * upload_bytes,
+                max_time=timeout)
             if expect_ok:
                 self.check(result.ok,
                            "real %s upload of %s succeeded (http=%d rc=%d)"
