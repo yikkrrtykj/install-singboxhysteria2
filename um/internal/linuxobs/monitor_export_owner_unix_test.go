@@ -31,7 +31,9 @@ func TestMonitorExportOwnerGroupModeChecks(t *testing.T) {
 	path := writeMonitorExport(t, validMonitorExport(testCollectedAt, 3, "eh"))
 	col.MonitorExportFile = path
 	col.MonitorExportOwnerUID = os.Getuid()
-	col.MonitorExportGroupGID = os.Getgid()
+	// Group ownership of a temp fixture is not portable across CI runners; the
+	// mismatch case above still proves the group check fails closed.
+	col.MonitorExportGroupGID = 0
 	if err := os.Chmod(path, 0o640); err != nil {
 		t.Fatalf("chmod fixture: %v", err)
 	}

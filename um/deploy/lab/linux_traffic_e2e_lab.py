@@ -1803,6 +1803,7 @@ class Lab:
         # Leave a stale complete export from the previous process behind; the
         # monitor must remove it at startup and publish a new epoch.
         lab.write_json(self.export_path, old["raw"])
+        os.chmod(self.export_path, 0o640)
         self.monitor_start()
         fresh = lab.wait_for_export(
             self.export_path, 45,
@@ -1966,6 +1967,7 @@ class Lab:
         for row in old_document["inbounds"]:
             row["observed_at"] = now - 3600
         lab.write_json(self.export_path, old_document)
+        os.chmod(self.export_path, 0o640)
         report = self.run_agent_once("export-old")
         parsed = lab.validate_rev7_snapshot_report(report)
         self.check_eq(parsed["freshness"], "stale",
