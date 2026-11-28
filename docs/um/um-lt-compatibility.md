@@ -52,8 +52,9 @@ rotation/revocation rules, node classes and Windows behavior are unchanged.
   the key or receive a key its old agent rejects fail-closed. Normative detail:
   overlay §11.1; testable cases `CFG-REV7-01..05`.
 - Config is validated per node class: `monitor_export=true` is invalid for
-  `windows_terminal`; a Windows agent rejects such a config and keeps its
-  previous applied config. There is no cross-class downgrade.
+  `windows_terminal`; a Windows agent rejects such a config and keeps running its
+  previously applied valid config while retrying the config pull. There is no
+  cross-class downgrade.
 - Reports are validated against the **effective-dated** config at `collected_at`
   (existing B2 rule). An enable→collect→disable sequence therefore preserves
   authorization for reports collected while enabled; a source never enabled
@@ -70,7 +71,7 @@ rotation/revocation rules, node classes and Windows behavior are unchanged.
 | A7 | C7 | rev-5 or rev-7 with false/absent | rev-5 | source disabled; node shows rev-5 `traffic: unavailable`; no fake zero |
 | A7+ | C7 | rev-7 `monitor_export=true` | rev-7 bodies per cadence | validated/stored; lower bounds displayed with freshness/exactness labels |
 | A7+ | C5 | impossible by config; if a rev-7 body still reaches C5 (race/rollback) | rev-7 body | C5 rejects with `400 invalid_request` (unknown/forbidden fields), no state change; A7+ quarantines the record (existing non-retryable rejection handling) and stops emitting rev-7 after its config refresh no longer advertises the switch |
-| A7 | C7 with `monitor_export=true` sent by mistake | rev-7 key present | A7 build supports it → behaves as A7+; **A5** in the same position | A5's strict config validator requires exactly six collect keys and rejects the seventh → config rejected fail-closed (retried with bounded backoff), previous applied config kept, no source enabled |
+| A7 | C7 with `monitor_export=true` sent by mistake | rev-7 key present | A7 build supports it → behaves as A7+; **A5** in the same position | A5's strict config validator requires exactly six collect keys and rejects the seventh → config rejected fail-closed; the frozen agent then retries the config pull immediately (no exponential backoff) and does not queue new snapshots, so collection effectively stalls until a compatible config is served. The center-side `CFG-REV7` gate is therefore mandatory, not defensive |
 | Windows A5/A7 | C7 | rev-5 (never `monitor_export`) | rev-5 + terminal | unchanged |
 | any Windows | C7 | malformed rev-7 config with `monitor_export` | — | agent rejects config (`platform_mismatch`/invalid), keeps previous config; center must never emit it |
 
@@ -176,8 +177,10 @@ Real tests, not only JSON parsing (mapping to the acceptance matrix):
 4. A7++C7: rev-7 accepted, stored and query-presented with lower-bound labels.
 5. C5 receiving a rev-7 body (direct HTTP): `400 invalid_request`, no state
    change, dedupe/seq high-water untouched.
-6. A5 receiving a 7-key config: config rejected fail-closed, previous config
-   kept; center rollout gate prevents this path.
+6. A5 receiving a 7-key config: config rejected fail-closed; the frozen agent
+   retries the config pull immediately without exponential backoff and does not
+   queue new snapshots, so the center-side rollout gate (never emit to a
+   non-rev-7 agent) is mandatory.
 7. Queued rev-7 record on config downgrade: not sent to C5; quarantine preserves
    `report_id`/body bytes; rev-5 spool records drain and are acknowledged.
 8. Center DB downgrade attempt: old binary fails closed on newer schema version.

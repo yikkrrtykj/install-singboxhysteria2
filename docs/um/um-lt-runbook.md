@@ -10,9 +10,12 @@ VPS/SSH/paid resource is used.
 
 Reference identities/paths: center `um-center.service` (`umcenter`), agent
 `um-agent.service` (`umagent`), monitor `singbox-monitor.service` (`sboxweb`),
-export group `um-lt-export`, export directory `/var/lib/um-lt-export/`, export
-file `traffic-export.json`, agent state `/var/lib/um-agent/`. The implementation
-PR fixes the exact names; the installer must assert them.
+export group `sboxmon-export`, export directory `/run/singbox-monitor-export/`,
+export file `traffic.json`, agent state `/var/lib/um-agent/`. The implementation
+PR fixes the exact names; the operator setup must assert them. The directory is
+on `/run` tmpfs, so it is operator-created and must be recreated after a reboot
+(systemd-tmpfiles or the install script); the exporter is disabled while it is
+absent.
 
 ## 0. Preconditions
 
@@ -39,7 +42,7 @@ PR fixes the exact names; the installer must assert them.
 | Step | Action | Why this order |
 | --- | --- | --- |
 | 1 | Upgrade the center to the rev-7-capable build with the source disabled (no node has `monitor_export`) | C7 must be able to receive/validate rev-5/6 bodies first; no behavior change for old agents |
-| 2 | Install the monitor package with the export writer and the `um-lt-export` group/directory | the file may exist before any center enables the source; nothing consumes it |
+| 2 | Install the monitor package with the export writer; the operator creates the `sboxmon-export` group and `/run/singbox-monitor-export/` directory | the file may exist before any center enables the source; nothing consumes it until enabled; the writer's operator path is validated at startup |
 | 3 | Upgrade agents to the rev-7 build (source disabled) | A7 emits only rev-5 bodies until a config advertises the switch; its signed snapshots must report `agent.version >= 1.1.0` before the center can emit the key |
 | 4 | Enable the source for one canary `linux_vps` node in the center | validates config/gating per node; if the stored flag is enabled before the version gate is satisfied, the center withholds the key and applies it on the next pull after a signed `>=1.1.0` snapshot |
 | 5 | Verify export file, agent report, ingest, storage and query (see §5) | catches ACL/schema/semantics issues before fleet |
@@ -53,29 +56,35 @@ monitor first and wait for one successful export.
 
 ## 2. Install (reference commands; verify in the implementation PR)
 
-### 2.1 Export group and directory (one-time per node)
+### 2.1 Export group and directory (one-time per node, operator step)
 
 ```bash
-getent group um-lt-export || groupadd --system um-lt-export
-# monitor writer + agent reader only; no login/interactive members
-usermod -aG um-lt-export sboxweb
-usermod -aG um-lt-export umagent
-install -d -o root -g um-lt-export -m 2750 /var/lib/um-lt-export
+# explicit operator step; the installer and the monitor never create these
+getent group sboxmon-export || groupadd --system sboxmon-export
+# the group contains ONLY the non-root local agent service user; never root,
+# never interactive users, and the monitor user is not a member (owner write)
+usermod -aG sboxmon-export umagent
+install -d -m 2750 -o sboxweb -g sboxmon-export /run/singbox-monitor-export
 ```
 
 Verify (must match; a wrong result aborts the rollout):
 
 ```bash
-stat -c '%U:%G %a %F %n' /var/lib/um-lt-export
-getent group um-lt-export
+stat -c '%U:%G %a %F %n' /run/singbox-monitor-export
+getent group sboxmon-export          # exactly one member: the agent user
 # agent must be able to traverse/read, not write:
-sudo -u umagent test -r /var/lib/um-lt-export && echo readable-ok
-sudo -u umagent test -w /var/lib/um-lt-export && echo "FAIL writable" || echo "read-only-ok"
+sudo -u umagent test -r /run/singbox-monitor-export && echo readable-ok
+sudo -u umagent test -w /run/singbox-monitor-export && echo "FAIL writable" || echo "read-only-ok"
+getfacl -p /run/singbox-monitor-export 2>/dev/null || true   # must have no extended ACL entries
 ```
 
-The monitor unit must gain exactly one writable path:
-`ReadWritePaths=/var/lib/um-lt-export` (or the packaged equivalent). No
-sing-box/`sbox-cm`/data-root permission changes. Diff and record the unit change.
+The monitor unit must gain exactly one optional writable path:
+`ReadWritePaths=-/run/singbox-monitor-export` (the packaged equivalent; the
+leading `-` keeps a default install without the directory working). No
+sing-box/`sbox-cm`/data-root permission changes. Diff and record the unit
+change. Because `/run` is tmpfs, recreate the directory after a reboot
+(systemd-tmpfiles/install script); an absent directory means no export and the
+agent reports honest unavailable.
 
 ### 2.2 Monitor package
 
@@ -89,10 +98,10 @@ systemctl is-active singbox-monitor.service
 The export file must appear after one collection interval:
 
 ```bash
-stat -c '%U:%G %a %s %y %n' /var/lib/um-lt-export/traffic-export.json
+stat -c '%U:%G %a %s %y %n' /run/singbox-monitor-export/traffic.json
 python3 - <<'PY'
 import json
-p="/var/lib/um-lt-export/traffic-export.json"
+p="/run/singbox-monitor-export/traffic.json"
 d=json.load(open(p))
 print(d["schema"], d["schema_version"], d["source"], d["source_epoch"], d["sequence"], d["monitor_stale"], len(d["inbounds"]))
 PY
@@ -154,7 +163,7 @@ rev-5 snapshot/metrics/events flow must remain healthy.
 
 | Check | Expected |
 | --- | --- |
-| export file owner/group/mode | `sboxweb:um-lt-export 0640`, regular file, size ≤64 KiB |
+| export file owner/group/mode | `sboxweb:sboxmon-export 0640`, regular file, size ≤64 KiB; directory owner `sboxweb` / `2750` / no ACL |
 | export epoch/sequence | 32-hex epoch; sequence increases; change of epoch only on monitor restart |
 | export privacy scan | no IP/hostname/user/device/connection-id/UUID/proxy/URL/YAML/secret tokens |
 | agent reads only export | no monitor data-root/secret access; no new listener; no export write |
@@ -189,8 +198,8 @@ Follow [`um-lt-compatibility.md`](um-lt-compatibility.md) §5–§6.
 1. Disable the source and drain/quarantine as in §6.
 2. Stop and remove the agent/monitor rev-7 packages using the reviewed uninstall
    path; do not hand-delete state directories that the uninstaller manages.
-3. Remove `umagent`/`sboxweb` from `um-lt-export`; remove
-   `/var/lib/um-lt-export/` only after the monitor writer is removed and the
+3. Remove `umagent` from `sboxmon-export`; remove
+   `/run/singbox-monitor-export/` only after the monitor writer is removed and the
    uninstall evidence confirms no remaining writer.
 4. Do not change sing-box/`sbox-cm` permissions or remove unrelated monitor data.
 5. `singbox_api` stays false; P1-10 FAIL is retained regardless of uninstall.
@@ -199,7 +208,7 @@ Follow [`um-lt-compatibility.md`](um-lt-compatibility.md) §5–§6.
 
 | Symptom | First checks | Likely action |
 | --- | --- | --- |
-| node shows no rev-7 data | center rollout gate, audit version, node class, latest signed `agent.version` (`>=1.1.0`), applied config switch | enable/upgrade only through the documented gate; never bypass |
+| node shows no rev-7 data | center rollout gate, audit version, node class, latest signed `agent.version` (`>=1.1.0`), applied config switch, monitor mode | enable/upgrade only through the documented gate; never bypass; if the monitor runs only the legacy compatibility collector-loop mode it never publishes the export — run the production web mode with the explicit export flags |
 | source flag enabled in center but key absent from agent config | `CFG-REV7` gate not satisfied: version unknown/older, no signed snapshot yet, or class/audit mismatch | upgrade agent and wait for a signed `>=1.1.0` snapshot + next config pull; center MUST omit the key, not emit `false` (`CFG-REV7-01/02/04`) |
 | key appears then disappears without a config disable | later signed snapshot reported an older version (agent rollback) or class/audit state changed | treat as compatibility downgrade; drain per §6; do not force-enable |
 | `traffic_observation.availability=unavailable` | monitor running, export file exists/fresh, owner/group/mode, `monitor_stale`, symlink/FIFO, size | fix monitor/ACL; do not fake data |

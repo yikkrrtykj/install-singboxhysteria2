@@ -45,8 +45,9 @@ monitor-v2 collector (non-root sboxweb)
         │  aggregate per inbound: observed lower-bound bytes, rates,
         │  active connections, observed_at, sequence; privacy-filtered
         ▼
-atomic restricted file export  /var/lib/um-lt-export/traffic-export.json
-  root:um-lt-export 2750 dir; sboxweb:um-lt-export 0640 file; temp+fsync+rename
+atomic restricted file export  /run/singbox-monitor-export/traffic.json
+  monitor-user:sboxmon-export 2750 setgid dir (group r-x); monitor-user:<group> 0640 file;
+  temp+fsync+rename; sboxmon-export contains only the non-root agent user
         │  read-only, O_NOFOLLOW, bounded 64 KiB, fixed compiled path
         ▼
 Linux um-agent (unprivileged umagent, no listening socket)
@@ -78,7 +79,7 @@ connection.
 | Component | Change | Boundary |
 | --- | --- | --- |
 | `monitor-v2` collector/API bridge | **modified by the implementation PR only**: add a bounded aggregate export writer; read-only consumption unchanged | already holds the existing `service.api` secret internally; keeps it; exports no secret and no raw data |
-| export directory/file | **new** | one restricted group `um-lt-export`; monitor writes, agent reads; no other principal |
+| export directory/file | **new** | operator-created `/run/singbox-monitor-export/` owned by the non-root monitor user, group `sboxmon-export` containing only the non-root agent user; no ACL; monitor writes as owner, agent reads via group; no other principal |
 | `um-agent` Linux | **modified by the implementation PR only**: read one fixed read-only path, build rev-7 observation, no new socket/credential | unprivileged `umagent`, no exec, no listener; never writes/deletes the export |
 | `um-center` ingest | **modified by the implementation PR only**: rev-7 dispatch/validation/storage/query | existing authenticated report path; unchanged signing/replay/durability |
 | Windows agent, rev-5 collectors, `/etc`/`/var/lib` sing-box or `sbox-cm` permissions | **unchanged** | no permission widening, no Windows change |
@@ -108,20 +109,26 @@ inaccessible from the monitor/agent/center read path used here.
   exactly once, and `ABANDONED` lifecycles (active IDs missing from a later
   reset) banked as a lower bound that is un-banked if the ID reappears. An
   independent LRU replay guard prevents double-banking of replayed IDs.
-- For the export writer, per configured/observed inbound tag it aggregates
-  across all devices: `banked finalized totals + current active lifecycle
-  totals` per direction; active connection count; and rates derived from the
-  stream's delta/elapsed updates. No per-device row leaves the monitor.
+- For the export writer, per operator-configured `TAG:KIND` allow-list pair it
+  aggregates across all devices: `banked finalized totals + current active
+  lifecycle totals` per direction; active connection count; and rates derived
+  from the stream's delta/elapsed updates. No per-device row leaves the monitor.
+  The `kind` in the file is the operator attestation from that allow-list, never
+  a heuristic over sing-box `inbound_type` or any other raw daemon field, and an
+  inbound tag outside the allow-list is never serialized.
 - The writer also emits monitor-side observability: `generated_at` (write time),
   `monitor_stale` (the monitor's own accumulator/stream-degradation flag) and
   `monitor_last_success_at` (last successful observation time in this epoch,
-  nullable). These are export-only: the agent uses them to avoid claiming the
-  observation is `ok` while the monitor knows it is degraded, and never forwards
-  them in the report.
+  nullable/non-null unless stale). These are export-only: the agent uses them to
+  avoid claiming the observation is `ok` while the monitor knows it is degraded,
+  and never forwards them in the report.
 - The accumulator is created with the process; when it restarts, a new
-  `source_epoch` is generated and the counters restart at zero. This is
+  `source_epoch` is generated and the in-memory counters restart at zero. This is
   fundamentally different from the host-boot `counter_epoch`, and the contract
-  keeps them independent.
+  keeps them independent. The first subscription `reset` batch can include
+  active/recent lifecycles whose authoritative totals predate the epoch, so the
+  published value is an observed lower bound on observed lifecycles — never a
+  pure epoch byte delta and never a daemon-lifetime exact total.
 - The export is not exact: lifecycles that are never observed (opened and closed
   entirely between stream events or outside the replay window), stream gaps and
   accounting limits make the value a **lower bound**. See
@@ -138,53 +145,73 @@ section records the file/transport architecture.
 The file is a monitor-owned document identified by
 `schema: "singbox-monitor-traffic-export"`, `schema_version: 1`,
 `source: "monitor-v2"`, `counter_scope: "observation_epoch"` and
-`exactness: "lower_bound"`. It is **not** the report body: the agent re-validates
-it, derives `age_seconds`/`freshness`/`availability`, maps
+`exactness: "lower_bound"`; its closed 14-top-level/9-per-entry shape and the
+schema-expressible coherence are pinned by
+[`contracts/v1/rev7/traffic-export.schema.json`](contracts/v1/rev7/traffic-export.schema.json)
+with positive fixture
+[`contracts/v1/rev7/examples/traffic-export.json`](contracts/v1/rev7/examples/traffic-export.json).
+It is **not** the report body: the agent re-validates it, derives
+`age_seconds`/`freshness`/`availability`, maps
 `observed_uplink_bytes`/`observed_downlink_bytes` to the report's
 `uplink_observed_lower_bound_bytes`/`downlink_observed_lower_bound_bytes`, and
 sets the report source token `traffic_observation.source =
 "monitor_readonly_export"`. Export-only observability fields (`generated_at`,
 `monitor_stale`, `monitor_last_success_at`) are never forwarded into the report.
+The export writer lives in the production web-mode runtime; the legacy
+compatibility collector-loop mode does not publish it, so a node running only
+that mode reports honest unavailable rather than falling back to
+`state/snapshot.json`.
 
 ### 5.1 File, group and ACL model
 
-Reference names (the implementation PR fixes them and the installer asserts
-them; they are never center-configurable):
+Reference names (the implementation PR fixes them and the operator setup
+asserts them; they are never center-configurable, and the monitor/installer do
+not create the directory):
 
 | Path | Owner:group | Mode | Purpose |
 | --- | --- | --- | --- |
-| `/var/lib/um-lt-export/` | `root:um-lt-export` | `2750` | dedicated export directory (setgid; no world access) |
-| `/var/lib/um-lt-export/traffic-export.json` | `sboxweb:um-lt-export` | `0640` | current complete export |
-| `/var/lib/um-lt-export/.traffic-export.tmp.*` | `sboxweb:um-lt-export` | `0640` | monitor-owned temporary files only; removed by the monitor |
+| `/run/singbox-monitor-export/` | `<monitor-user>:sboxmon-export` | `2750` | operator-created directory on root-controlled `/run` tmpfs (setgid; group r-x, no world access) |
+| `/run/singbox-monitor-export/traffic.json` | `<monitor-user>:sboxmon-export` | `0640` | current complete export, written by the monitor as directory owner |
+| `/run/singbox-monitor-export/.traffic.json.tmp.*` | `<monitor-user>:sboxmon-export` | `0640` | monitor-owned temporary files only; removed by the monitor |
 
-- System group `um-lt-export` has exactly two members: the monitor service user
-  (e.g. `sboxweb`) and the agent service user (e.g. `umagent`). No login shells,
-  no interactive users.
-- The agent is **not** added to any monitor, sing-box or `sbox-cm` group; the
-  monitor gets no new path outside its existing data root except this export
-  directory (a `ReadWritePaths=`/equivalent unit addition for that directory
-  only). No existing file mode/owner is changed.
+There are no POSIX ACLs beyond owner/group/other bits.
+
+- The system group `sboxmon-export` has exactly one member: the non-root agent
+  service user (`<agent-user>`, reference `umagent`). It never contains root or
+  interactive/login users, and the monitor user is **not** in it (the monitor
+  writes as owner).
+- The agent is **not** added to any monitor, sing-box or `sbox-cm` group, and it
+  gets no shell access to the monitor user. The monitor's only new writable path
+  is the export directory (`ReadWritePaths=-/run/singbox-monitor-export`, an
+  optional path so a default install without it is untouched). No existing
+  owner/mode is changed.
 - The agent opens with `O_RDONLY|O_NOFOLLOW`, requires a regular file, verifies
   size/owner/group/mode and that the resolved path is the fixed path, and reads
   at most 64 KiB. A symlink, FIFO, device, directory, wrong owner/mode or
   oversized file is rejected as unavailable.
-- The agent has no write bit and no directory write permission; it cannot
-  create, replace, delete or clean up export files. Stale/old files are the
-  monitor's responsibility.
+- The agent has no write bit and no directory write permission (group is `r-x`
+  on the directory, `r` on the file); it cannot create, replace, delete or clean
+  up export files. Stale/old files are the monitor's responsibility.
+- `/run` is tmpfs and root-controlled: an unrelated local user cannot pre-create
+  the path before the operator, and after a reboot the directory must be
+  recreated by the operator (systemd-tmpfiles/install script); an absent path is
+  an unavailable source, never a stale trusted file.
 
 ### 5.2 Atomic replacement and startup deletion of stale export
 
 Writer order (required): build the whole document in memory → create-exclusive
 temporary file in the same directory → write → `fsync` → set owner/group/mode →
-`rename()` over `traffic-export.json` → `fsync` the directory. Readers see the
-old complete document or the new complete document, never a partial one.
+`rename()` over `traffic.json` → `fsync` the directory. Readers see the old
+complete document or the new complete document, never a partial one.
 
 At monitor startup a new observation epoch begins: the monitor deletes the
-previous `traffic-export.json` and any stale temporary files it owns **before**
-its first new write. This prevents an agent from treating a previous monitor
+previous `traffic.json` and any stale temporary files it owns **before** its
+first new write. This prevents an agent from treating a previous monitor
 lifetime's file as the current epoch after a monitor restart. If the monitor is
 stopped, no file is refreshed: the agent ages the observation out to `stale`
-and then to the no-observation sentinel — it does not invent zero traffic.
+and then to the no-observation/status-only unavailable form — it does not invent
+zero traffic. `EXPORT_MAX_AGE_SECONDS = 86400` is measured consistently from
+`observed_at` (with `generated_at >= observed_at`).
 
 ### 5.3 Bounded sizes
 
@@ -213,8 +240,10 @@ fields are rejected, so the writer cannot grow the schema sideways.
 - On each collection it reads one complete file, validates it against the
   agent-side copy of the export/observation rules, filters entries to the applied
   `expected_inbound_tags` tag+kind pairs, derives `age_seconds`/`freshness`/
-  final `availability`, and builds the rev-7 snapshot. It uses no shell, no
-  exec, no subprocess and no network access for the source.
+  final `availability` (freshness uses the **effective-dated cadence at
+  `collected_at`**, not the mutable current config row), and builds the rev-7
+  snapshot. It uses no shell, no exec, no subprocess and no network access for
+  the source.
 - The report is spooled/signed by the unchanged rev-5 runtime; the signature
   covers the decoded body including the observation object. The agent does not
   rewrite or downgrade fsynced records.
@@ -284,6 +313,37 @@ remains the dedupe/conflict identity and the frozen base rev-5 projection may be
 stored as before; the observation is extracted into the bounded structured rows.
 Exact row sizes and the measured ratio belong to the implementation PR and UM-E.
 
+Sentinel and status-only storage rules (normative):
+
+1. an accepted zero-epoch no-observation sentinel stores **report-level header
+   and status metadata only** (report_id/event_id/node_id, collected_at/
+   received_at, freshness=availability=unavailable, counter_scope, exactness and
+   the zero epoch as an unavailable status). It stores no bytes, rates, active
+   counts, per-inbound value rows, bucket rows or epoch-series rows; the
+   all-zero epoch MUST NEVER be a key in `traffic_epoch` or any history/bucket
+   table.
+2. a status-only real-epoch form (valid export with no observed values) stores
+   header/status metadata including the real source_epoch/sequence/observed_at
+   for diagnostics, but still no byte/rate/active value rows, no bucket rows and
+   no epoch series.
+3. both forms supersede the previous latest status as `unavailable`; query never
+   keeps rendering the old lower-bound value as current after the newer status is
+   accepted.
+4. bucket/epoch rows are created only for observations carrying at least one
+   observed inbound value row; epochs never rewrite earlier buckets and the zero
+   epoch is never a row key.
+5. unavailable/status-only query output renders UNKNOWN/UNAVAILABLE with its
+   observation timestamp/freshness — never zero and never a synthetic point.
+
+Expected implementation tests (implementation PR): sentinel/status-only storage
+and previous-latest invalidation, zero-epoch-never-keyed, all-unavailable valid
+export becomes status-only, and query renders unknown. The reference
+implementation's `TestTrafficObservationStateExposesUnavailableSentinel`,
+`TestTrafficQueryLatestUsesObservedAt` and
+`TestTrafficQueryHistoryGapEpochAndTruncation` are the starting regression set;
+the sentinel/status-only storage and previous-latest-invalidation cases must be
+added by the implementation PR.
+
 ### 7.4 Query semantics
 
 - Latest: a node shows per-inbound "observed lower bound at least X bytes
@@ -292,7 +352,8 @@ Exact row sizes and the measured ratio belong to the implementation PR and UM-E.
 - History: 5-minute buckets within the 30-day/archive policy; ordered series
   never difference across `source_epoch`/`epoch_seq`; a monitor restart shows an
   epoch boundary/reset marker; a stale or unavailable interval is rendered as
-  such, never interpolated into zero.
+  such, never interpolated into zero. A status-only/unavailable row renders
+  UNKNOWN/UNAVAILABLE with its timestamp and no synthetic value.
 - An aggregate across nodes/inbounds may be shown only as a lower-bound sum
   (still labelled lower bound); no per-minute sums, no cross-epoch deltas, no
   client/device rows.

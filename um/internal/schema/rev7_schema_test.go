@@ -15,8 +15,14 @@ func TestRev7OverlayCompilesAndValidatesFixtures(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load(%q): %v", dir, err)
 	}
-	if !set.Has("report-snapshot.rev7.schema.json") || !set.Has("agent-config.rev7.schema.json") {
-		t.Fatalf("rev-7 overlay schemas missing: %v", set.Names())
+	for _, name := range []string{
+		"report-snapshot.rev7.schema.json",
+		"agent-config.rev7.schema.json",
+		"traffic-export.schema.json",
+	} {
+		if !set.Has(name) {
+			t.Fatalf("rev-7 overlay schema %q missing: %v", name, set.Names())
+		}
 	}
 	cases := []struct {
 		schema string
@@ -24,6 +30,7 @@ func TestRev7OverlayCompilesAndValidatesFixtures(t *testing.T) {
 	}{
 		{"report-snapshot.rev7.schema.json", "examples/report-snapshot.json"},
 		{"agent-config.rev7.schema.json", "examples/agent-config.json"},
+		{"traffic-export.schema.json", "examples/traffic-export.json"},
 	}
 	for _, tc := range cases {
 		body := readFile(t, filepath.Join(dir, filepath.FromSlash(tc.file)))

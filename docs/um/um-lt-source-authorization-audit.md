@@ -46,20 +46,29 @@ Invariants to prove (implementation PR tests):
 2. **Agent cannot read the service.api secret or raw monitor data.** The agent's
    only new readable path is the export file; it is not in any monitor/sing-box/
    `sbox-cm` group and its unit keeps no exec/listener.
-3. **Agent cannot write the export.** Directory is not agent-writable and the
-   file mode grants read-only to the export group; the agent opens
-   `O_RDONLY|O_NOFOLLOW`, verifies regular file/owner/group/mode/size, and never
-   deletes/renames/cleans anything.
-4. **Minimal group/ACL.** One system group `um-lt-export` with exactly the
-   monitor user and agent user; setgid directory `2750`, file `0640`, no world
-   access, no ACLs beyond owner/group/other bits, no existing mode/owner changed,
-   no new root process/setuid/capability/sudoers rule.
+3. **Agent cannot write the export.** The directory is owned by the non-root
+   monitor user with group `r-x` only, and the file mode grants read-only to the
+   reader group; the agent opens `O_RDONLY|O_NOFOLLOW`, verifies regular
+   file/owner/group/mode/size, and never deletes/renames/cleans anything.
+4. **Minimal group/ACL.** One system group `sboxmon-export` containing exactly
+   the non-root agent user (never root, never interactive users; the monitor user
+   writes as directory owner and is not a group member); operator-created setgid
+   directory `/run/singbox-monitor-export/` owned by the non-root monitor user
+   (`2750`), file `traffic.json` (`0640`), no world access, **no POSIX ACL
+   entries at all**, no existing mode/owner changed, no new root
+   process/setuid/capability/sudoers rule. The directory lives on root-controlled
+   `/run` tmpfs and is created by an operator step, not by the installer or the
+   monitor.
 5. **Symlink/path handling.** Fixed build-time path; no center/agent-config input
-   can change it; writer replaces atomically via a same-directory temp file with
-   create-exclusive semantics and no symlink following; reader refuses symlinks,
-   non-regular files, wrong ownership/mode and trailing/oversized data; the
-   directory is root-owned so the export path itself cannot be pre-created by a
-   less-privileged user.
+   can change it; the monitor's validated operator path must be absolute, the
+   parent must be an existing non-symlink directory, and an existing final path
+   must be a regular non-symlink file; the writer replaces atomically via a
+   same-directory create-exclusive temp file with no symlink following; the
+   reader refuses symlinks, non-regular files, wrong ownership/mode and
+   trailing/oversized data. `/run` is root-controlled, so an unrelated local user
+   cannot pre-create the path before the operator; after a reboot the directory
+   must be recreated and an absent path is unavailable, never a stale trusted
+   file.
 6. **No URL/command/path from the center.** The only rev-7 wire addition is the
    boolean `collect.monitor_export`; it carries no string at all. There is no
    center→agent command channel; the agent's source path and format are fixed.
@@ -71,7 +80,9 @@ Invariants to prove (implementation PR tests):
    connection IDs, proxy names, URLs, YAML, paths, journal/free text and secrets
    are never serialized; a privacy sentinel hit rejects the document/report.
 9. **Authorization is not inferred from the switch.** Recording this audit
-   version plus implementation evidence is required before a center may emit
+   version, the `CFG-REV7` agent-version evidence (minimum signed
+   `agent.version` `1.1.0`; key omitted entirely for unknown/older) and the
+   implementation evidence is required before a center may emit
    `monitor_export=true`; the boolean itself is only a source switch.
 10. **`singbox_api` isolation.** The rev-7 path never reads/delivers/proves the
     `service.api` credential; P1-10 remains FAIL and `collect.singbox_api` stays
@@ -83,10 +94,10 @@ Invariants to prove (implementation PR tests):
 | --- | --- |
 | Does the monitor gain a new credential? | No. It reuses only its existing loopback `service.api` stream internally; no token/password/path is added to its unit or configuration. |
 | Does the monitor gain a new network surface? | No. The export is written to a local file; its existing loopback listeners are unchanged. |
-| Does the monitor gain write access outside the export dir? | No. Its unit's writable path set gains only the dedicated export directory (implementation PR asserts the exact unit diff); sing-box/`sbox-cm`/data-root permissions are unchanged. |
-| Can the export leak the secret or raw data? | Only if the writer serializes forbidden fields; the format is closed and the implementation must prove a privacy scan over the writer output (sentinel tests), including "no field for raw data exists". |
+| Does the monitor gain write access outside the export dir? | No. Its unit's writable path set gains only `/run/singbox-monitor-export` (`ReadWritePaths=-…`, optional so a default install without the directory is untouched); sing-box/`sbox-cm`/data-root permissions are unchanged. |
+| Can the export leak the secret or raw data? | Only if the writer serializes forbidden fields; the format is closed and the implementation must prove a privacy scan over the writer output (sentinel tests), including "no field for raw data exists"; `kind` is the operator allow-list attestation `TAG:KIND`, never a heuristic over raw daemon data. |
 | Can a compromised agent use the export to write anywhere? | No. The file is read-only to the agent and contains no credential, URL, path or command. |
-| Can a malicious local user pre-create the path/symlink? | The export directory is root-owned (`2750`, group-only) and the file is replaced by the monitor with a same-directory temp+rename; a non-group user cannot create entries there, and the agent refuses symlinks/wrong owner/mode. The implementation PR must include the symlink/FIFO/wrong-owner negative tests. |
+| Can a malicious local user pre-create the path/symlink? | `/run` is root-controlled and the export directory is operator-created/owned by the non-root monitor user, so an unrelated local user cannot create entries before or inside it; the writer validates the operator-supplied absolute path (no relative path, no symlinked parent/final path, regular-file only) and replaces via a same-directory temp+rename; the agent refuses symlinks/wrong owner/mode. The implementation PR must include the symlink/FIFO/wrong-owner negative tests. |
 | Residual capability of the monitor itself | The monitor already holds a write-capable `service.api` secret; UM-LT does not reduce or expand that. This is the pre-existing accepted-in-monitor risk, not a new UM agent/center capability. |
 
 ## 4. Capability analysis: agent reader
@@ -141,8 +152,8 @@ document/report and is audited; the value itself is never logged.
 | # | Scenario | Disposition |
 | --- | --- | --- |
 | SA-1 | Compromised agent tries to read monitor secret/raw data | no access path; export-only group read; unit hardening; test asserts EACCES/nonexistent |
-| SA-2 | Compromised agent tries to forge/replace export or symlink the path | no directory/file write permission; writer replaces atomically; reader refuses symlinks/ownership mismatch; pre-existing non-root user cannot create entries in root-owned setgid dir |
-| SA-3 | Local user pre-creates a malicious file/path | root-owned directory, monitor-created temp with O_EXCL and rename; reader verifies owner/group/mode; path fixed |
+| SA-2 | Compromised agent tries to forge/replace export or symlink the path | no directory/file write permission (directory group is `r-x`, file `r`); monitor replaces atomically; reader refuses symlinks/ownership mismatch; an unrelated local user cannot create entries because `/run` is root-controlled and the operator-owned directory has no other writers |
+| SA-3 | Local user pre-creates a malicious file/path | `/run` is root-controlled and the directory is operator-created with the non-root monitor user as owner; an unrelated user cannot pre-create the path; the monitor validates the operator-supplied absolute path (no relative/symlinked parent or final path, regular file only), creates the temp with O_EXCL and renames; the reader verifies owner/group/mode; path fixed |
 | SA-4 | Malicious center sends a path/URL/command to read elsewhere | no such field exists; config is a closed schema; boolean only |
 | SA-5 | Compromised monitor writes raw secrets into export | closed writer format + privacy allow-list + implementation sentinel tests; no field for raw data; monitor compromise already implies its own data, but the export must not widen it |
 | SA-6 | Replay of an old export to fake freshness | `source_epoch`+`sequence`+`observed_at` must be coherent; monitor deletes stale file at startup; agent/center age-check; old-epoch values never diffed or resurrected |
@@ -150,15 +161,15 @@ document/report and is audited; the value itself is never logged.
 | SA-8 | Center stores/renders a lower bound as a total | schema exactness/counter_scope consts + semantic vectors + center query labelling tests; UI must render lower-bound label |
 | SA-9 | `service.api` gets enabled "because traffic now works" | prohibited: P1-10 FAIL retained, switch stays DISABLED, separately audited source; tests assert no enablement path/credential wiring |
 | SA-10 | Windows node receives/uses the source | class-gated in config and ingest; `platform_mismatch`; Windows code unchanged |
-| SA-11 | Export/agent file is read by an unrelated process | 0640 group, no world access; only monitor+agent in group; no other group membership |
-| SA-12 | Center downgrade/rollback reintroduces old agent surface | compatibility/rollback rules in [`um-lt-compatibility.md`](um-lt-compatibility.md); old center rejects rev-7; queued rev-7 quarantined, not rewritten |
+| SA-11 | Export/agent file is read by an unrelated process | 0640 group, no world access; only the non-root agent user is in `sboxmon-export`; the monitor user writes as owner and is not a group member; no ACL entries |
+| SA-12 | Center downgrade/rollback reintroduces old agent surface | compatibility/rollback rules in [`um-lt-compatibility.md`](um-lt-compatibility.md); old center rejects rev-7; queued rev-7 quarantined byte-identically, not rewritten |
 
 ## 8. Evidence status and what the implementation PR must prove
 
 | Evidence | Contract PR | Implementation PR |
 | --- | --- | --- |
 | Versioned audit text (this file) | **PROVIDED (docs)** | must stay current and be referenced by the implementation/runbook |
-| `$id`/schema/base-shape/negative-vector consistency | **PROVIDED** (JSON parse/consistency script; no conformance runner) | runner adds schema+semantic execution |
+| `$id`/schema/base-shape/negative-vector consistency | **PROVIDED, executed**: `cd um && go test ./internal/schema -run 'TestRev7' -v` compiles the rev-7 overlay schemas (report/config/traffic-export), validates the positive fixtures, executes all `json_schema`-stage vectors and the two raw-body lexical cases; reviewed HEAD `1aa71abe` Unified Monitor Go run `46156909313` all five jobs success | full runner also executes implementation-semantic/platform/config-generation vectors and real ingest/storage/query behavior |
 | real file-ACL/group/symlink/atomicity tests on Linux | **NOT RUN** | required (installer + reader/writer negative matrix) |
 | real writer privacy sentinel tests (no raw fields) | **NOT RUN** | required |
 | real agent EACCES/no-read of monitor secret/data root | **NOT RUN** | required (Linux systemd lab) |

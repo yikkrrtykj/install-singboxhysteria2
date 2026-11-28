@@ -156,8 +156,10 @@ away.
   between stream updates (`uplink_delta / max(now − last_seen)`), then aggregates
   the active connections per inbound direction.
 - The export declares a single `rate_window_seconds` for the document (the
-  monitor's configured/de-facto aggregation window). The field is required to
-  interpret the rate; the schema permits `null` only with `null` rates.
+  monitor's configured/de-facto aggregation window). A non-null rate requires a
+  non-null positive window; a null window implies null rates, but a present
+  window may still have null rates on partial/unavailable rows. The converse
+  "window null iff rates null" is deliberately not the rule.
 - Rates are **instantaneous/interval observations of active connections only**.
   They are not averages over the whole epoch, not a total and not billable.
 - A rate may be `0` while connections are idle; that is an observed zero, not a
@@ -171,8 +173,15 @@ away.
   collector reinitialisation), the monitor:
   1. generates a new random 32-hex `source_epoch`;
   2. restarts `sequence` at 0;
-  3. restarts all observed byte counters at zero;
+  3. restarts its in-memory counters at zero;
   4. deletes/overwrites the previous export before writing the first new one.
+  "Restarts at zero" describes the accumulator only: the first subscription
+  `reset` batch can immediately reintroduce active/recent lifecycles whose
+  authoritative totals include pre-epoch bytes (§3.3), so the first published
+  value is not necessarily 0 and is never a pure epoch delta.
+- The legacy compatibility collector-loop mode does not publish the UM-LT export;
+  a node running only that mode has no export and reports honest unavailable (no
+  fallback to `state/snapshot.json` and no behavior change to that mode).
 - The agent treats a `source_epoch` change as a hard reset: it never subtracts
   the previous value, never emits a negative or clamped delta, and reports the
   new observation under the new epoch.
@@ -199,9 +208,9 @@ away.
 | **Abandoned connections** | Active ID missing from a later reset without `CLOSED`: last known totals banked as a lower bound, not presented as closed/recent; un-banked if the ID reappears so nothing is double counted. |
 | **Replay / dedupe cap** | The server replays ~1000 recently closed connections in every reset. The monitor keeps an independent bounded LRU replay guard (4096 IDs in the existing monitor) so a replayed lifecycle is not banked twice; the display cache TTL never decides accounting. The guard is bounded, so pathological ID histories beyond it are an implementation risk recorded in the source audit, not a reason to call the number exact. |
 | **ID reuse** | A connection ID identifies exactly one lifecycle. An event that tries to move an ID to another user/inbound is rejected by the monitor's identity guard. A reused ID after a very long gap could confuse the bounded guard; the resulting value remains an observation, never an exact total, and the source audit records the residual risk. |
-| **Counter decrease within an epoch** | Source fault: agent reports unavailable/sentinel; center never stores/renders a negative delta (see §4). |
-| **Overflow** | Monitor counters may exceed the safe integer bound in pathological deployments: the writer truncates to integer, caps at `MAX_SAFE_BYTES = 9007199254740991` (still a valid lower bound) or marks the observation unavailable; it never wraps, rounds up or emits a float. |
-| **Float→integer migration** | The existing monitor keeps totals as floats and rounds for display. The rev-7 writer MUST convert byte counters to integer bytes by truncation toward zero (a lower bound must not round up), reject negative/NaN/Inf/out-of-range values, and emit JSON integer tokens only. Display-rounded monitor values are never used as the export value. |
+| **Counter decrease within an epoch** | Source fault: agent reports unavailable/status-only, center never stores/renders a negative delta (see §4). |
+| **Overflow** | Monitor counters are exact integers internally; a value outside `0..9007199254740991` is published as `null` with `quality=partial` (never rounded/clamped through float64, never wrapped). The agent copies integers unchanged. |
+| **Float→integer migration** | The legacy dashboard keeps its historical float formatting independently. The rev-7 writer keeps counters as exact integers (protobuf int64/uint64) and emits JSON integer tokens only; it never derives the exported value from a display-rounded float, never rounds up, and never emits a lexical float token for an integer field. A lexical `1048576.0` is rejected by the consumer even though JSON Schema would call it an integer. |
 | **Duplicate export** | The file is read whole; a repeated `sequence` is idempotent at the agent (reuse of the last accepted observation if still fresh) and a lower `sequence` in the same epoch is treated as replay/invalid, not as new data. |
 
 ## 8. Missing, partial, stale and unavailable
@@ -210,11 +219,12 @@ away.
 | --- | --- | --- |
 | no export ever / monitor not deployed / switch disabled | no observation source | rev-5 body or rev-7 no-observation sentinel depending on config; `availability.traffic=unavailable` |
 | export missing/unreadable/symlinked/oversized/invalid | can't trust a current observation | sentinel `freshness=unavailable`, `availability=unavailable`, `inbounds=[]` |
-| export valid but older than the fresh bound | usable past observation, not current | `freshness=stale`, `availability=partial` (never `ok`), values retained with `observed_at`/`age_seconds` |
+| export valid but older than the fresh bound | usable past observation, not current; fresh bound = `max(2 × effective-dated cadence at collected_at, 120)s` | `freshness=stale`, `availability=partial` (never `ok`), values retained with `observed_at`/`age_seconds` |
 | export valid but some expected inbounds missing or monitor-partial | partial coverage | `availability=partial`; missing tags absent (no fabricated zero), present tags carry their own availability/quality |
-| export valid but `monitor_stale=true` | the monitor itself flags its stream/accumulator as degraded | `availability=partial` at most; `freshness` is still derived from age, never fabricated |
-| `monitor_last_success_at` older than the fresh bound or `null` with `monitor_stale=true` | monitor has no recent successful observation | at most `partial`; if no usable counters remain, the no-observation sentinel |
-| export older than 86400 s | beyond the bounded payload age | sentinel unavailable (it is not replayed as a stale measurement) |
+| export valid but `monitor_stale=true` | the monitor itself flags its stream/accumulator as degraded | `freshness=stale` at best (never `fresh`) and `availability=partial` at most; rows are `partial`, rates null; age is still derived from the agent clock |
+| `monitor_last_success_at` older than the fresh bound or `null` with `monitor_stale=true` | monitor has no recent successful observation | at most `partial`; if no usable counters remain, the status-only/unavailable form |
+| export valid but contains no observed values (empty or all rows unavailable) | source reachable/current but nothing observed | **status-only real-epoch form**: real `source_epoch`/`sequence`/`observed_at` kept, `freshness=availability=unavailable`, no bytes/rates/active, no bucket/epoch rows |
+| export older than `EXPORT_MAX_AGE_SECONDS` (86400 s) | beyond the bounded payload age | zero-epoch sentinel unavailable (it is not replayed as a stale measurement) |
 | monitor unavailable state in export | monitor itself says it cannot observe | sentinel unavailable |
 | node/agent disabled or center not rev-7 capable | source not authorized in effect | rev-5 body / no rev-7 data; `traffic=[]`, `availability.traffic=unavailable` |
 
@@ -224,9 +234,11 @@ rule, unchanged).
 
 ## 9. When the source is unavailable (normative list)
 
-The rev-7 observation is `unavailable` (sentinel) when any of the following is
-true; the list is closed for v1 and the implementation must map each to a closed
-diagnostic counter rather than free text:
+The rev-7 observation is `unavailable` — either the zero-epoch no-observation
+sentinel or the distinct status-only real-epoch form (valid export, no observed
+values) — when any of the following is true; the list is closed for v1 and the
+implementation must map each to a closed diagnostic counter rather than free
+text:
 
 1. the monitor export file does not exist, is not a regular file, is a symlink,
    has the wrong owner/group/mode, or is larger than 64 KiB;
@@ -248,8 +260,11 @@ diagnostic counter rather than free text:
 7. the applied config does not enable `collect.monitor_export`, the node is not
    `linux_vps`, the center is not rev-7 capable, or the source authorization
    audit version does not match the implementation;
-8. the monitor itself reports `availability = unavailable` or the monitor is
-   known stopped (no fresh file).
+8. the monitor itself reports stale/unavailable state, a structurally valid
+   export contains no observed values (status-only real-epoch form), or the
+   monitor is known stopped (no fresh file);
+9. the monitor runs only the legacy compatibility collector-loop mode, which
+   never publishes this export.
 
 Availability is never inferred from silence or absence of traffic; a quiet
 service with a healthy export is an observed zero/vsmall lower bound, while an

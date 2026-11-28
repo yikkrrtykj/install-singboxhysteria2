@@ -39,9 +39,9 @@ unbounded by the 5 GiB basis:
 ```text
 full-body addition = N × (86400 / C) × D × S7
 N=150, D=30 d, S7≈1.0 KB per rev-7 observation
-C=30 s  → 150 × 2880 × 30 × 1.0 KB ≈ 12.96 GB  (fails the 5 GiB basis)
-C=60 s  → 150 × 1440 × 30 × 1.0 KB ≈  6.48 GB  (fails the 5 GiB basis)
-C=300 s → 150 ×  288 × 30 × 1.0 KB ≈  1.30 GB  (fits only at slow cadence)
+C=30 s  → 150 × 2880 × 30 × 1.0 KB ≈ 12.96 GB = 12.07 GiB  (fails the 5 GiB basis)
+C=60 s  → 150 × 1440 × 30 × 1.0 KB ≈  6.48 GB =  6.03 GiB  (fails the 5 GiB basis)
+C=300 s → 150 ×  288 × 30 × 1.0 KB ≈  1.30 GB =  1.21 GiB  (fits only at slow cadence)
 ```
 
 **Capacity requirement:** the center MUST extract the observation into the
@@ -62,10 +62,11 @@ actual bytes.
 | 300 s | 288 | 43 200 | 0.5 |
 
 Rev-7 adds one bounded structured write per accepted snapshot (latest upsert +
-at most 8 bucket upserts, amortised: at most 1 bucket row per 300 s bucket per
-inbound) inside the existing single `synchronous=FULL` transaction. This does
-not change the SQLite→PostgreSQL gate (doc 05 §5: >50 writes/s sustained etc.);
-the dominant cost stays the existing one durable commit per report.
+at most 8 bucket upserts, amortised: at most one bucket row per configured
+bucket per inbound) inside the existing single `synchronous=FULL` transaction.
+This does not change the SQLite→PostgreSQL gate (doc 05 §5: >50 writes/s
+sustained etc.); the dominant cost stays the existing one durable commit per
+report.
 
 ## 4. Structured storage model
 
@@ -73,23 +74,29 @@ the dominant cost stays the existing one durable commit per report.
 
 | Table | Rows (worst case) | Notes |
 | --- | --- | --- |
-| `traffic_observation_latest` | 150 (one per node) | current observation metadata only |
+| `traffic_observation_latest` | 150 (one per node) | current observation status/metadata only |
 | `traffic_inbound_latest` | ≤150 × 8 = 1 200 | one row per node/inbound current value |
-| `traffic_observation_bucket` | **N × I × B/day × D** | 5-minute buckets by default; one row per node/epoch/tag/bucket that has an accepted observation |
-| `traffic_epoch` | 150 × ≤8 recent epochs | bounded epoch registry, diagnostics only |
+| `traffic_observation_bucket` | **N × I × (86 400 / B) × D** | one row per node/epoch/tag/bucket with at least one observed value; **no row for unavailable/sentinel/status-only observations** |
+| `traffic_epoch` | 150 × ≤8 recent epochs | bounded epoch registry, diagnostics only; never keyed by the all-zero sentinel epoch |
 
-Bucket row count is **independent of cadence** for C ∈ [30 s, 300 s], because at
-most one row exists per 5-minute bucket and tag:
+Default bucket **B = 300 s (5 minutes)**. The bucket row count is independent of
+the agent cadence for C ∈ [30 s, 300 s], because at most one row exists per
+bucket and tag:
 
 ```text
-buckets/day = 86 400 / 300 s = 288
-rows = 150 × 8 × 288 × 30 = 10 368 000 rows  (worst case: all 8 tags, 30 days)
+bucket_row_bytes formula variables: N=150 nodes, I=8 tags, D=30 days, B=300 s
+buckets/day   = 86 400 / 300 = 288
+rows          = 150 × 8 × 288 × 30 = 10 368 000 rows (worst case: all 8 tags)
 ```
 
-If the implementation chooses a different bucket B (60 s, 300 s, 900 s), the
-formula is `rows = N × I × (86 400 / B) × D`. The contract does not freeze the
-bucket size; a bucket ≤300 s preserves observation accuracy, and a larger bucket
-must be a documented implementation/capacity decision.
+Permitted bucket policy (capacity-consistent): **B ∈ [300 s, 900 s]**; a bucket
+smaller than 300 s requires a separate owner-reviewed capacity decision because
+the row count then exceeds the 5 GiB planning basis (see §4.3). A larger bucket
+is a documented implementation/capacity decision and must still keep the
+observed lower-bound semantics. The contract does not freeze B; the
+implementation PR records the chosen B with measured numbers, and sentinel /
+status-only observations never create bucket or epoch rows
+([`um-a/04-node-protocol-v1.rev7.md`](um-a/04-node-protocol-v1.rev7.md) §11).
 
 ### 4.2 Row-size formula
 
@@ -130,24 +137,29 @@ upper bound.
 
 ### 4.3 Estimates
 
-| Scenario | Rows | Payload (R=140 B) | Payload (R=250 B) | Share of 5 GiB basis |
-| --- | --- | --- | --- | --- |
-| 30 d, 5-min buckets, 8 tags, 150 nodes | 10 368 000 | ≈1.45 GB (1.35 GiB) | ≈2.59 GB (2.41 GiB) | 27–48 % |
-| 30 d, 15-min buckets, 8 tags, 150 nodes | 3 456 000 | ≈0.48 GB | ≈0.86 GB | 9–16 % |
-| 30 d, 1-min buckets, 8 tags, 150 nodes | 51 840 000 | ≈7.26 GB | ≈12.96 GB | **fails** the basis |
-| 30 d, per-observation rows at C=30 s | 103 680 000 | ≈14.5 GB | ≈25.9 GB | **fails** the basis |
+All budget comparisons below use the frozen terms **5 GiB active** and
+**10 GiB active+archived overlap** (1 GiB = 1 073 741 824 B); decimal GB is shown
+only as a derived convenience.
 
-Latest tables add ≤~0.4 MB, negligible.
+| Scenario (N=150, I=8, D=30 d) | Rows | Payload at R=140 B | Payload at R=250 B | Share of 5 GiB basis |
+| --- | --- | --- | --- | --- |
+| B=300 s (default, 5-min) | 10 368 000 | ≈1.45 GB = 1.35 GiB | ≈2.59 GB = 2.41 GiB | 27–48 % |
+| B=900 s (15-min) | 3 456 000 | ≈0.48 GB = 0.45 GiB | ≈0.86 GB = 0.80 GiB | 9–16 % |
+| B=60 s (1-min, not permitted under §4.1) | 51 840 000 | ≈7.26 GB = 6.76 GiB | ≈12.96 GB = 12.07 GiB | **135–241 % ⇒ fails** |
+| per-observation rows at C=30 s (not used) | 103 680 000 | ≈14.5 GB = 13.5 GiB | ≈25.9 GB = 24.1 GiB | **270–482 % ⇒ fails** |
+
+Latest tables add ≤~0.4 MB, negligible; sentinel/status-only observations add no
+bucket or epoch-series rows.
 
 ### 4.4 Overlap (policy B)
 
 Policy-B worst case doubles the retained payload for an archived event
-(`2×` active basis = 10 GiB). With 5-minute buckets the rev-7 history is
-1.4–2.6 GB; doubling it gives 2.7–5.2 GB, i.e. **27–52 % of the 10 GiB overlap
-budget**, leaving the rest for the frozen rev-5 telemetry. At 1-minute buckets
-the rev-7 share alone would exceed the overlap budget even before rev-5 data, so
-1-minute buckets are not permitted without a separate capacity/owner decision.
-The exact bucket choice must be recorded with measured numbers in the
+(`2×` active basis = 10 GiB). With the 5-minute default the rev-7 history is
+1.35–2.41 GiB; doubling it gives 2.7–4.82 GiB, i.e. **27–48 % of the 10 GiB
+overlap budget**, leaving the rest for the frozen rev-5 telemetry. At 1-minute
+buckets the rev-7 share alone would exceed the overlap budget before any rev-5
+data, so 1-minute buckets are not permitted without a separate capacity/owner
+decision. The exact bucket choice must be recorded with measured numbers in the
 implementation PR and re-checked in UM-E.
 
 ### 4.5 Cadence and the 5 GiB basis
@@ -194,9 +206,9 @@ Rules:
 - VACUUM temp: doc-05 rule (free space ≥ DB size + 10 %, never concurrent with
   backup) is unchanged; the rev-7 addition is included in the DB size input.
 - Backups: compressed local backups are sized from the whole DB; an additional
-  1.4–2.6 GB payload implies roughly 0.5–1.3 GB compressed (35–45 % ratio), still
-  covered by the frozen ≤6 GB local backup envelope for the 150-node ceiling if
-  the base stays within budget.
+  1.35–2.41 GiB payload implies roughly 0.5–1.3 GB compressed (35–45 % ratio),
+  still covered by the frozen ≤6 GB local backup envelope for the 150-node
+  ceiling if the base stays within budget.
 - Disk-pressure degradation order, quota alarms and the PG gate are unchanged
   and NOT overridden by this source.
 
