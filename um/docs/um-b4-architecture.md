@@ -209,7 +209,8 @@ URL event is insufficient.
 - Critical security state changes continue to use the existing hash-chained
   security ledger: node revoke, key revoke, archive, purge, mapping creation,
   enroll/config events etc. B4 does not replace or weaken the ledger.
-- Audit reads are platform-wide for platform_admin, event-scoped for
+- Audit reads are filterable by event, action, result, actor and inclusive
+  Unix-second time range; platform-wide for platform_admin, event-scoped for
   event_admin, denied to viewer. Responses contain no token/private key/
   controller secret, raw proxy names or raw user traffic.
 - Ledger verify is platform_admin-only; it is visibility, not backup/restore

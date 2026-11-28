@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -498,9 +499,31 @@ func (h *Handler) routeAudit(ctx context.Context, w http.ResponseWriter, r *http
 		h.writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), false, requestID)
 		return
 	}
+	since, err := auditTime(r, "since")
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), false, requestID)
+		return
+	}
+	until, err := auditTime(r, "until")
+	if err != nil {
+		h.writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), false, requestID)
+		return
+	}
 	v, err := h.svc.ListAudit(ctx, p, r.URL.Query().Get("event_id"), r.URL.Query().Get("action"),
-		r.URL.Query().Get("result"), r.URL.Query().Get("actor"), limit, offset)
+		r.URL.Query().Get("result"), r.URL.Query().Get("actor"), since, until, limit, offset)
 	h.respond(w, err, v, requestID)
+}
+
+func auditTime(r *http.Request, name string) (int64, error) {
+	raw := strings.TrimSpace(r.URL.Query().Get(name))
+	if raw == "" {
+		return 0, nil
+	}
+	v, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || v < 0 {
+		return 0, fmt.Errorf("%s must be a non-negative Unix second", name)
+	}
+	return v, nil
 }
 
 func (h *Handler) requireMethod(w http.ResponseWriter, r *http.Request, requestID, method string) {

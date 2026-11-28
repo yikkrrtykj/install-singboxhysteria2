@@ -892,7 +892,11 @@ func (s *Service) RetentionRuns(ctx context.Context, p Principal, limit int) ([]
 
 // --- Audit --------------------------------------------------------------
 
-func (s *Service) ListAudit(ctx context.Context, p Principal, eventID, action, result, actor string, limit, offset int) (AuditList, error) {
+func (s *Service) ListAudit(ctx context.Context, p Principal, eventID, action, result, actor string,
+	sinceAt, untilAt int64, limit, offset int) (AuditList, error) {
+	if sinceAt > 0 && untilAt > 0 && untilAt < sinceAt {
+		return AuditList{}, &InvalidError{Field: "time_range", Detail: "until must not be before since"}
+	}
 	if p.Role == RoleViewer || !p.Role.Valid() {
 		s.auditDenied(ctx, p, ActionAuditRead, eventID, "audit")
 		return AuditList{}, ErrForbidden
@@ -914,8 +918,18 @@ func (s *Service) ListAudit(ctx context.Context, p Principal, eventID, action, r
 		scope = p.AllowedEvents()
 	}
 	limit, offset = clampPage(limit, offset)
+	var sincePtr, untilPtr *int64
+	if sinceAt > 0 {
+		v := sinceAt
+		sincePtr = &v
+	}
+	if untilAt > 0 {
+		v := untilAt
+		untilPtr = &v
+	}
 	page, err := s.st.ListAdminAudit(ctx, store.AuditFilter{EventIDs: scope, Action: action,
-		Result: result, Actor: actor, Limit: limit, Offset: offset})
+		Result: result, Actor: actor, SinceAt: sincePtr, UntilAt: untilPtr,
+		Limit: limit, Offset: offset})
 	if err != nil {
 		return AuditList{}, mapStoreError(err)
 	}

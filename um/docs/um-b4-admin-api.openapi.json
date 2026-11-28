@@ -4531,6 +4531,22 @@
             }
           },
           {
+            "name": "since",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "until",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
             "name": "limit",
             "in": "query",
             "required": false,

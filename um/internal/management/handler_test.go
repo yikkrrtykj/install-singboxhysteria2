@@ -8,8 +8,10 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/yikkrrtykj/install-singboxhysteria2/um/internal/management"
 )
@@ -99,6 +101,51 @@ func TestAdminRequestValidationAndTokenPrivacy(t *testing.T) {
 	}
 	if strings.Contains(string(auditJSON), "controller.secret") {
 		t.Fatal("secret marker appeared in audit")
+	}
+
+	// Audit queries support event/action/result/actor and time-range filters.
+	nowUnix := time.Now().Unix()
+	type auditEnvelope struct {
+		Data management.AuditList `json:"data"`
+	}
+	var body []byte
+	for _, tc := range []struct {
+		query string
+		want  int64
+	}{
+		{"?since=" + strconv.FormatInt(nowUnix+3600, 10), 0},
+		{"?until=" + strconv.FormatInt(nowUnix-3600, 10), 0},
+	} {
+		status, raw := rawRequest(t, http.MethodGet, bc.adminURL+"/api/v1/audit"+tc.query,
+			"platform-token-0123456789abcdef", nil)
+		if status != http.StatusOK {
+			t.Fatalf("audit time filter %s status=%d body=%s", tc.query, status, body)
+		}
+		var env auditEnvelope
+		if err := json.Unmarshal(raw, &env); err != nil {
+			t.Fatal(err)
+		}
+		if env.Data.Total != tc.want {
+			t.Fatalf("audit time filter %s total=%d want=%d", tc.query, env.Data.Total, tc.want)
+		}
+	}
+	inRange := "?since=" + strconv.FormatInt(nowUnix-3600, 10) + "&until=" + strconv.FormatInt(nowUnix+3600, 10)
+	status, body = rawRequest(t, http.MethodGet, bc.adminURL+"/api/v1/audit"+inRange,
+		"platform-token-0123456789abcdef", nil)
+	if status != http.StatusOK {
+		t.Fatalf("in-range audit status=%d", status)
+	}
+	var env auditEnvelope
+	if err := json.Unmarshal(body, &env); err != nil {
+		t.Fatal(err)
+	}
+	if env.Data.Total == 0 {
+		t.Fatal("in-range audit query returned no rows")
+	}
+	status, body = rawRequest(t, http.MethodGet, bc.adminURL+"/api/v1/audit?since=-1",
+		"platform-token-0123456789abcdef", nil)
+	if status != http.StatusBadRequest {
+		t.Fatalf("invalid since status=%d body=%s", status, body)
 	}
 
 	// Denied audit rows cannot be inflated with arbitrary path text.

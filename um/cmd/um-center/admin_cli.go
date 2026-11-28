@@ -49,7 +49,7 @@ commands:
   mapping resolve EVENT_ID WINDOWS_NODE_ID [--at EPOCH]
   retention state|timeline|runs|run
   capacity
-  audit list [--event EVENT_ID] [--action ACTION] [--result ok|denied|error] [--actor ID] [--limit N] [--offset N]
+  audit list [--event EVENT_ID] [--action ACTION] [--result ok|denied|error] [--actor ID] [--since EPOCH] [--until EPOCH] [--limit N] [--offset N]
   audit verify
 `
 
@@ -530,6 +530,8 @@ func runAdminAudit(ctx context.Context, c *management.Client, args []string, out
 	action := fs.String("action", "", "closed action")
 	result := fs.String("result", "", "ok|denied|error")
 	actor := fs.String("actor", "", "actor id")
+	since := fs.Int64("since", 0, "inclusive Unix-second lower bound")
+	until := fs.Int64("until", 0, "inclusive Unix-second upper bound")
 	limit := fs.Int("limit", 50, "page size")
 	offset := fs.Int("offset", 0, "page offset")
 	if err := fs.Parse(args[1:]); err != nil {
@@ -547,6 +549,12 @@ func runAdminAudit(ctx context.Context, c *management.Client, args []string, out
 	}
 	if *actor != "" {
 		q.Set("actor", *actor)
+	}
+	if *since > 0 {
+		q.Set("since", strconv.FormatInt(*since, 10))
+	}
+	if *until > 0 {
+		q.Set("until", strconv.FormatInt(*until, 10))
 	}
 	q.Set("limit", strconv.Itoa(*limit))
 	q.Set("offset", strconv.Itoa(*offset))

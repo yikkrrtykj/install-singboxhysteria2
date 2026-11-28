@@ -178,6 +178,8 @@ type AuditFilter struct {
 	Action   string
 	Result   string
 	Actor    string
+	SinceAt  *int64
+	UntilAt  *int64
 	Limit    int
 	Offset   int
 }
@@ -219,6 +221,14 @@ func (s *Store) ListAdminAudit(ctx context.Context, filter AuditFilter) (AdminAu
 		if filter.Result != "" {
 			clauses = append(clauses, "result=?")
 			args = append(args, filter.Result)
+		}
+		if filter.SinceAt != nil {
+			clauses = append(clauses, "at>=?")
+			args = append(args, *filter.SinceAt)
+		}
+		if filter.UntilAt != nil {
+			clauses = append(clauses, "at<=?")
+			args = append(args, *filter.UntilAt)
 		}
 		if filter.Actor != "" {
 			clauses = append(clauses, "actor=?")

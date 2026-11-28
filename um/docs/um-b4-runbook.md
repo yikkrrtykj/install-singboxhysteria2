@@ -141,7 +141,7 @@ um-center admin ... retention timeline
 um-center admin ... retention runs [N]
 um-center admin ... retention run
 um-center admin ... capacity
-um-center admin ... audit list [--event EVENT_ID] [--action ACTION] [--result ok|denied|error] [--actor ID] [--limit N]
+um-center admin ... audit list [--event EVENT_ID] [--action ACTION] [--result ok|denied|error] [--actor ID] [--since EPOCH] [--until EPOCH] [--limit N]
 um-center admin ... audit verify
 ```
 
