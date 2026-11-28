@@ -19,7 +19,11 @@ import (
 	"github.com/yikkrrtykj/install-singboxhysteria2/um/internal/agent"
 )
 
-const version = "1.0.0"
+// version is the reported agent.version. 1.1.0 is the first revision that
+// understands the optional rev-7 collect.monitor_export switch; the center only
+// emits that switch to agents reporting >= center.MinMonitorExportAgentVersion
+// (OD-LT-14), so this constant and the minimum must move together.
+const version = "1.1.0"
 
 func envOr(name, fallback string) string {
 	if v := os.Getenv(name); v != "" {
@@ -32,12 +36,19 @@ type commonFlags struct {
 	stateDir  string
 	centerURL string
 	nodeClass string
+	// monitorExportFile is the operator-local fixed absolute path of the optional
+	// monitor-v2 read-only traffic export. It is never accepted from center
+	// config; empty disables the local read path even when the center source is
+	// enabled (the report then carries an honest unavailable observation).
+	monitorExportFile string
 }
 
 func addCommon(fs *flag.FlagSet, c *commonFlags) {
 	fs.StringVar(&c.stateDir, "state-dir", envOr("UM_AGENT_STATE_DIR", ""), "owner-only agent state directory")
 	fs.StringVar(&c.centerURL, "center", envOr("UM_AGENT_CENTER_URL", ""), "center ingest base URL")
 	fs.StringVar(&c.nodeClass, "node-class", envOr("UM_AGENT_NODE_CLASS", ""), "linux_vps or windows_terminal")
+	fs.StringVar(&c.monitorExportFile, "monitor-export-file", envOr("UM_AGENT_MONITOR_EXPORT_FILE", ""),
+		"optional fixed absolute path of the monitor-v2 read-only traffic export (linux_vps only; empty disables)")
 }
 
 func (c commonFlags) validate() error {

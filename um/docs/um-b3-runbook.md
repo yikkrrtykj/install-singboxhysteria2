@@ -400,3 +400,61 @@ double storage.
 - Production remains **HOLD** until UM-E acceptance (load/capacity, backup/
   restore, independent review, real read-only/HA assertions) and separate Owner
   authorization; this runbook does not grant it.
+
+## 11. Optional revision-7 read-only traffic export (UM-LT)
+
+Status: OPTIONAL, default DISABLED, additive to the rev-5 agent protocol. It is
+not a production authorization, does not change `singbox_api`, and creates no
+credential or listening socket.
+
+- **Agent local input only.** The non-root agent reads one operator-local,
+  fixed absolute path supplied by `--monitor-export-file` or
+  `UM_AGENT_MONITOR_EXPORT_FILE` (for example
+  `/run/singbox-monitor-export/traffic.json`), produced by the separately
+  deployed non-root monitor-v2. The path is never accepted from center config, a
+  URL or a command. The file is read read-only under a 64 KiB cap; symlinks,
+  non-regular files and oversized documents are rejected and degrade to an
+  honest `unavailable` observation (never zero, never a previous value reused as
+  fresh). No new group/capability/secret is required by the agent: OS read
+  permission is enough (the monitor packaging notes describe a dedicated
+  `sboxmon-export` read group). No writing, no listener, no service.api secret.
+- **Center source switch.** `collect.monitor_export` (optional boolean, absence =
+  false) is stored by the center and enabled by an admin config update. While it
+  is disabled, the agent reads nothing and its snapshot remains byte-identical to
+  the frozen rev-5 body. When enabled and a valid fresh export exists, the agent
+  emits `contract_revision: 7` plus a per-inbound `traffic_observation` of
+  OBSERVED LOWER-BOUND bytes/rates; the rev-5 `traffic` array stays empty and
+  `availability.traffic` stays `unavailable` because lower bounds are not
+  contract totals.
+- **OD-LT-14 agent-version gate.** Agent releases before 1.1.0 have a strict
+  six-key `collect` decoder, so the center only emits `monitor_export` to a node
+  whose latest **authenticated snapshot** `agent.version` is `>= 1.1.0` (the
+  agent release version is 1.1.0 from that build on; the center tracks it in the
+  v14 `nodes.last_agent_version` metadata and never trusts a header). Bootstrap
+  ordering is deliberate: the old/unknown agent keeps receiving the frozen
+  six-key config and its rev-5 snapshots stay accepted; after it reports 1.1.0,
+  the next config pull (bounded refresh ≤5 min, or the next `run`/`-once` start)
+  carries the switch. Enabling the center source before upgrading is safe: the
+  stored switch persists and takes effect only for a capable agent.
+- **Expected tags.** The agent only reports center-authorized
+  `expected_inbound_tags`; export tags not in that allowlist, kind mismatches,
+  duplicate/unknown tags, malformed JSON, unsupported schema version, stale or
+  future observations, sequence regressions and source-epoch changes are handled
+  as documented in `docs/monitor-v2-traffic-export.md` and the rev-7
+  `traffic_observation` contract: freshness `fresh|stale|unavailable`,
+  availability `ok|partial|unavailable`, null counters when unobserved.
+- **Normalization.** The center stores only allowlisted normalized fields
+  (migration v14 `traffic_observation_reports` / `traffic_observations`), never
+  the raw export JSON, in the same snapshot ingest transaction; dedupe/replay of
+  a report never duplicates traffic rows. Retention/purge/archive delete the
+  rows with the snapshot/event.
+- **Read API.** The bounded browser-plane endpoints
+  `GET /web/api/traffic/latest` and `GET /web/api/traffic/history` require
+  Cloudflare Access plus an active UM-C session; viewer/event_admin are limited
+  to assigned events (out-of-scope event => 403), platform_admin is global; rows
+  are ordered by `observed_at` (never `received_at`), ranges are capped at 30
+  days and 2000 rows, and history reports `gap_before_seconds`/`truncated`.
+- **Explicit non-goals.** This does not expose raw Monitor state, sing-box
+  service.api, connection/user data, IPs/URLs, or a write path; it does not
+  change monitor-v2's default-disabled packaging and does not enable
+  `singbox_api`.

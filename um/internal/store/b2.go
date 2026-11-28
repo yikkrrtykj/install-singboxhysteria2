@@ -776,6 +776,7 @@ func defaultNodeConfig(nodeID, eventID, nodeClass, salt string, now int64) (Node
 	sources := map[string]bool{
 		"system": false, "services": false, "singbox_api": false,
 		"mihomo_api": false, "terminal": false, "events": false,
+		"monitor_export": false,
 	}
 	tags := []InboundTag{}
 	if nodeClass == NodeClassLinuxVPS {
@@ -817,6 +818,23 @@ func insertNodeConfig(ctx context.Context, q execQuerier, cfg NodeConfig) error 
 	return nil
 }
 
+// normalizeSources returns a snapshot of the stored source switches with the
+// optional rev-7 monitor_export switch normalized to false when an older row
+// carries only the frozen six keys. Callers never mutate the stored map.
+func normalizeSources(sources map[string]bool) map[string]bool {
+	if sources == nil {
+		return nil
+	}
+	out := make(map[string]bool, len(sources)+1)
+	for key, value := range sources {
+		out[key] = value
+	}
+	if _, ok := out["monitor_export"]; !ok {
+		out["monitor_export"] = false
+	}
+	return out
+}
+
 // ConfigTx loads one node config inside the caller's transaction.
 func (t *Tx) ConfigTx(ctx context.Context, nodeID string) (NodeConfig, error) {
 	var cfg NodeConfig
@@ -834,6 +852,7 @@ func (t *Tx) ConfigTx(ctx context.Context, nodeID string) (NodeConfig, error) {
 	if err := json.Unmarshal([]byte(src), &cfg.Sources); err != nil {
 		return NodeConfig{}, fmt.Errorf("store: decode config sources: %w", err)
 	}
+	cfg.Sources = normalizeSources(cfg.Sources)
 	if err := json.Unmarshal([]byte(tags), &cfg.ExpectedInboundTags); err != nil {
 		return NodeConfig{}, fmt.Errorf("store: decode expected tags: %w", err)
 	}
@@ -863,6 +882,7 @@ func (t *Tx) ConfigAtTx(ctx context.Context, nodeID string, collectedAt int64) (
 	if err := json.Unmarshal([]byte(src), &cfg.Sources); err != nil {
 		return NodeConfig{}, fmt.Errorf("store: decode historical config sources: %w", err)
 	}
+	cfg.Sources = normalizeSources(cfg.Sources)
 	if err := json.Unmarshal([]byte(tags), &cfg.ExpectedInboundTags); err != nil {
 		return NodeConfig{}, fmt.Errorf("store: decode historical expected tags: %w", err)
 	}
@@ -916,6 +936,9 @@ func (s *Store) UpdateNodeConfig(ctx context.Context, nodeID string, sources map
 	if sources == nil {
 		sources = cfg.Sources
 	}
+	// Normalize the optional rev-7 switch so every persisted row carries the
+	// seven-key source map regardless of whether the admin sent six or seven keys.
+	sources = normalizeSources(sources)
 	if tags == nil {
 		tags = cfg.ExpectedInboundTags
 	}
@@ -954,7 +977,9 @@ func (s *Store) UpdateNodeConfig(ctx context.Context, nodeID string, sources map
 
 // validateConfigForClass enforces the frozen class/source/tag/cadence rules before
 // persistence, so a config that cannot produce a valid agent-config document is
-// never stored.
+// never stored. Revision 7 adds the optional monitor_export switch: a stored map
+// may carry the frozen six keys (older row) or the seven rev-7 keys, but the key
+// is normalized to false when absent and only linux_vps may enable it.
 func validateConfigForClass(nodeClass string, sources map[string]bool, tags []InboundTag, cadence, version int) error {
 	if cadence < 30 || cadence > 300 {
 		return invalidArgument("cadence_seconds", "must be in [30,300]")
@@ -965,9 +990,10 @@ func validateConfigForClass(nodeClass string, sources map[string]bool, tags []In
 	if sources == nil {
 		return invalidArgument("collect", "must not be nil")
 	}
-	allowed := map[string]bool{"system": true, "services": true, "singbox_api": true, "mihomo_api": true, "terminal": true, "events": true}
-	if len(sources) != len(allowed) {
-		return invalidArgument("collect", "must contain exactly the frozen source switches")
+	allowed := map[string]bool{"system": true, "services": true, "singbox_api": true, "mihomo_api": true,
+		"terminal": true, "events": true, "monitor_export": true}
+	if len(sources) != 6 && len(sources) != 7 {
+		return invalidArgument("collect", "must contain the six frozen source switches and optionally monitor_export")
 	}
 	for k := range sources {
 		if !allowed[k] {
@@ -982,6 +1008,9 @@ func validateConfigForClass(nodeClass string, sources map[string]bool, tags []In
 	case NodeClassWindowsTerminal:
 		if sources["services"] || sources["singbox_api"] || len(tags) != 0 {
 			return invalidArgument("collect", "windows_terminal requires services/singbox_api=false and no expected inbound tags")
+		}
+		if sources["monitor_export"] {
+			return invalidArgument("collect", "windows_terminal cannot enable the linux-only monitor_export source")
 		}
 	default:
 		return invalidArgument("node_class", "unknown class")
@@ -1248,6 +1277,27 @@ func (t *Tx) StoreSnapshotTx(ctx context.Context, rec SnapshotRecord) (ReportDis
 	if err != nil {
 		return "", err
 	}
+	// Record the latest authenticated snapshot agent.version evidence. This is
+	// capability metadata only (never authorization on its own): the center uses
+	// it to decide whether an agent can safely receive the optional rev-7
+	// collect.monitor_export switch (OD-LT-14). It is updated in the same
+	// transaction for accepted and stale_ignored snapshots alike.
+	if rec.AgentVersion != "" && validStoredAgentVersion(rec.AgentVersion) {
+		if _, err := t.tx.ExecContext(ctx,
+			`UPDATE nodes SET last_agent_version=?, last_agent_version_at=? WHERE node_id=?`,
+			rec.AgentVersion, rec.ReceivedAt, rec.NodeID); err != nil {
+			return "", fmt.Errorf("store: record agent version: %w", err)
+		}
+	}
+	// Revision-7 normalized traffic observation rows are written in this same
+	// ingest transaction. The insert is idempotent on (node_id, report_id) so a
+	// replayed report can never duplicate the per-inbound history; the raw export
+	// JSON is never stored here.
+	if rec.TrafficObservation != nil {
+		if err := t.insertTrafficObservationTx(ctx, rec, id); err != nil {
+			return "", err
+		}
+	}
 	if disposition == DispositionAccepted {
 		if _, err := t.tx.ExecContext(ctx,
 			`INSERT INTO node_latest(node_id,snapshot_id,report_id,event_id,node_class,collected_at,updated_at)
@@ -1261,12 +1311,18 @@ func (t *Tx) StoreSnapshotTx(ctx context.Context, rec SnapshotRecord) (ReportDis
 	return disposition, nil
 }
 
-// SnapshotRecord is validated snapshot storage input.
+// SnapshotRecord is validated snapshot storage input. TrafficObservation is the
+// optional normalized revision-7 observation attached to the report; it is
+// persisted in the same transaction and never contains raw export JSON.
+// AgentVersion is the contract-validated snapshot agent.version, recorded as the
+// node's latest authenticated capability evidence (OD-LT-14).
 type SnapshotRecord struct {
 	NodeID, EventID, NodeClass, ReportID string
 	CollectedAt, ReceivedAt              int64
 	BodySHA256                           string
 	Payload                              []byte
+	TrafficObservation                   *TrafficObservationRecord
+	AgentVersion                         string
 }
 
 // GetLatestSnapshot returns the latest applied snapshot row.

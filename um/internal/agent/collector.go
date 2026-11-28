@@ -28,7 +28,8 @@ type InboundTag struct {
 }
 
 // CollectConfig is the center-managed collection authorization snapshot handed
-// to a platform collector. Sources use the frozen six keys.
+// to a platform collector. Sources use the frozen six keys plus the optional
+// rev-7 monitor_export switch (absence means false).
 type CollectConfig struct {
 	ConfigVersion int
 	Cadence       int

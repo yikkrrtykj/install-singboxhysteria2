@@ -11,8 +11,15 @@ import (
 	"github.com/yikkrrtykj/install-singboxhysteria2/um/internal/linuxobs"
 )
 
-func platformCollector(commonFlags) (agent.Collector, error) {
+func platformCollector(c commonFlags) (agent.Collector, error) {
 	col := &linuxobs.Collector{AgentVersion: version}
+	// The monitor-v2 traffic export path is operator-local only. It is never
+	// accepted from center config, a URL or a command; an invalid fixed path is a
+	// startup configuration error instead of a silently ignored one.
+	if err := linuxobs.ValidateMonitorExportPath(c.monitorExportFile); err != nil {
+		return nil, err
+	}
+	col.MonitorExportFile = c.monitorExportFile
 	// The systemd probe is read-only and non-root. If the system bus is
 	// unavailable, keep the honest unavailable default rather than failing the
 	// whole agent; services are source-gated by center config.

@@ -1,0 +1,146 @@
+name: UM-LT real-protocol traffic lab
+
+# Reproducible REAL-PROTOCOL end-to-end lab for the UM-LT Linux traffic export
+# data path:
+#
+#   real sing-box server (Reality `vless-in` + Hysteria2 `hy2-in`) and real
+#   sing-box clients -> real monitor-v2 restricted atomic export -> real Linux
+#   Go agent (`monitor_export` source) -> real Go center + SQLite store/query.
+#
+# It uses synthetic credentials, self-signed certificates and loopback test
+# services only. The only external network operation is downloading the pinned
+# official sing-box release with SHA-256 verification. No production/Cloudflare/
+# DNS/paid resource or repository secret is referenced.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/um-lt-traffic-lab.yml'
+      - 'um/deploy/lab/**'
+      - 'tests/um-lt/**'
+      - 'tests/test-um-lt*'
+      - 'um/cmd/**'
+      - 'um/internal/**'
+      - 'um/go.mod'
+      - 'um/go.sum'
+      - 'monitor-v2/**'
+      - 'docs/um/contracts/v1/**'
+  pull_request:
+    paths:
+      - '.github/workflows/um-lt-traffic-lab.yml'
+      - 'um/deploy/lab/**'
+      - 'tests/um-lt/**'
+      - 'tests/test-um-lt*'
+      - 'um/cmd/**'
+      - 'um/internal/**'
+      - 'um/go.mod'
+      - 'um/go.sum'
+      - 'monitor-v2/**'
+      - 'docs/um/contracts/v1/**'
+
+permissions:
+  contents: read
+
+jobs:
+  real-protocol-traffic-lab:
+    name: real-protocol-traffic-lab
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      GOTOOLCHAIN: local
+      GOPROXY: 'https://proxy.golang.org,direct'
+      GOSUMDB: 'sum.golang.org'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.4'
+          cache: true
+          cache-dependency-path: um/go.sum
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Verify toolchain (no binaries downloaded yet)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          go version
+          python3 --version
+          python3 -c 'import sqlite3, ssl, unittest; print("python stdlib ok", sqlite3.sqlite_version)'
+          curl --version | head -n 2
+          tar --version | head -n 1
+          openssl version
+          bash -n um/deploy/lab/linux-traffic-e2e-lab.sh
+
+      - name: Static contract/unit tests (no sing-box, no network)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 tests/um-lt/test_lab_contract.py
+
+      - name: Lab self-check (no sing-box, no network)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 um/deploy/lab/linux_traffic_e2e_lab.py --self-check
+
+      - name: Download and SHA-256 verify the pinned sing-box release
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY' > "$RUNNER_TEMP/singbox-path.txt"
+          import os, sys
+          sys.path.insert(0, "um/deploy/lab")
+          import um_lt_lab_lib as lab
+          path = lab.download_pinned_singbox(
+              os.path.join(os.environ["RUNNER_TEMP"], "um-lt-singbox"))
+          print(path)
+          PY
+          cat "$RUNNER_TEMP/singbox-path.txt"
+          "$(cat "$RUNNER_TEMP/singbox-path.txt")" version
+
+      - name: Build UM center and agent binaries for the lab
+        shell: bash
+        working-directory: um
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/um-lt-bin"
+          go build -trimpath -o "$RUNNER_TEMP/um-lt-bin/um-center" ./cmd/um-center
+          go build -trimpath -o "$RUNNER_TEMP/um-lt-bin/um-agent" ./cmd/um-agent
+
+      - name: Run real-protocol UM-LT traffic E2E lab
+        shell: bash
+        env:
+          UM_LT_LAB_ARTIFACTS: ${{ runner.temp }}/um-lt-artifacts
+        run: |
+          set -euxo pipefail
+          bash um/deploy/lab/linux-traffic-e2e-lab.sh \
+            --workdir "$RUNNER_TEMP/um-lt-lab-work" \
+            --artifacts "$UM_LT_LAB_ARTIFACTS" \
+            --singbox-bin "$(cat "$RUNNER_TEMP/singbox-path.txt")" \
+            --center-bin "$RUNNER_TEMP/um-lt-bin/um-center" \
+            --agent-bin "$RUNNER_TEMP/um-lt-bin/um-agent"
+
+      - name: Print lab summary
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$RUNNER_TEMP/um-lt-artifacts/summary.json" ]; then
+            python3 -m json.tool "$RUNNER_TEMP/um-lt-artifacts/summary.json" || true
+          else
+            echo "no lab summary.json produced"
+          fi
+
+      - name: Upload lab artifacts (logs, evidence, summary)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: um-lt-traffic-lab-artifacts
+          path: ${{ runner.temp }}/um-lt-artifacts
+          if-no-files-found: warn
+          retention-days: 14

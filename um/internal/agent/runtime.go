@@ -429,9 +429,16 @@ func ReportFields(identity Identity, attempt Attempt) wire.Fields {
 }
 
 var (
+	// collectSourceKeys is the frozen base source-switch set every agent-config
+	// response must carry. Revision 7 adds the OPTIONAL monitor_export switch for
+	// linux_vps; a rev-6 center that omits it keeps working (absence = false).
 	collectSourceKeys = []string{"system", "services", "singbox_api", "mihomo_api", "terminal", "events"}
-	inboundTagPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
-	deviceSaltPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{43}$`)
+	// optionalCollectSourceKeys are additive switches a newer center may include.
+	// An older agent rejects an unknown length, so the center only includes the
+	// key when it selects the rev-7 agent-config schema.
+	optionalCollectSourceKeys = []string{"monitor_export"}
+	inboundTagPattern         = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+	deviceSaltPattern         = regexp.MustCompile(`^[A-Za-z0-9_-]{43}$`)
 )
 
 func validInboundKind(kind string) bool {
@@ -448,22 +455,34 @@ func validateConfigForClass(class string, c Config) error {
 	}
 	if c.V != 1 || c.NodeClass != class || c.ConfigVersion < 1 ||
 		c.Cadence < 30 || c.Cadence > 300 ||
-		!deviceSaltPattern.MatchString(c.DeviceSalt) || len(c.Collect) != len(collectSourceKeys) {
+		!deviceSaltPattern.MatchString(c.DeviceSalt) {
 		return errors.New("agent: invalid config fields")
+	}
+	// A rev-7 center may include the optional monitor_export switch; a rev-6
+	// center sends exactly the six base keys. Any other size is invalid.
+	if len(c.Collect) != len(collectSourceKeys) && len(c.Collect) != len(collectSourceKeys)+len(optionalCollectSourceKeys) {
+		return errors.New("agent: invalid config source set")
 	}
 	for _, key := range collectSourceKeys {
 		if _, ok := c.Collect[key]; !ok {
 			return errors.New("agent: invalid config source set")
 		}
 	}
-	// Reject keys outside the frozen six. len(Collect)==6 plus all six known keys
-	// already implies this, but keep the explicit check for clarity.
+	// Reject keys outside the frozen six plus the optional monitor_export switch.
 	for key := range c.Collect {
 		found := false
 		for _, known := range collectSourceKeys {
 			if key == known {
 				found = true
 				break
+			}
+		}
+		if !found {
+			for _, known := range optionalCollectSourceKeys {
+				if key == known {
+					found = true
+					break
+				}
 			}
 		}
 		if !found {
@@ -488,6 +507,9 @@ func validateConfigForClass(class string, c Config) error {
 	case "windows_terminal":
 		if c.Collect["services"] || c.Collect["singbox_api"] || len(c.Tags) != 0 {
 			return errors.New("agent: windows_terminal config enables a linux-only source or carries tags")
+		}
+		if c.Collect["monitor_export"] {
+			return errors.New("agent: windows_terminal config enables the linux-only monitor_export source")
 		}
 	}
 	return nil

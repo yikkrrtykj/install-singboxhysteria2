@@ -34,6 +34,8 @@ if HERE not in sys.path:
 
 from collector import Collector, resolve_secret  # noqa: E402
 from diagnostics.probe_scheduler import ProbeScheduler  # noqa: E402
+from export import (TrafficExportConfigError,  # noqa: E402
+                    TrafficExportWriter, parse_inbound_specs)
 from web.access import LOOPBACK_ALLOW, AccessPolicy, host_entry_for_ip  # noqa: E402
 from web.auth import AuthStore, validate_password  # noqa: E402
 from web.broker import SnapshotBroker  # noqa: E402
@@ -127,6 +129,19 @@ def build_arg_parser():
                             "per publication tick (no client/runtime "
                             "payload). Standalone E2 omits it and behaves "
                             "exactly as without this flag.")
+    serve.add_argument("--traffic-export-file", default=None, metavar="PATH",
+                       help="OPTIONAL UM-LT restricted traffic export for the "
+                            "local Linux agent: an ABSOLUTE file path written "
+                            "atomically per publication tick (schema_version 1, "
+                            "aggregate counters only). Default: DISABLED -- no "
+                            "writer, no thread and no file I/O at all.")
+    serve.add_argument("--traffic-export-inbound", action="append",
+                       default=None, metavar="TAG:KIND",
+                       help="operator allow-list pair for "
+                            "--traffic-export-file (repeatable, at most 8, "
+                            "KIND one of reality|hysteria2|other). Only these "
+                            "configured inbound tags may appear in the export; "
+                            "at least 1 pair is required when the file is set.")
     serve.add_argument("--session-ttl", type=float, default=8 * 3600.0,
                        help="admin session lifetime in seconds")
     return parser
@@ -259,6 +274,29 @@ def cmd_serve(args):
                 print("  - %s" % problem, file=sys.stderr, flush=True)
             return 2
 
+    # OPTIONAL UM-LT restricted traffic export. FAIL CLOSED: when the feature
+    # is requested but its configuration/destination is unsafe the monitor
+    # refuses to start instead of silently serving with the feature off (and
+    # it NEVER falls back to /tmp or the current working directory). With no
+    # --traffic-export-file, no writer object exists: zero threads, zero
+    # file reads/writes and zero behavior change for standalone E2.
+    # Validation happens BEFORE the collector/broker exist; a leftover export
+    # file from a previous monitor process is removed before anything serves.
+    traffic_export_writer = None
+    if args.traffic_export_file is not None:
+        try:
+            specs = parse_inbound_specs(args.traffic_export_inbound or [])
+            traffic_export_writer = TrafficExportWriter(
+                args.traffic_export_file, specs).prepare()
+        except TrafficExportConfigError as exc:
+            print("refusing to start traffic export: %s" % exc,
+                  file=sys.stderr, flush=True)
+            return 2
+    elif args.traffic_export_inbound:
+        print("refusing to start traffic export: --traffic-export-inbound "
+              "requires --traffic-export-file", file=sys.stderr, flush=True)
+        return 2
+
     collector = Collector(url=args.url, interval=args.interval,
                           secret=resolve_secret(args.secret_file),
                           closed_ttl=args.closed_ttl)
@@ -285,7 +323,16 @@ def cmd_serve(args):
     scanner = IncidentScanner(history)
     broker = SnapshotBroker(collector, poll_seconds=args.poll,
                             health_file=args.health_file,
-                            incident_history=history)
+                            incident_history=history,
+                            traffic_export_writer=traffic_export_writer)
+    # The export writer thread starts BEFORE the broker publisher so no first
+    # publication is ever dropped on startup. It is deliberately NOT in the
+    # collector's path: a write failure only degrades the optional file.
+    if traffic_export_writer is not None:
+        traffic_export_writer.start()
+        print("traffic export enabled: %d configured inbound(s), atomic "
+              "bounded writer" % len(traffic_export_writer.inbounds),
+              flush=True)
     broker.start()
     probes.start()
     scanner.start()
@@ -326,6 +373,11 @@ def cmd_serve(args):
         host_evidence.stop()
         probes.stop()
         broker.stop()
+        # OPTIONAL UM-LT export: stop the writer AFTER the publisher stops
+        # submitting; join is bounded and a wedged writer is a daemon thread
+        # that can never hold up Monitor shutdown.
+        if traffic_export_writer is not None:
+            traffic_export_writer.stop()
         # PR-4B: the scanner must be down BEFORE the History store closes --
         # an in-flight scan cycle reads the runtime-state row, and a missing
         # row is a fail-closed _HistoryError, never a silent recreation.

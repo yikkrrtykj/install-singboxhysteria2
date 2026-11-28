@@ -105,16 +105,18 @@ func writeTree(t *testing.T, files map[string]string) string {
 	return root
 }
 
-// testSourceSwitches builds a frozen six-key source map with the listed
-// sources enabled and every other switch disabled.
+// testSourceSwitches builds a frozen source map with the listed sources enabled
+// and every other switch disabled. Revision 7 adds the optional monitor_export
+// switch; it defaults to disabled here like the center fail-closed default.
 func testSourceSwitches(enabled ...string) map[string]bool {
 	sources := map[string]bool{
-		"system":      false,
-		"services":    false,
-		"singbox_api": false,
-		"mihomo_api":  false,
-		"terminal":    false,
-		"events":      false,
+		"system":         false,
+		"services":       false,
+		"singbox_api":    false,
+		"mihomo_api":     false,
+		"terminal":       false,
+		"events":         false,
+		"monitor_export": false,
 	}
 	for _, name := range enabled {
 		sources[name] = true

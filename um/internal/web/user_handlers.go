@@ -19,6 +19,8 @@ func (h *Handler) serveWebAPI(w http.ResponseWriter, r *http.Request) {
 	switch parts[0] {
 	case "users":
 		h.routeUsers(w, r, parts[1:])
+	case "traffic":
+		h.routeTraffic(w, r, parts[1:])
 	case "status":
 		if r.Method != http.MethodGet {
 			h.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")

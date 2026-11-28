@@ -1,5 +1,6 @@
 // Package linuxobs implements the read-only Linux VPS collector for the
-// Unified Monitor (UM) v1 node protocol, revision 5.
+// Unified Monitor (UM) v1 node protocol, revision 5, with the additive revision
+// 7 read-only traffic observation (monitor-v2 export).
 //
 // The collector observes only local, unprivileged, read-only sources:
 //
@@ -15,7 +16,13 @@
 //     gRPC-Web StartedService/SubscribeConnections stream (fixed loopback
 //     origin, optional credential, no write RPCs);
 //   - a legacy SingBoxProbe for the old Clash-compatible API (kept only for
-//     compatibility/tests; it cannot provide daemon-lifetime totals).
+//     compatibility/tests; it cannot provide daemon-lifetime totals);
+//   - an optional revision-7 monitor-v2 read-only JSON traffic export
+//     (MonitorExportFile): per-inbound OBSERVED LOWER-BOUND bytes plus observed
+//     rates/freshness/epoch/sequence. It is enabled only by center config
+//     collect.monitor_export AND an operator-local fixed absolute path; the
+//     agent reads it read-only, never writes it, and never receives the path
+//     from the center.
 //
 // It never starts a process, never writes a file, never listens on a socket
 // and never needs a privileged uid. Report bodies are frozen-contract
@@ -70,6 +77,10 @@ const (
 	reportTypeMetrics  = "metrics"
 	reportTypeEvents   = "events"
 
+	// contractRevision7 is the snapshot contract revision that carries the
+	// optional monitor_export traffic_observation object.
+	contractRevision7 = 7
+
 	serviceNameSingBox    = "sing-box"
 	trafficScopeProtocol  = "protocol"
 	eventKindAgentStarted = "agent_started"
@@ -96,9 +107,10 @@ const (
 // Frozen center source-switch names (agent-config.schema.json collect object).
 // mihomo_api and terminal are Windows-only and are never read here.
 const (
-	sourceSystem     = "system"
-	sourceServices   = "services"
-	sourceSingBoxAPI = "singbox_api"
+	sourceSystem        = "system"
+	sourceServices      = "services"
+	sourceSingBoxAPI    = "singbox_api"
+	sourceMonitorExport = "monitor_export"
 )
 
 // Frozen availability vocabulary.
@@ -106,6 +118,12 @@ const (
 	availabilityOK          = "ok"
 	availabilityPartial     = "partial"
 	availabilityUnavailable = "unavailable"
+)
+
+// Frozen revision-7 traffic_observation tokens.
+const (
+	trafficCounterScopeObservationEpoch = "observation_epoch"
+	trafficExactnessLowerBound          = "lower_bound"
 )
 
 // BuildVersion is embedded in agent.version and the agent_started event when
@@ -149,6 +167,15 @@ type Collector struct {
 	// gate (P1-10). It defaults to false: an enabled but unproven source emits
 	// agent_error code=source_authorization_unproven and stays unavailable.
 	SingBoxSourceAuthorized bool
+	// MonitorExportFile is the operator-local fixed absolute path of the optional
+	// monitor-v2 read-only traffic export. Empty disables local export reading
+	// even when the center config enables collect.monitor_export; the snapshot
+	// then carries an honest unavailable traffic_observation. The path is never
+	// accepted from center config, a URL or a command.
+	MonitorExportFile string
+	// monitorExport is the in-memory monotonic epoch/sequence guard for the
+	// optional export. It is never persisted and never a data source.
+	monitorExport monitorExportTracker
 	// AgentVersion is the semantic version embedded in agent.version and in
 	// the agent_started event. Empty uses BuildVersion. A value that does not
 	// match the frozen version grammar is a configuration error.
@@ -231,6 +258,14 @@ func (c *Collector) Snapshot(ctx context.Context, rc agent.ReportContext) ([]byt
 			Tracked:   nil,
 			Summaries: make([]clientSummary, 0),
 		},
+	}
+	// The rev-7 traffic observation is emitted only when the center config
+	// enables collect.monitor_export. With the source absent/disabled the body
+	// above is byte-identical to the frozen rev-5 snapshot body: both rev-7
+	// fields are omitempty and never set.
+	if sourceEnabled(rc, sourceMonitorExport) {
+		body.ContractRevision = contractRevision7
+		body.TrafficObservation = c.trafficObservation(rc)
 	}
 	return marshalReport("snapshot", body)
 }

@@ -292,7 +292,7 @@ func (s *Store) purgeEvent(ctx context.Context, eventID, actor string, confirm b
 			_ = s.updatePurgeOp(ctx, op)
 			return fmt.Errorf("store: purge latest pointers: %w", err)
 		}
-		for _, table := range []string{"snapshots", "report_metrics", "report_events", "report_event_reports"} {
+		for _, table := range []string{"traffic_observation_reports", "snapshots", "report_metrics", "report_events", "report_event_reports"} {
 			for {
 				tx, err := s.db.BeginTx(ctx, nil)
 				if err != nil {

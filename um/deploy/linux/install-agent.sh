@@ -206,6 +206,10 @@ ENV_CONTENT="# UM-B3 Draft environment (no secrets; token is never stored here)
 UM_AGENT_STATE_DIR=$STATE_DIR
 UM_AGENT_NODE_CLASS=linux_vps
 UM_AGENT_CENTER_URL=$CENTER_URL
+# Optional revision-7 read-only monitor-v2 traffic export (default disabled).
+# Operator-local fixed absolute path; the umagent user must have OS read access
+# (for example via the monitor's dedicated sboxmon-export group).
+# UM_AGENT_MONITOR_EXPORT_FILE=/run/singbox-monitor-export/traffic.json
 "
 if [ "$APPLY" -eq 1 ]; then
   TMP_ENV="$(mktemp)"

@@ -691,6 +691,20 @@ sbmon_stage_release() { # sbmon_stage_release <version> -> prints release id on 
     cp -R -- "$SBMON_REPO_MONITOR_DIR/web" "$staged/app/monitor-v2/web"
     rm -rf -- "$staged/app/monitor-v2/web/__pycache__"
 
+    # UM-LT (traffic export, DEFAULT-DISABLED): webapp.py imports export/ at
+    # startup, so it is part of the monitor runtime tree. Same frozen-manifest
+    # discipline as diagnostics/remote_probe: no wildcard staging, fail-closed.
+    mkdir -p "$staged/app/monitor-v2/export"
+    local ef
+    for ef in "${TRAFFIC_EXPORT_MODULE_FILES[@]}"; do
+        [ -f "$SBMON_REPO_MONITOR_DIR/export/$ef" ] \
+            || sbmon_die "缺少 export 模块 $ef：webapp 运行期必需，fail-closed"
+        cp -- "$SBMON_REPO_MONITOR_DIR/export/$ef" \
+            "$staged/app/monitor-v2/export/$ef" \
+            || sbmon_die "export 模块 $ef 拷贝失败：fail-closed"
+    done
+    rm -rf -- "$staged/app/monitor-v2/export/__pycache__"
+
     # PR-6B: remote_probe/ is unconditional webapp startup payload --
     # same discipline as diagnostics (manifest, file-by-file,
     # fail-closed).
@@ -764,6 +778,7 @@ sbmon_stage_release() { # sbmon_stage_release <version> -> prints release id on 
         "$staged/app/monitor-v2/p6_distribution.py"
         "$staged/app/monitor-v2/api_bridge/"*.py
         "$staged/app/monitor-v2/web/"*.py
+        "$staged/app/monitor-v2/export/"*.py
         "$staged/$DIAGNOSTICS_REL/"*.py)
     local -a sh_targets=("$staged/bin/monitor-service" "$staged/bin/monitor-health"
         "$staged/bin/monitor-contract-probe" "$staged/lib/monitor-env.sh")
@@ -1012,6 +1027,15 @@ DIAGNOSTICS_REL="app/monitor-v2/diagnostics"
 # static gates in tests/test-monitor-v2-remote-server.sh.
 REMOTE_PROBE_MODULE_FILES=(__init__.py __main__.py agent.py delivery.py
     direct_probe.py evidence.py mihomo_probe.py payload.py spool.py)
+
+# UM-LT: the OPTIONAL restricted traffic export (DEFAULT-DISABLED at runtime)
+# is imported by webapp.py at startup, so export/ is part of the MONITOR
+# runtime tree: a release that cannot carry it must not be staged at all.
+# Frozen explicit manifest, staged file by file and NEVER `cp -R export`: a new
+# source file reaches production only by being named here AND by the static
+# gate in tests/test-monitor-packaging.sh. The feature writes NO file unless
+# the operator explicitly passes --traffic-export-file/--traffic-export-inbound.
+TRAFFIC_EXPORT_MODULE_FILES=(__init__.py contract.py writer.py)
 
 # EXACT-set audit of a staged/persisted diagnostics tree: missing OR
 # unexpected entries both fail closed (the same manifest discipline the reader

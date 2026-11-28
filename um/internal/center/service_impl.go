@@ -6,6 +6,7 @@ package center
 // passes already-parsed fields here.
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -319,6 +320,9 @@ func (s *ServiceImpl) Report(ctx context.Context, req ReportRequest) (ReportResu
 		Type        string `json:"type"`
 		ReportID    string `json:"report_id"`
 		CollectedAt int64  `json:"collected_at"`
+		Agent       struct {
+			Version string `json:"version"`
+		} `json:"agent"`
 	}
 	if err := json.Unmarshal(req.Body, &env); err != nil {
 		return ReportResult{}, apiErr(400, "invalid_request", false)
@@ -345,7 +349,10 @@ func (s *ServiceImpl) Report(ctx context.Context, req ReportRequest) (ReportResu
 	}
 	bodyHash := bodySHA(req.Body)
 	var disposition store.ReportDisposition
-	var currentCfg store.NodeConfig
+	var (
+		currentCfg    store.NodeConfig
+		trafficRecord *store.TrafficObservationRecord
+	)
 	validationRejected := false
 	auditKind := ""
 	attempt := protocol.Attempt{
@@ -374,7 +381,10 @@ func (s *ServiceImpl) Report(ctx context.Context, req ReportRequest) (ReportResu
 				return err
 			}
 			currentCfg = cur
-			opts := contract.ValidateOptions{TerminalConfigured: c.Sources["terminal"] || c.Sources["mihomo_api"]}
+			opts := contract.ValidateOptions{
+				TerminalConfigured:      c.Sources["terminal"] || c.Sources["mihomo_api"],
+				MonitorExportConfigured: c.Sources["monitor_export"],
+			}
 			if err := contract.ValidateReportBodyWithSchemaSet(s.schemas, node.NodeClass, req.ReportType, req.Body, opts); err != nil {
 				validationRejected = true
 				return mapServiceError(err)
@@ -388,6 +398,15 @@ func (s *ServiceImpl) Report(ctx context.Context, req ReportRequest) (ReportResu
 					validationRejected = true
 					return err
 				}
+				// The rev-7 traffic observation is normalized once, inside the
+				// authenticated transaction that decided the effective config, and
+				// stored in the same snapshot ingest transaction below.
+				rec, terr := normalizeTrafficObservation(env.CollectedAt, req.Body, now)
+				if terr != nil {
+					validationRejected = true
+					return mapServiceError(terr)
+				}
+				trafficRecord = rec
 			}
 			if err := validateMetricEventTagBindings(node.NodeClass, req.ReportType, req.Body, c.ExpectedInboundTags); err != nil {
 				validationRejected = true
@@ -429,7 +448,8 @@ func (s *ServiceImpl) Report(ctx context.Context, req ReportRequest) (ReportResu
 				d, err := tx.StoreSnapshotTx(ctx, store.SnapshotRecord{
 					NodeID: node.NodeID, EventID: node.EventID, NodeClass: node.NodeClass,
 					ReportID: env.ReportID, CollectedAt: env.CollectedAt, ReceivedAt: now,
-					BodySHA256: bodyHash, Payload: req.Body,
+					BodySHA256: bodyHash, Payload: req.Body, TrafficObservation: trafficRecord,
+					AgentVersion: env.Agent.Version,
 				})
 				if err != nil {
 					return "", mapServiceError(err)
@@ -691,17 +711,47 @@ func (s *ServiceImpl) Config(ctx context.Context, req ConfigRequest) (ConfigResu
 			if err := validateClassConfigForClass(node.NodeClass, cfg); err != nil {
 				return err
 			}
+			// OD-LT-14 revision-7 agent-config selection. The optional
+			// collect.monitor_export switch may only be emitted when ALL hold:
+			//   - the node is linux_vps;
+			//   - the operator/admin source switch is enabled in the stored config;
+			//   - the deployed contract set carries the rev-7 agent-config schema;
+			//   - the node's latest authenticated snapshot agent.version is at
+			//     least MinMonitorExportAgentVersion.
+			// Otherwise the key is omitted entirely (rev-5/rev-6 strict decoders
+			// require exactly the six frozen keys; the rev-7 schema makes
+			// monitor_export OPTIONAL so six keys are valid for a rev-7 agent too).
+			// The stored source switch stays true so enabling before a rev-7 agent
+			// reports takes effect after its next authenticated snapshot.
+			reportedVersion, err := tx.LastAgentVersionTx(ctx, node.NodeID)
+			if err != nil {
+				return mapServiceError(err)
+			}
+			includeMonitorExport := node.NodeClass == store.NodeClassLinuxVPS &&
+				cfg.Sources["monitor_export"] &&
+				s.schemas.Has(contract.AgentConfigRev7SchemaFile) &&
+				agentVersionAtLeast(reportedVersion, MinMonitorExportAgentVersion)
+			collect := cloneBoolMap(cfg.Sources)
+			if includeMonitorExport {
+				collect["monitor_export"] = true
+			} else {
+				delete(collect, "monitor_export")
+			}
 			doc := map[string]any{
 				"v": 1, "node_id": node.NodeID, "event_id": node.EventID, "node_class": node.NodeClass,
 				"config_version": cfg.ConfigVersion, "cadence_seconds": cfg.CadenceSeconds,
-				"collect": cfg.Sources, "device_salt": cfg.DeviceSalt, "server_time": now,
+				"collect": collect, "device_salt": cfg.DeviceSalt, "server_time": now,
 				"expected_inbound_tags": cfg.ExpectedInboundTags,
 			}
 			body, err := json.Marshal(doc)
 			if err != nil {
 				return apiErr(503, "storage_unavailable", true)
 			}
-			if err := s.schemas.Validate("agent-config.schema.json", body); err != nil {
+			agentConfigSchema := "agent-config.schema.json"
+			if includeMonitorExport {
+				agentConfigSchema = contract.AgentConfigRev7SchemaFile
+			}
+			if err := s.schemas.Validate(agentConfigSchema, body); err != nil {
 				// Validate the complete response BEFORE the high-water commit.
 				return apiErr(503, "storage_unavailable", true)
 			}
@@ -721,9 +771,75 @@ func (s *ServiceImpl) Config(ctx context.Context, req ConfigRequest) (ConfigResu
 	return ConfigResult{Body: responseBody, ConfigVersion: configVersion, ServerTime: now}, nil
 }
 
+// normalizeTrafficObservation extracts the optional rev-7 traffic observation
+// from an already contract-validated snapshot body into the normalized storage
+// projection. It stores only allowlisted fields, never the raw export JSON. A
+// rev-5 body has no observation and normalizes to nil.
+func normalizeTrafficObservation(collectedAt int64, body []byte, receivedAt int64) (*store.TrafficObservationRecord, error) {
+	var doc struct {
+		TrafficObservation json.RawMessage `json:"traffic_observation"`
+	}
+	raw := bytes.TrimSpace(body)
+	if len(raw) == 0 || raw[0] != '{' {
+		return nil, apiErr(400, "invalid_request", false)
+	}
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return nil, apiErr(400, "invalid_request", false)
+	}
+	if len(doc.TrafficObservation) == 0 || bytes.Equal(bytes.TrimSpace(doc.TrafficObservation), []byte("null")) {
+		return nil, nil
+	}
+	observation, err := contract.ValidateTrafficObservation(collectedAt, doc.TrafficObservation)
+	if err != nil {
+		return nil, err
+	}
+	record := &store.TrafficObservationRecord{
+		Source: observation.Source, SourceEpoch: observation.SourceEpoch,
+		Sequence: observation.Sequence, ObservedAt: observation.ObservedAt,
+		CollectedAt: collectedAt, ReceivedAt: receivedAt,
+		Availability: observation.Availability, Freshness: observation.Freshness,
+		ActiveConnections: cloneInt64Pointer(observation.ActiveConnections),
+		RateWindowSeconds: cloneFloat64Pointer(observation.RateWindowSeconds),
+		CounterScope:      observation.CounterScope, Exactness: observation.Exactness,
+		BytesEstimate: int64(len(doc.TrafficObservation)) + int64(len(observation.Inbounds))*128,
+		Inbounds:      make([]store.TrafficInboundRecord, 0, len(observation.Inbounds)),
+	}
+	for _, inbound := range observation.Inbounds {
+		record.Inbounds = append(record.Inbounds, store.TrafficInboundRecord{
+			InboundTag: inbound.InboundTag, Kind: inbound.Kind, ObservedAt: inbound.ObservedAt,
+			Availability: inbound.Availability, Quality: inbound.Quality,
+			UplinkObservedLowerBoundBytes:   cloneInt64Pointer(inbound.UplinkObservedLowerBoundBytes),
+			DownlinkObservedLowerBoundBytes: cloneInt64Pointer(inbound.DownlinkObservedLowerBoundBytes),
+			UplinkObservedRateBps:           cloneFloat64Pointer(inbound.UplinkObservedRateBps),
+			DownlinkObservedRateBps:         cloneFloat64Pointer(inbound.DownlinkObservedRateBps),
+			ActiveConnections:               inbound.ActiveConnections,
+		})
+	}
+	return record, nil
+}
+
+func cloneInt64Pointer(value *int64) *int64 {
+	if value == nil {
+		return nil
+	}
+	clone := *value
+	return &clone
+}
+
+func cloneFloat64Pointer(value *float64) *float64 {
+	if value == nil {
+		return nil
+	}
+	clone := *value
+	return &clone
+}
+
 // enforceExpectedInboundTags binds a Linux snapshot's protocol/traffic inbound
 // tags to the center-managed allowlist for that node/event. Unknown tags are
-// rejected at the boundary rather than stored/displayed.
+// rejected at the boundary rather than stored/displayed. Revision 7 additionally
+// binds the traffic_observation inbounds: every tag must be in the allowlist with
+// the configured kind, and an "ok" observation must cover every expected tag so
+// an agent cannot claim full observation while omitting a configured inbound.
 func enforceExpectedInboundTags(nodeClass string, body []byte, expected []store.InboundTag) error {
 	if nodeClass != store.NodeClassLinuxVPS {
 		return nil
@@ -740,6 +856,13 @@ func enforceExpectedInboundTags(nodeClass string, body []byte, expected []store.
 		Traffic []struct {
 			InboundTag string `json:"inbound_tag"`
 		} `json:"traffic"`
+		TrafficObservation *struct {
+			Availability string `json:"availability"`
+			Inbounds     []struct {
+				InboundTag string `json:"inbound_tag"`
+				Kind       string `json:"kind"`
+			} `json:"inbounds"`
+		} `json:"traffic_observation"`
 	}
 	if err := json.Unmarshal(body, &snap); err != nil {
 		return apiErr(400, "invalid_request", false)
@@ -755,11 +878,24 @@ func enforceExpectedInboundTags(nodeClass string, body []byte, expected []store.
 			return apiErr(400, "invalid_request", false)
 		}
 	}
+	if snap.TrafficObservation != nil {
+		seen := make(map[string]bool, len(snap.TrafficObservation.Inbounds))
+		for _, inbound := range snap.TrafficObservation.Inbounds {
+			kind, ok := allowed[inbound.InboundTag]
+			if !ok || kind != inbound.Kind || seen[inbound.InboundTag] {
+				return apiErr(400, "invalid_request", false)
+			}
+			seen[inbound.InboundTag] = true
+		}
+		if snap.TrafficObservation.Availability == "ok" && len(seen) != len(allowed) {
+			return apiErr(400, "invalid_request", false)
+		}
+	}
 	return nil
 }
 
 func validateClassConfigForClass(nodeClass string, cfg store.NodeConfig) error {
-	if cfg.Sources == nil || len(cfg.Sources) != 6 {
+	if cfg.Sources == nil || (len(cfg.Sources) != 6 && len(cfg.Sources) != 7) {
 		return apiErr(503, "storage_unavailable", true)
 	}
 	if cfg.CadenceSeconds < 30 || cfg.CadenceSeconds > 300 || cfg.ConfigVersion < 1 {
@@ -771,13 +907,22 @@ func validateClassConfigForClass(nodeClass string, cfg store.NodeConfig) error {
 			return apiErr(503, "storage_unavailable", true)
 		}
 	case store.NodeClassWindowsTerminal:
-		if cfg.Sources["services"] || cfg.Sources["singbox_api"] || len(cfg.ExpectedInboundTags) != 0 {
+		if cfg.Sources["services"] || cfg.Sources["singbox_api"] || cfg.Sources["monitor_export"] || len(cfg.ExpectedInboundTags) != 0 {
 			return apiErr(503, "storage_unavailable", true)
 		}
 	default:
 		return apiErr(503, "storage_unavailable", true)
 	}
 	return nil
+}
+
+// cloneBoolMap returns a defensive copy of a source-switch map.
+func cloneBoolMap(in map[string]bool) map[string]bool {
+	out := make(map[string]bool, len(in)+1)
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
 }
 
 // validateReportSources enforces the center-managed source switches while keeping

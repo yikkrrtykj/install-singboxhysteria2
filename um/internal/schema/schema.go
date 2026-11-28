@@ -39,11 +39,17 @@ type Set struct {
 // relative; in tests that directory is typically
 // "../../../docs/um/contracts/v1" (package-relative).
 func Load(dir string) (*Set, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil, fmt.Errorf("schema: read contracts dir %q: %w", dir, err)
-	}
+	return LoadDirs(dir)
+}
 
+// LoadDirs compiles every "*.schema.json" file in each directory into one Set.
+// It is used for a versioned overlay (for example docs/um/contracts/v1 plus its
+// rev7/ subdirectory) while keeping file-name collisions fail-closed. The first
+// directory is reported by Dir() for compatibility with Load.
+func LoadDirs(dirs ...string) (*Set, error) {
+	if len(dirs) == 0 {
+		return nil, errors.New("schema: at least one contracts directory is required")
+	}
 	compiler := jsonschema.NewCompiler()
 	// Load the frozen contract files from disk at runtime, not from embedded
 	// copies.
@@ -51,27 +57,36 @@ func Load(dir string) (*Set, error) {
 	compiler.DefaultDraft(jsonschema.Draft2020)
 
 	set := &Set{
-		dir:     dir,
+		dir:     dirs[0],
 		schemas: make(map[string]*jsonschema.Schema),
 	}
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), Suffix) {
-			continue
-		}
-		name := entry.Name()
-		abs, err := filepath.Abs(filepath.Join(dir, name))
+	for _, dir := range dirs {
+		entries, err := os.ReadDir(dir)
 		if err != nil {
-			return nil, fmt.Errorf("schema: resolve %q: %w", name, err)
+			return nil, fmt.Errorf("schema: read contracts dir %q: %w", dir, err)
 		}
-		compiled, err := compiler.Compile(fileURL(abs))
-		if err != nil {
-			return nil, fmt.Errorf("schema: compile %q: %w", name, err)
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), Suffix) {
+				continue
+			}
+			name := entry.Name()
+			if _, exists := set.schemas[name]; exists {
+				return nil, fmt.Errorf("schema: duplicate schema file %q across contract directories", name)
+			}
+			abs, err := filepath.Abs(filepath.Join(dir, name))
+			if err != nil {
+				return nil, fmt.Errorf("schema: resolve %q: %w", name, err)
+			}
+			compiled, err := compiler.Compile(fileURL(abs))
+			if err != nil {
+				return nil, fmt.Errorf("schema: compile %q: %w", name, err)
+			}
+			set.schemas[name] = compiled
+			set.names = append(set.names, name)
 		}
-		set.schemas[name] = compiled
-		set.names = append(set.names, name)
 	}
 	if len(set.names) == 0 {
-		return nil, fmt.Errorf("schema: no %s files in %q", Suffix, dir)
+		return nil, fmt.Errorf("schema: no %s files in %q", Suffix, dirs)
 	}
 	sort.Strings(set.names)
 	return set, nil

@@ -35,6 +35,16 @@ type ValidateOptions struct {
 	// `terminal` object; when false it MUST NOT. Ignored for linux_vps, which
 	// never carries terminal telemetry.
 	TerminalConfigured bool
+	// MonitorExportConfigured reports whether the center/agent-config has the
+	// linux_vps monitor_export source enabled at the snapshot's collected_at.
+	// Revision-7 snapshots (contract_revision=7 + traffic_observation) are
+	// accepted only when it is true. A rev-5 body remains valid even when it is
+	// true: old/unknown agents must be able to report a snapshot so the center can
+	// learn their capability version before ever emitting the optional rev-7
+	// switch (OD-LT-14); such an agent simply has no traffic observation. Ignored
+	// for windows_terminal, which never carries a read-only traffic export
+	// observation.
+	MonitorExportConfigured bool
 }
 
 // snapshotEnvelope is the shape needed by the runtime rules. Fields not relevant
@@ -43,15 +53,17 @@ type ValidateOptions struct {
 // strict-JSON scan when this struct is populated, so required fields are present
 // and well-typed.
 type snapshotEnvelope struct {
-	CollectedAt  int64                      `json:"collected_at"`
-	Host         snapshotHost               `json:"host"`
-	Availability map[string]string          `json:"availability"`
-	System       map[string]json.RawMessage `json:"system"`
-	Services     []serviceEntry             `json:"services"`
-	Protocols    []protocolEntry            `json:"protocols"`
-	Traffic      []trafficEntry             `json:"traffic"`
-	Clients      clientsEnvelope            `json:"clients"`
-	Terminal     json.RawMessage            `json:"terminal"`
+	CollectedAt        int64                      `json:"collected_at"`
+	ContractRevision   json.RawMessage            `json:"contract_revision"`
+	Host               snapshotHost               `json:"host"`
+	Availability       map[string]string          `json:"availability"`
+	System             map[string]json.RawMessage `json:"system"`
+	Services           []serviceEntry             `json:"services"`
+	Protocols          []protocolEntry            `json:"protocols"`
+	Traffic            []trafficEntry             `json:"traffic"`
+	TrafficObservation json.RawMessage            `json:"traffic_observation"`
+	Clients            clientsEnvelope            `json:"clients"`
+	Terminal           json.RawMessage            `json:"terminal"`
 }
 
 type snapshotHost struct {
@@ -96,16 +108,22 @@ var systemFieldNames = []string{
 // source configuration must use ValidateSnapshotWithOptions.
 //
 //  1. Strict-JSON grammar (no duplicate object member names, no trailing data).
-//  2. Report snapshot contract validation (JSON Schema 2020-12) -> invalid_request.
-//  3. Full-body path-aware privacy sentinel scan -> invalid_request.
-//  4. Platform isolation: linux_vps must not carry terminal and must be
+//  2. Contract revision selection: an absent contract_revision keeps the rev-5
+//     schema/behavior; contract_revision=7 selects report-snapshot.rev7
+//     .schema.json and is only legal for linux_vps with the monitor_export
+//     source configured -> invalid_request/platform_mismatch.
+//  3. Report snapshot contract validation (JSON Schema 2020-12) -> invalid_request.
+//  4. Full-body path-aware privacy sentinel scan -> invalid_request.
+//  5. Platform isolation: linux_vps must not carry terminal and must be
 //     host.os=linux; windows_terminal must be host.os=windows and carry the
 //     terminal object iff the terminal source is configured -> platform_mismatch.
-//  5. Linux availability ↔ null/empty coherence, protocol state/reason coherence
+//  6. Linux availability ↔ null/empty coherence, protocol state/reason coherence
 //     and protocol observed_at bounds -> invalid_request.
-//  6. Windows base data honesty: services/protocols/traffic/clients unavailable/
+//  7. Revision 7: traffic_observation lower-bound/freshness/epoch coherence and
+//     the honest empty traffic projection -> invalid_request.
+//  8. Windows base data honesty: services/protocols/traffic/clients unavailable/
 //     null/empty; the optional rev-5 system source is coherence-checked.
-//  7. Terminal selection/connection coherence and independent sampling bounds ->
+//  9. Terminal selection/connection coherence and independent sampling bounds ->
 //     invalid_request.
 func ValidateSnapshot(nodeClass string, raw []byte) error {
 	return ValidateSnapshotWithOptions(nodeClass, raw, ValidateOptions{TerminalConfigured: true})
@@ -125,26 +143,64 @@ func ValidateSnapshotWithSchemaSet(set *schema.Set, nodeClass string, raw []byte
 }
 
 func validateSnapshotWithSchemaSet(set *schema.Set, nodeClass string, raw []byte, opts ValidateOptions) error {
-	// 1–2. Real JSON Schema validation of the frozen contract (which itself
-	// enforces strict JSON before schema work).
+	// 1. Strict JSON grammar before any schema/revision selection so two
+	// consumers can never disagree about the same bytes.
+	if err := validateStrictJSON(raw); err != nil {
+		return err
+	}
+
+	// 2. Contract revision selection. A body without contract_revision is a
+	// rev-5 body and keeps the rev-5 schema/behavior byte-for-byte. A body that
+	// declares contract_revision=7 must use the rev-7 schema and is only legal
+	// for a linux_vps node whose monitor_export source is configured at
+	// collected_at. The rev-7 schema is optional in a deployment that predates
+	// the contract change; selecting it when absent fails closed.
+	revision, err := snapshotContractRevision(raw)
+	if err != nil {
+		return err
+	}
+	selectedSchema := snapshotSchemaFile
+	switch revision {
+	case 0:
+		// A rev-5 body stays valid even when the center source is enabled: an old
+		// agent (or a new agent before it has received the optional config switch)
+		// must never have its authenticated snapshot rejected, preserving the
+		// old-agent bootstrap ordering (report first, then the center may emit the
+		// rev-7 switch). Rev-7 bodies are the ones that require an enabled source.
+	case ContractRevision7:
+		if nodeClass != NodeClassLinuxVPS {
+			return mismatch("contract_revision", "contract_revision 7 is only allowed for linux_vps snapshots")
+		}
+		if !opts.MonitorExportConfigured {
+			return invalid("contract_revision", "contract_revision 7 requires the monitor_export source to be configured")
+		}
+		selectedSchema = SnapshotRev7SchemaFile
+	default:
+		return invalid("contract_revision", "unsupported snapshot contract revision")
+	}
+
+	// 3. Real JSON Schema validation of the selected frozen contract.
 	var schemaErr error
 	if set != nil {
-		schemaErr = set.Validate(snapshotSchemaFile, raw)
+		if !set.Has(selectedSchema) {
+			return invalid("contract_revision", "the selected snapshot contract schema is not loaded")
+		}
+		schemaErr = set.Validate(selectedSchema, raw)
 	} else {
-		schemaErr = validateSchema(snapshotSchemaFile, raw)
+		schemaErr = validateSchema(selectedSchema, raw)
 	}
 	if schemaErr != nil {
 		return schemaErr
 	}
 
-	// 3. Privacy boundary: scan every string reachable from the body, by path.
+	// 4. Privacy boundary: scan every string reachable from the body, by path.
 	// This covers identifiers the schema defines (report_id) without flagging
 	// them, and all non-terminal fields (metrics/events are scanned in report.go).
 	if err := scanReportPrivacy(ReportTypeSnapshot, raw); err != nil {
 		return err
 	}
 
-	// 4. Minimal parse; fields are schema-guaranteed.
+	// 5. Minimal parse; fields are schema-guaranteed.
 	var snap snapshotEnvelope
 	if err := json.Unmarshal(raw, &snap); err != nil {
 		return invalid("body", "malformed snapshot body")
@@ -159,7 +215,13 @@ func validateSnapshotWithSchemaSet(set *schema.Set, nodeClass string, raw []byte
 		if snap.Host.OS != "linux" {
 			return mismatch("host.os", "linux_vps snapshot requires host.os=linux")
 		}
-		return validateLinuxSnapshotSemantics(&snap)
+		if err := validateLinuxSnapshotSemantics(&snap); err != nil {
+			return err
+		}
+		if revision == ContractRevision7 {
+			return validateRevision7SnapshotSemantics(&snap)
+		}
+		return nil
 	case NodeClassWindowsTerminal:
 		if snap.Host.OS != "windows" {
 			return mismatch("host.os", "windows_terminal snapshot requires host.os=windows")
@@ -183,6 +245,54 @@ func validateSnapshotWithSchemaSet(set *schema.Set, nodeClass string, raw []byte
 	default:
 		return invalid("node_class", "unknown node class")
 	}
+}
+
+// snapshotContractRevision returns the declared contract_revision, or 0 for a
+// rev-5 body. contract_revision is a schema-bounded integer; a wrong JSON type
+// is a contract violation rather than an ignored field.
+func snapshotContractRevision(raw []byte) (int, error) {
+	var probe struct {
+		ContractRevision *int `json:"contract_revision"`
+	}
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		return 0, invalid("body", "malformed snapshot body")
+	}
+	if probe.ContractRevision == nil {
+		return 0, nil
+	}
+	return *probe.ContractRevision, nil
+}
+
+// validateRevision7SnapshotSemantics enforces the rev-7-only additions on top of
+// the rev-5 Linux coherence rules: the traffic_observation object must be a
+// coherent lower-bound observation, and the frozen rev-5 traffic array/state
+// stays an honest unavailable/empty projection because lower bounds are not
+// contract totals.
+func validateRevision7SnapshotSemantics(snap *snapshotEnvelope) error {
+	if len(snap.TrafficObservation) == 0 || isJSONNull(snap.TrafficObservation) {
+		return invalid("traffic_observation", "contract_revision 7 requires a traffic_observation object")
+	}
+	if _, err := ValidateTrafficObservation(snap.CollectedAt, snap.TrafficObservation); err != nil {
+		return err
+	}
+	if len(snap.Traffic) != 0 {
+		return invalid("traffic", "the monitor_export source reports lower bounds, not contract totals; traffic must stay empty")
+	}
+	if snap.Availability["traffic"] != "unavailable" && snap.Availability["traffic"] != "partial" {
+		return invalid("availability.traffic", "the monitor_export source allows availability.traffic partial or unavailable, never ok")
+	}
+	return nil
+}
+
+func isSnapshotRevision7(snap *snapshotEnvelope) bool {
+	if len(snap.ContractRevision) == 0 {
+		return false
+	}
+	var revision int
+	if err := json.Unmarshal(snap.ContractRevision, &revision); err != nil {
+		return false
+	}
+	return revision == ContractRevision7
 }
 
 // validateLinuxSnapshotSemantics enforces the frozen "availability ⇒
@@ -354,6 +464,14 @@ func validateTrafficCoherence(snap *snapshotEnvelope) error {
 			return invalid("traffic", "traffic availability unavailable requires an empty traffic array")
 		}
 	case "partial":
+		// Rev-7 Linux has a separate traffic_observation block that carries the
+		// lower-bound data; its frozen rev-5 traffic projection MUST stay empty.
+		// The contract permits availability.traffic to be "partial" in that one
+		// narrow case (but never "ok"). Snowflake/empty partial is still invalid
+		// for every rev-5 body.
+		if len(snap.Traffic) == 0 && isSnapshotRevision7(snap) {
+			return nil
+		}
 		for _, entry := range snap.Traffic {
 			if entry.UplinkBytes == nil || entry.DownlinkBytes == nil {
 				return nil

@@ -282,6 +282,9 @@ func eventPayloadBytesTx(ctx context.Context, tx *sql.Tx, eventID string) (int64
 		`SELECT COALESCE(SUM(LENGTH(payload_json)),0) FROM report_metrics WHERE event_id=?`,
 		`SELECT COALESCE(SUM(LENGTH(details_json)),0) FROM report_events WHERE event_id=?`,
 		`SELECT COALESCE(SUM(LENGTH(payload_json)),0) FROM report_event_reports WHERE event_id=?`,
+		// Normalized revision-7 traffic rows carry a bounded per-report byte
+		// estimate instead of raw payload; the child rows are accounted inside it.
+		`SELECT COALESCE(SUM(bytes_estimate),0) FROM traffic_observation_reports WHERE event_id=?`,
 	}
 	for _, q := range queries {
 		var v int64
@@ -499,18 +502,21 @@ func (s *Store) RetentionTimeline(ctx context.Context) (RetentionTimeline, error
 // CapacityStatsExtended adds database/WAL bytes and event lifecycle counters.
 type CapacityStatsExtended struct {
 	CapacityStats
-	ActiveEvents     int64
-	ArchivedEvents   int64
-	ArchivedRetained int64
-	EventsCatalog    int64
-	PurgeTombstones  int64
-	AdminAuditRows   int64
-	DBSizeBytes      int64
-	WALSizeBytes     int64
-	NodesBytes       int64
-	SnapshotsBytes   int64
-	MetricsBytes     int64
-	EventsBytes      int64
+	ActiveEvents        int64
+	ArchivedEvents      int64
+	ArchivedRetained    int64
+	EventsCatalog       int64
+	PurgeTombstones     int64
+	AdminAuditRows      int64
+	DBSizeBytes         int64
+	WALSizeBytes        int64
+	NodesBytes          int64
+	SnapshotsBytes      int64
+	MetricsBytes        int64
+	EventsBytes         int64
+	TrafficBytes        int64
+	TrafficReports      int64
+	TrafficObservations int64
 }
 
 func (s *Store) CapacityStatsExtended(ctx context.Context) (CapacityStatsExtended, error) {
@@ -536,6 +542,8 @@ func (s *Store) CapacityStatsExtended(ctx context.Context) (CapacityStatsExtende
 		{&c.EventsCatalog, `SELECT COUNT(*) FROM event_catalog`},
 		{&c.PurgeTombstones, `SELECT COUNT(*) FROM purge_tombstones`},
 		{&c.AdminAuditRows, `SELECT COUNT(*) FROM admin_audit`},
+		{&c.TrafficReports, `SELECT COUNT(*) FROM traffic_observation_reports`},
+		{&c.TrafficObservations, `SELECT COUNT(*) FROM traffic_observations`},
 	} {
 		if err := s.db.QueryRowContext(ctx, q.sql).Scan(q.dst); err != nil {
 			return CapacityStatsExtended{}, err
@@ -550,6 +558,7 @@ func (s *Store) CapacityStatsExtended(ctx context.Context) (CapacityStatsExtende
 		{&c.SnapshotsBytes, `SELECT COALESCE(SUM(LENGTH(payload_json)+128),0) FROM snapshots`},
 		{&c.MetricsBytes, `SELECT COALESCE(SUM(LENGTH(payload_json)+128),0) FROM report_metrics`},
 		{&c.EventsBytes, `SELECT COALESCE((SELECT SUM(LENGTH(details_json)+128) FROM report_events),0) + COALESCE((SELECT SUM(LENGTH(payload_json)+128) FROM report_event_reports),0)`},
+		{&c.TrafficBytes, `SELECT COALESCE(SUM(bytes_estimate),0) FROM traffic_observation_reports`},
 	} {
 		if err := s.db.QueryRowContext(ctx, q.sql).Scan(q.dst); err != nil {
 			return CapacityStatsExtended{}, err
@@ -675,7 +684,7 @@ func (s *Store) RunRetentionB2PolicyB(ctx context.Context, now int64) (map[strin
 				e.id, e.id, cutoff); err != nil {
 				return fail("active_event_latest", err)
 			}
-			for _, table := range []string{"snapshots", "report_metrics", "report_events", "report_event_reports"} {
+			for _, table := range []string{"traffic_observation_reports", "snapshots", "report_metrics", "report_events", "report_event_reports"} {
 				if n, err := deleteBatched(ctx, s.db, hook, table, "event_id=? AND collected_at < ?", e.id, cutoff); err != nil {
 					return fail("active_event:"+table, err)
 				} else {
@@ -691,7 +700,7 @@ func (s *Store) RunRetentionB2PolicyB(ctx context.Context, now int64) (map[strin
 			if _, err := s.db.ExecContext(ctx, `DELETE FROM node_latest WHERE event_id=?`, e.id); err != nil {
 				return fail("archived_event_latest", err)
 			}
-			for _, table := range []string{"snapshots", "report_metrics", "report_events", "report_event_reports"} {
+			for _, table := range []string{"traffic_observation_reports", "snapshots", "report_metrics", "report_events", "report_event_reports"} {
 				if n, err := deleteBatched(ctx, s.db, hook, table, "event_id=?", e.id); err != nil {
 					return fail("archived_event:"+table, err)
 				} else {
@@ -712,7 +721,7 @@ func (s *Store) RunRetentionB2PolicyB(ctx context.Context, now int64) (map[strin
 			e.id, e.id, cutoff); err != nil {
 			return fail("archive_tail_latest", err)
 		}
-		for _, table := range []string{"snapshots", "report_metrics", "report_events", "report_event_reports"} {
+		for _, table := range []string{"traffic_observation_reports", "snapshots", "report_metrics", "report_events", "report_event_reports"} {
 			if n, err := deleteBatched(ctx, s.db, hook, table, "event_id=? AND collected_at < ?", e.id, cutoff); err != nil {
 				return fail("archive_tail:"+table, err)
 			} else {

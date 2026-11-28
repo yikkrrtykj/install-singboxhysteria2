@@ -554,8 +554,17 @@ func TestLoadContracts(t *testing.T) {
 			t.Fatalf("contract set is missing %q", name)
 		}
 	}
-	if names := set.Names(); len(names) != len(ContractSchemaNames) {
-		t.Fatalf("loaded %d schemas (%v), want %d", len(names), names, len(ContractSchemaNames))
+	expected := len(ContractSchemaNames)
+	if info, statErr := os.Stat(filepath.Join(testContractDir, "rev7")); statErr == nil && info.IsDir() {
+		expected += 2
+		for _, name := range []string{"report-snapshot.rev7.schema.json", "agent-config.rev7.schema.json"} {
+			if !set.Has(name) {
+				t.Fatalf("contract set is missing rev-7 overlay %q", name)
+			}
+		}
+	}
+	if names := set.Names(); len(names) != expected {
+		t.Fatalf("loaded %d schemas (%v), want %d", len(names), names, expected)
 	}
 
 	if _, err := (Config{}).LoadContracts(); err == nil {

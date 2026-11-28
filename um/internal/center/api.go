@@ -19,6 +19,8 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -189,12 +191,24 @@ func (c Config) Validate() error {
 // explicit ContractDir and verifies that all ten rev-5 schemas are present.
 // schema.Load already compiles each file (draft 2020-12), so a returned Set is
 // prevalidated; a deployment with a missing or uncompilable schema fails here.
+//
+// Revision 7 is additive and optional at startup: when the deployment contract
+// directory also carries report-snapshot.rev7.schema.json and
+// agent-config.rev7.schema.json, those files are compiled into the same set and
+// selected only for a rev-7 body / a rev-7 agent-config response. A deployment
+// that predates the rev-7 contract change keeps serving the frozen rev-5 contract
+// and fails closed on a rev-7 body/source rather than misvalidating it.
 func (c Config) LoadContracts() (*schema.Set, error) {
 	dir := strings.TrimSpace(c.ContractDir)
 	if dir == "" {
 		return nil, errors.New("center: ContractDir is required")
 	}
-	set, err := schema.Load(dir)
+	dirs := []string{dir}
+	overlay := filepath.Join(dir, "rev7")
+	if info, statErr := os.Stat(overlay); statErr == nil && info.IsDir() {
+		dirs = append(dirs, overlay)
+	}
+	set, err := schema.LoadDirs(dirs...)
 	if err != nil {
 		return nil, fmt.Errorf("center: load contracts: %w", err)
 	}
