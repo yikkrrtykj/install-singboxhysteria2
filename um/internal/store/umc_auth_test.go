@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 )
 
@@ -67,7 +68,7 @@ func TestUMCAuthAccountsSessionsTOTPRecovery(t *testing.T) {
 	}
 
 	// Session + CSRF storage, subject binding, rotation and revocation.
-	sess := AuthSession{IDHash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+	sess := AuthSession{IDHash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", PublicID: "public-session-1",
 		UserID: ea.UserID, State: AuthSessionActive, AccessSubject: "subject-1", AccessIssuer: "https://access.example",
 		CSRFHash:  "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 		CreatedAt: now, LastSeenAt: now, IdleExpiresAt: now + 1800, AbsoluteExpiresAt: now + 43200}
@@ -79,6 +80,7 @@ func TestUMCAuthAccountsSessionsTOTPRecovery(t *testing.T) {
 	}
 	next := sess
 	next.IDHash = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	next.PublicID = "public-session-2"
 	next.CSRFHash = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
 	if err := s.RotateSession(ctx, sess.IDHash, next, now+1); err != nil {
 		t.Fatal(err)
@@ -146,5 +148,48 @@ func TestUMCAuthAccountsSessionsTOTPRecovery(t *testing.T) {
 	}
 	if _, err := s.GetPreauth(ctx, pre.TokenHash); !errors.Is(err, ErrAuthSessionUnknown) {
 		t.Fatalf("deleted preauth err=%v", err)
+	}
+}
+
+func TestUMCAuthConcurrentTOTPReplay(t *testing.T) {
+	s := openTestStore(t, tempStorePath(t))
+	ctx := context.Background()
+	now := int64(1_900_100_000)
+	hash := "$argon2id$v=19$m=65536,t=3,p=2$c2FsdHNhbHRzYWx0c2FsdA$aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	if _, err := s.BootstrapAuthUser(ctx, "concurrent-admin", hash, now); err != nil {
+		t.Fatal(err)
+	}
+	user, err := s.GetAuthUserByUsername(ctx, "concurrent-admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetAuthUserTOTP(ctx, user.UserID, []byte("sealed"), 1, now); err != nil {
+		t.Fatal(err)
+	}
+	const workers = 8
+	var wg sync.WaitGroup
+	results := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results <- s.ConsumeTOTPCounter(ctx, user.UserID, 424242, now+1)
+		}()
+	}
+	wg.Wait()
+	close(results)
+	success, replay := 0, 0
+	for err := range results {
+		switch {
+		case err == nil:
+			success++
+		case errors.Is(err, ErrAuthTOTPReplayed):
+			replay++
+		default:
+			t.Fatalf("unexpected concurrent TOTP result: %v", err)
+		}
+	}
+	if success != 1 || replay != workers-1 {
+		t.Fatalf("concurrent TOTP success=%d replay=%d", success, replay)
 	}
 }

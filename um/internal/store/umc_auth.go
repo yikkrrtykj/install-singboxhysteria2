@@ -54,6 +54,7 @@ type AuthUser struct {
 
 type AuthSession struct {
 	IDHash            string
+	PublicID          string
 	UserID            string
 	State             string
 	AccessSubject     string
@@ -376,6 +377,9 @@ func (s *Store) SetAuthUserEnabled(ctx context.Context, userID string, enabled b
 			return err
 		}
 	}
+	if err := appendAuthMutationTx(ctx, tx, nowUnix()); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -434,6 +438,9 @@ func (s *Store) SetAuthUserRoleAndScopes(ctx context.Context, userID, role strin
 	if _, err := tx.ExecContext(ctx, `UPDATE umc_sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL`, now, userID); err != nil {
 		return err
 	}
+	if err := appendAuthMutationTx(ctx, tx, nowUnix()); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -455,6 +462,9 @@ func (s *Store) SetAuthUserPassword(ctx context.Context, userID, passwordHash st
 		return ErrAuthUserUnknown
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE umc_sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL`, now, userID); err != nil {
+		return err
+	}
+	if err := appendAuthMutationTx(ctx, tx, nowUnix()); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -479,7 +489,13 @@ func (s *Store) SetAuthUserTOTP(ctx context.Context, userID string, secret []byt
 	if n, _ := res.RowsAffected(); n != 1 {
 		return ErrAuthUserUnknown
 	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM umc_totp_counters WHERE user_id=?`, userID); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `UPDATE umc_sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL`, now, userID); err != nil {
+		return err
+	}
+	if err := appendAuthMutationTx(ctx, tx, nowUnix()); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -510,6 +526,9 @@ func (s *Store) ConsumeTOTPCounter(ctx context.Context, userID string, counter i
 		counter, now, userID); err != nil {
 		return err
 	}
+	if err := appendAuthMutationTx(ctx, tx, nowUnix()); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -534,6 +553,9 @@ func (s *Store) ReplaceRecoveryCodes(ctx context.Context, userID string, hashes 
 		}
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE umc_users SET updated_at=? WHERE user_id=?`, now, userID); err != nil {
+		return err
+	}
+	if err := appendAuthMutationTx(ctx, tx, nowUnix()); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -562,6 +584,9 @@ func (s *Store) ConsumeRecoveryCode(ctx context.Context, userID, hash string, no
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE umc_sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL`, now, userID); err != nil {
+		return err
+	}
+	if err := appendAuthMutationTx(ctx, tx, nowUnix()); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -601,6 +626,9 @@ func (s *Store) DeletePreauth(ctx context.Context, tokenHash string) error {
 func (s *Store) CreateSession(ctx context.Context, sess AuthSession) error {
 	var pending []byte
 	var pendingAt any
+	if sess.PublicID == "" {
+		return invalidArgument("session_public_id", "must not be empty")
+	}
 	if len(sess.PendingSecret) > 0 {
 		pending = sess.PendingSecret
 	}
@@ -608,9 +636,9 @@ func (s *Store) CreateSession(ctx context.Context, sess AuthSession) error {
 		pendingAt = *sess.PendingCreatedAt
 	}
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO umc_sessions(session_id_hash,user_id,state,access_subject,access_issuer,csrf_hash,pending_secret,pending_created_at,created_at,last_seen_at,idle_expires_at,absolute_expires_at)
-		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
-		sess.IDHash, sess.UserID, sess.State, sess.AccessSubject, sess.AccessIssuer, sess.CSRFHash,
+		`INSERT INTO umc_sessions(session_id_hash,public_id,user_id,state,access_subject,access_issuer,csrf_hash,pending_secret,pending_created_at,created_at,last_seen_at,idle_expires_at,absolute_expires_at)
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		sess.IDHash, sess.PublicID, sess.UserID, sess.State, sess.AccessSubject, sess.AccessIssuer, sess.CSRFHash,
 		pending, pendingAt, sess.CreatedAt, sess.LastSeenAt, sess.IdleExpiresAt, sess.AbsoluteExpiresAt)
 	return err
 }
@@ -620,9 +648,9 @@ func (s *Store) GetSession(ctx context.Context, idHash string) (AuthSession, err
 	var pending []byte
 	var pendingAt, revoked sql.NullInt64
 	err := s.db.QueryRowContext(ctx,
-		`SELECT session_id_hash,user_id,state,access_subject,access_issuer,csrf_hash,pending_secret,pending_created_at,created_at,last_seen_at,idle_expires_at,absolute_expires_at,revoked_at
+		`SELECT session_id_hash,public_id,user_id,state,access_subject,access_issuer,csrf_hash,pending_secret,pending_created_at,created_at,last_seen_at,idle_expires_at,absolute_expires_at,revoked_at
 		 FROM umc_sessions WHERE session_id_hash=?`, idHash).
-		Scan(&sess.IDHash, &sess.UserID, &sess.State, &sess.AccessSubject, &sess.AccessIssuer, &sess.CSRFHash,
+		Scan(&sess.IDHash, &sess.PublicID, &sess.UserID, &sess.State, &sess.AccessSubject, &sess.AccessIssuer, &sess.CSRFHash,
 			&pending, &pendingAt, &sess.CreatedAt, &sess.LastSeenAt, &sess.IdleExpiresAt, &sess.AbsoluteExpiresAt, &revoked)
 	if errors.Is(err, sql.ErrNoRows) {
 		return AuthSession{}, ErrAuthSessionUnknown
@@ -640,6 +668,28 @@ func (s *Store) TouchSession(ctx context.Context, idHash string, now, idleExpire
 	_, err := s.db.ExecContext(ctx, `UPDATE umc_sessions SET last_seen_at=?,idle_expires_at=? WHERE session_id_hash=? AND revoked_at IS NULL`,
 		now, idleExpires, idHash)
 	return err
+}
+
+func (s *Store) GetSessionByPublicID(ctx context.Context, publicID string) (AuthSession, error) {
+	var idHash string
+	if err := s.db.QueryRowContext(ctx, `SELECT session_id_hash FROM umc_sessions WHERE public_id=?`, publicID).Scan(&idHash); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return AuthSession{}, ErrAuthSessionUnknown
+		}
+		return AuthSession{}, err
+	}
+	return s.GetSession(ctx, idHash)
+}
+
+func (s *Store) RevokeSessionByPublicID(ctx context.Context, publicID string, now int64) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE umc_sessions SET revoked_at=? WHERE public_id=? AND revoked_at IS NULL`, now, publicID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return ErrAuthSessionUnknown
+	}
+	return nil
 }
 
 func (s *Store) RevokeSession(ctx context.Context, idHash string, now int64) error {
@@ -681,14 +731,63 @@ func (s *Store) RotateSession(ctx context.Context, oldHash string, next AuthSess
 	if len(next.PendingSecret) > 0 {
 		pending = next.PendingSecret
 	}
+	if next.PublicID == "" {
+		return invalidArgument("session_public_id", "must not be empty")
+	}
 	if next.PendingCreatedAt != nil {
 		pendingAt = *next.PendingCreatedAt
 	}
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO umc_sessions(session_id_hash,user_id,state,access_subject,access_issuer,csrf_hash,pending_secret,pending_created_at,created_at,last_seen_at,idle_expires_at,absolute_expires_at)
-		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
-		next.IDHash, next.UserID, next.State, next.AccessSubject, next.AccessIssuer, next.CSRFHash,
+		`INSERT INTO umc_sessions(session_id_hash,public_id,user_id,state,access_subject,access_issuer,csrf_hash,pending_secret,pending_created_at,created_at,last_seen_at,idle_expires_at,absolute_expires_at)
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		next.IDHash, next.PublicID, next.UserID, next.State, next.AccessSubject, next.AccessIssuer, next.CSRFHash,
 		pending, pendingAt, next.CreatedAt, next.LastSeenAt, next.IdleExpiresAt, next.AbsoluteExpiresAt); err != nil {
+		return err
+	}
+	if err := appendAuthMutationTx(ctx, tx, nowUnix()); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// CompleteTOTPLogin atomically consumes the TOTP counter, revokes the pending
+// session and creates the authenticated replacement session. A replay or insert
+// failure leaves the pending session untouched and never emits a usable cookie.
+func (s *Store) CompleteTOTPLogin(ctx context.Context, userID string, counter int64, oldHash string, next AuthSession, now int64) error {
+	if next.PublicID == "" {
+		return invalidArgument("session_public_id", "must not be empty")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO umc_totp_counters(user_id,counter,used_at) VALUES(?,?,?)`,
+		userID, counter, now); err != nil {
+		if isUniqueViolation(err) {
+			return ErrAuthTOTPReplayed
+		}
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE umc_users SET totp_last_counter=?,last_login_at=?,updated_at=? WHERE user_id=?`,
+		counter, now, now, userID); err != nil {
+		return err
+	}
+	res, err := tx.ExecContext(ctx, `UPDATE umc_sessions SET revoked_at=? WHERE session_id_hash=? AND revoked_at IS NULL`, now, oldHash)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return ErrAuthSessionUnknown
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO umc_sessions(session_id_hash,public_id,user_id,state,access_subject,access_issuer,csrf_hash,pending_secret,pending_created_at,created_at,last_seen_at,idle_expires_at,absolute_expires_at)
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		next.IDHash, next.PublicID, next.UserID, next.State, next.AccessSubject, next.AccessIssuer, next.CSRFHash,
+		nil, nil, next.CreatedAt, next.LastSeenAt, next.IdleExpiresAt, next.AbsoluteExpiresAt); err != nil {
+		return err
+	}
+	if err := appendAuthMutationTx(ctx, tx, nowUnix()); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -696,7 +795,7 @@ func (s *Store) RotateSession(ctx context.Context, oldHash string, next AuthSess
 
 func (s *Store) ListUserSessions(ctx context.Context, userID string) ([]AuthSession, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT session_id_hash,user_id,state,access_subject,access_issuer,csrf_hash,created_at,last_seen_at,idle_expires_at,absolute_expires_at,revoked_at
+		`SELECT session_id_hash,public_id,user_id,state,access_subject,access_issuer,csrf_hash,created_at,last_seen_at,idle_expires_at,absolute_expires_at,revoked_at
 		 FROM umc_sessions WHERE user_id=? ORDER BY created_at DESC LIMIT 100`, userID)
 	if err != nil {
 		return nil, err
@@ -706,7 +805,7 @@ func (s *Store) ListUserSessions(ctx context.Context, userID string) ([]AuthSess
 	for rows.Next() {
 		var sess AuthSession
 		var revoked sql.NullInt64
-		if err := rows.Scan(&sess.IDHash, &sess.UserID, &sess.State, &sess.AccessSubject, &sess.AccessIssuer,
+		if err := rows.Scan(&sess.IDHash, &sess.PublicID, &sess.UserID, &sess.State, &sess.AccessSubject, &sess.AccessIssuer,
 			&sess.CSRFHash, &sess.CreatedAt, &sess.LastSeenAt, &sess.IdleExpiresAt, &sess.AbsoluteExpiresAt, &revoked); err != nil {
 			return nil, err
 		}
@@ -778,9 +877,108 @@ func (s *Store) CleanupAuthState(ctx context.Context, now int64) (map[string]int
 	return deleted, nil
 }
 
+// RecordAuthAudit writes one closed UM-C authentication/account audit row. The
+// caller must never pass passwords, codes, secrets or tokens in target/detail.
+// ResetAuthUserForLocalRecovery is the OS-protected local recovery primitive:
+// it replaces the password, clears TOTP/recovery state, revokes every session,
+// and requires a full TOTP re-enrollment. It does not bypass Cloudflare Access
+// for later browser login.
+func (s *Store) ResetAuthUserForLocalRecovery(ctx context.Context, userID, passwordHash string, now int64) error {
+	if strings.TrimSpace(passwordHash) == "" {
+		return invalidArgument("password", "must not be empty")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.ExecContext(ctx,
+		`UPDATE umc_users SET password_hash=?,totp_secret=NULL,totp_key_version=NULL,totp_enrolled_at=NULL,
+		 totp_last_counter=NULL,enabled=1,disabled_at=NULL,updated_at=? WHERE user_id=?`, passwordHash, now, userID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return ErrAuthUserUnknown
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM umc_recovery_codes WHERE user_id=?`, userID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM umc_totp_counters WHERE user_id=?`, userID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE umc_sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL`, now, userID); err != nil {
+		return err
+	}
+	if err := appendAuthMutationTx(ctx, tx, nowUnix()); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) RecordAuthAudit(ctx context.Context, actor, role, action, target, result string, now int64) error {
+	return s.RecordAdminAudit(ctx, AuditMeta{Actor: actor, Role: role, Action: action, Target: target}, result)
+}
+
+// RecordAuthLedger appends a hash-chained security-ledger entry for a critical
+// UM-C security-state change. detailHash must already be a SHA-256 of non-secret
+// bounded context (never a password/TOTP/recovery/session token).
+func (s *Store) RecordAuthLedger(ctx context.Context, kind, subject, detailHash string, now int64) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := appendLedgerTx(ctx, tx, now, kind, subject, detailHash); err != nil {
+		return err
+	}
+	if err := appendAuthMutationTx(ctx, tx, nowUnix()); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func boolInt(v bool) int {
 	if v {
 		return 1
 	}
 	return 0
+}
+
+// AuthMutationMeta lets the Web/CLI caller make a critical UM-C security-state
+// change and its audit row/security-ledger entry atomic with the mutation. The
+// store helpers append only closed action kinds and hashed non-secret detail.
+type AuthMutationMeta struct {
+	Audit            AuditMeta
+	LedgerKind       string
+	LedgerSubject    string
+	LedgerDetailHash string
+}
+
+type authMutationContextKey struct{}
+
+// WithAuthMutation attaches atomic audit/ledger metadata to a mutation context.
+func WithAuthMutation(ctx context.Context, meta AuthMutationMeta) context.Context {
+	return context.WithValue(ctx, authMutationContextKey{}, meta)
+}
+
+func appendAuthMutationTx(ctx context.Context, tx *sql.Tx, now int64) error {
+	meta, ok := ctx.Value(authMutationContextKey{}).(AuthMutationMeta)
+	if !ok {
+		return nil
+	}
+	if meta.Audit.Action != "" {
+		if err := AppendAuditTx(ctx, tx, meta.Audit, "ok"); err != nil {
+			return err
+		}
+	}
+	if meta.LedgerKind != "" {
+		if meta.LedgerSubject == "" || meta.LedgerDetailHash == "" {
+			return errors.New("store: incomplete auth ledger metadata")
+		}
+		if _, err := appendLedgerTx(ctx, tx, now, meta.LedgerKind, meta.LedgerSubject, meta.LedgerDetailHash); err != nil {
+			return err
+		}
+	}
+	return nil
 }

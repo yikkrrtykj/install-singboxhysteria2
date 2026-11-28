@@ -651,6 +651,7 @@ var migrations = []migration{
 		`CREATE INDEX IF NOT EXISTS idx_umc_preauth_expiry ON umc_preauth(expires_at)`,
 		`CREATE TABLE IF NOT EXISTS umc_sessions (
 			session_id_hash TEXT PRIMARY KEY,
+			public_id       TEXT NOT NULL UNIQUE,
 			user_id         TEXT NOT NULL REFERENCES umc_users(user_id) ON DELETE CASCADE,
 			state           TEXT NOT NULL CHECK (state IN ('totp_pending','totp_setup','authenticated')),
 			access_subject  TEXT NOT NULL,

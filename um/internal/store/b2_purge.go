@@ -457,6 +457,9 @@ func (s *Store) purgeEvent(ctx context.Context, eventID, actor string, confirm b
 		if _, err := tx.ExecContext(ctx, `DELETE FROM aliases WHERE event_id=?`, eventID); err != nil {
 			return err
 		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM umc_user_event_scopes WHERE event_id=?`, eventID); err != nil {
+			return err
+		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM event_catalog WHERE event_id=?`, eventID); err != nil {
 			return err
 		}

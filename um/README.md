@@ -7,8 +7,11 @@ center implementation (machine-ingest HTTP listener, enrollment/rotation,
 authenticated single-transaction report ingest, telemetry storage and policy-B
 retention).
 
-**Status: UM-B2 Draft PR / review only.** Not production code and not deployed.
-B3 and later slices are not started; UM-F is deferred; production is HOLD. The
+**Status: B1/B2/B3/B4 merged; UM-C Draft PR Refs #127.** UM-C adds local
+password/TOTP authentication, sessions/CSRF, Cloudflare Access verification and a
+secure Web ingress above the existing center/management engine. It is not
+production code and is not deployed; UM-D/E/F/G remain out of scope here.
+PRODUCTION HOLD, R1 PRODUCTION HOLD, `singbox_api` DISABLED, UM-F DEFERRED. The
 Windows observer/CLI remain experimental and are not wired into a service.
 
 ## Layout
@@ -19,7 +22,10 @@ Windows observer/CLI remain experimental and are not wired into a service.
 | `internal/protocol` | Pure A-1..A-5 recovery/ordering state machine (generation gaps, first-contact `seq>1`, ACK exhaustion, rotation retry ordering). No I/O. |
 | `internal/store` | SQLite (WAL, `synchronous=FULL`, per-connection DSN PRAGMAs) schema/migrations; STRICT bounded protocol numerics; transactional boot/seq high-water; B2-safe `Tx` nonce/report/seq API; immutable effective-dated route mappings; enrollment/config/snapshot/metrics/events/archive tables; B2 authenticated ingest transaction, retention and capacity stats. |
 | `internal/center` | UM-B2 center boundary + service: isolated ingest/admin listeners, strict header/encoding/body/JSON limits, rate limiting, enrollment/rotation, Ed25519 auth, freshness/nonce/boot/seq/report dedupe, telemetry persistence, schema-validated responses. |
-| `cmd/um-center` | Runnable center process with explicit `-ingest/-admin/-db/-contracts` configuration and graceful shutdown. |
+| `cmd/um-center` | Runnable center process with explicit `-ingest/-admin/-db/-contracts` configuration, local `auth bootstrap/recover/init-key` commands, optional UM-C Web listener and optional independent machine TLS 1.3 listener. |
+| `internal/umcauth` | UM-C Argon2id password, RFC 6238 TOTP, recovery-code hashing, AES-256-GCM master-key vault and strict Cloudflare Access JWT/JWKS verifier. |
+| `internal/web` | UM-C loopback Web plane: Access+session authentication, forced TOTP/recovery, server-side sessions/CSRF, account administration and a bridge into the existing B4 management/RBAC service. |
+| `um/web` | Vue 3 + TypeScript + Vite browser console (login/TOTP/recovery/account/session/user admin; no UM-D monitoring charts). |
 | `internal/schema` | Real JSON Schema 2020-12 validation of the frozen `docs/um/contracts/v1` files (not JSON parsing only), plus strict duplicate-key/trailing-data rejection. |
 | `internal/contract` | Platform isolation, Linux/Windows availability semantics (Windows `system` optional), terminal-config presence, temporal metric/event checks, and path-aware privacy scanning. |
 | `internal/windowsobs` | Experimental read-only Windows Mihomo route observer (prototype; not a service, not in the B1 acceptance path). |
@@ -133,3 +139,17 @@ with explicit event and node scope, node-side authorization, an operation
 receipt and retry and failure semantics. Reuse the existing configuration
 transaction boundary for committing writes. Device disable and configuration
 apply each need their own permissions and post-apply checks.
+
+
+## UM-C docs
+
+- `docs/um-c-architecture.md`
+- `docs/um-c-auth-api.md` / `docs/um-c-auth-api.openapi.json`
+- `docs/um-c-runbook.md`
+- `docs/um-c-migrations.md`
+- `docs/um-c-scope-and-acceptance.md`
+- `deploy/um-c/` (synthetic placeholders; production HOLD)
+
+UM-C is an isolated lab implementation with synthetic Access/JWKS/TLS/browser
+tests. Real Cloudflare/Tunnel/DNS/Access/IdP/certificates/production deployment
+remain HOLD and require separate Owner authorization.

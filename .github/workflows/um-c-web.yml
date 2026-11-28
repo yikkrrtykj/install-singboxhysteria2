@@ -1,0 +1,109 @@
+name: UM-C Web and Browser Lab
+
+on:
+  push:
+    paths:
+      - 'um/web/**'
+      - 'um/cmd/um-c-e2e/**'
+      - 'um/internal/web/**'
+      - 'um/internal/umcauth/**'
+      - 'um/internal/store/**'
+      - 'um/internal/management/**'
+      - '.github/workflows/um-c-web.yml'
+  pull_request:
+    paths:
+      - 'um/web/**'
+      - 'um/cmd/um-c-e2e/**'
+      - 'um/internal/web/**'
+      - 'um/internal/umcauth/**'
+      - 'um/internal/store/**'
+      - 'um/internal/management/**'
+      - '.github/workflows/um-c-web.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  web:
+    name: frontend
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: um/web
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: um/web/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: um-c-web-dist
+          path: um/web/dist
+          if-no-files-found: error
+
+  browser:
+    name: real-browser-auth-lab
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    needs: web
+    defaults:
+      run:
+        working-directory: um/web
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: um/web/package-lock.json
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.4'
+          cache: true
+          cache-dependency-path: um/go.sum
+      - run: npm ci
+      - name: Build frontend and install hermetic browser
+        run: |
+          npm run build
+          npx playwright install --with-deps chromium
+      - name: Real browser authentication closure
+        working-directory: um
+        shell: bash
+        run: |
+          set -euo pipefail
+          go build -o "$RUNNER_TEMP/um-c-e2e" ./cmd/um-c-e2e
+          "$RUNNER_TEMP/um-c-e2e" -listen 127.0.0.1:18443 -static web/dist > "$RUNNER_TEMP/e2e-harness.log" 2>&1 &
+          HARNESS_PID=$!
+          trap 'kill "$HARNESS_PID" 2>/dev/null || true' EXIT
+          for i in $(seq 1 80); do
+            if grep -q '^E2E_READY ' "$RUNNER_TEMP/e2e-harness.log"; then break; fi
+            sleep 0.5
+          done
+          READY="$(grep '^E2E_READY ' "$RUNNER_TEMP/e2e-harness.log" | head -n 1 | cut -d' ' -f2-)"
+          test -n "$READY"
+          export UM_C_E2E_URL="$(printf '%s' "$READY" | jq -r '.url')"
+          export UM_C_E2E_TOKEN="$(printf '%s' "$READY" | jq -r '.token')"
+          export UM_C_E2E_USER="$(printf '%s' "$READY" | jq -r '.username')"
+          export UM_C_E2E_PASSWORD="$(printf '%s' "$READY" | jq -r '.password')"
+          cd web
+          npx playwright test tests/e2e --reporter=list
+      - name: Upload browser evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: um-c-browser-evidence
+          path: |
+            um/web/test-results
+            ${{ runner.temp }}/e2e-harness.log
+          if-no-files-found: warn
