@@ -45,9 +45,10 @@ local, operator-owned, fail-closed credential boundary:
 - `um-center --admin-auth-file <path>` loads a protected JSON file with
   principals (`id`, `role`, event_ids) and SHA-256 token entries. The file must
   be non-symlink regular, size-bounded, and access-protected (POSIX no
-  group/world bits; Windows DACL allow-list is the file owner, current
-  `um-center` service account, LocalSystem and Builtin Administrators only;
-  arbitrary local/domain accounts and broad groups are rejected).
+  group/world bits and POSIX owner must be the current `um-center` service
+  user; Windows DACL allow-list is the file owner, current `um-center` service
+  account, LocalSystem and Builtin Administrators only; arbitrary local/domain
+  accounts and broad groups are rejected).
 - Requests use `Authorization: Bearer <raw-token>`. The server hashes the token
   and compares in constant time. Raw tokens are never stored in SQLite, logged,
   audited or returned by an API.
