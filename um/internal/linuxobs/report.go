@@ -84,21 +84,26 @@ type clientsInfo struct {
 	Summaries []clientSummary `json:"summaries"`
 }
 
-// snapshotBody is a report-snapshot.v1 body.
+// snapshotBody is a report-snapshot.v1 body. ContractRevision and
+// TrafficObservation are the additive revision-7 fields; both are omitted from
+// the wire body when the center monitor_export source is disabled, so the rev-5
+// body projection stays byte-identical.
 type snapshotBody struct {
-	V            int              `json:"v"`
-	Type         string           `json:"type"`
-	ReportID     string           `json:"report_id"`
-	CollectedAt  int64            `json:"collected_at"`
-	Agent        agentInfo        `json:"agent"`
-	Host         hostInfo         `json:"host"`
-	Availability availabilityInfo `json:"availability"`
-	CounterEpoch string           `json:"counter_epoch"`
-	System       systemValues     `json:"system"`
-	Services     []serviceEntry   `json:"services"`
-	Protocols    []protocolEntry  `json:"protocols"`
-	Traffic      []trafficEntry   `json:"traffic"`
-	Clients      clientsInfo      `json:"clients"`
+	V                  int                     `json:"v"`
+	Type               string                  `json:"type"`
+	ReportID           string                  `json:"report_id"`
+	CollectedAt        int64                   `json:"collected_at"`
+	Agent              agentInfo               `json:"agent"`
+	Host               hostInfo                `json:"host"`
+	Availability       availabilityInfo        `json:"availability"`
+	CounterEpoch       string                  `json:"counter_epoch"`
+	System             systemValues            `json:"system"`
+	Services           []serviceEntry          `json:"services"`
+	Protocols          []protocolEntry         `json:"protocols"`
+	Traffic            []trafficEntry          `json:"traffic"`
+	Clients            clientsInfo             `json:"clients"`
+	ContractRevision   int                     `json:"contract_revision,omitempty"`
+	TrafficObservation *trafficObservationBody `json:"traffic_observation,omitempty"`
 }
 
 // metricSample is one frozen metrics.samples[] element.

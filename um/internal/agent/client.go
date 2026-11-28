@@ -399,7 +399,8 @@ func (c *Client) Config(ctx context.Context, identity Identity, attempt Attempt)
 		resp.NodeID != identity.NodeID || resp.EventID != identity.EventID ||
 		resp.NodeClass != identity.NodeClass || resp.ConfigVersion < 1 ||
 		resp.CadenceSeconds < 30 || resp.CadenceSeconds > 300 ||
-		resp.DeviceSalt == "" || len(resp.Collect) != 6 {
+		resp.DeviceSalt == "" ||
+		(len(resp.Collect) != 6 && len(resp.Collect) != 7) {
 		return Config{}, &TransportError{Cause: "invalid config response"}
 	}
 	tags := make([]InboundTag, 0, len(resp.ExpectedInboundTags))

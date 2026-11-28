@@ -97,6 +97,11 @@ const (
 // (report-*.schema.json: maximum 1000000000000).
 const maxCollectedAt uint64 = 1000000000000
 
+// maxContractRevision is the largest contract_revision the boundary will parse
+// before delegating the legality decision to the Service. It only bounds the
+// schema-selection envelope; it is not the supported-revision set.
+const maxContractRevision uint64 = 1000
+
 // uuidV4Pattern is the frozen lowercase UUIDv4 grammar used by report_id and
 // node_id/event_id fields.
 var uuidV4Pattern = regexp.MustCompile(
@@ -107,17 +112,19 @@ var uuidV4Pattern = regexp.MustCompile(
 // a report body before choosing the per-type schema and calling the Service.
 // Pointers distinguish absent members from JSON zero values.
 type reportEnvelope struct {
-	V           *json.Number `json:"v"`
-	Type        *string      `json:"type"`
-	ReportID    *string      `json:"report_id"`
-	CollectedAt *json.Number `json:"collected_at"`
+	V                *json.Number `json:"v"`
+	Type             *string      `json:"type"`
+	ReportID         *string      `json:"report_id"`
+	CollectedAt      *json.Number `json:"collected_at"`
+	ContractRevision *json.Number `json:"contract_revision"`
 }
 
 // reportEnvelopeInfo is the validated report discriminator.
 type reportEnvelopeInfo struct {
-	Type        string
-	ReportID    string
-	CollectedAt int64
+	Type             string
+	ReportID         string
+	CollectedAt      int64
+	ContractRevision int
 }
 
 // extractReportEnvelope validates the frozen report discriminator:
@@ -154,9 +161,23 @@ func extractReportEnvelope(body []byte) (reportEnvelopeInfo, *APIError) {
 	if err != nil {
 		return reportEnvelopeInfo{}, invalidRequestError()
 	}
+	// contract_revision selects the report schema at the boundary. It is only a
+	// schema selector here: the Service independently enforces that revision 7 is
+	// legal for the authenticated node class and effective source configuration.
+	revision := 0
+	if envelope.ContractRevision != nil {
+		parsed, err := wire.ParseCanonicalDecimal(
+			"contract_revision", envelope.ContractRevision.String(), 1, maxContractRevision,
+		)
+		if err != nil {
+			return reportEnvelopeInfo{}, invalidRequestError()
+		}
+		revision = int(parsed)
+	}
 	return reportEnvelopeInfo{
-		Type:        reportType,
-		ReportID:    *envelope.ReportID,
-		CollectedAt: int64(collectedAt),
+		Type:             reportType,
+		ReportID:         *envelope.ReportID,
+		CollectedAt:      int64(collectedAt),
+		ContractRevision: revision,
 	}, nil
 }

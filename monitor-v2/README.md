@@ -887,3 +887,28 @@ record-category 按钮位于固定高度滚动区域上方；从长 sample 表�
 ### 0.8.1 历史发布清单（原 `docs/incident-reading-ux.md`）
 
 滚动位移已在真实浏览器复现并验证有界布局；完整判断、caveat、raw 字段和来源失败语义保留；UI 行为检查与变更路径已复核。CI exact candidate 与 merged main、existing-server 更新健康回执为发布时跟踪项；服务器侧 0.8.1 已于 2026-10-08 部署（见 `docs/monitor-v2-host-evidence.md`）。
+
+
+## UM-LT：受限只读流量导出（OPTIONAL，默认关闭）
+
+生产 web 模式（`webapp.py serve` -> `Collector` -> `SnapshotBroker`）可选择性向本机
+Linux Go Agent 发布一个**有界、脱敏、原子替换**的 JSON 流量导出文件；它不是 HTTP API，
+也从不向 Agent 提供 sing-box `service.api` secret 或原始 Monitor 状态。默认完全关闭：
+不带任何参数时没有 writer、线程、队列或文件读写，dashboard/collector/broker 行为不变。
+
+启用（仅本地 operator，绝对路径；重启生效）：
+
+    webapp.py serve ... \
+      --traffic-export-file /run/singbox-monitor-export/traffic.json \
+      --traffic-export-inbound vless-in:reality \
+      --traffic-export-inbound hy2-in:hysteria2
+
+只导出 operator 配置的 inbound（TAG:KIND，最多 8 个，kind 为 reality/hysteria2/other）；
+文件字段为 schema_version 1 的严格 allow-list（仅聚合字节下界/观测速率/活跃连接数），
+无 IP、UUID、连接 id、用户、配置或 secret；超 2^53-1 的计数发布为 null 而不做浮点舍入；
+stale 时计数可保留但 quality=partial、速率 null；temp 同目录 + fsync + rename 原子发布，
+0640，64 KiB 上限；启动时先删除上一进程遗留文件并生成新的 32 位 hex source_epoch。
+部署/权限（专用 `sboxmon-export` 组、setgid 目录、unit 的
+`ReadWritePaths=-/run/singbox-monitor-export`）与 Agent 消费契约见
+[受限流量导出说明](../docs/monitor-v2-traffic-export.md)，
+测试：`tests/test-monitor-v2-traffic-export.py`（现有 E1/E2 回归保持全绿）。

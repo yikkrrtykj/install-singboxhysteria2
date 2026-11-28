@@ -55,6 +55,14 @@ func invalidArgument(field, detail string) error {
 	return &InvalidArgumentError{Field: field, Detail: detail}
 }
 
+// IsInvalidArgument reports whether err is a caller-input validation failure
+// (as opposed to a storage/availability failure). Query/HTTP boundaries map it
+// to a bounded 400 without echoing field values.
+func IsInvalidArgument(err error) bool {
+	var invalid *InvalidArgumentError
+	return errors.As(err, &invalid)
+}
+
 // TransportConflictError is returned by ApplyTransport for a non-accepted,
 // non-duplicate transport outcome. The result is also returned so the HTTP
 // layer can map the outcome onto its frozen status/error code. No state was

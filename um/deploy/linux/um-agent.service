@@ -41,6 +41,35 @@ ExecStart=/usr/local/libexec/um-agent run
 #   UM_AGENT_STATE_DIR, UM_AGENT_CENTER_URL, UM_AGENT_NODE_CLASS
 # from the environment file written by install-agent.sh. If the final code slice
 # changes the flags, update /etc/um-agent/agent.env / this ExecStart together.
+#
+# Optional revision-7 read-only traffic export (DISABLED by default):
+#   UM_AGENT_MONITOR_EXPORT_FILE=/run/singbox-monitor-export/traffic.json
+#   UM_AGENT_MONITOR_EXPORT_OWNER_UID=<monitor uid>
+#   UM_AGENT_MONITOR_EXPORT_GROUP_GID=<sboxmon-export gid>
+#   UM_AGENT_MONITOR_EXPORT_MODE=0640
+# The owner/group/mode variables are the frozen rev-7 POSIX permission check.
+# When the export is enabled the operator MUST set all four; leaving the
+# owner/group/mode values unset keeps the backward-compatible no-check mode used
+# by non-standard deployments and is recorded as a documented integration
+# follow-up, not a waiver of the monitor-side permission model.
+# The value is an operator-local FIXED ABSOLUTE PATH only; it is never accepted
+# from center config, a URL or a command. The non-root umagent service user must
+# be able to READ that one file; the monitor-v2 deployment notes create a
+# dedicated sboxmon-export group for exactly that read grant (an OS group read is
+# sufficient; no extra capability, credential or socket is needed). The agent
+# rejects symlinks/non-regular files/oversized files and never writes the file.
+# When unset, nothing is read even if the center enables collect.monitor_export:
+# the snapshot then carries an honest unavailable traffic observation. This is
+# NOT a sing-box service.api credential path; service.api stays disabled.
+#
+# OD-LT-14 agent-version gate (operator note): the center only sends the optional
+# collect.monitor_export switch to an agent that has reported agent.version >=
+# 1.1.0 in an authenticated snapshot (agent releases before 1.1.0 have a strict
+# six-key collect decoder). Enabling the center source is safe at any time: the
+# setting is stored, old agents keep receiving the frozen six-key config, and the
+# new agent picks the switch up on the config pull after its first authenticated
+# snapshot report. Keep the agent package version (cmd/um-agent `version`) and the
+# center minimum in sync when changing this capability.
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=30s

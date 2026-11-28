@@ -36,6 +36,10 @@
     {
       "name": "health",
       "description": "Minimal anonymous Web health"
+    },
+    {
+      "name": "traffic",
+      "description": "Bounded read-only normalized traffic observation queries (observation_lower_bound data; observed_at is the traffic clock)"
     }
   ],
   "paths": {
@@ -824,6 +828,227 @@
           }
         }
       }
+    },
+    "/web/api/traffic/latest": {
+      "get": {
+        "tags": [
+          "traffic"
+        ],
+        "summary": "Latest normalized per-inbound lower-bound observation per series",
+        "description": "GET-only. Requires Cloudflare Access plus an active local UM-C session. viewer/event_admin see only assigned events; platform_admin is global. Selects the maximum observed_at per (event_id,node_id,inbound_tag,kind), never received_at, so a late/offline replay is still ordered by observation time. No anonymous or local bearer bypass exists.",
+        "parameters": [
+          {
+            "name": "event_id",
+            "in": "query",
+            "required": false,
+            "description": "Event scope filter (UUIDv4). Non-platform roles may only request their assigned events.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "node_id",
+            "in": "query",
+            "required": false,
+            "description": "Node filter (UUIDv4).",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "inbound_tag",
+            "in": "query",
+            "required": false,
+            "description": "Inbound tag filter.",
+            "schema": {
+              "type": "string",
+              "maxLength": 64
+            }
+          },
+          {
+            "name": "kind",
+            "in": "query",
+            "required": false,
+            "description": "Inbound kind filter.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "reality",
+                "hysteria2",
+                "other"
+              ]
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "required": false,
+            "description": "Optional observed_at lower bound (Unix seconds).",
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "required": false,
+            "description": "Optional observed_at upper bound (Unix seconds).",
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "Maximum rows (1..2000, default 500)",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 2000
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Bounded normalized traffic rows; latest returns one row per (event,node,inbound,kind) series by maximum observed_at; history is ordered by observed_at with gap_before_seconds/truncated metadata.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TrafficResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequestError"
+          },
+          "401": {
+            "$ref": "#/components/responses/AccessError"
+          },
+          "403": {
+            "$ref": "#/components/responses/ForbiddenError"
+          }
+        }
+      }
+    },
+    "/web/api/traffic/history": {
+      "get": {
+        "tags": [
+          "traffic"
+        ],
+        "summary": "Bounded observed_at-ordered traffic history",
+        "description": "GET-only. Requires Cloudflare Access plus an active local UM-C session with event scope. from and to are required; the range is capped at 30 days and rows at 2000. Ordering uses observed_at, never received_at. gap_before_seconds is present only inside a series and epoch; a monitor source_epoch change is a boundary, not a fabricated gap.",
+        "parameters": [
+          {
+            "name": "event_id",
+            "in": "query",
+            "required": false,
+            "description": "Event scope filter (UUIDv4). Non-platform roles may only request their assigned events.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "node_id",
+            "in": "query",
+            "required": false,
+            "description": "Node filter (UUIDv4).",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "inbound_tag",
+            "in": "query",
+            "required": false,
+            "description": "Inbound tag filter.",
+            "schema": {
+              "type": "string",
+              "maxLength": 64
+            }
+          },
+          {
+            "name": "kind",
+            "in": "query",
+            "required": false,
+            "description": "Inbound kind filter.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "reality",
+                "hysteria2",
+                "other"
+              ]
+            }
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "required": true,
+            "description": "Required observed_at lower bound (Unix seconds).",
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "required": true,
+            "description": "Required observed_at upper bound (Unix seconds).",
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "step_seconds",
+            "in": "query",
+            "required": false,
+            "description": "Optional downsample step (1..3600); the newest row per series/bucket is returned.",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 3600
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "Maximum rows (1..2000, default 500)",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 2000
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Bounded normalized traffic rows; latest returns one row per (event,node,inbound,kind) series by maximum observed_at; history is ordered by observed_at with gap_before_seconds/truncated metadata.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TrafficResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequestError"
+          },
+          "401": {
+            "$ref": "#/components/responses/AccessError"
+          },
+          "403": {
+            "$ref": "#/components/responses/ForbiddenError"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -1237,6 +1462,264 @@
           "initial_password": {
             "type": "string",
             "description": "One-time plaintext generated initial password; not retrievable later."
+          }
+        }
+      },
+      "TrafficPoint": {
+        "type": "object",
+        "required": [
+          "event_id",
+          "node_id",
+          "inbound_tag",
+          "kind",
+          "observed_at",
+          "collected_at",
+          "availability",
+          "freshness",
+          "quality",
+          "source_epoch",
+          "sequence",
+          "counter_scope",
+          "exactness",
+          "active_connections",
+          "uplink_observed_lower_bound_bytes",
+          "downlink_observed_lower_bound_bytes",
+          "uplink_observed_rate_bps",
+          "downlink_observed_rate_bps",
+          "gap_before_seconds"
+        ],
+        "properties": {
+          "event_id": {
+            "type": "string"
+          },
+          "node_id": {
+            "type": "string"
+          },
+          "inbound_tag": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "reality",
+              "hysteria2",
+              "other"
+            ]
+          },
+          "observed_at": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Traffic clock (monitor observation epoch); never received_at."
+          },
+          "collected_at": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "availability": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "partial",
+              "unavailable"
+            ]
+          },
+          "freshness": {
+            "type": "string",
+            "enum": [
+              "fresh",
+              "stale",
+              "unavailable"
+            ]
+          },
+          "quality": {
+            "type": "string",
+            "enum": [
+              "lower_bound",
+              "partial",
+              "unavailable"
+            ]
+          },
+          "source_epoch": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{32}$",
+            "description": "Independent monitor observation epoch."
+          },
+          "sequence": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "counter_scope": {
+            "type": "string",
+            "enum": [
+              "observation_epoch"
+            ]
+          },
+          "exactness": {
+            "type": "string",
+            "enum": [
+              "lower_bound"
+            ]
+          },
+          "active_connections": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 1000000
+          },
+          "uplink_observed_lower_bound_bytes": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "nullable": true
+          },
+          "downlink_observed_lower_bound_bytes": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "nullable": true
+          },
+          "uplink_observed_rate_bps": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1000000000000,
+            "nullable": true
+          },
+          "downlink_observed_rate_bps": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1000000000000,
+            "nullable": true
+          },
+          "gap_before_seconds": {
+            "type": "integer",
+            "minimum": 0,
+            "nullable": true,
+            "description": "History only: observed_at gap from the previous row of the same series and epoch; null for series start/epoch change/latest."
+          }
+        }
+      },
+      "TrafficResponse": {
+        "type": "object",
+        "required": [
+          "points",
+          "truncated",
+          "limit",
+          "from",
+          "to"
+        ],
+        "properties": {
+          "points": {
+            "type": "array",
+            "maxItems": 2000,
+            "items": {
+              "$ref": "#/components/schemas/TrafficPoint"
+            }
+          },
+          "observations": {
+            "type": "array",
+            "maxItems": 2000,
+            "items": {
+              "$ref": "#/components/schemas/TrafficObservationState"
+            },
+            "description": "Latest report-level observation headers, including honest unavailable sentinels with no per-inbound rows (latest endpoint only)."
+          },
+          "truncated": {
+            "type": "boolean",
+            "description": "True when more rows existed within the bounded query than limit."
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 2000
+          },
+          "from": {
+            "type": "integer",
+            "minimum": 0,
+            "nullable": true
+          },
+          "to": {
+            "type": "integer",
+            "minimum": 0,
+            "nullable": true
+          }
+        }
+      },
+      "TrafficObservationState": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "event_id",
+          "node_id",
+          "source_epoch",
+          "sequence",
+          "observed_at",
+          "collected_at",
+          "availability",
+          "freshness",
+          "active_connections",
+          "rate_window_seconds",
+          "counter_scope",
+          "exactness"
+        ],
+        "properties": {
+          "event_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "node_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "source_epoch": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{32}$"
+          },
+          "sequence": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "observed_at": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 1000000000000
+          },
+          "collected_at": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 1000000000000
+          },
+          "availability": {
+            "enum": [
+              "ok",
+              "partial",
+              "unavailable"
+            ]
+          },
+          "freshness": {
+            "enum": [
+              "fresh",
+              "stale",
+              "unavailable"
+            ]
+          },
+          "active_connections": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 1000000,
+            "nullable": true
+          },
+          "rate_window_seconds": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "maximum": 3600,
+            "nullable": true
+          },
+          "counter_scope": {
+            "const": "observation_epoch"
+          },
+          "exactness": {
+            "const": "lower_bound"
           }
         }
       }

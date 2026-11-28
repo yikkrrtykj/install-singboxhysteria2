@@ -3,9 +3,11 @@ package center
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"net"
 	"net/http"
 
+	"github.com/yikkrrtykj/install-singboxhysteria2/um/internal/contract"
 	"github.com/yikkrrtykj/install-singboxhysteria2/um/internal/schema"
 	"github.com/yikkrrtykj/install-singboxhysteria2/um/internal/wire"
 )
@@ -162,6 +164,16 @@ func (s *Server) handleReport(ctx context.Context, fields wire.Fields, signature
 		return ingestResult{}, apiErr
 	}
 	schemaName := schemaForReportType(envelope.Type)
+	// Revision-7 snapshots select the rev-7 schema at the boundary; a deployment
+	// without the additive rev-7 contract fails closed rather than validating the
+	// rev-7 body against the rev-5 schema (which would reject it for the new
+	// members with a misleading error).
+	if envelope.Type == reportTypeSnapshot && envelope.ContractRevision == contract.ContractRevision7 {
+		schemaName = contract.SnapshotRev7SchemaFile
+	}
+	if !s.schemas.Has(schemaName) {
+		return ingestResult{}, invalidRequestError()
+	}
 	if err := s.schemas.Validate(schemaName, body); err != nil {
 		return ingestResult{}, invalidRequestError()
 	}
@@ -258,9 +270,26 @@ func (s *Server) handleConfig(ctx context.Context, fields wire.Fields, signature
 	}
 	return ingestResult{
 		body:       result.Body,
-		schemaName: schemaAgentConfig,
+		schemaName: s.agentConfigSchemaForBody(result.Body),
 		maxBody:    DefaultMaxConfigResponse,
 	}, nil
+}
+
+// agentConfigSchemaForBody selects the schema the boundary revalidates a config
+// response against. The revision-7 response is identified by the optional
+// collect.monitor_export member; a body carrying it is validated only against the
+// rev-7 schema (which must be loaded and is selected by the Service only then).
+// This is a response-shape check, not an authorization decision.
+func (s *Server) agentConfigSchemaForBody(body []byte) string {
+	var doc struct {
+		Collect map[string]json.RawMessage `json:"collect"`
+	}
+	if err := json.Unmarshal(body, &doc); err == nil {
+		if _, ok := doc.Collect["monitor_export"]; ok && s.schemas.Has(contract.AgentConfigRev7SchemaFile) {
+			return contract.AgentConfigRev7SchemaFile
+		}
+	}
+	return schemaAgentConfig
 }
 
 // schemaForReportType maps the validated report discriminator to its frozen

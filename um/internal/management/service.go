@@ -626,11 +626,12 @@ func (s *Service) UpdateConfig(ctx context.Context, p Principal, eventID, nodeID
 
 // validateAdminSources enforces B4's conservative source controls: the
 // unproven Linux singbox_api source and the Windows R1 controller source may
-// not be enabled through the center config at all. The existing store/class
-// validator remains the second line of defense.
+// not be enabled through the center config at all. The optional revision-7
+// Linux monitor_export read-only switch may be enabled for linux_vps only; the
+// store/class validator is the second line of defense.
 func validateAdminSources(nodeClass string, sources map[string]bool) error {
 	allowed := map[string]bool{"system": true, "services": true, "singbox_api": true,
-		"mihomo_api": true, "terminal": true, "events": true}
+		"mihomo_api": true, "terminal": true, "events": true, "monitor_export": true}
 	for k := range sources {
 		if !allowed[k] {
 			return &InvalidError{Field: "sources"}
@@ -643,7 +644,7 @@ func validateAdminSources(nodeClass string, sources map[string]bool) error {
 		return &InvalidError{Field: "sources", Detail: "mihomo_api/R1 is local-bundle-only and cannot be enabled by center config"}
 	}
 	if nodeClass == store.NodeClassWindowsTerminal {
-		if sources["services"] || sources["singbox_api"] {
+		if sources["services"] || sources["singbox_api"] || sources["monitor_export"] {
 			return &InvalidError{Field: "sources"}
 		}
 	} else if sources["terminal"] {
@@ -849,8 +850,11 @@ func (s *Service) Capacity(ctx context.Context, p Principal) (CapacityView, erro
 		"boot_registry": base.BootRegistry, "report_dedupe": base.ReportDedupe,
 		"nonce_dedupe": base.NonceDedupe, "active_events": ext.ActiveEvents,
 		"archived_events": ext.ArchivedEvents, "archived_retained": ext.ArchivedRetained,
-		"events_catalog": ext.EventsCatalog,
-		"admin_audit":    ext.AdminAuditRows,
+		"events_catalog":       ext.EventsCatalog,
+		"admin_audit":          ext.AdminAuditRows,
+		"traffic_reports":      ext.TrafficReports,
+		"traffic_observations": ext.TrafficObservations,
+		"traffic_bytes":        ext.TrafficBytes,
 	}
 	quotas := map[string]int64{
 		"max_active_nodes_all_events":   store.MaxActiveNodesAllEvents,

@@ -33,3 +33,22 @@ func TestSourceAuthorizationEnvIsNotAProductionGate(t *testing.T) {
 		t.Fatalf("environment values authorized service.api: %#v", linuxCol)
 	}
 }
+
+func TestMonitorExportFileFlagIsOperatorLocalOnly(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "traffic.json")
+	col, err := platformCollector(commonFlags{monitorExportFile: path})
+	if err != nil {
+		t.Fatalf("valid fixed absolute export path rejected: %v", err)
+	}
+	linuxCol, ok := col.(*linuxobs.Collector)
+	if !ok || linuxCol.MonitorExportFile != path {
+		t.Fatalf("monitor export path not wired: %#v", col)
+	}
+	// A relative/traversal path is a startup configuration error, never silently
+	// ignored or resolved against the working directory.
+	for _, bad := range []string{"traffic.json", "sub/../traffic.json", "./traffic.json"} {
+		if _, err := platformCollector(commonFlags{monitorExportFile: bad}); err == nil {
+			t.Fatalf("invalid monitor export path %q accepted", bad)
+		}
+	}
+}

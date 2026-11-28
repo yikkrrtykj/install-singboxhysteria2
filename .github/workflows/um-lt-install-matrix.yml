@@ -1,0 +1,66 @@
+name: UM-LT installation matrix
+
+# Actual container install/upgrade/rollback/uninstall regression on the two
+# owner-required distributions. This is not a production VPS and does not use
+# systemd; the monitor packaging suite runs its REAL deploy code against a
+# temporary root with a recording systemctl mock, exactly as it does in the
+# repo's monitor-packaging lane. Both jobs must pass for the installation
+# matrix evidence row; no result is inferred from the other distribution.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/um-linux-traffic-export
+  pull_request:
+    paths:
+      - "monitor-v2/deploy/**"
+      - "monitor-v2/**"
+      - "tests/test-monitor-packaging.sh"
+      - ".github/workflows/um-lt-install-matrix.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  monitor-packaging:
+    name: monitor packaging on ${{ matrix.distro }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: ubuntu-24.04
+            image: ubuntu:24.04
+          - distro: debian-12
+            image: debian:12
+    container:
+      image: ${{ matrix.image }}
+      options: --user root
+    steps:
+      - name: Install test prerequisites
+        shell: bash
+        run: |
+          set -euxo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            bash ca-certificates coreutils findutils git grep jq python3 sed tar \
+            acl iproute2 procps sudo systemd
+      - name: Check out exact commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Run real monitor install/upgrade/rollback/uninstall test
+        shell: bash
+        env:
+          GIT_CONFIG_NOSYSTEM: "1"
+        run: |
+          set -euxo pipefail
+          bash tests/test-monitor-packaging.sh
+      - name: Record distribution
+        shell: bash
+        run: |
+          set -euxo pipefail
+          . /etc/os-release
+          printf 'distribution=%s version=%s id=%s\n' "$PRETTY_NAME" "$VERSION_ID" "$ID"

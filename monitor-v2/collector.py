@@ -84,6 +84,24 @@ STATUS_ACTIVE = "ACTIVE"
 STATUS_RECENT = "RECENT ACTIVITY"
 STATUS_IDLE = "IDLE"
 
+# ---------------------------------------------------------------------------
+# OPTIONAL restricted traffic export (UM-LT): safe-integer contract
+# ---------------------------------------------------------------------------
+# Byte counters are carried as EXACT Python integers internally (the official
+# protobuf fields are int64/uint64). The dashboard snapshot keeps its historic
+# float formatting at its projection edge, while the restricted export
+# projection below refuses to publish a counter beyond this bound instead of
+# silently rounding it through float64 (2**53 - 1 is the largest exactly
+# representable IEEE-754 integer). The export is DEFAULT-DISABLED: nothing in
+# this module writes a file, starts a thread, or opens a socket for it.
+EXPORT_SAFE_INT_MAX = 9007199254740991  # 2**53 - 1
+# Bounds mirrored by the rev-7 Linux-agent consumer of the export: a rate
+# window must be a positive number of seconds, observed rates are bounded, and
+# values outside those bounds are published as null (unavailable), never
+# clamped/fabricated.
+EXPORT_MAX_RATE_WINDOW_SECONDS = 3600.0
+EXPORT_MAX_RATE_BPS = 1e12
+
 
 def _iso(timestamp):
     if timestamp is None:
@@ -102,6 +120,76 @@ def _to_seconds(timestamp):
         return 0
     value = float(timestamp)
     return value / 1000.0 if value > 1e11 else value
+
+
+def _as_bytes(value):
+    """Exact integer byte counter.
+
+    The upstream protobuf traffic fields are integer int64/uint64, so the
+    accumulator keeps them as exact Python integers (no float64 round trip).
+    Defensive conversion: a malformed/non-numeric/NaN/infinite value counts as
+    zero rather than corrupting the accumulator; an integral float (only ever
+    seen in synthetic fixtures/tests) becomes that exact integer.
+    """
+    if value is None:
+        return 0
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if value != value or value in (float("inf"), float("-inf")):
+            return 0
+        return int(value)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _safe_export_counter(value):
+    """Exact safe integer for the export, or None (unavailable) -- never a clamp.
+
+    Out-of-range/non-integer values are NOT rounded or clamped: the export
+    marks that counter unavailable (null) and the row quality "partial".
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if value < 0 or value > EXPORT_SAFE_INT_MAX:
+        return None
+    return value
+
+
+def _safe_export_rate(value):
+    """Finite bounded non-negative float for the export, or None (unavailable).
+
+    Rates are OBSERVED estimates, not byte counters: a non-finite or
+    out-of-contract-bound value is withheld (null) rather than clamped, so the
+    agent never renders a fabricated rate.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if number != number or number in (float("inf"), float("-inf")):
+        return None
+    if number < 0 or number > EXPORT_MAX_RATE_BPS:
+        return None
+    return round(number, 3)
+
+
+def _export_rate_window(interval):
+    """The export's rate window in seconds, or None when it has no valid window."""
+    try:
+        window = float(interval)
+    except (TypeError, ValueError):
+        return None
+    if window != window or window in (float("inf"), float("-inf")):
+        return None
+    if window <= 0 or window > EXPORT_MAX_RATE_WINDOW_SECONDS:
+        return None
+    return window
 
 
 def redact(text, secrets):
@@ -130,8 +218,12 @@ def _new_connection(fields, now):
         "closed_at": 0,
         "uplink_rate": 0.0,
         "downlink_rate": 0.0,
-        "uplink_total": float(fields.get("uplink_total", 0)),
-        "downlink_total": float(fields.get("downlink_total", 0)),
+        # Internal-only marker (never projected into any snapshot): a rate is
+        # "observed" only after an UPDATE sample. The restricted export uses
+        # this to publish null (unavailable) instead of a fabricated 0 rate.
+        "rate_observed": False,
+        "uplink_total": _as_bytes(fields.get("uplink_total", 0)),
+        "downlink_total": _as_bytes(fields.get("downlink_total", 0)),
         "last_seen": now,
     }
 
@@ -160,8 +252,11 @@ def _connection_row(conn, state):
         "closed_at": _iso_or_none(conn.get("closed_at")),
         "uplink_rate": round(conn.get("uplink_rate", 0.0), 3),
         "downlink_rate": round(conn.get("downlink_rate", 0.0), 3),
-        "uplink_total": round(conn.get("uplink_total", 0.0), 3),
-        "downlink_total": round(conn.get("downlink_total", 0.0), 3),
+        # Snapshot formatting stays the historic float projection; the exact
+        # integer counters live in the tracker (and only the OPTIONAL
+        # restricted export publishes them as integers).
+        "uplink_total": round(float(conn.get("uplink_total", 0)), 3),
+        "downlink_total": round(float(conn.get("downlink_total", 0)), 3),
         "state": state,
     }
 
@@ -194,14 +289,14 @@ class Tracker:
         self.abandoned_on_reset = 0  # active ids dropped by reset without CLOSED
 
     def _bank(self, key, uplink, downlink):
-        slot = self.finalized.setdefault(key, {"uplink": 0.0, "downlink": 0.0})
-        slot["uplink"] += uplink
-        slot["downlink"] += downlink
+        slot = self.finalized.setdefault(key, {"uplink": 0, "downlink": 0})
+        slot["uplink"] += int(uplink)
+        slot["downlink"] += int(downlink)
 
     def _unbank(self, key, uplink, downlink):
-        slot = self.finalized.setdefault(key, {"uplink": 0.0, "downlink": 0.0})
-        slot["uplink"] = max(0.0, slot["uplink"] - uplink)
-        slot["downlink"] = max(0.0, slot["downlink"] - downlink)
+        slot = self.finalized.setdefault(key, {"uplink": 0, "downlink": 0})
+        slot["uplink"] = max(0, slot["uplink"] - int(uplink))
+        slot["downlink"] = max(0, slot["downlink"] - int(downlink))
 
     def _record_banked(self, cid, user, inbound, uplink, downlink, state):
         """LRU-register a banked lifecycle (closed or abandoned) for replay guard."""
@@ -317,9 +412,9 @@ class Tracker:
                 return
             # authoritative totals: same lifecycle, values replaced not added
             existing["uplink_total"] = max(existing["uplink_total"],
-                                           float(fields.get("uplink_total", 0)))
+                                           _as_bytes(fields.get("uplink_total", 0)))
             existing["downlink_total"] = max(existing["downlink_total"],
-                                             float(fields.get("downlink_total", 0)))
+                                             _as_bytes(fields.get("downlink_total", 0)))
             existing["last_seen"] = now
             return
         display = self.closed.get(cid)
@@ -394,9 +489,9 @@ class Tracker:
             # the active lifecycle received its authoritative closure
             conn = self.active.pop(cid)
             conn["uplink_total"] = max(conn["uplink_total"],
-                                       float(fields.get("uplink_total", 0)))
+                                       _as_bytes(fields.get("uplink_total", 0)))
             conn["downlink_total"] = max(conn["downlink_total"],
-                                         float(fields.get("downlink_total", 0)))
+                                         _as_bytes(fields.get("downlink_total", 0)))
             self._finalize(conn, now, closed_at=closed_at)
             return
         conn = _new_connection({"id": cid, "user": user, "inbound": inbound,
@@ -442,21 +537,24 @@ class Tracker:
             if fields and not self._identity_conflict(conn, fields, now):
                 return  # identity drift: traffic must not migrate
             elapsed = max(now - conn["last_seen"], 1e-6)
-            uplink_delta = float(event.get("uplink_delta", 0))
-            downlink_delta = float(event.get("downlink_delta", 0))
+            uplink_delta = _as_bytes(event.get("uplink_delta", 0))
+            downlink_delta = _as_bytes(event.get("downlink_delta", 0))
             if "uplink_total" in fields or "downlink_total" in fields:
                 # authoritative totals inside the UPDATE: replace, never add
                 if "uplink_total" in fields:
                     conn["uplink_total"] = max(conn["uplink_total"],
-                                               float(fields.get("uplink_total", 0)))
+                                               _as_bytes(fields.get("uplink_total", 0)))
                 if "downlink_total" in fields:
                     conn["downlink_total"] = max(conn["downlink_total"],
-                                                 float(fields.get("downlink_total", 0)))
+                                                 _as_bytes(fields.get("downlink_total", 0)))
             else:
                 conn["uplink_total"] += uplink_delta
                 conn["downlink_total"] += downlink_delta
             conn["uplink_rate"] = uplink_delta / elapsed
             conn["downlink_rate"] = downlink_delta / elapsed
+            # A rate SAMPLE exists only after an UPDATE ticker event; the
+            # restricted export must not publish a fabricated 0 before it.
+            conn["rate_observed"] = True
             conn["last_seen"] = now
             return
 
@@ -471,10 +569,10 @@ class Tracker:
                 if fields and self._identity_conflict(conn, fields, now):
                     if "uplink_total" in fields:
                         conn["uplink_total"] = max(conn["uplink_total"],
-                                                   float(fields.get("uplink_total", 0)))
+                                                   _as_bytes(fields.get("uplink_total", 0)))
                     if "downlink_total" in fields:
                         conn["downlink_total"] = max(conn["downlink_total"],
-                                                     float(fields.get("downlink_total", 0)))
+                                                     _as_bytes(fields.get("downlink_total", 0)))
                 closed_at = event.get("closed_at") or fields.get("closed_at")
                 self._finalize(conn, now, closed_at=closed_at)
                 return
@@ -541,20 +639,24 @@ class Tracker:
             for inbound in proto_names:
                 proto_active = [c for c in active if c["inbound"] == inbound]
                 banked = self.finalized.get((name, inbound),
-                                            {"uplink": 0.0, "downlink": 0.0})
+                                            {"uplink": 0, "downlink": 0})
                 protocols[inbound] = {
                     "device_name": name,
                     "inbound": inbound,
                     "active_connections": len(proto_active),
                     "uplink_rate": round(sum((c["uplink_rate"] for c in proto_active), 0.0), 3),
                     "downlink_rate": round(sum((c["downlink_rate"] for c in proto_active), 0.0), 3),
-                    "uplink_total": round(sum((c["uplink_total"] for c in proto_active), 0.0)
-                                          + banked["uplink"], 3),
-                    "downlink_total": round(sum((c["downlink_total"] for c in proto_active), 0.0)
-                                            + banked["downlink"], 3),
+                    # Snapshot formatting stays the historic float projection:
+                    # the exact integer counters are rounded to float only HERE.
+                    "uplink_total": round(float(sum(
+                        (c["uplink_total"] for c in proto_active), 0)
+                        + banked["uplink"]), 3),
+                    "downlink_total": round(float(sum(
+                        (c["downlink_total"] for c in proto_active), 0)
+                        + banked["downlink"]), 3),
                 }
             banked_all = [self.finalized.get((name, inbound),
-                                             {"uplink": 0.0, "downlink": 0.0})
+                                             {"uplink": 0, "downlink": 0})
                           for inbound in proto_names]
             last_seen_list = [c["last_seen"] for c in active + closed]
             if active:
@@ -573,10 +675,12 @@ class Tracker:
                 "active_connections": len(active),
                 "uplink_rate": round(sum((c["uplink_rate"] for c in active), 0.0), 3),
                 "downlink_rate": round(sum((c["downlink_rate"] for c in active), 0.0), 3),
-                "uplink_total": round(sum((c["uplink_total"] for c in active), 0.0)
-                                      + sum((b["uplink"] for b in banked_all), 0.0), 3),
-                "downlink_total": round(sum((c["downlink_total"] for c in active), 0.0)
-                                        + sum((b["downlink"] for b in banked_all), 0.0), 3),
+                "uplink_total": round(float(
+                    sum((c["uplink_total"] for c in active), 0)
+                    + sum((b["uplink"] for b in banked_all), 0)), 3),
+                "downlink_total": round(float(
+                    sum((c["downlink_total"] for c in active), 0)
+                    + sum((b["downlink"] for b in banked_all), 0)), 3),
                 "recent_sources": sorted(
                     {c["source"] for c in active + closed if c["source"]}
                 )[:RECENT_SOURCES_MAX],
@@ -584,8 +688,8 @@ class Tracker:
                 "recent_connections": [
                     {"id": c["id"], "inbound": c["inbound"], "source": c["source"],
                      "destination": c["destination"],
-                     "uplink_total": round(c["uplink_total"], 3),
-                     "downlink_total": round(c["downlink_total"], 3),
+                     "uplink_total": round(float(c["uplink_total"]), 3),
+                     "downlink_total": round(float(c["downlink_total"]), 3),
                      "closed_at": _iso(c["closed_at"])}
                     for c in recent_conns
                 ],
@@ -625,6 +729,127 @@ class Tracker:
             "connections": connection_rows,
             "devices": devices,
         }
+
+    # -- OPTIONAL restricted traffic export projection (UM-LT) -----------------
+
+    def export_traffic(self, now, inbounds, monitor_stale=False,
+                       monitor_last_success_at=None):
+        """Sanitized exact projection for the local restricted traffic export.
+
+        This is the ONLY bridge from Monitor state to the export file. It is a
+        pure projection of the SAME single accumulator the dashboard uses:
+        no second collector, no duplicate accounting, no mutation. It reads no
+        connection ids, users, sources, destinations, network/type fields or
+        secrets -- the output contains aggregate per-configured-inbound
+        counters/rates/connection counts only.
+
+        ``inbounds`` is an ordered sequence of operator-configured
+        ``(tag, kind)`` pairs; ONLY those tags can ever appear (a tag that never
+        produced traffic is still listed, with null counters and quality
+        "unavailable"). Byte counters are exact integers; a counter outside the
+        IEEE-754 safe-integer bound is published as null ("partial"), never
+        rounded or clamped. Stale monitors keep their counters but every
+        observed row degrades to quality "partial" and rates become null; a
+        configured tag with NO observation at all is omitted while stale (a
+        stale monitor cannot vouch for an "unavailable" reading either, and the
+        consumer fills missing expected tags as unavailable).
+
+        The returned dict deliberately contains only the traffic/documented
+        facts; the export writer adds schema identity, per-process source
+        epoch, sequence and generated_at.
+        """
+        observed_at = int(now)
+        active_by_inbound = {}
+        for conn in self.active.values():
+            active_by_inbound.setdefault(conn["inbound"], []).append(conn)
+        banked_by_inbound = {}
+        for (_user, inbound), slot in self.finalized.items():
+            banked = banked_by_inbound.setdefault(
+                inbound, {"uplink": 0, "downlink": 0})
+            banked["uplink"] += slot["uplink"]
+            banked["downlink"] += slot["downlink"]
+
+        rows = []
+        total_active = 0
+        rate_window = None
+        stale = bool(monitor_stale)
+        rate_window_value = _export_rate_window(getattr(self, "interval", None))
+        for spec in inbounds:
+            tag, kind = spec
+            connections = active_by_inbound.get(tag, [])
+            banked = banked_by_inbound.get(tag)
+            known = bool(connections) or banked is not None
+            active_count = len(connections)
+            uplink = banked["uplink"] if banked is not None else 0
+            downlink = banked["downlink"] if banked is not None else 0
+            for conn in connections:
+                uplink += conn["uplink_total"]
+                downlink += conn["downlink_total"]
+            uplink_bytes = _safe_export_counter(uplink) if known else None
+            downlink_bytes = _safe_export_counter(downlink) if known else None
+
+            rate_observed = any(conn.get("rate_observed") for conn in connections)
+            uplink_rate = None
+            downlink_rate = None
+            if not stale and rate_observed and rate_window_value is not None:
+                uplink_rate = _safe_export_rate(
+                    sum((conn["uplink_rate"] for conn in connections), 0.0))
+                downlink_rate = _safe_export_rate(
+                    sum((conn["downlink_rate"] for conn in connections), 0.0))
+                if uplink_rate is not None or downlink_rate is not None:
+                    rate_window = rate_window_value
+
+            if not known:
+                quality = "unavailable"
+            elif stale or uplink_bytes is None or downlink_bytes is None:
+                quality = "partial"
+            else:
+                quality = "lower_bound"
+            if quality == "partial" and uplink_bytes is None \
+                    and downlink_bytes is None and uplink_rate is None \
+                    and downlink_rate is None:
+                # Nothing safe to publish for this row: the rev-7 consumer
+                # requires "partial" to carry at least one observed value, so
+                # the row degrades to an honest fully-unavailable entry.
+                quality = "unavailable"
+            if stale and quality == "unavailable":
+                # The rev-7 consumer requires every row of a STALE export to
+                # be quality=partial (it refuses a stale export that also
+                # claims an unavailable reading). A stale monitor cannot vouch
+                # for a tag it never observed, so OMIT that configured row;
+                # the consumer fills any missing expected tag as unavailable.
+                continue
+            total_active += active_count
+            rows.append({
+                "inbound_tag": tag,
+                "kind": kind,
+                "observed_uplink_bytes": uplink_bytes,
+                "observed_downlink_bytes": downlink_bytes,
+                "uplink_observed_rate_bps": uplink_rate,
+                "downlink_observed_rate_bps": downlink_rate,
+                "active_connections": int(active_count),
+                "observed_at": observed_at,
+                "quality": quality,
+            })
+
+        last_success_at = None
+        if monitor_last_success_at is not None:
+            try:
+                candidate = int(monitor_last_success_at)
+            except (TypeError, ValueError):
+                candidate = None
+            if candidate is not None and candidate >= 0:
+                last_success_at = candidate
+
+        return {
+            "observed_at": observed_at,
+            "monitor_stale": stale,
+            "monitor_last_success_at": last_success_at,
+            "active_connections": int(total_active),
+            "rate_window_seconds": rate_window,
+            "inbounds": rows,
+        }
+
 
 class Collector:
     """Stream consumer + tracker: consume() never raises and marks staleness.

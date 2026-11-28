@@ -184,11 +184,13 @@ cp "$ROOT"/monitor-v2/*.py "$APP"/ 2>/dev/null
 cp -r "$ROOT/monitor-v2/web" "$APP"/web
 cp -r "$ROOT/monitor-v2/api_bridge" "$APP"/api_bridge
 cp -r "$ROOT/monitor-v2/diagnostics" "$APP"/diagnostics
+# UM-LT: the restricted traffic-export package is boot-imported by webapp.py.
+cp -r "$ROOT/monitor-v2/export" "$APP"/export
 # PR-6B: remote_probe/ joined the boot-critical monitor payload
 # (webapp.py wires the ingest plane at startup).
 cp -r "$ROOT/monitor-v2/remote_probe" "$APP"/remote_probe
 rm -rf "$APP/web/__pycache__" "$APP"/__pycache__        "$APP/api_bridge/__pycache__" \
-    "$APP/diagnostics/__pycache__" "$APP"/remote_probe/__pycache__ 2>/dev/null
+    "$APP/diagnostics/__pycache__" "$APP/export/__pycache__" "$APP"/remote_probe/__pycache__ 2>/dev/null
 chown -R "$AXE_USER":"$AXE_USER" "$APP" "$MDATA"
 chmod 0700 "$MDATA"
 mkdir -p /etc/sboxcm-m2
@@ -216,13 +218,15 @@ render_monitor_unit() {
           -e "s|^After=.*|After=network-online.target|" \
     > "$MUNIT"
     # B5 least-privilege regression guard: the rendered unit must
-    # carry the data root and NOTHING else on ReadWritePaths.
-    local rw
-    rw="$(grep '^ReadWritePaths=' "$MUNIT")"
-    if [ "$rw" = "ReadWritePaths=$MDATA" ]; then
-        pass "shipped unit is least-privilege: ReadWritePaths = data root only"
+    # carry the data root plus ONLY the optional rev-7 export path.
+    local rw_root rw_export rw_count
+    rw_count="$(grep -c '^ReadWritePaths=' "$MUNIT")"
+    rw_root="$(grep '^ReadWritePaths=' "$MUNIT" | sed -n '1p')"
+    rw_export="$(grep '^ReadWritePaths=' "$MUNIT" | sed -n '2p')"
+    if [ "$rw_count" = "2" ] && [ "$rw_root" = "ReadWritePaths=$MDATA" ]        && [ "$rw_export" = "ReadWritePaths=-/run/singbox-monitor-export" ]; then
+        pass "shipped unit is least-privilege: data root + optional rev-7 export path only"
     else
-        fail "shipped unit ReadWritePaths is not minimal: [$rw]"
+        fail "shipped unit ReadWritePaths is not the two reviewed paths: count=$rw_count root=[$rw_root] export=[$rw_export]"
     fi
     systemctl daemon-reload
 }

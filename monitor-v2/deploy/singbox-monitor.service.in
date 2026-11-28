@@ -49,6 +49,19 @@ PrivateDevices=true
 # -- so this unit deliberately stays at the least-privilege minimum.
 ProtectSystem=strict
 ReadWritePaths=@SBMON_STATE_ROOT@
+# UM-LT OPTIONAL restricted traffic export (DEFAULT-DISABLED). When the
+# operator explicitly enables it (webapp.py serve --traffic-export-file /
+# --traffic-export-inbound), the monitor writes ONE bounded, sanitized,
+# atomically replaced JSON file for the LOCAL Go agent -- never raw Monitor
+# state and never the service.api secret. The second writable path is
+# deliberately a fixed /run location that the installer/monitor NEVER creates:
+#   install -d -m 2750 -o @SBMON_USER@ -g sboxmon-export /run/singbox-monitor-export
+# (setgid makes the published file group sboxmon-export; file mode is 0640).
+# The dedicated sboxmon-export group contains ONLY the local agent's service
+# user -- never root, never interactive users. The leading '-' makes the unit
+# valid when the directory is absent, so a default install has NO extra
+# writable path and the export feature stays completely dark.
+ReadWritePaths=-/run/singbox-monitor-export
 ProtectHome=yes
 ProtectKernelTunables=true
 ProtectKernelModules=true

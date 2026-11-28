@@ -393,6 +393,15 @@ build_src() { # build_src <dest> [--with-jr]
         cp "$pf" "$dest/remote_probe/"
     done
     rm -rf "$dest/remote_probe/__pycache__"
+    # UM-LT: export/ is imported by webapp.py at startup (the feature stays
+    # DEFAULT-DISABLED at runtime), so every release mirror carries the
+    # library's frozen export manifest payload too.
+    mkdir -p "$dest/export"
+    local ef
+    for ef in "$ROOT"/monitor-v2/export/*.py; do
+        cp "$ef" "$dest/export/"
+    done
+    rm -rf "$dest/export/__pycache__"
     printf '0.1.0\n' > "$dest/VERSION"
     if [ "$with_jr" = "--with-jr" ]; then
         mkdir -p "$dest/journal_reader"

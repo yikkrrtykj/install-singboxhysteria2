@@ -442,6 +442,13 @@ DIAG_MANIFEST_MODULES=(__init__.py network_probes.py probe_scheduler.py)
 P6_MANIFEST_MODULES=(__init__.py __main__.py agent.py delivery.py
     direct_probe.py evidence.py mihomo_probe.py payload.py spool.py)
 
+# UM-LT: the OPTIONAL restricted traffic export is imported by webapp.py at
+# startup (export/contract.py + export/writer.py; feature DEFAULT-DISABLED at
+# runtime), so every release carries the same explicit-manifest payload. The
+# array is kept honest against the library's TRAFFIC_EXPORT_MODULE_FILES by the
+# static gate in "static checks"; the fixture helper stages it file by file.
+EXPORT_MANIFEST_MODULES=(__init__.py contract.py writer.py)
+
 # One path per iteration, built by explicit concatenation: a prefix glued to
 # "${arr[@]}" expands element-wise on some bash builds and only on the first
 # element on others, which silently drops payload files from the fixture.
@@ -483,7 +490,22 @@ p6_stage_payload() { # <src-dir> -- ship the P6 remote-probe payload
     [ "$n" = 9 ] || { printf 'FATAL: fixture staged %s remote_probe modules, expected 9\n' "$n" >&2; exit 70; }
 }
 
-runtime_payload() { jr_stage_payload "$1"; diag_stage_payload "$1"; p6_stage_payload "$1"; }
+runtime_payload() { jr_stage_payload "$1"; diag_stage_payload "$1"; p6_stage_payload "$1"; export_stage_payload "$1"; }
+
+# UM-LT: webapp.py imports export/ at startup (the feature stays
+# DEFAULT-DISABLED at runtime), so every fixture release must carry the same
+# explicit-manifest payload, exactly like diagnostics/remote_probe.
+export_stage_payload() { # <src-dir> -- ship the UM-LT traffic-export payload
+    local src="$1" m n
+    mkdir -p "$src/export"
+    for m in "${EXPORT_MANIFEST_MODULES[@]}"; do
+        cp -- "$REPO_ROOT/monitor-v2/export/$m" "$src/export/" \
+            || { printf 'FATAL: cannot stage export module %s\n' "$m" >&2; exit 70; }
+    done
+    rm -rf "$src/export/__pycache__"
+    n="$(find "$src/export" -maxdepth 1 -name '*.py' | wc -l | tr -d ' ')"
+    [ "$n" = 3 ] || { printf 'FATAL: fixture staged %s export modules, expected 3\n' "$n" >&2; exit 70; }
+}
 
 # A formal install co-activates the reader, so EVERY isolated fixture root has
 # to pin the reader's three paths into itself -- their production defaults
@@ -539,6 +561,26 @@ if grep -nE '^[[:space:]]*cp[[:space:]]+-R[[:space:]].*remote_probe' \
     fail "library cp -R's the remote_probe tree (wildcard staging)"
 else
     pass "remote_probe staged file-by-file from the manifest (no directory wildcard)"
+fi
+# UM-LT: the export payload is boot-imported by webapp.py, so the same
+# manifest discipline applies (array equality + no directory wildcard).
+LIB_EXPORT_MODULES="$(awk '/^TRAFFIC_EXPORT_MODULE_FILES=\(/{f=1} f{print} f&&/\)/{exit}' \
+    "$DEPLOY_DIR/lib/monitor-deploy-lib.sh" | grep -oE '[A-Za-z_]+\.py' \
+    | LC_ALL=C sort | tr '\n' ' ')"
+SUITE_EXPORT_MODULES="$(printf '%s\n' "${EXPORT_MANIFEST_MODULES[@]}" | LC_ALL=C sort | tr '\n' ' ')"
+assert_eq "$SUITE_EXPORT_MODULES" "$LIB_EXPORT_MODULES" \
+    "this lane's 3-module export manifest == the library's TRAFFIC_EXPORT_MODULE_FILES"
+if grep -nE '^[[:space:]]*cp[[:space:]]+-R[[:space:]].*export' \
+    "$DEPLOY_DIR/lib/monitor-deploy-lib.sh" >/dev/null; then
+    fail "library cp -R's the export tree (wildcard staging)"
+else
+    pass "export staged file-by-file from the manifest (no directory wildcard)"
+fi
+if grep -qE '^\s*\[ -f "\$SBMON_REPO_MONITOR_DIR/export/\$ef" \]' \
+    "$DEPLOY_DIR/lib/monitor-deploy-lib.sh"; then
+    pass "staging REQUIRES every export source file (unconditional, fail-closed)"
+else
+    fail "staging does not require the export sources"
 fi
 if grep -nE '^[[:space:]]*cp[[:space:]]+-R[[:space:]].*diagnostics' \
     "$DEPLOY_DIR/lib/monitor-deploy-lib.sh" >/dev/null; then
@@ -693,6 +735,24 @@ if [ -e "$DIAG_STAGED_DIR/__pycache__" ]; then
 else
     pass "no __pycache__ shipped inside the staged diagnostics tree"
 fi
+# UM-LT: the OPTIONAL traffic export is imported by webapp.py at startup (the
+# feature itself stays DEFAULT-DISABLED: no flags => no writer, no file), so
+# the release must carry EXACTLY the 3-file manifest payload.
+EXPORT_STAGED_DIR="$FIX_APP_LINK/app/monitor-v2/export"
+if [ -f "$EXPORT_STAGED_DIR/__init__.py" ] \
+   && [ -f "$EXPORT_STAGED_DIR/contract.py" ] \
+   && [ -f "$EXPORT_STAGED_DIR/writer.py" ]; then
+    pass "release stages the traffic-export trio under app/monitor-v2 (webapp import)"
+else
+    fail "traffic-export payload missing from the staged release"
+fi
+assert_eq "3" "$(find "$EXPORT_STAGED_DIR" -maxdepth 1 -type f | wc -l | tr -d ' ')" \
+    "staged export file set is EXACTLY the 3-file manifest"
+if [ -e "$EXPORT_STAGED_DIR/__pycache__" ]; then
+    fail "staged release carries __pycache__ inside export/"
+else
+    pass "no __pycache__ shipped inside the staged export tree"
+fi
 [ -f "$FIX_APP_LINK/app/monitor-v2/web/static/app.js" ] && pass "release stages web static assets" || fail "web static assets not staged"
 [ ! -e "$FIX_APP_LINK/app/collector" ] && pass "no duplicate independent collector runtime tree" || fail "legacy app/collector tree also staged (two collector runtimes)"
 if [ -e "$FIX_APP_LINK/app/monitor-v2/mihomo" ]; then
@@ -722,7 +782,8 @@ assert_grep '^SBMON_WEB_POLL_SECONDS=1$' "$FIX_CONF_DIR/monitor.conf" "fresh con
 assert_grep 'NoNewPrivileges=true' "$FIX_UNIT" "unit NoNewPrivileges"
 assert_grep 'ProtectHome=yes' "$FIX_UNIT" "unit ProtectHome=yes (cannot read /root/sbox)"
 assert_grep 'ProtectSystem=strict' "$FIX_UNIT" "unit ProtectSystem=strict (M0.5 G4)"
-assert_eq "ReadWritePaths=$FIX_STATE" "$(grep '^ReadWritePaths=' "$FIX_UNIT")" "unit re-opens ONLY the monitor data root for writing (M0.5 G4; M2 final review B5: least privilege restored)"
+assert_eq "ReadWritePaths=$FIX_STATE
+ReadWritePaths=-/run/singbox-monitor-export" "$(grep '^ReadWritePaths=' "$FIX_UNIT")" "unit re-opens ONLY the monitor data root plus the OPTIONAL UM-LT export dir (M0.5 G4; least privilege: '-' keeps default install dark)"
 assert_grep 'RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX' "$FIX_UNIT" "unit keeps the monitor address-family contract (not AF_UNIX-only)"
 assert_grep 'ProtectKernelTunables=true' "$FIX_UNIT" "unit ProtectKernelTunables"
 assert_grep 'ProtectControlGroups=true' "$FIX_UNIT" "unit ProtectControlGroups"

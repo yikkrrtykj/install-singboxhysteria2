@@ -27,7 +27,7 @@ SKIP=0
 # or is explicitly skipped; the gate at the bottom requires
 # PASS + FAIL + SKIP == EXPECTED_TOTAL, so a section that silently disappears
 # (the classic "fewer assertions but still green") can never fake success.
-EXPECTED_TOTAL=137
+EXPECTED_TOTAL=138
 TMP="$(mktemp -d)"
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT
@@ -101,8 +101,9 @@ assert_eq "ProtectControlGroups=true" "$(grep '^ProtectControlGroups=' "$UNIT")"
 assert_eq "RestrictSUIDSGID=true" "$(grep '^RestrictSUIDSGID=' "$UNIT")" "unit cannot create setuid/setgid files"
 assert_eq "CapabilityBoundingSet=" "$(grep '^CapabilityBoundingSet=' "$UNIT")" "unit drops the whole capability bounding set"
 assert_eq "AmbientCapabilities=" "$(grep '^AmbientCapabilities=' "$UNIT")" "unit holds zero ambient capabilities"
-assert_eq "1" "$(grep -c '^ReadWritePaths=' "$UNIT")" "unit declares EXACTLY ONE writable exception"
-assert_eq "ReadWritePaths=/var/lib/singbox-monitor" "$(grep '^ReadWritePaths=' "$UNIT")" "the only writable path is the monitor's own data root (M2 final review B5: least privilege restored)"
+assert_eq "2" "$(grep -c '^ReadWritePaths=' "$UNIT")" "unit declares EXACTLY TWO reviewed writable exceptions (data root + optional rev-7 export directory)"
+assert_eq "ReadWritePaths=/var/lib/singbox-monitor" "$(grep '^ReadWritePaths=' "$UNIT" | sed -n '1p')" "first writable path is the monitor's own data root (M2 final review B5: least privilege)"
+assert_eq "ReadWritePaths=-/run/singbox-monitor-export" "$(grep '^ReadWritePaths=' "$UNIT" | sed -n '2p')" "second writable path is the optional rev-7 export directory only; no other new path is opened"
 RW_ROOT="$(grep '^ReadWritePaths=' "$UNIT" | grep -F '/root/sbox' || true)"
 assert_eq "" "$RW_ROOT" "T12: the unit opens NO write path into /root/sbox"
 RW_CM="$(grep '^ReadWritePaths=' "$UNIT" | grep -F '/var/lib/sbox-cm' || true)"

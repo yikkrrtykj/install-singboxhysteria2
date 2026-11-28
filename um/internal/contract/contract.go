@@ -1,11 +1,17 @@
 // Package contract enforces the runtime semantics of the frozen Unified
-// Monitor v1 node protocol (revision 5) that JSON Schema cannot express:
-// platform isolation between linux_vps and windows_terminal nodes, the
-// availability ↔ null/empty coherence rules for Linux VPS reports, the Windows
+// Monitor v1 node protocol (revision 5, with the additive revision 7 read-only
+// traffic observation) that JSON Schema cannot express: platform isolation
+// between linux_vps and windows_terminal nodes, the availability ↔ null/empty
+// coherence rules for Linux VPS reports, the Windows
 // terminal source/route/connection coherence and sampling-window rules, the
 // metrics/events temporal bounds and event-id uniqueness, the report-body
 // allowlists per node class, strict JSON grammar (no duplicate object members,
 // no trailing data) and the path-aware privacy sentinel boundary.
+//
+// Revision 7 is additive: a body without contract_revision keeps the rev-5
+// schema/behavior, while contract_revision=7 selects the rev-7 snapshot schema
+// and validates the optional traffic_observation lower-bound object. See
+// traffic.go.
 //
 // Structural validation is delegated to internal/schema, which compiles the
 // committed docs/um/contracts/v1/*.schema.json files from disk at runtime.

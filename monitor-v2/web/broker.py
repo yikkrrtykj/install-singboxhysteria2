@@ -22,6 +22,13 @@ Threading model
   latest JSON. A browser that disconnects only ends its own generator --
   the collector never notices.
 
+Auxiliary planes (health file, incident history, the OPTIONAL UM-LT traffic
+export) all run on the same publisher tick but are contained: each one receives
+only what its own policy allows, a failure can never stop the publisher or the
+collector, and the traffic export additionally hands over a SANITIZED
+projection from the tracker's single accumulator (never the raw snapshot) into
+a bounded, non-blocking writer queue.
+
 Freeze detection
 ----------------
 
@@ -65,6 +72,16 @@ def _iso(timestamp):
         timestamp, datetime.timezone.utc).isoformat()
 
 
+def _epoch_of_iso(value):
+    """Parse a collector ISO timestamp into unix seconds (or None)."""
+    if not value:
+        return None
+    try:
+        return int(datetime.datetime.fromisoformat(value).timestamp())
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
 class _LockedTracker:
     """Serialize Tracker access between the consumer and publisher threads."""
 
@@ -82,13 +99,24 @@ class _LockedTracker:
         with self._lock:
             return self._tracker.snapshot(now)
 
+    def export_traffic(self, now, inbounds, **facts):
+        """Sanitized restricted-export projection (same lock, same accumulator).
+
+        The OPTIONAL traffic export rides this ONE accumulator: there is no
+        second collector and no duplicate accounting. The projection contains
+        aggregate per-configured-inbound counters only -- never raw snapshot
+        state (ids/users/sources/destinations/errors).
+        """
+        with self._lock:
+            return self._tracker.export_traffic(now, inbounds, **facts)
+
 
 class SnapshotBroker:
     """Owns the collector thread and the latest published snapshot."""
 
     def __init__(self, collector, poll_seconds=1.0, clock=time.time,
                  health_threshold=None, health_file=None,
-                 incident_history=None):
+                 incident_history=None, traffic_export_writer=None):
         self._collector = collector
         self._poll = poll_seconds
         self._clock = clock
@@ -100,6 +128,11 @@ class SnapshotBroker:
         # Incident history writer (issue #33 P1; optional like health_file --
         # None keeps this runtime byte-for-byte in its prior behavior).
         self._incident_history = incident_history
+        # OPTIONAL restricted traffic export (UM-LT): a writer object exposing
+        # ``inbounds`` (operator allow-list) and a non-blocking ``submit()``.
+        # None (the default) means the feature is completely dark: the
+        # publisher performs no projection, no queue operation and no I/O.
+        self._traffic_export_writer = traffic_export_writer
         self._lock = threading.Lock()       # tracker access
         self._cond = threading.Condition()  # snapshot publication
         self._version = 0
@@ -149,6 +182,7 @@ class SnapshotBroker:
                 self._cond.notify_all()
             self._export_health_file(snapshot, version)
             self._record_history(snapshot, version)
+            self._export_traffic(snapshot)
             self._stop.wait(self._poll)
 
     def _export_health_file(self, snapshot, version):
@@ -208,6 +242,38 @@ class SnapshotBroker:
         try:
             self._incident_history.on_publish(snapshot, version)
         except Exception:  # noqa: BLE001 - history never breaks publication
+            pass
+
+    def _export_traffic(self, snapshot):
+        """Hand a SANITIZED traffic projection to the OPTIONAL export writer.
+
+        Same auxiliary-plane contract as the health export and incident
+        history: this runs on the publisher thread, the writer only ever
+        receives the aggregate per-allow-list-inbound projection (never the
+        raw snapshot), ``submit()`` is non-blocking (bounded queue, older
+        pending snapshot dropped), and ANY failure here is contained so the
+        dashboard/collector keep running exactly as without the feature.
+        With no writer configured this function returns immediately.
+        """
+        writer = self._traffic_export_writer
+        if writer is None:
+            return
+        try:
+            last_success_at = _epoch_of_iso(snapshot.get("last_success_at"))
+            # The rev-7 consumer requires a non-stale export to carry a last
+            # successful observation timestamp; before the collector's first
+            # successful batch there is nothing that could honestly be fresh,
+            # so the export declares itself stale (counters stay null/partial).
+            monitor_stale = bool(snapshot.get("stale")) \
+                or last_success_at is None
+            projection = self._collector.tracker.export_traffic(
+                self._clock(),
+                [(spec.tag, spec.kind) for spec in writer.inbounds],
+                monitor_stale=monitor_stale,
+                monitor_last_success_at=last_success_at,
+            )
+            writer.submit(projection)
+        except Exception:  # noqa: BLE001 - export never breaks publication
             pass
 
     def _decorate(self, snapshot):

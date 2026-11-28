@@ -66,7 +66,7 @@ var contractUUIDFields = []string{"report_id", "event_id", "node_id"}
 // contractOpaqueIdentifierFields are further contract-defined identifiers whose
 // shape would otherwise look credential-like: the 43-char base64url device_ref
 // pseudonym and the 32-hex counter_epoch rotation epoch.
-var contractOpaqueIdentifierFields = []string{"device_ref", "counter_epoch"}
+var contractOpaqueIdentifierFields = []string{"device_ref", "counter_epoch", "source_epoch"}
 
 // matchesFieldPath reports whether path is the member named field, or a nested
 // member path ending in ".field" (for example "events[0].event_id").

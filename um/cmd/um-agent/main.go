@@ -13,13 +13,18 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 
 	"github.com/yikkrrtykj/install-singboxhysteria2/um/internal/agent"
 )
 
-const version = "1.0.0"
+// version is the reported agent.version. 1.1.0 is the first revision that
+// understands the optional rev-7 collect.monitor_export switch; the center only
+// emits that switch to agents reporting >= center.MinMonitorExportAgentVersion
+// (OD-LT-14), so this constant and the minimum must move together.
+const version = "1.1.0"
 
 func envOr(name, fallback string) string {
 	if v := os.Getenv(name); v != "" {
@@ -32,12 +37,30 @@ type commonFlags struct {
 	stateDir  string
 	centerURL string
 	nodeClass string
+	// monitorExportFile is the operator-local fixed absolute path of the optional
+	// monitor-v2 read-only traffic export. It is never accepted from center
+	// config; empty disables the local read path even when the center source is
+	// enabled (the report then carries an honest unavailable observation).
+	monitorExportFile string
+	// The expected POSIX owner/group/mode of the export are local operator
+	// flags, never center-supplied; non-zero values are enforced by the reader.
+	monitorExportOwnerUID int
+	monitorExportGroupGID int
+	monitorExportModeText string
 }
 
 func addCommon(fs *flag.FlagSet, c *commonFlags) {
 	fs.StringVar(&c.stateDir, "state-dir", envOr("UM_AGENT_STATE_DIR", ""), "owner-only agent state directory")
 	fs.StringVar(&c.centerURL, "center", envOr("UM_AGENT_CENTER_URL", ""), "center ingest base URL")
 	fs.StringVar(&c.nodeClass, "node-class", envOr("UM_AGENT_NODE_CLASS", ""), "linux_vps or windows_terminal")
+	fs.StringVar(&c.monitorExportFile, "monitor-export-file", envOr("UM_AGENT_MONITOR_EXPORT_FILE", ""),
+		"optional fixed absolute path of the monitor-v2 read-only traffic export (linux_vps only; empty disables)")
+	fs.IntVar(&c.monitorExportOwnerUID, "monitor-export-owner-uid", envIntOr("UM_AGENT_MONITOR_EXPORT_OWNER_UID", 0),
+		"expected numeric owner uid of the export (0 disables the owner check)")
+	fs.IntVar(&c.monitorExportGroupGID, "monitor-export-group-gid", envIntOr("UM_AGENT_MONITOR_EXPORT_GROUP_GID", 0),
+		"expected numeric group gid of the export (0 disables the group check)")
+	fs.StringVar(&c.monitorExportModeText, "monitor-export-mode", envOr("UM_AGENT_MONITOR_EXPORT_MODE", ""),
+		"expected exact octal POSIX mode of the export (e.g. 0640; empty disables the mode check)")
 }
 
 func (c commonFlags) validate() error {
@@ -50,7 +73,33 @@ func (c commonFlags) validate() error {
 	if c.nodeClass != "linux_vps" && c.nodeClass != "windows_terminal" {
 		return errors.New("--node-class must be linux_vps or windows_terminal")
 	}
+	if _, err := c.monitorExportMode(); err != nil {
+		return err
+	}
 	return nil
+}
+
+func (c commonFlags) monitorExportMode() (uint32, error) {
+	if strings.TrimSpace(c.monitorExportModeText) == "" {
+		return 0, nil
+	}
+	value, err := strconv.ParseUint(c.monitorExportModeText, 0, 32)
+	if err != nil || value > 0o777 {
+		return 0, errors.New("--monitor-export-mode must be an octal POSIX mode in [0,0777]")
+	}
+	return uint32(value), nil
+}
+
+func envIntOr(name string, fallback int) int {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil {
+		return fallback
+	}
+	return value
 }
 
 func newRuntime(c commonFlags, once bool) (*agent.Runtime, error) {
