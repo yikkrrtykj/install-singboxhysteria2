@@ -2780,9 +2780,12 @@ class Lab:
         try:
             self.setup()
             completed = {result["stage"] for result in self.stage_results}
-            for name, function in selected:
+            for name, _description in selected:
                 if name in completed:
                     continue
+                function = getattr(self, "stage_" + name.replace("-", "_"), None)
+                if not callable(function):
+                    raise lab.LabError("stage %r has no implementation method" % name)
                 self.run_stage(name, function)
             status = "passed"
         except lab.LabSkipped:
