@@ -1,17 +1,19 @@
-# UM-C evidence and acceptance notes (Draft, exact HEAD pending)
+# UM-C evidence and acceptance notes (Draft PR #134)
 
 Status: **UM-C Draft PR Refs #127**. This document records commands/results and
-honestly distinguishes verified local/CI evidence from production HOLD work. The
-final status line is only updated after the final exact-HEAD run and commit.
+honestly distinguishes verified local/CI evidence from production HOLD work.
+Verification target for code: commit `076335720cf8c15254ffe41acab1b1dc38525b80`
+(tree `a7fe98c94975af4e823248862674fa3fd6cb2beb`). A following docs-only commit
+records this document; no production code changes are in that commit.
 
 ## Baseline
 
 - Base `origin/main`: `6d9e12fd7ad4d0866ea507209fcbe52931c4a70a`
   (B1/B2/B3/B4 merged; tree `3cbd4bee73b49c5c047021390886c3e261bea42f`).
 - Branch: `codex/um-c-auth-security`; Draft PR #134 (Refs #127).
-- First implementation commit: `f04c9135`; second: `387e11b8`; review-fix
-  commit(s) are added after the findings below. Final evidence MUST be refreshed
-  after the last commit; do not treat an older run as exact-HEAD evidence.
+- Implementation commits: `f04c9135`, `387e11b8`, `d83b1942`, `395583e1`,
+  `051952be`, and code verification target `07633572` (test-only determinism fix
+  after the final code re-review).
 - UM-C uses the existing Go module/center/SQLite/management engine. No second
   database or RBAC engine was added.
 
@@ -57,28 +59,42 @@ Observed during development (before the final review-fix commit):
 - Auth CLI lab passed: protected key generation, once-only local bootstrap,
   controlled local recovery (TOTP/session reset).
 
-## CI observed (development commits, not final evidence)
+## CI exact verification target (`07633572`)
 
-For `387e11b8`:
+All required UM-C/Go/browser jobs below are on the pushed verification commit
+`076335720cf8c15254ffe41acab1b1dc38525b80`:
 
-- `UM-C Web and Browser Lab`: **success**. The `frontend` job ran typecheck/Vitest/
-  build; the `real-browser-auth-lab` job installed a hermetic Chromium, started
-  `um-c-e2e`, ran Playwright, and reported **1 passed**. This is synthetic
-  Access/TLS only.
-- `UM-B3 isolated service labs`: success; B4/B2/foundations jobs remained green.
-- `Unified Monitor Go` native Windows: passed. The Linux race job failed in the
-  new `umcauth` POSIX master-key test because a mode-0000 file hit `open`
-  permission-denied and the implementation classified it as `ErrMasterKeyFile`
-  instead of `ErrMasterKeyPermissions`. This review-fix is in the working tree
-  (`vault_unix.go`/`vault.go`), and the final run must confirm it.
-- Other workflows (HY2 BBR, monitor-packaging, p6b2-foundations, shell-tests,
-  quality-receiver) were green or not UM-C-specific; `Unified Monitor Go` is the
-  required exact-HEAD gate.
+- `Unified Monitor Go` run `46137755887`: **success**. Jobs:
+  `native (ubuntu-24.04)` success, `native (windows-2022)` success,
+  `linux-race` success, `coverage` success, `govulncheck` success.
+- `UM-C Web and Browser Lab` run `46137755898`: **success**.
+  `frontend` success (typecheck/Vitest/build); `real-browser-auth-lab` success
+  (hermetic Chromium started `um-c-e2e`, synthetic Access/TLS only, Playwright
+  real-browser auth closure passed).
+- `UM-B3 isolated service labs` remained green on the related baseline; B1-B4
+  regression tests are part of the full `go test ./...` above.
+- An unrelated `quality-receiver` Windows quality-exe process-enumeration lab
+  failed transiently with `winerror=5` (`PROCESS_ENUMERATION_FAILED`); it is not
+  part of the UM Go/UM-C changed code and was retried. Do not cite that
+  unrelated flake as UM-C evidence either way.
 
-**Final exact-HEAD CI/lab must be rerun after the review-fix commit; this file is
-updated with the final run IDs/commit/tree before the goal is reported complete.**
+Local final checks (same worktree/commit family):
 
-## Independent review (completed)
+- `go vet ./...`: exit 0.
+- Full `go test -count=1 ./...`: every package `ok`.
+- `go build ./...`: exit 0.
+- Frontend `npm ci`, `npm run typecheck`, `npm test` (99/99 in 10 files),
+  `npm run build`: green.
+- Local real-browser Playwright auth closure: `1 passed`; synthetic Access/JWKS
+  and self-signed loopback TLS only. Screenshots:
+  `um/docs/um-c-browser-dashboard.png`, `um/docs/um-c-browser-users.png`.
+- Machine TLS lab: production `center.MachineTLSConfig`, TLS 1.2 rejection,
+  untrusted CA rejection with a fresh token, real agent enrollment/config/snapshot
+  report; route isolation from admin/web.
+- Auth CLI lab: protected key generation, once-only local bootstrap, controlled
+  local recovery; no password in argv.
+- TOTP/session deterministic test suite run repeatedly successfully; no skipped
+  browser lab env (Playwright exits nonzero if `UM_C_E2E_*` is missing).
 
 An independent reviewer examined HEAD `387e11b8` read-only and returned
 **NEEDS FIXES** with no remote auth bypass found. High-priority findings and
@@ -117,6 +133,21 @@ A second read-only pass on `395583e1` confirmed the original P1/P2 fixes but fou
 
 ## Final status
 
-Pending: final review-fix commit, exact HEAD tree, full local/CI reruns, updated
-evidence IDs, and owner-equivalent independent rereview. The final report will
-use one of the authorized stop statuses.
+**UM-C GOAL COMPLETED / DRAFT PR / AWAITING FINAL INDEPENDENT REVIEW**
+
+- Draft PR #134 remains open, Draft, unmerged; no merge/force-push/main write.
+- Code verification target `07633572` has green exact-HEAD Go and browser CI as
+  above.
+- The independent reviewer's final read-only verdict was **CLEAN (Draft)** for
+  `051952be`; the only later commit (`07633572`) is a test-only deterministic
+  clock fix with no production-code change. Final reviewer sign-off on the
+  docs-only evidence commit is the remaining external review step.
+- Remaining accepted P3 items: inherent threshold-lockout DoS for an attacker who
+  already knows the password (mitigated by admin reset/enable/recovery/local
+  recovery and documented); test gaps for admin-unlock/upgrade/ledger-fault;
+  generic OpenAPI 429 vs `totp_locked` code detail; DB/TLS-key ACL hardening and
+  master-key startup validation remain operational HOLD hardening.
+- Holds: **PRODUCTION HOLD**, **R1 PRODUCTION HOLD**, `singbox_api` **DISABLED**,
+  UM-F **DEFERRED**. Real Cloudflare/Tunnel/DNS/Access/IdP/certificate and
+  production accounts are untouched. Linux Reality/Hysteria2 real traffic remains
+  a pre-production blocker on #127; #127 stays OPEN.
