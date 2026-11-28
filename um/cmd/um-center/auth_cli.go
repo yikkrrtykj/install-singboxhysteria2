@@ -15,6 +15,7 @@ import (
 
 	"github.com/yikkrrtykj/install-singboxhysteria2/um/internal/store"
 	"github.com/yikkrrtykj/install-singboxhysteria2/um/internal/umcauth"
+	"github.com/yikkrrtykj/install-singboxhysteria2/um/internal/web"
 	"golang.org/x/term"
 )
 
@@ -33,6 +34,8 @@ func runAuthCLI(args []string) error {
 		return runAuthBootstrap(args[1:])
 	case "recover":
 		return runAuthRecover(args[1:])
+	case "key-init":
+		return runAuthKeyInit(args[1:])
 	default:
 		return fmt.Errorf("unknown auth command %q", args[0])
 	}
@@ -172,4 +175,38 @@ func ledgerHash(value string) string {
 	// Reuse a SHA-256 hash hex string; details never contain the password.
 	sum := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(sum[:])
+}
+
+// runAuthKeyInit is the explicit local upgrade path for a v11/v12 auth database
+// that has encrypted TOTP state but no master-key sentinel. It verifies the key
+// against every stored TOTP secret before writing the sentinel; it never
+// rotates the key or rewrites TOTP state.
+func runAuthKeyInit(args []string) error {
+	fs := flag.NewFlagSet("auth key-init", flag.ContinueOnError)
+	dbPath := fs.String("db", "", "center SQLite path")
+	keyPath := fs.String("master-key", "", "protected master-key file")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *dbPath == "" || *keyPath == "" {
+		return errors.New("--db and --master-key are required")
+	}
+	key, err := umcauth.LoadMasterKey(*keyPath)
+	if err != nil {
+		return fmt.Errorf("master key: %w", err)
+	}
+	defer clear(key)
+	st, err := store.Open(*dbPath)
+	if err != nil {
+		return fmt.Errorf("open store: %w", err)
+	}
+	defer st.Close()
+	if err := web.InitializeMasterKeyForExistingDB(context.Background(), st, key); err != nil {
+		if errors.Is(err, web.ErrMasterKeyMismatch) {
+			return errors.New("master key does not match existing encrypted TOTP state; refusing to initialize")
+		}
+		return err
+	}
+	fmt.Fprintln(os.Stdout, "master-key sentinel initialized/verified; no TOTP state was changed")
+	return nil
 }

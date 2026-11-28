@@ -139,10 +139,11 @@ func (h *Handler) showUser(w http.ResponseWriter, r *http.Request, userID string
 }
 
 func (h *Handler) createUser(w http.ResponseWriter, r *http.Request) {
-	actor, ok := h.requirePlatformAdmin(w, r)
+	actor, release, ok := h.requireAdminActor(w, r)
 	if !ok {
 		return
 	}
+	defer release()
 	var req struct {
 		Username string   `json:"username"`
 		Role     string   `json:"role"`
@@ -185,10 +186,11 @@ func (h *Handler) createUser(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) setUserEnabled(w http.ResponseWriter, r *http.Request, userID string, enabled bool) {
-	actor, ok := h.requirePlatformAdmin(w, r)
+	actor, release, ok := h.requireAdminMutation(w, r, userID)
 	if !ok {
 		return
 	}
+	defer release()
 	action := "umc_user_disabled"
 	if enabled {
 		action = "umc_user_enabled"
@@ -202,10 +204,11 @@ func (h *Handler) setUserEnabled(w http.ResponseWriter, r *http.Request, userID 
 }
 
 func (h *Handler) setUserRole(w http.ResponseWriter, r *http.Request, userID string) {
-	actor, ok := h.requirePlatformAdmin(w, r)
+	actor, release, ok := h.requireAdminMutation(w, r, userID)
 	if !ok {
 		return
 	}
+	defer release()
 	var req struct {
 		Role     string   `json:"role"`
 		EventIDs []string `json:"event_ids"`
@@ -229,10 +232,11 @@ func (h *Handler) setUserRole(w http.ResponseWriter, r *http.Request, userID str
 }
 
 func (h *Handler) resetUserPassword(w http.ResponseWriter, r *http.Request, userID string) {
-	actor, ok := h.requirePlatformAdmin(w, r)
+	actor, release, ok := h.requireAdminMutation(w, r, userID)
 	if !ok {
 		return
 	}
+	defer release()
 	if _, err := h.store.GetAuthUserByID(r.Context(), userID); err != nil {
 		h.writeError(w, http.StatusNotFound, "not_found", "user not found")
 		return
@@ -280,20 +284,22 @@ func (h *Handler) listUserSessions(w http.ResponseWriter, r *http.Request, userI
 }
 
 func (h *Handler) revokeUserSession(w http.ResponseWriter, r *http.Request, userID, publicID string) {
-	actor, ok := h.requirePlatformAdmin(w, r)
+	actor, release, ok := h.requireAdminMutation(w, r, userID)
 	if !ok {
 		return
 	}
+	defer release()
 	sess, err := h.store.GetSessionByPublicID(r.Context(), publicID)
 	if err != nil || sess.UserID != userID {
 		h.writeError(w, http.StatusNotFound, "not_found", "session not found")
 		return
 	}
-	if err := h.store.RevokeSessionByPublicID(r.Context(), publicID, h.now().Unix()); err != nil {
+	revokeReq := h.mutationRequest(r, actor.User, "umc_user_session_revoked", "user:"+userID,
+		"umc_user_session_revoked", userID, "revoke-session")
+	if err := h.store.RevokeSessionByPublicID(revokeReq.Context(), publicID, h.now().Unix()); err != nil {
 		h.writeError(w, http.StatusInternalServerError, "internal", "session revoke failed")
 		return
 	}
-	h.auditIdentity(r, actor, "umc_user_session_revoked", "user:"+userID, "ok")
 	h.writeJSON(w, http.StatusOK, map[string]any{"revoked": true})
 }
 

@@ -83,7 +83,10 @@ func (h *Handler) authenticate(r *http.Request, allowedStates ...string) (*ident
 	hash := umcauth.HashToken(cookie.Value)
 	sess, err := h.store.GetSession(r.Context(), hash)
 	if err != nil {
-		return nil, ErrIdentityMissing
+		if errors.Is(err, store.ErrAuthSessionUnknown) {
+			return nil, ErrIdentityMissing
+		}
+		return nil, ErrAuthUnavailable
 	}
 	now := h.now().Unix()
 	if sess.RevokedAt != nil || now >= sess.AbsoluteExpiresAt || now >= sess.IdleExpiresAt {
@@ -106,11 +109,23 @@ func (h *Handler) authenticate(r *http.Request, allowedStates ...string) (*ident
 		return nil, ErrIdentityMissing
 	}
 	user, err := h.store.GetAuthUserByID(r.Context(), sess.UserID)
-	if err != nil || !user.Enabled {
+	if err != nil {
+		if errors.Is(err, store.ErrAuthUserUnknown) {
+			return nil, ErrIdentityMissing
+		}
+		return nil, ErrAuthUnavailable
+	}
+	if !user.Enabled {
+		return nil, ErrIdentityMissing
+	}
+	// A session is valid only for the account credential/security epoch that
+	// created it. This is a second defense behind explicit revocation and closes
+	// resets that race an in-flight request.
+	if user.AuthEpoch != sess.AuthEpoch {
 		return nil, ErrIdentityMissing
 	}
 	if err := h.store.TouchSession(r.Context(), hash, now, now+int64(h.idle/time.Second)); err != nil {
-		return nil, ErrIdentityMissing
+		return nil, ErrAuthUnavailable
 	}
 	scopes := make(map[string]bool, len(user.EventIDs))
 	for _, eventID := range user.EventIDs {
@@ -129,3 +144,8 @@ func (h *Handler) authenticate(r *http.Request, allowedStates ...string) (*ident
 
 // ErrIdentityMissing is a closed authentication failure.
 var ErrIdentityMissing = errors.New("web: authenticated session required")
+
+// ErrAuthUnavailable distinguishes a database/auth-state outage from a valid
+// negative authentication decision so callers can return a bounded 503 rather
+// than falsely claiming the user is unauthenticated.
+var ErrAuthUnavailable = errors.New("web: authentication state unavailable")

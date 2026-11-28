@@ -5,8 +5,11 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/yikkrrtykj/install-singboxhysteria2/um/internal/store"
+	"github.com/yikkrrtykj/install-singboxhysteria2/um/internal/umcauth"
+	"github.com/yikkrrtykj/install-singboxhysteria2/um/internal/web"
 )
 
 func feedStdin(t *testing.T, value string) func() {
@@ -74,5 +77,55 @@ func TestUMCAuthLocalBootstrapAndRecoveryCLI(t *testing.T) {
 	}
 	if user.TOTPSecret != nil {
 		t.Fatal("local recovery did not clear TOTP state")
+	}
+}
+
+func TestUMCAuthKeyInitUpgradeVerifiesExistingTOTP(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "center.db")
+	keyPath := filepath.Join(dir, "master.key")
+	if err := runAuthCLI([]string{"init-key", "--path", keyPath}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := umcauth.LoadMasterKey(keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	now := time.Now().Unix()
+	hash := "$argon2id$v=19$m=65536,t=3,p=2$c2FsdHNhbHRzYWx0c2FsdA$aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	user, err := st.BootstrapAuthUser(ctx, "key-init-admin", hash, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed, err := umcauth.Seal(key, []byte("totp-secret"), []byte("umc-totp:"+user.UserID+":v1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetAuthUserTOTP(ctx, user.UserID, sealed, 1, now); err != nil {
+		t.Fatal(err)
+	}
+	_ = st.Close()
+	if err := runAuthCLI([]string{"key-init", "--db", dbPath, "--master-key", keyPath}); err != nil {
+		t.Fatalf("key-init: %v", err)
+	}
+	st, err = store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := web.VerifyMasterKey(ctx, st, key); err != nil {
+		t.Fatalf("sentinel after key-init: %v", err)
+	}
+	wrong := make([]byte, len(key))
+	for i := range wrong {
+		wrong[i] = key[i] ^ 0xff
+	}
+	if err := web.InitializeMasterKeyForExistingDB(ctx, st, wrong); err == nil {
+		t.Fatal("wrong key initialized an existing sentinel database")
 	}
 }

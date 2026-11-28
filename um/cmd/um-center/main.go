@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/yikkrrtykj/install-singboxhysteria2/um/internal/center"
+	"github.com/yikkrrtykj/install-singboxhysteria2/um/internal/fileguard"
 	"github.com/yikkrrtykj/install-singboxhysteria2/um/internal/management"
 	"github.com/yikkrrtykj/install-singboxhysteria2/um/internal/store"
 	"github.com/yikkrrtykj/install-singboxhysteria2/um/internal/umcauth"
@@ -54,6 +55,7 @@ func envOr(name, fallback string) string {
 }
 
 func run() error {
+	hardenProcessUmask()
 	var (
 		ingestAddr          = flag.String("ingest", envOr("UM_CENTER_INGEST_ADDR", ""), "machine-ingest listen address (required; loopback preferred)")
 		adminAddr           = flag.String("admin", envOr("UM_CENTER_ADMIN_ADDR", ""), "isolated admin listen address (required)")
@@ -70,10 +72,10 @@ func run() error {
 		accessIssuer        = flag.String("access-issuer", envOr("UM_CENTER_ACCESS_ISSUER", ""), "Cloudflare Access issuer")
 		accessAudienceience = flag.String("access-audience", envOr("UM_CENTER_ACCESS_AUDIENCE", ""), "Cloudflare Access audience")
 		accessJWKS          = flag.String("access-jwks", envOr("UM_CENTER_ACCESS_JWKS", ""), "trusted Cloudflare Access JWKS URL")
-		accessHTTP          = flag.Bool("access-jwks-insecure-http-for-tests", false, "allow http JWKS only for hermetic tests")
-		machineTLS          = flag.String("machine-tls", envOr("UM_CENTER_MACHINE_TLS_ADDR", ""), "optional independent machine TLS listener")
-		machineCert         = flag.String("machine-tls-cert", envOr("UM_CENTER_MACHINE_TLS_CERT", ""), "machine listener TLS certificate")
-		machineKey          = flag.String("machine-tls-key", envOr("UM_CENTER_MACHINE_TLS_KEY", ""), "machine listener TLS private key")
+
+		machineTLS  = flag.String("machine-tls", envOr("UM_CENTER_MACHINE_TLS_ADDR", ""), "optional independent machine TLS listener")
+		machineCert = flag.String("machine-tls-cert", envOr("UM_CENTER_MACHINE_TLS_CERT", ""), "machine listener TLS certificate")
+		machineKey  = flag.String("machine-tls-key", envOr("UM_CENTER_MACHINE_TLS_KEY", ""), "machine listener TLS private key")
 	)
 	flag.Parse()
 
@@ -114,6 +116,12 @@ func run() error {
 		cfg.AdminAPI = adminAPI
 	}
 	var webHandler *web.Handler
+	// The plain ingest listener is a legacy/local compatibility path. Production
+	// machine traffic must use the independent TLS listener; an accidentally
+	// public plain listener is fail-closed rather than silently exposed.
+	if !isLoopbackHostPort(*ingestAddr) {
+		return errors.New("plain -ingest must be loopback; use -machine-tls for non-loopback machine traffic")
+	}
 	if *webAddr != "" {
 		if err := requireLoopbackAdmin(*webAddr); err != nil {
 			return fmt.Errorf("web listener: %w", err)
@@ -126,7 +134,7 @@ func run() error {
 			return fmt.Errorf("web master key: %w", err)
 		}
 		access, err := umcauth.NewVerifier(umcauth.Config{Issuer: *accessIssuer, Audience: *accessAudienceience,
-			JWKSURL: *accessJWKS, AllowInsecureHTTPForTests: *accessHTTP})
+			JWKSURL: *accessJWKS})
 		if err != nil {
 			return fmt.Errorf("access verifier: %w", err)
 		}
@@ -175,6 +183,10 @@ func run() error {
 			return fmt.Errorf("web listen: %w", err)
 		}
 		if *webTLSFlag {
+			if err := fileguard.CheckPrivateFile(*webTLSKey); err != nil {
+				_ = webLn.Close()
+				return fmt.Errorf("web TLS private key must be owner-private: %w", err)
+			}
 			cert, err := tls.LoadX509KeyPair(*webTLSCert, *webTLSKey)
 			if err != nil {
 				_ = webLn.Close()
@@ -192,6 +204,9 @@ func run() error {
 		log.Printf("um-center web listening on %s (%s; Cloudflare Access + local session)", webLn.Addr(), scheme)
 	}
 	if *machineTLS != "" {
+		if err := fileguard.CheckPrivateFile(*machineKey); err != nil {
+			return fmt.Errorf("machine TLS private key must be owner-private: %w", err)
+		}
 		cert, err := tls.LoadX509KeyPair(*machineCert, *machineKey)
 		if err != nil {
 			return fmt.Errorf("machine TLS certificate: %w", err)
@@ -264,4 +279,17 @@ func requireLoopbackAdmin(addr string) error {
 		return errors.New("management API requires a loopback admin address in B4")
 	}
 	return nil
+}
+
+func isLoopbackHostPort(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	host = strings.Trim(host, "[]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }

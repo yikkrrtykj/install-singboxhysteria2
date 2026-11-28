@@ -54,24 +54,35 @@ type Config struct {
 	StaticDir         string
 	AllowedOrigins    []string
 	Now               func() time.Time
-	IdleTimeout       time.Duration
-	AbsoluteTimeout   time.Duration
+	// TestHookBeforeManagementMutation is a nil-by-default test-only barrier. It
+	// is never set by the production command-line entrypoint; hermetic tests use
+	// it to deterministically interleave a B4 mutation with revocation.
+	TestHookBeforeManagementMutation func()
+	// TestHookAfterPasswordVerify is a nil-by-default test barrier placed after
+	// Argon2id verification and before any session is created.
+	TestHookAfterPasswordVerify func()
+	IdleTimeout                 time.Duration
+	AbsoluteTimeout             time.Duration
 }
 
 // Handler is the isolated loopback Web plane.
 type Handler struct {
-	store     *store.Store
-	mgmt      *management.Handler
-	access    *umcauth.Verifier
-	master    []byte
-	static    string
-	origins   map[string]bool
-	now       func() time.Time
-	idle      time.Duration
-	absolute  time.Duration
-	limiter   *limiter
-	kdf       chan struct{}
-	dummyHash string
+	store                    *store.Store
+	mgmt                     *management.Handler
+	access                   *umcauth.Verifier
+	master                   []byte
+	static                   string
+	origins                  map[string]bool
+	now                      func() time.Time
+	idle                     time.Duration
+	absolute                 time.Duration
+	limiter                  *limiter
+	kdf                      chan struct{}
+	dummyHash                string
+	gateMu                   sync.Mutex
+	gates                    map[string]*authGateEntry
+	beforeManagementMutation func()
+	afterPasswordVerify      func()
 }
 
 // NewHandler constructs the Web plane and its bridge into B4 management. It
@@ -82,6 +93,12 @@ func NewHandler(cfg Config) (*Handler, error) {
 	}
 	if len(cfg.MasterKey) != umcauth.MasterKeyBytes {
 		return nil, errors.New("web: invalid master key")
+	}
+	// Fail closed before the Web plane can accept credentials if the key does not
+	// match existing encrypted auth state. Existing v11/v12 databases without a
+	// sentinel require the explicit local key-init command.
+	if err := VerifyMasterKey(context.Background(), cfg.Store, cfg.MasterKey); err != nil {
+		return nil, err
 	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
@@ -112,6 +129,8 @@ func NewHandler(cfg Config) (*Handler, error) {
 		static: cfg.StaticDir, origins: origins, now: cfg.Now,
 		idle: cfg.IdleTimeout, absolute: cfg.AbsoluteTimeout,
 		limiter: newLimiter(cfg.Now), kdf: make(chan struct{}, KDFConcurrency), dummyHash: dummyHash,
+		beforeManagementMutation: cfg.TestHookBeforeManagementMutation,
+		afterPasswordVerify:      cfg.TestHookAfterPasswordVerify,
 	}
 	auth, err := NewSessionAuthenticator(cfg.Store, cfg.Access, cfg.Now)
 	if err != nil {
@@ -194,8 +213,31 @@ func (h *Handler) setSecurityHeaders(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) serveManagement(w http.ResponseWriter, r *http.Request) {
 	ident, err := h.authenticate(r, store.AuthSessionActive)
 	if err != nil {
+		if errors.Is(err, ErrAuthUnavailable) {
+			h.writeError(w, http.StatusServiceUnavailable, "auth_state_unavailable", "authentication state unavailable; retry")
+			return
+		}
 		h.writeError(w, http.StatusUnauthorized, "unauthenticated", "local session required")
 		return
+	}
+	mutation := r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions
+	if strings.HasSuffix(r.URL.Path, "/purge/preview") {
+		mutation = true
+	}
+	if mutation {
+		// Hold the principal's read gate across the existing B4 mutation so a
+		// concurrent Logout/disable/password-reset/role-change cannot revoke the
+		// authorization between middleware authentication and the B4 service
+		// transaction. Re-authenticate after acquiring the gate: if revocation
+		// already linearized first, this request must not start a new operation.
+		release := h.lockAuthGates(authLock{id: ident.User.UserID, write: false})
+		defer release()
+		fresh, authErr := h.authenticate(r, store.AuthSessionActive)
+		if authErr != nil {
+			h.writeError(w, http.StatusUnauthorized, "unauthenticated", "authorization changed; re-authenticate")
+			return
+		}
+		ident = fresh
 	}
 	if err := h.checkCSRF(r, ident); err != nil {
 		h.auditIdentity(r, ident, "csrf_rejected", "web", "denied")
@@ -203,6 +245,9 @@ func (h *Handler) serveManagement(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	r = r.WithContext(withIdentity(r.Context(), ident))
+	if mutation && h.beforeManagementMutation != nil {
+		h.beforeManagementMutation()
+	}
 	h.mgmt.ServeHTTP(w, r)
 }
 
@@ -338,15 +383,23 @@ func (l *limiter) allow(key string, rate, burst float64) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := l.now()
-	if len(l.buckets) > l.max {
+	if len(l.buckets) >= l.max {
 		for k, b := range l.buckets {
 			if now.Sub(b.last) > 10*time.Minute {
 				delete(l.buckets, k)
 			}
 		}
-		if len(l.buckets) > l.max {
-			// Bounded fail-safe: clear the oldest map wholesale rather than grow.
-			l.buckets = make(map[string]*bucket)
+		if len(l.buckets) >= l.max {
+			// Evict a bounded portion of arbitrary (least-recently-refreshed
+			// iteration order) buckets rather than clearing every account's
+			// protections. The map never exceeds max entries.
+			target := l.max / 2
+			for k := range l.buckets {
+				delete(l.buckets, k)
+				if len(l.buckets) <= target {
+					break
+				}
+			}
 		}
 	}
 	b := l.buckets[key]

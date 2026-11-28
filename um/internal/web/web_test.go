@@ -85,12 +85,28 @@ type testWeb struct {
 	access   *accessFixture
 	master   []byte
 	clock    *time.Time
+	dbPath   string
 	store    *store.Store
 	userID   string
 	password string
 }
 
 func newTestWeb(t *testing.T) *testWeb {
+	t.Helper()
+	return newTestWebWithHooks(t, nil, nil)
+}
+
+func newTestWebWithHook(t *testing.T, hook func()) *testWeb {
+	t.Helper()
+	return newTestWebWithHooks(t, hook, nil)
+}
+
+func newTestWebWithPasswordHook(t *testing.T, hook func()) *testWeb {
+	t.Helper()
+	return newTestWebWithHooks(t, nil, hook)
+}
+
+func newTestWebWithHooks(t *testing.T, managementHook, passwordHook func()) *testWeb {
 	t.Helper()
 	dir := t.TempDir()
 	st, err := store.Open(filepath.Join(dir, "center.db"))
@@ -120,7 +136,8 @@ func newTestWeb(t *testing.T) *testWeb {
 	}
 	h, err := web.NewHandler(web.Config{Store: st, ManagementService: msg, Access: verifier,
 		MasterKey: master, AllowedOrigins: []string{"https://web.example"},
-		Now: func() time.Time { return clock }})
+		Now: func() time.Time { return clock }, TestHookBeforeManagementMutation: managementHook,
+		TestHookAfterPasswordVerify: passwordHook})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,8 +147,9 @@ func newTestWeb(t *testing.T) *testWeb {
 	jar, _ := cookiejar.New(nil)
 	client := ts.Client()
 	client.Jar = jar
+	dbPath := filepath.Join(dir, "center.db")
 	return &testWeb{handler: h, server: ts, client: client, jwt: access.token(t, testAccessSubject, time.Now()),
-		access: access, master: master, clock: &clock, store: st, password: "correct horse battery staple"}
+		access: access, master: master, clock: &clock, dbPath: dbPath, store: st, password: "correct horse battery staple"}
 }
 
 func (tw *testWeb) request(t *testing.T, method, path, csrf string, body any, accessToken string) (int, []byte) {

@@ -66,7 +66,10 @@ Access JWT cannot be bypassed with an old session.
   sessions and issues the active session in one transaction; no cookie is sent
   before commit.
 - Per-account TOTP failures are persisted; five failures temporarily lock TOTP
-  (15 minutes) and revoke the account's sessions. The failure window resets after
+  (15 minutes) and revoke the account's sessions. The persistent `totp_last_counter`
+  high-water is checked on every counter consume even after bounded cleanup
+  deletes old counter rows, so restart/clock rollback/counter cleanup cannot revive
+  an old code; a new secret generation resets the high-water. The failure window resets after
   lock expiry or a successful TOTP/recovery/password-reset/enable so the lock is
   genuinely temporary. Login/TOTP/recovery rate limits are keyed to the verified
   Access subject/session, never solely to the loopback `RemoteAddr`, so a Tunnel
@@ -122,18 +125,57 @@ be disabled/demoted. No public self-registration. Account count/platform-admin
 expansion uses the frozen least-privilege defaults and Owner policy if a limit is
 later required.
 
+## 6.1 Credential epochs and authorization linearization
+
+Every account has a persistent integer credential epoch. Password reset, TOTP
+change/enrollment, recovery consumption, enable/disable and role/scope changes
+advance the epoch inside the same transaction that revokes sessions. Pending/
+active sessions bind to the epoch that authorized them; authentication rejects a
+session with a stale epoch even if a revocation write was missed. Session creation
+after Argon2id revalidates the account epoch in a SQLite transaction, so a
+password verified against the old hash cannot create a new session after a
+concurrent reset. The KDF runs outside the transaction.
+
+Management mutations additionally use per-account authorization gates. A B4
+mutation holds a per-principal read gate across the existing service transaction;
+logout/session revoke/password/TOTP/role/scope/disable/account-reset take a
+write gate. A revocation therefore linearizes either before a new B4 mutation
+request (which then re-authenticates and fails) or after an already-started
+mutation completes. Locks are per-account and acquired in ID order; there is no
+global lock or second RBAC engine. Local OS-controlled recovery is outside the
+Web gate; it advances the epoch and is documented as an OS-trusted boundary.
+
 ## 7. Database migration
 
-Additive v11/v12 add only UM-C tables/columns: `umc_users`, `umc_user_event_scopes`,
-`umc_preauth`, `umc_sessions`, `umc_recovery_codes`, `umc_totp_counters` and
-indexes. Existing v1-v10 migrations, B1-B4 tables, frozen schemas and ledger are
+Additive v11/v12/v13 add only UM-C tables/columns: `umc_users`,
+`umc_user_event_scopes`, `umc_preauth`, `umc_sessions`, `umc_recovery_codes`,
+`umc_totp_counters`, `umc_meta` and indexes. v13 adds credential-epoch columns and
+the master-key sentinel table. Existing v1-v10 migrations, B1-B4 tables, frozen schemas and ledger are
 unchanged. Auth state cleanup is bounded; TOTP/recovery/session critical
 transitions are transactional. Backup/restore drills, master-key offsite backup
 and real Cloudflare integration remain UM-E/HOLD.
 
+## 7.1 Master-key database consistency and private files
+
+On Web startup the master key is checked against a `umc_meta` AEAD sentinel. A
+wrong 32-byte key fails closed before the Web listener becomes usable. A v11/v12
+database with encrypted TOTP but no sentinel is not silently initialized; the
+operator must run local `um-center auth key-init --db ... --master-key ...`, which
+first opens every existing TOTP secret with the key and only then writes the
+sentinel. Empty/new auth databases may initialize the sentinel automatically.
+The sentinel never contains the key or plaintext TOTP.
+
+The SQLite parent directory is 0700, DB/WAL/SHM files are owner-private 0600
+(POSIX) or closed-DACL owner/service-account/LocalSystem/Administrators-only
+(Windows); the service entrypoint sets umask 0077 before SQLite creates future
+WAL/SHM. TLS private keys and B4 auth/token files are checked with the same
+closed permission model; the master key keeps its dedicated vault validator.
+
 ## 8. Machine TLS
 
-The production machine entry is an independent hostname + direct TLS 1.3
+The plain `-ingest` listener is restricted to loopback as a legacy/local
+compatibility path; non-loopback machine traffic must use the independent TLS
+listener. The production machine entry is an independent hostname + direct TLS 1.3
 listener serving the existing `/v1/agent/*` handler with the frozen Ed25519
 identity. Tests use synthetic CA/server certs and verify the production TLS 1.3
 configuration, TLS 1.2 rejection, untrusted CA rejection, and real agent

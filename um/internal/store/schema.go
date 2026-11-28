@@ -30,13 +30,14 @@ import (
 	"sync"
 	"time"
 
+	"github.com/yikkrrtykj/install-singboxhysteria2/um/internal/fileguard"
 	_ "modernc.org/sqlite" // registers the pure-Go "sqlite" database/sql driver
 )
 
 // SchemaVersion is the highest migration version this build knows. Open always
 // migrates a database to exactly this version; a database with a newer version
 // is rejected fail-closed instead of being silently used by older code.
-const SchemaVersion = 12
+const SchemaVersion = 13
 
 // Node classes accepted by the rev-5 platform isolation contract.
 const (
@@ -688,6 +689,20 @@ var migrations = []migration{
 		`ALTER TABLE umc_users ADD COLUMN totp_failed_attempts INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE umc_users ADD COLUMN totp_locked_until INTEGER`,
 	}},
+	{version: 13, statements: []string{
+		// Credential epoch CAS: account security changes increment auth_epoch;
+		// pending/active sessions bind to the epoch that authorized them. This
+		// closes the old-password-verification / password-reset race without
+		// holding an SQLite write transaction across Argon2id. Additive only.
+		`ALTER TABLE umc_users ADD COLUMN auth_epoch INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE umc_sessions ADD COLUMN auth_epoch INTEGER NOT NULL DEFAULT 0`,
+		// Master-key/database consistency sentinel and bounded auth metadata.
+		`CREATE TABLE IF NOT EXISTS umc_meta (
+			meta_key   TEXT PRIMARY KEY,
+			meta_value BLOB NOT NULL,
+			updated_at INTEGER NOT NULL
+		) STRICT`,
+	}},
 }
 
 // Open creates the parent directory if needed, opens the SQLite database,
@@ -699,8 +714,8 @@ func Open(path string) (*Store, error) {
 		return nil, &InvalidArgumentError{Field: "path", Detail: "must not be empty"}
 	}
 	if dir := filepath.Dir(path); dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return nil, fmt.Errorf("store: create database directory: %w", err)
+		if err := fileguard.EnsurePrivateDir(dir); err != nil {
+			return nil, fmt.Errorf("store: create/private database directory: %w", err)
 		}
 	}
 	// Apply PRAGMAs through the driver DSN. This is the per-connection
@@ -733,6 +748,21 @@ func Open(path string) (*Store, error) {
 	if err := s.applyMigrations(ctx); err != nil {
 		_ = db.Close()
 		return nil, err
+	}
+	// DB/WAL/SHM passwords, sessions and encrypted TOTP state must be readable
+	// only by the service owner. Existing WAL/SHM are hardened now; the service
+	// entrypoint also sets a private umask before future SQLite creates them.
+	if err := fileguard.EnsurePrivateFile(path); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("store: protect database file: %w", err)
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if _, statErr := os.Stat(path + suffix); statErr == nil {
+			if err := fileguard.EnsurePrivateFile(path + suffix); err != nil {
+				_ = db.Close()
+				return nil, fmt.Errorf("store: protect database %s: %w", suffix, err)
+			}
+		}
 	}
 	return s, nil
 }

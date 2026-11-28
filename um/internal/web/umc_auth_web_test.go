@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yikkrrtykj/install-singboxhysteria2/um/internal/store"
 	"github.com/yikkrrtykj/install-singboxhysteria2/um/internal/umcauth"
 )
 
@@ -175,13 +176,18 @@ func TestUMCRecoveryPasswordSessionsAndLastAdmin(t *testing.T) {
 	if status != http.StatusUnauthorized {
 		t.Fatalf("old password accepted: %d", status)
 	}
+	// Move the deterministic server clock forward so the replacement login uses
+	// a fresh time step above the persistent TOTP high-water (old steps are now
+	// rejected by design).
+	*tw.clock = tw.clock.Add(30 * time.Second)
+	tw.jwt = tw.access.token(t, testAccessSubject, *tw.clock)
 	preNew := tw.startContext(t)
 	login = tw.loginWithPassword(t, newPassword, preNew)
 	pendingCSRF, _ = login["csrf_token"].(string)
 	if pendingCSRF == "" || login["totp_required"] != true {
 		t.Fatalf("new password login shape: %v", login)
 	}
-	nextCode, _ := umcauth.TOTPCode(newSecret, tw.clock.Add(-30*time.Second))
+	nextCode, _ := umcauth.TOTPCode(newSecret, tw.clock.Add(30*time.Second))
 	status, raw = tw.request(t, http.MethodPost, "/auth/totp", pendingCSRF, map[string]any{"code": nextCode}, tw.jwt)
 	if status != http.StatusOK {
 		t.Fatalf("new password TOTP status=%d body=%s", status, raw)
@@ -340,5 +346,96 @@ func TestUMCTOTPFailureLockout(t *testing.T) {
 	status, raw = tw.request(t, http.MethodPost, "/auth/totp", pending, map[string]any{"code": code}, tw.jwt)
 	if status != http.StatusOK {
 		t.Fatalf("post-lock correct TOTP status=%d body=%s", status, raw)
+	}
+}
+
+func TestUMCSecurityStateChangeInvalidatesLiveSession(t *testing.T) {
+	tw := newTestWeb(t)
+	now := *tw.clock
+	hash, _ := umcauth.HashPassword(tw.password, umcauth.DefaultPasswordParams())
+	user, err := tw.store.BootstrapAuthUser(context.Background(), "security-change", hash, now.Unix())
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventID := "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+	if _, err := tw.store.CreateEvent(context.Background(), eventID, "A", now.Unix()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.store.CreateAuthUser(context.Background(), store.AuthUserInput{Username: "security-admin-2", PasswordHash: hash,
+		Role: store.AuthRolePlatformAdmin, Now: now.Unix()}); err != nil {
+		t.Fatal(err)
+	}
+	secret, _ := umcauth.NewTOTPSecret()
+	sealed, _ := umcauth.Seal(tw.master, []byte(secret), []byte("umc-totp:"+user.UserID+":v1"))
+	if err := tw.store.SetAuthUserTOTP(context.Background(), user.UserID, sealed, 1, now.Unix()); err != nil {
+		t.Fatal(err)
+	}
+	pre := tw.startContext(t)
+	status, raw := tw.request(t, http.MethodPost, "/auth/login", pre,
+		map[string]any{"username": "security-change", "password": tw.password}, tw.jwt)
+	if status != http.StatusOK {
+		t.Fatalf("login status=%d body=%s", status, raw)
+	}
+	pending, _ := decodeMap(t, raw)["csrf_token"].(string)
+	code, _ := umcauth.TOTPCode(secret, *tw.clock)
+	status, raw = tw.request(t, http.MethodPost, "/auth/totp", pending, map[string]any{"code": code}, tw.jwt)
+	if status != http.StatusOK {
+		t.Fatalf("TOTP status=%d body=%s", status, raw)
+	}
+	// A role/scope mutation commits while the browser session is live; the
+	// epoch/revocation boundary must make the old session unusable immediately.
+	user, _ = tw.store.GetAuthUserByID(context.Background(), user.UserID)
+	if err := tw.store.SetAuthUserRoleAndScopes(context.Background(), user.UserID, store.AuthRoleEventAdmin,
+		[]string{eventID}, now.Unix()+1); err != nil {
+		t.Fatal(err)
+	}
+	status, _ = tw.request(t, http.MethodGet, "/api/v1/events", "", nil, tw.jwt)
+	if status != http.StatusUnauthorized {
+		t.Fatalf("B4 request with role-changed session status=%d, want 401", status)
+	}
+}
+
+func TestUMCAdminRoleChangeRevokesLiveSession(t *testing.T) {
+	tw := newTestWeb(t)
+	now := *tw.clock
+	hash, _ := umcauth.HashPassword(tw.password, umcauth.DefaultPasswordParams())
+	user, err := tw.store.BootstrapAuthUser(context.Background(), "role-change-admin", hash, now.Unix())
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventID := "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+	if _, err := tw.store.CreateEvent(context.Background(), eventID, "A", now.Unix()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.store.CreateAuthUser(context.Background(), store.AuthUserInput{Username: "role-change-admin-2",
+		PasswordHash: hash, Role: store.AuthRolePlatformAdmin, Now: now.Unix()}); err != nil {
+		t.Fatal(err)
+	}
+	secret, _ := umcauth.NewTOTPSecret()
+	sealed, _ := umcauth.Seal(tw.master, []byte(secret), []byte("umc-totp:"+user.UserID+":v1"))
+	if err := tw.store.SetAuthUserTOTP(context.Background(), user.UserID, sealed, 1, now.Unix()); err != nil {
+		t.Fatal(err)
+	}
+	pre := tw.startContext(t)
+	status, raw := tw.request(t, http.MethodPost, "/auth/login", pre,
+		map[string]any{"username": "role-change-admin", "password": tw.password}, tw.jwt)
+	if status != http.StatusOK {
+		t.Fatalf("login status=%d body=%s", status, raw)
+	}
+	pending, _ := decodeMap(t, raw)["csrf_token"].(string)
+	code, _ := umcauth.TOTPCode(secret, *tw.clock)
+	status, raw = tw.request(t, http.MethodPost, "/auth/totp", pending, map[string]any{"code": code}, tw.jwt)
+	if status != http.StatusOK {
+		t.Fatalf("TOTP status=%d body=%s", status, raw)
+	}
+	csrf, _ := decodeMap(t, raw)["csrf_token"].(string)
+	status, raw = tw.request(t, http.MethodPost, "/web/api/users/"+user.UserID+"/role", csrf,
+		map[string]any{"role": store.AuthRoleEventAdmin, "event_ids": []string{eventID}}, tw.jwt)
+	if status != http.StatusOK {
+		t.Fatalf("role change status=%d body=%s", status, raw)
+	}
+	status, _ = tw.request(t, http.MethodGet, "/api/v1/events", "", nil, tw.jwt)
+	if status != http.StatusUnauthorized {
+		t.Fatalf("live session survived role change status=%d", status)
 	}
 }

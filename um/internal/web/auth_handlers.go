@@ -101,6 +101,7 @@ func (h *Handler) issueSession(ctx context.Context, w http.ResponseWriter, user 
 		AccessSubject: claims.Claims.Subject, AccessIssuer: claims.Claims.Issuer,
 		CSRFHash: umcauth.HashToken(csrf), PendingSecret: pending,
 		CreatedAt: now, LastSeenAt: now, IdleExpiresAt: now + idle, AbsoluteExpiresAt: now + absolute,
+		AuthEpoch: user.AuthEpoch,
 	}
 	if len(pending) > 0 {
 		v := now
@@ -112,6 +113,14 @@ func (h *Handler) issueSession(ctx context.Context, w http.ResponseWriter, user 
 	h.setSessionCookie(w, token, int(absolute))
 	h.setCSRFCookie(w, csrf, int(absolute))
 	return csrf, nil
+}
+
+func (h *Handler) writeSessionIssueError(w http.ResponseWriter, err error) {
+	if errors.Is(err, store.ErrAuthStale) {
+		h.writeError(w, http.StatusUnauthorized, "credentials_changed", "account security state changed; authenticate again")
+		return
+	}
+	h.writeError(w, http.StatusInternalServerError, "internal", "session unavailable")
 }
 
 func (h *Handler) rotateSession(ctx context.Context, w http.ResponseWriter, id *identity,
@@ -135,6 +144,7 @@ func (h *Handler) rotateSession(ctx context.Context, w http.ResponseWriter, id *
 		CSRFHash: umcauth.HashToken(csrf), PendingSecret: pending,
 		CreatedAt: now, LastSeenAt: now,
 		IdleExpiresAt: now + int64(h.idle/time.Second), AbsoluteExpiresAt: now + int64(h.absolute/time.Second),
+		AuthEpoch: id.User.AuthEpoch,
 	}
 	if len(pending) > 0 {
 		v := now
@@ -245,8 +255,8 @@ func (h *Handler) verifyPreauth(r *http.Request, claims *umcauth.VerifiedToken) 
 	return p, nil
 }
 
-func (h *Handler) clearPreauth(r *http.Request, p store.AuthPreauth) {
-	_ = h.store.DeletePreauth(r.Context(), p.TokenHash)
+func (h *Handler) clearPreauth(r *http.Request, p store.AuthPreauth) error {
+	return h.store.DeletePreauth(r.Context(), p.TokenHash)
 }
 
 func (h *Handler) login(w http.ResponseWriter, r *http.Request) {
@@ -281,7 +291,7 @@ func (h *Handler) login(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, http.StatusForbidden, "login_csrf_failed", "login session is invalid or expired")
 		return
 	}
-	if !h.limiter.allow("login-account:"+claims.Claims.Subject+"|"+strings.ToLower(username), 0.2, 5) {
+	if !h.limiter.allow("login-account:"+claims.Claims.Subject+"|"+umcauth.HashToken(strings.ToLower(username)), 0.2, 5) {
 		h.writeError(w, http.StatusTooManyRequests, "rate_limited", "login rate limit exceeded")
 		return
 	}
@@ -310,12 +320,18 @@ func (h *Handler) login(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, http.StatusUnauthorized, "invalid_credentials", "invalid username or password")
 		return
 	}
-	h.clearPreauth(r, pre)
+	if h.afterPasswordVerify != nil {
+		h.afterPasswordVerify()
+	}
+	if err := h.clearPreauth(r, pre); err != nil {
+		h.writeError(w, http.StatusServiceUnavailable, "login_state_uncertain", "login preauth could not be consumed; retry")
+		return
+	}
 	// Deliberately do not mark a full login yet: TOTP is mandatory.
 	if len(user.TOTPSecret) > 0 && user.TOTPEnrolledAt != nil {
 		csrf, err := h.issueSession(r.Context(), w, user, claims, store.AuthSessionTOTPPending, nil)
 		if err != nil {
-			h.writeError(w, http.StatusInternalServerError, "internal", "temporary authentication unavailable")
+			h.writeSessionIssueError(w, err)
 			return
 		}
 		h.auditIdentity(r, &identity{User: user}, "umc_password_ok", "user:"+user.UserID, "ok")
@@ -340,7 +356,7 @@ func (h *Handler) login(w http.ResponseWriter, r *http.Request) {
 	}
 	csrf, err := h.issueSession(r.Context(), w, user, claims, store.AuthSessionTOTPSetup, sealed)
 	if err != nil {
-		h.writeError(w, http.StatusInternalServerError, "internal", "temporary authentication unavailable")
+		h.writeSessionIssueError(w, err)
 		return
 	}
 	h.auditIdentity(r, &identity{User: user}, "umc_totp_setup_started", "user:"+user.UserID, "ok")
@@ -359,11 +375,12 @@ func (h *Handler) verifyTOTP(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 		return
 	}
-	id, err := h.authenticate(r, store.AuthSessionTOTPPending, store.AuthSessionTOTPSetup)
+	id, release, err := h.authenticateForMutation(r, store.AuthSessionTOTPPending, store.AuthSessionTOTPSetup)
 	if err != nil {
 		h.writeError(w, http.StatusUnauthorized, "unauthenticated", "pending TOTP session required")
 		return
 	}
+	defer release()
 	if err := h.checkCSRFFor(r, id); err != nil {
 		h.auditIdentity(r, id, "csrf_rejected", "auth_totp", "denied")
 		h.writeError(w, http.StatusForbidden, "csrf_invalid", "CSRF validation failed")
@@ -439,6 +456,7 @@ func (h *Handler) verifyTOTP(w http.ResponseWriter, r *http.Request) {
 		CreatedAt: nowUnix, LastSeenAt: nowUnix,
 		IdleExpiresAt:     nowUnix + int64(h.idle/time.Second),
 		AbsoluteExpiresAt: nowUnix + int64(h.absolute/time.Second),
+		AuthEpoch:         id.User.AuthEpoch,
 	}
 	if id.Session.State == store.AuthSessionTOTPSetup {
 		sealed, err := h.sealTOTP(id.User.UserID, secret)
@@ -453,7 +471,7 @@ func (h *Handler) verifyTOTP(w http.ResponseWriter, r *http.Request) {
 		}
 		setupReq := h.mutationRequest(r, id.User, "umc_totp_enrolled", "user:"+id.User.UserID,
 			"umc_totp_enrolled", id.User.UserID, "totp-setup")
-		if err := h.store.CompleteTOTPSetup(setupReq.Context(), id.User.UserID, sealed, 1,
+		if err := h.store.CompleteTOTPSetup(setupReq.Context(), id.User.UserID, id.User.AuthEpoch, sealed, 1,
 			int64(counter), hashes, oldHash, next, nowUnix); err != nil {
 			if errors.Is(err, store.ErrAuthTOTPReplayed) {
 				h.writeError(w, http.StatusUnauthorized, "totp_replayed", "TOTP code already used")
@@ -461,6 +479,10 @@ func (h *Handler) verifyTOTP(w http.ResponseWriter, r *http.Request) {
 			}
 			if errors.Is(err, store.ErrAuthSessionUnknown) {
 				h.writeError(w, http.StatusUnauthorized, "session_invalid", "pending setup session is no longer valid")
+				return
+			}
+			if errors.Is(err, store.ErrAuthStale) {
+				h.writeError(w, http.StatusUnauthorized, "credentials_changed", "account security state changed; authenticate again")
 				return
 			}
 			h.writeError(w, http.StatusInternalServerError, "internal", "TOTP setup failed")
@@ -474,10 +496,14 @@ func (h *Handler) verifyTOTP(w http.ResponseWriter, r *http.Request) {
 	}
 	loginReq := h.mutationRequest(r, id.User, "umc_login", "user:"+id.User.UserID,
 		"umc_login", id.User.UserID, "totp-login")
-	if err := h.store.CompleteTOTPLogin(loginReq.Context(), id.User.UserID, int64(counter), oldHash, next, nowUnix); err != nil {
+	if err := h.store.CompleteTOTPLogin(loginReq.Context(), id.User.UserID, id.User.AuthEpoch, int64(counter), oldHash, next, nowUnix); err != nil {
 		if errors.Is(err, store.ErrAuthTOTPReplayed) {
 			h.auditIdentity(r, id, "umc_totp_replay", "auth_totp", "denied")
 			h.writeError(w, http.StatusUnauthorized, "totp_replayed", "TOTP code already used")
+			return
+		}
+		if errors.Is(err, store.ErrAuthStale) || errors.Is(err, store.ErrAuthSessionUnknown) {
+			h.writeError(w, http.StatusUnauthorized, "credentials_changed", "account security state changed; authenticate again")
 			return
 		}
 		h.writeError(w, http.StatusInternalServerError, "internal", "session unavailable")
@@ -544,7 +570,7 @@ func (h *Handler) recover(w http.ResponseWriter, r *http.Request) {
 	// Apply the same pre-lookup bucket for existing and unknown usernames so a
 	// 429 response cannot become a deterministic account-enumeration oracle.
 	recoveryKey := strings.ToLower(strings.TrimSpace(req.Username))
-	if !h.limiter.allow("recovery-lookup:"+claims.Claims.Subject+"|"+recoveryKey, 0.1, 3) {
+	if !h.limiter.allow("recovery-lookup:"+claims.Claims.Subject+"|"+umcauth.HashToken(recoveryKey), 0.1, 3) {
 		h.writeError(w, http.StatusTooManyRequests, "rate_limited", "recovery rate limit exceeded")
 		return
 	}
@@ -555,6 +581,7 @@ func (h *Handler) recover(w http.ResponseWriter, r *http.Request) {
 	if getErr == nil {
 		passwordHash = user.PasswordHash
 	}
+	verifiedEpoch := user.AuthEpoch
 	var ok bool
 	if err := h.withKDF(func() error {
 		var verr error
@@ -573,15 +600,23 @@ func (h *Handler) recover(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, http.StatusUnauthorized, "invalid_recovery", "invalid recovery credentials")
 		return
 	}
-	hash := umcauth.HashRecoveryCode(req.RecoveryCode)
-	recoveryReq := h.mutationRequest(r, user, "umc_recovery_code_used", "user:"+user.UserID,
-		"umc_recovery_used", user.UserID, "recovery-code")
-	if err := h.store.ConsumeRecoveryCode(recoveryReq.Context(), user.UserID, hash, h.now().Unix()); err != nil {
+	// Recovery is a credential-state mutation. Serialize with account-security
+	// and management mutations, then reject the pre-lock password verification if
+	// the credential epoch changed while KDF was running.
+	release := h.lockAuthGates(authLock{id: user.UserID, write: true})
+	defer release()
+	latest, err := h.store.GetAuthUserByID(r.Context(), user.UserID)
+	if err != nil || !latest.Enabled || latest.AuthEpoch != verifiedEpoch {
 		h.auditIdentity(r, &identity{User: user}, "umc_recovery_failed", "user:"+user.UserID, "denied")
 		h.writeError(w, http.StatusUnauthorized, "invalid_recovery", "invalid recovery credentials")
 		return
 	}
-	h.clearPreauth(r, pre)
+	user = latest
+	hash := umcauth.HashRecoveryCode(req.RecoveryCode)
+	if err := h.clearPreauth(r, pre); err != nil {
+		h.writeError(w, http.StatusServiceUnavailable, "recovery_state_uncertain", "recovery preauth could not be consumed; retry")
+		return
+	}
 	secret, err := umcauth.NewTOTPSecret()
 	if err != nil {
 		h.writeError(w, http.StatusInternalServerError, "internal", "temporary authentication unavailable")
@@ -592,14 +627,50 @@ func (h *Handler) recover(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, http.StatusInternalServerError, "internal", "temporary authentication unavailable")
 		return
 	}
-	uri, _ := umcauth.OtpauthURI("UM Center", user.Username, secret)
-	csrf, err := h.issueSession(r.Context(), w, user, claims, store.AuthSessionTOTPSetup, sealed)
+	token, err := umcauth.NewToken()
 	if err != nil {
-		h.writeError(w, http.StatusInternalServerError, "internal", "session unavailable")
+		h.writeError(w, http.StatusInternalServerError, "internal", "temporary authentication unavailable")
 		return
 	}
+	publicID, err := umcauth.NewToken()
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, "internal", "temporary authentication unavailable")
+		return
+	}
+	csrf, err := umcauth.NewCSRFToken()
+	if err != nil {
+		h.writeError(w, http.StatusInternalServerError, "internal", "temporary authentication unavailable")
+		return
+	}
+	nowUnix := h.now().Unix()
+	newEpoch := user.AuthEpoch + 1
+	next := store.AuthSession{
+		IDHash: umcauth.HashToken(token), PublicID: publicID, UserID: user.UserID,
+		State: store.AuthSessionTOTPSetup, AccessSubject: claims.Claims.Subject,
+		AccessIssuer: claims.Claims.Issuer, CSRFHash: umcauth.HashToken(csrf),
+		PendingSecret: sealed, AuthEpoch: newEpoch,
+		CreatedAt: nowUnix, LastSeenAt: nowUnix,
+		IdleExpiresAt:     nowUnix + int64(h.idle/time.Second),
+		AbsoluteExpiresAt: nowUnix + int64(h.absolute/time.Second),
+	}
+	recoveryReq := h.mutationRequest(r, user, "umc_recovery_code_used", "user:"+user.UserID,
+		"umc_recovery_used", user.UserID, "recovery-code")
+	if err := h.store.ConsumeRecoveryCodeAndStartSetup(recoveryReq.Context(), user.UserID, user.AuthEpoch,
+		hash, sealed, next, nowUnix); err != nil {
+		if errors.Is(err, store.ErrAuthRecoveryUsed) || errors.Is(err, store.ErrAuthStale) {
+			h.auditIdentity(r, &identity{User: user}, "umc_recovery_failed", "user:"+user.UserID, "denied")
+			h.writeError(w, http.StatusUnauthorized, "invalid_recovery", "invalid recovery credentials")
+			return
+		}
+		h.writeError(w, http.StatusInternalServerError, "internal", "recovery setup failed")
+		return
+	}
+	h.setSessionCookie(w, token, int(h.absolute/time.Second))
+	h.setCSRFCookie(w, csrf, int(h.absolute/time.Second))
+	uri, _ := umcauth.OtpauthURI("UM Center", user.Username, secret)
+	userView := toUserView(user)
 	h.writeJSON(w, http.StatusOK, map[string]any{"totp_setup_required": true, "csrf_token": csrf,
-		"secret": secret, "otpauth_uri": uri, "user": toUserView(user)})
+		"secret": secret, "otpauth_uri": uri, "user": userView})
 }
 
 // mutationRequest attaches atomic audit/ledger metadata to a critical auth-state

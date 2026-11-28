@@ -56,6 +56,10 @@ func (h *Handler) serveAuth(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) requireActive(w http.ResponseWriter, r *http.Request) (*identity, bool) {
 	id, err := h.authenticate(r, store.AuthSessionActive)
 	if err != nil {
+		if errors.Is(err, ErrAuthUnavailable) {
+			h.writeError(w, http.StatusServiceUnavailable, "auth_state_unavailable", "authentication state unavailable; retry")
+			return nil, false
+		}
 		h.writeError(w, http.StatusUnauthorized, "unauthenticated", "authenticated session required")
 		return nil, false
 	}
@@ -78,7 +82,20 @@ func (h *Handler) logout(w http.ResponseWriter, r *http.Request) {
 	}
 	id, err := h.authenticate(r, store.AuthSessionActive, store.AuthSessionTOTPPending, store.AuthSessionTOTPSetup)
 	if err != nil {
+		if errors.Is(err, ErrAuthUnavailable) {
+			h.writeError(w, http.StatusServiceUnavailable, "auth_state_unavailable", "authentication state unavailable; retry")
+			return
+		}
 		h.writeError(w, http.StatusUnauthorized, "unauthenticated", "authenticated session required")
+		return
+	}
+	// Logout is itself a security-state mutation: serialize it with management
+	// mutations of the same account and revalidate after the gate.
+	release := h.lockAuthGates(authLock{id: id.User.UserID, write: true})
+	defer release()
+	id, err = h.authenticate(r, store.AuthSessionActive, store.AuthSessionTOTPPending, store.AuthSessionTOTPSetup)
+	if err != nil {
+		h.writeError(w, http.StatusUnauthorized, "unauthenticated", "session changed; authenticate again")
 		return
 	}
 	if r.Method == http.MethodPost {
@@ -87,8 +104,25 @@ func (h *Handler) logout(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	_ = h.store.RevokeSession(r.Context(), id.Session.IDHash, h.now().Unix())
-	h.auditIdentity(r, id, "umc_logout", "session", "ok")
+	// Revocation and its audit/ledger entry are one transaction. A database
+	// failure must not be reported as a successful logout, and must not emit a
+	// false success audit.
+	logoutReq := h.mutationRequest(r, id.User, "umc_logout", "session:"+id.Session.PublicID,
+		"umc_logout", id.User.UserID, "logout")
+	revokeErr := h.store.RevokeSession(logoutReq.Context(), id.Session.IDHash, h.now().Unix())
+	if revokeErr != nil && !errors.Is(revokeErr, store.ErrAuthSessionUnknown) {
+		h.writeError(w, http.StatusServiceUnavailable, "logout_failed", "session revocation failed; retry logout")
+		return
+	}
+	if errors.Is(revokeErr, store.ErrAuthSessionUnknown) {
+		// A concurrent logout may already have revoked it. Only report idempotent
+		// success after proving the session row is actually revoked.
+		sess, err := h.store.GetSession(r.Context(), id.Session.IDHash)
+		if err != nil || sess.RevokedAt == nil {
+			h.writeError(w, http.StatusServiceUnavailable, "logout_state_uncertain", "session state could not be confirmed")
+			return
+		}
+	}
 	h.clearCookies(w)
 	writeNoContent(w)
 }
@@ -100,6 +134,10 @@ func (h *Handler) me(w http.ResponseWriter, r *http.Request) {
 	}
 	id, err := h.authenticate(r, store.AuthSessionActive, store.AuthSessionTOTPPending, store.AuthSessionTOTPSetup)
 	if err != nil {
+		if errors.Is(err, ErrAuthUnavailable) {
+			h.writeError(w, http.StatusServiceUnavailable, "auth_state_unavailable", "authentication state unavailable; retry")
+			return
+		}
 		h.writeError(w, http.StatusUnauthorized, "unauthenticated", "authenticated session required")
 		return
 	}
@@ -111,10 +149,11 @@ func (h *Handler) changePassword(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 		return
 	}
-	id, ok := h.requireActive(w, r)
+	id, release, ok := h.requireActiveWrite(w, r)
 	if !ok {
 		return
 	}
+	defer release()
 	if !h.limiter.allow("password:"+id.User.UserID, 0.2, 3) {
 		h.writeError(w, http.StatusTooManyRequests, "rate_limited", "password rate limit exceeded")
 		return
@@ -166,10 +205,11 @@ func (h *Handler) regenerateRecoveryCodes(w http.ResponseWriter, r *http.Request
 		h.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 		return
 	}
-	id, ok := h.requireActive(w, r)
+	id, release, ok := h.requireActiveWrite(w, r)
 	if !ok {
 		return
 	}
+	defer release()
 	rotateReq := h.mutationRequest(r, id.User, "umc_recovery_codes_regenerated", "user:"+id.User.UserID,
 		"umc_recovery_codes_rotated", id.User.UserID, "recovery-codes")
 	codes, err := h.replaceRecoveryCodes(rotateReq.Context(), id.User.UserID)
@@ -216,10 +256,11 @@ func (h *Handler) revokeOwnSession(w http.ResponseWriter, r *http.Request, publi
 		h.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 		return
 	}
-	id, ok := h.requireActive(w, r)
+	id, release, ok := h.requireActiveWrite(w, r)
 	if !ok {
 		return
 	}
+	defer release()
 	if strings.TrimSpace(publicID) == "" || len(publicID) > 256 {
 		h.writeError(w, http.StatusBadRequest, "invalid_request", "invalid session id")
 		return
@@ -229,11 +270,12 @@ func (h *Handler) revokeOwnSession(w http.ResponseWriter, r *http.Request, publi
 		h.writeError(w, http.StatusNotFound, "not_found", "session not found")
 		return
 	}
-	if err := h.store.RevokeSessionByPublicID(r.Context(), publicID, h.now().Unix()); err != nil {
+	revokeReq := h.mutationRequest(r, id.User, "umc_session_revoked", "session:"+publicID,
+		"umc_session_revoked", id.User.UserID, "revoke-session")
+	if err := h.store.RevokeSessionByPublicID(revokeReq.Context(), publicID, h.now().Unix()); err != nil {
 		h.writeError(w, http.StatusInternalServerError, "internal", "session revoke failed")
 		return
 	}
-	h.auditIdentity(r, id, "umc_session_revoked", "session", "ok")
 	if sess.IDHash == id.Session.IDHash {
 		h.clearCookies(w)
 	}
@@ -247,10 +289,11 @@ func (h *Handler) updateTOTP(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 		return
 	}
-	id, ok := h.requireActive(w, r)
+	id, release, ok := h.requireActiveWrite(w, r)
 	if !ok {
 		return
 	}
+	defer release()
 	var req struct {
 		Password string `json:"password"`
 	}
@@ -282,6 +325,10 @@ func (h *Handler) updateTOTP(w http.ResponseWriter, r *http.Request) {
 	uri, _ := umcauth.OtpauthURI("UM Center", id.User.Username, secret)
 	csrf, err := h.rotateSession(r.Context(), w, id, store.AuthSessionTOTPSetup, sealed)
 	if err != nil {
+		if errors.Is(err, store.ErrAuthStale) || errors.Is(err, store.ErrAuthSessionUnknown) {
+			h.writeError(w, http.StatusUnauthorized, "credentials_changed", "account security state changed; authenticate again")
+			return
+		}
 		h.writeError(w, http.StatusInternalServerError, "internal", "session unavailable")
 		return
 	}

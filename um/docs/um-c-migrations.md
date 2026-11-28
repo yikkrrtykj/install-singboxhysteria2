@@ -6,6 +6,8 @@ UM-C adds one forward-only additive SQLite migration to the existing single
 - **v11** — local Web authentication/account/session/TOTP/recovery state.
 - **v12** — persistent per-account TOTP failure count and temporary lockout
   deadline (additive columns on `umc_users`).
+- **v13** — persistent credential epoch on `umc_users`/`umc_sessions` and the
+  `umc_meta` master-key sentinel/metadata table.
 
 Migrations v1-v10 and all B1-B4 tables, frozen contracts, triggers, ledger hash
 formula and rev-5/rev-6 schemas are unchanged. `store.Open` still applies
@@ -27,6 +29,13 @@ and is idempotent on reopen.
 v12 adds `umc_users.totp_failed_attempts` (default 0) and
 `umc_users.totp_locked_until` (nullable). These survive process restart and make
 online TOTP guessing protection persistent.
+
+v13 adds zero-default `auth_epoch` columns to `umc_users` and `umc_sessions` so
+existing v11/v12 rows remain valid; it also creates `umc_meta` for the AEAD
+master-key sentinel. Existing TOTP state is not rewritten. A v11/v12 database
+with encrypted TOTP and no sentinel requires the explicit local
+`um-center auth key-init` path, which verifies the key against every secret before
+writing the sentinel; it never rotates/discards TOTP state.
 
 The tables use STRICT typing where appropriate and CASCADE from `umc_users`.
 There are no foreign keys into frozen B1-B4 protocol tables; event scope rows are

@@ -167,18 +167,21 @@ export const useAuthStore = defineStore('auth', () => {
     return reconcileWithContext(snapshot)
   }
 
-  async function logout(): Promise<void> {
+  async function logout(): Promise<boolean> {
+    let serverLogoutOK = true
     try {
       await authApi.logout()
     } catch {
-      // Local state is cleared even if the server call fails (e.g. already
-      // expired); the HttpOnly cookie is handled server-side.
+      // Local memory is cleared for safety, but the caller must show that the
+      // server session may still be valid when revocation failed.
+      serverLogoutOK = false
     }
     resetClientState()
     initialized.value = true
     bootstrapError.value = null
     expired.value = false
     expiredReason.value = null
+    return serverLogoutOK
   }
 
   async function changePassword(

@@ -57,7 +57,14 @@ Observed during development (before the final review-fix commit):
   untrusted CA rejected with a fresh enrollment token, no admin/web routes on
   the machine listener.
 - Auth CLI lab passed: protected key generation, once-only local bootstrap,
-  controlled local recovery (TOTP/session reset).
+  controlled local recovery (TOTP/session reset), explicit master-key key-init
+  upgrade verification.
+- H1-H7 targeted labs passed: credential-epoch concurrent reset (bound/unbound
+  TOTP); B4 mutation vs logout deterministic gate; real SQLite write-lock logout
+  fault; TOTP high-water after cleanup/restart; recovery rollback; master-key
+  sentinel wrong-key/existing-TOTP upgrade; DB/WAL/SHM private files/DACL; TLS1.2,
+  untrusted CA, hostname-mismatch and expired-cert rejection; limiter capacity,
+  unknown-user anonymous audit and login-failure bounds; v12→v13 migration.
 
 ## CI exact verification target (`07633572`)
 
@@ -85,9 +92,15 @@ Local final checks (same worktree/commit family):
 - `go build ./...`: exit 0.
 - Frontend `npm ci`, `npm run typecheck`, `npm test` (99/99 in 10 files),
   `npm run build`: green.
-- Local real-browser Playwright auth closure: `1 passed`; synthetic Access/JWKS
-  and self-signed loopback TLS only. Screenshots:
-  `um/docs/um-c-browser-dashboard.png`, `um/docs/um-c-browser-users.png`.
+- Local real-browser Playwright auth closure expanded to **9/9 serial Chromium
+  tests** with synthetic Access/JWKS and self-signed loopback TLS only: preserved
+  platform-admin closure; UI provisioning of event_admin A/B + viewer A/B; forced
+  TOTP setup and normal login for all roles; two-event RBAC visibility/mutation
+  denial; CSRF and local-B4-bearer rejection; own/admin session revocation; admin
+  password reset; role/scope revocation/effectiveness; own password change;
+  recovery-code login/reuse rejection/stale TOTP; TOTP update; idle expiry;
+  logout; 403/404. Screenshots are under ignored `um/web/test-results/` and are
+  uploaded by the browser CI workflow.
 - Machine TLS lab: production `center.MachineTLSConfig`, TLS 1.2 rejection,
   untrusted CA rejection with a fresh token, real agent enrollment/config/snapshot
   report; route isolation from admin/web.
@@ -117,6 +130,16 @@ disposition:
 ### Follow-up independent review
 
 A second read-only pass on `395583e1` confirmed the original P1/P2 fixes but found two residual P2s: the persistent TOTP failure counter did not reset after an expired lock (possible indefinite lockout DoS), and `/auth/recovery` still had a deterministic 429-vs-401 pre-lookup oracle for known vs unknown usernames. Both are fixed in the next review-fix commit: lock expiry resets the failure window; password reset/enable clears lock state; all-session revocation is documented; recovery uses one subject+username pre-lookup bucket for both cases. The follow-up also committed the setup-session conflict 401 mapping. Remaining items are P3 doc/test gaps and exact-HEAD CI/evidence refresh.
+
+## H1-H8 final security closure notes (pending final exact-HEAD IDs)
+
+The final closure added v13 credential epochs/session binding and master-key
+sentinel, per-account management authorization gates, atomic logout audit/revoke,
+high-water TOTP replay protection after cleanup/restart, atomic recovery setup,
+closed file-permission/DACL hardening, production JWKS/plain-ingest restrictions,
+rate/resource bounds, and the 9-test multi-role browser lab. The final exact-HEAD
+CI/lab run, independent review and merge/post-merge verification are recorded
+below once complete; no real edge deployment is claimed.
 
 ## Claims NOT made
 

@@ -24,6 +24,9 @@ const notice = computed(() => {
   if (route.query.reason === 'session_expired') {
     return '会话已过期，请重新登录。'
   }
+  if (route.query.reason === 'logout_failed') {
+    return '退出请求未能确认撤销服务端会话。请检查网络后重试，必要时通过“登录会话”撤销该设备。'
+  }
   return null
 })
 

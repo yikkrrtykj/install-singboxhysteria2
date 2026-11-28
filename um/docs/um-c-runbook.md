@@ -79,8 +79,9 @@ um-center \
 
 - The Web listener must be loopback; `-web` requires master key, Access
   issuer/audience/JWKS and at least one exact `https://` origin.
-- Do not use `-access-jwks-insecure-http-for-tests` in deployment. It is only for
-  hermetic labs.
+- The production `um-center` binary has no insecure-JWKS flag; the Access verifier
+  accepts HTTPS JWKS only. Hermetic tests/harnesses set the test-only verifier
+  option directly, outside the production entrypoint.
 - `-web-tls` plus `-web-tls-cert/-web-tls-key` is for local browser labs. In
   production Cloudflare terminates public TLS and the origin remains loopback;
   Access is still cryptographically verified at the center.
@@ -166,11 +167,33 @@ um-center auth recover \
   auto-regenerate the key at startup. Restore the exact key/DB pair from an
   Owner-approved offline backup. Backup/restore drills and offsite escrow are
   UM-E/operations gates, not claimed complete here.
-- Migration v11 is additive only. There is no automatic downgrade. Operational
+- Migration v11/v12/v13 is additive only. There is no automatic downgrade. Operational
   rollback restores a pre-upgrade DB backup; older binaries refuse newer schema.
 - Stopping the center closes Web/admin/machine listeners; agents can continue to
   spool reports independently, and machine TLS does not depend on Cloudflare
   Access or browser sessions.
+
+## 8.1 Master-key sentinel upgrade and private files
+
+On startup the Web plane verifies the master key against the database sentinel.
+If an upgraded v11/v12 database already contains TOTP state but no sentinel, Web
+startup fails closed. With the database stopped, run:
+
+```bash
+um-center auth key-init --db /var/lib/um-center/center.db   --master-key /etc/um-center/master.key
+```
+
+The command first opens every existing TOTP secret with the key and only then
+writes the sentinel; a wrong key is refused and no TOTP state is changed. A brand
+new empty auth database initializes its sentinel automatically at first Web
+startup. The database directory is private (0700), DB/WAL/SHM are owner-private
+(0600 on POSIX; closed DACL on Windows), and the service sets a private umask
+before SQLite creates future WAL/SHM. TLS private keys must also pass the same
+owner-private/admin-only file check; public certificates need not.
+
+A wrong master key fails the whole center startup closed (machine and Web
+processes do not report the auth service as healthy). Once running, machine TLS
+and agent spooling do not depend on Cloudflare Access/JWKS/browser sessions.
 
 ## 9. Verification commands
 

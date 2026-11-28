@@ -2,8 +2,14 @@ package center_test
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -156,5 +162,71 @@ func TestUMCMachineTLSIndependentListener(t *testing.T) {
 	defer bad.Close()
 	if err := bad.Enroll(ctx, badToken); err == nil {
 		t.Fatal("untrusted machine TLS CA was accepted")
+	}
+}
+
+func syntheticMachineCert(t *testing.T, notBefore, notAfter time.Time, dns string) tls.Certificate {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tpl := &x509.Certificate{
+		SerialNumber: big.NewInt(time.Now().UnixNano()),
+		Subject:      pkix.Name{CommonName: dns},
+		NotBefore:    notBefore,
+		NotAfter:     notAfter,
+		DNSNames:     []string{dns},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tpl, tpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
+}
+
+func certPoolFor(t *testing.T, cert tls.Certificate) *x509.CertPool {
+	t.Helper()
+	pool := x509.NewCertPool()
+	parsed, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool.AddCert(parsed)
+	return pool
+}
+
+func TestUMCMachineTLSRejectsHostnameMismatchAndExpiredCertificate(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
+	cert := syntheticMachineCert(t, time.Now().Add(-time.Hour), time.Now().Add(time.Hour), "machine.example")
+	ts := httptest.NewUnstartedServer(handler)
+	ts.TLS = center.MachineTLSConfig(cert)
+	ts.StartTLS()
+	defer ts.Close()
+
+	// The cert is valid for machine.example, but the client connects to 127.0.0.1
+	// with an explicit mismatching ServerName.
+	pool := certPoolFor(t, cert)
+	badHost := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{RootCAs: pool, ServerName: "wrong.example"},
+	}}
+	if _, err := badHost.Get(ts.URL); err == nil {
+		t.Fatal("machine TLS accepted a hostname-mismatched certificate")
+	}
+
+	expired := syntheticMachineCert(t, time.Now().Add(-2*time.Hour), time.Now().Add(-time.Hour), "machine.example")
+	ets := httptest.NewUnstartedServer(handler)
+	ets.TLS = center.MachineTLSConfig(expired)
+	ets.StartTLS()
+	defer ets.Close()
+	expiredPool := certPoolFor(t, expired)
+	trusting := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{RootCAs: expiredPool, ServerName: "machine.example"},
+	}}
+	if _, err := trusting.Get(ets.URL); err == nil {
+		t.Fatal("machine TLS accepted an expired certificate")
 	}
 }

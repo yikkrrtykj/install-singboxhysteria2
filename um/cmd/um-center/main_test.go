@@ -14,3 +14,16 @@ func TestRequireLoopbackAdmin(t *testing.T) {
 		}
 	}
 }
+
+func TestUMCPlainIngestMustBeLoopback(t *testing.T) {
+	cases := map[string]bool{
+		"127.0.0.1:8443": true, "[::1]:8443": true, "localhost:8443": true,
+		"0.0.0.0:8443": false, "[::]:8443": false, ":8443": false,
+		"192.0.2.1:8443": false, "bad": false,
+	}
+	for addr, want := range cases {
+		if got := isLoopbackHostPort(addr); got != want {
+			t.Fatalf("isLoopbackHostPort(%q)=%v, want %v", addr, got, want)
+		}
+	}
+}

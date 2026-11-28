@@ -91,19 +91,28 @@ bearer listener remains separate and is not tunnel-routed.
 - CSRF cookie: `__Host-um_csrf`, Secure, HttpOnly, SameSite=Strict; the SPA
   obtains the raw value from `/auth/context` (never `document.cookie`) and puts
   it in `X-CSRF-Token`; server stores only its hash.
+- Credential epoch: password/TOTP/recovery/enable-disable/role-scope changes
+  advance a persistent account epoch; sessions bind to it and a password verified
+  before a concurrent reset cannot create a session. B4 mutations are linearized
+  against account revocation with per-account gates.
 - Idle 30 min, absolute 12 h (server-enforced). Pending TOTP challenge/setup
   sessions have a 10-minute TTL. Login/TOTP/recovery/user mutations are
   rate-limited by verified Access subject/session/user, not loopback IP;
   Argon2id concurrency is capped at 4. Five TOTP failures temporarily lock the
   account's TOTP for 15 minutes and revoke the account's sessions; the failure
   window resets after expiry or a successful password/TOTP/recovery/enable.
-- TOTP: RFC 6238 SHA-1/6 digits/30 s, ±1 step; persistent counter and atomic
-  login/setup completion prevent replay. Recovery codes: 10 generated, single
+- TOTP: RFC 6238 SHA-1/6 digits/30 s, ±1 step; persistent high-water plus counter
+  and atomic login/setup completion prevent replay even after old counter rows
+  are cleaned up or across restart/clock rollback. Recovery consumption is atomic
+  with the restricted setup-session creation. Recovery codes: 10 generated, single
   use, hashes only; successful recovery invalidates the remaining generation.
 
 ## Error model
 
-Errors are JSON `{"error":{"code","message","retryable"}}`. Credential failures
+Errors are JSON `{"error":{"code","message","retryable"}}`. Authentication-state
+database outages return bounded 503 (`auth_state_unavailable`) rather than a
+false 401; logout revocation failures return 503/`logout_state_uncertain` and are
+never reported as successful. The frontend displays that uncertainty. Credential failures
 use generic `invalid_credentials`/`invalid_recovery`; CSRF failure is
 `csrf_invalid`/`login_csrf_failed`; last-admin protection is
 `last_platform_admin`; rate limits use HTTP 429 and KDF saturation uses HTTP 503

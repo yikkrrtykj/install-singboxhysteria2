@@ -96,3 +96,20 @@ event operations return the pre-existing B4 non-leaking 404/403 behavior.
 - Docs/OpenAPI/runbook/templates committed; no real external resource used.
 - Independent review complete or explicitly outstanding; Draft PR remains open,
   unmerged; final status recorded only when evidence is tied to exact HEAD.
+
+
+## 6. Final security closure H1-H8 (this phase)
+
+| Area | Status/evidence |
+| --- | --- |
+| H1 credential epoch / KDF-vs-session race | Fixed: v13 persistent account/session credential epoch; transactional session-create CAS and epoch revalidation for pending/setup/active sessions; deterministic barrier test covers bound and unbound TOTP accounts and concurrent password reset. |
+| H2 management-mutation authorization linearization | Fixed: per-account read/write authorization gates around existing B4 service mutations and account-security mutations; deterministic real HTTP+SQLite barrier proves a revocation waits for an in-flight authorized mutation and a new mutation after revocation gets 401. No second RBAC/global lock. |
+| H3 logout/session failure semantics | Fixed: revoke+audit/ledger atomic transaction; DB fault returns bounded 503 and keeps session; retry succeeds and invalidates; authenticated-state DB errors map to 503 rather than false 401; preauth consumption checked; frontend displays logout uncertainty. Real SQLite write-lock fault test. |
+| H4 TOTP/recovery lifecycle | Fixed/verified: persistent high-water survives bounded counter cleanup/restart and clock rollback; setup/login completion atomic; recovery consumption atomic with setup-session creation (rollback test); recovery generation invalidation; lockout window expires/reset with admin unlock; concurrent counters/setup tests. |
+| H5 master key / files | Fixed: AEAD DB sentinel verifies key before Web starts; wrong key fails closed; explicit local v11/v12 key-init verifies all existing TOTP secrets before writing sentinel; DB/WAL/SHM/private dir/TLS key/B4 files use closed permission model (POSIX modes/owner, Windows DACL); private umask. |
+| H6 Access/JWKS and machine TLS boundary | Fixed/verified: no production insecure-JWKS flag; HTTPS-only verifier; plain ingest forced loopback, non-loopback machine traffic requires TLS 1.3; TLS1.2/untrusted CA/hostname mismatch/expired cert negatives; machine route isolation and real agent enrollment/config/report. |
+| H7 rate/audit/resource bounds | Verified/fixed: bounded limiter eviction, hashed untrusted keys, unknown usernames only anonymous audit, login failure/429 regression, preauth rate/cleanup, lockout admin unlock, v12→v13 migration test, audit/ledger atomic rollback test, B4 180d retention unchanged. |
+| H8 real browser E2E | Expanded to 9 serial Chromium tests covering platform_admin, event_admin A/B, viewer A/B, two events, UI user provisioning, forced TOTP setup + normal login, RBAC visibility/mutation denial, CSRF/local-bearer rejection, own/admin session revoke, role/scope change, admin password reset, password change, recovery-code login/reuse rejection, TOTP update, idle expiry, logout, 403/404. Synthetic Access/loopback TLS only. |
+
+Final exact-HEAD Go/frontend/browser/CI/labs, independent review, merge, post-merge
+verification and archive are recorded in `um-c-evidence.md` and the PR/Issue.

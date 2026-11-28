@@ -39,8 +39,13 @@ async function onLogout(): Promise<void> {
   loggingOut.value = true
   logoutError.value = null
   try {
-    await auth.logout()
-    await router.replace({ name: 'login' })
+    const serverLogoutOK = await auth.logout()
+    if (!serverLogoutOK) {
+      logoutError.value = '退出请求未能确认撤销服务端会话，请立即检查账户会话并重试。'
+      await router.replace({ name: 'login', query: { reason: 'logout_failed' } })
+    } else {
+      await router.replace({ name: 'login' })
+    }
   } catch {
     logoutError.value = '退出登录失败，请重试。'
   } finally {

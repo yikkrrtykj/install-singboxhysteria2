@@ -184,9 +184,18 @@ real SQLite store, real management bridge and real HTTP/TLS cookies. The isolate
 self-signed loopback TLS certificate only; it never contacts Cloudflare/DNS and
 does not prove a real edge deployment.
 
+The harness is a lab-only command (`um/cmd/um-c-e2e`) with two same-origin lab
+surfaces: `/__lab/state|advance` for deterministic forward-only clock/fixtures and
+`/__lab/b4/*`, which mounts the unchanged real B4 management handler behind a
+synthetic in-memory local bearer to prove that a valid local admin credential is
+still rejected by the browser Web plane. None of these surfaces exist in the
+production `um-center` command. The lab seeds a second platform_admin
+(`e2e-owner`) only as an isolated Owner-policy stand-in.
+
 ```bash
 cd um
 go build -o /tmp/um-c-e2e ./cmd/um-c-e2e
+(cd web && npm run build)
 /tmp/um-c-e2e -listen 127.0.0.1:18443 -static web/dist
 # read the E2E_READY JSON line and export:
 # UM_C_E2E_URL, UM_C_E2E_TOKEN, UM_C_E2E_USER, UM_C_E2E_PASSWORD
@@ -194,8 +203,24 @@ cd web
 PLAYWRIGHT_CHANNEL=chrome npm run test:e2e
 ```
 
-The committed test (`tests/e2e/auth.spec.ts`) covers Access-required page load,
-password login, forced TOTP setup/QR page, session establishment, platform-admin
-RBAC page through B4, logout and a second TOTP login. It fails closed if the
-environment is missing or any authentication step fails. See the UM-C runbook and
-scope docs for the production HOLD boundaries.
+`tests/e2e/auth.spec.ts` is the only spec and must run single-worker (the lab
+clock is global). It contains **9 serial real-Chromium tests**:
+
+1. preserved platform_admin login → forced TOTP → dashboard/users → logout →
+   TOTP login closure;
+2. UI provisioning of event_admin A/B and viewer A/B with two independent events;
+3. forced first-login TOTP + normal TOTP login for all roles;
+4. authorized/unauthorized event visibility, viewer read-only, event_admin without
+   global admin;
+5. CSRF rejection and synthetic B4 local bearer accepted by the isolated local
+   admin plane but rejected by the Web plane;
+6. own/admin session revocation and admin password reset;
+7. role/scope change revoking sessions and applying new authorization;
+8. own password change, recovery-code login, recovery-code reuse rejection, stale
+   authenticator rejection, TOTP update;
+9. idle-timeout `/expired`, logout and 404 surfaces.
+
+Screenshots are written under ignored `um/web/test-results/` and uploaded by CI.
+The test fails closed if `UM_C_E2E_*` is absent or any step fails. Real
+Cloudflare/Tunnel/DNS/Access/IdP/certificate/deployment remains HOLD; see the
+UM-C runbook/scope/evidence.
