@@ -11,9 +11,11 @@ with a local bearer token file and a server-side auth file containing principals
 roles, event scopes and SHA-256 token hashes. Do not use an agent identity,
 enrollment token or client-supplied role header as an admin credential.
 
-Create the files with owner-only permissions (`0600`; Windows: DACL without
-Everyone/Authenticated Users/Builtin Users). Keep the raw token in a separate
-operator file and give only its SHA-256 hash to the server auth file.
+Create the files with protected permissions (`0600`; Windows: a DACL whose only
+allow ACEs are the file owner, the `um-center` service account, LocalSystem and
+Builtin Administrators; reject arbitrary local/domain accounts). Keep the raw
+token in a separate operator file and give only its SHA-256 hash to the server
+auth file.
 
 Linux example (conceptual; use the host's secret tooling for the raw token):
 
