@@ -739,6 +739,35 @@ def build_singbox_client_config(creds: Credentials, ports: PortPlan,
     }
 
 
+
+def build_singbox_tls_target_config(creds: Credentials, ports: PortPlan) -> dict:
+    """Real sing-box TLS camouflage target for the Reality handshake.
+
+    A second real sing-box process (not a synthetic Python TLS server) serves a
+    TLS 1.3 trojan inbound on the loopback handshake port. This keeps the
+    Reality handshake target inside the audited real-protocol binary and avoids
+    TLS-library/key-share differences (the pinned 1.14.5 Reality client/server
+    pair interoperates with this target; a Python/OpenSSL target does not).
+    """
+    return {
+        "log": {"level": "error", "timestamp": True},
+        "inbounds": [{
+            "type": "trojan",
+            "tag": "tls-camouflage",
+            "listen": "127.0.0.1",
+            "listen_port": ports.handshake_tls,
+            "users": [{"password": "um-lt-tls-camouflage-synthetic"}],
+            "tls": {
+                "enabled": True,
+                "server_name": creds.server_name,
+                "certificate_path": creds.cert_path,
+                "key_path": creds.key_path,
+            },
+        }],
+        "outbounds": [{"type": "direct", "tag": "direct"}],
+    }
+
+
 def write_singbox_configs(workdir: str, creds: Credentials,
                           ports: PortPlan) -> dict:
     """Write + return paths of the server and both client configurations."""
@@ -747,12 +776,15 @@ def write_singbox_configs(workdir: str, creds: Credentials,
         "server": os.path.join(workdir, "singbox-server.json"),
         "client_reality": os.path.join(workdir, "singbox-client-reality.json"),
         "client_hysteria2": os.path.join(workdir, "singbox-client-hysteria2.json"),
+        "tls_target": os.path.join(workdir, "singbox-tls-target.json"),
     }
     write_json(paths["server"], build_singbox_server_config(creds, ports), 0o600)
     write_json(paths["client_reality"],
                build_singbox_client_config(creds, ports, "reality"), 0o600)
     write_json(paths["client_hysteria2"],
                build_singbox_client_config(creds, ports, "hysteria2"), 0o600)
+    write_json(paths["tls_target"],
+               build_singbox_tls_target_config(creds, ports), 0o600)
     return paths
 
 

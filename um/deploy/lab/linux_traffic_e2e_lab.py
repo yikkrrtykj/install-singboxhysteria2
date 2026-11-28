@@ -649,6 +649,7 @@ class Lab:
         self.continuous_agent = None
         self.payload_server = None
         self.tls_server = None
+        self.tls_target_proc = None
         self.export_path = os.path.join(self.monitor_export_dir,
                                         "traffic-export.json")
         self.health_file = os.path.join(self.monitor_export_dir,
@@ -913,12 +914,17 @@ class Lab:
     def start_singbox_stack(self) -> None:
         ports = self.ports
         # The Reality handshake target must be listening before any real client
-        # can complete a first handshake. Start it before the sing-box server and
-        # clients; its readiness probe is independent of traffic.
+        # can complete a first handshake. It is a second real sing-box TLS
+        # inbound, not a synthetic TLS library, because the pinned 1.14.5
+        # Reality client/server pair requires a compatible real TLS target.
         self.payload_server = lab.PayloadServer(ports.http_fixture).start()
-        self.tls_server = lab.TlsCamouflageServer(
-            ports.handshake_tls, self.creds.cert_path,
-            self.creds.key_path).start()
+        self.tls_target_proc = self._start_process(
+            "singbox-tls-target",
+            [self.singbox_bin, "run", "-c", self.config_paths["tls_target"]])
+        if not lab.wait_port("127.0.0.1", ports.handshake_tls, timeout=20):
+            raise lab.LabError(
+                "real sing-box TLS camouflage target did not start on "
+                "127.0.0.1:%d" % ports.handshake_tls)
         self.server_proc = self._start_process(
             "singbox-server",
             [self.singbox_bin, "run", "-c", self.config_paths["server"]])
@@ -2753,6 +2759,7 @@ class Lab:
         if self.tls_server is not None:
             self.tls_server.stop()
             self.tls_server = None
+        self.tls_target_proc = None
         # Never leave synthetic credential material behind when the lab is
         # asked to clean up. When the artifacts directory lives inside the
         # workdir it is preserved (redacted evidence is the deliverable).

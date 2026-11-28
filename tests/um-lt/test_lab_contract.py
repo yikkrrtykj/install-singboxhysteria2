@@ -480,7 +480,7 @@ class ConfigGenerationTests(unittest.TestCase):
             ports = lib.PortPlan.allocate()
             paths = lib.write_singbox_configs(tmp, self._credentials(), ports)
             self.assertEqual(set(paths), {"server", "client_reality",
-                                          "client_hysteria2"})
+                                          "client_hysteria2", "tls_target"})
             for path in paths.values():
                 self.assertTrue(os.path.isfile(path))
                 lib.read_json(path)
