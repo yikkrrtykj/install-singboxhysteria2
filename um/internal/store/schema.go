@@ -36,7 +36,7 @@ import (
 // SchemaVersion is the highest migration version this build knows. Open always
 // migrates a database to exactly this version; a database with a newer version
 // is rejected fail-closed instead of being silently used by older code.
-const SchemaVersion = 10
+const SchemaVersion = 11
 
 // Node classes accepted by the rev-5 platform isolation contract.
 const (
@@ -615,6 +615,71 @@ var migrations = []migration{
 			ON purge_confirmations(event_id, actor, expires_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_purge_confirmations_expiry
 			ON purge_confirmations(expires_at)`,
+	}},
+	{version: 11, statements: []string{
+		// UM-C local account/session/TOTP/recovery state. Additive only; the
+		// existing B1-B4 tables and frozen contracts are untouched.
+		`CREATE TABLE IF NOT EXISTS umc_users (
+			user_id       TEXT PRIMARY KEY,
+			username      TEXT NOT NULL UNIQUE COLLATE NOCASE,
+			password_hash TEXT NOT NULL,
+			role          TEXT NOT NULL CHECK (role IN ('platform_admin','event_admin','viewer')),
+			enabled       INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+			totp_secret   BLOB,
+			totp_key_version INTEGER,
+			totp_enrolled_at INTEGER,
+			totp_last_counter INTEGER,
+			created_at    INTEGER NOT NULL CHECK (typeof(created_at) = 'integer'),
+			updated_at    INTEGER NOT NULL CHECK (typeof(updated_at) = 'integer'),
+			disabled_at   INTEGER,
+			last_login_at INTEGER
+		) STRICT`,
+		`CREATE TABLE IF NOT EXISTS umc_user_event_scopes (
+			user_id  TEXT NOT NULL REFERENCES umc_users(user_id) ON DELETE CASCADE,
+			event_id TEXT NOT NULL,
+			PRIMARY KEY (user_id, event_id)
+		) STRICT`,
+		`CREATE INDEX IF NOT EXISTS idx_umc_user_event_scopes_event ON umc_user_event_scopes(event_id)`,
+		`CREATE TABLE IF NOT EXISTS umc_preauth (
+			token_hash     TEXT PRIMARY KEY,
+			access_subject TEXT NOT NULL,
+			access_issuer  TEXT NOT NULL,
+			csrf_hash      TEXT NOT NULL,
+			created_at     INTEGER NOT NULL,
+			expires_at     INTEGER NOT NULL
+		) STRICT`,
+		`CREATE INDEX IF NOT EXISTS idx_umc_preauth_expiry ON umc_preauth(expires_at)`,
+		`CREATE TABLE IF NOT EXISTS umc_sessions (
+			session_id_hash TEXT PRIMARY KEY,
+			user_id         TEXT NOT NULL REFERENCES umc_users(user_id) ON DELETE CASCADE,
+			state           TEXT NOT NULL CHECK (state IN ('totp_pending','totp_setup','authenticated')),
+			access_subject  TEXT NOT NULL,
+			access_issuer   TEXT NOT NULL,
+			csrf_hash       TEXT NOT NULL,
+			pending_secret  BLOB,
+			pending_created_at INTEGER,
+			created_at      INTEGER NOT NULL,
+			last_seen_at    INTEGER NOT NULL,
+			idle_expires_at INTEGER NOT NULL,
+			absolute_expires_at INTEGER NOT NULL,
+			revoked_at      INTEGER
+		) STRICT`,
+		`CREATE INDEX IF NOT EXISTS idx_umc_sessions_user ON umc_sessions(user_id, revoked_at, created_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_umc_sessions_idle ON umc_sessions(idle_expires_at)`,
+		`CREATE TABLE IF NOT EXISTS umc_recovery_codes (
+			user_id   TEXT NOT NULL REFERENCES umc_users(user_id) ON DELETE CASCADE,
+			code_hash TEXT NOT NULL,
+			created_at INTEGER NOT NULL,
+			used_at   INTEGER,
+			PRIMARY KEY (user_id, code_hash)
+		) STRICT`,
+		`CREATE TABLE IF NOT EXISTS umc_totp_counters (
+			user_id TEXT NOT NULL REFERENCES umc_users(user_id) ON DELETE CASCADE,
+			counter INTEGER NOT NULL,
+			used_at INTEGER NOT NULL,
+			PRIMARY KEY (user_id, counter)
+		) STRICT`,
+		`CREATE INDEX IF NOT EXISTS idx_umc_totp_counters_age ON umc_totp_counters(used_at)`,
 	}},
 }
 
