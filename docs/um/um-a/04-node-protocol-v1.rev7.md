@@ -130,9 +130,11 @@ match this section; they are never configurable by the center.
 The export is written by the non-root monitor service user (packaged:
 `sboxweb`, referenced as `<monitor-user>`) and read by the unprivileged agent
 service user (`<agent-user>`; reference `umagent`). The operator creates the
-directory and the reader group; the installer and the monitor never create or
-own the directory (an absent directory simply means no export path). There is
-**no ACL** beyond POSIX owner/group/other bits.
+directory and the reader group; the installer and the monitor never create the
+directory, and an absent directory simply means no export path. The operator
+creates it and sets ownership to the non-root monitor user, who then writes as
+the directory owner; the agent is only a reader group member. There is **no
+ACL** beyond POSIX owner/group/other bits.
 
 | Item | Requirement |
 | --- | --- |
@@ -325,7 +327,7 @@ tests remain the implementation PR's evidence.
 | `source_epoch` | 32 lowercase hex | independent monitor observation epoch; changes on monitor accumulator restart; never equal to or derived from `counter_epoch` |
 | `sequence` | integer `0..9007199254740991` | strictly increasing inside one `source_epoch`; ordering/freshness token only, not authorization |
 | `observed_at` | integer `0..1000000000000` | epoch seconds of the monitor observation |
-| `age_seconds` | integer `0..86400` | agent-computed `max(0, collected_at - observed_at)`; `observed_at` more than 60 s in the future relative to `collected_at` is rejected as untrusted clock data; see §7.3 |
+| `age_seconds` | integer `0..86400` | agent-computed `clamp(collected_at - observed_at, 0, 86400)` after the untrusted-clock/expiry checks; `observed_at` more than 60 s in the future relative to `collected_at` is rejected as untrusted clock data; see §7.3 |
 | `freshness` | `fresh\|stale\|unavailable` | derived, see §7.3 |
 | `availability` | `ok\|partial\|unavailable` | final agent view of the whole observation, see §7.4 |
 | `counter_scope` | const `observation_epoch` | counters are scoped to the monitor observation epoch, not the daemon lifetime and not host boot |
@@ -373,11 +375,14 @@ Required fields per entry: `inbound_tag`, `kind`, `observed_at`, `availability`,
 1. Integer counters use the JSON integer lexical form only: a token containing
    `.`, `e` or `E` (for example `1048576.0`) MUST be rejected by the receiving
    implementation even though JSON Schema classifies such a number as an
-   integer. The monitor keeps counters as exact integers internally (never as
-   floats); a counter outside `0..9007199254740991` is published as `null` with
-   `quality=partial`, never rounded, clamped or wrapped. The agent copies the
-   integer unchanged into the report; the legacy float-formatted dashboard
-   snapshot stays an independent presentation path.
+   integer. The rev-7 implementation MUST make byte accumulation exact integers
+   end-to-end (the pre-rev-7 monitor baseline historically used float64 totals;
+   that is not a licence to emit rounded or display-derived bytes). If any legacy
+   float value remains in the path, it MUST be converted by truncation toward
+   zero (never rounded up), and a value outside `0..9007199254740991` MUST be
+   published as `null` with `quality=partial`, never clamped/wrapped/rounded.
+   The agent copies the integer unchanged into the report; the legacy
+   float-formatted dashboard snapshot stays an independent presentation path.
    The lexical-integer fields are exactly: report `traffic_observation.sequence`,
    `observed_at`, `age_seconds`, each entry `observed_at`, each entry's two byte
    counters and `active_connections`, plus top-level `active_connections`; and
@@ -519,13 +524,15 @@ Missing, unreadable, disabled, unauthorized or expired data is never converted
 to `0`, `up`, `ok` or a stale-but-plausible number. A numeric zero is legal only
 as an observed zero inside a coherent, available observation (for example an
 idle inbound with `active_connections = 0` and observed byte counters that are
-genuinely zero). The no-observation sentinel below is the only representation
-of "nothing observed".
+genuinely zero). The zero-epoch sentinel below is the only representation of "no usable export
+document exists"; a readable, structurally valid export that observed no values
+uses the status-only real-epoch form in §7.6.
 
 ### 7.6 No-observation sentinel (normative)
 
-When a rev-7 body must be emitted and there is no usable observation, the agent
-emits exactly:
+When a rev-7 body must be emitted and there is no usable export document
+(missing, unreadable, invalid, expired, or otherwise untrusted), the agent emits
+exactly:
 
 ```json
 {
@@ -755,9 +762,9 @@ withholds the key until the `CFG-REV7` agent-version gate is satisfied by the
 latest signed snapshot (§11.1), and makes a stored enable flag effective on the
 next config pull after that. A rev-5 agent does not tolerate a seventh `collect`
 key: its frozen strict config validator rejects the config fail-closed and it
-retries the config request immediately without exponential backoff while
-continuing its existing (rev-5) collection; it does not queue new snapshots
-under a rejected config. The center-side gate is therefore mandatory, not
+retries the config request immediately without exponential backoff and does not
+queue new snapshots while the config remains rejected; collection stalls until a
+valid config is applied. The center-side gate is therefore mandatory, not
 defensive: a new center MUST NOT emit the key to an agent that has never reported
 the rev-7 build. Queued rev-7 reports on downgrade are quarantined/dropped by the
 agent without rewriting fsynced `report_id`/body, and rev-5 spool records are

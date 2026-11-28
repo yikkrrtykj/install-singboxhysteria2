@@ -1,0 +1,76 @@
+{
+  "v": 1,
+  "type": "snapshot",
+  "report_id": "7c1e4b9a-2d3f-4e5a-8b6c-9d0e1f2a3b4c",
+  "collected_at": 1795622400,
+  "agent": {
+    "version": "1.1.0",
+    "uptime_s": 86400
+  },
+  "host": {
+    "os": "linux",
+    "kernel": "6.8.0-45-generic",
+    "arch": "amd64"
+  },
+  "availability": {
+    "system": "ok",
+    "services": "ok",
+    "protocols": "ok",
+    "traffic": "unavailable",
+    "clients": "unavailable"
+  },
+  "counter_epoch": "5f0c2d7a91b4e6c8a3d1f9052b7e4c6a",
+  "system": {
+    "cpu_pct": 12.5,
+    "load1": 0.42,
+    "mem_total_bytes": 4294967296,
+    "mem_used_bytes": 1610612736,
+    "disk_total_bytes": 42949672960,
+    "disk_used_bytes": 10737418240,
+    "net_rx_bytes": 123456789,
+    "net_tx_bytes": 987654321
+  },
+  "services": [
+    {
+      "name": "sing-box",
+      "state": "active"
+    }
+  ],
+  "protocols": [
+    {
+      "kind": "reality",
+      "inbound_tag": "vless-in",
+      "state": "up",
+      "reason": "ok",
+      "observed_at": 1795622399
+    },
+    {
+      "kind": "hysteria2",
+      "inbound_tag": "hy2-in",
+      "state": "up",
+      "reason": "ok",
+      "observed_at": 1795622399
+    }
+  ],
+  "traffic": [],
+  "clients": {
+    "active": null,
+    "tracked": null,
+    "summaries": []
+  },
+  "contract_revision": 7,
+  "traffic_observation": {
+    "source": "monitor_readonly_export",
+    "source_epoch": "0123456789abcdef0123456789abcdef",
+    "sequence": 7,
+    "observed_at": 1795622398,
+    "age_seconds": 2,
+    "freshness": "unavailable",
+    "availability": "unavailable",
+    "counter_scope": "observation_epoch",
+    "exactness": "lower_bound",
+    "active_connections": null,
+    "rate_window_seconds": null,
+    "inbounds": []
+  }
+}

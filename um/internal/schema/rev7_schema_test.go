@@ -29,6 +29,7 @@ func TestRev7OverlayCompilesAndValidatesFixtures(t *testing.T) {
 		file   string
 	}{
 		{"report-snapshot.rev7.schema.json", "examples/report-snapshot.json"},
+		{"report-snapshot.rev7.schema.json", "examples/report-snapshot.status-only.json"},
 		{"agent-config.rev7.schema.json", "examples/agent-config.json"},
 		{"traffic-export.schema.json", "examples/traffic-export.json"},
 	}
