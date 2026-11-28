@@ -756,7 +756,7 @@ class Lab:
         self.run_stage("agent-version-gate",
                        self.stage_agent_version_gate)
         self.run_stage("default-disabled", self.stage_default_disabled)
-        self.start_monitor()
+        self.monitor_start()
         self.wait_monitor_ready()
 
     def assert_environment(self) -> None:
