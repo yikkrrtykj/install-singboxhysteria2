@@ -42,6 +42,11 @@ func TestMonitorExportOwnerGroupModeChecks(t *testing.T) {
 		t.Fatalf("stat fixture: %v", err)
 	}
 	col.MonitorExportMode = uint32(info.Mode().Perm())
+	uid, gid, ok := monitorExportPOSIXOwner(info)
+	t.Logf("fixture uid=%d gid=%d ok=%v mode=%o expected uid=%d group=%d mode=%o", uid, gid, ok, info.Mode().Perm(), col.MonitorExportOwnerUID, col.MonitorExportGroupGID, col.MonitorExportMode)
+	if _, err := readMonitorExportFile(path, col.MonitorExportOwnerUID, col.MonitorExportGroupGID, col.MonitorExportMode); err != nil {
+		t.Fatalf("matching owner/group/mode direct read rejected: %v", err)
+	}
 	if obs := snapshotTraffic(t, col); obs.Freshness != "fresh" {
 		t.Fatalf("matching owner/group/mode rejected: %s", obs.Freshness)
 	}
