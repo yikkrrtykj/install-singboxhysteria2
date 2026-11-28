@@ -282,8 +282,73 @@ func (t *Tx) insertTrafficObservationTx(ctx context.Context, rec SnapshotRecord,
 			inbound.ActiveConnections); err != nil {
 			return fmt.Errorf("store: insert traffic observation: %w", err)
 		}
+		if inbound.ObservedAt <= 0 || !trafficInboundHasMeasuredValues(inbound) {
+			continue
+		}
+		const bucketSeconds int64 = 900
+		bucketStart := (inbound.ObservedAt / bucketSeconds) * bucketSeconds
+		if _, err := t.tx.ExecContext(ctx,
+			`INSERT INTO traffic_observation_buckets(
+				node_id,event_id,inbound_tag,kind,source_epoch,bucket_start,sequence,
+				observed_at,collected_at,received_at,availability,freshness,quality,active_connections,
+				uplink_observed_lower_bound_bytes,downlink_observed_lower_bound_bytes,
+				uplink_observed_rate_bps,downlink_observed_rate_bps,bytes_estimate)
+			 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+			 ON CONFLICT(node_id,inbound_tag,source_epoch,bucket_start) DO UPDATE SET
+				event_id=excluded.event_id,
+				observed_at=CASE WHEN excluded.observed_at >= traffic_observation_buckets.observed_at THEN excluded.observed_at ELSE traffic_observation_buckets.observed_at END,
+				collected_at=CASE WHEN excluded.observed_at >= traffic_observation_buckets.observed_at THEN excluded.collected_at ELSE traffic_observation_buckets.collected_at END,
+				received_at=CASE WHEN excluded.observed_at >= traffic_observation_buckets.observed_at THEN excluded.received_at ELSE traffic_observation_buckets.received_at END,
+				sequence=CASE WHEN excluded.observed_at >= traffic_observation_buckets.observed_at THEN excluded.sequence ELSE traffic_observation_buckets.sequence END,
+				availability=CASE WHEN excluded.observed_at >= traffic_observation_buckets.observed_at THEN excluded.availability ELSE traffic_observation_buckets.availability END,
+				freshness=CASE WHEN excluded.observed_at >= traffic_observation_buckets.observed_at THEN excluded.freshness ELSE traffic_observation_buckets.freshness END,
+				quality=CASE WHEN excluded.observed_at >= traffic_observation_buckets.observed_at THEN excluded.quality ELSE traffic_observation_buckets.quality END,
+				uplink_observed_lower_bound_bytes=MAX(COALESCE(traffic_observation_buckets.uplink_observed_lower_bound_bytes,0),COALESCE(excluded.uplink_observed_lower_bound_bytes,0)),
+				downlink_observed_lower_bound_bytes=MAX(COALESCE(traffic_observation_buckets.downlink_observed_lower_bound_bytes,0),COALESCE(excluded.downlink_observed_lower_bound_bytes,0)),
+				uplink_observed_rate_bps=CASE WHEN excluded.observed_at >= traffic_observation_buckets.observed_at THEN excluded.uplink_observed_rate_bps ELSE traffic_observation_buckets.uplink_observed_rate_bps END,
+				downlink_observed_rate_bps=CASE WHEN excluded.observed_at >= traffic_observation_buckets.observed_at THEN excluded.downlink_observed_rate_bps ELSE traffic_observation_buckets.downlink_observed_rate_bps END,
+				active_connections=CASE WHEN excluded.observed_at >= traffic_observation_buckets.observed_at THEN excluded.active_connections ELSE traffic_observation_buckets.active_connections END,
+				bytes_estimate=MAX(traffic_observation_buckets.bytes_estimate,excluded.bytes_estimate)`,
+			rec.NodeID, rec.EventID, inbound.InboundTag, inbound.Kind, obs.SourceEpoch, bucketStart,
+			obs.Sequence, inbound.ObservedAt, obs.CollectedAt, obs.ReceivedAt,
+			inbound.Availability, obs.Freshness, inbound.Quality, inbound.ActiveConnections,
+			nullableInt64(inbound.UplinkObservedLowerBoundBytes), nullableInt64(inbound.DownlinkObservedLowerBoundBytes),
+			nullableFloat64(inbound.UplinkObservedRateBps), nullableFloat64(inbound.DownlinkObservedRateBps),
+			trafficBucketBytesEstimate(inbound)); err != nil {
+			return fmt.Errorf("store: upsert traffic observation bucket: %w", err)
+		}
+	}
+	// Keep a bounded recent raw ring per node (64 reports). Older reports are
+	// already represented by their 15-minute lower-bound bucket, so dropping the
+	// raw row (and its per-inbound child rows via ON DELETE CASCADE) cannot lose
+	// a distinct history sample. The node's latest row is always retained.
+	if _, err := t.tx.ExecContext(ctx,
+		`DELETE FROM traffic_observation_reports
+		 WHERE node_id=? AND report_row_id NOT IN (
+			SELECT report_row_id FROM traffic_observation_reports
+			WHERE node_id=? ORDER BY collected_at DESC, report_row_id DESC LIMIT 64)`,
+		rec.NodeID, rec.NodeID); err != nil {
+		return fmt.Errorf("store: prune traffic raw ring: %w", err)
 	}
 	return nil
+}
+
+func trafficInboundHasMeasuredValues(inbound TrafficInboundRecord) bool {
+	return inbound.UplinkObservedLowerBoundBytes != nil ||
+		inbound.DownlinkObservedLowerBoundBytes != nil ||
+		inbound.UplinkObservedRateBps != nil ||
+		inbound.DownlinkObservedRateBps != nil
+}
+
+func trafficBucketBytesEstimate(inbound TrafficInboundRecord) int64 {
+	estimate := int64(192 + len(inbound.InboundTag) + len(inbound.Kind))
+	if inbound.UplinkObservedLowerBoundBytes != nil {
+		estimate += 8
+	}
+	if inbound.DownlinkObservedLowerBoundBytes != nil {
+		estimate += 8
+	}
+	return estimate
 }
 
 // validateTrafficObservationRecord is defense in depth before the constrained
@@ -594,17 +659,16 @@ func (s *Store) QueryTrafficHistory(ctx context.Context, scope TrafficEventScope
 	// One extra row detects truncation without counting the whole range.
 	args = append(args, query.Limit+1)
 	selectList := `SELECT o.event_id AS event_id, o.node_id AS node_id, o.inbound_tag AS inbound_tag,
-	       o.kind AS kind, o.observed_at AS observed_at, r.collected_at AS collected_at,
-	       r.availability AS availability, r.freshness AS freshness, o.quality AS quality,
-	       r.source_epoch AS source_epoch, r.sequence AS sequence,
-	       r.counter_scope AS counter_scope, r.exactness AS exactness,
+	       o.kind AS kind, o.observed_at AS observed_at, o.collected_at AS collected_at,
+	       o.availability AS availability, o.freshness AS freshness, o.quality AS quality,
+	       o.source_epoch AS source_epoch, o.sequence AS sequence,
+	       o.counter_scope AS counter_scope, o.exactness AS exactness,
 	       o.active_connections AS active_connections,
 	       o.uplink_observed_lower_bound_bytes AS uplink_observed_lower_bound_bytes,
 	       o.downlink_observed_lower_bound_bytes AS downlink_observed_lower_bound_bytes,
 	       o.uplink_observed_rate_bps AS uplink_observed_rate_bps,
 	       o.downlink_observed_rate_bps AS downlink_observed_rate_bps`
-	fromWhere := ` FROM traffic_observations o
-		JOIN traffic_observation_reports r ON r.report_row_id = o.report_row_id ` + where
+	fromWhere := ` FROM traffic_history_view o ` + where
 	source := selectList + fromWhere
 	outerSelect := `SELECT event_id,node_id,inbound_tag,kind,observed_at,collected_at,
 	       availability,freshness,quality,source_epoch,sequence,counter_scope,exactness,
@@ -619,7 +683,7 @@ func (s *Store) QueryTrafficHistory(ctx context.Context, scope TrafficEventScope
 	       ROW_NUMBER() OVER (
 	           PARTITION BY o.event_id, o.node_id, o.inbound_tag, o.kind,
 	               (o.observed_at - (o.observed_at % ?))
-	           ORDER BY o.observed_at DESC, o.report_row_id DESC) AS bucket_rn` + fromWhere
+	           ORDER BY o.observed_at DESC) AS bucket_rn` + fromWhere
 		args = append([]any{query.StepSeconds}, args...)
 		statement = outerSelect + `FROM (` + source + `) sampled WHERE bucket_rn = 1` + orderBy
 	} else {

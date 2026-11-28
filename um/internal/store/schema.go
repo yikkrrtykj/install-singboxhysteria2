@@ -784,6 +784,75 @@ var migrations = []migration{
 			ON traffic_observations(report_row_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_traffic_obs_node_observed
 			ON traffic_observations(node_id, observed_at DESC)`,
+		// Bounded 15-minute history buckets (B in [300,900] in OD-LT-12). Raw
+		// report rows are retained only as a bounded recent ring; older history
+		// is represented by monotone lower-bound bucket samples so a 30-300 s
+		// cadence cannot grow the active table linearly. Buckets are independent
+		// of the raw report FK (raw rows are pruned after aggregation).
+		`CREATE TABLE IF NOT EXISTS traffic_observation_buckets (
+			id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+			node_id            TEXT NOT NULL,
+			event_id           TEXT NOT NULL,
+			inbound_tag        TEXT NOT NULL,
+			kind               TEXT NOT NULL CHECK (kind IN ('reality','hysteria2','other')),
+			source_epoch       TEXT NOT NULL CHECK (length(source_epoch) = 32),
+			bucket_start       INTEGER NOT NULL CHECK (typeof(bucket_start) = 'integer'),
+			sequence           INTEGER NOT NULL CHECK (sequence BETWEEN 0 AND 9007199254740991),
+			observed_at        INTEGER NOT NULL CHECK (typeof(observed_at) = 'integer'),
+			collected_at       INTEGER NOT NULL CHECK (typeof(collected_at) = 'integer'),
+			received_at        INTEGER NOT NULL CHECK (typeof(received_at) = 'integer'),
+			availability       TEXT NOT NULL CHECK (availability IN ('ok','partial','unavailable')),
+			freshness          TEXT NOT NULL CHECK (freshness IN ('fresh','stale','unavailable')),
+			quality            TEXT NOT NULL CHECK (quality IN ('lower_bound','partial','unavailable')),
+			active_connections INTEGER NOT NULL CHECK (active_connections BETWEEN 0 AND 1000000),
+			uplink_observed_lower_bound_bytes   INTEGER
+				CHECK (uplink_observed_lower_bound_bytes IS NULL OR uplink_observed_lower_bound_bytes BETWEEN 0 AND 9007199254740991),
+			downlink_observed_lower_bound_bytes INTEGER
+				CHECK (downlink_observed_lower_bound_bytes IS NULL OR downlink_observed_lower_bound_bytes BETWEEN 0 AND 9007199254740991),
+			uplink_observed_rate_bps   REAL
+				CHECK (uplink_observed_rate_bps IS NULL OR (uplink_observed_rate_bps >= 0 AND uplink_observed_rate_bps <= 1000000000000)),
+			downlink_observed_rate_bps REAL
+				CHECK (downlink_observed_rate_bps IS NULL OR (downlink_observed_rate_bps >= 0 AND downlink_observed_rate_bps <= 1000000000000)),
+			bytes_estimate     INTEGER NOT NULL CHECK (bytes_estimate >= 0),
+			UNIQUE (node_id, inbound_tag, source_epoch, bucket_start)
+		) STRICT`,
+		`CREATE INDEX IF NOT EXISTS idx_traffic_buckets_history
+			ON traffic_observation_buckets(event_id, node_id, inbound_tag, observed_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_traffic_buckets_collected
+			ON traffic_observation_buckets(collected_at)`,
+		// Unified bounded history: recent raw rows (bounded ring) plus older
+		// 15-minute buckets. Buckets for a window still covered by a raw row are
+		// excluded, so the same observation is never returned twice.
+		`CREATE VIEW IF NOT EXISTS traffic_history_view AS
+			SELECT r.event_id AS event_id, o.node_id AS node_id,
+			       o.inbound_tag AS inbound_tag, o.kind AS kind,
+			       o.observed_at AS observed_at, r.collected_at AS collected_at,
+			       r.availability AS availability, r.freshness AS freshness,
+			       o.quality AS quality, r.source_epoch AS source_epoch,
+			       r.sequence AS sequence, r.counter_scope AS counter_scope,
+			       r.exactness AS exactness, o.active_connections AS active_connections,
+			       o.uplink_observed_lower_bound_bytes AS uplink_observed_lower_bound_bytes,
+			       o.downlink_observed_lower_bound_bytes AS downlink_observed_lower_bound_bytes,
+			       o.uplink_observed_rate_bps AS uplink_observed_rate_bps,
+			       o.downlink_observed_rate_bps AS downlink_observed_rate_bps,
+			       o.observed_at AS history_observed_at
+			FROM traffic_observations o
+			JOIN traffic_observation_reports r ON r.report_row_id = o.report_row_id
+			UNION ALL
+			SELECT b.event_id, b.node_id, b.inbound_tag, b.kind, b.observed_at,
+			       b.collected_at, b.availability, b.freshness, b.quality,
+			       b.source_epoch, b.sequence, 'observation_epoch', 'lower_bound',
+			       b.active_connections, b.uplink_observed_lower_bound_bytes,
+			       b.downlink_observed_lower_bound_bytes,
+			       b.uplink_observed_rate_bps, b.downlink_observed_rate_bps,
+			       b.observed_at
+			FROM traffic_observation_buckets b
+			WHERE NOT EXISTS (
+				SELECT 1 FROM traffic_observations o2
+				JOIN traffic_observation_reports r2 ON r2.report_row_id = o2.report_row_id
+				WHERE o2.node_id=b.node_id AND o2.inbound_tag=b.inbound_tag
+				  AND r2.source_epoch=b.source_epoch
+				  AND (o2.observed_at/900)*900 = b.bucket_start)`,
 	}},
 }
 

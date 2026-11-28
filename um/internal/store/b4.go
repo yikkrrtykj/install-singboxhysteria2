@@ -1256,6 +1256,7 @@ var b4PurgePreviewTables = []string{
 	"report_metrics",
 	"report_events",
 	"report_event_reports",
+	"traffic_observation_buckets",
 	"traffic_observation_reports",
 	"traffic_observations",
 	"node_latest",

@@ -1,9 +1,11 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -501,5 +503,71 @@ func TestTrafficObservationStateExposesUnavailableSentinel(t *testing.T) {
 	}
 	if len(points) != 0 {
 		t.Fatalf("sentinel must not fabricate traffic points: %+v", points)
+	}
+}
+
+func TestTrafficHistoryFallsBackToBoundedBucketsAfterRawRingPrune(t *testing.T) {
+	s := openTestStore(t, filepath.Join(t.TempDir(), "private", "bucket.db"))
+	ctx := context.Background()
+	base := int64(1_700_000_000)
+	nodeID := "aaaaaaaa-1111-4111-8111-111111111111"
+	eventID := "bbbbbbbb-2222-4222-8222-222222222222"
+	up := int64(1000)
+	down := int64(2000)
+	for i := 0; i < 80; i++ {
+		at := base + int64(i*30)
+		rec := SnapshotRecord{
+			NodeID: nodeID, EventID: eventID, NodeClass: "linux_vps",
+			ReportID:    fmt.Sprintf("cccccccc-3333-4333-8333-%012d", i+1),
+			CollectedAt: at, ReceivedAt: at,
+			BodySHA256: fmt.Sprintf("%064d", i+1),
+			TrafficObservation: &TrafficObservationRecord{
+				Source: "monitor_readonly_export", SourceEpoch: strings.Repeat("a", 32),
+				Sequence: int64(i), ObservedAt: at, CollectedAt: at, ReceivedAt: at,
+				Availability: "ok", Freshness: "fresh", CounterScope: "observation_epoch",
+				Exactness: "lower_bound", Inbounds: []TrafficInboundRecord{{
+					InboundTag: "vless-in", Kind: "reality", ObservedAt: at,
+					Availability: "ok", Quality: "lower_bound",
+					UplinkObservedLowerBoundBytes: &up, DownlinkObservedLowerBoundBytes: &down,
+					ActiveConnections: 1,
+				}},
+			},
+		}
+		if err := s.SeedTrafficObservationForTest(ctx, rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := queryInt(t, s, `SELECT COUNT(*) FROM traffic_observation_reports`); got != 64 {
+		t.Fatalf("raw ring rows=%d want 64", got)
+	}
+	var expectedBuckets int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM traffic_observation_buckets`).Scan(&expectedBuckets); err != nil {
+		t.Fatal(err)
+	}
+	if expectedBuckets < 3 {
+		t.Fatalf("bucket rows=%d, want >=3", expectedBuckets)
+	}
+	points, truncated, err := s.QueryTrafficHistory(ctx, TrafficEventScope{AllEvents: true},
+		TrafficQuery{From: base, To: base + 80*30, Limit: 200})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if truncated {
+		t.Fatal("unexpected truncation")
+	}
+	if len(points) != 64+1 {
+		t.Fatalf("history rows=%d want bounded raw ring plus one older bucket sample", len(points))
+	}
+	oldestBucketOnly := false
+	for _, point := range points {
+		if point.UplinkObservedLowerBoundBytes == nil || *point.UplinkObservedLowerBoundBytes != up {
+			t.Fatalf("history point lost lower bound: %+v", point)
+		}
+		if point.ObservedAt < base+64*30 {
+			oldestBucketOnly = true
+		}
+	}
+	if !oldestBucketOnly {
+		t.Fatal("history did not include the bucket-only older window after raw prune")
 	}
 }
