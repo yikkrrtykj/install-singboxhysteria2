@@ -912,6 +912,13 @@ class Lab:
 
     def start_singbox_stack(self) -> None:
         ports = self.ports
+        # The Reality handshake target must be listening before any real client
+        # can complete a first handshake. Start it before the sing-box server and
+        # clients; its readiness probe is independent of traffic.
+        self.payload_server = lab.PayloadServer(ports.http_fixture).start()
+        self.tls_server = lab.TlsCamouflageServer(
+            ports.handshake_tls, self.creds.cert_path,
+            self.creds.key_path).start()
         self.server_proc = self._start_process(
             "singbox-server",
             [self.singbox_bin, "run", "-c", self.config_paths["server"]])
@@ -923,10 +930,6 @@ class Lab:
         if not lab.wait_port("127.0.0.1", ports.service_api, timeout=20):
             raise lab.LabError("sing-box service.api did not start\n%s"
                                % self.server_proc.log_tail(4000))
-        self.payload_server = lab.PayloadServer(ports.http_fixture).start()
-        self.tls_server = lab.TlsCamouflageServer(
-            ports.handshake_tls, self.creds.cert_path,
-            self.creds.key_path).start()
         for protocol, config_key, socks_port in (
                 ("reality", "client_reality", ports.socks_reality),
                 ("hysteria2", "client_hysteria2", ports.socks_hysteria2)):

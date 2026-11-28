@@ -593,19 +593,34 @@ class PortPlan:
 
     @classmethod
     def allocate(cls) -> "PortPlan":
+        # free_port() temporarily binds and closes a socket, so consecutive
+        # calls can reuse the same ephemeral port. The lab hosts several
+        # independent real processes on loopback; duplicate ports would make a
+        # later bind fail (and a readiness probe might hit the wrong process).
+        # Allocate a unique port for every field.
+        used: set[int] = set()
+
+        def unique_port(kind: str) -> int:
+            for _ in range(100):
+                port = free_port(kind)
+                if port not in used:
+                    used.add(port)
+                    return port
+            raise LabError("could not allocate a unique loopback port")
+
         return cls(
-            reality_tcp=free_port("tcp"),
-            hysteria2_udp=free_port("udp"),
-            handshake_tls=free_port("tcp"),
-            service_api=free_port("tcp"),
-            http_fixture=free_port("tcp"),
-            monitor_web=free_port("tcp"),
-            center_ingest=free_port("tcp"),
-            center_admin=free_port("tcp"),
-            center_web=free_port("tcp"),
-            socks_reality=free_port("tcp"),
-            socks_hysteria2=free_port("tcp"),
-            capture_proxy=free_port("tcp"),
+            reality_tcp=unique_port("tcp"),
+            hysteria2_udp=unique_port("udp"),
+            handshake_tls=unique_port("tcp"),
+            service_api=unique_port("tcp"),
+            http_fixture=unique_port("tcp"),
+            monitor_web=unique_port("tcp"),
+            center_ingest=unique_port("tcp"),
+            center_admin=unique_port("tcp"),
+            center_web=unique_port("tcp"),
+            socks_reality=unique_port("tcp"),
+            socks_hysteria2=unique_port("tcp"),
+            capture_proxy=unique_port("tcp"),
         )
 
 
