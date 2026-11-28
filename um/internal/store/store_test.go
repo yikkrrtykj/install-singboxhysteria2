@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/yikkrrtykj/install-singboxhysteria2/um/internal/fileguard"
 	"github.com/yikkrrtykj/install-singboxhysteria2/um/internal/protocol"
 	"github.com/yikkrrtykj/install-singboxhysteria2/um/internal/wire"
 )
@@ -25,7 +26,11 @@ func testContext() context.Context { return context.Background() }
 
 func tempStorePath(t *testing.T) string {
 	t.Helper()
-	return filepath.Join(t.TempDir(), "um.db")
+	path := filepath.Join(t.TempDir(), "private", "um.db")
+	if err := fileguard.EnsurePrivateDir(filepath.Dir(path)); err != nil {
+		t.Fatalf("create private test store dir: %v", err)
+	}
+	return path
 }
 
 func openTestStore(t *testing.T, path string) *Store {

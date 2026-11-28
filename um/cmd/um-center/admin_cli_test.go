@@ -18,7 +18,7 @@ import (
 
 func TestAdminCLIUsesManagementAPI(t *testing.T) {
 	dir := t.TempDir()
-	db := filepath.Join(dir, "center.db")
+	db := filepath.Join(dir, "private", "center.db")
 	st, err := store.Open(db)
 	if err != nil {
 		t.Fatal(err)

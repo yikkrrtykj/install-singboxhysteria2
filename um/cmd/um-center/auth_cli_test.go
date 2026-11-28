@@ -29,7 +29,7 @@ func feedStdin(t *testing.T, value string) func() {
 
 func TestUMCAuthLocalBootstrapAndRecoveryCLI(t *testing.T) {
 	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "center.db")
+	dbPath := filepath.Join(dir, "private", "center.db")
 	keyPath := filepath.Join(dir, "master.key")
 	if err := runAuthCLI([]string{"init-key", "--path", keyPath}); err != nil {
 		t.Fatalf("init-key: %v", err)
@@ -82,7 +82,7 @@ func TestUMCAuthLocalBootstrapAndRecoveryCLI(t *testing.T) {
 
 func TestUMCAuthKeyInitUpgradeVerifiesExistingTOTP(t *testing.T) {
 	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "center.db")
+	dbPath := filepath.Join(dir, "private", "center.db")
 	keyPath := filepath.Join(dir, "master.key")
 	if err := runAuthCLI([]string{"init-key", "--path", keyPath}); err != nil {
 		t.Fatal(err)

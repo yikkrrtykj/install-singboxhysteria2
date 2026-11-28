@@ -128,8 +128,9 @@ later required.
 ## 6.1 Credential epochs and authorization linearization
 
 Every account has a persistent integer credential epoch. Password reset, TOTP
-change/enrollment, recovery consumption, enable/disable and role/scope changes
-advance the epoch inside the same transaction that revokes sessions. Pending/
+change/enrollment, recovery consumption, disable and role/scope changes advance
+the epoch inside the same transaction that revokes sessions (enable advances the
+epoch; it normally has no active sessions to revoke). Pending/
 active sessions bind to the epoch that authorized them; authentication rejects a
 session with a stale epoch even if a revocation write was missed. Session creation
 after Argon2id revalidates the account epoch in a SQLite transaction, so a
@@ -159,16 +160,20 @@ and real Cloudflare integration remain UM-E/HOLD.
 
 On Web startup the master key is checked against a `umc_meta` AEAD sentinel. A
 wrong 32-byte key fails closed before the Web listener becomes usable. A v11/v12
-database with encrypted TOTP but no sentinel is not silently initialized; the
-operator must run local `um-center auth key-init --db ... --master-key ...`, which
-first opens every existing TOTP secret with the key and only then writes the
-sentinel. Empty/new auth databases may initialize the sentinel automatically.
+database with any existing account and no sentinel is not silently initialized;
+the operator must run local `um-center auth key-init --db ... --master-key ...`,
+which first opens every existing TOTP secret with the key and only then writes the
+sentinel. Only a completely empty (zero-account) auth database initializes the
+sentinel automatically; local `auth bootstrap` initializes it for the newly
+created admin.
 The sentinel never contains the key or plaintext TOTP.
 
-The SQLite parent directory is 0700, DB/WAL/SHM files are owner-private 0600
-(POSIX) or closed-DACL owner/service-account/LocalSystem/Administrators-only
-(Windows); the service entrypoint sets umask 0077 before SQLite creates future
-WAL/SHM. TLS private keys and B4 auth/token files are checked with the same
+The SQLite parent directory must already be a dedicated private directory
+(0700/service owner POSIX, closed DACL Windows); existing foreign/shared
+directories are refused rather than destructively chmod'ed/ACL-rewritten. DB/WAL/
+SHM files owned by the service are 0600 or closed-DACL
+owner/service-account/LocalSystem/Administrators-only. The service entrypoint
+sets umask 0077 before SQLite creates future WAL/SHM. TLS private keys and B4 auth/token files are checked with the same
 closed permission model; the master key keeps its dedicated vault validator.
 
 ## 8. Machine TLS

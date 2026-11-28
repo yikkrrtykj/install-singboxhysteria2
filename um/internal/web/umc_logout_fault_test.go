@@ -61,6 +61,13 @@ func TestUMCLogoutDatabaseFaultIsNotReportedAsSuccess(t *testing.T) {
 		_ = lockConn.Close()
 	}()
 
+	// Other authenticated mutations must also distinguish an auth-state outage
+	// from a false 401.
+	status, raw = tw.request(t, http.MethodPost, "/auth/password", csrf,
+		map[string]any{"current_password": tw.password, "new_password": "Another-Password-2026!"}, tw.jwt)
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("password under DB fault status=%d body=%s, want 503", status, raw)
+	}
 	status, raw = tw.request(t, http.MethodPost, "/auth/logout", csrf, nil, tw.jwt)
 	if status != http.StatusServiceUnavailable {
 		t.Fatalf("logout under DB fault status=%d body=%s, want 503", status, raw)

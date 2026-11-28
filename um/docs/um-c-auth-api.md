@@ -109,9 +109,9 @@ bearer listener remains separate and is not tunnel-routed.
 
 ## Error model
 
-Errors are JSON `{"error":{"code","message","retryable"}}`. Authentication-state
-database outages return bounded 503 (`auth_state_unavailable`) rather than a
-false 401; logout revocation failures return 503/`logout_state_uncertain` and are
+Errors are JSON `{"error":{"code","message","retryable"}}`. Authenticated session
+paths return bounded 503 (`auth_state_unavailable`) when session/account state is
+unavailable rather than a false 401; logout revocation failures return 503/`logout_state_uncertain` and are
 never reported as successful. The frontend displays that uncertainty. Credential failures
 use generic `invalid_credentials`/`invalid_recovery`; CSRF failure is
 `csrf_invalid`/`login_csrf_failed`; last-admin protection is

@@ -66,7 +66,7 @@ type agentCenter struct {
 func startAgentCenter(t *testing.T) *agentCenter {
 	t.Helper()
 	dir := t.TempDir()
-	db := filepath.Join(dir, "center.db")
+	db := filepath.Join(dir, "private", "center.db")
 	st, err := store.Open(db)
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)

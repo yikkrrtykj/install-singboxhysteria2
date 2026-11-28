@@ -84,7 +84,7 @@ func main() {
 		log.Fatal(err)
 	}
 	defer os.RemoveAll(dir)
-	st, err := store.Open(filepath.Join(dir, "center.db"))
+	st, err := store.Open(filepath.Join(dir, "state", "center.db"))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -191,6 +191,9 @@ func main() {
 		},
 	}
 
+	if err := web.InitializeMasterKeyForExistingDB(ctx, st, master); err != nil {
+		log.Fatal(err)
+	}
 	h, err := web.NewHandler(web.Config{
 		Store: st, ManagementService: msvc, Access: verifier, MasterKey: master,
 		StaticDir: *staticDir, AllowedOrigins: []string{origin}, Now: clock.Now,

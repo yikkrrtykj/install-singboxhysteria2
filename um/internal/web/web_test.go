@@ -109,7 +109,7 @@ func newTestWebWithPasswordHook(t *testing.T, hook func()) *testWeb {
 func newTestWebWithHooks(t *testing.T, managementHook, passwordHook func()) *testWeb {
 	t.Helper()
 	dir := t.TempDir()
-	st, err := store.Open(filepath.Join(dir, "center.db"))
+	st, err := store.Open(filepath.Join(dir, "private", "center.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +147,7 @@ func newTestWebWithHooks(t *testing.T, managementHook, passwordHook func()) *tes
 	jar, _ := cookiejar.New(nil)
 	client := ts.Client()
 	client.Jar = jar
-	dbPath := filepath.Join(dir, "center.db")
+	dbPath := filepath.Join(dir, "private", "center.db")
 	return &testWeb{handler: h, server: ts, client: client, jwt: access.token(t, testAccessSubject, time.Now()),
 		access: access, master: master, clock: &clock, dbPath: dbPath, store: st, password: "correct horse battery staple"}
 }

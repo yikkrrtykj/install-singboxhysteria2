@@ -38,3 +38,19 @@ func TestWindowsPrivateFileAndDACL(t *testing.T) {
 		t.Fatalf("CheckPrivateFile after restore: %v", err)
 	}
 }
+
+func TestWindowsExistingSharedDirectoryIsRefusedWithoutMutation(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "shared")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.Command("icacls", dir, "/grant", "*S-1-1-0:(OI)(CI)(F)").Run(); err != nil {
+		t.Skipf("icacls unavailable: %v", err)
+	}
+	if err := EnsurePrivateDir(dir); !errors.Is(err, ErrUnprotected) {
+		t.Fatalf("EnsurePrivateDir(shared)=%v, want ErrUnprotected", err)
+	}
+	if err := checkPrivateDir(dir); !errors.Is(err, ErrUnprotected) {
+		t.Fatalf("refused directory ACL was mutated to private: %v", err)
+	}
+}

@@ -13,6 +13,8 @@ Type=simple
 User=um-center
 Group=um-center
 WorkingDirectory=/opt/um-center
+StateDirectory=um-center
+StateDirectoryMode=0700
 ExecStart=/opt/um-center/bin/um-center \
   -ingest 127.0.0.1:8443 \
   -admin 127.0.0.1:8090 \

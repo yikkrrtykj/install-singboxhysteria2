@@ -34,6 +34,7 @@ var (
 	ErrAuthRecoveryUsed        = errors.New("store: recovery code already used")
 	ErrAuthSessionUnknown      = errors.New("store: auth session unknown")
 	ErrAuthStale               = errors.New("store: authentication context is stale")
+	ErrAuthSessionLimit        = errors.New("store: active authentication session limit reached")
 )
 
 type AuthUser struct {
@@ -682,6 +683,21 @@ func (s *Store) CreateSession(ctx context.Context, sess AuthSession) error {
 	}
 	if enabled == 0 || sess.AuthEpoch != userEpoch {
 		return ErrAuthStale
+	}
+	var activeForUser, activeTotal int64
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM umc_sessions WHERE user_id=? AND revoked_at IS NULL AND absolute_expires_at>?`,
+		sess.UserID, sess.CreatedAt).Scan(&activeForUser); err != nil {
+		return err
+	}
+	if activeForUser >= 32 {
+		return ErrAuthSessionLimit
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM umc_sessions WHERE revoked_at IS NULL AND absolute_expires_at>?`,
+		sess.CreatedAt).Scan(&activeTotal); err != nil {
+		return err
+	}
+	if activeTotal >= 10000 {
+		return ErrAuthSessionLimit
 	}
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO umc_sessions(session_id_hash,public_id,user_id,state,access_subject,access_issuer,csrf_hash,pending_secret,pending_created_at,created_at,last_seen_at,idle_expires_at,absolute_expires_at,auth_epoch)
@@ -1381,7 +1397,7 @@ type AuthTOTPSecretRow struct {
 }
 
 func (s *Store) ListEncryptedTOTPSecrets(ctx context.Context) ([]AuthTOTPSecretRow, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT user_id,totp_secret,totp_key_version FROM umc_users WHERE totp_secret IS NOT NULL LIMIT 1000`)
+	rows, err := s.db.QueryContext(ctx, `SELECT user_id,totp_secret,totp_key_version FROM umc_users WHERE totp_secret IS NOT NULL`)
 	if err != nil {
 		return nil, err
 	}
@@ -1395,4 +1411,12 @@ func (s *Store) ListEncryptedTOTPSecrets(ctx context.Context) ([]AuthTOTPSecretR
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) CountAuthUsers(ctx context.Context) (int64, error) {
+	var n int64
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM umc_users`).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
 }

@@ -16,7 +16,7 @@ PY
 )"
 INGEST="127.0.0.1:18080"
 ADMIN="127.0.0.1:18081"
-DB="$ROOT/center.db"
+DB="$ROOT/center-state/center.db"
 TOKEN="$ROOT/token"
 ADMIN_TOKEN="$ROOT/admin.token"
 ADMIN_AUTH="$ROOT/admin-auth.json"

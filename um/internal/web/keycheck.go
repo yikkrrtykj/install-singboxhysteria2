@@ -51,6 +51,17 @@ func VerifyMasterKey(ctx context.Context, st *store.Store, key []byte) error {
 	if len(secrets) > 0 {
 		return ErrMasterKeyUninitialized
 	}
+	// Once any account exists, initializing a sentinel automatically could bind a
+	// wrong-but-valid key to an upgraded database. Require the explicit local
+	// key-init path for any existing account; only a completely fresh auth
+	// database auto-initializes.
+	users, err := st.CountAuthUsers(ctx)
+	if err != nil {
+		return err
+	}
+	if users > 0 {
+		return ErrMasterKeyUninitialized
+	}
 	blob, err := umcauth.Seal(key, masterKeySentinelPlain(), masterKeySentinelAAD())
 	if err != nil {
 		return ErrMasterKeyMismatch

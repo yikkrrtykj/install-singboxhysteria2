@@ -116,6 +116,10 @@ func (h *Handler) issueSession(ctx context.Context, w http.ResponseWriter, user 
 }
 
 func (h *Handler) writeSessionIssueError(w http.ResponseWriter, err error) {
+	if errors.Is(err, store.ErrAuthSessionLimit) {
+		h.writeError(w, http.StatusTooManyRequests, "session_limit", "too many active sessions; revoke an old session")
+		return
+	}
 	if errors.Is(err, store.ErrAuthStale) {
 		h.writeError(w, http.StatusUnauthorized, "credentials_changed", "account security state changed; authenticate again")
 		return
@@ -201,12 +205,16 @@ func (h *Handler) authContext(w http.ResponseWriter, r *http.Request) {
 	if id, err := h.authenticate(r, store.AuthSessionActive, store.AuthSessionTOTPPending, store.AuthSessionTOTPSetup); err == nil {
 		h.writeJSON(w, http.StatusOK, h.authUserView(r, id))
 		return
+	} else if errors.Is(err, ErrAuthUnavailable) {
+		h.writeError(w, http.StatusServiceUnavailable, "auth_state_unavailable", "authentication state unavailable; retry")
+		return
 	}
 	// No valid session: issue a short-lived preauth binding to the verified
 	// Access subject, for login CSRF and subject continuity. Bound row creation
 	// per verified Access subject so repeated context calls cannot grow the
 	// preauth table faster than bounded maintenance cleanup.
-	if !h.limiter.allow("preauth-create:"+claims.Claims.Subject, 0.2, 20) {
+	if !h.limiter.allow("preauth-create:"+claims.Claims.Subject, 0.2, 20) ||
+		!h.limiter.allow("preauth-global", 5, 20) {
 		h.writeError(w, http.StatusTooManyRequests, "rate_limited", "authentication context rate limit exceeded")
 		return
 	}
@@ -377,6 +385,10 @@ func (h *Handler) verifyTOTP(w http.ResponseWriter, r *http.Request) {
 	}
 	id, release, err := h.authenticateForMutation(r, store.AuthSessionTOTPPending, store.AuthSessionTOTPSetup)
 	if err != nil {
+		if errors.Is(err, ErrAuthUnavailable) {
+			h.writeError(w, http.StatusServiceUnavailable, "auth_state_unavailable", "authentication state unavailable; retry")
+			return
+		}
 		h.writeError(w, http.StatusUnauthorized, "unauthenticated", "pending TOTP session required")
 		return
 	}

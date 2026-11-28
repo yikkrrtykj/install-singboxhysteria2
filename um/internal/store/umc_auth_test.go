@@ -655,3 +655,30 @@ func TestUMCAuthCompleteLoginChecksHighWater(t *testing.T) {
 		t.Fatalf("newer counter: %v", err)
 	}
 }
+
+func TestUMCAuthPerUserActiveSessionCap(t *testing.T) {
+	s := openTestStore(t, tempStorePath(t))
+	ctx := context.Background()
+	now := int64(1_901_300_000)
+	hash := "$argon2id$v=19$m=65536,t=3,p=2$c2FsdHNhbHRzYWx0c2FsdA$aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	user, err := s.BootstrapAuthUser(ctx, "session-cap", hash, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 32; i++ {
+		sess := AuthSession{IDHash: fmt.Sprintf("%064d", i+1), PublicID: fmt.Sprintf("cap-%d", i),
+			UserID: user.UserID, State: AuthSessionActive, AccessSubject: "s", AccessIssuer: "i",
+			CSRFHash:  "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+			CreatedAt: now, LastSeenAt: now, IdleExpiresAt: now + 600, AbsoluteExpiresAt: now + 3600}
+		if err := s.CreateSession(ctx, sess); err != nil {
+			t.Fatalf("session %d: %v", i, err)
+		}
+	}
+	over := AuthSession{IDHash: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+		PublicID: "cap-over", UserID: user.UserID, State: AuthSessionActive, AccessSubject: "s", AccessIssuer: "i",
+		CSRFHash:  "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+		CreatedAt: now, LastSeenAt: now, IdleExpiresAt: now + 600, AbsoluteExpiresAt: now + 3600}
+	if err := s.CreateSession(ctx, over); !errors.Is(err, ErrAuthSessionLimit) {
+		t.Fatalf("over-cap session error=%v, want ErrAuthSessionLimit", err)
+	}
+}

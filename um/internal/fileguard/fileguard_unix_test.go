@@ -45,3 +45,20 @@ func TestPOSIXPrivateFileAndDir(t *testing.T) {
 		t.Fatalf("CheckPrivateFile symlink=%v, want ErrUnsafePath", err)
 	}
 }
+
+func TestPOSIXExistingSharedDirectoryIsRefusedWithoutMutation(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "shared")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsurePrivateDir(dir); !errors.Is(err, ErrUnprotected) {
+		t.Fatalf("EnsurePrivateDir(shared)=%v, want ErrUnprotected", err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil || info.Mode().Perm() != 0o755 {
+		t.Fatalf("refused directory mode changed: mode=%v err=%v", info.Mode().Perm(), err)
+	}
+}

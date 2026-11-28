@@ -234,6 +234,10 @@ func (h *Handler) serveManagement(w http.ResponseWriter, r *http.Request) {
 		defer release()
 		fresh, authErr := h.authenticate(r, store.AuthSessionActive)
 		if authErr != nil {
+			if errors.Is(authErr, ErrAuthUnavailable) {
+				h.writeError(w, http.StatusServiceUnavailable, "auth_state_unavailable", "authentication state unavailable; retry")
+				return
+			}
 			h.writeError(w, http.StatusUnauthorized, "unauthenticated", "authorization changed; re-authenticate")
 			return
 		}
@@ -390,15 +394,22 @@ func (l *limiter) allow(key string, rate, burst float64) bool {
 			}
 		}
 		if len(l.buckets) >= l.max {
-			// Evict a bounded portion of arbitrary (least-recently-refreshed
-			// iteration order) buckets rather than clearing every account's
-			// protections. The map never exceeds max entries.
+			// Evict the oldest buckets (by last refresh) rather than clearing all
+			// protections or dropping a recently active target's rate bucket.
 			target := l.max / 2
-			for k := range l.buckets {
-				delete(l.buckets, k)
-				if len(l.buckets) <= target {
+			for len(l.buckets) > target {
+				oldestKey := ""
+				var oldest time.Time
+				for k, b := range l.buckets {
+					if oldestKey == "" || b.last.Before(oldest) {
+						oldestKey = k
+						oldest = b.last
+					}
+				}
+				if oldestKey == "" {
 					break
 				}
+				delete(l.buckets, oldestKey)
 			}
 		}
 	}

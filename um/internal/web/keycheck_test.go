@@ -14,7 +14,7 @@ import (
 
 func TestUMCMasterKeySentinelAndExplicitUpgrade(t *testing.T) {
 	dir := t.TempDir()
-	st, err := store.Open(filepath.Join(dir, "center.db"))
+	st, err := store.Open(filepath.Join(dir, "private", "center.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -37,7 +37,7 @@ func TestUMCMasterKeySentinelAndExplicitUpgrade(t *testing.T) {
 
 	// Simulate an upgraded v12 database with encrypted TOTP state but no sentinel:
 	// recreate a clean DB/auth state and avoid calling VerifyMasterKey.
-	st2, err := store.Open(filepath.Join(dir, "upgrade.db"))
+	st2, err := store.Open(filepath.Join(dir, "private", "upgrade.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,5 +67,33 @@ func TestUMCMasterKeySentinelAndExplicitUpgrade(t *testing.T) {
 	}
 	if err := web.VerifyMasterKey(ctx, st2, wrong); !errors.Is(err, web.ErrMasterKeyMismatch) {
 		t.Fatalf("wrong key after upgrade accepted: %v", err)
+	}
+}
+
+func TestUMCMasterKeyRefusesAutomaticBindingForExistingAccounts(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "private", "center.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+	now := time.Now().Unix()
+	hash := "$argon2id$v=19$m=65536,t=3,p=2$c2FsdHNhbHRzYWx0c2FsdA$aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	if _, err := st.BootstrapAuthUser(ctx, "existing-account", hash, now); err != nil {
+		t.Fatal(err)
+	}
+	key := make([]byte, umcauth.MasterKeyBytes)
+	for i := range key {
+		key[i] = byte(i + 9)
+	}
+	if err := web.VerifyMasterKey(ctx, st, key); !errors.Is(err, web.ErrMasterKeyUninitialized) {
+		t.Fatalf("VerifyMasterKey(existing accounts)=%v, want ErrMasterKeyUninitialized", err)
+	}
+	if err := web.InitializeMasterKeyForExistingDB(ctx, st, key); err != nil {
+		t.Fatalf("explicit InitializeMasterKeyForExistingDB: %v", err)
+	}
+	if err := web.VerifyMasterKey(ctx, st, key); err != nil {
+		t.Fatalf("VerifyMasterKey after explicit init: %v", err)
 	}
 }

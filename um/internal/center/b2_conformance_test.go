@@ -186,7 +186,7 @@ func TestB2REC03LostACKDuplicate(t *testing.T) {
 }
 
 func TestB2REC04NewGenerationFirstReportDuplicate(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "center.db")
+	path := filepath.Join(t.TempDir(), "private", "center.db")
 	tc := startTestCenterAt(t, path)
 	a := enrollAgent(t, tc, store.NodeClassLinuxVPS, "linux")
 	base := b2BaseCollected(t)

@@ -28,6 +28,7 @@ import (
 )
 
 func main() {
+	hardenProcessUmask()
 	if len(os.Args) > 1 && os.Args[1] == "admin" {
 		os.Exit(runAdminCLI(os.Args[2:]))
 	}

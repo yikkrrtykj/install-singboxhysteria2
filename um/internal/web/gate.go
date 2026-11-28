@@ -1,6 +1,7 @@
 package web
 
 import (
+	"errors"
 	"net/http"
 	"sort"
 	"sync"
@@ -115,6 +116,10 @@ func (h *Handler) authenticateForMutation(r *http.Request, states ...string) (*i
 func (h *Handler) requireActiveWrite(w http.ResponseWriter, r *http.Request) (*identity, func(), bool) {
 	id, release, err := h.authenticateForMutation(r, store.AuthSessionActive)
 	if err != nil {
+		if errors.Is(err, ErrAuthUnavailable) {
+			h.writeError(w, http.StatusServiceUnavailable, "auth_state_unavailable", "authentication state unavailable; retry")
+			return nil, nil, false
+		}
 		h.writeError(w, http.StatusUnauthorized, "unauthenticated", "authenticated session required")
 		return nil, nil, false
 	}
@@ -140,6 +145,10 @@ func (h *Handler) requireAdminMutation(w http.ResponseWriter, r *http.Request, t
 	fresh, err := h.authenticate(r, store.AuthSessionActive)
 	if err != nil {
 		release()
+		if errors.Is(err, ErrAuthUnavailable) {
+			h.writeError(w, http.StatusServiceUnavailable, "auth_state_unavailable", "authentication state unavailable; retry")
+			return nil, nil, false
+		}
 		h.writeError(w, http.StatusUnauthorized, "unauthenticated", "authorization changed; re-authenticate")
 		return nil, nil, false
 	}

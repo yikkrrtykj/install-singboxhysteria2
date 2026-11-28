@@ -95,6 +95,10 @@ func (h *Handler) logout(w http.ResponseWriter, r *http.Request) {
 	defer release()
 	id, err = h.authenticate(r, store.AuthSessionActive, store.AuthSessionTOTPPending, store.AuthSessionTOTPSetup)
 	if err != nil {
+		if errors.Is(err, ErrAuthUnavailable) {
+			h.writeError(w, http.StatusServiceUnavailable, "auth_state_unavailable", "authentication state unavailable; retry")
+			return
+		}
 		h.writeError(w, http.StatusUnauthorized, "unauthenticated", "session changed; authenticate again")
 		return
 	}
@@ -227,6 +231,10 @@ func (h *Handler) listSessions(w http.ResponseWriter, r *http.Request) {
 	}
 	id, err := h.authenticate(r, store.AuthSessionActive)
 	if err != nil {
+		if errors.Is(err, ErrAuthUnavailable) {
+			h.writeError(w, http.StatusServiceUnavailable, "auth_state_unavailable", "authentication state unavailable; retry")
+			return
+		}
 		h.writeError(w, http.StatusUnauthorized, "unauthenticated", "authenticated session required")
 		return
 	}

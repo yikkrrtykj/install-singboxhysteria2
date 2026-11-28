@@ -176,8 +176,9 @@ um-center auth recover \
 ## 8.1 Master-key sentinel upgrade and private files
 
 On startup the Web plane verifies the master key against the database sentinel.
-If an upgraded v11/v12 database already contains TOTP state but no sentinel, Web
-startup fails closed. With the database stopped, run:
+If an upgraded v11/v12 database already contains any account but no sentinel,
+Web startup fails closed; existing-account databases always require this
+explicit local initialization (even if no account has enrolled TOTP yet). With the database stopped, run:
 
 ```bash
 um-center auth key-init --db /var/lib/um-center/center.db   --master-key /etc/um-center/master.key
@@ -185,10 +186,13 @@ um-center auth key-init --db /var/lib/um-center/center.db   --master-key /etc/um
 
 The command first opens every existing TOTP secret with the key and only then
 writes the sentinel; a wrong key is refused and no TOTP state is changed. A brand
-new empty auth database initializes its sentinel automatically at first Web
-startup. The database directory is private (0700), DB/WAL/SHM are owner-private
-(0600 on POSIX; closed DACL on Windows), and the service sets a private umask
-before SQLite creates future WAL/SHM. TLS private keys must also pass the same
+new empty auth database (zero accounts) initializes its sentinel automatically at
+first Web startup; the local `auth bootstrap` command also initializes it after
+creating the first platform_admin. The database parent directory must already be a dedicated private directory
+(0700/owner-service on POSIX; closed DACL on Windows). The center refuses to
+rewrite a pre-existing foreign/shared directory before ownership validation; it
+creates only missing dedicated directories and hardens the DB/WAL/SHM files it
+owns. The service sets a private umask before SQLite creates future WAL/SHM. TLS private keys must also pass the same
 owner-private/admin-only file check; public certificates need not.
 
 A wrong master key fails the whole center startup closed (machine and Web
