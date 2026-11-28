@@ -828,7 +828,10 @@ class Lab:
         # monitor-export flag before a long lab run starts.
         result = lab.run_capture([self.agent_bin, "run", "-h"], timeout=60)
         help_text = (result.stdout or "") + (result.stderr or "")
-        if lab.AGENT_MONITOR_EXPORT_FLAG not in help_text:
+        # Go's flag package prints a single leading dash even though it accepts
+        # both one and two leading dashes on the command line.
+        if (lab.AGENT_MONITOR_EXPORT_FLAG not in help_text
+                and lab.AGENT_MONITOR_EXPORT_FLAG[1:] not in help_text):
             skip_or_fail(
                 "the um-agent build does not expose the expected %s flag; "
                 "the lab is written against the integrated UM-LT interface "
