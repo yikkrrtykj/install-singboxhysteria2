@@ -9,6 +9,7 @@ on:
       - 'um/internal/umcauth/**'
       - 'um/internal/store/**'
       - 'um/internal/management/**'
+      - 'um/docs/**'
       - '.github/workflows/um-c-web.yml'
   pull_request:
     paths:
@@ -18,6 +19,7 @@ on:
       - 'um/internal/umcauth/**'
       - 'um/internal/store/**'
       - 'um/internal/management/**'
+      - 'um/docs/**'
       - '.github/workflows/um-c-web.yml'
 
 permissions:
