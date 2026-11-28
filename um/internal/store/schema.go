@@ -36,7 +36,7 @@ import (
 // SchemaVersion is the highest migration version this build knows. Open always
 // migrates a database to exactly this version; a database with a newer version
 // is rejected fail-closed instead of being silently used by older code.
-const SchemaVersion = 11
+const SchemaVersion = 12
 
 // Node classes accepted by the rev-5 platform isolation contract.
 const (
@@ -681,6 +681,12 @@ var migrations = []migration{
 			PRIMARY KEY (user_id, counter)
 		) STRICT`,
 		`CREATE INDEX IF NOT EXISTS idx_umc_totp_counters_age ON umc_totp_counters(used_at)`,
+	}},
+	{version: 12, statements: []string{
+		// Bounded online TOTP guessing protection: persistent per-account failure
+		// count and temporary lockout. Additive only.
+		`ALTER TABLE umc_users ADD COLUMN totp_failed_attempts INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE umc_users ADD COLUMN totp_locked_until INTEGER`,
 	}},
 }
 

@@ -36,20 +36,22 @@ var (
 )
 
 type AuthUser struct {
-	UserID          string
-	Username        string
-	PasswordHash    string
-	Role            string
-	Enabled         bool
-	EventIDs        []string
-	TOTPSecret      []byte
-	TOTPKeyVersion  int
-	TOTPEnrolledAt  *int64
-	TOTPLastCounter *int64
-	CreatedAt       int64
-	UpdatedAt       int64
-	DisabledAt      *int64
-	LastLoginAt     *int64
+	UserID             string
+	Username           string
+	PasswordHash       string
+	Role               string
+	Enabled            bool
+	EventIDs           []string
+	TOTPSecret         []byte
+	TOTPKeyVersion     int
+	TOTPEnrolledAt     *int64
+	TOTPLastCounter    *int64
+	TOTPFailedAttempts int64
+	TOTPLockedUntil    *int64
+	CreatedAt          int64
+	UpdatedAt          int64
+	DisabledAt         *int64
+	LastLoginAt        *int64
 }
 
 type AuthSession struct {
@@ -159,8 +161,9 @@ func scanAuthUser(scanner interface {
 	var keyVersion sql.NullInt64
 	var enrolled, lastCounter, disabled, lastLogin sql.NullInt64
 	var secret []byte
+	var locked sql.NullInt64
 	if err := scanner.Scan(&u.UserID, &u.Username, &u.PasswordHash, &u.Role, &enabled,
-		&secret, &keyVersion, &enrolled, &lastCounter, &u.CreatedAt, &u.UpdatedAt, &disabled, &lastLogin); err != nil {
+		&secret, &keyVersion, &enrolled, &lastCounter, &u.TOTPFailedAttempts, &u.CreatedAt, &u.UpdatedAt, &disabled, &lastLogin, &locked); err != nil {
 		return AuthUser{}, err
 	}
 	u.Enabled = enabled != 0
@@ -168,13 +171,14 @@ func scanAuthUser(scanner interface {
 	u.TOTPKeyVersion = int(keyVersion.Int64)
 	u.TOTPEnrolledAt = nullInt64Pointer(enrolled)
 	u.TOTPLastCounter = nullInt64Pointer(lastCounter)
+	u.TOTPLockedUntil = nullInt64Pointer(locked)
 	u.DisabledAt = nullInt64Pointer(disabled)
 	u.LastLoginAt = nullInt64Pointer(lastLogin)
 	return u, nil
 }
 
 const authUserColumns = `user_id,username,password_hash,role,enabled,totp_secret,totp_key_version,
-	totp_enrolled_at,totp_last_counter,created_at,updated_at,disabled_at,last_login_at`
+	totp_enrolled_at,totp_last_counter,totp_failed_attempts,created_at,updated_at,disabled_at,last_login_at,totp_locked_until`
 
 func (s *Store) authUserEventIDs(ctx context.Context, userID string) ([]string, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT event_id FROM umc_user_event_scopes WHERE user_id=? ORDER BY event_id`, userID)
@@ -470,8 +474,9 @@ func (s *Store) SetAuthUserPassword(ctx context.Context, userID, passwordHash st
 	return tx.Commit()
 }
 
-// SetAuthUserTOTP stores a new encrypted secret, consumes no counter, revokes all
-// sessions, and clears recovery generation state for a fresh enrollment.
+// SetAuthUserTOTP stores a new encrypted secret, consumes no counter, resets
+// TOTP failure/counter state, and revokes all sessions. Recovery-code generation
+// is replaced separately by CompleteTOTPSetup or ReplaceRecoveryCodes.
 func (s *Store) SetAuthUserTOTP(ctx context.Context, userID string, secret []byte, keyVersion int, now int64) error {
 	if len(secret) == 0 || keyVersion < 1 {
 		return invalidArgument("totp", "invalid sealed secret")
@@ -481,7 +486,7 @@ func (s *Store) SetAuthUserTOTP(ctx context.Context, userID string, secret []byt
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	res, err := tx.ExecContext(ctx, `UPDATE umc_users SET totp_secret=?,totp_key_version=?,totp_enrolled_at=?,totp_last_counter=NULL,updated_at=? WHERE user_id=?`,
+	res, err := tx.ExecContext(ctx, `UPDATE umc_users SET totp_secret=?,totp_key_version=?,totp_enrolled_at=?,totp_last_counter=NULL,totp_failed_attempts=0,totp_locked_until=NULL,updated_at=? WHERE user_id=?`,
 		secret, keyVersion, now, now, userID)
 	if err != nil {
 		return err
@@ -522,7 +527,7 @@ func (s *Store) ConsumeTOTPCounter(ctx context.Context, userID string, counter i
 		}
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE umc_users SET totp_last_counter=?,updated_at=? WHERE user_id=?`,
+	if _, err := tx.ExecContext(ctx, `UPDATE umc_users SET totp_last_counter=?,totp_failed_attempts=0,totp_locked_until=NULL,updated_at=? WHERE user_id=?`,
 		counter, now, userID); err != nil {
 		return err
 	}
@@ -579,8 +584,17 @@ func (s *Store) ConsumeRecoveryCode(ctx context.Context, userID, hash string, no
 	if n != 1 {
 		return ErrAuthRecoveryUsed
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE umc_users SET totp_secret=NULL,totp_enrolled_at=NULL,totp_last_counter=NULL,updated_at=? WHERE user_id=?`,
+	if _, err := tx.ExecContext(ctx, `UPDATE umc_users SET totp_secret=NULL,totp_enrolled_at=NULL,totp_last_counter=NULL,totp_failed_attempts=0,totp_locked_until=NULL,updated_at=? WHERE user_id=?`,
 		now, userID); err != nil {
+		return err
+	}
+	// A successful recovery invalidates the whole recovery generation and resets
+	// the old TOTP time-step history; new one-time codes are generated only after
+	// the mandated TOTP re-enrollment.
+	if _, err := tx.ExecContext(ctx, `DELETE FROM umc_recovery_codes WHERE user_id=?`, userID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM umc_totp_counters WHERE user_id=?`, userID); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE umc_sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL`, now, userID); err != nil {
@@ -769,7 +783,7 @@ func (s *Store) CompleteTOTPLogin(ctx context.Context, userID string, counter in
 		}
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE umc_users SET totp_last_counter=?,last_login_at=?,updated_at=? WHERE user_id=?`,
+	if _, err := tx.ExecContext(ctx, `UPDATE umc_users SET totp_last_counter=?,last_login_at=?,totp_failed_attempts=0,totp_locked_until=NULL,updated_at=? WHERE user_id=?`,
 		counter, now, now, userID); err != nil {
 		return err
 	}
@@ -894,7 +908,7 @@ func (s *Store) ResetAuthUserForLocalRecovery(ctx context.Context, userID, passw
 	defer func() { _ = tx.Rollback() }()
 	res, err := tx.ExecContext(ctx,
 		`UPDATE umc_users SET password_hash=?,totp_secret=NULL,totp_key_version=NULL,totp_enrolled_at=NULL,
-		 totp_last_counter=NULL,enabled=1,disabled_at=NULL,updated_at=? WHERE user_id=?`, passwordHash, now, userID)
+		 totp_last_counter=NULL,totp_failed_attempts=0,totp_locked_until=NULL,enabled=1,disabled_at=NULL,updated_at=? WHERE user_id=?`, passwordHash, now, userID)
 	if err != nil {
 		return err
 	}
@@ -981,4 +995,124 @@ func appendAuthMutationTx(ctx context.Context, tx *sql.Tx, now int64) error {
 		}
 	}
 	return nil
+}
+
+// RecordTOTPFailure atomically increments the per-account TOTP failure count and
+// returns the lockout deadline (0 when not locked). This is persistent so a
+// process restart does not reset online guessing protection.
+func (s *Store) RecordTOTPFailure(ctx context.Context, userID string, now, threshold, lockSeconds int64) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var attempts int64
+	var locked sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `SELECT totp_failed_attempts,totp_locked_until FROM umc_users WHERE user_id=?`, userID).
+		Scan(&attempts, &locked); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, ErrAuthUserUnknown
+		}
+		return 0, err
+	}
+	attempts++
+	var until any
+	if threshold > 0 && attempts >= threshold {
+		v := now + lockSeconds
+		until = v
+		locked = sql.NullInt64{Int64: v, Valid: true}
+	} else if locked.Valid {
+		until = locked.Int64
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE umc_users SET totp_failed_attempts=?,totp_locked_until=?,updated_at=? WHERE user_id=?`,
+		attempts, until, now, userID); err != nil {
+		return 0, err
+	}
+	if locked.Valid {
+		if _, err := tx.ExecContext(ctx, `UPDATE umc_sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL`, now, userID); err != nil {
+			return 0, err
+		}
+	}
+	if err := appendAuthMutationTx(ctx, tx, now); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	if locked.Valid {
+		return locked.Int64, nil
+	}
+	return 0, nil
+}
+
+// ClearTOTPFailures resets the failure count after a successful TOTP.
+func (s *Store) ClearTOTPFailures(ctx context.Context, userID string, now int64) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE umc_users SET totp_failed_attempts=0,totp_locked_until=NULL,updated_at=? WHERE user_id=?`, now, userID)
+	return err
+}
+
+// CompleteTOTPSetup atomically consumes the setup counter, stores the new
+// encrypted TOTP secret, resets failure state, replaces the recovery-code
+// generation, revokes all old sessions and inserts the authenticated session.
+// No cookie is issued by the caller until this transaction commits.
+func (s *Store) CompleteTOTPSetup(ctx context.Context, userID string, secret []byte, keyVersion int,
+	counter int64, recoveryHashes []string, next AuthSession, now int64) error {
+	if len(secret) == 0 || keyVersion < 1 || next.PublicID == "" {
+		return invalidArgument("totp_setup", "invalid arguments")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO umc_totp_counters(user_id,counter,used_at) VALUES(?,?,?)`,
+		userID, counter, now); err != nil {
+		if isUniqueViolation(err) {
+			return ErrAuthTOTPReplayed
+		}
+		return err
+	}
+	res, err := tx.ExecContext(ctx, `UPDATE umc_users SET totp_secret=?,totp_key_version=?,totp_enrolled_at=?,
+		totp_last_counter=?,totp_failed_attempts=0,totp_locked_until=NULL,last_login_at=?,updated_at=? WHERE user_id=?`,
+		secret, keyVersion, now, counter, now, now, userID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return ErrAuthUserUnknown
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM umc_recovery_codes WHERE user_id=?`, userID); err != nil {
+		return err
+	}
+	for _, hash := range recoveryHashes {
+		if len(hash) != 64 {
+			return invalidArgument("recovery_code", "invalid hash")
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO umc_recovery_codes(user_id,code_hash,created_at) VALUES(?,?,?)`,
+			userID, hash, now); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE umc_sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL`, now, userID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO umc_sessions(session_id_hash,public_id,user_id,state,access_subject,access_issuer,csrf_hash,pending_secret,pending_created_at,created_at,last_seen_at,idle_expires_at,absolute_expires_at)
+		 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		next.IDHash, next.PublicID, next.UserID, next.State, next.AccessSubject, next.AccessIssuer, next.CSRFHash,
+		nil, nil, next.CreatedAt, next.LastSeenAt, next.IdleExpiresAt, next.AbsoluteExpiresAt); err != nil {
+		return err
+	}
+	if err := appendAuthMutationTx(ctx, tx, now); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// ClearTOTPCounterHistory is used when a TOTP re-enrollment starts with a new
+// secret, so the first code of the new authenticator is not rejected by counters
+// from the old secret. The caller must have already verified the current password.
+func (s *Store) ClearTOTPCounterHistory(ctx context.Context, userID string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM umc_totp_counters WHERE user_id=?`, userID)
+	return err
 }

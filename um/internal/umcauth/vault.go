@@ -76,6 +76,9 @@ func LoadMasterKey(path string) ([]byte, error) {
 
 	f, err := openMasterKeyFile(path)
 	if err != nil {
+		if errors.Is(err, ErrMasterKeyPermissions) {
+			return nil, err
+		}
 		return nil, fmt.Errorf("%w: %v", ErrMasterKeyFile, err)
 	}
 	defer func() { _ = f.Close() }()

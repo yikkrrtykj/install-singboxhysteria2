@@ -6,6 +6,10 @@ const accessToken = process.env.UM_C_E2E_TOKEN ?? ''
 const username = process.env.UM_C_E2E_USER ?? ''
 const password = process.env.UM_C_E2E_PASSWORD ?? ''
 
+if (!baseURL || !accessToken || !username || !password) {
+  throw new Error('UM_C_E2E_URL/TOKEN/USER/PASSWORD are required; the real-browser lab must never skip to green')
+}
+
 function decodeBase32(value: string): Buffer {
   const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'
   const clean = value.toUpperCase().replace(/[^A-Z2-7]/g, '')
@@ -61,8 +65,6 @@ async function login(page: Page): Promise<Record<string, unknown> | null> {
 }
 
 test.describe('UM-C real browser authentication closure', () => {
-  test.skip(!baseURL || !accessToken || !username || !password, 'UM_C_E2E_* env required')
-
   test('login, forced TOTP setup, session, RBAC pages, logout and TOTP login', async ({ page }) => {
     await installAccessRoute(page)
     await login(page)

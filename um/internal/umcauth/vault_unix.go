@@ -3,6 +3,7 @@
 package umcauth
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"syscall"
@@ -13,7 +14,17 @@ import (
 // openMasterKeyFile opens the key file without following a symlink, so a path
 // swapped to a symlink between Lstat and open still fails closed.
 func openMasterKeyFile(path string) (*os.File, error) {
-	return os.OpenFile(path, os.O_RDONLY|unix.O_NOFOLLOW, 0)
+	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		// A mode-0000 key can fail at open before an fstat permission check is
+		// possible. Classify it as a permissions failure (fail closed), not as a
+		// malformed/missing file.
+		if errors.Is(err, os.ErrPermission) {
+			return nil, fmt.Errorf("%w: permission denied", ErrMasterKeyPermissions)
+		}
+		return nil, err
+	}
+	return f, nil
 }
 
 // checkMasterKeyFilePermissions enforces the POSIX rule: mode 0600 or 0400 and

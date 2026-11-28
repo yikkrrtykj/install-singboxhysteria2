@@ -170,13 +170,13 @@ func (h *Handler) regenerateRecoveryCodes(w http.ResponseWriter, r *http.Request
 	if !ok {
 		return
 	}
-	codes, err := h.replaceRecoveryCodes(r.Context(), id.User.UserID)
+	rotateReq := h.mutationRequest(r, id.User, "umc_recovery_codes_regenerated", "user:"+id.User.UserID,
+		"umc_recovery_codes_rotated", id.User.UserID, "recovery-codes")
+	codes, err := h.replaceRecoveryCodes(rotateReq.Context(), id.User.UserID)
 	if err != nil {
 		h.writeError(w, http.StatusInternalServerError, "internal", "recovery code generation failed")
 		return
 	}
-	h.auditIdentity(r, id, "umc_recovery_codes_regenerated", "user:"+id.User.UserID, "ok")
-	_ = h.recordLedger(r.Context(), "umc_recovery_codes_rotated", id.User.UserID, "recovery-codes")
 	h.writeJSON(w, http.StatusOK, map[string]any{"recovery_codes": codes})
 }
 
@@ -267,6 +267,12 @@ func (h *Handler) updateTOTP(w http.ResponseWriter, r *http.Request) {
 	}); err != nil {
 		h.auditIdentity(r, id, "umc_totp_update_failed", "user:"+id.User.UserID, "denied")
 		h.writeError(w, http.StatusUnauthorized, "invalid_credentials", "current password is invalid")
+		return
+	}
+	// A new authenticator starts a fresh counter namespace; avoid rejecting its
+	// first code because of the previous secret's consumed time steps.
+	if err := h.store.ClearTOTPCounterHistory(r.Context(), id.User.UserID); err != nil {
+		h.writeError(w, http.StatusInternalServerError, "internal", "TOTP setup unavailable")
 		return
 	}
 	secret, err := umcauth.NewTOTPSecret()

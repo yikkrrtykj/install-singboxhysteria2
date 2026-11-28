@@ -61,16 +61,25 @@ Access JWT cannot be bypassed with an old session.
 - Every browser user requires TOTP for a normal session. First login after
   bootstrap/password reset enters a restricted TOTP setup session; only setup
   endpoints are available until confirmation. Pending/setup sessions never reach
-  `/api/v1`.
+  `/api/v1` and expire after a short 10-minute pending TTL.
+  Setup completion consumes the first code, stores the sealed secret, revokes old
+  sessions and issues the active session in one transaction; no cookie is sent
+  before commit.
+- Per-account TOTP failures are persisted; five failures temporarily lock TOTP
+  (15 minutes) and revoke pending sessions. Login/TOTP/recovery rate limits are
+  keyed to the verified Access subject/session, never solely to the loopback
+  `RemoteAddr`, so a Tunnel origin does not collapse every browser into one
+  bucket.
 - TOTP: RFC 6238 SHA1, 6 digits, 30 s, ±1 step; persistent consumed-counter
-  table makes replay/restart/clock-rollback fail; transactional insert means one
-  concurrent code succeeds at most once.
+  table makes replay/restart/clock-rollback fail; atomic login/setup completion
+  means one concurrent code succeeds at most once.
 - TOTP secrets are AES-256-GCM sealed with a master key from a protected local
   file (not SQLite), bound to user ID/version as AAD. Missing/corrupt/wrong key
   fails closed; startup never auto-regenerates a key.
 - Recovery codes: 10 high-entropy single-use codes, only hashes stored; display
-  once; regeneration replaces old generation; transactional consumption;
-  success revokes sessions and requires TOTP re-enrollment. Controlled local
+  once; regeneration replaces the old generation; transactional consumption;
+  success revokes sessions, invalidates the remaining recovery generation and
+  requires TOTP re-enrollment. Controlled local
   recovery remains available when both TOTP and codes are unavailable, bounded
   by OS-owned access to the center host.
 
@@ -114,7 +123,7 @@ later required.
 
 ## 7. Database migration
 
-Additive v11 adds only UM-C tables: `umc_users`, `umc_user_event_scopes`,
+Additive v11/v12 add only UM-C tables/columns: `umc_users`, `umc_user_event_scopes`,
 `umc_preauth`, `umc_sessions`, `umc_recovery_codes`, `umc_totp_counters` and
 indexes. Existing v1-v10 migrations, B1-B4 tables, frozen schemas and ledger are
 unchanged. Auth state cleanup is bounded; TOTP/recovery/session critical
@@ -125,9 +134,11 @@ and real Cloudflare integration remain UM-E/HOLD.
 
 The production machine entry is an independent hostname + direct TLS 1.3
 listener serving the existing `/v1/agent/*` handler with the frozen Ed25519
-identity. Tests use synthetic CA/server certs and verify hostname mismatch,
-untrusted CA, expired cert, no insecure fallback, agent enroll/report/rotate and
-Web/Access outage independence. Agent browser sessions/cookies/Cloudflare Access
+identity. Tests use synthetic CA/server certs and verify the production TLS 1.3
+configuration, TLS 1.2 rejection, untrusted CA rejection, and real agent
+enroll/config/snapshot report over the machine listener. Broader real-certificate
+rotation/expiry/hostname/Access-outage drills remain deployment HOLD work; B2/B3
+rotation protocol coverage is unchanged. Agent browser sessions/cookies/Cloudflare Access
 are never required for machine reports. Real certificates/DNS/public ports stay
 Owner HOLD.
 

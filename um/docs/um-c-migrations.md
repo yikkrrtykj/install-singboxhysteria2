@@ -4,6 +4,8 @@ UM-C adds one forward-only additive SQLite migration to the existing single
 `um/internal/store` database:
 
 - **v11** — local Web authentication/account/session/TOTP/recovery state.
+- **v12** — persistent per-account TOTP failure count and temporary lockout
+  deadline (additive columns on `umc_users`).
 
 Migrations v1-v10 and all B1-B4 tables, frozen contracts, triggers, ledger hash
 formula and rev-5/rev-6 schemas are unchanged. `store.Open` still applies
@@ -22,6 +24,10 @@ and is idempotent on reopen.
 | `umc_totp_counters` | per-user consumed TOTP time steps for replay/restart/clock-rollback resistance |
 | indexes | bounded preauth/session/recovery/TOTP lookup and expiry cleanup |
 
+v12 adds `umc_users.totp_failed_attempts` (default 0) and
+`umc_users.totp_locked_until` (nullable). These survive process restart and make
+online TOTP guessing protection persistent.
+
 The tables use STRICT typing where appropriate and CASCADE from `umc_users`.
 There are no foreign keys into frozen B1-B4 protocol tables; event scope rows are
 validated against `event_catalog` and removed in the existing event-purge
@@ -34,7 +40,9 @@ untouched.
   are versioned Argon2id PHC strings; TOTP secrets are AES-256-GCM sealed blobs
   with user/version associated data and a master key **outside** SQLite.
 - TOTP consumption is a transactional primary-key insert; concurrent/replayed
-  counters fail before a session is issued.
+  login/setup counters fail before a session is issued. Setup completion stores
+  the sealed secret, recovery-code generation, counter, session revoke/issue and
+  audit/ledger in one transaction; cookies are only written after commit.
 - Session creation/rotation, TOTP completion, password/scope/disable revocation
   and recovery consumption are transactional. Auth cleanup is bounded.
 - The database contains no raw session/CSRF/TOTP/recovery/Access JWT/password

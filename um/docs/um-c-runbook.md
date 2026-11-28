@@ -135,17 +135,22 @@ um-center auth recover \
 - Idle timeout is 30 minutes, absolute lifetime 12 hours (candidate defaults;
   configurable in code/Config). Session ID rotates after login/TOTP/recovery/
   password changes; only a SHA-256 hash is stored server-side.
-- Cookies are `__Host-um_session` Secure HttpOnly SameSite=Strict and
-  `__Host-um_csrf` (non-HttpOnly per-session double-submit). Fetch mutations send
-  `X-CSRF-Token` and same-origin `Origin`; browsers never store credentials in
-  localStorage/sessionStorage.
+- Cookies are `__Host-um_session` and `__Host-um_csrf`, both Secure HttpOnly
+  SameSite=Strict. The SPA receives the per-session CSRF value from
+  `/auth/context` and sends `X-CSRF-Token` plus same-origin `Origin`; it never
+  reads cookies and never stores credentials in localStorage/sessionStorage.
 - To respond to suspected compromise: disable the account in user
   administration (revokes sessions), revoke sessions from the account page, rotate
   the account password/TOTP/recovery codes, and if necessary stop the center and
   perform local recovery. Do not attempt to extract/decrypt secrets from SQLite.
 - Login/TOTP/recovery/user-admin endpoints have bounded in-memory rate limits and
-  Argon2id concurrency limits (4); sustained failure should return 429/503, not
-  weaken authentication.
+  Argon2id concurrency limits (4); sustained failure returns 429/503, not a
+  weakened authentication path. Rate-limit identity uses the verified Access
+  subject/session where available, not the tunnel loopback `RemoteAddr`.
+- Five failed TOTP attempts temporarily lock TOTP for 15 minutes and revoke the
+  pending session; the lock is persisted across restart. Pending TOTP challenge/
+  setup sessions expire after 10 minutes. If locked or the authenticator is lost,
+  wait for expiry, use a one-time recovery code, or use controlled local recovery.
 - Audit/ledger entries contain actor/role/action/result/target IDs and hashed
   ledger context only; never submit secrets in support requests.
 

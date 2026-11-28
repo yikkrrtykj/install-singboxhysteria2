@@ -88,12 +88,17 @@ bearer listener remains separate and is not tunnel-routed.
 
 - Session cookie: `__Host-um_session`, Secure, HttpOnly, SameSite=Strict, Path=/,
   no Domain. Server stores SHA-256(token) only.
-- CSRF cookie: `__Host-um_csrf`, Secure, SameSite=Strict, non-HttpOnly (the SPA
-  reads it only to place it in `X-CSRF-Token`); server stores its hash.
-- Idle 30 min, absolute 12 h (server-enforced). Login/TOTP/recovery/user
-  mutations are rate-limited; Argon2id concurrency is capped at 4.
-- TOTP: RFC 6238 SHA-1/6 digits/30 s, ±1 step; persistent counter prevents replay.
-  Recovery codes: 10 generated, single use, hashes only.
+- CSRF cookie: `__Host-um_csrf`, Secure, HttpOnly, SameSite=Strict; the SPA
+  obtains the raw value from `/auth/context` (never `document.cookie`) and puts
+  it in `X-CSRF-Token`; server stores only its hash.
+- Idle 30 min, absolute 12 h (server-enforced). Pending TOTP challenge/setup
+  sessions have a 10-minute TTL. Login/TOTP/recovery/user mutations are
+  rate-limited by verified Access subject/session/user, not loopback IP;
+  Argon2id concurrency is capped at 4. Five TOTP failures temporarily lock the
+  account's TOTP for 15 minutes and revoke pending sessions.
+- TOTP: RFC 6238 SHA-1/6 digits/30 s, ±1 step; persistent counter and atomic
+  login/setup completion prevent replay. Recovery codes: 10 generated, single
+  use, hashes only; successful recovery invalidates the remaining generation.
 
 ## Error model
 

@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 )
@@ -191,5 +192,87 @@ func TestUMCAuthConcurrentTOTPReplay(t *testing.T) {
 	}
 	if success != 1 || replay != workers-1 {
 		t.Fatalf("concurrent TOTP success=%d replay=%d", success, replay)
+	}
+}
+
+func TestUMCAuthConcurrentTOTPSetupIsAtomic(t *testing.T) {
+	s := openTestStore(t, tempStorePath(t))
+	ctx := context.Background()
+	now := int64(1_900_200_000)
+	hash := "$argon2id$v=19$m=65536,t=3,p=2$c2FsdHNhbHRzYWx0c2FsdA$aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	user, err := s.BootstrapAuthUser(ctx, "setup-admin", hash, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := AuthSession{IDHash: "1111111111111111111111111111111111111111111111111111111111111111",
+		PublicID: "setup-old", UserID: user.UserID, State: AuthSessionTOTPSetup,
+		AccessSubject: "subject", AccessIssuer: "issuer", CSRFHash: "2222222222222222222222222222222222222222222222222222222222222222",
+		CreatedAt: now, LastSeenAt: now, IdleExpiresAt: now + 600, AbsoluteExpiresAt: now + 3600}
+	if err := s.CreateSession(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	hashes := []string{"3333333333333333333333333333333333333333333333333333333333333333"}
+	const workers = 6
+	var wg sync.WaitGroup
+	results := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			next := AuthSession{IDHash: fmt.Sprintf("%064d", i+1), PublicID: fmt.Sprintf("setup-next-%d", i),
+				UserID: user.UserID, State: AuthSessionActive, AccessSubject: "subject", AccessIssuer: "issuer",
+				CSRFHash:  "4444444444444444444444444444444444444444444444444444444444444444",
+				CreatedAt: now, LastSeenAt: now, IdleExpiresAt: now + 600, AbsoluteExpiresAt: now + 3600}
+			results <- s.CompleteTOTPSetup(ctx, user.UserID, []byte("sealed"), 1, 777, hashes, next, now+1)
+		}(i)
+	}
+	wg.Wait()
+	close(results)
+	success, replay := 0, 0
+	for err := range results {
+		switch {
+		case err == nil:
+			success++
+		case errors.Is(err, ErrAuthTOTPReplayed):
+			replay++
+		default:
+			t.Fatalf("unexpected setup result: %v", err)
+		}
+	}
+	if success != 1 || replay != workers-1 {
+		t.Fatalf("atomic setup success=%d replay=%d", success, replay)
+	}
+}
+
+func TestUMCAuthCleanupBoundedExpiredState(t *testing.T) {
+	s := openTestStore(t, tempStorePath(t))
+	ctx := context.Background()
+	now := int64(1_900_300_000)
+	hash := "$argon2id$v=19$m=65536,t=3,p=2$c2FsdHNhbHRzYWx0c2FsdA$aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	user, err := s.BootstrapAuthUser(ctx, "cleanup-admin", hash, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pre := AuthPreauth{TokenHash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		AccessSubject: "s", AccessIssuer: "i", CSRFHash: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		CreatedAt: now - 600, ExpiresAt: now - 1}
+	if err := s.CreatePreauth(ctx, pre); err != nil {
+		t.Fatal(err)
+	}
+	sess := AuthSession{IDHash: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+		PublicID: "cleanup-session", UserID: user.UserID, State: AuthSessionActive,
+		AccessSubject: "s", AccessIssuer: "i", CSRFHash: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+		CreatedAt: now - 1000, LastSeenAt: now - 1000, IdleExpiresAt: now - 500, AbsoluteExpiresAt: now - 1}
+	if err := s.CreateSession(ctx, sess); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CleanupAuthState(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.GetPreauth(ctx, pre.TokenHash); !errors.Is(err, ErrAuthSessionUnknown) {
+		t.Fatalf("expired preauth survived cleanup: %v", err)
+	}
+	if _, err := s.GetSession(ctx, sess.IDHash); !errors.Is(err, ErrAuthSessionUnknown) {
+		t.Fatalf("expired session survived cleanup: %v", err)
 	}
 }

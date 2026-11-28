@@ -127,11 +127,15 @@ func runAuthRecover(args []string) error {
 	if err != nil {
 		return errors.New("account recovery target is unavailable")
 	}
-	if err := st.ResetAuthUserForLocalRecovery(context.Background(), user.UserID, hash, nowUnix()); err != nil {
+	recoveryCtx := store.WithAuthMutation(context.Background(), store.AuthMutationMeta{
+		Audit: store.AuditMeta{Actor: "local-recovery", Role: "platform_admin",
+			Action: "umc_local_recovery", Target: "user:" + user.UserID},
+		LedgerKind: "umc_local_recovery", LedgerSubject: user.UserID,
+		LedgerDetailHash: ledgerHash("local-recovery"),
+	})
+	if err := st.ResetAuthUserForLocalRecovery(recoveryCtx, user.UserID, hash, nowUnix()); err != nil {
 		return err
 	}
-	_ = st.RecordAuthAudit(context.Background(), "local-recovery", "platform_admin", "umc_local_recovery", "user:"+user.UserID, "ok", nowUnix())
-	_ = st.RecordAuthLedger(context.Background(), "umc_local_recovery", user.UserID, ledgerHash("local-recovery"), nowUnix())
 	log.Printf("um-center: controlled local recovery completed for %q; all sessions revoked and TOTP re-enrollment required", user.Username)
 	return nil
 }

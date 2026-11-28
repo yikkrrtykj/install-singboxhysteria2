@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/yikkrrtykj/install-singboxhysteria2/um/internal/agent"
+	"github.com/yikkrrtykj/install-singboxhysteria2/um/internal/center"
 	"github.com/yikkrrtykj/install-singboxhysteria2/um/internal/store"
 )
 
@@ -64,7 +65,12 @@ func TestUMCMachineTLSIndependentListener(t *testing.T) {
 		}
 		inner.ServeHTTP(w, r)
 	})
+	certSource := httptest.NewUnstartedServer(http.NotFoundHandler())
+	certSource.StartTLS()
+	cert := certSource.TLS.Certificates[0]
+	certSource.Close()
 	ts := httptest.NewUnstartedServer(handler)
+	ts.TLS = center.MachineTLSConfig(cert)
 	ts.StartTLS()
 	defer ts.Close()
 
@@ -120,7 +126,25 @@ func TestUMCMachineTLSIndependentListener(t *testing.T) {
 		t.Fatal("machine TLS listener did not negotiate TLS 1.3")
 	}
 
-	// An agent that does not trust the synthetic CA must fail closed.
+	// A TLS 1.2-only client must be rejected by the production machine config.
+	tls12Client := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12, MaxVersion: tls.VersionTLS12},
+	}}
+	tls12Req, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/agent/config", nil)
+	if _, err := tls12Client.Do(tls12Req); err == nil {
+		t.Fatal("machine TLS accepted a TLS 1.2 client")
+	}
+
+	// An agent that does not trust the synthetic CA must fail closed. Use a
+	// fresh, unconsumed token so a used-token rejection cannot mask a TLS
+	// certificate-verification regression.
+	badToken, badHash, err := store.NewEnrollToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tc.store.CreateEnrollToken(ctx, badHash, eventID, store.NodeClassLinuxVPS, now+600, now); err != nil {
+		t.Fatal(err)
+	}
 	bad, err := agent.NewRuntime(agent.Options{
 		StateDir: filepath.Join(t.TempDir(), "bad-state"), CenterURL: ts.URL,
 		NodeClass: store.NodeClassLinuxVPS, HostOS: "linux", AgentVersion: "1.0.0",
@@ -130,7 +154,7 @@ func TestUMCMachineTLSIndependentListener(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer bad.Close()
-	if err := bad.Enroll(ctx, token); err == nil {
+	if err := bad.Enroll(ctx, badToken); err == nil {
 		t.Fatal("untrusted machine TLS CA was accepted")
 	}
 }

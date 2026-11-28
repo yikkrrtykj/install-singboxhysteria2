@@ -196,8 +196,7 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("machine TLS certificate: %w", err)
 		}
-		machineLn, err = tls.Listen("tcp", *machineTLS, &tls.Config{MinVersion: tls.VersionTLS13,
-			Certificates: []tls.Certificate{cert}})
+		machineLn, err = tls.Listen("tcp", *machineTLS, center.MachineTLSConfig(cert))
 		if err != nil {
 			return fmt.Errorf("machine TLS listen: %w", err)
 		}

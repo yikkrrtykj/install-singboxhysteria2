@@ -6,324 +6,1231 @@
     "description": "Browser-plane API served by the center Web listener. Every route except GET /api/health requires a valid Cloudflare Access assertion; mutations additionally require a per-session X-CSRF-Token. This is an isolated lab/deployment-template contract, not a production authorization. The existing B4 /api/v1/* contract is referenced separately."
   },
   "servers": [
-    { "url": "https://localhost:8092", "description": "Loopback origin reached through Cloudflare Tunnel/Access (placeholder)" }
+    {
+      "url": "https://localhost:8092",
+      "description": "Loopback origin reached through Cloudflare Tunnel/Access (placeholder)"
+    }
   ],
   "security": [
-    { "CloudflareAccess": [] },
-    { "SessionCookie": [], "CsrfCookie": [] }
+    {
+      "CloudflareAccess": []
+    }
   ],
   "tags": [
-    { "name": "auth", "description": "Local login, TOTP, recovery and session lifecycle" },
-    { "name": "account", "description": "Authenticated account security" },
-    { "name": "users", "description": "platform_admin account administration" },
-    { "name": "b4", "description": "Existing B4 management API through the Web session bridge" },
-    { "name": "health", "description": "Minimal anonymous Web health" }
+    {
+      "name": "auth",
+      "description": "Local login, TOTP, recovery and session lifecycle"
+    },
+    {
+      "name": "account",
+      "description": "Authenticated account security"
+    },
+    {
+      "name": "users",
+      "description": "platform_admin account administration"
+    },
+    {
+      "name": "b4",
+      "description": "Existing B4 management API through the Web session bridge"
+    },
+    {
+      "name": "health",
+      "description": "Minimal anonymous Web health"
+    }
   ],
   "paths": {
     "/api/health": {
       "get": {
-        "tags": ["health"],
+        "tags": [
+          "health"
+        ],
         "summary": "Minimal Web health probe",
         "security": [],
         "responses": {
-          "200": { "description": "Service is listening", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Health" } } } }
+          "200": {
+            "description": "Service is listening",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                }
+              }
+            }
+          }
         }
       }
     },
     "/auth/context": {
       "get": {
-        "tags": ["auth"],
+        "tags": [
+          "auth"
+        ],
         "summary": "Get current session/preauth context and CSRF token",
         "responses": {
-          "200": { "description": "Authenticated, pending TOTP, or preauth context", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AuthContext" } } } },
-          "401": { "$ref": "#/components/responses/AccessError" }
+          "200": {
+            "description": "Authenticated, pending TOTP, or preauth context",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthContext"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/AccessError"
+          }
         }
       }
     },
     "/auth/login": {
       "post": {
-        "tags": ["auth"],
+        "tags": [
+          "auth"
+        ],
         "summary": "Password login; returns TOTP challenge or forced first-time setup",
-        "parameters": [{ "$ref": "#/components/parameters/CsrfHeader" }],
-        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LoginRequest" } } } },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginRequest"
+              }
+            }
+          }
+        },
         "responses": {
-          "200": { "description": "TOTP challenge or setup required", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AuthContext" } } } },
-          "401": { "$ref": "#/components/responses/CredentialError" },
-          "403": { "$ref": "#/components/responses/CsrfError" },
-          "429": { "$ref": "#/components/responses/RateLimitError" }
+          "200": {
+            "description": "TOTP challenge or setup required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthContext"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/CredentialError"
+          },
+          "403": {
+            "$ref": "#/components/responses/CsrfError"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimitError"
+          }
         }
       }
     },
     "/auth/totp": {
       "post": {
-        "tags": ["auth"],
+        "tags": [
+          "auth"
+        ],
         "summary": "Verify TOTP or complete first-time/recovery setup",
-        "parameters": [{ "$ref": "#/components/parameters/CsrfHeader" }],
-        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TotpRequest" } } } },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TotpRequest"
+              }
+            }
+          }
+        },
         "responses": {
-          "200": { "description": "Authenticated session (setup also returns recovery codes)", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AuthContext" } } } },
-          "401": { "$ref": "#/components/responses/CredentialError" },
-          "403": { "$ref": "#/components/responses/CsrfError" }
+          "200": {
+            "description": "Authenticated session (setup also returns recovery codes)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthContext"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/CredentialError"
+          },
+          "403": {
+            "$ref": "#/components/responses/CsrfError"
+          }
         }
       }
     },
     "/auth/totp/confirm": {
       "post": {
-        "tags": ["auth"],
+        "tags": [
+          "auth"
+        ],
         "summary": "Compatibility alias for TOTP verification/setup confirmation",
-        "parameters": [{ "$ref": "#/components/parameters/CsrfHeader" }],
-        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TotpRequest" } } } },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TotpRequest"
+              }
+            }
+          }
+        },
         "responses": {
-          "200": { "description": "Authenticated session", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AuthContext" } } } },
-          "401": { "$ref": "#/components/responses/CredentialError" }
+          "200": {
+            "description": "Authenticated session",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthContext"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/CredentialError"
+          }
         }
       }
     },
     "/auth/recovery": {
       "post": {
-        "tags": ["auth"],
+        "tags": [
+          "auth"
+        ],
         "summary": "Password plus one-time recovery code -> forced TOTP re-enrollment",
-        "parameters": [{ "$ref": "#/components/parameters/CsrfHeader" }],
-        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RecoveryRequest" } } } },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecoveryRequest"
+              }
+            }
+          }
+        },
         "responses": {
-          "200": { "description": "TOTP setup material", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AuthContext" } } } },
-          "401": { "$ref": "#/components/responses/CredentialError" },
-          "429": { "$ref": "#/components/responses/RateLimitError" }
+          "200": {
+            "description": "TOTP setup material",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthContext"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/CredentialError"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimitError"
+          }
         }
       }
     },
     "/auth/logout": {
       "post": {
-        "tags": ["auth"],
+        "tags": [
+          "auth"
+        ],
         "summary": "Revoke current session (active or pending)",
-        "parameters": [{ "$ref": "#/components/parameters/CsrfHeader" }],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfHeader"
+          }
+        ],
         "responses": {
-          "204": { "description": "Session revoked" },
-          "401": { "$ref": "#/components/responses/AccessError" },
-          "403": { "$ref": "#/components/responses/CsrfError" }
+          "204": {
+            "description": "Session revoked"
+          },
+          "401": {
+            "$ref": "#/components/responses/AccessError"
+          },
+          "403": {
+            "$ref": "#/components/responses/CsrfError"
+          }
         }
       }
     },
     "/auth/abandon": {
       "post": {
-        "tags": ["auth"],
+        "tags": [
+          "auth"
+        ],
         "summary": "Revoke a pending TOTP setup/challenge session",
-        "parameters": [{ "$ref": "#/components/parameters/CsrfHeader" }],
-        "responses": { "204": { "description": "Pending session revoked" } }
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfHeader"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Pending session revoked"
+          }
+        }
       }
     },
     "/auth/me": {
       "get": {
-        "tags": ["auth"],
+        "tags": [
+          "auth"
+        ],
         "summary": "Current user/session view",
         "responses": {
-          "200": { "description": "Current context", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AuthContext" } } } },
-          "401": { "$ref": "#/components/responses/AccessError" }
+          "200": {
+            "description": "Current context",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthContext"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/AccessError"
+          }
         }
       }
     },
     "/auth/password": {
       "post": {
-        "tags": ["account"],
+        "tags": [
+          "account"
+        ],
         "summary": "Change own password; revokes all sessions and requires re-login",
-        "parameters": [{ "$ref": "#/components/parameters/CsrfHeader" }],
-        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PasswordChangeRequest" } } } },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PasswordChangeRequest"
+              }
+            }
+          }
+        },
         "responses": {
-          "200": { "description": "Password changed; all sessions revoked", "content": { "application/json": { "schema": { "type": "object", "properties": { "relogin_required": { "type": "boolean" } } } } } },
-          "401": { "$ref": "#/components/responses/CredentialError" },
-          "403": { "$ref": "#/components/responses/CsrfError" }
+          "200": {
+            "description": "Password changed; all sessions revoked",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "relogin_required": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/CredentialError"
+          },
+          "403": {
+            "$ref": "#/components/responses/CsrfError"
+          }
         }
       }
     },
     "/auth/totp/update": {
       "post": {
-        "tags": ["account"],
+        "tags": [
+          "account"
+        ],
         "summary": "Verify current password and start TOTP re-enrollment",
-        "parameters": [{ "$ref": "#/components/parameters/CsrfHeader" }],
-        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["password"], "properties": { "password": { "type": "string", "format": "password" } } } } } },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "password"
+                ],
+                "properties": {
+                  "password": {
+                    "type": "string",
+                    "format": "password"
+                  }
+                }
+              }
+            }
+          }
+        },
         "responses": {
-          "200": { "description": "New TOTP setup material (secret/URI); confirm with /auth/totp", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AuthContext" } } } },
-          "401": { "$ref": "#/components/responses/CredentialError" }
+          "200": {
+            "description": "New TOTP setup material (secret/URI); confirm with /auth/totp",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthContext"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/CredentialError"
+          }
         }
       }
     },
     "/auth/recovery-codes": {
       "post": {
-        "tags": ["account"],
+        "tags": [
+          "account"
+        ],
         "summary": "Regenerate one-time recovery codes (plaintext returned once)",
-        "parameters": [{ "$ref": "#/components/parameters/CsrfHeader" }],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfHeader"
+          }
+        ],
         "responses": {
-          "200": { "description": "New codes", "content": { "application/json": { "schema": { "type": "object", "properties": { "recovery_codes": { "type": "array", "items": { "type": "string" } } } } } } },
-          "403": { "$ref": "#/components/responses/CsrfError" }
+          "200": {
+            "description": "New codes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "recovery_codes": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "$ref": "#/components/responses/CsrfError"
+          }
         }
       }
     },
     "/auth/sessions": {
       "get": {
-        "tags": ["account"],
+        "tags": [
+          "account"
+        ],
         "summary": "List own sessions (opaque public IDs, no token hashes)",
-        "responses": { "200": { "description": "Session list", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SessionList" } } } } }
+        "responses": {
+          "200": {
+            "description": "Session list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionList"
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/auth/sessions/{session_id}/revoke": {
       "post": {
-        "tags": ["account"],
+        "tags": [
+          "account"
+        ],
         "summary": "Revoke an owned session",
-        "parameters": [{ "$ref": "#/components/parameters/CsrfHeader" }, { "$ref": "#/components/parameters/SessionId" }],
-        "responses": { "200": { "description": "Revoked" }, "404": { "$ref": "#/components/responses/NotFoundError" } }
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfHeader"
+          },
+          {
+            "$ref": "#/components/parameters/SessionId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Revoked"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFoundError"
+          }
+        }
       }
     },
     "/web/api/users": {
       "get": {
-        "tags": ["users"],
+        "tags": [
+          "users"
+        ],
         "summary": "List local accounts (platform_admin only)",
-        "responses": { "200": { "description": "User list", "content": { "application/json": { "schema": { "type": "object", "properties": { "users": { "type": "array", "items": { "$ref": "#/components/schemas/UserView" } } } } } } }, "403": { "$ref": "#/components/responses/ForbiddenError" } }
+        "responses": {
+          "200": {
+            "description": "User list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "users": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/UserView"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "$ref": "#/components/responses/ForbiddenError"
+          }
+        }
       },
       "post": {
-        "tags": ["users"],
+        "tags": [
+          "users"
+        ],
         "summary": "Create event_admin/viewer with one-time initial password (platform_admin only)",
-        "parameters": [{ "$ref": "#/components/parameters/CsrfHeader" }],
-        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateUserRequest" } } } },
-        "responses": { "201": { "description": "Created user + one-time password", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateUserResponse" } } } }, "400": { "$ref": "#/components/responses/BadRequestError" }, "409": { "$ref": "#/components/responses/ConflictError" } }
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateUserRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created user + one-time password",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateUserResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequestError"
+          },
+          "409": {
+            "$ref": "#/components/responses/ConflictError"
+          }
+        }
       }
     },
     "/web/api/users/{user_id}": {
       "get": {
-        "tags": ["users"],
+        "tags": [
+          "users"
+        ],
         "summary": "Account detail (platform_admin only)",
-        "parameters": [{ "$ref": "#/components/parameters/UserId" }],
-        "responses": { "200": { "description": "Account detail", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UserDetail" } } } }, "404": { "$ref": "#/components/responses/NotFoundError" } }
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/UserId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Account detail",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFoundError"
+          }
+        }
       }
     },
     "/web/api/users/{user_id}/disable": {
       "post": {
-        "tags": ["users"],
+        "tags": [
+          "users"
+        ],
         "summary": "Disable account and revoke sessions; last platform_admin protected",
-        "parameters": [{ "$ref": "#/components/parameters/CsrfHeader" }, { "$ref": "#/components/parameters/UserId" }],
-        "responses": { "200": { "description": "Disabled" }, "409": { "$ref": "#/components/responses/ConflictError" } }
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfHeader"
+          },
+          {
+            "$ref": "#/components/parameters/UserId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Disabled"
+          },
+          "409": {
+            "$ref": "#/components/responses/ConflictError"
+          }
+        }
       }
     },
     "/web/api/users/{user_id}/enable": {
       "post": {
-        "tags": ["users"],
+        "tags": [
+          "users"
+        ],
         "summary": "Enable account",
-        "parameters": [{ "$ref": "#/components/parameters/CsrfHeader" }, { "$ref": "#/components/parameters/UserId" }],
-        "responses": { "200": { "description": "Enabled" } }
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfHeader"
+          },
+          {
+            "$ref": "#/components/parameters/UserId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Enabled"
+          }
+        }
       }
     },
     "/web/api/users/{user_id}/role": {
       "post": {
-        "tags": ["users"],
+        "tags": [
+          "users"
+        ],
         "summary": "Replace role and event scopes; revokes sessions; last platform_admin protected",
-        "parameters": [{ "$ref": "#/components/parameters/CsrfHeader" }, { "$ref": "#/components/parameters/UserId" }],
-        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RoleRequest" } } } },
-        "responses": { "200": { "description": "Updated user" }, "400": { "$ref": "#/components/responses/BadRequestError" }, "409": { "$ref": "#/components/responses/ConflictError" } }
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfHeader"
+          },
+          {
+            "$ref": "#/components/parameters/UserId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RoleRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated user"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequestError"
+          },
+          "409": {
+            "$ref": "#/components/responses/ConflictError"
+          }
+        }
       }
     },
     "/web/api/users/{user_id}/reset-password": {
       "post": {
-        "tags": ["users"],
+        "tags": [
+          "users"
+        ],
         "summary": "Set a one-time temporary password and revoke sessions (platform_admin only)",
-        "parameters": [{ "$ref": "#/components/parameters/CsrfHeader" }, { "$ref": "#/components/parameters/UserId" }],
-        "responses": { "200": { "description": "Temporary password returned once", "content": { "application/json": { "schema": { "type": "object", "properties": { "user_id": { "type": "string" }, "temporary_password": { "type": "string" }, "relogin_required": { "type": "boolean" } } } } } } }
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfHeader"
+          },
+          {
+            "$ref": "#/components/parameters/UserId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Temporary password returned once",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "user_id": {
+                      "type": "string"
+                    },
+                    "temporary_password": {
+                      "type": "string"
+                    },
+                    "relogin_required": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/web/api/users/{user_id}/sessions": {
       "get": {
-        "tags": ["users"],
+        "tags": [
+          "users"
+        ],
         "summary": "List another account's sessions (platform_admin only)",
-        "parameters": [{ "$ref": "#/components/parameters/UserId" }],
-        "responses": { "200": { "description": "Session list", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SessionList" } } } } }
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/UserId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Session list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionList"
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/web/api/users/{user_id}/sessions/{session_id}/revoke": {
       "post": {
-        "tags": ["users"],
+        "tags": [
+          "users"
+        ],
         "summary": "Revoke another account's session (platform_admin only)",
-        "parameters": [{ "$ref": "#/components/parameters/CsrfHeader" }, { "$ref": "#/components/parameters/UserId" }, { "$ref": "#/components/parameters/SessionId" }],
-        "responses": { "200": { "description": "Revoked" }, "404": { "$ref": "#/components/responses/NotFoundError" } }
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfHeader"
+          },
+          {
+            "$ref": "#/components/parameters/UserId"
+          },
+          {
+            "$ref": "#/components/parameters/SessionId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Revoked"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFoundError"
+          }
+        }
       }
     },
     "/api/v1/{path}": {
       "get": {
-        "tags": ["b4"],
+        "tags": [
+          "b4"
+        ],
         "summary": "Existing B4 management API through the Web session bridge (all B4 paths/methods)",
         "description": "The complete path/method inventory and schemas are defined by um-b4-admin-api.openapi.json. The Web wrapper requires Access + an active local session; unsafe methods and the purge-preview GET require X-CSRF-Token/Origin. Role/event-scope authorization is the existing B4 service behavior.",
-        "parameters": [{ "name": "path", "in": "path", "required": true, "schema": { "type": "string" } }],
-        "responses": { "200": { "description": "B4 response" }, "401": { "$ref": "#/components/responses/AccessError" }, "403": { "$ref": "#/components/responses/ForbiddenError" }, "404": { "$ref": "#/components/responses/NotFoundError" } }
+        "parameters": [
+          {
+            "name": "path",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "B4 response"
+          },
+          "401": {
+            "$ref": "#/components/responses/AccessError"
+          },
+          "403": {
+            "$ref": "#/components/responses/ForbiddenError"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFoundError"
+          }
+        }
       },
       "post": {
-        "tags": ["b4"],
+        "tags": [
+          "b4"
+        ],
         "summary": "Existing B4 mutation through the Web session bridge",
-        "parameters": [{ "name": "path", "in": "path", "required": true, "schema": { "type": "string" } }, { "$ref": "#/components/parameters/CsrfHeader" }],
-        "responses": { "200": { "description": "B4 response" }, "403": { "$ref": "#/components/responses/CsrfError" } }
+        "parameters": [
+          {
+            "name": "path",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/CsrfHeader"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "B4 response"
+          },
+          "403": {
+            "$ref": "#/components/responses/CsrfError"
+          }
+        }
       }
     }
   },
   "components": {
     "securitySchemes": {
-      "CloudflareAccess": { "type": "apiKey", "in": "header", "name": "Cf-Access-Jwt-Assertion", "description": "Cryptographically verified by the center against trusted issuer/audience/JWKS; edge-supplied, never accepted from a browser field." },
-      "SessionCookie": { "type": "apiKey", "in": "cookie", "name": "__Host-um_session" },
-      "CsrfCookie": { "type": "apiKey", "in": "cookie", "name": "__Host-um_csrf" }
+      "CloudflareAccess": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "Cf-Access-Jwt-Assertion",
+        "description": "Cryptographically verified by the center against trusted issuer/audience/JWKS; edge-supplied, never accepted from a browser field."
+      }
     },
     "parameters": {
-      "CsrfHeader": { "name": "X-CSRF-Token", "in": "header", "required": true, "schema": { "type": "string" } },
-      "UserId": { "name": "user_id", "in": "path", "required": true, "schema": { "type": "string" } },
-      "SessionId": { "name": "session_id", "in": "path", "required": true, "schema": { "type": "string" } }
+      "CsrfHeader": {
+        "name": "X-CSRF-Token",
+        "in": "header",
+        "required": true,
+        "schema": {
+          "type": "string"
+        }
+      },
+      "UserId": {
+        "name": "user_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string"
+        }
+      },
+      "SessionId": {
+        "name": "session_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string"
+        }
+      }
     },
     "responses": {
-      "AccessError": { "description": "Missing/invalid Cloudflare Access assertion or local session", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
-      "CredentialError": { "description": "Generic credential failure (no account enumeration)", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
-      "CsrfError": { "description": "CSRF/Origin validation failed", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
-      "ForbiddenError": { "description": "Role/scope forbidden", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
-      "NotFoundError": { "description": "Not found or intentionally non-leaking out-of-scope resource", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
-      "BadRequestError": { "description": "Invalid request", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
-      "ConflictError": { "description": "Conflict such as duplicate username or last platform admin", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
-      "RateLimitError": { "description": "Bounded rate limit exceeded", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+      "AccessError": {
+        "description": "Missing/invalid Cloudflare Access assertion or local session",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "CredentialError": {
+        "description": "Generic credential failure (no account enumeration)",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "CsrfError": {
+        "description": "CSRF/Origin validation failed",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "ForbiddenError": {
+        "description": "Role/scope forbidden",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "NotFoundError": {
+        "description": "Not found or intentionally non-leaking out-of-scope resource",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "BadRequestError": {
+        "description": "Invalid request",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "ConflictError": {
+        "description": "Conflict such as duplicate username or last platform admin",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "RateLimitError": {
+        "description": "Bounded rate limit exceeded",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      }
     },
     "schemas": {
-      "Health": { "type": "object", "properties": { "ok": { "type": "boolean" }, "service": { "type": "string" } } },
-      "Error": { "type": "object", "properties": { "error": { "type": "object", "properties": { "code": { "type": "string" }, "message": { "type": "string" }, "retryable": { "type": "boolean" } } } } },
-      "LoginRequest": { "type": "object", "required": ["username", "password"], "properties": { "username": { "type": "string", "minLength": 3, "maxLength": 64 }, "password": { "type": "string", "format": "password", "minLength": 12, "maxLength": 1024 } } },
-      "TotpRequest": { "type": "object", "required": ["code"], "properties": { "code": { "type": "string", "pattern": "^[0-9]{6}$" } } },
-      "RecoveryRequest": { "type": "object", "required": ["username", "password", "recovery_code"], "properties": { "username": { "type": "string" }, "password": { "type": "string", "format": "password" }, "recovery_code": { "type": "string" } } },
-      "PasswordChangeRequest": { "type": "object", "required": ["current_password", "new_password"], "properties": { "current_password": { "type": "string", "format": "password" }, "new_password": { "type": "string", "format": "password", "minLength": 12, "maxLength": 1024 } } },
+      "Health": {
+        "type": "object",
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "service": {
+            "type": "string"
+          }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              },
+              "retryable": {
+                "type": "boolean"
+              }
+            }
+          }
+        }
+      },
+      "LoginRequest": {
+        "type": "object",
+        "required": [
+          "username",
+          "password"
+        ],
+        "properties": {
+          "username": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 64
+          },
+          "password": {
+            "type": "string",
+            "format": "password",
+            "minLength": 12,
+            "maxLength": 1024
+          }
+        }
+      },
+      "TotpRequest": {
+        "type": "object",
+        "required": [
+          "code"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "pattern": "^[0-9]{6}$"
+          }
+        }
+      },
+      "RecoveryRequest": {
+        "type": "object",
+        "required": [
+          "username",
+          "password",
+          "recovery_code"
+        ],
+        "properties": {
+          "username": {
+            "type": "string"
+          },
+          "password": {
+            "type": "string",
+            "format": "password"
+          },
+          "recovery_code": {
+            "type": "string"
+          }
+        }
+      },
+      "PasswordChangeRequest": {
+        "type": "object",
+        "required": [
+          "current_password",
+          "new_password"
+        ],
+        "properties": {
+          "current_password": {
+            "type": "string",
+            "format": "password"
+          },
+          "new_password": {
+            "type": "string",
+            "format": "password",
+            "minLength": 12,
+            "maxLength": 1024
+          }
+        }
+      },
       "UserView": {
         "type": "object",
         "properties": {
-          "user_id": { "type": "string" }, "username": { "type": "string" },
-          "role": { "type": "string", "enum": ["platform_admin", "event_admin", "viewer"] },
-          "enabled": { "type": "boolean" }, "event_ids": { "type": "array", "items": { "type": "string", "format": "uuid" } },
-          "totp_enrolled": { "type": "boolean" }, "last_login_at": { "type": "integer", "nullable": true }
+          "user_id": {
+            "type": "string"
+          },
+          "username": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "platform_admin",
+              "event_admin",
+              "viewer"
+            ]
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "event_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          "totp_enrolled": {
+            "type": "boolean"
+          },
+          "last_login_at": {
+            "type": "integer",
+            "nullable": true
+          }
         }
       },
       "AuthContext": {
         "type": "object",
         "properties": {
-          "authenticated": { "type": "boolean" },
-          "session_state": { "type": "string", "enum": ["totp_pending", "totp_setup", "authenticated"] },
-          "totp_required": { "type": "boolean" }, "totp_setup_required": { "type": "boolean" },
-          "csrf_token": { "type": "string", "description": "Raw per-session CSRF token; never persisted client-side. Present when a session/preauth is active." },
-          "user": { "$ref": "#/components/schemas/UserView" },
-          "secret": { "type": "string", "description": "Only for a pending setup/recovery session; base32 TOTP secret, never persisted in browser storage." },
-          "otpauth_uri": { "type": "string" },
-          "recovery_codes": { "type": "array", "items": { "type": "string" } }
+          "authenticated": {
+            "type": "boolean"
+          },
+          "session_state": {
+            "type": "string",
+            "enum": [
+              "totp_pending",
+              "totp_setup",
+              "authenticated"
+            ]
+          },
+          "totp_required": {
+            "type": "boolean"
+          },
+          "totp_setup_required": {
+            "type": "boolean"
+          },
+          "csrf_token": {
+            "type": "string",
+            "description": "Raw per-session CSRF token; never persisted client-side. Present when a session/preauth is active."
+          },
+          "user": {
+            "$ref": "#/components/schemas/UserView"
+          },
+          "secret": {
+            "type": "string",
+            "description": "Only for a pending setup/recovery session; base32 TOTP secret, never persisted in browser storage."
+          },
+          "otpauth_uri": {
+            "type": "string"
+          },
+          "recovery_codes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
         }
       },
-      "SessionList": { "type": "object", "properties": { "sessions": { "type": "array", "items": { "$ref": "#/components/schemas/SessionView" } } } },
+      "SessionList": {
+        "type": "object",
+        "properties": {
+          "sessions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SessionView"
+            }
+          }
+        }
+      },
       "SessionView": {
         "type": "object",
         "properties": {
-          "session_id": { "type": "string", "description": "Opaque public session identifier, not the token/hash." },
-          "state": { "type": "string" }, "created_at": { "type": "integer" }, "last_seen_at": { "type": "integer" },
-          "idle_expires_at": { "type": "integer" }, "absolute_expires_at": { "type": "integer" },
-          "revoked_at": { "type": "integer", "nullable": true }, "current": { "type": "boolean" }
+          "session_id": {
+            "type": "string",
+            "description": "Opaque public session identifier, not the token/hash."
+          },
+          "state": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "integer"
+          },
+          "last_seen_at": {
+            "type": "integer"
+          },
+          "idle_expires_at": {
+            "type": "integer"
+          },
+          "absolute_expires_at": {
+            "type": "integer"
+          },
+          "revoked_at": {
+            "type": "integer",
+            "nullable": true
+          },
+          "current": {
+            "type": "boolean"
+          }
         }
       },
-      "UserDetail": { "type": "object", "properties": { "user": { "$ref": "#/components/schemas/UserView" }, "recovery_codes_unused": { "type": "integer" } } },
-      "CreateUserRequest": { "type": "object", "required": ["username", "role", "event_ids"], "properties": { "username": { "type": "string" }, "role": { "type": "string", "enum": ["event_admin", "viewer"] }, "event_ids": { "type": "array", "minItems": 1, "items": { "type": "string", "format": "uuid" } } } },
-      "RoleRequest": { "type": "object", "required": ["role", "event_ids"], "properties": { "role": { "type": "string", "enum": ["event_admin", "viewer"] }, "event_ids": { "type": "array", "minItems": 1, "items": { "type": "string", "format": "uuid" } } } },
-      "CreateUserResponse": { "type": "object", "properties": { "user": { "$ref": "#/components/schemas/UserView" }, "initial_password": { "type": "string", "description": "One-time plaintext generated initial password; not retrievable later." } } }
+      "UserDetail": {
+        "type": "object",
+        "properties": {
+          "user": {
+            "$ref": "#/components/schemas/UserView"
+          },
+          "recovery_codes_unused": {
+            "type": "integer"
+          }
+        }
+      },
+      "CreateUserRequest": {
+        "type": "object",
+        "required": [
+          "username",
+          "role",
+          "event_ids"
+        ],
+        "properties": {
+          "username": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "event_admin",
+              "viewer"
+            ]
+          },
+          "event_ids": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        }
+      },
+      "RoleRequest": {
+        "type": "object",
+        "required": [
+          "role",
+          "event_ids"
+        ],
+        "properties": {
+          "role": {
+            "type": "string",
+            "enum": [
+              "event_admin",
+              "viewer"
+            ]
+          },
+          "event_ids": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        }
+      },
+      "CreateUserResponse": {
+        "type": "object",
+        "properties": {
+          "user": {
+            "$ref": "#/components/schemas/UserView"
+          },
+          "initial_password": {
+            "type": "string",
+            "description": "One-time plaintext generated initial password; not retrievable later."
+          }
+        }
+      }
     }
   }
 }

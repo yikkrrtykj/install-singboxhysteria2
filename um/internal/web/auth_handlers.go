@@ -34,11 +34,11 @@ func (h *Handler) setSessionCookie(w http.ResponseWriter, value string, maxAge i
 }
 
 func (h *Handler) setCSRFCookie(w http.ResponseWriter, value string, maxAge int) {
-	// CSRF is a per-session double-submit token, not a credential. It remains
-	// HttpOnly=false so the SPA can send it in X-CSRF-Token; it is never used
-	// alone and cannot authenticate a request.
+	// CSRF is a per-session double-submit token, not a credential. It is HttpOnly
+	// and the SPA obtains the raw value from /auth/context (never document.cookie);
+	// it is never used alone and cannot authenticate a request.
 	http.SetCookie(w, &http.Cookie{Name: "__Host-um_csrf", Value: value, Path: "/", Secure: true,
-		HttpOnly: false, SameSite: http.SameSiteStrictMode, MaxAge: maxAge})
+		HttpOnly: true, SameSite: http.SameSiteStrictMode, MaxAge: maxAge})
 }
 
 func (h *Handler) setPreauthCookie(w http.ResponseWriter, value string, maxAge int) {
@@ -49,7 +49,7 @@ func (h *Handler) setPreauthCookie(w http.ResponseWriter, value string, maxAge i
 func (h *Handler) clearCookies(w http.ResponseWriter) {
 	for _, name := range []string{sessionCookie, preauthCookie, "__Host-um_csrf"} {
 		http.SetCookie(w, &http.Cookie{Name: name, Value: "", Path: "/", Secure: true, MaxAge: -1,
-			Expires: time.Unix(1, 0), HttpOnly: name != "__Host-um_csrf", SameSite: http.SameSiteStrictMode})
+			Expires: time.Unix(1, 0), HttpOnly: true, SameSite: http.SameSiteStrictMode})
 	}
 }
 
@@ -193,7 +193,13 @@ func (h *Handler) authContext(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// No valid session: issue a short-lived preauth binding to the verified
-	// Access subject, for login CSRF and subject continuity.
+	// Access subject, for login CSRF and subject continuity. Bound row creation
+	// per verified Access subject so repeated context calls cannot grow the
+	// preauth table faster than bounded maintenance cleanup.
+	if !h.limiter.allow("preauth-create:"+claims.Claims.Subject, 0.2, 20) {
+		h.writeError(w, http.StatusTooManyRequests, "rate_limited", "authentication context rate limit exceeded")
+		return
+	}
 	token, err := umcauth.NewToken()
 	if err != nil {
 		h.writeError(w, http.StatusInternalServerError, "internal", "temporary authentication unavailable")
@@ -253,7 +259,7 @@ func (h *Handler) login(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, http.StatusUnauthorized, "access_unauthorized", "valid Cloudflare Access identity required")
 		return
 	}
-	if !h.limiter.allow("login-global:"+remoteIP(r), 5, 20) {
+	if !h.limiter.allow("login-global:"+claims.Claims.Subject, 5, 20) {
 		h.writeError(w, http.StatusTooManyRequests, "rate_limited", "login rate limit exceeded")
 		return
 	}
@@ -266,14 +272,17 @@ func (h *Handler) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	username := strings.TrimSpace(req.Username)
-	if !h.limiter.allow("login-account:"+strings.ToLower(username)+":"+remoteIP(r), 0.2, 5) {
-		h.writeError(w, http.StatusTooManyRequests, "rate_limited", "login rate limit exceeded")
-		return
-	}
+	// Verify the preauth/CSRF binding before consuming the targeted account
+	// budget, so an unauthenticated party cannot exhaust a known account's
+	// per-subject/login budget without a valid preauth cookie and CSRF token.
 	pre, err := h.verifyPreauth(r, claims)
 	if err != nil {
 		h.auditAnonymous(r, "umc_login_failed", "preauth")
 		h.writeError(w, http.StatusForbidden, "login_csrf_failed", "login session is invalid or expired")
+		return
+	}
+	if !h.limiter.allow("login-account:"+claims.Claims.Subject+"|"+strings.ToLower(username), 0.2, 5) {
+		h.writeError(w, http.StatusTooManyRequests, "rate_limited", "login rate limit exceeded")
 		return
 	}
 	user, getErr := h.store.GetAuthUserByUsername(r.Context(), username)
@@ -339,6 +348,12 @@ func (h *Handler) login(w http.ResponseWriter, r *http.Request) {
 		"secret": secret, "otpauth_uri": uri, "user": toUserView(user)})
 }
 
+const (
+	totpPendingTTL   = 10 * time.Minute
+	totpMaxFailures  = int64(5)
+	totpLockDuration = int64(15 * 60)
+)
+
 func (h *Handler) verifyTOTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		h.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
@@ -354,8 +369,14 @@ func (h *Handler) verifyTOTP(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, http.StatusForbidden, "csrf_invalid", "CSRF validation failed")
 		return
 	}
-	if !h.limiter.allow("totp:"+id.User.UserID+":"+remoteIP(r), 0.5, 6) {
+	if !h.limiter.allow("totp:"+id.User.UserID, 0.5, 5) {
 		h.writeError(w, http.StatusTooManyRequests, "rate_limited", "TOTP rate limit exceeded")
+		return
+	}
+	if id.User.TOTPLockedUntil != nil && *id.User.TOTPLockedUntil > h.now().Unix() {
+		h.auditIdentity(r, id, "umc_totp_locked", "auth_totp", "denied")
+		h.clearCookies(w)
+		h.writeError(w, http.StatusTooManyRequests, "totp_locked", "TOTP temporarily locked")
 		return
 	}
 	var req struct {
@@ -379,43 +400,22 @@ func (h *Handler) verifyTOTP(w http.ResponseWriter, r *http.Request) {
 	}
 	counter, ok, err := umcauth.VerifyTOTP(secret, strings.TrimSpace(req.Code), now, 1)
 	if err != nil || !ok {
+		lockedUntil, ferr := h.store.RecordTOTPFailure(r.Context(), id.User.UserID, h.now().Unix(), totpMaxFailures, totpLockDuration)
 		h.auditIdentity(r, id, "umc_totp_failed", "auth_totp", "denied")
+		if ferr != nil {
+			h.writeError(w, http.StatusInternalServerError, "internal", "TOTP state unavailable")
+			return
+		}
+		if lockedUntil > 0 {
+			h.auditIdentity(r, id, "umc_totp_locked", "auth_totp", "denied")
+			h.clearCookies(w)
+			h.writeError(w, http.StatusTooManyRequests, "totp_locked", "TOTP temporarily locked")
+			return
+		}
 		h.writeError(w, http.StatusUnauthorized, "invalid_totp", "invalid TOTP code")
 		return
 	}
 	oldHash := id.Session.IDHash
-	if id.Session.State == store.AuthSessionTOTPSetup {
-		sealed, err := h.sealTOTP(id.User.UserID, secret)
-		if err != nil {
-			h.writeError(w, http.StatusInternalServerError, "internal", "TOTP state unavailable")
-			return
-		}
-		setupReq := h.mutationRequest(r, id.User, "umc_totp_enrolled", "user:"+id.User.UserID,
-			"umc_totp_enrolled", id.User.UserID, "totp-setup")
-		if err := h.store.SetAuthUserTOTP(setupReq.Context(), id.User.UserID, sealed, 1, now.Unix()); err != nil {
-			h.writeError(w, http.StatusInternalServerError, "internal", "TOTP state unavailable")
-			return
-		}
-		// SetAuthUserTOTP revoked all old sessions; create the active replacement.
-		csrf, err := h.issueSession(r.Context(), w, id.User, id.Claims, store.AuthSessionActive, nil)
-		if err != nil {
-			h.writeError(w, http.StatusInternalServerError, "internal", "session unavailable")
-			return
-		}
-		if err := h.store.ConsumeTOTPCounter(r.Context(), id.User.UserID, int64(counter), now.Unix()); err != nil {
-			h.writeError(w, http.StatusInternalServerError, "internal", "TOTP state unavailable")
-			return
-		}
-		codes, err := h.replaceRecoveryCodes(r.Context(), id.User.UserID)
-		if err != nil {
-			h.writeError(w, http.StatusInternalServerError, "internal", "recovery code setup failed")
-			return
-		}
-		_ = h.store.MarkAuthLogin(r.Context(), id.User.UserID, now.Unix())
-		h.writeJSON(w, http.StatusOK, map[string]any{"authenticated": true, "user": toUserView(id.User),
-			"csrf_token": csrf, "recovery_codes": codes})
-		return
-	}
 	nextToken, err := umcauth.NewToken()
 	if err != nil {
 		h.writeError(w, http.StatusInternalServerError, "internal", "session unavailable")
@@ -440,7 +440,37 @@ func (h *Handler) verifyTOTP(w http.ResponseWriter, r *http.Request) {
 		IdleExpiresAt:     nowUnix + int64(h.idle/time.Second),
 		AbsoluteExpiresAt: nowUnix + int64(h.absolute/time.Second),
 	}
-	if err := h.store.CompleteTOTPLogin(r.Context(), id.User.UserID, int64(counter), oldHash, next, nowUnix); err != nil {
+	if id.Session.State == store.AuthSessionTOTPSetup {
+		sealed, err := h.sealTOTP(id.User.UserID, secret)
+		if err != nil {
+			h.writeError(w, http.StatusInternalServerError, "internal", "TOTP state unavailable")
+			return
+		}
+		codes, hashes, err := h.generateRecoveryCodes(10)
+		if err != nil {
+			h.writeError(w, http.StatusInternalServerError, "internal", "recovery code setup failed")
+			return
+		}
+		setupReq := h.mutationRequest(r, id.User, "umc_totp_enrolled", "user:"+id.User.UserID,
+			"umc_totp_enrolled", id.User.UserID, "totp-setup")
+		if err := h.store.CompleteTOTPSetup(setupReq.Context(), id.User.UserID, sealed, 1,
+			int64(counter), hashes, next, nowUnix); err != nil {
+			if errors.Is(err, store.ErrAuthTOTPReplayed) {
+				h.writeError(w, http.StatusUnauthorized, "totp_replayed", "TOTP code already used")
+				return
+			}
+			h.writeError(w, http.StatusInternalServerError, "internal", "TOTP setup failed")
+			return
+		}
+		h.setSessionCookie(w, nextToken, int(h.absolute/time.Second))
+		h.setCSRFCookie(w, csrfRaw, int(h.absolute/time.Second))
+		h.writeJSON(w, http.StatusOK, map[string]any{"authenticated": true, "user": toUserView(id.User),
+			"csrf_token": csrfRaw, "recovery_codes": codes})
+		return
+	}
+	loginReq := h.mutationRequest(r, id.User, "umc_login", "user:"+id.User.UserID,
+		"umc_login", id.User.UserID, "totp-login")
+	if err := h.store.CompleteTOTPLogin(loginReq.Context(), id.User.UserID, int64(counter), oldHash, next, nowUnix); err != nil {
 		if errors.Is(err, store.ErrAuthTOTPReplayed) {
 			h.auditIdentity(r, id, "umc_totp_replay", "auth_totp", "denied")
 			h.writeError(w, http.StatusUnauthorized, "totp_replayed", "TOTP code already used")
@@ -451,19 +481,26 @@ func (h *Handler) verifyTOTP(w http.ResponseWriter, r *http.Request) {
 	}
 	h.setSessionCookie(w, nextToken, int(h.absolute/time.Second))
 	h.setCSRFCookie(w, csrfRaw, int(h.absolute/time.Second))
-	h.auditIdentity(r, id, "umc_login", "user:"+id.User.UserID, "ok")
 	h.writeJSON(w, http.StatusOK, map[string]any{"authenticated": true, "user": toUserView(id.User),
 		"csrf_token": csrfRaw})
 }
 
-func (h *Handler) replaceRecoveryCodes(ctx context.Context, userID string) ([]string, error) {
-	codes, err := umcauth.GenerateRecoveryCodes(10)
+func (h *Handler) generateRecoveryCodes(count int) ([]string, []string, error) {
+	codes, err := umcauth.GenerateRecoveryCodes(count)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	hashes := make([]string, len(codes))
 	for i, code := range codes {
 		hashes[i] = umcauth.HashRecoveryCode(code)
+	}
+	return codes, hashes, nil
+}
+
+func (h *Handler) replaceRecoveryCodes(ctx context.Context, userID string) ([]string, error) {
+	codes, hashes, err := h.generateRecoveryCodes(10)
+	if err != nil {
+		return nil, err
 	}
 	if err := h.store.ReplaceRecoveryCodes(ctx, userID, hashes, h.now().Unix()); err != nil {
 		return nil, err
@@ -481,7 +518,7 @@ func (h *Handler) recover(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, http.StatusUnauthorized, "access_unauthorized", "valid Cloudflare Access identity required")
 		return
 	}
-	if !h.limiter.allow("recovery-global:"+remoteIP(r), 2, 10) {
+	if !h.limiter.allow("recovery-global:"+claims.Claims.Subject, 2, 10) {
 		h.writeError(w, http.StatusTooManyRequests, "rate_limited", "recovery rate limit exceeded")
 		return
 	}
@@ -500,23 +537,32 @@ func (h *Handler) recover(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, http.StatusForbidden, "login_csrf_failed", "recovery session invalid or expired")
 		return
 	}
-	user, err := h.store.GetAuthUserByUsername(r.Context(), req.Username)
-	if err != nil || !user.Enabled {
-		h.auditAnonymous(r, "umc_recovery_failed", "credentials")
-		h.writeError(w, http.StatusUnauthorized, "invalid_recovery", "invalid recovery credentials")
-		return
+	user, getErr := h.store.GetAuthUserByUsername(r.Context(), req.Username)
+	// Use a constant dummy hash for unknown/disabled accounts so the response
+	// time does not become an account-existence oracle.
+	passwordHash := h.dummyHash
+	if getErr == nil {
+		passwordHash = user.PasswordHash
 	}
-	if !h.limiter.allow("recovery:"+user.UserID+":"+remoteIP(r), 0.1, 3) {
+	if getErr == nil && !h.limiter.allow("recovery:"+user.UserID, 0.1, 3) {
 		h.writeError(w, http.StatusTooManyRequests, "rate_limited", "recovery rate limit exceeded")
 		return
 	}
 	var ok bool
 	if err := h.withKDF(func() error {
 		var verr error
-		ok, verr = umcauth.VerifyPassword(user.PasswordHash, req.Password)
+		ok, verr = umcauth.VerifyPassword(passwordHash, req.Password)
 		return verr
-	}); err != nil || !ok {
-		h.auditIdentity(r, &identity{User: user}, "umc_recovery_failed", "user:"+user.UserID, "denied")
+	}); err != nil {
+		h.writeError(w, http.StatusServiceUnavailable, "kdf_busy", "authentication busy; retry")
+		return
+	}
+	if getErr != nil || !user.Enabled || !ok {
+		if getErr == nil {
+			h.auditIdentity(r, &identity{User: user}, "umc_recovery_failed", "user:"+user.UserID, "denied")
+		} else {
+			h.auditAnonymous(r, "umc_recovery_failed", "credentials")
+		}
 		h.writeError(w, http.StatusUnauthorized, "invalid_recovery", "invalid recovery credentials")
 		return
 	}
@@ -547,11 +593,6 @@ func (h *Handler) recover(w http.ResponseWriter, r *http.Request) {
 	}
 	h.writeJSON(w, http.StatusOK, map[string]any{"totp_setup_required": true, "csrf_token": csrf,
 		"secret": secret, "otpauth_uri": uri, "user": toUserView(user)})
-}
-
-func (h *Handler) recordLedger(ctx context.Context, kind, subject, detail string) error {
-	sum := sha256.Sum256([]byte(detail))
-	return h.store.RecordAuthLedger(ctx, kind, subject, hex.EncodeToString(sum[:]), h.now().Unix())
 }
 
 // mutationRequest attaches atomic audit/ledger metadata to a critical auth-state

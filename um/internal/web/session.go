@@ -92,6 +92,9 @@ func (h *Handler) authenticate(r *http.Request, allowedStates ...string) (*ident
 	if sess.AccessSubject != claims.Claims.Subject || sess.AccessIssuer != claims.Claims.Issuer {
 		return nil, ErrIdentityMissing
 	}
+	if sess.State != store.AuthSessionActive && now-sess.CreatedAt > int64(totpPendingTTL/time.Second) {
+		return nil, ErrIdentityMissing
+	}
 	stateAllowed := false
 	for _, state := range allowedStates {
 		if sess.State == state {

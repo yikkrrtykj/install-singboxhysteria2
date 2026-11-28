@@ -14,6 +14,7 @@ import (
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -83,6 +84,7 @@ type testWeb struct {
 	jwt      string
 	access   *accessFixture
 	master   []byte
+	clock    *time.Time
 	store    *store.Store
 	userID   string
 	password string
@@ -104,9 +106,11 @@ func newTestWeb(t *testing.T) *testWeb {
 	if err != nil {
 		t.Fatal(err)
 	}
+	clock := time.Now()
 	access := newAccessFixture(t)
 	verifier, err := umcauth.NewVerifier(umcauth.Config{Issuer: testAccessIssuer, Audience: testAccessAudience,
-		JWKSURL: access.server.URL + "/jwks", AllowInsecureHTTPForTests: true})
+		JWKSURL: access.server.URL + "/jwks", AllowInsecureHTTPForTests: true,
+		Now: func() time.Time { return clock }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +119,8 @@ func newTestWeb(t *testing.T) *testWeb {
 		t.Fatal(err)
 	}
 	h, err := web.NewHandler(web.Config{Store: st, ManagementService: msg, Access: verifier,
-		MasterKey: master, AllowedOrigins: []string{"https://web.example"}})
+		MasterKey: master, AllowedOrigins: []string{"https://web.example"},
+		Now: func() time.Time { return clock }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +131,7 @@ func newTestWeb(t *testing.T) *testWeb {
 	client := ts.Client()
 	client.Jar = jar
 	return &testWeb{handler: h, server: ts, client: client, jwt: access.token(t, testAccessSubject, time.Now()),
-		access: access, master: master, store: st, password: "correct horse battery staple"}
+		access: access, master: master, clock: &clock, store: st, password: "correct horse battery staple"}
 }
 
 func (tw *testWeb) request(t *testing.T, method, path, csrf string, body any, accessToken string) (int, []byte) {
@@ -339,6 +344,19 @@ func TestUMCLocalBearerAndAccessHeadersDoNotAuthorize(t *testing.T) {
 			t.Fatalf("%s without Access status=%d", path, status)
 		}
 	}
+	// A valid Access assertion plus the local B4 bearer still cannot create a
+	// local session on the Web plane.
+	req, _ = http.NewRequest(http.MethodGet, tw.server.URL+"/api/v1/events", nil)
+	req.Header.Set("Cf-Access-Jwt-Assertion", tw.jwt)
+	req.Header.Set("Authorization", "Bearer local-admin-token")
+	resp, err = tw.client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("valid Access + local bearer authorized on Web: %d", resp.StatusCode)
+	}
 }
 
 func TestUMCAccessJWTWrongSubjectDoesNotBindSession(t *testing.T) {
@@ -374,6 +392,47 @@ func TestUMCNoPublicBootstrapOrRegistration(t *testing.T) {
 		status, _ := tw.request(t, http.MethodPost, path, "", map[string]any{"username": "x"}, tw.jwt)
 		if status != http.StatusNotFound && status != http.StatusUnauthorized {
 			t.Fatalf("%s unexpectedly exposed: %d", path, status)
+		}
+	}
+}
+
+func TestUMCWebCookieSecurityAttributes(t *testing.T) {
+	tw := newTestWeb(t)
+	hash, _ := umcauth.HashPassword(tw.password, umcauth.DefaultPasswordParams())
+	if _, err := tw.store.BootstrapAuthUser(context.Background(), "cookie-admin", hash, (*tw.clock).Unix()); err != nil {
+		t.Fatal(err)
+	}
+	pre := tw.startContext(t)
+	body := []byte(`{"username":"cookie-admin","password":"correct horse battery staple"}`)
+	req, _ := http.NewRequest(http.MethodPost, tw.server.URL+"/auth/login", bytes.NewReader(body))
+	req.Header.Set("Cf-Access-Jwt-Assertion", tw.jwt)
+	req.Header.Set("X-CSRF-Token", pre)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := tw.client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("login status=%d", resp.StatusCode)
+	}
+	want := map[string]bool{"__Host-um_session": false, "__Host-um_csrf": false}
+	for _, c := range resp.Cookies() {
+		if _, ok := want[c.Name]; !ok {
+			continue
+		}
+		want[c.Name] = true
+		if !c.Secure || !c.HttpOnly || c.SameSite != http.SameSiteStrictMode || c.Path != "/" || c.Domain != "" {
+			t.Fatalf("cookie %s flags secure=%v httponly=%v samesite=%v path=%q domain=%q",
+				c.Name, c.Secure, c.HttpOnly, c.SameSite, c.Path, c.Domain)
+		}
+		if !strings.HasPrefix(c.Name, "__Host-") || strings.TrimSpace(c.Value) == "" {
+			t.Fatalf("cookie %s prefix/value invalid", c.Name)
+		}
+	}
+	for name, seen := range want {
+		if !seen {
+			t.Fatalf("missing cookie %s", name)
 		}
 	}
 }

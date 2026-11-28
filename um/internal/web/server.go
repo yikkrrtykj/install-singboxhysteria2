@@ -56,10 +56,6 @@ type Config struct {
 	Now               func() time.Time
 	IdleTimeout       time.Duration
 	AbsoluteTimeout   time.Duration
-	// TestHookAccessHeader permits tests to inject the Access JWT through a
-	// request header only; it never changes production behavior. The browser
-	// cannot set this header itself; Cloudflare Access supplies it at the origin.
-	TestHookAccessHeader bool
 }
 
 // Handler is the isolated loopback Web plane.

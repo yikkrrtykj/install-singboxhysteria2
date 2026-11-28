@@ -242,3 +242,97 @@ func TestUMCRecoveryPasswordSessionsAndLastAdmin(t *testing.T) {
 }
 
 func stringsReader(s string) *bytes.Reader { return bytes.NewReader([]byte(s)) }
+
+func TestUMCSessionIdleAndAbsoluteExpiry(t *testing.T) {
+	tw := newTestWeb(t)
+	now := *tw.clock
+	hash, _ := umcauth.HashPassword(tw.password, umcauth.DefaultPasswordParams())
+	user, err := tw.store.BootstrapAuthUser(context.Background(), "expiry-admin", hash, now.Unix())
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret, _ := umcauth.NewTOTPSecret()
+	sealed, _ := umcauth.Seal(tw.master, []byte(secret), []byte("umc-totp:"+user.UserID+":v1"))
+	if err := tw.store.SetAuthUserTOTP(context.Background(), user.UserID, sealed, 1, now.Unix()); err != nil {
+		t.Fatal(err)
+	}
+	login := func() {
+		pre := tw.startContext(t)
+		status, raw := tw.request(t, http.MethodPost, "/auth/login", pre,
+			map[string]any{"username": "expiry-admin", "password": tw.password}, tw.jwt)
+		if status != http.StatusOK {
+			t.Fatalf("login status=%d body=%s", status, raw)
+		}
+		pending, _ := decodeMap(t, raw)["csrf_token"].(string)
+		code, _ := umcauth.TOTPCode(secret, *tw.clock)
+		status, raw = tw.request(t, http.MethodPost, "/auth/totp", pending, map[string]any{"code": code}, tw.jwt)
+		if status != http.StatusOK {
+			t.Fatalf("TOTP status=%d body=%s", status, raw)
+		}
+	}
+	login()
+	status, _ := tw.request(t, http.MethodGet, "/auth/me", "", nil, tw.jwt)
+	if status != http.StatusOK {
+		t.Fatalf("active session status=%d", status)
+	}
+	// Idle timeout is 30 minutes.
+	*tw.clock = tw.clock.Add(31 * time.Minute)
+	tw.jwt = tw.access.token(t, testAccessSubject, *tw.clock)
+	status, _ = tw.request(t, http.MethodGet, "/auth/me", "", nil, tw.jwt)
+	if status != http.StatusUnauthorized {
+		t.Fatalf("idle-expired session status=%d", status)
+	}
+	// Absolute lifetime is 12 hours even with fresh activity.
+	login()
+	*tw.clock = tw.clock.Add(13 * time.Hour)
+	tw.jwt = tw.access.token(t, testAccessSubject, *tw.clock)
+	status, _ = tw.request(t, http.MethodGet, "/auth/me", "", nil, tw.jwt)
+	if status != http.StatusUnauthorized {
+		t.Fatalf("absolute-expired session status=%d", status)
+	}
+}
+
+func TestUMCTOTPFailureLockout(t *testing.T) {
+	tw := newTestWeb(t)
+	now := *tw.clock
+	hash, _ := umcauth.HashPassword(tw.password, umcauth.DefaultPasswordParams())
+	user, err := tw.store.BootstrapAuthUser(context.Background(), "lockout-admin", hash, now.Unix())
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret, _ := umcauth.NewTOTPSecret()
+	sealed, _ := umcauth.Seal(tw.master, []byte(secret), []byte("umc-totp:"+user.UserID+":v1"))
+	if err := tw.store.SetAuthUserTOTP(context.Background(), user.UserID, sealed, 1, now.Unix()); err != nil {
+		t.Fatal(err)
+	}
+	pre := tw.startContext(t)
+	status, raw := tw.request(t, http.MethodPost, "/auth/login", pre,
+		map[string]any{"username": "lockout-admin", "password": tw.password}, tw.jwt)
+	if status != http.StatusOK {
+		t.Fatalf("login status=%d body=%s", status, raw)
+	}
+	pending, _ := decodeMap(t, raw)["csrf_token"].(string)
+	lastStatus := 0
+	for i := 0; i < 5; i++ {
+		lastStatus, _ = tw.request(t, http.MethodPost, "/auth/totp", pending, map[string]any{"code": "000000"}, tw.jwt)
+	}
+	if lastStatus != http.StatusTooManyRequests {
+		t.Fatalf("lockout status=%d, want 429", lastStatus)
+	}
+	// Even the correct code is rejected while locked, and the pending session
+	// was revoked when the account locked.
+	*tw.clock = tw.clock.Add(16 * time.Minute)
+	tw.jwt = tw.access.token(t, testAccessSubject, *tw.clock)
+	pre = tw.startContext(t)
+	status, raw = tw.request(t, http.MethodPost, "/auth/login", pre,
+		map[string]any{"username": "lockout-admin", "password": tw.password}, tw.jwt)
+	if status != http.StatusOK {
+		t.Fatalf("post-lock login status=%d body=%s", status, raw)
+	}
+	pending, _ = decodeMap(t, raw)["csrf_token"].(string)
+	code, _ := umcauth.TOTPCode(secret, *tw.clock)
+	status, raw = tw.request(t, http.MethodPost, "/auth/totp", pending, map[string]any{"code": code}, tw.jwt)
+	if status != http.StatusOK {
+		t.Fatalf("post-lock correct TOTP status=%d body=%s", status, raw)
+	}
+}
