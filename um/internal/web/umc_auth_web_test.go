@@ -75,7 +75,7 @@ func TestUMCRecoveryPasswordSessionsAndLastAdmin(t *testing.T) {
 		t.Fatalf("expected TOTP challenge: %v", login)
 	}
 	pendingCSRF, _ := login["csrf_token"].(string)
-	code, err := umcauth.TOTPCode(totpSecret, time.Now())
+	code, err := umcauth.TOTPCode(totpSecret, *tw.clock)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +130,7 @@ func TestUMCRecoveryPasswordSessionsAndLastAdmin(t *testing.T) {
 	if newSecret == "" || setupCSRF == "" {
 		t.Fatalf("recovery setup missing: %s", raw)
 	}
-	setupCode, _ := umcauth.TOTPCode(newSecret, time.Now())
+	setupCode, _ := umcauth.TOTPCode(newSecret, *tw.clock)
 	status, raw = tw.request(t, http.MethodPost, "/auth/totp", setupCSRF, map[string]any{"code": setupCode}, tw.jwt)
 	if status != http.StatusOK {
 		t.Fatalf("recovery TOTP confirm status=%d body=%s", status, raw)
@@ -151,7 +151,7 @@ func TestUMCRecoveryPasswordSessionsAndLastAdmin(t *testing.T) {
 	preAuth := tw.startContext(t)
 	login = tw.loginWithPassword(t, tw.password, preAuth)
 	pendingCSRF, _ = login["csrf_token"].(string)
-	code2, _ := umcauth.TOTPCode(newSecret, time.Now().Add(30*time.Second))
+	code2, _ := umcauth.TOTPCode(newSecret, tw.clock.Add(30*time.Second))
 	status, raw = tw.request(t, http.MethodPost, "/auth/totp", pendingCSRF, map[string]any{"code": code2}, tw.jwt)
 	if status != http.StatusOK {
 		t.Fatalf("re-login for password change status=%d body=%s", status, raw)
@@ -181,7 +181,7 @@ func TestUMCRecoveryPasswordSessionsAndLastAdmin(t *testing.T) {
 	if pendingCSRF == "" || login["totp_required"] != true {
 		t.Fatalf("new password login shape: %v", login)
 	}
-	nextCode, _ := umcauth.TOTPCode(newSecret, time.Now().Add(-30*time.Second))
+	nextCode, _ := umcauth.TOTPCode(newSecret, tw.clock.Add(-30*time.Second))
 	status, raw = tw.request(t, http.MethodPost, "/auth/totp", pendingCSRF, map[string]any{"code": nextCode}, tw.jwt)
 	if status != http.StatusOK {
 		t.Fatalf("new password TOTP status=%d body=%s", status, raw)

@@ -225,7 +225,7 @@ func TestUMCWebFullLoginTOTPSessionAndRBAC(t *testing.T) {
 	if setupCSRF == "" || secret == "" {
 		t.Fatalf("setup response missing fields: %s", raw)
 	}
-	code, err := umcauth.TOTPCode(secret, time.Now())
+	code, err := umcauth.TOTPCode(secret, *tw.clock)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -316,7 +316,7 @@ func TestUMCWebFullLoginTOTPSessionAndRBAC(t *testing.T) {
 	if status != http.StatusUnauthorized {
 		t.Fatalf("TOTP setup code replay status=%d", status)
 	}
-	nextCode, err := umcauth.TOTPCode(secret, time.Now().Add(30*time.Second))
+	nextCode, err := umcauth.TOTPCode(secret, tw.clock.Add(30*time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}

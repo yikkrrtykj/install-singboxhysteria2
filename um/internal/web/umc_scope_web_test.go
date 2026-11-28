@@ -43,7 +43,7 @@ func TestUMCEventScopeIsolationThroughWebBridge(t *testing.T) {
 		t.Fatalf("scoped login status=%d body=%s", status, raw)
 	}
 	pendingCSRF, _ := decodeMap(t, raw)["csrf_token"].(string)
-	code, _ := umcauth.TOTPCode(secret, time.Now())
+	code, _ := umcauth.TOTPCode(secret, *tw.clock)
 	status, raw = tw.request(t, http.MethodPost, "/auth/totp", pendingCSRF, map[string]any{"code": code}, tw.jwt)
 	if status != http.StatusOK {
 		t.Fatalf("scoped TOTP status=%d body=%s", status, raw)

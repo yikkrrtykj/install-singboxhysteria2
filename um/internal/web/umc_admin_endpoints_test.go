@@ -36,7 +36,7 @@ func TestUMCAccountAdminEndpointsAndTOTPUpdate(t *testing.T) {
 		t.Fatalf("login status=%d body=%s", status, raw)
 	}
 	pending, _ := decodeMap(t, raw)["csrf_token"].(string)
-	code, _ := umcauth.TOTPCode(totpSecret, time.Now())
+	code, _ := umcauth.TOTPCode(totpSecret, *tw.clock)
 	status, raw = tw.request(t, http.MethodPost, "/auth/totp", pending, map[string]any{"code": code}, tw.jwt)
 	if status != http.StatusOK {
 		t.Fatalf("TOTP status=%d body=%s", status, raw)
@@ -87,7 +87,7 @@ func TestUMCAccountAdminEndpointsAndTOTPUpdate(t *testing.T) {
 	update := decodeMap(t, raw)
 	newSecret, _ := update["secret"].(string)
 	updateCSRF, _ := update["csrf_token"].(string)
-	newCode, _ := umcauth.TOTPCode(newSecret, time.Now())
+	newCode, _ := umcauth.TOTPCode(newSecret, *tw.clock)
 	status, raw = tw.request(t, http.MethodPost, "/auth/totp", updateCSRF, map[string]any{"code": newCode}, tw.jwt)
 	if status != http.StatusOK {
 		t.Fatalf("TOTP update confirm status=%d body=%s", status, raw)
