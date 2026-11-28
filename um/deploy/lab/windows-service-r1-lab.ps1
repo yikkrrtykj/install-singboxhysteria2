@@ -115,15 +115,20 @@ try {
 $hash = ([BitConverter]::ToString($hashBytes)).Replace('-', '').ToLowerInvariant()
 $authDoc = @{principals=@(@{id='windows-lab-admin';role='platform_admin';event_ids=@()});tokens=@(@{sha256=$hash;principal_id='windows-lab-admin'})} | ConvertTo-Json -Depth 6
 Set-Content -LiteralPath $adminAuth -Value $authDoc -Encoding ascii
-Invoke-Native 'icacls' @($adminToken, '/inheritance:r', '/grant:r', "$($env:USERNAME):(F)")
-Invoke-Native 'icacls' @($adminAuth, '/inheritance:r', '/grant:r', "$($env:USERNAME):(F)")
+$adminOwner = "*$(([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value)"
+Invoke-Native 'icacls' @($adminToken, '/inheritance:r', '/grant:r', "$($adminOwner):(F)", 'SYSTEM:(F)', 'Administrators:(F)')
+Invoke-Native 'icacls' @($adminAuth, '/inheritance:r', '/grant:r', "$($adminOwner):(F)", 'SYSTEM:(F)', 'Administrators:(F)')
 $centerProc = Start-Process -FilePath $center -ArgumentList @('-contracts', $contracts, '-db', $db, '-ingest', '127.0.0.1:18080', '-admin', '127.0.0.1:18081', '-admin-auth-file', $adminAuth) -RedirectStandardOutput $centerLog -RedirectStandardError ($centerLog + '.err') -PassThru
 $deadline = (Get-Date).AddSeconds(30)
 $healthy = $false
 while ((Get-Date) -lt $deadline) {
   try { Invoke-RestMethod -Uri 'http://127.0.0.1:18081/api/health' -TimeoutSec 1 | Out-Null; $healthy = $true; break } catch { Start-Sleep -Milliseconds 300 }
 }
-if (-not $healthy) { Fail 'center did not become healthy' }
+if (-not $healthy) {
+  Get-Content -LiteralPath ($centerLog + '.err') -ErrorAction SilentlyContinue | Write-Host
+  Get-Content -LiteralPath $centerLog -ErrorAction SilentlyContinue | Write-Host
+  Fail 'center did not become healthy'
+}
 $adminArgs = @('admin', '--url', 'http://127.0.0.1:18081', '--token-file', $adminToken, '--json')
 & $center @adminArgs event create --event-id $event --name 'windows-agent-lab' | Out-Null
 if ($LASTEXITCODE -ne 0) { Fail 'management event create failed' }

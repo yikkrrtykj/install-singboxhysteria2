@@ -3,26 +3,30 @@
 package management_test
 
 import (
-	"os"
 	"os/exec"
-	"strings"
 	"testing"
+
+	"golang.org/x/sys/windows"
 )
 
 // protectTestFile makes a temporary credential fixture emulate the documented
 // owner-only production ACL. Windows temp directories inherit access for
 // sandbox/other local accounts, which the hardened loader correctly rejects.
+// Grant the current process token SID explicitly so the fixture does not depend
+// on account-name/domain resolution on CI runners.
 func protectTestFile(t *testing.T, path string) {
 	t.Helper()
-	user := os.Getenv("USERNAME")
-	if domain := os.Getenv("USERDOMAIN"); domain != "" && user != "" {
-		user = domain + `\` + user
+	tokenUser, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		t.Fatalf("current token user: %v", err)
 	}
-	if strings.TrimSpace(user) == "" {
-		t.Fatal("cannot determine test owner")
+	sid := tokenUser.User.Sid
+	if sid == nil || !sid.IsValid() {
+		t.Fatal("current token user has invalid SID")
 	}
+	ownerArg := "*" + sid.String()
 	cmd := exec.Command("icacls", path, "/inheritance:r",
-		"/grant:r", user+":(F)", "SYSTEM:(F)", "Administrators:(F)")
+		"/grant:r", ownerArg+":(F)", "SYSTEM:(F)", "Administrators:(F)")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("protect test file ACL: %v\n%s", err, out)
 	}
