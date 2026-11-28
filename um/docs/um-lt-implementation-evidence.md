@@ -120,14 +120,80 @@ pass all lanes again. No B1-B4/UM-C production artifact was modified except that
 one regression assertion, which is required by the new optional feature and still
 enforces least privilege.
 
+## Installation / upgrade matrix (actual containers)
+
+Workflow `UM-LT installation matrix` runs the REAL monitor deploy code
+(`monitor-v2/deploy/install-monitor.sh`, not a stub) against a temporary root
+with a recording systemctl mock: install -> upgrade candidate ladder ->
+rollback matrix -> uninstall, plus the frozen least-privilege assertions. It
+passed on **both** required distribution containers on the implementation code:
+
+- Ubuntu 24.04 container: run `46187929856` (and `46187926505`) SUCCESS.
+- Debian 12 container: same run matrix SUCCESS (Debian 12 / Python 3.11.2;
+  `acl`, `jq`, `ss`, `journalctl`, `sudo` and the other deploy prerequisites
+  installed in the container).
+- This is a real container install/upgrade/rollback/uninstall test, but it is
+  not a privileged live-VPS systemd acceptance; that production installation
+  remains an Owner/UM-E gate and is not claimed as a production rollout.
+
+## Independent review corrections (at HEAD before final docs commit)
+
+The independent reviewer returned NEEDS FIXES at `21f85f7d`; the implementation
+fixes are in this branch:
+
+1. **Full observation retention (P1)** — the center now verifies the signed
+   rev-7 body, then stores only the bounded base projection in
+   `snapshots.payload_json`; the raw `traffic_observation` is never retained for
+   30 days. A center test asserts the stored payload has no
+   `traffic_observation` while required snapshot fields remain. The double
+   `bytes_estimate` count of the observation JSON was removed.
+2. **Sentinel supersession (P1)** — when the newest authenticated observation
+   state is unavailable, `QueryLatestTraffic` suppresses all older value rows for
+   that node; a new test covers value-then-sentinel and requires zero latest
+   points plus an unavailable state.
+3. **E3 deployment staging / shell lanes (P1)** — the E3 M2/M3 fixtures now
+   stage the boot-imported `monitor-v2/export/` package (and its pycache
+   cleanup); the M0.5 unit assertion allows exactly the two contractual
+   `ReadWritePaths` entries. The export test suite is now a monitor-regression
+   CI step.
+4. **Freshness bound (P2)** — the agent computes fresh iff
+   `age <= max(2*cadence,120)` from the signed center cadence; the center
+   validator uses the effective config cadence, with a default 15 s compatibility
+   wrapper for legacy unit tests. A test covers age 300 accepted at cadence 300,
+   rejected at cadence 30/default.
+5. **Owner/group/mode checks (P2)** — the Linux agent now enforces optional
+   operator-configured owner uid, group gid and exact POSIX mode on the actual
+   opened export file (fail-closed to unavailable); flags/environment are local
+   only and never center-supplied. Unit tests cover each mismatch; the real lab
+   passes the actual owner/uid/gid/mode.
+6. **Bucket nulls (P2)** — a bucket where both samples have a null counter now
+   preserves null instead of coercing to zero.
+7. **Allow-list drop (P2)** — a valid export whose tag set is a superset of the
+   center allow-list is filtered entry-by-entry; only authorized tags are
+   forwarded, and an all-unauthorized observation is honestly unavailable. The
+   previous whole-document rejection is gone.
+8. **Temp cleanup (P3)** — the writer removes bounded
+   `.traffic-export-*.tmp` garbage before serving, fail-closed on error.
+9. **Capacity decision (P2)** — the implementation chooses a **900 s** bucket
+   (inside the frozen contract's `[300,900]` implementation choice) with a
+   64-report raw ring. The opt-in capacity test now measures actual SQLite
+   `dbstat` bytes and fails above 5 GiB; the measured projection is recorded
+   above. This is the documented measured implementation decision, not a
+   contract edit.
+
 ## Not run / limitations (honest)
 
-- Full production installation/upgrade on a **live Debian 12** host and on a
-  privileged systemd VPS was **NOT RUN** in this environment. The existing
-  monitor-packaging and installer test suites ran in CI on Ubuntu, and the real
-  lab starts the actual monitor/agent/center processes, but that is not a
-  substitute for a Debian 12 systemd installation acceptance. This remains an
-  Owner/UM-E installation gate and must not be reported as passed.
+- A privileged live-VPS production installation and full production capacity /
+  backup / degradation acceptance were **NOT RUN**; those remain UM-E and
+  Owner gates. The container install/upgrade matrix above is real but not a live
+  systemd VPS.
+- Cloudflare Access authenticated browser E2E for `/web/api/traffic/*` is covered
+  by Go web tests; the offline real lab checks the fail-closed route and store
+  attribution, not a live Cloudflare tunnel.
+- No production capacity run, no R1/Cloudflare/DNS/cert/VPS/SSH authorization, no
+  UM-D/E/F/G work, no #127 close, no #48 reopen.
+- The implementation PR is Draft and must remain unmerged pending final
+  independent review and Owner merge authorization.
 - Cloudflare Access authenticated browser E2E for `/web/api/traffic/*` is covered
   by Go web tests; the offline real lab checks the fail-closed route and store
   attribution, not a live Cloudflare tunnel.
