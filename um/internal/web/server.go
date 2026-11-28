@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -397,19 +398,19 @@ func (l *limiter) allow(key string, rate, burst float64) bool {
 			// Evict the oldest buckets (by last refresh) rather than clearing all
 			// protections or dropping a recently active target's rate bucket.
 			target := l.max / 2
-			for len(l.buckets) > target {
-				oldestKey := ""
-				var oldest time.Time
-				for k, b := range l.buckets {
-					if oldestKey == "" || b.last.Before(oldest) {
-						oldestKey = k
-						oldest = b.last
-					}
-				}
-				if oldestKey == "" {
-					break
-				}
-				delete(l.buckets, oldestKey)
+			aged := make([]struct {
+				key  string
+				last time.Time
+			}, 0, len(l.buckets))
+			for k, b := range l.buckets {
+				aged = append(aged, struct {
+					key  string
+					last time.Time
+				}{k, b.last})
+			}
+			sort.Slice(aged, func(i, j int) bool { return aged[i].last.Before(aged[j].last) })
+			for i := 0; i < len(aged)-target; i++ {
+				delete(l.buckets, aged[i].key)
 			}
 		}
 	}

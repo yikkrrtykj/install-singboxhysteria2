@@ -682,3 +682,30 @@ func TestUMCAuthPerUserActiveSessionCap(t *testing.T) {
 		t.Fatalf("over-cap session error=%v, want ErrAuthSessionLimit", err)
 	}
 }
+
+func TestUMCAuthExpiredPendingChallengesDoNotConsumeSessionCap(t *testing.T) {
+	s := openTestStore(t, tempStorePath(t))
+	ctx := context.Background()
+	now := int64(1_901_400_000)
+	hash := "$argon2id$v=19$m=65536,t=3,p=2$c2FsdHNhbHRzYWx0c2FsdA$aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	user, err := s.BootstrapAuthUser(ctx, "pending-cap", hash, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 32; i++ {
+		sess := AuthSession{IDHash: fmt.Sprintf("%064d", i+1), PublicID: fmt.Sprintf("pending-cap-%d", i),
+			UserID: user.UserID, State: AuthSessionTOTPPending, AccessSubject: "s", AccessIssuer: "i",
+			CSRFHash:  "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+			CreatedAt: now - 3600, LastSeenAt: now - 3600, IdleExpiresAt: now + 600, AbsoluteExpiresAt: now + 3600}
+		if err := s.CreateSession(ctx, sess); err != nil {
+			t.Fatalf("expired pending challenge %d: %v", i, err)
+		}
+	}
+	active := AuthSession{IDHash: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+		PublicID: "pending-cap-active", UserID: user.UserID, State: AuthSessionActive,
+		AccessSubject: "s", AccessIssuer: "i", CSRFHash: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+		CreatedAt: now, LastSeenAt: now, IdleExpiresAt: now + 1800, AbsoluteExpiresAt: now + 3600}
+	if err := s.CreateSession(ctx, active); err != nil {
+		t.Fatalf("active session after abandoned pending challenges: %v", err)
+	}
+}

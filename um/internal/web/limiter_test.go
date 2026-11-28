@@ -54,3 +54,25 @@ func TestLimiterLongKeysStayBoundedByCallerHash(t *testing.T) {
 		t.Fatalf("limiter map size/key unexpectedly absent")
 	}
 }
+
+func TestLimiterEvictsOldestBuckets(t *testing.T) {
+	now := time.Unix(1_901_500_000, 0)
+	l := newLimiter(func() time.Time { return now })
+	l.max = 4
+	for i := 0; i < 4; i++ {
+		l.allow(fmt.Sprintf("old-%d", i), 1, 1)
+		now = now.Add(time.Millisecond)
+	}
+	l.allow("recent", 1, 1)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if _, ok := l.buckets["old-0"]; ok {
+		t.Fatal("oldest bucket was not evicted")
+	}
+	if _, ok := l.buckets["recent"]; !ok {
+		t.Fatal("recent bucket was evicted")
+	}
+	if len(l.buckets) > l.max/2+1 {
+		t.Fatalf("eviction did not bound map: %d", len(l.buckets))
+	}
+}

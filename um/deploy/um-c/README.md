@@ -16,7 +16,7 @@ certificate or production resource may be created under this milestone.
 ```text
 /etc/um-center/master.key          # protected master key, outside SQLite/backups
 /etc/um-center/admin-auth.json     # optional B4 local bearer auth (separate plane)
-/var/lib/um-center/center.db       # single existing SQLite DB, v11 additive
+/var/lib/um-center/center.db       # single existing SQLite DB, v13 additive
 /opt/um-center/web/dist            # built Vue assets (npm run build)
 /etc/cloudflared/um-c-tunnel.json  # Owner-managed tunnel credential (never commit)
 ```
@@ -24,10 +24,19 @@ certificate or production resource may be created under this milestone.
 ## First boot sequence (lab)
 
 ```bash
+# 0. Create the dedicated private state directory as the service account. The
+#    center refuses to rewrite an existing foreign/shared/symlinked directory.
+install -d -m 0700 -o um-center -g um-center /var/lib/um-center
+# Upgrades from a pre-v13 layout must fix the existing parent explicitly:
+#   chown um-center:um-center /var/lib/um-center && chmod 0700 /var/lib/um-center
+
 # 1. Protected master key (owner/service account only).
 um-center auth init-key --path /etc/um-center/master.key
 
 # 2. One-time local platform_admin bootstrap; password is typed, not passed in argv.
+#    This initializes the DB master-key sentinel before creating the account. For
+#    an upgraded database with existing accounts but no sentinel use:
+#    um-center auth key-init --db ... --master-key ...
 um-center auth bootstrap --db /var/lib/um-center/center.db \
   --master-key /etc/um-center/master.key --username <admin>
 

@@ -129,3 +129,43 @@ func TestUMCAuthKeyInitUpgradeVerifiesExistingTOTP(t *testing.T) {
 		t.Fatal("wrong key initialized an existing sentinel database")
 	}
 }
+
+func TestUMCAuthBootstrapDoesNotCreateUserWhenSentinelMismatch(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "private", "center.db")
+	keyA := filepath.Join(dir, "a.key")
+	keyB := filepath.Join(dir, "b.key")
+	if err := runAuthCLI([]string{"init-key", "--path", keyA}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runAuthCLI([]string{"init-key", "--path", keyB}); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := umcauth.LoadMasterKey(keyA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := web.InitializeMasterKeyForExistingDB(context.Background(), st, key); err != nil {
+		t.Fatal(err)
+	}
+	_ = st.Close()
+	restore := feedStdin(t, "Bootstrap-Mismatch-Password-2026!\n")
+	err = runAuthCLI([]string{"bootstrap", "--db", dbPath, "--master-key", keyB, "--username", "cannot-create"})
+	restore()
+	if err == nil {
+		t.Fatal("bootstrap with mismatched sentinel unexpectedly succeeded")
+	}
+	st, err = store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	n, err := st.CountAuthUsers(context.Background())
+	if err != nil || n != 0 {
+		t.Fatalf("bootstrap left users after sentinel failure: count=%d err=%v", n, err)
+	}
+}

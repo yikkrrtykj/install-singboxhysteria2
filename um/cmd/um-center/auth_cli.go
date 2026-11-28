@@ -92,12 +92,14 @@ func runAuthBootstrap(args []string) error {
 		return fmt.Errorf("master key: %w", err)
 	}
 	defer clear(key)
+	// Initialize/verify the sentinel before creating the first account so a
+	// failure cannot leave an account without a usable master-key binding.
+	if err := web.InitializeMasterKeyForExistingDB(context.Background(), st, key); err != nil {
+		return fmt.Errorf("initialize master-key sentinel: %w", err)
+	}
 	user, err := st.BootstrapAuthUser(context.Background(), *username, hash, nowUnix())
 	if err != nil {
 		return err
-	}
-	if err := web.InitializeMasterKeyForExistingDB(context.Background(), st, key); err != nil {
-		return fmt.Errorf("initialize master-key sentinel: %w", err)
 	}
 	_ = st.RecordAuthAudit(context.Background(), "local-bootstrap", "platform_admin", "umc_bootstrap_cli", "user:"+user.UserID, "ok", nowUnix())
 	fmt.Fprintf(os.Stdout, "initial platform_admin %q created; TOTP setup is required at first Web login\n", user.Username)

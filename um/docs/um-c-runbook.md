@@ -189,7 +189,14 @@ writes the sentinel; a wrong key is refused and no TOTP state is changed. A bran
 new empty auth database (zero accounts) initializes its sentinel automatically at
 first Web startup; the local `auth bootstrap` command also initializes it after
 creating the first platform_admin. The database parent directory must already be a dedicated private directory
-(0700/owner-service on POSIX; closed DACL on Windows). The center refuses to
+(0700/owner-service on POSIX; closed DACL on Windows). Create it as the service
+account before first boot: `install -d -m 0700 -o um-center -g um-center
+/var/lib/um-center`. On upgrade from an older layout run
+`chown um-center:um-center /var/lib/um-center && chmod 0700 /var/lib/um-center`.
+The center deliberately refuses to rewrite a foreign/shared/symlinked directory.
+On Windows it also fails closed on object/unknown ACE types rather than guessing;
+use a dedicated state directory with a normal closed DACL for
+owner/current-service/SYSTEM/Administrators. The center refuses to
 rewrite a pre-existing foreign/shared directory before ownership validation; it
 creates only missing dedicated directories and hardens the DB/WAL/SHM files it
 owns. The service sets a private umask before SQLite creates future WAL/SHM. TLS private keys must also pass the same

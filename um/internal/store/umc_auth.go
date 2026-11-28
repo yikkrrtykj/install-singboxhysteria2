@@ -684,16 +684,33 @@ func (s *Store) CreateSession(ctx context.Context, sess AuthSession) error {
 	if enabled == 0 || sess.AuthEpoch != userEpoch {
 		return ErrAuthStale
 	}
+	// Count only currently usable sessions. Pending/setup challenges have a
+	// 10-minute TTL even though their absolute row expiry is 12h; otherwise a
+	// password holder could open 32 abandoned TOTP challenges and lock the real
+	// account out of new logins for up to 12h. Purge this user's expired
+	// challenges first so abandoned rows cannot consume the cap.
+	const pendingTTL = int64(600)
+	pendingCutoff := sess.CreatedAt - pendingTTL
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM umc_sessions WHERE user_id=? AND revoked_at IS NULL AND state IN (?,?) AND created_at<=?`,
+		sess.UserID, AuthSessionTOTPPending, AuthSessionTOTPSetup, pendingCutoff); err != nil {
+		return err
+	}
+	const usable = `revoked_at IS NULL AND absolute_expires_at>? AND ((state=? AND idle_expires_at>?) OR (state IN (?,?) AND created_at>?))`
 	var activeForUser, activeTotal int64
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM umc_sessions WHERE user_id=? AND revoked_at IS NULL AND absolute_expires_at>?`,
-		sess.UserID, sess.CreatedAt).Scan(&activeForUser); err != nil {
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM umc_sessions WHERE user_id=? AND `+usable,
+		sess.UserID, sess.CreatedAt, AuthSessionActive, sess.CreatedAt, AuthSessionTOTPPending, AuthSessionTOTPSetup, pendingCutoff).
+		Scan(&activeForUser); err != nil {
 		return err
 	}
 	if activeForUser >= 32 {
 		return ErrAuthSessionLimit
 	}
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM umc_sessions WHERE revoked_at IS NULL AND absolute_expires_at>?`,
-		sess.CreatedAt).Scan(&activeTotal); err != nil {
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM umc_sessions WHERE `+usable,
+		sess.CreatedAt, AuthSessionActive, sess.CreatedAt, AuthSessionTOTPPending, AuthSessionTOTPSetup, pendingCutoff).
+		Scan(&activeTotal); err != nil {
 		return err
 	}
 	if activeTotal >= 10000 {

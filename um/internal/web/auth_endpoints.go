@@ -281,7 +281,19 @@ func (h *Handler) revokeOwnSession(w http.ResponseWriter, r *http.Request, publi
 	revokeReq := h.mutationRequest(r, id.User, "umc_session_revoked", "session:"+publicID,
 		"umc_session_revoked", id.User.UserID, "revoke-session")
 	if err := h.store.RevokeSessionByPublicID(revokeReq.Context(), publicID, h.now().Unix()); err != nil {
-		h.writeError(w, http.StatusInternalServerError, "internal", "session revoke failed")
+		if !errors.Is(err, store.ErrAuthSessionUnknown) {
+			h.writeError(w, http.StatusServiceUnavailable, "revoke_failed", "session revoke failed; retry")
+			return
+		}
+		already, getErr := h.store.GetSessionByPublicID(r.Context(), publicID)
+		if getErr != nil || already.RevokedAt == nil || already.UserID != id.User.UserID {
+			h.writeError(w, http.StatusServiceUnavailable, "revoke_state_uncertain", "session state could not be confirmed")
+			return
+		}
+		if sess.IDHash == id.Session.IDHash {
+			h.clearCookies(w)
+		}
+		h.writeJSON(w, http.StatusOK, map[string]any{"revoked": true, "already_revoked": true})
 		return
 	}
 	if sess.IDHash == id.Session.IDHash {

@@ -297,7 +297,16 @@ func (h *Handler) revokeUserSession(w http.ResponseWriter, r *http.Request, user
 	revokeReq := h.mutationRequest(r, actor.User, "umc_user_session_revoked", "user:"+userID,
 		"umc_user_session_revoked", userID, "revoke-session")
 	if err := h.store.RevokeSessionByPublicID(revokeReq.Context(), publicID, h.now().Unix()); err != nil {
-		h.writeError(w, http.StatusInternalServerError, "internal", "session revoke failed")
+		if !errors.Is(err, store.ErrAuthSessionUnknown) {
+			h.writeError(w, http.StatusServiceUnavailable, "revoke_failed", "session revoke failed; retry")
+			return
+		}
+		already, getErr := h.store.GetSessionByPublicID(r.Context(), publicID)
+		if getErr != nil || already.RevokedAt == nil || already.UserID != userID {
+			h.writeError(w, http.StatusServiceUnavailable, "revoke_state_uncertain", "session state could not be confirmed")
+			return
+		}
+		h.writeJSON(w, http.StatusOK, map[string]any{"revoked": true, "already_revoked": true})
 		return
 	}
 	h.writeJSON(w, http.StatusOK, map[string]any{"revoked": true})
