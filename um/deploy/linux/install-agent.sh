@@ -210,6 +210,9 @@ UM_AGENT_CENTER_URL=$CENTER_URL
 # Operator-local fixed absolute path; the umagent user must have OS read access
 # (for example via the monitor's dedicated sboxmon-export group).
 # UM_AGENT_MONITOR_EXPORT_FILE=/run/singbox-monitor-export/traffic.json
+# UM_AGENT_MONITOR_EXPORT_OWNER_UID=<monitor uid>
+# UM_AGENT_MONITOR_EXPORT_GROUP_GID=<sboxmon-export gid>
+# UM_AGENT_MONITOR_EXPORT_MODE=0640
 "
 if [ "$APPLY" -eq 1 ]; then
   TMP_ENV="$(mktemp)"

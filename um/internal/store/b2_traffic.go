@@ -582,7 +582,16 @@ func (s *Store) QueryLatestTraffic(ctx context.Context, scope TrafficEventScope,
 	}
 	scopeClause, scopeArgs := scope.clause("o.event_id")
 	filterClause, filterArgs := trafficFilterSQL(query, "o")
-	where := "WHERE NOT EXISTS (SELECT 1 FROM traffic_observation_reports st WHERE st.node_id=o.node_id AND st.availability='unavailable')"
+	// Suppress value rows only when the NEWEST authenticated observation state
+	// for this node is unavailable. A retained older sentinel must not hide
+	// newer lower-bound values after the monitor recovers.
+	where := `WHERE NOT EXISTS (
+		SELECT 1 FROM traffic_observation_reports st
+		WHERE st.node_id=o.node_id AND st.availability='unavailable'
+		  AND st.report_row_id = (
+			SELECT latest.report_row_id FROM traffic_observation_reports latest
+			WHERE latest.node_id=o.node_id
+			ORDER BY latest.collected_at DESC, latest.report_row_id DESC LIMIT 1))`
 	args := make([]any, 0, len(scopeArgs)+len(filterArgs)+1)
 	if scopeClause != "" {
 		where += " AND " + scopeClause

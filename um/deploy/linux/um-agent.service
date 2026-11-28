@@ -44,6 +44,14 @@ ExecStart=/usr/local/libexec/um-agent run
 #
 # Optional revision-7 read-only traffic export (DISABLED by default):
 #   UM_AGENT_MONITOR_EXPORT_FILE=/run/singbox-monitor-export/traffic.json
+#   UM_AGENT_MONITOR_EXPORT_OWNER_UID=<monitor uid>
+#   UM_AGENT_MONITOR_EXPORT_GROUP_GID=<sboxmon-export gid>
+#   UM_AGENT_MONITOR_EXPORT_MODE=0640
+# The owner/group/mode variables are the frozen rev-7 POSIX permission check.
+# When the export is enabled the operator MUST set all four; leaving the
+# owner/group/mode values unset keeps the backward-compatible no-check mode used
+# by non-standard deployments and is recorded as a documented integration
+# follow-up, not a waiver of the monitor-side permission model.
 # The value is an operator-local FIXED ABSOLUTE PATH only; it is never accepted
 # from center config, a URL or a command. The non-root umagent service user must
 # be able to READ that one file; the monitor-v2 deployment notes create a

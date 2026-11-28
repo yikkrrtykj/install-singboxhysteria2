@@ -480,6 +480,29 @@ func TestRev7SnapshotAcceptedStoredAndDeduped(t *testing.T) {
 	}
 }
 
+func TestRev7FreshnessUsesEffectiveConfigCadence(t *testing.T) {
+	tc, _ := startRev7TestCenter(t)
+	linux := enrollAgent(t, tc, store.NodeClassLinuxVPS, "linux")
+	enableRev7Config(t, tc, linux, true)
+	base := b2BaseCollected(t)
+	bootstrapAgentVersion(t, tc, linux, base, "1.1.0")
+	if status, resp := pullConfig(t, tc, linux); status != http.StatusOK {
+		t.Fatalf("config pull status=%d resp=%v", status, resp)
+	}
+	rev7At := base + 10
+	observation := freshTrafficObservationDoc(rev7At)
+	observation["observed_at"] = rev7At - 30
+	observation["age_seconds"] = int64(30)
+	for _, entry := range observation["inbounds"].([]any) {
+		entry.(map[string]any)["observed_at"] = rev7At - 30
+	}
+	doc := rev7SnapshotDoc(t, rev7At, observation)
+	status, resp, _ := reportAttempt(t, tc, linux, doc)
+	if status != http.StatusOK || resp["result"] != "accepted" {
+		t.Fatalf("age 30 at cadence 60 must be accepted (120 s bound): status=%d resp=%v", status, resp)
+	}
+}
+
 func TestRev7SnapshotRejectedWhenSourceDisabled(t *testing.T) {
 	tc, _ := startRev7TestCenter(t)
 	linux := enrollAgent(t, tc, store.NodeClassLinuxVPS, "linux")

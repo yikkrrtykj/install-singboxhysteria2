@@ -384,6 +384,7 @@ func (s *ServiceImpl) Report(ctx context.Context, req ReportRequest) (ReportResu
 			opts := contract.ValidateOptions{
 				TerminalConfigured:      c.Sources["terminal"] || c.Sources["mihomo_api"],
 				MonitorExportConfigured: c.Sources["monitor_export"],
+				CadenceSeconds:          c.CadenceSeconds,
 			}
 			if err := contract.ValidateReportBodyWithSchemaSet(s.schemas, node.NodeClass, req.ReportType, req.Body, opts); err != nil {
 				validationRejected = true

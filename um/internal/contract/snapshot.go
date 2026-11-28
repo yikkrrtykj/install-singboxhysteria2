@@ -45,6 +45,11 @@ type ValidateOptions struct {
 	// for windows_terminal, which never carries a read-only traffic export
 	// observation.
 	MonitorExportConfigured bool
+	// CadenceSeconds is the signed center config cadence effective for this
+	// report. It is used only for the rev-7 freshness bound
+	// fresh iff age <= max(2*cadence,120); zero keeps the legacy 15 s default
+	// for option-less callers that predate the rev-7 cadence plumbing.
+	CadenceSeconds int
 }
 
 // snapshotEnvelope is the shape needed by the runtime rules. Fields not relevant
@@ -219,7 +224,7 @@ func validateSnapshotWithSchemaSet(set *schema.Set, nodeClass string, raw []byte
 			return err
 		}
 		if revision == ContractRevision7 {
-			return validateRevision7SnapshotSemantics(&snap)
+			return validateRevision7SnapshotSemantics(&snap, opts.CadenceSeconds)
 		}
 		return nil
 	case NodeClassWindowsTerminal:
@@ -268,11 +273,11 @@ func snapshotContractRevision(raw []byte) (int, error) {
 // coherent lower-bound observation, and the frozen rev-5 traffic array/state
 // stays an honest unavailable/empty projection because lower bounds are not
 // contract totals.
-func validateRevision7SnapshotSemantics(snap *snapshotEnvelope) error {
+func validateRevision7SnapshotSemantics(snap *snapshotEnvelope, cadenceSeconds int) error {
 	if len(snap.TrafficObservation) == 0 || isJSONNull(snap.TrafficObservation) {
 		return invalid("traffic_observation", "contract_revision 7 requires a traffic_observation object")
 	}
-	if _, err := ValidateTrafficObservation(snap.CollectedAt, snap.TrafficObservation); err != nil {
+	if _, err := ValidateTrafficObservationWithCadence(snap.CollectedAt, snap.TrafficObservation, cadenceSeconds); err != nil {
 		return err
 	}
 	if len(snap.Traffic) != 0 {

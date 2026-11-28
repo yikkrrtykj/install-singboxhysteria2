@@ -540,6 +540,26 @@ func TestTrafficSentinelSupersedesPreviousLatestValues(t *testing.T) {
 	if len(states) != 1 || states[0].Availability != "unavailable" || states[0].NodeID != id.NodeID {
 		t.Fatalf("latest state = %+v", states)
 	}
+	// A newer value after a retained older sentinel must be visible again; the
+	// suppression is correlated to the newest state, not any old ring row.
+	if disp := storeTrafficSnapshot(t, s, id, "value-after-sentinel", now+10,
+		testTrafficObservation(now+10, 2, "ab")); disp != DispositionAccepted {
+		t.Fatalf("recovered value disposition = %q", disp)
+	}
+	points, err = s.QueryLatestTraffic(ctx, TrafficEventScope{AllEvents: true}, TrafficQuery{Limit: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(points) == 0 {
+		t.Fatal("newer value was suppressed by a retained older sentinel")
+	}
+	states, err = s.QueryLatestTrafficStates(ctx, TrafficEventScope{AllEvents: true}, TrafficQuery{Limit: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(states) != 1 || states[0].Availability != "ok" {
+		t.Fatalf("recovered latest state = %+v", states)
+	}
 }
 
 func TestTrafficHistoryFallsBackToBoundedBucketsAfterRawRingPrune(t *testing.T) {
