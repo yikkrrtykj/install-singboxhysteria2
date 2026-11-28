@@ -33,11 +33,17 @@ func TestWindowsACLTrustedSID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	service, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		t.Fatal(err)
+	}
+	serviceSID := service.User.Sid
 	for _, tc := range []struct {
 		name string
 		sid  *windows.SID
 		want bool
 	}{
+		{"service-user", serviceSID, true},
 		{"owner", owner, true},
 		{"system", system, true},
 		{"administrators", admin, true},
@@ -45,7 +51,7 @@ func TestWindowsACLTrustedSID(t *testing.T) {
 		{"everyone", everyone, false},
 		{"authenticated-users", authUsers, false},
 	} {
-		if got := trustedWindowsFileSID(owner, tc.sid); got != tc.want {
+		if got := trustedWindowsFileSID(owner, serviceSID, tc.sid); got != tc.want {
 			t.Fatalf("%s trusted=%v want=%v", tc.name, got, tc.want)
 		}
 	}

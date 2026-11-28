@@ -31,8 +31,13 @@ func protectedFileMode(path string, info os.FileInfo) bool {
 	if err != nil || ownerDefaulted || owner == nil {
 		return false
 	}
+	tokenUser, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil || tokenUser.User.Sid == nil || !tokenUser.User.Sid.IsValid() {
+		return false
+	}
+	serviceSID := tokenUser.User.Sid
 	trusted := func(sid *windows.SID) bool {
-		return trustedWindowsFileSID(owner, sid)
+		return trustedWindowsFileSID(owner, serviceSID, sid)
 	}
 	for i := uint32(0); i < uint32(dacl.AceCount); i++ {
 		var ace *windows.ACCESS_ALLOWED_ACE
@@ -51,12 +56,16 @@ func protectedFileMode(path string, info os.FileInfo) bool {
 }
 
 // trustedWindowsFileSID is the closed allow-list for a protected file DACL:
-// the file owner, LocalSystem and Builtin Administrators only.
-func trustedWindowsFileSID(owner, sid *windows.SID) bool {
+// the file owner, the current service account, LocalSystem and Builtin
+// Administrators only. Arbitrary local/domain accounts remain rejected.
+func trustedWindowsFileSID(owner, serviceUser, sid *windows.SID) bool {
 	if sid == nil || !sid.IsValid() {
 		return false
 	}
 	if owner != nil && owner.IsValid() && sid.Equals(owner) {
+		return true
+	}
+	if serviceUser != nil && serviceUser.IsValid() && sid.Equals(serviceUser) {
 		return true
 	}
 	return sid.IsWellKnown(windows.WinLocalSystemSid) ||
