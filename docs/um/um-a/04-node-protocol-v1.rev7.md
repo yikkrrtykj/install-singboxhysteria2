@@ -22,8 +22,8 @@ permission widening, or a new write-capable credential holder.
   the pre-production blocker on Issue #127; this overlay adds a **new, separate,
   audited local file source**, it does not unblock or enable `service.api`.
 - Machine-readable normative artifacts:
-  [`rev7/report-snapshot.schema.json`](../contracts/v1/rev7/report-snapshot.schema.json),
-  [`rev7/agent-config.schema.json`](../contracts/v1/rev7/agent-config.schema.json),
+  [`rev7/report-snapshot.rev7.schema.json`](../contracts/v1/rev7/report-snapshot.rev7.schema.json),
+  [`rev7/agent-config.rev7.schema.json`](../contracts/v1/rev7/agent-config.rev7.schema.json),
   positive fixtures under [`../contracts/v1/examples/`](../contracts/v1/examples/),
   and [`rev7/negative-vectors.json`](../contracts/v1/rev7/negative-vectors.json).
 
@@ -242,7 +242,7 @@ The agent never logs the raw export.
 - A rev-7 snapshot body is exactly the frozen rev-5 Linux snapshot shape plus
   required top-level `contract_revision: 7` plus required top-level
   `traffic_observation`; see
-  [`rev7/report-snapshot.schema.json`](../contracts/v1/rev7/report-snapshot.schema.json).
+  [`rev7/report-snapshot.rev7.schema.json`](../contracts/v1/rev7/report-snapshot.rev7.schema.json).
 - Only a `linux_vps` node may send a rev-7 body. A `windows_terminal` node
   sending one is `400 platform_mismatch`; Windows stays on revision-5 bodies.
 - A rev-7 body is expected only when the applied config contained
@@ -621,8 +621,8 @@ Closed failure → representation mapping (no new wire error codes):
 
 ## 13. Conformance artifacts (candidate)
 
-- [`rev7/report-snapshot.schema.json`](../contracts/v1/rev7/report-snapshot.schema.json),
-  [`rev7/agent-config.schema.json`](../contracts/v1/rev7/agent-config.schema.json):
+- [`rev7/report-snapshot.rev7.schema.json`](../contracts/v1/rev7/report-snapshot.rev7.schema.json),
+  [`rev7/agent-config.rev7.schema.json`](../contracts/v1/rev7/agent-config.rev7.schema.json):
   closed draft 2020-12 schemas that keep the frozen rev-5 base shape exactly and
   add only the rev-7 fields.
 - [`rev7/examples/report-snapshot.json`](../contracts/v1/rev7/examples/report-snapshot.json),

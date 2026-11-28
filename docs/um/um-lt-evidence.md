@@ -23,8 +23,8 @@ for a NOT RUN item.
 
 | Artifact | Purpose |
 | --- | --- |
-| `docs/um/contracts/v1/rev7/report-snapshot.schema.json` | rev-7 snapshot body: frozen rev-5 shape + required `contract_revision`/`traffic_observation` |
-| `docs/um/contracts/v1/rev7/agent-config.schema.json` | rev-5 config + optional `collect.monitor_export` |
+| `docs/um/contracts/v1/rev7/report-snapshot.rev7.schema.json` | rev-7 snapshot body: frozen rev-5 shape + required `contract_revision`/`traffic_observation` |
+| `docs/um/contracts/v1/rev7/agent-config.rev7.schema.json` | rev-5 config + optional `collect.monitor_export` |
 | `docs/um/contracts/v1/rev7/examples/report-snapshot.json` | synthetic rev-7 Linux positive fixture |
 | `docs/um/contracts/v1/rev7/examples/agent-config.json` | synthetic rev-7 config positive fixture |
 | `docs/um/contracts/v1/rev7/negative-vectors.json` | 37 machine-readable negative/gating vectors (schema/semantic/platform/config stages, incl. four `CFG-REV7` agent-version gate cases) |
