@@ -151,7 +151,12 @@ deleted `admin_audit` rows. After the minimal fixes:
   before the service's explicit denial. Fixed by applying the active-event
   transaction gate to both alias writes and restricting `audit_read` to
   platform/event admins in the central matrix, with archived-alias-delete and
-  viewer-audit regression coverage. Final Codex re-review at the fixed HEAD found
-  **no discrete actionable regressions** (full Go suite ok). A non-Codex
-  independent review was also run; its P1/P2 findings were fixed and it cleared
-  the runtime change set for Draft PR status.
+  viewer-audit regression coverage. The final-closure Codex pass then found a
+  third P1: the Windows credential-file DACL check only rejected broad groups
+  and allowed arbitrary explicit local/domain account ACEs. Fixed by requesting
+  owner security information and enforcing a closed allow-list of the file
+  owner, LocalSystem and Builtin Administrators only; test fixtures now seal
+  temporary credential files with an owner-only DACL, and the allow-list has a
+  unit test. Codex re-review after the fix reported no discrete actionable
+  regressions. A non-Codex independent review was also run; its P1/P2 findings
+  were fixed and it cleared the runtime change set for Draft PR status.

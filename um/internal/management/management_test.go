@@ -46,6 +46,7 @@ func writeProtected(t *testing.T, path string, data []byte) {
 	if err := os.Chmod(path, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	protectTestFile(t, path)
 }
 
 func startB4Center(t *testing.T) *b4Center {
@@ -91,12 +92,7 @@ func startB4Center(t *testing.T) *b4Center {
 	}
 	authRaw, _ := json.Marshal(authDoc)
 	authPath := filepath.Join(dir, "admin-auth.json")
-	if err := os.WriteFile(authPath, authRaw, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(authPath, 0o600); err != nil {
-		t.Fatal(err)
-	}
+	writeProtected(t, authPath, authRaw)
 	auth, err := management.LoadFileAuthenticator(authPath)
 	if err != nil {
 		t.Fatal(err)

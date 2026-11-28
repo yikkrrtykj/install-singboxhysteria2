@@ -45,6 +45,7 @@ func TestAdminCLIUsesManagementAPI(t *testing.T) {
 	if err := os.Chmod(authPath, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	protectTestFile(t, authPath)
 	auth, err := management.LoadFileAuthenticator(authPath)
 	if err != nil {
 		t.Fatal(err)
@@ -75,6 +76,7 @@ func TestAdminCLIUsesManagementAPI(t *testing.T) {
 	if err := os.Chmod(tokenPath, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	protectTestFile(t, tokenPath)
 	eventID := "44444444-4444-4444-8444-444444444444"
 	rc := runAdminCLI([]string{"--url", "http://" + srv.AdminAddr(),
 		"--token-file", tokenPath, "--json",
