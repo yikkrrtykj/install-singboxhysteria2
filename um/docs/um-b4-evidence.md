@@ -3,9 +3,12 @@
 PR: #133 (Draft, Refs #127)
 Branch: `codex/um-b4-management`
 Base: `da8173317aa6b6395a5e002ea4a89dac3fe4fd5e` (rev-6 main)
-Reviewed HEAD: the final PR head on `codex/um-b4-management`; exact CI/lab
-runs and review records are on PR #133. Independent review found no P0/P1 and
-approved the runtime change set for Draft PR status.
+Reviewed runtime HEAD: `7bb2c31b9092507f6185977f7d1724c95931ef27`.
+Exact-HEAD CI: 36/36 pass. Exact-HEAD isolated lab: run `46123762177`, all six
+jobs green (B4 management E2E, Linux systemd agent, Windows R1, serviceapi,
+both environment probes). Codex auto-review at this HEAD found no discrete
+actionable regressions; independent review found no P0/P1 and approved the
+runtime change set for the conditional merge gate.
 
 ## 1. Implementation evidence
 
@@ -117,10 +120,20 @@ deleted `admin_audit` rows. After the minimal fixes:
   `SecurityRetentionSeconds` (180d): strict `at < cutoff`, ≤50,000 rows per
   transaction, age-only deletion, interrupted/repeat runs idempotent,
   archived/purged event audit preserved while unexpired, and security ledger
-  unaffected. Capacity output exposes `admin_audit` row count.
+  unaffected. Capacity output exposes `admin_audit` row count. Tests:
+  `TestB4AdminAuditRetentionBoundedAgeAndIsolation`,
+  `TestB4AdminAuditRetentionBatchesAndInterruption`,
+  `TestB4AdminAuditRetentionPreservesArchivedAndPurgedEventAudit`,
+  `TestB4AdminAuditRetentionDoesNotShortenGlobalContract`.
 - v10 adds only the `purge_confirmations` table/indexes; the durable purge
   operation, graveyard, tombstone, ledger and B2 recovery semantics are
   unchanged.
+- Credential-file hardening final pass: POSIX requires `0600` **and** owner ==
+  the running `um-center` effective user; Windows requests owner security info
+  and accepts only the file owner, current service account, LocalSystem and
+  Builtin Administrators as allow ACEs (arbitrary local/domain accounts are
+  rejected). Test/lab fixtures are sealed by current token SID; Windows native
+  tests and the isolated Windows R1 lab passed at the final HEAD.
 
 ## 4. Migration/privacy/security notes
 
@@ -155,8 +168,11 @@ deleted `admin_audit` rows. After the minimal fixes:
   third P1: the Windows credential-file DACL check only rejected broad groups
   and allowed arbitrary explicit local/domain account ACEs. Fixed by requesting
   owner security information and enforcing a closed allow-list of the file
-  owner, LocalSystem and Builtin Administrators only; test fixtures now seal
-  temporary credential files with an owner-only DACL, and the allow-list has a
-  unit test. Codex re-review after the fix reported no discrete actionable
+  owner, current service account, LocalSystem and Builtin Administrators only.
+  The next Codex pass found a fourth P1: POSIX validation checked `0600` mode but
+  not that the file owner is the running service user. Fixed by requiring POSIX
+  owner == effective uid as well. Test/lab fixtures now seal temporary
+  credential files by current token SID/owner; the allow-list has a unit test.
+  Final Codex re-review after both fixes reported no discrete actionable
   regressions. A non-Codex independent review was also run; its P1/P2 findings
-  were fixed and it cleared the runtime change set for Draft PR status.
+  were fixed and it cleared the runtime change set for the merge gate.
