@@ -223,7 +223,7 @@ func TestUMCAuthConcurrentTOTPSetupIsAtomic(t *testing.T) {
 				UserID: user.UserID, State: AuthSessionActive, AccessSubject: "subject", AccessIssuer: "issuer",
 				CSRFHash:  "4444444444444444444444444444444444444444444444444444444444444444",
 				CreatedAt: now, LastSeenAt: now, IdleExpiresAt: now + 600, AbsoluteExpiresAt: now + 3600}
-			results <- s.CompleteTOTPSetup(ctx, user.UserID, []byte("sealed"), 1, 777, hashes, next, now+1)
+			results <- s.CompleteTOTPSetup(ctx, user.UserID, []byte("sealed"), 1, 777, hashes, old.IDHash, next, now+1)
 		}(i)
 	}
 	wg.Wait()
@@ -233,7 +233,7 @@ func TestUMCAuthConcurrentTOTPSetupIsAtomic(t *testing.T) {
 		switch {
 		case err == nil:
 			success++
-		case errors.Is(err, ErrAuthTOTPReplayed):
+		case errors.Is(err, ErrAuthTOTPReplayed), errors.Is(err, ErrAuthSessionUnknown):
 			replay++
 		default:
 			t.Fatalf("unexpected setup result: %v", err)

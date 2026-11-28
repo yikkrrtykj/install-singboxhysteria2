@@ -454,7 +454,7 @@ func (h *Handler) verifyTOTP(w http.ResponseWriter, r *http.Request) {
 		setupReq := h.mutationRequest(r, id.User, "umc_totp_enrolled", "user:"+id.User.UserID,
 			"umc_totp_enrolled", id.User.UserID, "totp-setup")
 		if err := h.store.CompleteTOTPSetup(setupReq.Context(), id.User.UserID, sealed, 1,
-			int64(counter), hashes, next, nowUnix); err != nil {
+			int64(counter), hashes, oldHash, next, nowUnix); err != nil {
 			if errors.Is(err, store.ErrAuthTOTPReplayed) {
 				h.writeError(w, http.StatusUnauthorized, "totp_replayed", "TOTP code already used")
 				return

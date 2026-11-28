@@ -1056,7 +1056,7 @@ func (s *Store) ClearTOTPFailures(ctx context.Context, userID string, now int64)
 // generation, revokes all old sessions and inserts the authenticated session.
 // No cookie is issued by the caller until this transaction commits.
 func (s *Store) CompleteTOTPSetup(ctx context.Context, userID string, secret []byte, keyVersion int,
-	counter int64, recoveryHashes []string, next AuthSession, now int64) error {
+	counter int64, recoveryHashes []string, oldHash string, next AuthSession, now int64) error {
 	if len(secret) == 0 || keyVersion < 1 || next.PublicID == "" {
 		return invalidArgument("totp_setup", "invalid arguments")
 	}
@@ -1065,6 +1065,23 @@ func (s *Store) CompleteTOTPSetup(ctx context.Context, userID string, secret []b
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	// Only the currently pending setup session may complete the enrollment. This
+	// serializes concurrent setup confirmations: the first revokes the old
+	// session; later requests fail before any new session/cookie is issued.
+	res, err := tx.ExecContext(ctx, `UPDATE umc_sessions SET revoked_at=? WHERE session_id_hash=? AND state=? AND revoked_at IS NULL`,
+		now, oldHash, AuthSessionTOTPSetup)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return ErrAuthSessionUnknown
+	}
+	// A new TOTP secret starts a fresh counter namespace; this happens inside the
+	// serialized completion transaction, so it does not open a pre-completion
+	// replay window for the old authenticator.
+	if _, err := tx.ExecContext(ctx, `DELETE FROM umc_totp_counters WHERE user_id=?`, userID); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO umc_totp_counters(user_id,counter,used_at) VALUES(?,?,?)`,
 		userID, counter, now); err != nil {
 		if isUniqueViolation(err) {
@@ -1072,7 +1089,7 @@ func (s *Store) CompleteTOTPSetup(ctx context.Context, userID string, secret []b
 		}
 		return err
 	}
-	res, err := tx.ExecContext(ctx, `UPDATE umc_users SET totp_secret=?,totp_key_version=?,totp_enrolled_at=?,
+	res, err = tx.ExecContext(ctx, `UPDATE umc_users SET totp_secret=?,totp_key_version=?,totp_enrolled_at=?,
 		totp_last_counter=?,totp_failed_attempts=0,totp_locked_until=NULL,last_login_at=?,updated_at=? WHERE user_id=?`,
 		secret, keyVersion, now, counter, now, now, userID)
 	if err != nil {
@@ -1107,12 +1124,4 @@ func (s *Store) CompleteTOTPSetup(ctx context.Context, userID string, secret []b
 		return err
 	}
 	return tx.Commit()
-}
-
-// ClearTOTPCounterHistory is used when a TOTP re-enrollment starts with a new
-// secret, so the first code of the new authenticator is not rejected by counters
-// from the old secret. The caller must have already verified the current password.
-func (s *Store) ClearTOTPCounterHistory(ctx context.Context, userID string) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM umc_totp_counters WHERE user_id=?`, userID)
-	return err
 }

@@ -269,12 +269,6 @@ func (h *Handler) updateTOTP(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, http.StatusUnauthorized, "invalid_credentials", "current password is invalid")
 		return
 	}
-	// A new authenticator starts a fresh counter namespace; avoid rejecting its
-	// first code because of the previous secret's consumed time steps.
-	if err := h.store.ClearTOTPCounterHistory(r.Context(), id.User.UserID); err != nil {
-		h.writeError(w, http.StatusInternalServerError, "internal", "TOTP setup unavailable")
-		return
-	}
 	secret, err := umcauth.NewTOTPSecret()
 	if err != nil {
 		h.writeError(w, http.StatusInternalServerError, "internal", "TOTP setup unavailable")
