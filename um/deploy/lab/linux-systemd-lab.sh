@@ -18,6 +18,8 @@ INGEST="127.0.0.1:18080"
 ADMIN="127.0.0.1:18081"
 DB="$ROOT/center.db"
 TOKEN="$ROOT/token"
+ADMIN_TOKEN="$ROOT/admin.token"
+ADMIN_AUTH="$ROOT/admin-auth.json"
 CENTER_LOG="$ROOT/center.log"
 
 cleanup() {
@@ -55,17 +57,37 @@ UNIT
 sudo systemctl daemon-reload
 sudo systemctl enable --now sing-box.service
 
-# Real center + real SQLite; issue a one-time token using the center binary.
+# Real center + real SQLite + local authenticated management API. The lab
+# creates the event/token through the management service (not a direct store
+# shortcut) so B3 regression also exercises the B4 admin boundary.
+umask 077
+python3 - <<'PY' > "$ADMIN_TOKEN"
+import secrets
+print(secrets.token_urlsafe(32), end="")
+PY
+ADMIN_HASH="$(sha256sum "$ADMIN_TOKEN" | awk '{print $1}')"
+cat > "$ADMIN_AUTH" <<JSON
+{"principals":[{"id":"linux-lab-admin","role":"platform_admin","event_ids":[]}],
+ "tokens":[{"sha256":"$ADMIN_HASH","principal_id":"linux-lab-admin"}]}
+JSON
+chmod 0600 "$ADMIN_TOKEN" "$ADMIN_AUTH"
 "$ROOT/um-center" -contracts "$REPO/docs/um/contracts/v1" -db "$DB" \
-  -issue-enroll-token -token-event "$EVENT" -token-class linux_vps > "$TOKEN"
-"$ROOT/um-center" -contracts "$REPO/docs/um/contracts/v1" -db "$DB" \
-  -ingest "$INGEST" -admin "$ADMIN" >"$CENTER_LOG" 2>&1 &
+  -ingest "$INGEST" -admin "$ADMIN" -admin-auth-file "$ADMIN_AUTH" >"$CENTER_LOG" 2>&1 &
 CENTER_PID=$!
 for _ in $(seq 1 50); do
   if curl -fsS "http://$ADMIN/api/health" >/dev/null 2>&1; then break; fi
   sleep 0.2
 done
 curl -fsS "http://$ADMIN/api/health" >/dev/null
+"$ROOT/um-center" admin --url "http://$ADMIN" --token-file "$ADMIN_TOKEN" --json \
+  event create --event-id "$EVENT" --name "linux-agent-lab" >/dev/null
+"$ROOT/um-center" admin --url "http://$ADMIN" --token-file "$ADMIN_TOKEN" --json \
+  token create "$EVENT" --class linux_vps --ttl-seconds 600 > "$ROOT/created.json"
+python3 - "$ROOT/created.json" > "$TOKEN" <<'PY'
+import json, sys
+with open(sys.argv[1]) as f:
+    print(json.load(f)["token"], end="")
+PY
 
 sudo mkdir -p /etc/um-agent
 sudo install -m 0400 -o root -g root "$TOKEN" /etc/um-agent/bootstrap.token

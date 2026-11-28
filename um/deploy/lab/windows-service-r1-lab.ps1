@@ -23,6 +23,8 @@ $labtool = Join-Path $lab 'um-lab.exe'
 $labSvc = Join-Path $lab 'um-lab-service.exe'
 $serviceLog = Join-Path $lab 'service.log'
 $tokenFile = Join-Path $lab 'bootstrap.token'
+$adminToken = Join-Path $lab 'admin.token'
+$adminAuth = Join-Path $lab 'admin-auth.json'
 $profilePath = Join-Path $lab 'mihomo-profile.json'
 $secretPath = Join-Path $lab 'mihomo.secret'
 $mihomoDir = Join-Path $lab 'mihomo'
@@ -99,19 +101,43 @@ try {
 } finally { Pop-Location }
 
 # ---------------------------------------------------------------------------
-# Real local center + real SQLite, one synthetic token.
+# Real local center + real SQLite + local authenticated management API. The lab
+# creates the event/token through the management service rather than a direct
+# store shortcut, so B3 regression also exercises the B4 admin boundary.
 # ---------------------------------------------------------------------------
 $event = [guid]::NewGuid().ToString()
-$token = (& $center -contracts $contracts -db $db -issue-enroll-token -token-event $event -token-class windows_terminal | Select-Object -Last 1)
-if ([string]::IsNullOrWhiteSpace($token)) { Fail 'center token issue failed' }
-Set-Content -LiteralPath $tokenFile -Value $token -NoNewline -Encoding ascii
-$centerProc = Start-Process -FilePath $center -ArgumentList @('-contracts', $contracts, '-db', $db, '-ingest', '127.0.0.1:18080', '-admin', '127.0.0.1:18081') -RedirectStandardOutput $centerLog -RedirectStandardError ($centerLog + '.err') -PassThru
+$rawAdminToken = ([guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N'))
+Set-Content -LiteralPath $adminToken -Value $rawAdminToken -NoNewline -Encoding ascii
+$sha = [System.Security.Cryptography.SHA256]::Create()
+try {
+  $hashBytes = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($rawAdminToken))
+} finally { $sha.Dispose() }
+$hash = ([BitConverter]::ToString($hashBytes)).Replace('-', '').ToLowerInvariant()
+$authDoc = @{principals=@(@{id='windows-lab-admin';role='platform_admin';event_ids=@()});tokens=@(@{sha256=$hash;principal_id='windows-lab-admin'})} | ConvertTo-Json -Depth 6
+Set-Content -LiteralPath $adminAuth -Value $authDoc -Encoding ascii
+$adminOwner = "*$(([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value)"
+Invoke-Native 'icacls' @($adminToken, '/inheritance:r', '/grant:r', "$($adminOwner):(F)", 'SYSTEM:(F)', 'Administrators:(F)')
+Invoke-Native 'icacls' @($adminAuth, '/inheritance:r', '/grant:r', "$($adminOwner):(F)", 'SYSTEM:(F)', 'Administrators:(F)')
+$centerProc = Start-Process -FilePath $center -ArgumentList @('-contracts', $contracts, '-db', $db, '-ingest', '127.0.0.1:18080', '-admin', '127.0.0.1:18081', '-admin-auth-file', $adminAuth) -RedirectStandardOutput $centerLog -RedirectStandardError ($centerLog + '.err') -PassThru
 $deadline = (Get-Date).AddSeconds(30)
 $healthy = $false
 while ((Get-Date) -lt $deadline) {
   try { Invoke-RestMethod -Uri 'http://127.0.0.1:18081/api/health' -TimeoutSec 1 | Out-Null; $healthy = $true; break } catch { Start-Sleep -Milliseconds 300 }
 }
-if (-not $healthy) { Fail 'center did not become healthy' }
+if (-not $healthy) {
+  Get-Content -LiteralPath ($centerLog + '.err') -ErrorAction SilentlyContinue | Write-Host
+  Get-Content -LiteralPath $centerLog -ErrorAction SilentlyContinue | Write-Host
+  Fail 'center did not become healthy'
+}
+$adminArgs = @('admin', '--url', 'http://127.0.0.1:18081', '--token-file', $adminToken, '--json')
+& $center @adminArgs event create --event-id $event --name 'windows-agent-lab' | Out-Null
+if ($LASTEXITCODE -ne 0) { Fail 'management event create failed' }
+$createdRaw = (& $center @adminArgs token create $event --class windows_terminal --ttl-seconds 600 | Out-String)
+if ($LASTEXITCODE -ne 0) { Fail 'management token create failed' }
+$created = $createdRaw | ConvertFrom-Json
+$token = $created.token
+if ([string]::IsNullOrWhiteSpace($token)) { Fail 'center token issue failed' }
+Set-Content -LiteralPath $tokenFile -Value $token -NoNewline -Encoding ascii
 
 # ---------------------------------------------------------------------------
 # Service account + enrollment under that account (DPAPI CurrentUser).

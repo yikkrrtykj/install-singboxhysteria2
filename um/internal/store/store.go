@@ -864,10 +864,10 @@ func (s *Store) createMappingVersion(ctx context.Context, eventID, windowsNodeID
 
 	// Validate every target inside the same transaction.
 	for token, target := range entries {
-		var targetClass, targetEvent string
+		var targetClass, targetEvent, targetState string
 		err := tx.QueryRowContext(ctx,
-			`SELECT node_class, event_id FROM nodes WHERE node_id = ?`, target).
-			Scan(&targetClass, &targetEvent)
+			`SELECT node_class, event_id, state FROM nodes WHERE node_id = ?`, target).
+			Scan(&targetClass, &targetEvent, &targetState)
 		if errors.Is(err, sql.ErrNoRows) {
 			return invalidArgument("target_node_id", fmt.Sprintf("target for route %q does not exist", token))
 		}
@@ -879,6 +879,9 @@ func (s *Store) createMappingVersion(ctx context.Context, eventID, windowsNodeID
 		}
 		if targetEvent != eventID {
 			return invalidArgument("target_node_id", fmt.Sprintf("target for route %q belongs to a different event", token))
+		}
+		if targetState != "active" {
+			return invalidArgument("target_node_id", fmt.Sprintf("target for route %q must be active", token))
 		}
 	}
 
@@ -905,6 +908,16 @@ func (s *Store) createMappingVersion(ctx context.Context, eventID, windowsNodeID
 			eventID, windowsNodeID, version, token, entries[token]); err != nil {
 			return fmt.Errorf("store: insert mapping entry: %w", err)
 		}
+	}
+	// UM-B4: the mapping write is an administrative security-state change. Record
+	// it in the hash-chained ledger and the scoped admin audit in the same
+	// transaction, naming the operator that created it.
+	if _, err := appendLedgerTx(ctx, tx, now, "route_mapping_created", eventID,
+		ledgerDetailHash(fmt.Sprintf("%s|%d|%s", windowsNodeID, version, createdBy))); err != nil {
+		return err
+	}
+	if err := appendAuditFromContextTxFields(ctx, tx, "ok", "route_mapping", eventID); err != nil {
+		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("store: commit mapping version: %w", err)

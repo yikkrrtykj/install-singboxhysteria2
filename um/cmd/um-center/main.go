@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"strings"
@@ -17,10 +18,17 @@ import (
 	"time"
 
 	"github.com/yikkrrtykj/install-singboxhysteria2/um/internal/center"
+	"github.com/yikkrrtykj/install-singboxhysteria2/um/internal/management"
 	"github.com/yikkrrtykj/install-singboxhysteria2/um/internal/store"
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "admin" {
+		os.Exit(runAdminCLI(os.Args[2:]))
+	}
+	if len(os.Args) > 1 && os.Args[1] == "serve" {
+		os.Args = append([]string{os.Args[0]}, os.Args[2:]...)
+	}
 	if err := run(); err != nil {
 		log.Printf("um-center: %v", err)
 		os.Exit(1)
@@ -36,14 +44,11 @@ func envOr(name, fallback string) string {
 
 func run() error {
 	var (
-		ingestAddr  = flag.String("ingest", envOr("UM_CENTER_INGEST_ADDR", ""), "machine-ingest listen address (required; loopback preferred)")
-		adminAddr   = flag.String("admin", envOr("UM_CENTER_ADMIN_ADDR", ""), "isolated admin listen address (required)")
-		dbPath      = flag.String("db", envOr("UM_CENTER_DB", ""), "SQLite database path (required)")
-		contractDir = flag.String("contracts", envOr("UM_CENTER_CONTRACTS", ""), "explicit trusted path to docs/um/contracts/v1 (required)")
-		issueToken  = flag.Bool("issue-enroll-token", false, "create one enrollment token and exit (admin action)")
-		tokenEvent  = flag.String("token-event", "", "event_id scope for -issue-enroll-token")
-		tokenClass  = flag.String("token-class", "", "node_class scope for -issue-enroll-token (linux_vps|windows_terminal)")
-		tokenTTL    = flag.Duration("token-ttl", 30*time.Minute, "enrollment token lifetime")
+		ingestAddr    = flag.String("ingest", envOr("UM_CENTER_INGEST_ADDR", ""), "machine-ingest listen address (required; loopback preferred)")
+		adminAddr     = flag.String("admin", envOr("UM_CENTER_ADMIN_ADDR", ""), "isolated admin listen address (required)")
+		dbPath        = flag.String("db", envOr("UM_CENTER_DB", ""), "SQLite database path (required)")
+		contractDir   = flag.String("contracts", envOr("UM_CENTER_CONTRACTS", ""), "explicit trusted path to docs/um/contracts/v1 (required)")
+		adminAuthFile = flag.String("admin-auth-file", envOr("UM_CENTER_ADMIN_AUTH_FILE", ""), "protected 0600 local admin auth JSON; enables /api/v1 management API")
 	)
 	flag.Parse()
 
@@ -55,29 +60,30 @@ func run() error {
 		return fmt.Errorf("open store: %w", err)
 	}
 	defer st.Close()
-	now := time.Now().Unix()
-
-	if *issueToken {
-		if *tokenEvent == "" || *tokenClass == "" {
-			return errors.New("-issue-enroll-token requires -token-event and -token-class")
-		}
-		token, hash, err := store.NewEnrollToken()
-		if err != nil {
-			return err
-		}
-		if err := st.CreateEnrollToken(context.Background(), hash, *tokenEvent, *tokenClass, now+int64(tokenTTL.Seconds()), now); err != nil {
-			return fmt.Errorf("create enrollment token: %w", err)
-		}
-		fmt.Println(token)
-		return nil
-	}
-
 	if *ingestAddr == "" || *adminAddr == "" {
 		return errors.New("-ingest and -admin are required (or UM_CENTER_INGEST_ADDR / UM_CENTER_ADMIN_ADDR)")
 	}
 	cfg := center.Config{
 		IngestAddr: *ingestAddr, AdminAddr: *adminAddr,
 		DBPath: *dbPath, ContractDir: *contractDir,
+	}
+	if *adminAuthFile != "" {
+		if err := requireLoopbackAdmin(*adminAddr); err != nil {
+			return err
+		}
+		auth, err := management.LoadFileAuthenticator(*adminAuthFile)
+		if err != nil {
+			return fmt.Errorf("admin auth: %w", err)
+		}
+		mgmt, err := management.NewService(st)
+		if err != nil {
+			return err
+		}
+		adminAPI, err := management.NewHandler(mgmt, auth)
+		if err != nil {
+			return err
+		}
+		cfg.AdminAPI = adminAPI
 	}
 	if err := cfg.Validate(); err != nil {
 		return err
@@ -98,7 +104,11 @@ func run() error {
 		return fmt.Errorf("start center: %w", err)
 	}
 	log.Printf("um-center ingest listening on %s (machine plane)", srv.IngestAddr())
-	log.Printf("um-center admin listening on %s (admin plane, health only)", srv.AdminAddr())
+	if cfg.AdminAPI != nil {
+		log.Printf("um-center admin listening on %s (admin plane; authenticated /api/v1 management API)", srv.AdminAddr())
+	} else {
+		log.Printf("um-center admin listening on %s (admin plane; health only, management API disabled)", srv.AdminAddr())
+	}
 	log.Printf("um-center contract set loaded from %s", *contractDir)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -131,5 +141,23 @@ func run() error {
 		return fmt.Errorf("shutdown: %w", err)
 	}
 	log.Printf("um-center stopped")
+	return nil
+}
+
+// requireLoopbackAdmin refuses to expose the management API on a non-loopback
+// listener. UM-C (Cloudflare Tunnel/TLS/login/session) is not implemented in
+// B4; an unauthenticated public admin listener is never acceptable.
+func requireLoopbackAdmin(addr string) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return errors.New("admin address must be host:port")
+	}
+	if host == "localhost" {
+		return nil
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return errors.New("management API requires a loopback admin address in B4")
+	}
 	return nil
 }
