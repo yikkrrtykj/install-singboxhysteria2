@@ -3,6 +3,8 @@
 PR: #133 (Draft, Refs #127)
 Branch: `codex/um-b4-management`
 Base: `da8173317aa6b6395a5e002ea4a89dac3fe4fd5e` (rev-6 main)
+Reviewed HEAD: `fe70275456da170a0fa075ae2a50aed0b2553bd3` (plus final docs/evidence-only
+commit if recorded on the PR).
 
 ## 1. Implementation evidence
 
@@ -61,9 +63,24 @@ GOOS=linux GOARCH=amd64 go build ./...
 GOOS=windows GOARCH=amd64 go build ./...
 ```
 
-Last local run: all packages PASS; vet/build/mod verify PASS. CI/race/coverage
-and exact-HEAD lab evidence are recorded on PR #133 and will be bound to the
-final reviewed HEAD before the final status claim.
+Last local run: all packages PASS; vet/build/mod verify PASS.
+
+Exact-HEAD evidence:
+- Full CI run `46084342391`: 35/36 lanes pass, including native
+  Linux/Windows unit/conformance/coverage and B4 management tests. The remaining
+  `windows-exe` lane is the pre-existing unrelated Python frozen-EXE process
+  enumeration lane; a rerun was attempted after its process-identity flake
+  (`QueryFullProcessImageNameW ... winerror=5`). Its final result is recorded on
+  PR #133; it does not exercise `um/**` or B4 code.
+- UM-B3/B4 isolated lab run `46084337257` at `fe702754` is **all green**:
+  `linux-systemd-agent-lab`, `windows-service-r1-lab`,
+  `linux-singbox-serviceapi-lab`, `b4-management-e2e`, and both environment
+  probes. The B4 labs now create event/token through the authenticated
+  management API (no removed direct-store `-issue-enroll-token` flag).
+- Independent review of `b4aee666` found four P1 issues (lab CLI JSON shape,
+  revoked-token 503, invalid/inconsistent OpenAPI, duplicate-event 500) and
+  material P2 issues. All were fixed in `fe702754`; a follow-up exact-HEAD
+  review is requested before the final status.
 
 ## 4. Migration/privacy/security notes
 
@@ -87,4 +104,5 @@ final reviewed HEAD before the final status claim.
   functional blocker on #127 (see `um-b4-data-source-investigation.md`).
 - Backup/restore, VACUUM/disk-pressure and offsite ledger acceptance remain UM-E.
 - Formal Codex review may be quota-blocked; independent review/quota record is
-  required and must not be represented as Codex completion.
+  required and must not be represented as Codex completion. A non-Codex
+  independent review was run and its findings were fixed as above.

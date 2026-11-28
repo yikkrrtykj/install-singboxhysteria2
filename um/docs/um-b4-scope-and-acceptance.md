@@ -13,7 +13,7 @@ deployment or UM-C+ work is authorized by this document.
 | B4.4 | Effective-dated agent config read/history/update; source/class validation; no unauthorized source enablement | management + existing B2 config engine | positive/negative source tests PASS |
 | B4.5 | Append-only route mapping list/create/resolve; same-event/class validation; historical resolution | management + existing store mapping engine | real two-event E2E historical mapping PASS; invalid target/version tests PASS |
 | B4.6 | Retention/capacity/audit visibility, bounded maintenance trigger; aliases; purge safety | management + existing B2 retention/purge | real purge isolation/idempotence tests; store lifecycle tests PASS |
-| B4.7 | Admin HTTP API, OpenAPI, management CLI, E2E/security/final acceptance | `management.Handler`, `cmd/um-center/admin_cli.go`, docs | spec/inventory test; CLI real HTTP test; full suite/CI/lab pending final HEAD |
+| B4.7 | Admin HTTP API, OpenAPI, management CLI, E2E/security/final acceptance | `management.Handler`, `cmd/um-center/admin_cli.go`, docs | strict OpenAPI+inventory tests; real CLI HTTP test; exact-HEAD lab all green; final CI evidence in `um-b4-evidence.md` |
 
 ## 2. API inventory
 
