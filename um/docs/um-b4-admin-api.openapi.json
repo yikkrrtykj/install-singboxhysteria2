@@ -3432,7 +3432,7 @@
                       ]
                     },
                     "data": {
-                      "$ref": "#/components/schemas/MappingVersionView"
+                      "$ref": "#/components/schemas/MappingCreated"
                     }
                   }
                 }
@@ -4735,6 +4735,22 @@
           "state": {
             "type": "string"
           },
+          "created_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "archived_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "purge_after": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "data_purged_at": {
+            "type": "integer",
+            "format": "int64"
+          },
           "node_count": {
             "type": "integer",
             "format": "int64"
@@ -4751,7 +4767,13 @@
             "type": "integer",
             "format": "int64"
           }
-        }
+        },
+        "required": [
+          "event_id",
+          "display_name",
+          "state",
+          "created_at"
+        ]
       },
       "EventList": {
         "type": "object",
@@ -4911,9 +4933,6 @@
           "expires_at": {
             "type": "integer",
             "format": "int64"
-          },
-          "status": {
-            "type": "string"
           }
         },
         "required": [
@@ -4926,6 +4945,10 @@
         "properties": {
           "token_id": {
             "type": "string"
+          },
+          "event_id": {
+            "type": "string",
+            "format": "uuid"
           },
           "node_class": {
             "type": "string"
@@ -5023,7 +5046,20 @@
             "type": "array",
             "maxItems": 8,
             "items": {
-              "type": "object"
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "inbound_tag",
+                "kind"
+              ],
+              "properties": {
+                "inbound_tag": {
+                  "type": "string"
+                },
+                "kind": {
+                  "type": "string"
+                }
+              }
             }
           }
         },
@@ -5035,14 +5071,18 @@
       "ConfigView": {
         "type": "object",
         "properties": {
+          "node_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "event_id": {
+            "type": "string",
+            "format": "uuid"
+          },
           "node_class": {
             "type": "string"
           },
           "config_version": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "effective_from": {
             "type": "integer",
             "format": "int64"
           },
@@ -5055,8 +5095,22 @@
           },
           "expected_inbound_tags": {
             "type": "array"
+          },
+          "updated_at": {
+            "type": "integer",
+            "format": "int64"
           }
-        }
+        },
+        "required": [
+          "node_id",
+          "event_id",
+          "node_class",
+          "config_version",
+          "cadence_seconds",
+          "sources",
+          "expected_inbound_tags",
+          "updated_at"
+        ]
       },
       "ConfigHistoryView": {
         "type": "array",
@@ -5087,7 +5141,15 @@
           "display_alias": {
             "type": "string"
           },
+          "created_at": {
+            "type": "integer",
+            "format": "int64"
+          },
           "last_seen_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "retired_at": {
             "type": "integer",
             "format": "int64"
           },
@@ -5106,9 +5168,7 @@
             "type": "integer",
             "format": "int64"
           },
-          "latest_snapshot": {
-            "type": "object"
-          },
+          "latest_snapshot": {},
           "keys": {
             "type": "array"
           },
@@ -5205,7 +5265,27 @@
             "type": "array",
             "maxItems": 4,
             "items": {
-              "type": "object"
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "route_token",
+                "target_node_id"
+              ],
+              "properties": {
+                "route_token": {
+                  "type": "string",
+                  "enum": [
+                    "a_reality",
+                    "a_hy2",
+                    "b_reality",
+                    "b_hy2"
+                  ]
+                },
+                "target_node_id": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
             }
           }
         },
@@ -5213,6 +5293,39 @@
           "version",
           "effective_from",
           "entries"
+        ]
+      },
+      "MappingEntryView": {
+        "type": "object",
+        "properties": {
+          "route_token": {
+            "type": "string",
+            "enum": [
+              "a_reality",
+              "a_hy2",
+              "b_reality",
+              "b_hy2"
+            ]
+          },
+          "target_node_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "route_token",
+          "target_node_id"
+        ]
+      },
+      "MappingCreated": {
+        "type": "object",
+        "properties": {
+          "created": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "created"
         ]
       },
       "MappingVersionView": {
@@ -5234,7 +5347,10 @@
             "format": "int64"
           },
           "entries": {
-            "type": "object"
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MappingEntryView"
+            }
           }
         }
       },

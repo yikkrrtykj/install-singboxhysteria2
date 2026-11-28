@@ -208,6 +208,16 @@ func TestMappingRejectsInvalidTargetsAndPreservesHistory(t *testing.T) {
 			"entries": []map[string]string{{"route_token": "a_reality", "target_node_id": linuxAID.NodeID}}}, nil); err != nil {
 		t.Fatal(err)
 	}
+	// A revoked/non-active target cannot be used by a later version.
+	if err := platform.Call(context.Background(), http.MethodPost,
+		"/api/v1/events/"+eventA+"/nodes/"+linuxAID.NodeID+"/revoke", nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := platform.Call(context.Background(), http.MethodPost, base, nil,
+		map[string]any{"version": 2, "effective_from": timeNow() + 120,
+			"entries": []map[string]string{{"route_token": "a_reality", "target_node_id": linuxAID.NodeID}}}, nil); err == nil {
+		t.Fatal("mapping accepted revoked target")
+	}
 	// Existing version cannot be rewritten.
 	if err := platform.Call(context.Background(), http.MethodPost, base, nil,
 		map[string]any{"version": 1, "effective_from": timeNow() + 120,

@@ -69,9 +69,10 @@ Exact-HEAD evidence:
 - Full CI run `46084342391`: 35/36 lanes pass, including native
   Linux/Windows unit/conformance/coverage and B4 management tests. The remaining
   `windows-exe` lane is the pre-existing unrelated Python frozen-EXE process
-  enumeration lane; a rerun was attempted after its process-identity flake
-  (`QueryFullProcessImageNameW ... winerror=5`). Its final result is recorded on
-  PR #133; it does not exercise `um/**` or B4 code.
+  enumeration lane; reruns after its process-identity flake
+  (`QueryFullProcessImageNameW ... winerror=5`) are recorded on PR #133; it does
+  not exercise `um/**` or B4 code and is not modified by B4. All B4-relevant
+  lanes pass.
 - UM-B3/B4 isolated lab run `46084337257` at `fe702754` is **all green**:
   `linux-systemd-agent-lab`, `windows-service-r1-lab`,
   `linux-singbox-serviceapi-lab`, `b4-management-e2e`, and both environment
@@ -79,8 +80,14 @@ Exact-HEAD evidence:
   management API (no removed direct-store `-issue-enroll-token` flag).
 - Independent review of `b4aee666` found four P1 issues (lab CLI JSON shape,
   revoked-token 503, invalid/inconsistent OpenAPI, duplicate-event 500) and
-  material P2 issues. All were fixed in `fe702754`; a follow-up exact-HEAD
-  review is requested before the final status.
+  material P2 issues. All were fixed in `fe702754`. A follow-up review of
+  `fb499a5e` confirmed all P1/P2 fixes and returned **no remaining P0/P1;
+  clear/approved for Draft PR status**. Its residual P2 OpenAPI field-fidelity
+  findings (mapping create response, mapping entries array, config/event/node/
+  token fields, request constraints) were then fixed and guarded by a
+  reflection test comparing every public JSON DTO with its OpenAPI schema.
+- Final lab dispatch `46085969348` at `fb499a5e` is all green (same code as the
+  current final HEAD apart from docs/spec/test fidelity only).
 
 ## 4. Migration/privacy/security notes
 

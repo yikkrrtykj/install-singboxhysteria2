@@ -93,12 +93,28 @@ func TestAdminRequestValidationAndTokenPrivacy(t *testing.T) {
 	if err := platform.Call(context.Background(), http.MethodGet, "/api/v1/audit", nil, nil, &audit); err != nil {
 		t.Fatal(err)
 	}
-	auditRaw, _ := json.Marshal(audit)
-	if strings.Contains(string(auditRaw), created.Token) {
+	auditJSON, _ := json.Marshal(audit)
+	if strings.Contains(string(auditJSON), created.Token) {
 		t.Fatal("enrollment token plaintext appeared in audit")
 	}
-	if strings.Contains(string(auditRaw), "controller.secret") {
+	if strings.Contains(string(auditJSON), "controller.secret") {
 		t.Fatal("secret marker appeared in audit")
+	}
+
+	// Denied audit rows cannot be inflated with arbitrary path text.
+	longEvent := strings.Repeat("A", 5000)
+	status, _ = rawRequest(t, http.MethodGet, bc.adminURL+"/api/v1/events/"+longEvent,
+		"viewer-a-token-0123456789abcdef", nil)
+	if status != http.StatusNotFound {
+		t.Fatalf("oversized out-of-scope event status=%d", status)
+	}
+	var auditRaw []byte
+	status, auditRaw = rawRequest(t, http.MethodGet, bc.adminURL+"/api/v1/audit", "platform-token-0123456789abcdef", nil)
+	if status != http.StatusOK {
+		t.Fatalf("audit list status=%d", status)
+	}
+	if strings.Contains(string(auditRaw), longEvent) || strings.Contains(string(auditRaw), "AAAAAAAAAAAAAAAA") {
+		t.Fatal("oversized denial text leaked into admin_audit")
 	}
 
 	// The auth file itself must be access-protected.
