@@ -2354,9 +2354,9 @@ class Lab:
             multi_threads.append(self.produce_async(
                 "hysteria2", "shape-multi",
                 "/payload/%d" % (1024 * 1024),
-                extra_args=["--limit-rate", "1m"]))
+                extra_args=["--limit-rate", "128k"]))
         multi_max = 0
-        deadline = time.time() + 10
+        deadline = time.time() + 15
         while time.time() < deadline and any(thread.is_alive()
                                              for thread in multi_threads):
             try:
