@@ -92,11 +92,30 @@ type TrafficInboundObservation struct {
 // rev-7 JSON schema; this function enforces the coherence rules the schema
 // cannot express. It returns the decoded object for normalized storage.
 func ValidateTrafficObservation(collectedAt int64, raw json.RawMessage) (*TrafficObservation, error) {
+	return ValidateTrafficObservationWithCadence(collectedAt, raw, 0)
+}
+
+// ValidateTrafficObservationWithCadence applies the frozen rev-7 freshness
+// bound fresh iff age <= max(2*cadence_seconds, 120). A cadence of zero keeps
+// the minimum 120 s bound; the center passes its effective signed config
+// cadence, so an age between 121 and 600 s is accepted as fresh exactly when the
+// contract allows it instead of being rejected by a hardcoded 15 s rule.
+func ValidateTrafficObservationWithCadence(collectedAt int64, raw json.RawMessage, cadenceSeconds int) (*TrafficObservation, error) {
 	var obs TrafficObservation
 	if err := json.Unmarshal(raw, &obs); err != nil {
 		return nil, invalid("traffic_observation", "malformed traffic observation object")
 	}
-	if err := validateTrafficObservationSemantics(collectedAt, &obs); err != nil {
+	var freshBound int64 = trafficFreshMaxAgeSeconds
+	if cadenceSeconds > 0 {
+		freshBound = int64(2 * cadenceSeconds)
+		if freshBound < 120 {
+			freshBound = 120
+		}
+		if freshBound > 600 {
+			freshBound = 600
+		}
+	}
+	if err := validateTrafficObservationSemanticsWithFreshBound(collectedAt, &obs, freshBound); err != nil {
 		return nil, err
 	}
 	return &obs, nil
@@ -115,6 +134,10 @@ func ValidateTrafficObservation(collectedAt int64, raw json.RawMessage) (*Traffi
 //   - the reported observations are not double counted: a total active count, if
 //     supplied, must cover the sum of per-inbound active counts.
 func validateTrafficObservationSemantics(collectedAt int64, obs *TrafficObservation) error {
+	return validateTrafficObservationSemanticsWithFreshBound(collectedAt, obs, trafficFreshMaxAgeSeconds)
+}
+
+func validateTrafficObservationSemanticsWithFreshBound(collectedAt int64, obs *TrafficObservation, freshMaxAge int64) error {
 	if obs.Source != TrafficSourceMonitorReadonlyExport {
 		return invalid("traffic_observation.source", "source must be monitor_readonly_export")
 	}
@@ -169,7 +192,7 @@ func validateTrafficObservationSemantics(collectedAt int64, obs *TrafficObservat
 	// observed; unavailable is always fully unavailable.
 	switch obs.Freshness {
 	case "fresh":
-		if obs.AgeSeconds > trafficFreshMaxAgeSeconds {
+		if obs.AgeSeconds > freshMaxAge {
 			return invalid("traffic_observation.age_seconds", "fresh observation age exceeds the fresh bound")
 		}
 		if obs.Availability == "unavailable" {

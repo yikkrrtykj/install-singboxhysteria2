@@ -173,6 +173,13 @@ type Collector struct {
 	// then carries an honest unavailable traffic_observation. The path is never
 	// accepted from center config, a URL or a command.
 	MonitorExportFile string
+	// MonitorExportOwnerUID / MonitorExportGroupGID / MonitorExportMode are the
+	// operator-configured expected owner, group and exact POSIX mode of the
+	// export. Non-zero values are enforced on POSIX; a mismatch fails closed to
+	// unavailable. They are local operator flags, never center-supplied.
+	MonitorExportOwnerUID int
+	MonitorExportGroupGID int
+	MonitorExportMode     uint32
 	// monitorExport is the in-memory monotonic epoch/sequence guard for the
 	// optional export. It is never persisted and never a data source.
 	monitorExport monitorExportTracker

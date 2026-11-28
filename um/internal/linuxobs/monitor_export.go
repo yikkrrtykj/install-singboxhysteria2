@@ -42,9 +42,13 @@ const (
 
 	maxMonitorExportBytes = int64(64 << 10)
 
-	// monitorFreshMaxAgeSeconds is the agent-side freshness bound: an export
-	// observed more than 15s before collected_at is stale, never fresh.
-	monitorFreshMaxAgeSeconds = int64(15)
+	// monitorFreshMinAgeSeconds is the floor of the frozen freshness bound
+	// fresh iff age <= max(2*cadence_seconds, 120). The runtime computes the
+	// effective bound from the signed center config cadence.
+	monitorFreshMinAgeSeconds = int64(120)
+	// monitorFreshMaxAgeSeconds is the contract's maximum freshness bound for a
+	// 300 s cadence (2*300 = 600); it is a defensive upper clamp.
+	monitorFreshMaxAgeSeconds = int64(600)
 	// monitorFutureToleranceSeconds is the small clock-skew allowance for
 	// observed/generated timestamps relative to collected_at.
 	monitorFutureToleranceSeconds = int64(5)
@@ -184,7 +188,7 @@ func ValidateMonitorExportPath(path string) error {
 // readMonitorExportFile reads the configured export with a bounded read and
 // rejects symlinks, non-regular files and oversized contents. Every read is
 // checked, so a file replaced after startup is re-validated.
-func readMonitorExportFile(path string) ([]byte, error) {
+func readMonitorExportFile(path string, expectedOwnerUID, expectedGroupGID int, expectedMode uint32) ([]byte, error) {
 	if err := ValidateMonitorExportPath(path); err != nil {
 		return nil, err
 	}
@@ -229,8 +233,25 @@ func readMonitorExportFile(path string) ([]byte, error) {
 	}
 	// POSIX permissions are meaningful only on Unix; Windows ACLs are checked by
 	// the OS group/ACL deployment, and Go reports synthetic modes there.
-	if runtime.GOOS != "windows" && opened.Mode().Perm()&0o007 != 0 {
-		return nil, errMonitorExportNotRegular
+	if runtime.GOOS != "windows" {
+		if opened.Mode().Perm()&0o007 != 0 {
+			return nil, errMonitorExportNotRegular
+		}
+		if expectedMode != 0 && uint32(opened.Mode().Perm()) != expectedMode {
+			return nil, errMonitorExportNotRegular
+		}
+		if expectedOwnerUID != 0 || expectedGroupGID != 0 {
+			uid, gid, ok := monitorExportPOSIXOwner(opened)
+			if !ok {
+				return nil, errMonitorExportNotRegular
+			}
+			if expectedOwnerUID != 0 && uid != uint32(expectedOwnerUID) {
+				return nil, errMonitorExportNotRegular
+			}
+			if expectedGroupGID != 0 && gid != uint32(expectedGroupGID) {
+				return nil, errMonitorExportNotRegular
+			}
+		}
 	}
 	if opened.Size() > maxMonitorExportBytes {
 		return nil, errMonitorExportTooLarge
@@ -454,7 +475,7 @@ func (c *Collector) trafficObservation(rc agent.ReportContext) *trafficObservati
 	if c.MonitorExportFile == "" {
 		return unavailable
 	}
-	raw, err := readMonitorExportFile(c.MonitorExportFile)
+	raw, err := readMonitorExportFile(c.MonitorExportFile, c.MonitorExportOwnerUID, c.MonitorExportGroupGID, c.MonitorExportMode)
 	if err != nil {
 		return unavailable
 	}
@@ -483,13 +504,15 @@ func (c *Collector) trafficObservation(rc agent.ReportContext) *trafficObservati
 	for index := range export.Inbounds {
 		byTag[export.Inbounds[index].InboundTag] = &export.Inbounds[index]
 	}
-	// Only center-authorized tags may appear, and the observed kind must match
-	// the center-declared kind exactly. Any unknown/mismatched tag makes the
-	// whole export unusable instead of leaking an unapproved tag downstream.
+	// Only center-authorized tags may be forwarded. An export may legitimately
+	// contain a superset while the center allow-list is narrower (operator
+	// config drift or a tag removed in a staged change): drop non-matching
+	// entries and forward only the authorized subset. Never leak an unapproved
+	// tag or kind downstream.
 	for tag, inbound := range byTag {
 		allowedKind, ok := expectedKind(expected, tag)
 		if !ok || allowedKind != inbound.Kind {
-			return unavailable
+			delete(byTag, tag)
 		}
 	}
 	// In-memory monotonic guard. It is advanced only for a fully acceptable
@@ -550,7 +573,17 @@ func (c *Collector) trafficObservation(rc agent.ReportContext) *trafficObservati
 		}
 		observation.Inbounds = append(observation.Inbounds, entry)
 	}
-	stale := export.MonitorStale || age > monitorFreshMaxAgeSeconds
+	freshMaxAge := monitorFreshMinAgeSeconds
+	if rc.Config.Cadence > 0 {
+		freshMaxAge = int64(2 * rc.Config.Cadence)
+		if freshMaxAge < monitorFreshMinAgeSeconds {
+			freshMaxAge = monitorFreshMinAgeSeconds
+		}
+		if freshMaxAge > monitorFreshMaxAgeSeconds {
+			freshMaxAge = monitorFreshMaxAgeSeconds
+		}
+	}
+	stale := export.MonitorStale || age > freshMaxAge
 	switch {
 	case stale && observed > 0:
 		observation.Freshness = "stale"

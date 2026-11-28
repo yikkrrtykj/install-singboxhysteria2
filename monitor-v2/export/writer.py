@@ -123,6 +123,23 @@ class TrafficExportWriter:
                 raise TrafficExportConfigError(
                     "cannot remove the stale traffic export file before "
                     "serving (fail closed)") from None
+        # Remove bounded temp garbage from an interrupted atomic replace. Only
+        # files with the writer's fixed temp prefix in the export directory are
+        # touched; any failure to clean the directory is still fail-closed.
+        directory = os.path.dirname(self.path) or "."
+        try:
+            entries = os.listdir(directory)
+        except OSError:
+            raise TrafficExportConfigError(
+                "cannot inspect the traffic export directory before serving") from None
+        for name in entries:
+            if name.startswith(".traffic-export-") and name.endswith(".tmp"):
+                try:
+                    os.unlink(os.path.join(directory, name))
+                except OSError:
+                    raise TrafficExportConfigError(
+                        "cannot remove stale traffic export temp files before "
+                        "serving (fail closed)") from None
         self.prepared = True
         return self
 

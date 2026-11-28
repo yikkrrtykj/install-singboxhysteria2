@@ -303,8 +303,8 @@ func (t *Tx) insertTrafficObservationTx(ctx context.Context, rec SnapshotRecord,
 				availability=CASE WHEN excluded.observed_at >= traffic_observation_buckets.observed_at THEN excluded.availability ELSE traffic_observation_buckets.availability END,
 				freshness=CASE WHEN excluded.observed_at >= traffic_observation_buckets.observed_at THEN excluded.freshness ELSE traffic_observation_buckets.freshness END,
 				quality=CASE WHEN excluded.observed_at >= traffic_observation_buckets.observed_at THEN excluded.quality ELSE traffic_observation_buckets.quality END,
-				uplink_observed_lower_bound_bytes=MAX(COALESCE(traffic_observation_buckets.uplink_observed_lower_bound_bytes,0),COALESCE(excluded.uplink_observed_lower_bound_bytes,0)),
-				downlink_observed_lower_bound_bytes=MAX(COALESCE(traffic_observation_buckets.downlink_observed_lower_bound_bytes,0),COALESCE(excluded.downlink_observed_lower_bound_bytes,0)),
+				uplink_observed_lower_bound_bytes=CASE WHEN traffic_observation_buckets.uplink_observed_lower_bound_bytes IS NULL AND excluded.uplink_observed_lower_bound_bytes IS NULL THEN NULL ELSE MAX(COALESCE(traffic_observation_buckets.uplink_observed_lower_bound_bytes,0),COALESCE(excluded.uplink_observed_lower_bound_bytes,0)) END,
+				downlink_observed_lower_bound_bytes=CASE WHEN traffic_observation_buckets.downlink_observed_lower_bound_bytes IS NULL AND excluded.downlink_observed_lower_bound_bytes IS NULL THEN NULL ELSE MAX(COALESCE(traffic_observation_buckets.downlink_observed_lower_bound_bytes,0),COALESCE(excluded.downlink_observed_lower_bound_bytes,0)) END,
 				uplink_observed_rate_bps=CASE WHEN excluded.observed_at >= traffic_observation_buckets.observed_at THEN excluded.uplink_observed_rate_bps ELSE traffic_observation_buckets.uplink_observed_rate_bps END,
 				downlink_observed_rate_bps=CASE WHEN excluded.observed_at >= traffic_observation_buckets.observed_at THEN excluded.downlink_observed_rate_bps ELSE traffic_observation_buckets.downlink_observed_rate_bps END,
 				active_connections=CASE WHEN excluded.observed_at >= traffic_observation_buckets.observed_at THEN excluded.active_connections ELSE traffic_observation_buckets.active_connections END,
@@ -582,7 +582,7 @@ func (s *Store) QueryLatestTraffic(ctx context.Context, scope TrafficEventScope,
 	}
 	scopeClause, scopeArgs := scope.clause("o.event_id")
 	filterClause, filterArgs := trafficFilterSQL(query, "o")
-	where := "WHERE 1=1"
+	where := "WHERE NOT EXISTS (SELECT 1 FROM traffic_observation_reports st WHERE st.node_id=o.node_id AND st.availability='unavailable')"
 	args := make([]any, 0, len(scopeArgs)+len(filterArgs)+1)
 	if scopeClause != "" {
 		where += " AND " + scopeClause

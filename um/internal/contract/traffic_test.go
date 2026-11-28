@@ -154,3 +154,25 @@ func TestValidateTrafficObservationRejectsIncoherence(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateTrafficObservationFreshnessUsesEffectiveCadence(t *testing.T) {
+	collectedAt := int64(1_700_000_000)
+	observation := baseTrafficObservation(collectedAt)
+	observation["observed_at"] = collectedAt - 300
+	observation["age_seconds"] = int64(300)
+	inbound := observation["inbounds"].([]any)[0].(map[string]any)
+	inbound["observed_at"] = collectedAt - 300
+	raw, err := json.Marshal(observation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ValidateTrafficObservation(collectedAt, raw); err == nil {
+		t.Fatal("default (15 s) validator accepted age 300")
+	}
+	if _, err := ValidateTrafficObservationWithCadence(collectedAt, raw, 30); err == nil {
+		t.Fatal("cadence 30 (120 s bound) accepted age 300")
+	}
+	if _, err := ValidateTrafficObservationWithCadence(collectedAt, raw, 300); err != nil {
+		t.Fatalf("cadence 300 (600 s bound) rejected age 300: %v", err)
+	}
+}

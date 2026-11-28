@@ -1076,7 +1076,13 @@ class Lab:
         return ["--state-dir", self.agent_state_dir,
                 "--center", self.agent_center_url,
                 "--node-class", "linux_vps",
-                lab.AGENT_MONITOR_EXPORT_FLAG, self.export_path]
+                lab.AGENT_MONITOR_EXPORT_FLAG, self.export_path,
+                # The real agent enforces the frozen owner/group/mode checks.
+                # The lab's monitor and agent run as the same non-root runner
+                # user; the export writer creates the file 0640.
+                "--monitor-export-owner-uid", str(os.getuid()),
+                "--monitor-export-group-gid", str(os.getgid()),
+                "--monitor-export-mode", "0640"]
 
     def run_agent_once(self, stage_note: str,
                        timeout: float = 180.0) -> dict:

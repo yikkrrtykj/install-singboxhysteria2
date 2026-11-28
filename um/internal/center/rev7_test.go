@@ -1,6 +1,7 @@
 package center_test
 
 import (
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"os"
@@ -459,6 +460,23 @@ func TestRev7SnapshotAcceptedStoredAndDeduped(t *testing.T) {
 	version, err := tc.store.GetLastAgentVersion(contextBackground(), linux.nodeID)
 	if err != nil || version != "1.1.0" {
 		t.Fatalf("recorded agent version = %q err=%v", version, err)
+	}
+	// The full signed rev-7 body is verified but must not be retained for 30
+	// days: snapshots.payload_json stores the bounded base projection only.
+	rawDB, err := sql.Open("sqlite", tc.dbPath)
+	if err != nil {
+		t.Fatalf("open raw db: %v", err)
+	}
+	defer rawDB.Close()
+	var storedPayload string
+	if err := rawDB.QueryRow(`SELECT payload_json FROM snapshots WHERE node_id=? ORDER BY collected_at DESC LIMIT 1`, linux.nodeID).Scan(&storedPayload); err != nil {
+		t.Fatalf("read stored snapshot payload: %v", err)
+	}
+	if strings.Contains(storedPayload, "traffic_observation") {
+		t.Fatalf("retained snapshot payload still contains the full traffic_observation: %.200s", storedPayload)
+	}
+	if !strings.Contains(storedPayload, `"type":"snapshot"`) || !strings.Contains(storedPayload, `"agent"`) {
+		t.Fatalf("base projection lost required snapshot fields: %.300s", storedPayload)
 	}
 }
 

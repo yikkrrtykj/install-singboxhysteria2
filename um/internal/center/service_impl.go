@@ -421,7 +421,7 @@ func (s *ServiceImpl) Report(ctx context.Context, req ReportRequest) (ReportResu
 				// The rev-7 traffic observation is normalized once, inside the
 				// authenticated transaction that decided the effective config, and
 				// stored in the same snapshot ingest transaction below.
-				rec, terr := normalizeTrafficObservation(env.CollectedAt, req.Body, now)
+				rec, terr := normalizeTrafficObservation(env.CollectedAt, req.Body, now, c.CadenceSeconds)
 				if terr != nil {
 					validationRejected = true
 					return mapServiceError(terr)
@@ -465,10 +465,25 @@ func (s *ServiceImpl) Report(ctx context.Context, req ReportRequest) (ReportResu
 			}
 			switch env.Type {
 			case "snapshot":
+				// The signed rev-7 body is verified above, but it MUST NOT be
+				// retained for 30 days: the frozen capacity contract forbids a
+				// second raw copy of traffic_observation. The snapshot body is
+				// stored as the bounded base projection (the rev-5 content); the
+				// normalized allow-listed traffic tables are the only observation
+				// representation. The original body hash remains the signed
+				// identity, so dedupe/audit semantics are unchanged.
+				storagePayload := req.Body
+				if trafficRecord != nil {
+					var projectionErr error
+					storagePayload, projectionErr = projectSnapshotStorageBody(req.Body)
+					if projectionErr != nil {
+						return "", mapServiceError(projectionErr)
+					}
+				}
 				d, err := tx.StoreSnapshotTx(ctx, store.SnapshotRecord{
 					NodeID: node.NodeID, EventID: node.EventID, NodeClass: node.NodeClass,
 					ReportID: env.ReportID, CollectedAt: env.CollectedAt, ReceivedAt: now,
-					BodySHA256: bodyHash, Payload: req.Body, TrafficObservation: trafficRecord,
+					BodySHA256: bodyHash, Payload: storagePayload, TrafficObservation: trafficRecord,
 					AgentVersion: env.Agent.Version,
 				})
 				if err != nil {
@@ -791,11 +806,32 @@ func (s *ServiceImpl) Config(ctx context.Context, req ConfigRequest) (ConfigResu
 	return ConfigResult{Body: responseBody, ConfigVersion: configVersion, ServerTime: now}, nil
 }
 
+// projectSnapshotStorageBody removes only the top-level rev-7
+// traffic_observation object from an already validated signed snapshot before
+// it is persisted. All other report fields and the signed body hash are
+// untouched. The raw observation remains available only through the bounded
+// normalized tables; it is never written to snapshots.payload_json.
+func projectSnapshotStorageBody(body []byte) ([]byte, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
+		return nil, apiErr(400, "invalid_request", false)
+	}
+	if _, ok := fields["traffic_observation"]; !ok {
+		return body, nil
+	}
+	delete(fields, "traffic_observation")
+	projected, err := json.Marshal(fields)
+	if err != nil {
+		return nil, apiErr(400, "invalid_request", false)
+	}
+	return projected, nil
+}
+
 // normalizeTrafficObservation extracts the optional rev-7 traffic observation
 // from an already contract-validated snapshot body into the normalized storage
 // projection. It stores only allowlisted fields, never the raw export JSON. A
 // rev-5 body has no observation and normalizes to nil.
-func normalizeTrafficObservation(collectedAt int64, body []byte, receivedAt int64) (*store.TrafficObservationRecord, error) {
+func normalizeTrafficObservation(collectedAt int64, body []byte, receivedAt int64, cadenceSeconds int) (*store.TrafficObservationRecord, error) {
 	var doc struct {
 		TrafficObservation json.RawMessage `json:"traffic_observation"`
 	}
@@ -809,7 +845,7 @@ func normalizeTrafficObservation(collectedAt int64, body []byte, receivedAt int6
 	if len(doc.TrafficObservation) == 0 || bytes.Equal(bytes.TrimSpace(doc.TrafficObservation), []byte("null")) {
 		return nil, nil
 	}
-	observation, err := contract.ValidateTrafficObservation(collectedAt, doc.TrafficObservation)
+	observation, err := contract.ValidateTrafficObservationWithCadence(collectedAt, doc.TrafficObservation, cadenceSeconds)
 	if err != nil {
 		return nil, err
 	}
@@ -821,7 +857,7 @@ func normalizeTrafficObservation(collectedAt int64, body []byte, receivedAt int6
 		ActiveConnections: cloneInt64Pointer(observation.ActiveConnections),
 		RateWindowSeconds: cloneFloat64Pointer(observation.RateWindowSeconds),
 		CounterScope:      observation.CounterScope, Exactness: observation.Exactness,
-		BytesEstimate: int64(len(doc.TrafficObservation)) + int64(len(observation.Inbounds))*128,
+		BytesEstimate: int64(len(observation.Inbounds)) * 128,
 		Inbounds:      make([]store.TrafficInboundRecord, 0, len(observation.Inbounds)),
 	}
 	for _, inbound := range observation.Inbounds {

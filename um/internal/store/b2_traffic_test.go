@@ -506,6 +506,42 @@ func TestTrafficObservationStateExposesUnavailableSentinel(t *testing.T) {
 	}
 }
 
+func TestTrafficSentinelSupersedesPreviousLatestValues(t *testing.T) {
+	s := openTestStore(t, tempStorePath(t))
+	ctx := testContext()
+	now := int64(1_901_500_000)
+	id := testEnroll(t, s, NodeClassLinuxVPS, now)
+	if disp := storeTrafficSnapshot(t, s, id, "value-before-sentinel", now-10,
+		testTrafficObservation(now-10, 1, "ab")); disp != DispositionAccepted {
+		t.Fatalf("value disposition = %q", disp)
+	}
+	// A newer authenticated sentinel/status-only report must make the previous
+	// lower-bound value unavailable, never keep rendering it as current.
+	sentinel := &TrafficObservationRecord{
+		Source: "monitor_readonly_export", SourceEpoch: "00000000000000000000000000000000",
+		Sequence: 0, ObservedAt: 0, CollectedAt: now, ReceivedAt: now,
+		Availability: "unavailable", Freshness: "unavailable",
+		CounterScope: "observation_epoch", Exactness: "lower_bound", BytesEstimate: 100,
+	}
+	if disp := storeTrafficSnapshot(t, s, id, "sentinel-after-value", now, sentinel); disp != DispositionAccepted {
+		t.Fatalf("sentinel disposition = %q", disp)
+	}
+	points, err := s.QueryLatestTraffic(ctx, TrafficEventScope{AllEvents: true}, TrafficQuery{Limit: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(points) != 0 {
+		t.Fatalf("newest unavailable sentinel must suppress previous value rows: %+v", points)
+	}
+	states, err := s.QueryLatestTrafficStates(ctx, TrafficEventScope{AllEvents: true}, TrafficQuery{Limit: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(states) != 1 || states[0].Availability != "unavailable" || states[0].NodeID != id.NodeID {
+		t.Fatalf("latest state = %+v", states)
+	}
+}
+
 func TestTrafficHistoryFallsBackToBoundedBucketsAfterRawRingPrune(t *testing.T) {
 	s := openTestStore(t, filepath.Join(t.TempDir(), "private", "bucket.db"))
 	ctx := context.Background()

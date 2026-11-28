@@ -20,6 +20,13 @@ func platformCollector(c commonFlags) (agent.Collector, error) {
 		return nil, err
 	}
 	col.MonitorExportFile = c.monitorExportFile
+	mode, err := c.monitorExportMode()
+	if err != nil {
+		return nil, err
+	}
+	col.MonitorExportOwnerUID = c.monitorExportOwnerUID
+	col.MonitorExportGroupGID = c.monitorExportGroupGID
+	col.MonitorExportMode = mode
 	// The systemd probe is read-only and non-root. If the system bus is
 	// unavailable, keep the honest unavailable default rather than failing the
 	// whole agent; services are source-gated by center config.

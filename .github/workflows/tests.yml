@@ -329,6 +329,9 @@ jobs:
       - name: "Server incident facts (collector, actual SQLite, restart/reset/gap, ownership, retained window and HTTP auth)"
         run: python3 tests/test-monitor-v2-host-evidence.py
 
+      - name: "UM-LT restricted traffic export suite (closed shape / atomic mode / stale / symlink / concurrency / privacy allowlist)"
+        run: python3 tests/test-monitor-v2-traffic-export.py
+
       - name: "0.7.0 PR-6A dark office remote-probe agent suite (explicit roles / closed active outcomes + delay-0 failure / bounded budgets and no overlap / GET-only Mihomo reuse byte-identical to E4 / canonical body + HMAC vector / run-seq-clock rollback / durable spool bounds + refusals / total response disposition / secret leak wall, issue #67 P6A)"
         run: bash tests/test-monitor-v2-remote-probe.sh
 

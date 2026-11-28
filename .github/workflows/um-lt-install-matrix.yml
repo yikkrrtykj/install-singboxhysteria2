@@ -45,7 +45,8 @@ jobs:
           export DEBIAN_FRONTEND=noninteractive
           apt-get update
           apt-get install -y --no-install-recommends \
-            bash ca-certificates coreutils findutils git grep python3 sed tar
+            bash ca-certificates coreutils findutils git grep jq python3 sed tar \
+            iproute2 procps systemd
       - name: Check out exact commit
         uses: actions/checkout@v4
         with:

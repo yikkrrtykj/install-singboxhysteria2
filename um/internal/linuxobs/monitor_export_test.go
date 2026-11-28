@@ -102,7 +102,7 @@ func TestMonitorExportValidFreshObservation(t *testing.T) {
 func TestMonitorExportStaleAndMonitorStale(t *testing.T) {
 	t.Run("old observed_at is stale", func(t *testing.T) {
 		col, _, _, _ := newFakeCollector(t)
-		export := validMonitorExport(testCollectedAt-40, 3, "bb")
+		export := validMonitorExport(testCollectedAt-200, 3, "bb")
 		col.MonitorExportFile = writeMonitorExport(t, export)
 		raw, err := col.Snapshot(context.Background(), reportContext([]string{sourceMonitorExport}, testExpectedTags()))
 		if err != nil {
@@ -112,8 +112,8 @@ func TestMonitorExportStaleAndMonitorStale(t *testing.T) {
 		if obs.Freshness != "stale" || obs.Availability != "partial" {
 			t.Fatalf("stale export rendered as %s/%s", obs.Freshness, obs.Availability)
 		}
-		if obs.AgeSeconds != 40 {
-			t.Fatalf("age_seconds = %d, want 40", obs.AgeSeconds)
+		if obs.AgeSeconds != 200 {
+			t.Fatalf("age_seconds = %d, want 200", obs.AgeSeconds)
 		}
 		// Lower-bound counters remain honest observed data, just not fresh.
 		if obs.Inbounds[0].Quality != "lower_bound" || obs.Inbounds[0].UplinkObservedLowerBoundBytes == nil {
@@ -150,20 +150,6 @@ func TestMonitorExportInvalidInputsDegradeToUnavailable(t *testing.T) {
 		}},
 		{name: "unknown member privacy field", mutate: func(_ *testing.T, export map[string]any) {
 			export["user_id"] = "alice"
-		}},
-		{name: "unknown inbound tag", mutate: func(_ *testing.T, export map[string]any) {
-			inbounds := export["inbounds"].([]map[string]any)
-			inbounds = append(inbounds, map[string]any{
-				"inbound_tag": "unexpected-in", "kind": "reality",
-				"observed_uplink_bytes": int64(1), "observed_downlink_bytes": int64(1),
-				"uplink_observed_rate_bps": nil, "downlink_observed_rate_bps": nil,
-				"active_connections": int64(0), "observed_at": testCollectedAt - 2, "quality": "lower_bound",
-			})
-			export["inbounds"] = inbounds
-		}},
-		{name: "kind mismatch", mutate: func(_ *testing.T, export map[string]any) {
-			inbounds := export["inbounds"].([]map[string]any)
-			inbounds[0]["kind"] = "other"
 		}},
 		{name: "duplicate tag", mutate: func(_ *testing.T, export map[string]any) {
 			inbounds := export["inbounds"].([]map[string]any)
@@ -301,6 +287,60 @@ func TestMonitorExportFileGuards(t *testing.T) {
 	})
 }
 
+func TestMonitorExportOwnerGroupModeChecks(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX owner/group/mode checks are not enforced on this host")
+	}
+	col, _, _, _ := newFakeCollector(t)
+	col.MonitorExportFile = writeMonitorExport(t, validMonitorExport(testCollectedAt, 3, "ee"))
+	col.MonitorExportOwnerUID = os.Getuid() + 1
+	assertUnavailableObservation(t, col)
+
+	col, _, _, _ = newFakeCollector(t)
+	col.MonitorExportFile = writeMonitorExport(t, validMonitorExport(testCollectedAt, 3, "ef"))
+	col.MonitorExportGroupGID = os.Getgid() + 1
+	assertUnavailableObservation(t, col)
+
+	col, _, _, _ = newFakeCollector(t)
+	col.MonitorExportFile = writeMonitorExport(t, validMonitorExport(testCollectedAt, 3, "eg"))
+	col.MonitorExportMode = 0o600
+	assertUnavailableObservation(t, col)
+
+	col, _, _, _ = newFakeCollector(t)
+	path := writeMonitorExport(t, validMonitorExport(testCollectedAt, 3, "eh"))
+	col.MonitorExportFile = path
+	col.MonitorExportOwnerUID = os.Getuid()
+	col.MonitorExportGroupGID = os.Getgid()
+	col.MonitorExportMode = uint32(0o640)
+	if info, err := os.Stat(path); err == nil {
+		_ = os.Chmod(path, 0o640)
+		_ = info
+	}
+	if obs := snapshotTraffic(t, col); obs.Freshness != "fresh" {
+		t.Fatalf("matching owner/group/mode rejected: %s", obs.Freshness)
+	}
+}
+
+func TestMonitorExportDropsUnauthorizedEntriesButForwardsAuthorizedSubset(t *testing.T) {
+	col, _, _, _ := newFakeCollector(t)
+	export := validMonitorExport(testCollectedAt, 4, "de")
+	inbounds := export["inbounds"].([]map[string]any)
+	if len(inbounds) < 2 {
+		t.Fatalf("fixture has %d inbounds, need >=2", len(inbounds))
+	}
+	inbounds[0]["inbound_tag"] = "unknown-in"
+	col.MonitorExportFile = writeMonitorExport(t, export)
+	obs := snapshotTraffic(t, col)
+	if obs.Freshness != "fresh" || obs.Availability != "partial" {
+		t.Fatalf("authorized-subset export rendered as %s/%s", obs.Freshness, obs.Availability)
+	}
+	for _, entry := range obs.Inbounds {
+		if entry.InboundTag == "unknown-in" {
+			t.Fatal("unauthorized tag leaked into the report")
+		}
+	}
+}
+
 func TestMonitorExportSequenceAndEpochGuard(t *testing.T) {
 	t.Run("replay of the same sequence is not fresh", func(t *testing.T) {
 		col, _, _, _ := newFakeCollector(t)
@@ -330,7 +370,7 @@ func TestMonitorExportSequenceAndEpochGuard(t *testing.T) {
 	})
 	t.Run("source epoch change is accepted", func(t *testing.T) {
 		col, _, _, _ := newFakeCollector(t)
-		col.MonitorExportFile = writeMonitorExport(t, validMonitorExport(testCollectedAt-20, 9, "ad"))
+		col.MonitorExportFile = writeMonitorExport(t, validMonitorExport(testCollectedAt-200, 9, "ad"))
 		if obs := snapshotTraffic(t, col); obs.Freshness != "stale" {
 			t.Fatalf("first export freshness = %s", obs.Freshness)
 		}
@@ -346,10 +386,10 @@ func TestMonitorExportSequenceAndEpochGuard(t *testing.T) {
 	t.Run("invalid export does not poison the sequence guard", func(t *testing.T) {
 		col, _, _, _ := newFakeCollector(t)
 		bad := validMonitorExport(testCollectedAt, 5, "b1")
-		bad["inbounds"].([]map[string]any)[0]["inbound_tag"] = "unknown-in"
+		bad["inbounds"].([]map[string]any)[0]["quality"] = "bogus"
 		col.MonitorExportFile = writeMonitorExport(t, bad)
 		if obs := snapshotTraffic(t, col); obs.Freshness != "unavailable" {
-			t.Fatalf("unknown-tag export rendered as %s", obs.Freshness)
+			t.Fatalf("malformed export rendered as %s", obs.Freshness)
 		}
 		// The corrected file keeps the same sequence: the rejected publication
 		// must not have advanced the in-memory guard.
