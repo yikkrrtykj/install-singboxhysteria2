@@ -10,35 +10,36 @@ post-merge verification are recorded in PR #134 and Issue #127, not claimed here
 - Base `origin/main`: `6d9e12fd7ad4d0866ea507209fcbe52931c4a70a`
   (tree `3cbd4bee73b49c5c047021390886c3e261bea42f`; B1/B2/B3/B4 merged).
 - Branch: `codex/um-c-auth-security`; Draft PR #134 (Refs #127).
-- Final code verification target: `f144a5a9492a8f8342cdd846e0b0069c13562f11`
-  (tree `58945473c090ac2ae790b649e07bd78328c14368`).
+- Final code verification target: `61df67f06631ff2886fc81e938dd8ce5f2db3c6f`
+  (tree `7605bf3f16f11e02a0db574eba46cfde9698b28c`).
 - Earlier implementation commits: `f04c9135`, `387e11b8`, `d83b1942`,
   `395583e1`, `051952be`, `07633572`, `45b90a46`, `d46a73fe`, `5f95d096`,
-  `6e3c7975`.
+  `6e3c7975`, `f144a5a9`, `61df67f0`.
 - This evidence document is committed in a docs/workflow-only commit after
-  `f144a5a9`; it changes no production code. Exact run IDs for that final
+  `61df67f0`; it changes no production code. Exact run IDs for that final
   evidence commit are archived in the PR/Issue comments.
 - UM-C uses the existing Go module/center/SQLite/management engine; no second
   database or RBAC engine.
 
-## Final code target CI (exact `f144a5a9`)
+## Final code target CI (exact `61df67f0`)
 
-- `Unified Monitor Go` run `46146632787` (push) and `46146627757` (PR):
+- `Unified Monitor Go` run `46148046992` (push) and `46148042788` (PR):
   **success**; Linux/Windows native, race, vet/build/tests all green.
-- `UM-C Web and Browser Lab` run `46146632820` (push) and `46146627815` (PR):
+- `UM-C Web and Browser Lab` run `46148046962` (push) and `46148042815` (PR):
   **success**, including frontend typecheck/Vitest/build, `um-c-e2e` harness
   tests, and the real Chromium 9-test lab (artifact
   `um-c-browser-evidence`).
-- `UM-B3 isolated service labs` run `46146627762`: **success**. Jobs:
+- `UM-B3 isolated service labs` run `46148042877`: **success**. Jobs:
   `linux-systemd-environment`, `windows-service-environment`,
   `linux-systemd-agent-lab`, `windows-service-r1-lab`, `b4-management-e2e`,
   `linux-singbox-serviceapi-lab` all success.
-- `quality-receiver` run `46146632759`: Linux contract/systemd jobs success at
-  the time of writing; the unrelated Windows quality-exe environment job was
-  still running/was rerun on the docs-only HEAD; no UM-C code is exercised by it.
-- `shell-tests` `46146632777`, `p6b2-foundations` `46146632791`,
-  `monitor-packaging` `46146632821`, `HY2 BBR defaults` `46146632880`:
-  **success** on `f144a5a9`.
+- `quality-receiver` run `46148047010`: Linux contract/systemd jobs success;
+  the unrelated Windows quality-exe environment job was still running at the
+  time of writing and is rerun on the docs-only final HEAD; no UM-C code is
+  exercised by it.
+- `shell-tests` `46148046965`, `p6b2-foundations` `46148046970`,
+  `monitor-packaging` `46148047022`, `HY2 BBR defaults` `46148046975`:
+  **success** on `61df67f0`.
 - Any later docs-only evidence commit is verified by the same full CI matrix on
   that exact HEAD; run IDs are archived in PR #134/Issue #127. No code diff is
   introduced by it.
@@ -153,7 +154,9 @@ Observed:
   mapping, conservative fileguard/private-dir lab layout, session caps/idempotence
   fixes, strict sentinel/bootstrap ordering, limiter/oldest eviction, DACL object
   ACE fail-closed, docs/remediation, and B3 lab ACL fix. A fresh independent
-  review of the final head is recorded in PR #134 before merge.
+  review of `f144a5a9`/`8d4f39df` returned **CLEAN (Draft)** with no P0/P1/P2;
+  the final `61df67f0` changes only close two P3 boundary/bootstrap edges and add
+  tests, and final review is archived in PR #134 before merge.
 - Codex Review is unavailable in this environment. As permitted by the Owner
   instruction, the substitute is a complete independent read-only review of the
   actual final commit; no Codex zero-finding claim is made.
