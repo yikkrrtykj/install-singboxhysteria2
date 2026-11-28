@@ -11,7 +11,8 @@ approved the runtime change set for Draft PR status.
 
 - `um/internal/management/` — service layer, local auth, RBAC, strict admin
   handler, CLI HTTP client, typed models, OpenAPI route inventory.
-- `um/internal/store/b4.go`, `b4_audit.go`, migration v9 — management reads,
+- `um/internal/store/b4.go`, `b4_audit.go`, `b4_purge_auth.go`, migrations
+  v9/v10 — management reads,
   event/node/token/alias/audit/mapping/purge/retention store additions; B2/B3
   engines reused.
 - `um/internal/center` — optional admin API mounted on the isolated admin
@@ -93,10 +94,39 @@ Exact-HEAD evidence:
   OpenAPI/CLI/tests; final independent review found no P0/P1 and approved it
   for Draft PR status.
 
+## 3.1 Final security closure (purge receipt + audit retention)
+
+Red-first evidence: the new management tests initially failed because
+`purge/preview` returned no server receipt and `RunRetentionB2PolicyB` never
+deleted `admin_audit` rows. After the minimal fixes:
+
+- Purge preview now returns a 5-minute single-use `preview_id` /
+  `preview_expires_at`; `purge/confirm` requires it for a first start. The
+  receipt is bound to authenticated actor, event, `event_purge`, and the preview
+  lifecycle fingerprint (state/archive/purge/data/catalog update time), and is
+  consumed in the same transaction that persists the durable purge operation.
+- Real HTTP tests cover missing/wrong event/wrong actor receipts, viewer and
+  event_admin rejection, expiry, preview-to-archived state change, concurrent
+  replay, completed-idempotence after expiry, and safe resume of an
+  already-persisted operation after an injected crash and receipt expiry.
+- Store-level `TestB4PurgeConfirmed50kResume` exercises the challenge-aware path
+  through the existing B2 engine: 50,005 rows, a batch-boundary interruption,
+  restart/resume without a live receipt, exactly one purge operation, exact
+  `deleted_rows=50005`, one security-ledger entry, and no remaining receipts.
+- `admin_audit` is now included in the bounded policy-B sweep at the frozen
+  `SecurityRetentionSeconds` (180d): strict `at < cutoff`, ≤50,000 rows per
+  transaction, age-only deletion, interrupted/repeat runs idempotent,
+  archived/purged event audit preserved while unexpired, and security ledger
+  unaffected. Capacity output exposes `admin_audit` row count.
+- v10 adds only the `purge_confirmations` table/indexes; the durable purge
+  operation, graveyard, tombstone, ledger and B2 recovery semantics are
+  unchanged.
+
 ## 4. Migration/privacy/security notes
 
 - v9 is additive (event display names, token revoked_at, admin_audit, aliases,
-  indexes); v1–v8 untouched; one transaction per migration.
+  indexes); v10 adds only purge confirmation receipts; v1–v8 untouched; one
+  transaction per migration.
 - Admin auth file and CLI token file are protected files; raw tokens never in
   SQLite/logs/audit/API list.
 - Mutations append audit rows inside their transaction; denied attempts are

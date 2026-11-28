@@ -29,7 +29,7 @@ commands:
   event rename EVENT_ID --name NAME
   event archive EVENT_ID
   event purge preview EVENT_ID
-  event purge confirm EVENT_ID --confirm purge:EVENT_ID
+  event purge confirm EVENT_ID --preview-id PREVIEW_ID --confirm purge:EVENT_ID
   event purge status EVENT_ID
   node list EVENT_ID [--class linux_vps|windows_terminal] [--state active|revoked]
   node show EVENT_ID NODE_ID
@@ -256,6 +256,7 @@ func runAdminPurge(ctx context.Context, c *management.Client, args []string, out
 	case "confirm":
 		fs, _ := subFlags("event purge confirm", args[2:])
 		confirm := fs.String("confirm", "", "must be purge:EVENT_ID")
+		previewID := fs.String("preview-id", "", "short-lived preview_id returned by event purge preview")
 		if err := fs.Parse(args[2:]); err != nil {
 			return err
 		}
@@ -263,7 +264,7 @@ func runAdminPurge(ctx context.Context, c *management.Client, args []string, out
 			return errors.New("confirmation must be exactly purge:<event_id>")
 		}
 		return c.Call(ctx, "POST", "/api/v1/events/"+url.PathEscape(id)+"/purge/confirm", nil,
-			map[string]any{"confirmation": *confirm}, out)
+			map[string]any{"confirmation": *confirm, "preview_id": *previewID}, out)
 	default:
 		return errors.New("unknown purge command")
 	}

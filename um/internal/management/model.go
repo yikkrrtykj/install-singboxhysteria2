@@ -144,6 +144,11 @@ type PurgePreviewView struct {
 	Incomplete    bool             `json:"incomplete"`
 	Irreversible  bool             `json:"irreversible"`
 	ConfirmPhrase string           `json:"confirm_phrase"`
+	// PreviewID is the short-lived server receipt required for a first purge
+	// start. It is bound to the authenticated actor, event, action and preview
+	// lifecycle state; the static phrase alone is not sufficient.
+	PreviewID        string `json:"preview_id"`
+	PreviewExpiresAt int64  `json:"preview_expires_at"`
 }
 
 type PurgeStatusView struct {

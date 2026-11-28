@@ -31,19 +31,19 @@ func TestTwoEventPurgeIsolationAndIdempotence(t *testing.T) {
 	if err := platform.Call(context.Background(), http.MethodGet, "/api/v1/events/"+eventB+"/purge/preview", nil, nil, &preview); err != nil {
 		t.Fatal(err)
 	}
-	if preview.ConfirmPhrase != "purge:"+eventB || preview.TotalRows == 0 {
+	if preview.ConfirmPhrase != "purge:"+eventB || preview.TotalRows == 0 || preview.PreviewID == "" || preview.PreviewExpiresAt == 0 {
 		t.Fatalf("preview=%+v", preview)
 	}
-	// Wrong/stale confirmation is rejected and does not purge.
+	// Wrong confirmation is rejected and does not purge.
 	var apiErr *management.APIError
 	err := platform.Call(context.Background(), http.MethodPost, "/api/v1/events/"+eventB+"/purge/confirm", nil,
-		map[string]any{"confirmation": "purge:" + eventA}, nil)
+		map[string]any{"confirmation": "purge:" + eventA, "preview_id": preview.PreviewID}, nil)
 	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusBadRequest {
 		t.Fatalf("wrong confirmation err=%v", err)
 	}
 	var status management.PurgeStatusView
 	if err := platform.Call(context.Background(), http.MethodPost, "/api/v1/events/"+eventB+"/purge/confirm", nil,
-		map[string]any{"confirmation": "purge:" + eventB}, &status); err != nil {
+		map[string]any{"confirmation": "purge:" + eventB, "preview_id": preview.PreviewID}, &status); err != nil {
 		t.Fatal(err)
 	}
 	if !status.Graveyard {
@@ -51,7 +51,7 @@ func TestTwoEventPurgeIsolationAndIdempotence(t *testing.T) {
 	}
 	// Repeated request is idempotent and still safe.
 	if err := platform.Call(context.Background(), http.MethodPost, "/api/v1/events/"+eventB+"/purge/confirm", nil,
-		map[string]any{"confirmation": "purge:" + eventB}, &status); err != nil {
+		map[string]any{"confirmation": "purge:" + eventB, "preview_id": preview.PreviewID}, &status); err != nil {
 		t.Fatalf("idempotent purge: %v", err)
 	}
 	// Event B cannot be recreated, token-created, or listed.

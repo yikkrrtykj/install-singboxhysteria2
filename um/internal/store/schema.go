@@ -36,7 +36,7 @@ import (
 // SchemaVersion is the highest migration version this build knows. Open always
 // migrates a database to exactly this version; a database with a newer version
 // is rejected fail-closed instead of being silently used by older code.
-const SchemaVersion = 9
+const SchemaVersion = 10
 
 // Node classes accepted by the rev-5 platform isolation contract.
 const (
@@ -591,6 +591,30 @@ var migrations = []migration{
 		`CREATE INDEX IF NOT EXISTS idx_nodes_event_class_state ON nodes(event_id, node_class, state)`,
 		`CREATE INDEX IF NOT EXISTS idx_nodes_event_last_seen ON nodes(event_id, last_seen_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_enroll_tokens_event_expiry ON enroll_tokens(event_id, expires_at)`,
+	}},
+	{version: 10, statements: []string{
+		// UM-B4 final-closure purge confirmation binding. A first permanent
+		// deletion requires a short-lived, single-use server receipt bound to the
+		// authenticated actor, event, action and preview lifecycle state. This is
+		// authorization metadata only; the durable B2 purge engine remains the
+		// single executor and survives independent of receipt expiry.
+		`CREATE TABLE IF NOT EXISTS purge_confirmations (
+			confirmation_id TEXT PRIMARY KEY,
+			event_id        TEXT NOT NULL,
+			actor           TEXT NOT NULL,
+			action          TEXT NOT NULL CHECK (action = 'event_purge'),
+			state_fingerprint TEXT NOT NULL,
+			issued_at       INTEGER NOT NULL CHECK (typeof(issued_at) = 'integer'),
+			expires_at      INTEGER NOT NULL CHECK (typeof(expires_at) = 'integer'),
+			consumed_at     INTEGER,
+			consumed_by_op_id TEXT,
+			CHECK (expires_at > issued_at),
+			CHECK ((consumed_at IS NULL) = (consumed_by_op_id IS NULL))
+		) STRICT`,
+		`CREATE INDEX IF NOT EXISTS idx_purge_confirmations_lookup
+			ON purge_confirmations(event_id, actor, expires_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_purge_confirmations_expiry
+			ON purge_confirmations(expires_at)`,
 	}},
 }
 

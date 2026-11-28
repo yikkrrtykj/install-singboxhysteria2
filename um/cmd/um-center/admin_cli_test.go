@@ -136,6 +136,52 @@ func TestAdminCLIUsesManagementAPI(t *testing.T) {
 	if err := client.Call(context.Background(), "GET", "/api/v1/events/"+eventID, nil, nil, &ev); err != nil || ev.DisplayName != "CLI renamed" {
 		t.Fatalf("CLI rename readback display=%q err=%v", ev.DisplayName, err)
 	}
+	// CLI purge preview/confirm uses the same bound preview receipt.
+	if rc := runAdminCLI([]string{"--url", "http://" + srv.AdminAddr(),
+		"--token-file", tokenPath, "--json", "event", "archive", eventID}); rc != 0 {
+		t.Fatalf("CLI archive exit=%d", rc)
+	}
+	capture := func(args []string) (int, []byte) {
+		old := os.Stdout
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		os.Stdout = w
+		rc := runAdminCLI(args)
+		_ = w.Close()
+		os.Stdout = old
+		raw, _ := io.ReadAll(r)
+		_ = r.Close()
+		return rc, raw
+	}
+	rc, previewRaw := capture([]string{"--url", "http://" + srv.AdminAddr(),
+		"--token-file", tokenPath, "--json", "event", "purge", "preview", eventID})
+	if rc != 0 {
+		t.Fatalf("CLI purge preview exit=%d raw=%s", rc, previewRaw)
+	}
+	var preview map[string]any
+	if err := json.Unmarshal(previewRaw, &preview); err != nil {
+		t.Fatalf("CLI purge preview JSON: %v raw=%s", err, previewRaw)
+	}
+	previewID, _ := preview["preview_id"].(string)
+	phrase, _ := preview["confirm_phrase"].(string)
+	if previewID == "" || phrase == "" {
+		t.Fatalf("CLI purge preview missing receipt: %v", preview)
+	}
+	if rc, raw := capture([]string{"--url", "http://" + srv.AdminAddr(),
+		"--token-file", tokenPath, "--json", "event", "purge", "confirm", eventID,
+		"--preview-id", previewID, "--confirm", phrase}); rc != 0 {
+		t.Fatalf("CLI purge confirm exit=%d raw=%s", rc, raw)
+	}
+	var purgeStatus management.PurgeStatusView
+	if err := client.Call(context.Background(), "GET", "/api/v1/events/"+eventID+"/purge/status", nil, nil, &purgeStatus); err != nil {
+		t.Fatalf("CLI purge status read: %v", err)
+	}
+	if !purgeStatus.Graveyard {
+		t.Fatalf("CLI purge did not complete: %+v", purgeStatus)
+	}
+
 	// A CLI failure must use a non-zero exit code and cannot be mistaken for success.
 	if rc := runAdminCLI([]string{"--url", "http://" + srv.AdminAddr(),
 		"--token-file", tokenPath, "event", "show", "55555555-5555-4555-8555-555555555555"}); rc == 0 {

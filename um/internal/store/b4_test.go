@@ -65,16 +65,16 @@ func TestB4MigrationReopenKeepsManagementState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	if version, err := s.SchemaVersion(ctx); err != nil || version != 9 {
-		t.Fatalf("schema version = %d (err=%v), want 9", version, err)
+	if version, err := s.SchemaVersion(ctx); err != nil || version != SchemaVersion {
+		t.Fatalf("schema version = %d (err=%v), want %d", version, err, SchemaVersion)
 	}
 	now := int64(1_700_000_000)
 	mustCreateB4Event(t, s, b4AuditContext("event_create"), testB4EventA, "Event A", now)
-	for _, table := range []string{"admin_audit", "aliases"} {
+	for _, table := range []string{"admin_audit", "aliases", "purge_confirmations"} {
 		var name string
 		if err := s.db.QueryRowContext(ctx,
 			`SELECT name FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&name); err != nil {
-			t.Fatalf("missing v9 table %q: %v", table, err)
+			t.Fatalf("missing management table %q: %v", table, err)
 		}
 	}
 	if err := s.Close(); err != nil {
@@ -86,8 +86,8 @@ func TestB4MigrationReopenKeepsManagementState(t *testing.T) {
 		t.Fatalf("reopen: %v", err)
 	}
 	defer reopened.Close()
-	if version, err := reopened.SchemaVersion(ctx); err != nil || version != 9 {
-		t.Fatalf("reopened schema version = %d (err=%v)", version, err)
+	if version, err := reopened.SchemaVersion(ctx); err != nil || version != SchemaVersion {
+		t.Fatalf("reopened schema version = %d (err=%v), want %d", version, err, SchemaVersion)
 	}
 	record, err := reopened.GetEvent(ctx, testB4EventA, nil)
 	if err != nil {

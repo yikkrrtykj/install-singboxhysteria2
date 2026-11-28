@@ -178,6 +178,7 @@ func (h *Handler) routeEvents(ctx context.Context, w http.ResponseWriter, r *htt
 			}
 			var req struct {
 				Confirmation string `json:"confirmation"`
+				PreviewID    string `json:"preview_id"`
 			}
 			if err := h.decode(w, r, &req); err != nil {
 				if errors.Is(err, errAdminBodyTooLarge) {
@@ -187,7 +188,7 @@ func (h *Handler) routeEvents(ctx context.Context, w http.ResponseWriter, r *htt
 				h.writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), false, requestID)
 				return
 			}
-			v, err := h.svc.PurgeConfirm(ctx, p, parts[1], req.Confirmation)
+			v, err := h.svc.PurgeConfirm(ctx, p, parts[1], req.Confirmation, req.PreviewID)
 			h.respond(w, err, v, requestID)
 		case "status":
 			if r.Method != http.MethodGet {

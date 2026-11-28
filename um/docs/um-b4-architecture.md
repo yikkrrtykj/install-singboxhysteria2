@@ -117,10 +117,20 @@ URL event is insufficient.
   `ArchiveEvent`; archived ingest/rotation/config/mapping/enrollment stops.
 - Archive keeps the B2 policy-B archive tail; no second copy.
 - Purge is the existing durable `PurgeEvent` engine: platform_admin only,
-  preview, exact `purge:<event_id>` confirmation, authorization revalidation,
+  preview, exact `purge:<event_id>` type-to-confirm, authorization revalidation,
   `purge_ops` progress/resume, per-event lock, permanent graveyard, 180-day
   tombstone, security ledger, real deleted-row count. B4 adds no new purge
   engine and does not weaken mapping-delete triggers.
+- **Final-closure confirmation binding (v10):** a preview returns a short-lived
+  (5 min) single-use `preview_id`. The server stores a receipt bound to the
+  authenticated actor, event, `event_purge` action, and the preview lifecycle
+  fingerprint (state/archived/purge/data fields/catalog update time). The first
+  durable purge operation is created only in the transaction that re-reads and
+  consumes that receipt under the capacity/per-event serialization locks; an
+  expired, replayed, actor/event-mismatched or stale receipt is rejected. The
+  static phrase remains mandatory but is not sufficient alone. Once the op is
+  durably persisted, resume and completed-operation idempotence do not require a
+  live receipt; an expired receipt can never create a new operation.
 - Purged event IDs cannot be recreated (graveyard) and old data/duplicate
   operations cannot revive them.
 
@@ -205,13 +215,23 @@ URL event is insufficient.
 - `admin_audit` (v9) stores bounded actor/role/action/target/event/result/
   request_id. Mutations append the audit row **inside the same transaction** as
   the mutation through `AuditMeta` context; an audit insert failure rolls back
-  the mutation.
+  the mutation. Final closure adds the missing policy-B retention class: the
+  existing bounded sweep deletes only rows with `at < now-180d` in ≤50,000-row
+  batches, strictly age-based (archived/purged event audit rows remain until
+  their own 180-day boundary) and never touches the independent security ledger.
+- v10 adds the `purge_confirmations` receipt table only; it is not a second purge
+  engine.
 - Critical security state changes continue to use the existing hash-chained
   security ledger: node revoke, key revoke, archive, purge, mapping creation,
   enroll/config events etc. B4 does not replace or weaken the ledger.
 - Audit reads are filterable by event, action, result, actor and inclusive
   Unix-second time range; platform-wide for platform_admin, event-scoped for
-  event_admin, denied to viewer. Responses contain no token/private key/
+  event_admin, denied to viewer.
+- Successful mutations and authenticated permission/scope denials are audited.
+  Unauthenticated failures have no trusted principal and are not attributed to
+  `admin_audit`; invalid/conflict mutations fail before a success audit row is
+  written. This is the actual documented boundary, not a fabricated audit of
+  untrusted request fields. Responses contain no token/private key/
   controller secret, raw proxy names or raw user traffic.
 - Ledger verify is platform_admin-only; it is visibility, not backup/restore
   authorization. UM-E owns full offsite/checkpoint/restore acceptance.

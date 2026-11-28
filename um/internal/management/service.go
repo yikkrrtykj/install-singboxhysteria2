@@ -175,6 +175,12 @@ func mapStoreError(err error) error {
 	case errors.Is(err, store.ErrAliasConflict), errors.Is(err, store.ErrAlreadyExists),
 		errors.Is(err, store.ErrConflict):
 		return ErrConflict
+	case errors.Is(err, store.ErrPurgeConfirmationRequired), errors.Is(err, store.ErrPurgeConfirmationInvalid):
+		return &InvalidError{Field: "preview_id", Detail: "preview receipt is required, unknown, already used or bound to another actor/event"}
+	case errors.Is(err, store.ErrPurgeConfirmationExpired):
+		return ErrConflict
+	case errors.Is(err, store.ErrPurgeConfirmationStale):
+		return ErrConflict
 	default:
 		return err
 	}
@@ -280,16 +286,21 @@ func (s *Service) PurgePreview(ctx context.Context, p Principal, eventID string)
 	if err != nil {
 		return PurgePreviewView{}, mapStoreError(err)
 	}
+	confirmation, err := s.st.IssuePurgeConfirmation(ctx, eventID, p.ID, preview.StateFingerprint, s.now())
+	if err != nil {
+		return PurgePreviewView{}, mapStoreError(err)
+	}
 	v := PurgePreviewView{
 		EventID: eventID, State: preview.Event.State, TableCounts: preview.TableCounts,
 		TotalRows: preview.TotalRows, DataPurged: preview.DataPurged,
 		Incomplete: preview.Incomplete, Irreversible: true,
-		ConfirmPhrase: "purge:" + eventID,
+		ConfirmPhrase: "purge:" + eventID, PreviewID: confirmation.ID,
+		PreviewExpiresAt: confirmation.ExpiresAt,
 	}
 	return v, nil
 }
 
-func (s *Service) PurgeConfirm(ctx context.Context, p Principal, eventID, confirmation string) (PurgeStatusView, error) {
+func (s *Service) PurgeConfirm(ctx context.Context, p Principal, eventID, confirmation, previewID string) (PurgeStatusView, error) {
 	if err := Authorize(p, ActionEventPurge, eventID); err != nil {
 		s.auditDenied(ctx, p, ActionEventPurge, eventID, "event:"+eventID)
 		return PurgeStatusView{}, err
@@ -298,7 +309,7 @@ func (s *Service) PurgeConfirm(ctx context.Context, p Principal, eventID, confir
 		return PurgeStatusView{}, &InvalidError{Field: "confirmation", Detail: "must be purge:<event_id>"}
 	}
 	ctx = auditContext(ctx, p, ActionEventPurge, eventID, "event:"+eventID)
-	if err := s.st.PurgeEvent(ctx, eventID, p.ID, true, s.now()); err != nil {
+	if err := s.st.PurgeEventConfirmed(ctx, eventID, p.ID, previewID, true, s.now()); err != nil {
 		return PurgeStatusView{}, mapStoreError(err)
 	}
 	return s.purgeStatus(ctx, eventID)
@@ -839,6 +850,7 @@ func (s *Service) Capacity(ctx context.Context, p Principal) (CapacityView, erro
 		"nonce_dedupe": base.NonceDedupe, "active_events": ext.ActiveEvents,
 		"archived_events": ext.ArchivedEvents, "archived_retained": ext.ArchivedRetained,
 		"events_catalog": ext.EventsCatalog,
+		"admin_audit":    ext.AdminAuditRows,
 	}
 	quotas := map[string]int64{
 		"max_active_nodes_all_events":   store.MaxActiveNodesAllEvents,

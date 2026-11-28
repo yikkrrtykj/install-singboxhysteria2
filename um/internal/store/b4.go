@@ -214,6 +214,9 @@ type PurgePreview struct {
 	TotalRows   int64
 	DataPurged  bool
 	Incomplete  bool
+	// StateFingerprint binds a preview receipt to the exact lifecycle snapshot
+	// observed while building this preview. It is internal and never serialized.
+	StateFingerprint string
 }
 
 // PurgeStatus is the latest durable purge state plus permanent graveyard and
@@ -1303,6 +1306,17 @@ func (s *Store) PurgePreview(ctx context.Context, eventID string) (PurgePreview,
 	case !errors.Is(err, sql.ErrNoRows):
 		return PurgePreview{}, fmt.Errorf("store: purge preview state: %w", err)
 	}
+	fingerprint, err := purgeStateFingerprint(ctx, s.db, eventID)
+	if err != nil {
+		return PurgePreview{}, err
+	}
+	// The preview response and the receipt must describe the same lifecycle
+	// snapshot. A concurrent archive/purge between the event read and the
+	// fingerprint is rejected; the operator should re-preview.
+	if !strings.HasPrefix(fingerprint, rec.State+"|") {
+		return PurgePreview{}, ErrPurgeConfirmationStale
+	}
+	preview.StateFingerprint = fingerprint
 	return preview, nil
 }
 

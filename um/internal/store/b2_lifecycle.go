@@ -504,6 +504,7 @@ type CapacityStatsExtended struct {
 	ArchivedRetained int64
 	EventsCatalog    int64
 	PurgeTombstones  int64
+	AdminAuditRows   int64
 	DBSizeBytes      int64
 	WALSizeBytes     int64
 	NodesBytes       int64
@@ -534,6 +535,7 @@ func (s *Store) CapacityStatsExtended(ctx context.Context) (CapacityStatsExtende
 		{&c.ArchivedRetained, `SELECT COUNT(*) FROM event_catalog WHERE state='archived' AND data_purged_at IS NULL`},
 		{&c.EventsCatalog, `SELECT COUNT(*) FROM event_catalog`},
 		{&c.PurgeTombstones, `SELECT COUNT(*) FROM purge_tombstones`},
+		{&c.AdminAuditRows, `SELECT COUNT(*) FROM admin_audit`},
 	} {
 		if err := s.db.QueryRowContext(ctx, q.sql).Scan(q.dst); err != nil {
 			return CapacityStatsExtended{}, err
@@ -726,6 +728,14 @@ func (s *Store) RunRetentionB2PolicyB(ctx context.Context, now int64) (map[strin
 	} else {
 		deleted["node_latest"] = n
 	}
+	// UM-B4 admin audit is a formal 180d security-audit class. Age is the only
+	// deletion criterion: archived/purged event audits remain until their own
+	// 180d boundary, and the independent security ledger is never touched here.
+	if n, err := deleteBatched(ctx, s.db, hook, "admin_audit", "at < ?", now-SecurityRetentionSeconds); err != nil {
+		return fail("admin_audit", err)
+	} else {
+		deleted["admin_audit"] = n
+	}
 	// Retention runs and purge tombstones are themselves bounded.
 	if n, err := deleteBatched(ctx, s.db, hook, "retention_runs", `id NOT IN (SELECT id FROM retention_runs ORDER BY id DESC LIMIT ?)`, RetentionRunsKeep-1); err != nil {
 		return fail("retention_runs", err)
@@ -736,6 +746,13 @@ func (s *Store) RunRetentionB2PolicyB(ctx context.Context, now int64) (map[strin
 		return fail("purge_tombstones", err)
 	} else {
 		deleted["purge_tombstones"] = n
+	}
+	// Short-lived purge preview receipts are authorization metadata, not audit;
+	// expired rows are safe to prune in the same bounded maintenance path.
+	if n, err := deleteBatched(ctx, s.db, hook, "purge_confirmations", "expires_at < ?", now); err != nil {
+		return fail("purge_confirmations", err)
+	} else {
+		deleted["purge_confirmations"] = n
 	}
 	result, _ := jsonMarshal(deleted)
 	if _, err := s.db.ExecContext(ctx, `INSERT INTO retention_runs(ran_at,result_json) VALUES(?,?)`, now, result); err != nil {

@@ -26,6 +26,7 @@ const (
 
 type b4Center struct {
 	st       *store.Store
+	mgmt     *management.Service
 	srv      *center.Server
 	adminURL string
 	ingest   string
@@ -68,15 +69,17 @@ func startB4Center(t *testing.T) *b4Center {
 		t.Fatal(err)
 	}
 	raw := map[string]string{
-		"platform": "platform-token-0123456789abcdef",
-		"admin-a":  "admin-a-token-0123456789abcdef",
-		"admin-b":  "admin-b-token-0123456789abcdef",
-		"viewer-a": "viewer-a-token-0123456789abcdef",
-		"viewer-b": "viewer-b-token-0123456789abcdef",
+		"platform":   "platform-token-0123456789abcdef",
+		"platform-b": "platform-b-token-0123456789abcdef",
+		"admin-a":    "admin-a-token-0123456789abcdef",
+		"admin-b":    "admin-b-token-0123456789abcdef",
+		"viewer-a":   "viewer-a-token-0123456789abcdef",
+		"viewer-b":   "viewer-b-token-0123456789abcdef",
 	}
 	authDoc := management.AuthConfig{
 		Principals: []management.AuthPrincipal{
 			{ID: "platform", Role: management.RolePlatformAdmin},
+			{ID: "platform-b", Role: management.RolePlatformAdmin},
 			{ID: "admin-a", Role: management.RoleEventAdmin, EventIDs: []string{eventA}},
 			{ID: "admin-b", Role: management.RoleEventAdmin, EventIDs: []string{eventB}},
 			{ID: "viewer-a", Role: management.RoleViewer, EventIDs: []string{eventA}},
@@ -120,7 +123,7 @@ func startB4Center(t *testing.T) *b4Center {
 		writeProtected(t, p, []byte(rawToken))
 		tokens[name] = p
 	}
-	return &b4Center{st: st, srv: srv, adminURL: "http://" + srv.AdminAddr(),
+	return &b4Center{st: st, mgmt: mgmt, srv: srv, adminURL: "http://" + srv.AdminAddr(),
 		ingest: "http://" + srv.IngestAddr(), tokens: tokens}
 }
 
@@ -238,6 +241,33 @@ func TestAuthAndRBAC(t *testing.T) {
 	if !errors.As(errAudit, &apiErr) || apiErr.Status != http.StatusForbidden {
 		t.Fatalf("viewer read audit err=%v, want 403", errAudit)
 	}
+	// Authenticated denials are audited; unauthenticated failures have no
+	// trusted principal and therefore cannot be attributed into admin_audit.
+	platformClient := clientFor(t, bc, "platform")
+	var auditBefore, auditAfter management.AuditList
+	if err := platformClient.Call(context.Background(), http.MethodGet, "/api/v1/audit", nil, nil, &auditBefore); err != nil {
+		t.Fatal(err)
+	}
+	status, _ := rawRequest(t, http.MethodGet, bc.adminURL+"/api/v1/events", "", nil)
+	if status != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated admin request status=%d", status)
+	}
+	if err := platformClient.Call(context.Background(), http.MethodGet, "/api/v1/audit", nil, nil, &auditAfter); err != nil {
+		t.Fatal(err)
+	}
+	if auditAfter.Total != auditBefore.Total {
+		t.Fatalf("unauthenticated request changed audit rows: before=%d after=%d", auditBefore.Total, auditAfter.Total)
+	}
+	var deniedVerified bool
+	for _, entry := range auditAfter.Entries {
+		if entry.Result == "denied" && entry.Actor == "viewer-a" && entry.Action == "enroll_token_create" {
+			deniedVerified = true
+			break
+		}
+	}
+	if !deniedVerified {
+		t.Fatal("viewer denial was not recorded in admin_audit")
+	}
 	// event_admin B cannot see event A.
 	if err := eventAdminB.Call(context.Background(), http.MethodGet, "/api/v1/events/"+eventA, nil, nil, &tok); err == nil {
 		t.Fatal("event_admin B read event A")
@@ -290,16 +320,16 @@ func TestEventLifecycleAndAudit(t *testing.T) {
 	if err := p.Call(context.Background(), http.MethodGet, "/api/v1/events/"+eventA+"/purge/preview", nil, nil, &preview); err != nil {
 		t.Fatal(err)
 	}
-	if preview.ConfirmPhrase != "purge:"+eventA {
-		t.Fatalf("confirm phrase=%q", preview.ConfirmPhrase)
+	if preview.ConfirmPhrase != "purge:"+eventA || preview.PreviewID == "" {
+		t.Fatalf("confirm receipt=%+v", preview)
 	}
 	if err := p.Call(context.Background(), http.MethodPost, "/api/v1/events/"+eventA+"/purge/confirm", nil,
-		map[string]any{"confirmation": "purge:" + eventB}, nil); err == nil {
+		map[string]any{"confirmation": "purge:" + eventB, "preview_id": preview.PreviewID}, nil); err == nil {
 		t.Fatal("cross-event purge confirmation accepted")
 	}
 	var status management.PurgeStatusView
 	if err := p.Call(context.Background(), http.MethodPost, "/api/v1/events/"+eventA+"/purge/confirm", nil,
-		map[string]any{"confirmation": "purge:" + eventA}, &status); err != nil {
+		map[string]any{"confirmation": "purge:" + eventA, "preview_id": preview.PreviewID}, &status); err != nil {
 		t.Fatalf("purge confirm: %v", err)
 	}
 	if !status.Graveyard {

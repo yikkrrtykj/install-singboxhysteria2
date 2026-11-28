@@ -81,14 +81,18 @@ um-center admin ... event show EVENT_ID
 um-center admin ... event rename EVENT_ID --name "New name"
 um-center admin ... event archive EVENT_ID
 um-center admin ... event purge preview EVENT_ID
-um-center admin ... event purge confirm EVENT_ID --confirm purge:EVENT_ID
+# preview returns preview_id + preview_expires_at; first confirm requires it:
+um-center admin ... event purge confirm EVENT_ID --preview-id PREVIEW_ID --confirm purge:EVENT_ID
 um-center admin ... event purge status EVENT_ID
 ```
 
 Purge is platform_admin-only, previews affected rows, requires the exact
-`purge:<event_id>` phrase, and revalidates authorization/target at execution.
-Repeat requests are idempotent once the durable graveyard exists. There is no
-`--yes` shortcut.
+`purge:<event_id>` phrase **and** the short-lived `preview_id` receipt for a
+first start (bound to actor/event/action/lifecycle state, five-minute expiry,
+single use). The receipt is consumed in the same transaction that persists the
+durable purge operation. Repeat requests and interrupted-operation recovery are
+idempotent once the operation/graveyard exists, without needing a live receipt.
+There is no `--yes` shortcut.
 
 ### Nodes / config / tokens
 
@@ -175,7 +179,7 @@ security-ledger hash chain but is not a backup/restore authorization.
   Mihomo/Clash/HA, run commands, fetch arbitrary URLs or read arbitrary files.
 - Do not use management API aliases as identity; stable `node_id`/`event_id`
   remain authoritative.
-- Database migrations are forward-only v9+; never edit an applied migration.
+- Database migrations are forward-only; v10 adds only the purge confirmation receipt table. Never edit an applied migration.
   Back up the SQLite DB according to the center deployment policy before upgrade
   (B4 does not implement backup/restore itself).
 - Production deployment, public ingress, real tournament terminals, R1 production

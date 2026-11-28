@@ -4845,6 +4845,10 @@
         "properties": {
           "confirmation": {
             "type": "string"
+          },
+          "preview_id": {
+            "type": "string",
+            "description": "preview_id returned by purge preview; optional only for resume/idempotent completion of an already-persisted operation."
           }
         },
         "required": [
@@ -4879,6 +4883,15 @@
           },
           "confirm_phrase": {
             "type": "string"
+          },
+          "preview_id": {
+            "type": "string",
+            "description": "Short-lived single-use preview receipt; required for a first purge start."
+          },
+          "preview_expires_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix-second expiry of the preview receipt."
           }
         }
       },

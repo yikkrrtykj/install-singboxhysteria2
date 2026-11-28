@@ -13,7 +13,7 @@ deployment or UM-C+ work is authorized by this document.
 | B4.4 | Effective-dated agent config read/history/update; source/class validation; no unauthorized source enablement | management + existing B2 config engine | positive/negative source tests PASS |
 | B4.5 | Append-only route mapping list/create/resolve; same-event/class validation; historical resolution | management + existing store mapping engine | real two-event E2E historical mapping PASS; invalid target/version tests PASS |
 | B4.6 | Retention/capacity/audit visibility, bounded maintenance trigger; aliases; purge safety | management + existing B2 retention/purge | real purge isolation/idempotence tests; store lifecycle tests PASS |
-| B4.7 | Admin HTTP API, OpenAPI, management CLI, E2E/security/final acceptance | `management.Handler`, `cmd/um-center/admin_cli.go`, docs | strict OpenAPI+inventory+DTO-field tests; real CLI HTTP test; exact-HEAD lab all green; independent review cleared P0/P1; final CI evidence in `um-b4-evidence.md` |
+| B4.7 | Admin HTTP API, OpenAPI, management CLI, E2E/security/final acceptance + final purge/audit closure | `management.Handler`, `cmd/um-center/admin_cli.go`, docs, v10 | strict OpenAPI+inventory+DTO-field tests; real two-event purge receipt/expiry/state/resume/concurrency tests; 180d admin audit retention tests; exact-HEAD CI/lab; Codex+independent review |
 
 ## 2. API inventory
 
@@ -83,9 +83,15 @@ to claim API acceptance. Real CLI test is in `cmd/um-center/admin_cli_test.go`.
 - Config rejects `singbox_api:true` and `mihomo_api:true`; class rules enforced.
 - Mapping rejects reserved tokens, cross-event/class targets, duplicate versions,
   backdating and rewrites; append-only triggers unchanged.
-- Purge requires platform_admin + exact type-to-confirm; invalid/cross-event
-  confirmation rejected; durable op/graveyard/tombstone/ledger; repeated request
-  safe; event A untouched.
+- Purge requires platform_admin + exact type-to-confirm **plus a short-lived
+  preview receipt bound to actor/event/action/lifecycle**; missing, wrong-actor,
+  wrong-event, expired, replayed and state-changed receipts are rejected before
+  any new operation; already-authorized operations resume after receipt expiry;
+  completed operations stay idempotent; durable op/graveyard/tombstone/ledger;
+  repeated request safe; event A untouched.
+- `admin_audit` is retained for 180 days by the bounded policy-B sweep; only
+  strictly age-expired rows are deleted, archived/purged event audit is preserved
+  until its own boundary, and the security ledger is untouched.
 - No admin path reads arbitrary files, executes commands, fetches URLs or pushes
   commands/config to agents.
 - Audit and ledger failure cannot be reported as success for mutations (audit is

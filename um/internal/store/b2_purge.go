@@ -169,9 +169,26 @@ func (s *Store) addPurgeProgress(ctx context.Context, opID string, n int64, phas
 	return nil
 }
 
-// PurgeEvent performs a resumable, durable purge. confirm/actor are required.
+// PurgeEvent performs a resumable, durable purge using the legacy internal
+// engine entry point (B1/B2 compatibility and engine-level tests). The
+// management boundary must use PurgeEventConfirmed so a first permanent
+// deletion also consumes a short-lived bound preview receipt.
+//
 // It returns nil if the event was already fully purged by a prior attempt.
 func (s *Store) PurgeEvent(ctx context.Context, eventID, actor string, confirm bool, now int64) error {
+	return s.purgeEvent(ctx, eventID, actor, confirm, now, nil)
+}
+
+// PurgeEventConfirmed is the B4 management entry point. For a first permanent
+// deletion it atomically consumes a preview receipt in the same transaction
+// that persists the authorized purge operation. Resume of an already-persisted
+// incomplete operation and idempotent completion remain available even after
+// the receipt expires; the receipt can never create a second operation.
+func (s *Store) PurgeEventConfirmed(ctx context.Context, eventID, actor, confirmationID string, confirm bool, now int64) error {
+	return s.purgeEvent(ctx, eventID, actor, confirm, now, &purgeAuthorization{ConfirmationID: confirmationID})
+}
+
+func (s *Store) purgeEvent(ctx context.Context, eventID, actor string, confirm bool, now int64, auth *purgeAuthorization) error {
 	if !confirm {
 		return invalidArgument("confirm", "explicit confirmation is required")
 	}
@@ -233,6 +250,17 @@ func (s *Store) PurgeEvent(ctx context.Context, eventID, actor string, confirm b
 			if err := eventBlockedTx(ctx, tx, eventID); err != nil && !errors.Is(err, ErrEventPurged) {
 				_ = tx.Rollback()
 				return err
+			}
+			// First permanent deletion only: consume the short-lived receipt in
+			// the same transaction that persists the authorized operation. The
+			// event lifecycle fingerprint is re-read under the capacity lock, so a
+			// preview/confirm race cannot authorize stale state. An existing
+			// incomplete op took the resume branch above and does not need it.
+			if auth != nil {
+				if err := consumePurgeConfirmationTx(ctx, tx, eventID, actor, op.OpID, auth.ConfirmationID, now); err != nil {
+					_ = tx.Rollback()
+					return err
+				}
 			}
 			if _, err := tx.ExecContext(ctx,
 				`INSERT INTO purge_ops(op_id,event_id,actor,started_at,updated_at,state,phase,deleted_rows,error)
@@ -430,6 +458,9 @@ func (s *Store) PurgeEvent(ctx context.Context, eventID, actor string, confirm b
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM event_catalog WHERE event_id=?`, eventID); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM purge_confirmations WHERE event_id=?`, eventID); err != nil {
 			return err
 		}
 		// Permanent identity isolation (independent of the 180-day audit row).
