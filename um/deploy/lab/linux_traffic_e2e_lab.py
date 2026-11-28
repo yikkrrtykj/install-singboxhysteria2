@@ -1025,7 +1025,7 @@ class Lab:
         token_document = lab.run_admin_cli(
             self.center_bin, self.center_admin_url, self.center_token_file,
             ["token", "create", self.event_id, "--class", "linux_vps",
-             "--ttl-seconds", "1800"])
+             "--ttl-seconds", "600"])
         token = token_document.get("token")
         if not token:
             raise lab.LabError("center token create did not return a token: %r"
