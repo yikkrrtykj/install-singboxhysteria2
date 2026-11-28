@@ -147,7 +147,9 @@ $enrollPath = '"' + $labSvc + '" --log "' + $serviceLog + '" "' + $agent + '" en
 Invoke-Native 'sc.exe' @('create', $svc, 'binPath=', $enrollPath, 'start=', 'demand', 'obj=', "NT SERVICE\$svc")
 Invoke-Native 'sc.exe' @('sidtype', $svc, 'unrestricted')
 $sid = Get-ServiceSid $svc
-Invoke-Native 'icacls' @($lab, '/grant', "*${sid}:(OI)(CI)M", '/T')
+Invoke-Native 'icacls' @($lab, '/grant', "*${sid}:(OI)(CI)M")
+Invoke-Native 'icacls' @($agent, '/grant', "*${sid}:R")
+Invoke-Native 'icacls' @($labSvc, '/grant', "*${sid}:R")
 Invoke-Native 'icacls' @($state, '/inheritance:r', '/grant:r', '*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F', "*${sid}:(OI)(CI)F", '/T')
 Invoke-Native 'icacls' @($tokenFile, '/grant', "*${sid}:R")
 Start-OneShotService
