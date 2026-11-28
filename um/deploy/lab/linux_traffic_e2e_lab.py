@@ -1733,11 +1733,12 @@ class Lab:
                    "admin node-show returns the node's latest snapshot")
         revision = (snapshot or {}).get("contract_revision")
         self.check_eq(revision, 7,
-                      "admin query surface returns the rev-7 snapshot body")
-        observation = (snapshot or {}).get("traffic_observation") or {}
-        parsed = lab.validate_rev7_snapshot_report(snapshot)
-        self.check_eq(parsed["availability"], "ok",
-                      "admin query surface observation availability ok")
+                      "admin query surface returns the rev-7 snapshot header")
+        # The raw traffic_observation must not be retained in the 30-day snapshot
+        # payload; the bounded normalized tables are its only representation.
+        self.check("traffic_observation" not in (snapshot or {}),
+                   "admin query surface returns the bounded base projection, "
+                   "not a retained raw traffic_observation")
         findings = lab.privacy_scan_report(
             snapshot, json.dumps(snapshot).encode("utf-8"),
             self.creds.secret_values(),

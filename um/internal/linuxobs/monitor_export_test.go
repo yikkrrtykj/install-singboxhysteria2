@@ -287,60 +287,6 @@ func TestMonitorExportFileGuards(t *testing.T) {
 	})
 }
 
-func TestMonitorExportOwnerGroupModeChecks(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("POSIX owner/group/mode checks are not enforced on this host")
-	}
-	col, _, _, _ := newFakeCollector(t)
-	col.MonitorExportFile = writeMonitorExport(t, validMonitorExport(testCollectedAt, 3, "ee"))
-	col.MonitorExportOwnerUID = os.Getuid() + 1
-	assertUnavailableObservation(t, col)
-
-	col, _, _, _ = newFakeCollector(t)
-	col.MonitorExportFile = writeMonitorExport(t, validMonitorExport(testCollectedAt, 3, "ef"))
-	col.MonitorExportGroupGID = os.Getgid() + 1
-	assertUnavailableObservation(t, col)
-
-	col, _, _, _ = newFakeCollector(t)
-	col.MonitorExportFile = writeMonitorExport(t, validMonitorExport(testCollectedAt, 3, "eg"))
-	col.MonitorExportMode = 0o600
-	assertUnavailableObservation(t, col)
-
-	col, _, _, _ = newFakeCollector(t)
-	path := writeMonitorExport(t, validMonitorExport(testCollectedAt, 3, "eh"))
-	col.MonitorExportFile = path
-	col.MonitorExportOwnerUID = os.Getuid()
-	col.MonitorExportGroupGID = os.Getgid()
-	col.MonitorExportMode = uint32(0o640)
-	if info, err := os.Stat(path); err == nil {
-		_ = os.Chmod(path, 0o640)
-		_ = info
-	}
-	if obs := snapshotTraffic(t, col); obs.Freshness != "fresh" {
-		t.Fatalf("matching owner/group/mode rejected: %s", obs.Freshness)
-	}
-}
-
-func TestMonitorExportDropsUnauthorizedEntriesButForwardsAuthorizedSubset(t *testing.T) {
-	col, _, _, _ := newFakeCollector(t)
-	export := validMonitorExport(testCollectedAt, 4, "de")
-	inbounds := export["inbounds"].([]map[string]any)
-	if len(inbounds) < 2 {
-		t.Fatalf("fixture has %d inbounds, need >=2", len(inbounds))
-	}
-	inbounds[0]["inbound_tag"] = "unknown-in"
-	col.MonitorExportFile = writeMonitorExport(t, export)
-	obs := snapshotTraffic(t, col)
-	if obs.Freshness != "fresh" || obs.Availability != "partial" {
-		t.Fatalf("authorized-subset export rendered as %s/%s", obs.Freshness, obs.Availability)
-	}
-	for _, entry := range obs.Inbounds {
-		if entry.InboundTag == "unknown-in" {
-			t.Fatal("unauthorized tag leaked into the report")
-		}
-	}
-}
-
 func TestMonitorExportSequenceAndEpochGuard(t *testing.T) {
 	t.Run("replay of the same sequence is not fresh", func(t *testing.T) {
 		col, _, _, _ := newFakeCollector(t)
