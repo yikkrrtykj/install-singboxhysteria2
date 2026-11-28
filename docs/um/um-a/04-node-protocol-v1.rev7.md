@@ -22,10 +22,10 @@ permission widening, or a new write-capable credential holder.
   the pre-production blocker on Issue #127; this overlay adds a **new, separate,
   audited local file source**, it does not unblock or enable `service.api`.
 - Machine-readable normative artifacts:
-  [`report-snapshot.rev7.schema.json`](../contracts/v1/report-snapshot.rev7.schema.json),
-  [`agent-config.rev7.schema.json`](../contracts/v1/agent-config.rev7.schema.json),
+  [`rev7/report-snapshot.schema.json`](../contracts/v1/rev7/report-snapshot.schema.json),
+  [`rev7/agent-config.schema.json`](../contracts/v1/rev7/agent-config.schema.json),
   positive fixtures under [`../contracts/v1/examples/`](../contracts/v1/examples/),
-  and [`negative-vectors.rev7.json`](../contracts/v1/negative-vectors.rev7.json).
+  and [`rev7/negative-vectors.json`](../contracts/v1/rev7/negative-vectors.json).
 
 ## 0. Precedence and compatibility
 
@@ -242,7 +242,7 @@ The agent never logs the raw export.
 - A rev-7 snapshot body is exactly the frozen rev-5 Linux snapshot shape plus
   required top-level `contract_revision: 7` plus required top-level
   `traffic_observation`; see
-  [`report-snapshot.rev7.schema.json`](../contracts/v1/report-snapshot.rev7.schema.json).
+  [`rev7/report-snapshot.schema.json`](../contracts/v1/rev7/report-snapshot.schema.json).
 - Only a `linux_vps` node may send a rev-7 body. A `windows_terminal` node
   sending one is `400 platform_mismatch`; Windows stays on revision-5 bodies.
 - A rev-7 body is expected only when the applied config contained
@@ -582,7 +582,7 @@ fixtures contain synthetic values only.
   operator/rollout gate, the `linux_vps` class and the applied config switch
   still apply. An old agent cannot gain anything by misreporting a version — it
   would receive a config its strict validator rejects fail-closed.
-- Testable cases (encoded in [`negative-vectors.rev7.json`](../contracts/v1/negative-vectors.rev7.json)
+- Testable cases (encoded in [`rev7/negative-vectors.json`](../contracts/v1/rev7/negative-vectors.json)
   `NEG7-CFG-04..07` and required in the implementation PR): `CFG-REV7-01`
   unknown version ⇒ key absent; `CFG-REV7-02` reported `< 1.1.0` ⇒ key absent
   even with the stored flag set; `CFG-REV7-03` reported `>= 1.1.0` ⇒ the next
@@ -621,14 +621,14 @@ Closed failure → representation mapping (no new wire error codes):
 
 ## 13. Conformance artifacts (candidate)
 
-- [`report-snapshot.rev7.schema.json`](../contracts/v1/report-snapshot.rev7.schema.json),
-  [`agent-config.rev7.schema.json`](../contracts/v1/agent-config.rev7.schema.json):
+- [`rev7/report-snapshot.schema.json`](../contracts/v1/rev7/report-snapshot.schema.json),
+  [`rev7/agent-config.schema.json`](../contracts/v1/rev7/agent-config.schema.json):
   closed draft 2020-12 schemas that keep the frozen rev-5 base shape exactly and
   add only the rev-7 fields.
-- [`examples/report-snapshot.rev7.json`](../contracts/v1/examples/report-snapshot.rev7.json),
-  [`examples/agent-config.rev7.json`](../contracts/v1/examples/agent-config.rev7.json):
+- [`rev7/examples/report-snapshot.json`](../contracts/v1/rev7/examples/report-snapshot.json),
+  [`rev7/examples/agent-config.json`](../contracts/v1/rev7/examples/agent-config.json):
   synthetic positive fixtures.
-- [`negative-vectors.rev7.json`](../contracts/v1/negative-vectors.rev7.json):
+- [`rev7/negative-vectors.json`](../contracts/v1/rev7/negative-vectors.json):
   37 machine-readable negative/gating vectors (schema, implementation-semantic
   and platform/config stages) covering exact/lower-bound ambiguity, float/
   negative/over-bound bytes, bad epoch/sequence, stale-with-ok-availability,

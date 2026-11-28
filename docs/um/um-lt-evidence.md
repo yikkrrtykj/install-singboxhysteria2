@@ -23,11 +23,11 @@ for a NOT RUN item.
 
 | Artifact | Purpose |
 | --- | --- |
-| `docs/um/contracts/v1/report-snapshot.rev7.schema.json` | rev-7 snapshot body: frozen rev-5 shape + required `contract_revision`/`traffic_observation` |
-| `docs/um/contracts/v1/agent-config.rev7.schema.json` | rev-5 config + optional `collect.monitor_export` |
-| `docs/um/contracts/v1/examples/report-snapshot.rev7.json` | synthetic rev-7 Linux positive fixture |
-| `docs/um/contracts/v1/examples/agent-config.rev7.json` | synthetic rev-7 config positive fixture |
-| `docs/um/contracts/v1/negative-vectors.rev7.json` | 37 machine-readable negative/gating vectors (schema/semantic/platform/config stages, incl. four `CFG-REV7` agent-version gate cases) |
+| `docs/um/contracts/v1/rev7/report-snapshot.schema.json` | rev-7 snapshot body: frozen rev-5 shape + required `contract_revision`/`traffic_observation` |
+| `docs/um/contracts/v1/rev7/agent-config.schema.json` | rev-5 config + optional `collect.monitor_export` |
+| `docs/um/contracts/v1/rev7/examples/report-snapshot.json` | synthetic rev-7 Linux positive fixture |
+| `docs/um/contracts/v1/rev7/examples/agent-config.json` | synthetic rev-7 config positive fixture |
+| `docs/um/contracts/v1/rev7/negative-vectors.json` | 37 machine-readable negative/gating vectors (schema/semantic/platform/config stages, incl. four `CFG-REV7` agent-version gate cases) |
 | `docs/um/um-a/04-node-protocol-v1.rev7.md` | candidate normative overlay (source, export transport, report semantics, bounds, epoch/freshness, compatibility, no-weakening, conformance, provenance) |
 | `docs/um/um-lt-*.md` (architecture, data semantics, source audit, compatibility, capacity, runbook, scope/acceptance, owner decisions, this file) | design/audit/operations/acceptance/decision records |
 

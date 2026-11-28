@@ -13,8 +13,7 @@ import (
 // um/internal/schema + ../../../ = worktree root; then docs/um/contracts/v1.
 const contractsDir = "../../../docs/um/contracts/v1"
 
-// allSchemas is the frozen rev-5 schema set plus the additive rev-7 overlay
-// schemas. The rev-5 files remain byte-frozen; rev-7 adds two standalone files.
+// allSchemas is the frozen rev-5 schema set (10 files).
 var allSchemas = []string{
 	"ack.schema.json",
 	"agent-config.schema.json",
@@ -26,8 +25,6 @@ var allSchemas = []string{
 	"report-snapshot.schema.json",
 	"rotate-request.schema.json",
 	"rotate-response.schema.json",
-	"agent-config.rev7.schema.json",
-	"report-snapshot.rev7.schema.json",
 }
 
 func loadSet(t *testing.T) *Set {
@@ -108,8 +105,6 @@ func TestValidatePositiveExamples(t *testing.T) {
 		{"agent-config.schema.json", "examples/agent-config.v1.json"},
 		{"rotate-request.schema.json", "examples/rotate-request.v1.json"},
 		{"rotate-response.schema.json", "examples/rotate-response.v1.json"},
-		{"agent-config.rev7.schema.json", "examples/agent-config.rev7.json"},
-		{"report-snapshot.rev7.schema.json", "examples/report-snapshot.rev7.json"},
 	}
 	for _, tc := range cases {
 		tc := tc

@@ -191,5 +191,5 @@ Real tests, not only JSON parsing (mapping to the acceptance matrix):
     absent again; `CFG-REV7-05` `windows_terminal`/unknown class ⇒ never emitted.
     The test must observe the actual JSON response (presence/absence), not a
     stored flag.
-11. Full negative-vector runner for `negative-vectors.rev7.json`
+11. Full negative-vector runner for `rev7/negative-vectors.json`
     (schema + implementation-semantic + `CFG-REV7` config-generation cases).
