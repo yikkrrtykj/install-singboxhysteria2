@@ -692,11 +692,11 @@ func (s *Store) CreateSession(ctx context.Context, sess AuthSession) error {
 	const pendingTTL = int64(600)
 	pendingCutoff := sess.CreatedAt - pendingTTL
 	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM umc_sessions WHERE user_id=? AND revoked_at IS NULL AND state IN (?,?) AND created_at<=?`,
+		`DELETE FROM umc_sessions WHERE user_id=? AND revoked_at IS NULL AND state IN (?,?) AND created_at<?`,
 		sess.UserID, AuthSessionTOTPPending, AuthSessionTOTPSetup, pendingCutoff); err != nil {
 		return err
 	}
-	const usable = `revoked_at IS NULL AND absolute_expires_at>? AND ((state=? AND idle_expires_at>?) OR (state IN (?,?) AND created_at>?))`
+	const usable = `revoked_at IS NULL AND absolute_expires_at>? AND ((state=? AND idle_expires_at>?) OR (state IN (?,?) AND created_at>=?))`
 	var activeForUser, activeTotal int64
 	if err := tx.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM umc_sessions WHERE user_id=? AND `+usable,

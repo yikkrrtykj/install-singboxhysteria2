@@ -92,6 +92,13 @@ func runAuthBootstrap(args []string) error {
 		return fmt.Errorf("master key: %w", err)
 	}
 	defer clear(key)
+	accounts, err := st.CountAuthUsers(context.Background())
+	if err != nil {
+		return err
+	}
+	if accounts > 0 {
+		return errors.New("authentication is already initialized; use auth key-init for an existing-account database")
+	}
 	// Initialize/verify the sentinel before creating the first account so a
 	// failure cannot leave an account without a usable master-key binding.
 	if err := web.InitializeMasterKeyForExistingDB(context.Background(), st, key); err != nil {
