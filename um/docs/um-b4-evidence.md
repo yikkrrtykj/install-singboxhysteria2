@@ -3,8 +3,8 @@
 PR: #133 (Draft, Refs #127)
 Branch: `codex/um-b4-management`
 Base: `da8173317aa6b6395a5e002ea4a89dac3fe4fd5e` (rev-6 main)
-Reviewed HEAD: `fe70275456da170a0fa075ae2a50aed0b2553bd3` (plus final docs/evidence-only
-commit if recorded on the PR).
+Reviewed HEAD: `04480ef6d6d93d2b79d975d9eb1b45a9f1d6da0d`; final independent
+review found no P0/P1 and approved for Draft PR status.
 
 ## 1. Implementation evidence
 
@@ -86,8 +86,11 @@ Exact-HEAD evidence:
   findings (mapping create response, mapping entries array, config/event/node/
   token fields, request constraints) were then fixed and guarded by a
   reflection test comparing every public JSON DTO with its OpenAPI schema.
-- Final lab dispatch `46085969348` at `fb499a5e` is all green (same code as the
-  current final HEAD apart from docs/spec/test fidelity only).
+- Final lab dispatch `46088111556` at `04480ef6` is all green, including
+  `b4-management-e2e`, Linux systemd agent, Windows R1 and serviceapi. The
+  same HEAD adds the required audit time-range filter (`since`/`until`) and its
+  OpenAPI/CLI/tests; final independent review found no P0/P1 and approved it
+  for Draft PR status.
 
 ## 4. Migration/privacy/security notes
 
